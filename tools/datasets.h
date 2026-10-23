@@ -34,6 +34,7 @@ typedef struct ds_state {
     ds_kind kind;
     uint64_t rng;
     int64_t t0, i;
+    int64_t stamp_ms; /* if set, timestamps use this interval; values still follow the kind's own */
     double x, y, z;  /* model state */
     double hold;     /* samples left in the current episode (spike, shutdown, fill) */
     int phase;
@@ -84,7 +85,7 @@ static inline void ds_next(ds_state *s, int64_t *ts_out, float *v_out)
 {
     int64_t step = ds_info[s->kind].step_ms;
     int jit = ds_info[s->kind].jitter_ms;
-    int64_t ts = s->t0 + s->i * step;
+    int64_t ts = s->t0 + s->i * (s->stamp_ms ? s->stamp_ms : step);
     if (jit)
         ts += (int64_t)(ds_u(s) * (2 * jit + 1)) - jit;
     double tsec = (double)(s->i * step) / 1000.0, v = 0;

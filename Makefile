@@ -15,7 +15,7 @@ OBJ  := $(SRC:src/%.c=build/%.o)
 LIB  := build/libtsdb.a
 BINS := build/tsdb build/tsdb-bench build/test_tsdb
 
-all: $(LIB) build/tsdb build/tsdb-bench build/codec-bench build/insert-bench build/tsdbd $(CLIB) build/tsdbc-bench
+all: $(LIB) build/tsdb build/tsdb-bench build/codec-bench build/insert-bench build/tsdbd $(CLIB) build/tsdbc-bench build/scale-bench
 
 build/%.o: src/%.c src/internal.h include/tsdb.h | build
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -71,6 +71,9 @@ $(CLIB): build/tsdb_client.o
 
 build/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB)
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) -lpthread -lm
+
+build/scale-bench: tools/scale-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
 build/test_server: tests/test_server.c $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
