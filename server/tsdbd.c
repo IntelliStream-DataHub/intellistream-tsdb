@@ -810,11 +810,15 @@ int main(int argc, char **argv)
                 conn *c = e->c;
                 c->recv_inflight = false;
                 if (res <= 0 || c->closed) {
+                    if (getenv("TSDBD_DEBUG") && !c->closed)
+                        fprintf(stderr, "tsdbd: connection %d: recv %s\n", c->fd, res == 0 ? "end" : strerror(-res));
                     conn_close(c);
                     break;
                 }
                 c->in.len += (size_t)res;
                 if (!parse(c)) {
+                    if (getenv("TSDBD_DEBUG"))
+                        fprintf(stderr, "tsdbd: connection %d: protocol error\n", c->fd);
                     conn_close(c);
                     break;
                 }
@@ -826,6 +830,8 @@ int main(int argc, char **argv)
                 conn *c = e->c;
                 c->send_inflight = false;
                 if (res < 0 || c->closed) {
+                    if (getenv("TSDBD_DEBUG") && res < 0)
+                        fprintf(stderr, "tsdbd: connection %d: send %s\n", c->fd, strerror(-res));
                     conn_close(c);
                     break;
                 }
@@ -839,6 +845,11 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "tsdbd: shutting down\n");
+    /* The pending multishot accept holds its own reference to the socket, and the
+     * ring is torn down asynchronously, after the process has exited: close() alone
+     * leaves it listening for a moment, so a restarted server cannot bind and clients
+     * connect to a listener nobody accepts from. shutdown() stops listening now. */
+    shutdown(lfd, SHUT_RDWR);
     close(lfd);
     pthread_mutex_lock(&work_lock);
     work_stop = true;

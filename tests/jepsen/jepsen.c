@@ -494,13 +494,33 @@ static int check(uint32_t final[NSERIES][NKEYS])
 
 static void final_state(uint32_t final[NSERIES][NKEYS])
 {
-    tsdbc *c = connect_retry();
+    /* not connect_retry(): that gives up once `stop` is set, which it is by now */
+    tsdbc *c = NULL;
+    for (int i = 0; i < 1000 && tsdbc_connect("127.0.0.1", port, &c) != 0; i++)
+        usleep(10000);
+    if (!c) {
+        fprintf(stderr, "jepsen: cannot connect for the final read\n");
+        stop_server(SIGTERM);
+        exit(2);
+    }
     for (int s = 0; s < NSERIES; s++) {
         memset(final[s], 0, sizeof final[s]);
         tsdb_points p;
         int rc = tsdbc_query_points(c, ids[s], INT64_MIN, INT64_MAX, &p);
         if (rc != 0) {
             fprintf(stderr, "jepsen: final read of series %d failed: %s\n", s, tsdbc_strerror(rc));
+            int st;
+            pid_t pid = atomic_load(&server_pid);
+            usleep(200000);
+            if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
+                if (WIFSIGNALED(st))
+                    fprintf(stderr, "jepsen: server %d was killed by signal %d\n", (int)pid, WTERMSIG(st));
+                else
+                    fprintf(stderr, "jepsen: server %d exited with %d\n", (int)pid, WEXITSTATUS(st));
+                atomic_store(&server_pid, 0);
+            } else {
+                fprintf(stderr, "jepsen: server %d is still running\n", (int)pid);
+            }
             stop_server(SIGTERM); /* no orphan server */
             exit(2);
         }
