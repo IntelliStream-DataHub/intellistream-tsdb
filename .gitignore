@@ -1,0 +1,10 @@
+# build output
+/build/
+*.o
+*.a
+*.so
+
+# test and benchmark leftovers
+core
+core.*
+perf.data*
