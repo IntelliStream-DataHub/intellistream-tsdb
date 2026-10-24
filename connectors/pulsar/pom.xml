@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>ai.intellistream</groupId>
+  <artifactId>tsdb-pulsar-sink</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>nar</packaging>
+
+  <name>tsdb-pulsar-sink</name>
+  <description>Apache Pulsar 5 IO sink that writes points into tsdbd</description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>17</maven.compiler.release>
+    <!-- Pinned exactly: the connector is built and tested against Pulsar 5.0.0 LTS. -->
+    <pulsar.version>5.0.0</pulsar.version>
+    <tsdb-client.version>0.1.0-SNAPSHOT</tsdb-client.version>
+    <jackson.version>2.18.2</jackson.version>
+    <junit.version>5.13.1</junit.version>
+    <!-- The tests that need a real server start this binary; override with -Dtsdbd=... -->
+    <tsdbd>${project.basedir}/../../build/tsdbd</tsdbd>
+  </properties>
+
+  <dependencies>
+    <!-- The Pulsar IO runtime provides these; they must not be packed into the NAR. -->
+    <dependency>
+      <groupId>org.apache.pulsar</groupId>
+      <artifactId>pulsar-io-core</artifactId>
+      <version>${pulsar.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.pulsar</groupId>
+      <artifactId>pulsar-functions-api</artifactId>
+      <version>${pulsar.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.pulsar</groupId>
+      <artifactId>pulsar-client-api</artifactId>
+      <version>${pulsar.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.pulsar</groupId>
+      <artifactId>pulsar-client-api-v5</artifactId>
+      <version>${pulsar.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>ai.intellistream</groupId>
+      <artifactId>tsdb-client</artifactId>
+      <version>${tsdb-client.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>2.0.16</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.14.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>-Xlint:all,-processing,-classfile</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.3</version>
+        <configuration>
+          <systemPropertyVariables>
+            <tsdbd>${tsdbd}</tsdbd>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.12.0</version>
+        <configuration>
+          <doclint>all,-missing</doclint>
+          <failOnWarnings>true</failOnWarnings>
+          <quiet>true</quiet>
+        </configuration>
+      </plugin>
+      <!-- Packs the connector and its dependencies (tsdb-client, zstd-jni, Jackson) into the NAR Pulsar loads. -->
+      <plugin>
+        <groupId>org.apache.nifi</groupId>
+        <artifactId>nifi-nar-maven-plugin</artifactId>
+        <version>1.5.0</version>
+        <extensions>true</extensions>
+        <configuration>
+          <finalName>${project.artifactId}-${project.version}</finalName>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- The integration driver produces and verifies with the Pulsar 5 (v5 API) client; see test/integration.sh. -->
+    <profile>
+      <id>integration</id>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.pulsar</groupId>
+          <artifactId>pulsar-client-v5</artifactId>
+          <version>${pulsar.version}</version>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+    </profile>
+  </profiles>
+</project>

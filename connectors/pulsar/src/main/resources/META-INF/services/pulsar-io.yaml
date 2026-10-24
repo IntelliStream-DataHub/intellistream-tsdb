@@ -1,0 +1,4 @@
+name: tsdb
+description: Writes points from Pulsar topics into tsdbd, the tsdb time series server; acks only what tsdb made durable
+sinkClass: ai.intellistream.tsdb.pulsar.TsdbSink
+sinkConfigClass: ai.intellistream.tsdb.pulsar.TsdbSinkConfig
