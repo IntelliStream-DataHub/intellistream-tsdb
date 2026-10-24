@@ -42,6 +42,7 @@ static bool rec_ok(const uint8_t *rec, uint64_t off)
 
 static int ret_put_locked(eng *db, uint32_t series, int64_t limit)
 {
+    atomic_fetch_add(&db->ret_gen, 1);
     if (series >= db->ret_cap) {
         uint32_t cap = db->ret_cap ? db->ret_cap : 1024;
         while (cap <= series)
@@ -132,6 +133,10 @@ void ret_close(eng *db)
 void ret_clock_init(eng *db)
 {
     int64_t floor = 0;
+    if (db->opt.clock_ms) { /* a test clock: part mtimes are on another time line */
+        atomic_store(&db->clock_floor, floor);
+        return;
+    }
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < db->nparts; i++)
         floor = MAX(floor, (int64_t)db->parts[i]->created * 1000);

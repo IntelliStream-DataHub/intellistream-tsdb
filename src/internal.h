@@ -422,6 +422,8 @@ typedef struct part {
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
+    uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
+    int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
     char pending[64];     /* tmp file name while the part awaits parts_commit, else "" */
 } part;
@@ -648,8 +650,8 @@ struct eng {
     uint64_t ret_off;
     bool ret_broken;
     atomic_int_fast64_t clock_floor; /* now never goes below this */
-    int64_t last_ttl_ms;             /* merge thread: last scan for expired rows (under lock) */
-    atomic_uint tomb_parts;          /* listed parts that hold tombstones (stats) */
+    atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
+    int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
     pool *qpool;
 
     /* memtable and WAL (memtable.c) */
@@ -806,6 +808,8 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms);
 int eng_delete_range(eng *db, uint32_t series, int64_t start, int64_t end);
 int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
                       const void *v, size_t n);
-int ttl_select_locked(eng *db, part **sel); /* merge.c: a part to rewrite for retention, or a partition to drop */
+/* merge.c: drops partitions every series of which has expired (sets *dropped) and selects a part to rewrite
+ * without its expired rows (returns 1, sel[0] marked merging and referenced); caller holds db->lock */
+size_t ttl_select_locked(eng *db, part **sel, bool *dropped);
 
 #endif
