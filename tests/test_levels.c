@@ -491,12 +491,16 @@ static void run(rec *r, codec_ctx *c)
          * 2^63 + 2^62 past 0, so dt and ts - t0 reach 2^63 and more and only an unsigned conversion is right. */
         int64_t *ts = malloc((x->n + 1) * sizeof *ts);
         uint64_t *sl = malloc((x->n + 1) * sizeof *sl);
-        for (int wide = 0; wide < 2; wide++) {
-            uint64_t z = 0x9e3779b97f4a7c15u * (uint64_t)(x->n + 1), t = wide ? (uint64_t)INT64_MIN + 10000 : 1ull << 62;
+        /* and one with every gap below 2^52, where the SSE and AVX TWA kernels keep their cheap conversion */
+        for (int wide = 0; wide < 3; wide++) {
+            uint64_t z = 0x9e3779b97f4a7c15u * (uint64_t)(x->n + 1);
+            uint64_t t = wide == 1 ? (uint64_t)INT64_MIN + 10000 : 1ull << 62;
             for (size_t i = 0; i < x->n; i++) {
                 z = z * 6364136223846793005u + 1442695040888963407u;
                 uint64_t r = z >> 11;
-                if (wide)
+                if (wide == 2)
+                    t += r % 997;
+                else if (wide)
                     t += i == x->n / 2 ? (1ull << 63) + (1ull << 62) : 1 + r % 997;
                 else
                     t += 1 + (r % 61 == 0 ? (r << 3) | (1ull << 55) | 1 : r % 997);
@@ -507,7 +511,7 @@ static void run(rec *r, codec_ctx *c)
                 granule g;
                 memset(&g, 0, sizeof g);
                 granule_twa(x->type, ts, x->v, m, &g);
-                snprintf(what, sizeof what, "granule_twa %zu%s", m, wide ? " wide" : "");
+                snprintf(what, sizeof what, "granule_twa %zu%s", m, wide == 1 ? " wide" : wide ? " narrow" : "");
                 put(r, what, x->name, &g, sizeof g);
                 if (!m)
                     continue;
@@ -519,14 +523,14 @@ static void run(rec *r, codec_ctx *c)
                     simd_twa(x->type, ts, x->v, m, &o2);
                     if (memcmp(&o1, &o2, sizeof o1) != 0) {
                         fprintf(stderr, "%s, %zu points%s: the short TWA path differs from the kernel %s\n",
-                                x->name, m, wide ? " wide" : "", simd_name());
+                                x->name, m, wide == 1 ? " wide" : wide ? " narrow" : "", simd_name());
                         failures++;
                     }
                 }
                 size_t k[2] = {
                     lttb_argmax(x->type, ts, sl, m, ts[0] - 5000, 0, 1.5, (double)(t - (uint64_t)ts[0]), -3),
                     lttb_argmax(x->type, ts, sl, m, ts[0], -7, 1, 1e6, 1)};
-                snprintf(what, sizeof what, "lttb_argmax %zu%s", m, wide ? " wide" : "");
+                snprintf(what, sizeof what, "lttb_argmax %zu%s", m, wide == 1 ? " wide" : wide ? " narrow" : "");
                 put(r, what, x->name, k, sizeof k);
             }
         }

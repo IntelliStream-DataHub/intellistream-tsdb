@@ -484,8 +484,13 @@ typedef struct twa_sums {
     uint64_t sms, lms, gap;
 } twa_sums;
 extern void (*simd_twa)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o);
-/* simd_twa, or for at most SIMD_LANES_F64 points the same sums without the kernels' setup (n >= 1) */
-void simd_twa_run(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o);
+/* the same sums for at most simd_twa_max points (n >= 1) without the setup of simd_twa's long loop */
+extern void (*simd_twa_small)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o);
+extern size_t simd_twa_max;
+static inline void simd_twa_run(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    (n > simd_twa_max ? simd_twa : simd_twa_small)(type, ts, v, n, o);
+}
 
 typedef struct part_header {
     char magic[8];

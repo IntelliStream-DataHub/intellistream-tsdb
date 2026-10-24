@@ -672,8 +672,9 @@ KI __m128d KN(twa_ld)(int type, const void *v, size_t p, __m128i *ok)
     }
 }
 
-/* TWA: segment s into lane s % 16, as twa_avx2_impl; lanes 2q, 2q + 1 in vector q */
-KI void KN(twa_impl)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+/* TWA: segment s into lane s % 16, as twa_avx2_impl; lanes 2q, 2q + 1 in vector q. Exact for any timestamps:
+ * the fallback of KN(twa_impl) below, which takes gaps below 2^52 only. */
+KI void KN(twa_exact)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
 {
     const __m128i bias = _mm_set1_epi64x(INT64_MIN);
     const __m128d half = _mm_set1_pd(0.5);
@@ -708,6 +709,256 @@ KI void KN(twa_impl)(int type, const int64_t *ts, const void *v, size_t n, twa_s
     _mm_storeu_si128((__m128i *)g, _mm_xor_si128(gf, bias));
     *o = (twa_sums){.sms = a[0] + a[1], .lms = b[0] + b[1], .gap = g[0] > g[1] ? g[0] : g[1]};
     twa_tail(type, ts, v, s, n, sl, ll, o, L64);
+}
+
+
+/*
+ * TWA as above with less work per point, for any n >= 2 (simd_twa_run sends short granules here too): each
+ * value is converted once, the segment's end values come from two neighbouring vectors by a shuffle, and the
+ * gaps take the cheap conversion of integers below 2^52 (OR into 2^52's mantissa, subtract) and MAXPD for the
+ * longest. A granule with a gap of 2^52 ms or more (timestamps out of order, or a jump of 142,000 years), seen
+ * in the OR of all gaps, is done again by KN(twa_exact): the same bits either way. A short granule's lanes stay
+ * in registers and reduce from the smallest power of two that holds its segments: the lanes beyond add +0.0,
+ * which changes nothing as no lane is ever -0.0 (simd.c, short runs). Lanes 2q, 2q + 1 in vector q.
+ */
+/* points p, p + 1 as doubles and their null masks (all ones where null); KN(twa_cv1) point p alone, lane 1 null */
+KI __m128d KN(twa_cv)(int type, const void *v, size_t p, __m128i *eq)
+{
+    switch (type) {
+    case TSDB_FLOAT32: {
+        __m128i b = _mm_loadl_epi64((const __m128i *)((const uint32_t *)v + p));
+        *eq = _mm_cvtepi32_epi64(_mm_cmpeq_epi32(b, _mm_set1_epi32((int)NULL_F32)));
+        return _mm_cvtps_pd(_mm_castsi128_ps(b));
+    }
+    case TSDB_FLOAT64: {
+        __m128i b = _mm_loadu_si128((const __m128i *)((const uint64_t *)v + p));
+        *eq = _mm_cmpeq_epi64(b, _mm_set1_epi64x((long long)NULL_F64));
+        return _mm_castsi128_pd(b);
+    }
+    case TSDB_INT64: {
+        __m128i b = _mm_loadu_si128((const __m128i *)((const int64_t *)v + p));
+        *eq = _mm_cmpeq_epi64(b, _mm_set1_epi64x(NULL_I64));
+        return KN(i64_pd)(b);
+    }
+    default: { /* (double)u as (double)(int32_t)(u - 2^31) + 2^31, both exact */
+        __m128i b = _mm_loadl_epi64((const __m128i *)((const uint32_t *)v + p));
+        *eq = _mm_cvtepi32_epi64(_mm_cmpeq_epi32(b, _mm_set1_epi32((int)NULL_BOOL)));
+        return _mm_add_pd(_mm_cvtepi32_pd(_mm_xor_si128(b, _mm_set1_epi32(INT32_MIN))), _mm_set1_pd(0x1p31));
+    }
+    }
+}
+
+KI __m128d KN(twa_cv1)(int type, const void *v, size_t p, __m128i *eq)
+{
+    const __m128i hi = _mm_set_epi64x(-1, 0);
+    switch (type) {
+    case TSDB_FLOAT32: {
+        __m128i b = _mm_cvtsi32_si128((int)((const uint32_t *)v)[p]);
+        *eq = _mm_or_si128(_mm_cvtepi32_epi64(_mm_cmpeq_epi32(b, _mm_set1_epi32((int)NULL_F32))), hi);
+        return _mm_cvtps_pd(_mm_castsi128_ps(b));
+    }
+    case TSDB_FLOAT64: {
+        __m128i b = _mm_loadl_epi64((const __m128i *)((const uint64_t *)v + p));
+        *eq = _mm_or_si128(_mm_cmpeq_epi64(b, _mm_set1_epi64x((long long)NULL_F64)), hi);
+        return _mm_castsi128_pd(b);
+    }
+    case TSDB_INT64: {
+        __m128i b = _mm_loadl_epi64((const __m128i *)((const int64_t *)v + p));
+        *eq = _mm_or_si128(_mm_cmpeq_epi64(b, _mm_set1_epi64x(NULL_I64)), hi);
+        return KN(i64_pd)(b);
+    }
+    default: {
+        __m128i b = _mm_cvtsi32_si128((int)((const uint32_t *)v)[p]);
+        *eq = _mm_or_si128(_mm_cvtepi32_epi64(_mm_cmpeq_epi32(b, _mm_set1_epi32((int)NULL_BOOL))), hi);
+        return _mm_add_pd(_mm_cvtepi32_pd(_mm_xor_si128(b, _mm_set1_epi32(INT32_MIN))), _mm_set1_pd(0x1p31));
+    }
+    }
+}
+
+typedef struct {
+    __m128i sms, lms, dtor; /* the milliseconds, and the OR of all gaps */
+    __m128d gmax;           /* the longest gap, exact while dtor stays below 2^52 */
+} KN(twa_acc);
+
+/* the two segments from vp (null where eqp) to x (null where eqx) over gaps dt into lane vectors st, li */
+KI void KN(twa_seg)(__m128d vp, __m128i eqp, __m128d x, __m128i eqx, __m128i dt, __m128d *st, __m128d *li,
+                    KN(twa_acc) *a)
+{
+    __m128d d = _mm_sub_pd(_mm_castsi128_pd(_mm_or_si128(dt, _mm_castpd_si128(_mm_set1_pd(0x1p52)))),
+                           _mm_set1_pd(0x1p52));
+    __m128i nb = _mm_or_si128(eqp, eqx);
+    a->dtor = _mm_or_si128(a->dtor, dt);
+    a->gmax = _mm_max_pd(a->gmax, d);
+    *st = _mm_add_pd(*st, _mm_andnot_pd(_mm_castsi128_pd(eqp), _mm_mul_pd(vp, d)));
+    *li = _mm_add_pd(*li, _mm_andnot_pd(_mm_castsi128_pd(nb),
+                                        _mm_mul_pd(_mm_mul_pd(_mm_add_pd(vp, x), _mm_set1_pd(0.5)), d)));
+    a->sms = _mm_add_epi64(a->sms, _mm_andnot_si128(eqp, dt));
+    a->lms = _mm_add_epi64(a->lms, _mm_andnot_si128(nb, dt));
+}
+
+/* segments [s, n - 1), at most 2Q of them, into vectors 0 .. Q - 1; c, eqc: points s, s + 1 (point s + 1 only
+ * if it exists), each point converted once */
+KI void KN(twa_pairs)(int type, const int64_t *ts, const void *v, size_t s, size_t n, __m128d *st, __m128d *li,
+                      KN(twa_acc) *a, __m128d c, __m128i eqc, const int Q)
+{
+    _Pragma("GCC unroll 8") for (int q = 0; q < Q; q++)
+    {
+        size_t p = s + 2 * (size_t)q;
+        if (p + 1 >= n)
+            break;
+        __m128i eqn, dt, eqp = eqc;
+        __m128d nx;
+        if (p + 3 < n)
+            nx = KN(twa_cv)(type, v, p + 2, &eqn);
+        else if (p + 2 < n)
+            nx = KN(twa_cv1)(type, v, p + 2, &eqn);
+        else {
+            nx = _mm_setzero_pd();
+            eqn = _mm_set1_epi64x(-1);
+        }
+        __m128i eqx = _mm_alignr_epi8(eqn, eqc, 8);
+        if (p + 2 < n)
+            dt = _mm_sub_epi64(_mm_loadu_si128((const __m128i *)(ts + p + 1)),
+                               _mm_loadu_si128((const __m128i *)(ts + p)));
+        else { /* one segment: the second lane is none */
+            dt = _mm_sub_epi64(_mm_loadl_epi64((const __m128i *)(ts + p + 1)),
+                               _mm_loadl_epi64((const __m128i *)(ts + p)));
+            eqp = _mm_or_si128(eqp, _mm_set_epi64x(-1, 0));
+        }
+        KN(twa_seg)(c, eqp, _mm_shuffle_pd(c, nx, 1), eqx, dt, &st[q], &li[q], a);
+        c = nx;
+        eqc = eqn;
+    }
+}
+
+/* the halving from Q vectors (2Q lanes), then the sums out of a */
+KI void KN(twa_out)(__m128d *st, __m128d *li, const KN(twa_acc) *a, twa_sums *o, const int Q)
+{
+    _Pragma("GCC unroll 4") for (int w = Q / 2; w >= 1; w /= 2)
+        _Pragma("GCC unroll 4") for (int j = 0; j < w; j++)
+    {
+        st[j] = _mm_add_pd(st[j], st[j + w]);
+        li[j] = _mm_add_pd(li[j], li[j + w]);
+    }
+    __m128i sm = _mm_add_epi64(a->sms, _mm_unpackhi_epi64(a->sms, a->sms));
+    __m128i lm = _mm_add_epi64(a->lms, _mm_unpackhi_epi64(a->lms, a->lms));
+    double g = _mm_cvtsd_f64(_mm_max_sd(a->gmax, _mm_unpackhi_pd(a->gmax, a->gmax)));
+    *o = (twa_sums){.sms = (uint64_t)_mm_cvtsi128_si64(sm),
+                    .lms = (uint64_t)_mm_cvtsi128_si64(lm),
+                    .gap = (uint64_t)g,
+                    .step = canon_nan(_mm_cvtsd_f64(_mm_add_sd(st[0], _mm_unpackhi_pd(st[0], st[0])))),
+                    .lin = canon_nan(_mm_cvtsd_f64(_mm_add_sd(li[0], _mm_unpackhi_pd(li[0], li[0]))))};
+}
+
+KI bool KN(twa_wide)(const KN(twa_acc) *a)
+{
+    return !_mm_testz_si128(a->dtor, _mm_set1_epi64x((long long)(~0ull << 52)));
+}
+
+/* KN(twa_exact) for any type, out of line: the rare fallback stays out of the callers' frames */
+__attribute__((target(KTARGET), noinline, cold)) static void KN(twa_exact_any)(int type, const int64_t *ts,
+                                                                               const void *v, size_t n,
+                                                                               twa_sums *o)
+{
+    switch (type) {
+    case TSDB_FLOAT32: KN(twa_exact)(TSDB_FLOAT32, ts, v, n, o); break;
+    case TSDB_FLOAT64: KN(twa_exact)(TSDB_FLOAT64, ts, v, n, o); break;
+    case TSDB_INT64: KN(twa_exact)(TSDB_INT64, ts, v, n, o); break;
+    default: KN(twa_exact)(TSDB_BOOL, ts, v, n, o); break;
+    }
+}
+
+/* one per number of vectors Q, so that the lane arrays have their exact size and stay in registers */
+#define KTWA_Q(Q)                                                                                                     \
+    KI void KCAT(KN(twa_q), Q)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)                 \
+    {                                                                                                                 \
+        __m128d st[Q], li[Q];                                                                                         \
+        KN(twa_acc) a = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_pd()};          \
+        for (int q = 0; q < Q; q++)                                                                                   \
+            st[q] = li[q] = _mm_setzero_pd();                                                                         \
+        __m128i eqc;                                                                                                  \
+        __m128d c = KN(twa_cv)(type, v, 0, &eqc);                                                                     \
+        KN(twa_pairs)(type, ts, v, 0, n, st, li, &a, c, eqc, Q);                                                      \
+        if (KN(twa_wide)(&a))                                                                                         \
+            KN(twa_exact_any)(type, ts, v, n, o);                                                                     \
+        else                                                                                                          \
+            KN(twa_out)(st, li, &a, o, Q);                                                                            \
+    }
+KTWA_Q(1)
+KTWA_Q(2)
+KTWA_Q(4)
+KTWA_Q(8)
+#undef KTWA_Q
+
+/* 10 to 17 points: their eight vectors of each sum stay in memory; out of line, so that the shorter ones do not
+ * pay for that frame */
+__attribute__((target(KTARGET), noinline)) static void KN(twa_q8_any)(int type, const int64_t *ts, const void *v,
+                                                                      size_t n, twa_sums *o)
+{
+    switch (type) {
+    case TSDB_FLOAT32: KCAT(KN(twa_q), 8)(TSDB_FLOAT32, ts, v, n, o); break;
+    case TSDB_FLOAT64: KCAT(KN(twa_q), 8)(TSDB_FLOAT64, ts, v, n, o); break;
+    case TSDB_INT64: KCAT(KN(twa_q), 8)(TSDB_INT64, ts, v, n, o); break;
+    default: KCAT(KN(twa_q), 8)(TSDB_BOOL, ts, v, n, o); break;
+    }
+}
+
+/* at most L64 + 1 points */
+KI void KN(twa_few)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    if (n < 2)
+        *o = (twa_sums){0};
+    else if (n <= 3)
+        KCAT(KN(twa_q), 1)(type, ts, v, n, o);
+    else if (n <= 5)
+        KCAT(KN(twa_q), 2)(type, ts, v, n, o);
+    else if (n <= 9)
+        KCAT(KN(twa_q), 4)(type, ts, v, n, o);
+    else
+        KN(twa_q8_any)(type, ts, v, n, o);
+}
+
+KI void KN(twa_impl)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    if (n <= L64 + 1) {
+        KN(twa_few)(type, ts, v, n, o);
+        return;
+    }
+    __m128d st[8], li[8];
+    KN(twa_acc) a = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_pd()};
+    for (int q = 0; q < 8; q++)
+        st[q] = li[q] = _mm_setzero_pd();
+    __m128i eqc;
+    __m128d c = KN(twa_cv)(type, v, 0, &eqc);
+    size_t s = 0;
+    for (; s + L64 + 2 <= n; s += L64)
+        _Pragma("GCC unroll 8") for (int q = 0; q < 8; q++)
+        {
+            size_t p = s + 2 * (size_t)q;
+            __m128i dt = _mm_sub_epi64(_mm_loadu_si128((const __m128i *)(ts + p + 1)),
+                                       _mm_loadu_si128((const __m128i *)(ts + p)));
+            __m128i eqn;
+            __m128d nx = KN(twa_cv)(type, v, p + 2, &eqn);
+            KN(twa_seg)(c, eqc, _mm_shuffle_pd(c, nx, 1), _mm_alignr_epi8(eqn, eqc, 8), dt, &st[q], &li[q], &a);
+            c = nx;
+            eqc = eqn;
+        }
+    KN(twa_pairs)(type, ts, v, s, n, st, li, &a, c, eqc, 8);
+    if (KN(twa_wide)(&a))
+        KN(twa_exact_any)(type, ts, v, n, o);
+    else
+        KN(twa_out)(st, li, &a, o, 8);
+}
+
+/* the short granules (at most L64 + 1 points: simd_twa_small), without the long loop's frame */
+KF void KN(twa_short)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    switch (type) {
+    case TSDB_FLOAT32: KN(twa_few)(TSDB_FLOAT32, ts, v, n, o); break;
+    case TSDB_FLOAT64: KN(twa_few)(TSDB_FLOAT64, ts, v, n, o); break;
+    case TSDB_INT64: KN(twa_few)(TSDB_INT64, ts, v, n, o); break;
+    default: KN(twa_few)(TSDB_BOOL, ts, v, n, o); break;
+    }
 }
 
 KF void KN(twa)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)

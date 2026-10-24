@@ -1193,12 +1193,8 @@ INL void twa_small_impl(int type, const int64_t *ts, const void *v, size_t n, tw
     }
 }
 
-void simd_twa_run(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+static void twa_small(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
 {
-    if (n > L64) {
-        simd_twa(type, ts, v, n, o);
-        return;
-    }
     switch (type) {
     case TSDB_FLOAT32: twa_small_impl(TSDB_FLOAT32, ts, v, n, o); break;
     case TSDB_FLOAT64: twa_small_impl(TSDB_FLOAT64, ts, v, n, o); break;
@@ -1384,6 +1380,9 @@ __attribute__((target("avx512f,avx512dq"))) static void twa_avx512(int type, con
 #endif
 
 void (*simd_twa)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o) = twa_scalar;
+void (*simd_twa_small)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o) = twa_small;
+/* twa_small's limit; the SSE and AVX sets have a short path of their own, with L64 + 1 points in its vectors */
+size_t simd_twa_max = L64;
 
 /* ---------------------------------------------------------------- LTTB */
 
@@ -1666,7 +1665,8 @@ void simd_select(int level)
         lttb_scalar;
     void (*sf32)(const float *, size_t, bool, agg_state *, agg_dev *) = small_f32_scalar;
     void (*sf64)(const double *, size_t, bool, agg_state *, agg_dev *) = small_f64_scalar;
-    size_t shortn = SIMD_SHORT;
+    void (*twa_s)(int, const int64_t *, const void *, size_t, twa_sums *) = twa_small;
+    size_t shortn = SIMD_SHORT, twa_max = L64;
     const char *name = "scalar";
 #ifdef TSDB_X86
     static const char *const names[] = {"scalar", "sse", "avx", "avx2", "avx512"};
@@ -1717,6 +1717,8 @@ void simd_select(int level)
         i64 = fold_i64_avx;
         u32 = fold_u32_avx;
         twa = twa_avx;
+        twa_s = twa_short_avx;
+        twa_max = L64 + 1;
         lttb = lttb_avx;
         name = "avx";
         break;
@@ -1730,6 +1732,8 @@ void simd_select(int level)
         i64 = fold_i64_sse;
         u32 = fold_u32_sse;
         twa = twa_sse;
+        twa_s = twa_short_sse;
+        twa_max = L64 + 1;
         lttb = lttb_sse;
         name = "sse";
         break;
@@ -1742,6 +1746,8 @@ void simd_select(int level)
     simd_fold_i64 = i64;
     simd_fold_u32 = u32;
     simd_twa = twa;
+    simd_twa_small = twa_s;
+    simd_twa_max = twa_max;
     simd_lttb = lttb;
     simd_small_f32 = sf32;
     simd_small_f64 = sf64;
