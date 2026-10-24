@@ -115,7 +115,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         return rc;
 
     part_list rows = {0}, all = {0};
-    if (n && (rc = insert_rows(db, st, NULL, series, ts, v, n, 0, &rows)) != 0) {
+    if (n && (rc = insert_rows(db, st, NULL, series, ts, v, n, 0, &rows, true)) != 0) {
         parts_discard(db, rows.p, rows.n);
         free(rows.p);
         return rc;

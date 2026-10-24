@@ -18,23 +18,28 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/random.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_NAME 32767
 #define REC_HDR 8
+/* Names per dictionary: ids stay below 2^31, and the table (twice as many slots) stays addressable by a size_t
+   without wrapping. A create beyond is refused before its record is written; a file with more is damage. */
+#define DICT_MAX_NAMES ((1u << 31) - 1)
 
-static uint32_t name_hash(const char *s, size_t len) { return (uint32_t)xxh64(s, len, 0x5e71e5); }
+static size_t name_hash(const series_dict *d, const char *s, size_t len) { return (size_t)xxh64(s, len, d->seed); }
 
 static int table_grow(series_dict *d)
 {
-    uint32_t cap = d->tcap ? d->tcap * 2 : 1024;
+    size_t cap = d->tcap ? d->tcap * 2 : 1024;
     uint32_t *t = calloc(cap, sizeof *t);
     if (!t)
         return TSDB_ERR_NOMEM;
     uint32_t n = atomic_load(&d->count);
     for (uint32_t id = 0; id < n; id++) {
-        uint32_t h = name_hash(d->names[id], strlen(d->names[id])) & (cap - 1);
+        size_t h = name_hash(d, d->names[id], strlen(d->names[id])) & (cap - 1);
         while (t[h])
             h = (h + 1) & (cap - 1);
         t[h] = id + 1;
@@ -45,9 +50,9 @@ static int table_grow(series_dict *d)
     return 0;
 }
 
-static int64_t table_find(const series_dict *d, const char *name, size_t len, uint32_t *slot)
+static int64_t table_find(const series_dict *d, const char *name, size_t len, size_t *slot)
 {
-    uint32_t h = name_hash(name, len) & (d->tcap - 1);
+    size_t h = name_hash(d, name, len) & (d->tcap - 1);
     while (d->table[h]) {
         uint32_t id = d->table[h] - 1;
         if (strcmp(d->names[id], name) == 0)
@@ -62,10 +67,12 @@ static int64_t table_find(const series_dict *d, const char *name, size_t len, ui
 static int dict_add(series_dict *d, const char *name, size_t len, int type, uint32_t *id)
 {
     uint32_t n = atomic_load(&d->count);
+    if (n >= DICT_MAX_NAMES)
+        return TSDB_ERR_CORRUPT; /* series_get refuses such a create, so only a damaged or crafted file has more */
     if ((uint64_t)(n + 1) * 2 > d->tcap && table_grow(d) != 0)
         return TSDB_ERR_NOMEM;
     if (n == d->cap) {
-        uint32_t cap = d->cap ? d->cap * 2 : 256;
+        size_t cap = d->cap ? d->cap * 2 : 256;
         char **names = realloc(d->names, cap * sizeof *names);
         if (!names)
             return TSDB_ERR_NOMEM;
@@ -81,7 +88,7 @@ static int dict_add(series_dict *d, const char *name, size_t len, int type, uint
         return TSDB_ERR_NOMEM;
     memcpy(copy, name, len);
     copy[len] = '\0';
-    uint32_t slot = 0;
+    size_t slot = 0;
     table_find(d, copy, len, &slot);
     d->names[n] = copy;
     d->types[n] = (uint8_t)type;
@@ -145,6 +152,8 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
 {
     memset(d, 0, sizeof *d);
     pthread_mutex_init(&d->lock, NULL);
+    if (getrandom(&d->seed, sizeof d->seed, GRND_NONBLOCK) != sizeof d->seed)
+        d->seed = xxh64(&d, sizeof d, (uint64_t)time(NULL) ^ (uint64_t)getpid()); /* no entropy yet: still not public */
     d->file = file;
     d->fsync = fsync;
     d->fd = openat(dirfd, file, (read_only ? O_RDONLY : O_RDWR | O_CREAT | O_APPEND) | O_CLOEXEC, 0644);
@@ -239,7 +248,7 @@ int series_get(series_dict *d, const char *name, bool create, int type, uint32_t
     if (len == 0 || len > MAX_NAME || (create && !type_valid(type)))
         return TSDB_ERR_INVALID;
     pthread_mutex_lock(&d->lock);
-    uint32_t slot;
+    size_t slot;
     int64_t found = table_find(d, name, len, &slot);
     int rc = 0;
     if (found >= 0) {
@@ -252,6 +261,8 @@ int series_get(series_dict *d, const char *name, bool create, int type, uint32_t
         rc = TSDB_ERR_READONLY;
     } else if (d->broken) {
         rc = TSDB_ERR_IO; /* a record after a torn one would be lost at the next open, yet acknowledged */
+    } else if (atomic_load(&d->count) >= DICT_MAX_NAMES) {
+        rc = TSDB_ERR_INVALID; /* full: checked before the record is written, or every open would fail on it */
     } else {
         size_t size = rec_size(len);
         uint8_t *rec = calloc(1, size);

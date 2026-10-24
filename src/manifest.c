@@ -204,6 +204,12 @@ static int manifest_read(eng *db, manifest *m)
             fields += sscanf(line, "wal_flushed %" SCNu64, &m->wal_flushed) == 1;
             fields += sscanf(line, "wal_active %" SCNu64, &m->wal_active) == 1;
             if (sscanf(line, "parts %zu", &nparts) == 1) {
+                /* the checksum is no authentication: a crafted count must not wrap the calloc below. Every part
+                   takes a line of its own, so more parts than bytes is damage, and so is a second count */
+                if (m->parts || nparts > size) {
+                    manifest_free(m);
+                    return TSDB_ERR_CORRUPT;
+                }
                 fields++;
                 m->parts = calloc(nparts + 1, sizeof *m->parts);
                 if (!m->parts) {

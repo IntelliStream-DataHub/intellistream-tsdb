@@ -154,9 +154,12 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
         goto fail;
     p->grows = h.granule_rows;
     p->wal_seq = h.wal_seq;
-    uint64_t index_end = f.index_off + (uint64_t)f.ngranules * sizeof(granule);
-    if (f.index_off % 8 != 0 || f.index_off < sizeof h || index_end + sizeof f > (uint64_t)size)
+    /* checked without wrapping: the hash is no authentication, and a crafted index_off near 2^64 would otherwise
+       make part_hash read before the mapping */
+    if (f.index_off % 8 != 0 || f.index_off < sizeof h || f.index_off > (uint64_t)size - sizeof f ||
+        (uint64_t)f.ngranules * sizeof(granule) > (uint64_t)size - sizeof f - f.index_off)
         goto fail;
+    uint64_t index_end = f.index_off + (uint64_t)f.ngranules * sizeof(granule);
     size_t tlen = (size_t)((uint64_t)size - sizeof f - index_end);
     if (part_hash(&h, p->map + f.index_off, (size_t)f.ngranules * sizeof(granule), p->map + index_end, tlen, &f) !=
             f.index_hash ||
@@ -195,7 +198,7 @@ atomic_uint_fast64_t granule_checks;
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, bool verify)
 {
     uint64_t len = (uint64_t)g->ts_len + g->val_len;
-    if (g->off < sizeof(part_header) || g->off + len > p->index_off || g->count == 0 ||
+    if (g->off < sizeof(part_header) || g->off > p->index_off || len > p->index_off - g->off || g->count == 0 ||
         g->count > p->grows)
         return TSDB_ERR_CORRUPT;
     const uint8_t *blk = p->map + g->off;
@@ -357,7 +360,7 @@ int pw_copy_granule(part_writer *w, const part *src, const granule *g)
     if (rc)
         return rc;
     size_t len = (size_t)g->ts_len + g->val_len;
-    if (g->off + len > src->index_off)
+    if (g->off < sizeof(part_header) || g->off > src->index_off || len > src->index_off - g->off)
         return TSDB_ERR_CORRUPT;
     if (w->len + len > w->cap && (rc = pw_flush(w)) != 0)
         return rc;
@@ -605,6 +608,21 @@ int parts_commit(eng *db, part **ps, size_t n)
     return 0;
 }
 
+/* An intent renames a part writer's tmp file to a part name, nothing else: the hash is no authentication, and a
+ * crafted intent must not rename over MANIFEST or SERIES, or pull a file in from another directory. */
+static bool intent_names_valid(const char *tmp, const char *fin)
+{
+    int a = 0, b = 0;
+    unsigned pid, seq, level;
+    int64_t partition;
+    uint64_t lo, hi;
+    if (strchr(tmp, '/') || strchr(fin, '/'))
+        return false;
+    return sscanf(tmp, "tmp_%u_%u.part%n", &pid, &seq, &a) == 2 && a > 0 && tmp[a] == '\0' &&
+           sscanf(fin, "p%" SCNd64 "_%" SCNu64 "_%" SCNu64 "_%u.part%n", &partition, &lo, &hi, &level, &b) == 4 &&
+           b > 0 && fin[b] == '\0';
+}
+
 /* Parses an intent into its n renames; false when it is torn or damaged. */
 static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[128], size_t *n)
 {
@@ -636,8 +654,7 @@ static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[1
         next = strchr(line, '\n');
         if (next)
             *next = '\0';
-        if (sscanf(line, "%95s %127s%c", (*tmp)[*n], (*fin)[*n], &extra) != 2 ||
-            strncmp((*tmp)[*n], "tmp_", 4) != 0 || strchr((*fin)[*n], '/'))
+        if (sscanf(line, "%95s %127s%c", (*tmp)[*n], (*fin)[*n], &extra) != 2 || !intent_names_valid((*tmp)[*n], (*fin)[*n]))
             return false;
         ++*n;
         if (!next)

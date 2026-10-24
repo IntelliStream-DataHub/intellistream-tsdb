@@ -301,6 +301,8 @@ int patas_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
         uint32_t v = load32(p) & (uint32_t)((1ull << (8 * nb)) - 1);
         p += nb;
         size_t j = i - 1 - ((i - 1 - ref) % RING);
+        if (UNLIKELY(j >= i)) /* a slot before the first value (as in chimp128_decode) */
+            return TSDB_ERR_CORRUPT;
         out[i] = out[j] ^ (v << tz);
     }
     return p == end ? 0 : TSDB_ERR_CORRUPT;

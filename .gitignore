@@ -1,6 +1,7 @@
 # build output
 /build/
 /build-tsan/
+/build-fuzz/
 /build-dist/
 *.o
 *.a
