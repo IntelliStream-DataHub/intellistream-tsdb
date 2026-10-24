@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tsdb-client"
+description = "Client for tsdbd, the TCP server of the tsdb time series database"
+requires-python = ">=3.9"
+dynamic = ["version"]
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
+
+[project.optional-dependencies]
+numpy = ["numpy"]
+test = ["pytest"]
+
+[tool.maturin]
+module-name = "tsdb_client"
+features = ["pyo3/extension-module"]

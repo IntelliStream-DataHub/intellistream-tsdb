@@ -7,7 +7,7 @@ else
 ARCH    ?= -march=native
 endif
 CFLAGS  ?= -O3 -g
-CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno $(ARCH) -Iinclude -fPIC
+override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno $(ARCH) -Iinclude -fPIC
 LDLIBS  += -lzstd -lpthread -lm
 
 SRC  := $(wildcard src/*.c)
@@ -39,9 +39,12 @@ test: build/test_tsdb build/test_server build/test_follow build/test_volumes bui
 	./build/test_volumes
 	./build/test_server
 
+# Without -march=native: with it, GCC 15.2's AddressSanitizer crashes in memcpy into
+# fake-stack frames (use-after-return detection), in code that did not change.
+# The runtime-dispatched AVX-512 kernels are still tested.
 asan:
 	$(MAKE) clean
-	$(MAKE) CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	$(MAKE) ARCH= CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
 	        LDFLAGS="-fsanitize=address,undefined" test
 
 build:
@@ -50,7 +53,24 @@ build:
 clean:
 	rm -rf build
 
-.PHONY: all test asan clean jepsen
+# Clients in other languages; not part of `make test`, so the C build needs no
+# cargo, Python or JDK. Each runs its tests against build/tsdbd.
+PYVENV ?= build/pyvenv
+
+test-rust: build/tsdbd
+	cd client/rust && cargo test
+
+test-python: build/tsdbd
+	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
+	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
+	    && $(abspath $(PYVENV))/bin/python -m pytest tests
+
+test-java: build/tsdbd
+	cd client/java && mvn -q test
+
+test-clients: test-rust test-python test-java
+
+.PHONY: all test asan clean jepsen test-rust test-python test-java test-clients
 
 build/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

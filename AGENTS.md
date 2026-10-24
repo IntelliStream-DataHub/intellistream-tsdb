@@ -11,6 +11,7 @@ make test                 # all unit, integration and server tests
 make asan                 # the tests under AddressSanitizer + UBSan
 make jepsen               # fault injection: kill -9, simulated power loss, pauses
 make PORTABLE=1           # without -march=native
+make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 ```
 
 Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only).
@@ -35,7 +36,9 @@ with `-fsanitize=thread`.
   queries, aggregation, bucketing. `src/manifest.c`: MANIFEST, retired parts, followers.
 - `src/codec*.c`: codecs; `src/simd.c`: dispatched aggregation kernels;
   `src/tz.c`: time zones (TZif and POSIX rules).
-- `server/tsdbd.c`: io_uring server. `client/`: client library (does not link the engine).
+- `server/tsdbd.c`: io_uring server. `client/`: C client library (does not link the engine);
+  `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
+  A protocol change has to reach all four; `make test-clients` runs their tests.
 - `tools/`: CLI and benchmarks. `tests/`: tests; `tests/jepsen/`: the
   fault-injection harness and the `crashfs` LD_PRELOAD power-loss simulator.
 
@@ -76,6 +79,7 @@ with `-fsanitize=thread`.
 - Match the surrounding code: 4-space indent, lines up to about 120
   characters, `snake_case`, errors as negative `TSDB_ERR_*` codes.
 - Comments say why, not what; file headers describe the design of the file.
+- Every bug fix comes with a regression test that fails without the fix.
 - New behaviour comes with a test, and with numbers if it is about speed or size
   (`build/codec-bench`, `build/tsdb-bench`, `build/insert-bench`, `build/tsdbc-bench`).
 - Comparisons with ClickHouse run it in **Podman** (never Docker), bound to

@@ -1,0 +1,12 @@
+[package]
+name = "tsdb-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Blocking client for tsdbd, the TCP server of the tsdb time series database"
+publish = false
+readme = "README.md"
+keywords = ["timeseries", "database", "client"]
+categories = ["database"]
+
+[dependencies]

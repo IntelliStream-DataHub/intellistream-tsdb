@@ -183,8 +183,20 @@ tsdbc_series(c, "pump7.flow", 1, &id);
 tsdbc_insert_series_async(c, id, ts, values, n);   /* pipelined */
 tsdbc_wait(c);                                     /* acknowledgements */
 tsdbc_query_agg(c, id, start, end, 60000, &b, &nb);
-tsdbc_close(c);
+tsdbc_close(c);                                    /* collects outstanding acknowledgements first */
 ```
+
+Requests the server has received run even if the client disconnects before
+reading the replies; a client that half-closes its socket still gets every reply.
+
+Clients in other languages, each with a quick start in its README:
+
+| | directory | build and test |
+|---|---|---|
+| C | [`client/`](client) | `make`, `make test` |
+| Rust (std only, blocking) | [`client/rust`](client/rust) | `make test-rust` |
+| Python (PyO3 over the Rust client, numpy optional) | [`client/python`](client/python) | `make test-python` |
+| Java 17+ (Maven, no runtime dependencies) | [`client/java`](client/java) | `make test-java` |
 
 ## Command line
 

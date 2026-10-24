@@ -1,0 +1,175 @@
+//! Wire format of `include/tsdb_protocol.h`: little-endian frames
+//! `[u32 len][u32 id][u8 op] payload`, where `len` counts the bytes after
+//! itself. Every reply has op REPLY and starts with an i32 status.
+
+use crate::error::{Error, Result};
+use crate::value::VALUE_SIZE;
+
+/// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
+pub const PROTOCOL_VERSION: u32 = 1;
+/// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
+pub const DEFAULT_PORT: u16 = 7070;
+
+/// Largest frame either side accepts (`TSDB_MAX_FRAME`), counted like `len`.
+pub(crate) const MAX_FRAME: usize = 256 << 20;
+/// The series field of an INSERT whose rows carry their own series.
+pub(crate) const MANY_SERIES: u32 = u32::MAX;
+/// Bytes per bucket in an aggregate reply (`TSDB_AGG_ROW`).
+pub(crate) const AGG_ROW: usize = 24 + 2 * VALUE_SIZE;
+/// Reply header: len, id, op, status.
+pub(crate) const REPLY_HEADER: usize = 13;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Op {
+    Reply = 0,
+    Hello = 1,
+    Series = 2,
+    SeriesName = 3,
+    Insert = 4,
+    QueryRaw = 5,
+    QueryAgg = 6,
+    Commit = 7,
+    Flush = 8,
+    Optimize = 9,
+    Stats = 10,
+    QueryGroup = 11,
+}
+
+/// Builds one request frame in a reusable buffer.
+#[derive(Default)]
+pub(crate) struct FrameBuf {
+    buf: Vec<u8>,
+}
+
+impl FrameBuf {
+    pub(crate) fn begin(&mut self, id: u32, op: Op) -> &mut Self {
+        self.buf.clear();
+        self.buf.extend_from_slice(&[0; 4]);
+        self.buf.extend_from_slice(&id.to_le_bytes());
+        self.buf.push(op as u8);
+        self
+    }
+
+    pub(crate) fn u8(&mut self, v: u8) -> &mut Self {
+        self.buf.push(v);
+        self
+    }
+
+    pub(crate) fn u16(&mut self, v: u16) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    pub(crate) fn u32(&mut self, v: u32) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    pub(crate) fn i64(&mut self, v: i64) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    pub(crate) fn u64(&mut self, v: u64) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    pub(crate) fn bytes(&mut self, v: &[u8]) -> &mut Self {
+        self.buf.extend_from_slice(v);
+        self
+    }
+
+    pub(crate) fn u32s(&mut self, v: &[u32]) -> &mut Self {
+        self.buf.reserve(v.len() * 4);
+        for x in v {
+            self.buf.extend_from_slice(&x.to_le_bytes());
+        }
+        self
+    }
+
+    pub(crate) fn i64s(&mut self, v: &[i64]) -> &mut Self {
+        self.buf.reserve(v.len() * 8);
+        for x in v {
+            self.buf.extend_from_slice(&x.to_le_bytes());
+        }
+        self
+    }
+
+    pub(crate) fn raw(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+
+    /// Fills in the length and returns the frame.
+    pub(crate) fn finish(&mut self) -> &[u8] {
+        let len = (self.buf.len() - 4) as u32;
+        self.buf[..4].copy_from_slice(&len.to_le_bytes());
+        &self.buf
+    }
+
+    /// Releases memory after a large request, keeping a modest buffer.
+    pub(crate) fn shrink(&mut self) {
+        const KEEP: usize = 1 << 20;
+        if self.buf.capacity() > KEEP {
+            self.buf = Vec::with_capacity(KEEP);
+        }
+    }
+}
+
+/// Reads fixed-width little-endian fields from a reply body.
+pub(crate) struct Cursor<'a> {
+    b: &'a [u8],
+}
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
+        Cursor { b }
+    }
+
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.b.len() < n {
+            return Err(Error::Protocol(format!("reply too short: wanted {n} more bytes, got {}", self.b.len())));
+        }
+        let (h, t) = self.b.split_at(n);
+        self.b = t;
+        Ok(h)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        Ok(self.take(N)?.try_into().expect("length checked"))
+    }
+
+    pub(crate) fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub(crate) fn u16(&mut self) -> Result<u16> {
+        self.array().map(u16::from_le_bytes)
+    }
+
+    pub(crate) fn u32(&mut self) -> Result<u32> {
+        self.array().map(u32::from_le_bytes)
+    }
+
+    pub(crate) fn i64(&mut self) -> Result<i64> {
+        self.array().map(i64::from_le_bytes)
+    }
+
+    pub(crate) fn u64(&mut self) -> Result<u64> {
+        self.array().map(u64::from_le_bytes)
+    }
+
+    pub(crate) fn f64(&mut self) -> Result<f64> {
+        self.array().map(f64::from_le_bytes)
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.b.len()
+    }
+}
+
+/// Decodes a column of i64 (`b.len()` is a multiple of 8) onto `out`.
+pub(crate) fn extend_i64s(out: &mut Vec<i64>, b: &[u8]) {
+    out.extend(b.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().expect("8 bytes"))));
+}
