@@ -7,11 +7,14 @@
 //! sends QUERY_BUCKETS for every aggregate: its 64-byte rows carry f64 min/max
 //! and the exact integer fields, which the version 1 QUERY_AGG/GROUP rows lack.
 //! Version 3 adds packed, zstd-compressed INSERT_VALUES bodies (`pack.rs`).
+//! Version 4: the server knows UTC only. QUERY_BUCKETS refuses a time zone
+//! other than UTC; local periods arrive as their UTC bounds in QUERY_BOUNDS
+//! (`calendar.rs` computes them).
 
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 
@@ -51,6 +54,7 @@ pub(crate) enum Op {
     StateName = 17,
     QueryBuckets = 18,
     LastStats = 19,
+    QueryBounds = 20,
 }
 
 /// Builds one request frame in a reusable buffer.

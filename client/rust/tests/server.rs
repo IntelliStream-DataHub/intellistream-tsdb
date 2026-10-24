@@ -196,9 +196,9 @@ fn group_by_calendar_in_a_time_zone() {
     let one = c.query_group(a, T0.., None, QueryOpts::asc()).unwrap();
     assert_eq!((one.len(), one[0].start, one[0].count), (1, T0, n as u64));
 
-    // an unknown zone is an invalid argument
+    // an unknown zone is an invalid argument (found by the client: the server knows UTC only)
     let bad = Group::new(Unit::Day).timezone("Mars/Olympus_Mons");
-    assert_eq!(c.query_group(a, .., Some(&bad), QueryOpts::asc()).unwrap_err().status(), Some(Status::Invalid));
+    assert_eq!(c.query_group(a, .., Some(&bad), QueryOpts::asc()).unwrap_err().code(), Status::Invalid.code());
     let bad = Group::new(Unit::Day).timezone("Europe\0Oslo");
     assert!(matches!(c.query_group(a, .., Some(&bad), QueryOpts::asc()), Err(Error::InvalidArgument(_))));
 }

@@ -20,4 +20,5 @@ def test_quick_start(server):
     count = lambda p: sum(1 for line in lines if line.startswith(p))  # noqa: E731
     assert (count("raw "), count("hour"), count("day ")) == (3, 6, 2), out.stdout
     assert lines[0] == "raw  1700085540000 59.0", out.stdout
-    assert lines[-3:] == ["rows [3, None, 5]", "int  count 2 isum 8", "mode off"], out.stdout
+    # Oslo days begin at 23:00 UTC in November
+    assert lines[-2:] == ["day  1699916400000 60 1770.0", "day  1700002800000 1380 40710.0"], out.stdout

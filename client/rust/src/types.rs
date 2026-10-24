@@ -13,9 +13,9 @@ pub enum Order {
     Desc,
 }
 
-/// Order and limit for [`query_points`](crate::Client::query_points),
-/// [`query_raw`](crate::Client::query_raw) and
-/// [`query_group`](crate::Client::query_group).
+/// Order and limit for the queries: [`query_points`](crate::Client::query_points),
+/// [`query_rows`](crate::Client::query_rows), [`query_group`](crate::Client::query_group),
+/// [`query_bounds`](crate::Client::query_bounds) and their streaming forms.
 ///
 /// ```
 /// use tsdb_client::QueryOpts;
@@ -84,7 +84,8 @@ pub enum Unit {
     Year = 8,
 }
 
-/// Calendar grouping: `count` units per bucket, in a time zone.
+/// Calendar grouping for [`query_group`](crate::Client::query_group):
+/// `count` units per bucket, in a time zone.
 ///
 /// ```
 /// use tsdb_client::{Group, Unit};
@@ -99,7 +100,10 @@ pub struct Group {
     /// Units per bucket; 0 is treated as 1. Multiples are counted from 1970 in local time.
     pub count: u32,
     /// `None` or `"UTC"`, a fixed offset (`"+02:00"`, `"-0530"`) or an IANA
-    /// name such as `"Europe/Oslo"`, resolved on the server.
+    /// name such as `"Europe/Oslo"`. The client reads the zone from the
+    /// system's zoneinfo and computes the bounds of the local periods (see
+    /// [`calendar_bounds`](crate::calendar_bounds)); a server older than
+    /// protocol version 4 gets the name and resolves it itself.
     pub timezone: Option<String>,
 }
 
@@ -115,7 +119,7 @@ impl Group {
         self
     }
 
-    /// Sets the time zone.
+    /// Sets the time zone; see [`Group::timezone`](Group#structfield.timezone).
     pub fn timezone(mut self, tz: impl Into<String>) -> Self {
         self.timezone = Some(tz.into());
         self

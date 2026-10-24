@@ -314,13 +314,21 @@ impl Bitmap {
         self.len == 0
     }
 
-    /// Whether value `i` is known. Panics if `i` is out of range.
+    /// Whether value `i` is known.
+    ///
+    /// # Panics
+    ///
+    /// If `i` is out of range.
     pub fn get(&self, i: usize) -> bool {
         assert!(i < self.len, "bit {i} of {}", self.len);
         self.bytes[i >> 3] >> (i & 7) & 1 != 0
     }
 
-    /// Marks value `i` known or null. Panics if `i` is out of range.
+    /// Marks value `i` known or null.
+    ///
+    /// # Panics
+    ///
+    /// If `i` is out of range.
     pub fn set(&mut self, i: usize, known: bool) {
         assert!(i < self.len, "bit {i} of {}", self.len);
         if known {
@@ -453,6 +461,10 @@ impl Column {
     }
 
     /// Whether value `i` is null.
+    ///
+    /// # Panics
+    ///
+    /// If the column has nulls and `i` is out of range.
     pub fn is_null(&self, i: usize) -> bool {
         self.valid.as_ref().is_some_and(|b| !b.get(i))
     }

@@ -29,5 +29,9 @@ fn quick_start_runs() {
     let count = |p: &str| stdout.lines().filter(|l| l.starts_with(p)).count();
     assert_eq!((count("raw "), count("hour "), count("day ")), (3, 6, 2), "{stdout}");
     assert!(stdout.contains("raw  1700085540000 59"), "{stdout}");
-    assert!(stdout.contains("rows [Some(3), None, Some(5)]\nint  count 2 isum 8\nmode off\n"), "{stdout}");
+    // Oslo days begin at 23:00 UTC in November
+    assert!(
+        stdout.ends_with("day  1699916400000 count 60 sum 1770\nday  1700002800000 count 1380 sum 40710\n"),
+        "{stdout}"
+    );
 }
