@@ -31,6 +31,8 @@ use pyo3::types::{PyByteArray, PyList, PyTuple};
 use ::tsdb_client as tc;
 use tc::{Column, ValueType, Values};
 
+mod embedded;
+
 create_exception!(
     tsdb_client,
     TsdbError,
@@ -1385,6 +1387,7 @@ fn calendar_bounds(
 #[pymodule]
 fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
+    m.add_class::<embedded::Db>()?;
     m.add_class::<Bucket>()?;
     m.add_class::<Stats>()?;
     m.add_class::<QueryStats>()?;

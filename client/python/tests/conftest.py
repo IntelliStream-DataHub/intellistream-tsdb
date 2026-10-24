@@ -22,8 +22,9 @@ TSDBD = os.environ.get("TSDBD", str(ROOT / "build" / "tsdbd"))
 
 
 class Server:
-    def __init__(self, base):
-        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="tsdb-py-", dir=base)) / "db"
+    def __init__(self, base, dir=None):
+        """Serves dir (an existing database: test_embedded), or a new directory under base."""
+        self.dir = pathlib.Path(dir) if dir else pathlib.Path(tempfile.mkdtemp(prefix="tsdb-py-", dir=base)) / "db"
         log = []
         for _ in range(10):
             with socket.socket() as s:

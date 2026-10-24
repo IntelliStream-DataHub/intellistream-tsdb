@@ -79,6 +79,8 @@ fn series_and_states(db: &mut impl Database) {
     assert_eq!(db.series_lookup("plain").unwrap(), plain);
     assert_eq!(status(db.series_lookup("missing")), Some(Status::NotFound));
     assert_eq!(status(db.series_type(999_999)), Some(Status::NotFound));
+    let none = db.query_rows(999_999, .., QueryOpts::asc()).unwrap(); // no rows, typed float32 as tsdbd answers
+    assert!(none.ts.is_empty() && none.values.value_type() == ValueType::Float32);
     assert!(matches!(db.series(""), Err(Error::InvalidArgument(_))));
 
     let st = ids[4];
@@ -259,6 +261,9 @@ fn aggregates_groups_and_bounds(db: &mut impl Database) {
         vec![(1_711_753_200_000, 23), (1_711_839_600_000, 23), (1_711_922_400_000, 24), (1_712_008_800_000, 2)]
     );
     let bad = db.query_group(oslo, .., Some(&Group::new(Unit::Day).timezone("Mars/Olympus")), QueryOpts::asc());
+    assert_eq!(bad.unwrap_err().code(), -4);
+    let empty = db.series("empty.zone").unwrap(); // no rows: the zone is still checked
+    let bad = db.query_group(empty, .., Some(&Group::new(Unit::Day).timezone("Mars/Olympus")), QueryOpts::asc());
     assert_eq!(bad.unwrap_err().code(), -4);
 
     let b = db.query_bounds(oslo, .., &[start, start + DAY / 2, start + DAY], QueryOpts::asc()).unwrap();

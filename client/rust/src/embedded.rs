@@ -717,7 +717,13 @@ impl Db {
         })?;
         match rows {
             Some(r) => Ok(r),
-            None => Ok(Rows { ts: Vec::new(), values: Column::empty(self.series_type(series)?) }),
+            // an unknown series has no rows, typed float32 as tsdbd answers it
+            None => match self.series_type(series) {
+                Err(e) if e.status() == Some(Status::NotFound) => {
+                    Ok(Rows { ts: Vec::new(), values: Column::empty(ValueType::Float32) })
+                }
+                t => Ok(Rows { ts: Vec::new(), values: Column::empty(t?) }),
+            },
         }
     }
 
@@ -795,10 +801,12 @@ impl Db {
         });
         let gp = g.as_ref().map_or(ptr::null(), |g| g as *const sys::tsdb_group);
         let local = zone.as_ref().is_some_and(|z| z.as_bytes() != b"UTC");
+        if let Some(z) = zone.as_ref().filter(|_| local) {
+            // tsdb_query_group_local reads the zone only when there are rows; over TCP an unknown
+            // zone is an error whatever the series holds and whatever the limit
+            check_zone(z)?;
+        }
         let Some(o) = c_opts(opts) else {
-            if let Some(z) = zone.as_ref().filter(|_| local) {
-                check_zone(z)?; // an unknown zone is an error even when nothing is asked for, as over TCP
-            }
             return Ok(Vec::new());
         };
         buckets(|out, n| unsafe {

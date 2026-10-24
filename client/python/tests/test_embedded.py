@@ -1,0 +1,204 @@
+"""tsdb_client.Db: the engine inside this process.
+
+The Client tests that need nothing but a client run here a second time: this module's `client`
+fixture (a Db on a fresh directory) replaces the one in conftest.py, so the same code checks that
+Db answers as tsdbd does. After them come the cases only an embedded database has.
+"""
+
+import array
+import threading
+
+import pytest
+
+import tsdb_client
+from tsdb_client import Db, TsdbError
+
+# Imported tests are collected again in this module and use its `client` fixture. Left out: the ones
+# about pipelining (errors of async inserts arrive later over TCP; embedded inserts finish at once) and
+# the ones that need a server.
+from test_client import (  # noqa: F401
+    test_aggregates,
+    test_group_by_in_a_time_zone,
+    test_last_query_stats,
+    test_maintenance,
+    test_numpy,
+    test_order_limit_and_columns,
+)
+from test_types import (  # noqa: F401
+    test_bools_floats_and_float32,
+    test_buffers_without_numpy,
+    test_exact_integers,
+    test_int64_nulls_order_limit_and_groups,
+    test_numpy_masked_arrays_and_chunk_boundaries,
+    test_states,
+    test_type_mismatches,
+)
+from test_zones import test_groups_are_those_of_the_c_client, test_oslo_days, test_query_bounds  # noqa: F401
+
+T0 = 1_699_999_980_000
+
+
+@pytest.fixture
+def client(tmp_path):
+    with Db(tmp_path / "db", fsync=False, merge_threads=1) as db:
+        yield db
+
+
+def code(fn, *args, **kw):
+    with pytest.raises(TsdbError) as e:
+        fn(*args, **kw)
+    return e.value.code
+
+
+def test_async_inserts_are_done_at_once(client):
+    a = client.series("a")
+    client.insert_series_async(a, [T0, T0 + 1000], [1.0, 2.0])
+    client.insert_async([a], [T0], [5.0])  # the last write wins
+    assert client.pending == 0
+    client.wait()
+    assert client.query_raw(a, numpy=False) == ([T0, T0 + 1000], [5.0, 2.0])
+    x = client.series_create("x", "bool")
+    with pytest.raises(TsdbError) as e:  # raised by the call itself, not by wait()
+        client.insert_series_values_async(x, [T0], [1], value_type="int64")
+    assert e.value.code == tsdb_client.ERR_INVALID
+    client.insert_values_async([x, x], [T0, T0 + 1], [True, None])
+    assert client.query_values(x, numpy=False) == ([T0, T0 + 1], [True, None])
+
+
+def test_series_types_and_volumes(tmp_path, client):
+    for t in tsdb_client.VALUE_TYPES:
+        sid = client.series_create(f"t.{t}", t)
+        assert client.series_type(sid) == t
+        assert client.series_create(f"t.{t}", t) == sid
+    assert code(client.series_create, "t.float64", "int64") == tsdb_client.ERR_INVALID
+    assert code(client.series_type, 999_999) == tsdb_client.ERR_NOTFOUND
+    assert code(client.series, "nope", create=False) == tsdb_client.ERR_NOTFOUND
+    with pytest.raises(ValueError):
+        client.series_create("x", "decimal")
+    vol = str(tmp_path / "volume")
+    v = client.series_create("on.volume", "int64", vol)
+    client.insert_series_values(v, [T0], [42])
+    assert client.query_values(v, numpy=False) == ([T0], [42])
+    assert client.series_path(v) == vol and client.volumes() == [str(client.path), vol]
+    assert client.series_count() == len(tsdb_client.VALUE_TYPES) + 1
+    assert client.series_name(v) == "on.volume"
+    assert client.failed() is None and Db.simd_level()
+
+
+def test_options_and_errors(tmp_path):
+    with pytest.raises(ValueError):
+        Db(tmp_path / "x", value_codec="lz4")
+    assert code(Db, tmp_path / "missing" / "db") == tsdb_client.ERR_IO
+    db = Db(tmp_path / "db", fsync=False, wal_sync_ms=-1, value_codec="chimp", granule_rows=1024, zstd_level=0)
+    a = db.series("a")
+    db.insert_series(a, [T0 + i for i in range(5000)], [float(i) for i in range(5000)])
+    db.flush()
+    assert db.stats().parts >= 1 and db.query_agg(a)[0].count == 5000
+    assert "open" in repr(db)
+    db.close()
+    db.close()  # twice is fine
+    assert "closed" in repr(db)
+    assert code(db.series, "a") == tsdb_client.ERR_IO
+    assert code(db.query_raw, a) == tsdb_client.ERR_IO
+
+
+def test_a_locked_directory_and_readers(tmp_path):
+    path = tmp_path / "db"
+    with Db(path, fsync=False) as db:
+        x = db.series("x")
+        db.insert_series(x, [T0], [1.0])
+        db.flush()
+        assert code(Db, path) == tsdb_client.ERR_LOCKED
+        with Db(path, read_only=True) as ro:  # a reader takes no lock
+            assert ro.query_raw(ro.series("x", create=False), numpy=False) == ([T0], [1.0])
+            assert code(ro.series, "y") == tsdb_client.ERR_READONLY
+            db.insert_series(x, [T0 + 1], [2.0])
+            db.flush()
+            ro.refresh()
+            assert ro.query_raw(x, numpy=False) == ([T0, T0 + 1], [1.0, 2.0])
+    with Db(path) as again:  # closed: the lock is gone
+        assert again.series("x", create=False) == x
+
+
+def test_threads_share_one_db(client):
+    ids = [client.series_create(f"vib.{i}", "float64") for i in range(8)]
+    errors = []
+    start = threading.Barrier(len(ids))
+
+    def work(sid):
+        try:
+            start.wait()
+            for r in range(20):
+                ts = array.array("q", (T0 + (r * 500 + i) * 1000 for i in range(500)))
+                client.insert_series_values(sid, ts, array.array("d", [float(sid)]) * 500)
+                (b,) = client.query_agg(sid)
+                assert b.count == (r + 1) * 500
+        except Exception as e:  # noqa: BLE001 - reported below
+            errors.append(e)
+
+    threads = [threading.Thread(target=work, args=(sid,)) for sid in ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    for sid in ids:
+        (b,) = client.query_agg(sid)
+        assert (b.count, b.min, b.max) == (10_000, sid, sid)
+
+
+def fill(db):
+    """Every type, with nulls, specials, corrections and some rows still in the memtable."""
+    f32 = db.series("f32")
+    db.insert_series(f32, [T0 + i * 1000 for i in range(3000)], [i * 0.25 for i in range(3000)])
+    db.insert_series(f32, [T0 + 7000], [float("inf")])  # a correction: the last write wins
+    f64 = db.series_create("f64", "float64")
+    db.insert_series_values(f64, [T0, T0 + 1, T0 + 2, T0 + 3], [1e300, None, float("-inf"), -0.0])
+    i64 = db.series_create("i64", "int64")
+    db.insert_series_values(i64, [T0 + i * 60_000 for i in range(2000)], [2**62 - i if i % 7 else None for i in range(2000)])
+    bl = db.series_create("bool", "bool")
+    db.insert_series_values(bl, [T0 + i for i in range(100)], [i % 3 == 0 if i % 5 else None for i in range(100)])
+    st = db.series_create("state", "state")
+    codes = [db.state(st, n) for n in ("off", "on")]
+    db.insert_series_values(st, [T0 + i * 3_600_000 for i in range(48)], [codes[i % 2] for i in range(48)])
+    db.flush()
+    db.insert_series(f32, [T0 + 1000, T0 + 9_000_000], [-1.0, 5.0])  # memtable
+    return [f32, f64, i64, bl, st]
+
+
+def answers(db, ids):
+    out = []
+    for s in ids:
+        out.append(db.series_name(s))
+        out.append(db.series_type(s))
+        out.append(db.query_values(s, numpy=False))
+        out.append(db.query_values(s, T0 + 500, T0 + 100_000_000, order="desc", limit=17, numpy=False))
+        out.append(db.query_agg(s))
+        out.append(db.query_agg(s, T0, T0 + 86_400_000, interval_ms=600_000))
+        out.append(db.query_group(s, unit="hour", count=2, timezone="Europe/Oslo"))
+        out.append(db.query_group(s, unit="day", order="desc", limit=1))
+        out.append(db.query_bounds(s, [T0, T0 + 5_000, T0 + 3_600_000, T0 + 86_400_000]))
+    out.append(db.state_names(ids[-1], [1, 2, None]))
+    return out
+
+
+def test_tsdbd_answers_what_the_embedded_engine_answered(tmp_path):
+    from conftest import TSDBD, Server
+
+    import os
+
+    if not os.access(TSDBD, os.X_OK):
+        pytest.fail(f"{TSDBD} is missing: run make in the repository root")
+    path = tmp_path / "db"
+    with Db(path, fsync=False) as db:
+        ids = fill(db)
+        embedded = answers(db, ids)
+    srv = Server(None, dir=path)
+    try:
+        with tsdb_client.Client(port=srv.port) as c:
+            assert [c.series(n, create=False) for n in ("f32", "f64", "i64", "bool", "state")] == ids
+            assert answers(c, ids) == embedded
+    finally:
+        assert srv.stop() == 0
+    with Db(path, read_only=True) as db:  # and what tsdbd left is still the same
+        assert answers(db, ids) == embedded

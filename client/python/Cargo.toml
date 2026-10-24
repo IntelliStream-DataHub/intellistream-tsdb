@@ -11,5 +11,5 @@ name = "tsdb_client"
 crate-type = ["cdylib"]
 
 [dependencies]
-tsdb-client = { path = "../rust" }
+tsdb-client = { path = "../rust", features = ["embedded"] }
 pyo3 = "0.29"
