@@ -8,7 +8,8 @@ b=$1
 version=${2:-$(git describe --always --dirty 2>/dev/null || echo dev)}
 name=tsdb-$version-x86_64-linux
 stage=$b/$name
-rm -rf "$stage"
+# One tarball per build dir: `make dist-test` and dist-check-almalinux10 find it by tsdb-*.
+rm -rf "$b"/tsdb-*-x86_64-linux "$b"/tsdb-*-x86_64-linux.tar.gz
 mkdir -p "$stage/bin" "$stage/bench" "$stage/lib" "$stage/include" "$stage/tests" "$stage/systemd"
 cp "$b/tsdbd" "$b/tsdb" "$stage/bin/"
 for f in codec-bench type-bench tsdb-bench insert-bench tsdbc-bench scale-bench; do cp "$b/$f" "$stage/bench/"; done

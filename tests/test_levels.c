@@ -388,6 +388,8 @@ int main(void)
         }
     }
     unsetenv("TSDB_SIMD");
+    free(base.name);
+    free(base.hash);
     printf("%d inputs, %d configurations compared\n", nin, configs);
     if (failures) {
         printf("test_levels: %d failures\n", failures);
