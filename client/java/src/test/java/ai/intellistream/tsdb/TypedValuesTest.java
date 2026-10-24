@@ -45,6 +45,7 @@ class TypedValuesTest {
     static void start(int level) throws Exception {
         scratch = TsdbServer.scratch("tsdbd-java-types-");
         server = TsdbServer.start(scratch.resolve("db"));
+        server.addVolume(scratch.resolve("volume")); /* tsdbd never creates a volume for a client */
         c = server.client();
         c.setCompression(level);
     }
@@ -141,6 +142,9 @@ class TypedValuesTest {
         assertEquals(Status.ERR_INVALID, status(() -> c.seriesCreate("create.FLOAT64", ValueType.INT64)));
         assertEquals(Status.ERR_INVALID, status(() -> c.seriesCreate("create.default", ValueType.BOOL)));
         assertEquals(Status.ERR_NOTFOUND, status(() -> c.seriesType(0x7ffffff0)));
+        String none = scratch.resolve("not_a_volume").toString();
+        assertEquals(Status.ERR_NOTFOUND, status(() -> c.seriesCreate("create.off_volume", ValueType.INT64, none)));
+        assertFalse(java.nio.file.Files.exists(scratch.resolve("not_a_volume")));
         int onVolume = c.seriesCreate("create.on_volume", ValueType.INT64, scratch.resolve("volume").toString());
         assertEquals(ValueType.INT64, c.seriesType(onVolume));
         assertNotEquals(d, onVolume);
