@@ -34,8 +34,10 @@ run nothing else heavy meanwhile.
 
 Podman; gcc and make; libpq's shared library (`libpq.so.5`, package `libpq5` or `libpq`; headers
 are not needed); snappy's shared library (`libsnappy.so.1`, package `libsnappy1v5` or `snappy`; no
-headers); `psql` (TimescaleDB setup and `check.py ts`); curl, jq, bc; Python 3 (standard library only); about 25 GB free on the disk under `$DBCMP` and 30 GB of free memory. For DuckDB,
-its C library release (below); `make` builds `embq` only when it finds that.
+headers); `psql` (TimescaleDB setup and `check.py ts`); curl, jq, bc; Python 3 (standard library
+only); about 32 GB free on the disk under `$DBCMP` (of which the OpenMetrics input `mixed.om` takes
+about 5 GB and Prometheus' WAL and blocks about 1.5 GB) and 30 GB of free memory. For DuckDB, its C
+library release (below); `make` builds `embq` only when it finds that.
 
 ## Setup
 
@@ -268,7 +270,7 @@ row is counted once. The backfill leaves nothing outside its blocks.
 
 ```sh
 P=$DBCMP/prometheus
-IMG=docker.io/prom/prometheus:v3.15.0   # sha256:86b17a25c2db1d16a61b16b3c8f336679eb19e26333d03e808da387206e40faa
+IMG=docker.io/prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e   # index digest
 mkdir -p $P/data $P/data-bf && cp $H/prometheus.yml $P/ && podman unshare chown 65534:65534 $P/data $P/data-bf
 prom() { # NAME PORT DATADIR
   podman run -d --name $1 --network host -v $3:/prometheus -v $P/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
@@ -278,16 +280,30 @@ prom() { # NAME PORT DATADIR
 # (a) remote write, settle, size
 prom dbcmp-prom 9090 $P/data && until curl -sf 127.0.0.1:9090/-/ready; do sleep 0.1; done
 cat $DATA > /dev/null; sync; $B/loadprw $DATA 127.0.0.1 9090 2000 16
-$H/prom_settle.sh $(date +%s) | tee $WORK/res/prom-settle.log   # 78 min for 10 M rows: see above
+time sync -f $P/data   # acknowledged is not durable: see "Fairness notes"
+# 78 min for 10 M rows (see above); on 100 M expect several hours: run this under tmux or nohup
+$H/prom_settle.sh $(date +%s) | tee $WORK/res/prom-settle.log
 podman unshare sh -c "cd $P/data && du -scb 01* | tail -1 && du -sb wal wbl chunks_head"
 S=$(curl -s -XPOST 127.0.0.1:9090/api/v1/admin/tsdb/snapshot | jq -r .data.name)
 podman unshare du -sb $P/data/snapshots/$S && podman unshare rm -rf $P/data/snapshots/$S
 podman stop dbcmp-prom
 
+# (a') remote write with more shards and larger requests, load time only, each into a fresh directory;
+# report the best load (+ sync) next to 16 shards, or that 16 matched it (on 10 series at most 10
+# shards carry data, so only the 100-series run can tell)
+for c in "2000 50" "20000 16" "20000 50"; do
+  mkdir -p $P/data-sweep && podman unshare chown 65534:65534 $P/data-sweep
+  prom dbcmp-prom-sweep 9090 $P/data-sweep && until curl -sf 127.0.0.1:9090/-/ready; do sleep 0.1; done
+  cat $DATA > /dev/null; sync; echo "samples/request, shards: $c"; $B/loadprw $DATA 127.0.0.1 9090 $c
+  time sync -f $P/data-sweep
+  podman stop dbcmp-prom-sweep && podman rm dbcmp-prom-sweep && podman unshare rm -rf $P/data-sweep
+done
+
 # (b) backfill, then a server on the blocks (port 9091, so both can be kept; one runs at a time)
 cat $DBCMP/input/mixed.om > /dev/null; sync
 time podman run --rm --network none -v $DBCMP/input:/input:ro -v $P/data-bf:/prometheus --entrypoint /bin/promtool $IMG \
   tsdb create-blocks-from openmetrics --max-block-duration=744h -q /input/mixed.om /prometheus
+time sync -f $P/data-bf   # promtool fsyncs its blocks itself, so this should be about 0
 time (prom dbcmp-prom-bf 9091 $P/data-bf && until curl -sf 127.0.0.1:9091/-/ready; do sleep 0.1; done)
 podman unshare sh -c "cd $P/data-bf && du -scb 01* | tail -1 && du -sb wal wbl chunks_head"
 ```
@@ -381,8 +397,8 @@ time bounds are cast to `TIMESTAMP_MS` so that both reach the scan as plain tabl
   sessions, where its policy would use one job. ClickHouse keeps merging lazily long after
   `ch_load.sh` calls it settled. Prometheus' remote write is made for live data, not two years of
   history in one go: almost all of it takes the out-of-order path and leaves thousands of 2 h blocks
-  to compact (78 minutes for 10 M rows); its backfill (promtool) is the route its docs give for history, and is
-  reported next to it.
+  to compact (78 minutes for 10 M rows, hours for 100 M); its backfill (promtool) is the route its
+  docs give for history, and is reported next to it.
 - **Types.** Values are float32 everywhere except both InfluxDBs and Prometheus, which only have
   float64 (they store the exact float32 value).
 - **Indexes.** TimescaleDB has only the default `ts` index on uncompressed chunks, which favours its
@@ -400,8 +416,10 @@ time bounds are cast to `TIMESTAMP_MS` so that both reach the scan as plain tabl
   the others `qdrive` over HTTP or libpq. InfluxDB 3's Flight SQL was not tried. PromQL cannot clip a
   bucket to a window that starts or ends inside it, so Prometheus answers an aggregate window with
   two requests (whole buckets, then the clipped ends), timed together as one query; its whole-range
-  bucket queries are 4 or 8 `query_range` requests (11,000 points per series at most). Its JSON
-  answers are larger than the others' (buckets of 60 samples: about 11 MB per series).
+  bucket queries are 4 or 8 `query_range` requests (11,000 points per series at most), each
+  limited to its step group's data span (± 1 s), because `query_range` evaluates every step, empty
+  or not, where the others take fixed bounds or none. Its JSON answers are larger than the others'
+  (buckets of 60 samples: about 11 MB per series).
 
 ## Cleaning up
 
