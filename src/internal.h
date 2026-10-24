@@ -193,33 +193,44 @@ size_t xor64_encode(const uint64_t *in, size_t n, uint8_t *out);
 int xor64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out);
 
 /* ---- SIMD kernels (simd.c), dispatched once at startup ---- */
+/* The statistics of one bucket. Only the half of the type is in use: buckets
+ * of tiny intervals are many, so the state stays small. */
 typedef struct agg_state {
     uint64_t rows;  /* rows folded, nulls included */
     uint64_t count; /* known values */
-    double sum, min, max;     /* floats */
-    __int128 isum;            /* int64, bool, state */
-    int64_t imin, imax;
+    union {
+        struct { double sum, min, max; };               /* float32, float64 */
+        struct { __int128 isum; int64_t imin, imax; };  /* int64, bool, state */
+    };
 } agg_state;
 
-static inline void agg_init(agg_state *a)
+static inline void agg_init(agg_state *a, int type)
 {
-    memset(a, 0, sizeof *a);
-    a->min = __builtin_inf();
-    a->max = -__builtin_inf();
-    a->imin = INT64_MAX;
-    a->imax = INT64_MIN;
+    a->rows = a->count = 0;
+    if (type == TSDB_FLOAT32 || type == TSDB_FLOAT64) {
+        a->sum = 0;
+        a->min = __builtin_inf();
+        a->max = -__builtin_inf();
+    } else {
+        a->isum = 0;
+        a->imin = INT64_MAX;
+        a->imax = INT64_MIN;
+    }
 }
 
-static inline void agg_combine(agg_state *a, const agg_state *b)
+static inline void agg_combine(agg_state *a, const agg_state *b, int type)
 {
     a->rows += b->rows;
     a->count += b->count;
-    a->sum += b->sum;
-    if (b->min < a->min) a->min = b->min;
-    if (b->max > a->max) a->max = b->max;
-    a->isum += b->isum;
-    if (b->imin < a->imin) a->imin = b->imin;
-    if (b->imax > a->imax) a->imax = b->imax;
+    if (type == TSDB_FLOAT32 || type == TSDB_FLOAT64) {
+        a->sum += b->sum;
+        if (b->min < a->min) a->min = b->min;
+        if (b->max > a->max) a->max = b->max;
+    } else {
+        a->isum += b->isum;
+        if (b->imin < a->imin) a->imin = b->imin;
+        if (b->imax > a->imax) a->imax = b->imax;
+    }
 }
 
 /* Folds float32 values (no nulls) into a: count, sum (in double), min and max (NaN ignored). */
@@ -232,7 +243,30 @@ struct granule;
 /* The statistics of a granule's values; and a granule's statistics as an agg_state. */
 void granule_stats(int type, const void *v, size_t n, struct granule *g);
 void agg_from_granule(int type, const struct granule *g, agg_state *a);
-void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b);
+static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
+{
+    const double nan = __builtin_nan("");
+    b->count = a->count;
+    b->sum = 0;
+    b->min = b->max = nan;
+    b->isum = b->imin = b->imax = 0;
+    if (type == TSDB_STATE || a->count == 0)
+        return;
+    if (type_is_int(type)) {
+        b->isum = a->isum > INT64_MAX ? INT64_MAX : a->isum < INT64_MIN ? INT64_MIN : (int64_t)a->isum;
+        b->imin = a->imin;
+        b->imax = a->imax;
+        b->sum = (double)a->isum;
+        b->min = (double)a->imin;
+        b->max = (double)a->imax;
+        return;
+    }
+    b->sum = a->sum;
+    if (a->min <= a->max) { /* else only NaN values */
+        b->min = a->min;
+        b->max = a->max;
+    }
+}
 const char *simd_name(void);
 void simd_init(void);
 

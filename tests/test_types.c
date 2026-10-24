@@ -608,7 +608,7 @@ static void test_v1(const char *base)
         size_t tl = block_encode_ts(c, 1, ts + k0, (size_t)n, blk);
         size_t vl = block_encode_f32(c, 1, TSDB_VALUES_AUTO, v + k0, (size_t)n, blk + tl);
         agg_state a;
-        agg_init(&a);
+        agg_init(&a, TSDB_FLOAT32);
         simd_agg_f32(v + k0, (size_t)n, &a);
         idx[ng] = (granule_v1){0, (uint32_t)n, ts[k0], ts[k0 + n - 1], len, (uint32_t)tl, (uint32_t)vl, a.sum,
                                (float)a.min, (float)a.max, (uint32_t)xxh64(blk, tl + vl, 0), 0};

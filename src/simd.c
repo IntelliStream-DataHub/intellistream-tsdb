@@ -73,7 +73,7 @@ __attribute__((target("avx2"))) static void agg_avx2(const float *v, size_t n, a
     _mm256_storeu_ps(mins, mn);
     _mm256_storeu_ps(maxs, mx);
     agg_state t;
-    agg_init(&t);
+    agg_init(&t, TSDB_FLOAT32);
     t.sum = (sums[0] + sums[1]) + (sums[2] + sums[3]);
     t.min = a->min;
     t.max = a->max;

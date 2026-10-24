@@ -390,6 +390,18 @@ typedef struct agg_target {
 
 
 
+/* One run of rows into a: float32 without nulls goes straight to the SIMD
+ * kernel, which matters when buckets hold a handful of rows each. */
+static inline void fold_run(const agg_target *t, const uint8_t *v, size_t n, bool may_be_null, agg_state *a)
+{
+    if (t->type == TSDB_FLOAT32 && !may_be_null) {
+        a->rows += n;
+        simd_agg_f32((const float *)v, n, a);
+    } else {
+        agg_fold_hint(t->type, v, n, may_be_null, a);
+    }
+}
+
 /* Folds time-sorted rows (all within [start, end)) into per-bucket states,
  * one entry per bucket touched; returns the number of entries. */
 static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, size_t n, bool may_be_null,
@@ -400,8 +412,8 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, 
         return 0;
     if (t->bk->kind == BK_ONE) {
         out[0].b = t->b0;
-        agg_init(&out[0].a);
-        agg_fold_hint(t->type, v, n, may_be_null, &out[0].a);
+        agg_init(&out[0].a, t->type);
+        fold_run(t, v, n, may_be_null, &out[0].a);
         return 1;
     }
     size_t nl = 0;
@@ -419,18 +431,32 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, 
                 e = i + 1 + lower_bound_i64(ts + i + 1, e - i - 1, sat_mul(tr, 1000));
         }
         out[nl].b = b;
-        agg_init(&out[nl].a);
-        agg_fold_hint(t->type, v + i * t->w, e - i, may_be_null, &out[nl].a);
+        agg_init(&out[nl].a, t->type);
+        fold_run(t, v + i * t->w, e - i, may_be_null, &out[nl].a);
         nl++;
         i = e;
     }
     return nl;
 }
 
-static void fold_into(const agg_target *t, const local_bucket *l, size_t nl)
+static inline void fold_into(const agg_target *t, const local_bucket *l, size_t nl)
 {
-    for (size_t k = 0; k < nl; k++)
-        agg_combine(&t->acc[l[k].b - t->b0], &l[k].a);
+    agg_state *acc = t->acc;
+    /* the type decided once, not per bucket: buckets can be a handful of rows each */
+    if (t->type == TSDB_FLOAT32 || t->type == TSDB_FLOAT64) {
+        for (size_t k = 0; k < nl; k++) {
+            agg_state *a = &acc[l[k].b - t->b0];
+            const agg_state *x = &l[k].a;
+            a->rows += x->rows;
+            a->count += x->count;
+            a->sum += x->sum;
+            a->min = x->min < a->min ? x->min : a->min;
+            a->max = x->max > a->max ? x->max : a->max;
+        }
+    } else {
+        for (size_t k = 0; k < nl; k++)
+            agg_combine(&acc[l[k].b - t->b0], &l[k].a, t->type);
+    }
 }
 
 typedef struct fold_ctx {
@@ -621,7 +647,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
         goto done;
     }
     for (size_t k = 0; k < nb; k++)
-        agg_init(&acc[k]);
+        agg_init(&acc[k], type);
     t.acc = acc;
     fc.t = &t;
 
@@ -656,7 +682,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                 if (inside && one) {
                     agg_state ga;
                     agg_from_granule(type, g, &ga);
-                    agg_combine(&acc[bmin - t.b0], &ga);
+                    agg_combine(&acc[bmin - t.b0], &ga, type);
                 } else
                     work[nwork++] = (gref){sn.parts[it->src], g};
             }

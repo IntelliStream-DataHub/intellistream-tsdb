@@ -121,7 +121,7 @@ void agg_fold(int type, const void *v, size_t n, agg_state *a) { agg_fold_hint(t
 void granule_stats(int type, const void *v, size_t n, granule *g)
 {
     agg_state a;
-    agg_init(&a);
+    agg_init(&a, type);
     agg_fold(type, v, n, &a);
     g->nulls = (uint32_t)(n - a.count);
     if (type_is_int(type)) {
@@ -139,7 +139,7 @@ void granule_stats(int type, const void *v, size_t n, granule *g)
 
 void agg_from_granule(int type, const granule *g, agg_state *a)
 {
-    agg_init(a);
+    agg_init(a, type);
     a->rows = g->count;
     a->count = g->count - g->nulls;
     if (type_is_int(type)) {
@@ -150,30 +150,5 @@ void agg_from_granule(int type, const granule *g, agg_state *a)
         a->sum = g->fsum;
         a->min = g->fmin;
         a->max = g->fmax;
-    }
-}
-
-void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
-{
-    const double nan = __builtin_nan("");
-    b->count = a->count;
-    b->sum = 0;
-    b->min = b->max = nan;
-    b->isum = b->imin = b->imax = 0;
-    if (type == TSDB_STATE || a->count == 0)
-        return;
-    if (type_is_int(type)) {
-        b->isum = a->isum > INT64_MAX ? INT64_MAX : a->isum < INT64_MIN ? INT64_MIN : (int64_t)a->isum;
-        b->imin = a->imin;
-        b->imax = a->imax;
-        b->sum = (double)a->isum;
-        b->min = (double)a->imin;
-        b->max = (double)a->imax;
-        return;
-    }
-    b->sum = a->sum;
-    if (a->min <= a->max) { /* else only NaN values */
-        b->min = a->min;
-        b->max = a->max;
     }
 }
