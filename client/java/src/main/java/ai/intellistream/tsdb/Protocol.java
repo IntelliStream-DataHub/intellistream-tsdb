@@ -11,6 +11,7 @@ final class Protocol {
     static final int AGG_ROW = 32;         /* version 1: i64 start, u64 count, f64 sum, f32 min, f32 max */
     static final int BUCKET_ROW = 64;      /* + f64 min, f64 max, i64 isum, i64 imin, i64 imax instead */
     static final int VALUES_HEADER = 16;   /* INSERT_VALUES: u32 n, u32 series, u8 type, u8 flags, u16 0, u32 0 */
+    static final int STATS_REPLY = 88;     /* LAST_STATS: f64 elapsed_s, 10 x u64 */
     static final int VALID = 1;            /* flags: a validity bitmap follows the values */
 
     static final byte OP_REPLY = 0;
@@ -32,6 +33,7 @@ final class Protocol {
     static final byte OP_STATE = 16;
     static final byte OP_STATE_NAME = 17;
     static final byte OP_QUERY_BUCKETS = 18;
+    static final byte OP_LAST_STATS = 19;
 
     private Protocol() {
     }

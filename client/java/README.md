@@ -198,6 +198,7 @@ properties change where things are:
 | `queryAgg(series, start, end, intervalMs[, order, limit])` | count/sum/min/max per fixed interval, as `Bucket` records |
 | `queryGroup(series, start, end, group[, order, limit])` | the same per calendar unit, in a time zone |
 | `commit()`, `flush()`, `optimize()`, `stats()` | maintenance and storage statistics |
+| `lastQueryStats()` | what the server did for this connection's previous query (`QueryStats`: rows decoded or answered from granule statistics, bytes read, time) |
 | `hello()` | the server's protocol version |
 
 Points are timestamps in milliseconds since the Unix epoch and values of the series' type. Writing an existing (series,

@@ -1230,6 +1230,30 @@ public final class TsdbClient implements AutoCloseable {
         return s;
     }
 
+    /**
+     * Returns what the server did for this connection's previous query: {@code queryPoints}, {@code queryRaw},
+     * {@code queryValues}, {@code queryAgg} or {@code queryGroup}. Queries on other connections do not change it;
+     * before the first query every field is 0.
+     *
+     * @return the statistics of the previous query
+     * @throws TsdbException on a connection failure
+     */
+    public QueryStats lastQueryStats() throws TsdbException {
+        request();
+        begin(Protocol.OP_LAST_STATS, 0);
+        send();
+        int st = frame();
+        if (st == 0 && bodyLen != Protocol.STATS_REPLY)
+            throw lost(Status.ERR_CORRUPT, "LAST_STATS reply of " + bodyLen + " bytes");
+        QueryStats q = st == 0
+                ? new QueryStats(in.getDouble(), in.getLong(), in.getLong(), in.getLong(), in.getLong(), in.getLong(),
+                        in.getLong(), in.getLong(), in.getLong(), in.getLong(), in.getLong())
+                : null;
+        endReply();
+        check(st);
+        return q;
+    }
+
     private void simple(byte op) throws TsdbException {
         request();
         begin(op, 0);

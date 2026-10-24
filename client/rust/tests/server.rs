@@ -298,3 +298,40 @@ fn concurrent_clients() {
         }
     });
 }
+
+#[test]
+fn last_query_stats() {
+    let srv = Server::start();
+    let mut c = srv.client();
+    assert_eq!(c.last_query_stats().unwrap().result_rows, 0); // no query yet
+    let a = c.series("qs").unwrap();
+    const N: u64 = 200_000;
+    let ts: Vec<i64> = (0..N as i64).map(|i| T0 + i * 1000).collect();
+    c.insert_series(a, &ts, &vec![1.0; N as usize]).unwrap();
+    c.flush().unwrap();
+
+    // a whole-range aggregate is answered from granule statistics
+    let b = c.query_agg(a, .., 0).unwrap();
+    let st = c.last_query_stats().unwrap();
+    assert_eq!(b[0].count, N);
+    assert_eq!((st.rows, st.rows_from_stats, st.rows_decoded, st.memtable_rows), (N, N, 0, 0));
+    assert_eq!((st.bytes_read, st.result_rows), (0, 1));
+    assert!(st.parts >= 1 && st.granules >= 1 && st.granules_from_stats == st.granules && st.bytes == N * 12);
+    assert!(st.elapsed_s >= 0.0);
+    // asking again reports the same query: LAST_STATS is not a query itself
+    assert_eq!(c.last_query_stats().unwrap(), st);
+
+    // buckets smaller than a granule decode it
+    let b = c.query_agg(a, T0..T0 + 600_000, 10_000).unwrap();
+    let st = c.last_query_stats().unwrap();
+    assert_eq!(b.len(), 60);
+    assert!(st.rows_decoded > 0 && st.bytes_read > 0, "{st:?}");
+    assert_eq!(st.result_rows, 60);
+    assert_eq!(st.rows, st.rows_decoded + st.rows_from_stats + st.memtable_rows);
+
+    // raw rows and calendar buckets count what was returned
+    let p = c.query_points(a, .., QueryOpts::desc().limit(7)).unwrap();
+    assert_eq!((p.len(), c.last_query_stats().unwrap().result_rows), (7, 7));
+    let g = c.query_group(a, .., Some(&Group::new(Unit::Hour)), QueryOpts::asc()).unwrap();
+    assert_eq!(c.last_query_stats().unwrap().result_rows, g.len() as u64);
+}

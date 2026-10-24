@@ -92,6 +92,7 @@ everything.
 | `query_agg(id, range, interval_ms)` | `Vec<Bucket>` aligned to the epoch; 0 = one bucket |
 | `query_group(id, range, Option<&Group>, opts)` | calendar buckets in a time zone |
 | `commit()`, `flush()`, `optimize()`, `stats()` | maintenance |
+| `last_query_stats()` | `QueryStats` of this connection's previous query: rows covered, decoded or answered from granule statistics, bytes, time |
 
 `QueryOpts` carries the order and limit (`QueryOpts::desc().limit(5)`);
 `Group::new(Unit::Day).count(1).timezone("Europe/Oslo")` a calendar grouping.

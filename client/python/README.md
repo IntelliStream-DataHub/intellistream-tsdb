@@ -71,6 +71,7 @@ Ranges are `[start, end)`; `None` means unbounded.
 | `query_agg(id, start=None, end=None, interval_ms=0)` | `list[Bucket]`, aligned to the epoch |
 | `query_group(id, start=None, end=None, *, unit=None, count=1, timezone=None, order="asc", limit=None)` | calendar buckets |
 | `commit()`, `flush()`, `optimize()`, `stats()` | maintenance; `stats()` returns `Stats` |
+| `last_query_stats()` | `QueryStats` of this connection's previous query: rows covered, decoded or answered from granule statistics, bytes, time |
 
 Columns can be numpy arrays or `array.array`s of the matching type (int64
 timestamps, uint32 series ids), which are copied without iterating, or any

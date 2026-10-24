@@ -91,6 +91,39 @@ class Stats:
         """Rows in the WAL-backed memtable, not yet in parts."""
 
 @final
+class QueryStats:
+    """What the server did for this connection's previous query."""
+
+    @property
+    def elapsed_s(self) -> float: ...
+    @property
+    def rows(self) -> int:
+        """Rows covered: rows_decoded + rows_from_stats + memtable_rows."""
+    @property
+    def rows_decoded(self) -> int:
+        """Rows decompressed (whole granules)."""
+    @property
+    def rows_from_stats(self) -> int:
+        """Rows answered from granule statistics, without decoding."""
+    @property
+    def memtable_rows(self) -> int: ...
+    @property
+    def bytes(self) -> int:
+        """Uncompressed size of the rows covered."""
+    @property
+    def bytes_read(self) -> int:
+        """Compressed bytes of the granules decoded."""
+    @property
+    def parts(self) -> int: ...
+    @property
+    def granules(self) -> int: ...
+    @property
+    def granules_from_stats(self) -> int: ...
+    @property
+    def result_rows(self) -> int:
+        """Rows, or buckets, returned."""
+
+@final
 class Client:
     """One TCP connection to tsdbd. Network calls release the GIL; threads
     sharing a client take turns."""
@@ -208,3 +241,5 @@ class Client:
     def flush(self) -> None: ...
     def optimize(self) -> None: ...
     def stats(self) -> Stats: ...
+    def last_query_stats(self) -> QueryStats:
+        """What the server did for this connection's previous query."""

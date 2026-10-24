@@ -20,7 +20,7 @@ use crate::protocol::{
     BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PROTOCOL_VERSION, REPLY_HEADER, VALID,
     VALUES_CHUNK_HEADER,
 };
-use crate::types::{Bucket, Group, Order, Points, QueryOpts, Rows, Stats};
+use crate::types::{Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, Stats};
 use crate::value::{Bitmap, Column, ColumnRef, Native, Value, ValueType};
 
 /// Rows per INSERT frame: 8M rows of the many-series layout make 128 MiB,
@@ -744,6 +744,33 @@ impl Client {
                 passthrough_granules: r.u64()?,
                 memtable_rows: r.u64()?,
             })
+        })
+    }
+
+    /// What the server did for this connection's previous query (LAST_STATS):
+    /// rows covered, decoded or answered from granule statistics, bytes, time.
+    /// A query this client answered without asking the server (a limit of
+    /// `Some(0)` on [`query_points`](Client::query_points) or
+    /// [`query_group`](Client::query_group)) does not count; all zero before any query.
+    pub fn last_query_stats(&mut self) -> Result<QueryStats> {
+        self.run(|c| {
+            c.request(Op::LastStats, |_| {})?;
+            let mut r = Cursor::new(&c.body);
+            let st = QueryStats {
+                elapsed_s: r.f64()?,
+                rows: r.u64()?,
+                rows_decoded: r.u64()?,
+                rows_from_stats: r.u64()?,
+                memtable_rows: r.u64()?,
+                bytes: r.u64()?,
+                bytes_read: r.u64()?,
+                parts: r.u64()?,
+                granules: r.u64()?,
+                granules_from_stats: r.u64()?,
+                result_rows: r.u64()?,
+            };
+            end(&r)?;
+            Ok(st)
         })
     }
 

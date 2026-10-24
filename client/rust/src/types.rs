@@ -229,3 +229,31 @@ pub struct Stats {
     /// Rows in the WAL-backed memtable, not yet in parts.
     pub memtable_rows: u64,
 }
+
+/// What the server did for this connection's previous query (`tsdb_query_stats`),
+/// like ClickHouse's "Processed N rows, M MB".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct QueryStats {
+    /// Seconds the server spent on the query.
+    pub elapsed_s: f64,
+    /// Rows covered: `rows_decoded + rows_from_stats + memtable_rows`.
+    pub rows: u64,
+    /// Rows decompressed (whole granules).
+    pub rows_decoded: u64,
+    /// Rows answered from granule statistics, without decoding.
+    pub rows_from_stats: u64,
+    /// Rows read from memtables (not yet in parts).
+    pub memtable_rows: u64,
+    /// Uncompressed size of the rows covered (timestamp + value).
+    pub bytes: u64,
+    /// Compressed bytes of the granules decoded.
+    pub bytes_read: u64,
+    /// Parts with rows of the series in the range.
+    pub parts: u64,
+    /// Their granules in the range.
+    pub granules: u64,
+    /// Granules answered from their index entry.
+    pub granules_from_stats: u64,
+    /// Rows, or buckets, returned.
+    pub result_rows: u64,
+}

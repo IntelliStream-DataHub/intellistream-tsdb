@@ -359,6 +359,49 @@ class TsdbClientTest {
     }
 
     @Test
+    void lastQueryStats() throws Exception {
+        try (TsdbClient own = server.client()) {
+            assertEquals(new QueryStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), own.lastQueryStats(), "before any query");
+            int id = own.series("query.stats");
+            own.insert(id, seq(T0, 1000, N), bigValues());
+            own.flush();
+
+            /* a whole-range aggregate is answered from granule statistics */
+            List<Bucket> one = own.queryAgg(id, Long.MIN_VALUE, Long.MAX_VALUE, 0);
+            assertEquals(N, one.get(0).count());
+            QueryStats s = own.lastQueryStats();
+            assertEquals(N, s.rows(), s.toString());
+            assertEquals(N, s.rowsFromStats(), s.toString());
+            assertEquals(0, s.rowsDecoded(), s.toString());
+            assertEquals(0, s.memtableRows(), s.toString());
+            assertEquals(0, s.bytesRead(), s.toString());
+            assertEquals(s.granules(), s.granulesFromStats(), s.toString());
+            assertTrue(s.parts() >= 1 && s.granules() >= N / 8192 && s.bytes() > 0, s.toString());
+            assertEquals(one.size(), s.resultRows());
+            assertTrue(s.elapsedS() >= 0 && s.elapsedS() < 60, s.toString());
+            assertEquals(s, own.lastQueryStats(), "LAST_STATS is not a query itself");
+
+            /* buckets of 10 s split every granule: the rows are decoded */
+            List<Bucket> small = own.queryAgg(id, Long.MIN_VALUE, Long.MAX_VALUE, 10_000);
+            assertEquals(N / 10, small.size());
+            s = own.lastQueryStats();
+            assertTrue(s.rowsDecoded() > 0 && s.bytesRead() > 0, s.toString());
+            assertEquals(s.rows(), s.rowsDecoded() + s.rowsFromStats() + s.memtableRows(), s.toString());
+            assertEquals(small.size(), s.resultRows());
+
+            /* raw queries count the rows they return */
+            Points p = own.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE, Order.DESC, 5);
+            s = own.lastQueryStats();
+            assertEquals(p.size(), s.resultRows(), s.toString());
+            assertTrue(s.rowsDecoded() >= 5, s.toString());
+
+            /* another connection's queries do not change this one's */
+            c.queryAgg(id, Long.MIN_VALUE, Long.MAX_VALUE, 0);
+            assertEquals(s, own.lastQueryStats());
+        }
+    }
+
+    @Test
     void concurrentPipelinedClients() throws Exception {
         int threads = 8;
         ExecutorService pool = Executors.newFixedThreadPool(threads);

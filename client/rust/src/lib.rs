@@ -38,5 +38,5 @@ mod value;
 pub use client::Client;
 pub use error::{Error, Result, Status, strerror};
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};
-pub use types::{Bucket, Group, Order, Points, QueryOpts, Rows, Stats, Unit};
+pub use types::{Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, Stats, Unit};
 pub use value::{Bitmap, Column, ColumnRef, NULL_F32_BITS, NULL_F64_BITS, Native, Value, ValueType, Values, ValuesRef};

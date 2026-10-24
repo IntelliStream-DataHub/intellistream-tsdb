@@ -226,3 +226,27 @@ def test_threads_share_or_own_clients(server, client):
     for sid in ids:
         (b,) = client.query_agg(sid)
         assert (b.count, b.min, b.max) == (10_000, sid, sid)
+
+
+def test_last_query_stats(client):
+    assert client.last_query_stats().result_rows == 0  # no query yet
+    a = client.series("qs")
+    n = 200_000
+    client.insert_series(a, array.array("q", (T0 + i * 1000 for i in range(n))), array.array("f", [1.0]) * n)
+    client.flush()
+
+    (b,) = client.query_agg(a)  # answered from granule statistics
+    st = client.last_query_stats()
+    assert b.count == n
+    assert (st.rows, st.rows_from_stats, st.rows_decoded, st.memtable_rows, st.bytes_read) == (n, n, 0, 0, 0)
+    assert st.result_rows == 1 and st.granules == st.granules_from_stats >= 1 and st.elapsed_s >= 0
+    assert "rows_from_stats=200000" in repr(st)
+
+    bk = client.query_agg(a, T0, T0 + 600_000, interval_ms=10_000)  # smaller than a granule: decoded
+    st = client.last_query_stats()
+    assert len(bk) == 60 and st.result_rows == 60
+    assert st.rows_decoded > 0 and st.bytes_read > 0
+    assert st.rows == st.rows_decoded + st.rows_from_stats + st.memtable_rows
+
+    t, _ = client.query_raw(a, order="desc", limit=7, numpy=False)
+    assert len(t) == client.last_query_stats().result_rows == 7

@@ -394,6 +394,61 @@ impl From<tc::Stats> for Stats {
     }
 }
 
+/// What the server did for this connection's previous query.
+#[pyclass(frozen, get_all, module = "tsdb_client")]
+struct QueryStats {
+    elapsed_s: f64,
+    rows: u64,
+    rows_decoded: u64,
+    rows_from_stats: u64,
+    memtable_rows: u64,
+    bytes: u64,
+    bytes_read: u64,
+    parts: u64,
+    granules: u64,
+    granules_from_stats: u64,
+    result_rows: u64,
+}
+
+#[pymethods]
+impl QueryStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "QueryStats(elapsed_s={:?}, rows={}, rows_decoded={}, rows_from_stats={}, memtable_rows={}, bytes={}, \
+             bytes_read={}, parts={}, granules={}, granules_from_stats={}, result_rows={})",
+            self.elapsed_s,
+            self.rows,
+            self.rows_decoded,
+            self.rows_from_stats,
+            self.memtable_rows,
+            self.bytes,
+            self.bytes_read,
+            self.parts,
+            self.granules,
+            self.granules_from_stats,
+            self.result_rows
+        )
+    }
+}
+
+impl From<tc::QueryStats> for QueryStats {
+    fn from(s: tc::QueryStats) -> Self {
+        QueryStats {
+            elapsed_s: s.elapsed_s,
+            rows: s.rows,
+            rows_decoded: s.rows_decoded,
+            rows_from_stats: s.rows_from_stats,
+            memtable_rows: s.memtable_rows,
+            bytes: s.bytes,
+            bytes_read: s.bytes_read,
+            parts: s.parts,
+            granules: s.granules,
+            granules_from_stats: s.granules_from_stats,
+            result_rows: s.result_rows,
+        }
+    }
+}
+
 // ---------------------------------------------------------------- client
 
 /// The connection and what never changes on the server once created.
@@ -845,6 +900,12 @@ impl Client {
     fn stats(&self, py: Python<'_>) -> PyResult<Stats> {
         self.with(py, |c| c.stats()).map(Stats::from)
     }
+
+    /// What the server did for this connection's previous query: rows
+    /// covered, decoded or answered from granule statistics, bytes, time.
+    fn last_query_stats(&self, py: Python<'_>) -> PyResult<QueryStats> {
+        self.with(py, |c| c.last_query_stats()).map(QueryStats::from)
+    }
 }
 
 /// The text for a TSDB_ERR_* code.
@@ -858,6 +919,7 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<Bucket>()?;
     m.add_class::<Stats>()?;
+    m.add_class::<QueryStats>()?;
     m.add("TsdbError", m.py().get_type::<TsdbError>())?;
     m.add_function(wrap_pyfunction!(strerror, m)?)?;
     m.add("DEFAULT_PORT", tc::DEFAULT_PORT)?;

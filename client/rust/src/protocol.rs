@@ -47,6 +47,7 @@ pub(crate) enum Op {
     State = 16,
     StateName = 17,
     QueryBuckets = 18,
+    LastStats = 19,
 }
 
 /// Builds one request frame in a reusable buffer.
