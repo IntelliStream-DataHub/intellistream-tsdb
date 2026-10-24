@@ -11,6 +11,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$here/.." && pwd)
 scratch=${1:-/tmp}
 export TSDBD="$top/bin/tsdbd"
+export TSDB_CRASHFS="$here/libcrashfs.so" # the server fail-stop test fails a WAL write through it
 fail=0
 run() {
     echo "=== $*"

@@ -173,8 +173,8 @@ dist:
 	    [ -d $(DIST_B) ] && echo "dist: compiler or flags changed since the last build: rebuilding $(DIST_B)"; \
 	    rm -rf $(DIST_B) && mkdir -p $(DIST_B) && printf '%s\n' "$$sig" >$(DIST_B)/.flags; \
 	fi
-	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%)
-	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
+	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%) $(DIST_B)/libcrashfs.so
+	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES) $(DIST_B)/libcrashfs.so
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
 	CC="$(CC)" tools/mkdist.sh $(DIST_B)
 
@@ -360,7 +360,7 @@ $(B)/test_limits: tests/test_limits.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
-	$(CC) -O2 -g -std=gnu11 -Wall -fPIC -shared -o $@ $< -ldl -lpthread
+	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
 
 $(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)

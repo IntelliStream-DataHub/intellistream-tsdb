@@ -58,8 +58,11 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
     char pf[PATH_MAX + 64], shim[PATH_MAX], near[PATH_MAX];
     th_portfile(pf, sizeof pf, dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd"; /* e.g. a sanitizer build */
-    /* the shim of the same build, next to the server */
-    snprintf(near, sizeof near, "%.*slibcrashfs.so", (int)(strrchr(bin, '/') ? strrchr(bin, '/') - bin + 1 : 0), bin);
+    /* the shim of the same build, next to the server, or where TSDB_CRASHFS says (the dist tarball's tests/) */
+    if (getenv("TSDB_CRASHFS"))
+        snprintf(near, sizeof near, "%s", getenv("TSDB_CRASHFS"));
+    else
+        snprintf(near, sizeof near, "%.*slibcrashfs.so", (int)(strrchr(bin, '/') ? strrchr(bin, '/') - bin + 1 : 0), bin);
     if (eio_mark && !realpath(near, shim)) {
         fprintf(stderr, "%s is missing\n", near);
         exit(1);

@@ -18,7 +18,8 @@ cp include/tsdb.h include/tsdb_protocol.h include/tsdb_calendar.h client/tsdb_cl
 for t in test_tsdb test_types test_levels test_group test_follow test_volumes test_server test_stability test_ports; do
     cp "$b/$t" "$stage/tests/"
 done
-cp dist/run-tests.sh "$stage/tests/"
+# test_server preloads the crashfs shim to fail a WAL write (fail-stop); run-tests.sh points it there.
+cp "$b/libcrashfs.so" dist/run-tests.sh "$stage/tests/"
 cp dist/tsdbd.service "$stage/systemd/"
 cp dist/README.dist "$stage/README.dist"
 {

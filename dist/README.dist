@@ -11,7 +11,8 @@ Contents
   lib/libtsdb.a        the embedded engine; link with -lzstd -lpthread -lm
   lib/libtsdbclient.a  the C client of tsdbd; link with -lzstd -lpthread -lm
   include/             tsdb.h, tsdb_protocol.h, tsdb_calendar.h, tsdb_client.h
-  tests/               the test suite of this build; tests/run-tests.sh runs it
+  tests/               the test suite of this build; tests/run-tests.sh runs it (libcrashfs.so there is a
+                       test-only shim that fails a write on purpose; nothing else loads it)
   systemd/tsdbd.service
   BUILDINFO            version, compiler, glibc
 
