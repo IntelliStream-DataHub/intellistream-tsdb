@@ -19,6 +19,8 @@ typedef struct eng eng;
 #include <time.h>
 #include <zstd.h>
 
+#include "levels.h" /* before the declarations: renames them in a per-CPU-level compile */
+
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -218,6 +220,12 @@ typedef struct agg_state {
     };
 } agg_state;
 
+/* One NaN for every NaN sum. Which payload and sign an addition of NaNs keeps
+ * depends on the operand order the compiler picked (ADDSD returns its first
+ * NaN operand), and that differs between CPU levels and kernels; a sum must
+ * not (levels.h). */
+static inline double canon_nan(double x) { return x == x ? x : __builtin_nan(""); }
+
 static inline void agg_init(agg_state *a, int type)
 {
     a->rows = a->count = 0;
@@ -283,6 +291,15 @@ static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
 }
 const char *simd_name(void);
 void simd_init(void);
+/* Re-picks the kernels for at most `level` (CPU_BASE: scalar, CPU_V3: AVX2, CPU_V4: AVX-512); cpu.c calls it. */
+void simd_select(int level);
+
+/* ---- CPU levels (cpu.c, levels.h) ---- */
+int cpu_level(void);                 /* the level in use */
+int cpu_level_max(void);             /* the highest level both this CPU and this build have */
+int cpu_set_level(int level);        /* for tests; -1 if this CPU or build lacks the level */
+const void *cpu_level_probe(void);   /* for tests: the level's xxh64 in use (NULL without levels) */
+const char *cpu_level_name(int level); /* "v2" (or "base" when the build targets more), "v3", "v4" */
 
 /* Index of the first element >= key in a sorted array (branchless). */
 static inline size_t lower_bound_i64(const int64_t *a, size_t n, int64_t key)

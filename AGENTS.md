@@ -14,6 +14,10 @@ make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (abo
 make jepsen               # fault injection: kill -9, simulated power loss, pauses
 make PORTABLE=1           # without -march=native
 make NO_URING=1           # tsdbd on epoll only, without liburing (after make clean)
+make dist                 # portable tarball (x86-64-v2 + v3/v4 codecs) in build-dist/; checks glibc and ISA
+make dist-test            # the tarball's own test suite, at every CPU level (TSDB_CPU=v2|v3|v4)
+make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
+make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere/SandyBridge if installed
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 ```
 
@@ -49,6 +53,10 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/merge.c`: merge selection and execution. `src/query.c`: snapshots, raw
   queries, aggregation, bucketing. `src/manifest.c`: MANIFEST, retired parts, followers.
 - `src/codec*.c`: codecs; `src/simd.c`: dispatched aggregation kernels.
+  `src/levels.h`: the functions compiled once per CPU level in `make dist`;
+  `src/cpu.c`: picks the level at startup and dispatches to it.
+- `tools/mkdist.sh`, `tools/check-glibc.sh`, `tools/check-isa.sh`, `dist/`:
+  the portable tarball. `tests/distro/`: running it in containers and qemu.
 - `client/tsdb_calendar.c`: time zones (TZif and POSIX rules) and the UTC
   bounds of local periods. The engine and the server know UTC only; the
   clients turn local periods into bounds (QUERY_BOUNDS). `src/calendar.c`:
@@ -109,6 +117,22 @@ cgroup, so `nice` does not keep your work out of its way.
   reach the C, Rust, Python and Java clients in the same commit, with
   `make test-clients` green. History so far: version 2 typed operations, 3
   packed inserts, 4 QUERY_BOUNDS (the server knows UTC only).
+
+- **CPU levels.** `make dist` compiles for x86-64-v2 and compiles codec.c,
+  codec_alp.c, codec_typed.c, codec_xor.c and values.c again for v3 and v4;
+  `cpu.c` picks one set at startup. A function exported by those files needs
+  an entry in `src/levels.h` (the linker complains otherwise); a new hot path
+  elsewhere stays at v2 in the tarball unless it moves into one of them. Every
+  level, and every simd.c kernel, must give byte-identical blocks and identical
+  values and aggregates, since parts move between CPUs: no FMA contraction
+  (`-ffp-contract=off`), no libm functions glibc dispatches by CPU (log2, exp,
+  pow...: write the arithmetic out, as `log2_portable`), the f32 kernels sum in
+  one order (32 lanes), NaN sums are canonical (`canon_nan`). Those files must
+  not have constructors or other startup code: a v3/v4 copy's would run on
+  every CPU before the dispatch (SIGILL on a CPU without AVX); use constant
+  tables. `tests/test_levels.c` compares all of it and checks the dispatch;
+  add new codecs and edge cases there. `tools/check-isa.sh` (run by `make dist`)
+  checks the rest from the objects. The normal `make` (-march=native) has no levels.
 
 ## Conventions
 
