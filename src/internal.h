@@ -610,6 +610,12 @@ void db_retire_locked(struct eng *db, part *p);
 void graveyard_purge(struct eng *db, bool all);
 
 /* ---- database ---- */
+typedef struct ret_table {
+    uint64_t cap;
+    struct ret_table *older;
+    _Atomic int64_t limit[];
+} ret_table;
+
 struct eng {
     char *dir;
     int dirfd;
@@ -643,8 +649,9 @@ struct eng {
 
     /* retention (retention.c) */
     pthread_mutex_t ret_lock;
-    int64_t *ret_limit; /* ms per series id, 0 = keep */
-    uint32_t ret_cap;
+    /* ms per series id, 0 = keep: read without a lock (every query does); grown by a copy under ret_lock, the
+     * replaced tables stay valid until close */
+    _Atomic(struct ret_table *) ret_tab;
     atomic_bool has_retention; /* some series has a limit: queries and merges look it up */
     int ret_fd;
     uint64_t ret_off;
@@ -685,6 +692,9 @@ struct eng {
     pthread_mutex_t manifest_lock;
     uint64_t manifest_version;
     uint64_t wal_flushed; /* segments up to this are entirely in parts (db->lock) */
+    /* segments up to wal_removed are unlinked, up to wal_removed_synced durably (db->lock): an empty part (a
+     * merge's wal_seq anchor) is needed only while a segment up to its wal_seq may come back at open */
+    uint64_t wal_removed, wal_removed_synced;
     graveyard_entry *graveyard;
     size_t ngraveyard, graveyard_cap;
 
@@ -810,6 +820,6 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
                       const void *v, size_t n);
 /* merge.c: drops partitions every series of which has expired (sets *dropped) and selects a part to rewrite
  * without its expired rows (returns 1, sel[0] marked merging and referenced); caller holds db->lock */
-size_t ttl_select_locked(eng *db, part **sel, bool *dropped);
+size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal);
 
 #endif

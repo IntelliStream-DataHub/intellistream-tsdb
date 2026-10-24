@@ -443,6 +443,7 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     }
     if (!ro) {
         db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
+        db->wal_removed = db->wal_removed_synced = db->wal_seq - 1; /* and unlinked them, with a directory fsync */
         if ((rc = manifest_publish(db)) != 0)
             goto fail;
     }

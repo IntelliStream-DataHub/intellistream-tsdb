@@ -9,10 +9,13 @@
  * followers, and retention with a clock that jumps. */
 #include "internal.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -135,6 +138,8 @@ static tsdb_options test_opts(void)
     return o;
 }
 
+static const tsdb_options *reopen_opts; /* NULL: test_opts() */
+
 static void db_apply(tsdb **db, const char *dir, const op *o)
 {
     tsdb_values v = {TSDB_INT64, o->v, o->valid};
@@ -157,7 +162,7 @@ static void db_apply(tsdb **db, const char *dir, const op *o)
         break;
     case OP_REOPEN: {
         OK(tsdb_close(*db));
-        tsdb_options opt = test_opts();
+        tsdb_options opt = reopen_opts ? *reopen_opts : test_opts();
         OK(tsdb_open(dir, &opt, db));
         break;
     }
@@ -274,6 +279,9 @@ static void check_queries(tsdb *db, const model *m, uint64_t *r)
     }
 }
 
+static int mixed_parts(const char *dir);
+static int model_mixed; /* model steps that saw a part with both rows and tombstones */
+
 static void test_model(uint64_t seed, int steps)
 {
     char dir[1024];
@@ -281,6 +289,11 @@ static void test_model(uint64_t seed, int steps)
     rmrf(dir);
     tsdb_options opt = test_opts();
     opt.merge_threads = seed % 2 ? 2 : 0;
+    if (seed % 2) { /* background merges of a few parts at a time: tombstones kept by partial merges */
+        opt.merge_idle_s = 1;
+        opt.max_part_bytes = 12000;
+    }
+    reopen_opts = &opt;
     tsdb *db;
     OK(tsdb_open(dir, &opt, &db));
     create_series(db);
@@ -293,6 +306,8 @@ static void test_model(uint64_t seed, int steps)
     int start_failures = failures;
     for (int i = 0; i < steps && failures == start_failures; i++) {
         gen_op(&r, &o, true);
+        if (seed % 2 && o.kind == OP_OPTIMIZE)
+            o.kind = OP_FLUSH; /* parts pile up: level merges of the newer, smaller ones leave older ones out */
         db_apply(&db, dir, &o);
         model_apply(&m, &o);
         for (uint32_t s = 0; s < NS; s++)
@@ -303,11 +318,20 @@ static void test_model(uint64_t seed, int steps)
                 break;
             }
         check_queries(db, &m, &qr);
+        if (seed % 2)
+            model_mixed += mixed_parts(dir) > 0;
+    }
+    if (getenv("TSDB_DELETE_VERBOSE")) {
+        tsdb_stats st;
+        tsdb_get_stats(db, &st);
+        printf("model seed %" PRIu64 ": %" PRIu64 " background merges, %d steps with mixed parts\n", seed, st.merges,
+               model_mixed);
     }
     OK(tsdb_optimize(db));
     for (uint32_t s = 0; s < NS; s++)
         CHECK(series_matches(db, &m, s, false));
     OK(tsdb_close(db));
+    reopen_opts = NULL;
 }
 
 /* A child runs the sequence and reports each acknowledged operation through a
@@ -690,6 +714,231 @@ static void test_retention(void)
     OK(tsdb_close(db));
 }
 
+/* Parts in dir that hold both granules and tombstones: what a merge that left an older part of the partition out
+ * writes (it must keep the tombstones, and they must not hide its own rows). */
+static int mixed_parts(const char *dir)
+{
+    DIR *d = opendir(dir);
+    int n = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        size_t l = strlen(e->d_name);
+        if (l < 6 || strcmp(e->d_name + l - 5, ".part") != 0 || strncmp(e->d_name, "retired_", 8) == 0)
+            continue;
+        char path[1400];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        struct stat st;
+        part_footer f;
+        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= (off_t)sizeof f &&
+            pread(fd, &f, sizeof f, st.st_size - (off_t)sizeof f) == (ssize_t)sizeof f && f.ngranules > 0 &&
+            f.index_off + (uint64_t)f.ngranules * sizeof(granule) + sizeof f < (uint64_t)st.st_size)
+            n++;
+        if (fd >= 0)
+            close(fd);
+    }
+    if (d)
+        closedir(d);
+    return n;
+}
+
+static void wait_ms(int ms)
+{
+    struct timespec d = {ms / 1000, (long)(ms % 1000) * 1000000};
+    nanosleep(&d, NULL);
+}
+
+/* A background merge of a replace's parts (tombstones + new rows) that leaves the big old part out
+ * (max_part_bytes): the merged part keeps the tombstones, which still hide the old part's rows and not its own. */
+static void test_partial_merge(void)
+{
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/tsdb_delete_partial", scratch);
+    rmrf(dir);
+    tsdb_options opt;
+    tsdb_options_init(&opt);
+    opt.partition_ms = 1000000000;
+    opt.merge_threads = 1;
+    opt.merge_idle_s = 1;
+    opt.max_part_bytes = 200000;
+    tsdb *db;
+    OK(tsdb_open(dir, &opt, &db));
+    uint32_t s;
+    OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &s));
+    enum { N = 100000 };
+    static int64_t ts[N], v[N];
+    uint64_t r = 88172645463325252ull;
+    for (int i = 0; i < N; i++)
+        ts[i] = i, v[i] = 1 | (int64_t)(rnd(&r) & 0xffffff) << 1;
+    tsdb_values tv = {TSDB_INT64, v, NULL};
+    OK(tsdb_insert_series_values(db, s, ts, &tv, N));
+    OK(tsdb_flush(db));
+    int64_t want = 0;
+    for (int i = N / 2; i < N; i++)
+        want += v[i];
+    int64_t rts[100], rv[100];
+    for (int i = 0; i < 100; i++)
+        rts[i] = i, rv[i] = 7, want += 7;
+    tsdb_values rtv = {TSDB_INT64, rv, NULL};
+    OK(tsdb_replace_range(db, s, 0, N / 2, rts, &rtv, 100));
+    tsdb_stats st;
+    for (int i = 0; i < 100; i++) {
+        tsdb_get_stats(db, &st);
+        if (st.parts == 2 && mixed_parts(dir) == 1)
+            break;
+        wait_ms(100);
+    }
+    CHECK(mixed_parts(dir) == 1); /* the merge happened, and left the old part out */
+    tsdb_query_stats qs;
+    int64_t sum;
+    CHECK(agg_count(db, s, 0, N, &sum, &qs) == N / 2 + 100);
+    CHECK(sum == want);
+    OK(tsdb_close(db));
+    OK(tsdb_open(dir, &opt, &db));
+    CHECK(agg_count(db, s, 0, N, &sum, &qs) == N / 2 + 100);
+    OK(tsdb_optimize(db));
+    CHECK(agg_count(db, s, 0, N, &sum, &qs) == N / 2 + 100);
+    CHECK(sum == want);
+    OK(tsdb_close(db));
+}
+
+/* Deletes whose ends fall exactly on the first or last row of a granule, a part or a partition. */
+static void test_edges(void)
+{
+    static const struct {
+        int64_t a, b, left; /* delete [a, b) of rows 0..5999 (granules of 64, partitions of 2000) */
+    } c[] = {
+        {5999, 7000, 5999}, /* start at the last row of the last part */
+        {1999, 2500, 5499}, /* start at the last row of a partition */
+        {1500, 2000, 5500}, /* end at the first row of the next partition */
+        {2000, 4000, 4000}, /* exactly one partition */
+        {1000, 1001, 5999}, /* one row */
+        {63, 64, 5999},     /* the last row of a granule */
+        {127, 300, 5827},   /* from the last row of a granule */
+        {50, 64, 5986},     /* up to the first row of the next granule */
+        {-5, 0, 6000},      /* up to the first row */
+    };
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/tsdb_delete_edges", scratch);
+    for (size_t k = 0; k < sizeof c / sizeof c[0]; k++) {
+        rmrf(dir);
+        tsdb_options opt = test_opts();
+        opt.merge_threads = 0;
+        tsdb *db;
+        OK(tsdb_open(dir, &opt, &db));
+        uint32_t s;
+        OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &s));
+        static int64_t ts[6000], v[6000];
+        for (int i = 0; i < 6000; i++)
+            ts[i] = i, v[i] = 1;
+        tsdb_values tv = {TSDB_INT64, v, NULL};
+        OK(tsdb_insert_series_values(db, s, ts, &tv, 6000));
+        OK(tsdb_flush(db));
+        OK(tsdb_delete_range(db, s, c[k].a, c[k].b));
+        tsdb_query_stats qs;
+        int64_t sum, q = agg_count(db, s, -10, 10000, &sum, &qs);
+        OK(tsdb_optimize(db));
+        int64_t m = agg_count(db, s, -10, 10000, &sum, &qs);
+        if (q != c[k].left || m != c[k].left || sum != c[k].left) {
+            fprintf(stderr, "edges: delete [%" PRId64 ", %" PRId64 ") left %" PRId64 ", after merge %" PRId64
+                    ", want %" PRId64 "\n", c[k].a, c[k].b, q, m, c[k].left);
+            failures++;
+        }
+        OK(tsdb_close(db));
+    }
+}
+
+/* An empty part left by a merge (all rows deleted or expired) anchors WAL replay: while a WAL segment from before
+ * the delete may come back (an unlink that was not durable), it keeps that segment's deleted rows out. Once no
+ * such segment can exist, the anchor and its partition go: nothing is left behind for good. */
+static void test_anchors(void)
+{
+    char dir[1024], seg[1400], aside[1400];
+    snprintf(dir, sizeof dir, "%s/tsdb_delete_anchor", scratch);
+    snprintf(aside, sizeof aside, "%s.wal", dir);
+    rmrf(dir);
+    tsdb_options opt = test_opts();
+    opt.merge_threads = 0; /* nothing may retire the anchor before the segment comes back */
+    tsdb *db;
+    OK(tsdb_open(dir, &opt, &db));
+    uint32_t s;
+    OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &s));
+    int64_t ts[100], v[100];
+    for (int i = 0; i < 100; i++)
+        ts[i] = i, v[i] = 1;
+    tsdb_values tv = {TSDB_INT64, v, NULL};
+    OK(tsdb_insert_series_values(db, s, ts, &tv, 100)); /* small: in the WAL */
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    seg[0] = 0;
+    while (d && (e = readdir(d)) != NULL)
+        if (strncmp(e->d_name, "wal_", 4) == 0)
+            snprintf(seg, sizeof seg, "%s/%s", dir, e->d_name);
+    if (d)
+        closedir(d);
+    char cmd[3000];
+    snprintf(cmd, sizeof cmd, "cp '%s' '%s'", seg, aside);
+    CHECK(seg[0] && system(cmd) == 0);
+    OK(tsdb_delete_range(db, s, 0, 100));
+    OK(tsdb_optimize(db));
+    OK(tsdb_close(db));
+    CHECK(rename(aside, seg) == 0); /* the segment's unlink was lost */
+    OK(tsdb_open(dir, &opt, &db));
+    tsdb_query_stats qs;
+    int64_t sum;
+    CHECK(agg_count(db, s, 0, 100, &sum, &qs) == 0);
+    OK(tsdb_close(db));
+
+    /* with merges on, the anchor goes once its WAL segment is gone */
+    opt.merge_threads = 1;
+    OK(tsdb_open(dir, &opt, &db));
+    tsdb_stats st;
+    for (int i = 0; i < 50; i++) {
+        tsdb_get_stats(db, &st);
+        if (st.partitions == 0)
+            break;
+        wait_ms(100);
+    }
+    CHECK(st.partitions == 0 && st.parts == 0);
+    CHECK(agg_count(db, s, 0, 100, &sum, &qs) == 0);
+    OK(tsdb_close(db));
+
+    /* retention: the rows expire before the end of their partition; the k = 1 rewrite leaves an anchor, which must
+     * not keep the expired partition forever */
+    rmrf(dir);
+    opt = test_opts();
+    opt.merge_threads = 1;
+    opt.retention_merge_s = 1;
+    opt.clock_ms = fake_clock;
+    fake_now = 1000;
+    OK(tsdb_open(dir, &opt, &db));
+    OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &s));
+    static int64_t ts2[1000], v2[1000];
+    for (int i = 0; i < 1000; i++)
+        ts2[i] = i, v2[i] = 1;
+    tv.values = v2;
+    OK(tsdb_insert_series_values(db, s, ts2, &tv, 1000));
+    OK(tsdb_flush(db));
+    OK(tsdb_set_retention(db, s, 1000));
+    __atomic_store_n(&fake_now, 2500, __ATOMIC_SEQ_CST); /* rows expired, their partition [0, 2000) not yet */
+    for (int i = 0; i < 60; i++) {
+        tsdb_get_stats(db, &st);
+        if (st.rows == 0)
+            break;
+        wait_ms(100);
+    }
+    CHECK(st.rows == 0); /* rewritten into an anchor (which may go at once) */
+    __atomic_store_n(&fake_now, 100000, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < 60; i++) {
+        tsdb_get_stats(db, &st);
+        if (st.partitions == 0)
+            break;
+        wait_ms(100);
+    }
+    CHECK(st.partitions == 0 && st.parts == 0);
+    OK(tsdb_close(db));
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1)
@@ -699,8 +948,17 @@ int main(int argc, char **argv)
     test_wal_replay();
     test_follower();
     test_retention();
+    test_partial_merge();
+    test_edges();
+    test_anchors();
     for (int i = 0; i < rounds && !failures; i++)
         test_model(1000 + (uint64_t)i, 150);
+    if (rounds >= 2 && !failures && model_mixed == 0) {
+        fprintf(stderr, "model: no merge ever kept tombstones next to rows (partial merges untested)\n");
+        failures++;
+    }
+    if (getenv("TSDB_DELETE_VERBOSE"))
+        printf("model: %d steps saw a part with rows and tombstones\n", model_mixed);
     for (int i = 0; i < 4 * rounds && !failures; i++)
         test_crash(5000 + (uint64_t)i);
     if (failures) {

@@ -402,10 +402,8 @@ static void ttl_compute_locked(eng *db, part *p, uint32_t gen)
     if (__builtin_mul_overflow(p->partition, db->partition_ms, &lo))
         lo = p->partition < 0 ? INT64_MIN : INT64_MAX;
     pend = sat_add64(lo, db->partition_ms);
-    pthread_mutex_lock(&db->ret_lock);
     for (uint32_t i = 0; i < p->ng; i++) {
-        uint32_t s = p->g[i].series;
-        int64_t lim = s < db->ret_cap ? db->ret_limit[s] : 0;
+        int64_t lim = eng_retention(db, p->g[i].series);
         if (lim <= 0) {
             all = INT64_MAX;
             continue;
@@ -414,23 +412,24 @@ static void ttl_compute_locked(eng *db, part *p, uint32_t gen)
         all = MAX(all, sat_add64(pend, lim));
     }
     for (uint32_t i = 0; i < p->nt; i++) {
-        uint32_t s = p->t[i].series;
-        int64_t lim = s < db->ret_cap ? db->ret_limit[s] : 0;
+        int64_t lim = eng_retention(db, p->t[i].series);
         all = MAX(all, lim <= 0 ? INT64_MAX : sat_add64(pend, lim));
     }
-    pthread_mutex_unlock(&db->ret_lock);
-    if (!p->ng && !p->nt)
-        all = INT64_MAX; /* an empty merge result anchors WAL replay: it goes with its partition only */
     p->ttl_any = any;
     p->ttl_all = all;
     p->ttl_gen = gen;
 }
 
-size_t ttl_select_locked(eng *db, part **sel, bool *dropped)
+/* Expired partitions and partitions left with nothing but empty parts are retired (*dropped); one part with
+ * expired rows is selected for a rewrite. An empty part (a merge's wal_seq anchor) holds its partition only while
+ * a WAL segment up to its wal_seq may still be replayed: *sync_wal asks for a directory fsync that makes the
+ * removal of such segments durable, after which it can go. Caller holds db->lock. */
+size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
 {
-    *dropped = false;
-    if (!atomic_load_explicit(&db->has_retention, memory_order_relaxed) || db->opt.read_only)
+    *dropped = *sync_wal = false;
+    if (db->opt.read_only)
         return 0;
+    bool ret = atomic_load_explicit(&db->has_retention, memory_order_relaxed);
     struct timespec mono;
     clock_gettime(CLOCK_MONOTONIC, &mono);
     int64_t mono_ms = (int64_t)mono.tv_sec * 1000 + mono.tv_nsec / 1000000;
@@ -438,20 +437,32 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped)
         return 0;
     db->last_ttl_ms = mono_ms;
     uint32_t gen = atomic_load(&db->ret_gen);
-    int64_t now = eng_now_ms(db);
+    int64_t now = ret ? eng_now_ms(db) : 0;
     time_t wall = time(NULL);
     size_t k = 0;
     for (size_t a = 0, b; a < db->nparts; a = b) {
         int64_t all = INT64_MIN;
         for (b = a; b < db->nparts && db->parts[b]->partition == db->parts[a]->partition; b++) {
             part *p = db->parts[b];
+            if (!p->ng && !p->nt) {
+                if (p->wal_seq > db->wal_removed_synced) {
+                    all = INT64_MAX;
+                    *sync_wal |= p->wal_seq <= db->wal_removed;
+                }
+                continue;
+            }
+            if (!ret) {
+                all = INT64_MAX;
+                continue;
+            }
             if (p->ttl_gen != gen)
                 ttl_compute_locked(db, p, gen);
             all = MAX(all, p->ttl_all);
         }
         if (now >= all && !eng_check(db)) {
-            /* every series in the partition has expired past its end: drop it like tsdb_drop_before. Memtable
-             * rows of it are hidden by the same cutoffs; flushed later, they go the same way. */
+            /* every series in the partition has expired past its end, or nothing is left in it: drop it like
+             * tsdb_drop_before. Memtable rows of it are hidden by the same cutoffs; flushed later, they go the
+             * same way (or, for an empty partition, are newer than what was deleted). */
             for (size_t i = b; i-- > a;) {
                 db->parts[i]->dropped = true; /* an in-flight merge of it discards its result */
                 db_retire_locked(db, db->parts[i]);
@@ -460,9 +471,9 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped)
             b = a; /* the list shrank */
             continue;
         }
-        for (size_t i = a; i < b && !k; i++) {
+        for (size_t i = a; ret && i < b && !k; i++) {
             part *p = db->parts[i];
-            if (p->merging || now <= p->ttl_any || db->opt.retention_merge_s < 0 ||
+            if (p->merging || (!p->ng && !p->nt) || now <= p->ttl_any || db->opt.retention_merge_s < 0 ||
                 wall - p->created < db->opt.retention_merge_s)
                 continue;
             p->merging = true;
@@ -470,7 +481,7 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped)
             sel[k++] = p;
         }
     }
-    if (k)
+    if (k || *sync_wal)
         db->last_ttl_ms = 0; /* there may be more: look again once this one is done */
     return k;
 }
@@ -482,14 +493,19 @@ void *merge_thread_main(void *arg)
     pthread_mutex_lock(&db->lock);
     while (!atomic_load(&db->stop)) {
         size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel); /* a failed engine writes nothing more */
-        bool dropped = false;
+        bool dropped = false, sync_wal = false;
         if (!k && !eng_check(db))
-            k = ttl_select_locked(db, sel, &dropped);
-        if (dropped) {
+            k = ttl_select_locked(db, sel, &dropped, &sync_wal);
+        if (dropped || sync_wal) {
+            uint64_t removed = db->wal_removed;
             pthread_mutex_unlock(&db->lock);
-            if (eng_sync_dir(db, "fsync of the directory after retiring expired partitions") == 0)
+            int src = eng_sync_dir(db, "fsync of the directory after retiring expired partitions");
+            if (src == 0 && dropped)
                 manifest_publish(db);
             pthread_mutex_lock(&db->lock);
+            if (src == 0)
+                db->wal_removed_synced = MAX(db->wal_removed_synced, removed);
+            dropped |= sync_wal && src == 0; /* look again at once */
         }
         if (!k) {
             if (dropped)

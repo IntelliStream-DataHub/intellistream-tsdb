@@ -594,6 +594,11 @@ static int flush_waiting(eng *db)
             wal_name(name, sizeof name, m->wal_seq);
             unlinkat(db->dirfd, name, 0);
         }
+        if (mrc == 0) {
+            pthread_mutex_lock(&db->lock);
+            db->wal_removed = MAX(db->wal_removed, m->wal_seq);
+            pthread_mutex_unlock(&db->lock);
+        }
         mt_unref(m);
         rc = mrc;
     }

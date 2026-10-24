@@ -43,18 +43,22 @@ static bool rec_ok(const uint8_t *rec, uint64_t off)
 static int ret_put_locked(eng *db, uint32_t series, int64_t limit)
 {
     atomic_fetch_add(&db->ret_gen, 1);
-    if (series >= db->ret_cap) {
-        uint32_t cap = db->ret_cap ? db->ret_cap : 1024;
+    ret_table *t = atomic_load_explicit(&db->ret_tab, memory_order_relaxed);
+    if (!t || series >= t->cap) {
+        uint64_t cap = t ? t->cap : 1024;
         while (cap <= series)
             cap *= 2;
-        int64_t *x = realloc(db->ret_limit, cap * sizeof *x);
+        ret_table *x = calloc(1, sizeof *x + cap * sizeof x->limit[0]);
         if (!x)
             return TSDB_ERR_NOMEM;
-        memset(x + db->ret_cap, 0, (cap - db->ret_cap) * sizeof *x);
-        db->ret_limit = x;
-        db->ret_cap = cap;
+        x->cap = cap;
+        x->older = t;
+        for (uint64_t i = 0; t && i < t->cap; i++)
+            atomic_init(&x->limit[i], atomic_load_explicit(&t->limit[i], memory_order_relaxed));
+        atomic_store_explicit(&db->ret_tab, x, memory_order_release);
+        t = x;
     }
-    db->ret_limit[series] = limit;
+    atomic_store_explicit(&t->limit[series], limit, memory_order_relaxed);
     if (limit > 0)
         atomic_store(&db->has_retention, true);
     return 0;
@@ -124,9 +128,11 @@ void ret_close(eng *db)
     if (db->ret_fd >= 0)
         close(db->ret_fd);
     db->ret_fd = -1;
-    free(db->ret_limit);
-    db->ret_limit = NULL;
-    db->ret_cap = 0;
+    for (ret_table *t = atomic_load(&db->ret_tab), *o; t; t = o) {
+        o = t->older;
+        free(t);
+    }
+    atomic_store(&db->ret_tab, NULL);
     pthread_mutex_destroy(&db->ret_lock);
 }
 
@@ -164,10 +170,8 @@ int64_t eng_retention(eng *db, uint32_t series)
 {
     if (!atomic_load_explicit(&db->has_retention, memory_order_relaxed))
         return 0;
-    pthread_mutex_lock(&db->ret_lock);
-    int64_t limit = series < db->ret_cap ? db->ret_limit[series] : 0;
-    pthread_mutex_unlock(&db->ret_lock);
-    return limit;
+    ret_table *t = atomic_load_explicit(&db->ret_tab, memory_order_acquire);
+    return t && series < t->cap ? atomic_load_explicit(&t->limit[series], memory_order_relaxed) : 0;
 }
 
 int64_t eng_cutoff_at(eng *db, uint32_t series, int64_t now)

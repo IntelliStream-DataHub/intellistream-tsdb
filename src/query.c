@@ -43,6 +43,7 @@ typedef struct snapshot {
     mem_run *mem; /* rows of the series from memtables, oldest memtable first, and from parts with deletes */
     uint64_t *mprio; /* per run: its priority on equal timestamps */
     size_t nmem;
+    int64_t start, end; /* the range gi/gj were found for */
 } snapshot;
 
 static void snapshot_release(snapshot *s)
@@ -168,6 +169,11 @@ static void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uin
 static void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t start, int64_t end, uint32_t *gi,
                       uint32_t *gj)
 {
+    if (start <= sn->start && end >= sn->end) { /* the snapshot's window is the answer: no second search */
+        *gi = sn->gi[i];
+        *gj = sn->gj[i];
+        return;
+    }
     part_find(sn->parts[i], series, start, end, gi, gj);
     *gi = MAX(*gi, sn->gi[i]);
     *gj = MIN(*gj, sn->gj[i]);
@@ -267,6 +273,8 @@ static int decode_visible(codec_ctx *cc, const part *p, uint32_t k, uint32_t e, 
  */
 static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start, int64_t end)
 {
+    s->start = start;
+    s->end = end;
     s->gi = malloc((s->np + 1) * sizeof *s->gi);
     s->gj = malloc((s->np + 1) * sizeof *s->gj);
     s->mprio = malloc((s->nmem + 1) * sizeof *s->mprio);
