@@ -13,6 +13,7 @@ import ai.intellistream.tsdb.Unit;
 import ai.intellistream.tsdb.ValuePoints;
 import ai.intellistream.tsdb.ValueType;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -75,7 +76,7 @@ class EmbeddedDbTest {
         assertTrue(new EmbeddedOptions().toString().contains("granuleRows=8192"));
         /* the fields after obsolete_part_lifetime_s, read from tsdb_options_init and written back at their offsets */
         String defaults = new EmbeddedOptions().toString();
-        assertTrue(defaults.contains("verifyChecksums=false, retentionMergeS=3600]"), defaults);
+        assertTrue(defaults.contains("verifyChecksums=false, retentionMergeS=3600, createVolumes=true]"), defaults);
         assertTrue(db.isOpen());
         assertTrue(db.toString().contains("db"));
     }
@@ -575,6 +576,27 @@ class EmbeddedDbTest {
             db.queryBounds(s, T0, T0 + 2000, new long[] {T0});
         }
         assertEquals(before, Native.OUTSTANDING.get());
+    }
+
+    @Test
+    void volumesOnlyWhereAllowed() throws Exception {
+        /* create_volumes is the last field of tsdb_options: off, as in tsdbd, an unknown directory is not made */
+        Path other = tmp.resolve("db2");
+        Path vol = tmp.resolve("vol2b");
+        try (EmbeddedDb d = EmbeddedDb.open(other.toString(), new EmbeddedOptions().fsync(false).createVolumes(false))) {
+            assertEquals(Status.ERR_NOTFOUND, status(() -> d.seriesAt("x", vol.toString())));
+            assertFalse(Files.exists(vol), "no directory for a refused volume");
+            assertEquals(1, d.volumeCount());
+        }
+        /* on (the default), the same path checks as tsdb volume add still apply */
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesAt("x", "relative/vol")));
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesAt("x", vol + "/../vol3")));
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesAt("x", vol + "\nx")));
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesAt("x", tmp.resolve("db").resolve("in").toString())));
+        assertFalse(Files.exists(tmp.resolve("vol3")));
+        assertEquals(1, db.volumeCount());
+        db.seriesAt("x", vol.toString());
+        assertEquals(2, db.volumeCount());
     }
 
     @Test

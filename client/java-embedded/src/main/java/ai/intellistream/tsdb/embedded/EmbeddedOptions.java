@@ -39,6 +39,7 @@ public final class EmbeddedOptions {
     private int obsoletePartLifetimeS;
     private boolean verifyChecksums;
     private int retentionMergeS;
+    private boolean createVolumes;
 
     /** The library's defaults. */
     public EmbeddedOptions() {
@@ -68,6 +69,7 @@ public final class EmbeddedOptions {
             obsoletePartLifetimeS = o.get(JAVA_INT, offset(OPTIONS, "obsolete_part_lifetime_s"));
             verifyChecksums = o.get(JAVA_INT, offset(OPTIONS, "verify_checksums")) != 0;
             retentionMergeS = o.get(JAVA_INT, offset(OPTIONS, "retention_merge_s"));
+            createVolumes = o.get(JAVA_INT, offset(OPTIONS, "create_volumes")) != 0;
         }
     }
 
@@ -93,6 +95,7 @@ public final class EmbeddedOptions {
         o.set(JAVA_INT, offset(OPTIONS, "obsolete_part_lifetime_s"), obsoletePartLifetimeS);
         o.set(JAVA_INT, offset(OPTIONS, "verify_checksums"), verifyChecksums ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "retention_merge_s"), retentionMergeS);
+        o.set(JAVA_INT, offset(OPTIONS, "create_volumes"), createVolumes ? 1 : 0);
         /* clock_ms and clock_arg stay NULL (allocate zeroes): retention reads the wall clock */
         return o;
     }
@@ -308,6 +311,18 @@ public final class EmbeddedOptions {
         return this;
     }
 
+    /**
+     * Whether {@link EmbeddedDb#seriesAt} may add a volume for a directory not yet listed (after the same path
+     * checks as {@code tsdb volume add}). Off, an unknown directory is refused (not found), as tsdbd does.
+     *
+     * @param on default true
+     * @return this
+     */
+    public EmbeddedOptions createVolumes(boolean on) {
+        createVolumes = on;
+        return this;
+    }
+
     @Override
     public String toString() {
         return "EmbeddedOptions[partitionMs=" + partitionMs + ", granuleRows=" + granuleRows + ", zstdLevel="
@@ -316,6 +331,7 @@ public final class EmbeddedOptions {
                 + flushIntervalMs + ", walSyncMs=" + walSyncMs + ", walMaxBatchRows=" + walMaxBatchRows
                 + ", maxPartBytes=" + maxPartBytes + ", readOnly=" + readOnly + ", follow=" + follow + ", refreshMs="
                 + refreshMs + ", mergeIdleS=" + mergeIdleS + ", obsoletePartLifetimeS=" + obsoletePartLifetimeS
-                + ", verifyChecksums=" + verifyChecksums + ", retentionMergeS=" + retentionMergeS + "]";
+                + ", verifyChecksums=" + verifyChecksums + ", retentionMergeS=" + retentionMergeS
+                + ", createVolumes=" + createVolumes + "]";
     }
 }
