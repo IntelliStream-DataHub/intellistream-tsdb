@@ -11,10 +11,12 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -2571,6 +2573,25 @@ static void test_metrics_more(const char *dir)
         if (took > 500000)
             fprintf(stderr, "metrics: a scrape behind 3 clients that do not read took %lld ms\n", (long long)took / 1000);
         CHECK(took < 500000);
+        /* a client that does not read its reply holds its slot for SEND_BUDGET_MS (1 s), then the reply is
+         * dropped: reading now gets the part the kernel took and the end, not the whole reply */
+        usleep(1500000);
+        struct timeval tv = {5, 0};
+        setsockopt(stuck[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        size_t cap = len * 2 + 65536, got = 0;
+        char *all = malloc(cap + 1);
+        for (ssize_t r; got < cap && (r = read(stuck[0], all + got, cap - got)) > 0;)
+            got += (size_t)r;
+        all[got] = 0;
+        char *body = strstr(all, "\r\n\r\n"), *cl = strstr(all, "Content-Length: ");
+        CHECK(body && cl);
+        if (body && cl) {
+            size_t blen = got - (size_t)(body + 4 - all);
+            if (blen >= (size_t)atol(cl + 16))
+                fprintf(stderr, "metrics: a client that did not read for 1.5 s still got all %zu bytes\n", blen);
+            CHECK(blen < (size_t)atol(cl + 16));
+        }
+        free(all);
         for (int i = 0; i < 3; i++)
             close(stuck[i]);
     }
@@ -2581,8 +2602,437 @@ static void test_metrics_more(const char *dir)
         failures++;
 }
 
+/* tsdb_request_memory_bytes of the server whose metrics port is mport; -1 if the scrape failed. */
+static double request_memory(void)
+{
+    mset m;
+    if (!scrape(&m))
+        return -1;
+    double v = mval(&m, "tsdb_request_memory_bytes", NULL);
+    mset_free(&m);
+    return v;
+}
+
+/* Sends `fr` (`total` bytes, repeated) without blocking until the server stops taking it for a second or `cap`
+ * bytes went; returns the bytes sent. */
+static size_t send_until_stalled(int fd, const uint8_t *fr, size_t total, size_t cap)
+{
+    int fl = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    size_t sent = 0;
+    int64_t quiet = mono_us();
+    while (sent < cap && mono_us() - quiet < 1000000) {
+        ssize_t w = send(fd, fr + sent % total, total - sent % total, MSG_NOSIGNAL);
+        if (w > 0) {
+            sent += (size_t)w;
+            quiet = mono_us();
+        } else {
+            usleep(1000);
+        }
+    }
+    fcntl(fd, F_SETFL, fl);
+    return sent;
+}
+
+/* An INSERT frame of n rows (1 MB for 87000) into series s, all at time 0. */
+static uint8_t *insert_frame(uint32_t s, uint32_t n, uint32_t id, size_t *total)
+{
+    size_t len = 8 + (size_t)n * 12;
+    uint8_t *fr = calloc(9 + len, 1);
+    uint32_t flen = (uint32_t)len + 5;
+    memcpy(fr, &flen, 4);
+    memcpy(fr + 4, &id, 4);
+    fr[8] = TSDB_OP_INSERT;
+    memcpy(fr + 9, &n, 4);
+    memcpy(fr + 13, &s, 4);
+    *total = 9 + len;
+    return fr;
+}
+
+/* What a client can make the server hold or answer is bounded: the size of a reply, of a packed insert, the
+ * memory of requests across connections, the time a frame may take to arrive; and bad flags stop the start. */
+static void test_hostile(const char *dir)
+{
+    char cmd[2400];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s.bad'", dir, dir);
+    if (system(cmd) != 0) {
+        failures++;
+        return;
+    }
+    const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+
+    /* bad numeric flags: exit 2 at once (the port used to wrap: 70000 bound 4464). KILL on timeout and no huge
+         * worker counts: a server that takes the flag starts that many threads and ignores TERM while it does
+         * (on the old code, --workers 100000 held 70,000 threads until the user's task limit stopped every fork) */
+    {
+        static const char *const bad[] = {"--port 70000", "--port -1", "--port 12x", "--workers 0", "--workers 4097",
+                                          "--max-connections 0", "--max-connections -1", "--refresh-ms -5",
+                                          "--wal-sync-ms -5", "--frame-timeout 0", "--max-request-memory 0",
+                                          "--send-timeout abc", "--partition-ms 99999999999999999999"};
+        for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+            snprintf(cmd, sizeof cmd, "timeout -s KILL 10 '%s' --dir '%s.bad' %s >/dev/null 2>&1", bin, dir, bad[i]);
+            int st = system(cmd);
+            if (!(WIFEXITED(st) && WEXITSTATUS(st) == 2))
+                fprintf(stderr, "tsdbd %s: status %d, not 2\n", bad[i], WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+            CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2);
+        }
+    }
+
+    /* --port-file: a link planted at the temporary name another user could predict (FILE.tmp.<pid>) is not
+     * followed; its target is left alone */
+    {
+        char pf[1200], tmp[1300], target[1200];
+        snprintf(pf, sizeof pf, "%s.bad.port", dir);
+        snprintf(target, sizeof target, "%s.bad.target", dir);
+        FILE *f = fopen(target, "w");
+        CHECK(f && fputs("precious\n", f) >= 0 && fclose(f) == 0);
+        pid_t pid = fork();
+        if (pid == 0) {
+            snprintf(tmp, sizeof tmp, "%s.tmp.%d", pf, (int)getpid());
+            if (symlink(target, tmp) != 0)
+                _exit(126);
+            execl(bin, "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--no-fsync", (char *)NULL);
+            _exit(127);
+        }
+        int p = th_await(pf, pid, 30000);
+        if (p <= 0)
+            fputs(th_why, stderr);
+        CHECK(p > 0);
+        char got[64] = "";
+        f = fopen(target, "r");
+        CHECK(f && fgets(got, sizeof got, f));
+        if (f)
+            fclose(f);
+        CHECK(strcmp(got, "precious\n") == 0);
+        signal_pid(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        snprintf(tmp, sizeof tmp, "%s.tmp.%d", pf, (int)pid);
+        unlink(tmp);
+        unlink(pf);
+        unlink(target);
+    }
+
+    const char *extra[] = {"--frame-timeout", "2", "--max-request-memory", "1", "--send-timeout", "5",
+                           "--metrics-port", "auto", "--metrics-bind", "127.0.0.1", NULL};
+    pid_t srv = start_server_with(dir, extra);
+    mport = th_mport;
+    CHECK(mport > 0);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    uint32_t s;
+    OK(tsdbc_series(c, "hostile", 1, &s));
+
+    {
+        int64_t ts[2] = {0, 5000000};
+        float v[2] = {1, 2};
+        uint32_t ss[2] = {s, s};
+        OK(tsdbc_insert(c, ss, ts, v, 2));
+    }
+    uint32_t big;
+    size_t nbig = 4500000;
+    OK(tsdbc_series(c, "hostile.big", 1, &big));
+    {
+        int64_t *ts = malloc(nbig * 8);
+        float *v = malloc(nbig * 4);
+        uint32_t *ss = malloc(nbig * 4);
+        for (size_t i = 0; i < nbig; i++) {
+            ts[i] = (int64_t)i;
+            v[i] = (float)i;
+            ss[i] = big;
+        }
+        OK(tsdbc_insert(c, ss, ts, v, nbig));
+        free(ts);
+        free(v);
+        free(ss);
+    }
+
+    /* a reply larger than a frame is TOO_MANY_BUCKETS (4.5 million buckets of 64 bytes made a 288 MB frame,
+     * which clients refuse; 64 million wrapped the 32-bit length) */
+    {
+        tsdb_bucket *b = NULL;
+        size_t nb = 0;
+        CHECK(tsdbc_query_agg(c, big, 0, (int64_t)nbig, 1, &b, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+        free(b);
+        CHECK(count_of(c, big) == nbig); /* the connection still works */
+    }
+
+    /* the same for QUERY_AGG (32 bytes a bucket): 9 million buckets would make a 288 MB frame */
+    {
+        int64_t *ts = malloc(nbig * 8);
+        float *v = calloc(nbig, 4);
+        uint32_t *ss = malloc(nbig * 4);
+        for (size_t i = 0; i < nbig; i++) {
+            ts[i] = (int64_t)(nbig + i);
+            ss[i] = big;
+        }
+        OK(tsdbc_insert(c, ss, ts, v, nbig));
+        free(ts);
+        free(v);
+        free(ss);
+        uint8_t q[28];
+        int64_t start = 0, end = 2 * (int64_t)nbig, iv = 1;
+        memcpy(q, &big, 4);
+        memcpy(q + 4, &start, 8);
+        memcpy(q + 12, &end, 8);
+        memcpy(q + 20, &iv, 8);
+        int fd = raw_connect();
+        raw_send(fd, 3, TSDB_OP_QUERY_AGG, q, sizeof q);
+        uint32_t id = 0;
+        uint8_t rest[64];
+        size_t nrest;
+        CHECK(raw_reply(fd, &id, rest, sizeof rest, &nrest) == TSDB_ERR_TOO_MANY_BUCKETS && id == 3);
+        close(fd);
+    }
+
+    /* a packed insert whose rows would not fit a frame unpacked: refused before anything is allocated
+     * (23 million float32 rows, 276 MB unpacked, from 115 MB of zeros, a few kilobytes compressed) */
+    {
+        uint32_t n = 23000000, raw_len = n * 5;
+        uint8_t *zeros = calloc(raw_len, 1);
+        size_t zcap = ZSTD_compressBound(raw_len);
+        uint8_t *pl = malloc(TSDB_VALUES_HEADER + 4 + zcap);
+        CHECK(zeros && pl);
+        memset(pl, 0, TSDB_VALUES_HEADER);
+        memcpy(pl, &n, 4);
+        memcpy(pl + 4, &s, 4);
+        pl[8] = TSDB_FLOAT32;
+        pl[9] = TSDB_PACKED;
+        memcpy(pl + TSDB_VALUES_HEADER, &raw_len, 4);
+        size_t z = ZSTD_compress(pl + TSDB_VALUES_HEADER + 4, zcap, zeros, raw_len, 1);
+        CHECK(!ZSTD_isError(z) && z < 100000);
+        int fd = raw_connect();
+        raw_send(fd, 7, TSDB_OP_INSERT_VALUES, pl, (uint32_t)(TSDB_VALUES_HEADER + 4 + z));
+        uint32_t id = 0;
+        uint8_t rest[64];
+        size_t nrest;
+        CHECK(raw_reply(fd, &id, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID && id == 7);
+        close(fd);
+        free(zeros);
+        free(pl);
+        CHECK(count_of(c, s) == 2);
+    }
+
+    /* a frame started and not completed within --frame-timeout: the connection is closed */
+    {
+        int fd = raw_connect();
+        uint8_t h[12] = {100, 0, 0, 0, 1, 0, 0, 0, TSDB_OP_INSERT, 0, 0, 0}; /* 9 of 104 bytes */
+        CHECK(write(fd, h, sizeof h) == (ssize_t)sizeof h);
+        struct timeval tv = {8, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        int64_t t0 = mono_us();
+        char x;
+        ssize_t r = read(fd, &x, 1);
+        int64_t took = mono_us() - t0;
+        CHECK(r == 0 && took > 1900000 && took < 5000000);
+        close(fd);
+    }
+
+    /* the deadline is the frame's, not the last byte's: one byte every quarter second does not keep it open */
+    {
+        int fd = raw_connect();
+        uint8_t h[12] = {100, 0, 0, 0, 1, 0, 0, 0, TSDB_OP_INSERT, 0, 0, 0};
+        CHECK(write(fd, h, sizeof h) == (ssize_t)sizeof h);
+        int64_t t0 = mono_us();
+        bool closed = false;
+        for (int i = 0; i < 40 && !closed; i++) { /* 92 more bytes would complete it: never */
+            struct pollfd pf = {.fd = fd, .events = POLLIN};
+            char x;
+            if (poll(&pf, 1, 250) == 1)
+                closed = read(fd, &x, 1) <= 0;
+            else
+                closed = send(fd, "", 1, MSG_NOSIGNAL) != 1;
+        }
+        int64_t took = mono_us() - t0;
+        if (!closed || took >= 5000000)
+            fprintf(stderr, "hostile: a frame trickled for %lld ms, closed %d\n", (long long)took / 1000, closed);
+        CHECK(closed && took < 5000000);
+        close(fd);
+    }
+
+    /* request memory across connections (1 MB here): while one connection holds a large frame half received,
+     * another's 2 MB insert waits, and runs once that memory is freed */
+    uint64_t rows_s = 2;
+    for (int round = 0; round < 2; round++) {
+        static const uint32_t a_flen[2] = {64u << 20, 250000}; /* the second fits the old 256 KB uncounted buffer */
+        static const size_t a_sent[2] = {4096, 200000};
+        int a = raw_connect(), b = raw_connect();
+        uint8_t *h = calloc(9 + a_sent[round], 1);
+        memcpy(h, &a_flen[round], 4);
+        h[8] = TSDB_OP_INSERT;
+        CHECK(write(a, h, 9 + a_sent[round]) == (ssize_t)(9 + a_sent[round]));
+        free(h);
+        usleep(100000);
+        uint32_t n = 170000; /* 2 MB */
+        size_t len = 8 + (size_t)n * 12;
+        uint8_t *pl = calloc(len, 1);
+        memcpy(pl, &n, 4);
+        memcpy(pl + 4, &s, 4);
+        for (uint32_t i = 0; i < n; i++) {
+            int64_t t = 10000000 + round * 1000000 + i;
+            memcpy(pl + 8 + (size_t)i * 8, &t, 8);
+        }
+        raw_send(b, 9, TSDB_OP_INSERT, pl, (uint32_t)len);
+        free(pl);
+        struct pollfd pf = {.fd = b, .events = POLLIN};
+        if (poll(&pf, 1, 500) != 0)
+            fprintf(stderr, "hostile: an insert ran while a %u-byte frame held the request memory\n", a_flen[round]);
+        CHECK(poll(&pf, 1, 0) == 0); /* not answered while a holds the memory */
+        close(a);
+        uint32_t id = 0;
+        uint8_t rest[64];
+        size_t nrest;
+        CHECK(raw_reply(b, &id, rest, sizeof rest, &nrest) == 0 && id == 9);
+        close(b);
+        rows_s += n;
+        CHECK(count_of(c, s) == rows_s);
+    }
+
+    /* a connection parked for memory gets the whole frame deadline once it is read again: here b waits for a,
+     * whose frame (holding the memory) times out, and only then sends the rest of its own, more than
+     * --frame-timeout after b began it */
+    {
+        int a = raw_connect(), b = raw_connect();
+        uint8_t h[9 + 4096] = {0};
+        uint32_t flen = 64u << 20;
+        memcpy(h, &flen, 4);
+        h[8] = TSDB_OP_INSERT;
+        CHECK(write(a, h, sizeof h) == (ssize_t)sizeof h);
+        usleep(100000);
+        uint32_t n = 170000;
+        size_t total;
+        uint8_t *fr = insert_frame(s, n, 11, &total);
+        for (uint32_t i = 0; i < n; i++) {
+            int64_t t = 20000000 + i;
+            memcpy(fr + 17 + (size_t)i * 8, &t, 8);
+        }
+        CHECK(write(b, fr, total / 2) == (ssize_t)(total / 2));
+        struct timeval tv = {8, 0};
+        setsockopt(a, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char x;
+        CHECK(read(a, &x, 1) == 0); /* a's deadline */
+        usleep(1500000);
+        CHECK(write(b, fr + total / 2, total - total / 2) == (ssize_t)(total - total / 2));
+        uint32_t id = 0;
+        uint8_t rest[64];
+        size_t nrest;
+        int32_t st = raw_reply(b, &id, rest, sizeof rest, &nrest);
+        if (st != 0)
+            fprintf(stderr, "hostile: a frame parked for memory was closed by the deadline (%d)\n", st);
+        CHECK(st == 0 && id == 11);
+        free(fr);
+        close(a);
+        close(b);
+        rows_s += n;
+        CHECK(count_of(c, s) == rows_s);
+    }
+
+    /* over --max-request-memory, a connection with requests waiting is read no further (well before PIPE_CAP),
+     * also when its frames are small enough to need no buffer of their own */
+    {
+        int fd = raw_connect();
+        uint8_t q[20] = {0};
+        int64_t end = (int64_t)nbig;
+        memcpy(q, &big, 4);
+        memcpy(q + 12, &end, 8);
+        raw_send(fd, 1, TSDB_OP_QUERY_RAW, q, sizeof q); /* about 54 MB of reply, not read */
+        size_t total;
+        uint8_t *fr = insert_frame(s, 4000, 2, &total); /* 48 KB: frames over 64 KB wait for the limit anyway */
+        send_until_stalled(fd, fr, total, (size_t)100 << 20);
+        double held = request_memory();
+        if (held >= 3.0 * (1 << 20))
+            fprintf(stderr, "hostile: %.0f bytes of requests held over a 1 MB limit\n", held);
+        CHECK(held >= 0 && held < 3.0 * (1 << 20));
+        free(fr);
+        close(fd);
+    }
+
+    /* the same database under the default limit (an eighth of the RAM): what stops a connection now is PIPE_CAP */
+    tsdbc_close(c);
+    stop_server(srv);
+    const char *extra2[] = {"--metrics-port", "auto", "--metrics-bind", "127.0.0.1", NULL};
+    srv = start_server_with(dir, extra2);
+    mport = th_mport;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+
+    /* frames without a payload (9 bytes) count too: a client that sends them and reads nothing used to make the
+     * server hold 1.6 GB for 180 MB sent */
+    {
+        int fd = raw_connect();
+        uint8_t fr[9 * 7000];
+        for (int i = 0; i < 7000; i++) {
+            uint32_t flen = 5, id = (uint32_t)i;
+            memcpy(fr + 9 * i, &flen, 4);
+            memcpy(fr + 9 * i + 4, &id, 4);
+            fr[9 * i + 8] = TSDB_OP_LAST_STATS;
+        }
+        size_t sent = send_until_stalled(fd, fr, sizeof fr, (size_t)100 << 20);
+        double held = request_memory();
+        if (sent >= ((size_t)48 << 20) || held >= 8.0 * (1 << 20))
+            fprintf(stderr, "hostile: %zu MB of empty frames sent, %.0f bytes held\n", sent >> 20, held);
+        CHECK(sent < ((size_t)48 << 20) && held >= 0 && held < 8.0 * (1 << 20));
+        close(fd);
+    }
+
+    /* requests pile up on one connection only to PIPE_CAP: while its worker waits on a large reply nobody
+     * reads, the server stops reading the inserts the client keeps sending; once the reply is read, it reads and
+     * answers all of them */
+    {
+        int fd = raw_connect();
+        uint8_t q[20] = {0};
+        int64_t end = (int64_t)nbig;
+        memcpy(q, &big, 4);
+        memcpy(q + 12, &end, 8);
+        raw_send(fd, 1, TSDB_OP_QUERY_RAW, q, sizeof q); /* about 54 MB of reply, not read */
+        size_t total;
+        uint8_t *fr = insert_frame(s, 87000, 2, &total);
+        size_t sent = send_until_stalled(fd, fr, total, (size_t)100 << 20);
+        double held = request_memory();
+        if (sent >= ((size_t)48 << 20) || held >= 8.0 * (1 << 20))
+            fprintf(stderr, "hostile: the server took %zu MB of requests behind an unread reply, holds %.0f bytes\n",
+                    sent >> 20, held);
+        CHECK(sent < ((size_t)48 << 20) && held >= 0 && held < 8.0 * (1 << 20));
+        shutdown(fd, SHUT_WR); /* the last frame, likely partial, is dropped at the end of the stream */
+        struct timeval tv = {20, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        size_t want = sent / total, got = 0;
+        uint8_t hdr[13], junk[65536];
+        while (got < want && read_full(fd, hdr, 13)) {
+            uint32_t flen, id;
+            int32_t st;
+            memcpy(&flen, hdr, 4);
+            memcpy(&id, hdr + 4, 4);
+            memcpy(&st, hdr + 9, 4);
+            size_t left = flen - 9;
+            bool ok = true;
+            while (left && ok) {
+                size_t k = left < sizeof junk ? left : sizeof junk;
+                ok = read_full(fd, junk, k);
+                left -= k;
+            }
+            if (!ok)
+                break;
+            if (id == 2) {
+                CHECK(st == 0);
+                got++;
+            }
+        }
+        if (got != want)
+            fprintf(stderr, "hostile: %zu of %zu inserts answered after the reply was read\n", got, want);
+        CHECK(got == want && want > 0);
+        free(fr);
+        close(fd);
+    }
+
+    tsdbc_close(c);
+    stop_server(srv);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s.bad'", dir, dir);
+    if (!failures && system(cmd) != 0)
+        failures++;
+}
+
 int main(int argc, char **argv)
 {
+    signal(SIGPIPE, SIG_IGN); /* a check failing on a connection the server closed must not end the run */
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdbd-test-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     char cmd[1300];
@@ -2790,6 +3240,9 @@ int main(int argc, char **argv)
     test_metrics(dir);
     snprintf(dir, sizeof dir, "%s/tsdbd-metrics2-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_metrics_more(dir);
+    printf("hostile clients and flags\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-hostile-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_hostile(dir);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;
