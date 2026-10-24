@@ -50,7 +50,10 @@
  *   QUERY_VALUES as QUERY_RAW
  *               -> chunks: u8 last, u8 type, u8 flags, u8 0, u32 n, i64 ts[n], values[n],
  *                  [u8 valid[(n + 7) / 8] when flags & TSDB_VALID]
+ *               (the u16 and u32 after flags, and flag bits other than
+ *               TSDB_VALID, are reserved: they must be zero)
  *   STATE       u32 series, u8 create, u16 len, name  -> u32 code
+ *               (the series only picks the volume, whose dictionary it is)
  *   STATE_NAME  u32 series, u32 code           -> u16 len, name
  *   QUERY_BUCKETS u32 series, i64 start, i64 end, i64 interval, u8 unit, u32 count,
  *               u8 order, u64 limit, u16 len, time zone

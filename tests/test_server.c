@@ -318,8 +318,31 @@ static void test_types(tsdbc *c)
     CHECK(tsdbc_query_points(c, d, INT64_MIN, INT64_MAX, &pts) == TSDB_ERR_INVALID);
     CHECK(tsdbc_insert_values(c, sv, ts, &(tsdb_values){TSDB_INT64, iv, NULL}, 4) == TSDB_ERR_INVALID);
 
-    /* QUERY_AGG still answers with version 1 rows (f32 min and max) */
+    /* Regression: INSERT_VALUES ignored its reserved header bytes and flag
+     * bits, so they could never be given a meaning */
     int fd = raw_connect();
+    for (int bad = 0; bad < 2; bad++) {
+        uint8_t f[TSDB_VALUES_HEADER + 8 + 8] = {0};
+        uint32_t one = 1;
+        memcpy(f, &one, 4);
+        memcpy(f + 4, &i, 4);
+        f[8] = TSDB_INT64;
+        if (bad)
+            f[12] = 1; /* a reserved byte */
+        else
+            f[9] = 0x80; /* an unknown flag */
+        memcpy(f + 16, &ts[0], 8);
+        memcpy(f + 24, &iv[0], 8);
+        raw_send(fd, 40 + (uint32_t)bad, TSDB_OP_INSERT_VALUES, f, sizeof f);
+        uint32_t rid0;
+        uint8_t rest0[64];
+        size_t nrest0;
+        CHECK(raw_reply(fd, &rid0, rest0, sizeof rest0, &nrest0) == TSDB_ERR_INVALID && rid0 == 40 + (uint32_t)bad);
+    }
+    close(fd);
+
+    /* QUERY_AGG still answers with version 1 rows (f32 min and max) */
+    fd = raw_connect();
     uint8_t q[28];
     int64_t lo = INT64_MIN, hi = INT64_MAX, every = 0;
     memcpy(q, &d, 4);

@@ -537,7 +537,9 @@ static void handle(req *r)
     }
     case TSDB_OP_INSERT_VALUES: {
         uint32_t n, s;
-        if (len < TSDB_VALUES_HEADER || p[8] > TSDB_STATE) {
+        static const uint8_t zero[6];
+        /* reserved bytes and flags must be zero, so they can mean something later */
+        if (len < TSDB_VALUES_HEADER || p[8] > TSDB_STATE || (p[9] & ~TSDB_VALID) || memcmp(p + 10, zero, 6)) {
             rc = TSDB_ERR_INVALID;
             break;
         }
