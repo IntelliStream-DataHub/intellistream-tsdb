@@ -186,6 +186,7 @@ name = "tsdb-client"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tsdb-sys",
  "zstd",
 ]
 
@@ -195,6 +196,14 @@ version = "0.1.0"
 dependencies = [
  "pyo3",
  "tsdb-client",
+]
+
+[[package]]
+name = "tsdb-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "zstd-sys",
 ]
 
 [[package]]

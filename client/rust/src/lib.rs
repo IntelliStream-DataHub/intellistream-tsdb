@@ -64,6 +64,9 @@
 
 mod calendar;
 mod client;
+mod database;
+#[cfg(feature = "embedded")]
+mod embedded;
 mod error;
 mod keepalive;
 mod pack;
@@ -73,6 +76,9 @@ mod value;
 
 pub use calendar::calendar_bounds;
 pub use client::{Client, DEFAULT_COMPRESSION};
+pub use database::Database;
+#[cfg(feature = "embedded")]
+pub use embedded::{ChunkRef, Db, Options, PartInfo, RawValues, ValueCodec};
 pub use error::{Error, Result, Status, strerror};
 pub use keepalive::KeepAlive;
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};

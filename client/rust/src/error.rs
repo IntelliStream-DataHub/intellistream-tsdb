@@ -97,7 +97,8 @@ pub fn strerror(code: i32) -> &'static str {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// The server executed the request and answered with an error status.
+    /// The server executed the request and answered with an error status; for an embedded
+    /// [`Db`](crate::Db), the engine's status.
     Server(Status),
     /// The connection failed (or was already broken by an earlier failure).
     Io(io::Error),

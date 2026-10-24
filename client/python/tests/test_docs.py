@@ -52,6 +52,7 @@ def test_everything_is_documented():
 def test_the_stub_has_the_same_docstrings():
     stub, runtime = stub_docs(), runtime_docs()
     stub.pop("Client.__new__")  # documented on the class
+    stub.pop("Db.__new__")
     assert sorted(stub) == sorted(runtime), "the stub and the module name different things"
     differ = [name for name in runtime if stub[name] != runtime[name]]
     assert not differ, f"docstrings differ between tsdb_client.pyi and the module: {differ}"

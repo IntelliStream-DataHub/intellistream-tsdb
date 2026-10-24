@@ -89,7 +89,7 @@ fn main() {
         let queries: u64 = results.iter().map(|r| r.0).sum();
         let rows: u64 = results.iter().map(|r| r.1).sum();
         let secs = results.iter().map(|r| r.2).fold(0.0, f64::max);
-        common::report_query("rust", k, args.conns, queries, rows, secs, common::cpu_s() - cpu0);
+        common::report_query("rust", k, "conn", args.conns, queries, rows, secs, common::cpu_s() - cpu0);
         if rows == 0 {
             eprintln!("query: class {} returned no rows: the server is empty or does not hold the data set", k.id);
             std::process::exit(1);

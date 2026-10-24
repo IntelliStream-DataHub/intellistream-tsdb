@@ -9,10 +9,31 @@ readme = "README.md"
 keywords = ["timeseries", "database", "client"]
 categories = ["database"]
 
+[features]
+# Db: the database inside this process (crate tsdb-sys builds the C engine into it)
+embedded = ["dep:tsdb-sys"]
+# embedded, linking a prebuilt libtsdb.so (TSDB_LIB_DIR) instead of compiling the engine
+embedded-system = ["embedded", "tsdb-sys/system"]
+# embedded, with the engine compiled for this CPU (-march=native)
+native = ["embedded", "tsdb-sys/native"]
+
 [dependencies]
 # packed inserts (protocol version 3); the bundled libzstd, no optional features
 zstd = { version = "0.13", default-features = false }
+tsdb-sys = { path = "../rust-sys", optional = true }
 
 # TCP keepalive options, which std does not expose
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[[example]]
+name = "embedded_quickstart"
+required-features = ["embedded"]
+
+[[example]]
+name = "embedded_bench"
+required-features = ["embedded"]
+
+[[example]]
+name = "embedded_suite"
+required-features = ["embedded"]

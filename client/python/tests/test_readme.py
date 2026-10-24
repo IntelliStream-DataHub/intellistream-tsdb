@@ -22,3 +22,20 @@ def test_quick_start(server):
     assert lines[0] == "raw  1700085540000 59.0", out.stdout
     # Oslo days begin at 23:00 UTC in November
     assert lines[-2:] == ["day  1699916400000 60 1770.0", "day  1700002800000 1380 40710.0"], out.stdout
+
+
+def test_embedded(tmp_path):
+    text = README.read_text()
+    section = text[text.index("## Embedded") :]
+    code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
+    assert '"/tmp/tsdb-embedded"' in code
+    code = code.replace('"/tmp/tsdb-embedded"', repr(str(tmp_path / "db")))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [
+        "raw  1700000000000 0.0",
+        "raw  1700000060000 1.0",
+        "raw  1700000120000 2.0",
+        "day  1699916400000 47 1081.0",
+        "day  1700002800000 1393 41399.0",
+    ], out.stdout

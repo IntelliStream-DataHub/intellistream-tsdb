@@ -76,7 +76,16 @@ name = "tsdb-client"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tsdb-sys",
  "zstd",
+]
+
+[[package]]
+name = "tsdb-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "zstd-sys",
 ]
 
 [[package]]

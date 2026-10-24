@@ -27,6 +27,14 @@ const SIGTERM: i32 = 15;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// A fresh directory path (not created) under `$TSDB_TEST_DIR` or the system temp directory.
+pub fn test_dir(prefix: &str) -> PathBuf {
+    let base = std::env::var_os("TSDB_TEST_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!("{prefix}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 pub struct Server {
     child: Option<Child>,
     pub port: u16,
@@ -35,13 +43,15 @@ pub struct Server {
 
 impl Server {
     pub fn start() -> Server {
+        Server::start_in(test_dir("tsdb-rust"))
+    }
+
+    /// Starts tsdbd on `dir`, which may already hold a database.
+    pub fn start_in(dir: PathBuf) -> Server {
         let bin = std::env::var_os("TSDBD")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/tsdbd"));
         assert!(bin.exists(), "{} is missing: run make in the repository root", bin.display());
-        let base = std::env::var_os("TSDB_TEST_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("tsdb-rust-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-        let _ = std::fs::remove_dir_all(&dir);
         // tsdbd picks its port (--port 0) and writes "PORT PID" to this file once it serves: no port is
         // computed here, and the pid in the file must be the child started here.
         let pf = dir.with_extension("port");
@@ -55,6 +65,12 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            // The sanitizer runs (asan/tsan of the embedded engine) preload their runtime into the test binary;
+            // tsdbd is not instrumented, and under a preloaded TSan its SIGTERM handler waits for an intercepted
+            // call that its io_uring_enter never makes, so the server would never stop.
+            .env_remove("LD_PRELOAD")
+            .env_remove("TSAN_OPTIONS")
+            .env_remove("ASAN_OPTIONS")
             .spawn()
             .expect("spawn tsdbd");
         let log = Arc::new(Mutex::new(String::new()));

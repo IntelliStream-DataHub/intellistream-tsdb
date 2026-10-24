@@ -22,9 +22,11 @@ TSDBD = os.environ.get("TSDBD", str(ROOT / "build" / "tsdbd"))
 
 
 class Server:
-    def __init__(self, base):
-        self.dir = pathlib.Path(tempfile.mkdtemp(prefix="tsdb-py-", dir=base)) / "db"
-        pf = self.dir.parent / "port"
+    def __init__(self, base, dir=None):
+        """Serves dir (an existing database: test_embedded), or a new directory under base."""
+        own = pathlib.Path(tempfile.mkdtemp(prefix="tsdb-py-", dir=base))
+        self.dir = pathlib.Path(dir) if dir else own / "db"
+        pf = own / "port"
         self.proc = subprocess.Popen(
             [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4"],
             stdin=subprocess.DEVNULL,

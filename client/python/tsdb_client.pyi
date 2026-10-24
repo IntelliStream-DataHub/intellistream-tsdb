@@ -16,6 +16,8 @@ Example:
 Errors are raised as TsdbError; its code is one of the ERR_* numbers.
 """
 
+import os
+import pathlib
 from collections.abc import Sequence
 from types import TracebackType
 from typing import Any, Literal, final
@@ -661,3 +663,256 @@ class Client:
         Rows covered, decompressed or answered from block statistics, bytes
         and time. All zero before the first query.
         """
+
+
+@final
+class Db:
+    """A tsdb database opened in this process: no server, no network.
+
+    The methods are those of Client, so code written for one runs with the
+    other. Use it as a context manager (``with Db(path) as db:``) or call
+    close(); one process at a time may open a directory for writing.
+    The engine works with the GIL released, and threads sharing one Db
+    run in parallel.
+
+    Args:
+        path: The database directory; created if missing (its parent must exist).
+        read_only: Open without writing, merging or locking exclusively.
+        follow: Read only, and keep following a writer of the same directory.
+        fsync: fsync parts before publishing them (default True).
+        wal_sync_ms: 0: every small write waits for the WAL fsync (the
+            default); N > 0: the WAL is synced every N ms; -1: no WAL.
+        merge_threads: Background merge threads; 0 disables merges.
+        query_threads: Threads for one query (default: every CPU).
+        The other keywords are the engine's tsdb_options fields of the same
+        name; None keeps the engine's default. partition_ms and granule_rows
+        are fixed when the database is created. value_codec is "auto",
+        "gorilla" or "chimp".
+
+    Raises:
+        TsdbError: ERR_LOCKED if another process has the directory open for
+            writing; ERR_IO if it cannot be created.
+        ValueError: Unknown value_codec.
+    """
+
+    def __new__(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        read_only: bool = False,
+        follow: bool = False,
+        fsync: bool | None = None,
+        wal_sync_ms: int | None = None,
+        merge_threads: int | None = None,
+        query_threads: int | None = None,
+        partition_ms: int | None = None,
+        granule_rows: int | None = None,
+        zstd_level: int | None = None,
+        value_codec: Literal["auto", "gorilla", "chimp"] | None = None,
+        buffer_rows: int | None = None,
+        flush_interval_ms: int | None = None,
+        wal_max_batch_rows: int | None = None,
+        max_part_bytes: int | None = None,
+        refresh_ms: int | None = None,
+        merge_idle_s: int | None = None,
+        obsolete_part_lifetime_s: int | None = None,
+        verify_checksums: bool | None = None,
+        retention_merge_s: int | None = None,
+    ) -> Db: ...
+    def close(self) -> None:
+        """Flushes the memtable and closes the database.
+
+        Waits for calls other threads are making on it. Closing twice is
+        fine; any later call raises TsdbError (ERR_IO).
+        """
+    def __enter__(self) -> Db:
+        """Returns the database itself, to use in a with statement."""
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        """Closes the database at the end of a with block."""
+    @staticmethod
+    def simd_level() -> str:
+        """Returns the SIMD kernels the engine picked for this CPU, such as "avx2"."""
+    def series(self, name: str, create: bool = True) -> int:
+        """Returns the id of a series, creating it (as float32) if needed.
+
+        Raises:
+            TsdbError: ERR_NOTFOUND if create is False and there is no such series.
+        """
+    def series_at(self, name: str, path: str) -> int:
+        """Returns the id of a series, creating it (as float32) in a volume if needed."""
+    def series_create(self, name: str, value_type: _ValueType = "float32", path: str | None = None) -> int:
+        """Returns the id of a series of a given value type, creating it if needed.
+
+        Raises:
+            TsdbError: ERR_INVALID if the series exists with another type.
+            ValueError: Unknown value_type.
+        """
+    def series_type(self, id: int) -> _ValueType:
+        """Returns the value type of a series: "float32", "float64", "int64", "bool" or "state"."""
+    def series_name(self, id: int) -> str:
+        """Returns the name of a series."""
+    def series_path(self, id: int) -> str:
+        """Returns the volume (directory) a series is stored in."""
+    def series_count(self) -> int:
+        """Returns the number of series."""
+    def volumes(self) -> list[str]:
+        """Returns the directories of the volumes, the database directory first."""
+    def state(self, series: int, name: str) -> int:
+        """Returns the code of a state name, creating it if needed."""
+    def state_lookup(self, series: int, name: str) -> int:
+        """Returns the code of an existing state name (ERR_NOTFOUND if it has none)."""
+    def state_name(self, series: int, code: int) -> str:
+        """Returns the name of a state code (ERR_NOTFOUND for an unknown code)."""
+    def state_names(self, series: int, codes: _TypedValues) -> list[str | None]:
+        """Returns the names of many state codes; None and masked entries give None."""
+    def insert_series(self, series: int, ts: _Timestamps, values: _Values) -> None:
+        """Inserts float32 rows into one series. The last write wins.
+
+        Args:
+            series: The series id.
+            ts: Timestamps, ms since the epoch: a list of ints or an int64 array.
+            values: One float per timestamp: a list or a float32/float64 array.
+        """
+    def insert(self, series: _SeriesIds, ts: _Timestamps, values: _Values) -> None:
+        """Inserts float32 rows into many series, all or nothing."""
+    def insert_series_async(self, series: int, ts: _Timestamps, values: _Values) -> None:
+        """The same as insert_series(): an embedded insert has no round trip to hide."""
+    def insert_async(self, series: _SeriesIds, ts: _Timestamps, values: _Values) -> None:
+        """The same as insert()."""
+    def insert_series_values(
+        self, series: int, ts: _Timestamps, values: _TypedValues, *, value_type: _ValueType | None = None
+    ) -> None:
+        """Inserts values of any type, with nulls, into one series.
+
+        Args:
+            series: The series id.
+            ts: Timestamps, ms since the epoch.
+            values: A list with None for nulls, a numpy array, or a numpy
+                masked array (masked = null).
+            value_type: The series' type; None looks it up.
+        """
+    def insert_values(
+        self, series: _SeriesIds, ts: _Timestamps, values: _TypedValues, *, value_type: _ValueType | None = None
+    ) -> None:
+        """Inserts values of any type into many series of that type, all or nothing."""
+    def insert_series_values_async(
+        self, series: int, ts: _Timestamps, values: _TypedValues, *, value_type: _ValueType | None = None
+    ) -> None:
+        """The same as insert_series_values()."""
+    def insert_values_async(
+        self, series: _SeriesIds, ts: _Timestamps, values: _TypedValues, *, value_type: _ValueType | None = None
+    ) -> None:
+        """The same as insert_values()."""
+    def wait(self) -> None:
+        """Nothing to wait for: embedded inserts are done when they return."""
+    def query_raw(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        numpy: bool | None = None,
+    ) -> tuple[Any, Any]:
+        """Returns the float32 rows of a series as (timestamps, values).
+
+        Args:
+            start, end: The half-open range [start, end) in ms; None is unbounded.
+            order: "asc" or "desc".
+            limit: At most this many rows; None is all.
+            numpy: True for numpy arrays, False for lists, None for numpy if
+                it can be imported.
+        """
+    def query_points(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        numpy: bool | None = None,
+    ) -> tuple[Any, Any]:
+        """The same as query_raw()."""
+    def query_values(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        numpy: bool | None = None,
+    ) -> tuple[Any, Any]:
+        """Returns the rows of a series of any type as (timestamps, values).
+
+        values is a numpy masked array (masked = null) of the series' type,
+        or a list with None for nulls; the arguments are those of query_raw().
+        """
+    def query_agg(
+        self, series: int, start: int | None = None, end: int | None = None, interval_ms: int = 0
+    ) -> list[Bucket]:
+        """Aggregates a series: one Bucket per interval_ms, or one for the whole
+        range when interval_ms is 0. Empty buckets are left out.
+        """
+    def query_group(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> list[Bucket]:
+        """Aggregates a series by calendar units, as Client.query_group() does.
+
+        Args:
+            unit: "second", "minute", "hour", "day", "week", "month",
+                "quarter" or "year"; None is one bucket for the whole range.
+            count: Units per bucket.
+            timezone: A zone name or tzinfo; None is UTC.
+        """
+    def query_bounds(
+        self,
+        series: int,
+        bounds: _Timestamps,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> list[Bucket]:
+        """Aggregates a series into buckets between ascending bounds (ms)."""
+    def commit(self) -> None:
+        """Makes every insert so far durable (syncs the WAL)."""
+    def flush(self) -> None:
+        """Writes the memtable into parts."""
+    def optimize(self) -> None:
+        """Flushes, then merges every partition down to as few parts as it can."""
+    def drop_before(self, ts: int) -> None:
+        """Drops whole partitions that end at or before ts."""
+    def refresh(self) -> None:
+        """A read-only database: picks up what the writer published since the last refresh."""
+    def stats(self) -> Stats:
+        """Returns the storage statistics."""
+    def last_query_stats(self) -> QueryStats:
+        """Returns what the last query through this Db read (all zero before the first)."""
+    def failed(self) -> str | None:
+        """None while healthy; after a storage error that leaves it unknown what
+        reached the disk, what failed (writes then fail until reopened).
+        """
+    @property
+    def path(self) -> pathlib.Path:
+        """The database directory."""
+    @property
+    def pending(self) -> int:
+        """Always 0: embedded inserts are done when they return."""

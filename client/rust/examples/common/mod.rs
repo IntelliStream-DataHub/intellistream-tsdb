@@ -61,9 +61,10 @@ pub fn cpu_s() -> f64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn report_query(client: &str, k: &Class, threads: usize, queries: u64, rows: u64, secs: f64, cpu: f64) {
+/// `unit` names what runs the queries in the human line: "conn" (connections) or "thr" (threads of an embedded Db).
+pub fn report_query(client: &str, k: &Class, unit: &str, threads: usize, queries: u64, rows: u64, secs: f64, cpu: f64) {
     println!(
-        "  {:<44} {:>3} conn {:>10.0} q/s  {:>8.1} us/q  {:>7.1} Mrows/s",
+        "  {:<44} {:>3} {unit} {:>10.0} q/s  {:>8.1} us/q  {:>7.1} Mrows/s",
         k.label,
         threads,
         queries as f64 / secs,

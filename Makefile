@@ -194,12 +194,29 @@ dist-check-sandybridge: dist
 PYVENV ?= build/pyvenv
 
 test-rust: $(B)/tsdbd
-	cd client/rust && cargo test
+	cd client/rust && cargo test --features embedded
+	cd client/rust && cargo build --all-targets  # the TCP-only crate (no features) must still build
+	cd client/rust-sys && cargo test
 
 test-python: $(B)/tsdbd
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
 	    && $(abspath $(PYVENV))/bin/python -m pytest tests
+
+# The Python sdist carries tsdb-sys as a path dependency, so the engine's C sources travel in it as the copy
+# client/rust-sys/vendor.sh makes (csrc/). test-python-sdist builds a wheel from the sdist alone and imports it.
+python-sdist:
+	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
+	client/rust-sys/vendor.sh
+	rm -rf $(B)/sdist
+	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin sdist -o $(abspath $(B))/sdist
+
+test-python-sdist: python-sdist
+	rm -rf $(B)/sdist-check && mkdir -p $(B)/sdist-check/whl
+	PATH=$(abspath $(PYVENV))/bin:$$PATH $(PYVENV)/bin/pip wheel -q --no-build-isolation --no-deps -w $(B)/sdist-check/whl $(B)/sdist/tsdb_client-*.tar.gz
+	cd $(B)/sdist-check && unzip -q whl/tsdb_client-*.whl -d site \
+	    && $(abspath $(PYVENV))/bin/python -I -c "import os, sys; sys.path.insert(0, os.path.abspath('site')); import tsdb_client; \
+	    assert tsdb_client.__file__.startswith('$(abspath $(B))/sdist-check/site'), tsdb_client.__file__; tsdb_client.Db"
 
 test-java: $(B)/tsdbd $(B)/tsdb
 	cd client/java && mvn -q test
@@ -211,7 +228,7 @@ test-java-embedded: $(B)/tsdbd $(B)/libtsdb.so
 	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
 	cd client/java-embedded && mvn -q $(JAVA_M2) test
 
-test-clients: test-rust test-python test-java test-java-embedded
+test-clients: test-rust test-python test-python-sdist test-java test-java-embedded
 
 # Commit rules as a git hook (no session links, DCO sign-off last); once per clone.
 hooks:
@@ -256,7 +273,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

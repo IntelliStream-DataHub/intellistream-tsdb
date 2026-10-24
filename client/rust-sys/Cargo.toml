@@ -1,0 +1,32 @@
+[package]
+name = "tsdb-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Raw FFI bindings to the tsdb embedded time series database (include/tsdb.h), with the engine built in"
+publish = false
+readme = "README.md"
+links = "tsdb"
+build = "build.rs"
+# csrc/ is the engine copied by vendor.sh: listed explicitly because it is not in git
+include = ["Cargo.toml", "Cargo.lock", "README.md", "build.rs", "layout.c", "src/**", "tests/**", "csrc/**"]
+keywords = ["timeseries", "database", "ffi"]
+categories = ["database", "external-ffi-bindings"]
+
+[features]
+default = ["bundled-zstd"]
+# libzstd compiled from source by zstd-sys (the version the TCP client's zstd crate already uses), so
+# nothing has to be installed; without it the engine links the system's libzstd.
+bundled-zstd = ["dep:zstd-sys"]
+# Link a prebuilt libtsdb.so (`make` in the repository root) instead of compiling the engine:
+# TSDB_LIB_DIR names its directory (default: build/ of the repository).
+system = []
+# Compile the engine for the building CPU (-march=native) instead of the portable baseline with
+# x86-64-v3 and v4 copies of the codecs picked at runtime. The binary may not run elsewhere.
+native = []
+
+[dependencies]
+zstd-sys = { version = "2.1", default-features = false, optional = true }
+
+[build-dependencies]
+cc = "1.2"
