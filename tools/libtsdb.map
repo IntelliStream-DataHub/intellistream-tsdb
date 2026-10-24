@@ -1,0 +1,8 @@
+/* Exported symbols of libtsdb.so: the public API of include/tsdb.h and
+ * include/tsdb_calendar.h, nothing internal. */
+{
+    global:
+        tsdb_*;
+    local:
+        *;
+};

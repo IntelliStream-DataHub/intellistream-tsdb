@@ -50,7 +50,7 @@ endif
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench
+all: $(LIB) $(B)/libtsdb.so $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench
 
 $(B)/%.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -68,6 +68,13 @@ $(B)/%.v4.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 $(LIB): $(OBJ) $(B)/tsdb_calendar.o
 	$(AR) rcs $@ $^
 
+# The engine as a shared library for the embedded bindings (Rust, Python, Java FFM).
+# Only the public tsdb_* API is exported (tools/libtsdb.map); zstd is linked in
+# statically when ZSTD_LIB says so (make dist), else dynamically.
+$(B)/libtsdb.so: $(OBJ) $(B)/tsdb_calendar.o tools/libtsdb.map
+	$(CC) $(CFLAGS) -shared -Wl,--version-script=tools/libtsdb.map -Wl,-soname,libtsdb.so -o $@ \
+	    $(OBJ) $(B)/tsdb_calendar.o $(LDLIBS)
+
 $(B)/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -84,8 +91,9 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_failstop $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
+test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
 	./$(B)/test_tsdb
+	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
 	./$(B)/test_types
 	./$(B)/test_levels
@@ -237,6 +245,10 @@ $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 
 $(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# links against libtsdb.so, as the embedded bindings do; run with LD_LIBRARY_PATH=$(B)
+$(B)/test_shared: tests/test_shared.c $(B)/libtsdb.so
+	$(CC) $(CFLAGS) -o $@ $< -L$(B) -ltsdb -ldl
 
 $(B)/test_group: tests/test_group.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

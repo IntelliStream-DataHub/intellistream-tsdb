@@ -174,6 +174,10 @@ typedef struct tsdb_points {
 } tsdb_points;
 int tsdb_query_points(tsdb *db, uint32_t series, int64_t start, int64_t end, tsdb_points *out);
 void tsdb_points_free(tsdb_points *p);
+/* Frees an array the library returned (buckets, bounds, ...). Callers in other
+ * languages (embedded bindings) use it so the engine's allocator frees its own
+ * memory; C callers may use free() as before. */
+void tsdb_free(void *p);
 
 /* Aggregates skip nulls: count is the number of known values, and a bucket
  * with only nulls is returned with count 0 (buckets without rows are not).

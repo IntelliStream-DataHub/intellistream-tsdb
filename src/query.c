@@ -1056,6 +1056,8 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
     return rc;
 }
 
+void tsdb_free(void *p) { free(p); }
+
 void tsdb_points_free(tsdb_points *p)
 {
     free(p->ts);
