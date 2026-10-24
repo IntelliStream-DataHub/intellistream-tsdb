@@ -108,6 +108,23 @@ impl Server {
         panic!("tsdbd did not write {} in 30 s:\n{}", pf.display(), log.lock().unwrap());
     }
 
+    /// Adds volume `path` to the running server's database, as an operator does: `tsdb <dir> volume add`
+    /// (tsdbd never creates a volume for a client). The CLI is the `tsdb` next to the tsdbd in use.
+    pub fn add_volume(&self, path: &std::path::Path) {
+        let tsdbd = std::env::var_os("TSDBD")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/tsdbd"));
+        let cli = tsdbd.with_file_name("tsdb");
+        let out = Command::new(&cli)
+            .arg(&self.dir)
+            .args(["volume", "add"])
+            .arg(path)
+            .env_remove("LD_PRELOAD")
+            .output()
+            .unwrap_or_else(|e| panic!("{}: {e}", cli.display()));
+        assert!(out.status.success(), "volume add {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    }
+
     pub fn addr(&self) -> String {
         format!("127.0.0.1:{}", self.port)
     }

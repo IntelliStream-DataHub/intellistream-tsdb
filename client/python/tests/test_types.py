@@ -38,7 +38,12 @@ def test_series_types(server, client):
     assert e.value.code == tsdb_client.ERR_NOTFOUND
     with pytest.raises(ValueError):
         client.series_create("x", "decimal")
-    v = client.series_create("on.volume", "int64", str(server.dir) + ".volume")
+    vol = str(server.dir) + ".volume"
+    with pytest.raises(TsdbError) as e:  # tsdbd never creates a volume for a client
+        client.series_create("on.volume", "int64", vol)
+    assert e.value.code == tsdb_client.ERR_NOTFOUND
+    server.add_volume(vol)
+    v = client.series_create("on.volume", "int64", vol)
     client.insert_series_values(v, [T0], [42])
     assert client.query_values(v, numpy=False) == ([T0], [42])
 

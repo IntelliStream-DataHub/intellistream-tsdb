@@ -62,6 +62,14 @@ class Server:
         self.proc.wait()
         raise RuntimeError("tsdbd did not write its port file in 30 s:\n" + "".join(log))
 
+    def add_volume(self, path):
+        """Adds a volume as an operator does (tsdbd never creates one for a client): the tsdb CLI beside tsdbd."""
+        cli = str(pathlib.Path(TSDBD).with_name("tsdb"))
+        env = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+        r = subprocess.run([cli, str(self.dir), "volume", "add", str(path)], capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            raise RuntimeError(f"volume add {path}: {r.stderr}")
+
     def stop(self):
         """SIGTERM, then the exit status."""
         if self.proc.poll() is None:

@@ -11,6 +11,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -2442,6 +2443,7 @@ static void test_metrics_more(const char *dir)
      * (Prometheus drops a whole scrape with a malformed line) */
     snprintf(vol, sizeof vol, "%s.vol\"q\\z", dir);
     uint32_t vid, sid;
+    OK(tsdb_volume_add_dir(dir, vol, &vid)); /* tsdb-cli volume add, while the server runs */
     OK(tsdbc_series_at(c, "weird", vol, &vid));
     OK(tsdbc_series(c, "plain", 1, &sid));
     {
@@ -2561,6 +2563,20 @@ int main(int argc, char **argv)
     char vol[600];
     snprintf(vol, sizeof vol, "%s.volume", dir);
     uint32_t onvol;
+    /* a client cannot choose where the server writes: a path that is no volume is NOTFOUND and creates
+     * nothing, a newline (which split the VOLUMES line, so the database never opened again) is INVALID */
+    struct stat vst;
+    CHECK(tsdbc_series_at(c, "remote.on_volume", vol, &onvol) == TSDB_ERR_NOTFOUND);
+    CHECK(tsdbc_series_create(c, "remote.on_volume", TSDB_INT64, vol, &onvol) == TSDB_ERR_NOTFOUND);
+    CHECK(stat(vol, &vst) != 0 && errno == ENOENT);
+    char evil[700];
+    snprintf(evil, sizeof evil, "%s.vol\ny", dir);
+    CHECK(tsdbc_series_at(c, "evil", evil, &onvol) == TSDB_ERR_INVALID);
+    CHECK(stat(evil, &vst) != 0 && errno == ENOENT);
+    CHECK(tsdbc_series(c, "remote.on_volume", 0, &onvol) == TSDB_ERR_NOTFOUND);
+    uint32_t vnum;
+    OK(tsdb_volume_add_dir(dir, vol, &vnum)); /* the operator adds it (tsdb-cli volume add) */
+    CHECK(vnum == 1);
     OK(tsdbc_series_at(c, "remote.on_volume", vol, &onvol));
     int64_t vt = T0;
     float vv = 3.5f;

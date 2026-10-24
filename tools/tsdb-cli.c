@@ -26,7 +26,11 @@ static void usage(void)
             "                                     (value x ms), covered_ms, count\n"
             "  create <series> [path] [--type T]  create a series of type T (float32, float64, int64,\n"
             "                                     bool, state), in volume <path> if given\n"
+            "                                     (an existing volume: see volume add)\n"
             "  series                             list series (type and volume)\n"
+            "  volume add <path>                  add a volume: a directory for series of their own\n"
+            "                                     (e.g. one per disk or NFS mount); also while tsdbd runs\n"
+            "  volume list                        list the volumes, the database directory first\n"
             "  stats                              rows, parts, size, compression ratio\n"
             "  parts                              list active parts\n"
             "  optimize                           merge every partition into one part\n"
@@ -544,6 +548,20 @@ int main(int argc, char **argv)
     if (argc < 3)
         usage();
     const char *dir = argv[1], *cmd = argv[2];
+    if (strcmp(cmd, "volume") == 0 && argc == 5 && strcmp(argv[3], "add") == 0) {
+        /* without opening the database: a running tsdbd holds its lock, and opens the volume when a
+         * request first names it */
+        uint32_t index;
+        int rc = tsdb_volume_add_dir(dir, argv[4], &index);
+        if (rc == TSDB_ERR_INVALID && argv[4][0] != '/')
+            fprintf(stderr, "tsdb: %s: a volume path must be absolute\n", argv[4]);
+        if (rc)
+            die(argv[4], rc);
+        printf("%u\t%s\n", index, argv[4]);
+        return 0;
+    }
+    if (strcmp(cmd, "volume") == 0 && (argc != 4 || strcmp(argv[3], "list") != 0))
+        usage();
     bool writes = strcmp(cmd, "insert") == 0 || strcmp(cmd, "import") == 0 || strcmp(cmd, "optimize") == 0 ||
                   strcmp(cmd, "drop-before") == 0 || strcmp(cmd, "create") == 0 || strcmp(cmd, "delete") == 0 ||
                   (strcmp(cmd, "retention") == 0 && argc > 4);
@@ -551,6 +569,7 @@ int main(int argc, char **argv)
     tsdb_options_init(&o);
     o.read_only = !writes;
     o.merge_threads = 0; /* a short-lived process: merging happens in optimize or in the long-running writer */
+    o.create_volumes = 0; /* volumes are added by "volume add", as for tsdbd */
     if (!writes && access(dir, F_OK) != 0) {
         fprintf(stderr, "tsdb: %s does not exist\n", dir);
         return 1;
@@ -595,6 +614,9 @@ int main(int argc, char **argv)
             tsdb_series_type(db, i, &t);
             printf("%s\t%s\t%s\n", tsdb_series_name(db, i), type_names[t], tsdb_series_path(db, i));
         }
+    } else if (strcmp(cmd, "volume") == 0) {
+        for (uint32_t i = 0; i < tsdb_volume_count(db); i++)
+            printf("%u\t%s\n", i, tsdb_volume_path(db, i));
     } else if (strcmp(cmd, "stats") == 0) {
         tsdb_stats st;
         tsdb_get_stats(db, &st);

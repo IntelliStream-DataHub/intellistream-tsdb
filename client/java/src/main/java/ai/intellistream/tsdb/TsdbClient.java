@@ -434,7 +434,8 @@ public final class TsdbClient implements AutoCloseable {
     /**
      * Returns the id of a series, creating it in the volume {@code path} on the server if it does not exist
      * ({@code tsdb_series_at}). Series created with the same path share that volume; the path only matters when the
-     * series is created.
+     * series is created. The volume must be one the operator added ({@code tsdb <dir> volume add}): tsdbd never adds
+     * one, and answers {@code ERR_NOTFOUND} for any other path.
      *
      * @param name the series name, 1 to 65535 bytes of UTF-8
      * @param path a directory on the server, or {@code null} or "" for the database directory

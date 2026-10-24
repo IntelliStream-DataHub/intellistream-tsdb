@@ -77,7 +77,9 @@ final class Native {
             JAVA_INT.withName("retention_merge_s"),
             MemoryLayout.paddingLayout(4),
             PTR.withName("clock_ms"), /* int64_t (*)(void *): left NULL, the wall clock */
-            PTR.withName("clock_arg")).withName("tsdb_options");
+            PTR.withName("clock_arg"),
+            JAVA_INT.withName("create_volumes"),
+            MemoryLayout.paddingLayout(4)).withName("tsdb_options");
 
     static final StructLayout VALUES = MemoryLayout.structLayout(
             JAVA_INT.withName("type"),

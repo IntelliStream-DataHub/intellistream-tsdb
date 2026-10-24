@@ -31,6 +31,11 @@ fn series_create_lookup_name_and_volume() {
 
     // a series in another volume, then read back through the same connection
     let vol = srv.dir.with_extension("volume");
+    // tsdbd never creates a volume for a client: a path that is none is NotFound and makes no directory
+    let e = c.series_at("remote.on_volume", vol.to_str().unwrap()).unwrap_err();
+    assert_eq!(e.status(), Some(Status::NotFound));
+    assert!(!vol.exists());
+    srv.add_volume(&vol);
     let v = c.series_at("remote.on_volume", vol.to_str().unwrap()).unwrap();
     c.insert_series(v, &[T0], &[3.5]).unwrap();
     let p = c.query_points(v, .., QueryOpts::asc()).unwrap();

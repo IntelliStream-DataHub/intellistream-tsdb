@@ -44,6 +44,9 @@
  *  - of the directory operations not made durable, a random subset, in the
  *    order they were made for each name: once one on a name is undone,
  *    every later one on that name (or inside it) is undone too.
+ *
+ * With CRASHFS_AT_EXIT=1 the power also fails as the process exits normally:
+ * what a command reported done must already be durable.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -112,6 +115,7 @@ static volatile sig_atomic_t crash_requested;
 static bool tear; /* CRASHFS_TEAR=1 */
 static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the power loss kept, for the message */
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
+static bool loss_at_exit;       /* CRASHFS_AT_EXIT=1 */
 static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error */
 static char mark[PATH_MAX], eio_only[64];
 static char *fdpath[MAX_FDS];
@@ -184,6 +188,7 @@ __attribute__((constructor)) static void init(void)
     if (getenv("CRASHFS_MARK"))
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
+    loss_at_exit = getenv("CRASHFS_AT_EXIT") && atoi(getenv("CRASHFS_AT_EXIT")) != 0;
     signal(SIGUSR2, on_usr2);
     active = files && dops;
 }
@@ -535,10 +540,12 @@ static bool eio_now(int fd, const char *what)
 }
 
 /* After an injected EIO the process may exit on its own (fail-stop) or be
- * stopped: either way, what its lying syncs did not make durable is gone. */
+ * stopped: either way, what its lying syncs did not make durable is gone.
+ * With CRASHFS_AT_EXIT the power fails just after a process that finished
+ * (a command line tool: what it reported done must be on disk). */
 __attribute__((destructor)) static void fini(void)
 {
-    if (!eio_done)
+    if (!eio_done && !(loss_at_exit && active))
         return;
     pthread_mutex_lock(&lock); /* never released: no thread writes after this */
     rollback();

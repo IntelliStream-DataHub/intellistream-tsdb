@@ -73,6 +73,7 @@ pub struct tsdb_options {
     pub retention_merge_s: c_int,
     pub clock_ms: Option<unsafe extern "C" fn(arg: *mut c_void) -> i64>,
     pub clock_arg: *mut c_void,
+    pub create_volumes: c_int,
 }
 
 impl Default for tsdb_options {

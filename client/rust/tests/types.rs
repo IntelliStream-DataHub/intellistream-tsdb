@@ -28,6 +28,7 @@ fn series_types() {
     assert_eq!(c.series_type(999_999).unwrap_err().status(), Some(Status::NotFound));
 
     let vol = srv.dir.with_extension("volume");
+    srv.add_volume(&vol);
     let v = c.series_create("on.volume", ValueType::Int64, Some(vol.to_str().unwrap())).unwrap();
     c.insert_series_values(v, &[T0], &[42i64]).unwrap();
     assert_eq!(c.query_rows(v, .., QueryOpts::asc()).unwrap().values.to_options::<i64>(), Some(vec![Some(42)]));

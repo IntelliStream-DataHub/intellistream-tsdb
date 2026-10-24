@@ -107,6 +107,20 @@ final class TsdbServer implements AutoCloseable {
         }
     }
 
+    /**
+     * Adds volume {@code path} as an operator does, with the {@code tsdb} CLI beside tsdbd ({@code volume add}):
+     * tsdbd never creates a volume for a client.
+     */
+    void addVolume(Path path) throws IOException, InterruptedException {
+        Path cli = binary().resolveSibling("tsdb");
+        Process p = new ProcessBuilder(cli.toString(), dir.toString(), "volume", "add", path.toString())
+                .redirectErrorStream(true)
+                .start();
+        String out = new String(p.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        if (p.waitFor() != 0)
+            throw new IllegalStateException("volume add " + path + ": " + out);
+    }
+
     static void delete(Path p) throws IOException {
         if (!Files.exists(p))
             return;

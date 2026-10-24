@@ -297,8 +297,9 @@ class Client:
 
         Args:
             name: The series name.
-            path: A directory on the server for the new series (a volume);
-                it only matters when the series is created.
+            path: A volume on the server for the new series, one the operator
+                added (`tsdb <dir> volume add`; else ERR_NOTFOUND); it only
+                matters when the series is created.
         """
     def series_create(self, name: str, value_type: _ValueType = "float32", path: str | None = None) -> int:
         """Returns the id of a series of a given value type, creating it if needed.
@@ -306,8 +307,9 @@ class Client:
         Args:
             name: The series name.
             value_type: "float32", "float64", "int64", "bool" or "state".
-            path: A directory on the server for the new series (a volume);
-                None means the database directory.
+            path: A volume on the server for the new series, one the operator
+                added (`tsdb <dir> volume add`; else ERR_NOTFOUND); None
+                means the database directory.
 
         Raises:
             TsdbError: ERR_INVALID if the series exists with another type.

@@ -30,7 +30,8 @@ void tsdbc_close(tsdbc *c); /* waits for pipelined inserts first; use tsdbc_wait
 const char *tsdbc_strerror(int err); /* the client does not link the storage engine */
 
 int tsdbc_series(tsdbc *c, const char *name, int create, uint32_t *id);
-/* Creates the series in the volume `path` on the server (see tsdb_series_at). */
+/* Creates the series in the volume `path` on the server (see tsdb_series_at), one the operator added with
+ * `tsdb <dir> volume add`: tsdbd never adds one (TSDB_ERR_NOTFOUND). */
 int tsdbc_series_at(tsdbc *c, const char *name, const char *path, uint32_t *id);
 int tsdbc_series_name(tsdbc *c, uint32_t id, char *buf, size_t len);
 

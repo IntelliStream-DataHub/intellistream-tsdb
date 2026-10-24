@@ -94,6 +94,9 @@ pub struct Options {
     /// A part holding rows past their series' retention is rewritten without them once it is this many
     /// seconds old; -1 never (merges still drop them). Default 3600.
     pub retention_merge_s: i32,
+    /// [`series_at`](Db::series_at) and [`series_create`](Db::series_create) add a volume for a path that is
+    /// not one yet (with the checks of `tsdb_volume_add`); false: such a path is NotFound. Default true.
+    pub create_volumes: bool,
 }
 
 impl Default for Options {
@@ -124,6 +127,7 @@ impl Default for Options {
             obsolete_part_lifetime_s: o.obsolete_part_lifetime_s,
             verify_checksums: o.verify_checksums != 0,
             retention_merge_s: o.retention_merge_s,
+            create_volumes: o.create_volumes != 0,
         }
     }
 }
@@ -157,6 +161,7 @@ impl Options {
             // the wall clock: CLOCK_REALTIME
             clock_ms: None,
             clock_arg: std::ptr::null_mut(),
+            create_volumes: self.create_volumes as c_int,
         }
     }
 }

@@ -100,7 +100,13 @@ class TsdbClientTest {
 
     @Test
     void seriesAtVolume() throws Exception {
-        int id = c.seriesAt("remote.on_volume", scratch.resolve("volume").toString());
+        String vol = scratch.resolve("volume").toString();
+        /* tsdbd never creates a volume for a client: a path that is none is NOTFOUND and makes no directory */
+        assertEquals(Status.ERR_NOTFOUND,
+                assertThrows(TsdbException.class, () -> c.seriesAt("remote.on_volume", vol)).status());
+        assertFalse(java.nio.file.Files.exists(scratch.resolve("volume")));
+        server.addVolume(scratch.resolve("volume"));
+        int id = c.seriesAt("remote.on_volume", vol);
         assertEquals(id, c.seriesAt("remote.on_volume", null)); /* the path only matters at creation */
         c.insert(id, new long[] {T0}, new float[] {3.5f});
         Points p = c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE);
