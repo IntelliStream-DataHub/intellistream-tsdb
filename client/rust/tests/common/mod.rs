@@ -26,6 +26,14 @@ const SIGTERM: i32 = 15;
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
+/// A fresh directory path (not created) under `$TSDB_TEST_DIR` or the system temp directory.
+pub fn test_dir(prefix: &str) -> PathBuf {
+    let base = std::env::var_os("TSDB_TEST_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!("{prefix}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 pub struct Server {
     child: Option<Child>,
     pub port: u16,
@@ -34,13 +42,15 @@ pub struct Server {
 
 impl Server {
     pub fn start() -> Server {
+        Server::start_in(test_dir("tsdb-rust"))
+    }
+
+    /// Starts tsdbd on `dir`, which may already hold a database.
+    pub fn start_in(dir: PathBuf) -> Server {
         let bin = std::env::var_os("TSDBD")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/tsdbd"));
         assert!(bin.exists(), "{} is missing: run make in the repository root", bin.display());
-        let base = std::env::var_os("TSDB_TEST_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("tsdb-rust-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-        let _ = std::fs::remove_dir_all(&dir);
         let mut log = String::new();
         for _ in 0..10 {
             let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

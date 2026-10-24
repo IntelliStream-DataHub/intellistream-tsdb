@@ -185,7 +185,8 @@ dist-check-sandybridge: dist
 PYVENV ?= build/pyvenv
 
 test-rust: $(B)/tsdbd
-	cd client/rust && cargo test
+	cd client/rust && cargo test --features embedded
+	cd client/rust-sys && cargo test
 
 test-python: $(B)/tsdbd
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
