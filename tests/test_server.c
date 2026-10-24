@@ -2282,12 +2282,14 @@ static void test_metrics(const char *dir)
     CHECK(qcount - q0 >= (double)M_THREADS * (M_QUERIES + 1));
     CHECK(msum(&after, "tsdb_query_duration_seconds_sum") > msum(&before, "tsdb_query_duration_seconds_sum"));
     {   /* a query of a few thousand rows takes far less than 30 s: it must not sit in the +Inf bucket,
-         * and a fast one is in a bucket at or below 1 s */
-        double agg_inf = mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"+Inf\"");
+         * and a fast one is in a bucket at or below 1 s. The workers' tsdbc_query_agg calls arrive as
+         * QUERY_BUCKETS (protocol 9); the only QUERY_AGG is the refused raw frame above, which the server
+         * counts after its reply is sent, so a scrape for op="query_agg" races it. */
+        double agg_inf = mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_buckets\",le=\"+Inf\"");
         CHECK(agg_inf > 0);
-        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"30\"") == agg_inf);
-        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"1\"") == agg_inf);
-        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"0.0005\"") <= agg_inf);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_buckets\",le=\"30\"") == agg_inf);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_buckets\",le=\"1\"") == agg_inf);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_buckets\",le=\"0.0005\"") <= agg_inf);
     }
     double inv = mval(&after, "tsdb_request_errors_total", "code=\"invalid\"") - mval(&before, "tsdb_request_errors_total", "code=\"invalid\"");
     CHECK(inv == 1);

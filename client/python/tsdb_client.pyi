@@ -223,7 +223,8 @@ class Client:
         host: Server name or address.
         port: Server port (7070 by default).
         timeout: Seconds to wait for the connection and for every later read
-            or write; None (the default) waits forever. A call that times out
+            or write; None (the default) gives up on the connect after 10 s
+            and lets every later call wait forever. A call that times out
             raises TsdbError (ERR_IO) and closes the client.
         keepalive: Turn TCP keepalive on (the default): after 30 s of silence
             the client probes every 10 s and drops the connection after 3
