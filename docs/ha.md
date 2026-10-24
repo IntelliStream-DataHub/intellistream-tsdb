@@ -611,3 +611,425 @@ Each step lands with its tests green: `make test`, `make asan`, plus `make jepse
 | U19 | `dup2` over an fd with a syscall in flight flushes and releases the old description only after that syscall returns. | Source (`do_dup2`, `filp_close`); unit test with a stalled crashfs write |
 | U20 | On the poison descriptor, `pwrite`, `write`, `fdatasync`, `ftruncate` and `*at` calls all return errors. | Unit test |
 | U21 | Without `local_lock`, NFSv4 sends OFD locks to the server with owner = description. | lockprobe across two hosts |
+
+## 15. NFS server outages
+
+This is §15 of this document. Subsections are numbered 15.0 to 15.10.
+
+**Setting.** About 10 NFS servers export ZFS pools (raidz or draid, with a SLOG) over NFSv4.1/4.2 on RDMA. The servers have no failover: one can be down for hours. About 1000 volumes are spread over the servers and about 20 tsdb nodes, so every node has volumes on every server. A server can also fail in part: one of its pools suspended (`failmode=wait`), one dataset full, or one export missing.
+
+**Goal.**
+- A request for a volume that cannot be served gets an answer within `admit_deadline` (2 s by default). The answer is either "definitely not applied" (UNAVAILABLE) or "outcome unknown" (IO).
+- Volumes on healthy storage keep full speed. Nothing that happens on dead storage may kill, reboot or freeze a node.
+- When the storage returns, its volumes come back without an operator. Before they do, tsdb checks that the storage still holds what tsdb acknowledged.
+
+**What this section changes elsewhere in the document.**
+- §1: a per-volume health state next to the role.
+- §2.7 and D17: the stuck-I/O escalation needs a successful probe of the *same filesystem*.
+- §5: creation skips volumes on DOWN storage, with an abort rule.
+- §8: new admission rules, watchdog exemptions, and no `FailureAction=reboot-force` for outages.
+- §9: v5 without HA, D13 and HELLO amended, new bodies and statuses.
+- §11: `grace-time` and the exports.
+- §10, §13 and §14: new rows, tests and steps.
+
+Section 15 can ship **before** the rest of HA, on today's engine (O0-O9).
+
+### 15.0 Decisions
+
+| # | Decision | Rejected | Why |
+|---|---|---|---|
+| D20 | Keep **`hard`** mounts (§2.1). tsdb detects outages itself. | `soft`/`softerr` | A soft timeout leaves the outcome unknown. It also adds `ETIMEDOUT` to the errors whose dirty pages are dropped without redirtying (`fs/nfs/internal.h:911-929`, `write.c:972-976`). Hard mounts reduce errors but do not remove them: ENOSPC, EDQUOT, EIO and ESTALE from the server drop pages on hard mounts too. So the WAL taint (§15.3) and the SIGBUS guard are needed either way. |
+| D21 | Health is tracked per **storage domain**. A domain is one NFS superblock: one exported filesystem, i.e. one ZFS dataset or pool, found through the `major:minor` field of `/proc/self/mountinfo`. Domains are grouped by server address. Each volume also has its own health (STUCK, FULL). | Health per server only; per volume only | A server can suspend one pool and serve another, or fill one dataset. With per-server health the probe says UP while volumes hang, and §2.7 then escalates. With per-volume health only, 50 independent timeouts. |
+| D22 | Unavailable storage makes its volumes **UNAVAILABLE**. It never causes a kill, reboot or takeover, and threads stuck on it are exempt from every watchdog condition. | Escalation from D17 | No other node can reach the storage either. Killing nodes only loses their healthy volumes. |
+| D23 | Refusals happen **at admission, before any engine work**. They return `TSDB_ERR_UNAVAILABLE` (definitely not applied). | Trying and timing out | A thread that touches a dead hard mount is lost until the storage returns. |
+| D24 | A **stuck request fences its volume.** While any request is parked on volume v, v is UNAVAILABLE(STUCK) for every session. A parked request that has not yet published is *abandoned*: it discards its work instead of landing late. A parked request never touches another volume. | Letting late writes land after newer acked ones; per-session blocking | Block numbers are assigned at publish (`parts_publish`). A late direct insert would therefore win over a write acked after it. |
+| D25 | Multi-volume inserts: a v5 frame writes its healthy volumes and replies `TSDB_ERR_PARTIAL` with a per-row bitmap. A v≤4 frame is refused **whole** if any target volume is unavailable. | Partial application for old clients | Old clients see PARTIAL as IO and resend the whole frame hours later. The resend overwrites newer acked values on the healthy volumes and undoes `drop_before`. |
+| D26 | **tsdbd never creates a database or a volume implicitly.** It checks each path's mount identity against the node-local `catalog.cache` before opening. | Today's `eng_open` mkdir and META/ID creation | An empty export (dataset not mounted after a reboot) or a missing mount would otherwise get a fresh database. Writes to it vanish when the real one appears. |
+| D27 | **Every recovery revalidates storage against memory** (WAL tail, MANIFEST, parts, CATALOG). On a mismatch the volume is DIVERGED: re-log, cold reopen, alert. | Resuming silently after a pure hang | `zpool import -m/-F` and SLOG loss roll back fdatasync-acked writes. |
+| D28 | **No write is accepted for an unavailable volume:** no hinted handoff and no client spool. Apache Pulsar, in front of tsdb, is the buffer. The Pulsar sink (`connectors/pulsar`) retries a refused batch in place until the volume returns. | Server-side hints; a client spool with conditional replay | The user's architecture: Pulsar already keeps the data durably and in order per key, so an OK from tsdb keeps meaning "durable on the volume's storage". |
+
+### 15.1 Mount options, kernel facts and rules
+
+**Mounts.**
+- Clients: `vers=4.2,proto=rdma,port=20049,hard,timeo=100,retrans=2,lookupcache=positive`, no `local_lock`. On a hard mount, `timeo` and `retrans` only control "not responding" and the RDMA disconnect (`xprtrdma/transport.c:409-426`). After that, reconnects back off from 5 s to 30 s (`xprt_rdma.h:65-66`).
+- Server (changes §11): `grace-time=90`, with `lease-time=10` unchanged.
+  - Grace must outlast the slowest client reconnect (30 s) with margin. Otherwise an owner in backoff misses reclaim, its lock is LOST, and the whole domain fails over at once.
+  - nfsd extends grace only while someone is reclaiming (`clients_still_reclaiming`, `nfsd/nfs4state.c:6277-6288`). A client that has not reconnected yet does not count.
+  - Grace delays only the restart of a server, never the failover of a node.
+- Exports carry `mp` (or `mountpoint=`), so nfsd refuses to export a dataset directory that is not mounted (U34).
+
+**Kernel facts (v6.12) that the rules rest on.**
+1. Synchronous RPCs on a hard mount are killable only (`sched.c:987-989`). Waits for writeback are `TASK_UNINTERRUPTIBLE` (`mm/filemap.c:1448`): fsync, and close of a writable fd with dirty pages. Not even SIGKILL ends them.
+2. A failed writeback with a "fatal" error is not redirtied. ETIMEDOUT and EIO count, and so do ENOSPC, EDQUOT and ESTALE (`internal.h:911-929`). Its pages are dropped and the error is reported once per open file description.
+3. A fault on an uncached page waits, killable, without holding `mmap_lock` (`filemap.c:2373, 3433`). Any read error returns `VM_FAULT_SIGBUS` (`filemap.c:3433-3444`). That includes EIO from a degraded pool and ESTALE from a rolled-back file, **on hard mounts too**.
+4. `nfs_file_mmap` may send a GETATTR under `mmap_write_lock` (`file.c:213-216`, `inode.c:1493-1503`). If that RPC goes to a dead server, every mmap, munmap and brk in the process stalls.
+5. Direct reclaim can block on a dead server. `nfs_release_folio` calls `nfs_wb_folio` → `nfs_commit_inode` for clean but uncommitted (PG_private) folios when the gfp mask allows it and the caller is not kswapd (`file.c:447-460`). Any thread that enters direct reclaim can then wait for hours.
+6. A process that has one thread in D state cannot finish exiting. Its shared fd table stays open, with every flock, the listening socket and every mapping.
+
+**Rules.**
+- **R1. Process-wide resources are never held across I/O to a volume.** These are: the event loop, the shared pools, global locks, `t->lock`, and `mmap_lock`.
+  - All I/O to a volume runs on that volume's threads, or on a worker that admission has assigned to the volume and can write off (§15.3).
+  - `part_open` keeps its `fstat` immediately before `mmap` (`part.c:75-87`), so the attribute cache is fresh and `nfs_file_mmap` sends no RPC (U39). A comment and a test with `acregmin=0` guard this.
+- **R2.** Soft mounts are refused for every open. `--allow-soft-mount` overrides it.
+- **R3. Bounded unstable data per file.**
+  - The part writer and the WAL writer call `fdatasync` at least every `nfs_commit_bytes` (default 32 MiB, to be tuned in O0). Uncommitted folios then stay bounded, which bounds both the reclaim hazard (fact 5) and the dirty pages a dead domain pins.
+  - The interval is measured with `insert-bench` and merges. O_DIRECT part writing is the fallback.
+- **R4. Host settings that `tsdb-cli ha preflight` checks:**
+  - **Per-bdi limits:** `strict_limit=1` and `max_bytes` in `/sys/class/bdi/<dev>/`. The sum of `max_bytes` over all NFS bdis must stay below half the global dirty limit (`vm.dirty_ratio`; about 51 GB at 20% of 256 GB). Otherwise one dead server can again throttle every writer (`mm/page-writeback.c:1082-1085`). Preflight reads `mountinfo` and `/sys/class/bdi`, computes the sum and fails over the limit.
+  - **No memory limit on tsdbd:** no `MemoryHigh`/`MemoryMax`, which would push threads into direct reclaim. Raise `vm.min_free_kbytes` and `vm.watermark_scale_factor` so that kswapd does the reclaim (fact 5, U36).
+  - **No statfs on NFS:** no agent may call statfs on the NFS mounts (`nfs_statfs` always sends an RPC). Exclude nfs4 from node_exporter. No `sync` and no bare `df`.
+  - **Exports:** the exports use `mp`. tsdbd is started through `tsdbd.socket` (§15.3, Shutdown).
+
+### 15.2 Storage domains and detection
+
+**Domains.**
+- At open, tsdb reads `/proc/self/mountinfo`, without stat-ing any NFS path. Each volume's path is mapped to its mount: `major:minor`, source `server:/export` and `addr=`. Volumes with the same `major:minor` form one **fs domain**. fs domains with the same `addr=` form one **server group**, used for display and for the recovery cap.
+- An exported child dataset gets its own client superblock (U38). Each mount's `major:minor`, source and fstype are recorded in `catalog.cache` (§15.3). A path whose mount is missing or different is DOWN(NOT_MOUNTED), never opened.
+
+**Probes.** Each fs domain has one probe thread on each node, and it does nothing else.
+- Every 1 s it reads 4 KiB with O_DIRECT from `<first volume of the domain>/PROBE`.
+- Every 5 s it does a `pwrite` and `fdatasync` of 4 KiB to `PROBE.<node_id>`.
+- The probe thread is allowed to hang. A **monitor thread** that does no I/O reads the start time of the probe in flight (`CLOCK_MONOTONIC`).
+- If a probe has been stuck for 60 s, a second probe thread starts. At most 2 probe threads per domain exist.
+
+**Signals per volume (from §15.3 admission).**
+- **In-engine age:** the start time of the oldest request inside the engine.
+- **Parked count:** the number of requests parked on the volume (§15.3).
+- **EIO or ETIMEDOUT** from the engine: the domain is probed at once.
+- **ENOSPC or EDQUOT**, from the engine or from a write probe: the volume (not the domain) becomes **FULL**. Writes are refused and reads keep working.
+
+**Domain states.**
+
+| State | Entered when | Effect |
+|---|---|---|
+| UP | (start) | Normal admission. |
+| DEGRADED | Write-probe p99 over the last minute is above `max(500 ms, 10 × its 1 h baseline)` | Merges are throttled to 1 per domain on this node (not paused: inserts wait in `db_wait_merges` after publishing, `db.c:150-162`, `insert.c:503`). The per-volume cap drops to 1 only while in-engine age is growing. `admit_deadline` for the domain becomes `min(10 s, max(2 s, 4 × in-engine p99))`. |
+| DOWN | A probe has been outstanding for `down_ms` (default 10 s), or 3 probes in a row failed with errors other than ENOSPC/EDQUOT, or the mount is gone | Every volume is UNAVAILABLE(NFS_DOWN or NOT_MOUNTED). No merges, flushes, follower refreshes or recoveries start. |
+| RECOVERING | **Write and fdatasync probes** succeed for 10 s, each within 1 s, after the last probe thread stuck on the domain has returned | Volumes are recovered one at a time (§15.5). Read probes alone never leave DOWN: the server's ARC answers reads while writes to the pool are suspended. |
+
+**Hysteresis.** Leaving DEGRADED needs 2 min under the threshold. A domain that went DOWN 3 times in 10 minutes needs 60 s of good probes to leave DOWN. A slow domain (a resilver or a scrub) therefore stays DEGRADED and serves. It does not flap through DOWN and RECOVERING unless one probe really takes `down_ms`.
+
+**Effective health of a volume.**
+- AVAILABLE, DEGRADED, or UNAVAILABLE with a reason. The reasons are NFS_DOWN, NOT_MOUNTED, STUCK, FULL (writes only), BUSY, ROOT_DOWN, LOCKED, RECOVERING, DIVERGED and MAINTENANCE, plus SUSPECT, PROMOTING and FENCED from §1.
+- **STUCK** is per volume, whatever the domain state. It holds while the volume has a parked request (D24). It also holds while `parked ≥ cap` or in-engine age exceeds `down_ms`. Parked requests count against the volume's cap, so new admission stops before more threads are lost. That bound holds even if the probe of a healthy sibling pool says UP.
+- `tsdbd` publishes the domain and volume states to `/run/tsdbd/health` (tmpfs, written by the monitor thread) for the escalation helper.
+
+**HA (changes §2.7, §8, D17).**
+- An owned volume on DOWN storage goes SUSPECT through the ack gate.
+- **§2.7 stuck-I/O escalation** now requires three things:
+  - the volume's own fs domain is UP;
+  - a write+fdatasync probe of that same fs domain succeeded after the stuck I/O began;
+  - the volume is not FULL.
+
+  A stall of a server, a pool or a dataset never escalates.
+- **§8 watchdog.**
+  - A thread registered as "in I/O on domain d" is exempt from the progress condition while d is not UP or its volume is STUCK. These are parked workers, read-pool threads, the opener, probe, recovery and HA threads.
+  - The per-volume "HA thread issued a probe" condition is waived for volumes whose domain is not UP. Issuing is otherwise impossible: the previous synchronous probe is still stuck.
+  - A jepsen-ha check (§15.8) asserts zero SIGKILLs and zero reboots during a 10-minute hang.
+- **Standbys.** `F_OFD_SETLK` calls to DOWN storage block on per-volume HA threads, which are allowed to hang. When the domain returns, a standby waits for grace (90 s) plus 30 s before it polls, so a reclaiming owner keeps its volume.
+
+### 15.3 Isolation
+
+The row numbers refer to the stall map (rows 1-16).
+
+**Admission in tsdbd (rows 1, 2, 14, 15). This is D19, made concrete.**
+- **The loop routes by header only.**
+  - A v5 insert carries `vol` (§9). Single-series frames are routed with an in-memory `route()` that never does I/O.
+  - Packed MANY_SERIES frames without a single `vol` go to a small **decode pool**: zstd and unshaping (`tsdbd.c:360-392`). The pool routes them and hands them to per-volume admission. Decompression never runs on the loop.
+  - Decode-pool threads do no engine I/O.
+- **Refusals.**
+  - Refusals for an UNAVAILABLE volume are sent from the loop or from the decode pool.
+  - Refusals to v≤4 connections are **tarpitted**: the reply is held for `min(retry_after, 1 s)` on a loop timer, holding no worker, and limited per connection. Old clients that retry in a tight loop cannot load the loop.
+  - STATUS counts refusals per connection.
+- **Per volume:** a FIFO bounded in bytes (`vol_queue_bytes`, default 64 MiB), and a cap on requests in the engine (4). A full queue replies UNAVAILABLE(BUSY), with `retry_after` taken from the measured drain rate. Queries use the separate read pool (§8) with the same per-volume caps.
+
+**Parking (D24).** A request that has been in the engine longer than `admit_deadline` on a volume whose domain is not UP, or whose in-engine age is growing, is parked:
+1. **The volume is fenced.** It becomes UNAVAILABLE(STUCK) for every session and connection until every parked request on it has returned.
+2. **The request is abandoned.** Its `abandoned` flag (atomic) is set.
+   - The engine checks the flag under `publish_lock` in `parts_publish`, before allocating block numbers, and in `mem_insert` before `mt_add`.
+   - An abandoned request discards its pending parts and returns `TSDB_ERR_ABANDONED`.
+   - If it was already past that check, it completes. The fence in (1) makes sure nothing newer was admitted to that volume before it lands.
+   - A multi-volume request checks the flag before each volume (`insert_slots`, `volumes.c:659-662`; `each()`; QUERY_GROUP), so it never touches another volume after being parked.
+3. **The request is detached from its connection.**
+   - The loop gives the connection a new generation and clears `busy`. The client gets `TSDB_ERR_IO`, which is indeterminate.
+   - The worker's later `reply()` and `notify(done)` go to a tombstone. The tombstone is freed when the worker returns, never to `c` (`tsdbd.c:220-260, 915-924`).
+4. **The pool starts a replacement worker.** Parked workers count against the volume's cap, not against `nworkers`. Parked threads are bounded by cap × volumes on the node.
+5. **eng references.** A parked thread holds a reference on every `eng` it may touch. Recovery and abandonment (§15.5) wait for those references, not only for threads parked on one volume.
+
+**D13 and HELLO (changes §9).**
+- `seq == blocked_at` clears the block only when no frame of that session is still parked on the volume.
+- A HELLO with a session id held by an older connection detaches that connection's queued frames and replies at once. It does not wait for a request in progress, which may be parked for hours. The STUCK fence keeps the order.
+
+**Operations without one volume (rows 3, 4, and STATS).**
+- COMMIT, FLUSH, OPTIMIZE, drop_before, STATS, `foreach_part`, QUERY_GROUP and LAST_STATS are split into **per-volume subtasks**. Each subtask goes through that volume's admission, cap and parking.
+- The parent waits for at most `admit_deadline`. It reports volumes that were refused or did not finish (PARTIAL for v5, §15.4).
+- **COMMIT and FLUSH** cover only the volumes the connection has written since its last COMMIT, tracked per connection. A client that never wrote to a down volume gets OK.
+- **drop_before.**
+  - `drop_lock` (`volumes.c:742-750`) becomes per volume.
+  - A drop on an unavailable volume is recorded in `/var/lib/tsdb/<uuid>/pending_drops` (fsynced, local) and replied as pending.
+  - Recovery runs it before the volume admits writes (§15.5).
+- **Root I/O.** Series creation registers "I/O on domain d" around root I/O, so parking keys on the domain actually touched. It takes the root create lock with `pthread_mutex_timedlock` and refuses ROOT_DOWN on timeout.
+
+**Global locks held across I/O (rows 5-8). Rule: never hold a lock that is not the volume's own across I/O to a volume.**
+- **Row 5.** Placement and creation pick only AVAILABLE volumes. The SERIES append runs under the volume's own lock, and the CATALOG append under a short root lock.
+- **Row 6: the catalog follower.**
+  - No I/O ever runs under `t->lock` or on the loop. Today follower `catch_up` takes the wrlock and calls `eng_refresh(root)` and `load_layout` (`volumes.c:377-385`). Both `route()` and `tsdb_series_lookup()` call it on any miss (`388-418`).
+  - Instead, each node runs one **catalog-follower thread**. It refreshes CATALOG and VOLUMES in the background, with a deadline, at most once per 100 ms and coalesced. It builds new arrays outside the lock and publishes them under a short wrlock.
+  - On a miss, the caller never refreshes. It waits, on a worker and never the loop, for the next catalog generation, up to `admit_deadline`. Then it replies NOTFOUND, or UNAVAILABLE(ROOT_DOWN) if the root domain is not UP or the deadline passed.
+  - `volume_open` runs outside the lock as well. This applies to every role (§5 "every role calls `catch_up`").
+- **Row 7.** STATS and `foreach_part` copy the `eng` pointers and release the rdlock (`volumes.c:1035-1061`). The `renameat` in `db_retire_locked` and the `unlinkat` in `graveyard_purge` move out from under `db->lock`.
+- **Row 8.** Series names are kept in `tsdb` memory. `names_find` never takes a volume's `d->lock`.
+
+**Series creation when a volume stalls (row 5, §5).**
+- Creation may skip the SERIES-tail check of volumes on DOWN storage. Nobody can append to them, so the only names missed are orphans, which §5 treats as dead local ids.
+- **Abort rule.** Each creation batch carries an abort generation.
+  - A batch whose SERIES append stalls past `admit_deadline` is aborted: its waiters get IO and the generation is bumped.
+  - The thread re-checks the generation under the root lock immediately before the CATALOG append and `cat_add` (today these follow `eng_series` unchecked, `volumes.c:477-487`), and skips both if it changed. Its SERIES entry stays an orphan.
+  - Under HA the thread holds the CATALOG fd through the grant, and aborting `dup2`s the poison over it before unlocking (§2.6). A late `pwrite` or `ftruncate` with a stale `size` then fails.
+
+**Root volume and `catalog.cache` (row 9).**
+- Each node keeps `/var/lib/tsdb/<uuid>/catalog.cache`: the CATALOG and VOLUMES prefix, its length and xxh64, the database id (`ID_FILE`) and `ROOT_ID`, and each volume's mount identity.
+- Routing works from the cache while the root is down.
+- Creation, and ids beyond the cached prefix, get UNAVAILABLE(ROOT_DOWN), never NOTFOUND.
+- The cache is used only for the database id it names.
+
+**mmap faults (row 10).**
+- Queries are refused at admission. A query already running checks the volume state (atomic load) before each part and each granule run.
+- **SIGBUS guard (version 1, all mounts).**
+  - Decoding of mapped parts runs inside a per-thread `sigsetjmp` region that holds no locks and does no allocation. The part pin and the output buffers are released by the region's exit path.
+  - The handler checks that `si_addr` lies in a registered part mapping and that the thread is inside a region, then `siglongjmp`s. Otherwise it restores the default action and re-raises.
+  - The volume becomes UNAVAILABLE(IO_ERROR), its domain is probed, and the volume is tainted (recovery revalidates, §15.5).
+- A fault in progress on a hard mount parks its worker.
+
+**Startup (row 11, D26).**
+- **No implicit creation.**
+  - `tsdbd` opens the root and volumes without creating anything: no `mkdir` (`db.c:394`), no META (`db.c:236-245`), no `ID_FILE` (`volumes.c:313-320`).
+  - `tsdbd --init` and `tsdb-cli init` create a database. `--db-id` (or the id in `catalog.cache`) must match `ID_FILE`.
+  - Each path's mount identity is checked through `mountinfo` before any open. A mismatch or a missing mount is DOWN(NOT_MOUNTED).
+  - The library keeps `create` for embedded use, but `tsdb_open` takes a new `TSDB_OPEN_NOCREATE` that tsdbd always passes.
+- **Opening.**
+  - `load_layout` opens volumes in parallel on opener threads, with a 10 s deadline per domain. A volume that fails or does not answer keeps its slot and routes to UNAVAILABLE.
+  - Every unopened volume is retried in the background: when its domain recovers, when `mountinfo` changes (poll it every 2 s), and with backoff for any other error. Today a volume that fails at once is never retried.
+  - `tsdb_open` succeeds if the root or a `catalog.cache` with the matching id is readable.
+- **TSDB_ERR_LOCKED.** If the flock is held, the previous tsdbd (pid from `/run/tsdbd/pid`) may still be alive in D state. The volume is registered UNAVAILABLE(LOCKED) and retried in the background, instead of failing the open.
+
+**Shutdown, crash and restart (row 12).**
+- **SIGTERM.**
+  1. Stop admission.
+  2. Flush and **fully close** every volume on UP domains, in parallel: `eng_close`, including the LOCK fd, which releases the flock. In sync mode, the acked rows of DOWN volumes are in their WAL.
+  3. Never touch the fds of DOWN domains.
+  4. `_exit`.
+
+  A leftover thread then pins only the dead domain's fds.
+- **Crash handler** (SIGSEGV, SIGABRT, and unguarded SIGBUS).
+  1. For each volume on an UP domain, `dup2` the poison (§2.6) over its write fds: WAL, part writer and `dirfd`.
+  2. Close its LOCK fd.
+  3. Re-raise.
+
+  Writes already inside the kernel finish within one RPC on healthy storage, before a restart (`RestartSec=1`) can open the volume (U37). `oom_score_adj` is set low.
+- **Listener.**
+  - The listening socket comes from systemd socket activation (`tsdbd.socket`, `LISTEN_FDS`). A half-dead old process then cannot keep the port from the new one.
+  - Today the listener uses only SO_REUSEADDR (`tsdbd.c:1146`). SO_REUSEPORT is rejected: the dead process's socket would keep receiving its share of connections.
+- **systemd (changes §8).** `FailureAction=reboot-force` is removed from the unit. The escalation helper reboots only when `/run/tsdbd/health` records a §2.7 stuck file on an UP domain. It never reboots when the leftover threads belong to DOWN domains. Outside HA there is no escalation.
+
+**WAL taint (durability).**
+- On any write or `fdatasync` error, `wal_commit` sets `wal_broken` under `wal_sync_lock`, **before** it clears `wal_writing` (`memtable.c:434-474`).
+- From then on, no leader advances `wal_durable` on that `eng`, every waiter returns IO, and `mem_insert` refuses.
+- This is the only safe point. Today the next leader appends with O_APPEND (`memtable.c:330`) after a torn record, its `fdatasync` returns 0 because errseq was consumed, and `wal_durable` advances over the failed rows. Replay then stops at the torn record and loses the acked rows after it.
+- The taint is set inside the engine, so a parked thread's error taints even when its reply goes to a tombstone.
+- A tainted volume is UNAVAILABLE(IO_ERROR) and is never appended to again. Recovery uses the re-log procedure (§15.5).
+
+### 15.4 Client-facing behaviour (protocol v5, extending §9)
+
+**`TSDB_ERR_UNAVAILABLE = -11`** is sent only before engine work.
+- v5 body: `u16 n, n × {u16 vol, u8 reason, u8 flags, u32 epoch, i64 since_ms, u32 retry_after_ms, u64 outage_id}`, then `[u64 resend_from]` when the frame carried a seq.
+- `retry_after_ms = clamp(outage_age/10, 1 s, 60 s)` with ±20% jitter. For BUSY it comes from the drain rate; for MAINTENANCE it is the operator's `--until`.
+- `outage_id` increments each time the volume leaves AVAILABLE (for logs and metrics).
+- Streaming ops send `{last=1, n=0}` and then the body.
+
+**`TSDB_ERR_PARTIAL = -12`**, v5 only.
+- Body: `u16 nv, nv × {u16 vol, i16 status}`, `u32 nrows, u8 not_applied[(nrows+7)/8]`, then the UNAVAILABLE entries.
+- A row's bit is set when its volume was refused (definitely not applied) or abandoned or indeterminate. The per-volume status says which.
+- COMMIT, FLUSH and drop_before reply PARTIAL with per-volume statuses. QUERY_GROUP and LAST_STATS return the available series and end with PARTIAL listing the missing ones.
+
+**v5 without HA.** The epoch is 0 outside HA mode. Sessions work as in §9: clients always send a random session id. This changes §9's assumption that v5 implies HA.
+
+**New op `SERIES_VOLUME`:** `u32 n, ids[n]` → `u16 vol[n]`.
+
+**TOPOLOGY** entries gain `u8 health, u8 reason, i64 since_ms, u16 domain, u16 server`. The request gains `u64 since_gen` and the reply `u64 gen`. There is no server push; clients poll.
+
+**STATUS** gains `domain.<d>.{state,since,probe_ms,parked,refused}`, `vol.<n>.{health,reason}` and refusals per connection.
+
+**Old clients (v≤4).**
+- No error bodies (`tsdb_client.c:408-410`, `client.rs:813-821`).
+- A refusal replies `TSDB_ERR_IO` (tarpitted, §15.3), or -11 with `legacy_unavailable_status=unavailable`.
+- **A multi-volume frame is refused whole** if any target volume is unavailable, before anything is applied (D25). The option `legacy_partial=apply` restores partial application for operators who accept the overwrite risk.
+- A volume that fails mid-frame still yields IO, as today.
+- COMMIT and FLUSH use the per-connection written set, so they fail only if the connection wrote to an unavailable volume.
+- Pipelined frames after a refused one are still applied. Old clients have no seq; this is documented.
+- Late resends follow §9's caveat: last write wins by arrival, so they are idempotent only if no other producer writes the same keys and no `drop_before` runs in between.
+
+**The four client libraries.**
+- **C:** `tsdbc_unavailable(c, &info)`, per-frame statuses from `drain` (`tsdb_client.c:228-241` keeps only the first), a pipeline cap, frames copied out of the zstd buffer, and a read timeout.
+- **Rust:** `Status::Unavailable(Vec<VolInfo>)` and `Status::Partial`. `wait()` returns every failed frame.
+- **Python:** `TsdbUnavailable(TsdbError)` with `.volumes` and `.retry_after`.
+- **Java:** `UnavailableException` and `PartialException`, plus a read timeout.
+- **All four** split MANY_SERIES per volume (`SERIES_VOLUME`), keep refused and unacked frames per volume in seq order, and back off with full jitter capped by `retry_after_ms`.
+
+**Pulsar as the buffer (D28).** Writers go through Apache Pulsar, and the Pulsar sink is the tsdb client that feeds a volume:
+- It acknowledges a Pulsar message only after tsdb replied OK for the batch holding it.
+- On UNAVAILABLE, BUSY or an indeterminate IO it retries the same batch in place, in order, after `retry_after_ms` with jitter. It never negatively acknowledges, because that would reorder a series.
+- A late landing of an indeterminate attempt is harmless: D24 makes it land before anything admitted later to that volume, and the retry writes the same values.
+- Producers key messages by series, and topics are best partitioned by volume (`SERIES_VOLUME`/TOPOLOGY), so one unavailable volume holds back only its own messages.
+
+**What a reply means.**
+
+| Reply | Meaning |
+|---|---|
+| OK | Durable on the volume's storage, as today. |
+| UNAVAILABLE, or a PARTIAL row marked refused | Definitely not applied. |
+| PARTIAL row marked abandoned | Not applied; the work was discarded. |
+| IO, or a timeout | Indeterminate. If it lands, it lands before anything admitted later to that volume (D24). |
+
+### 15.5 Recovery when the storage returns
+
+1. **The domain goes RECOVERING** on write probes (§15.2). Stuck threads return on their own as the hard mount retries.
+2. **Wait for references.** A volume is recovered only after every thread holding a reference on its `eng` has returned: parked workers, the opener, the flusher, mergers, the follower and the HA thread. Late writes therefore land, or are abandoned, before anything new is admitted. One recovery attempt per volume runs at a time; a new attempt starts only after the previous thread has returned. At most 4 volumes per server group per node recover at once, with 0-5 s of jitter.
+3. **Revalidate (D27).** This runs for every volume, tainted or not.
+   - **WAL:** an O_DIRECT read of the last durable record of the current segment. Its offset and xxh64 must match what the engine recorded at `wal_durable`, and the server size must be at least that offset.
+   - **MANIFEST:** an O_DIRECT read must match the last published checksum and generation.
+   - **Parts:** every live part exists with its expected size (`fstatat` on a fresh open).
+   - **Pending drops:** run them now.
+   - If everything matches and the volume is not tainted: resume on new fds (`wal_fd` is reopened, never reused).
+4. **Re-log** (on taint, or on DIVERGED after a mismatch).
+   1. Write the memtable rows with `lsn ≤ wal_durable` (`mt_collect` with `visible`) into a **new** segment, then fdatasync it and the directory. Rows past `wal_durable` were never acked and are dropped.
+   2. Cold-reopen the volume from the directory (the intent files and `wal_seq` rules apply). A rollback that reverted a merge brings the source parts back under their live names, so the directory, not memory, is the truth.
+   3. Parts that memory listed but the storage lost are reported (`tsdb_lost_parts{vol}`, block ranges, log at error level). Their rows are gone.
+   4. In HA this is an edit under the ledger (§2.5). The volume stays DIVERGED until an operator acknowledges it, if any part was lost.
+5. **Root.**
+   - If CATALOG is shorter than `catalog.cache` and its prefix hash matches, a node may re-append the cached tail under the CATALOG lock, but only if every referenced volume's SERIES holds that local id with the cached name. Ids are positions, so this restores them exactly.
+   - Otherwise the root is ROOT_DIVERGED. Creation is refused until `tsdb-cli catalog repair` runs.
+   - A CATALOG whose prefix differs from the cache is always ROOT_DIVERGED. Creation reuses `id = size/8` (`volumes.c:483-486`), so continuing would give two series one id.
+6. **NFSv4 state.**
+   - After a server reboot, opens and locks are reclaimed during grace (`nfs4state.c:1638, 1881-1883`; U32). The 90 s grace covers the 30 s reconnect backoff.
+   - A server that stayed up keeps an uncontested expired client as COURTESY.
+   - Lost state (`NFS4ERR_EXPIRED`, `recover_lost_locks=0`) returns EIO on lock-owning fds (`nfs4state.c:998-999`), which leads to taint and the re-log path.
+7. **HA writer lease.**
+   - A lock that survived: the next heartbeat moves SUSPECT to OWNER, same epoch.
+   - A LOST lock leads to FENCED and abandon (§2.6), then the §4 takeover at E+1. Standbys hold back for grace + 30 s (§15.2), so the old owner usually reclaims or wins.
+8. **After recovery.**
+   - Merges run at full rate. Admission is throttled by the part count (`PARTS_TO_DELAY_INSERT`, `db.c:150-162`): when a partition nears the limit, the volume's queue stops draining, fills and replies BUSY. Nothing holds a worker in `db_wait_merges` beyond the cap.
+   - Followers refresh in random order. Clients see AVAILABLE in TOPOLOGY. Pulsar sinks resume as their `retry_after_ms` expire, and the part-count throttle (BUSY) paces the backlog they deliver.
+9. **Storage that comes back elsewhere.** A pool imported on another head, or an export remounted at another path, leaves the old threads stuck for good. `tsdb-cli volume abandon <vol>` and `tsdb-cli domain abandon <d>` handle this:
+   - mark the old `eng` and its threads abandoned (they leak, and their wakeups go to tombstones);
+   - re-resolve the path through `mountinfo` to the new mount and domain;
+   - cold-open with replay and revalidation.
+
+   The old export must never be served again while abandoned threads exist. Under HA the new open claims a new epoch.
+
+### 15.6 Not planned: hinted handoff
+
+tsdb does not accept writes it cannot make durable on the volume's own storage. Data for an unavailable volume waits in Pulsar (D28), so there is no hint volume, no client spool and no conditional replay.
+
+### 15.7 Observability and operator tools
+
+**Metrics** (none of them touches NFS):
+- `tsdb_domain_state{domain,server}` and `tsdb_probe_seconds{domain,kind}`;
+- `tsdb_volume_health{vol,reason}`, `tsdb_refused_total{vol,reason}` and `tsdb_partial_total`;
+- `tsdb_parked_threads{domain}` and `tsdb_abandoned_total{vol}`;
+- `tsdb_lost_parts{vol}`, `tsdb_diverged{vol}`, `tsdb_outage_seconds_total` and `tsdb_recovery_seconds{step}`;
+- the bdi dirty and writeback bytes.
+
+**Logs.** Every transition is logged. Refusals are logged once per volume per minute.
+
+**Commands.**
+- `tsdb-cli ha status`, grouped by server and domain.
+- `domain maint <d> on|off [--until]` drains: stop writes, flush, stop merges, `fdatasync`, then MAINTENANCE.
+- `volume maint`, `domain probe`, `volume abandon` and `domain abandon`.
+- `catalog repair`, and `volume ack-divergence`.
+
+**Runbook.** A pool imported with `zpool import -m` or `-F`, or one that lost its SLOG, may have rolled back. Revalidation (§15.5) detects it, but the operator should expect DIVERGED volumes and check `tsdb_lost_parts`.
+
+### 15.8 Test plan (extends §13)
+
+**crashfs control socket** (`CRASHFS_CTL`).
+- `hang`, `eio`, `enospc`, `estale`, `etimedout`, `slow <ms>`, `rollback` and `heal` per path prefix.
+- `rollback` restores a prefix to a snapshot taken by `snap`.
+- **mmap:** faults are served through `userfaultfd` (`UFFD_USER_MODE_ONLY`). The handler blocks them while hung and switches to `UFFD_FEATURE_SIGBUS` for eio and estale.
+
+**`tests/test_outage.c` (make test).** Prefixes A, A2 and B: A and A2 are two filesystems of one "server", B is another server.
+- With A hung, B's p99 stays within 1.2× of baseline and A answers within 2.5 s. With only A hung, A2 stays AVAILABLE.
+- With A at `slow 500`, no volume becomes UNAVAILABLE, and merges and inserts continue.
+- `heal`: A returns automatically, no acked row is lost, and no refused or abandoned row is visible.
+- A PARTIAL bitmap matches the disk.
+
+**Regression tests**, each failing on the old code (AGENTS.md):
+- Stall-map rows 1, 3, 4, 5, 6 (a follower with the root hung and unknown lookups), 7, 8, 11 and 12.
+- A parked direct insert, then a newer acked write to the same key, then heal: the newer value wins (D24).
+- A parked MANY_SERIES frame: after heal, Y keeps the newer value.
+- WAL `enospc` mid-record, then more inserts and kill -9: every acked row replays, and nothing after the error is acked.
+- `rollback` of A's WAL tail and of a part: DIVERGED, re-log, and no acked row is lost that the memtable still held.
+- `rollback` of the root CATALOG: ROOT_DIVERGED, and no duplicate id.
+- An aborted creation whose SERIES append lands late: no second CATALOG entry.
+- Root prefix missing at start: no ID or META is created, ROOT_DOWN, and recovery after "mount".
+- SIGTERM with A hung, then restart: B's volumes open (flock released) and the port is served.
+- A SIGBUS in a query on A (estale): the process survives, and A is UNAVAILABLE.
+- A v≤4 multi-volume frame with A down is refused whole, and COMMIT on a connection that only wrote B returns OK.
+- A Pulsar sink against a volume that goes down for minutes: no message is acknowledged early, none is lost, per-series order holds after recovery (connectors/pulsar integration tests).
+
+**`make jepsen`: an `outage` nemesis** (hang, eio, slow or rollback of one prefix for 2-600 s, mixed with kill -9 and power loss). Checks: no acked write lost (outside declared rollbacks), no refused write visible, healthy throughput ≥ 80%, recovery within 30 s of heal plus grace.
+
+**jepsen-ha:** a 10-minute hang of one domain, with zero SIGKILLs, zero reboots and zero takeovers. Server reboot with the client's RDMA reconnect at maximum backoff: owners reclaim and nothing fails over.
+
+**Manual (`tests/ha/nfs-outage.sh`), 1 h and 3 h runs.** Ways to take storage away:
+- (a) nft drop, TCP test mount only;
+- (b) link down on the NFS server (RDMA);
+- (c) nfsd threads set to 0;
+- (d) server reboot;
+- (e) `zpool export` of one pool while another stays up;
+- (f) a dataset quota filled to ENOSPC;
+- (g) a dataset unmounted under its export, to check `mp`.
+
+Each run records: time to UNAVAILABLE, healthy-volume bench numbers, `df`/`sync` hangs, bdi dirty bytes, wchan of every tsdbd thread (looking for `nfs_commit_inode` in reclaim), time to recovery, reclaim, and parked threads.
+
+### 15.9 Implementation plan
+
+Each step lands with `make test` and `make asan`. Steps that touch the disk path also need `make jepsen`.
+- **O0.** Measure on AlmaLinux 10 over RDMA: the timeouts, the dirty coupling and bdi sums, reclaim stalls under memory pressure, an mmap GETATTR, nfsd grace and reconnect, ZFS EIO over NFS, and the `nfs_commit_bytes` cost (U30-U39).
+- **O1.** crashfs control socket and uffd. `test_outage.c`, failing at first.
+- **O2.** `src/health.c`: domains from `mountinfo`, probes, monitor, states, STUCK and FULL; the new statuses in `tsdb.h`.
+- **O3.** WAL taint in `wal_commit`; the abandoned flag in `parts_publish` and `mem_insert`; the SIGBUS guard; R3 periodic `fdatasync`.
+- **O4.** No implicit creation, mount identity, `catalog.cache` with ids; the catalog-follower thread; no I/O under global locks (rows 5-9); the creation abort generation.
+- **O5.** Parallel open, background reopen, LOCKED handling; SIGTERM full close, the crash handler, socket activation.
+- **O6.** tsdbd admission: header routing, decode pool, per-volume queues and caps, parking with tombstones, tarpit, per-volume subtasks, per-connection COMMIT sets, pending drops. Both io_uring and epoll.
+- **O7.** Recovery: reference waits, revalidation, re-log, DIVERGED, root repair, abandon. Part-count throttling.
+- **O8.** Protocol v5 bodies, `SERIES_VOLUME`, TOPOLOGY, STATUS, `outage_id`; the four clients; `make test-clients`.
+- **O9.** jepsen `outage` nemesis; manual runs (a)-(g).
+- **O10.** HA: watchdog exemptions, the §2.7 same-filesystem rule, grace and standby hold-back, removal of `reboot-force`, the escalation helper reading `/run/tsdbd/health`. This goes into §14 steps 5 and 8.
+
+### 15.10 Open questions for the user
+
+1. Hard mounts with tsdb's own detection, as proposed? Is any node mounted `soft`?
+2. Old clients: should a refusal be IO (tarpitted) or -11? Is whole-frame refusal of multi-volume frames from v≤4 clients acceptable? It stops batching v≤4 clients until the volume returns.
+3. Root: a node-local `catalog.cache`, or CATALOG mirrored on a second server so creation survives a root outage?
+4. Answered: Pulsar buffers writes during an outage (D28). Still open: the ingest rate per volume, which sizes the backlog to drain after a 3 h outage.
+5. Should reads ever be served from page cache during an outage, marked stale?
+6. Planned ZFS maintenance: how often? (`domain maint` drains.)
+7. Do the ZFS servers run nfsdcld? What are their lease and grace times? Is raising grace to 90 s acceptable?
+8. Monitoring agents on the tsdb nodes: which ones call statfs or `df`?
+9. Should placement spread tenants across servers?
+10. One ZFS dataset per volume, or several volumes per dataset? This decides the number of fs domains and probes.
+11. `drop_before` today lets later inserts recreate dropped partitions (`db.c:624-646`). Should a per-volume dropped-before watermark reject late resends and replays below it?
+12. Is there a spare head where pools can be imported? If so, `volume abandon` is the procedure.
+
+**New unverified assumptions.**
+- **U30.** The time to "not responding" and the RDMA reconnect time with `timeo=100,retrans=2`.
+- **U31.** A process with a thread in D state keeps its fd table. After the changes above, only the fds of DOWN domains stay pinned.
+- **U32.** The ZFS servers keep client records across a reboot.
+- **U33.** Per-bdi `strict_limit` and `max_bytes`, with their sum below the global limit, stop a dead domain from throttling healthy mounts.
+- **U34.** nfsd `mp` refuses to export an unmounted dataset directory on these servers.
+- **U35.** ZFS returns NFS4ERR_IO for blocks with permanent errors, rather than hanging.
+- **U36.** With no memcg limit and raised watermarks, tsdbd threads rarely enter direct reclaim. With `nfs_commit_bytes`, uncommitted folios are few enough that the risk is acceptable.
+- **U37.** On healthy storage, in-flight write RPCs from a crashing process finish within `RestartSec`.
+- **U38.** Each exported ZFS dataset gets its own client superblock (distinct `major:minor`), including child datasets under `crossmnt`.
+- **U39.** An `fstat` immediately before `mmap` keeps `nfs_file_mmap` from sending a GETATTR.
