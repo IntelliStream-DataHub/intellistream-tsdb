@@ -37,7 +37,20 @@ int main(int argc, char **argv)
         CHECK(dlsym(self, "tsdb_free") != NULL);
         CHECK(dlsym(self, "eng_open") == NULL);
         CHECK(dlsym(self, "parts_publish") == NULL);
+        CHECK(dlsym(self, "tsdb_struct_size") != NULL);
     }
+
+    /* what a binding compares with its own layouts when it loads the library */
+    CHECK(tsdb_struct_size(TSDB_STRUCT_OPTIONS) == sizeof(tsdb_options));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_VALUES) == sizeof(tsdb_values));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_BUCKET) == sizeof(tsdb_bucket));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_POINTS) == sizeof(tsdb_points));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_GROUP) == sizeof(tsdb_group));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_QUERY_OPTS) == sizeof(tsdb_query_opts));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_QUERY_STATS) == sizeof(tsdb_query_stats));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_STATS) == sizeof(tsdb_stats));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_PART_INFO) == sizeof(tsdb_part_info));
+    CHECK(tsdb_struct_size(-1) == 0 && tsdb_struct_size(TSDB_STRUCT_PART_INFO + 1) == 0);
 
     tsdb *db;
     OK(tsdb_open(dir, NULL, &db));

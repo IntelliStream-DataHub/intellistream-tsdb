@@ -349,6 +349,22 @@ int tsdb_refresh(tsdb *db);
  * portable build (`make dist`) followed by the CPU level of the codecs: "avx2, codecs x86-64-v3". */
 const char *tsdb_simd_level(void);
 
+/* sizeof each public struct as this library was compiled, 0 for an unknown kind. For bindings that lay out the
+ * structs themselves (client/java-embedded): they compare these with their own layouts when they load the library
+ * and refuse a library built from other headers, instead of reading or writing past the end of a struct. */
+typedef enum tsdb_struct_kind {
+    TSDB_STRUCT_OPTIONS = 0,
+    TSDB_STRUCT_VALUES = 1,
+    TSDB_STRUCT_BUCKET = 2,
+    TSDB_STRUCT_POINTS = 3,
+    TSDB_STRUCT_GROUP = 4,
+    TSDB_STRUCT_QUERY_OPTS = 5,
+    TSDB_STRUCT_QUERY_STATS = 6,
+    TSDB_STRUCT_STATS = 7,
+    TSDB_STRUCT_PART_INFO = 8,
+} tsdb_struct_kind;
+size_t tsdb_struct_size(int kind);
+
 #ifdef __cplusplus
 }
 #endif
