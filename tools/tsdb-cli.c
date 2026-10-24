@@ -3,6 +3,7 @@
 #include "tsdb.h"
 #include "tsdb_calendar.h"
 
+#include <math.h>
 #include <unistd.h>
 
 static void usage(void)
@@ -38,7 +39,8 @@ static void usage(void)
             "times: 1700000000000 (ms), 2024-01-31, \"2024-01-31 12:00:00.250\", 2024-01-31T12:00:00Z,\n"
             "       now, now-1h, min, max.  ranges are [start, end).\n"
             "groups: 500ms, 10s, 15m, 6h (fixed length); 1d, 1w, 1mo, 1q, 1y (calendar, in --tz,\n"
-            "        e.g. Europe/Oslo; default UTC). Output is ClickHouse-style TSV, times in UTC.\n");
+            "        e.g. Europe/Oslo; default UTC). Output is ClickHouse-style TSV, times in UTC;\n"
+            "        names escaped (\\t, \\n, \\\\, other control bytes as \\xNN).\n");
     exit(2);
 }
 
@@ -108,6 +110,33 @@ static void batch_push(batch *b, uint32_t s, int64_t t, const void *v, bool know
     b->n++;
 }
 
+/* Writes a name into TSV output escaped as ClickHouse does (\\t, \\n, \\\\, other control bytes as \\xNN):
+ * names may hold any byte but NUL, and a raw tab, newline or ESC would forge rows or reach the terminal. */
+static void put_name(FILE *f, const char *s)
+{
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        if (*p == '\t')
+            fputs("\\t", f);
+        else if (*p == '\n')
+            fputs("\\n", f);
+        else if (*p == '\\')
+            fputs("\\\\", f);
+        else if (*p < 0x20 || *p == 0x7f)
+            fprintf(f, "\\x%02x", *p);
+        else
+            fputc(*p, f);
+    }
+}
+
+/* die() for a name read from an import file: escaped, so its bytes cannot drive the terminal. */
+static void die_name(const char *name, int rc)
+{
+    fputs("tsdb: ", stderr);
+    put_name(stderr, name);
+    fprintf(stderr, ": %s\n", tsdb_strerror(rc));
+    exit(1);
+}
+
 /* Parses a value of `type` into out (its API layout); false if it does not parse. */
 static bool parse_value(tsdb *db, uint32_t series, tsdb_type type, const char *vs, uint8_t out[8], bool *known)
 {
@@ -115,23 +144,31 @@ static bool parse_value(tsdb *db, uint32_t series, tsdb_type type, const char *v
     memset(out, 0, 8);
     if (!*known)
         return true;
+    /* Out of range is refused, not clamped to the largest value or to inf, and the bit patterns reserved for
+     * null are refused rather than stored as a null nobody wrote (as the Pulsar sink does). An explicit
+     * "inf" is a value; "1e999" is an overflow. */
     char *end;
+    errno = 0;
     switch (type) {
     case TSDB_FLOAT32: {
         float f = strtof(vs, &end);
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
         memcpy(out, &f, 4);
-        return end != vs && !*end;
+        return end != vs && !*end && !(errno == ERANGE && isinf(f)) && bits != TSDB_NULL_F32_BITS;
     }
     case TSDB_FLOAT64: {
         double d = strtod(vs, &end);
+        uint64_t bits;
+        memcpy(&bits, &d, 8);
         memcpy(out, &d, 8);
-        return end != vs && !*end;
+        return end != vs && !*end && !(errno == ERANGE && isinf(d)) && bits != TSDB_NULL_F64_BITS;
     }
     case TSDB_INT64: {
         long long x = strtoll(vs, &end, 10);
         int64_t i = x;
         memcpy(out, &i, 8);
-        return end != vs && !*end;
+        return end != vs && !*end && errno != ERANGE && i != INT64_MIN;
     }
     case TSDB_BOOL:
         out[0] = strcmp(vs, "1") == 0 || strcmp(vs, "true") == 0;
@@ -159,8 +196,10 @@ static int cmd_import(tsdb *db, const char *fixed_series)
     char *line = NULL;
     size_t cap = 0, lineno = 0, total = 0;
     ssize_t len;
-    /* remember the last series name to avoid a dictionary lookup per line */
-    char last_name[1024] = "";
+    /* remember the last series name to avoid a dictionary lookup per line; a copy of its full length, so a
+     * name is never mistaken for a longer one that shares its first bytes */
+    char *last_name = NULL;
+    size_t last_cap = 0;
     uint32_t last_id = 0;
     tsdb_type last_type = TSDB_FLOAT32;
     double t0 = now_s();
@@ -189,11 +228,17 @@ static int cmd_import(tsdb *db, const char *fixed_series)
         uint32_t id = fixed;
         tsdb_type type = fixed_type;
         if (!fixed_series) {
-            if (strcmp(fields[0], last_name) != 0) {
+            if (!last_name || strcmp(fields[0], last_name) != 0) {
                 if ((rc = tsdb_series(db, fields[0], &last_id)) != 0 ||
                     (rc = tsdb_series_type(db, last_id, &last_type)) != 0)
-                    die(fields[0], rc);
-                snprintf(last_name, sizeof last_name, "%s", fields[0]);
+                    die_name(fields[0], rc);
+                size_t n = strlen(fields[0]) + 1;
+                if (n > last_cap) {
+                    free(last_name);
+                    if (!(last_name = malloc(last_cap = n)))
+                        die("out of memory", TSDB_ERR_NOMEM);
+                }
+                memcpy(last_name, fields[0], n);
             }
             id = last_id;
             type = last_type;
@@ -203,7 +248,11 @@ static int cmd_import(tsdb *db, const char *fixed_series)
         bool known;
         const char *ts = fields[need - 2], *vs = fields[need - 1];
         if (!parse_time(ts, &t) || !parse_value(db, id, type, vs, v, &known)) {
-            fprintf(stderr, "tsdb: line %zu: cannot parse \"%s,%s\" as time, %s\n", lineno, ts, vs, type_names[type]);
+            fprintf(stderr, "tsdb: line %zu: cannot parse \"", lineno);
+            put_name(stderr, ts);
+            fputc(',', stderr);
+            put_name(stderr, vs);
+            fprintf(stderr, "\" as time, %s\n", type_names[type]);
             return 1;
         }
         batch_push(&b[type], id, t, v, known);
@@ -220,6 +269,7 @@ static int cmd_import(tsdb *db, const char *fixed_series)
     double dt = now_s() - t0;
     fprintf(stderr, "inserted %zu rows in %.2f s (%.0f rows/s)\n", total, dt, total / (dt > 0 ? dt : 1));
     free(line);
+    free(last_name);
     return 0;
 }
 
@@ -249,7 +299,9 @@ static int print_raw(void *ctx, const int64_t *ts, const tsdb_values *col, size_
         case TSDB_BOOL: fprintf(o->f, "%s\t%s\n", tb, ((const uint8_t *)col->values)[i] ? "true" : "false"); break;
         default: {
             const char *name = tsdb_state_name(o->db, o->series, ((const uint32_t *)col->values)[i]);
-            fprintf(o->f, "%s\t%s\n", tb, name ? name : "?");
+            fprintf(o->f, "%s\t", tb);
+            put_name(o->f, name ? name : "?");
+            fputc('\n', o->f);
         }
         }
     }
@@ -305,6 +357,7 @@ static void print_stats(const char *what)
 static bool parse_group(const char *s, tsdb_group *g, int64_t *interval_ms)
 {
     char *end;
+    errno = 0;
     long n = strtol(s, &end, 10);
     if (end == s || n <= 0)
         return false;
@@ -315,6 +368,8 @@ static bool parse_group(const char *s, tsdb_group *g, int64_t *interval_ms)
                  {"w", TSDB_WEEK},   {"mo", TSDB_MONTH}, {"q", TSDB_QUARTER}, {"y", TSDB_YEAR}};
     for (size_t i = 0; i < sizeof units / sizeof *units; i++)
         if (strcmp(end, units[i].suffix) == 0) {
+            if (errno == ERANGE || n > (long)UINT32_MAX) /* not cut to 32 bits: 4294967297h is not 1h */
+                return false;
             g->unit = units[i].unit;
             g->count = (uint32_t)n;
             return true;
@@ -366,8 +421,17 @@ static int cmd_query(tsdb *db, int argc, char **argv)
             }
         } else if (strcmp(argv[i], "--desc") == 0)
             q.order = TSDB_DESC;
-        else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc)
-            q.limit = strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) {
+            /* digits only: "abc" would be 0 (no limit) and "-1" the largest number */
+            const char *l = argv[++i];
+            char *e;
+            errno = 0;
+            q.limit = isdigit((unsigned char)l[0]) ? strtoull(l, &e, 10) : 0;
+            if (!isdigit((unsigned char)l[0]) || *e || errno == ERANGE || q.limit == 0) {
+                fprintf(stderr, "tsdb: --limit wants a positive number, not \"%s\"\n", l);
+                return 2;
+            }
+        }
         else if (strcmp(argv[i], "--tz") == 0 && i + 1 < argc)
             zone = argv[++i];
         else if (npos < 5)
@@ -588,12 +652,19 @@ int main(int argc, char **argv)
         uint32_t id;
         if ((rc = tsdb_series_create(db, name, (tsdb_type)type, path, &id)) != 0)
             die(name, rc);
-        printf("%u\t%s\t%s\t%s\n", id, name, type_names[type], tsdb_series_path(db, id));
+        printf("%u\t", id);
+        put_name(stdout, name);
+        printf("\t%s\t", type_names[type]);
+        put_name(stdout, tsdb_series_path(db, id));
+        putchar('\n');
     } else if (strcmp(cmd, "series") == 0) {
         for (uint32_t i = 0; i < tsdb_series_count(db); i++) {
             tsdb_type t = TSDB_FLOAT32;
             tsdb_series_type(db, i, &t);
-            printf("%s\t%s\t%s\n", tsdb_series_name(db, i), type_names[t], tsdb_series_path(db, i));
+            put_name(stdout, tsdb_series_name(db, i));
+            printf("\t%s\t", type_names[t]);
+            put_name(stdout, tsdb_series_path(db, i));
+            putchar('\n');
         }
     } else if (strcmp(cmd, "stats") == 0) {
         tsdb_stats st;

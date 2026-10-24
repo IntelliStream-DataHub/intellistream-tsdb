@@ -4,6 +4,7 @@
 
 #define _GNU_SOURCE
 #include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -37,6 +38,29 @@ static inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
     return era * 146097 + (int64_t)doe - 719468;
 }
 
+static inline int tools_days_in_month(int64_t y, int m)
+{
+    static const unsigned char dm[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m < 1 || m > 12)
+        return 0; /* no such month: no day is valid */
+    return dm[m - 1] + (m == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+}
+
+/* Reads min..max decimal digits at *p into *out and advances *p; false if there are fewer or more. */
+static inline bool tools_take_num(const char **p, int min, int max, int64_t *out)
+{
+    int64_t v = 0;
+    int n = 0;
+    while (isdigit((unsigned char)**p)) {
+        if (++n > max)
+            return false;
+        v = v * 10 + (**p - '0');
+        (*p)++;
+    }
+    *out = v;
+    return n >= min;
+}
+
 /*
  * Accepts: integer milliseconds, "now", "min", "max",
  * "YYYY-MM-DD", "YYYY-MM-DD HH:MM:SS[.fff]", "YYYY-MM-DDTHH:MM:SS[.fff][Z]" (UTC),
@@ -62,21 +86,32 @@ static inline bool parse_time(const char *s, int64_t *out)
             *out = t;
             return true;
         }
-        if ((s[3] == '-' || s[3] == '+') && parse_interval(s + 4, &d)) {
-            *out = s[3] == '-' ? t - d : t + d;
-            return true;
-        }
+        /* a destructive command (drop-before, delete) must never act on a time that wrapped */
+        if ((s[3] == '-' || s[3] == '+') && parse_interval(s + 4, &d))
+            return !(s[3] == '-' ? __builtin_sub_overflow(t, d, out) : __builtin_add_overflow(t, d, out));
         return false;
     }
-    int y, mo, d, h = 0, mi = 0, sec = 0, n = 0;
-    if (sscanf(s, "%d-%d-%d%n", &y, &mo, &d, &n) == 3 && n >= 8) {
-        const char *p = s + n;
-        int ms = 0;
+    /* A date: digits, then '-'. Every field has a bounded number of digits and a range, so nothing
+     * overflows and a typo like 99:99:99 or 02-31 is refused instead of read as another time. */
+    const char *p = s + (*s == '-');
+    const char *q = p;
+    while (isdigit((unsigned char)*q))
+        q++;
+    if (q > p && *q == '-') {
+        int64_t y;
+        int mo, d, h = 0, mi = 0, sec = 0, ms = 0;
+        if (!tools_take_num(&p, 4, 6, &y) || *p++ != '-')
+            return false;
+        int64_t f;
+        if (!tools_take_num(&p, 1, 2, &f) || (mo = (int)f) < 1 || mo > 12 || *p++ != '-' ||
+            !tools_take_num(&p, 1, 2, &f) || (d = (int)f) < 1 || d > tools_days_in_month(y, mo))
+            return false;
         if (*p == ' ' || *p == 'T') {
-            int m2 = 0;
-            if (sscanf(p + 1, "%d:%d:%d%n", &h, &mi, &sec, &m2) != 3)
+            p++;
+            if (!tools_take_num(&p, 1, 2, &f) || (h = (int)f) > 23 || *p++ != ':' ||
+                !tools_take_num(&p, 1, 2, &f) || (mi = (int)f) > 59 || *p++ != ':' ||
+                !tools_take_num(&p, 1, 2, &f) || (sec = (int)f) > 59)
                 return false;
-            p += 1 + m2;
             if (*p == '.') {
                 int digits = 0;
                 p++;
@@ -95,14 +130,18 @@ static inline bool parse_time(const char *s, int64_t *out)
         }
         while (isspace((unsigned char)*p))
             p++;
-        if (*p || mo < 1 || mo > 12 || d < 1 || d > 31)
+        if (*p)
             return false;
+        if (*s == '-')
+            y = -y;
+        /* |y| < 10^6 years is about 3.2e16 ms: far inside int64 */
         *out = ((days_from_civil(y, (unsigned)mo, (unsigned)d) * 24 + h) * 60 + mi) * 60000LL + sec * 1000LL + ms;
         return true;
     }
     char *end;
+    errno = 0;
     long long v = strtoll(s, &end, 10);
-    if (end == s)
+    if (end == s || errno == ERANGE) /* strtoll clamps; a clamped time is not the one asked for */
         return false;
     while (isspace((unsigned char)*end))
         end++;
@@ -117,7 +156,7 @@ static inline bool parse_interval(const char *s, int64_t *out)
 {
     char *end;
     double v = strtod(s, &end);
-    if (end == s || v < 0)
+    if (end == s || !(v >= 0))
         return false;
     int64_t mult = 1;
     if (*end == '\0' || strcmp(end, "ms") == 0)
@@ -134,7 +173,11 @@ static inline bool parse_interval(const char *s, int64_t *out)
         mult = 7 * 86400000LL;
     else
         return false;
-    *out = (int64_t)(v * (double)mult);
+    /* NaN, inf and anything past int64 are refused before the cast, which is undefined for them */
+    double x = v * (double)mult;
+    if (!(x < 9223372036854775808.0))
+        return false;
+    *out = (int64_t)x;
     return true;
 }
 

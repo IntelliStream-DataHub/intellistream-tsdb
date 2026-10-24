@@ -105,6 +105,7 @@ test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/t
 	./$(B)/test_twa
 	./$(B)/test_spread
 	B=$(B) tests/test_cli_spread.sh
+	B=$(B) tests/test_cli_input.sh
 	./$(B)/test_limits
 	./$(B)/test_follow
 	./$(B)/test_volumes
@@ -118,7 +119,8 @@ test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/t
 # fake-stack frames (use-after-return detection), in code that did not change.
 # The runtime-dispatched AVX-512 kernels are still tested.
 # UBSan only prints by default and the run still exits 0: halt_on_error makes the first report fail
-# it. `ubsan-check` proves that with a program that overflows on purpose.
+# it. `ubsan-check` proves that with a program that overflows on purpose, then runs the CLI's parsers on
+# out-of-range input with float-cast-overflow added (GCC's `undefined` leaves it out).
 ASAN_FLAGS := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 UBSAN_RUN  := halt_on_error=1:print_stacktrace=1
 asan: ubsan-check
@@ -132,6 +134,8 @@ ubsan-check:
 	@if UBSAN_OPTIONS="$(UBSAN_RUN)" ./$(B)/ubsan_overflow >/dev/null 2>&1; then \
 	    echo "ubsan-check: an undefined behaviour report did not fail the run"; exit 1; fi
 	@echo "ubsan-check: ok"
+	$(CC) $(ASAN_FLAGS) -fsanitize=float-cast-overflow -o $(B)/ubsan_cli_parse tests/ubsan_cli_parse.c
+	UBSAN_OPTIONS="$(UBSAN_RUN)" ./$(B)/ubsan_cli_parse
 
 # ThreadSanitizer, in build-tsan/ (no `make clean`: a normal build in build/
 # stays), the server under test included. -O1 keeps reports readable;
