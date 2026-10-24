@@ -99,6 +99,7 @@ static const struct {
     [TSDB_OP_LAST_STATS] = {"last_stats"},
     [TSDB_OP_QUERY_BOUNDS] = {"query_bounds", true},
     [TSDB_OP_QUERY_LTTB] = {"query_lttb", true},
+    [TSDB_OP_QUERY_TWA] = {"query_twa", true},
 };
 
 static bool is_query_op(unsigned o) { return o < NOPS && ops[o].query; }
