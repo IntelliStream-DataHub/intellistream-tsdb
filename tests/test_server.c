@@ -228,6 +228,25 @@ static void test_close(tsdbc *c)
 }
 
 /* Regressions in request and reply framing. */
+/* HELLO answers the version both sides speak: an older client (whose tests compare it with
+ * its own constant) hears its own version, a newer one the server's. */
+static void test_hello(void)
+{
+    int fd = raw_connect();
+    const uint32_t asks[] = {4, 5, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION + 7, 0};
+    const uint32_t want[] = {4, 5, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION};
+    for (uint32_t i = 0; i < 6; i++) {
+        raw_send(fd, 70 + i, TSDB_OP_HELLO, i < 5 ? &asks[i] : NULL, i < 5 ? 4 : 0); /* the last: no version */
+        uint32_t rid, v = 0;
+        uint8_t rest[16];
+        size_t nrest = 0;
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 70 + i && nrest == 4);
+        memcpy(&v, rest, 4);
+        CHECK(v == (i < 5 ? want[i] : TSDB_PROTOCOL_VERSION));
+    }
+    close(fd);
+}
+
 static void test_framing(void)
 {
     int rfd = raw_connect();
@@ -811,6 +830,10 @@ static void test_twa(tsdbc *c)
     /* [t0, t0 + 4000): 10 -> 20, then 30 -> 40 cut at t0 + 4000 */
     CHECK(n == 3 && b[0].covered_ms == 2000 && fabs(b[0].area - (15000 + (60 + 10.0 / 7) / 2 * 1000)) < 1e-6 &&
           b[1].covered_ms == 4000);
+    free(b);
+    /* the staleness limit reaches the server: the 7 s from t0 + 3000 to t0 + 10000 no longer count */
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 0, &(tsdb_twa_opts){.max_gap_ms = 5000}, &b, &n));
+    CHECK(n == 1 && b[0].covered_ms == 2000 && b[0].count == 4 && b[0].area == 30000);
     free(b);
     tsdb_twa_opts stale = {.max_gap_ms = 5000, .order = TSDB_DESC, .limit = 1};
     OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 1000, &stale, &b, &n));
@@ -1431,6 +1454,7 @@ int main(int argc, char **argv)
 
     test_close(c);
     test_framing();
+    test_hello();
     test_types(c);
     test_nan(c);
     test_lttb_remote(c);

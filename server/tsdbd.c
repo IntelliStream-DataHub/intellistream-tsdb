@@ -477,7 +477,8 @@ static int handle_twa(conn *c, uint32_t id, const uint8_t *p, size_t len)
     memcpy(&lim, p + 32, 8);
     memcpy(&interval, p + 40, 8);
     memcpy(&count, p + 48, 4);
-    tsdb_twa_opts o = {(tsdb_twa_method)p[20], gap, p[21] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
+    tsdb_twa_opts o = {.method = (tsdb_twa_method)p[20], .max_gap_ms = gap, .order = p[21] ? TSDB_DESC : TSDB_ASC,
+                       .limit = (size_t)lim};
     uint8_t unit = p[22];
     tsdb_twa_bucket *b = NULL;
     size_t nb = 0;
@@ -509,7 +510,14 @@ static void handle(req *r)
     int rc = 0;
     switch (r->op) {
     case TSDB_OP_HELLO: {
-        uint32_t v = TSDB_PROTOCOL_VERSION;
+        /* the version both sides speak: a client never sends what it does not know, so an older one hears
+         * its own version back, as it did from the server it was written against */
+        uint32_t v = TSDB_PROTOCOL_VERSION, theirs;
+        if (len >= 4) {
+            memcpy(&theirs, p, 4);
+            if (theirs && theirs < v)
+                v = theirs;
+        }
         reply(c, r->id, 0, &v, 4, NULL, 0, NULL, 0);
         return;
     }

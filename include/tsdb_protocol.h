@@ -16,6 +16,8 @@
  * Requests and their successful responses:
  *
  *   HELLO       u32 version                    -> u32 version
+ *               the lower of the client's and the server's (since version 6;
+ *               before, the server's): the version both speak
  *   SERIES      u8 create, u16 len, name [, u16 plen, path]  -> u32 id
  *               (path: the volume to create the series in; see tsdb_series_at)
  *   SERIES_NAME u32 id                         -> u16 len, name
