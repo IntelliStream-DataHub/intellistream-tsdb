@@ -113,6 +113,9 @@ static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
 static int restarts;
 static char markpath[PATH_MAX]; /* eio: crashfs writes the path of the file it failed here */
 static int failstops, eio_problems;
+static int lives_faulty, lives_clean, lives_died_starting; /* servers started under the nemesis, by kind */
+static int death_problems;       /* power: a server that ended any way but a power loss (exit 99) or our kill */
+static bool server_faulty;       /* the current server runs under the shim (set under server_lock or at start) */
 static int fport;                   /* the follower, where tsdbd put it; 0 = none */
 static atomic_int follower_pid;
 static char flogpath[PATH_MAX];     /* its stderr */
@@ -146,6 +149,8 @@ static void server_gone(void)
     atomic_store(&port, 0);
 }
 static const char *tsdbd_path(void) { return getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd"; }
+
+static void note_death(int st, bool we_killed, pid_t pid);
 
 static void start_server(bool faulty)
 {
@@ -183,17 +188,25 @@ static void start_server(bool faulty)
             _exit(127);
         }
         atomic_store(&server_pid, pid);
+        server_faulty = attempt == 0 && faulty && crashfs;
+        if (faulty && crashfs && !server_faulty)
+            lives_clean++;
         if (getenv("JEPSEN_VERBOSE"))
             fprintf(stderr, "jepsen: started %d (%s)\n", (int)pid, attempt == 0 && faulty ? "faulty" : "clean");
         int p = th_await(pf, pid, 30000);
         unlink(pf);
         if (p > 0) {
             atomic_store(&port, p);
+            if (server_faulty)
+                lives_faulty++;
             return;
         }
         if (p == TH_EXITED) {
             server_gone();
             if (faulty && crashfs && attempt == 0) { /* crashed while starting (power loss at open): a clean one */
+                lives_died_starting++;
+                if (!strcmp(nemesis, "power"))
+                    note_death(th_status, false, pid);
                 if (getenv("JEPSEN_VERBOSE"))
                     fprintf(stderr, "jepsen: %d died while starting\n", (int)pid);
                 continue;
@@ -353,7 +366,7 @@ static tsdbc *connect_retry(void)
             return c;
         if (atomic_load(&stop))
             return NULL;
-        usleep(10000);
+        usleep(2000); /* a server that crashes a few ms after it listens leaves little time to be found */
     }
 }
 
@@ -439,13 +452,44 @@ static void *client(void *arg)
 
 /* ------------------------------------------------------------- nemesis */
 
+/* Sleeps `us`; with a fault-injecting server (power) it ends early once the server has crashed by itself, which
+ * the shim does a few ms after the listener is up (the fault is due after a fixed count of file operations).
+ * Sleeping through it left the server dead for most of the run and the clients idle. The process is not reaped
+ * here (WNOWAIT): the nemesis below does that. */
+static void nap(useconds_t us, bool watch)
+{
+    for (useconds_t t = 0; t < us && !atomic_load(&stop); t += 5000) {
+        pid_t pid = atomic_load(&server_pid);
+        siginfo_t si;
+        si.si_pid = 0;
+        if (watch && pid > 0 && waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == pid)
+            return;
+        usleep(5000);
+    }
+}
+
+/* How a power-nemesis server may end: crashfs's power loss is _exit(99); a plain kill of ours (an idle server);
+ * SIGUSR2 on a server without the shim (the clean one after a failed start, which has no handler). Anything
+ * else, a SIGSEGV or abort() in the server above all, is a crash bug that the restarts would otherwise hide. */
+static void note_death(int st, bool we_killed, pid_t pid)
+{
+    bool ok = (WIFEXITED(st) && WEXITSTATUS(st) == 99 && server_faulty) ||
+              (we_killed && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL) ||
+              (WIFSIGNALED(st) && WTERMSIG(st) == SIGUSR2 && !server_faulty);
+    if (ok)
+        return;
+    death_problems++;
+    fprintf(stderr, "  the %s server (pid %d) ended with status %#x, not a power loss (exit 99) or our kill\n",
+            server_faulty ? "faulty" : "clean", (int)pid, st);
+}
+
 static void *nemesis_thread(void *arg)
 {
     (void)arg;
     uint64_t r = mix(seed + 77);
     while (!atomic_load(&stop)) {
         r = mix(r);
-        usleep(150000 + (useconds_t)(r % 600000));
+        nap(150000 + (useconds_t)(r % 600000), !strcmp(nemesis, "power") && crashfs);
         if (atomic_load(&stop))
             break;
         pthread_mutex_lock(&server_lock);
@@ -456,6 +500,7 @@ static void *nemesis_thread(void *arg)
         } else if (!strcmp(nemesis, "power")) {
             pid_t pid = atomic_load(&server_pid);
             int st;
+            bool killed = false;
             if (waitpid(pid, &st, WNOHANG) != pid) { /* not crashed on its own yet: pull the plug */
                 signal_pid(pid, SIGUSR2);
                 for (int i = 0; i < 100 && waitpid(pid, &st, WNOHANG) != pid; i++)
@@ -463,8 +508,10 @@ static void *nemesis_thread(void *arg)
                 if (signal_pid(pid, 0) == 0) { /* idle, no file operation to crash in: plain kill */
                     signal_pid(pid, SIGKILL);
                     waitpid(pid, &st, 0);
+                    killed = true;
                 }
             }
+            note_death(st, killed, pid);
             server_gone();
             start_server(true);
             restarts++;
@@ -953,12 +1000,25 @@ int main(int argc, char **argv)
         rok += reads[i].st == ST_OK;
     printf("jepsen %s: %.0f s, %d clients, %d restarts; writes %u ok / %u indeterminate / %u failed, reads %u ok\n",
            nemesis, seconds, nclients, restarts, ok, info, fail, rok);
+    if (crashfs)
+        printf("servers under the shim: %d faulty, %d clean (fallback after a failed start), %d died while starting\n",
+               lives_faulty, lives_clean, lives_died_starting);
     if (memcmp(final, again, sizeof final) != 0)
         VIOLATION("the state changed across a clean restart\n");
     int v = check(final); /* counts the follower's violations too */
     if (!strcmp(nemesis, "eio")) {
         printf("eio: %d fail-stops\n", failstops);
         v += eio_problems;
+    }
+    if (!strcmp(nemesis, "power")) {
+        v += death_problems;
+        /* the nemesis must keep killing: a server left dead until the next tick (the clients idle, 40 restarts in
+         * 20 s instead of 300) tests far less, and passes every check above */
+        if (crashfs && seconds >= 10 && restarts < (int)(seconds * 4)) {
+            fprintf(stderr, "  only %d restarts in %.0f s (at least %d expected): the nemesis was idle\n", restarts,
+                    seconds, (int)(seconds * 4));
+            v++;
+        }
     }
     unlink(markpath);
     if (fport && !fv)
