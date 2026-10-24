@@ -413,6 +413,19 @@ otherwise report "-" (not supported), and footnote which route each took:
 LTTB answers must be the same points (first maximum wins on ties); time-weighted averages within a stated
 tolerance. The twa track's REPORT.md has the ClickHouse query.
 
+## To add at the release run: embedded ClickHouse (chDB)
+
+DuckDB runs in-process (embq.c), so its whole-range bucket query avoids the network and the serialisation of
+1.67 M result rows that the ClickHouse server pays, and ClickHouse's size-optimised codecs (DoubleDelta,
+Gorilla, ZSTD) decode one value at a time while DuckDB's lightweight encodings do not. To separate the two:
+add chDB (ClickHouse's engine as an in-process library, C API libchdb; pin a release at least two weeks old) to
+embq.c next to DuckDB and tsdb, with the same data, queries and answer checks, and the table created twice:
+with the server run's codecs and with ClickHouse's default (LZ4). chDB against the ClickHouse server then shows
+the cost of the network, Gorilla/DoubleDelta+ZSTD against LZ4 the cost of the codecs. Note how chDB hands back
+results through its C API (it may serialise to Arrow or another format in memory; DuckDB returns native
+vectors). `clickhouse local` is the other serverless form, but it is a separate process writing its output, so
+chDB is the fair embedded counterpart.
+
 ## Fairness notes
 
 - **Durability at acknowledgement differs.** tsdb, PostgreSQL and both InfluxDBs flush to disk before
