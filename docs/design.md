@@ -374,7 +374,13 @@ or after the range is the nearest live reading, because tombstoned granules
 are mem runs holding only their live rows. TWA's fast path therefore applies
 unchanged to the untouched granules; a TWA query without a staleness limit
 takes a snapshot of the whole history and so decodes every tombstoned granule
-of the series until merges remove the deleted rows.
+of the series until merges remove the deleted rows. Measured (30 days of one
+float64 reading a second, optimized, then one one-row delete a day, merges
+off; a one-hour TWA on day 29): without a staleness limit 245760 rows decoded
+and about 1 ms, against 8192 rows and 0.11 ms with a 60 s limit or without the
+deletes (rows exact, times on a loaded machine). A query that searched outward
+from its range for the nearest live reading would decode only the nearest dirty
+run on each side; it is not done, since merges bound the cost.
 
 **Merges** drop the rows of each source hidden by the tombstones of a newer
 source, and never copy a granule that intersects them. The output keeps the
