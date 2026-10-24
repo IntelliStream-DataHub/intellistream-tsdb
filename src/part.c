@@ -440,9 +440,21 @@ int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, ui
  * One insert can make several parts (one per partition). They are written
  * and fsync'd under tmp names; then an intent file listing the renames is
  * made durable, which is the commit point; then the renames happen and the
- * intent is removed. After a crash, an intent that is complete (it ends with
- * "end") is rolled forward; tmp files without one are deleted at open. So an
+ * intent is removed. tmp files without an intent are deleted at open. So an
  * insert is all or nothing.
+ *
+ * An intent reads "tsdb-intent 3 <n>", n lines "<tmp> <final>", and
+ * "end <xxh64 of everything before it>". At open, one whose count or
+ * checksum does not match was torn while it was written: no rename can have
+ * followed it (renames start only after the intent and the directory are
+ * synced), so the insert is rolled back whole. A complete intent is rolled
+ * forward only when every one of its parts is still there, under its tmp or
+ * its final name: after a failed directory fsync the intent's name can be
+ * durable while some tmp names are not, and renaming the ones that survived
+ * would publish part of the insert. If a part is missing and none was
+ * renamed yet, the insert is rolled back; if some were renamed, the insert
+ * was published and the missing ones have since been merged or dropped.
+ * Failing I/O (reading the intent, a rename) fails the open.
  */
 
 #define INTENT_PREFIX "txn_"
@@ -482,10 +494,10 @@ int parts_commit(eng *db, part **ps, size_t n)
         char *buf = malloc(cap);
         if (!buf)
             return TSDB_ERR_NOMEM;
-        len += (size_t)snprintf(buf + len, cap - len, "tsdb-intent 1\n");
+        len += (size_t)snprintf(buf + len, cap - len, "tsdb-intent 3 %zu\n", n);
         for (size_t i = 0; i < n; i++)
             len += (size_t)snprintf(buf + len, cap - len, "%s %s\n", ps[i]->pending, ps[i]->name);
-        len += (size_t)snprintf(buf + len, cap - len, "end\n");
+        len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
         snprintf(intent, sizeof intent, INTENT_PREFIX "%d_%u.intent", (int)getpid(),
                  atomic_fetch_add(&db->tmp_counter, 1));
         int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -514,7 +526,48 @@ int parts_commit(eng *db, part **ps, size_t n)
     return 0;
 }
 
-/* At open: finish committed inserts that a crash interrupted. */
+/* Parses an intent into its n renames; false when it is torn or damaged. */
+static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[128], size_t *n)
+{
+    *tmp = NULL;
+    *fin = NULL;
+    *n = 0;
+    if (len < 4 || buf[len - 1] != '\n' || memchr(buf, '\0', len))
+        return false;
+    buf[len - 1] = '\0';
+    char *end = strrchr(buf, '\n'); /* the line before "end <hash>" */
+    uint64_t want;
+    char extra;
+    if (!end || sscanf(end + 1, "end %16" SCNx64 "%c", &want, &extra) != 1 || strlen(end + 1) != 20 ||
+        xxh64(buf, (size_t)(end + 1 - buf), 0) != want)
+        return false;
+    *end = '\0';
+    char *line = buf, *next = strchr(line, '\n');
+    size_t count;
+    if (!next)
+        return false;
+    *next = '\0';
+    if (sscanf(line, "tsdb-intent 3 %zu%c", &count, &extra) != 1 || count < 2 || count > 1u << 20)
+        return false;
+    *tmp = malloc(count * sizeof **tmp);
+    *fin = malloc(count * sizeof **fin);
+    if (!*tmp || !*fin)
+        return false;
+    for (line = next + 1; *n < count; line = next + 1) {
+        next = strchr(line, '\n');
+        if (next)
+            *next = '\0';
+        if (sscanf(line, "%95s %127s%c", (*tmp)[*n], (*fin)[*n], &extra) != 2 ||
+            strncmp((*tmp)[*n], "tmp_", 4) != 0 || strchr((*fin)[*n], '/'))
+            return false;
+        ++*n;
+        if (!next)
+            break;
+    }
+    return *n == count && !next;
+}
+
+/* At open: finish committed inserts that a crash interrupted, roll back the others. */
 int intents_recover(eng *db)
 {
     DIR *d = fdopendir(dup(db->dirfd));
@@ -523,35 +576,62 @@ int intents_recover(eng *db)
     rewinddir(d);
     struct dirent *e;
     bool any = false;
-    while ((e = readdir(d))) {
+    int rc = 0;
+    while (rc == 0 && (e = readdir(d))) {
         if (strncmp(e->d_name, INTENT_PREFIX, strlen(INTENT_PREFIX)) != 0)
             continue;
         int fd = openat(db->dirfd, e->d_name, O_RDONLY | O_CLOEXEC);
         struct stat st;
         char *buf = NULL;
-        if (fd >= 0 && fstat(fd, &st) == 0 && (buf = malloc((size_t)st.st_size + 1)) &&
-            pread(fd, buf, (size_t)st.st_size, 0) == st.st_size) {
-            buf[st.st_size] = '\0';
-            size_t len = (size_t)st.st_size;
-            bool complete = len >= 4 && strcmp(buf + len - 4, "end\n") == 0 && strncmp(buf, "tsdb-intent 1\n", 14) == 0;
-            for (char *line = buf + 14, *next; complete && *line; line = next) {
-                next = strchr(line, '\n');
-                if (!next)
-                    break;
-                *next++ = '\0';
-                char tmp[96], fin[128];
-                if (sscanf(line, "%95s %127s", tmp, fin) == 2 && faccessat(db->dirfd, tmp, F_OK, 0) == 0)
-                    renameat(db->dirfd, tmp, db->dirfd, fin); /* roll forward */
+        if (fd < 0 || fstat(fd, &st) != 0 || !(buf = malloc((size_t)st.st_size + 1)) ||
+            pread(fd, buf, (size_t)st.st_size, 0) != st.st_size) {
+            fprintf(stderr, "tsdb: cannot read the insert intent %s: %s\n", e->d_name,
+                    buf || fd < 0 ? strerror(errno ? errno : EIO) : "out of memory");
+            rc = buf || fd < 0 ? TSDB_ERR_IO : TSDB_ERR_NOMEM;
+            free(buf);
+            if (fd >= 0)
+                close(fd);
+            break;
+        }
+        close(fd);
+        char (*tmp)[96], (*fin)[128];
+        size_t n;
+        if (!intent_parse(buf, (size_t)st.st_size, &tmp, &fin, &n)) {
+            fprintf(stderr, "tsdb: insert intent %s is torn: the insert is rolled back\n", e->d_name);
+        } else {
+            size_t missing = 0, renamed = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (faccessat(db->dirfd, tmp[i], F_OK, 0) == 0)
+                    continue;
+                if (faccessat(db->dirfd, fin[i], F_OK, 0) == 0)
+                    renamed++;
+                else
+                    missing++;
+            }
+            if (missing && !renamed) {
+                fprintf(stderr, "tsdb: %zu of the %zu parts of insert intent %s are gone: the insert is rolled back\n",
+                        missing, n, e->d_name);
+            } else {
+                for (size_t i = 0; i < n && rc == 0; i++)
+                    if (faccessat(db->dirfd, tmp[i], F_OK, 0) == 0 && renameat(db->dirfd, tmp[i], db->dirfd, fin[i]) != 0) {
+                        fprintf(stderr, "tsdb: rolling insert intent %s forward: rename of %s: %s\n", e->d_name,
+                                tmp[i], strerror(errno));
+                        rc = TSDB_ERR_IO;
+                    }
             }
         }
+        free(tmp);
+        free(fin);
         free(buf);
-        if (fd >= 0)
-            close(fd);
-        unlinkat(db->dirfd, e->d_name, 0);
-        any = true;
+        if (rc == 0) {
+            /* the tmp files of a rolled-back insert go with the other tmp files, after this */
+            if (unlinkat(db->dirfd, e->d_name, 0) != 0 && errno != ENOENT)
+                rc = TSDB_ERR_IO;
+            any = true;
+        }
     }
     closedir(d);
-    if (any && db->opt.fsync && fsync(db->dirfd) != 0)
+    if (rc == 0 && any && db->opt.fsync && fsync(db->dirfd) != 0)
         return TSDB_ERR_IO; /* at open: the open fails */
-    return 0;
+    return rc;
 }

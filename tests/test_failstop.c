@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include "tsdb.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
@@ -775,6 +776,50 @@ static void test_state_race(const char *base)
     printf("  failed state dictionary append with a second creator waiting\n");
 }
 
+/* The name of the first file in dir that starts with prefix and ends with suffix; false if none. */
+static bool find_file(const char *prefix, const char *suffix, char *out, size_t cap)
+{
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    bool found = false;
+    while (d && !found && (e = readdir(d))) {
+        size_t l = strlen(e->d_name), sl = strlen(suffix);
+        if (strncmp(e->d_name, prefix, strlen(prefix)) == 0 && l >= sl && strcmp(e->d_name + l - sl, suffix) == 0) {
+            snprintf(out, cap, "%s/%s", dir, e->d_name);
+            found = true;
+        }
+    }
+    if (d)
+        closedir(d);
+    return found;
+}
+
+/* A failed insert over two partitions whose intent is left on disk, the database closed. */
+static void intent_left(const char *name)
+{
+    tsdb *db = open_fresh(name, opts());
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    arm(F_FSYNC, "/", false, false);
+    CHECK(insert_n(db, id, 0, 100, true) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    tsdb_close(db);
+    char path[PATH_MAX];
+    CHECK(find_file("txn_", ".intent", path, sizeof path));
+}
+
+static int64_t rows_after_open(void)
+{
+    tsdb_options o = opts();
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    if (!db)
+        return -1;
+    int64_t n = count_rows(db, "s");
+    tsdb_close(db);
+    return n;
+}
+
 /* One insert over two partitions commits through an intent: all or nothing. */
 static void test_intent(const char *base)
 {
@@ -806,7 +851,38 @@ static void test_intent(const char *base)
     db = reopen(db);
     CHECK(count_rows(db, "s") == 100);
     tsdb_close(db);
+
+    /* after the failed directory fsync the intent's name survived a power loss, one tmp name did not: rolling
+     * the other one forward would publish half the insert */
+    char path[PATH_MAX];
+    intent_left(name);
+    CHECK(find_file("tmp_", ".part", path, sizeof path) && unlink(path) == 0);
+    CHECK(rows_after_open() == 0);
+    CHECK(!find_file("txn_", ".intent", path, sizeof path) && !find_file("tmp_", "", path, sizeof path));
+
+    /* an intent damaged in the middle (torn: its sectors not all written) rolls the insert back whole */
+    intent_left(name);
+    CHECK(find_file("txn_", ".intent", path, sizeof path));
+    int fd = open(path, O_RDWR);
+    CHECK(fd >= 0 && pwrite(fd, "X", 1, 20) == 1);
+    close(fd);
+    CHECK(rows_after_open() == 0);
+    CHECK(!find_file("txn_", ".intent", path, sizeof path) && !find_file("tmp_", "", path, sizeof path));
+
+    /* cut short (the end line lost) or empty: rolled back whole as well */
+    for (int cut = 0; cut < 2; cut++) {
+        intent_left(name);
+        CHECK(find_file("txn_", ".intent", path, sizeof path));
+        struct stat st;
+        CHECK(stat(path, &st) == 0 && truncate(path, cut ? st.st_size - 10 : 0) == 0);
+        CHECK(rows_after_open() == 0);
+    }
+
+    /* an intent that is whole is rolled forward */
+    intent_left(name);
+    CHECK(rows_after_open() == 100);
     printf("  failed commit of an insert over two partitions: all or nothing\n");
+    printf("  a torn intent, or one whose parts are not all there, rolls the insert back\n");
 }
 
 static int64_t stat_parts(tsdb *db)
