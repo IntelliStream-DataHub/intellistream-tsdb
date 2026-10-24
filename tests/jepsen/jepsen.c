@@ -157,13 +157,17 @@ static void start_server(bool faulty)
     exit(2);
 }
 
+/* kill() with pid 0 or -1 signals the process group, or every process of the
+ * user: with no server running, a nemesis must do nothing. */
+static int signal_pid(pid_t pid, int sig) { return pid > 0 ? kill(pid, sig) : -1; }
+
 static void stop_server(int sig)
 {
     pid_t pid = atomic_load(&server_pid);
     if (getenv("JEPSEN_VERBOSE"))
         fprintf(stderr, "jepsen: stopping %d with signal %d\n", (int)pid, sig);
     if (pid > 0) {
-        kill(pid, sig);
+        signal_pid(pid, sig);
         int st;
         waitpid(pid, &st, 0);
         atomic_store(&server_pid, 0);
@@ -284,11 +288,11 @@ static void *nemesis_thread(void *arg)
             pid_t pid = atomic_load(&server_pid);
             int st;
             if (waitpid(pid, &st, WNOHANG) != pid) { /* not crashed on its own yet: pull the plug */
-                kill(pid, SIGUSR2);
+                signal_pid(pid, SIGUSR2);
                 for (int i = 0; i < 100 && waitpid(pid, &st, WNOHANG) != pid; i++)
                     usleep(10000);
-                if (kill(pid, 0) == 0) { /* idle, no file operation to crash in: plain kill */
-                    kill(pid, SIGKILL);
+                if (signal_pid(pid, 0) == 0) { /* idle, no file operation to crash in: plain kill */
+                    signal_pid(pid, SIGKILL);
                     waitpid(pid, &st, 0);
                 }
             }
@@ -297,9 +301,9 @@ static void *nemesis_thread(void *arg)
             restarts++;
         } else if (!strcmp(nemesis, "pause")) {
             pid_t pid = atomic_load(&server_pid);
-            kill(pid, SIGSTOP);
+            signal_pid(pid, SIGSTOP);
             usleep(100000 + (useconds_t)(r % 300000));
-            kill(pid, SIGCONT);
+            signal_pid(pid, SIGCONT);
         }
         pthread_mutex_unlock(&server_lock);
     }
@@ -559,7 +563,7 @@ int main(int argc, char **argv)
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
-    port = 30000 + (int)(getpid() % 20000);
+    port = 10000 + (int)(getpid() % 20000); /* below the ephemeral range, where client sockets take ports */
     char cmd[1200];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0)

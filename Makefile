@@ -32,13 +32,14 @@ build/tsdb-bench: tools/tsdb-bench.c tools/common.h tools/datasets.h $(LIB)
 build/test_tsdb: tests/test_tsdb.c $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
-test: build/test_tsdb build/test_types build/test_server build/test_follow build/test_volumes build/test_group build/tsdbd
+test: build/test_tsdb build/test_types build/test_server build/test_stability build/test_follow build/test_volumes build/test_group build/tsdbd
 	./build/test_tsdb
 	./build/test_types
 	./build/test_group
 	./build/test_follow
 	./build/test_volumes
 	./build/test_server
+	./build/test_stability
 
 # Without -march=native: with it, GCC 15.2's AddressSanitizer crashes in memcpy into
 # fake-stack frames (use-after-return detection), in code that did not change.
@@ -91,13 +92,16 @@ $(CLIB): build/tsdb_client.o
 	$(AR) rcs $@ $^
 
 build/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB)
-	$(CC) $(CFLAGS) -o $@ $< $(CLIB) -lpthread -lm
+	$(CC) $(CFLAGS) -o $@ $< $(CLIB) -lzstd -lpthread -lm
 
 build/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 build/scale-bench: tools/scale-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+
+build/test_stability: tests/test_stability.c $(CLIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) -lzstd -lpthread -lm
 
 build/test_server: tests/test_server.c $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
@@ -118,7 +122,7 @@ build/libcrashfs.so: tests/jepsen/crashfs.c | build
 	$(CC) -O2 -g -std=gnu11 -Wall -fPIC -shared -o $@ $< -ldl -lpthread
 
 build/jepsen: tests/jepsen/jepsen.c $(CLIB)
-	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) -lpthread -lm
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) -lzstd -lpthread -lm
 
 # Jepsen-style fault injection: crashes, simulated power loss and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.

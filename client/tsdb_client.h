@@ -34,6 +34,11 @@ int tsdbc_series(tsdbc *c, const char *name, int create, uint32_t *id);
 int tsdbc_series_at(tsdbc *c, const char *name, const char *path, uint32_t *id);
 int tsdbc_series_name(tsdbc *c, uint32_t id, char *buf, size_t len);
 
+/* Bounds every wait for the server (send or receive) to ms milliseconds; 0, the
+ * default, waits forever. A call that times out returns TSDB_ERR_IO and the
+ * connection is of no further use: close it. */
+int tsdbc_set_timeout(tsdbc *c, int ms);
+
 int tsdbc_insert(tsdbc *c, const uint32_t *series, const int64_t *ts, const float *values, size_t n);
 int tsdbc_insert_series(tsdbc *c, uint32_t series, const int64_t *ts, const float *values, size_t n);
 int tsdbc_insert_async(tsdbc *c, const uint32_t *series, const int64_t *ts, const float *values, size_t n);

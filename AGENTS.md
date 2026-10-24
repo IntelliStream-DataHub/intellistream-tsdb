@@ -25,7 +25,10 @@ ThreadSanitizer is not wired into make; build it the way `make asan` does,
 with `-fsanitize=thread`. `make asan` starts with `make clean`: while anything
 else uses `build/` (a running tsdbd, client tests, another agent), run it in a
 copy of the tree instead. Stop only the tsdbd processes you started (by pid),
-never all of them.
+never all of them (and no `pkill -f`: it matches your own shell). In test code,
+signal a process only through a helper that refuses pid 0 and -1: `kill(-1, sig)`
+reaches every process of the user, the terminal included, and a server that
+failed to start is exactly when a test holds such a pid.
 
 Every bug fix comes with a regression test that fails without the fix (check
 by building the old code). Query timings go on a quiet machine: no builds or

@@ -59,9 +59,16 @@ static pid_t start_server(const char *dir)
     exit(1);
 }
 
+/* kill() with pid 0 or -1 signals the process group, or every process of the user. */
+static void signal_pid(pid_t pid, int sig)
+{
+    if (pid > 0)
+        kill(pid, sig);
+}
+
 static void stop_server(pid_t pid)
 {
-    kill(pid, SIGTERM);
+    signal_pid(pid, SIGTERM);
     int status;
     waitpid(pid, &status, 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -424,7 +431,7 @@ int main(int argc, char **argv)
 {
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdbd-test-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
-    port = 20000 + (int)(getpid() % 20000);
+    port = 10000 + (int)(getpid() % 20000); /* below the ephemeral range, where client sockets take ports */
     char cmd[1300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s.volume'", dir, dir);
     if (system(cmd) != 0)
@@ -584,6 +591,7 @@ int main(int argc, char **argv)
         tsdbc_close(c3);
         stop_server(srv);
     }
+
 
     /* everything is on disk */
     tsdb_options o;

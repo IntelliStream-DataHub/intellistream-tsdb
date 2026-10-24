@@ -749,6 +749,17 @@ int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st)
     return 0;
 }
 
+int tsdbc_set_timeout(tsdbc *c, int ms)
+{
+    if (ms < 0)
+        return TSDB_ERR_INVALID;
+    struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
+    if (setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0 ||
+        setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0)
+        return TSDB_ERR_IO;
+    return 0;
+}
+
 int tsdbc_commit(tsdbc *c) { return call(c, TSDB_OP_COMMIT, NULL, 0, NULL, 0, NULL, NULL); }
 int tsdbc_flush(tsdbc *c) { return call(c, TSDB_OP_FLUSH, NULL, 0, NULL, 0, NULL, NULL); }
 int tsdbc_optimize(tsdbc *c) { return call(c, TSDB_OP_OPTIMIZE, NULL, 0, NULL, 0, NULL, NULL); }

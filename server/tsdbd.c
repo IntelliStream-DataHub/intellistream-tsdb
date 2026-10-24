@@ -1,9 +1,13 @@
 /*
  * tsdbd: serves a tsdb directory over TCP (protocol in tsdb_protocol.h).
  *
- * One thread runs an io_uring event loop: multishot accept, one recv and at
- * most one send in flight per connection, and a multishot poll on an eventfd
- * through which workers report. Database calls may block (fsync, decoding),
+ * One thread runs an io_uring event loop: one recv and at most one send in
+ * flight per connection, and a multishot poll on an eventfd through which
+ * workers report. Connections are accepted by a thread of their own with a
+ * plain accept(), not through the ring: a pending io_uring accept keeps the
+ * listening socket alive until the ring is torn down, which for a killed
+ * process happens some time after its death, and meanwhile a restarted server
+ * cannot bind and clients connect to a listener nobody serves. Database calls may block (fsync, decoding),
  * so complete request frames go to a pool of worker threads.
  *
  * A connection's requests run in order, one at a time, which keeps "last
@@ -22,6 +26,10 @@
  * descriptor (the soft limit is raised to the hard one at start) and 16 KB
  * of receive buffer while idle. Requests run on --workers threads; requests
  * beyond that wait in their connection's queue.
+ *
+ * Signals: SIGTERM and SIGINT stop it cleanly (requests in progress finish,
+ * the memtable is flushed, exit status 0); SIGHUP and SIGPIPE are ignored.
+ * After SIGKILL a new server can start on the same port and directory at once.
  *
  * There is no authentication: listen on a trusted interface only.
  */
@@ -86,7 +94,7 @@ static void buf_shrink(buf *b)
     }
 }
 
-typedef enum { EV_ACCEPT, EV_RECV, EV_SEND, EV_WAKE } ev_type;
+typedef enum { EV_RECV, EV_SEND, EV_WAKE } ev_type;
 
 struct conn;
 typedef struct ev {
@@ -130,7 +138,7 @@ static tsdb *db;
 static struct io_uring ring;
 static int wake_fd = -1;
 static volatile sig_atomic_t stopping;
-static ev accept_ev = {EV_ACCEPT, NULL}, wake_ev = {EV_WAKE, NULL};
+static ev wake_ev = {EV_WAKE, NULL};
 static conn *conns;
 static size_t nconns, max_conns = 10000;
 
@@ -140,6 +148,36 @@ static pthread_cond_t work_cv = PTHREAD_COND_INITIALIZER;
 static req *work_head, *work_tail;
 static bool work_stop;
 
+/* A worker streaming to a client that does not read waits for output space.
+ * Enough such clients would hold every worker and stop the server for
+ * everyone else, so a worker about to wait while no other is free starts an
+ * extra one (they leave again when the queue is empty), and a client that
+ * reads nothing for send_timeout_s loses its connection. Under work_lock. */
+#define MAX_EXTRA_WORKERS 256
+static int base_workers, running_workers, waiting_workers;
+static pthread_cond_t workers_gone_cv = PTHREAD_COND_INITIALIZER;
+static int send_timeout_s = 60;
+static void *worker_main(void *arg);
+
+static void worker_waits(int delta)
+{
+    pthread_mutex_lock(&work_lock);
+    waiting_workers += delta;
+    if (delta < 0)
+        pthread_cond_broadcast(&work_cv); /* an idle extra may leave now that this one is free */
+    if (delta > 0 && running_workers == waiting_workers && running_workers < base_workers + MAX_EXTRA_WORKERS &&
+        !work_stop) {
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        pthread_t t;
+        if (pthread_create(&t, &at, worker_main, (void *)1) == 0)
+            running_workers++;
+        pthread_attr_destroy(&at);
+    }
+    pthread_mutex_unlock(&work_lock);
+}
+
 /* events from workers to the main thread */
 typedef struct note {
     conn *c;
@@ -148,6 +186,10 @@ typedef struct note {
 static pthread_mutex_t note_lock = PTHREAD_MUTEX_INITIALIZER;
 static note *notes;
 static size_t nnotes, notes_cap;
+
+/* connections the accept thread took, for the main thread to set up */
+static int *new_fds;
+static size_t nnew, new_cap;
 
 static void notify(conn *c, bool done)
 {
@@ -182,8 +224,19 @@ static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t al
     hdr[8] = TSDB_OP_REPLY;
     memcpy(hdr + 9, &status, 4);
     pthread_mutex_lock(&c->lock);
-    while (c->out.len > OUT_CAP && !atomic_load(&c->closing))
-        pthread_cond_wait(&c->cv, &c->lock);
+    if (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
+        worker_waits(1);
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += send_timeout_s;
+        while (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
+            if (pthread_cond_timedwait(&c->cv, &c->lock, &deadline) == ETIMEDOUT) {
+                atomic_store(&c->closing, true); /* the client reads nothing: give the worker back */
+                shutdown(c->fd, SHUT_RDWR);
+            }
+        }
+        worker_waits(-1);
+    }
     bool ok = !atomic_load(&c->closing);
     if (ok && buf_reserve(&c->out, 13 + alen + blen + dlen) != 0) {
         /* a lost reply would leave the client waiting forever: drop the connection instead */
@@ -701,12 +754,14 @@ static void handle(req *r)
 
 static void *worker_main(void *arg)
 {
-    (void)arg;
+    bool extra = arg != NULL; /* started while every worker waited: leaves when idle and another is free */
     for (;;) {
         pthread_mutex_lock(&work_lock);
-        while (!work_head && !work_stop)
+        while (!work_head && !work_stop && (!extra || running_workers - waiting_workers <= 1))
             pthread_cond_wait(&work_cv, &work_lock);
         if (!work_head) {
+            if (--running_workers == 0)
+                pthread_cond_broadcast(&workers_gone_cv);
             pthread_mutex_unlock(&work_lock);
             return NULL;
         }
@@ -929,7 +984,14 @@ static void on_wake(void)
     size_t n = nnotes;
     notes = NULL;
     nnotes = notes_cap = 0;
+    int *fds = new_fds;
+    size_t nfds = nnew;
+    new_fds = NULL;
+    nnew = new_cap = 0;
     pthread_mutex_unlock(&note_lock);
+    for (size_t i = 0; i < nfds; i++)
+        on_accept(fds[i]);
+    free(fds);
     for (size_t i = 0; i < n; i++) {
         conn *c = batch[i].c;
         if (batch[i].done)
@@ -944,6 +1006,37 @@ static void on_wake(void)
         finish_if_drained(c);
     }
     free(batch);
+}
+
+/* Accepts connections until the listening socket is shut down. */
+static void *accept_main(void *arg)
+{
+    int lfd = *(int *)arg;
+    for (;;) {
+        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED)
+                continue;
+            if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                struct timespec d = {0, 10000000}; /* out of descriptors: let some close */
+                nanosleep(&d, NULL);
+                continue;
+            }
+            return NULL; /* EINVAL: shut down */
+        }
+        pthread_mutex_lock(&note_lock);
+        if (nnew == new_cap) {
+            new_cap = new_cap ? new_cap * 2 : 64;
+            new_fds = realloc(new_fds, new_cap * sizeof *new_fds);
+            if (!new_fds)
+                abort();
+        }
+        new_fds[nnew++] = fd;
+        pthread_mutex_unlock(&note_lock);
+        uint64_t one = 1;
+        if (write(wake_fd, &one, 8) != 8) {
+        }
+    }
 }
 
 static void on_signal(int sig)
@@ -997,6 +1090,7 @@ int main(int argc, char **argv)
                                    {"refresh-ms", required_argument, 0, 'R'}, {"max-connections", required_argument, 0, 'm'},
                                    {"wal-max-batch-rows", required_argument, 0, 'B'},
                                    {"partition-ms", required_argument, 0, 'P'},
+                                   {"send-timeout", required_argument, 0, 'T'},
                                    {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -1013,13 +1107,15 @@ int main(int argc, char **argv)
         case 'm': max_conns = (size_t)atol(optarg); break;
         case 'B': o.wal_max_batch_rows = (size_t)atol(optarg); break;
         case 'P': o.partition_ms = atoll(optarg); break; /* only when the database is created */
+        case 'T': send_timeout_s = atoi(optarg); break;
         default: goto usage;
         }
     }
-    if (!dir || nworkers < 1) {
+    if (!dir || nworkers < 1 || send_timeout_s < 1) {
     usage:
         fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d] [--workers N] [--wal-sync-ms MS]\n"
-                        "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n",
+                        "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
+                        "             [--send-timeout 60]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
@@ -1052,15 +1148,16 @@ int main(int argc, char **argv)
     }
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    signal(SIGPIPE, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN); /* a client that went away is a send error, not a death */
+    signal(SIGHUP, SIG_IGN);  /* nothing to reload; a closing terminal must not take the server down */
     pthread_t *workers = calloc((size_t)nworkers, sizeof *workers);
+    base_workers = running_workers = nworkers;
     for (int i = 0; i < nworkers; i++)
         pthread_create(&workers[i], NULL, worker_main, NULL);
 
+    pthread_t acceptor;
+    pthread_create(&acceptor, NULL, accept_main, &lfd);
     struct io_uring_sqe *sqe = sqe_get();
-    io_uring_prep_multishot_accept(sqe, lfd, NULL, NULL, SOCK_CLOEXEC);
-    io_uring_sqe_set_data(sqe, &accept_ev);
-    sqe = sqe_get();
     io_uring_prep_poll_multishot(sqe, wake_fd, POLLIN);
     io_uring_sqe_set_data(sqe, &wake_ev);
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s\n", dir,
@@ -1077,15 +1174,6 @@ int main(int argc, char **argv)
             ev *e = io_uring_cqe_get_data(cqe);
             int res = cqe->res;
             switch (e->type) {
-            case EV_ACCEPT:
-                if (res >= 0)
-                    on_accept(res);
-                if (!(cqe->flags & IORING_CQE_F_MORE)) { /* re-arm */
-                    struct io_uring_sqe *s2 = sqe_get();
-                    io_uring_prep_multishot_accept(s2, lfd, NULL, NULL, SOCK_CLOEXEC);
-                    io_uring_sqe_set_data(s2, &accept_ev);
-                }
-                break;
             case EV_WAKE:
                 on_wake();
                 if (!(cqe->flags & IORING_CQE_F_MORE)) {
@@ -1141,11 +1229,8 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "tsdbd: shutting down\n");
-    /* The pending multishot accept holds its own reference to the socket, and the
-     * ring is torn down asynchronously, after the process has exited: close() alone
-     * leaves it listening for a moment, so a restarted server cannot bind and clients
-     * connect to a listener nobody accepts from. shutdown() stops listening now. */
-    shutdown(lfd, SHUT_RDWR);
+    shutdown(lfd, SHUT_RDWR); /* stops listening, and ends the accept thread's accept() */
+    pthread_join(acceptor, NULL);
     close(lfd);
     pthread_mutex_lock(&work_lock);
     work_stop = true;
@@ -1160,12 +1245,19 @@ int main(int argc, char **argv)
     for (int i = 0; i < nworkers; i++)
         pthread_join(workers[i], NULL);
     free(workers);
+    pthread_mutex_lock(&work_lock); /* and the extra ones, which are detached */
+    while (running_workers > 0)
+        pthread_cond_wait(&workers_gone_cv, &work_lock);
+    pthread_mutex_unlock(&work_lock);
     io_uring_queue_exit(&ring);
     while (conns) {
         close(conns->fd);
         conn_free(conns);
     }
     free(notes);
+    for (size_t i = 0; i < nnew; i++)
+        close(new_fds[i]);
+    free(new_fds);
     rc = tsdb_close(db);
     if (rc)
         fprintf(stderr, "tsdbd: close: %s\n", tsdb_strerror(rc));
