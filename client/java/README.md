@@ -74,12 +74,79 @@ public final class Example {
 }
 ```
 
-This is `src/main/java/ai/intellistream/tsdb/example/Example.java`, verbatim; the tests check that the two match
-and run it against a live server. Run it with:
+Series can also hold float64, int64, bool or state values, and any value may be null (protocol version 2):
+
+```java
+package ai.intellistream.tsdb.example;
+
+import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.Column;
+import ai.intellistream.tsdb.TsdbClient;
+import ai.intellistream.tsdb.ValuePoints;
+import ai.intellistream.tsdb.ValueType;
+
+import java.time.Instant;
+import java.util.BitSet;
+import java.util.StringJoiner;
+
+/** Value types and nulls: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.TypedExample}. */
+public final class TypedExample {
+    private TypedExample() {
+    }
+
+    /**
+     * Runs the example.
+     *
+     * @param args the host and port of a running tsdbd; default 127.0.0.1 7070
+     * @throws Exception if the server cannot be reached or a request fails
+     */
+    public static void main(String[] args) throws Exception {
+        String host = args.length > 0 ? args[0] : "127.0.0.1";
+        int port = args.length > 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
+
+        try (TsdbClient client = TsdbClient.connect(host, port)) {
+            long t0 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
+            long[] ts = {t0, t0 + 60_000, t0 + 120_000, t0 + 180_000};
+
+            // An int64 meter reading per minute; the third one is missing (null).
+            int energy = client.seriesCreate("pump7.energy_wh", ValueType.INT64);
+            BitSet missing = new BitSet();
+            missing.set(2);
+            client.insertSeriesValues(energy, ts, Column.ofLongs(1_000, 1_250, 0, 1_900).withNulls(missing));
+
+            ValuePoints points = client.queryValues(energy, Long.MIN_VALUE, Long.MAX_VALUE);
+            long[] wh = points.values().longs();
+            for (int i = 0; i < points.size(); i++) {
+                String value = points.values().isNull(i) ? "null" : Long.toString(wh[i]);
+                System.out.println(Instant.ofEpochMilli(points.timestamps()[i]) + " " + value);
+            }
+
+            // Aggregates skip nulls; integer sums are exact.
+            Bucket all = client.queryAgg(energy, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0);
+            System.out.println("known " + all.count() + ", sum " + all.isum() + ", max " + all.imax());
+
+            // A state series stores each name once, as a code.
+            int mode = client.seriesCreate("pump7.mode", ValueType.STATE);
+            int running = client.state(mode, "running");
+            int stopped = client.state(mode, "stopped");
+            client.insertSeriesValues(mode, ts, Column.ofStates(running, running, stopped, running));
+
+            StringJoiner names = new StringJoiner(" ");
+            for (int code : client.queryValues(mode, Long.MIN_VALUE, Long.MAX_VALUE).values().states())
+                names.add(client.stateName(mode, code));
+            System.out.println(names);
+        }
+    }
+}
+```
+
+These are `Example.java` and `TypedExample.java` in `src/main/java/ai/intellistream/tsdb/example/`, verbatim; the
+tests check that README and sources match, and run both against a live server. Run them with:
 
 ```sh
 mvn -q package -DskipTests
 java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070
+java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar ai.intellistream.tsdb.example.TypedExample 127.0.0.1 7070
 ```
 
 ## Build and test
@@ -121,12 +188,19 @@ properties change where things are:
 | `insertAsync(...)`, `await()`, `pending()` | pipelined inserts: send now, collect acknowledgements later |
 | `queryPoints(series, start, end[, order, limit])` | raw points as `long[]` and `float[]` |
 | `queryRaw(series, start, end[, order, limit], consumer)` | raw points streamed in chunks, for large results |
-| `queryAgg(series, start, end, intervalMs)` | count/sum/min/max per fixed interval, as `Bucket` records |
+| `seriesCreate(name, type[, path])`, `seriesType(id)` | a series of a `ValueType`, and the type of a series |
+| `insertSeriesValues(series, ts, column[, off, len])` | inserts a typed `Column` (with nulls) into one series |
+| `insertValues(int[] series, ts, column[, off, len])` | the same for rows of several series |
+| `insertSeriesValuesAsync(...)`, `insertValuesAsync(...)` | pipelined typed inserts, collected by `await()` |
+| `queryValues(series, start, end[, order, limit])` | typed points: `long[]` timestamps and a `Column` |
+| `queryValues(series, start, end[, order, limit], consumer)` | typed points streamed in chunks |
+| `state(series, name)`, `stateLookup(...)`, `stateName(series, code)` | the state dictionary: names and codes |
+| `queryAgg(series, start, end, intervalMs[, order, limit])` | count/sum/min/max per fixed interval, as `Bucket` records |
 | `queryGroup(series, start, end, group[, order, limit])` | the same per calendar unit, in a time zone |
 | `commit()`, `flush()`, `optimize()`, `stats()` | maintenance and storage statistics |
 | `hello()` | the server's protocol version |
 
-Points are timestamps in milliseconds since the Unix epoch and float32 values. Writing an existing (series,
+Points are timestamps in milliseconds since the Unix epoch and values of the series' type. Writing an existing (series,
 timestamp) replaces its value: the last write wins. Time ranges are half open, `[start, end)`; pass
 `Long.MIN_VALUE` and `Long.MAX_VALUE` for everything.
 
@@ -152,6 +226,16 @@ past that, `insertAsync` reads the oldest acknowledgement before sending.
 `include/tsdb.h` (`Status.message(code)` describes it). An error status from the server leaves the connection
 usable; a connection failure or a malformed reply closes it (`isOpen()` turns false). Arguments the protocol cannot
 carry, such as arrays of different lengths, throw `IllegalArgumentException` without contacting the server.
+
+**Value types and nulls.** A series has one `ValueType`, fixed at creation: `FLOAT32` (what `series(name)`
+creates), `FLOAT64`, `INT64`, `BOOL` or `STATE`. A `Column` holds the values in the primitive array of its type
+(`float[]`, `double[]`, `long[]`, `boolean[]`, `int[]` state codes) and marks nulls in a `BitSet` (set bit: null):
+`Column.ofLongs(values).withNulls(nulls)`. Read it with the accessor of its type (`longs()`, ...) and `isNull(i)`.
+The float32 methods (`insert`, `queryPoints`, `queryRaw`) only work on float32 series; the typed ones work on
+all. The database reserves `Long.MIN_VALUE`, state code 0 and one NaN payload per float type as null: written as
+values, they read back as null. Aggregates skip nulls; `Bucket` has double `min`/`max`, and for int64 and bool
+series exact `isum`/`imin`/`imax` (`isum` saturates). `queryAgg` and `queryGroup` use the version 2
+`QUERY_BUCKETS` operation, so they need a version 2 server.
 
 **Threads.** A `TsdbClient` is one connection and is not thread safe: use one client per thread. The server runs
 the requests of different connections in parallel.

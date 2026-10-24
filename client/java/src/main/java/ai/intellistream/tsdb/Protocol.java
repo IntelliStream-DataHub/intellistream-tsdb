@@ -2,13 +2,16 @@ package ai.intellistream.tsdb;
 
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */
 final class Protocol {
-    static final int VERSION = 1;
+    static final int VERSION = 2;
     static final int DEFAULT_PORT = 7070;
     static final int MAX_FRAME = 256 << 20;
     static final int HEADER = 9;           /* u32 length, u32 id, u8 op */
     static final int REPLY_HEADER = 13;    /* header + i32 status */
     static final int MANY_SERIES = 0xffffffff;
-    static final int AGG_ROW = 32;         /* i64 start, u64 count, f64 sum, f32 min, f32 max */
+    static final int AGG_ROW = 32;         /* version 1: i64 start, u64 count, f64 sum, f32 min, f32 max */
+    static final int BUCKET_ROW = 64;      /* + f64 min, f64 max, i64 isum, i64 imin, i64 imax instead */
+    static final int VALUES_HEADER = 16;   /* INSERT_VALUES: u32 n, u32 series, u8 type, u8 flags, u16 0, u32 0 */
+    static final int VALID = 1;            /* flags: a validity bitmap follows the values */
 
     static final byte OP_REPLY = 0;
     static final byte OP_HELLO = 1;
@@ -22,6 +25,13 @@ final class Protocol {
     static final byte OP_OPTIMIZE = 9;
     static final byte OP_STATS = 10;
     static final byte OP_QUERY_GROUP = 11;
+    static final byte OP_SERIES_CREATE = 12;
+    static final byte OP_SERIES_TYPE = 13;
+    static final byte OP_INSERT_VALUES = 14;
+    static final byte OP_QUERY_VALUES = 15;
+    static final byte OP_STATE = 16;
+    static final byte OP_STATE_NAME = 17;
+    static final byte OP_QUERY_BUCKETS = 18;
 
     private Protocol() {
     }

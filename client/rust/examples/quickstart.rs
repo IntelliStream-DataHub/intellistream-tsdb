@@ -1,4 +1,4 @@
-use tsdb_client::{Client, Group, QueryOpts, Unit};
+use tsdb_client::{Client, Column, Group, QueryOpts, Unit, ValueType};
 
 fn main() -> Result<(), tsdb_client::Error> {
     // Connect to tsdbd (the address is the first argument, if any).
@@ -28,6 +28,22 @@ fn main() -> Result<(), tsdb_client::Error> {
     for b in client.query_group(id, .., Some(&days), QueryOpts::asc())? {
         println!("day  {} count {} sum {}", b.start, b.count, b.sum);
     }
+
+    // Typed series: int64 with a null, aggregated exactly.
+    let starts = client.series_create("pump7.starts", ValueType::Int64, None)?;
+    client.insert_series_values(starts, &ts[..3], &Column::from_options([Some(3i64), None, Some(5)]))?;
+    let rows = client.query_rows(starts, .., QueryOpts::asc())?;
+    println!("rows {:?}", rows.values.to_options::<i64>().unwrap());
+    let total = client.query_agg(starts, .., 0)?[0];
+    println!("int  count {} isum {}", total.count, total.isum);
+
+    // A state series stores codes; the server keeps their names.
+    let mode = client.series_create("pump7.mode", ValueType::State, None)?;
+    let (on, off) = (client.state(mode, "on")?, client.state(mode, "off")?);
+    client.insert_series_values(mode, &ts[..2], &[on, off])?;
+    let latest = client.query_rows(mode, .., QueryOpts::desc().limit(1))?;
+    let code = latest.values.as_slice::<u32>().unwrap()[0];
+    println!("mode {}", client.state_name(mode, code)?);
 
     client.close()
 }

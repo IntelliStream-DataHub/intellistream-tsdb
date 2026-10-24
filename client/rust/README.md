@@ -13,7 +13,7 @@ Start a server (`make` in the repository root, then
 it against a live server.
 
 ```rust
-use tsdb_client::{Client, Group, QueryOpts, Unit};
+use tsdb_client::{Client, Column, Group, QueryOpts, Unit, ValueType};
 
 fn main() -> Result<(), tsdb_client::Error> {
     // Connect to tsdbd (the address is the first argument, if any).
@@ -44,6 +44,22 @@ fn main() -> Result<(), tsdb_client::Error> {
         println!("day  {} count {} sum {}", b.start, b.count, b.sum);
     }
 
+    // Typed series: int64 with a null, aggregated exactly.
+    let starts = client.series_create("pump7.starts", ValueType::Int64, None)?;
+    client.insert_series_values(starts, &ts[..3], &Column::from_options([Some(3i64), None, Some(5)]))?;
+    let rows = client.query_rows(starts, .., QueryOpts::asc())?;
+    println!("rows {:?}", rows.values.to_options::<i64>().unwrap());
+    let total = client.query_agg(starts, .., 0)?[0];
+    println!("int  count {} isum {}", total.count, total.isum);
+
+    // A state series stores codes; the server keeps their names.
+    let mode = client.series_create("pump7.mode", ValueType::State, None)?;
+    let (on, off) = (client.state(mode, "on")?, client.state(mode, "off")?);
+    client.insert_series_values(mode, &ts[..2], &[on, off])?;
+    let latest = client.query_rows(mode, .., QueryOpts::desc().limit(1))?;
+    let code = latest.values.as_slice::<u32>().unwrap()[0];
+    println!("mode {}", client.state_name(mode, code)?);
+
     client.close()
 }
 ```
@@ -51,8 +67,7 @@ fn main() -> Result<(), tsdb_client::Error> {
 ## API
 
 One `Client` is one TCP connection; methods take `&mut self`, so use one
-client per thread. Timestamps are `i64` milliseconds since the epoch, values
-are `Value` (`f32`, defined in `src/value.rs`). Time ranges are any
+client per thread. Timestamps are `i64` milliseconds since the epoch. Time ranges are any
 `RangeBounds<i64>`: `t0..t1` is `[t0, t1)`, `t0..=t1` includes `t1`, `..` is
 everything.
 
@@ -68,13 +83,44 @@ everything.
 | `insert_series_async(..)`, `insert_async(..)`, `wait()`, `pending()` | pipelined inserts |
 | `query_points(id, range, opts)` | raw points as `Points { ts, values }` |
 | `query_raw(id, range, opts, \|ts, values\| ControlFlow)` | raw points streamed in chunks |
+| `series_create(name, ValueType, Option<path>)`, `series_type(id)` | typed series (protocol version 2) |
+| `insert_series_values(id, &ts, column)`, `insert_values(&series, &ts, column)` | typed values with nulls, and wait |
+| `insert_series_values_async(..)`, `insert_values_async(..)` | the same, pipelined |
+| `query_rows(id, range, opts)` | typed rows as `Rows { ts, values: Column }` |
+| `query_values(id, range, opts, \|ts, &Column\| ControlFlow)` | typed rows streamed in chunks |
+| `state(id, name)`, `state_lookup(id, name)`, `state_name(id, code)` | the state dictionary of a series' volume |
 | `query_agg(id, range, interval_ms)` | `Vec<Bucket>` aligned to the epoch; 0 = one bucket |
 | `query_group(id, range, Option<&Group>, opts)` | calendar buckets in a time zone |
 | `commit()`, `flush()`, `optimize()`, `stats()` | maintenance |
 
 `QueryOpts` carries the order and limit (`QueryOpts::desc().limit(5)`);
 `Group::new(Unit::Day).count(1).timezone("Europe/Oslo")` a calendar grouping.
-`Bucket` has `start`, `count`, `sum`, `min`, `max` and `avg()`.
+
+### Value types and nulls
+
+A series has a `ValueType`: `Float32` (what `series()` creates), `Float64`,
+`Int64`, `Bool` or `State`. Each has a Rust type (`f32`, `f64`, `i64`,
+`bool`, and `u32` for state codes; the `Native` trait). A `Column` is typed
+values (`Values`) plus an optional validity `Bitmap` (bit set = known, the wire
+layout, so nulls cost one bit and no conversion). `Column::from_options` and
+`column.to_options::<T>()` / `iter::<T>()` give the `Option<T>` view;
+`as_slice::<T>()` the raw values. Inserts take anything that converts into a
+`ColumnRef`: `&[T]`, `&[T; N]`, `&Vec<T>`, `&Column`, or
+`ColumnRef::from(&values).with_validity(&bitmap)`, so a plain slice is sent
+without building a column. The column's type must be the series' type.
+
+The protocol reserves one value per type for null: `i64::MIN`, state code 0,
+and the NaNs with bits `NULL_F32_BITS` / `NULL_F64_BITS`; written as known
+values they read back as null. Other NaNs are ordinary values.
+
+The version 1 calls (`insert_series`, `query_points`, `query_raw`) remain the
+fast path for float32 series, with plain `f32` slices; `query_points` reads
+nulls as NaN, and the version 1 calls on other types fail with `Status::Invalid`.
+
+`Bucket` has `start`, `count`, `sum`, `min`, `max` (f64) and `avg()`, plus
+`isum`, `imin` and `imax`: exact for int64 and bool series (`isum` saturates).
+Aggregates skip nulls; `count` counts known values. All aggregates use
+QUERY_BUCKETS.
 
 Errors are `tsdb_client::Error`: `Server(Status)` carries the server's
 `TSDB_ERR_*` status, `Io`, `Protocol` and `InvalidArgument` are client-side;

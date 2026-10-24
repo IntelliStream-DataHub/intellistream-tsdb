@@ -11,6 +11,7 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
@@ -43,9 +44,16 @@ import java.util.Objects;
  * Arguments the protocol cannot carry (mismatched array lengths, names over 65535 UTF-8 bytes, negative limits)
  * throw {@link IllegalArgumentException} without contacting the server.
  *
- * <p><b>Types.</b> Series ids are unsigned 32-bit integers carried in an {@code int}. Timestamps are milliseconds
- * since the Unix epoch. Time ranges are half open, {@code [start, end)}; use {@link Long#MIN_VALUE} and
- * {@link Long#MAX_VALUE} for "everything".
+ * <p><b>Value types.</b> A series has one {@link ValueType}, chosen when it is created: float32 (the type of
+ * {@link #series(String)}), float64, int64, bool or state, and any value may be null. The float32 methods
+ * ({@link #insert(int, long[], float[])}, {@link #queryPoints(int, long, long)}, {@link #queryRaw}) take and return
+ * {@code float[]} and work on float32 series only; {@link #insertSeriesValues}, {@link #insertValues} and
+ * {@link #queryValues} carry a {@link Column} of any type with its nulls (protocol version 2).
+ * {@link #queryAgg} and {@link #queryGroup} work on every type and need a version 2 server.
+ *
+ * <p><b>Numbers.</b> Series ids and state codes are unsigned 32-bit integers carried in an {@code int}.
+ * Timestamps are milliseconds since the Unix epoch. Time ranges are half open, {@code [start, end)}; use
+ * {@link Long#MIN_VALUE} and {@link Long#MAX_VALUE} for "everything".
  */
 public final class TsdbClient implements AutoCloseable {
     /** The port {@code tsdbd} listens on by default. */
@@ -54,8 +62,8 @@ public final class TsdbClient implements AutoCloseable {
     /** The most insert frames {@code insertAsync} leaves unacknowledged. */
     public static final int MAX_IN_FLIGHT = 4096;
 
-    private static final int BUF = 1 << 20;               /* send buffer, and the receive buffer between large replies */
-    private static final int INSERT_FRAME_ROWS = 8 << 20; /* at most 128 MiB per frame, as the C client */
+    private static final int BUF = 1 << 20;               /* send buffer; receive buffer between large replies */
+    private static final int INSERT_FRAME_ROWS = 8 << 20; /* as the C client: under 256 MiB for any value type */
     private static final int MAX_STRING = 0xffff;         /* u16 length prefix */
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
@@ -70,6 +78,8 @@ public final class TsdbClient implements AutoCloseable {
     private boolean broken, closed;
     private long[] chunkTs = new long[0];        /* reused for RawConsumer */
     private float[] chunkValues = Values.alloc(0);
+    private Column chunkColumn;                  /* reused for ValuesConsumer */
+    private final BitSet chunkNulls = new BitSet();
 
     private TsdbClient(SocketChannel ch) {
         this.ch = ch;
@@ -157,7 +167,7 @@ public final class TsdbClient implements AutoCloseable {
     /**
      * Exchanges protocol versions with the server.
      *
-     * @return the server's protocol version (1 for this client)
+     * @return the server's protocol version (2 for the server this client is written for)
      * @throws TsdbException on a connection failure
      */
     public int hello() throws TsdbException {
@@ -245,19 +255,7 @@ public final class TsdbClient implements AutoCloseable {
         begin(Protocol.OP_SERIES_NAME, 4);
         out.putInt(id);
         send();
-        int st = frame();
-        String name = null;
-        if (st == 0) {
-            int len = bodyLen >= 2 ? in.getShort() & 0xffff : -1;
-            if (bodyLen != 2 + len)
-                throw lost(Status.ERR_CORRUPT, "SERIES_NAME reply of " + bodyLen + " bytes");
-            byte[] b = new byte[len];
-            in.get(b);
-            name = new String(b, StandardCharsets.UTF_8);
-        }
-        endReply();
-        check(st);
-        return name;
+        return stringReply("SERIES_NAME");
     }
 
     // ----------------------------------------------------------------- inserts
@@ -605,7 +603,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * Aggregates a series over {@code [start, end)} in fixed intervals aligned to the epoch, like ClickHouse's
-     * {@code toStartOfInterval}. Only non-empty buckets are returned, oldest first.
+     * {@code toStartOfInterval}. Only buckets with rows are returned, oldest first.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -616,11 +614,25 @@ public final class TsdbClient implements AutoCloseable {
      *     {@link Status#ERR_TOO_MANY_BUCKETS} if the range holds too many, and so on
      */
     public List<Bucket> queryAgg(int series, long start, long end, long intervalMs) throws TsdbException {
-        request();
-        begin(Protocol.OP_QUERY_AGG, 28);
-        out.putInt(series).putLong(start).putLong(end).putLong(intervalMs);
-        send();
-        return buckets();
+        return buckets(series, start, end, intervalMs, null, Order.ASC, 0);
+    }
+
+    /**
+     * Aggregates a series over {@code [start, end)} in fixed intervals, in the given order, at most {@code limit}
+     * buckets.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param intervalMs the bucket length in ms; 0 for a single bucket starting at {@code start}
+     * @param order oldest or newest bucket first
+     * @param limit the most buckets to return; 0 for all
+     * @return the buckets
+     * @throws TsdbException as {@link #queryAgg(int, long, long, long)}
+     */
+    public List<Bucket> queryAgg(int series, long start, long end, long intervalMs, Order order, long limit)
+            throws TsdbException {
+        return buckets(series, start, end, intervalMs, null, order, limit);
     }
 
     /**
@@ -630,7 +642,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param start the first timestamp included
      * @param end the first timestamp excluded
      * @param group the calendar grouping, or {@code null} for one bucket over the whole range
-     * @return the non-empty buckets
+     * @return the buckets with rows
      * @throws TsdbException with {@link Status#ERR_INVALID} for an unknown time zone, and so on
      */
     public List<Bucket> queryGroup(int series, long start, long end, Group group) throws TsdbException {
@@ -647,39 +659,524 @@ public final class TsdbClient implements AutoCloseable {
      * @param group the calendar grouping, or {@code null} for one bucket over the whole range
      * @param order oldest or newest bucket first
      * @param limit the most buckets to return; 0 for all
-     * @return the non-empty buckets
+     * @return the buckets with rows
      * @throws TsdbException with {@link Status#ERR_INVALID} for an unknown time zone, and so on
      */
     public List<Bucket> queryGroup(int series, long start, long end, Group group, Order order, long limit)
             throws TsdbException {
+        return buckets(series, start, end, 0, group, order, limit);
+    }
+
+    /** QUERY_BUCKETS: fixed intervals (group null) or calendar groups, with f64 min/max and exact integers. */
+    private List<Bucket> buckets(int series, long start, long end, long interval, Group group, Order order,
+                                 long limit) throws TsdbException {
         Objects.requireNonNull(order, "order");
         if (limit < 0)
             throw new IllegalArgumentException("negative limit");
         byte[] zone = group != null && group.timezone() != null ? utf8(group.timezone(), "timezone") : new byte[0];
         request();
-        begin(Protocol.OP_QUERY_GROUP, 36 + zone.length);
-        out.putInt(series).putLong(start).putLong(end);
+        begin(Protocol.OP_QUERY_BUCKETS, 44 + zone.length);
+        out.putInt(series).putLong(start).putLong(end).putLong(interval);
         out.put((byte) (group != null ? group.unit().code : 0)).putInt(group != null ? group.count() : 0);
         out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
         out.putShort((short) zone.length).put(zone);
         send();
-        return buckets();
-    }
-
-    private List<Bucket> buckets() throws TsdbException {
         int st = frame();
         if (st != 0) {
             endReply();
             throw new TsdbException(st);
         }
         int n = bodyLen >= 4 ? in.getInt() : -1;
-        if (n < 0 || bodyLen != 4 + (long) n * Protocol.AGG_ROW)
-            throw lost(Status.ERR_CORRUPT, "aggregate reply of " + bodyLen + " bytes");
+        if (n < 0 || bodyLen != 4 + (long) n * Protocol.BUCKET_ROW)
+            throw lost(Status.ERR_CORRUPT, "QUERY_BUCKETS reply of " + bodyLen + " bytes");
         Bucket[] b = new Bucket[n];
         for (int i = 0; i < n; i++)
-            b[i] = new Bucket(in.getLong(), in.getLong(), in.getDouble(), Values.getOne(in), Values.getOne(in));
+            b[i] = new Bucket(in.getLong(), in.getLong(), in.getDouble(), in.getDouble(), in.getDouble(),
+                    in.getLong(), in.getLong(), in.getLong());
         endReply();
         return Collections.unmodifiableList(Arrays.asList(b));
+    }
+
+    // ------------------------------------------------------------- value types
+
+    /**
+     * Returns the id of a series of {@code type}, creating it in the database directory if it does not exist.
+     *
+     * @param name the series name, 1 to 65535 bytes of UTF-8
+     * @param type the value type
+     * @return the series id
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the series exists with another type
+     */
+    public int seriesCreate(String name, ValueType type) throws TsdbException {
+        return seriesCreate(name, type, null);
+    }
+
+    /**
+     * Returns the id of a series of {@code type}, creating it in the volume {@code path} on the server if it does
+     * not exist. An existing series keeps its type and volume.
+     *
+     * @param name the series name, 1 to 65535 bytes of UTF-8
+     * @param type the value type
+     * @param path a directory on the server, or {@code null} or "" for the database directory
+     * @return the series id
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the series exists with another type
+     */
+    public int seriesCreate(String name, ValueType type, String path) throws TsdbException {
+        byte[] n = utf8(Objects.requireNonNull(name, "name"), "name");
+        if (n.length == 0)
+            throw new IllegalArgumentException("empty series name");
+        Objects.requireNonNull(type, "type");
+        byte[] p = path != null ? utf8(path, "path") : new byte[0];
+        request();
+        begin(Protocol.OP_SERIES_CREATE, 5 + n.length + p.length);
+        out.put((byte) type.code).putShort((short) n.length).put(n).putShort((short) p.length).put(p);
+        send();
+        return u32Reply("SERIES_CREATE");
+    }
+
+    /**
+     * Returns the value type of a series.
+     *
+     * @param id the series id
+     * @return its type
+     * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
+     */
+    public ValueType seriesType(int id) throws TsdbException {
+        request();
+        begin(Protocol.OP_SERIES_TYPE, 4);
+        out.putInt(id);
+        send();
+        int st = frame();
+        ValueType t = null;
+        if (st == 0 && (bodyLen != 1 || (t = ValueType.of(in.get())) == null))
+            throw lost(Status.ERR_CORRUPT, "SERIES_TYPE reply");
+        endReply();
+        check(st);
+        return t;
+    }
+
+    /**
+     * Returns the code of a state name in the dictionary of a state series' volume, adding the name if it is new.
+     * Codes start at 1 and never change.
+     *
+     * <p>The series only selects the volume whose dictionary is used: tsdbd accepts any series of that volume, of
+     * any type.
+     *
+     * @param series a state series
+     * @param name the state name, 1 to 65535 bytes of UTF-8
+     * @return its code
+     * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown series
+     */
+    public int state(int series, String name) throws TsdbException {
+        return stateRequest(series, name, true);
+    }
+
+    /**
+     * Returns the code of an existing state name.
+     *
+     * @param series a state series
+     * @param name the state name
+     * @return its code
+     * @throws TsdbException with {@link Status#ERR_NOTFOUND} if the name has no code
+     */
+    public int stateLookup(int series, String name) throws TsdbException {
+        return stateRequest(series, name, false);
+    }
+
+    /**
+     * Returns the name of a state code.
+     *
+     * @param series a state series
+     * @param code the code
+     * @return its name
+     * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown code
+     */
+    public String stateName(int series, int code) throws TsdbException {
+        request();
+        begin(Protocol.OP_STATE_NAME, 8);
+        out.putInt(series).putInt(code);
+        send();
+        return stringReply("STATE_NAME");
+    }
+
+    private int stateRequest(int series, String name, boolean create) throws TsdbException {
+        byte[] n = utf8(Objects.requireNonNull(name, "name"), "name");
+        if (n.length == 0)
+            throw new IllegalArgumentException("empty state name");
+        request();
+        begin(Protocol.OP_STATE, 7 + n.length);
+        out.putInt(series).put((byte) (create ? 1 : 0)).putShort((short) n.length).put(n);
+        send();
+        return u32Reply("STATE");
+    }
+
+    private int u32Reply(String what) throws TsdbException {
+        int st = frame();
+        if (st == 0 && bodyLen != 4)
+            throw lost(Status.ERR_CORRUPT, what + " reply of " + bodyLen + " bytes");
+        int v = st == 0 ? in.getInt() : 0;
+        endReply();
+        check(st);
+        return v;
+    }
+
+    private String stringReply(String what) throws TsdbException {
+        int st = frame();
+        String s = null;
+        if (st == 0) {
+            int len = bodyLen >= 2 ? in.getShort() & 0xffff : -1;
+            if (bodyLen != 2 + len)
+                throw lost(Status.ERR_CORRUPT, what + " reply of " + bodyLen + " bytes");
+            byte[] b = new byte[len];
+            in.get(b);
+            s = new String(b, StandardCharsets.UTF_8);
+        }
+        endReply();
+        check(st);
+        return s;
+    }
+
+    /**
+     * Inserts values of any type, with nulls, into one series and waits until they are durable and visible. The
+     * column's type must be the series' type.
+     *
+     * @param series the series id
+     * @param timestamps ms since the epoch
+     * @param values the values; as long as {@code timestamps}
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a type mismatch; the first error among this insert
+     *     and earlier pipelined ones
+     * @see #insert(int, long[], float[])
+     */
+    public void insertSeriesValues(int series, long[] timestamps, Column values) throws TsdbException {
+        insertSeriesValues(series, timestamps, values, 0, sameLength(timestamps, values));
+    }
+
+    /**
+     * Inserts {@code length} rows from position {@code offset} into one series, and waits.
+     *
+     * @param series the series id
+     * @param timestamps ms since the epoch
+     * @param values the values
+     * @param offset the first row to send
+     * @param length the number of rows
+     * @throws TsdbException the first error among this insert and earlier pipelined ones
+     */
+    public void insertSeriesValues(int series, long[] timestamps, Column values, int offset, int length)
+            throws TsdbException {
+        insertValuesFrames(series, null, timestamps, values, offset, length);
+        await();
+    }
+
+    /**
+     * Inserts values of several series, one series id per row, and waits. Every series must have the column's
+     * type.
+     *
+     * @param series the series id of each row
+     * @param timestamps ms since the epoch
+     * @param values the values
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a type mismatch; the first error among this insert
+     *     and earlier pipelined ones
+     */
+    public void insertValues(int[] series, long[] timestamps, Column values) throws TsdbException {
+        insertValues(series, timestamps, values, 0, sameLength(series, timestamps, values));
+    }
+
+    /**
+     * Inserts {@code length} rows from position {@code offset}, one series id per row, and waits.
+     *
+     * @param series the series id of each row
+     * @param timestamps ms since the epoch
+     * @param values the values
+     * @param offset the first row to send
+     * @param length the number of rows
+     * @throws TsdbException the first error among this insert and earlier pipelined ones
+     */
+    public void insertValues(int[] series, long[] timestamps, Column values, int offset, int length)
+            throws TsdbException {
+        insertValuesFrames(0, Objects.requireNonNull(series, "series"), timestamps, values, offset, length);
+        await();
+    }
+
+    /**
+     * Sends an insert of typed values into one series without waiting; see
+     * {@link #insertAsync(int, long[], float[])}. The arrays may be reused as soon as this returns.
+     *
+     * @param series the series id
+     * @param timestamps ms since the epoch
+     * @param values the values
+     * @throws TsdbException on a connection failure
+     */
+    public void insertSeriesValuesAsync(int series, long[] timestamps, Column values) throws TsdbException {
+        insertSeriesValuesAsync(series, timestamps, values, 0, sameLength(timestamps, values));
+    }
+
+    /**
+     * Sends {@code length} typed rows from position {@code offset} into one series without waiting.
+     *
+     * @param series the series id
+     * @param timestamps ms since the epoch
+     * @param values the values
+     * @param offset the first row to send
+     * @param length the number of rows
+     * @throws TsdbException on a connection failure
+     */
+    public void insertSeriesValuesAsync(int series, long[] timestamps, Column values, int offset, int length)
+            throws TsdbException {
+        insertValuesFrames(series, null, timestamps, values, offset, length);
+    }
+
+    /**
+     * Sends an insert of typed values of several series, one series id per row, without waiting.
+     *
+     * @param series the series id of each row
+     * @param timestamps ms since the epoch
+     * @param values the values
+     * @throws TsdbException on a connection failure
+     */
+    public void insertValuesAsync(int[] series, long[] timestamps, Column values) throws TsdbException {
+        insertValuesAsync(series, timestamps, values, 0, sameLength(series, timestamps, values));
+    }
+
+    /**
+     * Sends {@code length} typed rows from position {@code offset}, one series id per row, without waiting.
+     *
+     * @param series the series id of each row
+     * @param timestamps ms since the epoch
+     * @param values the values
+     * @param offset the first row to send
+     * @param length the number of rows
+     * @throws TsdbException on a connection failure
+     */
+    public void insertValuesAsync(int[] series, long[] timestamps, Column values, int offset, int length)
+            throws TsdbException {
+        insertValuesFrames(0, Objects.requireNonNull(series, "series"), timestamps, values, offset, length);
+    }
+
+    private void insertValuesFrames(int series, int[] many, long[] ts, Column col, int off, int n)
+            throws TsdbException {
+        Objects.requireNonNull(ts, "timestamps");
+        Objects.requireNonNull(col, "values");
+        Objects.checkFromIndexSize(off, n, ts.length);
+        Objects.checkFromIndexSize(off, n, col.size());
+        if (many != null)
+            Objects.checkFromIndexSize(off, n, many.length);
+        else if (series == Protocol.MANY_SERIES)
+            throw new IllegalArgumentException("series id 0xffffffff is reserved");
+        ready();
+        ValueType type = col.type();
+        int sent = 0;
+        do { /* one frame even for zero rows, as the C client */
+            int m = Math.min(n - sent, INSERT_FRAME_ROWS);
+            byte[] valid = Values.validity(col, off + sent, m);
+            long end = Protocol.VALUES_HEADER + (long) m * (Long.BYTES + type.width)
+                    + (valid != null ? valid.length : 0);
+            int pad = many != null ? (int) (((end + 3) & ~3L) - end) : 0;
+            while (pending >= MAX_IN_FLIGHT)
+                collectOne();
+            begin(Protocol.OP_INSERT_VALUES, end + pad + (many != null ? (long) m * Integer.BYTES : 0));
+            out.putInt(m).putInt(many != null ? Protocol.MANY_SERIES : series);
+            out.put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0).putInt(0);
+            putLongs(ts, off + sent, m);
+            putColumn(col, off + sent, m);
+            if (valid != null)
+                putBytes(valid);
+            if (many != null) {
+                if (out.remaining() < pad)
+                    send();
+                for (int i = 0; i < pad; i++)
+                    out.put((byte) 0);
+                putInts(many, off + sent, m);
+            }
+            send();
+            pending++;
+            sent += m;
+        } while (sent < n);
+    }
+
+    /**
+     * Returns the points of a series of any type in {@code [start, end)}, oldest first, with nulls.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @return the points
+     * @throws TsdbException if the query fails, or {@link Status#ERR_NOMEM} if the result does not fit in one array
+     */
+    public ValuePoints queryValues(int series, long start, long end) throws TsdbException {
+        return queryValues(series, start, end, Order.ASC, 0);
+    }
+
+    /**
+     * Returns the points of a series of any type in {@code [start, end)}, in the given order, at most {@code limit}
+     * of them, with nulls. An unknown series gives no points (as a float32 column).
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param order oldest or newest first
+     * @param limit the most points to return; 0 for all
+     * @return the points
+     * @throws TsdbException if the query fails, or {@link Status#ERR_NOMEM} if the result does not fit in one array
+     */
+    public ValuePoints queryValues(int series, long start, long end, Order order, long limit) throws TsdbException {
+        ValueCollector c = new ValueCollector();
+        values(series, start, end, order, limit, c);
+        if (c.overflow)
+            throw new TsdbException(Status.ERR_NOMEM, "more points than one array holds; stream them with queryValues",
+                    null);
+        if (c.mixed)
+            throw new TsdbException(Status.ERR_CORRUPT, "chunks of different value types", null);
+        return c.result();
+    }
+
+    /**
+     * Streams the points of a series of any type in {@code [start, end)}, oldest first, chunk by chunk.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param consumer receives the chunks
+     * @return {@code true} if every point was delivered, {@code false} if the consumer stopped early
+     * @throws TsdbException if the query fails
+     */
+    public boolean queryValues(int series, long start, long end, ValuesConsumer consumer) throws TsdbException {
+        return queryValues(series, start, end, Order.ASC, 0, consumer);
+    }
+
+    /**
+     * Streams the points of a series of any type in {@code [start, end)}, in the given order, at most {@code limit}
+     * of them, in chunks of up to 16384 points. As with {@link #queryRaw(int, long, long, Order, long, RawConsumer)},
+     * stopping early still reads the rest of the stream.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param order oldest or newest first
+     * @param limit the most points to return; 0 for all
+     * @param consumer receives the chunks
+     * @return {@code true} if every point was delivered, {@code false} if the consumer stopped early
+     * @throws TsdbException if the query fails
+     */
+    public boolean queryValues(int series, long start, long end, Order order, long limit, ValuesConsumer consumer)
+            throws TsdbException {
+        Objects.requireNonNull(consumer, "consumer");
+        return values(series, start, end, order, limit, (b, type, n, valid) -> {
+            if (n == 0)
+                return true;
+            if (chunkTs.length < n)
+                chunkTs = new long[n];
+            if (chunkColumn == null || chunkColumn.type() != type || chunkColumn.capacity() < n)
+                chunkColumn = Column.allocate(type, Math.max(n, chunkTs.length));
+            getLongs(b, chunkTs, 0, n);
+            Values.get(b, chunkColumn, 0, n);
+            chunkNulls.clear();
+            chunkColumn.nulls = chunkNulls;
+            if (valid)
+                Values.getValidity(b, chunkColumn, 0, n);
+            if (chunkNulls.isEmpty())
+                chunkColumn.nulls = null;
+            chunkColumn.size = n;
+            return consumer.accept(chunkTs, chunkColumn, n);
+        });
+    }
+
+    /** Takes one chunk of a QUERY_VALUES reply: n timestamps at the buffer's position, n values, the bitmap. */
+    private interface ValueSink {
+        boolean chunk(ByteBuffer b, ValueType type, int n, boolean valid);
+    }
+
+    /** Collects a QUERY_VALUES reply into growing arrays. */
+    private static final class ValueCollector implements ValueSink {
+        long[] ts = new long[0];
+        Column col;
+        int n;
+        boolean overflow, mixed;
+
+        @Override
+        public boolean chunk(ByteBuffer b, ValueType type, int k, boolean valid) {
+            if (col == null) {
+                col = Column.allocate(type, 0);
+            } else if (col.type() != type) {
+                mixed = true;
+                return false;
+            }
+            if (k > ts.length - n) {
+                if ((long) n + k > Integer.MAX_VALUE - 8) {
+                    overflow = true;
+                    return false;
+                }
+                int cap = (int) Math.min(Math.max((long) ts.length * 2, (long) n + k), Integer.MAX_VALUE - 8);
+                ts = Arrays.copyOf(ts, cap);
+                col.grow(cap);
+            }
+            getLongs(b, ts, n, k);
+            Values.get(b, col, n, k);
+            if (valid)
+                Values.getValidity(b, col, n, k);
+            n += k;
+            col.size = n;
+            return true;
+        }
+
+        ValuePoints result() {
+            if (col == null)
+                col = Column.allocate(ValueType.FLOAT32, 0);
+            if (col.capacity() != n)
+                col.grow(n);
+            return new ValuePoints(n == ts.length ? ts : Arrays.copyOf(ts, n), col);
+        }
+    }
+
+    private boolean values(int series, long start, long end, Order order, long limit, ValueSink sink)
+            throws TsdbException {
+        Objects.requireNonNull(order, "order");
+        if (limit < 0)
+            throw new IllegalArgumentException("negative limit");
+        request();
+        boolean opts = order != Order.ASC || limit != 0;
+        begin(Protocol.OP_QUERY_VALUES, opts ? 29 : 20);
+        out.putInt(series).putLong(start).putLong(end);
+        if (opts)
+            out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
+        send();
+        boolean stopped = false;
+        RuntimeException thrown = null;
+        for (;;) {
+            int st = frame();
+            if (bodyLen == 0 && st != 0) { /* not produced by tsdbd today, but cheap to accept */
+                endReply();
+                throw new TsdbException(st);
+            }
+            int p = in.position();
+            ValueType type = bodyLen >= 8 ? ValueType.of(in.get(p + 1)) : null;
+            int n = bodyLen >= 8 ? in.getInt(p + 4) : -1;
+            boolean valid = bodyLen >= 8 && (in.get(p + 2) & Protocol.VALID) != 0;
+            if (type == null || n < 0
+                    || bodyLen != 8 + (long) n * (Long.BYTES + type.width) + (valid ? (n + 7) / 8 : 0))
+                throw lost(Status.ERR_CORRUPT, "QUERY_VALUES chunk of " + bodyLen + " bytes");
+            boolean last = in.get(p) != 0;
+            in.position(p + 8);
+            if (!stopped) {
+                try {
+                    stopped = !sink.chunk(in, type, n, valid);
+                } catch (RuntimeException e) {
+                    thrown = e;
+                    stopped = true;
+                } catch (Error e) {
+                    lost(Status.ERR_IO, "consumer failed");
+                    throw e;
+                }
+            }
+            if (!last) {
+                in.position(bodyEnd);
+                continue;
+            }
+            endReply();
+            if (thrown != null)
+                throw thrown;
+            check(st);
+            return !stopped;
+        }
     }
 
     // ------------------------------------------------------------- maintenance
@@ -841,6 +1338,28 @@ public final class TsdbClient implements AutoCloseable {
         }
     }
 
+    private void putColumn(Column c, int off, int n) throws TsdbException {
+        int w = c.type().width;
+        while (n > 0) {
+            if (out.remaining() < w)
+                send();
+            int k = Math.min(n, out.remaining() / w);
+            Values.put(out, c, off, k);
+            off += k;
+            n -= k;
+        }
+    }
+
+    private void putBytes(byte[] a) throws TsdbException {
+        for (int off = 0; off < a.length;) {
+            if (!out.hasRemaining())
+                send();
+            int k = Math.min(a.length - off, out.remaining());
+            out.put(a, off, k);
+            off += k;
+        }
+    }
+
     private static void getLongs(ByteBuffer b, long[] a, int off, int n) {
         b.asLongBuffer().get(a, off, n);
         b.position(b.position() + n * Long.BYTES);
@@ -911,6 +1430,18 @@ public final class TsdbClient implements AutoCloseable {
         if (ts.length != values.length)
             throw new IllegalArgumentException("timestamps and values differ in length");
         return ts.length;
+    }
+
+    private static int sameLength(long[] ts, Column values) {
+        if (ts.length != values.size())
+            throw new IllegalArgumentException("timestamps and values differ in length");
+        return ts.length;
+    }
+
+    private static int sameLength(int[] series, long[] ts, Column values) {
+        if (series.length != ts.length)
+            throw new IllegalArgumentException("series and timestamps differ in length");
+        return sameLength(ts, values);
     }
 
     private static int sameLength(int[] series, long[] ts, float[] values) {

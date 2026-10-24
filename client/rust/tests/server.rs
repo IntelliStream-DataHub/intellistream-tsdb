@@ -144,8 +144,8 @@ fn aggregates() {
         assert_eq!(b.start, T0 + k as i64 * MIN);
         assert_eq!(b.count, 60);
         assert!((b.sum - w.iter().map(|&x| x as f64).sum::<f64>()).abs() < 1e-6);
-        assert_eq!(b.min, w.iter().copied().fold(f32::INFINITY, f32::min));
-        assert_eq!(b.max, w.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        assert_eq!(b.min, w.iter().copied().fold(f32::INFINITY, f32::min) as f64);
+        assert_eq!(b.max, w.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64);
         assert!((b.avg() - b.sum / 60.0).abs() < 1e-12);
     }
 
@@ -293,7 +293,7 @@ fn concurrent_clients() {
                 }
                 c.wait().unwrap();
                 let b = c.query_agg(id, .., 0).unwrap();
-                assert_eq!((b.len(), b[0].count, b[0].min, b[0].max), (1, 50_000, id as f32, id as f32));
+                assert_eq!((b.len(), b[0].count, b[0].min, b[0].max), (1, 50_000, id as f64, id as f64));
             });
         }
     });

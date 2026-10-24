@@ -79,7 +79,7 @@ class TsdbClientTest {
 
     @Test
     void hello() throws Exception {
-        assertEquals(1, c.hello());
+        assertEquals(Protocol.VERSION, c.hello());
     }
 
     @Test
@@ -153,7 +153,7 @@ class TsdbClientTest {
                 () -> c.queryRaw(id, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, n) -> {
                     throw boom;
                 })));
-        assertEquals(1, c.hello());
+        assertEquals(Protocol.VERSION, c.hello());
         assertEquals(100_000, c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE).size());
     }
 
@@ -264,7 +264,7 @@ class TsdbClientTest {
 
         /* a reply far larger than the receive buffer: N buckets of 32 bytes */
         assertEquals(N, c.queryAgg(id, Long.MIN_VALUE, Long.MAX_VALUE, 1000).size());
-        assertEquals(1, c.hello());
+        assertEquals(Protocol.VERSION, c.hello());
         assertTrue(c.queryAgg(id, 0, 1000, 1000).isEmpty());
     }
 

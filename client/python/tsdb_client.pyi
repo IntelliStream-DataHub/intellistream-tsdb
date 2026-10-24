@@ -21,6 +21,7 @@ ERR_NOTFOUND: int
 ERR_TOO_MANY_BUCKETS: int
 ERR_STOPPED: int
 ERR_READONLY: int
+VALUE_TYPES: list[str]
 
 _Order = Literal["asc", "desc"]
 _Unit = Literal["second", "minute", "hour", "day", "week", "month", "quarter", "year"]
@@ -29,6 +30,10 @@ _Unit = Literal["second", "minute", "hour", "day", "week", "month", "quarter", "
 _Timestamps = Buffer | Sequence[int]
 _Values = Buffer | Sequence[float]
 _SeriesIds = Buffer | Sequence[int]
+_ValueType = Literal["float32", "float64", "int64", "bool", "state"]
+# Typed values: a numpy array or masked array (masked = null), a buffer, or a
+# sequence with None for nulls.
+_TypedValues = Buffer | Sequence[float | int | bool | None]
 
 class TsdbError(Exception):
     """An error from tsdbd or the client."""
@@ -54,6 +59,13 @@ class Bucket:
     def min(self) -> float: ...
     @property
     def max(self) -> float: ...
+    @property
+    def isum(self) -> int:
+        """Exact sum for int64 and bool series (saturating)."""
+    @property
+    def imin(self) -> int: ...
+    @property
+    def imax(self) -> int: ...
     @property
     def avg(self) -> float:
         """sum / count (0 for an empty bucket)."""
@@ -109,6 +121,42 @@ class Client:
     def insert_series_async(self, series: int, ts: _Timestamps, values: _Values) -> None:
         """Sends without waiting; errors come from wait() or the next call that reads a reply."""
     def insert_async(self, series: _SeriesIds, ts: _Timestamps, values: _Values) -> None: ...
+    def series_create(self, name: str, value_type: _ValueType = "float32", path: str | None = None) -> int:
+        """The id of a typed series, created if needed; another type is TsdbError(ERR_INVALID)."""
+    def series_type(self, id: int) -> _ValueType: ...
+    def state(self, series: int, name: str) -> int:
+        """The code of state `name` in the series' volume dictionary, created if needed."""
+    def state_lookup(self, series: int, name: str) -> int: ...
+    def state_name(self, series: int, code: int) -> str: ...
+    def state_names(self, series: int, codes: _TypedValues) -> list[str | None]:
+        """Names of codes (None and masked entries give None); cached."""
+    def insert_series_values(
+        self, series: int, ts: _Timestamps, values: _TypedValues, *, value_type: _ValueType | None = None
+    ) -> None:
+        """Inserts typed values (None or masked = null) and waits. value_type
+        defaults to the series' type, asked once and cached."""
+    def insert_values(
+        self, series: _SeriesIds, ts: _Timestamps, values: _TypedValues, *, value_type: _ValueType | None = None
+    ) -> None: ...
+    def insert_series_values_async(
+        self, series: int, ts: _Timestamps, values: _TypedValues, *, value_type: _ValueType | None = None
+    ) -> None: ...
+    def insert_values_async(
+        self, series: _SeriesIds, ts: _Timestamps, values: _TypedValues, *, value_type: _ValueType | None = None
+    ) -> None: ...
+    def query_values(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        numpy: bool | None = None,
+    ) -> tuple[Any, Any]:
+        """(timestamps, values) of any type: an int64 array and a
+        numpy.ma.MaskedArray (masked = null) with numpy, else lists with None
+        for nulls."""
     def wait(self) -> None:
         """Collects pending insert acknowledgements; raises the first error."""
     @property

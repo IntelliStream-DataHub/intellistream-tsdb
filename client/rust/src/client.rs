@@ -16,13 +16,20 @@ use std::time::Duration;
 
 use crate::error::{Error, Result, Status};
 use crate::protocol::extend_i64s;
-use crate::protocol::{AGG_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PROTOCOL_VERSION, REPLY_HEADER};
-use crate::types::{Bucket, Group, Order, Points, QueryOpts, Stats};
-use crate::value::{self, VALUE_SIZE, Value};
+use crate::protocol::{
+    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PROTOCOL_VERSION, REPLY_HEADER, VALID,
+    VALUES_CHUNK_HEADER,
+};
+use crate::types::{Bucket, Group, Order, Points, QueryOpts, Rows, Stats};
+use crate::value::{Bitmap, Column, ColumnRef, Native, Value, ValueType};
 
 /// Rows per INSERT frame: 8M rows of the many-series layout make 128 MiB,
 /// half of the largest frame the server accepts.
 const INSERT_FRAME_ROWS: usize = 8 << 20;
+/// Rows per INSERT_VALUES frame: 6M rows of the widest layout (8 + 8 bytes,
+/// a bit, 4 bytes of series) make about 115 MiB. A multiple of 8, so every
+/// frame's part of the validity bitmap starts on a byte.
+const INSERT_VALUE_ROWS: usize = 6 << 20;
 /// Unacknowledged inserts allowed in flight. Their replies (13 bytes each)
 /// then always fit in the socket buffers, so neither side can block the other.
 const MAX_PIPELINE: usize = 1024;
@@ -176,6 +183,72 @@ impl Client {
         Ok(id)
     }
 
+    /// Returns the id of series `name` of type `ty`, creating it if needed in
+    /// the volume `path` (`None`: the database directory). An existing series
+    /// of another type is [`Status::Invalid`]. [`series`](Client::series) creates float32 series.
+    pub fn series_create(&mut self, name: &str, ty: ValueType, path: Option<&str>) -> Result<u32> {
+        self.run(|c| {
+            let name = wire_str("series name", name, false)?;
+            let path = wire_str("path", path.unwrap_or(""), true)?;
+            c.request(Op::SeriesCreate, |f| {
+                f.u8(ty.code()).u16(name.len() as u16).bytes(name).u16(path.len() as u16).bytes(path);
+            })?;
+            let mut r = Cursor::new(&c.body);
+            let id = r.u32()?;
+            end(&r)?;
+            Ok(id)
+        })
+    }
+
+    /// The value type of series `id`; [`Status::NotFound`] if there is none.
+    pub fn series_type(&mut self, id: u32) -> Result<ValueType> {
+        self.run(|c| {
+            c.request(Op::SeriesType, |f| {
+                f.u32(id);
+            })?;
+            let mut r = Cursor::new(&c.body);
+            let code = r.u8()?;
+            end(&r)?;
+            ValueType::from_code(code).ok_or_else(|| Error::Protocol(format!("unknown value type {code}")))
+        })
+    }
+
+    /// The code of state `name` in the dictionary of `series`'s volume,
+    /// created if needed. Codes start at 1 and never change.
+    pub fn state(&mut self, series: u32, name: &str) -> Result<u32> {
+        self.run(|c| c.state_req(series, name, true))
+    }
+
+    /// The code of an existing state; [`Status::NotFound`] if there is none.
+    pub fn state_lookup(&mut self, series: u32, name: &str) -> Result<u32> {
+        self.run(|c| c.state_req(series, name, false))
+    }
+
+    /// The name of state `code`; [`Status::NotFound`] for an unknown code.
+    pub fn state_name(&mut self, series: u32, code: u32) -> Result<String> {
+        self.run(|c| {
+            c.request(Op::StateName, |f| {
+                f.u32(series).u32(code);
+            })?;
+            let mut r = Cursor::new(&c.body);
+            let n = r.u16()? as usize;
+            let name = String::from_utf8_lossy(r.take(n)?).into_owned();
+            end(&r)?;
+            Ok(name)
+        })
+    }
+
+    fn state_req(&mut self, series: u32, name: &str, create: bool) -> Result<u32> {
+        let name = wire_str("state name", name, false)?;
+        self.request(Op::State, |f| {
+            f.u32(series).u8(create as u8).u16(name.len() as u16).bytes(name);
+        })?;
+        let mut r = Cursor::new(&self.body);
+        let code = r.u32()?;
+        end(&r)?;
+        Ok(code)
+    }
+
     // ------------------------------------------------------------ inserts
 
     /// Inserts rows of one series and waits until the server has applied them
@@ -211,6 +284,62 @@ impl Client {
         self.run(|c| c.insert_frames(Some(series), 0, ts, values))
     }
 
+    /// Inserts typed values, with nulls, into one series and waits. The
+    /// column's type must be the series' type ([`Status::Invalid`] otherwise).
+    ///
+    /// ```no_run
+    /// # use tsdb_client::{Client, Column};
+    /// # let mut c = Client::connect("127.0.0.1:7070")?;
+    /// # let (id, t0) = (1, 0);
+    /// c.insert_series_values(id, &[t0, t0 + 1000], &[10i64, 20])?;
+    /// c.insert_series_values(id, &[t0 + 2000, t0 + 3000], &Column::from_options([Some(30i64), None]))?;
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    pub fn insert_series_values<'a>(
+        &mut self,
+        series: u32,
+        ts: &[i64],
+        values: impl Into<ColumnRef<'a>>,
+    ) -> Result<()> {
+        let col = values.into();
+        self.run(|c| {
+            c.insert_values_frames(None, series, ts, col)?;
+            c.wait_inner()
+        })
+    }
+
+    /// Inserts typed values into many series (`series[i]` is the series of
+    /// row `i`, all of the column's type) and waits.
+    pub fn insert_values<'a>(&mut self, series: &[u32], ts: &[i64], values: impl Into<ColumnRef<'a>>) -> Result<()> {
+        let col = values.into();
+        self.run(|c| {
+            c.insert_values_frames(Some(series), 0, ts, col)?;
+            c.wait_inner()
+        })
+    }
+
+    /// Sends typed values for one series without waiting; see [`insert_series_async`](Client::insert_series_async).
+    pub fn insert_series_values_async<'a>(
+        &mut self,
+        series: u32,
+        ts: &[i64],
+        values: impl Into<ColumnRef<'a>>,
+    ) -> Result<()> {
+        let col = values.into();
+        self.run(|c| c.insert_values_frames(None, series, ts, col))
+    }
+
+    /// Sends typed values for many series without waiting.
+    pub fn insert_values_async<'a>(
+        &mut self,
+        series: &[u32],
+        ts: &[i64],
+        values: impl Into<ColumnRef<'a>>,
+    ) -> Result<()> {
+        let col = values.into();
+        self.run(|c| c.insert_values_frames(Some(series), 0, ts, col))
+    }
+
     /// Collects the acknowledgements of all pending inserts and returns the
     /// first error among them.
     pub fn wait(&mut self) -> Result<()> {
@@ -223,17 +352,7 @@ impl Client {
     }
 
     fn insert_frames(&mut self, series: Option<&[u32]>, one: u32, ts: &[i64], values: &[Value]) -> Result<()> {
-        if ts.len() != values.len() || series.is_some_and(|s| s.len() != ts.len()) {
-            return Err(Error::InvalidArgument(format!(
-                "column lengths differ: {} timestamps, {} values{}",
-                ts.len(),
-                values.len(),
-                series.map_or(String::new(), |s| format!(", {} series", s.len()))
-            )));
-        }
-        if series.is_none() && one == MANY_SERIES {
-            return Err(Error::InvalidArgument(format!("series id {one} is reserved")));
-        }
+        check_lengths(series, one, ts, values.len())?;
         let n = ts.len();
         let mut off = 0;
         loop {
@@ -243,19 +362,68 @@ impl Client {
             }
             let f = self.req.begin(self.next_id, Op::Insert);
             f.u32(m as u32).u32(series.map_or(one, |_| MANY_SERIES)).i64s(&ts[off..off + m]);
-            value::put_values(f.raw(), &values[off..off + m]);
+            Native::put(&values[off..off + m], f.raw());
             if let Some(s) = series {
                 f.u32s(&s[off..off + m]);
             }
-            let sent = self.send();
-            self.req.shrink();
-            sent?;
-            self.pending += 1;
+            self.send_insert()?;
             off += m;
             if off >= n {
                 return Ok(());
             }
         }
+    }
+
+    /// INSERT_VALUES frames: header, timestamps, values, the validity bitmap
+    /// if any, then (aligned to 4) the series of each row.
+    fn insert_values_frames(&mut self, series: Option<&[u32]>, one: u32, ts: &[i64], col: ColumnRef<'_>) -> Result<()> {
+        check_lengths(series, one, ts, col.len())?;
+        if let Some(v) = col.valid
+            && v.len() != col.len()
+        {
+            return Err(Error::InvalidArgument(format!(
+                "validity bitmap of {} bits for {} values",
+                v.len(),
+                col.len()
+            )));
+        }
+        let n = ts.len();
+        let mut off = 0;
+        loop {
+            // INSERT_VALUE_ROWS is a multiple of 8, so each frame's bitmap starts on a byte
+            let m = (n - off).min(INSERT_VALUE_ROWS);
+            if self.pending >= MAX_PIPELINE {
+                self.collect_ack()?;
+            }
+            let f = self.req.begin(self.next_id, Op::InsertValues);
+            f.u32(m as u32)
+                .u32(series.map_or(one, |_| MANY_SERIES))
+                .u8(col.value_type().code())
+                .u8(if col.valid.is_some() { VALID } else { 0 })
+                .u16(0)
+                .u32(0)
+                .i64s(&ts[off..off + m]);
+            col.values.put(f.raw(), off, off + m);
+            if let Some(v) = col.valid {
+                f.bytes(&v.as_bytes()[off / 8..(off + m).div_ceil(8)]);
+            }
+            if let Some(s) = series {
+                f.align4().u32s(&s[off..off + m]);
+            }
+            self.send_insert()?;
+            off += m;
+            if off >= n {
+                return Ok(());
+            }
+        }
+    }
+
+    fn send_insert(&mut self) -> Result<()> {
+        let sent = self.send();
+        self.req.shrink();
+        sent?;
+        self.pending += 1;
+        Ok(())
     }
 
     fn collect_ack(&mut self) -> Result<()> {
@@ -277,24 +445,26 @@ impl Client {
 
     // ------------------------------------------------------------ queries
 
-    /// Returns the points of `series` in `range`, in `opts.order`, at most `opts.limit` of them.
+    /// Returns the points of a float32 `series` in `range`, in `opts.order`,
+    /// at most `opts.limit` of them (QUERY_RAW: nulls read as NaN; other types
+    /// are [`Status::Invalid`], use [`query_rows`](Client::query_rows)).
     pub fn query_points(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Points> {
         let (start, end) = bounds(&range);
         self.run(|c| {
             let mut p = Points::default();
             c.raw_stream(series, start, end, opts, |ts, v| {
                 extend_i64s(&mut p.ts, ts);
-                value::extend_values(&mut p.values, v);
+                Native::extend(&mut p.values, v);
                 ControlFlow::Continue(())
             })?;
             Ok(p)
         })
     }
 
-    /// Streams the points of `series` in `range` to `f` in chunks (the server
-    /// sends up to 16384 rows per chunk). Return [`ControlFlow::Break`] from
-    /// `f` to stop early; the rest of the stream is then read and discarded,
-    /// since the protocol cannot cancel a query.
+    /// Streams the points of a float32 `series` in `range` to `f` in chunks
+    /// (the server sends up to 16384 rows per chunk). Return
+    /// [`ControlFlow::Break`] from `f` to stop early; the rest of the stream is
+    /// then read and discarded, since the protocol cannot cancel a query.
     pub fn query_raw<F>(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts, mut f: F) -> Result<()>
     where
         F: FnMut(&[i64], &[Value]) -> ControlFlow<()>,
@@ -306,7 +476,7 @@ impl Client {
                 ts.clear();
                 vs.clear();
                 extend_i64s(&mut ts, tb);
-                value::extend_values(&mut vs, vb);
+                Native::extend(&mut vs, vb);
                 f(&ts, &vs)
             })
         })
@@ -321,14 +491,7 @@ impl Client {
         let Some(limit) = opts.wire_limit() else {
             return Ok(());
         };
-        self.req
-            .begin(self.next_id, Op::QueryRaw)
-            .u32(series)
-            .i64(start)
-            .i64(end)
-            .u8((opts.order == Order::Desc) as u8)
-            .u64(limit);
-        self.send()?;
+        self.send_range_query(Op::QueryRaw, series, start, end, opts.order, limit)?;
         let (mut status, mut stopped) = (0, false);
         loop {
             let st = self.read_frame()?;
@@ -338,7 +501,7 @@ impl Client {
             let mut r = Cursor::new(&self.body);
             let last = r.u8()? != 0;
             let n = r.u32()? as usize;
-            if r.remaining() != n * (8 + VALUE_SIZE) {
+            if r.remaining() != n * 12 {
                 return Err(Error::Protocol(format!("raw chunk of {n} rows has {} bytes", r.remaining())));
             }
             if n > 0 && !stopped {
@@ -354,17 +517,138 @@ impl Client {
         status_result(status)
     }
 
+    /// Returns the rows of `series` (any type, with nulls) in `range`, in
+    /// `opts.order`, at most `opts.limit` of them. An unknown series has no
+    /// rows (and reads as float32).
+    pub fn query_rows(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Rows> {
+        let (start, end) = bounds(&range);
+        self.run(|c| {
+            let mut rows = Rows { ts: Vec::new(), values: Column::empty(ValueType::Float32) };
+            let mut first = true;
+            c.values_stream(series, start, end, opts, |chunk| {
+                let col = &mut rows.values;
+                if first {
+                    *col = Column::empty(chunk.ty);
+                    first = false;
+                } else if chunk.ty != col.value_type() {
+                    return Err(Error::Protocol(format!("chunk of {} in a {} series", chunk.ty, col.value_type())));
+                }
+                let before = rows.ts.len();
+                extend_i64s(&mut rows.ts, chunk.ts);
+                col.values.extend_wire(chunk.values);
+                match (chunk.valid, &mut col.valid) {
+                    (Some(bits), valid) => {
+                        valid.get_or_insert_with(|| Bitmap::all_valid(before)).extend_from_wire(bits, chunk.n)
+                    }
+                    (None, Some(valid)) => valid.extend_valid(chunk.n),
+                    (None, None) => {}
+                }
+                Ok(ControlFlow::Continue(()))
+            })?;
+            Ok(rows)
+        })
+    }
+
+    /// Streams the rows of `series` (any type, with nulls) in `range` to `f`
+    /// in chunks of up to 16384 rows; the [`Column`] of a chunk has a
+    /// validity bitmap only if the chunk has nulls. Return
+    /// [`ControlFlow::Break`] to stop early, as with [`query_raw`](Client::query_raw).
+    pub fn query_values<F>(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        opts: QueryOpts,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[i64], &Column) -> ControlFlow<()>,
+    {
+        let (start, end) = bounds(&range);
+        self.run(|c| {
+            let (mut ts, mut col) = (Vec::new(), Column::empty(ValueType::Float32));
+            c.values_stream(series, start, end, opts, |chunk| {
+                if chunk.n == 0 {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                ts.clear();
+                extend_i64s(&mut ts, chunk.ts);
+                if col.value_type() == chunk.ty {
+                    col.clear();
+                } else {
+                    col = Column::empty(chunk.ty);
+                }
+                col.values.extend_wire(chunk.values);
+                col.valid = chunk.valid.map(|b| {
+                    let mut v = Bitmap::default();
+                    v.extend_from_wire(b, chunk.n);
+                    v
+                });
+                Ok(f(&ts, &col))
+            })
+        })
+    }
+
+    /// Sends a QUERY_VALUES and passes every chunk, empty ones included (they
+    /// still carry the type), to `sink` until it breaks. A limit of `Some(0)`
+    /// asks for one row and passes none, so the type still arrives.
+    fn values_stream<F>(&mut self, series: u32, start: i64, end: i64, opts: QueryOpts, mut sink: F) -> Result<()>
+    where
+        F: FnMut(Chunk<'_>) -> Result<ControlFlow<()>>,
+    {
+        self.wait_inner()?;
+        let (limit, mut stopped) = match opts.wire_limit() {
+            Some(l) => (l, false),
+            None => (1, true),
+        };
+        self.send_range_query(Op::QueryValues, series, start, end, opts.order, limit)?;
+        let mut status = 0;
+        let mut first = true;
+        loop {
+            let st = self.read_frame()?;
+            if status == 0 {
+                status = st;
+            }
+            let mut r = Cursor::new(&self.body);
+            let h = r.take(VALUES_CHUNK_HEADER)?;
+            let last = h[0] != 0;
+            let ty = ValueType::from_code(h[1]).ok_or_else(|| Error::Protocol(format!("value type {}", h[1])))?;
+            let n = u32::from_le_bytes(h[4..8].try_into().expect("4 bytes")) as usize;
+            let vb = n * ty.wire_width();
+            let valid = if h[2] & VALID != 0 { n.div_ceil(8) } else { 0 };
+            if r.remaining() != n * 8 + vb + valid {
+                return Err(Error::Protocol(format!("values chunk of {n} rows has {} bytes", r.remaining())));
+            }
+            if !stopped || first {
+                let ts = r.take(n * 8)?;
+                let values = r.take(vb)?;
+                let bits = (valid > 0).then(|| r.take(valid)).transpose()?;
+                let chunk = if stopped {
+                    Chunk { ty, n: 0, ts: &[], values: &[], valid: None }
+                } else {
+                    Chunk { ty, n, ts, values, valid: bits }
+                };
+                stopped |= sink(chunk)?.is_break();
+                first = false;
+            }
+            if last {
+                break;
+            }
+        }
+        self.reply_id = self.reply_id.wrapping_add(1);
+        status_result(status)
+    }
+
+    fn send_range_query(&mut self, op: Op, series: u32, start: i64, end: i64, order: Order, limit: u64) -> Result<()> {
+        self.req.begin(self.next_id, op).u32(series).i64(start).i64(end).u8((order == Order::Desc) as u8).u64(limit);
+        self.send()
+    }
+
     /// Aggregates `series` over `range` into buckets of `interval_ms`, aligned
     /// to the epoch; 0 gives one bucket for the whole range. Only non-empty
     /// buckets are returned, in time order.
     pub fn query_agg(&mut self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
-        self.run(|c| {
-            c.request(Op::QueryAgg, |f| {
-                f.u32(series).i64(start).i64(end).i64(interval_ms);
-            })?;
-            c.read_buckets()
-        })
+        self.run(|c| c.buckets(series, start, end, interval_ms, None, QueryOpts::asc()))
     }
 
     /// Aggregates `series` over `range` by calendar periods (`None`: one
@@ -377,31 +661,39 @@ impl Client {
         opts: QueryOpts,
     ) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
-        self.run(|c| {
-            let tz = wire_str("time zone", group.and_then(|g| g.timezone.as_deref()).unwrap_or(""), true)?;
-            let Some(limit) = opts.wire_limit() else {
-                c.wait_inner()?;
-                return Ok(Vec::new());
-            };
-            c.request(Op::QueryGroup, |f| {
-                f.u32(series)
-                    .i64(start)
-                    .i64(end)
-                    .u8(group.map_or(0, |g| g.unit as u8))
-                    .u32(group.map_or(0, |g| g.count))
-                    .u8((opts.order == Order::Desc) as u8)
-                    .u64(limit)
-                    .u16(tz.len() as u16)
-                    .bytes(tz);
-            })?;
-            c.read_buckets()
-        })
+        self.run(|c| c.buckets(series, start, end, 0, group, opts))
     }
 
-    fn read_buckets(&self) -> Result<Vec<Bucket>> {
+    /// QUERY_BUCKETS: fixed intervals (no group) or calendar groups.
+    fn buckets(
+        &mut self,
+        series: u32,
+        start: i64,
+        end: i64,
+        interval: i64,
+        group: Option<&Group>,
+        opts: QueryOpts,
+    ) -> Result<Vec<Bucket>> {
+        let tz = wire_str("time zone", group.and_then(|g| g.timezone.as_deref()).unwrap_or(""), true)?;
+        let Some(limit) = opts.wire_limit() else {
+            self.wait_inner()?;
+            return Ok(Vec::new());
+        };
+        self.request(Op::QueryBuckets, |f| {
+            f.u32(series)
+                .i64(start)
+                .i64(end)
+                .i64(interval)
+                .u8(group.map_or(0, |g| g.unit as u8))
+                .u32(group.map_or(0, |g| g.count))
+                .u8((opts.order == Order::Desc) as u8)
+                .u64(limit)
+                .u16(tz.len() as u16)
+                .bytes(tz);
+        })?;
         let mut r = Cursor::new(&self.body);
         let n = r.u32()? as usize;
-        if r.remaining() != n * AGG_ROW {
+        if r.remaining() != n * BUCKET_ROW {
             return Err(Error::Protocol(format!("{n} buckets in {} bytes", r.remaining())));
         }
         let mut out = Vec::with_capacity(n);
@@ -410,8 +702,11 @@ impl Client {
                 start: r.i64()?,
                 count: r.u64()?,
                 sum: r.f64()?,
-                min: value::get_value(r.take(VALUE_SIZE)?),
-                max: value::get_value(r.take(VALUE_SIZE)?),
+                min: r.f64()?,
+                max: r.f64()?,
+                isum: r.i64()?,
+                imin: r.i64()?,
+                imax: r.i64()?,
             });
         }
         Ok(out)
@@ -537,6 +832,29 @@ fn wire_str<'a>(what: &str, s: &'a str, allow_empty: bool) -> Result<&'a [u8]> {
         return Err(Error::InvalidArgument(format!("{what} contains a NUL byte")));
     }
     Ok(s.as_bytes())
+}
+
+/// One QUERY_VALUES chunk, still in wire form.
+struct Chunk<'a> {
+    ty: ValueType,
+    n: usize,
+    ts: &'a [u8],
+    values: &'a [u8],
+    valid: Option<&'a [u8]>,
+}
+
+fn check_lengths(series: Option<&[u32]>, one: u32, ts: &[i64], values: usize) -> Result<()> {
+    if ts.len() != values || series.is_some_and(|s| s.len() != ts.len()) {
+        return Err(Error::InvalidArgument(format!(
+            "column lengths differ: {} timestamps, {values} values{}",
+            ts.len(),
+            series.map_or(String::new(), |s| format!(", {} series", s.len()))
+        )));
+    }
+    if series.is_none() && one == MANY_SERIES {
+        return Err(Error::InvalidArgument(format!("series id {one} is reserved")));
+    }
+    Ok(())
 }
 
 /// Converts a range to the protocol's `[start, end)`.

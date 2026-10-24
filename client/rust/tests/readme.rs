@@ -29,4 +29,5 @@ fn quick_start_runs() {
     let count = |p: &str| stdout.lines().filter(|l| l.starts_with(p)).count();
     assert_eq!((count("raw "), count("hour "), count("day ")), (3, 6, 2), "{stdout}");
     assert!(stdout.contains("raw  1700085540000 59"), "{stdout}");
+    assert!(stdout.contains("rows [Some(3), None, Some(5)]\nint  count 2 isum 8\nmode off\n"), "{stdout}");
 }

@@ -1,6 +1,6 @@
 //! Query options and results.
 
-use crate::value::Value;
+use crate::value::{Column, Value, ValueType};
 
 /// The order of raw rows or buckets, by timestamp.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -122,20 +122,32 @@ impl Group {
     }
 }
 
-/// One aggregate bucket. Only non-empty buckets are returned.
+/// One aggregate bucket (`tsdb_bucket`).
+///
+/// Aggregates skip nulls: `count` is the number of known values, and a bucket
+/// whose rows are all null is returned with count 0 (buckets without rows are
+/// not returned). For int64 and bool series (false 0, true 1) `isum`, `imin`
+/// and `imax` are exact, where the f64 fields may round; `isum` saturates at
+/// `i64::MIN`/`i64::MAX`. For state series only `count` is meaningful.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bucket {
     /// The bucket's start in ms since the epoch (the UTC instant its local
     /// period begins); for a single bucket, the query's start.
     pub start: i64,
-    /// Number of points.
+    /// Number of known values.
     pub count: u64,
     /// Sum of the values (NaN values propagate into it).
     pub sum: f64,
-    /// Smallest value, ignoring NaN (NaN if all values are NaN).
-    pub min: Value,
-    /// Largest value, ignoring NaN (NaN if all values are NaN).
-    pub max: Value,
+    /// Smallest value, ignoring NaN (NaN if there is no other value).
+    pub min: f64,
+    /// Largest value, ignoring NaN (NaN if there is no other value).
+    pub max: f64,
+    /// Exact sum, for int64 and bool series.
+    pub isum: i64,
+    /// Exact minimum, for int64 and bool series.
+    pub imin: i64,
+    /// Exact maximum, for int64 and bool series.
+    pub imax: i64,
 }
 
 impl Bucket {
@@ -168,6 +180,32 @@ impl Points {
     /// Iterates over `(timestamp, value)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (i64, Value)> + '_ {
         self.ts.iter().copied().zip(self.values.iter().copied())
+    }
+}
+
+/// Raw points of a series of any type, with nulls: timestamps and a [`Column`] of equal length.
+#[derive(Debug, Clone)]
+pub struct Rows {
+    /// Timestamps in ms since the epoch, in the query's order.
+    pub ts: Vec<i64>,
+    /// The value of each timestamp.
+    pub values: Column,
+}
+
+impl Rows {
+    /// Number of rows.
+    pub fn len(&self) -> usize {
+        self.ts.len()
+    }
+
+    /// Whether there are no rows.
+    pub fn is_empty(&self) -> bool {
+        self.ts.is_empty()
+    }
+
+    /// The series' value type.
+    pub fn value_type(&self) -> ValueType {
+        self.values.value_type()
     }
 }
 

@@ -1,12 +1,16 @@
 //! Wire format of `include/tsdb_protocol.h`: little-endian frames
 //! `[u32 len][u32 id][u8 op] payload`, where `len` counts the bytes after
 //! itself. Every reply has op REPLY and starts with an i32 status.
+//!
+//! Version 2 adds value types and nulls (SERIES_CREATE, SERIES_TYPE,
+//! INSERT_VALUES, QUERY_VALUES, STATE, STATE_NAME, QUERY_BUCKETS). This client
+//! sends QUERY_BUCKETS for every aggregate: its 64-byte rows carry f64 min/max
+//! and the exact integer fields, which the version 1 QUERY_AGG/GROUP rows lack.
 
 use crate::error::{Error, Result};
-use crate::value::VALUE_SIZE;
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 
@@ -14,8 +18,12 @@ pub const DEFAULT_PORT: u16 = 7070;
 pub(crate) const MAX_FRAME: usize = 256 << 20;
 /// The series field of an INSERT whose rows carry their own series.
 pub(crate) const MANY_SERIES: u32 = u32::MAX;
-/// Bytes per bucket in an aggregate reply (`TSDB_AGG_ROW`).
-pub(crate) const AGG_ROW: usize = 24 + 2 * VALUE_SIZE;
+/// Bytes per bucket in a QUERY_BUCKETS reply (`TSDB_BUCKET_ROW`).
+pub(crate) const BUCKET_ROW: usize = 64;
+/// Header of a QUERY_VALUES chunk: last, type, flags, 0, n.
+pub(crate) const VALUES_CHUNK_HEADER: usize = 8;
+/// Flag: a validity bitmap follows the values (`TSDB_VALID`).
+pub(crate) const VALID: u8 = 1;
 /// Reply header: len, id, op, status.
 pub(crate) const REPLY_HEADER: usize = 13;
 
@@ -28,12 +36,17 @@ pub(crate) enum Op {
     SeriesName = 3,
     Insert = 4,
     QueryRaw = 5,
-    QueryAgg = 6,
     Commit = 7,
     Flush = 8,
     Optimize = 9,
     Stats = 10,
-    QueryGroup = 11,
+    SeriesCreate = 12,
+    SeriesType = 13,
+    InsertValues = 14,
+    QueryValues = 15,
+    State = 16,
+    StateName = 17,
+    QueryBuckets = 18,
 }
 
 /// Builds one request frame in a reusable buffer.
@@ -99,6 +112,13 @@ impl FrameBuf {
 
     pub(crate) fn raw(&mut self) -> &mut Vec<u8> {
         &mut self.buf
+    }
+
+    /// Pads the payload (which starts after the 9-byte header) to a multiple of 4 bytes.
+    pub(crate) fn align4(&mut self) -> &mut Self {
+        let pad = (4 - (self.buf.len() - 9) % 4) % 4;
+        self.buf.extend_from_slice(&[0; 3][..pad]);
+        self
     }
 
     /// Fills in the length and returns the frame.

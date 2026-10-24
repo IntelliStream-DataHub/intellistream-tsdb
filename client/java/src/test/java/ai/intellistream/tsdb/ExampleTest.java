@@ -9,9 +9,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 import ai.intellistream.tsdb.example.Example;
+import ai.intellistream.tsdb.example.TypedExample;
 import org.junit.jupiter.api.Test;
 
 /** The README's quick start is the example class, and the example runs against a live server. */
@@ -19,35 +22,48 @@ class ExampleTest {
     static final Path BASE = Paths.get(System.getProperty("basedir", "."));
 
     @Test
-    void readmeQuickStartIsTheExampleClass() throws Exception {
+    void readmeQuickStartIsTheExampleClasses() throws Exception {
         String readme = Files.readString(BASE.resolve("README.md"), StandardCharsets.UTF_8);
         assertTrue(readme.startsWith("# "), "README starts with its title");
         int section = readme.indexOf("\n## ");
         assertTrue(readme.startsWith("## Quick start", section + 1), "the first section is the quick start");
-        int open = readme.indexOf("```java\n", section);
-        int close = readme.indexOf("\n```\n", open);
-        assertTrue(open > 0 && close > open, "the quick start has a java code block");
-        String block = readme.substring(open + "```java\n".length(), close + 1);
-        String source = Files.readString(BASE.resolve("src/main/java/ai/intellistream/tsdb/example/Example.java"),
-                StandardCharsets.UTF_8);
-        assertEquals(source, block, "README.md's quick start must be Example.java, verbatim");
+        int next = readme.indexOf("\n## ", section + 1);
+        String quick = readme.substring(section, next < 0 ? readme.length() : next);
+        List<String> blocks = new ArrayList<>();
+        for (int open = quick.indexOf("```java\n"); open >= 0; open = quick.indexOf("```java\n", open + 1)) {
+            int close = quick.indexOf("\n```\n", open);
+            blocks.add(quick.substring(open + "```java\n".length(), close + 1));
+        }
+        String dir = "src/main/java/ai/intellistream/tsdb/example/";
+        assertEquals(List.of(Files.readString(BASE.resolve(dir + "Example.java"), StandardCharsets.UTF_8),
+                Files.readString(BASE.resolve(dir + "TypedExample.java"), StandardCharsets.UTF_8)), blocks,
+                "README.md's quick start must hold Example.java and TypedExample.java, verbatim");
+    }
+
+    /** Runs an example's main against the server and returns what it printed. */
+    static String run(TsdbServer s, ThrowingMain main) throws Exception {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        PrintStream old = System.out;
+        Locale locale = Locale.getDefault();
+        System.setOut(new PrintStream(buf, true, StandardCharsets.UTF_8));
+        Locale.setDefault(Locale.ROOT); /* decimal points */
+        try {
+            main.run(new String[] {"127.0.0.1", Integer.toString(s.port)});
+        } finally {
+            System.setOut(old);
+            Locale.setDefault(locale);
+        }
+        return buf.toString(StandardCharsets.UTF_8);
+    }
+
+    interface ThrowingMain {
+        void run(String[] args) throws Exception;
     }
 
     @Test
     void exampleRuns() throws Exception {
         Path scratch = TsdbServer.scratch("tsdbd-java-example-");
         try (TsdbServer s = TsdbServer.start(scratch.resolve("db"))) {
-            ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            PrintStream old = System.out;
-            Locale locale = Locale.getDefault();
-            System.setOut(new PrintStream(buf, true, StandardCharsets.UTF_8));
-            Locale.setDefault(Locale.ROOT); /* decimal points */
-            try {
-                Example.main(new String[] {"127.0.0.1", Integer.toString(s.port)});
-            } finally {
-                System.setOut(old);
-                Locale.setDefault(locale);
-            }
             String expected = String.join(System.lineSeparator(),
                     "2024-03-01T23:59:00Z 45.9",
                     "2024-03-01T23:58:00Z 45.8",
@@ -59,7 +75,15 @@ class ExampleTest {
                     "Oslo day from 2024-02-29T23:00:00Z: 1380 points",
                     "Oslo day from 2024-03-01T23:00:00Z: 60 points",
                     "");
-            assertEquals(expected, buf.toString(StandardCharsets.UTF_8));
+            assertEquals(expected, run(s, Example::main));
+            assertEquals(String.join(System.lineSeparator(),
+                    "2024-03-01T00:00:00Z 1000",
+                    "2024-03-01T00:01:00Z 1250",
+                    "2024-03-01T00:02:00Z null",
+                    "2024-03-01T00:03:00Z 1900",
+                    "known 3, sum 4150, max 1900",
+                    "running running stopped running",
+                    ""), run(s, TypedExample::main));
             assertEquals(0, s.stop(), s.log());
         } finally {
             TsdbServer.delete(scratch);
