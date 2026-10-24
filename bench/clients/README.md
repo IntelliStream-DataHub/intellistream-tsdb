@@ -1,6 +1,6 @@
 # Embedded C, Java, Rust and Python and the four tsdbd clients, side by side
 
-One data set, loaded and queried by the same program in nine ways:
+One data set, loaded and queried by the same program in twelve ways:
 
 | row in the tables | program | path |
 |---|---|---|
