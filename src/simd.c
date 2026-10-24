@@ -26,6 +26,14 @@
  * order stays by position (lane j: positions j, j + LANES, ...). The same for
  * the spread's deviations. The caller counts the nulls first (values.c) and
  * passes the count; with none the kernels do no masking at all.
+ *
+ * One order for all five sets: the lanes are the same (float32 in 32 double lanes, float64 and TWA segments in
+ * 16), only how many of them one instruction holds differs (SSE and AVX's 128-bit code: two float64 lanes per
+ * vector, eight vectors; AVX2: four; AVX-512: eight; scalar: one), and every set halves them in the same steps.
+ * A short run (below simd_short: SIMD_SHORT, or AVX_SHORT where simd_small_* are 128-bit kernels) starts the
+ * halving at the smallest power of two that holds it; so does a short TWA granule (up to simd_twa_max points), and
+ * twa.c adds one or two segments itself. Where the integer kernels and LTTB's take over from values.c's loops and
+ * lttb_scalar is set per set (simd_thresholds), as is everything else that only changes speed.
  */
 #include "internal.h"
 
