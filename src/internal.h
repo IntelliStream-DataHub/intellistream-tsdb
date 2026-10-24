@@ -26,9 +26,10 @@ typedef struct eng eng;
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-/* 3: checksummed part header and footer, WAL records and dictionary records; databases
- * of older versions are refused (no release had them) */
-#define FORMAT_VERSION 3
+/* 3: checksummed part header and footer, WAL records and dictionary records;
+ * 4: time-weighted statistics in granule entries (136 bytes). Databases of older
+ * versions are refused (no release had them). */
+#define FORMAT_VERSION 4
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -222,11 +223,22 @@ typedef struct agg_state {
     };
 } agg_state;
 
-/* One NaN for every NaN sum. Which payload and sign an addition of NaNs keeps
- * depends on the operand order the compiler picked (ADDSD returns its first
- * NaN operand), and that differs between CPU levels and kernels; a sum must
- * not (levels.h). */
-static inline double canon_nan(double x) { return x == x ? x : __builtin_nan(""); }
+/* One NaN for every NaN result: the quiet NaN 0x7ff8000000000000 (as float32,
+ * 0x7fc00000). Which payload and sign an addition of NaNs keeps depends on the
+ * order of the additions (ADDSD returns its first NaN operand), and that varies
+ * with CPU levels, kernels, threads and merges; a result must not. Nor may a
+ * result carry a stored value's payload: a signalling NaN with payload 0x1001
+ * quiets into TSDB_NULL_F64_BITS. Stored values keep their bits; only results
+ * (and granule sums, which are results kept on disk) are canonical. */
+#define CANON_NAN_BITS 0x7ff8000000000000ull
+static inline double nan_canonical(void)
+{
+    uint64_t b = CANON_NAN_BITS;
+    double d;
+    memcpy(&d, &b, 8);
+    return d;
+}
+static inline double canon_nan(double x) { return x == x ? x : nan_canonical(); }
 
 static inline void agg_init(agg_state *a, int type)
 {
@@ -269,7 +281,7 @@ void granule_stats(int type, const void *v, size_t n, struct granule *g);
 void agg_from_granule(int type, const struct granule *g, agg_state *a);
 static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
 {
-    const double nan = __builtin_nan("");
+    const double nan = nan_canonical();
     b->count = a->count;
     b->sum = 0;
     b->min = b->max = nan;
@@ -285,8 +297,8 @@ static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
         b->max = (double)a->imax;
         return;
     }
-    b->sum = a->sum;
-    if (a->min <= a->max) { /* else only NaN values */
+    b->sum = canon_nan(a->sum);
+    if (a->min <= a->max) { /* else only NaN values; min and max skip NaNs, so neither is one here */
         b->min = a->min;
         b->max = a->max;
     }
@@ -347,8 +359,21 @@ typedef struct granule {
     union { double fmax; int64_t imax; };
     union { double fsum; uint64_t isum_lo; };
     int64_t isum_hi; /* integer sums are 128 bits */
+    /* Time-weighted statistics (twa.c): the granule's first and last values (as
+     * doubles; GT_FIRST_NULL/GT_LAST_NULL when null), and over the segments
+     * between its consecutive rows the STEP and LINEAR areas (value x ms) and
+     * the time they cover; tw_gap is the longest of those segments (saturated),
+     * so a query with a staleness limit knows whether the areas apply. */
+    double tw_first, tw_last;
+    double tw_step, tw_lin;
+    uint64_t tw_step_ms, tw_lin_ms;
+    uint32_t tw_gap;
+    uint32_t tw_flags;
 } granule;
-_Static_assert(sizeof(granule) == 80, "granule must be 80 bytes");
+_Static_assert(sizeof(granule) == 136, "granule must be 136 bytes");
+enum { GT_FIRST_NULL = 1, GT_LAST_NULL = 2 };
+/* The time-weighted statistics of a granule's rows (n >= 1, ts strictly increasing). */
+void granule_twa(int type, const int64_t *ts, const void *v, size_t n, struct granule *g);
 
 typedef struct part_header {
     char magic[8];
@@ -686,6 +711,8 @@ struct eng {
     pthread_t flusher;
 
     atomic_uint_fast64_t st_merges, st_merged_rows, st_passthrough;
+    atomic_uint_fast64_t st_wal_bytes, st_wal_syncs; /* tsdb_get_volume_stats; bumped by the WAL writer role */
+    atomic_int_fast64_t follow_ok_ms; /* follower: mono_ms() of the last refresh that succeeded */
     atomic_uint_fast64_t st_broken_parts, st_follow_errors;
 
     /* writer: MANIFEST for followers, delayed deletion of replaced parts */
@@ -790,18 +817,69 @@ int eng_commit(eng *db);
 int eng_flush(eng *db);
 extern size_t desc_window_rows;
 /* Raw rows in time order; v as slots of the series' type. */
+/* ---- query internals shared with twa.c (query.c) ---- */
+/* A part can have several entries: granules overlapped by a newer tombstone are decoded, filtered and moved to
+ * `mem`, so parts[i] answers only for granules [gi[i], gj[i]) and those hold no deleted or expired row. Readers
+ * use gi/gj, never part_find on parts[i]: only then do statistics stay exact. */
+typedef struct snapshot {
+    part **parts;
+    uint32_t *gi, *gj; /* per entry: the granules of the series in the range */
+    size_t np;
+    mem_run *mem; /* rows of the series from memtables, oldest memtable first, and from parts with deletes */
+    uint64_t *mprio; /* per run: its priority on equal timestamps */
+    size_t nmem;
+    int64_t start, end; /* the range gi/gj were found for */
+} snapshot;
+int snapshot_take(struct eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s);
+void snapshot_release(snapshot *s);
+uint64_t mem_prio(const snapshot *sn, size_t i);
+/* Granules [*gi, *gj) of series s that may hold rows in [start, end). */
+void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj);
+typedef struct src {
+    const part *p;   /* NULL for a memtable run */
+    uint32_t gi, gj; /* granules still to load */
+    uint64_t prio;   /* newer sources win on equal timestamps */
+    bool loaded;
+    size_t pos, n;   /* rows [pos, n) of ts/v are in range and unread */
+    int64_t *ts;
+    uint8_t *v;      /* slots of `type` */
+    int type;
+    size_t w;        /* slot width */
+    bool own;        /* ts/v are decode buffers owned by the cursor */
+} src;
+void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type);
+void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type);
+void src_free(src *c);
 typedef int (*slot_fn)(void *ctx, const int64_t *ts, const void *v, size_t n);
+/* Emits the union of the sources in time order, newest row per timestamp. */
+int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx);
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
                      slot_fn fn, void *ctx);
+/* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID */
+int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, slot_fn fn, void *ctx);
+extern size_t lttb_buffer_bytes; /* tests make it small to exercise the two-pass way */
 int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
                   size_t *nout);
 int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
                     size_t *nout);
 int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g);
 int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n);
+int64_t bucketer_key(const bucketer *bk, int64_t ts);    /* the bucket of ts */
+int64_t bucketer_start(const bucketer *bk, int64_t key); /* the first instant of bucket key */
+/* Time-weighted averages (twa.c). */
+int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                  const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
 int eng_get_stats(eng *db, tsdb_stats *st);
+int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs);
+
+static inline int64_t eng_mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
 /* retention.c */

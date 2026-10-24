@@ -50,7 +50,7 @@ endif
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.so $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench
+all: $(LIB) $(B)/libtsdb.so $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench $(B)/twa-bench
 
 $(B)/%.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -91,7 +91,7 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
+test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb
 	./$(B)/test_tsdb
 	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
@@ -100,6 +100,9 @@ test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/t
 	./$(B)/test_delete
 	./$(B)/test_levels
 	./$(B)/test_group
+	./$(B)/test_lttb
+	B=$(B) tests/test_cli_lttb.sh
+	./$(B)/test_twa
 	./$(B)/test_follow
 	./$(B)/test_volumes
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
@@ -153,8 +156,8 @@ DIST_ARCH  ?= -march=x86-64-v2 -mtune=generic
 GLIBC_MAX  ?= 2.34
 DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tools/glibc-compat.h" \
               CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
-DIST_BINS   = tsdbd tsdb codec-bench type-bench tsdb-bench insert-bench tsdbc-bench scale-bench
-DIST_TESTS  = test_tsdb test_types test_levels test_group test_follow test_volumes test_server test_stability
+DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench tsdb-bench insert-bench tsdbc-bench scale-bench
+DIST_TESTS  = test_tsdb test_types test_levels test_group test_lttb test_twa test_follow test_volumes test_server test_stability
 DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS))
 
 DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
@@ -250,8 +253,11 @@ $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/tsdbd: server/tsdbd.c include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -o $@ $< $(B)/tsdb_pack.o $(LIB) $(LDLIBS) $(URING_LIBS)
+# The version shown by tsdb_build_info; part of the tsdbd.o flags, so a change rebuilds only that.
+TSDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
+
+$(B)/tsdbd: server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c $(B)/tsdb_pack.o $(LIB) $(LDLIBS) $(URING_LIBS)
 
 CLIB := $(B)/libtsdbclient.a
 
@@ -270,14 +276,17 @@ $(B)/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/
 $(B)/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+$(B)/twa-bench: tools/twa-bench.c tools/common.h include/tsdb.h $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/scale-bench: tools/scale-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
 $(B)/test_stability: tests/test_stability.c $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
-$(B)/test_server: tests/test_server.c tests/samekeys.h $(CLIB) $(LIB)
-	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+$(B)/test_server: tests/test_server.c tests/samekeys.h tests/lttb_ref.h server/metrics.c server/metrics.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/metrics.c $(CLIB) $(LIB) $(LDLIBS)
 
 $(B)/test_follow: tests/test_follow.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -301,7 +310,13 @@ $(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels
 $(B)/test_shared: tests/test_shared.c $(B)/libtsdb.so
 	$(CC) $(CFLAGS) -o $@ $< -L$(B) -ltsdb -ldl
 
+$(B)/test_lttb: tests/test_lttb.c tests/lttb_ref.h src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/test_group: tests/test_group.c $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+$(B)/test_twa: tests/test_twa.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)

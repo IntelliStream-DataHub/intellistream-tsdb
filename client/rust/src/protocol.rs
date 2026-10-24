@@ -14,7 +14,7 @@
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 

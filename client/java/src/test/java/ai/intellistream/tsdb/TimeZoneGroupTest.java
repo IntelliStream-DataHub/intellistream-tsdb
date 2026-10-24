@@ -52,7 +52,7 @@ class TimeZoneGroupTest {
             Map<Spec, List<Bucket>> java = new LinkedHashMap<>();
             List<Spec> specs = new ArrayList<>();
             try (TsdbServer s = TsdbServer.start(db); TsdbClient c = s.client()) {
-                assertEquals(4, c.hello());
+                assertEquals(Protocol.VERSION, c.hello());
                 /* every 10 minutes through 2024 and a bit, and random rows over 50 years; int64 sums are exact */
                 int tenMin = c.seriesCreate("ten.min", ValueType.INT64);
                 long t0 = utc(2023, 12, 25, 0);

@@ -67,6 +67,8 @@ cgroup, so `nice` does not keep your work out of its way.
   the same for embedded use (`tsdb_query_group_local`).
 - `server/tsdbd.c`: the server, one event loop on io_uring or epoll (`--io`; epoll where io_uring
   is disabled, as on RHEL/AlmaLinux 10); `make test` and `make jepsen` run the server tests on both.
+  `server/metrics.c`: the `--metrics-port` thread (Prometheus text format, own poll loop, counters
+  the server bumps through small hooks); `tsdb_get_volume_stats` feeds it. `docs/metrics.md` lists the metrics.
   `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
   A protocol change has to reach all four; `make test-clients` runs their tests.
@@ -148,8 +150,8 @@ cgroup, so `nice` does not keep your work out of its way.
   innermost.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- The on-disk format is version 3 (`FORMAT_VERSION`): 80-byte granule entries
-  with typed statistics, a checksum over each part's header, index and footer,
+- The on-disk format is version 4 (`FORMAT_VERSION`): 136-byte granule entries
+  with typed and time-weighted statistics, a checksum over each part's header, index and footer,
   checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Before
   the first release, older formats need not stay readable (the user decided
   this on 2026-10-24): a layout change bumps `FORMAT_VERSION`, and a database of

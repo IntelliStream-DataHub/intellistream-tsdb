@@ -458,6 +458,7 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     }
     if (!ro && pthread_create(&db->flusher, NULL, flusher_main, db) == 0)
         db->has_flusher = true;
+    atomic_store(&db->follow_ok_ms, eng_mono_ms());
     if (db->opt.follow && pthread_create(&db->follower, NULL, follower_main, db) == 0)
         db->has_follower = true;
     *out = db;
@@ -730,12 +731,18 @@ int eng_drop_before(eng *db, int64_t ts)
     return manifest_publish(db);
 }
 
-int eng_get_stats(eng *db, tsdb_stats *st)
+/* The numbers of tsdb_stats in one pass over the parts; the volume statistics ask for the granule
+ * and merging counts in the same pass (granules and rows then come from one snapshot). */
+static void stats_walk(eng *db, tsdb_stats *st, uint64_t *granules, uint64_t *merging)
 {
     memset(st, 0, sizeof *st);
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < db->nparts; i++) {
         part *p = db->parts[i];
+        if (granules)
+            *granules += p->ng;
+        if (merging)
+            *merging += p->merging;
         st->parts++;
         st->rows += p->rows;
         st->bytes += p->map_len;
@@ -756,6 +763,35 @@ int eng_get_stats(eng *db, tsdb_stats *st)
     st->passthrough_granules = atomic_load(&db->st_passthrough);
     st->broken_parts = atomic_load(&db->st_broken_parts);
     st->follow_errors = atomic_load(&db->st_follow_errors);
+}
+
+int eng_get_stats(eng *db, tsdb_stats *st)
+{
+    stats_walk(db, st, NULL, NULL);
+    return 0;
+}
+
+int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs)
+{
+    memset(vs, 0, sizeof *vs);
+    tsdb_stats st;
+    stats_walk(db, &st, &vs->granules, &vs->merging_parts);
+    vs->parts = st.parts;
+    vs->partitions = st.partitions;
+    vs->rows = st.rows;
+    vs->bytes = st.bytes;
+    vs->memtable_rows = st.memtable_rows;
+    vs->merges = st.merges;
+    vs->merged_rows = st.merged_rows;
+    vs->broken_parts = st.broken_parts;
+    vs->follow_errors = st.follow_errors;
+    vs->wal_bytes = atomic_load_explicit(&db->st_wal_bytes, memory_order_relaxed);
+    vs->wal_syncs = atomic_load_explicit(&db->st_wal_syncs, memory_order_relaxed);
+    vs->failed = atomic_load(&db->failed) ? 1 : 0;
+    if (db->opt.follow) {
+        int64_t lag = eng_mono_ms() - atomic_load(&db->follow_ok_ms);
+        vs->follow_refresh_age_ms = lag > 0 ? lag : 0;
+    }
     return 0;
 }
 

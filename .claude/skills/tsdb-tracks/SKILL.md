@@ -36,7 +36,7 @@ calls). Read AGENTS.md first: its invariants and rules are the contract every tr
 | anything in src/, server/, client/*.c | `make test`; `make asan` in the worktree (it runs `make clean`); `make tsan` |
 | how data reaches the disk (writes, fsync, renames, recovery, merges, WAL) | the above + `make jepsen` |
 | wire protocol | the above + `make test-clients` (all four clients change in the same commit) |
-| clients, connectors | their own suites (`make test-rust`, `test-python`, `test-java`, `mvn test`) |
+| anything under client/ or connectors/ (code, tests, docstrings, stubs, constants) | that client's own suite (`make test-rust`, `test-python`, `test-java`, `mvn test` in connectors/pulsar); a protocol version bump runs `make test-clients` |
 | portability | `make dist`, `make dist-check-sandybridge`, `make test-almalinux10` |
 | docs | every claim checked against the code or a primary source; runnable snippets run |
 

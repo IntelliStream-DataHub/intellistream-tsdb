@@ -2,7 +2,7 @@ package ai.intellistream.tsdb;
 
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */
 final class Protocol {
-    static final int VERSION = 4;
+    static final int VERSION = 5;
     static final int DEFAULT_PORT = 7070;
     static final int MAX_FRAME = 256 << 20;
     static final int HEADER = 9;           /* u32 length, u32 id, u8 op */

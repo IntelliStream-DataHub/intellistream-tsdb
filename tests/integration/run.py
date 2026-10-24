@@ -268,46 +268,40 @@ class Fails:
         self.notes.append(msg)
 
 
-def drop_nan_sums(text):
-    """Bucket lines with every NaN in sum, min and max reduced to "nan". A sum of NaNs has the payload of whichever
-    NaN was added first, which depends on the order of the additions (threads, memtable, parts, merged parts), so
-    it is not the same twice; a NaN is a NaN. Raw lines are never touched."""
-    out = []
-    for ln in text.split("\n"):
-        f = ln.split("\t")
-        if len(f) == 8 and len(f[2]) == 16:
-            for k in (2, 3, 4):
-                x = int(f[k], 16)
-                if (x >> 52) & 0x7FF == 0x7FF and x & ((1 << 52) - 1):
-                    f[k] = "nan"
-            ln = "\t".join(f)
-        out.append(ln)
-    return "\n".join(out)
+def is_nan64(hexbits):
+    x = int(hexbits, 16)
+    return (x >> 52) & 0x7FF == 0x7FF and x & ((1 << 52) - 1) != 0
+
+
+def sum_order_free(lo, hi):
+    """Whether a float bucket with this min and max (hex doubles) has a NaN sum whatever the order of additions."""
+    return (is_nan64(lo) and is_nan64(hi)) or (int(lo, 16) == 0xFFF0000000000000 and int(hi, 16) == 0x7FF0000000000000)
 
 
 def drop_float_sums(text, types):
     """Bucket lines of float series without their sum: the same rows added in another order (memtable, parts,
     merged parts, and tsdbd merges in the background while the clients read) round differently in the last bits.
-    The model checks the sums to 1e-9 instead. A min or max of -0.0 and +0.0 is whichever was met first: both
-    read as +0.0."""
+    The model checks the sums to 1e-9 instead, and NaN as 0x7ff8000000000000 exactly. Whether a sum is NaN at all
+    can depend on the order too: DBL_MAX + DBL_MAX - DBL_MAX - DBL_MAX is +inf in one order and NaN (inf - inf) in
+    another. The sum stays only where it is NaN in every order, which min and max show: the bucket holds only NaNs
+    (both NaN) or both infinities (-inf and +inf); then it is the one quiet NaN and compared bit for bit. A min or
+    max of -0.0 and +0.0 is whichever was met first: both read as +0.0."""
     out = []
     for blk, lines in gen.parse_blocks(text):
         ty = types.get(blk.split(" ")[1])
         if blk.split(" ")[0] in ("agg", "grp", "bnd") and ty in ("float32", "float64"):
-            lines = [("\t".join(f[:2] + ["*"] + [("0" * 16 if int(x, 16) << 1 & (2**64 - 1) == 0 else x) for x in f[3:5]]
+            lines = [("\t".join(f[:2] + [f[2] if sum_order_free(f[3], f[4]) else "*"] + [("0" * 16 if int(x, 16) << 1 & (2**64 - 1) == 0 else x) for x in f[3:5]]
                               + f[5:]) if len(f := ln.split("\t")) == 8 else ln) for ln in lines]
         out.append("## " + blk)
         out.extend(lines)
     return "\n".join(out) + "\n"
 
 
-def diff_outputs(a_name, a, b_name, b, limit=3, nan_sums=True, types=None):
+def diff_outputs(a_name, a, b_name, b, limit=3, types=None):
     """Differences between two canonical outputs, as strings (the first few queries). types: series -> type; with
     it, the sums of float series are left out (answers given by different layouts of the same rows)."""
     if types:
         a, b = drop_float_sums(a, types), drop_float_sums(b, types)
-    if nan_sums:
-        a, b = drop_nan_sums(a), drop_nan_sums(b)
     if a == b:
         return []
     A, B = gen.parse_blocks(a), gen.parse_blocks(b)
@@ -513,8 +507,6 @@ def cli_check(ctx, F, dbdir, model, queries, text, d):
                         if len(f := ln.split("\t")) == 6 and f[1].isdigit() else ln) for ln in got]
                 want = [("\t".join(f[:2] + ["*"] + [x.replace("-0", "0") if x == "-0" else x for x in f[3:5]] + ["*"])
                          if len(f := ln.split("\t")) == 6 and f[1].isdigit() else ln) for ln in want or []] if want else want
-            if q.split(" ")[0] != "raw" and want and got:  # the sign of a NaN sum is as unspecified as its payload
-                want, got = [x.replace("-nan", "nan") for x in want], [x.replace("-nan", "nan") for x in got]
             if want != got:
                 bad += 1
                 if bad <= 5:

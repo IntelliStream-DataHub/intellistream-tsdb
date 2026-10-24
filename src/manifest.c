@@ -36,12 +36,7 @@
 
 static int64_t now_s(void) { return (int64_t)time(NULL); }
 
-static int64_t mono_ms(void)
-{
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
-}
+static int64_t mono_ms(void) { return eng_mono_ms(); }
 
 /* How long a follower lets something look damaged before it reports it: a
  * writer's appends and rewrites can reach it out of order and torn (NFS). */
@@ -487,6 +482,8 @@ int follow_refresh(eng *db)
     pthread_mutex_unlock(&db->refresh_lock);
     if (rc)
         atomic_fetch_add(&db->st_follow_errors, 1);
+    else
+        atomic_store(&db->follow_ok_ms, eng_mono_ms());
     return rc;
 }
 

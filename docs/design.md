@@ -34,14 +34,32 @@ start, the tests and the benchmark results.
 - Float sums are not bit-reproducible. A float sum depends on the order of the
   additions, and that order follows how parts were merged and how a query was
   split over threads, so the same rows can give sums that differ in the last
-  bits after a background merge (a sum that hits NaN can also come back with a
-  different NaN bit pattern). ClickHouse, PostgreSQL and DuckDB behave the same.
+  bits after a background merge, and where the running sum overflows a double
+  (rows near `DBL_MAX`), +inf in one order and NaN (inf - inf) in another.
+  ClickHouse, PostgreSQL and DuckDB behave the same.
   min, max and count are exact. Where reproducible sums matter, store the values
   as int64 in fixed point (21.3 degC as 21300 milli-degrees): sums are added in
   a 128-bit integer inside (and kept that way in each granule's statistics), so
   `isum` is exact whatever the order, as long as the total fits in an int64
   (about 9.2e18; beyond that it is clamped). int64 series compress as well as
   the fixed-point floats.
+- One NaN for every NaN result. A sum that hits NaN, and a min or max of a
+  bucket that holds only NaNs, is the quiet NaN `0x7ff8000000000000` (in
+  float32, as in the server's version 1 rows: `0x7fc00000`), from every query,
+  path (memtable, granule statistics, merged parts, threads) and client. An
+  addition of NaNs keeps the payload of whichever NaN came first, and that
+  order varies; PostgreSQL and ClickHouse do not canonicalise either, but print
+  every NaN as `NaN`, while tsdb's clients receive the bits. A NaN result is
+  never one of the null patterns (a signalling NaN with payload `0x1001`
+  quiets into the float64 null), and granule statistics store their sums
+  canonical too. Stored values are untouched: a raw query returns the NaN a
+  sensor wrote bit for bit.
+- All NaNs are equal. tsdb never compares stored values with each other (a
+  write replaces by key, not by value), and where results are compared (the
+  tests, the integration model) any NaN equals any other, as in PostgreSQL.
+  min and max differ from PostgreSQL on purpose: they skip NaNs and are NaN
+  only when a bucket has no other value, where PostgreSQL sorts NaN above
+  every number, so one sensor glitch would replace a bucket's max.
 - Buckets are fixed lengths aligned to the epoch, like `toStartOfInterval`,
   or calendar periods (day, ISO week, month, quarter, year) in UTC
   (`tsdb_query_group`), or buckets that begin at given instants
@@ -68,6 +86,161 @@ covered, as ClickHouse counts processed rows: a granule answered from its
 statistics counts its rows without reading them, which is how a scan can
 report billions of rows a second.
 
+## Downsampling: LTTB
+
+`tsdb_query_lttb` (and `QUERY_LTTB`, `tsdbc_query_lttb`, `tsdb DIR query S A B
+lttb N`) returns N of a range's points that keep the series' shape on a chart:
+Largest-Triangle-Three-Buckets (Sveinn Steinarsson, "Downsampling Time Series
+for Visual Representation", 2013). The points are real stored points with their
+exact values, in time order, so a chart of 1,000 points from a billion looks
+like the billion, spikes included, where per-bucket averages would flatten them.
+
+The algorithm, over the n points of the range:
+
+- The first and the last point are kept. Points 1 .. n-2 fall into N-2 buckets
+  of nearly equal count: bucket b starts at `floor(b * every) + 1` with
+  `every = (n-2)/(N-2)` in doubles, exactly as the paper's code, ClickHouse's
+  `largestTriangleThreeBuckets` and the TimescaleDB toolkit's `lttb()` bound
+  them, so that the same points come out. Exact integer division
+  (`b(n-2)/(N-2)`) would be the cleaner rule, but where b·every rounds just
+  below an integer it starts the bucket one point later: n = 17 with N = 13
+  already differs, and so do about 5% of random (n, N) pairs up to n = 1e8,
+  each such case changing the chosen points. Past n = 2^53 the doubles lose
+  whole points of a boundary, as they do in those systems.
+- From each bucket, the point that forms the largest triangle with the point
+  kept from the previous bucket and the mean (time, value) of the next bucket
+  is kept; for the last bucket, the "next bucket" is the rest of the points
+  from `floor((N-2) * every) + 1`: the last point, or the last two where that
+  product rounds below n-2 (as in the paper's code). The area
+  is the paper's `|(ax - cx)(y - ay) - (ax - x)(cy - ay)| / 2`. Of equal areas
+  the first point wins; if no area compares (an overflow to NaN, only with
+  values near the float64 limit), the bucket's first point.
+- n <= N returns every point. N < 3 is `TSDB_ERR_INVALID`: one or two points
+  would only be the ends, which a caller can ask for directly, and a silent
+  "first and last" for a chart of 2 pixels hides a mistake.
+- Points are the known, finite values. Nulls, NaN and infinities are skipped:
+  they have no place on a chart, and one NaN would make every area of the
+  previous bucket NaN through the mean. State series are `TSDB_ERR_INVALID`
+  (codes have no order to draw); bools are 0 and 1; int64 values are rounded
+  to doubles for the area only.
+- x is milliseconds since the range's first point, as a double: epoch
+  milliseconds (1.7e12) squared in the area would lose the low bits that
+  separate neighbouring points.
+- Where other systems can still choose differently: they skip no NaN (a NaN
+  area never wins there, and poisons the next bucket's mean), and they measure
+  x from the epoch (ClickHouse) or in their own unit, which rounds the areas
+  differently; only areas equal to the last bits can then pick another point.
+
+How it reads (src/query.c, one snapshot for every pass, so concurrent inserts,
+flushes and merges cannot tear the result, and followers work as for any
+query):
+
+1. **Count.** The bucket boundaries need n. The granules of the range are
+   grouped like the aggregates' clusters; a granule that lies inside the range,
+   overlaps no other source (so holds no replaced row) and has a finite float
+   sum (a NaN or an infinity would make it NaN or infinite) counts
+   `count - nulls` from its index entry without decoding. The rest (the range's
+   edges, overlapping sources through the deduplicating merge, granules with
+   NaN, memtable rows) are streamed and counted.
+2. **Choose.** Choosing in bucket b needs the mean of bucket b+1, known only
+   once that bucket has been read. While two buckets fit in 32 MiB (16 bytes a
+   point: timestamp and value; buckets up to 1M points), one pass keeps the
+   points of the bucket being chosen from and of the one being read, and
+   chooses when the next bucket ends. Larger buckets (a billion points into a
+   few hundred) take two passes instead: the means of every bucket first
+   (O(N) memory), then the choice while streaming again. Both add the
+   coordinates in time order from zero, so they produce the same means and the
+   same points; `test_lttb` runs every case both ways.
+
+Cost: one decode of the range (two for huge buckets) plus the count, which
+decodes nothing for the granules alone in their span: on 10M points, about
+two to three times a raw read of the same range. Memory: up to 32 MiB of
+buffered buckets per running query (so on a server, times its query workers),
+or O(N) means; plus, as for the aggregates, one 32-byte item per granule of the
+range and per memtable run for the count (a series of 1e10 points in
+8192-row granules: 1.2M items, about 39 MB). The
+query statistics describe one read of the range, as for a raw query, with the
+points returned as `result_rows`; the count and the means pass are not added.
+
+Tests: `tests/test_lttb.c` checks the engine point for point against a
+straightforward array implementation (`tests/lttb_ref.h`) over what
+`tsdb_query_values` returns: random walks, steps, spikes, constants, monotonic
+series, NaN and infinities, values near the float64 limit, irregular times,
+nulls, every numeric type, thresholds 3, 4, n-1, n, n+1 and beyond, ranges
+that cut granules; with the data in memtables, in overlapping parts with
+corrections, merged, and through a follower. `test_server` does the same over
+the network.
+
+## Time-weighted averages
+
+Sensors that report irregularly or only when their value changes make a plain
+average wrong: a value that held for an hour counts as much as one that held
+for a second. `tsdb_query_twa` (and `_group`, `_bounds`, `QUERY_TWA` on the
+wire, `twa` in the command line) weights each value by how long it held. The
+contract is in `include/tsdb.h`; in short, following OSIsoft PI and
+TimescaleDB's `time_weight` where they agree:
+
+- Consecutive readings of a series bound a segment `[t_i, t_i+1)`. STEP
+  (last observation carried forward) holds `v_i` over it; LINEAR runs a
+  straight line from `v_i` to `v_i+1` (trapezoids).
+- A null holds nothing: under STEP it ends the previous value; under LINEAR a
+  segment with a null at either end covers nothing. With `max_gap_ms`, a
+  segment longer than that covers nothing (the value is stale, and LINEAR does
+  not interpolate across an outage). The last reading holds nothing: it waits
+  for the next one, never runs up to "now".
+- Segments are cut exactly at bucket edges and at the range's start and end
+  (LINEAR interpolates the value there). The value in force at a bucket's
+  start comes from the last reading before it, however long ago (within
+  `max_gap_ms`), so a bucket with no reading of its own still has an average.
+  ClickHouse has no time-weighted average; the usual SQL (window functions and
+  `avgWeighted`) loses exactly this carried-in value.
+- A bucket reports the area (value x ms), the covered time and their
+  quotient, plus the count of readings in it. Areas and covered times add, so
+  buckets combine into longer averages. NaN propagates (the canonical quiet
+  NaN); bool series give the fraction of time they were true (run time); state
+  series are refused.
+
+**The fast path.** Each granule's index entry carries what makes whole
+granules combinable without decoding them: the first and last value (and
+whether they are null), the STEP and LINEAR areas of the segments inside the
+granule with the durations they cover (integer ms), and the longest gap
+between its rows (`granule_twa` in `src/twa.c`, called by the part writer
+with the other statistics for inserts, memtable flushes and merges that
+re-encode; a merge that copies a granule's bytes copies its entry). A query lists the granules of every source
+(parts and memtables) around the range in time order. A granule that lies
+inside the range and inside one bucket, whose longest gap is within
+`max_gap_ms`, and that no other source overlaps contributes its stored areas;
+the segment joining it to its neighbour comes from its first and last value
+and the neighbour's. Only granules that a bucket edge or the range cuts, and
+time spans where sources overlap (corrections: last write wins, merged
+exactly as the raw query does), are decoded, in parallel on the query pool.
+`tsdb_twa_opts.no_stats` turns the fast path off for benchmarks
+(`build/twa-bench`).
+
+Outside the range only two readings matter: the latest before it and the
+earliest after it. Of the granules outside the range a query keeps those that
+hold them (several only where sources tie on that time, merged by last write
+wins), and takes their first and last values from the index entry without
+decoding. So a query without a staleness limit, whose snapshot spans the whole
+history, costs the same for a series of ten years in daily partitions as for
+one of a day: otherwise every part would add a decoded granule.
+
+The fast path pays off for buckets much wider than a granule. A granule of
+8192 on-change readings can span hours; hourly buckets then cut nearly every
+granule and run at decode speed (about 1.4 G rows a second, one series of 1 G
+rows), while daily buckets take 82% of the granules from statistics and run
+five times faster (`build/twa-bench`).
+
+A TWA bucket needs no reading of its own (a segment across it is enough), so
+two readings far apart could ask for a bucket per millisecond between them. A
+request gets at most 4M buckets (`TSDB_ERR_TOO_MANY_BUCKETS` beyond), which
+fits one reply frame and bounds its memory to some 400 MB.
+
+The statistics cost 56 bytes per granule entry (136 instead of 80 bytes): 0.007
+bytes a row in full 8192-row granules, and 0.013 bytes a row measured on
+on-change data with partly filled granules (1.189 to 1.202 bytes a row, +1.1%).
+They made the on-disk format version 4.
+
 ## Storage
 
 A database is a directory:
@@ -93,13 +266,16 @@ one insert (or produced by one merge), sorted by `(series, ts)`:
 header | ts block, value block, ts block, value block, ... | granule index | footer
 ```
 
-A granule is up to 8192 rows of one series. Its 80-byte index entry holds
+A granule is up to 8192 rows of one series. Its 136-byte index entry holds
 the series, min/max timestamp, row count, null count, the sum, min and max of
 the known values (doubles for floats; exact for integers: int64 min/max and a
-128-bit sum), block offsets and a checksum of the granule's blocks. The
+128-bit sum), block offsets and a checksum of the granule's blocks, and the
+time-weighted statistics (first and last value, STEP and LINEAR areas, the
+time they cover and the longest gap between rows: see "Time-weighted
+averages"). The
 header, the index and the footer (WAL segment, row count, time range) are
 covered by one more checksum, checked when the part is opened. The on-disk
-format is version 3; a database of another version is refused at open
+format is version 4; a database of another version is refused at open
 (there is no release yet, so no older format is read). The index is the sparse primary index of MergeTree: finding a series'
 rows in a time range is a binary search, and aggregates over whole granules
 are answered from the stored statistics without decompressing anything.
@@ -685,6 +861,7 @@ build/tsdb /data/sensors import < rows.csv          # series,time,value (null or
 build/tsdb /data/sensors insert pump7.flow < p.csv  # time,value
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2024-01-02 avg 5m
 build/tsdb /data/sensors query pump7.flow now-1h now raw
+build/tsdb /data/sensors query pump7.temp 2024-01-01 2024-02-01 twa 1d --tz Europe/Oslo --max-gap 10m
 build/tsdb /data/sensors stats
 build/tsdb /data/sensors parts
 build/tsdb /data/sensors optimize

@@ -227,15 +227,19 @@ void tsdb_free(void *p);
 
 /* Aggregates skip nulls: count is the number of known values, and a bucket
  * with only nulls is returned with count 0 (buckets without rows are not).
- * Floats: NaN values are ignored by min/max (NaN if there are none) but
- * propagate into sum. int64 and bool (false 0, true 1): sum, min and max are
+ * Floats: NaN values are ignored by min/max (NaN if there are none; unlike
+ * PostgreSQL, where NaN is greater than every number) but propagate into sum.
+ * Every NaN result is the one quiet NaN 0x7ff8000000000000, whatever the
+ * payloads of the NaNs in the data (a raw query returns those bit for bit);
+ * all NaNs are equal. int64 and bool (false 0, true 1): sum, min and max are
  * also exact in isum, imin and imax (isum is the exact sum, clamped to the
  * int64 range when it does not fit, whatever the order of the rows).
  * State: only count is meaningful.
  * Float sums are not bit-reproducible: rows are added in an order that depends
  * on how parts were merged and how the query was split over threads, so the
- * same data can give sums that differ in the last bits (and a NaN sum's bit
- * pattern can differ), as in ClickHouse. min, max and count are exact. Where
+ * same data can give sums that differ in the last bits, as in ClickHouse; where
+ * the running sum overflows (rows near DBL_MAX), one order gives +inf and
+ * another NaN. min, max and count are exact. Where
  * reproducible sums matter, store the values as int64 in fixed point (21.3 degC
  * as 21300 milli-degrees): isum is then exact. */
 typedef struct tsdb_bucket {
@@ -277,6 +281,31 @@ typedef int (*tsdb_values_fn)(void *ctx, const int64_t *ts, const tsdb_values *v
 int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_values_fn fn, void *ctx);
 
+/* Downsampling for charts: Largest-Triangle-Three-Buckets (Steinarsson 2013)
+ * picks `threshold` of the points in [start, end) that keep the series' visual
+ * shape, and streams them in time order with their stored values, exactly
+ * (bools as bytes, valid always NULL: no nulls are returned).
+ *  - Points are the known, finite values: nulls, NaN and infinities are
+ *    skipped (they have no place on a chart and would poison the means).
+ *  - The first and the last point are always kept; points 1 .. n-2 fall into
+ *    threshold - 2 buckets, bucket b starting at floor(b * every) + 1 with
+ *    every = (n-2)/(threshold-2) in doubles, as in the paper's code (and
+ *    ClickHouse's and the TimescaleDB toolkit's). From each bucket the point
+ *    with the largest triangle formed with the point kept from the previous
+ *    bucket and the mean (time, value) of the next bucket is kept (the bucket
+ *    after the last is the rest: the last point, or the last two where
+ *    rounding ends the last bucket early); of equal areas the first wins,
+ *    and when no area compares (overflow to NaN) the bucket's first point.
+ *  - Area coordinates: x is milliseconds since the first point as a double, y
+ *    the value as a double (int64 rounded, bool 0 or 1).
+ *  - n <= threshold returns every point. threshold < 3 or a state series:
+ *    TSDB_ERR_INVALID.
+ * It reads one snapshot, so concurrent writes and merges do not tear the
+ * result. Query statistics describe one read of the range (the counting pass,
+ * and for very large buckets a second pass for the means, are not counted). */
+int tsdb_query_lttb(tsdb *db, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+                    void *ctx);
+
 /* Calendar grouping, in UTC: `count` units per bucket.
  *  - TSDB_SECOND, _MINUTE, _HOUR: fixed lengths, aligned to multiples of their
  *    length since the epoch.
@@ -315,6 +344,69 @@ int tsdb_query_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, con
 int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
+/* ---- time-weighted averages ----
+ * For sensors that report irregularly or only on change, a plain average
+ * weights every reading the same; a time-weighted average weights each value
+ * by how long it held. Readings are joined by segments: reading i (at t_i)
+ * and the next reading of the series (at t_{i+1}) bound the segment
+ * [t_i, t_{i+1}).
+ *  - TSDB_TWA_STEP (last observation carried forward): v_i holds over the
+ *    segment. A null reading holds nothing: a null ends the previous value.
+ *  - TSDB_TWA_LINEAR: the value runs on a straight line from v_i to v_{i+1}
+ *    (trapezoids); a segment with a null at either end covers nothing.
+ *  - max_gap_ms > 0: a segment longer than max_gap_ms covers nothing (the value
+ *    is stale; LINEAR does not interpolate across it). 0: no limit.
+ *  - The last reading of a series has no segment: it holds until a later
+ *    reading arrives, never up to "now".
+ * A bucket [b0, b1) integrates every segment over its intersection with the
+ * bucket and with [start, end): segments are cut exactly at bucket edges and at
+ * start and end (LINEAR interpolates the value at the cut), and the value in
+ * force at b0 comes from the last reading before it, however long ago (within
+ * max_gap_ms), even before start. Readings after end only end segments.
+ *    area       = integral of value dt, in value x ms
+ *    covered_ms = time covered by segments
+ *    twa        = area / covered_ms (NaN when covered_ms is 0)
+ *    count      = non-null readings in the bucket and in [start, end)
+ * area and covered_ms add up across buckets: the average over several buckets is
+ * the sum of their areas over the sum of their covered_ms. A bucket is returned
+ * when covered_ms or count is not 0. Since a segment alone fills a bucket, a
+ * query may span at most 4M buckets between its first and last reading in range
+ * (TSDB_ERR_TOO_MANY_BUCKETS beyond).
+ * NaN propagates: a NaN value held for any time makes the area and twa NaN;
+ * infinities follow IEEE arithmetic, and a LINEAR segment with an infinite end
+ * is that infinity throughout (+inf to -inf: NaN), wherever buckets cut it. A NaN result is the canonical quiet NaN.
+ * Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:
+ * twa is the fraction of covered time that it was true); state series are
+ * TSDB_ERR_INVALID. Whole granules inside one bucket are answered from stored
+ * statistics without decoding (see docs/design.md). */
+typedef enum { TSDB_TWA_STEP = 0, TSDB_TWA_LINEAR = 1 } tsdb_twa_method;
+
+typedef struct tsdb_twa_opts {
+    tsdb_twa_method method;
+    int64_t max_gap_ms; /* 0: no staleness limit */
+    tsdb_order order;   /* of the buckets */
+    size_t limit;       /* 0: no limit */
+    int no_stats;       /* nonzero: decode every granule, never its statistics (benchmarks, checks) */
+} tsdb_twa_opts;
+
+typedef struct tsdb_twa_bucket {
+    int64_t start; /* bucket start; with interval 0 this is the query start */
+    double twa;
+    double area;
+    int64_t covered_ms;
+    uint64_t count;
+} tsdb_twa_bucket;
+
+/* interval_ms as in tsdb_query_agg (0: one bucket); opts NULL: STEP, no limit. Free with free(). */
+int tsdb_query_twa(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                   const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+/* UTC calendar groups as in tsdb_query_group (group NULL: one bucket). */
+int tsdb_query_twa_group(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                         const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+/* Client bounds as in tsdb_query_bounds: segments before bounds[0] do not count. */
+int tsdb_query_twa_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                          const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+
 /* ---- query statistics ----
  * What the calling thread's last query did, like ClickHouse's "Processed N
  * rows, M MB": rows it covered (decoded, answered from granule statistics, or
@@ -352,6 +444,21 @@ typedef struct tsdb_stats {
     uint64_t follow_errors; /* follower refreshes that failed (MANIFEST, a part or the WAL damaged, or EIO) */
 } tsdb_stats;
 int tsdb_get_stats(tsdb *db, tsdb_stats *st);
+
+/* One volume's numbers, for monitoring (tsdbd --metrics-port). Cheap: counters are atomics, the
+ * part list is walked once under its lock. TSDB_ERR_INVALID for a volume >= tsdb_volume_count. */
+typedef struct tsdb_volume_stats {
+    uint64_t parts, partitions, rows, bytes, granules;
+    uint64_t memtable_rows;
+    uint64_t merges, merged_rows;
+    uint64_t merging_parts;  /* parts a running merge is reading now (gauge) */
+    uint64_t wal_bytes;      /* written to the WAL since open, record headers included */
+    uint64_t wal_syncs;      /* WAL fdatasyncs since open (0 with fsync off) */
+    uint64_t broken_parts, follow_errors;
+    int64_t follow_refresh_age_ms;   /* follower: time since its last successful refresh; 0 for a writer */
+    int failed;              /* fail-stop state of this volume (see tsdb_failed) */
+} tsdb_volume_stats;
+int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
 
 /* Fail-stop. A storage error after which it is unknown what reached the disk
  * (a failed WAL write or fsync, a failed fsync of the directory after new

@@ -67,6 +67,15 @@ int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, con
 /* Buckets beginning at given UTC instants, as tsdb_query_bounds. */
 int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                        const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
+/* Time-weighted averages, as tsdb_query_twa, _twa_group and _twa_bounds (tsdb.h);
+ * a group in a time zone other than UTC is turned into bounds here. Needs a
+ * server of protocol version 5 (TSDB_ERR_INVALID from an older one). */
+int tsdbc_query_twa(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                    const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+int tsdbc_query_twa_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                          const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+int tsdbc_query_twa_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                           const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 
 /* Value types and nulls (protocol version 2), as tsdb_series_create,
  * tsdb_insert_values, tsdb_query_values and the state dictionary. */
@@ -80,6 +89,16 @@ int tsdbc_insert_series_values_async(tsdbc *c, uint32_t series, const int64_t *t
                                      size_t n);
 int tsdbc_query_values(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                        tsdb_values_fn fn, void *ctx);
+/* The server's protocol version from HELLO (asked once per connection; 1 for a
+ * server that predates HELLO), after waiting for pipelined inserts; 0 if the
+ * connection failed. */
+uint32_t tsdbc_server_version(tsdbc *c);
+/* LTTB downsampling, as tsdb_query_lttb (protocol version 5: against an older
+ * server it returns TSDB_ERR_INVALID without asking, as such a server would
+ * for the unknown op; the same code as a bad threshold, so a caller that must
+ * tell them apart checks tsdbc_server_version first). */
+int tsdbc_query_lttb(tsdbc *c, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+                     void *ctx);
 int tsdbc_state(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
 int tsdbc_state_lookup(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
 int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t len);
@@ -88,7 +107,7 @@ int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t
 int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st);
 
 /* Deletes, replaces and retention, as tsdb_delete_range, tsdb_replace_range, tsdb_set_retention and
- * tsdb_get_retention (protocol version 5; an older server answers TSDB_ERR_INVALID). A replace travels as
+ * tsdb_get_retention (protocol version 7; with an older server: TSDB_ERR_INVALID). A replace travels as
  * one frame, so n is limited by the frame size (about 256 MiB). */
 int tsdbc_delete_range(tsdbc *c, uint32_t series, int64_t start, int64_t end);
 int tsdbc_replace_range(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *ts,

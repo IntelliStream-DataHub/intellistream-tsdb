@@ -476,10 +476,14 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
         eng_fail(db, "WAL write", errno);
         return TSDB_ERR_IO;
     }
-    if (db->opt.fsync && fdatasync(fd) != 0) {
-        eng_fail(db, "WAL fdatasync", errno);
-        return TSDB_ERR_IO;
+    if (db->opt.fsync) {
+        if (fdatasync(fd) != 0) {
+            eng_fail(db, "WAL fdatasync", errno);
+            return TSDB_ERR_IO;
+        }
+        atomic_fetch_add_explicit(&db->st_wal_syncs, 1, memory_order_relaxed);
     }
+    atomic_fetch_add_explicit(&db->st_wal_bytes, len, memory_order_relaxed);
     *off += len;
     return 0;
 }
