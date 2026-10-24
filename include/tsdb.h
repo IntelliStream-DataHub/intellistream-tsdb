@@ -289,6 +289,20 @@ typedef struct tsdb_stats {
 } tsdb_stats;
 int tsdb_get_stats(tsdb *db, tsdb_stats *st);
 
+/* Fail-stop. A storage error after which it is unknown what reached the disk
+ * (a failed WAL write or fsync, a failed fsync of the directory after new
+ * parts were named, a failed MANIFEST, series dictionary or CATALOG write)
+ * puts the database, or the volume it happened in, in a failed state for good:
+ * after a failed fsync Linux may drop the unwritten pages and report success
+ * the next time, so retrying could acknowledge data that is not on disk.
+ * From then on every insert, append, series creation, commit, flush, optimize
+ * and drop of that volume returns TSDB_ERR_IO, including the writes that were
+ * waiting for the failed sync; queries keep working. Close and reopen to
+ * recover: every write that returned 0 is there.
+ * Returns 0 while healthy; TSDB_ERR_IO once failed, with what failed (the
+ * directory, the operation, the errno text) in msg. */
+int tsdb_failed(tsdb *db, char *msg, size_t len);
+
 typedef struct tsdb_part_info {
     const char *name;
     int64_t partition, min_ts, max_ts;

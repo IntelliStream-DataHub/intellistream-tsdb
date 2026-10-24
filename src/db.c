@@ -202,8 +202,7 @@ static int meta_write(eng *db)
     close(fd);
     if (!ok || renameat(db->dirfd, META_FILE ".tmp", db->dirfd, META_FILE) != 0)
         return TSDB_ERR_IO;
-    fsync(db->dirfd);
-    return 0;
+    return fsync(db->dirfd) == 0 ? 0 : TSDB_ERR_IO; /* at creation: the open fails */
 }
 
 static int meta_load_or_create(eng *db, bool read_only)
@@ -383,6 +382,7 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     pthread_mutex_init(&db->manifest_lock, NULL);
     pthread_mutex_init(&db->publish_lock, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
+    pthread_mutex_init(&db->fail_lock, NULL);
     pthread_cond_init(&db->wal_cv, NULL);
     pthread_cond_init(&db->merge_cv, NULL);
     pthread_cond_init(&db->merged_cv, NULL);
@@ -514,6 +514,7 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->manifest_lock);
     pthread_mutex_destroy(&db->publish_lock);
     pthread_mutex_destroy(&db->refresh_lock);
+    pthread_mutex_destroy(&db->fail_lock);
     pthread_cond_destroy(&db->wal_cv);
     pthread_cond_destroy(&db->merge_cv);
     pthread_cond_destroy(&db->merged_cv);
@@ -525,7 +526,52 @@ int eng_close(eng *db)
 
 /* ---------------------------------------------------------------- series */
 
-int eng_series(eng *db, const char *name, int type, uint32_t *id) { return series_get(&db->series, name, true, type, id); }
+/* ---------------------------------------------------------- fail-stop */
+
+void eng_fail(eng *db, const char *what, int err)
+{
+    pthread_mutex_lock(&db->fail_lock);
+    if (!atomic_load(&db->failed)) {
+        snprintf(db->fail_msg, sizeof db->fail_msg, "%s: %s failed: %s", db->dir, what, strerror(err ? err : EIO));
+        fprintf(stderr, "tsdb: %s; no more writes until the database is reopened\n", db->fail_msg);
+        atomic_store_explicit(&db->failed, true, memory_order_release);
+    }
+    pthread_mutex_unlock(&db->fail_lock);
+}
+
+int eng_failed_msg(eng *db, char *msg, size_t len)
+{
+    if (!eng_check(db))
+        return 0;
+    if (msg && len) {
+        pthread_mutex_lock(&db->fail_lock);
+        snprintf(msg, len, "%s", db->fail_msg);
+        pthread_mutex_unlock(&db->fail_lock);
+    }
+    return TSDB_ERR_IO;
+}
+
+/* A failed dictionary append may leave a torn record, which ends the file for
+ * the next open: nothing may be appended after it. After a failure, existing
+ * names are still found. */
+static int dict_get(eng *db, series_dict *d, const char *what, const char *name, bool create, int type,
+                    uint32_t *id)
+{
+    if (create && eng_check(db)) {
+        int rc = series_get(d, name, false, type, id);
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_IO : rc;
+    }
+    errno = 0;
+    int rc = series_get(d, name, create, type, id);
+    if (rc == TSDB_ERR_IO && create && !db->opt.read_only)
+        eng_fail(db, what, errno);
+    return rc;
+}
+
+int eng_series(eng *db, const char *name, int type, uint32_t *id)
+{
+    return dict_get(db, &db->series, "append to the series dictionary", name, true, type, id);
+}
 int eng_series_lookup(eng *db, const char *name, uint32_t *id) { return series_get(&db->series, name, false, 0, id); }
 uint32_t eng_series_count(eng *db) { return atomic_load(&db->series.count); }
 const char *eng_series_name(eng *db, uint32_t id) { return series_name(&db->series, id); }
@@ -535,7 +581,7 @@ int eng_series_type(eng *db, uint32_t id) { return series_type(&db->series, id);
 int eng_state(eng *db, const char *name, bool create, uint32_t *code)
 {
     uint32_t id;
-    int rc = series_get(&db->states, name, create, 0, &id);
+    int rc = dict_get(db, &db->states, "append to the state dictionary", name, create, 0, &id);
     if (rc == TSDB_ERR_NOTFOUND && db->opt.read_only) {
         series_reload(&db->states, db->dirfd); /* the writer may have made it a moment ago */
         rc = series_get(&db->states, name, false, 0, &id);
@@ -565,8 +611,9 @@ const char *eng_state_name(eng *db, uint32_t code)
 static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v,
                       size_t n)
 {
-    if (n == 0)
-        return 0;
+    int rc = eng_check(db);
+    if (rc || n == 0)
+        return rc;
     if (n < db->opt.wal_max_batch_rows)
         return mem_insert(db, series, cs, ts, v, type_width(type), n);
     pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
@@ -574,7 +621,7 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
     bool pending = db->active->rows > 0 || db->nflushing > 0;
     pthread_mutex_unlock(&db->buf_lock);
     pthread_mutex_unlock(&db->lock);
-    int rc = pending ? mt_flush(db) : 0;
+    rc = pending ? mt_flush(db) : 0;
     return rc ? rc : insert_rows(db, type, series, cs, ts, v, n, 0, NULL);
 }
 
@@ -607,6 +654,8 @@ int eng_commit(eng *db)
     int rc = db->bg_error;
     db->bg_error = 0;
     pthread_mutex_unlock(&db->buf_lock);
+    if (rc == 0)
+        rc = eng_check(db); /* even with nothing pending: the caller learns of the failure */
     return rc ? rc : wal_commit(db, target);
 }
 
@@ -641,8 +690,10 @@ int eng_drop_before(eng *db, int64_t ts)
         }
     }
     pthread_mutex_unlock(&db->lock);
-    if (db->opt.fsync)
-        fsync(db->dirfd);
+    if (db->opt.fsync && fsync(db->dirfd) != 0) {
+        eng_fail(db, "fsync of the directory after retiring dropped parts", errno);
+        return TSDB_ERR_IO;
+    }
     return manifest_publish(db);
 }
 

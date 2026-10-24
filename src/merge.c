@@ -298,7 +298,9 @@ void merge_commit_locked(eng *db, part **src, size_t k, part *out)
         src[i]->merging = false;
         dropped |= src[i]->dropped;
     }
-    if (out && !dropped) {
+    if (out && !dropped && eng_check(db)) {
+        part_unref(out); /* failed engine: no renames; the next open sees what a crash here leaves */
+    } else if (out && !dropped) {
         db_parts_insert_locked(db, out);
         for (size_t i = 0; i < k; i++)
             db_retire_locked(db, src[i]);
@@ -316,7 +318,7 @@ void *merge_thread_main(void *arg)
     part *sel[MAX_MERGE_PARTS];
     pthread_mutex_lock(&db->lock);
     while (!atomic_load(&db->stop)) {
-        size_t k = select_merge_locked(db, sel);
+        size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel); /* a failed engine writes nothing more */
         if (!k) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);

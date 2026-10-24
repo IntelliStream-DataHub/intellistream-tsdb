@@ -228,9 +228,18 @@ int series_get(series_dict *d, const char *name, bool create, int type, uint32_t
             if (hdr == 3)
                 rec[2] = (uint8_t)type;
             memcpy(rec + hdr, name, len);
-            if (write(d->fd, rec, len + hdr) != (ssize_t)(len + hdr) || (d->fsync && fdatasync(d->fd) != 0))
-                rc = TSDB_ERR_IO;
+            int err = 0;
+            ssize_t wr = write(d->fd, rec, len + hdr);
+            if (wr != (ssize_t)(len + hdr) || (d->fsync && fdatasync(d->fd) != 0)) {
+                rc = TSDB_ERR_IO; /* the caller fails the engine (dict_get): see eng_fail */
+                err = wr >= 0 && wr != (ssize_t)(len + hdr) ? ENOSPC : errno;
+            }
             free(rec);
+            if (rc == TSDB_ERR_IO) {
+                pthread_mutex_unlock(&d->lock);
+                errno = err;
+                return rc;
+            }
             if (rc == 0)
                 rc = dict_add(d, name, len, type, id);
         }

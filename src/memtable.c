@@ -15,6 +15,12 @@
  * restart a segment is replayed only into partitions that do not already
  * contain its data, even when a crash interrupted its flush half way.
  *
+ * A failed WAL write or fdatasync is final (eng_fail, "fsyncgate"): the
+ * failing writer marks the engine failed before it hands on the writer role,
+ * so no waiter is acknowledged for rows that went through the failed call,
+ * wal_durable never moves again and no byte follows a possibly torn record,
+ * which is therefore the last one replay sees.
+ *
  * Memtables are never modified after they stop being active, and readers
  * never modify them, so queries can read a memtable while it is flushed.
  * They hold every value as an 8-byte slot (4-byte types zero-extended), so
@@ -330,17 +336,26 @@ static int wal_open_segment(eng *db, uint64_t seq, int *fd)
     *fd = openat(db->dirfd, name, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (*fd < 0)
         return TSDB_ERR_IO;
-    if (db->opt.fsync)
-        fsync(db->dirfd); /* the segment must exist after a crash before rows in it are acknowledged */
+    /* the segment must exist after a crash before rows in it are acknowledged */
+    if (db->opt.fsync && fsync(db->dirfd) != 0) {
+        int err = errno;
+        close(*fd);
+        *fd = -1;
+        eng_fail(db, "fsync of the directory after creating a WAL segment", err);
+        return TSDB_ERR_IO;
+    }
     return 0;
 }
 
+/* errno tells why on failure */
 static int write_full(int fd, const void *buf, size_t len)
 {
     const uint8_t *p = buf;
     while (len) {
         ssize_t r = write(fd, p, len);
-        if (r < 0) {
+        if (r == 0)
+            errno = ENOSPC;
+        if (r <= 0) {
             if (errno == EINTR)
                 continue;
             return TSDB_ERR_IO;
@@ -431,7 +446,27 @@ static void wal_writer_leave(eng *db)
     pthread_mutex_unlock(&db->wal_sync_lock);
 }
 
-/* Makes every row appended up to `target` durable: group commit. */
+/* Writes a record of the rows in buf (WAL_HDR spare bytes first) to fd and
+ * syncs it. On failure the engine is failed (eng_fail) before it returns:
+ * the caller holds the writer role and has not woken anyone yet. */
+static int wal_write_sync(eng *db, int fd, uint8_t *buf, size_t len)
+{
+    if (len <= WAL_HDR)
+        return 0;
+    if (wal_write_record(fd, buf, (len - WAL_HDR) / WAL_ROW) != 0) {
+        eng_fail(db, "WAL write", errno);
+        return TSDB_ERR_IO;
+    }
+    if (db->opt.fsync && fdatasync(fd) != 0) {
+        eng_fail(db, "WAL fdatasync", errno);
+        return TSDB_ERR_IO;
+    }
+    return 0;
+}
+
+/* Makes every row appended up to `target` durable: group commit. Returns 0
+ * only if they are; TSDB_ERR_IO once the engine has failed, including to
+ * waiters whose rows were in a batch whose write or sync failed. */
 int wal_commit(eng *db, uint64_t target)
 {
     if (!db->wal_enabled || atomic_load(&db->wal_durable) >= target)
@@ -439,6 +474,9 @@ int wal_commit(eng *db, uint64_t target)
     int rc = 0;
     pthread_mutex_lock(&db->wal_sync_lock);
     while (rc == 0 && atomic_load(&db->wal_durable) < target) {
+        /* set before the failing writer gave up the role, so seen here first */
+        if ((rc = eng_check(db)) != 0)
+            break;
         if (db->wal_writing) {
             /* another writer is syncing; it, or the next one, will cover us */
             pthread_cond_wait(&db->wal_cv, &db->wal_sync_lock);
@@ -458,10 +496,7 @@ int wal_commit(eng *db, uint64_t target)
         db->wal_len = 0;
         pthread_mutex_unlock(&db->buf_lock);
 
-        if (len > WAL_HDR)
-            rc = wal_write_record(fd, buf, (len - WAL_HDR) / WAL_ROW);
-        if (rc == 0 && len > WAL_HDR && db->opt.fsync && fdatasync(fd) != 0)
-            rc = TSDB_ERR_IO;
+        rc = wal_write_sync(db, fd, buf, len);
         db->wal_spare = buf;
         db->wal_spare_cap = cap;
         if (rc == 0)
@@ -512,9 +547,9 @@ int mt_flush(eng *db)
     pthread_mutex_lock(&db->buf_lock);
     bool empty = db->active->rows == 0;
     pthread_mutex_unlock(&db->buf_lock);
-    int rc = 0;
+    int rc = eng_check(db); /* rows of a failed engine may not be durable: none become parts */
     /* a memtable whose write failed earlier is retried before a new one is started */
-    if (!empty && db->nflushing == 0) {
+    if (rc == 0 && !empty && db->nflushing == 0) {
         uint64_t seq = db->wal_seq + 1;
         int newfd = -1;
         memtable *nm = mt_new(seq);
@@ -543,10 +578,7 @@ int mt_flush(eng *db)
             if (db->wal_enabled) {
                 /* the rest of the old segment; a part will hold these rows, but
                  * until then the segment is what makes them durable */
-                if (len > WAL_HDR)
-                    rc = wal_write_record(oldfd, buf, (len - WAL_HDR) / WAL_ROW);
-                if (rc == 0 && len > WAL_HDR && db->opt.fsync && fdatasync(oldfd) != 0)
-                    rc = TSDB_ERR_IO;
+                rc = wal_write_sync(db, oldfd, buf, len);
                 close(oldfd);
                 if (rc == 0)
                     atomic_store(&db->wal_durable, upto);
@@ -561,6 +593,8 @@ int mt_flush(eng *db)
     for (size_t i = 0; i < db->nflushing && rc == 0;) {
         memtable *m = db->flushing[i]; /* only flush_lock holders change the list's members */
         part_list pl = {0};
+        if ((rc = eng_check(db)) != 0) /* e.g. the MANIFEST rewrite above failed */
+            break;
         rc = mt_write(db, m, &pl);
         if (rc == 0) {
             pthread_mutex_lock(&db->publish_lock); /* numbered, named and listed in one step */
@@ -624,14 +658,15 @@ void *flusher_main(void *arg)
         bool sync = db->opt.wal_sync_ms > 0 && now - db->last_wal_sync_ms >= db->opt.wal_sync_ms;
         uint64_t target = db->wal_appended;
         pthread_mutex_unlock(&db->buf_lock);
-        int rc = 0;
-        if (sync) {
+        int rc = eng_check(db); /* a failed engine writes nothing more */
+        if (rc == 0 && sync) {
             rc = wal_commit(db, target);
             db->last_wal_sync_ms = now;
         }
         if (rc == 0 && flush)
             rc = mt_flush(db);
-        graveyard_purge(db, false);
+        if (rc == 0)
+            graveyard_purge(db, false);
         pthread_mutex_lock(&db->buf_lock);
         if (rc && !db->bg_error)
             db->bg_error = rc;
@@ -788,8 +823,8 @@ int wal_open(eng *db)
             unlinkat(db->dirfd, segs[k].name, 0);
     }
     free(segs);
-    if (rc == 0 && !ro && db->opt.fsync)
-        fsync(db->dirfd);
+    if (rc == 0 && !ro && db->opt.fsync && fsync(db->dirfd) != 0)
+        rc = TSDB_ERR_IO; /* at open: the open fails */
     if (rc == 0 && db->wal_enabled)
         rc = wal_open_segment(db, db->wal_seq, &db->wal_fd);
     return rc;
@@ -801,7 +836,7 @@ void wal_close(eng *db)
     if (db->wal_fd >= 0) {
         close(db->wal_fd);
         db->wal_fd = -1;
-        if (db->active && db->active->rows == 0 && db->nflushing == 0) {
+        if (db->active && db->active->rows == 0 && db->nflushing == 0 && !eng_check(db)) {
             char name[64];
             wal_name(name, sizeof name, db->wal_seq);
             unlinkat(db->dirfd, name, 0);

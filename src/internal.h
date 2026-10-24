@@ -450,7 +450,11 @@ int pw_finish(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t l
 /* As pw_finish, but the part stays under its tmp name until parts_commit. */
 int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
 /* Numbers pending parts and gives them their names, all or none even across a
- * crash. Caller holds publish_lock and publishes them before releasing it. */
+ * crash. Caller holds publish_lock and publishes them before releasing it.
+ * A failure once the commit may have reached the disk (the intent's or the
+ * names' directory fsync, a rename) fails the engine (eng_fail): the caller
+ * then discards the parts without publishing them, and parts_discard leaves
+ * their files for the next open. */
 int parts_commit(struct eng *db, part **ps, size_t n);
 void parts_discard(struct eng *db, part **ps, size_t n);
 int intents_recover(struct eng *db);
@@ -647,7 +651,34 @@ struct eng {
     uint64_t follow_flushed, follow_active;
     wal_tail tails[MAX_TAILS]; /* oldest first; the array is changed under db->lock + buf_lock */
     size_t ntails;
+
+    /* fail-stop (eng_fail): set once, never cleared; fail_msg is written under
+     * fail_lock before `failed` is stored, so whoever sees `failed` can read it */
+    atomic_bool failed;
+    pthread_mutex_t fail_lock; /* innermost; held only to fill fail_msg */
+    char fail_msg[256];
 };
+
+/* Fail-stop. After a storage error that leaves durable state uncertain (a
+ * failed WAL write or fdatasync, a failed directory fsync after a publish, a
+ * failed MANIFEST rewrite, a failed series dictionary append) the engine stops
+ * writing for good: Linux may drop the dirty pages of a failed fsync and clear
+ * the error, so a retry can "succeed" without the data (PostgreSQL's
+ * "fsyncgate", 2018). eng_fail records the first such error (`what` failed
+ * with `err`, an errno), prints one line to stderr and sets db->failed; call
+ * it before waking anyone who waits for the failed operation. Any lock may be
+ * held: it takes only fail_lock, which nests inside every other lock. From then
+ * on every write path returns TSDB_ERR_IO at once (eng_check), background
+ * threads stop writing, reads keep working, and reopening recovers what was
+ * durable. */
+void eng_fail(struct eng *db, const char *what, int err);
+/* TSDB_ERR_IO once the engine has failed, else 0. */
+static inline int eng_check(struct eng *db)
+{
+    return atomic_load_explicit(&db->failed, memory_order_acquire) ? TSDB_ERR_IO : 0;
+}
+/* 0 while healthy; TSDB_ERR_IO with the message (directory, what failed, errno) once failed. */
+int eng_failed_msg(struct eng *db, char *msg, size_t len);
 
 codec_ctx *cc_get(struct eng *db);
 void cc_put(struct eng *db, codec_ctx *c);

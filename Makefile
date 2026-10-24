@@ -80,8 +80,13 @@ $(B)/tsdb-bench: tools/tsdb-bench.c tools/common.h tools/datasets.h $(LIB)
 $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd
+# its own write/fsync/fdatasync/pwrite/renameat inject storage errors into the library
+$(B)/test_failstop: tests/test_failstop.c $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+test: $(B)/test_tsdb $(B)/test_failstop $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd
 	./$(B)/test_tsdb
+	./$(B)/test_failstop
 	./$(B)/test_types
 	./$(B)/test_levels
 	./$(B)/test_group

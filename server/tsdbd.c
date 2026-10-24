@@ -32,6 +32,13 @@
  *
  * Signals: SIGTERM and SIGINT stop it cleanly (requests in progress finish,
  * the memtable is flushed, exit status 0); SIGHUP and SIGPIPE are ignored.
+ *
+ * Fail-stop: when a storage error puts the database in its failed state
+ * (tsdb_failed: a failed WAL write or fsync and the like, after which it is
+ * unknown what reached the disk) writes return TSDB_ERR_IO, which clients
+ * already know. The server then logs one line, stops accepting connections,
+ * lets the replies in flight go out for a moment and exits with status 1:
+ * only a reopen recovers, so a supervisor restarts it (or a standby takes over).
  * After SIGKILL a new server can start on the same port and directory at once.
  *
  * There is no authentication: listen on a trusted interface only.
@@ -1385,6 +1392,33 @@ static void *accept_main(void *arg)
     }
 }
 
+static atomic_bool db_failed;
+
+/* Polls tsdb_failed: a failure can come from any worker or from a background
+ * thread of the library, with no request to report it. */
+static void *failwatch_main(void *arg)
+{
+    int lfd = *(int *)arg;
+    char msg[512];
+    while (!stopping) {
+        if (tsdb_failed(db, msg, sizeof msg)) {
+            fprintf(stderr, "tsdbd: storage failure, exiting: %s\n", msg);
+            atomic_store(&db_failed, true);
+            shutdown(lfd, SHUT_RDWR); /* new clients go elsewhere; ends the accept thread */
+            struct timespec grace = {0, 200000000}; /* replies in flight (TSDB_ERR_IO for writes) go out */
+            nanosleep(&grace, NULL);
+            stopping = 1;
+            uint64_t one = 1;
+            if (write(wake_fd, &one, 8) != 8) {
+            }
+            return NULL;
+        }
+        struct timespec d = {0, 20000000};
+        nanosleep(&d, NULL);
+    }
+    return NULL;
+}
+
 static void on_signal(int sig)
 {
     (void)sig;
@@ -1540,6 +1574,8 @@ int main(int argc, char **argv)
 
     pthread_t acceptor;
     pthread_create(&acceptor, NULL, accept_main, &lfd);
+    pthread_t failwatch;
+    pthread_create(&failwatch, NULL, failwatch_main, &lfd);
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
             max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll");
@@ -1553,6 +1589,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "tsdbd: shutting down\n");
     shutdown(lfd, SHUT_RDWR); /* stops listening, and ends the accept thread's accept() */
     pthread_join(acceptor, NULL);
+    pthread_join(failwatch, NULL);
     close(lfd);
     pthread_mutex_lock(&work_lock);
     work_stop = true;
@@ -1590,6 +1627,8 @@ int main(int argc, char **argv)
         close(new_fds[i]);
     free(new_fds);
     rc = tsdb_close(db);
+    if (atomic_load(&db_failed))
+        return 1; /* close failed too, by design: nothing more was written */
     if (rc)
         fprintf(stderr, "tsdbd: close: %s\n", tsdb_strerror(rc));
     return rc ? 1 : 0;

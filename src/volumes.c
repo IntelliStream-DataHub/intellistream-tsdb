@@ -115,14 +115,33 @@ static int cat_add(tsdb *t, uint32_t vol, uint32_t local)
     return 0;
 }
 
+/* errno tells why on failure */
 static int append_file(int dirfd, const char *name, const void *data, size_t len, bool sync)
 {
     int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0)
         return TSDB_ERR_IO;
-    bool ok = write(fd, data, len) == (ssize_t)len && (!sync || fdatasync(fd) == 0);
+    ssize_t wr = write(fd, data, len);
+    bool ok = wr == (ssize_t)len && (!sync || fdatasync(fd) == 0);
+    int err = ok ? 0 : wr >= 0 && wr != (ssize_t)len ? ENOSPC : errno;
     close(fd);
+    errno = err;
     return ok ? 0 : TSDB_ERR_IO;
+}
+
+/* A failed append to CATALOG or VOLUMES may leave a torn record, after which
+ * the next open reads nothing: no record may follow it. The root volume's
+ * engine holds the failure (eng_fail), so tsdb_failed reports it and writes
+ * to the root volume stop too. */
+static int append_root(tsdb *t, const char *name, const void *data, size_t len)
+{
+    int rc = eng_check(t->vols[0]);
+    if (rc == 0 && (rc = append_file(t->dirfd, name, data, len, t->opt.fsync)) != 0) {
+        char what[64];
+        snprintf(what, sizeof what, "append to %s", name);
+        eng_fail(t->vols[0], what, errno);
+    }
+    return rc;
 }
 
 static int read_file_all(int dirfd, const char *name, char **out, size_t *len)
@@ -435,6 +454,8 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ui
         return type < 0 || (tsdb_series_type(t, *id, &have) == 0 && (int)have == type) ? 0 : TSDB_ERR_INVALID;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
+    if (eng_check(t->vols[0]))
+        return TSDB_ERR_IO; /* CATALOG takes no more records */
     char canon[PATH_MAX];
     if (path) {
         mkdir(path, 0755);
@@ -469,7 +490,7 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ui
             } else {
                 memcpy(line, canon, n);
                 line[n] = '\n';
-                rc = append_file(t->dirfd, VOLUMES_FILE, line, n + 1, t->opt.fsync);
+                rc = append_root(t, VOLUMES_FILE, line, n + 1);
                 free(line);
             }
         }
@@ -479,7 +500,7 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ui
         rc = eng_series(t->vols[vol], name, type < 0 ? TSDB_FLOAT32 : type, &local); /* the volume, then the catalog */
     if (rc == 0) {
         uint32_t rec[2] = {vol, local};
-        rc = append_file(t->dirfd, CATALOG_FILE, rec, 8, t->opt.fsync);
+        rc = append_root(t, CATALOG_FILE, rec, 8);
     }
     if (rc == 0) {
         pthread_rwlock_wrlock(&t->lock);
@@ -728,6 +749,18 @@ static int each(tsdb *t, int (*fn)(eng *))
 }
 
 int tsdb_commit(tsdb *t) { return each(t, eng_commit); }
+
+int tsdb_failed(tsdb *t, char *msg, size_t len)
+{
+    if (msg && len)
+        msg[0] = '\0';
+    pthread_rwlock_rdlock(&t->lock);
+    int rc = 0;
+    for (size_t i = 0; i < t->nvols && rc == 0; i++)
+        rc = eng_failed_msg(t->vols[i], msg, len);
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
 int tsdb_flush(tsdb *t) { return each(t, eng_flush); }
 int tsdb_optimize(tsdb *t) { return each(t, eng_optimize); }
 

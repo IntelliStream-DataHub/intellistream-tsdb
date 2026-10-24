@@ -38,10 +38,14 @@ static int64_t now_s(void) { return (int64_t)time(NULL); }
 
 /* ------------------------------------------------------------- writer */
 
+/* A failure fails the engine: the file may be torn, and followers would see
+ * no further version. */
 int manifest_publish(eng *db)
 {
     if (db->opt.read_only)
         return 0;
+    if (eng_check(db))
+        return TSDB_ERR_IO;
     pthread_mutex_lock(&db->manifest_lock);
     pthread_mutex_lock(&db->lock);
     size_t cap = 256 + db->nparts * 112, len = 0;
@@ -64,11 +68,19 @@ int manifest_publish(eng *db)
     /* in place, never renamed: see the comment at the top */
     int rc = 0;
     int fd = openat(db->dirfd, MANIFEST_FILE, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-    if (fd < 0 || pwrite(fd, buf, len, 0) != (ssize_t)len || ftruncate(fd, (off_t)len) != 0)
+    int err = 0;
+    ssize_t wr = fd < 0 ? -1 : pwrite(fd, buf, len, 0);
+    if (wr != (ssize_t)len || ftruncate(fd, (off_t)len) != 0) {
         rc = TSDB_ERR_IO;
-    if (fd >= 0 && close(fd) != 0) /* on NFS, close sends the data to the server */
+        err = wr >= 0 && wr != (ssize_t)len ? ENOSPC : errno;
+    }
+    if (fd >= 0 && close(fd) != 0 && !rc) { /* on NFS, close sends the data to the server */
         rc = TSDB_ERR_IO;
+        err = errno;
+    }
     free(buf);
+    if (rc)
+        eng_fail(db, "MANIFEST rewrite", err);
     pthread_mutex_unlock(&db->manifest_lock);
     return rc;
 }
@@ -81,7 +93,10 @@ void db_retire_locked(eng *db, part *p)
     snprintf(retired, sizeof retired, RETIRED_PREFIX "%s", p->name);
     if (db->opt.obsolete_part_lifetime_s <= 0) {
         atomic_store(&p->obsolete, true); /* deleted when the last reference goes */
-    } else if (renameat(db->dirfd, p->name, db->dirfd, retired) == 0) {
+    } else if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0) {
+        /* still listed after a reopen: a dropped part would come back */
+        eng_fail(db, "rename of a replaced part to retired_", errno);
+    } else {
         if (db->ngraveyard == db->graveyard_cap) {
             size_t cap = db->graveyard_cap ? db->graveyard_cap * 2 : 64;
             graveyard_entry *g = realloc(db->graveyard, cap * sizeof *g);
@@ -103,6 +118,8 @@ void db_retire_locked(eng *db, part *p)
 /* Deletes retired parts whose lifetime is over (or all of them). */
 void graveyard_purge(eng *db, bool all)
 {
+    if (eng_check(db))
+        return; /* a failed engine writes nothing more; the next open collects them */
     int64_t now = now_s();
     pthread_mutex_lock(&db->lock);
     size_t kept = 0;
