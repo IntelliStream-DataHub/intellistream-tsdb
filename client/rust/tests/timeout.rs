@@ -308,7 +308,7 @@ fn connect_with_gives_up() {
         (0..4).filter_map(|_| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()).collect();
     assert!(!held.is_empty() && held.len() < 4, "the accept queue must fill up, {} connected", held.len());
     let t = Instant::now();
-    let e = Client::connect_with(addr, Some(Duration::from_millis(300))).err().expect("the connect must fail");
+    let Err(e) = Client::connect_with(addr, Some(Duration::from_millis(300))) else { panic!("the connect must fail") };
     let took = t.elapsed();
     assert!(matches!(&e, Error::Io(io) if io.kind() == ErrorKind::TimedOut), "{e:?}");
     assert!(took >= Duration::from_millis(250) && took < BOUND, "{took:?}");

@@ -26,7 +26,8 @@ fn structs_match_the_c_header() {
         tsdb_group { unit, count, timezone }
         tsdb_query_stats { elapsed_s, rows, rows_decoded, rows_from_stats, memtable_rows, bytes, bytes_read, parts,
             granules, granules_from_stats, result_rows }
-        tsdb_stats { parts, partitions, rows, bytes, merges, merged_rows, passthrough_granules, memtable_rows }
+        tsdb_stats { parts, partitions, rows, bytes, merges, merged_rows, passthrough_granules, memtable_rows,
+            broken_parts, follow_errors }
         tsdb_part_info { name, partition, min_ts, max_ts, rows, bytes, granules, level, created_s, written_s }
     };
     rust.push(("tsdb_type", "sizeof", size_of::<tsdb_type>()));

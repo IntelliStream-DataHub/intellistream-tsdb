@@ -26,7 +26,7 @@ static const size_t layout[] = {
     O(tsdb_query_stats, granules_from_stats), O(tsdb_query_stats, result_rows),
     S(tsdb_stats), O(tsdb_stats, parts), O(tsdb_stats, partitions), O(tsdb_stats, rows), O(tsdb_stats, bytes),
     O(tsdb_stats, merges), O(tsdb_stats, merged_rows), O(tsdb_stats, passthrough_granules),
-    O(tsdb_stats, memtable_rows),
+    O(tsdb_stats, memtable_rows), O(tsdb_stats, broken_parts), O(tsdb_stats, follow_errors),
     S(tsdb_part_info), O(tsdb_part_info, name), O(tsdb_part_info, partition), O(tsdb_part_info, min_ts),
     O(tsdb_part_info, max_ts), O(tsdb_part_info, rows), O(tsdb_part_info, bytes), O(tsdb_part_info, granules),
     O(tsdb_part_info, level), O(tsdb_part_info, created_s), O(tsdb_part_info, written_s),

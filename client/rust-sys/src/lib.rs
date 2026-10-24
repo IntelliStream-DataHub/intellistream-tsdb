@@ -179,6 +179,8 @@ pub struct tsdb_stats {
     pub merged_rows: u64,
     pub passthrough_granules: u64,
     pub memtable_rows: u64,
+    pub broken_parts: u64,
+    pub follow_errors: u64,
 }
 
 #[repr(C)]
