@@ -80,6 +80,16 @@ int tsdbc_insert_series_values_async(tsdbc *c, uint32_t series, const int64_t *t
                                      size_t n);
 int tsdbc_query_values(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                        tsdb_values_fn fn, void *ctx);
+/* The server's protocol version from HELLO (asked once per connection; 1 for a
+ * server that predates HELLO), after waiting for pipelined inserts; 0 if the
+ * connection failed. */
+uint32_t tsdbc_server_version(tsdbc *c);
+/* LTTB downsampling, as tsdb_query_lttb (protocol version 5: against an older
+ * server it returns TSDB_ERR_INVALID without asking, as such a server would
+ * for the unknown op; the same code as a bad threshold, so a caller that must
+ * tell them apart checks tsdbc_server_version first). */
+int tsdbc_query_lttb(tsdbc *c, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+                     void *ctx);
 int tsdbc_state(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
 int tsdbc_state_lookup(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
 int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t len);

@@ -243,6 +243,31 @@ typedef int (*tsdb_values_fn)(void *ctx, const int64_t *ts, const tsdb_values *v
 int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_values_fn fn, void *ctx);
 
+/* Downsampling for charts: Largest-Triangle-Three-Buckets (Steinarsson 2013)
+ * picks `threshold` of the points in [start, end) that keep the series' visual
+ * shape, and streams them in time order with their stored values, exactly
+ * (bools as bytes, valid always NULL: no nulls are returned).
+ *  - Points are the known, finite values: nulls, NaN and infinities are
+ *    skipped (they have no place on a chart and would poison the means).
+ *  - The first and the last point are always kept; points 1 .. n-2 fall into
+ *    threshold - 2 buckets, bucket b starting at floor(b * every) + 1 with
+ *    every = (n-2)/(threshold-2) in doubles, as in the paper's code (and
+ *    ClickHouse's and the TimescaleDB toolkit's). From each bucket the point
+ *    with the largest triangle formed with the point kept from the previous
+ *    bucket and the mean (time, value) of the next bucket is kept (the bucket
+ *    after the last is the rest: the last point, or the last two where
+ *    rounding ends the last bucket early); of equal areas the first wins,
+ *    and when no area compares (overflow to NaN) the bucket's first point.
+ *  - Area coordinates: x is milliseconds since the first point as a double, y
+ *    the value as a double (int64 rounded, bool 0 or 1).
+ *  - n <= threshold returns every point. threshold < 3 or a state series:
+ *    TSDB_ERR_INVALID.
+ * It reads one snapshot, so concurrent writes and merges do not tear the
+ * result. Query statistics describe one read of the range (the counting pass,
+ * and for very large buckets a second pass for the means, are not counted). */
+int tsdb_query_lttb(tsdb *db, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+                    void *ctx);
+
 /* Calendar grouping, in UTC: `count` units per bucket.
  *  - TSDB_SECOND, _MINUTE, _HOUR: fixed lengths, aligned to multiples of their
  *    length since the epoch.

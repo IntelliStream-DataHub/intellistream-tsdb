@@ -744,6 +744,9 @@ extern size_t desc_window_rows;
 typedef int (*slot_fn)(void *ctx, const int64_t *ts, const void *v, size_t n);
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
                      slot_fn fn, void *ctx);
+/* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID */
+int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, slot_fn fn, void *ctx);
+extern size_t lttb_buffer_bytes; /* tests make it small to exercise the two-pass way */
 int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
                   size_t *nout);
 int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,

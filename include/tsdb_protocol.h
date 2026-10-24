@@ -73,11 +73,17 @@
  *               (bucket i begins at bounds[i]; bounds strictly increase)
  *   LAST_STATS                                 -> f64 elapsed_s, then the ten u64 of
  *               tsdb_query_stats in order: the connection's previous query
+ *   Version 5: LTTB downsampling (tsdb_query_lttb). An older server answers
+ *   the op with TSDB_ERR_INVALID; clients check HELLO for 5 first.
+ *   QUERY_LTTB  u32 series, i64 start, i64 end, u64 threshold
+ *               -> chunks as QUERY_VALUES (never with TSDB_VALID: no nulls),
+ *               the chosen points in time order with their stored values
+ *               (threshold < 3 or a state series: TSDB_ERR_INVALID)
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
-#define TSDB_PROTOCOL_VERSION 4
+#define TSDB_PROTOCOL_VERSION 5
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
@@ -105,6 +111,7 @@ enum {
     TSDB_OP_QUERY_BUCKETS = 18,
     TSDB_OP_LAST_STATS = 19,
     TSDB_OP_QUERY_BOUNDS = 20,
+    TSDB_OP_QUERY_LTTB = 21,
 };
 
 #define TSDB_AGG_ROW 32    /* bytes per bucket in a QUERY_AGG or QUERY_GROUP reply */

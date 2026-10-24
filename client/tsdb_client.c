@@ -677,6 +677,8 @@ static uint32_t server_version(tsdbc *c)
     return c->server_version;
 }
 
+uint32_t tsdbc_server_version(tsdbc *c) { return tsdbc_wait(c) ? 0 : server_version(c); }
+
 uint64_t tsdbc_bytes_sent(const tsdbc *c) { return c->sent; }
 
 /* Whether inserts go packed: compression on, and a server that reads them. */
@@ -785,6 +787,8 @@ int tsdbc_insert_series_values_async(tsdbc *c, uint32_t series, const int64_t *t
     return insert_values_frames(c, NULL, series, ts, values, n, false);
 }
 
+static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx);
+
 int tsdbc_query_values(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                        tsdb_values_fn fn, void *ctx)
 {
@@ -800,6 +804,32 @@ int tsdbc_query_values(tsdbc *c, uint32_t series, int64_t start, int64_t end, co
     memcpy(q + 21, &lim, 8);
     if ((rc = send_req(c, TSDB_OP_QUERY_VALUES, q, 29, NULL, 0, NULL, 0, NULL, 0)) != 0)
         return rc;
+    return read_values(c, fn, ctx);
+}
+
+int tsdbc_query_lttb(tsdbc *c, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+                     void *ctx)
+{
+    int rc = tsdbc_wait(c);
+    if (rc)
+        return rc;
+    if (server_version(c) < 5)
+        return TSDB_ERR_INVALID; /* the server does not know QUERY_LTTB */
+    uint8_t q[28];
+    uint64_t t = threshold;
+    memcpy(q, &series, 4);
+    memcpy(q + 4, &start, 8);
+    memcpy(q + 12, &end, 8);
+    memcpy(q + 20, &t, 8);
+    if ((rc = send_req(c, TSDB_OP_QUERY_LTTB, q, 28, NULL, 0, NULL, 0, NULL, 0)) != 0)
+        return rc;
+    return read_values(c, fn, ctx);
+}
+
+/* The chunks of a QUERY_VALUES or QUERY_LTTB reply, to fn. */
+static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
+{
+    int rc = 0;
     int64_t *ts = NULL;
     uint8_t *v = NULL;
     size_t cap = 0;

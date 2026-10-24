@@ -5,6 +5,7 @@
 #include "tsdb_pack.h"
 #include "tsdb_protocol.h"
 #include "samekeys.h"
+#include "lttb_ref.h"
 
 #include <arpa/inet.h>
 #include <limits.h>
@@ -609,6 +610,105 @@ static void *client_thread(void *arg)
 
 /* The packed insert body round trips for every type and layout, and anything
  * that does not hold exactly n rows is refused. */
+/* LTTB through the server: the points chosen against the reference over QUERY_VALUES */
+typedef struct lpts {
+    pt *p;
+    size_t n, cap;
+    bool had_valid;
+} lpts;
+
+static int lttb_collect(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    lpts *o = ctx;
+    o->had_valid |= col->valid != NULL;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t bits = 0;
+        double y = 0;
+        if (!col_point(col, i, &bits, &y))
+            continue;
+        if (o->n == o->cap) {
+            o->cap = o->cap ? o->cap * 2 : 4096;
+            o->p = realloc(o->p, o->cap * sizeof *o->p);
+        }
+        o->p[o->n++] = (pt){ts[i], bits, y};
+    }
+    return 0;
+}
+
+static int lttb_stop(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n) { return 1; }
+
+static void test_lttb_remote(tsdbc *c)
+{
+    uint32_t f, bo, st;
+    OK(tsdbc_series_create(c, "lttb.f64", TSDB_FLOAT64, NULL, &f));
+    OK(tsdbc_series_create(c, "lttb.bool", TSDB_BOOL, NULL, &bo));
+    OK(tsdbc_series_create(c, "lttb.state", TSDB_STATE, NULL, &st));
+    enum { N = 150000 };
+    int64_t *ts = malloc(N * sizeof *ts);
+    double *dv = malloc(N * sizeof *dv);
+    uint8_t *bv = malloc(N), *valid = malloc((N + 7) / 8);
+    memset(valid, 0xff, (N + 7) / 8);
+    for (int i = 0; i < N; i++) {
+        ts[i] = T0 + (int64_t)i * 250 + i % 7;
+        dv[i] = i % 1013 == 0 ? NAN : sin(i / 300.0) * 50 + (i % 4999 == 0 ? 400 : 0);
+        bv[i] = sin(i / 77.0) > 0.3;
+        if (i % 97 == 0)
+            valid[i >> 3] &= (uint8_t)~(1u << (i & 7));
+    }
+    OK(tsdbc_insert_series_values(c, f, ts, &(tsdb_values){TSDB_FLOAT64, dv, valid}, N));
+    OK(tsdbc_insert_series_values(c, bo, ts, &(tsdb_values){TSDB_BOOL, bv, valid}, N));
+    size_t ths[] = {3, 500, 40000, N + 10};
+    uint32_t ser[] = {f, bo};
+    for (size_t s = 0; s < 2; s++)
+        for (size_t k = 0; k < sizeof ths / sizeof *ths; k++) {
+            lpts raw = {0}, got = {0};
+            OK(tsdbc_query_values(c, ser[s], INT64_MIN, INT64_MAX, NULL, lttb_collect, &raw));
+            OK(tsdbc_query_lttb(c, ser[s], INT64_MIN, INT64_MAX, ths[k], lttb_collect, &got));
+            tsdb_query_stats qs;
+            OK(tsdbc_last_query_stats(c, &qs));
+            size_t *idx = malloc(raw.n * sizeof *idx);
+            size_t m = ref_lttb(raw.p, raw.n, ths[k], idx);
+            bool same = got.n == m && !got.had_valid && qs.result_rows == m && m == (raw.n < ths[k] ? raw.n : ths[k]);
+            for (size_t i = 0; same && i < m; i++)
+                same = got.p[i].ts == raw.p[idx[i]].ts && got.p[i].bits == raw.p[idx[i]].bits;
+            CHECK(same);
+            free(idx);
+            free(raw.p);
+            free(got.p);
+        }
+    lpts none = {0};
+    CHECK(tsdbc_server_version(c) == TSDB_PROTOCOL_VERSION); /* QUERY_LTTB needs 5 */
+    CHECK(tsdbc_query_lttb(c, f, INT64_MIN, INT64_MAX, 2, lttb_collect, &none) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_lttb(c, st, INT64_MIN, INT64_MAX, 10, lttb_collect, &none) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_lttb(c, f, INT64_MIN, INT64_MAX, 40000, lttb_stop, NULL) == TSDB_ERR_STOPPED);
+    OK(tsdbc_query_lttb(c, f, T0, T0 + 1000000, 10, lttb_collect, &none)); /* the connection goes on */
+    CHECK(none.n == 10);
+    free(none.p);
+
+    /* the request is exactly 28 bytes: shorter or longer frames are refused */
+    int fd = raw_connect();
+    uint8_t q[29] = {0};
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    uint64_t t = 10;
+    memcpy(q, &f, 4);
+    memcpy(q + 4, &lo, 8);
+    memcpy(q + 12, &hi, 8);
+    memcpy(q + 20, &t, 8);
+    for (uint32_t len = 27; len <= 29; len += 2) {
+        raw_send(fd, 40 + len, TSDB_OP_QUERY_LTTB, q, len);
+        uint32_t rid;
+        uint8_t rest[256];
+        size_t nrest;
+        int32_t st = raw_reply(fd, &rid, rest, sizeof rest, &nrest);
+        CHECK(rid == 40 + len && st == TSDB_ERR_INVALID);
+    }
+    close(fd);
+    free(ts);
+    free(dv);
+    free(bv);
+    free(valid);
+}
+
 static void test_pack_roundtrip(void)
 {
     static const size_t sizes[] = {0, 1, 7, 8, 9, 1000, 65537};
@@ -1284,6 +1384,7 @@ int main(int argc, char **argv)
     test_framing();
     test_types(c);
     test_nan(c);
+    test_lttb_remote(c);
     test_pack_roundtrip();
     test_packed_inserts(c);
     test_bounds(c, a, N);
