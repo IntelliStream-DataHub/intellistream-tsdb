@@ -229,14 +229,30 @@ def test_connect_gives_up():
         listener.close()
 
 
-def keepalive_timer_armed(port):
-    """Whether the kernel runs a keepalive timer on the local socket with this port (Linux)."""
-    with open("/proc/net/tcp") as f:
-        for line in f.read().splitlines()[1:]:
-            fields = line.split()
-            if int(fields[1].split(":")[1], 16) == port:
-                return fields[5].split(":")[0] == "02"
-    raise AssertionError(f"no socket with local port {port}")
+def keepalive_timer_armed(port, server_port, expected, settle=0.5):
+    """Whether the kernel runs a keepalive timer on the local socket with this port (Linux).
+
+    /proc/net/tcp shows one timer per socket: right after the client sends, it is the
+    retransmit timer (01) until the peer's ACK arrives, and only then keepalive (02). So poll:
+    when keepalive is expected, until 02 shows; when it is not, that 02 never shows. Only the
+    established socket to the fake server counts: an older socket in TIME_WAIT can hold the same
+    local port."""
+    deadline = time.monotonic() + settle
+    seen = False
+    while True:
+        with open("/proc/net/tcp") as f:
+            rows = [l.split() for l in f.read().splitlines()[1:]]
+        mine = [r for r in rows if int(r[1].split(":")[1], 16) == port and int(r[2].split(":")[1], 16) == server_port
+                and r[3] == "01"]  # ESTABLISHED
+        if not mine:
+            raise AssertionError(f"no socket with local port {port}")
+        armed = mine[0][5].split(":")[0] == "02"
+        seen = seen or armed
+        if expected and armed:
+            return True
+        if time.monotonic() >= deadline:
+            return seen
+        time.sleep(0.01)
 
 
 @pytest.mark.skipif(not os.path.exists("/proc/net/tcp"), reason="reads the kernel's socket table")
@@ -249,6 +265,6 @@ def test_keepalive_is_on_by_default_and_can_be_turned_off(fake):
         while not peers and time.monotonic() < deadline:
             time.sleep(0.01)
         assert peers, "the fake server saw no connection"
-        assert keepalive_timer_armed(peers[0]) is expected
+        assert keepalive_timer_armed(peers[0], f.port, expected) is expected
         c.close()
 
