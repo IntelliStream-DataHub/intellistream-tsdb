@@ -55,7 +55,7 @@ queried on the same machine (AMD Ryzen 9 7950X, NVMe disk):
 | InfluxDB 2 | 3.6 million | 14 million | 5.3 ms | 315 MB | 3.8x |
 | TimescaleDB | 3.4 million | 26 million | 5.8 ms | 404 MB | 3.0x |
 | InfluxDB 3 Core | 1.0 million | 2.2 million | 72 ms | 723 MB | 1.7x |
-| QuestDB | 32 million | 78 million | 5.3 ms | 1,657 MB | 0.7x |
+| QuestDB (\*\*) | 32 million | 78 million | 5.3 ms | 1,657 MB | 0.7x |
 
 - **Query (rows per second):** all 100 sensors over the whole range in buckets
   of 60 readings, a query that has to read every row: 100 million rows divided
@@ -70,6 +70,11 @@ queried on the same machine (AMD Ryzen 9 7950X, NVMe disk):
 - (\*) DuckDB is a library, not a server. Compare it with tsdb used as a
   library: 101 million rows per second for inserts, 2.5 billion rows per
   second for the query above, and 0.07 ms per query.
+- (\*\*) QuestDB stores its data uncompressed by default, as measured here,
+  which is why it is larger than the raw data. Its open source version can
+  compress only if you convert partitions to Parquet by hand or run it on a
+  compressing file system such as ZFS; converting partitions automatically as
+  they age is a feature of its paid Enterprise edition.
 
 At 100 billion rows, tsdb needs 116 GB where ClickHouse needs 170 GB. A summary
 of the whole table takes 0.17 seconds instead of 59.
