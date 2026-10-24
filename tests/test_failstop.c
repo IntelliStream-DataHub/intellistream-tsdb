@@ -439,6 +439,55 @@ static void test_dir_fsync(const char *base)
     printf("  failed directory fsync after publishing a part\n");
 }
 
+/* A flush fails on a part file: an error that fails only the call, the
+ * memtable waits to be retried. A large insert after it flushes the memtables
+ * first, so older small writes cannot shadow its part: before the fix, the
+ * retry wrote only the failed memtable and left the active one, which queries
+ * read as newer than every part (the jepsen eio nemesis found this). */
+static void test_flush_retry(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-flush", base);
+    tsdb *db = open_fresh(name, opts());
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    int64_t ts[100];
+    float v[100];
+    for (int i = 0; i < 100; i++)
+        ts[i] = i;
+    for (int i = 0; i < 100; i++)
+        v[i] = 1;
+    OK(tsdb_insert_series(db, id, ts, v, 10)); /* memtable */
+    arm(F_FDATASYNC, "/tmp_", false, false);
+    CHECK(tsdb_flush(db) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(!is_failed(db, NULL));
+    for (int i = 0; i < 100; i++)
+        v[i] = 2;
+    OK(tsdb_insert_series(db, id, ts, v, 10)); /* the new active memtable */
+    for (int i = 0; i < 100; i++)
+        v[i] = 3;
+    OK(tsdb_insert_series(db, id, ts, v, 100)); /* a part, newer than both */
+    for (int round = 0; round < 2; round++) {
+        tsdb_points p = {0};
+        uint32_t sid;
+        OK(tsdb_series_lookup(db, "s", &sid));
+        OK(tsdb_query_points(db, sid, 0, 100, &p));
+        CHECK(p.n == 100);
+        int stale = 0;
+        for (size_t i = 0; i < p.n; i++)
+            stale += p.values[i] != 3;
+        if (stale)
+            fprintf(stderr, "%s: %d of %zu rows older than the last write\n", round ? "after reopen" : "live", stale, p.n);
+        CHECK(stale == 0);
+        tsdb_points_free(&p);
+        if (round == 0)
+            db = reopen(db);
+    }
+    tsdb_close(db);
+    printf("  failed flush, then a large insert over the same keys\n");
+}
+
 /* MANIFEST is rewritten in place: a failed rewrite may leave it torn. */
 static void test_manifest(const char *base)
 {
@@ -580,6 +629,7 @@ int main(int argc, char **argv)
     test_group_commit(root);
     test_torn_write(root);
     test_dir_fsync(root);
+    test_flush_retry(root);
     test_manifest(root);
     test_series_dict(root);
     test_catalog(root);

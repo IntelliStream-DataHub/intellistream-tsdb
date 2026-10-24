@@ -535,6 +535,49 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     return rc;
 }
 
+/* Writes every memtable waiting to be flushed, oldest first; one whose write
+ * failed stays in the list to be retried. Called with flush_lock held. */
+static int flush_waiting(eng *db)
+{
+    int rc = 0;
+    for (size_t i = 0; i < db->nflushing && rc == 0;) {
+        memtable *m = db->flushing[i]; /* only flush_lock holders change the list's members */
+        part_list pl = {0};
+        if ((rc = eng_check(db)) != 0) /* e.g. the MANIFEST rewrite in mt_flush failed */
+            break;
+        rc = mt_write(db, m, &pl);
+        if (rc == 0) {
+            pthread_mutex_lock(&db->publish_lock); /* numbered, named and listed in one step */
+            rc = parts_commit(db, pl.p, pl.n);
+            if (rc)
+                pthread_mutex_unlock(&db->publish_lock);
+        }
+        if (rc) {
+            parts_discard(db, pl.p, pl.n);
+            free(pl.p);
+            break;
+        }
+        pthread_mutex_lock(&db->lock);
+        for (size_t k = 0; k < pl.n; k++)
+            db_parts_insert_locked(db, pl.p[k]);
+        memmove(db->flushing + i, db->flushing + i + 1, (db->nflushing - i - 1) * sizeof *db->flushing);
+        db->nflushing--;
+        db->wal_flushed = MAX(db->wal_flushed, m->wal_seq); /* flushes go in segment order */
+        pthread_cond_signal(&db->merge_cv);
+        pthread_mutex_unlock(&db->lock);
+        pthread_mutex_unlock(&db->publish_lock);
+        manifest_publish(db);
+        free(pl.p);
+        if (db->wal_enabled) {
+            char name[64];
+            wal_name(name, sizeof name, m->wal_seq);
+            unlinkat(db->dirfd, name, 0);
+        }
+        mt_unref(m);
+    }
+    return rc;
+}
+
 /* Turns the active memtable into parts. Rows stay visible throughout: the
  * memtable is moved to the flushing list and only leaves it together with
  * the publication of its parts. */
@@ -543,12 +586,16 @@ int mt_flush(eng *db)
     if (db->opt.read_only)
         return 0;
     pthread_mutex_lock(&db->flush_lock);
+    /* a memtable whose write failed earlier holds older rows than the active
+     * one: it is written first, and the active one after it all the same, or
+     * a large insert that relies on this flush would be shadowed by it */
+    int rc = flush_waiting(db);
     wal_writer_enter(db); /* no commit may write to the segment being retired */
     pthread_mutex_lock(&db->buf_lock);
     bool empty = db->active->rows == 0;
     pthread_mutex_unlock(&db->buf_lock);
-    int rc = eng_check(db); /* rows of a failed engine may not be durable: none become parts */
-    /* a memtable whose write failed earlier is retried before a new one is started */
+    if (rc == 0)
+        rc = eng_check(db); /* rows of a failed engine may not be durable: none become parts */
     if (rc == 0 && !empty && db->nflushing == 0) {
         uint64_t seq = db->wal_seq + 1;
         int newfd = -1;
@@ -589,42 +636,8 @@ int mt_flush(eng *db)
     }
     wal_writer_leave(db);
 
-    /* write every memtable waiting to be flushed (earlier failures are retried) */
-    for (size_t i = 0; i < db->nflushing && rc == 0;) {
-        memtable *m = db->flushing[i]; /* only flush_lock holders change the list's members */
-        part_list pl = {0};
-        if ((rc = eng_check(db)) != 0) /* e.g. the MANIFEST rewrite above failed */
-            break;
-        rc = mt_write(db, m, &pl);
-        if (rc == 0) {
-            pthread_mutex_lock(&db->publish_lock); /* numbered, named and listed in one step */
-            rc = parts_commit(db, pl.p, pl.n);
-            if (rc)
-                pthread_mutex_unlock(&db->publish_lock);
-        }
-        if (rc) {
-            parts_discard(db, pl.p, pl.n);
-            free(pl.p);
-            break;
-        }
-        pthread_mutex_lock(&db->lock);
-        for (size_t k = 0; k < pl.n; k++)
-            db_parts_insert_locked(db, pl.p[k]);
-        memmove(db->flushing + i, db->flushing + i + 1, (db->nflushing - i - 1) * sizeof *db->flushing);
-        db->nflushing--;
-        db->wal_flushed = MAX(db->wal_flushed, m->wal_seq); /* flushes go in segment order */
-        pthread_cond_signal(&db->merge_cv);
-        pthread_mutex_unlock(&db->lock);
-        pthread_mutex_unlock(&db->publish_lock);
-        manifest_publish(db);
-        free(pl.p);
-        if (db->wal_enabled) {
-            char name[64];
-            wal_name(name, sizeof name, m->wal_seq);
-            unlinkat(db->dirfd, name, 0);
-        }
-        mt_unref(m);
-    }
+    if (rc == 0)
+        rc = flush_waiting(db);
     pthread_mutex_unlock(&db->flush_lock);
     return rc;
 }
