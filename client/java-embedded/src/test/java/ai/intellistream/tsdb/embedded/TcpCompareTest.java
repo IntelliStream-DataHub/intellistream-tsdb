@@ -9,8 +9,6 @@ import ai.intellistream.tsdb.ValuePoints;
 import ai.intellistream.tsdb.ValueType;
 
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -78,19 +76,24 @@ class TcpCompareTest {
             db.insertSeriesValues(ids[4], ts, Column.ofStates(st).withNulls(nulls));
             db.insert(ids[0], new long[] {T0}, new float[] {123}); /* a correction, in the memtable */
         }
-        int port;
-        try (ServerSocket s = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-            port = s.getLocalPort();
-        }
+        /* tsdbd picks a free port itself (--port 0) and writes "PORT PID" to the port file once it serves: a port
+         * picked here and released could be taken by another tree's tsdbd, whose answers this test would then check */
         Path log = tmp.resolve("tsdbd.log");
-        Process server = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", Integer.toString(port),
-                "--no-fsync", "--workers", "2").redirectErrorStream(true).redirectOutput(log.toFile()).start();
+        Path portFile = tmp.resolve("tsdbd.port");
+        Process server = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", "0", "--port-file",
+                portFile.toString(), "--no-fsync", "--workers", "2").redirectErrorStream(true).redirectOutput(log.toFile()).start();
         try {
-            String ready = "on 127.0.0.1:" + port + ",";
-            for (int i = 0; i < 500 && server.isAlive()
-                    && !Files.readString(log, StandardCharsets.UTF_8).contains(ready); i++)
-                Thread.sleep(20);
-            assertTrue(server.isAlive(), () -> "tsdbd: " + read(log));
+            int port = -1;
+            for (int i = 0; i < 1500 && server.isAlive() && port < 0; i++) {
+                if (Files.exists(portFile)) {
+                    String[] pf = Files.readString(portFile, StandardCharsets.UTF_8).trim().split("\\s+");
+                    assertEquals(server.pid(), Long.parseLong(pf[1]), "the port file names another process");
+                    port = Integer.parseInt(pf[0]);
+                } else {
+                    Thread.sleep(20);
+                }
+            }
+            assertTrue(server.isAlive() && port > 0, () -> "tsdbd did not serve: " + read(log));
             try (EmbeddedDb db = EmbeddedDb.open(dir.toString(), new EmbeddedOptions().readOnly(true));
                  TsdbClient tcp = TsdbClient.connect("127.0.0.1", port)) {
                 for (int k = 0; k < names.length; k++) {
