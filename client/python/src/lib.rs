@@ -328,7 +328,8 @@ impl Bucket {
         self.count
     }
 
-    /// Sum of the values, as a float.
+    /// Sum of the values, as a float. A NaN sum, min or max is always the quiet NaN
+    /// 0x7ff8000000000000, whatever NaNs were stored, so results compare bit for bit.
     #[getter]
     fn sum(&self) -> f64 {
         self.sum
