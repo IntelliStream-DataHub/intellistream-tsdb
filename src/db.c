@@ -132,19 +132,18 @@ static size_t partition_part_count_locked(eng *db, int64_t partition)
     return n;
 }
 
-int db_add_part(eng *db, part *p) { return db_add_parts(db, &p, 1); }
-
-/* Publishes parts together: a query sees all of them or none. */
-int db_add_parts(eng *db, part **ps, size_t n)
+/* Publishes parts together: a query sees all of them or none. The result of
+ * manifest_publish is not the caller's: its parts are committed and listed. */
+void db_add_parts(eng *db, part **ps, size_t n)
 {
     if (n == 0)
-        return 0;
+        return;
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < n; i++)
         db_parts_insert_locked(db, ps[i]);
     pthread_cond_signal(&db->merge_cv);
     pthread_mutex_unlock(&db->lock);
-    return manifest_publish(db);
+    manifest_publish(db);
 }
 
 /* Waits while a partition has too many parts (parts_to_delay_insert). */

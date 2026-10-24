@@ -16,6 +16,20 @@
  * operation (after $CRASHFS_WARMUP of them), or at the next one after
  * SIGUSR2. Every tracked operation runs under one lock, so no thread can
  * write while the state is being rolled back.
+ *
+ * With CRASHFS_MODE=eio the fault is an I/O error instead, the way Linux
+ * reports a failed writeback ("fsyncgate", PostgreSQL 2018): at the point
+ * where a power loss would happen, the next write, pwrite, fsync or fdatasync
+ * of a tracked file fails with EIO (a write after storing half of its bytes).
+ * From then on that file or directory lies, in the worst way Linux allows:
+ * its syncs return 0 but make nothing durable, because the kernel dropped the
+ * pages and cleared the error. When the process exits, everything not made
+ * durable is rolled back as in a power loss, so a write acknowledged after
+ * the error, on the strength of a sync that lied, is lost and a checker sees
+ * it. One fault per process; SIGUSR2 after it is a power loss at the next
+ * tracked operation, for a process that carries on. With $CRASHFS_EIO_ONLY, only files whose name
+ * starts with it fail (e.g. "wal_"). If $CRASHFS_MARK is set, the path of the
+ * file that failed is written there, so a harness knows the fault happened.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -50,6 +64,7 @@ typedef struct file {
     } dirty[MAX_DIRTY];
     int ndirty;
     bool used;
+    bool lying; /* after an injected EIO: syncs succeed without making anything durable */
 } file;
 
 typedef enum { OP_CREATE, OP_RENAME, OP_UNLINK, OP_MKDIR } op_kind;
@@ -71,6 +86,9 @@ static double prob;
 static long warmup, ops;
 static uint64_t rng;
 static volatile sig_atomic_t crash_requested;
+static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
+static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error */
+static char mark[PATH_MAX], eio_only[64];
 static char *fdpath[MAX_FDS];
 static file *files;
 static size_t nfiles;
@@ -127,6 +145,11 @@ __attribute__((constructor)) static void init(void)
     rng = rng * 6364136223846793005ull + 1;
     files = calloc(MAX_FILES, sizeof *files);
     dops = calloc(MAX_OPS, sizeof *dops);
+    eio_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "eio");
+    if (getenv("CRASHFS_EIO_ONLY"))
+        snprintf(eio_only, sizeof eio_only, "%s", getenv("CRASHFS_EIO_ONLY"));
+    if (getenv("CRASHFS_MARK"))
+        snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
     signal(SIGUSR2, on_usr2);
     active = files && dops;
 }
@@ -243,7 +266,8 @@ static void rm_tree(const char *p)
     }
 }
 
-__attribute__((noreturn)) static void power_loss(void)
+/* Rolls the tracked tree back to what was made durable. Called with the lock held. */
+static void rollback(void)
 {
     /* file data first, by each file's current name */
     for (size_t i = 0; i < nfiles; i++) {
@@ -292,18 +316,79 @@ __attribute__((noreturn)) static void power_loss(void)
     for (size_t i = 0; i < ndops; i++)
         if (dops[i].done && dops[i].saved[0])
             rm_tree(dops[i].saved);
+}
+
+__attribute__((noreturn)) static void power_loss(void)
+{
+    rollback();
     static const char msg[] = "crashfs: power loss\n";
     if (real_write(2, msg, sizeof msg - 1) < 0) {
     }
     _exit(99);
 }
 
-/* Called with the lock held, before each tracked operation. */
+/* Called with the lock held, before each tracked operation. In eio mode a
+ * fault only becomes due here; eio_now() injects it at the next write or sync. */
 static void maybe_crash(void)
 {
     ops++;
+    if (eio_mode) {
+        if (eio_done && crash_requested) /* a process that carried on after the error loses power */
+            power_loss();
+        if (!eio_done && !crash_requested && ops > warmup && prob > 0 && urand() < prob)
+            crash_requested = 1;
+        return;
+    }
     if (crash_requested || (ops > warmup && prob > 0 && urand() < prob))
         power_loss();
+}
+
+/* Called with the lock held by a write or sync of fd: true if it must fail
+ * with EIO now. Marks the file (or directory) as lying from here on. */
+static bool eio_now(int fd, const char *what)
+{
+    if (!eio_mode || eio_done || !crash_requested)
+        return false;
+    const char *base = strrchr(fdpath[fd], '/') ? strrchr(fdpath[fd], '/') + 1 : fdpath[fd];
+    if (eio_only[0] && strncmp(base, eio_only, strlen(eio_only)) != 0)
+        return false;
+    eio_done = true;
+    crash_requested = 0;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+        snprintf(lying_dir, sizeof lying_dir, "%s", fdpath[fd]);
+    } else {
+        file *f = file_get(fdpath[fd], false);
+        if (f)
+            f->lying = true;
+    }
+    char msg[PATH_MAX + 64];
+    int n = snprintf(msg, sizeof msg, "crashfs: EIO on %s of %s\n", what, fdpath[fd]);
+    if (real_write(2, msg, (size_t)n) < 0) {
+    }
+    if (mark[0]) {
+        int m = real_open(mark, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (m >= 0) {
+            n = snprintf(msg, sizeof msg, "%s\n", fdpath[fd]);
+            if (real_write(m, msg, (size_t)n) < 0) {
+            }
+            real_close(m);
+        }
+    }
+    return true;
+}
+
+/* After an injected EIO the process may exit on its own (fail-stop) or be
+ * stopped: either way, what its lying syncs did not make durable is gone. */
+__attribute__((destructor)) static void fini(void)
+{
+    if (!eio_done)
+        return;
+    pthread_mutex_lock(&lock); /* never released: no thread writes after this */
+    rollback();
+    static const char msg[] = "crashfs: at exit, unsynced data lost\n";
+    if (real_write(2, msg, sizeof msg - 1) < 0) {
+    }
 }
 
 /* --------------------------------------------------------------- hooks */
@@ -381,6 +466,13 @@ ssize_t write(int fd, const void *buf, size_t n)
         return real_write(fd, buf, n);
     pthread_mutex_lock(&lock);
     maybe_crash();
+    if (eio_now(fd, "write")) {
+        if (n > 1 && real_write(fd, buf, n / 2) < 0) { /* a torn record */
+        }
+        pthread_mutex_unlock(&lock);
+        errno = EIO;
+        return -1;
+    }
     ssize_t r = real_write(fd, buf, n); /* tsdb only appends with write() */
     pthread_mutex_unlock(&lock);
     return r;
@@ -393,6 +485,9 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
     pthread_mutex_lock(&lock);
     maybe_crash();
     file *f = file_get(fdpath[fd], false);
+    bool fail = eio_now(fd, "pwrite");
+    if (fail)
+        n = n > 1 ? n / 2 : 0;
     if (f && off < f->durable) { /* a rewrite of durable data */
         if (f->ndirty < MAX_DIRTY) {
             f->dirty[f->ndirty].off = off;
@@ -404,6 +499,10 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
     }
     ssize_t r = real_pwrite(fd, buf, n, off);
     pthread_mutex_unlock(&lock);
+    if (fail) {
+        errno = EIO;
+        return -1;
+    }
     return r;
 }
 
@@ -415,10 +514,19 @@ static int do_sync(int fd, bool data_only)
         return data_only ? real_fdatasync(fd) : real_fsync(fd);
     pthread_mutex_lock(&lock);
     maybe_crash();
+    if (eio_now(fd, data_only ? "fdatasync" : "fsync")) { /* the pages are dropped: nothing becomes durable */
+        pthread_mutex_unlock(&lock);
+        errno = EIO;
+        return -1;
+    }
     int r = data_only ? real_fdatasync(fd) : real_fsync(fd);
     if (r == 0) {
         struct stat st;
         if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (lying_dir[0] && !strcmp(lying_dir, fdpath[fd])) {
+                pthread_mutex_unlock(&lock);
+                return 0;
+            }
             /* the directory's entries are durable now */
             for (size_t i = 0; i < ndops; i++)
                 if (!dops[i].done && !strcmp(dops[i].dir, fdpath[fd])) {
@@ -429,7 +537,7 @@ static int do_sync(int fd, bool data_only)
                 }
         } else {
             file *f = file_get(fdpath[fd], false);
-            if (f) {
+            if (f && !f->lying) {
                 f->durable = st.st_size;
                 f->ndirty = 0;
             }

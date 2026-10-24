@@ -684,8 +684,10 @@ codec_ctx *cc_get(struct eng *db);
 void cc_put(struct eng *db, codec_ctx *c);
 
 int64_t partition_of(const struct eng *db, int64_t ts);
-int db_add_part(struct eng *db, part *p);
-int db_add_parts(struct eng *db, part **ps, size_t n);
+/* Lists committed parts, taking over the caller's references, and rewrites
+ * MANIFEST. Cannot fail: once listed, the parts are published and must not
+ * be discarded; a MANIFEST failure fails the engine by itself (eng_fail). */
+void db_add_parts(struct eng *db, part **ps, size_t n);
 void db_wait_merges(struct eng *db, int64_t partition);
 void db_parts_insert_locked(struct eng *db, part *p);
 void db_parts_remove_locked(struct eng *db, part *p);

@@ -459,6 +459,33 @@ static void test_manifest(const char *base)
     expect_rows(db, "s", want, 1);
     tsdb_close(db);
     printf("  failed MANIFEST rewrite\n");
+
+    /* The same failure while publishing an insert's parts: they are committed
+     * (renamed, directory synced) and listed before MANIFEST is rewritten, so
+     * the insert succeeded and the parts must stay. Discarding them freed
+     * parts that queries still found in the list. */
+    snprintf(name, sizeof name, "%s/failstop-manifest-insert", base);
+    db = open_fresh(name, opts());
+    OK(tsdb_series(db, "s", &id));
+    int64_t ts[100];
+    float v[100];
+    for (int i = 0; i < 100; i++) {
+        ts[i] = 10 + i;
+        v[i] = (float)i;
+    }
+    arm(F_PWRITE, "/MANIFEST", false, false);
+    OK(tsdb_insert_series(db, id, ts, v, 100)); /* a part, straight away */
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "MANIFEST"));
+    tsdb_points p = {0};
+    OK(tsdb_query_points(db, id, 0, 1000, &p));
+    CHECK(p.n == 100 && p.ts[0] == 10 && p.values[99] == 99);
+    tsdb_points_free(&p);
+    CHECK(tsdb_insert_series(db, id, ts, v, 100) == TSDB_ERR_IO);
+    db = reopen(db);
+    expect_rows(db, "s", ts, 100);
+    tsdb_close(db);
+    printf("  failed MANIFEST rewrite after an insert's commit\n");
 }
 
 /* A torn series dictionary record ends the dictionary for the next open. */

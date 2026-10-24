@@ -2,7 +2,7 @@
  * A Jepsen-style test of tsdbd: clients write and read through the network
  * while a nemesis crashes the server, and a checker verifies the history.
  *
- *   jepsen --dir DIR [--nemesis kill|power|pause|none] [--seconds 20]
+ *   jepsen --dir DIR [--nemesis kill|power|pause|eio|none] [--seconds 20]
  *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so]
  *
  * Model. Each series is a set of keys (timestamps) holding the id of the write
@@ -14,7 +14,15 @@
  *
  * Nemeses: kill (SIGKILL the server), power (the crashfs shim rolls the
  * directory back to what was fsync'd, then the server dies), pause
- * (SIGSTOP/SIGCONT). After each fault the server is restarted.
+ * (SIGSTOP/SIGCONT), eio (the crashfs shim fails one write or sync with EIO
+ * and from then on lies about that file's syncs, as Linux may after a failed
+ * writeback; at exit it rolls back what was not made durable). After an EIO
+ * on anything already relied upon (the WAL, MANIFEST, a dictionary, CATALOG,
+ * the directory) the server must stop by itself with exit status 1
+ * (fail-stop); after one on an unpublished part (tmp_*) or intent (txn_*) it
+ * may stop or carry on, and then loses power (or, if idle, is stopped with
+ * SIGTERM).
+ * After each fault the server is restarted.
  *
  * Checks, with applied(w) = acknowledged, or found in the final state, or seen
  * by a read:
@@ -35,6 +43,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -85,6 +94,8 @@ static atomic_bool stop;
 static atomic_int server_pid;
 static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
 static int restarts;
+static char markpath[PATH_MAX]; /* eio: crashfs writes the path of the file it failed here */
+static int failstops, eio_problems;
 
 static int64_t now_ns(void)
 {
@@ -111,6 +122,7 @@ static void start_server(bool faulty)
     char portstr[16], pms[32];
     snprintf(portstr, sizeof portstr, "%d", port);
     snprintf(pms, sizeof pms, "%lld", PARTITION_MS);
+    unlink(markpath);
     pid_t pid = fork();
     if (pid == 0) {
         if (faulty && crashfs) {
@@ -121,6 +133,12 @@ static void start_server(bool faulty)
             setenv("CRASHFS_SEED", sd, 1);
             setenv("CRASHFS_PROB", "0.0005", 1);
             setenv("CRASHFS_WARMUP", "200", 1);
+            if (!strcmp(nemesis, "eio")) {
+                setenv("CRASHFS_MODE", "eio", 1);
+                setenv("CRASHFS_MARK", markpath, 1);
+                if (restarts % 2 == 0) /* every other server: the WAL, where an error must stop it */
+                    setenv("CRASHFS_EIO_ONLY", "wal_", 1);
+            }
         }
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0 && !getenv("JEPSEN_VERBOSE"))
@@ -143,6 +161,7 @@ static void start_server(bool faulty)
         if (waitpid(pid, &st, WNOHANG) == pid) { /* crashed while starting (power loss at open) */
             if (getenv("JEPSEN_VERBOSE"))
                 fprintf(stderr, "jepsen: %d died while starting\n", (int)pid);
+            unlink(markpath); /* an EIO while opening: the clean server below has no fault */
             pid = fork();
             if (pid == 0) {
                 execl(getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd", "tsdbd", "--dir", dir, "--port",
@@ -301,6 +320,59 @@ static void *nemesis_thread(void *arg)
             atomic_store(&server_pid, 0);
             start_server(true);
             restarts++;
+        } else if (!strcmp(nemesis, "eio")) {
+            pid_t pid = atomic_load(&server_pid);
+            int st = 0;
+            bool gone = waitpid(pid, &st, WNOHANG) == pid;
+            if (!gone && access(markpath, F_OK) != 0) { /* the next write or sync fails */
+                signal_pid(pid, SIGUSR2);
+                for (int i = 0; i < 100 && access(markpath, F_OK) != 0; i++)
+                    usleep(10000);
+            }
+            if (access(markpath, F_OK) == 0) {
+                for (int i = 0; !gone && i < 100; i++) /* fail-stop takes about 220 ms */
+                    if (!(gone = waitpid(pid, &st, WNOHANG) == pid))
+                        usleep(10000);
+                char failed[PATH_MAX] = "";
+                FILE *m = fopen(markpath, "r");
+                if (m) {
+                    if (fgets(failed, sizeof failed, m))
+                        failed[strcspn(failed, "\n")] = 0;
+                    fclose(m);
+                }
+                const char *base = strrchr(failed, '/') ? strrchr(failed, '/') + 1 : failed;
+                if (gone) {
+                    failstops++;
+                    if (!WIFEXITED(st) || WEXITSTATUS(st) != 1) {
+                        eio_problems++;
+                        fprintf(stderr, "  after EIO on %s the server ended with status %#x, not exit 1\n", failed, st);
+                    }
+                } else {
+                    /* only an unpublished part (tmp_) or an intent whose name was never synced (txn_) fails
+                     * just the call; the WAL, MANIFEST, the dictionaries, CATALOG and the directory are
+                     * relied upon (class b in docs/design.md): fail-stop */
+                    if (strncmp(base, "tmp_", 4) && strncmp(base, "txn_", 4)) {
+                        eio_problems++;
+                        fprintf(stderr, "  after EIO on %s the server is still running after 1 s\n", failed);
+                    }
+                    signal_pid(pid, SIGUSR2); /* a power loss at its next file operation */
+                    for (int i = 0; i < 100 && waitpid(pid, &st, WNOHANG) != pid; i++)
+                        usleep(10000);
+                    if (signal_pid(pid, 0) == 0) { /* idle: stopped, the shim rolls back at exit */
+                        signal_pid(pid, SIGTERM);
+                        waitpid(pid, &st, 0);
+                    }
+                }
+                atomic_store(&server_pid, 0);
+                start_server(true);
+                restarts++;
+            } else if (gone) {
+                eio_problems++;
+                fprintf(stderr, "  the server ended (status %#x) without a fault\n", st);
+                atomic_store(&server_pid, 0);
+                start_server(true);
+                restarts++;
+            }
         } else if (!strcmp(nemesis, "pause")) {
             pid_t pid = atomic_load(&server_pid);
             signal_pid(pid, SIGSTOP);
@@ -559,8 +631,9 @@ int main(int argc, char **argv)
         default: return 2;
         }
     }
-    if (!dir || (!strcmp(nemesis, "power") && !crashfs)) {
-        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|none] [--seconds S] [--clients N]\n"
+    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio");
+    if (!dir || (shim && !crashfs)) {
+        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|none] [--seconds S] [--clients N]\n"
                         "              [--seed N] [--crashfs build/libcrashfs.so]\n");
         return 2;
     }
@@ -570,6 +643,7 @@ int main(int argc, char **argv)
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0)
         return 2;
+    snprintf(markpath, sizeof markpath, "%s.eio", dir);
     writes = calloc(MAX_OPS, sizeof *writes);
     reads = calloc(MAX_OPS, sizeof *reads);
 
@@ -584,7 +658,7 @@ int main(int argc, char **argv)
         }
     }
     tsdbc_close(c);
-    if (!strcmp(nemesis, "power")) { /* from here on, file operations may lose power */
+    if (shim) { /* from here on, file operations may lose power or fail */
         pthread_mutex_lock(&server_lock);
         stop_server(SIGTERM);
         start_server(true);
@@ -609,7 +683,7 @@ int main(int argc, char **argv)
     int st;
     if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid)
         atomic_store(&server_pid, 0);
-    stop_server(SIGKILL);
+    stop_server(strcmp(nemesis, "eio") ? SIGKILL : SIGTERM); /* eio: the shim rolls back at a normal exit */
     start_server(false);
     static uint32_t final[NSERIES][NKEYS], again[NSERIES][NKEYS];
     final_state(final);
@@ -630,6 +704,11 @@ int main(int argc, char **argv)
     if (memcmp(final, again, sizeof final) != 0)
         VIOLATION("the state changed across a clean restart\n");
     int v = check(final);
+    if (!strcmp(nemesis, "eio")) {
+        printf("eio: %d fail-stops\n", failstops);
+        v += eio_problems;
+    }
+    unlink(markpath);
     if (system(cmd) != 0)
         return 2;
     if (v) {

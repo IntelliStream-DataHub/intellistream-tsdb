@@ -471,7 +471,7 @@ int parts_publish(eng *db, part **ps, size_t n)
     pthread_mutex_lock(&db->publish_lock);
     int rc = parts_commit(db, ps, n);
     if (rc == 0)
-        rc = db_add_parts(db, ps, n);
+        db_add_parts(db, ps, n); /* published: whatever happens to MANIFEST, the caller must not discard them */
     pthread_mutex_unlock(&db->publish_lock);
     return rc;
 }

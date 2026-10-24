@@ -247,13 +247,14 @@ $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
 $(B)/jepsen: tests/jepsen/jepsen.c $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
-# Jepsen-style fault injection: crashes, simulated power loss and pauses while
+# Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.
 JEPSEN_DIR ?= /tmp/tsdb-jepsen
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20 && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so && \
+	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis eio   --seconds 20 --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10 || exit 1; done
 
 # Build and test on AlmaLinux 10 (the production OS) in Podman; takes minutes, logs in $LOGDIR.
