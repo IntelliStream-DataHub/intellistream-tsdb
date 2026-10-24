@@ -7,6 +7,7 @@
 #include "samekeys.h"
 
 #include <arpa/inet.h>
+#include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -40,16 +41,37 @@ static int failures;
 static int port;
 static const int64_t T0 = 1699999980000; /* on a minute boundary: buckets below are whole */
 
+/* When set, the next server runs under the crashfs shim in eio mode: SIGUSR2
+ * makes its next write or sync of a WAL segment fail, and the shim writes the
+ * failed file's path to this file. */
+static const char *eio_mark;
+
 /* extra: more arguments, NULL-terminated, or NULL */
 static pid_t start_server_with(const char *dir, const char *const *extra)
 {
-    char portstr[16];
+    char portstr[16], shim[PATH_MAX], near[PATH_MAX];
     snprintf(portstr, sizeof portstr, "%d", port);
+    const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd"; /* e.g. a sanitizer build */
+    /* the shim of the same build, next to the server */
+    snprintf(near, sizeof near, "%.*slibcrashfs.so", (int)(strrchr(bin, '/') ? strrchr(bin, '/') - bin + 1 : 0), bin);
+    if (eio_mark && !realpath(near, shim)) {
+        fprintf(stderr, "%s is missing\n", near);
+        exit(1);
+    }
     pid_t pid = fork();
     if (pid == 0) {
-        const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd"; /* e.g. a sanitizer build */
-        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", portstr, "--no-fsync", "--workers", "4"};
-        int n = 8;
+        if (eio_mark) {
+            char asan[512]; /* an ASan build of the shim, preloaded, comes before the ASan runtime */
+            snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+            setenv("LD_PRELOAD", shim, 1);
+            setenv("CRASHFS_ROOT", dir, 1);
+            setenv("CRASHFS_MODE", "eio", 1);
+            setenv("CRASHFS_EIO_ONLY", "wal_", 1);
+            setenv("CRASHFS_MARK", eio_mark, 1);
+        }
+        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", portstr, "--workers", "4", "--no-fsync"};
+        int n = eio_mark ? 7 : 8; /* under the shim, syncs are what make data survive its rollback at exit */
         if (getenv("TSDBD_IO")) { /* the event loop backend: make test runs uring and epoll */
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
@@ -898,6 +920,79 @@ static void test_same_keys(const char *dir)
     CHECK(system(cmd) == 0);
 }
 
+/* Fail-stop: a WAL write or sync fails (EIO from the crashfs shim, which
+ * from then on lies about that file's syncs, as Linux may after a failed
+ * writeback). The insert whose rows went through the failed call gets an I/O
+ * error, the server exits with status 1 instead of acknowledging anything
+ * more, and a restart has every acknowledged row. */
+static void test_wal_failstop(const char *dir)
+{
+    char cmd[1200], mark[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", dir, dir);
+    if (system(cmd) != 0) {
+        failures++;
+        return;
+    }
+    snprintf(mark, sizeof mark, "%s.mark", dir);
+    unlink(mark);
+    eio_mark = mark;
+    pid_t srv = start_server_with(dir, NULL);
+    eio_mark = NULL;
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    uint32_t id;
+    OK(tsdbc_series(c, "failstop", 1, &id));
+    enum { ROWS = 10 };
+    int64_t ts[ROWS];
+    float v[ROWS] = {0};
+    uint64_t acked = 0;
+    int first_error = 0, after = 0;
+    for (int b = 0; b < 400; b++) {
+        if (b == 50)
+            signal_pid(srv, SIGUSR2); /* the next WAL write or fdatasync fails */
+        for (int i = 0; i < ROWS; i++)
+            ts[i] = T0 + (int64_t)(b * ROWS + i) * 1000;
+        int rc = tsdbc_insert_series(c, id, ts, v, ROWS);
+        if (rc == 0 && !first_error)
+            acked += ROWS;
+        else if (rc == 0)
+            after++; /* acknowledged after a failure: what fail-stop forbids */
+        else if (!first_error)
+            first_error = rc;
+        if (first_error && rc != 0 && b > 60)
+            break;
+    }
+    CHECK(acked >= 50 * ROWS);
+    CHECK(first_error == TSDB_ERR_IO);
+    CHECK(after == 0);
+    tsdbc_close(c);
+    int status = 0;
+    pid_t got = 0;
+    for (int i = 0; i < 300 && (got = waitpid(srv, &status, WNOHANG)) == 0; i++) /* stops in about 220 ms */
+        usleep(10000);
+    CHECK(got == srv);
+    if (got != srv) {
+        signal_pid(srv, SIGKILL);
+        waitpid(srv, &status, 0);
+    }
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1);
+    CHECK(access(mark, F_OK) == 0);
+    srv = start_server_with(dir, NULL);
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    uint64_t n = count_of(c, id);
+    if (n < acked || n > acked + ROWS)
+        fprintf(stderr, "after the restart %llu rows, %llu acknowledged\n", (unsigned long long)n,
+                (unsigned long long)acked);
+    CHECK(n >= acked && n <= acked + ROWS);
+    OK(tsdbc_insert_series(c, id, ts, v, ROWS)); /* the restarted server takes writes */
+    tsdbc_close(c);
+    stop_server(srv);
+    unlink(mark);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (!failures && system(cmd) != 0)
+        failures++;
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -1089,6 +1184,9 @@ int main(int argc, char **argv)
     printf("concurrent writes to the same keys\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-samekeys-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_same_keys(dir);
+    printf("fail-stop after a WAL write error\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-failstop-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_wal_failstop(dir);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;
