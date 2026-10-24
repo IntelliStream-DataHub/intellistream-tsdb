@@ -189,6 +189,42 @@ static void make_inputs(void)
             ((uint32_t *)x->v)[i] = (uint32_t)(r >> 63) << 31 | exp << 23 | (uint32_t)(r >> 8 & 0x7fffff);
         }
     }
+    /* the same with nulls, which the kernels mask to +0.0 in their lane (lane order kept): every position mod
+     * 16 and 32, runs of nulls longer than a lane group, nothing but nulls; and float64 likewise */
+    static const size_t null_n[] = {GR, 1000, 95, 64, 47, 33, 32, 31, 17, 16, 15, 1};
+    for (size_t k = 0; k < sizeof null_n / sizeof *null_n; k++) {
+        for (int t = 0; t < 2; t++) {
+            snprintf(name, sizeof name, "%s random exponents with nulls, %zu", t ? "f64" : "f32", null_n[k]);
+            x = add(name, t ? TSDB_FLOAT64 : TSDB_FLOAT32, null_n[k]);
+            for (size_t i = 0; i < x->n; i++) {
+                uint64_t r = next();
+                bool null = r % 3 == 0 || (i / 40) % 5 == 4; /* scattered, and runs of 40 */
+                if (t) {
+                    uint64_t exp = 1023 - 60 + (r >> 8) % 121; /* 2^-60 .. 2^60 */
+                    ((uint64_t *)x->v)[i] = null ? NULL_F64 : (r >> 63) << 63 | exp << 52 | (next() >> 12);
+                } else {
+                    uint32_t exp = 127 - 40 + (uint32_t)((r >> 8) % 81);
+                    ((uint32_t *)x->v)[i] =
+                        null ? NULL_F32 : (uint32_t)(r >> 63) << 31 | exp << 23 | (uint32_t)(r >> 20 & 0x7fffff);
+                }
+            }
+        }
+    }
+    x = add("f32 only nulls", TSDB_FLOAT32, 100);
+    for (size_t i = 0; i < 100; i++)
+        ((uint32_t *)x->v)[i] = NULL_F32;
+    x = add("f64 only nulls", TSDB_FLOAT64, 100);
+    for (size_t i = 0; i < 100; i++)
+        ((uint64_t *)x->v)[i] = NULL_F64;
+    x = add("f32 NaN, inf and nulls", TSDB_FLOAT32, 200);
+    for (size_t i = 0; i < 200; i++) {
+        static const uint32_t sp[] = {0x7fc00000, 0xffc00001, 0x7f800000, 0xff800000, 0x80000000, 0, NULL_F32,
+                                      0x3f800000};
+        ((uint32_t *)x->v)[i] = sp[next() % 8];
+    }
+    x = add("f64 -0 and +0 with nulls", TSDB_FLOAT64, 100);
+    for (size_t i = 0; i < 100; i++)
+        ((uint64_t *)x->v)[i] = next() % 3 ? (next() & 1 ? 0x8000000000000000ull : 0) : NULL_F64;
     x = add("f32 -0 and +0", TSDB_FLOAT32, 100);
     for (size_t i = 0; i < 100; i++)
         ((float *)x->v)[i] = next() & 1 ? -0.0f : 0.0f;
@@ -333,6 +369,11 @@ static void run(rec *r, codec_ctx *c)
             agg_dev_init(&a.x);
             agg_fold(x->type, x->v, m, &a.a, &a.x);
             snprintf(what, sizeof what, "agg_fold %zu", m);
+            put(r, what, x->name, &a, sizeof a);
+            memset(&a, 0, sizeof a); /* without the spread: another tail (sum_finish) */
+            agg_init(&a.a, x->type);
+            agg_fold(x->type, x->v, m, &a.a, NULL);
+            snprintf(what, sizeof what, "agg_fold %zu without spread", m);
             put(r, what, x->name, &a, sizeof a);
             granule g;
             memset(&g, 0, sizeof g);

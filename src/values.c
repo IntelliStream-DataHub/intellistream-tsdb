@@ -5,10 +5,10 @@
  * Floats aggregate in double (sum, min, max; NaN is ignored by min/max and
  * propagates into sum), and their spread as m2 in two passes over each run
  * (see agg_state). Integers (int64, bool, state codes) aggregate exactly:
- * a 128-bit sum, a 192-bit sum of squares and int64 min/max. Float32 without
- * nulls uses the SIMD kernels; with nulls, or for the other types, a scalar
- * loop the compiler vectorizes where it can (never a float reduction: that
- * would change the order of the additions with the CPU level).
+ * a 128-bit sum, a 192-bit sum of squares and int64 min/max. Floats use the
+ * SIMD kernels of simd.c, whose order of additions is fixed (lanes, see there)
+ * and does not change with the CPU level; the integers a scalar loop the
+ * compiler vectorizes where it can (exact, so in any order).
  */
 #include "internal.h"
 
@@ -20,82 +20,23 @@ static size_t count_null_f32(const uint32_t *v, size_t n)
     return k;
 }
 
+static size_t count_null_f64(const uint64_t *v, size_t n)
+{
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++)
+        k += v[i] == NULL_F64;
+    return k;
+}
+
+/* the null count first (a quick pass the compiler vectorizes): without nulls the kernels skip the masking */
 static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
-    if (!may_be_null || !count_null_f32((const uint32_t *)v, n)) {
-        simd_agg_f32(v, n, a, x);
-        return;
-    }
-    double s = 0, mn = a->min, mx = a->max;
-    uint64_t c = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint32_t bits;
-        memcpy(&bits, &v[i], 4);
-        if (bits == NULL_F32)
-            continue;
-        double x = v[i];
-        c++;
-        s += x;
-        mn = x < mn ? x : mn;
-        mx = x > mx ? x : mx;
-    }
-    if (!x) {
-        a->count += c;
-        a->sum += s;
-        a->min = mn;
-        a->max = mx;
-        return;
-    }
-    double m = c ? s / (double)c : 0, d1 = 0, d2 = 0;
-    for (size_t i = 0; i < n && c; i++) {
-        uint32_t bits;
-        memcpy(&bits, &v[i], 4);
-        if (bits == NULL_F32)
-            continue;
-        double d = (double)v[i] - m;
-        d1 += d;
-        d2 += d * d;
-    }
-    agg_add_run(a, x, c, s, d1, d2);
-    a->min = mn;
-    a->max = mx;
+    simd_fold_f32(v, n, may_be_null ? count_null_f32((const uint32_t *)v, n) : 0, a, x);
 }
 
 static void fold_f64(const double *v, size_t n, agg_state *a, agg_dev *x)
 {
-    double s = 0, mn = a->min, mx = a->max;
-    uint64_t c = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint64_t bits;
-        memcpy(&bits, &v[i], 8);
-        if (bits == NULL_F64)
-            continue;
-        double x = v[i];
-        c++;
-        s += x;
-        mn = x < mn ? x : mn;
-        mx = x > mx ? x : mx;
-    }
-    if (!x) {
-        a->count += c;
-        a->sum += s;
-        a->min = mn;
-        a->max = mx;
-        return;
-    }
-    double m = c ? s / (double)c : 0, d1 = 0, d2 = 0;
-    for (size_t i = 0; i < n && c; i++) {
-        uint64_t bits;
-        memcpy(&bits, &v[i], 8);
-        if (bits == NULL_F64)
-            continue;
-        double d = v[i] - m;
-        d1 += d;
-        d2 += d * d;
-    }
-    agg_add_run(a, x, c, s, d1, d2);
-    a->min = mn;
-    a->max = mx;
+    simd_fold_f64(v, n, count_null_f64((const uint64_t *)v, n), a, x);
 }
 
 static void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)

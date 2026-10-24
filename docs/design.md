@@ -107,8 +107,9 @@ What is bit-reproducible:
 - int64 and bool: every spread value, in every order, path and CPU.
 - Floats: the m2 of one run of rows is the same on every CPU level and kernel
   (`TSDB_CPU`, `TSDB_SIMD`): the scalar, AVX2 and AVX-512 kernels keep 32
-  lanes and halve them in the same order, as for sums (test_spread checks all
-  of them bit for bit, on varied runs and on whole databases). How runs and granules combine follows how parts were
+  lanes (float32) or 16 (float64) and halve them in the same order, as for
+  sums (test_spread and test_levels check all of them bit for bit, on varied
+  runs, with and without nulls, and on whole databases). How runs and granules combine follows how parts were
   merged and the query split over threads, so like float sums the variances
   may differ in the last bits after a merge.
 - range comes from min and max and is exact (for int64 the difference of two
@@ -972,6 +973,24 @@ Skylake-SP, Cascade Lake and Cooper Lake Xeons, which lower the clock of the
 core after 512-bit instructions. `TSDB_SIMD=avx512|avx2|scalar` overrides the
 choice. In a portable build the codecs are compiled per CPU level instead (see
 "Decoding and CPU levels" above).
+
+Every kernel gives the same bits, so a granule's statistics do not depend on
+the CPU that wrote them. Float additions are not associative, so floats are
+summed in one fixed order on every path: float32 in 32 double lanes, float64
+in 16 (lane j takes values j, j+16, j+32, ...; 16 because AVX2 then still
+holds sums, minima and maxima in its 16 registers), then the lanes are halved
+(lane j + lane j+8, j + j+4, ...). The scalar code is written in the same
+lanes. min and max are compared lane by lane the same way, which decides the
+sign of a zero minimum. A null (a reserved value, a NaN for floats) adds +0.0
+to its lane instead of being skipped: a lane starts at +0.0 and never becomes
+-0.0, so +0.0 changes nothing and the lane order stays by position, without a
+branch per row. The kernels take the number of nulls (one quick pass counts
+them first) and mask only when there are any.
+
+Before these kernels, float64 and float32 with nulls were summed one value
+after the other; their sums and spreads may now differ from those in the last
+bits (there has been no release, so stored granule statistics were not
+rewritten). Since the order is fixed, this is a one-time change.
 
 ## Server and clients
 

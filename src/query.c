@@ -1736,17 +1736,8 @@ static int lttb_emit(lttb_run *r, int64_t ts, uint64_t v)
 static int lttb_choose_buffered(lttb_run *r)
 {
     if (r->b >= 1) {
-        double cx = r->sx / (double)r->cnt, cy = r->sy / (double)r->cnt, best = -1;
-        size_t k = 0;
-        for (size_t j = 0; j < r->cur.n; j++) {
-            double y;
-            lttb_value(r->type, r->cur.v[j], &y);
-            double a = lttb_area(r->ax, r->ay, cx, cy, lttb_x(r, r->cur.ts[j]), y);
-            if (a > best) { /* the first of equal areas wins */
-                best = a;
-                k = j;
-            }
-        }
+        double cx = r->sx / (double)r->cnt, cy = r->sy / (double)r->cnt;
+        size_t k = lttb_argmax(r->type, r->cur.ts, r->cur.v, r->cur.n, r->t0, r->ax, r->ay, cx, cy);
         lttb_value(r->type, r->cur.v[k], &r->ay);
         r->ax = lttb_x(r, r->cur.ts[k]);
         if (lttb_emit(r, r->cur.ts[k], r->cur.v[k]))

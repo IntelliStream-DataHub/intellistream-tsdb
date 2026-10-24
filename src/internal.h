@@ -345,6 +345,9 @@ static inline void agg_combine(agg_state *a, agg_dev *ax, const agg_state *b, co
  * m2 into x (a second pass over the values). Queries that do not ask for the spread pass NULL: m2 and the
  * sums of squares are the cost of the spread, and a query of tiny buckets would pay it on every row. */
 extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *x);
+/* the same with nulls: `nulls` of the n slots hold the type's null (0: none, the kernel above) */
+extern void (*simd_fold_f32)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);
+extern void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);
 /* Folds n slots of `type` into a, skipping nulls, with the spread (values.c; granule statistics). */
 void agg_fold(int type, const void *v, size_t n, agg_state *a, agg_dev *x);
 /* the same, skipping the search for nulls when the caller knows there are none (a granule's count), and
@@ -380,6 +383,11 @@ static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
         b->max = a->max;
     }
 }
+/* LTTB (query.c): the index of the point with the largest triangle area with a = (ax, ay) and the mean c of
+ * the next bucket, the first of equal areas, 0 when none is a number. Points are slot bits (zero-extended) of
+ * values that are points (no nulls, NaN or infinities); x is milliseconds since t0. */
+size_t lttb_argmax(int type, const int64_t *ts, const uint64_t *v, size_t n, int64_t t0, double ax, double ay,
+                   double cx, double cy);
 const char *simd_name(void);
 void simd_init(void);
 /* Re-picks the kernels for at most `level` (CPU_BASE: scalar, CPU_V3: AVX2, CPU_V4: AVX-512); cpu.c calls it. */
