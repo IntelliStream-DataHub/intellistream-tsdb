@@ -26,7 +26,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * them. The series are created first, named as tsdbc-bench names them; then the file is split into contiguous
  * slices, one per connection, and each connection sends its slice in batches with the many-series layout, with up
  * to four batches in flight before it waits for their acknowledgements. Rows are read from the memory-mapped file
- * during the run. The result is rows per second and the bytes written to the connections per row.
+ * during the run. The result is rows per second, the bytes written to the connections per row and the CPU time of the
+ * process, in the format of tsdbc-bench ({@code BenchCommon}).
  */
 public final class InsertBench {
     private static final String[] KINDS = {"hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate",
@@ -82,6 +83,7 @@ public final class InsertBench {
             final String h = host;
             final int p = port, b = batch, l = level;
             long t0 = System.nanoTime();
+            double cpu0 = BenchCommon.cpuSeconds();
             for (int c = 0; c < conns; c++) {
                 long from = n * c / conns, to = n * (c + 1) / conns;
                 int k = c;
@@ -97,7 +99,7 @@ public final class InsertBench {
             }
             for (Thread t : threads)
                 t.join();
-            double dt = (System.nanoTime() - t0) / 1e9;
+            double dt = (System.nanoTime() - t0) / 1e9, cpu = BenchCommon.cpuSeconds() - cpu0;
             if (failed.get() != null) {
                 System.err.println("InsertBench: " + failed.get());
                 System.exit(1);
@@ -105,9 +107,8 @@ public final class InsertBench {
             long wire = 0;
             for (long x : bytes)
                 wire += x;
-            System.out.printf("load over TCP (Java): %d rows in %.2f s = %.1f M rows/s (%d connections, batches of %d,"
-                    + " %s), %.2f bytes/row sent%n", n, dt, n / dt / 1e6, conns, batch,
-                    level == 0 ? "plain" : "zstd level " + level, wire / (double) n);
+            BenchCommon.reportLoad("java", conns, level, n, dt, wire, cpu, ", batches of " + batch + ", "
+                    + (level == 0 ? "plain" : "zstd level " + level));
         }
     }
 
