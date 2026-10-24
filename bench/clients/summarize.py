@@ -13,11 +13,15 @@ from pathlib import Path
 # the aggregates cover the same window. A client that draws other windows (another generator, a wrong step) differs.
 ROWS_PER_QUERY_TOLERANCE = 0.10
 
-ORDER = ["embedded-fsync", "embedded-nofsync", "embedded", "c", "rust", "python", "java"]
+ORDER = ["embedded-fsync", "embedded-nofsync", "embedded", "embedded-java-fsync", "embedded-java-nofsync", "embedded-java",
+         "c", "rust", "python", "java"]
 NAMES = {
     "embedded-fsync": "embedded C, fsync on",
     "embedded-nofsync": "embedded C, fsync off",
     "embedded": "embedded C",
+    "embedded-java-fsync": "embedded Java (FFM), fsync on",
+    "embedded-java-nofsync": "embedded Java (FFM), fsync off",
+    "embedded-java": "embedded Java (FFM)",
     "c": "C over TCP",
     "rust": "Rust over TCP",
     "python": "Python over TCP",

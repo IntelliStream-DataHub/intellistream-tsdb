@@ -1,10 +1,11 @@
 # Embedded C and the four tsdbd clients, side by side
 
-One data set, loaded and queried by the same program in six ways:
+One data set, loaded and queried by the same program in seven ways:
 
 | row in the tables | program | path |
 |---|---|---|
 | embedded C, fsync on / off | `build/tsdb-bench --load`, `--qps` | libtsdb in the process: no server, no network |
+| embedded Java (FFM), fsync on / off | `client/java-embedded/.../bench/EmbeddedBench.java --load`, `--qps` | `EmbeddedDb`: libtsdb in the JVM through the FFM API (Java 22+) |
 | C over TCP | `build/tsdbc-bench` | `client/tsdb_client.c` to tsdbd |
 | Rust over TCP | `client/rust/examples/insert_bench.rs`, `query_bench.rs` | `tsdb-client` crate |
 | Python over TCP | `client/python/bench_insert.py`, `bench_query.py` | `tsdb_client` (PyO3 over the Rust crate), threads |
@@ -22,7 +23,7 @@ bench/clients/run.sh --series 10 --points 100000 --repeat 1 --seconds 1   # a sm
 ```
 
 Options: `--port` (tsdbd, default 17070), `--conns "1 4 16"` (loader connections or threads), `--qthreads "1 32"`,
-`--clients "c rust python java"`, `--only load|query`, `--repeat N`, `--seconds S` (per query class), `--no-build`,
+`--clients "c rust python java java-embedded"`, `--only load|query`, `--repeat N`, `--seconds S` (per query class), `--no-build`,
 `--force`.
 
 It needs cargo (Rust), python3 with venv and pip (a virtual environment `build/pyvenv` gets maturin and numpy;
@@ -41,15 +42,16 @@ What it does:
 1. Builds everything (`make`, `cargo build --release --examples`, `maturin develop --release`, `mvn package`).
 2. Records the machine: CPU, memory, kernel, governor, file system, git revision, tool versions.
 3. Exports the data set once with `tsdb-bench --export` (mixed sensor kinds, time-major).
-4. Loads, per repetition: embedded with 1, 4 and 16 threads and fsync on and off; then for each client 1, 4 and
+4. Loads, per repetition: embedded C and embedded Java with 1, 4 and 16 threads and fsync on and off; then for each client 1, 4 and
    16 connections with zstd level 1 (the client default) and with plain arrays. Before every TCP load the
    tsdbd data directory is wiped and tsdbd restarted. After every load the contents are checked against the
    file: in every series the same row count and sum (from the aggregate path the query benchmarks use) and the
    same rows read back, checked by a hash over all (timestamp, value) pairs, so a loader that stores a wrong
-   timestamp fails (`tsdb-bench --load` does it in process, `tsdbc-bench verify` through the server). A mismatch
+   timestamp fails (`tsdb-bench --load` does it in process, `tsdb-bench --verify` after the embedded Java load,
+   `tsdbc-bench verify` through the server). A mismatch
    stops the run.
-5. Queries: the data set is loaded once into the embedded database and once into tsdbd (and merged,
-   `tsdb_optimize`), then for each repetition and each of 1 and 32 threads or connections, every system runs
+5. Queries: the data set is loaded once into the embedded database (embedded C and embedded Java query it in
+   turn) and once into tsdbd (and merged, `tsdb_optimize`), then for each repetition and each of 1 and 32 threads or connections, every system runs
    the three window classes for `--seconds` each.
 6. Prints Markdown (`summarize.py`): the machine, the load tables and one table per query class, each cell the
    median of the repetitions with the spread, embedded first.
