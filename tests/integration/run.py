@@ -32,7 +32,7 @@ library is enough (no third-party modules, 3.9+).
 
 Processes: every process this script starts is signalled through signal_proc(), which refuses pids <= 1 (kill(0)
 and kill(-1) reach the whole process group or every process of the user), and only by the Popen object it
-started. Nothing is ever killed by name. Ports are 10000 + pid % 20000 upwards, the first one that binds.
+started. Nothing is ever killed by name. Ports are never computed: tsdbd --port 0 --port-file reports the one it got, and the pid it reports must be ours.
 """
 import argparse
 import atexit
@@ -130,23 +130,34 @@ def _on_signal(sig, frame):
 signal.signal(signal.SIGINT, _on_signal)
 signal.signal(signal.SIGTERM, _on_signal)
 
-_port_next = [10000 + os.getpid() % 20000]
-
-
-def free_port():
-    while True:
-        port = _port_next[0]
-        _port_next[0] = 10000 + (port - 10000 + 1) % 20000
-        with socket.socket() as s:
+def owns_port(pid, port):
+    """True when process pid holds a listening TCP socket on port (read from /proc)."""
+    inodes = set()
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(f).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            fld = ln.split()
+            if len(fld) > 9 and fld[3] == "0A" and int(fld[1].rsplit(":", 1)[1], 16) == port:
+                inodes.add("socket:[%s]" % fld[9])
+    try:
+        for fd in os.listdir("/proc/%d/fd" % pid):
             try:
-                s.bind(("127.0.0.1", port))
+                if os.readlink("/proc/%d/fd/%s" % (pid, fd)) in inodes:
+                    return True
             except OSError:
-                continue
-        return port
+                pass
+    except OSError:
+        pass
+    return False
 
 
 class Server:
-    """A tsdbd. start() waits for its "serving" line, which comes after the port is bound."""
+    """A tsdbd on a port the kernel chose (--port 0 --port-file). start() waits for the port file, which tsdbd
+    writes once it serves; it names the pid, which must be the process started here and the holder of the port.
+    No port is ever computed here, and a server that did not start is an error, not a reason to try another."""
 
     def __init__(self, ctx, dirpath, log, io, follow=False, extra=()):
         self.ctx, self.dir, self.log, self.io, self.follow, self.extra = ctx, dirpath, Path(log), io, follow, list(extra)
@@ -154,30 +165,40 @@ class Server:
         self.port = None
 
     def start(self):
-        for _ in range(50):
-            self.port = free_port()
-            cmd = [str(self.ctx.tsdbd), "--dir", str(self.dir), "--listen", "127.0.0.1", "--port", str(self.port),
-                   "--workers", "4", "--io", self.io] + (["--follow", "--refresh-ms", "100"] if self.follow else []) + self.extra
-            logf = open(self.log, "ab")
-            logf.write(("$ " + " ".join(cmd) + "\n").encode())
-            logf.flush()
-            self.proc = spawn(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf)
-            logf.close()
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                if "serving" in self.log.read_text(errors="replace").split("$ ")[-1]:
-                    return self
-                if self.proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-            if self.proc.poll() is None:
+        pf = Path(str(self.log) + ".port.%d" % time.monotonic_ns())
+        cmd = [str(self.ctx.tsdbd), "--dir", str(self.dir), "--listen", "127.0.0.1", "--port", "0",
+               "--port-file", str(pf), "--workers", "4", "--io", self.io] + \
+              (["--follow", "--refresh-ms", "100"] if self.follow else []) + self.extra
+        logf = open(self.log, "ab")
+        logf.write(("$ " + " ".join(cmd) + "\n").encode())
+        logf.flush()
+        self.proc = spawn(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf)
+        logf.close()
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                tail = self.log.read_text(errors="replace").split("$ ")[-1]
+                raise RuntimeError("tsdbd exited: %s" % tail.strip()[-300:])
+            try:
+                port, pid = (int(x) for x in pf.read_text().split())
+            except (OSError, ValueError):
+                time.sleep(0.02)
+                continue
+            why = None
+            if pid != self.proc.pid:
+                why = "%s names pid %d, but the server started here is pid %d" % (pf, pid, self.proc.pid)
+            elif not owns_port(pid, port):
+                why = "port %d is not held by the server started here (pid %d)" % (port, pid)
+            if why:
                 signal_proc(self.proc, signal.SIGKILL)
                 self.proc.wait()
-                raise RuntimeError("tsdbd did not announce itself in 30 s, see %s" % self.log)
-            tail = self.log.read_text(errors="replace").split("$ ")[-1]
-            if "bind" not in tail.lower() and "address" not in tail.lower():
-                raise RuntimeError("tsdbd exited: %s" % tail.strip()[-300:])
-        raise RuntimeError("no free port")
+                raise RuntimeError(why)
+            pf.unlink()
+            self.port = port
+            return self
+        signal_proc(self.proc, signal.SIGKILL)
+        self.proc.wait()
+        raise RuntimeError("tsdbd did not announce itself in 30 s, see %s" % self.log)
 
     def stop(self):
         """SIGTERM and wait: a clean shutdown. Returns the exit status."""

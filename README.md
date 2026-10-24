@@ -352,6 +352,10 @@ build/tsdbd --dir /data/sensors --port 7070
 build/tsdbd --dir /mnt/sensors --port 7070 --follow    # a read-only copy that follows the writer
 ```
 
+`--port 0` binds a free port the kernel chooses, and `--port-file FILE` writes `PORT PID` to FILE (through a temporary
+file and a rename, once the server serves) and the start-up line names the port: a script or test that starts a server
+reads the port from there instead of guessing a free one.
+
 On AlmaLinux and RHEL 10, where io_uring is disabled by default, tsdbd runs on epoll by itself
 (`--io auto`, the default; `--io epoll` skips the attempt) and says so when it starts;
 `make NO_URING=1` builds it without io_uring, so liburing need not be installed there.

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Embedded C and the four tsdbd clients (C, Rust, Python, Java) on one data set: loads and queries, side by side.
 # See README.md. Usage:
-#   bench/clients/run.sh [--work DIR] [--port N] [--series 100] [--points 1000000] [--repeat 3] [--seconds 3]
+#   bench/clients/run.sh [--work DIR] [--port N|0] [--series 100] [--points 1000000] [--repeat 3] [--seconds 3]
 #                        [--conns "1 4 16"] [--qthreads "1 32"] [--clients "c rust python java"]
 #                        [--only load|query] [--no-build] [--force]
 set -u -o pipefail
@@ -9,7 +9,8 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 B=$ROOT/build
 WORK=${CBENCH:-/var/tmp/cbench}
-PORT=17070
+REQ_PORT=0 # --port N asks for that port, 0 for any free one; PORT is where the server says it listens
+PORT=
 SERIES=100
 POINTS=1000000
 REPEAT=3
@@ -28,7 +29,7 @@ usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 while [ $# -gt 0 ]; do
     case $1 in
     --work) WORK=$2; shift 2 ;;
-    --port) PORT=$2; shift 2 ;;
+    --port) REQ_PORT=$2; shift 2 ;;
     --series) SERIES=$2; shift 2 ;;
     --points) POINTS=$2; shift 2 ;;
     --repeat) REPEAT=$2; shift 2 ;;
@@ -130,25 +131,26 @@ stop_server() {
     fi
     SPID=""
 }
-port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
+# tsdbd picks its port (--port 0) and writes "PORT PID" to a file once it serves; PORT is whatever that says, after
+# checking that the pid is the server started here: no load or query ever goes to a server this script did not start.
 start_server() { # fresh data directory unless $1 = keep
     stop_server
-    if port_open; then # whatever answers there would get every load and query instead of our tsdbd
-        echo "run.sh: something already listens on 127.0.0.1:$PORT; pick another --port or stop it" >&2
-        exit 1
-    fi
     [ "${1:-}" = keep ] || rm -rf "$SRV"
-    "$B/tsdbd" --dir "$SRV" --port "$PORT" >>"$OUT/tsdbd.log" 2>&1 &
+    local pf=$OUT/tsdbd.port
+    rm -f "$pf"
+    "$B/tsdbd" --dir "$SRV" --port "$REQ_PORT" --port-file "$pf" >>"$OUT/tsdbd.log" 2>&1 &
     SPID=$!
-    for _ in $(seq 100); do
+    for _ in $(seq 300); do
         kill -0 "$SPID" 2>/dev/null || { echo "tsdbd died, see $OUT/tsdbd.log" >&2; exit 1; }
-        if port_open; then # and it is ours that listens, not a server that appeared after the check above
-            kill -0 "$SPID" 2>/dev/null || { echo "tsdbd died, see $OUT/tsdbd.log" >&2; exit 1; }
+        if [ -s "$pf" ]; then
+            local fpid
+            read -r PORT fpid <"$pf"
+            [ "$fpid" = "$SPID" ] || { echo "run.sh: $pf names pid $fpid, the server started here is $SPID" >&2; exit 1; }
             return 0
         fi
         sleep 0.1
     done
-    echo "tsdbd did not listen on $PORT" >&2
+    echo "tsdbd did not write $pf, see $OUT/tsdbd.log" >&2
     exit 1
 }
 trap 'stop_server' EXIT

@@ -1,19 +1,19 @@
-"""Starts build/tsdbd for each test: a free port and a fresh data directory.
+"""Starts build/tsdbd for each test: a port tsdbd chose and a fresh data directory.
 
 The binary is $TSDBD or ../../build/tsdbd (run make in the repository root);
 data goes under $TSDB_TEST_DIR or the system temp directory. The server is
-ready once it prints its "serving" line, which comes after it has bound the
-port: a successful connect alone could reach another server on that port.
+ready once it has written its port file (--port 0 --port-file: "PORT PID"); the
+pid must be the child's, so a test never talks to a server it did not start.
 """
 
 import os
 import pathlib
 import shutil
 import signal
-import socket
 import subprocess
 import tempfile
 import threading
+import time
 
 import pytest
 
@@ -24,29 +24,41 @@ TSDBD = os.environ.get("TSDBD", str(ROOT / "build" / "tsdbd"))
 class Server:
     def __init__(self, base):
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix="tsdb-py-", dir=base)) / "db"
+        pf = self.dir.parent / "port"
+        self.proc = subprocess.Popen(
+            [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         log = []
-        for _ in range(10):
-            with socket.socket() as s:
-                s.bind(("127.0.0.1", 0))
-                self.port = s.getsockname()[1]
-            self.proc = subprocess.Popen(
-                [TSDBD, "--dir", str(self.dir), "--port", str(self.port), "--no-fsync", "--workers", "4"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+
+        def collect():
             for line in self.proc.stderr:
                 log.append(line)
-                if "serving" in line:
-                    threading.Thread(target=self._drain, daemon=True).start()
-                    return
-            self.proc.wait()  # exited, most likely because the port was taken
-        raise RuntimeError("tsdbd did not start:\n" + "".join(log))
 
-    def _drain(self):
-        for _ in self.proc.stderr:
-            pass
+        t = threading.Thread(target=collect, daemon=True)
+        t.start()
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                t.join(5)
+                raise RuntimeError(f"tsdbd exited with {self.proc.returncode} before it listened:\n" + "".join(log))
+            try:
+                port, pid = (int(x) for x in pf.read_text().split())
+            except (OSError, ValueError):
+                time.sleep(0.01)
+                continue
+            if pid != self.proc.pid:
+                self.proc.kill()
+                self.proc.wait()
+                raise RuntimeError(f"{pf} names pid {pid}, but the server started here is pid {self.proc.pid}")
+            self.port = port
+            return
+        self.proc.kill()
+        self.proc.wait()
+        raise RuntimeError("tsdbd did not write its port file in 30 s:\n" + "".join(log))
 
     def stop(self):
         """SIGTERM, then the exit status."""

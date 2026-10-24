@@ -2,7 +2,8 @@
 
 `tsdbd --metrics-port 9170` serves `GET /metrics` in the Prometheus text format (0.0.4) on a port of its own.
 It is off by default and binds to `--listen` unless `--metrics-bind ADDR` says otherwise. There is no
-authentication, like the main port: bind it to a trusted interface.
+authentication, like the main port: bind it to a trusted interface. `--metrics-port auto` takes a port the kernel
+chooses, which `--port-file` reports as its third number (for tests that must not compute a port).
 
 ```yaml
 scrape_configs:
