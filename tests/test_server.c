@@ -61,8 +61,16 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
     /* the shim of the same build, next to the server */
     snprintf(near, sizeof near, "%.*slibcrashfs.so", (int)(strrchr(bin, '/') ? strrchr(bin, '/') - bin + 1 : 0), bin);
     if (eio_mark && !realpath(near, shim)) {
-        fprintf(stderr, "%s is missing\n", near);
-        exit(1);
+        /* the tarball keeps it among the tests, beside this program */
+        char self[PATH_MAX], beside[PATH_MAX + 32];
+        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        self[n > 0 ? n : 0] = '\0';
+        snprintf(beside, sizeof beside, "%.*slibcrashfs.so", (int)(strrchr(self, '/') ? strrchr(self, '/') - self + 1 : 0),
+                 self);
+        if (!realpath(beside, shim)) {
+            fprintf(stderr, "%s is missing, and so is %s\n", near, beside);
+            exit(1);
+        }
     }
     pid_t pid = fork();
     if (pid == 0) {

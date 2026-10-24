@@ -18,6 +18,7 @@ cp include/tsdb.h include/tsdb_protocol.h include/tsdb_calendar.h client/tsdb_cl
 for t in test_tsdb test_types test_levels test_group test_follow test_volumes test_server test_stability test_ports; do
     cp "$b/$t" "$stage/tests/"
 done
+cp "$b/libcrashfs.so" "$stage/tests/" # the power-loss and EIO shim test_server preloads
 cp dist/run-tests.sh "$stage/tests/"
 cp dist/tsdbd.service "$stage/systemd/"
 cp dist/README.dist "$stage/README.dist"

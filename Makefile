@@ -223,7 +223,7 @@ DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tool
               CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
 DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench tsdb-bench insert-bench tsdbc-bench scale-bench
 DIST_TESTS  = test_tsdb test_types test_levels test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
-DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS))
+DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS) libcrashfs.so)
 
 DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
               | $$(cksum <tools/glibc-compat.h)
@@ -234,7 +234,7 @@ dist:
 	    [ -d $(DIST_B) ] && echo "dist: compiler or flags changed since the last build: rebuilding $(DIST_B)"; \
 	    rm -rf $(DIST_B) && mkdir -p $(DIST_B) && printf '%s\n' "$$sig" >$(DIST_B)/.flags; \
 	fi
-	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%)
+	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%) $(DIST_B)/libcrashfs.so
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
 	CC="$(CC)" tools/mkdist.sh $(DIST_B)
@@ -425,8 +425,9 @@ $(B)/test_spread: tests/test_spread.c src/internal.h $(LIB)
 $(B)/test_limits: tests/test_limits.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
+# with ARCH: in `make dist` it carries the glibc-compat header, since the tarball's test_server preloads it
 $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
-	$(CC) -O2 -g -std=gnu11 -Wall -fPIC -shared -o $@ $< -ldl -lpthread
+	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
 
 $(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
