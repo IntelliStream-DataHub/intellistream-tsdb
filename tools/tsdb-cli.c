@@ -23,6 +23,9 @@ static void usage(void)
             "  parts                              list active parts\n"
             "  optimize                           merge every partition into one part\n"
             "  drop-before <time>                 drop whole partitions ending before <time>\n"
+            "  delete <series> <start> <end>      delete the series' values in [start, end)\n"
+            "  retention <series> [<age>|off]     show or set how long the series keeps values\n"
+            "                                     (e.g. 30d, 12h; off keeps them for ever)\n"
             "\n"
             "times: 1700000000000 (ms), 2024-01-31, \"2024-01-31 12:00:00.250\", 2024-01-31T12:00:00Z,\n"
             "       now, now-1h, min, max.  ranges are [start, end).\n"
@@ -449,7 +452,8 @@ int main(int argc, char **argv)
         usage();
     const char *dir = argv[1], *cmd = argv[2];
     bool writes = strcmp(cmd, "insert") == 0 || strcmp(cmd, "import") == 0 || strcmp(cmd, "optimize") == 0 ||
-                  strcmp(cmd, "drop-before") == 0 || strcmp(cmd, "create") == 0;
+                  strcmp(cmd, "drop-before") == 0 || strcmp(cmd, "create") == 0 || strcmp(cmd, "delete") == 0 ||
+                  (strcmp(cmd, "retention") == 0 && argc > 4);
     tsdb_options o;
     tsdb_options_init(&o);
     o.read_only = !writes;
@@ -523,6 +527,29 @@ int main(int argc, char **argv)
             usage();
         if ((rc = tsdb_drop_before(db, t)) != 0)
             die("drop-before", rc);
+    } else if (strcmp(cmd, "delete") == 0) {
+        int64_t a, b;
+        uint32_t id;
+        if (argc != 6 || !parse_time(argv[4], &a) || !parse_time(argv[5], &b))
+            usage();
+        if ((rc = tsdb_series_lookup(db, argv[3], &id)) != 0 || (rc = tsdb_delete_range(db, id, a, b)) != 0)
+            die(argv[3], rc);
+    } else if (strcmp(cmd, "retention") == 0) {
+        uint32_t id;
+        int64_t limit = 0;
+        if (argc < 4 || argc > 5 || (argc == 5 && strcmp(argv[4], "off") != 0 &&
+                                     (!parse_interval(argv[4], &limit) || limit <= 0)))
+            usage();
+        if ((rc = tsdb_series_lookup(db, argv[3], &id)) != 0)
+            die(argv[3], rc);
+        if (argc == 5 && (rc = tsdb_set_retention(db, id, limit)) != 0)
+            die(argv[3], rc);
+        if ((rc = tsdb_get_retention(db, id, &limit)) != 0)
+            die(argv[3], rc);
+        if (limit)
+            printf("%s\t%" PRId64 " ms\n", argv[3], limit);
+        else
+            printf("%s\toff\n", argv[3]);
     } else {
         usage();
     }

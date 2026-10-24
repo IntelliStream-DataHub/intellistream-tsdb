@@ -73,11 +73,18 @@
  *               (bucket i begins at bounds[i]; bounds strictly increase)
  *   LAST_STATS                                 -> f64 elapsed_s, then the ten u64 of
  *               tsdb_query_stats in order: the connection's previous query
+ *   Version 5: deletes and retention (tsdb_delete_range and friends).
+ *   DELETE_RANGE u32 series, u32 0, i64 start, i64 end  -> (nothing)
+ *   REPLACE_RANGE u32 n, u32 series, u8 type, u8 flags, u16 0, u32 0, i64 start, i64 end,
+ *               i64 ts[n], values[n], [u8 valid[(n + 7) / 8]]  -> (nothing)
+ *               (as INSERT_VALUES for one series, unpacked; flags: TSDB_VALID only)
+ *   SET_RETENTION u32 series, u32 0, i64 limit_ms      -> (nothing)
+ *   GET_RETENTION u32 series                           -> i64 limit_ms
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
-#define TSDB_PROTOCOL_VERSION 4
+#define TSDB_PROTOCOL_VERSION 5
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
@@ -105,11 +112,17 @@ enum {
     TSDB_OP_QUERY_BUCKETS = 18,
     TSDB_OP_LAST_STATS = 19,
     TSDB_OP_QUERY_BOUNDS = 20,
+    /* 21..24 left to the query operations of other branches (LTTB, time-weighted averages) */
+    TSDB_OP_DELETE_RANGE = 25,
+    TSDB_OP_REPLACE_RANGE = 26,
+    TSDB_OP_SET_RETENTION = 27,
+    TSDB_OP_GET_RETENTION = 28,
 };
 
 #define TSDB_AGG_ROW 32    /* bytes per bucket in a QUERY_AGG or QUERY_GROUP reply */
 #define TSDB_BUCKET_ROW 64 /* bytes per bucket in a QUERY_BUCKETS reply */
 #define TSDB_VALUES_HEADER 16
+#define TSDB_REPLACE_HEADER 32 /* REPLACE_RANGE: the INSERT_VALUES header, then start and end */
 #define TSDB_STATS_REPLY 88 /* bytes in a LAST_STATS reply after the status */
 #define TSDB_VALID 1  /* flags: a validity bitmap follows the values */
 #define TSDB_PACKED 2 /* flags: the arrays are packed and zstd compressed (version 3) */

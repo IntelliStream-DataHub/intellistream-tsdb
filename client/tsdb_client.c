@@ -925,6 +925,68 @@ int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st)
 
 int tsdbc_commit(tsdbc *c) { return call(c, TSDB_OP_COMMIT, NULL, 0, NULL, 0, NULL, NULL); }
 int tsdbc_flush(tsdbc *c) { return call(c, TSDB_OP_FLUSH, NULL, 0, NULL, 0, NULL, NULL); }
+
+int tsdbc_delete_range(tsdbc *c, uint32_t series, int64_t start, int64_t end)
+{
+    uint8_t b[24] = {0};
+    memcpy(b, &series, 4);
+    memcpy(b + 8, &start, 8);
+    memcpy(b + 16, &end, 8);
+    return call(c, TSDB_OP_DELETE_RANGE, b, sizeof b, NULL, 0, NULL, NULL);
+}
+
+/* One frame, unpacked: the server applies it as one tsdb_replace_range, all or nothing. */
+int tsdbc_replace_range(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+                        const tsdb_values *v, size_t n)
+{
+    if (!v || (unsigned)v->type > TSDB_STATE || (n && (!ts || !v->values)))
+        return TSDB_ERR_INVALID;
+    size_t vb = n * tsdb_wire_width(v->type), valid = v->valid ? (n + 7) / 8 : 0;
+    if (n > UINT32_MAX || TSDB_REPLACE_HEADER + n * 8 + vb + valid > TSDB_MAX_FRAME - 16)
+        return TSDB_ERR_INVALID;
+    uint8_t h[TSDB_REPLACE_HEADER] = {0};
+    uint32_t m = (uint32_t)n;
+    memcpy(h, &m, 4);
+    memcpy(h + 4, &series, 4);
+    h[8] = (uint8_t)v->type;
+    h[9] = v->valid ? TSDB_VALID : 0;
+    memcpy(h + 16, &start, 8);
+    memcpy(h + 24, &end, 8);
+    int rc = tsdbc_wait(c);
+    if (rc)
+        return rc;
+    struct iovec parts[5] = {{0}, {h, sizeof h}, {(void *)ts, n * 8}, {(void *)v->values, vb},
+                             {(void *)v->valid, valid}};
+    if ((rc = send_reqv(c, TSDB_OP_REPLACE_RANGE, parts, 5)) != 0)
+        return rc;
+    int32_t st;
+    const uint8_t *b;
+    size_t len;
+    if ((rc = read_reply(c, &st, &b, &len)) != 0)
+        return rc;
+    return st;
+}
+
+int tsdbc_set_retention(tsdbc *c, uint32_t series, int64_t limit_ms)
+{
+    uint8_t b[16] = {0};
+    memcpy(b, &series, 4);
+    memcpy(b + 8, &limit_ms, 8);
+    return call(c, TSDB_OP_SET_RETENTION, b, sizeof b, NULL, 0, NULL, NULL);
+}
+
+int tsdbc_get_retention(tsdbc *c, uint32_t series, int64_t *limit_ms)
+{
+    const uint8_t *b;
+    size_t n;
+    int rc = call(c, TSDB_OP_GET_RETENTION, &series, 4, NULL, 0, &b, &n);
+    if (rc)
+        return rc;
+    if (n != 8)
+        return TSDB_ERR_CORRUPT;
+    memcpy(limit_ms, b, 8);
+    return 0;
+}
 int tsdbc_optimize(tsdbc *c) { return call(c, TSDB_OP_OPTIMIZE, NULL, 0, NULL, 0, NULL, NULL); }
 
 int tsdbc_stats(tsdbc *c, tsdb_stats *st)

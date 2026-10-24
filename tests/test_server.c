@@ -466,6 +466,50 @@ static void *client_thread(void *arg)
 
 /* The packed insert body round trips for every type and layout, and anything
  * that does not hold exactly n rows is refused. */
+/* Deletes, replaces and retention over the wire (protocol version 5). */
+static void test_delete(tsdbc *c)
+{
+    uint32_t s;
+    OK(tsdbc_series_create(c, "del.i64", TSDB_INT64, NULL, &s));
+    int64_t ts[100], v[100];
+    for (int k = 0; k < 100; k++)
+        ts[k] = T0 + k * 1000, v[k] = k;
+    tsdb_values col = {TSDB_INT64, v, NULL};
+    OK(tsdbc_insert_series_values(c, s, ts, &col, 100));
+    OK(tsdbc_delete_range(c, s, T0 + 10000, T0 + 20000));
+    tsdb_bucket *bk;
+    size_t nb;
+    OK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    CHECK(nb == 1 && bk[0].count == 90 && bk[0].isum == 4950 - 145);
+    free(bk);
+
+    /* replace with nulls; a row outside the range refuses the whole replace */
+    int64_t rts[3] = {T0 + 50000, T0 + 50500, T0 + 51000}, rv[3] = {7, 8, 9};
+    uint8_t valid = 0x5; /* row 1 is null */
+    tsdb_values rcol = {TSDB_INT64, rv, &valid};
+    CHECK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 51000, rts, &rcol, 3) == TSDB_ERR_INVALID);
+    OK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 60000, rts, &rcol, 3));
+    vrows r = {0};
+    OK(tsdbc_query_values(c, s, T0 + 50000, T0 + 60000, NULL, collect_values, &r));
+    CHECK(r.n == 3 && r.ts[1] == T0 + 50500 && !r.known[1] && r.known[2] && r.i[2] == 9);
+    OK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    CHECK(nb == 1 && bk[0].count == 82);
+    free(bk);
+    OK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 60000, NULL, &rcol, 0)); /* n = 0: a delete */
+    OK(tsdbc_query_agg(c, s, T0 + 50000, T0 + 60000, 0, &bk, &nb));
+    CHECK(nb == 0);
+    free(bk);
+
+    int64_t lim = -1;
+    OK(tsdbc_get_retention(c, s, &lim));
+    CHECK(lim == 0);
+    OK(tsdbc_set_retention(c, s, 86400000));
+    OK(tsdbc_get_retention(c, s, &lim));
+    CHECK(lim == 86400000);
+    CHECK(tsdbc_set_retention(c, s, -1) == TSDB_ERR_INVALID);
+    OK(tsdbc_set_retention(c, s, 0));
+}
+
 static void test_pack_roundtrip(void)
 {
     static const size_t sizes[] = {0, 1, 7, 8, 9, 1000, 65537};
@@ -1143,6 +1187,7 @@ int main(int argc, char **argv)
     test_pack_roundtrip();
     test_packed_inserts(c);
     test_bounds(c, a, N);
+    test_delete(c);
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);
