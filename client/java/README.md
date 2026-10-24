@@ -1,8 +1,9 @@
 # tsdb Java client
 
 A Java client for `tsdbd`, the TCP server of the tsdb time series database. It speaks the protocol of
-[`include/tsdb_protocol.h`](../../include/tsdb_protocol.h), mirrors the C client in [`client/`](..), and has no
-runtime dependencies. Built for Java 17 and later.
+[`include/tsdb_protocol.h`](../../include/tsdb_protocol.h) and mirrors the C client in [`client/`](..). Its one
+runtime dependency is [zstd-jni](https://github.com/luben/zstd-jni) (`com.github.luben:zstd-jni`), the native
+zstd library, for compressed inserts. Built for Java 17 and later.
 
 ## Quick start
 
@@ -199,6 +200,8 @@ properties change where things are:
 | `queryGroup(series, start, end, group[, order, limit])` | the same per calendar unit, in a time zone |
 | `commit()`, `flush()`, `optimize()`, `stats()` | maintenance and storage statistics |
 | `lastQueryStats()` | what the server did for this connection's previous query (`QueryStats`: rows decoded or answered from granule statistics, bytes read, time) |
+| `setCompression(level)`, `compression()` | zstd level of inserts: 1 by default, 0 for plain arrays |
+| `bytesSent()` | bytes written to the connection so far |
 | `hello()` | the server's protocol version |
 
 Points are timestamps in milliseconds since the Unix epoch and values of the series' type. Writing an existing (series,
@@ -242,5 +245,31 @@ series exact `isum`/`imin`/`imax` (`isum` saturates). `queryAgg` and `queryGroup
 the requests of different connections in parallel.
 
 **Inserts.** A batch is applied all or nothing, except that batches over 8M rows go out as several frames (as
-in the C client), each applied on its own. Columns are copied into a 1 MiB direct buffer in bulk, so even large
-batches cost no per-row work in Java and no extra allocation.
+in the C client), each applied on its own.
+
+**Compression.** As the C client, inserts of every type (float32 too) travel packed: delta varints for
+timestamps and series ids, byte planes for values, all in one zstd frame (level 1 by default), a few bytes a row
+instead of 16. The client asks the server's version (HELLO) before its first insert and packs only for protocol
+version 3 or later; older servers get plain arrays. `setCompression(0)` sends plain arrays, which costs no CPU;
+negative levels are faster, higher ones smaller. Packing needs zstd-jni at run time: without it the client sends
+plain arrays. zstd-jni loads native code, so JDK 22 and later print a warning unless run with
+`--enable-native-access=ALL-UNNAMED`. `mvn package` copies it to `target/lib`, which the jar's manifest names, so
+`java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar` finds it.
+
+## Insert benchmark
+
+`ai.intellistream.tsdb.bench.InsertBench` is the Java counterpart of `tsdbc-bench load`. It reads a RowBinary
+file (u32 series, i64 ts, f32 value; 16 bytes a row), creates the series, and inserts the file with the
+many-series layout in batches of 1M rows, up to four in flight, over N connections. It prints rows per second and
+the bytes sent per row.
+
+```sh
+make -C ../.. && ../../build/tsdb-bench --export /tmp/x.rb --series 10 --points 100000
+../../build/tsdbd --dir /tmp/bench-db --port 7070 &
+mvn -q package -DskipTests
+java --enable-native-access=ALL-UNNAMED -cp target/tsdb-client-0.1.0-SNAPSHOT.jar \
+    ai.intellistream.tsdb.bench.InsertBench /tmp/x.rb --port 7070 --conns 4 --batch 1000000 --compression 1
+```
+
+`--compression off` sends plain arrays; `--host` picks another server. Small files mostly measure the JIT
+warming up: use a few hundred million rows.

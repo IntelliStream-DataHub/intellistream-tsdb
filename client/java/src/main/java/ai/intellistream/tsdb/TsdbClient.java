@@ -38,6 +38,10 @@ import java.util.Objects;
  * request. At most {@value #MAX_IN_FLIGHT} insert frames are outstanding: past that, {@code insertAsync} reads the
  * oldest acknowledgement before sending, which bounds the memory the server spends on queued requests.
  *
+ * <p><b>Compression.</b> Inserts travel packed and zstd compressed (level 1 by default) when the server speaks
+ * protocol version 3, as with the C client; see {@link #setCompression(int)}. {@link #bytesSent()} counts what
+ * goes on the wire.
+ *
  * <p><b>Errors.</b> Every request either succeeds or throws {@link TsdbException}. A status from the server (such
  * as {@link Status#ERR_NOTFOUND}) leaves the connection usable. A connection failure, a malformed reply, or an
  * interrupt of the calling thread during I/O closes the connection: later calls throw {@link Status#ERR_IO}.
@@ -80,6 +84,12 @@ public final class TsdbClient implements AutoCloseable {
     private float[] chunkValues = Values.alloc(0);
     private Column chunkColumn;                  /* reused for ValuesConsumer */
     private final BitSet chunkNulls = new BitSet();
+    private int zlevel = 1;                      /* zstd level of packed inserts; 0: plain arrays */
+    private int serverVersion;                   /* from HELLO; 0 until asked */
+    private Compressor zstd;                     /* created at the first packed insert */
+    private boolean noZstd;                      /* zstd-jni could not be loaded: send plain arrays */
+    private byte[] raw = new byte[0];            /* the reshaped body of a packed frame */
+    private long bytesSent;
 
     private TsdbClient(SocketChannel ch) {
         this.ch = ch;
@@ -151,6 +161,8 @@ public final class TsdbClient implements AutoCloseable {
         }
         closed = true;
         closeQuietly(ch);
+        if (zstd != null)
+            zstd.close();
         if (err != null)
             throw err;
     }
@@ -167,7 +179,7 @@ public final class TsdbClient implements AutoCloseable {
     /**
      * Exchanges protocol versions with the server.
      *
-     * @return the server's protocol version (2 for the server this client is written for)
+     * @return the server's protocol version (3 for the server this client is written for)
      * @throws TsdbException on a connection failure
      */
     public int hello() throws TsdbException {
@@ -181,7 +193,45 @@ public final class TsdbClient implements AutoCloseable {
         int v = st == 0 ? in.getInt() : 0;
         endReply();
         check(st);
+        serverVersion = v;
         return v;
+    }
+
+    /**
+     * Sets how inserts travel. With a level other than 0 (the default is 1), inserts of every type, float32
+     * included, are packed (delta varints and byte planes) and compressed as one zstd frame each, which takes a few
+     * bytes a row on the wire instead of 16 or more. The client asks the server's version (HELLO) before the first
+     * insert and packs only for a server that speaks protocol version 3; older servers get plain arrays. Level 0
+     * sends plain arrays, which costs no CPU; negative levels are faster than 1 and compress less.
+     *
+     * <p>Packing needs zstd-jni at run time; without it the client sends plain arrays.
+     *
+     * @param level a zstd level from -131072 to 22, or 0 for plain arrays
+     * @throws IllegalArgumentException for a level zstd does not have
+     */
+    public void setCompression(int level) {
+        if (level < Compressor.MIN_LEVEL || level > Compressor.MAX_LEVEL)
+            throw new IllegalArgumentException("zstd level " + level + " is not in [" + Compressor.MIN_LEVEL + ", "
+                    + Compressor.MAX_LEVEL + "]");
+        zlevel = level;
+    }
+
+    /**
+     * The zstd level of inserts.
+     *
+     * @return the level set by {@link #setCompression(int)}; 0 for plain arrays
+     */
+    public int compression() {
+        return zlevel;
+    }
+
+    /**
+     * Bytes written to the connection so far: every request frame, headers included.
+     *
+     * @return the bytes sent since the client connected
+     */
+    public long bytesSent() {
+        return bytesSent;
     }
 
     // ------------------------------------------------------------------ series
@@ -413,6 +463,10 @@ public final class TsdbClient implements AutoCloseable {
         else if (series == Protocol.MANY_SERIES)
             throw new IllegalArgumentException("series id 0xffffffff is reserved");
         ready();
+        if (n > 0 && packing()) { /* float32 too: the packed form is the smaller one */
+            insertValuesFrames(series, many, ts, Column.ofFloats(values), off, n);
+            return;
+        }
         int rowBytes = Long.BYTES + Values.BYTES + (many != null ? Integer.BYTES : 0);
         int sent = 0;
         do { /* one frame even for zero rows, as the C client */
@@ -963,6 +1017,17 @@ public final class TsdbClient implements AutoCloseable {
         else if (series == Protocol.MANY_SERIES)
             throw new IllegalArgumentException("series id 0xffffffff is reserved");
         ready();
+        if (n > 0 && packing()) {
+            for (int sent = 0; sent < n;) {
+                int m = Math.min(n - sent, INSERT_FRAME_ROWS);
+                while (pending >= MAX_IN_FLIGHT)
+                    collectOne();
+                sendPacked(series, many, ts, col, off + sent, m);
+                pending++;
+                sent += m;
+            }
+            return;
+        }
         ValueType type = col.type();
         int sent = 0;
         do { /* one frame even for zero rows, as the C client */
@@ -991,6 +1056,54 @@ public final class TsdbClient implements AutoCloseable {
             pending++;
             sent += m;
         } while (sent < n);
+    }
+
+    /**
+     * Whether inserts go packed: compression on, zstd available, and a server that reads them (HELLO, asked once).
+     * Outstanding acknowledgements are collected first; their errors stay for {@link #await()}.
+     */
+    private boolean packing() throws TsdbException {
+        if (zlevel == 0 || noZstd)
+            return false;
+        if (serverVersion == 0) {
+            while (pending > 0)
+                collectOne();
+            begin(Protocol.OP_HELLO, 4);
+            out.putInt(Protocol.VERSION);
+            send();
+            int st = frame();
+            int v = st == 0 && bodyLen == 4 ? in.getInt() : 1; /* as the C client: anything else is version 1 */
+            endReply();
+            serverVersion = v;
+        }
+        if (serverVersion < 3)
+            return false;
+        if (zstd == null && (zstd = Compressor.create()) == null) {
+            noZstd = true;
+            return false;
+        }
+        return true;
+    }
+
+    /** One packed frame of rows {@code [off, off + m)}: reshape, compress, send. */
+    private void sendPacked(int series, int[] many, long[] ts, Column col, int off, int m) throws TsdbException {
+        byte[] valid = Values.validity(col, off, m);
+        long bound = Pack.rawBound(m, col.type(), valid != null, many != null);
+        if (raw.length < bound)
+            raw = new byte[(int) bound];
+        int len = Pack.reshape(ts, col, many, off, m, valid, raw);
+        int z;
+        try {
+            z = zstd.compress(raw, len, zlevel);
+        } catch (RuntimeException e) { /* ZstdException: only when out of memory */
+            throw new TsdbException(Status.ERR_NOMEM, "zstd", e);
+        }
+        begin(Protocol.OP_INSERT_VALUES, Protocol.VALUES_HEADER + 4 + (long) z);
+        out.putInt(m).putInt(many != null ? Protocol.MANY_SERIES : series);
+        out.put((byte) col.type().code).put((byte) (Protocol.PACKED | (valid != null ? Protocol.VALID : 0)));
+        out.putShort((short) 0).putInt(0).putInt(len);
+        putBytes(zstd.out(), z);
+        send();
     }
 
     /**
@@ -1319,7 +1432,7 @@ public final class TsdbClient implements AutoCloseable {
         out.flip();
         try {
             while (out.hasRemaining())
-                ch.write(out);
+                bytesSent += ch.write(out);
         } catch (IOException e) {
             throw lost(Status.ERR_IO, "send failed", e);
         } finally {
@@ -1375,10 +1488,14 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     private void putBytes(byte[] a) throws TsdbException {
-        for (int off = 0; off < a.length;) {
+        putBytes(a, a.length);
+    }
+
+    private void putBytes(byte[] a, int len) throws TsdbException {
+        for (int off = 0; off < len;) {
             if (!out.hasRemaining())
                 send();
-            int k = Math.min(a.length - off, out.remaining());
+            int k = Math.min(len - off, out.remaining());
             out.put(a, off, k);
             off += k;
         }

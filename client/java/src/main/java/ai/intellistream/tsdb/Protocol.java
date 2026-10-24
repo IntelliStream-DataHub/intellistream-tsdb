@@ -2,7 +2,7 @@ package ai.intellistream.tsdb;
 
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */
 final class Protocol {
-    static final int VERSION = 2;
+    static final int VERSION = 3;
     static final int DEFAULT_PORT = 7070;
     static final int MAX_FRAME = 256 << 20;
     static final int HEADER = 9;           /* u32 length, u32 id, u8 op */
@@ -13,6 +13,7 @@ final class Protocol {
     static final int VALUES_HEADER = 16;   /* INSERT_VALUES: u32 n, u32 series, u8 type, u8 flags, u16 0, u32 0 */
     static final int STATS_REPLY = 88;     /* LAST_STATS: f64 elapsed_s, 10 x u64 */
     static final int VALID = 1;            /* flags: a validity bitmap follows the values */
+    static final int PACKED = 2;           /* flags: u32 raw_len and a zstd frame of the packed arrays (v3) */
 
     static final byte OP_REPLY = 0;
     static final byte OP_HELLO = 1;
