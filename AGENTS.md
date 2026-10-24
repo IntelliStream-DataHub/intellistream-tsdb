@@ -15,7 +15,7 @@ make PORTABLE=1           # without -march=native
 make dist                 # portable tarball (x86-64-v2 + v3/v4 codecs) in build-dist/; checks glibc and ISA
 make dist-test            # the tarball's own test suite, at every CPU level (TSDB_CPU=v2|v3|v4)
 make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
-make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu SandyBridge if installed
+make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere/SandyBridge if installed
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 ```
 
@@ -119,9 +119,14 @@ cgroup, so `nice` does not keep your work out of its way.
   elsewhere stays at v2 in the tarball unless it moves into one of them. Every
   level, and every simd.c kernel, must give byte-identical blocks and identical
   values and aggregates, since parts move between CPUs: no FMA contraction
-  (`-ffp-contract=off`), the f32 kernels sum in one order, NaN sums are
-  canonical (`canon_nan`). `tests/test_levels.c` compares all of it; add new
-  codecs and edge cases there. The normal `make` (-march=native) has no levels.
+  (`-ffp-contract=off`), no libm functions glibc dispatches by CPU (log2, exp,
+  pow...: write the arithmetic out, as `log2_portable`), the f32 kernels sum in
+  one order (32 lanes), NaN sums are canonical (`canon_nan`). Those files must
+  not have constructors or other startup code: a v3/v4 copy's would run on
+  every CPU before the dispatch (SIGILL on a CPU without AVX); use constant
+  tables. `tests/test_levels.c` compares all of it and checks the dispatch;
+  add new codecs and edge cases there. `tools/check-isa.sh` (run by `make dist`)
+  checks the rest from the objects. The normal `make` (-march=native) has no levels.
 
 ## Conventions
 

@@ -1,5 +1,7 @@
 #!/bin/sh
-# Fails if a portable build uses instructions beyond x86-64-v2 outside the code
+# Fails if a portable build has per-level code that runs before the CPU check
+# (constructors), per-level code whose rounding depends on the CPU (FMA, libm's
+# dispatched functions), or uses instructions beyond x86-64-v2 outside the code
 # that is only reached after a CPU check: the per-level compiles (*.v3.o,
 # *.v4.o, functions *_v3/_v4), simd.c's agg_avx2/agg_avx512, and zstd's BMI2
 # variants. An emulator finds most such slips (qemu -cpu SandyBridge raises
@@ -29,6 +31,37 @@ above_v2() {
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# 0. a level object must not run anything by itself: a constructor (or any
+#    .init_array/.ctors entry) of a v3/v4 copy runs at startup on every CPU,
+#    before the dispatch, and dies with SIGILL on one without that level
+for o in "$dir"/*.v3.o "$dir"/*.v4.o; do
+    [ -e "$o" ] || continue
+    if objdump -h "$o" | awk '{print $2}' | grep -Eq '^\.(init_array|preinit_array|ctors|init)(\.|$)'; then
+        echo "$o: has startup code (.init_array/.ctors): it would run unchecked on every CPU" >&2
+        echo x >>"$tmp/bad"
+    fi
+done
+# ... nor call libm's transcendental functions: glibc picks their code by CPU
+#     (log2 has an FMA variant), so their last bit, and a codec choice that
+#     hangs on it, could differ between two machines running this binary
+for o in "$dir"/*.base.o "$dir"/*.v3.o "$dir"/*.v4.o; do
+    [ -e "$o" ] || continue
+    nm -u "$o" | awk '{print $2}' | grep -E '^(__)?(a?(sin|cos|tan)h?|atan2|exp(2|10|m1)?|log(2|10|1p|b)?|pow|cbrt|hypot|erfc?|[lt]gamma)f?(_finite)?(@.*)?$' |
+        while read -r f; do
+            echo "$o: calls $f: libm dispatches it by CPU, so its rounding is not the same on every machine" >&2
+            echo x >>"$tmp/bad"
+        done
+done
+# ... nor use FMA: the codecs call no fma(), so one there is a contraction of
+#     a*b+c (-ffp-contract=off missing), which rounds differently from the v2 copy
+for o in "$dir"/*.v3.o "$dir"/*.v4.o; do
+    [ -e "$o" ] || continue
+    n=$(objdump -d --no-show-raw-insn "$o" | awk '$2 ~ /^vfn?m(add|sub)/' | wc -l)
+    if [ "$n" -gt 0 ]; then
+        echo "$o: $n FMA instructions: rounding differs from the baseline copy" >&2
+        echo x >>"$tmp/bad"
+    fi
+done
 # 1. objects compiled for the baseline: nothing above v2 but simd.c's kernels
 for o in "$dir"/*.o; do
     case "$o" in *.v3.o | *.v4.o) continue ;; esac
@@ -39,7 +72,8 @@ for o in "$dir"/*.o; do
     done
 done
 # 2. the binaries (zstd and liburing come in here): every such function must
-#    be one the dispatch reaches only on a capable CPU
+#    be one the dispatch reaches only on a capable CPU (step 0 rules out the
+#    level objects' functions being reached from startup)
 for o in "$dir"/*.v3.o "$dir"/*.v4.o; do
     [ -e "$o" ] && nm --defined-only "$o" | awk '$2 ~ /^[tT]$/ {print $3}'
 done | sort -u >"$tmp/level_fns"
@@ -56,7 +90,7 @@ for b in "$@"; do
     done
 done
 if [ -s "$tmp/bad" ]; then
-    echo "check-isa: code beyond x86-64-v2 outside the CPU dispatch" >&2
+    echo "check-isa: the build would not run, or not write the same bytes, on every x86-64-v2 CPU" >&2
     exit 1
 fi
 echo "check-isa: $# binaries use nothing beyond x86-64-v2 outside the CPU dispatch"

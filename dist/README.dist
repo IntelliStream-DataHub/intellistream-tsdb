@@ -16,8 +16,8 @@ Contents
   BUILDINFO            version, compiler, glibc
 
 Requirements
-  CPU     x86-64-v2: SSE4.2 and POPCNT (Intel Nehalem and later, Sandy Bridge
-          included; AMD Bulldozer and later). Both the x86-64-v3 (default) and
+  CPU     x86-64-v2: SSE4.2 and POPCNT, AVX not needed (Intel Nehalem and
+          later, Sandy Bridge included; AMD Bulldozer and later). Both the x86-64-v3 (default) and
           the x86-64-v2 builds of AlmaLinux 10 run it.
   glibc   2.34 or newer (AlmaLinux 10 has 2.39, EL9 has 2.34). zstd and liburing
           are linked in; nothing else is needed.

@@ -120,7 +120,7 @@ make dist       # build-dist/tsdb-VERSION-x86_64-linux.tar.gz
 ```
 
 It runs on any x86-64 Linux with glibc 2.34 or newer and an x86-64-v2 CPU
-(Sandy Bridge and later), so on both the default and the x86-64-v2 builds of
+(Intel Nehalem, Sandy Bridge and later; AMD Bulldozer and later), so on both the default and the x86-64-v2 builds of
 AlmaLinux 10, and it picks faster code at startup on CPUs with AVX2 or AVX-512.
 Unpack it there, run `tests/run-tests.sh` once if you like, and start
 `bin/tsdbd`; the tarball's README.dist has the details and a systemd unit.

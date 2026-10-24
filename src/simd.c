@@ -23,13 +23,15 @@
  * query results must not depend on the CPU that computed them (a part written
  * on one machine is read on another; `make dist` runs the same binary on v2,
  * v3 and v4 CPUs). Floating-point addition is not associative, so they share
- * one order: 16 double lanes, lane j summing values j, j+16, j+32, ... in turn,
- * then halved (lane j + lane j+8, then j + j+4, ...). min and max keep 16
- * float lanes the same way, combined with MINPS/MAXPS semantics (the second
- * operand wins on NaN and on equal values, which decides the sign of a zero).
- * A last partial group of 16 goes into the lanes one value at a time.
+ * one order: 32 double lanes, lane j summing values j, j+32, j+64, ... in turn,
+ * then halved (lane j + lane j+16, then j + j+8, ...). 32 lanes because that
+ * is what AVX-512 needs to hide the latency of its adds and min/max (chains of
+ * 16 floats or 8 doubles) and AVX2 can just hold in its 16 registers. min and
+ * max keep 32 float lanes the same way, combined with MINPS/MAXPS semantics
+ * (the second operand wins on NaN and on equal values, which decides the sign
+ * of a zero). A last partial group of 32 goes into the lanes one value at a time.
  */
-#define LANES 16
+#define LANES 32
 
 typedef struct lanes {
     double s[LANES];
@@ -82,36 +84,51 @@ static void agg_scalar(const float *v, size_t n, agg_state *a)
 }
 
 #ifdef TSDB_X86
+/* sum of the 4 floats as doubles into s */
+#define ADD4(s, q) s = _mm256_add_pd(s, _mm256_cvtps_pd(q))
+
 __attribute__((target("avx2"))) static void agg_avx2(const float *v, size_t n, agg_state *a)
 {
     lanes l;
     lanes_init(&l, a);
-    /* lanes 0-3, 4-7, 8-11, 12-15 */
-    __m256d s0 = _mm256_setzero_pd(), s1 = _mm256_setzero_pd();
-    __m256d s2 = _mm256_setzero_pd(), s3 = _mm256_setzero_pd();
-    __m256 mn = _mm256_loadu_ps(l.mn), mx = _mm256_loadu_ps(l.mx); /* lanes 0-7 */
-    __m256 mn2 = mn, mx2 = mx;                                      /* lanes 8-15 */
+    /* sum lanes 0-3, 4-7, ..., 28-31 */
+    __m256d s0 = _mm256_setzero_pd(), s1 = s0, s2 = s0, s3 = s0, s4 = s0, s5 = s0, s6 = s0, s7 = s0;
+    /* min/max lanes 0-7, 8-15, 16-23, 24-31 */
+    __m256 mn0 = _mm256_loadu_ps(l.mn), mn1 = mn0, mn2 = mn0, mn3 = mn0;
+    __m256 mx0 = _mm256_loadu_ps(l.mx), mx1 = mx0, mx2 = mx0, mx3 = mx0;
     size_t i = 0;
+    /* one quarter at a time, so that no loaded vector stays live: 16 accumulators fill the registers */
+#define QUARTER(q, sa, sb, mnq, mxq)                                      \
+    do {                                                                  \
+        __m256 x = _mm256_loadu_ps(v + i + 8 * (q));                      \
+        ADD4(sa, _mm256_castps256_ps128(x));                              \
+        ADD4(sb, _mm256_extractf128_ps(x, 1));                            \
+        mnq = _mm256_min_ps(x, mnq);                                      \
+        mxq = _mm256_max_ps(x, mxq);                                      \
+    } while (0)
     for (; i + LANES <= n; i += LANES) {
-        __m256 x = _mm256_loadu_ps(v + i);
-        __m256 y = _mm256_loadu_ps(v + i + 8);
-        s0 = _mm256_add_pd(s0, _mm256_cvtps_pd(_mm256_castps256_ps128(x)));
-        s1 = _mm256_add_pd(s1, _mm256_cvtps_pd(_mm256_extractf128_ps(x, 1)));
-        s2 = _mm256_add_pd(s2, _mm256_cvtps_pd(_mm256_castps256_ps128(y)));
-        s3 = _mm256_add_pd(s3, _mm256_cvtps_pd(_mm256_extractf128_ps(y, 1)));
-        mn = _mm256_min_ps(x, mn);
-        mx = _mm256_max_ps(x, mx);
-        mn2 = _mm256_min_ps(y, mn2);
-        mx2 = _mm256_max_ps(y, mx2);
+        QUARTER(0, s0, s1, mn0, mx0);
+        QUARTER(1, s2, s3, mn1, mx1);
+        QUARTER(2, s4, s5, mn2, mx2);
+        QUARTER(3, s6, s7, mn3, mx3);
     }
+#undef QUARTER
     _mm256_storeu_pd(l.s, s0);
     _mm256_storeu_pd(l.s + 4, s1);
     _mm256_storeu_pd(l.s + 8, s2);
     _mm256_storeu_pd(l.s + 12, s3);
-    _mm256_storeu_ps(l.mn, mn);
-    _mm256_storeu_ps(l.mn + 8, mn2);
-    _mm256_storeu_ps(l.mx, mx);
-    _mm256_storeu_ps(l.mx + 8, mx2);
+    _mm256_storeu_pd(l.s + 16, s4);
+    _mm256_storeu_pd(l.s + 20, s5);
+    _mm256_storeu_pd(l.s + 24, s6);
+    _mm256_storeu_pd(l.s + 28, s7);
+    _mm256_storeu_ps(l.mn, mn0);
+    _mm256_storeu_ps(l.mn + 8, mn1);
+    _mm256_storeu_ps(l.mn + 16, mn2);
+    _mm256_storeu_ps(l.mn + 24, mn3);
+    _mm256_storeu_ps(l.mx, mx0);
+    _mm256_storeu_ps(l.mx + 8, mx1);
+    _mm256_storeu_ps(l.mx + 16, mx2);
+    _mm256_storeu_ps(l.mx + 24, mx3);
     lanes_finish(&l, v, i, n, a);
 }
 
@@ -119,20 +136,30 @@ __attribute__((target("avx512f,avx512dq"))) static void agg_avx512(const float *
 {
     lanes l;
     lanes_init(&l, a);
-    __m512d s0 = _mm512_setzero_pd(), s1 = _mm512_setzero_pd(); /* lanes 0-7, 8-15 */
-    __m512 mn = _mm512_loadu_ps(l.mn), mx = _mm512_loadu_ps(l.mx);
+    /* sum lanes 0-7, 8-15, 16-23, 24-31 */
+    __m512d s0 = _mm512_setzero_pd(), s1 = s0, s2 = s0, s3 = s0;
+    __m512 mn = _mm512_loadu_ps(l.mn), mx = _mm512_loadu_ps(l.mx); /* min/max lanes 0-15 */
+    __m512 mn2 = mn, mx2 = mx;                                      /* min/max lanes 16-31 */
     size_t i = 0;
     for (; i + LANES <= n; i += LANES) {
-        __m512 x = _mm512_loadu_ps(v + i);
+        __m512 x = _mm512_loadu_ps(v + i), y = _mm512_loadu_ps(v + i + 16);
         s0 = _mm512_add_pd(s0, _mm512_cvtps_pd(_mm512_castps512_ps256(x)));
         s1 = _mm512_add_pd(s1, _mm512_cvtps_pd(_mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(x), 1))));
+        s2 = _mm512_add_pd(s2, _mm512_cvtps_pd(_mm512_castps512_ps256(y)));
+        s3 = _mm512_add_pd(s3, _mm512_cvtps_pd(_mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(y), 1))));
         mn = _mm512_min_ps(x, mn);
         mx = _mm512_max_ps(x, mx);
+        mn2 = _mm512_min_ps(y, mn2);
+        mx2 = _mm512_max_ps(y, mx2);
     }
     _mm512_storeu_pd(l.s, s0);
     _mm512_storeu_pd(l.s + 8, s1);
+    _mm512_storeu_pd(l.s + 16, s2);
+    _mm512_storeu_pd(l.s + 24, s3);
     _mm512_storeu_ps(l.mn, mn);
+    _mm512_storeu_ps(l.mn + 16, mn2);
     _mm512_storeu_ps(l.mx, mx);
+    _mm512_storeu_ps(l.mx + 16, mx2);
     lanes_finish(&l, v, i, n, a);
 }
 #endif

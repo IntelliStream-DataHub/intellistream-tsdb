@@ -26,7 +26,11 @@
  * All levels must produce byte-identical blocks and identical values and
  * statistics: parts written on one CPU are read on another. Hence
  * -ffp-contract=off everywhere (v3 has FMA, and contracted a*b+c rounds
- * differently); tests/test_levels.c compares every level this CPU has.
+ * differently), and no libm function that glibc picks by CPU (codec.c's
+ * log2_portable); tests/test_levels.c compares every level this CPU has.
+ * Nothing in those files may run at startup (constructors): the v3/v4 copies
+ * would run on every CPU, before cpu.c's check. tools/check-isa.sh enforces
+ * both on the objects.
  */
 #ifndef TSDB_LEVELS_H
 #define TSDB_LEVELS_H

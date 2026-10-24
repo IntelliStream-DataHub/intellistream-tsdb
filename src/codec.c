@@ -308,21 +308,24 @@ int gorilla_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
 #define DEC_LIMIT 4503599627370496.0 /* 2^52: integers are exact in a double */
 #define DEC_HDR 14
 
-static double dec_scale[DEC_MAX_EXP + 1], dec_inv[DEC_MAX_EXP + 1];
-
-__attribute__((constructor)) static void dec_tables(void)
-{
-    static const double inv10[DEC_NDEC] = {1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10};
-    double p = 1;
-    for (int e = 0; e < DEC_NDEC; e++, p *= 10) {
-        dec_scale[e] = p;
-        dec_inv[e] = inv10[e]; /* literals: the decoder multiplies by exactly these */
-    }
-    for (int b = 1; b <= DEC_NBIN; b++) {
-        dec_scale[DEC_NDEC + b - 1] = ldexp(1.0, b);
-        dec_inv[DEC_NDEC + b - 1] = ldexp(1.0, -b);
-    }
-}
+/*
+ * Constants, not tables a constructor fills: codec.c is compiled once per CPU
+ * level (levels.h), and a constructor in a v3/v4 copy would run on every CPU
+ * at startup, before any dispatch, with AVX in it.
+ */
+#define P2S(b) ((double)(1L << (b)))
+#define P2I(b) (1.0 / (double)(1L << (b)))
+static const double dec_scale[] = {1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+                                   P2S(1), P2S(2), P2S(3), P2S(4), P2S(5), P2S(6), P2S(7), P2S(8), P2S(9), P2S(10),
+                                   P2S(11), P2S(12), P2S(13), P2S(14), P2S(15), P2S(16), P2S(17), P2S(18), P2S(19), P2S(20),
+                                   P2S(21), P2S(22), P2S(23), P2S(24)};
+/* the decimal inverses are literals: the decoder multiplies by exactly these */
+static const double dec_inv[] = {1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10,
+                                 P2I(1), P2I(2), P2I(3), P2I(4), P2I(5), P2I(6), P2I(7), P2I(8), P2I(9), P2I(10),
+                                 P2I(11), P2I(12), P2I(13), P2I(14), P2I(15), P2I(16), P2I(17), P2I(18), P2I(19), P2I(20),
+                                 P2I(21), P2I(22), P2I(23), P2I(24)};
+_Static_assert(sizeof dec_scale / sizeof *dec_scale == DEC_MAX_EXP + 1, "dec_scale");
+_Static_assert(sizeof dec_inv / sizeof *dec_inv == DEC_MAX_EXP + 1, "dec_inv");
 
 static inline float dec_value(int64_t k, int e) { return (float)((double)k * dec_inv[e]); }
 static inline uint64_t zigzag(int64_t x) { return ((uint64_t)x << 1) ^ (uint64_t)(x >> 63); }
@@ -946,6 +949,32 @@ static size_t encode_f32_kind(codec_ctx *c, int kind, const float *v, size_t n)
     }
 }
 
+/*
+ * log2 by plain arithmetic, for the entropy estimate that picks codecs. libm's
+ * log2 is an IFUNC with an FMA variant on newer CPUs, so the same binary could
+ * round it differently on two machines and, in a near tie, write other bytes.
+ * Only + - * / here, which round the same at every level (-ffp-contract=off):
+ * log2(m * 2^e) = e + 2/ln 2 * atanh(s), s = (m - 1) / (m + 1), |s| < 0.172,
+ * whose series is far below double precision after 11 terms. x > 0, normal.
+ */
+static double log2_portable(double x)
+{
+    uint64_t b;
+    memcpy(&b, &x, 8);
+    int e = (int)(b >> 52 & 0x7ff) - 1023;
+    b = (b & 0x000fffffffffffffull) | 0x3ff0000000000000ull;
+    double m;
+    memcpy(&m, &b, 8); /* [1, 2) */
+    if (m > 1.4142135623730951) {
+        m *= 0.5;
+        e++;
+    }
+    double s = (m - 1) / (m + 1), s2 = s * s, t = 1.0 / 21;
+    for (int k = 19; k >= 1; k -= 2)
+        t = t * s2 + 1.0 / k;
+    return e + s * t * 2.8853900817779268; /* 2 / ln 2 */
+}
+
 /* Order-0 entropy of every `stride`-th byte starting at p, in bytes (scaled
  * up from a 1-in-3 sample), as an estimate of their size after ZSTD's entropy
  * stage. Much cheaper than compressing every candidate. */
@@ -968,7 +997,7 @@ static double entropy_lane(const uint8_t *p, size_t len, size_t stride)
     for (int k = 0; k < 256; k++) {
         uint32_t c = h[0][k] + h[1][k] + h[2][k] + h[3][k];
         if (c)
-            bits -= c * __builtin_log2(c / n);
+            bits -= c * log2_portable(c / n);
     }
     size_t total = (len + stride - 1) / stride;
     return bits * ((double)total / n) / 8;

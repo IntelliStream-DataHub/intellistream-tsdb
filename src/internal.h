@@ -298,6 +298,7 @@ void simd_select(int level);
 int cpu_level(void);                 /* the level in use */
 int cpu_level_max(void);             /* the highest level both this CPU and this build have */
 int cpu_set_level(int level);        /* for tests; -1 if this CPU or build lacks the level */
+const void *cpu_level_probe(void);   /* for tests: the level's xxh64 in use (NULL without levels) */
 const char *cpu_level_name(int level); /* "v2" (or "base" when the build targets more), "v3", "v4" */
 
 /* Index of the first element >= key in a sorted array (branchless). */

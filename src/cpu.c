@@ -15,6 +15,7 @@
  */
 #include "internal.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #if defined(TSDB_LEVELS) && !(defined(__x86_64__) || defined(__i386__))
@@ -108,6 +109,12 @@ static int hw_level(void)
 }
 
 int cpu_level(void) { return level_now; }
+
+#ifdef TSDB_LEVELS
+const void *cpu_level_probe(void) { return (const void *)lv->xxh64; }
+#else
+const void *cpu_level_probe(void) { return NULL; }
+#endif
 int cpu_level_max(void) { return level_max; }
 
 int cpu_set_level(int level)
@@ -131,12 +138,15 @@ __attribute__((constructor)) static void cpu_pick(void)
     int want = level_max;
     const char *env = getenv("TSDB_CPU");
     if (env && *env) {
-        if (!strcmp(env, "v2") || !strcmp(env, "base"))
+        const char *v = !strncmp(env, "x86-64-", 7) ? env + 7 : env;
+        if (!strcmp(v, "v2") || !strcmp(v, "base"))
             want = CPU_BASE;
-        else if (!strcmp(env, "v3"))
+        else if (!strcmp(v, "v3"))
             want = CPU_V3;
-        else if (!strcmp(env, "v4"))
+        else if (!strcmp(v, "v4"))
             want = CPU_V4;
+        else /* a typo must not quietly measure the newest level instead */
+            fprintf(stderr, "tsdb: TSDB_CPU=%s ignored: use v2, v3 or v4 (or x86-64-v2...)\n", env);
         if (want > level_max)
             want = level_max;
         while (want > CPU_BASE && !built(want))

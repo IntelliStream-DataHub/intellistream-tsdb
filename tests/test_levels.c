@@ -177,6 +177,18 @@ static void make_inputs(void)
     x = add("f32 random bits", TSDB_FLOAT32, GR);
     for (size_t i = 0; i < GR; i++)
         ((uint32_t *)x->v)[i] = (uint32_t)next();
+    /* finite values of random sign and magnitude: their sum in double rounds, so it depends on the
+     * order of the additions (the kernels must share one); lengths around the 32-lane groups too */
+    static const size_t spread_n[] = {GR, 64, 31, 33, 47, 95, 1000};
+    for (size_t k = 0; k < sizeof spread_n / sizeof *spread_n; k++) {
+        snprintf(name, sizeof name, "f32 random exponents, %zu", spread_n[k]);
+        x = add(name, TSDB_FLOAT32, spread_n[k]);
+        for (size_t i = 0; i < x->n; i++) {
+            uint64_t r = next();
+            uint32_t exp = 127 - 40 + (uint32_t)(r % 81); /* 2^-40 .. 2^40 */
+            ((uint32_t *)x->v)[i] = (uint32_t)(r >> 63) << 31 | exp << 23 | (uint32_t)(r >> 8 & 0x7fffff);
+        }
+    }
     x = add("f32 -0 and +0", TSDB_FLOAT32, 100);
     for (size_t i = 0; i < 100; i++)
         ((float *)x->v)[i] = next() & 1 ? -0.0f : 0.0f;
@@ -354,8 +366,68 @@ static bool same(const rec *a, const rec *b, const char *label)
     return bad == 0;
 }
 
+#ifdef TSDB_LEVELS
+/* The dispatch itself: a level the CPU has must be used, and must call that level's compile. A broken
+ * CPU check or table would otherwise ship baseline code everywhere with every comparison still equal. */
+uint64_t xxh64_base(const void *data, size_t len, uint64_t seed);
+#ifdef TSDB_HAVE_v3
+uint64_t xxh64_v3(const void *data, size_t len, uint64_t seed);
+#endif
+#ifdef TSDB_HAVE_v4
+uint64_t xxh64_v4(const void *data, size_t len, uint64_t seed);
+#endif
+
+static const void *level_fn(int level)
+{
+    switch (level) {
+#ifdef TSDB_HAVE_v3
+    case CPU_V3: return (const void *)xxh64_v3;
+#endif
+#ifdef TSDB_HAVE_v4
+    case CPU_V4: return (const void *)xxh64_v4;
+#endif
+    default: return (const void *)xxh64_base;
+    }
+}
+
+static void check_dispatch(void)
+{
+    int hw = CPU_BASE;
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("bmi") && __builtin_cpu_supports("bmi2") &&
+        __builtin_cpu_supports("fma") && __builtin_cpu_supports("lzcnt") && __builtin_cpu_supports("movbe"))
+        hw = CPU_V3;
+    if (hw == CPU_V3 && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512cd") && __builtin_cpu_supports("avx512dq") &&
+        __builtin_cpu_supports("avx512vl"))
+        hw = CPU_V4;
+#ifndef TSDB_HAVE_v4
+    if (hw == CPU_V4)
+        hw = CPU_V3;
+#endif
+#ifndef TSDB_HAVE_v3
+    hw = CPU_BASE;
+#endif
+    const char *env = getenv("TSDB_CPU");
+    if (!env || !*env) {
+        printf("dispatch: this CPU has %s, the build uses up to %s\n", cpu_level_name(hw),
+               cpu_level_name(cpu_level_max()));
+        CHECK(cpu_level_max() == hw);
+        CHECK(cpu_level() == hw);
+    }
+    for (int level = CPU_BASE; level <= cpu_level_max(); level++) {
+        CHECK(cpu_set_level(level) == 0);
+        CHECK(cpu_level() == level);
+        CHECK(cpu_level_probe() == level_fn(level));
+    }
+}
+#else
+static void check_dispatch(void) {}
+#endif
+
 int main(void)
 {
+    check_dispatch();
     make_inputs();
     buf = malloc(BUF(GR) + BLK_SLACK);
     dec = malloc(GR * 8 + BLK_SLACK);
@@ -390,7 +462,10 @@ int main(void)
     unsetenv("TSDB_SIMD");
     free(base.name);
     free(base.hash);
-    printf("%d inputs, %d configurations compared\n", nin, configs);
+    if (configs > 1)
+        printf("%d inputs, %d configurations compared\n", nin, configs);
+    else /* an older CPU, or TSDB_CPU=v2 on a build without levels: still decodes every input exactly */
+        printf("%d inputs, one configuration on this CPU: nothing to compare (SKIPPED the comparison)\n", nin);
     if (failures) {
         printf("test_levels: %d failures\n", failures);
         return 1;

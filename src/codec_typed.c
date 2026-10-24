@@ -128,22 +128,23 @@ int int_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
 
 #define F64_MUL 0x80 /* scale byte: rebuild as k * 10^-e rather than k / 10^e */
 
-static double f64_scale[F64_MAX_EXP + 1], f64_inv[F64_MAX_EXP + 1];
-
-__attribute__((constructor)) static void f64_tables(void)
-{
-    static const double inv10[F64_NDEC] = {1e0,  1e-1,  1e-2,  1e-3,  1e-4,  1e-5,  1e-6,  1e-7,
-                                           1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15};
-    double p = 1;
-    for (int e = 0; e < F64_NDEC; e++, p *= 10) {
-        f64_scale[e] = p; /* exact: powers of ten up to 10^22 are doubles */
-        f64_inv[e] = inv10[e]; /* literals: the nearest doubles, as a program computing k * 0.1 has */
-    }
-    for (int b = 1; b <= F64_NBIN; b++) {
-        f64_scale[F64_NDEC + b - 1] = ldexp(1.0, b);
-        f64_inv[F64_NDEC + b - 1] = ldexp(1.0, -b);
-    }
-}
+/* Constants rather than a constructor's tables: see dec_scale in codec.c (levels). */
+#define P2S(b) ((double)(1L << (b)))
+#define P2I(b) (1.0 / (double)(1L << (b)))
+/* powers of ten up to 10^22 are exact doubles */
+static const double f64_scale[] = {1e0, 1e1, 1e2,  1e3,  1e4,  1e5,  1e6,  1e7,
+                                   1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+                                   P2S(1), P2S(2), P2S(3), P2S(4), P2S(5), P2S(6), P2S(7), P2S(8), P2S(9), P2S(10),
+                                   P2S(11), P2S(12), P2S(13), P2S(14), P2S(15), P2S(16), P2S(17), P2S(18), P2S(19), P2S(20),
+                                   P2S(21), P2S(22), P2S(23), P2S(24), P2S(25), P2S(26), P2S(27), P2S(28), P2S(29), P2S(30)};
+/* decimal inverses are literals: the nearest doubles, as a program computing k * 0.1 has */
+static const double f64_inv[] = {1e0,  1e-1, 1e-2,  1e-3,  1e-4,  1e-5,  1e-6,  1e-7,
+                                 1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15,
+                                 P2I(1), P2I(2), P2I(3), P2I(4), P2I(5), P2I(6), P2I(7), P2I(8), P2I(9), P2I(10),
+                                 P2I(11), P2I(12), P2I(13), P2I(14), P2I(15), P2I(16), P2I(17), P2I(18), P2I(19), P2I(20),
+                                 P2I(21), P2I(22), P2I(23), P2I(24), P2I(25), P2I(26), P2I(27), P2I(28), P2I(29), P2I(30)};
+_Static_assert(sizeof f64_scale / sizeof *f64_scale == F64_MAX_EXP + 1, "f64_scale");
+_Static_assert(sizeof f64_inv / sizeof *f64_inv == F64_MAX_EXP + 1, "f64_inv");
 
 static inline double f64_back(int64_t k, int e, bool mul)
 {

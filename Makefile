@@ -102,19 +102,31 @@ clean:
 	rm -rf build build-tsan $(DIST_B)
 
 # ---- portable binaries (dist/README.dist): built here, run on AlmaLinux 10 ----
-# x86-64-v2 for CPUs as old as Sandy Bridge, with the codecs also compiled for
+# x86-64-v2 for CPUs as old as Nehalem (no AVX needed), with the codecs also compiled for
 # v3 and v4 and picked at runtime (src/levels.h); zstd and liburing static,
-# glibc dynamic and no newer than GLIBC_MAX. CC=gcc-16 works like any CC.
+# glibc dynamic and no newer than GLIBC_MAX (2.34: AlmaLinux 9 as well as 10).
+# CC=gcc-16 works like any CC. The object rules know only the sources, so a
+# change of compiler or flags empties $(DIST_B) (its .flags records them):
+# otherwise `make dist CC=gcc-16` after a GCC 15 build would package the old
+# objects as GCC 16's.
 DIST_B     ?= build-dist
 DIST_ARCH  ?= -march=x86-64-v2 -mtune=generic
-GLIBC_MAX  ?= 2.39
+GLIBC_MAX  ?= 2.34
 DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tools/glibc-compat.h" \
               CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
 DIST_BINS   = tsdbd tsdb codec-bench type-bench tsdb-bench insert-bench tsdbc-bench scale-bench
 DIST_TESTS  = test_tsdb test_types test_levels test_group test_follow test_volumes test_server test_stability
 DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS))
 
+DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
+              | $$(cksum <tools/glibc-compat.h)
+
 dist:
+	@sig="$(DIST_SIG)"; \
+	if [ "$$(cat $(DIST_B)/.flags 2>/dev/null)" != "$$sig" ]; then \
+	    [ -d $(DIST_B) ] && echo "dist: compiler or flags changed since the last build: rebuilding $(DIST_B)"; \
+	    rm -rf $(DIST_B) && mkdir -p $(DIST_B) && printf '%s\n' "$$sig" >$(DIST_B)/.flags; \
+	fi
 	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%)
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
@@ -124,7 +136,7 @@ dist:
 dist-test: dist
 	cd $(DIST_B)/tsdb-*-x86_64-linux && tests/run-tests.sh
 
-# The same inside AlmaLinux 10 (Podman), and under an emulated Sandy Bridge.
+# The same inside AlmaLinux 10 (Podman), and under an emulated Westmere and Sandy Bridge.
 dist-check-almalinux10: dist
 	tests/distro/dist-check.sh $(DIST_B)/tsdb-*-x86_64-linux.tar.gz
 
