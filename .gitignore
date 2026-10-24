@@ -10,3 +10,4 @@
 core
 core.*
 perf.data*
+/build-nouring/
