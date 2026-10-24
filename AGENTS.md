@@ -22,7 +22,15 @@ Run the tests that cover what you changed, and the sanitizers for anything
 concurrent or touching memory layout. A change to how data reaches the disk
 (writes, fsync, renames, recovery, merges, the WAL) also needs `make jepsen`.
 ThreadSanitizer is not wired into make; build it the way `make asan` does,
-with `-fsanitize=thread`.
+with `-fsanitize=thread`. `make asan` starts with `make clean`: while anything
+else uses `build/` (a running tsdbd, client tests, another agent), run it in a
+copy of the tree instead. Stop only the tsdbd processes you started (by pid),
+never all of them.
+
+Every bug fix comes with a regression test that fails without the fix (check
+by building the old code). Query timings go on a quiet machine: no builds or
+tests alongside them, and ClickHouse in its own container competes per
+cgroup, so `nice` does not keep your work out of its way.
 
 ## Layout
 
@@ -90,7 +98,6 @@ with `-fsanitize=thread`.
 - Match the surrounding code: 4-space indent, lines up to about 120
   characters, `snake_case`, errors as negative `TSDB_ERR_*` codes.
 - Comments say why, not what; file headers describe the design of the file.
-- Every bug fix comes with a regression test that fails without the fix.
 - New behaviour comes with a test, and with numbers if it is about speed or size
   (`build/codec-bench`, `build/tsdb-bench`, `build/insert-bench`, `build/tsdbc-bench`).
 - Comparisons with ClickHouse run it in **Podman** (never Docker), bound to
