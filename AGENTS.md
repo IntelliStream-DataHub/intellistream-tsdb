@@ -203,6 +203,13 @@ build/scale-bench export --from 0 --to 1250 | clickhouse client -q "INSERT INTO 
 
 ## Benchmark results
 
+These comparisons were measured before the changes of 2026-10-24 (compressed
+client inserts, fail-stop, the epoll backend, the portable build). The user
+decided to rerun the full comparison against the other databases, and the 100 B
+run against ClickHouse, only when a release is near; `bench/dbcmp/README.md`
+has the steps, Prometheus included. Internal benchmarks (flags, float32 vs
+float64, io_uring vs epoll, clients) are rerun whenever the machine is quiet.
+
 Machine: AMD Ryzen 9 7950X (16 cores / 32 threads, AVX-512), 64 GB RAM,
 WD SN720 NVMe (LUKS, ext4). ClickHouse 26.8.2.7.
 
