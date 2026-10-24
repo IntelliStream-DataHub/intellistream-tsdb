@@ -46,7 +46,8 @@ released again can be taken by another run's tsdbd, whose clients then answer yo
 "lost writes" that way). Start tsdbd with `--port 0 --port-file FILE` and read "PORT PID" from FILE, which tsdbd writes
 (atomically, once it serves; a third number is the metrics port of `--metrics-port auto`). Check that the pid is the child you started (`tests/harness.h` also checks that the child
 holds the port), and fail if the server exited or the file names someone else. A restart gets a new port; clients
-reconnect to the one in the new file. `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
+reconnect to the one in the new file. `th_owns_port` remembers the listener's socket inode, so a client that asks on every
+connect scans only the server's descriptors, not `/proc/net/tcp` (which grows with every reconnect). `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
 `tests/integration/run.py` has `Server`, and the client test helpers under `client/*/tests` do the same in their language.
 
 Every bug fix comes with a regression test that fails without the fix (check

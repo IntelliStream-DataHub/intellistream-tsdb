@@ -147,6 +147,14 @@ int main(int argc, char **argv)
     CHECK(p1 != 7070 && p2 != 7070); /* neither is the default port */
     CHECK(th_owns_port(s1, p1) && th_owns_port(s2, p2));
     CHECK(!th_owns_port(s1, p2) && !th_owns_port(s2, p1)); /* each port is held by its own server only */
+    /* th_await proved both ports: asking again must not list /proc/net/tcp (jepsen's clients ask on every connect and
+     * the listing grows with every reconnect: it once took 15 ms and cost power runs most of their writes) */
+    {
+        unsigned before = atomic_load(&th_scans);
+        for (int i = 0; i < 100; i++)
+            CHECK(th_owns_port(s1, p1) && th_owns_port(s2, p2));
+        CHECK(atomic_load(&th_scans) == before);
+    }
     CHECK(serves(p1) && serves(p2));
     {
         tsdbc *c;
@@ -278,6 +286,7 @@ int main(int argc, char **argv)
     stop(s1);
     stop(s2);
     CHECK(!serves(p1) && !serves(p2));
+    CHECK(!th_owns_port(s1, p1) && !th_owns_port(s2, p2)); /* a cached proof is no proof once the holder is gone */
     unlink(pf1);
     unlink(pf2);
     rmrf(d1);

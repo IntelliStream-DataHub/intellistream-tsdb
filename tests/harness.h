@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
@@ -30,11 +31,66 @@ static inline void th_portfile(char *buf, size_t n, const char *base)
     unlink(buf);
 }
 
+/* Listening sockets already proven to be on a port: (port << 48 | inode). Listing /proc/net/tcp costs milliseconds
+ * once it holds the TIME_WAIT sockets of a few thousand reconnects, and jepsen's clients ask on every connect. A
+ * socket inode names one socket for as long as someone holds it, so "pid has inode I open" proves "pid listens on
+ * the port I was found on" with a scan of the pid's few descriptors only; a dead server holds nothing and falls
+ * through to the full scan, which then finds no listener. */
+#define TH_CACHE 16
+static _Atomic unsigned long long th_cache[TH_CACHE];
+static _Atomic unsigned th_cache_next;
+static _Atomic unsigned th_scans; /* full /proc/net/tcp listings so far (the test of the cache reads it) */
+
+static inline void th_cache_add(int port, unsigned long ino)
+{
+    unsigned long long v = ((unsigned long long)port << 48) | (ino & 0xffffffffffffULL);
+    for (int i = 0; i < TH_CACHE; i++)
+        if (atomic_load(&th_cache[i]) == v)
+            return;
+    atomic_store(&th_cache[atomic_fetch_add(&th_cache_next, 1) % TH_CACHE], v);
+}
+
+/* Does `pid` hold a socket with one of these inodes (`want`, n of them)? Returns the inode, or 0. */
+static inline unsigned long th_fd_socket(pid_t pid, const unsigned long *want, int n)
+{
+    char dirp[64];
+    snprintf(dirp, sizeof dirp, "/proc/%d/fd", (int)pid);
+    DIR *d = opendir(dirp);
+    if (!d)
+        return 0;
+    unsigned long found = 0;
+    struct dirent *e;
+    while (!found && (e = readdir(d))) {
+        char lp[PATH_MAX], target[128];
+        snprintf(lp, sizeof lp, "%s/%s", dirp, e->d_name);
+        ssize_t r = readlink(lp, target, sizeof target - 1);
+        if (r <= 0)
+            continue;
+        target[r] = 0;
+        unsigned long ino;
+        if (sscanf(target, "socket:[%lu]", &ino) == 1)
+            for (int i = 0; i < n; i++)
+                if (want[i] == ino)
+                    found = ino;
+    }
+    closedir(d);
+    return found;
+}
+
 /* Is a listening TCP socket on `port` held by process `pid`? */
 static inline int th_owns_port(pid_t pid, int port)
 {
     unsigned long inodes[64];
     int ni = 0;
+    for (int i = 0; i < TH_CACHE; i++) { /* sockets proven to listen on this port before */
+        unsigned long long v = atomic_load(&th_cache[i]);
+        if ((int)(v >> 48) == port && v && ni < 64)
+            inodes[ni++] = (unsigned long)(v & 0xffffffffffffULL);
+    }
+    if (ni > 0 && th_fd_socket(pid, inodes, ni))
+        return 1;
+    ni = 0;
+    atomic_fetch_add(&th_scans, 1);
     for (int v6 = 0; v6 < 2; v6++) {
         FILE *f = fopen(v6 ? "/proc/net/tcp6" : "/proc/net/tcp", "r");
         if (!f)
@@ -55,27 +111,10 @@ static inline int th_owns_port(pid_t pid, int port)
     }
     if (ni == 0)
         return 0;
-    char dirp[64];
-    snprintf(dirp, sizeof dirp, "/proc/%d/fd", (int)pid);
-    DIR *d = opendir(dirp);
-    if (!d)
-        return 0;
-    int owns = 0;
-    struct dirent *e;
-    while (!owns && (e = readdir(d))) {
-        char lp[PATH_MAX], target[128];
-        snprintf(lp, sizeof lp, "%s/%s", dirp, e->d_name);
-        ssize_t r = readlink(lp, target, sizeof target - 1);
-        if (r <= 0)
-            continue;
-        target[r] = 0;
-        unsigned long ino;
-        if (sscanf(target, "socket:[%lu]", &ino) == 1)
-            for (int i = 0; i < ni; i++)
-                owns |= inodes[i] == ino;
-    }
-    closedir(d);
-    return owns;
+    unsigned long ino = th_fd_socket(pid, inodes, ni);
+    if (ino)
+        th_cache_add(port, ino);
+    return ino != 0;
 }
 
 /* Why the last th_await() failed, ready to print. */
