@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -113,6 +114,103 @@ typedef struct rb {
     double sum;
 } rb;
 
+extern size_t local_piece_bounds; /* src/calendar.c: local periods per window (0: the default) */
+
+static long maxrss_mb(void)
+{
+    struct rusage u;
+    getrusage(RUSAGE_SELF, &u);
+    return u.ru_maxrss / 1024;
+}
+
+/* Local grouping a few periods at a time gives the buckets of one window over every bound, bit for bit,
+ * in both orders and with limits, for the buckets and the spread. */
+static void same_in_windows(tsdb *db, uint32_t id, int64_t start, int64_t end, const tsdb_group *g)
+{
+    size_t lims[] = {0, 3}, wins[] = {2, 7};
+    for (int desc = 0; desc < 2; desc++)
+        for (size_t l = 0; l < 2; l++) {
+            tsdb_query_opts o = {desc ? TSDB_DESC : TSDB_ASC, lims[l]};
+            tsdb_bucket *a, *b;
+            tsdb_spread_bucket *sa, *sb;
+            size_t na, nb, nsa, nsb;
+            local_piece_bounds = 0;
+            OK(tsdb_query_group_local(db, id, start, end, g, &o, &a, &na));
+            OK(tsdb_query_spread_group_local(db, id, start, end, g, &o, &sa, &nsa));
+            CHECK(na > 0 && na == nsa && (!lims[l] || na <= lims[l]));
+            for (size_t w = 0; w < 2; w++) {
+                local_piece_bounds = wins[w];
+                OK(tsdb_query_group_local(db, id, start, end, g, &o, &b, &nb));
+                OK(tsdb_query_spread_group_local(db, id, start, end, g, &o, &sb, &nsb));
+                if (nb != na || memcmp(a, b, na * sizeof *a) != 0 || nsb != nsa ||
+                    memcmp(sa, sb, nsa * sizeof *sa) != 0)
+                    fprintf(stderr, "  %s unit %d x%u desc %d limit %zu, windows of %zu: %zu buckets, want %zu\n",
+                            g->timezone, g->unit, g->count, desc, lims[l], wins[w], nb, na);
+                CHECK(nb == na && memcmp(a, b, na * sizeof *a) == 0);
+                CHECK(nsb == nsa && memcmp(sa, sb, nsa * sizeof *sa) == 0);
+                free(b);
+                free(sb);
+            }
+            free(a);
+            free(sa);
+        }
+    /* the TWA lists every bound, window after window: the same list as in one */
+    tsdb_twa_bucket *ta, *tb;
+    size_t nta, ntb;
+    local_piece_bounds = 0;
+    OK(tsdb_query_twa_group_local(db, id, start, end, g, NULL, &ta, &nta));
+    for (size_t w = 0; w < 2; w++) {
+        local_piece_bounds = wins[w];
+        OK(tsdb_query_twa_group_local(db, id, start, end, g, NULL, &tb, &ntb));
+        CHECK(ntb == nta && memcmp(ta, tb, nta * sizeof *ta) == 0);
+        free(tb);
+    }
+    free(ta);
+    local_piece_bounds = 0;
+}
+
+/* Two rows years apart, grouped by the local second: memory follows the two buckets, not the 60 or 100
+ * million periods between them (which listed 8 bytes of bounds each and then a dense array, or were refused).
+ * The TWA, whose segments fill every period, is refused before it lists them. */
+static void test_sparse_local(tsdb *db)
+{
+    int64_t t0 = days_from_civil(2024, 1, 1) * 86400000LL + 1500, gaps[] = {60000000LL * 1000, 100000000LL * 1000};
+    for (int k = 0; k < 2; k++) {
+        char name[32];
+        snprintf(name, sizeof name, "sparse%d", k);
+        uint32_t id;
+        OK(tsdb_series(db, name, &id));
+        int64_t tt[2] = {t0, t0 + gaps[k]};
+        float vv[2] = {1, 2};
+        OK(tsdb_insert_series(db, id, tt, vv, 2));
+        tsdb_group g = {TSDB_SECOND, 1, "Europe/Oslo"};
+        tsdb_query_opts newest = {TSDB_DESC, 1};
+        tsdb_bucket *b;
+        tsdb_spread_bucket *sb;
+        tsdb_twa_bucket *tb;
+        size_t nb;
+        long before = maxrss_mb();
+        OK(tsdb_query_group_local(db, id, INT64_MIN, INT64_MAX, &g, NULL, &b, &nb));
+        CHECK(nb == 2 && b[0].start == t0 - 500 && b[1].start == tt[1] - 500 && b[0].count == 1 && b[1].sum == 2);
+        free(b);
+        OK(tsdb_query_group_local(db, id, INT64_MIN, INT64_MAX, &g, &newest, &b, &nb));
+        CHECK(nb == 1 && b[0].start == tt[1] - 500);
+        free(b);
+        OK(tsdb_query_spread_group_local(db, id, t0 - 7, t0 + gaps[k] + 1, &g, NULL, &sb, &nb));
+        CHECK(nb == 2 && sb[1].b.start == tt[1] - 500 && sb[1].range == 0);
+        free(sb);
+        CHECK(tsdb_query_twa_group_local(db, id, INT64_MIN, INT64_MAX, &g, NULL, &tb, &nb) ==
+              TSDB_ERR_TOO_MANY_BUCKETS);
+        long grew = maxrss_mb() - before;
+        if (grew >= 128)
+            fprintf(stderr, "  two rows %lld s apart by the local second: the queries took %ld MB\n",
+                    (long long)(gaps[k] / 1000), grew);
+        CHECK(grew < 128);
+        /* windows of a few periods jump from row to row */
+        same_in_windows(db, id, INT64_MIN, INT64_MAX, &(tsdb_group){TSDB_HOUR, 1, "Europe/Oslo"});
+    }
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -130,6 +228,7 @@ int main(int argc, char **argv)
     OK(tsdb_open(dir, &o, &db));
     uint32_t id;
     OK(tsdb_series(db, "s", &id));
+    test_sparse_local(db);
 
     /* sparse rows from 1945 to 2105 (Japan's DST 1948-51, China's 1986-91,
      * Moscow's offset changes), dense ones around DST changes */
@@ -229,6 +328,21 @@ int main(int argc, char **argv)
                 checked++;
                 free(b);
             }
+        }
+    }
+    /* windows of local periods: the same buckets as one window over every bound */
+    {
+        const char *wz[] = {"Europe/Oslo", "America/New_York", "Australia/Sydney", "America/St_Johns", "+05:45"};
+        int64_t y0 = days_from_civil(2018, 1, 1) * 86400000LL, y1 = days_from_civil(2019, 1, 1) * 86400000LL;
+        for (size_t z = 0; z < 5; z++) {
+            tsdb_group gs[] = {{TSDB_HOUR, 1, wz[z]}, {TSDB_MINUTE, 15, wz[z]}, {TSDB_DAY, 1, wz[z]},
+                               {TSDB_DAY, 3, wz[z]}, {TSDB_WEEK, 1, wz[z]}, {TSDB_MONTH, 1, wz[z]}};
+            /* not on period bounds; the hours and quarters over March and April only (DST changes, dense rows) */
+            int64_t m0 = days_from_civil(2018, 3, 1) * 86400000LL + 45296789, m1 = m0 + 61LL * 86400000;
+            for (size_t k = 0; k < sizeof gs / sizeof *gs; k++)
+                same_in_windows(db, id, k < 2 ? m0 : y0 + 45296789, k < 2 ? m1 : y1 - 3600000 * 7, &gs[k]);
+            same_in_windows(db, id, INT64_MIN, INT64_MAX, &(tsdb_group){TSDB_MONTH, 1, wz[z]});
+            same_in_windows(db, id, INT64_MIN, INT64_MAX, &(tsdb_group){TSDB_YEAR, 2, wz[z]});
         }
     }
     /* sub-day units in a fixed-offset zone: multiples of the length in local time */
