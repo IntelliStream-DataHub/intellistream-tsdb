@@ -137,7 +137,7 @@ impl Db {
                         merge_threads = None, query_threads = None, partition_ms = None, granule_rows = None,
                         zstd_level = None, value_codec = None, buffer_rows = None, flush_interval_ms = None,
                         wal_max_batch_rows = None, max_part_bytes = None, refresh_ms = None, merge_idle_s = None,
-                        obsolete_part_lifetime_s = None))]
+                        obsolete_part_lifetime_s = None, verify_checksums = None, retention_merge_s = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -159,6 +159,8 @@ impl Db {
         refresh_ms: Option<i32>,
         merge_idle_s: Option<i32>,
         obsolete_part_lifetime_s: Option<i32>,
+        verify_checksums: Option<bool>,
+        retention_merge_s: Option<i32>,
     ) -> PyResult<Self> {
         let d = tc::Options::default();
         let o = tc::Options {
@@ -179,6 +181,8 @@ impl Db {
             refresh_ms: refresh_ms.unwrap_or(d.refresh_ms),
             merge_idle_s: merge_idle_s.unwrap_or(d.merge_idle_s),
             obsolete_part_lifetime_s: obsolete_part_lifetime_s.unwrap_or(d.obsolete_part_lifetime_s),
+            verify_checksums: verify_checksums.unwrap_or(d.verify_checksums),
+            retention_merge_s: retention_merge_s.unwrap_or(d.retention_merge_s),
         };
         let db = py.detach(|| tc::Db::open(&path, &o)).map_err(|e| to_pyerr(py, e))?;
         Ok(Db { db: RwLock::new(Some(db)), path, last: Mutex::default() })

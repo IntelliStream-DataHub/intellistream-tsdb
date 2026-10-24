@@ -18,7 +18,8 @@ fn structs_match_the_c_header() {
     let mut rust = layout! {
         tsdb_options { partition_ms, granule_rows, zstd_level, value_codec, fsync, merge_threads, query_threads,
             buffer_rows, flush_interval_ms, wal_sync_ms, wal_max_batch_rows, max_part_bytes, read_only, follow,
-            refresh_ms, merge_idle_s, obsolete_part_lifetime_s }
+            refresh_ms, merge_idle_s, obsolete_part_lifetime_s, verify_checksums, retention_merge_s, clock_ms,
+            clock_arg }
         tsdb_values { type_, values, valid }
         tsdb_points { ts, values, n, cap }
         tsdb_bucket { start, count, sum, min, max, isum, imin, imax }
@@ -52,4 +53,53 @@ fn engine_is_linked() {
     let level = unsafe { std::ffi::CStr::from_ptr(tsdb_simd_level()) };
     assert!(!level.to_bytes().is_empty());
     eprintln!("simd level: {}", level.to_string_lossy());
+}
+
+/// The offsets above only cover the fields listed; a field the header gained (in the middle, at the end, or in
+/// what was padding) must be listed too, or the engine reads past the Rust struct or into its padding.
+#[test]
+fn every_field_of_the_header_is_listed() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let header = std::fs::read_to_string(root.join("../../include/tsdb.h")).unwrap();
+    let layout = std::fs::read_to_string(root.join("layout.c")).unwrap();
+    let header = strip_comments(&header);
+    let mut structs: Vec<&str> = Vec::new();
+    for t in layout.split("S(").skip(1).filter_map(|s| s.split(')').next()) {
+        if !structs.contains(&t) && header.contains(&format!("typedef struct {t} {{")) {
+            structs.push(t);
+        }
+    }
+    assert!(structs.len() >= 8, "found only {structs:?} in layout.c");
+    for t in structs {
+        let start = header.find(&format!("typedef struct {t} {{")).unwrap();
+        let body = &header[start..];
+        let body = &body[body.find('{').unwrap() + 1..body.find(&format!("}} {t};")).unwrap()];
+        let mut fields = Vec::new();
+        for decl in body.split(';').map(str::trim).filter(|d| !d.is_empty()) {
+            if let Some(fp) = decl.find("(*") {
+                // a function pointer: int64_t (*name)(args)
+                fields.push(decl[fp + 2..decl[fp..].find(')').unwrap() + fp].to_string());
+                continue;
+            }
+            let decl = decl.split('[').next().unwrap(); // char name[256]
+            // "uint64_t a, b": the names start after the last blank or '*' of the first declarator
+            let first = decl.split(',').next().unwrap();
+            let names = &decl[first.rfind(|c: char| c.is_whitespace() || c == '*').unwrap() + 1..];
+            fields.extend(names.split(',').map(|n| n.trim().trim_start_matches('*').to_string()));
+        }
+        for f in &fields {
+            assert!(layout.contains(&format!("O({t}, {f})")), "{t}.{f} is in tsdb.h but not in layout.c (nor in Rust)");
+        }
+    }
+}
+
+fn strip_comments(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("/*") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + rest[i..].find("*/").unwrap() + 2..];
+    }
+    out.push_str(rest);
+    out.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n")
 }

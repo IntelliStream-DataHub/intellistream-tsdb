@@ -88,6 +88,12 @@ pub struct Options {
     pub merge_idle_s: i32,
     /// Parts replaced by merges are deleted this many seconds later (for readers on NFS). Default 480.
     pub obsolete_part_lifetime_s: i32,
+    /// Queries check each granule's checksum before decoding it (a mismatch is [`Error::Server`] with
+    /// `TSDB_ERR_CORRUPT`). Default false: for storage that checks its data itself (ZFS, ECC memory).
+    pub verify_checksums: bool,
+    /// A part holding rows past their series' retention is rewritten without them once it is this many
+    /// seconds old; -1 never (merges still drop them). Default 3600.
+    pub retention_merge_s: i32,
 }
 
 impl Default for Options {
@@ -116,6 +122,8 @@ impl Default for Options {
             refresh_ms: o.refresh_ms,
             merge_idle_s: o.merge_idle_s,
             obsolete_part_lifetime_s: o.obsolete_part_lifetime_s,
+            verify_checksums: o.verify_checksums != 0,
+            retention_merge_s: o.retention_merge_s,
         }
     }
 }
@@ -144,6 +152,11 @@ impl Options {
             refresh_ms: self.refresh_ms,
             merge_idle_s: self.merge_idle_s,
             obsolete_part_lifetime_s: self.obsolete_part_lifetime_s,
+            verify_checksums: self.verify_checksums as c_int,
+            retention_merge_s: self.retention_merge_s,
+            // the wall clock: CLOCK_REALTIME
+            clock_ms: None,
+            clock_arg: std::ptr::null_mut(),
         }
     }
 }

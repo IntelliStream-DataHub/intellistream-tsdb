@@ -50,7 +50,7 @@ pub const TSDB_VALUES_CHIMP: c_int = 2;
 
 /// Options of [`tsdb_open`]; fill with [`tsdb_options_init`] first. See `tsdb.h` for each field.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct tsdb_options {
     pub partition_ms: i64,
     pub granule_rows: u32,
@@ -69,6 +69,18 @@ pub struct tsdb_options {
     pub refresh_ms: c_int,
     pub merge_idle_s: c_int,
     pub obsolete_part_lifetime_s: c_int,
+    pub verify_checksums: c_int,
+    pub retention_merge_s: c_int,
+    pub clock_ms: Option<unsafe extern "C" fn(arg: *mut c_void) -> i64>,
+    pub clock_arg: *mut c_void,
+}
+
+impl Default for tsdb_options {
+    /// All zero, as C's `{0}`; [`tsdb_options_init`] sets the defaults.
+    fn default() -> tsdb_options {
+        // SAFETY: integers, a nullable function pointer (None is null) and a raw pointer: all-zero is valid.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 pub type tsdb_type = c_int;

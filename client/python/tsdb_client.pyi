@@ -716,6 +716,8 @@ class Db:
         refresh_ms: int | None = None,
         merge_idle_s: int | None = None,
         obsolete_part_lifetime_s: int | None = None,
+        verify_checksums: bool | None = None,
+        retention_merge_s: int | None = None,
     ) -> Db: ...
     def close(self) -> None:
         """Flushes the memtable and closes the database.
