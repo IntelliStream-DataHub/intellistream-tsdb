@@ -401,21 +401,26 @@ static size_t reference_n(const ref_series *s, size_t nrows, int64_t interval, r
     return n;
 }
 
-/* the reference over the rows that are left: a deleted row is not a null, it opens no bucket */
-static size_t reference(const ref_series *s, int64_t interval, ref_bucket *out)
+/* the reference over the rows in [a, e) that are left: a deleted row is not a null, it opens no bucket */
+static size_t reference_in(const ref_series *s, int64_t interval, int64_t a, int64_t e, ref_bucket *out)
 {
     static ref_series live;
     size_t n = 0;
     live.type = s->type;
     live.shape = s->shape;
     for (size_t i = 0; i < NROWS; i++)
-        if (!s->gone[i]) {
+        if (!s->gone[i] && s->ts[i] >= a && s->ts[i] < e) {
             live.ts[n] = s->ts[i];
             live.v[n] = s->v[i];
             live.ok[n] = s->ok[i];
             n++;
         }
     return reference_n(&live, n, interval, out);
+}
+
+static size_t reference(const ref_series *s, int64_t interval, ref_bucket *out)
+{
+    return reference_in(s, interval, INT64_MIN, INT64_MAX, out);
 }
 
 /* tolerance of a float standard deviation: relative, and a few ulps of the largest value (the means
@@ -511,6 +516,72 @@ static void check_all(tsdb *db, const uint32_t *ids, ref_series *const *ss, cons
             memcpy(*all + *nall, b, nb * sizeof *b);
             *nall += nb;
             free(b);
+        }
+}
+
+/* the same buckets, in reverse when desc, and only the first limit of them (0: all) */
+static void same_order(const char *what, const char *form, const tsdb_spread_bucket *asc, size_t na,
+                       const tsdb_spread_bucket *b, size_t nb, bool desc, size_t limit)
+{
+    size_t want = limit && limit < na ? limit : na;
+    bool ok = nb == want;
+    for (size_t i = 0; ok && i < nb; i++)
+        ok = memcmp(&b[i], &asc[desc ? na - 1 - i : i], sizeof *b) == 0;
+    if (!ok) {
+        fprintf(stderr, "%s, %s (%s, limit %zu): %zu buckets, not the %zu expected or not the same\n", what, form,
+                desc ? "desc" : "asc", limit, nb, want);
+        failures++;
+    }
+}
+
+/* The interval, group and bounds forms over a part of the range, ascending, descending and limited, against
+ * the reference. bounds[0] lies after the first rows: those belong to no bucket even though start is 0. */
+static void check_forms(tsdb *db, const uint32_t *ids, ref_series *const *ss, const char *stage)
+{
+    static ref_bucket r[NROWS];
+    static int64_t bounds[NROWS];
+    static const int64_t ivs[] = {640, 777, 7000};
+    for (int k = 0; k < NS; k++)
+        for (size_t q = 0; q < sizeof ivs / sizeof ivs[0]; q++) {
+            int64_t iv = ivs[q], a = iv * (1 + rndr(4)), m = 1 + rndr(60000 / iv);
+            int64_t e = a + m * iv - rndr(2) * rndr(iv); /* the last bucket whole or cut short */
+            for (int64_t j = 0; j < m; j++)
+                bounds[j] = a + j * iv;
+            size_t nr = reference_in(ss[k], iv, a, e, r);
+            tsdb_spread_bucket *asc, *b;
+            size_t na, nb;
+            char what[160];
+            snprintf(what, sizeof what, "%s, series %d, interval %lld from %lld", stage, k, (long long)iv,
+                     (long long)a);
+            OK(tsdb_query_spread(db, ids[k], a, e, iv, NULL, &asc, &na));
+            failures += compare(what, ss[k], r, nr, asc, na) != 0;
+            tsdb_group g = {.unit = TSDB_SECOND, .count = (uint32_t)(iv / 1000)};
+            if (iv % 1000 == 0) {
+                OK(tsdb_query_spread_group(db, ids[k], a, e, &g, NULL, &b, &nb));
+                same_order(what, "group", asc, na, b, nb, false, 0);
+                free(b);
+            }
+            OK(tsdb_query_spread_bounds(db, ids[k], 0, e, bounds, (size_t)m, NULL, &b, &nb));
+            char wb[200];
+            snprintf(wb, sizeof wb, "%s, bounds", what);
+            failures += compare(wb, ss[k], r, nr, b, nb) != 0;
+            free(b);
+            for (int d = 0; d < 2; d++) {
+                size_t limit = d && !rndr(3) ? 0 : 1 + (size_t)rndr((int64_t)na + 1);
+                tsdb_query_opts o = {.order = d ? TSDB_DESC : TSDB_ASC, .limit = limit};
+                OK(tsdb_query_spread(db, ids[k], a, e, iv, &o, &b, &nb));
+                same_order(what, "interval", asc, na, b, nb, d, limit);
+                free(b);
+                OK(tsdb_query_spread_bounds(db, ids[k], 0, e, bounds, (size_t)m, &o, &b, &nb));
+                same_order(what, "bounds", asc, na, b, nb, d, limit);
+                free(b);
+                if (iv % 1000 == 0) {
+                    OK(tsdb_query_spread_group(db, ids[k], a, e, &g, &o, &b, &nb));
+                    same_order(what, "group", asc, na, b, nb, d, limit);
+                    free(b);
+                }
+            }
+            free(asc);
         }
 }
 
@@ -757,6 +828,7 @@ static void test_deletes(bool merges)
         char st[64];
         snprintf(st, sizeof st, "deletes%d round %d", merges, round);
         check_all(db, ids, ss, st, &b, &nb);
+        check_forms(db, ids, ss, st);
         free(b);
     }
     if (!merges)
@@ -765,6 +837,7 @@ static void test_deletes(bool merges)
     if (!merges)
         check_levels(db, ids, ss, "deletes, parts");
     check_all(db, ids, ss, "deletes, flushed", &b, &nb);
+    check_forms(db, ids, ss, "deletes, flushed");
     tsdb *fo = open_del(dir, false, true);
     OK(tsdb_refresh(fo));
     check_all(fo, ids, ss, "deletes, follower", &b2, &nb2);
@@ -787,6 +860,7 @@ static void test_deletes(bool merges)
         check_levels(db, ids, ss, "deletes, optimized");
     OK(tsdb_refresh(fo));
     check_all(fo, ids, ss, "deletes, follower after optimize", &b, &nb);
+    check_forms(fo, ids, ss, "deletes, follower after optimize");
     free(b);
 
     /* retention: every row before a cutoff inside each series is gone, merged away or not */
@@ -797,6 +871,7 @@ static void test_deletes(bool merges)
             ss[k]->gone[i] = true;
     }
     check_all(db, ids, ss, "retention", &b, &nb);
+    check_forms(db, ids, ss, "retention");
     if (!merges)
         check_levels(db, ids, ss, "retention");
     OK(tsdb_optimize(db)); /* merges drop the expired rows */
@@ -806,6 +881,7 @@ static void test_deletes(bool merges)
     OK(tsdb_close(fo));
     fo = open_del(dir, false, true);
     check_all(fo, ids, ss, "retention, follower", &b2, &nb2);
+    check_forms(fo, ids, ss, "retention, follower");
     same_ints(b, nb, b2, nb2, "retention, follower");
     free(b2);
     free(b);
