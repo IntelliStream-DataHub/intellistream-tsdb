@@ -657,6 +657,7 @@ struct eng {
      * fail_lock before `failed` is stored, so whoever sees `failed` can read it */
     atomic_bool failed;
     pthread_mutex_t fail_lock; /* innermost; held only to fill fail_msg */
+    pthread_mutex_t dir_sync_lock; /* eng_sync_dir; inside every lock but fail_lock */
     char fail_msg[256];
 };
 
@@ -673,6 +674,13 @@ struct eng {
  * threads stop writing, reads keep working, and reopening recovers what was
  * durable. */
 void eng_fail(struct eng *db, const char *what, int err);
+/* fsync of the database directory after naming or removing files, failing the
+ * engine (with `what`) if it fails. All callers share one directory fd, and a
+ * writeback error is reported once per open file: a concurrent or later fsync
+ * returns 0 although the entries of the failed one may never reach the disk.
+ * So these fsyncs take turns, and none succeeds once the engine has failed:
+ * a 0 means every entry named before the call is durable. */
+int eng_sync_dir(struct eng *db, const char *what);
 /* TSDB_ERR_IO once the engine has failed, else 0. */
 static inline int eng_check(struct eng *db)
 {

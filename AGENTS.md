@@ -94,7 +94,9 @@ cgroup, so `nice` does not keep your work out of its way.
   its output), and `tsdb_failed` reports it;
   tsdbd exits with status 1. A retried fsync can return 0 after the kernel
   dropped the dirty pages, so it proves nothing; only a reopen, which replays
-  from what is on disk, is safe. Errors on files nothing relies on yet (a
+  from what is on disk, is safe. Every directory fsync goes through
+  `eng_sync_dir`: they share one fd, which reports a writeback error once, so
+  they take turns and none succeeds after the engine failed. Errors on files nothing relies on yet (a
   `tmp_*` part, a merge output before it is named) fail just the call; the
   directory fsync after naming a merged part is fail-stop. A dictionary marks
   itself `broken` under its own lock before the engine fails, so a creator
@@ -119,7 +121,8 @@ cgroup, so `nice` does not keep your work out of its way.
   (`type_null`), so a null written later replaces an older value like any
   other write. Aggregates skip nulls; integer sums are exact (128 bits).
 - **Lock order:** `flush_lock` > the WAL writer role > `publish_lock` >
-  `manifest_lock` > `db->lock` > `buf_lock`. The `crashfs` lock in tests is innermost.
+  `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`. The `crashfs` lock in tests is
+  innermost.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
 - The on-disk format is version 2 (`FORMAT_VERSION`): 80-byte granule entries

@@ -410,9 +410,8 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     }
     close(w->fd);
     w->fd = -1;
-    if (db->opt.fsync && fsync(db->dirfd) != 0) {
+    if (eng_sync_dir(db, "fsync of the directory after naming a merged part") != 0) {
         /* the caller (a merge) would retire the sources next */
-        eng_fail(db, "fsync of the directory after naming a merged part", errno);
         unlinkat(db->dirfd, name, 0);
         pw_abort(w);
         return TSDB_ERR_IO;
@@ -499,10 +498,8 @@ int parts_commit(eng *db, part **ps, size_t n)
             unlinkat(db->dirfd, intent, 0);
             return rc;
         }
-        if (db->opt.fsync && fsync(db->dirfd) != 0) { /* the intent's name is the commit */
-            eng_fail(db, "fsync of the directory after writing an insert's intent", errno);
-            return TSDB_ERR_IO; /* committed or not: the next open decides, by the intent */
-        }
+        if (eng_sync_dir(db, "fsync of the directory after writing an insert's intent") != 0)
+            return TSDB_ERR_IO; /* the intent's name is the commit; committed or not: the next open decides */
     }
     for (size_t i = 0; i < n; i++) {
         if (renameat(db->dirfd, ps[i]->pending, db->dirfd, ps[i]->name) != 0) {
@@ -511,10 +508,8 @@ int parts_commit(eng *db, part **ps, size_t n)
         }
         ps[i]->pending[0] = '\0';
     }
-    if (db->opt.fsync && fsync(db->dirfd) != 0) {
-        eng_fail(db, "fsync of the directory after publishing parts", errno);
+    if (eng_sync_dir(db, "fsync of the directory after publishing parts") != 0)
         return TSDB_ERR_IO; /* not published; the next open lists the parts that made it */
-    }
     if (intent[0])
         unlinkat(db->dirfd, intent, 0);
     return 0;

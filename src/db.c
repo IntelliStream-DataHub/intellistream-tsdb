@@ -382,6 +382,7 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     pthread_mutex_init(&db->publish_lock, NULL);
     pthread_mutex_init(&db->refresh_lock, NULL);
     pthread_mutex_init(&db->fail_lock, NULL);
+    pthread_mutex_init(&db->dir_sync_lock, NULL);
     pthread_cond_init(&db->wal_cv, NULL);
     pthread_cond_init(&db->merge_cv, NULL);
     pthread_cond_init(&db->merged_cv, NULL);
@@ -514,6 +515,7 @@ int eng_close(eng *db)
     pthread_mutex_destroy(&db->publish_lock);
     pthread_mutex_destroy(&db->refresh_lock);
     pthread_mutex_destroy(&db->fail_lock);
+    pthread_mutex_destroy(&db->dir_sync_lock);
     pthread_cond_destroy(&db->wal_cv);
     pthread_cond_destroy(&db->merge_cv);
     pthread_cond_destroy(&db->merged_cv);
@@ -536,6 +538,20 @@ void eng_fail(eng *db, const char *what, int err)
         atomic_store_explicit(&db->failed, true, memory_order_release);
     }
     pthread_mutex_unlock(&db->fail_lock);
+}
+
+int eng_sync_dir(eng *db, const char *what)
+{
+    if (!db->opt.fsync)
+        return eng_check(db);
+    pthread_mutex_lock(&db->dir_sync_lock);
+    int rc = eng_check(db);
+    if (rc == 0 && fsync(db->dirfd) != 0) {
+        eng_fail(db, what, errno);
+        rc = TSDB_ERR_IO;
+    }
+    pthread_mutex_unlock(&db->dir_sync_lock);
+    return rc;
 }
 
 int eng_failed_msg(eng *db, char *msg, size_t len)
@@ -691,12 +707,8 @@ int eng_drop_before(eng *db, int64_t ts)
         }
     }
     pthread_mutex_unlock(&db->lock);
-    if ((rc = eng_check(db)) != 0) /* failed since the flush, here or elsewhere */
-        return rc;
-    if (db->opt.fsync && fsync(db->dirfd) != 0) {
-        eng_fail(db, "fsync of the directory after retiring dropped parts", errno);
-        return TSDB_ERR_IO;
-    }
+    if ((rc = eng_sync_dir(db, "fsync of the directory after retiring dropped parts")) != 0)
+        return rc; /* failed since the flush, here or elsewhere */
     return manifest_publish(db);
 }
 

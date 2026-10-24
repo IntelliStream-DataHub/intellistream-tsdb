@@ -337,11 +337,9 @@ static int wal_open_segment(eng *db, uint64_t seq, int *fd)
     if (*fd < 0)
         return TSDB_ERR_IO;
     /* the segment must exist after a crash before rows in it are acknowledged */
-    if (db->opt.fsync && fsync(db->dirfd) != 0) {
-        int err = errno;
+    if (eng_sync_dir(db, "fsync of the directory after creating a WAL segment") != 0) {
         close(*fd);
         *fd = -1;
-        eng_fail(db, "fsync of the directory after creating a WAL segment", err);
         return TSDB_ERR_IO;
     }
     return 0;

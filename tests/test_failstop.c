@@ -936,6 +936,54 @@ static void test_wal_segment(const char *base)
     printf("  failed directory fsync after creating a WAL segment\n");
 }
 
+/* A large insert's part is renamed while another thread's directory fsync
+ * fails. Its own fsync after that returns 0, but proves nothing: the kernel
+ * reports a writeback error once per open file, the database shares one
+ * directory fd, and the failed entries may never reach the disk
+ * ("fsyncgate"). Before the fix the insert was acknowledged after the failure
+ * (the jepsen eio nemesis lost such an insert after a WAL segment's directory
+ * fsync failed in a flush). */
+typedef struct {
+    tsdb *db;
+    uint32_t id;
+    int rc;
+} inserter;
+
+static void *insert_main(void *arg)
+{
+    inserter *a = arg;
+    a->rc = insert_n(a->db, a->id, 0, 100, false);
+    return NULL;
+}
+
+static void test_dir_fsync_race(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-dirrace", base);
+    tsdb *db = open_fresh(name, opts());
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    hold(F_RENAME, "_0.part"); /* the large insert, before it names its part */
+    inserter a = {db, id, -1};
+    pthread_t t;
+    pthread_create(&t, NULL, insert_main, &a);
+    wait_held();
+    OK(tsdb_append(db, id, 1000, 1)); /* something to flush */
+    OK(tsdb_commit(db));
+    arm(F_FSYNC, "/", false, false);
+    CHECK(tsdb_flush(db) == TSDB_ERR_IO); /* the new WAL segment's directory fsync */
+    CHECK(fired() == 1);
+    release();
+    pthread_join(t, NULL);
+    CHECK(a.rc == TSDB_ERR_IO);
+    CHECK(is_failed(db, "WAL segment"));
+    db = reopen(db);
+    int64_t n = count_rows(db, "s");
+    CHECK(n == 1 || n == 101); /* the unacknowledged part may or may not be there */
+    tsdb_close(db);
+    printf("  a directory fsync after another one failed\n");
+}
+
 static void test_drop_before(const char *base)
 {
     char name[600];
@@ -977,6 +1025,7 @@ int main(int argc, char **argv)
     test_merge_backoff(root);
     test_wal_segment(root);
     test_drop_before(root);
+    test_dir_fsync_race(root);
     if (!failures) {
         char cmd[512];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);

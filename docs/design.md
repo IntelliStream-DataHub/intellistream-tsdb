@@ -126,7 +126,12 @@ was written after it. Errors on files nothing relies on yet (a new part before
 it is committed, a merge output before it is named) fail only that insert,
 flush or merge; a failed flush keeps its memtable and retries it first. The
 directory fsync after naming a merged part is fail-stop, because the sources
-would be retired next. A full disk (ENOSPC) on the WAL, MANIFEST or a
+would be retired next. The same holds across threads: all directory fsyncs
+use one file descriptor, and the kernel reports a writeback error to one of
+them, so a concurrent or later `fsync` of the directory can return 0 without
+the entries of the failed one. They take turns, and once the engine has failed
+none of them succeeds, so a commit that reached its fsync after another
+thread's failure is not acknowledged. A full disk (ENOSPC) on the WAL, MANIFEST or a
 dictionary is fail-stop as well, as in PostgreSQL: under systemd a full disk
 means restarts that serve reads in between, until space is freed. The failure
 message goes to stderr once, possibly while the caller holds engine locks;
