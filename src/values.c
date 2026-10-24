@@ -41,6 +41,10 @@ static void fold_f64(const double *v, size_t n, agg_state *a, agg_dev *x)
 
 static void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
 {
+    if (simd_fold_i64) {
+        simd_fold_i64(v, n, a, dx);
+        return;
+    }
     if (!dx) {
         __int128 s = 0;
         int64_t mn = a->imin, mx = a->imax;

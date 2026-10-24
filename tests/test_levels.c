@@ -128,6 +128,32 @@ static void make_inputs(void)
     x = add("int64 nulls", TSDB_INT64, 1000);
     for (size_t i = 0; i < 1000; i++)
         ((int64_t *)x->v)[i] = next() % 4 ? NULL_I64 : (int64_t)(next() % 100) - 50;
+    /* int64 kernels: lane sums in 32-bit halves and a sign count, squares in vectors only within int32 */
+    static const size_t i64_n[] = {GR, 1000, 33, 32, 31, 17, 16, 15, 9, 8, 7, 1};
+    for (size_t k = 0; k < sizeof i64_n / sizeof *i64_n; k++) {
+        snprintf(name, sizeof name, "int64 int32 range with nulls, %zu", i64_n[k]);
+        x = add(name, TSDB_INT64, i64_n[k]);
+        for (size_t i = 0; i < x->n; i++) {
+            static const int64_t e[] = {INT32_MIN, INT32_MAX, -1, 0, 1, INT32_MIN + 1};
+            uint64_t r = next();
+            ((int64_t *)x->v)[i] = r % 5 == 0 ? NULL_I64 : r % 5 == 1 ? e[(r >> 8) % 6] : (int32_t)(r >> 16);
+        }
+        snprintf(name, sizeof name, "int64 just past int32, %zu", i64_n[k]);
+        x = add(name, TSDB_INT64, i64_n[k]);
+        for (size_t i = 0; i < x->n; i++)
+            ((int64_t *)x->v)[i] = i == x->n / 2 ? (int64_t)INT32_MAX + 2 : (int32_t)next();
+        snprintf(name, sizeof name, "int64 most negative, %zu", i64_n[k]);
+        x = add(name, TSDB_INT64, i64_n[k]);
+        for (size_t i = 0; i < x->n; i++)
+            ((int64_t *)x->v)[i] = next() % 9 ? INT64_MIN + 1 : NULL_I64;
+        snprintf(name, sizeof name, "int64 most positive, %zu", i64_n[k]);
+        x = add(name, TSDB_INT64, i64_n[k]);
+        for (size_t i = 0; i < x->n; i++)
+            ((int64_t *)x->v)[i] = INT64_MAX - (int64_t)(next() % 3);
+    }
+    x = add("int64 only nulls", TSDB_INT64, 100);
+    for (size_t i = 0; i < 100; i++)
+        ((int64_t *)x->v)[i] = NULL_I64;
     x = add("bool door", TSDB_BOOL, GR);
     for (size_t i = 0; i < GR; i++)
         ((uint32_t *)x->v)[i] = i ? (next() % 1200 == 0 ? !((uint32_t *)x->v)[i - 1] : ((uint32_t *)x->v)[i - 1]) : 0;

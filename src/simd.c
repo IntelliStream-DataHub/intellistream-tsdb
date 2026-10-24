@@ -626,6 +626,226 @@ __attribute__((target("avx512f,avx512dq"))) static void fold_f64_avx512(const do
 }
 #endif
 
+/* ---------------------------------------------------------------- int64 */
+
+/*
+ * Integer results are exact, so the order of the additions is free and these
+ * kernels need not share lanes with anything; the scalar loops of values.c
+ * (v2, TSDB_SIMD=scalar) are the reference. The sum: a value x is
+ * lo + 2^32 hi - 2^64 neg, with lo and hi its unsigned 32-bit halves and neg
+ * its sign bit. 64-bit lane sums of lo, hi and neg cannot overflow within
+ * 2^32 values per lane; they are combined into 128 bits per block of
+ * I64_BLOCK vectors. A null (INT64_MIN) is masked to 0 for the sums and to
+ * INT64_MAX for the minimum; for the maximum it is the identity already.
+ * The spread's squares take a second pass: in vectors when the run's known
+ * values all fit in int32 (each square then below 2^62, summed in halves
+ * like the values), else the exact 128-bit scalar loop.
+ */
+#define I64_BLOCK ((size_t)1 << 26)
+
+/* the 192-bit sum of the squares of v's known values into dx, one at a time */
+static void i64_squares(const int64_t *v, size_t i, size_t n, agg_dev *dx)
+{
+    unsigned __int128 q = 0;
+    uint64_t qh = 0;
+    for (; i < n; i++) {
+        int64_t x = v[i];
+        if (x == NULL_I64)
+            continue;
+        uint64_t u = x < 0 ? 0 - (uint64_t)x : (uint64_t)x;
+        unsigned __int128 sq = (unsigned __int128)u * u;
+        q += sq;
+        qh += q < sq;
+    }
+    isq_add(dx, q, qh);
+}
+
+/* v[i, n) one at a time into the run's sum, known count, min and max */
+static void i64_tail(const int64_t *v, size_t i, size_t n, __int128 *s, uint64_t *c, int64_t *mn, int64_t *mx)
+{
+    for (; i < n; i++) {
+        int64_t x = v[i];
+        if (x == NULL_I64)
+            continue;
+        ++*c;
+        *s += x;
+        *mn = x < *mn ? x : *mn;
+        *mx = x > *mx ? x : *mx;
+    }
+}
+
+static void i64_finish(agg_state *a, __int128 s, uint64_t c, int64_t mn, int64_t mx)
+{
+    a->count += c;
+    a->isum += s;
+    a->imin = mn < a->imin ? mn : a->imin;
+    a->imax = mx > a->imax ? mx : a->imax;
+}
+
+static inline __int128 i64_combine(const uint64_t *lo, const uint64_t *hi, const uint64_t *neg, int k)
+{
+    uint64_t l = 0, h = 0, g = 0;
+    for (int j = 0; j < k; j++) {
+        l += lo[j];
+        h += hi[j];
+        g += neg[j];
+    }
+    return (__int128)l + ((__int128)h << 32) - ((__int128)g << 64);
+}
+
+#ifdef TSDB_X86
+K_AVX2 int64_t hmin4(__m256i x)
+{
+    int64_t t[4];
+    _mm256_storeu_si256((__m256i *)t, x);
+    int64_t m = t[0];
+    for (int j = 1; j < 4; j++)
+        m = t[j] < m ? t[j] : m;
+    return m;
+}
+
+K_AVX2 int64_t hmax4(__m256i x)
+{
+    int64_t t[4];
+    _mm256_storeu_si256((__m256i *)t, x);
+    int64_t m = t[0];
+    for (int j = 1; j < 4; j++)
+        m = t[j] > m ? t[j] : m;
+    return m;
+}
+
+__attribute__((target("avx2"))) static void fold_i64_avx2(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
+{
+    const __m256i nv = _mm256_set1_epi64x(INT64_MIN), lom = _mm256_set1_epi64x(0xffffffff),
+                  maxv = _mm256_set1_epi64x(INT64_MAX);
+    __m256i mn0 = maxv, mn1 = maxv, mx0 = nv, mx1 = nv;
+    __int128 s = 0;
+    uint64_t c = 0;
+    size_t i = 0;
+    while (n - i >= 8) {
+        size_t end = i + ((n - i) / 8 < I64_BLOCK ? (n - i) / 8 : I64_BLOCK) * 8, start = i;
+        __m256i slo = _mm256_setzero_si256(), shi = slo, sneg = slo, snull = slo;
+#define STEP(x, mn, mx)                                                                                            \
+    do {                                                                                                           \
+        __m256i m = _mm256_cmpeq_epi64(x, nv), xs = _mm256_andnot_si256(m, x);                                     \
+        slo = _mm256_add_epi64(slo, _mm256_and_si256(xs, lom));                                                    \
+        shi = _mm256_add_epi64(shi, _mm256_srli_epi64(xs, 32));                                                    \
+        sneg = _mm256_add_epi64(sneg, _mm256_srli_epi64(xs, 63));                                                  \
+        snull = _mm256_sub_epi64(snull, m);                                                                        \
+        __m256i xm = _mm256_blendv_epi8(x, maxv, m);                                                               \
+        mn = _mm256_blendv_epi8(mn, xm, _mm256_cmpgt_epi64(mn, xm));                                               \
+        mx = _mm256_blendv_epi8(mx, x, _mm256_cmpgt_epi64(x, mx));                                                 \
+    } while (0)
+        for (; i < end; i += 8) {
+            __m256i x = _mm256_loadu_si256((const __m256i *)(v + i));
+            __m256i y = _mm256_loadu_si256((const __m256i *)(v + i + 4));
+            STEP(x, mn0, mx0);
+            STEP(y, mn1, mx1);
+        }
+#undef STEP
+        uint64_t lo[4], hi[4], neg[4], nul[4];
+        _mm256_storeu_si256((__m256i *)lo, slo);
+        _mm256_storeu_si256((__m256i *)hi, shi);
+        _mm256_storeu_si256((__m256i *)neg, sneg);
+        _mm256_storeu_si256((__m256i *)nul, snull);
+        s += i64_combine(lo, hi, neg, 4);
+        c += (end - start) - (nul[0] + nul[1] + nul[2] + nul[3]);
+    }
+    int64_t mn = hmin4(mn0), mx = hmax4(mx0), mn_1 = hmin4(mn1), mx_1 = hmax4(mx1);
+    mn = mn_1 < mn ? mn_1 : mn;
+    mx = mx_1 > mx ? mx_1 : mx;
+    i64_tail(v, i, n, &s, &c, &mn, &mx);
+    i64_finish(a, s, c, mn, mx);
+    if (!dx || !c)
+        return;
+    if (mn < INT32_MIN || mx > INT32_MAX) {
+        i64_squares(v, 0, n, dx);
+        return;
+    }
+    unsigned __int128 q = 0;
+    i = 0;
+    while (n - i >= 4) {
+        size_t end = i + ((n - i) / 4 < I64_BLOCK ? (n - i) / 4 : I64_BLOCK) * 4;
+        __m256i qlo = _mm256_setzero_si256(), qhi = qlo;
+        for (; i < end; i += 4) {
+            __m256i x = _mm256_loadu_si256((const __m256i *)(v + i));
+            __m256i xs = _mm256_andnot_si256(_mm256_cmpeq_epi64(x, nv), x), sq = _mm256_mul_epi32(xs, xs);
+            qlo = _mm256_add_epi64(qlo, _mm256_and_si256(sq, lom));
+            qhi = _mm256_add_epi64(qhi, _mm256_srli_epi64(sq, 32));
+        }
+        uint64_t lo[4], hi[4];
+        _mm256_storeu_si256((__m256i *)lo, qlo);
+        _mm256_storeu_si256((__m256i *)hi, qhi);
+        q += (unsigned __int128)(lo[0] + lo[1] + lo[2] + lo[3]) +
+             ((unsigned __int128)(hi[0] + hi[1] + hi[2] + hi[3]) << 32);
+    }
+    isq_add(dx, q, 0);
+    i64_squares(v, i, n, dx);
+}
+
+__attribute__((target("avx512f,avx512dq"))) static void fold_i64_avx512(const int64_t *v, size_t n, agg_state *a,
+                                                                        agg_dev *dx)
+{
+    const __m512i nv = _mm512_set1_epi64(INT64_MIN), lom = _mm512_set1_epi64(0xffffffff);
+    __m512i mn0 = _mm512_set1_epi64(INT64_MAX), mn1 = mn0, mx0 = nv, mx1 = nv;
+    __int128 s = 0;
+    uint64_t c = 0;
+    size_t i = 0;
+    while (n - i >= 16) {
+        size_t end = i + ((n - i) / 16 < I64_BLOCK ? (n - i) / 16 : I64_BLOCK) * 16;
+        __m512i slo = _mm512_setzero_si512(), shi = slo, sneg = slo;
+#define STEP(x, mn, mx)                                                                                            \
+    do {                                                                                                           \
+        __mmask8 k = _mm512_cmpneq_epi64_mask(x, nv);                                                              \
+        __m512i xs = _mm512_maskz_mov_epi64(k, x);                                                                 \
+        slo = _mm512_add_epi64(slo, _mm512_and_si512(xs, lom));                                                    \
+        shi = _mm512_add_epi64(shi, _mm512_srli_epi64(xs, 32));                                                    \
+        sneg = _mm512_add_epi64(sneg, _mm512_srli_epi64(xs, 63));                                                  \
+        c += (uint64_t)__builtin_popcount(k);                                                                      \
+        mn = _mm512_mask_min_epi64(mn, k, mn, x);                                                                  \
+        mx = _mm512_max_epi64(mx, x);                                                                              \
+    } while (0)
+        for (; i < end; i += 16) {
+            __m512i x = _mm512_loadu_si512(v + i), y = _mm512_loadu_si512(v + i + 8);
+            STEP(x, mn0, mx0);
+            STEP(y, mn1, mx1);
+        }
+#undef STEP
+        uint64_t lo[8], hi[8], neg[8];
+        _mm512_storeu_si512(lo, slo);
+        _mm512_storeu_si512(hi, shi);
+        _mm512_storeu_si512(neg, sneg);
+        s += i64_combine(lo, hi, neg, 8);
+    }
+    int64_t mn = _mm512_reduce_min_epi64(_mm512_min_epi64(mn0, mn1));
+    int64_t mx = _mm512_reduce_max_epi64(_mm512_max_epi64(mx0, mx1));
+    i64_tail(v, i, n, &s, &c, &mn, &mx);
+    i64_finish(a, s, c, mn, mx);
+    if (!dx || !c)
+        return;
+    if (mn < INT32_MIN || mx > INT32_MAX) {
+        i64_squares(v, 0, n, dx);
+        return;
+    }
+    unsigned __int128 q = 0;
+    i = 0;
+    while (n - i >= 8) {
+        size_t end = i + ((n - i) / 8 < I64_BLOCK ? (n - i) / 8 : I64_BLOCK) * 8;
+        __m512i qlo = _mm512_setzero_si512(), qhi = qlo;
+        for (; i < end; i += 8) {
+            __m512i x = _mm512_loadu_si512(v + i);
+            __m512i xs = _mm512_maskz_mov_epi64(_mm512_cmpneq_epi64_mask(x, nv), x), sq = _mm512_mul_epi32(xs, xs);
+            qlo = _mm512_add_epi64(qlo, _mm512_and_si512(sq, lom));
+            qhi = _mm512_add_epi64(qhi, _mm512_srli_epi64(sq, 32));
+        }
+        q += (unsigned __int128)(uint64_t)_mm512_reduce_add_epi64(qlo) +
+             ((unsigned __int128)(uint64_t)_mm512_reduce_add_epi64(qhi) << 32);
+    }
+    isq_add(dx, q, 0);
+    i64_squares(v, i, n, dx);
+}
+#endif
+
 /* ---------------------------------------------------------------- LTTB */
 
 /* a point's value as LTTB takes it (query.c, lttb_value) */
@@ -676,6 +896,7 @@ size_t lttb_argmax(int type, const int64_t *ts, const uint64_t *v, size_t n, int
 void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *dv) = agg_scalar;
 void (*simd_fold_f32)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv) = fold_f32_scalar;
 void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv) = fold_f64_scalar;
+void (*simd_fold_i64)(const int64_t *v, size_t n, agg_state *a, agg_dev *dx);
 static const char *simd_level = "scalar";
 
 const char *simd_name(void) { return simd_level; }
@@ -716,6 +937,7 @@ void simd_select(int level)
     void (*f)(const float *, size_t, agg_state *, agg_dev *) = agg_scalar;
     void (*f32)(const float *, size_t, size_t, agg_state *, agg_dev *) = fold_f32_scalar;
     void (*f64)(const double *, size_t, size_t, agg_state *, agg_dev *) = fold_f64_scalar;
+    void (*i64)(const int64_t *, size_t, agg_state *, agg_dev *) = NULL;
     const char *name = "scalar";
 #ifdef TSDB_X86
     const char *force = getenv("TSDB_SIMD"); /* "scalar", "avx2" or "avx512", for benchmarking */
@@ -732,17 +954,20 @@ void simd_select(int level)
         f = agg_avx512;
         f32 = fold_f32_avx512;
         f64 = fold_f64_avx512;
+        i64 = fold_i64_avx512;
         name = "avx512";
     } else if (avx2) {
         f = agg_avx2;
         f32 = fold_f32_avx2;
         f64 = fold_f64_avx2;
+        i64 = fold_i64_avx2;
         name = "avx2";
     }
 #endif
     simd_agg_f32 = f;
     simd_fold_f32 = f32;
     simd_fold_f64 = f64;
+    simd_fold_i64 = i64;
     simd_level = name;
 #ifdef TSDB_LEVELS
     snprintf(simd_desc, sizeof simd_desc, "%s, codecs x86-64-%s", name, cpu_level_name(level));
