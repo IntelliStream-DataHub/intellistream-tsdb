@@ -1,9 +1,12 @@
 /*
  * tsdbd: serves a tsdb directory over TCP (protocol in tsdb_protocol.h).
  *
- * One thread runs an io_uring event loop: one recv and at most one send in
- * flight per connection, and a multishot poll on an eventfd through which
- * workers report. Connections are accepted by a thread of their own with a
+ * One thread runs the event loop: one recv and at most one send in flight per
+ * connection, and an eventfd through which workers report. The loop runs on
+ * io_uring, or on epoll where io_uring is not allowed (RHEL and AlmaLinux 10
+ * disable it by default); --io auto (the default) tries io_uring and falls
+ * back to epoll when the kernel refuses it. Only how bytes move differs: see
+ * "event loop" below. Connections are accepted by a thread of their own with a
  * plain accept(), not through the ring: a pending io_uring accept keeps the
  * listening socket alive until the ring is torn down, which for a killed
  * process happens some time after its death, and meanwhile a restarted server
@@ -17,7 +20,7 @@
  * without bound.
  *
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--workers N]
- *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow]
+ *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
  *
  * --follow serves queries from a directory another process writes (on this
  * host or another one, over NFS), following its parts and WAL as they change.
@@ -41,7 +44,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
+#ifndef TSDBD_NO_URING /* make NO_URING=1: epoll only, no liburing needed at run time */
 #include <liburing.h>
+#endif
 #include <zstd.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -54,9 +59,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define RECV_MIN_FREE (16u << 10) /* per connection; grows for large frames */
@@ -125,6 +132,9 @@ typedef struct conn {
     bool eof;           /* the client sent everything it will: reply to it, then close */
     buf sending;
     size_t sent;
+    bool readable, writable, rdhup; /* epoll: what the socket can do, as far as we know */
+    bool in_ready, dead;            /* epoll: in the ready list; freed while in it */
+    struct conn *ready_next;
     /* shared with the worker */
     pthread_mutex_t lock;
     pthread_cond_t cv;
@@ -137,10 +147,14 @@ typedef struct conn {
 /* ------------------------------------------------------------ globals */
 
 static tsdb *db;
+#ifndef TSDBD_NO_URING
 static struct io_uring ring;
+#endif
 static int wake_fd = -1;
 static volatile sig_atomic_t stopping;
+#ifndef TSDBD_NO_URING
 static ev wake_ev = {EV_WAKE, NULL};
+#endif
 static conn *conns;
 static size_t nconns, max_conns = 10000;
 
@@ -863,6 +877,40 @@ static void *worker_main(void *arg)
 
 /* ---------------------------------------------------------- event loop */
 
+/*
+ * Two backends move the bytes; everything else (framing, dispatch, replies,
+ * closing) is shared. With io_uring a recv or send is submitted to the ring and
+ * completes later. With epoll, for kernels or policies without io_uring (RHEL
+ * and AlmaLinux 10 ship it disabled: kernel.io_uring_disabled=2), the same
+ * operation is wanted until the socket is ready and then done with a
+ * non-blocking call. Both end in on_recv and on_send, and recv_inflight and
+ * send_inflight mean "a recv / send is pending" in both, so the order of
+ * replies, back-pressure and closing cannot differ between them.
+ *
+ * epoll is edge-triggered: a socket is added once, with EPOLLIN, EPOLLOUT and
+ * EPOLLRDHUP, and never modified, so a connection changing between reading
+ * and writing costs no epoll_ctl, and a client that hangs up while its request
+ * runs is reported once rather than on every wait (level-triggered, EPOLLHUP
+ * cannot be masked). Events only mark a connection readable or writable. A
+ * recv or send that returns EAGAIN clears the mark; so does a short read, since
+ * data arriving later raises a new edge, unless the peer has already shut
+ * down (EPOLLRDHUP: no edge will announce the end of stream). Connections with
+ * a wanted operation on a ready socket wait in the ready list, worked through
+ * in rounds of at most one recv and one send each, like one batch of
+ * completions: a client that sends without pause cannot hold the loop.
+ * Events carry the descriptor, not the connection: an event for a connection
+ * freed earlier in the same batch finds nothing in fd_conn, or the connection
+ * that has the number since, for which it is a spurious wakeup.
+ */
+typedef enum { IO_AUTO, IO_URING, IO_EPOLL } io_kind;
+static io_kind io = IO_AUTO;
+static int epfd = -1;
+static conn **fd_conn; /* epoll: connections by descriptor */
+static size_t fd_conn_cap;
+static conn *ready_head, *ready_tail; /* epoll: connections that can make progress */
+static size_t nready;
+
+#ifndef TSDBD_NO_URING
 static struct io_uring_sqe *sqe_get(void)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -872,6 +920,22 @@ static struct io_uring_sqe *sqe_get(void)
     }
     return sqe;
 }
+#endif
+
+/* epoll: queues c for the next round if a wanted operation can proceed. */
+static void ep_want(conn *c)
+{
+    if (c->in_ready || !((c->recv_inflight && c->readable) || (c->send_inflight && c->writable)))
+        return;
+    c->in_ready = true;
+    c->ready_next = NULL;
+    if (ready_tail)
+        ready_tail->ready_next = c;
+    else
+        ready_head = c;
+    ready_tail = c;
+    nready++;
+}
 
 static void submit_recv(conn *c)
 {
@@ -880,10 +944,16 @@ static void submit_recv(conn *c)
     buf_shrink(&c->in);
     if (buf_reserve(&c->in, RECV_MIN_FREE) != 0)
         return;
+    c->recv_inflight = true;
+    if (io == IO_EPOLL) {
+        ep_want(c);
+        return;
+    }
+#ifndef TSDBD_NO_URING
     struct io_uring_sqe *sqe = sqe_get();
     io_uring_prep_recv(sqe, c->fd, c->in.p + c->in.len, c->in.cap - c->in.len, 0);
     io_uring_sqe_set_data(sqe, &c->recv_ev);
-    c->recv_inflight = true;
+#endif
 }
 
 static void submit_send(conn *c)
@@ -906,10 +976,16 @@ static void submit_send(conn *c)
             return;
         }
     }
+    c->send_inflight = true;
+    if (io == IO_EPOLL) {
+        ep_want(c);
+        return;
+    }
+#ifndef TSDBD_NO_URING
     struct io_uring_sqe *sqe = sqe_get();
     io_uring_prep_send(sqe, c->fd, c->sending.p + c->sent, c->sending.len - c->sent, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, &c->send_ev);
-    c->send_inflight = true;
+#endif
 }
 
 static void dispatch(conn *c)
@@ -932,6 +1008,8 @@ static void dispatch(conn *c)
     pthread_mutex_unlock(&work_lock);
 }
 
+/* Closes the descriptor and frees c. A connection still in the epoll ready
+ * list is only marked dead: ep_round frees it when it comes out. */
 static void conn_free(conn *c)
 {
     nconns--;
@@ -947,12 +1025,18 @@ static void conn_free(conn *c)
         free(r->payload);
         free(r);
     }
+    if (io == IO_EPOLL && (size_t)c->fd < fd_conn_cap)
+        fd_conn[c->fd] = NULL; /* before close: the number may come back for the next connection */
+    close(c->fd);
     free(c->in.p);
     free(c->out.p);
     free(c->sending.p);
     pthread_mutex_destroy(&c->lock);
     pthread_cond_destroy(&c->cv);
-    free(c);
+    if (c->in_ready)
+        c->dead = true;
+    else
+        free(c);
 }
 
 /* Starts closing; the memory goes once nothing refers to it any more. Requests
@@ -967,13 +1051,13 @@ static void conn_close(conn *c)
         atomic_store(&c->closing, true);
         pthread_cond_broadcast(&c->cv); /* a worker waiting for output space gives up */
         pthread_mutex_unlock(&c->lock);
-        shutdown(c->fd, SHUT_RDWR); /* completes the outstanding recv */
+        shutdown(c->fd, SHUT_RDWR); /* completes the outstanding recv (io_uring) */
+        if (io == IO_EPOLL)
+            c->recv_inflight = c->send_inflight = false; /* only wanted: nothing in the kernel to complete */
     }
     dispatch(c);
-    if (!c->busy && !c->q_head && !c->recv_inflight && !c->send_inflight) {
-        close(c->fd);
+    if (!c->busy && !c->q_head && !c->recv_inflight && !c->send_inflight)
         conn_free(c);
-    }
 }
 
 /* After the client's end of stream: close once every request has been answered. */
@@ -1023,6 +1107,63 @@ static bool parse(conn *c)
     return true;
 }
 
+/* A recv finished: res bytes arrived (0: end of stream), or -errno. */
+static void on_recv(conn *c, ssize_t res)
+{
+    c->recv_inflight = false;
+    if (res == 0 && !c->closed) { /* end of stream: what was received still gets its replies */
+        if (getenv("TSDBD_DEBUG"))
+            fprintf(stderr, "tsdbd: connection %d: recv end\n", c->fd);
+        c->eof = true;
+        finish_if_drained(c);
+        return;
+    }
+    if (res < 0 || c->closed) {
+        if (getenv("TSDBD_DEBUG") && !c->closed)
+            fprintf(stderr, "tsdbd: connection %d: recv %s\n", c->fd, strerror((int)-res));
+        conn_close(c);
+        return;
+    }
+    c->in.len += (size_t)res;
+    if (!parse(c)) {
+        if (getenv("TSDBD_DEBUG"))
+            fprintf(stderr, "tsdbd: connection %d: protocol error\n", c->fd);
+        conn_close(c);
+        return;
+    }
+    dispatch(c);
+    submit_recv(c);
+}
+
+/* A send finished: res bytes went out, or -errno. */
+static void on_send(conn *c, ssize_t res)
+{
+    c->send_inflight = false;
+    if (res < 0 || c->closed) {
+        if (getenv("TSDBD_DEBUG") && res < 0)
+            fprintf(stderr, "tsdbd: connection %d: send %s\n", c->fd, strerror((int)-res));
+        conn_close(c);
+        return;
+    }
+    c->sent += (size_t)res;
+    submit_send(c);
+    finish_if_drained(c);
+}
+
+/* A new connection closed for want of memory or of epoll watches: the client
+ * only sees it closed, so say why here, at most once a second (a shortage hits
+ * every connection of a burst). Event loop thread only. */
+static void drop_new_conn(int fd, const char *what, int err)
+{
+    static time_t last;
+    time_t t = time(NULL);
+    if (t != last) {
+        last = t;
+        fprintf(stderr, "tsdbd: connection refused: %s: %s\n", what, strerror(err));
+    }
+    close(fd);
+}
+
 static void on_accept(int fd)
 {
     if (nconns >= max_conns) {
@@ -1033,8 +1174,33 @@ static void on_accept(int fd)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     conn *c = calloc(1, sizeof *c);
     if (!c) {
-        close(fd);
+        drop_new_conn(fd, "connection", ENOMEM);
         return;
+    }
+    if (io == IO_EPOLL) {
+        if ((size_t)fd >= fd_conn_cap) {
+            size_t cap = fd_conn_cap ? fd_conn_cap : 1024;
+            while (cap <= (size_t)fd)
+                cap *= 2;
+            conn **t = realloc(fd_conn, cap * sizeof *t);
+            if (!t) {
+                free(c);
+                drop_new_conn(fd, "descriptor table", ENOMEM);
+                return;
+            }
+            memset(t + fd_conn_cap, 0, (cap - fd_conn_cap) * sizeof *t);
+            fd_conn = t;
+            fd_conn_cap = cap;
+        }
+        struct epoll_event e = {.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET, .data.fd = fd};
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &e) != 0) {
+            int err = errno;
+            free(c);
+            drop_new_conn(fd, "epoll_ctl", err); /* ENOSPC: fs.epoll.max_user_watches */
+            return;
+        }
+        fd_conn[fd] = c;
+        c->readable = c->writable = true; /* until a call says otherwise */
     }
     c->fd = fd;
     c->recv_ev = (ev){EV_RECV, c};
@@ -1081,6 +1247,111 @@ static void on_wake(void)
         finish_if_drained(c);
     }
     free(batch);
+}
+
+#ifndef TSDBD_NO_URING
+static void uring_loop(void)
+{
+    struct io_uring_sqe *sqe = sqe_get();
+    io_uring_prep_poll_multishot(sqe, wake_fd, POLLIN);
+    io_uring_sqe_set_data(sqe, &wake_ev);
+    while (!stopping) {
+        io_uring_submit_and_wait(&ring, 1);
+        struct io_uring_cqe *cqe;
+        unsigned head, seen = 0;
+        io_uring_for_each_cqe(&ring, head, cqe)
+        {
+            seen++;
+            ev *e = io_uring_cqe_get_data(cqe);
+            switch (e->type) {
+            case EV_WAKE:
+                on_wake();
+                if (!(cqe->flags & IORING_CQE_F_MORE)) {
+                    struct io_uring_sqe *s2 = sqe_get();
+                    io_uring_prep_poll_multishot(s2, wake_fd, POLLIN);
+                    io_uring_sqe_set_data(s2, &wake_ev);
+                }
+                break;
+            case EV_RECV: on_recv(e->c, cqe->res); break;
+            case EV_SEND: on_send(e->c, cqe->res); break;
+            }
+        }
+        io_uring_cq_advance(&ring, seen);
+    }
+}
+#endif
+
+/* epoll: one round over the connections that were ready when it started.
+ * in_ready stays set while one is handled, so it is not queued twice and a
+ * close leaves the freeing to this loop. */
+static void ep_round(void)
+{
+    for (size_t n = nready; n > 0 && ready_head; n--) {
+        conn *c = ready_head;
+        ready_head = c->ready_next;
+        if (!ready_head)
+            ready_tail = NULL;
+        nready--;
+        if (!c->dead && c->recv_inflight && c->readable) {
+            size_t room = c->in.cap - c->in.len;
+            ssize_t r = recv(c->fd, c->in.p + c->in.len, room, MSG_DONTWAIT);
+            int err = errno;
+            if (r < 0 && (err == EAGAIN || err == EWOULDBLOCK))
+                c->readable = false;
+            else if (r >= 0 || err != EINTR) {
+                if (r == 0 || (r > 0 && (size_t)r < room && !c->rdhup))
+                    c->readable = false;
+                on_recv(c, r < 0 ? -err : r);
+            }
+        }
+        if (!c->dead && c->send_inflight && c->writable) {
+            ssize_t r = send(c->fd, c->sending.p + c->sent, c->sending.len - c->sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+            int err = errno;
+            if (r < 0 && (err == EAGAIN || err == EWOULDBLOCK))
+                c->writable = false;
+            else if (r >= 0 || err != EINTR)
+                on_send(c, r < 0 ? -err : r);
+        }
+        c->in_ready = false;
+        if (c->dead)
+            free(c);
+        else
+            ep_want(c);
+    }
+}
+
+static void ep_loop(void)
+{
+    struct epoll_event evs[256];
+    while (!stopping) {
+        int n = epoll_wait(epfd, evs, 256, ready_head ? 0 : -1);
+        if (n < 0) {
+            if (errno != EINTR) {
+                perror("tsdbd: epoll_wait");
+                stopping = 1;
+            }
+            continue;
+        }
+        for (int i = 0; i < n; i++) {
+            int fd = evs[i].data.fd;
+            if (fd == wake_fd) {
+                on_wake();
+                continue;
+            }
+            conn *c = (size_t)fd < fd_conn_cap ? fd_conn[fd] : NULL;
+            if (!c)
+                continue;
+            uint32_t m = evs[i].events;
+            if (m & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
+                c->rdhup = true; /* recv no longer blocks, and no further edge may come */
+            if (m & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))
+                c->readable = true;
+            if (m & (EPOLLOUT | EPOLLHUP | EPOLLERR))
+                c->writable = true;
+            ep_want(c);
+        }
+        ep_round();
+    }
 }
 
 /* Accepts connections until the listening socket is shut down. */
@@ -1166,6 +1437,7 @@ int main(int argc, char **argv)
                                    {"wal-max-batch-rows", required_argument, 0, 'B'},
                                    {"partition-ms", required_argument, 0, 'P'},
                                    {"send-timeout", required_argument, 0, 'T'},
+                                   {"io", required_argument, 0, 'I'},
                                    {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -1183,6 +1455,16 @@ int main(int argc, char **argv)
         case 'B': o.wal_max_batch_rows = (size_t)atol(optarg); break;
         case 'P': o.partition_ms = atoll(optarg); break; /* only when the database is created */
         case 'T': send_timeout_s = atoi(optarg); break;
+        case 'I':
+            if (strcmp(optarg, "auto") == 0)
+                io = IO_AUTO;
+            else if (strcmp(optarg, "uring") == 0)
+                io = IO_URING;
+            else if (strcmp(optarg, "epoll") == 0)
+                io = IO_EPOLL;
+            else
+                goto usage;
+            break;
         default: goto usage;
         }
     }
@@ -1190,7 +1472,7 @@ int main(int argc, char **argv)
     usage:
         fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d] [--workers N] [--wal-sync-ms MS]\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
-                        "             [--send-timeout 60]\n",
+                        "             [--send-timeout 60] [--io auto|uring|epoll]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
@@ -1213,11 +1495,37 @@ int main(int argc, char **argv)
     if (lfd < 0)
         return 1;
     wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    struct io_uring_params params = {.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN};
-    if (io_uring_queue_init_params(4096, &ring, &params) < 0) {
-        params.flags = 0; /* older kernels */
+#ifdef TSDBD_NO_URING
+    if (io == IO_URING) {
+        fprintf(stderr, "tsdbd: io_uring: not in this build (NO_URING=1)\n");
+        return 1;
+    }
+    io = IO_EPOLL;
+#else
+    if (io != IO_EPOLL) {
+        struct io_uring_params params = {.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN};
         if ((rc = io_uring_queue_init_params(4096, &ring, &params)) < 0) {
+            params = (struct io_uring_params){0}; /* older kernels */
+            rc = io_uring_queue_init_params(4096, &ring, &params);
+        }
+        /* Under auto every error falls back, the reason logged: EPERM is policy
+         * (kernel.io_uring_disabled, seccomp), ENOSYS a kernel without it, EINVAL
+         * one too old for what we ask, EACCES a security module, ENOMEM a locked
+         * memory limit; epoll serves the same clients in all of these. */
+        if (rc < 0 && io == IO_URING) {
             fprintf(stderr, "tsdbd: io_uring: %s\n", strerror(-rc));
+            return 1;
+        }
+        if (rc < 0)
+            fprintf(stderr, "tsdbd: io_uring unavailable (%s%s), using epoll\n", strerror(-rc),
+                    rc == -EPERM ? ": see sysctl kernel.io_uring_disabled" : "");
+        io = rc < 0 ? IO_EPOLL : IO_URING;
+    }
+#endif
+    if (io == IO_EPOLL) {
+        struct epoll_event e = {.events = EPOLLIN, .data.fd = wake_fd};
+        if ((epfd = epoll_create1(EPOLL_CLOEXEC)) < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, wake_fd, &e) != 0) {
+            fprintf(stderr, "tsdbd: epoll: %s\n", strerror(errno));
             return 1;
         }
     }
@@ -1232,76 +1540,15 @@ int main(int argc, char **argv)
 
     pthread_t acceptor;
     pthread_create(&acceptor, NULL, accept_main, &lfd);
-    struct io_uring_sqe *sqe = sqe_get();
-    io_uring_prep_poll_multishot(sqe, wake_fd, POLLIN);
-    io_uring_sqe_set_data(sqe, &wake_ev);
-    fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s\n", dir,
+    fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
-            max_conns, tsdb_simd_level());
-
-    while (!stopping) {
-        io_uring_submit_and_wait(&ring, 1);
-        struct io_uring_cqe *cqe;
-        unsigned head, seen = 0;
-        io_uring_for_each_cqe(&ring, head, cqe)
-        {
-            seen++;
-            ev *e = io_uring_cqe_get_data(cqe);
-            int res = cqe->res;
-            switch (e->type) {
-            case EV_WAKE:
-                on_wake();
-                if (!(cqe->flags & IORING_CQE_F_MORE)) {
-                    struct io_uring_sqe *s2 = sqe_get();
-                    io_uring_prep_poll_multishot(s2, wake_fd, POLLIN);
-                    io_uring_sqe_set_data(s2, &wake_ev);
-                }
-                break;
-            case EV_RECV: {
-                conn *c = e->c;
-                c->recv_inflight = false;
-                if (res == 0 && !c->closed) { /* end of stream: what was received still gets its replies */
-                    if (getenv("TSDBD_DEBUG"))
-                        fprintf(stderr, "tsdbd: connection %d: recv end\n", c->fd);
-                    c->eof = true;
-                    finish_if_drained(c);
-                    break;
-                }
-                if (res < 0 || c->closed) {
-                    if (getenv("TSDBD_DEBUG") && !c->closed)
-                        fprintf(stderr, "tsdbd: connection %d: recv %s\n", c->fd, strerror(-res));
-                    conn_close(c);
-                    break;
-                }
-                c->in.len += (size_t)res;
-                if (!parse(c)) {
-                    if (getenv("TSDBD_DEBUG"))
-                        fprintf(stderr, "tsdbd: connection %d: protocol error\n", c->fd);
-                    conn_close(c);
-                    break;
-                }
-                dispatch(c);
-                submit_recv(c);
-                break;
-            }
-            case EV_SEND: {
-                conn *c = e->c;
-                c->send_inflight = false;
-                if (res < 0 || c->closed) {
-                    if (getenv("TSDBD_DEBUG") && res < 0)
-                        fprintf(stderr, "tsdbd: connection %d: send %s\n", c->fd, strerror(-res));
-                    conn_close(c);
-                    break;
-                }
-                c->sent += (size_t)res;
-                submit_send(c);
-                finish_if_drained(c);
-                break;
-            }
-            }
-        }
-        io_uring_cq_advance(&ring, seen);
-    }
+            max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll");
+#ifndef TSDBD_NO_URING
+    if (io == IO_URING)
+        uring_loop();
+    else
+#endif
+        ep_loop();
 
     fprintf(stderr, "tsdbd: shutting down\n");
     shutdown(lfd, SHUT_RDWR); /* stops listening, and ends the accept thread's accept() */
@@ -1324,11 +1571,20 @@ int main(int argc, char **argv)
     while (running_workers > 0)
         pthread_cond_wait(&workers_gone_cv, &work_lock);
     pthread_mutex_unlock(&work_lock);
-    io_uring_queue_exit(&ring);
-    while (conns) {
-        close(conns->fd);
+#ifndef TSDBD_NO_URING
+    if (io == IO_URING)
+        io_uring_queue_exit(&ring);
+    else
+#endif
+        close(epfd);
+    while (conns)
         conn_free(conns);
+    while (ready_head) { /* only dead ones are left */
+        conn *c = ready_head;
+        ready_head = c->ready_next;
+        free(c);
     }
+    free(fd_conn);
     free(notes);
     for (size_t i = 0; i < nnew; i++)
         close(new_fds[i]);

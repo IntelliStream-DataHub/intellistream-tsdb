@@ -8,14 +8,16 @@ C (MergeTree-style storage), the `tsdbd` server and its client.
 ```sh
 make                      # library, CLI, server, client, benchmarks (into build/)
 make test                 # all unit, integration and server tests
+make test IO=epoll        # server tests on epoll only (where io_uring is disabled)
 make asan                 # the tests under AddressSanitizer + UBSan
 make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
 make jepsen               # fault injection: kill -9, simulated power loss, pauses
 make PORTABLE=1           # without -march=native
+make NO_URING=1           # tsdbd on epoll only, without liburing (after make clean)
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 ```
 
-Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only).
+Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only; not with `NO_URING=1`).
 Tests take a scratch directory as their first argument
 (`./build/test_tsdb /tmp/x`); default `/tmp`.
 
@@ -51,7 +53,9 @@ cgroup, so `nice` does not keep your work out of its way.
   bounds of local periods. The engine and the server know UTC only; the
   clients turn local periods into bounds (QUERY_BOUNDS). `src/calendar.c`:
   the same for embedded use (`tsdb_query_group_local`).
-- `server/tsdbd.c`: io_uring server. `client/`: C client library (does not link the engine);
+- `server/tsdbd.c`: the server, one event loop on io_uring or epoll (`--io`; epoll where io_uring
+  is disabled, as on RHEL/AlmaLinux 10); `make test` and `make jepsen` run the server tests on both.
+  `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
   A protocol change has to reach all four; `make test-clients` runs their tests.
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
