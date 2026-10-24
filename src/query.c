@@ -31,6 +31,7 @@
 #include <stdlib.h>
 
 #define MAX_BUCKETS (64u << 20)
+#define AGG_DENSE_BYTES (32u << 20) /* one dense array of bucket states (bq_window) */
 #define PARALLEL_MIN_GRANULES 8
 #define AGG_STRIPES 64
 #define AGG_STRIPE_SHIFT 10 /* 1024 consecutive buckets share a lock */
@@ -912,6 +913,15 @@ bool mem_from_memtable(const snapshot *sn, size_t i) { return sn->mprio[i] >= UI
  * counted from the nearest data (w->bound skips empty time), so a sparse
  * range takes a few windows, and the last N of a long range touch about N
  * buckets' granules (plus those a window edge cuts, which are decoded). */
+static void bk_swap(uint8_t *a, uint8_t *b, size_t row)
+{
+    uint8_t x[sizeof(tsdb_spread_bucket) > sizeof(tsdb_twa_bucket) ? sizeof(tsdb_spread_bucket)
+                                                                    : sizeof(tsdb_twa_bucket)];
+    memcpy(x, a, row);
+    memcpy(a, b, row);
+    memcpy(b, x, row);
+}
+
 int bucket_windows(const bk_windows *w, int64_t start, int64_t end, void **out, size_t *nout)
 {
     *out = NULL;
@@ -921,14 +931,8 @@ int bucket_windows(const bk_windows *w, int64_t start, int64_t end, void **out, 
     if (w->limit == 0 || w->bk->kind == BK_ONE) { /* everything, then order and cut */
         int rc = w->run(w->ctx, start, end, out, nout);
         if (rc == 0 && w->desc)
-            for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {
-                uint8_t x[sizeof(tsdb_spread_bucket) > sizeof(tsdb_twa_bucket) ? sizeof(tsdb_spread_bucket)
-                                                                                : sizeof(tsdb_twa_bucket)];
-                uint8_t *a = (uint8_t *)*out + i * w->row, *b = (uint8_t *)*out + j * w->row;
-                memcpy(x, a, w->row);
-                memcpy(a, b, w->row);
-                memcpy(b, x, w->row);
-            }
+            for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--)
+                bk_swap((uint8_t *)*out + i * w->row, (uint8_t *)*out + j * w->row, w->row);
         if (rc == 0 && w->limit && *nout > w->limit)
             *nout = w->limit;
         return rc;
@@ -957,6 +961,17 @@ int bucket_windows(const bk_windows *w, int64_t start, int64_t end, void **out, 
         rc = w->run(w->ctx, a, b, &wr, &wn);
         if (rc)
             break;
+        if (wn && !res) { /* the first window with buckets: its array is the result so far, in the query's order */
+            for (size_t i = 0, j = wn - 1; w->desc && i < j; i++, j--)
+                bk_swap((uint8_t *)wr + i * w->row, (uint8_t *)wr + j * w->row, w->row);
+            res = wr;
+            got = wn;
+            if (w->desc)
+                hi = a;
+            else
+                lo = b;
+            continue;
+        }
         uint8_t *r2 = wn ? realloc(res, (got + wn) * w->row) : res;
         if (wn && !r2) {
             free(wr);
@@ -1095,55 +1110,48 @@ static bool bq_bound(void *ctx, int64_t lo, int64_t hi, bool newest, int64_t *at
     return any;
 }
 
-/* The buckets of [start, end) (bucket edges, or the query's ends), ascending. out: tsdb_bucket, or with
- * spread tsdb_spread_bucket (which begins with one) */
-static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *nout)
+/* Bucket states of every dense array so far (once per array, not per row); tests check the work follows the rows */
+size_t agg_dense_states;
+
+/* The first cluster that ends at or after `start` */
+static size_t bq_first_cluster(const bq *q, int64_t start)
 {
-    const bq *q = ctx;
+    size_t a = 0, b = q->ncl;
+    while (a < b) {
+        size_t m = a + (b - a) / 2;
+        if (q->cl[m].hi < start)
+            a = m + 1;
+        else
+            b = m;
+    }
+    return a;
+}
+
+/* The clusters that reach into [start, end): [*c0, *c1) */
+static void bq_clusters(const bq *q, int64_t start, int64_t end, size_t *c0, size_t *c1)
+{
+    size_t a = bq_first_cluster(q, start), b;
+    for (b = a; b < q->ncl && q->cl[b].lo < end;)
+        b++;
+    *c0 = a;
+    *c1 = b;
+}
+
+/* The buckets of [start, end) (bucket edges, or the query's ends) in one dense array of nb states from bucket b0
+ * on, which holds every bucket with rows there; clusters [c0, c1), at most nin items. Ascending. out: tsdb_bucket,
+ * or with spread tsdb_spread_bucket (which begins with one) */
+static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c1, size_t nin, int64_t b0,
+                    size_t nb, void **out, size_t *nout)
+{
     eng *db = q->db;
     const snapshot *sn = q->sn;
     int type = q->type;
     size_t wd = type_width(type);
     const bucketer *bk = q->bk;
     const item *items = q->items;
+    int rc = 0;
     *out = NULL;
     *nout = 0;
-    if (!q->ncl)
-        return 0;
-    /* the clusters that reach into the window */
-    size_t c0 = 0, c1 = q->ncl;
-    while (c0 < c1) {
-        size_t m = c0 + (c1 - c0) / 2;
-        if (q->cl[m].hi < start)
-            c0 = m + 1;
-        else
-            c1 = m;
-    }
-    for (c1 = c0; c1 < q->ncl && q->cl[c1].lo < end;)
-        c1++;
-    int rc = 0;
-    size_t nin = 0;
-    int64_t dmin = INT64_MAX, dmax = INT64_MIN;
-    uint8_t *seen = calloc(sn->np + 1, 1);
-    if (!seen)
-        return TSDB_ERR_NOMEM;
-    for (size_t k = c0 < c1 ? q->cl[c0].a : 0; c0 < c1 && k < q->cl[c1 - 1].b; k++) {
-        const item *it = &items[k];
-        if (it->hi < start || it->lo >= end)
-            continue;
-        nin++;
-        dmin = MIN(dmin, MAX(it->lo, start));
-        dmax = MAX(dmax, MIN(it->hi, end - 1));
-        if (it->g) {
-            QS_ADD(granules, 1);
-            if (!seen[it->src])
-                QS_ADD(parts, 1);
-            seen[it->src] = 1;
-        } else if (mem_from_memtable(sn, it->src - sn->np)) {
-            QS_ADD(memtable_rows, run_cut(&sn->mem[it->src - sn->np], start, end, wd).n);
-        }
-    }
-    free(seen);
     agg_state *acc = NULL;
     agg_dev *accx = NULL;
     gref *work = NULL;
@@ -1151,20 +1159,8 @@ static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *
     codec_ctx *cc = NULL;
     fold_ctx fc = {0};
     agg_job *j = NULL;
-    agg_target t = {.start = start, .end = end, .bk = bk, .type = type, .w = wd};
-    size_t nb = 1;
-    if (nin == 0)
-        goto done;
-
-    if (bk->kind != BK_ONE) {
-        t.b0 = bk_key(bk, dmin);
-        uint64_t span = (uint64_t)bk_key(bk, dmax) - (uint64_t)t.b0 + 1;
-        if (span > MAX_BUCKETS) {
-            rc = TSDB_ERR_TOO_MANY_BUCKETS;
-            goto done;
-        }
-        nb = (size_t)span;
-    }
+    agg_target t = {.start = start, .end = end, .b0 = b0, .bk = bk, .type = type, .w = wd};
+    __atomic_fetch_add(&agg_dense_states, nb, __ATOMIC_RELAXED);
     acc = malloc(nb * sizeof *acc);
     accx = q->spread ? malloc(nb * sizeof *accx) : NULL;
     work = malloc(nin * sizeof *work);
@@ -1310,6 +1306,122 @@ done:
     free(work);
     free(srcs);
     return rc;
+}
+
+/* The most buckets one dense array holds (0: AGG_DENSE_BYTES worth); tests make it small to exercise chunks */
+size_t agg_dense_buckets;
+/* Empty buckets a chunk spans rather than ending and starting a new one at the next cluster: about what a chunk's
+ * own setup costs, so a chunk's states stay near its buckets with rows (plus the time its granules span). */
+#define AGG_CHUNK_GAP 4096
+
+/* The buckets of [start, end) (bucket edges, or the query's ends), ascending: bq_window's contract.
+ *
+ * The working memory follows the buckets that have rows, never the span between the first and the last row: a
+ * span up to the dense limit (some tens of MB of states) is one dense array, as fast as it gets; a longer one is
+ * computed chunk by chunk. A chunk begins at the next row (empty time costs nothing) and takes whole clusters
+ * while they fit in the dense limit and follow each other within AGG_CHUNK_GAP buckets, so its states follow the
+ * time its granules span, not the gaps between them, and no granule is decoded twice; only a cluster longer than
+ * the limit is cut, at a bucket edge, and its granules there are decoded once per chunk. A chunk's edges are
+ * bucket edges, so it computes each of its buckets from the same rows, the same granule statistics and in the
+ * same order as one pass would (bucket_windows relies on the same): the results are those of one dense array, bit
+ * for bit. TSDB_ERR_TOO_MANY_BUCKETS still counts the span. */
+static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *nout)
+{
+    const bq *q = ctx;
+    const snapshot *sn = q->sn;
+    size_t wd = type_width(q->type);
+    const bucketer *bk = q->bk;
+    const item *items = q->items;
+    *out = NULL;
+    *nout = 0;
+    if (!q->ncl)
+        return 0;
+    size_t c0, c1;
+    bq_clusters(q, start, end, &c0, &c1);
+    size_t nin = 0;
+    int64_t dmin = INT64_MAX, dmax = INT64_MIN;
+    uint8_t *seen = calloc(sn->np + 1, 1);
+    if (!seen)
+        return TSDB_ERR_NOMEM;
+    for (size_t k = c0 < c1 ? q->cl[c0].a : 0; c0 < c1 && k < q->cl[c1 - 1].b; k++) {
+        const item *it = &items[k];
+        if (it->hi < start || it->lo >= end)
+            continue;
+        nin++;
+        dmin = MIN(dmin, MAX(it->lo, start));
+        dmax = MAX(dmax, MIN(it->hi, end - 1));
+        if (it->g) {
+            QS_ADD(granules, 1);
+            if (!seen[it->src])
+                QS_ADD(parts, 1);
+            seen[it->src] = 1;
+        } else if (mem_from_memtable(sn, it->src - sn->np)) {
+            QS_ADD(memtable_rows, run_cut(&sn->mem[it->src - sn->np], start, end, wd).n);
+        }
+    }
+    free(seen);
+    if (nin == 0)
+        return 0;
+    if (bk->kind == BK_ONE)
+        return bq_dense(q, start, end, c0, c1, nin, 0, 1, out, nout);
+    int64_t kfirst = bk_key(bk, dmin), klast = bk_key(bk, dmax);
+    uint64_t span = (uint64_t)klast - (uint64_t)kfirst + 1;
+    if (span > MAX_BUCKETS)
+        return TSDB_ERR_TOO_MANY_BUCKETS;
+    size_t dense = agg_dense_buckets ? agg_dense_buckets
+                                     : AGG_DENSE_BYTES / (sizeof(agg_state) + (q->spread ? sizeof(agg_dev) : 0));
+    if (span <= dense)
+        return bq_dense(q, start, end, c0, c1, nin, kfirst, (size_t)span, out, nout);
+    size_t row = q->spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+    uint8_t *res = NULL;
+    size_t got = 0;
+    int rc = 0;
+    for (int64_t lo = start, p; rc == 0 && lo < end && bq_bound((void *)q, lo, end, false, &p);) {
+        int64_t kp = bk_key(bk, p); /* the buckets before the next row are empty */
+        if (kp > klast)
+            break;
+        size_t a = bq_first_cluster(q, lo), b;
+        int64_t kmax = kp; /* the chunk's last bucket */
+        for (size_t c = a; c < q->ncl && q->cl[c].lo < end; c++) {
+            int64_t kc = bk_key(bk, MAX(q->cl[c].lo, lo)), ke = bk_key(bk, MIN(q->cl[c].hi, end - 1));
+            /* a cluster that starts in a later bucket may begin the next chunk: after a gap, or if it does not fit */
+            if (c > a && kc > kmax &&
+                ((uint64_t)kc - (uint64_t)kmax > AGG_CHUNK_GAP || (uint64_t)ke - (uint64_t)kp >= dense))
+                break;
+            kmax = MAX(kmax, ke);
+            if ((uint64_t)kmax - (uint64_t)kp >= dense) /* one cluster longer than a chunk: cut it */
+                break;
+        }
+        size_t n = (size_t)MIN((uint64_t)dense, (uint64_t)kmax - (uint64_t)kp + 1);
+        int64_t hi = (uint64_t)klast - (uint64_t)kp + 1 > n ? bk_start(bk, kp + (int64_t)n) : end;
+        bq_clusters(q, lo, hi, &a, &b);
+        void *wr;
+        size_t wn;
+        rc = bq_dense(q, lo, hi, a, b, nin, kp, n, &wr, &wn);
+        if (rc == 0 && wn && !res) { /* the first chunk's array is the result so far */
+            res = wr;
+            got = wn;
+            wr = NULL;
+        } else if (rc == 0 && wn) {
+            uint8_t *r2 = realloc(res, (got + wn) * row);
+            if (r2) {
+                memcpy(r2 + got * row, wr, wn * row);
+                res = r2;
+                got += wn;
+            } else {
+                rc = TSDB_ERR_NOMEM;
+            }
+        }
+        free(wr);
+        lo = hi;
+    }
+    if (rc) {
+        free(res);
+        return rc;
+    }
+    *out = res;
+    *nout = got;
+    return 0;
 }
 
 static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool spread,

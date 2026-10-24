@@ -432,10 +432,27 @@ static int insert_packed(const uint8_t *p, size_t len, uint32_t n, uint32_t s)
 
 /* fields: 0 (bb: tsdb_bucket) or TSDB_SPREAD (bb: tsdb_spread_bucket, version 8), which appends the spread
  * to every row */
+/* The most bucket rows of `row` bytes that one reply frame carries (after its count). A reply with more buckets is
+ * refused (TSDB_ERR_TOO_MANY_BUCKETS) rather than built. A request with a larger limit computes at most one bucket
+ * more than a frame carries (the limit it runs with). One without a limit runs as it does embedded, so it is
+ * refused at once when its span exceeds the engine's bucket limit, and its work and memory follow the buckets
+ * with rows (src/query.c bq_window); running it with the frame as its limit would instead walk a sparse span
+ * window by window that the engine refuses as a whole. */
+static size_t frame_rows(size_t row) { return (TSDB_MAX_FRAME - 9 - 4) / row; }
+static size_t frame_limit(uint64_t lim, size_t row)
+{
+    size_t cap = frame_rows(row);
+    return lim > cap ? cap + 1 : (size_t)lim;
+}
+
 static void reply_buckets(conn *c, uint32_t id, const void *bb, size_t nb, uint8_t fields)
 {
     size_t row = fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
     size_t stride = fields & TSDB_SPREAD ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+    if (nb > frame_rows(row)) {
+        reply_status(c, id, TSDB_ERR_TOO_MANY_BUCKETS);
+        return;
+    }
     uint8_t *rows = malloc(nb * row + 1);
     if (!rows) {
         reply_status(c, id, TSDB_ERR_NOMEM);
@@ -678,9 +695,14 @@ static void handle(req *r)
             memcpy(&lim, p + 26, 8);
             char *zone = zl ? strndup((const char *)p + 36, zl) : NULL;
             tsdb_group g = {(tsdb_unit)p[20], count, zone};
-            tsdb_query_opts q = {p[25] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
+            tsdb_query_opts q = {p[25] ? TSDB_DESC : TSDB_ASC, frame_limit(lim, TSDB_AGG_ROW)};
             rc = tsdb_query_group_ex(db, s, start, end, p[20] ? &g : NULL, &q, &b, &nb);
             free(zone);
+        }
+        if (rc == 0 && nb > frame_rows(TSDB_AGG_ROW)) {
+            free(b);
+            rc = TSDB_ERR_TOO_MANY_BUCKETS;
+            break;
         }
         if (rc == 0) {
             uint8_t *rows = malloc(nb * TSDB_AGG_ROW + 1);
@@ -873,7 +895,8 @@ static void handle(req *r)
         memcpy(&interval, p + 20, 8);
         memcpy(&count, p + 29, 4);
         memcpy(&lim, p + 34, 8);
-        tsdb_query_opts q = {p[33] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
+        tsdb_query_opts q = {p[33] ? TSDB_DESC : TSDB_ASC,
+                             frame_limit(lim, fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW)};
         tsdb_bucket *b = NULL;
         size_t nb = 0;
         char *zone = zl ? strndup((const char *)p + 44, zl) : NULL;
@@ -922,7 +945,8 @@ static void handle(req *r)
         memcpy(&start, p + 4, 8);
         memcpy(&end, p + 12, 8);
         memcpy(&lim, p + 21, 8);
-        tsdb_query_opts q = {p[20] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
+        tsdb_query_opts q = {p[20] ? TSDB_DESC : TSDB_ASC,
+                             frame_limit(lim, fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW)};
         int64_t *bounds = malloc((size_t)n * 8); /* aligned copy */
         tsdb_bucket *b = NULL;
         size_t nb = 0;

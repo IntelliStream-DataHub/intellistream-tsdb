@@ -834,6 +834,111 @@ static void test_lttb_remote(tsdbc *c)
 }
 
 /* Deletes, replaces and retention over the wire (protocol version 7). */
+/* A bucketed reply that does not fit a frame is refused with TSDB_ERR_TOO_MANY_BUCKETS, and the server computes
+ * no more buckets than a frame carries (plus one) to find out: it used to build the whole reply, over 256 MB,
+ * which the client then refused as a broken frame. A limit within a frame still answers. */
+/* QUERY_AGG over a raw connection: its status, and the buckets of an answer in *nb (the reply is read and dropped) */
+static int32_t raw_query_agg(uint32_t s, int64_t start, int64_t end, int64_t interval, size_t *nb)
+{
+    int fd = raw_connect();
+    uint8_t q[28], h[13];
+    memcpy(q, &s, 4);
+    memcpy(q + 4, &start, 8);
+    memcpy(q + 12, &end, 8);
+    memcpy(q + 20, &interval, 8);
+    raw_send(fd, 9, TSDB_OP_QUERY_AGG, q, sizeof q);
+    int32_t status = INT32_MIN;
+    uint32_t flen, n = 0;
+    *nb = 0;
+    if (read_full(fd, h, 13)) {
+        memcpy(&flen, h, 4);
+        memcpy(&status, h + 9, 4);
+        size_t left = flen - 9; /* after the status */
+        if (status == 0 && left >= 4 && read_full(fd, &n, 4)) {
+            left -= 4;
+            *nb = n;
+            CHECK(left == (size_t)n * TSDB_AGG_ROW);
+        }
+        static uint8_t sink[1 << 16];
+        while (left && read_full(fd, sink, left < sizeof sink ? left : sizeof sink))
+            left -= left < sizeof sink ? left : sizeof sink;
+    }
+    close(fd);
+    return status;
+}
+
+/* A reply is at most one frame: exactly a frame's worth of buckets answers, one more is TOO_MANY_BUCKETS (not a
+ * frame the client refuses), for QUERY_AGG (32-byte rows), aggregates (64) and the spread (104). A request without
+ * a limit is the embedded query: a span over the engine's limit is refused at once, however few rows it has. One
+ * with a larger limit computes about a frame's worth (it runs with one bucket more than a frame as its limit). */
+static void test_frame_cap(tsdbc *c)
+{
+    uint32_t s;
+    OK(tsdbc_series_create(c, "cap.f32", TSDB_FLOAT32, NULL, &s));
+    size_t acap = (TSDB_MAX_FRAME - 13) / TSDB_AGG_ROW, bcap = (TSDB_MAX_FRAME - 13) / TSDB_BUCKET_ROW,
+           scap = (TSDB_MAX_FRAME - 13) / TSDB_SPREAD_ROW;
+    size_t n = acap + 1, chunk = 500000;
+    int64_t *ts = malloc(chunk * sizeof *ts);
+    float *v = malloc(chunk * sizeof *v);
+    for (size_t a = 0; a < n; a += chunk) {
+        size_t m = n - a < chunk ? n - a : chunk;
+        for (size_t i = 0; i < m; i++)
+            ts[i] = T0 + (int64_t)(a + i), v[i] = (float)(i % 100);
+        OK(tsdbc_insert_series(c, s, ts, v, m));
+    }
+    free(ts);
+    free(v);
+    tsdb_spread_bucket *sb = NULL;
+    tsdb_bucket *b = NULL;
+    size_t nb = 0;
+    OK(tsdbc_query_spread(c, s, T0, T0 + (int64_t)scap, 1, NULL, &sb, &nb));
+    CHECK(nb == scap && sb[scap - 1].b.start == T0 + (int64_t)scap - 1);
+    free(sb);
+    CHECK(tsdbc_query_spread(c, s, T0, T0 + (int64_t)scap + 1, 1, NULL, &sb, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+    OK(tsdbc_query_agg(c, s, T0, T0 + (int64_t)bcap, 1, &b, &nb));
+    CHECK(nb == bcap && b[bcap - 1].start == T0 + (int64_t)bcap - 1);
+    free(b);
+    CHECK(tsdbc_query_agg(c, s, T0, T0 + (int64_t)bcap + 1, 1, &b, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+    CHECK(raw_query_agg(s, T0, T0 + (int64_t)acap, 1, &nb) == 0 && nb == acap);
+    CHECK(raw_query_agg(s, INT64_MIN, INT64_MAX, 1, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+
+    /* a limit over a frame computes a frame and one bucket, not the 8 M rows' buckets */
+    tsdb_query_opts all = {TSDB_ASC, SIZE_MAX};
+    CHECK(tsdbc_query_spread(c, s, INT64_MIN, INT64_MAX, 1, &all, &sb, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+    tsdb_query_stats st;
+    OK(tsdbc_last_query_stats(c, &st));
+    CHECK(st.granules > 0 && st.granules < (n / 8192) / 2);
+
+    tsdb_query_opts o = {TSDB_DESC, 10};
+    OK(tsdbc_query_spread(c, s, INT64_MIN, INT64_MAX, 1, &o, &sb, &nb));
+    CHECK(nb == 10 && sb[0].b.start == T0 + (int64_t)n - 1 && sb[0].b.count == 1);
+    free(sb);
+    OK(tsdbc_query_spread(c, s, INT64_MIN, INT64_MAX, 4, NULL, &sb, &nb));
+    CHECK(nb == (n + 3) / 4);
+    free(sb);
+    int64_t bounds[2] = {T0, T0 + 4};
+    CHECK(tsdbc_query_spread_bounds(c, s, INT64_MIN, INT64_MAX, bounds, 2, NULL, &sb, &nb) == 0 && nb == 2 &&
+          sb[1].b.count == n - 4);
+    free(sb);
+
+    /* 200 rows 700 s apart (one granule) by the millisecond: 140 M buckets, refused at once as embedded, not
+     * answered after seconds of walking the span in windows; with a limit the windows answer */
+    OK(tsdbc_series_create(c, "cap.sparse", TSDB_FLOAT32, NULL, &s));
+    int64_t st2[200];
+    float sv[200];
+    for (int i = 0; i < 200; i++)
+        st2[i] = T0 + (int64_t)i * 700000, sv[i] = (float)i;
+    OK(tsdbc_insert_series(c, s, st2, sv, 200));
+    OK(tsdbc_flush(c));
+    CHECK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 1, &b, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+    CHECK(tsdbc_query_spread(c, s, INT64_MIN, INT64_MAX, 1, NULL, &sb, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+    CHECK(raw_query_agg(s, INT64_MIN, INT64_MAX, 1, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+    tsdb_query_opts last = {TSDB_DESC, 3};
+    OK(tsdbc_query_agg_ex(c, s, INT64_MIN, INT64_MAX, 1, &last, &b, &nb));
+    CHECK(nb == 3 && b[0].start == st2[199] && b[2].start == st2[197]);
+    free(b);
+}
+
 static void test_delete(tsdbc *c)
 {
     uint32_t s;
@@ -2697,6 +2802,7 @@ int main(int argc, char **argv)
     test_spread_remote(c);
     test_spread_old_server();
     test_delete(c);
+    test_frame_cap(c);
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);
