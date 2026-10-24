@@ -117,6 +117,7 @@ into make: build the way `make asan` does, with `-fsanitize=thread`.
 | `build/insert-bench` | durable inserts on a real disk, 1 row to 1 billion rows per call |
 | `build/tsdbc-bench` | the server: loading, queries, 10,000 connections |
 | `build/scale-bench` | 100 billion rows: load, then a query suite, with the same queries as SQL for ClickHouse |
+| [`bench/dbcmp`](bench/dbcmp) | tsdb against ClickHouse, QuestDB, TimescaleDB and InfluxDB 2 and 3 on 100 M rows; its README has the steps |
 
 ```sh
 build/codec-bench
