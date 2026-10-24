@@ -9,7 +9,17 @@ public final class Points {
     private final long[] timestamps;
     private final float[] values;
 
-    Points(long[] timestamps, float[] values) {
+    /**
+     * Points over the given arrays, which are not copied (for other implementations of the API, such as the
+     * embedded database).
+     *
+     * @param timestamps ms since the epoch
+     * @param values the values, in the same positions; as long as {@code timestamps}
+     * @throws IllegalArgumentException if the lengths differ
+     */
+    public Points(long[] timestamps, float[] values) {
+        if (timestamps.length != values.length)
+            throw new IllegalArgumentException(timestamps.length + " timestamps and " + values.length + " values");
         this.timestamps = timestamps;
         this.values = values;
     }

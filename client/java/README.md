@@ -7,6 +7,20 @@ back, and ask for totals per hour, per day or per month.
 You need Java 17 or newer and Maven. The library uses one other library,
 [zstd-jni](https://github.com/luben/zstd-jni), to compress data on the network.
 
+To run the database inside your Java program instead of talking to a server, use `tsdb-embedded`
+([client/java-embedded](../java-embedded/README.md)). It needs Java 22 or newer and calls the engine directly,
+with no server and no network. Its `EmbeddedDb` has the same methods as `TsdbClient` and uses the same types,
+so the same code works with either one: only the line that opens the database changes.
+
+```java
+try (EmbeddedDb db = EmbeddedDb.open("/var/lib/tsdb")) {   // instead of TsdbClient.connect("host", 7070)
+    int id = db.series("pump7.flow");
+    db.insert(id, times, values);
+}
+```
+
+Start Java with `--enable-native-access=ALL-UNNAMED` so that it allows the calls into the engine.
+
 ## Quick start
 
 1. Build and start the server. From the root of this repository:
