@@ -49,36 +49,49 @@ average). You can link tsdb into your program as a library, or run its server,
 ## How it compares
 
 100 million sensor readings (100 sensors, 1 million readings each), loaded and
-queried on the same machine (AMD Ryzen 9 7950X, NVMe disk):
+queried on the same machine (AMD Ryzen 9 7950X, NVMe disk). Two tables: tsdb as
+a library inside your program, and tsdb as a server used through its clients
+over TCP. Each is compared only with systems used the same way.
+
+**Embedded: a library inside your program, no network**
 
 | database | insert (rows per second) | query (rows per second) | query time | size on disk | compression |
 |---|---:|---:|---:|---:|---:|
-| **tsdb** | **82.6 million** | **862 million** | **0.15 ms** | **119 MB** | **10x** |
+| **tsdb** | **101 million** | **2.5 billion** | **0.07 ms** | **119 MB** | **10x** |
+| DuckDB | 28 million | 552 million | 3.7 ms | 307 MB | 3.9x |
+
+**Server: through the clients over TCP**
+
+| database | insert (rows per second) | query (rows per second) | query time | size on disk | compression |
+|---|---:|---:|---:|---:|---:|
+| **tsdb** (tsdbd) | **82.6 million** | **862 million** | **0.15 ms** | **119 MB** | **10x** |
 | ClickHouse | 43 million | 272 million | 3.2 ms | 221 MB | 5.4x |
-| DuckDB (\*) | 28 million | 552 million | 3.7 ms | 307 MB | 3.9x |
 | InfluxDB 2 | 3.6 million | 14 million | 5.3 ms | 315 MB | 3.8x |
 | TimescaleDB | 3.4 million | 26 million | 5.8 ms | 404 MB | 3.0x |
 | InfluxDB 3 Core | 1.0 million | 2.2 million | 72 ms | 723 MB | 1.7x |
-| QuestDB (\*\*) | 32 million | 78 million | 5.3 ms | 1,657 MB | 0.7x |
+| QuestDB (\*) | 32 million | 78 million | 5.3 ms | 1,657 MB | 0.7x |
 
 - **Query (rows per second):** all 100 sensors over the whole range in buckets
   of 60 readings, a query that has to read every row: 100 million rows divided
-  by the time it took. tsdb on one connection; ClickHouse and DuckDB ran the
-  query on 32 threads. Summaries over whole blocks are much faster still,
-  because tsdb answers them from each block's summary without reading the
-  rows.
+  by the time it took. tsdb used one thread (embedded) or one connection
+  (server); DuckDB and ClickHouse ran the query on 32 threads. Summaries over
+  whole blocks are much faster still, because tsdb answers them from each
+  block's summary without reading the rows.
 - **Query time:** one day of one sensor as 5-minute averages (86,400 readings
   into 288 buckets), one client, average over thousands of random days.
 - **Compression:** the raw size (8 bytes of time and 4 bytes of value per
   reading, 1.2 GB) divided by the size on disk.
-- (\*) DuckDB is a library, not a server. Compare it with tsdb used as a
-  library: 101 million rows per second for inserts, 2.5 billion rows per
-  second for the query above, and 0.07 ms per query.
-- (\*\*) QuestDB stores its data uncompressed by default, as measured here,
+- **Inserts:** embedded, 4 threads (DuckDB got its rows sorted beforehand, not
+  counted); server, 4 connections for tsdb, each system's recommended loader
+  for the others.
+- (\*) QuestDB stores its data uncompressed by default, as measured here,
   which is why it is larger than the raw data. Its open source version can
   compress only if you convert partitions to Parquet by hand or run it on a
   compressing file system such as ZFS; converting partitions automatically as
   they age is a feature of its paid Enterprise edition.
+- Coming with the next measurement: ClickHouse embedded (chDB) in the first
+  table, Prometheus in the second, and columns for LTTB downsampling and
+  time-weighted averages.
 
 At 100 billion rows, tsdb needs 116 GB where ClickHouse needs 170 GB. A summary
 of the whole table takes 0.17 seconds instead of 59.
