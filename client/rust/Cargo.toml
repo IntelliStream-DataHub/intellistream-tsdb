@@ -25,3 +25,7 @@ tsdb-sys = { path = "../rust-sys", optional = true }
 [[example]]
 name = "embedded_quickstart"
 required-features = ["embedded"]
+
+[[example]]
+name = "embedded_bench"
+required-features = ["embedded"]
