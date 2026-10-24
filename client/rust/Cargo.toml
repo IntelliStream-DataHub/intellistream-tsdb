@@ -10,3 +10,5 @@ keywords = ["timeseries", "database", "client"]
 categories = ["database"]
 
 [dependencies]
+# packed inserts (protocol version 3); the bundled libzstd, no optional features
+zstd = { version = "0.13", default-features = false }

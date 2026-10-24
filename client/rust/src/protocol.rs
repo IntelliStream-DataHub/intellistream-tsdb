@@ -6,11 +6,12 @@
 //! INSERT_VALUES, QUERY_VALUES, STATE, STATE_NAME, QUERY_BUCKETS). This client
 //! sends QUERY_BUCKETS for every aggregate: its 64-byte rows carry f64 min/max
 //! and the exact integer fields, which the version 1 QUERY_AGG/GROUP rows lack.
+//! Version 3 adds packed, zstd-compressed INSERT_VALUES bodies (`pack.rs`).
 
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 
@@ -24,6 +25,8 @@ pub(crate) const BUCKET_ROW: usize = 64;
 pub(crate) const VALUES_CHUNK_HEADER: usize = 8;
 /// Flag: a validity bitmap follows the values (`TSDB_VALID`).
 pub(crate) const VALID: u8 = 1;
+/// Flag: the arrays are packed and zstd compressed (`TSDB_PACKED`, version 3).
+pub(crate) const PACKED: u8 = 2;
 /// Reply header: len, id, op, status.
 pub(crate) const REPLY_HEADER: usize = 13;
 

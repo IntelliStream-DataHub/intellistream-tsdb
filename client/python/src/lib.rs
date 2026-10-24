@@ -789,6 +789,25 @@ impl Client {
         self.with(py, |c| Ok(c.pending()))
     }
 
+    /// Sets the zstd level of inserts: 0 sends plain arrays; any other level
+    /// zstd accepts (1, the default; negative is faster) packs them when the
+    /// server speaks protocol version 3.
+    fn set_compression(&self, py: Python<'_>, level: i32) -> PyResult<()> {
+        self.with(py, |c| c.set_compression(level))
+    }
+
+    /// The zstd level of inserts (0: off).
+    #[getter]
+    fn compression(&self, py: Python<'_>) -> PyResult<i32> {
+        self.with(py, |c| Ok(c.compression()))
+    }
+
+    /// Bytes written to the socket by this client so far.
+    #[getter]
+    fn bytes_sent(&self, py: Python<'_>) -> PyResult<u64> {
+        self.with(py, |c| Ok(c.bytes_sent()))
+    }
+
     /// Raw points of a float32 `series` in [start, end) as (timestamps,
     /// values): numpy arrays (int64, float32) if numpy is importable and
     /// `numpy` is not False, else lists. Nulls read as NaN.
@@ -924,6 +943,7 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(strerror, m)?)?;
     m.add("DEFAULT_PORT", tc::DEFAULT_PORT)?;
     m.add("PROTOCOL_VERSION", tc::PROTOCOL_VERSION)?;
+    m.add("DEFAULT_COMPRESSION", tc::DEFAULT_COMPRESSION)?;
     m.add("VALUE_TYPES", ValueType::ALL.map(ValueType::name).to_vec())?;
     for (name, s) in [
         ("ERR_IO", tc::Status::Io),
