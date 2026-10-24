@@ -3,7 +3,7 @@
  * clients that misbehave. Each check runs under a watchdog, so a server or a
  * client that hangs fails the test instead of stopping it.
  *
- *   test_stability [scratch dir]        (TSDBD=path picks the server binary)
+ *   test_stability [scratch dir]        (TSDBD=path picks the server binary, TSDBD_IO=uring|epoll its backend)
  */
 #define _GNU_SOURCE
 #include "tsdb.h"
@@ -13,14 +13,21 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -103,6 +110,41 @@ static void remove_dir(const char *dir)
     CHECK(system(cmd) == 0);
 }
 
+/* For the next spawn: io_uring_setup fails with this errno (0: it does not),
+ * and the server's stderr goes to this file (NULL: inherited). */
+static int deny_uring;
+static const char *spawn_log;
+
+/* In the child before exec: io_uring_setup fails with err, as it does under
+ * kernel.io_uring_disabled=2 (EPERM, RHEL 10), on a kernel built without
+ * io_uring (ENOSYS) or under a security module that denies it (EACCES). A
+ * seccomp filter rather than an LD_PRELOAD shim: liburing makes the system call
+ * itself. Calls of another architecture's ABI (x32, ia32) are let through: the
+ * number would mean something else there. */
+#if defined(__x86_64__)
+#define TEST_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#define TEST_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#endif
+static void refuse_io_uring(int err)
+{
+    struct sock_filter f[] = {
+#ifdef TEST_AUDIT_ARCH
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TEST_AUDIT_ARCH, 0, 3),
+#endif
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ((unsigned)err & SECCOMP_RET_DATA)),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog = {sizeof f / sizeof f[0], f};
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+        perror("seccomp");
+        _exit(126);
+    }
+}
+
 /* Starts tsdbd; extra arguments end with NULL. Does not wait for it. */
 static pid_t spawn(const char *dir, int port, const char *extra1, const char *extra2)
 {
@@ -111,7 +153,19 @@ static pid_t spawn(const char *dir, int port, const char *extra1, const char *ex
     pid_t pid = fork();
     if (pid == 0) {
         const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
-        execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--workers", "4", extra1, extra2, (char *)NULL);
+        if (spawn_log) {
+            int fd = open(spawn_log, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (fd < 0 || dup2(fd, 2) < 0)
+                _exit(126);
+        }
+        if (deny_uring)
+            refuse_io_uring(deny_uring);
+        const char *io = getenv("TSDBD_IO"); /* the event loop backend: make test runs uring and epoll */
+        if (io)
+            execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--workers", "4", "--io", io, extra1, extra2,
+                  (char *)NULL);
+        else
+            execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--workers", "4", extra1, extra2, (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 16; i++)
@@ -500,7 +554,15 @@ static void test_storm(void)
     int port = next_port++;
     pid_t pid = start(dir, port, NULL, NULL);
     CHECK(insert(port, "q", 0, 10000) == 0);
+    /* The server closes its end of the insert connection only once it sees the client's close, so a count taken
+     * at once can still include it (seen with epoll): the baseline is the count once it has stopped falling. */
     int before = count_fds(pid);
+    for (int stable = 0, i = 0; stable < 5 && i < 100; i++) {
+        sleep_ms(20);
+        int n = count_fds(pid);
+        stable = n == before ? stable + 1 : 0;
+        before = n;
+    }
     enum { NT = 8 };
     pthread_t th[NT];
     storm s[NT];
@@ -521,9 +583,346 @@ static void test_storm(void)
         sleep_ms(20);
         after = count_fds(pid);
     }
+    if (after != before) {
+        fprintf(stderr, "%s: %d descriptors before, %d after:\n", current, before, after);
+        char cmd[128];
+        snprintf(cmd, sizeof cmd, "ls -l /proc/%d/fd >&2", (int)pid);
+        if (system(cmd) != 0)
+            fprintf(stderr, "(no listing)\n");
+    }
     CHECK(after == before);
     signal_pid(pid, SIGTERM);
     CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
+/* Asks for every row of series id in one QUERY_RAW; the reply streams in chunks. */
+static void send_query_raw(int fd, uint32_t id)
+{
+    uint8_t f[9 + 20];
+    uint32_t flen = 25, rid = 7;
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    memcpy(f, &flen, 4);
+    memcpy(f + 4, &rid, 4);
+    f[8] = TSDB_OP_QUERY_RAW;
+    memcpy(f + 9, &id, 4);
+    memcpy(f + 13, &lo, 8);
+    memcpy(f + 21, &hi, 8);
+    CHECK(write(fd, f, sizeof f) == (ssize_t)sizeof f);
+}
+
+static bool read_full(int fd, void *p, size_t n)
+{
+    for (size_t got = 0; got < n;) {
+        ssize_t r = read(fd, (uint8_t *)p + got, n - got);
+        if (r <= 0)
+            return false;
+        got += (size_t)r;
+    }
+    return true;
+}
+
+/* Reads a QUERY_RAW reply to the end, pausing between reads like a slow
+ * consumer; returns the rows, or UINT64_MAX when the stream breaks, a chunk
+ * fails or timestamps do not increase. */
+static uint64_t read_raw_slowly(int fd)
+{
+    uint64_t rows = 0;
+    int64_t prev = INT64_MIN;
+    size_t since_pause = 0;
+    static uint8_t body[16384 * 12 + 64];
+    for (;;) {
+        uint8_t h[18]; /* length, id, op, status, last, n */
+        if (!read_full(fd, h, sizeof h))
+            return UINT64_MAX;
+        uint32_t len, n;
+        int32_t st;
+        memcpy(&len, h, 4);
+        memcpy(&st, h + 9, 4);
+        memcpy(&n, h + 14, 4);
+        if (st != 0 || h[8] != TSDB_OP_REPLY || len != 14 + (uint64_t)n * 12 || n > 16384)
+            return UINT64_MAX;
+        if (!read_full(fd, body, (size_t)n * 12))
+            return UINT64_MAX;
+        for (uint32_t i = 0; i < n; i++) {
+            int64_t t;
+            memcpy(&t, body + (size_t)i * 8, 8);
+            if (t <= prev)
+                return UINT64_MAX;
+            prev = t;
+        }
+        rows += n;
+        if ((since_pause += (size_t)n * 12) > (256u << 10)) {
+            since_pause = 0;
+            sleep_ms(1); /* the server finds the socket full and waits for it to drain */
+        }
+        if (h[13])
+            return rows;
+    }
+}
+
+/* Back-pressure: a slow reader gets a large result whole and in order; clients
+ * that read nothing hold no more than their workers (extra ones start, so
+ * others are served) and lose the connection after --send-timeout. */
+static void test_slow_readers(void)
+{
+    current = "slow and stuck readers";
+    alarm(120);
+    char dir[512];
+    make_dir(dir, sizeof dir, "slow");
+    int port = next_port++;
+    pid_t pid = start(dir, port, "--workers=1", "--send-timeout=2");
+    enum { N = 3000000 };
+    CHECK(insert(port, "big", 0, N) == 0);
+    tsdbc *c;
+    uint32_t id = 0;
+    CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
+    tsdbc_close(c);
+
+    int fd = raw_connect(port);
+    send_query_raw(fd, id);
+    CHECK(read_raw_slowly(fd) == N);
+    close(fd);
+
+    int stuck[2];
+    for (int i = 0; i < 2; i++) {
+        stuck[i] = raw_connect(port);
+        send_query_raw(stuck[i], id);
+    }
+    sleep_ms(300);
+    CHECK(hello(port)); /* the only worker and an extra one wait for output space */
+    sleep_ms(4000);     /* past the send timeout */
+    for (int i = 0; i < 2; i++) {
+        size_t got = 0;
+        uint8_t b[65536];
+        ssize_t r;
+        while ((r = read(stuck[i], b, sizeof b)) > 0)
+            got += (size_t)r;
+        CHECK(r == 0 || errno == ECONNRESET); /* cut off, not still streaming (EAGAIN after 5 s) */
+        CHECK(got < (size_t)N * 12);
+        close(stuck[i]);
+    }
+    CHECK(count_rows(port, "big") == N);
+    signal_pid(pid, SIGTERM);
+    CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
+/* CPU time (user + system) the thread tid of process pid has used, in seconds. */
+static double thread_cpu(pid_t pid, pid_t tid)
+{
+    char path[64], buf[1024];
+    snprintf(path, sizeof path, "/proc/%d/task/%d/stat", (int)pid, (int)tid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return -1;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *p = strrchr(buf, ')'); /* the name may hold spaces */
+    unsigned long long ut, st;
+    /* after the name: state (field 3) ... utime (14) and stime (15) */
+    if (!p || sscanf(p + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) != 2)
+        return -1;
+    return (double)(ut + st) / (double)sysconf(_SC_CLK_TCK);
+}
+
+/* Regression: a client that stops reading must cost the event loop nothing
+ * while its send waits. An epoll loop that keeps such a socket marked writable
+ * after EAGAIN tries the send again on every round and burns a core per stuck
+ * client, which no other test notices. */
+static void test_stuck_reader_idle(void)
+{
+    current = "stuck reader: idle event loop";
+    alarm(60);
+    char dir[512];
+    make_dir(dir, sizeof dir, "idle");
+    int port = next_port++;
+    pid_t pid = start(dir, port, NULL, NULL);
+    enum { N = 1000000 }; /* 12 MB of reply: far beyond both socket buffers */
+    CHECK(insert(port, "big", 0, N) == 0);
+    tsdbc *c;
+    uint32_t id = 0;
+    CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
+    tsdbc_close(c);
+    int fd = raw_connect(port);
+    int small = 4096; /* and no receive buffer autotuning */
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+    send_query_raw(fd, id);
+    sleep_ms(500); /* the send now waits for the client */
+    double t0 = thread_cpu(pid, pid), w0 = now();
+    sleep_ms(2000);
+    double t1 = thread_cpu(pid, pid), w1 = now();
+    CHECK(t0 >= 0 && t1 >= 0);
+    if (t1 - t0 > 0.25 * (w1 - w0)) { /* a spinning loop uses all of it; an idle one about none */
+        fprintf(stderr, "%s: event loop used %.2f s of CPU in %.2f s\n", current, t1 - t0, w1 - w0);
+        failures++;
+    }
+    CHECK(hello(port));
+    close(fd);
+    signal_pid(pid, SIGTERM);
+    CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
+/* A request any server answers at once (an unknown operation: INVALID). */
+static bool answers(int fd)
+{
+    uint8_t f[9] = {5, 0, 0, 0, 1, 0, 0, 0, 250}, r[13];
+    return write(fd, f, sizeof f) == (ssize_t)sizeof f && read_full(fd, r, sizeof r) && r[8] == TSDB_OP_REPLY;
+}
+
+/* --max-connections: one more is accepted and closed at once; when one
+ * leaves, the next gets in. */
+static void test_connection_limit(void)
+{
+    current = "connection limit";
+    alarm(60);
+    char dir[512];
+    make_dir(dir, sizeof dir, "limit");
+    int port = next_port++;
+    pid_t pid = start(dir, port, "--max-connections=20", NULL);
+    sleep_ms(200); /* until the server has seen start's probe go */
+    int fds[20];
+    for (int i = 0; i < 20; i++) {
+        fds[i] = raw_connect(port);
+        CHECK(fds[i] >= 0 && answers(fds[i]));
+    }
+    int over = raw_connect(port);
+    uint8_t b[16];
+    CHECK(over >= 0 && !answers(over));
+    errno = 0;
+    CHECK(read(over, b, sizeof b) <= 0 && errno != EAGAIN); /* closed, not just slow */
+    close(over);
+    close(fds[0]);
+    bool in = false;
+    for (int i = 0; i < 100 && !in; i++) { /* once the server has seen the close */
+        sleep_ms(20);
+        int fd = raw_connect(port);
+        in = fd >= 0 && answers(fd);
+        if (fd >= 0) {
+            if (in)
+                fds[0] = fd;
+            else
+                close(fd);
+        }
+    }
+    CHECK(in);
+    for (int i = 0; i < 20; i++)
+        if (fds[i] >= 0)
+            close(fds[i]);
+    signal_pid(pid, SIGTERM);
+    CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
+/* A client sends its last requests and its end of stream while the server is
+ * stopped, so both are waiting when it looks again: every request is answered,
+ * in order, and then the server closes. (epoll: one event says readable and
+ * hung up; a recv that empties the socket must not be taken as "wait for the
+ * next edge", which never comes.) */
+static void test_half_close_while_stopped(void)
+{
+    current = "end of stream while stopped";
+    alarm(60);
+    char dir[512];
+    make_dir(dir, sizeof dir, "halfclose");
+    int port = next_port++;
+    pid_t pid = start(dir, port, NULL, NULL);
+    for (int round = 0; round < 3; round++) {
+        int fd = raw_connect(port);
+        CHECK(fd >= 0 && answers(fd)); /* registered, and idle again */
+        sleep_ms(50);
+        signal_pid(pid, SIGSTOP);
+        sleep_ms(50);
+        uint8_t f[50 * 9];
+        for (uint32_t i = 0; i < 50; i++) {
+            uint8_t h[9] = {5, 0, 0, 0, 0, 0, 0, 0, 250};
+            memcpy(h + 4, &i, 4);
+            memcpy(f + i * 9, h, 9);
+        }
+        CHECK(write(fd, f, sizeof f) == (ssize_t)sizeof f);
+        shutdown(fd, SHUT_WR);
+        sleep_ms(50);
+        signal_pid(pid, SIGCONT);
+        uint32_t n = 0;
+        uint8_t r[13];
+        while (read_full(fd, r, sizeof r)) {
+            uint32_t rid;
+            memcpy(&rid, r + 4, 4);
+            CHECK(rid == n && r[8] == TSDB_OP_REPLY);
+            n++;
+        }
+        CHECK(n == 50);
+        errno = 0;
+        CHECK(read(fd, r, sizeof r) == 0); /* the end, not a timeout */
+        close(fd);
+    }
+    signal_pid(pid, SIGTERM);
+    CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
+static bool file_has(const char *path, const char *text)
+{
+    char buf[8192];
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return false;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    return strstr(buf, text) != NULL;
+}
+
+/* AlmaLinux and RHEL 10 refuse io_uring: --io auto (the default) must serve on
+ * epoll and say why, whatever the error, and --io uring must fail as before.
+ * Skipped in the epoll pass of make test: it picks the backend itself, so the
+ * other pass has already run it. */
+static void test_io_fallback(void)
+{
+    const char *io = getenv("TSDBD_IO");
+    if (io && strcmp(io, "epoll") == 0)
+        return;
+    current = "io_uring refused: epoll fallback";
+    alarm(120);
+    char dir[512], log[600];
+    make_dir(dir, sizeof dir, "iofallback");
+    snprintf(log, sizeof log, "%s.log", dir);
+    spawn_log = log;
+    /* policy (RHEL 10), not built in, too old for the flags, denied by a security module */
+    static const int errs[] = {EPERM, ENOSYS, EINVAL, EACCES};
+    enum { NERRS = sizeof errs / sizeof errs[0] };
+    for (int i = 0; i < NERRS; i++) {
+        int port = next_port++;
+        deny_uring = errs[i];
+        pid_t pid = start(dir, port, "--io", "auto"); /* last wins over TSDBD_IO */
+        deny_uring = 0;
+        CHECK(pid > 0);
+        if (pid <= 0)
+            continue;
+        CHECK(insert(port, "fb", i * 1000, 1000) == 0);
+        CHECK(count_rows(port, "fb") == (uint64_t)(i + 1) * 1000);
+        signal_pid(pid, SIGTERM);
+        CHECK(clean_exit(wait_exit(pid, 10)));
+        char want[128];
+        snprintf(want, sizeof want, "io_uring unavailable (%s", strerror(errs[i]));
+        CHECK(file_has(log, want));
+        CHECK(file_has(log, "using epoll"));
+        CHECK(file_has(log, ", io epoll\n"));
+    }
+    /* asked for io_uring explicitly: no fallback */
+    int port = next_port++;
+    deny_uring = EPERM;
+    pid_t pid = spawn(dir, port, "--io", "uring");
+    deny_uring = 0;
+    int st = wait_exit(pid, 10);
+    CHECK(st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 1);
+    CHECK(file_has(log, "tsdbd: io_uring: Operation not permitted"));
+    CHECK(!file_has(log, "using epoll"));
+    CHECK(port_free(port));
+    spawn_log = NULL;
+    unlink(log);
     remove_dir(dir);
 }
 
@@ -574,6 +973,11 @@ int main(int argc, char **argv)
     test_conflicts();
     test_storm();
     test_follower();
+    test_slow_readers();
+    test_stuck_reader_idle();
+    test_connection_limit();
+    test_half_close_while_stopped();
+    test_io_fallback();
     alarm(0);
     if (failures) {
         printf("FAILED: %d checks\n", failures);

@@ -126,7 +126,8 @@ static void start_server(bool faulty)
         if (devnull >= 0 && !getenv("JEPSEN_VERBOSE"))
             dup2(devnull, 2);
         execl(getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd", "tsdbd", "--dir", dir, "--port", portstr,
-              "--workers", "8", "--wal-max-batch-rows", "500", "--partition-ms", pms, (char *)NULL);
+              "--workers", "8", "--wal-max-batch-rows", "500", "--partition-ms", pms, getenv("TSDBD_IO") ? "--io" : NULL,
+              getenv("TSDBD_IO"), (char *)NULL);
         _exit(127);
     }
     atomic_store(&server_pid, pid);
@@ -145,7 +146,8 @@ static void start_server(bool faulty)
             pid = fork();
             if (pid == 0) {
                 execl(getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd", "tsdbd", "--dir", dir, "--port",
-                      portstr, "--workers", "8", "--wal-max-batch-rows", "500", "--partition-ms", pms, (char *)NULL);
+                      portstr, "--workers", "8", "--wal-max-batch-rows", "500", "--partition-ms", pms,
+                      getenv("TSDBD_IO") ? "--io" : NULL, getenv("TSDBD_IO"), (char *)NULL);
                 _exit(127);
             }
             atomic_store(&server_pid, pid);

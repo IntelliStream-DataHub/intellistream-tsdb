@@ -50,6 +50,10 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
         const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd"; /* e.g. a sanitizer build */
         const char *argv[32] = {"tsdbd", "--dir", dir, "--port", portstr, "--no-fsync", "--workers", "4"};
         int n = 8;
+        if (getenv("TSDBD_IO")) { /* the event loop backend: make test runs uring and epoll */
+            argv[n++] = "--io";
+            argv[n++] = getenv("TSDBD_IO");
+        }
         for (int i = 0; extra && extra[i] && n < 31; i++)
             argv[n++] = extra[i];
         argv[n] = NULL;

@@ -148,6 +148,9 @@ build/tsdbd --dir /data/sensors --port 7070
 build/tsdbd --dir /mnt/sensors --port 7070 --follow    # a read-only copy that follows the writer
 ```
 
+On AlmaLinux and RHEL 10, where io_uring is disabled by default, tsdbd runs on epoll by itself
+(`--io auto`, the default; `--io epoll` skips the attempt) and says so when it starts.
+
 | client | quick start |
 |---|---|
 | C | [`client/tsdb_client.h`](client/tsdb_client.h), example below |

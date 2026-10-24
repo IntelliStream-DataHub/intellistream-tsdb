@@ -15,6 +15,9 @@ LDLIBS  += -lzstd -lpthread -lm
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 TSDBD   ?= $(B)/tsdbd
+# Event loop backends the server tests and jepsen run against; `make test IO=epoll`
+# where io_uring is disabled (RHEL and AlmaLinux 10).
+IO      ?= uring epoll
 
 SRC  := $(wildcard src/*.c)
 OBJ  := $(SRC:src/%.c=$(B)/%.o)
@@ -48,8 +51,9 @@ test: $(B)/test_tsdb $(B)/test_types $(B)/test_server $(B)/test_stability $(B)/t
 	./$(B)/test_group
 	./$(B)/test_follow
 	./$(B)/test_volumes
-	TSDBD=$(TSDBD) ./$(B)/test_server
-	TSDBD=$(TSDBD) ./$(B)/test_stability
+	for io in $(IO); do echo "== tsdbd --io $$io"; \
+	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server && \
+	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
 
 # Without -march=native: with it, GCC 15.2's AddressSanitizer crashes in memcpy into
 # fake-stack frames (use-after-return detection), in code that did not change.
@@ -150,6 +154,7 @@ $(B)/jepsen: tests/jepsen/jepsen.c $(CLIB)
 # clients write and read; a checker verifies durability, atomicity and reads.
 JEPSEN_DIR ?= /tmp/tsdb-jepsen
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
-	./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20
-	./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so
-	./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10
+	for io in $(IO); do echo "== tsdbd --io $$io"; \
+	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20 && \
+	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so && \
+	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10 || exit 1; done
