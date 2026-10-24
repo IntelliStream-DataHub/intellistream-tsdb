@@ -10,6 +10,7 @@
  */
 #define _GNU_SOURCE
 #include "tsdb.h"
+#include "tsdb_calendar.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -614,6 +615,58 @@ static void test_stats_only(void)
     rmrf(dir);
 }
 
+/* Local calendar groups: the range is cut to where segments can cover time, including the value carried in from
+ * before start and the segment that a reading after end ends. Around Oslo's spring DST change (a 23-hour day). */
+static void test_local(void)
+{
+    char dir[600];
+    tsdb *db = open_db("local", 4, dir);
+    uint32_t s;
+    OK(tsdb_series_create(db, "x", TSDB_FLOAT64, NULL, &s));
+    const int64_t h = 3600000, t0 = 1711836000000LL; /* 2024-03-30T22:00Z */
+    int64_t ts[] = {t0, t0 + 2 * h + h / 2, t0 + 14 * h, t0 + 32 * h};
+    double v[] = {1, 3, 5, 7};
+    OK(tsdb_insert_series_values(db, s, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, 4));
+    tsdb_group g = {TSDB_DAY, 1, "Europe/Oslo"};
+    tsdb_twa_bucket *b;
+    size_t n;
+    OK(tsdb_query_twa_group_local(db, s, INT64_MIN, INT64_MAX, &g, NULL, &b, &n));
+    CHECK(n == 3);
+    if (n == 3) { /* local days start at 23:00Z, then 22:00Z after the change */
+        CHECK(b[0].start == t0 - 23 * h && b[0].covered_ms == h && near(b[0].area, 1.0 * h) && b[0].count == 1);
+        CHECK(b[1].start == t0 + h && b[1].covered_ms == 23 * h && b[1].count == 2 &&
+              near(b[1].area, 1.5 * h + 3 * 11.5 * h + 5 * 10.0 * h));
+        CHECK(b[2].start == t0 + 24 * h && b[2].covered_ms == 8 * h && near(b[2].area, 5 * 8.0 * h));
+    }
+    free(b);
+    /* no reading inside the range: the value carried in still covers it, in the day the range lies in */
+    OK(tsdb_query_twa_group_local(db, s, t0 + 3 * h, t0 + 4 * h, &g, NULL, &b, &n));
+    CHECK(n == 1 && n && b[0].start == t0 + h && b[0].covered_ms == h && b[0].count == 0 && near(b[0].twa, 3));
+    free(b);
+    /* after the last reading nothing holds */
+    OK(tsdb_query_twa_group_local(db, s, t0 + 33 * h, INT64_MAX, &g, NULL, &b, &n));
+    CHECK(n == 0);
+    free(b);
+    /* the same as explicit bounds, and UTC goes to tsdb_query_twa_group */
+    tsdb_twa_opts o = {.method = TSDB_TWA_LINEAR, .order = TSDB_DESC, .limit = 2};
+    tsdb_twa_bucket *c;
+    size_t nc;
+    int64_t bounds[] = {t0 - 23 * h, t0 + h, t0 + 24 * h};
+    OK(tsdb_query_twa_group_local(db, s, t0 - h, t0 + 30 * h, &g, &o, &b, &n));
+    OK(tsdb_query_twa_bounds(db, s, t0 - h, t0 + 30 * h, bounds, 3, &o, &c, &nc));
+    CHECK(n == 2 && nc == 2 && memcmp(b, c, 2 * sizeof *b) == 0);
+    free(b);
+    free(c);
+    g.timezone = "UTC";
+    OK(tsdb_query_twa_group_local(db, s, t0 - h, t0 + 30 * h, &g, &o, &b, &n));
+    OK(tsdb_query_twa_group(db, s, t0 - h, t0 + 30 * h, &g, &o, &c, &nc));
+    CHECK(n == nc && n == 2 && memcmp(b, c, n * sizeof *b) == 0);
+    free(b);
+    free(c);
+    tsdb_close(db);
+    rmrf(dir);
+}
+
 int main(int argc, char **argv)
 {
     snprintf(base, sizeof base, "%s/tsdb_twa_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
@@ -624,6 +677,7 @@ int main(int argc, char **argv)
         return 1;
     test_rules();
     test_stats_only();
+    test_local();
     test_random();
     rmrf(base);
     if (failures) {

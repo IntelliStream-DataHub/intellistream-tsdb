@@ -32,6 +32,13 @@ int tsdb_calendar_bounds(const char *zone, tsdb_unit unit, uint32_t count, int64
 int tsdb_query_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                            const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
+/* Embedded: tsdb_query_twa_group with a time zone, through tsdb_query_twa_bounds.
+ * An unbounded range is cut to where segments can cover time: from the first
+ * reading in [start, end) (start itself when a reading before it carries a
+ * value in) to the last one (end when a later reading ends its segment). */
+int tsdb_query_twa_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                               const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+
 #ifdef __cplusplus
 }
 #endif

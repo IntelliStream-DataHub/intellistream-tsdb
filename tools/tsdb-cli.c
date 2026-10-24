@@ -17,6 +17,11 @@ static void usage(void)
             "  query <series> <start> <end> [raw|count|sum|min|max|avg|all] [group] [--tz ZONE]\n"
             "        [--desc] [--limit N]         newest first; at most N rows or buckets\n"
             "  query <series> <start> <end> lttb N  N points that keep the shape (for charts)\n"
+            "  query <series> <start> <end> twa [group] [--linear] [--max-gap INTERVAL] [--tz ZONE]\n"
+            "                                     time-weighted average: each value weighted by how\n"
+            "                                     long it held (step; --linear: interpolated), not\n"
+            "                                     across gaps over --max-gap; columns twa, area\n"
+            "                                     (value x ms), covered_ms, count\n"
             "  create <series> [path] [--type T]  create a series of type T (float32, float64, int64,\n"
             "                                     bool, state), in volume <path> if given\n"
             "  series                             list series (type and volume)\n"
@@ -312,6 +317,32 @@ static bool parse_group(const char *s, tsdb_group *g, int64_t *interval_ms)
     return parse_interval(s, interval_ms) && *interval_ms > 0;
 }
 
+static int query_twa(tsdb *db, uint32_t id, int64_t start, int64_t end, const tsdb_group *g, int64_t interval,
+                     tsdb_twa_opts *tw, const tsdb_query_opts *q)
+{
+    tw->order = q->order;
+    tw->limit = q->limit;
+    tsdb_twa_bucket *b;
+    size_t nb;
+    int rc = g ? tsdb_query_twa_group_local(db, id, start, end, g, tw, &b, &nb)
+               : tsdb_query_twa(db, id, start, end, interval, tw, &b, &nb);
+    if (rc)
+        die("query", rc);
+    printf("time\ttwa\tarea\tcovered_ms\tcount\n");
+    char tb[40], twa[32];
+    for (size_t i = 0; i < nb; i++) {
+        format_time(b[i].start, tb, sizeof tb);
+        if (b[i].covered_ms)
+            snprintf(twa, sizeof twa, "%.17g", b[i].twa);
+        else
+            snprintf(twa, sizeof twa, "\\N"); /* readings, but none held for any time */
+        printf("%s\t%s\t%.17g\t%" PRId64 "\t%" PRIu64 "\n", tb, twa, b[i].area, b[i].covered_ms, b[i].count);
+    }
+    free(b);
+    print_stats("buckets");
+    return 0;
+}
+
 static int cmd_query(tsdb *db, int argc, char **argv)
 {
     /* positional arguments, then --tz, --desc, --limit anywhere after them */
@@ -319,8 +350,16 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     int npos = 0;
     tsdb_query_opts q = {TSDB_ASC, 0};
     const char *zone = NULL;
+    tsdb_twa_opts tw = {TSDB_TWA_STEP, 0, TSDB_ASC, 0};
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--desc") == 0)
+        if (strcmp(argv[i], "--linear") == 0)
+            tw.method = TSDB_TWA_LINEAR;
+        else if (strcmp(argv[i], "--max-gap") == 0 && i + 1 < argc) {
+            if (!parse_interval(argv[++i], &tw.max_gap_ms) || tw.max_gap_ms < 0) {
+                fprintf(stderr, "tsdb: cannot parse --max-gap \"%s\"\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--desc") == 0)
             q.order = TSDB_DESC;
         else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc)
             q.limit = strtoull(argv[++i], NULL, 10);
@@ -375,6 +414,8 @@ static int cmd_query(tsdb *db, int argc, char **argv)
         print_stats("rows");
         return 0;
     }
+    if (strcmp(mode, "twa") == 0)
+        return query_twa(db, id, start, end, grouped ? &g : NULL, interval, &tw, &q);
     tsdb_bucket *b;
     size_t nb;
     if (grouped)
