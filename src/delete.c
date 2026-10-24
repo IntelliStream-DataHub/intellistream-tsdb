@@ -5,9 +5,11 @@
  * every row acknowledged before the delete is in a part with a lower block
  * number, then the tombstone parts are committed through parts_commit (one
  * intent for several) and published under publish_lock. Which partitions get
- * one is decided under publish_lock too: those whose listed parts hold rows of
- * the series in the range. Block numbers are assigned under that lock, so a
- * part published later is newer than the delete and needs no tombstone.
+ * one: those whose listed parts hold rows of the series in the range, once
+ * before publish_lock (their tombstone parts are written and synced outside
+ * it, so writers do not wait for that) and again under it, for parts listed in
+ * between. Block numbers are assigned under that lock, so a part published
+ * later is newer than the delete and needs no tombstone.
  *
  * A replace commits its tombstone parts and the parts of its new rows as one
  * commit, the tombstone parts first: they get the lower block numbers, so the
@@ -52,6 +54,40 @@ static int tomb_part(eng *db, uint32_t series, int64_t partition, int64_t start,
     return pw_finish_pending(&w, 0, 0, 0, out);
 }
 
+/* The partitions, ascending, whose listed parts hold rows of the series in [start, end). */
+static int range_partitions(eng *db, uint32_t series, int64_t start, int64_t end, int64_t **out, size_t *n)
+{
+    *n = 0;
+    pthread_mutex_lock(&db->lock);
+    int64_t *ps = malloc((db->nparts ? db->nparts : 1) * sizeof *ps);
+    for (size_t i = 0; ps && i < db->nparts; i++) {
+        part *p = db->parts[i]; /* sorted by partition */
+        if (p->max_ts < start || p->min_ts >= end || (*n && ps[*n - 1] == p->partition))
+            continue;
+        if (part_has(p, series, start, end))
+            ps[(*n)++] = p->partition;
+    }
+    pthread_mutex_unlock(&db->lock);
+    *out = ps;
+    return ps ? 0 : TSDB_ERR_NOMEM;
+}
+
+static int add_tomb_part(eng *db, uint32_t series, int64_t partition, int64_t start, int64_t end, part_list *l)
+{
+    if (l->n == l->cap) {
+        part **x = realloc(l->p, (l->cap * 2 + 1) * sizeof *x);
+        if (!x)
+            return TSDB_ERR_NOMEM;
+        l->p = x;
+        l->cap = l->cap * 2 + 1;
+    }
+    part *t = NULL;
+    int rc = tomb_part(db, series, partition, start, end, &t);
+    if (rc == 0 && t)
+        l->p[l->n++] = t;
+    return rc;
+}
+
 int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
                       const void *v, size_t n)
 {
@@ -85,27 +121,35 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         return rc;
     }
 
-    pthread_mutex_lock(&db->publish_lock);
-    int64_t *parts_of = NULL;
-    size_t np = 0;
-    pthread_mutex_lock(&db->lock);
-    parts_of = malloc((db->nparts ? db->nparts : 1) * sizeof *parts_of);
-    for (size_t i = 0; parts_of && i < db->nparts; i++) {
-        part *p = db->parts[i]; /* sorted by partition */
-        if (p->max_ts < start || p->min_ts >= end || (np && parts_of[np - 1] == p->partition))
-            continue;
-        if (part_has(p, series, start, end))
-            parts_of[np++] = p->partition;
+    /* The tombstone parts are written before publish_lock, for the partitions listed now: writers and flushes
+     * are not held up while they are synced. Under the lock, a partition that got rows of the series since
+     * then (a part published in between is older than this delete) gets one more, written there: rare. */
+    int64_t *before = NULL, *now = NULL;
+    size_t nb = 0, nn = 0;
+    if ((rc = range_partitions(db, series, start, end, &before, &nb)) == 0) {
+        all.cap = nb + rows.n + 1;
+        if (!(all.p = malloc(all.cap * sizeof *all.p)))
+            rc = TSDB_ERR_NOMEM;
     }
-    pthread_mutex_unlock(&db->lock);
-    all.cap = np + rows.n + 1;
-    if (!parts_of || !(all.p = malloc(all.cap * sizeof *all.p)))
-        rc = TSDB_ERR_NOMEM;
-    for (size_t i = 0; rc == 0 && i < np; i++) {
-        part *t = NULL;
-        rc = tomb_part(db, series, parts_of[i], start, end, &t);
-        if (rc == 0 && t)
-            all.p[all.n++] = t;
+    for (size_t i = 0; rc == 0 && i < nb; i++)
+        rc = add_tomb_part(db, series, before[i], start, end, &all);
+    pthread_mutex_lock(&db->publish_lock);
+    if (rc == 0)
+        rc = range_partitions(db, series, start, end, &now, &nn);
+    for (size_t i = 0, j = 0; rc == 0 && i < nn; i++) { /* both sorted */
+        while (j < nb && before[j] < now[i])
+            j++;
+        if (j == nb || before[j] != now[i])
+            rc = add_tomb_part(db, series, now[i], start, end, &all);
+    }
+    if (rc == 0 && all.n + rows.n > all.cap) {
+        part **x = realloc(all.p, (all.n + rows.n) * sizeof *x);
+        if (x) {
+            all.p = x;
+            all.cap = all.n + rows.n;
+        } else {
+            rc = TSDB_ERR_NOMEM;
+        }
     }
     if (rc == 0) {
         for (size_t i = 0; i < rows.n; i++)
@@ -121,7 +165,8 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         pthread_mutex_unlock(&db->lock);
     }
     pthread_mutex_unlock(&db->publish_lock);
-    free(parts_of);
+    free(before);
+    free(now);
     if (rc == 0 && all.n) {
         manifest_publish(db); /* published: like an insert, whatever happens to MANIFEST (it fails the engine) */
     } else if (rc) {

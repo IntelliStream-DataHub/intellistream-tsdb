@@ -164,9 +164,11 @@ int tsdb_insert_series_values(tsdb *db, uint32_t series, const int64_t *ts, cons
  * acknowledged after the delete returned is visible, one acknowledged before
  * it started is gone. It returns once the delete is durable (fsync'd) and
  * visible; it is all or nothing across a crash. A delete costs about what a
- * large insert costs (it flushes the memtable and writes a small part per
- * partition that holds values of the series in the range); merges remove the
- * deleted rows for good later. start >= end deletes nothing.
+ * large insert costs: it flushes the memtable (of all series) and writes and
+ * syncs a small part per partition that holds values of the series in the
+ * range, without holding up other writers meanwhile; merges absorb those
+ * parts and remove the deleted rows for good later. Frequent small deletes
+ * thus mean frequent small flushes. start >= end deletes nothing.
  *
  * tsdb_replace_range deletes [start, end) of the series and inserts the n
  * given rows in its place, atomically: a reader, and a crash, sees either the
