@@ -102,11 +102,27 @@ stores how much each step differs from the one before. That is almost always
 the first one and then the changes: +1, 0, +2. Small changes need only a few
 bits each, instead of the 32 bits of a float.
 
-**Everything else.** When values do not follow fixed steps, tsdb compares each
-value's bits with the previous value's and stores only the bits that changed
-(the Gorilla and Chimp methods). Each block tries the methods and keeps the
-smallest result. Then a general-purpose compressor (zstd) goes over it, but
-only where that still makes it smaller.
+This part is our own implementation, built on ideas from ALP (Afroozeh, Kuffó
+and Boncz, SIGMOD 2024), the method DuckDB also uses for decimals:
+
+- tsdb looks at a small sample of each block to find the step size, instead of
+  trying every possibility on every reading;
+- the odd reading that does not fit the step (a glitch, a missing value) is
+  stored on the side as an exception, so it does not spoil the whole block;
+- the changes are packed in groups of 1,024 at a fixed number of bits each, so
+  unpacking them is a quick, simple loop.
+
+What we added for sensor data: steps that are powers of two as well as of ten
+(a 16-bit sensor's raw counts), storing the changes between neighbouring
+readings rather than the readings themselves, and choosing per block.
+
+**Everything else.** When values do not follow fixed steps, tsdb tries other
+methods: comparing each value's bits with the previous value's and storing only
+the bits that changed (the Gorilla and Chimp methods), or ALP's second method,
+which splits each value into its first bits, which repeat a lot and go into a
+small dictionary, and its last bits, which are stored as they are. Each block
+tries the methods and keeps the smallest result. Then a general-purpose
+compressor (zstd) goes over it, but only where that still makes it smaller.
 
 The result: a reading that takes 12 bytes raw takes about 1.2 bytes on disk.
 A slow temperature sensor needs less than 2 bits per value.
