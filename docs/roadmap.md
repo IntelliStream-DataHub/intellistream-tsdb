@@ -33,7 +33,13 @@ series store underneath; tsdb does not duplicate it.
 
 ## Next
 
-Nothing queued beyond the work in progress above.
+- The spread in the Rust, Python and Java clients: protocol 8 reaches only
+  the C client and the CLI so far.
+- Limits: raw, bucketed, bounds, calendar, time-weighted and spread queries
+  take an order and a limit everywhere (library, protocol, all four clients,
+  CLI `--limit`). Missing: a limit on QUERY_AGG (protocol 1) and on LTTB; and
+  bucketed queries aggregate the whole range before they cut to the limit,
+  so "the newest bucket" costs a full scan where raw queries stop early.
 
 ## After the first release
 
