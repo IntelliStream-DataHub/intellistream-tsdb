@@ -339,12 +339,16 @@ void *merge_thread_main(void *arg)
             manifest_publish(db);
         for (size_t i = 0; i < k; i++)
             part_unref(sel[i]);
-        if (rc != 0 && rc != TSDB_ERR_STOPPED) {
-            /* back off instead of retrying a failing merge in a tight loop */
-            struct timespec d = {1, 0};
-            nanosleep(&d, NULL);
-        }
         pthread_mutex_lock(&db->lock);
+        if (rc != 0 && rc != TSDB_ERR_STOPPED) {
+            /* back off instead of retrying a failing merge in a tight loop, but on the condition variable:
+             * close must not wait out the back-off (tsdbd closes right after a storage failure) */
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += 1;
+            while (!atomic_load(&db->stop) && pthread_cond_timedwait(&db->merge_cv, &db->lock, &until) == 0) {
+            }
+        }
     }
     pthread_mutex_unlock(&db->lock);
     return NULL;

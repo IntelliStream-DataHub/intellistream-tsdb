@@ -253,6 +253,15 @@ static int fired(void)
     return n;
 }
 
+/* whether the armed call has failed, leaving it armed */
+static bool fired_yet(void)
+{
+    pthread_mutex_lock(&f_lock);
+    bool yes = f_fired > 0;
+    pthread_mutex_unlock(&f_lock);
+    return yes;
+}
+
 /* ------------------------------------------------------------- helpers */
 
 static char dir[600];
@@ -877,6 +886,35 @@ static void test_merge(const char *base)
     printf("  failed merges, and a merge in flight when the engine fails\n");
 }
 
+/* A failed merge backs off for a second before it tries again. tsdbd closes the database right after a storage
+ * failure, often with a merge failed by it, and has to be gone within a second: close must not wait it out. */
+static void test_merge_backoff(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-backoff", base);
+    tsdb *db = two_parts(name);
+    tsdb_close(db);
+    tsdb_options o = opts();
+    o.merge_threads = 1;
+    o.merge_idle_s = 1; /* merges the two parts a second after they were written */
+    arm(F_FDATASYNC, "/tmp_", false, false); /* the merged part's data: the merge fails, the engine does not */
+    OK(tsdb_open(dir, &o, &db));
+    for (int i = 0; i < 2500 && !fired_yet(); i++)
+        sleep_ms(2);
+    CHECK(fired() == 1);
+    sleep_ms(50); /* into the back-off */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    tsdb_close(db);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    CHECK(ms < 300);
+    db = reopen(NULL);
+    CHECK(count_rows(db, "s") == 200);
+    tsdb_close(db);
+    printf("  close does not wait for a failed merge's back-off (%.0f ms)\n", ms);
+}
+
 /* A flush opens a new WAL segment; its name must be durable before rows go there. */
 static void test_wal_segment(const char *base)
 {
@@ -936,6 +974,7 @@ int main(int argc, char **argv)
     test_state_race(root);
     test_intent(root);
     test_merge(root);
+    test_merge_backoff(root);
     test_wal_segment(root);
     test_drop_before(root);
     if (!failures) {
