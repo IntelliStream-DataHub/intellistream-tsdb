@@ -19,15 +19,20 @@
  * that buffer is over OUT_CAP, so a slow client cannot make the server buffer
  * without bound.
  *
- *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--workers N]
+ *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--port-file FILE] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
- *         [--verify-checksums] [--metrics-port N [--metrics-bind ADDR]]
+ *         [--verify-checksums] [--metrics-port N|auto [--metrics-bind ADDR]]
  *
  * --metrics-port serves Prometheus metrics (GET /metrics) on a port of its own, from a
  * thread of its own: see metrics.c. Off by default; binds to --listen unless --metrics-bind.
  *
  * --verify-checksums checks each granule's checksum before a query decodes it
  * (off by default: meant for storage without checksums of its own).
+ *
+ * --port 0 binds a port the kernel chooses; --port-file FILE then holds "PORT PID" (written to a temporary file
+ * and renamed once the listener is up; an old FILE is removed at start), and the banner names the real port.
+ * Scripts and tests start servers this way and never compute a port, so two of them cannot collide.
+ * --metrics-port auto does the same for the metrics port, which the file then names as a third number.
  *
  * --follow serves queries from a directory another process writes (on this
  * host or another one, over NFS), following its parts and WAL as they change.
@@ -1600,8 +1605,10 @@ static void on_signal(int sig)
     }
 }
 
-static int listen_on(const char *addr, int port)
+/* Binds and listens; *port_p is updated to the port actually bound, which is the kernel's choice for port 0. */
+static int listen_on(const char *addr, int *port_p)
 {
+    int port = *port_p;
     int fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_in6 sa6 = {.sin6_family = AF_INET6, .sin6_port = htons((uint16_t)port)};
     struct sockaddr_in sa4 = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
@@ -1626,12 +1633,40 @@ static int listen_on(const char *addr, int port)
         close(fd);
         return -1;
     }
+    struct sockaddr_storage bound;
+    socklen_t bl = sizeof bound;
+    if (getsockname(fd, (struct sockaddr *)&bound, &bl) == 0)
+        *port_p = ntohs(bound.ss_family == AF_INET ? ((struct sockaddr_in *)&bound)->sin_port
+                                                   : ((struct sockaddr_in6 *)&bound)->sin6_port);
     return fd;
+}
+
+/* "PORT PID [METRICS_PORT]\n", written to a temporary file and renamed once the listener is up, so a reader sees
+ * all of it or none (a half-written pid would read as another server's, and the harness would refuse a good one). A stale file is removed at startup: whoever finds one now knows this server wrote it. */
+static int write_port_file(const char *path, int port, int mport)
+{
+    char tmp[4096];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid()) >= (int)sizeof tmp)
+        return -1;
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return -1;
+    int ok = fprintf(f, "%d %d", port, (int)getpid()) > 0;
+    if (mport)
+        ok = (fprintf(f, " %d", mport) > 0 && ok);
+    ok = (fputc('\n', f) != EOF && ok);
+    ok = (fflush(f) == 0 && ok);
+    ok = (fclose(f) == 0 && ok);
+    if (!ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
-    const char *dir = NULL, *addr = "127.0.0.1";
+    const char *dir = NULL, *addr = "127.0.0.1", *port_file = NULL;
     int port = TSDB_DEFAULT_PORT, nworkers = (int)sysconf(_SC_NPROCESSORS_ONLN);
     tsdb_options o;
     tsdb_options_init(&o);
@@ -1647,23 +1682,31 @@ int main(int argc, char **argv)
                                    {"verify-checksums", no_argument, 0, 'V'},
                                    {"metrics-port", required_argument, 0, 'M'},
                                    {"metrics-bind", required_argument, 0, 'b'},
+                                   {"port-file", required_argument, 0, 'Q'},
                                    {0, 0, 0, 0}};
-    int ch, metrics_port = 0;
+    int ch, metrics_port = 0, metrics_on = 0;
     const char *metrics_addr = NULL;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
         case 'd': dir = optarg; break;
         case 'l': addr = optarg; break;
-        case 'p': port = atoi(optarg); break;
+        case 'p': port = atoi(optarg); break; /* 0: any free port, told by --port-file and the banner */
+        case 'Q': port_file = optarg; break;
         case 'w': nworkers = atoi(optarg); break;
         case 's': o.wal_sync_ms = atoi(optarg); break;
         case 'F': o.fsync = 0; break;
         case 'V': o.verify_checksums = 1; break;
         case 'M': {
+            if (!strcmp(optarg, "auto")) { /* a port the kernel chooses; the port file names it */
+                metrics_on = 1;
+                metrics_port = 0;
+                break;
+            }
             char *end;
             long mp = strtol(optarg, &end, 10);
             if (!*optarg || *end || mp < 1 || mp > 65535)
                 goto usage;
+            metrics_on = 1;
             metrics_port = (int)mp;
             break;
         }
@@ -1689,15 +1732,18 @@ int main(int argc, char **argv)
         }
     }
     if (!dir || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
-        (metrics_addr && !metrics_port)) {
+        (metrics_addr && !metrics_on)) {
     usage:
-        fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d] [--workers N] [--wal-sync-ms MS]\n"
+        fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
+                        "             [--wal-sync-ms MS]\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
                         "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"
-                        "             [--metrics-port N [--metrics-bind ADDR]]\n",
+                        "             [--metrics-port N|auto [--metrics-bind ADDR]]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
+    if (port_file)
+        unlink(port_file);
     int rc = tsdb_open(dir, &o, &db);
     if (rc) {
         fprintf(stderr, "tsdbd: %s: %s\n", dir, tsdb_strerror(rc));
@@ -1713,13 +1759,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: descriptor limit %llu: at most %zu connections\n", (unsigned long long)rl.rlim_cur,
                 max_conns);
     }
-    int lfd = listen_on(addr, port);
+    int lfd = listen_on(addr, &port);
     if (lfd < 0)
         return 1;
     int mfd = -1;
-    if (metrics_port)
+    if (metrics_on)
         metrics_enable(); /* before any connection: the hooks count from the start */
-    if (metrics_port && (mfd = listen_on(metrics_addr ? metrics_addr : addr, metrics_port)) < 0)
+    if (metrics_on && (mfd = listen_on(metrics_addr ? metrics_addr : addr, &metrics_port)) < 0)
         return 1;
     wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 #ifdef TSDBD_NO_URING
@@ -1786,6 +1832,10 @@ int main(int argc, char **argv)
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
             max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll");
+    if (port_file && write_port_file(port_file, port, metrics_on ? metrics_port : 0) != 0) { /* last: whoever reads it finds a server that serves */
+        fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
+        return 1;
+    }
 #ifndef TSDBD_NO_URING
     if (io == IO_URING)
         uring_loop();

@@ -41,6 +41,14 @@ signal a process only through a helper that refuses pid 0 and -1: `kill(-1, sig)
 reaches every process of the user, the terminal included, and a server that
 failed to start is exactly when a test holds such a pid.
 
+Ports: no harness picks one. Several worktrees test at once, and a port computed from the pid or found free and
+released again can be taken by another run's tsdbd, whose clients then answer yours (jepsen once reported 192 million
+"lost writes" that way). Start tsdbd with `--port 0 --port-file FILE` and read "PORT PID" from FILE, which tsdbd writes
+(atomically, once it serves; a third number is the metrics port of `--metrics-port auto`). Check that the pid is the child you started (`tests/harness.h` also checks that the child
+holds the port), and fail if the server exited or the file names someone else. A restart gets a new port; clients
+reconnect to the one in the new file. `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
+`tests/integration/run.py` has `Server`, and the client test helpers under `client/*/tests` do the same in their language.
+
 Every bug fix comes with a regression test that fails without the fix (check
 by building the old code). Query timings go on a quiet machine: no builds or
 tests alongside them, and ClickHouse in its own container competes per

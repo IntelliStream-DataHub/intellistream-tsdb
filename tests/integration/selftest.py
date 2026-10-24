@@ -5,6 +5,8 @@ failure into a pass.
   selftest.py
 
   uring probe   a broken io_uring backend must FAIL the run; only tsdbd's own "io_uring is not offered" is a skip
+  ports         a server never gets a computed port: two at once differ, a port file naming another pid is refused,
+                a server that cannot start is an error
   signals       SIGTERM while the main thread holds the process-list lock must not deadlock the driver
   verdicts      mutate.py counts a crashed driver or a hang as a problem, never as a caught bug
   float sums    a float sum whose NaN-ness depends on the order of additions is neither compared between layouts
@@ -68,6 +70,63 @@ def test_uring_probe():
         b = fake_bin(tmp, "exit 3")
         rc, out = run_py(b, tmp)
         check(rc != 0 and "uring SKIPPED" not in out, "a uring server that exits silently: the run FAILS (rc %d)" % rc)
+
+
+def test_ports():
+    print("ports")
+    code = textwrap.dedent("""
+        import sys, tempfile, types
+        from pathlib import Path
+        sys.path.insert(0, %r)
+        import run
+        tmp = Path(tempfile.mkdtemp(prefix="integ-ports-"))
+        ctx = types.SimpleNamespace(tsdbd=%r)
+        a = run.Server(ctx, tmp / "a", tmp / "a.log", "epoll").start()
+        b = run.Server(ctx, tmp / "b", tmp / "b.log", "epoll").start()
+        try:
+            print("ports", a.port != b.port, a.port > 0 and b.port > 0)
+            print("owned", run.owns_port(a.proc.pid, a.port), run.owns_port(a.proc.pid, b.port))
+        finally:
+            a.stop()
+            b.stop()
+        # a directory below a regular file: tsdbd cannot open it and exits; start() must say so
+        (tmp / "f").write_text("x")
+        try:
+            run.Server(ctx, tmp / "f" / "db", tmp / "c.log", "epoll").start()
+            print("bad dir", "accepted")
+        except RuntimeError as e:
+            print("bad dir", "refused", "exited" in str(e))
+        """) % (str(HERE), str(ROOT / "build/tsdbd"))
+    p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120)
+    check("ports True True" in p.stdout, "two servers started at once listen on different, kernel-chosen ports")
+    check("owned True False" in p.stdout, "the harness sees which process holds a port")
+    check("bad dir refused True" in p.stdout, "a server that cannot start is an error that names the exit (%s)" % p.stderr[-200:])
+    # a server that writes a port file naming another pid (a stale file, or someone else's server) is refused
+    with tempfile.TemporaryDirectory(prefix="integ-self-") as tmp:
+        sh = Path(tmp) / "tsdbd"
+        sh.write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --port-file ] && f=$2; shift; done\n'
+                      'echo "9 $PPID" > "$f"\nsleep 30\n')  # the parent's pid, not this process's
+        sh.chmod(sh.stat().st_mode | stat.S_IXUSR)
+        code = textwrap.dedent("""
+            import sys, types
+            from pathlib import Path
+            sys.path.insert(0, %r)
+            import run
+            ctx = types.SimpleNamespace(tsdbd=%r)
+            try:
+                run.Server(ctx, Path(%r) / "db", Path(%r) / "x.log", "epoll").start()
+                print("result accepted")
+            except RuntimeError as e:
+                print("result refused", "names pid" in str(e))
+            """) % (str(HERE), str(sh), tmp, tmp)
+        p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120)
+        check("result refused True" in p.stdout, "a port file naming another pid is refused (%s)" % (p.stdout + p.stderr)[-200:])
+        # the right pid but a port it does not hold (someone else's server): refused by the /proc ownership check
+        sh.write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --port-file ] && f=$2; shift; done\n'
+                      'echo "9 $$" > "$f"\nsleep 30\n')
+        code = code.replace('"names pid" in str(e)', '"not held" in str(e)')
+        p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120)
+        check("result refused True" in p.stdout, "a port its server does not hold is refused (%s)" % (p.stdout + p.stderr)[-200:])
 
 
 def test_signal_while_locked():
@@ -180,6 +239,7 @@ def main():
         return 2
     test_verdicts()
     test_float_sums()
+    test_ports()
     test_signal_while_locked()
     test_signal_during_spawn()
     test_uring_probe()

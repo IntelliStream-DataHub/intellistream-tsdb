@@ -59,22 +59,31 @@ mkdir -p "$CONN/target/it-classes"
 javac -nowarn -cp "$(cat "$CONN/target/it-cp.txt")" -d "$CONN/target/it-classes" "$HERE/IntegrationDriver.java"
 driver() { java -cp "$CONN/target/it-classes:$(cat "$CONN/target/it-cp.txt")" IntegrationDriver "$@"; }
 
-BP=$(free_port); WP=$(free_port); TP=$(free_port)
+BP=$(free_port); WP=$(free_port) # Pulsar's ports; tsdbd's port comes from tsdbd itself
+TP=
 URL=pulsar://127.0.0.1:$BP
 
+# tsdbd picks its port (--port 0) and says which in a port file. The sink needs a stable port across the kill and
+# restart below, so a restart asks for the same one (TP) and fails loudly if it cannot have it. In that gap the port
+# is free, so the final "verify" also reads the data back from our own server.
 start_tsdbd() {
-    for _ in $(seq 50); do
-        "$ROOT/build/tsdbd" --dir "$W/data" --listen 127.0.0.1 --port "$TP" --workers 2 >> "$W/tsdbd.log" 2>&1 &
-        TSDBD_PID=$!
-        for _ in $(seq 100); do
-            kill -0 "$TSDBD_PID" 2>/dev/null || break
-            if tail -n 5 "$W/tsdbd.log" | grep -q "on 127.0.0.1:$TP,"; then log "tsdbd up (pid $TSDBD_PID)"; return; fi
-            sleep 0.05
-        done
-        wait "$TSDBD_PID" 2>/dev/null || true
-        sleep 0.2 # the port of a killed server can take a moment
+    local pf="$W/tsdbd.port" want=${TP:-0} port pid
+    rm -f "$pf"
+    "$ROOT/build/tsdbd" --dir "$W/data" --listen 127.0.0.1 --port "$want" --port-file "$pf" --workers 2 \
+        >> "$W/tsdbd.log" 2>&1 &
+    TSDBD_PID=$!
+    for _ in $(seq 600); do
+        kill -0 "$TSDBD_PID" 2>/dev/null || { wait "$TSDBD_PID" 2>/dev/null || true; die "tsdbd did not start (port $want), see $W/tsdbd.log"; }
+        if [ -s "$pf" ] && read -r port pid _ < "$pf" && [ -n "$pid" ]; then
+            [ "$pid" = "$TSDBD_PID" ] || die "$pf names pid $pid, but we started $TSDBD_PID"
+            [ -z "${TP:-}" ] || [ "$port" = "$TP" ] || die "tsdbd restarted on port $port, not $TP"
+            TP=$port
+            log "tsdbd up (pid $TSDBD_PID, port $TP)"
+            return
+        fi
+        sleep 0.05
     done
-    die "tsdbd did not start on $TP"
+    die "tsdbd wrote no port file"
 }
 stop_tsdbd() { # $1: KILL or TERM
     signal "$1" "$TSDBD_PID"
