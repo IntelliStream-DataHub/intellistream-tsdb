@@ -254,10 +254,13 @@ $(B)/jepsen: tests/jepsen/jepsen.c $(CLIB)
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.
 JEPSEN_DIR ?= /tmp/tsdb-jepsen
+JEPSEN_SEEDS ?= 1 2 3
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20 && \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so && \
+	    for seed in $(JEPSEN_SEEDS); do \
+	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --seed $$seed \
+	            --crashfs $(B)/libcrashfs.so || exit 1; done && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis eio   --seconds 20 --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10 || exit 1; done
 

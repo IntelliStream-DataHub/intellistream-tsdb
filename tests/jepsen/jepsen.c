@@ -13,7 +13,9 @@
  * paths and many of them span several partitions (parts).
  *
  * Nemeses: kill (SIGKILL the server), power (the crashfs shim rolls the
- * directory back to what was fsync'd, then the server dies), pause
+ * directory back to what was fsync'd, then the server dies; every other
+ * server with CRASHFS_TEAR, which keeps torn tails, old-or-new sectors and a
+ * random subset of unsynced directory operations), pause
  * (SIGSTOP/SIGCONT), eio (the crashfs shim fails one write or sync with EIO
  * and from then on lies about that file's syncs, as Linux may after a failed
  * writeback; at exit it rolls back what was not made durable). After an EIO
@@ -133,6 +135,8 @@ static void start_server(bool faulty)
             setenv("CRASHFS_SEED", sd, 1);
             setenv("CRASHFS_PROB", "0.0005", 1);
             setenv("CRASHFS_WARMUP", "200", 1);
+            if (!strcmp(nemesis, "power") && restarts % 2 == 1)
+                setenv("CRASHFS_TEAR", "1", 1); /* every other server: keep what a real disk may keep */
             if (!strcmp(nemesis, "eio")) {
                 setenv("CRASHFS_MODE", "eio", 1);
                 setenv("CRASHFS_MARK", markpath, 1);
