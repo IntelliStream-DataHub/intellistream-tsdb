@@ -996,6 +996,18 @@ squares in a second pass (one 32-bit multiply per value when every known value
 of the run fits in 32 bits, three otherwise). The scalar loops in `values.c` are the
 reference, and the code for CPUs without AVX2.
 
+A granule's time-weighted areas (`tw_step`, `tw_lin`, written with the
+granule) are float sums too: segment s (from reading s to s + 1) adds to lane
+s % 16 of the float64 scheme, a segment that does not count adds +0.0, and the
+lanes are halved the same way. The milliseconds and the longest gap are
+integers. LTTB's scan for the largest triangle computes each point's area with
+the same expression in every kernel (timestamps and int64 values converted to
+double rounded once, as the scalar conversion does); each lane keeps its first
+largest area and the lanes are then combined by area and lowest index, so the
+pick is always the first point with the largest area, and a NaN never wins.
+The areas were summed one segment after the other before; like the float64
+sums, they may differ from those in the last bits once.
+
 Before these kernels, float64 and float32 with nulls were summed one value
 after the other; their sums and spreads may now differ from those in the last
 bits (there has been no release, so stored granule statistics were not

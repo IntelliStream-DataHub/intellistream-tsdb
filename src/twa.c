@@ -90,36 +90,17 @@ void granule_twa(int type, const int64_t *ts, const void *vv, size_t n, granule 
     g->tw_flags = GT_FIRST_NULL | GT_LAST_NULL;
     if (n == 0 || type == TSDB_STATE)
         return;
-    bool okp = slot_ok(type, v);
-    double vp = okp ? slot_val(type, v) : 0;
-    double step = 0, lin = 0;
-    uint64_t sms = 0, lms = 0, gap = 0;
-    g->tw_first = vp;
-    g->tw_flags = okp ? 0 : GT_FIRST_NULL;
-    for (size_t i = 1; i < n; i++) {
-        uint64_t dt = (uint64_t)ts[i] - (uint64_t)ts[i - 1];
-        gap = dt > gap ? dt : gap;
-        bool ok = slot_ok(type, v + i * w);
-        double x = ok ? slot_val(type, v + i * w) : 0;
-        /* the same expressions as seg() below for a segment inside one bucket */
-        if (okp) {
-            step += vp * (double)dt;
-            sms += dt;
-            if (ok) {
-                lin += (vp + x) * 0.5 * (double)dt;
-                lms += dt;
-            }
-        }
-        vp = x;
-        okp = ok;
-    }
-    g->tw_last = vp;
-    if (!okp)
-        g->tw_flags |= GT_LAST_NULL;
-    g->tw_step = step;
-    g->tw_lin = lin;
-    g->tw_step_ms = sms;
-    g->tw_lin_ms = lms;
+    bool ok0 = slot_ok(type, v), okl = slot_ok(type, v + (n - 1) * w);
+    twa_sums o;
+    simd_twa(type, ts, v, n, &o); /* the same expressions as seg() below for a segment inside one bucket */
+    g->tw_first = ok0 ? slot_val(type, v) : 0;
+    g->tw_flags = (ok0 ? 0 : GT_FIRST_NULL) | (okl ? 0 : GT_LAST_NULL);
+    g->tw_last = okl ? slot_val(type, v + (n - 1) * w) : 0;
+    g->tw_step = o.step;
+    g->tw_lin = o.lin;
+    g->tw_step_ms = o.sms;
+    g->tw_lin_ms = o.lms;
+    uint64_t gap = o.gap;
     g->tw_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
 }
 

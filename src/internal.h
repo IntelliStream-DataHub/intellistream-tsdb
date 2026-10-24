@@ -468,6 +468,12 @@ _Static_assert(sizeof(granule) == 160, "granule must be 160 bytes");
 enum { GT_FIRST_NULL = 1, GT_LAST_NULL = 2 };
 /* The time-weighted statistics of a granule's rows (n >= 1, ts strictly increasing). */
 void granule_twa(int type, const int64_t *ts, const void *v, size_t n, struct granule *g);
+/* granule_twa's sums over the n - 1 segments (simd.c: one order of the areas on every CPU) */
+typedef struct twa_sums {
+    double step, lin;
+    uint64_t sms, lms, gap;
+} twa_sums;
+extern void (*simd_twa)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o);
 
 typedef struct part_header {
     char magic[8];

@@ -7,7 +7,9 @@
  * spread's deviations (floats) or squares (integers). float32 and float64 have
  * a scalar kernel that shares the vector kernels' order (below); int64, bool
  * and state codes are exact, so their scalar reference is values.c's loop and
- * the vector kernels may add in any order (further down).
+ * the vector kernels may add in any order (further down). Further: a
+ * granule's time-weighted areas (float64 lanes by segment) and LTTB's argmax
+ * (the first largest area), each identical on every path as well.
  *
  * min/max follow MINPS/MAXPS semantics with the accumulator as the second
  * operand, so NaN inputs are ignored; NaN still propagates into the sum.
@@ -1068,6 +1070,287 @@ __attribute__((target("avx512f,avx512dq"))) static void fold_u32_avx512(const ui
 }
 #endif
 
+/* ----------------------------------------------------------------- TWA */
+
+/*
+ * A granule's step and linear areas (granule_twa, stored with the granule):
+ * segment s runs from point s to point s + 1 and adds its areas to lane
+ * s % L64, the float64 lanes; a segment that does not count (the reading at
+ * its start, or for the linear area at either end, is null) adds +0.0, so
+ * the order stays by position. Reduced by halving like the sums. The
+ * products are those of seg() in twa.c: v * dt and (v + x) * 0.5 * dt, with
+ * dt converted to double rounded once (the vector paths build it from two
+ * exact halves added once), int64 values likewise. The scalar code keeps the
+ * same lanes; the milliseconds and the longest gap are integers.
+ */
+static inline double twa_y(int type, const void *v, size_t i, bool *ok)
+{
+    switch (type) {
+    case TSDB_FLOAT32: {
+        uint32_t u;
+        float f;
+        memcpy(&u, (const uint8_t *)v + 4 * i, 4);
+        memcpy(&f, &u, 4);
+        *ok = u != NULL_F32;
+        return f;
+    }
+    case TSDB_FLOAT64: {
+        uint64_t u;
+        double d;
+        memcpy(&u, (const uint8_t *)v + 8 * i, 8);
+        memcpy(&d, &u, 8);
+        *ok = u != NULL_F64;
+        return d;
+    }
+    case TSDB_INT64: {
+        int64_t x;
+        memcpy(&x, (const uint8_t *)v + 8 * i, 8);
+        *ok = x != NULL_I64;
+        return (double)x;
+    }
+    default: {
+        uint32_t u;
+        memcpy(&u, (const uint8_t *)v + 4 * i, 4);
+        *ok = u != NULL_BOOL;
+        return (double)u;
+    }
+    }
+}
+
+/* segments [s, n - 1) one at a time into the lanes, then the reduction */
+static void twa_tail(int type, const int64_t *ts, const void *v, size_t s, size_t n, double *st, double *li,
+                     twa_sums *o)
+{
+    bool okp;
+    double vp = twa_y(type, v, s, &okp);
+    for (size_t i = s + 1; i < n; i++) {
+        uint64_t dt = (uint64_t)ts[i] - (uint64_t)ts[i - 1];
+        o->gap = dt > o->gap ? dt : o->gap;
+        bool ok;
+        double x = twa_y(type, v, i, &ok), d = (double)dt;
+        size_t j = (i - 1) % L64;
+        st[j] += okp ? vp * d : 0.0;
+        li[j] += okp && ok ? (vp + x) * 0.5 * d : 0.0;
+        o->sms += okp ? dt : 0;
+        o->lms += okp && ok ? dt : 0;
+        vp = x;
+        okp = ok;
+    }
+    o->step = canon_nan(lanes_reduce(st, L64));
+    o->lin = canon_nan(lanes_reduce(li, L64));
+}
+
+/* whole groups of L64 segments with the lane as a constant (the compiler keeps the lanes in registers and
+ * may vectorize them; it cannot reorder the additions), then the tail */
+INL void twa_scalar_impl(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    double st[L64] = {0}, li[L64] = {0};
+    uint64_t sms = 0, lms = 0, gap = 0;
+    size_t s = 0;
+    for (; s + L64 + 1 <= n; s += L64)
+        for (size_t j = 0; j < L64; j++) {
+            size_t i = s + j + 1;
+            uint64_t dt = (uint64_t)ts[i] - (uint64_t)ts[i - 1];
+            gap = dt > gap ? dt : gap;
+            bool okp, ok;
+            double vp = twa_y(type, v, i - 1, &okp), x = twa_y(type, v, i, &ok), d = (double)dt;
+            st[j] += okp ? vp * d : 0.0;
+            li[j] += okp && ok ? (vp + x) * 0.5 * d : 0.0;
+            sms += okp ? dt : 0;
+            lms += okp && ok ? dt : 0;
+        }
+    *o = (twa_sums){.sms = sms, .lms = lms, .gap = gap};
+    twa_tail(type, ts, v, s, n, st, li, o);
+}
+
+static void twa_scalar(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    switch (type) {
+    case TSDB_FLOAT32: twa_scalar_impl(TSDB_FLOAT32, ts, v, n, o); break;
+    case TSDB_FLOAT64: twa_scalar_impl(TSDB_FLOAT64, ts, v, n, o); break;
+    case TSDB_INT64: twa_scalar_impl(TSDB_INT64, ts, v, n, o); break;
+    default: twa_scalar_impl(TSDB_BOOL, ts, v, n, o); break;
+    }
+}
+
+#ifdef TSDB_X86
+/* (double) of unsigned and signed 64-bit lanes, rounded once as the scalar conversion: the high half scaled by
+ * 2^32 minus a constant is exact, and adding the low half rounds */
+K_AVX2 __m256d u64_pd_avx2(__m256i x)
+{
+    __m256i lo = _mm256_blend_epi32(x, _mm256_castpd_si256(_mm256_set1_pd(0x1p52)), 0xaa);
+    __m256i hi = _mm256_or_si256(_mm256_srli_epi64(x, 32), _mm256_castpd_si256(_mm256_set1_pd(0x1p84)));
+    __m256d h = _mm256_sub_pd(_mm256_castsi256_pd(hi), _mm256_set1_pd(0x1p84 + 0x1p52));
+    return _mm256_add_pd(h, _mm256_castsi256_pd(lo));
+}
+
+K_AVX2 __m256d i64_pd_avx2(__m256i x)
+{
+    x = _mm256_xor_si256(x, _mm256_set1_epi64x(INT64_MIN)); /* x + 2^63, unsigned */
+    __m256i lo = _mm256_blend_epi32(x, _mm256_castpd_si256(_mm256_set1_pd(0x1p52)), 0xaa);
+    __m256i hi = _mm256_or_si256(_mm256_srli_epi64(x, 32), _mm256_castpd_si256(_mm256_set1_pd(0x1p84)));
+    __m256d h = _mm256_sub_pd(_mm256_castsi256_pd(hi), _mm256_set1_pd(0x1p84 + 0x1p63 + 0x1p52));
+    return _mm256_add_pd(h, _mm256_castsi256_pd(lo));
+}
+
+/* points p .. p + 3 of a granule's slots as doubles, and which are not null (all ones) */
+K_AVX2 __m256d twa_ld_avx2(int type, const void *v, size_t p, __m256i *ok)
+{
+    const __m256i ones = _mm256_set1_epi64x(-1);
+    switch (type) {
+    case TSDB_FLOAT32: {
+        __m128i b = _mm_loadu_si128((const __m128i *)((const uint32_t *)v + p));
+        *ok = _mm256_xor_si256(_mm256_cvtepi32_epi64(_mm_cmpeq_epi32(b, _mm_set1_epi32((int)NULL_F32))), ones);
+        return _mm256_cvtps_pd(_mm_castsi128_ps(b));
+    }
+    case TSDB_FLOAT64: {
+        __m256i b = _mm256_loadu_si256((const __m256i *)((const uint64_t *)v + p));
+        *ok = _mm256_xor_si256(_mm256_cmpeq_epi64(b, _mm256_set1_epi64x((long long)NULL_F64)), ones);
+        return _mm256_castsi256_pd(b);
+    }
+    case TSDB_INT64: {
+        __m256i b = _mm256_loadu_si256((const __m256i *)((const int64_t *)v + p));
+        *ok = _mm256_xor_si256(_mm256_cmpeq_epi64(b, _mm256_set1_epi64x(NULL_I64)), ones);
+        return i64_pd_avx2(b);
+    }
+    default: {
+        __m256i b = _mm256_cvtepu32_epi64(_mm_loadu_si128((const __m128i *)((const uint32_t *)v + p)));
+        *ok = _mm256_xor_si256(_mm256_cmpeq_epi64(b, _mm256_set1_epi64x(NULL_BOOL)), ones);
+        return u64_pd_avx2(b);
+    }
+    }
+}
+
+K_AVX2 void twa_avx2_impl(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    const __m256i bias = _mm256_set1_epi64x(INT64_MIN);
+    const __m256d half = _mm256_set1_pd(0.5);
+    __m256d st[4], li[4];
+    __m256i sms = _mm256_setzero_si256(), lms = sms, gf = bias; /* the gap biased, for signed compares */
+    for (int q = 0; q < 4; q++)
+        st[q] = li[q] = _mm256_setzero_pd();
+    size_t s = 0;
+    for (; s + L64 + 1 <= n; s += L64) {
+        for (int q = 0; q < 4; q++) {
+            size_t p = s + 4 * (size_t)q;
+            __m256i dt = _mm256_sub_epi64(_mm256_loadu_si256((const __m256i *)(ts + p + 1)),
+                                          _mm256_loadu_si256((const __m256i *)(ts + p)));
+            __m256i db = _mm256_xor_si256(dt, bias), okp, ok;
+            gf = _mm256_blendv_epi8(gf, db, _mm256_cmpgt_epi64(db, gf));
+            __m256d vp = twa_ld_avx2(type, v, p, &okp), x = twa_ld_avx2(type, v, p + 1, &ok), d = u64_pd_avx2(dt);
+            __m256i both = _mm256_and_si256(okp, ok);
+            st[q] = _mm256_add_pd(st[q], _mm256_and_pd(_mm256_castsi256_pd(okp), _mm256_mul_pd(vp, d)));
+            li[q] = _mm256_add_pd(li[q], _mm256_and_pd(_mm256_castsi256_pd(both),
+                                                       _mm256_mul_pd(_mm256_mul_pd(_mm256_add_pd(vp, x), half), d)));
+            sms = _mm256_add_epi64(sms, _mm256_and_si256(okp, dt));
+            lms = _mm256_add_epi64(lms, _mm256_and_si256(both, dt));
+        }
+    }
+    double sl[L64], ll[L64];
+    uint64_t a[4], b[4], g[4];
+    for (int q = 0; q < 4; q++) {
+        _mm256_storeu_pd(sl + 4 * q, st[q]);
+        _mm256_storeu_pd(ll + 4 * q, li[q]);
+    }
+    _mm256_storeu_si256((__m256i *)a, sms);
+    _mm256_storeu_si256((__m256i *)b, lms);
+    _mm256_storeu_si256((__m256i *)g, _mm256_xor_si256(gf, bias));
+    *o = (twa_sums){0};
+    for (int j = 0; j < 4; j++) {
+        o->sms += a[j];
+        o->lms += b[j];
+        o->gap = g[j] > o->gap ? g[j] : o->gap;
+    }
+    twa_tail(type, ts, v, s, n, sl, ll, o);
+}
+
+__attribute__((target("avx2"))) static void twa_avx2(int type, const int64_t *ts, const void *v, size_t n,
+                                                    twa_sums *o)
+{
+    switch (type) {
+    case TSDB_FLOAT32: twa_avx2_impl(TSDB_FLOAT32, ts, v, n, o); break;
+    case TSDB_FLOAT64: twa_avx2_impl(TSDB_FLOAT64, ts, v, n, o); break;
+    case TSDB_INT64: twa_avx2_impl(TSDB_INT64, ts, v, n, o); break;
+    default: twa_avx2_impl(TSDB_BOOL, ts, v, n, o); break;
+    }
+}
+
+K_AVX512 __m512d twa_ld_avx512(int type, const void *v, size_t p, __mmask8 *ok)
+{
+    switch (type) {
+    case TSDB_FLOAT32: {
+        __m256i b = _mm256_loadu_si256((const __m256i *)((const uint32_t *)v + p));
+        *ok = _mm512_cmpneq_epi64_mask(_mm512_cvtepu32_epi64(b), _mm512_set1_epi64(NULL_F32));
+        return _mm512_cvtps_pd(_mm256_castsi256_ps(b));
+    }
+    case TSDB_FLOAT64: {
+        __m512i b = _mm512_loadu_si512((const uint64_t *)v + p);
+        *ok = _mm512_cmpneq_epi64_mask(b, _mm512_set1_epi64((long long)NULL_F64));
+        return _mm512_castsi512_pd(b);
+    }
+    case TSDB_INT64: {
+        __m512i b = _mm512_loadu_si512((const int64_t *)v + p);
+        *ok = _mm512_cmpneq_epi64_mask(b, _mm512_set1_epi64(NULL_I64));
+        return _mm512_cvtepi64_pd(b);
+    }
+    default: {
+        __m512i b = _mm512_cvtepu32_epi64(_mm256_loadu_si256((const __m256i *)((const uint32_t *)v + p)));
+        *ok = _mm512_cmpneq_epi64_mask(b, _mm512_set1_epi64(NULL_BOOL));
+        return _mm512_cvtepu64_pd(b);
+    }
+    }
+}
+
+K_AVX512 void twa_avx512_impl(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    const __m512d half = _mm512_set1_pd(0.5);
+    __m512d st[2], li[2];
+    __m512i sms = _mm512_setzero_si512(), lms = sms, gap = sms;
+    for (int q = 0; q < 2; q++)
+        st[q] = li[q] = _mm512_setzero_pd();
+    size_t s = 0;
+    for (; s + L64 + 1 <= n; s += L64) {
+        for (int q = 0; q < 2; q++) {
+            size_t p = s + 8 * (size_t)q;
+            __m512i dt = _mm512_sub_epi64(_mm512_loadu_si512(ts + p + 1), _mm512_loadu_si512(ts + p));
+            __mmask8 okp, ok;
+            gap = _mm512_max_epu64(gap, dt);
+            __m512d vp = twa_ld_avx512(type, v, p, &okp), x = twa_ld_avx512(type, v, p + 1, &ok);
+            __m512d d = _mm512_cvtepu64_pd(dt);
+            __mmask8 both = okp & ok;
+            st[q] = _mm512_add_pd(st[q], _mm512_maskz_mov_pd(okp, _mm512_mul_pd(vp, d)));
+            li[q] = _mm512_add_pd(li[q],
+                                  _mm512_maskz_mov_pd(both, _mm512_mul_pd(_mm512_mul_pd(_mm512_add_pd(vp, x), half), d)));
+            sms = _mm512_mask_add_epi64(sms, okp, sms, dt);
+            lms = _mm512_mask_add_epi64(lms, both, lms, dt);
+        }
+    }
+    double sl[L64], ll[L64];
+    for (int q = 0; q < 2; q++) {
+        _mm512_storeu_pd(sl + 8 * q, st[q]);
+        _mm512_storeu_pd(ll + 8 * q, li[q]);
+    }
+    *o = (twa_sums){0};
+    o->sms = (uint64_t)_mm512_reduce_add_epi64(sms);
+    o->lms = (uint64_t)_mm512_reduce_add_epi64(lms);
+    o->gap = (uint64_t)_mm512_reduce_max_epu64(gap);
+    twa_tail(type, ts, v, s, n, sl, ll, o);
+}
+
+__attribute__((target("avx512f,avx512dq"))) static void twa_avx512(int type, const int64_t *ts, const void *v,
+                                                                   size_t n, twa_sums *o)
+{
+    switch (type) {
+    case TSDB_FLOAT32: twa_avx512_impl(TSDB_FLOAT32, ts, v, n, o); break;
+    case TSDB_FLOAT64: twa_avx512_impl(TSDB_FLOAT64, ts, v, n, o); break;
+    case TSDB_INT64: twa_avx512_impl(TSDB_INT64, ts, v, n, o); break;
+    default: twa_avx512_impl(TSDB_BOOL, ts, v, n, o); break;
+    }
+}
+#endif
+
+void (*simd_twa)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o) = twa_scalar;
+
 /* ---------------------------------------------------------------- LTTB */
 
 /* a point's value as LTTB takes it (query.c, lttb_value) */
@@ -1105,6 +1388,164 @@ static size_t lttb_scalar(int type, const int64_t *ts, const uint64_t *v, size_t
     }
     return k;
 }
+
+#ifdef TSDB_X86
+/* LTTB in vectors: the same expression per point (x and y converted rounded once, as lttb_y), each lane keeps
+ * its first largest area (NaN never compares greater); then the largest over the lanes, the lowest index on
+ * equal areas, and the rest one at a time, so the pick is the scalar loop's */
+K_AVX2 __m256d lttb_y_avx2(int type, __m256i x)
+{
+    switch (type) {
+    case TSDB_FLOAT32:
+        return _mm256_cvtps_pd(_mm_castsi128_ps(
+            _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(x, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6)))));
+    case TSDB_FLOAT64: return _mm256_castsi256_pd(x);
+    case TSDB_INT64: return i64_pd_avx2(x);
+    default: return u64_pd_avx2(x);
+    }
+}
+
+K_AVX2 size_t lttb_avx2_impl(int type, const int64_t *ts, const uint64_t *v, size_t n, int64_t t0, double ax,
+                             double ay, double cx, double cy)
+{
+    const __m256d kx = _mm256_set1_pd(ax - cx), ky = _mm256_set1_pd(cy - ay), vax = _mm256_set1_pd(ax),
+                  vay = _mm256_set1_pd(ay), half = _mm256_set1_pd(0.5), sign = _mm256_set1_pd(-0.0);
+    const __m256i vt0 = _mm256_set1_epi64x(t0), four = _mm256_set1_epi64x(4);
+    __m256d b0 = _mm256_set1_pd(-1), b1 = b0;
+    __m256i k0 = _mm256_setr_epi64x(0, 1, 2, 3), k1 = _mm256_setr_epi64x(4, 5, 6, 7), i0 = k0, i1 = k1;
+#define AREA(j)                                                                                                    \
+    _mm256_mul_pd(                                                                                                 \
+        _mm256_andnot_pd(sign, _mm256_sub_pd(                                                                      \
+                                   _mm256_mul_pd(kx, _mm256_sub_pd(lttb_y_avx2(type, _mm256_loadu_si256(           \
+                                                                                     (const __m256i *)(v + (j)))), \
+                                                                   vay)),                                          \
+                                   _mm256_mul_pd(_mm256_sub_pd(vax, u64_pd_avx2(_mm256_sub_epi64(                  \
+                                                                        _mm256_loadu_si256(                        \
+                                                                            (const __m256i *)(ts + (j))),          \
+                                                                        vt0))),                                    \
+                                                 ky))),                                                            \
+        half)
+    size_t j = 0;
+    for (; j + 8 <= n; j += 8) {
+        __m256d a0 = AREA(j), a1 = AREA(j + 4);
+        __m256d g0 = _mm256_cmp_pd(a0, b0, _CMP_GT_OQ), g1 = _mm256_cmp_pd(a1, b1, _CMP_GT_OQ);
+        b0 = _mm256_blendv_pd(b0, a0, g0);
+        b1 = _mm256_blendv_pd(b1, a1, g1);
+        k0 = _mm256_blendv_epi8(k0, i0, _mm256_castpd_si256(g0));
+        k1 = _mm256_blendv_epi8(k1, i1, _mm256_castpd_si256(g1));
+        i0 = _mm256_add_epi64(i0, _mm256_add_epi64(four, four));
+        i1 = _mm256_add_epi64(i1, _mm256_add_epi64(four, four));
+    }
+#undef AREA
+    double bl[8];
+    uint64_t kl[8];
+    _mm256_storeu_pd(bl, b0);
+    _mm256_storeu_pd(bl + 4, b1);
+    _mm256_storeu_si256((__m256i *)kl, k0);
+    _mm256_storeu_si256((__m256i *)(kl + 4), k1);
+    double best = -1;
+    size_t k = 0;
+    for (int l = 0; l < 8; l++)
+        if (bl[l] > best || (bl[l] == best && bl[l] >= 0 && kl[l] < k)) {
+            best = bl[l];
+            k = kl[l];
+        }
+    for (; j < n; j++) {
+        double x = (double)((uint64_t)ts[j] - (uint64_t)t0), y = lttb_y(type, v[j]);
+        double a = fabs((ax - cx) * (y - ay) - (ax - x) * (cy - ay)) * 0.5;
+        if (a > best) {
+            best = a;
+            k = j;
+        }
+    }
+    return k;
+}
+
+__attribute__((target("avx2"))) static size_t lttb_avx2(int type, const int64_t *ts, const uint64_t *v, size_t n,
+                                                       int64_t t0, double ax, double ay, double cx, double cy)
+{
+    switch (type) {
+    case TSDB_FLOAT32: return lttb_avx2_impl(TSDB_FLOAT32, ts, v, n, t0, ax, ay, cx, cy);
+    case TSDB_FLOAT64: return lttb_avx2_impl(TSDB_FLOAT64, ts, v, n, t0, ax, ay, cx, cy);
+    case TSDB_INT64: return lttb_avx2_impl(TSDB_INT64, ts, v, n, t0, ax, ay, cx, cy);
+    default: return lttb_avx2_impl(TSDB_BOOL, ts, v, n, t0, ax, ay, cx, cy);
+    }
+}
+
+K_AVX512 __m512d lttb_y_avx512(int type, __m512i x)
+{
+    switch (type) {
+    case TSDB_FLOAT32: return _mm512_cvtps_pd(_mm256_castsi256_ps(_mm512_cvtepi64_epi32(x)));
+    case TSDB_FLOAT64: return _mm512_castsi512_pd(x);
+    case TSDB_INT64: return _mm512_cvtepi64_pd(x);
+    default: return _mm512_cvtepu64_pd(x);
+    }
+}
+
+K_AVX512 size_t lttb_avx512_impl(int type, const int64_t *ts, const uint64_t *v, size_t n, int64_t t0, double ax,
+                                 double ay, double cx, double cy)
+{
+    const __m512d kx = _mm512_set1_pd(ax - cx), ky = _mm512_set1_pd(cy - ay), vax = _mm512_set1_pd(ax),
+                  vay = _mm512_set1_pd(ay), half = _mm512_set1_pd(0.5);
+    const __m512i vt0 = _mm512_set1_epi64(t0), step = _mm512_set1_epi64(16);
+    __m512d b0 = _mm512_set1_pd(-1), b1 = b0;
+    __m512i k0 = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7), k1 = _mm512_add_epi64(k0, _mm512_set1_epi64(8));
+    __m512i i0 = k0, i1 = k1;
+#define AREA(j)                                                                                                    \
+    _mm512_mul_pd(_mm512_abs_pd(_mm512_sub_pd(                                                                     \
+                      _mm512_mul_pd(kx, _mm512_sub_pd(lttb_y_avx512(type, _mm512_loadu_si512(v + (j))), vay)),     \
+                      _mm512_mul_pd(_mm512_sub_pd(vax, _mm512_cvtepu64_pd(                                         \
+                                                           _mm512_sub_epi64(_mm512_loadu_si512(ts + (j)), vt0))),   \
+                                    ky))),                                                                         \
+                  half)
+    size_t j = 0;
+    for (; j + 16 <= n; j += 16) {
+        __m512d a0 = AREA(j), a1 = AREA(j + 8);
+        __mmask8 g0 = _mm512_cmp_pd_mask(a0, b0, _CMP_GT_OQ), g1 = _mm512_cmp_pd_mask(a1, b1, _CMP_GT_OQ);
+        b0 = _mm512_mask_mov_pd(b0, g0, a0);
+        b1 = _mm512_mask_mov_pd(b1, g1, a1);
+        k0 = _mm512_mask_mov_epi64(k0, g0, i0);
+        k1 = _mm512_mask_mov_epi64(k1, g1, i1);
+        i0 = _mm512_add_epi64(i0, step);
+        i1 = _mm512_add_epi64(i1, step);
+    }
+#undef AREA
+    double bl[16];
+    uint64_t kl[16];
+    _mm512_storeu_pd(bl, b0);
+    _mm512_storeu_pd(bl + 8, b1);
+    _mm512_storeu_si512(kl, k0);
+    _mm512_storeu_si512(kl + 8, k1);
+    double best = -1;
+    size_t k = 0;
+    for (int l = 0; l < 16; l++)
+        if (bl[l] > best || (bl[l] == best && bl[l] >= 0 && kl[l] < k)) {
+            best = bl[l];
+            k = kl[l];
+        }
+    for (; j < n; j++) {
+        double x = (double)((uint64_t)ts[j] - (uint64_t)t0), y = lttb_y(type, v[j]);
+        double a = fabs((ax - cx) * (y - ay) - (ax - x) * (cy - ay)) * 0.5;
+        if (a > best) {
+            best = a;
+            k = j;
+        }
+    }
+    return k;
+}
+
+__attribute__((target("avx512f,avx512dq"))) static size_t lttb_avx512(int type, const int64_t *ts,
+                                                                      const uint64_t *v, size_t n, int64_t t0,
+                                                                      double ax, double ay, double cx, double cy)
+{
+    switch (type) {
+    case TSDB_FLOAT32: return lttb_avx512_impl(TSDB_FLOAT32, ts, v, n, t0, ax, ay, cx, cy);
+    case TSDB_FLOAT64: return lttb_avx512_impl(TSDB_FLOAT64, ts, v, n, t0, ax, ay, cx, cy);
+    case TSDB_INT64: return lttb_avx512_impl(TSDB_INT64, ts, v, n, t0, ax, ay, cx, cy);
+    default: return lttb_avx512_impl(TSDB_BOOL, ts, v, n, t0, ax, ay, cx, cy);
+    }
+}
+#endif
 
 static size_t (*simd_lttb)(int, const int64_t *, const uint64_t *, size_t, int64_t, double, double, double,
                            double) = lttb_scalar;
@@ -1162,6 +1603,9 @@ void simd_select(int level)
     void (*f64)(const double *, size_t, size_t, agg_state *, agg_dev *) = fold_f64_scalar;
     void (*i64)(const int64_t *, size_t, agg_state *, agg_dev *) = NULL;
     void (*u32)(const uint32_t *, size_t, uint32_t, agg_state *, agg_dev *) = NULL;
+    void (*twa)(int, const int64_t *, const void *, size_t, twa_sums *) = twa_scalar;
+    size_t (*lttb)(int, const int64_t *, const uint64_t *, size_t, int64_t, double, double, double, double) =
+        lttb_scalar;
     const char *name = "scalar";
 #ifdef TSDB_X86
     const char *force = getenv("TSDB_SIMD"); /* "scalar", "avx2" or "avx512", for benchmarking */
@@ -1180,6 +1624,8 @@ void simd_select(int level)
         f64 = fold_f64_avx512;
         i64 = fold_i64_avx512;
         u32 = fold_u32_avx512;
+        twa = twa_avx512;
+        lttb = lttb_avx512;
         name = "avx512";
     } else if (avx2) {
         f = agg_avx2;
@@ -1187,6 +1633,8 @@ void simd_select(int level)
         f64 = fold_f64_avx2;
         i64 = fold_i64_avx2;
         u32 = fold_u32_avx2;
+        twa = twa_avx2;
+        lttb = lttb_avx2;
         name = "avx2";
     }
 #endif
@@ -1195,6 +1643,8 @@ void simd_select(int level)
     simd_fold_f64 = f64;
     simd_fold_i64 = i64;
     simd_fold_u32 = u32;
+    simd_twa = twa;
+    simd_lttb = lttb;
     simd_level = name;
 #ifdef TSDB_LEVELS
     snprintf(simd_desc, sizeof simd_desc, "%s, codecs x86-64-%s", name, cpu_level_name(level));

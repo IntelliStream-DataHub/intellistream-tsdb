@@ -442,6 +442,32 @@ static void run(rec *r, codec_ctx *c)
                 put(r, what, x->name, &a, sizeof a);
             }
         }
+        /* TWA areas and LTTB picks (simd.c): gaps beyond 2^55 (dt rounds when converted), large time
+         * offsets, every short prefix (the lanes' tails), equal areas (cy == ay: the area follows y alone) */
+        int64_t *ts = malloc((x->n + 1) * sizeof *ts);
+        uint64_t *sl = malloc((x->n + 1) * sizeof *sl), z = 0x9e3779b97f4a7c15u * (uint64_t)(x->n + 1), t = 1ull << 62;
+        for (size_t i = 0; i < x->n; i++) {
+            z = z * 6364136223846793005u + 1442695040888963407u;
+            uint64_t r = z >> 11;
+            t += 1 + (r % 61 == 0 ? (r << 3) | (1ull << 55) | 1 : r % 997);
+            ts[i] = (int64_t)t;
+            sl[i] = w == 4 ? ((const uint32_t *)x->v)[i] : ((const uint64_t *)x->v)[i];
+        }
+        for (size_t m = 0; m <= x->n; m = m < 40 ? m + 1 : m == x->n ? m + 1 : x->n) {
+            granule g;
+            memset(&g, 0, sizeof g);
+            granule_twa(x->type, ts, x->v, m, &g);
+            snprintf(what, sizeof what, "granule_twa %zu", m);
+            put(r, what, x->name, &g, sizeof g);
+            if (!m)
+                continue;
+            size_t k[2] = {lttb_argmax(x->type, ts, sl, m, ts[0] - 5000, 0, 1.5, (double)(t - (uint64_t)ts[0]), -3),
+                           lttb_argmax(x->type, ts, sl, m, ts[0], -7, 1, 1e6, 1)};
+            snprintf(what, sizeof what, "lttb_argmax %zu", m);
+            put(r, what, x->name, k, sizeof k);
+        }
+        free(ts);
+        free(sl);
         snprintf(what, sizeof what, "xxh64");
         uint64_t h = xxh64(x->v, x->n * w, 7);
         put(r, what, x->name, &h, sizeof h);
