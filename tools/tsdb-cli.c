@@ -17,7 +17,8 @@ static void usage(void)
             "  query <series> <start> <end> [raw|count|sum|min|max|avg|all] [group] [--tz ZONE]\n"
             "        also range, stddev_pop, stddev_samp, var_pop, var_samp (stddev, var: the _pop ones)\n"
             "        [--desc] [--limit N]         newest first; at most N rows or buckets\n"
-            "  query <series> <start> <end> lttb N  N points that keep the shape (for charts)\n"
+            "  query <series> <start> <end> lttb N  N points that keep the shape (for charts);\n"
+            "                                     --desc and --limit as above\n"
             "  query <series> <start> <end> twa [group] [--linear] [--max-gap INTERVAL] [--tz ZONE]\n"
             "                                     time-weighted average: each value weighted by how\n"
             "                                     long it held (step; --linear: interpolated), not\n"
@@ -413,7 +414,7 @@ static int cmd_query(tsdb *db, int argc, char **argv)
             return 1;
         }
         raw_out o = {stdout, 0, db, id};
-        if ((rc = tsdb_query_lttb(db, id, start, end, (size_t)n, print_raw, &o)) != 0)
+        if ((rc = tsdb_query_lttb_ex(db, id, start, end, (size_t)n, &q, print_raw, &o)) != 0)
             die("query", rc);
         print_stats("rows");
         return 0;
@@ -441,19 +442,9 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     } else {
         if (grouped)
             rc = tsdb_query_group_local(db, id, start, end, &g, &q, &pb, &nb);
-        else if (interval) {
-            rc = tsdb_query_agg(db, id, start, end, interval, &pb, &nb);
-            if (rc == 0) { /* order and limit as tsdb_query_group_ex applies them */
-                if (q.order == TSDB_DESC)
-                    for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
-                        tsdb_bucket x = pb[i];
-                        pb[i] = pb[j];
-                        pb[j] = x;
-                    }
-                if (q.limit && nb > q.limit)
-                    nb = q.limit;
-            }
-        } else
+        else if (interval)
+            rc = tsdb_query_agg_ex(db, id, start, end, interval, &q, &pb, &nb);
+        else
             rc = tsdb_query_group_ex(db, id, start, end, NULL, &q, &pb, &nb);
         /* one loop below prints both */
         if (rc == 0 && (b = calloc(nb ? nb : 1, sizeof *b)) == NULL)

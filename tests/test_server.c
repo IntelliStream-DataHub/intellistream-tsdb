@@ -311,6 +311,11 @@ static void test_old_server(uint32_t version)
         CHECK(tsdbc_set_retention(c, 1, 1000) == TSDB_ERR_INVALID);
         CHECK(tsdbc_get_retention(c, 1, &lim) == TSDB_ERR_INVALID);
     }
+    if (version < 9) { /* LTTB's order and limit are version 9; the plain form still goes out */
+        tsdb_query_opts desc = {TSDB_DESC, 0}, lim = {TSDB_ASC, 5};
+        CHECK(tsdbc_query_lttb_ex(c, 1, T0, T0 + 10, 100, &desc, NULL, NULL) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_query_lttb_ex(c, 1, T0, T0 + 10, 100, &lim, NULL, NULL) == TSDB_ERR_INVALID);
+    }
     if (version < 6) {
         tsdb_twa_bucket *b = NULL;
         size_t nb = 0;
@@ -600,6 +605,15 @@ static void test_nan(tsdbc *c)
                 nan_mins += isnan(bk[k].min);
                 bad += !canon64(bk[k].sum) + !canon64(bk[k].min) + !canon64(bk[k].max);
             }
+            /* tsdbc_query_agg_ex: newest first, cut to the limit, the same buckets */
+            tsdb_bucket *bx;
+            size_t nx;
+            tsdb_query_opts o = {TSDB_DESC, 3};
+            OK(tsdbc_query_agg_ex(c, ids[t], lo, hi, iv[i], &o, &bx, &nx));
+            CHECK(nx == (nb < 3 ? nb : 3));
+            for (size_t k = 0; k < nx && k < nb; k++)
+                CHECK(!memcmp(&bx[k], &bk[nb - 1 - k], sizeof *bx));
+            free(bx);
             free(bk);
         }
         OK(tsdbc_query_group(c, ids[t], lo, hi, &(tsdb_group){TSDB_MINUTE, 5, NULL}, NULL, &bk, &nb));
@@ -778,16 +792,33 @@ static void test_lttb_remote(tsdbc *c)
     CHECK(none.n == 10);
     free(none.p);
 
-    /* the request is exactly 28 bytes: shorter or longer frames are refused */
+    /* version 9: newest first and limits, the same points */
+    for (size_t k = 0; k < sizeof ths / sizeof *ths; k++) {
+        lpts asc = {0}, d = {0}, dl = {0}, al = {0};
+        tsdb_query_opts desc = {TSDB_DESC, 0}, dlim = {TSDB_DESC, 7}, alim = {TSDB_ASC, 5};
+        OK(tsdbc_query_lttb_ex(c, f, INT64_MIN, INT64_MAX, ths[k], NULL, lttb_collect, &asc));
+        OK(tsdbc_query_lttb_ex(c, f, INT64_MIN, INT64_MAX, ths[k], &desc, lttb_collect, &d));
+        OK(tsdbc_query_lttb_ex(c, f, INT64_MIN, INT64_MAX, ths[k], &dlim, lttb_collect, &dl));
+        OK(tsdbc_query_lttb_ex(c, f, INT64_MIN, INT64_MAX, ths[k], &alim, lttb_collect, &al));
+        bool same = asc.n > 0 && d.n == asc.n && dl.n == (asc.n < 7 ? asc.n : 7) && al.n == (asc.n < 5 ? asc.n : 5);
+        for (size_t i = 0; same && i < d.n; i++)
+            same = d.p[i].ts == asc.p[asc.n - 1 - i].ts && d.p[i].bits == asc.p[asc.n - 1 - i].bits &&
+                   (i >= dl.n || (dl.p[i].ts == d.p[i].ts && dl.p[i].bits == d.p[i].bits)) &&
+                   (i >= al.n || (al.p[i].ts == asc.p[i].ts && al.p[i].bits == asc.p[i].bits));
+        CHECK(same);
+        free(asc.p), free(d.p), free(dl.p), free(al.p);
+    }
+
+    /* the request is exactly 28 bytes, or 37 with order and limit: other lengths are refused */
     int fd = raw_connect();
-    uint8_t q[29] = {0};
+    uint8_t q[38] = {0};
     int64_t lo = INT64_MIN, hi = INT64_MAX;
     uint64_t t = 10;
     memcpy(q, &f, 4);
     memcpy(q + 4, &lo, 8);
     memcpy(q + 12, &hi, 8);
     memcpy(q + 20, &t, 8);
-    for (uint32_t len = 27; len <= 29; len += 2) {
+    for (uint32_t len = 27; len <= 38; len += len == 29 ? 7 : 2) {
         raw_send(fd, 40 + len, TSDB_OP_QUERY_LTTB, q, len);
         uint32_t rid;
         uint8_t rest[256];
@@ -930,6 +961,50 @@ static void test_hello_keeps_errors(uint32_t f64)
 
 /* Version 4: the server knows UTC only; clients send the bounds of local periods. */
 /* QUERY_TWA: the interval, calendar, local and bounds forms, against hand-computed values */
+/* QUERY_BUCKETS with a limit stops early in the server as well, for the interval form (unit 0, which
+ * tsdbc_query_agg_ex sends) as for calendar groups: 60 days at one row a minute, a granule a day, and the last (or
+ * first) 3 hours touch one or two granules, not 60. */
+static void test_limits_remote(tsdbc *c)
+{
+    enum { DAYS = 60, N = DAYS * 1440 };
+    uint32_t s;
+    OK(tsdbc_series_create(c, "limits.year", TSDB_FLOAT64, NULL, &s));
+    const int64_t t0 = 1700000000000LL / 86400000 * 86400000, t1 = t0 + (int64_t)N * 60000;
+    int64_t *ts = malloc(N * sizeof *ts);
+    double *v = malloc(N * sizeof *v);
+    for (int i = 0; i < N; i++)
+        ts[i] = t0 + (int64_t)i * 60000, v[i] = i % 977;
+    for (int o = 0; o < N; o += 1440)
+        OK(tsdbc_insert_series_values(c, s, ts + o, &(tsdb_values){TSDB_FLOAT64, v + o, NULL}, 1440));
+    OK(tsdbc_flush(c));
+    free(ts);
+    free(v);
+    tsdb_bucket *all, *b;
+    size_t nall, n;
+    tsdb_query_stats st;
+    OK(tsdbc_query_agg(c, s, t0, t1, 3600000, &all, &nall));
+    OK(tsdbc_last_query_stats(c, &st));
+    CHECK(nall == DAYS * 24 && st.granules >= DAYS);
+    for (int k = 0; k < 4; k++) {
+        tsdb_query_opts q = {k & 1 ? TSDB_DESC : TSDB_ASC, 3};
+        if (k < 2)
+            OK(tsdbc_query_agg_ex(c, s, t0, t1, 3600000, &q, &b, &n));
+        else
+            OK(tsdbc_query_group(c, s, t0, t1, &(tsdb_group){TSDB_HOUR, 1, NULL}, &q, &b, &n));
+        OK(tsdbc_last_query_stats(c, &st));
+        if (st.granules > 2 || st.rows_decoded > 2 * 1440)
+            fprintf(stderr, "  limits %s %s: %llu granules, %llu rows decoded for 3 buckets\n",
+                    k < 2 ? "agg_ex" : "group", k & 1 ? "desc" : "asc", (unsigned long long)st.granules,
+                    (unsigned long long)st.rows_decoded);
+        CHECK(st.granules <= 2 && st.rows_decoded <= 2 * 1440);
+        CHECK(n == 3);
+        for (size_t i = 0; i < n && n == 3; i++)
+            CHECK(!memcmp(&b[i], &all[k & 1 ? nall - 1 - i : i], sizeof *b));
+        free(b);
+    }
+    free(all);
+}
+
 static void test_twa(tsdbc *c)
 {
     uint32_t s, st;
@@ -2608,6 +2683,7 @@ int main(int argc, char **argv)
     test_close(c);
     test_framing();
     test_hello();
+    test_old_server(8);
     test_old_server(6);
     test_old_server(5);
     test_types(c);
@@ -2617,6 +2693,7 @@ int main(int argc, char **argv)
     test_packed_inserts(c);
     test_bounds(c, a, N);
     test_twa(c);
+    test_limits_remote(c);
     test_spread_remote(c);
     test_spread_old_server();
     test_delete(c);

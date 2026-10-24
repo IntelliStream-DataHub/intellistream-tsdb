@@ -177,6 +177,68 @@ covered, as ClickHouse counts processed rows: a granule answered from its
 statistics counts its rows without reading them, which is how a scan can
 report billions of rows a second.
 
+## Order, limits and early stop
+
+Raw queries in descending order read backwards window by window, so "the
+newest N points" touches about N rows. Bucketed queries (aggregates, calendar
+groups, bounds, the spread, TWA) with a limit stop early the same way
+(`bucket_windows` in src/query.c). The query takes one snapshot of its whole
+range; then it computes windows of buckets, each as if it were the query
+range, from the start (ascending) or from the end (descending), until
+`limit` non-empty buckets are in. A window spans max(still needed, twice the
+previous) buckets, counted from the nearest data in the remaining range (the
+granule index and the memtable answer that without decoding), so empty
+stretches cost nothing and a sparse range takes a few windows. Without a
+limit, or with one bucket, there is one pass and the result is reversed and
+cut.
+
+The result is that of computing every bucket and then cutting, bit for bit,
+because a bucket is combined the same way either way:
+
+- Window edges are bucket edges: a bucket lies in one window, and a granule
+  that a window edge cuts is decoded, as a granule that spans buckets always
+  is; a granule inside one bucket answers from its statistics in both.
+- Overlap clusters (granules and memtable runs of several sources whose time
+  ranges overlap, merged so replaced rows are not counted) are found once for
+  the whole range; a window takes each cluster that reaches into it as it is,
+  so a merge chain is never split differently by a window than by the full
+  range. TWA finds the overlaps per window, which merges the same rows into
+  the same stream of segments (a merge emits the newest row per timestamp,
+  whatever range it starts from), and takes the value carried into a window
+  from the same snapshot, which reaches around the whole range.
+- A worker folds the buckets inside its granule directly; the first and the
+  last bucket of each granule, which other granules may share, are folded
+  after the pool in work order (they were folded in completion order). Float
+  sums therefore depend only on how parts were merged, not on threads, order
+  or limit.
+
+Only the query statistics and `TSDB_ERR_TOO_MANY_BUCKETS` (which counts the
+buckets computed) differ. On a year of one row a minute (one granule a day),
+the last 10 hourly buckets cover 1 granule and 1440 rows instead of 366 and
+527040 (about 0.02 ms instead of 0.25 to 0.5 ms, on a busy machine);
+tests/test_limits.c asserts the counts and checks every form against
+compute-all-then-cut over random ranges, orders and limits, with deletes,
+retention, the memtable, a follower and merges.
+
+`tsdb_query_agg` has no options; `tsdb_query_agg_ex` adds order and limit.
+On the wire, QUERY_AGG (version 1) keeps its 32-byte rows without order or
+limit: QUERY_BUCKETS with unit 0 is the same query with both and with the
+exact int64 fields, so clients use it (`tsdbc_query_agg` already did) and no
+second form of QUERY_AGG is needed. LTTB needs every point of the range to
+choose, so its order and limit (`tsdb_query_lttb_ex`, QUERY_LTTB's optional
+order and limit in version 9) only reverse and cut the chosen points:
+ascending stops the callback at the limit. Descending, when the threshold
+keeps every point (it is the client's to choose, up to 2^64), is a raw read
+backwards that stops at the limit; otherwise the choice runs oldest first
+and a ring keeps the last min(limit, threshold) chosen points, grown as they
+come, so memory follows what is returned, never the rows of the range.
+
+Costs a limit does not remove: the overlap clusters are found once from the
+granule index of the whole range (sorting every granule entry, O(G log G)
+for G granules, no decoding), and the statistics count a part (and, for TWA,
+a memtable run's rows) once per window that reads it, so a query that took
+several windows reports more parts and memtable rows than it holds.
+
 ## Downsampling: LTTB
 
 `tsdb_query_lttb` (and `QUERY_LTTB`, `tsdbc_query_lttb`, `tsdb DIR query S A B

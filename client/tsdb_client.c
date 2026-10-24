@@ -586,12 +586,19 @@ static int bounds_req(tsdbc *c, uint32_t series, int64_t start, int64_t end, con
 int tsdbc_query_agg(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
                     size_t *nout)
 {
+    return tsdbc_query_agg_ex(c, series, start, end, interval_ms, NULL, out, nout);
+}
+
+/* QUERY_BUCKETS with unit 0, not QUERY_AGG: its 32-byte rows have neither order, limit nor the int64 fields */
+int tsdbc_query_agg_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+{
     if (interval_ms < 0) {
         *out = NULL;
         *nout = 0;
         return TSDB_ERR_INVALID;
     }
-    return buckets_req(c, series, start, end, interval_ms, NULL, NULL, 0, (void **)out, nout);
+    return buckets_req(c, series, start, end, interval_ms, NULL, opts, 0, (void **)out, nout);
 }
 
 int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
@@ -986,18 +993,30 @@ int tsdbc_query_values(tsdbc *c, uint32_t series, int64_t start, int64_t end, co
 int tsdbc_query_lttb(tsdbc *c, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
                      void *ctx)
 {
+    return tsdbc_query_lttb_ex(c, series, start, end, threshold, NULL, fn, ctx);
+}
+
+int tsdbc_query_lttb_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, size_t threshold,
+                        const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx)
+{
     int rc = tsdbc_wait(c);
     if (rc)
         return rc;
     if (server_version(c) < 5)
         return TSDB_ERR_INVALID; /* the server does not know QUERY_LTTB */
-    uint8_t q[28];
-    uint64_t t = threshold;
+    /* order and limit only when they change something: the 28-byte form is what every server takes */
+    bool ex = opts && (opts->order == TSDB_DESC || opts->limit);
+    if (ex && server_version(c) < 9)
+        return TSDB_ERR_INVALID;
+    uint8_t q[37];
+    uint64_t t = threshold, lim = opts ? opts->limit : 0;
     memcpy(q, &series, 4);
     memcpy(q + 4, &start, 8);
     memcpy(q + 12, &end, 8);
     memcpy(q + 20, &t, 8);
-    if ((rc = send_req(c, TSDB_OP_QUERY_LTTB, q, 28, NULL, 0, NULL, 0, NULL, 0)) != 0)
+    q[28] = ex && opts->order == TSDB_DESC;
+    memcpy(q + 29, &lim, 8);
+    if ((rc = send_req(c, TSDB_OP_QUERY_LTTB, q, ex ? 37 : 28, NULL, 0, NULL, 0, NULL, 0)) != 0)
         return rc;
     return read_values(c, fn, ctx);
 }

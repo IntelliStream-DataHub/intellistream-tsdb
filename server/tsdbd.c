@@ -777,7 +777,7 @@ static void handle(req *r)
     case TSDB_OP_QUERY_LTTB: { /* the same chunks: LTTB's points are rows of the series */
         bool lttb = r->op == TSDB_OP_QUERY_LTTB;
         values_out o = {c, r->id, 0, 0, NULL, NULL, 0, false};
-        if (lttb ? len != 28 : len != 20 && len != 29) {
+        if (lttb ? len != 28 && len != 37 : len != 20 && len != 29) { /* version 9: LTTB's order and limit */
             values_flush(&o, true, TSDB_ERR_INVALID);
             return;
         }
@@ -790,11 +790,12 @@ static void handle(req *r)
         uint64_t threshold = 0;
         if (lttb)
             memcpy(&threshold, p + 20, 8);
-        if (len == 29) {
+        if (len == 29 || len == 37) {
             uint64_t lim;
-            q.order = p[20] ? TSDB_DESC : TSDB_ASC;
-            memcpy(&lim, p + 21, 8);
-            q.limit = (size_t)lim;
+            size_t at = lttb ? 28 : 20;
+            q.order = p[at] ? TSDB_DESC : TSDB_ASC;
+            memcpy(&lim, p + at + 1, 8);
+            q.limit = lim > SIZE_MAX ? SIZE_MAX : (size_t)lim;
         }
         tsdb_type t = TSDB_FLOAT32;
         tsdb_series_type(db, s, &t); /* an unknown series: no rows */
@@ -814,7 +815,7 @@ static void handle(req *r)
         else if (threshold > SIZE_MAX)
             rc = TSDB_ERR_INVALID;
         else
-            rc = tsdb_query_lttb(db, s, start, end, (size_t)threshold, values_cb, &o);
+            rc = tsdb_query_lttb_ex(db, s, start, end, (size_t)threshold, &q, values_cb, &o);
         if (!o.gone)
             values_flush(&o, true, rc); /* the rest of the rows, or the error */
         free(o.ts);
@@ -885,15 +886,7 @@ static void handle(req *r)
                             : tsdb_query_spread_group(db, s, start, end, &g, &q, &sb, &nb);
             b = (tsdb_bucket *)sb;
         } else if (p[28] == 0) {
-            rc = tsdb_query_agg(db, s, start, end, interval, &b, &nb);
-            if (rc == 0 && q.order == TSDB_DESC)
-                for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
-                    tsdb_bucket x = b[i];
-                    b[i] = b[j];
-                    b[j] = x;
-                }
-            if (rc == 0 && q.limit && nb > q.limit)
-                nb = q.limit;
+            rc = tsdb_query_agg_ex(db, s, start, end, interval, &q, &b, &nb);
         } else {
             rc = tsdb_query_group_ex(db, s, start, end, &g, &q, &b, &nb);
         }

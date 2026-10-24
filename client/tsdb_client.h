@@ -55,6 +55,9 @@ int tsdbc_query_raw(tsdbc *c, uint32_t series, int64_t start, int64_t end, tsdb_
 int tsdbc_query_points(tsdbc *c, uint32_t series, int64_t start, int64_t end, tsdb_points *out);
 int tsdbc_query_agg(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
                     size_t *nout);
+/* With order and limit, as tsdb_query_agg_ex (opts NULL: as tsdbc_query_agg). */
+int tsdbc_query_agg_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 /* Ordering, limits and calendar grouping, as tsdb_query_raw_ex / tsdb_query_group_ex. */
 int tsdbc_query_raw_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                        tsdb_raw_fn fn, void *ctx);
@@ -109,6 +112,10 @@ uint32_t tsdbc_server_version(tsdbc *c);
  * tell them apart checks tsdbc_server_version first). */
 int tsdbc_query_lttb(tsdbc *c, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
                      void *ctx);
+/* Newest first or cut to a limit, as tsdb_query_lttb_ex. Needs a server of protocol version 9 when opts asks
+ * for either (TSDB_ERR_INVALID from an older one, without asking it). */
+int tsdbc_query_lttb_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, size_t threshold,
+                        const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx);
 int tsdbc_state(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
 int tsdbc_state_lookup(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
 int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t len);

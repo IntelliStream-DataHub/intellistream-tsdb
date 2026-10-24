@@ -30,7 +30,8 @@ average). You can link tsdb into your program as a library, or run its server,
 - Read raw points (oldest or newest first, with a limit), or summaries per
   time bucket: fixed buckets (every 5 minutes) or calendar ones (day, week,
   month, quarter, year). The server works in UTC; the clients turn your local
-  time zone into UTC for you.
+  time zone into UTC for you. A limit stops early: "the last 10 hours" of a
+  year of data reads about 10 hours of it.
 - Downsample a series to N points that keep its shape, for charts: the peaks
   and dips stay (LTTB), and every point returned is a real stored point.
 - Besides count, sum, min, max and average, each bucket tells how much the
@@ -323,6 +324,7 @@ The quick start used these. Use a directory you can write to instead of `/data/s
 build/tsdb /data/sensors import < rows.csv          # lines of: series,time,value
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2024-01-02 avg 5m
 build/tsdb /data/sensors query pump7.flow now-1h now raw --desc --limit 10
+build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 avg 1h --desc --limit 10   # the last 10 hours
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 lttb 1000   # 1000 points for a chart
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 all 1mo --tz Europe/Oslo
 build/tsdb /data/sensors query pump7.temp 2024-01-01 2024-02-01 twa 1d --linear --max-gap 10m

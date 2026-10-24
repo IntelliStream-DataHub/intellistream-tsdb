@@ -21,6 +21,11 @@ out=$("$B/tsdb" "$dir/db" query s min max lttb 50 2>/dev/null) || fail "lttb 50"
 printf '%s\n' "$out" | while IFS= read -r line; do
     printf '%s\n' "$raw" | grep -qxF -- "$line" || { echo "not a stored point: $line" >&2; exit 1; }
 done || fail "lttb printed a point that is not stored"
+# --desc: the same points newest first; --limit cuts them in that order
+desc=$("$B/tsdb" "$dir/db" query s min max lttb 50 --desc 2>/dev/null) || fail "lttb 50 --desc"
+[ "$desc" = "$(printf '%s\n' "$out" | tac)" ] || fail "lttb --desc is not the points reversed"
+lim=$("$B/tsdb" "$dir/db" query s min max lttb 50 --desc --limit 7 2>/dev/null) || fail "lttb --desc --limit 7"
+[ "$lim" = "$(printf '%s\n' "$desc" | head -n 7)" ] || fail "lttb --desc --limit 7 is not the newest 7"
 for bad in -1 2 x 5x ""; do
     if "$B/tsdb" "$dir/db" query s min max lttb $bad >/dev/null 2>&1; then fail "lttb '$bad' accepted"; fi
 done

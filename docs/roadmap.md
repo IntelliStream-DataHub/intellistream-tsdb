@@ -35,11 +35,11 @@ series store underneath; tsdb does not duplicate it.
 
 - The spread in the Rust, Python and Java clients: protocol 8 reaches only
   the C client and the CLI so far.
-- Limits: raw, bucketed, bounds, calendar, time-weighted and spread queries
-  take an order and a limit everywhere (library, protocol, all four clients,
-  CLI `--limit`). Missing: a limit on QUERY_AGG (protocol 1) and on LTTB; and
-  bucketed queries aggregate the whole range before they cut to the limit,
-  so "the newest bucket" costs a full scan where raw queries stop early.
+- Limits in the Rust, Python and Java clients: `agg_ex` (QUERY_BUCKETS with
+  order and limit) and LTTB's order and limit (protocol 9) reach only the C
+  client and the CLI so far. Bucketed queries with a limit stop early in the
+  engine and the server (docs/design.md, "Order, limits and early stop");
+  QUERY_AGG (protocol 1) keeps no limit, QUERY_BUCKETS replaces it.
 
 ## After the first release
 

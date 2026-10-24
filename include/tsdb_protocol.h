@@ -108,11 +108,24 @@
  *   the server does not compute the spread), so older clients read it
  *   unchanged; a client sends it only to a server whose HELLO says 8 or more
  *   (an older one answers TSDB_ERR_INVALID).
+ *   Version 9: order and limit for LTTB. QUERY_LTTB takes an optional
+ *               u8 order, u64 limit
+ *   after the threshold (37 bytes instead of 28): the same points, newest
+ *   first with order 1, and only the first `limit` of them in that order (0:
+ *   all); the choice of points does not change. A client sends the longer
+ *   form only to a server whose HELLO says 9 or more (an older one answers
+ *   TSDB_ERR_INVALID); the 28-byte form is unchanged. QUERY_AGG (version 1)
+ *   keeps its layout and has no order or limit: QUERY_BUCKETS (unit 0) is
+ *   the same query with them, and with the int64 fields, and is what clients
+ *   use for both (tsdb_client.h: tsdbc_query_agg_ex).
+ *   A server of version 9 also stops bucketed queries with a limit early
+ *   (QUERY_BUCKETS, QUERY_BOUNDS, QUERY_TWA compute only about the buckets
+ *   they return); their replies do not change.
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
-#define TSDB_PROTOCOL_VERSION 8
+#define TSDB_PROTOCOL_VERSION 9
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
