@@ -42,7 +42,7 @@ fn unit(code: &str) -> Unit {
 fn local_groups_are_those_of_the_c_client() {
     let srv = Server::start();
     let mut c = srv.client();
-    assert_eq!(c.protocol_version().unwrap(), 4);
+    assert_eq!(c.protocol_version().unwrap(), tsdb_client::PROTOCOL_VERSION);
     let id = load(&mut c);
     let expected = include_str!("fixtures/group_by_zone.txt");
     for line in expected.lines() {
