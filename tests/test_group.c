@@ -285,6 +285,25 @@ int main(int argc, char **argv)
         after += ts[i] >= ok_bounds[1];
     CHECK(nb == 2 && b[0].start == ok_bounds[0] && b[1].start == ok_bounds[1] && b[1].count >= after);
     free(b);
+
+    /* Regression: "+0530" was read as 530 hours (the +hh form parsed first), so
+     * its days began 2 hours off. Fixed offsets in every spelling agree. */
+    const char *offsets[][3] = {{"+0530", "+05:30", "+05:30:00"}, {"-0530", "-05:30", "-05:30:00"}};
+    const int64_t midnight[2] = {(24 - 5) * 3600000LL - 30 * 60000LL, 5 * 3600000LL + 30 * 60000LL};
+    for (int i = 0; i < 2; i++)
+        for (int k = 0; k < 3; k++) {
+            int64_t *bd;
+            size_t nbd;
+            OK(tsdb_calendar_bounds(offsets[i][k], TSDB_DAY, 1, 0, 10 * 86400000LL, &bd, &nbd));
+            bool at_midnight = nbd >= 10;
+            for (size_t j = 0; j < nbd; j++)
+                at_midnight &= ((bd[j] % 86400000) + 86400000) % 86400000 == midnight[i];
+            if (!at_midnight)
+                printf("%s: days begin at %lld ms past UTC midnight\n", offsets[i][k],
+                       nbd ? (long long)(((bd[0] % 86400000) + 86400000) % 86400000) : -1LL);
+            CHECK(at_midnight);
+            free(bd);
+        }
     OK(tsdb_close(db));
     if (system(cmd) != 0)
         return 1;

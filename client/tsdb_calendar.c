@@ -261,16 +261,17 @@ static int load_zone(const char *name, tz *z)
     const char *p;
     if (!strcmp(name, "UTC") || !strcmp(name, "Z") || !strcmp(name, "GMT") || !strcmp(name, "Etc/UTC"))
         return 0;
-    if ((name[0] == '+' || name[0] == '-') && (p = parse_hms(name, &off)) && !*p) {
-        z->before = off;
-        return 0;
-    }
-    if ((name[0] == '+' || name[0] == '-') && strlen(name) == 5) { /* +0530 */
+    /* +0530 before +hh[:mm[:ss]]: read as hours, "0530" would be 530 of them */
+    if ((name[0] == '+' || name[0] == '-') && strlen(name) == 5 && strspn(name + 1, "0123456789") == 4) {
         char buf[8] = {name[0], name[1], name[2], ':', name[3], name[4], 0};
         if ((p = parse_hms(buf, &off)) && !*p) {
             z->before = off;
             return 0;
         }
+    }
+    if ((name[0] == '+' || name[0] == '-') && (p = parse_hms(name, &off)) && !*p) {
+        z->before = off;
+        return 0;
     }
     if (strstr(name, "..") || name[0] == '/')
         return TSDB_ERR_INVALID;
