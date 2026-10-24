@@ -54,6 +54,8 @@ all: $(LIB) $(B)/libtsdb.so $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/inse
 
 $(B)/%.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
+# simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
+$(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
 
 $(B)/%.base.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -DTSDB_LV=base -c -o $@ $<

@@ -1,5 +1,10 @@
 /*
- * Aggregation kernels with runtime dispatch: AVX-512, AVX2 or scalar.
+ * Aggregation kernels with runtime dispatch, five sets: AVX-512 (v4), AVX2
+ * (v3), AVX without AVX2 (Sandy Bridge, Ivy Bridge), SSE4.2 (x86-64-v2) and
+ * scalar. The AVX-512 kernels are written here, the AVX2 and AVX ones for
+ * float32 and float64 in simd_avx.inc (included once per set), the SSE ones,
+ * and AVX's integer, TWA and LTTB kernels (AVX has no 256-bit integer
+ * operations: the same 128-bit code, VEX-encoded), in simd_sse.inc.
  *
  * Gorilla and DoubleDelta are bit-serial (each value's bit position depends on
  * the previous one), so they are decoded with scalar code. What vectorizes is
@@ -34,7 +39,7 @@
 #endif
 
 /*
- * The three kernels give bit-identical results: stored granule statistics and
+ * All five sets give bit-identical results: stored granule statistics and
  * query results must not depend on the CPU that computed them (a part written
  * on one machine is read on another; `make dist` runs the same binary on v2,
  * v3 and v4 CPUs). Floating-point addition is not associative, so they share
@@ -45,6 +50,9 @@
  * max keep 32 float lanes the same way, combined with MINPS/MAXPS semantics
  * (the second operand wins on NaN and on equal values, which decides the sign
  * of a zero). A last partial group of 32 goes into the lanes one value at a time.
+ * AVX2 and AVX hold the 32 lanes in 8 vectors of four doubles (sums) and 4 of
+ * eight floats (min/max), SSE in 16 of two and 8 of four: lane j is always
+ * value j of each group of 32, whatever the width.
  *
  * float64 takes the same scheme with 16 lanes (L64): lane j sums values j,
  * j+16, ...; halved 8, 4, 2, 1. 16 because AVX2 then still holds sums, minima
@@ -429,34 +437,15 @@ void simd_small_f64(const double *v, size_t n, bool may_be_null, agg_state *a, a
 #define K_AVX2 static inline __attribute__((target("avx2"), always_inline))
 #define K_AVX512 static inline __attribute__((target("avx512f,avx512dq"), always_inline))
 
-K_AVX2 void dev_avx2(const float *v, size_t n, uint64_t c, double s, agg_state *a, agg_dev *dv, const bool nl)
-{
-    if (!c)
-        return;
-    dev_lanes l;
-    double m = s / (double)c;
-    const __m256d mm = _mm256_set1_pd(m);
-    const __m128i nv = _mm_set1_epi32((int)NULL_F32);
-    __m256d d1[8], d2[8]; /* lanes 4q .. 4q+3 */
-    for (int q = 0; q < 8; q++)
-        d1[q] = d2[q] = _mm256_setzero_pd();
-    size_t i = 0;
-    for (; i + LANES <= n; i += LANES)
-        for (int q = 0; q < 8; q++) {
-            __m128 x = _mm_loadu_ps(v + i + 4 * q);
-            __m256d d = _mm256_sub_pd(_mm256_cvtps_pd(x), mm);
-            if (nl) /* a null adds +0.0 to its lane: see the top of the file */
-                d = _mm256_andnot_pd(
-                    _mm256_castsi256_pd(_mm256_cvtepi32_epi64(_mm_cmpeq_epi32(_mm_castps_si128(x), nv))), d);
-            d1[q] = _mm256_add_pd(d1[q], d);
-            d2[q] = _mm256_add_pd(d2[q], _mm256_mul_pd(d, d));
-        }
-    for (int q = 0; q < 8; q++) {
-        _mm256_storeu_pd(l.d1 + 4 * q, d1[q]);
-        _mm256_storeu_pd(l.d2 + 4 * q, d2[q]);
-    }
-    dev_finish(&l, v, i, n, m, c, s, a, dv, nl, LANES);
-}
+/* the 256-bit float32 and float64 kernels: AVX2, and AVX without AVX2 (Sandy Bridge, Ivy Bridge) */
+#define KSUF avx2
+#define KTARGET "avx2"
+#define KS_AVX2 1
+#include "simd_avx.inc"
+#define KSUF avx
+#define KTARGET "avx"
+#define KS_AVX2 0
+#include "simd_avx.inc"
 
 K_AVX512 void dev_avx512(const float *v, size_t n, uint64_t c, double s, agg_state *a, agg_dev *dv, const bool nl)
 {
@@ -487,78 +476,6 @@ K_AVX512 void dev_avx512(const float *v, size_t n, uint64_t c, double s, agg_sta
         _mm512_storeu_pd(l.d2 + 8 * q, d2[q]);
     }
     dev_finish(&l, v, i, n, m, c, s, a, dv, nl, LANES);
-}
-
-/* sum of the 4 floats as doubles into s */
-#define ADD4(s, q) s = _mm256_add_pd(s, _mm256_cvtps_pd(q))
-
-K_AVX2 void agg_avx2_impl(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl)
-{
-    if (!n)
-        return;
-    lanes l;
-    lanes_init(&l, a);
-    const __m256i nv = _mm256_set1_epi32((int)NULL_F32);
-    /* sum lanes 0-3, 4-7, ..., 28-31 */
-    __m256d s0 = _mm256_setzero_pd(), s1 = s0, s2 = s0, s3 = s0, s4 = s0, s5 = s0, s6 = s0, s7 = s0;
-    /* min/max lanes 0-7, 8-15, 16-23, 24-31 */
-    __m256 mn0 = _mm256_loadu_ps(l.mn), mn1 = mn0, mn2 = mn0, mn3 = mn0;
-    __m256 mx0 = _mm256_loadu_ps(l.mx), mx1 = mx0, mx2 = mx0, mx3 = mx0;
-    size_t i = 0;
-    /* one quarter at a time, so that no loaded vector stays live: 16 accumulators fill the registers; min/max
-     * take the null as it is (a NaN: the accumulator wins), the sums a +0.0 in its place */
-#define QUARTER(q, sa, sb, mnq, mxq)                                                                               \
-    do {                                                                                                           \
-        __m256 x = _mm256_loadu_ps(v + i + 8 * (q)), xs = x;                                                       \
-        if (nl)                                                                                                    \
-            xs = _mm256_andnot_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_castps_si256(x), nv)), x);         \
-        ADD4(sa, _mm256_castps256_ps128(xs));                                                                      \
-        ADD4(sb, _mm256_extractf128_ps(xs, 1));                                                                    \
-        mnq = _mm256_min_ps(x, mnq);                                                                               \
-        mxq = _mm256_max_ps(x, mxq);                                                                               \
-    } while (0)
-    for (; i + LANES <= n; i += LANES) {
-        QUARTER(0, s0, s1, mn0, mx0);
-        QUARTER(1, s2, s3, mn1, mx1);
-        QUARTER(2, s4, s5, mn2, mx2);
-        QUARTER(3, s6, s7, mn3, mx3);
-    }
-#undef QUARTER
-    _mm256_storeu_pd(l.s, s0);
-    _mm256_storeu_pd(l.s + 4, s1);
-    _mm256_storeu_pd(l.s + 8, s2);
-    _mm256_storeu_pd(l.s + 12, s3);
-    _mm256_storeu_pd(l.s + 16, s4);
-    _mm256_storeu_pd(l.s + 20, s5);
-    _mm256_storeu_pd(l.s + 24, s6);
-    _mm256_storeu_pd(l.s + 28, s7);
-    _mm256_storeu_ps(l.mn, mn0);
-    _mm256_storeu_ps(l.mn + 8, mn1);
-    _mm256_storeu_ps(l.mn + 16, mn2);
-    _mm256_storeu_ps(l.mn + 24, mn3);
-    _mm256_storeu_ps(l.mx, mx0);
-    _mm256_storeu_ps(l.mx + 8, mx1);
-    _mm256_storeu_ps(l.mx + 16, mx2);
-    _mm256_storeu_ps(l.mx + 24, mx3);
-    double s = lanes_finish(&l, v, i, n, a, nl, LANES);
-    if (dv)
-        dev_avx2(v, n, n - nulls, s, a, dv, nl);
-    else
-        sum_finish(n - nulls, s, a);
-}
-
-__attribute__((target("avx2"))) static void agg_avx2(const float *v, size_t n, agg_state *a, agg_dev *dv)
-{
-    agg_avx2_impl(v, n, 0, a, dv, false);
-}
-
-__attribute__((target("avx2"))) static void fold_f32_avx2(const float *v, size_t n, size_t nulls, agg_state *a,
-                                                         agg_dev *dv)
-{
-    if (nulls)
-        agg_avx2_impl(v, n, nulls, a, dv, true);
-    else
-        agg_avx2_impl(v, n, 0, a, dv, false);
 }
 
 K_AVX512 void agg_avx512_impl(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl)
@@ -616,78 +533,6 @@ __attribute__((target("avx512f,avx512dq"))) static void fold_f32_avx512(const fl
         agg_avx512_impl(v, n, nulls, a, dv, true);
     else
         agg_avx512_impl(v, n, 0, a, dv, false);
-}
-
-/* float64: 16 lanes, 4 vectors of AVX2 or 2 of AVX-512 */
-K_AVX2 void dev64_avx2(const double *v, size_t n, uint64_t c, double s, agg_state *a, agg_dev *dv, const bool nl)
-{
-    if (!c)
-        return;
-    dev64 l;
-    double m = s / (double)c;
-    const __m256d mm = _mm256_set1_pd(m);
-    const __m256i nv = _mm256_set1_epi64x((long long)NULL_F64);
-    __m256d d1[4], d2[4];
-    for (int q = 0; q < 4; q++)
-        d1[q] = d2[q] = _mm256_setzero_pd();
-    size_t i = 0;
-    for (; i + L64 <= n; i += L64)
-        for (int q = 0; q < 4; q++) {
-            __m256d x = _mm256_loadu_pd(v + i + 4 * q), d = _mm256_sub_pd(x, mm);
-            if (nl)
-                d = _mm256_andnot_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_castpd_si256(x), nv)), d);
-            d1[q] = _mm256_add_pd(d1[q], d);
-            d2[q] = _mm256_add_pd(d2[q], _mm256_mul_pd(d, d));
-        }
-    for (int q = 0; q < 4; q++) {
-        _mm256_storeu_pd(l.d1 + 4 * q, d1[q]);
-        _mm256_storeu_pd(l.d2 + 4 * q, d2[q]);
-    }
-    dev64_finish(&l, v, i, n, m, c, s, a, dv, nl, L64);
-}
-
-K_AVX2 void agg64_avx2_impl(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl)
-{
-    if (!n)
-        return;
-    lanes64 l;
-    lanes64_init(&l, a);
-    const __m256i nv = _mm256_set1_epi64x((long long)NULL_F64);
-    __m256d s[4], mn[4], mx[4]; /* lanes 4q .. 4q+3 */
-    for (int q = 0; q < 4; q++) {
-        s[q] = _mm256_setzero_pd();
-        mn[q] = _mm256_loadu_pd(l.mn + 4 * q);
-        mx[q] = _mm256_loadu_pd(l.mx + 4 * q);
-    }
-    size_t i = 0;
-    for (; i + L64 <= n; i += L64)
-        for (int q = 0; q < 4; q++) {
-            __m256d x = _mm256_loadu_pd(v + i + 4 * q), xs = x;
-            if (nl)
-                xs = _mm256_andnot_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_castpd_si256(x), nv)), x);
-            s[q] = _mm256_add_pd(s[q], xs);
-            mn[q] = _mm256_min_pd(x, mn[q]);
-            mx[q] = _mm256_max_pd(x, mx[q]);
-        }
-    for (int q = 0; q < 4; q++) {
-        _mm256_storeu_pd(l.s + 4 * q, s[q]);
-        _mm256_storeu_pd(l.mn + 4 * q, mn[q]);
-        _mm256_storeu_pd(l.mx + 4 * q, mx[q]);
-    }
-    double sum = lanes64_finish(&l, v, i, n, a, nl, L64);
-    if (dv)
-        dev64_avx2(v, n, n - nulls, sum, a, dv, nl);
-    else
-        sum_finish(n - nulls, sum, a);
-}
-
-__attribute__((target("avx2"))) static void fold_f64_avx2(const double *v, size_t n, size_t nulls, agg_state *a,
-                                                         agg_dev *dv)
-{
-    if (nulls)
-        agg64_avx2_impl(v, n, nulls, a, dv, true);
-    else
-        agg64_avx2_impl(v, n, 0, a, dv, false);
 }
 
 K_AVX512 void dev64_avx512(const double *v, size_t n, uint64_t c, double s, agg_state *a, agg_dev *dv,
@@ -1736,6 +1581,18 @@ __attribute__((target("avx512f,avx512dq"))) static size_t lttb_avx512(int type, 
 }
 #endif
 
+#ifdef TSDB_X86
+/* the 128-bit kernels: x86-64-v2 (SSE4.2), and the integer, TWA and LTTB ones VEX-encoded for AVX without AVX2 */
+#define KSUF sse
+#define KTARGET "sse4.2"
+#define KS_FLOAT 1
+#include "simd_sse.inc"
+#define KSUF avx
+#define KTARGET "avx"
+#define KS_FLOAT 0
+#include "simd_sse.inc"
+#endif
+
 /* points per call below which lttb_scalar is faster than the kernels (fold-bench: 8 points 0.6x, 16 on par) */
 #define LTTB_SMALL 16
 
@@ -1788,8 +1645,11 @@ static bool avx512_downclocks(void)
 }
 #endif
 
-/* The best kernels for at most `level` (TSDB_CPU caps it through cpu.c, so a
- * forced v2 run uses no AVX at all, as on Sandy Bridge without AVX2). */
+/* The best kernels for at most `level`: AVX-512 from v4, AVX2 from v3; AVX
+ * (Sandy Bridge, Ivy Bridge) and SSE4.2 at every level, as a CPU with them
+ * is still v2 (TSDB_CPU caps it through cpu.c). TSDB_SIMD caps the choice
+ * further, for benchmarks and tests: "scalar", "sse", "avx", "avx2" or
+ * "avx512" picks the best kernels up to that one this CPU has. */
 void simd_select(int level)
 {
     void (*f)(const float *, size_t, agg_state *, agg_dev *) = agg_scalar;
@@ -1802,17 +1662,25 @@ void simd_select(int level)
         lttb_scalar;
     const char *name = "scalar";
 #ifdef TSDB_X86
-    const char *force = getenv("TSDB_SIMD"); /* "scalar", "avx2" or "avx512", for benchmarking */
+    static const char *const names[] = {"scalar", "sse", "avx", "avx2", "avx512"};
+    const char *force = getenv("TSDB_SIMD");
+    int cap = 4;
+    for (int k = 0; force && k < 5; k++)
+        if (strcmp(force, names[k]) == 0)
+            cap = k;
     __builtin_cpu_init();
-    bool avx512 = level >= CPU_V4 && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq");
-    bool avx2 = level >= CPU_V3 && __builtin_cpu_supports("avx2");
-    if (avx512 && avx512_downclocks() && !(force && strcmp(force, "avx512") == 0))
-        avx512 = false;
-    if (force && strcmp(force, "scalar") == 0)
-        avx512 = avx2 = false;
-    else if (force && strcmp(force, "avx2") == 0)
-        avx512 = false;
-    if (avx512) {
+    int best = 0;
+    if (__builtin_cpu_supports("sse4.2"))
+        best = 1;
+    if (best == 1 && __builtin_cpu_supports("avx"))
+        best = 2;
+    if (best == 2 && level >= CPU_V3 && __builtin_cpu_supports("avx2"))
+        best = 3;
+    if (best == 3 && level >= CPU_V4 && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq") &&
+        (!avx512_downclocks() || (force && strcmp(force, "avx512") == 0)))
+        best = 4;
+    switch (best < cap ? best : cap) {
+    case 4:
         f = agg_avx512;
         f32 = fold_f32_avx512;
         f64 = fold_f64_avx512;
@@ -1821,7 +1689,8 @@ void simd_select(int level)
         twa = twa_avx512;
         lttb = lttb_avx512;
         name = "avx512";
-    } else if (avx2) {
+        break;
+    case 3:
         f = agg_avx2;
         f32 = fold_f32_avx2;
         f64 = fold_f64_avx2;
@@ -1830,6 +1699,28 @@ void simd_select(int level)
         twa = twa_avx2;
         lttb = lttb_avx2;
         name = "avx2";
+        break;
+    case 2:
+        f = agg_avx;
+        f32 = fold_f32_avx;
+        f64 = fold_f64_avx;
+        i64 = fold_i64_avx;
+        u32 = fold_u32_avx;
+        twa = twa_avx;
+        lttb = lttb_avx;
+        name = "avx";
+        break;
+    case 1:
+        f = agg_sse;
+        f32 = fold_f32_sse;
+        f64 = fold_f64_sse;
+        i64 = fold_i64_sse;
+        u32 = fold_u32_sse;
+        twa = twa_sse;
+        lttb = lttb_sse;
+        name = "sse";
+        break;
+    default: break;
     }
 #endif
     simd_agg_f32 = f;

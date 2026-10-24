@@ -3,7 +3,7 @@
 # (constructors), per-level code whose rounding depends on the CPU (FMA, libm's
 # dispatched functions), or uses instructions beyond x86-64-v2 outside the code
 # that is only reached after a CPU check: the per-level compiles (*.v3.o,
-# *.v4.o, functions *_v3/_v4), simd.c's kernels (functions *_avx2/*_avx512,
+# *.v4.o, functions *_v3/_v4), simd.c's kernels (functions *_avx/*_avx2/*_avx512,
 # and GCC's .part/.constprop clones of them), and zstd's BMI2 variants. An
 # emulator finds most such slips (qemu -cpu SandyBridge raises SIGILL), but not
 # LZCNT: older CPUs run it as BSR and silently get another result. So this
@@ -67,7 +67,7 @@ done
 for o in "$dir"/*.o; do
     case "$o" in *.v3.o | *.v4.o) continue ;; esac
     above_v2 "$o" | while read -r fn cnt; do
-        case "$(basename "$o"):${fn%%.*}" in simd.o:*_avx2 | simd.o:*_avx512) continue ;; esac
+        case "$(basename "$o"):${fn%%.*}" in simd.o:*_avx | simd.o:*_avx2 | simd.o:*_avx512) continue ;; esac
         echo "$o: $fn: $cnt instructions beyond x86-64-v2" >&2
         echo x >>"$tmp/bad"
     done
@@ -81,7 +81,7 @@ done | sort -u >"$tmp/level_fns"
 # simd.c's kernels by name, so a zstd or libc function that happens to end in
 # _avx2 is not let through
 nm --defined-only "$dir/simd.o" | awk '$2 ~ /^[tT]$/ {sub(/\..*/, "", $3); print $3}' |
-    grep -E '_avx2$|_avx512$' | sort -u >"$tmp/simd_fns"
+    grep -E '_avx$|_avx2$|_avx512$' | sort -u >"$tmp/simd_fns"
 for b in "$@"; do
     above_v2 "$b" | while read -r fn cnt; do
         base=${fn%%.*} # foo.part.0, foo.constprop.0

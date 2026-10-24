@@ -1,7 +1,7 @@
 /*
  * The aggregation folds over decoded values, per type and aggregate, at the
  * CPU level and kernels this process runs with (TSDB_CPU=v2|v3|v4 in a
- * `make dist` build, TSDB_SIMD=scalar|avx2|avx512):
+ * `make dist` build, TSDB_SIMD=scalar|sse|avx|avx2|avx512):
  *
  *   fold-bench [--rows 8192] [--ms 200] [--only SUBSTRING]
  *

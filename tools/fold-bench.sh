@@ -5,7 +5,8 @@
 #
 #   tools/fold-bench.sh [BUILD_DIR=build-dist] [ROUNDS=5] [fold-bench options...]
 #
-# Configurations: TSDB_CPU=v2 (no AVX: the scalar kernels compiled for x86-64-v2), v3 (AVX2), v4 (AVX-512).
+# Configurations: TSDB_CPU=v2 with TSDB_SIMD=scalar, sse (SSE4.2) and avx (AVX without AVX2, as on Sandy
+# Bridge), v3 (AVX2), v4 (AVX-512).
 set -eu
 dir=${1:-build-dist}
 rounds=${2:-5}
@@ -14,11 +15,14 @@ bench=$dir/fold-bench
 [ -x "$bench" ] || { echo "fold-bench.sh: no $bench (make dist)" >&2; exit 1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-configs="v2 v3 v4"
+configs="v2:scalar v2:sse v2:avx v3 v4"
 r=1
 while [ "$r" -le "$rounds" ]; do
     for c in $configs; do
-        TSDB_CPU=$c "$bench" "$@" >"$tmp/$c.$r"
+        case $c in
+        *:*) TSDB_CPU=${c%%:*} TSDB_SIMD=${c#*:} "$bench" "$@" >"$tmp/$c.$r" ;;
+        *) TSDB_CPU=$c "$bench" "$@" >"$tmp/$c.$r" ;;
+        esac
     done
     r=$((r + 1))
 done

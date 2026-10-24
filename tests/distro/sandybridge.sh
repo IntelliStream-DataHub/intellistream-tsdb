@@ -49,6 +49,10 @@ else
         grep -qP '^min\t1000\t500000\t' "$scratch/out" || { echo "=== FAILED: $cpu: count/sum of the CLI query"; fail=1; }
         run "$qemu" -cpu $cpu "$b/tsdb" "$scratch/cli-$cpu" stats
         grep -q 'codecs x86-64-v2' "$scratch/out" || { echo "=== FAILED: $cpu: the CLI did not pick the v2 codecs"; fail=1; }
+        # the aggregation kernels: SSE4.2 on Westmere, AVX (no AVX2) on Sandy Bridge
+        case $cpu in Westmere) k=sse ;; *) k=avx ;; esac
+        echo "=== $cpu: $(grep '^simd' "$scratch/out")"
+        grep -qE "^simd +$k, codecs" "$scratch/out" || { echo "=== FAILED: $cpu: the kernels are not $k"; fail=1; }
     done
 fi
 [ $fail -eq 0 ] && echo "sandybridge: all passed" || echo "sandybridge: FAILURES"

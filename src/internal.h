@@ -401,7 +401,7 @@ size_t lttb_argmax(int type, const int64_t *ts, const uint64_t *v, size_t n, int
                    double cx, double cy);
 const char *simd_name(void);
 void simd_init(void);
-/* Re-picks the kernels for at most `level` (CPU_BASE: scalar, CPU_V3: AVX2, CPU_V4: AVX-512); cpu.c calls it. */
+/* Re-picks the kernels for at most `level` (CPU_BASE: SSE4.2/AVX, CPU_V3: AVX2, CPU_V4: AVX-512); cpu.c calls it. */
 void simd_select(int level);
 
 /* ---- CPU levels (cpu.c, levels.h) ---- */

@@ -616,11 +616,12 @@ int main(void)
     make_inputs();
     buf = malloc(BUF(GR) + BLK_SLACK);
     dec = malloc(GR * 8 + BLK_SLACK);
-    static const char *const kernels[] = {"scalar", "avx2", "avx512"};
+    static const char *const kernels[] = {"scalar", "sse", "avx", "avx2", "avx512"};
+    static const int kmin[] = {CPU_BASE, CPU_BASE, CPU_BASE, CPU_V3, CPU_V4}; /* the lowest level of each */
     rec base = {0};
     int configs = 0;
     for (int level = CPU_BASE; level <= cpu_level_max(); level++) {
-        for (int k = 0; k <= level; k++) { /* each kernel the level allows: v2 has scalar only */
+        for (int k = 0; k < 5 && kmin[k] <= level; k++) { /* each kernel the level allows */
             setenv("TSDB_SIMD", kernels[k], 1);
             if (cpu_set_level(level) != 0)
                 break;
