@@ -1,6 +1,7 @@
 /*
  * Query load driver for the systems spoken to over HTTP or the PostgreSQL wire protocol.
- *   qdrive http HOST PORT HEADERS QFILE THREADS SECONDS [MAXQ]   lines: "GET path" or "POST path<TAB>ctype<TAB>body"
+ *   qdrive http HOST PORT HEADERS QFILE THREADS SECONDS [MAXQ]   lines: "GET path" or "POST path<TAB>ctype<TAB>body",
+ *                                                                 or several of them joined by " && "
  *   qdrive pg   CONNINFO QFILE THREADS SECONDS [MAXQ]            lines: SQL
  *
  * Each thread has its own connection; thread i runs queries i, i+T, i+2T, ... of the file
@@ -81,30 +82,39 @@ static void *run(void *arg)
             }
             j->rows += (unsigned long long)PQntuples(r);
             PQclear(r);
-        } else {
-            char method[8], path[16384], ctype[128] = "";
-            const char *body = "";
-            const char *sp = strchr(q, ' ');
-            snprintf(method, sizeof method, "%.*s", (int)(sp - q), q);
-            const char *t1 = strchr(sp + 1, '\t');
-            if (t1) {
-                snprintf(path, sizeof path, "%.*s", (int)(t1 - sp - 1), sp + 1);
-                const char *t2 = strchr(t1 + 1, '\t');
-                snprintf(ctype, sizeof ctype, "Content-Type: %.*s\r\n", (int)(t2 - t1 - 1), t1 + 1);
-                body = t2 + 1;
-            } else
-                snprintf(path, sizeof path, "%s", sp + 1);
-            char hdrs[4096];
-            snprintf(hdrs, sizeof hdrs, "%s%s", headers, ctype);
-            size_t rb = 0;
-            resp.n = 0;
-            int st = h_request(&c, method, path, hdrs, body, strlen(body), &resp, &rb);
-            if (st != 200) {
-                fprintf(stderr, "query failed: status %d: %.500s\n%.300s\n", st, resp.p ? resp.p : "", q);
-                exit(1);
+        } else
+            /* a line may hold several requests joined by " && " (Prometheus: one query_range for the whole
+               buckets of a window, one instant query for the partial ones at its ends); they run one after
+               the other and count as one query */
+            for (const char *seg = q; seg;) {
+                const char *nx = strstr(seg, " && ");
+                size_t sl = nx ? (size_t)(nx - seg) : strlen(seg);
+                char one[16384];
+                snprintf(one, sizeof one, "%.*s", (int)sl, seg);
+                seg = nx ? nx + 4 : NULL;
+                char method[8], path[16384], ctype[128] = "";
+                const char *body = "";
+                const char *sp = strchr(one, ' ');
+                snprintf(method, sizeof method, "%.*s", (int)(sp - one), one);
+                const char *t1 = strchr(sp + 1, '\t');
+                if (t1) {
+                    snprintf(path, sizeof path, "%.*s", (int)(t1 - sp - 1), sp + 1);
+                    const char *t2 = strchr(t1 + 1, '\t');
+                    snprintf(ctype, sizeof ctype, "Content-Type: %.*s\r\n", (int)(t2 - t1 - 1), t1 + 1);
+                    body = t2 + 1;
+                } else
+                    snprintf(path, sizeof path, "%s", sp + 1);
+                char hdrs[4096];
+                snprintf(hdrs, sizeof hdrs, "%s%s", headers, ctype);
+                size_t rb = 0;
+                resp.n = 0;
+                int st = h_request(&c, method, path, hdrs, body, strlen(body), &resp, &rb);
+                if (st != 200) {
+                    fprintf(stderr, "query failed: status %d: %.500s\n%.300s\n", st, resp.p ? resp.p : "", one);
+                    exit(1);
+                }
+                j->bytes += rb;
             }
-            j->bytes += rb;
-        }
         double dt = now() - a;
         if (j->n == j->cap) j->lat = realloc(j->lat, (j->cap = j->cap ? j->cap * 2 : 4096) * sizeof(double));
         j->lat[j->n++] = dt;

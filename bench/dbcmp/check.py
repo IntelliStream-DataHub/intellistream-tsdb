@@ -2,6 +2,7 @@
 # only the output format may differ) and the whole-range queries, and compares them with tsdb's
 # answers in ref/ (tsdbq dump / tsdbq full ... dump). Run in $WORK:
 #   python3 -I check.py SYS [N]          FULLS="0 3600" limits the whole-range queries ("" skips them)
+# REF_WINDOWS (ref/windows.jsonl) names other reference answers, e.g. all of them: tsdbq dump spec.tsv 10000.
 #
 # Raw windows compare row count, first and last timestamp and the sum of the values; buckets compare
 # start, count, sum, min and max; point lookups the value. Whole-range queries are reduced per series
@@ -19,6 +20,8 @@ TS_PORT = os.environ.get("TS_PORT", "5434")
 QDB_HTTP = os.environ.get("QDB_HTTP_PORT", "9100")
 I2_PORT = os.environ.get("I2_PORT", "8086")
 I3_PORT = os.environ.get("I3_PORT", "8181")
+PROM_PORT = os.environ.get("PROM_PORT", "9090")
+NSERIES = int(os.environ.get("NSERIES", "100"))  # series in the file, as for spec.py
 
 def f32(x):  # values are float32, and some servers print the shortest float32 text ("30.8")
     return struct.unpack('<f', struct.pack('<f', x))[0]
@@ -174,14 +177,52 @@ class I3:
         r = self.q(f"SELECT series, sum(c) AS c, sum(s) AS s, sum(mn) AS mn, sum(mx) AS mx, count(*) AS n FROM ({inner}) GROUP BY series ORDER BY series")
         return {int(x[0]): tuple(float(v) for v in x[1:]) for x in r}
 
-RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day")}
+
+class Prom:
+    """PromQL over Prometheus' HTTP API: a line is one or more requests joined by " && " (mkq.py)."""
+    def q(self, line):
+        out = []
+        for req in line.split(" && "):
+            r = json.loads(reqline(req, f"http://127.0.0.1:{PROM_PORT}", {}))
+            if r.get("status") != "success": raise RuntimeError(str(r)[:300])
+            out.append((req, r["data"]))
+        return out
+    def buckets(self, line):
+        """{series: {bucket start: {fn: value}}} from query_range (labelled by the evaluation time
+        b + w - 1) and from instant queries of clipped buckets (labelled b)."""
+        by = {}
+        for req, d in self.q(line):
+            step = urllib.parse.parse_qs(req.split("?", 1)[1]).get("step")
+            w = int(step[0][:-2]) if step else None  # "<w>ms"
+            for se in d["result"]:
+                m = se["metric"]; s = int(m.get("series", -1))
+                pts = se["values"] if d["resultType"] == "matrix" else [se["value"]]
+                for t, v in pts:
+                    b = round(float(t) * 1000) + 1 - w if w else int(m.get("b", 0))
+                    by.setdefault(s, {}).setdefault(b, {})[m["fn"]] = float(v)
+        return by
+    def rows(self, cls, line):
+        if cls in ("raw", "point"):
+            (_, d), = self.q(line)
+            assert d["resultType"] == "matrix" and len(d["result"]) <= 1
+            return [(round(float(t) * 1000), float(v)) for t, v in (d["result"][0]["values"] if d["result"] else [])]
+        by = self.buckets(line)
+        assert len(by) <= 1
+        bs = next(iter(by.values()), {})
+        return [(b, int(x["count"]), x["sum"], x["min"], x["max"]) for b, x in sorted(bs.items())]
+    def digest(self, n, line):
+        return {s: (sum(x["count"] for x in bs.values()), sum(x["sum"] for x in bs.values()), sum(x["min"] for x in bs.values()),
+                    sum(x["max"] for x in bs.values()), float(len(bs)))
+                for s, bs in self.buckets(line).items()}
+
+RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day"), "prom": Prom}
 
 def close(a, b, rel):
     return a == b or abs(a - b) <= rel * max(abs(a), abs(b), 1e-300)
 
 def main():
     run = RUNNERS[sysname]()
-    ref = [json.loads(l) for l in open("ref/windows.jsonl")]
+    ref = [json.loads(l) for l in open(os.environ.get("REF_WINDOWS", "ref/windows.jsonl"))]
     qfiles = {}
     bad = 0; checked = {}; worst_sum = 0.0
     first = {}  # spec.tsv holds the classes one after another: index within the class
@@ -218,14 +259,14 @@ def main():
     for n in [int(x) for x in os.environ.get("FULLS", "0 3600 60").split()]:
         q = open(f"q/{sysname}.full{n}.txt").read().strip()
         d = run.digest(n, q)
-        okc = len(d) == 100
-        for s in range(100):
+        okc = len(d) == NSERIES
+        for s in range(NSERIES):
             e = fref[(n, s)]; g = d.get(s)
             if g is None or not (g[0] == e[0] and g[4] == e[4] and close(g[1], e[1], 1e-9) and close(g[2], e[2], 1e-7) and close(g[3], e[3], 1e-7)):
                 okc = False
                 print("MISMATCH full", n, s, "got", g, "ref", e)
                 break
-        checked[f"full{n}"] = 100
+        checked[f"full{n}"] = NSERIES
         bad += not okc
     print(sysname, "checked", checked, "mismatches", bad, f"worst relative sum error {worst_sum:.2e}")
 

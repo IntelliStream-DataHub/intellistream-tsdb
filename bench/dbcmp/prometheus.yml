@@ -1,0 +1,6 @@
+# dbcmp: no scrape jobs (Prometheus would otherwise scrape itself into the same TSDB)
+storage:
+  tsdb:
+    out_of_order_time_window: 700d   # the data spans 694 days; see README.md
+    retention:
+      time: 10y                      # retention counts back from the newest block

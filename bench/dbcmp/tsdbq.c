@@ -9,6 +9,7 @@
  *                                             stderr (ref/full.jsonl)
  * tsdbd is at TSDB_HOST:TSDB_PORT (127.0.0.1:7070). Series ids are taken to equal the series
  * numbers of the RowBinary file, which holds when tsdbc-bench load created them in a fresh database.
+ * NSERIES (100) is the number of series for the whole-range queries, as for spec.py.
  */
 #include "tsdb_client.h"
 #include <math.h>
@@ -24,6 +25,8 @@ static q *qs;
 static size_t nq;
 static int threads;
 static double seconds;
+static uint32_t nseries = 100;
+#define MAXSERIES 1024
 
 static double now(void)
 {
@@ -100,12 +103,12 @@ static int cmpd(const void *a, const void *b)
 }
 
 /* ---- whole range ---- */
-typedef struct fjob { int id, conns; int64_t nsamp; /* 0: one bucket */ double digest[100][5]; } fjob;
+typedef struct fjob { int id, conns; int64_t nsamp; /* 0: one bucket */ double digest[MAXSERIES][5]; } fjob;
 static void *full_run(void *arg)
 {
     fjob *j = arg;
     tsdbc *c = conn();
-    for (uint32_t s = (uint32_t)j->id; s < 100; s += (uint32_t)j->conns) {
+    for (uint32_t s = (uint32_t)j->id; s < nseries; s += (uint32_t)j->conns) {
         tsdb_bucket *b;
         size_t nb;
         int rc = tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, j->nsamp * STEP[s % 7], &b, &nb);
@@ -177,6 +180,8 @@ int main(int argc, char **argv)
     if (argc >= 4 && !strcmp(argv[1], "full")) {
         int conns = atoi(argv[2]), reps = atoi(argv[3]);
         int dump = argc > 4;
+        if (getenv("NSERIES")) nseries = (uint32_t)atoi(getenv("NSERIES"));
+        if (nseries < 1 || nseries > MAXSERIES) { fprintf(stderr, "NSERIES: 1 to %d\n", MAXSERIES); return 2; }
         int64_t sizes[3] = {0, 3600, 60};
         const char *names[3] = {"count/sum/min/max per series", "buckets of 3600 samples", "buckets of 60 samples"};
         for (int k = 0; k < 3; k++) {
@@ -196,7 +201,7 @@ int main(int argc, char **argv)
             printf("full %-30s %3d conns: median %.4f s (min %.4f, max %.4f, %d runs)\n", names[k], conns, t[reps / 2],
                    t[0], t[reps - 1], reps);
             if (dump)
-                for (uint32_t s = 0; s < 100; s++) {
+                for (uint32_t s = 0; s < nseries; s++) {
                     double *d = jobs[s % conns].digest[s];
                     fprintf(stderr, "{\"full\":%ld,\"s\":%u,\"d\":[%.17g,%.17g,%.17g,%.17g,%.17g]}\n", sizes[k], s, d[0],
                             d[1], d[2], d[3], d[4]);

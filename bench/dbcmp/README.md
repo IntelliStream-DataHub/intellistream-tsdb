@@ -1,7 +1,7 @@
-# tsdb against six other databases, 100 M rows
+# tsdb against seven other databases, 100 M rows
 
-The harness behind the README's "100 million rows, six databases" tables: tsdb (through tsdbd and
-embedded), ClickHouse, TimescaleDB, QuestDB, InfluxDB 2 and InfluxDB 3 Core, each loaded with the
+The harness behind the README's "100 million rows" tables: tsdb (through tsdbd and embedded),
+ClickHouse, TimescaleDB, QuestDB, InfluxDB 2, InfluxDB 3 Core and Prometheus, each loaded with the
 same 100 M rows and asked the same queries, with every answer checked against tsdb's; and DuckDB,
 embedded like tsdb, compared with tsdb's library in the same process.
 
@@ -15,11 +15,12 @@ run nothing else heavy meanwhile.
 |---|---|
 | `Makefile` | builds the C programs into `build/dbcmp/` |
 | `env.sh` | defaults the scripts share (`DBCMP`, `WORK`, `DATA`, `BIN`, `CLICKHOUSE`) |
-| `conv.c` | RowBinary to line protocol (`lp`, `ilp32`) and CSV |
+| `conv.c` | RowBinary to line protocol (`lp`, `ilp32`), CSV and OpenMetrics (`om`) |
 | `spec.py` | the query list every system runs (`spec.tsv`) |
 | `mkq.py` | that list in each system's dialect (`q/`) |
 | `check.py` | compares a system's answers with tsdb's (`ref/`) |
 | `loadlp.c`, `httpc.h` | parallel line protocol loader over HTTP |
+| `loadprw.c` | Prometheus remote write loader (protobuf + snappy over HTTP, sharded by series) |
 | `qdrive.c` | query load driver, HTTP or PostgreSQL wire protocol |
 | `tsdbq.c`, `tsdbstat.c` | the same for tsdbd, the reference answers, and tsdbd's merge state |
 | `embq.c` | embedded driver: tsdb's library and DuckDB's C API, load, queries and answers |
@@ -27,12 +28,13 @@ run nothing else heavy meanwhile.
 | `qbench.sh` | the query runs through `qdrive` |
 | `ts_compress.sh` | `compress_chunk` on every TimescaleDB chunk |
 | `qdb_wait.sh`, `i2_settle.sh`, `i3_watch.sh` | wait for QuestDB's WAL apply, InfluxDB 2's compaction, InfluxDB 3's snapshot |
+| `prom_settle.sh` | wait for Prometheus' head and block compactions |
 
 ## Requirements
 
 Podman; gcc and make; libpq's shared library (`libpq.so.5`, package `libpq5` or `libpq`; headers
-are not needed); `psql` (TimescaleDB setup and `check.py ts`); curl, jq, bc; Python 3 (standard
-library only); about 25 GB free on the disk under `$DBCMP` and 30 GB of free memory. For DuckDB,
+are not needed); snappy's shared library (`libsnappy.so.1`, package `libsnappy1v5` or `snappy`; no
+headers); `psql` (TimescaleDB setup and `check.py ts`); curl, jq, bc; Python 3 (standard library only); about 25 GB free on the disk under `$DBCMP` and 30 GB of free memory. For DuckDB,
 its C library release (below); `make` builds `embq` only when it finds that.
 
 ## Setup
@@ -42,7 +44,7 @@ Paths are absolute. The scripts read these variables (defaults in `env.sh`):
 ```sh
 cd <repository>
 make                                      # tsdb, tsdbd, tsdb-bench, tsdbc-bench, the client library
-make -C bench/dbcmp                       # build/dbcmp/{conv,loadlp,qdrive,tsdbq,tsdbstat}
+make -C bench/dbcmp                       # build/dbcmp/{conv,loadlp,loadprw,qdrive,tsdbq,tsdbstat}
 export DBCMP=/var/tmp/dbcmp               # every data directory goes here: one disk for all systems
 export DATA=$DBCMP/input/mixed.rowbinary
 export WORK=$DBCMP/work                   # spec.tsv, q/, ref/, res/
@@ -56,13 +58,17 @@ mkdir -p $DBCMP/input $WORK/ref $WORK/res
 
 ```sh
 $T/tsdb-bench --export $DATA --series 100 --points 1000000
-for f in lp ilp32 csv; do $B/conv $f $DATA $DBCMP/input/mixed.$f & done; wait   # 2 min, not part of a load
+for f in lp ilp32 csv om; do $B/conv $f $DATA $DBCMP/input/mixed.$f & done; wait   # 2 min, not part of a load
 cd $WORK && python3 -I $H/spec.py $DATA 10000 > spec.tsv
 ```
 
 Before each load, read its input once (`cat FILE > /dev/null`) so it comes from the page cache,
 and run `sync`. After starting a server, check that its ports are on 127.0.0.1 only:
-`ss -ltnp | grep -E ':(7070|8123|9000|5434|9100|9103|8812|9109|8086|8181)\b'`.
+`ss -ltnp | grep -E ':(7070|8123|9000|5434|9100|9103|8812|9109|8086|8181|9090|9091)\b'`.
+
+A smaller sample runs the same way: `tsdb-bench --export $DATA --series 10 --points 1000000` and
+`export NSERIES=10` for `spec.py`, `mkq.py`, `check.py` and `tsdbq` (the windows need the 1 M
+samples per series).
 
 ## tsdb (first: it gives the reference answers)
 
@@ -221,6 +227,89 @@ minutes, and 32 concurrent 7-day aggregates got the server OOM-killed at 28 GB. 
 the WAL (20 s) and starts the one-hour snapshot timer again. The whole-range queries touch about
 100,000 Parquet files, hence `--query-file-limit`; the default was not tried.
 
+## Prometheus 3.15.0
+
+Set up as Prometheus' docs describe it for this data: one metric `sensors` with a label
+`series` (like InfluxDB's tag), float64 values (it has no float32; they hold the exact float32
+value). `prometheus.yml` here has no scrape jobs (Prometheus would scrape itself into the same
+TSDB), `out_of_order_time_window: 700d` and `retention.time: 10y`: the data spans 694 days from
+2024-01-01, retention counts back from the newest block, and the window must cover all of it for
+remote write (below). Retention also caps the largest compacted block at 10% of it, at most 31 days;
+so blocks grow to 486 h (2 h x 3^5). The flags add the remote write receiver, the admin API (only
+for the size snapshot) and `--query.max-concurrency=32` (default 20) so that 32 clients run at once.
+The image runs as `nobody`, hence the `chown`.
+
+Two loads, each into its own fresh data directory and container:
+
+- **Remote write** (protocol 1.0, protobuf + snappy; the image also accepts 2.0, which mainly saves
+  bandwidth through interned labels): `loadprw` sends like Prometheus' own remote write queue,
+  series spread over shards (`series % shards`), each shard one request at a time on its own
+  connection, so a series' samples arrive in order. 2000 samples per request is Prometheus'
+  `max_samples_per_send` default; 16 shards (its default `max_shards` is 50). Requests are encoded
+  before the clock starts (as the other loaders send pre-converted files); the loader prints its
+  own CPU time while sending, about 0.1 cores at 7 M samples/s, far from a bottleneck.
+  The file's order (all series at sample i, then i + 1, with sample steps from 1 ms to 60 s)
+  means the 60 s series run 694 days ahead of the 1 ms ones: almost every sample is older than the
+  head's newest minus 1 h and goes through the out-of-order path. Head compaction then writes one
+  2 h block per 2 h of the span (8,333 blocks), out-of-order compaction thousands more, and
+  vertical and leveled compactions merge them: on a 10 M-row sample 29,144 compactions over 78
+  minutes, down to 40 blocks; `prom_settle.sh` waits for that. The out-of-order path also cuts
+  chunks at 32 samples (`out_of_order_cap_max`), and compaction keeps them: 3.7 times the chunks of
+  the backfill (120 samples) and 22% more bytes.
+- **Backfill** (the docs' route for historical data): `promtool tsdb create-blocks-from openmetrics`
+  writes blocks from an OpenMetrics file (`conv om`, not part of the load), then a server starts on
+  them. `--max-block-duration=744h` follows the docs' advice for long ranges: promtool picks the
+  largest compaction range up to that, 486 h, the size the server compacts to, so nothing is left to
+  compact. The load time is promtool's plus the server's start until `/-/ready`.
+
+Size: the blocks, with the WAL, the out-of-order WBL and the head's chunks apart; then a snapshot
+(admin API), which writes the head too as a block next to hard links of the others, so that every
+row is counted once. The backfill leaves nothing outside its blocks.
+
+```sh
+P=$DBCMP/prometheus
+IMG=docker.io/prom/prometheus:v3.15.0   # sha256:86b17a25c2db1d16a61b16b3c8f336679eb19e26333d03e808da387206e40faa
+mkdir -p $P/data $P/data-bf && cp $H/prometheus.yml $P/ && podman unshare chown 65534:65534 $P/data $P/data-bf
+prom() { # NAME PORT DATADIR
+  podman run -d --name $1 --network host -v $3:/prometheus -v $P/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+    $IMG --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --web.listen-address=127.0.0.1:$2 \
+    --web.enable-remote-write-receiver --web.enable-admin-api --query.max-concurrency=32; }
+
+# (a) remote write, settle, size
+prom dbcmp-prom 9090 $P/data && until curl -sf 127.0.0.1:9090/-/ready; do sleep 0.1; done
+cat $DATA > /dev/null; sync; $B/loadprw $DATA 127.0.0.1 9090 2000 16
+$H/prom_settle.sh $(date +%s) | tee $WORK/res/prom-settle.log   # 78 min for 10 M rows: see above
+podman unshare sh -c "cd $P/data && du -scb 01* | tail -1 && du -sb wal wbl chunks_head"
+S=$(curl -s -XPOST 127.0.0.1:9090/api/v1/admin/tsdb/snapshot | jq -r .data.name)
+podman unshare du -sb $P/data/snapshots/$S && podman unshare rm -rf $P/data/snapshots/$S
+podman stop dbcmp-prom
+
+# (b) backfill, then a server on the blocks (port 9091, so both can be kept; one runs at a time)
+cat $DBCMP/input/mixed.om > /dev/null; sync
+time podman run --rm --network none -v $DBCMP/input:/input:ro -v $P/data-bf:/prometheus --entrypoint /bin/promtool $IMG \
+  tsdb create-blocks-from openmetrics --max-block-duration=744h -q /input/mixed.om /prometheus
+time (prom dbcmp-prom-bf 9091 $P/data-bf && until curl -sf 127.0.0.1:9091/-/ready; do sleep 0.1; done)
+podman unshare sh -c "cd $P/data-bf && du -scb 01* | tail -1 && du -sb wal wbl chunks_head"
+```
+
+Queries, PromQL over the HTTP API (`mkq.py` says how each class is written). A range selector
+`m[r]` at time t holds the samples in (t - r, t], so the rows of [a, b) are `m[b - a]` at b - 1 ms,
+and a bucket [k w, (k + 1) w) is `count_over_time(m[w])` (and `sum_`, `min_`, `max_over_time`) at
+(k + 1) w - 1; range selectors return stored samples, so lookback and staleness do not enter. The
+whole buckets of a window are one `query_range` with step w; where a window starts or ends inside
+a bucket, that bucket is clipped to the window by its own range at a fixed time (`@`), both ends in
+one instant query: an aggregate window is two requests, sent one after the other on one
+connection and timed as one query (`qdrive` runs lines of requests joined by ` && `). Whole range:
+one instant query for count/sum/min/max, and for buckets one `query_range` per step group, cut at
+Prometheus' 11,000 points per series (2 requests per group for buckets of 60 samples).
+
+```sh
+cd $WORK && python3 -I $H/mkq.py prom
+PROM_PORT=9091 python3 -I $H/check.py prom 200 && $H/qbench.sh prom http 127.0.0.1 9091 ""   # backfill
+podman stop dbcmp-prom-bf && podman start dbcmp-prom && until curl -sf 127.0.0.1:9090/-/ready; do sleep 0.1; done
+python3 -I $H/check.py prom 200 && $H/qbench.sh prom http 127.0.0.1 9090 ""                   # remote write
+```
+
 ## DuckDB 1.5.6, embedded, against tsdb embedded
 
 Both run in the driver's process: tsdb through `build/libtsdb.a`, DuckDB through its C API, with the
@@ -285,31 +374,39 @@ time bounds are cast to `TIMESTAMP_MS` so that both reach the scan as plain tabl
 ## Fairness notes
 
 - **Durability at acknowledgement differs.** tsdb, PostgreSQL and both InfluxDBs flush to disk before
-  acknowledging; ClickHouse and QuestDB (`cairo.commit.mode=nosync`) do not. Time the `sync -f`
-  after their loads separately.
+  acknowledging; ClickHouse, QuestDB (`cairo.commit.mode=nosync`) and Prometheus (its WAL is synced
+  when a 128 MB segment is full) do not. Time the `sync -f` after their loads separately.
 - **Background work.** InfluxDB 2's full-compaction wait was cut from 4 h to 1 min so it can be
   measured; its 10-minute cache snapshot wait is the default. TimescaleDB compresses from 16
   sessions, where its policy would use one job. ClickHouse keeps merging lazily long after
-  `ch_load.sh` calls it settled.
-- **Types.** Values are float32 everywhere except both InfluxDBs, which only have float64 (they
-  store the exact float32 value).
+  `ch_load.sh` calls it settled. Prometheus' remote write is made for live data, not two years of
+  history in one go: almost all of it takes the out-of-order path and leaves thousands of 2 h blocks
+  to compact (78 minutes for 10 M rows); its backfill (promtool) is the route its docs give for history, and is
+  reported next to it.
+- **Types.** Values are float32 everywhere except both InfluxDBs and Prometheus, which only have
+  float64 (they store the exact float32 value).
 - **Indexes.** TimescaleDB has only the default `ts` index on uncompressed chunks, which favours its
   load. QuestDB is measured without and with a symbol index.
 - **Input order and limits.** Every system gets the file in its original order (all series at sample
   i, then i+1), not sorted by time. InfluxDB 2 has a 24 GB and InfluxDB 3 a 28 GB container limit;
-  InfluxDB 3's memory pools are set for that.
+  InfluxDB 3's memory pools are set for that. Prometheus' remote write gets each series in that
+  order too (each series on one shard); its backfill reads the OpenMetrics file in that order.
 - **DuckDB.** It has no last-write-wins: without a primary key, a second write of a timestamp adds a
   row (tsdb replaces it); with one, every append would pay a key check. Its input is sorted by
   (series, ts) before the load (timed apart) while tsdb takes the file unsorted. It runs with
   threads = 32 and memory_limit = 24GB; tsdb queries use every core too (`query_threads`), so
   "1 thread" means one calling thread for both. Its fsync behaviour on commit was not examined.
 - **Clients.** ClickHouse uses its own native client (`clickhouse-benchmark`), tsdbd the C client,
-  the others `qdrive` over HTTP or libpq. InfluxDB 3's Flight SQL was not tried.
+  the others `qdrive` over HTTP or libpq. InfluxDB 3's Flight SQL was not tried. PromQL cannot clip a
+  bucket to a window that starts or ends inside it, so Prometheus answers an aggregate window with
+  two requests (whole buckets, then the clipped ends), timed together as one query; its whole-range
+  bucket queries are 4 or 8 `query_range` requests (11,000 points per series at most). Its JSON
+  answers are larger than the others' (buckets of 60 samples: about 11 MB per series).
 
 ## Cleaning up
 
 ```sh
-podman stop dbcmp-clickhouse dbcmp-timescale dbcmp-questdb dbcmp-influx2 dbcmp-influx3
-podman rm dbcmp-clickhouse dbcmp-timescale dbcmp-questdb dbcmp-influx2 dbcmp-influx3
+podman stop dbcmp-clickhouse dbcmp-timescale dbcmp-questdb dbcmp-influx2 dbcmp-influx3 dbcmp-prom dbcmp-prom-bf
+podman rm dbcmp-clickhouse dbcmp-timescale dbcmp-questdb dbcmp-influx2 dbcmp-influx3 dbcmp-prom dbcmp-prom-bf
 podman unshare rm -rf $DBCMP           # the containers' files belong to mapped users (and DuckDB's download)
 ```

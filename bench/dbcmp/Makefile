@@ -2,7 +2,8 @@
 #
 # tsdbq and tsdbstat link the client library, which the top-level Makefile builds. qdrive needs
 # only libpq's shared library, not its headers: it declares the few functions it calls. Without
-# pkg-config it links libpq.so.5 by name (Debian/Ubuntu: libpq5; Fedora: libpq).
+# pkg-config it links libpq.so.5 by name (Debian/Ubuntu: libpq5; Fedora: libpq). loadprw, the Prometheus
+# remote write loader, likewise needs only snappy's shared library (libsnappy1v5; Fedora: snappy).
 #
 # embq, the embedded tsdb / DuckDB driver, is built only when DUCKDB names a directory holding
 # duckdb.h and libduckdb.so from a DuckDB C library release (see README.md); the path to the
@@ -13,11 +14,12 @@ CC      ?= cc
 CFLAGS  ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter
 LIBPQ   ?= $(shell pkg-config --libs libpq 2>/dev/null || echo -l:libpq.so.5)
+SNAPPY  ?= $(shell pkg-config --libs snappy 2>/dev/null || echo -l:libsnappy.so.1)
 CLIB    := $(ROOT)/build/libtsdbclient.a
 LIB     := $(ROOT)/build/libtsdb.a
 DUCKDB  ?= /var/tmp/dbcmp/duckdb/v1.5.6/lib
 
-PROGS := $(addprefix $(OUT)/,conv loadlp qdrive tsdbq tsdbstat)
+PROGS := $(addprefix $(OUT)/,conv loadlp loadprw qdrive tsdbq tsdbstat)
 ifneq ($(wildcard $(DUCKDB)/duckdb.h),)
 PROGS += $(OUT)/embq
 endif
@@ -32,6 +34,9 @@ $(OUT)/conv: conv.c | $(OUT)
 
 $(OUT)/loadlp: loadlp.c httpc.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
+$(OUT)/loadprw: loadprw.c httpc.h | $(OUT)
+	$(CC) $(CFLAGS) -o $@ $< $(SNAPPY) -lpthread
 
 $(OUT)/qdrive: qdrive.c httpc.h | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBPQ) -lpthread
