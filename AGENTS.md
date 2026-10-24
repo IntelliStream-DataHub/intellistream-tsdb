@@ -12,6 +12,8 @@ make test IO=epoll        # server tests on epoll only (where io_uring is disabl
 make asan                 # the tests under AddressSanitizer + UBSan
 make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
 make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO
+make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz/); a crash-* input,
+                          # once fixed, goes to tests/fuzz/frames/, which make test replays
 make PORTABLE=1           # without -march=native
 make NO_URING=1           # tsdbd on epoll only, without liburing (after make clean)
 make dist                 # portable tarball (x86-64-v2 + v3/v4 codecs) in build-dist/; checks glibc and ISA
