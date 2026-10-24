@@ -1,19 +1,42 @@
 /*
- * Time zones for calendar grouping: UTC, fixed offsets ("+02:00", "-0530")
- * and IANA names read from the system's zoneinfo (TZif, versions 1 to 4).
- * Instants after the last transition in the file follow the POSIX rule in
- * its footer, as in "CET-1CEST,M3.5.0,M10.5.0/3", so DST keeps working for
- * future years with "slim" zoneinfo files too.
+ * Calendar periods in a time zone, as UTC bucket bounds (tsdb_calendar.h).
  *
- * Loaded zones are cached for the life of the process.
+ * The database itself only knows UTC. Grouping by local days, weeks or months
+ * happens on the client side: this file turns "per day in Europe/Oslo" into
+ * the UTC instants at which each local day begins (23 or 25 hours apart
+ * around DST changes), and the database groups by those bounds.
+ *
+ * Zones: UTC, fixed offsets ("+02:00", "-0530") and IANA names read from the
+ * system's zoneinfo (TZif, versions 1 to 4). Instants after the last
+ * transition in the file follow the POSIX rule in its footer, as in
+ * "CET-1CEST,M3.5.0,M10.5.0/3", so DST keeps working for future years with
+ * "slim" zoneinfo files too. Loaded zones are cached for the life of the
+ * process.
  */
-#include "internal.h"
+#include "tsdb_calendar.h"
 
 #include <ctype.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+typedef struct tz tz;
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MAX_BOUNDS (64u << 20)
+
+static inline int64_t floor_div(int64_t a, int64_t b) /* b > 0 */
+{
+    int64_t q = a / b;
+    return (a % b < 0) ? q - 1 : q;
+}
 
 typedef struct posix_rule {
     int month, week, wday; /* Mm.w.d */
@@ -45,7 +68,7 @@ static int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
     return era * 146097 + (int64_t)doe - 719468;
 }
 
-void tz_civil(int64_t days, int64_t *y, int *m, int *d)
+static void tz_civil(int64_t days, int64_t *y, int *m, int *d)
 {
     int64_t z = days + 719468;
     int64_t era = (z >= 0 ? z : z - 146096) / 146097;
@@ -58,7 +81,7 @@ void tz_civil(int64_t days, int64_t *y, int *m, int *d)
     *y = (int64_t)yoe + era * 400 + (*m <= 2);
 }
 
-int64_t tz_days_from_civil(int64_t y, int m, int d) { return days_from_civil(y, (unsigned)m, (unsigned)d); }
+static int64_t tz_days_from_civil(int64_t y, int m, int d) { return days_from_civil(y, (unsigned)m, (unsigned)d); }
 
 /* ------------------------------------------------------------ POSIX rule */
 
@@ -268,7 +291,7 @@ static int load_zone(const char *name, tz *z)
     return rc;
 }
 
-int tz_get(const char *name, const tz **out)
+static int tz_get(const char *name, const tz **out)
 {
     if (!name || !*name)
         name = "UTC";
@@ -299,7 +322,7 @@ int tz_get(const char *name, const tz **out)
 }
 
 /* Offset in seconds east of UTC at UTC second t. */
-int32_t tz_offset(const tz *z, int64_t t)
+static int32_t tz_offset(const tz *z, int64_t t)
 {
     if (z->ntrans == 0 || t < z->trans[0])
         return z->ntrans == 0 && z->has_rule ? rule_offset(z, t) : z->before;
@@ -319,7 +342,7 @@ int32_t tz_offset(const tz *z, int64_t t)
 /* The UTC second at which local time `local` (seconds) begins. Repeated local
  * times (DST ends) give the first; skipped ones (DST starts) give the moment
  * the clock jumps past them. */
-int64_t tz_utc(const tz *z, int64_t local)
+static int64_t tz_utc(const tz *z, int64_t local)
 {
     int32_t a = tz_offset(z, local - 2 * 86400), b = tz_offset(z, local + 2 * 86400);
     int32_t lo_off = MIN(a, b), hi_off = MAX(a, b);
@@ -343,38 +366,90 @@ int64_t tz_utc(const tz *z, int64_t local)
     return hi;
 }
 
-/* The first UTC second after t at which the offset changes (INT64_MAX if never). */
-int64_t tz_next_transition(const tz *z, int64_t t)
-{
-    if (z->ntrans && t < z->trans[z->ntrans - 1]) {
-        size_t lo = 0, hi = z->ntrans; /* first transition > t */
-        while (lo < hi) {
-            size_t mid = (lo + hi) / 2;
-            if (z->trans[mid] <= t)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        return z->trans[lo];
-    }
-    if (!z->rule_dst)
-        return INT64_MAX;
-    int64_t y;
-    int m, d;
-    tz_civil(t >= 0 ? t / 86400 : -((-t + 86399) / 86400), &y, &m, &d);
-    int64_t best = INT64_MAX;
-    for (int64_t yy = y; yy <= y + 1; yy++) {
-        int64_t a = rule_utc(&z->start, yy, z->std_off), b = rule_utc(&z->end, yy, z->dst_off);
-        if (a > t && a < best)
-            best = a;
-        if (b > t && b < best)
-            best = b;
-    }
-    return best;
-}
 
-int32_t tz_fixed_offset(const tz *z, bool *fixed)
+static int32_t tz_fixed_offset(const tz *z, bool *fixed)
 {
     *fixed = z->ntrans == 0 && !z->rule_dst;
     return z->has_rule ? z->std_off : z->before;
+}
+
+/* ------------------------------------------------------------------ bounds */
+
+static const int64_t unit_ms[] = {0, 1000, 60000, 3600000};
+
+/* index of the local calendar unit (days, ISO weeks, months, quarters, years since 1970) */
+static int64_t cal_index(const tz *z, tsdb_unit unit, int64_t ts)
+{
+    int64_t s = floor_div(ts, 1000), local = s + tz_offset(z, s);
+    int64_t day = floor_div(local, 86400);
+    switch (unit) {
+    case TSDB_DAY: return day;
+    case TSDB_WEEK: return floor_div(day + 3, 7); /* 1970-01-01 was a Thursday */
+    default: {
+        int64_t y;
+        int m, d;
+        tz_civil(day, &y, &m, &d);
+        int64_t month = (y - 1970) * 12 + (m - 1);
+        return unit == TSDB_MONTH ? month : unit == TSDB_QUARTER ? floor_div(month, 3) : y - 1970;
+    }
+    }
+}
+
+/* local seconds at which calendar unit `idx` begins */
+static int64_t cal_local_start(tsdb_unit unit, int64_t idx)
+{
+    switch (unit) {
+    case TSDB_DAY: return idx * 86400;
+    case TSDB_WEEK: return (idx * 7 - 3) * 86400;
+    case TSDB_MONTH:
+    case TSDB_QUARTER: {
+        int64_t month = unit == TSDB_MONTH ? idx : idx * 3;
+        return tz_days_from_civil(1970 + floor_div(month, 12), (int)(month - floor_div(month, 12) * 12) + 1, 1) * 86400;
+    }
+    default: return tz_days_from_civil(1970 + idx, 1, 1) * 86400;
+    }
+}
+
+int tsdb_calendar_bounds(const char *zone, tsdb_unit unit, uint32_t count, int64_t start, int64_t end,
+                         int64_t **bounds, size_t *n)
+{
+    *bounds = NULL;
+    *n = 0;
+    if (unit < TSDB_SECOND || unit > TSDB_YEAR)
+        return TSDB_ERR_INVALID;
+    if (start >= end)
+        return 0;
+    /* beyond a few hundred thousand years the arithmetic below would overflow */
+    const int64_t limit = 1000LL * 86400 * 366 * 200000;
+    if (start < -limit || end > limit)
+        return TSDB_ERR_INVALID;
+    const tz *z;
+    int rc = tz_get(zone, &z);
+    if (rc)
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_INVALID : rc;
+    int64_t c = count ? count : 1, k0, k1, interval = 0, shift = 0;
+    if (unit <= TSDB_HOUR) {
+        bool fixed;
+        interval = unit_ms[unit] * c;
+        shift = (int64_t)tz_fixed_offset(z, &fixed) * 1000;
+        k0 = floor_div(start + shift, interval);
+        k1 = floor_div(end - 1 + shift, interval);
+    } else {
+        k0 = floor_div(cal_index(z, unit, start), c);
+        k1 = floor_div(cal_index(z, unit, end - 1), c);
+    }
+    if (k1 - k0 + 1 > (int64_t)MAX_BOUNDS)
+        return TSDB_ERR_TOO_MANY_BUCKETS;
+    int64_t *b = malloc((size_t)(k1 - k0 + 1) * sizeof *b);
+    if (!b)
+        return TSDB_ERR_NOMEM;
+    size_t m = 0;
+    for (int64_t k = k0; k <= k1; k++) {
+        int64_t t = unit <= TSDB_HOUR ? k * interval - shift : tz_utc(z, cal_local_start(unit, k * c)) * 1000;
+        if (m == 0 || t > b[m - 1]) /* bounds strictly increase */
+            b[m++] = t;
+    }
+    *bounds = b;
+    *n = m;
+    return 0;
 }

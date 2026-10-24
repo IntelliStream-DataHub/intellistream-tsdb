@@ -45,8 +45,11 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable.
 - `src/merge.c`: merge selection and execution. `src/query.c`: snapshots, raw
   queries, aggregation, bucketing. `src/manifest.c`: MANIFEST, retired parts, followers.
-- `src/codec*.c`: codecs; `src/simd.c`: dispatched aggregation kernels;
-  `src/tz.c`: time zones (TZif and POSIX rules).
+- `src/codec*.c`: codecs; `src/simd.c`: dispatched aggregation kernels.
+- `client/tsdb_calendar.c`: time zones (TZif and POSIX rules) and the UTC
+  bounds of local periods. The engine and the server know UTC only; the
+  clients turn local periods into bounds (QUERY_BOUNDS). `src/calendar.c`:
+  the same for embedded use (`tsdb_query_group_local`).
 - `server/tsdbd.c`: io_uring server. `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
   A protocol change has to reach all four; `make test-clients` runs their tests.
@@ -92,8 +95,10 @@ cgroup, so `nice` does not keep your work out of its way.
   records (16-byte rows) are still read; keep it that way, `test_types` writes
   both by hand. Value blocks name their codec, so new codecs can be added
   without a version bump; changing an existing layout needs one.
-- **Protocol** version 2 added operations without changing version 1 ones:
-  old clients keep working. A change to the wire format has to reach the C,
+- **Protocol** versions only add: version 2 typed operations, 3 packed
+  inserts, 4 QUERY_BOUNDS. Old clients keep working, except that grouping by a
+  time zone other than UTC now needs a version 4 client: the server refuses
+  zones. A new client asks HELLO and falls back for an old server. A change to the wire format has to reach the C,
   Rust, Python and Java clients.
 
 ## Conventions

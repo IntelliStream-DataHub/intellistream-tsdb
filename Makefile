@@ -20,8 +20,12 @@ all: $(LIB) build/tsdb build/tsdb-bench build/codec-bench build/insert-bench bui
 build/%.o: src/%.c src/internal.h include/tsdb.h | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(LIB): $(OBJ)
+# the calendar helper is client-side code, in both libraries: the engine itself knows UTC only
+$(LIB): $(OBJ) build/tsdb_calendar.o
 	$(AR) rcs $@ $^
+
+build/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsdb.h | build
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 build/tsdb: tools/tsdb-cli.c tools/common.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -91,7 +95,7 @@ build/tsdb_client.o: client/tsdb_client.c client/tsdb_client.h include/tsdb_prot
 build/tsdb_pack.o: client/tsdb_pack.c client/tsdb_pack.h include/tsdb_protocol.h | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(CLIB): build/tsdb_client.o build/tsdb_pack.o
+$(CLIB): build/tsdb_client.o build/tsdb_pack.o build/tsdb_calendar.o
 	$(AR) rcs $@ $^
 
 build/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB)

@@ -304,15 +304,12 @@ int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g)
     }
     if (g->unit < TSDB_SECOND || g->unit > TSDB_YEAR)
         return TSDB_ERR_INVALID;
-    int rc = tz_get(g->timezone, &bk->zone);
-    if (rc)
-        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_INVALID : rc;
+    if (g->timezone && strcmp(g->timezone, "UTC") != 0)
+        return TSDB_ERR_INVALID; /* UTC only: a client turns local periods into bounds */
     bk->count = g->count ? g->count : 1;
     if (g->unit <= TSDB_HOUR) {
-        bool fixed;
         bk->kind = BK_FIXED;
         bk->interval = unit_ms[g->unit] * bk->count;
-        bk->shift = (int64_t)tz_fixed_offset(bk->zone, &fixed) * 1000;
         return 0;
     }
     bk->kind = BK_CALENDAR;
@@ -320,37 +317,68 @@ int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g)
     return 0;
 }
 
-static inline int64_t secs_of(int64_t ms) { return floor_div(ms, 1000); }
+int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n)
+{
+    memset(bk, 0, sizeof *bk);
+    if (n == 0)
+        return TSDB_ERR_INVALID;
+    for (size_t i = 1; i < n; i++)
+        if (bounds[i] <= bounds[i - 1])
+            return TSDB_ERR_INVALID;
+    bk->kind = BK_BOUNDS;
+    bk->bounds = bounds;
+    bk->nbounds = n;
+    return 0;
+}
 
-/* index of the calendar unit (days, ISO weeks, months, quarters, years since 1970) */
+static inline int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
+{
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static inline void civil_from_days(int64_t days, int64_t *y, int *m)
+{
+    int64_t z = days + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097), yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = (int64_t)yoe + era * 400 + (*m <= 2);
+}
+
+/* index of the UTC calendar unit (days, ISO weeks, months, quarters, years since 1970) */
 static int64_t cal_index(const bucketer *bk, int64_t ts)
 {
-    int64_t s = secs_of(ts), local = s + tz_offset(bk->zone, s);
-    int64_t day = floor_div(local, 86400);
+    int64_t day = floor_div(ts, 86400000);
     switch (bk->unit) {
     case TSDB_DAY: return day;
     case TSDB_WEEK: return floor_div(day + 3, 7); /* 1970-01-01 was a Thursday */
     default: {
         int64_t y;
-        int m, d;
-        tz_civil(day, &y, &m, &d);
+        int m;
+        civil_from_days(day, &y, &m);
         int64_t month = (y - 1970) * 12 + (m - 1);
         return bk->unit == TSDB_MONTH ? month : bk->unit == TSDB_QUARTER ? floor_div(month, 3) : y - 1970;
     }
     }
 }
 
-static int64_t cal_local_start(const bucketer *bk, int64_t idx)
+/* the day (since 1970) on which calendar unit `idx` begins */
+static int64_t cal_start_day(const bucketer *bk, int64_t idx)
 {
     switch (bk->unit) {
-    case TSDB_DAY: return idx * 86400;
-    case TSDB_WEEK: return (idx * 7 - 3) * 86400;
+    case TSDB_DAY: return idx;
+    case TSDB_WEEK: return idx * 7 - 3;
     case TSDB_MONTH:
     case TSDB_QUARTER: {
         int64_t month = bk->unit == TSDB_MONTH ? idx : idx * 3;
-        return tz_days_from_civil(1970 + floor_div(month, 12), (int)(month - floor_div(month, 12) * 12) + 1, 1) * 86400;
+        return days_from_civil(1970 + floor_div(month, 12), (unsigned)(month - floor_div(month, 12) * 12) + 1, 1);
     }
-    default: return tz_days_from_civil(1970 + idx, 1, 1) * 86400;
+    default: return days_from_civil(1970 + idx, 1, 1);
     }
 }
 
@@ -358,7 +386,11 @@ static inline int64_t bk_key(const bucketer *bk, int64_t ts)
 {
     switch (bk->kind) {
     case BK_ONE: return 0;
-    case BK_FIXED: return floor_div(sat_add(ts, bk->shift), bk->interval);
+    case BK_FIXED: return floor_div(ts, bk->interval);
+    case BK_BOUNDS: { /* the last bound at or before ts */
+        size_t i = lower_bound_i64(bk->bounds, bk->nbounds, sat_add(ts, 1));
+        return (int64_t)i - 1;
+    }
     default: return floor_div(cal_index(bk, ts), bk->count);
     }
 }
@@ -368,8 +400,9 @@ static inline int64_t bk_start(const bucketer *bk, int64_t key)
 {
     switch (bk->kind) {
     case BK_ONE: return bk->start;
-    case BK_FIXED: return sat_add(sat_mul(key, bk->interval), -bk->shift);
-    default: return sat_mul(tz_utc(bk->zone, cal_local_start(bk, key * bk->count)), 1000);
+    case BK_FIXED: return sat_mul(key, bk->interval);
+    case BK_BOUNDS: return key < 0 ? INT64_MIN : (size_t)key < bk->nbounds ? bk->bounds[key] : INT64_MAX;
+    default: return sat_mul(cal_start_day(bk, key * bk->count), 86400000);
     }
 }
 
@@ -422,14 +455,6 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, 
         int64_t b = bk_key(t->bk, ts[i]);
         int64_t bend = bk_start(t->bk, b + 1);
         size_t e = bend == INT64_MAX ? n : i + 1 + lower_bound_i64(ts + i + 1, n - i - 1, bend);
-        if (t->bk->kind == BK_CALENDAR && e - i > 1) {
-            /* keys only increase while the offset holds; a change can take local
-             * time back across a date (St. John's fell back at 00:01 until 2011),
-             * so a run also ends at the next transition */
-            int64_t tr = tz_next_transition(t->bk->zone, secs_of(ts[i]));
-            if (tr != INT64_MAX && sat_mul(tr, 1000) < bend)
-                e = i + 1 + lower_bound_i64(ts + i + 1, e - i - 1, sat_mul(tr, 1000));
-        }
         out[nl].b = b;
         agg_init(&out[nl].a, t->type);
         fold_run(t, v + i * t->w, e - i, may_be_null, &out[nl].a);
@@ -687,9 +712,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                 bool inside = g->ts_min >= start && g->ts_max < end;
                 int64_t bmin = bk_key(bk, g->ts_min);
                 int64_t bmax = bk_key(bk, g->ts_max);
-                /* calendar keys can repeat after a DST change at midnight: the
-                 * granule must also end before the bucket's next start */
-                bool one = bmin == bmax && (bk->kind != BK_CALENDAR || bk_start(bk, bmin + 1) > g->ts_max);
+                bool one = bmin == bmax; /* keys only grow with time: one key, one bucket */
                 if (inside && one) {
                     agg_state ga;
                     QS_ADD(granules_from_stats, 1);

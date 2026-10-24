@@ -1,10 +1,12 @@
 /*
  * Calendar grouping against glibc: for each zone, the bucket of every row is
  * computed with localtime_r and every bucket start with mktime, and both must
- * match tsdb_query_group.
+ * match tsdb_query_group_local. The database knows UTC only; the zone is the
+ * client side's (tsdb_calendar.h), which sends the periods' UTC bounds.
  */
 #define _GNU_SOURCE
 #include "tsdb.h"
+#include "tsdb_calendar.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -59,6 +61,19 @@ static int64_t ref_key(time_t t, tsdb_unit unit, int64_t count)
     return floordiv64(idx, count);
 }
 
+static time_t ref_start(int64_t key, tsdb_unit unit, int64_t count);
+
+/* A period runs from its first instant to the next period's: a row in an hour
+ * that comes back to the previous date (St. John's fell back from 00:01 to
+ * 23:01 until 2011) stays in the period that had begun. */
+static int64_t ref_bucket(time_t t, tsdb_unit unit, int64_t count)
+{
+    int64_t k = ref_key(t, unit, count);
+    while (ref_start(k + 1, unit, count) <= t)
+        k++;
+    return k;
+}
+
 static time_t ref_start(int64_t key, tsdb_unit unit, int64_t count)
 {
     int64_t idx = key * count, y, m = 1, d = 1;
@@ -77,7 +92,19 @@ static time_t ref_start(int64_t key, tsdb_unit unit, int64_t count)
         m = month - floordiv64(month, 12) * 12 + 1;
     }
     struct tm tm = {.tm_year = (int)(y - 1900), .tm_mon = (int)(m - 1), .tm_mday = (int)d, .tm_isdst = -1};
-    return mktime(&tm);
+    time_t t = mktime(&tm);
+    /* a local midnight that happens twice (a fallback just after it) begins the period the first time;
+     * mktime may pick either reading, and fallbacks move clocks back by half an hour to two hours */
+    static const int back[] = {7200, 3600, 1800};
+    for (size_t i = 0; i < sizeof back / sizeof back[0]; i++) {
+        time_t e = t - back[i];
+        struct tm l;
+        localtime_r(&e, &l);
+        if (l.tm_year == tm.tm_year && l.tm_mon == tm.tm_mon && l.tm_mday == tm.tm_mday && l.tm_hour == 0 &&
+            l.tm_min == 0 && l.tm_sec == 0)
+            return e;
+    }
+    return t;
 }
 
 typedef struct rb {
@@ -166,12 +193,10 @@ int main(int argc, char **argv)
                 tsdb_group g = {units[u], (uint32_t)counts[c], zones[z]};
                 tsdb_bucket *b;
                 size_t nb;
-                OK(tsdb_query_group(db, id, INT64_MIN, INT64_MAX, &g, &b, &nb));
-                /* reference: by key, since a local date can repeat (St. John's fell
-                 * back from 00:01 to 23:01 of the day before until 2011) */
+                OK(tsdb_query_group_local(db, id, INT64_MIN, INT64_MAX, &g, NULL, &b, &nb));
                 size_t nr = 0;
                 for (size_t i = 0; i < n; i++) {
-                    int64_t k = ref_key((time_t)floordiv64(ts[i], 1000), units[u], counts[c]);
+                    int64_t k = ref_bucket((time_t)floordiv64(ts[i], 1000), units[u], counts[c]);
                     size_t j = nr;
                     while (j > 0 && ref[j - 1].key > k)
                         j--;
@@ -208,7 +233,7 @@ int main(int argc, char **argv)
         tsdb_group g = {TSDB_MINUTE, 15, "+05:45"};
         tsdb_bucket *b;
         size_t nb;
-        OK(tsdb_query_group(db, id, INT64_MIN, INT64_MAX, &g, &b, &nb));
+        OK(tsdb_query_group_local(db, id, INT64_MIN, INT64_MAX, &g, NULL, &b, &nb));
         bool ok = nb > 0;
         for (size_t i = 0; i < nb; i++)
             ok &= floordiv64(b[i].start + (5 * 3600 + 45 * 60) * 1000LL, 900000) * 900000 == b[i].start + (5 * 3600 + 45 * 60) * 1000LL;
@@ -233,7 +258,7 @@ int main(int argc, char **argv)
         int64_t tt[3] = {a + 1, a + 86400000 + 1, a + 2 * 86400000 + 1};
         float vv[3] = {1, 1, 1};
         OK(tsdb_insert_series(db, id, tt, vv, 3));
-        OK(tsdb_query_group(db, id, a - 86400000, e, &g, &b, &nb));
+        OK(tsdb_query_group_local(db, id, a - 86400000, e, &g, NULL, &b, &nb));
         bool found = false;
         for (size_t i = 0; i + 1 < nb; i++)
             if (b[i + 1].start - b[i].start == 23 * 3600000LL)
@@ -244,7 +269,22 @@ int main(int argc, char **argv)
     tsdb_group bad = {TSDB_DAY, 1, "Not/AZone"};
     tsdb_bucket *b;
     size_t nb;
-    CHECK(tsdb_query_group(db, id, 0, 1, &bad, &b, &nb) == TSDB_ERR_INVALID);
+    CHECK(tsdb_query_group_local(db, id, INT64_MIN, INT64_MAX, &bad, NULL, &b, &nb) == TSDB_ERR_INVALID);
+    /* the database itself takes no zone: only UTC, or bounds from the client */
+    tsdb_group oslo = {TSDB_DAY, 1, "Europe/Oslo"}, utc = {TSDB_DAY, 1, "UTC"};
+    CHECK(tsdb_query_group(db, id, 0, 1, &oslo, &b, &nb) == TSDB_ERR_INVALID);
+    OK(tsdb_query_group(db, id, 0, 86400000, &utc, &b, &nb));
+    free(b);
+    int64_t unordered[3] = {0, 2000, 1000}, ok_bounds[2] = {157766400000LL, 157766400000LL + 86400000};
+    CHECK(tsdb_query_bounds(db, id, 0, 1, unordered, 3, NULL, &b, &nb) == TSDB_ERR_INVALID);
+    CHECK(tsdb_query_bounds(db, id, 0, 1, ok_bounds, 0, NULL, &b, &nb) == TSDB_ERR_INVALID);
+    /* rows before the first bound count nowhere; the last bucket runs on */
+    OK(tsdb_query_bounds(db, id, INT64_MIN, INT64_MAX, ok_bounds, 2, NULL, &b, &nb));
+    uint64_t after = 0;
+    for (size_t i = 0; i < n; i++)
+        after += ts[i] >= ok_bounds[1];
+    CHECK(nb == 2 && b[0].start == ok_bounds[0] && b[1].start == ok_bounds[1] && b[1].count >= after);
+    free(b);
     OK(tsdb_close(db));
     if (system(cmd) != 0)
         return 1;

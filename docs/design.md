@@ -27,8 +27,15 @@ start, the tests and the benchmark results.
   aggregate exactly (`isum`, `imin`, `imax`; the sum saturates at the int64
   limits, `sum` holds it as a double). For states only the count is meaningful.
 - Buckets are fixed lengths aligned to the epoch, like `toStartOfInterval`,
-  or calendar periods (day, ISO week, month, quarter, year) in any time zone
-  (`tsdb_query_group`).
+  or calendar periods (day, ISO week, month, quarter, year) in UTC
+  (`tsdb_query_group`), or buckets that begin at given instants
+  (`tsdb_query_bounds`).
+- The engine and the server know UTC only. Local time is the caller's
+  business: `tsdb_calendar_bounds` (`include/tsdb_calendar.h`, compiled into
+  both the engine and the client library) turns the periods of a time zone into
+  UTC bounds, and `tsdb_query_group_local` and `tsdbc_query_group` send those.
+  A period runs from its first instant to the next period's first instant, so
+  a local midnight that occurs twice begins the day the first time.
 - All functions are thread safe. One process opens a database for writing
   (`flock`); any number may open it `read_only` or follow it (below).
 

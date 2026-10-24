@@ -477,6 +477,100 @@ static void test_pack_roundtrip(void)
 
 /* Inserts arrive packed (the default) or plain, with the same result; a
  * packed frame that does not decode is refused and the server carries on. */
+/* Regression: the first packed insert asked the server's version through a
+ * call that first collected the pipelined acknowledgements; an error among
+ * them was taken for HELLO's, lost, and the connection never packed again. */
+static void test_hello_keeps_errors(uint32_t f64)
+{
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    OK(tsdbc_set_compression(c, 0));
+    int64_t t = T0;
+    float bad = 1;
+    OK(tsdbc_insert_async(c, &f64, &t, &bad, 1)); /* float32 rows for a float64 series */
+    OK(tsdbc_set_compression(c, 1));
+    enum { N = 10000 };
+    int64_t *ts = malloc(N * 8);
+    double *v = malloc(N * 8);
+    for (int i = 0; i < N; i++) {
+        ts[i] = T0 + i * 1000;
+        v[i] = 20 + (i % 10) / 10.0;
+    }
+    tsdb_values col = {TSDB_FLOAT64, v, NULL};
+    uint32_t *ids = malloc(N * 4);
+    for (int i = 0; i < N; i++)
+        ids[i] = f64;
+    OK(tsdbc_insert_values_async(c, ids, ts, &col, N));
+    CHECK(tsdbc_wait(c) != 0); /* the float32 insert's error, not lost */
+    uint64_t before = tsdbc_bytes_sent(c);
+    OK(tsdbc_insert_values(c, ids, ts, &col, N));
+    CHECK(tsdbc_bytes_sent(c) - before < N * 4); /* packed: plain would be 20 bytes a row */
+    free(ids);
+    free(ts);
+    free(v);
+    tsdbc_close(c);
+}
+
+/* Version 4: the server knows UTC only; clients send the bounds of local periods. */
+static void test_bounds(tsdbc *c, uint32_t a, size_t n)
+{
+    tsdb_bucket *bk, *bb;
+    size_t nb, nbb;
+    tsdb_group day = {TSDB_DAY, 1, "Europe/Oslo"};
+    OK(tsdbc_query_group(c, a, INT64_MIN, INT64_MAX, &day, NULL, &bk, &nb));
+    CHECK(nb >= 2);
+    uint64_t rows = 0;
+    bool midnight = true;
+    for (size_t k = 0; k < nb; k++) {
+        rows += bk[k].count;
+        midnight &= bk[k].start % 86400000 == 23 * 3600000; /* Oslo is UTC+1 in November */
+    }
+    CHECK(rows == n && midnight);
+
+    /* the same bounds sent by hand */
+    int64_t *bounds = malloc(nb * 8);
+    for (size_t k = 0; k < nb; k++)
+        bounds[k] = bk[k].start;
+    OK(tsdbc_query_bounds(c, a, INT64_MIN, INT64_MAX, bounds, nb, NULL, &bb, &nbb));
+    CHECK(nbb == nb && memcmp(bb, bk, nb * sizeof *bk) == 0);
+    free(bb);
+    tsdb_query_opts last = {TSDB_DESC, 1};
+    OK(tsdbc_query_bounds(c, a, INT64_MIN, INT64_MAX, bounds, nb, &last, &bb, &nbb));
+    CHECK(nbb == 1 && bb[0].start == bk[nb - 1].start && bb[0].count == bk[nb - 1].count);
+    free(bb);
+    if (nb >= 2) {
+        int64_t swapped[2] = {bounds[1], bounds[0]};
+        CHECK(tsdbc_query_bounds(c, a, INT64_MIN, INT64_MAX, swapped, 2, NULL, &bb, &nbb) == TSDB_ERR_INVALID);
+    }
+    CHECK(tsdbc_query_bounds(c, a, INT64_MIN, INT64_MAX, bounds, 0, NULL, &bb, &nbb) == TSDB_ERR_INVALID);
+    free(bounds);
+    free(bk);
+
+    /* a time zone sent to the server itself is refused; UTC is fine */
+    int fd = raw_connect();
+    for (int utc = 0; utc < 2; utc++) {
+        const char *zone = utc ? "UTC" : "Europe/Oslo";
+        uint8_t q[64] = {0};
+        int64_t lo = INT64_MIN, hi = INT64_MAX;
+        uint32_t count = 1;
+        uint16_t zl = (uint16_t)strlen(zone);
+        memcpy(q, &a, 4);
+        memcpy(q + 4, &lo, 8);
+        memcpy(q + 12, &hi, 8);
+        q[20] = TSDB_DAY;
+        memcpy(q + 21, &count, 4);
+        memcpy(q + 34, &zl, 2);
+        memcpy(q + 36, zone, zl);
+        raw_send(fd, 30 + (uint32_t)utc, TSDB_OP_QUERY_GROUP, q, 36u + zl);
+        uint32_t rid;
+        uint8_t rest[1 << 16];
+        size_t nrest;
+        int32_t st = raw_reply(fd, &rid, rest, sizeof rest, &nrest);
+        CHECK(rid == 30u + (uint32_t)utc && st == (utc ? 0 : TSDB_ERR_INVALID));
+    }
+    close(fd);
+}
+
 static void test_packed_inserts(tsdbc *c)
 {
     uint32_t a, b;
@@ -532,6 +626,7 @@ static void test_packed_inserts(tsdbc *c)
     free(ba);
     free(ts);
     free(v);
+    test_hello_keeps_errors(a);
 }
 
 int main(int argc, char **argv)
@@ -683,6 +778,7 @@ int main(int argc, char **argv)
     test_types(c);
     test_pack_roundtrip();
     test_packed_inserts(c);
+    test_bounds(c, a, N);
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);

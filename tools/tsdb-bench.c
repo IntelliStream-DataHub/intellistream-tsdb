@@ -11,6 +11,7 @@
 #include "common.h"
 #include "datasets.h"
 #include "tsdb.h"
+#include "tsdb_calendar.h"
 
 #include <getopt.h>
 #include <math.h>
@@ -337,7 +338,7 @@ int main(int argc, char **argv)
             for (uint32_t s = 0; s < c.series; s++) {
                 tsdb_bucket *b;
                 size_t nb;
-                if ((rc = tsdb_query_group(db, s, INT64_MIN, INT64_MAX, &groups[k].g, &b, &nb)) != 0) {
+                if ((rc = tsdb_query_group_local(db, s, INT64_MIN, INT64_MAX, &groups[k].g, NULL, &b, &nb)) != 0) {
                     fprintf(stderr, "group: %s\n", tsdb_strerror(rc));
                     return 1;
                 }

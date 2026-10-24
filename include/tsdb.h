@@ -221,16 +221,15 @@ typedef int (*tsdb_values_fn)(void *ctx, const int64_t *ts, const tsdb_values *v
 int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_values_fn fn, void *ctx);
 
-/* Calendar grouping: `count` units per bucket, in a time zone.
- *  - TSDB_SECOND, _MINUTE, _HOUR: fixed-length buckets, aligned to multiples
- *    of their length since the epoch in the zone's standard time (for zones
- *    with whole-hour offsets, hours and minutes start where local ones do).
- *  - TSDB_DAY, _WEEK (ISO, from Monday), _MONTH, _QUARTER, _YEAR: local
- *    calendar periods; a day across a DST change lasts 23 or 25 hours.
- * Multiples are counted from 1970 in local time, like toStartOfInterval.
- * Each bucket's start is the UTC instant its local period begins.
- * timezone: NULL or "UTC", a fixed offset ("+02:00", "-0530"), or an IANA
- * name such as "Europe/Oslo" (from /usr/share/zoneinfo, or $TZDIR). */
+/* Calendar grouping, in UTC: `count` units per bucket.
+ *  - TSDB_SECOND, _MINUTE, _HOUR: fixed lengths, aligned to multiples of their
+ *    length since the epoch.
+ *  - TSDB_DAY, _WEEK (ISO, from Monday), _MONTH, _QUARTER, _YEAR: UTC calendar
+ *    periods, multiples counted from 1970, like toStartOfInterval.
+ * The database knows UTC only: timezone must be NULL or "UTC" (anything else is
+ * TSDB_ERR_INVALID). Local days, weeks and months are bounds a client computes
+ * (tsdb_calendar.h: tsdb_calendar_bounds, tsdb_query_group_local) and passes to
+ * tsdb_query_bounds. */
 typedef enum {
     TSDB_SECOND = 1,
     TSDB_MINUTE,
@@ -245,11 +244,17 @@ typedef enum {
 typedef struct tsdb_group {
     tsdb_unit unit;
     uint32_t count;       /* 0 means 1 */
-    const char *timezone; /* NULL means UTC */
+    const char *timezone; /* NULL or "UTC"; clients turn other zones into bounds */
 } tsdb_group;
 
 int tsdb_query_group(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                      tsdb_bucket **out, size_t *nout);
+/* Buckets that begin at given UTC instants: bucket i covers [bounds[i],
+ * bounds[i + 1]), the last one everything from bounds[n - 1] on; only rows in
+ * [start, end) count. bounds must strictly increase. Reported starts are the
+ * bounds; order and limit as in tsdb_query_group_ex. */
+int tsdb_query_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                      const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 /* group NULL: one bucket for the whole range. */
 int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);

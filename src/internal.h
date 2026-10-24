@@ -296,27 +296,19 @@ static inline size_t lower_bound_i64(const int64_t *a, size_t n, int64_t key)
     return (size_t)(base - a) + (n == 1 && *base < key);
 }
 
-/* ---- time zones (tz.c) and buckets (query.c) ---- */
-typedef struct tz tz;
-int tz_get(const char *name, const tz **out);
-int32_t tz_offset(const tz *z, int64_t utc_seconds);  /* seconds east of UTC */
-int64_t tz_utc(const tz *z, int64_t local_seconds);   /* first UTC second of a local time */
-int32_t tz_fixed_offset(const tz *z, bool *fixed);
-int64_t tz_next_transition(const tz *z, int64_t utc_seconds);
-void tz_civil(int64_t days, int64_t *y, int *m, int *d);
-int64_t tz_days_from_civil(int64_t y, int m, int d);
-
-/* Maps timestamps to dense bucket keys and keys to bucket start instants. */
+/* ---- buckets (query.c) ----
+ * The engine knows UTC only. Local calendars are the client's business: it
+ * sends the bounds (BK_BOUNDS, from tsdb_calendar_bounds). */
 typedef struct bucketer {
-    int kind;         /* BK_ONE, BK_FIXED or BK_CALENDAR */
+    int kind;         /* BK_ONE, BK_FIXED, BK_CALENDAR or BK_BOUNDS */
     int64_t start;    /* BK_ONE: the start reported for the one bucket */
     int64_t interval; /* BK_FIXED: length in ms */
-    int64_t shift;    /* BK_FIXED: ms added before dividing (a zone offset) */
-    int unit;         /* BK_CALENDAR: TSDB_DAY .. TSDB_YEAR */
+    int unit;         /* BK_CALENDAR: TSDB_DAY .. TSDB_YEAR, in UTC */
     int64_t count;
-    const tz *zone;
+    const int64_t *bounds; /* BK_BOUNDS: bucket i begins at bounds[i]; the last runs on without end */
+    size_t nbounds;
 } bucketer;
-enum { BK_ONE, BK_FIXED, BK_CALENDAR };
+enum { BK_ONE, BK_FIXED, BK_CALENDAR, BK_BOUNDS };
 
 /* ---- parts ---- */
 
@@ -689,6 +681,7 @@ int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t 
 int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
                     size_t *nout);
 int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g);
+int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n);
 int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
 int eng_get_stats(eng *db, tsdb_stats *st);

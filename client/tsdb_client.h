@@ -38,6 +38,8 @@ int tsdbc_series_name(tsdbc *c, uint32_t id, char *buf, size_t len);
  * server speaks protocol version 3; 0 sends plain arrays, which costs 16 bytes
  * a row on the wire instead of a few, but no CPU. Negative levels are faster. */
 int tsdbc_set_compression(tsdbc *c, int level);
+/* Bytes written to the server so far, frame headers included. */
+uint64_t tsdbc_bytes_sent(const tsdbc *c);
 /* Bounds every wait for the server (send or receive) to ms milliseconds; 0, the
  * default, waits forever. A call that times out returns TSDB_ERR_IO and the
  * connection is of no further use: close it. */
@@ -58,8 +60,13 @@ int tsdbc_query_raw_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, co
                        tsdb_raw_fn fn, void *ctx);
 int tsdbc_query_points_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                           tsdb_points *out);
+/* With a time zone in `group`, the client computes the UTC bounds of the
+ * local periods (tsdb_calendar.h) and asks for those: the server knows UTC only. */
 int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
+/* Buckets beginning at given UTC instants, as tsdb_query_bounds. */
+int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
 /* Value types and nulls (protocol version 2), as tsdb_series_create,
  * tsdb_insert_values, tsdb_query_values and the state dictionary. */

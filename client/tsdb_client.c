@@ -1,5 +1,6 @@
 /* Client for tsdbd: blocking sockets, columnar frames, optional pipelining. */
 #define _GNU_SOURCE
+#include "tsdb_calendar.h"
 #include "tsdb_client.h"
 #include "tsdb_pack.h"
 #include "tsdb_protocol.h"
@@ -35,6 +36,7 @@ struct tsdbc {
     ZSTD_CCtx *zc;
     uint8_t *raw, *zbuf;
     size_t raw_cap, zbuf_cap;
+    uint64_t sent;   /* bytes written to the socket */
 };
 
 int tsdbc_connect(const char *host, int port, tsdbc **out)
@@ -117,6 +119,7 @@ static int send_iov(tsdbc *c, struct iovec *iov, int n)
                 continue;
             return TSDB_ERR_IO;
         }
+        c->sent += (uint64_t)w;
         while (n && (size_t)w >= iov->iov_len) {
             w -= (ssize_t)iov->iov_len;
             iov++;
@@ -221,7 +224,8 @@ static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *b
     return 0;
 }
 
-int tsdbc_wait(tsdbc *c)
+/* Reads the pipelined acknowledgements, keeping the first error for tsdbc_wait. */
+static int drain(tsdbc *c)
 {
     while (c->pending) {
         int32_t st;
@@ -234,7 +238,15 @@ int tsdbc_wait(tsdbc *c)
         if (st && !c->pending_rc)
             c->pending_rc = st;
     }
-    int rc = c->pending_rc;
+    return 0;
+}
+
+int tsdbc_wait(tsdbc *c)
+{
+    int rc = drain(c);
+    if (rc)
+        return rc;
+    rc = c->pending_rc;
     c->pending_rc = 0;
     return rc;
 }
@@ -318,6 +330,7 @@ int tsdbc_series_name(tsdbc *c, uint32_t id, char *buf, size_t len)
 static int insert_values_frames(tsdbc *c, const uint32_t *series, uint32_t s, const int64_t *ts,
                                 const tsdb_values *v, size_t n, bool wait);
 static bool packing(tsdbc *c);
+static uint32_t server_version(tsdbc *c);
 
 static int insert_frames(tsdbc *c, const uint32_t *series, uint32_t s, const int64_t *ts, const float *v, size_t n,
                          bool wait)
@@ -527,10 +540,59 @@ int tsdbc_query_agg(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64
     return buckets_req(c, series, start, end, interval_ms, NULL, NULL, out, nout);
 }
 
+int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    if (!bounds || n == 0 || n > (TSDB_MAX_FRAME - 64) / 8)
+        return TSDB_ERR_INVALID;
+    uint8_t q[33];
+    uint32_t n32 = (uint32_t)n;
+    uint64_t lim = opts ? opts->limit : 0;
+    memcpy(q, &series, 4);
+    memcpy(q + 4, &start, 8);
+    memcpy(q + 12, &end, 8);
+    q[20] = opts && opts->order == TSDB_DESC;
+    memcpy(q + 21, &lim, 8);
+    memcpy(q + 29, &n32, 4);
+    const uint8_t *b;
+    size_t len;
+    int rc = call(c, TSDB_OP_QUERY_BOUNDS, q, 33, bounds, n * 8, &b, &len);
+    return rc ? rc : read_buckets(b, len, out, nout);
+}
+
+static int first_ts(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
+{
+    (void)v;
+    if (n)
+        *(int64_t *)ctx = ts[0];
+    return 0;
+}
+
 int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
-    return buckets_req(c, series, start, end, 0, group, opts, out, nout);
+    bool local = group && group->timezone && strcmp(group->timezone, "UTC") != 0;
+    if (!local || server_version(c) < 4) /* an older server still takes the zone itself */
+        return buckets_req(c, series, start, end, 0, group, opts, out, nout);
+    *out = NULL;
+    *nout = 0;
+    /* local periods become UTC bounds here; an open range is cut to the rows there are */
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    tsdb_query_opts first = {TSDB_ASC, 1}, last = {TSDB_DESC, 1};
+    int rc = tsdbc_query_values(c, series, start, end, &first, first_ts, &lo);
+    if (rc == 0)
+        rc = tsdbc_query_values(c, series, start, end, &last, first_ts, &hi);
+    if (rc || lo > hi)
+        return rc;
+    int64_t *bounds;
+    size_t n;
+    rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
+    if (rc == 0)
+        rc = tsdbc_query_bounds(c, series, start, end, bounds, n, opts, out, nout);
+    free(bounds);
+    return rc;
 }
 
 /* ------------------------------------------------------------ value types */
@@ -594,21 +656,31 @@ int tsdbc_set_compression(tsdbc *c, int level)
     return 0;
 }
 
-/* Whether inserts go packed: compression on, and a server that reads them. */
-static bool packing(tsdbc *c)
+/* The server's protocol version, asked once. Not through call(): an error
+ * among the pipelined inserts before it belongs to the next tsdbc_wait, and
+ * taking it for HELLO's would leave the connection unpacked for good. */
+static uint32_t server_version(tsdbc *c)
 {
-    if (!c->zlevel)
-        return false;
     if (!c->server_version) {
-        uint32_t mine = TSDB_PROTOCOL_VERSION, theirs = 1;
+        uint32_t mine = TSDB_PROTOCOL_VERSION;
+        int32_t st;
         const uint8_t *b;
         size_t n;
-        if (call(c, TSDB_OP_HELLO, &mine, 4, NULL, 0, &b, &n) == 0 && n == 4)
+        if (drain(c) || send_req(c, TSDB_OP_HELLO, &mine, 4, NULL, 0, NULL, 0, NULL, 0) ||
+            read_reply(c, &st, &b, &n))
+            return 1; /* the connection failed; whatever comes next reports it */
+        uint32_t theirs = 1; /* a version 1 server does not know HELLO */
+        if (st == 0 && n == 4)
             memcpy(&theirs, b, 4);
         c->server_version = theirs;
     }
-    return c->server_version >= 3;
+    return c->server_version;
 }
+
+uint64_t tsdbc_bytes_sent(const tsdbc *c) { return c->sent; }
+
+/* Whether inserts go packed: compression on, and a server that reads them. */
+static bool packing(tsdbc *c) { return c->zlevel && server_version(c) >= 3; }
 
 /* One packed frame: reshape, zstd, send (the buffers are free again on return). */
 static int send_packed(tsdbc *c, const uint32_t *series, uint32_t s, const int64_t *ts, const tsdb_values *v,

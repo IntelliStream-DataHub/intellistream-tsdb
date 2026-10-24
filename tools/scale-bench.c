@@ -28,6 +28,7 @@
 #include "common.h"
 #include "datasets.h"
 #include "tsdb.h"
+#include "tsdb_calendar.h"
 
 #include <getopt.h>
 #include <math.h>
@@ -260,7 +261,8 @@ static int run_one(const target *tg, int slot, const qclass *qc, uint32_t s, int
     const tsdb_group *g = qc->group == G_NONE ? NULL : &groups[qc->group];
     tsdb_bucket *b = NULL;
     size_t nb = 0;
-    int rc = c ? tsdbc_query_group(c, s, start, end, g, NULL, &b, &nb) : tsdb_query_group(tg->db, s, start, end, g, &b, &nb);
+    int rc = c ? tsdbc_query_group(c, s, start, end, g, NULL, &b, &nb)
+               : tsdb_query_group_local(tg->db, s, start, end, g, NULL, &b, &nb);
     for (size_t i = 0; i < nb; i++) {
         t->rows += b[i].count;
         t->sum += b[i].sum;

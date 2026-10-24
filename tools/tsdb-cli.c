@@ -1,6 +1,7 @@
 /* Command line client for a tsdb directory. */
 #include "common.h"
 #include "tsdb.h"
+#include "tsdb_calendar.h"
 
 #include <unistd.h>
 
@@ -362,7 +363,7 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     tsdb_bucket *b;
     size_t nb;
     if (grouped)
-        rc = tsdb_query_group_ex(db, id, start, end, &g, &q, &b, &nb);
+        rc = tsdb_query_group_local(db, id, start, end, &g, &q, &b, &nb);
     else if (interval) {
         rc = tsdb_query_agg(db, id, start, end, interval, &b, &nb);
         if (rc == 0) { /* order and limit as tsdb_query_group_ex applies them */

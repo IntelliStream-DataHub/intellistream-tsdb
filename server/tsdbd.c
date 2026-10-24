@@ -780,6 +780,37 @@ static void handle(req *r)
         reply(c, r->id, 0, &st.elapsed_s, 8, v, sizeof v, NULL, 0);
         return;
     }
+    case TSDB_OP_QUERY_BOUNDS: {
+        uint32_t s, n;
+        int64_t start, end;
+        uint64_t lim;
+        if (len < 33 || (memcpy(&n, p + 29, 4), len != 33 + (size_t)n * 8) || n == 0) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        memcpy(&start, p + 4, 8);
+        memcpy(&end, p + 12, 8);
+        memcpy(&lim, p + 21, 8);
+        tsdb_query_opts q = {p[20] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
+        int64_t *bounds = malloc((size_t)n * 8); /* aligned copy */
+        tsdb_bucket *b = NULL;
+        size_t nb = 0;
+        if (!bounds) {
+            rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        memcpy(bounds, p + 33, (size_t)n * 8);
+        rc = tsdb_query_bounds(db, s, start, end, bounds, n, &q, &b, &nb);
+        free(bounds);
+        if (rc == 0) {
+            reply_buckets(c, r->id, b, nb);
+            free(b);
+            return;
+        }
+        free(b);
+        break;
+    }
     case TSDB_OP_COMMIT: rc = tsdb_commit(db); break;
     case TSDB_OP_FLUSH: rc = tsdb_flush(db); break;
     case TSDB_OP_OPTIMIZE: rc = tsdb_optimize(db); break;
@@ -816,7 +847,7 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&work_lock);
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
         if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_AGG || r->op == TSDB_OP_QUERY_GROUP ||
-            r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS) {
+            r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS || r->op == TSDB_OP_QUERY_BOUNDS) {
             tsdb_query_stats st;
             tsdb_last_query_stats(&st); /* this worker ran it */
             pthread_mutex_lock(&r->c->lock);
