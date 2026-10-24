@@ -177,7 +177,8 @@ void tsdb_points_free(tsdb_points *p);
  * with only nulls is returned with count 0 (buckets without rows are not).
  * Floats: NaN values are ignored by min/max (NaN if there are none) but
  * propagate into sum. int64 and bool (false 0, true 1): sum, min and max are
- * also exact in isum, imin and imax (isum saturates at INT64_MIN/INT64_MAX).
+ * also exact in isum, imin and imax (isum is the exact sum, clamped to the
+ * int64 range when it does not fit, whatever the order of the rows).
  * State: only count is meaningful. */
 typedef struct tsdb_bucket {
     int64_t start; /* bucket start; with interval 0 this is the query start */

@@ -1,179 +1,74 @@
 # tsdb
 
-An embedded time series database in C, modelled on ClickHouse's MergeTree,
-for one shape of data: named series of `(DateTime64(3), Float32)` points.
-No SQL: you query a series over a time range, raw or aggregated
-(count, sum, min, max, avg), optionally in time buckets.
+An embedded time series database in C, modelled on ClickHouse's MergeTree.
+Named series of timestamped values (float32, float64, int64, bool, or a state
+from a small set; any value may be null), queried by time range: raw, or
+aggregated (count, sum, min, max, avg) in fixed or calendar buckets. No SQL.
+It comes with `tsdbd`, an io_uring TCP server, and clients for C, Rust,
+Python and Java.
+
+On 100 billion sensor readings, against ClickHouse on the same machine:
+stored in **116 GB instead of 170 GB**, loaded in **15 minutes instead of 45**
+(until merges settled), whole-table aggregates in **0.16 s instead of 59 s**,
+single-series queries **2.3 to 190 times faster**
+([details](#100-billion-rows-tsdb-and-clickhouse)).
+
+How it works: [docs/design.md](docs/design.md).
+
+## Quick start
+
+Needs a C11 compiler, pthreads, libzstd, and liburing for the server.
+
+```sh
+make                       # library, CLI, server, client library, benchmarks into build/
+```
+
+From the command line:
+
+```sh
+build/tsdb /data/sensors create pump7.mode --type state       # float32 unless --type
+build/tsdb /data/sensors import < rows.csv                     # series,time,value (null or empty: null)
+build/tsdb /data/sensors query pump7.flow 2024-01-01 2024-01-02 avg 5m
+build/tsdb /data/sensors query pump7.flow now-1h now raw --desc --limit 10
+build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 all 1mo --tz Europe/Oslo
+```
+
+Embedded in C ([`include/tsdb.h`](include/tsdb.h)):
 
 ```c
 tsdb *db;
 tsdb_open("/data/sensors", NULL, &db);
 
-uint32_t id;
-tsdb_series(db, "pump7.pressure_bar", &id);            /* get or create */
+uint32_t flow, runtime;
+tsdb_series(db, "pump7.flow", &flow);                               /* float32 */
+tsdb_series_create(db, "pump7.runtime_s", TSDB_INT64, NULL, &runtime);
 
-tsdb_insert_series(db, id, ts, values, n);             /* a batch: durable on return */
-tsdb_append(db, id, ts_ms, 3.142f);                    /* one point: WAL, group commit */
+tsdb_insert_series(db, flow, ts, values, n);                         /* durable on return */
+tsdb_values col = {TSDB_INT64, seconds, valid};                      /* valid: bitmap, NULL = no nulls */
+tsdb_insert_series_values(db, runtime, ts, &col, n);
 
-tsdb_points p;                                         /* raw, [start, end), time order */
-tsdb_query_points(db, id, start, end, &p);
-
-tsdb_bucket *b; size_t nb;                             /* 5 minute buckets */
-tsdb_query_agg(db, id, start, end, 300000, &b, &nb);
+tsdb_bucket *b; size_t nb;
+tsdb_group day = {TSDB_DAY, 1, "Europe/Oslo"};
+tsdb_query_group(db, flow, start, end, &day, &b, &nb);               /* count, sum, min, max per day */
 printf("%f\n", tsdb_bucket_avg(&b[0]));
-
+free(b);
 tsdb_close(db);
 ```
 
-The full API is in [`include/tsdb.h`](include/tsdb.h).
-
-## Semantics
-
-- `(series, ts)` is unique, like a `ReplacingMergeTree` that is always read
-  with `FINAL`: writing a timestamp that exists replaces its value, the last
-  write wins (within one batch, the later row), and queries never return
-  duplicates.
-- Time ranges are half open, `[start, end)`, in milliseconds since the epoch.
-- Aggregate buckets are aligned to the epoch, like `toStartOfInterval`.
-  min/max ignore NaN (a bucket of only NaN gives NaN); NaN propagates into sum.
-- All functions are thread safe. One process opens a database for writing
-  (`flock`); any number may open it `read_only`.
-
-## Storage
-
-A database is a directory:
-
-```
-META                       format version, partition size, granule size
-SERIES                     append-only series dictionary (name -> dense id)
-LOCK
-wal_<seq>.log              write-ahead log of the current memtable
-p<partition>_<minblock>_<maxblock>_<level>.part
-```
-
-Each part is one immutable file holding the rows of every series written in
-one insert (or produced by one merge), sorted by `(series, ts)`:
-
-```
-header | ts block, value block, ts block, value block, ... | granule index | footer
-```
-
-A granule is up to 8192 rows of one series. Its 64-byte index entry holds
-the series, min/max timestamp, count, sum, min, max, block offsets and a
-checksum. The index is the sparse primary index of MergeTree: finding a series'
-rows in a time range is a binary search, and aggregates over whole granules
-are answered from the stored statistics without decompressing anything.
-
-Parts are grouped by time partition (one day by default) and merged in the
-background with ClickHouse's `SimpleMergeSelector` heuristics: only adjacent
-block ranges are merged, so "newest part wins" stays well defined. A merge
-copies granules that need no re-encoding as compressed bytes.
-
-Writes are published atomically (`tmp_*.part`, fsync, rename, fsync dir).
-On open, leftovers of interrupted writes are removed, parts covered by a
-merged part are deleted, and broken parts are renamed to `*.broken`.
-
-### Write paths
-
-- **Large batches** (`wal_max_batch_rows`, default 65536 rows, and more)
-  become parts directly, one per partition, like a MergeTree INSERT.
-- **Small batches and single points** go to a write-ahead log and an
-  in-memory memtable that queries read immediately. With `wal_sync_ms = 0`
-  (the default) a write returns after `fdatasync`, and concurrent writers share
-  one fsync (group commit). With `wal_sync_ms = 100` writes return at once and
-  the WAL is synced every 100 ms. The memtable becomes parts when it reaches
-  `buffer_rows` or `flush_interval_ms`.
-
-Each part records the WAL segment it contains, so recovery replays a segment
-only into partitions that do not already hold its rows, even after a crash in
-the middle of a flush.
-
-### Compression
-
-Every granule picks its own encodings, with ZSTD (level 1) on top whenever it
-saves a few percent:
-
-**Timestamps**: DoubleDelta (ClickHouse's bit format) for regular clocks,
-about 0.03 bits per row. When the clock jitters, DoubleDelta doubles the
-noise, so the granule instead stores the **residual from a regular grid**
-(`ts[i] - (ts0 + i * step)`) or **frame-of-reference deltas**, as 1 to 8 byte
-words, whichever is estimated smaller.
-
-**Values** (`value_codec = TSDB_VALUES_AUTO`):
-
-1. **Fixed point** (decimal or binary): if the values are `k * 10^-e`
-   (a sensor with a resolution, like 21.3 or 1.024) or `k * 2^-b` (ADC counts),
-   store the integers `k` as 1/2/4-byte zigzag deltas. The encoder checks
-   that every value round-trips bit for bit; the rare value that does not
-   (NaN, -0.0, a glitch) is kept as an exception. The scale is chosen on
-   samples and then verified on all values. Ideas from ALP (SIGMOD 2024).
-2. Otherwise **Chimp** (an improved Gorilla), **bit delta** or **byte-stream
-   split**. Cheap entropy estimates shortlist two candidates and both are
-   compressed for real; the smaller is kept.
-
-`TSDB_VALUES_GORILLA` or `TSDB_VALUES_CHIMP` force one XOR codec instead.
-`build/codec-bench` compares Gorilla, Chimp, Chimp128, Patas, fixed point
-and the simple transforms on each sensor type, with and without ZSTD:
-
-| sensor (bits per value, codec + ZSTD) | Gorilla | Chimp | Chimp128 | Patas | tsdb AUTO |
-|---|---:|---:|---:|---:|---:|
-| SMART disk temperature, 0.1 degC, 60 s | 2.66 | 2.33 | 5.93 | 3.39 | **1.35** |
-| CPU temperature, spikes to 100 degC, 1 s | 10.82 | 11.34 | 11.86 | 10.75 | **3.60** |
-| tank pressure, 0.001 bar, 10 s | 9.09 | 8.85 | 8.79 | 7.45 | **2.01** |
-| tank pressure in psi (converted, unrounded) | 23.77 | 19.57 | 19.62 | 27.24 | **19.56** |
-| vibration, 16-bit ADC at 1 kHz | 21.51 | 23.58 | 30.78 | 27.87 | **14.70** |
-| pipeline flow rate, 0.01 m3/h | 23.08 | 20.85 | 19.94 | 17.76 | **11.41** |
-| pipeline flow totalizer, m3 | 8.68 | 6.07 | 6.10 | 8.40 | **1.67** |
-| uniform random floats | 32.32 | 32.90 | 32.90 | 39.91 | **28.95** |
-
-### SIMD
-
-Gorilla, Chimp and DoubleDelta decoding is bit-serial: where value i+1 starts
-depends on value i, so it cannot be vectorized. The aggregation kernels are
-dispatched at runtime to AVX-512, AVX2 or scalar code, and the fixed-point
-encoder is written so the compiler vectorizes it. AVX-512 is not used on
-Skylake-SP, Cascade Lake and Cooper Lake Xeons, which lower the clock of the
-core after 512-bit instructions. `TSDB_SIMD=avx512|avx2|scalar` overrides the
-choice.
-
-## Building
-
-Needs a C11 compiler, pthreads, libzstd, and liburing for the server.
+As a server ([`include/tsdb_protocol.h`](include/tsdb_protocol.h)), with one
+writer and any number of followers on the same directory, also over NFS:
 
 ```sh
-make            # build/libtsdb.a, build/tsdb, benchmarks
-make test       # unit, crash-recovery and server tests
-make asan       # the tests under AddressSanitizer + UBSan
-make PORTABLE=1 # without -march=native
+build/tsdbd --dir /data/sensors --port 7070 --wal-sync-ms 10
+build/tsdbd --dir /mnt/sensors  --port 7070 --follow          # read-only, follows the writer
 ```
 
-## Server and client
-
-`tsdbd` serves a database over TCP with a small binary protocol
-([`include/tsdb_protocol.h`](include/tsdb_protocol.h)): length-prefixed frames,
-columnar arrays, results of raw queries streamed in chunks. One thread runs an
-io_uring event loop (multishot accept, recv/send, an eventfd from the workers);
-requests run on a worker pool, in order per connection, so a client can
-pipeline inserts and still get "last write wins". A client that reads slowly
-pauses its query instead of making the server buffer its result.
-
-```sh
-build/tsdbd --dir /data/sensors --listen 127.0.0.1 --port 7070 --wal-sync-ms 10
-```
-
-Connections: up to `--max-connections` at once (default 10,000; the descriptor
-limit is raised to the hard limit at start). An idle connection costs one file
-descriptor and about 16 KB; buffers grow for large frames and shrink back.
-Requests run on `--workers` threads (default: one per CPU) and the rest wait
-in their connection's queue. Measured with `tsdbc-bench connections`: 10,000
-connections open at once, all querying, 85,000 queries/s in total, no
-failures; the server's resident memory went from 148 MB at 1,000 connections
-to 231 MB at 10,000.
-
-There is no authentication or TLS: listen on loopback or a trusted network.
-
-The client library (`build/libtsdbclient.a`, [`client/tsdb_client.h`](client/tsdb_client.h))
-mirrors the embedded API and does not link the storage engine:
+| client | where | quick start |
+|---|---|---|
+| C | [`client/tsdb_client.h`](client/tsdb_client.h) | below |
+| Rust (std only) | [`client/rust`](client/rust) | [README](client/rust/README.md) |
+| Python (PyO3 over the Rust client, numpy optional) | [`client/python`](client/python) | [README](client/python/README.md) |
+| Java 17+ (no runtime dependencies) | [`client/java`](client/java) | [README](client/java/README.md) |
 
 ```c
 tsdbc *c;
@@ -181,97 +76,117 @@ tsdbc_connect("127.0.0.1", 7070, &c);
 uint32_t id;
 tsdbc_series(c, "pump7.flow", 1, &id);
 tsdbc_insert_series_async(c, id, ts, values, n);   /* pipelined */
-tsdbc_wait(c);                                     /* acknowledgements */
 tsdbc_query_agg(c, id, start, end, 60000, &b, &nb);
-tsdbc_close(c);                                    /* collects outstanding acknowledgements first */
+tsdbc_close(c);                                    /* waits for the acknowledgements */
 ```
 
-Requests the server has received run even if the client disconnects before
-reading the replies; a client that half-closes its socket still gets every reply.
-
-Clients in other languages, each with a quick start in its README:
-
-| | directory | build and test |
-|---|---|---|
-| C | [`client/`](client) | `make`, `make test` |
-| Rust (std only, blocking) | [`client/rust`](client/rust) | `make test-rust` |
-| Python (PyO3 over the Rust client, numpy optional) | [`client/python`](client/python) | `make test-python` |
-| Java 17+ (Maven, no runtime dependencies) | [`client/java`](client/java) | `make test-java` |
-
-## Command line
+## Tests
 
 ```sh
-build/tsdb /data/sensors import < rows.csv          # series,time,value
-build/tsdb /data/sensors insert pump7.flow < p.csv  # time,value
-build/tsdb /data/sensors query pump7.flow 2024-01-01 2024-01-02 avg 5m
-build/tsdb /data/sensors query pump7.flow now-1h now raw
-build/tsdb /data/sensors stats
-build/tsdb /data/sensors parts
-build/tsdb /data/sensors optimize
-build/tsdb /data/sensors drop-before 2023-01-01
+make test          # unit, crash-recovery, value type, follower, volume and server tests
+make asan          # the same under AddressSanitizer + UBSan
+make jepsen        # fault injection: kill -9, simulated power loss, pauses (Jepsen-style checker)
+make test-clients  # the Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 ```
 
-## One writer, many readers (also over NFS)
-
-One process writes; any number of processes follow it, on the same host or
-on other hosts that mount the directory over NFS (NFS over RDMA works well):
-
-```c
-tsdb_options o;
-tsdb_options_init(&o);
-o.follow = 1;            /* read only, and keep up with the writer */
-o.refresh_ms = 100;      /* how often to look */
-tsdb_open("/mnt/sensors", &o, &db);
-```
-
-```sh
-build/tsdbd --dir /data/sensors --port 7070                    # the writer
-build/tsdbd --dir /mnt/sensors  --port 7070 --follow            # query servers, anywhere
-```
-
-The writer keeps a `MANIFEST`: the active parts, the series count, and which
-WAL segments are already in parts. Followers poll it, open new parts, drop
-replaced ones, read new series names, and tail the WAL segments that are not
-in parts yet, so rows acknowledged by the writer are visible to followers
-within about `refresh_ms` (plus `wal_sync_ms` if the writer syncs
-periodically). A segment's rows leave a follower's memory in the same step as
-the parts that hold them arrive, so queries never see a row twice or miss one.
-
-What makes this safe on NFS:
-
-- `MANIFEST` is rewritten in place with a checksum rather than renamed: NFS
-  revalidates a file when it is reopened (close-to-open consistency), but a
-  name looked up again can come from the directory cache. A torn read fails
-  the checksum and is retried at the next poll.
-- A file deleted on the NFS server is gone for every client, even one that has
-  it mapped (the next page fault raises SIGBUS). Parts replaced by a merge are
-  therefore renamed to `retired_*` at once and deleted only
-  `obsolete_part_lifetime_s` later (480 s by default, ClickHouse's
-  `old_parts_lifetime`). Renaming does not disturb readers that have the file
-  open, and a follower that is a step behind finds a part under its retired name.
-- Mount followers with `lookupcache=positive`, so a part or WAL segment created
-  a moment ago is not hidden behind a cached "no such file".
-- The writer must sync the WAL (`fsync = 1`, the default) for its rows to
-  reach the server; NFS clients only write back on fsync or close.
-
-Only one writer may exist (it takes a `flock` on `LOCK`, which NFSv4 honours).
-`tests/test_follow.c` runs a writer and a follower as separate processes on one
-directory while the writer appends, overwrites, merges and retires parts.
-It has not been run against an actual NFS server in this repository's tests.
+Tests take a scratch directory as their first argument
+(`./build/test_tsdb /tmp/x`); `make` uses /tmp. ThreadSanitizer is not wired
+into make: build the way `make asan` does, with `-fsanitize=thread`.
 
 ## Benchmarks
 
-Machine: AMD Ryzen 9 7950X (16 cores / 32 threads, AVX-512), 64 GB RAM.
-ClickHouse 26.8.2.7 in Podman on the same machine.
+| tool | measures |
+|---|---|
+| `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed |
+| `build/type-bench` | the float64, int64, bool and state codecs |
+| `build/tsdb-bench` | load, compression and queries on 100 M rows; `--export` writes the rows for ClickHouse |
+| `build/insert-bench` | durable inserts on a real disk, 1 row to 1 billion rows per call |
+| `build/tsdbc-bench` | the server: loading, queries, 10,000 connections |
+| `build/scale-bench` | 100 billion rows: load, then a query suite, with the same queries as SQL for ClickHouse |
 
-Dataset: 100 series x 1,000,000 samples = 100 M rows of the seven sensor types
-above, mixed (`tsdb-bench --export`), written once to a RowBinary file that
-both systems load. ClickHouse table: `PARTITION BY toDate(ts) ORDER BY (series, ts)`
-with its recommended time series codecs unless noted; tsdb with its defaults
-(1 day partitions, 8192-row granules). Data on tmpfs, so these numbers are
-CPU, not disk; durable writes on NVMe have their own table.
+```sh
+build/codec-bench
+build/tsdb-bench --dir /tmp/b --series 100 --points 1000000
+build/insert-bench --dir /var/tmp/b
+build/tsdbd --dir /tmp/srv & build/tsdbc-bench query --conns 32
+build/scale-bench load --dir /var/tmp/big --series 10000 --points 10000000 --threads 8
+build/scale-bench query --dir /var/tmp/big --threads 32 --sql /tmp/sql
+tools/scale-bench-ch.sh /tmp/sql scale.big            # the same queries in ClickHouse
+```
 
-### Compression
+ClickHouse runs in Podman, bound to 127.0.0.1, with its data on the same
+file system as tsdb's:
+
+```sh
+podman run -d --name ch --network host -v /var/tmp/ch:/var/lib/clickhouse \
+    -v ./listen.xml:/etc/clickhouse-server/config.d/zz-listen.xml docker.io/clickhouse/clickhouse-server
+build/scale-bench export --from 0 --to 1250 | clickhouse client -q "INSERT INTO scale.big FORMAT RowBinary"
+```
+
+## Results
+
+Machine: AMD Ryzen 9 7950X (16 cores / 32 threads, AVX-512), 64 GB RAM,
+WD SN720 NVMe (LUKS, ext4). ClickHouse 26.8.2.7.
+
+### 100 billion rows, tsdb and ClickHouse
+
+10,000 series x 10 million samples: the seven sensor types below, mixed, all
+stamped at 1 Hz (115.7 days from 2024-01-01). Both load exactly the same rows
+in the same order: 8 streams, each sending 100 series 100,000 samples at a
+time. ClickHouse: `MergeTree PARTITION BY toDate(ts) ORDER BY (series, ts)`,
+`Delta, ZSTD(1)` on time and value (its best codecs on this data), default
+settings otherwise; tsdb with its defaults (1-day partitions, 8192-row granules).
+The data set is two to three times the RAM, so large scans read from disk.
+
+| | tsdb | ClickHouse |
+|---|---:|---:|
+| size on disk | **116,113 MB** (1.161 bytes/row) | 170,098 MB (1.701 bytes/row) |
+| of which timestamps / values / index, bits per row | 2.00 / 7.22 / 0.07 | 2.54 / 11.03 / 0.02 series, plus marks |
+| load, 8 streams | **880 s** (114 M rows/s) | 1,107 s (90 M rows/s) |
+| until background merges settled | **900 s** (1,035 parts) | 2,676 s (868 parts) |
+
+ClickHouse with 10 M-row insert blocks ran out of memory (its limit here was
+25 GiB) in one of the 8 streams; the numbers are with its default blocks of
+1 M rows, which made 91,000 parts to merge.
+
+Queries: results read in full. Random windows on random series, mean of 20
+to 1,000 queries; whole-table and 100-series queries, median of 2 or 3.
+Second of two runs. ClickHouse gets each query over one connection and runs it
+on 32 threads; tsdb answers a query over many series with one query per
+series on 32 threads (32 connections to tsdbd). The results agree: count, sum
+(to 1e-14), min and max of the whole table are the same in both.
+
+| query | rows | ClickHouse | **tsdbd** (TCP) | tsdb embedded | ClickHouse / tsdbd |
+|---|---:|---:|---:|---:|---:|
+| a random single row | 1 | 2.68 ms | **0.29 ms** | 0.30 ms | 9x |
+| aggregate a random window of one series | 100 K | 5.78 ms | **0.57 ms** | 0.63 ms | 10x |
+| | 1 M | 11.3 ms | **0.58 ms** | 0.66 ms | 20x |
+| | 10 M (all of it) | 43.3 ms | **0.23 ms** | 0.17 ms | 190x |
+| aggregate 100 series | 1 G | 738 ms | **2.1 ms** | 2.1 ms | 350x |
+| aggregate the whole table | 100 G | 58.7 s | **0.17 s** | 0.16 s | 340x |
+| one series by hour | 10 M | 49.1 ms | **16.3 ms** | 19.4 ms | 3x |
+| one series by minute | 10 M | 63.2 ms | **27.2 ms** | 20.3 ms | 2.3x |
+| 100 series by series and day (Europe/Oslo) | 1 G | 959 ms | **172 ms** | 273 ms | 5.6x |
+| 100 series by series and hour | 1 G | 982 ms | **344 ms** | 365 ms | 2.9x |
+| whole table by series and day (UTC) | 100 G | 96.7 s | **0.18 s** | 0.15 s | 540x |
+| whole table by series and day (Europe/Oslo) | 100 G | 95.7 s | **37.6 s** | 27.9 s | 2.5x |
+| whole table by series and hour | 100 G | 100.7 s | **46.8 s** | 47.0 s | 2.2x |
+
+Where the answer lies in the granule statistics (every bucket covers whole
+granules), tsdb reads one index entry per 8192 rows: whole-table aggregates
+and UTC days take milliseconds. Hours, minutes and local days that do not line up
+with granules have to decode them, and then both systems read the data from
+disk; tsdb reads less of it.
+
+### 100 million rows
+
+100 series x 1,000,000 samples of the same seven sensor types at their own
+rates (`tsdb-bench --export`), written once to a RowBinary file that both
+systems load. ClickHouse table: `PARTITION BY toDate(ts) ORDER BY (series, ts)`
+with its recommended time series codecs unless noted. Data on tmpfs, so these
+numbers are CPU, not disk; durable writes on NVMe have their own table.
+
+#### Compression
 
 | | bytes / row | ratio vs 12 bytes |
 |---|---:|---:|
@@ -281,10 +196,9 @@ CPU, not disk; durable writes on NVMe have their own table.
 
 tsdb per row: timestamps 2.05 bits, values 7.68 bits, granule index 0.12 bits.
 ClickHouse at its best: timestamps 2.98 bits, values 7.40 bits, and about 4 bits
-of marks, primary index and checksums. The per-sensor value codec table is in
-[Compression](#compression).
+of marks, primary index and checksums. The per-sensor value codecs are below.
 
-### Write speed
+#### Write speed
 
 Loading the 100 M rows:
 
@@ -330,7 +244,7 @@ after its own fsync, shared by concurrent writers (group commit). A periodic
 sync of 10 ms costs no measurable throughput against 100 ms and bounds what a
 power failure can lose to the last 10 ms of acknowledged writes.
 
-### Read speed
+#### Read speed
 
 Whole range, all 100 series. Bucket sizes are in samples so each sensor type
 does the same work (`GROUP BY series, intDiv(ts, step * N)` in ClickHouse).
@@ -375,15 +289,37 @@ every row written twice, aggregates have to merge both copies instead of using
 the granule statistics, and ran about 14x slower until `tsdb_optimize` (or the
 background merges) folded them together.
 
-### Reproducing
+### Value codecs
 
-```sh
-build/codec-bench                                    # value codecs per sensor type
-build/tsdb-bench --export data.rowbinary --series 100 --points 1000000
-build/tsdb-bench --dir /tmp/b --series 100 --points 1000000 [--query-threads 1]
-build/insert-bench --dir /var/tmp/b                  # durable inserts, 1 row .. 1e9 rows per batch
-build/tsdbd --dir /tmp/srv &                         # then, against it:
-build/tsdbc-bench load data.rowbinary --conns 4
-build/tsdbc-bench query --conns 32
-build/tsdbc-bench connections --conns 10000
-```
+float32, bits per value after ZSTD(1) (`build/codec-bench`):
+
+| sensor (bits per value, codec + ZSTD) | Gorilla | Chimp | Chimp128 | Patas | tsdb AUTO |
+|---|---:|---:|---:|---:|---:|
+| SMART disk temperature, 0.1 degC, 60 s | 2.66 | 2.33 | 5.93 | 3.39 | **1.35** |
+| CPU temperature, spikes to 100 degC, 1 s | 10.82 | 11.34 | 11.86 | 10.75 | **3.60** |
+| tank pressure, 0.001 bar, 10 s | 9.09 | 8.85 | 8.79 | 7.45 | **2.01** |
+| tank pressure in psi (converted, unrounded) | 23.77 | 19.57 | 19.62 | 27.24 | **19.56** |
+| vibration, 16-bit ADC at 1 kHz | 21.51 | 23.58 | 30.78 | 27.87 | **14.70** |
+| pipeline flow rate, 0.01 m3/h | 23.08 | 20.85 | 19.94 | 17.76 | **11.41** |
+| pipeline flow totalizer, m3 | 8.68 | 6.07 | 6.10 | 8.40 | **1.67** |
+| uniform random floats | 32.32 | 32.90 | 32.90 | 39.91 | **28.95** |
+
+The other types (`build/type-bench`), bits per value with ZSTD(1), and
+decoding speed on one core:
+
+| data | type | bits / value | vs raw | decode, M values/s | codec |
+|---|---|---:|---:|---:|---|
+| SMART disk temperature, 0.1 degC | float64 | 0.88 | 73x | 749 | fixed point |
+| CPU temperature, spikes to 100 degC | float64 | 3.10 | 21x | 722 | fixed point |
+| tank pressure, 0.001 bar | float64 | 1.82 | 35x | 421 | fixed point |
+| tank pressure in psi (unrounded) | float64 | 48.87 | 1.3x | 1,032 | byte split |
+| vibration, 16-bit ADC | float64 | 14.03 | 4.6x | 620 | fixed point (binary) |
+| pipeline flow rate, 0.01 m3/h | float64 | 10.80 | 5.9x | 903 | fixed point |
+| pipeline totalizer, m3 | float64 | 1.56 | 41x | 397 | fixed point |
+| uniform random | float64 | 59.24 | 1.1x | 526 | byte split |
+| totalizer in whole liters | int64 | 1.18 | 54x | 431 | bit-packed deltas |
+| a rate, random 50,000 - 70,000 | int64 | 16.01 | 4.0x | 1,076 | bit-packed deltas |
+| an event sequence | int64 | 0.04 | 1,680x | 963 | bit-packed deltas |
+| a door, a few changes an hour | bool | 0.06 | 130x | 1,118 | bit-packed deltas |
+| coin flips | bool | 1.29 | 6.2x | 794 | bit-packed deltas |
+| a machine mode of 5 states | state | 0.13 | 245x | 896 | bit-packed deltas |
