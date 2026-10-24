@@ -395,6 +395,24 @@ each other here); `DUCK_THREADS=1` runs DuckDB with one thread per query instead
 `DUCK_MEMORY` sets its memory limit (24GB). `embq duckdb sql DB "EXPLAIN ..."` shows a plan: the
 time bounds are cast to `TIMESTAMP_MS` so that both reach the scan as plain table filters.
 
+## To add at the release run: LTTB and time-weighted averages
+
+The README's comparison table gets two more columns, measured like the others and checked against tsdb's
+answers: LTTB downsampling (the same 1000 points per series over the whole range) and time-weighted
+averages (step method, by hour, over the whole range, with the value carried in at each bucket's start).
+For each system use its built-in function where it has one, otherwise its usual window-function recipe in SQL,
+otherwise report "-" (not supported), and footnote which route each took:
+
+| system | LTTB | time-weighted average |
+|---|---|---|
+| ClickHouse | `largestTriangleThreeBuckets` (alias `lttb`; check the pinned version has it) | `lagInFrame`/`leadInFrame` window plus `avgWeighted` |
+| TimescaleDB | toolkit `lttb()` (needs the timescaledb toolkit in the image) | toolkit `time_weight()` and `average()` |
+| DuckDB, InfluxDB 3 (SQL), QuestDB | window-function SQL, if the dialect supports it | window-function SQL |
+| InfluxDB 2, Prometheus | - unless built in by then | - unless built in by then |
+
+LTTB answers must be the same points (first maximum wins on ties); time-weighted averages within a stated
+tolerance. The twa track's REPORT.md has the ClickHouse query.
+
 ## Fairness notes
 
 - **Durability at acknowledgement differs.** tsdb, PostgreSQL and both InfluxDBs flush to disk before
