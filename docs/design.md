@@ -1002,10 +1002,9 @@ On SSE and AVX the short path is itself a 128-bit kernel and is used up to
 64 values. The integer loops below likewise take short runs, and short LTTB
 buckets are scanned by the scalar loop; where each set's kernels start to pay
 was measured per set (`fold-bench --vary`): int64 from 16 to 48 values (with
-the spread from 16 on AVX-512 to 256 on SSE, which has no 64-bit multiply for
-the squares), bool and state codes from 24 or 32, LTTB from 8 to 48 points.
-A short granule's time-weighted areas (up to 16 or 17 points) take the same
-shortened halving, and one or two segments are added without a kernel call.
+the spread from 16 or 24 on AVX-512 and AVX2; never on SSE and AVX, which have
+no 64-bit multiply for the squares and lose to the loop at every length), bool
+and state codes from 24 or 32, LTTB from 8 to 48 points.
 
 Integers (int64, bool and state codes) are summed exactly, so their order is
 free: the vector kernels add 32-bit halves of the values in 64-bit
@@ -1017,16 +1016,22 @@ of the run fits in 32 bits, three otherwise). The scalar loops in `values.c` are
 reference, and the code for short runs.
 
 A granule's time-weighted areas (`tw_step`, `tw_lin`, written with the
-granule) are float sums too: segment s (from reading s to s + 1) adds to lane
-s % 16 of the float64 scheme, a segment that does not count adds +0.0, and the
-lanes are halved the same way. The milliseconds and the longest gap are
-integers. LTTB's scan for the largest triangle computes each point's area with
+granule) are float sums too, in one of two orders fixed by the granule's
+length alone, the same on every CPU and kernel set. Up to `TWA_SEQ_MAX` (383)
+points the segments are added one after the other, starting from +0.0, by a
+plain loop in `twa.c`; that file is compiled once, so every CPU runs the same
+instructions on the same values. Beyond that, segment s (from reading s to
+s + 1) adds to lane s % 16 of the float64 scheme, a segment that does not count
+adds +0.0, and the lanes are halved the same way, in every kernel set. The
+limit is where the slowest kernel set (SSE, int64 with nulls) first matches
+the loop; below it the loop's fixed cost is lower. The milliseconds and the
+longest gap are integers. LTTB's scan for the largest triangle computes each point's area with
 the same expression in every kernel (timestamps and int64 values converted to
 double rounded once, as the scalar conversion does); each lane keeps its first
 largest area and the lanes are then combined by area and lowest index, so the
 pick is always the first point with the largest area, and a NaN never wins.
-The areas were summed one segment after the other before; like the float64
-sums, they may differ from those in the last bits once.
+The areas of longer granules were summed one segment after the other before;
+like the float64 sums, they may differ from those in the last bits once.
 
 Before these kernels, float64 and float32 with nulls were summed one value
 after the other; their sums and spreads may now differ from those in the last

@@ -341,10 +341,13 @@ static inline void agg_combine(agg_state *a, agg_dev *ax, const agg_state *b, co
     a->count += b->count;
 }
 
+/* The kernel dispatch (simd.c): hidden, so that -fPIC code reads these without a GOT load on every short fold */
+#define SIMD_VAR extern __attribute__((visibility("hidden")))
+
 /* Folds float32 values (no nulls) into a: count, sum (in double), min and max (NaN ignored); with x also
  * m2 into x (a second pass over the values). Queries that do not ask for the spread pass NULL: m2 and the
  * sums of squares are the cost of the spread, and a query of tiny buckets would pay it on every row. */
-extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *x);
+SIMD_VAR void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *x);
 /* The lanes of simd.c's float kernels (their order of additions). A run of fewer than simd_short values goes to
  * simd_small_*: the same bits as the kernels at a fraction of their fixed cost; values.c picks. simd_short is
  * SIMD_SHORT (the scalar short path's limit: the float32 lanes taken 16 at a time) or, where simd_small_* are the
@@ -352,22 +355,22 @@ extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *x);
 #define SIMD_LANES_F32 32
 #define SIMD_LANES_F64 16
 #define SIMD_SHORT 32
-extern size_t simd_short;
-extern void (*simd_small_f32)(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
-extern void (*simd_small_f64)(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
+SIMD_VAR size_t simd_short;
+SIMD_VAR void (*simd_small_f32)(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
+SIMD_VAR void (*simd_small_f64)(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
 /* the same with nulls: `nulls` of the n slots hold the type's null (0: none, the kernel above) */
-extern void (*simd_fold_f32)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);
-extern void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);
+SIMD_VAR void (*simd_fold_f32)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);
+SIMD_VAR void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);
 /* int64 with nulls; NULL where only the scalar loop of values.c is left (exact results, so any order) */
-extern void (*simd_fold_i64)(const int64_t *v, size_t n, agg_state *a, agg_dev *x);
+SIMD_VAR void (*simd_fold_i64)(const int64_t *v, size_t n, agg_state *a, agg_dev *x);
 /* bool and state codes (null: NULL_BOOL, NULL_STATE); NULL as for int64 */
-extern void (*simd_fold_u32)(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *x);
+SIMD_VAR void (*simd_fold_u32)(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *x);
 /* Fewer values than these go to values.c's loops, which beat the integer kernels' setup and lane combine there:
  * int64 without and with the spread, bool and state. Per kernel set (simd_select, from fold-bench); the sums
  * are exact, so either side gives the same bits. */
-extern size_t simd_i64_min, simd_i64_dev_min, simd_u32_min;
+SIMD_VAR size_t simd_i64_min, simd_i64_dev_min, simd_u32_min;
 /* points below which lttb_argmax takes its scalar loop (the same pick), per kernel set */
-extern size_t simd_lttb_small;
+SIMD_VAR size_t simd_lttb_small;
 /* Folds n slots of `type` into a, skipping nulls, with the spread (values.c; granule statistics). */
 void agg_fold(int type, const void *v, size_t n, agg_state *a, agg_dev *x);
 /* the same, skipping the search for nulls when the caller knows there are none (a granule's count), and
@@ -484,19 +487,18 @@ _Static_assert(sizeof(granule) == 160, "granule must be 160 bytes");
 enum { GT_FIRST_NULL = 1, GT_LAST_NULL = 2 };
 /* The time-weighted statistics of a granule's rows (n >= 1, ts strictly increasing). */
 void granule_twa(int type, const int64_t *ts, const void *v, size_t n, struct granule *g);
-/* granule_twa's sums over the n - 1 segments (simd.c: one order of the areas on every CPU) */
+/* Granules of at most TWA_SEQ_MAX points add their segments' areas one after another (twa.c, compiled once: the
+ * same bits on every CPU); longer ones take simd_twa, whose 16 lanes give the same bits on every kernel set. The
+ * limit is where every set's kernel is at least as fast as that loop. */
+#ifndef TWA_SEQ_MAX
+#define TWA_SEQ_MAX 383
+#endif
+/* granule_twa's sums over the n - 1 segments of a longer granule (simd.c) */
 typedef struct twa_sums {
     double step, lin;
     uint64_t sms, lms, gap;
 } twa_sums;
-extern void (*simd_twa)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o);
-/* the same sums for at most simd_twa_max points (n >= 1) without the setup of simd_twa's long loop */
-extern void (*simd_twa_small)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o);
-extern size_t simd_twa_max;
-static inline void simd_twa_run(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
-{
-    (n > simd_twa_max ? simd_twa : simd_twa_small)(type, ts, v, n, o);
-}
+SIMD_VAR void (*simd_twa)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o);
 
 typedef struct part_header {
     char magic[8];

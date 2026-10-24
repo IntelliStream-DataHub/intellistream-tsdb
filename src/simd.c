@@ -31,9 +31,11 @@
  * 16), only how many of them one instruction holds differs (SSE and AVX's 128-bit code: two float64 lanes per
  * vector, eight vectors; AVX2: four; AVX-512: eight; scalar: one), and every set halves them in the same steps.
  * A short run (below simd_short: SIMD_SHORT, or AVX_SHORT where simd_small_* are 128-bit kernels) starts the
- * halving at the smallest power of two that holds it; so does a short TWA granule (up to simd_twa_max points), and
- * twa.c adds one or two segments itself. Where the integer kernels and LTTB's take over from values.c's loops and
- * lttb_scalar is set per set (simd_thresholds), as is everything else that only changes speed.
+ * halving at the smallest power of two that holds it. TWA has two orders, chosen by the granule's length alone:
+ * up to TWA_SEQ_MAX points twa.c adds the segments one after another (compiled once, so the same bits on every
+ * CPU), beyond it simd_twa's 16 lanes in every set. Where the integer kernels and LTTB's take over from values.c's
+ * loops and lttb_scalar is set per set (simd_thresholds; SIZE_MAX: never), as is everything else that only changes
+ * speed.
  */
 #include "internal.h"
 
@@ -1101,8 +1103,7 @@ static inline double twa_y(int type, const void *v, size_t i, bool *ok)
     }
 }
 
-/* segments [s, n - 1) one at a time into the lanes, then the reduction of the first k lanes (L64, or fewer for
- * a short granule: see twa_small) */
+/* segments [s, n - 1) one at a time into the lanes, then the reduction of the first k lanes */
 INL void twa_tail(int type, const int64_t *ts, const void *v, size_t s, size_t n, double *st, double *li,
                   twa_sums *o, const int k)
 {
@@ -1155,59 +1156,6 @@ static void twa_scalar(int type, const int64_t *ts, const void *v, size_t n, twa
     case TSDB_FLOAT64: twa_scalar_impl(TSDB_FLOAT64, ts, v, n, o); break;
     case TSDB_INT64: twa_scalar_impl(TSDB_INT64, ts, v, n, o); break;
     default: twa_scalar_impl(TSDB_BOOL, ts, v, n, o); break;
-    }
-}
-
-/* At most L64 points, so at most one segment per lane: as for the short runs above, the reduction of the k
- * lanes in use gives the same bits, and with K a constant the lanes stay in registers. */
-INL void twa_small_k(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o, const int K)
-{
-    double st[L64], li[L64];
-    uint64_t sms = 0, lms = 0, gap = 0;
-    bool okp;
-    double vp = twa_y(type, v, 0, &okp);
-    _Pragma("GCC unroll 16") for (int j = 0; j < K; j++)
-    {
-        size_t i = (size_t)j + 1;
-        bool in = i < n, ok = false;
-        uint64_t dt = in ? (uint64_t)ts[i] - (uint64_t)ts[i - 1] : 0;
-        double x = in ? twa_y(type, v, i, &ok) : 0.0, d = (double)dt;
-        ok = in && ok;
-        gap = dt > gap ? dt : gap;
-        st[j] = 0.0 + (in && okp ? vp * d : 0.0);
-        li[j] = 0.0 + (okp && ok ? (vp + x) * 0.5 * d : 0.0);
-        sms += in && okp ? dt : 0;
-        lms += okp && ok ? dt : 0;
-        vp = x;
-        okp = ok;
-    }
-    _Pragma("GCC unroll 8") for (int w = K / 2; w >= 1; w /= 2)
-        _Pragma("GCC unroll 16") for (int j = 0; j < w; j++)
-    {
-        st[j] = st[j] + st[j + w];
-        li[j] = li[j] + li[j + w];
-    }
-    *o = (twa_sums){.sms = sms, .lms = lms, .gap = gap, .step = canon_nan(st[0]), .lin = canon_nan(li[0])};
-}
-
-INL void twa_small_impl(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
-{
-    switch (lanes_for(n - 1)) {
-    case 1: twa_small_k(type, ts, v, n, o, 1); break;
-    case 2: twa_small_k(type, ts, v, n, o, 2); break;
-    case 4: twa_small_k(type, ts, v, n, o, 4); break;
-    case 8: twa_small_k(type, ts, v, n, o, 8); break;
-    default: twa_small_k(type, ts, v, n, o, 16); break;
-    }
-}
-
-static void twa_small(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
-{
-    switch (type) {
-    case TSDB_FLOAT32: twa_small_impl(TSDB_FLOAT32, ts, v, n, o); break;
-    case TSDB_FLOAT64: twa_small_impl(TSDB_FLOAT64, ts, v, n, o); break;
-    case TSDB_INT64: twa_small_impl(TSDB_INT64, ts, v, n, o); break;
-    default: twa_small_impl(TSDB_BOOL, ts, v, n, o); break;
     }
 }
 
@@ -1388,9 +1336,6 @@ __attribute__((target("avx512f,avx512dq"))) static void twa_avx512(int type, con
 #endif
 
 void (*simd_twa)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o) = twa_scalar;
-void (*simd_twa_small)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o) = twa_small;
-/* twa_small's limit; the SSE and AVX sets have a short path of their own, with L64 + 1 points in its vectors */
-size_t simd_twa_max = L64;
 
 /* ---------------------------------------------------------------- LTTB */
 
@@ -1600,14 +1545,15 @@ __attribute__((target("avx512f,avx512dq"))) static size_t lttb_avx512(int type, 
 
 /* Per kernel set, the lengths from which the integer kernels beat values.c's loops (int64 without and with the
  * spread, bool and state) and the LTTB kernel lttb_scalar: fold-bench --vary, kernel against loop at 4 to 8192
- * rows. SSE has no 64-bit multiply, so its int64 squares cost the most: its spread kernel only draws level with
- * the loop (which skips nulls) from about 256 values. The defaults are the scalar set's (no kernels). */
+ * rows. SIZE_MAX: never. SSE and AVX have no 64-bit multiply, so their int64 squares cost the most: the loop
+ * (one mul and an add-with-carry chain per value, skipping nulls) beats their spread kernels at every length. The
+ * scalar set has no integer kernels at all. */
 typedef struct {
     size_t i64, i64_dev, u32, lttb;
 } simd_thresholds;
-#define THR_SCALAR ((simd_thresholds){16, 0, 32, 16})
-#define THR_SSE ((simd_thresholds){48, 256, 24, 24})
-#define THR_AVX ((simd_thresholds){24, 128, 24, 48})
+#define THR_SCALAR ((simd_thresholds){SIZE_MAX, SIZE_MAX, SIZE_MAX, 16})
+#define THR_SSE ((simd_thresholds){48, SIZE_MAX, 24, 24})
+#define THR_AVX ((simd_thresholds){24, SIZE_MAX, 24, 48})
 #define THR_AVX2 ((simd_thresholds){16, 24, 32, 8})
 #define THR_AVX512 ((simd_thresholds){16, 16, 32, 16})
 /* the SSE and AVX sets: runs shorter than this take simd_sse.inc's short-run kernels (small_*), whose fixed cost is
@@ -1633,7 +1579,7 @@ void (*simd_fold_u32)(const uint32_t *v, size_t n, uint32_t null, agg_state *a, 
 void (*simd_small_f32)(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv) = small_f32_scalar;
 void (*simd_small_f64)(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv) = small_f64_scalar;
 size_t simd_short = SIMD_SHORT;
-size_t simd_i64_min = 16, simd_i64_dev_min = 0, simd_u32_min = 32;
+size_t simd_i64_min = SIZE_MAX, simd_i64_dev_min = SIZE_MAX, simd_u32_min = SIZE_MAX;
 size_t simd_lttb_small = 16;
 static const char *simd_level = "scalar";
 
@@ -1685,8 +1631,7 @@ void simd_select(int level)
         lttb_scalar;
     void (*sf32)(const float *, size_t, bool, agg_state *, agg_dev *) = small_f32_scalar;
     void (*sf64)(const double *, size_t, bool, agg_state *, agg_dev *) = small_f64_scalar;
-    void (*twa_s)(int, const int64_t *, const void *, size_t, twa_sums *) = twa_small;
-    size_t shortn = SIMD_SHORT, twa_max = L64;
+    size_t shortn = SIMD_SHORT;
     simd_thresholds thr = THR_SCALAR;
     const char *name = "scalar";
 #ifdef TSDB_X86
@@ -1740,8 +1685,6 @@ void simd_select(int level)
         i64 = fold_i64_avx;
         u32 = fold_u32_avx;
         twa = twa_avx;
-        twa_s = twa_short_avx;
-        twa_max = L64 + 1;
         lttb = lttb_avx;
         name = "avx";
         thr = THR_AVX;
@@ -1756,8 +1699,6 @@ void simd_select(int level)
         i64 = fold_i64_sse;
         u32 = fold_u32_sse;
         twa = twa_sse;
-        twa_s = twa_short_sse;
-        twa_max = L64 + 1;
         lttb = lttb_sse;
         name = "sse";
         thr = THR_SSE;
@@ -1771,8 +1712,6 @@ void simd_select(int level)
     simd_fold_i64 = i64;
     simd_fold_u32 = u32;
     simd_twa = twa;
-    simd_twa_small = twa_s;
-    simd_twa_max = twa_max;
     simd_lttb = lttb;
     simd_small_f32 = sf32;
     simd_small_f64 = sf64;

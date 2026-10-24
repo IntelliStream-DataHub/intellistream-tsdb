@@ -47,31 +47,10 @@ static void fold_f64(const double *v, size_t n, bool may_be_null, agg_state *a, 
         simd_fold_f64(v, n, may_be_null ? count_null_f64((const uint64_t *)v, n) : 0, a, x);
 }
 
-static void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
+/* The loops below the kernels' thresholds, out of line: inlined into agg_fold_hint behind the dispatch check, GCC
+ * rematerialised the 64-bit null (movabs) on every row, 7-9% slower than main's same loop. */
+__attribute__((noinline)) static void fold_i64_dev(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
 {
-    if (simd_fold_i64 && n >= (dx ? simd_i64_dev_min : simd_i64_min)) {
-        simd_fold_i64(v, n, a, dx);
-        return;
-    }
-    if (!dx) {
-        __int128 s = 0;
-        int64_t mn = a->imin, mx = a->imax;
-        uint64_t c = 0;
-        for (size_t i = 0; i < n; i++) {
-            int64_t x = v[i];
-            if (x == NULL_I64)
-                continue;
-            c++;
-            s += x;
-            mn = x < mn ? x : mn;
-            mx = x > mx ? x : mx;
-        }
-        a->count += c;
-        a->isum += s;
-        a->imin = mn;
-        a->imax = mx;
-        return;
-    }
     __int128 s = 0;
     unsigned __int128 q = 0; /* squares: up to 2^126 each, so a carry word */
     uint64_t qh = 0;
@@ -85,8 +64,7 @@ static void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
         s += x;
         uint64_t u = x < 0 ? 0 - (uint64_t)x : (uint64_t)x;
         unsigned __int128 sq = (unsigned __int128)u * u;
-        q += sq;
-        qh += q < sq;
+        qh += __builtin_add_overflow(q, sq, &q); /* add, adc, adc: no compare of 128-bit values */
         mn = x < mn ? x : mn;
         mx = x > mx ? x : mx;
     }
@@ -97,31 +75,49 @@ static void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
     a->imax = mx;
 }
 
-/* bool (0, 1) and state codes: 4-byte slots with their own null */
-static void fold_u32(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx)
+__attribute__((noinline)) static void fold_i64_agg(const int64_t *v, size_t n, agg_state *a)
 {
-    if (simd_fold_u32 && n >= simd_u32_min) {
-        simd_fold_u32(v, n, null, a, dx);
-        return;
+    __int128 s = 0;
+    int64_t mn = a->imin, mx = a->imax;
+    uint64_t c = 0;
+    for (size_t i = 0; i < n; i++) {
+        int64_t x = v[i];
+        if (x == NULL_I64)
+            continue;
+        c++;
+        s += x;
+        mn = x < mn ? x : mn;
+        mx = x > mx ? x : mx;
     }
-    if (!dx) {
-        int64_t s = 0, mn = a->imin, mx = a->imax;
-        uint64_t c = 0;
-        for (size_t i = 0; i < n; i++) {
-            uint32_t x = v[i];
-            if (x == null)
-                continue;
-            c++;
-            s += x;
-            mn = (int64_t)x < mn ? (int64_t)x : mn;
-            mx = (int64_t)x > mx ? (int64_t)x : mx;
-        }
-        a->count += c;
-        a->isum += s;
-        a->imin = mn;
-        a->imax = mx;
-        return;
+    a->count += c;
+    a->isum += s;
+    a->imin = mn;
+    a->imax = mx;
+}
+
+/* bool (0, 1) and state codes: 4-byte slots with their own null */
+__attribute__((noinline)) static void fold_u32_agg(const uint32_t *v, size_t n, uint32_t null, agg_state *a)
+{
+    int64_t s = 0, mn = a->imin, mx = a->imax;
+    uint64_t c = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t x = v[i];
+        if (x == null)
+            continue;
+        c++;
+        s += x;
+        mn = (int64_t)x < mn ? (int64_t)x : mn;
+        mx = (int64_t)x > mx ? (int64_t)x : mx;
     }
+    a->count += c;
+    a->isum += s;
+    a->imin = mn;
+    a->imax = mx;
+}
+
+__attribute__((noinline)) static void fold_u32_dev(const uint32_t *v, size_t n, uint32_t null, agg_state *a,
+                                                   agg_dev *dx)
+{
     int64_t s = 0, mn = a->imin, mx = a->imax;
     unsigned __int128 q = 0; /* squares below 2^64: no carry word for 2^64 of them */
     uint64_t c = 0;
@@ -140,6 +136,27 @@ static void fold_u32(const uint32_t *v, size_t n, uint32_t null, agg_state *a, a
     isq_add(dx, q, 0);
     a->imin = mn;
     a->imax = mx;
+}
+
+/* the thresholds are SIZE_MAX where a set has no such kernel: one compare decides */
+static inline void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
+{
+    if (n >= (dx ? simd_i64_dev_min : simd_i64_min))
+        simd_fold_i64(v, n, a, dx);
+    else if (dx)
+        fold_i64_dev(v, n, a, dx);
+    else
+        fold_i64_agg(v, n, a);
+}
+
+static inline void fold_u32(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx)
+{
+    if (n >= simd_u32_min)
+        simd_fold_u32(v, n, null, a, dx);
+    else if (dx)
+        fold_u32_dev(v, n, null, a, dx);
+    else
+        fold_u32_agg(v, n, null, a);
 }
 
 void agg_fold_hint(int type, const void *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
