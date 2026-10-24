@@ -123,21 +123,34 @@ static int th_mport; /* the metrics port of the last th_await(), 0 if the server
 #define TH_EXITED (-1) /* the child exited before it listened (reaped) */
 #define TH_BAD (-2)    /* anything else: another pid, a port that is not the child's, no file in time */
 
+/* Set by th_await when it reaps the child: the wait status of a server that exited before it listened. */
+static int th_status;
+/* Test hook: called right before th_await asks whether the child holds its port (test_ports makes the child die
+ * exactly there, the race a server that power-cuts itself right after writing its port file runs into). */
+static void (*th_before_owns)(pid_t child);
+
+/* Reaps `child` if it has exited: sets th_why and th_status, returns 1. */
+static inline int th_reaped(pid_t child)
+{
+    int status;
+    if (waitpid(child, &status, WNOHANG) != child)
+        return 0;
+    th_status = status;
+    if (WIFEXITED(status))
+        snprintf(th_why, sizeof th_why, "harness: tsdbd (pid %d) exited with status %d before it listened\n",
+                 (int)child, WEXITSTATUS(status));
+    else
+        snprintf(th_why, sizeof th_why, "harness: tsdbd (pid %d) died of signal %d before it listened\n",
+                 (int)child, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    return 1;
+}
+
 /* Waits up to timeout_ms for the port file of `child`. Returns the port, or TH_EXITED / TH_BAD with th_why set. */
 static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
 {
     for (int waited = 0; waited <= timeout_ms; waited += 5) {
-        int status;
-        pid_t r = waitpid(child, &status, WNOHANG);
-        if (r == child) {
-            if (WIFEXITED(status))
-                snprintf(th_why, sizeof th_why, "harness: tsdbd (pid %d) exited with status %d before it listened\n",
-                         (int)child, WEXITSTATUS(status));
-            else
-                snprintf(th_why, sizeof th_why, "harness: tsdbd (pid %d) died of signal %d before it listened\n",
-                         (int)child, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        if (th_reaped(child))
             return TH_EXITED;
-        }
         FILE *f = fopen(portfile, "r");
         if (f) {
             int port = 0, pid = 0, mport = 0;
@@ -150,12 +163,20 @@ static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
                              (int)child);
                     return TH_BAD;
                 }
+                if (th_before_owns)
+                    th_before_owns(child);
                 if (!th_owns_port(child, port)) {
+                    /* a server that wrote its port file and then died (a fault that hits a background file
+                     * operation) holds nothing: that is an exit, not a foreign port */
+                    if (th_reaped(child))
+                        return TH_EXITED;
                     snprintf(th_why, sizeof th_why,
                              "harness: port %d is not held by the server started here (pid %d)\n", port, (int)child);
                     return TH_BAD;
                 }
                 if (n == 3 && !th_owns_port(child, mport)) {
+                    if (th_reaped(child))
+                        return TH_EXITED;
                     snprintf(th_why, sizeof th_why,
                              "harness: metrics port %d is not held by the server started here (pid %d)\n", mport,
                              (int)child);

@@ -77,6 +77,16 @@ static bool series_exists(int port, const char *name)
     return rc == 0;
 }
 
+/* th_before_owns hook: the child is killed and left a zombie (not reaped), as a server that power-cuts itself
+ * between writing its port file and the harness asking who holds the port. */
+static void die_now(pid_t child)
+{
+    sig(child, SIGKILL);
+    siginfo_t si;
+    si.si_pid = 0;
+    waitid(P_PID, (id_t)child, &si, WEXITED | WNOWAIT);
+}
+
 static void stop(pid_t pid)
 {
     sig(pid, SIGTERM);
@@ -148,7 +158,7 @@ int main(int argc, char **argv)
     CHECK(th_owns_port(s1, p1) && th_owns_port(s2, p2));
     CHECK(!th_owns_port(s1, p2) && !th_owns_port(s2, p1)); /* each port is held by its own server only */
     /* th_await proved both ports: asking again must not list /proc/net/tcp (jepsen's clients ask on every connect and
-     * the listing grows with every reconnect: it once took 15 ms and cost power runs most of their writes) */
+     * the listing grows with every reconnect: about 15 ms per ask in a 20 s power run) */
     {
         unsigned before = atomic_load(&th_scans);
         for (int i = 0; i < 100; i++)
@@ -216,6 +226,26 @@ int main(int argc, char **argv)
         CHECK(th_await(bad, s1, 1000) == p1);
         unlink(bad);
         CHECK(th_await(bad, s1, 100) == TH_BAD); /* no file: a timeout, not a guess */
+    }
+
+    /* a server that wrote its port file and died before the harness checked the port is an exit (TH_EXITED, which
+     * jepsen answers with a clean restart), not a "foreign port" (TH_BAD, which stops the run) */
+    {
+        char tmp[700], txt[64];
+        th_portfile(tmp, sizeof tmp, d1);
+        pid_t z = fork();
+        if (z == 0) {
+            pause();
+            _exit(0);
+        }
+        snprintf(txt, sizeof txt, "%d %d\n", p1, (int)z); /* a port nobody holds under z's pid, like a dead server's */
+        put(tmp, txt);
+        th_before_owns = die_now;
+        int r = th_await(tmp, z, 5000);
+        th_before_owns = NULL;
+        CHECK(r == TH_EXITED);
+        CHECK(WIFSIGNALED(th_status) && WTERMSIG(th_status) == SIGKILL);
+        unlink(tmp);
     }
 
     /* a port somebody else holds: tsdbd gives up, the harness is told so and never connects */
