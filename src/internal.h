@@ -370,6 +370,34 @@ typedef struct part_footer {
 _Static_assert(sizeof(part_footer) == 56, "footer must be 56 bytes");
 _Static_assert(sizeof(part_footer) >= BLK_SLACK, "footer must cover decoder overread");
 
+/* A range tombstone: rows of `series` with start <= ts < end are deleted from
+ * every part of the same partition with a lower block number (never from the
+ * part that holds it: its own rows are newer). Stored like this in the
+ * trailer of a part, sorted by (series, start), ranges of one series disjoint. */
+typedef struct tomb {
+    uint32_t series;
+    uint32_t zero;
+    int64_t start, end;
+} tomb;
+_Static_assert(sizeof(tomb) == 24, "tomb must be 24 bytes");
+
+/* A sorted, coalesced set of tombstones, for applying several parts' at once. */
+typedef struct tomb_set {
+    tomb *t;
+    size_t n, cap;
+} tomb_set;
+int tomb_set_add(tomb_set *s, const tomb *t, size_t n);
+void tomb_set_finish(tomb_set *s); /* sorts and coalesces; call after adding */
+void tomb_set_free(tomb_set *s);
+/* index of the first range of `series` that ends after ts (s->n if none) */
+size_t tomb_set_seek(const tomb_set *s, uint32_t series, int64_t ts);
+/* whether a range of `series` intersects [lo, hi] */
+bool tomb_set_hits(const tomb_set *s, uint32_t series, int64_t lo, int64_t hi);
+/* Keeps the rows (ts ascending, slots of width w) at or after `cutoff` that no
+ * range of `series` covers, in place; returns how many remain. */
+size_t tomb_set_filter(const tomb_set *s, uint32_t series, int64_t cutoff, int64_t *ts, uint8_t *v, size_t w,
+                       size_t n);
+
 typedef struct part {
     char name[96];
     int dirfd;
@@ -382,6 +410,8 @@ typedef struct part {
     size_t map_len;
     const granule *g;
     uint32_t ng;
+    const tomb *t; /* the part's tombstones (in the map); NULL when none */
+    uint32_t nt;
     uint64_t index_off;
     uint64_t rows;
     int64_t min_ts, max_ts;
@@ -427,12 +457,18 @@ typedef struct part_writer {
     codec_ctx *cc;
     uint64_t rows;
     int64_t min_ts, max_ts;
+    tomb *tombs; /* written after the index; sorted, disjoint per series */
+    size_t nt;
+    bool keep_empty;  /* write a part even with no rows and no tombstones (a merge's wal_seq anchor) */
+    int64_t empty_ts; /* its min_ts = max_ts then */
 } part_writer;
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq);
 /* Rows of one series of `type` (v in its slots); (series, ts) order across calls. */
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n);
 int pw_copy_granule(part_writer *w, const part *src, const granule *g);
+/* Tombstones for the trailer, sorted by (series, start) and disjoint per series; copied. */
+int pw_set_tombs(part_writer *w, const tomb *t, size_t n);
 int pw_finish(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
 /* As pw_finish, but the part stays under its tmp name until parts_commit. */
 int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
@@ -602,6 +638,18 @@ struct eng {
 
     series_dict series;
     series_dict states;
+
+    /* retention (retention.c) */
+    pthread_mutex_t ret_lock;
+    int64_t *ret_limit; /* ms per series id, 0 = keep */
+    uint32_t ret_cap;
+    atomic_bool has_retention; /* some series has a limit: queries and merges look it up */
+    int ret_fd;
+    uint64_t ret_off;
+    bool ret_broken;
+    atomic_int_fast64_t clock_floor; /* now never goes below this */
+    int64_t last_ttl_ms;             /* merge thread: last scan for expired rows (under lock) */
+    atomic_uint tomb_parts;          /* listed parts that hold tombstones (stats) */
     pool *qpool;
 
     /* memtable and WAL (memtable.c) */
@@ -744,5 +792,20 @@ int eng_drop_before(eng *db, int64_t ts);
 int eng_get_stats(eng *db, tsdb_stats *st);
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
+/* retention.c */
+int ret_open(eng *db, bool read_only);
+int ret_reload(eng *db);
+void ret_close(eng *db);
+void ret_clock_init(eng *db);
+int64_t eng_now_ms(eng *db);
+int64_t eng_retention(eng *db, uint32_t series);
+int64_t eng_cutoff(eng *db, uint32_t series); /* rows before it have expired; INT64_MIN when none */
+int64_t eng_cutoff_at(eng *db, uint32_t series, int64_t now);
+int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms);
+/* delete.c */
+int eng_delete_range(eng *db, uint32_t series, int64_t start, int64_t end);
+int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+                      const void *v, size_t n);
+int ttl_select_locked(eng *db, part **sel); /* merge.c: a part to rewrite for retention, or a partition to drop */
 
 #endif

@@ -14,6 +14,14 @@
  * the newest source part (highest block number), which is what makes the
  * table behave like a ReplacingMergeTree. When a whole source granule sorts
  * strictly before everything else that remains, it is copied as compressed bytes.
+ *
+ * Deletes and retention: a source's rows covered by the tombstones of a newer
+ * source, or older than their series' retention cutoff, are dropped (a granule
+ * that has any is decoded, never copied). The output keeps the union of the
+ * sources' tombstones, which still hide older parts of the partition, unless
+ * no older part is listed: block numbers only grow, so none can come later. An
+ * output with no rows is still written, with no granules, so that it replaces
+ * its sources and keeps their wal_seq: WAL replay skips a partition by it.
  */
 #include "internal.h"
 
@@ -105,6 +113,7 @@ typedef struct cursor {
     int64_t *ts;
     uint8_t *v; /* slots of type */
     int type;   /* of the loaded granule's series */
+    tomb_set hide; /* tombstones of newer sources */
 } cursor;
 
 static inline bool cur_done(const cursor *c) { return c->gi >= c->p->ng; }
@@ -171,14 +180,56 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         level = MAX(level, src[i]->level);
     }
     uint64_t wal_seq = 0;
-    for (size_t i = 0; i < k; i++)
+    bool tombs = false;
+    int64_t min_ts = INT64_MAX;
+    for (size_t i = 0; i < k; i++) {
         wal_seq = MAX(wal_seq, src[i]->wal_seq);
+        tombs |= src[i]->nt > 0;
+        min_ts = MIN(min_ts, src[i]->min_ts);
+    }
+    int64_t now = eng_now_ms(db); /* one instant for the whole merge */
+    bool ttl = atomic_load(&db->has_retention);
     part_writer w;
     int rc = pw_begin(&w, db, src[0]->partition, wal_seq);
     if (rc) {
         free(cur);
         return rc;
     }
+    w.keep_empty = true; /* replaces its sources even when nothing is left */
+    w.empty_ts = min_ts;
+    if (tombs) {
+        bool older = false; /* a listed part of the partition below the merge: the tombstones still hide it */
+        pthread_mutex_lock(&db->lock);
+        for (size_t i = 0; i < db->nparts && !older; i++)
+            older = db->parts[i]->partition == src[0]->partition && db->parts[i]->max_block < min_block;
+        pthread_mutex_unlock(&db->lock);
+        tomb_set keep = {0};
+        for (size_t i = 0; i < k && rc == 0; i++) {
+            for (size_t j = 0; j < k && rc == 0; j++)
+                if (src[j]->min_block > src[i]->max_block)
+                    rc = tomb_set_add(&cur[i].hide, src[j]->t, src[j]->nt);
+            tomb_set_finish(&cur[i].hide);
+            if (older && rc == 0)
+                rc = tomb_set_add(&keep, src[i]->t, src[i]->nt);
+        }
+        tomb_set_finish(&keep);
+        size_t o = 0;
+        for (size_t i = 0; i < keep.n; i++) { /* what retention removes needs no tombstone */
+            int64_t cut = ttl ? eng_cutoff_at(db, keep.t[i].series, now) : INT64_MIN;
+            if (keep.t[i].end <= cut)
+                continue;
+            keep.t[o] = keep.t[i];
+            keep.t[o].start = MAX(keep.t[o].start, cut);
+            o++;
+        }
+        if (rc == 0)
+            rc = pw_set_tombs(&w, keep.t, o);
+        tomb_set_free(&keep);
+    }
+    uint32_t cut_series = UINT32_MAX;
+    int64_t cut = INT64_MIN;
+    int64_t *fts = NULL;
+    uint8_t *fv = NULL;
     codec_ctx *cc = cc_get(db);
     uint64_t rows = 0, copied = 0;
     if (!cc)
@@ -222,10 +273,16 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         if (!c)
             break;
         const granule *g = &c->p->g[c->gi];
+        if (ttl && g->series != cut_series) {
+            cut_series = g->series;
+            cut = eng_cutoff_at(db, g->series, now);
+        }
+        int64_t gcut = ttl ? cut : INT64_MIN;
+        bool filter = gcut > g->ts_min || (c->hide.n && tomb_set_hits(&c->hide, g->series, g->ts_min, g->ts_max));
         if (!c->loaded) {
             bool before_rest = !has_bound || g->series < bs || (g->series == bs && g->ts_max < bt);
             bool full = g->count >= w.grows;
-            if (before_rest && full && (w.pend_n == 0 || w.pend_series != g->series)) {
+            if (!filter && before_rest && full && (w.pend_n == 0 || w.pend_series != g->series)) {
                 rc = pw_copy_granule(&w, c->p, g);
                 rows += g->count;
                 copied++;
@@ -245,8 +302,21 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
                 tie = true;
             }
         }
-        rc = pw_add(&w, g->series, c->type, c->ts + c->pos, c->v + c->pos * type_width(c->type), end - c->pos);
-        rows += end - c->pos;
+        if (filter) {
+            size_t wd = type_width(c->type), m = end - c->pos;
+            if (!fts && (!(fts = malloc(MAX_GRANULE_ROWS * sizeof *fts)) || !(fv = malloc(MAX_GRANULE_ROWS * 8)))) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            memcpy(fts, c->ts + c->pos, m * sizeof *fts);
+            memcpy(fv, c->v + c->pos * wd, m * wd);
+            m = tomb_set_filter(&c->hide, g->series, gcut, fts, fv, wd, m);
+            rc = m ? pw_add(&w, g->series, c->type, fts, fv, m) : 0;
+            rows += m;
+        } else {
+            rc = pw_add(&w, g->series, c->type, c->ts + c->pos, c->v + c->pos * type_width(c->type), end - c->pos);
+            rows += end - c->pos;
+        }
         c->pos = end;
         if (c->pos == c->n) {
             c->loaded = false;
@@ -268,8 +338,11 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
     for (size_t i = 0; i < k; i++) {
         free(cur[i].ts);
         free(cur[i].v);
+        tomb_set_free(&cur[i].hide);
     }
     free(cur);
+    free(fts);
+    free(fv);
     if (rc) {
         pw_abort(&w);
         return rc;

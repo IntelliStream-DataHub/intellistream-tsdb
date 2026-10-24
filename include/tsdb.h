@@ -81,6 +81,11 @@ typedef struct tsdb_options {
                               * returned without an error. Merges check what they decode, so damage is
                               * never rewritten under a fresh checksum; structural checksums (part header,
                               * footer and index, WAL, MANIFEST, dictionaries) are always checked. */
+    int retention_merge_s;   /* a part holding rows past their series' retention is rewritten without them
+                              * once it is this old; default 3600 (0 too), -1 never (merges still drop them) */
+    int64_t (*clock_ms)(void *arg); /* the wall clock retention reads, ms since the epoch; NULL: CLOCK_REALTIME.
+                                     * For tests: it may step back and forth like a real clock */
+    void *clock_arg;
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -152,6 +157,37 @@ int tsdb_insert_series(tsdb *db, uint32_t series, const int64_t *ts, const float
  * calls above are these with a float32 column and no nulls. */
 int tsdb_insert_values(tsdb *db, const uint32_t *series, const int64_t *ts, const tsdb_values *values, size_t n);
 int tsdb_insert_series_values(tsdb *db, uint32_t series, const int64_t *ts, const tsdb_values *values, size_t n);
+
+/* ---- deleting ----
+ * tsdb_delete_range deletes every value of one series with start <= ts < end.
+ * A delete is a write like any other: an insert of the same (series, ts)
+ * acknowledged after the delete returned is visible, one acknowledged before
+ * it started is gone. It returns once the delete is durable (fsync'd) and
+ * visible; it is all or nothing across a crash. A delete costs about what a
+ * large insert costs (it flushes the memtable and writes a small part per
+ * partition that holds values of the series in the range); merges remove the
+ * deleted rows for good later. start >= end deletes nothing.
+ *
+ * tsdb_replace_range deletes [start, end) of the series and inserts the n
+ * given rows in its place, atomically: a reader, and a crash, sees either the
+ * old values or the new ones, never a mix. Every ts must lie in [start, end)
+ * (TSDB_ERR_INVALID otherwise); values as in tsdb_insert_series_values. n = 0
+ * is a delete. */
+int tsdb_delete_range(tsdb *db, uint32_t series, int64_t start, int64_t end);
+int tsdb_replace_range(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+                       const tsdb_values *values, size_t n);
+
+/* ---- retention ----
+ * A series' values older than now - limit_ms disappear; 0 (the default)
+ * keeps them. "now" is the wall clock (tsdb_options.clock_ms), but it never
+ * goes back: after the clock is stepped back, nothing expired comes back; a
+ * clock stepped forward expires values early, and for good once merges have
+ * removed them. Queries stop returning expired values at once; merges remove
+ * them in the background, whole partitions go when every series in them has
+ * expired. Raising a limit brings back only values merges have not removed yet.
+ * The limit is durable when tsdb_set_retention returns. */
+int tsdb_set_retention(tsdb *db, uint32_t series, int64_t limit_ms);
+int tsdb_get_retention(tsdb *db, uint32_t series, int64_t *limit_ms);
 
 /* State dictionary: names <-> codes (1, 2, ...), shared by the state series
  * of one volume. tsdb_state creates a name's code if needed; codes never

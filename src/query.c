@@ -38,8 +38,10 @@
 
 typedef struct snapshot {
     part **parts;
+    uint32_t *gi, *gj; /* per entry: the granules of the series in the range (a part can have several entries) */
     size_t np;
-    mem_run *mem; /* rows of the series from memtables, oldest memtable first */
+    mem_run *mem; /* rows of the series from memtables, oldest memtable first, and from parts with deletes */
+    uint64_t *mprio; /* per run: its priority on equal timestamps */
     size_t nmem;
 } snapshot;
 
@@ -49,8 +51,14 @@ static void snapshot_release(snapshot *s)
     for (size_t i = 0; i < s->nmem; i++)
         mem_run_free(&s->mem[i]);
     free(s->mem);
+    free(s->gi);
+    free(s->gj);
+    free(s->mprio);
     memset(s, 0, sizeof *s);
 }
+
+static void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj);
+static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start, int64_t end);
 
 /* Parts and memtables as of one instant: a flush publishes its parts and
  * retires its memtable under db->lock, so nothing is seen twice or missed. */
@@ -125,6 +133,8 @@ static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int6
         s->mem[s->nmem++] = active;
     else
         mem_run_free(&active);
+    if (rc == 0)
+        rc = snapshot_prepare(db, s, series, start, end);
     if (rc)
         snapshot_release(s);
     return rc;
@@ -152,6 +162,201 @@ static void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uin
             hi = mid;
     }
     *gj = lo;
+}
+
+/* Entry i's granules that may hold rows in [start, end), within its window. */
+static void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t start, int64_t end, uint32_t *gi,
+                      uint32_t *gj)
+{
+    part_find(sn->parts[i], series, start, end, gi, gj);
+    *gi = MAX(*gi, sn->gi[i]);
+    *gj = MIN(*gj, sn->gj[i]);
+    if (*gi > *gj)
+        *gi = *gj;
+}
+
+typedef struct snap_build {
+    part **parts;
+    uint32_t *gi, *gj;
+    size_t np, pcap;
+    mem_run *mem;
+    uint64_t *mprio;
+    size_t nmem, mcap;
+} snap_build;
+
+static int sb_part(snap_build *b, part *p, uint32_t gi, uint32_t gj)
+{
+    if (b->np == b->pcap) {
+        size_t cap = b->pcap ? b->pcap * 2 : 16;
+        part **x = realloc(b->parts, cap * sizeof *x);
+        if (x)
+            b->parts = x;
+        uint32_t *y = realloc(b->gi, cap * sizeof *y);
+        if (y)
+            b->gi = y;
+        uint32_t *z = realloc(b->gj, cap * sizeof *z);
+        if (z)
+            b->gj = z;
+        if (!x || !y || !z)
+            return TSDB_ERR_NOMEM;
+        b->pcap = cap;
+    }
+    part_ref(p);
+    b->parts[b->np] = p;
+    b->gi[b->np] = gi;
+    b->gj[b->np] = gj;
+    b->np++;
+    return 0;
+}
+
+static int sb_mem(snap_build *b, mem_run r, uint64_t prio)
+{
+    if (b->nmem == b->mcap) {
+        size_t cap = b->mcap ? b->mcap * 2 : 8;
+        mem_run *x = realloc(b->mem, cap * sizeof *x);
+        if (x)
+            b->mem = x;
+        uint64_t *y = realloc(b->mprio, cap * sizeof *y);
+        if (y)
+            b->mprio = y;
+        if (!x || !y)
+            return TSDB_ERR_NOMEM;
+        b->mcap = cap;
+    }
+    b->mem[b->nmem] = r;
+    b->mprio[b->nmem] = prio;
+    b->nmem++;
+    return 0;
+}
+
+/* Granules [k, e) of p decoded, cut to [start, end), without the rows h deletes. */
+static int decode_visible(codec_ctx *cc, const part *p, uint32_t k, uint32_t e, int type, uint32_t series,
+                          int64_t start, int64_t end, const tomb_set *h, mem_run *out)
+{
+    size_t w = type_width(type), total = 0;
+    for (uint32_t x = k; x < e; x++)
+        total += p->g[x].count;
+    memset(out, 0, sizeof *out);
+    out->ts = malloc(total * sizeof *out->ts + 1);
+    out->v = malloc(total * w + 1);
+    if (!out->ts || !out->v)
+        return TSDB_ERR_NOMEM;
+    for (uint32_t x = k; x < e; x++) {
+        const granule *g = &p->g[x];
+        int64_t *ts = out->ts + out->n;
+        uint8_t *v = out->v + out->n * w;
+        int rc = granule_read(cc, p, g, type, ts, v, p->verify);
+        if (rc)
+            return rc;
+        size_t lo = lower_bound_i64(ts, g->count, start), hi = lower_bound_i64(ts, g->count, end);
+        if (lo) {
+            memmove(ts, ts + lo, (hi - lo) * sizeof *ts);
+            memmove(v, v + lo * w, (hi - lo) * w);
+        }
+        out->n += tomb_set_filter(h, series, INT64_MIN, ts, v, w, hi - lo);
+    }
+    return 0;
+}
+
+/*
+ * Each part entry gets its window of granules. When parts in the snapshot hold
+ * tombstones, a part's granules that the tombstones of newer parts (of its
+ * partition) touch are decoded and filtered into a run with the part's
+ * priority; its other granules stay entries of their own, so their statistics
+ * still answer aggregates. Without tombstones this is one part_find per part.
+ */
+static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start, int64_t end)
+{
+    s->gi = malloc((s->np + 1) * sizeof *s->gi);
+    s->gj = malloc((s->np + 1) * sizeof *s->gj);
+    s->mprio = malloc((s->nmem + 1) * sizeof *s->mprio);
+    if (!s->gi || !s->gj || !s->mprio)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < s->nmem; i++)
+        s->mprio[i] = UINT64_MAX - (s->nmem - i); /* memtables are newer than every part */
+    bool tombs = false;
+    for (size_t i = 0; i < s->np; i++) {
+        part_find(s->parts[i], series, start, end, &s->gi[i], &s->gj[i]);
+        tombs |= s->parts[i]->nt > 0;
+    }
+    if (!tombs)
+        return 0;
+
+    int type = eng_series_type(db, series);
+    snap_build b = {0};
+    codec_ctx *cc = NULL;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < s->np; i++) {
+        part *p = s->parts[i];
+        tomb_set h = {0};
+        for (size_t j = 0; rc == 0 && s->gi[i] < s->gj[i] && j < s->np; j++) {
+            const part *q = s->parts[j];
+            if (!q->nt || q->partition != p->partition || q->min_block <= p->max_block)
+                continue;
+            for (uint32_t t = 0; rc == 0 && t < q->nt; t++)
+                if (q->t[t].series == series && q->t[t].start < end && q->t[t].end > start)
+                    rc = tomb_set_add(&h, &q->t[t], 1);
+        }
+        tomb_set_finish(&h);
+        if (rc == 0 && h.n == 0) {
+            rc = sb_part(&b, p, s->gi[i], s->gj[i]);
+        } else {
+            for (uint32_t k = s->gi[i], e; rc == 0 && k < s->gj[i]; k = e) {
+                bool dirty = tomb_set_hits(&h, series, p->g[k].ts_min, p->g[k].ts_max);
+                for (e = k + 1; e < s->gj[i] && tomb_set_hits(&h, series, p->g[e].ts_min, p->g[e].ts_max) == dirty;)
+                    e++;
+                if (!dirty) {
+                    rc = sb_part(&b, p, k, e);
+                    continue;
+                }
+                if (!cc && !(cc = cc_get(db))) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                mem_run r;
+                rc = decode_visible(cc, p, k, e, type, series, start, end, &h, &r);
+                if (rc == 0 && r.n)
+                    rc = sb_mem(&b, r, p->max_block);
+                if (rc || !r.n)
+                    mem_run_free(&r);
+            }
+        }
+        tomb_set_free(&h);
+    }
+    if (cc)
+        cc_put(db, cc);
+    for (size_t i = 0; rc == 0 && i < s->nmem; i++) {
+        rc = sb_mem(&b, s->mem[i], s->mprio[i]);
+        if (rc == 0)
+            s->mem[i] = (mem_run){0}; /* moved */
+    }
+    if (rc) {
+        db_release(b.parts, b.np);
+        for (size_t i = 0; i < b.nmem; i++)
+            if (b.mprio[i] < UINT64_MAX - s->nmem) /* decoded here; memtable runs stay with s */
+                mem_run_free(&b.mem[i]);
+        for (size_t i = 0, k = 0; i < b.nmem; i++) /* give moved memtable runs back */
+            if (b.mprio[i] >= UINT64_MAX - s->nmem)
+                s->mem[k++] = b.mem[i];
+        free(b.gi);
+        free(b.gj);
+        free(b.mem);
+        free(b.mprio);
+        return rc;
+    }
+    db_release(s->parts, s->np);
+    free(s->gi);
+    free(s->gj);
+    free(s->mem);
+    free(s->mprio);
+    s->parts = b.parts;
+    s->gi = b.gi;
+    s->gj = b.gj;
+    s->np = b.np;
+    s->mem = b.mem;
+    s->mprio = b.mprio;
+    s->nmem = b.nmem;
+    return 0;
 }
 
 /* ---------------------------------------------------- deduplicating merge */
@@ -590,7 +795,7 @@ static int cmp_item(const void *a, const void *b)
     return (x->lo > y->lo) - (x->lo < y->lo);
 }
 
-static uint64_t mem_prio(const snapshot *sn, size_t i) { return UINT64_MAX - (sn->nmem - i); }
+static uint64_t mem_prio(const snapshot *sn, size_t i) { return sn->mprio[i]; }
 
 int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
                   size_t *nout)
@@ -609,6 +814,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
     *out = NULL;
     *nout = 0;
     int type = eng_series_type(db, series);
+    start = MAX(start, eng_cutoff(db, series)); /* expired rows are gone at once, merged away or not */
     if (start >= end || type < 0)
         return 0;
     snapshot sn;
@@ -623,7 +829,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
     for (size_t i = 0; i < sn.np + sn.nmem && rc == 0; i++) {
         uint32_t gi = 0, gj = 1;
         if (i < sn.np) {
-            part_find(sn.parts[i], series, start, end, &gi, &gj);
+            snap_find(&sn, i, series, start, end, &gi, &gj);
             if (gi < gj) {
                 QS_ADD(parts, 1);
                 QS_ADD(granules, gj - gi);
@@ -818,7 +1024,7 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
     (void)db;
     for (size_t i = 0; rc == 0 && i < sn->np; i++) {
         uint32_t gi, gj;
-        part_find(sn->parts[i], series, start, end, &gi, &gj);
+        snap_find(sn, i, series, start, end, &gi, &gj);
         if (gi < gj) {
             src_init_part(&cur[nc++], sn->parts[i], gi, gj, type);
             QS_ADD(parts, 1);
@@ -945,7 +1151,7 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
     for (size_t i = 0; rc == 0 && i < sn->np + sn->nmem; i++) {
         uint32_t gi = 0, gj = 1;
         if (i < sn->np)
-            part_find(sn->parts[i], series, start, end, &gi, &gj);
+            snap_find(sn, i, series, start, end, &gi, &gj);
         for (uint32_t k = gi; k < gj; k++) {
             if (ns == cap) {
                 span *s2 = realloc(sp, (cap *= 2) * sizeof *sp);
@@ -1030,6 +1236,7 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
                      slot_fn fn, void *ctx)
 {
     int type = eng_series_type(db, series);
+    start = MAX(start, eng_cutoff(db, series)); /* expired rows are gone at once, merged away or not */
     if (start >= end || type < 0)
         return 0;
     snapshot sn;
