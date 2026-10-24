@@ -560,22 +560,31 @@ static int sk_check_final(const sk_cfg *c, const sk_val *st, const int *last_kin
             errors++;
             continue;
         }
-        /* a null shared by several last writes: one of them must be last among the writes covering the key */
+        /* A null shared by several last writes: one of them must be last among the writes covering the key. When
+         * one of them is no node of this scope (a per-series insert or an append across series, an append within
+         * one), the scope does not order it: that write may be the newest and its null the one shown, though every
+         * other candidate is ordered before another write. Such a key is left to the scope that orders all of its
+         * candidates (within its series, unless one is an append). */
         for (uint32_t key = 0; key < nk; key++) {
             if (st[key].st != SK_NULL || win[key] >= 0 || (!global && key / span != (uint32_t)scope))
                 continue;
-            bool ok = false, any = false;
+            bool ok = false, any = false, unordered = false;
             for (int cnd = 0; cnd < W && !ok; cnd++) {
-                if (!node[cnd] || !sk_covers(c, cnd, key % span) || !sk_null(c, cnd, last, key))
+                if (!sk_covers(c, cnd, key % span) || !sk_null(c, cnd, last, key))
                     continue;
+                if (!node[cnd]) {
+                    unordered = true;
+                    continue;
+                }
                 any = true;
                 bool later = false;
                 for (int u = 0; u < W; u++)
                     later |= u != cnd && node[u] && sk_covers(c, u, key % span) && before[cnd][u];
                 ok = !later;
             }
-            if (any && !ok) {
-                SK_FAIL("%s: key %u: null, but every write with that null is ordered before another\n", c->name, key);
+            if (any && !ok && !unordered) {
+                SK_FAIL("%s: %s: key %u: null, but every write with that null is ordered before another\n", c->name,
+                        global ? "across series" : "within a series", key);
                 errors++;
             }
         }

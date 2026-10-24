@@ -1438,11 +1438,89 @@ static void sk_run(const char *base, const sk_cfg *c, int wal_sync_ms, bool cras
     free(x);
 }
 
+/* The final state after the last rounds of c's writers were applied in order: order[i] = {writer, series}, a
+ * series of nseries meaning every series at once. */
+static void sk_apply(const sk_cfg *c, const int (*order)[2], int n, sk_val *st)
+{
+    uint32_t span = sk_span(c);
+    memset(st, 0, sk_nkeys(c) * sizeof *st);
+    for (int i = 0; i < n; i++) {
+        int w = order[i][0], s = order[i][1];
+        for (uint32_t key = 0; key < sk_nkeys(c); key++)
+            if (sk_covers(c, w, key % span) && (s == (int)c->nseries || key / span == (uint32_t)s))
+                st[key] = sk_null(c, w, c->rounds - 1, key) ? (sk_val){SK_NULL, 0}
+                                                            : (sk_val){SK_VALUE, sk_code(c, w, c->rounds - 1, key)};
+    }
+}
+
+/* The model itself, on states no database produced. The server's "float64 + nulls, per series" run: the last
+ * writes of writers 1 and 5 are per series, the others whole inserts. Writers 1 and 2 both put a null at key 380
+ * (series 1), where 3 writes a value. In the order 0 2 3 4 5 1, series 1 of writer 1 comes last and the key shows
+ * its null, while other keys order 2 before 3. Across series only whole inserts are ordered, so the null check
+ * there saw writer 2 alone and failed, though writer 1's null is the newest (1 run in 15-30 of test_server). */
+static void test_samekeys_model(void)
+{
+    sk_cfg c = {"model", 6, 600, 3, 80, 37, 0, 97000, TSDB_FLOAT64, true, SK_SMALL | SK_LARGE | SK_SERIES};
+    const int kind[6] = {SK_SMALL, SK_SERIES, SK_LARGE, SK_LARGE, SK_SMALL, SK_SERIES}, all = (int)c.nseries;
+    const int order[][2] = {{0, all}, {2, all}, {3, all}, {4, all}, {5, 0}, {5, 1}, {5, 2}, {1, 0}, {1, 1}, {1, 2}};
+    const int n = (int)(sizeof order / sizeof order[0]), last = c.rounds - 1;
+    uint32_t span = sk_span(&c), key = 380;
+    CHECK(key / span == 1 && sk_null(&c, 1, last, key) && sk_null(&c, 2, last, key) &&
+          sk_covers(&c, 3, key % span) && !sk_null(&c, 3, last, key));
+    sk_val *st = malloc(sk_nkeys(&c) * sizeof *st);
+    if (!st)
+        exit(1);
+    sk_apply(&c, order, n, st);
+    CHECK(st[key].st == SK_NULL);
+    CHECK(sk_check_final(&c, st, kind) == 0);
+    /* An older null winning is still caught: where whole insert 4 wrote the last value (timestamps 148..184),
+     * a null of 0, 2 or 3, all ordered before it. */
+    int planted = 0, reports = atomic_exchange(&sk_reports, 1 << 20); /* the expected messages stay quiet */
+    for (uint32_t k = 0; k < sk_nkeys(&c); k++) {
+        uint32_t j = k % span;
+        bool older = false;
+        for (int w = 0; w < 4; w++)
+            older |= w != 1 && sk_covers(&c, w, j) && sk_null(&c, w, last, k);
+        if (st[k].st != SK_VALUE || !sk_covers(&c, 4, j) || sk_covers(&c, 5, j) || !older)
+            continue;
+        st[k] = (sk_val){SK_NULL, 0};
+        CHECK(sk_check_final(&c, st, kind) > 0);
+        sk_apply(&c, order, n, st);
+        planted++;
+    }
+    atomic_store(&sk_reports, reports);
+    CHECK(planted > 0);
+    /* A per-series null is still judged within its series: writer 1 first, then the whole inserts 2 3 4 and
+     * writer 5. Wherever 1 put a null that a later write (not 5) covered, plant 1's null back. Most of these keys
+     * are caught by the order (1 is their only null candidate); the few with another null candidate reach the
+     * null check, and only the series scope can report them, so a check that skipped every key with a per-series
+     * candidate, or judged nulls only across series, misses them. Judging nulls only within a series passes here
+     * too: on every state we built, the null check across series reports nothing the series scopes do not. */
+    const int early[][2] = {{0, all}, {1, 0}, {1, 1}, {1, 2}, {2, all}, {3, all}, {4, all}, {5, 0}, {5, 1}, {5, 2}};
+    sk_apply(&c, early, n, st);
+    CHECK(sk_check_final(&c, st, kind) == 0);
+    planted = 0;
+    reports = atomic_exchange(&sk_reports, 1 << 20);
+    for (uint32_t k = 0; k < sk_nkeys(&c); k++) {
+        uint32_t j = k % span;
+        if (st[k].st != SK_VALUE || !sk_covers(&c, 1, j) || !sk_null(&c, 1, last, k) || sk_covers(&c, 5, j))
+            continue;
+        st[k] = (sk_val){SK_NULL, 0};
+        CHECK(sk_check_final(&c, st, kind) > 0);
+        sk_apply(&c, early, n, st);
+        planted++;
+    }
+    atomic_store(&sk_reports, reports);
+    CHECK(planted > 0);
+    free(st);
+}
+
 static void test_same_keys(const char *base)
 {
+    test_samekeys_model();
     const int64_t t0 = 1700000000000 + 1234; /* partitions do not start at a key */
     const unsigned batches = SK_SMALL | SK_LARGE;
-    static sk_cfg c[6];
+    static sk_cfg c[7];
     c[0] = (sk_cfg){"float32, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_FLOAT32, false, batches};
     c[1] = (sk_cfg){"int64 + nulls, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_INT64, true, batches};
     c[2] = (sk_cfg){"float64 + nulls, same keys", 5, 1000, 2, 120, 0, t0, 61000, TSDB_FLOAT64, true, batches};
@@ -1450,12 +1528,16 @@ static void test_same_keys(const char *base)
     c[4] = (sk_cfg){"int64 + nulls, shifted keys", 6, 1000, 3, 80, 37, t0, 97000, TSDB_INT64, true, batches};
     c[5] = (sk_cfg){"appends, per series, batches", 6, 200, 3, 60, 10, t0, 97000, TSDB_FLOAT32, false,
                     batches | SK_APPEND | SK_SERIES};
+    /* the server's: per-series inserts with nulls (appends take float32 only) */
+    c[6] = (sk_cfg){"float64 + nulls, per series", 6, 600, 3, 80, 37, t0, 97000, TSDB_FLOAT64, true,
+                    batches | SK_SERIES};
     sk_run(base, &c[0], 0, false);  /* WAL synced on every write: rows visible once durable */
     sk_run(base, &c[1], 5, true);   /* WAL synced in the background */
     sk_run(base, &c[2], -1, false); /* no WAL */
     sk_run(base, &c[3], 0, true);
     sk_run(base, &c[4], 0, false);
     sk_run(base, &c[5], 0, false);
+    sk_run(base, &c[6], 5, false);
 }
 
 typedef struct part_count {
