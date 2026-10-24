@@ -166,6 +166,55 @@ that cut granules; with the data in memtables, in overlapping parts with
 corrections, merged, and through a follower. `test_server` does the same over
 the network.
 
+## Time-weighted averages
+
+Sensors that report irregularly or only when their value changes make a plain
+average wrong: a value that held for an hour counts as much as one that held
+for a second. `tsdb_query_twa` (and `_group`, `_bounds`, `QUERY_TWA` on the
+wire, `twa` in the command line) weights each value by how long it held. The
+contract is in `include/tsdb.h`; in short, following OSIsoft PI and
+TimescaleDB's `time_weight` where they agree:
+
+- Consecutive readings of a series bound a segment `[t_i, t_i+1)`. STEP
+  (last observation carried forward) holds `v_i` over it; LINEAR runs a
+  straight line from `v_i` to `v_i+1` (trapezoids).
+- A null holds nothing: under STEP it ends the previous value; under LINEAR a
+  segment with a null at either end covers nothing. With `max_gap_ms`, a
+  segment longer than that covers nothing (the value is stale, and LINEAR does
+  not interpolate across an outage). The last reading holds nothing: it waits
+  for the next one, never runs up to "now".
+- Segments are cut exactly at bucket edges and at the range's start and end
+  (LINEAR interpolates the value there). The value in force at a bucket's
+  start comes from the last reading before it, however long ago (within
+  `max_gap_ms`), so a bucket with no reading of its own still has an average.
+  ClickHouse has no time-weighted average; the usual SQL (window functions and
+  `avgWeighted`) loses exactly this carried-in value.
+- A bucket reports the area (value x ms), the covered time and their
+  quotient, plus the count of readings in it. Areas and covered times add, so
+  buckets combine into longer averages. NaN propagates (the canonical quiet
+  NaN); bool series give the fraction of time they were true (run time); state
+  series are refused.
+
+**The fast path.** Each granule's index entry carries what makes whole
+granules combinable without decoding them: the first and last value (and
+whether they are null), the STEP and LINEAR areas of the segments inside the
+granule with the durations they cover (integer ms), and the longest gap
+between its rows (`granule_twa` in `src/twa.c`, called by the part writer
+with the other statistics for inserts, memtable flushes and merges that
+re-encode; a merge that copies a granule's bytes copies its entry). A query lists the granules of every source
+(parts and memtables) around the range in time order. A granule that lies
+inside the range and inside one bucket, whose longest gap is within
+`max_gap_ms`, and that no other source overlaps contributes its stored areas;
+the segment joining it to its neighbour comes from its first and last value
+and the neighbour's. Only granules that a bucket edge or the range cuts, and
+time spans where sources overlap (corrections: last write wins, merged
+exactly as the raw query does), are decoded, in parallel on the query pool.
+`TSDB_TWA_DECODE=1` turns the fast path off for benchmarks
+(`build/twa-bench`).
+
+The statistics cost 56 bytes per granule entry (136 instead of 80 bytes per
+8192 rows: under 0.01 bytes a row). They made the on-disk format version 4.
+
 ## Storage
 
 A database is a directory:
@@ -706,6 +755,7 @@ build/tsdb /data/sensors import < rows.csv          # series,time,value (null or
 build/tsdb /data/sensors insert pump7.flow < p.csv  # time,value
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2024-01-02 avg 5m
 build/tsdb /data/sensors query pump7.flow now-1h now raw
+build/tsdb /data/sensors query pump7.temp 2024-01-01 2024-02-01 twa 1d --tz Europe/Oslo --max-gap 10m
 build/tsdb /data/sensors stats
 build/tsdb /data/sensors parts
 build/tsdb /data/sensors optimize

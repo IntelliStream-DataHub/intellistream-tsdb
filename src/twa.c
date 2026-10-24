@@ -371,6 +371,9 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
         return TSDB_ERR_INVALID;
     if (start >= end || type < 0)
         return 0;
+    /* TSDB_TWA_DECODE=1 decodes every granule instead of using its statistics, to benchmark the fast path */
+    const char *env = getenv("TSDB_TWA_DECODE");
+    bool force_decode = env && *env && strcmp(env, "0") != 0;
     twa_q q = {.bk = bk, .linear = method == TSDB_TWA_LINEAR, .max_gap = (uint64_t)max_gap, .start = start,
                .end = end, .type = type, .w = type_width(type)};
     /* the readings around the range that bound its first and last segments */
@@ -482,7 +485,7 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
                 if (!it->g)
                     continue;
                 const granule *g = it->g;
-                bool usable = g->ts_min >= start && g->ts_max < end &&
+                bool usable = !force_decode && g->ts_min >= start && g->ts_max < end &&
                               bucketer_key(bk, g->ts_min) == bucketer_key(bk, g->ts_max) &&
                               (!max_gap || (g->tw_gap < UINT32_MAX && g->tw_gap <= (uint64_t)max_gap));
                 x->kind = usable ? PC_STATS : PC_DECODE;

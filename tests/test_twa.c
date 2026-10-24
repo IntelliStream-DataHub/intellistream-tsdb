@@ -591,6 +591,14 @@ static void test_stats_only(void)
         CHECK(n == 1 && b[0].covered_ms == 1000LL * (N - 1) && b[0].count == N &&
               fabsl(b[0].area - area) < 1e-9L * area);
         free(b);
+        /* the benchmark switch decodes everything, to the same result */
+        setenv("TSDB_TWA_DECODE", "1", 1);
+        OK(tsdb_query_twa(db, s, 0, 1000LL * N, 0, &o, &b, &n));
+        unsetenv("TSDB_TWA_DECODE");
+        tsdb_last_query_stats(&st);
+        CHECK(st.rows_decoded == N && st.granules_from_stats == 0 && n == 1 && b[0].covered_ms == 1000LL * (N - 1) &&
+              b[0].count == N && fabsl(b[0].area - area) < 1e-9L * area);
+        free(b);
         /* a staleness limit above the sampling interval keeps the fast path; below it decodes */
         o.max_gap_ms = 1000;
         OK(tsdb_query_twa(db, s, 0, 1000LL * N, 0, &o, &b, &n));
