@@ -142,6 +142,10 @@ static void make_inputs(void)
         x = add(name, TSDB_INT64, i64_n[k]);
         for (size_t i = 0; i < x->n; i++)
             ((int64_t *)x->v)[i] = i == x->n / 2 ? (int64_t)INT32_MAX + 2 : (int32_t)next();
+        snprintf(name, sizeof name, "int64 just below int32, %zu", i64_n[k]); /* squares from all 64 bits */
+        x = add(name, TSDB_INT64, i64_n[k]);
+        for (size_t i = 0; i < x->n; i++)
+            ((int64_t *)x->v)[i] = i == x->n / 2 ? (int64_t)INT32_MIN - 1 - (int64_t)(i & 1) : (int32_t)next();
         snprintf(name, sizeof name, "int64 most negative, %zu", i64_n[k]);
         x = add(name, TSDB_INT64, i64_n[k]);
         for (size_t i = 0; i < x->n; i++)
@@ -336,6 +340,42 @@ typedef int (*dec_fn)(const uint8_t *, size_t, size_t, void *);
 static uint8_t *buf, *dec;
 #define BUF(n) ((n) * 16 + 4096)
 
+/* A run shorter than SIMD_SHORT takes simd_small_* (values.c): it must give the bits of the lane kernels of the
+ * level, which it skips, with and without the spread and the search for nulls. */
+static void short_run(const input *x, size_t m)
+{
+    for (int sp = 0; sp < 2; sp++)
+        for (int hint = 0; hint < 2; hint++) {
+            size_t nulls = 0;
+            for (size_t i = 0; i < m; i++)
+                nulls += x->type == TSDB_FLOAT32 ? ((const uint32_t *)x->v)[i] == NULL_F32
+                                                 : ((const uint64_t *)x->v)[i] == NULL_F64;
+            if (hint && nulls)
+                continue; /* "no nulls" would be a lie */
+            struct {
+                agg_state a;
+                agg_dev x;
+            } a, b;
+            memset(&a, 0, sizeof a);
+            memset(&b, 0, sizeof b);
+            agg_init(&a.a, x->type);
+            agg_dev_init(&a.x);
+            agg_init(&b.a, x->type);
+            agg_dev_init(&b.x);
+            agg_fold_hint(x->type, x->v, m, !hint, &a.a, sp ? &a.x : NULL);
+            b.a.rows += m;
+            if (x->type == TSDB_FLOAT32)
+                simd_fold_f32(x->v, m, nulls, &b.a, sp ? &b.x : NULL);
+            else
+                simd_fold_f64(x->v, m, nulls, &b.a, sp ? &b.x : NULL);
+            if (memcmp(&a, &b, sizeof a) != 0) {
+                fprintf(stderr, "%s, %zu values%s%s: the short path differs from the kernel %s\n", x->name, m,
+                        sp ? ", spread" : "", hint ? ", no nulls" : "", simd_name());
+                failures++;
+            }
+        }
+}
+
 /* a transform codec alone: its bytes, and its decoding (which must give back the input) */
 static void codec(rec *r, const input *x, const char *what, enc_fn enc, dec_fn dc, const void *v, size_t w)
 {
@@ -408,7 +448,8 @@ static void run(rec *r, codec_ctx *c)
             CODEC(dd, x->v, 8);
             break;
         }
-        /* aggregates: whole, every short prefix (the kernels' tails), and the statistics parts store */
+        /* aggregates: whole, every short prefix (the kernels' tails, the short runs), and the statistics parts
+         * store */
         for (size_t m = 0; m <= x->n; m = m < 40 ? m + 1 : m == x->n ? m + 1 : x->n) {
             struct {
                 agg_state a;
@@ -433,6 +474,8 @@ static void run(rec *r, codec_ctx *c)
             memset(&a, 0, sizeof a);
             agg_from_granule(x->type, &g, &a.a, &a.x);
             put(r, "agg_from_granule", x->name, &a, sizeof a);
+            if (m < SIMD_SHORT && (x->type == TSDB_FLOAT32 || x->type == TSDB_FLOAT64))
+                short_run(x, m);
             for (int sp = 0; m && g.nulls == 0 && sp < 2; sp++) { /* queries without and with the spread */
                 memset(&a, 0, sizeof a);
                 agg_init(&a.a, x->type);
@@ -444,27 +487,48 @@ static void run(rec *r, codec_ctx *c)
         }
         /* TWA areas and LTTB picks (simd.c): gaps beyond 2^55 (dt rounds when converted), large time
          * offsets, every short prefix (the lanes' tails), equal areas (cy == ay: the area follows y alone) */
+        /* Then a timeline across all of int64 (TSDB_TS_MIN is INT64_MIN): from near INT64_MIN, one jump of
+         * 2^63 + 2^62 past 0, so dt and ts - t0 reach 2^63 and more and only an unsigned conversion is right. */
         int64_t *ts = malloc((x->n + 1) * sizeof *ts);
-        uint64_t *sl = malloc((x->n + 1) * sizeof *sl), z = 0x9e3779b97f4a7c15u * (uint64_t)(x->n + 1), t = 1ull << 62;
-        for (size_t i = 0; i < x->n; i++) {
-            z = z * 6364136223846793005u + 1442695040888963407u;
-            uint64_t r = z >> 11;
-            t += 1 + (r % 61 == 0 ? (r << 3) | (1ull << 55) | 1 : r % 997);
-            ts[i] = (int64_t)t;
-            sl[i] = w == 4 ? ((const uint32_t *)x->v)[i] : ((const uint64_t *)x->v)[i];
-        }
-        for (size_t m = 0; m <= x->n; m = m < 40 ? m + 1 : m == x->n ? m + 1 : x->n) {
-            granule g;
-            memset(&g, 0, sizeof g);
-            granule_twa(x->type, ts, x->v, m, &g);
-            snprintf(what, sizeof what, "granule_twa %zu", m);
-            put(r, what, x->name, &g, sizeof g);
-            if (!m)
-                continue;
-            size_t k[2] = {lttb_argmax(x->type, ts, sl, m, ts[0] - 5000, 0, 1.5, (double)(t - (uint64_t)ts[0]), -3),
-                           lttb_argmax(x->type, ts, sl, m, ts[0], -7, 1, 1e6, 1)};
-            snprintf(what, sizeof what, "lttb_argmax %zu", m);
-            put(r, what, x->name, k, sizeof k);
+        uint64_t *sl = malloc((x->n + 1) * sizeof *sl);
+        for (int wide = 0; wide < 2; wide++) {
+            uint64_t z = 0x9e3779b97f4a7c15u * (uint64_t)(x->n + 1), t = wide ? (uint64_t)INT64_MIN + 10000 : 1ull << 62;
+            for (size_t i = 0; i < x->n; i++) {
+                z = z * 6364136223846793005u + 1442695040888963407u;
+                uint64_t r = z >> 11;
+                if (wide)
+                    t += i == x->n / 2 ? (1ull << 63) + (1ull << 62) : 1 + r % 997;
+                else
+                    t += 1 + (r % 61 == 0 ? (r << 3) | (1ull << 55) | 1 : r % 997);
+                ts[i] = (int64_t)t;
+                sl[i] = w == 4 ? ((const uint32_t *)x->v)[i] : ((const uint64_t *)x->v)[i];
+            }
+            for (size_t m = 0; m <= x->n; m = m < 40 ? m + 1 : m == x->n ? m + 1 : x->n) {
+                granule g;
+                memset(&g, 0, sizeof g);
+                granule_twa(x->type, ts, x->v, m, &g);
+                snprintf(what, sizeof what, "granule_twa %zu%s", m, wide ? " wide" : "");
+                put(r, what, x->name, &g, sizeof g);
+                if (!m)
+                    continue;
+                if (x->type != TSDB_STATE && m <= SIMD_LANES_F64) { /* the short path against the kernel */
+                    twa_sums o1, o2;
+                    memset(&o1, 0, sizeof o1);
+                    memset(&o2, 0, sizeof o2);
+                    simd_twa_run(x->type, ts, x->v, m, &o1);
+                    simd_twa(x->type, ts, x->v, m, &o2);
+                    if (memcmp(&o1, &o2, sizeof o1) != 0) {
+                        fprintf(stderr, "%s, %zu points%s: the short TWA path differs from the kernel %s\n",
+                                x->name, m, wide ? " wide" : "", simd_name());
+                        failures++;
+                    }
+                }
+                size_t k[2] = {
+                    lttb_argmax(x->type, ts, sl, m, ts[0] - 5000, 0, 1.5, (double)(t - (uint64_t)ts[0]), -3),
+                    lttb_argmax(x->type, ts, sl, m, ts[0], -7, 1, 1e6, 1)};
+                snprintf(what, sizeof what, "lttb_argmax %zu%s", m, wide ? " wide" : "");
+                put(r, what, x->name, k, sizeof k);
+            }
         }
         free(ts);
         free(sl);

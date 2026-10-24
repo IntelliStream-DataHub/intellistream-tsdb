@@ -92,7 +92,7 @@ void granule_twa(int type, const int64_t *ts, const void *vv, size_t n, granule 
         return;
     bool ok0 = slot_ok(type, v), okl = slot_ok(type, v + (n - 1) * w);
     twa_sums o;
-    simd_twa(type, ts, v, n, &o); /* the same expressions as seg() below for a segment inside one bucket */
+    simd_twa_run(type, ts, v, n, &o); /* the same expressions as seg() below for a segment inside one bucket */
     g->tw_first = ok0 ? slot_val(type, v) : 0;
     g->tw_flags = (ok0 ? 0 : GT_FIRST_NULL) | (okl ? 0 : GT_LAST_NULL);
     g->tw_last = okl ? slot_val(type, v + (n - 1) * w) : 0;

@@ -59,7 +59,7 @@
  * it. (What is not reproducible is the combination of runs, as for sums: it
  * follows merges and threads.)
  */
-#define LANES 32
+#define LANES SIMD_LANES_F32
 #define INL static inline __attribute__((always_inline))
 
 typedef struct lanes {
@@ -105,7 +105,7 @@ static double lanes_reduce(double *s, int k)
 
 /* pass two, values [i, n) with n - i < LANES, then the reduction; and the run of c known values into a */
 INL void dev_finish(dev_lanes *l, const float *v, size_t i, size_t n, double m, uint64_t c, double s,
-                    agg_state *a, agg_dev *dv, const bool nl)
+                    agg_state *a, agg_dev *dv, const bool nl, const int k)
 {
     for (int j = 0; i + (size_t)j < n; j++) {
         float x = v[i + (size_t)j];
@@ -113,7 +113,7 @@ INL void dev_finish(dev_lanes *l, const float *v, size_t i, size_t n, double m, 
         l->d1[j] += d;
         l->d2[j] += d * d;
     }
-    double d1 = lanes_reduce(l->d1, LANES), d2 = lanes_reduce(l->d2, LANES);
+    double d1 = lanes_reduce(l->d1, k), d2 = lanes_reduce(l->d2, k);
     agg_add_run(a, dv, c, s, d1, d2);
     a->sum = canon_nan(a->sum);
 }
@@ -139,11 +139,12 @@ INL void dev_scalar(const float *v, size_t n, uint64_t c, double s, agg_state *a
             l.d1[j] += d;
             l.d2[j] += d * d;
         }
-    dev_finish(&l, v, i, n, m, c, s, a, dv, nl);
+    dev_finish(&l, v, i, n, m, c, s, a, dv, nl, LANES);
 }
 
-/* values [i, n) with n - i < LANES, then the reduction: min and max into a; returns the sum */
-INL double lanes_finish(lanes *l, const float *v, size_t i, size_t n, agg_state *a, const bool nl)
+/* values [i, n) with n - i < LANES, then the reduction of the first k lanes (LANES, or fewer for a short run,
+ * see small_f32): min and max into a; returns the sum */
+INL double lanes_finish(lanes *l, const float *v, size_t i, size_t n, agg_state *a, const bool nl, const int k)
 {
     for (int j = 0; i + (size_t)j < n; j++) {
         float x = v[i + (size_t)j];
@@ -151,7 +152,7 @@ INL double lanes_finish(lanes *l, const float *v, size_t i, size_t n, agg_state 
         l->mn[j] = x < l->mn[j] ? x : l->mn[j];
         l->mx[j] = x > l->mx[j] ? x : l->mx[j];
     }
-    for (int w = LANES / 2; w >= 1; w /= 2)
+    for (int w = k / 2; w >= 1; w /= 2)
         for (int j = 0; j < w; j++) {
             l->s[j] = l->s[j] + l->s[j + w];
             l->mn[j] = l->mn[j + w] < l->mn[j] ? l->mn[j + w] : l->mn[j];
@@ -176,7 +177,7 @@ INL void agg_scalar_impl(const float *v, size_t n, size_t nulls, agg_state *a, a
             l.mn[j] = x < l.mn[j] ? x : l.mn[j];
             l.mx[j] = x > l.mx[j] ? x : l.mx[j];
         }
-    double s = lanes_finish(&l, v, i, n, a, nl);
+    double s = lanes_finish(&l, v, i, n, a, nl, LANES);
     if (dv)
         dev_scalar(v, n, n - nulls, s, a, dv, nl);
     else
@@ -195,7 +196,7 @@ static void fold_f32_scalar(const float *v, size_t n, size_t nulls, agg_state *a
 
 /* ---------------------------------------------------------------- float64 */
 
-#define L64 16
+#define L64 SIMD_LANES_F64
 
 typedef struct lanes64 {
     double s[L64], mn[L64], mx[L64];
@@ -214,8 +215,9 @@ static void lanes64_init(lanes64 *l, const agg_state *a)
     }
 }
 
-/* values [i, n) with n - i < L64, then the reduction: min and max into a; returns the sum */
-INL double lanes64_finish(lanes64 *l, const double *v, size_t i, size_t n, agg_state *a, const bool nl)
+/* values [i, n) with n - i < L64, then the reduction of the first k lanes (as lanes_finish): min and max into
+ * a; returns the sum */
+INL double lanes64_finish(lanes64 *l, const double *v, size_t i, size_t n, agg_state *a, const bool nl, const int k)
 {
     for (int j = 0; i + (size_t)j < n; j++) {
         double x = v[i + (size_t)j];
@@ -223,7 +225,7 @@ INL double lanes64_finish(lanes64 *l, const double *v, size_t i, size_t n, agg_s
         l->mn[j] = x < l->mn[j] ? x : l->mn[j];
         l->mx[j] = x > l->mx[j] ? x : l->mx[j];
     }
-    for (int w = L64 / 2; w >= 1; w /= 2)
+    for (int w = k / 2; w >= 1; w /= 2)
         for (int j = 0; j < w; j++) {
             l->s[j] = l->s[j] + l->s[j + w];
             l->mn[j] = l->mn[j + w] < l->mn[j] ? l->mn[j + w] : l->mn[j];
@@ -235,7 +237,7 @@ INL double lanes64_finish(lanes64 *l, const double *v, size_t i, size_t n, agg_s
 }
 
 INL void dev64_finish(dev64 *l, const double *v, size_t i, size_t n, double m, uint64_t c, double s, agg_state *a,
-                      agg_dev *dv, const bool nl)
+                      agg_dev *dv, const bool nl, const int k)
 {
     for (int j = 0; i + (size_t)j < n; j++) {
         double x = v[i + (size_t)j];
@@ -243,7 +245,7 @@ INL void dev64_finish(dev64 *l, const double *v, size_t i, size_t n, double m, u
         l->d1[j] += d;
         l->d2[j] += d * d;
     }
-    double d1 = lanes_reduce(l->d1, L64), d2 = lanes_reduce(l->d2, L64);
+    double d1 = lanes_reduce(l->d1, k), d2 = lanes_reduce(l->d2, k);
     agg_add_run(a, dv, c, s, d1, d2);
     a->sum = canon_nan(a->sum);
 }
@@ -262,7 +264,7 @@ INL void dev64_scalar(const double *v, size_t n, uint64_t c, double s, agg_state
             l.d1[j] += d;
             l.d2[j] += d * d;
         }
-    dev64_finish(&l, v, i, n, m, c, s, a, dv, nl);
+    dev64_finish(&l, v, i, n, m, c, s, a, dv, nl, L64);
 }
 
 INL void agg64_scalar_impl(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl)
@@ -279,7 +281,7 @@ INL void agg64_scalar_impl(const double *v, size_t n, size_t nulls, agg_state *a
             l.mn[j] = x < l.mn[j] ? x : l.mn[j];
             l.mx[j] = x > l.mx[j] ? x : l.mx[j];
         }
-    double s = lanes64_finish(&l, v, i, n, a, nl);
+    double s = lanes64_finish(&l, v, i, n, a, nl, L64);
     if (dv)
         dev64_scalar(v, n, n - nulls, s, a, dv, nl);
     else
@@ -292,6 +294,135 @@ static void fold_f64_scalar(const double *v, size_t n, size_t nulls, agg_state *
         agg64_scalar_impl(v, n, nulls, a, dv, true);
     else
         agg64_scalar_impl(v, n, 0, a, dv, false);
+}
+
+/* ------------------------------------------------------ short runs */
+
+/*
+ * A run shorter than the lanes (a bucket of a few rows: query.c's fold_run
+ * folds once per bucket) puts value j alone into lane j; every lane from n on
+ * stays +0.0 for the sums and the deviations and at a's min and max. Such a
+ * lane changes nothing in the halving: x + +0.0 is x, since no lane is ever
+ * -0.0 (above), and min/max keep the other operand, which is a's own bound or
+ * a value beyond it. So the reduction can start at the smallest power of two
+ * k >= n, with the same bits as the kernels' full reduction, and without their
+ * fixed cost (setting up and reducing 32 lanes, the vector setup, the null
+ * count as a pass of its own), which is larger than the fold itself for a few
+ * values. values.c and twa.c take these below SIMD_LANES_F32 / _F64 on every
+ * CPU level; test_levels compares them with the kernels.
+ */
+static int lanes_for(size_t n)
+{
+    int k = 1;
+    while ((size_t)k < n)
+        k *= 2;
+    return k;
+}
+
+/*
+ * K (the lanes in use) is a constant in each copy, so the loops unroll and the lanes stay in registers: a loop
+ * over a variable number of lanes kept them in memory and cost more than the kernels it replaces. The null
+ * count comes from the same loop (a null adds +0.0 to its lane as in the kernels; with nl false, none is
+ * looked for). T is float or double; F32 says which, for the float32 lanes of min and max.
+ */
+#define SMALL_FOLD(NAME, T, MT, NULLF, NL_LANES)                                                              \
+    INL void NAME##_k(const T *v, size_t n, agg_state *a, agg_dev *dv, const bool nl, const int K, const int R)\
+    {                                                                                                       \
+        double s[NL_LANES];                                                                                 \
+        MT mn[NL_LANES], mx[NL_LANES];                                                                      \
+        const MT lo = (MT)a->min, hi = (MT)a->max;                                                          \
+        size_t nulls = 0;                                                                                   \
+        _Pragma("GCC unroll 32") for (int j = 0; j < K; j++)                                                \
+        {                                                                                                   \
+            s[j] = 0.0;                                                                                     \
+            mn[j] = lo;                                                                                     \
+            mx[j] = hi;                                                                                     \
+            _Pragma("GCC unroll 4") for (int r = 0; r < R; r++)                                             \
+            {                                                                                               \
+                size_t i = (size_t)(r * K + j);                                                      \
+                bool in = i < n;                                                                            \
+                T x = in ? v[i] : 0;                                                                        \
+                bool nul = in && nl && NULLF(x);                                                            \
+                nulls += nul;                                                                               \
+                s[j] += in && !nul ? (double)x : 0.0;                                                       \
+                mn[j] = in && x < mn[j] ? x : mn[j];                                                        \
+                mx[j] = in && x > mx[j] ? x : mx[j];                                                        \
+            }                                                                                               \
+        }                                                                                                   \
+        _Pragma("GCC unroll 8") for (int w = K / 2; w >= 1; w /= 2)                                         \
+            _Pragma("GCC unroll 16") for (int j = 0; j < w; j++)                                            \
+        {                                                                                                   \
+            s[j] = s[j] + s[j + w];                                                                         \
+            mn[j] = mn[j + w] < mn[j] ? mn[j + w] : mn[j];                                                  \
+            mx[j] = mx[j + w] > mx[j] ? mx[j + w] : mx[j];                                                  \
+        }                                                                                                   \
+        a->min = mn[0] < a->min ? mn[0] : a->min;                                                           \
+        a->max = mx[0] > a->max ? mx[0] : a->max;                                                           \
+        uint64_t c = n - nulls;                                                                             \
+        if (!dv) {                                                                                          \
+            sum_finish(c, s[0], a);                                                                         \
+            return;                                                                                         \
+        }                                                                                                   \
+        if (!c)                                                                                             \
+            return;                                                                                         \
+        double m = s[0] / (double)c, d1[NL_LANES], d2[NL_LANES];                                            \
+        _Pragma("GCC unroll 32") for (int j = 0; j < K; j++)                                                \
+        {                                                                                                   \
+            d1[j] = d2[j] = 0.0;                                                                            \
+            _Pragma("GCC unroll 4") for (int r = 0; r < R; r++)                                             \
+            {                                                                                               \
+                size_t i = (size_t)(r * K + j);                                                      \
+                bool in = i < n;                                                                            \
+                T x = in ? v[i] : 0;                                                                        \
+                double d = in && !(nl && NULLF(x)) ? (double)x - m : 0.0;                                   \
+                d1[j] += d;                                                                                 \
+                d2[j] += d * d;                                                                             \
+            }                                                                                               \
+        }                                                                                                   \
+        _Pragma("GCC unroll 8") for (int w = K / 2; w >= 1; w /= 2)                                         \
+            _Pragma("GCC unroll 16") for (int j = 0; j < w; j++)                                            \
+        {                                                                                                   \
+            d1[j] = d1[j] + d1[j + w];                                                                      \
+            d2[j] = d2[j] + d2[j + w];                                                                      \
+        }                                                                                                   \
+        agg_add_run(a, dv, c, s[0], d1[0], d2[0]);                                                          \
+        a->sum = canon_nan(a->sum);                                                                         \
+    }
+
+SMALL_FOLD(small_f32, float, float, null_f32, 16)
+SMALL_FOLD(small_f64, double, double, null_f64, 16)
+
+/* n < 32: up to 16 lanes of one value, or 16 of two (values j and j + 16). For float32 (32 lanes), 16 < n < 32
+ * is the same: the first halving adds lane j + 16 (one value, never -0.0 after +0.0 + x) to lane j, which is
+ * what adding the value itself does, as an empty lane's +0.0 does nothing; min and max likewise. */
+#define SMALL_SWITCH(NAME, NL)                                                                              \
+    switch (n <= 16 ? lanes_for(n) : 32) {                                                                  \
+    case 1: NAME##_k(v, n, a, dv, NL, 1, 1); break;                                                         \
+    case 2: NAME##_k(v, n, a, dv, NL, 2, 1); break;                                                         \
+    case 4: NAME##_k(v, n, a, dv, NL, 4, 1); break;                                                         \
+    case 8: NAME##_k(v, n, a, dv, NL, 8, 1); break;                                                         \
+    case 16: NAME##_k(v, n, a, dv, NL, 16, 1); break;                                                       \
+    default: NAME##_k(v, n, a, dv, NL, 16, 2); break;                                                       \
+    }
+
+void simd_small_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv)
+{
+    if (!n)
+        return;
+    if (may_be_null)
+        SMALL_SWITCH(small_f32, true)
+    else
+        SMALL_SWITCH(small_f32, false)
+}
+
+void simd_small_f64(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv)
+{
+    if (!n)
+        return;
+    if (may_be_null)
+        SMALL_SWITCH(small_f64, true)
+    else
+        SMALL_SWITCH(small_f64, false)
 }
 
 #ifdef TSDB_X86
@@ -324,7 +455,7 @@ K_AVX2 void dev_avx2(const float *v, size_t n, uint64_t c, double s, agg_state *
         _mm256_storeu_pd(l.d1 + 4 * q, d1[q]);
         _mm256_storeu_pd(l.d2 + 4 * q, d2[q]);
     }
-    dev_finish(&l, v, i, n, m, c, s, a, dv, nl);
+    dev_finish(&l, v, i, n, m, c, s, a, dv, nl, LANES);
 }
 
 K_AVX512 void dev_avx512(const float *v, size_t n, uint64_t c, double s, agg_state *a, agg_dev *dv, const bool nl)
@@ -355,7 +486,7 @@ K_AVX512 void dev_avx512(const float *v, size_t n, uint64_t c, double s, agg_sta
         _mm512_storeu_pd(l.d1 + 8 * q, d1[q]);
         _mm512_storeu_pd(l.d2 + 8 * q, d2[q]);
     }
-    dev_finish(&l, v, i, n, m, c, s, a, dv, nl);
+    dev_finish(&l, v, i, n, m, c, s, a, dv, nl, LANES);
 }
 
 /* sum of the 4 floats as doubles into s */
@@ -409,7 +540,7 @@ K_AVX2 void agg_avx2_impl(const float *v, size_t n, size_t nulls, agg_state *a, 
     _mm256_storeu_ps(l.mx + 8, mx1);
     _mm256_storeu_ps(l.mx + 16, mx2);
     _mm256_storeu_ps(l.mx + 24, mx3);
-    double s = lanes_finish(&l, v, i, n, a, nl);
+    double s = lanes_finish(&l, v, i, n, a, nl, LANES);
     if (dv)
         dev_avx2(v, n, n - nulls, s, a, dv, nl);
     else
@@ -465,7 +596,7 @@ K_AVX512 void agg_avx512_impl(const float *v, size_t n, size_t nulls, agg_state 
     _mm512_storeu_ps(l.mn + 16, mn2);
     _mm512_storeu_ps(l.mx, mx);
     _mm512_storeu_ps(l.mx + 16, mx2);
-    double s = lanes_finish(&l, v, i, n, a, nl);
+    double s = lanes_finish(&l, v, i, n, a, nl, LANES);
     if (dv)
         dev_avx512(v, n, n - nulls, s, a, dv, nl);
     else
@@ -512,7 +643,7 @@ K_AVX2 void dev64_avx2(const double *v, size_t n, uint64_t c, double s, agg_stat
         _mm256_storeu_pd(l.d1 + 4 * q, d1[q]);
         _mm256_storeu_pd(l.d2 + 4 * q, d2[q]);
     }
-    dev64_finish(&l, v, i, n, m, c, s, a, dv, nl);
+    dev64_finish(&l, v, i, n, m, c, s, a, dv, nl, L64);
 }
 
 K_AVX2 void agg64_avx2_impl(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl)
@@ -543,7 +674,7 @@ K_AVX2 void agg64_avx2_impl(const double *v, size_t n, size_t nulls, agg_state *
         _mm256_storeu_pd(l.mn + 4 * q, mn[q]);
         _mm256_storeu_pd(l.mx + 4 * q, mx[q]);
     }
-    double sum = lanes64_finish(&l, v, i, n, a, nl);
+    double sum = lanes64_finish(&l, v, i, n, a, nl, L64);
     if (dv)
         dev64_avx2(v, n, n - nulls, sum, a, dv, nl);
     else
@@ -584,7 +715,7 @@ K_AVX512 void dev64_avx512(const double *v, size_t n, uint64_t c, double s, agg_
         _mm512_storeu_pd(l.d1 + 8 * q, d1[q]);
         _mm512_storeu_pd(l.d2 + 8 * q, d2[q]);
     }
-    dev64_finish(&l, v, i, n, m, c, s, a, dv, nl);
+    dev64_finish(&l, v, i, n, m, c, s, a, dv, nl, L64);
 }
 
 K_AVX512 void agg64_avx512_impl(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl)
@@ -615,7 +746,7 @@ K_AVX512 void agg64_avx512_impl(const double *v, size_t n, size_t nulls, agg_sta
         _mm512_storeu_pd(l.mn + 8 * q, mn[q]);
         _mm512_storeu_pd(l.mx + 8 * q, mx[q]);
     }
-    double sum = lanes64_finish(&l, v, i, n, a, nl);
+    double sum = lanes64_finish(&l, v, i, n, a, nl, L64);
     if (dv)
         dev64_avx512(v, n, n - nulls, sum, a, dv, nl);
     else
@@ -1117,9 +1248,10 @@ static inline double twa_y(int type, const void *v, size_t i, bool *ok)
     }
 }
 
-/* segments [s, n - 1) one at a time into the lanes, then the reduction */
-static void twa_tail(int type, const int64_t *ts, const void *v, size_t s, size_t n, double *st, double *li,
-                     twa_sums *o)
+/* segments [s, n - 1) one at a time into the lanes, then the reduction of the first k lanes (L64, or fewer for
+ * a short granule: see twa_small) */
+INL void twa_tail(int type, const int64_t *ts, const void *v, size_t s, size_t n, double *st, double *li,
+                  twa_sums *o, const int k)
 {
     bool okp;
     double vp = twa_y(type, v, s, &okp);
@@ -1136,8 +1268,8 @@ static void twa_tail(int type, const int64_t *ts, const void *v, size_t s, size_
         vp = x;
         okp = ok;
     }
-    o->step = canon_nan(lanes_reduce(st, L64));
-    o->lin = canon_nan(lanes_reduce(li, L64));
+    o->step = canon_nan(lanes_reduce(st, k));
+    o->lin = canon_nan(lanes_reduce(li, k));
 }
 
 /* whole groups of L64 segments with the lane as a constant (the compiler keeps the lanes in registers and
@@ -1160,7 +1292,7 @@ INL void twa_scalar_impl(int type, const int64_t *ts, const void *v, size_t n, t
             lms += okp && ok ? dt : 0;
         }
     *o = (twa_sums){.sms = sms, .lms = lms, .gap = gap};
-    twa_tail(type, ts, v, s, n, st, li, o);
+    twa_tail(type, ts, v, s, n, st, li, o, L64);
 }
 
 static void twa_scalar(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
@@ -1170,6 +1302,63 @@ static void twa_scalar(int type, const int64_t *ts, const void *v, size_t n, twa
     case TSDB_FLOAT64: twa_scalar_impl(TSDB_FLOAT64, ts, v, n, o); break;
     case TSDB_INT64: twa_scalar_impl(TSDB_INT64, ts, v, n, o); break;
     default: twa_scalar_impl(TSDB_BOOL, ts, v, n, o); break;
+    }
+}
+
+/* At most L64 points, so at most one segment per lane: as for the short runs above, the reduction of the k
+ * lanes in use gives the same bits, and with K a constant the lanes stay in registers. */
+INL void twa_small_k(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o, const int K)
+{
+    double st[L64], li[L64];
+    uint64_t sms = 0, lms = 0, gap = 0;
+    bool okp;
+    double vp = twa_y(type, v, 0, &okp);
+    _Pragma("GCC unroll 16") for (int j = 0; j < K; j++)
+    {
+        size_t i = (size_t)j + 1;
+        bool in = i < n, ok = false;
+        uint64_t dt = in ? (uint64_t)ts[i] - (uint64_t)ts[i - 1] : 0;
+        double x = in ? twa_y(type, v, i, &ok) : 0.0, d = (double)dt;
+        ok = in && ok;
+        gap = dt > gap ? dt : gap;
+        st[j] = 0.0 + (in && okp ? vp * d : 0.0);
+        li[j] = 0.0 + (okp && ok ? (vp + x) * 0.5 * d : 0.0);
+        sms += in && okp ? dt : 0;
+        lms += okp && ok ? dt : 0;
+        vp = x;
+        okp = ok;
+    }
+    _Pragma("GCC unroll 8") for (int w = K / 2; w >= 1; w /= 2)
+        _Pragma("GCC unroll 16") for (int j = 0; j < w; j++)
+    {
+        st[j] = st[j] + st[j + w];
+        li[j] = li[j] + li[j + w];
+    }
+    *o = (twa_sums){.sms = sms, .lms = lms, .gap = gap, .step = canon_nan(st[0]), .lin = canon_nan(li[0])};
+}
+
+INL void twa_small_impl(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    switch (lanes_for(n - 1)) {
+    case 1: twa_small_k(type, ts, v, n, o, 1); break;
+    case 2: twa_small_k(type, ts, v, n, o, 2); break;
+    case 4: twa_small_k(type, ts, v, n, o, 4); break;
+    case 8: twa_small_k(type, ts, v, n, o, 8); break;
+    default: twa_small_k(type, ts, v, n, o, 16); break;
+    }
+}
+
+void simd_twa_run(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
+{
+    if (n > L64) {
+        simd_twa(type, ts, v, n, o);
+        return;
+    }
+    switch (type) {
+    case TSDB_FLOAT32: twa_small_impl(TSDB_FLOAT32, ts, v, n, o); break;
+    case TSDB_FLOAT64: twa_small_impl(TSDB_FLOAT64, ts, v, n, o); break;
+    case TSDB_INT64: twa_small_impl(TSDB_INT64, ts, v, n, o); break;
+    default: twa_small_impl(TSDB_BOOL, ts, v, n, o); break;
     }
 }
 
@@ -1261,7 +1450,7 @@ K_AVX2 void twa_avx2_impl(int type, const int64_t *ts, const void *v, size_t n, 
         o->lms += b[j];
         o->gap = g[j] > o->gap ? g[j] : o->gap;
     }
-    twa_tail(type, ts, v, s, n, sl, ll, o);
+    twa_tail(type, ts, v, s, n, sl, ll, o, L64);
 }
 
 __attribute__((target("avx2"))) static void twa_avx2(int type, const int64_t *ts, const void *v, size_t n,
@@ -1334,7 +1523,7 @@ K_AVX512 void twa_avx512_impl(int type, const int64_t *ts, const void *v, size_t
     o->sms = (uint64_t)_mm512_reduce_add_epi64(sms);
     o->lms = (uint64_t)_mm512_reduce_add_epi64(lms);
     o->gap = (uint64_t)_mm512_reduce_max_epu64(gap);
-    twa_tail(type, ts, v, s, n, sl, ll, o);
+    twa_tail(type, ts, v, s, n, sl, ll, o, L64);
 }
 
 __attribute__((target("avx512f,avx512dq"))) static void twa_avx512(int type, const int64_t *ts, const void *v,
@@ -1547,12 +1736,17 @@ __attribute__((target("avx512f,avx512dq"))) static size_t lttb_avx512(int type, 
 }
 #endif
 
+/* points per call below which lttb_scalar is faster than the kernels (fold-bench: 8 points 0.6x, 16 on par) */
+#define LTTB_SMALL 16
+
 static size_t (*simd_lttb)(int, const int64_t *, const uint64_t *, size_t, int64_t, double, double, double,
                            double) = lttb_scalar;
 
 size_t lttb_argmax(int type, const int64_t *ts, const uint64_t *v, size_t n, int64_t t0, double ax, double ay,
                    double cx, double cy)
 {
+    if (n < LTTB_SMALL) /* the same pick (the first largest area) without the kernels' setup and lane combine */
+        return lttb_scalar(type, ts, v, n, t0, ax, ay, cx, cy);
     return simd_lttb(type, ts, v, n, t0, ax, ay, cx, cy);
 }
 

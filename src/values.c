@@ -29,20 +29,34 @@ static size_t count_null_f64(const uint64_t *v, size_t n)
     return k;
 }
 
-/* the null count first (a quick pass the compiler vectorizes): without nulls the kernels skip the masking */
+/* the null count first (a quick pass the compiler vectorizes): without nulls the kernels skip the masking.
+ * Runs shorter than the lanes take simd_small_* (same bits, less fixed cost: buckets of a few rows). */
 static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
-    simd_fold_f32(v, n, may_be_null ? count_null_f32((const uint32_t *)v, n) : 0, a, x);
+    if (n < SIMD_SHORT)
+        simd_small_f32(v, n, may_be_null, a, x);
+    else
+        simd_fold_f32(v, n, may_be_null ? count_null_f32((const uint32_t *)v, n) : 0, a, x);
 }
 
-static void fold_f64(const double *v, size_t n, agg_state *a, agg_dev *x)
+static void fold_f64(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
-    simd_fold_f64(v, n, count_null_f64((const uint64_t *)v, n), a, x);
+    if (n < SIMD_SHORT)
+        simd_small_f64(v, n, may_be_null, a, x);
+    else
+        simd_fold_f64(v, n, may_be_null ? count_null_f64((const uint64_t *)v, n) : 0, a, x);
 }
+
+/* Below these many values the loops here beat the integer kernels, whose setup and final combine (lanes of
+ * 128-bit sums, min/max across lanes) cost more than a few values (fold-bench --rows 8, 16, 32: int64 without
+ * the spread 0.75x of the loop at 8 rows, 1.25x at 16; with the spread the kernel is on par at 8 and the loop's
+ * 128-bit squares slower; bool and state 0.6x at 16, 2x at 32). */
+#define I64_KERNEL_MIN 16
+#define U32_KERNEL_MIN 32
 
 static void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
 {
-    if (simd_fold_i64) {
+    if (simd_fold_i64 && (dx || n >= I64_KERNEL_MIN)) {
         simd_fold_i64(v, n, a, dx);
         return;
     }
@@ -93,7 +107,7 @@ static void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
 /* bool (0, 1) and state codes: 4-byte slots with their own null */
 static void fold_u32(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx)
 {
-    if (simd_fold_u32) {
+    if (simd_fold_u32 && n >= U32_KERNEL_MIN) {
         simd_fold_u32(v, n, null, a, dx);
         return;
     }
@@ -140,7 +154,7 @@ void agg_fold_hint(int type, const void *v, size_t n, bool may_be_null, agg_stat
     a->rows += n;
     switch (type) {
     case TSDB_FLOAT32: fold_f32(v, n, may_be_null, a, x); break;
-    case TSDB_FLOAT64: fold_f64(v, n, a, x); break;
+    case TSDB_FLOAT64: fold_f64(v, n, may_be_null, a, x); break;
     case TSDB_INT64: fold_i64(v, n, a, x); break;
     case TSDB_BOOL: fold_u32(v, n, NULL_BOOL, a, x); break;
     default: fold_u32(v, n, NULL_STATE, a, x); break;

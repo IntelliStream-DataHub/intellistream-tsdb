@@ -987,6 +987,17 @@ to its lane instead of being skipped: a lane starts at +0.0 and never becomes
 branch per row. The kernels take the number of nulls (one quick pass counts
 them first) and mask only when there are any.
 
+A run shorter than the lanes (a bucket of a few rows, folded once per bucket)
+skips the kernels: value j alone in lane j, and the halving starts at the
+smallest power of two that holds the run, since an empty lane (+0.0, or the
+running minimum and maximum) changes nothing in it. The bits are those of the
+kernels; setting up and reducing 32 lanes would cost more than the values.
+The integer loops below likewise take short runs (under 16 int64 values, 64
+bool or state codes), and LTTB buckets of under 16 points are scanned by the
+scalar loop. CPUs below x86-64-v3 (x86-64-v2, and Sandy Bridge, which has AVX
+but not AVX2) run the scalar code in the same lanes: there are no SSE or AVX1
+kernels yet.
+
 Integers (int64, bool and state codes) are summed exactly, so their order is
 free: the AVX2 and AVX-512 kernels add 32-bit halves of the values in 64-bit
 lanes (and, for int64, count the negative ones), which cannot overflow within a
