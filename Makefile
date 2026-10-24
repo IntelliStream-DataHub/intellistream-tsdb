@@ -67,10 +67,21 @@ test: $(B)/test_tsdb $(B)/test_types $(B)/test_server $(B)/test_stability $(B)/t
 # Without -march=native: with it, GCC 15.2's AddressSanitizer crashes in memcpy into
 # fake-stack frames (use-after-return detection), in code that did not change.
 # The runtime-dispatched AVX-512 kernels are still tested.
-asan:
+# UBSan only prints by default and the run still exits 0: halt_on_error makes the first report fail
+# it. `ubsan-check` proves that with a program that overflows on purpose.
+ASAN_FLAGS := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+UBSAN_RUN  := halt_on_error=1:print_stacktrace=1
+asan: ubsan-check
 	$(MAKE) clean
-	$(MAKE) ARCH= CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
-	        LDFLAGS="-fsanitize=address,undefined" test
+	UBSAN_OPTIONS="$(UBSAN_RUN) $$UBSAN_OPTIONS" \
+	$(MAKE) ARCH= CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" test
+
+ubsan-check:
+	@mkdir -p $(B)
+	$(CC) $(ASAN_FLAGS) -o $(B)/ubsan_overflow tests/ubsan_overflow.c
+	@if UBSAN_OPTIONS="$(UBSAN_RUN)" ./$(B)/ubsan_overflow >/dev/null 2>&1; then \
+	    echo "ubsan-check: an undefined behaviour report did not fail the run"; exit 1; fi
+	@echo "ubsan-check: ok"
 
 # ThreadSanitizer, in build-tsan/ (no `make clean`: a normal build in build/
 # stays), the server under test included. -O1 keeps reports readable;
@@ -104,7 +115,7 @@ test-java: $(B)/tsdbd
 
 test-clients: test-rust test-python test-java
 
-.PHONY: all test asan tsan clean jepsen test-rust test-python test-java test-clients
+.PHONY: all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -167,3 +178,8 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20 && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10 || exit 1; done
+
+# Build and test on AlmaLinux 10 (the production OS) in Podman; takes minutes, logs in $LOGDIR.
+# URING=0 keeps Podman's stock seccomp profile, which blocks io_uring as production does: tsdbd then runs on epoll.
+test-almalinux10:
+	tests/distro/almalinux10.sh
