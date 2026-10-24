@@ -23,9 +23,12 @@ start, the tests and the benchmark results.
   replaces too), the last write wins (within one batch, the later row), and
   queries never return duplicates.
 - Time ranges are half open, `[start, end)`.
-- Aggregates: count, sum, min, max, avg. Integer types (int64, bool as 0/1)
+- Aggregates: count, sum, min, max, avg, and the spread: range (max - min),
+  population and sample variance and standard deviation (`var_pop`,
+  `var_samp`, `stddev_pop`, `stddev_samp`). Integer types (int64, bool as 0/1)
   aggregate exactly (`isum`, `imin`, `imax`; the sum saturates at the int64
   limits, `sum` holds it as a double). For states only the count is meaningful.
+  See "Spread" below for how variances stay exact.
 - Float sums are not bit-reproducible. A float sum depends on the order of the
   additions, and that order follows how parts were merged and how a query was
   split over threads, so the same rows can give sums that differ in the last
@@ -67,6 +70,83 @@ start, the tests and the benchmark results.
   a local midnight that occurs twice begins the day the first time.
 - All functions are thread safe. One process opens a database for writing
   (`flock`); any number may open it `read_only` or follow it (below).
+
+## Spread: range, variance, standard deviation
+
+Whole granules answer the spread from their statistics like they answer sums,
+so the statistics must combine without losing precision. A raw sum of squares
+does not: pressure in Pa around 101325 with a spread of +-5 has squares near
+1e10 whose difference from n * mean^2 is the variance, and in a double that
+difference cancels to noise (or to a negative variance). So float series keep
+the stable form: per granule, besides count and sum, m2, the sum of squared
+deviations from the granule's mean. A run of decoded values gets its m2 in two
+passes, the mean first and then the squared deviations from it, corrected by
+their sum (the corrected two-pass algorithm); runs, granules, memtables and
+threads then combine with the parallel formula of Chan, Golub and LeVeque:
+m2 = m2a + m2b + d^2 * na * nb / (na + nb), d the difference of the means.
+Constant data gives exactly 0, and an offset costs no precision.
+
+int64 and bool keep exact sums instead: of x (128 bits, as for `isum`) and of
+x^2 in 192 bits, enough for 2^64 rows of int64 squares. The variance is
+computed once, at the end: n * S2 - S1^2 exactly in 256 bits, then
+converted to long double and divided by n^2 (or n (n - 1)) and rounded to a
+double. Nothing cancels, the error is a few roundings in the last bits of a
+long double (so close to, but not always, the correctly rounded double; on
+aarch64 long double is binary128 and the last bits can differ from x86-64),
+and the result depends only on the multiset of values, not on
+their order. m2 would not have done: the mean of integers is not an integer,
+and m2 of integers is a float with the reproducibility of float sums.
+
+What is bit-reproducible:
+
+- int64 and bool: every spread value, in every order, path and CPU.
+- Floats: the m2 of one run of rows is the same on every CPU level and kernel
+  (`TSDB_CPU`, `TSDB_SIMD`): the scalar, AVX2 and AVX-512 kernels keep 32
+  lanes and halve them in the same order, as for sums (test_spread checks all
+  of them bit for bit, on varied runs and on whole databases). How runs and granules combine follows how parts were
+  merged and the query split over threads, so like float sums the variances
+  may differ in the last bits after a merge.
+- range comes from min and max and is exact (for int64 the difference of two
+  exact integers, rounded once to a double; the CLI prints it as an exact
+  unsigned integer).
+
+NaN and infinities: min and max skip NaN, so the range does too; a NaN or an
+infinity among the values makes the variances and deviations NaN (the
+deviation of an infinity from the mean is undefined), the canonical NaN like
+every NaN result. So do finite float values whose sum overflows a double
+(two values of 1e308): the mean is then infinite. A bucket without known
+values gives NaN for all of them, a single value gives 0 for the population
+and NaN for the sample measures.
+
+The spread is opt in, because its second pass over decoded values costs time
+that count, sum, min, max and avg do not need: `tsdb_query_spread`,
+`tsdb_query_spread_group` and `tsdb_query_spread_bounds` (and
+`tsdb_query_spread_group_local` for calendar buckets) fill
+`tsdb_spread_bucket`, a `tsdb_bucket` followed by the five spread values.
+`tsdb_query_agg` and the other plain queries fold in one pass, skip the
+squares, and return the same bits as before; `tsdb_bucket` keeps its 64
+bytes, so bindings that mirror it are unchanged. Whole granules cost the same
+either way: their statistics hold m2 already. The engine keeps m2 and the sums
+of squares beside each bucket's state (`agg_dev`), not in it: a plain query
+of 10-row buckets holds one state per bucket, and a state of 80 instead of 48
+bytes made it 20-30% slower (`build/tsdb-bench`, buckets of 10 samples). With
+the state at 48 bytes the plain queries run as fast as before the spread.
+
+The three statistics cost 24 bytes per granule entry (160 instead of 136
+bytes: m2 or the low 64 bits of the integer sum of squares, and its other 128
+bits) and made the on-disk format version 5. Measured with `build/tsdb-bench`
+(100 series of 1 M rows, partly filled granules): 1.202 to 1.208 bytes a row,
++0.5%; 0.003 bytes a row in full 8192-row granules.
+
+Over the protocol the spread is optional (version 8; 7 is range deletes):
+QUERY_BUCKETS and QUERY_BOUNDS take a `fields` byte, and with `TSDB_SPREAD`
+each 64-byte bucket row is followed by the five doubles. A request without
+the byte gets the old rows and the server runs the plain, one-pass query, so
+clients that do not know the spread read replies unchanged and pay nothing.
+The C client's `tsdbc_query_agg`, `_group` and `_bounds` never send the byte;
+`tsdbc_query_spread`, `_spread_group` and `_spread_bounds` send it, and
+against a server older than version 8 fail with `TSDB_ERR_INVALID` without a
+request.
 
 ## Query statistics
 
@@ -776,6 +856,7 @@ build/tsdb /data/sensors import < rows.csv          # series,time,value (null or
 build/tsdb /data/sensors insert pump7.flow < p.csv  # time,value
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2024-01-02 avg 5m
 build/tsdb /data/sensors query pump7.flow now-1h now raw
+build/tsdb /data/sensors query pump7.pressure 2024-01-01 2024-01-02 stddev 1h   # also range, stddev_samp, var, var_samp
 build/tsdb /data/sensors query pump7.temp 2024-01-01 2024-02-01 twa 1d --tz Europe/Oslo --max-gap 10m
 build/tsdb /data/sensors stats
 build/tsdb /data/sensors parts

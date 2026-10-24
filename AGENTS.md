@@ -131,8 +131,8 @@ cgroup, so `nice` does not keep your work out of its way.
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
   host may still have them mapped.
-- **Granules** never span series; their count/nulls/sum/min/max must match the
-  rows exactly, because aggregates use them instead of decoding.
+- **Granules** never span series; their count/nulls/sum/min/max, and m2 (floats) or the sum of
+  squares (integers), must match the rows exactly, because aggregates use them instead of decoding.
 - **Value types.** A series' type is fixed at creation and lives in the SERIES
   dictionary, not in the parts. Values travel as slots of `type_width(type)`
   bytes (4: float32, bool, state; 8: float64, int64); the memtable and the WAL
@@ -144,8 +144,8 @@ cgroup, so `nice` does not keep your work out of its way.
   innermost.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- The on-disk format is version 4 (`FORMAT_VERSION`): 136-byte granule entries
-  with typed and time-weighted statistics, a checksum over each part's header, index and footer,
+- The on-disk format is version 5 (`FORMAT_VERSION`): 160-byte granule entries
+  with typed, time-weighted and spread statistics, a checksum over each part's header, index and footer,
   checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Before
   the first release, older formats need not stay readable (the user decided
   this on 2026-10-24): a layout change bumps `FORMAT_VERSION`, and a database of

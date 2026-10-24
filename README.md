@@ -33,6 +33,10 @@ average). You can link tsdb into your program as a library, or run its server,
   time zone into UTC for you.
 - Downsample a series to N points that keep its shape, for charts: the peaks
   and dips stay (LTTB), and every point returned is a real stored point.
+- Besides count, sum, min, max and average, each bucket tells how much the
+  values spread: the range (max - min) and the standard deviation and
+  variance. They stay exact for a sensor with a large offset and a small
+  spread (air pressure: 101325 Pa, +- 5), and are exact for int64 values.
 - Time-weighted averages for sensors that report irregularly or only on
   change: each value counts for as long as it held, stepwise or on a straight
   line between readings, and not across an outage longer than you allow. Wide
