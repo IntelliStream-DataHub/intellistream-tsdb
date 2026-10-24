@@ -7,7 +7,7 @@
 set -eu
 dir=$1 table=${2:-big} ch=${3:-clickhouse}
 for c in point agg_100k agg_1m agg_10m agg_1b agg_all grp_1s_hour grp_1s_minute \
-         grp_100s_day grp_100s_hour grp_all_day grp_all_hour; do
+         grp_100s_day grp_100s_hour grp_all_day grp_all_hour grp_all_day_utc; do
     f=$dir/$c.sql
     [ -f "$f" ] || continue
     n=$(wc -l < "$f")

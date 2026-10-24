@@ -200,7 +200,7 @@ static int cmd_export(void)
 /* ---- query ---- */
 
 enum { Q_RAW, Q_AGG };
-enum { G_NONE, G_MINUTE, G_HOUR, G_DAY_OSLO };
+enum { G_NONE, G_MINUTE, G_HOUR, G_DAY_OSLO, G_DAY_UTC };
 
 typedef struct qclass {
     const char *name, *label;
@@ -224,12 +224,13 @@ static const qclass classes[] = {
     {"grp_100s_hour", "100 series by series, hour", Q_AGG, 100, 0, G_HOUR, 3},
     {"grp_all_day", "whole table by series, day (Europe/Oslo)", Q_AGG, 0, 0, G_DAY_OSLO, 2},
     {"grp_all_hour", "whole table by series, hour", Q_AGG, 0, 0, G_HOUR, 2},
+    {"grp_all_day_utc", "whole table by series, day (UTC)", Q_AGG, 0, 0, G_DAY_UTC, 2},
 };
 
 static const tsdb_group groups[] = {{0, 0, NULL}, {TSDB_MINUTE, 1, NULL}, {TSDB_HOUR, 1, NULL},
-                                    {TSDB_DAY, 1, "Europe/Oslo"}};
+                                    {TSDB_DAY, 1, "Europe/Oslo"}, {TSDB_DAY, 1, NULL}};
 static const char *ch_bucket[] = {NULL, "toStartOfMinute(ts)", "toStartOfHour(ts)",
-                                  "toStartOfDay(ts, 'Europe/Oslo')"};
+                                  "toStartOfDay(ts, 'Europe/Oslo')", "toStartOfDay(ts)"};
 
 typedef struct target {
     tsdb *db;
