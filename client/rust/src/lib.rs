@@ -1,7 +1,7 @@
 //! A blocking client for tsdbd, the TCP server of the tsdb time series database.
 //!
 //! The protocol is the one in `include/tsdb_protocol.h`; this crate mirrors the
-//! C client in `client/tsdb_client.h` and has no dependencies beyond `std`.
+//! C client in `client/tsdb_client.h`; its only dependency is `zstd`, for packed inserts.
 //!
 //! - Timestamps are `i64` milliseconds since the epoch. A series has a
 //!   [`ValueType`] (float32, float64, int64, bool or state); values travel as
@@ -12,6 +12,8 @@
 //! - Every call returns [`Result`]; a server status arrives as
 //!   [`Error::Server`] with a [`Status`], and [`Error::code`] gives the
 //!   `TSDB_ERR_*` number.
+//! - Inserts are packed and zstd compressed for servers of protocol version 3
+//!   ([`Client::set_compression`]; level 1 by default, 0 sends plain arrays).
 //! - Inserts can be pipelined with [`Client::insert_series_async`] /
 //!   [`Client::insert_async`] and collected with [`Client::wait`]. The server
 //!   runs one connection's requests in order, so the last write still wins.
@@ -31,11 +33,12 @@
 
 mod client;
 mod error;
+mod pack;
 mod protocol;
 mod types;
 mod value;
 
-pub use client::Client;
+pub use client::{Client, DEFAULT_COMPRESSION};
 pub use error::{Error, Result, Status, strerror};
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};
 pub use types::{Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, Stats, Unit};

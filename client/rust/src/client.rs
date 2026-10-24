@@ -7,6 +7,11 @@
 //! reply. Every reply's id is checked against the request it answers. After an
 //! I/O or protocol error the stream may be out of step, so the client refuses
 //! further calls rather than misread replies.
+//!
+//! Inserts go packed and zstd compressed (protocol version 3) when compression
+//! is on (level 1 by default) and the server's HELLO, asked before the first
+//! non-empty insert, says 3 or more; otherwise as plain arrays. float32
+//! inserts too: the packed form is the smaller one.
 
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
@@ -15,9 +20,10 @@ use std::ops::{Bound, ControlFlow, RangeBounds};
 use std::time::Duration;
 
 use crate::error::{Error, Result, Status};
+use crate::pack;
 use crate::protocol::extend_i64s;
 use crate::protocol::{
-    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PROTOCOL_VERSION, REPLY_HEADER, VALID,
+    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PACKED, PROTOCOL_VERSION, REPLY_HEADER, VALID,
     VALUES_CHUNK_HEADER,
 };
 use crate::types::{Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, Stats};
@@ -34,6 +40,30 @@ const INSERT_VALUE_ROWS: usize = 6 << 20;
 /// then always fit in the socket buffers, so neither side can block the other.
 const MAX_PIPELINE: usize = 1024;
 const READ_BUF: usize = 1 << 20;
+
+/// The zstd level a new client compresses inserts with, as the C client.
+pub const DEFAULT_COMPRESSION: i32 = 1;
+
+/// The packing state: a zstd context and buffers reused between frames.
+struct Packer {
+    zc: zstd::bulk::Compressor<'static>,
+    level: i32,
+    scratch: Vec<u8>,
+    raw: Vec<u8>,
+    z: Vec<u8>,
+}
+
+impl Packer {
+    /// Releases memory after a large insert, as `FrameBuf::shrink`.
+    fn shrink(&mut self) {
+        const KEEP: usize = 1 << 20;
+        for b in [&mut self.scratch, &mut self.raw, &mut self.z] {
+            if b.capacity() > KEEP {
+                *b = Vec::new();
+            }
+        }
+    }
+}
 
 /// A connection to tsdbd.
 ///
@@ -65,6 +95,12 @@ pub struct Client {
     /// The first error status among the acknowledgements read so far.
     pending_status: i32,
     broken: bool,
+    /// zstd level of packed inserts; 0 sends plain arrays.
+    level: i32,
+    /// The server's protocol version, once asked.
+    server_version: Option<u32>,
+    packer: Option<Packer>,
+    bytes_sent: u64,
 }
 
 impl fmt::Debug for Client {
@@ -73,6 +109,8 @@ impl fmt::Debug for Client {
             .field("peer", &self.stream.get_ref().peer_addr().ok())
             .field("pending", &self.pending)
             .field("broken", &self.broken)
+            .field("compression", &self.level)
+            .field("server_version", &self.server_version)
             .finish()
     }
 }
@@ -100,7 +138,35 @@ impl Client {
             pending: 0,
             pending_status: 0,
             broken: false,
+            level: DEFAULT_COMPRESSION,
+            server_version: None,
+            packer: None,
+            bytes_sent: 0,
         })
+    }
+
+    /// Sets the zstd level of inserts: 0 sends plain arrays, any other level
+    /// zstd accepts (1 is the default; negative levels are faster) packs them
+    /// when the server speaks protocol version 3.
+    pub fn set_compression(&mut self, level: i32) -> Result<()> {
+        if level != 0 && !zstd::compression_level_range().contains(&level) {
+            return Err(Error::InvalidArgument(format!(
+                "compression level {level} is outside {:?}",
+                zstd::compression_level_range()
+            )));
+        }
+        self.level = level;
+        Ok(())
+    }
+
+    /// The zstd level of inserts (0: off).
+    pub fn compression(&self) -> i32 {
+        self.level
+    }
+
+    /// Bytes written to the socket by this client so far.
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent
     }
 
     /// Sets the read and write timeout of the socket (`None`: block forever).
@@ -114,15 +180,32 @@ impl Client {
 
     /// The server's protocol version (HELLO).
     pub fn protocol_version(&mut self) -> Result<u32> {
-        self.run(|c| {
-            c.request(Op::Hello, |f| {
-                f.u32(PROTOCOL_VERSION);
-            })?;
-            let mut r = Cursor::new(&c.body);
-            let v = r.u32()?;
-            end(&r)?;
-            Ok(v)
-        })
+        self.run(|c| c.hello())
+    }
+
+    fn hello(&mut self) -> Result<u32> {
+        self.request(Op::Hello, |f| {
+            f.u32(PROTOCOL_VERSION);
+        })?;
+        let mut r = Cursor::new(&self.body);
+        let v = r.u32()?;
+        end(&r)?;
+        self.server_version = Some(v);
+        Ok(v)
+    }
+
+    /// Whether an insert goes packed: compression on and a server that reads
+    /// it. The first time, this asks the server (after collecting pending
+    /// inserts, whose errors it returns rather than taking them for an old server).
+    fn packing(&mut self) -> Result<bool> {
+        if self.level == 0 {
+            return Ok(false);
+        }
+        let v = match self.server_version {
+            Some(v) => v,
+            None => self.hello()?,
+        };
+        Ok(v >= 3)
     }
 
     /// Waits for pending inserts, then closes the connection. Returns the
@@ -354,6 +437,9 @@ impl Client {
     fn insert_frames(&mut self, series: Option<&[u32]>, one: u32, ts: &[i64], values: &[Value]) -> Result<()> {
         check_lengths(series, one, ts, values.len())?;
         let n = ts.len();
+        if n > 0 && self.packing()? {
+            return self.insert_values_frames(series, one, ts, ColumnRef::from(values));
+        }
         let mut off = 0;
         loop {
             let m = (n - off).min(INSERT_FRAME_ROWS);
@@ -388,6 +474,8 @@ impl Client {
             )));
         }
         let n = ts.len();
+        let packed = n > 0 && self.packing()?;
+        let flags = if col.valid.is_some() { VALID } else { 0 } | if packed { PACKED } else { 0 };
         let mut off = 0;
         loop {
             // INSERT_VALUE_ROWS is a multiple of 8, so each frame's bitmap starts on a byte
@@ -399,16 +487,42 @@ impl Client {
             f.u32(m as u32)
                 .u32(series.map_or(one, |_| MANY_SERIES))
                 .u8(col.value_type().code())
-                .u8(if col.valid.is_some() { VALID } else { 0 })
+                .u8(flags)
                 .u16(0)
-                .u32(0)
-                .i64s(&ts[off..off + m]);
-            col.values.put(f.raw(), off, off + m);
-            if let Some(v) = col.valid {
-                f.bytes(&v.as_bytes()[off / 8..(off + m).div_ceil(8)]);
-            }
-            if let Some(s) = series {
-                f.align4().u32s(&s[off..off + m]);
+                .u32(0);
+            if packed {
+                let p = match &mut self.packer {
+                    Some(p) => p,
+                    p @ None => p.insert(Packer {
+                        zc: zstd::bulk::Compressor::new(self.level)?,
+                        level: self.level,
+                        scratch: Vec::new(),
+                        raw: Vec::new(),
+                        z: Vec::new(),
+                    }),
+                };
+                if p.level != self.level {
+                    p.zc.set_compression_level(self.level)?;
+                    p.level = self.level;
+                }
+                p.raw.clear();
+                let valid = col.valid.map(Bitmap::as_bytes);
+                pack::reshape(ts, col.values, valid, series, off, off + m, &mut p.scratch, &mut p.raw);
+                debug_assert!(p.raw.len() <= pack::raw_bound(m, col.value_type(), valid.is_some(), series.is_some()));
+                p.z.clear();
+                p.z.reserve(zstd::zstd_safe::compress_bound(p.raw.len()));
+                p.zc.compress_to_buffer(&p.raw, &mut p.z)?;
+                f.u32(p.raw.len() as u32).bytes(&p.z);
+                p.shrink();
+            } else {
+                f.i64s(&ts[off..off + m]);
+                col.values.put(f.raw(), off, off + m);
+                if let Some(v) = col.valid {
+                    f.bytes(&v.as_bytes()[off / 8..(off + m).div_ceil(8)]);
+                }
+                if let Some(s) = series {
+                    f.align4().u32s(&s[off..off + m]);
+                }
             }
             self.send_insert()?;
             off += m;
@@ -808,6 +922,7 @@ impl Client {
         }
         let mut s: &TcpStream = self.stream.get_ref();
         s.write_all(frame)?;
+        self.bytes_sent += frame.len() as u64;
         self.next_id = self.next_id.wrapping_add(1);
         Ok(())
     }

@@ -71,6 +71,7 @@ Ranges are `[start, end)`; `None` means unbounded.
 | `query_agg(id, start=None, end=None, interval_ms=0)` | `list[Bucket]`, aligned to the epoch |
 | `query_group(id, start=None, end=None, *, unit=None, count=1, timezone=None, order="asc", limit=None)` | calendar buckets |
 | `commit()`, `flush()`, `optimize()`, `stats()` | maintenance; `stats()` returns `Stats` |
+| `set_compression(level)`, `compression`, `bytes_sent` | zstd level of inserts (0: plain), bytes written to the socket |
 | `last_query_stats()` | `QueryStats` of this connection's previous query: rows covered, decoded or answered from granule statistics, bytes, time |
 
 Columns can be numpy arrays or `array.array`s of the matching type (int64
@@ -115,6 +116,21 @@ for int64 and bool series (true = 1); `isum` saturates. Every error is a
 `TsdbError` whose `code` is the `TSDB_ERR_*` number (`tsdb_client.ERR_NOTFOUND`
 and so on; `strerror(code)` gives the text). Errors of asynchronous inserts
 are raised by `wait()`, or by the next call that reads a reply.
+
+Inserts are packed and zstd compressed (protocol version 3, level 1 by
+default) for servers that speak version 3, as in the Rust client;
+`set_compression(0)` sends plain arrays.
+
+## Insert benchmark
+
+`bench_insert.py` loads a RowBinary file (u32 series, i64 ts, f32 value)
+over N connections, one thread each, and reports rows/s and bytes sent per
+row. numpy makes it much faster but is not required:
+
+```sh
+../../build/tsdb-bench --export /tmp/x.rb --series 10 --points 100000
+python bench_insert.py /tmp/x.rb --addr 127.0.0.1:7070 --conns 4 --compression 1
+```
 
 ## Build and test
 

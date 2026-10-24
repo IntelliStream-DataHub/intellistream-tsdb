@@ -2,7 +2,7 @@
 
 A blocking Rust client for `tsdbd`, the TCP server of tsdb. It mirrors the C
 client (`client/tsdb_client.h`), speaks the protocol in
-`include/tsdb_protocol.h`, and depends on nothing beyond `std`.
+`include/tsdb_protocol.h`, and depends only on `zstd` (for packed inserts).
 
 ## Quick start
 
@@ -92,6 +92,7 @@ everything.
 | `query_agg(id, range, interval_ms)` | `Vec<Bucket>` aligned to the epoch; 0 = one bucket |
 | `query_group(id, range, Option<&Group>, opts)` | calendar buckets in a time zone |
 | `commit()`, `flush()`, `optimize()`, `stats()` | maintenance |
+| `set_compression(level)`, `compression()`, `bytes_sent()` | zstd level of inserts (0: plain), bytes written to the socket |
 | `last_query_stats()` | `QueryStats` of this connection's previous query: rows covered, decoded or answered from granule statistics, bytes, time |
 
 `QueryOpts` carries the order and limit (`QueryOpts::desc().limit(5)`);
@@ -131,6 +132,21 @@ error the client refuses further calls, because the stream may be out of step.
 Asynchronous inserts are pipelined: the server runs one connection's requests
 in order, so the last write still wins. Their errors come back from `wait()`,
 or from the next call that reads a reply (that call is then not sent).
+
+Inserts are packed and zstd compressed (protocol version 3, zstd level 1 by
+default), float32 ones included. The client asks the server's version with
+HELLO before its first insert and sends plain arrays to servers older than
+version 3. `set_compression(0)` always sends plain arrays.
+
+## Insert benchmark
+
+`examples/insert_bench.rs` loads a RowBinary file (u32 series, i64 ts, f32
+value) the way `tsdbc-bench load` does, and reports rows/s and bytes sent per row:
+
+```sh
+../../build/tsdb-bench --export /tmp/x.rb --series 10 --points 100000
+cargo run --release --example insert_bench -- /tmp/x.rb --addr 127.0.0.1:7070 --conns 4 --compression 1
+```
 
 ## Build and test
 

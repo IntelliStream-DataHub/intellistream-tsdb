@@ -12,6 +12,7 @@ from typing_extensions import Buffer
 
 DEFAULT_PORT: int
 PROTOCOL_VERSION: int
+DEFAULT_COMPRESSION: int
 ERR_IO: int
 ERR_NOMEM: int
 ERR_CORRUPT: int
@@ -192,6 +193,14 @@ class Client:
         for nulls."""
     def wait(self) -> None:
         """Collects pending insert acknowledgements; raises the first error."""
+    def set_compression(self, level: int) -> None:
+        """zstd level of inserts: 0 sends plain arrays; others (1 by default)
+        pack them for servers of protocol version 3 or later."""
+    @property
+    def compression(self) -> int: ...
+    @property
+    def bytes_sent(self) -> int:
+        """Bytes written to the socket by this client so far."""
     @property
     def pending(self) -> int:
         """Inserts sent but not yet acknowledged."""
