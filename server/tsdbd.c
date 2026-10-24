@@ -682,9 +682,11 @@ static void handle(req *r)
                   : tsdb_insert_series_values(db, s, ts, &col, n);
         break;
     }
-    case TSDB_OP_QUERY_VALUES: {
+    case TSDB_OP_QUERY_VALUES:
+    case TSDB_OP_QUERY_LTTB: { /* the same chunks: LTTB's points are rows of the series */
+        bool lttb = r->op == TSDB_OP_QUERY_LTTB;
         values_out o = {c, r->id, 0, 0, NULL, NULL, 0, false};
-        if (len != 20 && len != 29) {
+        if (lttb ? len != 28 : len != 20 && len != 29) {
             values_flush(&o, true, TSDB_ERR_INVALID);
             return;
         }
@@ -694,6 +696,9 @@ static void handle(req *r)
         memcpy(&s, p, 4);
         memcpy(&start, p + 4, 8);
         memcpy(&end, p + 12, 8);
+        uint64_t threshold = 0;
+        if (lttb)
+            memcpy(&threshold, p + 20, 8);
         if (len == 29) {
             uint64_t lim;
             q.order = p[20] ? TSDB_DESC : TSDB_ASC;
@@ -713,7 +718,12 @@ static void handle(req *r)
             values_flush(&o, true, TSDB_ERR_NOMEM);
             return;
         }
-        rc = tsdb_query_values(db, s, start, end, &q, values_cb, &o);
+        if (!lttb)
+            rc = tsdb_query_values(db, s, start, end, &q, values_cb, &o);
+        else if (threshold > SIZE_MAX)
+            rc = TSDB_ERR_INVALID;
+        else
+            rc = tsdb_query_lttb(db, s, start, end, (size_t)threshold, values_cb, &o);
         if (!o.gone)
             values_flush(&o, true, rc); /* the rest of the rows, or the error */
         free(o.ts);
@@ -872,7 +882,8 @@ static void *worker_main(void *arg)
         pthread_mutex_unlock(&work_lock);
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
         if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_AGG || r->op == TSDB_OP_QUERY_GROUP ||
-            r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS || r->op == TSDB_OP_QUERY_BOUNDS) {
+            r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS || r->op == TSDB_OP_QUERY_BOUNDS ||
+            r->op == TSDB_OP_QUERY_LTTB) {
             tsdb_query_stats st;
             tsdb_last_query_stats(&st); /* this worker ran it */
             pthread_mutex_lock(&r->c->lock);

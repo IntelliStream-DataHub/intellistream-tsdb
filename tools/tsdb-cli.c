@@ -16,6 +16,7 @@ static void usage(void)
             "                                     new series are float32)\n"
             "  query <series> <start> <end> [raw|count|sum|min|max|avg|all] [group] [--tz ZONE]\n"
             "        [--desc] [--limit N]         newest first; at most N rows or buckets\n"
+            "  query <series> <start> <end> lttb N  N points that keep the shape (for charts)\n"
             "  create <series> [path] [--type T]  create a series of type T (float32, float64, int64,\n"
             "                                     bool, state), in volume <path> if given\n"
             "  series                             list series (type and volume)\n"
@@ -356,6 +357,20 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     if (strcmp(mode, "raw") == 0) {
         raw_out o = {stdout, 0, db, id};
         if ((rc = tsdb_query_values(db, id, start, end, &q, print_raw, &o)) != 0)
+            die("query", rc);
+        print_stats("rows");
+        return 0;
+    }
+    if (strcmp(mode, "lttb") == 0) { /* the points that keep the shape, printed like raw */
+        char *e = NULL;
+        /* digits only: strtoull would take "-1" as the largest number */
+        unsigned long long n = npos > 4 && pos[4][0] >= '0' && pos[4][0] <= '9' ? strtoull(pos[4], &e, 10) : 0;
+        if (!e || *e || n < 3) {
+            fprintf(stderr, "tsdb: lttb needs a number of points, at least 3\n");
+            return 1;
+        }
+        raw_out o = {stdout, 0, db, id};
+        if ((rc = tsdb_query_lttb(db, id, start, end, (size_t)n, print_raw, &o)) != 0)
             die("query", rc);
         print_stats("rows");
         return 0;
