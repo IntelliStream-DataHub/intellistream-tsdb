@@ -56,6 +56,12 @@ $(B)/%.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 # simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
 $(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
+# Its lanes start at zero (arrays of 16 and 32 doubles): GCC's generic tuning (the dist build) clears 33 to 8192
+# known bytes with `rep stosq`, whose startup (some 30 cycles) was a third of a short run's fold (fold-bench --rows
+# 32, sse kernels); -march=native picks vector stores itself. Vector stores up to 512 bytes, memset beyond.
+MEMSET_FLAG := $(shell $(CC) -mmemset-strategy=vector_loop:512:noalign,libcall:-1:noalign -E -x c /dev/null \
+                 >/dev/null 2>&1 && echo -mmemset-strategy=vector_loop:512:noalign,libcall:-1:noalign)
+$(B)/simd.o: override CFLAGS += $(MEMSET_FLAG)
 
 $(B)/%.base.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -DTSDB_LV=base -c -o $@ $<

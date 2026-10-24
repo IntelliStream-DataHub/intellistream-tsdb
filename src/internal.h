@@ -345,13 +345,16 @@ static inline void agg_combine(agg_state *a, agg_dev *ax, const agg_state *b, co
  * m2 into x (a second pass over the values). Queries that do not ask for the spread pass NULL: m2 and the
  * sums of squares are the cost of the spread, and a query of tiny buckets would pay it on every row. */
 extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *x);
-/* The lanes of simd.c's float kernels (their order of additions). A run of fewer than SIMD_SHORT values goes to
- * simd_small_*: the same bits as the kernels at a fraction of their fixed cost; values.c picks. */
+/* The lanes of simd.c's float kernels (their order of additions). A run of fewer than simd_short values goes to
+ * simd_small_*: the same bits as the kernels at a fraction of their fixed cost; values.c picks. simd_short is
+ * SIMD_SHORT (the scalar short path's limit: the float32 lanes taken 16 at a time) or, where simd_small_* are the
+ * SSE/AVX kernels of any length, the length from which the set's wider kernels win. */
 #define SIMD_LANES_F32 32
 #define SIMD_LANES_F64 16
 #define SIMD_SHORT 32
-void simd_small_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
-void simd_small_f64(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
+extern size_t simd_short;
+extern void (*simd_small_f32)(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
+extern void (*simd_small_f64)(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
 /* the same with nulls: `nulls` of the n slots hold the type's null (0: none, the kernel above) */
 extern void (*simd_fold_f32)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);
 extern void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);

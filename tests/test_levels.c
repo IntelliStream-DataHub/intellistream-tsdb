@@ -340,7 +340,7 @@ typedef int (*dec_fn)(const uint8_t *, size_t, size_t, void *);
 static uint8_t *buf, *dec;
 #define BUF(n) ((n) * 16 + 4096)
 
-/* A run shorter than SIMD_SHORT takes simd_small_* (values.c): it must give the bits of the lane kernels of the
+/* A run shorter than simd_short takes simd_small_* (values.c): it must give the bits of the lane kernels of the
  * level, which it skips, with and without the spread and the search for nulls. */
 static void short_run(const input *x, size_t m)
 {
@@ -450,7 +450,7 @@ static void run(rec *r, codec_ctx *c)
         }
         /* aggregates: whole, every short prefix (the kernels' tails, the short runs), and the statistics parts
          * store */
-        for (size_t m = 0; m <= x->n; m = m < 40 ? m + 1 : m == x->n ? m + 1 : x->n) {
+        for (size_t m = 0; m <= x->n; m = m < 66 ? m + 1 : m == x->n ? m + 1 : x->n) {
             struct {
                 agg_state a;
                 agg_dev x;
@@ -474,7 +474,7 @@ static void run(rec *r, codec_ctx *c)
             memset(&a, 0, sizeof a);
             agg_from_granule(x->type, &g, &a.a, &a.x);
             put(r, "agg_from_granule", x->name, &a, sizeof a);
-            if (m < SIMD_SHORT && (x->type == TSDB_FLOAT32 || x->type == TSDB_FLOAT64))
+            if (m < simd_short && (x->type == TSDB_FLOAT32 || x->type == TSDB_FLOAT64))
                 short_run(x, m);
             for (int sp = 0; m && g.nulls == 0 && sp < 2; sp++) { /* queries without and with the spread */
                 memset(&a, 0, sizeof a);

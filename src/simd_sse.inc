@@ -3,174 +3,458 @@
  * (KSUF avx: Sandy Bridge and Ivy Bridge, the same code VEX-encoded). AVX has 256-bit float operations but no
  * 256-bit integer ones, and these kernels are mostly integer work (int64 sums in 32-bit halves, bool and state
  * codes, timestamps): split into 128-bit halves and joined again, a 256-bit version would add more shuffles than
- * it saves. The float32 and float64 folds, which are float work, take simd_avx.inc on AVX; here they are built
- * for SSE only (KS_FLOAT). Every kernel keeps simd.c's lanes and order of float additions, so the results are the
- * scalar code's bits; the integer results are exact in any order.
+ * it saves. The AVX set takes simd_avx.inc's 256-bit float32 and float64 folds for long runs and these for short
+ * ones. Every kernel keeps simd.c's lanes and order of float additions, so the results are the scalar code's
+ * bits; the integer results are exact in any order.
  *
- * Defined by the includer: KSUF (the name suffix), KTARGET (the target attribute), KS_FLOAT (1 or 0).
+ * Defined by the includer: KSUF (the name suffix), KTARGET (the target attribute).
  */
 #define KCAT_(a, b) a##_##b
 #define KCAT(a, b) KCAT_(a, b)
 #define KN(f) KCAT(f, KSUF)
 #define KI static inline __attribute__((target(KTARGET), always_inline))
-#define KF __attribute__((target(KTARGET))) static
+#define KF __attribute__((target(KTARGET), unused)) static
 
-#if KS_FLOAT
-/* float32: the 32 lanes as 16 vectors of two doubles (lanes 2r, 2r + 1) for the sums and the deviations, 8 of
- * four floats (lanes 4q .. 4q + 3) for min and max */
-KI void KN(dev)(const float *v, size_t n, uint64_t c, double s, agg_state *a, agg_dev *dv, const bool nl)
+/*
+ * float32 and float64. The lanes stay in registers to the end: a last partial group goes into its vectors under
+ * a mask of the lanes it fills (an empty lane adds +0.0 to its sum and an all-ones NaN to min and max, which
+ * MINPD/MAXPD pass over: the scalar code's untouched lane), and the halving runs on the vectors. So a short run,
+ * a bucket of a few rows, costs little more than its values, and these also serve values.c's short runs
+ * (KN(small_*), counting the nulls on the way; the AVX set's 256-bit kernels keep the long ones). Lanes and
+ * order as in simd.c: float64 16 lanes as 8 vectors of two (lanes 2q, 2q + 1); float32 32 lanes as 16 vectors of
+ * two doubles (lanes 2r, 2r + 1) for the sums and the deviations, 8 of four floats (lanes 4q .. 4q + 3) for min
+ * and max.
+ */
+
+/* values v[i + j] for lanes j < k of a vector of four floats (1 <= k <= 3), the others +0.0; without reading on */
+KI __m128 KN(part_ps)(const float *p, size_t k)
 {
-    if (!c)
-        return;
-    dev_lanes l;
-    double m = s / (double)c;
-    const __m128d mm = _mm_set1_pd(m);
-    const __m128i nv = _mm_set1_epi32((int)NULL_F32);
-    __m128d d1[16], d2[16];
-    for (int r = 0; r < 16; r++)
-        d1[r] = d2[r] = _mm_setzero_pd();
-    size_t i = 0;
-    for (; i + LANES <= n; i += LANES)
-        for (int q = 0; q < 8; q++) {
-            __m128 x = _mm_loadu_ps(v + i + 4 * q);
-            __m128d lo = _mm_sub_pd(_mm_cvtps_pd(x), mm), hi = _mm_sub_pd(_mm_cvtps_pd(_mm_movehl_ps(x, x)), mm);
-            if (nl) { /* a null adds +0.0 to its lane: see the top of simd.c */
-                __m128i e = _mm_cmpeq_epi32(_mm_castps_si128(x), nv);
-                lo = _mm_andnot_pd(_mm_castsi128_pd(_mm_unpacklo_epi32(e, e)), lo);
-                hi = _mm_andnot_pd(_mm_castsi128_pd(_mm_unpackhi_epi32(e, e)), hi);
-            }
-            d1[2 * q] = _mm_add_pd(d1[2 * q], lo);
-            d2[2 * q] = _mm_add_pd(d2[2 * q], _mm_mul_pd(lo, lo));
-            d1[2 * q + 1] = _mm_add_pd(d1[2 * q + 1], hi);
-            d2[2 * q + 1] = _mm_add_pd(d2[2 * q + 1], _mm_mul_pd(hi, hi));
-        }
-    for (int r = 0; r < 16; r++) {
-        _mm_storeu_pd(l.d1 + 2 * r, d1[r]);
-        _mm_storeu_pd(l.d2 + 2 * r, d2[r]);
-    }
-    dev_finish(&l, v, i, n, m, c, s, a, dv, nl, LANES);
+    if (k == 1)
+        return _mm_load_ss(p);
+    __m128 x = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)p));
+    return k == 2 ? x : _mm_movelh_ps(x, _mm_load_ss(p + 2));
 }
 
-KI void KN(agg_impl)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl)
+/* all ones in the lanes from k on */
+KI __m128i KN(beyond)(size_t k) { return _mm_cmpgt_epi32(_mm_setr_epi32(0, 1, 2, 3), _mm_set1_epi32((int)k - 1)); }
+
+/* pass one over four floats at p (part: k of them, the lanes from k on past the run) into group q */
+#define K32_SUM(p, k, part, q)                                                                                      \
+    do {                                                                                                           \
+        __m128 x_ = (part) ? KN(part_ps)(p, k) : _mm_loadu_ps(p), xm_ = x_, xs_ = x_;                             \
+        if (part)                                                                                                  \
+            xm_ = _mm_or_ps(x_, _mm_castsi128_ps(KN(beyond)(k)));                                                  \
+        if (nl) {                                                                                                  \
+            __m128i e_ = _mm_cmpeq_epi32(_mm_castps_si128(x_), nv);                                                \
+            xs_ = _mm_andnot_ps(_mm_castsi128_ps(e_), x_);                                                         \
+            if (cnt)                                                                                               \
+                nc = _mm_sub_epi32(nc, e_);                                                                        \
+        }                                                                                                          \
+        s[2 * (q)] = _mm_add_pd(s[2 * (q)], _mm_cvtps_pd(xs_));                                                   \
+        s[2 * (q) + 1] = _mm_add_pd(s[2 * (q) + 1], _mm_cvtps_pd(_mm_movehl_ps(xs_, xs_)));                       \
+        mn[q] = _mm_min_ps(xm_, mn[q]);                                                                            \
+        mx[q] = _mm_max_ps(xm_, mx[q]);                                                                            \
+    } while (0)
+
+/* pass two: a null or a lane past the run adds +0.0 (see the top of simd.c) */
+#define K32_DEV(p, k, part, q)                                                                                      \
+    do {                                                                                                           \
+        __m128 x_ = (part) ? KN(part_ps)(p, k) : _mm_loadu_ps(p);                                                 \
+        __m128d lo_ = _mm_sub_pd(_mm_cvtps_pd(x_), mm), hi_ = _mm_sub_pd(_mm_cvtps_pd(_mm_movehl_ps(x_, x_)), mm); \
+        if (nl || (part)) {                                                                                        \
+            __m128i e_ = (part) ? KN(beyond)(k) : _mm_setzero_si128();                                             \
+            if (nl)                                                                                                \
+                e_ = _mm_or_si128(e_, _mm_cmpeq_epi32(_mm_castps_si128(x_), nv));                                  \
+            lo_ = _mm_andnot_pd(_mm_castsi128_pd(_mm_unpacklo_epi32(e_, e_)), lo_);                                \
+            hi_ = _mm_andnot_pd(_mm_castsi128_pd(_mm_unpackhi_epi32(e_, e_)), hi_);                                \
+        }                                                                                                          \
+        d1[2 * (q)] = _mm_add_pd(d1[2 * (q)], lo_);                                                               \
+        d2[2 * (q)] = _mm_add_pd(d2[2 * (q)], _mm_mul_pd(lo_, lo_));                                              \
+        d1[2 * (q) + 1] = _mm_add_pd(d1[2 * (q) + 1], hi_);                                                       \
+        d2[2 * (q) + 1] = _mm_add_pd(d2[2 * (q) + 1], _mm_mul_pd(hi_, hi_));                                      \
+    } while (0)
+
+/* G groups of four lanes in use (8: all 32, with whole groups of 32 values; fewer: a run of at most 4G values,
+ * whose lanes from 4G on would stay empty and change nothing in the halving). G is a constant in each copy, so
+ * the loops unroll and the lanes stay in registers. */
+KI void KN(f32_core)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl,
+                     const bool cnt, const int G)
 {
     if (!n)
         return;
-    lanes l;
-    lanes_init(&l, a);
     const __m128i nv = _mm_set1_epi32((int)NULL_F32);
     __m128d s[16];
     __m128 mn[8], mx[8];
-    for (int r = 0; r < 16; r++)
-        s[r] = _mm_setzero_pd();
-    for (int q = 0; q < 8; q++) {
-        mn[q] = _mm_loadu_ps(l.mn + 4 * q);
-        mx[q] = _mm_loadu_ps(l.mx + 4 * q);
+    __m128i nc = _mm_setzero_si128();
+    _Pragma("GCC unroll 8") for (int q = 0; q < G; q++)
+    {
+        s[2 * q] = s[2 * q + 1] = _mm_setzero_pd();
+        mn[q] = _mm_set1_ps((float)a->min); /* the state holds float32 values here */
+        mx[q] = _mm_set1_ps((float)a->max);
     }
     size_t i = 0;
-    for (; i + LANES <= n; i += LANES)
-        for (int q = 0; q < 8; q++) {
-            __m128 x = _mm_loadu_ps(v + i + 4 * q), xs = x;
-            if (nl)
-                xs = _mm_andnot_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(x), nv)), x);
-            s[2 * q] = _mm_add_pd(s[2 * q], _mm_cvtps_pd(xs));
-            s[2 * q + 1] = _mm_add_pd(s[2 * q + 1], _mm_cvtps_pd(_mm_movehl_ps(xs, xs)));
-            mn[q] = _mm_min_ps(x, mn[q]);
-            mx[q] = _mm_max_ps(x, mx[q]);
-        }
-    for (int r = 0; r < 16; r++)
-        _mm_storeu_pd(l.s + 2 * r, s[r]);
-    for (int q = 0; q < 8; q++) {
-        _mm_storeu_ps(l.mn + 4 * q, mn[q]);
-        _mm_storeu_ps(l.mx + 4 * q, mx[q]);
+    if (G == 8)
+        for (; i + LANES <= n; i += LANES)
+            _Pragma("GCC unroll 8") for (int q = 0; q < 8; q++) K32_SUM(v + i + 4 * q, 4, false, q);
+    _Pragma("GCC unroll 8") for (int q = 0; q < G; q++)
+    {
+        size_t j = i + (size_t)(4 * q);
+        if (j + 4 <= n)
+            K32_SUM(v + j, 4, false, q);
+        else if (j < n)
+            K32_SUM(v + j, n - j, true, q);
     }
-    double sum = lanes_finish(&l, v, i, n, a, nl, LANES);
-    if (dv)
-        KN(dev)(v, n, n - nulls, sum, a, dv, nl);
-    else
-        sum_finish(n - nulls, sum, a);
-}
-
-KF void KN(agg)(const float *v, size_t n, agg_state *a, agg_dev *dv) { KN(agg_impl)(v, n, 0, a, dv, false); }
-
-KF void KN(fold_f32)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv)
-{
-    if (nulls)
-        KN(agg_impl)(v, n, nulls, a, dv, true);
-    else
-        KN(agg_impl)(v, n, 0, a, dv, false);
-}
-
-/* float64: the 16 lanes as 8 vectors of two (lanes 2q, 2q + 1) */
-KI void KN(dev64)(const double *v, size_t n, uint64_t c, double s, agg_state *a, agg_dev *dv, const bool nl)
-{
+    _Pragma("GCC unroll 8") for (int w = G; w >= 1; w /= 2)
+        _Pragma("GCC unroll 8") for (int r = 0; r < w; r++) s[r] = _mm_add_pd(s[r], s[r + w]);
+    double sum = _mm_cvtsd_f64(_mm_add_sd(s[0], _mm_unpackhi_pd(s[0], s[0])));
+    _Pragma("GCC unroll 8") for (int w = G / 2; w >= 1; w /= 2)
+        _Pragma("GCC unroll 8") for (int q = 0; q < w; q++)
+    {
+        mn[q] = _mm_min_ps(mn[q + w], mn[q]);
+        mx[q] = _mm_max_ps(mx[q + w], mx[q]);
+    }
+    __m128 m0 = _mm_min_ps(_mm_movehl_ps(mn[0], mn[0]), mn[0]), x0 = _mm_max_ps(_mm_movehl_ps(mx[0], mx[0]), mx[0]);
+    float lo = _mm_cvtss_f32(_mm_min_ss(_mm_shuffle_ps(m0, m0, 1), m0));
+    float hi = _mm_cvtss_f32(_mm_max_ss(_mm_shuffle_ps(x0, x0, 1), x0));
+    a->min = lo < a->min ? lo : a->min;
+    a->max = hi > a->max ? hi : a->max;
+    if (cnt) {
+        nc = _mm_add_epi32(nc, _mm_shuffle_epi32(nc, _MM_SHUFFLE(1, 0, 3, 2)));
+        nc = _mm_add_epi32(nc, _mm_shuffle_epi32(nc, _MM_SHUFFLE(2, 3, 0, 1)));
+        nulls = (uint32_t)_mm_cvtsi128_si32(nc);
+    }
+    uint64_t c = n - nulls;
+    if (!dv) {
+        sum_finish(c, sum, a);
+        return;
+    }
     if (!c)
         return;
-    dev64 l;
-    double m = s / (double)c;
-    const __m128d mm = _mm_set1_pd(m);
-    const __m128i nv = _mm_set1_epi64x((long long)NULL_F64);
-    __m128d d1[8], d2[8];
-    for (int q = 0; q < 8; q++)
-        d1[q] = d2[q] = _mm_setzero_pd();
-    size_t i = 0;
-    for (; i + L64 <= n; i += L64)
-        for (int q = 0; q < 8; q++) {
-            __m128d x = _mm_loadu_pd(v + i + 2 * q), d = _mm_sub_pd(x, mm);
-            if (nl)
-                d = _mm_andnot_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_castpd_si128(x), nv)), d);
-            d1[q] = _mm_add_pd(d1[q], d);
-            d2[q] = _mm_add_pd(d2[q], _mm_mul_pd(d, d));
-        }
-    for (int q = 0; q < 8; q++) {
-        _mm_storeu_pd(l.d1 + 2 * q, d1[q]);
-        _mm_storeu_pd(l.d2 + 2 * q, d2[q]);
+    const __m128d mm = _mm_set1_pd(sum / (double)c);
+    __m128d d1[16], d2[16];
+    _Pragma("GCC unroll 16") for (int r = 0; r < 2 * G; r++) d1[r] = d2[r] = _mm_setzero_pd();
+    i = 0;
+    if (G == 8)
+        for (; i + LANES <= n; i += LANES)
+            _Pragma("GCC unroll 8") for (int q = 0; q < 8; q++) K32_DEV(v + i + 4 * q, 4, false, q);
+    _Pragma("GCC unroll 8") for (int q = 0; q < G; q++)
+    {
+        size_t j = i + (size_t)(4 * q);
+        if (j + 4 <= n)
+            K32_DEV(v + j, 4, false, q);
+        else if (j < n)
+            K32_DEV(v + j, n - j, true, q);
     }
-    dev64_finish(&l, v, i, n, m, c, s, a, dv, nl, L64);
+    _Pragma("GCC unroll 8") for (int w = G; w >= 1; w /= 2)
+        _Pragma("GCC unroll 8") for (int r = 0; r < w; r++)
+    {
+        d1[r] = _mm_add_pd(d1[r], d1[r + w]);
+        d2[r] = _mm_add_pd(d2[r], d2[r + w]);
+    }
+    double r1 = _mm_cvtsd_f64(_mm_add_sd(d1[0], _mm_unpackhi_pd(d1[0], d1[0])));
+    double r2 = _mm_cvtsd_f64(_mm_add_sd(d2[0], _mm_unpackhi_pd(d2[0], d2[0])));
+    agg_add_run(a, dv, c, sum, r1, r2);
+    a->sum = canon_nan(a->sum);
 }
 
-KI void KN(agg64_impl)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl)
+/* float64: two lanes at p (part: lane 1 is past the run) into pair q */
+#define K64_SUM(p, part, q)                                                                                         \
+    do {                                                                                                           \
+        __m128d x_ = (part) ? _mm_load_sd(p) : _mm_loadu_pd(p), xm_ = x_, xs_ = x_;                               \
+        if (part)                                                                                                  \
+            xm_ = _mm_or_pd(x_, _mm_castsi128_pd(_mm_set_epi64x(-1, 0)));                                          \
+        if (nl) {                                                                                                  \
+            __m128i e_ = _mm_cmpeq_epi64(_mm_castpd_si128(x_), nv);                                                \
+            xs_ = _mm_andnot_pd(_mm_castsi128_pd(e_), x_);                                                         \
+            if (cnt)                                                                                               \
+                nc = _mm_sub_epi64(nc, e_);                                                                        \
+        }                                                                                                          \
+        s[q] = _mm_add_pd(s[q], xs_);                                                                              \
+        mn[q] = _mm_min_pd(xm_, mn[q]);                                                                            \
+        mx[q] = _mm_max_pd(xm_, mx[q]);                                                                            \
+    } while (0)
+
+#define K64_DEV(p, part, q)                                                                                         \
+    do {                                                                                                           \
+        __m128d x_ = (part) ? _mm_load_sd(p) : _mm_loadu_pd(p), d_ = _mm_sub_pd(x_, mm);                          \
+        if (nl)                                                                                                    \
+            d_ = _mm_andnot_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_castpd_si128(x_), nv)), d_);                   \
+        if (part)                                                                                                  \
+            d_ = _mm_move_sd(_mm_setzero_pd(), d_);                                                                \
+        d1[q] = _mm_add_pd(d1[q], d_);                                                                             \
+        d2[q] = _mm_add_pd(d2[q], _mm_mul_pd(d_, d_));                                                             \
+    } while (0)
+
+/* P pairs of lanes in use (8: all 16; fewer: a run of at most 2P values), as G above */
+KI void KN(f64_core)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv, const bool nl,
+                     const bool cnt, const int P)
 {
     if (!n)
         return;
-    lanes64 l;
-    lanes64_init(&l, a);
     const __m128i nv = _mm_set1_epi64x((long long)NULL_F64);
     __m128d s[8], mn[8], mx[8];
-    for (int q = 0; q < 8; q++) {
+    __m128i nc = _mm_setzero_si128();
+    _Pragma("GCC unroll 8") for (int q = 0; q < P; q++)
+    {
         s[q] = _mm_setzero_pd();
-        mn[q] = _mm_loadu_pd(l.mn + 2 * q);
-        mx[q] = _mm_loadu_pd(l.mx + 2 * q);
+        mn[q] = _mm_set1_pd(a->min);
+        mx[q] = _mm_set1_pd(a->max);
     }
     size_t i = 0;
-    for (; i + L64 <= n; i += L64)
-        for (int q = 0; q < 8; q++) {
-            __m128d x = _mm_loadu_pd(v + i + 2 * q), xs = x;
-            if (nl)
-                xs = _mm_andnot_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_castpd_si128(x), nv)), x);
-            s[q] = _mm_add_pd(s[q], xs);
-            mn[q] = _mm_min_pd(x, mn[q]);
-            mx[q] = _mm_max_pd(x, mx[q]);
-        }
-    for (int q = 0; q < 8; q++) {
-        _mm_storeu_pd(l.s + 2 * q, s[q]);
-        _mm_storeu_pd(l.mn + 2 * q, mn[q]);
-        _mm_storeu_pd(l.mx + 2 * q, mx[q]);
+    if (P == 8)
+        for (; i + L64 <= n; i += L64)
+            _Pragma("GCC unroll 8") for (int q = 0; q < 8; q++) K64_SUM(v + i + 2 * q, false, q);
+    _Pragma("GCC unroll 8") for (int q = 0; q < P; q++)
+    {
+        size_t j = i + (size_t)(2 * q);
+        if (j + 2 <= n)
+            K64_SUM(v + j, false, q);
+        else if (j < n)
+            K64_SUM(v + j, true, q);
     }
-    double sum = lanes64_finish(&l, v, i, n, a, nl, L64);
-    if (dv)
-        KN(dev64)(v, n, n - nulls, sum, a, dv, nl);
-    else
-        sum_finish(n - nulls, sum, a);
+    _Pragma("GCC unroll 8") for (int w = P / 2; w >= 1; w /= 2)
+        _Pragma("GCC unroll 8") for (int q = 0; q < w; q++)
+    {
+        s[q] = _mm_add_pd(s[q], s[q + w]);
+        mn[q] = _mm_min_pd(mn[q + w], mn[q]);
+        mx[q] = _mm_max_pd(mx[q + w], mx[q]);
+    }
+    double sum = _mm_cvtsd_f64(_mm_add_sd(s[0], _mm_unpackhi_pd(s[0], s[0])));
+    double lo = _mm_cvtsd_f64(_mm_min_sd(_mm_unpackhi_pd(mn[0], mn[0]), mn[0]));
+    double hi = _mm_cvtsd_f64(_mm_max_sd(_mm_unpackhi_pd(mx[0], mx[0]), mx[0]));
+    a->min = lo < a->min ? lo : a->min;
+    a->max = hi > a->max ? hi : a->max;
+    if (cnt)
+        nulls = (size_t)(_mm_cvtsi128_si64(nc) + _mm_extract_epi64(nc, 1));
+    uint64_t c = n - nulls;
+    if (!dv) {
+        sum_finish(c, sum, a);
+        return;
+    }
+    if (!c)
+        return;
+    const __m128d mm = _mm_set1_pd(sum / (double)c);
+    __m128d d1[8], d2[8];
+    _Pragma("GCC unroll 8") for (int q = 0; q < P; q++) d1[q] = d2[q] = _mm_setzero_pd();
+    i = 0;
+    if (P == 8)
+        for (; i + L64 <= n; i += L64)
+            _Pragma("GCC unroll 8") for (int q = 0; q < 8; q++) K64_DEV(v + i + 2 * q, false, q);
+    _Pragma("GCC unroll 8") for (int q = 0; q < P; q++)
+    {
+        size_t j = i + (size_t)(2 * q);
+        if (j + 2 <= n)
+            K64_DEV(v + j, false, q);
+        else if (j < n)
+            K64_DEV(v + j, true, q);
+    }
+    _Pragma("GCC unroll 8") for (int w = P / 2; w >= 1; w /= 2)
+        _Pragma("GCC unroll 8") for (int q = 0; q < w; q++)
+    {
+        d1[q] = _mm_add_pd(d1[q], d1[q + w]);
+        d2[q] = _mm_add_pd(d2[q], d2[q + w]);
+    }
+    double r1 = _mm_cvtsd_f64(_mm_add_sd(d1[0], _mm_unpackhi_pd(d1[0], d1[0])));
+    double r2 = _mm_cvtsd_f64(_mm_add_sd(d2[0], _mm_unpackhi_pd(d2[0], d2[0])));
+    agg_add_run(a, dv, c, sum, r1, r2);
+    a->sum = canon_nan(a->sum);
 }
 
-KF void KN(fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv)
+/* values.c's short runs: pairs q and q + H (H = P / 2) built side by side, each over its values j, j + 16, ...,
+ * and added at once (the first halving), so that 3H vectors stay live rather than 3P: SSE has 16 registers,
+ * and the 24 accumulators of f64_core spill. The same lanes and order. */
+/* the pair at v[j] (chk: it may hold one value only, as the last of the run) into sv, nv_, xv; and the pairs of
+ * lanes q: v[2q] (f0: known to be a whole pair) and, with more, the rows after it */
+#define K64_X(j, sv, nv_, xv, chk)                                                                                  \
+    do {                                                                                                           \
+        bool p_ = (chk) && (j) + 2 > n;                                                                            \
+        __m128d x_ = p_ ? _mm_load_sd(v + (j)) : _mm_loadu_pd(v + (j)), xm_ = x_, xs_ = x_;                       \
+        if (p_)                                                                                                    \
+            xm_ = _mm_or_pd(x_, _mm_castsi128_pd(_mm_set_epi64x(-1, 0)));                                          \
+        if (nl) {                                                                                                  \
+            __m128i e_ = _mm_cmpeq_epi64(_mm_castpd_si128(x_), nul);                                               \
+            xs_ = _mm_andnot_pd(_mm_castsi128_pd(e_), x_);                                                         \
+            nc = _mm_sub_epi64(nc, e_);                                                                            \
+        }                                                                                                          \
+        sv = _mm_add_pd(sv, xs_);                                                                                  \
+        nv_ = _mm_min_pd(xm_, nv_);                                                                                \
+        xv = _mm_max_pd(xm_, xv);                                                                                  \
+    } while (0)
+
+#define K64_PAIR(q, sv, nv_, xv, f0, more)                                                                          \
+    do {                                                                                                           \
+        size_t j_ = (size_t)(2 * (q));                                                                             \
+        if (f0)                                                                                                    \
+            K64_X(j_, sv, nv_, xv, false);                                                                         \
+        else if (j_ < n)                                                                                           \
+            K64_X(j_, sv, nv_, xv, true);                                                                          \
+        if (more)                                                                                                  \
+            for (j_ += L64; j_ < n; j_ += L64)                                                                     \
+                K64_X(j_, sv, nv_, xv, true);                                                                      \
+    } while (0)
+
+#define K64_XDEV(j, d1v, d2v, chk)                                                                                  \
+    do {                                                                                                           \
+        bool p_ = (chk) && (j) + 2 > n;                                                                            \
+        __m128d x_ = p_ ? _mm_load_sd(v + (j)) : _mm_loadu_pd(v + (j)), d_ = _mm_sub_pd(x_, mm);                  \
+        if (nl)                                                                                                    \
+            d_ = _mm_andnot_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(_mm_castpd_si128(x_), nul)), d_);                  \
+        if (p_)                                                                                                    \
+            d_ = _mm_move_sd(_mm_setzero_pd(), d_);                                                                \
+        d1v = _mm_add_pd(d1v, d_);                                                                                 \
+        d2v = _mm_add_pd(d2v, _mm_mul_pd(d_, d_));                                                                 \
+    } while (0)
+
+#define K64_PAIR_DEV(q, d1v, d2v, f0, more)                                                                         \
+    do {                                                                                                           \
+        size_t j_ = (size_t)(2 * (q));                                                                             \
+        if (f0)                                                                                                    \
+            K64_XDEV(j_, d1v, d2v, false);                                                                         \
+        else if (j_ < n)                                                                                           \
+            K64_XDEV(j_, d1v, d2v, true);                                                                          \
+        if (more)                                                                                                  \
+            for (j_ += L64; j_ < n; j_ += L64)                                                                     \
+                K64_XDEV(j_, d1v, d2v, true);                                                                      \
+    } while (0)
+
+/* P pairs of lanes in use: 1 (n <= 2), 2 (n <= 4), 4 (n <= 8) or 8; M: more than one row (n > 16). The pairs
+ * of the first half hold whole pairs from P = 2 on, and with M those of the second half too. */
+KI void KN(f64_short)(const double *v, size_t n, agg_state *a, agg_dev *dv, const bool nl, const int P, const bool M)
+{
+    size_t nulls = 0;
+    const int H = P > 1 ? P / 2 : 1;
+    const __m128i nul = _mm_set1_epi64x((long long)NULL_F64);
+    const __m128d lo0 = _mm_set1_pd(a->min), hi0 = _mm_set1_pd(a->max);
+    __m128d s[4], mn[4], mx[4];
+    __m128i nc = _mm_setzero_si128();
+    _Pragma("GCC unroll 4") for (int q = 0; q < H; q++)
+    {
+        __m128d sa = _mm_setzero_pd(), na = lo0, xa = hi0;
+        K64_PAIR(q, sa, na, xa, P > 1, M);
+        if (P > 1) {
+            __m128d sb = _mm_setzero_pd(), nb = lo0, xb = hi0;
+            K64_PAIR(q + H, sb, nb, xb, M, M);
+            sa = _mm_add_pd(sa, sb);
+            na = _mm_min_pd(nb, na);
+            xa = _mm_max_pd(xb, xa);
+        }
+        s[q] = sa;
+        mn[q] = na;
+        mx[q] = xa;
+    }
+    _Pragma("GCC unroll 4") for (int w = H / 2; w >= 1; w /= 2)
+        _Pragma("GCC unroll 4") for (int q = 0; q < w; q++)
+    {
+        s[q] = _mm_add_pd(s[q], s[q + w]);
+        mn[q] = _mm_min_pd(mn[q + w], mn[q]);
+        mx[q] = _mm_max_pd(mx[q + w], mx[q]);
+    }
+    double sum = _mm_cvtsd_f64(_mm_add_sd(s[0], _mm_unpackhi_pd(s[0], s[0])));
+    double lo = _mm_cvtsd_f64(_mm_min_sd(_mm_unpackhi_pd(mn[0], mn[0]), mn[0]));
+    double hi = _mm_cvtsd_f64(_mm_max_sd(_mm_unpackhi_pd(mx[0], mx[0]), mx[0]));
+    a->min = lo < a->min ? lo : a->min;
+    a->max = hi > a->max ? hi : a->max;
+    if (nl)
+        nulls = (size_t)(_mm_cvtsi128_si64(nc) + _mm_extract_epi64(nc, 1));
+    uint64_t c = n - nulls;
+    if (!dv) {
+        sum_finish(c, sum, a);
+        return;
+    }
+    if (!c)
+        return;
+    const __m128d mm = _mm_set1_pd(sum / (double)c);
+    __m128d d1[4], d2[4];
+    _Pragma("GCC unroll 4") for (int q = 0; q < H; q++)
+    {
+        __m128d a1 = _mm_setzero_pd(), a2 = _mm_setzero_pd();
+        K64_PAIR_DEV(q, a1, a2, P > 1, M);
+        if (P > 1) {
+            __m128d b1 = _mm_setzero_pd(), b2 = _mm_setzero_pd();
+            K64_PAIR_DEV(q + H, b1, b2, M, M);
+            a1 = _mm_add_pd(a1, b1);
+            a2 = _mm_add_pd(a2, b2);
+        }
+        d1[q] = a1;
+        d2[q] = a2;
+    }
+    _Pragma("GCC unroll 4") for (int w = H / 2; w >= 1; w /= 2)
+        _Pragma("GCC unroll 4") for (int q = 0; q < w; q++)
+    {
+        d1[q] = _mm_add_pd(d1[q], d1[q + w]);
+        d2[q] = _mm_add_pd(d2[q], d2[q + w]);
+    }
+    double r1 = _mm_cvtsd_f64(_mm_add_sd(d1[0], _mm_unpackhi_pd(d1[0], d1[0])));
+    double r2 = _mm_cvtsd_f64(_mm_add_sd(d2[0], _mm_unpackhi_pd(d2[0], d2[0])));
+    agg_add_run(a, dv, c, sum, r1, r2);
+    a->sum = canon_nan(a->sum);
+}
+
+/* the copies by the lanes a run of n values fills (a short run: fewer than the 32 or 16 lanes) */
+#define KBY_WIDTH(core, n, per, ...)                                                                               \
+    do {                                                                                                           \
+        if ((n) <= (per))                                                                                          \
+            core(__VA_ARGS__, 1);                                                                                  \
+        else if ((n) <= 2 * (per))                                                                                 \
+            core(__VA_ARGS__, 2);                                                                                  \
+        else if ((n) <= 4 * (per))                                                                                 \
+            core(__VA_ARGS__, 4);                                                                                  \
+        else                                                                                                       \
+            core(__VA_ARGS__, 8);                                                                                  \
+    } while (0)
+
+KF void KN(agg128)(const float *v, size_t n, agg_state *a, agg_dev *dv)
+{
+    KN(f32_core)(v, n, 0, a, dv, false, false, 8);
+}
+
+KF void KN(fold_f32_128)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv)
 {
     if (nulls)
-        KN(agg64_impl)(v, n, nulls, a, dv, true);
+        KN(f32_core)(v, n, nulls, a, dv, true, false, 8);
     else
-        KN(agg64_impl)(v, n, 0, a, dv, false);
+        KN(f32_core)(v, n, 0, a, dv, false, false, 8);
 }
-#endif /* KS_FLOAT */
+
+KF void KN(fold_f64_128)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv)
+{
+    if (nulls)
+        KN(f64_core)(v, n, nulls, a, dv, true, false, 8);
+    else
+        KN(f64_core)(v, n, 0, a, dv, false, false, 8);
+}
+
+KF void KN(small_f32)(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv)
+{
+    if (may_be_null)
+        KBY_WIDTH(KN(f32_core), n, 4, v, n, 0, a, dv, true, true);
+    else
+        KBY_WIDTH(KN(f32_core), n, 4, v, n, 0, a, dv, false, false);
+}
+
+#define K64_SHORT(nl)                                                                                               \
+    do {                                                                                                           \
+        if (n <= 2)                                                                                                \
+            KN(f64_short)(v, n, a, dv, nl, 1, false);                                                              \
+        else if (n <= 4)                                                                                           \
+            KN(f64_short)(v, n, a, dv, nl, 2, false);                                                              \
+        else if (n <= 8)                                                                                           \
+            KN(f64_short)(v, n, a, dv, nl, 4, false);                                                              \
+        else if (n <= L64)                                                                                         \
+            KN(f64_short)(v, n, a, dv, nl, 8, false);                                                              \
+        else                                                                                                       \
+            KN(f64_short)(v, n, a, dv, nl, 8, true);                                                               \
+    } while (0)
+
+KF void KN(small_f64)(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv)
+{
+    if (!n)
+        return;
+    if (may_be_null)
+        K64_SHORT(true);
+    else
+        K64_SHORT(false);
+}
 
 /* int64: as fold_i64_avx2 in vectors of two; per lane and block at most 2^27 values (x and y), as there */
 KI int64_t KN(hmin2)(__m128i x)
@@ -508,6 +792,16 @@ KF size_t KN(lttb)(int type, const int64_t *ts, const uint64_t *v, size_t n, int
     }
 }
 
+#undef K32_SUM
+#undef K32_DEV
+#undef K64_SUM
+#undef K64_DEV
+#undef K64_PAIR
+#undef K64_X
+#undef K64_XDEV
+#undef K64_SHORT
+#undef K64_PAIR_DEV
+#undef KBY_WIDTH
 #undef KF
 #undef KI
 #undef KN
@@ -515,4 +809,3 @@ KF size_t KN(lttb)(int type, const int64_t *ts, const uint64_t *v, size_t n, int
 #undef KCAT_
 #undef KSUF
 #undef KTARGET
-#undef KS_FLOAT

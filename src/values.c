@@ -33,7 +33,7 @@ static size_t count_null_f64(const uint64_t *v, size_t n)
  * Runs shorter than the lanes take simd_small_* (same bits, less fixed cost: buckets of a few rows). */
 static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
-    if (n < SIMD_SHORT)
+    if (n < simd_short)
         simd_small_f32(v, n, may_be_null, a, x);
     else
         simd_fold_f32(v, n, may_be_null ? count_null_f32((const uint32_t *)v, n) : 0, a, x);
@@ -41,7 +41,7 @@ static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, a
 
 static void fold_f64(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
-    if (n < SIMD_SHORT)
+    if (n < simd_short)
         simd_small_f64(v, n, may_be_null, a, x);
     else
         simd_fold_f64(v, n, may_be_null ? count_null_f64((const uint64_t *)v, n) : 0, a, x);

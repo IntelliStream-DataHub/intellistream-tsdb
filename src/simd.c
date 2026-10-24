@@ -413,7 +413,7 @@ SMALL_FOLD(small_f64, double, double, null_f64, 16)
     default: NAME##_k(v, n, a, dv, NL, 16, 2); break;                                                       \
     }
 
-void simd_small_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv)
+static void small_f32_scalar(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv)
 {
     if (!n)
         return;
@@ -423,7 +423,7 @@ void simd_small_f32(const float *v, size_t n, bool may_be_null, agg_state *a, ag
         SMALL_SWITCH(small_f32, false)
 }
 
-void simd_small_f64(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv)
+static void small_f64_scalar(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv)
 {
     if (!n)
         return;
@@ -1585,16 +1585,17 @@ __attribute__((target("avx512f,avx512dq"))) static size_t lttb_avx512(int type, 
 /* the 128-bit kernels: x86-64-v2 (SSE4.2), and the integer, TWA and LTTB ones VEX-encoded for AVX without AVX2 */
 #define KSUF sse
 #define KTARGET "sse4.2"
-#define KS_FLOAT 1
 #include "simd_sse.inc"
 #define KSUF avx
 #define KTARGET "avx"
-#define KS_FLOAT 0
 #include "simd_sse.inc"
 #endif
 
 /* points per call below which lttb_scalar is faster than the kernels (fold-bench: 8 points 0.6x, 16 on par) */
 #define LTTB_SMALL 16
+/* the SSE and AVX sets: runs shorter than this take simd_sse.inc's short-run kernels (small_*), whose fixed cost is
+ * lower than that of the long-run ones (and for AVX of its 256-bit ones): fold-bench --rows 32, 64 */
+#define AVX_SHORT 64
 
 static size_t (*simd_lttb)(int, const int64_t *, const uint64_t *, size_t, int64_t, double, double, double,
                            double) = lttb_scalar;
@@ -1612,6 +1613,9 @@ void (*simd_fold_f32)(const float *v, size_t n, size_t nulls, agg_state *a, agg_
 void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv) = fold_f64_scalar;
 void (*simd_fold_i64)(const int64_t *v, size_t n, agg_state *a, agg_dev *dx);
 void (*simd_fold_u32)(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx);
+void (*simd_small_f32)(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv) = small_f32_scalar;
+void (*simd_small_f64)(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv) = small_f64_scalar;
+size_t simd_short = SIMD_SHORT;
 static const char *simd_level = "scalar";
 
 const char *simd_name(void) { return simd_level; }
@@ -1660,6 +1664,9 @@ void simd_select(int level)
     void (*twa)(int, const int64_t *, const void *, size_t, twa_sums *) = twa_scalar;
     size_t (*lttb)(int, const int64_t *, const uint64_t *, size_t, int64_t, double, double, double, double) =
         lttb_scalar;
+    void (*sf32)(const float *, size_t, bool, agg_state *, agg_dev *) = small_f32_scalar;
+    void (*sf64)(const double *, size_t, bool, agg_state *, agg_dev *) = small_f64_scalar;
+    size_t shortn = SIMD_SHORT;
     const char *name = "scalar";
 #ifdef TSDB_X86
     static const char *const names[] = {"scalar", "sse", "avx", "avx2", "avx512"};
@@ -1704,6 +1711,9 @@ void simd_select(int level)
         f = agg_avx;
         f32 = fold_f32_avx;
         f64 = fold_f64_avx;
+        sf32 = small_f32_avx; /* the 128-bit kernels up to AVX_SHORT, then the 256-bit ones */
+        sf64 = small_f64_avx;
+        shortn = AVX_SHORT;
         i64 = fold_i64_avx;
         u32 = fold_u32_avx;
         twa = twa_avx;
@@ -1711,9 +1721,12 @@ void simd_select(int level)
         name = "avx";
         break;
     case 1:
-        f = agg_sse;
-        f32 = fold_f32_sse;
-        f64 = fold_f64_sse;
+        f = agg128_sse;
+        f32 = fold_f32_128_sse;
+        f64 = fold_f64_128_sse;
+        sf32 = small_f32_sse;
+        sf64 = small_f64_sse;
+        shortn = AVX_SHORT;
         i64 = fold_i64_sse;
         u32 = fold_u32_sse;
         twa = twa_sse;
@@ -1730,6 +1743,9 @@ void simd_select(int level)
     simd_fold_u32 = u32;
     simd_twa = twa;
     simd_lttb = lttb;
+    simd_small_f32 = sf32;
+    simd_small_f64 = sf64;
+    simd_short = shortn;
     simd_level = name;
 #ifdef TSDB_LEVELS
     snprintf(simd_desc, sizeof simd_desc, "%s, codecs x86-64-%s", name, cpu_level_name(level));
