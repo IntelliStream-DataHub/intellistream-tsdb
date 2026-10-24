@@ -66,6 +66,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../harness.h"
+
 #define NSERIES 4
 #define NKEYS 6000
 #define T0 1700000000000LL
@@ -95,7 +97,8 @@ typedef struct rop {
 } rop;
 
 static const char *dir, *crashfs, *nemesis = "kill";
-static int nclients = 8, port;
+static int nclients = 8;
+static atomic_int port; /* where the current server listens, 0 while none runs: tsdbd picks it, see start_server */
 static double seconds = 20;
 static uint64_t seed = 1;
 static uint32_t ids[NSERIES];
@@ -110,7 +113,7 @@ static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
 static int restarts;
 static char markpath[PATH_MAX]; /* eio: crashfs writes the path of the file it failed here */
 static int failstops, eio_problems;
-static int fport;                   /* the follower; 0 = none */
+static int fport;                   /* the follower, where tsdbd put it; 0 = none */
 static atomic_int follower_pid;
 static char flogpath[PATH_MAX];     /* its stderr */
 static rop *freads;
@@ -136,68 +139,70 @@ static uint64_t mix(uint64_t x)
 /* ----------------------------------------------------------- the server */
 
 static void stop_server(int sig);
+/* No server runs: clients must not try the old port, which anything may take now. */
+static void server_gone(void)
+{
+    atomic_store(&server_pid, 0);
+    atomic_store(&port, 0);
+}
+static const char *tsdbd_path(void) { return getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd"; }
 
 static void start_server(bool faulty)
 {
-    char portstr[16], pms[32];
-    snprintf(portstr, sizeof portstr, "%d", port);
+    char pms[32], pf[PATH_MAX];
     snprintf(pms, sizeof pms, "%lld", PARTITION_MS);
-    unlink(markpath);
-    pid_t pid = fork();
-    if (pid == 0) {
-        if (faulty && crashfs) {
-            char sd[32];
-            snprintf(sd, sizeof sd, "%llu", (unsigned long long)mix(seed + (uint64_t)restarts));
-            setenv("LD_PRELOAD", crashfs, 1);
-            setenv("CRASHFS_ROOT", dir, 1);
-            setenv("CRASHFS_SEED", sd, 1);
-            setenv("CRASHFS_PROB", "0.0005", 1);
-            setenv("CRASHFS_WARMUP", "200", 1);
-            if (!strcmp(nemesis, "power") && restarts % 2 == 1)
-                setenv("CRASHFS_TEAR", "1", 1); /* every other server: keep what a real disk may keep */
-            if (!strcmp(nemesis, "eio")) {
-                setenv("CRASHFS_MODE", "eio", 1);
-                setenv("CRASHFS_MARK", markpath, 1);
-                if (restarts % 2 == 0) /* every other server: the WAL, where an error must stop it */
-                    setenv("CRASHFS_EIO_ONLY", "wal_", 1);
+    atomic_store(&port, 0); /* until this server says where it listens, the clients have nowhere to go */
+    for (int attempt = 0;; attempt++) {
+        unlink(markpath); /* an EIO while opening: the clean server of the second attempt has no fault */
+        th_portfile(pf, sizeof pf, dir);
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (faulty && crashfs && attempt == 0) {
+                char sd[32];
+                snprintf(sd, sizeof sd, "%llu", (unsigned long long)mix(seed + (uint64_t)restarts));
+                setenv("LD_PRELOAD", crashfs, 1);
+                setenv("CRASHFS_ROOT", dir, 1);
+                setenv("CRASHFS_SEED", sd, 1);
+                setenv("CRASHFS_PROB", "0.0005", 1);
+                setenv("CRASHFS_WARMUP", "200", 1);
+                if (!strcmp(nemesis, "power") && restarts % 2 == 1)
+                    setenv("CRASHFS_TEAR", "1", 1); /* every other server: keep what a real disk may keep */
+                if (!strcmp(nemesis, "eio")) {
+                    setenv("CRASHFS_MODE", "eio", 1);
+                    setenv("CRASHFS_MARK", markpath, 1);
+                    if (restarts % 2 == 0) /* every other server: the WAL, where an error must stop it */
+                        setenv("CRASHFS_EIO_ONLY", "wal_", 1);
+                }
             }
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0 && !getenv("JEPSEN_VERBOSE"))
+                dup2(devnull, 2);
+            execl(tsdbd_path(), "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
+                  "--wal-max-batch-rows", "500", "--partition-ms", pms, getenv("TSDBD_IO") ? "--io" : NULL,
+                  getenv("TSDBD_IO"), (char *)NULL);
+            _exit(127);
         }
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0 && !getenv("JEPSEN_VERBOSE"))
-            dup2(devnull, 2);
-        execl(getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd", "tsdbd", "--dir", dir, "--port", portstr,
-              "--workers", "8", "--wal-max-batch-rows", "500", "--partition-ms", pms, getenv("TSDBD_IO") ? "--io" : NULL,
-              getenv("TSDBD_IO"), (char *)NULL);
-        _exit(127);
-    }
-    atomic_store(&server_pid, pid);
-    if (getenv("JEPSEN_VERBOSE"))
-        fprintf(stderr, "jepsen: started %d (%s)\n", (int)pid, faulty ? "faulty" : "clean");
-    for (int i = 0; i < 300; i++) { /* until it accepts */
-        tsdbc *c;
-        if (tsdbc_connect("127.0.0.1", port, &c) == 0) {
-            tsdbc_close(c);
+        atomic_store(&server_pid, pid);
+        if (getenv("JEPSEN_VERBOSE"))
+            fprintf(stderr, "jepsen: started %d (%s)\n", (int)pid, attempt == 0 && faulty ? "faulty" : "clean");
+        int p = th_await(pf, pid, 30000);
+        unlink(pf);
+        if (p > 0) {
+            atomic_store(&port, p);
             return;
         }
-        int st;
-        if (waitpid(pid, &st, WNOHANG) == pid) { /* crashed while starting (power loss at open) */
-            if (getenv("JEPSEN_VERBOSE"))
-                fprintf(stderr, "jepsen: %d died while starting\n", (int)pid);
-            unlink(markpath); /* an EIO while opening: the clean server below has no fault */
-            pid = fork();
-            if (pid == 0) {
-                execl(getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd", "tsdbd", "--dir", dir, "--port",
-                      portstr, "--workers", "8", "--wal-max-batch-rows", "500", "--partition-ms", pms,
-                      getenv("TSDBD_IO") ? "--io" : NULL, getenv("TSDBD_IO"), (char *)NULL);
-                _exit(127);
+        if (p == TH_EXITED) {
+            server_gone();
+            if (faulty && crashfs && attempt == 0) { /* crashed while starting (power loss at open): a clean one */
+                if (getenv("JEPSEN_VERBOSE"))
+                    fprintf(stderr, "jepsen: %d died while starting\n", (int)pid);
+                continue;
             }
-            atomic_store(&server_pid, pid);
         }
-        usleep(20000);
+        fprintf(stderr, "jepsen: the server does not come up: %s", th_why);
+        stop_server(SIGKILL);
+        exit(2);
     }
-    fprintf(stderr, "jepsen: the server does not come up\n");
-    stop_server(SIGKILL);
-    exit(2);
 }
 
 /* kill() with pid 0 or -1 signals the process group, or every process of the
@@ -213,45 +218,40 @@ static void stop_server(int sig)
         signal_pid(pid, sig);
         int st;
         waitpid(pid, &st, 0);
-        atomic_store(&server_pid, 0);
+        server_gone();
     }
+    atomic_store(&port, 0);
 }
 
 /* ----------------------------------------------------------- the follower */
 
-static const char *tsdbd_path(void) { return getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd"; }
-
 static void start_follower(void)
 {
-    char portstr[16];
-    snprintf(portstr, sizeof portstr, "%d", fport);
+    char pf[PATH_MAX];
+    th_portfile(pf, sizeof pf, dir);
     pid_t pid = fork();
     if (pid == 0) { /* never under the shim: it plays a reader on another host */
         unsetenv("LD_PRELOAD");
         int log = open(flogpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (log >= 0)
             dup2(log, 2);
-        execl(tsdbd_path(), "tsdbd", "--dir", dir, "--port", portstr, "--workers", "2", "--follow",
+        execl(tsdbd_path(), "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--follow",
               getenv("TSDBD_IO") ? "--io" : NULL, getenv("TSDBD_IO"), (char *)NULL);
         _exit(127);
     }
     atomic_store(&follower_pid, pid);
-    for (int i = 0; i < 300; i++) {
-        tsdbc *c;
-        if (tsdbc_connect("127.0.0.1", fport, &c) == 0) {
-            tsdbc_close(c);
-            return;
-        }
-        int st;
-        if (waitpid(pid, &st, WNOHANG) == pid) {
-            fprintf(stderr, "jepsen: the follower died while starting (status %#x), see %s\n", st, flogpath);
-            break;
-        }
-        usleep(20000);
+    int p = th_await(pf, pid, 30000);
+    unlink(pf);
+    if (p > 0) {
+        fport = p;
+        return;
     }
-    fprintf(stderr, "jepsen: the follower does not come up\n");
-    signal_pid(atomic_load(&follower_pid), SIGKILL);
-    waitpid(pid, NULL, 0);
+    fprintf(stderr, "jepsen: the follower does not come up (see %s): %s", flogpath, th_why);
+    if (p != TH_EXITED) {
+        signal_pid(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+    }
+    atomic_store(&follower_pid, 0);
     stop_server(SIGKILL);
     exit(2);
 }
@@ -264,6 +264,21 @@ static void kill_follower(void) /* at exit(2): no orphan */
         waitpid(pid, NULL, 0);
 }
 
+/* Connects to the server this harness started, and only to it: the port may have been given to another process
+ * since that server died (the nemesis notices a crash only at its next tick), so after connecting the socket
+ * has to belong to `pid`. A dead server holds no socket, which makes this fail until the next one is up. */
+static int connect_own(int p, pid_t pid, tsdbc **c)
+{
+    if (p <= 0 || pid <= 0 || tsdbc_connect("127.0.0.1", p, c) != 0)
+        return -1;
+    if (!th_owns_port(pid, p)) {
+        tsdbc_close(*c);
+        *c = NULL;
+        return -1;
+    }
+    return 0;
+}
+
 static void *follower_reader(void *arg)
 {
     (void)arg;
@@ -272,7 +287,7 @@ static void *follower_reader(void *arg)
     int64_t fail_since = 0;
     while (!atomic_load(&stop)) {
         bool ok = false;
-        if (c || tsdbc_connect("127.0.0.1", fport, &c) == 0) {
+        if (c || connect_own(fport, atomic_load(&follower_pid), &c) == 0) {
             uint32_t idx = atomic_fetch_add(&nfreads, 1);
             if (idx >= MAX_FREADS)
                 break;
@@ -334,7 +349,7 @@ static tsdbc *connect_retry(void)
 {
     for (;;) {
         tsdbc *c;
-        if (tsdbc_connect("127.0.0.1", port, &c) == 0)
+        if (connect_own(atomic_load(&port), atomic_load(&server_pid), &c) == 0)
             return c;
         if (atomic_load(&stop))
             return NULL;
@@ -450,7 +465,7 @@ static void *nemesis_thread(void *arg)
                     waitpid(pid, &st, 0);
                 }
             }
-            atomic_store(&server_pid, 0);
+            server_gone();
             start_server(true);
             restarts++;
         } else if (!strcmp(nemesis, "eio")) {
@@ -496,13 +511,13 @@ static void *nemesis_thread(void *arg)
                         waitpid(pid, &st, 0);
                     }
                 }
-                atomic_store(&server_pid, 0);
+                server_gone();
                 start_server(true);
                 restarts++;
             } else if (gone) {
                 eio_problems++;
                 fprintf(stderr, "  the server ended (status %#x) without a fault\n", st);
-                atomic_store(&server_pid, 0);
+                server_gone();
                 start_server(true);
                 restarts++;
             }
@@ -707,7 +722,7 @@ static int check(uint32_t final[NSERIES][NKEYS])
 static int follower_state(uint32_t out[NSERIES][NKEYS])
 {
     tsdbc *c;
-    if (tsdbc_connect("127.0.0.1", fport, &c) != 0)
+    if (connect_own(fport, atomic_load(&follower_pid), &c) != 0)
         return -1;
     int rc = 0;
     for (int s = 0; s < NSERIES && !rc; s++) {
@@ -802,7 +817,7 @@ static void final_state(uint32_t final[NSERIES][NKEYS])
 {
     /* not connect_retry(): that gives up once `stop` is set, which it is by now */
     tsdbc *c = NULL;
-    for (int i = 0; i < 1000 && tsdbc_connect("127.0.0.1", port, &c) != 0; i++)
+    for (int i = 0; i < 1000 && connect_own(atomic_load(&port), atomic_load(&server_pid), &c) != 0; i++)
         usleep(10000);
     if (!c) {
         fprintf(stderr, "jepsen: cannot connect for the final read\n");
@@ -823,7 +838,7 @@ static void final_state(uint32_t final[NSERIES][NKEYS])
                     fprintf(stderr, "jepsen: server %d was killed by signal %d\n", (int)pid, WTERMSIG(st));
                 else
                     fprintf(stderr, "jepsen: server %d exited with %d\n", (int)pid, WEXITSTATUS(st));
-                atomic_store(&server_pid, 0);
+                server_gone();
             } else {
                 fprintf(stderr, "jepsen: server %d is still running\n", (int)pid);
             }
@@ -866,7 +881,6 @@ int main(int argc, char **argv)
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
-    port = 10000 + (int)(getpid() % 20000); /* below the ephemeral range, where client sockets take ports */
     char cmd[1200];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0)
@@ -895,7 +909,6 @@ int main(int argc, char **argv)
 
     pthread_t th[256], nem, fr;
     if (!strcmp(nemesis, "power")) {
-        fport = port + 1;
         snprintf(flogpath, sizeof flogpath, "%s.follower.log", dir);
         freads = calloc(MAX_FREADS, sizeof *freads);
         atexit(kill_follower);
@@ -920,7 +933,7 @@ int main(int argc, char **argv)
     pid_t pid = atomic_load(&server_pid);
     int st;
     if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid)
-        atomic_store(&server_pid, 0);
+        server_gone();
     stop_server(strcmp(nemesis, "eio") ? SIGKILL : SIGTERM); /* eio: the shim rolls back at a normal exit */
     start_server(false);
     static uint32_t final[NSERIES][NKEYS], again[NSERIES][NKEYS];

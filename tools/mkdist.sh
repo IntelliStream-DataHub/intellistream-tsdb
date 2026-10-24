@@ -15,7 +15,7 @@ cp "$b/tsdbd" "$b/tsdb" "$stage/bin/"
 for f in codec-bench type-bench tsdb-bench insert-bench tsdbc-bench scale-bench; do cp "$b/$f" "$stage/bench/"; done
 cp "$b/libtsdb.a" "$b/libtsdbclient.a" "$stage/lib/"
 cp include/tsdb.h include/tsdb_protocol.h include/tsdb_calendar.h client/tsdb_client.h "$stage/include/"
-for t in test_tsdb test_types test_levels test_group test_follow test_volumes test_server test_stability; do
+for t in test_tsdb test_types test_levels test_group test_follow test_volumes test_server test_stability test_ports; do
     cp "$b/$t" "$stage/tests/"
 done
 cp dist/run-tests.sh "$stage/tests/"

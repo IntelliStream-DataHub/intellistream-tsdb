@@ -38,6 +38,7 @@ calls). Read AGENTS.md first: its invariants and rules are the contract every tr
 | wire protocol | the above + `make test-clients` (all four clients change in the same commit) |
 | anything under client/ or connectors/ (code, tests, docstrings, stubs, constants) | that client's own suite (`make test-rust`, `test-python`, `test-java`, `mvn test` in connectors/pulsar); a protocol version bump runs `make test-clients` |
 | portability | `make dist`, `make dist-check-sandybridge`, `make test-almalinux10` |
+| a test or benchmark harness that starts tsdbd | `--port 0 --port-file`, never a computed port (AGENTS.md "Ports"); `make test` in two copies of the tree at once shows no collision |
 | docs | every claim checked against the code or a primary source; runnable snippets run |
 
 ## Merge (main session)

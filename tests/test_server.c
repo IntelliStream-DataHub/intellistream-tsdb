@@ -7,6 +7,7 @@
 #include "metrics.h"
 #include "samekeys.h"
 #include "lttb_ref.h"
+#include "harness.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -43,7 +44,7 @@ static int failures;
         }                                                                                            \
     } while (0)
 
-static int port;
+static int port; /* where the server started last listens: tsdbd chose it, see start_server_with */
 static const int64_t T0 = 1699999980000; /* on a minute boundary: buckets below are whole */
 
 /* When set, the next server runs under the crashfs shim in eio mode: SIGUSR2
@@ -54,8 +55,8 @@ static const char *eio_mark;
 /* extra: more arguments, NULL-terminated, or NULL */
 static pid_t start_server_with(const char *dir, const char *const *extra)
 {
-    char portstr[16], shim[PATH_MAX], near[PATH_MAX];
-    snprintf(portstr, sizeof portstr, "%d", port);
+    char pf[PATH_MAX + 64], shim[PATH_MAX], near[PATH_MAX];
+    th_portfile(pf, sizeof pf, dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd"; /* e.g. a sanitizer build */
     /* the shim of the same build, next to the server */
     snprintf(near, sizeof near, "%.*slibcrashfs.so", (int)(strrchr(bin, '/') ? strrchr(bin, '/') - bin + 1 : 0), bin);
@@ -75,8 +76,8 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
             setenv("CRASHFS_EIO_ONLY", "wal_", 1);
             setenv("CRASHFS_MARK", eio_mark, 1);
         }
-        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", portstr, "--workers", "4", "--no-fsync"};
-        int n = eio_mark ? 7 : 8; /* under the shim, syncs are what make data survive its rollback at exit */
+        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-fsync"};
+        int n = eio_mark ? 9 : 10; /* under the shim, syncs are what make data survive its rollback at exit */
         if (getenv("TSDBD_IO")) { /* the event loop backend: make test runs uring and epoll */
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
@@ -87,16 +88,18 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
         execv(bin, (char *const *)argv);
         _exit(127);
     }
-    for (int i = 0; i < 100; i++) { /* wait until it accepts */
-        tsdbc *c;
-        if (tsdbc_connect("127.0.0.1", port, &c) == 0) {
-            tsdbc_close(c);
-            return pid;
+    int p = th_await(pf, pid, 30000); /* the port and pid of the server started here, nobody else's */
+    unlink(pf);
+    if (p <= 0) {
+        fputs(th_why, stderr);
+        if (p != TH_EXITED && pid > 0) {
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
         }
-        usleep(20000);
+        exit(1);
     }
-    fprintf(stderr, "tsdbd did not start\n");
-    exit(1);
+    port = p;
+    return pid;
 }
 
 static pid_t start_server(const char *dir) { return start_server_with(dir, NULL); }
@@ -1745,16 +1748,16 @@ static void test_metrics_buckets(void)
 static void test_metrics(const char *dir)
 {
     test_metrics_buckets();
-    char cmd[1200], mps[16];
+    char cmd[1200];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0) {
         failures++;
         return;
     }
-    mport = port + 1;
-    snprintf(mps, sizeof mps, "%d", mport);
-    const char *extra[] = {"--metrics-port", mps, "--metrics-bind", "127.0.0.1", NULL};
+    const char *extra[] = {"--metrics-port", "auto", "--metrics-bind", "127.0.0.1", NULL};
     pid_t srv = start_server_with(dir, extra);
+    mport = th_mport; /* the port file names the metrics port of this server */
+    CHECK(mport > 0 && mport != port);
 
     /* the endpoint: format, headers, the paths and methods it refuses */
     mset m0;
@@ -1997,16 +2000,16 @@ static void test_metrics(const char *dir)
  * label escaping, error codes other than "invalid", merges. */
 static void test_metrics_more(const char *dir)
 {
-    char cmd[2400], mps[16], vol[1100];
+    char cmd[2400], vol[1100];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0) {
         failures++;
         return;
     }
-    mport = port + 1;
-    snprintf(mps, sizeof mps, "%d", mport);
-    const char *extra[] = {"--metrics-port", mps, "--metrics-bind", "127.0.0.1", "--max-connections", "6", NULL};
+    const char *extra[] = {"--metrics-port", "auto", "--metrics-bind", "127.0.0.1", "--max-connections", "6", NULL};
     pid_t srv = start_server_with(dir, extra);
+    mport = th_mport;
+    CHECK(mport > 0 && mport != port);
     tsdbc *c;
     OK(tsdbc_connect("127.0.0.1", port, &c));
 
@@ -2015,13 +2018,13 @@ static void test_metrics_more(const char *dir)
         const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
         const char *bad[] = {"abc", "12x", "0", "70000", "-1", ""};
         for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
-            snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port %d --metrics-port '%s' >/dev/null 2>&1", bin, dir,
-                     port + 7, bad[i]);
+            snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port 0 --metrics-port '%s' >/dev/null 2>&1", bin, dir,
+                     bad[i]);
             int st = system(cmd);
             CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2);
         }
-        snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port %d --metrics-port %d >/dev/null 2>&1", bin, dir,
-                 port + 7, mport); /* the port the running server holds */
+        snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port 0 --metrics-port %d >/dev/null 2>&1", bin, dir,
+                 mport); /* the port the running server holds */
         int st = system(cmd);
         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 1);
         snprintf(cmd, sizeof cmd, "rm -rf '%s.bad'", dir);
@@ -2132,7 +2135,6 @@ int main(int argc, char **argv)
 {
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdbd-test-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
-    port = 10000 + (int)(getpid() % 20000); /* below the ephemeral range, where client sockets take ports */
     char cmd[1300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s.volume'", dir, dir);
     if (system(cmd) != 0)

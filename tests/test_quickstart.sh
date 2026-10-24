@@ -5,7 +5,7 @@
 #
 # The block is the first fenced block after the "<!-- quickstart" marker in README.md.
 # Two things are changed in a copy of it, nothing else: /tmp/tsdb-qs becomes a fresh
-# scratch directory and port 17070 a free one, so the test can run next to a real
+# scratch directory and port 17070 the port tsdbd picked (--port 0), so the test can run next to a real
 # tsdbd and next to other tests. With B=build-tsan (make tsan) build/ becomes that
 # directory. If the README's commands are wrong, this fails: that is its point.
 #
@@ -51,13 +51,9 @@ awk '/^<!-- quickstart/ { want = 1; next }
      inblock { print }' README.md > "$scratch/block.orig"
 [ -s "$scratch/block.orig" ] || { echo "test_quickstart: FAIL: no quick start block in README.md" >&2; exit 1; }
 
-# A free port: nothing accepts connections on it.
-port=
-for _ in $(seq 50); do
-    p=$((30000 + RANDOM % 2500))   # above the other server tests' 10000-29999, below the ephemeral 32768+
-    if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then port=$p; break; fi
-done
-[ -n "$port" ] || { echo "test_quickstart: no free port found" >&2; exit 1; }
+# No port is picked here: the block starts tsdbd with --port 0 --port-file (below), and the client step
+# reads the port from that file, which names the pid of the server the block started.
+portfile=$scratch/qs/port
 
 # Extract the expected-output blocks.
 awk '/^<!-- quickstart-output/ { want = 1; next }
@@ -79,8 +75,15 @@ else
     echo "test_quickstart: no mawk or localedef: not checking a decimal-comma locale"
 fi
 
-sed -e "s#/tmp/tsdb-qs#$scratch/qs#g" -e "s#17070#$port#g" -e "s#^\\(build/\\)#$B/#" \
+# The README names port 17070, a fixed one a reader may change. Here the server gets any free port and says which:
+# "--port 0 --port-file", the wait loop waits for that file, the client reads the port from it.
+sed -e "s#/tmp/tsdb-qs#$scratch/qs#g" -e "s#--port 17070#--port 0 --port-file $portfile#" \
+    -e "s#grep -q serving [^ ]*tsdbd.log#test -s $portfile#" -e "s#127.0.0.1 17070#127.0.0.1 \$(cut -d' ' -f1 $portfile)#" \
+    -e "s#^\\(build/\\)#$B/#" \
     -e "s#\\([ <(]\\)build/#\\1$B/#g" "$scratch/block.orig" > "$scratch/block.sh"
+
+# No client of the block may still name the README's port: it would talk to whatever listens there.
+! grep -q 17070 "$scratch/block.sh" || fail "the README block still names port 17070 after the rewrite"
 
 # -e: the first command that fails ends the quick start, as it would for a reader who pastes it.
 if ! "${runenv[@]}" timeout 600 bash -e "$scratch/block.sh" > "$scratch/out" 2>&1; then
@@ -113,7 +116,9 @@ expect 2 "24 hours, the first average: 51.28"
 expect 2 "Oslo day 1: 1320 rows, average 50.23"
 expect 2 "Oslo day 2: 120 rows, average 47.47"
 expect 1 "rows        1440"
-grep -q "serving $scratch/qs/server on 127.0.0.1:$port" "$scratch/qs/tsdbd.log" || fail "tsdbd did not log that it serves on port $port"
+read -r port fpid < "$portfile" || fail "the server wrote no port file"
+[ "$fpid" = "$(cat "$pidfile")" ] || fail "the port file names pid $fpid, the block started $(cat "$pidfile")"
+grep -q "serving $scratch/qs/server on 127.0.0.1:$port," "$scratch/qs/tsdbd.log" || fail "tsdbd did not log that it serves on port $port"
 
 # The block stopped the server.
 pid=$(cat "$pidfile")

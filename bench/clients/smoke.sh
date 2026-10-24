@@ -7,11 +7,10 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 B=$ROOT/build
 W=${1:-$B/cbench-smoke}
-PORT=${2:-17072}
 rm -rf "$W"
 mkdir -p "$W"
 "$HERE/run.sh" --force --no-build --clients c --series 5 --points 20000 --repeat 1 --seconds 0.5 --conns "1 2" \
-    --qthreads "1 2" --work "$W" --port "$PORT" >"$W/run.out" 2>&1 || { tail -n 30 "$W/run.out"; exit 1; }
+    --qthreads "1 2" --work "$W" >"$W/run.out" 2>&1 || { tail -n 30 "$W/run.out"; exit 1; }
 grep -q "0 mismatches" "$W"/results-*/summary.md
 
 # Verification must fail when the server (or the embedded database) holds other rows than the file: another row
@@ -31,11 +30,12 @@ moved[100] = (moved[100][0], moved[100][1] + 500, moved[100][2])         # one r
 write("moved.rb", moved)
 PY
 mkdir -p "$W/neg"
-"$B/tsdbd" --dir "$W/neg/srv" --port "$PORT" >"$W/neg.log" 2>&1 &
+"$B/tsdbd" --dir "$W/neg/srv" --port 0 --port-file "$W/neg.port" >"$W/neg.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT
-for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.1; done
-kill -0 $pid
+for _ in $(seq 100); do [ -s "$W/neg.port" ] && break; kill -0 $pid; sleep 0.1; done
+read -r PORT fpid <"$W/neg.port" # where tsdbd says it listens, and whose server that is
+[ "$fpid" = "$pid" ] || { echo "smoke: $W/neg.port names pid $fpid, the server started here is $pid" >&2; exit 1; }
 "$B/tsdbc-bench" --port "$PORT" load "$W/a.rb" >/dev/null
 "$B/tsdbc-bench" --port "$PORT" verify "$W/a.rb" >/dev/null
 "$B/tsdb-bench" --dir "$W/neg/emb" --load "$W/a.rb" --threads 2 >/dev/null
