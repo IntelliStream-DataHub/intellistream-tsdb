@@ -19,6 +19,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::ops::{Bound, ControlFlow, RangeBounds};
 use std::time::Duration;
 
+use crate::calendar;
 use crate::error::{Error, Result, Status};
 use crate::pack;
 use crate::protocol::extend_i64s;
@@ -116,17 +117,40 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
-    /// Connects to tsdbd, trying each address `addr` resolves to.
+    /// Connects to tsdbd, trying each address `addr` resolves to in turn.
+    ///
+    /// `addr` is anything [`ToSocketAddrs`] takes: `"127.0.0.1:7070"`,
+    /// `("db.example", 7070)` or a [`SocketAddr`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if no address accepts the connection.
+    ///
+    /// ```no_run
+    /// let mut c = tsdb_client::Client::connect(("127.0.0.1", tsdb_client::DEFAULT_PORT))?;
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
     pub fn connect(addr: impl ToSocketAddrs) -> Result<Client> {
         Client::from_stream(TcpStream::connect(addr)?)
     }
 
     /// Connects to one address, giving up after `timeout`.
+    ///
+    /// Only the connect is bounded; use [`set_timeout`](Client::set_timeout) for
+    /// later reads and writes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails or times out.
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> Result<Client> {
         Client::from_stream(TcpStream::connect_timeout(addr, timeout)?)
     }
 
-    /// Wraps a connected stream.
+    /// Wraps a TCP stream that is already connected to tsdbd.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if `TCP_NODELAY` cannot be set on the stream.
     pub fn from_stream(stream: TcpStream) -> Result<Client> {
         stream.set_nodelay(true)?;
         Ok(Client {
@@ -145,9 +169,16 @@ impl Client {
         })
     }
 
-    /// Sets the zstd level of inserts: 0 sends plain arrays, any other level
-    /// zstd accepts (1 is the default; negative levels are faster) packs them
-    /// when the server speaks protocol version 3.
+    /// Sets how much inserts are compressed (the zstd level).
+    ///
+    /// `level` 0 sends plain arrays. Any other level zstd accepts packs and
+    /// compresses inserts for servers of protocol version 3 or later: 1 (the
+    /// default, [`DEFAULT_COMPRESSION`]) is fast, higher levels compress more and
+    /// negative ones are faster still. Older servers always get plain arrays.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for a level outside zstd's range.
     pub fn set_compression(&mut self, level: i32) -> Result<()> {
         if level != 0 && !zstd::compression_level_range().contains(&level) {
             return Err(Error::InvalidArgument(format!(
@@ -164,13 +195,19 @@ impl Client {
         self.level
     }
 
-    /// Bytes written to the socket by this client so far.
+    /// Bytes this client has written to the socket so far, to measure what
+    /// compression saves.
     pub fn bytes_sent(&self) -> u64 {
         self.bytes_sent
     }
 
-    /// Sets the read and write timeout of the socket (`None`: block forever).
-    /// A call that times out leaves the connection unusable.
+    /// Sets the read and write timeout of the socket; `None` waits forever.
+    ///
+    /// A call that times out leaves the client unusable.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the socket refuses the timeout (a zero duration).
     pub fn set_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         let s = self.stream.get_ref();
         s.set_read_timeout(timeout)?;
@@ -178,7 +215,15 @@ impl Client {
         Ok(())
     }
 
-    /// The server's protocol version (HELLO).
+    /// Asks the server for its protocol version (HELLO).
+    ///
+    /// Version 2 added value types, 3 compressed inserts, 4 bucket bounds
+    /// ([`query_bounds`](Client::query_bounds)). The client remembers the answer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn protocol_version(&mut self) -> Result<u32> {
         self.run(|c| c.hello())
     }
@@ -198,19 +243,24 @@ impl Client {
     /// it. The first time, this asks the server (after collecting pending
     /// inserts, whose errors it returns rather than taking them for an old server).
     fn packing(&mut self) -> Result<bool> {
-        if self.level == 0 {
-            return Ok(false);
-        }
-        let v = match self.server_version {
-            Some(v) => v,
-            None => self.hello()?,
-        };
-        Ok(v >= 3)
+        Ok(self.level != 0 && self.server_version()? >= 3)
     }
 
-    /// Waits for pending inserts, then closes the connection. Returns the
-    /// first error among the pending inserts. Dropping a client closes it
-    /// without waiting.
+    /// The server's protocol version, asked once per connection.
+    fn server_version(&mut self) -> Result<u32> {
+        match self.server_version {
+            Some(v) => Ok(v),
+            None => self.hello(),
+        }
+    }
+
+    /// Waits for pending inserts, then closes the connection.
+    ///
+    /// Dropping a client also closes it, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// The first error among the pending inserts.
     pub fn close(mut self) -> Result<()> {
         let r = if self.broken { Ok(()) } else { self.wait() };
         let _ = self.stream.get_ref().shutdown(Shutdown::Both);
@@ -219,25 +269,52 @@ impl Client {
 
     // ------------------------------------------------------------ series
 
-    /// Returns the id of series `name`, creating it in the database directory if needed.
+    /// Returns the id of series `name`, creating it if needed.
+    ///
+    /// New series are float32, in the database directory; use
+    /// [`series_create`](Client::series_create) for other types.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for an empty name, one longer than 65535 bytes
+    /// or with a NUL byte; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn series(&mut self, name: &str) -> Result<u32> {
         self.run(|c| c.series_req(name, true, None))
     }
 
-    /// Returns the id of an existing series; [`Status::NotFound`] if there is none.
+    /// Returns the id of an existing series.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::NotFound`] if there is no series `name`; otherwise as
+    /// [`series`](Client::series).
     pub fn series_lookup(&mut self, name: &str) -> Result<u32> {
         self.run(|c| c.series_req(name, false, None))
     }
 
-    /// Returns the id of series `name`, creating it in the volume `path` on the
-    /// server if needed (see `tsdb_series_at`). The path only matters at creation;
-    /// an empty path means the database directory.
+    /// Returns the id of series `name`, creating it (float32) in the volume
+    /// `path` on the server if needed.
+    ///
+    /// A volume is another directory, such as one on another disk (see
+    /// `tsdb_series_at` in `include/tsdb.h`). The path only matters when the
+    /// series is created; an empty path means the database directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`series`](Client::series); [`Status::Invalid`] if the server cannot
+    /// use `path`.
     pub fn series_at(&mut self, name: &str, path: &str) -> Result<u32> {
         self.run(|c| c.series_req(name, true, Some(path)))
     }
 
-    /// The name of series `id`; [`Status::NotFound`] if there is none. Names
-    /// that are not UTF-8 are converted lossily.
+    /// Returns the name of series `id`. Names that are not UTF-8 are converted
+    /// lossily.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::NotFound`] if there is no such series; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn series_name(&mut self, id: u32) -> Result<String> {
         self.run(|c| {
             c.request(Op::SeriesName, |f| {
@@ -266,9 +343,24 @@ impl Client {
         Ok(id)
     }
 
-    /// Returns the id of series `name` of type `ty`, creating it if needed in
-    /// the volume `path` (`None`: the database directory). An existing series
-    /// of another type is [`Status::Invalid`]. [`series`](Client::series) creates float32 series.
+    /// Returns the id of series `name` of value type `ty`, creating it if needed
+    /// in the volume `path` (`None`: the database directory).
+    ///
+    /// [`series`](Client::series) creates float32 series.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] if the series exists with another type; as
+    /// [`series`](Client::series) otherwise.
+    ///
+    /// ```no_run
+    /// use tsdb_client::{Client, ValueType};
+    ///
+    /// let mut c = Client::connect("127.0.0.1:7070")?;
+    /// let starts = c.series_create("pump7.starts", ValueType::Int64, None)?;
+    /// # let _ = starts;
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
     pub fn series_create(&mut self, name: &str, ty: ValueType, path: Option<&str>) -> Result<u32> {
         self.run(|c| {
             let name = wire_str("series name", name, false)?;
@@ -283,7 +375,12 @@ impl Client {
         })
     }
 
-    /// The value type of series `id`; [`Status::NotFound`] if there is none.
+    /// Returns the value type of series `id`.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::NotFound`] if there is no such series; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn series_type(&mut self, id: u32) -> Result<ValueType> {
         self.run(|c| {
             c.request(Op::SeriesType, |f| {
@@ -296,18 +393,36 @@ impl Client {
         })
     }
 
-    /// The code of state `name` in the dictionary of `series`'s volume,
-    /// created if needed. Codes start at 1 and never change.
+    /// Returns the code of state `name` for a state series, creating it if needed.
+    ///
+    /// State series store small integer codes (`u32`); the server keeps their
+    /// names, in a dictionary per volume, so `series` only picks the volume.
+    /// Codes start at 1 and never change.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for an empty name; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn state(&mut self, series: u32, name: &str) -> Result<u32> {
         self.run(|c| c.state_req(series, name, true))
     }
 
-    /// The code of an existing state; [`Status::NotFound`] if there is none.
+    /// Returns the code of an existing state name.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::NotFound`] if `name` has no code; as [`state`](Client::state)
+    /// otherwise.
     pub fn state_lookup(&mut self, series: u32, name: &str) -> Result<u32> {
         self.run(|c| c.state_req(series, name, false))
     }
 
-    /// The name of state `code`; [`Status::NotFound`] for an unknown code.
+    /// Returns the name of state `code` in the dictionary of `series`'s volume.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::NotFound`] for an unknown code; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn state_name(&mut self, series: u32, code: u32) -> Result<String> {
         self.run(|c| {
             c.request(Op::StateName, |f| {
@@ -334,12 +449,27 @@ impl Client {
 
     // ------------------------------------------------------------ inserts
 
-    /// Inserts rows of one series and waits until the server has applied them
-    /// (durable per the server's sync settings, and visible).
+    /// Inserts float32 rows into one series and waits until the server has
+    /// applied them (durable as the server's sync settings say, and visible to
+    /// queries).
     ///
-    /// Writing an existing `(series, ts)` replaces its value: the last write
-    /// wins, and within one batch the later row. A batch is applied all or
-    /// nothing, except that batches over 8M rows are sent as several requests.
+    /// `ts[i]` (ms since the epoch) and `values[i]` make row `i`. Writing a
+    /// timestamp that already has a value replaces it: the last write wins, and
+    /// within one call the later row. A call is applied all or nothing, except
+    /// that more than 8 Mi rows go as several requests.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if the slices differ in length;
+    /// [`Status::Invalid`] if the series is not float32; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
+    ///
+    /// ```no_run
+    /// # let mut c = tsdb_client::Client::connect("127.0.0.1:7070")?;
+    /// let id = c.series("tank.level_bar")?;
+    /// c.insert_series(id, &[1_700_000_000_000, 1_700_000_001_000], &[4.2, 4.3])?;
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
     pub fn insert_series(&mut self, series: u32, ts: &[i64], values: &[Value]) -> Result<()> {
         self.run(|c| {
             c.insert_frames(None, series, ts, values)?;
@@ -347,7 +477,13 @@ impl Client {
         })
     }
 
-    /// Inserts rows of many series (`series[i]` is the series of row `i`) and waits.
+    /// Inserts float32 rows into many series and waits; `series[i]` is the series
+    /// of row `i`.
+    ///
+    /// # Errors
+    ///
+    /// As [`insert_series`](Client::insert_series), and
+    /// [`Error::InvalidArgument`] if `series` has another length.
     pub fn insert(&mut self, series: &[u32], ts: &[i64], values: &[Value]) -> Result<()> {
         self.run(|c| {
             c.insert_frames(Some(series), 0, ts, values)?;
@@ -355,20 +491,42 @@ impl Client {
         })
     }
 
-    /// Sends an insert of one series without waiting for the acknowledgement.
-    /// Errors are reported by [`wait`](Client::wait), or by the next call that
-    /// reads a reply (which then is not sent).
+    /// Sends float32 rows of one series without waiting for the answer.
+    ///
+    /// Many small inserts go much faster this way. The answers are collected by
+    /// [`wait`](Client::wait), or by the next call that needs a reply; the first
+    /// error among them is returned there (and that call is not sent). The server
+    /// runs one connection's requests in order, so the last write still wins.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if the slices differ in length; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn insert_series_async(&mut self, series: u32, ts: &[i64], values: &[Value]) -> Result<()> {
         self.run(|c| c.insert_frames(None, series, ts, values))
     }
 
-    /// Sends an insert of many series without waiting; see [`insert_series_async`](Client::insert_series_async).
+    /// Sends float32 rows of many series without waiting; see
+    /// [`insert_series_async`](Client::insert_series_async).
+    ///
+    /// # Errors
+    ///
+    /// As [`insert_series_async`](Client::insert_series_async).
     pub fn insert_async(&mut self, series: &[u32], ts: &[i64], values: &[Value]) -> Result<()> {
         self.run(|c| c.insert_frames(Some(series), 0, ts, values))
     }
 
-    /// Inserts typed values, with nulls, into one series and waits. The
-    /// column's type must be the series' type ([`Status::Invalid`] otherwise).
+    /// Inserts typed values, with nulls, into one series and waits.
+    ///
+    /// `values` is anything that turns into a [`ColumnRef`]: a slice or `Vec` of
+    /// `f32`, `f64`, `i64`, `bool` or `u32` (state codes), or a [`Column`], whose
+    /// validity [`Bitmap`] marks nulls. Its type must be the series' type.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] if the column's type is not the series' type;
+    /// [`Error::InvalidArgument`] if the lengths differ; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     ///
     /// ```no_run
     /// # use tsdb_client::{Client, Column};
@@ -391,8 +549,12 @@ impl Client {
         })
     }
 
-    /// Inserts typed values into many series (`series[i]` is the series of
-    /// row `i`, all of the column's type) and waits.
+    /// Inserts typed values into many series of the column's type and waits;
+    /// `series[i]` is the series of row `i`.
+    ///
+    /// # Errors
+    ///
+    /// As [`insert_series_values`](Client::insert_series_values).
     pub fn insert_values<'a>(&mut self, series: &[u32], ts: &[i64], values: impl Into<ColumnRef<'a>>) -> Result<()> {
         let col = values.into();
         self.run(|c| {
@@ -401,7 +563,13 @@ impl Client {
         })
     }
 
-    /// Sends typed values for one series without waiting; see [`insert_series_async`](Client::insert_series_async).
+    /// Sends typed values of one series without waiting; see
+    /// [`insert_series_async`](Client::insert_series_async).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if the lengths differ; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn insert_series_values_async<'a>(
         &mut self,
         series: u32,
@@ -412,7 +580,12 @@ impl Client {
         self.run(|c| c.insert_values_frames(None, series, ts, col))
     }
 
-    /// Sends typed values for many series without waiting.
+    /// Sends typed values of many series without waiting; see
+    /// [`insert_series_async`](Client::insert_series_async).
+    ///
+    /// # Errors
+    ///
+    /// As [`insert_series_values_async`](Client::insert_series_values_async).
     pub fn insert_values_async<'a>(
         &mut self,
         series: &[u32],
@@ -423,13 +596,17 @@ impl Client {
         self.run(|c| c.insert_values_frames(Some(series), 0, ts, col))
     }
 
-    /// Collects the acknowledgements of all pending inserts and returns the
-    /// first error among them.
+    /// Waits for the answers to all inserts sent without waiting.
+    ///
+    /// # Errors
+    ///
+    /// The first error among them; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn wait(&mut self) -> Result<()> {
         self.run(|c| c.wait_inner())
     }
 
-    /// Number of inserts sent but not yet acknowledged.
+    /// Number of inserts sent but not yet answered.
     pub fn pending(&self) -> usize {
         self.pending
     }
@@ -559,9 +736,29 @@ impl Client {
 
     // ------------------------------------------------------------ queries
 
-    /// Returns the points of a float32 `series` in `range`, in `opts.order`,
-    /// at most `opts.limit` of them (QUERY_RAW: nulls read as NaN; other types
-    /// are [`Status::Invalid`], use [`query_rows`](Client::query_rows)).
+    /// Returns the rows of a float32 `series` in `range`, as two columns.
+    ///
+    /// `range` is any range of ms timestamps: `t0..t1` is `[t0, t1)`, `..` is
+    /// everything. `opts` sets the order and a limit. Nulls read as NaN; use
+    /// [`query_rows`](Client::query_rows) for other types and nulls.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] if the series is not float32; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls. An unknown series
+    /// has no rows.
+    ///
+    /// ```no_run
+    /// use tsdb_client::{Client, QueryOpts};
+    ///
+    /// let mut c = Client::connect("127.0.0.1:7070")?;
+    /// let id = c.series("tank.level_bar")?;
+    /// let newest = c.query_points(id, .., QueryOpts::desc().limit(10))?;
+    /// for (ts, v) in newest.iter() {
+    ///     println!("{ts} {v}");
+    /// }
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
     pub fn query_points(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Points> {
         let (start, end) = bounds(&range);
         self.run(|c| {
@@ -575,10 +772,15 @@ impl Client {
         })
     }
 
-    /// Streams the points of a float32 `series` in `range` to `f` in chunks
-    /// (the server sends up to 16384 rows per chunk). Return
-    /// [`ControlFlow::Break`] from `f` to stop early; the rest of the stream is
-    /// then read and discarded, since the protocol cannot cancel a query.
+    /// Streams the rows of a float32 `series` in `range` to `f`, a chunk (up to
+    /// 16384 rows) at a time, without collecting them all.
+    ///
+    /// Return [`ControlFlow::Break`] from `f` to stop early; the rest of the
+    /// answer is then read and dropped, since a query cannot be cancelled.
+    ///
+    /// # Errors
+    ///
+    /// As [`query_points`](Client::query_points).
     pub fn query_raw<F>(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts, mut f: F) -> Result<()>
     where
         F: FnMut(&[i64], &[Value]) -> ControlFlow<()>,
@@ -632,8 +834,26 @@ impl Client {
     }
 
     /// Returns the rows of `series` (any type, with nulls) in `range`, in
-    /// `opts.order`, at most `opts.limit` of them. An unknown series has no
-    /// rows (and reads as float32).
+    /// `opts.order`, at most `opts.limit` of them.
+    ///
+    /// An unknown series has no rows (and reads as float32).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
+    ///
+    /// ```no_run
+    /// use tsdb_client::{Client, QueryOpts};
+    ///
+    /// let mut c = Client::connect("127.0.0.1:7070")?;
+    /// let id = c.series_lookup("pump7.starts")?;
+    /// let rows = c.query_rows(id, .., QueryOpts::asc())?;
+    /// for (ts, v) in rows.ts.iter().zip(rows.values.iter::<i64>().unwrap()) {
+    ///     println!("{ts} {v:?}"); // None for a null
+    /// }
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
     pub fn query_rows(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Rows> {
         let (start, end) = bounds(&range);
         self.run(|c| {
@@ -663,10 +883,17 @@ impl Client {
         })
     }
 
-    /// Streams the rows of `series` (any type, with nulls) in `range` to `f`
-    /// in chunks of up to 16384 rows; the [`Column`] of a chunk has a
-    /// validity bitmap only if the chunk has nulls. Return
-    /// [`ControlFlow::Break`] to stop early, as with [`query_raw`](Client::query_raw).
+    /// Streams the rows of `series` (any type, with nulls) in `range` to `f`, a
+    /// chunk of up to 16384 rows at a time.
+    ///
+    /// A chunk's [`Column`] has a validity bitmap only if the chunk has nulls.
+    /// Return [`ControlFlow::Break`] to stop early, as with
+    /// [`query_raw`](Client::query_raw).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn query_values<F>(
         &mut self,
         series: u32,
@@ -757,16 +984,59 @@ impl Client {
         self.send()
     }
 
-    /// Aggregates `series` over `range` into buckets of `interval_ms`, aligned
-    /// to the epoch; 0 gives one bucket for the whole range. Only non-empty
-    /// buckets are returned, in time order.
+    /// Aggregates `series` over `range` into buckets of `interval_ms`, aligned to
+    /// the epoch (UTC); 0 gives one bucket for the whole range.
+    ///
+    /// Only non-empty buckets are returned, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] for a negative interval,
+    /// [`Status::TooManyBuckets`] if the range holds too many buckets; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
+    ///
+    /// ```no_run
+    /// # let mut c = tsdb_client::Client::connect("127.0.0.1:7070")?;
+    /// # let id = 1;
+    /// for b in c.query_agg(id, 1_700_000_000_000..1_700_086_400_000, 3_600_000)? {
+    ///     println!("{} count {} avg {}", b.start, b.count, b.avg());
+    /// }
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
     pub fn query_agg(&mut self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
         self.run(|c| c.buckets(series, start, end, interval_ms, None, QueryOpts::asc()))
     }
 
-    /// Aggregates `series` over `range` by calendar periods (`None`: one
-    /// bucket for the whole range), in `opts.order`, at most `opts.limit` buckets.
+    /// Aggregates `series` over `range` by calendar periods, such as days in a
+    /// time zone, in `opts.order`, at most `opts.limit` buckets. `group` `None`
+    /// gives one bucket for the whole range.
+    ///
+    /// In UTC the server does the grouping. For another zone the client computes
+    /// where the local periods begin ([`calendar_bounds`](crate::calendar_bounds),
+    /// over the first to the last row in the range) and sends those instants
+    /// ([`query_bounds`](Client::query_bounds)); a server older than protocol
+    /// version 4 gets the zone itself. Either way a bucket's `start` is the UTC
+    /// instant its period begins.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for an unknown time zone (even on a series
+    /// without rows); [`Status::TooManyBuckets`] or [`Error::InvalidArgument`] if
+    /// the range holds too many periods; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
+    ///
+    /// ```no_run
+    /// use tsdb_client::{Client, Group, QueryOpts, Unit};
+    ///
+    /// let mut c = Client::connect("127.0.0.1:7070")?;
+    /// let id = c.series("pump7.flow")?;
+    /// let days = Group::new(Unit::Day).timezone("Europe/Oslo");
+    /// for b in c.query_group(id, .., Some(&days), QueryOpts::asc())? {
+    ///     println!("{} {}", b.start, b.sum); // 23:00 or 22:00 UTC: midnight in Oslo
+    /// }
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
     pub fn query_group(
         &mut self,
         series: u32,
@@ -775,7 +1045,110 @@ impl Client {
         opts: QueryOpts,
     ) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
-        self.run(|c| c.buckets(series, start, end, 0, group, opts))
+        self.run(|c| match group {
+            Some(g) if g.timezone.as_deref().is_some_and(|z| z != "UTC") && c.server_version()? >= 4 => {
+                c.group_local(series, start, end, g, opts)
+            }
+            // UTC, or an older server, which still takes the zone itself
+            _ => c.buckets(series, start, end, 0, group, opts),
+        })
+    }
+
+    /// Calendar groups in a time zone for a version 4 server: their UTC
+    /// bounds, computed over the rows there are (an open range would be
+    /// millennia of periods), go out in QUERY_BOUNDS.
+    fn group_local(&mut self, series: u32, start: i64, end: i64, g: &Group, opts: QueryOpts) -> Result<Vec<Bucket>> {
+        let zone = g.timezone.as_deref().unwrap_or("");
+        calendar::zone(zone)?; // an unknown zone is an error even for a series without rows
+        let Some(_) = opts.wire_limit() else {
+            self.wait_inner()?;
+            return Ok(Vec::new());
+        };
+        let (Some(first), Some(last)) =
+            (self.edge_ts(series, start, end, Order::Asc)?, self.edge_ts(series, start, end, Order::Desc)?)
+        else {
+            return Ok(Vec::new());
+        };
+        let b = calendar::calendar_bounds(zone, g.unit, g.count, first..last.saturating_add(1))?;
+        self.bounds_req(series, start, end, &b, opts)
+    }
+
+    /// The timestamp of the first (`Asc`) or last (`Desc`) row of `series` in `[start, end)`.
+    fn edge_ts(&mut self, series: u32, start: i64, end: i64, order: Order) -> Result<Option<i64>> {
+        let mut ts = None;
+        self.values_stream(series, start, end, QueryOpts { order, limit: Some(1) }, |chunk| {
+            if chunk.n > 0 {
+                ts = Some(i64::from_le_bytes(chunk.ts[..8].try_into().expect("8 bytes")));
+                return Ok(ControlFlow::Break(()));
+            }
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(ts)
+    }
+
+    /// Aggregates `series` over `range` into buckets with the given bounds:
+    /// bucket `i` holds the rows from `bounds[i]` up to `bounds[i + 1]`, the
+    /// last one up to the end of `range`. Rows before `bounds[0]` belong to
+    /// no bucket. Only non-empty buckets are returned, in `opts.order`, at
+    /// most `opts.limit` of them; a bucket's `start` is its bound.
+    ///
+    /// This is how calendar periods in a time zone reach a server, which
+    /// knows UTC only: [`calendar_bounds`](crate::calendar_bounds) computes
+    /// them, and [`query_group`](Client::query_group) does both steps.
+    /// Needs a server of protocol version 4.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if `bounds` is empty, does not strictly
+    /// increase, or has more than 32 Mi entries (the largest request);
+    /// [`Status::Invalid`] from a server older than version 4.
+    ///
+    /// ```no_run
+    /// use tsdb_client::{Client, QueryOpts, Unit, calendar_bounds};
+    ///
+    /// let mut c = Client::connect("127.0.0.1:7070")?;
+    /// let id = c.series("pump7.flow")?;
+    /// let (t0, t1) = (1_711_756_800_000, 1_711_929_600_000);
+    /// let days = calendar_bounds("Europe/Oslo", Unit::Day, 1, t0..t1)?;
+    /// for b in c.query_bounds(id, t0..t1, &days, QueryOpts::asc())? {
+    ///     println!("{} {} {}", b.start, b.count, b.avg());
+    /// }
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    pub fn query_bounds(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        bounds: &[i64],
+        opts: QueryOpts,
+    ) -> Result<Vec<Bucket>> {
+        let (start, end) = self::bounds(&range);
+        self.run(|c| c.bounds_req(series, start, end, bounds, opts))
+    }
+
+    /// QUERY_BOUNDS.
+    fn bounds_req(&mut self, series: u32, start: i64, end: i64, b: &[i64], opts: QueryOpts) -> Result<Vec<Bucket>> {
+        if b.is_empty() || b.len() > (MAX_FRAME - 64) / 8 {
+            return Err(Error::InvalidArgument(format!("{} bucket bounds", b.len())));
+        }
+        if let Some(i) = b.windows(2).position(|w| w[0] >= w[1]) {
+            return Err(Error::InvalidArgument(format!("bucket bounds do not increase at index {}", i + 1)));
+        }
+        let Some(limit) = opts.wire_limit() else {
+            self.wait_inner()?;
+            return Ok(Vec::new());
+        };
+        self.request(Op::QueryBounds, |f| {
+            f.u32(series)
+                .i64(start)
+                .i64(end)
+                .u8((opts.order == Order::Desc) as u8)
+                .u64(limit)
+                .u32(b.len() as u32)
+                .i64s(b);
+        })?;
+        self.req.shrink();
+        self.read_buckets()
     }
 
     /// QUERY_BUCKETS: fixed intervals (no group) or calendar groups.
@@ -805,6 +1178,11 @@ impl Client {
                 .u16(tz.len() as u16)
                 .bytes(tz);
         })?;
+        self.read_buckets()
+    }
+
+    /// A QUERY_BUCKETS or QUERY_BOUNDS reply.
+    fn read_buckets(&self) -> Result<Vec<Bucket>> {
         let mut r = Cursor::new(&self.body);
         let n = r.u32()? as usize;
         if r.remaining() != n * BUCKET_ROW {
@@ -828,22 +1206,43 @@ impl Client {
 
     // -------------------------------------------------------- maintenance
 
-    /// Makes everything written so far durable, without creating parts.
+    /// Makes everything written so far durable on the server, without writing
+    /// parts.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn commit(&mut self) -> Result<()> {
         self.run(|c| c.request(Op::Commit, |_| {}))
     }
 
-    /// Commits, then turns the server's memtable into parts.
+    /// Commits, then writes the rows the server holds in memory to parts on disk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn flush(&mut self) -> Result<()> {
         self.run(|c| c.request(Op::Flush, |_| {}))
     }
 
-    /// Merges every partition down to one part.
+    /// Merges every partition down to one part (slow on a big database).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn optimize(&mut self) -> Result<()> {
         self.run(|c| c.request(Op::Optimize, |_| {}))
     }
 
-    /// Database statistics.
+    /// Returns database statistics: parts, rows, bytes, merges.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn stats(&mut self) -> Result<Stats> {
         self.run(|c| {
             c.request(Op::Stats, |_| {})?;
@@ -861,11 +1260,16 @@ impl Client {
         })
     }
 
-    /// What the server did for this connection's previous query (LAST_STATS):
-    /// rows covered, decoded or answered from granule statistics, bytes, time.
+    /// Returns what the server did for this connection's previous query: rows
+    /// covered, decoded or answered from granule statistics, bytes and time.
+    ///
     /// A query this client answered without asking the server (a limit of
-    /// `Some(0)` on [`query_points`](Client::query_points) or
-    /// [`query_group`](Client::query_group)) does not count; all zero before any query.
+    /// `Some(0)`) does not count; all zero before any query.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// after either the client refuses further calls.
     pub fn last_query_stats(&mut self) -> Result<QueryStats> {
         self.run(|c| {
             c.request(Op::LastStats, |_| {})?;
@@ -1000,7 +1404,7 @@ fn check_lengths(series: Option<&[u32]>, one: u32, ts: &[i64], values: usize) ->
 }
 
 /// Converts a range to the protocol's `[start, end)`.
-fn bounds(r: &impl RangeBounds<i64>) -> (i64, i64) {
+pub(crate) fn bounds(r: &impl RangeBounds<i64>) -> (i64, i64) {
     let start = match r.start_bound() {
         Bound::Included(&s) => s,
         Bound::Excluded(&s) => s.saturating_add(1),

@@ -1,36 +1,68 @@
-//! A blocking client for tsdbd, the TCP server of the tsdb time series database.
+//! A client for tsdbd, the network server of the tsdb time series database.
 //!
-//! The protocol is the one in `include/tsdb_protocol.h`; this crate mirrors the
-//! C client in `client/tsdb_client.h`; its only dependency is `zstd`, for packed inserts.
-//!
-//! - Timestamps are `i64` milliseconds since the epoch. A series has a
-//!   [`ValueType`] (float32, float64, int64, bool or state); values travel as
-//!   typed [`Column`]s with an optional validity [`Bitmap`] for nulls
-//!   ([`Client::insert_series_values`], [`Client::query_rows`]). Float32
-//!   series also have the version 1 fast path with plain `f32` slices
-//!   ([`Client::insert_series`], [`Client::query_points`]).
-//! - Every call returns [`Result`]; a server status arrives as
-//!   [`Error::Server`] with a [`Status`], and [`Error::code`] gives the
-//!   `TSDB_ERR_*` number.
-//! - Inserts are packed and zstd compressed for servers of protocol version 3
-//!   ([`Client::set_compression`]; level 1 by default, 0 sends plain arrays).
-//! - Inserts can be pipelined with [`Client::insert_series_async`] /
-//!   [`Client::insert_async`] and collected with [`Client::wait`]. The server
-//!   runs one connection's requests in order, so the last write still wins.
+//! One [`Client`] is one TCP connection. With it you create series, insert
+//! rows and read them back, raw or aggregated into buckets.
 //!
 //! ```no_run
-//! use tsdb_client::{Client, QueryOpts};
+//! use tsdb_client::{Client, Group, QueryOpts, Unit};
 //!
 //! let mut c = Client::connect(("127.0.0.1", tsdb_client::DEFAULT_PORT))?;
+//!
+//! // a series has a name and a numeric id
 //! let id = c.series("tank.level_bar")?;
-//! c.insert_series(id, &[1_700_000_000_000], &[4.2])?;
-//! for (ts, v) in c.query_points(id, .., QueryOpts::asc())?.iter() {
+//!
+//! // insert rows: timestamps in ms since 1970-01-01 UTC, and values
+//! c.insert_series(id, &[1_700_000_000_000, 1_700_000_060_000], &[4.2, 4.3])?;
+//!
+//! // read them back, newest first
+//! for (ts, v) in c.query_points(id, .., QueryOpts::desc())?.iter() {
 //!     println!("{ts} {v}");
+//! }
+//!
+//! // one bucket per day in Oslo, with count, sum, min, max
+//! let days = Group::new(Unit::Day).timezone("Europe/Oslo");
+//! for b in c.query_group(id, .., Some(&days), QueryOpts::asc())? {
+//!     println!("{} {} {}", b.start, b.count, b.avg());
 //! }
 //! # Ok::<(), tsdb_client::Error>(())
 //! ```
+//!
+//! # Basics
+//!
+//! - **Time** is `i64` milliseconds since the epoch. A time range is any Rust
+//!   range of those: `t0..t1` includes `t0` and stops before `t1`; `..` is
+//!   everything.
+//! - **Value types.** A series has a [`ValueType`], fixed when it is created:
+//!   float32 (what [`Client::series`] creates), float64, int64, bool or state
+//!   (codes of names, see [`Client::state`]). Typed values travel as a
+//!   [`Column`], whose validity [`Bitmap`] marks nulls
+//!   ([`Client::insert_series_values`], [`Client::query_rows`]). Float32
+//!   series also have a fast path with plain `f32` slices
+//!   ([`Client::insert_series`], [`Client::query_points`]).
+//! - **Last write wins.** Writing a timestamp again replaces its value.
+//! - **Aggregates** ([`Client::query_agg`], [`Client::query_group`],
+//!   [`Client::query_bounds`]) return [`Bucket`]s with count, sum, min and
+//!   max; they skip nulls.
+//! - **Time zones.** The server knows UTC only. For local days, weeks,
+//!   months, quarters or years, the client computes the UTC instants where
+//!   the periods begin ([`calendar_bounds`]) from the system's time zone
+//!   files, and the server groups by those. [`Client::query_group`] does
+//!   this for you.
+//! - **Errors.** Every call returns [`Result`]. An error status from the
+//!   server is [`Error::Server`] with a [`Status`]; [`Error::code`] gives the
+//!   `TSDB_ERR_*` number. After an I/O or protocol error the client refuses
+//!   further calls: connect again.
+//! - **Speed.** Inserts are compressed with zstd for servers of protocol
+//!   version 3 or later ([`Client::set_compression`]; level 1 by default, 0
+//!   turns it off). Many small inserts go faster sent without waiting for
+//!   each answer ([`Client::insert_series_async`], then [`Client::wait`]).
+//!
+//! The protocol is described in `include/tsdb_protocol.h` of the tsdb
+//! repository; this crate mirrors the C client in `client/tsdb_client.h`.
+//! Its only dependency is `zstd`.
 #![warn(missing_docs)]
 
+mod calendar;
 mod client;
 mod error;
 mod pack;
@@ -38,6 +70,7 @@ mod protocol;
 mod types;
 mod value;
 
+pub use calendar::calendar_bounds;
 pub use client::{Client, DEFAULT_COMPRESSION};
 pub use error::{Error, Result, Status, strerror};
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};

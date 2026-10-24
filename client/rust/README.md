@@ -1,163 +1,233 @@
 # tsdb-client (Rust)
 
-A blocking Rust client for `tsdbd`, the TCP server of tsdb. It mirrors the C
-client (`client/tsdb_client.h`), speaks the protocol in
-`include/tsdb_protocol.h`, and depends only on `zstd` (for packed inserts).
+A Rust library for talking to `tsdbd`, the tsdb database server. You use it
+to store numbers with a timestamp (a "time series") and to read them back,
+raw or summed up per hour, day or month.
+
+The client waits for each answer (it is blocking, not async). Its only
+dependency is `zstd`, for compressing inserts.
 
 ## Quick start
 
-Start a server (`make` in the repository root, then
-`./build/tsdbd --dir /tmp/tsdb-demo`) and run
-`cargo run --example quickstart` (optionally with `host:port`). This is
-`examples/quickstart.rs`; a test checks that the two stay identical and runs
-it against a live server.
+1. Build and start a server. In the root of the tsdb repository:
+
+   ```sh
+   make
+   ./build/tsdbd --dir /tmp/tsdb-demo
+   ```
+
+   It listens on port 7070. Leave it running and open a second terminal.
+
+2. Run the example program in `examples/quickstart.rs`:
+
+   ```sh
+   cd client/rust
+   cargo run --example quickstart
+   ```
+
+   To use another server, add its address: `cargo run --example quickstart -- 10.0.0.5:7070`.
+
+This is the program. It stores one value per minute for a day, then reads
+them back in three ways:
 
 ```rust
-use tsdb_client::{Client, Column, Group, QueryOpts, Unit, ValueType};
+use tsdb_client::{Client, Group, QueryOpts, Unit};
 
 fn main() -> Result<(), tsdb_client::Error> {
-    // Connect to tsdbd (the address is the first argument, if any).
+    // Connect to tsdbd. The address is the first argument, if there is one.
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
     let mut client = Client::connect(addr.as_str())?;
 
-    // Get or create a series, then insert one point a minute for a day.
+    // Get the id of a series (it is created the first time).
     let id = client.series("pump7.flow")?;
-    let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC, in ms since the epoch
+
+    // Insert one value per minute for a day. Times are ms since 1970-01-01 UTC.
+    let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC
     let ts: Vec<i64> = (0..1440).map(|i| t0 + i * 60_000).collect();
     let values: Vec<f32> = (0..1440).map(|i| (i % 60) as f32).collect();
     client.insert_series(id, &ts, &values)?;
 
-    // Raw query: the newest three points.
-    let newest = client.query_points(id, .., QueryOpts::desc().limit(3))?;
-    for (t, v) in newest.iter() {
+    // Read the newest three values.
+    for (t, v) in client.query_points(id, .., QueryOpts::desc().limit(3))?.iter() {
         println!("raw  {t} {v}");
     }
 
-    // Aggregate: hourly buckets over the first six hours.
+    // Count, average, min and max per hour, for the first six hours.
     for b in client.query_agg(id, t0..t0 + 6 * 3_600_000, 3_600_000)? {
         println!("hour {} count {} avg {:.2} min {} max {}", b.start, b.count, b.avg(), b.min, b.max);
     }
 
-    // Group by calendar day in a time zone.
+    // Sum per day, where days begin at midnight in Oslo.
     let days = Group::new(Unit::Day).timezone("Europe/Oslo");
     for b in client.query_group(id, .., Some(&days), QueryOpts::asc())? {
         println!("day  {} count {} sum {}", b.start, b.count, b.sum);
     }
 
-    // Typed series: int64 with a null, aggregated exactly.
-    let starts = client.series_create("pump7.starts", ValueType::Int64, None)?;
-    client.insert_series_values(starts, &ts[..3], &Column::from_options([Some(3i64), None, Some(5)]))?;
-    let rows = client.query_rows(starts, .., QueryOpts::asc())?;
-    println!("rows {:?}", rows.values.to_options::<i64>().unwrap());
-    let total = client.query_agg(starts, .., 0)?[0];
-    println!("int  count {} isum {}", total.count, total.isum);
-
-    // A state series stores codes; the server keeps their names.
-    let mode = client.series_create("pump7.mode", ValueType::State, None)?;
-    let (on, off) = (client.state(mode, "on")?, client.state(mode, "off")?);
-    client.insert_series_values(mode, &ts[..2], &[on, off])?;
-    let latest = client.query_rows(mode, .., QueryOpts::desc().limit(1))?;
-    let code = latest.values.as_slice::<u32>().unwrap()[0];
-    println!("mode {}", client.state_name(mode, code)?);
-
     client.close()
 }
 ```
 
-## API
+It prints:
 
-One `Client` is one TCP connection; methods take `&mut self`, so use one
-client per thread. Timestamps are `i64` milliseconds since the epoch. Time ranges are any
-`RangeBounds<i64>`: `t0..t1` is `[t0, t1)`, `t0..=t1` includes `t1`, `..` is
-everything.
+```text
+raw  1700085540000 59
+raw  1700085480000 58
+raw  1700085420000 57
+hour 1699999200000 count 60 avg 29.50 min 0 max 59
+...
+day  1699916400000 count 60 sum 1770
+day  1700002800000 count 1380 sum 40710
+```
 
-| Method | |
-|---|---|
-| `Client::connect(addr)`, `connect_timeout(&addr, d)`, `from_stream(s)` | open a connection |
-| `set_timeout(Option<Duration>)` | socket read/write timeout |
-| `close()` | wait for pending inserts, then close (dropping closes without waiting) |
-| `protocol_version()` | HELLO |
-| `series(name)`, `series_lookup(name)`, `series_at(name, path)` | get or create, look up, create in a volume |
-| `series_name(id)` | the name of a series |
-| `insert_series(id, &ts, &values)`, `insert(&series, &ts, &values)` | insert one series or many, and wait |
-| `insert_series_async(..)`, `insert_async(..)`, `wait()`, `pending()` | pipelined inserts |
-| `query_points(id, range, opts)` | raw points as `Points { ts, values }` |
-| `query_raw(id, range, opts, \|ts, values\| ControlFlow)` | raw points streamed in chunks |
-| `series_create(name, ValueType, Option<path>)`, `series_type(id)` | typed series (protocol version 2) |
-| `insert_series_values(id, &ts, column)`, `insert_values(&series, &ts, column)` | typed values with nulls, and wait |
-| `insert_series_values_async(..)`, `insert_values_async(..)` | the same, pipelined |
-| `query_rows(id, range, opts)` | typed rows as `Rows { ts, values: Column }` |
-| `query_values(id, range, opts, \|ts, &Column\| ControlFlow)` | typed rows streamed in chunks |
-| `state(id, name)`, `state_lookup(id, name)`, `state_name(id, code)` | the state dictionary of a series' volume |
-| `query_agg(id, range, interval_ms)` | `Vec<Bucket>` aligned to the epoch; 0 = one bucket |
-| `query_group(id, range, Option<&Group>, opts)` | calendar buckets in a time zone |
-| `commit()`, `flush()`, `optimize()`, `stats()` | maintenance |
-| `set_compression(level)`, `compression()`, `bytes_sent()` | zstd level of inserts (0: plain), bytes written to the socket |
-| `last_query_stats()` | `QueryStats` of this connection's previous query: rows covered, decoded or answered from granule statistics, bytes, time |
+To use the library in your own project, add it to your `Cargo.toml`:
 
-`QueryOpts` carries the order and limit (`QueryOpts::desc().limit(5)`);
-`Group::new(Unit::Day).count(1).timezone("Europe/Oslo")` a calendar grouping.
+```toml
+[dependencies]
+tsdb-client = { path = "path/to/tsdb/client/rust" }
+```
 
-### Value types and nulls
+## Connect
 
-A series has a `ValueType`: `Float32` (what `series()` creates), `Float64`,
-`Int64`, `Bool` or `State`. Each has a Rust type (`f32`, `f64`, `i64`,
-`bool`, and `u32` for state codes; the `Native` trait). A `Column` is typed
-values (`Values`) plus an optional validity `Bitmap` (bit set = known, the wire
-layout, so nulls cost one bit and no conversion). `Column::from_options` and
-`column.to_options::<T>()` / `iter::<T>()` give the `Option<T>` view;
-`as_slice::<T>()` the raw values. Inserts take anything that converts into a
-`ColumnRef`: `&[T]`, `&[T; N]`, `&Vec<T>`, `&Column`, or
-`ColumnRef::from(&values).with_validity(&bitmap)`, so a plain slice is sent
-without building a column. The column's type must be the series' type.
+`Client::connect("127.0.0.1:7070")` opens one connection. Methods take
+`&mut self`, so give each thread its own client. `close()` waits for
+unfinished inserts and closes the connection; dropping the client closes it too.
 
-The protocol reserves one value per type for null: `i64::MIN`, state code 0,
-and the NaNs with bits `NULL_F32_BITS` / `NULL_F64_BITS`; written as known
-values they read back as null. Other NaNs are ordinary values.
+Every method returns a `Result`. If the server says no, you get
+`Error::Server(status)`, for example `Status::NotFound`. After a network
+error the client stops working: connect again.
 
-The version 1 calls (`insert_series`, `query_points`, `query_raw`) remain the
-fast path for float32 series, with plain `f32` slices; `query_points` reads
-nulls as NaN, and the version 1 calls on other types fail with `Status::Invalid`.
+## Create a series
 
-`Bucket` has `start`, `count`, `sum`, `min`, `max` (f64) and `avg()`, plus
-`isum`, `imin` and `imax`: exact for int64 and bool series (`isum` saturates).
-Aggregates skip nulls; `count` counts known values. All aggregates use
-QUERY_BUCKETS.
+A series has a name and a number (its id). You use the id in every other call.
 
-Errors are `tsdb_client::Error`: `Server(Status)` carries the server's
-`TSDB_ERR_*` status, `Io`, `Protocol` and `InvalidArgument` are client-side;
-`Error::code()` gives the numeric code either way. After an I/O or protocol
-error the client refuses further calls, because the stream may be out of step.
+```rust
+let id = client.series("pump7.flow")?;           // creates it if it does not exist
+let id = client.series_lookup("pump7.flow")?;    // only finds it
+```
 
-Asynchronous inserts are pipelined: the server runs one connection's requests
-in order, so the last write still wins. Their errors come back from `wait()`,
-or from the next call that reads a reply (that call is then not sent).
+## Insert rows
 
-Inserts are packed and zstd compressed (protocol version 3, zstd level 1 by
-default), float32 ones included. The client asks the server's version with
-HELLO before its first insert and sends plain arrays to servers older than
-version 3. `set_compression(0)` always sends plain arrays.
+A row is a timestamp and a value. Timestamps are milliseconds since
+1970-01-01 UTC, as `i64`. You pass two slices of the same length:
+
+```rust
+client.insert_series(id, &[1_700_000_000_000, 1_700_000_060_000], &[4.2, 4.3])?;
+```
+
+If you write the same timestamp twice, the last value wins. The call returns
+when the server has stored the rows.
+
+For many small inserts, `insert_series_async` is much faster: it does not
+wait for the answer. Call `wait()` at the end to get any error.
+
+## Read raw rows
+
+```rust
+let all = client.query_points(id, .., QueryOpts::asc())?;
+let newest = client.query_points(id, .., QueryOpts::desc().limit(10))?;
+let some = client.query_points(id, t0..t1, QueryOpts::asc())?; // t0 <= ts < t1
+for (ts, value) in newest.iter() {
+    println!("{ts} {value}");
+}
+```
+
+The range is a normal Rust range: `t0..t1` includes `t0` but not `t1`, and
+`..` means all time.
+
+## Aggregate
+
+`query_agg` splits a range into buckets of a fixed length and returns, for
+each bucket, how many values it has (`count`) and their `sum`, `min`, `max`
+and `avg()`:
+
+```rust
+for b in client.query_agg(id, t0..t1, 3_600_000)? {   // one bucket per hour
+    println!("{} {} {}", b.start, b.count, b.avg());
+}
+let total = client.query_agg(id, .., 0)?;             // 0: one bucket for everything
+```
+
+## Group by day in a time zone
+
+A day in Oslo starts at 23:00 or 22:00 UTC, depending on daylight saving
+time. `query_group` takes care of that:
+
+```rust
+let days = Group::new(Unit::Day).timezone("Europe/Oslo");
+for b in client.query_group(id, .., Some(&days), QueryOpts::asc())? {
+    println!("{} {}", b.start, b.sum);   // b.start is the UTC time the local day begins
+}
+```
+
+Units are `Second`, `Minute`, `Hour`, `Day`, `Week`, `Month`, `Quarter`
+and `Year`; `.count(15)` with `Unit::Minute` gives quarter hours. A time zone
+is a name such as `"Europe/Oslo"` (read from `/usr/share/zoneinfo`), an
+offset such as `"+02:00"`, or `"UTC"`.
+
+The server only knows UTC. The client works out when each local day begins
+and sends those times (`calendar_bounds` and `query_bounds` let you do the
+two steps yourself). With a server older than protocol version 4, the client
+sends the zone name instead.
+
+## Value types and nulls
+
+`series()` makes series of 32-bit floats. For other types, use
+`series_create` with a `ValueType`: `Float32`, `Float64`, `Int64`, `Bool` or
+`State` (a small number that stands for a name, such as "on" or "off").
+
+A null is a missing value. Use `Column::from_options` to insert values with
+nulls, and `query_rows` to read any type back:
+
+```rust
+let starts = client.series_create("pump7.starts", ValueType::Int64, None)?;
+client.insert_series_values(starts, &[t0, t0 + 1000], &Column::from_options([Some(3i64), None]))?;
+let rows = client.query_rows(starts, .., QueryOpts::asc())?;
+println!("{:?}", rows.values.to_options::<i64>());   // Some([Some(3), None])
+```
+
+Aggregates skip nulls. For int64 and bool series, `isum`, `imin` and `imax`
+in a bucket are exact (the float fields may round).
+
+## Compression
+
+Inserts are compressed with zstd before they are sent (level 1). This makes
+them smaller on the network and usually faster. To change it:
+
+```rust
+client.set_compression(0)?;   // off: send plain arrays
+client.set_compression(3)?;   // smaller, but uses more CPU
+```
+
+Servers older than protocol version 3 always get uncompressed inserts.
 
 ## Insert benchmark
 
-`examples/insert_bench.rs` loads a RowBinary file (u32 series, i64 ts, f32
-value) the way `tsdbc-bench load` does, and reports rows/s and bytes sent per row:
+`examples/insert_bench.rs` measures how fast inserts go. Make a test file
+with `tsdb-bench`, then load it over 4 connections:
 
 ```sh
 ../../build/tsdb-bench --export /tmp/x.rb --series 10 --points 100000
 cargo run --release --example insert_bench -- /tmp/x.rb --addr 127.0.0.1:7070 --conns 4 --compression 1
 ```
 
+It prints rows per second and bytes sent per row. Try `--compression 0` to compare.
+
+## API documentation
+
+```sh
+cargo doc --no-deps --open
+```
+
 ## Build and test
 
 ```sh
-make                         # in the repository root: builds build/tsdbd
+make                 # in the repository root: builds build/tsdbd
 cd client/rust
-cargo build
-cargo test                   # starts ../../build/tsdbd on free ports
+cargo test           # starts ../../build/tsdbd on free ports
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 ```
 
-The tests use `$TSDBD` instead of `../../build/tsdbd` if set (for example a
-sanitizer build), and put their data directories under `$TSDB_TEST_DIR` or
-the system temp directory.
+The tests use `$TSDBD` instead of `../../build/tsdbd` if it is set, and put
+their data under `$TSDB_TEST_DIR` or the system temp directory.
+`tests/fixtures/gen_calendar_fixtures.sh` regenerates the time zone test
+data from the C client.

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use pyo3::buffer::PyBuffer;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyList, PyTuple};
 
@@ -281,31 +281,90 @@ fn unit(name: &str) -> PyResult<tc::Unit> {
     })
 }
 
+/// A time zone argument: a name, or a `zoneinfo.ZoneInfo` (its `key`).
+fn zone_name(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(s);
+    }
+    if let Ok(key) = obj.getattr("key")
+        && let Ok(s) = key.extract::<String>()
+    {
+        return Ok(s);
+    }
+    Err(PyTypeError::new_err("timezone must be a str or a zoneinfo.ZoneInfo with a key"))
+}
+
 // --------------------------------------------------------------- results
 
-/// One aggregate bucket.
-#[pyclass(frozen, get_all, module = "tsdb_client")]
+/// One aggregate bucket, as returned by query_agg, query_group and query_bounds.
+///
+/// Aggregates skip nulls. Buckets without rows are not returned; a bucket
+/// whose rows are all null is returned with count 0. Two buckets are equal
+/// when all their fields are (floats compared bit for bit).
+#[pyclass(frozen, module = "tsdb_client")]
 struct Bucket {
-    /// Bucket start, ms since the epoch.
     start: i64,
-    /// Number of known values.
     count: u64,
-    /// Sum of the values.
     sum: f64,
-    /// Smallest value.
     min: f64,
-    /// Largest value.
     max: f64,
-    /// Exact sum (int64 and bool series).
     isum: i64,
-    /// Exact minimum (int64 and bool series).
     imin: i64,
-    /// Exact maximum (int64 and bool series).
     imax: i64,
 }
 
 #[pymethods]
 impl Bucket {
+    /// Start of the bucket, ms since the epoch (UTC). For a single bucket
+    /// over the whole range, the start of the range.
+    #[getter]
+    fn start(&self) -> i64 {
+        self.start
+    }
+
+    /// Number of known (not null) values in the bucket.
+    #[getter]
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Sum of the values, as a float.
+    #[getter]
+    fn sum(&self) -> f64 {
+        self.sum
+    }
+
+    /// Smallest value (NaN if there is none).
+    #[getter]
+    fn min(&self) -> f64 {
+        self.min
+    }
+
+    /// Largest value (NaN if there is none).
+    #[getter]
+    fn max(&self) -> f64 {
+        self.max
+    }
+
+    /// Exact sum for int64 and bool series (true counts 1); saturates at the
+    /// int64 limits.
+    #[getter]
+    fn isum(&self) -> i64 {
+        self.isum
+    }
+
+    /// Exact smallest value for int64 and bool series.
+    #[getter]
+    fn imin(&self) -> i64 {
+        self.imin
+    }
+
+    /// Exact largest value for int64 and bool series.
+    #[getter]
+    fn imax(&self) -> i64 {
+        self.imax
+    }
+
     /// The mean, sum / count (0 for an empty bucket).
     #[getter]
     fn avg(&self) -> f64 {
@@ -348,8 +407,8 @@ fn buckets(v: Vec<tc::Bucket>) -> Vec<Bucket> {
     v.into_iter().map(Bucket::from).collect()
 }
 
-/// Database statistics.
-#[pyclass(frozen, get_all, module = "tsdb_client")]
+/// Database statistics, as returned by Client.stats().
+#[pyclass(frozen, module = "tsdb_client")]
 struct Stats {
     parts: u64,
     partitions: u64,
@@ -363,6 +422,54 @@ struct Stats {
 
 #[pymethods]
 impl Stats {
+    /// Parts (files of sorted rows) on disk.
+    #[getter]
+    fn parts(&self) -> u64 {
+        self.parts
+    }
+
+    /// Partitions (time ranges, one day each by default).
+    #[getter]
+    fn partitions(&self) -> u64 {
+        self.partitions
+    }
+
+    /// Rows stored in parts.
+    #[getter]
+    fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Bytes of the parts on disk.
+    #[getter]
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Merges of parts done since the server started.
+    #[getter]
+    fn merges(&self) -> u64 {
+        self.merges
+    }
+
+    /// Rows written by those merges.
+    #[getter]
+    fn merged_rows(&self) -> u64 {
+        self.merged_rows
+    }
+
+    /// Blocks of rows that merges copied without decompressing them.
+    #[getter]
+    fn passthrough_granules(&self) -> u64 {
+        self.passthrough_granules
+    }
+
+    /// Rows held in memory (and in the write-ahead log), not yet in parts.
+    #[getter]
+    fn memtable_rows(&self) -> u64 {
+        self.memtable_rows
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Stats(parts={}, partitions={}, rows={}, bytes={}, merges={}, merged_rows={}, \
@@ -394,8 +501,13 @@ impl From<tc::Stats> for Stats {
     }
 }
 
-/// What the server did for this connection's previous query.
-#[pyclass(frozen, get_all, module = "tsdb_client")]
+/// What the server did for this connection's previous query, as returned by
+/// Client.last_query_stats().
+///
+/// The server stores rows in blocks ("granules") of up to 8192 rows, each
+/// with its count, sum, min and max. An aggregate over whole blocks reads
+/// those numbers instead of decompressing the rows.
+#[pyclass(frozen, module = "tsdb_client")]
 struct QueryStats {
     elapsed_s: f64,
     rows: u64,
@@ -412,6 +524,72 @@ struct QueryStats {
 
 #[pymethods]
 impl QueryStats {
+    /// Seconds the server spent on the query.
+    #[getter]
+    fn elapsed_s(&self) -> f64 {
+        self.elapsed_s
+    }
+
+    /// Rows covered: rows_decoded + rows_from_stats + memtable_rows.
+    #[getter]
+    fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Rows decompressed (whole granules).
+    #[getter]
+    fn rows_decoded(&self) -> u64 {
+        self.rows_decoded
+    }
+
+    /// Rows answered from granule statistics, without decompressing them.
+    #[getter]
+    fn rows_from_stats(&self) -> u64 {
+        self.rows_from_stats
+    }
+
+    /// Rows read from memory (not yet in parts).
+    #[getter]
+    fn memtable_rows(&self) -> u64 {
+        self.memtable_rows
+    }
+
+    /// Uncompressed size of the rows covered (timestamp and value).
+    #[getter]
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Compressed bytes of the granules decompressed.
+    #[getter]
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Parts with rows of the series in the range.
+    #[getter]
+    fn parts(&self) -> u64 {
+        self.parts
+    }
+
+    /// Granules of those parts in the range.
+    #[getter]
+    fn granules(&self) -> u64 {
+        self.granules
+    }
+
+    /// Granules answered from their statistics.
+    #[getter]
+    fn granules_from_stats(&self) -> u64 {
+        self.granules_from_stats
+    }
+
+    /// Rows, or buckets, returned.
+    #[getter]
+    fn result_rows(&self) -> u64 {
+        self.result_rows
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "QueryStats(elapsed_s={:?}, rows={}, rows_decoded={}, rows_from_stats={}, memtable_rows={}, bytes={}, \
@@ -483,7 +661,22 @@ impl Inner {
     }
 }
 
-/// A connection to tsdbd.
+/// One TCP connection to tsdbd.
+///
+/// Use it as a context manager (``with Client(...) as c:``) or call close().
+/// Network calls release the GIL: threads can share one client (they take
+/// turns) or open one each.
+///
+/// Args:
+///     host: Server name or address.
+///     port: Server port (7070 by default).
+///     timeout: Seconds to wait for the connection and for every later read
+///         or write; None waits forever. A call that times out closes the
+///         client.
+///
+/// Raises:
+///     TsdbError: The connection failed.
+///     ValueError: timeout is not a positive number.
 #[pyclass(module = "tsdb_client")]
 struct Client {
     inner: Mutex<Inner>,
@@ -559,8 +752,6 @@ fn connect(host: &str, port: u16, timeout: Option<Duration>) -> tc::Result<tc::C
 
 #[pymethods]
 impl Client {
-    /// Connects to tsdbd. `timeout` (seconds) bounds the connect and every
-    /// later socket read or write; a call that times out closes the client.
     #[new]
     #[pyo3(signature = (host = "127.0.0.1", port = 7070, timeout = None))]
     fn new(py: Python<'_>, host: &str, port: u16, timeout: Option<f64>) -> PyResult<Self> {
@@ -574,17 +765,25 @@ impl Client {
         Ok(Client { inner: Mutex::new(Inner { conn: Some(c), ..Inner::default() }), addr: format!("{host}:{port}") })
     }
 
-    /// Waits for pending inserts, then closes the connection. Closing twice is fine.
+    /// Waits for pending inserts, then closes the connection.
+    ///
+    /// Closing twice is fine. Any later call raises TsdbError (ERR_IO).
+    ///
+    /// Raises:
+    ///     TsdbError: The first error among the pending inserts.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.with_inner(py, |i| i.conn.take().map_or(Ok(()), tc::Client::close))
     }
 
+    /// Returns the client itself, to use in a with statement.
     fn __enter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    /// Closes the client: waiting for pending inserts if the block succeeded,
-    /// dropping the connection at once if it raised.
+    /// Closes the client at the end of a with block.
+    ///
+    /// If the block succeeded, this waits for pending inserts as close()
+    /// does; if it raised, the connection is dropped at once.
     #[pyo3(signature = (exc_type, _exc, _tb))]
     fn __exit__(
         &self,
@@ -609,26 +808,48 @@ impl Client {
         format!("<tsdb_client.Client {} {}>", self.addr, if open { "open" } else { "closed" })
     }
 
-    /// The server's protocol version.
+    /// Returns the protocol version the server speaks.
+    ///
+    /// Version 3 added compressed inserts, version 4 grouping in time zones
+    /// by the client (query_bounds).
     fn protocol_version(&self, py: Python<'_>) -> PyResult<u32> {
         self.with(py, |c| c.protocol_version())
     }
 
-    /// The id of series `name`: created (as float32) if needed when `create`,
-    /// else TsdbError (ERR_NOTFOUND) if it does not exist.
+    /// Returns the id of a series, creating it (as float32) if needed.
+    ///
+    /// Args:
+    ///     name: The series name, such as "pump7.flow".
+    ///     create: If False, do not create the series.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_NOTFOUND if create is False and there is no such series.
     #[pyo3(signature = (name, create = true))]
     fn series(&self, py: Python<'_>, name: &str, create: bool) -> PyResult<u32> {
         self.with(py, |c| if create { c.series(name) } else { c.series_lookup(name) })
     }
 
-    /// The id of series `name`, created (as float32) in the volume `path` on the server if needed.
+    /// Returns the id of a series, creating it (as float32) in a volume if needed.
+    ///
+    /// Args:
+    ///     name: The series name.
+    ///     path: A directory on the server for the new series (a volume);
+    ///         it only matters when the series is created.
     fn series_at(&self, py: Python<'_>, name: &str, path: &str) -> PyResult<u32> {
         self.with(py, |c| c.series_at(name, path))
     }
 
-    /// The id of series `name` of `value_type`, created if needed (in volume
-    /// `path`, or the database directory). An existing series of another type
-    /// is TsdbError (ERR_INVALID).
+    /// Returns the id of a series of a given value type, creating it if needed.
+    ///
+    /// Args:
+    ///     name: The series name.
+    ///     value_type: "float32", "float64", "int64", "bool" or "state".
+    ///     path: A directory on the server for the new series (a volume);
+    ///         None means the database directory.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID if the series exists with another type.
+    ///     ValueError: Unknown value_type.
     #[pyo3(signature = (name, value_type = "float32", path = None))]
     fn series_create(&self, py: Python<'_>, name: &str, value_type: &str, path: Option<&str>) -> PyResult<u32> {
         let ty = self::value_type(value_type)?;
@@ -639,33 +860,59 @@ impl Client {
         })
     }
 
-    /// The value type of series `id`: "float32", "float64", "int64", "bool" or "state".
+    /// Returns the value type of a series: "float32", "float64", "int64", "bool" or "state".
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_NOTFOUND if there is no such series.
     fn series_type(&self, py: Python<'_>, id: u32) -> PyResult<&'static str> {
         self.with_inner(py, |i| i.series_type(id)).map(ValueType::name)
     }
 
-    /// The name of series `id`.
+    /// Returns the name of a series.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_NOTFOUND if there is no such series.
     fn series_name(&self, py: Python<'_>, id: u32) -> PyResult<String> {
         self.with(py, |c| c.series_name(id))
     }
 
-    /// The code of state `name` for `series` (its volume's dictionary), created if needed.
+    /// Returns the code of a state name, creating it if needed.
+    ///
+    /// State series store small integer codes; the server keeps their names.
+    /// Codes start at 1 and never change.
+    ///
+    /// Args:
+    ///     series: A series id; its volume holds the names.
+    ///     name: The state name, such as "running".
     fn state(&self, py: Python<'_>, series: u32, name: &str) -> PyResult<u32> {
         self.with(py, |c| c.state(series, name))
     }
 
-    /// The code of an existing state; TsdbError (ERR_NOTFOUND) if there is none.
+    /// Returns the code of an existing state name.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_NOTFOUND if the name has no code.
     fn state_lookup(&self, py: Python<'_>, series: u32, name: &str) -> PyResult<u32> {
         self.with(py, |c| c.state_lookup(series, name))
     }
 
-    /// The name of state `code`; TsdbError (ERR_NOTFOUND) for an unknown code.
+    /// Returns the name of a state code.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_NOTFOUND for an unknown code.
     fn state_name(&self, py: Python<'_>, series: u32, code: u32) -> PyResult<String> {
         self.with_inner(py, |i| i.state_name(series, code))
     }
 
-    /// The names of state codes (a list, array or masked array, as returned by
-    /// query_values); None and masked entries give None. Names are cached.
+    /// Returns the names of many state codes.
+    ///
+    /// Args:
+    ///     series: A series id; its volume holds the names.
+    ///     codes: A list, array or masked array of codes, as query_values
+    ///         returns them. None and masked entries give None.
+    ///
+    /// Returns:
+    ///     A list of names. Names are cached in the client.
     fn state_names(&self, py: Python<'_>, series: u32, codes: &Bound<'_, PyAny>) -> PyResult<Vec<Option<String>>> {
         let col = py_column(codes, ValueType::State)?;
         self.with_inner(py, |i| {
@@ -676,7 +923,19 @@ impl Client {
         })
     }
 
-    /// Inserts float32 rows of one series and waits until the server has applied them.
+    /// Inserts float32 rows into one series and waits until the server has them.
+    ///
+    /// Writing a timestamp that already has a value replaces it: the last
+    /// write wins.
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     ts: Timestamps, ms since the epoch: a list of ints or an int64 array.
+    ///     values: One float per timestamp: a list or a float32/float64 array.
+    ///
+    /// Raises:
+    ///     TsdbError: The server refused the rows (ERR_INVALID for a series
+    ///         that is not float32).
     fn insert_series(
         &self,
         py: Python<'_>,
@@ -688,7 +947,12 @@ impl Client {
         self.with(py, |c| c.insert_series(series, &ts, &values))
     }
 
-    /// Inserts float32 rows of many series (`series[i]` is the series of row i) and waits.
+    /// Inserts float32 rows into many series and waits.
+    ///
+    /// Args:
+    ///     series: The series id of each row: a list of ints or a uint32 array.
+    ///     ts: The timestamp of each row, ms since the epoch.
+    ///     values: The value of each row.
     fn insert(
         &self,
         py: Python<'_>,
@@ -700,8 +964,10 @@ impl Client {
         self.with(py, |c| c.insert(&series, &ts, &values))
     }
 
-    /// Sends float32 rows of one series without waiting; errors come from
-    /// wait() or from the next call that reads a reply.
+    /// Sends float32 rows of one series without waiting for the answer.
+    ///
+    /// Faster for many small inserts. An error is raised by wait(), or by
+    /// the next call that waits for the server.
     fn insert_series_async(
         &self,
         py: Python<'_>,
@@ -713,7 +979,7 @@ impl Client {
         self.with(py, |c| c.insert_series_async(series, &ts, &values))
     }
 
-    /// Sends float32 rows of many series without waiting.
+    /// Sends float32 rows of many series without waiting; see insert_series_async().
     fn insert_async(
         &self,
         py: Python<'_>,
@@ -725,8 +991,18 @@ impl Client {
         self.with(py, |c| c.insert_async(&series, &ts, &values))
     }
 
-    /// Inserts typed values (None or masked = null) into one series and
-    /// waits. `value_type` defaults to the series' type (asked once, then cached).
+    /// Inserts values of any type, with nulls, into one series and waits.
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     ts: Timestamps, ms since the epoch.
+    ///     values: A list with None for nulls, a numpy array, or a numpy
+    ///         masked array (masked = null).
+    ///     value_type: The series' type. None asks the server once and
+    ///         remembers it.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID if value_type is not the series' type.
     #[pyo3(signature = (series, ts, values, *, value_type = None))]
     fn insert_series_values(
         &self,
@@ -739,7 +1015,9 @@ impl Client {
         self.insert_typed(py, Some(series), None, ts, values, value_type, true)
     }
 
-    /// Inserts typed values into many series of one type and waits.
+    /// Inserts values of any type into many series of that type and waits.
+    ///
+    /// As insert_series_values(), with a series id per row.
     #[pyo3(signature = (series, ts, values, *, value_type = None))]
     fn insert_values(
         &self,
@@ -752,7 +1030,7 @@ impl Client {
         self.insert_typed(py, None, Some(series), ts, values, value_type, true)
     }
 
-    /// Sends typed values for one series without waiting.
+    /// Sends values of any type into one series without waiting; see insert_series_async().
     #[pyo3(signature = (series, ts, values, *, value_type = None))]
     fn insert_series_values_async(
         &self,
@@ -765,7 +1043,7 @@ impl Client {
         self.insert_typed(py, Some(series), None, ts, values, value_type, false)
     }
 
-    /// Sends typed values for many series without waiting.
+    /// Sends values of any type into many series without waiting; see insert_series_async().
     #[pyo3(signature = (series, ts, values, *, value_type = None))]
     fn insert_values_async(
         &self,
@@ -778,20 +1056,29 @@ impl Client {
         self.insert_typed(py, None, Some(series), ts, values, value_type, false)
     }
 
-    /// Collects the acknowledgements of pending inserts; raises the first error.
+    /// Waits for the answers to all inserts sent without waiting.
+    ///
+    /// Raises:
+    ///     TsdbError: The first error among them.
     fn wait(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |c| c.wait())
     }
 
-    /// Inserts sent but not yet acknowledged.
+    /// Number of inserts sent but not yet answered.
     #[getter]
     fn pending(&self, py: Python<'_>) -> PyResult<usize> {
         self.with(py, |c| Ok(c.pending()))
     }
 
-    /// Sets the zstd level of inserts: 0 sends plain arrays; any other level
-    /// zstd accepts (1, the default; negative is faster) packs them when the
-    /// server speaks protocol version 3.
+    /// Sets how much inserts are compressed (zstd level).
+    ///
+    /// Args:
+    ///     level: 0 turns compression off; 1 (the default) is fast, higher
+    ///         levels compress more, negative levels are faster still. Servers
+    ///         older than protocol version 3 always get uncompressed inserts.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for a level zstd does not have.
     fn set_compression(&self, py: Python<'_>, level: i32) -> PyResult<()> {
         self.with(py, |c| c.set_compression(level))
     }
@@ -802,15 +1089,30 @@ impl Client {
         self.with(py, |c| Ok(c.compression()))
     }
 
-    /// Bytes written to the socket by this client so far.
+    /// Bytes this client has written to the network so far.
     #[getter]
     fn bytes_sent(&self, py: Python<'_>) -> PyResult<u64> {
         self.with(py, |c| Ok(c.bytes_sent()))
     }
 
-    /// Raw points of a float32 `series` in [start, end) as (timestamps,
-    /// values): numpy arrays (int64, float32) if numpy is importable and
-    /// `numpy` is not False, else lists. Nulls read as NaN.
+    /// Returns the raw rows of a float32 series.
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     start: First timestamp to include (ms); None for no lower limit.
+    ///     end: Timestamp to stop before (ms); None for no upper limit.
+    ///     order: "asc" (oldest first) or "desc" (newest first).
+    ///     limit: At most this many rows; None for all, 0 for none.
+    ///     numpy: True for numpy arrays, False for lists, None for numpy
+    ///         arrays if numpy is installed.
+    ///
+    /// Returns:
+    ///     (timestamps, values): int64 and float32 arrays, or lists of int and
+    ///     float. Nulls read as NaN.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for a series that is not float32 (use
+    ///         query_values()).
     #[pyo3(signature = (series, start = None, end = None, *, order = "asc", limit = None, numpy = None))]
     #[allow(clippy::too_many_arguments)]
     fn query_raw<'py>(
@@ -828,7 +1130,7 @@ impl Client {
         points_to_py(py, p, numpy)
     }
 
-    /// Same as query_raw (the collecting call is query_points in the Rust and C clients).
+    /// The same as query_raw() (its name in the Rust and C clients).
     #[pyo3(signature = (series, start = None, end = None, *, order = "asc", limit = None, numpy = None))]
     #[allow(clippy::too_many_arguments)]
     fn query_points<'py>(
@@ -844,9 +1146,14 @@ impl Client {
         self.query_raw(py, series, start, end, order, limit, numpy)
     }
 
-    /// Rows of a series of any type as (timestamps, values). With numpy: an
-    /// int64 array and a numpy.ma.MaskedArray (float32, float64, int64, bool
-    /// or uint32 state codes; masked = null). Without: lists, None for nulls.
+    /// Returns the raw rows of a series of any type, with nulls.
+    ///
+    /// Takes the same arguments as query_raw().
+    ///
+    /// Returns:
+    ///     (timestamps, values). With numpy: an int64 array and a
+    ///     numpy.ma.MaskedArray (masked = null) of float32, float64, int64,
+    ///     bool or uint32 (state codes). Without: two lists, None for nulls.
     #[pyo3(signature = (series, start = None, end = None, *, order = "asc", limit = None, numpy = None))]
     #[allow(clippy::too_many_arguments)]
     fn query_values<'py>(
@@ -865,7 +1172,21 @@ impl Client {
         PyTuple::new(py, [ts_to_py(py, np.as_ref(), &rows.ts)?, column_to_py(py, np.as_ref(), &rows.values)?])
     }
 
-    /// Buckets of `interval_ms` aligned to the epoch (0: one bucket for the range).
+    /// Aggregates a series into buckets of a fixed length.
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     start: First timestamp to include (ms); None for no lower limit.
+    ///     end: Timestamp to stop before (ms); None for no upper limit.
+    ///     interval_ms: Bucket length in ms; buckets start at multiples of it
+    ///         since the epoch. 0 gives one bucket for the whole range.
+    ///
+    /// Returns:
+    ///     A list of Bucket, oldest first; empty buckets are left out.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for a negative interval, ERR_TOO_MANY_BUCKETS
+    ///         if the range holds too many buckets.
     #[pyo3(signature = (series, start = None, end = None, interval_ms = 0))]
     fn query_agg(
         &self,
@@ -878,8 +1199,35 @@ impl Client {
         self.with(py, |c| c.query_agg(series, range(start, end), interval_ms)).map(buckets)
     }
 
-    /// Buckets of `count` calendar `unit`s in `timezone` (None: UTC); unit
-    /// None gives one bucket for the whole range.
+    /// Aggregates a series by calendar periods, such as days in a time zone.
+    ///
+    /// Days, weeks (from Monday), months, quarters and years follow the local
+    /// calendar: a day across a daylight saving change lasts 23 or 25 hours.
+    /// Seconds, minutes and hours have a fixed length. For a zone other than
+    /// UTC the client computes where the local periods begin and sends those
+    /// times (query_bounds()); a server older than protocol version 4 gets
+    /// the zone itself.
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     start: First timestamp to include (ms); None for no lower limit.
+    ///     end: Timestamp to stop before (ms); None for no upper limit.
+    ///     unit: "second", "minute", "hour", "day", "week", "month",
+    ///         "quarter" or "year"; None gives one bucket for the whole range.
+    ///     count: Units per bucket, counted from 1970 (count=15 with
+    ///         unit="minute" gives quarter hours).
+    ///     timezone: "UTC" (or None), a fixed offset such as "+02:00", an
+    ///         IANA name such as "Europe/Oslo", or a zoneinfo.ZoneInfo.
+    ///     order: "asc" (oldest first) or "desc" (newest first).
+    ///     limit: At most this many buckets; None for all.
+    ///
+    /// Returns:
+    ///     A list of Bucket; empty buckets are left out. A bucket's start is
+    ///     the UTC time its local period begins.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for an unknown time zone.
+    ///     ValueError: Unknown unit or order.
     #[pyo3(signature = (series, start = None, end = None, *, unit = None, count = 1, timezone = None,
                         order = "asc", limit = None))]
     #[allow(clippy::too_many_arguments)]
@@ -891,48 +1239,149 @@ impl Client {
         end: Option<i64>,
         unit: Option<&str>,
         count: u32,
-        timezone: Option<String>,
+        timezone: Option<&Bound<'_, PyAny>>,
         order: &str,
         limit: Option<u64>,
     ) -> PyResult<Vec<Bucket>> {
         let o = opts(order, limit)?;
+        let timezone = timezone.map(zone_name).transpose()?;
         let group = unit.map(self::unit).transpose()?.map(|u| tc::Group { unit: u, count, timezone });
         self.with(py, |c| c.query_group(series, range(start, end), group.as_ref(), o)).map(buckets)
     }
 
-    /// Makes everything written so far durable.
+    /// Aggregates a series into buckets that start at the given times.
+    ///
+    /// Bucket i holds the rows from bounds[i] up to bounds[i + 1]; the last
+    /// one holds the rows up to end. Rows before bounds[0] are left out.
+    /// calendar_bounds() computes such bounds for local days, weeks, months,
+    /// quarters or years; query_group() does both steps. Needs a server of
+    /// protocol version 4.
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     bounds: Bucket starts, ms since the epoch, strictly increasing: a
+    ///         list of ints or an int64 array.
+    ///     start: First timestamp to include (ms); None for no lower limit.
+    ///     end: Timestamp to stop before (ms); None for no upper limit.
+    ///     order: "asc" (oldest first) or "desc" (newest first).
+    ///     limit: At most this many buckets; None for all.
+    ///
+    /// Returns:
+    ///     A list of Bucket; empty buckets are left out.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID if bounds is empty or does not increase, or
+    ///         from a server older than version 4.
+    #[pyo3(signature = (series, bounds, start = None, end = None, *, order = "asc", limit = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_bounds(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        bounds: &Bound<'_, PyAny>,
+        start: Option<i64>,
+        end: Option<i64>,
+        order: &str,
+        limit: Option<u64>,
+    ) -> PyResult<Vec<Bucket>> {
+        let o = opts(order, limit)?;
+        let bounds = ts_column(bounds)?;
+        self.with(py, |c| c.query_bounds(series, range(start, end), &bounds, o)).map(buckets)
+    }
+
+    /// Makes everything written so far durable on the server's disk.
     fn commit(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |c| c.commit())
     }
 
-    /// Commits, then turns the server's memtable into parts.
+    /// Commits, then writes the rows the server holds in memory to parts on disk.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |c| c.flush())
     }
 
-    /// Merges every partition down to one part.
+    /// Merges the parts of every partition into one (slow on big databases).
     fn optimize(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |c| c.optimize())
     }
 
-    /// Database statistics.
+    /// Returns database statistics (a Stats).
     fn stats(&self, py: Python<'_>) -> PyResult<Stats> {
         self.with(py, |c| c.stats()).map(Stats::from)
     }
 
-    /// What the server did for this connection's previous query: rows
-    /// covered, decoded or answered from granule statistics, bytes, time.
+    /// Returns what the server did for this connection's previous query (a QueryStats).
+    ///
+    /// Rows covered, decompressed or answered from block statistics, bytes
+    /// and time. All zero before the first query.
     fn last_query_stats(&self, py: Python<'_>) -> PyResult<QueryStats> {
         self.with(py, |c| c.last_query_stats()).map(QueryStats::from)
     }
 }
 
-/// The text for a TSDB_ERR_* code.
+/// Returns the text for a TSDB_ERR_* code, such as ERR_NOTFOUND.
 #[pyfunction]
 fn strerror(code: i32) -> &'static str {
     tc::strerror(code)
 }
 
+/// Returns the UTC times at which local calendar periods begin.
+///
+/// These are the bucket starts query_group() uses for a time zone, and what
+/// query_bounds() takes. The result is the same as the C client's
+/// tsdb_calendar_bounds.
+///
+/// Args:
+///     timezone: "UTC", a fixed offset such as "+02:00" or "-0530", an IANA
+///         name such as "Europe/Oslo" (read from /usr/share/zoneinfo, or
+///         $TZDIR), or a zoneinfo.ZoneInfo.
+///     unit: "second", "minute", "hour", "day", "week", "month", "quarter"
+///         or "year". Days and longer follow the local calendar; seconds to
+///         hours have a fixed length, aligned in the zone's standard time.
+///     start: Start of the range, ms since the epoch.
+///     end: End of the range (not included), ms since the epoch.
+///     count: Units per period, counted from 1970 in local time (0 counts
+///         as 1).
+///
+/// Returns:
+///     The start (ms, UTC) of every period that overlaps [start, end),
+///     strictly increasing. A local midnight that happens twice begins its
+///     day the first time; one that is skipped begins it when the clock
+///     jumps.
+///
+/// Raises:
+///     TsdbError: ERR_INVALID for an unknown time zone or more than 64 Mi
+///         periods.
+///     ValueError: Unknown unit.
+#[pyfunction]
+#[pyo3(signature = (timezone, unit, start, end, count = 1))]
+fn calendar_bounds(
+    py: Python<'_>,
+    timezone: &Bound<'_, PyAny>,
+    unit: &str,
+    start: i64,
+    end: i64,
+    count: u32,
+) -> PyResult<Vec<i64>> {
+    let (zone, unit) = (zone_name(timezone)?, self::unit(unit)?);
+    py.detach(|| tc::calendar_bounds(&zone, unit, count, start..end)).map_err(|e| to_pyerr(py, e))
+}
+
+/// Client for tsdbd, the TCP server of the tsdb time series database.
+///
+/// Connect with Client, create series, insert rows and read them back, raw
+/// or aggregated into buckets. Timestamps are int milliseconds since
+/// 1970-01-01 UTC. Time ranges are [start, end): start is included, end is
+/// not, and None means no limit.
+///
+/// Example:
+///     >>> from tsdb_client import Client
+///     >>> with Client("127.0.0.1", 7070) as c:
+///     ...     s = c.series("pump7.flow")
+///     ...     c.insert_series(s, [1_700_000_000_000], [4.5])
+///     ...     c.query_raw(s, numpy=False)
+///     ([1700000000000], [4.5])
+///
+/// Errors are raised as TsdbError; its code is one of the ERR_* numbers.
 #[pymodule]
 fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
@@ -941,6 +1390,7 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<QueryStats>()?;
     m.add("TsdbError", m.py().get_type::<TsdbError>())?;
     m.add_function(wrap_pyfunction!(strerror, m)?)?;
+    m.add_function(wrap_pyfunction!(calendar_bounds, m)?)?;
     m.add("DEFAULT_PORT", tc::DEFAULT_PORT)?;
     m.add("PROTOCOL_VERSION", tc::PROTOCOL_VERSION)?;
     m.add("DEFAULT_COMPRESSION", tc::DEFAULT_COMPRESSION)?;

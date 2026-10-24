@@ -2,7 +2,7 @@
 name = "tsdb-client-python"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Python binding (PyO3) for the tsdbd client"
 publish = false
 

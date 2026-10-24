@@ -150,7 +150,7 @@ fn hello_does_not_swallow_a_pending_error() {
     // ...and has learned the server's version anyway: later inserts go packed
     c.insert_series(id, &[T0 + 1], &[2.0]).unwrap();
     assert_eq!(c.query_points(id, .., QueryOpts::asc()).unwrap().values, vec![2.0]);
-    assert_eq!(c.protocol_version().unwrap(), 3);
+    assert_eq!(c.protocol_version().unwrap(), tsdb_client::PROTOCOL_VERSION);
 }
 
 /// One request a fake server saw: op and, for INSERT_VALUES, the flags and body.
