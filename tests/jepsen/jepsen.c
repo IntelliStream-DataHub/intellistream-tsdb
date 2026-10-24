@@ -26,6 +26,15 @@
  * SIGTERM).
  * After each fault the server is restarted.
  *
+ * Power runs also start a follower: a second tsdbd with --follow over the same
+ * directory, outside the shim, as a query server on another host would be. It
+ * lives across every writer restart, so it tails whatever a power loss leaves
+ * behind (torn and rolled back WAL tails, intents, half-written MANIFESTs).
+ * Its reads may be stale, but each value they show must be valid (as in 2,
+ * and from a write that had begun); it must not die, its reads must not keep
+ * failing for FOLLOW_FAIL_S, and at the end it must catch up with the final
+ * state.
+ *
  * Checks, with applied(w) = acknowledged, or found in the final state, or seen
  * by a read:
  *  1. durability and order: for every applied write w and each key k it wrote,
@@ -63,6 +72,9 @@
 #define KEY_MS 2000      /* keys every 2 s: 6000 keys span 3.3 hours */
 #define PARTITION_MS 3600000LL
 #define MAX_OPS 2000000
+#define MAX_FREADS 200000
+#define FOLLOW_FAIL_S 10 /* longest run of failed follower reads */
+#define FOLLOW_CATCHUP_S 20
 
 typedef enum { ST_PENDING, ST_OK, ST_FAIL, ST_INFO } status;
 
@@ -98,6 +110,12 @@ static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
 static int restarts;
 static char markpath[PATH_MAX]; /* eio: crashfs writes the path of the file it failed here */
 static int failstops, eio_problems;
+static int fport;                   /* the follower; 0 = none */
+static atomic_int follower_pid;
+static char flogpath[PATH_MAX];     /* its stderr */
+static rop *freads;
+static atomic_uint nfreads;
+static int64_t ffail_longest;       /* ns, the longest run of failed follower reads */
 
 static int64_t now_ns(void)
 {
@@ -197,6 +215,117 @@ static void stop_server(int sig)
         waitpid(pid, &st, 0);
         atomic_store(&server_pid, 0);
     }
+}
+
+/* ----------------------------------------------------------- the follower */
+
+static const char *tsdbd_path(void) { return getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd"; }
+
+static void start_follower(void)
+{
+    char portstr[16];
+    snprintf(portstr, sizeof portstr, "%d", fport);
+    pid_t pid = fork();
+    if (pid == 0) { /* never under the shim: it plays a reader on another host */
+        unsetenv("LD_PRELOAD");
+        int log = open(flogpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (log >= 0)
+            dup2(log, 2);
+        execl(tsdbd_path(), "tsdbd", "--dir", dir, "--port", portstr, "--workers", "2", "--follow",
+              getenv("TSDBD_IO") ? "--io" : NULL, getenv("TSDBD_IO"), (char *)NULL);
+        _exit(127);
+    }
+    atomic_store(&follower_pid, pid);
+    for (int i = 0; i < 300; i++) {
+        tsdbc *c;
+        if (tsdbc_connect("127.0.0.1", fport, &c) == 0) {
+            tsdbc_close(c);
+            return;
+        }
+        int st;
+        if (waitpid(pid, &st, WNOHANG) == pid) {
+            fprintf(stderr, "jepsen: the follower died while starting (status %#x), see %s\n", st, flogpath);
+            break;
+        }
+        usleep(20000);
+    }
+    fprintf(stderr, "jepsen: the follower does not come up\n");
+    signal_pid(atomic_load(&follower_pid), SIGKILL);
+    waitpid(pid, NULL, 0);
+    stop_server(SIGKILL);
+    exit(2);
+}
+
+/* Reads from the follower; any outcome but a failure is fine here, check_follower() judges the values. */
+static void kill_follower(void) /* at exit(2): no orphan */
+{
+    pid_t pid = atomic_load(&follower_pid);
+    if (pid > 0 && signal_pid(pid, SIGKILL) == 0)
+        waitpid(pid, NULL, 0);
+}
+
+static void *follower_reader(void *arg)
+{
+    (void)arg;
+    uint64_t r = mix(seed * 7919 + 5);
+    tsdbc *c = NULL;
+    int64_t fail_since = 0;
+    while (!atomic_load(&stop)) {
+        bool ok = false;
+        if (c || tsdbc_connect("127.0.0.1", fport, &c) == 0) {
+            uint32_t idx = atomic_fetch_add(&nfreads, 1);
+            if (idx >= MAX_FREADS)
+                break;
+            rop *q = &freads[idx];
+            r = mix(r);
+            q->series = (int)(r % NSERIES);
+            q->lo = (uint32_t)((r >> 12) % NKEYS);
+            q->hi = q->lo + 1 + (uint32_t)((r >> 30) % 400);
+            if (q->hi > NKEYS)
+                q->hi = NKEYS;
+            q->seen = calloc(q->hi - q->lo, sizeof *q->seen);
+            tsdb_points p;
+            q->invoke = now_ns();
+            int rc = tsdbc_query_points(c, ids[q->series], T0 + (int64_t)q->lo * KEY_MS, T0 + (int64_t)q->hi * KEY_MS,
+                                        &p);
+            q->complete = now_ns();
+            if (rc == 0) {
+                ok = true;
+                q->st = ST_OK;
+                for (size_t i = 0; i < p.n; i++) {
+                    int64_t k = (p.ts[i] - T0) / KEY_MS;
+                    if (k >= q->lo && k < q->hi && (p.ts[i] - T0) % KEY_MS == 0)
+                        q->seen[k - q->lo] = (uint32_t)p.values[i];
+                    else
+                        q->seen[0] = UINT32_MAX;
+                }
+                free(p.ts);
+                free(p.values);
+            } else {
+                q->st = ST_FAIL;
+                if (getenv("JEPSEN_VERBOSE") && !fail_since)
+                    fprintf(stderr, "jepsen: follower read failed: %s\n", tsdbc_strerror(rc));
+                tsdbc_close(c);
+                c = NULL;
+            }
+        } else {
+            c = NULL;
+        }
+        int64_t now = now_ns();
+        if (ok && fail_since) {
+            if (now - fail_since > ffail_longest)
+                ffail_longest = now - fail_since;
+            fail_since = 0;
+        } else if (!ok && !fail_since) {
+            fail_since = now;
+        }
+        usleep(ok ? 2000 : 10000); /* a reader, not a load: MAX_FREADS lasts for minutes */
+    }
+    if (fail_since && now_ns() - fail_since > ffail_longest)
+        ffail_longest = now_ns() - fail_since;
+    if (c)
+        tsdbc_close(c);
+    return NULL;
 }
 
 /* ------------------------------------------------------------ clients */
@@ -574,6 +703,101 @@ static int check(uint32_t final[NSERIES][NKEYS])
     return violations;
 }
 
+/* The follower's view of every series; nonzero if a read fails. */
+static int follower_state(uint32_t out[NSERIES][NKEYS])
+{
+    tsdbc *c;
+    if (tsdbc_connect("127.0.0.1", fport, &c) != 0)
+        return -1;
+    int rc = 0;
+    for (int s = 0; s < NSERIES && !rc; s++) {
+        memset(out[s], 0, sizeof out[s]);
+        tsdb_points p;
+        if ((rc = tsdbc_query_points(c, ids[s], INT64_MIN, INT64_MAX, &p)) != 0)
+            break;
+        for (size_t i = 0; i < p.n; i++) {
+            int64_t k = (p.ts[i] - T0) / KEY_MS;
+            if (k >= 0 && k < NKEYS)
+                out[s][k] = (uint32_t)p.values[i];
+        }
+        free(p.ts);
+        free(p.values);
+    }
+    tsdbc_close(c);
+    return rc;
+}
+
+/* With the clean writer still up: the follower is alive, its reads were valid and did not keep failing, and it
+ * catches up with `final`. Stops the follower. */
+static int check_follower(uint32_t final[NSERIES][NKEYS])
+{
+    int before = violations;
+    pid_t pid = atomic_load(&follower_pid);
+    int st;
+    if (waitpid(pid, &st, WNOHANG) == pid) {
+        VIOLATION("the follower died (status %#x), see %s\n", st, flogpath);
+        atomic_store(&follower_pid, 0);
+        return violations - before;
+    }
+    uint32_t nw = atomic_load(&nwrites), nr = atomic_load(&nfreads);
+    if (nw > MAX_OPS)
+        nw = MAX_OPS;
+    if (nr > MAX_FREADS)
+        nr = MAX_FREADS;
+    unsigned ok = 0;
+    uint64_t values = 0;
+    for (uint32_t i = 0; i < nr; i++) {
+        rop *q = &freads[i];
+        if (q->st != ST_OK)
+            continue;
+        ok++;
+        for (uint32_t k = q->lo; k < q->hi; k++)
+            values += q->seen[k - q->lo] != 0;
+        if (q->hi > q->lo && q->seen[0] == UINT32_MAX) {
+            VIOLATION("follower read %u: a row at a timestamp no write used\n", i);
+            continue;
+        }
+        for (uint32_t k = q->lo; k < q->hi; k++) {
+            uint32_t w = q->seen[k - q->lo];
+            if (!w)
+                continue;
+            if (w >= nw || writes[w].series != q->series || !wrote_key(w, k))
+                VIOLATION("follower read %u: key %u shows %u, which never wrote it\n", i, k, w);
+            else if (writes[w].st == ST_FAIL)
+                VIOLATION("follower read %u: key %u shows %u, which failed\n", i, k, w);
+            else if (writes[w].invoke > q->complete)
+                VIOLATION("follower read %u: key %u shows %u, which began after the read\n", i, k, w);
+        }
+    }
+    printf("follower: %u reads, %u ok, %llu values, longest run of failures %.1f s\n", nr, ok,
+           (unsigned long long)values, ffail_longest / 1e9);
+    if (ffail_longest > FOLLOW_FAIL_S * 1000000000LL)
+        VIOLATION("follower reads kept failing for %.1f s\n", ffail_longest / 1e9);
+    static uint32_t view[NSERIES][NKEYS];
+    int64_t deadline = now_ns() + FOLLOW_CATCHUP_S * 1000000000LL;
+    int rc;
+    bool same = false;
+    while (!(same = (rc = follower_state(view)) == 0 && !memcmp(view, final, sizeof view)) && now_ns() < deadline)
+        usleep(100000);
+    if (!same) {
+        if (rc)
+            VIOLATION("the follower cannot be read at the end: %s\n", rc < 0 ? "no connection" : tsdbc_strerror(rc));
+        for (int s = 0; s < NSERIES && !rc; s++)
+            for (uint32_t k = 0; k < NKEYS; k++)
+                if (view[s][k] != final[s][k]) {
+                    VIOLATION("the follower does not catch up in %d s: series %d key %u holds %u, the writer %u\n",
+                              FOLLOW_CATCHUP_S, s, k, view[s][k], final[s][k]);
+                    break;
+                }
+    }
+    signal_pid(pid, SIGTERM);
+    waitpid(pid, &st, 0);
+    atomic_store(&follower_pid, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+        VIOLATION("the follower ended with status %#x at SIGTERM, see %s\n", st, flogpath);
+    return violations - before;
+}
+
 static void final_state(uint32_t final[NSERIES][NKEYS])
 {
     /* not connect_retry(): that gives up once `stop` is set, which it is by now */
@@ -669,7 +893,15 @@ int main(int argc, char **argv)
         pthread_mutex_unlock(&server_lock);
     }
 
-    pthread_t th[256], nem;
+    pthread_t th[256], nem, fr;
+    if (!strcmp(nemesis, "power")) {
+        fport = port + 1;
+        snprintf(flogpath, sizeof flogpath, "%s.follower.log", dir);
+        freads = calloc(MAX_FREADS, sizeof *freads);
+        atexit(kill_follower);
+        start_follower();
+        pthread_create(&fr, NULL, follower_reader, NULL);
+    }
     for (int i = 0; i < nclients; i++)
         pthread_create(&th[i], NULL, client, (void *)(intptr_t)i);
     if (strcmp(nemesis, "none"))
@@ -680,6 +912,8 @@ int main(int argc, char **argv)
         pthread_join(nem, NULL);
     for (int i = 0; i < nclients; i++)
         pthread_join(th[i], NULL);
+    if (fport)
+        pthread_join(fr, NULL);
 
     /* the final state, from a server without faults, and again after a clean restart */
     pthread_mutex_lock(&server_lock);
@@ -694,6 +928,7 @@ int main(int argc, char **argv)
     stop_server(SIGTERM);
     start_server(false);
     final_state(again);
+    int fv = fport ? check_follower(again) : 0;
     stop_server(SIGTERM);
     pthread_mutex_unlock(&server_lock);
 
@@ -707,12 +942,14 @@ int main(int argc, char **argv)
            nemesis, seconds, nclients, restarts, ok, info, fail, rok);
     if (memcmp(final, again, sizeof final) != 0)
         VIOLATION("the state changed across a clean restart\n");
-    int v = check(final);
+    int v = check(final); /* counts the follower's violations too */
     if (!strcmp(nemesis, "eio")) {
         printf("eio: %d fail-stops\n", failstops);
         v += eio_problems;
     }
     unlink(markpath);
+    if (fport && !fv)
+        unlink(flogpath);
     if (system(cmd) != 0)
         return 2;
     if (v) {
