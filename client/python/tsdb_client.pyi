@@ -113,7 +113,8 @@ class Bucket:
         """Number of known (not null) values in the bucket."""
     @property
     def sum(self) -> float:
-        """Sum of the values, as a float."""
+        """Sum of the values, as a float. A NaN sum, min or max is always the quiet NaN
+        0x7ff8000000000000, whatever NaNs were stored, so results compare bit for bit."""
     @property
     def min(self) -> float:
         """Smallest value (NaN if there is none)."""

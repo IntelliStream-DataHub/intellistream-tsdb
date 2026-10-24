@@ -28,10 +28,13 @@ for, so acknowledgements come in groups of 8 and 0 to 7 batches are unacknowledg
 Logs: one directory per scenario and backend with the write scripts, every client's output, the server logs and
 `notes.txt`; `summary.txt` at the top. The data directories are removed unless `--keep` or the scenario failed.
 
-What is compared and what is not: bytes, with these exceptions that the server cannot promise. The payload of a NaN
-sum depends on which NaN was added first, so it is compared as "NaN". Sums of float series are not compared between
-the memtable, flushed and merged states of the same rows (a different order of additions rounds differently); the
-model checks them to 1e-9 of the sum of magnitudes, and exactly where NaN or infinity is involved.
+What is compared and what is not: bytes, with this exception that the server cannot promise. Sums of float series
+are not compared between the memtable, flushed and merged states of the same rows (a different order of additions
+rounds differently, and rows near `DBL_MAX` can overflow to +inf in one order and to NaN in another); the model
+checks them to 1e-9 of the sum of magnitudes, and exactly where NaN or infinity is involved and no order can
+overflow. Every NaN result (sum, min, max) is the one quiet NaN `0x7ff8000000000000`, so NaN results are compared
+bit for bit: by the model, and between layouts wherever the sum is NaN in every order (a bucket of only NaNs, or
+with both infinities). Raw values keep the payloads they were written with.
 
 Limits, so that a green run is not read as more than it is:
 

@@ -29,14 +29,32 @@ start, the tests and the benchmark results.
 - Float sums are not bit-reproducible. A float sum depends on the order of the
   additions, and that order follows how parts were merged and how a query was
   split over threads, so the same rows can give sums that differ in the last
-  bits after a background merge (a sum that hits NaN can also come back with a
-  different NaN bit pattern). ClickHouse, PostgreSQL and DuckDB behave the same.
+  bits after a background merge, and where the running sum overflows a double
+  (rows near `DBL_MAX`), +inf in one order and NaN (inf - inf) in another.
+  ClickHouse, PostgreSQL and DuckDB behave the same.
   min, max and count are exact. Where reproducible sums matter, store the values
   as int64 in fixed point (21.3 degC as 21300 milli-degrees): sums are added in
   a 128-bit integer inside (and kept that way in each granule's statistics), so
   `isum` is exact whatever the order, as long as the total fits in an int64
   (about 9.2e18; beyond that it is clamped). int64 series compress as well as
   the fixed-point floats.
+- One NaN for every NaN result. A sum that hits NaN, and a min or max of a
+  bucket that holds only NaNs, is the quiet NaN `0x7ff8000000000000` (in
+  float32, as in the server's version 1 rows: `0x7fc00000`), from every query,
+  path (memtable, granule statistics, merged parts, threads) and client. An
+  addition of NaNs keeps the payload of whichever NaN came first, and that
+  order varies; PostgreSQL and ClickHouse do not canonicalise either, but print
+  every NaN as `NaN`, while tsdb's clients receive the bits. A NaN result is
+  never one of the null patterns (a signalling NaN with payload `0x1001`
+  quiets into the float64 null), and granule statistics store their sums
+  canonical too. Stored values are untouched: a raw query returns the NaN a
+  sensor wrote bit for bit.
+- All NaNs are equal. tsdb never compares stored values with each other (a
+  write replaces by key, not by value), and where results are compared (the
+  tests, the integration model) any NaN equals any other, as in PostgreSQL.
+  min and max differ from PostgreSQL on purpose: they skip NaNs and are NaN
+  only when a bucket has no other value, where PostgreSQL sorts NaN above
+  every number, so one sensor glitch would replace a bucket's max.
 - Buckets are fixed lengths aligned to the epoch, like `toStartOfInterval`,
   or calendar periods (day, ISO week, month, quarter, year) in UTC
   (`tsdb_query_group`), or buckets that begin at given instants

@@ -189,15 +189,19 @@ void tsdb_free(void *p);
 
 /* Aggregates skip nulls: count is the number of known values, and a bucket
  * with only nulls is returned with count 0 (buckets without rows are not).
- * Floats: NaN values are ignored by min/max (NaN if there are none) but
- * propagate into sum. int64 and bool (false 0, true 1): sum, min and max are
+ * Floats: NaN values are ignored by min/max (NaN if there are none; unlike
+ * PostgreSQL, where NaN is greater than every number) but propagate into sum.
+ * Every NaN result is the one quiet NaN 0x7ff8000000000000, whatever the
+ * payloads of the NaNs in the data (a raw query returns those bit for bit);
+ * all NaNs are equal. int64 and bool (false 0, true 1): sum, min and max are
  * also exact in isum, imin and imax (isum is the exact sum, clamped to the
  * int64 range when it does not fit, whatever the order of the rows).
  * State: only count is meaningful.
  * Float sums are not bit-reproducible: rows are added in an order that depends
  * on how parts were merged and how the query was split over threads, so the
- * same data can give sums that differ in the last bits (and a NaN sum's bit
- * pattern can differ), as in ClickHouse. min, max and count are exact. Where
+ * same data can give sums that differ in the last bits, as in ClickHouse; where
+ * the running sum overflows (rows near DBL_MAX), one order gives +inf and
+ * another NaN. min, max and count are exact. Where
  * reproducible sums matter, store the values as int64 in fixed point (21.3 degC
  * as 21300 milli-degrees): isum is then exact. */
 typedef struct tsdb_bucket {

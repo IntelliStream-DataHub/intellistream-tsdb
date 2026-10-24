@@ -406,7 +406,8 @@ def bucket_lines(ty, groups, order, limit):
 def float_aggregates(ty, known):
     """Expected [sum, min, max] of known float tokens as ("sum", x, tolerance) / ("val", x) checks, None to skip.
     Sums are checked to 1e-9 of the sum of magnitudes (the server adds in a different order for the memtable, parts
-    and merged parts); NaN and infinities exactly; not at all where an order could overflow a double."""
+    and merged parts); NaN (as 0x7ff8000000000000) and infinities exactly; not at all where an order could overflow a
+    double."""
     import math
     vals = [f32val(int(t, 16)) if ty == "float32" else f64val(int(t, 16)) for t in known]
     nan = any(v != v for v in vals)
@@ -415,10 +416,10 @@ def float_aggregates(ty, known):
     mag = sum(abs(v) for v in real if abs(v) != math.inf)
     if nan or (pos and neg):
         s = ("sum", math.nan, 0)
+    elif mag > 1e300:  # finite rows may overflow to the other infinity first: inf, NaN or a finite sum
+        s = None
     elif pos or neg:
         s = ("sum", math.inf if pos else -math.inf, 0)
-    elif mag > 1e300:
-        s = None
     else:
         s = ("sum", math.fsum(real), 1e-9 * mag)
     return [s, ("val", min(real) if real else math.nan), ("val", max(real) if real else math.nan)]
@@ -449,10 +450,10 @@ def field_ok(e, x):
     import math
     if isinstance(e, tuple):
         v = f64val(int(x, 16))
+        if e[1] != e[1]:  # every NaN result is the one quiet NaN, whatever the payloads of the NaNs stored
+            return int(x, 16) == 0x7FF8000000000000
         if e[0] == "val":
-            return (v != v) if e[1] != e[1] else v == e[1]
-        if e[1] != e[1]:
-            return v != v
+            return v == e[1]
         if abs(e[1]) == math.inf:
             return v == e[1]
         return v == v and abs(v - e[1]) <= e[2]
