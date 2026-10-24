@@ -362,6 +362,12 @@ extern void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state 
 extern void (*simd_fold_i64)(const int64_t *v, size_t n, agg_state *a, agg_dev *x);
 /* bool and state codes (null: NULL_BOOL, NULL_STATE); NULL as for int64 */
 extern void (*simd_fold_u32)(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *x);
+/* Fewer values than these go to values.c's loops, which beat the integer kernels' setup and lane combine there:
+ * int64 without and with the spread, bool and state. Per kernel set (simd_select, from fold-bench); the sums
+ * are exact, so either side gives the same bits. */
+extern size_t simd_i64_min, simd_i64_dev_min, simd_u32_min;
+/* points below which lttb_argmax takes its scalar loop (the same pick), per kernel set */
+extern size_t simd_lttb_small;
 /* Folds n slots of `type` into a, skipping nulls, with the spread (values.c; granule statistics). */
 void agg_fold(int type, const void *v, size_t n, agg_state *a, agg_dev *x);
 /* the same, skipping the search for nulls when the caller knows there are none (a granule's count), and

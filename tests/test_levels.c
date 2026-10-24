@@ -395,6 +395,20 @@ static void codec(rec *r, const input *x, const char *what, enc_fn enc, dec_fn d
 
 #define CODEC(name, src, w) codec(r, x, #name, (enc_fn)name##_encode, (dec_fn)name##_decode, src, w)
 
+/* The lengths of the prefixes folded and searched: every one up to SHORT_LENS (the short runs, the kernels' tails,
+ * most of the sets' thresholds), the longer integer thresholds on both sides (check_thresholds), then all of it. */
+#define SHORT_LENS 66
+static const size_t long_lens[] = {127, 128, 255, 256};
+static size_t next_len(size_t m, size_t n)
+{
+    if (m < SHORT_LENS)
+        return m + 1;
+    for (size_t i = 0; i < sizeof long_lens / sizeof *long_lens; i++)
+        if (long_lens[i] > m && long_lens[i] < n)
+            return long_lens[i];
+    return m < n ? n : n + 1;
+}
+
 static void run(rec *r, codec_ctx *c)
 {
     for (int k = 0; k < nin; k++) {
@@ -450,7 +464,7 @@ static void run(rec *r, codec_ctx *c)
         }
         /* aggregates: whole, every short prefix (the kernels' tails, the short runs), and the statistics parts
          * store */
-        for (size_t m = 0; m <= x->n; m = m < 66 ? m + 1 : m == x->n ? m + 1 : x->n) {
+        for (size_t m = 0; m <= x->n; m = next_len(m, x->n)) {
             struct {
                 agg_state a;
                 agg_dev x;
@@ -507,7 +521,7 @@ static void run(rec *r, codec_ctx *c)
                 ts[i] = (int64_t)t;
                 sl[i] = w == 4 ? ((const uint32_t *)x->v)[i] : ((const uint64_t *)x->v)[i];
             }
-            for (size_t m = 0; m <= x->n; m = m < 40 ? m + 1 : m == x->n ? m + 1 : x->n) {
+            for (size_t m = 0; m <= x->n; m = next_len(m, x->n)) {
                 granule g;
                 memset(&g, 0, sizeof g);
                 granule_twa(x->type, ts, x->v, m, &g);
@@ -622,6 +636,23 @@ static void check_dispatch(void)
 static void check_dispatch(void) {}
 #endif
 
+/* each threshold of the selected kernel set is tried on both sides */
+static void check_thresholds(void)
+{
+    const size_t t[] = {simd_i64_min, simd_i64_dev_min, simd_u32_min, simd_lttb_small, simd_short, simd_twa_max};
+    for (size_t i = 0; i < sizeof t / sizeof *t; i++) {
+        bool lo = t[i] <= SHORT_LENS, hi = t[i] <= SHORT_LENS;
+        for (size_t j = 0; j < sizeof long_lens / sizeof *long_lens; j++) {
+            lo |= long_lens[j] == t[i] - 1;
+            hi |= long_lens[j] == t[i];
+        }
+        if (!lo || !hi) {
+            fprintf(stderr, "kernel %s: threshold %zu (#%zu) is not tested on both sides\n", simd_name(), t[i], i);
+            failures++;
+        }
+    }
+}
+
 int main(void)
 {
     check_dispatch();
@@ -639,6 +670,7 @@ int main(void)
                 break;
             if (strcmp(simd_name(), kernels[k]) != 0)
                 continue; /* this CPU lacks it */
+            check_thresholds();
             codec_ctx *c = codec_new();
             rec r = {0};
             run(&r, c);
