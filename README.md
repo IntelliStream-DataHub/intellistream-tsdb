@@ -396,6 +396,12 @@ tsdbc_query_agg(c, id, start, end, 60000, &b, &nb);    /* one summary per minute
 tsdbc_close(c);
 ```
 
+All four clients give up on a connect after 10 seconds and turn TCP keepalive
+on (a server that vanished without a word is noticed about a minute later).
+A request waits as long as the server takes unless you set a timeout
+(`tsdbc_set_timeout`); after a timeout or any connection error the client
+refuses further calls on that connection, so close it and connect again.
+
 ## Tests
 
 ```sh

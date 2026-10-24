@@ -75,7 +75,7 @@ mod types;
 mod value;
 
 pub use calendar::calendar_bounds;
-pub use client::{Client, DEFAULT_COMPRESSION};
+pub use client::{Client, CONNECT_TIMEOUT, DEFAULT_COMPRESSION};
 pub use database::Database;
 #[cfg(feature = "embedded")]
 pub use embedded::{ChunkRef, Db, Options, PartInfo, RawValues, ValueCodec};

@@ -6,11 +6,13 @@
 #include "tsdb_protocol.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -37,11 +39,63 @@ struct tsdbc {
     uint8_t *raw, *zbuf;
     size_t raw_cap, zbuf_cap;
     uint64_t sent;   /* bytes written to the socket */
+    uint32_t expect; /* the id of the oldest request whose reply is not read yet */
+    /* Set by an I/O error (a timeout included) or a reply out of step: part of
+     * a frame may be unsent or unread, so the next reply read could answer an
+     * earlier request. Every later call fails with TSDB_ERR_IO. */
+    bool broken;
 };
+
+/* Waits up to ms (0: as long as the kernel does) for a connect to finish. */
+static int connect_within(int fd, const struct sockaddr *addr, socklen_t len, int ms)
+{
+    if (ms <= 0)
+        return connect(fd, addr, len);
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0)
+        return -1;
+    int rc = connect(fd, addr, len);
+    if (rc != 0 && errno == EINPROGRESS) {
+        struct pollfd p = {.fd = fd, .events = POLLOUT};
+        int r;
+        while ((r = poll(&p, 1, ms)) < 0 && errno == EINTR)
+            ; /* a signal restarts the whole wait: bounded by the caller's patience, not exact */
+        int err = 0;
+        socklen_t el = sizeof err;
+        if (r == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0)
+            rc = 0;
+        else
+            errno = r == 0 ? ETIMEDOUT : err ? err : errno;
+    }
+    if (fcntl(fd, F_SETFL, fl) != 0)
+        rc = -1;
+    return rc;
+}
+
+int tsdbc_set_keepalive(tsdbc *c, int idle_s, int interval_s, int count)
+{
+    if (idle_s < 0 || interval_s < 0 || count < 0 || (idle_s && (!interval_s || !count)))
+        return TSDB_ERR_INVALID;
+    int on = idle_s > 0;
+    if (setsockopt(c->fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on) != 0)
+        return TSDB_ERR_IO;
+    if (on && (setsockopt(c->fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof idle_s) != 0 ||
+               setsockopt(c->fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_s, sizeof interval_s) != 0 ||
+               setsockopt(c->fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof count) != 0))
+        return TSDB_ERR_IO;
+    return 0;
+}
 
 int tsdbc_connect(const char *host, int port, tsdbc **out)
 {
+    return tsdbc_connect_timeout(host, port, TSDBC_CONNECT_TIMEOUT_MS, out);
+}
+
+int tsdbc_connect_timeout(const char *host, int port, int connect_ms, tsdbc **out)
+{
     *out = NULL;
+    if (connect_ms < 0)
+        return TSDB_ERR_INVALID;
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     struct addrinfo hints = {.ai_socktype = SOCK_STREAM}, *ai;
@@ -50,7 +104,7 @@ int tsdbc_connect(const char *host, int port, tsdbc **out)
     int fd = -1;
     for (struct addrinfo *a = ai; a; a = a->ai_next) {
         fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
-        if (fd >= 0 && connect(fd, a->ai_addr, a->ai_addrlen) == 0)
+        if (fd >= 0 && connect_within(fd, a->ai_addr, a->ai_addrlen, connect_ms) == 0)
             break;
         if (fd >= 0)
             close(fd);
@@ -70,6 +124,8 @@ int tsdbc_connect(const char *host, int port, tsdbc **out)
     c->fd = fd;
     c->rcap = RBUF;
     c->zlevel = 1;
+    /* Best effort, as in the other clients: a socket without the probe options still works. */
+    tsdbc_set_keepalive(c, TSDBC_KEEPALIVE_IDLE_S, TSDBC_KEEPALIVE_INTERVAL_S, TSDBC_KEEPALIVE_COUNT);
     *out = c;
     return 0;
 }
@@ -97,7 +153,7 @@ void tsdbc_close(tsdbc *c)
         return;
     /* Closing with acknowledgements unread makes the kernel reset the connection,
      * which discards requests the server has not read yet: collect them first. */
-    if (c->pending)
+    if (c->pending && !c->broken)
         tsdbc_wait(c);
     close(c->fd);
     free(c->rbuf);
@@ -112,11 +168,17 @@ void tsdbc_close(tsdbc *c)
 
 static int send_iov(tsdbc *c, struct iovec *iov, int n)
 {
+    if (c->broken)
+        return TSDB_ERR_IO;
     while (n) {
-        ssize_t w = writev(c->fd, iov, n);
+        /* sendmsg with MSG_NOSIGNAL, not writev: a peer that closed the connection must not kill the
+         * host process with SIGPIPE; the send fails with EPIPE and the connection is broken. */
+        struct msghdr m = {.msg_iov = iov, .msg_iovlen = (size_t)n};
+        ssize_t w = sendmsg(c->fd, &m, MSG_NOSIGNAL);
         if (w < 0) {
             if (errno == EINTR)
                 continue;
+            c->broken = true; /* part of the frame may be on its way */
             return TSDB_ERR_IO;
         }
         c->sent += (uint64_t)w;
@@ -165,6 +227,8 @@ static int send_reqv(tsdbc *c, uint8_t op, struct iovec *parts, int n)
 
 static int read_exact(tsdbc *c, void *dst, size_t n)
 {
+    if (c->broken)
+        return TSDB_ERR_IO;
     uint8_t *o = dst;
     while (n) {
         if (c->roff == c->rlen) {
@@ -173,6 +237,7 @@ static int read_exact(tsdbc *c, void *dst, size_t n)
                 if (r <= 0) {
                     if (r < 0 && errno == EINTR)
                         continue;
+                    c->broken = true;
                     return TSDB_ERR_IO;
                 }
                 o += r;
@@ -183,6 +248,7 @@ static int read_exact(tsdbc *c, void *dst, size_t n)
             if (r <= 0) {
                 if (r < 0 && errno == EINTR)
                     continue;
+                c->broken = true;
                 return TSDB_ERR_IO;
             }
             c->rlen = (size_t)r;
@@ -197,23 +263,32 @@ static int read_exact(tsdbc *c, void *dst, size_t n)
     return 0;
 }
 
-/* Reads one reply frame; *body points at the payload after the status. */
+/* Reads one reply frame; *body points at the payload after the status. The
+ * reply must answer the oldest request not yet answered: replies come in the
+ * order of the requests, so any other id means the stream is out of step. A
+ * reply counts as answered here; a stream's frames all carry its request's id,
+ * and the readers of streams call stream_more for each frame before the last. */
 static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *blen)
 {
     uint8_t hdr[13];
     int rc = read_exact(c, hdr, 13);
     if (rc)
         return rc;
-    uint32_t len;
+    uint32_t len, id;
     memcpy(&len, hdr, 4);
-    if (len < 9 || len > TSDB_MAX_FRAME || hdr[8] != TSDB_OP_REPLY)
+    memcpy(&id, hdr + 4, 4);
+    if (len < 9 || len > TSDB_MAX_FRAME || hdr[8] != TSDB_OP_REPLY || id != c->expect) {
+        c->broken = true;
         return TSDB_ERR_CORRUPT;
+    }
     memcpy(status, hdr + 9, 4);
     size_t n = len - 9;
     if (n > c->fcap) {
         uint8_t *f = realloc(c->frame, n);
-        if (!f)
+        if (!f) {
+            c->broken = true; /* the body stays unread */
             return TSDB_ERR_NOMEM;
+        }
         c->frame = f;
         c->fcap = n;
     }
@@ -221,8 +296,12 @@ static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *b
         return rc;
     *body = c->frame;
     *blen = n;
+    c->expect++;
     return 0;
 }
+
+/* The frame just read is not the last of its stream. */
+static void stream_more(tsdbc *c) { c->expect--; }
 
 /* Reads the pipelined acknowledgements, keeping the first error for tsdbc_wait. */
 static int drain(tsdbc *c)
@@ -243,6 +322,8 @@ static int drain(tsdbc *c)
 
 int tsdbc_wait(tsdbc *c)
 {
+    if (c->broken)
+        return TSDB_ERR_IO;
     int rc = drain(c);
     if (rc)
         return rc;
@@ -319,11 +400,12 @@ int tsdbc_series_name(tsdbc *c, uint32_t id, char *buf, size_t len)
     uint16_t l;
     if (n < 2 || (memcpy(&l, b, 2), n != 2u + l))
         return TSDB_ERR_CORRUPT;
-    if (len == 0)
-        return TSDB_ERR_INVALID;
-    size_t k = l < len - 1 ? l : len - 1;
-    memcpy(buf, b + 2, k);
-    buf[k] = '\0';
+    if (memchr(b + 2, 0, l))
+        return TSDB_ERR_CORRUPT; /* names never hold NUL */
+    if (len <= l)
+        return TSDB_ERR_INVALID; /* a cut name could name another series or state */
+    memcpy(buf, b + 2, l);
+    buf[l] = '\0';
     return 0;
 }
 
@@ -407,8 +489,11 @@ int tsdbc_query_raw_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, co
         uint32_t n;
         if (len < 5 || (memcpy(&n, b + 1, 4), len != 5 + (size_t)n * 12)) {
             rc = TSDB_ERR_CORRUPT;
+            c->broken = true; /* whether more of the stream follows is unknown */
             break;
         }
+        if (!b[0])
+            stream_more(c);
         if (n && !stopped) {
             if (n > cap) { /* aligned copies of the columns */
                 free(ts);
@@ -418,6 +503,7 @@ int tsdbc_query_raw_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end, co
                 cap = ts && v ? n : 0;
                 if (!cap) {
                     rc = TSDB_ERR_NOMEM;
+                    c->broken = !b[0]; /* the rest of the stream stays unread */
                     break;
                 }
             }
@@ -1038,14 +1124,18 @@ static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
         uint32_t n;
         if (len < 8 || b[1] > TSDB_STATE || (memcpy(&n, b + 4, 4), false)) {
             rc = TSDB_ERR_CORRUPT;
+            c->broken = true;
             break;
         }
         unsigned aw = tsdb_wire_width(b[1]);
         size_t valid = (b[2] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0;
         if (len != 8 + (size_t)n * (8 + aw) + valid) {
             rc = TSDB_ERR_CORRUPT;
+            c->broken = true;
             break;
         }
+        if (!b[0])
+            stream_more(c);
         if (n && !stopped) {
             if (n > cap) { /* aligned copies of the columns */
                 free(ts);
@@ -1055,6 +1145,7 @@ static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
                 cap = ts && v ? n : 0;
                 if (!cap) {
                     rc = TSDB_ERR_NOMEM;
+                    c->broken = !b[0]; /* the rest of the stream stays unread */
                     break;
                 }
             }
@@ -1115,11 +1206,12 @@ int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t
     uint16_t l;
     if (n < 2 || (memcpy(&l, b, 2), n != 2u + l))
         return TSDB_ERR_CORRUPT;
-    if (len == 0)
-        return TSDB_ERR_INVALID;
-    size_t k = l < len - 1 ? l : len - 1;
-    memcpy(buf, b + 2, k);
-    buf[k] = '\0';
+    if (memchr(b + 2, 0, l))
+        return TSDB_ERR_CORRUPT; /* names never hold NUL */
+    if (len <= l)
+        return TSDB_ERR_INVALID; /* a cut name could name another series or state */
+    memcpy(buf, b + 2, l);
+    buf[l] = '\0';
     return 0;
 }
 

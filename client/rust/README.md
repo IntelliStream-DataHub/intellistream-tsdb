@@ -96,6 +96,7 @@ Every method returns a `Result`. If the server says no, you get
 `Error::Server(status)`, for example `Status::NotFound`. After a network
 error the client stops working: connect again.
 
+`Client::connect` gives up on each address after 10 s (`CONNECT_TIMEOUT`).
 By default a call waits as long as the server takes, so a server that hangs
 (a stalled disk, a dead peer) hangs the caller. `Client::connect_with(addr,
 Some(Duration::from_secs(30)))` bounds the connect and every later wait for

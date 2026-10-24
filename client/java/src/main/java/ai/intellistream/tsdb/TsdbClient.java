@@ -1147,7 +1147,7 @@ public final class TsdbClient implements AutoCloseable {
         String s = null;
         if (st == 0) {
             int len = bodyLen >= 2 ? in.getShort() & 0xffff : -1;
-            if (bodyLen != 2 + len)
+            if (bodyLen < 2 || bodyLen != 2 + len) /* bodyLen 1 would pass the second test with len -1 */
                 throw lost(Status.ERR_CORRUPT, what + " reply of " + bodyLen + " bytes");
             byte[] b = new byte[len];
             in.get(b);
@@ -1991,7 +1991,25 @@ public final class TsdbClient implements AutoCloseable {
             in = direct(BUF).flip(); /* give a large reply's buffer back */
     }
 
-    private static byte[] utf8(String s, String what) {
+    /**
+     * The UTF-8 bytes of a name, path or zone. getBytes would turn an unpaired surrogate into '?' and so map
+     * different malformed names onto one series; such names, and names with NUL (which the server refuses too), fail
+     * here with ERR_INVALID before anything is sent. One pass over the string, once per request.
+     */
+    private static byte[] utf8(String s, String what) throws TsdbException {
+        for (int i = 0, n = s.length(); i < n; i++) {
+            char ch = s.charAt(i);
+            if (ch == 0)
+                throw new TsdbException(Status.ERR_INVALID, what + " contains NUL", null);
+            if (Character.isSurrogate(ch)) {
+                if (Character.isHighSurrogate(ch) && i + 1 < n && Character.isLowSurrogate(s.charAt(i + 1))) {
+                    i++;
+                    continue;
+                }
+                throw new TsdbException(Status.ERR_INVALID, what + " contains an unpaired UTF-16 surrogate at index "
+                        + i, null);
+            }
+        }
         byte[] b = s.getBytes(StandardCharsets.UTF_8);
         if (b.length > MAX_STRING)
             throw new IllegalArgumentException(what + " longer than 65535 bytes of UTF-8");

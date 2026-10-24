@@ -117,6 +117,21 @@ impl fmt::Debug for Client {
     }
 }
 
+/// How long [`Client::connect`] waits for each address before trying the next.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connects to the first address of `addr` that answers within `t`.
+fn connect_each(addr: impl ToSocketAddrs, t: Duration) -> io::Result<TcpStream> {
+    let mut last = io::Error::new(io::ErrorKind::InvalidInput, "the address resolves to nothing");
+    for a in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&a, t) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 impl Client {
     /// Connects to tsdbd, trying each address `addr` resolves to in turn.
     ///
@@ -131,8 +146,13 @@ impl Client {
     /// let mut c = tsdb_client::Client::connect(("127.0.0.1", tsdb_client::DEFAULT_PORT))?;
     /// # Ok::<(), tsdb_client::Error>(())
     /// ```
+    ///
+    /// The connect to each address gives up after [`CONNECT_TIMEOUT`] (10 s, as
+    /// in the C, Python and Java clients), so a host that drops packets fails
+    /// in seconds rather than after the kernel's two minutes of retries.
+    /// Requests have no time limit until [`set_timeout`](Client::set_timeout).
     pub fn connect(addr: impl ToSocketAddrs) -> Result<Client> {
-        Client::from_stream(TcpStream::connect(addr)?)
+        Client::from_stream(connect_each(addr, CONNECT_TIMEOUT)?)
     }
 
     /// Connects to one address, giving up after `timeout`.
@@ -150,9 +170,10 @@ impl Client {
     /// Connects like [`connect`](Client::connect) with `timeout` bounding the
     /// connect to each address and, afterwards, every wait for the server.
     ///
-    /// `None` waits as long as the operating system does, as `connect` does. This
-    /// is `connect_timeout` plus [`set_timeout`](Client::set_timeout) for
-    /// every address `addr` resolves to.
+    /// `None` is [`connect`](Client::connect): the connect bounded by
+    /// [`CONNECT_TIMEOUT`], requests without a limit. This is `connect_timeout`
+    /// plus [`set_timeout`](Client::set_timeout) for every address `addr`
+    /// resolves to.
     ///
     /// # Errors
     ///
@@ -162,18 +183,9 @@ impl Client {
         let Some(t) = timeout else {
             return Client::connect(addr);
         };
-        let mut last = io::Error::new(io::ErrorKind::InvalidInput, "the address resolves to nothing");
-        for a in addr.to_socket_addrs()? {
-            match TcpStream::connect_timeout(&a, t) {
-                Ok(s) => {
-                    let c = Client::from_stream(s)?;
-                    c.set_timeout(Some(t))?;
-                    return Ok(c);
-                }
-                Err(e) => last = e,
-            }
-        }
-        Err(last.into())
+        let c = Client::from_stream(connect_each(addr, t)?)?;
+        c.set_timeout(Some(t))?;
+        Ok(c)
     }
 
     /// Wraps a TCP stream that is already connected to tsdbd.
