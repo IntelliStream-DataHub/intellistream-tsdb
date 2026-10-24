@@ -8,6 +8,10 @@
 # to (count, sum, sum of mins, sum of maxes, buckets). Sums are compared in double precision, which
 # is why the SQL casts float32 columns to double before summing (sum(real) and QuestDB's sum(float)
 # return float32). Servers are on 127.0.0.1 with the ports and credentials of README.md.
+#
+# Embedded engines answer through embq, which writes the same reduced answers as tsdbq; those
+# files are compared directly, every query of the dump:
+#   python3 -I check.py --dumps REF_WINDOWS REF_FULL GOT_WINDOWS GOT_FULL
 import datetime, json, os, struct, sys, urllib.request, urllib.parse
 
 CH_HTTP = os.environ.get("CH_HTTP_PORT", "8123")
@@ -19,8 +23,8 @@ I3_PORT = os.environ.get("I3_PORT", "8181")
 def f32(x):  # values are float32, and some servers print the shortest float32 text ("30.8")
     return struct.unpack('<f', struct.pack('<f', x))[0]
 
-sysname = sys.argv[1]
-per = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+sysname = sys.argv[1] if len(sys.argv) > 1 else ""
+per = int(sys.argv[2]) if len(sys.argv) > 2 and sysname != "--dumps" else 200
 
 def ms_of(t):  # '2024-01-01 00:00:00.123' or RFC 3339, UTC
     t = t.strip().replace("T", " ").rstrip("Z").replace("+00:00", "").replace("+00", "")
@@ -225,5 +229,43 @@ def main():
         bad += not okc
     print(sysname, "checked", checked, "mismatches", bad, f"worst relative sum error {worst_sum:.2e}")
 
+def same_window(r, g):
+    """Two reduced answers (tsdbq / embq dump records) of the same query."""
+    if r["cls"] in ("raw", "point"):
+        if r["n"] != g["n"]: return False
+        if r["n"] == 0: return True
+        if r["cls"] == "point": return g["first"] == r["first"] and close(g["v"], r["v"], 1e-7)
+        return g["first"] == r["first"] and g["last"] == r["last"] and close(g["sum"], r["sum"], 1e-9)
+    return len(g["b"]) == len(r["b"]) and all(
+        x[0] == y[0] and x[1] == y[1] and close(x[2], y[2], 1e-9) and close(x[3], y[3], 1e-7) and close(x[4], y[4], 1e-7)
+        for x, y in zip(g["b"], r["b"]))
+
+def dumps(ref_w, ref_f, got_w, got_f):
+    ref = {}
+    for l in open(ref_w):
+        x = json.loads(l); ref[x["i"]] = x
+    checked, bad, missing = {}, 0, 0
+    for l in open(got_w):
+        g = json.loads(l); r = ref.get(g["i"])
+        if r is None: missing += 1; continue
+        ok = r["cls"] == g["cls"] and same_window(r, g)
+        if not ok:
+            bad += 1
+            if bad <= 10: print("MISMATCH", g["i"], "got", json.dumps(g)[:300], "ref", json.dumps(r)[:300])
+        checked[g["cls"]] = checked.get(g["cls"], 0) + 1
+    fref = {}
+    for l in open(ref_f):
+        x = json.loads(l); fref[(x["full"], x["s"])] = x["d"]
+    for l in open(got_f):
+        x = json.loads(l); e = fref[(x["full"], x["s"])]; g = x["d"]
+        if not (g[0] == e[0] and g[4] == e[4] and close(g[1], e[1], 1e-9) and close(g[2], e[2], 1e-7) and close(g[3], e[3], 1e-7)):
+            bad += 1
+            print("MISMATCH full", x["full"], x["s"], "got", g, "ref", e)
+        checked[f"full{x['full']}"] = checked.get(f"full{x['full']}", 0) + 1
+    print(got_w, "checked", checked, "mismatches", bad, "not in the reference", missing)
+
 if __name__ == "__main__":
-    main()
+    if sysname == "--dumps":
+        dumps(*sys.argv[2:6])
+    else:
+        main()

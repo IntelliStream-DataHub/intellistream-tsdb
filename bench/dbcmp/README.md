@@ -1,11 +1,13 @@
-# tsdb against five other databases, 100 M rows
+# tsdb against six other databases, 100 M rows
 
 The harness behind the README's "100 million rows, six databases" tables: tsdb (through tsdbd and
 embedded), ClickHouse, TimescaleDB, QuestDB, InfluxDB 2 and InfluxDB 3 Core, each loaded with the
-same 100 M rows and asked the same queries, with every answer checked against tsdb's.
+same 100 M rows and asked the same queries, with every answer checked against tsdb's; and DuckDB,
+embedded like tsdb, compared with tsdb's library in the same process.
 
 Every server runs in **Podman** (never Docker), with `--network host` and its own listen setting
-bound to 127.0.0.1. Run one system at a time: stop each container before starting the next.
+bound to 127.0.0.1. Run one system at a time: stop each container before starting the next, and
+run nothing else heavy meanwhile.
 
 ## What is here
 
@@ -20,6 +22,7 @@ bound to 127.0.0.1. Run one system at a time: stop each container before startin
 | `loadlp.c`, `httpc.h` | parallel line protocol loader over HTTP |
 | `qdrive.c` | query load driver, HTTP or PostgreSQL wire protocol |
 | `tsdbq.c`, `tsdbstat.c` | the same for tsdbd, the reference answers, and tsdbd's merge state |
+| `embq.c` | embedded driver: tsdb's library and DuckDB's C API, load, queries and answers |
 | `ch_load.sh`, `ch_bench.sh` | ClickHouse load (with merge wait) and queries via `clickhouse-benchmark` |
 | `qbench.sh` | the query runs through `qdrive` |
 | `ts_compress.sh` | `compress_chunk` on every TimescaleDB chunk |
@@ -29,7 +32,8 @@ bound to 127.0.0.1. Run one system at a time: stop each container before startin
 
 Podman; gcc and make; libpq's shared library (`libpq.so.5`, package `libpq5` or `libpq`; headers
 are not needed); `psql` (TimescaleDB setup and `check.py ts`); curl, jq, bc; Python 3 (standard
-library only); about 25 GB free on the disk under `$DBCMP` and 30 GB of free memory.
+library only); about 25 GB free on the disk under `$DBCMP` and 30 GB of free memory. For DuckDB,
+its C library release (below); `make` builds `embq` only when it finds that.
 
 ## Setup
 
@@ -217,6 +221,67 @@ minutes, and 32 concurrent 7-day aggregates got the server OOM-killed at 28 GB. 
 the WAL (20 s) and starts the one-hour snapshot timer again. The whole-range queries touch about
 100,000 Parquet files, hence `--query-file-limit`; the default was not tried.
 
+## DuckDB 1.5.6, embedded, against tsdb embedded
+
+Both run in the driver's process: tsdb through `build/libtsdb.a`, DuckDB through its C API, with the
+same query spec, timing and result handling (`embq.c` describes both sides). DuckDB is the C
+library release from GitHub, pinned by version and checksum; nothing is installed. The archive is
+data: it is unpacked into its own directory and nothing from it is run except the library the
+driver links.
+
+```sh
+mkdir -p $DBCMP/duckdb/v1.5.6 && cd $DBCMP/duckdb/v1.5.6
+curl -sSLO https://github.com/duckdb/duckdb/releases/download/v1.5.6/libduckdb-linux-amd64.zip
+echo "b845005f5132a7d8180057c35e14a7626632258782f871a90861b19c1c03841b  libduckdb-linux-amd64.zip" | sha256sum -c
+unzip -q libduckdb-linux-amd64.zip -d lib   # duckdb.h, libduckdb.so (sha256 3f4962cd...b747633)
+cd <repository> && make -C bench/dbcmp DUCKDB=$DBCMP/duckdb/v1.5.6/lib   # builds build/dbcmp/embq too
+```
+
+Load, settle and size. tsdb takes the file as it is and settles with `tsdb_optimize`. DuckDB gets
+one table `(series INTEGER, ts TIMESTAMP_MS, value FLOAT)` without a primary key, filled through
+4 Appenders (more were not faster) with the rows sorted by (series, ts) first, so the zone maps of
+its row groups prune; the sort is timed and reported apart from the load. A CHECKPOINT follows;
+the size is the file plus its `.wal`, if any.
+
+```sh
+cd $WORK && mkdir -p dump
+rm -rf $DBCMP/tsdb-embq && sync && $B/embq tsdb load $DBCMP/tsdb-embq $DATA 4
+rm -f $DBCMP/duckdb/t.duckdb* && sync && $B/embq duckdb load $DBCMP/duckdb/t.duckdb $DATA 4
+```
+
+Every answer is checked: both engines write all 40,000 window answers and the whole-range digests,
+and `check.py --dumps` compares them (the first line checks the embedded reference against tsdbd's).
+
+```sh
+$B/embq tsdb dump $DBCMP/tsdb-embq spec.tsv > dump/tsdb-windows.jsonl
+$B/embq tsdb full $DBCMP/tsdb-embq 1 1 dump/tsdb-full.jsonl
+$B/embq duckdb dump $DBCMP/duckdb/t.duckdb spec.tsv > dump/duckdb-windows.jsonl
+$B/embq duckdb full $DBCMP/duckdb/t.duckdb 1 1 dump/duckdb-full.jsonl
+python3 -I $H/check.py --dumps dump/tsdb-windows.jsonl dump/tsdb-full.jsonl ref/windows.jsonl ref/full.jsonl
+python3 -I $H/check.py --dumps dump/tsdb-windows.jsonl dump/tsdb-full.jsonl dump/duckdb-windows.jsonl dump/duckdb-full.jsonl
+```
+
+Queries: whole range (median of 5 after a warm-up), then the random windows and point lookups at
+1 and 32 threads, each thread with its own DuckDB connection and prepared statements.
+
+```sh
+$B/embq tsdb full $DBCMP/tsdb-embq 5 1; $B/embq tsdb full $DBCMP/tsdb-embq 5 32
+$B/embq duckdb full $DBCMP/duckdb/t.duckdb 5 1
+for c in raw agg1d agg7d point; do      # a 3 s warm-up per class, then 15 s at 1 and at 32 threads
+  $B/embq tsdb qps $DBCMP/tsdb-embq spec.tsv $c 1 3 > /dev/null
+  for t in 1 32; do $B/embq tsdb qps $DBCMP/tsdb-embq spec.tsv $c $t 15; done
+done
+for c in raw agg1d agg7d point; do
+  $B/embq duckdb qps $DBCMP/duckdb/t.duckdb spec.tsv $c 1 3 > /dev/null
+  for t in 1 32; do $B/embq duckdb qps $DBCMP/duckdb/t.duckdb spec.tsv $c $t 15; done
+done
+```
+
+Variants: `EMBQ_NOPREP=1` sends literal SQL instead of prepared statements (within a few percent of
+each other here); `DUCK_THREADS=1` runs DuckDB with one thread per query instead of 32;
+`DUCK_MEMORY` sets its memory limit (24GB). `embq duckdb sql DB "EXPLAIN ..."` shows a plan: the
+time bounds are cast to `TIMESTAMP_MS` so that both reach the scan as plain table filters.
+
 ## Fairness notes
 
 - **Durability at acknowledgement differs.** tsdb, PostgreSQL and both InfluxDBs flush to disk before
@@ -233,6 +298,11 @@ the WAL (20 s) and starts the one-hour snapshot timer again. The whole-range que
 - **Input order and limits.** Every system gets the file in its original order (all series at sample
   i, then i+1), not sorted by time. InfluxDB 2 has a 24 GB and InfluxDB 3 a 28 GB container limit;
   InfluxDB 3's memory pools are set for that.
+- **DuckDB.** It has no last-write-wins: without a primary key, a second write of a timestamp adds a
+  row (tsdb replaces it); with one, every append would pay a key check. Its input is sorted by
+  (series, ts) before the load (timed apart) while tsdb takes the file unsorted. It runs with
+  threads = 32 and memory_limit = 24GB; tsdb queries use every core too (`query_threads`), so
+  "1 thread" means one calling thread for both. Its fsync behaviour on commit was not examined.
 - **Clients.** ClickHouse uses its own native client (`clickhouse-benchmark`), tsdbd the C client,
   the others `qdrive` over HTTP or libpq. InfluxDB 3's Flight SQL was not tried.
 
@@ -241,5 +311,5 @@ the WAL (20 s) and starts the one-hour snapshot timer again. The whole-range que
 ```sh
 podman stop dbcmp-clickhouse dbcmp-timescale dbcmp-questdb dbcmp-influx2 dbcmp-influx3
 podman rm dbcmp-clickhouse dbcmp-timescale dbcmp-questdb dbcmp-influx2 dbcmp-influx3
-podman unshare rm -rf $DBCMP           # the containers' files belong to mapped users
+podman unshare rm -rf $DBCMP           # the containers' files belong to mapped users (and DuckDB's download)
 ```
