@@ -13,12 +13,20 @@ import java.util.BitSet;
 import java.util.List;
 import java.util.function.IntPredicate;
 
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
+import org.junit.jupiter.params.AfterParameterizedClassInvocation;
+import org.junit.jupiter.params.BeforeParameterizedClassInvocation;
+import org.junit.jupiter.params.Parameter;
+import org.junit.jupiter.params.ParameterizedClass;
+import org.junit.jupiter.params.provider.ValueSource;
 
-/** Protocol version 2 against a live build/tsdbd: value types, nulls, the state dictionary, QUERY_BUCKETS. */
+/**
+ * Protocol version 2 against a live build/tsdbd: value types, nulls, the state dictionary, QUERY_BUCKETS. Every
+ * test runs twice: with packed, compressed inserts (version 3, the default) and with plain arrays.
+ */
+@ParameterizedClass(name = "compression level {0}")
+@ValueSource(ints = {1, 0})
 class TypedValuesTest {
     static final long T0 = TsdbClientTest.T0;
     static final int CHUNK = 16384;        /* rows per QUERY_VALUES chunk of the server */
@@ -30,14 +38,18 @@ class TypedValuesTest {
     static TsdbServer server;
     static TsdbClient c;
 
-    @BeforeAll
-    static void start() throws Exception {
+    @Parameter
+    int level; /* the zstd level of the client: 1 packs, 0 sends plain arrays */
+
+    @BeforeParameterizedClassInvocation
+    static void start(int level) throws Exception {
         scratch = TsdbServer.scratch("tsdbd-java-types-");
         server = TsdbServer.start(scratch.resolve("db"));
         c = server.client();
+        c.setCompression(level);
     }
 
-    @AfterAll
+    @AfterParameterizedClassInvocation
     static void stop() throws Exception {
         try {
             if (c != null)
@@ -117,6 +129,7 @@ class TypedValuesTest {
 
     @Test
     void seriesCreateAndType() throws Exception {
+        assertEquals(level, c.compression(), "the client of this invocation");
         for (ValueType t : ValueType.values()) {
             int id = c.seriesCreate("create." + t, t);
             assertEquals(t, c.seriesType(id));

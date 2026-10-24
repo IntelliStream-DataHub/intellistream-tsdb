@@ -16,11 +16,18 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>17</maven.compiler.release>
     <junit.version>5.13.1</junit.version>
+    <zstd-jni.version>1.5.7-6</zstd-jni.version>
     <!-- The integration tests start this server binary; override with -Dtsdbd=... (e.g. a sanitizer build). -->
     <tsdbd>${project.basedir}/../../build/tsdbd</tsdbd>
   </properties>
 
   <dependencies>
+    <!-- zstd for packed inserts (protocol version 3); without it at run time, inserts go plain. -->
+    <dependency>
+      <groupId>com.github.luben</groupId>
+      <artifactId>zstd-jni</artifactId>
+      <version>${zstd-jni.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
@@ -58,11 +65,34 @@
         <version>3.4.2</version>
         <configuration>
           <archive>
+            <manifest>
+              <!-- java -cp target/tsdb-client-*.jar finds zstd-jni in target/lib -->
+              <addClasspath>true</addClasspath>
+              <classpathPrefix>lib/</classpathPrefix>
+            </manifest>
             <manifestEntries>
               <Automatic-Module-Name>ai.intellistream.tsdb</Automatic-Module-Name>
             </manifestEntries>
           </archive>
         </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.0</version>
+        <executions>
+          <execution>
+            <id>runtime-libs</id>
+            <phase>package</phase>
+            <goals>
+              <goal>copy-dependencies</goal>
+            </goals>
+            <configuration>
+              <includeScope>runtime</includeScope>
+              <outputDirectory>${project.build.directory}/lib</outputDirectory>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>
