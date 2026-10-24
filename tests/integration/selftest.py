@@ -7,6 +7,8 @@ failure into a pass.
   uring probe   a broken io_uring backend must FAIL the run; only tsdbd's own "io_uring is not offered" is a skip
   signals       SIGTERM while the main thread holds the process-list lock must not deadlock the driver
   verdicts      mutate.py counts a crashed driver or a hang as a problem, never as a caught bug
+  float sums    a float sum whose NaN-ness depends on the order of additions is neither compared between layouts
+                nor predicted by the model; one that is NaN in every order is compared bit for bit
 
 Needs build/tsdbd and build/tsdb (make).
 """
@@ -144,11 +146,40 @@ def test_verdicts():
     check(got == "CAUGHT", "a timeout of a hang mutant -> %s (wanted CAUGHT)" % got)
 
 
+def test_float_sums():
+    print("float sums")
+    import run
+    import gen
+    types = {"f": "float64"}
+    big, nbig, inf, ninf, nan = "7fefffffffffffff", "ffefffffffffffff", "7ff0000000000000", "fff0000000000000", \
+        "7ff8000000000000"
+
+    def out(s, lo, hi):
+        return "## agg f 0 100 10\n" + "\t".join(["0", "4", s, lo, hi, "0", "0", "0"]) + "\n"
+    # DBL_MAX, DBL_MAX, -DBL_MAX, -DBL_MAX: +inf in the memtable, NaN once two parts hold +inf and -inf
+    d = run.diff_outputs("memtable", out(inf, nbig, big), "parts", out(nan, nbig, big), types=types)
+    check(d == [], "an overflowing sum is +inf in one layout and NaN in another: not a difference (%s)" % d)
+    d = run.diff_outputs("a", out(nan, nan, nan), "b", out("7ff8000000000001", nan, nan), types=types)
+    check(d != [], "a bucket of only NaNs: a NaN sum with another payload is a difference")
+    d = run.diff_outputs("a", out(nan, ninf, inf), "b", out("fff8000000000000", ninf, inf), types=types)
+    check(d != [], "a bucket with -inf and +inf: a NaN sum with another sign is a difference")
+    d = run.diff_outputs("a", out(inf, nbig, big), "b", out(inf, nbig, inf), types=types)
+    check(d != [], "a different max is still a difference")
+    # +inf, -DBL_MAX, -DBL_MAX: +inf in one order, NaN in another (-DBL_MAX - DBL_MAX = -inf first)
+    sm = gen.float_aggregates("float64", [inf, nbig, nbig])[0]
+    check(sm is None, "the model does not predict a sum of an infinity and rows that can overflow (%s)" % (sm,))
+    sm = gen.float_aggregates("float64", [inf, "3ff0000000000000"])[0]
+    check(sm is not None and sm[1] == float("inf"), "the model predicts +inf for +inf and small rows (%s)" % (sm,))
+    sm = gen.float_aggregates("float64", [big, ninf, inf])[0]
+    check(sm is not None and sm[1] != sm[1], "the model predicts NaN for -inf and +inf (%s)" % (sm,))
+
+
 def main():
     if not (ROOT / "build/tsdbd").exists() or not (ROOT / "build/tsdb").exists():
         print("build/tsdbd and build/tsdb are missing: run make", file=sys.stderr)
         return 2
     test_verdicts()
+    test_float_sums()
     test_signal_while_locked()
     test_signal_during_spawn()
     test_uring_probe()

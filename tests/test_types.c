@@ -650,6 +650,228 @@ static void test_query_stats(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+/* ------------------------------------------------- canonical NaN results */
+
+/* Every aggregate result that is NaN is the one quiet NaN 0x7ff8000000000000,
+ * whatever payloads the NaNs in the data had and in whatever order the engine
+ * added them (memtable, parts, overlapping sources, merges, threads); raw
+ * reads return each stored NaN bit for bit. */
+#define NAN_ROWS 40000
+#define NAN_STEP 1000 /* ms: 40000 rows span two 6-hour partitions */
+#define NAN_ALL0 5000 /* rows [NAN_ALL0, NAN_ALL0 + 300) are NaN only */
+
+static const uint64_t nan_f64[] = {
+    0x7ff8000000000001ull, 0xfff8000000000000ull, 0x7ff0000000000001ull, 0xfff0000000000001ull,
+    0x7ff0000000001001ull, /* signalling: quiets into TSDB_NULL_F64_BITS */
+    0x7ff8000000001000ull, 0x7ff8000000001002ull, 0xfff8000000001001ull, 0x7fffffffffffffffull,
+    0xffffffffffffffffull, 0x7ff8dead00000000ull, 0x7ff4000000000000ull};
+static const uint32_t nan_f32[] = {0x7fc00001u, 0xffc00000u, 0x7f800001u, 0xff800001u, 0x7f801001u, 0x7fc01000u,
+                                   0x7fc01002u, 0xffc01001u, 0x7fffffffu, 0xffffffffu, 0x7fc0deadu, 0x7fa00000u};
+
+static uint64_t nan_slot(int type)
+{
+    uint64_t r = rnd();
+    if (r % 3) /* from the list */
+        return type == TSDB_FLOAT64 ? nan_f64[r / 3 % 12] : nan_f32[r / 3 % 12];
+    /* any other: random sign and payload, never the null */
+    uint64_t s;
+    do {
+        uint64_t p = rnd();
+        if (type == TSDB_FLOAT64)
+            s = (p & 0x800fffffffffffffull) | 0x7ff0000000000000ull;
+        else
+            s = (p & 0x807fffffu) | 0x7f800000u;
+    } while ((type == TSDB_FLOAT64 ? (s & 0x000fffffffffffffull) : (s & 0x7fffffu)) == 0 || s == type_null(type));
+    return s;
+}
+
+static uint64_t num_slot(int type, size_t k)
+{
+    double d = (double)(k % 997) * 0.25 - 50;
+    if (type == TSDB_FLOAT64) {
+        uint64_t s;
+        memcpy(&s, &d, 8);
+        return s;
+    }
+    float f = (float)d;
+    uint32_t s;
+    memcpy(&s, &f, 4);
+    return s;
+}
+
+/* Writes rows k0, k0 + stride, ... below k1 in batches of `batch`; with `nans` one row in that many is a NaN
+ * (every row in the NaN-only range), one in 101 a null, the rest numbers. */
+static void nan_write(tsdb *db, uint32_t id, int type, uint64_t *ref, size_t k0, size_t k1, size_t stride,
+                      size_t batch, unsigned nans)
+{
+    int64_t *ts = malloc(batch * sizeof *ts);
+    uint8_t *v = calloc(batch, 8), *valid = calloc((batch + 7) / 8, 1);
+    size_t w = type_width(type);
+    for (size_t k = k0; k < k1;) {
+        size_t n = 0;
+        memset(valid, 0, (batch + 7) / 8);
+        for (; n < batch && k < k1; k += stride, n++) {
+            bool all = k >= NAN_ALL0 && k < NAN_ALL0 + 300;
+            uint64_t s = all || rnd() % nans == 0 ? nan_slot(type) : rnd() % 101 == 0 ? type_null(type)
+                                                                                       : num_slot(type, k + rnd() % 7);
+            ts[n] = 1700000000000 + (int64_t)k * NAN_STEP;
+            bool known = s != type_null(type);
+            valid[n >> 3] |= (uint8_t)(known << (n & 7));
+            slot_put(v, w, n, known ? s : 0);
+            ref[k] = s;
+        }
+        OK(tsdb_insert_series_values(db, id, ts, &(tsdb_values){(tsdb_type)type, v, valid}, n));
+    }
+    free(ts);
+    free(v);
+    free(valid);
+}
+
+static bool is_canon(double d)
+{
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return d == d || b == 0x7ff8000000000000ull;
+}
+
+/* every NaN in the buckets canonical; returns the number of NaN sums and adds the NaN mins to *nan_min */
+static size_t nan_check_buckets(const tsdb_bucket *b, size_t nb, size_t *nan_min, const char *what)
+{
+    size_t nan_sum = 0, bad = 0;
+    for (size_t i = 0; i < nb; i++) {
+        nan_sum += isnan(b[i].sum);
+        *nan_min += isnan(b[i].min) && b[i].count;
+        bad += !is_canon(b[i].sum) + !is_canon(b[i].min) + !is_canon(b[i].max);
+        if (!is_canon(b[i].sum) || !is_canon(b[i].min) || !is_canon(b[i].max)) {
+            uint64_t s, mn, mx;
+            memcpy(&s, &b[i].sum, 8), memcpy(&mn, &b[i].min, 8), memcpy(&mx, &b[i].max, 8);
+            if (bad < 4)
+                fprintf(stderr, "  %s bucket %zu: sum %016" PRIx64 " min %016" PRIx64 " max %016" PRIx64 "\n", what,
+                        i, s, mn, mx);
+        }
+        /* the version 1 wire rows narrow min and max to float32: canonical there too */
+        float f[2] = {(float)b[i].min, (float)b[i].max};
+        uint32_t fb[2];
+        memcpy(fb, f, 8);
+        CHECK(!isnan(f[0]) || fb[0] == 0x7fc00000u);
+        CHECK(!isnan(f[1]) || fb[1] == 0x7fc00000u);
+    }
+    CHECK(bad == 0);
+    return nan_sum;
+}
+
+static void nan_check(tsdb *db, const uint32_t *ids, uint64_t *const *refs, const char *when)
+{
+    const int64_t t0 = 1700000000000, t1 = t0 + (int64_t)NAN_ROWS * NAN_STEP;
+    for (int t = 0; t < 2; t++) {
+        int type = t ? TSDB_FLOAT64 : TSDB_FLOAT32;
+        char what[96];
+        snprintf(what, sizeof what, "%s %s", type_name[type], when);
+        size_t nan_sum = 0, nan_min = 0, nb;
+        tsdb_bucket *b;
+        /* one bucket over all: granule statistics for most granules */
+        OK(tsdb_query_agg(db, ids[t], t0, t1, 0, &b, &nb));
+        size_t known = 0;
+        for (size_t k = 0; k < NAN_ROWS; k++)
+            known += refs[t][k] != type_null(type);
+        CHECK(nb == 1 && b[0].count == known && isnan(b[0].sum));
+        nan_sum += nan_check_buckets(b, nb, &nan_min, what);
+        free(b);
+        static const int64_t iv[] = {7000, 60000, 256000, 3600000};
+        for (size_t i = 0; i < sizeof iv / sizeof *iv; i++) {
+            OK(tsdb_query_agg(db, ids[t], t0, t1, iv[i], &b, &nb));
+            nan_sum += nan_check_buckets(b, nb, &nan_min, what);
+            free(b);
+        }
+        OK(tsdb_query_group(db, ids[t], t0, t1, &(tsdb_group){TSDB_HOUR, 1, NULL}, &b, &nb));
+        nan_sum += nan_check_buckets(b, nb, &nan_min, what);
+        free(b);
+        int64_t bounds[] = {t0, t0 + 3333 * NAN_STEP, t0 + 4999 * NAN_STEP, t0 + 17777 * NAN_STEP, t0 + 30001 * NAN_STEP};
+        OK(tsdb_query_bounds(db, ids[t], t0, t1, bounds, 5, NULL, &b, &nb));
+        nan_sum += nan_check_buckets(b, nb, &nan_min, what);
+        free(b);
+        /* the NaN-only rows: min and max NaN too */
+        OK(tsdb_query_agg(db, ids[t], t0 + NAN_ALL0 * NAN_STEP, t0 + (NAN_ALL0 + 300) * NAN_STEP, 0, &b, &nb));
+        CHECK(nb == 1 && b[0].count == 300 && isnan(b[0].min) && isnan(b[0].max));
+        nan_sum += nan_check_buckets(b, nb, &nan_min, what);
+        free(b);
+        CHECK(nan_sum > 50 && nan_min >= 2);
+        /* raw: every payload as written */
+        got g = {type, NULL, 0, 0};
+        OK(tsdb_query_values(db, ids[t], INT64_MIN, INT64_MAX, NULL, collect, &g));
+        bool same = g.n == NAN_ROWS;
+        for (size_t k = 0; same && k < NAN_ROWS; k++)
+            same = g.rows[k].ts == t0 + (int64_t)k * NAN_STEP && g.rows[k].slot == refs[t][k];
+        if (!same)
+            fprintf(stderr, "  %s: raw NaN payloads changed\n", what);
+        CHECK(same);
+        free(g.rows);
+    }
+}
+
+static void test_nan_canonical(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/types-nan-%d", base, (int)getpid());
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.granule_rows = 256;
+    o.partition_ms = 6 * 3600000;
+    o.fsync = 0;
+    o.wal_max_batch_rows = 1000;
+    o.query_threads = 8;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t ids[2];
+    uint64_t *refs[2];
+    OK(tsdb_series_create(db, "nan.f32", TSDB_FLOAT32, NULL, &ids[0]));
+    OK(tsdb_series_create(db, "nan.f64", TSDB_FLOAT64, NULL, &ids[1]));
+    for (int t = 0; t < 2; t++) {
+        int type = t ? TSDB_FLOAT64 : TSDB_FLOAT32;
+        refs[t] = malloc(NAN_ROWS * sizeof *refs[t]);
+        /* small batches into the WAL and memtable, large ones straight into parts */
+        nan_write(db, ids[t], type, refs[t], 0, NAN_ROWS / 2, 1, 500, 37);
+        nan_write(db, ids[t], type, refs[t], NAN_ROWS / 2, NAN_ROWS, 1, 4000, 23);
+    }
+    nan_check(db, ids, refs, "memtable and parts");
+    OK(tsdb_flush(db));
+    nan_check(db, ids, refs, "flushed");
+    /* a read-only follower of the same directory answers from what it refreshes: canonical there too */
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1;
+    ro.query_threads = 8;
+    tsdb *fol;
+    OK(tsdb_open(dir, &ro, &fol));
+    nan_check(fol, ids, refs, "follower");
+    /* rewrite every third row of a range: overlapping sources, newer NaNs over older ones */
+    for (int t = 0; t < 2; t++) {
+        nan_write(db, ids[t], t ? TSDB_FLOAT64 : TSDB_FLOAT32, refs[t], 3001, 31001, 3, 2500, 5);
+        nan_write(db, ids[t], t ? TSDB_FLOAT64 : TSDB_FLOAT32, refs[t], 10002, 12002, 3, 300, 3);
+    }
+    nan_check(db, ids, refs, "overlapping");
+    OK(tsdb_flush(db));
+    OK(tsdb_refresh(fol));
+    nan_check(fol, ids, refs, "follower, overlapping");
+    OK(tsdb_optimize(db));
+    nan_check(db, ids, refs, "merged");
+    OK(tsdb_refresh(fol));
+    nan_check(fol, ids, refs, "follower, merged");
+    OK(tsdb_close(fol));
+    OK(tsdb_close(db));
+    for (int threads = 1; threads <= 8; threads += 7) {
+        o.query_threads = threads;
+        OK(tsdb_open(dir, &o, &db));
+        nan_check(db, ids, refs, threads == 1 ? "reopened, 1 thread" : "reopened, 8 threads");
+        OK(tsdb_close(db));
+    }
+    free(refs[0]);
+    free(refs[1]);
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -657,6 +879,7 @@ int main(int argc, char **argv)
     test_engine(base);
     test_old_version(base);
     test_query_stats(base);
+    test_nan_canonical(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

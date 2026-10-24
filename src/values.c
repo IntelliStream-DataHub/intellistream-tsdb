@@ -132,7 +132,7 @@ void granule_stats(int type, const void *v, size_t n, granule *g)
     } else {
         g->fmin = a.min;
         g->fmax = a.max;
-        g->fsum = a.sum;
+        g->fsum = canon_nan(a.sum); /* a merge rewriting the granule writes the same bits */
         g->isum_hi = 0;
     }
 }

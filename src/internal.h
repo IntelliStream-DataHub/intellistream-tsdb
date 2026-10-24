@@ -222,11 +222,22 @@ typedef struct agg_state {
     };
 } agg_state;
 
-/* One NaN for every NaN sum. Which payload and sign an addition of NaNs keeps
- * depends on the operand order the compiler picked (ADDSD returns its first
- * NaN operand), and that differs between CPU levels and kernels; a sum must
- * not (levels.h). */
-static inline double canon_nan(double x) { return x == x ? x : __builtin_nan(""); }
+/* One NaN for every NaN result: the quiet NaN 0x7ff8000000000000 (as float32,
+ * 0x7fc00000). Which payload and sign an addition of NaNs keeps depends on the
+ * order of the additions (ADDSD returns its first NaN operand), and that varies
+ * with CPU levels, kernels, threads and merges; a result must not. Nor may a
+ * result carry a stored value's payload: a signalling NaN with payload 0x1001
+ * quiets into TSDB_NULL_F64_BITS. Stored values keep their bits; only results
+ * (and granule sums, which are results kept on disk) are canonical. */
+#define CANON_NAN_BITS 0x7ff8000000000000ull
+static inline double nan_canonical(void)
+{
+    uint64_t b = CANON_NAN_BITS;
+    double d;
+    memcpy(&d, &b, 8);
+    return d;
+}
+static inline double canon_nan(double x) { return x == x ? x : nan_canonical(); }
 
 static inline void agg_init(agg_state *a, int type)
 {
@@ -269,7 +280,7 @@ void granule_stats(int type, const void *v, size_t n, struct granule *g);
 void agg_from_granule(int type, const struct granule *g, agg_state *a);
 static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
 {
-    const double nan = __builtin_nan("");
+    const double nan = nan_canonical();
     b->count = a->count;
     b->sum = 0;
     b->min = b->max = nan;
@@ -285,8 +296,8 @@ static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
         b->max = (double)a->imax;
         return;
     }
-    b->sum = a->sum;
-    if (a->min <= a->max) { /* else only NaN values */
+    b->sum = canon_nan(a->sum);
+    if (a->min <= a->max) { /* else only NaN values; min and max skip NaNs, so neither is one here */
         b->min = a->min;
         b->max = a->max;
     }

@@ -409,6 +409,149 @@ static void test_types(tsdbc *c)
     close(fd);
 }
 
+/* NaN results through the server: one quiet NaN 0x7ff8000000000000 (0x7fc00000 in the float32 min and max of
+ * version 1 rows), whatever payloads the data had; raw values keep theirs. */
+static bool canon64(double d)
+{
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return d == d || b == 0x7ff8000000000000ull;
+}
+
+typedef struct nan_rows {
+    uint64_t *bits;
+    size_t n, cap;
+    int type;
+} nan_rows;
+
+static int collect_bits(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    nan_rows *r = ctx;
+    for (size_t k = 0; k < n && r->n < r->cap; k++, r->n++) {
+        bool known = !col->valid || ((col->valid[k >> 3] >> (k & 7)) & 1);
+        uint64_t s = 0;
+        if (col->type == TSDB_FLOAT64)
+            memcpy(&s, (const double *)col->values + k, 8);
+        else
+            memcpy(&s, (const float *)col->values + k, 4);
+        r->bits[r->n] = known ? s : UINT64_MAX;
+    }
+    return 0;
+}
+
+static void test_nan(tsdbc *c)
+{
+    enum { NN = 6000 };
+    static const uint64_t p64[] = {0x7ff8000000000001ull, 0xfff8000000000000ull, 0x7ff0000000000001ull,
+                                   0x7ff0000000001001ull, 0x7ff8000000001000ull, 0x7ff8000000001002ull,
+                                   0xffffffffffffffffull, 0x7ff8dead00000000ull};
+    static const uint32_t p32[] = {0x7fc00001u, 0xffc00000u, 0x7f800001u, 0x7f801001u,
+                                   0x7fc01000u, 0x7fc01002u, 0xffffffffu, 0x7fc0deadu};
+    uint64_t x = 0x2545f4914f6cdd1dull;
+    uint32_t ids[2];
+    OK(tsdbc_series_create(c, "nan.f32", TSDB_FLOAT32, NULL, &ids[0]));
+    OK(tsdbc_series_create(c, "nan.f64", TSDB_FLOAT64, NULL, &ids[1]));
+    static uint64_t ref[2][NN];
+    int64_t *ts = malloc(NN * sizeof *ts);
+    uint64_t *v = malloc(NN * 8);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int t = 0; t < 2; t++) {
+            /* pass 0 everything in batches, flushed; pass 1 every 4th row again, newer NaNs over older ones */
+            size_t n = 0;
+            for (size_t k = pass; k < NN; k += pass ? 4 : 1, n++) {
+                x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+                bool nan = x % 9 == 0 || (k >= 1000 && k < 1100);
+                double d = (double)(k % 101) - 20.5;
+                uint64_t s;
+                if (t) {
+                    s = nan ? p64[x / 9 % 8] : 0;
+                    if (!nan)
+                        memcpy(&s, &d, 8);
+                } else {
+                    float f = (float)d;
+                    uint32_t u = nan ? p32[x / 9 % 8] : 0;
+                    if (!nan)
+                        memcpy(&u, &f, 4);
+                    s = u;
+                }
+                ts[n] = T0 + 86400000 + (int64_t)k * 1000;
+                if (t)
+                    v[n] = s;
+                else
+                    memcpy((uint32_t *)v + n, &(uint32_t){(uint32_t)s}, 4);
+                ref[t][k] = s;
+            }
+            for (size_t o = 0; o < n; o += 700) /* frames of 700: some into the memtable, some into parts */
+                OK(tsdbc_insert_series_values(c, ids[t], ts + o,
+                                              &(tsdb_values){t ? TSDB_FLOAT64 : TSDB_FLOAT32,
+                                                             t ? (void *)(v + o) : (void *)((uint32_t *)v + o), NULL},
+                                              n - o < 700 ? n - o : 700));
+        }
+        if (pass == 0)
+            OK(tsdbc_flush(c));
+    }
+    free(ts);
+    free(v);
+    const int64_t lo = T0 + 86400000, hi = lo + NN * 1000;
+    for (int t = 0; t < 2; t++) {
+        tsdb_bucket *bk;
+        size_t nb, nan_sums = 0, nan_mins = 0, bad = 0;
+        static const int64_t iv[] = {0, 7000, 60000, 3600000};
+        for (size_t i = 0; i < 4; i++) {
+            OK(tsdbc_query_agg(c, ids[t], lo, hi, iv[i], &bk, &nb));
+            for (size_t k = 0; k < nb; k++) {
+                nan_sums += isnan(bk[k].sum);
+                nan_mins += isnan(bk[k].min);
+                bad += !canon64(bk[k].sum) + !canon64(bk[k].min) + !canon64(bk[k].max);
+            }
+            free(bk);
+        }
+        OK(tsdbc_query_group(c, ids[t], lo, hi, &(tsdb_group){TSDB_MINUTE, 5, NULL}, NULL, &bk, &nb));
+        for (size_t k = 0; k < nb; k++)
+            bad += !canon64(bk[k].sum) + !canon64(bk[k].min) + !canon64(bk[k].max);
+        free(bk);
+        int64_t bounds[] = {lo, lo + 999 * 1000, lo + 1000 * 1000, lo + 1100 * 1000, lo + 4321 * 1000};
+        OK(tsdbc_query_bounds(c, ids[t], lo, hi, bounds, 5, NULL, &bk, &nb));
+        CHECK(nb == 5 && bk[2].count == 100 && isnan(bk[2].min) && isnan(bk[2].max) && isnan(bk[2].sum));
+        for (size_t k = 0; k < nb; k++)
+            bad += !canon64(bk[k].sum) + !canon64(bk[k].min) + !canon64(bk[k].max);
+        free(bk);
+        if (bad)
+            fprintf(stderr, "  %s: %zu NaN results are not 0x7ff8000000000000\n", t ? "float64" : "float32", bad);
+        CHECK(bad == 0 && nan_sums > 10 && nan_mins >= 2);
+
+        /* version 1 rows (QUERY_AGG): double sum, float32 min and max */
+        int fd = raw_connect();
+        uint8_t q[28];
+        int64_t a = lo + 1000 * 1000, z = lo + 1100 * 1000, every = 0;
+        memcpy(q, &ids[t], 4);
+        memcpy(q + 4, &a, 8);
+        memcpy(q + 12, &z, 8);
+        memcpy(q + 20, &every, 8);
+        raw_send(fd, 7, TSDB_OP_QUERY_AGG, q, sizeof q);
+        uint32_t rid;
+        uint8_t rest[64];
+        size_t nrest = 0;
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && nrest == 4 + TSDB_AGG_ROW);
+        uint64_t sb;
+        uint32_t mnb, mxb;
+        memcpy(&sb, rest + 4 + 16, 8);
+        memcpy(&mnb, rest + 4 + 24, 4);
+        memcpy(&mxb, rest + 4 + 28, 4);
+        CHECK(sb == 0x7ff8000000000000ull && mnb == 0x7fc00000u && mxb == 0x7fc00000u);
+        close(fd);
+
+        /* raw: the payloads as written */
+        nan_rows r = {malloc(NN * 8), 0, NN, t};
+        OK(tsdbc_query_values(c, ids[t], lo, hi, NULL, collect_bits, &r));
+        bool same = r.n == NN;
+        for (size_t k = 0; same && k < NN; k++)
+            same = r.bits[k] == ref[t][k];
+        CHECK(same);
+        free(r.bits);
+    }
+}
+
 typedef struct counter {
     size_t rows, calls, stop_after;
     int64_t last;
@@ -1140,6 +1283,7 @@ int main(int argc, char **argv)
     test_close(c);
     test_framing();
     test_types(c);
+    test_nan(c);
     test_pack_roundtrip();
     test_packed_inserts(c);
     test_bounds(c, a, N);

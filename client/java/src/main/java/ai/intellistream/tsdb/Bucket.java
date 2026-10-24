@@ -5,7 +5,9 @@ package ai.intellistream.tsdb;
  *
  * <p>Aggregates skip nulls: {@code count} is the number of known values, and a bucket whose rows are all null is
  * returned with count 0 (buckets without rows are not returned). For floats, NaN values are ignored by {@code min}
- * and {@code max} (NaN if there are no others) but propagate into {@code sum}. For int64 and bool series ({@code
+ * and {@code max} (NaN if there are no others) but propagate into {@code sum}. Every NaN {@code sum}, {@code min}
+ * or {@code max} is the one quiet NaN {@code 0x7ff8000000000000} ({@link Double#NaN}), whatever NaNs were stored,
+ * so results compare bit for bit. For int64 and bool series ({@code
  * false} 0, {@code true} 1) the sum, minimum and maximum are also exact in {@code isum}, {@code imin} and {@code
  * imax}; {@code isum} saturates at {@link Long#MIN_VALUE} and {@link Long#MAX_VALUE}. For state series only
  * {@code count} is meaningful.
