@@ -2108,7 +2108,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: descriptor limit %llu: at most %zu connections\n", (unsigned long long)rl.rlim_cur,
                 max_conns);
     }
-    int lfd = listen_on(addr, &port);
+    /* static: the accept and failwatch threads read it through a pointer, and a startup failure after they began
+     * (the port file) returns from main while they may not have read it yet */
+    static int lfd;
+    lfd = listen_on(addr, &port);
     if (lfd < 0)
         return 1;
     int mfd = -1;
