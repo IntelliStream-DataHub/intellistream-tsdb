@@ -402,12 +402,16 @@ fn threads_share_one_db() {
         std::thread::spawn(move || {
             let mut last = 0;
             for _ in 0..200 {
-                let n: u64 =
-                    ids.iter().map(|&id| db.query_agg(id, .., 0).unwrap().first().map_or(0, |b| b.count)).sum();
+                let (mut n, mut buckets) = (0u64, 0);
+                for &id in &ids {
+                    let b = db.query_agg(id, .., 0).unwrap();
+                    n += b.first().map_or(0, |b| b.count);
+                    buckets = b.len() as u64; // 0 while that series' writer has not inserted yet
+                }
                 assert!(n >= last, "rows went from {last} to {n}");
                 last = n;
-                // per thread: this thread's last query
-                assert_eq!(db.last_query_stats().result_rows, 1);
+                // per thread: this thread's last query, whatever the writers query meanwhile
+                assert_eq!(db.last_query_stats().result_rows, buckets);
             }
         })
     };
