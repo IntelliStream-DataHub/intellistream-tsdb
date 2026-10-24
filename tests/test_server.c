@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -2530,9 +2531,52 @@ static void test_metrics_more(const char *dir)
     CHECK(rej >= 6);
     for (int i = 0; i < 12; i++)
         close(extra_fd[i]);
+
+    /* scrapers that do not read their reply delay nobody: the metrics thread sends as the socket takes it
+     * (it used to wait up to a second per such client, in the one thread that serves every scraper) */
+    {
+        char name[64], svol[1100];
+        size_t len = 0;
+        /* a reply far larger than a small socket buffer takes; its size per volume depends on the length of the
+         * scratch directory's path, so add volumes until it is (48 were enough under /tmp/claude-1000/x, not /tmp) */
+        for (int v = 0; v < 400 && len <= 150000; v++) {
+            snprintf(svol, sizeof svol, "%s.slow%03d.%0120d", dir, v, 0);
+            snprintf(name, sizeof name, "slow%d", v);
+            OK(tsdbc_series_at(c, name, svol, &sid));
+            if (v % 16 == 15) {
+                char *r = HTTP_EXCHANGE("GET /metrics HTTP/1.1\r\n\r\n", 5, &len);
+                CHECK(r);
+                free(r);
+            }
+        }
+        CHECK(len > 150000);
+        int stuck[3];
+        for (int i = 0; i < 3; i++) {
+            stuck[i] = socket(AF_INET, SOCK_STREAM, 0);
+            int one = 1, mss = 536;
+            setsockopt(stuck[i], SOL_SOCKET, SO_RCVBUF, &one, sizeof one);
+            setsockopt(stuck[i], IPPROTO_TCP, TCP_MAXSEG, &mss, sizeof mss);
+            struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)mport)};
+            inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+            CHECK(connect(stuck[i], (struct sockaddr *)&sa, sizeof sa) == 0);
+            static const char req[] = "GET /metrics HTTP/1.1\r\n\r\n";
+            CHECK(send(stuck[i], req, sizeof req - 1, MSG_NOSIGNAL) == (ssize_t)(sizeof req - 1));
+        }
+        usleep(50000);
+        int64_t t0 = mono_us();
+        mset m;
+        CHECK(scrape(&m));
+        int64_t took = mono_us() - t0;
+        mset_free(&m);
+        if (took > 500000)
+            fprintf(stderr, "metrics: a scrape behind 3 clients that do not read took %lld ms\n", (long long)took / 1000);
+        CHECK(took < 500000);
+        for (int i = 0; i < 3; i++)
+            close(stuck[i]);
+    }
     tsdbc_close(c);
     stop_server(srv);
-    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", dir, vol);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s' '%s'.slow*", dir, vol, dir);
     if (!failures && system(cmd) != 0)
         failures++;
 }
