@@ -3,8 +3,10 @@
  *   conv lp    IN OUT   line protocol for InfluxDB 2 and 3 (measurement sensors, tag series, ms)
  *   conv ilp32 IN OUT   the same for QuestDB's FLOAT column
  *   conv csv   IN OUT   series,timestamptz,value for TimescaleDB's COPY
+ *   conv om    IN OUT   OpenMetrics text for Prometheus' promtool tsdb create-blocks-from openmetrics:
+ *                       gauge sensors{series="N"}, timestamps in seconds with milliseconds
  *
- * Values must stay exactly the float32 of the input. InfluxDB has only float64 fields, so lp
+ * Values must stay exactly the float32 of the input. InfluxDB and Prometheus have only float64, so lp and om
  * writes the float32's exact double value, as the shortest text that parses back to that double;
  * ilp32 and csv write the shortest text that parses back to the float32 ("21.9", not
  * "21.8999996"), which is smaller and what an exporter of float32 data would print.
@@ -33,13 +35,14 @@ int main(int argc, char **argv)
     FILE *o = fopen(argv[3], "w");
     static char obuf[1 << 22];
     setvbuf(o, obuf, _IOFBF, sizeof obuf);
-    int mode = !strcmp(argv[1], "lp") ? 0 : !strcmp(argv[1], "ilp32") ? 1 : 2;
+    int mode = !strcmp(argv[1], "lp") ? 0 : !strcmp(argv[1], "ilp32") ? 1 : !strcmp(argv[1], "om") ? 3 : 2;
+    if (mode == 3) fputs("# TYPE sensors gauge\n", o);
     char vb[40];
     int64_t last_sec = INT64_MIN;
     char secbuf[32] = "";
     for (size_t i = 0; i < n; i++) {
-        /* shortest text that parses back to the same value: as a double for lp, as a float otherwise */
-        if (mode == 0) {
+        /* shortest text that parses back to the same value: as a double for lp and om, as a float otherwise */
+        if (mode == 0 || mode == 3) {
             double d = r[i].v;
             for (int p = 9; p <= 17; p++) {
                 snprintf(vb, sizeof vb, "%.*g", p, d);
@@ -53,6 +56,9 @@ int main(int argc, char **argv)
         }
         if (mode < 2)
             fprintf(o, "sensors,series=%u value=%s %lld\n", r[i].s, vb, (long long)r[i].t);
+        else if (mode == 3)
+            fprintf(o, "sensors{series=\"%u\"} %s %lld.%03lld\n", r[i].s, vb, (long long)(r[i].t / 1000),
+                    (long long)(r[i].t % 1000));
         else {
             int64_t sec = r[i].t / 1000, ms = r[i].t % 1000; /* all timestamps are positive */
             if (sec != last_sec) {
@@ -65,6 +71,7 @@ int main(int argc, char **argv)
             fprintf(o, "%u,%s.%03lld+00,%s\n", r[i].s, secbuf, (long long)ms, vb);
         }
     }
+    if (mode == 3) fputs("# EOF\n", o);
     fclose(o);
     return 0;
 }
