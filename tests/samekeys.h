@@ -26,7 +26,7 @@
  *  - no stale reads: once (A, r) was acknowledged, or a reader has seen it, a
  *    later query (of any series, for writes that cover all series at once)
  *    does not show an older write of A at a key that (A, r) covers.
- * Appends (one row per call) and per-series inserts are not atomic across keys
+ * Appends (one row per call), per-series inserts and replaces are not atomic across keys
  * or series; runs that use them keep the checks that still apply.
  */
 #ifndef SAMEKEYS_H
@@ -45,7 +45,11 @@
 #define SK_MAX_SERIES 8
 
 /* write kinds */
-enum { SK_SMALL = 1, SK_LARGE = 2, SK_APPEND = 4, SK_SERIES = 8 };
+/* SK_REPLACE: per series, tsdb_replace_range of exactly the writer's window, so
+ * it leaves the same state as a per-series insert of the window; it checks that
+ * the tombstone hides neither its own rows nor newer inserts, and that no reader
+ * sees the window empty in between. */
+enum { SK_SMALL = 1, SK_LARGE = 2, SK_APPEND = 4, SK_SERIES = 8, SK_REPLACE = 16 };
 /* key states */
 enum { SK_ABSENT = 0, SK_VALUE = 1, SK_NULL = 2, SK_GARBAGE = 3 };
 
@@ -320,7 +324,7 @@ static int sk_check_snapshot(const sk_cfg *c, uint32_t s, const sk_val *row, con
     int errors = 0, W = c->writers;
     uint32_t span = sk_span(c);
     bool snap = !(c->kinds & SK_APPEND);               /* every write of the series is one batch */
-    bool cross = !(c->kinds & (SK_APPEND | SK_SERIES)); /* ... and of every series together */
+    bool cross = !(c->kinds & (SK_APPEND | SK_SERIES | SK_REPLACE)); /* ... and of every series together */
     int16_t inq[SK_MAX_WRITERS];
     for (int w = 0; w < W; w++)
         inq[w] = -1;
@@ -610,8 +614,8 @@ static int sk_check_final(const sk_cfg *c, const sk_val *st, const int *last_kin
 /* Picks a write kind from c->kinds. */
 static int sk_pick(const sk_cfg *c, uint64_t x)
 {
-    int opts[4], n = 0;
-    for (int k = 1; k <= SK_SERIES; k <<= 1)
+    int opts[5], n = 0;
+    for (int k = 1; k <= SK_REPLACE; k <<= 1)
         if (c->kinds & (unsigned)k)
             opts[n++] = k;
     return opts[x % (uint64_t)n];

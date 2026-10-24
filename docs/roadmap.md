@@ -17,14 +17,23 @@ series store underneath; tsdb does not duplicate it.
 - Failover with one writer per volume, and NFS outage handling (docs/ha.md).
 - Edge buffering: Apache Pulsar and the Pulsar sink (connectors/pulsar).
 
+## Done
+
+- Delete or replace a time range of one series: atomic replace (delete plus
+  insert), in the library, tsdbd (protocol 7), the C, Rust, Python and Java
+  clients and the CLI.
+- Retention per series: values older than the series' limit disappear from
+  queries at once and are removed by merges.
+- Standard deviation and range in aggregates: range, population and sample
+  variance and standard deviation (`tsdb_query_spread` and friends), exact
+  for integers, numerically stable for floats, from granule statistics; in
+  tsdbd (protocol 8), the C client and the CLI.
+- Prometheus metrics: tsdbd serves `/metrics` in Prometheus text format on a
+  separate port (`--metrics-port`, docs/metrics.md).
+
 ## Next
 
-| feature | notes |
-|---|---|
-| Delete or replace a time range of one series | atomic replace (delete plus insert), from the library and every client |
-| Retention per series | built on the range delete: data older than the series' limit is removed |
-| Prometheus metrics | tsdbd serves `/metrics` in Prometheus text format on a separate port |
-| Standard deviation and range in aggregates | after the time-weighted average work (both extend the granule statistics) |
+Nothing queued beyond the work in progress above.
 
 ## After the first release
 

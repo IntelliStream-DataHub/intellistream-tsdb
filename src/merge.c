@@ -14,6 +14,14 @@
  * the newest source part (highest block number), which is what makes the
  * table behave like a ReplacingMergeTree. When a whole source granule sorts
  * strictly before everything else that remains, it is copied as compressed bytes.
+ *
+ * Deletes and retention: a source's rows covered by the tombstones of a newer
+ * source, or older than their series' retention cutoff, are dropped (a granule
+ * that has any is decoded, never copied). The output keeps the union of the
+ * sources' tombstones, which still hide older parts of the partition, unless
+ * no older part is listed: block numbers only grow, so none can come later. An
+ * output with no rows is still written, with no granules, so that it replaces
+ * its sources and keeps their wal_seq: WAL replay skips a partition by it.
  */
 #include "internal.h"
 
@@ -105,6 +113,7 @@ typedef struct cursor {
     int64_t *ts;
     uint8_t *v; /* slots of type */
     int type;   /* of the loaded granule's series */
+    tomb_set hide; /* tombstones of newer sources */
 } cursor;
 
 static inline bool cur_done(const cursor *c) { return c->gi >= c->p->ng; }
@@ -171,14 +180,56 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         level = MAX(level, src[i]->level);
     }
     uint64_t wal_seq = 0;
-    for (size_t i = 0; i < k; i++)
+    bool tombs = false;
+    int64_t min_ts = INT64_MAX;
+    for (size_t i = 0; i < k; i++) {
         wal_seq = MAX(wal_seq, src[i]->wal_seq);
+        tombs |= src[i]->nt > 0;
+        min_ts = MIN(min_ts, src[i]->min_ts);
+    }
+    int64_t now = eng_now_ms(db); /* one instant for the whole merge */
+    bool ttl = atomic_load(&db->has_retention);
     part_writer w;
     int rc = pw_begin(&w, db, src[0]->partition, wal_seq);
     if (rc) {
         free(cur);
         return rc;
     }
+    w.keep_empty = true; /* replaces its sources even when nothing is left */
+    w.empty_ts = min_ts;
+    if (tombs) {
+        bool older = false; /* a listed part of the partition below the merge: the tombstones still hide it */
+        pthread_mutex_lock(&db->lock);
+        for (size_t i = 0; i < db->nparts && !older; i++)
+            older = db->parts[i]->partition == src[0]->partition && db->parts[i]->max_block < min_block;
+        pthread_mutex_unlock(&db->lock);
+        tomb_set keep = {0};
+        for (size_t i = 0; i < k && rc == 0; i++) {
+            for (size_t j = 0; j < k && rc == 0; j++)
+                if (src[j]->min_block > src[i]->max_block)
+                    rc = tomb_set_add(&cur[i].hide, src[j]->t, src[j]->nt);
+            tomb_set_finish(&cur[i].hide);
+            if (older && rc == 0)
+                rc = tomb_set_add(&keep, src[i]->t, src[i]->nt);
+        }
+        tomb_set_finish(&keep);
+        size_t o = 0;
+        for (size_t i = 0; i < keep.n; i++) { /* what retention removes needs no tombstone */
+            int64_t cut = ttl ? eng_cutoff_at(db, keep.t[i].series, now) : INT64_MIN;
+            if (keep.t[i].end <= cut)
+                continue;
+            keep.t[o] = keep.t[i];
+            keep.t[o].start = MAX(keep.t[o].start, cut);
+            o++;
+        }
+        if (rc == 0)
+            rc = pw_set_tombs(&w, keep.t, o);
+        tomb_set_free(&keep);
+    }
+    uint32_t cut_series = UINT32_MAX;
+    int64_t cut = INT64_MIN;
+    int64_t *fts = NULL;
+    uint8_t *fv = NULL;
     codec_ctx *cc = cc_get(db);
     uint64_t rows = 0, copied = 0;
     if (!cc)
@@ -222,10 +273,16 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         if (!c)
             break;
         const granule *g = &c->p->g[c->gi];
+        if (ttl && g->series != cut_series) {
+            cut_series = g->series;
+            cut = eng_cutoff_at(db, g->series, now);
+        }
+        int64_t gcut = ttl ? cut : INT64_MIN;
+        bool filter = gcut > g->ts_min || (c->hide.n && tomb_set_hits(&c->hide, g->series, g->ts_min, g->ts_max));
         if (!c->loaded) {
             bool before_rest = !has_bound || g->series < bs || (g->series == bs && g->ts_max < bt);
             bool full = g->count >= w.grows;
-            if (before_rest && full && (w.pend_n == 0 || w.pend_series != g->series)) {
+            if (!filter && before_rest && full && (w.pend_n == 0 || w.pend_series != g->series)) {
                 rc = pw_copy_granule(&w, c->p, g);
                 rows += g->count;
                 copied++;
@@ -245,8 +302,21 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
                 tie = true;
             }
         }
-        rc = pw_add(&w, g->series, c->type, c->ts + c->pos, c->v + c->pos * type_width(c->type), end - c->pos);
-        rows += end - c->pos;
+        if (filter) {
+            size_t wd = type_width(c->type), m = end - c->pos;
+            if (!fts && (!(fts = malloc(MAX_GRANULE_ROWS * sizeof *fts)) || !(fv = malloc(MAX_GRANULE_ROWS * 8)))) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            memcpy(fts, c->ts + c->pos, m * sizeof *fts);
+            memcpy(fv, c->v + c->pos * wd, m * wd);
+            m = tomb_set_filter(&c->hide, g->series, gcut, fts, fv, wd, m);
+            rc = m ? pw_add(&w, g->series, c->type, fts, fv, m) : 0;
+            rows += m;
+        } else {
+            rc = pw_add(&w, g->series, c->type, c->ts + c->pos, c->v + c->pos * type_width(c->type), end - c->pos);
+            rows += end - c->pos;
+        }
         c->pos = end;
         if (c->pos == c->n) {
             c->loaded = false;
@@ -268,8 +338,11 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
     for (size_t i = 0; i < k; i++) {
         free(cur[i].ts);
         free(cur[i].v);
+        tomb_set_free(&cur[i].hide);
     }
     free(cur);
+    free(fts);
+    free(fv);
     if (rc) {
         pw_abort(&w);
         return rc;
@@ -312,6 +385,107 @@ void merge_commit_locked(eng *db, part **src, size_t k, part *out)
     pthread_cond_broadcast(&db->merged_cv);
 }
 
+/* ------------------------------------------------------------ retention */
+
+static int64_t sat_add64(int64_t a, int64_t b)
+{
+    int64_t r;
+    return __builtin_add_overflow(a, b, &r) ? (b > 0 ? INT64_MAX : INT64_MIN) : r;
+}
+
+/* When some row of p expires (ttl_any) and when all of it, tombstones included, has expired past the end of
+ * its partition (ttl_all), in retention "now"; cached per part until a limit changes. Caller holds db->lock. */
+static void ttl_compute_locked(eng *db, part *p, uint32_t gen)
+{
+    int64_t any = INT64_MAX, all = INT64_MIN;
+    int64_t lo, pend;
+    if (__builtin_mul_overflow(p->partition, db->partition_ms, &lo))
+        lo = p->partition < 0 ? INT64_MIN : INT64_MAX;
+    pend = sat_add64(lo, db->partition_ms);
+    for (uint32_t i = 0; i < p->ng; i++) {
+        int64_t lim = eng_retention(db, p->g[i].series);
+        if (lim <= 0) {
+            all = INT64_MAX;
+            continue;
+        }
+        any = MIN(any, sat_add64(p->g[i].ts_min, lim));
+        all = MAX(all, sat_add64(pend, lim));
+    }
+    for (uint32_t i = 0; i < p->nt; i++) {
+        int64_t lim = eng_retention(db, p->t[i].series);
+        all = MAX(all, lim <= 0 ? INT64_MAX : sat_add64(pend, lim));
+    }
+    p->ttl_any = any;
+    p->ttl_all = all;
+    p->ttl_gen = gen;
+}
+
+/* Expired partitions and partitions left with nothing but empty parts are retired (*dropped); one part with
+ * expired rows is selected for a rewrite. An empty part (a merge's wal_seq anchor) holds its partition only while
+ * a WAL segment up to its wal_seq may still be replayed: *sync_wal asks for a directory fsync that makes the
+ * removal of such segments durable, after which it can go. Caller holds db->lock. */
+size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
+{
+    *dropped = *sync_wal = false;
+    if (db->opt.read_only)
+        return 0;
+    bool ret = atomic_load_explicit(&db->has_retention, memory_order_relaxed);
+    struct timespec mono;
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    int64_t mono_ms = (int64_t)mono.tv_sec * 1000 + mono.tv_nsec / 1000000;
+    if (db->last_ttl_ms && mono_ms - db->last_ttl_ms < 1000)
+        return 0;
+    db->last_ttl_ms = mono_ms;
+    uint32_t gen = atomic_load(&db->ret_gen);
+    int64_t now = ret ? eng_now_ms(db) : 0;
+    time_t wall = time(NULL);
+    size_t k = 0;
+    for (size_t a = 0, b; a < db->nparts; a = b) {
+        int64_t all = INT64_MIN;
+        for (b = a; b < db->nparts && db->parts[b]->partition == db->parts[a]->partition; b++) {
+            part *p = db->parts[b];
+            if (!p->ng && !p->nt) {
+                if (p->wal_seq > db->wal_removed_synced) {
+                    all = INT64_MAX;
+                    *sync_wal |= p->wal_seq <= db->wal_removed;
+                }
+                continue;
+            }
+            if (!ret) {
+                all = INT64_MAX;
+                continue;
+            }
+            if (p->ttl_gen != gen)
+                ttl_compute_locked(db, p, gen);
+            all = MAX(all, p->ttl_all);
+        }
+        if (now >= all && !eng_check(db)) {
+            /* every series in the partition has expired past its end, or nothing is left in it: drop it like
+             * tsdb_drop_before. Memtable rows of it are hidden by the same cutoffs; flushed later, they go the
+             * same way (or, for an empty partition, are newer than what was deleted). */
+            for (size_t i = b; i-- > a;) {
+                db->parts[i]->dropped = true; /* an in-flight merge of it discards its result */
+                db_retire_locked(db, db->parts[i]);
+            }
+            *dropped = true;
+            b = a; /* the list shrank */
+            continue;
+        }
+        for (size_t i = a; ret && i < b && !k; i++) {
+            part *p = db->parts[i];
+            if (p->merging || (!p->ng && !p->nt) || now <= p->ttl_any || db->opt.retention_merge_s < 0 ||
+                wall - p->created < db->opt.retention_merge_s)
+                continue;
+            p->merging = true;
+            part_ref(p);
+            sel[k++] = p;
+        }
+    }
+    if (k || *sync_wal)
+        db->last_ttl_ms = 0; /* there may be more: look again once this one is done */
+    return k;
+}
+
 void *merge_thread_main(void *arg)
 {
     eng *db = arg;
@@ -319,7 +493,23 @@ void *merge_thread_main(void *arg)
     pthread_mutex_lock(&db->lock);
     while (!atomic_load(&db->stop)) {
         size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel); /* a failed engine writes nothing more */
+        bool dropped = false, sync_wal = false;
+        if (!k && !eng_check(db))
+            k = ttl_select_locked(db, sel, &dropped, &sync_wal);
+        if (dropped || sync_wal) {
+            uint64_t removed = db->wal_removed;
+            pthread_mutex_unlock(&db->lock);
+            int src = eng_sync_dir(db, "fsync of the directory after retiring expired partitions");
+            if (src == 0 && dropped)
+                manifest_publish(db);
+            pthread_mutex_lock(&db->lock);
+            if (src == 0)
+                db->wal_removed_synced = MAX(db->wal_removed_synced, removed);
+            dropped |= sync_wal && src == 0; /* look again at once */
+        }
         if (!k) {
+            if (dropped)
+                continue;
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_sec += 1;

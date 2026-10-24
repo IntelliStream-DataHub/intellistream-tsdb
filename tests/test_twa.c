@@ -826,6 +826,238 @@ static void test_local(void)
     rmrf(dir);
 }
 
+/* ------------------------------------------- deletes, replaces, retention */
+
+/* The model of a delete, replace or insert: rows of s in [a, b) go, then the m rows (sorted, unique) land and
+ * win over rows with the same timestamp. */
+static void ref_splice(ref_series *s, int64_t a, int64_t b, const int64_t *ts, const long double *v, const bool *ok,
+                       size_t m)
+{
+    size_t cap = s->n + m + 1, i = 0, j = 0, n = 0;
+    int64_t *nt = malloc(cap * sizeof *nt);
+    long double *nv = malloc(cap * sizeof *nv);
+    bool *no = malloc(cap * sizeof *no);
+    while (i < s->n || j < m) {
+        if (i < s->n && s->ts[i] >= a && s->ts[i] < b) {
+            i++;
+        } else if (j < m && (i == s->n || ts[j] <= s->ts[i])) {
+            if (i < s->n && ts[j] == s->ts[i])
+                i++;
+            nt[n] = ts[j], nv[n] = v[j], no[n] = ok[j], n++, j++;
+        } else {
+            nt[n] = s->ts[i], nv[n] = s->v[i], no[n] = s->ok[i], n++, i++;
+        }
+    }
+    free(s->ts);
+    free(s->v);
+    free(s->ok);
+    s->ts = nt, s->v = nv, s->ok = no, s->n = n;
+}
+
+/* Writes m rows of the series' type: a replace of [a, b) when `replace`, else an insert. */
+static void put_rows(tsdb *db, uint32_t id, int type, const int64_t *ts, const long double *v, const bool *ok, size_t m,
+                     bool replace, int64_t a, int64_t b)
+{
+    uint8_t *vals = malloc(m * 8 + 8), *valid = calloc(m / 8 + 2, 1);
+    for (size_t i = 0; i < m; i++) {
+        if (ok[i])
+            valid[i >> 3] |= (uint8_t)(1u << (i & 7));
+        switch (type) {
+        case TSDB_FLOAT32: ((float *)vals)[i] = (float)v[i]; break;
+        case TSDB_FLOAT64: ((double *)vals)[i] = (double)v[i]; break;
+        case TSDB_INT64: ((int64_t *)vals)[i] = (int64_t)v[i]; break;
+        default: vals[i] = (uint8_t)(v[i] != 0); break;
+        }
+    }
+    tsdb_values tv = {(tsdb_type)type, vals, valid};
+    if (replace)
+        OK(tsdb_replace_range(db, id, a, b, ts, &tv, m));
+    else if (m)
+        OK(tsdb_insert_series_values(db, id, ts, &tv, m));
+    free(vals);
+    free(valid);
+}
+
+/* One random change to series s: a delete, a replace or plain inserts over a random slice of its history,
+ * applied to the database and the model alike. */
+static void random_change(tsdb *db, uint32_t id, ref_series *s, int shape)
+{
+    int64_t t0 = s->ts[0], t1 = s->ts[s->n - 1], span = t1 - t0 + 1;
+    int op = (int)rndr(3);
+    int64_t a, b;
+    if (rndr(3) == 0) { /* exactly at rows: the first or last row of a granule, part or the whole series */
+        size_t i = (size_t)rndr((int64_t)s->n), j = i + (size_t)rndr(200);
+        a = s->ts[i];
+        b = j < s->n ? s->ts[j] + rndr(2) : t1 + 1;
+    } else {
+        a = t0 + rndr(span);
+        b = a + 1 + rndr(span / 12 + 1);
+    }
+    size_t live = 0;
+    for (size_t i = 0; i < s->n; i++)
+        live += s->ts[i] < a || s->ts[i] >= b;
+    if (live < 20 && op == 0) /* keep the series alive: the checks pick ranges around its rows */
+        op = 1;
+    size_t m = 0, cap = op ? (size_t)rndr(300) + 1 : 0;
+    int64_t *ts = malloc((cap + 1) * sizeof *ts);
+    long double *v = malloc((cap + 1) * sizeof *v);
+    bool *ok = malloc(cap + 1);
+    int64_t step = (b - a) / (int64_t)(cap + 1) + 1;
+    for (int64_t t = a + rndr(step); m < cap && t < b; t += 1 + rndr(2 * step)) {
+        ts[m] = t;
+        v[m] = gen_value(s->type, (int64_t)m, shape);
+        if (isnan(v[m]))
+            v[m] = 7;
+        ok[m] = rndr(20) != 0;
+        m++;
+    }
+    if (op == 2) { /* plain inserts: only the rows change, nothing between them goes */
+        put_rows(db, id, s->type, ts, v, ok, m, false, 0, 0);
+        ref_splice(s, 0, 0, ts, v, ok, m);
+    } else {
+        if (op == 0)
+            m = 0;
+        if (m == 0 && rndr(2))
+            OK(tsdb_delete_range(db, id, a, b));
+        else
+            put_rows(db, id, s->type, ts, v, ok, m, true, a, b);
+        ref_splice(s, a, b, ts, v, ok, m);
+    }
+    free(ts);
+    free(v);
+    free(ok);
+}
+
+static int64_t twa_now;
+static int64_t twa_clock(void *arg)
+{
+    (void)arg;
+    return __atomic_load_n(&twa_now, __ATOMIC_SEQ_CST);
+}
+
+static tsdb *open_del(const char *dir, bool merges, bool follow)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.granule_rows = 64;
+    o.merge_threads = merges ? 2 : 0;
+    o.max_part_bytes = 12000; /* background merges of a few parts, not the whole history */
+    o.merge_idle_s = 1;
+    o.flush_interval_ms = 600000;
+    o.buffer_rows = 1 << 22;
+    o.wal_max_batch_rows = 64;
+    o.partition_ms = 3600000;
+    o.clock_ms = twa_clock;
+    o.follow = follow;
+    o.refresh_ms = 20;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    return db;
+}
+
+/* The fast paths answer from granule statistics and the neighbours' stored first and last readings: with
+ * deletes, replaces and retention in the history, each must skip what is gone and find the nearest live
+ * reading. Checked against the reference in parts with tombstones, the memtable on top, a follower, after
+ * background merges and after a full merge (exact statistics again), then with retention. */
+static void test_deletes(bool merges)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/deletes%d", base, merges);
+    rmrf(dir);
+    __atomic_store_n(&twa_now, 1700000000000LL, __ATOMIC_SEQ_CST);
+    tsdb *db = open_del(dir, merges, false);
+    enum { NS = NSER * 3 };
+    uint32_t ids[NS];
+    ref_series ss[NS];
+    for (int k = 0; k < NS; k++) {
+        char name[32];
+        snprintf(name, sizeof name, "d%d", k);
+        OK(tsdb_series_create(db, name, (tsdb_type)types[k % NSER], NULL, &ids[k]));
+        gen_series(&ss[k], types[k % NSER], k / NSER, 1500);
+        write_series(db, ids[k], &ss[k]);
+    }
+    OK(tsdb_flush(db));
+    int bad = 0;
+    for (int round = 0; round < 6 && !bad; round++) {
+        for (int k = 0; k < NS; k++)
+            for (int c = 0; c < 3; c++)
+                random_change(db, ids[k], &ss[k], k / NSER);
+        if (round % 2)
+            OK(tsdb_flush(db)); /* else the inserts stay in the memtable, newer than the tombstones */
+        char st[64];
+        snprintf(st, sizeof st, "deletes%d round %d", merges, round);
+        bad += check_all(db, ids, ss, NS, st);
+    }
+    OK(tsdb_flush(db));
+    tsdb *fo = open_del(dir, false, true);
+    OK(tsdb_refresh(fo));
+    bad += check_all(fo, ids, ss, NS, merges ? "follower (merges)" : "follower");
+    OK(tsdb_optimize(db));
+    bad += check_all(db, ids, ss, NS, merges ? "optimized (merges)" : "optimized");
+    /* merged: the rows are physically gone and the statistics exact, so whole granules answer from them */
+    tsdb_query_stats qs = check_one(db, ids[0], &ss[0], ss[0].ts[0], ss[0].ts[ss[0].n - 1] + 1, TSDB_TWA_STEP, 0,
+                                    "optimized whole range");
+    CHECK(qs.granules_from_stats > 0);
+    OK(tsdb_refresh(fo));
+    bad += check_all(fo, ids, ss, NS, "follower after optimize");
+
+    /* retention: everything before a cutoff inside each series is gone, and no reading before it carries in */
+    __atomic_store_n(&twa_now, 1800000000000LL, __ATOMIC_SEQ_CST); /* after every row */
+    for (int k = 0; k < NS; k++) {
+        int64_t cut = ss[k].ts[ss[k].n / 3] + rndr(2); /* at a row or just after it */
+        int64_t limit = __atomic_load_n(&twa_now, __ATOMIC_SEQ_CST) - cut;
+        OK(tsdb_set_retention(db, ids[k], limit));
+        ref_splice(&ss[k], INT64_MIN, cut, NULL, NULL, NULL, 0);
+    }
+    bad += check_all(db, ids, ss, NS, "retention");
+    OK(tsdb_optimize(db)); /* merges drop the expired rows */
+    bad += check_all(db, ids, ss, NS, "retention, optimized");
+    OK(tsdb_close(fo));
+    fo = open_del(dir, false, true);
+    bad += check_all(fo, ids, ss, NS, "retention, follower");
+    OK(tsdb_close(fo));
+    OK(tsdb_close(db));
+    for (int k = 0; k < NS; k++) {
+        free(ss[k].ts);
+        free(ss[k].v);
+        free(ss[k].ok);
+    }
+    rmrf(dir);
+    (void)bad;
+}
+
+/* Regression: a reading before the retention cutoff carried its value into the range (TWA read the
+ * neighbours of the range without the cutoff, and a decoded granule fed its expired rows too). */
+static void test_retention_carry(void)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/retcarry", base);
+    rmrf(dir);
+    __atomic_store_n(&twa_now, 100000, __ATOMIC_SEQ_CST);
+    tsdb *db = open_del(dir, false, false);
+    uint32_t id;
+    OK(tsdb_series_create(db, "r", TSDB_FLOAT64, NULL, &id));
+    int64_t ts[3] = {0, 10000, 20000};
+    double v[3] = {10, 20, 30};
+    OK(tsdb_insert_series_values(db, id, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, 3));
+    OK(tsdb_flush(db));
+    OK(tsdb_set_retention(db, id, 95000)); /* cutoff 5000: the reading at 0 has expired */
+    for (int m = 0; m < 2; m++) {
+        tsdb_twa_bucket *b;
+        size_t n;
+        query1(db, id, 0, 30000, 0, m, 0, &b, &n);
+        CHECK(n == 1);
+        if (n == 1) {
+            CHECK(b[0].covered_ms == 10000 && b[0].count == 2);
+            CHECK(near(b[0].twa, m ? 25 : 20));
+        }
+        free(b);
+    }
+    OK(tsdb_close(db));
+    rmrf(dir);
+}
+
 int main(int argc, char **argv)
 {
     snprintf(base, sizeof base, "%s/tsdb_twa_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
@@ -840,6 +1072,9 @@ int main(int argc, char **argv)
     test_long_gap();
     test_local();
     test_random();
+    test_retention_carry();
+    test_deletes(false);
+    test_deletes(true);
     rmrf(base);
     if (failures) {
         fprintf(stderr, "test_twa: %d failures\n", failures);

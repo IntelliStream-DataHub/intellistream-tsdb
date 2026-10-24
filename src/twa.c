@@ -130,6 +130,7 @@ typedef struct twa_q {
     bool linear;
     uint64_t max_gap; /* 0: none */
     int64_t start, end;
+    int64_t floor; /* retention: readings before it have expired and start no segment */
     int type;
     size_t w;
 } twa_q;
@@ -221,6 +222,8 @@ static inline void seg(const twa_q *q, twa_cur *c, twa_pt a, twa_pt b)
     if (!a.ok || (q->linear && !b.ok))
         return;
     if (q->max_gap && (uint64_t)b.t - (uint64_t)a.t > q->max_gap)
+        return;
+    if (a.t < q->floor) /* an expired reading: no value is in force until the next live one */
         return;
     int64_t x = MAX(a.t, q->start), y = MIN(b.t, q->end);
     while (x < y) {
@@ -383,12 +386,14 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
     int type = eng_series_type(db, series);
     if (type == TSDB_STATE || max_gap < 0 || (method != TSDB_TWA_STEP && method != TSDB_TWA_LINEAR))
         return TSDB_ERR_INVALID;
+    int64_t cutoff = eng_cutoff(db, series); /* expired rows are gone at once, merged away or not */
+    start = MAX(start, cutoff);
     if (start >= end || type < 0)
         return 0;
     twa_q q = {.bk = bk, .linear = method == TSDB_TWA_LINEAR, .max_gap = (uint64_t)max_gap, .start = start,
-               .end = end, .type = type, .w = type_width(type)};
-    /* the readings around the range that bound its first and last segments */
-    int64_t lo = max_gap ? sat_add(start, -max_gap) : INT64_MIN;
+               .end = end, .floor = cutoff, .type = type, .w = type_width(type)};
+    /* the readings around the range that bound its first and last segments; none expired */
+    int64_t lo = MAX(max_gap ? sat_add(start, -max_gap) : INT64_MIN, cutoff);
     int64_t hi = max_gap ? sat_add(sat_add(end, max_gap), 1) : INT64_MAX;
     snapshot sn;
     int rc = snapshot_take(db, series, q.w, lo, hi, &sn);
@@ -409,15 +414,17 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
     for (size_t i = 0; i < sn.np + sn.nmem && rc == 0; i++) {
         uint32_t gi = 0, gj = 1;
         if (i < sn.np) {
+            /* Only within the entry's window: granules that tombstones touch were moved to mem runs (their live
+             * rows only), so the neighbours found here and there are the nearest live readings. */
             const part *p = sn.parts[i];
-            part_find(p, series, start, end, &gi, &gj);
+            snap_find(&sn, i, series, start, end, &gi, &gj);
             /* the last granule before the range, unless one in it already starts before it */
-            if (gi > 0 && p->g[gi - 1].series == series && (gi == gj || p->g[gi].ts_min >= start))
+            if (gi > sn.gi[i] && p->g[gi - 1].series == series && (gi == gj || p->g[gi].ts_min >= start))
                 gi--;
             /* and the first after it */
-            if (gj < p->ng && p->g[gj].series == series && (gj == gi || p->g[gj - 1].ts_max < end))
+            if (gj < sn.gj[i] && p->g[gj].series == series && (gj == gi || p->g[gj - 1].ts_max < end))
                 gj++;
-        } else {
+        } else if (mem_from_memtable(&sn, i - sn.np)) {
             QS_ADD(memtable_rows, sn.mem[i - sn.np].n);
         }
         for (uint32_t k = gi; k < gj; k++) {

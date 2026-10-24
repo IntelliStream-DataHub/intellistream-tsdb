@@ -46,7 +46,8 @@ released again can be taken by another run's tsdbd, whose clients then answer yo
 "lost writes" that way). Start tsdbd with `--port 0 --port-file FILE` and read "PORT PID" from FILE, which tsdbd writes
 (atomically, once it serves; a third number is the metrics port of `--metrics-port auto`). Check that the pid is the child you started (`tests/harness.h` also checks that the child
 holds the port), and fail if the server exited or the file names someone else. A restart gets a new port; clients
-reconnect to the one in the new file. `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
+reconnect to the one in the new file. `th_owns_port` remembers the listener's socket inode, so a client that asks on every
+connect scans only the server's descriptors, not `/proc/net/tcp` (which grows with every reconnect). `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
 `tests/integration/run.py` has `Server`, and the client test helpers under `client/*/tests` do the same in their language.
 
 Every bug fix comes with a regression test that fails without the fix (check
@@ -99,6 +100,28 @@ cgroup, so `nice` does not keep your work out of its way.
   still in flight and resurrect older values.
 - **Merges** only combine adjacent block ranges within a partition. On equal
   keys the newest source wins.
+- **Range tombstones** (deletes, replaces) live only in parts, never in the WAL
+  or a memtable. A part's tombstones hide rows of lower block numbers in the
+  same partition, never its own rows or memtable rows. Deletes flush the
+  memtable first and commit their parts under `publish_lock` like a large
+  insert; a replace commits tombstones and rows in one `parts_commit`. A
+  granule a tombstone touches is decoded, never answered from its statistics.
+  A merge output with no rows is kept as an empty part: its `wal_seq` stops a
+  stale WAL segment from replaying deleted rows back. It goes (with a partition
+  left with nothing else) only once every segment up to its `wal_seq` is
+  unlinked and the directory synced (`wal_removed_synced`).
+- **Retention** limits live in the append-only `RETENTION` file (beside
+  `SERIES`). Retention "now" (`eng_now_ms`) never goes back; queries clamp to
+  the cutoff, merges drop expired rows, the merge thread drops whole expired
+  partitions by retiring them. A query that reads before its start (TWA's
+  carried-in reading) stops at the cutoff as well.
+- **Snapshot windows.** Readers use the per-part entry windows of their
+  snapshot (`sn.gi`/`sn.gj`, `snap_find`), also to step to granules outside
+  their range; never `part_find` on `sn.parts`: granules a tombstone touches
+  were moved to mem runs with their live rows, and a direct lookup sees them
+  twice, deleted rows included. New granule statistics must be computed by the
+  part writer (merges re-encode every granule a tombstone touched) and read only
+  through these windows.
 - **Inserts are all or nothing.** All parts of one insert are written pending,
   then committed through an intent file (`parts_commit`). Never publish them one
   by one.

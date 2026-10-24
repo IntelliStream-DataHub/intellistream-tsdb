@@ -100,6 +100,10 @@ static const struct {
     [TSDB_OP_QUERY_BOUNDS] = {"query_bounds", true},
     [TSDB_OP_QUERY_LTTB] = {"query_lttb", true},
     [TSDB_OP_QUERY_TWA] = {"query_twa", true},
+    [TSDB_OP_DELETE_RANGE] = {"delete_range"},
+    [TSDB_OP_REPLACE_RANGE] = {"replace_range"},
+    [TSDB_OP_SET_RETENTION] = {"set_retention"},
+    [TSDB_OP_GET_RETENTION] = {"get_retention"},
 };
 
 static bool is_query_op(unsigned o) { return o < NOPS && ops[o].query; }

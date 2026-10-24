@@ -598,6 +598,55 @@ class Client:
             TsdbError: ERR_INVALID if bounds is empty or does not increase, or
                 from a server older than version 4.
         """
+    def delete_range(self, series: int, start: int | None, end: int | None) -> None:
+        """Deletes the rows of a series with start <= ts < end (protocol version 7).
+
+        A delete is a write like any other: a row inserted after it returned
+        is kept. start and end are required; None is unbounded, so
+        delete_range(id, None, None) deletes every row of the series.
+
+        Raises:
+            TsdbError: ERR_INVALID from a server older than version 7 (the
+                client asks HELLO first and does not send the request).
+        """
+    def replace_range(
+        self,
+        series: int,
+        start: int | None,
+        end: int | None,
+        ts: _Timestamps,
+        values: _TypedValues,
+        *,
+        value_type: _ValueType | None = None,
+    ) -> None:
+        """Replaces the rows of a series with start <= ts < end by ts and values,
+        atomically: a reader sees the old rows or the new ones, never a mix
+        (protocol version 7).
+
+        Args:
+            series: The series id.
+            start, end: The range; None is unbounded.
+            ts: Timestamps, ms since the epoch, each in the range.
+            values: As for insert_series_values(); no rows make it a delete.
+            value_type: The series' type. None asks the server once and
+                remembers it.
+
+        Raises:
+            TsdbError: ERR_INVALID for a timestamp outside the range, a
+                value_type other than the series', rows that do not fit in
+                one request (256 MiB), or a server older than version 7.
+        """
+    def set_retention(self, series: int, limit_ms: int) -> None:
+        """Sets how long a series keeps its rows, in ms (protocol version 7):
+        rows older than the server's clock minus limit_ms disappear from
+        queries at once and from disk as merges get to them. 0 keeps them.
+
+        Raises:
+            TsdbError: ERR_INVALID for a negative limit or a server older
+                than version 7.
+        """
+    def retention(self, series: int) -> int:
+        """Returns the retention limit of a series in ms, 0 for none (protocol version 7)."""
     def commit(self) -> None:
         """Makes everything written so far durable on the server's disk."""
     def flush(self) -> None:

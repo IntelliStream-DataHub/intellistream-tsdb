@@ -91,12 +91,13 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_ports $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb
+test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_ports $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb
 	./$(B)/test_tsdb
 	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
 	./$(B)/test_damage
 	./$(B)/test_types
+	./$(B)/test_delete
 	./$(B)/test_levels
 	./$(B)/test_group
 	./$(B)/test_lttb
@@ -247,7 +248,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -305,6 +306,9 @@ $(B)/test_damage: tests/test_damage.c src/internal.h $(LIB)
 $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+$(B)/test_delete: tests/test_delete.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
@@ -334,7 +338,7 @@ $(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB)
 # clients write and read; a checker verifies durability, atomicity and reads.
 JEPSEN_DIR ?= /tmp/tsdb-jepsen
 JEPSEN_SEEDS ?= 1 2 3
-jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
+jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so jepsen-selftest
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20 && \
 	    for seed in $(JEPSEN_SEEDS); do \
@@ -342,6 +346,15 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	            --crashfs $(B)/libcrashfs.so || exit 1; done && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis eio   --seconds 20 --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10 || exit 1; done
+
+# The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
+# power run, and a power run that restarts too rarely fails too.
+jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
+	@out=$$(JEPSEN_TSDBD=tests/jepsen/segv-tsdbd.sh ./$(B)/jepsen --dir $(JEPSEN_DIR)-selftest --nemesis power \
+	    --seconds 5 --crashfs $(B)/libcrashfs.so 2>&1); rc=$$?; \
+	    if [ $$rc -eq 0 ] || ! echo "$$out" | grep -q 'ended with status 0x8\?b, not a power loss'; then \
+	        echo "jepsen-selftest: a SIGSEGV in the server went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
+	    echo "jepsen-selftest: ok"
 
 # Build and test on AlmaLinux 10 (the production OS) in Podman; takes minutes, logs in $LOGDIR.
 # URING=0 keeps Podman's stock seccomp profile, which blocks io_uring as production does: tsdbd then runs on epoll.

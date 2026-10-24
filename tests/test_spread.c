@@ -260,6 +260,7 @@ typedef struct ref_series {
     int64_t ts[NROWS];
     long double v[NROWS]; /* as stored: float32 values rounded to float */
     bool ok[NROWS];
+    bool gone[NROWS]; /* deleted, replaced away or expired (test_deletes) */
 } ref_series;
 
 static long double gen_value(int type, int shape, size_t i)
@@ -298,6 +299,7 @@ static void gen_series(ref_series *s, int type, int shape)
         s->v[i] = gen_value(type, shape, i);
         /* shape 4: sparse, mostly nulls (single values in a bucket); else a few */
         s->ok[i] = shape == 4 ? rndr(9) == 0 : rndr(40) != 0;
+        s->gone[i] = false;
     }
 }
 
@@ -348,12 +350,12 @@ typedef struct ref_bucket {
 /* The corrected two-pass method in long double over the known values of each bucket of [0, end): with
  * values close to the mean x - m is exact, and the correction makes up for the rounding of m (at 4e18 a
  * long double mean is off by up to 0.25, which Welford's method would carry into every term). */
-static size_t reference(const ref_series *s, int64_t interval, ref_bucket *out)
+static size_t reference_n(const ref_series *s, size_t nrows, int64_t interval, ref_bucket *out)
 {
     size_t n = 0, i0 = 0;
-    for (size_t i = 0; i <= NROWS; i++) {
-        int64_t st = i < NROWS && interval ? s->ts[i] / interval * interval : 0;
-        if (i < NROWS && (i == 0 || out[n - 1].start == st))
+    for (size_t i = 0; i <= nrows; i++) {
+        int64_t st = i < nrows && interval ? s->ts[i] / interval * interval : 0;
+        if (i < nrows && (i == 0 || out[n - 1].start == st))
             goto open;
         if (n) { /* close bucket n - 1: rows [i0, i) */
             ref_bucket *b = &out[n - 1];
@@ -374,7 +376,7 @@ static size_t reference(const ref_series *s, int64_t interval, ref_bucket *out)
                 }
             b->m2 = c ? s2 - s1 * s1 / (long double)c : 0;
         }
-        if (i == NROWS)
+        if (i == nrows)
             break;
         i0 = i;
     open:
@@ -397,6 +399,23 @@ static size_t reference(const ref_series *s, int64_t interval, ref_bucket *out)
         }
     }
     return n;
+}
+
+/* the reference over the rows that are left: a deleted row is not a null, it opens no bucket */
+static size_t reference(const ref_series *s, int64_t interval, ref_bucket *out)
+{
+    static ref_series live;
+    size_t n = 0;
+    live.type = s->type;
+    live.shape = s->shape;
+    for (size_t i = 0; i < NROWS; i++)
+        if (!s->gone[i]) {
+            live.ts[n] = s->ts[i];
+            live.v[n] = s->v[i];
+            live.ok[n] = s->ok[i];
+            n++;
+        }
+    return reference_n(&live, n, interval, out);
 }
 
 /* tolerance of a float standard deviation: relative, and a few ulps of the largest value (the means
@@ -513,6 +532,45 @@ static void same_ints(const tsdb_spread_bucket *a, size_t na, const tsdb_spread_
     }
 }
 
+/* every CPU level and kernel (TSDB_CPU, TSDB_SIMD): the same bits as the first one */
+static void check_levels(tsdb *db, const uint32_t *ids, ref_series *const *ss, const char *stage)
+{
+    tsdb_spread_bucket *b;
+    size_t nb;
+    static const char *const kernels[] = {"scalar", "avx2", "avx512"};
+    tsdb_spread_bucket *lv0 = NULL;
+    size_t nlv0 = 0;
+    int configs = 0;
+    for (int level = CPU_BASE; level <= cpu_level_max(); level++)
+        for (int kk = 0; kk <= level && kk < 3; kk++) {
+            setenv("TSDB_SIMD", kernels[kk], 1);
+            if (cpu_set_level(level) != 0) {
+                simd_select(level);
+                if (cpu_level_max() != level && level != CPU_BASE)
+                    break;
+            }
+            if (strcmp(simd_name(), kernels[kk]) != 0)
+                continue;
+            char label[160];
+            snprintf(label, sizeof label, "%s, level %s, kernel %s", stage, cpu_level_name(level), simd_name());
+            check_all(db, ids, ss, label, &b, &nb);
+            if (!configs++) {
+                lv0 = b;
+                nlv0 = nb;
+                continue;
+            }
+            bool same = nb == nlv0 && memcmp(b, lv0, nb * sizeof *b) == 0;
+            printf("%s: %s\n", label, same ? "identical" : "DIFFERENT");
+            failures += !same;
+            free(b);
+        }
+    unsetenv("TSDB_SIMD");
+    cpu_set_level(cpu_level_max());
+    simd_select(cpu_level_max());
+    printf("CPU levels and kernels compared: %d\n", configs);
+    free(lv0);
+}
+
 static void test_random(void)
 {
     char dir[600];
@@ -551,39 +609,7 @@ static void test_random(void)
     same_ints(first, nfirst, b, nb, "parts");
     free(b);
 
-    /* every CPU level and kernel: the same bits as the baseline */
-    static const char *const kernels[] = {"scalar", "avx2", "avx512"};
-    tsdb_spread_bucket *lv0 = NULL;
-    size_t nlv0 = 0;
-    int configs = 0;
-    for (int level = CPU_BASE; level <= cpu_level_max(); level++)
-        for (int kk = 0; kk <= level && kk < 3; kk++) {
-            setenv("TSDB_SIMD", kernels[kk], 1);
-            if (cpu_set_level(level) != 0) {
-                simd_select(level);
-                if (cpu_level_max() != level && level != CPU_BASE)
-                    break;
-            }
-            if (strcmp(simd_name(), kernels[kk]) != 0)
-                continue;
-            char label[64];
-            snprintf(label, sizeof label, "parts, level %s, kernel %s", cpu_level_name(level), simd_name());
-            check_all(db, ids, ss, label, &b, &nb);
-            if (!configs++) {
-                lv0 = b;
-                nlv0 = nb;
-                continue;
-            }
-            bool same = nb == nlv0 && memcmp(b, lv0, nb * sizeof *b) == 0;
-            printf("%s: %s\n", label, same ? "identical" : "DIFFERENT");
-            failures += !same;
-            free(b);
-        }
-    unsetenv("TSDB_SIMD");
-    cpu_set_level(cpu_level_max());
-    simd_select(cpu_level_max());
-    printf("CPU levels and kernels compared: %d\n", configs);
-    free(lv0);
+    check_levels(db, ids, ss, "parts");
 
     tsdb_options fo;
     tsdb_options_init(&fo);
@@ -602,6 +628,189 @@ static void test_random(void)
     free(b);
     free(first);
     tsdb_close(db);
+    rmrf(dir);
+}
+
+/* ------------------------------------------- deletes, replaces, retention */
+
+/* Writes the rows idx[0..m) of s (sorted): a replace of [a, b) when `replace`, else an insert. */
+static void write_rows(tsdb *db, uint32_t id, const ref_series *s, const size_t *idx, size_t m, bool replace,
+                       int64_t a, int64_t b)
+{
+    int64_t *ts = malloc((m + 1) * sizeof *ts);
+    uint8_t *vals = malloc(m * 8 + 8), *valid = calloc(m / 8 + 2, 1);
+    for (size_t k = 0; k < m; k++) {
+        size_t i = idx[k];
+        ts[k] = s->ts[i];
+        if (s->ok[i])
+            valid[k >> 3] |= (uint8_t)(1u << (k & 7));
+        switch (s->type) {
+        case TSDB_FLOAT32: ((float *)vals)[k] = (float)s->v[i]; break;
+        case TSDB_FLOAT64: ((double *)vals)[k] = (double)s->v[i]; break;
+        case TSDB_INT64: ((int64_t *)vals)[k] = (int64_t)s->v[i]; break;
+        default: vals[k] = s->v[i] != 0; break;
+        }
+    }
+    tsdb_values tv = {(tsdb_type)s->type, vals, valid};
+    if (replace)
+        OK(tsdb_replace_range(db, id, a, b, ts, &tv, m));
+    else if (m)
+        OK(tsdb_insert_series_values(db, id, ts, &tv, m));
+    free(ts);
+    free(vals);
+    free(valid);
+}
+
+/* One random change to a slice of s's history, in the database and the model alike: a delete, a replace
+ * (some rows of the slice come back with new values) or inserts over the old values. The range's ends fall
+ * between rows or on them; small writes land in the memtable, big ones in parts. */
+static void spread_change(tsdb *db, uint32_t id, ref_series *s)
+{
+    size_t i = (size_t)rndr(NROWS);
+    size_t j = i + 1 + (size_t)rndr(rndr(4) ? 200 : 1500);
+    if (j > NROWS)
+        j = NROWS;
+    int64_t a = s->ts[i] - rndr(10); /* the rows [i, j) are in [a, b): the grid is 10 ms */
+    int64_t b = j < NROWS ? s->ts[j] - rndr(10) : s->ts[NROWS - 1] + 1 + rndr(10);
+    if (i == 0 && rndr(4) == 0)
+        a = INT64_MIN;
+    static size_t idx[NROWS];
+    size_t m = 0;
+    int op = (int)rndr(3);
+    for (size_t k = i; k < j; k++) {
+        if (op == 0 || rndr(2)) {
+            if (op != 2)
+                s->gone[k] = true;
+            continue;
+        }
+        s->v[k] = gen_value(s->type, s->shape, k);
+        s->ok[k] = rndr(40) != 0;
+        s->gone[k] = false;
+        idx[m++] = k;
+    }
+    if (op == 0 && rndr(2))
+        OK(tsdb_delete_range(db, id, a, b));
+    else
+        write_rows(db, id, s, idx, m, op != 2, a, b);
+}
+
+static int64_t spread_now;
+static int64_t spread_clock(void *arg)
+{
+    (void)arg;
+    return __atomic_load_n(&spread_now, __ATOMIC_SEQ_CST);
+}
+
+static tsdb *open_del(const char *dir, bool merges, bool follow)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.granule_rows = 64;
+    o.merge_threads = merges ? 2 : 0;
+    o.max_part_bytes = 40000; /* background merges of a few parts, not the whole history */
+    o.merge_idle_s = 1;
+    o.query_threads = 1;
+    o.flush_interval_ms = 600000;
+    o.buffer_rows = 1 << 22;
+    o.wal_max_batch_rows = 64;
+    o.clock_ms = spread_clock;
+    o.follow = follow;
+    o.refresh_ms = 20;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    return db;
+}
+
+/* The spread must never include a deleted, replaced-away or expired row: granules a tombstone overlaps
+ * do not answer from their statistics, merges that drop rows compute m2 and the sums of squares anew, and
+ * the retention cutoff applies. Checked against the reference with tombstones in parts, the memtable on
+ * top, a follower, background merges, a full merge, then retention; without background merges every CPU
+ * level and kernel must give the same bits. */
+static void test_deletes(bool merges)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/deletes%d", base, merges);
+    rmrf(dir);
+    __atomic_store_n(&spread_now, 1000000, __ATOMIC_SEQ_CST);
+    tsdb *db = open_del(dir, merges, false);
+    static ref_series store[NS];
+    ref_series *ss[NS];
+    uint32_t ids[NS];
+    for (int k = 0; k < NS; k++) {
+        char name[32];
+        snprintf(name, sizeof name, "d%d", k);
+        ss[k] = &store[k];
+        OK(tsdb_series_create(db, name, (tsdb_type)types[k % NT], NULL, &ids[k]));
+        gen_series(ss[k], types[k % NT], k / NT);
+        put_rows(db, ids[k], ss[k], 0, NROWS, false, false);
+    }
+    OK(tsdb_flush(db));
+    tsdb_spread_bucket *b, *b2;
+    size_t nb, nb2;
+    for (int round = 0; round < 6; round++) {
+        for (int k = 0; k < NS; k++)
+            for (int c = 0; c < 3; c++)
+                spread_change(db, ids[k], ss[k]);
+        if (round % 2)
+            OK(tsdb_flush(db)); /* else the writes stay in the memtable, newer than the tombstones */
+        char st[64];
+        snprintf(st, sizeof st, "deletes%d round %d", merges, round);
+        check_all(db, ids, ss, st, &b, &nb);
+        free(b);
+    }
+    if (!merges)
+        check_levels(db, ids, ss, "deletes, memtable");
+    OK(tsdb_flush(db));
+    if (!merges)
+        check_levels(db, ids, ss, "deletes, parts");
+    check_all(db, ids, ss, "deletes, flushed", &b, &nb);
+    tsdb *fo = open_del(dir, false, true);
+    OK(tsdb_refresh(fo));
+    check_all(fo, ids, ss, "deletes, follower", &b2, &nb2);
+    same_ints(b, nb, b2, nb2, "deletes, follower");
+    free(b2);
+    OK(tsdb_optimize(db));
+    check_all(db, ids, ss, "deletes, optimized", &b2, &nb2);
+    same_ints(b, nb, b2, nb2, "deletes, optimized");
+    free(b2);
+    free(b);
+    /* merged: the rows are gone from the files and the statistics exact, so granules answer from them */
+    for (int k = 0; k < NS; k++) {
+        OK(spread_agg(db, ids[k], 0, INT64_MAX, 0, &b, &nb));
+        free(b);
+        tsdb_query_stats qs;
+        tsdb_last_query_stats(&qs);
+        CHECK(qs.granules_from_stats > 0);
+    }
+    if (!merges)
+        check_levels(db, ids, ss, "deletes, optimized");
+    OK(tsdb_refresh(fo));
+    check_all(fo, ids, ss, "deletes, follower after optimize", &b, &nb);
+    free(b);
+
+    /* retention: every row before a cutoff inside each series is gone, merged away or not */
+    for (int k = 0; k < NS; k++) {
+        int64_t cut = ss[k]->ts[NROWS / 3 + (size_t)rndr(NROWS / 3)] + rndr(2); /* at a row or just after it */
+        OK(tsdb_set_retention(db, ids[k], __atomic_load_n(&spread_now, __ATOMIC_SEQ_CST) - cut));
+        for (size_t i = 0; i < NROWS && ss[k]->ts[i] < cut; i++)
+            ss[k]->gone[i] = true;
+    }
+    check_all(db, ids, ss, "retention", &b, &nb);
+    if (!merges)
+        check_levels(db, ids, ss, "retention");
+    OK(tsdb_optimize(db)); /* merges drop the expired rows */
+    check_all(db, ids, ss, "retention, optimized", &b2, &nb2);
+    same_ints(b, nb, b2, nb2, "retention, optimized");
+    free(b2);
+    OK(tsdb_close(fo));
+    fo = open_del(dir, false, true);
+    check_all(fo, ids, ss, "retention, follower", &b2, &nb2);
+    same_ints(b, nb, b2, nb2, "retention, follower");
+    free(b2);
+    free(b);
+    OK(tsdb_close(fo));
+    OK(tsdb_close(db));
     rmrf(dir);
 }
 
@@ -802,6 +1011,8 @@ int main(int argc, char **argv)
     test_single_runs();
     test_random();
     test_fast_path();
+    test_deletes(false);
+    test_deletes(true);
     free(btype);
     rmrf(base);
     if (failures) {

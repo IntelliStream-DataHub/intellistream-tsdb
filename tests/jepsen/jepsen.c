@@ -46,6 +46,13 @@
  *     completed before w began (or nothing at all);
  *  4. no stale reads: a read that began after w was acknowledged sees, at w's
  *     keys inside its range, w or something not older than w.
+ * Deletes and replaces clear a key range of one series (a replace writes its
+ * keys in that range in the same step). A key may then be absent where the
+ * checks above want a value, if a delete covering it that did not definitely
+ * fail could be ordered after that value (did not complete before it began,
+ * and began before the read completed). An applied delete is a write to every
+ * key of its range: 1 and 4 hold for it with "absent" as its value, and a read
+ * that sees a replace shows nothing older than it in its range (3).
  */
 #define _GNU_SOURCE
 #include "tsdb.h"
@@ -80,8 +87,12 @@
 
 typedef enum { ST_PENDING, ST_OK, ST_FAIL, ST_INFO } status;
 
+enum { W_INSERT, W_DELETE, W_REPLACE };
+
 typedef struct wop {
     int series;
+    int kind;       /* W_*: a delete or replace also clears [lo, hi) of the series */
+    uint32_t lo, hi;
     uint32_t *keys;
     uint32_t nkeys;
     int64_t invoke, complete; /* ns */
@@ -113,6 +124,9 @@ static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
 static int restarts;
 static char markpath[PATH_MAX]; /* eio: crashfs writes the path of the file it failed here */
 static int failstops, eio_problems;
+static int lives_faulty, lives_clean, lives_died_starting; /* servers started under the nemesis, by kind */
+static int death_problems;       /* power: a server that ended any way but a power loss (exit 99) or our kill */
+static bool server_faulty;       /* the current server runs under the shim (set under server_lock or at start) */
 static int fport;                   /* the follower, where tsdbd put it; 0 = none */
 static atomic_int follower_pid;
 static char flogpath[PATH_MAX];     /* its stderr */
@@ -146,6 +160,8 @@ static void server_gone(void)
     atomic_store(&port, 0);
 }
 static const char *tsdbd_path(void) { return getenv("JEPSEN_TSDBD") ? getenv("JEPSEN_TSDBD") : "./build/tsdbd"; }
+
+static void note_death(int st, bool we_killed, pid_t pid);
 
 static void start_server(bool faulty)
 {
@@ -183,17 +199,25 @@ static void start_server(bool faulty)
             _exit(127);
         }
         atomic_store(&server_pid, pid);
+        server_faulty = attempt == 0 && faulty && crashfs;
+        if (faulty && crashfs && !server_faulty)
+            lives_clean++;
         if (getenv("JEPSEN_VERBOSE"))
             fprintf(stderr, "jepsen: started %d (%s)\n", (int)pid, attempt == 0 && faulty ? "faulty" : "clean");
         int p = th_await(pf, pid, 30000);
         unlink(pf);
         if (p > 0) {
             atomic_store(&port, p);
+            if (server_faulty)
+                lives_faulty++;
             return;
         }
         if (p == TH_EXITED) {
             server_gone();
             if (faulty && crashfs && attempt == 0) { /* crashed while starting (power loss at open): a clean one */
+                lives_died_starting++;
+                if (!strcmp(nemesis, "power"))
+                    note_death(th_status, false, pid);
                 if (getenv("JEPSEN_VERBOSE"))
                     fprintf(stderr, "jepsen: %d died while starting\n", (int)pid);
                 continue;
@@ -353,7 +377,7 @@ static tsdbc *connect_retry(void)
             return c;
         if (atomic_load(&stop))
             return NULL;
-        usleep(10000);
+        usleep(2000); /* a server that crashes a few ms after it listens leaves little time to be found */
     }
 }
 
@@ -364,7 +388,41 @@ static void *client(void *arg)
     while (c && !atomic_load(&stop)) {
         r = mix(r);
         int s = (int)(r % NSERIES);
-        if ((r >> 8) % 10 < 6) { /* a write */
+        if ((r >> 8) % 100 < 6) { /* a delete or a replace of a key range */
+            uint32_t id = atomic_fetch_add(&nwrites, 1);
+            if (id >= MAX_OPS)
+                break;
+            wop *w = &writes[id];
+            w->series = s;
+            w->kind = (r >> 16) % 2 ? W_REPLACE : W_DELETE;
+            w->lo = (uint32_t)(mix(r + 3) % NKEYS);
+            w->hi = w->lo + 1 + (uint32_t)(mix(r + 4) % 200);
+            if (w->hi > NKEYS)
+                w->hi = NKEYS;
+            uint32_t n = w->kind == W_REPLACE ? (w->hi - w->lo) : 0, stride = 1 + (uint32_t)(mix(r + 5) % 4), m = 0;
+            w->keys = malloc((n ? n : 1) * sizeof *w->keys);
+            int64_t *ts = malloc((n ? n : 1) * sizeof *ts);
+            float *v = malloc((n ? n : 1) * sizeof *v);
+            for (uint32_t k = w->lo; k < w->lo + n; k += stride) {
+                w->keys[m] = k;
+                ts[m] = T0 + (int64_t)k * KEY_MS;
+                v[m++] = (float)id;
+            }
+            w->nkeys = m;
+            tsdb_values col = {TSDB_FLOAT32, v, NULL};
+            int64_t a = T0 + (int64_t)w->lo * KEY_MS, b = T0 + (int64_t)w->hi * KEY_MS;
+            w->invoke = now_ns();
+            int rc = w->kind == W_REPLACE ? tsdbc_replace_range(c, ids[s], a, b, ts, &col, m)
+                                          : tsdbc_delete_range(c, ids[s], a, b);
+            w->complete = now_ns();
+            w->st = rc == 0 ? ST_OK : (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) ? ST_INFO : ST_FAIL;
+            free(ts);
+            free(v);
+            if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
+                tsdbc_close(c);
+                c = connect_retry();
+            }
+        } else if ((r >> 8) % 100 < 60) { /* a write */
             uint32_t n = (r >> 16) % 100 < 85 ? 1 + (uint32_t)((r >> 24) % 20) : 400 + (uint32_t)((r >> 24) % 2600);
             uint32_t id = atomic_fetch_add(&nwrites, 1);
             if (id >= MAX_OPS)
@@ -439,13 +497,44 @@ static void *client(void *arg)
 
 /* ------------------------------------------------------------- nemesis */
 
+/* Sleeps `us`; with a fault-injecting server (power) it ends early once the server has crashed by itself, which
+ * the shim does a few ms after the listener is up (the fault is due after a fixed count of file operations).
+ * Sleeping through it left the server dead for most of the run and the clients idle. The process is not reaped
+ * here (WNOWAIT): the nemesis below does that. */
+static void nap(useconds_t us, bool watch)
+{
+    for (useconds_t t = 0; t < us && !atomic_load(&stop); t += 5000) {
+        pid_t pid = atomic_load(&server_pid);
+        siginfo_t si;
+        si.si_pid = 0;
+        if (watch && pid > 0 && waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == pid)
+            return;
+        usleep(5000);
+    }
+}
+
+/* How a power-nemesis server may end: crashfs's power loss is _exit(99); a plain kill of ours (an idle server);
+ * SIGUSR2 on a server without the shim (the clean one after a failed start, which has no handler). Anything
+ * else, a SIGSEGV or abort() in the server above all, is a crash bug that the restarts would otherwise hide. */
+static void note_death(int st, bool we_killed, pid_t pid)
+{
+    bool ok = (WIFEXITED(st) && WEXITSTATUS(st) == 99 && server_faulty) ||
+              (we_killed && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL) ||
+              (WIFSIGNALED(st) && WTERMSIG(st) == SIGUSR2 && !server_faulty);
+    if (ok)
+        return;
+    death_problems++;
+    fprintf(stderr, "  the %s server (pid %d) ended with status %#x, not a power loss (exit 99) or our kill\n",
+            server_faulty ? "faulty" : "clean", (int)pid, st);
+}
+
 static void *nemesis_thread(void *arg)
 {
     (void)arg;
     uint64_t r = mix(seed + 77);
     while (!atomic_load(&stop)) {
         r = mix(r);
-        usleep(150000 + (useconds_t)(r % 600000));
+        nap(150000 + (useconds_t)(r % 600000), !strcmp(nemesis, "power") && crashfs);
         if (atomic_load(&stop))
             break;
         pthread_mutex_lock(&server_lock);
@@ -456,6 +545,7 @@ static void *nemesis_thread(void *arg)
         } else if (!strcmp(nemesis, "power")) {
             pid_t pid = atomic_load(&server_pid);
             int st;
+            bool killed = false;
             if (waitpid(pid, &st, WNOHANG) != pid) { /* not crashed on its own yet: pull the plug */
                 signal_pid(pid, SIGUSR2);
                 for (int i = 0; i < 100 && waitpid(pid, &st, WNOHANG) != pid; i++)
@@ -463,8 +553,10 @@ static void *nemesis_thread(void *arg)
                 if (signal_pid(pid, 0) == 0) { /* idle, no file operation to crash in: plain kill */
                     signal_pid(pid, SIGKILL);
                     waitpid(pid, &st, 0);
+                    killed = true;
                 }
             }
+            note_death(st, killed, pid);
             server_gone();
             start_server(true);
             restarts++;
@@ -553,6 +645,23 @@ static bool wrote_key(uint32_t w, uint32_t k)
     return false;
 }
 
+/* deletes covering each key (series * NKEYS + key), as offsets into dlist */
+static uint32_t *dcnt, *dlist;
+
+/* Whether a delete covering the key, that did not definitely fail, could be
+ * ordered after something that began at `after` and before a read that
+ * completed at `before`: then the key may be absent. */
+static bool absent_ok(int series, uint32_t k, int64_t after, int64_t before)
+{
+    size_t slot = (size_t)series * NKEYS + k;
+    for (uint32_t i = dcnt[slot]; i < dcnt[slot + 1]; i++) {
+        const wop *d = &writes[dlist[i]];
+        if (d->st != ST_FAIL && d->complete >= after && d->invoke <= before)
+            return true;
+    }
+    return false;
+}
+
 static int check(uint32_t final[NSERIES][NKEYS])
 {
     uint32_t nw = atomic_load(&nwrites), nr = atomic_load(&nreads);
@@ -561,6 +670,21 @@ static int check(uint32_t final[NSERIES][NKEYS])
     if (nr > MAX_OPS)
         nr = MAX_OPS;
     bool *applied = calloc(nw, sizeof *applied);
+    dcnt = calloc((size_t)NSERIES * NKEYS + 1, sizeof *dcnt);
+    size_t ndel = 0;
+    for (uint32_t w = 1; w < nw; w++)
+        for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++, ndel++)
+            dcnt[(size_t)writes[w].series * NKEYS + k + 1]++;
+    for (size_t x = 1; x <= (size_t)NSERIES * NKEYS; x++)
+        dcnt[x] += dcnt[x - 1];
+    dlist = malloc((ndel + 1) * sizeof *dlist);
+    uint32_t *dfill = calloc((size_t)NSERIES * NKEYS, sizeof *dfill);
+    for (uint32_t w = 1; w < nw; w++)
+        for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
+            size_t slot = (size_t)writes[w].series * NKEYS + k;
+            dlist[dcnt[slot] + dfill[slot]++] = w;
+        }
+    free(dfill);
     /* applied: acknowledged, in the final state, or seen by a read */
     for (uint32_t w = 1; w < nw; w++)
         applied[w] = writes[w].st == ST_OK;
@@ -605,10 +729,26 @@ static int check(uint32_t final[NSERIES][NKEYS])
             continue;
         for (uint32_t i = 0; i < writes[w].nkeys; i++) {
             uint32_t k = writes[w].keys[i], f = final[writes[w].series][k];
-            if (!f || older(f, w)) {
+            if (f ? older(f, w) : !absent_ok(writes[w].series, k, writes[w].invoke, INT64_MAX)) {
                 if (lost++ < 10)
                     VIOLATION("write %u (%s) to series %d key %u lost: final holds %u\n", w,
                               writes[w].st == ST_OK ? "acknowledged" : "seen or partly kept", writes[w].series, k, f);
+                else
+                    violations++;
+            }
+        }
+    }
+    /* 1. for deletes: nothing older than an applied delete survives in its range */
+    for (uint32_t w = 1; w < nw; w++) {
+        if (!applied[w] || writes[w].kind == W_INSERT)
+            continue;
+        for (uint32_t k = writes[w].lo; k < writes[w].hi; k++) {
+            uint32_t f = final[writes[w].series][k];
+            if (f && f < nw && older(f, w)) {
+                if (lost++ < 10)
+                    VIOLATION("%s %u of series %d keys %u..%u: final holds %u at key %u, which completed before\n",
+                              writes[w].kind == W_DELETE ? "delete" : "replace", w, writes[w].series, writes[w].lo,
+                              writes[w].hi, f, k);
                 else
                     violations++;
             }
@@ -638,7 +778,7 @@ static int check(uint32_t final[NSERIES][NKEYS])
                 if (k2 < q->lo || k2 >= q->hi)
                     continue;
                 uint32_t other = q->seen[k2 - q->lo];
-                if (!other || (other != w && older(other, w))) {
+                if (other ? other != w && older(other, w) : !absent_ok(q->series, k2, writes[w].invoke, q->complete)) {
                     VIOLATION("read %u [%lld..%lld] saw write %u (%u keys, %lld..%lld) but %u (%u keys, %lld..%lld) at "
                               "its key %u: torn\n",
                               i, (long long)q->invoke, (long long)q->complete, w, writes[w].nkeys,
@@ -646,6 +786,15 @@ static int check(uint32_t final[NSERIES][NKEYS])
                               other < nw ? writes[other].nkeys : 0, other < nw ? (long long)writes[other].invoke : 0LL,
                               other < nw ? (long long)writes[other].complete : 0LL, k2);
                 }
+            }
+            /* a replace seen: its tombstone came with it */
+            for (uint32_t k2 = writes[w].lo; writes[w].kind == W_REPLACE && k2 < writes[w].hi; k2++) {
+                if (k2 < q->lo || k2 >= q->hi)
+                    continue;
+                uint32_t other = q->seen[k2 - q->lo];
+                if (other && other < nw && other != w && older(other, w))
+                    VIOLATION("read %u saw replace %u (keys %u..%u) but %u at key %u, which completed before it: torn\n",
+                              i, w, writes[w].lo, writes[w].hi, other, k2);
             }
         }
     }
@@ -660,21 +809,31 @@ static int check(uint32_t final[NSERIES][NKEYS])
     size_t total = 0;
     uint32_t *cnt = calloc((size_t)NSERIES * NKEYS + 1, sizeof *cnt);
     for (uint32_t w = 1; w < nw; w++)
-        if (writes[w].st == ST_OK)
+        if (writes[w].st == ST_OK) {
             for (uint32_t j = 0; j < writes[w].nkeys; j++) {
                 cnt[(size_t)writes[w].series * NKEYS + writes[w].keys[j] + 1]++;
                 total++;
             }
+            for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
+                cnt[(size_t)writes[w].series * NKEYS + k + 1]++;
+                total++;
+            }
+        }
     for (size_t x = 1; x <= (size_t)NSERIES * NKEYS; x++)
         cnt[x] += cnt[x - 1];
     ack *acks = malloc((total + 1) * sizeof *acks);
     uint32_t *fill = calloc((size_t)NSERIES * NKEYS, sizeof *fill);
     for (uint32_t w = 1; w < nw; w++)
-        if (writes[w].st == ST_OK)
+        if (writes[w].st == ST_OK) {
             for (uint32_t j = 0; j < writes[w].nkeys; j++) {
                 size_t slot = (size_t)writes[w].series * NKEYS + writes[w].keys[j];
                 acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke};
             }
+            for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
+                size_t slot = (size_t)writes[w].series * NKEYS + k;
+                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke};
+            }
+        }
     for (size_t slot = 0; slot < (size_t)NSERIES * NKEYS; slot++) {
         ack *a = acks + cnt[slot];
         size_t n = cnt[slot + 1] - cnt[slot];
@@ -706,7 +865,8 @@ static int check(uint32_t final[NSERIES][NKEYS])
             if (!lo)
                 continue;
             uint32_t seen = q->seen[k - q->lo];
-            if (!seen || (seen < nw && writes[seen].complete < a[lo - 1].max_invoke))
+            if (seen ? seen < nw && writes[seen].complete < a[lo - 1].max_invoke
+                     : !absent_ok(q->series, k, a[lo - 1].max_invoke, q->complete))
                 VIOLATION("read %u shows %u at series %d key %u, older than an acknowledged write: stale\n", i, seen,
                           q->series, k);
         }
@@ -715,6 +875,8 @@ static int check(uint32_t final[NSERIES][NKEYS])
     free(fill);
     free(cnt);
     free(applied);
+    free(dcnt);
+    free(dlist);
     return violations;
 }
 
@@ -946,19 +1108,36 @@ int main(int argc, char **argv)
     pthread_mutex_unlock(&server_lock);
 
     uint32_t nw = atomic_load(&nwrites) - 1, nr = atomic_load(&nreads);
-    unsigned ok = 0, info = 0, fail = 0, rok = 0;
-    for (uint32_t w = 1; w <= nw && w < MAX_OPS; w++)
+    unsigned ok = 0, info = 0, fail = 0, rok = 0, dels = 0, reps = 0;
+    for (uint32_t w = 1; w <= nw && w < MAX_OPS; w++) {
         ok += writes[w].st == ST_OK, info += writes[w].st == ST_INFO, fail += writes[w].st == ST_FAIL;
+        dels += writes[w].kind == W_DELETE && writes[w].st == ST_OK;
+        reps += writes[w].kind == W_REPLACE && writes[w].st == ST_OK;
+    }
     for (uint32_t i = 0; i < nr && i < MAX_OPS; i++)
         rok += reads[i].st == ST_OK;
-    printf("jepsen %s: %.0f s, %d clients, %d restarts; writes %u ok / %u indeterminate / %u failed, reads %u ok\n",
-           nemesis, seconds, nclients, restarts, ok, info, fail, rok);
+    printf("jepsen %s: %.0f s, %d clients, %d restarts; writes %u ok / %u indeterminate / %u failed, reads %u ok; "
+           "%u deletes and %u replaces ok\n",
+           nemesis, seconds, nclients, restarts, ok, info, fail, rok, dels, reps);
+    if (crashfs)
+        printf("servers under the shim: %d faulty, %d clean (fallback after a failed start), %d died while starting\n",
+               lives_faulty, lives_clean, lives_died_starting);
     if (memcmp(final, again, sizeof final) != 0)
         VIOLATION("the state changed across a clean restart\n");
     int v = check(final); /* counts the follower's violations too */
     if (!strcmp(nemesis, "eio")) {
         printf("eio: %d fail-stops\n", failstops);
         v += eio_problems;
+    }
+    if (!strcmp(nemesis, "power")) {
+        v += death_problems;
+        /* the nemesis must keep killing: a server left dead until the next tick (the clients idle, 40 restarts in
+         * 20 s instead of 300) tests far less, and passes every check above */
+        if (crashfs && seconds >= 10 && restarts < (int)(seconds * 4)) {
+            fprintf(stderr, "  only %d restarts in %.0f s (at least %d expected): the nemesis was idle\n", restarts,
+                    seconds, (int)(seconds * 4));
+            v++;
+        }
     }
     unlink(markpath);
     if (fport && !fv)

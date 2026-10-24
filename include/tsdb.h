@@ -81,6 +81,11 @@ typedef struct tsdb_options {
                               * returned without an error. Merges check what they decode, so damage is
                               * never rewritten under a fresh checksum; structural checksums (part header,
                               * footer and index, WAL, MANIFEST, dictionaries) are always checked. */
+    int retention_merge_s;   /* a part holding rows past their series' retention is rewritten without them
+                              * once it is this old; default 3600 (0 too), -1 never (merges still drop them) */
+    int64_t (*clock_ms)(void *arg); /* the wall clock retention reads, ms since the epoch; NULL: CLOCK_REALTIME.
+                                     * For tests: it may step back and forth like a real clock */
+    void *clock_arg;
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -152,6 +157,39 @@ int tsdb_insert_series(tsdb *db, uint32_t series, const int64_t *ts, const float
  * calls above are these with a float32 column and no nulls. */
 int tsdb_insert_values(tsdb *db, const uint32_t *series, const int64_t *ts, const tsdb_values *values, size_t n);
 int tsdb_insert_series_values(tsdb *db, uint32_t series, const int64_t *ts, const tsdb_values *values, size_t n);
+
+/* ---- deleting ----
+ * tsdb_delete_range deletes every value of one series with start <= ts < end.
+ * A delete is a write like any other: an insert of the same (series, ts)
+ * acknowledged after the delete returned is visible, one acknowledged before
+ * it started is gone. It returns once the delete is durable (fsync'd) and
+ * visible; it is all or nothing across a crash. A delete costs about what a
+ * large insert costs: it flushes the memtable (of all series) and writes and
+ * syncs a small part per partition that holds values of the series in the
+ * range, without holding up other writers meanwhile; merges absorb those
+ * parts and remove the deleted rows for good later. Frequent small deletes
+ * thus mean frequent small flushes. start >= end deletes nothing.
+ *
+ * tsdb_replace_range deletes [start, end) of the series and inserts the n
+ * given rows in its place, atomically: a reader, and a crash, sees either the
+ * old values or the new ones, never a mix. Every ts must lie in [start, end)
+ * (TSDB_ERR_INVALID otherwise); values as in tsdb_insert_series_values. n = 0
+ * is a delete. */
+int tsdb_delete_range(tsdb *db, uint32_t series, int64_t start, int64_t end);
+int tsdb_replace_range(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+                       const tsdb_values *values, size_t n);
+
+/* ---- retention ----
+ * A series' values older than now - limit_ms disappear; 0 (the default)
+ * keeps them. "now" is the wall clock (tsdb_options.clock_ms), but it never
+ * goes back: after the clock is stepped back, nothing expired comes back; a
+ * clock stepped forward expires values early, and for good once merges have
+ * removed them. Queries stop returning expired values at once; merges remove
+ * them in the background, whole partitions go when every series in them has
+ * expired. Raising a limit brings back only values merges have not removed yet.
+ * The limit is durable when tsdb_set_retention returns. */
+int tsdb_set_retention(tsdb *db, uint32_t series, int64_t limit_ms);
+int tsdb_get_retention(tsdb *db, uint32_t series, int64_t *limit_ms);
 
 /* State dictionary: names <-> codes (1, 2, ...), shared by the state series
  * of one volume. tsdb_state creates a name's code if needed; codes never
@@ -262,6 +300,8 @@ int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, con
  *    the value as a double (int64 rounded, bool 0 or 1).
  *  - n <= threshold returns every point. threshold < 3 or a state series:
  *    TSDB_ERR_INVALID.
+ * Deleted and expired values are not points: the buckets are cut over the
+ * live rows only, as if the others had never been written.
  * It reads one snapshot, so concurrent writes and merges do not tear the
  * result. Query statistics describe one read of the range (the counting pass,
  * and for very large buckets a second pass for the means, are not counted). */
@@ -324,6 +364,9 @@ int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, c
  *  - int64 and bool keep exact integer sums of x and x^2: the variance is
  *    computed from exact moments, with a few roundings at the end (in long
  *    double), and does not depend on the order of the rows.
+ * Like every aggregate, the spread covers only the rows that are left: a
+ * deleted, replaced-away or expired (retention) value is never part of it,
+ * whether merges have removed it from disk yet or not.
  * The spread costs a second pass over decoded floats and the squares of
  * integers, so only these functions compute it; tsdb_query_agg and the rest
  * do not. Arguments, order and limit as in tsdb_query_agg, tsdb_query_group_ex
@@ -356,6 +399,10 @@ int tsdb_query_spread_bounds(tsdb *db, uint32_t series, int64_t start, int64_t e
  *    is stale; LINEAR does not interpolate across it). 0: no limit.
  *  - The last reading of a series has no segment: it holds until a later
  *    reading arrives, never up to "now".
+ *  - Deleted readings do not exist: the segment before a deleted range runs
+ *    from the last live reading to the next live one. Expired readings
+ *    (retention) do not either, and nothing is carried in from before the
+ *    retention cutoff: the first segment starts at the first unexpired reading.
  * A bucket [b0, b1) integrates every segment over its intersection with the
  * bucket and with [start, end): segments are cut exactly at bucket edges and at
  * start and end (LINEAR interpolates the value at the cut), and the value in
@@ -376,7 +423,8 @@ int tsdb_query_spread_bounds(tsdb *db, uint32_t series, int64_t start, int64_t e
  * Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:
  * twa is the fraction of covered time that it was true); state series are
  * TSDB_ERR_INVALID. Whole granules inside one bucket are answered from stored
- * statistics without decoding (see docs/design.md). */
+ * statistics without decoding, except where a delete overlaps them and until a
+ * merge has removed the deleted rows (see docs/design.md). */
 typedef enum { TSDB_TWA_STEP = 0, TSDB_TWA_LINEAR = 1 } tsdb_twa_method;
 
 typedef struct tsdb_twa_opts {

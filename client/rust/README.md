@@ -198,6 +198,21 @@ println!("{:?}", rows.values.to_options::<i64>());   // Some([Some(3), None])
 Aggregates skip nulls. For int64 and bool series, `isum`, `imin` and `imax`
 in a bucket are exact (the float fields may round).
 
+## Delete, replace and retention
+
+```rust
+client.delete_range(starts, t0..t0 + 3_600_000)?;   // one hour, its end excluded
+client.replace_range(starts, t0..t0 + 2000, &[t0], &[7i64])?;
+client.set_retention(starts, 30 * 86_400_000)?;     // keep 30 days; 0 keeps everything
+assert_eq!(client.retention(starts)?, 30 * 86_400_000);
+```
+
+A delete returns once it is durable; queries stop seeing the rows at once.
+A replace is atomic: readers see the old rows or the new ones, never a mix.
+Rows older than a series' retention limit disappear from queries at once and
+from disk as merges get to them. These need a server of protocol version 7; an
+older one gets no request and the call fails with `Status::Invalid`.
+
 ## Compression
 
 Inserts are compressed with zstd before they are sent (level 1). This makes

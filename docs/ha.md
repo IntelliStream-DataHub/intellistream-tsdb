@@ -198,6 +198,16 @@ Records follow the checkpoint: `{u32 len, u32 gen, u32 epoch, u8 kind, payload, 
 - **No unlinks of adopted names outside PURGE.** The runtime never unlinks a name `lstate` holds, except through PURGE. With the local backend and a lifetime of 0, `part_unref` may still unlink retired names (part.c:166-167). Only *live* names that are missing make a volume CORRUPT.
 - **Intents.** `txn_*` intent files no longer exist for format-3 volumes. `intents_recover` (part.c:506) stays for legacy volumes.
 
+**Range deletes, replaces and retention** (added after this plan) map onto
+the same edits. A delete or replace commits tombstone parts (and a replace's
+row parts) through `parts_commit` under `publish_lock`, exactly like a direct
+large insert: one COMMIT edit, nothing new to replay. Tombstones only hide rows
+of lower block numbers in their partition, so the ledger's block order is all
+they need. A retention drop of a whole partition is a DROP predicate for that
+one partition and does not raise the drop watermark (D33): a later insert into
+it is a valid write. `RETENTION` is a dictionary like `SERIES`: append-only,
+its length goes into the OWNERS high-water mark with the others.
+
 ### 2.6 fd lifecycle, abandon and the abort rule
 
 **The grant.** The grant object holds the LOCK fd, the chained fds, `dirfd`, a generation `gen` and the engine's thread handles. Queries never use grant fds: they use mmaps and separate unlocked read fds. Pinned `eng`s therefore keep working after the grant is released (finding 19).

@@ -958,6 +958,68 @@ static void handle(req *r)
         if ((rc = handle_twa(c, r->id, p, len)) == 0)
             return;
         break;
+    case TSDB_OP_DELETE_RANGE: {
+        uint32_t s, zero;
+        int64_t start, end;
+        if (len != 24 || (memcpy(&zero, p + 4, 4), zero)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        memcpy(&start, p + 8, 8);
+        memcpy(&end, p + 16, 8);
+        rc = tsdb_delete_range(db, s, start, end);
+        break;
+    }
+    case TSDB_OP_REPLACE_RANGE: {
+        uint32_t n, s;
+        int64_t start, end;
+        static const uint8_t zero[6];
+        if (len < TSDB_REPLACE_HEADER || p[8] > TSDB_STATE || (p[9] & ~TSDB_VALID) || memcmp(p + 10, zero, 6)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&n, p, 4);
+        memcpy(&s, p + 4, 4);
+        memcpy(&start, p + 16, 8);
+        memcpy(&end, p + 24, 8);
+        size_t vb = (size_t)n * tsdb_wire_width(p[8]), valid = (p[9] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0;
+        if (len != TSDB_REPLACE_HEADER + (size_t)n * 8 + vb + valid) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        const int64_t *ts = (const int64_t *)(p + TSDB_REPLACE_HEADER); /* the payload is 8-aligned */
+        const uint8_t *vals = p + TSDB_REPLACE_HEADER + (size_t)n * 8;
+        tsdb_values col = {(tsdb_type)p[8], vals, valid ? vals + vb : NULL};
+        rc = tsdb_replace_range(db, s, start, end, ts, &col, n);
+        break;
+    }
+    case TSDB_OP_SET_RETENTION: {
+        uint32_t s, zero;
+        int64_t limit;
+        if (len != 16 || (memcpy(&zero, p + 4, 4), zero)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        memcpy(&limit, p + 8, 8);
+        rc = tsdb_set_retention(db, s, limit);
+        break;
+    }
+    case TSDB_OP_GET_RETENTION: {
+        uint32_t s;
+        int64_t limit;
+        if (len != 4) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        if ((rc = tsdb_get_retention(db, s, &limit)) == 0) {
+            reply(c, r->id, 0, &limit, 8, NULL, 0, NULL, 0);
+            return;
+        }
+        break;
+    }
     case TSDB_OP_COMMIT: rc = tsdb_commit(db); break;
     case TSDB_OP_FLUSH: rc = tsdb_flush(db); break;
     case TSDB_OP_OPTIMIZE: rc = tsdb_optimize(db); break;
