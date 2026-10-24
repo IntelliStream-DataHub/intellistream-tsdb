@@ -833,7 +833,6 @@ static void test_lttb_remote(tsdbc *c)
     free(valid);
 }
 
-/* Deletes, replaces and retention over the wire (protocol version 7). */
 /* A bucketed reply that does not fit a frame is refused with TSDB_ERR_TOO_MANY_BUCKETS, and the server computes
  * no more buckets than a frame carries (plus one) to find out: it used to build the whole reply, over 256 MB,
  * which the client then refused as a broken frame. A limit within a frame still answers. */
@@ -939,6 +938,7 @@ static void test_frame_cap(tsdbc *c)
     free(b);
 }
 
+/* Deletes, replaces and retention over the wire (protocol version 7). */
 static void test_delete(tsdbc *c)
 {
     uint32_t s;
@@ -1760,6 +1760,10 @@ static void test_same_keys(const char *dir)
  * more, and a restart has every acknowledged row. */
 static void test_wal_failstop(const char *dir)
 {
+    if (getenv("TSDB_TEST_NO_CRASHFS")) { /* a dist tarball ships no shim; make test runs this */
+        printf("  skipped: no crashfs shim\n");
+        return;
+    }
     char cmd[1200], mark[600];
     snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", dir, dir);
     if (system(cmd) != 0) {

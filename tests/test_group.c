@@ -115,6 +115,7 @@ typedef struct rb {
 } rb;
 
 extern size_t local_piece_bounds; /* src/calendar.c: local periods per window (0: the default) */
+extern size_t local_twa_listed;   /* src/calendar.c: bounds local TWAs have listed so far */
 
 static long maxrss_mb(void)
 {
@@ -171,11 +172,13 @@ static void same_in_windows(tsdb *db, uint32_t id, int64_t start, int64_t end, c
 
 /* Two rows years apart, grouped by the local second: memory follows the two buckets, not the 60 or 100
  * million periods between them (which listed 8 bytes of bounds each and then a dense array, or were refused).
- * The TWA, whose segments fill every period, is refused before it lists them. */
+ * The TWA, whose segments fill every period, is refused before it lists them (from their nominal length), or
+ * for 8 million of them (too few for that) once it has listed one more than it answers. */
 static void test_sparse_local(tsdb *db)
 {
-    int64_t t0 = days_from_civil(2024, 1, 1) * 86400000LL + 1500, gaps[] = {60000000LL * 1000, 100000000LL * 1000};
-    for (int k = 0; k < 2; k++) {
+    int64_t t0 = days_from_civil(2024, 1, 1) * 86400000LL + 1500;
+    int64_t gaps[] = {60000000LL * 1000, 100000000LL * 1000, 8000000LL * 1000};
+    for (int k = 0; k < 3; k++) {
         char name[32];
         snprintf(name, sizeof name, "sparse%d", k);
         uint32_t id;
@@ -199,8 +202,15 @@ static void test_sparse_local(tsdb *db)
         OK(tsdb_query_spread_group_local(db, id, t0 - 7, t0 + gaps[k] + 1, &g, NULL, &sb, &nb));
         CHECK(nb == 2 && sb[1].b.start == tt[1] - 500 && sb[1].range == 0);
         free(sb);
+        size_t listed = local_twa_listed;
         CHECK(tsdb_query_twa_group_local(db, id, INT64_MIN, INT64_MAX, &g, NULL, &tb, &nb) ==
               TSDB_ERR_TOO_MANY_BUCKETS);
+        /* refused from the nominal length before listing, unless the span is too short to tell */
+        listed = local_twa_listed - listed;
+        if (gaps[k] / 4 / 1000 > (4 << 20) + 2)
+            CHECK(listed == 0);
+        else
+            CHECK(listed > (4 << 20));
         long grew = maxrss_mb() - before;
         if (grew >= 128)
             fprintf(stderr, "  two rows %lld s apart by the local second: the queries took %ld MB\n",

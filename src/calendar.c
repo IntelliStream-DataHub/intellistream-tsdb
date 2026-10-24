@@ -28,6 +28,7 @@ static int first_ts(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n
  * the buckets, and the order and limit across windows, are those of one query
  * over every bound (only empty buckets, never returned, are skipped). */
 size_t local_piece_bounds;
+size_t local_twa_listed; /* bounds a local TWA has listed so far (once per window); tests */
 #define TWA_LOCAL_MAX_BOUNDS ((4u << 20) + 2) /* twa.c: at most TWA_MAX_BUCKETS buckets between its data's ends */
 
 /* Nominal length of `count` periods, in ms (0: too long to matter). */
@@ -222,9 +223,15 @@ int tsdb_query_twa_group_local(tsdb *db, uint32_t series, int64_t start, int64_t
         return 0; /* nothing in range, and no segment crosses it */
     /* Segments fill every period they cross, so the bounds are listed in full, but no more of them than a TWA
      * answers (twa.c TWA_MAX_BUCKETS, by the span of its buckets): not 512 MB of bounds to be refused after. */
+    /* Local periods are seldom longer than nominal (a day of 25 hours, a day repeated where a zone crossed the
+     * date line), never four times over a whole span: one that long holds too many whatever the zone, refused
+     * before any bound is listed. */
+    int64_t len = period_ms(group);
+    if (len > 0 && hi >= lo && ((uint64_t)hi - (uint64_t)lo) / 4 / (uint64_t)len > TWA_LOCAL_MAX_BOUNDS)
+        return TSDB_ERR_TOO_MANY_BUCKETS;
     int64_t *bounds = NULL;
     t = lo;
-    size_t n = 0;
+    size_t n = 0, cap = 0;
     for (bool final = false; !final;) {
         int64_t *b;
         size_t m;
@@ -232,7 +239,16 @@ int tsdb_query_twa_group_local(tsdb *db, uint32_t series, int64_t start, int64_t
             break;
         if (!final)
             t = b[--m]; /* the next window begins with it */
-        int64_t *r = n + m <= TWA_LOCAL_MAX_BOUNDS ? realloc(bounds, (n + m) * sizeof *bounds) : NULL;
+        __atomic_fetch_add(&local_twa_listed, m, __ATOMIC_RELAXED);
+        int64_t *r = bounds;
+        if (n + m > TWA_LOCAL_MAX_BOUNDS) {
+            r = NULL;
+        } else if (n + m > cap) { /* doubling: an allocator that copies on realloc copies each bound twice at most */
+            size_t c = cap * 2 > n + m ? cap * 2 : n + m;
+            c = c < TWA_LOCAL_MAX_BOUNDS ? c : TWA_LOCAL_MAX_BOUNDS;
+            if ((r = realloc(bounds, c * sizeof *bounds)))
+                cap = c;
+        }
         if (r)
             memcpy(r + n, b, m * sizeof *b), bounds = r, n += m;
         free(b);
