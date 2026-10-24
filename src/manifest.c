@@ -352,11 +352,14 @@ int follow_refresh(eng *db)
             db->manifest_bad_since = now;
         if (now - db->manifest_bad_since < follow_patience_ms(db))
             rc = 0;
-        else if (now - db->manifest_bad_since < follow_patience_ms(db) + db->opt.refresh_ms)
+        else if (!db->manifest_reported) { /* once, however long a refresh takes */
+            db->manifest_reported = true;
             fprintf(stderr, "tsdb: follower: MANIFEST has failed its checks for %" PRId64 " ms\n",
                     now - db->manifest_bad_since);
+        }
     } else if (rc == 0) {
         db->manifest_bad_since = 0;
+        db->manifest_reported = false;
     }
     if (rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_CORRUPT || (rc == 0 && db->manifest_bad_since)) {
         pthread_mutex_unlock(&db->refresh_lock);

@@ -645,6 +645,7 @@ struct eng {
     pthread_mutex_t refresh_lock;
     uint64_t follow_version;
     int64_t manifest_bad_since; /* follower: MANIFEST failed its checks since (monotonic ms), else 0 */
+    bool manifest_reported;     /* follower: and that was logged */
     char broken_reported[96];   /* follower: the last broken part logged */
     uint64_t follow_flushed, follow_active;
     wal_tail tails[MAX_TAILS]; /* oldest first; the array is changed under db->lock + buf_lock */

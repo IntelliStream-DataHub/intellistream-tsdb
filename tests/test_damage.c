@@ -574,7 +574,44 @@ static void test_manifest(const char *scratch)
     if (f)
         tsdb_close(f);
 
+    /* torn after a follower opened, and its refreshes come slower than refresh_ms:
+     * the failure is still logged (once) when the patience runs out */
+    file_pwrite(dir, "MANIFEST", 0, orig, (size_t)len);
+    tsdb_options ro = opts();
+    ro.read_only = 1; /* no polling thread: refreshes happen here */
+    ro.refresh_ms = 20;
+    f = NULL;
+    OK(tsdb_open(dir, &ro, &f));
+    if (f) {
+        file_pwrite(dir, "MANIFEST", 0, junk, torn);
+        char log[700];
+        snprintf(log, sizeof log, "%s.stderr", dir);
+        fflush(stderr);
+        int saved = dup(2), lfd = open(log, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        dup2(lfd, 2);
+        int rc0 = tsdb_refresh(f);
+        usleep(2300 * 1000); /* past the patience (2 s) and one refresh interval more */
+        int rc1 = tsdb_refresh(f), rc2 = tsdb_refresh(f);
+        fflush(stderr);
+        dup2(saved, 2);
+        close(saved);
+        char text[4096] = "";
+        ssize_t got = pread(lfd, text, sizeof text - 1, 0);
+        text[got > 0 ? got : 0] = '\0';
+        close(lfd);
+        unlink(log);
+        RC(rc0, 0);
+        RC(rc1, TSDB_ERR_CORRUPT);
+        RC(rc2, TSDB_ERR_CORRUPT);
+        const char *line = strstr(text, "MANIFEST has failed its checks");
+        CHECK(line && !strstr(line + 1, "MANIFEST has failed its checks"));
+        file_pwrite(dir, "MANIFEST", 0, orig, (size_t)len);
+        OK(tsdb_refresh(f));
+        OK(tsdb_close(f));
+    }
+
     /* the writer rebuilds it from the parts */
+    file_pwrite(dir, "MANIFEST", 0, junk, torn);
     CHECK(rows_of(dir, "part.series") == PART_ROWS);
     printf("  MANIFEST: a follower waits out a torn rewrite, and fails the open on one that stays torn\n");
     free(orig);
