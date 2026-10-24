@@ -37,6 +37,8 @@ public final class EmbeddedOptions {
     private int refreshMs;
     private int mergeIdleS;
     private int obsoletePartLifetimeS;
+    private boolean verifyChecksums;
+    private int retentionMergeS;
 
     /** The library's defaults. */
     public EmbeddedOptions() {
@@ -64,6 +66,8 @@ public final class EmbeddedOptions {
             refreshMs = o.get(JAVA_INT, offset(OPTIONS, "refresh_ms"));
             mergeIdleS = o.get(JAVA_INT, offset(OPTIONS, "merge_idle_s"));
             obsoletePartLifetimeS = o.get(JAVA_INT, offset(OPTIONS, "obsolete_part_lifetime_s"));
+            verifyChecksums = o.get(JAVA_INT, offset(OPTIONS, "verify_checksums")) != 0;
+            retentionMergeS = o.get(JAVA_INT, offset(OPTIONS, "retention_merge_s"));
         }
     }
 
@@ -87,6 +91,9 @@ public final class EmbeddedOptions {
         o.set(JAVA_INT, offset(OPTIONS, "refresh_ms"), refreshMs);
         o.set(JAVA_INT, offset(OPTIONS, "merge_idle_s"), mergeIdleS);
         o.set(JAVA_INT, offset(OPTIONS, "obsolete_part_lifetime_s"), obsoletePartLifetimeS);
+        o.set(JAVA_INT, offset(OPTIONS, "verify_checksums"), verifyChecksums ? 1 : 0);
+        o.set(JAVA_INT, offset(OPTIONS, "retention_merge_s"), retentionMergeS);
+        /* clock_ms and clock_arg stay NULL (allocate zeroes): retention reads the wall clock */
         return o;
     }
 
@@ -278,6 +285,29 @@ public final class EmbeddedOptions {
         return this;
     }
 
+    /**
+     * Whether queries check each granule's checksum before decoding it (a mismatch fails the query as corrupt).
+     * Structural checksums (part headers and indexes, WAL, MANIFEST, dictionaries) are always checked.
+     *
+     * @param on default false: storage with checksums of its own (ZFS, ECC memory) catches the damage already
+     * @return this
+     */
+    public EmbeddedOptions verifyChecksums(boolean on) {
+        verifyChecksums = on;
+        return this;
+    }
+
+    /**
+     * A part holding rows past their series' retention is rewritten without them once it is this old.
+     *
+     * @param seconds default 3600; -1 never (merges still drop them)
+     * @return this
+     */
+    public EmbeddedOptions retentionMergeS(int seconds) {
+        retentionMergeS = seconds;
+        return this;
+    }
+
     @Override
     public String toString() {
         return "EmbeddedOptions[partitionMs=" + partitionMs + ", granuleRows=" + granuleRows + ", zstdLevel="
@@ -285,6 +315,7 @@ public final class EmbeddedOptions {
                 + ", queryThreads=" + queryThreads + ", bufferRows=" + bufferRows + ", flushIntervalMs="
                 + flushIntervalMs + ", walSyncMs=" + walSyncMs + ", walMaxBatchRows=" + walMaxBatchRows
                 + ", maxPartBytes=" + maxPartBytes + ", readOnly=" + readOnly + ", follow=" + follow + ", refreshMs="
-                + refreshMs + ", mergeIdleS=" + mergeIdleS + ", obsoletePartLifetimeS=" + obsoletePartLifetimeS + "]";
+                + refreshMs + ", mergeIdleS=" + mergeIdleS + ", obsoletePartLifetimeS=" + obsoletePartLifetimeS
+                + ", verifyChecksums=" + verifyChecksums + ", retentionMergeS=" + retentionMergeS + "]";
     }
 }

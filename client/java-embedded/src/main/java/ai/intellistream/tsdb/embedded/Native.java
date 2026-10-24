@@ -17,7 +17,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.function.IntToLongFunction;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -71,7 +73,11 @@ final class Native {
             JAVA_INT.withName("refresh_ms"),
             JAVA_INT.withName("merge_idle_s"),
             JAVA_INT.withName("obsolete_part_lifetime_s"),
-            MemoryLayout.paddingLayout(4)).withName("tsdb_options");
+            JAVA_INT.withName("verify_checksums"),
+            JAVA_INT.withName("retention_merge_s"),
+            MemoryLayout.paddingLayout(4),
+            PTR.withName("clock_ms"), /* int64_t (*)(void *): left NULL, the wall clock */
+            PTR.withName("clock_arg")).withName("tsdb_options");
 
     static final StructLayout VALUES = MemoryLayout.structLayout(
             JAVA_INT.withName("type"),
@@ -260,7 +266,11 @@ final class Native {
         }
     }
 
+    /** The C name and descriptor of every handle, for the test that compares them with the prototypes. */
+    static final Map<String, FunctionDescriptor> BOUND = new LinkedHashMap<>();
+
     private static MethodHandle fn(String name, FunctionDescriptor d, Linker.Option... options) {
+        BOUND.put(name, d);
         MemorySegment sym = LIB.find(name).orElseThrow(() -> new UnsatisfiedLinkError("libtsdb.so: no " + name));
         return LINKER.downcallHandle(sym, d, options);
     }

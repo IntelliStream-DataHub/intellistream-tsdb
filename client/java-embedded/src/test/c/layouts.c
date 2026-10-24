@@ -18,7 +18,8 @@ int main(void)
     F(tsdb_options, query_threads); F(tsdb_options, buffer_rows); F(tsdb_options, flush_interval_ms);
     F(tsdb_options, wal_sync_ms); F(tsdb_options, wal_max_batch_rows); F(tsdb_options, max_part_bytes);
     F(tsdb_options, read_only); F(tsdb_options, follow); F(tsdb_options, refresh_ms); F(tsdb_options, merge_idle_s);
-    F(tsdb_options, obsolete_part_lifetime_s);
+    F(tsdb_options, obsolete_part_lifetime_s); F(tsdb_options, verify_checksums); F(tsdb_options, retention_merge_s);
+    F(tsdb_options, clock_ms); F(tsdb_options, clock_arg);
     S(tsdb_values);
     F(tsdb_values, type); F(tsdb_values, values); F(tsdb_values, valid);
     S(tsdb_bucket);

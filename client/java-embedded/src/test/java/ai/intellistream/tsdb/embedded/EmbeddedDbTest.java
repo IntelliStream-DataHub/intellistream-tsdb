@@ -73,6 +73,9 @@ class EmbeddedDbTest {
         assertEquals("not found", EmbeddedDb.strerror(Status.ERR_NOTFOUND).toLowerCase().replace("series ", ""),
                 "the engine's text");
         assertTrue(new EmbeddedOptions().toString().contains("granuleRows=8192"));
+        /* the fields after obsolete_part_lifetime_s, read from tsdb_options_init and written back at their offsets */
+        String defaults = new EmbeddedOptions().toString();
+        assertTrue(defaults.contains("verifyChecksums=false, retentionMergeS=3600]"), defaults);
         assertTrue(db.isOpen());
         assertTrue(db.toString().contains("db"));
     }
