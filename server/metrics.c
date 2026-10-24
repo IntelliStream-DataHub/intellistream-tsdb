@@ -361,6 +361,11 @@ static void render(sb *b)
     int64_t busy = atomic_load_explicit(&M.workers_busy, memory_order_relaxed);
     family(b, "tsdb_workers", "gauge", "Worker threads (the --workers count, plus extras started for slow clients).");
     sb_add(b, "tsdb_workers %zu\n", cfg.workers ? cfg.workers() : 0);
+    family(b, "tsdb_request_memory_bytes", "gauge",
+           "Requests received and not yet run, large receive buffers and packed inserts being unpacked.");
+    sb_add(b, "tsdb_request_memory_bytes %zu\n", cfg.request_memory ? cfg.request_memory() : 0);
+    family(b, "tsdb_request_memory_limit_bytes", "gauge", "--max-request-memory.");
+    sb_add(b, "tsdb_request_memory_limit_bytes %zu\n", cfg.request_memory_limit);
     family(b, "tsdb_workers_busy", "gauge", "Worker threads running a request now.");
     sb_add(b, "tsdb_workers_busy %lld\n", (long long)(busy > 0 ? busy : 0));
     family(b, "tsdb_metrics_scrapes_total", "counter", "Scrapes of this endpoint answered.");

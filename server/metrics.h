@@ -20,6 +20,8 @@ typedef struct metrics_cfg {
     const char *role;        /* "writer", "read-only" or "follower" */
     size_t max_conns;        /* --max-connections */
     size_t (*workers)(void); /* worker threads running now (base plus extra) */
+    size_t (*request_memory)(void); /* bytes counted against --max-request-memory now */
+    size_t request_memory_limit;    /* --max-request-memory in bytes */
 } metrics_cfg;
 
 /* Starts the metrics thread. Returns 0, or a negative errno. */

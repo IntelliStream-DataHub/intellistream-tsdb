@@ -48,6 +48,7 @@ directory) and `path`.
 | `tsdb_connections`, `tsdb_connections_max` | gauge | open connections on the main port, and the limit |
 | `tsdb_connections_accepted_total`, `tsdb_connections_rejected_total` | counter | accepted, and closed at once for the limit |
 | `tsdb_workers`, `tsdb_workers_busy` | gauge | worker threads (extras start for slow clients), and those running a request |
+| `tsdb_request_memory_bytes`, `tsdb_request_memory_limit_bytes` | gauge | memory of requests received and not yet run (with large receive buffers and packed inserts being unpacked), and `--max-request-memory` |
 | `tsdb_metrics_scrapes_total`, `tsdb_metrics_rejected_total` | counter | this endpoint: scrapes answered, requests refused or timed out |
 
 Useful expressions: `rate(tsdb_inserted_rows_total[1m])` is the insert rate;

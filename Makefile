@@ -91,7 +91,7 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_ports $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb
+test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_ports $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
 	./$(B)/test_tsdb
 	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
@@ -108,6 +108,7 @@ test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/t
 	./$(B)/test_limits
 	./$(B)/test_follow
 	./$(B)/test_volumes
+	./$(B)/fuzz_frames replay tests/fuzz/frames
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server && \
@@ -145,7 +146,7 @@ $(B):
 	mkdir -p $(B)
 
 clean:
-	rm -rf build build-tsan $(DIST_B)
+	rm -rf build build-tsan build-fuzz $(DIST_B)
 
 # ---- portable binaries (dist/README.dist): built here, run on AlmaLinux 10 ----
 # x86-64-v2 for CPUs as old as Nehalem (no AVX needed), with the codecs also compiled for
@@ -273,7 +274,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -286,6 +287,26 @@ TSDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
 
 $(B)/tsdbd: server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c $(B)/tsdb_pack.o $(LIB) $(LDLIBS) $(URING_LIBS)
+
+# tests/fuzz/fuzz_frames.c includes server/tsdbd.c (epoll only: no ring needed without sockets). FUZZ_COV is
+# -fsanitize-coverage=trace-pc in `make fuzz-frames`, which feeds its coverage-guided driver.
+$(B)/fuzz_frames: tests/fuzz/fuzz_frames.c server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h \
+                  client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
+	$(CC) $(CFLAGS) $(FUZZ_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c $(B)/tsdb_pack.o $(LIB) $(LDLIBS)
+
+# Mutates the request corpus for FUZZ_SECONDS under ASan and UBSan, in build-fuzz/; new inputs go to
+# build-fuzz/frames-new/ and a failing one to build-fuzz/frames-new/crash-*; the next run starts from both. A
+# finding, once fixed, is committed to tests/fuzz/frames/ as its regression input (make test replays that directory).
+FUZZ_SECONDS ?= 600
+# No allocation may exceed a frame (256 MB) and some slack: a request that makes the server allocate more than
+# that from a few bytes is a finding (a crash), not a NULL the handler turns into TSDB_ERR_NOMEM.
+FUZZ_MAX_ALLOC_MB ?= 300
+fuzz-frames:
+	$(MAKE) B=build-fuzz ARCH= CFLAGS="$(ASAN_FLAGS)" FUZZ_COV=-fsanitize-coverage=trace-pc build-fuzz/fuzz_frames
+	UBSAN_OPTIONS="$(UBSAN_RUN) $$UBSAN_OPTIONS" \
+	    ASAN_OPTIONS="allocator_may_return_null=0 max_allocation_size_mb=$(FUZZ_MAX_ALLOC_MB) $$ASAN_OPTIONS" \
+	    ./build-fuzz/fuzz_frames fuzz --seconds $(FUZZ_SECONDS) --out build-fuzz/frames-new tests/fuzz/frames \
+	    $$(test -d build-fuzz/frames-new && echo build-fuzz/frames-new)
 
 CLIB := $(B)/libtsdbclient.a
 

@@ -53,6 +53,21 @@
  * only a reopen recovers, so a supervisor restarts it (or a standby takes over).
  * After SIGKILL a new server can start on the same port and directory at once.
  *
+ * Memory: a request is held from its first byte until a worker has run it. Requests waiting to run (their payload
+ * and REQ_OVERHEAD each, so empty frames count too), receive buffers grown past IN_KEEP (64 KB; a frame larger
+ * than that gets a buffer of exactly its size when its length arrives) and packed inserts being unpacked all count
+ * against --max-request-memory (default an eighth of the RAM, at least 1024 MB). A connection that would start a
+ * large frame beyond it is not read from until memory frees (unless nothing else holds any, so one frame always
+ * fits), and neither is one with requests waiting while the total is over it; a packed insert waits to unpack
+ * while the total would exceed it, unless no other is unpacking. Outside it: up to IN_KEEP of receive buffer per
+ * connection, and the replies waiting for a client that does not read them (up to OUT_CAP and one reply per
+ * connection, after which its worker waits). A connection with more than PIPE_CAP of requests waiting reads no
+ * more until they run, and one whose frame has been started but not completed for --frame-timeout seconds
+ * (default 60) while the server waits for its bytes is closed (slow senders); time the server itself held the
+ * connection unread does not count. Replies never exceed a frame: a result too large for one is
+ * TSDB_ERR_TOO_MANY_BUCKETS. Without authentication, a client can still hold the whole limit with large frames it
+ * sends slowly, for --frame-timeout at a time, making others' large frames wait.
+ *
  * There is no authentication: listen on a trusted interface only.
  */
 #define _GNU_SOURCE
@@ -79,17 +94,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #define RECV_MIN_FREE (16u << 10) /* per connection; grows for large frames */
 #define BUF_KEEP (256u << 10)      /* buffers grown past this shrink back when idle */
+#ifndef OUT_CAP /* tests/fuzz/fuzz_frames.c includes this file with its own */
 #define OUT_CAP (8u << 20)
+#endif
 #define RAW_CHUNK_ROWS 16384
+#define PIPE_CAP (4u << 20) /* bytes of requests waiting on one connection before it is read no further */
+/* A receive buffer up to this size is not counted in the request memory; a frame larger than it gets a buffer of
+ * its own size, which is (see the file header). */
+#define IN_KEEP (64u << 10)
 
 typedef struct buf {
     uint8_t *p;
@@ -123,7 +147,7 @@ static void buf_shrink(buf *b)
     }
 }
 
-typedef enum { EV_RECV, EV_SEND, EV_WAKE } ev_type;
+typedef enum { EV_RECV, EV_SEND, EV_WAKE, EV_TICK } ev_type;
 
 struct conn;
 typedef struct ev {
@@ -140,6 +164,10 @@ typedef struct req {
     size_t len;
 } req;
 
+/* What a request costs beyond its payload: the struct and two allocations. Counted with the payload, so frames
+ * without one (9 bytes on the wire) cannot pile up uncounted. */
+#define REQ_OVERHEAD (sizeof(req) + 64)
+#define REQ_COST(r) ((r)->len + REQ_OVERHEAD)
 typedef struct conn {
     struct conn *prev, *next; /* all connections, for shutdown (main thread) */
     int fd;
@@ -152,6 +180,13 @@ typedef struct conn {
     bool eof;           /* the client sent everything it will: reply to it, then close */
     buf sending;
     size_t sent;
+    size_t in_charged;  /* of in.cap, counted in req_held (a buffer grown for a large frame) */
+    size_t q_bytes;     /* REQ_COST of the requests in q */
+    int64_t frame_t0;   /* when the partial frame in `in` was started (monotonic s), 0: none */
+    bool parked;        /* not read from until memory frees (park list); park_frame: to grow for a frame */
+    bool park_frame;
+    bool held;          /* the server stopped reading it (parked or PIPE_CAP): its frame deadline restarts */
+    struct conn *park_prev, *park_next;
     bool readable, writable, rdhup; /* epoll: what the socket can do, as far as we know */
     bool in_ready, dead;            /* epoll: in the ready list; freed while in it */
     struct conn *ready_next;
@@ -173,7 +208,7 @@ static struct io_uring ring;
 static int wake_fd = -1;
 static atomic_int stopping; /* lock-free, so the signal handler may store it; read by failwatch too */
 #ifndef TSDBD_NO_URING
-static ev wake_ev = {EV_WAKE, NULL};
+static ev wake_ev = {EV_WAKE, NULL}, tick_ev = {EV_TICK, NULL};
 #endif
 static conn *conns;
 static size_t nconns, max_conns = 10000;
@@ -194,6 +229,50 @@ static int base_workers, running_workers, waiting_workers;
 static pthread_cond_t workers_gone_cv = PTHREAD_COND_INITIALIZER;
 static int send_timeout_s = 60;
 static void *worker_main(void *arg);
+
+/* Bytes of requests held (see the file header): receive buffers grown for large frames, and payloads from
+ * parsing until a worker has run them. Changed by the main thread and the workers. */
+static size_t req_budget = (size_t)1024 << 20; /* at least; main raises it to an eighth of the RAM */
+static atomic_size_t req_held;
+static int frame_timeout_s = 60;
+
+static size_t request_memory_now(void)
+{
+    return atomic_load_explicit(&req_held, memory_order_relaxed);
+}
+
+static void req_free(req *r)
+{
+    atomic_fetch_sub(&req_held, REQ_COST(r));
+    free(r->payload);
+    free(r);
+}
+
+/* Packed inserts decompress to up to a frame's worth of arrays from a few kilobytes: counted in req_held with the
+ * requests (so the server also reads less meanwhile) and waiting while the total would exceed the limit. One always
+ * may when no other is decompressing, so this never waits on itself: the peak is the limit plus one insert. */
+static pthread_mutex_t inflate_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t inflate_cv = PTHREAD_COND_INITIALIZER;
+static size_t inflate_held;
+
+static void inflate_acquire(size_t n)
+{
+    pthread_mutex_lock(&inflate_lock);
+    while (inflate_held && atomic_load_explicit(&req_held, memory_order_relaxed) + n > req_budget)
+        pthread_cond_wait(&inflate_cv, &inflate_lock);
+    inflate_held += n;
+    atomic_fetch_add_explicit(&req_held, n, memory_order_relaxed);
+    pthread_mutex_unlock(&inflate_lock);
+}
+
+static void inflate_release(size_t n)
+{
+    pthread_mutex_lock(&inflate_lock);
+    inflate_held -= n;
+    atomic_fetch_sub_explicit(&req_held, n, memory_order_relaxed);
+    pthread_cond_broadcast(&inflate_cv);
+    pthread_mutex_unlock(&inflate_lock);
+}
 
 static void worker_waits(int delta)
 {
@@ -254,6 +333,11 @@ static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t al
                   const void *d, size_t dlen)
 {
     size_t body = 4 + 1 + 4 + alen + blen + dlen;
+    if (body > TSDB_MAX_FRAME) { /* callers check: a client could not read it, and the length would wrap */
+        atomic_store(&c->closing, true);
+        shutdown(c->fd, SHUT_RDWR);
+        return false;
+    }
     if (status)
         metrics_error(status);
     uint8_t hdr[13];
@@ -404,9 +488,16 @@ static int insert_packed(const uint8_t *p, size_t len, uint32_t n, uint32_t s)
     memcpy(&raw_len, p + TSDB_VALUES_HEADER, 4);
     const uint8_t *z = p + TSDB_VALUES_HEADER + 4;
     size_t zlen = len - TSDB_VALUES_HEADER - 4;
-    if (raw_len > tsdb_pack_raw_bound(n, type, valid, many) || ZSTD_getFrameContentSize(z, zlen) != raw_len)
-        return TSDB_ERR_INVALID;
     unsigned w = tsdb_wire_width(type);
+    /* The rows must fit a frame unpacked, as clients split them (INSERT_FRAME_ROWS); the packed form holds at
+     * least a byte per timestamp and the values' bytes. Checked before anything is sized by n or raw_len: a
+     * zstd frame of a few kilobytes can claim gigabytes. */
+    size_t unpacked = TSDB_VALUES_HEADER + (size_t)n * (8 + w + (many ? 4 : 0)) + (valid ? ((size_t)n + 7) / 8 : 0);
+    if (unpacked > TSDB_MAX_FRAME || raw_len < (size_t)n * (1 + w) ||
+        raw_len > tsdb_pack_raw_bound(n, type, valid, many) || ZSTD_getFrameContentSize(z, zlen) != raw_len)
+        return TSDB_ERR_INVALID;
+    size_t held = raw_len + unpacked;
+    inflate_acquire(held);
     uint8_t *raw = malloc(raw_len ? raw_len : 1);
     int64_t *ts = malloc((size_t)n * 8 + 8);
     uint8_t *vals = malloc((size_t)n * w + (size_t)n / 8 + 9); /* values, then the bitmap */
@@ -427,6 +518,7 @@ static int insert_packed(const uint8_t *p, size_t len, uint32_t n, uint32_t s)
     free(ts);
     free(vals);
     free(series);
+    inflate_release(held);
     return rc;
 }
 
@@ -436,6 +528,10 @@ static void reply_buckets(conn *c, uint32_t id, const void *bb, size_t nb, uint8
 {
     size_t row = fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
     size_t stride = fields & TSDB_SPREAD ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+    if (nb > (TSDB_MAX_FRAME - 13) / row) {
+        reply_status(c, id, TSDB_ERR_TOO_MANY_BUCKETS);
+        return;
+    }
     uint8_t *rows = malloc(nb * row + 1);
     if (!rows) {
         reply_status(c, id, TSDB_ERR_NOMEM);
@@ -468,6 +564,10 @@ static void reply_buckets(conn *c, uint32_t id, const void *bb, size_t nb, uint8
 
 static void reply_twa(conn *c, uint32_t id, const tsdb_twa_bucket *b, size_t nb)
 {
+    if (nb > (TSDB_MAX_FRAME - 13) / TSDB_TWA_ROW) {
+        reply_status(c, id, TSDB_ERR_TOO_MANY_BUCKETS);
+        return;
+    }
     uint8_t *rows = malloc(nb * TSDB_TWA_ROW + 1);
     if (!rows) {
         reply_status(c, id, TSDB_ERR_NOMEM);
@@ -681,6 +781,11 @@ static void handle(req *r)
             tsdb_query_opts q = {p[25] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
             rc = tsdb_query_group_ex(db, s, start, end, p[20] ? &g : NULL, &q, &b, &nb);
             free(zone);
+        }
+        if (rc == 0 && nb > (TSDB_MAX_FRAME - 13) / TSDB_AGG_ROW) {
+            free(b);
+            rc = TSDB_ERR_TOO_MANY_BUCKETS; /* the reply would not fit a frame */
+            break;
         }
         if (rc == 0) {
             uint8_t *rows = malloc(nb * TSDB_AGG_ROW + 1);
@@ -1065,8 +1170,7 @@ static void *worker_main(void *arg)
             pthread_mutex_unlock(&r->c->lock);
         }
         conn *c = r->c;
-        free(r->payload);
-        free(r);
+        req_free(r);
         notify(c, true);
     }
 }
@@ -1105,6 +1209,72 @@ static conn **fd_conn; /* epoll: connections by descriptor */
 static size_t fd_conn_cap;
 static conn *ready_head, *ready_tail; /* epoll: connections that can make progress */
 static size_t nready;
+static conn *park_head, *park_tail; /* not read from until request memory frees */
+static int tick_fd = -1;           /* a timerfd: once a second, the frame deadlines */
+
+static int64_t mono_s(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &t);
+    return (int64_t)t.tv_sec;
+}
+
+/* What c's receive buffer counts in req_held: all of it once grown past IN_KEEP. */
+static void in_account(conn *c)
+{
+    size_t now = c->in.cap > IN_KEEP ? c->in.cap : 0;
+    if (now > c->in_charged)
+        atomic_fetch_add(&req_held, now - c->in_charged);
+    else if (now < c->in_charged)
+        atomic_fetch_sub(&req_held, c->in_charged - now);
+    c->in_charged = now;
+}
+
+/* Gives back a receive buffer grown for a large frame, unless one is being received into it. No recv may be in
+ * flight. */
+static void in_shrink(conn *c)
+{
+    uint32_t flen;
+    if (c->in.cap <= IN_KEEP || c->in.len > IN_KEEP / 2 ||
+        (c->in.len >= 4 && (memcpy(&flen, c->in.p, 4), 4 + (size_t)flen > IN_KEEP)))
+        return;
+    uint8_t *p = realloc(c->in.p, IN_KEEP);
+    if (p) {
+        c->in.p = p;
+        c->in.cap = IN_KEEP;
+    }
+    in_account(c);
+}
+
+static void park(conn *c, bool for_frame)
+{
+    c->parked = true;
+    c->held = true;
+    c->park_frame = for_frame;
+    c->park_next = NULL;
+    c->park_prev = park_tail;
+    if (park_tail)
+        park_tail->park_next = c;
+    else
+        park_head = c;
+    park_tail = c;
+}
+
+static void unpark(conn *c)
+{
+    if (!c->parked)
+        return;
+    c->parked = false;
+    if (c->park_prev)
+        c->park_prev->park_next = c->park_next;
+    else
+        park_head = c->park_next;
+    if (c->park_next)
+        c->park_next->park_prev = c->park_prev;
+    else
+        park_tail = c->park_prev;
+    c->park_prev = c->park_next = NULL;
+}
 
 #ifndef TSDBD_NO_URING
 static struct io_uring_sqe *sqe_get(void)
@@ -1135,11 +1305,33 @@ static void ep_want(conn *c)
 
 static void submit_recv(conn *c)
 {
-    if (c->recv_inflight || c->closed)
+    if (c->recv_inflight || c->closed || c->eof || c->parked)
         return;
-    buf_shrink(&c->in);
-    if (buf_reserve(&c->in, RECV_MIN_FREE) != 0)
+    if (c->q_bytes > PIPE_CAP) {
+        c->held = true;
+        return; /* on_wake resumes it as its requests run */
+    }
+    if (c->q_head && atomic_load_explicit(&req_held, memory_order_relaxed) > req_budget) {
+        park(c, false); /* its requests waiting are memory enough: read again once memory frees */
         return;
+    }
+    in_shrink(c);
+    size_t want = RECV_MIN_FREE;
+    uint32_t flen;
+    if (c->in.len >= 4 && (memcpy(&flen, c->in.p, 4), 4 + (size_t)flen > c->in.len)) {
+        size_t rest = 4 + (size_t)flen - c->in.len;
+        /* a large frame: the rest, into the buffer reserved for it; a small one: room for at least its rest,
+         * which parse reserved, so the buffer never grows past IN_KEEP uncounted */
+        want = 4 + (size_t)flen > IN_KEEP || rest < want ? rest : want;
+    }
+    if (buf_reserve(&c->in, want) != 0)
+        return;
+    in_account(c);
+    if (c->held) { /* the wait was the server's: the client gets the whole deadline again */
+        c->held = false;
+        if (c->frame_t0)
+            c->frame_t0 = mono_s();
+    }
     c->recv_inflight = true;
     if (io == IO_EPOLL) {
         ep_want(c);
@@ -1193,6 +1385,7 @@ static void dispatch(conn *c)
     if (!c->q_head)
         c->q_tail = NULL;
     r->next = NULL;
+    c->q_bytes -= REQ_COST(r);
     c->busy = true;
     pthread_mutex_lock(&work_lock);
     if (work_tail)
@@ -1219,13 +1412,15 @@ static void conn_free(conn *c)
     while (c->q_head) {
         req *r = c->q_head;
         c->q_head = r->next;
-        free(r->payload);
-        free(r);
+        req_free(r);
     }
+    unpark(c);
+    free(c->in.p);
+    c->in = (buf){0};
+    in_account(c);
     if (io == IO_EPOLL && (size_t)c->fd < fd_conn_cap)
         fd_conn[c->fd] = NULL; /* before close: the number may come back for the next connection */
     close(c->fd);
-    free(c->in.p);
     free(c->out.p);
     free(c->sending.p);
     pthread_mutex_destroy(&c->lock);
@@ -1264,24 +1459,48 @@ static void finish_if_drained(conn *c)
         conn_close(c);
 }
 
-/* Splits received bytes into requests. Returns false on a protocol error. */
-static bool parse(conn *c)
+/* Splits received bytes into requests. Returns 0, -1 on a protocol error, or 1 when the frame begun needs a
+ * buffer that the request memory cannot have yet (the connection is then parked, unread). */
+static int parse(conn *c)
 {
     size_t off = 0;
+    int rc = 0;
+    bool consumed = false;
     while (c->in.len - off >= 4) {
         uint32_t flen;
         memcpy(&flen, c->in.p + off, 4);
         if (flen < 5 || flen > TSDB_MAX_FRAME)
-            return false;
-        if (c->in.len - off < 4 + (size_t)flen) {
-            /* make room for the whole frame up front */
-            if (buf_reserve(&c->in, 4 + (size_t)flen - (c->in.len - off)) != 0)
-                return false;
+            return -1;
+        size_t need = 4 + (size_t)flen;
+        if (c->in.len - off < need) {
+            /* make room for the whole frame up front: exactly, for a large one, which request memory counts */
+            if (off) {
+                memmove(c->in.p, c->in.p + off, c->in.len - off);
+                c->in.len -= off;
+                off = 0;
+            }
+            if (need > c->in.cap) {
+                if (need > IN_KEEP) {
+                    size_t held = atomic_load_explicit(&req_held, memory_order_relaxed) - c->in_charged;
+                    if (held && held + need > req_budget) {
+                        rc = 1;
+                        break;
+                    }
+                    uint8_t *p = realloc(c->in.p, need);
+                    if (!p)
+                        return -1;
+                    c->in.p = p;
+                    c->in.cap = need;
+                } else if (buf_reserve(&c->in, need - c->in.len) != 0) {
+                    return -1;
+                }
+                in_account(c);
+            }
             break;
         }
         req *r = calloc(1, sizeof *r);
         if (!r)
-            return false;
+            return -1;
         r->c = c;
         memcpy(&r->id, c->in.p + off + 4, 4);
         r->op = c->in.p[off + 8];
@@ -1289,19 +1508,26 @@ static bool parse(conn *c)
         r->payload = malloc(r->len ? r->len : 1);
         if (!r->payload) {
             free(r);
-            return false;
+            return -1;
         }
         memcpy(r->payload, c->in.p + off + 9, r->len);
+        atomic_fetch_add_explicit(&req_held, REQ_COST(r), memory_order_relaxed);
+        c->q_bytes += REQ_COST(r);
         if (c->q_tail)
             c->q_tail->next = r;
         else
             c->q_head = r;
         c->q_tail = r;
-        off += 4 + (size_t)flen;
+        off += need;
+        consumed = true;
     }
-    memmove(c->in.p, c->in.p + off, c->in.len - off);
-    c->in.len -= off;
-    return true;
+    if (off) {
+        memmove(c->in.p, c->in.p + off, c->in.len - off);
+        c->in.len -= off;
+    }
+    /* the deadline runs from the first byte of each frame */
+    c->frame_t0 = c->in.len == 0 ? 0 : consumed || !c->frame_t0 ? mono_s() : c->frame_t0;
+    return rc;
 }
 
 /* A recv finished: res bytes arrived (0: end of stream), or -errno. */
@@ -1322,14 +1548,63 @@ static void on_recv(conn *c, ssize_t res)
         return;
     }
     c->in.len += (size_t)res;
-    if (!parse(c)) {
+    int pr = parse(c);
+    if (pr < 0) {
         if (getenv("TSDBD_DEBUG"))
             fprintf(stderr, "tsdbd: connection %d: protocol error\n", c->fd);
         conn_close(c);
         return;
     }
+    if (pr > 0)
+        park(c, true);
+    in_shrink(c); /* a large frame's buffer goes once the frame is parsed */
     dispatch(c);
     submit_recv(c);
+}
+
+/* Reads again from parked connections while request memory allows: each at most once a call (one that still
+ * cannot have its frame's buffer goes back to the end). */
+static void unpark_some(void)
+{
+    conn *last = park_tail;
+    while (park_head && atomic_load_explicit(&req_held, memory_order_relaxed) < req_budget) {
+        conn *c = park_head;
+        bool frame = c->park_frame, end = c == last;
+        unpark(c);
+        int pr = frame ? parse(c) : 0;
+        if (pr < 0) {
+            conn_close(c);
+        } else {
+            if (pr > 0)
+                park(c, true);
+            dispatch(c);
+            submit_recv(c);
+        }
+        if (end)
+            break;
+    }
+}
+
+/* Once a second: closes connections whose frame was started frame_timeout_s ago and is still incomplete while
+ * the server waits for its bytes (not one parked or held back by its own pipeline). */
+static void on_tick(void)
+{
+    uint64_t v;
+    if (read(tick_fd, &v, 8) < 0 && errno != EAGAIN)
+        perror("tsdbd: timerfd");
+    int64_t now = mono_s();
+    static int64_t logged;
+    for (conn *c = conns, *next; c; c = next) {
+        next = c->next;
+        if (c->frame_t0 && c->recv_inflight && !c->closed && now - c->frame_t0 > frame_timeout_s) {
+            if (logged != now) {
+                logged = now;
+                fprintf(stderr, "tsdbd: connection closed: a frame incomplete after %d s\n", frame_timeout_s);
+            }
+            conn_close(c);
+        }
+    }
+    unpark_some();
 }
 
 /* A send finished: res bytes went out, or -errno. */
@@ -1441,11 +1716,15 @@ static void on_wake(void)
             continue;
         }
         submit_send(c);
-        if (batch[i].done)
+        if (batch[i].done) {
             dispatch(c);
+            submit_recv(c); /* its pipeline may have room again */
+        }
         finish_if_drained(c);
     }
     free(batch);
+    if (park_head)
+        unpark_some();
 }
 
 #ifndef TSDBD_NO_URING
@@ -1454,6 +1733,9 @@ static void uring_loop(void)
     struct io_uring_sqe *sqe = sqe_get();
     io_uring_prep_poll_multishot(sqe, wake_fd, POLLIN);
     io_uring_sqe_set_data(sqe, &wake_ev);
+    sqe = sqe_get();
+    io_uring_prep_poll_multishot(sqe, tick_fd, POLLIN);
+    io_uring_sqe_set_data(sqe, &tick_ev);
     while (!stopping) {
         io_uring_submit_and_wait(&ring, 1);
         struct io_uring_cqe *cqe;
@@ -1469,6 +1751,14 @@ static void uring_loop(void)
                     struct io_uring_sqe *s2 = sqe_get();
                     io_uring_prep_poll_multishot(s2, wake_fd, POLLIN);
                     io_uring_sqe_set_data(s2, &wake_ev);
+                }
+                break;
+            case EV_TICK:
+                on_tick();
+                if (!(cqe->flags & IORING_CQE_F_MORE)) {
+                    struct io_uring_sqe *s2 = sqe_get();
+                    io_uring_prep_poll_multishot(s2, tick_fd, POLLIN);
+                    io_uring_sqe_set_data(s2, &tick_ev);
                 }
                 break;
             case EV_RECV: on_recv(e->c, cqe->res); break;
@@ -1535,6 +1825,10 @@ static void ep_loop(void)
             int fd = evs[i].data.fd;
             if (fd == wake_fd) {
                 on_wake();
+                continue;
+            }
+            if (fd == tick_fd) {
+                on_tick();
                 continue;
             }
             conn *c = (size_t)fd < fd_conn_cap ? fd_conn[fd] : NULL;
@@ -1668,12 +1962,25 @@ static int listen_on(const char *addr, int *port_p)
  * all of it or none (a half-written pid would read as another server's, and the harness would refuse a good one). A stale file is removed at startup: whoever finds one now knows this server wrote it. */
 static int write_port_file(const char *path, int port, int mport)
 {
+    /* A name nobody can guess, created new (mkostemp: O_EXCL, so never through a link planted there): the directory
+     * may be shared. */
     char tmp[4096];
-    if (snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid()) >= (int)sizeof tmp)
+    if (snprintf(tmp, sizeof tmp, "%s.tmp.XXXXXX", path) >= (int)sizeof tmp)
         return -1;
-    FILE *f = fopen(tmp, "w");
-    if (!f)
+    int fd = mkostemp(tmp, O_CLOEXEC);
+    if (fd >= 0 && fchmod(fd, 0644) != 0) {
+        close(fd);
+        unlink(tmp);
         return -1;
+    }
+    FILE *f = fd < 0 ? NULL : fdopen(fd, "w");
+    if (!f) {
+        if (fd >= 0) {
+            close(fd);
+            unlink(tmp);
+        }
+        return -1;
+    }
     int ok = fprintf(f, "%d %d", port, (int)getpid()) > 0;
     if (mport)
         ok = (fprintf(f, " %d", mport) > 0 && ok);
@@ -1685,6 +1992,19 @@ static int write_port_file(const char *path, int port, int mport)
         return -1;
     }
     return 0;
+}
+
+/* A numeric flag: all of `s` a decimal integer within [lo, hi], or a message and exit status 2. */
+static long long num_arg(const char *flag, const char *s, long long lo, long long hi)
+{
+    char *end;
+    errno = 0;
+    long long v = strtoll(s, &end, 10);
+    if (!*s || *end || errno == ERANGE || v < lo || v > hi) {
+        fprintf(stderr, "tsdbd: --%s %s: expected a whole number from %lld to %lld\n", flag, s, lo, hi);
+        exit(2);
+    }
+    return v;
 }
 
 int main(int argc, char **argv)
@@ -1706,17 +2026,22 @@ int main(int argc, char **argv)
                                    {"metrics-port", required_argument, 0, 'M'},
                                    {"metrics-bind", required_argument, 0, 'b'},
                                    {"port-file", required_argument, 0, 'Q'},
+                                   {"max-request-memory", required_argument, 0, 'X'},
+                                   {"frame-timeout", required_argument, 0, 'D'},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0;
     const char *metrics_addr = NULL;
+    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page > 0 && (size_t)pages / 8 * (size_t)page > req_budget)
+        req_budget = (size_t)pages / 8 * (size_t)page; /* 1024 MB slowed 32 connections loading at full speed */
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
         case 'd': dir = optarg; break;
         case 'l': addr = optarg; break;
-        case 'p': port = atoi(optarg); break; /* 0: any free port, told by --port-file and the banner */
+        case 'p': port = (int)num_arg("port", optarg, 0, 65535); break; /* 0: any free port, told by --port-file and the banner */
         case 'Q': port_file = optarg; break;
-        case 'w': nworkers = atoi(optarg); break;
-        case 's': o.wal_sync_ms = atoi(optarg); break;
+        case 'w': nworkers = (int)num_arg("workers", optarg, 1, 4096); break;
+        case 's': o.wal_sync_ms = (int)num_arg("wal-sync-ms", optarg, -1, 3600000); break; /* -1: no WAL */
         case 'F': o.fsync = 0; break;
         case 'V': o.verify_checksums = 1; break;
         case 'M': {
@@ -1725,22 +2050,22 @@ int main(int argc, char **argv)
                 metrics_port = 0;
                 break;
             }
-            char *end;
-            long mp = strtol(optarg, &end, 10);
-            if (!*optarg || *end || mp < 1 || mp > 65535)
-                goto usage;
             metrics_on = 1;
-            metrics_port = (int)mp;
+            metrics_port = (int)num_arg("metrics-port", optarg, 1, 65535);
             break;
         }
         case 'b': metrics_addr = optarg; break;
         case 'r': o.read_only = 1; break;
         case 'f': o.follow = 1; break;
-        case 'R': o.refresh_ms = atoi(optarg); break;
-        case 'm': max_conns = (size_t)atol(optarg); break;
-        case 'B': o.wal_max_batch_rows = (size_t)atol(optarg); break;
-        case 'P': o.partition_ms = atoll(optarg); break; /* only when the database is created */
-        case 'T': send_timeout_s = atoi(optarg); break;
+        case 'R': o.refresh_ms = (int)num_arg("refresh-ms", optarg, 1, 3600000); break;
+        case 'm': max_conns = (size_t)num_arg("max-connections", optarg, 1, 10000000); break;
+        case 'B': o.wal_max_batch_rows = (size_t)num_arg("wal-max-batch-rows", optarg, 1, (long long)1 << 32); break;
+        case 'P': /* only when the database is created */
+            o.partition_ms = num_arg("partition-ms", optarg, 1, (long long)1 << 50);
+            break;
+        case 'T': send_timeout_s = (int)num_arg("send-timeout", optarg, 1, 86400); break;
+        case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
+        case 'X': req_budget = (size_t)num_arg("max-request-memory", optarg, 1, (long long)1 << 24) << 20; break;
         case 'I':
             if (strcmp(optarg, "auto") == 0)
                 io = IO_AUTO;
@@ -1761,7 +2086,8 @@ int main(int argc, char **argv)
                         "             [--wal-sync-ms MS]\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
                         "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"
-                        "             [--metrics-port N|auto [--metrics-bind ADDR]]\n",
+                        "             [--metrics-port N|auto [--metrics-bind ADDR]]\n"
+                        "             [--max-request-memory MB] [--frame-timeout 60]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
@@ -1818,9 +2144,16 @@ int main(int argc, char **argv)
         io = rc < 0 ? IO_EPOLL : IO_URING;
     }
 #endif
+    tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    struct itimerspec second = {{1, 0}, {1, 0}};
+    if (tick_fd < 0 || timerfd_settime(tick_fd, 0, &second, NULL) != 0) {
+        fprintf(stderr, "tsdbd: timerfd: %s\n", strerror(errno));
+        return 1;
+    }
     if (io == IO_EPOLL) {
-        struct epoll_event e = {.events = EPOLLIN, .data.fd = wake_fd};
-        if ((epfd = epoll_create1(EPOLL_CLOEXEC)) < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, wake_fd, &e) != 0) {
+        struct epoll_event e = {.events = EPOLLIN, .data.fd = wake_fd}, t = {.events = EPOLLIN, .data.fd = tick_fd};
+        if ((epfd = epoll_create1(EPOLL_CLOEXEC)) < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, wake_fd, &e) != 0 ||
+            epoll_ctl(epfd, EPOLL_CTL_ADD, tick_fd, &t) != 0) {
             fprintf(stderr, "tsdbd: epoll: %s\n", strerror(errno));
             return 1;
         }
@@ -1837,7 +2170,9 @@ int main(int argc, char **argv)
                           .io = io == IO_URING ? "io_uring" : "epoll",
                           .role = o.follow ? "follower" : o.read_only ? "read-only" : "writer",
                           .max_conns = max_conns,
-                          .workers = workers_now};
+                          .workers = workers_now,
+                          .request_memory = request_memory_now,
+                          .request_memory_limit = req_budget};
         int mrc = metrics_start(&mc);
         if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
             fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));
@@ -1845,13 +2180,18 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "tsdbd: metrics on %s:%d\n", metrics_addr ? metrics_addr : addr, metrics_port);
     }
-    for (int i = 0; i < nworkers; i++)
-        pthread_create(&workers[i], NULL, worker_main, NULL);
-
-    pthread_t acceptor;
-    pthread_create(&acceptor, NULL, accept_main, &lfd);
-    pthread_t failwatch;
-    pthread_create(&failwatch, NULL, failwatch_main, &lfd);
+    pthread_t acceptor, failwatch;
+    for (int i = 0; i < nworkers; i++) {
+        if ((rc = pthread_create(&workers[i], NULL, worker_main, NULL)) != 0) {
+            fprintf(stderr, "tsdbd: cannot start worker %d: %s\n", i + 1, strerror(rc));
+            return 1;
+        }
+    }
+    if ((rc = pthread_create(&acceptor, NULL, accept_main, &lfd)) != 0 ||
+        (rc = pthread_create(&failwatch, NULL, failwatch_main, &lfd)) != 0) {
+        fprintf(stderr, "tsdbd: cannot start a thread: %s\n", strerror(rc));
+        return 1;
+    }
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
             max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll");
