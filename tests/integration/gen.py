@@ -23,7 +23,9 @@ SPECIAL_F32 = [0x7F800000, 0xFF800000, 0x80000000, 0x00000000, 0x7FC00001, 0xFFC
                0xFFC01001, 0x00000001, 0x007FFFFF, 0x7F7FFFFF, 0xFF7FFFFF, 0x7FE00000, 0x7FC00000, 0xFFC00000]
 SPECIAL_F64 = [0x7FF0000000000000, 0xFFF0000000000000, 0x8000000000000000, 0x0000000000000000, 0x7FF8000000000001,
                0xFFF8123456789ABC, 0x7FF8000000001000, 0x7FF8000000001002, 0xFFF8000000001001, 0x0000000000000001,
-               0x7FEFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF, 0x7FF0000000000001, 0x7FF8000000000000]
+               0x7FF0000000000001, 0x7FF8000000000000]
+# the largest doubles make a sum overflow depending on the order of the additions: rare, and the model skips those sums
+HUGE_F64 = [0x7FEFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF]
 SPECIAL_I64 = [I64_MAX, I64_MIN + 1, 0, -1, 1, I64_MAX - 1, 1 << 53, -(1 << 53) - 1]
 
 
@@ -50,11 +52,11 @@ def value_token(rng, ty, i, nulls=True, special=True):
     r = rng.random()
     if nulls and r < 0.08:
         return "N"
-    if special and r < 0.12:
+    if special and r < 0.105:
         if ty == "float32":
             return "%08x" % rng.choice(SPECIAL_F32)
         if ty == "float64":
-            return "%016x" % rng.choice(SPECIAL_F64)
+            return "%016x" % rng.choice(HUGE_F64 if r < 0.0805 else SPECIAL_F64)
         if ty == "int64":
             return str(rng.choice(SPECIAL_I64))
     if ty == "float32":
@@ -385,6 +387,8 @@ def bucket_lines(ty, groups, order, limit):
             continue
         known = [v for _, v in items if v != "N"]
         f = [start, len(known), None, None, None, None, None, None]
+        if ty in ("float32", "float64") and known:
+            f[2:5] = float_aggregates(ty, known)
         if ty in ("int64", "bool") and known:
             vals = [int(v) for v in known]
             s = max(I64_MIN, min(I64_MAX, sum(vals)))
@@ -395,6 +399,27 @@ def bucket_lines(ty, groups, order, limit):
     if limit:
         out = out[:limit]
     return out
+
+
+def float_aggregates(ty, known):
+    """Expected [sum, min, max] of known float tokens as ("sum", x, tolerance) / ("val", x) checks, None to skip.
+    Sums are checked to 1e-9 of the sum of magnitudes (the server adds in a different order for the memtable, parts
+    and merged parts); NaN and infinities exactly; not at all where an order could overflow a double."""
+    import math
+    vals = [f32val(int(t, 16)) if ty == "float32" else f64val(int(t, 16)) for t in known]
+    nan = any(v != v for v in vals)
+    real = [v for v in vals if v == v]
+    pos, neg = any(v == math.inf for v in real), any(v == -math.inf for v in real)
+    mag = sum(abs(v) for v in real if abs(v) != math.inf)
+    if nan or (pos and neg):
+        s = ("sum", math.nan, 0)
+    elif pos or neg:
+        s = ("sum", math.inf if pos else -math.inf, 0)
+    elif mag > 1e300:
+        s = None
+    else:
+        s = ("sum", math.fsum(real), 1e-9 * mag)
+    return [s, ("val", min(real) if real else math.nan), ("val", max(real) if real else math.nan)]
 
 
 def parse_blocks(text):
@@ -415,7 +440,21 @@ def match_line(exp, got):
     g = got.split("\t")
     if len(g) != len(exp):
         return False
-    return all(e is None or str(e) == x for e, x in zip(exp, g))
+    return all(e is None or field_ok(e, x) for e, x in zip(exp, g))
+
+
+def field_ok(e, x):
+    import math
+    if isinstance(e, tuple):
+        v = f64val(int(x, 16))
+        if e[0] == "val":
+            return (v != v) if e[1] != e[1] else v == e[1]
+        if e[1] != e[1]:
+            return v != v
+        if abs(e[1]) == math.inf:
+            return v == e[1]
+        return v == v and abs(v - e[1]) <= e[2]
+    return str(e) == x
 
 
 def compare_oracle(text, expected, limit=8):

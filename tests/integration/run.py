@@ -197,13 +197,14 @@ class Ctx:
 
     def missing(self):
         need = [self.tsdbd, self.tsdb, self.itc, Path(self.cmd["rust"][0]), Path(self.cmd["python"][0]),
-                ROOT / "build/integ/java/Itj.class"]
+                BUILD / "integ/java/Itj.class"]
         return [str(p) for p in need if not p.exists()]
 
 
-def run_client(ctx, lang, args, out, timeout=240):
+def run_client(ctx, lang, args, out, timeout=None):
     """Runs one client program; stdout to the file out (stderr next to it). Returns (rc, seconds)."""
     out = Path(out)
+    timeout = timeout or ctx.args.timeout
     t0 = time.time()
     with open(out, "wb") as so, open(str(out) + ".err", "wb") as se:
         p = spawn(ctx.cmd[lang] + [str(a) for a in args], stdin=subprocess.DEVNULL, stdout=so, stderr=se)
@@ -216,7 +217,7 @@ def run_client(ctx, lang, args, out, timeout=240):
     return rc, time.time() - t0
 
 
-def run_all(ctx, jobs, timeout=240):
+def run_all(ctx, jobs, timeout=None):
     """jobs: {key: (lang, args, outfile)} run concurrently. Returns {key: (rc, secs)}."""
     with concurrent.futures.ThreadPoolExecutor(len(jobs)) as ex:
         futs = {k: ex.submit(run_client, ctx, lang, args, out, timeout) for k, (lang, args, out) in jobs.items()}
@@ -262,8 +263,27 @@ def drop_nan_sums(text):
     return "\n".join(out)
 
 
-def diff_outputs(a_name, a, b_name, b, limit=3, nan_sums=True):
-    """Differences between two canonical outputs, as strings (the first few queries)."""
+def drop_float_sums(text, types):
+    """Bucket lines of float series without their sum: the same rows added in another order (memtable, parts,
+    merged parts, and tsdbd merges in the background while the clients read) round differently in the last bits.
+    The model checks the sums to 1e-9 instead. A min or max of -0.0 and +0.0 is whichever was met first: both
+    read as +0.0."""
+    out = []
+    for blk, lines in gen.parse_blocks(text):
+        ty = types.get(blk.split(" ")[1])
+        if blk.split(" ")[0] in ("agg", "grp", "bnd") and ty in ("float32", "float64"):
+            lines = [("\t".join(f[:2] + ["*"] + [("0" * 16 if int(x, 16) << 1 & (2**64 - 1) == 0 else x) for x in f[3:5]]
+                              + f[5:]) if len(f := ln.split("\t")) == 8 else ln) for ln in lines]
+        out.append("## " + blk)
+        out.extend(lines)
+    return "\n".join(out) + "\n"
+
+
+def diff_outputs(a_name, a, b_name, b, limit=3, nan_sums=True, types=None):
+    """Differences between two canonical outputs, as strings (the first few queries). types: series -> type; with
+    it, the sums of float series are left out (answers given by different layouts of the same rows)."""
+    if types:
+        a, b = drop_float_sums(a, types), drop_float_sums(b, types)
     if nan_sums:
         a, b = drop_nan_sums(a), drop_nan_sums(b)
     if a == b:
@@ -295,7 +315,7 @@ def write_queries(path, model, only_prefixes=None):
     return qs
 
 
-def read_phase(ctx, F, d, tag, port, qfile, expected, langs=LANGS, reference=None, check_oracle=True):
+def read_phase(ctx, F, d, tag, port, qfile, expected, types, langs=LANGS, reference=None, check_oracle=True):
     """All langs read qfile from the server at port; compares them with each other and with the model.
     Returns {lang: text}."""
     t0 = time.time()
@@ -311,14 +331,14 @@ def read_phase(ctx, F, d, tag, port, qfile, expected, langs=LANGS, reference=Non
     ref_lang = next(iter(texts), None)
     for l, t in texts.items():
         if l != ref_lang:
-            for m in diff_outputs(ref_lang, texts[ref_lang], l, t):
+            for m in diff_outputs(ref_lang, texts[ref_lang], l, t, types=types):
                 F.add("%s: clients disagree: %s" % (tag, m))
     if check_oracle and texts:
         for l in ([ref_lang] if all(t == texts[ref_lang] for t in texts.values()) else list(texts)):
             for m in gen.compare_oracle(texts[l], expected):
                 F.add("%s: %s differs from the model: %s" % (tag, l, m))
     if reference is not None and ref_lang:
-        for m in diff_outputs("earlier", reference, ref_lang, texts[ref_lang]):
+        for m in diff_outputs("earlier", reference, ref_lang, texts[ref_lang], types=types):
             F.add("%s: answers changed: %s" % (tag, m))
     F.note("%s: %d clients read %d queries in %.1f s" % (tag, len(texts), len(expected), time.time() - t0))
     return texts
@@ -438,6 +458,8 @@ def cli_expected(q, ty, lines):
         avg = "%.9g" % (dv[0] / cnt if cnt else 0.0)
         if cnt and dv[0] != dv[0]:
             avg = "-nan" if d[0] >> 63 else "nan"
+        if ty in ("float32", "float64"):  # the sum depends on the order of the additions (a merge may have run)
+            sums[0] = avg = "*"
         out.append("%s\t%d\t%s\t%s\t%s\t%s" % (fmt_time(int(s)), cnt, sums[0], sums[1], sums[2], avg))
     return out
 
@@ -464,6 +486,11 @@ def cli_check(ctx, F, dbdir, model, queries, text, d):
             ty = model.types[q.split(" ")[1]]
             want = cli_expected(q, ty, lines)
             got = p.stdout.decode("utf-8", "replace").split("\n")[:-1] if p.returncode == 0 else None
+            if got and q.split(" ")[0] != "raw" and ty in ("float32", "float64"):
+                got = [("\t".join(f[:2] + ["*"] + [x.replace("-0", "0") if x == "-0" else x for x in f[3:5]] + ["*"])
+                        if len(f := ln.split("\t")) == 6 and f[1].isdigit() else ln) for ln in got]
+                want = [("\t".join(f[:2] + ["*"] + [x.replace("-0", "0") if x == "-0" else x for x in f[3:5]] + ["*"])
+                         if len(f := ln.split("\t")) == 6 and f[1].isdigit() else ln) for ln in want or []] if want else want
             if q.split(" ")[0] != "raw" and want and got:  # the sign of a NaN sum is as unspecified as its payload
                 want, got = [x.replace("-nan", "nan") for x in want], [x.replace("-nan", "nan") for x in got]
             if want != got:
@@ -481,6 +508,7 @@ def cli_check(ctx, F, dbdir, model, queries, text, d):
 def scenario_matrix(ctx, F, io, d):
     model = gen.Model()
     scripts = gen_scripts(ctx, model, d, 1)
+    scripts2 = gen_scripts(ctx, model, d, 2, seedoff=500)  # corrections to everything, written after a flush
     qfile = d / "queries.txt"
     queries = write_queries(qfile, model)
     expected = gen.expected_blocks(queries, model)
@@ -488,13 +516,14 @@ def scenario_matrix(ctx, F, io, d):
     db = d / "db"
     srv = Server(ctx, db, d / "tsdbd.log", io).start()
     try:
-        if write_phase(ctx, F, d, "write", srv.port, scripts):
-            first = read_phase(ctx, F, d, "live", srv.port, qfile, expected)
+        if (write_phase(ctx, F, d, "write", srv.port, scripts) and admin(ctx, F, d, srv.port, "flush")
+                and write_phase(ctx, F, d, "write2", srv.port, scripts2)):
+            first = read_phase(ctx, F, d, "live", srv.port, qfile, expected, model.types)
             ref = first.get("c")
             if admin(ctx, F, d, srv.port, "flush"):
-                read_phase(ctx, F, d, "flushed", srv.port, qfile, expected, reference=ref)
+                read_phase(ctx, F, d, "flushed", srv.port, qfile, expected, model.types, reference=ref)
             if admin(ctx, F, d, srv.port, "optimize"):
-                final = read_phase(ctx, F, d, "optimized", srv.port, qfile, expected, reference=ref)
+                final = read_phase(ctx, F, d, "optimized", srv.port, qfile, expected, model.types, reference=ref)
                 ref = final.get("c", ref)
     finally:
         rc = srv.stop()
@@ -520,10 +549,10 @@ def scenario_follower(ctx, F, io, d):
         admin(ctx, F, d, prim.port, "flush")
         foll = Server(ctx, db, d / "follower.log", io, follow=True).start()
         wait_caught_up(ctx, F, d, foll.port, prim.port, m1, "wave 1")
-        p1 = read_phase(ctx, F, d, "primary-1", prim.port, q1, e1)
-        f1 = read_phase(ctx, F, d, "follower-1", foll.port, q1, e1)
+        p1 = read_phase(ctx, F, d, "primary-1", prim.port, q1, e1, m1.types)
+        f1 = read_phase(ctx, F, d, "follower-1", foll.port, q1, e1, m1.types)
         if p1.get("c") and f1.get("c"):
-            for m in diff_outputs("primary", p1["c"], "follower", f1["c"]):
+            for m in diff_outputs("primary", p1["c"], "follower", f1["c"], types=m1.types):
                 F.add("wave 1: follower and primary differ: " + m)
         # a follower is read-only
         wp = d / "write-to-follower.txt"
@@ -540,10 +569,10 @@ def scenario_follower(ctx, F, io, d):
         queries2 = write_queries(q2, model)
         e2 = gen.expected_blocks(queries2, model)
         wait_caught_up(ctx, F, d, foll.port, prim.port, model, "wave 2")
-        p2 = read_phase(ctx, F, d, "primary-2", prim.port, q2, e2)
-        f2 = read_phase(ctx, F, d, "follower-2", foll.port, q2, e2)
+        p2 = read_phase(ctx, F, d, "primary-2", prim.port, q2, e2, model.types)
+        f2 = read_phase(ctx, F, d, "follower-2", foll.port, q2, e2, model.types)
         if p2.get("c") and f2.get("c"):
-            for m in diff_outputs("primary", p2["c"], "follower", f2["c"]):
+            for m in diff_outputs("primary", p2["c"], "follower", f2["c"], types=model.types):
                 F.add("wave 2: follower and primary differ: " + m)
     finally:
         for s, name in ((foll, "follower"), (prim, "primary")):
@@ -647,7 +676,7 @@ def scenario_cli(ctx, F, io, d):
     expected = gen.expected_blocks(queries, model)
     srv = Server(ctx, db, d / "tsdbd.log", io).start()
     try:
-        out = read_phase(ctx, F, d, "csv", srv.port, qfile, expected)
+        out = read_phase(ctx, F, d, "csv", srv.port, qfile, expected, model.types)
     finally:
         rc = srv.stop()
         if rc != 0:
@@ -851,6 +880,7 @@ def main():
     ap.add_argument("--seed", type=int, default=int(os.environ.get("INTEG_SEED", "1")))
     ap.add_argument("--logs", default=str(BUILD / "integ/logs"))
     ap.add_argument("--work", default=os.environ.get("TMPDIR", "/tmp"))
+    ap.add_argument("--timeout", type=int, default=240, help="seconds a client program may take (default 240)")
     ap.add_argument("--keep", action="store_true", help="keep the data directories")
     ap.add_argument("--bin-dir", help="directory with tsdbd and tsdb (default build/; the dist build for dist runs)")
     ap.add_argument("--itc", help="the C client program (default build/integ/itc)")
@@ -922,10 +952,10 @@ def main():
                 lines.append("[%s %s] %s" % (s, io, m.splitlines()[0][:400]))
     print("\n".join(lines))
     Path(args.logs, "summary.txt").write_text("\n".join(lines) + "\n")
-    if not args.keep:
+    if not args.keep and not nfail:
         shutil.rmtree(ctx.work, ignore_errors=True)
     else:
-        print("data kept in " + str(ctx.work))
+        print("data directories kept in " + str(ctx.work))
     return 1 if nfail else 0
 
 

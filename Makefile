@@ -207,9 +207,9 @@ hooks:
 INTEG      := $(B)/integ
 INTEG_ARGS ?=
 
-$(INTEG)/itc: tests/integration/c/itc.c client/tsdb_client.h $(CLIB)
+$(INTEG)/itc: tests/integration/c/itc.c client/tsdb_client.h $(B)/libtsdbclient.a
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(B)/libtsdbclient.a $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 integ-rust:
 	cd tests/integration/rust && cargo build --release --locked --target-dir $(abspath $(INTEG))/rust
