@@ -1,0 +1,748 @@
+package ai.intellistream.tsdb.embedded;
+
+import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.Column;
+import ai.intellistream.tsdb.Group;
+import ai.intellistream.tsdb.Order;
+import ai.intellistream.tsdb.Points;
+import ai.intellistream.tsdb.QueryStats;
+import ai.intellistream.tsdb.Stats;
+import ai.intellistream.tsdb.Status;
+import ai.intellistream.tsdb.TsdbException;
+import ai.intellistream.tsdb.Unit;
+import ai.intellistream.tsdb.ValuePoints;
+import ai.intellistream.tsdb.ValueType;
+
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.List;
+import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/** The embedded database: the TCP client's tests, plus what only an in-process binding can get wrong. */
+class EmbeddedDbTest {
+    static final long T0 = 1_704_067_200_000L; /* 2024-01-01 UTC */
+
+    @TempDir
+    Path tmp;
+    EmbeddedDb db;
+
+    @BeforeEach
+    void open() throws TsdbException {
+        db = EmbeddedDb.open(tmp.resolve("db").toString(), new EmbeddedOptions().fsync(false).walSyncMs(-1));
+    }
+
+    @AfterEach
+    void close() throws TsdbException {
+        db.close();
+        assertEquals(0, Native.OUTSTANDING.get(), "every array the library returned is freed");
+    }
+
+    static int status(ThrowingRunnable r) {
+        return assertThrows(TsdbException.class, r::run).status();
+    }
+
+    interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
+    @Test
+    void libraryAndOptions() throws TsdbException {
+        assertTrue(EmbeddedDb.librarySource().length() > 0);
+        assertTrue(EmbeddedDb.simdLevel().length() > 0);
+        assertEquals("not found", EmbeddedDb.strerror(Status.ERR_NOTFOUND).toLowerCase().replace("series ", ""),
+                "the engine's text");
+        assertTrue(new EmbeddedOptions().toString().contains("granuleRows=8192"));
+        assertTrue(db.isOpen());
+        assertTrue(db.toString().contains("db"));
+    }
+
+    @Test
+    void series() throws TsdbException {
+        int a = db.series("a");
+        assertEquals(a, db.series("a"));
+        assertEquals(a, db.series("a", false));
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.series("missing", false)));
+        assertEquals("a", db.seriesName(a));
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.seriesName(12345)));
+        assertThrows(IllegalArgumentException.class, () -> db.series(""));
+        assertEquals(1, db.seriesCount());
+        assertEquals(1, db.volumeCount());
+        assertEquals(db.volumePath(0), db.seriesPath(a));
+        int b = db.seriesAt("b", tmp.resolve("vol2").toString());
+        assertEquals(2, db.volumeCount());
+        assertTrue(db.seriesPath(b).endsWith("vol2"));
+        assertEquals(ValueType.FLOAT32, db.seriesType(b));
+    }
+
+    @Test
+    void insertAndStream() throws TsdbException {
+        int s = db.series("x");
+        int n = 100_000; /* more than CHUNK: several chunks */
+        long[] ts = new long[n];
+        float[] v = new float[n];
+        for (int i = 0; i < n; i++) {
+            ts[n - 1 - i] = T0 + i * 1000L; /* any order */
+            v[n - 1 - i] = i * 0.5f;
+        }
+        db.insert(s, ts, v);
+        Points p = db.queryPoints(s, Long.MIN_VALUE, Long.MAX_VALUE);
+        assertEquals(n, p.size());
+        for (int i = 0; i < n; i++) {
+            assertEquals(T0 + i * 1000L, p.timestamp(i));
+            assertEquals(i * 0.5f, p.value(i));
+        }
+        long[] seen = {0, 0};
+        long[] last = {Long.MIN_VALUE};
+        assertTrue(db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, k) -> {
+            assertTrue(k <= EmbeddedDb.CHUNK && k > 0);
+            for (int i = 0; i < k; i++) {
+                assertTrue(t[i] > last[0]);
+                last[0] = t[i];
+                assertEquals((t[i] - T0) / 1000 * 0.5f, x[i]);
+            }
+            seen[0] += k;
+            seen[1]++;
+            return true;
+        }));
+        assertEquals(n, seen[0]);
+        assertEquals((n + EmbeddedDb.CHUNK - 1) / EmbeddedDb.CHUNK, seen[1], "full chunks as over TCP");
+        /* stopping */
+        AtomicInteger calls = new AtomicInteger();
+        assertFalse(db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, k) -> calls.incrementAndGet() > 5));
+        assertEquals(1, calls.get());
+        /* empty */
+        assertTrue(db.queryRaw(s, 0, 1, (t, x, k) -> {
+            throw new AssertionError("no rows");
+        }));
+        assertEquals(0, db.queryPoints(s, 0, 1).size());
+    }
+
+    @Test
+    void offsetsManySeriesAndEmptyInserts() throws TsdbException {
+        int a = db.series("a");
+        int b = db.series("b");
+        long[] ts = {T0, T0 + 1, T0 + 2, T0 + 3};
+        float[] v = {1, 2, 3, 4};
+        db.insert(a, ts, v, 1, 2);
+        db.insert(new int[] {a, b, a, b}, ts, v, 0, 4);
+        db.insert(a, new long[0], new float[0]);
+        db.insertAsync(a, new long[] {T0 + 9}, new float[] {9});
+        db.await();
+        assertEquals(0, db.pending());
+        assertThrows(IndexOutOfBoundsException.class, () -> db.insert(a, ts, v, 3, 2));
+        assertArrayEquals(new long[] {T0, T0 + 1, T0 + 2, T0 + 9}, db.queryPoints(a, T0, T0 + 10).timestamps());
+        assertArrayEquals(new float[] {1, 2, 3, 9}, db.queryPoints(a, T0, T0 + 10).values());
+        assertArrayEquals(new float[] {2, 4}, db.queryPoints(b, T0, T0 + 10).values());
+    }
+
+    @Test
+    void lastWriteWinsAndCorrections() throws TsdbException {
+        int s = db.series("x");
+        db.insert(s, new long[] {T0, T0 + 1, T0}, new float[] {1, 2, 3}); /* later row of a batch wins */
+        db.append(s, T0 + 1, 20);
+        db.flush();
+        db.insert(s, new long[] {T0 + 1}, new float[] {200});
+        assertArrayEquals(new float[] {3, 200}, db.queryPoints(s, T0, T0 + 2).values());
+        db.optimize();
+        assertArrayEquals(new float[] {3, 200}, db.queryPoints(s, T0, T0 + 2).values());
+        db.commit();
+    }
+
+    @Test
+    void descendingWithLimit() throws TsdbException {
+        int s = db.series("x");
+        long[] ts = new long[50];
+        float[] v = new float[50];
+        for (int i = 0; i < 50; i++) {
+            ts[i] = T0 + i;
+            v[i] = i;
+        }
+        db.insert(s, ts, v);
+        assertArrayEquals(new float[] {49, 48, 47}, db.queryPoints(s, T0, T0 + 50, Order.DESC, 3).values());
+        assertArrayEquals(new float[] {0, 1}, db.queryPoints(s, T0, T0 + 50, Order.ASC, 2).values());
+        List<Float> got = new ArrayList<>();
+        db.queryRaw(s, T0, T0 + 50, Order.DESC, 4, (t, x, k) -> {
+            for (int i = 0; i < k; i++)
+                got.add(x[i]);
+            return true;
+        });
+        assertEquals(List.of(49f, 48f, 47f, 46f), got);
+        List<Bucket> b = db.queryAgg(s, T0, T0 + 50, 10, Order.DESC, 2);
+        assertEquals(2, b.size());
+        assertEquals(T0 + 40, b.get(0).start());
+        assertEquals(T0 + 30, b.get(1).start());
+        assertThrows(IllegalArgumentException.class, () -> db.queryPoints(s, T0, T0 + 1, Order.ASC, -1));
+    }
+
+    @Test
+    void everyTypeRoundTripsWithNulls() throws TsdbException {
+        BitSet nulls = new BitSet();
+        nulls.set(1);
+        nulls.set(3);
+        long[] ts = {T0, T0 + 1, T0 + 2, T0 + 3, T0 + 4};
+        Column[] cols = {
+            Column.ofFloats(1.5f, 0, Float.NaN, 4, Float.POSITIVE_INFINITY).withNulls(nulls),
+            Column.ofDoubles(1.5, 0, -0.0, 4, Double.NEGATIVE_INFINITY).withNulls(nulls),
+            Column.ofLongs(Long.MAX_VALUE, 0, -7, 4, Long.MIN_VALUE + 1).withNulls(nulls),
+            Column.ofBools(true, false, false, true, true).withNulls(nulls),
+            null,
+        };
+        int st = db.seriesCreate("state", ValueType.STATE);
+        int on = db.state(st, "on");
+        int off = db.state(st, "off");
+        assertEquals(on, db.state(st, "on"));
+        assertEquals(off, db.stateLookup(st, "off"));
+        assertEquals("on", db.stateName(st, on));
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.stateLookup(st, "nope")));
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.stateName(st, 999)));
+        cols[4] = Column.ofStates(on, off, off, on, off).withNulls(nulls);
+        for (Column c : cols) {
+            int s = c.type() == ValueType.STATE ? st : db.seriesCreate("t" + c.type(), c.type());
+            assertEquals(c.type(), db.seriesType(s));
+            db.insertSeriesValues(s, ts, c);
+            ValuePoints p = db.queryValues(s, T0, T0 + 10);
+            assertEquals(5, p.size());
+            assertArrayEquals(ts, p.timestamps());
+            assertEquals(c.type(), p.type());
+            for (int i = 0; i < 5; i++) {
+                assertEquals(c.isNull(i), p.values().isNull(i), c.type() + " null " + i);
+                if (!c.isNull(i))
+                    assertEquals(Double.doubleToRawLongBits(c.getDouble(i)),
+                            Double.doubleToRawLongBits(p.values().getDouble(i)), c.type() + " value " + i);
+            }
+            /* streamed, in DESC with a limit */
+            List<Long> seen = new ArrayList<>();
+            assertTrue(db.queryValues(s, T0, T0 + 10, Order.DESC, 3, (t, col, k) -> {
+                assertEquals(k, col.size());
+                for (int i = 0; i < k; i++) {
+                    seen.add(t[i]);
+                    assertEquals(c.isNull((int) (t[i] - T0)), col.isNull(i));
+                }
+                return true;
+            }));
+            assertEquals(List.of(T0 + 4, T0 + 3, T0 + 2), seen);
+        }
+        int f = db.series("f32");
+        assertEquals(Status.ERR_INVALID, status(() -> db.insertSeriesValues(f, ts, cols[1])), "type mismatch");
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesCreate("f32", ValueType.INT64)));
+        int i64 = db.seriesCreate("tINT64", ValueType.INT64);
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryPoints(i64, T0, T0 + 10)));
+    }
+
+    @Test
+    void manySeriesTypedInsertAndOffsets() throws TsdbException {
+        int a = db.seriesCreate("a", ValueType.FLOAT64);
+        int b = db.seriesCreate("b", ValueType.FLOAT64);
+        BitSet nulls = new BitSet();
+        nulls.set(2);
+        Column c = Column.ofDoubles(0, 1, 2, 3, 4, 5).withNulls(nulls);
+        long[] ts = {T0, T0, T0 + 1, T0 + 1, T0 + 2, T0 + 2};
+        db.insertValues(new int[] {a, b, a, b, a, b}, ts, c, 1, 5); /* the bitmap shifts with the offset */
+        ValuePoints pa = db.queryValues(a, T0, T0 + 10);
+        assertArrayEquals(new long[] {T0 + 1, T0 + 2}, pa.timestamps());
+        assertTrue(pa.values().isNull(0));
+        assertEquals(4.0, pa.values().getDouble(1));
+        ValuePoints pb = db.queryValues(b, T0, T0 + 10);
+        assertArrayEquals(new double[] {1, 3, 5}, pb.values().doubles());
+        assertFalse(pb.values().hasNulls());
+    }
+
+    @Test
+    void reservedValuesReadBackAsNull() throws TsdbException {
+        int f = db.seriesCreate("f", ValueType.FLOAT32);
+        int i = db.seriesCreate("i", ValueType.INT64);
+        db.insertSeriesValues(f, new long[] {T0, T0 + 1}, Column.ofFloats(Float.intBitsToFloat(0x7fc01001), 1));
+        db.insertSeriesValues(i, new long[] {T0}, Column.ofLongs(Long.MIN_VALUE));
+        assertTrue(db.queryValues(f, T0, T0 + 2).values().isNull(0));
+        assertTrue(Float.isNaN(db.queryPoints(f, T0, T0 + 2).value(0)), "a null reads as NaN through the float API");
+        assertTrue(db.queryValues(i, T0, T0 + 2).values().isNull(0));
+    }
+
+    @Test
+    void aggregates() throws TsdbException {
+        int s = db.series("x");
+        long[] ts = new long[100];
+        float[] v = new float[100];
+        for (int i = 0; i < 100; i++) {
+            ts[i] = T0 + i * 1000L;
+            v[i] = i;
+        }
+        v[50] = Float.NaN;
+        db.insert(s, ts, v);
+        List<Bucket> one = db.queryAgg(s, T0, T0 + 100_000, 0);
+        assertEquals(1, one.size());
+        assertEquals(100, one.get(0).count());
+        assertTrue(Double.isNaN(one.get(0).sum()), "NaN propagates into sum");
+        assertEquals(0, one.get(0).min());
+        assertEquals(99, one.get(0).max(), "NaN is ignored by max");
+        List<Bucket> tens = db.queryAgg(s, T0, T0 + 100_000, 10_000);
+        assertEquals(10, tens.size());
+        assertEquals(45, tens.get(0).sum());
+        assertEquals(4.5, tens.get(0).avg());
+        int n = db.seriesCreate("n", ValueType.INT64);
+        db.insertSeriesValues(n, new long[] {T0, T0 + 1, T0 + 2}, Column.ofLongs(Long.MAX_VALUE, Long.MAX_VALUE, -1));
+        Bucket b = db.queryAgg(n, T0, T0 + 3, 0).get(0);
+        assertEquals(Long.MAX_VALUE, b.isum(), "clamped exact sum");
+        assertEquals(-1, b.imin());
+        assertEquals(Long.MAX_VALUE, b.imax());
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryBounds(s, T0, T0 + 1, new long[] {5, 5})));
+        assertThrows(IllegalArgumentException.class, () -> db.queryBounds(s, T0, T0 + 1, new long[0]));
+        List<Bucket> bb = db.queryBounds(s, T0, T0 + 100_000, new long[] {T0 + 10_000, T0 + 95_000});
+        assertEquals(2, bb.size());
+        assertEquals(85, bb.get(0).count());
+        assertEquals(T0 + 95_000, bb.get(1).start());
+    }
+
+    @Test
+    void groupInUtcAndInZones() throws TsdbException {
+        int s = db.series("x");
+        int n = 24 * 400; /* hourly for 400 days: DST changes both ways, month and year ends */
+        long[] ts = new long[n];
+        float[] v = new float[n];
+        for (int i = 0; i < n; i++) {
+            ts[i] = T0 + i * 3_600_000L;
+            v[i] = i % 17;
+        }
+        db.insert(s, ts, v);
+        List<Bucket> days = db.queryGroup(s, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY));
+        assertEquals(400, days.size());
+        assertEquals(24, days.get(0).count());
+        assertEquals(days, db.queryAgg(s, Long.MIN_VALUE, Long.MAX_VALUE, 86_400_000L));
+        assertEquals(1, db.queryGroup(s, T0, T0 + 86_400_000L, null).size());
+        String[] zones = {"Europe/Oslo", "America/St_Johns", "Asia/Kolkata", "Australia/Lord_Howe", "+05:30"};
+        Unit[] units = {Unit.HOUR, Unit.DAY, Unit.WEEK, Unit.MONTH, Unit.QUARTER, Unit.YEAR};
+        for (String z : zones) {
+            for (Unit u : units) {
+                for (int count : new int[] {1, 3}) {
+                    Group g = Group.of(u, count).in(z);
+                    for (long[] r : new long[][] {{Long.MIN_VALUE, Long.MAX_VALUE}, {T0 + 7_777_777, T0 + 99 * 86_400_000L}}) {
+                        List<Bucket> java = db.queryGroup(s, r[0], r[1], g);
+                        assertEquals(db.queryGroupNative(s, r[0], r[1], g, Order.ASC, 0), java, z + " " + u + count);
+                        assertEquals(db.queryGroupNative(s, r[0], r[1], g, Order.DESC, 2),
+                                db.queryGroup(s, r[0], r[1], g, Order.DESC, 2));
+                        long sum = 0;
+                        for (Bucket b : java)
+                            sum += b.count();
+                        if (r[0] == Long.MIN_VALUE)
+                            assertEquals(n, sum);
+                    }
+                }
+                assertArrayEquals(EmbeddedDb.calendarBoundsNative(z, u.ordinal() + 1, 1, T0, T0 + 400 * 86_400_000L),
+                        Group.of(u).in(z).bounds(T0, T0 + 400 * 86_400_000L), z + " " + u);
+            }
+        }
+        int empty = db.series("empty");
+        assertEquals(0, db.queryGroup(empty, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY).in("Europe/Oslo"))
+                .size());
+    }
+
+    @Test
+    void errorsAndClosedDatabase() throws Exception {
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.queryValues(4242, 0, 1)));
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.seriesType(4242)));
+        /* a second open of a directory being written fails cleanly */
+        TsdbException locked = assertThrows(TsdbException.class, () -> EmbeddedDb.open(db.directory()));
+        assertEquals(Status.ERR_LOCKED, locked.status());
+        assertTrue(locked.getMessage().contains(db.directory()));
+        try (EmbeddedDb ro = EmbeddedDb.open(db.directory(), new EmbeddedOptions().readOnly(true))) {
+            assertEquals(Status.ERR_READONLY, status(() -> ro.series("new")));
+        }
+        assertNull(db.failed());
+        EmbeddedDb other = EmbeddedDb.open(tmp.resolve("other").toString());
+        other.close();
+        other.close(); /* twice is fine */
+        assertFalse(other.isOpen());
+        assertEquals(Status.ERR_IO, status(() -> other.series("x")));
+        assertEquals(Status.ERR_IO, status(() -> other.queryAgg(0, 0, 1, 0)));
+    }
+
+    @Test
+    void exceptionInAConsumerStopsTheQuery() throws TsdbException {
+        int s = db.series("x");
+        int n = 3 * EmbeddedDb.CHUNK;
+        long[] ts = new long[n];
+        float[] v = new float[n];
+        for (int i = 0; i < n; i++)
+            ts[i] = T0 + i;
+        db.insert(s, ts, v);
+        AtomicInteger calls = new AtomicInteger();
+        IllegalStateException e = assertThrows(IllegalStateException.class,
+                () -> db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, k) -> {
+                    calls.incrementAndGet();
+                    throw new IllegalStateException("boom");
+                }));
+        assertEquals("boom", e.getMessage());
+        assertEquals(1, calls.get(), "no chunk after the exception");
+        StackOverflowError so = assertThrows(StackOverflowError.class,
+                () -> db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, c, k) -> {
+                    throw new StackOverflowError();
+                }));
+        assertTrue(so != null);
+        /* the database and this thread's buffers still work */
+        assertEquals(n, db.queryPoints(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
+        long[] count = {0};
+        db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, k) -> {
+            count[0] += k;
+            return true;
+        });
+        assertEquals(n, count[0]);
+        /* closing from a consumer is refused rather than deadlocking */
+        assertThrows(IllegalStateException.class, () -> db.queryRaw(s, T0, T0 + 1, (t, x, k) -> {
+            try {
+                db.close();
+            } catch (TsdbException ex) {
+                throw new AssertionError(ex);
+            }
+            return true;
+        }));
+        /* a nested query from a consumer gets its own buffers */
+        long[] nested = {0};
+        db.queryRaw(s, T0, T0 + 10, (t, x, k) -> {
+            try {
+                nested[0] += db.queryPoints(s, T0, T0 + 5).size();
+                db.queryRaw(s, T0, T0 + 3, (t2, x2, k2) -> {
+                    nested[0] += k2;
+                    return true;
+                });
+            } catch (TsdbException ex) {
+                throw new AssertionError(ex);
+            }
+            return true;
+        });
+        assertEquals(8, nested[0]);
+    }
+
+    @Test
+    void maintenanceStatsAndParts() throws TsdbException {
+        int s = db.series("x");
+        for (int k = 0; k < 3; k++)
+            db.insert(s, new long[] {T0 + k * 86_400_000L}, new float[] {k});
+        db.flush();
+        Stats st = db.stats();
+        assertEquals(3, st.rows());
+        assertTrue(st.parts() >= 1);
+        List<PartInfo> parts = db.parts();
+        assertEquals(st.parts(), parts.size());
+        long rows = 0;
+        for (PartInfo p : parts) {
+            rows += p.rows();
+            assertTrue(p.name().length() > 0);
+            assertTrue(p.minTs() <= p.maxTs());
+        }
+        assertEquals(3, rows);
+        db.dropBefore(T0 + 86_400_000L);
+        assertEquals(2, db.queryPoints(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
+        db.queryAgg(s, Long.MIN_VALUE, Long.MAX_VALUE, 0);
+        QueryStats q = db.lastQueryStats();
+        assertEquals(2, q.rows());
+        assertEquals(1, q.resultRows());
+        db.queryPoints(s, T0 + 86_400_000L, T0 + 86_400_001L);
+        assertEquals(1, db.lastQueryStats().resultRows());
+    }
+
+    @Test
+    void lastQueryStatsBelongToTheVirtualThread() throws Exception {
+        int s = db.series("x");
+        long[] ts = new long[1000];
+        float[] v = new float[1000];
+        for (int i = 0; i < 1000; i++)
+            ts[i] = T0 + i;
+        db.insert(s, ts, v);
+        try (ExecutorService ex = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<Boolean>> fs = new ArrayList<>();
+            for (int k = 1; k <= 200; k++) {
+                int want = k;
+                fs.add(ex.submit(() -> {
+                    db.queryPoints(s, T0, T0 + want);
+                    Thread.yield();
+                    return db.lastQueryStats().resultRows() == want;
+                }));
+            }
+            for (Future<Boolean> f : fs)
+                assertTrue(f.get());
+        }
+    }
+
+    @Test
+    void manyThreadsOnOneDatabase() throws Exception {
+        int threads = 16;
+        int[] ids = new int[threads];
+        for (int t = 0; t < threads; t++)
+            ids[t] = db.series("s" + t);
+        ExecutorService ex = Executors.newFixedThreadPool(threads);
+        try {
+            List<Future<Long>> fs = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                int id = ids[t];
+                int other = ids[(t + 1) % threads];
+                fs.add(ex.submit(() -> {
+                    long checked = 0;
+                    for (int round = 0; round < 50; round++) {
+                        long[] ts = new long[200];
+                        float[] v = new float[200];
+                        for (int i = 0; i < 200; i++) {
+                            ts[i] = T0 + round * 200L + i;
+                            v[i] = round;
+                        }
+                        db.insert(id, ts, v);
+                        Points p = db.queryPoints(id, T0 + round * 200L, T0 + round * 200L + 200);
+                        assertEquals(200, p.size());
+                        assertEquals(round, p.value(199));
+                        db.queryAgg(other, Long.MIN_VALUE, Long.MAX_VALUE, 1000);
+                        db.queryRaw(other, Long.MIN_VALUE, Long.MAX_VALUE, (a, b, k) -> true);
+                        checked += p.size();
+                    }
+                    return checked;
+                }));
+            }
+            long total = 0;
+            for (Future<Long> f : fs)
+                total += f.get();
+            assertEquals(threads * 50L * 200, total);
+            for (int id : ids)
+                assertEquals(10_000, db.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE).size());
+        } finally {
+            ex.shutdown();
+        }
+    }
+
+    @Test
+    void closeWaitsForRunningCalls() throws Exception {
+        int s = db.series("x");
+        long[] ts = new long[50_000];
+        float[] v = new float[50_000];
+        for (int i = 0; i < ts.length; i++)
+            ts[i] = T0 + i;
+        db.insert(s, ts, v);
+        ExecutorService ex = Executors.newFixedThreadPool(4);
+        try {
+            List<Future<Integer>> fs = new ArrayList<>();
+            for (int t = 0; t < 4; t++)
+                fs.add(ex.submit(() -> {
+                    int ok = 0;
+                    try {
+                        while (true) {
+                            db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (a, b, k) -> true);
+                            ok++;
+                        }
+                    } catch (TsdbException e) {
+                        assertEquals(Status.ERR_IO, e.status()); /* closed: never a crash */
+                    }
+                    return ok;
+                }));
+            Thread.sleep(200);
+            db.close();
+            for (Future<Integer> f : fs)
+                assertTrue(f.get() > 0);
+        } finally {
+            ex.shutdown();
+        }
+        assertFalse(db.isOpen());
+    }
+
+    @Test
+    void arraysTheLibraryReturnsAreFreed() throws TsdbException {
+        int s = db.series("x");
+        db.insert(s, new long[] {T0, T0 + 1000}, new float[] {1, 2});
+        long before = Native.OUTSTANDING.get();
+        for (int i = 0; i < 10_000; i++) {
+            db.queryAgg(s, T0, T0 + 2000, 1000);
+            db.queryGroup(s, T0, T0 + 2000, Group.of(Unit.SECOND));
+            db.queryBounds(s, T0, T0 + 2000, new long[] {T0});
+        }
+        assertEquals(before, Native.OUTSTANDING.get());
+    }
+
+    @Test
+    void aNulInsideAStringIsRefused() throws Exception {
+        /* C would read "a" and use that series instead; tsdbd refuses the same names */
+        int a = db.series("a");
+        int st = db.seriesCreate("st", ValueType.STATE);
+        db.state(st, "run");
+        int count = db.seriesCount();
+        String vol = tmp.resolve("vol").toString();
+        assertEquals(Status.ERR_INVALID, status(() -> db.series("a\0b")));
+        assertEquals(Status.ERR_INVALID, status(() -> db.series("a\0b", false)));
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesAt("a\0b", vol)));
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesAt("c", vol + "\0x")));
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesCreate("a\0b", ValueType.INT64)));
+        assertEquals(Status.ERR_INVALID, status(() -> db.seriesCreate("c", ValueType.INT64, vol + "\0x")));
+        assertEquals(Status.ERR_INVALID, status(() -> db.state(st, "run\0x")));
+        assertEquals(Status.ERR_INVALID, status(() -> db.stateLookup(st, "run\0x")));
+        assertEquals(Status.ERR_INVALID, status(() -> EmbeddedDb.open(tmp.resolve("db").toString() + "\0x")));
+        assertEquals(count, db.seriesCount());
+        assertEquals(a, db.series("a", false));
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.series("c", false)));
+    }
+
+    @Test
+    void aCollectingQueryOverTheArrayLimitFails() throws TsdbException {
+        int s = db.series("x");
+        long[] ts = new long[1000];
+        for (int i = 0; i < ts.length; i++)
+            ts[i] = T0 + i;
+        db.insert(s, ts, new float[ts.length]);
+        int old = EmbeddedDb.collectLimit;
+        EmbeddedDb.collectLimit = 100;
+        try {
+            /* used to loop on 0 rows of room with the read lock held */
+            int st = assertTimeoutPreemptively(Duration.ofSeconds(20),
+                    () -> status(() -> db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE)));
+            assertEquals(Status.ERR_NOMEM, st);
+        } finally {
+            EmbeddedDb.collectLimit = old;
+        }
+        assertEquals(1000, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
+    }
+
+    /* rows in a part and in the memtable reach the stub in several engine callbacks */
+    private int rowsInSeveralCallbacks(ValueType type) throws TsdbException {
+        int s = type == ValueType.FLOAT32 ? db.series("x") : db.seriesCreate("x", type);
+        int n = EmbeddedDb.CHUNK + 100;
+        long[] ts = new long[n];
+        for (int i = 0; i < n; i++)
+            ts[i] = T0 + i;
+        db.insertSeriesValues(s, ts, type == ValueType.FLOAT32 ? Column.ofFloats(new float[n])
+                : Column.ofLongs(new long[n]));
+        db.flush();
+        for (int i = 0; i < n; i++)
+            ts[i] = T0 + n + i;
+        db.insertSeriesValues(s, ts, type == ValueType.FLOAT32 ? Column.ofFloats(new float[n])
+                : Column.ofLongs(new long[n]));
+        return s;
+    }
+
+    @Test
+    void anExceptionStopsAQueryThatSpansSeveralEngineCallbacks() throws TsdbException {
+        int s = rowsInSeveralCallbacks(ValueType.FLOAT32);
+        AtomicInteger calls = new AtomicInteger();
+        assertThrows(IllegalStateException.class, () -> db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, k) -> {
+            calls.incrementAndGet();
+            throw new IllegalStateException("boom");
+        }));
+        assertEquals(1, calls.get(), "no chunk after the exception");
+        AtomicInteger seen = new AtomicInteger();
+        db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, k) -> seen.addAndGet(k) > 0);
+        assertEquals(2 * (EmbeddedDb.CHUNK + 100), seen.get(), "both runs reach the consumer");
+    }
+
+    @Test
+    void anExceptionStopsATypedQueryThatSpansSeveralEngineCallbacks() throws TsdbException {
+        int s = rowsInSeveralCallbacks(ValueType.INT64);
+        AtomicInteger calls = new AtomicInteger();
+        assertThrows(IllegalStateException.class,
+                () -> db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, c, k) -> {
+                    calls.incrementAndGet();
+                    throw new IllegalStateException("boom");
+                }));
+        assertEquals(1, calls.get(), "no chunk after the exception");
+    }
+
+    @Test
+    void closeWaitsForACallInsideAConsumer() throws Exception {
+        int s = db.series("x");
+        db.insert(s, new long[] {T0, T0 + 1}, new float[] {1, 2});
+        CountDownLatch inside = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompletableFuture<Boolean> query = CompletableFuture.supplyAsync(() -> {
+            try {
+                return db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, k) -> {
+                    inside.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException e) {
+                        throw new AssertionError(e);
+                    }
+                    return true;
+                });
+            } catch (TsdbException e) {
+                throw new AssertionError(e);
+            }
+        });
+        assertTrue(inside.await(20, TimeUnit.SECONDS));
+        CompletableFuture<Void> closing = CompletableFuture.runAsync(() -> {
+            try {
+                db.close();
+            } catch (TsdbException e) {
+                throw new AssertionError(e);
+            }
+        });
+        Thread.sleep(300);
+        assertFalse(closing.isDone(), "close returned while a query was inside the library");
+        release.countDown();
+        assertTrue(query.get(20, TimeUnit.SECONDS));
+        closing.get(20, TimeUnit.SECONDS);
+        assertFalse(db.isOpen());
+    }
+
+    @Test
+    void insertOffsetsApplyToTheSeriesArrayAndToBools() throws TsdbException {
+        int a = db.series("a");
+        int b = db.series("b");
+        long[] ts = {T0, T0 + 1, T0 + 2, T0 + 3};
+        db.insert(new int[] {b, a, b, a}, ts, new float[] {1, 2, 3, 4}, 1, 2);
+        assertArrayEquals(new long[] {T0 + 1}, db.queryPoints(a, T0, T0 + 10).timestamps());
+        assertArrayEquals(new float[] {2}, db.queryPoints(a, T0, T0 + 10).values());
+        assertArrayEquals(new long[] {T0 + 2}, db.queryPoints(b, T0, T0 + 10).timestamps());
+        int c = db.seriesCreate("c", ValueType.BOOL);
+        int d = db.seriesCreate("d", ValueType.BOOL);
+        db.insertSeriesValues(c, ts, Column.ofBools(true, false, true, true), 1, 2);
+        assertArrayEquals(new boolean[] {false, true}, db.queryValues(c, T0, T0 + 10).values().bools());
+        db.insertValues(new int[] {c, d, d, c}, ts, Column.ofBools(true, true, false, true), 1, 2);
+        ValuePoints vd = db.queryValues(d, T0, T0 + 10);
+        assertArrayEquals(new long[] {T0 + 1, T0 + 2}, vd.timestamps());
+        assertArrayEquals(new boolean[] {true, false}, vd.values().bools());
+    }
+
+    @Test
+    void lastQueryStatsFollowStreamingAndCollectingQueries() throws TsdbException {
+        int s = db.series("x");
+        long[] ts = new long[100];
+        for (int i = 0; i < ts.length; i++)
+            ts[i] = T0 + i;
+        db.insert(s, ts, new float[ts.length]);
+        db.queryPoints(s, T0, T0 + 50);
+        assertEquals(50, db.lastQueryStats().resultRows());
+        db.queryRaw(s, T0, T0 + 7, (t, x, k) -> true);
+        assertEquals(7, db.lastQueryStats().resultRows());
+        db.queryValues(s, T0, T0 + 11);
+        assertEquals(11, db.lastQueryStats().resultRows());
+        db.queryValues(s, T0, T0 + 13, (t, c, k) -> true);
+        assertEquals(13, db.lastQueryStats().resultRows());
+    }
+
+    @Test
+    void optimizeRaisesThePartLevel() throws TsdbException {
+        int s = db.series("x");
+        for (int k = 0; k < 3; k++) {
+            db.insert(s, new long[] {T0 + k}, new float[] {k});
+            db.flush();
+        }
+        db.optimize();
+        List<PartInfo> parts = db.parts();
+        assertEquals(1, parts.size());
+        assertTrue(parts.get(0).level() >= 1, "a merged part has a level: " + parts.get(0));
+        assertEquals(3, parts.get(0).rows());
+    }
+}

@@ -2117,6 +2117,22 @@ out:
 
 void tsdb_free(void *p) { free(p); }
 
+size_t tsdb_struct_size(int kind)
+{
+    switch (kind) {
+    case TSDB_STRUCT_OPTIONS: return sizeof(tsdb_options);
+    case TSDB_STRUCT_VALUES: return sizeof(tsdb_values);
+    case TSDB_STRUCT_BUCKET: return sizeof(tsdb_bucket);
+    case TSDB_STRUCT_POINTS: return sizeof(tsdb_points);
+    case TSDB_STRUCT_GROUP: return sizeof(tsdb_group);
+    case TSDB_STRUCT_QUERY_OPTS: return sizeof(tsdb_query_opts);
+    case TSDB_STRUCT_QUERY_STATS: return sizeof(tsdb_query_stats);
+    case TSDB_STRUCT_STATS: return sizeof(tsdb_stats);
+    case TSDB_STRUCT_PART_INFO: return sizeof(tsdb_part_info);
+    default: return 0;
+    }
+}
+
 void tsdb_points_free(tsdb_points *p)
 {
     free(p->ts);

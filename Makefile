@@ -201,10 +201,17 @@ test-python: $(B)/tsdbd
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
 	    && $(abspath $(PYVENV))/bin/python -m pytest tests
 
-test-java: $(B)/tsdbd
+test-java: $(B)/tsdbd $(B)/tsdb
 	cd client/java && mvn -q test
 
-test-clients: test-rust test-python test-java
+# The embedded Java binding (Java 22+, FFM) needs the TCP client's jar for the shared types. It is installed into a
+# local repository of this tree's build (read through to ~/.m2), never into the ~/.m2 that other trees share.
+JAVA_M2 := -Dmaven.repo.local=$(abspath $(B))/m2 -Dmaven.repo.local.tail=$(HOME)/.m2/repository
+test-java-embedded: $(B)/tsdbd $(B)/libtsdb.so
+	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
+	cd client/java-embedded && mvn -q $(JAVA_M2) test
+
+test-clients: test-rust test-python test-java test-java-embedded
 
 # Commit rules as a git hook (no session links, DCO sign-off last); once per clone.
 hooks:
@@ -249,7 +256,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

@@ -29,6 +29,15 @@ public enum ValueType {
         this.width = width;
     }
 
+    /**
+     * The type's code: on the wire, and the C library's {@code tsdb_type}.
+     *
+     * @return the code
+     */
+    public int code() {
+        return code;
+    }
+
     /** The type with this wire code, or {@code null}. */
     static ValueType of(int code) {
         ValueType[] all = values();

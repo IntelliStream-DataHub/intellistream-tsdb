@@ -8,7 +8,17 @@ public final class ValuePoints {
     private final long[] timestamps;
     private final Column values;
 
-    ValuePoints(long[] timestamps, Column values) {
+    /**
+     * Points over the given timestamps and column, which are not copied (for other implementations of the API, such
+     * as the embedded database).
+     *
+     * @param timestamps ms since the epoch
+     * @param values the values, in the same positions; of the same size as {@code timestamps}
+     * @throws IllegalArgumentException if the sizes differ
+     */
+    public ValuePoints(long[] timestamps, Column values) {
+        if (timestamps.length != values.size())
+            throw new IllegalArgumentException(timestamps.length + " timestamps and " + values.size() + " values");
         this.timestamps = timestamps;
         this.values = values;
     }

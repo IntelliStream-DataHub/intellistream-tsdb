@@ -31,4 +31,13 @@ public enum Unit {
     Unit(int code) {
         this.code = code;
     }
+
+    /**
+     * The unit's code: on the wire, and the C library's {@code tsdb_unit}.
+     *
+     * @return the code
+     */
+    public int code() {
+        return code;
+    }
 }

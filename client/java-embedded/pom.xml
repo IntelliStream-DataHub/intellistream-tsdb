@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- A project of its own, not a module of client/java: it needs Java 22 (java.lang.foreign), the TCP client
+       stays on Java 17, and client/java keeps building exactly as before. It shares the TCP client's types
+       (Bucket, Column, Group, TsdbException, ...), so client/java is installed first; make test-java-embedded installs it
+       into a repository of the tree's build (build/m2), not into the ~/.m2 that other trees share. -->
+  <groupId>ai.intellistream</groupId>
+  <artifactId>tsdb-embedded</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>tsdb-embedded</name>
+  <description>The tsdb time series database in-process, through libtsdb.so and the Java FFM API (Java 22+)</description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>22</maven.compiler.release>
+    <junit.version>5.13.1</junit.version>
+    <!-- Where libtsdb.so is taken from to bundle it in the jar (for the build machine's platform, see the profiles):
+         the tree's build. Build it with
+         `make PORTABLE=1 build/libtsdb.so` (or make dist) for a jar that runs on other CPUs. -->
+    <tsdb.native.dir>${project.basedir}/../../build</tsdb.native.dir>
+    <tsdb.native.platform>linux-x86_64</tsdb.native.platform>
+    <!-- -Dtsdb.library=/path/libtsdb.so makes the tests load that library instead of the bundled copy
+         (e.g. a sanitizer build). Empty: the usual search. -->
+    <tsdb.library></tsdb.library>
+    <!-- The comparison with the TCP server starts this binary. -->
+    <tsdbd>${project.basedir}/../../build/tsdbd</tsdbd>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>ai.intellistream</groupId>
+      <artifactId>tsdb-client</artifactId>
+      <version>0.1.0-SNAPSHOT</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <!-- The bundled library is the build machine's, so it goes under that machine's platform (Native.platform()). -->
+  <profiles>
+    <profile>
+      <id>linux-x86_64</id>
+      <activation><os><family>unix</family><name>Linux</name><arch>amd64</arch></os></activation>
+      <properties><tsdb.native.platform>linux-x86_64</tsdb.native.platform></properties>
+    </profile>
+    <profile>
+      <id>linux-aarch64</id>
+      <activation><os><family>unix</family><name>Linux</name><arch>aarch64</arch></os></activation>
+      <properties><tsdb.native.platform>linux-aarch64</tsdb.native.platform></properties>
+    </profile>
+  </profiles>
+
+  <build>
+    <resources>
+      <resource>
+        <directory>${tsdb.native.dir}</directory>
+        <includes>
+          <include>libtsdb.so</include>
+        </includes>
+        <targetPath>ai/intellistream/tsdb/embedded/native/${tsdb.native.platform}</targetPath>
+      </resource>
+    </resources>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.14.0</version>
+        <configuration>
+          <compilerArgs>
+            <arg>-Xlint:all</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.3</version>
+        <configuration>
+          <!-- Without the flag the JVM warns on the first downcall (and a future JDK refuses it). -->
+          <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+          <systemPropertyVariables>
+            <tsdb.library>${tsdb.library}</tsdb.library>
+            <tsdbd>${tsdbd}</tsdbd>
+            <tsdb.include>${project.basedir}/../../include</tsdb.include>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.2</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <addClasspath>true</addClasspath>
+              <classpathPrefix>lib/</classpathPrefix>
+            </manifest>
+            <manifestEntries>
+              <Automatic-Module-Name>ai.intellistream.tsdb.embedded</Automatic-Module-Name>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+      <plugin>
+        <!-- mvn javadoc:javadoc writes target/reports/apidocs; any doclint warning fails it -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.12.0</version>
+        <configuration>
+          <doclint>all</doclint>
+          <failOnWarnings>true</failOnWarnings>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.0</version>
+        <executions>
+          <execution>
+            <id>runtime-libs</id>
+            <phase>package</phase>
+            <goals>
+              <goal>copy-dependencies</goal>
+            </goals>
+            <configuration>
+              <includeScope>runtime</includeScope>
+              <outputDirectory>${project.build.directory}/lib</outputDirectory>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

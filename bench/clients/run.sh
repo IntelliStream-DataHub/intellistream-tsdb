@@ -1,8 +1,9 @@
 #!/bin/bash
-# Embedded C and the four tsdbd clients (C, Rust, Python, Java) on one data set: loads and queries, side by side.
+# Embedded C, embedded Java (FFM) and the four tsdbd clients (C, Rust, Python, Java) on one data set: loads and
+# queries, side by side.
 # See README.md. Usage:
 #   bench/clients/run.sh [--work DIR] [--port N|0] [--series 100] [--points 1000000] [--repeat 3] [--seconds 3]
-#                        [--conns "1 4 16"] [--qthreads "1 32"] [--clients "c rust python java"]
+#                        [--conns "1 4 16"] [--qthreads "1 32"] [--clients "c rust python java java-embedded"]
 #                        [--only load|query] [--no-build] [--force]
 set -u -o pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -17,7 +18,7 @@ REPEAT=3
 SECONDS_PER_CLASS=3
 CONNS="1 4 16"
 QTHREADS="1 32"
-CLIENTS="c rust python java"
+CLIENTS="c rust python java java-embedded"
 ONLY=""
 BUILD=1
 FORCE=0
@@ -25,7 +26,7 @@ MAXLOAD=2   # load average at the start
 MAXBUSY=1   # CPUs other processes may keep busy before a measurement (see quiet_wait)
 PYVENV=${PYVENV:-$B/pyvenv}
 
-usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 while [ $# -gt 0 ]; do
     case $1 in
     --work) WORK=$2; shift 2 ;;
@@ -79,6 +80,7 @@ mkdir -p "$WORK" || exit 1
 DATAFILE=$WORK/data-${SERIES}x${POINTS}.rowbinary
 SRV=$WORK/db # tsdbd's data directory, wiped between loads
 EMB=$WORK/emb # the embedded database
+EMBJ=$WORK/embj # the embedded Java loads (its queries read $EMB)
 OUT=$WORK/results-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 LOG=$OUT/results.log
@@ -88,6 +90,8 @@ SPID=""
 # ------------------------------------------------------------------ build
 RUSTX=$ROOT/client/rust/target/release/examples
 JAR=$ROOT/client/java/target/tsdb-client-0.1.0-SNAPSHOT.jar
+EJAR=$ROOT/client/java-embedded/target/tsdb-embedded-0.1.0-SNAPSHOT.jar
+JM2="-Dmaven.repo.local=$B/m2 -Dmaven.repo.local.tail=$HOME/.m2/repository"
 PY=$PYVENV/bin/python
 if [ "$BUILD" = 1 ]; then
     echo "== building"
@@ -99,10 +103,17 @@ if [ "$BUILD" = 1 ]; then
         "$PYVENV/bin/python" -c 'import numpy' 2>/dev/null || "$PYVENV/bin/pip" -q install numpy >>"$OUT/build.log" 2>&1 ;;
     esac
     case " $CLIENTS " in *" java "*) (cd "$ROOT/client/java" && mvn -q package -DskipTests) >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; } ;; esac
+    # the TCP client's jar into a repository of this tree (not the shared ~/.m2), then the embedded jar against it
+    case " $CLIENTS " in *" java-embedded "*)
+        (cd "$ROOT/client/java" && mvn -q $JM2 install -DskipTests && cd ../java-embedded && mvn -q $JM2 package -DskipTests) \
+            >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; } ;;
+    esac
 fi
 ZSTDJNI=$(find "$HOME/.m2/repository/com/github/luben/zstd-jni" -name 'zstd-jni-*.jar' 2>/dev/null | sort -V | tail -n 1)
 JAVA_CP=$JAR${ZSTDJNI:+:$ZSTDJNI}
 JAVA="java --enable-native-access=ALL-UNNAMED -cp $JAVA_CP"
+# the embedded Java benchmark loads the libtsdb.so of this build, not the copy in its jar
+JAVAEMB="java --enable-native-access=ALL-UNNAMED -Dtsdb.library=$B/libtsdb.so -cp $EJAR:$JAR ai.intellistream.tsdb.embedded.bench.EmbeddedBench"
 
 # ------------------------------------------------------------------ machine facts
 {
@@ -117,7 +128,7 @@ JAVA="java --enable-native-access=ALL-UNNAMED -cp $JAVA_CP"
     echo "cc:        $(cc --version | head -n 1)"
     case " $CLIENTS " in *" rust "*) echo "rustc:     $(rustc --version)" ;; esac
     case " $CLIENTS " in *" python "*) echo "python:    $($PY --version 2>&1), numpy $($PY -c 'import numpy; print(numpy.__version__)' 2>/dev/null || echo none)" ;; esac
-    case " $CLIENTS " in *" java "*) echo "java:      $(java -version 2>&1 | head -n 1), zstd-jni $(basename "${ZSTDJNI:-none}")" ;; esac
+    case " $CLIENTS " in *" java "*|*" java-embedded "*) echo "java:      $(java -version 2>&1 | head -n 1), zstd-jni $(basename "${ZSTDJNI:-none}")" ;; esac
     echo "run:       series=$SERIES points=$POINTS repeat=$REPEAT seconds/class=$SECONDS_PER_CLASS conns=($CONNS) qthreads=($QTHREADS) clients=(embedded $CLIENTS)"
     echo "tsdbd:     defaults: fsync on, wal_sync_ms 0 (an insert is acknowledged once durable), zstd 1 storage, $(nproc) workers"
 } >"$OUT/facts.txt"
@@ -216,9 +227,16 @@ if [ "$ONLY" != query ]; then
             for fs in on off; do
                 echo "  embedded, $k threads, fsync $fs"
                 record "phase=load rep=$rep" "$B/tsdb-bench" --dir "$EMB" --load "$DATAFILE" --threads "$k" $([ $fs = off ] && echo --no-fsync)
+                case " $CLIENTS " in *" java-embedded "*)
+                    echo "  embedded Java, $k threads, fsync $fs"
+                    # shellcheck disable=SC2086
+                    record "phase=load rep=$rep" $JAVAEMB --dir "$EMBJ" --load "$DATAFILE" --threads "$k" $([ $fs = off ] && echo --no-fsync)
+                    STEPTAG="phase=verify rep=$rep client=embedded-java conns=$k fsync=$fs" step "$B/tsdb-bench" --dir "$EMBJ" --verify "$DATAFILE" ;;
+                esac
             done
         done
         for c in $CLIENTS; do
+            [ "$c" = java-embedded ] && continue # above, with the embedded loads
             for l in 1 0; do
                 for k in $CONNS; do
                     echo "  $c, $k connections, compression $l"
@@ -251,6 +269,12 @@ if [ "$ONLY" != load ]; then
             echo "  embedded"
             record "phase=query rep=$rep" "$B/tsdb-bench" --dir "$EMB" --qps "$q" --series "$SERIES" --points "$POINTS" --seconds "$SECONDS_PER_CLASS"
             for c in $CLIENTS; do
+                if [ "$c" = java-embedded ]; then # the same database as embedded C, in turn
+                    echo "  embedded Java"
+                    # shellcheck disable=SC2086
+                    record "phase=query rep=$rep" $JAVAEMB --dir "$EMB" --qps "$q" --series "$SERIES" --points "$POINTS" --seconds "$SECONDS_PER_CLASS"
+                    continue
+                fi
                 echo "  $c"
                 # shellcheck disable=SC2046
                 record "phase=query rep=$rep" $(client_query_cmd "$c" "$q")
