@@ -1,19 +1,42 @@
 # tsdb Java client
 
-A Java client for `tsdbd`, the TCP server of the tsdb time series database. It speaks the protocol of
-[`include/tsdb_protocol.h`](../../include/tsdb_protocol.h) and mirrors the C client in [`client/`](..). Its one
-runtime dependency is [zstd-jni](https://github.com/luben/zstd-jni) (`com.github.luben:zstd-jni`), the native
-zstd library, for compressed inserts. Built for Java 17 and later.
+This is a Java library for talking to `tsdbd`, the server of the tsdb time series database. A time series is a
+list of measurements over time, such as the flow of a pump once a minute. You can store measurements, read them
+back, and ask for totals per hour, per day or per month.
+
+You need Java 17 or newer and Maven. The library uses one other library,
+[zstd-jni](https://github.com/luben/zstd-jni), to compress data on the network.
 
 ## Quick start
 
-Start a server (from the repository root, after `make`):
+1. Build and start the server. From the root of this repository:
 
-```sh
-./build/tsdbd --dir /tmp/tsdb-demo --port 7070
-```
+   ```sh
+   make
+   ./build/tsdbd --dir /tmp/tsdb-demo --port 7070
+   ```
 
-Then connect, create a series, insert a batch, and query it raw, aggregated and grouped by local day:
+2. In another terminal, build the client and run the example below:
+
+   ```sh
+   cd client/java
+   mvn -q package -DskipTests
+   java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070
+   ```
+
+3. To use the client in your own Maven project, install it into your local Maven repository with `mvn install`
+   and add this dependency:
+
+   ```xml
+   <dependency>
+     <groupId>ai.intellistream</groupId>
+     <artifactId>tsdb-client</artifactId>
+     <version>0.1.0-SNAPSHOT</version>
+   </dependency>
+   ```
+
+The example (`src/main/java/ai/intellistream/tsdb/example/Example.java`) stores one value per minute for a day,
+then reads them back in three ways:
 
 ```java
 package ai.intellistream.tsdb.example;
@@ -75,201 +98,164 @@ public final class Example {
 }
 ```
 
-Series can also hold float64, int64, bool or state values, and any value may be null (protocol version 2):
+## Connect
 
 ```java
-package ai.intellistream.tsdb.example;
-
-import ai.intellistream.tsdb.Bucket;
-import ai.intellistream.tsdb.Column;
-import ai.intellistream.tsdb.TsdbClient;
-import ai.intellistream.tsdb.ValuePoints;
-import ai.intellistream.tsdb.ValueType;
-
-import java.time.Instant;
-import java.util.BitSet;
-import java.util.StringJoiner;
-
-/** Value types and nulls: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.TypedExample}. */
-public final class TypedExample {
-    private TypedExample() {
-    }
-
-    /**
-     * Runs the example.
-     *
-     * @param args the host and port of a running tsdbd; default 127.0.0.1 7070
-     * @throws Exception if the server cannot be reached or a request fails
-     */
-    public static void main(String[] args) throws Exception {
-        String host = args.length > 0 ? args[0] : "127.0.0.1";
-        int port = args.length > 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
-
-        try (TsdbClient client = TsdbClient.connect(host, port)) {
-            long t0 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
-            long[] ts = {t0, t0 + 60_000, t0 + 120_000, t0 + 180_000};
-
-            // An int64 meter reading per minute; the third one is missing (null).
-            int energy = client.seriesCreate("pump7.energy_wh", ValueType.INT64);
-            BitSet missing = new BitSet();
-            missing.set(2);
-            client.insertSeriesValues(energy, ts, Column.ofLongs(1_000, 1_250, 0, 1_900).withNulls(missing));
-
-            ValuePoints points = client.queryValues(energy, Long.MIN_VALUE, Long.MAX_VALUE);
-            long[] wh = points.values().longs();
-            for (int i = 0; i < points.size(); i++) {
-                String value = points.values().isNull(i) ? "null" : Long.toString(wh[i]);
-                System.out.println(Instant.ofEpochMilli(points.timestamps()[i]) + " " + value);
-            }
-
-            // Aggregates skip nulls; integer sums are exact.
-            Bucket all = client.queryAgg(energy, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0);
-            System.out.println("known " + all.count() + ", sum " + all.isum() + ", max " + all.imax());
-
-            // A state series stores each name once, as a code.
-            int mode = client.seriesCreate("pump7.mode", ValueType.STATE);
-            int running = client.state(mode, "running");
-            int stopped = client.state(mode, "stopped");
-            client.insertSeriesValues(mode, ts, Column.ofStates(running, running, stopped, running));
-
-            StringJoiner names = new StringJoiner(" ");
-            for (int code : client.queryValues(mode, Long.MIN_VALUE, Long.MAX_VALUE).values().states())
-                names.add(client.stateName(mode, code));
-            System.out.println(names);
-        }
-    }
+try (TsdbClient client = TsdbClient.connect("127.0.0.1", 7070)) {
+    // use the client here; it is closed at the end of the block
 }
 ```
 
-These are `Example.java` and `TypedExample.java` in `src/main/java/ai/intellistream/tsdb/example/`, verbatim; the
-tests check that README and sources match, and run both against a live server. Run them with:
+One client is one network connection. Use it from one thread at a time. If several threads need the database,
+give each its own client.
 
-```sh
-mvn -q package -DskipTests
-java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070
-java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar ai.intellistream.tsdb.example.TypedExample 127.0.0.1 7070
-```
+## Create a series
 
-## Build and test
-
-Requirements: JDK 17 or later, Maven 3.6 or later, and the server built in the repository root.
-
-```sh
-make -C ../..            # builds build/tsdbd, which the tests start
-mvn package              # compile, run the tests, build target/tsdb-client-0.1.0-SNAPSHOT.jar
-mvn test                 # the tests only
-mvn package -DskipTests  # the jar only
-mvn install              # into ~/.m2, for use as ai.intellistream:tsdb-client:0.1.0-SNAPSHOT
-```
-
-The tests are integration tests. Each test class starts `../../build/tsdbd` on a free port of 127.0.0.1 with a
-fresh database directory, stops it with SIGTERM, checks that it exits cleanly and deletes the directory. Two
-properties change where things are:
-
-- `-Dtsdbd=/path/to/tsdbd`: another server binary, such as a sanitizer build;
-- `-Dtsdb.test.dir=/path`: where the database directories and server logs go (default: `java.io.tmpdir`).
-
-## Usage
-
-```xml
-<dependency>
-  <groupId>ai.intellistream</groupId>
-  <artifactId>tsdb-client</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
-</dependency>
-```
-
-| Method | Does |
-| --- | --- |
-| `TsdbClient.connect(host, port[, timeout])` | opens a connection (`close()` closes it) |
-| `series(name[, create])`, `seriesAt(name, path)` | id of a series, created if missing (`seriesAt`: in a volume on the server) |
-| `seriesName(id)` | name of a series |
-| `insert(series, ts, values[, off, len])` | inserts into one series, waits until durable and visible |
-| `insert(int[] series, ts, values[, off, len])` | inserts rows of several series, one id per row |
-| `insertAsync(...)`, `await()`, `pending()` | pipelined inserts: send now, collect acknowledgements later |
-| `queryPoints(series, start, end[, order, limit])` | raw points as `long[]` and `float[]` |
-| `queryRaw(series, start, end[, order, limit], consumer)` | raw points streamed in chunks, for large results |
-| `seriesCreate(name, type[, path])`, `seriesType(id)` | a series of a `ValueType`, and the type of a series |
-| `insertSeriesValues(series, ts, column[, off, len])` | inserts a typed `Column` (with nulls) into one series |
-| `insertValues(int[] series, ts, column[, off, len])` | the same for rows of several series |
-| `insertSeriesValuesAsync(...)`, `insertValuesAsync(...)` | pipelined typed inserts, collected by `await()` |
-| `queryValues(series, start, end[, order, limit])` | typed points: `long[]` timestamps and a `Column` |
-| `queryValues(series, start, end[, order, limit], consumer)` | typed points streamed in chunks |
-| `state(series, name)`, `stateLookup(...)`, `stateName(series, code)` | the state dictionary: names and codes |
-| `queryAgg(series, start, end, intervalMs[, order, limit])` | count/sum/min/max per fixed interval, as `Bucket` records |
-| `queryGroup(series, start, end, group[, order, limit])` | the same per calendar unit, in a time zone |
-| `commit()`, `flush()`, `optimize()`, `stats()` | maintenance and storage statistics |
-| `lastQueryStats()` | what the server did for this connection's previous query (`QueryStats`: rows decoded or answered from granule statistics, bytes read, time) |
-| `setCompression(level)`, `compression()` | zstd level of inserts: 1 by default, 0 for plain arrays |
-| `bytesSent()` | bytes written to the connection so far |
-| `hello()` | the server's protocol version |
-
-Points are timestamps in milliseconds since the Unix epoch and values of the series' type. Writing an existing (series,
-timestamp) replaces its value: the last write wins. Time ranges are half open, `[start, end)`; pass
-`Long.MIN_VALUE` and `Long.MAX_VALUE` for everything.
-
-**Streaming.** `queryRaw` hands the consumer chunks of up to 16384 points in arrays it reuses, so memory stays
-bounded. Return `false` to stop; the protocol cannot cancel a query, so the client still reads (and discards) the
-rest of the stream. Use a limit to bound the work instead.
+A series has a name and a value type. `series` gets a series of 32-bit floats, and creates it if it is missing.
+`seriesCreate` lets you choose another type (see [Value types and nulls](#value-types-and-nulls)).
 
 ```java
-client.queryRaw(id, start, end, Order.ASC, 0, (ts, values, n) -> {
-    for (int i = 0; i < n; i++)
-        sink.write(ts[i], values[i]);
-    return true;
-});
+int flow = client.series("pump7.flow");
+int energy = client.seriesCreate("pump7.energy_wh", ValueType.INT64);
 ```
 
-**Pipelining.** `insertAsync` sends without waiting; `await()` collects the acknowledgements and throws the first
-error. The server runs one connection's requests in order, so pipelined writes keep last-write-wins. Every other
-call collects outstanding acknowledgements first, and `close()` does too, because the server drops the queued
-requests of a connection that closes. At most `TsdbClient.MAX_IN_FLIGHT` (4096) insert frames are outstanding;
-past that, `insertAsync` reads the oldest acknowledgement before sending.
+Both return a number, the series id. The other calls take this id.
 
-**Errors.** Everything that fails throws `TsdbException`, whose `status()` is one of the `Status.ERR_*` codes of
-`include/tsdb.h` (`Status.message(code)` describes it). An error status from the server leaves the connection
-usable; a connection failure or a malformed reply closes it (`isOpen()` turns false). Arguments the protocol cannot
-carry, such as arrays of different lengths, throw `IllegalArgumentException` without contacting the server.
+## Insert
 
-**Value types and nulls.** A series has one `ValueType`, fixed at creation: `FLOAT32` (what `series(name)`
-creates), `FLOAT64`, `INT64`, `BOOL` or `STATE`. A `Column` holds the values in the primitive array of its type
-(`float[]`, `double[]`, `long[]`, `boolean[]`, `int[]` state codes) and marks nulls in a `BitSet` (set bit: null):
-`Column.ofLongs(values).withNulls(nulls)`. Read it with the accessor of its type (`longs()`, ...) and `isNull(i)`.
-The float32 methods (`insert`, `queryPoints`, `queryRaw`) only work on float32 series; the typed ones work on
-all. The database reserves `Long.MIN_VALUE`, state code 0 and one NaN payload per float type as null: written as
-values, they read back as null. Aggregates skip nulls; `Bucket` has double `min`/`max`, and for int64 and bool
-series exact `isum`/`imin`/`imax` (`isum` saturates). `queryAgg` and `queryGroup` use the version 2
-`QUERY_BUCKETS` operation, so they need a version 2 server.
+Times are milliseconds since 1970-01-01 00:00 UTC, as `Instant.toEpochMilli()` gives them.
 
-**Threads.** A `TsdbClient` is one connection and is not thread safe: use one client per thread. The server runs
-the requests of different connections in parallel.
+```java
+long t0 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
+long[] times = {t0, t0 + 60_000, t0 + 120_000};
+float[] values = {41.5f, 42.0f, 41.8f};
+client.insert(flow, times, values);
+```
 
-**Inserts.** A batch is applied all or nothing, except that batches over 8M rows go out as several frames (as
-in the C client), each applied on its own.
+`insert` returns when the server has saved the rows. If you write the same series and time again, the new value
+replaces the old one. Send many rows per call: one call with 10,000 rows is far faster than 10,000 calls with one
+row. To keep sending without waiting for each answer, use `insertAsync`, then call `await()` once at the end.
 
-**Compression.** As the C client, inserts of every type (float32 too) travel packed: delta varints for
-timestamps and series ids, byte planes for values, all in one zstd frame (level 1 by default), a few bytes a row
-instead of 16. The client asks the server's version (HELLO) before its first insert and packs only for protocol
-version 3 or later; older servers get plain arrays. `setCompression(0)` sends plain arrays, which costs no CPU;
-negative levels are faster, higher ones smaller. Packing needs zstd-jni at run time: without it the client sends
-plain arrays. zstd-jni loads native code, so JDK 22 and later print a warning unless run with
-`--enable-native-access=ALL-UNNAMED`. `mvn package` copies it to `target/lib`, which the jar's manifest names, so
-`java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar` finds it.
+## Read raw points
+
+A time range includes its start and excludes its end. `Long.MIN_VALUE` and `Long.MAX_VALUE` mean "from the
+beginning" and "to the end".
+
+```java
+Points hour = client.queryPoints(flow, t0, t0 + 3_600_000);
+for (int i = 0; i < hour.size(); i++)
+    System.out.println(Instant.ofEpochMilli(hour.timestamp(i)) + " " + hour.value(i));
+
+Points newest = client.queryPoints(flow, Long.MIN_VALUE, Long.MAX_VALUE, Order.DESC, 10); // the 10 newest
+```
+
+For results too large for memory, `queryRaw` hands you the points in pieces of up to 16,384.
+
+## Aggregate
+
+`queryAgg` cuts a time range into equal intervals and returns the count, sum, minimum, maximum and average of each
+one. Intervals without data are left out.
+
+```java
+for (Bucket b : client.queryAgg(flow, t0, t0 + 86_400_000, 3_600_000)) // one bucket per hour
+    System.out.println(Instant.ofEpochMilli(b.start()) + " avg " + b.avg() + " max " + b.max());
+```
+
+An interval of 0 gives one bucket for the whole range.
+
+## Group by day in a time zone
+
+`queryGroup` groups by calendar units: `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK` (Monday to Sunday), `MONTH`,
+`QUARTER` and `YEAR`, in UTC or in a time zone.
+
+```java
+Group osloDays = Group.of(Unit.DAY).in("Europe/Oslo"); // or .in(ZoneId.of("Europe/Oslo"))
+for (Bucket b : client.queryGroup(flow, Long.MIN_VALUE, Long.MAX_VALUE, osloDays))
+    System.out.println(Instant.ofEpochMilli(b.start()) + " " + b.count());
+
+Group quarterHours = Group.of(Unit.MINUTE, 15);        // 15 minutes per bucket, in UTC
+```
+
+A day in Oslo starts at local midnight. That is 23:00 UTC in winter and 22:00 UTC in summer, and the days when
+the clocks change have 23 or 25 hours. Each bucket's `start()` is the UTC time its day began.
+
+The server only knows UTC. The client looks up the time zone in Java's own time zone data (`java.time`), works
+out when each local day begins, and sends those times to the server. `osloDays.bounds(start, end)` returns these
+times if you want them, and `queryBounds` takes your own list of start times.
+
+## Value types and nulls
+
+A series holds one type of value, chosen when it is created:
+
+| `ValueType` | Java array | Note |
+| --- | --- | --- |
+| `FLOAT32` | `float[]` | what `series(name)` creates |
+| `FLOAT64` | `double[]` | |
+| `INT64` | `long[]` | sums are exact (`isum()`, `imin()`, `imax()` in a `Bucket`) |
+| `BOOL` | `boolean[]` | sums count `true` as 1 |
+| `STATE` | `int[]` | names such as "running", stored as numbers: `client.state(series, "running")` |
+
+A `Column` holds the values. A null means "unknown value"; mark nulls with a `BitSet`:
+
+```java
+long[] times4 = {t0, t0 + 60_000, t0 + 120_000, t0 + 180_000};
+BitSet unknown = new BitSet();
+unknown.set(2); // the third value is unknown
+client.insertSeriesValues(energy, times4, Column.ofLongs(1_000, 1_250, 0, 1_900).withNulls(unknown));
+
+ValuePoints read = client.queryValues(energy, Long.MIN_VALUE, Long.MAX_VALUE);
+long[] wh = read.values().longs();
+boolean missing = read.values().isNull(2); // true
+```
+
+Aggregates skip nulls. `TypedExample.java` in the example folder shows all of this, with state names too.
+
+## Compression
+
+Inserts are compressed with zstd, level 1, by default. A row then takes a few bytes on the network instead of
+16 or more. The client only compresses when the server supports it (version 3 or newer) and zstd-jni is on the
+class path; otherwise it sends rows uncompressed.
+
+```java
+client.setCompression(0);  // off: less CPU, more network traffic
+client.setCompression(3);  // smaller, slower; any zstd level works
+long sent = client.bytesSent();
+```
+
+zstd-jni loads native code. On Java 22 and newer, run with `--enable-native-access=ALL-UNNAMED` to avoid a
+warning.
+
+## Errors
+
+A failed request throws `TsdbException`. Its `status()` is one of the `Status.ERR_*` codes, and `getMessage()`
+explains it. After an error from the server the client still works. After a network error `isOpen()` is false:
+make a new client. Bad arguments, such as arrays of different lengths, throw `IllegalArgumentException` before
+anything is sent.
 
 ## Insert benchmark
 
-`ai.intellistream.tsdb.bench.InsertBench` is the Java counterpart of `tsdbc-bench load`. It reads a RowBinary
-file (u32 series, i64 ts, f32 value; 16 bytes a row), creates the series, and inserts the file with the
-many-series layout in batches of 1M rows, up to four in flight, over N connections. It prints rows per second and
-the bytes sent per row.
+`InsertBench` measures how fast the client can insert. It reads a file of rows made by `tsdb-bench`, sends it over
+one or more connections, and prints rows per second and bytes per row.
 
 ```sh
-make -C ../.. && ../../build/tsdb-bench --export /tmp/x.rb --series 10 --points 100000
+../../build/tsdb-bench --export /tmp/x.rb --series 10 --points 100000
 ../../build/tsdbd --dir /tmp/bench-db --port 7070 &
 mvn -q package -DskipTests
 java --enable-native-access=ALL-UNNAMED -cp target/tsdb-client-0.1.0-SNAPSHOT.jar \
-    ai.intellistream.tsdb.bench.InsertBench /tmp/x.rb --port 7070 --conns 4 --batch 1000000 --compression 1
+    ai.intellistream.tsdb.bench.InsertBench /tmp/x.rb --port 7070 --conns 4 --compression 1
 ```
 
-`--compression off` sends plain arrays; `--host` picks another server. Small files mostly measure the JIT
-warming up: use a few hundred million rows.
+`--compression off` sends rows uncompressed. Use a large file (hundreds of millions of rows): small runs mostly
+measure Java warming up.
+
+## Build, test and docs
+
+```sh
+make -C ../..           # the server, which the tests start
+mvn package             # build and run all tests
+mvn javadoc:javadoc     # API docs in target/reports/apidocs/index.html
+```
+
+The tests start `../../build/tsdbd` themselves, each on a free port with a fresh directory. Use
+`-Dtsdbd=/path/to/tsdbd` to test another server binary and `-Dtsdb.test.dir=/path` to choose where the test data
+goes.
