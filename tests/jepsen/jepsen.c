@@ -69,6 +69,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1043,6 +1044,16 @@ int main(int argc, char **argv)
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
+    /* Two runs on one directory wipe and write each other's database, and the checker then reports the other run's
+     * writes as lost acknowledged writes. The lock beside the directory (it survives the wipe) is held until exit. */
+    char lockpath[1100];
+    snprintf(lockpath, sizeof lockpath, "%s.lock", dir);
+    int lockfd = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (lockfd < 0 || flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+        fprintf(stderr, "jepsen: %s is in use by another run (or cannot be locked: %s); use a --dir of your own\n",
+                dir, strerror(errno));
+        return 2;
+    }
     char cmd[1200];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0)

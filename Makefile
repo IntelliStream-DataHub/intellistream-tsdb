@@ -364,7 +364,9 @@ $(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB)
 
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.
-JEPSEN_DIR ?= /tmp/tsdb-jepsen
+# One directory per tree: worktrees run make jepsen at the same time, and a shared directory turns the other run's
+# activity into reported "lost writes". jepsen also refuses a directory another run holds.
+JEPSEN_DIR ?= /tmp/tsdb-jepsen-$(shell printf %s "$(CURDIR)" | cksum | cut -d' ' -f1)
 JEPSEN_SEEDS ?= 1 2 3
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so jepsen-selftest
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
