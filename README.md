@@ -31,6 +31,8 @@ average). You can link tsdb into your program as a library, or run its server,
   time bucket: fixed buckets (every 5 minutes) or calendar ones (day, week,
   month, quarter, year). The server works in UTC; the clients turn your local
   time zone into UTC for you.
+- Downsample a series to N points that keep its shape, for charts: the peaks
+  and dips stay (LTTB), and every point returned is a real stored point.
 - Sums of int64 values are exact. Sums of float values can differ in the last
   digits from one run to the next, as in ClickHouse, because the order of the
   additions changes. If exact sums matter, store the value as an int64 in fixed
@@ -280,6 +282,7 @@ The quick start used these. Use a directory you can write to instead of `/data/s
 build/tsdb /data/sensors import < rows.csv          # lines of: series,time,value
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2024-01-02 avg 5m
 build/tsdb /data/sensors query pump7.flow now-1h now raw --desc --limit 10
+build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 lttb 1000   # 1000 points for a chart
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 all 1mo --tz Europe/Oslo
 ```
 

@@ -63,6 +63,91 @@ covered, as ClickHouse counts processed rows: a granule answered from its
 statistics counts its rows without reading them, which is how a scan can
 report billions of rows a second.
 
+## Downsampling: LTTB
+
+`tsdb_query_lttb` (and `QUERY_LTTB`, `tsdbc_query_lttb`, `tsdb DIR query S A B
+lttb N`) returns N of a range's points that keep the series' shape on a chart:
+Largest-Triangle-Three-Buckets (Sveinn Steinarsson, "Downsampling Time Series
+for Visual Representation", 2013). The points are real stored points with their
+exact values, in time order, so a chart of 1,000 points from a billion looks
+like the billion, spikes included, where per-bucket averages would flatten them.
+
+The algorithm, over the n points of the range:
+
+- The first and the last point are kept. Points 1 .. n-2 fall into N-2 buckets
+  of nearly equal count: bucket b starts at `floor(b * every) + 1` with
+  `every = (n-2)/(N-2)` in doubles, exactly as the paper's code, ClickHouse's
+  `largestTriangleThreeBuckets` and the TimescaleDB toolkit's `lttb()` bound
+  them, so that the same points come out. Exact integer division
+  (`b(n-2)/(N-2)`) would be the cleaner rule, but where b·every rounds just
+  below an integer it starts the bucket one point later: n = 17 with N = 13
+  already differs, and so do about 5% of random (n, N) pairs up to n = 1e8,
+  each such case changing the chosen points. Past n = 2^53 the doubles lose
+  whole points of a boundary, as they do in those systems.
+- From each bucket, the point that forms the largest triangle with the point
+  kept from the previous bucket and the mean (time, value) of the next bucket
+  is kept; for the last bucket, the "next bucket" is the rest of the points
+  from `floor((N-2) * every) + 1`: the last point, or the last two where that
+  product rounds below n-2 (as in the paper's code). The area
+  is the paper's `|(ax - cx)(y - ay) - (ax - x)(cy - ay)| / 2`. Of equal areas
+  the first point wins; if no area compares (an overflow to NaN, only with
+  values near the float64 limit), the bucket's first point.
+- n <= N returns every point. N < 3 is `TSDB_ERR_INVALID`: one or two points
+  would only be the ends, which a caller can ask for directly, and a silent
+  "first and last" for a chart of 2 pixels hides a mistake.
+- Points are the known, finite values. Nulls, NaN and infinities are skipped:
+  they have no place on a chart, and one NaN would make every area of the
+  previous bucket NaN through the mean. State series are `TSDB_ERR_INVALID`
+  (codes have no order to draw); bools are 0 and 1; int64 values are rounded
+  to doubles for the area only.
+- x is milliseconds since the range's first point, as a double: epoch
+  milliseconds (1.7e12) squared in the area would lose the low bits that
+  separate neighbouring points.
+- Where other systems can still choose differently: they skip no NaN (a NaN
+  area never wins there, and poisons the next bucket's mean), and they measure
+  x from the epoch (ClickHouse) or in their own unit, which rounds the areas
+  differently; only areas equal to the last bits can then pick another point.
+
+How it reads (src/query.c, one snapshot for every pass, so concurrent inserts,
+flushes and merges cannot tear the result, and followers work as for any
+query):
+
+1. **Count.** The bucket boundaries need n. The granules of the range are
+   grouped like the aggregates' clusters; a granule that lies inside the range,
+   overlaps no other source (so holds no replaced row) and has a finite float
+   sum (a NaN or an infinity would make it NaN or infinite) counts
+   `count - nulls` from its index entry without decoding. The rest (the range's
+   edges, overlapping sources through the deduplicating merge, granules with
+   NaN, memtable rows) are streamed and counted.
+2. **Choose.** Choosing in bucket b needs the mean of bucket b+1, known only
+   once that bucket has been read. While two buckets fit in 32 MiB (16 bytes a
+   point: timestamp and value; buckets up to 1M points), one pass keeps the
+   points of the bucket being chosen from and of the one being read, and
+   chooses when the next bucket ends. Larger buckets (a billion points into a
+   few hundred) take two passes instead: the means of every bucket first
+   (O(N) memory), then the choice while streaming again. Both add the
+   coordinates in time order from zero, so they produce the same means and the
+   same points; `test_lttb` runs every case both ways.
+
+Cost: one decode of the range (two for huge buckets) plus the count, which
+decodes nothing for the granules alone in their span: on 10M points, about
+two to three times a raw read of the same range. Memory: up to 32 MiB of
+buffered buckets per running query (so on a server, times its query workers),
+or O(N) means; plus, as for the aggregates, one 32-byte item per granule of the
+range and per memtable run for the count (a series of 1e10 points in
+8192-row granules: 1.2M items, about 39 MB). The
+query statistics describe one read of the range, as for a raw query, with the
+points returned as `result_rows`; the count and the means pass are not added.
+
+Tests: `tests/test_lttb.c` checks the engine point for point against a
+straightforward array implementation (`tests/lttb_ref.h`) over what
+`tsdb_query_values` returns: random walks, steps, spikes, constants, monotonic
+series, NaN and infinities, values near the float64 limit, irregular times,
+nulls, every numeric type, thresholds 3, 4, n-1, n, n+1 and beyond, ranges
+that cut granules; with the data in memtables, in overlapping parts with
+corrections, merged, and through a follower. `test_server` does the same over
+the network.
+
 ## Storage
 
 A database is a directory:
