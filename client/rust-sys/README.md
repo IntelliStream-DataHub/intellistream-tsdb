@@ -25,7 +25,17 @@ kernels pick AVX-512, AVX2 or scalar code at runtime either way. The flags are
 the Makefile's: `-std=gnu11 -O3 -fno-math-errno -ffp-contract=off`, so parts
 written by a Rust program are byte for byte those `make` would write.
 
-`TSDB_SRC_DIR` points the build at another checkout of the repository.
+`TSDB_SRC_DIR` points the build at another checkout of the repository. Outside
+the repository (a package of this crate, such as the Python sdist) the build
+uses `csrc/`, the copy of the C sources that `vendor.sh` makes; `make
+python-sdist` runs it.
+
+On ELF targets the engine's objects are linked into one with `cc -r` and
+`objcopy` keeps only the `tsdb_*` symbols global, as `tools/libtsdb.map` does
+for `libtsdb.so`: the engine's internal names (`pool_new`, `wal_open`, ...)
+cannot clash with another library's in the program that links it
+(`tests/symbols.rs`). `OBJCOPY` names the tool if it is not `objcopy` or
+`llvm-objcopy`.
 
 ## Why hand-written
 

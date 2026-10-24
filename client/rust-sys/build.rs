@@ -17,7 +17,11 @@ fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     println!("cargo:rerun-if-env-changed=TSDB_SRC_DIR");
     println!("cargo:rerun-if-env-changed=TSDB_LIB_DIR");
-    let root = env::var_os("TSDB_SRC_DIR").map(PathBuf::from).unwrap_or_else(|| manifest.join("../.."));
+    // the repository around the crate, else the copy vendor.sh made for a package (the Python sdist)
+    let root = env::var_os("TSDB_SRC_DIR").map(PathBuf::from).unwrap_or_else(|| {
+        let repo = manifest.join("../..");
+        if repo.join("include/tsdb.h").exists() { repo } else { manifest.join("csrc") }
+    });
     let include = root.join("include");
     assert!(include.join("tsdb.h").exists(), "{} has no include/tsdb.h: set TSDB_SRC_DIR", root.display());
     println!("cargo:include={}", include.display());
@@ -93,9 +97,38 @@ fn main() {
             objects.extend(b.compile_intermediates());
         }
     }
+    let objects = hide_internal_symbols(&out, objects);
     cc::Build::new().objects(objects).out_dir(&out).compile("tsdb");
     println!("cargo:rustc-link-lib=m");
     if zstd_include.is_empty() {
         println!("cargo:rustc-link-lib=zstd");
     }
+}
+
+/// Links the engine's objects into one and keeps only the `tsdb_*` symbols global, as
+/// tools/libtsdb.map does for libtsdb.so. Otherwise every internal name (pool_new, wal_open,
+/// xxh64, ...) lands in the user's binary, where another library defining the same name breaks
+/// the link or, through an archive, silently takes tsdb's calls. ELF targets only (`cc -r` and
+/// objcopy); elsewhere the objects are archived as they are.
+fn hide_internal_symbols(out: &Path, objects: Vec<PathBuf>) -> Vec<PathBuf> {
+    let os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    if !matches!(os.as_str(), "linux" | "android" | "freebsd" | "netbsd" | "openbsd" | "dragonfly") {
+        return objects;
+    }
+    let merged = out.join("tsdb_engine.o");
+    let cc = cc::Build::new().get_compiler();
+    let status = cc.to_command().args(["-r", "-nostdlib", "-o"]).arg(&merged).args(&objects).status();
+    assert!(status.is_ok_and(|s| s.success()), "{:?} -r failed to link the engine's objects", cc.path());
+    println!("cargo:rerun-if-env-changed=OBJCOPY");
+    let tools = env::var("OBJCOPY").map(|o| vec![o]).unwrap_or_else(|_| vec!["objcopy".into(), "llvm-objcopy".into()]);
+    for tool in &tools {
+        let status =
+            std::process::Command::new(tool).args(["--wildcard", "--keep-global-symbol=tsdb_*"]).arg(&merged).status();
+        match status {
+            Ok(s) if s.success() => return vec![merged],
+            Ok(s) => panic!("{tool} failed ({s}) to localize the engine's internal symbols"),
+            Err(_) => continue,
+        }
+    }
+    panic!("no objcopy found (tried {tools:?}; set OBJCOPY) to localize the engine's internal symbols");
 }

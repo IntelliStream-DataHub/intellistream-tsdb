@@ -8,6 +8,8 @@ publish = false
 readme = "README.md"
 links = "tsdb"
 build = "build.rs"
+# csrc/ is the engine copied by vendor.sh: listed explicitly because it is not in git
+include = ["Cargo.toml", "Cargo.lock", "README.md", "build.rs", "layout.c", "src/**", "tests/**", "csrc/**"]
 keywords = ["timeseries", "database", "ffi"]
 categories = ["database", "external-ffi-bindings"]
 
