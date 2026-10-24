@@ -277,3 +277,19 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 # URING=0 keeps Podman's stock seccomp profile, which blocks io_uring as production does: tsdbd then runs on epoll.
 test-almalinux10:
 	tests/distro/almalinux10.sh
+
+# The programs in examples/ are what the README's quick start builds and runs.
+$(B)/embedded-example: examples/embedded.c include/tsdb.h include/tsdb_calendar.h $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+$(B)/client-example: examples/client.c client/tsdb_client.h include/tsdb_calendar.h $(CLIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+
+all: $(B)/embedded-example $(B)/client-example
+
+# Runs the README's quick start, word for word, in a scratch directory.
+test: test-quickstart
+test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
+	B=$(B) tests/test_quickstart.sh
+
+.PHONY: test-quickstart
