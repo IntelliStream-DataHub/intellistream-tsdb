@@ -30,6 +30,20 @@
  * tracked operation, for a process that carries on. With $CRASHFS_EIO_ONLY, only files whose name
  * starts with it fail (e.g. "wal_"). If $CRASHFS_MARK is set, the path of the
  * file that failed is written there, so a harness knows the fault happened.
+ *
+ * With CRASHFS_TEAR=1 a power loss keeps what a real disk may keep rather
+ * than the least it must (each choice drawn from $CRASHFS_SEED):
+ *  - of a file's unsynced appends, a random prefix: none, all, or up to a
+ *    512-byte sector boundary (the page cache writes back in any order, but
+ *    a sector is written whole);
+ *  - or, at random, nothing after the durable end but garbage up to the end
+ *    of the sector that holds it (that sector was being written when the
+ *    power went; the bytes before the durable end were synced and stay);
+ *  - of the sectors rewritten in place since the last sync, each one old or
+ *    new at random (MANIFEST is rewritten in place);
+ *  - of the directory operations not made durable, a random subset, in the
+ *    order they were made for each name: once one on a name is undone,
+ *    every later one on that name (or inside it) is undone too.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -66,7 +80,15 @@ typedef struct file {
     int ndirty;
     bool used;
     bool lying; /* after an injected EIO: syncs succeed without making anything durable */
+    struct old_sector *old; /* CRASHFS_TEAR: durable sectors rewritten since the last sync, as they were */
+    size_t nold, capold;
 } file;
+
+#define SECTOR 512
+struct old_sector {
+    off_t off;
+    unsigned char data[SECTOR];
+};
 
 typedef enum { OP_CREATE, OP_RENAME, OP_UNLINK, OP_MKDIR } op_kind;
 
@@ -87,6 +109,8 @@ static double prob;
 static long warmup, ops;
 static uint64_t rng;
 static volatile sig_atomic_t crash_requested;
+static bool tear; /* CRASHFS_TEAR=1 */
+static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the power loss kept, for the message */
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
 static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error */
 static char mark[PATH_MAX], eio_only[64];
@@ -159,6 +183,7 @@ __attribute__((constructor)) static void init(void)
         snprintf(eio_only, sizeof eio_only, "%s", getenv("CRASHFS_EIO_ONLY"));
     if (getenv("CRASHFS_MARK"))
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
+    tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
     signal(SIGUSR2, on_usr2);
     active = files && dops;
 }
@@ -223,6 +248,36 @@ static file *file_get(const char *path, bool create_new)
     return f;
 }
 
+/* CRASHFS_TEAR: keeps the durable content of the sectors in [off, end) that
+ * are about to change, once per sync, so a power loss can bring them back. */
+static void keep_old(file *f, int fd, off_t off, off_t end)
+{
+    if (!tear || f->lying)
+        return;
+    if (end > f->durable)
+        end = f->durable;
+    for (off_t s = off / SECTOR * SECTOR; s < end; s += SECTOR) {
+        bool have = false;
+        for (size_t i = 0; i < f->nold && !have; i++)
+            have = f->old[i].off == s;
+        if (have)
+            continue;
+        if (f->nold == f->capold) {
+            size_t cap = f->capold ? 2 * f->capold : 16;
+            struct old_sector *o = realloc(f->old, cap * sizeof *o);
+            if (!o)
+                return;
+            f->old = o;
+            f->capold = cap;
+        }
+        struct old_sector *o = &f->old[f->nold++];
+        o->off = s;
+        memset(o->data, 0, SECTOR);
+        if (pread(fd, o->data, SECTOR, s) < 0) {
+        }
+    }
+}
+
 static void add_dirop(op_kind k, const char *a, const char *b, const char *saved)
 {
     if (ndops == MAX_OPS)
@@ -275,6 +330,86 @@ static void rm_tree(const char *p)
     }
 }
 
+/* CRASHFS_TEAR: what a disk may keep of a file (see the header). */
+static void tear_file(file *f, int fd, off_t size)
+{
+    /* sectors rewritten in place: old or new, each; past the current end
+     * (an unsynced truncate) the old ones come back */
+    for (size_t i = 0; i < f->nold; i++) {
+        struct old_sector *o = &f->old[i];
+        off_t len = f->durable - o->off < SECTOR ? f->durable - o->off : SECTOR;
+        if (o->off + len > size || urand() < 0.5) {
+            tear_old++;
+            if (real_pwrite(fd, o->data, (size_t)len, o->off) < 0) {
+            }
+        }
+    }
+    if (size <= f->durable)
+        return;
+    off_t keep;
+    off_t sector_end = (f->durable + SECTOR - 1) / SECTOR * SECTOR;
+    if (f->durable % SECTOR && urand() < 0.25) {
+        /* the sector holding the durable end was being written: garbage after that end */
+        keep = sector_end < size ? sector_end : size;
+        tear_garbage++;
+        unsigned char junk[SECTOR];
+        for (off_t k = 0; k < keep - f->durable; k++)
+            junk[k] = (unsigned char)(urand() * 256);
+        if (real_pwrite(fd, junk, (size_t)(keep - f->durable), f->durable) < 0) {
+        }
+    } else {
+        /* cut at the durable end, at a sector boundary after it, or nowhere: one of them at random */
+        off_t first = f->durable / SECTOR * SECTOR + SECTOR;
+        off_t nb = first < size ? (size - 1 - first) / SECTOR + 1 : 0; /* boundaries strictly inside */
+        off_t k = (off_t)(urand() * (double)(nb + 2));
+        keep = k == 0 ? f->durable : k > nb ? size : first + (k - 1) * SECTOR;
+        if (keep > f->durable)
+            tear_prefix++;
+    }
+    if (keep < size && real_ftruncate(fd, keep) != 0) {
+    }
+}
+
+/* CRASHFS_TEAR: names whose undone operations force later ones on them (or inside them) to be undone too. */
+static bool name_cut(char **cut, size_t ncut, const char *name)
+{
+    if (!name[0])
+        return false;
+    for (size_t i = 0; i < ncut; i++) {
+        size_t n = strlen(cut[i]);
+        if (!strncmp(cut[i], name, n) && (name[n] == '\0' || name[n] == '/'))
+            return true;
+    }
+    return false;
+}
+
+static void tear_dirops(void)
+{
+    char **cut = malloc((2 * ndops + 1) * sizeof *cut);
+    size_t ncut = 0;
+    if (!cut)
+        return;
+    /* oldest first: each not durable op is kept at random, unless an earlier one on its names was undone */
+    for (size_t i = 0; i < ndops; i++) {
+        dirop *d = &dops[i];
+        if (d->done)
+            continue;
+        char srcdir[PATH_MAX];
+        dir_of(d->a, srcdir);
+        bool forced = name_cut(cut, ncut, d->a) || name_cut(cut, ncut, d->b) || name_cut(cut, ncut, srcdir) ||
+                      name_cut(cut, ncut, d->dir);
+        if (!forced && urand() < 0.5) {
+            d->done = true; /* reached the disk after all */
+            tear_kept++;
+            continue;
+        }
+        cut[ncut++] = d->a;
+        if (d->b[0])
+            cut[ncut++] = d->b;
+    }
+    free(cut);
+}
+
 /* Rolls the tracked tree back to what was made durable. Called with the lock held. */
 static void rollback(void)
 {
@@ -287,6 +422,11 @@ static void rollback(void)
         int fd = real_open(f->path, O_WRONLY);
         if (fd < 0)
             continue;
+        if (tear) {
+            tear_file(f, fd, st.st_size);
+            real_close(fd);
+            continue;
+        }
         for (int k = 0; k < f->ndirty; k++) { /* rewritten in place, never synced */
             off_t end = f->dirty[k].off + f->dirty[k].len;
             if (end > f->durable)
@@ -303,6 +443,8 @@ static void rollback(void)
         real_close(fd);
     }
     /* then directory entries, newest first */
+    if (tear)
+        tear_dirops();
     for (size_t i = ndops; i-- > 0;) {
         dirop *d = &dops[i];
         if (d->done)
@@ -330,8 +472,13 @@ static void rollback(void)
 __attribute__((noreturn)) static void power_loss(void)
 {
     rollback();
-    static const char msg[] = "crashfs: power loss\n";
-    if (real_write(2, msg, sizeof msg - 1) < 0) {
+    char msg[200];
+    int n = tear ? snprintf(msg, sizeof msg,
+                            "crashfs: power loss (torn: %u unsynced prefixes kept, %u garbage tails, %u old sectors "
+                            "back, %u unsynced directory operations kept)\n",
+                            tear_prefix, tear_garbage, tear_old, tear_kept)
+                 : snprintf(msg, sizeof msg, "crashfs: power loss\n");
+    if (real_write(2, msg, (size_t)n) < 0) {
     }
     _exit(99);
 }
@@ -498,6 +645,7 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
     if (fail)
         n = n > 1 ? n / 2 : 0;
     if (f && off < f->durable) { /* a rewrite of durable data */
+        keep_old(f, fd, off, off + (off_t)n);
         if (f->ndirty < MAX_DIRTY) {
             f->dirty[f->ndirty].off = off;
             f->dirty[f->ndirty].len = (off_t)n;
@@ -549,6 +697,7 @@ static int do_sync(int fd, bool data_only)
             if (f && !f->lying) {
                 f->durable = st.st_size;
                 f->ndirty = 0;
+                f->nold = 0;
             }
         }
     }
@@ -653,6 +802,8 @@ int ftruncate(int fd, off_t len)
     pthread_mutex_lock(&lock);
     maybe_crash();
     file *f = file_get(fdpath[fd], false);
+    if (f && len < f->durable)
+        keep_old(f, fd, len, f->durable);
     if (f && len < f->durable && f->ndirty < MAX_DIRTY) { /* cutting durable data, unsynced */
         f->dirty[f->ndirty].off = len;
         f->dirty[f->ndirty].len = f->durable - len;

@@ -22,6 +22,10 @@ native = ["embedded", "tsdb-sys/native"]
 zstd = { version = "0.13", default-features = false }
 tsdb-sys = { path = "../rust-sys", optional = true }
 
+# TCP keepalive options, which std does not expose
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [[example]]
 name = "embedded_quickstart"
 required-features = ["embedded"]

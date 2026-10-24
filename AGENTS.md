@@ -20,6 +20,9 @@ make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
 make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere/SandyBridge if installed
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
+make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end, uring and epoll (~2 min, same tools);
+                          # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/; mutate.py checks it has teeth;
+                          # make integration-selftest tests the harness itself (seconds)
 ```
 
 Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only; not with `NO_URING=1`).
@@ -131,12 +134,21 @@ cgroup, so `nice` does not keep your work out of its way.
   innermost.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- The on-disk format is version 2 (`FORMAT_VERSION`): 80-byte granule entries
-  with typed statistics. Before the first release, older formats need not stay
-  readable (the user decided this on 2026-10-24): a layout change bumps
-  `FORMAT_VERSION`, and the reader for the old layout may go with it. The
-  version 1 readers (64-byte entries, float32; 16-byte WAL rows) are due to be
-  removed. Value blocks name their codec, so new codecs need no version bump.
+- The on-disk format is version 3 (`FORMAT_VERSION`): 80-byte granule entries
+  with typed statistics, a checksum over each part's header, index and footer,
+  checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Before
+  the first release, older formats need not stay readable (the user decided
+  this on 2026-10-24): a layout change bumps `FORMAT_VERSION`, and a database of
+  another version is refused at open. Value blocks name their codec, so new
+  codecs need no version bump.
+- **Damage is never silent.** A torn tail of an append-only file is cut; a bad
+  record with a valid one after it, a read error or a broken part fails the open
+  (`TSDB_ERR_CORRUPT` / `TSDB_ERR_IO`) with a log line. Never treat a read error
+  as end of file, skip a part or drop a WAL record quietly. The one exception:
+  granule payloads are hashed only with `verify_checksums` (default off), so
+  without it a damaged granule decodes to wrong values; decoders must therefore
+  be safe (no UB, no overread) on any bytes. With `fsync = 0` a power loss looks
+  like damage and fails the open.
 - **Protocol.** There has been no release yet, so the wire protocol may change
   without keeping old clients working (the user decided this on 2026-10-24): no
   legacy paths for earlier protocol versions in new designs. Every change must

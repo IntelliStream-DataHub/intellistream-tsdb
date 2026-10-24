@@ -546,12 +546,14 @@ int decimal_bp_decode(const uint8_t *in, size_t len, size_t n, float *out)
     uint32_t nexc = load32(in + 10);
     if (e > DEC_MAX_EXP || nexc > n)
         return TSDB_ERR_CORRUPT;
-    int64_t k;
+    /* unsigned, so that a damaged block wraps instead of overflowing (with
+     * verify_checksums off the decoder is the first to see damaged bytes) */
+    uint64_t k;
     memcpy(&k, in + 2, 8);
     const double inv = dec_inv[e];
     const uint8_t *p = in + DEC_HDR, *end = in + len;
     uint32_t z[DBP_VEC];
-    out[0] = (float)((double)k * inv);
+    out[0] = (float)((double)(int64_t)k * inv);
     for (size_t v0 = 0; v0 + 1 < n; v0 += DBP_VEC) {
         size_t nv = MIN((size_t)DBP_VEC, n - 1 - v0);
         if (p >= end || *p > 32)
@@ -564,8 +566,8 @@ int decimal_bp_decode(const uint8_t *in, size_t len, size_t n, float *out)
         p += pb;
         float *o = out + v0 + 1;
         for (size_t i = 0; i < nv; i++) {
-            k += unzigzag(z[i]);
-            o[i] = (float)((double)k * inv);
+            k += (uint64_t)unzigzag(z[i]);
+            o[i] = (float)((double)(int64_t)k * inv);
         }
     }
     if (p + (size_t)nexc * 8 != end)
@@ -590,27 +592,27 @@ int decimal_decode(const uint8_t *in, size_t len, size_t n, float *out)
     if (e > DEC_MAX_EXP || (width != 1 && width != 2 && width != 4) || nexc > n ||
         len != DEC_HDR + (n - 1) * (size_t)width + (size_t)nexc * 8)
         return TSDB_ERR_CORRUPT;
-    int64_t k;
+    uint64_t k; /* unsigned: damage wraps (decimal_bp_decode) */
     memcpy(&k, in + 2, 8);
     const double inv = dec_inv[e];
     const uint8_t *p = in + DEC_HDR;
-    out[0] = (float)((double)k * inv);
+    out[0] = (float)((double)(int64_t)k * inv);
     if (width == 1) {
         for (size_t i = 1; i < n; i++) {
-            k += unzigzag(p[i - 1]);
-            out[i] = (float)((double)k * inv);
+            k += (uint64_t)unzigzag(p[i - 1]);
+            out[i] = (float)((double)(int64_t)k * inv);
         }
     } else if (width == 2) {
         for (size_t i = 1; i < n; i++) {
             uint16_t z;
             memcpy(&z, p + 2 * (i - 1), 2);
-            k += unzigzag(z);
-            out[i] = (float)((double)k * inv);
+            k += (uint64_t)unzigzag(z);
+            out[i] = (float)((double)(int64_t)k * inv);
         }
     } else {
         for (size_t i = 1; i < n; i++) {
-            k += unzigzag(load32(p + 4 * (i - 1)));
-            out[i] = (float)((double)k * inv);
+            k += (uint64_t)unzigzag(load32(p + 4 * (i - 1)));
+            out[i] = (float)((double)(int64_t)k * inv);
         }
     }
     const uint8_t *x = p + (n - 1) * (size_t)width;
@@ -1020,7 +1022,8 @@ static double entropy_words(const uint8_t *p, size_t len, size_t width)
  *    allowed): bit-packed zigzag deltas of the integers, with ZSTD on top when
  *    it helps. This won on every such sensor stream measured.
  *  - anything else: Chimp, bit delta, byte-stream split or ALP_rd. Cheap
- *    entropy estimates shortlist two, both are compressed, the smaller stays.
+ *    entropy estimates shortlist three, all three are compressed, the smallest
+ *    stays (docs/design.md, "How AUTO picks").
  */
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out)
 {

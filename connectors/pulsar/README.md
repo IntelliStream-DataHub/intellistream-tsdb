@@ -16,7 +16,8 @@ What it promises:
   on disk, and a crash of its host can lose points the sink has already
   acknowledged: run tsdbd behind this sink without those options. If the sink, tsdbd or Pulsar crashes, unacknowledged messages are delivered
   again. Writing a point twice is harmless: tsdb keeps one value per series and
-  time, the last one written.
+  time, the last one written (but see the request timeout below for rewrites
+  of the same key).
 - **Order per series.** Points of one series are written in the order Pulsar
   delivered them, so a correction (same series and time, new value) wins over
   the value it corrects. A batch that fails is retried as it is, never
@@ -139,6 +140,7 @@ one instance at a time; with `--retain-ordering` keep `--parallelism 1`.
 | `retryMaxMs` | `30000` | longest delay; it doubles up to this |
 | `retryJitter` | `0.2` | random part of each delay (fraction) |
 | `connectTimeoutMs` | `10000` | timeout of a connection attempt |
+| `requestTimeoutMs` | `30000` | longest wait for tsdb on an open connection; `0` waits forever (see below) |
 | `defaultType` | `float64` | type of new series whose points name none |
 | `autoCreate` | `true` | create missing series; `false` dead-letters their points |
 | `deadLetterTopic` | empty | where refused messages go (see above); empty: `record.fail()` |
@@ -152,10 +154,23 @@ one instance at a time; with `--retain-ordering` keep `--parallelism 1`.
 
 | failure | what the sink does |
 |---|---|
-| connection refused, reset or timed out; `TSDB_ERR_IO` (disk or NFS gone), `NOMEM`, `CORRUPT`; any code it does not know | waits (exponential backoff with jitter, capped) and sends the **same** batch again; acknowledges nothing meanwhile |
+| connection refused, reset or timed out; no answer within `requestTimeoutMs` (the connection is closed); `TSDB_ERR_IO` (disk or NFS gone), `NOMEM`, `CORRUPT`; any code it does not know | waits (exponential backoff with jitter, capped) and sends the **same** batch again; acknowledges nothing meanwhile |
 | `LOCKED`, `STOPPED`, `READONLY` (a follower after a failover, a server shutting down) | as above, but first closes the connection, so the retry goes to the next endpoint in `hosts` |
 | `TSDB_ERR_INVALID` (bad name, wrong type), `NOTFOUND` (unknown series, `autoCreate=false`), `TOO_MANY_BUCKETS`; a message that does not parse; a value that is tsdb's encoding of null (int64 `-9223372036854775808`, the reserved NaN of float32/float64), which would silently read back as null | dead-letters that message; the rest of the batch is written |
 | the dead-letter topic refuses the message | keeps it unacknowledged and tries again (backoff), so the stream behind it waits; counted in `tsdb_dead_letter_failures`, logged as an error when only an operator can fix it (permissions, missing topic, size limit) |
+
+A tsdb that stops answering (an NFS outage parks its requests, a dead peer sends
+no reset) would block a writer for good, so every wait for tsdb on an open
+connection is bounded by `requestTimeoutMs` (30 s; `0` waits forever; the
+longest silence tolerated, not a deadline for a whole batch). On a
+timeout the sink closes the connection, backs off and sends the same batch again
+on a new one, as for any lost connection. Set it above the longest write you
+expect to take. A batch that is only slow is sent twice, and the first copy may
+still be parked in tsdb when the second one runs: it can then be applied after
+points the sink wrote later on the new connection, so for a key written more
+than once within that window the older value can win. Keys written once (the
+usual case: a point per series and time) are unaffected. TCP keepalive is on
+as well.
 
 Unknown codes are retried on purpose: a wrong "retry" stalls the sink where
 everyone can see it, a wrong "dead-letter" silently moves data aside. Later

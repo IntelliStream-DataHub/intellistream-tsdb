@@ -75,6 +75,15 @@ day  1700002800000 1380 40710.0
 `with` block, or call `client.close()` when you are done. Threads can share
 a client (they take turns) or open one each. `timeout` is in seconds.
 
+Without a `timeout` a call waits as long as the server takes, so a server that
+hangs (a stalled disk, a dead peer) hangs your program. With one, the connect
+and every later wait for the server is bounded: the longest silence it puts
+up with, not a deadline for the whole call (`client.set_timeout(30)` changes
+it later). A call that times out raises `TsdbError` with
+`tsdb_client.ERR_IO` and closes the client; connect again. TCP keepalive is on:
+after 30 s of silence the client probes every 10 s and drops the connection
+after 3 unanswered probes (`keepalive=False` turns it off).
+
 Errors are raised as `TsdbError`. Its `code` tells what went wrong, for
 example `tsdb_client.ERR_NOTFOUND`.
 

@@ -673,8 +673,11 @@ impl Inner {
 ///     host: Server name or address.
 ///     port: Server port (7070 by default).
 ///     timeout: Seconds to wait for the connection and for every later read
-///         or write; None waits forever. A call that times out closes the
-///         client.
+///         or write; None (the default) waits forever. A call that times out
+///         raises TsdbError (ERR_IO) and closes the client.
+///     keepalive: Turn TCP keepalive on (the default): after 30 s of silence
+///         the client probes every 10 s and drops the connection after 3
+///         unanswered probes, where the platform allows.
 ///
 /// Raises:
 ///     TsdbError: The connection failed.
@@ -692,7 +695,16 @@ impl Client {
         T: Send,
         F: FnOnce(&mut Inner) -> tc::Result<T> + Send,
     {
-        py.detach(|| f(&mut self.inner.lock().unwrap_or_else(|e| e.into_inner()))).map_err(|e| to_pyerr(py, e))
+        py.detach(|| {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let r = f(&mut inner);
+            // after an I/O error (a timeout included) the stream is out of step: close it
+            if inner.conn.as_ref().is_some_and(tc::Client::is_broken) {
+                inner.conn = None;
+            }
+            r
+        })
+        .map_err(|e| to_pyerr(py, e))
     }
 
     /// Runs `f` on the connection with the GIL released.
@@ -734,37 +746,61 @@ impl Client {
     }
 }
 
-fn connect(host: &str, port: u16, timeout: Option<Duration>) -> tc::Result<tc::Client> {
-    use std::net::ToSocketAddrs;
-    let Some(t) = timeout else {
-        return tc::Client::connect((host, port));
-    };
-    let mut last = closed();
-    for addr in (host, port).to_socket_addrs()? {
-        match tc::Client::connect_timeout(&addr, t) {
-            Ok(c) => {
-                c.set_timeout(Some(t))?;
-                return Ok(c);
-            }
-            Err(e) => last = e,
-        }
+fn connect(host: &str, port: u16, timeout: Option<Duration>, keepalive: bool) -> tc::Result<tc::Client> {
+    let c = tc::Client::connect_with((host, port), timeout)?;
+    if !keepalive {
+        c.set_keepalive(None)?;
     }
-    Err(last)
+    Ok(c)
+}
+
+/// A timeout in seconds as the client takes it: positive and finite, or None.
+/// Anything that does not make a `Duration` (too large, or under a nanosecond)
+/// is a ValueError too; `Duration::from_secs_f64` would panic on it.
+fn seconds(t: Option<f64>) -> PyResult<Option<Duration>> {
+    let bad = || PyValueError::new_err("timeout must be a positive number of seconds (at least 1e-9, finite)");
+    match t {
+        None => Ok(None),
+        Some(t) if !(t > 0.0 && t.is_finite()) => Err(bad()),
+        Some(t) => match Duration::try_from_secs_f64(t) {
+            Ok(d) if !d.is_zero() => Ok(Some(d)),
+            _ => Err(bad()),
+        },
+    }
 }
 
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (host = "127.0.0.1", port = 7070, timeout = None))]
-    fn new(py: Python<'_>, host: &str, port: u16, timeout: Option<f64>) -> PyResult<Self> {
-        let timeout = match timeout {
-            Some(t) if !(t > 0.0 && t.is_finite()) => {
-                return Err(PyValueError::new_err("timeout must be a positive number of seconds"));
-            }
-            t => t.map(Duration::from_secs_f64),
-        };
-        let c = py.detach(|| connect(host, port, timeout)).map_err(|e| to_pyerr(py, e))?;
+    #[pyo3(signature = (host = "127.0.0.1", port = 7070, timeout = None, keepalive = true))]
+    fn new(py: Python<'_>, host: &str, port: u16, timeout: Option<f64>, keepalive: bool) -> PyResult<Self> {
+        let timeout = seconds(timeout)?;
+        let c = py.detach(|| connect(host, port, timeout, keepalive)).map_err(|e| to_pyerr(py, e))?;
         Ok(Client { inner: Mutex::new(Inner { conn: Some(c), ..Inner::default() }), addr: format!("{host}:{port}") })
+    }
+
+    /// Changes how long a call waits for the server, in seconds; None waits forever.
+    ///
+    /// The limit applies to each wait for the server (sending or receiving), not
+    /// to a whole call. A call that times out raises TsdbError (ERR_IO) and closes
+    /// the client: connect again.
+    ///
+    /// Raises:
+    ///     ValueError: timeout is not a positive number.
+    ///     TsdbError: The client is closed.
+    #[pyo3(signature = (timeout))]
+    fn set_timeout(&self, py: Python<'_>, timeout: Option<f64>) -> PyResult<()> {
+        let t = seconds(timeout)?;
+        self.with(py, |c| c.set_timeout(t))
+    }
+
+    /// The timeout in seconds set at connect or by set_timeout; None waits forever.
+    ///
+    /// Raises:
+    ///     TsdbError: The client is closed.
+    #[getter]
+    fn timeout(&self, py: Python<'_>) -> PyResult<Option<f64>> {
+        self.with(py, |c| Ok(c.timeout().map(|d| d.as_secs_f64())))
     }
 
     /// Waits for pending inserts, then closes the connection.

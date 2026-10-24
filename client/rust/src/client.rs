@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use crate::calendar;
 use crate::error::{Error, Result, Status};
+use crate::keepalive::{self, KeepAlive};
 use crate::pack;
 use crate::protocol::extend_i64s;
 use crate::protocol::{
@@ -137,7 +138,7 @@ impl Client {
     /// Connects to one address, giving up after `timeout`.
     ///
     /// Only the connect is bounded; use [`set_timeout`](Client::set_timeout) for
-    /// later reads and writes.
+    /// later reads and writes, or [`connect_with`](Client::connect_with) for both.
     ///
     /// # Errors
     ///
@@ -146,13 +147,48 @@ impl Client {
         Client::from_stream(TcpStream::connect_timeout(addr, timeout)?)
     }
 
+    /// Connects like [`connect`](Client::connect) with `timeout` bounding the
+    /// connect to each address and, afterwards, every wait for the server.
+    ///
+    /// `None` waits as long as the operating system does, as `connect` does. This
+    /// is `connect_timeout` plus [`set_timeout`](Client::set_timeout) for
+    /// every address `addr` resolves to.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if no address accepts the connection in time, or if
+    /// `timeout` is zero.
+    pub fn connect_with(addr: impl ToSocketAddrs, timeout: Option<Duration>) -> Result<Client> {
+        let Some(t) = timeout else {
+            return Client::connect(addr);
+        };
+        let mut last = io::Error::new(io::ErrorKind::InvalidInput, "the address resolves to nothing");
+        for a in addr.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&a, t) {
+                Ok(s) => {
+                    let c = Client::from_stream(s)?;
+                    c.set_timeout(Some(t))?;
+                    return Ok(c);
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last.into())
+    }
+
     /// Wraps a TCP stream that is already connected to tsdbd.
+    ///
+    /// Sets `TCP_NODELAY` and turns TCP keepalive on with the
+    /// [`KeepAlive`] defaults (a failure to set the probe options is ignored;
+    /// see [`set_keepalive`](Client::set_keepalive)). The stream's own timeouts
+    /// are kept.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] if `TCP_NODELAY` cannot be set on the stream.
     pub fn from_stream(stream: TcpStream) -> Result<Client> {
         stream.set_nodelay(true)?;
+        let _ = keepalive::apply(&stream, Some(KeepAlive::default()));
         Ok(Client {
             stream: BufReader::with_capacity(READ_BUF, stream),
             req: FrameBuf::default(),
@@ -201,9 +237,18 @@ impl Client {
         self.bytes_sent
     }
 
-    /// Sets the read and write timeout of the socket; `None` waits forever.
+    /// Bounds every wait for the server, sending or receiving, to `timeout`;
+    /// `None` (the default) waits forever.
     ///
-    /// A call that times out leaves the client unusable.
+    /// The bound applies to each wait on the socket, not to a whole call: a
+    /// reply that arrives in pieces, each within `timeout`, is accepted. A call
+    /// that times out fails with [`Error::Io`] of kind
+    /// [`TimedOut`](io::ErrorKind::TimedOut) and leaves the client unusable:
+    /// the reply may still arrive later, so every later call fails at once
+    /// ([`is_broken`](Client::is_broken)). Close the client and connect again.
+    ///
+    /// A stalled server (a hung disk, a dead peer without a reset) otherwise
+    /// parks the caller for good.
     ///
     /// # Errors
     ///
@@ -212,6 +257,33 @@ impl Client {
         let s = self.stream.get_ref();
         s.set_read_timeout(timeout)?;
         s.set_write_timeout(timeout)?;
+        Ok(())
+    }
+
+    /// The timeout set by [`set_timeout`](Client::set_timeout); `None` waits forever.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.stream.get_ref().read_timeout().ok().flatten()
+    }
+
+    /// Whether an earlier I/O or protocol error (a timeout included) made the
+    /// client unusable: every call fails at once.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Sets the TCP keepalive probes of the connection; `None` turns them off.
+    ///
+    /// New clients start with [`KeepAlive::default`]: probes after 30 s of
+    /// silence, every 10 s, 3 unanswered probes drop the connection. Probes
+    /// notice a peer that is gone without a reset while the connection is idle;
+    /// they do not bound a request, [`set_timeout`](Client::set_timeout) does.
+    /// Only Unix sets the probe values; elsewhere the call does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the socket refuses the option.
+    pub fn set_keepalive(&self, keepalive: Option<KeepAlive>) -> Result<()> {
+        keepalive::apply(self.stream.get_ref(), keepalive)?;
         Ok(())
     }
 
@@ -1303,10 +1375,22 @@ impl Client {
             )));
         }
         let r = f(self);
-        if matches!(r, Err(Error::Io(_) | Error::Protocol(_))) {
-            self.broken = true;
+        match r {
+            Err(Error::Io(e)) => {
+                self.broken = true;
+                // a socket timeout is WouldBlock on Unix, TimedOut on Windows
+                Err(Error::Io(if e.kind() == io::ErrorKind::WouldBlock {
+                    io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for the server")
+                } else {
+                    e
+                }))
+            }
+            Err(Error::Protocol(_)) => {
+                self.broken = true;
+                r
+            }
+            r => r,
         }
-        r
     }
 
     /// Sends a request after collecting pending inserts, and reads its reply into `body`.

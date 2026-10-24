@@ -6,8 +6,15 @@
  * The memtable becomes parts when it is full or old enough.
  *
  * WAL: one segment file wal_<seq>.log per memtable, holding records of
- * [u32 rows | WAL_WIDE][u32 checksum][rows x (u32 series, i64 ts, u64 value slot)]
- * (records without WAL_WIDE, from version 1, have f32 values).
+ * [u32 rows][u32 header check][u64 hash][rows x (u32 series, i64 ts, u64 value slot)],
+ * one per group commit. The header check binds a record to its segment and
+ * offset, so zeros, garbage and stale bytes never pass for a record. Replay
+ * keeps the records up to the first bad one. That one is a torn tail, cut,
+ * unless a valid record follows it: then it is damage to rows that may have
+ * been acknowledged, and the open fails (TSDB_ERR_CORRUPT, with a log line)
+ * and keeps the segment, rather than drop them silently. Removing the segment
+ * from the directory accepts the loss. A read error during replay fails the
+ * open too: it never passes for the end of the segment.
  * Durability is group commit: one writer at a time writes everything
  * appended so far and fdatasyncs it, and wakes every waiter whose rows that
  * covered. Waiters sleep on a condition variable rather than queueing on a
@@ -39,8 +46,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define WAL_ROW_V1 16
-#define WAL_ROW 20
 
 static int64_t mono_ms(void)
 {
@@ -364,38 +369,54 @@ static int write_full(int fd, const void *buf, size_t len)
     return 0;
 }
 
-/* buf holds WAL_HDR spare bytes in front of the rows for the record header. */
-static int wal_write_record(int fd, uint8_t *buf, size_t nrows)
+static uint32_t wal_head_check(uint32_t nrows, uint64_t hash, uint64_t seq, uint64_t off)
 {
-    store32(buf, (uint32_t)nrows | WAL_WIDE);
-    store32(buf + 4, (uint32_t)xxh64(buf + WAL_HDR, nrows * WAL_ROW, 0));
+    uint8_t t[12];
+    store32(t, nrows);
+    memcpy(t + 4, &hash, 8);
+    return (uint32_t)xxh64(t, sizeof t, seq * 0x9e3779b97f4a7c15ull ^ off);
+}
+
+/* buf holds WAL_HDR spare bytes in front of the rows for the record header. */
+static int wal_write_record(int fd, uint64_t seq, uint64_t off, uint8_t *buf, size_t nrows)
+{
+    uint64_t hash = xxh64(buf + WAL_HDR, nrows * WAL_ROW, 0);
+    store32(buf, (uint32_t)nrows);
+    store32(buf + 4, wal_head_check((uint32_t)nrows, hash, seq, off));
+    memcpy(buf + 8, &hash, 8);
     return write_full(fd, buf, WAL_HDR + nrows * WAL_ROW);
 }
 
-size_t wal_record(const uint8_t *p, size_t avail, size_t *nrows, size_t *row)
+size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, size_t *nrows)
 {
     if (avail < WAL_HDR)
         return 0;
-    uint32_t h = load32(p);
-    size_t n = h & ~WAL_WIDE, rs = (h & WAL_WIDE) ? WAL_ROW : WAL_ROW_V1;
-    if (n > (avail - WAL_HDR) / rs || (uint32_t)xxh64(p + WAL_HDR, n * rs, 0) != load32(p + 4))
-        return 0; /* torn tail: never acknowledged */
+    uint32_t n = load32(p);
+    uint64_t hash;
+    memcpy(&hash, p + 8, 8);
+    if (n == 0 || n > (avail - WAL_HDR) / WAL_ROW || wal_head_check(n, hash, seq, off) != load32(p + 4) ||
+        xxh64(p + WAL_HDR, (size_t)n * WAL_ROW, 0) != hash)
+        return 0;
     *nrows = n;
-    *row = rs;
-    return WAL_HDR + n * rs;
+    return WAL_HDR + (size_t)n * WAL_ROW;
 }
 
-void wal_row(const uint8_t *r, size_t row, uint32_t *id, int64_t *ts, uint64_t *slot)
+bool wal_valid_after(const uint8_t *p, size_t len, size_t from, uint64_t seq, uint64_t base)
+{
+    size_t n;
+    /* records are 4-byte aligned (16 + 20 n bytes); the header check rejects
+     * nearly every other offset without hashing rows */
+    for (size_t q = (from + 4) & ~(size_t)3; q + WAL_HDR <= len; q += 4)
+        if (wal_record(p + q, len - q, seq, base + q, &n))
+            return true;
+    return false;
+}
+
+void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot)
 {
     memcpy(id, r, 4);
     memcpy(ts, r + 4, 8);
-    if (row == WAL_ROW) {
-        memcpy(slot, r + 12, 8);
-    } else {
-        uint32_t x;
-        memcpy(&x, r + 12, 4);
-        *slot = x;
-    }
+    memcpy(slot, r + 12, 8);
 }
 
 /* Appends rows to the pending WAL buffer; caller holds buf_lock. */
@@ -447,11 +468,11 @@ static void wal_writer_leave(eng *db)
 /* Writes a record of the rows in buf (WAL_HDR spare bytes first) to fd and
  * syncs it. On failure the engine is failed (eng_fail) before it returns:
  * the caller holds the writer role and has not woken anyone yet. */
-static int wal_write_sync(eng *db, int fd, uint8_t *buf, size_t len)
+static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t *buf, size_t len)
 {
     if (len <= WAL_HDR)
         return 0;
-    if (wal_write_record(fd, buf, (len - WAL_HDR) / WAL_ROW) != 0) {
+    if (wal_write_record(fd, seq, *off, buf, (len - WAL_HDR) / WAL_ROW) != 0) {
         eng_fail(db, "WAL write", errno);
         return TSDB_ERR_IO;
     }
@@ -459,6 +480,7 @@ static int wal_write_sync(eng *db, int fd, uint8_t *buf, size_t len)
         eng_fail(db, "WAL fdatasync", errno);
         return TSDB_ERR_IO;
     }
+    *off += len;
     return 0;
 }
 
@@ -489,12 +511,13 @@ int wal_commit(eng *db, uint64_t target)
         size_t cap = db->wal_cap, len = db->wal_len;
         uint64_t upto = db->wal_appended;
         int fd = db->wal_fd;
+        uint64_t seq = db->wal_seq;
         db->wal_buf = db->wal_spare;
         db->wal_cap = db->wal_spare_cap;
         db->wal_len = 0;
         pthread_mutex_unlock(&db->buf_lock);
 
-        rc = wal_write_sync(db, fd, buf, len);
+        rc = wal_write_sync(db, fd, seq, &db->wal_off, buf, len);
         db->wal_spare = buf;
         db->wal_spare_cap = cap;
         if (rc == 0)
@@ -614,6 +637,8 @@ int mt_flush(eng *db)
             size_t len = db->wal_len;
             uint64_t upto = db->wal_appended;
             int oldfd = db->wal_fd;
+            uint64_t oldseq = db->wal_seq, oldoff = db->wal_off;
+            db->wal_off = 0;
             db->wal_buf = NULL;
             db->wal_cap = db->wal_len = 0;
             db->wal_fd = newfd;
@@ -624,7 +649,7 @@ int mt_flush(eng *db)
             if (db->wal_enabled) {
                 /* the rest of the old segment; a part will hold these rows, but
                  * until then the segment is what makes them durable */
-                rc = wal_write_sync(db, oldfd, buf, len);
+                rc = wal_write_sync(db, oldfd, oldseq, &oldoff, buf, len);
                 close(oldfd);
                 if (rc == 0)
                     atomic_store(&db->wal_durable, upto);
@@ -723,17 +748,25 @@ static int read_file(int dirfd, const char *name, uint8_t **out, size_t *len)
     *len = (size_t)st.st_size;
     *out = malloc(*len ? *len : 1);
     size_t got = 0;
-    while (*out && got < *len) {
+    int rc = *out ? 0 : TSDB_ERR_NOMEM;
+    while (rc == 0 && got < *len) {
         ssize_t r = pread(fd, *out + got, *len - got, (off_t)got);
-        if (r <= 0)
-            break;
-        got += (size_t)r;
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0) {
+            /* an error, or a file that shrank under us: never taken for its end */
+            fprintf(stderr, "tsdb: reading %s at offset %zu: %s\n", name, got, r < 0 ? strerror(errno) : "short read");
+            rc = TSDB_ERR_IO;
+        } else {
+            got += (size_t)r;
+        }
     }
     close(fd);
-    if (!*out)
-        return TSDB_ERR_NOMEM;
-    *len = got;
-    return 0;
+    if (rc) {
+        free(*out);
+        *out = NULL;
+    }
+    return rc;
 }
 
 /* Replays WAL segments left by a previous run, then opens a fresh segment. */
@@ -796,17 +829,17 @@ int wal_open(eng *db)
             rc = TSDB_ERR_NOMEM;
             break;
         }
-        size_t pos = 0, n, row, rec;
+        size_t pos = 0, n, rec;
         int64_t cached_p = 0;
         uint64_t cached_seq = 0;
         bool have_cache = false;
-        while (rc == 0 && (rec = wal_record(buf + pos, len - pos, &n, &row)) != 0) {
+        while (rc == 0 && (rec = wal_record(buf + pos, len - pos, segs[k].seq, pos, &n)) != 0) {
             const uint8_t *r = buf + pos + WAL_HDR;
-            for (size_t i = 0; i < n && rc == 0; i++, r += row) {
+            for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
                 uint32_t id;
                 int64_t ts;
                 uint64_t slot;
-                wal_row(r, row, &id, &ts, &slot);
+                wal_row(r, &id, &ts, &slot);
                 int64_t p = partition_of(db, ts);
                 if (!have_cache || p != cached_p) {
                     cached_p = p;
@@ -818,6 +851,13 @@ int wal_open(eng *db)
                 rc = mt_add(m, NULL, id, &ts, &slot, 8, 1, 0);
             }
             pos += rec;
+        }
+        if (rc == 0 && pos < len && wal_valid_after(buf, len, pos, segs[k].seq, 0)) {
+            fprintf(stderr,
+                    "tsdb: WAL segment %s is damaged at offset %zu, before valid records: the open fails and the "
+                    "segment is kept (move it out of the directory to accept the loss of its rows)\n",
+                    segs[k].name, pos);
+            rc = TSDB_ERR_CORRUPT;
         }
         free(buf);
         if (rc == 0 && !ro) {

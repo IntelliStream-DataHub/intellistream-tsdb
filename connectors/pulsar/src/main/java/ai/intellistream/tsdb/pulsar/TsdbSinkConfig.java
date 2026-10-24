@@ -74,6 +74,16 @@ public class TsdbSinkConfig {
     @FieldDoc(required = false, defaultValue = "10000", help = "connect timeout in ms")
     public long connectTimeoutMs = 10_000;
 
+    /**
+     * Longest wait for tsdb on an open connection, sending or receiving. A stalled server (an NFS outage parks its
+     * requests, a dead peer sends no reset) would otherwise block a writer for good; on a timeout the connection is
+     * closed and the batch retried on a new one, like any other lost connection.
+     */
+    @FieldDoc(required = false, defaultValue = "30000",
+            help = "longest wait for tsdb on an open connection in ms; 0 waits forever. A timeout closes the "
+                    + "connection and the batch is retried")
+    public long requestTimeoutMs = 30_000;
+
     /** Type of series the sink creates when a point names none. */
     @FieldDoc(required = false, defaultValue = "float64",
             help = "type of series created for points without a type field: float64, float32, int64, bool or state")
@@ -167,6 +177,7 @@ public class TsdbSinkConfig {
         require(retryInitialMs >= 1 && retryMaxMs >= retryInitialMs, "need 1 <= retryInitialMs <= retryMaxMs");
         require(retryJitter >= 0 && retryJitter <= 1, "retryJitter must be 0 to 1");
         require(connectTimeoutMs >= 1, "connectTimeoutMs must be positive");
+        require(requestTimeoutMs >= 0, "requestTimeoutMs must not be negative");
         require(seriesCacheSize >= 1, "seriesCacheSize must be positive");
         require(closeTimeoutMs >= 0, "closeTimeoutMs must not be negative");
         defaultValueType();

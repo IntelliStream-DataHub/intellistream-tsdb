@@ -1,0 +1,10 @@
+[package]
+name = "itr"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tsdb-client = { path = "../../../client/rust" }
+
+[workspace]

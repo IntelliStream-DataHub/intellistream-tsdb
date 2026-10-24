@@ -91,10 +91,11 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
+test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
 	./$(B)/test_tsdb
 	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
+	./$(B)/test_damage
 	./$(B)/test_types
 	./$(B)/test_levels
 	./$(B)/test_group
@@ -206,7 +207,42 @@ hooks:
 bench-clients-smoke: $(B)/tsdbd $(B)/tsdb-bench $(B)/tsdbc-bench
 	bench/clients/smoke.sh
 
-.PHONY: bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge
+# End-to-end tests (tests/integration/run.py): real tsdbd processes, the C, Rust, Python and Java clients and the
+# tsdb CLI, on both server backends. Needs what test-clients needs, and builds its programs into $(B)/integ.
+# `make integration-tests INTEG_ARGS="--only matrix --io epoll"` runs part of it; see run.py --help.
+INTEG      := $(B)/integ
+INTEG_ARGS ?=
+
+$(INTEG)/itc: tests/integration/c/itc.c client/tsdb_client.h $(B)/libtsdbclient.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(B)/libtsdbclient.a $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+
+integ-rust:
+	cd tests/integration/rust && cargo build --release --locked --target-dir $(abspath $(INTEG))/rust
+
+integ-python:
+	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
+	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release
+
+integ-java:
+	cd client/java && mvn -q -DskipTests package
+	@mkdir -p $(INTEG)/java
+	javac -d $(INTEG)/java -cp "$$(ls client/java/target/tsdb-client-*.jar | head -n 1)" tests/integration/java/Itj.java
+
+integration-tests: $(B)/tsdbd $(B)/tsdb $(INTEG)/itc integ-rust integ-python integ-java
+	python3 tests/integration/run.py --bin-dir $(B) $(INTEG_ARGS)
+
+# The harness's own tests (seconds): a broken io_uring backend fails the run, signals, mutate.py's verdicts.
+integration-selftest: $(B)/tsdbd $(B)/tsdb
+	python3 tests/integration/selftest.py
+
+# The same against the binaries of `make dist`: its tsdbd and tsdb, and the C client linked with its libtsdbclient.a.
+integration-tests-dist: dist integ-rust integ-python integ-java
+	$(CC) -O2 -g -std=gnu11 -Iinclude -Iclient -o $(DIST_B)/itc tests/integration/c/itc.c $(DIST_B)/libtsdbclient.a \
+	    $(ZSTD_LIB) -lpthread -lm
+	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
+
+.PHONY: bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -249,6 +285,9 @@ $(B)/test_follow: tests/test_follow.c $(LIB)
 $(B)/test_volumes: tests/test_volumes.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
+$(B)/test_damage: tests/test_damage.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
@@ -271,10 +310,13 @@ $(B)/jepsen: tests/jepsen/jepsen.c $(CLIB)
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.
 JEPSEN_DIR ?= /tmp/tsdb-jepsen
+JEPSEN_SEEDS ?= 1 2 3
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20 && \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so && \
+	    for seed in $(JEPSEN_SEEDS); do \
+	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --seed $$seed \
+	            --crashfs $(B)/libcrashfs.so || exit 1; done && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis eio   --seconds 20 --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10 || exit 1; done
 

@@ -331,4 +331,5 @@ make asan          # the same, checking for memory errors
 make tsan          # the same, checking threads for data races
 make jepsen        # crash tests: kill -9, power loss, pauses, disk errors
 make test-clients  # the Rust, Python and Java clients (needs cargo, python3, mvn)
+make integration-tests  # tsdbd, the CLI and all four clients end to end, both server backends (same tools)
 ```

@@ -938,6 +938,6 @@ int tsdbc_stats(tsdbc *c, tsdb_stats *st)
         return TSDB_ERR_CORRUPT;
     uint64_t v[8];
     memcpy(v, b, 64);
-    *st = (tsdb_stats){v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]};
+    *st = (tsdb_stats){v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], 0, 0}; /* the last two are local only */
     return 0;
 }

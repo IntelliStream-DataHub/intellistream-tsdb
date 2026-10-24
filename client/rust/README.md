@@ -96,6 +96,16 @@ Every method returns a `Result`. If the server says no, you get
 `Error::Server(status)`, for example `Status::NotFound`. After a network
 error the client stops working: connect again.
 
+By default a call waits as long as the server takes, so a server that hangs
+(a stalled disk, a dead peer) hangs the caller. `Client::connect_with(addr,
+Some(Duration::from_secs(30)))` bounds the connect and every later wait for
+the server (the longest silence it puts up with, not a deadline for the whole
+call), and `set_timeout` changes it on a live client. A call that times
+out returns `Error::Io` of kind `TimedOut` and the client refuses further
+calls (`is_broken()`), so close it and connect again. TCP keepalive is on:
+after 30 s of silence the client probes every 10 s and drops the connection
+after 3 unanswered probes, which `set_keepalive` changes or turns off.
+
 ## Create a series
 
 A series has a name and a number (its id). You use the id in every other call.
