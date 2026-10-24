@@ -103,11 +103,11 @@
     X(size_t, xor64_bound, (size_t n), (n))                                                                   \
     X(size_t, xor64_encode, (const uint64_t *in, size_t n, uint8_t *out), (in, n, out))                       \
     X(int, xor64_decode, (const uint8_t *in, size_t len, size_t n, uint64_t *out), (in, len, n, out))         \
-    XV(agg_fold, (int type, const void *v, size_t n, agg_state *a), (type, v, n, a))                          \
-    XV(agg_fold_hint, (int type, const void *v, size_t n, bool may_be_null, agg_state *a),                    \
-       (type, v, n, may_be_null, a))                                                                          \
+    XV(agg_fold, (int type, const void *v, size_t n, agg_state *a, agg_dev *x), (type, v, n, a, x))          \
+    XV(agg_fold_hint, (int type, const void *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x),        \
+       (type, v, n, may_be_null, a, x))                                                                       \
     XV(granule_stats, (int type, const void *v, size_t n, struct granule *g), (type, v, n, g))                \
-    XV(agg_from_granule, (int type, const struct granule *g, agg_state *a), (type, g, a))
+    XV(agg_from_granule, (int type, const struct granule *g, agg_state *a, agg_dev *x), (type, g, a, x))
 
 /* CPU levels; CPU_BASE is whatever the build's ARCH targets (x86-64-v2 in `make dist`). */
 enum { CPU_BASE, CPU_V3, CPU_V4, CPU_LEVELS };
