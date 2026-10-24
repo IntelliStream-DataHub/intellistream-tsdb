@@ -89,6 +89,18 @@ cgroup, so `nice` does not keep your work out of its way.
   still in flight and resurrect older values.
 - **Merges** only combine adjacent block ranges within a partition. On equal
   keys the newest source wins.
+- **Range tombstones** (deletes, replaces) live only in parts, never in the WAL
+  or a memtable. A part's tombstones hide rows of lower block numbers in the
+  same partition, never its own rows or memtable rows. Deletes flush the
+  memtable first and commit their parts under `publish_lock` like a large
+  insert; a replace commits tombstones and rows in one `parts_commit`. A
+  granule a tombstone touches is decoded, never answered from its statistics.
+  A merge output with no rows is kept as an empty part: its `wal_seq` stops a
+  stale WAL segment from replaying deleted rows back.
+- **Retention** limits live in the append-only `RETENTION` file (beside
+  `SERIES`). Retention "now" (`eng_now_ms`) never goes back; queries clamp to
+  the cutoff, merges drop expired rows, the merge thread drops whole expired
+  partitions by retiring them.
 - **Inserts are all or nothing.** All parts of one insert are written pending,
   then committed through an intent file (`parts_commit`). Never publish them one
   by one.

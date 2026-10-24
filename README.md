@@ -35,6 +35,10 @@ average). You can link tsdb into your program as a library, or run its server,
   digits from one run to the next, as in ClickHouse, because the order of the
   additions changes. If exact sums matter, store the value as an int64 in fixed
   point: 21.3 °C as 21300 milli-degrees.
+- Delete the values of one series in a time range, or replace them with new
+  ones in one step (readers see the old values or the new ones, never a mix).
+  Give a series a retention period, and values older than that disappear on
+  their own.
 - Safe writes: data is on disk when a write returns. We test this by killing
   the server and by simulating power loss.
 - One writer and any number of read-only followers can share a directory,

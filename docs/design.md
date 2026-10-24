@@ -23,6 +23,11 @@ start, the tests and the benchmark results.
   replaces too), the last write wins (within one batch, the later row), and
   queries never return duplicates.
 - Time ranges are half open, `[start, end)`.
+- A time range of one series can be deleted (`tsdb_delete_range`) or replaced
+  atomically (`tsdb_replace_range`). A delete is a write: a value written
+  after it returned is kept, one written before it is gone. A series can have
+  a retention limit (`tsdb_set_retention`): older values disappear from
+  queries at once and from disk in the background (see Storage).
 - Aggregates: count, sum, min, max, avg. Integer types (int64, bool as 0/1)
   aggregate exactly (`isum`, `imin`, `imax`; the sum saturates at the int64
   limits, `sum` holds it as a double). For states only the count is meaningful.
@@ -125,6 +130,75 @@ removed and parts covered by a merged part are deleted.
 Each part records the WAL segment it contains, so recovery replays a segment
 only into partitions that do not already hold its rows, even after a crash in
 the middle of a flush.
+
+### Deletes, replaces and retention (src/delete.c, src/tomb.c, src/retention.c)
+
+**Tombstones live in parts.** `tsdb_delete_range(series, start, end)` writes
+a range tombstone `{series, start, end}`, and only into parts: never into the
+WAL or a memtable. A part's tombstones hide the rows of that series in
+`[start, end)` in every part of the same partition with a *lower* block number;
+they never hide the rows of their own part, nor memtable rows. That is the
+existing last-write-wins order (a higher block is newer, memtables are newer
+than every part), so a delete needs no ordering of its own:
+
+- A delete runs like a large insert. It flushes the memtable first (rows
+  acknowledged before it get older block numbers), then, under `publish_lock`,
+  finds every listed part with rows of the series in the range, writes one
+  small tombstone-only part per such partition and commits them through
+  `parts_commit` (an intent file when there is more than one). It returns once
+  they are fsync'd and published. Anything published later (a flush, a large
+  insert) has a higher block number and is newer than the delete; a partition
+  that held no rows of the series in the range needs no tombstone.
+- A replace is the tombstone parts plus the new rows' parts in one
+  `parts_commit`, tombstones first (lower blocks): one intent, so a reader or a
+  crash sees the old rows or the new ones. Rows outside `[start, end)` are
+  refused.
+- The WAL, the memtable, WAL replay and the follower's tail are unchanged.
+  Replay skips a partition by its parts' `wal_seq`; a tombstone part carries
+  none, and a merge output that ends up with no rows is still kept as an
+  (empty) part, so that the `wal_seq` anchor of the rows it replaced survives
+  and a stale WAL segment cannot replay deleted rows back.
+
+**On disk.** A part with tombstones has an optional trailer between the index
+and the footer: `n x {u32 series, u32 0, i64 start, i64 end}`, then `u32 n,
+u32 'TOMB'`; `index_hash` covers it. Parts without tombstones are byte for byte
+what they were, so `FORMAT_VERSION` stays; an older binary rejects a part with
+a trailer at open (its size does not match) and never misreads one. A part's
+`min_ts`/`max_ts` cover its tombstones, and a part may hold 0 granules.
+
+**Queries.** A snapshot that has no part with tombstones costs one test per
+part and nothing more. Otherwise, for each part p, the tombstones that apply to
+it are those of newer snapshot parts of its partition (their lowest block above
+p's highest). Granules of p that intersect them are decoded, filtered and
+treated as a memtable-like run with p's priority; p's other granules stay as
+they are, and aggregates keep using their statistics. So granule statistics
+are never used for a granule a tombstone touches, and once a merge has removed
+the rows they are exact again with no special case.
+
+**Merges** drop the rows of each source hidden by the tombstones of a newer
+source, and never copy a granule that intersects them. The output keeps the
+union of the sources' tombstones (clipped by retention), unless no part of the
+partition is older than the merge's lowest block: then nothing is left for
+them to hide and they go.
+
+**Retention.** `tsdb_set_retention(series, limit_ms)` appends a record
+`[u32 check][u32 series][i64 limit_ms]` to the file `RETENTION` (fsync'd, last
+record per series wins, a torn tail is cut like `SERIES`; an older binary
+ignores the file), then republishes MANIFEST so followers reload it. Set it
+right after creating a series to have it from the start. "now" is the wall
+clock (`tsdb_options.clock_ms`, default `CLOCK_REALTIME`) but never goes back
+within a process, and it starts no earlier than the newest part's mtime at
+open: after the clock is stepped back nothing expired reappears; a clock
+stepped forward expires rows early, and for good once a merge has removed
+them. A series' cutoff is `now - limit`:
+
+- queries clamp their start to the cutoff, so expired rows vanish at once;
+- every merge drops rows below the cutoff;
+- the merge thread, at most once a second, drops a whole partition once every
+  series in it (its rows and its tombstones) has expired (retired like
+  `drop_before`, never unlinked at once), and rewrites alone a part that holds
+  expired rows and was written more than `retention_merge_s` (default 3600)
+  ago. Writes and queries never wait for it.
 
 ### Storage errors
 
