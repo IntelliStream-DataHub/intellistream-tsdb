@@ -153,8 +153,10 @@ def querier(db, a, klass, thread, out, errors):
             for _ in range(16):
                 r, s, start, end = bc.window(r, a.series, a.points, window)
                 if not agg:
-                    ts, _v = db.query_raw(s, start, end, numpy=True)
+                    ts, v = db.query_raw(s, start, end, numpy=True)
                     rows += len(ts)
+                    if len(v):
+                        float(v[-1])  # touch the data, as tsdb-bench does
                 else:
                     rows += sum(b.count for b in db.query_agg(s, start, end, bucket * bc.step_ms(s)))
                 queries += 1

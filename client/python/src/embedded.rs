@@ -69,6 +69,17 @@ pub(crate) struct Db {
     last: Mutex<tc::QueryStats>,
 }
 
+impl Drop for Db {
+    /// A Db that is collected without close(): closing flushes the memtable and waits for merges,
+    /// which must not stall every other Python thread. CPython's file objects close their file
+    /// descriptor the same way, with the GIL released inside dealloc.
+    fn drop(&mut self) {
+        if let Some(db) = self.db.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            Python::attach(|py| py.detach(move || drop(db)));
+        }
+    }
+}
+
 impl Db {
     /// Runs `f` on the open database with the GIL released.
     fn with<T, F>(&self, py: Python<'_>, f: F) -> PyResult<T>

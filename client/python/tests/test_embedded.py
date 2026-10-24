@@ -6,7 +6,9 @@ Db answers as tsdbd does. After them come the cases only an embedded database ha
 """
 
 import array
+import gc
 import threading
+import time
 
 import pytest
 
@@ -145,6 +147,63 @@ def test_threads_share_one_db(client):
     for sid in ids:
         (b,) = client.query_agg(sid)
         assert (b.count, b.min, b.max) == (10_000, sid, sid)
+
+
+def counted_while(call):
+    """How far a Python thread counts while `call` runs, as a share of its pace with the GIL free.
+
+    A call that keeps the GIL lets the counter run for one switch interval (5 ms) at most."""
+    count, stop = 0, False
+
+    def spin():
+        nonlocal count
+        while not stop:
+            count += 1
+
+    t = threading.Thread(target=spin)
+    t.start()
+    try:
+        c0, t0 = count, time.perf_counter()
+        time.sleep(0.2)
+        pace = (count - c0) / (time.perf_counter() - t0)
+        c0, t0 = count, time.perf_counter()
+        call()
+        took = time.perf_counter() - t0
+        counted = count - c0
+    finally:
+        stop = True
+        t.join()
+    assert took > 0.1, f"the call took {took:.3f} s: too short to tell"
+    return counted / (pace * took)
+
+
+def test_engine_calls_release_the_gil(tmp_path):
+    # everything in the memtable, so that flush and close have all the work to do
+    n = 3_000_000
+    ts = array.array("q", range(T0, T0 + n * 10, 10))
+    vals = array.array("d", range(n))
+
+    def loaded(name):
+        db = Db(tmp_path / name, fsync=False, merge_threads=1, wal_max_batch_rows=n + 1, buffer_rows=8 * n,
+                flush_interval_ms=3_600_000)
+        for i in range(4):
+            db.insert_series_values(db.series_create(f"s{i}", "float64"), ts, vals)
+        return db
+
+    db = loaded("flush")
+    assert counted_while(db.flush) > 0.3
+    db.close()
+    # a Db collected without close() closes, and so flushes, with the GIL released too
+    db = loaded("dropped")
+
+    def collect():
+        nonlocal db
+        db = None
+        gc.collect()
+
+    assert counted_while(collect) > 0.3
+    with Db(tmp_path / "dropped") as again:
+        assert [again.query_agg(again.series(f"s{i}", create=False))[0].count for i in range(4)] == [n] * 4
 
 
 def fill(db):
