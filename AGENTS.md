@@ -92,17 +92,17 @@ cgroup, so `nice` does not keep your work out of its way.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
 - The on-disk format is version 2 (`FORMAT_VERSION`): 80-byte granule entries
-  with typed statistics. Version 1 parts (64-byte entries, float32) and WAL
-  records (16-byte rows) are still read; keep it that way, `test_types` writes
-  both by hand. Value blocks name their codec, so new codecs can be added
-  without a version bump; changing an existing layout needs one.
+  with typed statistics. Before the first release, older formats need not stay
+  readable (the user decided this on 2026-10-24): a layout change bumps
+  `FORMAT_VERSION`, and the reader for the old layout may go with it. The
+  version 1 readers (64-byte entries, float32; 16-byte WAL rows) are due to be
+  removed. Value blocks name their codec, so new codecs need no version bump.
 - **Protocol.** There has been no release yet, so the wire protocol may change
   without keeping old clients working (the user decided this on 2026-10-24): no
   legacy paths for earlier protocol versions in new designs. Every change must
   reach the C, Rust, Python and Java clients in the same commit, with
   `make test-clients` green. History so far: version 2 typed operations, 3
-  packed inserts, 4 QUERY_BOUNDS (the server knows UTC only). This does not
-  apply to the on-disk format: old parts and WAL records stay readable.
+  packed inserts, 4 QUERY_BOUNDS (the server knows UTC only).
 
 ## Conventions
 
