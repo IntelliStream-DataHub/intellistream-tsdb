@@ -37,6 +37,10 @@ average). You can link tsdb into your program as a library, or run its server,
   also over NFS.
 - The clients compress the data before they send it, so an insert uses about
   6 bytes per point on the network instead of 16.
+- An Apache Pulsar 5 sink ([connectors/pulsar](connectors/pulsar/README.md))
+  writes points from Pulsar into tsdb. Pulsar holds them while tsdb is down,
+  and a point is taken off Pulsar only once it is safely on disk in tsdb
+  (in tsdbd's default sync mode).
 
 ## How it compares
 

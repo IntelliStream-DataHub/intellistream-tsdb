@@ -54,6 +54,8 @@ cgroup, so `nice` does not keep your work out of its way.
 - `server/tsdbd.c`: io_uring server. `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
   A protocol change has to reach all four; `make test-clients` runs their tests.
+- `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
+  build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
 - `tools/`: CLI and benchmarks. `tests/`: tests; `tests/jepsen/`: the
   fault-injection harness and the `crashfs` LD_PRELOAD power-loss simulator.
 
