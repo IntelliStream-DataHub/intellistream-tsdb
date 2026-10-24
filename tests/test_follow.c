@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 #include "tsdb.h"
 
+#include <fcntl.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -17,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -240,6 +242,59 @@ static void test_typed_follow(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+/* The library's fstat calls land here (the test binary's definition wins over
+ * libc's): the next one can report a file larger than it is, which is what a
+ * reader sees when a MANIFEST shrinks while it is rewritten in place. */
+static atomic_int stat_grow;
+
+int fstat(int fd, struct stat *st)
+{
+    int rc = fstatat(fd, "", st, AT_EMPTY_PATH);
+    int grow = atomic_exchange(&stat_grow, 0);
+    if (rc == 0)
+        st->st_size += grow;
+    return rc;
+}
+
+/* Regression: a MANIFEST read while the writer rewrote it (shorter than the
+ * size a moment before) made a reader's refresh fail with "out of memory": the
+ * error was chosen after the buffer was freed. It is retried at the next poll. */
+static void test_torn_manifest(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-follow-torn-%d", base, (int)getpid());
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *w, *r = NULL;
+    uint32_t id;
+    if (tsdb_open(dir, &o, &w) != 0) {
+        CHECK(!"open writer");
+        return;
+    }
+    CHECK(tsdb_series(w, "s", &id) == 0 && tsdb_append(w, id, T0, 1.0f) == 0 && tsdb_flush(w) == 0);
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1; /* no polling thread: refreshes happen here */
+    CHECK(tsdb_open(dir, &ro, &r) == 0);
+    if (r) {
+        atomic_store(&stat_grow, 1); /* the MANIFEST's fstat: the first one of a refresh */
+        CHECK(tsdb_refresh(r) == 0);
+        CHECK(atomic_load(&stat_grow) == 0);
+        CHECK(tsdb_append(w, id, T0 + 1, 2.0f) == 0 && tsdb_flush(w) == 0);
+        CHECK(tsdb_refresh(r) == 0); /* the next one catches up */
+        tsdb_points p;
+        CHECK(tsdb_query_points(r, id, T0, T0 + 2, &p) == 0 && p.n == 2);
+        tsdb_points_free(&p);
+        tsdb_close(r);
+    }
+    tsdb_close(w);
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    printf("  a MANIFEST torn by a rewrite is read again at the next refresh\n");
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -336,6 +391,7 @@ int main(int argc, char **argv)
     if (system(cmd) != 0)
         return 1;
     test_typed_follow(argc > 1 ? argv[1] : "/tmp");
+    test_torn_manifest(argc > 1 ? argv[1] : "/tmp");
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

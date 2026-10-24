@@ -569,10 +569,12 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
         return 0;
     if (n < db->opt.wal_max_batch_rows)
         return mem_insert(db, series, cs, ts, v, type_width(type), n);
+    pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
     pthread_mutex_lock(&db->buf_lock);
-    bool pending = db->active->rows > 0;
+    bool pending = db->active->rows > 0 || db->nflushing > 0;
     pthread_mutex_unlock(&db->buf_lock);
-    int rc = pending || db->nflushing ? mt_flush(db) : 0;
+    pthread_mutex_unlock(&db->lock);
+    int rc = pending ? mt_flush(db) : 0;
     return rc ? rc : insert_rows(db, type, series, cs, ts, v, n, 0, NULL);
 }
 

@@ -1,5 +1,6 @@
 # build output
 /build/
+/build-tsan/
 *.o
 *.a
 *.so

@@ -151,8 +151,9 @@ static int manifest_read(eng *db, manifest *m)
     ssize_t got = m->text ? pread(fd, m->text, size, 0) : -1;
     close(fd);
     if (got != (ssize_t)size) {
+        int rc = m->text ? TSDB_ERR_CORRUPT : TSDB_ERR_NOMEM; /* torn: rewritten as we read it */
         manifest_free(m);
-        return m->text ? TSDB_ERR_CORRUPT : TSDB_ERR_NOMEM;
+        return rc;
     }
     m->text[size] = '\0';
     /* the last line is "checksum <hex>" over everything before it */
@@ -254,23 +255,29 @@ static int tail_segment(eng *db, wal_tail *t)
     size_t n, row, rec;
     /* a record that does not check out is still being written: next poll */
     while (rc == 0 && (rec = wal_record(buf + pos, (size_t)got - pos, &n, &row)) != 0) {
-        const uint8_t *r = buf + pos + WAL_HDR;
-        for (size_t i = 0; i < n && rc == 0; i++, r += row) {
-            uint32_t id;
-            int64_t ts;
-            uint64_t slot;
+        const uint8_t *r0 = buf + pos + WAL_HDR, *r = r0;
+        uint32_t id;
+        int64_t ts;
+        uint64_t slot;
+        for (size_t i = 0; i < n && !reloaded; i++, r += row) {
             wal_row(r, row, &id, &ts, &slot);
-            if (id >= eng_series_count(db) && !reloaded) {
+            if (id >= eng_series_count(db)) {
                 series_reload(&db->series, db->dirfd); /* created after our last look */
                 series_reload(&db->states, db->dirfd);
                 reloaded = true;
             }
-            if (id >= eng_series_count(db))
-                continue;
-            pthread_mutex_lock(&db->buf_lock);
-            rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, 0);
-            pthread_mutex_unlock(&db->buf_lock);
         }
+        /* A record holds whole inserts (the writer appends an insert to the WAL
+         * buffer in one step, and writes what it took of it as one record): its
+         * rows become visible together, so queries never see part of an insert. */
+        pthread_mutex_lock(&db->buf_lock);
+        r = r0;
+        for (size_t i = 0; i < n && rc == 0; i++, r += row) {
+            wal_row(r, row, &id, &ts, &slot);
+            if (id < eng_series_count(db))
+                rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, 0);
+        }
+        pthread_mutex_unlock(&db->buf_lock);
         pos += rec;
     }
     t->off += pos;

@@ -62,6 +62,11 @@ static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int6
     int rc = 0;
     mem_run active = {0};
     pthread_mutex_lock(&db->lock);
+    /* With a WAL synced on every write, a row is visible once it is durable:
+     * no reader sees a write that a power failure could still take back. That
+     * includes the flushing memtables: a flush rotates the active one before
+     * it writes and syncs the rest of its segment. */
+    uint64_t visible = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
     s->parts = malloc((db->nparts ? db->nparts : 1) * sizeof *s->parts);
     if (s->parts) {
         for (size_t i = 0; i < db->nparts; i++) {
@@ -90,9 +95,6 @@ static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int6
             else
                 mem_run_free(&tails[ntails]);
         }
-        /* with a WAL synced on every write, a row is visible once it is durable:
-         * no reader sees a write that a power failure could still take back */
-        uint64_t visible = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
         if (rc == 0 && db->active)
             rc = mt_collect(db->active, series, w, start, end, visible, &active);
         pthread_mutex_unlock(&db->buf_lock);
@@ -112,7 +114,7 @@ static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int6
         /* flushing memtables are immutable: read them without locks */
         mem_run r = {0};
         if (rc == 0)
-            rc = mt_collect(ms[i], series, w, start, end, UINT64_MAX, &r); /* synced when it was rotated */
+            rc = mt_collect(ms[i], series, w, start, end, visible, &r);
         if (r.n && s->mem)
             s->mem[s->nmem++] = r;
         else

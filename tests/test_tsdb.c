@@ -1,11 +1,13 @@
 /* Tests: codec round trips, and every query checked against a brute-force reference. */
 #include "internal.h"
+#include "samekeys.h"
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -794,6 +796,220 @@ static void test_wal(const char *dir)
     printf("  stale WAL segment after a flush is not replayed over newer data\n");
 }
 
+/* The library's fsync and fdatasync calls land here: the test binary's
+ * definitions win over libc's. A test can hold the next call, to look at the
+ * database while a write waits for the disk. */
+static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hold_cv = PTHREAD_COND_INITIALIZER;
+static int hold_armed; /* HOLD_*: hold the next such call */
+static int hold_begun, hold_ended, hold_go;
+static bool hold_others; /* only calls from threads other than hold_main */
+static pthread_t hold_main;
+enum { HOLD_FSYNC = 1, HOLD_FDATASYNC = 2 };
+
+static void hold_point(int which)
+{
+    pthread_mutex_lock(&hold_lock);
+    if ((hold_armed & which) && !(hold_others && pthread_equal(pthread_self(), hold_main))) {
+        hold_armed &= ~which;
+        int me = ++hold_begun;
+        pthread_cond_broadcast(&hold_cv);
+        while (hold_go < me)
+            pthread_cond_wait(&hold_cv, &hold_lock);
+        hold_ended = me;
+        pthread_cond_broadcast(&hold_cv);
+    }
+    pthread_mutex_unlock(&hold_lock);
+}
+
+int fsync(int fd)
+{
+    hold_point(HOLD_FSYNC);
+    return (int)syscall(SYS_fsync, fd);
+}
+
+int fdatasync(int fd)
+{
+    hold_point(HOLD_FDATASYNC);
+    return (int)syscall(SYS_fdatasync, fd);
+}
+
+static void hold_arm(int which)
+{
+    pthread_mutex_lock(&hold_lock);
+    hold_armed |= which;
+    pthread_mutex_unlock(&hold_lock);
+}
+
+static void hold_wait(void) /* until the next call is held */
+{
+    pthread_mutex_lock(&hold_lock);
+    while (hold_begun <= hold_go)
+        pthread_cond_wait(&hold_cv, &hold_lock);
+    pthread_mutex_unlock(&hold_lock);
+}
+
+static void hold_release(void) /* lets the held call go on */
+{
+    pthread_mutex_lock(&hold_lock);
+    int me = ++hold_go;
+    pthread_cond_broadcast(&hold_cv);
+    while (hold_ended < me)
+        pthread_cond_wait(&hold_cv, &hold_lock);
+    pthread_mutex_unlock(&hold_lock);
+}
+
+static void *flush_main(void *db)
+{
+    OK(tsdb_flush(db));
+    return NULL;
+}
+
+static void *append_two(void *db)
+{
+    OK(tsdb_append(db, 0, 1700000000000, 2.0f));
+    return NULL;
+}
+
+static float value_at(tsdb *db, int64_t t)
+{
+    tsdb_points p;
+    OK(tsdb_query_points(db, 0, t, t + 1, &p));
+    float v = p.n == 1 ? p.values[0] : NAN;
+    tsdb_points_free(&p);
+    return v;
+}
+
+/* Regression: with wal_sync_ms = 0 a row is visible once the WAL is synced up
+ * to it. A memtable flush moved the active memtable to the flushing list and
+ * only then wrote and synced the rest of its WAL segment, and queries read
+ * flushing memtables without that limit: meanwhile a row was visible that a
+ * power failure could still take back (its writer not yet acknowledged). */
+static void test_flush_visibility(const char *dir)
+{
+    rm_rf(dir);
+    tsdb_options o = test_opts(0);
+    o.fsync = 1;
+    o.wal_sync_ms = 0;
+    o.flush_interval_ms = 1000000;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    const int64_t t = 1700000000000;
+    OK(tsdb_append(db, id, t, 1.0f));
+    /* the flush holds the WAL writer role while it creates the next segment
+     * (and fsyncs the directory): a row appended now waits for it */
+    hold_arm(HOLD_FSYNC);
+    pthread_t fl, wr;
+    pthread_create(&fl, NULL, flush_main, db);
+    hold_wait();
+    pthread_create(&wr, NULL, append_two, db);
+    tsdb_stats st;
+    do {
+        usleep(1000);
+        OK(tsdb_get_stats(db, &st));
+    } while (st.memtable_rows < 2);
+    CHECK(value_at(db, t) == 1.0f); /* in the active memtable, not durable */
+    /* the flush rotates the memtable, then syncs the rest of the old segment */
+    hold_arm(HOLD_FDATASYNC);
+    hold_release();
+    hold_wait();
+    CHECK(value_at(db, t) == 1.0f); /* in the flushing memtable, still not durable */
+    hold_release();
+    pthread_join(wr, NULL);
+    pthread_join(fl, NULL);
+    CHECK(value_at(db, t) == 2.0f);
+    OK(tsdb_close(db));
+    printf("  a row in a memtable being flushed is not visible before its WAL record is durable\n");
+}
+
+typedef struct pins {
+    tsdb *db;
+    int64_t t; /* a row in each of the partitions of t and t + 1 hour, or only t's */
+    bool two;
+} pins;
+
+static void *insert_parts(void *a)
+{
+    pins *p = a;
+    int64_t ts[200];
+    float v[200];
+    for (int i = 0; i < 200; i++) {
+        ts[i] = p->t + (p->two && i >= 100 ? 3600000 : 0) + i;
+        v[i] = 2.0f;
+    }
+    OK(tsdb_insert_series(p->db, 0, ts, v, 200));
+    return NULL;
+}
+
+static void *optimize_main(void *db)
+{
+    OK(tsdb_optimize(db));
+    return NULL;
+}
+
+static void count_partition(void *ctx, const tsdb_part_info *p)
+{
+    int64_t *c = ctx; /* c[0]: the partition, c[1]: its parts */
+    c[1] += p->partition == c[0];
+}
+
+static int64_t parts_in(tsdb *db, int64_t partition)
+{
+    int64_t c[2] = {partition, 0};
+    OK(tsdb_foreach_part(db, count_partition, c));
+    return c[1];
+}
+
+/* Regression: after publishing its parts, an insert read each part's
+ * partition to wait for merges there (parts_to_delay_insert), without a
+ * reference: meanwhile the part could have been merged away and freed. A use
+ * after free that AddressSanitizer and ThreadSanitizer report (it was found by
+ * test_same_keys under ThreadSanitizer). Here the insert waits in its first
+ * partition, which has too many parts, while its part in the second one is
+ * merged away. */
+static void test_publish_then_merge(const char *dir)
+{
+    rm_rf(dir);
+    tsdb_options o = test_opts(1);
+    o.fsync = 1; /* so the merge thread can be held in its fdatasync */
+    o.wal_max_batch_rows = 100;
+    o.obsolete_part_lifetime_s = 0; /* a replaced part goes with its last reference */
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    const int64_t t = 1700002800000; /* partitions of an hour: p0 and p1 = p0 + 1 */
+    const int64_t p0 = t / 3600000;
+    pins one = {db, t, false}, both = {db, t, true};
+    hold_main = pthread_self();
+    hold_others = true;
+    hold_arm(HOLD_FDATASYNC); /* the merge thread's first merge: its parts stay "merging" */
+    insert_parts(&both);
+    for (int i = 1; i < PARTS_TO_DELAY_INSERT; i++)
+        insert_parts(&one);
+    hold_wait();
+    pthread_t more, ins, opt;
+    pthread_create(&more, NULL, insert_parts, &one); /* one too many: waits for merges */
+    while (parts_in(db, p0) <= PARTS_TO_DELAY_INSERT)
+        usleep(1000);
+    pthread_create(&ins, NULL, insert_parts, &both); /* waits in p0 after publishing its parts */
+    while (parts_in(db, p0 + 1) < 2)
+        usleep(1000);
+    pthread_create(&opt, NULL, optimize_main, db); /* merges p1 (p0 is busy), frees the insert's part there */
+    while (parts_in(db, p0 + 1) != 1)
+        usleep(1000);
+    hold_release(); /* merges in p0 go on, and the insert stops waiting */
+    pthread_join(more, NULL);
+    pthread_join(ins, NULL);
+    pthread_join(opt, NULL);
+    hold_others = false;
+    CHECK(value_at(db, t) == 2.0f && value_at(db, t + 3600000 + 150) == 2.0f);
+    OK(tsdb_close(db));
+    printf("  an insert does not touch its parts once they are published\n");
+}
+
 /* ------------------------------------------------------------ concurrency */
 
 typedef struct conc {
@@ -883,6 +1099,365 @@ static void test_concurrency(const char *dir)
     OK(tsdb_close(db));
 }
 
+/* ------------------------------------------ concurrent writes to the same keys */
+
+/* Several threads write the same series and timestamps at once (samekeys.h has
+ * the model and the checks), through every write path, while the memtable is
+ * flushed, merges run and readers query. */
+typedef struct skx {
+    const sk_cfg *c;
+    tsdb *db;
+    uint32_t ids[SK_MAX_SERIES];
+    atomic_int started[SK_MAX_WRITERS]; /* rounds begun */
+    atomic_int acked[SK_MAX_WRITERS];   /* rounds acknowledged */
+    int last_kind[SK_MAX_WRITERS];
+    atomic_int writing; /* writers still running */
+    atomic_int errors;
+    atomic_long snapshots, torn_across, aggs;
+    long merges;
+    tsdb *follower; /* a follower of the same directory, or NULL */
+    atomic_long follower_snapshots;
+    atomic_int follower_errors;
+} skx;
+
+typedef struct skt {
+    skx *x;
+    int i;
+} skt;
+
+static int sk_write(skx *x, int w, int r, int kind, uint64_t seed)
+{
+    const sk_cfg *c = x->c;
+    sk_batch b;
+    int rc = 0;
+    if (kind == SK_APPEND) { /* one row per call, in random order */
+        sk_build(c, x->ids, w, r, false, 2, seed, UINT32_MAX, &b);
+        for (size_t i = 0; i < b.n && rc == 0; i++) {
+            float f;
+            memcpy(&f, b.v + 4 * i, 4);
+            rc = tsdb_append(x->db, b.series[i], b.ts[i], f);
+        }
+        sk_batch_free(&b);
+        return rc;
+    }
+    bool plain = c->type == TSDB_FLOAT32 && !c->nulls && (seed >> 20) % 2; /* the float32 calls, too */
+    for (uint32_t s = 0; s < (kind == SK_SERIES ? c->nseries : 1) && rc == 0; s++) {
+        bool large = kind == SK_LARGE || (kind == SK_SERIES && (seed >> 24) % 2);
+        sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, kind == SK_SERIES ? s : UINT32_MAX, &b);
+        tsdb_values col = {(tsdb_type)c->type, b.v, c->nulls ? b.valid : NULL};
+        if (kind == SK_SERIES)
+            rc = plain ? tsdb_insert_series(x->db, b.series[0], b.ts, (const float *)(void *)b.v, b.n)
+                       : tsdb_insert_series_values(x->db, b.series[0], b.ts, &col, b.n);
+        else
+            rc = plain ? tsdb_insert(x->db, b.series, b.ts, (const float *)(void *)b.v, b.n)
+                       : tsdb_insert_values(x->db, b.series, b.ts, &col, b.n);
+        sk_batch_free(&b);
+    }
+    return rc;
+}
+
+static void *sk_writer(void *a)
+{
+    skt *t = a;
+    skx *x = t->x;
+    for (int r = 0; r < x->c->rounds; r++) {
+        uint64_t seed = sk_mix(((uint64_t)t->i << 32) ^ (uint64_t)r ^ 0x5eedull);
+        int kind = sk_pick(x->c, seed >> 40);
+        atomic_store(&x->started[t->i], r + 1);
+        OK(sk_write(x, t->i, r, kind, seed));
+        atomic_store(&x->acked[t->i], r + 1);
+        x->last_kind[t->i] = kind;
+    }
+    atomic_fetch_sub(&x->writing, 1);
+    return NULL;
+}
+
+static void *sk_reader(void *a)
+{
+    skt *t = a;
+    skx *x = t->x;
+    const sk_cfg *c = x->c;
+    uint32_t span = sk_span(c);
+    sk_seen seen;
+    sk_seen_init(&seen, c);
+    sk_val *row = malloc(span * sizeof *row);
+    int started[SK_MAX_WRITERS], acked[SK_MAX_WRITERS];
+    bool batches = !(c->kinds & SK_APPEND);
+    for (uint64_t it = 0; atomic_load(&x->writing) > 0; it++) {
+        int64_t prev = -1;
+        for (uint32_t s = 0; s < c->nseries; s++) {
+            sk_collect k;
+            for (int w = 0; w < c->writers; w++)
+                acked[w] = atomic_load(&x->acked[w]);
+            sk_collect_begin(&k, c, row, false);
+            OK(tsdb_query_values(x->db, x->ids[s], c->t0, sk_end(c), NULL, sk_collect_cb, &k));
+            for (int w = 0; w < c->writers; w++)
+                started[w] = atomic_load(&x->started[w]);
+            int64_t id;
+            int e = k.errors + sk_check_snapshot(c, s, row, acked, started, &seen, &id);
+            if (s > 0 && id >= 0 && prev >= 0 && id != prev)
+                atomic_fetch_add(&x->torn_across, 1); /* allowed: one query, one series, one snapshot */
+            prev = id;
+            atomic_fetch_add(&x->snapshots, 1);
+            if (batches && c->shift == 0 && (it + s) % 3 == (uint64_t)t->i % 3) {
+                tsdb_bucket *b;
+                size_t nb;
+                OK(tsdb_query_agg(x->db, x->ids[s], c->t0, sk_end(c), 0, &b, &nb));
+                for (int w = 0; w < c->writers; w++)
+                    started[w] = atomic_load(&x->started[w]);
+                e += sk_check_agg(c, s, b, nb, started);
+                free(b);
+                atomic_fetch_add(&x->aggs, 1);
+            }
+            if ((it + s) % 4 == 1) { /* newest first, a few windows */
+                tsdb_query_opts desc = {TSDB_DESC, span / 3};
+                sk_collect_begin(&k, c, row, true);
+                OK(tsdb_query_values(x->db, x->ids[s], c->t0, sk_end(c), &desc, sk_collect_cb, &k));
+                e += k.errors + (k.n > span / 3);
+            }
+            if (e)
+                atomic_fetch_add(&x->errors, e);
+        }
+    }
+    free(row);
+    sk_seen_free(&seen);
+    return NULL;
+}
+
+/* Queries a follower: it lags behind the writer, so nothing acknowledged has
+ * to be there yet, but what it shows must be a snapshot of whole inserts. */
+static void *sk_follower_reader(void *a)
+{
+    skt *t = a;
+    skx *x = t->x;
+    const sk_cfg *c = x->c;
+    sk_seen seen;
+    sk_seen_init(&seen, c);
+    sk_val *row = malloc(sk_span(c) * sizeof *row);
+    int started[SK_MAX_WRITERS], acked[SK_MAX_WRITERS] = {0};
+    while (atomic_load(&x->writing) > 0) {
+        for (uint32_t s = 0; s < c->nseries; s++) {
+            sk_collect k;
+            sk_collect_begin(&k, c, row, false);
+            OK(tsdb_query_values(x->follower, x->ids[s], c->t0, sk_end(c), NULL, sk_collect_cb, &k));
+            for (int w = 0; w < c->writers; w++)
+                started[w] = atomic_load(&x->started[w]);
+            int64_t id;
+            int e = k.errors + sk_check_snapshot(c, s, row, acked, started, &seen, &id);
+            atomic_fetch_add(&x->follower_snapshots, 1);
+            if (e)
+                atomic_fetch_add(&x->follower_errors, e);
+        }
+    }
+    free(row);
+    sk_seen_free(&seen);
+    return NULL;
+}
+
+static void *sk_maintenance(void *a)
+{
+    skx *x = ((skt *)a)->x;
+    for (int i = 0; atomic_load(&x->writing) > 0; i++) {
+        usleep(10000);
+        OK(i % 10 == 9 ? tsdb_optimize(x->db) : tsdb_flush(x->db));
+    }
+    return NULL;
+}
+
+static void sk_read_all(const sk_cfg *c, tsdb *db, const uint32_t *ids, sk_val *st)
+{
+    for (uint32_t s = 0; s < c->nseries; s++) {
+        sk_collect k;
+        sk_collect_begin(&k, c, st + (size_t)s * sk_span(c), false);
+        OK(tsdb_query_values(db, ids[s], c->t0, sk_end(c), NULL, sk_collect_cb, &k));
+        CHECK(k.errors == 0);
+    }
+}
+
+static tsdb_options sk_options(const sk_cfg *c, int wal_sync_ms)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.partition_ms = 3600000; /* every write spans several partitions */
+    o.granule_rows = 64;
+    o.fsync = 0;
+    o.merge_threads = 2;
+    o.query_threads = 4;
+    size_t kw = (size_t)c->nseries * c->nts;
+    o.wal_max_batch_rows = kw + kw / 2; /* a write of every key once: WAL + memtable; twice: parts */
+    o.buffer_rows = 2 * kw;             /* the memtable is flushed every few small writes */
+    o.flush_interval_ms = 10;
+    o.wal_sync_ms = wal_sync_ms;
+    o.obsolete_part_lifetime_s = 0;
+    return o;
+}
+
+/* Runs the writers, readers and maintenance; the state they leave in st. */
+static void sk_phase(skx *x, sk_val *st)
+{
+    const sk_cfg *c = x->c;
+    enum { READERS = 3 };
+    pthread_t th[SK_MAX_WRITERS + READERS + 1];
+    skt args[SK_MAX_WRITERS + READERS + 1];
+    int n = 0;
+    atomic_store(&x->writing, c->writers);
+    for (int w = 0; w < c->writers; w++) {
+        args[n] = (skt){x, w};
+        pthread_create(&th[n], NULL, sk_writer, &args[n]);
+        n++;
+    }
+    for (int i = 0; i < READERS; i++) {
+        args[n] = (skt){x, i};
+        pthread_create(&th[n], NULL, sk_reader, &args[n]);
+        n++;
+    }
+    args[n] = (skt){x, 0};
+    pthread_create(&th[n], NULL, sk_maintenance, &args[n]);
+    n++;
+    pthread_t fth;
+    skt farg = {x, 0};
+    if (x->follower)
+        pthread_create(&fth, NULL, sk_follower_reader, &farg);
+    for (int i = 0; i < n; i++)
+        pthread_join(th[i], NULL);
+    if (x->follower)
+        pthread_join(fth, NULL);
+    CHECK(atomic_load(&x->errors) == 0);
+    tsdb_stats sts;
+    OK(tsdb_get_stats(x->db, &sts));
+    x->merges = (long)sts.merges;
+    sk_read_all(c, x->db, x->ids, st);
+    CHECK(sk_check_final(c, st, x->last_kind) == 0);
+}
+
+static void sk_same(const sk_cfg *c, const sk_val *want, tsdb *db, const uint32_t *ids, const char *after)
+{
+    size_t nk = sk_nkeys(c);
+    sk_val *st = calloc(nk, sizeof *st);
+    sk_read_all(c, db, ids, st);
+    bool same = true;
+    for (size_t i = 0; i < nk; i++)
+        same &= st[i].st == want[i].st && st[i].code == want[i].code;
+    if (!same)
+        fprintf(stderr, "  %s: the state changed after %s\n", c->name, after);
+    CHECK(same);
+    free(st);
+}
+
+/* crash: the writers run in a child that exits without closing the database,
+ * and the parent reopens it: the WAL is replayed next to the parts written meanwhile. */
+static void sk_run(const char *base, const sk_cfg *c, int wal_sync_ms, bool crash)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-samekeys-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o = sk_options(c, wal_sync_ms);
+    size_t nk = sk_nkeys(c);
+    sk_val *st = calloc(nk, sizeof *st);
+    skx *x = calloc(1, sizeof *x);
+    x->c = c;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int pfd[2] = {-1, -1};
+    pid_t child = 0;
+    if (crash) {
+        CHECK(pipe(pfd) == 0);
+        child = fork();
+        CHECK(child >= 0);
+    }
+    int failures0 = failures;
+    if (child == 0) {
+        OK(tsdb_open(dir, &o, &x->db));
+        for (uint32_t s = 0; s < c->nseries; s++) {
+            char name[64];
+            snprintf(name, sizeof name, "same.%u", s);
+            OK(tsdb_series_create(x->db, name, (tsdb_type)c->type, NULL, &x->ids[s]));
+        }
+        if (!crash) {
+            tsdb_options fo = o;
+            fo.follow = 1;
+            fo.refresh_ms = 2;
+            OK(tsdb_open(dir, &fo, &x->follower));
+        }
+        sk_phase(x, st);
+        if (x->follower) {
+            OK(tsdb_close(x->follower));
+            CHECK(atomic_load(&x->follower_errors) == 0);
+        }
+        if (crash) {
+            OK(tsdb_commit(x->db)); /* durable, as every write is with wal_sync_ms = 0 */
+            bool ok = write(pfd[1], st, nk * sizeof *st) == (ssize_t)(nk * sizeof *st) &&
+                      write(pfd[1], x, sizeof *x) == (ssize_t)sizeof *x;
+            _exit(ok && failures == failures0 ? 0 : 1); /* no close: the memtable stays in the WAL */
+        }
+    } else {
+        close(pfd[1]);
+        uint8_t *dst = (uint8_t *)st;
+        size_t want = nk * sizeof *st, got = 0;
+        skx copy;
+        while (got < want + sizeof copy) {
+            ssize_t r = read(pfd[0], got < want ? dst + got : (uint8_t *)&copy + (got - want),
+                             got < want ? want - got : sizeof copy - (got - want));
+            if (r <= 0)
+                break;
+            got += (size_t)r;
+        }
+        close(pfd[0]);
+        int status;
+        waitpid(child, &status, 0);
+        CHECK(got == want + sizeof copy && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        memcpy(x->ids, copy.ids, sizeof x->ids);
+        memcpy(x->last_kind, copy.last_kind, sizeof x->last_kind);
+        x->snapshots = copy.snapshots;
+        x->torn_across = copy.torn_across;
+        x->aggs = copy.aggs;
+        x->merges = copy.merges;
+        OK(tsdb_open(dir, &o, &x->db));
+        sk_same(c, st, x->db, x->ids, "a crash and WAL replay");
+        CHECK(sk_check_final(c, st, x->last_kind) == 0);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    OK(tsdb_flush(x->db));
+    sk_same(c, st, x->db, x->ids, "tsdb_flush");
+    OK(tsdb_optimize(x->db));
+    sk_same(c, st, x->db, x->ids, "tsdb_optimize");
+    tsdb_stats sts;
+    OK(tsdb_get_stats(x->db, &sts));
+    CHECK(sts.rows == nk && sts.memtable_rows == 0); /* one row per key: nothing older survives */
+    OK(tsdb_close(x->db));
+    OK(tsdb_open(dir, &o, &x->db));
+    sk_same(c, st, x->db, x->ids, "close and reopen");
+    OK(tsdb_close(x->db));
+    printf("  %-28s %d writers x %d rounds, %zu keys: %ld merges, %ld snapshots (%ld aggregates, %ld on a "
+           "follower), %ld torn across series, %.2f s%s\n",
+           c->name, c->writers, c->rounds, nk, x->merges, (long)x->snapshots, (long)x->aggs,
+           (long)x->follower_snapshots, (long)x->torn_across,
+           (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9, crash ? ", crash + replay" : "");
+    rm_rf(dir);
+    free(st);
+    free(x);
+}
+
+static void test_same_keys(const char *base)
+{
+    const int64_t t0 = 1700000000000 + 1234; /* partitions do not start at a key */
+    const unsigned batches = SK_SMALL | SK_LARGE;
+    static sk_cfg c[6];
+    c[0] = (sk_cfg){"float32, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_FLOAT32, false, batches};
+    c[1] = (sk_cfg){"int64 + nulls, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_INT64, true, batches};
+    c[2] = (sk_cfg){"float64 + nulls, same keys", 5, 1000, 2, 120, 0, t0, 61000, TSDB_FLOAT64, true, batches};
+    c[3] = (sk_cfg){"float32, shifted keys", 6, 1000, 3, 80, 20, t0, 97000, TSDB_FLOAT32, false, batches};
+    c[4] = (sk_cfg){"int64 + nulls, shifted keys", 6, 1000, 3, 80, 37, t0, 97000, TSDB_INT64, true, batches};
+    c[5] = (sk_cfg){"appends, per series, batches", 6, 200, 3, 60, 10, t0, 97000, TSDB_FLOAT32, false,
+                    batches | SK_APPEND | SK_SERIES};
+    sk_run(base, &c[0], 0, false);  /* WAL synced on every write: rows visible once durable */
+    sk_run(base, &c[1], 5, true);   /* WAL synced in the background */
+    sk_run(base, &c[2], -1, false); /* no WAL */
+    sk_run(base, &c[3], 0, true);
+    sk_run(base, &c[4], 0, false);
+    sk_run(base, &c[5], 0, false);
+}
+
 typedef struct part_count {
     int n;
     int64_t created, written;
@@ -958,6 +1533,11 @@ int main(int argc, char **argv)
     const char *base = argc > 1 ? argv[1] : "/tmp";
     char dir[256];
     simd_init();
+    if (argc > 2 && strcmp(argv[2], "samekeys") == 0) { /* just these, e.g. under a sanitizer */
+        test_same_keys(base);
+        printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
+        return failures != 0;
+    }
     printf("simd: %s\n", simd_name());
     printf("codecs\n");
     test_codecs();
@@ -969,9 +1549,13 @@ int main(int argc, char **argv)
     test_replace(dir);
     printf("write-ahead log\n");
     test_wal(dir);
+    test_flush_visibility(dir);
+    test_publish_then_merge(dir);
     printf("concurrency\n");
     test_concurrency(dir);
     rm_rf(dir);
+    printf("concurrent writes to the same keys\n");
+    test_same_keys(base);
     printf("idle partitions merged\n");
     test_idle_merge(base);
     if (failures) {
