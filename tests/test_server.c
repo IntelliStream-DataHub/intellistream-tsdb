@@ -750,13 +750,17 @@ static void *skn_writer(void *a)
         bool async = (seed >> 8) % 2, packed = (seed >> 9) % 2, plain = c->type == TSDB_FLOAT32 && !c->nulls;
         OK(tsdbc_set_compression(cn, packed ? 1 : 0));
         atomic_store(&x->started[w], r + 1);
-        for (uint32_t s = 0; s < (kind == SK_SERIES ? c->nseries : 1); s++) {
+        bool per = kind == SK_SERIES || kind == SK_REPLACE;
+        for (uint32_t s = 0; s < (per ? c->nseries : 1); s++) {
             sk_batch b;
-            bool large = kind == SK_LARGE || (kind == SK_SERIES && (seed >> 24) % 2);
-            sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, kind == SK_SERIES ? s : UINT32_MAX, &b);
+            bool large = kind == SK_LARGE || (per && (seed >> 24) % 2);
+            sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, per ? s : UINT32_MAX, &b);
             tsdb_values col = {(tsdb_type)c->type, b.v, c->nulls ? b.valid : NULL};
             const float *f = (const float *)(void *)b.v;
-            if (kind == SK_SERIES)
+            if (kind == SK_REPLACE) /* synchronous: the replace has no pipelined form */
+                OK(tsdbc_replace_range(cn, b.series[0], sk_ts(c, (uint32_t)w * c->shift),
+                                       sk_ts(c, (uint32_t)w * c->shift + c->nts), b.ts, &col, b.n));
+            else if (kind == SK_SERIES)
                 OK(async ? tsdbc_insert_series_values_async(cn, b.series[0], b.ts, &col, b.n)
                          : tsdbc_insert_series_values(cn, b.series[0], b.ts, &col, b.n));
             else if (plain)
@@ -920,14 +924,16 @@ static void test_same_keys(const char *dir)
     pid_t srv = start_server_with(dir, args);
     const int64_t t0 = T0 + 1234;
     const unsigned batches = SK_SMALL | SK_LARGE;
-    enum { NC = 5 };
+    enum { NC = 6 };
     static sk_cfg c[NC];
     c[0] = (sk_cfg){"float32, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_FLOAT32, false, batches};
     c[1] = (sk_cfg){"int64 + nulls, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_INT64, true, batches};
     c[2] = (sk_cfg){"float32, shifted keys", 6, 1000, 3, 80, 20, t0, 97000, TSDB_FLOAT32, false, batches};
     c[3] = (sk_cfg){"float64 + nulls, per series", 6, 600, 3, 80, 37, t0, 97000, TSDB_FLOAT64, true,
                     batches | SK_SERIES};
-    c[4] = (sk_cfg){"float32, then SIGKILL", 5, 600, 3, 80, 10, t0, 97000, TSDB_FLOAT32, false, batches};
+    c[4] = (sk_cfg){"int64 + nulls, replaces", 5, 150, 3, 80, 23, t0, 97000, TSDB_INT64, true,
+                    batches | SK_REPLACE};
+    c[5] = (sk_cfg){"float32, then SIGKILL", 5, 600, 3, 80, 10, t0, 97000, TSDB_FLOAT32, false, batches};
     skn *x = calloc(NC, sizeof *x);
     sk_val *st[NC];
     for (int k = 0; k < NC; k++) {

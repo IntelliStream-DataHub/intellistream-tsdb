@@ -396,6 +396,98 @@ static void test_crash(uint64_t seed)
 
 /* ------------------------------------------------------- deterministic */
 
+/* WAL replay around deletes: rows in the memtable before a delete, rows written
+ * after it into the same WAL segment, then SIGKILL. The delete flushed the older
+ * rows into parts, so replay must neither bring them back nor skip the newer
+ * ones in the partitions where the delete left a tombstone part. */
+static void wr_put(tsdb *db, uint32_t s, int64_t a, int64_t b, int64_t add)
+{
+    int64_t ts[100], v[100];
+    size_t n = 0;
+    for (int64_t t = a; t < b; t += 100, n++) {
+        ts[n] = t;
+        v[n] = add + t;
+    }
+    tsdb_values col = {TSDB_INT64, v, NULL};
+    OK(tsdb_insert_series_values(db, s, ts, &col, n));
+}
+
+static void wr_check(tsdb *db, const int64_t *exp0, const char *when)
+{
+    static rows r;
+    for (uint32_t s = 0; s < 2; s++) {
+        r.n = 0;
+        OK(tsdb_query_values(db, s, INT64_MIN, INT64_MAX, NULL, collect, &r));
+        size_t k = 0;
+        bool ok = true;
+        for (int64_t t = 0; t < 10000; t += 100) {
+            int64_t want = s ? t : exp0[t / 100];
+            if (want == NULLV)
+                continue;
+            if (ok && (k >= r.n || r.ts[k] != t || r.v[k] != want)) {
+                fprintf(stderr, "  ts %lld: want %lld, row %zu has ts %lld value %lld\n", (long long)t,
+                        (long long)want, k, k < r.n ? (long long)r.ts[k] : -1LL, k < r.n ? (long long)r.v[k] : -1LL);
+                ok = false;
+            }
+            k++;
+        }
+        if (!ok || k != r.n) {
+            fprintf(stderr, "FAIL wal replay (%s): series %u has %zu rows, %zu expected\n", when, s, r.n, k);
+            failures++;
+        }
+    }
+}
+
+static void test_wal_replay(void)
+{
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/tsdb_delete_wal", scratch);
+    rmrf(dir);
+    tsdb_options opt = test_opts();
+    opt.wal_sync_ms = 0; /* every write durable on return */
+    pid_t pid = fork();
+    if (pid == 0) {
+        tsdb *db;
+        OK(tsdb_open(dir, &opt, &db));
+        create_series(db);
+        wr_put(db, 0, 0, 10000, 0); /* five partitions, all in the memtable */
+        wr_put(db, 1, 0, 10000, 0);
+        OK(tsdb_delete_range(db, 0, 2000, 6000));
+        wr_put(db, 0, 3000, 4000, 1000000);   /* after the delete: visible */
+        wr_put(db, 0, 7000, 8000, 2000000);   /* overwrites outside the range */
+        int64_t ts = 8500, v = 3000000;
+        tsdb_values col = {TSDB_INT64, &v, NULL};
+        OK(tsdb_replace_range(db, 0, 8000, 9000, &ts, &col, 1));
+        wr_put(db, 0, 8800, 8900, 4000000);   /* after the replace */
+        raise(SIGKILL);
+        _exit(1);
+    }
+    int st;
+    waitpid(pid, &st, 0);
+    CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    int64_t exp0[100];
+    for (int i = 0; i < 100; i++) {
+        int64_t t = i * 100;
+        exp0[i] = t >= 2000 && t < 6000 ? NULLV : t;
+        if (t >= 3000 && t < 4000)
+            exp0[i] = 1000000 + t;
+        if (t >= 7000 && t < 8000)
+            exp0[i] = 2000000 + t;
+        if (t >= 8000 && t < 9000)
+            exp0[i] = t == 8500 ? 3000000 : t == 8800 ? 4000000 + t : NULLV;
+    }
+    tsdb *db;
+    OK(tsdb_open(dir, &opt, &db));
+    wr_check(db, exp0, "replayed");
+    OK(tsdb_close(db));
+    OK(tsdb_open(dir, &opt, &db)); /* the replay's own parts must not replay again */
+    wr_check(db, exp0, "reopened");
+    OK(tsdb_optimize(db));
+    wr_check(db, exp0, "merged");
+    OK(tsdb_close(db));
+    rmrf(dir);
+}
+
 static int64_t agg_count(tsdb *db, uint32_t s, int64_t a, int64_t b, int64_t *sum, tsdb_query_stats *st)
 {
     tsdb_bucket *bk = NULL;
@@ -604,6 +696,7 @@ int main(int argc, char **argv)
         scratch = argv[1];
     int rounds = getenv("TSDB_DELETE_ROUNDS") ? atoi(getenv("TSDB_DELETE_ROUNDS")) : 6;
     test_stats();
+    test_wal_replay();
     test_follower();
     test_retention();
     for (int i = 0; i < rounds && !failures; i++)
