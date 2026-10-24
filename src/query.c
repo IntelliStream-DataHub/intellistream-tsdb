@@ -157,7 +157,7 @@ void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *
 }
 
 /* Entry i's granules that may hold rows in [start, end), within its window. */
-static void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t start, int64_t end, uint32_t *gi,
+void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t start, int64_t end, uint32_t *gi,
                       uint32_t *gj)
 {
     if (start <= sn->start && end >= sn->end) { /* the snapshot's window is the answer: no second search */
@@ -166,10 +166,10 @@ static void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t sta
         return;
     }
     part_find(sn->parts[i], series, start, end, gi, gj);
-    *gi = MAX(*gi, sn->gi[i]);
-    *gj = MIN(*gj, sn->gj[i]);
-    if (*gi > *gj)
-        *gi = *gj;
+    /* both ends clamped into the window: an empty answer stays inside it, so a caller stepping one granule
+     * outward (TWA's neighbours) never reaches a granule the snapshot moved to mem */
+    *gi = MIN(MAX(*gi, sn->gi[i]), sn->gj[i]);
+    *gj = MAX(MIN(*gj, sn->gj[i]), sn->gi[i]);
 }
 
 typedef struct snap_build {
@@ -1527,7 +1527,7 @@ static int lttb_count(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t serie
     int rc = items ? 0 : TSDB_ERR_NOMEM;
     for (uint32_t s = 0; rc == 0 && s < sn->np; s++) {
         uint32_t gi, gj;
-        part_find(sn->parts[s], series, start, end, &gi, &gj);
+        snap_find(sn, s, series, start, end, &gi, &gj); /* never granules a tombstone hides: those are in mem */
         for (uint32_t k = gi; k < gj; k++) {
             if (nitem == cap) {
                 item *i2 = realloc(items, (cap *= 2) * sizeof *items);
@@ -1596,6 +1596,7 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
     int type = eng_series_type(db, series);
     if (type == TSDB_STATE)
         return TSDB_ERR_INVALID;
+    start = MAX(start, eng_cutoff(db, series)); /* expired rows are gone at once, merged away or not */
     if (start >= end || type < 0)
         return 0;
     snapshot sn;

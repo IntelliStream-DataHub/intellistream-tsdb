@@ -833,6 +833,9 @@ typedef struct snapshot {
 int snapshot_take(struct eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s);
 void snapshot_release(snapshot *s);
 uint64_t mem_prio(const snapshot *sn, size_t i);
+/* Entry i's granules that may hold rows in [start, end): part_find limited to the entry's window. */
+void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t start, int64_t end, uint32_t *gi,
+               uint32_t *gj);
 /* Granules [*gi, *gj) of series s that may hold rows in [start, end). */
 void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj);
 typedef struct src {

@@ -98,7 +98,7 @@ static void check_one(tsdb *db, tsdb *truth, uint32_t s, int64_t start, int64_t 
         ok = got.p[i].ts > got.p[i - 1].ts;
     if (ok && m) /* first and last kept */
         ok = got.p[0].ts == raw.p[0].ts && got.p[m - 1].ts == raw.p[raw.n - 1].ts;
-    if (ok && db == truth) /* statistics: one read of the range */
+    if (ok && db == truth && m) /* statistics: one read of the range (none when the count found no point) */
         ok = ls.result_rows == got.n && ls.rows == rs.rows && ls.parts == rs.parts;
     if (!ok) {
         fprintf(stderr, "%s: series %u [%lld, %lld) threshold %zu: %zu points of %zu, expected %zu\n", what, s,
@@ -458,6 +458,13 @@ static void test_concurrent(const char *base)
         failures++;
 }
 
+#define LTTB_NOW 1800000000000LL
+static int64_t lttb_clock(void *arg)
+{
+    (void)arg;
+    return LTTB_NOW;
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -475,6 +482,7 @@ int main(int argc, char **argv)
     o.buffer_rows = 1 << 22;
     o.flush_interval_ms = 600000;
     o.merge_threads = 0; /* merges only when asked for */
+    o.clock_ms = lttb_clock; /* retention: expired points stay put while the checks run */
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
     test_by_hand(db);
@@ -524,11 +532,46 @@ int main(int argc, char **argv)
         }
     check_all(db, db, ids, "corrections");
 
+    /* deletes and replaces: the count pass must not count rows a tombstone hides (their granules' statistics
+     * still hold them until a merge), in parts, with inserts on top in the memtable, and after merges */
+    for (int round = 0; round < 4; round++) {
+        for (int k = 0; k < NSER; k++) {
+            pts all = {.all = true};
+            OK(tsdb_query_values(db, ids[k], TSDB_TS_MIN, TSDB_TS_MAX, NULL, collect, &all));
+            size_t n = 1 + rnd() % (round == 3 ? 60 : 400);
+            size_t at = rnd() % (all.n - 2 * n - 1);
+            int64_t a = all.p[at].ts + (int64_t)(rnd() % 2), b = all.p[at + 2 * n].ts + (int64_t)(rnd() % 2);
+            if (k % 3 == 0) {
+                OK(tsdb_delete_range(db, ids[k], a, b));
+            } else {
+                int64_t c = 0;
+                double w = 0;
+                fill(types[k / NSHAPES], k % NSHAPES, n, ts, vals, valid, &c, &w, 0);
+                size_t m = 0;
+                for (size_t i = 0; i < n; i++) /* every other old timestamp: the ones between go */
+                    if (all.p[at + 1 + 2 * i].ts >= a && all.p[at + 1 + 2 * i].ts < b)
+                        ts[m++] = all.p[at + 1 + 2 * i].ts;
+                tsdb_values tv = {types[k / NSHAPES], vals, valid};
+                OK(k % 3 == 1 ? tsdb_replace_range(db, ids[k], a, b, ts, &tv, m)
+                              : tsdb_insert_series_values(db, ids[k], ts, &tv, m)); /* inserts: memtable */
+                if (k % 3 == 2)
+                    OK(tsdb_delete_range(db, ids[k], all.p[at].ts, all.p[at].ts + 1)); /* one row */
+            }
+            free(all.p);
+        }
+        if (round == 1)
+            OK(tsdb_flush(db));
+        char w[32];
+        snprintf(w, sizeof w, "deletes %d", round);
+        check_all(db, db, ids, w);
+    }
+
     /* a follower sees the same points */
     tsdb_options fo;
     tsdb_options_init(&fo);
     fo.follow = 1;
     fo.refresh_ms = 20;
+    fo.clock_ms = lttb_clock;
     tsdb *f;
     OK(tsdb_commit(db));
     OK(tsdb_flush(db));
@@ -539,6 +582,20 @@ int main(int argc, char **argv)
 
     OK(tsdb_optimize(db));
     check_all(db, db, ids, "merged");
+
+    /* retention: expired points never count, merged away or not */
+    for (int k = 0; k < NSER; k++) {
+        pts all = {.all = true};
+        OK(tsdb_query_values(db, ids[k], TSDB_TS_MIN, TSDB_TS_MAX, NULL, collect, &all));
+        OK(tsdb_set_retention(db, ids[k], LTTB_NOW - all.p[all.n / 3].ts - (int64_t)(rnd() % 2)));
+        free(all.p);
+    }
+    check_all(db, db, ids, "retention");
+    OK(tsdb_open(dir, &fo, &f));
+    check_all(f, db, ids, "retention, follower");
+    OK(tsdb_close(f));
+    OK(tsdb_optimize(db));
+    check_all(db, db, ids, "retention, merged");
 
     /* a callback that stops */
     CHECK(tsdb_query_lttb(db, ids[0], TSDB_TS_MIN, TSDB_TS_MAX, 50, stop_cb, NULL) == TSDB_ERR_STOPPED);
