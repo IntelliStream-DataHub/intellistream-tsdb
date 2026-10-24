@@ -306,6 +306,42 @@ int tsdb_query_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, con
 int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
+/* ---- the spread: range, variance, standard deviation ----
+ * A bucket as above followed by the spread of its known values: range is
+ * max - min; var_pop and stddev_pop are the population variance and standard
+ * deviation (divided by count), var_samp and stddev_samp the sample ones
+ * (divided by count - 1, NaN for a single value). All are NaN for a bucket
+ * without known values and for state series. A NaN or an infinity among the
+ * values makes the variances NaN (the deviation of an infinity from the mean
+ * is undefined), not the range, which comes from min and max; so do finite
+ * floats whose sum overflows (values near DBL_MAX), as it does the sum.
+ *  - Floats are combined in the numerically stable form (the sum of squared
+ *    deviations from the mean, granule by granule with the parallel formula of
+ *    Chan et al.), so a large offset (pressure in Pa around 101325) costs no
+ *    precision. Like sums, they may differ in the last bits with the order in
+ *    which rows were combined (parts, merges, threads). Constant data gives
+ *    exactly 0.
+ *  - int64 and bool keep exact integer sums of x and x^2: the variance is
+ *    computed from exact moments, with a few roundings at the end (in long
+ *    double), and does not depend on the order of the rows.
+ * The spread costs a second pass over decoded floats and the squares of
+ * integers, so only these functions compute it; tsdb_query_agg and the rest
+ * do not. Arguments, order and limit as in tsdb_query_agg, tsdb_query_group_ex
+ * and tsdb_query_bounds; opts may be NULL. Free with free(). */
+typedef struct tsdb_spread_bucket {
+    tsdb_bucket b;
+    double range;
+    double var_pop, var_samp;
+    double stddev_pop, stddev_samp;
+} tsdb_spread_bucket;
+
+int tsdb_query_spread(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                      const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
+int tsdb_query_spread_group(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                            const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
+int tsdb_query_spread_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *bounds,
+                             size_t n, const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
+
 /* ---- time-weighted averages ----
  * For sensors that report irregularly or only on change, a plain average
  * weights every reading the same; a time-weighted average weights each value

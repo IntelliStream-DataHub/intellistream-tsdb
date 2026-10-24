@@ -1259,6 +1259,66 @@ int tsdb_query_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
     return rc;
 }
 
+/* The spread: one router for the interval, group and bounds forms, like query_twa. */
+static int query_spread(tsdb *t, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                        const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
+{
+    eng *e;
+    uint32_t local;
+    qrun qr;
+    qs_begin(&qr);
+    int rc = 0, type = -1;
+    if (route(t, series, &e, &local)) {
+        type = eng_series_type(e, local);
+        rc = eng_query_spread(e, local, start, end, bk, out, nout);
+    }
+    if (rc == 0 && opts && opts->order == TSDB_DESC)
+        for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {
+            tsdb_spread_bucket x = (*out)[i];
+            (*out)[i] = (*out)[j];
+            (*out)[j] = x;
+        }
+    if (rc == 0 && opts && opts->limit && *nout > opts->limit)
+        *nout = opts->limit;
+    qs_end(&qr, type, *nout);
+    return rc;
+}
+
+int tsdb_query_spread(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                      const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    if (interval_ms < 0)
+        return TSDB_ERR_INVALID;
+    bucketer bk = {.kind = interval_ms ? BK_FIXED : BK_ONE, .start = start, .interval = interval_ms};
+    return query_spread(t, series, start, end, &bk, opts, out, nout);
+}
+
+int tsdb_query_spread_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                            const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    bucketer bk;
+    int rc = bucketer_init(&bk, start, group);
+    return rc ? rc : query_spread(t, series, start, end, &bk, opts, out, nout);
+}
+
+int tsdb_query_spread_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *bounds,
+                             size_t n, const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    bucketer bk;
+    int rc = bounds ? bucketer_bounds(&bk, bounds, n) : TSDB_ERR_INVALID;
+    if (rc)
+        return rc;
+    if (start < bounds[0]) /* rows before the first bound belong to no bucket */
+        start = bounds[0];
+    return query_spread(t, series, start, end, &bk, opts, out, nout);
+}
+
 /* ----------------------------------------------------------- inspection */
 
 int tsdb_get_stats(tsdb *t, tsdb_stats *st)

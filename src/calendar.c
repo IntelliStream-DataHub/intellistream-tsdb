@@ -2,7 +2,8 @@
  * tsdb_query_group_local: grouping in a time zone for programs that embed
  * the database. The engine knows UTC only; this is the client's part (the
  * bounds of the local periods, tsdb_calendar_bounds) done in-process;
- * tsdb_query_twa_group_local likewise for time-weighted averages.
+ * tsdb_query_spread_group_local and tsdb_query_twa_group_local likewise for
+ * the spread and time-weighted averages.
  */
 #include "internal.h"
 
@@ -18,13 +19,15 @@ static int first_ts(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n
     return 1; /* one row is all it takes */
 }
 
-int tsdb_query_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
-                           const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+/* Buckets (spread false: tsdb_bucket) or the spread (tsdb_spread_bucket) of local periods. */
+static int group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                       const tsdb_query_opts *opts, bool spread, void **out, size_t *nout)
 {
     *out = NULL;
     *nout = 0;
     if (!group || !group->timezone || strcmp(group->timezone, "UTC") == 0)
-        return tsdb_query_group_ex(db, series, start, end, group, opts, out, nout);
+        return spread ? tsdb_query_spread_group(db, series, start, end, group, opts, (tsdb_spread_bucket **)out, nout)
+                      : tsdb_query_group_ex(db, series, start, end, group, opts, (tsdb_bucket **)out, nout);
     /* bounds are listed one by one: cut an open range to the rows there are */
     int64_t lo = INT64_MAX, hi = INT64_MIN;
     tsdb_query_opts first = {TSDB_ASC, 1}, last = {TSDB_DESC, 1};
@@ -39,9 +42,23 @@ int tsdb_query_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end
     size_t n;
     rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
     if (rc == 0)
-        rc = tsdb_query_bounds(db, series, start, end, bounds, n, opts, out, nout);
+        rc = spread ? tsdb_query_spread_bounds(db, series, start, end, bounds, n, opts, (tsdb_spread_bucket **)out,
+                                               nout)
+                    : tsdb_query_bounds(db, series, start, end, bounds, n, opts, (tsdb_bucket **)out, nout);
     free(bounds);
     return rc;
+}
+
+int tsdb_query_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                           const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+{
+    return group_local(db, series, start, end, group, opts, false, (void **)out, nout);
+}
+
+int tsdb_query_spread_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                                  const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
+{
+    return group_local(db, series, start, end, group, opts, true, (void **)out, nout);
 }
 
 /* The time of the newest (desc) or oldest reading in [start, end), if any. */

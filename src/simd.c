@@ -30,6 +30,14 @@
  * max keep 32 float lanes the same way, combined with MINPS/MAXPS semantics
  * (the second operand wins on NaN and on equal values, which decides the sign
  * of a zero). A last partial group of 32 goes into the lanes one value at a time.
+ *
+ * The spread takes a second pass (see agg_state), only where it is asked for: with the mean m of the run
+ * (its sum, reduced as above, over n), lane j sums d = (double)x - m and d * d
+ * for the same values j, j+32, ..., reduced by the same halving. The kernels
+ * share that order too, and -ffp-contract=off keeps d * d from fusing into an
+ * FMA, so m2 is bit-identical across them: granule statistics are written with
+ * it. (What is not reproducible is the combination of runs, as for sums: it
+ * follows merges and threads.)
  */
 #define LANES 32
 
@@ -47,8 +55,55 @@ static void lanes_init(lanes *l, const agg_state *a)
     }
 }
 
-/* values [i, n) with n - i < LANES, then the reduction into a */
-static void lanes_finish(lanes *l, const float *v, size_t i, size_t n, agg_state *a)
+typedef struct dev_lanes {
+    double d1[LANES], d2[LANES];
+} dev_lanes;
+
+static double lanes_reduce(double *s)
+{
+    for (int w = LANES / 2; w >= 1; w /= 2)
+        for (int j = 0; j < w; j++)
+            s[j] = s[j] + s[j + w];
+    return s[0];
+}
+
+/* pass two, values [i, n) with n - i < LANES, then the reduction; and the run into a */
+static void dev_finish(dev_lanes *l, const float *v, size_t i, size_t n, double m, double s, agg_state *a,
+                       agg_dev *dv)
+{
+    for (int j = 0; i + (size_t)j < n; j++) {
+        double d = (double)v[i + (size_t)j] - m;
+        l->d1[j] += d;
+        l->d2[j] += d * d;
+    }
+    double d1 = lanes_reduce(l->d1), d2 = lanes_reduce(l->d2);
+    agg_add_run(a, dv, n, s, d1, d2);
+    a->sum = canon_nan(a->sum);
+}
+
+/* the run into a without the spread: count and sum only */
+static void sum_finish(size_t n, double s, agg_state *a)
+{
+    a->count += n;
+    a->sum = canon_nan(a->sum + s);
+}
+
+static void dev_scalar(const float *v, size_t n, double s, agg_state *a, agg_dev *dv)
+{
+    dev_lanes l = {0};
+    double m = s / (double)n;
+    size_t i = 0;
+    for (; i + LANES <= n; i += LANES)
+        for (int j = 0; j < LANES; j++) {
+            double d = (double)v[i + (size_t)j] - m;
+            l.d1[j] += d;
+            l.d2[j] += d * d;
+        }
+    dev_finish(&l, v, i, n, m, s, a, dv);
+}
+
+/* values [i, n) with n - i < LANES, then the reduction: min and max into a; returns the sum */
+static double lanes_finish(lanes *l, const float *v, size_t i, size_t n, agg_state *a)
 {
     for (int j = 0; i + (size_t)j < n; j++) {
         float x = v[i + (size_t)j];
@@ -62,14 +117,15 @@ static void lanes_finish(lanes *l, const float *v, size_t i, size_t n, agg_state
             l->mn[j] = l->mn[j + w] < l->mn[j] ? l->mn[j + w] : l->mn[j];
             l->mx[j] = l->mx[j + w] > l->mx[j] ? l->mx[j + w] : l->mx[j];
         }
-    a->count += n;
-    a->sum = canon_nan(a->sum + l->s[0]);
     a->min = l->mn[0] < a->min ? l->mn[0] : a->min;
     a->max = l->mx[0] > a->max ? l->mx[0] : a->max;
+    return l->s[0];
 }
 
-static void agg_scalar(const float *v, size_t n, agg_state *a)
+static void agg_scalar(const float *v, size_t n, agg_state *a, agg_dev *dv)
 {
+    if (!n)
+        return;
     lanes l;
     lanes_init(&l, a);
     size_t i = 0;
@@ -80,15 +136,68 @@ static void agg_scalar(const float *v, size_t n, agg_state *a)
             l.mn[j] = x < l.mn[j] ? x : l.mn[j];
             l.mx[j] = x > l.mx[j] ? x : l.mx[j];
         }
-    lanes_finish(&l, v, i, n, a);
+    double s = lanes_finish(&l, v, i, n, a);
+    if (dv)
+        dev_scalar(v, n, s, a, dv);
+    else
+        sum_finish(n, s, a);
 }
 
 #ifdef TSDB_X86
+__attribute__((target("avx2"))) static void dev_avx2(const float *v, size_t n, double s, agg_state *a,
+                                                    agg_dev *dv)
+{
+    dev_lanes l;
+    double m = s / (double)n;
+    const __m256d mm = _mm256_set1_pd(m);
+    __m256d d1[8], d2[8]; /* lanes 4q .. 4q+3 */
+    for (int q = 0; q < 8; q++)
+        d1[q] = d2[q] = _mm256_setzero_pd();
+    size_t i = 0;
+    for (; i + LANES <= n; i += LANES)
+        for (int q = 0; q < 8; q++) {
+            __m256d d = _mm256_sub_pd(_mm256_cvtps_pd(_mm_loadu_ps(v + i + 4 * q)), mm);
+            d1[q] = _mm256_add_pd(d1[q], d);
+            d2[q] = _mm256_add_pd(d2[q], _mm256_mul_pd(d, d));
+        }
+    for (int q = 0; q < 8; q++) {
+        _mm256_storeu_pd(l.d1 + 4 * q, d1[q]);
+        _mm256_storeu_pd(l.d2 + 4 * q, d2[q]);
+    }
+    dev_finish(&l, v, i, n, m, s, a, dv);
+}
+
+__attribute__((target("avx512f"))) static void dev_avx512(const float *v, size_t n, double s, agg_state *a,
+                                                         agg_dev *dv)
+{
+    dev_lanes l;
+    double m = s / (double)n;
+    const __m512d mm = _mm512_set1_pd(m);
+    __m512d d1[4], d2[4]; /* lanes 8q .. 8q+7 */
+    for (int q = 0; q < 4; q++)
+        d1[q] = d2[q] = _mm512_setzero_pd();
+    size_t i = 0;
+    for (; i + LANES <= n; i += LANES)
+        for (int q = 0; q < 4; q++) {
+            __m512d d = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(v + i + 8 * q)), mm);
+            d1[q] = _mm512_add_pd(d1[q], d);
+            d2[q] = _mm512_add_pd(d2[q], _mm512_mul_pd(d, d));
+        }
+    for (int q = 0; q < 4; q++) {
+        _mm512_storeu_pd(l.d1 + 8 * q, d1[q]);
+        _mm512_storeu_pd(l.d2 + 8 * q, d2[q]);
+    }
+    dev_finish(&l, v, i, n, m, s, a, dv);
+}
+
+
 /* sum of the 4 floats as doubles into s */
 #define ADD4(s, q) s = _mm256_add_pd(s, _mm256_cvtps_pd(q))
 
-__attribute__((target("avx2"))) static void agg_avx2(const float *v, size_t n, agg_state *a)
+__attribute__((target("avx2"))) static void agg_avx2(const float *v, size_t n, agg_state *a, agg_dev *dv)
 {
+    if (!n)
+        return;
     lanes l;
     lanes_init(&l, a);
     /* sum lanes 0-3, 4-7, ..., 28-31 */
@@ -129,11 +238,18 @@ __attribute__((target("avx2"))) static void agg_avx2(const float *v, size_t n, a
     _mm256_storeu_ps(l.mx + 8, mx1);
     _mm256_storeu_ps(l.mx + 16, mx2);
     _mm256_storeu_ps(l.mx + 24, mx3);
-    lanes_finish(&l, v, i, n, a);
+    double s = lanes_finish(&l, v, i, n, a);
+    if (dv)
+        dev_avx2(v, n, s, a, dv);
+    else
+        sum_finish(n, s, a);
 }
 
-__attribute__((target("avx512f,avx512dq"))) static void agg_avx512(const float *v, size_t n, agg_state *a)
+__attribute__((target("avx512f,avx512dq"))) static void agg_avx512(const float *v, size_t n, agg_state *a,
+                                                                         agg_dev *dv)
 {
+    if (!n)
+        return;
     lanes l;
     lanes_init(&l, a);
     /* sum lanes 0-7, 8-15, 16-23, 24-31 */
@@ -160,11 +276,15 @@ __attribute__((target("avx512f,avx512dq"))) static void agg_avx512(const float *
     _mm512_storeu_ps(l.mn + 16, mn2);
     _mm512_storeu_ps(l.mx, mx);
     _mm512_storeu_ps(l.mx + 16, mx2);
-    lanes_finish(&l, v, i, n, a);
+    double s = lanes_finish(&l, v, i, n, a);
+    if (dv)
+        dev_avx512(v, n, s, a, dv);
+    else
+        sum_finish(n, s, a);
 }
 #endif
 
-void (*simd_agg_f32)(const float *v, size_t n, agg_state *a) = agg_scalar;
+void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *dv) = agg_scalar;
 static const char *simd_level = "scalar";
 
 const char *simd_name(void) { return simd_level; }
@@ -202,7 +322,7 @@ static bool avx512_downclocks(void)
  * forced v2 run uses no AVX at all, as on Sandy Bridge without AVX2). */
 void simd_select(int level)
 {
-    void (*f)(const float *, size_t, agg_state *) = agg_scalar;
+    void (*f)(const float *, size_t, agg_state *, agg_dev *) = agg_scalar;
     const char *name = "scalar";
 #ifdef TSDB_X86
     const char *force = getenv("TSDB_SIMD"); /* "scalar", "avx2" or "avx512", for benchmarking */

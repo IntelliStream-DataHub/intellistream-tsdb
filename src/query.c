@@ -396,6 +396,77 @@ int64_t bucketer_start(const bucketer *bk, int64_t key) { return bk_start(bk, ke
 
 /* -------------------------------------------------------------- aggregate */
 
+/* u[k..] += x * y, in 64-bit limbs (the carry runs off the top of a 256-bit number: never, for the callers) */
+static void mul_add256(uint64_t u[4], int k, uint64_t x, uint64_t y)
+{
+    unsigned __int128 p = (unsigned __int128)x * y;
+    unsigned __int128 c = 0;
+    for (int i = k; i < 4; i++) {
+        c += u[i];
+        if (i == k)
+            c += (uint64_t)p;
+        else if (i == k + 1)
+            c += (uint64_t)(p >> 64);
+        u[i] = (uint64_t)c;
+        c >>= 64;
+    }
+}
+
+/* Integer variances from the exact sums: n^2 var_pop = n sum(x^2) - sum(x)^2,
+ * a 256-bit integer, exact; converted once to long double (64-bit mantissa on
+ * x86, so two roundings at most before the final one to double). Depends on
+ * the multiset of values only: the same bits whatever the order. */
+static void int_variance(const agg_state *a, const agg_dev *x, double *vp, double *vs)
+{
+    uint64_t n = a->count, A[4] = {0}, B[4] = {0}, D[4];
+    mul_add256(A, 0, n, (uint64_t)x->isq);
+    mul_add256(A, 1, n, (uint64_t)(x->isq >> 64));
+    mul_add256(A, 2, n, x->isq_hi);
+    unsigned __int128 s = a->isum < 0 ? -(unsigned __int128)a->isum : (unsigned __int128)a->isum;
+    uint64_t lo = (uint64_t)s, hi = (uint64_t)(s >> 64);
+    mul_add256(B, 0, lo, lo);
+    mul_add256(B, 1, lo, hi);
+    mul_add256(B, 1, lo, hi);
+    mul_add256(B, 2, hi, hi);
+    unsigned __int128 borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned __int128 d = (unsigned __int128)A[i] - B[i] - borrow;
+        D[i] = (uint64_t)d;
+        borrow = (d >> 64) ? 1 : 0;
+    }
+    long double num = 0;
+    for (int i = 3; i >= 0; i--)
+        num = num * 0x1p64L + (long double)D[i];
+    long double ln = (long double)n;
+    *vp = (double)(num / (ln * ln));
+    *vs = n > 1 ? (double)(num / (ln * (long double)(n - 1))) : nan_canonical();
+}
+
+void agg_spread(int type, const agg_state *a, const agg_dev *x, tsdb_spread_bucket *b)
+{
+    const double nan = nan_canonical();
+    double vp, vs;
+    b->range = b->var_pop = b->var_samp = b->stddev_pop = b->stddev_samp = nan;
+    if (type == TSDB_STATE || a->count == 0)
+        return;
+    if (type_is_int(type)) {
+        b->range = (double)((__int128)a->imax - a->imin);
+        int_variance(a, x, &vp, &vs);
+    } else {
+        if (a->min <= a->max) /* else only NaN values */
+            b->range = canon_nan(a->max - a->min);
+        /* constant data: exactly 0, where the means of the runs combined may differ in the last bit */
+        double m2 = a->min == a->max && isfinite(a->sum) ? 0 : x->m2;
+        vp = m2 / (double)a->count;
+        vs = a->count > 1 ? m2 / (double)(a->count - 1) : nan;
+    }
+    b->var_pop = canon_nan(vp);
+    b->var_samp = canon_nan(vs);
+    b->stddev_pop = canon_nan(__builtin_sqrt(vp));
+    b->stddev_samp = canon_nan(__builtin_sqrt(vs));
+}
+
+
 typedef struct local_bucket {
     int64_t b;
     agg_state a;
@@ -405,6 +476,7 @@ typedef struct agg_target {
     int64_t start, end, b0;
     const bucketer *bk;
     agg_state *acc;
+    agg_dev *accx; /* beside acc for the spread (tsdb_query_spread), else NULL */
     int type;
     size_t w;
 } agg_target;
@@ -413,20 +485,21 @@ typedef struct agg_target {
 
 /* One run of rows into a: float32 without nulls goes straight to the SIMD
  * kernel, which matters when buckets hold a handful of rows each. */
-static inline void fold_run(const agg_target *t, const uint8_t *v, size_t n, bool may_be_null, agg_state *a)
+static inline void fold_run(const agg_target *t, const uint8_t *v, size_t n, bool may_be_null, agg_state *a,
+                            agg_dev *x)
 {
     if (t->type == TSDB_FLOAT32 && !may_be_null) {
         a->rows += n;
-        simd_agg_f32((const float *)v, n, a);
+        simd_agg_f32((const float *)v, n, a, x);
     } else {
-        agg_fold_hint(t->type, v, n, may_be_null, a);
+        agg_fold_hint(t->type, v, n, may_be_null, a, x);
     }
 }
 
 /* Folds time-sorted rows (all within [start, end)) into per-bucket states,
- * one entry per bucket touched; returns the number of entries. */
+ * one entry per bucket touched (and its spread in outx, with t->accx); returns the number of entries. */
 static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, size_t n, bool may_be_null,
-                        local_bucket *out)
+                        local_bucket *out, agg_dev *outx)
 {
     const uint8_t *v = vv;
     if (!n)
@@ -434,7 +507,9 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, 
     if (t->bk->kind == BK_ONE) {
         out[0].b = t->b0;
         agg_init(&out[0].a, t->type);
-        fold_run(t, v, n, may_be_null, &out[0].a);
+        if (outx)
+            agg_dev_init(&outx[0]);
+        fold_run(t, v, n, may_be_null, &out[0].a, outx);
         return 1;
     }
     size_t nl = 0;
@@ -445,16 +520,23 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, 
         size_t e = bend == INT64_MAX ? n : i + 1 + lower_bound_i64(ts + i + 1, n - i - 1, bend);
         out[nl].b = b;
         agg_init(&out[nl].a, t->type);
-        fold_run(t, v + i * t->w, e - i, may_be_null, &out[nl].a);
+        if (outx)
+            agg_dev_init(&outx[nl]);
+        fold_run(t, v + i * t->w, e - i, may_be_null, &out[nl].a, outx ? &outx[nl] : NULL);
         nl++;
         i = e;
     }
     return nl;
 }
 
-static inline void fold_into(const agg_target *t, const local_bucket *l, size_t nl)
+static inline void fold_into(const agg_target *t, const local_bucket *l, const agg_dev *lx, size_t nl)
 {
     agg_state *acc = t->acc;
+    if (t->accx) { /* the spread: its cost stays out of the loops below */
+        for (size_t k = 0; k < nl; k++)
+            agg_combine(&acc[l[k].b - t->b0], &t->accx[l[k].b - t->b0], &l[k].a, &lx[k], t->type);
+        return;
+    }
     /* the type decided once, not per bucket: buckets can be a handful of rows each */
     if (t->type == TSDB_FLOAT32 || t->type == TSDB_FLOAT64) {
         for (size_t k = 0; k < nl; k++) {
@@ -468,13 +550,14 @@ static inline void fold_into(const agg_target *t, const local_bucket *l, size_t 
         }
     } else {
         for (size_t k = 0; k < nl; k++)
-            agg_combine(&acc[l[k].b - t->b0], &l[k].a, t->type);
+            agg_combine(&acc[l[k].b - t->b0], NULL, &l[k].a, NULL, t->type);
     }
 }
 
 typedef struct fold_ctx {
     const agg_target *t;
     local_bucket *scratch;
+    agg_dev *scratchx; /* with t->accx */
     size_t cap;
 } fold_ctx;
 
@@ -486,9 +569,15 @@ static int fold_emit(void *ctx, const int64_t *ts, const void *v, size_t n)
         if (!s)
             return 1;
         f->scratch = s;
+        if (f->t->accx) {
+            agg_dev *x = realloc(f->scratchx, n * sizeof *x);
+            if (!x)
+                return 1;
+            f->scratchx = x;
+        }
         f->cap = n;
     }
-    fold_into(f->t, f->scratch, fold_rows(f->t, ts, v, n, true, f->scratch));
+    fold_into(f->t, f->scratch, f->scratchx, fold_rows(f->t, ts, v, n, true, f->scratch, f->scratchx));
     return 0;
 }
 
@@ -521,7 +610,8 @@ static void agg_worker(void *arg, int idx)
     int64_t *ts = malloc(cap * sizeof *ts);
     uint8_t *v = malloc(cap * sizeof(uint64_t));
     local_bucket *local = malloc(cap * sizeof *local); /* a granule touches at most count buckets */
-    if (!cc || !ts || !v || !local) {
+    agg_dev *localx = j->t.accx ? malloc(cap * sizeof *localx) : NULL;
+    if (!cc || !ts || !v || !local || (j->t.accx && !localx)) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
         goto out;
     }
@@ -538,7 +628,8 @@ static void agg_worker(void *arg, int idx)
         size_t n = r->g->count;
         size_t lo = lower_bound_i64(ts, n, j->t.start);
         size_t hi = lower_bound_i64(ts, n, j->t.end);
-        size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, r->g->nulls > 0, local);
+        size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, r->g->nulls > 0, local,
+                              localx);
         if (nl) {
             /* local buckets ascend: fold each run that falls in one stripe under its lock */
             for (size_t a = 0; a < nl;) {
@@ -548,7 +639,7 @@ static void agg_worker(void *arg, int idx)
                     e++;
                 pthread_mutex_t *m = &j->locks[stripe % AGG_STRIPES];
                 pthread_mutex_lock(m);
-                fold_into(&j->t, local + a, e - a);
+                fold_into(&j->t, local + a, localx ? localx + a : NULL, e - a);
                 pthread_mutex_unlock(m);
                 a = e;
             }
@@ -560,6 +651,7 @@ out:
     free(ts);
     free(v);
     free(local);
+    free(localx);
     cur_qstats = mine;
 }
 
@@ -589,8 +681,9 @@ int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t 
     return eng_query_group(db, series, start, end, &bk, out, nout);
 }
 
-int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
-                    size_t *nout)
+/* out: tsdb_bucket, or with spread tsdb_spread_bucket (which begins with one) */
+static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool spread,
+                         void **out, size_t *nout)
 {
     *out = NULL;
     *nout = 0;
@@ -644,6 +737,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
         }
     }
     agg_state *acc = NULL;
+    agg_dev *accx = NULL;
     gref *work = NULL;
     src *srcs = NULL;
     codec_ctx *cc = NULL;
@@ -663,16 +757,20 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
         nb = (size_t)span;
     }
     acc = malloc(nb * sizeof *acc);
+    accx = spread ? malloc(nb * sizeof *accx) : NULL;
     work = malloc(nitem * sizeof *work);
     srcs = malloc((sn.np + sn.nmem) * sizeof *srcs);
     cc = cc_get(db);
-    if (!acc || !work || !srcs || !cc) {
+    if (!acc || (spread && !accx) || !work || !srcs || !cc) {
         rc = TSDB_ERR_NOMEM;
         goto done;
     }
     for (size_t k = 0; k < nb; k++)
         agg_init(&acc[k], type);
+    for (size_t k = 0; spread && k < nb; k++)
+        agg_dev_init(&accx[k]);
     t.acc = acc;
+    t.accx = accx;
     fc.t = &t;
 
     /* clusters of items with overlapping time ranges */
@@ -703,10 +801,11 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                 bool one = bmin == bmax; /* keys only grow with time: one key, one bucket */
                 if (inside && one) {
                     agg_state ga;
+                    agg_dev gx;
                     QS_ADD(granules_from_stats, 1);
                     QS_ADD(rows_from_stats, g->count);
-                    agg_from_granule(type, g, &ga);
-                    agg_combine(&acc[bmin - t.b0], &ga, type);
+                    agg_from_granule(type, g, &ga, accx ? &gx : NULL);
+                    agg_combine(&acc[bmin - t.b0], accx ? &accx[bmin - t.b0] : NULL, &ga, &gx, type);
                 } else
                     work[nwork++] = (gref){sn.parts[it->src], g};
             }
@@ -757,7 +856,8 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
         size_t nonempty = 0;
         for (size_t k = 0; k < nb; k++)
             nonempty += acc[k].rows != 0;
-        tsdb_bucket *res = malloc((nonempty ? nonempty : 1) * sizeof *res);
+        size_t row = spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+        uint8_t *res = malloc((nonempty ? nonempty : 1) * row);
         if (!res) {
             rc = TSDB_ERR_NOMEM;
         } else {
@@ -765,8 +865,11 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
             for (size_t k = 0; k < nb; k++) {
                 if (!acc[k].rows)
                     continue;
-                res[o].start = bk_start(bk, t.b0 + (int64_t)k);
-                agg_to_bucket(type, &acc[k], &res[o]);
+                tsdb_bucket *r = (tsdb_bucket *)(res + o * row);
+                r->start = bk_start(bk, t.b0 + (int64_t)k);
+                agg_to_bucket(type, &acc[k], r);
+                if (spread)
+                    agg_spread(type, &acc[k], &accx[k], (tsdb_spread_bucket *)r);
                 o++;
             }
             *out = res;
@@ -777,12 +880,26 @@ done:
     if (cc)
         cc_put(db, cc);
     free(fc.scratch);
+    free(fc.scratchx);
     free(acc);
+    free(accx);
     free(work);
     free(srcs);
     free(items);
     snapshot_release(&sn);
     return rc;
+}
+
+int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
+                    size_t *nout)
+{
+    return query_buckets(db, series, start, end, bk, false, (void **)out, nout);
+}
+
+int eng_query_spread(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                     tsdb_spread_bucket **out, size_t *nout)
+{
+    return query_buckets(db, series, start, end, bk, true, (void **)out, nout);
 }
 
 /* -------------------------------------------------------------------- raw */

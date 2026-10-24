@@ -1,0 +1,813 @@
+/*
+ * The spread in aggregates: range, population and sample variance and
+ * standard deviation (tsdb_query_spread), for float32, float64, int64 and bool.
+ *
+ * Hand-computed cases first (exact results, the int64 cases that a double
+ * could not hold, NaN rules). Then hard data against a reference that runs
+ * Welford's method in long double over the rows of each bucket: a large offset
+ * with a small spread (101325 Pa +- 5; a raw sum of squares loses ~7 digits
+ * there and fails the tolerance), a tiny spread on 1e9, int64 near 4e18 and
+ * at the extremes (the sums of squares need more than 128 bits), NaN and
+ * infinities, nulls, single values, constant data. The rows are spread over
+ * parts with replaced values and the memtable, checked again flushed, from a
+ * follower and merged; int64 and bool must give the same bits at every stage
+ * (their variances come from exact integer sums), and every CPU level and
+ * kernel must give the same bits as the baseline (query_threads 1). One test
+ * checks the granule-statistics fast path against the decoding fold.
+ */
+#define _GNU_SOURCE
+#include "internal.h"
+#include "tsdb.h"
+
+#include <float.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int failures;
+#define CHECK(cond)                                                                  \
+    do {                                                                             \
+        if (!(cond)) {                                                               \
+            fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond); \
+            failures++;                                                              \
+        }                                                                            \
+    } while (0)
+#define OK(expr)                                                                                    \
+    do {                                                                                            \
+        int rc_ = (expr);                                                                           \
+        if (rc_ != 0) {                                                                             \
+            fprintf(stderr, "%s:%d: %s -> %s\n", __FILE__, __LINE__, #expr, tsdb_strerror(rc_)); \
+            exit(1);                                                                                \
+        }                                                                                           \
+    } while (0)
+
+static uint64_t rng = 0x9e3779b97f4a7c15ull;
+static uint64_t rnd(void)
+{
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+static int64_t rndr(int64_t n) { return (int64_t)(rnd() % (uint64_t)n); }
+static double rndu(void) { return (double)(rnd() >> 11) * 0x1p-53; }
+
+static char base[512];
+
+static void rmrf(const char *d)
+{
+    char cmd[1100];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", d);
+    if (system(cmd) != 0)
+        fprintf(stderr, "rm failed\n");
+}
+
+static tsdb *open_db(const char *name, char *dir)
+{
+    snprintf(dir, 600, "%s/%s", base, name);
+    rmrf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.granule_rows = 64;
+    o.merge_threads = 0;
+    o.query_threads = 1; /* one order of combination: results comparable bit for bit across CPU levels */
+    o.flush_interval_ms = 600000;
+    o.buffer_rows = 1 << 22;
+    o.wal_max_batch_rows = 64;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    return db;
+}
+
+static bool is_canon_nan(double x)
+{
+    uint64_t b;
+    memcpy(&b, &x, 8);
+    return b == 0x7ff8000000000000ull;
+}
+
+/* equal, or both NaN (the canonical one in the result) */
+static bool same_bits(double result, double x) { return result == x || (x != x && is_canon_nan(result)); }
+
+/* ------------------------------------------------------------- hand cases */
+
+static void insert(tsdb *db, uint32_t s, int type, const double *v, const bool *ok, size_t n, int64_t t0)
+{
+    int64_t ts[64];
+    uint8_t vals[64 * 8], valid[8] = {0};
+    for (size_t i = 0; i < n; i++) {
+        ts[i] = t0 + (int64_t)i;
+        if (!ok || ok[i])
+            valid[i >> 3] |= (uint8_t)(1u << (i & 7));
+        switch (type) {
+        case TSDB_FLOAT32: ((float *)vals)[i] = (float)v[i]; break;
+        case TSDB_FLOAT64: ((double *)vals)[i] = v[i]; break;
+        case TSDB_INT64: ((int64_t *)vals)[i] = (int64_t)v[i]; break;
+        case TSDB_BOOL: vals[i] = v[i] != 0; break;
+        default: ((uint32_t *)vals)[i] = (uint32_t)v[i]; break;
+        }
+    }
+    OK(tsdb_insert_series_values(db, s, ts, &(tsdb_values){(tsdb_type)type, vals, valid}, n));
+}
+
+/* tsdb_query_spread; and tsdb_query_agg, which skips the spread, must give the same buckets bit for bit */
+static int spread_agg(tsdb *db, uint32_t s, int64_t start, int64_t end, int64_t interval, tsdb_spread_bucket **out,
+                      size_t *nout)
+{
+    int rc = tsdb_query_spread(db, s, start, end, interval, NULL, out, nout);
+    tsdb_bucket *p;
+    size_t np;
+    OK(tsdb_query_agg(db, s, start, end, interval, &p, &np));
+    bool same = rc == 0 && np == *nout;
+    for (size_t i = 0; same && i < np; i++)
+        same = memcmp(&p[i], &(*out)[i].b, sizeof *p) == 0;
+    if (!same)
+        fprintf(stderr, "series %u interval %lld: tsdb_query_agg differs from tsdb_query_spread\n", s,
+                (long long)interval);
+    failures += !same;
+    free(p);
+    return rc;
+}
+
+static tsdb_spread_bucket one(tsdb *db, uint32_t s)
+{
+    tsdb_spread_bucket *b;
+    size_t n;
+    OK(spread_agg(db, s, 0, INT64_MAX, 0, &b, &n));
+    tsdb_spread_bucket r;
+    memset(&r, 0, sizeof r);
+    CHECK(n == 1);
+    if (n)
+        r = b[0];
+    free(b);
+    return r;
+}
+
+static void test_hand(void)
+{
+    char dir[600];
+    tsdb *db = open_db("hand", dir);
+    uint32_t s[12];
+    for (int pass = 0; pass < 2; pass++) { /* memtable, then parts */
+        char name[32];
+        int k = 0;
+#define SERIES(type)                                                    \
+    do {                                                                \
+        snprintf(name, sizeof name, "h%d", k);                          \
+        if (!pass)                                                      \
+            OK(tsdb_series_create(db, name, (tsdb_type)(type), NULL, &s[k])); \
+    } while (0)
+        /* 1 2 3 4 */
+        SERIES(TSDB_FLOAT64);
+        if (!pass)
+            insert(db, s[k], TSDB_FLOAT64, (double[]){1, 2, 3, 4}, NULL, 4, 0);
+        tsdb_spread_bucket b = one(db, s[k++]);
+        CHECK(b.range == 3 && b.var_pop == 1.25 && b.var_samp == 5.0 / 3 && b.stddev_pop == sqrt(1.25));
+        CHECK(b.stddev_samp == sqrt(5.0 / 3));
+        /* the same in float32 and int64 */
+        SERIES(TSDB_FLOAT32);
+        if (!pass)
+            insert(db, s[k], TSDB_FLOAT32, (double[]){4, 2, 3, 1}, NULL, 4, 0);
+        b = one(db, s[k++]);
+        CHECK(b.range == 3 && b.var_pop == 1.25 && b.var_samp == 5.0 / 3);
+        SERIES(TSDB_INT64);
+        if (!pass)
+            insert(db, s[k], TSDB_INT64, (double[]){3, 1, 4, 2}, NULL, 4, 0);
+        b = one(db, s[k++]);
+        CHECK(b.range == 3 && b.var_pop == 1.25 && b.var_samp == 5.0 / 3);
+        /* int64 beyond 2^53: 4e18 + {0, 1, 2}, variance 2/3 exactly (a double holds none of the values) */
+        SERIES(TSDB_INT64);
+        if (!pass) {
+            int64_t ts[3] = {0, 1, 2}, iv[3] = {4000000000000000002, 4000000000000000000, 4000000000000000001};
+            OK(tsdb_insert_series_values(db, s[k], ts, &(tsdb_values){TSDB_INT64, iv, NULL}, 3));
+        }
+        b = one(db, s[k++]);
+        CHECK(b.range == 2 && b.var_pop == 2.0 / 3 && b.var_samp == 1 && b.stddev_samp == 1);
+        /* the extremes (INT64_MIN is null): range 2^64 - 2, var_pop (2^63 - 1)^2 */
+        SERIES(TSDB_INT64);
+        if (!pass) {
+            int64_t ts[2] = {0, 1}, iv[2] = {INT64_MIN + 1, INT64_MAX};
+            OK(tsdb_insert_series_values(db, s[k], ts, &(tsdb_values){TSDB_INT64, iv, NULL}, 2));
+        }
+        b = one(db, s[k++]);
+        long double r = 18446744073709551614.0L;
+        CHECK(b.range == (double)r && b.var_pop == (double)(r * r / 4) && b.var_samp == (double)(r * r / 2));
+        /* bool 0 1 1 1 and a null */
+        SERIES(TSDB_BOOL);
+        if (!pass)
+            insert(db, s[k], TSDB_BOOL, (double[]){0, 1, 1, 1, 0}, (bool[]){1, 1, 1, 1, 0}, 5, 0);
+        b = one(db, s[k++]);
+        CHECK(b.b.count == 4 && b.range == 1 && b.var_pop == 0.1875 && b.var_samp == 0.25);
+        /* a single value: sample variance NaN */
+        SERIES(TSDB_FLOAT64);
+        if (!pass)
+            insert(db, s[k], TSDB_FLOAT64, (double[]){101325.37, 0}, (bool[]){1, 0}, 2, 0);
+        b = one(db, s[k++]);
+        CHECK(b.range == 0 && b.var_pop == 0 && b.stddev_pop == 0 && is_canon_nan(b.var_samp));
+        CHECK(is_canon_nan(b.stddev_samp));
+        /* only nulls: everything NaN */
+        SERIES(TSDB_INT64);
+        if (!pass)
+            insert(db, s[k], TSDB_INT64, (double[]){1, 2}, (bool[]){0, 0}, 2, 0);
+        b = one(db, s[k++]);
+        CHECK(b.b.count == 0 && is_canon_nan(b.range) && is_canon_nan(b.var_pop) && is_canon_nan(b.stddev_samp));
+        /* NaN among the values: variances NaN, the range from min and max */
+        SERIES(TSDB_FLOAT64);
+        if (!pass)
+            insert(db, s[k], TSDB_FLOAT64, (double[]){1, NAN, 5}, NULL, 3, 0);
+        b = one(db, s[k++]);
+        CHECK(b.range == 4 && is_canon_nan(b.var_pop) && is_canon_nan(b.stddev_pop) && is_canon_nan(b.var_samp));
+        /* an infinity: range inf, variances NaN */
+        SERIES(TSDB_FLOAT32);
+        if (!pass)
+            insert(db, s[k], TSDB_FLOAT32, (double[]){1, INFINITY, 5}, NULL, 3, 0);
+        b = one(db, s[k++]);
+        CHECK(b.range == INFINITY && is_canon_nan(b.var_pop) && is_canon_nan(b.stddev_samp));
+        /* states: not meaningful */
+        SERIES(TSDB_STATE);
+        if (!pass)
+            insert(db, s[k], TSDB_STATE, (double[]){1, 2, 3}, NULL, 3, 0);
+        b = one(db, s[k++]);
+        CHECK(b.b.count == 3 && is_canon_nan(b.range) && is_canon_nan(b.var_pop) && is_canon_nan(b.stddev_pop));
+        /* constant data that no double sum holds exactly: exactly 0 */
+        SERIES(TSDB_FLOAT64);
+        if (!pass) {
+            double v[64];
+            for (int i = 0; i < 64; i++)
+                v[i] = 101325.37;
+            insert(db, s[k], TSDB_FLOAT64, v, NULL, 64, 0);
+            insert(db, s[k], TSDB_FLOAT64, v, NULL, 37, 1000);
+        }
+        b = one(db, s[k++]);
+        CHECK(b.b.count == 101 && b.range == 0 && b.var_pop == 0 && b.var_samp == 0 && b.stddev_samp == 0);
+#undef SERIES
+        if (!pass)
+            OK(tsdb_flush(db));
+    }
+    tsdb_close(db);
+    rmrf(dir);
+}
+
+/* -------------------------------------------------------------- reference */
+
+enum { NROWS = 6000 };
+typedef struct ref_series {
+    int type, shape;
+    int64_t ts[NROWS];
+    long double v[NROWS]; /* as stored: float32 values rounded to float */
+    bool ok[NROWS];
+} ref_series;
+
+static long double gen_value(int type, int shape, size_t i)
+{
+    switch (type) {
+    case TSDB_FLOAT32:
+    case TSDB_FLOAT64: {
+        long double v;
+        switch (shape) {
+        case 0: v = 101325 + (rndu() * 10 - 5); break;             /* pressure in Pa */
+        case 1: v = 1e9 + (double)rndr(1000) * 1e-6; break;       /* tiny spread on a large offset */
+        case 2: v = rndr(50) ? rndu() * 100 - 50 : rndr(2) ? NAN : rndr(2) ? INFINITY : -INFINITY; break;
+        case 3: v = 21.3; break;                                  /* constant */
+        default: v = (double)(i % 1000) * 0.001 - 0.5 + rndu(); break;
+        }
+        return type == TSDB_FLOAT32 ? (long double)(float)v : (long double)(double)v;
+    }
+    case TSDB_INT64:
+        switch (shape) {
+        case 0: return 4000000000000000000LL + rndr(2001) - 1000; /* squares of ~1.6e37: past 128 bits in sum */
+        case 1: return rndr(2) ? INT64_MAX - rndr(5) : INT64_MIN + 1 + rndr(5); /* INT64_MIN is null */
+        case 2: return rndr(1000001) - 500000;
+        case 3: return -7;
+        default: return (int64_t)(i % 97);
+        }
+    default: return shape == 3 ? 1 : rndr(4) != 0;
+    }
+}
+
+static void gen_series(ref_series *s, int type, int shape)
+{
+    s->type = type;
+    s->shape = shape;
+    for (size_t i = 0; i < NROWS; i++) {
+        s->ts[i] = (int64_t)i * 10;
+        s->v[i] = gen_value(type, shape, i);
+        /* shape 4: sparse, mostly nulls (single values in a bucket); else a few */
+        s->ok[i] = shape == 4 ? rndr(9) == 0 : rndr(40) != 0;
+    }
+}
+
+static void put_rows1(tsdb *db, uint32_t id, const ref_series *s, size_t a, size_t e, bool wrong);
+/* batches of at most 64 rows go to the memtable (wal_max_batch_rows), bigger ones straight into parts */
+static void put_rows(tsdb *db, uint32_t id, const ref_series *s, size_t a, size_t e, bool wrong, bool small)
+{
+    if (!small) {
+        put_rows1(db, id, s, a, e, wrong);
+        return;
+    }
+    for (size_t k = a; k < e; k += 50)
+        put_rows1(db, id, s, k, k + 50 < e ? k + 50 : e, wrong);
+}
+
+static void put_rows1(tsdb *db, uint32_t id, const ref_series *s, size_t a, size_t e, bool wrong)
+{
+    int64_t ts[NROWS];
+    static uint8_t vals[NROWS * 8], valid[NROWS / 8 + 1];
+    memset(valid, 0, sizeof valid);
+    size_t m = 0;
+    for (size_t i = a; i < e; i++) {
+        if (wrong && rndr(3))
+            continue;
+        long double v = wrong ? 12345 : s->v[i];
+        ts[m] = s->ts[i];
+        if (wrong || s->ok[i])
+            valid[m >> 3] |= (uint8_t)(1u << (m & 7));
+        switch (s->type) {
+        case TSDB_FLOAT32: ((float *)vals)[m] = (float)v; break;
+        case TSDB_FLOAT64: ((double *)vals)[m] = (double)v; break;
+        case TSDB_INT64: ((int64_t *)vals)[m] = (int64_t)v; break;
+        default: vals[m] = v != 0; break;
+        }
+        m++;
+    }
+    if (m)
+        OK(tsdb_insert_series_values(db, id, ts, &(tsdb_values){(tsdb_type)s->type, vals, valid}, m));
+}
+
+typedef struct ref_bucket {
+    int64_t start;
+    uint64_t count;
+    bool special; /* a NaN or an infinity among the values */
+    long double mean, m2, mn, mx, maxabs;
+} ref_bucket;
+
+/* The corrected two-pass method in long double over the known values of each bucket of [0, end): with
+ * values close to the mean x - m is exact, and the correction makes up for the rounding of m (at 4e18 a
+ * long double mean is off by up to 0.25, which Welford's method would carry into every term). */
+static size_t reference(const ref_series *s, int64_t interval, ref_bucket *out)
+{
+    size_t n = 0, i0 = 0;
+    for (size_t i = 0; i <= NROWS; i++) {
+        int64_t st = i < NROWS && interval ? s->ts[i] / interval * interval : 0;
+        if (i < NROWS && (i == 0 || out[n - 1].start == st))
+            goto open;
+        if (n) { /* close bucket n - 1: rows [i0, i) */
+            ref_bucket *b = &out[n - 1];
+            long double sum = 0, s1 = 0, s2 = 0;
+            uint64_t c = 0;
+            for (size_t k = i0; k < i; k++)
+                if (s->ok[k] && isfinite(s->v[k])) {
+                    sum += s->v[k];
+                    c++;
+                }
+            long double m = c ? sum / (long double)c : 0;
+            for (size_t k = i0; k < i; k++)
+                if (s->ok[k] && isfinite(s->v[k])) {
+                    long double d = s->v[k] - m;
+                    s1 += d;
+                    s2 += d * d;
+                    b->maxabs = fabsl(s->v[k]) > b->maxabs ? fabsl(s->v[k]) : b->maxabs;
+                }
+            b->m2 = c ? s2 - s1 * s1 / (long double)c : 0;
+        }
+        if (i == NROWS)
+            break;
+        i0 = i;
+    open:
+        if (!n || out[n - 1].start != st) {
+            memset(&out[n], 0, sizeof out[n]);
+            out[n].start = st;
+            out[n].mn = INFINITY;
+            out[n].mx = -INFINITY;
+            n++;
+        }
+        ref_bucket *b = &out[n - 1];
+        if (!s->ok[i])
+            continue;
+        long double x = s->v[i];
+        b->count++;
+        b->special |= !isfinite(x);
+        if (x == x) {
+            b->mn = x < b->mn ? x : b->mn;
+            b->mx = x > b->mx ? x : b->mx;
+        }
+    }
+    return n;
+}
+
+/* tolerance of a float standard deviation: relative, and a few ulps of the largest value (the means
+ * of the runs combined are sums over counts, rounded at the scale of the values) */
+static bool sd_near(double got, long double ref, long double maxabs)
+{
+    long double tol = 1e-10L * ref + 64 * DBL_EPSILON * maxabs;
+    return fabsl((long double)got - ref) <= tol;
+}
+
+static int compare(const char *what, const ref_series *s, const ref_bucket *r, size_t nr, const tsdb_spread_bucket *b,
+                   size_t nb)
+{
+    int bad = 0;
+    if (nr != nb) {
+        fprintf(stderr, "%s: %zu buckets, reference %zu\n", what, nb, nr);
+        return 1;
+    }
+    bool isint = s->type == TSDB_INT64 || s->type == TSDB_BOOL;
+    for (size_t k = 0; k < nb && bad < 5; k++) {
+        const ref_bucket *x = &r[k];
+        const tsdb_spread_bucket *y = &b[k];
+        bool ok = y->b.start == x->start && y->b.count == x->count;
+        long double n = (long double)x->count;
+        if (ok && x->count == 0)
+            ok = is_canon_nan(y->range) && is_canon_nan(y->var_pop) && is_canon_nan(y->stddev_samp);
+        else if (ok) {
+            double range = x->mn <= x->mx ? (double)x->mx - (double)x->mn : NAN;
+            if (isint)
+                range = (double)(x->mx - x->mn);
+            ok = range == y->range || (range != range && is_canon_nan(y->range));
+            ok = ok && same_bits(y->stddev_pop, sqrt(y->var_pop));
+            ok = ok && (x->count > 1 ? same_bits(y->stddev_samp, sqrt(y->var_samp)) : is_canon_nan(y->stddev_samp));
+            if (x->special)
+                ok = ok && is_canon_nan(y->var_pop) && is_canon_nan(y->var_samp);
+            else if (isint) {
+                /* exact up to the final rounding; the reference is long double */
+                long double vp = x->m2 / n;
+                ok = ok && fabsl(y->var_pop - vp) <= 1e-14L * vp;
+                if (x->count > 1)
+                    ok = ok && fabsl(y->var_samp - x->m2 / (n - 1)) <= 1e-14L * vp * 2;
+            } else {
+                ok = ok && sd_near(y->stddev_pop, sqrtl(x->m2 / n), x->maxabs);
+                if (x->count > 1)
+                    ok = ok && sd_near(y->stddev_samp, sqrtl(x->m2 / (n - 1)), x->maxabs);
+            }
+        }
+        if (!ok) {
+            fprintf(stderr,
+                    "%s: type %d shape %d bucket %lld: count %llu/%llu range %.17g/%.17Lg sd_pop %.17g/%.17Lg "
+                    "sd_samp %.17g/%.17Lg%s\n",
+                    what, s->type, s->shape, (long long)y->b.start, (unsigned long long)y->b.count,
+                    (unsigned long long)x->count, y->range, x->mx - x->mn, y->stddev_pop, sqrtl(x->m2 / n),
+                    y->stddev_samp, x->count > 1 ? sqrtl(x->m2 / (n - 1)) : 0.0L, x->special ? " (special)" : "");
+            bad++;
+        }
+    }
+    return bad;
+}
+
+/* ---------------------------------------------------------- random data */
+
+static const int types[] = {TSDB_FLOAT32, TSDB_FLOAT64, TSDB_INT64, TSDB_BOOL};
+enum { NT = 4, NSHAPE = 5, NS = NT * NSHAPE };
+static const int64_t intervals[] = {0, 640, 6400, 777, 30, 10};
+enum { NI = sizeof intervals / sizeof intervals[0] };
+
+/* every query of every series; results appended to *all (for bit comparisons), their types to btype */
+static int *btype;
+static void check_all(tsdb *db, const uint32_t *ids, ref_series *const *ss, const char *stage, tsdb_spread_bucket **all,
+                      size_t *nall)
+{
+    static ref_bucket r[NROWS];
+    size_t cap = 0;
+    *all = NULL;
+    *nall = 0;
+    for (int k = 0; k < NS; k++)
+        for (int q = 0; q < NI; q++) {
+            tsdb_spread_bucket *b;
+            size_t nb;
+            OK(spread_agg(db, ids[k], 0, INT64_MAX, intervals[q], &b, &nb));
+            size_t nr = reference(ss[k], intervals[q], r);
+            char what[128];
+            snprintf(what, sizeof what, "%s, interval %lld", stage, (long long)intervals[q]);
+            failures += compare(what, ss[k], r, nr, b, nb) != 0;
+            if (*nall + nb > cap) {
+                cap = (*nall + nb) * 2;
+                *all = realloc(*all, cap * sizeof **all);
+                btype = realloc(btype, cap * sizeof *btype);
+            }
+            for (size_t i = 0; i < nb; i++)
+                btype[*nall + i] = ss[k]->type;
+            memcpy(*all + *nall, b, nb * sizeof *b);
+            *nall += nb;
+            free(b);
+        }
+}
+
+/* the spread fields of int64 and bool series: bit for bit the same as at the first stage */
+static void same_ints(const tsdb_spread_bucket *a, size_t na, const tsdb_spread_bucket *b, size_t nb, const char *stage)
+{
+    if (na != nb) {
+        fprintf(stderr, "%s: %zu buckets, first stage %zu\n", stage, nb, na);
+        failures++;
+        return;
+    }
+    int diff = 0;
+    for (size_t o = 0; o < na; o++)
+        if (btype[o] == TSDB_INT64 || btype[o] == TSDB_BOOL)
+            diff += memcmp(&a[o].range, &b[o].range, 5 * sizeof(double)) != 0 || a[o].b.count != b[o].b.count;
+    if (diff) {
+        fprintf(stderr, "%s: %d int64/bool buckets differ in bits from the first stage\n", stage, diff);
+        failures++;
+    }
+}
+
+static void test_random(void)
+{
+    char dir[600];
+    tsdb *db = open_db("random", dir);
+    static ref_series store[NS];
+    ref_series *ss[NS];
+    uint32_t ids[NS];
+    for (int k = 0; k < NS; k++) {
+        char name[32];
+        snprintf(name, sizeof name, "s%d", k);
+        ss[k] = &store[k];
+        OK(tsdb_series_create(db, name, (tsdb_type)types[k % NT], NULL, &ids[k]));
+        gen_series(ss[k], types[k % NT], k / NT);
+        /* wrong values for a third of the rows, in parts; then the right ones in slices of random
+         * order, some flushed into parts of their own, the rest left in the memtable */
+        put_rows(db, ids[k], ss[k], 0, NROWS, true, false);
+    }
+    OK(tsdb_flush(db));
+    for (int k = 0; k < NS; k++) {
+        size_t cuts[64], nc = 0;
+        for (size_t a = 0; a < NROWS && nc < 63; a += 1 + (size_t)rndr(500))
+            cuts[nc++] = a;
+        cuts[nc] = NROWS;
+        for (size_t j = 0; j < nc; j++) {
+            size_t c = (j * 37) % nc;
+            put_rows(db, ids[k], ss[k], cuts[c], cuts[c + 1], false, j % 2);
+            if (j % 5 == 4 && k % 3 == 0)
+                OK(tsdb_flush(db));
+        }
+    }
+    tsdb_spread_bucket *first, *b;
+    size_t nfirst, nb;
+    check_all(db, ids, ss, "parts+memtable", &first, &nfirst);
+    OK(tsdb_flush(db));
+    check_all(db, ids, ss, "parts", &b, &nb);
+    same_ints(first, nfirst, b, nb, "parts");
+    free(b);
+
+    /* every CPU level and kernel: the same bits as the baseline */
+    static const char *const kernels[] = {"scalar", "avx2", "avx512"};
+    tsdb_spread_bucket *lv0 = NULL;
+    size_t nlv0 = 0;
+    int configs = 0;
+    for (int level = CPU_BASE; level <= cpu_level_max(); level++)
+        for (int kk = 0; kk <= level && kk < 3; kk++) {
+            setenv("TSDB_SIMD", kernels[kk], 1);
+            if (cpu_set_level(level) != 0) {
+                simd_select(level);
+                if (cpu_level_max() != level && level != CPU_BASE)
+                    break;
+            }
+            if (strcmp(simd_name(), kernels[kk]) != 0)
+                continue;
+            char label[64];
+            snprintf(label, sizeof label, "parts, level %s, kernel %s", cpu_level_name(level), simd_name());
+            check_all(db, ids, ss, label, &b, &nb);
+            if (!configs++) {
+                lv0 = b;
+                nlv0 = nb;
+                continue;
+            }
+            bool same = nb == nlv0 && memcmp(b, lv0, nb * sizeof *b) == 0;
+            printf("%s: %s\n", label, same ? "identical" : "DIFFERENT");
+            failures += !same;
+            free(b);
+        }
+    unsetenv("TSDB_SIMD");
+    cpu_set_level(cpu_level_max());
+    simd_select(cpu_level_max());
+    printf("CPU levels and kernels compared: %d\n", configs);
+    free(lv0);
+
+    tsdb_options fo;
+    tsdb_options_init(&fo);
+    fo.follow = 1;
+    fo.refresh_ms = 20;
+    fo.query_threads = 1;
+    tsdb *f;
+    OK(tsdb_open(dir, &fo, &f));
+    check_all(f, ids, ss, "follower", &b, &nb);
+    same_ints(first, nfirst, b, nb, "follower");
+    free(b);
+    tsdb_close(f);
+    OK(tsdb_optimize(db));
+    check_all(db, ids, ss, "merged", &b, &nb);
+    same_ints(first, nfirst, b, nb, "merged");
+    free(b);
+    free(first);
+    tsdb_close(db);
+    rmrf(dir);
+}
+
+/* The fast path (whole granules from their statistics) against the fold over decoded rows: the same
+ * rows in the memtable, then flushed into a part. */
+static void test_fast_path(void)
+{
+    char dir[600];
+    tsdb *db = open_db("fast", dir);
+    static ref_series s;
+    for (int t = 0; t < NT; t++)
+        for (int shape = 0; shape < NSHAPE; shape++) {
+            char name[32];
+            snprintf(name, sizeof name, "f%d_%d", t, shape);
+            uint32_t id;
+            OK(tsdb_series_create(db, name, (tsdb_type)types[t], NULL, &id));
+            gen_series(&s, types[t], shape);
+            put_rows(db, id, &s, 0, NROWS, false, true);
+            static ref_bucket r[NROWS];
+            tsdb_spread_bucket *mb, *pb;
+            size_t nm, np;
+            tsdb_query_stats st;
+            /* 6400 ms: whole granules of 64 rows 10 ms apart */
+            OK(spread_agg(db, id, 0, INT64_MAX, 6400, &mb, &nm));
+            tsdb_last_query_stats(&st);
+            CHECK(st.granules_from_stats == 0 && st.memtable_rows == NROWS);
+            if (st.memtable_rows != NROWS)
+                fprintf(stderr, "memtable rows %llu\n", (unsigned long long)st.memtable_rows);
+            OK(tsdb_flush(db));
+            OK(spread_agg(db, id, 0, INT64_MAX, 6400, &pb, &np));
+            tsdb_last_query_stats(&st);
+            CHECK(st.granules_from_stats == (NROWS + 63) / 64 && st.rows_decoded <= 64);
+            if (st.granules_from_stats != (NROWS + 63) / 64 || st.rows_decoded > 64)
+                fprintf(stderr, "from stats %llu, decoded %llu\n", (unsigned long long)st.granules_from_stats,
+                        (unsigned long long)st.rows_decoded);
+            size_t nr = reference(&s, 6400, r);
+            failures += compare("memtable", &s, r, nr, mb, nm) != 0;
+            failures += compare("granule statistics", &s, r, nr, pb, np) != 0;
+            if (types[t] == TSDB_INT64 || types[t] == TSDB_BOOL)
+                CHECK(nm == np && memcmp(mb, pb, nm * sizeof *mb) == 0);
+            free(mb);
+            free(pb);
+        }
+    tsdb_close(db);
+    rmrf(dir);
+}
+
+/* The kernels bit for bit, on what reaches them: float32 runs without nulls and NaN, of varied values (the
+ * data the database-level tests feed them is mostly constant, NaN-ridden or null-ridden in float32, and FMA
+ * in the deviation pass happens not to change 101325 +- 5). Each kernel's agg_state of every run, with and
+ * without the spread, and the granule entries written at each CPU level must equal the scalar ones. */
+static void test_kernels(void)
+{
+    enum { NRUN = 24, MAXN = 8192 };
+    static float v[NRUN][MAXN];
+    static size_t len[NRUN];
+    static const double offsets[] = {0, 101325, 1e6, -273.15};
+    for (int r = 0; r < NRUN; r++) {
+        static const size_t lens[] = {1, 2, 31, 32, 33, 63, 64, 65, 100, 777, 1000, 8192};
+        len[r] = lens[r % 12];
+        double off = offsets[r % 4], amp = r < 12 ? 50 : 0.001 * (r + 1);
+        for (size_t i = 0; i < len[r]; i++)
+            v[r][i] = (float)(off + amp * ((double)rndr(2000001) / 1e6 - 1) + (r % 3 == 0 ? (double)i * 0.25 : 0));
+    }
+    static const char *const kernels[] = {"scalar", "avx2", "avx512"};
+    typedef struct {
+        agg_state a;
+        agg_dev x;
+    } state;
+    state base[NRUN][2];
+    granule gbase[NRUN];
+    int configs = 0;
+    for (int level = CPU_BASE; level <= cpu_level_max(); level++)
+        for (int kk = 0; kk <= level && kk < 3; kk++) {
+            setenv("TSDB_SIMD", kernels[kk], 1);
+            if (cpu_set_level(level) != 0) {
+                simd_select(level);
+                if (cpu_level_max() != level && level != CPU_BASE)
+                    break;
+            }
+            if (strcmp(simd_name(), kernels[kk]) != 0)
+                continue;
+            int diff = 0;
+            for (int r = 0; r < NRUN; r++) {
+                for (int sp = 0; sp < 2; sp++) {
+                    state a;
+                    memset(&a, 0, sizeof a);
+                    agg_init(&a.a, TSDB_FLOAT32);
+                    agg_dev_init(&a.x);
+                    simd_agg_f32(v[r], len[r], &a.a, sp ? &a.x : NULL);
+                    if (!configs)
+                        base[r][sp] = a;
+                    else
+                        diff += memcmp(&a, &base[r][sp], sizeof a) != 0;
+                }
+                granule g;
+                memset(&g, 0, sizeof g);
+                granule_stats(TSDB_FLOAT32, v[r], len[r], &g);
+                if (!configs)
+                    gbase[r] = g;
+                else
+                    diff += memcmp(&g, &gbase[r], sizeof g) != 0;
+            }
+            if (diff)
+                fprintf(stderr, "kernels: level %s, kernel %s: %d of %d runs differ from the scalar kernel\n",
+                        cpu_level_name(level), simd_name(), diff, NRUN * 3);
+            failures += diff != 0;
+            configs++;
+        }
+    unsetenv("TSDB_SIMD");
+    cpu_set_level(cpu_level_max());
+    simd_select(cpu_level_max());
+    printf("kernels compared on varied float32 runs: %d\n", configs);
+}
+
+/* m2 of one run, long double two-pass with the correction term: the reference for test_single_runs */
+static long double ref_m2(const double *x, size_t n)
+{
+    long double s = 0, d1 = 0, d2 = 0;
+    for (size_t i = 0; i < n; i++)
+        s += x[i];
+    long double m = s / n;
+    for (size_t i = 0; i < n; i++) {
+        long double d = x[i] - m;
+        d1 += d;
+        d2 += d * d;
+    }
+    return d2 - d1 * d1 / n;
+}
+
+/* The precision of one run, where no merge of rounded means adds its error: a small spread on a large offset
+ * (1e9 + k * 1e-6, 101325 +- 5), where the mean's rounding is of the order of the spread. The corrected
+ * two-pass m2 stays within a few ulps times n; without the correction term (d1) it is off by n * delta^2,
+ * ~1e-5 relative here. The database level (compare) has to allow for merges and cannot check this tightly. */
+static void test_single_runs(void)
+{
+    enum { N = 1000 };
+    static double x[N];
+    static float xf[N];
+    int bad = 0, runs = 0;
+    for (int shape = 0; shape < 4; shape++)
+        for (int rep = 0; rep < 8; rep++) {
+            size_t n = 2 + (size_t)rndr(N - 1);
+            for (size_t i = 0; i < n; i++) {
+                switch (shape) {
+                case 0: x[i] = 1e9 + (double)rndr(1000) * 1e-6; break;
+                case 1: x[i] = 101325 + (double)rndr(1000001) / 1e5 - 5; break;
+                case 2: x[i] = -1e12 + (double)rndr(100) * 1e-3; break;
+                default: xf[i] = (float)(101325 + (double)rndr(1001) / 100 - 5); x[i] = xf[i]; break;
+                }
+            }
+            long double ref = ref_m2(x, n);
+            for (int path = 0; path < (shape == 3 ? 2 : 1); path++) {
+                agg_state a;
+                agg_dev ax;
+                agg_init(&a, shape == 3 ? TSDB_FLOAT32 : TSDB_FLOAT64);
+                agg_dev_init(&ax);
+                if (path)
+                    simd_agg_f32(xf, n, &a, &ax);
+                else if (shape == 3)
+                    agg_fold(TSDB_FLOAT32, xf, n, &a, &ax);
+                else
+                    agg_fold(TSDB_FLOAT64, x, n, &a, &ax);
+                runs++;
+                if (a.count != n || !(fabsl((long double)ax.m2 - ref) <= 1e-11L * ref)) {
+                    if (bad++ < 5)
+                        fprintf(stderr, "single run: shape %d n %zu path %d: m2 %.17g, reference %.17Lg\n", shape, n,
+                                path, ax.m2, ref);
+                }
+            }
+        }
+    failures += bad;
+    printf("single runs, m2 within 1e-11 of the long double reference: %d of %d\n", runs - bad, runs);
+}
+
+/* Queries that do not ask for the spread must not pay for it: a query of 10-row buckets folds into one state
+ * per bucket, and 80 bytes instead of 48 cost it 20-30% (tsdb-bench, buckets of 10 samples). The spread keeps
+ * its m2 and sums of squares beside the state (agg_dev), only where it is asked for. */
+static void test_state_size(void)
+{
+    if (sizeof(agg_state) > 48) {
+        fprintf(stderr, "agg_state is %zu bytes: the spread's state belongs in agg_dev\n", sizeof(agg_state));
+        failures++;
+    }
+}
+
+int main(int argc, char **argv)
+{
+    snprintf(base, sizeof base, "%s/tsdb_spread_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    rmrf(base);
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "mkdir -p '%s'", base);
+    if (system(cmd) != 0)
+        return 1;
+    test_state_size();
+    test_hand();
+    test_kernels();
+    test_single_runs();
+    test_random();
+    test_fast_path();
+    free(btype);
+    rmrf(base);
+    if (failures) {
+        fprintf(stderr, "test_spread: %d failures\n", failures);
+        return 1;
+    }
+    printf("test_spread: ok\n");
+    return 0;
+}

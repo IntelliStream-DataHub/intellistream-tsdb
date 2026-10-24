@@ -242,7 +242,9 @@ static void test_codecs(void)
             f[i] = (rnd() % 17 == 0) ? NAN : (float)((int64_t)(rnd() % 20001) - 10000) / 8;
         agg_state a;
         agg_init(&a, TSDB_FLOAT32);
-        simd_agg_f32(f, n, &a);
+        agg_dev x;
+        agg_dev_init(&x);
+        simd_agg_f32(f, n, &a, n % 2 ? &x : NULL); /* with the spread or without: the same count, sum, min, max */
         float mn = INFINITY, mx = -INFINITY;
         for (size_t i = 0; i < n; i++) {
             if (f[i] < mn) mn = f[i];

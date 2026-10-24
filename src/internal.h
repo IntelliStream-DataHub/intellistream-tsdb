@@ -27,9 +27,12 @@ typedef struct eng eng;
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /* 3: checksummed part header and footer, WAL records and dictionary records;
- * 4: time-weighted statistics in granule entries (136 bytes). Databases of older
+ * 4: time-weighted statistics in granule entries (136 bytes); 5: the spread
+ * (m2 or the sum of squares) in granule entries (160 bytes). Databases of older
  * versions are refused (no release had them). */
-#define FORMAT_VERSION 4
+
+#define FORMAT_VERSION 5
+
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -213,7 +216,20 @@ int xor64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out);
 
 /* ---- SIMD kernels (simd.c), dispatched once at startup ---- */
 /* The statistics of one bucket. Only the half of the type is in use: buckets
- * of tiny intervals are many, so the state stays small. */
+ * of tiny intervals are many, so the state stays small.
+ *
+ * The spread (variance, standard deviation) of floats is kept in the stable
+ * form: m2, the sum of squared deviations from the mean (sum / count). A run
+ * of values gets its m2 in two passes (the mean, then the squared deviations
+ * from it, corrected by their sum), and states combine with the parallel
+ * formula of Chan, Golub and LeVeque (m2_merge), so an offset as large as
+ * 101325 Pa costs no precision on a spread of +-5 the way a raw sum of squares
+ * would (it cancels catastrophically). Integers keep the exact sum of squares
+ * instead: 192 bits (isq + isq_hi * 2^128) hold 2^64 rows of int64 squares,
+ * and the variance comes from exact integers once, at the end (agg_spread).
+ * Those live beside the state, in an agg_dev, which only queries for the
+ * spread keep: 48 bytes instead of 80 per bucket are worth 20-30% on buckets
+ * of ten rows. Every function taking an agg_dev takes NULL for "no spread". */
 typedef struct agg_state {
     uint64_t rows;  /* rows folded, nulls included */
     uint64_t count; /* known values */
@@ -222,6 +238,13 @@ typedef struct agg_state {
         struct { __int128 isum; int64_t imin, imax; };  /* int64, bool, state */
     };
 } agg_state;
+
+typedef struct agg_dev {
+    union {
+        double m2;                                              /* float32, float64 */
+        struct { unsigned __int128 isq; uint64_t isq_hi; };     /* int64, bool, state */
+    };
+} agg_dev;
 
 /* One NaN for every NaN result: the quiet NaN 0x7ff8000000000000 (as float32,
  * 0x7fc00000). Which payload and sign an addition of NaNs keeps depends on the
@@ -254,11 +277,57 @@ static inline void agg_init(agg_state *a, int type)
     }
 }
 
-static inline void agg_combine(agg_state *a, const agg_state *b, int type)
+static inline void agg_dev_init(agg_dev *x)
 {
-    a->rows += b->rows;
-    a->count += b->count;
+    x->isq = 0; /* covers m2 = 0 too */
+    x->isq_hi = 0;
+}
+
+/* The m2 of two runs together (Chan, Golub and LeVeque 1979): na values with
+ * sum sa and m2a, nb values with sum sb and m2b. One order of operations for
+ * every caller, so that a combination rounds the same everywhere. A NaN m2 is
+ * the canonical one: the payload of a NaN in the sums depends on the kernel. */
+static inline double m2_merge(uint64_t na, double sa, double m2a, uint64_t nb, double sb, double m2b)
+{
+    if (!nb)
+        return m2a;
+    if (!na)
+        return canon_nan(m2b);
+
+    double d = sb / (double)nb - sa / (double)na;
+    return canon_nan(m2a + m2b + d * d * ((double)na * (double)nb / ((double)na + (double)nb)));
+}
+
+
+/* Folds a run of c known float values into a: their sum s, and d1 and d2, the
+ * sums of their deviations from the run's mean s / c and of the squares of
+ * those (the second pass). d2 - d1^2 / c is the corrected two-pass m2 (Chan,
+ * Golub and LeVeque 1983): d1 makes up for the rounding of the mean. */
+static inline void agg_add_run(agg_state *a, agg_dev *x, uint64_t c, double s, double d1, double d2)
+{
+    if (!c)
+        return;
+    double m2 = d2 - d1 * d1 / (double)c;
+    if (m2 < 0) /* rounding, with constant data; NaN stays */
+        m2 = 0;
+    x->m2 = m2_merge(a->count, a->sum, x->m2, c, s, m2);
+    a->count += c;
+    a->sum += s;
+}
+
+/* adds the 192-bit sum of squares (lo + hi * 2^128) to x's */
+static inline void isq_add(agg_dev *x, unsigned __int128 lo, uint64_t hi)
+{
+    x->isq += lo;
+    x->isq_hi += hi + (x->isq < lo);
+}
+
+/* b (with bx) into a (with ax); ax NULL: without the spread (only queries for it pay for it) */
+static inline void agg_combine(agg_state *a, agg_dev *ax, const agg_state *b, const agg_dev *bx, int type)
+{
     if (type == TSDB_FLOAT32 || type == TSDB_FLOAT64) {
+        if (ax)
+            ax->m2 = m2_merge(a->count, a->sum, ax->m2, b->count, b->sum, bx->m2);
         a->sum += b->sum;
         if (b->min < a->min) a->min = b->min;
         if (b->max > a->max) a->max = b->max;
@@ -266,19 +335,28 @@ static inline void agg_combine(agg_state *a, const agg_state *b, int type)
         a->isum += b->isum;
         if (b->imin < a->imin) a->imin = b->imin;
         if (b->imax > a->imax) a->imax = b->imax;
+        if (ax)
+            isq_add(ax, bx->isq, bx->isq_hi);
     }
+    a->rows += b->rows;
+    a->count += b->count;
 }
 
-/* Folds float32 values (no nulls) into a: count, sum (in double), min and max (NaN ignored). */
-extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a);
-/* Folds n slots of `type` into a, skipping nulls (values.c). */
-void agg_fold(int type, const void *v, size_t n, agg_state *a);
-/* the same, skipping the search for nulls when the caller knows there are none (a granule's count) */
-void agg_fold_hint(int type, const void *v, size_t n, bool may_be_null, agg_state *a);
+/* Folds float32 values (no nulls) into a: count, sum (in double), min and max (NaN ignored); with x also
+ * m2 into x (a second pass over the values). Queries that do not ask for the spread pass NULL: m2 and the
+ * sums of squares are the cost of the spread, and a query of tiny buckets would pay it on every row. */
+extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *x);
+/* Folds n slots of `type` into a, skipping nulls, with the spread (values.c; granule statistics). */
+void agg_fold(int type, const void *v, size_t n, agg_state *a, agg_dev *x);
+/* the same, skipping the search for nulls when the caller knows there are none (a granule's count), and
+ * the spread unless asked for */
+void agg_fold_hint(int type, const void *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
 struct granule;
 /* The statistics of a granule's values; and a granule's statistics as an agg_state. */
 void granule_stats(int type, const void *v, size_t n, struct granule *g);
-void agg_from_granule(int type, const struct granule *g, agg_state *a);
+void agg_from_granule(int type, const struct granule *g, agg_state *a, agg_dev *x);
+/* The bucket's range, variances and standard deviations (query.c). */
+void agg_spread(int type, const agg_state *a, const agg_dev *x, tsdb_spread_bucket *b);
 static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
 {
     const double nan = nan_canonical();
@@ -359,6 +437,11 @@ typedef struct granule {
     union { double fmax; int64_t imax; };
     union { double fsum; uint64_t isum_lo; };
     int64_t isum_hi; /* integer sums are 128 bits */
+    /* The spread: for floats m2, the sum of squared deviations from the mean
+     * (fsum over the known values); for integers the exact sum of squares,
+     * 192 bits (isq0 + isq1 * 2^64 + isq2 * 2^128). See agg_state. */
+    union { double fm2; uint64_t isq0; };
+    uint64_t isq1, isq2;
     /* Time-weighted statistics (twa.c): the granule's first and last values (as
      * doubles; GT_FIRST_NULL/GT_LAST_NULL when null), and over the segments
      * between its consecutive rows the STEP and LINEAR areas (value x ms) and
@@ -370,7 +453,7 @@ typedef struct granule {
     uint32_t tw_gap;
     uint32_t tw_flags;
 } granule;
-_Static_assert(sizeof(granule) == 136, "granule must be 136 bytes");
+_Static_assert(sizeof(granule) == 160, "granule must be 160 bytes");
 enum { GT_FIRST_NULL = 1, GT_LAST_NULL = 2 };
 /* The time-weighted statistics of a granule's rows (n >= 1, ts strictly increasing). */
 void granule_twa(int type, const int64_t *ts, const void *v, size_t n, struct granule *g);
@@ -796,6 +879,9 @@ int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t 
                   size_t *nout);
 int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
                     size_t *nout);
+/* the same with the spread: tsdb_spread_bucket results */
+int eng_query_spread(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                     tsdb_spread_bucket **out, size_t *nout);
 int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g);
 int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n);
 int64_t bucketer_key(const bucketer *bk, int64_t ts);    /* the bucket of ts */
