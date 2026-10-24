@@ -842,6 +842,56 @@ int tsdb_insert_series_values(tsdb *t, uint32_t series, const int64_t *ts, const
     return rc;
 }
 
+/* ---------------------------------------------------- deletes, retention */
+
+int tsdb_delete_range(tsdb *t, uint32_t series, int64_t start, int64_t end)
+{
+    eng *e;
+    uint32_t local;
+    if (t->opt.read_only)
+        return TSDB_ERR_READONLY;
+    return route(t, series, &e, &local) ? eng_delete_range(e, local, start, end) : TSDB_ERR_INVALID;
+}
+
+int tsdb_replace_range(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+                       const tsdb_values *values, size_t n)
+{
+    eng *e;
+    uint32_t local;
+    if (t->opt.read_only)
+        return TSDB_ERR_READONLY;
+    if (!route(t, series, &e, &local))
+        return TSDB_ERR_INVALID;
+    if (n == 0)
+        return eng_delete_range(e, local, start, end);
+    const void *slots;
+    void *owned;
+    int rc = vals_import(values, n, &slots, &owned);
+    if (rc == 0)
+        rc = eng_replace_range(e, values->type, local, start, end, ts, slots, n);
+    free(owned);
+    return rc;
+}
+
+int tsdb_set_retention(tsdb *t, uint32_t series, int64_t limit_ms)
+{
+    eng *e;
+    uint32_t local;
+    if (t->opt.read_only)
+        return TSDB_ERR_READONLY;
+    return route(t, series, &e, &local) ? eng_set_retention(e, local, limit_ms) : TSDB_ERR_NOTFOUND;
+}
+
+int tsdb_get_retention(tsdb *t, uint32_t series, int64_t *limit_ms)
+{
+    eng *e;
+    uint32_t local;
+    if (!route(t, series, &e, &local) || eng_series_type(e, local) < 0)
+        return TSDB_ERR_NOTFOUND;
+    *limit_ms = eng_retention(e, local);
+    return 0;
+}
+
 /* Runs fn on every volume; the first error wins. */
 static int each(tsdb *t, int (*fn)(eng *))
 {

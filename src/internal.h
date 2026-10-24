@@ -395,6 +395,34 @@ typedef struct part_footer {
 _Static_assert(sizeof(part_footer) == 56, "footer must be 56 bytes");
 _Static_assert(sizeof(part_footer) >= BLK_SLACK, "footer must cover decoder overread");
 
+/* A range tombstone: rows of `series` with start <= ts < end are deleted from
+ * every part of the same partition with a lower block number (never from the
+ * part that holds it: its own rows are newer). Stored like this in the
+ * trailer of a part, sorted by (series, start), ranges of one series disjoint. */
+typedef struct tomb {
+    uint32_t series;
+    uint32_t zero;
+    int64_t start, end;
+} tomb;
+_Static_assert(sizeof(tomb) == 24, "tomb must be 24 bytes");
+
+/* A sorted, coalesced set of tombstones, for applying several parts' at once. */
+typedef struct tomb_set {
+    tomb *t;
+    size_t n, cap;
+} tomb_set;
+int tomb_set_add(tomb_set *s, const tomb *t, size_t n);
+void tomb_set_finish(tomb_set *s); /* sorts and coalesces; call after adding */
+void tomb_set_free(tomb_set *s);
+/* index of the first range of `series` that ends after ts (s->n if none) */
+size_t tomb_set_seek(const tomb_set *s, uint32_t series, int64_t ts);
+/* whether a range of `series` intersects [lo, hi] */
+bool tomb_set_hits(const tomb_set *s, uint32_t series, int64_t lo, int64_t hi);
+/* Keeps the rows (ts ascending, slots of width w) at or after `cutoff` that no
+ * range of `series` covers, in place; returns how many remain. */
+size_t tomb_set_filter(const tomb_set *s, uint32_t series, int64_t cutoff, int64_t *ts, uint8_t *v, size_t w,
+                       size_t n);
+
 typedef struct part {
     char name[96];
     int dirfd;
@@ -407,6 +435,8 @@ typedef struct part {
     size_t map_len;
     const granule *g;
     uint32_t ng;
+    const tomb *t; /* the part's tombstones (in the map); NULL when none */
+    uint32_t nt;
     uint64_t index_off;
     uint64_t rows;
     int64_t min_ts, max_ts;
@@ -417,6 +447,8 @@ typedef struct part {
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
+    uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
+    int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
     char pending[64];     /* tmp file name while the part awaits parts_commit, else "" */
 } part;
@@ -452,12 +484,18 @@ typedef struct part_writer {
     codec_ctx *cc;
     uint64_t rows;
     int64_t min_ts, max_ts;
+    tomb *tombs; /* written after the index; sorted, disjoint per series */
+    size_t nt;
+    bool keep_empty;  /* write a part even with no rows and no tombstones (a merge's wal_seq anchor) */
+    int64_t empty_ts; /* its min_ts = max_ts then */
 } part_writer;
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq);
 /* Rows of one series of `type` (v in its slots); (series, ts) order across calls. */
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n);
 int pw_copy_granule(part_writer *w, const part *src, const granule *g);
+/* Tombstones for the trailer, sorted by (series, start) and disjoint per series; copied. */
+int pw_set_tombs(part_writer *w, const tomb *t, size_t n);
 int pw_finish(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
 /* As pw_finish, but the part stays under its tmp name until parts_commit. */
 int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
@@ -597,6 +635,12 @@ void db_retire_locked(struct eng *db, part *p);
 void graveyard_purge(struct eng *db, bool all);
 
 /* ---- database ---- */
+typedef struct ret_table {
+    uint64_t cap;
+    struct ret_table *older;
+    _Atomic int64_t limit[];
+} ret_table;
+
 struct eng {
     char *dir;
     int dirfd;
@@ -627,6 +671,19 @@ struct eng {
 
     series_dict series;
     series_dict states;
+
+    /* retention (retention.c) */
+    pthread_mutex_t ret_lock;
+    /* ms per series id, 0 = keep: read without a lock (every query does); grown by a copy under ret_lock, the
+     * replaced tables stay valid until close */
+    _Atomic(struct ret_table *) ret_tab;
+    atomic_bool has_retention; /* some series has a limit: queries and merges look it up */
+    int ret_fd;
+    uint64_t ret_off;
+    bool ret_broken;
+    atomic_int_fast64_t clock_floor; /* now never goes below this */
+    atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
+    int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
     pool *qpool;
 
     /* memtable and WAL (memtable.c) */
@@ -662,6 +719,9 @@ struct eng {
     pthread_mutex_t manifest_lock;
     uint64_t manifest_version;
     uint64_t wal_flushed; /* segments up to this are entirely in parts (db->lock) */
+    /* segments up to wal_removed are unlinked, up to wal_removed_synced durably (db->lock): an empty part (a
+     * merge's wal_seq anchor) is needed only while a segment up to its wal_seq may come back at open */
+    uint64_t wal_removed, wal_removed_synced;
     graveyard_entry *graveyard;
     size_t ngraveyard, graveyard_cap;
 
@@ -758,15 +818,26 @@ int eng_flush(eng *db);
 extern size_t desc_window_rows;
 /* Raw rows in time order; v as slots of the series' type. */
 /* ---- query internals shared with twa.c (query.c) ---- */
+/* A part can have several entries: granules overlapped by a newer tombstone are decoded, filtered and moved to
+ * `mem`, so parts[i] answers only for granules [gi[i], gj[i]) and those hold no deleted or expired row. Readers
+ * use gi/gj, never part_find on parts[i]: only then do statistics stay exact. */
 typedef struct snapshot {
     part **parts;
+    uint32_t *gi, *gj; /* per entry: the granules of the series in the range */
     size_t np;
-    mem_run *mem; /* rows of the series from memtables, oldest memtable first */
+    mem_run *mem; /* rows of the series from memtables, oldest memtable first, and from parts with deletes */
+    uint64_t *mprio; /* per run: its priority on equal timestamps */
     size_t nmem;
+    int64_t start, end; /* the range gi/gj were found for */
 } snapshot;
 int snapshot_take(struct eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s);
 void snapshot_release(snapshot *s);
 uint64_t mem_prio(const snapshot *sn, size_t i);
+/* whether mem run i came from a memtable, not from part granules decoded around tombstones */
+bool mem_from_memtable(const snapshot *sn, size_t i);
+/* Entry i's granules that may hold rows in [start, end): part_find limited to the entry's window. */
+void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t start, int64_t end, uint32_t *gi,
+               uint32_t *gj);
 /* Granules [*gi, *gj) of series s that may hold rows in [start, end). */
 void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj);
 typedef struct src {
@@ -816,5 +887,22 @@ static inline int64_t eng_mono_ms(void)
 }
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
+/* retention.c */
+int ret_open(eng *db, bool read_only);
+int ret_reload(eng *db);
+void ret_close(eng *db);
+void ret_clock_init(eng *db);
+int64_t eng_now_ms(eng *db);
+int64_t eng_retention(eng *db, uint32_t series);
+int64_t eng_cutoff(eng *db, uint32_t series); /* rows before it have expired; INT64_MIN when none */
+int64_t eng_cutoff_at(eng *db, uint32_t series, int64_t now);
+int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms);
+/* delete.c */
+int eng_delete_range(eng *db, uint32_t series, int64_t start, int64_t end);
+int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+                      const void *v, size_t n);
+/* merge.c: drops partitions every series of which has expired (sets *dropped) and selects a part to rewrite
+ * without its expired rows (returns 1, sel[0] marked merging and referenced); caller holds db->lock */
+size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal);
 
 #endif

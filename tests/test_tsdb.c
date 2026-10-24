@@ -1148,11 +1148,15 @@ static int sk_write(skx *x, int w, int r, int kind, uint64_t seed)
         return rc;
     }
     bool plain = c->type == TSDB_FLOAT32 && !c->nulls && (seed >> 20) % 2; /* the float32 calls, too */
-    for (uint32_t s = 0; s < (kind == SK_SERIES ? c->nseries : 1) && rc == 0; s++) {
-        bool large = kind == SK_LARGE || (kind == SK_SERIES && (seed >> 24) % 2);
-        sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, kind == SK_SERIES ? s : UINT32_MAX, &b);
+    bool per = kind == SK_SERIES || kind == SK_REPLACE;
+    for (uint32_t s = 0; s < (per ? c->nseries : 1) && rc == 0; s++) {
+        bool large = kind == SK_LARGE || (per && (seed >> 24) % 2);
+        sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, per ? s : UINT32_MAX, &b);
         tsdb_values col = {(tsdb_type)c->type, b.v, c->nulls ? b.valid : NULL};
-        if (kind == SK_SERIES)
+        if (kind == SK_REPLACE)
+            rc = tsdb_replace_range(x->db, b.series[0], sk_ts(c, (uint32_t)w * c->shift),
+                                    sk_ts(c, (uint32_t)w * c->shift + c->nts), b.ts, &col, b.n);
+        else if (kind == SK_SERIES)
             rc = plain ? tsdb_insert_series(x->db, b.series[0], b.ts, (const float *)(void *)b.v, b.n)
                        : tsdb_insert_series_values(x->db, b.series[0], b.ts, &col, b.n);
         else
@@ -1527,7 +1531,7 @@ static void test_same_keys(const char *base)
     test_samekeys_model();
     const int64_t t0 = 1700000000000 + 1234; /* partitions do not start at a key */
     const unsigned batches = SK_SMALL | SK_LARGE;
-    static sk_cfg c[7];
+    static sk_cfg c[9];
     c[0] = (sk_cfg){"float32, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_FLOAT32, false, batches};
     c[1] = (sk_cfg){"int64 + nulls, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_INT64, true, batches};
     c[2] = (sk_cfg){"float64 + nulls, same keys", 5, 1000, 2, 120, 0, t0, 61000, TSDB_FLOAT64, true, batches};
@@ -1545,6 +1549,13 @@ static void test_same_keys(const char *base)
     sk_run(base, &c[4], 0, false);
     sk_run(base, &c[5], 0, false);
     sk_run(base, &c[6], 5, false);
+    /* replaces (tombstone + rows in one commit) racing inserts of the same keys */
+    c[7] = (sk_cfg){"int64 + nulls, replaces, same keys", 5, 150, 2, 80, 0, t0, 97000, TSDB_INT64, true,
+                    batches | SK_REPLACE};
+    c[8] = (sk_cfg){"float64 + nulls, replaces, shifted keys", 5, 150, 3, 80, 23, t0, 97000, TSDB_FLOAT64, true,
+                    batches | SK_SERIES | SK_REPLACE};
+    sk_run(base, &c[7], 0, false);
+    sk_run(base, &c[8], 5, true);
 }
 
 typedef struct part_count {

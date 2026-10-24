@@ -254,6 +254,75 @@ static void test_hello(void)
     close(fd);
 }
 
+/* A server older than the client: it answers HELLO with fake_version and refuses everything else, counting it.
+ * The client must refuse what that version does not know without sending it. */
+static uint32_t fake_version;
+static int fake_others; /* read after the join */
+
+static void *fake_server(void *arg)
+{
+    int fd = accept(*(int *)arg, NULL, NULL);
+    uint8_t h[9], body[256];
+    while (fd >= 0 && read_full(fd, h, 9)) {
+        uint32_t flen, id;
+        memcpy(&flen, h, 4);
+        memcpy(&id, h + 4, 4);
+        if (flen < 5 || flen - 5 > sizeof body || !read_full(fd, body, flen - 5))
+            break;
+        int32_t st = h[8] == TSDB_OP_HELLO ? 0 : TSDB_ERR_INVALID;
+        fake_others += h[8] != TSDB_OP_HELLO;
+        uint8_t r[17];
+        uint32_t rlen = st ? 9 : 13;
+        memcpy(r, &rlen, 4);
+        memcpy(r + 4, &id, 4);
+        r[8] = TSDB_OP_REPLY;
+        memcpy(r + 9, &st, 4);
+        memcpy(r + 13, &fake_version, 4);
+        if (write(fd, r, 4 + rlen) != (ssize_t)(4 + rlen))
+            break;
+    }
+    if (fd >= 0)
+        close(fd);
+    return NULL;
+}
+
+static void test_old_server(uint32_t version)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    socklen_t sl = sizeof sa;
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 1) == 0 &&
+          getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0);
+    fake_version = version;
+    fake_others = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, fake_server, &lfd) == 0);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", ntohs(sa.sin_port), &c));
+    OK(tsdbc_set_compression(c, 0));
+    CHECK(tsdbc_server_version(c) == version);
+    int64_t lim = 7, t = T0;
+    double one = 1;
+    tsdb_values col = {TSDB_FLOAT64, &one, NULL};
+    if (version < 7) {
+        CHECK(tsdbc_delete_range(c, 1, T0, T0 + 10) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_replace_range(c, 1, T0, T0 + 10, &t, &col, 1) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_set_retention(c, 1, 1000) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_get_retention(c, 1, &lim) == TSDB_ERR_INVALID);
+    }
+    if (version < 6) {
+        tsdb_twa_bucket *b = NULL;
+        size_t nb = 0;
+        CHECK(tsdbc_query_twa(c, 1, T0, T0 + 10, 0, NULL, &b, &nb) == TSDB_ERR_INVALID && nb == 0);
+        free(b);
+    }
+    tsdbc_close(c);
+    pthread_join(th, NULL);
+    close(lfd);
+    CHECK(fake_others == 0); /* only HELLO went out */
+}
+
 static void test_framing(void)
 {
     int rfd = raw_connect();
@@ -634,8 +703,6 @@ static void *client_thread(void *arg)
     return NULL;
 }
 
-/* The packed insert body round trips for every type and layout, and anything
- * that does not hold exactly n rows is refused. */
 /* LTTB through the server: the points chosen against the reference over QUERY_VALUES */
 typedef struct lpts {
     pt *p;
@@ -735,6 +802,52 @@ static void test_lttb_remote(tsdbc *c)
     free(valid);
 }
 
+/* Deletes, replaces and retention over the wire (protocol version 7). */
+static void test_delete(tsdbc *c)
+{
+    uint32_t s;
+    OK(tsdbc_series_create(c, "del.i64", TSDB_INT64, NULL, &s));
+    int64_t ts[100], v[100];
+    for (int k = 0; k < 100; k++)
+        ts[k] = T0 + k * 1000, v[k] = k;
+    tsdb_values col = {TSDB_INT64, v, NULL};
+    OK(tsdbc_insert_series_values(c, s, ts, &col, 100));
+    OK(tsdbc_delete_range(c, s, T0 + 10000, T0 + 20000));
+    tsdb_bucket *bk;
+    size_t nb;
+    OK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    CHECK(nb == 1 && bk[0].count == 90 && bk[0].isum == 4950 - 145);
+    free(bk);
+
+    /* replace with nulls; a row outside the range refuses the whole replace */
+    int64_t rts[3] = {T0 + 50000, T0 + 50500, T0 + 51000}, rv[3] = {7, 8, 9};
+    uint8_t valid = 0x5; /* row 1 is null */
+    tsdb_values rcol = {TSDB_INT64, rv, &valid};
+    CHECK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 51000, rts, &rcol, 3) == TSDB_ERR_INVALID);
+    OK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 60000, rts, &rcol, 3));
+    vrows r = {0};
+    OK(tsdbc_query_values(c, s, T0 + 50000, T0 + 60000, NULL, collect_values, &r));
+    CHECK(r.n == 3 && r.ts[1] == T0 + 50500 && !r.known[1] && r.known[2] && r.i[2] == 9);
+    OK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    CHECK(nb == 1 && bk[0].count == 82);
+    free(bk);
+    OK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 60000, NULL, &rcol, 0)); /* n = 0: a delete */
+    OK(tsdbc_query_agg(c, s, T0 + 50000, T0 + 60000, 0, &bk, &nb));
+    CHECK(nb == 0);
+    free(bk);
+
+    int64_t lim = -1;
+    OK(tsdbc_get_retention(c, s, &lim));
+    CHECK(lim == 0);
+    OK(tsdbc_set_retention(c, s, 86400000));
+    OK(tsdbc_get_retention(c, s, &lim));
+    CHECK(lim == 86400000);
+    CHECK(tsdbc_set_retention(c, s, -1) == TSDB_ERR_INVALID);
+    OK(tsdbc_set_retention(c, s, 0));
+}
+
+/* The packed insert body round trips for every type and layout, and anything
+ * that does not hold exactly n rows is refused. */
 static void test_pack_roundtrip(void)
 {
     static const size_t sizes[] = {0, 1, 7, 8, 9, 1000, 65537};
@@ -1028,13 +1141,17 @@ static void *skn_writer(void *a)
         bool async = (seed >> 8) % 2, packed = (seed >> 9) % 2, plain = c->type == TSDB_FLOAT32 && !c->nulls;
         OK(tsdbc_set_compression(cn, packed ? 1 : 0));
         atomic_store(&x->started[w], r + 1);
-        for (uint32_t s = 0; s < (kind == SK_SERIES ? c->nseries : 1); s++) {
+        bool per = kind == SK_SERIES || kind == SK_REPLACE;
+        for (uint32_t s = 0; s < (per ? c->nseries : 1); s++) {
             sk_batch b;
-            bool large = kind == SK_LARGE || (kind == SK_SERIES && (seed >> 24) % 2);
-            sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, kind == SK_SERIES ? s : UINT32_MAX, &b);
+            bool large = kind == SK_LARGE || (per && (seed >> 24) % 2);
+            sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, per ? s : UINT32_MAX, &b);
             tsdb_values col = {(tsdb_type)c->type, b.v, c->nulls ? b.valid : NULL};
             const float *f = (const float *)(void *)b.v;
-            if (kind == SK_SERIES)
+            if (kind == SK_REPLACE) /* synchronous: the replace has no pipelined form */
+                OK(tsdbc_replace_range(cn, b.series[0], sk_ts(c, (uint32_t)w * c->shift),
+                                       sk_ts(c, (uint32_t)w * c->shift + c->nts), b.ts, &col, b.n));
+            else if (kind == SK_SERIES)
                 OK(async ? tsdbc_insert_series_values_async(cn, b.series[0], b.ts, &col, b.n)
                          : tsdbc_insert_series_values(cn, b.series[0], b.ts, &col, b.n));
             else if (plain)
@@ -1198,14 +1315,16 @@ static void test_same_keys(const char *dir)
     pid_t srv = start_server_with(dir, args);
     const int64_t t0 = T0 + 1234;
     const unsigned batches = SK_SMALL | SK_LARGE;
-    enum { NC = 5 };
+    enum { NC = 6 };
     static sk_cfg c[NC];
     c[0] = (sk_cfg){"float32, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_FLOAT32, false, batches};
     c[1] = (sk_cfg){"int64 + nulls, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_INT64, true, batches};
     c[2] = (sk_cfg){"float32, shifted keys", 6, 1000, 3, 80, 20, t0, 97000, TSDB_FLOAT32, false, batches};
     c[3] = (sk_cfg){"float64 + nulls, per series", 6, 600, 3, 80, 37, t0, 97000, TSDB_FLOAT64, true,
                     batches | SK_SERIES};
-    c[4] = (sk_cfg){"float32, then SIGKILL", 5, 600, 3, 80, 10, t0, 97000, TSDB_FLOAT32, false, batches};
+    c[4] = (sk_cfg){"int64 + nulls, replaces", 5, 150, 3, 80, 23, t0, 97000, TSDB_INT64, true,
+                    batches | SK_REPLACE};
+    c[5] = (sk_cfg){"float32, then SIGKILL", 5, 600, 3, 80, 10, t0, 97000, TSDB_FLOAT32, false, batches};
     skn *x = calloc(NC, sizeof *x);
     sk_val *st[NC];
     for (int k = 0; k < NC; k++) {
@@ -2277,6 +2396,8 @@ int main(int argc, char **argv)
     test_close(c);
     test_framing();
     test_hello();
+    test_old_server(6);
+    test_old_server(5);
     test_types(c);
     test_nan(c);
     test_lttb_remote(c);
@@ -2284,6 +2405,7 @@ int main(int argc, char **argv)
     test_packed_inserts(c);
     test_bounds(c, a, N);
     test_twa(c);
+    test_delete(c);
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);

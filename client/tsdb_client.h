@@ -106,6 +106,15 @@ int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t
 /* What the server did for this connection's previous query (tsdb_last_query_stats there). */
 int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st);
 
+/* Deletes, replaces and retention, as tsdb_delete_range, tsdb_replace_range, tsdb_set_retention and
+ * tsdb_get_retention (protocol version 7; with an older server: TSDB_ERR_INVALID). A replace travels as
+ * one frame, so n is limited by the frame size (about 256 MiB). */
+int tsdbc_delete_range(tsdbc *c, uint32_t series, int64_t start, int64_t end);
+int tsdbc_replace_range(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+                        const tsdb_values *values, size_t n);
+int tsdbc_set_retention(tsdbc *c, uint32_t series, int64_t limit_ms);
+int tsdbc_get_retention(tsdbc *c, uint32_t series, int64_t *limit_ms);
+
 int tsdbc_commit(tsdbc *c);
 int tsdbc_flush(tsdbc *c);
 int tsdbc_optimize(tsdbc *c);
