@@ -73,7 +73,9 @@ static char *f_dir; /* the database directory */
 static bool f_partial;    /* a failing write writes half its bytes first */
 static bool f_drop;       /* a failing fdatasync loses the bytes since the last successful one */
 static int f_fired;
-static int h_op;          /* hold the next such call on a WAL segment until h_go */
+static int f_skip;        /* matching calls to let through before the one that fails */
+static int h_op;          /* hold the next such call on a path with h_match until h_go */
+static char h_match[64];
 static int h_begun, h_go;
 
 /* sizes at the last successful sync, by inode */
@@ -107,12 +109,15 @@ static bool inject(int op, int fd, const char *name)
             fail = f_dir && strcmp(path, f_dir) == 0;
         else
             fail = strstr(path, f_match) != NULL;
-        if (fail) {
+        if (fail && f_skip > 0) {
+            f_skip--;
+            fail = false;
+        } else if (fail) {
             f_op = 0;
             f_fired++;
         }
     }
-    if (!fail && h_op == op && strstr(path, "/wal_")) {
+    if (h_op == op && strstr(path, h_match)) { /* held even when it is to fail */
         h_op = 0;
         int me = ++h_begun;
         pthread_cond_broadcast(&f_cv);
@@ -202,6 +207,40 @@ static void arm(int op, const char *match, bool partial, bool drop)
     f_partial = partial;
     f_drop = drop;
     f_fired = 0;
+    f_skip = 0;
+    pthread_mutex_unlock(&f_lock);
+}
+
+static void arm_after(int skip, int op, const char *match)
+{
+    arm(op, match, false, false);
+    pthread_mutex_lock(&f_lock);
+    f_skip = skip;
+    pthread_mutex_unlock(&f_lock);
+}
+
+static void hold(int op, const char *match)
+{
+    pthread_mutex_lock(&f_lock);
+    h_op = op;
+    snprintf(h_match, sizeof h_match, "%s", match);
+    h_begun = h_go = 0;
+    pthread_mutex_unlock(&f_lock);
+}
+
+static void wait_held(void)
+{
+    pthread_mutex_lock(&f_lock);
+    while (h_begun < 1)
+        pthread_cond_wait(&f_cv, &f_lock);
+    pthread_mutex_unlock(&f_lock);
+}
+
+static void release(void)
+{
+    pthread_mutex_lock(&f_lock);
+    h_go = 1;
+    pthread_cond_broadcast(&f_cv);
     pthread_mutex_unlock(&f_lock);
 }
 
@@ -290,6 +329,20 @@ static void expect_rows(tsdb *db, const char *series, const int64_t *want, size_
     tsdb_points_free(&p);
 }
 
+/* files in the database directory whose names match the grep pattern */
+static int count_files(const char *pattern)
+{
+    char cmd[800], out[64] = "";
+    snprintf(cmd, sizeof cmd, "ls '%s' | grep -c '%s'", dir, pattern);
+    FILE *f = popen(cmd, "r");
+    if (f) {
+        if (!fgets(out, sizeof out, f))
+            out[0] = '\0';
+        pclose(f);
+    }
+    return atoi(out);
+}
+
 static void sleep_ms(int ms)
 {
     struct timespec d = {ms / 1000, (ms % 1000) * 1000000L};
@@ -324,10 +377,7 @@ static void test_group_commit(const char *base)
 
     /* X syncs and is held in its fdatasync; A and D append meanwhile, so the
      * next writer's batch holds both their rows */
-    pthread_mutex_lock(&f_lock);
-    h_op = F_FDATASYNC;
-    h_begun = h_go = 0;
-    pthread_mutex_unlock(&f_lock);
+    hold(F_FDATASYNC, "/wal_");
     appender x = {db, id, 1, 0}, a = {db, id, 2, 0}, d = {db, id, 3, 0};
     pthread_t tx, ta, td;
     pthread_create(&tx, NULL, append_main, &x);
@@ -499,7 +549,7 @@ static void test_manifest(const char *base)
     OK(tsdb_series(db, "s", &id));
     OK(tsdb_append(db, id, 1, 1));
     arm(F_PWRITE, "/MANIFEST", false, false);
-    tsdb_flush(db); /* the rows are durable in the WAL either way */
+    CHECK(tsdb_flush(db) == TSDB_ERR_IO); /* the rows are durable in the WAL either way */
     CHECK(fired() == 1);
     CHECK(is_failed(db, "MANIFEST"));
     CHECK(tsdb_append(db, id, 2, 2) == TSDB_ERR_IO);
@@ -509,6 +559,22 @@ static void test_manifest(const char *base)
     expect_rows(db, "s", want, 1);
     tsdb_close(db);
     printf("  failed MANIFEST rewrite\n");
+
+    /* The rewrite after a flush's parts are listed fails (the one naming the new segment succeeded): the flushed
+     * segment stays, since MANIFEST on disk still names it and a follower may be tailing it. */
+    snprintf(name, sizeof name, "%s/failstop-manifest-flush", base);
+    db = open_fresh(name, opts());
+    OK(tsdb_series(db, "s", &id));
+    OK(tsdb_append(db, id, 1, 1));
+    arm_after(1, F_PWRITE, "/MANIFEST");
+    CHECK(tsdb_flush(db) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "MANIFEST"));
+    CHECK(count_files("^wal_") == 2);
+    db = reopen(db);
+    expect_rows(db, "s", want, 1);
+    tsdb_close(db);
+    printf("  failed MANIFEST rewrite after a flush\n");
 
     /* The same failure while publishing an insert's parts: they are committed
      * (renamed, directory synced) and listed before MANIFEST is rewritten, so
@@ -613,11 +679,243 @@ static void test_background_sync(const char *base)
     CHECK(is_failed(db, "WAL fdatasync"));
     CHECK(tsdb_append(db, id, 3, 3) == TSDB_ERR_IO);
     CHECK(tsdb_commit(db) == TSDB_ERR_IO);
+    CHECK(tsdb_append(db, id, 4, 4) == TSDB_ERR_IO); /* the WAL reports the error once; the engine keeps it */
     db = reopen(db);
     int64_t want[] = {1};
     expect_rows(db, "s", want, 1);
     tsdb_close(db);
     printf("  failed background WAL sync\n");
+}
+
+/* ------------------------------------------------- tests after review */
+
+static int64_t count_rows(tsdb *db, const char *series)
+{
+    uint32_t id;
+    if (tsdb_series_lookup(db, series, &id) != 0)
+        return 0;
+    tsdb_points p = {0};
+    OK(tsdb_query_points(db, id, INT64_MIN, INT64_MAX, &p));
+    int64_t n = (int64_t)p.n;
+    tsdb_points_free(&p);
+    return n;
+}
+
+/* n rows from ts0 on; with split, the second half one day later (another partition) */
+static int insert_n(tsdb *db, uint32_t id, int64_t ts0, int n, bool split)
+{
+    int64_t ts[200];
+    float v[200];
+    for (int i = 0; i < n; i++) {
+        ts[i] = ts0 + i + (split && i >= n / 2 ? 86400000 : 0);
+        v[i] = (float)i;
+    }
+    return tsdb_insert_series(db, id, ts, v, (size_t)n);
+}
+
+typedef struct {
+    tsdb *db;
+    uint32_t series;
+    const char *name;
+    uint32_t code;
+    int rc;
+} stater;
+
+static void *state_main(void *arg)
+{
+    stater *s = arg;
+    s->rc = tsdb_state(s->db, s->series, s->name, &s->code);
+    return NULL;
+}
+
+/* A creator waiting for the dictionary lock while another one's append fails
+ * must not append after the torn record: the open would end the dictionary
+ * there and give its acknowledged code to another name. SERIES is guarded by
+ * the volume's create lock, STATES only by the dictionary's. */
+static void test_state_race(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-states", base);
+    tsdb *db = open_fresh(name, opts());
+    uint32_t mode, idle;
+    OK(tsdb_series_create(db, "mode", TSDB_STATE, NULL, &mode));
+    OK(tsdb_state(db, mode, "idle", &idle));
+    arm(F_WRITE, "/STATES", true, false);
+    hold(F_WRITE, "/STATES");
+    stater a = {db, mode, "a", 0, 0}, b = {db, mode, "b", 0, 0};
+    pthread_t ta, tb;
+    pthread_create(&ta, NULL, state_main, &a);
+    wait_held(); /* a holds the dictionary lock in its failing write */
+    pthread_create(&tb, NULL, state_main, &b);
+    sleep_ms(100); /* b has passed the engine's check and waits for the lock */
+    release();
+    pthread_join(ta, NULL);
+    pthread_join(tb, NULL);
+    CHECK(a.rc == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(b.rc == TSDB_ERR_IO);
+    CHECK(is_failed(db, "state dictionary"));
+    db = reopen(db);
+    uint32_t got;
+    OK(tsdb_state_lookup(db, mode, "idle", &got));
+    CHECK(got == idle);
+    if (b.rc == 0) { /* acknowledged: must be there, with its code */
+        CHECK(tsdb_state_lookup(db, mode, "b", &got) == 0 && got == b.code);
+    }
+    tsdb_close(db);
+    printf("  failed state dictionary append with a second creator waiting\n");
+}
+
+/* One insert over two partitions commits through an intent: all or nothing. */
+static void test_intent(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-intent", base);
+
+    /* the directory fsync that makes the intent durable fails: committed or not, never half */
+    tsdb *db = open_fresh(name, opts());
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    arm(F_FSYNC, "/", false, false);
+    CHECK(insert_n(db, id, 0, 100, true) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "intent"));
+    CHECK(insert_n(db, id, 1000, 100, true) == TSDB_ERR_IO);
+    db = reopen(db);
+    int64_t n = count_rows(db, "s");
+    CHECK(n == 0 || n == 100);
+    tsdb_close(db);
+
+    /* the rename of the second partition's part fails after the intent is durable: the open rolls it forward,
+     * so its tmp file must still be there */
+    db = open_fresh(name, opts());
+    OK(tsdb_series(db, "s", &id));
+    arm(F_RENAME, "p1_", false, false); /* renameat gets the bare name */
+    CHECK(insert_n(db, id, 0, 100, true) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "rename of a new part"));
+    db = reopen(db);
+    CHECK(count_rows(db, "s") == 100);
+    tsdb_close(db);
+    printf("  failed commit of an insert over two partitions: all or nothing\n");
+}
+
+static int64_t stat_parts(tsdb *db)
+{
+    tsdb_stats st;
+    OK(tsdb_get_stats(db, &st));
+    return (int64_t)st.parts;
+}
+
+static tsdb *two_parts(const char *name)
+{
+    tsdb *db = open_fresh(name, opts());
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    OK(insert_n(db, id, 0, 100, false));
+    OK(insert_n(db, id, 100, 100, false));
+    CHECK(stat_parts(db) == 2);
+    return db;
+}
+
+typedef struct {
+    tsdb *db;
+    int rc;
+} optimizer;
+
+static void *optimize_main(void *arg)
+{
+    optimizer *o = arg;
+    o->rc = tsdb_optimize(o->db);
+    return NULL;
+}
+
+static void test_merge(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-merge", base);
+
+    /* the fsync that makes the merged part's name durable fails: the sources are not retired */
+    tsdb *db = two_parts(name);
+    arm(F_FSYNC, "/", false, false);
+    CHECK(tsdb_optimize(db) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "merged part"));
+    db = reopen(db);
+    CHECK(count_rows(db, "s") == 200);
+    tsdb_close(db);
+
+    /* renaming a replaced source to retired_ fails: still listed after a reopen, so fail-stop */
+    db = two_parts(name);
+    arm(F_RENAME, "retired_", false, false);
+    CHECK(tsdb_optimize(db) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "retired_"));
+    db = reopen(db);
+    CHECK(count_rows(db, "s") == 200);
+    tsdb_close(db);
+
+    /* the engine fails while a merge is in flight: its output is neither named nor listed */
+    db = two_parts(name);
+    uint32_t id;
+    OK(tsdb_series_lookup(db, "s", &id));
+    hold(F_FDATASYNC, "/tmp_");
+    optimizer o = {db, 0};
+    pthread_t t;
+    pthread_create(&t, NULL, optimize_main, &o);
+    wait_held();
+    arm(F_WRITE, "/wal_", false, false);
+    CHECK(tsdb_append(db, id, 5000, 1) == TSDB_ERR_IO);
+    release();
+    pthread_join(t, NULL);
+    CHECK(o.rc == TSDB_ERR_IO);
+    CHECK(stat_parts(db) == 2);
+    CHECK(count_files("^p.*\\.part$") == 2);
+    db = reopen(db);
+    CHECK(count_rows(db, "s") == 200);
+    tsdb_close(db);
+    printf("  failed merges, and a merge in flight when the engine fails\n");
+}
+
+/* A flush opens a new WAL segment; its name must be durable before rows go there. */
+static void test_wal_segment(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-segment", base);
+    tsdb *db = open_fresh(name, opts());
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    OK(tsdb_append(db, id, 1, 1));
+    arm(F_FSYNC, "/", false, false);
+    CHECK(tsdb_flush(db) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "WAL segment"));
+    CHECK(tsdb_append(db, id, 2, 2) == TSDB_ERR_IO);
+    db = reopen(db);
+    int64_t want[] = {1};
+    expect_rows(db, "s", want, 1);
+    tsdb_close(db);
+    printf("  failed directory fsync after creating a WAL segment\n");
+}
+
+static void test_drop_before(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-drop", base);
+    tsdb *db = open_fresh(name, opts());
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    OK(insert_n(db, id, 0, 100, false));
+    OK(insert_n(db, id, 86400000, 100, false));
+    arm(F_FSYNC, "/", false, false);
+    CHECK(tsdb_drop_before(db, 86400000) == TSDB_ERR_IO);
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "dropped"));
+    db = reopen(db);
+    int64_t n = count_rows(db, "s");
+    CHECK(n == 100 || n == 200);
+    tsdb_close(db);
+    printf("  failed directory fsync after dropping partitions\n");
 }
 
 int main(int argc, char **argv)
@@ -635,6 +933,11 @@ int main(int argc, char **argv)
     test_series_dict(root);
     test_catalog(root);
     test_background_sync(root);
+    test_state_race(root);
+    test_intent(root);
+    test_merge(root);
+    test_wal_segment(root);
+    test_drop_before(root);
     if (!failures) {
         char cmd[512];
         snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);

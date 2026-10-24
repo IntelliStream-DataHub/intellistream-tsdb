@@ -393,12 +393,14 @@ int eng_optimize(eng *db)
         pthread_mutex_lock(&db->lock);
         merge_commit_locked(db, sel, k, out);
         pthread_mutex_unlock(&db->lock);
-        if (out)
-            manifest_publish(db);
+        if (out) {
+            int mrc = manifest_publish(db);
+            rc = rc ? rc : mrc;
+        }
         for (size_t i = 0; i < k; i++)
             part_unref(sel[i]);
         pthread_mutex_lock(&db->lock);
-        if (rc)
+        if (rc || (rc = eng_check(db)) != 0) /* failed meanwhile: the output was dropped, do not select again */
             break;
     }
     pthread_mutex_unlock(&db->lock);

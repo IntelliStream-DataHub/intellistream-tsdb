@@ -473,6 +473,7 @@ typedef struct series_dict {
     uint32_t *table; /* open addressing; id + 1, 0 = empty */
     uint32_t tcap;
     uint64_t file_off; /* bytes of SERIES already loaded */
+    bool broken;       /* an append failed (under lock): the file may end in a torn record, append no more */
 } series_dict;
 
 /* The series dictionary (file SERIES) and the state names (file STATES) are both these. */

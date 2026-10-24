@@ -681,6 +681,8 @@ int eng_drop_before(eng *db, int64_t ts)
     for (size_t i = 0; i < db->nparts;) {
         part *p = db->parts[i];
         int64_t end = sat_add(sat_mul(p->partition, db->partition_ms), db->partition_ms);
+        if (eng_check(db)) /* a rename below failed: retire nothing more */
+            break;
         if (end <= ts) {
             p->dropped = true; /* an in-flight merge of it discards its result */
             db_retire_locked(db, p);
@@ -689,6 +691,8 @@ int eng_drop_before(eng *db, int64_t ts)
         }
     }
     pthread_mutex_unlock(&db->lock);
+    if ((rc = eng_check(db)) != 0) /* failed since the flush, here or elsewhere */
+        return rc;
     if (db->opt.fsync && fsync(db->dirfd) != 0) {
         eng_fail(db, "fsync of the directory after retiring dropped parts", errno);
         return TSDB_ERR_IO;

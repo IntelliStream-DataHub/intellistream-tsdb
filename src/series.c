@@ -216,6 +216,8 @@ int series_get(series_dict *d, const char *name, bool create, int type, uint32_t
         rc = TSDB_ERR_NOTFOUND;
     } else if (d->fd < 0) {
         rc = TSDB_ERR_READONLY;
+    } else if (d->broken) {
+        rc = TSDB_ERR_IO; /* a record after a torn one would be lost at the next open, yet acknowledged */
     } else {
         size_t hdr = type == TSDB_FLOAT32 ? 2 : 3; /* float32: readable by version 1 */
         uint8_t *rec = malloc(len + hdr);
@@ -236,6 +238,9 @@ int series_get(series_dict *d, const char *name, bool create, int type, uint32_t
             }
             free(rec);
             if (rc == TSDB_ERR_IO) {
+                /* Set before the unlock: the caller fails the engine only after it, and another creator
+                 * waiting for the lock must not append behind the torn record meanwhile. */
+                d->broken = true;
                 pthread_mutex_unlock(&d->lock);
                 errno = err;
                 return rc;

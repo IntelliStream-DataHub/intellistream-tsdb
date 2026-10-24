@@ -566,14 +566,15 @@ static int flush_waiting(eng *db)
         pthread_cond_signal(&db->merge_cv);
         pthread_mutex_unlock(&db->lock);
         pthread_mutex_unlock(&db->publish_lock);
-        manifest_publish(db);
+        int mrc = manifest_publish(db); /* fails the engine on error */
         free(pl.p);
-        if (db->wal_enabled) {
+        if (db->wal_enabled && mrc == 0) { /* else MANIFEST may still name it: a follower would tail it */
             char name[64];
             wal_name(name, sizeof name, m->wal_seq);
             unlinkat(db->dirfd, name, 0);
         }
         mt_unref(m);
+        rc = mrc;
     }
     return rc;
 }

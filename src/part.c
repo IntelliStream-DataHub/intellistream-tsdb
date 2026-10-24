@@ -403,7 +403,8 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         pw_abort(w);
         return rc;
     }
-    if (renameat(db->dirfd, w->tmp_name, db->dirfd, name) != 0) {
+    /* a merge that finishes after the engine failed: a failed engine names no new files */
+    if (eng_check(db) || renameat(db->dirfd, w->tmp_name, db->dirfd, name) != 0) {
         rc = TSDB_ERR_IO;
         goto fail;
     }
