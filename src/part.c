@@ -256,6 +256,7 @@ static int pw_emit(part_writer *w, uint32_t series, int type, const int64_t *ts,
     if (!vl)
         return TSDB_ERR_NOMEM;
     granule_stats(type, v, n, &g);
+    granule_twa(type, ts, v, n, &g);
     g.series = series;
     g.count = (uint32_t)n;
     g.ts_min = ts[0];

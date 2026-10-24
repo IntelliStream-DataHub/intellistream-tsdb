@@ -306,6 +306,65 @@ int tsdb_query_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, con
 int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
+/* ---- time-weighted averages ----
+ * For sensors that report irregularly or only on change, a plain average
+ * weights every reading the same; a time-weighted average weights each value
+ * by how long it held. Readings are joined by segments: reading i (at t_i)
+ * and the next reading of the series (at t_{i+1}) bound the segment
+ * [t_i, t_{i+1}).
+ *  - TSDB_TWA_STEP (last observation carried forward): v_i holds over the
+ *    segment. A null reading holds nothing: a null ends the previous value.
+ *  - TSDB_TWA_LINEAR: the value runs on a straight line from v_i to v_{i+1}
+ *    (trapezoids); a segment with a null at either end covers nothing.
+ *  - max_gap_ms > 0: a segment longer than max_gap_ms covers nothing (the value
+ *    is stale; LINEAR does not interpolate across it). 0: no limit.
+ *  - The last reading of a series has no segment: it holds until a later
+ *    reading arrives, never up to "now".
+ * A bucket [b0, b1) integrates every segment over its intersection with the
+ * bucket and with [start, end): segments are cut exactly at bucket edges and at
+ * start and end (LINEAR interpolates the value at the cut), and the value in
+ * force at b0 comes from the last reading before it, however long ago (within
+ * max_gap_ms), even before start. Readings after end only end segments.
+ *    area       = integral of value dt, in value x ms
+ *    covered_ms = time covered by segments
+ *    twa        = area / covered_ms (NaN when covered_ms is 0)
+ *    count      = non-null readings in the bucket and in [start, end)
+ * area and covered_ms add up across buckets: the average over several buckets is
+ * the sum of their areas over the sum of their covered_ms. A bucket is returned
+ * when covered_ms or count is not 0.
+ * NaN propagates: a NaN value held for any time makes the area and twa NaN;
+ * infinities follow IEEE arithmetic. A NaN result is the canonical quiet NaN.
+ * Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:
+ * twa is the fraction of covered time that it was true); state series are
+ * TSDB_ERR_INVALID. Whole granules inside one bucket are answered from stored
+ * statistics without decoding (see docs/design.md). */
+typedef enum { TSDB_TWA_STEP = 0, TSDB_TWA_LINEAR = 1 } tsdb_twa_method;
+
+typedef struct tsdb_twa_opts {
+    tsdb_twa_method method;
+    int64_t max_gap_ms; /* 0: no staleness limit */
+    tsdb_order order;   /* of the buckets */
+    size_t limit;       /* 0: no limit */
+} tsdb_twa_opts;
+
+typedef struct tsdb_twa_bucket {
+    int64_t start; /* bucket start; with interval 0 this is the query start */
+    double twa;
+    double area;
+    int64_t covered_ms;
+    uint64_t count;
+} tsdb_twa_bucket;
+
+/* interval_ms as in tsdb_query_agg (0: one bucket); opts NULL: STEP, no limit. Free with free(). */
+int tsdb_query_twa(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                   const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+/* UTC calendar groups as in tsdb_query_group (group NULL: one bucket). */
+int tsdb_query_twa_group(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                         const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+/* Client bounds as in tsdb_query_bounds: segments before bounds[0] do not count. */
+int tsdb_query_twa_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                          const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+
 /* ---- query statistics ----
  * What the calling thread's last query did, like ClickHouse's "Processed N
  * rows, M MB": rows it covered (decoded, answered from granule statistics, or

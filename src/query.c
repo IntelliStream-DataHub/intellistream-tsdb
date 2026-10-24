@@ -37,14 +37,8 @@
 
 /* --------------------------------------------------------------- snapshot */
 
-typedef struct snapshot {
-    part **parts;
-    size_t np;
-    mem_run *mem; /* rows of the series from memtables, oldest memtable first */
-    size_t nmem;
-} snapshot;
 
-static void snapshot_release(snapshot *s)
+void snapshot_release(snapshot *s)
 {
     db_release(s->parts, s->np);
     for (size_t i = 0; i < s->nmem; i++)
@@ -55,7 +49,7 @@ static void snapshot_release(snapshot *s)
 
 /* Parts and memtables as of one instant: a flush publishes its parts and
  * retires its memtable under db->lock, so nothing is seen twice or missed. */
-static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
+int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
 {
     memset(s, 0, sizeof *s);
     memtable *ms[MAX_FLUSHING];
@@ -132,7 +126,7 @@ static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int6
 }
 
 /* Granules [*gi, *gj) of series s that may hold rows in [start, end). */
-static void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj)
+void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj)
 {
     const granule *g = p->g;
     uint32_t lo = 0, hi = p->ng;
@@ -159,20 +153,8 @@ static void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uin
 
 /* A time-ordered stream of unique timestamps from one source: a range of a
  * part's granules, or a memtable run. */
-typedef struct src {
-    const part *p;   /* NULL for a memtable run */
-    uint32_t gi, gj; /* granules still to load */
-    uint64_t prio;   /* newer sources win on equal timestamps */
-    bool loaded;
-    size_t pos, n;   /* rows [pos, n) of ts/v are in range and unread */
-    int64_t *ts;
-    uint8_t *v;      /* slots of `type` */
-    int type;
-    size_t w;        /* slot width */
-    bool own;        /* ts/v are decode buffers owned by the cursor */
-} src;
 
-static void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type)
+void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type)
 {
     memset(c, 0, sizeof *c);
     c->p = p;
@@ -184,7 +166,7 @@ static void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int t
 }
 
 /* Memtable runs are newer than every part; later memtables are newer. */
-static void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type)
+void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type)
 {
     memset(c, 0, sizeof *c);
     c->prio = prio;
@@ -196,7 +178,7 @@ static void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type)
     c->w = type_width(type);
 }
 
-static void src_free(src *c)
+void src_free(src *c)
 {
     if (c->own) {
         free(c->ts);
@@ -247,7 +229,7 @@ static int src_advance(codec_ctx *cc, src *c, size_t rows, int64_t start, int64_
 /* Emits the union of the sources in time order, one row per timestamp: the
  * row of the source with the highest priority. Every live source is kept
  * decoded, so the head timestamps are exact. */
-static int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx)
+int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx)
 {
     int rc = 0;
     for (size_t i = 0; i < nc && rc == 0; i++)
@@ -408,6 +390,9 @@ static inline int64_t bk_start(const bucketer *bk, int64_t key)
     default: return sat_mul(cal_start_day(bk, key * bk->count), 86400000);
     }
 }
+
+int64_t bucketer_key(const bucketer *bk, int64_t ts) { return bk_key(bk, ts); }
+int64_t bucketer_start(const bucketer *bk, int64_t key) { return bk_start(bk, key); }
 
 /* -------------------------------------------------------------- aggregate */
 
@@ -591,7 +576,7 @@ static int cmp_item(const void *a, const void *b)
     return (x->lo > y->lo) - (x->lo < y->lo);
 }
 
-static uint64_t mem_prio(const snapshot *sn, size_t i) { return UINT64_MAX - (sn->nmem - i); }
+uint64_t mem_prio(const snapshot *sn, size_t i) { return UINT64_MAX - (sn->nmem - i); }
 
 int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
                   size_t *nout)

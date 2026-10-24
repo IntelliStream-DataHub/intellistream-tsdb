@@ -26,9 +26,10 @@ typedef struct eng eng;
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-/* 3: checksummed part header and footer, WAL records and dictionary records; databases
- * of older versions are refused (no release had them) */
-#define FORMAT_VERSION 3
+/* 3: checksummed part header and footer, WAL records and dictionary records;
+ * 4: time-weighted statistics in granule entries (136 bytes). Databases of older
+ * versions are refused (no release had them). */
+#define FORMAT_VERSION 4
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -358,8 +359,21 @@ typedef struct granule {
     union { double fmax; int64_t imax; };
     union { double fsum; uint64_t isum_lo; };
     int64_t isum_hi; /* integer sums are 128 bits */
+    /* Time-weighted statistics (twa.c): the granule's first and last values (as
+     * doubles; GT_FIRST_NULL/GT_LAST_NULL when null), and over the segments
+     * between its consecutive rows the STEP and LINEAR areas (value x ms) and
+     * the time they cover; tw_gap is the longest of those segments (saturated),
+     * so a query with a staleness limit knows whether the areas apply. */
+    double tw_first, tw_last;
+    double tw_step, tw_lin;
+    uint64_t tw_step_ms, tw_lin_ms;
+    uint32_t tw_gap;
+    uint32_t tw_flags;
 } granule;
-_Static_assert(sizeof(granule) == 80, "granule must be 80 bytes");
+_Static_assert(sizeof(granule) == 136, "granule must be 136 bytes");
+enum { GT_FIRST_NULL = 1, GT_LAST_NULL = 2 };
+/* The time-weighted statistics of a granule's rows (n >= 1, ts strictly increasing). */
+void granule_twa(int type, const int64_t *ts, const void *v, size_t n, struct granule *g);
 
 typedef struct part_header {
     char magic[8];
@@ -741,7 +755,36 @@ int eng_commit(eng *db);
 int eng_flush(eng *db);
 extern size_t desc_window_rows;
 /* Raw rows in time order; v as slots of the series' type. */
+/* ---- query internals shared with twa.c (query.c) ---- */
+typedef struct snapshot {
+    part **parts;
+    size_t np;
+    mem_run *mem; /* rows of the series from memtables, oldest memtable first */
+    size_t nmem;
+} snapshot;
+int snapshot_take(struct eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s);
+void snapshot_release(snapshot *s);
+uint64_t mem_prio(const snapshot *sn, size_t i);
+/* Granules [*gi, *gj) of series s that may hold rows in [start, end). */
+void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj);
+typedef struct src {
+    const part *p;   /* NULL for a memtable run */
+    uint32_t gi, gj; /* granules still to load */
+    uint64_t prio;   /* newer sources win on equal timestamps */
+    bool loaded;
+    size_t pos, n;   /* rows [pos, n) of ts/v are in range and unread */
+    int64_t *ts;
+    uint8_t *v;      /* slots of `type` */
+    int type;
+    size_t w;        /* slot width */
+    bool own;        /* ts/v are decode buffers owned by the cursor */
+} src;
+void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type);
+void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type);
+void src_free(src *c);
 typedef int (*slot_fn)(void *ctx, const int64_t *ts, const void *v, size_t n);
+/* Emits the union of the sources in time order, newest row per timestamp. */
+int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx);
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
                      slot_fn fn, void *ctx);
 /* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID */
@@ -753,6 +796,11 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                     size_t *nout);
 int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g);
 int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n);
+int64_t bucketer_key(const bucketer *bk, int64_t ts);    /* the bucket of ts */
+int64_t bucketer_start(const bucketer *bk, int64_t key); /* the first instant of bucket key */
+/* Time-weighted averages (twa.c). */
+int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, int method,
+                  int64_t max_gap, tsdb_twa_bucket **out, size_t *nout);
 int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
 int eng_get_stats(eng *db, tsdb_stats *st);

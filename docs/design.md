@@ -191,13 +191,16 @@ one insert (or produced by one merge), sorted by `(series, ts)`:
 header | ts block, value block, ts block, value block, ... | granule index | footer
 ```
 
-A granule is up to 8192 rows of one series. Its 80-byte index entry holds
+A granule is up to 8192 rows of one series. Its 136-byte index entry holds
 the series, min/max timestamp, row count, null count, the sum, min and max of
 the known values (doubles for floats; exact for integers: int64 min/max and a
-128-bit sum), block offsets and a checksum of the granule's blocks. The
+128-bit sum), block offsets and a checksum of the granule's blocks, and the
+time-weighted statistics (first and last value, STEP and LINEAR areas, the
+time they cover and the longest gap between rows: see "Time-weighted
+averages"). The
 header, the index and the footer (WAL segment, row count, time range) are
 covered by one more checksum, checked when the part is opened. The on-disk
-format is version 3; a database of another version is refused at open
+format is version 4; a database of another version is refused at open
 (there is no release yet, so no older format is read). The index is the sparse primary index of MergeTree: finding a series'
 rows in a time range is a binary search, and aggregates over whole granules
 are answered from the stored statistics without decompressing anything.

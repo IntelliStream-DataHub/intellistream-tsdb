@@ -1162,6 +1162,69 @@ int tsdb_query_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const
     return rc;
 }
 
+/* Time-weighted averages: one router for the interval, group and bounds forms. */
+static int query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                     const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+{
+    eng *e;
+    uint32_t local;
+    tsdb_twa_opts def = {0};
+    if (!opts)
+        opts = &def;
+    qrun qr;
+    qs_begin(&qr);
+    int rc = 0, type = -1;
+    if (route(t, series, &e, &local)) {
+        type = eng_series_type(e, local);
+        rc = eng_query_twa(e, local, start, end, bk, (int)opts->method, opts->max_gap_ms, out, nout);
+    }
+    if (rc == 0 && opts->order == TSDB_DESC)
+        for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {
+            tsdb_twa_bucket x = (*out)[i];
+            (*out)[i] = (*out)[j];
+            (*out)[j] = x;
+        }
+    if (rc == 0 && opts->limit && *nout > opts->limit)
+        *nout = opts->limit;
+    qs_end(&qr, type, *nout);
+    return rc;
+}
+
+int tsdb_query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                   const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    if (interval_ms < 0)
+        return TSDB_ERR_INVALID;
+    bucketer bk = {.kind = interval_ms ? BK_FIXED : BK_ONE, .start = start, .interval = interval_ms};
+    return query_twa(t, series, start, end, &bk, opts, out, nout);
+}
+
+int tsdb_query_twa_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                         const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    bucketer bk;
+    int rc = bucketer_init(&bk, start, group);
+    return rc ? rc : query_twa(t, series, start, end, &bk, opts, out, nout);
+}
+
+int tsdb_query_twa_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                          const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    bucketer bk;
+    int rc = bounds ? bucketer_bounds(&bk, bounds, n) : TSDB_ERR_INVALID;
+    if (rc)
+        return rc;
+    if (start < bounds[0]) /* segments before the first bound belong to no bucket */
+        start = bounds[0];
+    return query_twa(t, series, start, end, &bk, opts, out, nout);
+}
+
 int tsdb_query_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
