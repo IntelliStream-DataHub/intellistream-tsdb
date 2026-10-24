@@ -197,7 +197,11 @@ test-java: $(B)/tsdbd
 
 test-clients: test-rust test-python test-java
 
-.PHONY: all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge
+# Commit rules as a git hook (no session links, DCO sign-off last); once per clone.
+hooks:
+	git config core.hooksPath .githooks
+
+.PHONY: hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

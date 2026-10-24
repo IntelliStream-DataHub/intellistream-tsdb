@@ -11,3 +11,6 @@ core
 core.*
 perf.data*
 /build-nouring/
+
+# personal Claude Code settings
+/.claude/settings.local.json
