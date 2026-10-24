@@ -212,6 +212,10 @@ cargo run --release --example insert_bench -- /tmp/x.rb --addr 127.0.0.1:7070 --
 
 It prints rows per second and bytes sent per row. Try `--compression 0` to compare.
 
+`examples/query_bench.rs` runs the random query windows of `tsdbc-bench query` from this client
+(`--conns N` threads, `--seconds S`); `../../bench/clients/run.sh` runs it next to the other clients and the
+embedded library.
+
 ## Embedded
 
 The feature `embedded` puts the database itself into your program: no

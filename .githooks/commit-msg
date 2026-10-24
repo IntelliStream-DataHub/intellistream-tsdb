@@ -1,0 +1,20 @@
+#!/bin/sh
+# commit-msg: the project's commit rules (AGENTS.md), for people and agents alike.
+#   - no link to a Claude session (Claude-Session trailer, claude.ai/code URL);
+#   - a DCO Signed-off-by, as the last trailer (git commit -s).
+# Install once per clone: make hooks  (git config core.hooksPath .githooks)
+msg=$1
+if grep -Eqi 'claude\.ai/code|^Claude-Session:' "$msg"; then
+    echo "commit-msg: remove the link to a Claude session from the message" >&2
+    exit 1
+fi
+# the last non-empty, non-comment line must be a Signed-off-by trailer
+last=$(grep -v '^#' "$msg" | sed '/^[[:space:]]*$/d' | tail -n 1)
+case $last in
+Signed-off-by:*) ;;
+*)
+    echo "commit-msg: end the message with a DCO Signed-off-by (git commit -s)" >&2
+    exit 1
+    ;;
+esac
+exit 0

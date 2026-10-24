@@ -1,42 +1,33 @@
 /*
  * Network benchmark against tsdbd.
  *
- *   tsdbc-bench load  FILE.rowbinary [--conns 4] [--batch 1000000]
+ *   tsdbc-bench load  FILE.rowbinary [--conns 4] [--batch 1000000] [--compression 1]
+ *   tsdbc-bench verify FILE.rowbinary     the server holds exactly the rows of FILE (count, sum, every timestamp and value)
+ *   tsdbc-bench optimize                  flush and merge, as tsdb-bench does after its load
  *   tsdbc-bench query [--series 100] [--points 1000000] [--conns 1] [--seconds 3]
  *   tsdbc-bench connections --conns 5000 [--seconds 5]
  *
  * load sends a RowBinary file (u32 series, i64 ts, f32 value per row), split
  * into contiguous slices, one per connection, with up to 4 batches in flight.
- * query runs the random windows of tsdb-bench (mixed dataset intervals).
+ * query runs the random windows of cbench.h (mixed dataset intervals); tsdb-bench --qps runs the same ones
+ * in-process, and the Rust, Python and Java query benchmarks the same again.
  * connections holds --conns connections open at once (from up to 64 threads)
  * and keeps sending small aggregate queries through all of them.
  */
 #include "../client/tsdb_client.h"
-#include "common.h"
-#include "datasets.h"
+#include "cbench.h"
 
-#include <fcntl.h>
 #include <getopt.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 static const char *host = "127.0.0.1";
 static int port = 7070, conns = 1;
 static size_t batch = 1000000;
 static uint32_t nseries = 100;
 static uint64_t points = 1000000;
-static double seconds = 3;
-
-#pragma pack(push, 1)
-typedef struct rbrow {
-    uint32_t s;
-    int64_t t;
-    float v;
-} rbrow;
-#pragma pack(pop)
+static double seconds = CB_DEFAULT_SECONDS;
+static int compression = 1; /* zstd level of insert batches; 0 sends plain arrays */
 
 static void die(const char *what, int rc)
 {
@@ -47,6 +38,7 @@ static void die(const char *what, int rc)
 typedef struct load_job {
     const rbrow *rows;
     size_t n;
+    uint64_t sent;
 } load_job;
 
 static void *loader(void *arg)
@@ -56,6 +48,8 @@ static void *loader(void *arg)
     int rc = tsdbc_connect(host, port, &c);
     if (rc)
         die("connect", rc);
+    if ((rc = tsdbc_set_compression(c, compression)) != 0)
+        die("compression", rc);
     uint32_t *s = malloc(batch * 4);
     int64_t *t = malloc(batch * 8);
     float *v = malloc(batch * 4);
@@ -79,6 +73,7 @@ static void *loader(void *arg)
     }
     if ((rc = tsdbc_wait(c)) != 0)
         die("insert", rc);
+    j->sent = tsdbc_bytes_sent(c);
     tsdbc_close(c);
     free(s);
     free(t);
@@ -88,14 +83,11 @@ static void *loader(void *arg)
 
 static int load(const char *path)
 {
-    int fd = open(path, O_RDONLY);
-    struct stat st;
-    if (fd < 0 || fstat(fd, &st) != 0) {
-        perror(path);
+    cb_file f;
+    if (cb_file_open(path, &f) != 0)
         return 1;
-    }
-    const rbrow *rows = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
-    size_t n = (size_t)st.st_size / sizeof(rbrow);
+    const rbrow *rows = f.rows;
+    size_t n = f.n;
     uint32_t maxs = 0;
     for (size_t i = 0; i < n && i < 10000000; i++)
         maxs = rows[i].s > maxs ? rows[i].s : maxs;
@@ -110,19 +102,70 @@ static int load(const char *path)
         if ((rc = tsdbc_series(c, name, 1, &id)) != 0)
             die("series", rc);
     }
-    double t0 = now_s();
+    double t0 = now_s(), cpu0 = cb_cpu_s();
     pthread_t th[256];
     load_job jobs[256];
     for (int i = 0; i < conns; i++) {
         size_t a = n * (size_t)i / (size_t)conns, b = n * (size_t)(i + 1) / (size_t)conns;
-        jobs[i] = (load_job){rows + a, b - a};
+        jobs[i] = (load_job){rows + a, b - a, 0};
         pthread_create(&th[i], NULL, loader, &jobs[i]);
     }
-    for (int i = 0; i < conns; i++)
+    double sent = 0;
+    for (int i = 0; i < conns; i++) {
         pthread_join(th[i], NULL);
-    double dt = now_s() - t0;
-    printf("load over TCP: %zu rows in %.2f s = %.1f M rows/s (%d connections, batches of %zu)\n", n, dt,
-           n / dt / 1e6, conns, batch);
+        sent += (double)jobs[i].sent;
+    }
+    double dt = now_s() - t0, cpu = cb_cpu_s() - cpu0;
+    char extra[64];
+    snprintf(extra, sizeof extra, ", batches of %zu", batch);
+    cb_report_load("c", conns, compression, n, dt, sent, cpu, extra);
+    tsdbc_close(c);
+    return 0;
+}
+
+static int verify_agg(void *ctx, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
+                      size_t *nout)
+{
+    return tsdbc_query_agg(ctx, series, start, end, interval, out, nout);
+}
+
+static int verify_raw(void *ctx, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *fnctx)
+{
+    return tsdbc_query_raw(ctx, series, start, end, fn, fnctx);
+}
+
+/* The server holds the rows of the file: the same rows in every series: count, sum, and every timestamp and value. Series ids
+ * are the file's, which is what a fresh server gives to series created in order (all clients create them that way). */
+static int verify(const char *path)
+{
+    cb_file f;
+    if (cb_file_open(path, &f) != 0)
+        return 1;
+    cb_expect e;
+    cb_expect_make(&f, &e);
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect", rc);
+    cb_source src = {c, verify_agg, verify_raw};
+    rc = cb_expect_verify_all(&e, f.n, &src, "on the server");
+    tsdbc_close(c);
+    cb_expect_free(&e);
+    return rc;
+}
+
+static int optimize(void)
+{
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect", rc);
+    double t0 = now_s();
+    if ((rc = tsdbc_flush(c)) != 0)
+        die("flush", rc);
+    if ((rc = tsdbc_optimize(c)) != 0)
+        die("optimize", rc);
+    printf("flush and optimize: %.2f s\n", now_s() - t0);
     tsdbc_close(c);
     return 0;
 }
@@ -130,8 +173,7 @@ static int load(const char *path)
 /* ---------------------------------------------------------------- query */
 
 typedef struct qjob {
-    int kind; /* 0 raw, 1 agg */
-    uint64_t window, bucket;
+    const cb_class *k;
     int seed;
     uint64_t queries, rows;
     double secs;
@@ -152,17 +194,14 @@ static void *querier(void *arg)
     int rc = tsdbc_connect(host, port, &c);
     if (rc)
         die("connect", rc);
-    uint64_t r = ds_mix((uint64_t)q->seed + 991);
+    uint64_t r = cb_seed(q->seed);
     double t0 = now_s();
     while (now_s() - t0 < seconds) {
         for (int k = 0; k < 16; k++) {
-            r = ds_mix(r);
-            uint32_t s = (uint32_t)(r % nseries);
-            int64_t step = ds_info[s % (DS_KINDS - 1)].step_ms;
-            uint64_t span = points > q->window ? points - q->window : 1;
-            int64_t start = 1704067200000 + (int64_t)((r >> 20) % span) * step;
-            int64_t end = start + (int64_t)q->window * step;
-            if (q->kind == 0) {
+            uint32_t s;
+            int64_t start, end;
+            cb_window(&r, nseries, points, q->k->window, &s, &start, &end);
+            if (!q->k->agg) {
                 uint64_t n = 0;
                 if ((rc = tsdbc_query_raw(c, s, start, end, count_cb, &n)) != 0)
                     die("query", rc);
@@ -170,7 +209,7 @@ static void *querier(void *arg)
             } else {
                 tsdb_bucket *b;
                 size_t nb;
-                if ((rc = tsdbc_query_agg(c, s, start, end, (int64_t)q->bucket * step, &b, &nb)) != 0)
+                if ((rc = tsdbc_query_agg(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(s), &b, &nb)) != 0)
                     die("query", rc);
                 for (size_t i = 0; i < nb; i++)
                     q->rows += b[i].count;
@@ -184,12 +223,13 @@ static void *querier(void *arg)
     return NULL;
 }
 
-static void run_queries(const char *label, int kind, uint64_t window, uint64_t bucket)
+static int run_queries(const cb_class *k)
 {
     pthread_t th[256];
     qjob jobs[256];
+    double cpu0 = cb_cpu_s();
     for (int i = 0; i < conns; i++) {
-        jobs[i] = (qjob){kind, window, bucket, i, 0, 0, 0};
+        jobs[i] = (qjob){k, i, 0, 0, 0};
         pthread_create(&th[i], NULL, querier, &jobs[i]);
     }
     uint64_t nq = 0, rows = 0;
@@ -200,8 +240,12 @@ static void run_queries(const char *label, int kind, uint64_t window, uint64_t b
         rows += jobs[i].rows;
         secs = jobs[i].secs > secs ? jobs[i].secs : secs;
     }
-    printf("  %-44s %3d conn %10.0f q/s  %8.1f us/q  %7.1f Mrows/s\n", label, conns, nq / secs,
-           secs * conns / nq * 1e6, rows / secs / 1e6);
+    cb_report_query("c", k, "conn", conns, nq, rows, secs, cb_cpu_s() - cpu0);
+    if (rows == 0) {
+        fprintf(stderr, "query: class %s returned no rows: the server is empty or does not hold the data set\n", k->id);
+        return 1;
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------- connections */
@@ -286,7 +330,8 @@ int main(int argc, char **argv)
     static struct option opts[] = {{"host", required_argument, 0, 'h'},   {"port", required_argument, 0, 'p'},
                                    {"conns", required_argument, 0, 'c'},  {"batch", required_argument, 0, 'b'},
                                    {"series", required_argument, 0, 's'}, {"points", required_argument, 0, 'n'},
-                                   {"seconds", required_argument, 0, 't'}, {0, 0, 0, 0}};
+                                   {"seconds", required_argument, 0, 't'}, {"compression", required_argument, 0, 'z'},
+                                   {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -297,13 +342,15 @@ int main(int argc, char **argv)
         case 's': nseries = (uint32_t)atoi(optarg); break;
         case 'n': points = strtoull(optarg, NULL, 10); break;
         case 't': seconds = atof(optarg); break;
+        case 'z': compression = atoi(optarg); break;
         default: return 2;
         }
     }
     if (optind < argc && strcmp(argv[optind], "connections") == 0 && conns >= 1)
         return connections();
     if (conns < 1 || conns > 256 || optind >= argc) {
-        fprintf(stderr, "usage: tsdbc-bench load FILE [--conns N] [--batch ROWS]\n"
+        fprintf(stderr, "usage: tsdbc-bench load FILE [--conns N] [--batch ROWS] [--compression LEVEL]\n"
+                        "       tsdbc-bench verify FILE | optimize\n"
                         "       tsdbc-bench query [--series N] [--points N] [--conns N] [--seconds S]\n"
                         "       tsdbc-bench connections --conns N [--seconds S]\n"
                         "       [--host H] [--port P]\n");
@@ -311,11 +358,15 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[optind], "load") == 0 && optind + 1 < argc)
         return load(argv[optind + 1]);
+    if (strcmp(argv[optind], "verify") == 0 && optind + 1 < argc)
+        return verify(argv[optind + 1]);
+    if (strcmp(argv[optind], "optimize") == 0)
+        return optimize();
     if (strcmp(argv[optind], "query") == 0) {
-        run_queries("raw, 3600 samples", 0, 3600, 0);
-        run_queries("agg, 86400 samples in buckets of 300", 1, 86400, 300);
-        run_queries("agg, 604800 samples in buckets of 3600", 1, 604800, 3600);
-        return 0;
+        int bad = 0;
+        for (int k = 0; k < CB_NCLASSES; k++)
+            bad |= run_queries(&cb_classes[k]);
+        return bad;
     }
     return 2;
 }

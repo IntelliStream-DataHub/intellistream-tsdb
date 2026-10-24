@@ -81,7 +81,7 @@ $(B)/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsd
 $(B)/tsdb: tools/tsdb-cli.c tools/common.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/tsdb-bench: tools/tsdb-bench.c tools/common.h tools/datasets.h $(LIB)
+$(B)/tsdb-bench: tools/tsdb-bench.c tools/common.h tools/datasets.h tools/cbench.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
@@ -198,7 +198,15 @@ test-java: $(B)/tsdbd
 
 test-clients: test-rust test-python test-java
 
-.PHONY: all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge
+# Commit rules as a git hook (no session links, DCO sign-off last); once per clone.
+hooks:
+	git config core.hooksPath .githooks
+
+# the client benchmark harness on a tiny data set (embedded and the C client); numbers are meaningless
+bench-clients-smoke: $(B)/tsdbd $(B)/tsdb-bench $(B)/tsdbc-bench
+	bench/clients/smoke.sh
+
+.PHONY: bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -220,7 +228,7 @@ $(B)/tsdb_pack.o: client/tsdb_pack.c client/tsdb_pack.h include/tsdb_protocol.h 
 $(CLIB): $(B)/tsdb_client.o $(B)/tsdb_pack.o $(B)/tsdb_calendar.o
 	$(AR) rcs $@ $^
 
-$(B)/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB)
+$(B)/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h tools/cbench.h $(CLIB)
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 $(B)/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal.h $(LIB)
@@ -274,3 +282,19 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 # URING=0 keeps Podman's stock seccomp profile, which blocks io_uring as production does: tsdbd then runs on epoll.
 test-almalinux10:
 	tests/distro/almalinux10.sh
+
+# The programs in examples/ are what the README's quick start builds and runs.
+$(B)/embedded-example: examples/embedded.c include/tsdb.h include/tsdb_calendar.h $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+$(B)/client-example: examples/client.c client/tsdb_client.h include/tsdb_calendar.h $(CLIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+
+all: $(B)/embedded-example $(B)/client-example
+
+# Runs the README's quick start, word for word, in a scratch directory.
+test: test-quickstart
+test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
+	B=$(B) tests/test_quickstart.sh
+
+.PHONY: test-quickstart

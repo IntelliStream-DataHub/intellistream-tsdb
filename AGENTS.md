@@ -19,6 +19,7 @@ make dist-test            # the tarball's own test suite, at every CPU level (TS
 make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
 make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere/SandyBridge if installed
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
+make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
 ```
 
 Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only; not with `NO_URING=1`).
@@ -68,6 +69,11 @@ cgroup, so `nice` does not keep your work out of its way.
   A protocol change has to reach all four; `make test-clients` runs their tests.
 - `connectors/pulsar/`: Apache Pulsar 5 IO sink (Java, a NAR) over the Java client; `mvn test` there needs
   build/tsdbd, `connectors/pulsar/test/integration.sh` runs Pulsar 5.0.0 in Podman with faults.
+- `.claude/`: shared Claude Code setup. `settings.json` runs `hooks/guard-bash.sh` (refuses `pkill -f`,
+  `killall`, `kill` with pid -1 or 0, `docker`) and `hooks/guard-push.sh` (refuses a push while unpushed
+  commits carry a session link); `skills/tsdb-tracks/` is how changes are built, reviewed, gated and merged
+  with subagents; `agents/iso-waiter.md` waits on detached runs. Personal settings go in the ignored
+  `.claude/settings.local.json`. `.githooks/commit-msg`: the commit rules for everyone (`make hooks`).
 - `tools/`: CLI and benchmarks. `tests/`: tests; `tests/jepsen/`: the
   fault-injection harness and the `crashfs` LD_PRELOAD power-loss simulator.
 
@@ -202,6 +208,13 @@ build/scale-bench export --from 0 --to 1250 | clickhouse client -q "INSERT INTO 
 ```
 
 ## Benchmark results
+
+These comparisons were measured before the changes of 2026-10-24 (compressed
+client inserts, fail-stop, the epoll backend, the portable build). The user
+decided to rerun the full comparison against the other databases, and the 100 B
+run against ClickHouse, only when a release is near; `bench/dbcmp/README.md`
+has the steps, Prometheus included. Internal benchmarks (flags, float32 vs
+float64, io_uring vs epoll, clients) are rerun whenever the machine is quiet.
 
 Machine: AMD Ryzen 9 7950X (16 cores / 32 threads, AVX-512), 64 GB RAM,
 WD SN720 NVMe (LUKS, ext4). ClickHouse 26.8.2.7.

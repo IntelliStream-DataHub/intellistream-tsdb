@@ -11,7 +11,10 @@
 //! many-series layout, keeping up to `--inflight` of them unacknowledged.
 //! `--compression 0` sends plain arrays; any other zstd level packs them
 //! (protocol version 3). Series `bench.<n>` are created first, outside the
-//! timing. Reports rows/s and the bytes written to the sockets per row.
+//! timing. Reports rows/s, the bytes written to the sockets per row and the CPU time of the process, in the
+//! format of tsdbc-bench (see examples/common/mod.rs).
+
+mod common;
 
 use std::time::Instant;
 
@@ -106,7 +109,7 @@ fn main() {
     let mut c = Client::connect(args.addr.as_str()).expect("connect");
     let ids: Vec<u32> = (0..=max).map(|i| c.series(&format!("bench.{i}")).expect("series")).collect();
 
-    let t0 = Instant::now();
+    let (t0, cpu0) = (Instant::now(), common::cpu_s());
     let sent: u64 = std::thread::scope(|sc| {
         let jobs: Vec<_> = (0..args.conns)
             .map(|k| {
@@ -117,15 +120,15 @@ fn main() {
             .collect();
         jobs.into_iter().map(|j| j.join().unwrap()).sum()
     });
-    let dt = t0.elapsed().as_secs_f64();
-    println!(
-        "rust insert: {n} rows in {dt:.2} s = {:.2} M rows/s, {:.2} bytes/row on the wire \
-         ({} connections, batches of {}, compression {}, {} in flight)",
-        n as f64 / dt / 1e6,
-        sent as f64 / n.max(1) as f64,
+    let (dt, cpu) = (t0.elapsed().as_secs_f64(), common::cpu_s() - cpu0);
+    common::report_load(
+        "rust",
         args.conns,
-        args.batch,
         args.compression,
-        args.inflight
+        n as u64,
+        dt,
+        sent,
+        cpu,
+        &format!(", batches of {}, {} in flight", args.batch, args.inflight),
     );
 }
