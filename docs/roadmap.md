@@ -20,8 +20,8 @@ series store underneath; tsdb does not duplicate it.
 ## Done
 
 - Delete or replace a time range of one series: atomic replace (delete plus
-  insert), in the library, tsdbd (protocol 7), the C client and the CLI. The
-  Rust, Python and Java clients still need the four operations.
+  insert), in the library, tsdbd (protocol 7), the C, Rust, Python and Java
+  clients and the CLI.
 - Retention per series: values older than the series' limit disappear from
   queries at once and are removed by merges.
 

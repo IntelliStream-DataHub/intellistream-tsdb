@@ -218,6 +218,21 @@ boolean missing = read.values().isNull(2); // true
 
 Aggregates skip nulls. `TypedExample.java` in the example folder shows all of this, with state names too.
 
+## Delete, replace and retention
+
+```java
+client.deleteRange(energy, t0, t0 + 3_600_000);   // one hour, its end excluded; Long.MIN_VALUE/MAX_VALUE: open
+client.replaceRange(energy, t0, t0 + 2000, new long[] {t0}, Column.ofLongs(7));
+client.setRetention(energy, 30 * 86_400_000L);    // keep 30 days; 0 keeps everything
+long limit = client.retention(energy);
+```
+
+A delete returns once it is durable; queries stop seeing the rows at once.
+A replace is atomic: readers see the old rows or the new ones, never a mix.
+Rows older than a series' retention limit disappear from queries at once and
+from disk as merges get to them. These need a server of protocol version 7; an
+older one gets no request and the call fails with `Status.ERR_INVALID`.
+
 ## Compression
 
 Inserts are compressed with zstd, level 1, by default. A row then takes a few bytes on the network instead of
