@@ -328,33 +328,72 @@ fn chunks_are_borrowed_with_their_bitmap() {
     let nulls = [0, 5, 8191, 8192, 30_000, n - 1];
     let valid: Bitmap = (0..n).map(|i| !nulls.contains(&i)).collect();
     db.insert_series_values(id, &ts, ColumnRef::from(&v).with_validity(&valid)).unwrap();
-    let (mut rows, mut null_rows, mut with_bitmap) = (0, Vec::new(), 0);
-    db.query_chunks(id, .., QueryOpts::asc(), |t, chunk| {
-        assert_eq!(t.len(), chunk.len());
-        let RawValues::Int64(vals) = chunk.values else { panic!("{:?}", chunk.value_type()) };
-        for (i, &x) in vals.iter().enumerate() {
-            if chunk.is_null(i) {
-                null_rows.push(rows + i);
-            } else {
-                assert_eq!(x, (rows + i) as i64);
+    // from the memtable the rows come as one chunk; after the flush as several, so the bitmap is
+    // cut into pieces whose boundaries fall next to the nulls at 8191 and 8192
+    let chunks = |db: &Db| {
+        let (mut rows, mut null_rows, mut with_bitmap, mut chunks) = (0, Vec::new(), 0, 0);
+        db.query_chunks(id, .., QueryOpts::asc(), |t, chunk| {
+            assert_eq!(t.len(), chunk.len());
+            let RawValues::Int64(vals) = chunk.values else { panic!("{:?}", chunk.value_type()) };
+            for (i, &x) in vals.iter().enumerate() {
+                if chunk.is_null(i) {
+                    null_rows.push(rows + i);
+                } else {
+                    assert_eq!(x, (rows + i) as i64);
+                }
             }
-        }
-        with_bitmap += chunk.has_nulls() as usize;
-        assert_eq!(chunk.to_column().len(), chunk.len());
-        rows += chunk.len();
-        ControlFlow::Continue(())
-    })
-    .unwrap();
-    assert_eq!(rows, n);
-    assert_eq!(null_rows, nulls);
-    assert!(with_bitmap >= 1);
-    // the collected form carries the same bitmap
-    let all = db.query_rows(id, .., QueryOpts::asc()).unwrap();
-    assert_eq!(all.values.valid.as_ref(), Some(&valid));
+            with_bitmap += chunk.has_nulls() as usize;
+            assert_eq!(chunk.to_column().len(), chunk.len());
+            rows += chunk.len();
+            chunks += 1;
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(rows, n);
+        assert_eq!(null_rows, nulls);
+        assert!(with_bitmap >= 1);
+        // the collected form stitches the chunks' bitmaps together
+        let all = db.query_rows(id, .., QueryOpts::asc()).unwrap();
+        assert_eq!(all.values.valid.as_ref(), Some(&valid));
+        chunks
+    };
+    assert_eq!(chunks(&db), 1);
+    db.flush().unwrap();
+    assert!(chunks(&db) > 2);
     // an empty answer still has the series' type
     let none = db.query_rows(id, 0..1, QueryOpts::asc()).unwrap();
     assert_eq!((none.len(), none.value_type()), (0, ValueType::Int64));
     done(db);
+}
+
+#[test]
+fn parts_and_query_stats_belong_to_their_db() {
+    let (a, b) = (open(), open());
+    let id = a.series("x").unwrap();
+    a.insert_series(id, &[T0, T0 + 1000], &[1.0, 2.0]).unwrap();
+    a.flush().unwrap();
+    a.insert_series(id, &[T0 + 2000], &[3.0]).unwrap();
+    a.flush().unwrap();
+    let mut parts = a.parts().unwrap();
+    parts.sort_by_key(|p| p.min_ts);
+    let span: Vec<_> = parts.iter().map(|p| (p.rows, p.min_ts, p.max_ts, p.level)).collect();
+    assert_eq!(span, [(2, T0, T0 + 1000, 0), (1, T0 + 2000, T0 + 2000, 0)]);
+    assert!(parts.iter().all(|p| p.bytes > 0 && p.granules == 1 && !p.name.is_empty() && p.partition <= T0));
+    a.optimize().unwrap();
+    let merged = a.parts().unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!((merged[0].rows, merged[0].min_ts, merged[0].max_ts), (3, T0, T0 + 2000));
+    assert!(merged[0].level >= 1, "{merged:?}");
+
+    // a query on another Db in the same thread leaves a's statistics alone
+    assert_eq!(a.last_query_stats().result_rows, 0);
+    assert_eq!(a.query_points(id, .., QueryOpts::asc()).unwrap().len(), 3);
+    let other = b.series("y").unwrap();
+    assert_eq!(b.query_points(other, .., QueryOpts::asc()).unwrap().len(), 0);
+    assert_eq!(a.last_query_stats().result_rows, 3);
+    assert_eq!(b.last_query_stats().result_rows, 0);
+    done(a);
+    done(b);
 }
 
 #[test]

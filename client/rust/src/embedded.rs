@@ -23,6 +23,7 @@ use std::ops::{ControlFlow, RangeBounds};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
+use std::sync::Mutex;
 
 use tsdb_sys as sys;
 
@@ -304,6 +305,10 @@ impl<'a> ChunkRef<'a> {
 pub struct Db {
     db: NonNull<sys::tsdb>,
     path: PathBuf,
+    /// The engine keeps the last query's statistics per thread, for whatever handle ran it; kept
+    /// here after each query they belong to this Db, as they belong to a connection in the
+    /// TCP client.
+    last: Mutex<sys::tsdb_query_stats>,
 }
 
 // The engine is thread safe for one handle (tsdb.h), and the handle is not tied to a thread.
@@ -496,7 +501,7 @@ impl Db {
         let mut db = ptr::null_mut();
         check(unsafe { sys::tsdb_open(c.as_ptr(), &opts.to_c(), &mut db) })?;
         let db = NonNull::new(db).ok_or(Error::Server(Status::Io))?;
-        Ok(Db { db, path })
+        Ok(Db { db, path, last: Mutex::default() })
     }
 
     /// Closes the database: commits, flushes the memtable and waits for the background work.
@@ -703,6 +708,7 @@ impl Db {
         let rc = unsafe {
             sys::tsdb_query_raw_ex(self.p(), series, start, end, &o, Some(raw_fn::<F>), (&raw mut call).cast())
         };
+        self.record();
         call.finish(rc)
     }
 
@@ -762,6 +768,7 @@ impl Db {
         let rc = unsafe {
             sys::tsdb_query_values(self.p(), series, start, end, &o, Some(values_fn::<F>), (&raw mut call).cast())
         };
+        self.record();
         call.finish(rc)
     }
 
@@ -769,7 +776,9 @@ impl Db {
     /// 0 gives one bucket. Only non-empty buckets, oldest first.
     pub fn query_agg(&self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
-        buckets(|out, n| unsafe { sys::tsdb_query_agg(self.p(), series, start, end, interval_ms, out, n) })
+        let r = buckets(|out, n| unsafe { sys::tsdb_query_agg(self.p(), series, start, end, interval_ms, out, n) });
+        self.record();
+        r
     }
 
     /// Aggregates `series` over `range` in calendar buckets: `group` units, in its time zone
@@ -809,13 +818,15 @@ impl Db {
         let Some(o) = c_opts(opts) else {
             return Ok(Vec::new());
         };
-        buckets(|out, n| unsafe {
+        let r = buckets(|out, n| unsafe {
             if local {
                 sys::tsdb_query_group_local(self.p(), series, start, end, gp, &o, out, n)
             } else {
                 sys::tsdb_query_group_ex(self.p(), series, start, end, gp, &o, out, n)
             }
-        })
+        });
+        self.record();
+        r
     }
 
     /// Aggregates `series` over `range` into buckets that begin at `bounds` (UTC ms, strictly
@@ -840,9 +851,11 @@ impl Db {
             return Err(Error::InvalidArgument(format!("bucket bounds do not increase at index {}", i + 1)));
         }
         let Some(o) = c_opts(opts) else { return Ok(Vec::new()) };
-        buckets(|out, n| unsafe {
+        let r = buckets(|out, n| unsafe {
             sys::tsdb_query_bounds(self.p(), series, start, end, bounds.as_ptr(), bounds.len(), &o, out, n)
-        })
+        });
+        self.record();
+        r
     }
 
     // ------------------------------------------------------------- maintenance
@@ -888,11 +901,17 @@ impl Db {
         })
     }
 
-    /// What the calling thread's last query did (rows covered, decoded, bytes read, time).
-    /// Per thread: a query on another thread does not change it.
-    pub fn last_query_stats(&self) -> QueryStats {
+    /// Takes the statistics of the query this thread just ran on this Db from the engine.
+    fn record(&self) {
         let mut s = sys::tsdb_query_stats::default();
         unsafe { sys::tsdb_last_query_stats(&mut s) };
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = s;
+    }
+
+    /// What the last query on this Db did (rows covered, decoded, bytes read, time), all zero
+    /// before the first. When several threads query one Db, the one that finished last.
+    pub fn last_query_stats(&self) -> QueryStats {
+        let s = *self.last.lock().unwrap_or_else(|e| e.into_inner());
         QueryStats {
             elapsed_s: s.elapsed_s,
             rows: s.rows,

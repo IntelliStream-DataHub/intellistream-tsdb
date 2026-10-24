@@ -241,13 +241,15 @@ fn load(a: &Args, path: &str) -> bool {
 fn querier(db: &Db, a: &Args, k: &Class, thread: usize) -> (u64, u64, f64) {
     let mut r = common::seed(thread);
     let (mut queries, mut rows) = (0u64, 0u64);
+    let mut touch = 0.0f64;
     let t0 = Instant::now();
     while t0.elapsed().as_secs_f64() < a.seconds {
         for _ in 0..16 {
             let (s, start, end) = common::window(&mut r, a.series, a.points, k.window);
             if !k.agg {
-                db.query_raw(s, start..end, QueryOpts::default(), |ts, _| {
+                db.query_raw(s, start..end, QueryOpts::default(), |ts, v| {
                     rows += ts.len() as u64;
+                    touch += v.last().map_or(0.0, |&x| f64::from(x)); // touch the data, as tsdb-bench does
                     ControlFlow::Continue(())
                 })
                 .expect("query");
@@ -258,6 +260,7 @@ fn querier(db: &Db, a: &Args, k: &Class, thread: usize) -> (u64, u64, f64) {
             queries += 1;
         }
     }
+    std::hint::black_box(touch);
     (queries, rows, t0.elapsed().as_secs_f64())
 }
 
