@@ -80,9 +80,11 @@ header | ts block, value block, ts block, value block, ... | granule index | foo
 A granule is up to 8192 rows of one series. Its 80-byte index entry holds
 the series, min/max timestamp, row count, null count, the sum, min and max of
 the known values (doubles for floats; exact for integers: int64 min/max and a
-128-bit sum), block offsets and a checksum. Format version 1 parts (64-byte
-entries, float32 statistics) are still read; their index is converted when
-they are opened. The index is the sparse primary index of MergeTree: finding a series'
+128-bit sum), block offsets and a checksum of the granule's blocks. The
+header, the index and the footer (WAL segment, row count, time range) are
+covered by one more checksum, checked when the part is opened. The on-disk
+format is version 3; a database of another version is refused at open
+(there is no release yet, so no older format is read). The index is the sparse primary index of MergeTree: finding a series'
 rows in a time range is a binary search, and aggregates over whole granules
 are answered from the stored statistics without decompressing anything.
 
@@ -92,8 +94,11 @@ block ranges are merged, so "newest part wins" stays well defined. A merge
 copies granules that need no re-encoding as compressed bytes.
 
 Writes are published atomically (`tmp_*.part`, fsync, rename, fsync dir).
-On open, leftovers of interrupted writes are removed, parts covered by a
-merged part are deleted, and broken parts are renamed to `*.broken`.
+An insert that makes several parts (one per partition) commits through an
+intent file listing the renames, with a count and a checksum: at open a torn
+intent, or one whose parts are not all there, rolls the insert back whole;
+a complete one is rolled forward. On open, leftovers of interrupted writes are
+removed and parts covered by a merged part are deleted.
 
 ### Write paths
 
@@ -121,8 +126,8 @@ dictionaries, CATALOG), the engine is marked failed: the writers whose rows
 went through the failed call get `TSDB_ERR_IO`, no later write is acknowledged,
 no new file is named (a merge that finishes afterwards deletes its output),
 and `tsdb_failed` says what failed. tsdbd exits with status 1, and a restart
-recovers from what is on disk; replay stops at a torn WAL record, and nothing
-was written after it. Errors on files nothing relies on yet (a new part before
+recovers from what is on disk; replay stops at a torn WAL record at the end
+of the segment, and nothing was written after it. Errors on files nothing relies on yet (a new part before
 it is committed, a merge output before it is named) fail only that insert,
 flush or merge; a failed flush keeps its memtable and retries it first. The
 directory fsync after naming a merged part is fail-stop, because the sources
@@ -137,6 +142,40 @@ means restarts that serve reads in between, until space is freed. The failure
 message goes to stderr once, possibly while the caller holds engine locks;
 it is one short line per engine lifetime. With several volumes,
 a failure stops only the volume it happened in (the root volume for CATALOG).
+
+### Damage on disk
+
+A crash can tear what was being appended; storage can also return damaged
+bytes or fail a read. tsdb tells the two apart where it can and never turns
+damage into silently missing or shifted data:
+
+- **WAL records** carry a checksum of their head (seeded with the segment and
+  offset) and one of their rows. A bad record at the end of a segment is a
+  torn tail and is cut. A bad record followed by a valid one is damage to
+  acknowledged rows: it is logged and the open fails with `TSDB_ERR_CORRUPT`,
+  leaving the segment in place (removing it accepts the loss). An I/O error
+  while reading a segment fails the open; it is never taken for its end.
+- **SERIES and STATES** records carry a checksum seeded with their offset, so
+  a run of zeros or a shifted record is never read as a name. A torn tail is
+  cut; damage before a valid record fails the open.
+- **CATALOG** records (16 bytes) and **VOLUMES** lines carry a checksum that
+  includes their position. A torn tail is cut; damage before a valid record,
+  or a record naming a series its volume does not have, fails the open.
+- **Parts**: a part whose header, index or footer fails its checksum fails
+  the open with `TSDB_ERR_CORRUPT` and a log line naming it; renaming it to
+  `*.broken` accepts the loss of its rows. Dropping it silently would answer
+  queries without its rows. A follower keeps its previous view, counts the
+  error in `tsdb_stats.follow_errors` / `broken_parts` and logs it once.
+- **Granules**: with `verify_checksums` (`tsdbd --verify-checksums`) queries
+  check each granule's checksum before decoding it and return
+  `TSDB_ERR_CORRUPT` on a mismatch. It is off by default: production storage
+  (ZFS, ECC memory) has checksums of its own, and hashing every granule read
+  costs query time. Merges always check, so damage is never rewritten under a
+  fresh checksum.
+- **Followers** reading over NFS may see appends out of order: a bad WAL
+  record or MANIFEST is tolerated for a while (2 s or 20 refresh intervals,
+  whichever is longer) and then reported as `TSDB_ERR_CORRUPT`, once; an
+  I/O error is reported at once.
 
 ### Compression
 
