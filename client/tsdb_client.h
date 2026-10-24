@@ -34,6 +34,10 @@ int tsdbc_series(tsdbc *c, const char *name, int create, uint32_t *id);
 int tsdbc_series_at(tsdbc *c, const char *name, const char *path, uint32_t *id);
 int tsdbc_series_name(tsdbc *c, uint32_t id, char *buf, size_t len);
 
+/* Inserts travel packed and zstd compressed (level 1 by default) when the
+ * server speaks protocol version 3; 0 sends plain arrays, which costs 16 bytes
+ * a row on the wire instead of a few, but no CPU. Negative levels are faster. */
+int tsdbc_set_compression(tsdbc *c, int level);
 /* Bounds every wait for the server (send or receive) to ms milliseconds; 0, the
  * default, waits forever. A call that times out returns TSDB_ERR_IO and the
  * connection is of no further use: close it. */

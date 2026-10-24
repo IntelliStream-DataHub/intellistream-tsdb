@@ -51,7 +51,11 @@
  *               -> chunks: u8 last, u8 type, u8 flags, u8 0, u32 n, i64 ts[n], values[n],
  *                  [u8 valid[(n + 7) / 8] when flags & TSDB_VALID]
  *               (the u16 and u32 after flags, and flag bits other than
- *               TSDB_VALID, are reserved: they must be zero)
+ *               TSDB_VALID and TSDB_PACKED, are reserved: they must be zero)
+ *               Version 3: with flags & TSDB_PACKED the arrays after the header
+ *               are replaced by u32 raw_len and a zstd frame of their packed
+ *               form (client/tsdb_pack.h): delta varints, byte planes. A
+ *               client sends it only to a server whose HELLO says 3 or more.
  *   STATE       u32 series, u8 create, u16 len, name  -> u32 code
  *               (the series only picks the volume, whose dictionary it is)
  *   STATE_NAME  u32 series, u32 code           -> u16 len, name
@@ -67,7 +71,7 @@
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
-#define TSDB_PROTOCOL_VERSION 2
+#define TSDB_PROTOCOL_VERSION 3
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
@@ -100,7 +104,8 @@ enum {
 #define TSDB_BUCKET_ROW 64 /* bytes per bucket in a QUERY_BUCKETS reply */
 #define TSDB_VALUES_HEADER 16
 #define TSDB_STATS_REPLY 88 /* bytes in a LAST_STATS reply after the status */
-#define TSDB_VALID 1 /* flags: a validity bitmap follows the values */
+#define TSDB_VALID 1  /* flags: a validity bitmap follows the values */
+#define TSDB_PACKED 2 /* flags: the arrays are packed and zstd compressed (version 3) */
 
 /* bytes per value on the wire: bool is one byte */
 static inline unsigned tsdb_wire_width(unsigned type) { return type == 3 ? 1 : type == 1 || type == 2 ? 8 : 4; }

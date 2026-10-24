@@ -1,6 +1,7 @@
 /* Client for tsdbd: blocking sockets, columnar frames, optional pipelining. */
 #define _GNU_SOURCE
 #include "tsdb_client.h"
+#include "tsdb_pack.h"
 #include "tsdb_protocol.h"
 
 #include <errno.h>
@@ -14,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <zstd.h>
 
 #define INSERT_FRAME_ROWS (8u << 20) /* 128 MiB frames at most */
 #define RBUF (1u << 20)
@@ -27,6 +29,12 @@ struct tsdbc {
     size_t rlen, roff, rcap;
     uint8_t *frame;  /* the body of the last frame read */
     size_t fcap;
+    /* packed inserts (protocol version 3) */
+    int zlevel;      /* zstd level; 0: send plain arrays */
+    uint32_t server_version; /* from HELLO; 0 until asked */
+    ZSTD_CCtx *zc;
+    uint8_t *raw, *zbuf;
+    size_t raw_cap, zbuf_cap;
 };
 
 int tsdbc_connect(const char *host, int port, tsdbc **out)
@@ -59,6 +67,7 @@ int tsdbc_connect(const char *host, int port, tsdbc **out)
     }
     c->fd = fd;
     c->rcap = RBUF;
+    c->zlevel = 1;
     *out = c;
     return 0;
 }
@@ -91,6 +100,9 @@ void tsdbc_close(tsdbc *c)
     close(c->fd);
     free(c->rbuf);
     free(c->frame);
+    ZSTD_freeCCtx(c->zc);
+    free(c->raw);
+    free(c->zbuf);
     free(c);
 }
 
@@ -303,9 +315,17 @@ int tsdbc_series_name(tsdbc *c, uint32_t id, char *buf, size_t len)
     return 0;
 }
 
+static int insert_values_frames(tsdbc *c, const uint32_t *series, uint32_t s, const int64_t *ts,
+                                const tsdb_values *v, size_t n, bool wait);
+static bool packing(tsdbc *c);
+
 static int insert_frames(tsdbc *c, const uint32_t *series, uint32_t s, const int64_t *ts, const float *v, size_t n,
                          bool wait)
 {
+    if (n && packing(c)) { /* float32 too: the packed form is the smaller one */
+        tsdb_values col = {TSDB_FLOAT32, v, NULL};
+        return insert_values_frames(c, series, s, ts, &col, n, wait);
+    }
     int rc = 0;
     for (size_t off = 0; off < n || (n == 0 && off == 0); off += INSERT_FRAME_ROWS) {
         uint32_t m = (uint32_t)(n - off < INSERT_FRAME_ROWS ? n - off : INSERT_FRAME_ROWS);
@@ -555,6 +575,79 @@ int tsdbc_series_type(tsdbc *c, uint32_t id, tsdb_type *type)
     return 0;
 }
 
+int tsdbc_set_timeout(tsdbc *c, int ms)
+{
+    if (ms < 0)
+        return TSDB_ERR_INVALID;
+    struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
+    if (setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0 ||
+        setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0)
+        return TSDB_ERR_IO;
+    return 0;
+}
+
+int tsdbc_set_compression(tsdbc *c, int level)
+{
+    if (level > ZSTD_maxCLevel() || level < ZSTD_minCLevel())
+        return TSDB_ERR_INVALID;
+    c->zlevel = level;
+    return 0;
+}
+
+/* Whether inserts go packed: compression on, and a server that reads them. */
+static bool packing(tsdbc *c)
+{
+    if (!c->zlevel)
+        return false;
+    if (!c->server_version) {
+        uint32_t mine = TSDB_PROTOCOL_VERSION, theirs = 1;
+        const uint8_t *b;
+        size_t n;
+        if (call(c, TSDB_OP_HELLO, &mine, 4, NULL, 0, &b, &n) == 0 && n == 4)
+            memcpy(&theirs, b, 4);
+        c->server_version = theirs;
+    }
+    return c->server_version >= 3;
+}
+
+/* One packed frame: reshape, zstd, send (the buffers are free again on return). */
+static int send_packed(tsdbc *c, const uint32_t *series, uint32_t s, const int64_t *ts, const tsdb_values *v,
+                       size_t off, uint32_t m)
+{
+    unsigned aw = tsdb_wire_width(v->type);
+    size_t bound = tsdb_pack_raw_bound(m, v->type, v->valid != NULL, series != NULL);
+    if (bound > c->raw_cap) {
+        free(c->raw);
+        c->raw = malloc(bound);
+        c->raw_cap = c->raw ? bound : 0;
+    }
+    size_t zb = ZSTD_compressBound(bound);
+    if (zb > c->zbuf_cap) {
+        free(c->zbuf);
+        c->zbuf = malloc(zb);
+        c->zbuf_cap = c->zbuf ? zb : 0;
+    }
+    if (!c->zc)
+        c->zc = ZSTD_createCCtx();
+    if (!c->raw_cap || !c->zbuf_cap || !c->zc)
+        return TSDB_ERR_NOMEM;
+    /* a frame starts at a multiple of 8 rows, so its bitmap slice starts on a byte */
+    size_t raw = tsdb_pack_reshape(m, v->type, ts + off, (const uint8_t *)v->values + off * aw,
+                                   v->valid ? v->valid + off / 8 : NULL, series ? series + off : NULL, c->raw);
+    size_t z = ZSTD_compressCCtx(c->zc, c->zbuf, c->zbuf_cap, c->raw, raw, c->zlevel);
+    if (ZSTD_isError(z))
+        return TSDB_ERR_NOMEM;
+    uint8_t h[TSDB_VALUES_HEADER + 4] = {0};
+    uint32_t sid = series ? TSDB_MANY_SERIES : s, rl = (uint32_t)raw;
+    memcpy(h, &m, 4);
+    memcpy(h + 4, &sid, 4);
+    h[8] = (uint8_t)v->type;
+    h[9] = (uint8_t)(TSDB_PACKED | (v->valid ? TSDB_VALID : 0));
+    memcpy(h + TSDB_VALUES_HEADER, &rl, 4);
+    struct iovec parts[3] = {{0}, {h, sizeof h}, {c->zbuf, z}};
+    return send_reqv(c, TSDB_OP_INSERT_VALUES, parts, 3);
+}
+
 static int insert_values_frames(tsdbc *c, const uint32_t *series, uint32_t s, const int64_t *ts,
                                 const tsdb_values *v, size_t n, bool wait)
 {
@@ -562,6 +655,15 @@ static int insert_values_frames(tsdbc *c, const uint32_t *series, uint32_t s, co
         return TSDB_ERR_INVALID;
     unsigned aw = tsdb_wire_width(v->type);
     int rc = 0;
+    if (n && packing(c)) {
+        for (size_t off = 0; off < n; off += INSERT_FRAME_ROWS) {
+            uint32_t m = (uint32_t)(n - off < INSERT_FRAME_ROWS ? n - off : INSERT_FRAME_ROWS);
+            if ((rc = send_packed(c, series, s, ts, v, off, m)) != 0)
+                return rc;
+            c->pending++;
+        }
+        return wait ? tsdbc_wait(c) : 0;
+    }
     static const uint8_t pad[3];
     for (size_t off = 0; off < n || (n == 0 && off == 0); off += INSERT_FRAME_ROWS) {
         uint32_t m = (uint32_t)(n - off < INSERT_FRAME_ROWS ? n - off : INSERT_FRAME_ROWS);
@@ -746,17 +848,6 @@ int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st)
     st->granules = v[7];
     st->granules_from_stats = v[8];
     st->result_rows = v[9];
-    return 0;
-}
-
-int tsdbc_set_timeout(tsdbc *c, int ms)
-{
-    if (ms < 0)
-        return TSDB_ERR_INVALID;
-    struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
-    if (setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0 ||
-        setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0)
-        return TSDB_ERR_IO;
     return 0;
 }
 

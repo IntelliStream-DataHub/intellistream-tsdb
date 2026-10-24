@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "tsdb.h"
 #include "tsdb_client.h"
+#include "tsdb_pack.h"
 #include "tsdb_protocol.h"
 
 #include <arpa/inet.h>
@@ -11,6 +12,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <zstd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -427,6 +429,111 @@ static void *client_thread(void *arg)
     return NULL;
 }
 
+/* The packed insert body round trips for every type and layout, and anything
+ * that does not hold exactly n rows is refused. */
+static void test_pack_roundtrip(void)
+{
+    static const size_t sizes[] = {0, 1, 7, 8, 9, 1000, 65537};
+    uint64_t r = 0x9e3779b97f4a7c15ull;
+    for (unsigned type = TSDB_FLOAT32; type <= TSDB_STATE; type++)
+        for (size_t si = 0; si < sizeof sizes / sizeof *sizes; si++)
+            for (int flags = 0; flags < 4; flags++) {
+                size_t n = sizes[si];
+                int valid = flags & 1, many = flags & 2;
+                unsigned w = tsdb_wire_width(type);
+                int64_t *ts = malloc((n + 1) * 8), *ts2 = malloc((n + 1) * 8);
+                uint8_t *v = malloc(n * w + 1), *v2 = malloc(n * w + 1);
+                uint8_t *bits = calloc(n / 8 + 1, 1), *bits2 = calloc(n / 8 + 1, 1);
+                uint32_t *sv = malloc((n + 1) * 4), *sv2 = malloc((n + 1) * 4);
+                for (size_t i = 0; i < n; i++) {
+                    r = r * 6364136223846793005ull + 1442695040888963407ull;
+                    /* regular clocks, jumps, and the extremes (deltas wrap) */
+                    ts[i] = i % 97 == 0 ? (int64_t)r : i % 89 == 0 ? INT64_MIN : T0 + (int64_t)i * 1000;
+                    for (unsigned b = 0; b < w; b++)
+                        v[i * w + b] = (uint8_t)(r >> (8 * b));
+                    if (type == TSDB_BOOL)
+                        v[i] &= 1;
+                    sv[i] = i % 5 == 0 ? UINT32_MAX - (uint32_t)i : (uint32_t)(r >> 40);
+                    if (valid && (r >> 13) & 1)
+                        bits[i / 8] |= (uint8_t)(1u << (i % 8));
+                }
+                uint8_t *raw = malloc(tsdb_pack_raw_bound(n, type, valid, many) + 1);
+                size_t len = tsdb_pack_reshape(n, type, ts, v, valid ? bits : NULL, many ? sv : NULL, raw);
+                CHECK(len <= tsdb_pack_raw_bound(n, type, valid, many));
+                int rc = tsdb_pack_unshape(raw, len, n, type, valid, many, ts2, v2, bits2, sv2);
+                bool same = rc == 0 && (!n || (memcmp(ts, ts2, n * 8) == 0 && memcmp(v, v2, n * w) == 0)) &&
+                            (!valid || memcmp(bits, bits2, (n + 7) / 8) == 0) && (!many || !n || memcmp(sv, sv2, n * 4) == 0);
+                if (!same)
+                    fprintf(stderr, "  pack round trip failed: type %u, n %zu, valid %d, many %d\n", type, n, valid, many);
+                CHECK(same);
+                if (len) { /* one byte short, or one byte too many */
+                    CHECK(tsdb_pack_unshape(raw, len - 1, n, type, valid, many, ts2, v2, bits2, sv2) != 0);
+                    raw[len] = 0;
+                    CHECK(tsdb_pack_unshape(raw, len + 1, n, type, valid, many, ts2, v2, bits2, sv2) != 0);
+                }
+                free(ts), free(ts2), free(v), free(v2), free(bits), free(bits2), free(sv), free(sv2), free(raw);
+            }
+}
+
+/* Inserts arrive packed (the default) or plain, with the same result; a
+ * packed frame that does not decode is refused and the server carries on. */
+static void test_packed_inserts(tsdbc *c)
+{
+    uint32_t a, b;
+    OK(tsdbc_series_create(c, "pk.on", TSDB_FLOAT64, NULL, &a));
+    OK(tsdbc_series_create(c, "pk.off", TSDB_FLOAT64, NULL, &b));
+    enum { N = 100000 };
+    int64_t *ts = malloc(N * 8);
+    double *v = malloc(N * 8);
+    for (int i = 0; i < N; i++) {
+        ts[i] = T0 + i * 1000;
+        v[i] = 20 + (i % 100) / 10.0;
+    }
+    tsdb_values col = {TSDB_FLOAT64, v, NULL};
+    OK(tsdbc_insert_series_values(c, a, ts, &col, N));
+    OK(tsdbc_set_compression(c, 0));
+    OK(tsdbc_insert_series_values(c, b, ts, &col, N));
+    OK(tsdbc_set_compression(c, 1));
+    tsdb_bucket *ba, *bb;
+    size_t na, nb;
+    OK(tsdbc_query_agg(c, a, INT64_MIN, INT64_MAX, 0, &ba, &na));
+    OK(tsdbc_query_agg(c, b, INT64_MIN, INT64_MAX, 0, &bb, &nb));
+    CHECK(na == 1 && nb == 1 && ba[0].count == N && bb[0].count == N && ba[0].sum == bb[0].sum);
+    free(ba);
+    free(bb);
+    CHECK(tsdbc_set_compression(c, 1000) == TSDB_ERR_INVALID);
+
+    /* a packed frame whose zstd frame is damaged, and one that claims more rows */
+    int fd = raw_connect();
+    for (int bad = 0; bad < 2; bad++) {
+        uint8_t raw[64], z[128], f[TSDB_VALUES_HEADER + 4 + 128] = {0};
+        int64_t t1 = T0;
+        double x = 1;
+        size_t rl = tsdb_pack_reshape(1, TSDB_FLOAT64, &t1, &x, NULL, NULL, raw);
+        size_t zl = ZSTD_compress(z, sizeof z, raw, rl, 1);
+        uint32_t n = bad ? 2 : 1, rl32 = (uint32_t)rl;
+        memcpy(f, &n, 4);
+        memcpy(f + 4, &a, 4);
+        f[8] = TSDB_FLOAT64;
+        f[9] = TSDB_PACKED;
+        memcpy(f + TSDB_VALUES_HEADER, &rl32, 4);
+        memcpy(f + TSDB_VALUES_HEADER + 4, z, zl);
+        if (!bad)
+            f[TSDB_VALUES_HEADER + 4 + zl / 2] ^= 0xff;
+        raw_send(fd, 60 + (uint32_t)bad, TSDB_OP_INSERT_VALUES, f, (uint32_t)(TSDB_VALUES_HEADER + 4 + zl));
+        uint32_t rid;
+        uint8_t rest[64];
+        size_t nrest;
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID && rid == 60 + (uint32_t)bad);
+    }
+    close(fd);
+    OK(tsdbc_query_agg(c, a, INT64_MIN, INT64_MAX, 0, &ba, &na));
+    CHECK(na == 1 && ba[0].count == N); /* nothing of them got in */
+    free(ba);
+    free(ts);
+    free(v);
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -574,6 +681,8 @@ int main(int argc, char **argv)
     test_close(c);
     test_framing();
     test_types(c);
+    test_pack_roundtrip();
+    test_packed_inserts(c);
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);

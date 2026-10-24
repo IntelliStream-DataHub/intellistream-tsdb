@@ -36,11 +36,13 @@
 #define _GNU_SOURCE
 #include "tsdb.h"
 #include "tsdb_protocol.h"
+#include "../client/tsdb_pack.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
 #include <liburing.h>
+#include <zstd.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -355,6 +357,43 @@ static int values_cb(void *ctx, const int64_t *ts, const tsdb_values *col, size_
     return 0;
 }
 
+/* A packed INSERT_VALUES: unzstd, unshape into plain arrays, insert. */
+static int insert_packed(const uint8_t *p, size_t len, uint32_t n, uint32_t s)
+{
+    unsigned type = p[8];
+    bool valid = p[9] & TSDB_VALID, many = s == TSDB_MANY_SERIES;
+    uint32_t raw_len;
+    if (len < TSDB_VALUES_HEADER + 4)
+        return TSDB_ERR_INVALID;
+    memcpy(&raw_len, p + TSDB_VALUES_HEADER, 4);
+    const uint8_t *z = p + TSDB_VALUES_HEADER + 4;
+    size_t zlen = len - TSDB_VALUES_HEADER - 4;
+    if (raw_len > tsdb_pack_raw_bound(n, type, valid, many) || ZSTD_getFrameContentSize(z, zlen) != raw_len)
+        return TSDB_ERR_INVALID;
+    unsigned w = tsdb_wire_width(type);
+    uint8_t *raw = malloc(raw_len ? raw_len : 1);
+    int64_t *ts = malloc((size_t)n * 8 + 8);
+    uint8_t *vals = malloc((size_t)n * w + (size_t)n / 8 + 9); /* values, then the bitmap */
+    uint32_t *series = many ? malloc((size_t)n * 4 + 4) : NULL;
+    int rc = !raw || !ts || !vals || (many && !series) ? TSDB_ERR_NOMEM : 0;
+    if (rc == 0) {
+        size_t got = ZSTD_decompress(raw, raw_len, z, zlen);
+        uint8_t *bits = vals + (size_t)n * w;
+        if (ZSTD_isError(got) || got != raw_len ||
+            tsdb_pack_unshape(raw, raw_len, n, type, valid, many, ts, vals, bits, series) != 0) {
+            rc = TSDB_ERR_INVALID;
+        } else {
+            tsdb_values col = {(tsdb_type)type, vals, valid ? bits : NULL};
+            rc = many ? tsdb_insert_values(db, series, ts, &col, n) : tsdb_insert_series_values(db, s, ts, &col, n);
+        }
+    }
+    free(raw);
+    free(ts);
+    free(vals);
+    free(series);
+    return rc;
+}
+
 static void reply_buckets(conn *c, uint32_t id, const tsdb_bucket *b, size_t nb)
 {
     uint8_t *rows = malloc(nb * TSDB_BUCKET_ROW + 1);
@@ -593,13 +632,18 @@ static void handle(req *r)
         uint32_t n, s;
         static const uint8_t zero[6];
         /* reserved bytes and flags must be zero, so they can mean something later */
-        if (len < TSDB_VALUES_HEADER || p[8] > TSDB_STATE || (p[9] & ~TSDB_VALID) || memcmp(p + 10, zero, 6)) {
+        if (len < TSDB_VALUES_HEADER || p[8] > TSDB_STATE || (p[9] & ~(TSDB_VALID | TSDB_PACKED)) ||
+            memcmp(p + 10, zero, 6)) {
             rc = TSDB_ERR_INVALID;
             break;
         }
         memcpy(&n, p, 4);
         memcpy(&s, p + 4, 4);
         bool many = s == TSDB_MANY_SERIES;
+        if (p[9] & TSDB_PACKED) {
+            rc = insert_packed(p, len, n, s);
+            break;
+        }
         size_t vb = (size_t)n * tsdb_wire_width(p[8]), valid = (p[9] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0;
         size_t end = TSDB_VALUES_HEADER + (size_t)n * 8 + vb + valid, sofs = (end + 3) & ~(size_t)3;
         if (len != (many ? sofs + (size_t)n * 4 : end)) {

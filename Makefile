@@ -80,15 +80,18 @@ build/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 build/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-build/tsdbd: server/tsdbd.c include/tsdb_protocol.h $(LIB)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS) -luring
+build/tsdbd: server/tsdbd.c include/tsdb_protocol.h client/tsdb_pack.h build/tsdb_pack.o $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< build/tsdb_pack.o $(LIB) $(LDLIBS) -luring
 
 CLIB := build/libtsdbclient.a
 
 build/tsdb_client.o: client/tsdb_client.c client/tsdb_client.h include/tsdb_protocol.h include/tsdb.h | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(CLIB): build/tsdb_client.o
+build/tsdb_pack.o: client/tsdb_pack.c client/tsdb_pack.h include/tsdb_protocol.h | build
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(CLIB): build/tsdb_client.o build/tsdb_pack.o
 	$(AR) rcs $@ $^
 
 build/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB)
