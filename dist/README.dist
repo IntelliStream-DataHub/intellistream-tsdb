@@ -1,0 +1,51 @@
+tsdb portable binaries for x86-64 Linux
+=======================================
+
+Built by `make dist` (on Ubuntu with GCC 15 or 16), for running on other
+distributions, AlmaLinux 10 first of all.
+
+Contents
+  bin/tsdbd            the server
+  bin/tsdb             the command-line tool (create, insert, import, query, stats)
+  bench/               codec-bench, type-bench, tsdb-bench, insert-bench, tsdbc-bench, scale-bench
+  lib/libtsdb.a        the embedded engine; link with -lzstd -lpthread -lm
+  lib/libtsdbclient.a  the C client of tsdbd; link with -lzstd -lpthread -lm
+  include/             tsdb.h, tsdb_protocol.h, tsdb_calendar.h, tsdb_client.h
+  tests/               the test suite of this build; tests/run-tests.sh runs it
+  systemd/tsdbd.service
+  BUILDINFO            version, compiler, glibc
+
+Requirements
+  CPU     x86-64-v2: SSE4.2 and POPCNT (Intel Nehalem and later, Sandy Bridge
+          included; AMD Bulldozer and later). Both the x86-64-v3 (default) and
+          the x86-64-v2 builds of AlmaLinux 10 run it.
+  glibc   2.34 or newer (AlmaLinux 10 has 2.39, EL9 has 2.34). zstd and liburing
+          are linked in; nothing else is needed.
+  kernel  io_uring for tsdbd (AlmaLinux 10: kernel 6.12). If tsdbd stops with
+          "io_uring: Operation not permitted" or "Function not implemented",
+          check `sysctl kernel.io_uring_disabled` (0 allows it) and, in a
+          container, the seccomp profile.
+
+Speed on new CPUs
+  The baseline is x86-64-v2, but the code that decodes, encodes and folds
+  values is in the binary three times: for x86-64-v2, x86-64-v3 (AVX2, BMI2,
+  LZCNT) and x86-64-v4 (AVX-512). The best one this CPU has is picked at
+  startup; tsdbd prints it ("simd avx2, codecs x86-64-v3"). Every level writes
+  byte-identical parts and gives identical query results, so parts move freely
+  between machines. TSDB_CPU=v2 (or v3) runs the lower level on a newer CPU,
+  to see how an older machine will do.
+
+Install
+  tar xzf tsdb-VERSION-x86_64-linux.tar.gz && cd tsdb-VERSION-x86_64-linux
+  tests/run-tests.sh /var/tmp            # optional, a few minutes
+  install -m 755 bin/tsdbd bin/tsdb /usr/local/bin/
+  restorecon -v /usr/local/bin/tsdbd /usr/local/bin/tsdb    # SELinux: bin_t
+  useradd -r -s /sbin/nologin -d /var/lib/tsdb tsdb
+  install -m 644 systemd/tsdbd.service /etc/systemd/system/
+  systemctl daemon-reload && systemctl enable --now tsdbd
+
+  The unit runs tsdbd on 127.0.0.1:7070 with its data in /var/lib/tsdb. tsdbd
+  has no authentication: listen on a trusted interface only. Under SELinux it
+  runs unconfined (unconfined_service_t): no tsdb policy exists, so none
+  confines it; the systemd sandboxing in the unit (ProtectSystem=strict, ...)
+  is what limits it.

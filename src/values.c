@@ -38,7 +38,7 @@ static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a)
         mx = x > mx ? x : mx;
     }
     a->count += c;
-    a->sum += s;
+    a->sum = canon_nan(a->sum + s);
     a->min = mn;
     a->max = mx;
 }
@@ -59,7 +59,7 @@ static void fold_f64(const double *v, size_t n, agg_state *a)
         mx = x > mx ? x : mx;
     }
     a->count += c;
-    a->sum += s;
+    a->sum = canon_nan(a->sum + s);
     a->min = mn;
     a->max = mx;
 }

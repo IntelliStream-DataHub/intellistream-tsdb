@@ -1,0 +1,38 @@
+# tsdbd as a systemd service (README.dist). Install:
+#   useradd -r -s /sbin/nologin -d /var/lib/tsdb tsdb
+#   cp tsdbd.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now tsdbd
+#
+# Type=simple: tsdbd does not call sd_notify; systemd counts it as started
+# once it runs, and it listens within milliseconds of that.
+# SELinux: a binary under /usr/local/bin is labelled bin_t (run `restorecon -v
+# /usr/local/bin/tsdbd` after copying it there), so the service runs in the
+# unconfined_service_t domain: no tsdb policy confines it, and none blocks it.
+[Unit]
+Description=tsdb time series server
+Documentation=file:///usr/local/share/doc/tsdb/README.dist
+After=network.target local-fs.target
+# with --dir on NFS: After=remote-fs.target
+
+[Service]
+Type=simple
+User=tsdb
+Group=tsdb
+# /var/lib/tsdb, created and owned by User= when missing
+StateDirectory=tsdb
+# There is no authentication: listen on a trusted interface only.
+ExecStart=/usr/local/bin/tsdbd --dir /var/lib/tsdb --listen 127.0.0.1 --port 7070
+# SIGTERM: requests in progress finish, the WAL is synced, then it exits
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=2
+# a file per part and per connection
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

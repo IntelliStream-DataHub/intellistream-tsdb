@@ -303,7 +303,8 @@ int tsdb_foreach_part(tsdb *db, void (*fn)(void *ctx, const tsdb_part_info *info
  * refresh (a follower does this every refresh_ms on its own). */
 int tsdb_refresh(tsdb *db);
 
-/* Name of the SIMD kernel set picked at runtime: "avx512", "avx2" or "scalar". */
+/* Name of the SIMD kernel set picked at runtime: "avx512", "avx2" or "scalar"; in a
+ * portable build (`make dist`) followed by the CPU level of the codecs: "avx2, codecs x86-64-v3". */
 const char *tsdb_simd_level(void);
 
 #ifdef __cplusplus

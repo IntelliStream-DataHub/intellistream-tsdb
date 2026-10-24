@@ -9,22 +9,48 @@ endif
 CFLAGS  ?= -O3 -g
 # -ffp-contract=off: GNU C modes let GCC fuse a*b+c into FMA where the target has it, so a
 # -march=native build and a portable one would round differently; codec choices (and the
-# bytes they write) must not depend on the CPU the code was built for.
+# bytes they write) must not depend on the CPU the code was built for, nor on the CPU
+# level of `make dist` in use (src/levels.h).
 override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off $(ARCH) -Iinclude -fPIC
-LDLIBS  += -lzstd -lpthread -lm
+# `make dist` links these statically (-l:libzstd.a); glibc stays dynamic.
+ZSTD_LIB  ?= -lzstd
+URING_LIB ?= -luring
+LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 TSDBD   ?= $(B)/tsdbd
 
 SRC  := $(wildcard src/*.c)
 OBJ  := $(SRC:src/%.c=$(B)/%.o)
+
+# CPU levels (src/levels.h): with CPU_LEVELS="v3 v4" these files are compiled
+# once for $(ARCH) and once per level, and src/cpu.c picks one at startup.
+# Off by default: a -march=native build has nothing to pick.
+LV_SRC := codec codec_alp codec_typed codec_xor values
+LV_FLAGS_v3 := -march=x86-64-v3
+# 256-bit vectors: the gain of v4 is AVX-512's instructions (int64 <-> double,
+# masks, 64-bit min/max), and Skylake-SP slows the core after 512-bit ones.
+LV_FLAGS_v4 := -march=x86-64-v4 -mprefer-vector-width=256
+ifneq ($(strip $(CPU_LEVELS)),)
+override CFLAGS += -DTSDB_LEVELS $(foreach l,$(CPU_LEVELS),-DTSDB_HAVE_$(l))
+OBJ := $(filter-out $(LV_SRC:%=$(B)/%.o),$(OBJ)) $(foreach l,base $(CPU_LEVELS),$(LV_SRC:%=$(B)/%.$(l).o))
+endif
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
 all: $(LIB) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench
 
-$(B)/%.o: src/%.c src/internal.h include/tsdb.h | $(B)
+$(B)/%.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(B)/%.base.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
+	$(CC) $(CFLAGS) -DTSDB_LV=base -c -o $@ $<
+
+$(B)/%.v3.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
+	$(CC) $(CFLAGS) $(LV_FLAGS_v3) -DTSDB_LV=v3 -c -o $@ $<
+
+$(B)/%.v4.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
+	$(CC) $(CFLAGS) $(LV_FLAGS_v4) -DTSDB_LV=v4 -c -o $@ $<
 
 # the calendar helper is client-side code, in both libraries: the engine itself knows UTC only
 $(LIB): $(OBJ) $(B)/tsdb_calendar.o
@@ -42,9 +68,10 @@ $(B)/tsdb-bench: tools/tsdb-bench.c tools/common.h tools/datasets.h $(LIB)
 $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_types $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd
+test: $(B)/test_tsdb $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd
 	./$(B)/test_tsdb
 	./$(B)/test_types
+	./$(B)/test_levels
 	./$(B)/test_group
 	./$(B)/test_follow
 	./$(B)/test_volumes
@@ -72,7 +99,37 @@ $(B):
 	mkdir -p $(B)
 
 clean:
-	rm -rf build build-tsan
+	rm -rf build build-tsan $(DIST_B)
+
+# ---- portable binaries (dist/README.dist): built here, run on AlmaLinux 10 ----
+# x86-64-v2 for CPUs as old as Sandy Bridge, with the codecs also compiled for
+# v3 and v4 and picked at runtime (src/levels.h); zstd and liburing static,
+# glibc dynamic and no newer than GLIBC_MAX. CC=gcc-16 works like any CC.
+DIST_B     ?= build-dist
+DIST_ARCH  ?= -march=x86-64-v2 -mtune=generic
+GLIBC_MAX  ?= 2.39
+DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tools/glibc-compat.h" \
+              CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
+DIST_BINS   = tsdbd tsdb codec-bench type-bench tsdb-bench insert-bench tsdbc-bench scale-bench
+DIST_TESTS  = test_tsdb test_types test_levels test_group test_follow test_volumes test_server test_stability
+DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS))
+
+dist:
+	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%)
+	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
+	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
+	CC="$(CC)" tools/mkdist.sh $(DIST_B)
+
+# The tarball's own test suite on this machine, every CPU level included.
+dist-test: dist
+	cd $(DIST_B)/tsdb-*-x86_64-linux && tests/run-tests.sh
+
+# The same inside AlmaLinux 10 (Podman), and under an emulated Sandy Bridge.
+dist-check-almalinux10: dist
+	tests/distro/dist-check.sh $(DIST_B)/tsdb-*-x86_64-linux.tar.gz
+
+dist-check-sandybridge: dist
+	tests/distro/sandybridge.sh $(DIST_B)
 
 # Clients in other languages; not part of `make test`, so the C build needs no
 # cargo, Python or JDK. Each runs its tests against build/tsdbd.
@@ -91,7 +148,7 @@ test-java: $(B)/tsdbd
 
 test-clients: test-rust test-python test-java
 
-.PHONY: all test asan tsan clean jepsen test-rust test-python test-java test-clients
+.PHONY: all test asan tsan clean jepsen dist dist-test dist-check-almalinux10 dist-check-sandybridge test-rust test-python test-java test-clients
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -100,7 +157,7 @@ $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/tsdbd: server/tsdbd.c include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
-	$(CC) $(CFLAGS) -o $@ $< $(B)/tsdb_pack.o $(LIB) $(LDLIBS) -luring
+	$(CC) $(CFLAGS) -o $@ $< $(B)/tsdb_pack.o $(LIB) $(LDLIBS) $(URING_LIB)
 
 CLIB := $(B)/libtsdbclient.a
 
@@ -114,7 +171,7 @@ $(CLIB): $(B)/tsdb_client.o $(B)/tsdb_pack.o $(B)/tsdb_calendar.o
 	$(AR) rcs $@ $^
 
 $(B)/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB)
-	$(CC) $(CFLAGS) -o $@ $< $(CLIB) -lzstd -lpthread -lm
+	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 $(B)/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
@@ -123,7 +180,7 @@ $(B)/scale-bench: tools/scale-bench.c client/tsdb_client.h tools/common.h tools/
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
 $(B)/test_stability: tests/test_stability.c $(CLIB)
-	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) -lzstd -lpthread -lm
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 $(B)/test_server: tests/test_server.c tests/samekeys.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
@@ -137,6 +194,9 @@ $(B)/test_volumes: tests/test_volumes.c $(LIB)
 $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+$(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/test_group: tests/test_group.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
@@ -144,7 +204,7 @@ $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
 	$(CC) -O2 -g -std=gnu11 -Wall -fPIC -shared -o $@ $< -ldl -lpthread
 
 $(B)/jepsen: tests/jepsen/jepsen.c $(CLIB)
-	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) -lzstd -lpthread -lm
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 # Jepsen-style fault injection: crashes, simulated power loss and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.

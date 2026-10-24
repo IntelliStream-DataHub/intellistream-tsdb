@@ -1,0 +1,62 @@
+#!/bin/sh
+# Fails if a portable build uses instructions beyond x86-64-v2 outside the code
+# that is only reached after a CPU check: the per-level compiles (*.v3.o,
+# *.v4.o, functions *_v3/_v4), simd.c's agg_avx2/agg_avx512, and zstd's BMI2
+# variants. An emulator finds most such slips (qemu -cpu SandyBridge raises
+# SIGILL), but not LZCNT: older CPUs run it as BSR and silently get another
+# result. So this reads the machine code.
+#
+#   tools/check-isa.sh build-dir binary...
+set -eu
+[ $# -ge 2 ] || { echo "usage: $0 build-dir binary..." >&2; exit 2; }
+dir=$1; shift
+
+# mnemonics of AVX/AVX2/AVX-512 (all VEX/EVEX ones start with v), BMI1/2,
+# LZCNT, MOVBE and the AVX-512 mask registers; TZCNT is left out: it runs as
+# BSF where it is missing and GCC uses it only where both agree.
+above_v2() {
+    objdump -d --no-show-raw-insn "$1" | awk '
+        /^[0-9a-f]+ <.*>:$/ { fn = substr($2, 2, length($2) - 3); next }
+        NF >= 2 {
+            m = $2
+            if (m ~ /^v/ || m ~ /^(andn|bextr|blsi|blsmsk|blsr|bzhi|mulx|pdep|pext|rorx|sarx|shlx|shrx|lzcnt|movbe)$/ ||
+                m ~ /^k(mov|and|andn|or|xnor|xor|not|ortest|test|shiftl|shiftr|unpck|add)[bwdq]*$/)
+                n[fn]++
+        }
+        END { for (f in n) print f, n[f] }'
+}
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# 1. objects compiled for the baseline: nothing above v2 but simd.c's kernels
+for o in "$dir"/*.o; do
+    case "$o" in *.v3.o | *.v4.o) continue ;; esac
+    above_v2 "$o" | while read -r fn cnt; do
+        case "$(basename "$o"):$fn" in simd.o:agg_avx2 | simd.o:agg_avx512) continue ;; esac
+        echo "$o: $fn: $cnt instructions beyond x86-64-v2" >&2
+        echo x >>"$tmp/bad"
+    done
+done
+# 2. the binaries (zstd and liburing come in here): every such function must
+#    be one the dispatch reaches only on a capable CPU
+for o in "$dir"/*.v3.o "$dir"/*.v4.o; do
+    [ -e "$o" ] && nm --defined-only "$o" | awk '$2 ~ /^[tT]$/ {print $3}'
+done | sort -u >"$tmp/level_fns"
+for b in "$@"; do
+    above_v2 "$b" | while read -r fn cnt; do
+        base=${fn%%.*} # foo.part.0, foo.constprop.0
+        case "$base" in
+        *_v3 | *_v4 | agg_avx2 | agg_avx512) continue ;;
+        HUF_*_bmi2 | FSE_*_bmi2 | ZSTD_*_bmi2 | HUF_*_fast | HUF_*_fast_c_loop | HUF_*_fast_asm_loop) continue ;;
+        esac
+        grep -qx "$fn" "$tmp/level_fns" && continue # a static helper of a level compile (its base copy is step 1's)
+        echo "$b: $fn: $cnt instructions beyond x86-64-v2" >&2
+        echo x >>"$tmp/bad"
+    done
+done
+if [ -s "$tmp/bad" ]; then
+    echo "check-isa: code beyond x86-64-v2 outside the CPU dispatch" >&2
+    exit 1
+fi
+echo "check-isa: $# binaries use nothing beyond x86-64-v2 outside the CPU dispatch"
