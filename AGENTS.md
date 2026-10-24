@@ -21,7 +21,8 @@ make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
 make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end, uring and epoll (~2 min, same tools);
-                          # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/; mutate.py checks it has teeth
+                          # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/; mutate.py checks it has teeth;
+                          # make integration-selftest tests the harness itself (seconds)
 ```
 
 Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only; not with `NO_URING=1`).

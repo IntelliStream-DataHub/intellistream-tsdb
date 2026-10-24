@@ -380,7 +380,8 @@ static void do_read(tsdbc *c, const char *path)
 
 /* ---- durability load ----
  * One series, `rows` timestamps 1000 ms apart. Pass 1 writes value base+i, pass 2 overwrites the same
- * timestamps with base+i+1000000. Batches of 200 rows, 8 in flight; after every tsdbc_wait that returns 0 the
+ * timestamps with base+i+1000000. Batches of 200 rows are sent 8 at a time and then waited for together (the
+ * pipeline drains every 8 batches, it is not a sliding window); after every tsdbc_wait that returns 0 the
  * batches since the last wait are acknowledged and printed as "ACK <pass> <first-batch> <last-batch>". */
 #define LOAD_ROWS 1000000
 #define LOAD_BATCH 200

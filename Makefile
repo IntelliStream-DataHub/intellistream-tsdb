@@ -226,13 +226,17 @@ integ-java:
 integration-tests: $(B)/tsdbd $(B)/tsdb $(INTEG)/itc integ-rust integ-python integ-java
 	python3 tests/integration/run.py --bin-dir $(B) $(INTEG_ARGS)
 
+# The harness's own tests (seconds): a broken io_uring backend fails the run, signals, mutate.py's verdicts.
+integration-selftest: $(B)/tsdbd $(B)/tsdb
+	python3 tests/integration/selftest.py
+
 # The same against the binaries of `make dist`: its tsdbd and tsdb, and the C client linked with its libtsdbclient.a.
 integration-tests-dist: dist integ-rust integ-python integ-java
 	$(CC) -O2 -g -std=gnu11 -Iinclude -Iclient -o $(DIST_B)/itc tests/integration/c/itc.c $(DIST_B)/libtsdbclient.a \
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist
+.PHONY: hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-clients dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

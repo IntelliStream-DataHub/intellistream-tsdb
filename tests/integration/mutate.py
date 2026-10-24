@@ -26,8 +26,9 @@ ROOT = Path(__file__).resolve().parents[2]
 M = []
 
 
-def mut(id, what, file, old, new, build, scen, io="epoll"):
-    M.append(dict(id=id, what=what, file=file, old=old, new=new, build=build, scen=scen, io=io))
+def mut(id, what, file, old, new, build, scen, io="epoll", hang=False):
+    """hang: the bug can only show as a client that waits for ever (a lost reply); its timeout is then the catch."""
+    M.append(dict(id=id, what=what, file=file, old=old, new=new, build=build, scen=scen, io=io, hang=hang))
 
 
 mut("M1", "C client ignores the validity bitmap of a values reply (nulls read as values)",
@@ -47,7 +48,7 @@ mut("M3", "server loses the acknowledgement of every 61st values insert (a dropp
     "    static unsigned dropped;\n"
     "    if (!(r->op == TSDB_OP_INSERT_VALUES && rc == 0 && ++dropped % 61 == 0))\n"
     "        reply_status(c, r->id, rc);\n}",
-    ["c"], "matrix")
+    ["c"], "matrix", hang=True)
 mut("M4", "Java client sends limit + 1 for raw queries (off by one in limits)",
     "client/java/src/main/java/ai/intellistream/tsdb/TsdbClient.java",
     "begin(Protocol.OP_QUERY_RAW, opts ? 29 : 20);\n        out.putInt(series).putLong(start).putLong(end);\n"
@@ -96,15 +97,69 @@ mut("M12", "Python client sends limit - 1 (off by one in limits, in the PyO3 lay
     "    Ok(tc::QueryOpts { order, limit: limit.map(|l| if l > 1 { l - 1 } else { l }) })",
     ["python"], "matrix")
 
+# found by review: these four survived the first version of the suite
+mut("M13", "crash recovery replays every WAL segment, ignoring each part's wal_seq (old values over newer parts)",
+    "src/memtable.c",
+    "if (cached_seq >= segs[k].seq || id >= eng_series_count(db))",
+    "if ((cached_seq >= segs[k].seq && 0) || id >= eng_series_count(db))",
+    ["c"], "stale_wal")
+mut("M14", "descending raw reads: every window after the first loses its oldest row (only series over 65536 rows)",
+    "src/query.c",
+    "        size_t m = w.n;",
+    "        size_t m = w.n - (hi != end && w.n > 0);",
+    ["c"], "durability")
+mut("M15", "C client calendar: a repeated local midnight (Havana, 2024-11-03) resolves to the LATER instant",
+    "client/tsdb_calendar.c",
+    "    int64_t u = local - hi_off;\n    if (tz_offset(z, u) == hi_off)\n        return u;\n    u = local - lo_off;\n"
+    "    if (tz_offset(z, u) == lo_off)\n        return u;",
+    "    int64_t u = local - lo_off;\n    if (tz_offset(z, u) == lo_off)\n        return u;\n    u = local - hi_off;\n"
+    "    if (tz_offset(z, u) == hi_off)\n        return u;",
+    ["c"], "matrix")
+mut("M16", "C client calendar: a skipped local midnight (Havana 2024-03-10, Beirut 2024-03-31) resolves one second early",
+    "client/tsdb_calendar.c",
+    "    return hi;",
+    "    return lo;",
+    ["c"], "matrix")
+mut("M17", "granule statistics drop the high word of 128-bit integer sums beyond +-2^64",
+    "src/values.c",
+    "        g->isum_hi = (int64_t)(a.isum >> 64);",
+    "        g->isum_hi = a.isum < 0 ? -1 : 0;",
+    ["c"], "matrix")
 
-def sh(cmd, cwd, log, env=None, check=True):
+
+def sh(cmd, cwd, log, env=None, check=True, timeout=None):
     with open(log, "ab") as f:
         f.write(("$ %s\n" % " ".join(map(str, cmd))).encode())
         f.flush()
-        p = subprocess.run(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, env=env)
+        try:
+            p = subprocess.run(cmd, cwd=cwd, stdout=f, stderr=subprocess.STDOUT, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return "timeout"
     if check and p.returncode:
         raise RuntimeError("%s failed (%d), see %s" % (" ".join(map(str, cmd[:3])), p.returncode, log))
     return p.returncode
+
+
+RUN_TIMEOUT = 1500  # seconds for one run.py of a planted bug; a hang is reported as TIMEOUT, not as a catch
+
+
+def classify(rc, out, hang=False):
+    """The verdict for a run.py exit status and output. Only a failed CHECK is a catch: a driver that crashed
+    ("scenario crashed", a Python exception in run.py) or hung says nothing about the planted bug, and neither does a
+    client that timed out as the first failure."""
+    first = [ln for ln in out.splitlines() if re.match(r"\[\w+ \w+\] ", ln)][:1]
+    line = (first[0] if first else "?")[:330]
+    if rc == "timeout":
+        return "TIMEOUT", "run.py did not finish in %d s" % RUN_TIMEOUT
+    if rc == 0:
+        return "SURVIVED", "the suite passed with the bug planted"
+    if rc == 1:
+        if not first or "scenario crashed" in line:
+            return "HARNESS", line if first else "run.py failed without a failure line (a crash of the driver?)"
+        if "timeout after" in line and not hang:
+            return "TIMEOUT", line
+        return "CAUGHT", line
+    return "ERROR", "run.py exited %s" % rc
 
 
 def run_one(m, keep, logdir):
@@ -153,14 +208,9 @@ def run_one(m, keep, logdir):
             env["PYVENV"] = str(venv)
         logs = tmp / "logs"
         rc = sh([sys.executable, "tests/integration/run.py", "--bin-dir", str(b), "--only", m["scen"], "--io", m["io"],
-                 "--timeout", "40", "--logs", str(logs), "--work", str(tmp)], tree, log, env=env, check=False)
-        out = log.read_text(errors="replace")
-        first = [ln for ln in out.splitlines() if ln.startswith("[")][:1]
-        if rc == 1:
-            return "CAUGHT", (first[0] if first else "?")[:330]
-        if rc == 0:
-            return "SURVIVED", "the suite passed with the bug planted"
-        return "ERROR", "run.py exited %d" % rc
+                 "--timeout", "40", "--logs", str(logs), "--work", str(tmp)], tree, log, env=env, check=False,
+                timeout=RUN_TIMEOUT)
+        return classify(rc, log.read_text(errors="replace"), m["hang"])
     except Exception as e:  # noqa: BLE001
         return "ERROR", str(e)[:300]
     finally:
@@ -198,7 +248,7 @@ def main():
     print("\n%-4s %-9s %s" % ("id", "result", "bug"))
     for m, v, why in rows:
         print("%-4s %-9s %s" % (m["id"], v, m["what"]))
-    bad = [m["id"] for m, v, _ in rows if v != "CAUGHT"]
+    bad = [m["id"] for m, v, _ in rows if v != "CAUGHT"]  # SURVIVED, TIMEOUT, HARNESS and ERROR all count against
     print("%d of %d planted bugs caught%s; logs in %s" % (len(rows) - len(bad), len(rows),
                                                           ("; NOT caught: " + ", ".join(bad)) if bad else "", logdir))
     return 1 if bad else 0

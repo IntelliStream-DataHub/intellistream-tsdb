@@ -13,7 +13,9 @@ I64_MIN, I64_MAX = -(1 << 63), (1 << 63) - 1
 NULL_F32, NULL_F64 = 0x7FC01001, 0x7FF8000000001001
 T_PERIOD = ("float32", "float64", "int64", "bool", "state")
 STATES = ["idle", "run", "fault", "größe", "日本語", "x"]
-ZONES = ["Europe/Oslo", "America/New_York", "Asia/Kolkata"]
+# Havana and Beirut change their clocks AT midnight: a day starts in a gap (Havana 2024-03-10, Beirut 2024-03-31)
+# or twice (Havana 2024-11-03), which exercises the gap and overlap branches of every calendar implementation.
+ZONES = ["Europe/Oslo", "America/New_York", "Asia/Kolkata", "America/Havana", "Asia/Beirut"]
 HOUR = 3600_000
 DAY = 24 * HOUR
 

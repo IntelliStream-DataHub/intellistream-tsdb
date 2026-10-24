@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end tests of tsdb: real tsdbd processes, real clients in four languages, and the tsdb CLI.
 
-  run.py [--only matrix,cli,follower,durability] [--io uring,epoll] [--scale 1.0] [--seed N]
+  run.py [--only matrix,cli,follower,durability,stale_wal] [--io uring,epoll] [--scale 1.0] [--seed N]
          [--logs DIR] [--keep] [--bin-dir DIR] [--itc PATH]
 
 Scenarios (each runs once per server backend, --io uring and --io epoll; on a host without io_uring only epoll):
@@ -9,16 +9,21 @@ Scenarios (each runs once per server backend, --io uring and --io epoll; on a ho
   matrix      Each client (C, Rust, Python, Java) writes its own set of series (every type, nulls, special floats,
               corrections, packed/plain/legacy and pipelined inserts); then every client reads every set back
               (raw both orders with limits, aggregates, buckets, calendar groups in UTC, Europe/Oslo,
-              America/New_York and Asia/Kolkata, explicit bounds, errors). The four answers must be identical to
+              America/New_York, Asia/Kolkata and, with midnight clock changes, America/Havana and Asia/Beirut, explicit bounds, errors). The four answers must be identical to
               each other, to an independent model (gen.py) and, after tsdbd stopped, to `tsdb <dir> query`.
               Repeated after flush and after optimize (merges).
   cli         `tsdb create/import` a CSV (ms and ISO times, nan/inf/-0, nulls, a second import correcting the first),
               then all four clients read it through a server.
   follower    A second `tsdbd --follow` on the same directory catches up with a first wave and a second wave of
-              writes and answers like the primary; it refuses writes.
-  durability  Every client runs a pipelined two-pass load (the second pass overwrites the first); tsdbd is killed
-              with SIGKILL in the middle of pass 1 or pass 2; after the restart every acknowledged batch is there,
-              nothing older came back, no batch is half there; again after optimize and after a clean restart.
+              writes and answers like the primary; it refuses writes. The primary then runs optimize while the
+              follower is being read: the replaced parts are retired_*, and the follower must go on answering.
+  stale_wal   A WAL segment left behind by a flush (made by hand: segments copied away, flushed, corrected, put
+              back) is not replayed over the newer parts.
+  durability  Every client runs a pipelined two-pass load (the second pass overwrites the first; batches are sent 8
+              at a time and acknowledged together, so 0 to 7 batches are unacknowledged at the kill); tsdbd is
+              killed with SIGKILL in the middle of pass 1 or pass 2; after the restart every acknowledged batch is
+              there, nothing older came back, no batch is half there; again after optimize and after a clean
+              restart. Each series is also read descending, whole and with a limit across the 65536-row window.
 
 Why Python and not bash: the scenarios need binary-safe comparison, threads (four clients and a server at once,
 a trigger that fires on the clients' acknowledgements), a model of the expected answers and zoneinfo as an
@@ -62,7 +67,8 @@ I64_MIN, I64_MAX = gen.I64_MIN, gen.I64_MAX
 # ---------------------------------------------------------------- processes
 
 _procs = []
-_lock = threading.Lock()
+# re-entrant: the signal handler runs on the main thread, possibly while the main thread is inside spawn()
+_lock = threading.RLock()
 
 
 def signal_proc(p, sig):
@@ -77,10 +83,23 @@ def signal_proc(p, sig):
             pass
 
 
+_defer = threading.local()
+
+
 def spawn(cmd, **kw):
-    p = subprocess.Popen(cmd, **kw)
+    """Starts a child and records it. A SIGINT/SIGTERM that the handler would see between the fork and the
+    bookkeeping on this thread is held back until the child is listed (else it would be orphaned). Not a signal mask:
+    that would be inherited by the child, and tsdbd would never see its SIGTERM."""
     with _lock:
-        _procs.append(p)
+        _defer.on, _defer.pending = True, None
+        try:
+            p = subprocess.Popen(cmd, **kw)
+            _procs.append(p)
+        finally:
+            _defer.on = False
+            pending, _defer.pending = _defer.pending, None
+    if pending:
+        _on_signal(*pending)
     return p
 
 
@@ -101,6 +120,9 @@ atexit.register(cleanup)
 
 
 def _on_signal(sig, frame):
+    if getattr(_defer, "on", False):  # the main thread is inside spawn(): spawn() calls us again when it is done
+        _defer.pending = (sig, frame)
+        return
     cleanup()
     os._exit(130)
 
@@ -515,6 +537,7 @@ def scenario_matrix(ctx, F, io, d):
     F.note("%d series, %d rows, %d queries" % (len(model.types), sum(len(r) for r in model.rows.values()), len(queries)))
     db = d / "db"
     srv = Server(ctx, db, d / "tsdbd.log", io).start()
+    ref = None
     try:
         if (write_phase(ctx, F, d, "write", srv.port, scripts) and admin(ctx, F, d, srv.port, "flush")
                 and write_phase(ctx, F, d, "write2", srv.port, scripts2)):
@@ -570,10 +593,30 @@ def scenario_follower(ctx, F, io, d):
         e2 = gen.expected_blocks(queries2, model)
         wait_caught_up(ctx, F, d, foll.port, prim.port, model, "wave 2")
         p2 = read_phase(ctx, F, d, "primary-2", prim.port, q2, e2, model.types)
-        f2 = read_phase(ctx, F, d, "follower-2", foll.port, q2, e2, model.types)
+        # the primary merges (optimize) while the follower is being read: the replaced parts are renamed retired_*
+        # and stay for obsolete_part_lifetime_s, because a follower may still have them mapped
+        box = {}
+        reader = threading.Thread(target=lambda: box.update(
+            f=read_phase(ctx, F, d, "follower-2", foll.port, q2, e2, model.types)))
+        reader.start()
+        time.sleep(0.5)
+        admin(ctx, F, d, prim.port, "optimize")
+        reader.join()
+        f2 = box.get("f", {})
         if p2.get("c") and f2.get("c"):
             for m in diff_outputs("primary", p2["c"], "follower", f2["c"], types=model.types):
                 F.add("wave 2: follower and primary differ: " + m)
+        # the merged state: the follower follows to it and answers the same as before the merge
+        wait_caught_up(ctx, F, d, foll.port, prim.port, model, "the merge")
+        f3 = read_phase(ctx, F, d, "follower-3", foll.port, q2, e2, model.types, reference=p2.get("c"))
+        p3 = read_phase(ctx, F, d, "primary-3", prim.port, q2, e2, model.types, reference=p2.get("c"))
+        if p3.get("c") and f3.get("c"):
+            for m in diff_outputs("primary", p3["c"], "follower", f3["c"], types=model.types):
+                F.add("after the merge: follower and primary differ: " + m)
+        retired = len(list(db.rglob("retired_*")))
+        F.note("%d retired_* entries on disk after the merge" % retired)
+        if not retired:
+            F.add("the merge left no retired_* part: the follower invariant was not exercised")
     finally:
         for s, name in ((foll, "follower"), (prim, "primary")):
             if s:
@@ -789,23 +832,46 @@ def verify_load(ld, rows):
 
 
 def read_load(ctx, F, d, tag, port, loaders):
+    """Reads every loader's series back ascending and checks it (verify_load). Also reads it descending, whole and with
+    a limit that crosses the 65536-row window of the descending reader, and expects the ascending answer reversed."""
     qf = d / ("loadq-%s.txt" % tag)
-    qf.write_text("\n".join("raw %s %d %d asc 0" % (ld.name, I64_MIN, I64_MAX) for ld in loaders) + "\n")
+    cross = 70000
+    qs = []
+    for ld in loaders:
+        qs += ["raw %s %d %d asc 0" % (ld.name, I64_MIN, I64_MAX), "raw %s %d %d desc 0" % (ld.name, I64_MIN, I64_MAX),
+               "raw %s %d %d desc %d" % (ld.name, I64_MIN, I64_MAX, cross)]
+    qf.write_text("\n".join(qs) + "\n")
     out = d / ("loadread-%s.out" % tag)
     rc, _ = run_client(ctx, "c", ["read", port, qf], out)
     if rc != 0:
         F.add("%s: reading back failed (%s): %s" % (tag, rc, err_tail(out)))
         return
     blocks = gen.parse_blocks(out.read_text())
-    for ld, (q, lines) in zip(loaders, blocks):
+    for i, ld in enumerate(loaders):
+        if len(blocks) < 3 * i + 3:
+            F.add("%s: %s: %d answers, wanted %d" % (tag, ld.lang, len(blocks), 3 * len(loaders)))
+            return
+        asc, desc, desc_lim = (blocks[3 * i + k][1] for k in range(3))
         rows = {}
-        for ln in lines:
+        for ln in asc:
             if ln == "!!":
                 break
             t, v = ln.split("\t")
             rows[int(t)] = int(v)
         for m in verify_load(ld, rows):
             F.add("%s: %s" % (tag, m))
+        want = list(reversed(asc))
+        if desc != want:
+            F.add("%s: %s: the descending read (%d rows) is not the ascending one (%d rows) reversed; first difference "
+                  "at index %d" % (tag, ld.lang, len(desc), len(asc), next(
+                      (k for k, (x, y) in enumerate(zip(desc, want)) if x != y), min(len(desc), len(want)))))
+        elif desc_lim != want[:cross]:
+            F.add("%s: %s: desc with limit %d returned %d rows, not the newest %d of the series"
+                  % (tag, ld.lang, cross, len(desc_lim), min(cross, len(want))))
+        ld.rows_read = len(asc)
+    F.note("%s: rows per client %s%s" % (tag, {ld.lang: getattr(ld, "rows_read", None) for ld in loaders},
+                                         "" if any(getattr(ld, "rows_read", 0) > cross for ld in loaders)
+                                         else " (no series crossed the descending window)"))
 
 
 def scenario_durability(ctx, F, io, d):
@@ -856,20 +922,88 @@ def scenario_durability(ctx, F, io, d):
         F.note("pass %d outcome per client: %s" % (phase, {ld.lang: getattr(ld, "summary", None) for ld in loaders}))
 
 
+def scenario_stale_wal(ctx, F, io, d):
+    """A WAL segment that outlived its flush (the server died between publishing the part and unlinking the
+    segment) must not be replayed over newer parts: recovery relies on each part's wal_seq. A kill timed on client
+    acknowledgements never lands in that window, so it is made by hand: the segments of wave 1 are copied away while
+    they are live, wave 1 is flushed, wave 2 corrects every value and is flushed, the server stops, the old segments
+    are put back, and the restarted server must still answer wave 2."""
+    model = gen.Model()
+    s1 = gen_scripts(ctx, model, d, 1)
+    db = d / "db"
+    stash = d / "stale-wal"
+    srv = Server(ctx, db, d / "tsdbd.log", io).start()
+    try:
+        if not write_phase(ctx, F, d, "wave1", srv.port, s1):
+            return
+        kept = 0
+        for p in db.rglob("wal_*.log"):
+            dst = stash / p.relative_to(db)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+            kept += 1
+        if not kept:
+            F.add("no WAL segment to keep after wave 1: the test would prove nothing")
+            return
+        if not admin(ctx, F, d, srv.port, "flush"):
+            return
+        gone = sum(1 for p in stash.rglob("wal_*.log") if not (db / p.relative_to(stash)).exists())
+        F.note("%d WAL segment(s) kept, %d of them unlinked by the flush" % (kept, gone))
+        s2 = gen_scripts(ctx, model, d, 2, seedoff=500)  # corrections to everything
+        if not (write_phase(ctx, F, d, "wave2", srv.port, s2) and admin(ctx, F, d, srv.port, "flush")):
+            return
+    finally:
+        rc = srv.stop()
+        if rc != 0:
+            F.add("tsdbd exited with %s on SIGTERM" % (rc,))
+    if not gone:
+        F.add("the flush unlinked none of the kept WAL segments: putting them back would prove nothing")
+        return
+    for p in stash.rglob("wal_*.log"):
+        shutil.copy2(p, db / p.relative_to(stash))
+    qfile = d / "queries.txt"
+    queries = write_queries(qfile, model)
+    expected = gen.expected_blocks(queries, model)
+    srv = Server(ctx, db, d / "tsdbd2.log", io).start()
+    try:
+        read_phase(ctx, F, d, "stale-wal", srv.port, qfile, expected, model.types, langs=["c"])
+    finally:
+        rc = srv.stop()
+        if rc != 0:
+            F.add("tsdbd exited with %s on SIGTERM after recovery" % (rc,))
+
+
 SCENARIOS = collections.OrderedDict([("matrix", scenario_matrix), ("cli", scenario_cli),
-                                     ("follower", scenario_follower), ("durability", scenario_durability)])
+                                     ("follower", scenario_follower), ("durability", scenario_durability),
+                                     ("stale_wal", scenario_stale_wal)])
 
 
 # ---------------------------------------------------------------- main
 
-def uring_works(ctx):
+# What tsdbd prints under --io uring when the kernel or its policy does not offer io_uring (tsdbd.c: the ring setup
+# error through strerror(), or a build without it). Anything else going wrong with the backend is a failure.
+URING_UNAVAILABLE = ("Operation not permitted", "Function not implemented", "Permission denied",
+                     "Cannot allocate memory", "Invalid argument", "not in this build")
+
+
+def uring_probe(ctx):
+    """Starts and stops a tsdbd --io uring. Returns ("ok" | "unavailable" | "broken", why): only the server saying
+    that io_uring is not offered counts as unavailable; a crash, a hang, or a bad exit status is "broken"."""
     d = Path(tempfile.mkdtemp(prefix="probe-", dir=ctx.work))
     log = d / "probe.log"
+    srv = Server(ctx, d / "db", log, "uring")
     try:
-        Server(ctx, d / "db", log, "uring").start().stop()
-        return True, ""
+        srv.start()
     except Exception as e:  # noqa: BLE001
-        return False, str(e)[:200]
+        tail = log.read_text(errors="replace").split("$ ")[-1] if log.exists() else ""
+        for ln in tail.splitlines():
+            if ln.startswith("tsdbd: io_uring:") and any(w in ln for w in URING_UNAVAILABLE):
+                return "unavailable", ln.strip()
+        return "broken", "tsdbd --io uring: %s (%s)" % (str(e)[:200], log)
+    rc = srv.stop()
+    if rc != 0:
+        return "broken", "tsdbd --io uring exited with %s on SIGTERM (%s)" % (rc, log)
+    return "ok", ""
 
 
 def main():
@@ -893,13 +1027,18 @@ def main():
         return 2
     Path(args.logs).mkdir(parents=True)
     ios = []
+    skipped = []
+    probe_fail = []
     for io in args.io.split(","):
         if io == "uring":
-            ok, why = uring_works(ctx)
-            if not ok:
-                print("io_uring is not available here (%s): the epoll backend only" % why)
-                if "epoll" not in args.io.split(","):
-                    ios.append("epoll")
+            state, why = uring_probe(ctx)
+            if state == "unavailable":
+                print("io_uring is not available here (%s): uring SKIPPED" % why)
+                skipped.append("uring SKIPPED: " + why)
+                continue
+            if state == "broken":
+                print("FAILED: " + why)
+                probe_fail.append(why)
                 continue
         ios.append(io)
     wanted = [s for s in args.only.split(",") if s]
@@ -943,8 +1082,10 @@ def main():
     lines = ["", "%-10s %-6s %8s  %s" % ("scenario", "io", "seconds", "result")]
     for io, s, secs, F in results:
         lines.append("%-10s %-6s %8.1f  %s" % (s, io, secs, "ok" if not F.items else "FAILED: %d" % len(F.items)))
-    nfail = sum(1 for r in results if r[3].items)
-    lines.append("%d of %d scenario runs failed in %.0f s; logs in %s" % (nfail, len(results), total, args.logs))
+    nfail = sum(1 for r in results if r[3].items) + len(probe_fail)
+    lines += skipped
+    lines += ["[uring probe] FAILED: " + w for w in probe_fail]
+    lines.append("%d of %d scenario runs failed in %.0f s; logs in %s" % (nfail, len(results) + len(probe_fail), total, args.logs))
     if nfail:
         lines.append("")
         for io, s, secs, F in results:
