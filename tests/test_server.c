@@ -254,6 +254,75 @@ static void test_hello(void)
     close(fd);
 }
 
+/* A server older than the client: it answers HELLO with fake_version and refuses everything else, counting it.
+ * The client must refuse what that version does not know without sending it. */
+static uint32_t fake_version;
+static int fake_others; /* read after the join */
+
+static void *fake_server(void *arg)
+{
+    int fd = accept(*(int *)arg, NULL, NULL);
+    uint8_t h[9], body[256];
+    while (fd >= 0 && read_full(fd, h, 9)) {
+        uint32_t flen, id;
+        memcpy(&flen, h, 4);
+        memcpy(&id, h + 4, 4);
+        if (flen < 5 || flen - 5 > sizeof body || !read_full(fd, body, flen - 5))
+            break;
+        int32_t st = h[8] == TSDB_OP_HELLO ? 0 : TSDB_ERR_INVALID;
+        fake_others += h[8] != TSDB_OP_HELLO;
+        uint8_t r[17];
+        uint32_t rlen = st ? 9 : 13;
+        memcpy(r, &rlen, 4);
+        memcpy(r + 4, &id, 4);
+        r[8] = TSDB_OP_REPLY;
+        memcpy(r + 9, &st, 4);
+        memcpy(r + 13, &fake_version, 4);
+        if (write(fd, r, 4 + rlen) != (ssize_t)(4 + rlen))
+            break;
+    }
+    if (fd >= 0)
+        close(fd);
+    return NULL;
+}
+
+static void test_old_server(uint32_t version)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    socklen_t sl = sizeof sa;
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 1) == 0 &&
+          getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0);
+    fake_version = version;
+    fake_others = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, fake_server, &lfd) == 0);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", ntohs(sa.sin_port), &c));
+    OK(tsdbc_set_compression(c, 0));
+    CHECK(tsdbc_server_version(c) == version);
+    int64_t lim = 7, t = T0;
+    double one = 1;
+    tsdb_values col = {TSDB_FLOAT64, &one, NULL};
+    if (version < 7) {
+        CHECK(tsdbc_delete_range(c, 1, T0, T0 + 10) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_replace_range(c, 1, T0, T0 + 10, &t, &col, 1) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_set_retention(c, 1, 1000) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_get_retention(c, 1, &lim) == TSDB_ERR_INVALID);
+    }
+    if (version < 6) {
+        tsdb_twa_bucket *b = NULL;
+        size_t nb = 0;
+        CHECK(tsdbc_query_twa(c, 1, T0, T0 + 10, 0, NULL, &b, &nb) == TSDB_ERR_INVALID && nb == 0);
+        free(b);
+    }
+    tsdbc_close(c);
+    pthread_join(th, NULL);
+    close(lfd);
+    CHECK(fake_others == 0); /* only HELLO went out */
+}
+
 static void test_framing(void)
 {
     int rfd = raw_connect();
@@ -2327,6 +2396,8 @@ int main(int argc, char **argv)
     test_close(c);
     test_framing();
     test_hello();
+    test_old_server(6);
+    test_old_server(5);
     test_types(c);
     test_nan(c);
     test_lttb_remote(c);
