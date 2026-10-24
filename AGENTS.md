@@ -96,11 +96,13 @@ cgroup, so `nice` does not keep your work out of its way.
   records (16-byte rows) are still read; keep it that way, `test_types` writes
   both by hand. Value blocks name their codec, so new codecs can be added
   without a version bump; changing an existing layout needs one.
-- **Protocol** versions only add: version 2 typed operations, 3 packed
-  inserts, 4 QUERY_BOUNDS. Old clients keep working, except that grouping by a
-  time zone other than UTC now needs a version 4 client: the server refuses
-  zones. A new client asks HELLO and falls back for an old server. A change to
-  the wire format has to reach the C, Rust, Python and Java clients.
+- **Protocol.** There has been no release yet, so the wire protocol may change
+  without keeping old clients working (the user decided this on 2026-10-24): no
+  legacy paths for earlier protocol versions in new designs. Every change must
+  reach the C, Rust, Python and Java clients in the same commit, with
+  `make test-clients` green. History so far: version 2 typed operations, 3
+  packed inserts, 4 QUERY_BOUNDS (the server knows UTC only). This does not
+  apply to the on-disk format: old parts and WAL records stay readable.
 
 ## Conventions
 
