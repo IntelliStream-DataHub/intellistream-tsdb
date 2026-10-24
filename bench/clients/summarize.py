@@ -13,11 +13,20 @@ from pathlib import Path
 # the aggregates cover the same window. A client that draws other windows (another generator, a wrong step) differs.
 ROWS_PER_QUERY_TOLERANCE = 0.10
 
-ORDER = ["embedded-fsync", "embedded-nofsync", "embedded", "c", "rust", "python", "java"]
+ORDER = ["embedded-fsync", "embedded-nofsync", "embedded",
+         "embedded-rust-fsync", "embedded-rust-nofsync", "embedded-rust",
+         "embedded-python-fsync", "embedded-python-nofsync", "embedded-python",
+         "c", "rust", "python", "java"]
 NAMES = {
     "embedded-fsync": "embedded C, fsync on",
     "embedded-nofsync": "embedded C, fsync off",
     "embedded": "embedded C",
+    "embedded-rust-fsync": "embedded Rust, fsync on",
+    "embedded-rust-nofsync": "embedded Rust, fsync off",
+    "embedded-rust": "embedded Rust",
+    "embedded-python-fsync": "embedded Python, fsync on",
+    "embedded-python-nofsync": "embedded Python, fsync off",
+    "embedded-python": "embedded Python",
     "c": "C over TCP",
     "rust": "Rust over TCP",
     "python": "Python over TCP",
@@ -112,7 +121,7 @@ def main():
             else:
                 bad += 1
 
-    print("# Embedded C and tsdbd clients\n")
+    print("# Embedded and tsdbd clients\n")
     print("```\n" + (d / "facts.txt").read_text().rstrip() + "\n```\n")
     if loadavgs:
         print(f"Load average (1 min) before each measurement: {min(loadavgs):.2f} to {max(loadavgs):.2f}. "
@@ -123,7 +132,8 @@ def main():
     print(f"Correctness: {verified} loads checked against the file (row count, sum and every timestamp and value of every series), "
           f"{bad} mismatches.\n")
     print("Each cell is the median of the repetitions (± half the spread, as a percentage of the median). "
-          "Embedded rows call libtsdb in this process; the others go through tsdbd on 127.0.0.1.\n")
+          "Embedded rows call libtsdb in this process (from C, Rust or Python); the others go through tsdbd on "
+          "127.0.0.1.\n")
 
     conns = sorted({k[2] for k in loads})
     lrows = sorted({(k[0], k[1]) for k in loads}, key=lambda x: (ORDER.index(x[0]), -x[1]))

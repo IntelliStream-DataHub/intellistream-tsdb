@@ -29,3 +29,7 @@ required-features = ["embedded"]
 [[example]]
 name = "embedded_bench"
 required-features = ["embedded"]
+
+[[example]]
+name = "embedded_suite"
+required-features = ["embedded"]

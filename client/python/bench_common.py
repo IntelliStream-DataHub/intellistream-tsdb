@@ -48,10 +48,11 @@ def cpu_s():
     return time.process_time()
 
 
-def report_query(client, klass, threads, queries, rows, secs, cpu):
+def report_query(client, klass, threads, queries, rows, secs, cpu, unit="conn"):
+    """unit names what runs the queries in the human line: "conn" (connections) or "thr" (threads of an embedded Db)."""
     cid, label, _, _, _ = klass
     print(
-        f"  {label:<44} {threads:>3} conn {queries / secs:>10.0f} q/s  {secs * threads / queries * 1e6:>8.1f} us/q"
+        f"  {label:<44} {threads:>3} {unit} {queries / secs:>10.0f} q/s  {secs * threads / queries * 1e6:>8.1f} us/q"
         f"  {rows / secs / 1e6:>7.1f} Mrows/s"
     )
     print(

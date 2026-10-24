@@ -214,7 +214,9 @@ It prints rows per second and bytes sent per row. Try `--compression 0` to compa
 
 `examples/query_bench.rs` runs the random query windows of `tsdbc-bench query` from this client
 (`--conns N` threads, `--seconds S`); `../../bench/clients/run.sh` runs it next to the other clients and the
-embedded library.
+embedded library. `examples/embedded_bench.rs` (feature `embedded`) loads and queries the same way through an
+embedded `Db` (`--load FILE`, `--qps THREADS`, as `tsdb-bench`), and `examples/embedded_suite.rs` runs the
+whole default suite of `tsdb-bench` through it.
 
 ## Embedded
 

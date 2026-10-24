@@ -1,5 +1,6 @@
 #!/bin/bash
-# Embedded C and the four tsdbd clients (C, Rust, Python, Java) on one data set: loads and queries, side by side.
+# Embedded C, Rust and Python and the four tsdbd clients (C, Rust, Python, Java) on one data set: loads and queries,
+# side by side.
 # See README.md. Usage:
 #   bench/clients/run.sh [--work DIR] [--port N] [--series 100] [--points 1000000] [--repeat 3] [--seconds 3]
 #                        [--conns "1 4 16"] [--qthreads "1 32"] [--clients "c rust python java"]
@@ -24,7 +25,7 @@ MAXLOAD=2   # load average at the start
 MAXBUSY=1   # CPUs other processes may keep busy before a measurement (see quiet_wait)
 PYVENV=${PYVENV:-$B/pyvenv}
 
-usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '3,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 while [ $# -gt 0 ]; do
     case $1 in
     --work) WORK=$2; shift 2 ;;
@@ -42,6 +43,10 @@ while [ $# -gt 0 ]; do
     *) usage ;;
     esac
 done
+# The embedded benchmarks: tsdb-bench (C) and, for the clients in --clients that have one, the same modes through the
+# Rust and Python embedded Db (client/rust/examples/embedded_bench.rs, client/python/bench_embedded.py).
+EMBEDDED="c"
+for c in rust python; do case " $CLIENTS " in *" $c "*) EMBEDDED="$EMBEDDED $c" ;; esac; done
 
 load1() { cut -d' ' -f1 /proc/loadavg; }
 if [ "$FORCE" != 1 ] && awk -v l="$(load1)" -v m=$MAXLOAD 'BEGIN { exit !(l > m) }'; then
@@ -91,7 +96,7 @@ PY=$PYVENV/bin/python
 if [ "$BUILD" = 1 ]; then
     echo "== building"
     make -C "$ROOT" -j"$(nproc)" >"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; }
-    case " $CLIENTS " in *" rust "*) (cd "$ROOT/client/rust" && cargo build --release --examples) >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; } ;; esac
+    case " $CLIENTS " in *" rust "*) (cd "$ROOT/client/rust" && cargo build --release --features embedded --examples) >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; } ;; esac
     case " $CLIENTS " in *" python "*)
         if [ ! -x "$PYVENV/bin/maturin" ]; then python3 -m venv "$PYVENV" && "$PYVENV/bin/pip" -q install maturin numpy >>"$OUT/build.log" 2>&1 || exit 1; fi
         (cd "$ROOT/client/python" && VIRTUAL_ENV=$PYVENV "$PYVENV/bin/maturin" develop --release) >>"$OUT/build.log" 2>&1 || { tail -n 20 "$OUT/build.log"; exit 1; }
@@ -117,7 +122,7 @@ JAVA="java --enable-native-access=ALL-UNNAMED -cp $JAVA_CP"
     case " $CLIENTS " in *" rust "*) echo "rustc:     $(rustc --version)" ;; esac
     case " $CLIENTS " in *" python "*) echo "python:    $($PY --version 2>&1), numpy $($PY -c 'import numpy; print(numpy.__version__)' 2>/dev/null || echo none)" ;; esac
     case " $CLIENTS " in *" java "*) echo "java:      $(java -version 2>&1 | head -n 1), zstd-jni $(basename "${ZSTDJNI:-none}")" ;; esac
-    echo "run:       series=$SERIES points=$POINTS repeat=$REPEAT seconds/class=$SECONDS_PER_CLASS conns=($CONNS) qthreads=($QTHREADS) clients=(embedded $CLIENTS)"
+    echo "run:       series=$SERIES points=$POINTS repeat=$REPEAT seconds/class=$SECONDS_PER_CLASS conns=($CONNS) qthreads=($QTHREADS) embedded=($EMBEDDED) clients=($CLIENTS)"
     echo "tsdbd:     defaults: fsync on, wal_sync_ms 0 (an insert is acknowledged once durable), zstd 1 storage, $(nproc) workers"
 } >"$OUT/facts.txt"
 cat "$OUT/facts.txt"
@@ -181,6 +186,13 @@ record() {
     if [ $rc -ne 0 ]; then echo "FAILED ($rc): $*" >&2; exit 1; fi
     printf '%s\n' "$out" | grep '^RESULT ' | sed "s/^RESULT /RESULT $tag load1=$l busy=$BUSY /" >>"$LOG"
 }
+embedded_cmd() { # lang
+    case $1 in
+    c) echo "$B/tsdb-bench" ;;
+    rust) echo "$RUSTX/embedded_bench" ;;
+    python) echo "$PY $ROOT/client/python/bench_embedded.py" ;;
+    esac
+}
 client_load_cmd() { # client conns level
     local c=$1 k=$2 l=$3
     case $c in
@@ -211,9 +223,12 @@ if [ "$ONLY" != query ]; then
     for rep in $(seq "$REPEAT"); do
         echo "== loads, repetition $rep of $REPEAT"
         for k in $CONNS; do
-            for fs in on off; do
-                echo "  embedded, $k threads, fsync $fs"
-                record "phase=load rep=$rep" "$B/tsdb-bench" --dir "$EMB" --load "$DATAFILE" --threads "$k" $([ $fs = off ] && echo --no-fsync)
+            for e in $EMBEDDED; do
+                for fs in on off; do
+                    echo "  embedded $e, $k threads, fsync $fs"
+                    # shellcheck disable=SC2046
+                    record "phase=load rep=$rep" $(embedded_cmd "$e") --dir "$EMB" --load "$DATAFILE" --threads "$k" $([ $fs = off ] && echo --no-fsync)
+                done
             done
         done
         for c in $CLIENTS; do
@@ -246,8 +261,11 @@ if [ "$ONLY" != load ]; then
     for rep in $(seq "$REPEAT"); do
         for q in $QTHREADS; do
             echo "== queries, $q threads/connections, repetition $rep of $REPEAT"
-            echo "  embedded"
-            record "phase=query rep=$rep" "$B/tsdb-bench" --dir "$EMB" --qps "$q" --series "$SERIES" --points "$POINTS" --seconds "$SECONDS_PER_CLASS"
+            for e in $EMBEDDED; do
+                echo "  embedded $e"
+                # shellcheck disable=SC2046
+                record "phase=query rep=$rep" $(embedded_cmd "$e") --dir "$EMB" --qps "$q" --series "$SERIES" --points "$POINTS" --seconds "$SECONDS_PER_CLASS"
+            done
             for c in $CLIENTS; do
                 echo "  $c"
                 # shellcheck disable=SC2046

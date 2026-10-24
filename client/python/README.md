@@ -195,6 +195,8 @@ It prints rows per second and bytes sent per row. Try `--compression 0` to compa
 
 `bench_query.py` runs the random query windows of `tsdbc-bench query` (`--conns N` threads, which share the GIL;
 see the file). `../../bench/clients/run.sh` runs both next to the other clients and the embedded library.
+`bench_embedded.py` loads and queries the same way through an embedded `Db` (`--load FILE`, `--qps THREADS`, as
+`tsdb-bench`), and `bench_embedded_suite.py` runs the whole default suite of `tsdb-bench` through it.
 
 ## Embedded
 

@@ -1,10 +1,12 @@
-# Embedded C and the four tsdbd clients, side by side
+# Embedded C, Rust and Python and the four tsdbd clients, side by side
 
-One data set, loaded and queried by the same program in six ways:
+One data set, loaded and queried by the same program in eight ways:
 
 | row in the tables | program | path |
 |---|---|---|
 | embedded C, fsync on / off | `build/tsdb-bench --load`, `--qps` | libtsdb in the process: no server, no network |
+| embedded Rust, fsync on / off | `client/rust/examples/embedded_bench.rs --load`, `--qps` | `tsdb_client::Db` (feature `embedded`): the engine compiled into the crate |
+| embedded Python, fsync on / off | `client/python/bench_embedded.py --load`, `--qps` | `tsdb_client.Db` over the Rust `Db`, threads |
 | C over TCP | `build/tsdbc-bench` | `client/tsdb_client.c` to tsdbd |
 | Rust over TCP | `client/rust/examples/insert_bench.rs`, `query_bench.rs` | `tsdb-client` crate |
 | Python over TCP | `client/python/bench_insert.py`, `bench_query.py` | `tsdb_client` (PyO3 over the Rust crate), threads |
@@ -38,15 +40,16 @@ kept and printed with the results. It refuses to start when something already li
 
 What it does:
 
-1. Builds everything (`make`, `cargo build --release --examples`, `maturin develop --release`, `mvn package`).
+1. Builds everything (`make`, `cargo build --release --features embedded --examples`, `maturin develop --release`, `mvn package`).
 2. Records the machine: CPU, memory, kernel, governor, file system, git revision, tool versions.
 3. Exports the data set once with `tsdb-bench --export` (mixed sensor kinds, time-major).
-4. Loads, per repetition: embedded with 1, 4 and 16 threads and fsync on and off; then for each client 1, 4 and
-   16 connections with zstd level 1 (the client default) and with plain arrays. Before every TCP load the
+4. Loads, per repetition: embedded (C, and Rust and Python when they are in `--clients`) with 1, 4 and 16
+   threads and fsync on and off; then for each client 1, 4 and 16 connections with zstd level 1 (the client
+   default) and with plain arrays. Before every TCP load the
    tsdbd data directory is wiped and tsdbd restarted. After every load the contents are checked against the
    file: in every series the same row count and sum (from the aggregate path the query benchmarks use) and the
    same rows read back, checked by a hash over all (timestamp, value) pairs, so a loader that stores a wrong
-   timestamp fails (`tsdb-bench --load` does it in process, `tsdbc-bench verify` through the server). A mismatch
+   timestamp fails (`tsdb-bench --load` and the Rust and Python embedded benchmarks do it in process, `tsdbc-bench verify` through the server). A mismatch
    stops the run.
 5. Queries: the data set is loaded once into the embedded database and once into tsdbd (and merged,
    `tsdb_optimize`), then for each repetition and each of 1 and 32 threads or connections, every system runs
