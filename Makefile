@@ -103,6 +103,7 @@ test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/t
 	B=$(B) tests/test_cli_lttb.sh
 	./$(B)/test_twa
 	./$(B)/test_spread
+	B=$(B) tests/test_cli_spread.sh
 	./$(B)/test_follow
 	./$(B)/test_volumes
 	TSDBD=$(TSDBD) ./$(B)/test_ports

@@ -15,6 +15,7 @@ static void usage(void)
             "                                     (values by the series' type; null or empty: null;\n"
             "                                     new series are float32)\n"
             "  query <series> <start> <end> [raw|count|sum|min|max|avg|all] [group] [--tz ZONE]\n"
+            "        also range, stddev_pop, stddev_samp, var_pop, var_samp (stddev, var: the _pop ones)\n"
             "        [--desc] [--limit N]         newest first; at most N rows or buckets\n"
             "  query <series> <start> <end> lttb N  N points that keep the shape (for charts)\n"
             "  query <series> <start> <end> twa [group] [--linear] [--max-gap INTERVAL] [--tz ZONE]\n"
@@ -416,50 +417,91 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     }
     if (strcmp(mode, "twa") == 0)
         return query_twa(db, id, start, end, grouped ? &g : NULL, interval, &tw, &q);
-    tsdb_bucket *b;
-    size_t nb;
-    if (grouped)
-        rc = tsdb_query_group_local(db, id, start, end, &g, &q, &b, &nb);
-    else if (interval) {
-        rc = tsdb_query_agg(db, id, start, end, interval, &b, &nb);
-        if (rc == 0) { /* order and limit as tsdb_query_group_ex applies them */
-            if (q.order == TSDB_DESC)
-                for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
-                    tsdb_bucket x = b[i];
-                    b[i] = b[j];
-                    b[j] = x;
-                }
-            if (q.limit && nb > q.limit)
-                nb = q.limit;
-        }
-    } else
-        rc = tsdb_query_group_ex(db, id, start, end, NULL, &q, &b, &nb);
+    /* the spread costs a second pass over the rows: asked for only by the modes that print it */
+    static const char *const spread_modes[] = {"all", "range", "stddev", "stddev_pop", "stddev_samp",
+                                               "var", "var_pop", "var_samp"};
+    bool spread = false;
+    for (size_t i = 0; i < sizeof spread_modes / sizeof *spread_modes; i++)
+        spread = spread || strcmp(mode, spread_modes[i]) == 0;
+    if (strcmp(mode, "stddev") == 0)
+        mode = "stddev_pop";
+    if (strcmp(mode, "var") == 0)
+        mode = "var_pop";
+    tsdb_spread_bucket *b = NULL;
+    tsdb_bucket *pb = NULL;
+    size_t nb = 0;
+    if (spread) {
+        if (grouped)
+            rc = tsdb_query_spread_group_local(db, id, start, end, &g, &q, &b, &nb);
+        else
+            rc = tsdb_query_spread(db, id, start, end, interval, &q, &b, &nb);
+    } else {
+        if (grouped)
+            rc = tsdb_query_group_local(db, id, start, end, &g, &q, &pb, &nb);
+        else if (interval) {
+            rc = tsdb_query_agg(db, id, start, end, interval, &pb, &nb);
+            if (rc == 0) { /* order and limit as tsdb_query_group_ex applies them */
+                if (q.order == TSDB_DESC)
+                    for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
+                        tsdb_bucket x = pb[i];
+                        pb[i] = pb[j];
+                        pb[j] = x;
+                    }
+                if (q.limit && nb > q.limit)
+                    nb = q.limit;
+            }
+        } else
+            rc = tsdb_query_group_ex(db, id, start, end, NULL, &q, &pb, &nb);
+        /* one loop below prints both */
+        if (rc == 0 && (b = calloc(nb ? nb : 1, sizeof *b)) == NULL)
+            rc = TSDB_ERR_NOMEM;
+        for (size_t i = 0; rc == 0 && i < nb; i++)
+            b[i].b = pb[i];
+        free(pb);
+    }
     if (rc)
         die("query", rc);
     tsdb_type type = TSDB_FLOAT32;
     tsdb_series_type(db, id, &type);
     bool all = strcmp(mode, "all") == 0, ints = type == TSDB_INT64 || type == TSDB_BOOL;
     if (all)
-        printf("time\tcount\tsum\tmin\tmax\tavg\n");
+        printf("time\tcount\tsum\tmin\tmax\tavg\trange\tstddev_pop\tstddev_samp\n");
     char tb[40];
     for (size_t i = 0; i < nb; i++) {
-        format_time(b[i].start, tb, sizeof tb);
-        char sum[32], mn[32], mx[32];
-        if (ints) { /* exact */
-            snprintf(sum, sizeof sum, "%" PRId64, b[i].isum);
-            snprintf(mn, sizeof mn, "%" PRId64, b[i].imin);
-            snprintf(mx, sizeof mx, "%" PRId64, b[i].imax);
+        const tsdb_bucket *x = &b[i].b;
+        const tsdb_spread_bucket *y = &b[i];
+        format_time(x->start, tb, sizeof tb);
+        char sum[32], mn[32], mx[32], rg[32], sp[32] = "";
+        if (ints) { /* exact; the range of int64 values fits only in 64 unsigned bits */
+            snprintf(sum, sizeof sum, "%" PRId64, x->isum);
+            snprintf(mn, sizeof mn, "%" PRId64, x->imin);
+            snprintf(mx, sizeof mx, "%" PRId64, x->imax);
+            if (x->count)
+                snprintf(rg, sizeof rg, "%" PRIu64, (uint64_t)x->imax - (uint64_t)x->imin);
+            else
+                snprintf(rg, sizeof rg, "%.17g", y->range);
         } else {
-            snprintf(sum, sizeof sum, "%.17g", b[i].sum);
-            snprintf(mn, sizeof mn, "%.17g", b[i].min);
-            snprintf(mx, sizeof mx, "%.17g", b[i].max);
+            snprintf(sum, sizeof sum, "%.17g", x->sum);
+            snprintf(mn, sizeof mn, "%.17g", x->min);
+            snprintf(mx, sizeof mx, "%.17g", x->max);
+            snprintf(rg, sizeof rg, "%.17g", y->range);
         }
-        if (!b[i].count && !all) /* only nulls */
-            snprintf(sum, sizeof sum, "\\N"), snprintf(mn, sizeof mn, "\\N"), snprintf(mx, sizeof mx, "\\N");
+        if (strcmp(mode, "stddev_pop") == 0)
+            snprintf(sp, sizeof sp, "%.9g", y->stddev_pop);
+        else if (strcmp(mode, "stddev_samp") == 0)
+            snprintf(sp, sizeof sp, "%.9g", y->stddev_samp);
+        else if (strcmp(mode, "var_pop") == 0)
+            snprintf(sp, sizeof sp, "%.9g", y->var_pop);
+        else if (strcmp(mode, "var_samp") == 0)
+            snprintf(sp, sizeof sp, "%.9g", y->var_samp);
+        if (!x->count && !all) /* only nulls */
+            snprintf(sum, sizeof sum, "\\N"), snprintf(mn, sizeof mn, "\\N"), snprintf(mx, sizeof mx, "\\N"),
+                snprintf(rg, sizeof rg, "\\N"), snprintf(sp, sizeof sp, "\\N");
         if (all)
-            printf("%s\t%" PRIu64 "\t%s\t%s\t%s\t%.9g\n", tb, b[i].count, sum, mn, mx, tsdb_bucket_avg(&b[i]));
+            printf("%s\t%" PRIu64 "\t%s\t%s\t%s\t%.9g\t%s\t%.9g\t%.9g\n", tb, x->count, sum, mn, mx,
+                   tsdb_bucket_avg(x), rg, y->stddev_pop, y->stddev_samp);
         else if (strcmp(mode, "count") == 0)
-            printf("%s\t%" PRIu64 "\n", tb, b[i].count);
+            printf("%s\t%" PRIu64 "\n", tb, x->count);
         else if (strcmp(mode, "sum") == 0)
             printf("%s\t%s\n", tb, sum);
         else if (strcmp(mode, "min") == 0)
@@ -467,7 +509,11 @@ static int cmd_query(tsdb *db, int argc, char **argv)
         else if (strcmp(mode, "max") == 0)
             printf("%s\t%s\n", tb, mx);
         else if (strcmp(mode, "avg") == 0)
-            printf("%s\t%.9g\n", tb, tsdb_bucket_avg(&b[i]));
+            printf("%s\t%.9g\n", tb, tsdb_bucket_avg(x));
+        else if (strcmp(mode, "range") == 0)
+            printf("%s\t%s\n", tb, rg);
+        else if (spread)
+            printf("%s\t%s\n", tb, sp);
         else
             usage();
     }
