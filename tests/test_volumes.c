@@ -29,6 +29,8 @@ static int failures;
     } while (0)
 
 #define NS 6
+
+uint64_t xxh64(const void *data, size_t len, uint64_t seed); /* the library's, to forge a record that checks out */
 #define T0 1700000000000LL
 #define SPAN 20000
 
@@ -84,6 +86,25 @@ static void *vol_writer(void *arg)
             want[j->s][slot] = v;
     }
     return NULL;
+}
+
+static void append_bytes(const char *path, const void *data, size_t n)
+{
+    int fd = open(path, O_WRONLY | O_APPEND);
+    CHECK(fd >= 0 && write(fd, data, n) == (ssize_t)n);
+    if (fd >= 0)
+        close(fd);
+}
+
+static void flip_byte(const char *path, off_t off)
+{
+    int fd = open(path, O_RDWR);
+    unsigned char c = 0;
+    CHECK(fd >= 0 && pread(fd, &c, 1, off) == 1);
+    c ^= 0x5a;
+    CHECK(fd >= 0 && pwrite(fd, &c, 1, off) == 1);
+    if (fd >= 0)
+        close(fd);
 }
 
 int main(int argc, char **argv)
@@ -215,8 +236,8 @@ int main(int argc, char **argv)
     char cat[600];
     snprintf(cat, sizeof cat, "%s/CATALOG", root);
     struct stat cs;
-    CHECK(stat(cat, &cs) == 0 && cs.st_size == (NS + 1) * 8);
-    CHECK(truncate(cat, cs.st_size - 8) == 0); /* "late.on_c" is no longer recorded */
+    CHECK(stat(cat, &cs) == 0 && cs.st_size == (NS + 1) * 16);
+    CHECK(truncate(cat, cs.st_size - 16) == 0); /* "late.on_c" is no longer recorded */
     OK(tsdb_open(root, &o, &db));
     uint32_t back;
     OK(tsdb_series_lookup(db, "late.on_c", &back));
@@ -232,6 +253,84 @@ int main(int argc, char **argv)
     CHECK(tsdb_series_at(db2, "steal", va, &x) == TSDB_ERR_INVALID);
     OK(tsdb_close(db2));
     OK(tsdb_close(db));
+
+    /* CATALOG: a torn tail is cut, so the next record starts on a boundary */
+    CHECK(stat(cat, &cs) == 0 && cs.st_size == (NS + 1) * 16);
+    off_t full = cs.st_size;
+    append_bytes(cat, "abc", 3);
+    OK(tsdb_open(root, &o, &db));
+    CHECK(stat(cat, &cs) == 0 && cs.st_size == full);
+    uint32_t after_torn = 0;
+    OK(tsdb_series(db, "after.torn", &after_torn));
+    CHECK(after_torn == NS + 1);
+    OK(tsdb_close(db));
+    OK(tsdb_open(root, &o, &db));
+    CHECK(tsdb_series_count(db) == NS + 2);
+    OK(tsdb_series_lookup(db, "after.torn", &back));
+    CHECK(back == after_torn);
+    check_all(db, ids);
+    OK(tsdb_close(db));
+    full += 16;
+
+    /* a run of zeros at the end (blocks allocated, data not written) is a torn tail too */
+    static const char zeros[40];
+    append_bytes(cat, zeros, sizeof zeros);
+    OK(tsdb_open(root, &o, &db));
+    CHECK(tsdb_series_count(db) == NS + 2);
+    OK(tsdb_close(db));
+    CHECK(stat(cat, &cs) == 0 && cs.st_size == full);
+
+    /* a damaged record with good ones after it: the open fails instead of renumbering or re-adding series */
+    flip_byte(cat, 16 + 1);
+    CHECK(tsdb_open(root, &o, &db) == TSDB_ERR_CORRUPT);
+    CHECK(tsdb_open(root, &o, &db) == TSDB_ERR_CORRUPT);
+    CHECK(stat(cat, &cs) == 0 && cs.st_size == full); /* nothing appended behind the damage */
+    flip_byte(cat, 16 + 1);
+
+    /* a record that checks out but names a series its volume does not have: damage, every time */
+    {
+        uint32_t vol = 0, local = 9999;
+        uint64_t gid = (uint64_t)full / 16;
+        uint8_t key[16], rec[16];
+        memcpy(key, &gid, 8);
+        memcpy(key + 8, &vol, 4);
+        memcpy(key + 12, &local, 4);
+        uint64_t check = xxh64(key, 16, 0x434154414c4f47ull);
+        memcpy(rec, &vol, 4);
+        memcpy(rec + 4, &local, 4);
+        memcpy(rec + 8, &check, 8);
+        append_bytes(cat, rec, 16);
+        CHECK(tsdb_open(root, &o, &db) == TSDB_ERR_CORRUPT);
+        CHECK(tsdb_open(root, &o, &db) == TSDB_ERR_CORRUPT);
+        CHECK(truncate(cat, full) == 0);
+    }
+
+    /* VOLUMES: a torn last line is cut; a volume added after it is found again */
+    char vols[600], vd[600];
+    snprintf(vols, sizeof vols, "%s/VOLUMES", root);
+    snprintf(vd, sizeof vd, "%s/tsdb-vol-%d/vol_d", base, (int)getpid());
+    append_bytes(vols, "0123abcd /half/a/pa", 19);
+    OK(tsdb_open(root, &o, &db));
+    uint32_t on_d;
+    OK(tsdb_series_at(db, "on.d", vd, &on_d));
+    OK(tsdb_append(db, on_d, T0, 1.0));
+    OK(tsdb_close(db));
+    OK(tsdb_open(root, &o, &db));
+    CHECK(tsdb_volume_count(db) == 5);
+    OK(tsdb_series_lookup(db, "on.d", &back));
+    CHECK(back == on_d);
+    OK(tsdb_query_points(db, back, INT64_MIN, INT64_MAX, &p));
+    CHECK(p.n == 1);
+    tsdb_points_free(&p);
+    OK(tsdb_close(db));
+
+    /* a damaged volume line with good ones after it fails the open */
+    flip_byte(vols, 12);
+    CHECK(tsdb_open(root, &o, &db) == TSDB_ERR_CORRUPT);
+    flip_byte(vols, 12);
+    OK(tsdb_open(root, &o, &db));
+    OK(tsdb_close(db));
+    printf("  torn CATALOG and VOLUMES tails cut, damage before good records fails the open\n");
 
     if (system(cmd) != 0)
         return 1;
