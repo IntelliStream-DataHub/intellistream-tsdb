@@ -395,6 +395,46 @@ each other here); `DUCK_THREADS=1` runs DuckDB with one thread per query instead
 `DUCK_MEMORY` sets its memory limit (24GB). `embq duckdb sql DB "EXPLAIN ..."` shows a plan: the
 time bounds are cast to `TIMESTAMP_MS` so that both reach the scan as plain table filters.
 
+## To add at the release run: LTTB and time-weighted averages
+
+The README's comparison table gets two more columns, measured like the others and checked against tsdb's
+answers: LTTB downsampling (the same 1000 points per series over the whole range) and time-weighted
+averages (step method, by hour, over the whole range, with the value carried in at each bucket's start).
+For each system use its built-in function where it has one, otherwise its usual window-function recipe in SQL,
+otherwise report "-" (not supported), and footnote which route each took:
+
+| system | LTTB | time-weighted average |
+|---|---|---|
+| ClickHouse | `largestTriangleThreeBuckets` (alias `lttb`; check the pinned version has it) | `lagInFrame`/`leadInFrame` window plus `avgWeighted` |
+| TimescaleDB | toolkit `lttb()` (needs the timescaledb toolkit in the image) | toolkit `time_weight()` and `average()` |
+| DuckDB, InfluxDB 3 (SQL), QuestDB | window-function SQL, if the dialect supports it | window-function SQL |
+| InfluxDB 2, Prometheus | - unless built in by then | - unless built in by then |
+
+LTTB answers must be the same points (first maximum wins on ties); time-weighted averages within a stated
+tolerance. The twa track's REPORT.md has the ClickHouse query.
+
+## To add at the release run: embedded ClickHouse (chDB)
+
+DuckDB runs in-process (embq.c), so its whole-range bucket query avoids the network and the serialisation of
+1.67 M result rows that the ClickHouse server pays, and ClickHouse's size-optimised codecs (DoubleDelta,
+Gorilla, ZSTD) decode one value at a time while DuckDB's lightweight encodings do not. To separate the two:
+add chDB (ClickHouse's engine as an in-process library, C API libchdb; pin a release at least two weeks old) to
+embq.c next to DuckDB and tsdb, with the same data, queries and answer checks, and the table created twice:
+with the server run's codecs and with ClickHouse's default (LZ4). chDB against the ClickHouse server then shows
+the cost of the network, Gorilla/DoubleDelta+ZSTD against LZ4 the cost of the codecs. Note how chDB hands back
+results through its C API (it may serialise to Arrow or another format in memory; DuckDB returns native
+vectors). `clickhouse local` is the other serverless form, but it is a separate process writing its output, so
+chDB is the fair embedded counterpart.
+
+## To add at the release run: compression per kind of sensor, one column per database
+
+The README's per-sensor table today compares compression methods (codec-bench). At the release run replace it
+with real on-disk sizes: load each sensor data set of tools/datasets.h (1 M readings each, plus random) on its
+own into every system (tsdb, ClickHouse, DuckDB, QuestDB native and Parquet, TimescaleDB, InfluxDB 2 and 3,
+Prometheus), let each settle (merges, compaction, compression jobs), and record the exact size on disk the same
+way as for the main table. One column per database: bytes per reading (and the ratio to 12 raw bytes). Sizes do
+not depend on machine load. Remove the containers and data afterwards.
+
 ## Fairness notes
 
 - **Durability at acknowledgement differs.** tsdb, PostgreSQL and both InfluxDBs flush to disk before

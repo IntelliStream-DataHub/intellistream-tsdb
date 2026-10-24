@@ -23,20 +23,46 @@ start, the tests and the benchmark results.
   replaces too), the last write wins (within one batch, the later row), and
   queries never return duplicates.
 - Time ranges are half open, `[start, end)`.
-- Aggregates: count, sum, min, max, avg. Integer types (int64, bool as 0/1)
+- A time range of one series can be deleted (`tsdb_delete_range`) or replaced
+  atomically (`tsdb_replace_range`). A delete is a write: a value written
+  after it returned is kept, one written before it is gone. A series can have
+  a retention limit (`tsdb_set_retention`): older values disappear from
+  queries at once and from disk in the background (see Storage).
+- Aggregates: count, sum, min, max, avg, and the spread: range (max - min),
+  population and sample variance and standard deviation (`var_pop`,
+  `var_samp`, `stddev_pop`, `stddev_samp`). Integer types (int64, bool as 0/1)
   aggregate exactly (`isum`, `imin`, `imax`; the sum saturates at the int64
   limits, `sum` holds it as a double). For states only the count is meaningful.
+  See "Spread" below for how variances stay exact.
 - Float sums are not bit-reproducible. A float sum depends on the order of the
   additions, and that order follows how parts were merged and how a query was
   split over threads, so the same rows can give sums that differ in the last
-  bits after a background merge (a sum that hits NaN can also come back with a
-  different NaN bit pattern). ClickHouse, PostgreSQL and DuckDB behave the same.
+  bits after a background merge, and where the running sum overflows a double
+  (rows near `DBL_MAX`), +inf in one order and NaN (inf - inf) in another.
+  ClickHouse, PostgreSQL and DuckDB behave the same.
   min, max and count are exact. Where reproducible sums matter, store the values
   as int64 in fixed point (21.3 degC as 21300 milli-degrees): sums are added in
   a 128-bit integer inside (and kept that way in each granule's statistics), so
   `isum` is exact whatever the order, as long as the total fits in an int64
   (about 9.2e18; beyond that it is clamped). int64 series compress as well as
   the fixed-point floats.
+- One NaN for every NaN result. A sum that hits NaN, and a min or max of a
+  bucket that holds only NaNs, is the quiet NaN `0x7ff8000000000000` (in
+  float32, as in the server's version 1 rows: `0x7fc00000`), from every query,
+  path (memtable, granule statistics, merged parts, threads) and client. An
+  addition of NaNs keeps the payload of whichever NaN came first, and that
+  order varies; PostgreSQL and ClickHouse do not canonicalise either, but print
+  every NaN as `NaN`, while tsdb's clients receive the bits. A NaN result is
+  never one of the null patterns (a signalling NaN with payload `0x1001`
+  quiets into the float64 null), and granule statistics store their sums
+  canonical too. Stored values are untouched: a raw query returns the NaN a
+  sensor wrote bit for bit.
+- All NaNs are equal. tsdb never compares stored values with each other (a
+  write replaces by key, not by value), and where results are compared (the
+  tests, the integration model) any NaN equals any other, as in PostgreSQL.
+  min and max differ from PostgreSQL on purpose: they skip NaNs and are NaN
+  only when a bucket has no other value, where PostgreSQL sorts NaN above
+  every number, so one sensor glitch would replace a bucket's max.
 - Buckets are fixed lengths aligned to the epoch, like `toStartOfInterval`,
   or calendar periods (day, ISO week, month, quarter, year) in UTC
   (`tsdb_query_group`), or buckets that begin at given instants
@@ -50,6 +76,94 @@ start, the tests and the benchmark results.
 - All functions are thread safe. One process opens a database for writing
   (`flock`); any number may open it `read_only` or follow it (below).
 
+## Spread: range, variance, standard deviation
+
+Whole granules answer the spread from their statistics like they answer sums,
+so the statistics must combine without losing precision. A raw sum of squares
+does not: pressure in Pa around 101325 with a spread of +-5 has squares near
+1e10 whose difference from n * mean^2 is the variance, and in a double that
+difference cancels to noise (or to a negative variance). So float series keep
+the stable form: per granule, besides count and sum, m2, the sum of squared
+deviations from the granule's mean. A run of decoded values gets its m2 in two
+passes, the mean first and then the squared deviations from it, corrected by
+their sum (the corrected two-pass algorithm); runs, granules, memtables and
+threads then combine with the parallel formula of Chan, Golub and LeVeque:
+m2 = m2a + m2b + d^2 * na * nb / (na + nb), d the difference of the means.
+Constant data gives exactly 0, and an offset costs no precision.
+
+int64 and bool keep exact sums instead: of x (128 bits, as for `isum`) and of
+x^2 in 192 bits, enough for 2^64 rows of int64 squares. The variance is
+computed once, at the end: n * S2 - S1^2 exactly in 256 bits, then
+converted to long double and divided by n^2 (or n (n - 1)) and rounded to a
+double. Nothing cancels, the error is a few roundings in the last bits of a
+long double (so close to, but not always, the correctly rounded double; on
+aarch64 long double is binary128 and the last bits can differ from x86-64),
+and the result depends only on the multiset of values, not on
+their order. m2 would not have done: the mean of integers is not an integer,
+and m2 of integers is a float with the reproducibility of float sums.
+
+What is bit-reproducible:
+
+- int64 and bool: every spread value, in every order, path and CPU.
+- Floats: the m2 of one run of rows is the same on every CPU level and kernel
+  (`TSDB_CPU`, `TSDB_SIMD`): the scalar, AVX2 and AVX-512 kernels keep 32
+  lanes and halve them in the same order, as for sums (test_spread checks all
+  of them bit for bit, on varied runs and on whole databases). How runs and granules combine follows how parts were
+  merged and the query split over threads, so like float sums the variances
+  may differ in the last bits after a merge.
+- range comes from min and max and is exact (for int64 the difference of two
+  exact integers, rounded once to a double; the CLI prints it as an exact
+  unsigned integer).
+
+NaN and infinities: min and max skip NaN, so the range does too; a NaN or an
+infinity among the values makes the variances and deviations NaN (the
+deviation of an infinity from the mean is undefined), the canonical NaN like
+every NaN result. So do finite float values whose sum overflows a double
+(two values of 1e308): the mean is then infinite. A bucket without known
+values gives NaN for all of them, a single value gives 0 for the population
+and NaN for the sample measures.
+
+The spread is opt in, because its second pass over decoded values costs time
+that count, sum, min, max and avg do not need: `tsdb_query_spread`,
+`tsdb_query_spread_group` and `tsdb_query_spread_bounds` (and
+`tsdb_query_spread_group_local` for calendar buckets) fill
+`tsdb_spread_bucket`, a `tsdb_bucket` followed by the five spread values.
+`tsdb_query_agg` and the other plain queries fold in one pass, skip the
+squares, and return the same bits as before; `tsdb_bucket` keeps its 64
+bytes, so bindings that mirror it are unchanged. Whole granules cost the same
+either way: their statistics hold m2 already. The engine keeps m2 and the sums
+of squares beside each bucket's state (`agg_dev`), not in it: a plain query
+of 10-row buckets holds one state per bucket, and a state of 80 instead of 48
+bytes made it 20-30% slower (`build/tsdb-bench`, buckets of 10 samples). With
+the state at 48 bytes the plain queries run as fast as before the spread.
+
+The three statistics cost 24 bytes per granule entry (160 instead of 136
+bytes: m2 or the low 64 bits of the integer sum of squares, and its other 128
+bits) and made the on-disk format version 5. Measured with `build/tsdb-bench`
+(100 series of 1 M rows, partly filled granules): 1.202 to 1.208 bytes a row,
++0.5%; 0.003 bytes a row in full 8192-row granules.
+
+Deletes, replaces and retention need nothing of their own: the spread is one
+more statistic of the aggregate path. Granules a newer tombstone overlaps are
+decoded, filtered and folded like memtable rows (the snapshot's entry windows
+never hand them out as whole granules), and a query starts at the retention
+cutoff, so a granule that straddles it is decoded too. Merges re-encode every
+granule a tombstone or the cutoff touched through the part writer, which
+computes m2 and the sums of squares of the rows that are left, so whole
+granules answer from statistics again, exactly, once the rows are gone from
+the files (`test_spread`'s `test_deletes` checks this against the reference,
+with and without background merges, on followers and at every CPU level).
+
+Over the protocol the spread is optional (version 8; 7 is range deletes):
+QUERY_BUCKETS and QUERY_BOUNDS take a `fields` byte, and with `TSDB_SPREAD`
+each 64-byte bucket row is followed by the five doubles. A request without
+the byte gets the old rows and the server runs the plain, one-pass query, so
+clients that do not know the spread read replies unchanged and pay nothing.
+The C client's `tsdbc_query_agg`, `_group` and `_bounds` never send the byte;
+`tsdbc_query_spread`, `_spread_group` and `_spread_bounds` send it, and
+against a server older than version 8 fail with `TSDB_ERR_INVALID` without a
+request.
+
 ## Query statistics
 
 Every query counts what it touched, on the thread that runs it and on the
@@ -62,6 +176,161 @@ the command line prints them after each query. "Rows" are the rows a query
 covered, as ClickHouse counts processed rows: a granule answered from its
 statistics counts its rows without reading them, which is how a scan can
 report billions of rows a second.
+
+## Downsampling: LTTB
+
+`tsdb_query_lttb` (and `QUERY_LTTB`, `tsdbc_query_lttb`, `tsdb DIR query S A B
+lttb N`) returns N of a range's points that keep the series' shape on a chart:
+Largest-Triangle-Three-Buckets (Sveinn Steinarsson, "Downsampling Time Series
+for Visual Representation", 2013). The points are real stored points with their
+exact values, in time order, so a chart of 1,000 points from a billion looks
+like the billion, spikes included, where per-bucket averages would flatten them.
+
+The algorithm, over the n points of the range:
+
+- The first and the last point are kept. Points 1 .. n-2 fall into N-2 buckets
+  of nearly equal count: bucket b starts at `floor(b * every) + 1` with
+  `every = (n-2)/(N-2)` in doubles, exactly as the paper's code, ClickHouse's
+  `largestTriangleThreeBuckets` and the TimescaleDB toolkit's `lttb()` bound
+  them, so that the same points come out. Exact integer division
+  (`b(n-2)/(N-2)`) would be the cleaner rule, but where b·every rounds just
+  below an integer it starts the bucket one point later: n = 17 with N = 13
+  already differs, and so do about 5% of random (n, N) pairs up to n = 1e8,
+  each such case changing the chosen points. Past n = 2^53 the doubles lose
+  whole points of a boundary, as they do in those systems.
+- From each bucket, the point that forms the largest triangle with the point
+  kept from the previous bucket and the mean (time, value) of the next bucket
+  is kept; for the last bucket, the "next bucket" is the rest of the points
+  from `floor((N-2) * every) + 1`: the last point, or the last two where that
+  product rounds below n-2 (as in the paper's code). The area
+  is the paper's `|(ax - cx)(y - ay) - (ax - x)(cy - ay)| / 2`. Of equal areas
+  the first point wins; if no area compares (an overflow to NaN, only with
+  values near the float64 limit), the bucket's first point.
+- n <= N returns every point. N < 3 is `TSDB_ERR_INVALID`: one or two points
+  would only be the ends, which a caller can ask for directly, and a silent
+  "first and last" for a chart of 2 pixels hides a mistake.
+- Points are the known, finite values. Nulls, NaN and infinities are skipped:
+  they have no place on a chart, and one NaN would make every area of the
+  previous bucket NaN through the mean. State series are `TSDB_ERR_INVALID`
+  (codes have no order to draw); bools are 0 and 1; int64 values are rounded
+  to doubles for the area only.
+- x is milliseconds since the range's first point, as a double: epoch
+  milliseconds (1.7e12) squared in the area would lose the low bits that
+  separate neighbouring points.
+- Where other systems can still choose differently: they skip no NaN (a NaN
+  area never wins there, and poisons the next bucket's mean), and they measure
+  x from the epoch (ClickHouse) or in their own unit, which rounds the areas
+  differently; only areas equal to the last bits can then pick another point.
+
+How it reads (src/query.c, one snapshot for every pass, so concurrent inserts,
+flushes and merges cannot tear the result, and followers work as for any
+query):
+
+1. **Count.** The bucket boundaries need n. The granules of the range are
+   grouped like the aggregates' clusters; a granule that lies inside the range,
+   overlaps no other source (so holds no replaced row) and has a finite float
+   sum (a NaN or an infinity would make it NaN or infinite) counts
+   `count - nulls` from its index entry without decoding. The rest (the range's
+   edges, overlapping sources through the deduplicating merge, granules with
+   NaN, memtable rows) are streamed and counted.
+2. **Choose.** Choosing in bucket b needs the mean of bucket b+1, known only
+   once that bucket has been read. While two buckets fit in 32 MiB (16 bytes a
+   point: timestamp and value; buckets up to 1M points), one pass keeps the
+   points of the bucket being chosen from and of the one being read, and
+   chooses when the next bucket ends. Larger buckets (a billion points into a
+   few hundred) take two passes instead: the means of every bucket first
+   (O(N) memory), then the choice while streaming again. Both add the
+   coordinates in time order from zero, so they produce the same means and the
+   same points; `test_lttb` runs every case both ways.
+
+Cost: one decode of the range (two for huge buckets) plus the count, which
+decodes nothing for the granules alone in their span: on 10M points, about
+two to three times a raw read of the same range. Memory: up to 32 MiB of
+buffered buckets per running query (so on a server, times its query workers),
+or O(N) means; plus, as for the aggregates, one 32-byte item per granule of the
+range and per memtable run for the count (a series of 1e10 points in
+8192-row granules: 1.2M items, about 39 MB). The
+query statistics describe one read of the range, as for a raw query, with the
+points returned as `result_rows`; the count and the means pass are not added.
+
+Tests: `tests/test_lttb.c` checks the engine point for point against a
+straightforward array implementation (`tests/lttb_ref.h`) over what
+`tsdb_query_values` returns: random walks, steps, spikes, constants, monotonic
+series, NaN and infinities, values near the float64 limit, irregular times,
+nulls, every numeric type, thresholds 3, 4, n-1, n, n+1 and beyond, ranges
+that cut granules; with the data in memtables, in overlapping parts with
+corrections, merged, and through a follower. `test_server` does the same over
+the network.
+
+## Time-weighted averages
+
+Sensors that report irregularly or only when their value changes make a plain
+average wrong: a value that held for an hour counts as much as one that held
+for a second. `tsdb_query_twa` (and `_group`, `_bounds`, `QUERY_TWA` on the
+wire, `twa` in the command line) weights each value by how long it held. The
+contract is in `include/tsdb.h`; in short, following OSIsoft PI and
+TimescaleDB's `time_weight` where they agree:
+
+- Consecutive readings of a series bound a segment `[t_i, t_i+1)`. STEP
+  (last observation carried forward) holds `v_i` over it; LINEAR runs a
+  straight line from `v_i` to `v_i+1` (trapezoids).
+- A null holds nothing: under STEP it ends the previous value; under LINEAR a
+  segment with a null at either end covers nothing. With `max_gap_ms`, a
+  segment longer than that covers nothing (the value is stale, and LINEAR does
+  not interpolate across an outage). The last reading holds nothing: it waits
+  for the next one, never runs up to "now".
+- Segments are cut exactly at bucket edges and at the range's start and end
+  (LINEAR interpolates the value there). The value in force at a bucket's
+  start comes from the last reading before it, however long ago (within
+  `max_gap_ms`), so a bucket with no reading of its own still has an average.
+  ClickHouse has no time-weighted average; the usual SQL (window functions and
+  `avgWeighted`) loses exactly this carried-in value.
+- A bucket reports the area (value x ms), the covered time and their
+  quotient, plus the count of readings in it. Areas and covered times add, so
+  buckets combine into longer averages. NaN propagates (the canonical quiet
+  NaN); bool series give the fraction of time they were true (run time); state
+  series are refused.
+
+**The fast path.** Each granule's index entry carries what makes whole
+granules combinable without decoding them: the first and last value (and
+whether they are null), the STEP and LINEAR areas of the segments inside the
+granule with the durations they cover (integer ms), and the longest gap
+between its rows (`granule_twa` in `src/twa.c`, called by the part writer
+with the other statistics for inserts, memtable flushes and merges that
+re-encode; a merge that copies a granule's bytes copies its entry). A query lists the granules of every source
+(parts and memtables) around the range in time order. A granule that lies
+inside the range and inside one bucket, whose longest gap is within
+`max_gap_ms`, and that no other source overlaps contributes its stored areas;
+the segment joining it to its neighbour comes from its first and last value
+and the neighbour's. Only granules that a bucket edge or the range cuts, and
+time spans where sources overlap (corrections: last write wins, merged
+exactly as the raw query does), are decoded, in parallel on the query pool.
+`tsdb_twa_opts.no_stats` turns the fast path off for benchmarks
+(`build/twa-bench`).
+
+Outside the range only two readings matter: the latest before it and the
+earliest after it. Of the granules outside the range a query keeps those that
+hold them (several only where sources tie on that time, merged by last write
+wins), and takes their first and last values from the index entry without
+decoding. So a query without a staleness limit, whose snapshot spans the whole
+history, costs the same for a series of ten years in daily partitions as for
+one of a day: otherwise every part would add a decoded granule.
+
+The fast path pays off for buckets much wider than a granule. A granule of
+8192 on-change readings can span hours; hourly buckets then cut nearly every
+granule and run at decode speed (about 1.4 G rows a second, one series of 1 G
+rows), while daily buckets take 82% of the granules from statistics and run
+five times faster (`build/twa-bench`).
+
+A TWA bucket needs no reading of its own (a segment across it is enough), so
+two readings far apart could ask for a bucket per millisecond between them. A
+request gets at most 4M buckets (`TSDB_ERR_TOO_MANY_BUCKETS` beyond), which
+fits one reply frame and bounds its memory to some 400 MB.
+
+The statistics cost 56 bytes per granule entry (136 instead of 80 bytes): 0.007
+bytes a row in full 8192-row granules, and 0.013 bytes a row measured on
+on-change data with partly filled granules (1.189 to 1.202 bytes a row, +1.1%).
+They made the on-disk format version 4.
 
 ## Storage
 
@@ -88,13 +357,16 @@ one insert (or produced by one merge), sorted by `(series, ts)`:
 header | ts block, value block, ts block, value block, ... | granule index | footer
 ```
 
-A granule is up to 8192 rows of one series. Its 80-byte index entry holds
+A granule is up to 8192 rows of one series. Its 136-byte index entry holds
 the series, min/max timestamp, row count, null count, the sum, min and max of
 the known values (doubles for floats; exact for integers: int64 min/max and a
-128-bit sum), block offsets and a checksum of the granule's blocks. The
+128-bit sum), block offsets and a checksum of the granule's blocks, and the
+time-weighted statistics (first and last value, STEP and LINEAR areas, the
+time they cover and the longest gap between rows: see "Time-weighted
+averages"). The
 header, the index and the footer (WAL segment, row count, time range) are
 covered by one more checksum, checked when the part is opened. The on-disk
-format is version 3; a database of another version is refused at open
+format is version 4; a database of another version is refused at open
 (there is no release yet, so no older format is read). The index is the sparse primary index of MergeTree: finding a series'
 rows in a time range is a binary search, and aggregates over whole granules
 are answered from the stored statistics without decompressing anything.
@@ -125,6 +397,110 @@ removed and parts covered by a merged part are deleted.
 Each part records the WAL segment it contains, so recovery replays a segment
 only into partitions that do not already hold its rows, even after a crash in
 the middle of a flush.
+
+### Deletes, replaces and retention (src/delete.c, src/tomb.c, src/retention.c)
+
+**Tombstones live in parts.** `tsdb_delete_range(series, start, end)` writes
+a range tombstone `{series, start, end}`, and only into parts: never into the
+WAL or a memtable. A part's tombstones hide the rows of that series in
+`[start, end)` in every part of the same partition with a *lower* block number;
+they never hide the rows of their own part, nor memtable rows. That is the
+existing last-write-wins order (a higher block is newer, memtables are newer
+than every part), so a delete needs no ordering of its own:
+
+- A delete runs like a large insert. It flushes the memtable first (rows
+  acknowledged before it get older block numbers), then finds every listed
+  part with rows of the series in the range and writes one small
+  tombstone-only part per such partition, outside `publish_lock`, so writers
+  and flushes do not wait for those fsyncs. Under `publish_lock` it looks
+  again and writes one more for a partition that got rows of the series in
+  between (rare), then commits them all through `parts_commit` (an intent file
+  when there is more than one). It returns once they are fsync'd and
+  published. Anything published later (a flush, a large
+  insert) has a higher block number and is newer than the delete; a partition
+  that held no rows of the series in the range needs no tombstone.
+- A replace is the tombstone parts plus the new rows' parts in one
+  `parts_commit`, tombstones first (lower blocks): one intent, so a reader or a
+  crash sees the old rows or the new ones. Rows outside `[start, end)` are
+  refused.
+- The WAL, the memtable, WAL replay and the follower's tail are unchanged.
+  Replay skips a partition by its parts' `wal_seq`; a tombstone part carries
+  none, and a merge output that ends up with no rows is still kept as an
+  (empty) part, so that the `wal_seq` anchor of the rows it replaced survives
+  and a stale WAL segment cannot replay deleted rows back. Such an anchor is
+  needed only while a segment up to its `wal_seq` may come back at open (an
+  unlink not yet made durable): once every such segment is unlinked and the
+  directory synced, the merge thread retires a partition left with nothing but
+  anchors, so deleted or expired partitions do not stay behind for good.
+
+**On disk.** A part with tombstones has an optional trailer between the index
+and the footer: `n x {u32 series, u32 0, i64 start, i64 end}`, then `u32 n,
+u32 'TOMB'`; `index_hash` covers it. Parts without tombstones are byte for byte
+what they were, so `FORMAT_VERSION` stays; an older binary rejects a part with
+a trailer at open (its size does not match) and never misreads one. **No
+downgrade while tombstone parts exist**: the older binary calls such a part
+broken and suggests renaming it to `.broken`, which would bring every deleted
+row back. Run `tsdb_optimize` before going back: a merge of a whole partition
+leaves no older part for tombstones to hide, so it drops them all. A part's
+`min_ts`/`max_ts` cover its tombstones, and a part may hold 0 granules.
+
+**Queries.** A snapshot that has no part with tombstones costs one test per
+part and nothing more. Otherwise, for each part p, the tombstones that apply to
+it are those of newer snapshot parts of its partition (their lowest block above
+p's highest). Granules of p that intersect them are decoded, filtered and
+treated as a memtable-like run with p's priority; p's other granules stay as
+they are, and aggregates keep using their statistics. So granule statistics
+are never used for a granule a tombstone touches, and once a merge has removed
+the rows they are exact again with no special case.
+
+The snapshot records, per part, the window of index entries the query may use
+(`sn.gi`/`sn.gj`, found with `snap_find`): the granules of the series in
+range, minus those moved to mem runs. Every reader that goes past its range
+(TWA looking for the readings before and after it, LTTB's counting pass) must
+stay inside that window. Looking a part up directly (`part_find` on
+`sn.parts`) would see a tombstoned granule a second time, deleted rows
+included: LTTB counted such granules twice and read garbage, TWA carried a
+deleted reading into the range. Inside the window, the nearest granule before
+or after the range is the nearest live reading, because tombstoned granules
+are mem runs holding only their live rows. TWA's fast path therefore applies
+unchanged to the untouched granules; a TWA query without a staleness limit
+takes a snapshot of the whole history and so decodes every tombstoned granule
+of the series until merges remove the deleted rows. Measured (30 days of one
+float64 reading a second, optimized, then one one-row delete a day, merges
+off; a one-hour TWA on day 29): without a staleness limit 245760 rows decoded
+and about 1 ms, against 8192 rows and 0.11 ms with a 60 s limit or without the
+deletes (rows exact, times on a loaded machine). A query that searched outward
+from its range for the nearest live reading would decode only the nearest dirty
+run on each side; it is not done, since merges bound the cost.
+
+**Merges** drop the rows of each source hidden by the tombstones of a newer
+source, and never copy a granule that intersects them. The output keeps the
+union of the sources' tombstones (clipped by retention), unless no part of the
+partition is older than the merge's lowest block: then nothing is left for
+them to hide and they go.
+
+**Retention.** `tsdb_set_retention(series, limit_ms)` appends a record
+`[u32 check][u32 series][i64 limit_ms]` to the file `RETENTION` (fsync'd, last
+record per series wins, a torn tail is cut like `SERIES`; an older binary
+ignores the file), then republishes MANIFEST so followers reload it. Set it
+right after creating a series to have it from the start. "now" is the wall
+clock (`tsdb_options.clock_ms`, default `CLOCK_REALTIME`) but never goes back
+within a process, and it starts no earlier than the newest part's mtime at
+open: after the clock is stepped back nothing expired reappears; a clock
+stepped forward expires rows early, and for good once a merge has removed
+them. A series' cutoff is `now - limit`:
+
+- queries clamp their start to the cutoff, so expired rows vanish at once.
+  A query that reads before its start stops at the cutoff too: TWA carries no
+  reading in from before it (a decoded granule straddling the cutoff starts no
+  segment at an expired reading), and LTTB counts and buckets only rows from
+  the cutoff on;
+- every merge drops rows below the cutoff;
+- the merge thread, at most once a second, drops a whole partition once every
+  series in it (its rows and its tombstones) has expired (retired like
+  `drop_before`, never unlinked at once), and rewrites alone a part that holds
+  expired rows and was written more than `retention_merge_s` (default 3600)
+  ago. Writes and queries never wait for it.
 
 ### Storage errors
 
@@ -600,6 +976,8 @@ build/tsdb /data/sensors import < rows.csv          # series,time,value (null or
 build/tsdb /data/sensors insert pump7.flow < p.csv  # time,value
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2024-01-02 avg 5m
 build/tsdb /data/sensors query pump7.flow now-1h now raw
+build/tsdb /data/sensors query pump7.pressure 2024-01-01 2024-01-02 stddev 1h   # also range, stddev_samp, var, var_samp
+build/tsdb /data/sensors query pump7.temp 2024-01-01 2024-02-01 twa 1d --tz Europe/Oslo --max-gap 10m
 build/tsdb /data/sensors stats
 build/tsdb /data/sensors parts
 build/tsdb /data/sensors optimize

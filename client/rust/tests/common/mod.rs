@@ -1,18 +1,19 @@
-//! Starts `build/tsdbd` for one test: a free port and a fresh data directory.
+//! Starts `build/tsdbd` for one test: a port tsdbd chose and a fresh data directory.
 //!
 //! The binary is `$TSDBD` or `../../build/tsdbd` (build it with `make` in the
 //! repository root); data goes under `$TSDB_TEST_DIR` or the system temp
-//! directory. The server is ready once it prints its "serving" line, which it
-//! does after binding: a successful connect alone could reach another server
-//! that already holds the port.
+//! directory. The server is ready once it has written its port file
+//! (`--port 0 --port-file`: "PORT PID"); the pid must be the child's, so a
+//! test never talks to a server it did not start.
 
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tsdb_client::Client;
 
@@ -51,38 +52,60 @@ impl Server {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/tsdbd"));
         assert!(bin.exists(), "{} is missing: run make in the repository root", bin.display());
-        let mut log = String::new();
-        for _ in 0..10 {
-            let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-            let mut child = Command::new(&bin)
-                .arg("--dir")
-                .arg(&dir)
-                .args(["--port", &port.to_string(), "--no-fsync", "--workers", "4"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn tsdbd");
-            let mut stderr = BufReader::new(child.stderr.take().unwrap());
-            let mut line = String::new();
-            loop {
-                line.clear();
-                if stderr.read_line(&mut line).unwrap_or(0) == 0 {
-                    break; // exited, most likely because the port was taken
-                }
-                log.push_str(&line);
-                if line.contains("serving") {
-                    std::thread::spawn(move || {
-                        for l in stderr.lines().map_while(Result::ok) {
-                            eprintln!("{l}");
-                        }
-                    });
-                    return Server { child: Some(child), port, dir };
+        // tsdbd picks its port (--port 0) and writes "PORT PID" to this file once it serves: no port is
+        // computed here, and the pid in the file must be the child started here.
+        let pf = dir.with_extension("port");
+        let _ = std::fs::remove_file(&pf);
+        let mut child = Command::new(&bin)
+            .arg("--dir")
+            .arg(&dir)
+            .args(["--port", "0", "--port-file"])
+            .arg(&pf)
+            .args(["--no-fsync", "--workers", "4"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            // The sanitizer runs (asan/tsan of the embedded engine) preload their runtime into the test binary;
+            // tsdbd is not instrumented, and under a preloaded TSan its SIGTERM handler waits for an intercepted
+            // call that its io_uring_enter never makes, so the server would never stop.
+            .env_remove("LD_PRELOAD")
+            .env_remove("TSAN_OPTIONS")
+            .env_remove("ASAN_OPTIONS")
+            .spawn()
+            .expect("spawn tsdbd");
+        let log = Arc::new(Mutex::new(String::new()));
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        let sink = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for l in stderr.lines().map_while(Result::ok) {
+                eprintln!("{l}");
+                let mut g = sink.lock().unwrap();
+                g.push_str(&l);
+                g.push('\n');
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Some(st) = child.try_wait().expect("wait for tsdbd") {
+                panic!("tsdbd exited with {st} before it listened:\n{}", log.lock().unwrap());
+            }
+            if let Ok(text) = std::fs::read_to_string(&pf) {
+                let mut it = text.split_whitespace().map(|x| x.parse::<u32>());
+                if let (Some(Ok(port)), Some(Ok(pid))) = (it.next(), it.next()) {
+                    let _ = std::fs::remove_file(&pf);
+                    if pid != child.id() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("{} names pid {pid}, but the server started here is pid {}", pf.display(), child.id());
+                    }
+                    return Server { child: Some(child), port: port as u16, dir };
                 }
             }
-            let _ = child.wait();
+            std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("tsdbd did not start:\n{log}");
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("tsdbd did not write {} in 30 s:\n{}", pf.display(), log.lock().unwrap());
     }
 
     pub fn addr(&self) -> String {

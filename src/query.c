@@ -27,6 +27,7 @@
  */
 #include "internal.h"
 
+#include <math.h>
 #include <stdlib.h>
 
 #define MAX_BUCKETS (64u << 20)
@@ -36,25 +37,24 @@
 
 /* --------------------------------------------------------------- snapshot */
 
-typedef struct snapshot {
-    part **parts;
-    size_t np;
-    mem_run *mem; /* rows of the series from memtables, oldest memtable first */
-    size_t nmem;
-} snapshot;
 
-static void snapshot_release(snapshot *s)
+void snapshot_release(snapshot *s)
 {
     db_release(s->parts, s->np);
     for (size_t i = 0; i < s->nmem; i++)
         mem_run_free(&s->mem[i]);
     free(s->mem);
+    free(s->gi);
+    free(s->gj);
+    free(s->mprio);
     memset(s, 0, sizeof *s);
 }
 
+static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start, int64_t end);
+
 /* Parts and memtables as of one instant: a flush publishes its parts and
  * retires its memtable under db->lock, so nothing is seen twice or missed. */
-static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
+int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
 {
     memset(s, 0, sizeof *s);
     memtable *ms[MAX_FLUSHING];
@@ -125,13 +125,15 @@ static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int6
         s->mem[s->nmem++] = active;
     else
         mem_run_free(&active);
+    if (rc == 0)
+        rc = snapshot_prepare(db, s, series, start, end);
     if (rc)
         snapshot_release(s);
     return rc;
 }
 
 /* Granules [*gi, *gj) of series s that may hold rows in [start, end). */
-static void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj)
+void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj)
 {
     const granule *g = p->g;
     uint32_t lo = 0, hi = p->ng;
@@ -154,24 +156,214 @@ static void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uin
     *gj = lo;
 }
 
+/* Entry i's granules that may hold rows in [start, end), within its window. */
+void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t start, int64_t end, uint32_t *gi,
+                      uint32_t *gj)
+{
+    if (start <= sn->start && end >= sn->end) { /* the snapshot's window is the answer: no second search */
+        *gi = sn->gi[i];
+        *gj = sn->gj[i];
+        return;
+    }
+    part_find(sn->parts[i], series, start, end, gi, gj);
+    /* both ends clamped into the window: an empty answer stays inside it, so a caller stepping one granule
+     * outward (TWA's neighbours) never reaches a granule the snapshot moved to mem */
+    *gi = MIN(MAX(*gi, sn->gi[i]), sn->gj[i]);
+    *gj = MAX(MIN(*gj, sn->gj[i]), sn->gi[i]);
+}
+
+typedef struct snap_build {
+    part **parts;
+    uint32_t *gi, *gj;
+    size_t np, pcap;
+    mem_run *mem;
+    uint64_t *mprio;
+    size_t nmem, mcap;
+} snap_build;
+
+static int sb_part(snap_build *b, part *p, uint32_t gi, uint32_t gj)
+{
+    if (b->np == b->pcap) {
+        size_t cap = b->pcap ? b->pcap * 2 : 16;
+        part **x = realloc(b->parts, cap * sizeof *x);
+        if (x)
+            b->parts = x;
+        uint32_t *y = realloc(b->gi, cap * sizeof *y);
+        if (y)
+            b->gi = y;
+        uint32_t *z = realloc(b->gj, cap * sizeof *z);
+        if (z)
+            b->gj = z;
+        if (!x || !y || !z)
+            return TSDB_ERR_NOMEM;
+        b->pcap = cap;
+    }
+    part_ref(p);
+    b->parts[b->np] = p;
+    b->gi[b->np] = gi;
+    b->gj[b->np] = gj;
+    b->np++;
+    return 0;
+}
+
+static int sb_mem(snap_build *b, mem_run r, uint64_t prio)
+{
+    if (b->nmem == b->mcap) {
+        size_t cap = b->mcap ? b->mcap * 2 : 8;
+        mem_run *x = realloc(b->mem, cap * sizeof *x);
+        if (x)
+            b->mem = x;
+        uint64_t *y = realloc(b->mprio, cap * sizeof *y);
+        if (y)
+            b->mprio = y;
+        if (!x || !y)
+            return TSDB_ERR_NOMEM;
+        b->mcap = cap;
+    }
+    b->mem[b->nmem] = r;
+    b->mprio[b->nmem] = prio;
+    b->nmem++;
+    return 0;
+}
+
+/* Granules [k, e) of p decoded, cut to [start, end), without the rows h deletes. */
+static int decode_visible(codec_ctx *cc, const part *p, uint32_t k, uint32_t e, int type, uint32_t series,
+                          int64_t start, int64_t end, const tomb_set *h, mem_run *out)
+{
+    size_t w = type_width(type), total = 0;
+    for (uint32_t x = k; x < e; x++)
+        total += p->g[x].count;
+    memset(out, 0, sizeof *out);
+    out->ts = malloc(total * sizeof *out->ts + 1);
+    out->v = malloc(total * w + 1);
+    if (!out->ts || !out->v)
+        return TSDB_ERR_NOMEM;
+    for (uint32_t x = k; x < e; x++) {
+        const granule *g = &p->g[x];
+        int64_t *ts = out->ts + out->n;
+        uint8_t *v = out->v + out->n * w;
+        int rc = granule_read(cc, p, g, type, ts, v, p->verify);
+        if (rc)
+            return rc;
+        size_t lo = lower_bound_i64(ts, g->count, start), hi = lower_bound_i64(ts, g->count, end);
+        if (lo) {
+            memmove(ts, ts + lo, (hi - lo) * sizeof *ts);
+            memmove(v, v + lo * w, (hi - lo) * w);
+        }
+        out->n += tomb_set_filter(h, series, INT64_MIN, ts, v, w, hi - lo);
+    }
+    return 0;
+}
+
+/*
+ * Each part entry gets its window of granules. When parts in the snapshot hold
+ * tombstones, a part's granules that the tombstones of newer parts (of its
+ * partition) touch are decoded and filtered into a run with the part's
+ * priority; its other granules stay entries of their own, so their statistics
+ * still answer aggregates. Without tombstones this is one part_find per part.
+ */
+static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start, int64_t end)
+{
+    s->start = start;
+    s->end = end;
+    s->gi = malloc((s->np + 1) * sizeof *s->gi);
+    s->gj = malloc((s->np + 1) * sizeof *s->gj);
+    s->mprio = malloc((s->nmem + 1) * sizeof *s->mprio);
+    if (!s->gi || !s->gj || !s->mprio)
+        return TSDB_ERR_NOMEM;
+    for (size_t i = 0; i < s->nmem; i++)
+        s->mprio[i] = UINT64_MAX - (s->nmem - i); /* memtables are newer than every part */
+    bool tombs = false;
+    for (size_t i = 0; i < s->np; i++) {
+        part_find(s->parts[i], series, start, end, &s->gi[i], &s->gj[i]);
+        tombs |= s->parts[i]->nt > 0;
+    }
+    if (!tombs)
+        return 0;
+
+    int type = eng_series_type(db, series);
+    snap_build b = {0};
+    codec_ctx *cc = NULL;
+    int rc = 0;
+    for (size_t i = 0; rc == 0 && i < s->np; i++) {
+        part *p = s->parts[i];
+        tomb_set h = {0};
+        for (size_t j = 0; rc == 0 && s->gi[i] < s->gj[i] && j < s->np; j++) {
+            const part *q = s->parts[j];
+            if (!q->nt || q->partition != p->partition || q->min_block <= p->max_block)
+                continue;
+            for (uint32_t t = 0; rc == 0 && t < q->nt; t++)
+                if (q->t[t].series == series && q->t[t].start < end && q->t[t].end > start)
+                    rc = tomb_set_add(&h, &q->t[t], 1);
+        }
+        tomb_set_finish(&h);
+        if (rc == 0 && h.n == 0) {
+            rc = sb_part(&b, p, s->gi[i], s->gj[i]);
+        } else {
+            for (uint32_t k = s->gi[i], e; rc == 0 && k < s->gj[i]; k = e) {
+                bool dirty = tomb_set_hits(&h, series, p->g[k].ts_min, p->g[k].ts_max);
+                for (e = k + 1; e < s->gj[i] && tomb_set_hits(&h, series, p->g[e].ts_min, p->g[e].ts_max) == dirty;)
+                    e++;
+                if (!dirty) {
+                    rc = sb_part(&b, p, k, e);
+                    continue;
+                }
+                if (!cc && !(cc = cc_get(db))) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                mem_run r;
+                rc = decode_visible(cc, p, k, e, type, series, start, end, &h, &r);
+                if (rc == 0 && r.n)
+                    rc = sb_mem(&b, r, p->max_block);
+                if (rc || !r.n)
+                    mem_run_free(&r);
+            }
+        }
+        tomb_set_free(&h);
+    }
+    if (cc)
+        cc_put(db, cc);
+    for (size_t i = 0; rc == 0 && i < s->nmem; i++) {
+        rc = sb_mem(&b, s->mem[i], s->mprio[i]);
+        if (rc == 0)
+            s->mem[i] = (mem_run){0}; /* moved */
+    }
+    if (rc) {
+        db_release(b.parts, b.np);
+        for (size_t i = 0; i < b.nmem; i++)
+            if (b.mprio[i] < UINT64_MAX - s->nmem) /* decoded here; memtable runs stay with s */
+                mem_run_free(&b.mem[i]);
+        for (size_t i = 0, k = 0; i < b.nmem; i++) /* give moved memtable runs back */
+            if (b.mprio[i] >= UINT64_MAX - s->nmem)
+                s->mem[k++] = b.mem[i];
+        free(b.gi);
+        free(b.gj);
+        free(b.mem);
+        free(b.mprio);
+        return rc;
+    }
+    db_release(s->parts, s->np);
+    free(s->gi);
+    free(s->gj);
+    free(s->mem);
+    free(s->mprio);
+    s->parts = b.parts;
+    s->gi = b.gi;
+    s->gj = b.gj;
+    s->np = b.np;
+    s->mem = b.mem;
+    s->mprio = b.mprio;
+    s->nmem = b.nmem;
+    return 0;
+}
+
 /* ---------------------------------------------------- deduplicating merge */
 
 /* A time-ordered stream of unique timestamps from one source: a range of a
  * part's granules, or a memtable run. */
-typedef struct src {
-    const part *p;   /* NULL for a memtable run */
-    uint32_t gi, gj; /* granules still to load */
-    uint64_t prio;   /* newer sources win on equal timestamps */
-    bool loaded;
-    size_t pos, n;   /* rows [pos, n) of ts/v are in range and unread */
-    int64_t *ts;
-    uint8_t *v;      /* slots of `type` */
-    int type;
-    size_t w;        /* slot width */
-    bool own;        /* ts/v are decode buffers owned by the cursor */
-} src;
 
-static void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type)
+void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type)
 {
     memset(c, 0, sizeof *c);
     c->p = p;
@@ -183,7 +375,7 @@ static void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int t
 }
 
 /* Memtable runs are newer than every part; later memtables are newer. */
-static void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type)
+void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type)
 {
     memset(c, 0, sizeof *c);
     c->prio = prio;
@@ -195,7 +387,7 @@ static void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type)
     c->w = type_width(type);
 }
 
-static void src_free(src *c)
+void src_free(src *c)
 {
     if (c->own) {
         free(c->ts);
@@ -246,7 +438,7 @@ static int src_advance(codec_ctx *cc, src *c, size_t rows, int64_t start, int64_
 /* Emits the union of the sources in time order, one row per timestamp: the
  * row of the source with the highest priority. Every live source is kept
  * decoded, so the head timestamps are exact. */
-static int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx)
+int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx)
 {
     int rc = 0;
     for (size_t i = 0; i < nc && rc == 0; i++)
@@ -408,7 +600,81 @@ static inline int64_t bk_start(const bucketer *bk, int64_t key)
     }
 }
 
+int64_t bucketer_key(const bucketer *bk, int64_t ts) { return bk_key(bk, ts); }
+int64_t bucketer_start(const bucketer *bk, int64_t key) { return bk_start(bk, key); }
+
 /* -------------------------------------------------------------- aggregate */
+
+/* u[k..] += x * y, in 64-bit limbs (the carry runs off the top of a 256-bit number: never, for the callers) */
+static void mul_add256(uint64_t u[4], int k, uint64_t x, uint64_t y)
+{
+    unsigned __int128 p = (unsigned __int128)x * y;
+    unsigned __int128 c = 0;
+    for (int i = k; i < 4; i++) {
+        c += u[i];
+        if (i == k)
+            c += (uint64_t)p;
+        else if (i == k + 1)
+            c += (uint64_t)(p >> 64);
+        u[i] = (uint64_t)c;
+        c >>= 64;
+    }
+}
+
+/* Integer variances from the exact sums: n^2 var_pop = n sum(x^2) - sum(x)^2,
+ * a 256-bit integer, exact; converted once to long double (64-bit mantissa on
+ * x86, so two roundings at most before the final one to double). Depends on
+ * the multiset of values only: the same bits whatever the order. */
+static void int_variance(const agg_state *a, const agg_dev *x, double *vp, double *vs)
+{
+    uint64_t n = a->count, A[4] = {0}, B[4] = {0}, D[4];
+    mul_add256(A, 0, n, (uint64_t)x->isq);
+    mul_add256(A, 1, n, (uint64_t)(x->isq >> 64));
+    mul_add256(A, 2, n, x->isq_hi);
+    unsigned __int128 s = a->isum < 0 ? -(unsigned __int128)a->isum : (unsigned __int128)a->isum;
+    uint64_t lo = (uint64_t)s, hi = (uint64_t)(s >> 64);
+    mul_add256(B, 0, lo, lo);
+    mul_add256(B, 1, lo, hi);
+    mul_add256(B, 1, lo, hi);
+    mul_add256(B, 2, hi, hi);
+    unsigned __int128 borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        unsigned __int128 d = (unsigned __int128)A[i] - B[i] - borrow;
+        D[i] = (uint64_t)d;
+        borrow = (d >> 64) ? 1 : 0;
+    }
+    long double num = 0;
+    for (int i = 3; i >= 0; i--)
+        num = num * 0x1p64L + (long double)D[i];
+    long double ln = (long double)n;
+    *vp = (double)(num / (ln * ln));
+    *vs = n > 1 ? (double)(num / (ln * (long double)(n - 1))) : nan_canonical();
+}
+
+void agg_spread(int type, const agg_state *a, const agg_dev *x, tsdb_spread_bucket *b)
+{
+    const double nan = nan_canonical();
+    double vp, vs;
+    b->range = b->var_pop = b->var_samp = b->stddev_pop = b->stddev_samp = nan;
+    if (type == TSDB_STATE || a->count == 0)
+        return;
+    if (type_is_int(type)) {
+        b->range = (double)((__int128)a->imax - a->imin);
+        int_variance(a, x, &vp, &vs);
+    } else {
+        if (a->min <= a->max) /* else only NaN values */
+            b->range = canon_nan(a->max - a->min);
+        /* constant data: exactly 0, where the means of the runs combined may differ in the last bit */
+        double m2 = a->min == a->max && isfinite(a->sum) ? 0 : x->m2;
+        vp = m2 / (double)a->count;
+        vs = a->count > 1 ? m2 / (double)(a->count - 1) : nan;
+    }
+    b->var_pop = canon_nan(vp);
+    b->var_samp = canon_nan(vs);
+    b->stddev_pop = canon_nan(__builtin_sqrt(vp));
+    b->stddev_samp = canon_nan(__builtin_sqrt(vs));
+}
+
 
 typedef struct local_bucket {
     int64_t b;
@@ -419,6 +685,7 @@ typedef struct agg_target {
     int64_t start, end, b0;
     const bucketer *bk;
     agg_state *acc;
+    agg_dev *accx; /* beside acc for the spread (tsdb_query_spread), else NULL */
     int type;
     size_t w;
 } agg_target;
@@ -427,20 +694,21 @@ typedef struct agg_target {
 
 /* One run of rows into a: float32 without nulls goes straight to the SIMD
  * kernel, which matters when buckets hold a handful of rows each. */
-static inline void fold_run(const agg_target *t, const uint8_t *v, size_t n, bool may_be_null, agg_state *a)
+static inline void fold_run(const agg_target *t, const uint8_t *v, size_t n, bool may_be_null, agg_state *a,
+                            agg_dev *x)
 {
     if (t->type == TSDB_FLOAT32 && !may_be_null) {
         a->rows += n;
-        simd_agg_f32((const float *)v, n, a);
+        simd_agg_f32((const float *)v, n, a, x);
     } else {
-        agg_fold_hint(t->type, v, n, may_be_null, a);
+        agg_fold_hint(t->type, v, n, may_be_null, a, x);
     }
 }
 
 /* Folds time-sorted rows (all within [start, end)) into per-bucket states,
- * one entry per bucket touched; returns the number of entries. */
+ * one entry per bucket touched (and its spread in outx, with t->accx); returns the number of entries. */
 static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, size_t n, bool may_be_null,
-                        local_bucket *out)
+                        local_bucket *out, agg_dev *outx)
 {
     const uint8_t *v = vv;
     if (!n)
@@ -448,7 +716,9 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, 
     if (t->bk->kind == BK_ONE) {
         out[0].b = t->b0;
         agg_init(&out[0].a, t->type);
-        fold_run(t, v, n, may_be_null, &out[0].a);
+        if (outx)
+            agg_dev_init(&outx[0]);
+        fold_run(t, v, n, may_be_null, &out[0].a, outx);
         return 1;
     }
     size_t nl = 0;
@@ -459,16 +729,23 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, 
         size_t e = bend == INT64_MAX ? n : i + 1 + lower_bound_i64(ts + i + 1, n - i - 1, bend);
         out[nl].b = b;
         agg_init(&out[nl].a, t->type);
-        fold_run(t, v + i * t->w, e - i, may_be_null, &out[nl].a);
+        if (outx)
+            agg_dev_init(&outx[nl]);
+        fold_run(t, v + i * t->w, e - i, may_be_null, &out[nl].a, outx ? &outx[nl] : NULL);
         nl++;
         i = e;
     }
     return nl;
 }
 
-static inline void fold_into(const agg_target *t, const local_bucket *l, size_t nl)
+static inline void fold_into(const agg_target *t, const local_bucket *l, const agg_dev *lx, size_t nl)
 {
     agg_state *acc = t->acc;
+    if (t->accx) { /* the spread: its cost stays out of the loops below */
+        for (size_t k = 0; k < nl; k++)
+            agg_combine(&acc[l[k].b - t->b0], &t->accx[l[k].b - t->b0], &l[k].a, &lx[k], t->type);
+        return;
+    }
     /* the type decided once, not per bucket: buckets can be a handful of rows each */
     if (t->type == TSDB_FLOAT32 || t->type == TSDB_FLOAT64) {
         for (size_t k = 0; k < nl; k++) {
@@ -482,13 +759,14 @@ static inline void fold_into(const agg_target *t, const local_bucket *l, size_t 
         }
     } else {
         for (size_t k = 0; k < nl; k++)
-            agg_combine(&acc[l[k].b - t->b0], &l[k].a, t->type);
+            agg_combine(&acc[l[k].b - t->b0], NULL, &l[k].a, NULL, t->type);
     }
 }
 
 typedef struct fold_ctx {
     const agg_target *t;
     local_bucket *scratch;
+    agg_dev *scratchx; /* with t->accx */
     size_t cap;
 } fold_ctx;
 
@@ -500,9 +778,15 @@ static int fold_emit(void *ctx, const int64_t *ts, const void *v, size_t n)
         if (!s)
             return 1;
         f->scratch = s;
+        if (f->t->accx) {
+            agg_dev *x = realloc(f->scratchx, n * sizeof *x);
+            if (!x)
+                return 1;
+            f->scratchx = x;
+        }
         f->cap = n;
     }
-    fold_into(f->t, f->scratch, fold_rows(f->t, ts, v, n, true, f->scratch));
+    fold_into(f->t, f->scratch, f->scratchx, fold_rows(f->t, ts, v, n, true, f->scratch, f->scratchx));
     return 0;
 }
 
@@ -535,7 +819,8 @@ static void agg_worker(void *arg, int idx)
     int64_t *ts = malloc(cap * sizeof *ts);
     uint8_t *v = malloc(cap * sizeof(uint64_t));
     local_bucket *local = malloc(cap * sizeof *local); /* a granule touches at most count buckets */
-    if (!cc || !ts || !v || !local) {
+    agg_dev *localx = j->t.accx ? malloc(cap * sizeof *localx) : NULL;
+    if (!cc || !ts || !v || !local || (j->t.accx && !localx)) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
         goto out;
     }
@@ -552,7 +837,8 @@ static void agg_worker(void *arg, int idx)
         size_t n = r->g->count;
         size_t lo = lower_bound_i64(ts, n, j->t.start);
         size_t hi = lower_bound_i64(ts, n, j->t.end);
-        size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, r->g->nulls > 0, local);
+        size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, r->g->nulls > 0, local,
+                              localx);
         if (nl) {
             /* local buckets ascend: fold each run that falls in one stripe under its lock */
             for (size_t a = 0; a < nl;) {
@@ -562,7 +848,7 @@ static void agg_worker(void *arg, int idx)
                     e++;
                 pthread_mutex_t *m = &j->locks[stripe % AGG_STRIPES];
                 pthread_mutex_lock(m);
-                fold_into(&j->t, local + a, e - a);
+                fold_into(&j->t, local + a, localx ? localx + a : NULL, e - a);
                 pthread_mutex_unlock(m);
                 a = e;
             }
@@ -574,6 +860,7 @@ out:
     free(ts);
     free(v);
     free(local);
+    free(localx);
     cur_qstats = mine;
 }
 
@@ -590,7 +877,11 @@ static int cmp_item(const void *a, const void *b)
     return (x->lo > y->lo) - (x->lo < y->lo);
 }
 
-static uint64_t mem_prio(const snapshot *sn, size_t i) { return UINT64_MAX - (sn->nmem - i); }
+uint64_t mem_prio(const snapshot *sn, size_t i) { return sn->mprio[i]; }
+
+/* Decoded runs take their part's max_block as priority, far below the memtables' UINT64_MAX - k; their rows are
+ * already counted in rows_decoded. */
+bool mem_from_memtable(const snapshot *sn, size_t i) { return sn->mprio[i] >= UINT64_MAX - sn->nmem; }
 
 int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
                   size_t *nout)
@@ -603,12 +894,14 @@ int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t 
     return eng_query_group(db, series, start, end, &bk, out, nout);
 }
 
-int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
-                    size_t *nout)
+/* out: tsdb_bucket, or with spread tsdb_spread_bucket (which begins with one) */
+static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool spread,
+                         void **out, size_t *nout)
 {
     *out = NULL;
     *nout = 0;
     int type = eng_series_type(db, series);
+    start = MAX(start, eng_cutoff(db, series)); /* expired rows are gone at once, merged away or not */
     if (start >= end || type < 0)
         return 0;
     snapshot sn;
@@ -623,12 +916,12 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
     for (size_t i = 0; i < sn.np + sn.nmem && rc == 0; i++) {
         uint32_t gi = 0, gj = 1;
         if (i < sn.np) {
-            part_find(sn.parts[i], series, start, end, &gi, &gj);
+            snap_find(&sn, i, series, start, end, &gi, &gj);
             if (gi < gj) {
                 QS_ADD(parts, 1);
                 QS_ADD(granules, gj - gi);
             }
-        } else {
+        } else if (mem_from_memtable(&sn, i - sn.np)) {
             QS_ADD(memtable_rows, sn.mem[i - sn.np].n);
         }
         for (uint32_t k = gi; k < gj; k++) {
@@ -658,6 +951,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
         }
     }
     agg_state *acc = NULL;
+    agg_dev *accx = NULL;
     gref *work = NULL;
     src *srcs = NULL;
     codec_ctx *cc = NULL;
@@ -677,16 +971,20 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
         nb = (size_t)span;
     }
     acc = malloc(nb * sizeof *acc);
+    accx = spread ? malloc(nb * sizeof *accx) : NULL;
     work = malloc(nitem * sizeof *work);
     srcs = malloc((sn.np + sn.nmem) * sizeof *srcs);
     cc = cc_get(db);
-    if (!acc || !work || !srcs || !cc) {
+    if (!acc || (spread && !accx) || !work || !srcs || !cc) {
         rc = TSDB_ERR_NOMEM;
         goto done;
     }
     for (size_t k = 0; k < nb; k++)
         agg_init(&acc[k], type);
+    for (size_t k = 0; spread && k < nb; k++)
+        agg_dev_init(&accx[k]);
     t.acc = acc;
+    t.accx = accx;
     fc.t = &t;
 
     /* clusters of items with overlapping time ranges */
@@ -717,10 +1015,11 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                 bool one = bmin == bmax; /* keys only grow with time: one key, one bucket */
                 if (inside && one) {
                     agg_state ga;
+                    agg_dev gx;
                     QS_ADD(granules_from_stats, 1);
                     QS_ADD(rows_from_stats, g->count);
-                    agg_from_granule(type, g, &ga);
-                    agg_combine(&acc[bmin - t.b0], &ga, type);
+                    agg_from_granule(type, g, &ga, accx ? &gx : NULL);
+                    agg_combine(&acc[bmin - t.b0], accx ? &accx[bmin - t.b0] : NULL, &ga, &gx, type);
                 } else
                     work[nwork++] = (gref){sn.parts[it->src], g};
             }
@@ -771,7 +1070,8 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
         size_t nonempty = 0;
         for (size_t k = 0; k < nb; k++)
             nonempty += acc[k].rows != 0;
-        tsdb_bucket *res = malloc((nonempty ? nonempty : 1) * sizeof *res);
+        size_t row = spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+        uint8_t *res = malloc((nonempty ? nonempty : 1) * row);
         if (!res) {
             rc = TSDB_ERR_NOMEM;
         } else {
@@ -779,8 +1079,11 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
             for (size_t k = 0; k < nb; k++) {
                 if (!acc[k].rows)
                     continue;
-                res[o].start = bk_start(bk, t.b0 + (int64_t)k);
-                agg_to_bucket(type, &acc[k], &res[o]);
+                tsdb_bucket *r = (tsdb_bucket *)(res + o * row);
+                r->start = bk_start(bk, t.b0 + (int64_t)k);
+                agg_to_bucket(type, &acc[k], r);
+                if (spread)
+                    agg_spread(type, &acc[k], &accx[k], (tsdb_spread_bucket *)r);
                 o++;
             }
             *out = res;
@@ -791,12 +1094,26 @@ done:
     if (cc)
         cc_put(db, cc);
     free(fc.scratch);
+    free(fc.scratchx);
     free(acc);
+    free(accx);
     free(work);
     free(srcs);
     free(items);
     snapshot_release(&sn);
     return rc;
+}
+
+int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
+                    size_t *nout)
+{
+    return query_buckets(db, series, start, end, bk, false, (void **)out, nout);
+}
+
+int eng_query_spread(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                     tsdb_spread_bucket **out, size_t *nout)
+{
+    return query_buckets(db, series, start, end, bk, true, (void **)out, nout);
 }
 
 /* -------------------------------------------------------------------- raw */
@@ -818,7 +1135,7 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
     (void)db;
     for (size_t i = 0; rc == 0 && i < sn->np; i++) {
         uint32_t gi, gj;
-        part_find(sn->parts[i], series, start, end, &gi, &gj);
+        snap_find(sn, i, series, start, end, &gi, &gj);
         if (gi < gj) {
             src_init_part(&cur[nc++], sn->parts[i], gi, gj, type);
             QS_ADD(parts, 1);
@@ -835,7 +1152,8 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
         if (lo >= hi)
             continue;
         clipped[i] = (mem_run){r->ts + lo, r->v + lo * w, hi - lo};
-        QS_ADD(memtable_rows, hi - lo);
+        if (mem_from_memtable(sn, i))
+            QS_ADD(memtable_rows, hi - lo);
         src_init_mem(&cur[nc++], &clipped[i], mem_prio(sn, i), type);
     }
     if (rc || nc == 0)
@@ -945,7 +1263,7 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
     for (size_t i = 0; rc == 0 && i < sn->np + sn->nmem; i++) {
         uint32_t gi = 0, gj = 1;
         if (i < sn->np)
-            part_find(sn->parts[i], series, start, end, &gi, &gj);
+            snap_find(sn, i, series, start, end, &gi, &gj);
         for (uint32_t k = gi; k < gj; k++) {
             if (ns == cap) {
                 span *s2 = realloc(sp, (cap *= 2) * sizeof *sp);
@@ -1030,6 +1348,7 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
                      slot_fn fn, void *ctx)
 {
     int type = eng_series_type(db, series);
+    start = MAX(start, eng_cutoff(db, series)); /* expired rows are gone at once, merged away or not */
     if (start >= end || type < 0)
         return 0;
     snapshot sn;
@@ -1050,6 +1369,439 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
             rc = 0;
     } else {
         rc = raw_range(db, cc, &sn, series, type, start, end, fn, ctx);
+    }
+    cc_put(db, cc);
+    snapshot_release(&sn);
+    return rc;
+}
+
+/* ------------------------------------------------------------------- lttb */
+
+/* Largest-Triangle-Three-Buckets (Steinarsson 2013) over the known, finite
+ * points of one series: point 0 and point n - 1 are kept; points 1 .. n - 2
+ * fall into nb = threshold - 2 buckets, bucket b holding [lttb_start(b),
+ * lttb_start(b + 1)) as the paper bounds them; from each bucket the point
+ * with the largest triangle (previously chosen point, the point, the mean of
+ * the next bucket) is kept.
+ * The bucket after the last one, whose mean the last choice uses, is
+ * [lttb_start(nb), n): the last point, or the last two where nb * every
+ * rounds below n - 2.
+ *
+ * The bucket boundaries need n, so a first pass counts the points: from the
+ * granule index where a granule lies inside the range, overlaps no other
+ * source and its statistics show no NaN or infinity (its float sum is finite),
+ * by streaming the rest. Choosing in bucket b needs the mean of bucket b + 1,
+ * known only once that bucket is read. Two exact ways, both on one snapshot:
+ *  - buffered: one pass that keeps the points of two buckets (16 bytes each);
+ *  - two passes: the means of every bucket first, then the choice while
+ *    streaming again, with O(threshold) memory.
+ * Buffered is used while two buckets fit in lttb_buffer_bytes; it decodes the
+ * range once instead of twice. Both add the coordinates in time order, so they
+ * choose the same points. */
+size_t lttb_buffer_bytes = 32u << 20;
+
+typedef struct lttb_buf {
+    int64_t *ts;
+    uint64_t *v; /* slot bits, zero-extended */
+    size_t n;
+} lttb_buf;
+
+typedef struct lttb_run {
+    int type;
+    size_t w;
+    uint64_t n, nb; /* points, buckets (threshold - 2) */
+    double every;   /* (n - 2) / nb, the paper's bucket width */
+    bool buffered;
+    int pass;       /* two passes: 1 sums the buckets, 2 chooses */
+    uint64_t i;     /* index of the next point */
+    uint64_t b;     /* bucket of the points being read; nb is the last point */
+    uint64_t bend;  /* first point of bucket b + 1 */
+    int64_t t0;     /* x is milliseconds since the first point */
+    double ax, ay;  /* the point chosen last */
+    double sx, sy;  /* sums of bucket b */
+    uint64_t cnt;
+    lttb_buf cur, nxt; /* buffered: bucket b - 1 (to choose from) and bucket b */
+    double *mx, *my;   /* two passes: mean of bucket b at [b - 1], b = 1 .. nb */
+    double best;       /* two passes: the choice so far in bucket b */
+    int64_t bts;
+    uint64_t bv;
+    double bx, by;
+    int64_t lts;       /* the last point read */
+    uint64_t lv;
+    int64_t ots[256];  /* chosen points not yet sent */
+    uint64_t ov[256];
+    uint8_t oslots[256 * 8];
+    size_t on;
+    slot_fn fn;
+    void *ctx;
+    int err;
+} lttb_run;
+
+/* A point's value as a double; false for nulls, NaN and infinities, which are
+ * not points (they have no place on a chart and would poison the means). */
+static inline bool lttb_value(int type, uint64_t x, double *y)
+{
+    switch (type) {
+    case TSDB_FLOAT32: {
+        float f;
+        uint32_t u = (uint32_t)x;
+        memcpy(&f, &u, 4);
+        *y = f;
+        return u != NULL_F32 && isfinite(f);
+    }
+    case TSDB_FLOAT64: {
+        double d;
+        memcpy(&d, &x, 8);
+        *y = d;
+        return x != NULL_F64 && isfinite(d);
+    }
+    case TSDB_INT64: *y = (double)(int64_t)x; return x != (uint64_t)NULL_I64;
+    default: *y = (double)x; return x != NULL_BOOL;
+    }
+}
+
+/* first point of bucket b (b <= nb): floor(b * every) + 1 in doubles, as in the
+ * paper's code, ClickHouse and the TimescaleDB toolkit, so that the same
+ * points come out. Exact integer division would differ where b * every rounds
+ * below an integer (n = 17, threshold 13: bucket 11 starts at 15, not 16). */
+static inline uint64_t lttb_start(const lttb_run *r, uint64_t b)
+{
+    return (uint64_t)floor((double)b * r->every) + 1;
+}
+
+static inline double lttb_x(const lttb_run *r, int64_t ts) { return (double)((uint64_t)ts - (uint64_t)r->t0); }
+
+/* the triangle's area, computed as in the paper */
+static inline double lttb_area(double ax, double ay, double cx, double cy, double x, double y)
+{
+    return fabs((ax - cx) * (y - ay) - (ax - x) * (cy - ay)) * 0.5;
+}
+
+static int lttb_flush_out(lttb_run *r)
+{
+    if (!r->on)
+        return 0;
+    for (size_t k = 0; k < r->on; k++)
+        slot_put(r->oslots, r->w, k, r->ov[k]);
+    size_t n = r->on;
+    r->on = 0;
+    if (r->fn(r->ctx, r->ots, r->oslots, n)) {
+        r->err = TSDB_ERR_STOPPED;
+        return 1;
+    }
+    return 0;
+}
+
+static int lttb_emit(lttb_run *r, int64_t ts, uint64_t v)
+{
+    r->ots[r->on] = ts;
+    r->ov[r->on++] = v;
+    return r->on == 256 ? lttb_flush_out(r) : 0;
+}
+
+/* buffered: bucket b is complete; choose from bucket b - 1 with its mean */
+static int lttb_choose_buffered(lttb_run *r)
+{
+    if (r->b >= 1) {
+        double cx = r->sx / (double)r->cnt, cy = r->sy / (double)r->cnt, best = -1;
+        size_t k = 0;
+        for (size_t j = 0; j < r->cur.n; j++) {
+            double y;
+            lttb_value(r->type, r->cur.v[j], &y);
+            double a = lttb_area(r->ax, r->ay, cx, cy, lttb_x(r, r->cur.ts[j]), y);
+            if (a > best) { /* the first of equal areas wins */
+                best = a;
+                k = j;
+            }
+        }
+        lttb_value(r->type, r->cur.v[k], &r->ay);
+        r->ax = lttb_x(r, r->cur.ts[k]);
+        if (lttb_emit(r, r->cur.ts[k], r->cur.v[k]))
+            return 1;
+    }
+    lttb_buf t = r->cur;
+    r->cur = r->nxt;
+    r->nxt = t;
+    r->nxt.n = 0;
+    return 0;
+}
+
+/* bucket b is complete */
+static int lttb_finish_bucket(lttb_run *r)
+{
+    if (r->buffered) {
+        if (lttb_choose_buffered(r))
+            return 1;
+    } else if (r->pass == 1) {
+        if (r->b >= 1) {
+            r->mx[r->b - 1] = r->sx / (double)r->cnt;
+            r->my[r->b - 1] = r->sy / (double)r->cnt;
+        }
+    } else if (r->b < r->nb) {
+        r->ax = r->bx;
+        r->ay = r->by;
+        if (lttb_emit(r, r->bts, r->bv))
+            return 1;
+    }
+    r->sx = r->sy = 0;
+    r->cnt = 0;
+    r->best = -1;
+    return 0;
+}
+
+static int lttb_point(lttb_run *r, int64_t ts, uint64_t v, double y)
+{
+    uint64_t i = r->i++;
+    r->lts = ts;
+    r->lv = v;
+    if (i >= r->n) {
+        r->err = TSDB_ERR_CORRUPT; /* the count disagrees with the rows */
+        return 1;
+    }
+    if (i == 0) {
+        r->t0 = ts;
+        r->ax = 0;
+        r->ay = y;
+        r->b = 0;
+        r->bend = lttb_start(r, 1);
+        r->best = -1;
+        return r->pass == 1 ? 0 : lttb_emit(r, ts, v);
+    }
+    if (i == r->bend) {
+        if (lttb_finish_bucket(r))
+            return 1;
+        r->b++;
+        r->bend = r->b < r->nb ? lttb_start(r, r->b + 1) : r->n;
+    }
+    double x = lttb_x(r, ts);
+    if (r->buffered) {
+        r->nxt.ts[r->nxt.n] = ts;
+        r->nxt.v[r->nxt.n++] = v;
+    } else if (r->pass == 2 && r->b < r->nb) {
+        double a = lttb_area(r->ax, r->ay, r->mx[r->b], r->my[r->b], x, y);
+        if (a > r->best || r->cnt == 0) { /* the first of equal areas wins */
+            r->best = a > r->best ? a : r->best;
+            r->bts = ts;
+            r->bv = v;
+            r->bx = x;
+            r->by = y;
+        }
+    }
+    r->sx += x;
+    r->sy += y;
+    r->cnt++;
+    return 0;
+}
+
+/* raw rows to lttb_point, without nulls, NaN and infinities */
+static int lttb_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_run *r = arg;
+    for (size_t k = 0; k < n; k++) {
+        uint64_t x = slot_get(v, r->w, k);
+        double y;
+        if (lttb_value(r->type, x, &y) && lttb_point(r, ts[k], x, y))
+            return 1;
+    }
+    return 0;
+}
+
+/* n <= threshold: every point, in runs straight from the decode buffers */
+static int lttb_all_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_run *r = arg;
+    size_t k = 0;
+    while (k < n) {
+        double y;
+        while (k < n && !lttb_value(r->type, slot_get(v, r->w, k), &y))
+            k++;
+        size_t a = k;
+        while (k < n && lttb_value(r->type, slot_get(v, r->w, k), &y))
+            k++;
+        if (k > a) {
+            r->i += k - a;
+            if (r->fn(r->ctx, ts + a, (const uint8_t *)v + a * r->w, k - a)) {
+                r->err = TSDB_ERR_STOPPED;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int lttb_count_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_run *r = arg;
+    for (size_t k = 0; k < n; k++) {
+        double y;
+        r->n += lttb_value(r->type, slot_get(v, r->w, k), &y);
+    }
+    return 0;
+}
+
+/* The known, finite points in [start, end), as one read of the snapshot would
+ * see them: granules alone in their time span count from the index. */
+static int lttb_count(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series, lttb_run *r, int64_t start,
+                      int64_t end)
+{
+    size_t cap = sn->nmem + 16, nitem = 0;
+    item *items = malloc(cap * sizeof *items);
+    int rc = items ? 0 : TSDB_ERR_NOMEM;
+    for (uint32_t s = 0; rc == 0 && s < sn->np; s++) {
+        uint32_t gi, gj;
+        snap_find(sn, s, series, start, end, &gi, &gj); /* never granules a tombstone hides: those are in mem */
+        for (uint32_t k = gi; k < gj; k++) {
+            if (nitem == cap) {
+                item *i2 = realloc(items, (cap *= 2) * sizeof *items);
+                if (!i2) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                items = i2;
+            }
+            const granule *g = &sn->parts[s]->g[k];
+            items[nitem++] = (item){g->ts_min, g->ts_max, s, g};
+        }
+    }
+    for (size_t m = 0; rc == 0 && m < sn->nmem; m++) {
+        const mem_run *mr = &sn->mem[m];
+        size_t lo = lower_bound_i64(mr->ts, mr->n, start), hi = lower_bound_i64(mr->ts, mr->n, end);
+        if (lo >= hi)
+            continue;
+        if (nitem == cap) {
+            item *i2 = realloc(items, (cap *= 2) * sizeof *items);
+            if (!i2) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            items = i2;
+        }
+        items[nitem++] = (item){mr->ts[lo], mr->ts[hi - 1], (uint32_t)(sn->np + m), NULL};
+    }
+    if (rc == 0)
+        qsort(items, nitem, sizeof *items, cmp_item);
+    for (size_t a = 0; a < nitem && rc == 0;) {
+        size_t b = a + 1;
+        int64_t hi = items[a].hi;
+        bool multi = false;
+        while (b < nitem && items[b].lo <= hi) {
+            multi |= items[b].src != items[a].src;
+            hi = MAX(hi, items[b].hi);
+            b++;
+        }
+        for (size_t k = a; k < b && rc == 0; k++) {
+            const granule *g = items[k].g;
+            if (!multi && g && g->ts_min >= start && g->ts_max < end &&
+                (type_is_int(r->type) || isfinite(g->fsum))) {
+                r->n += g->count - g->nulls; /* a NaN or an infinity makes the sum NaN or infinite */
+                continue;
+            }
+            /* a cluster of several sources goes through the deduplicating merge at once */
+            int64_t lo = multi ? items[a].lo : items[k].lo, h = multi ? hi : items[k].hi;
+            lo = MAX(lo, start);
+            h = MIN(h, end - 1);
+            if (lo <= h)
+                rc = raw_range(db, cc, sn, series, r->type, lo, h + 1, lttb_count_cb, r);
+            if (multi)
+                break;
+        }
+        a = b;
+    }
+    free(items);
+    return rc;
+}
+
+int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, slot_fn fn, void *ctx)
+{
+    if (threshold < 3)
+        return TSDB_ERR_INVALID;
+    int type = eng_series_type(db, series);
+    if (type == TSDB_STATE)
+        return TSDB_ERR_INVALID;
+    start = MAX(start, eng_cutoff(db, series)); /* expired rows are gone at once, merged away or not */
+    if (start >= end || type < 0)
+        return 0;
+    snapshot sn;
+    int rc = snapshot_take(db, series, type_width(type), start, end, &sn);
+    if (rc)
+        return rc;
+    codec_ctx *cc = cc_get(db);
+    if (!cc) {
+        snapshot_release(&sn);
+        return TSDB_ERR_NOMEM;
+    }
+    lttb_run *r = calloc(1, sizeof *r);
+    if (!r) {
+        rc = TSDB_ERR_NOMEM;
+        goto out;
+    }
+    r->type = type;
+    r->w = type_width(type);
+    r->fn = fn;
+    r->ctx = ctx;
+    /* statistics describe one read of the range: the count and the means are extra passes */
+    qstats *mine = cur_qstats;
+    cur_qstats = NULL;
+    rc = lttb_count(db, cc, &sn, series, r, start, end);
+    cur_qstats = mine;
+    if (rc || r->n == 0)
+        goto out;
+    if (r->n <= threshold) {
+        rc = raw_range(db, cc, &sn, series, type, start, end, lttb_all_cb, r);
+    } else {
+        r->nb = threshold - 2;
+        r->every = (double)(r->n - 2) / (double)r->nb;
+        /* the largest bucket: floor(e) + 1 points, one more for rounding; bucket nb (the
+         * last mean) holds n - lttb_start(nb) <= 2 */
+        uint64_t per = (r->n - 2) / r->nb + 2;
+        r->buffered = per <= lttb_buffer_bytes / 32;
+        if (r->buffered) {
+            r->cur.ts = malloc(per * sizeof(int64_t));
+            r->cur.v = malloc(per * sizeof(uint64_t));
+            r->nxt.ts = malloc(per * sizeof(int64_t));
+            r->nxt.v = malloc(per * sizeof(uint64_t));
+            if (!r->cur.ts || !r->cur.v || !r->nxt.ts || !r->nxt.v) {
+                rc = TSDB_ERR_NOMEM;
+                goto out;
+            }
+        } else {
+            r->mx = malloc(r->nb * sizeof *r->mx);
+            r->my = malloc(r->nb * sizeof *r->my);
+            if (!r->mx || !r->my) {
+                rc = TSDB_ERR_NOMEM;
+                goto out;
+            }
+            r->pass = 1;
+            cur_qstats = NULL;
+            rc = raw_range(db, cc, &sn, series, type, start, end, lttb_cb, r);
+            cur_qstats = mine;
+            if (rc == 0 && r->i != r->n)
+                rc = TSDB_ERR_CORRUPT; /* no means for the last buckets: send nothing */
+            if (rc == 0)
+                lttb_finish_bucket(r); /* the mean of the last bucket */
+            r->pass = 2;
+            r->i = 0;
+            r->sx = r->sy = 0;
+            r->cnt = 0;
+        }
+        if (rc == 0)
+            rc = raw_range(db, cc, &sn, series, type, start, end, lttb_cb, r);
+        if (rc == 0 && r->i == r->n && !lttb_finish_bucket(r) && !lttb_emit(r, r->lts, r->lv))
+            lttb_flush_out(r);
+    }
+    if (rc == TSDB_ERR_STOPPED || (rc == 0 && r->err))
+        rc = r->err ? r->err : TSDB_ERR_STOPPED;
+    if (rc == 0 && r->i != r->n)
+        rc = TSDB_ERR_CORRUPT; /* the granule index promised more points than the parts hold */
+out:
+    if (r) {
+        free(r->cur.ts);
+        free(r->cur.v);
+        free(r->nxt.ts);
+        free(r->nxt.v);
+        free(r->mx);
+        free(r->my);
+        free(r);
     }
     cc_put(db, cc);
     snapshot_release(&sn);

@@ -26,9 +26,12 @@ typedef struct eng eng;
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-/* 3: checksummed part header and footer, WAL records and dictionary records; databases
- * of older versions are refused (no release had them) */
-#define FORMAT_VERSION 3
+/* 3: checksummed part header and footer, WAL records and dictionary records;
+ * 4: time-weighted statistics in granule entries (136 bytes), range tombstones
+ * between the index and the footer; 5: the spread (m2 or the sum of squares) in
+ * granule entries (160 bytes), tombstones as in 4. Databases of older versions
+ * are refused (no release had them). */
+#define FORMAT_VERSION 5
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -212,7 +215,20 @@ int xor64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out);
 
 /* ---- SIMD kernels (simd.c), dispatched once at startup ---- */
 /* The statistics of one bucket. Only the half of the type is in use: buckets
- * of tiny intervals are many, so the state stays small. */
+ * of tiny intervals are many, so the state stays small.
+ *
+ * The spread (variance, standard deviation) of floats is kept in the stable
+ * form: m2, the sum of squared deviations from the mean (sum / count). A run
+ * of values gets its m2 in two passes (the mean, then the squared deviations
+ * from it, corrected by their sum), and states combine with the parallel
+ * formula of Chan, Golub and LeVeque (m2_merge), so an offset as large as
+ * 101325 Pa costs no precision on a spread of +-5 the way a raw sum of squares
+ * would (it cancels catastrophically). Integers keep the exact sum of squares
+ * instead: 192 bits (isq + isq_hi * 2^128) hold 2^64 rows of int64 squares,
+ * and the variance comes from exact integers once, at the end (agg_spread).
+ * Those live beside the state, in an agg_dev, which only queries for the
+ * spread keep: 48 bytes instead of 80 per bucket are worth 20-30% on buckets
+ * of ten rows. Every function taking an agg_dev takes NULL for "no spread". */
 typedef struct agg_state {
     uint64_t rows;  /* rows folded, nulls included */
     uint64_t count; /* known values */
@@ -222,11 +238,29 @@ typedef struct agg_state {
     };
 } agg_state;
 
-/* One NaN for every NaN sum. Which payload and sign an addition of NaNs keeps
- * depends on the operand order the compiler picked (ADDSD returns its first
- * NaN operand), and that differs between CPU levels and kernels; a sum must
- * not (levels.h). */
-static inline double canon_nan(double x) { return x == x ? x : __builtin_nan(""); }
+typedef struct agg_dev {
+    union {
+        double m2;                                              /* float32, float64 */
+        struct { unsigned __int128 isq; uint64_t isq_hi; };     /* int64, bool, state */
+    };
+} agg_dev;
+
+/* One NaN for every NaN result: the quiet NaN 0x7ff8000000000000 (as float32,
+ * 0x7fc00000). Which payload and sign an addition of NaNs keeps depends on the
+ * order of the additions (ADDSD returns its first NaN operand), and that varies
+ * with CPU levels, kernels, threads and merges; a result must not. Nor may a
+ * result carry a stored value's payload: a signalling NaN with payload 0x1001
+ * quiets into TSDB_NULL_F64_BITS. Stored values keep their bits; only results
+ * (and granule sums, which are results kept on disk) are canonical. */
+#define CANON_NAN_BITS 0x7ff8000000000000ull
+static inline double nan_canonical(void)
+{
+    uint64_t b = CANON_NAN_BITS;
+    double d;
+    memcpy(&d, &b, 8);
+    return d;
+}
+static inline double canon_nan(double x) { return x == x ? x : nan_canonical(); }
 
 static inline void agg_init(agg_state *a, int type)
 {
@@ -242,11 +276,57 @@ static inline void agg_init(agg_state *a, int type)
     }
 }
 
-static inline void agg_combine(agg_state *a, const agg_state *b, int type)
+static inline void agg_dev_init(agg_dev *x)
 {
-    a->rows += b->rows;
-    a->count += b->count;
+    x->isq = 0; /* covers m2 = 0 too */
+    x->isq_hi = 0;
+}
+
+/* The m2 of two runs together (Chan, Golub and LeVeque 1979): na values with
+ * sum sa and m2a, nb values with sum sb and m2b. One order of operations for
+ * every caller, so that a combination rounds the same everywhere. A NaN m2 is
+ * the canonical one: the payload of a NaN in the sums depends on the kernel. */
+static inline double m2_merge(uint64_t na, double sa, double m2a, uint64_t nb, double sb, double m2b)
+{
+    if (!nb)
+        return m2a;
+    if (!na)
+        return canon_nan(m2b);
+
+    double d = sb / (double)nb - sa / (double)na;
+    return canon_nan(m2a + m2b + d * d * ((double)na * (double)nb / ((double)na + (double)nb)));
+}
+
+
+/* Folds a run of c known float values into a: their sum s, and d1 and d2, the
+ * sums of their deviations from the run's mean s / c and of the squares of
+ * those (the second pass). d2 - d1^2 / c is the corrected two-pass m2 (Chan,
+ * Golub and LeVeque 1983): d1 makes up for the rounding of the mean. */
+static inline void agg_add_run(agg_state *a, agg_dev *x, uint64_t c, double s, double d1, double d2)
+{
+    if (!c)
+        return;
+    double m2 = d2 - d1 * d1 / (double)c;
+    if (m2 < 0) /* rounding, with constant data; NaN stays */
+        m2 = 0;
+    x->m2 = m2_merge(a->count, a->sum, x->m2, c, s, m2);
+    a->count += c;
+    a->sum += s;
+}
+
+/* adds the 192-bit sum of squares (lo + hi * 2^128) to x's */
+static inline void isq_add(agg_dev *x, unsigned __int128 lo, uint64_t hi)
+{
+    x->isq += lo;
+    x->isq_hi += hi + (x->isq < lo);
+}
+
+/* b (with bx) into a (with ax); ax NULL: without the spread (only queries for it pay for it) */
+static inline void agg_combine(agg_state *a, agg_dev *ax, const agg_state *b, const agg_dev *bx, int type)
+{
     if (type == TSDB_FLOAT32 || type == TSDB_FLOAT64) {
+        if (ax)
+            ax->m2 = m2_merge(a->count, a->sum, ax->m2, b->count, b->sum, bx->m2);
         a->sum += b->sum;
         if (b->min < a->min) a->min = b->min;
         if (b->max > a->max) a->max = b->max;
@@ -254,22 +334,31 @@ static inline void agg_combine(agg_state *a, const agg_state *b, int type)
         a->isum += b->isum;
         if (b->imin < a->imin) a->imin = b->imin;
         if (b->imax > a->imax) a->imax = b->imax;
+        if (ax)
+            isq_add(ax, bx->isq, bx->isq_hi);
     }
+    a->rows += b->rows;
+    a->count += b->count;
 }
 
-/* Folds float32 values (no nulls) into a: count, sum (in double), min and max (NaN ignored). */
-extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a);
-/* Folds n slots of `type` into a, skipping nulls (values.c). */
-void agg_fold(int type, const void *v, size_t n, agg_state *a);
-/* the same, skipping the search for nulls when the caller knows there are none (a granule's count) */
-void agg_fold_hint(int type, const void *v, size_t n, bool may_be_null, agg_state *a);
+/* Folds float32 values (no nulls) into a: count, sum (in double), min and max (NaN ignored); with x also
+ * m2 into x (a second pass over the values). Queries that do not ask for the spread pass NULL: m2 and the
+ * sums of squares are the cost of the spread, and a query of tiny buckets would pay it on every row. */
+extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *x);
+/* Folds n slots of `type` into a, skipping nulls, with the spread (values.c; granule statistics). */
+void agg_fold(int type, const void *v, size_t n, agg_state *a, agg_dev *x);
+/* the same, skipping the search for nulls when the caller knows there are none (a granule's count), and
+ * the spread unless asked for */
+void agg_fold_hint(int type, const void *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
 struct granule;
 /* The statistics of a granule's values; and a granule's statistics as an agg_state. */
 void granule_stats(int type, const void *v, size_t n, struct granule *g);
-void agg_from_granule(int type, const struct granule *g, agg_state *a);
+void agg_from_granule(int type, const struct granule *g, agg_state *a, agg_dev *x);
+/* The bucket's range, variances and standard deviations (query.c). */
+void agg_spread(int type, const agg_state *a, const agg_dev *x, tsdb_spread_bucket *b);
 static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
 {
-    const double nan = __builtin_nan("");
+    const double nan = nan_canonical();
     b->count = a->count;
     b->sum = 0;
     b->min = b->max = nan;
@@ -285,8 +374,8 @@ static inline void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b)
         b->max = (double)a->imax;
         return;
     }
-    b->sum = a->sum;
-    if (a->min <= a->max) { /* else only NaN values */
+    b->sum = canon_nan(a->sum);
+    if (a->min <= a->max) { /* else only NaN values; min and max skip NaNs, so neither is one here */
         b->min = a->min;
         b->max = a->max;
     }
@@ -347,8 +436,26 @@ typedef struct granule {
     union { double fmax; int64_t imax; };
     union { double fsum; uint64_t isum_lo; };
     int64_t isum_hi; /* integer sums are 128 bits */
+    /* The spread: for floats m2, the sum of squared deviations from the mean
+     * (fsum over the known values); for integers the exact sum of squares,
+     * 192 bits (isq0 + isq1 * 2^64 + isq2 * 2^128). See agg_state. */
+    union { double fm2; uint64_t isq0; };
+    uint64_t isq1, isq2;
+    /* Time-weighted statistics (twa.c): the granule's first and last values (as
+     * doubles; GT_FIRST_NULL/GT_LAST_NULL when null), and over the segments
+     * between its consecutive rows the STEP and LINEAR areas (value x ms) and
+     * the time they cover; tw_gap is the longest of those segments (saturated),
+     * so a query with a staleness limit knows whether the areas apply. */
+    double tw_first, tw_last;
+    double tw_step, tw_lin;
+    uint64_t tw_step_ms, tw_lin_ms;
+    uint32_t tw_gap;
+    uint32_t tw_flags;
 } granule;
-_Static_assert(sizeof(granule) == 80, "granule must be 80 bytes");
+_Static_assert(sizeof(granule) == 160, "granule must be 160 bytes");
+enum { GT_FIRST_NULL = 1, GT_LAST_NULL = 2 };
+/* The time-weighted statistics of a granule's rows (n >= 1, ts strictly increasing). */
+void granule_twa(int type, const int64_t *ts, const void *v, size_t n, struct granule *g);
 
 typedef struct part_header {
     char magic[8];
@@ -370,6 +477,34 @@ typedef struct part_footer {
 _Static_assert(sizeof(part_footer) == 56, "footer must be 56 bytes");
 _Static_assert(sizeof(part_footer) >= BLK_SLACK, "footer must cover decoder overread");
 
+/* A range tombstone: rows of `series` with start <= ts < end are deleted from
+ * every part of the same partition with a lower block number (never from the
+ * part that holds it: its own rows are newer). Stored like this in the
+ * trailer of a part, sorted by (series, start), ranges of one series disjoint. */
+typedef struct tomb {
+    uint32_t series;
+    uint32_t zero;
+    int64_t start, end;
+} tomb;
+_Static_assert(sizeof(tomb) == 24, "tomb must be 24 bytes");
+
+/* A sorted, coalesced set of tombstones, for applying several parts' at once. */
+typedef struct tomb_set {
+    tomb *t;
+    size_t n, cap;
+} tomb_set;
+int tomb_set_add(tomb_set *s, const tomb *t, size_t n);
+void tomb_set_finish(tomb_set *s); /* sorts and coalesces; call after adding */
+void tomb_set_free(tomb_set *s);
+/* index of the first range of `series` that ends after ts (s->n if none) */
+size_t tomb_set_seek(const tomb_set *s, uint32_t series, int64_t ts);
+/* whether a range of `series` intersects [lo, hi] */
+bool tomb_set_hits(const tomb_set *s, uint32_t series, int64_t lo, int64_t hi);
+/* Keeps the rows (ts ascending, slots of width w) at or after `cutoff` that no
+ * range of `series` covers, in place; returns how many remain. */
+size_t tomb_set_filter(const tomb_set *s, uint32_t series, int64_t cutoff, int64_t *ts, uint8_t *v, size_t w,
+                       size_t n);
+
 typedef struct part {
     char name[96];
     int dirfd;
@@ -382,6 +517,8 @@ typedef struct part {
     size_t map_len;
     const granule *g;
     uint32_t ng;
+    const tomb *t; /* the part's tombstones (in the map); NULL when none */
+    uint32_t nt;
     uint64_t index_off;
     uint64_t rows;
     int64_t min_ts, max_ts;
@@ -392,6 +529,8 @@ typedef struct part {
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
+    uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
+    int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
     char pending[64];     /* tmp file name while the part awaits parts_commit, else "" */
 } part;
@@ -427,12 +566,18 @@ typedef struct part_writer {
     codec_ctx *cc;
     uint64_t rows;
     int64_t min_ts, max_ts;
+    tomb *tombs; /* written after the index; sorted, disjoint per series */
+    size_t nt;
+    bool keep_empty;  /* write a part even with no rows and no tombstones (a merge's wal_seq anchor) */
+    int64_t empty_ts; /* its min_ts = max_ts then */
 } part_writer;
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq);
 /* Rows of one series of `type` (v in its slots); (series, ts) order across calls. */
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n);
 int pw_copy_granule(part_writer *w, const part *src, const granule *g);
+/* Tombstones for the trailer, sorted by (series, start) and disjoint per series; copied. */
+int pw_set_tombs(part_writer *w, const tomb *t, size_t n);
 int pw_finish(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
 /* As pw_finish, but the part stays under its tmp name until parts_commit. */
 int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
@@ -572,6 +717,12 @@ void db_retire_locked(struct eng *db, part *p);
 void graveyard_purge(struct eng *db, bool all);
 
 /* ---- database ---- */
+typedef struct ret_table {
+    uint64_t cap;
+    struct ret_table *older;
+    _Atomic int64_t limit[];
+} ret_table;
+
 struct eng {
     char *dir;
     int dirfd;
@@ -602,6 +753,19 @@ struct eng {
 
     series_dict series;
     series_dict states;
+
+    /* retention (retention.c) */
+    pthread_mutex_t ret_lock;
+    /* ms per series id, 0 = keep: read without a lock (every query does); grown by a copy under ret_lock, the
+     * replaced tables stay valid until close */
+    _Atomic(struct ret_table *) ret_tab;
+    atomic_bool has_retention; /* some series has a limit: queries and merges look it up */
+    int ret_fd;
+    uint64_t ret_off;
+    bool ret_broken;
+    atomic_int_fast64_t clock_floor; /* now never goes below this */
+    atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
+    int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
     pool *qpool;
 
     /* memtable and WAL (memtable.c) */
@@ -629,12 +793,17 @@ struct eng {
     pthread_t flusher;
 
     atomic_uint_fast64_t st_merges, st_merged_rows, st_passthrough;
+    atomic_uint_fast64_t st_wal_bytes, st_wal_syncs; /* tsdb_get_volume_stats; bumped by the WAL writer role */
+    atomic_int_fast64_t follow_ok_ms; /* follower: mono_ms() of the last refresh that succeeded */
     atomic_uint_fast64_t st_broken_parts, st_follow_errors;
 
     /* writer: MANIFEST for followers, delayed deletion of replaced parts */
     pthread_mutex_t manifest_lock;
     uint64_t manifest_version;
     uint64_t wal_flushed; /* segments up to this are entirely in parts (db->lock) */
+    /* segments up to wal_removed are unlinked, up to wal_removed_synced durably (db->lock): an empty part (a
+     * merge's wal_seq anchor) is needed only while a segment up to its wal_seq may come back at open */
+    uint64_t wal_removed, wal_removed_synced;
     graveyard_entry *graveyard;
     size_t ngraveyard, graveyard_cap;
 
@@ -730,19 +899,95 @@ int eng_commit(eng *db);
 int eng_flush(eng *db);
 extern size_t desc_window_rows;
 /* Raw rows in time order; v as slots of the series' type. */
+/* ---- query internals shared with twa.c (query.c) ---- */
+/* A part can have several entries: granules overlapped by a newer tombstone are decoded, filtered and moved to
+ * `mem`, so parts[i] answers only for granules [gi[i], gj[i]) and those hold no deleted or expired row. Readers
+ * use gi/gj, never part_find on parts[i]: only then do statistics stay exact. */
+typedef struct snapshot {
+    part **parts;
+    uint32_t *gi, *gj; /* per entry: the granules of the series in the range */
+    size_t np;
+    mem_run *mem; /* rows of the series from memtables, oldest memtable first, and from parts with deletes */
+    uint64_t *mprio; /* per run: its priority on equal timestamps */
+    size_t nmem;
+    int64_t start, end; /* the range gi/gj were found for */
+} snapshot;
+int snapshot_take(struct eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s);
+void snapshot_release(snapshot *s);
+uint64_t mem_prio(const snapshot *sn, size_t i);
+/* whether mem run i came from a memtable, not from part granules decoded around tombstones */
+bool mem_from_memtable(const snapshot *sn, size_t i);
+/* Entry i's granules that may hold rows in [start, end): part_find limited to the entry's window. */
+void snap_find(const snapshot *sn, size_t i, uint32_t series, int64_t start, int64_t end, uint32_t *gi,
+               uint32_t *gj);
+/* Granules [*gi, *gj) of series s that may hold rows in [start, end). */
+void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj);
+typedef struct src {
+    const part *p;   /* NULL for a memtable run */
+    uint32_t gi, gj; /* granules still to load */
+    uint64_t prio;   /* newer sources win on equal timestamps */
+    bool loaded;
+    size_t pos, n;   /* rows [pos, n) of ts/v are in range and unread */
+    int64_t *ts;
+    uint8_t *v;      /* slots of `type` */
+    int type;
+    size_t w;        /* slot width */
+    bool own;        /* ts/v are decode buffers owned by the cursor */
+} src;
+void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type);
+void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type);
+void src_free(src *c);
 typedef int (*slot_fn)(void *ctx, const int64_t *ts, const void *v, size_t n);
+/* Emits the union of the sources in time order, newest row per timestamp. */
+int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx);
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
                      slot_fn fn, void *ctx);
+/* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID */
+int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, slot_fn fn, void *ctx);
+extern size_t lttb_buffer_bytes; /* tests make it small to exercise the two-pass way */
 int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
                   size_t *nout);
 int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
                     size_t *nout);
+/* the same with the spread: tsdb_spread_bucket results */
+int eng_query_spread(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                     tsdb_spread_bucket **out, size_t *nout);
 int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g);
 int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n);
+int64_t bucketer_key(const bucketer *bk, int64_t ts);    /* the bucket of ts */
+int64_t bucketer_start(const bucketer *bk, int64_t key); /* the first instant of bucket key */
+/* Time-weighted averages (twa.c). */
+int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                  const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
 int eng_get_stats(eng *db, tsdb_stats *st);
+int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs);
+
+static inline int64_t eng_mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
+/* retention.c */
+int ret_open(eng *db, bool read_only);
+int ret_reload(eng *db);
+void ret_close(eng *db);
+void ret_clock_init(eng *db);
+int64_t eng_now_ms(eng *db);
+int64_t eng_retention(eng *db, uint32_t series);
+int64_t eng_cutoff(eng *db, uint32_t series); /* rows before it have expired; INT64_MIN when none */
+int64_t eng_cutoff_at(eng *db, uint32_t series, int64_t now);
+int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms);
+/* delete.c */
+int eng_delete_range(eng *db, uint32_t series, int64_t start, int64_t end);
+int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+                      const void *v, size_t n);
+/* merge.c: drops partitions every series of which has expired (sets *dropped) and selects a part to rewrite
+ * without its expired rows (returns 1, sel[0] marked merging and referenced); caller holds db->lock */
+size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal);
 
 #endif

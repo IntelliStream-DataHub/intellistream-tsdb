@@ -330,7 +330,8 @@ impl Bucket {
         self.count
     }
 
-    /// Sum of the values, as a float.
+    /// Sum of the values, as a float. A NaN sum, min or max is always the quiet NaN
+    /// 0x7ff8000000000000, whatever NaNs were stored, so results compare bit for bit.
     #[getter]
     fn sum(&self) -> f64 {
         self.sum
@@ -743,6 +744,26 @@ impl Client {
             (None, Some(id)) => c.insert_series_values_async(id, &ts, &col),
             (None, None) => unreachable!("one of the two is given"),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_typed(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        start: Option<i64>,
+        end: Option<i64>,
+        ts: &Bound<'_, PyAny>,
+        values: &Bound<'_, PyAny>,
+        value_type: Option<&str>,
+    ) -> PyResult<()> {
+        let ts = ts_column(ts)?;
+        let ty = match value_type {
+            Some(t) => self::value_type(t)?,
+            None => self.with_inner(py, |i| i.series_type(series))?,
+        };
+        let col = py_column(values, ty)?;
+        self.with(py, |c| c.replace_range(series, range(start, end), &ts, &col))
     }
 }
 
@@ -1325,6 +1346,67 @@ impl Client {
         let o = opts(order, limit)?;
         let bounds = ts_column(bounds)?;
         self.with(py, |c| c.query_bounds(series, range(start, end), &bounds, o)).map(buckets)
+    }
+
+    /// Deletes the rows of a series with start <= ts < end (protocol version 7).
+    ///
+    /// A delete is a write like any other: a row inserted after it returned
+    /// is kept. start and end are required; None is unbounded, so
+    /// delete_range(id, None, None) deletes every row of the series.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID from a server older than version 7 (the
+    ///         client asks HELLO first and does not send the request).
+    #[pyo3(signature = (series, start, end))]
+    fn delete_range(&self, py: Python<'_>, series: u32, start: Option<i64>, end: Option<i64>) -> PyResult<()> {
+        self.with(py, |c| c.delete_range(series, range(start, end)))
+    }
+
+    /// Replaces the rows of a series with start <= ts < end by ts and values,
+    /// atomically: a reader sees the old rows or the new ones, never a mix
+    /// (protocol version 7).
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     start, end: The range; None is unbounded.
+    ///     ts: Timestamps, ms since the epoch, each in the range.
+    ///     values: As for insert_series_values(); no rows make it a delete.
+    ///     value_type: The series' type. None asks the server once and
+    ///         remembers it.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for a timestamp outside the range, a
+    ///         value_type other than the series', rows that do not fit in
+    ///         one request (256 MiB), or a server older than version 7.
+    #[pyo3(signature = (series, start, end, ts, values, *, value_type = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn replace_range(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        start: Option<i64>,
+        end: Option<i64>,
+        ts: &Bound<'_, PyAny>,
+        values: &Bound<'_, PyAny>,
+        value_type: Option<&str>,
+    ) -> PyResult<()> {
+        self.replace_typed(py, series, start, end, ts, values, value_type)
+    }
+
+    /// Sets how long a series keeps its rows, in ms (protocol version 7):
+    /// rows older than the server's clock minus limit_ms disappear from
+    /// queries at once and from disk as merges get to them. 0 keeps them.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for a negative limit or a server older
+    ///         than version 7.
+    fn set_retention(&self, py: Python<'_>, series: u32, limit_ms: i64) -> PyResult<()> {
+        self.with(py, |c| c.set_retention(series, limit_ms))
+    }
+
+    /// Returns the retention limit of a series in ms, 0 for none (protocol version 7).
+    fn retention(&self, py: Python<'_>, series: u32) -> PyResult<i64> {
+        self.with(py, |c| c.retention(series))
     }
 
     /// Makes everything written so far durable on the server's disk.

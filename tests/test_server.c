@@ -4,9 +4,13 @@
 #include "tsdb_client.h"
 #include "tsdb_pack.h"
 #include "tsdb_protocol.h"
+#include "metrics.h"
 #include "samekeys.h"
+#include "lttb_ref.h"
+#include "harness.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -19,6 +23,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static int failures;
@@ -38,7 +44,7 @@ static int failures;
         }                                                                                            \
     } while (0)
 
-static int port;
+static int port; /* where the server started last listens: tsdbd chose it, see start_server_with */
 static const int64_t T0 = 1699999980000; /* on a minute boundary: buckets below are whole */
 
 /* When set, the next server runs under the crashfs shim in eio mode: SIGUSR2
@@ -49,8 +55,8 @@ static const char *eio_mark;
 /* extra: more arguments, NULL-terminated, or NULL */
 static pid_t start_server_with(const char *dir, const char *const *extra)
 {
-    char portstr[16], shim[PATH_MAX], near[PATH_MAX];
-    snprintf(portstr, sizeof portstr, "%d", port);
+    char pf[PATH_MAX + 64], shim[PATH_MAX], near[PATH_MAX];
+    th_portfile(pf, sizeof pf, dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd"; /* e.g. a sanitizer build */
     /* the shim of the same build, next to the server */
     snprintf(near, sizeof near, "%.*slibcrashfs.so", (int)(strrchr(bin, '/') ? strrchr(bin, '/') - bin + 1 : 0), bin);
@@ -70,8 +76,8 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
             setenv("CRASHFS_EIO_ONLY", "wal_", 1);
             setenv("CRASHFS_MARK", eio_mark, 1);
         }
-        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", portstr, "--workers", "4", "--no-fsync"};
-        int n = eio_mark ? 7 : 8; /* under the shim, syncs are what make data survive its rollback at exit */
+        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-fsync"};
+        int n = eio_mark ? 9 : 10; /* under the shim, syncs are what make data survive its rollback at exit */
         if (getenv("TSDBD_IO")) { /* the event loop backend: make test runs uring and epoll */
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
@@ -82,16 +88,18 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
         execv(bin, (char *const *)argv);
         _exit(127);
     }
-    for (int i = 0; i < 100; i++) { /* wait until it accepts */
-        tsdbc *c;
-        if (tsdbc_connect("127.0.0.1", port, &c) == 0) {
-            tsdbc_close(c);
-            return pid;
+    int p = th_await(pf, pid, 30000); /* the port and pid of the server started here, nobody else's */
+    unlink(pf);
+    if (p <= 0) {
+        fputs(th_why, stderr);
+        if (p != TH_EXITED && pid > 0) {
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
         }
-        usleep(20000);
+        exit(1);
     }
-    fprintf(stderr, "tsdbd did not start\n");
-    exit(1);
+    port = p;
+    return pid;
 }
 
 static pid_t start_server(const char *dir) { return start_server_with(dir, NULL); }
@@ -227,6 +235,94 @@ static void test_close(tsdbc *c)
 }
 
 /* Regressions in request and reply framing. */
+/* HELLO answers the version both sides speak: an older client (whose tests compare it with
+ * its own constant) hears its own version, a newer one the server's. */
+static void test_hello(void)
+{
+    int fd = raw_connect();
+    const uint32_t asks[] = {4, 5, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION + 7, 0};
+    const uint32_t want[] = {4, 5, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION};
+    for (uint32_t i = 0; i < 6; i++) {
+        raw_send(fd, 70 + i, TSDB_OP_HELLO, i < 5 ? &asks[i] : NULL, i < 5 ? 4 : 0); /* the last: no version */
+        uint32_t rid, v = 0;
+        uint8_t rest[16];
+        size_t nrest = 0;
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 70 + i && nrest == 4);
+        memcpy(&v, rest, 4);
+        CHECK(v == (i < 5 ? want[i] : TSDB_PROTOCOL_VERSION));
+    }
+    close(fd);
+}
+
+/* A server older than the client: it answers HELLO with fake_version and refuses everything else, counting it.
+ * The client must refuse what that version does not know without sending it. */
+static uint32_t fake_version;
+static int fake_others; /* read after the join */
+
+static void *fake_server(void *arg)
+{
+    int fd = accept(*(int *)arg, NULL, NULL);
+    uint8_t h[9], body[256];
+    while (fd >= 0 && read_full(fd, h, 9)) {
+        uint32_t flen, id;
+        memcpy(&flen, h, 4);
+        memcpy(&id, h + 4, 4);
+        if (flen < 5 || flen - 5 > sizeof body || !read_full(fd, body, flen - 5))
+            break;
+        int32_t st = h[8] == TSDB_OP_HELLO ? 0 : TSDB_ERR_INVALID;
+        fake_others += h[8] != TSDB_OP_HELLO;
+        uint8_t r[17];
+        uint32_t rlen = st ? 9 : 13;
+        memcpy(r, &rlen, 4);
+        memcpy(r + 4, &id, 4);
+        r[8] = TSDB_OP_REPLY;
+        memcpy(r + 9, &st, 4);
+        memcpy(r + 13, &fake_version, 4);
+        if (write(fd, r, 4 + rlen) != (ssize_t)(4 + rlen))
+            break;
+    }
+    if (fd >= 0)
+        close(fd);
+    return NULL;
+}
+
+static void test_old_server(uint32_t version)
+{
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    socklen_t sl = sizeof sa;
+    CHECK(bind(lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(lfd, 1) == 0 &&
+          getsockname(lfd, (struct sockaddr *)&sa, &sl) == 0);
+    fake_version = version;
+    fake_others = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, fake_server, &lfd) == 0);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", ntohs(sa.sin_port), &c));
+    OK(tsdbc_set_compression(c, 0));
+    CHECK(tsdbc_server_version(c) == version);
+    int64_t lim = 7, t = T0;
+    double one = 1;
+    tsdb_values col = {TSDB_FLOAT64, &one, NULL};
+    if (version < 7) {
+        CHECK(tsdbc_delete_range(c, 1, T0, T0 + 10) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_replace_range(c, 1, T0, T0 + 10, &t, &col, 1) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_set_retention(c, 1, 1000) == TSDB_ERR_INVALID);
+        CHECK(tsdbc_get_retention(c, 1, &lim) == TSDB_ERR_INVALID);
+    }
+    if (version < 6) {
+        tsdb_twa_bucket *b = NULL;
+        size_t nb = 0;
+        CHECK(tsdbc_query_twa(c, 1, T0, T0 + 10, 0, NULL, &b, &nb) == TSDB_ERR_INVALID && nb == 0);
+        free(b);
+    }
+    tsdbc_close(c);
+    pthread_join(th, NULL);
+    close(lfd);
+    CHECK(fake_others == 0); /* only HELLO went out */
+}
+
 static void test_framing(void)
 {
     int rfd = raw_connect();
@@ -409,6 +505,149 @@ static void test_types(tsdbc *c)
     close(fd);
 }
 
+/* NaN results through the server: one quiet NaN 0x7ff8000000000000 (0x7fc00000 in the float32 min and max of
+ * version 1 rows), whatever payloads the data had; raw values keep theirs. */
+static bool canon64(double d)
+{
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return d == d || b == 0x7ff8000000000000ull;
+}
+
+typedef struct nan_rows {
+    uint64_t *bits;
+    size_t n, cap;
+    int type;
+} nan_rows;
+
+static int collect_bits(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    nan_rows *r = ctx;
+    for (size_t k = 0; k < n && r->n < r->cap; k++, r->n++) {
+        bool known = !col->valid || ((col->valid[k >> 3] >> (k & 7)) & 1);
+        uint64_t s = 0;
+        if (col->type == TSDB_FLOAT64)
+            memcpy(&s, (const double *)col->values + k, 8);
+        else
+            memcpy(&s, (const float *)col->values + k, 4);
+        r->bits[r->n] = known ? s : UINT64_MAX;
+    }
+    return 0;
+}
+
+static void test_nan(tsdbc *c)
+{
+    enum { NN = 6000 };
+    static const uint64_t p64[] = {0x7ff8000000000001ull, 0xfff8000000000000ull, 0x7ff0000000000001ull,
+                                   0x7ff0000000001001ull, 0x7ff8000000001000ull, 0x7ff8000000001002ull,
+                                   0xffffffffffffffffull, 0x7ff8dead00000000ull};
+    static const uint32_t p32[] = {0x7fc00001u, 0xffc00000u, 0x7f800001u, 0x7f801001u,
+                                   0x7fc01000u, 0x7fc01002u, 0xffffffffu, 0x7fc0deadu};
+    uint64_t x = 0x2545f4914f6cdd1dull;
+    uint32_t ids[2];
+    OK(tsdbc_series_create(c, "nan.f32", TSDB_FLOAT32, NULL, &ids[0]));
+    OK(tsdbc_series_create(c, "nan.f64", TSDB_FLOAT64, NULL, &ids[1]));
+    static uint64_t ref[2][NN];
+    int64_t *ts = malloc(NN * sizeof *ts);
+    uint64_t *v = malloc(NN * 8);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int t = 0; t < 2; t++) {
+            /* pass 0 everything in batches, flushed; pass 1 every 4th row again, newer NaNs over older ones */
+            size_t n = 0;
+            for (size_t k = pass; k < NN; k += pass ? 4 : 1, n++) {
+                x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+                bool nan = x % 9 == 0 || (k >= 1000 && k < 1100);
+                double d = (double)(k % 101) - 20.5;
+                uint64_t s;
+                if (t) {
+                    s = nan ? p64[x / 9 % 8] : 0;
+                    if (!nan)
+                        memcpy(&s, &d, 8);
+                } else {
+                    float f = (float)d;
+                    uint32_t u = nan ? p32[x / 9 % 8] : 0;
+                    if (!nan)
+                        memcpy(&u, &f, 4);
+                    s = u;
+                }
+                ts[n] = T0 + 86400000 + (int64_t)k * 1000;
+                if (t)
+                    v[n] = s;
+                else
+                    memcpy((uint32_t *)v + n, &(uint32_t){(uint32_t)s}, 4);
+                ref[t][k] = s;
+            }
+            for (size_t o = 0; o < n; o += 700) /* frames of 700: some into the memtable, some into parts */
+                OK(tsdbc_insert_series_values(c, ids[t], ts + o,
+                                              &(tsdb_values){t ? TSDB_FLOAT64 : TSDB_FLOAT32,
+                                                             t ? (void *)(v + o) : (void *)((uint32_t *)v + o), NULL},
+                                              n - o < 700 ? n - o : 700));
+        }
+        if (pass == 0)
+            OK(tsdbc_flush(c));
+    }
+    free(ts);
+    free(v);
+    const int64_t lo = T0 + 86400000, hi = lo + NN * 1000;
+    for (int t = 0; t < 2; t++) {
+        tsdb_bucket *bk;
+        size_t nb, nan_sums = 0, nan_mins = 0, bad = 0;
+        static const int64_t iv[] = {0, 7000, 60000, 3600000};
+        for (size_t i = 0; i < 4; i++) {
+            OK(tsdbc_query_agg(c, ids[t], lo, hi, iv[i], &bk, &nb));
+            for (size_t k = 0; k < nb; k++) {
+                nan_sums += isnan(bk[k].sum);
+                nan_mins += isnan(bk[k].min);
+                bad += !canon64(bk[k].sum) + !canon64(bk[k].min) + !canon64(bk[k].max);
+            }
+            free(bk);
+        }
+        OK(tsdbc_query_group(c, ids[t], lo, hi, &(tsdb_group){TSDB_MINUTE, 5, NULL}, NULL, &bk, &nb));
+        for (size_t k = 0; k < nb; k++)
+            bad += !canon64(bk[k].sum) + !canon64(bk[k].min) + !canon64(bk[k].max);
+        free(bk);
+        int64_t bounds[] = {lo, lo + 999 * 1000, lo + 1000 * 1000, lo + 1100 * 1000, lo + 4321 * 1000};
+        OK(tsdbc_query_bounds(c, ids[t], lo, hi, bounds, 5, NULL, &bk, &nb));
+        CHECK(nb == 5 && bk[2].count == 100 && isnan(bk[2].min) && isnan(bk[2].max) && isnan(bk[2].sum));
+        for (size_t k = 0; k < nb; k++)
+            bad += !canon64(bk[k].sum) + !canon64(bk[k].min) + !canon64(bk[k].max);
+        free(bk);
+        if (bad)
+            fprintf(stderr, "  %s: %zu NaN results are not 0x7ff8000000000000\n", t ? "float64" : "float32", bad);
+        CHECK(bad == 0 && nan_sums > 10 && nan_mins >= 2);
+
+        /* version 1 rows (QUERY_AGG): double sum, float32 min and max */
+        int fd = raw_connect();
+        uint8_t q[28];
+        int64_t a = lo + 1000 * 1000, z = lo + 1100 * 1000, every = 0;
+        memcpy(q, &ids[t], 4);
+        memcpy(q + 4, &a, 8);
+        memcpy(q + 12, &z, 8);
+        memcpy(q + 20, &every, 8);
+        raw_send(fd, 7, TSDB_OP_QUERY_AGG, q, sizeof q);
+        uint32_t rid;
+        uint8_t rest[64];
+        size_t nrest = 0;
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && nrest == 4 + TSDB_AGG_ROW);
+        uint64_t sb;
+        uint32_t mnb, mxb;
+        memcpy(&sb, rest + 4 + 16, 8);
+        memcpy(&mnb, rest + 4 + 24, 4);
+        memcpy(&mxb, rest + 4 + 28, 4);
+        CHECK(sb == 0x7ff8000000000000ull && mnb == 0x7fc00000u && mxb == 0x7fc00000u);
+        close(fd);
+
+        /* raw: the payloads as written */
+        nan_rows r = {malloc(NN * 8), 0, NN, t};
+        OK(tsdbc_query_values(c, ids[t], lo, hi, NULL, collect_bits, &r));
+        bool same = r.n == NN;
+        for (size_t k = 0; same && k < NN; k++)
+            same = r.bits[k] == ref[t][k];
+        CHECK(same);
+        free(r.bits);
+    }
+}
+
 typedef struct counter {
     size_t rows, calls, stop_after;
     int64_t last;
@@ -462,6 +701,149 @@ static void *client_thread(void *arg)
         free(b);
     tsdbc_close(c);
     return NULL;
+}
+
+/* LTTB through the server: the points chosen against the reference over QUERY_VALUES */
+typedef struct lpts {
+    pt *p;
+    size_t n, cap;
+    bool had_valid;
+} lpts;
+
+static int lttb_collect(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    lpts *o = ctx;
+    o->had_valid |= col->valid != NULL;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t bits = 0;
+        double y = 0;
+        if (!col_point(col, i, &bits, &y))
+            continue;
+        if (o->n == o->cap) {
+            o->cap = o->cap ? o->cap * 2 : 4096;
+            o->p = realloc(o->p, o->cap * sizeof *o->p);
+        }
+        o->p[o->n++] = (pt){ts[i], bits, y};
+    }
+    return 0;
+}
+
+static int lttb_stop(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n) { return 1; }
+
+static void test_lttb_remote(tsdbc *c)
+{
+    uint32_t f, bo, st;
+    OK(tsdbc_series_create(c, "lttb.f64", TSDB_FLOAT64, NULL, &f));
+    OK(tsdbc_series_create(c, "lttb.bool", TSDB_BOOL, NULL, &bo));
+    OK(tsdbc_series_create(c, "lttb.state", TSDB_STATE, NULL, &st));
+    enum { N = 150000 };
+    int64_t *ts = malloc(N * sizeof *ts);
+    double *dv = malloc(N * sizeof *dv);
+    uint8_t *bv = malloc(N), *valid = malloc((N + 7) / 8);
+    memset(valid, 0xff, (N + 7) / 8);
+    for (int i = 0; i < N; i++) {
+        ts[i] = T0 + (int64_t)i * 250 + i % 7;
+        dv[i] = i % 1013 == 0 ? NAN : sin(i / 300.0) * 50 + (i % 4999 == 0 ? 400 : 0);
+        bv[i] = sin(i / 77.0) > 0.3;
+        if (i % 97 == 0)
+            valid[i >> 3] &= (uint8_t)~(1u << (i & 7));
+    }
+    OK(tsdbc_insert_series_values(c, f, ts, &(tsdb_values){TSDB_FLOAT64, dv, valid}, N));
+    OK(tsdbc_insert_series_values(c, bo, ts, &(tsdb_values){TSDB_BOOL, bv, valid}, N));
+    size_t ths[] = {3, 500, 40000, N + 10};
+    uint32_t ser[] = {f, bo};
+    for (size_t s = 0; s < 2; s++)
+        for (size_t k = 0; k < sizeof ths / sizeof *ths; k++) {
+            lpts raw = {0}, got = {0};
+            OK(tsdbc_query_values(c, ser[s], INT64_MIN, INT64_MAX, NULL, lttb_collect, &raw));
+            OK(tsdbc_query_lttb(c, ser[s], INT64_MIN, INT64_MAX, ths[k], lttb_collect, &got));
+            tsdb_query_stats qs;
+            OK(tsdbc_last_query_stats(c, &qs));
+            size_t *idx = malloc(raw.n * sizeof *idx);
+            size_t m = ref_lttb(raw.p, raw.n, ths[k], idx);
+            bool same = got.n == m && !got.had_valid && qs.result_rows == m && m == (raw.n < ths[k] ? raw.n : ths[k]);
+            for (size_t i = 0; same && i < m; i++)
+                same = got.p[i].ts == raw.p[idx[i]].ts && got.p[i].bits == raw.p[idx[i]].bits;
+            CHECK(same);
+            free(idx);
+            free(raw.p);
+            free(got.p);
+        }
+    lpts none = {0};
+    CHECK(tsdbc_server_version(c) == TSDB_PROTOCOL_VERSION); /* QUERY_LTTB needs 5 */
+    CHECK(tsdbc_query_lttb(c, f, INT64_MIN, INT64_MAX, 2, lttb_collect, &none) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_lttb(c, st, INT64_MIN, INT64_MAX, 10, lttb_collect, &none) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_lttb(c, f, INT64_MIN, INT64_MAX, 40000, lttb_stop, NULL) == TSDB_ERR_STOPPED);
+    OK(tsdbc_query_lttb(c, f, T0, T0 + 1000000, 10, lttb_collect, &none)); /* the connection goes on */
+    CHECK(none.n == 10);
+    free(none.p);
+
+    /* the request is exactly 28 bytes: shorter or longer frames are refused */
+    int fd = raw_connect();
+    uint8_t q[29] = {0};
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    uint64_t t = 10;
+    memcpy(q, &f, 4);
+    memcpy(q + 4, &lo, 8);
+    memcpy(q + 12, &hi, 8);
+    memcpy(q + 20, &t, 8);
+    for (uint32_t len = 27; len <= 29; len += 2) {
+        raw_send(fd, 40 + len, TSDB_OP_QUERY_LTTB, q, len);
+        uint32_t rid;
+        uint8_t rest[256];
+        size_t nrest;
+        int32_t st = raw_reply(fd, &rid, rest, sizeof rest, &nrest);
+        CHECK(rid == 40 + len && st == TSDB_ERR_INVALID);
+    }
+    close(fd);
+    free(ts);
+    free(dv);
+    free(bv);
+    free(valid);
+}
+
+/* Deletes, replaces and retention over the wire (protocol version 7). */
+static void test_delete(tsdbc *c)
+{
+    uint32_t s;
+    OK(tsdbc_series_create(c, "del.i64", TSDB_INT64, NULL, &s));
+    int64_t ts[100], v[100];
+    for (int k = 0; k < 100; k++)
+        ts[k] = T0 + k * 1000, v[k] = k;
+    tsdb_values col = {TSDB_INT64, v, NULL};
+    OK(tsdbc_insert_series_values(c, s, ts, &col, 100));
+    OK(tsdbc_delete_range(c, s, T0 + 10000, T0 + 20000));
+    tsdb_bucket *bk;
+    size_t nb;
+    OK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    CHECK(nb == 1 && bk[0].count == 90 && bk[0].isum == 4950 - 145);
+    free(bk);
+
+    /* replace with nulls; a row outside the range refuses the whole replace */
+    int64_t rts[3] = {T0 + 50000, T0 + 50500, T0 + 51000}, rv[3] = {7, 8, 9};
+    uint8_t valid = 0x5; /* row 1 is null */
+    tsdb_values rcol = {TSDB_INT64, rv, &valid};
+    CHECK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 51000, rts, &rcol, 3) == TSDB_ERR_INVALID);
+    OK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 60000, rts, &rcol, 3));
+    vrows r = {0};
+    OK(tsdbc_query_values(c, s, T0 + 50000, T0 + 60000, NULL, collect_values, &r));
+    CHECK(r.n == 3 && r.ts[1] == T0 + 50500 && !r.known[1] && r.known[2] && r.i[2] == 9);
+    OK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    CHECK(nb == 1 && bk[0].count == 82);
+    free(bk);
+    OK(tsdbc_replace_range(c, s, T0 + 50000, T0 + 60000, NULL, &rcol, 0)); /* n = 0: a delete */
+    OK(tsdbc_query_agg(c, s, T0 + 50000, T0 + 60000, 0, &bk, &nb));
+    CHECK(nb == 0);
+    free(bk);
+
+    int64_t lim = -1;
+    OK(tsdbc_get_retention(c, s, &lim));
+    CHECK(lim == 0);
+    OK(tsdbc_set_retention(c, s, 86400000));
+    OK(tsdbc_get_retention(c, s, &lim));
+    CHECK(lim == 86400000);
+    CHECK(tsdbc_set_retention(c, s, -1) == TSDB_ERR_INVALID);
+    OK(tsdbc_set_retention(c, s, 0));
 }
 
 /* The packed insert body round trips for every type and layout, and anything
@@ -547,6 +929,59 @@ static void test_hello_keeps_errors(uint32_t f64)
 }
 
 /* Version 4: the server knows UTC only; clients send the bounds of local periods. */
+/* QUERY_TWA: the interval, calendar, local and bounds forms, against hand-computed values */
+static void test_twa(tsdbc *c)
+{
+    uint32_t s, st;
+    OK(tsdbc_series_create(c, "twa.level", TSDB_FLOAT64, NULL, &s));
+    int64_t t0 = 1700000000000LL / 86400000 * 86400000; /* a UTC midnight */
+    int64_t ts[] = {t0, t0 + 1000, t0 + 2000, t0 + 3000, t0 + 10000};
+    double v[] = {10, 20, 0, 30, 40};
+    uint8_t valid = 0xff & ~(1u << 2);
+    OK(tsdbc_insert_series_values(c, s, ts, &(tsdb_values){TSDB_FLOAT64, v, &valid}, 5));
+    OK(tsdbc_wait(c));
+    tsdb_twa_bucket *b;
+    size_t n;
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 0, NULL, &b, &n));
+    CHECK(n == 1 && b[0].start == t0 && b[0].covered_ms == 9000 && b[0].count == 4 && b[0].area == 240000);
+    free(b);
+    tsdb_twa_opts lin = {.method = TSDB_TWA_LINEAR};
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 4000, &lin, &b, &n));
+    /* [t0, t0 + 4000): 10 -> 20, then 30 -> 40 cut at t0 + 4000 */
+    CHECK(n == 3 && b[0].covered_ms == 2000 && fabs(b[0].area - (15000 + (60 + 10.0 / 7) / 2 * 1000)) < 1e-6 &&
+          b[1].covered_ms == 4000);
+    free(b);
+    /* the staleness limit reaches the server: the 7 s from t0 + 3000 to t0 + 10000 no longer count */
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 0, &(tsdb_twa_opts){.max_gap_ms = 5000}, &b, &n));
+    CHECK(n == 1 && b[0].covered_ms == 2000 && b[0].count == 4 && b[0].area == 30000);
+    free(b);
+    tsdb_twa_opts stale = {.max_gap_ms = 5000, .order = TSDB_DESC, .limit = 1};
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 1000, &stale, &b, &n));
+    CHECK(n == 1 && b[0].start == t0 + 10000 && b[0].covered_ms == 0 && b[0].count == 1 && isnan(b[0].twa));
+    free(b);
+    tsdb_group day = {TSDB_DAY, 1, NULL};
+    OK(tsdbc_query_twa_group(c, s, t0 - 5000, t0 + 20000, &day, NULL, &b, &n));
+    CHECK(n == 1 && b[0].start == t0 && b[0].covered_ms == 9000);
+    free(b);
+    tsdb_group oslo = {TSDB_DAY, 1, "Europe/Oslo"}; /* a local day begins at 23:00 UTC in November */
+    OK(tsdbc_query_twa_group(c, s, t0, t0 + 20000, &oslo, NULL, &b, &n));
+    CHECK(n == 1 && b[0].start == t0 - 3600000 && b[0].covered_ms == 9000);
+    free(b);
+    int64_t bounds[] = {t0 + 500, t0 + 2500};
+    OK(tsdbc_query_twa_bounds(c, s, t0, t0 + 20000, bounds, 2, NULL, &b, &n));
+    CHECK(n == 2 && b[0].start == t0 + 500 && b[0].covered_ms == 1500 && b[1].covered_ms == 7000 &&
+          b[1].area == 7000 * 30.0);
+    free(b);
+    OK(tsdbc_series_create(c, "twa.state", TSDB_STATE, NULL, &st));
+    CHECK(tsdbc_query_twa(c, st, t0, t0 + 1, 0, NULL, &b, &n) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_twa(c, s, t0, t0 + 1, 0, &(tsdb_twa_opts){.method = 9}, &b, &n) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_twa_bounds(c, s, t0, t0 + 1, NULL, 0, NULL, &b, &n) == TSDB_ERR_INVALID);
+    /* the connection still works after the errors */
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 0, NULL, &b, &n));
+    CHECK(n == 1);
+    free(b);
+}
+
 static void test_bounds(tsdbc *c, uint32_t a, size_t n)
 {
     tsdb_bucket *bk, *bb;
@@ -604,6 +1039,218 @@ static void test_bounds(tsdbc *c, uint32_t a, size_t n)
         CHECK(rid == 30u + (uint32_t)utc && st == (utc ? 0 : TSDB_ERR_INVALID));
     }
     close(fd);
+}
+
+/* The spread (protocol version 8): through the client, and by hand: without the fields byte the reply keeps
+ * its 64-byte rows (what older clients read), with TSDB_SPREAD the rows carry it, other bits are refused. */
+static void test_spread_remote(tsdbc *c)
+{
+    uint32_t d;
+    OK(tsdbc_series_create(c, "spread.f64", TSDB_FLOAT64, NULL, &d));
+    int64_t ts[5];
+    double v[5] = {101326, 101324, 101327, 101323, 0};
+    uint8_t valid = 0x0f; /* the last one null */
+    for (int k = 0; k < 5; k++)
+        ts[k] = T0 + k * 1000;
+    OK(tsdbc_insert_series_values(c, d, ts, &(tsdb_values){TSDB_FLOAT64, v, &valid}, 5));
+    CHECK(tsdbc_server_version(c) == TSDB_PROTOCOL_VERSION);
+    tsdb_spread_bucket *bk;
+    size_t nb;
+    OK(tsdbc_query_spread(c, d, INT64_MIN, INT64_MAX, 0, NULL, &bk, &nb));
+    CHECK(nb == 1 && bk[0].b.count == 4 && bk[0].range == 4 && bk[0].var_pop == 2.5 && bk[0].var_samp == 10.0 / 3);
+    CHECK(nb == 1 && bk[0].stddev_pop == sqrt(2.5) && bk[0].stddev_samp == sqrt(10.0 / 3));
+    tsdb_bucket *pb;
+    size_t np;
+    OK(tsdbc_query_agg(c, d, INT64_MIN, INT64_MAX, 0, &pb, &np));
+    CHECK(np == 1 && nb == 1 && memcmp(&pb[0], &bk[0].b, sizeof *pb) == 0);
+    free(pb);
+    int64_t bounds[2] = {T0, T0 + 2000};
+    tsdb_spread_bucket *bb;
+    size_t nbb;
+    tsdb_query_opts desc = {TSDB_DESC, 1};
+    OK(tsdbc_query_spread_bounds(c, d, INT64_MIN, INT64_MAX, bounds, 2, NULL, &bb, &nbb));
+    CHECK(nbb == 2 && bb[0].b.count == 2 && bb[0].range == 2 && bb[0].var_pop == 1 && bb[1].var_samp == 8);
+    free(bb);
+    OK(tsdbc_query_spread_bounds(c, d, INT64_MIN, INT64_MAX, bounds, 2, &desc, &bb, &nbb));
+    CHECK(nbb == 1 && bb[0].b.start == T0 + 2000 && bb[0].var_samp == 8);
+    free(bb);
+    tsdb_group sec2 = {TSDB_SECOND, 2, NULL}, berlin = {TSDB_DAY, 1, "Europe/Berlin"};
+    tsdb_query_opts desc_all = {TSDB_DESC, 0};
+    OK(tsdbc_query_spread_group(c, d, INT64_MIN, T0 + 4000, &sec2, &desc_all, &bb, &nbb));
+    CHECK(nbb == 2 && bb[0].b.start == T0 + 2000 && bb[0].var_samp == 8 && bb[1].var_pop == 1);
+    free(bb);
+    OK(tsdbc_query_spread_group(c, d, INT64_MIN, INT64_MAX, &berlin, NULL, &bb, &nbb)); /* local: bounds */
+    CHECK(nbb == 1 && bb[0].b.count == 4 && bb[0].var_pop == 2.5);
+    free(bb);
+
+    int fd = raw_connect();
+    for (int fields = -1; fields <= 2; fields++) {
+        uint8_t q[45] = {0};
+        int64_t lo = INT64_MIN, hi = INT64_MAX;
+        memcpy(q, &d, 4);
+        memcpy(q + 4, &lo, 8);
+        memcpy(q + 12, &hi, 8);
+        q[44] = (uint8_t)fields;
+        raw_send(fd, 40 + (uint32_t)(fields + 1), TSDB_OP_QUERY_BUCKETS, q, fields < 0 ? 44 : 45);
+        uint32_t rid, n = 0;
+        uint8_t rest[256];
+        size_t nrest = 0;
+        int32_t st = raw_reply(fd, &rid, rest, sizeof rest, &nrest);
+        CHECK(rid == 40u + (uint32_t)(fields + 1));
+        if (fields == 2) {
+            CHECK(st == TSDB_ERR_INVALID);
+            continue;
+        }
+        memcpy(&n, rest, 4);
+        size_t row = fields == TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
+        CHECK(st == 0 && n == 1 && nrest == 4 + row);
+        if (st == 0 && n == 1 && nrest == 4 + row && row == TSDB_SPREAD_ROW) {
+            double x[5];
+            memcpy(x, rest + 4 + 64, sizeof x);
+            CHECK(x[0] == bk[0].range && x[1] == bk[0].var_pop && x[2] == bk[0].var_samp &&
+                  x[3] == bk[0].stddev_pop && x[4] == bk[0].stddev_samp);
+        }
+    }
+    /* QUERY_BOUNDS with the byte after the bounds; a reserved bit is refused */
+    for (int fields = 1; fields <= 3; fields++) {
+        uint8_t q[33 + 16 + 1] = {0};
+        int64_t lo = INT64_MIN, hi = INT64_MAX;
+        uint32_t n2 = 2;
+        memcpy(q, &d, 4);
+        memcpy(q + 4, &lo, 8);
+        memcpy(q + 12, &hi, 8);
+        memcpy(q + 29, &n2, 4);
+        memcpy(q + 33, bounds, 16);
+        q[49] = (uint8_t)fields;
+        raw_send(fd, 50 + (uint32_t)fields, TSDB_OP_QUERY_BOUNDS, q, sizeof q);
+        uint32_t rid, n = 0;
+        uint8_t rest[512];
+        size_t nrest = 0;
+        int32_t st = raw_reply(fd, &rid, rest, sizeof rest, &nrest);
+        CHECK(rid == 50u + (uint32_t)fields);
+        if (fields != TSDB_SPREAD) {
+            CHECK(st == TSDB_ERR_INVALID);
+            continue;
+        }
+        memcpy(&n, rest, 4);
+        CHECK(st == 0 && n == 2 && nrest == 4 + 2 * TSDB_SPREAD_ROW);
+    }
+    close(fd);
+    free(bk);
+}
+
+/* A server of protocol version 6 (before the spread), as far as bucket queries go: HELLO answers 6, a
+ * QUERY_BUCKETS or QUERY_BOUNDS with a byte after the zone or bounds is refused as such a server does, one
+ * without it gets a bucket of 64 bytes. Counts the bucket requests it sees. */
+static const int64_t t0_old = 1700000000000;
+
+typedef struct old_server {
+    int lfd, port;
+    int bucket_reqs, refused;
+} old_server;
+
+static void old_reply(int fd, uint32_t id, int32_t st, const void *body, uint32_t n)
+{
+    uint8_t h[13];
+    uint32_t flen = 9 + n;
+    memcpy(h, &flen, 4);
+    memcpy(h + 4, &id, 4);
+    h[8] = TSDB_OP_REPLY;
+    memcpy(h + 9, &st, 4);
+    CHECK(write(fd, h, 13) == 13);
+    CHECK(n == 0 || write(fd, body, n) == (ssize_t)n);
+}
+
+static void *old_server_run(void *arg)
+{
+    old_server *o = arg;
+    int fd = accept(o->lfd, NULL, NULL);
+    uint8_t h[9], p[4096];
+    while (fd >= 0 && read_full(fd, h, 9)) {
+        uint32_t flen, id;
+        memcpy(&flen, h, 4);
+        memcpy(&id, h + 4, 4);
+        uint32_t len = flen - 5;
+        if (len > sizeof p || !read_full(fd, p, len))
+            break;
+        if (h[8] == TSDB_OP_HELLO) {
+            uint32_t six = 6;
+            old_reply(fd, id, 0, &six, 4);
+            continue;
+        }
+        bool exact = false;
+        if (h[8] == TSDB_OP_QUERY_BUCKETS && len >= 44) {
+            uint16_t zl;
+            memcpy(&zl, p + 42, 2);
+            exact = len == 44u + zl;
+        } else if (h[8] == TSDB_OP_QUERY_BOUNDS && len >= 33) {
+            uint32_t n;
+            memcpy(&n, p + 29, 4);
+            exact = len == 33 + (size_t)n * 8;
+        } else {
+            old_reply(fd, id, TSDB_ERR_INVALID, NULL, 0);
+            continue;
+        }
+        o->bucket_reqs++;
+        if (!exact) {
+            o->refused++;
+            old_reply(fd, id, TSDB_ERR_INVALID, NULL, 0);
+            continue;
+        }
+        uint8_t body[4 + TSDB_BUCKET_ROW] = {0};
+        uint32_t one = 1;
+        uint64_t count = 3;
+        memcpy(body, &one, 4);
+        memcpy(body + 4, &t0_old, 8);
+        memcpy(body + 12, &count, 8);
+        old_reply(fd, id, 0, body, sizeof body);
+    }
+    if (fd >= 0)
+        close(fd);
+    return NULL;
+}
+
+/* The client against a version 6 server: plain bucket queries send exactly what such a server takes and read
+ * its 64-byte rows; the spread is refused by the client without a request (the server would refuse it). */
+static void test_spread_old_server(void)
+{
+    old_server o = {0};
+    o.lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    socklen_t sl = sizeof sa;
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    CHECK(bind(o.lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(o.lfd, 1) == 0);
+    CHECK(getsockname(o.lfd, (struct sockaddr *)&sa, &sl) == 0);
+    o.port = ntohs(sa.sin_port);
+    pthread_t th;
+    pthread_create(&th, NULL, old_server_run, &o);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", o.port, &c));
+    CHECK(tsdbc_server_version(c) == 6);
+    tsdb_bucket *b;
+    size_t n;
+    int64_t bounds[1] = {0};
+    tsdb_group g = {TSDB_SECOND, 1, NULL};
+    OK(tsdbc_query_agg(c, 1, 0, INT64_MAX, 1000, &b, &n));
+    CHECK(n == 1 && b[0].start == t0_old && b[0].count == 3);
+    free(b);
+    OK(tsdbc_query_group(c, 1, 0, INT64_MAX, &g, NULL, &b, &n));
+    CHECK(n == 1 && b[0].count == 3);
+    free(b);
+    OK(tsdbc_query_bounds(c, 1, 0, INT64_MAX, bounds, 1, NULL, &b, &n));
+    CHECK(n == 1 && b[0].count == 3);
+    free(b);
+    tsdb_spread_bucket *sb = (tsdb_spread_bucket *)1;
+    n = 7;
+    CHECK(tsdbc_query_spread(c, 1, 0, INT64_MAX, 1000, NULL, &sb, &n) == TSDB_ERR_INVALID && !sb && !n);
+    CHECK(tsdbc_query_spread_group(c, 1, 0, INT64_MAX, &g, NULL, &sb, &n) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_spread_bounds(c, 1, 0, INT64_MAX, bounds, 1, NULL, &sb, &n) == TSDB_ERR_INVALID);
+    tsdbc_close(c);
+    pthread_join(th, NULL);
+    close(o.lfd);
+    CHECK(o.bucket_reqs == 3 && o.refused == 0);
+    if (o.bucket_reqs != 3 || o.refused)
+        fprintf(stderr, "old server: %d bucket requests, %d refused\n", o.bucket_reqs, o.refused);
 }
 
 static void test_packed_inserts(tsdbc *c)
@@ -706,13 +1353,17 @@ static void *skn_writer(void *a)
         bool async = (seed >> 8) % 2, packed = (seed >> 9) % 2, plain = c->type == TSDB_FLOAT32 && !c->nulls;
         OK(tsdbc_set_compression(cn, packed ? 1 : 0));
         atomic_store(&x->started[w], r + 1);
-        for (uint32_t s = 0; s < (kind == SK_SERIES ? c->nseries : 1); s++) {
+        bool per = kind == SK_SERIES || kind == SK_REPLACE;
+        for (uint32_t s = 0; s < (per ? c->nseries : 1); s++) {
             sk_batch b;
-            bool large = kind == SK_LARGE || (kind == SK_SERIES && (seed >> 24) % 2);
-            sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, kind == SK_SERIES ? s : UINT32_MAX, &b);
+            bool large = kind == SK_LARGE || (per && (seed >> 24) % 2);
+            sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, per ? s : UINT32_MAX, &b);
             tsdb_values col = {(tsdb_type)c->type, b.v, c->nulls ? b.valid : NULL};
             const float *f = (const float *)(void *)b.v;
-            if (kind == SK_SERIES)
+            if (kind == SK_REPLACE) /* synchronous: the replace has no pipelined form */
+                OK(tsdbc_replace_range(cn, b.series[0], sk_ts(c, (uint32_t)w * c->shift),
+                                       sk_ts(c, (uint32_t)w * c->shift + c->nts), b.ts, &col, b.n));
+            else if (kind == SK_SERIES)
                 OK(async ? tsdbc_insert_series_values_async(cn, b.series[0], b.ts, &col, b.n)
                          : tsdbc_insert_series_values(cn, b.series[0], b.ts, &col, b.n));
             else if (plain)
@@ -876,14 +1527,16 @@ static void test_same_keys(const char *dir)
     pid_t srv = start_server_with(dir, args);
     const int64_t t0 = T0 + 1234;
     const unsigned batches = SK_SMALL | SK_LARGE;
-    enum { NC = 5 };
+    enum { NC = 6 };
     static sk_cfg c[NC];
     c[0] = (sk_cfg){"float32, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_FLOAT32, false, batches};
     c[1] = (sk_cfg){"int64 + nulls, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_INT64, true, batches};
     c[2] = (sk_cfg){"float32, shifted keys", 6, 1000, 3, 80, 20, t0, 97000, TSDB_FLOAT32, false, batches};
     c[3] = (sk_cfg){"float64 + nulls, per series", 6, 600, 3, 80, 37, t0, 97000, TSDB_FLOAT64, true,
                     batches | SK_SERIES};
-    c[4] = (sk_cfg){"float32, then SIGKILL", 5, 600, 3, 80, 10, t0, 97000, TSDB_FLOAT32, false, batches};
+    c[4] = (sk_cfg){"int64 + nulls, replaces", 5, 150, 3, 80, 23, t0, 97000, TSDB_INT64, true,
+                    batches | SK_REPLACE};
+    c[5] = (sk_cfg){"float32, then SIGKILL", 5, 600, 3, 80, 10, t0, 97000, TSDB_FLOAT32, false, batches};
     skn *x = calloc(NC, sizeof *x);
     sk_val *st[NC];
     for (int k = 0; k < NC; k++) {
@@ -993,11 +1646,826 @@ static void test_wal_failstop(const char *dir)
         failures++;
 }
 
+/* ------------------------------------------------------------ metrics endpoint */
+
+static int mport;
+
+static int metrics_connect(void)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)mport)};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Sends req (n bytes) and reads until the server closes or `wait_s` passes. Returns the
+ * malloc'd reply (NUL-terminated), its length in *len; NULL when the connection failed. */
+static char *http_exchange(const char *req, size_t n, int wait_s, size_t *len)
+{
+    int fd = metrics_connect();
+    if (fd < 0)
+        return NULL;
+    struct timeval tv = {wait_s, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    for (size_t sent = 0; sent < n;) {
+        ssize_t w = send(fd, req + sent, n - sent, MSG_NOSIGNAL);
+        if (w <= 0)
+            break; /* the server may already have answered and closed */
+        sent += (size_t)w;
+    }
+    size_t cap = 1 << 16, got = 0;
+    char *buf = malloc(cap);
+    for (;;) {
+        if (got + 4096 > cap)
+            buf = realloc(buf, cap *= 2);
+        ssize_t r = recv(fd, buf + got, cap - got - 1, 0);
+        if (r <= 0)
+            break;
+        got += (size_t)r;
+    }
+    buf[got] = '\0';
+    close(fd);
+    *len = got;
+    return buf;
+}
+
+#define HTTP_EXCHANGE(req, wait_s, len) http_exchange(req, sizeof(req) - 1, wait_s, len)
+
+static int http_status(const char *reply) { return strncmp(reply, "HTTP/1.1 ", 9) == 0 ? atoi(reply + 9) : -1; }
+
+/* One parsed sample. */
+typedef struct {
+    char name[96], labels[256];
+    double v;
+} msample;
+typedef struct {
+    msample *s;
+    size_t n, cap;
+} mset;
+
+static bool name_char(char ch, bool first)
+{
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || ch == ':' || (!first && ch >= '0' && ch <= '9');
+}
+
+/* A strict reader of the text exposition format 0.0.4 (what promtool check metrics enforces for the
+ * parts we emit): HELP and TYPE before the samples of a family and once each, names and labels
+ * well formed, quoted label values with only \\ \" \n escapes, numeric values, histogram buckets
+ * cumulative with le="+Inf" equal to _count. Fills `out`; returns false (after saying why) if not. */
+static bool parse_exposition(const char *body, mset *out)
+{
+    struct fam {
+        char name[96], type[16];
+        bool help, sampled;
+    } fams[128];
+    size_t nf = 0;
+    memset(out, 0, sizeof *out);
+    const char *p = body;
+    int lineno = 0;
+#define BAD(...)                                           \
+    do {                                                   \
+        fprintf(stderr, "metrics line %d: ", lineno);      \
+        fprintf(stderr, __VA_ARGS__);                      \
+        fprintf(stderr, "\n");                             \
+        return false;                                      \
+    } while (0)
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        if (!e)
+            BAD("no newline at the end");
+        lineno++;
+        size_t ll = (size_t)(e - p);
+        char line[1024];
+        if (ll >= sizeof line)
+            BAD("line too long");
+        memcpy(line, p, ll);
+        line[ll] = '\0';
+        p = e + 1;
+        if (ll == 0)
+            continue;
+        if (line[0] == '#') {
+            char kind[8], name[96], rest[600] = "";
+            int k = sscanf(line, "# %7s %95s %599[^\n]", kind, name, rest);
+            if (k < 2)
+                continue; /* a plain comment */
+            size_t i;
+            for (i = 0; i < nf && strcmp(fams[i].name, name); i++)
+                ;
+            if (strcmp(kind, "TYPE") == 0) {
+                if (i < nf && fams[i].type[0])
+                    BAD("TYPE of %s twice", name);
+                if (i < nf && fams[i].sampled)
+                    BAD("TYPE of %s after its samples", name);
+                if (k < 3 || !(strcmp(rest, "counter") == 0 || strcmp(rest, "gauge") == 0 || strcmp(rest, "histogram") == 0))
+                    BAD("TYPE %s: unknown type '%s'", name, rest);
+                if (i == nf) {
+                    if (nf == 128)
+                        BAD("too many families");
+                    fams[nf++] = (struct fam){0};
+                    snprintf(fams[i].name, sizeof fams[i].name, "%s", name);
+                }
+                snprintf(fams[i].type, sizeof fams[i].type, "%s", rest);
+                if (strcmp(rest, "counter") == 0 && (strlen(name) < 6 || strcmp(name + strlen(name) - 6, "_total")))
+                    BAD("counter %s does not end in _total", name);
+            } else if (strcmp(kind, "HELP") == 0) {
+                if (i == nf) {
+                    fams[nf] = (struct fam){0};
+                    snprintf(fams[nf].name, sizeof fams[nf].name, "%s", name);
+                    i = nf++;
+                }
+                if (fams[i].help)
+                    BAD("HELP of %s twice", name);
+                fams[i].help = true;
+            }
+            continue;
+        }
+        /* sample: name[{labels}] value */
+        msample sm = {0};
+        const char *q = line;
+        size_t nl = 0;
+        while (name_char(*q, nl == 0) && nl < sizeof sm.name - 1)
+            sm.name[nl++] = *q++;
+        if (nl == 0)
+            BAD("sample without a name: %s", line);
+        if (*q == '{') {
+            const char *lb = ++q;
+            while (*q != '}') {
+                size_t kl = 0;
+                while (name_char(q[kl], kl == 0) && q[kl] != ':')
+                    kl++;
+                if (kl == 0 || q[kl] != '=' || q[kl + 1] != '"')
+                    BAD("bad label in: %s", line);
+                q += kl + 2;
+                for (;;) {
+                    if (*q == '\0')
+                        BAD("unterminated label value: %s", line);
+                    if (*q == '\\') {
+                        if (q[1] != '\\' && q[1] != '"' && q[1] != 'n')
+                            BAD("bad escape: %s", line);
+                        q += 2;
+                    } else if (*q == '"') {
+                        q++;
+                        break;
+                    } else {
+                        q++;
+                    }
+                }
+                if (*q == ',')
+                    q++;
+                else if (*q != '}')
+                    BAD("bad label list: %s", line);
+            }
+            size_t lablen = (size_t)(q - lb);
+            if (lablen >= sizeof sm.labels)
+                BAD("labels too long");
+            memcpy(sm.labels, lb, lablen);
+            q++;
+        }
+        if (*q != ' ')
+            BAD("no space before the value: %s", line);
+        char *endp;
+        sm.v = strtod(q + 1, &endp);
+        if (endp == q + 1 || *endp != '\0')
+            BAD("bad value: %s", line);
+        /* the family: the name itself, or a histogram's _bucket, _sum, _count */
+        size_t i;
+        for (i = 0; i < nf; i++) {
+            size_t fl = strlen(fams[i].name);
+            if (strcmp(fams[i].name, sm.name) == 0 ||
+                (strcmp(fams[i].type, "histogram") == 0 && strncmp(sm.name, fams[i].name, fl) == 0 &&
+                 (strcmp(sm.name + fl, "_bucket") == 0 || strcmp(sm.name + fl, "_sum") == 0 ||
+                  strcmp(sm.name + fl, "_count") == 0)))
+                break;
+        }
+        if (i == nf || !fams[i].type[0] || !fams[i].help)
+            BAD("sample %s without HELP and TYPE before it", sm.name);
+        fams[i].sampled = true;
+        if (out->n == out->cap) {
+            out->cap = out->cap ? out->cap * 2 : 256;
+            out->s = realloc(out->s, out->cap * sizeof *out->s);
+        }
+        out->s[out->n++] = sm;
+    }
+    /* histograms: per label set, buckets cumulative in file order, +Inf last and equal to _count */
+    for (size_t i = 0; i < out->n; i++) {
+        const msample *a = &out->s[i];
+        size_t nl = strlen(a->name);
+        if (nl < 7 || strcmp(a->name + nl - 7, "_bucket"))
+            continue;
+        char base[96], series[256], inf_labels[300];
+        snprintf(base, sizeof base, "%.*s", (int)nl - 7, a->name);
+        const char *le = strstr(a->labels, ",le=\"");
+        if (!le)
+            BAD("bucket without le: %s", a->labels);
+        snprintf(series, sizeof series, "%.*s", (int)(le - a->labels), a->labels);
+        snprintf(inf_labels, sizeof inf_labels, "%s,le=\"+Inf\"", series);
+        if (i + 1 < out->n && strcmp(out->s[i + 1].name, a->name) == 0 && strncmp(out->s[i + 1].labels, series, strlen(series)) == 0 &&
+            out->s[i + 1].v < a->v)
+            BAD("%s buckets decrease", base);
+        if (strcmp(a->labels, inf_labels) == 0) {
+            char cname[128];
+            snprintf(cname, sizeof cname, "%s_count", base);
+            bool found = false;
+            for (size_t j = 0; j < out->n; j++)
+                if (strcmp(out->s[j].name, cname) == 0 && strcmp(out->s[j].labels, series) == 0) {
+                    found = true;
+                    if (out->s[j].v != a->v)
+                        BAD("%s{%s}: _count %g != +Inf bucket %g", base, series, out->s[j].v, a->v);
+                }
+            if (!found)
+                BAD("%s{%s} has no _count", base, series);
+        }
+    }
+#undef BAD
+    return true;
+}
+
+/* Value of the first sample called `name` whose labels contain `lab` (NULL: any); NAN if none. */
+static double mval(const mset *m, const char *name, const char *lab)
+{
+    for (size_t i = 0; i < m->n; i++)
+        if (strcmp(m->s[i].name, name) == 0 && (!lab || strstr(m->s[i].labels, lab)))
+            return m->s[i].v;
+    return NAN;
+}
+
+/* Sum of the values of every sample called `name` (labels ignored). */
+static double msum(const mset *m, const char *name)
+{
+    double t = 0;
+    for (size_t i = 0; i < m->n; i++)
+        if (strcmp(m->s[i].name, name) == 0)
+            t += m->s[i].v;
+    return t;
+}
+
+/* Scrapes /metrics and parses it; fails the test if it does not work. */
+static bool scrape(mset *out)
+{
+    static const char req[] = "GET /metrics HTTP/1.1\r\nHost: x\r\nAccept: text/plain\r\n\r\n";
+    size_t len;
+    char *r = http_exchange(req, sizeof req - 1, 5, &len);
+    if (!r) {
+        CHECK(!"metrics port refused the connection");
+        memset(out, 0, sizeof *out);
+        return false;
+    }
+    char *body = strstr(r, "\r\n\r\n");
+    bool ok = http_status(r) == 200 && body && strstr(r, "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n");
+    if (ok) {
+        body += 4;
+        const char *cl = strstr(r, "Content-Length: ");
+        ok = cl && (size_t)atol(cl + 16) == strlen(body) && parse_exposition(body, out);
+    }
+    if (!ok) {
+        free(out->s); /* a parse that failed halfway has filled it in part */
+        memset(out, 0, sizeof *out);
+    }
+    free(r);
+    CHECK(ok);
+    return ok;
+}
+
+static void mset_free(mset *m)
+{
+    free(m->s);
+    memset(m, 0, sizeof *m);
+}
+
+/* Counters never go down between two scrapes. */
+static void check_monotone(const mset *a, const mset *b)
+{
+    for (size_t i = 0; i < a->n; i++) {
+        size_t nl = strlen(a->s[i].name);
+        bool counter = (nl > 6 && strcmp(a->s[i].name + nl - 6, "_total") == 0) ||
+                       (nl > 7 && strcmp(a->s[i].name + nl - 7, "_bucket") == 0) ||
+                       (nl > 6 && strcmp(a->s[i].name + nl - 6, "_count") == 0) ||
+                       (nl > 4 && strcmp(a->s[i].name + nl - 4, "_sum") == 0);
+        if (!counter)
+            continue;
+        for (size_t j = 0; j < b->n; j++)
+            if (strcmp(b->s[j].name, a->s[i].name) == 0 && strcmp(b->s[j].labels, a->s[i].labels) == 0) {
+                if (b->s[j].v < a->s[i].v) {
+                    fprintf(stderr, "%s{%s} went down: %g -> %g\n", a->s[i].name, a->s[i].labels, a->s[i].v, b->s[j].v);
+                    failures++;
+                }
+                break;
+            }
+    }
+}
+
+typedef struct {
+    uint32_t id;
+    int errors;
+} mjob;
+
+enum { M_THREADS = 4, M_ROUNDS = 20, M_ROWS = 1000, M_QUERIES = 5 };
+
+/* Every TSDB_OP_X in tsdb_protocol.h must have a tsdb_requests_total{op="x"} sample: an op added to the
+ * protocol (by this or another branch) and left out of the table in metrics.c would be counted as
+ * "other" and a query op would miss the latency histogram. */
+static void check_ops_named(const mset *m)
+{
+    const char *paths[] = {"include/tsdb_protocol.h", "../include/tsdb_protocol.h", NULL};
+    FILE *f = NULL;
+    for (int i = 0; paths[i] && !f; i++)
+        f = fopen(paths[i], "r");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    char line[256];
+    int seen = 0;
+    while (fgets(line, sizeof line, f)) {
+        char name[64];
+        int num;
+        if (sscanf(line, " TSDB_OP_%63[A-Z_] = %d", name, &num) != 2 || strcmp(name, "REPLY") == 0)
+            continue;
+        char want[96];
+        size_t k = 0;
+        for (const char *q = name; *q && k < 60; q++)
+            want[k++] = (char)(*q >= 'A' && *q <= 'Z' ? *q - 'A' + 'a' : *q);
+        want[k] = 0;
+        char lab[128];
+        snprintf(lab, sizeof lab, "op=\"%s\"", want);
+        double v = mval(m, "tsdb_requests_total", lab);
+        CHECK(!isnan(v));
+        if (isnan(v))
+            fprintf(stderr, "TSDB_OP_%s = %d has no tsdb_requests_total{%s}: add it to the ops table in server/metrics.c\n",
+                    name, num, lab);
+        if (strncmp(want, "query_", 6) == 0) /* every query op has a latency histogram */
+            CHECK(!isnan(mval(m, "tsdb_query_duration_seconds_count", lab)));
+        seen++;
+    }
+    fclose(f);
+    CHECK(seen >= 20);
+}
+
+static void *metrics_load_thread(void *arg)
+{
+    mjob *j = arg;
+    tsdbc *c;
+    if (tsdbc_connect("127.0.0.1", port, &c)) {
+        j->errors++;
+        return NULL;
+    }
+    int64_t ts[M_ROWS];
+    float v[M_ROWS];
+    for (int round = 0; round < M_ROUNDS; round++) {
+        for (int i = 0; i < M_ROWS; i++) {
+            ts[i] = T0 + (int64_t)(round * M_ROWS + i) * 1000;
+            v[i] = (float)i;
+        }
+        if (tsdbc_insert_series(c, j->id, ts, v, M_ROWS))
+            j->errors++;
+        if (round % (M_ROUNDS / M_QUERIES) == 0) {
+            tsdb_bucket *b;
+            size_t nb;
+            if (tsdbc_query_agg(c, j->id, INT64_MIN, INT64_MAX, 0, &b, &nb))
+                j->errors++;
+            else
+                free(b);
+        }
+    }
+    tsdb_points p;
+    if (tsdbc_query_points(c, j->id, INT64_MIN, INT64_MAX, &p))
+        j->errors++;
+    else {
+        free(p.ts);
+        free(p.values);
+    }
+    tsdbc_close(c);
+    return NULL;
+}
+
+static int64_t mono_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+}
+
+/* Slowest of n small queries on the main port, microseconds. */
+static int64_t main_port_worst_us(tsdbc *c, uint32_t id, int n)
+{
+    int64_t worst = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t t = mono_us();
+        tsdb_bucket *b;
+        size_t nb;
+        if (tsdbc_query_agg(c, id, T0, T0 + 60000, 0, &b, &nb) == 0)
+            free(b);
+        else
+            CHECK(!"main port query failed");
+        int64_t d = mono_us() - t;
+        if (d > worst)
+            worst = d;
+    }
+    return worst;
+}
+
+static void test_metrics_buckets(void)
+{
+    CHECK(metrics_bucket_for(0) == 0 && metrics_bucket_for(0.0004) == 0 && metrics_bucket_for(0.0005) == 0);
+    CHECK(metrics_bucket_for(0.0006) == 1 && metrics_bucket_for(0.001) == 1);
+    CHECK(metrics_bucket_for(0.003) == 3 && metrics_bucket_for(0.1) == 7 && metrics_bucket_for(0.5) == 9);
+    CHECK(metrics_bucket_for(1) == 10 && metrics_bucket_for(30) == 14); /* bounds are inclusive, as in Prometheus */
+    CHECK(metrics_bucket_for(30.1) == 15 && metrics_bucket_for(1e9) == 15);
+}
+
+static void test_metrics(const char *dir)
+{
+    test_metrics_buckets();
+    char cmd[1200];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0) {
+        failures++;
+        return;
+    }
+    const char *extra[] = {"--metrics-port", "auto", "--metrics-bind", "127.0.0.1", NULL};
+    pid_t srv = start_server_with(dir, extra);
+    mport = th_mport; /* the port file names the metrics port of this server */
+    CHECK(mport > 0 && mport != port);
+
+    /* the endpoint: format, headers, the paths and methods it refuses */
+    mset m0;
+    scrape(&m0);
+    CHECK(mval(&m0, "tsdb_build_info", "version=\"") == 1);
+    CHECK(mval(&m0, "tsdb_role_info", "role=\"writer\"") == 1);
+    const char *iob = getenv("TSDBD_IO");
+    if (iob && strcmp(iob, "auto") != 0 && strcmp(iob, "uring") != 0)
+        CHECK(mval(&m0, "tsdb_io_backend_info", "backend=\"epoll\"") == 1);
+    CHECK(mval(&m0, "tsdb_io_backend_info", NULL) == 1);
+    CHECK(mval(&m0, "tsdb_workers", NULL) == 4);
+    CHECK(mval(&m0, "tsdb_connections_max", NULL) == 10000);
+    CHECK(mval(&m0, "tsdb_failed", NULL) == 0);
+    CHECK(mval(&m0, "tsdb_rows", "volume=\"0\"") == 0);
+    CHECK(mval(&m0, "tsdb_start_time_seconds", NULL) > 1e9);
+    check_ops_named(&m0);
+    mset_free(&m0);
+    size_t len;
+    char *r = HTTP_EXCHANGE("GET /nothing HTTP/1.1\r\n\r\n", 5, &len);
+    CHECK(r && http_status(r) == 404);
+    free(r);
+    r = HTTP_EXCHANGE("GET /metrics?x=1 HTTP/1.0\r\n\r\n", 5, &len);
+    CHECK(r && http_status(r) == 200 && strstr(r, "tsdb_build_info"));
+    free(r);
+    r = HTTP_EXCHANGE("POST /metrics HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody", 5, &len);
+    CHECK(r && http_status(r) == 405);
+    free(r);
+    r = HTTP_EXCHANGE("HEAD /metrics HTTP/1.1\r\n\r\n", 5, &len);
+    CHECK(r && http_status(r) == 200 && strstr(r, "Content-Length: ") && !strstr(r, "tsdb_build_info"));
+    free(r);
+    r = HTTP_EXCHANGE("\x01\xff\xfe garbage\r\n\r\n", 5, &len);
+    CHECK(r && http_status(r) == 400);
+    free(r);
+    {
+        char big[9000];
+        memset(big, 'a', sizeof big);
+        memcpy(big, "GET /metrics HTTP/1.1\r\nX: ", 26);
+        r = http_exchange(big, sizeof big, 5, &len); /* a head that never ends */
+        CHECK(r && http_status(r) == 431);
+        free(r);
+    }
+
+    /* scraping while clients insert and query from several connections */
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    pthread_t th[M_THREADS];
+    mjob jobs[M_THREADS];
+    mset before, prev;
+    scrape(&before);
+    prev = (mset){0};
+    for (int i = 0; i < M_THREADS; i++) {
+        char sname[32];
+        snprintf(sname, sizeof sname, "metrics.%d", i);
+        OK(tsdbc_series(c, sname, 1, &jobs[i].id));
+        jobs[i].errors = 0;
+        pthread_create(&th[i], NULL, metrics_load_thread, &jobs[i]);
+    }
+    int scrapes_during = 0, saw_conns = 0, saw_busy = 0;
+    for (int done = 0; done < 1;) {
+        mset cur;
+        if (scrape(&cur)) {
+            scrapes_during++;
+            if (prev.s)
+                check_monotone(&prev, &cur);
+            saw_conns += mval(&cur, "tsdb_connections", NULL) >= 2; /* mine and the load threads' */
+            saw_busy += mval(&cur, "tsdb_workers_busy", NULL) >= 1;
+            CHECK(mval(&cur, "tsdb_workers_busy", NULL) <= mval(&cur, "tsdb_workers", NULL));
+            mset_free(&prev);
+            prev = cur;
+        }
+        if (scrapes_during >= 400)
+            break;
+        done = 1;
+        for (int i = 0; i < M_THREADS; i++) {
+            /* a thread is finished when its series has all its rows */
+            tsdb_bucket *b;
+            size_t nb;
+            if (tsdbc_query_agg(c, jobs[i].id, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0) {
+                done &= nb == 1 && b[0].count == (uint64_t)M_ROUNDS * M_ROWS;
+                free(b);
+            }
+        }
+    }
+    for (int i = 0; i < M_THREADS; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(jobs[i].errors == 0);
+    }
+    CHECK(scrapes_during >= 3);
+    CHECK(saw_conns >= 1);
+    OK(tsdbc_flush(c));
+    {   /* one request the server refuses: a counted error */
+        int rfd = raw_connect();
+        uint8_t short_payload[3] = {1, 2, 3};
+        uint8_t rest[64];
+        size_t nrest;
+        uint32_t rid;
+        raw_send(rfd, 7, TSDB_OP_QUERY_AGG, short_payload, sizeof short_payload);
+        CHECK(raw_reply(rfd, &rid, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID);
+        close(rfd);
+    }
+    (void)saw_busy; /* busy workers are a snapshot: reported, but too fast here to rely on */
+
+    mset after;
+    scrape(&after);
+    check_monotone(&before, &after);
+    double rows = (double)M_THREADS * M_ROUNDS * M_ROWS;
+    CHECK(mval(&after, "tsdb_inserted_rows_total", NULL) - mval(&before, "tsdb_inserted_rows_total", NULL) == rows);
+    double ins = mval(&after, "tsdb_requests_total", "op=\"insert\"") + mval(&after, "tsdb_requests_total", "op=\"insert_values\"") -
+                 mval(&before, "tsdb_requests_total", "op=\"insert\"") - mval(&before, "tsdb_requests_total", "op=\"insert_values\"");
+    CHECK(ins == (double)M_THREADS * M_ROUNDS);
+    double qcount = 0;
+    for (size_t i = 0; i < after.n; i++)
+        if (strcmp(after.s[i].name, "tsdb_query_duration_seconds_count") == 0)
+            qcount += after.s[i].v;
+    double q0 = msum(&before, "tsdb_query_duration_seconds_count");
+    CHECK(qcount - q0 >= (double)M_THREADS * (M_QUERIES + 1));
+    CHECK(msum(&after, "tsdb_query_duration_seconds_sum") > msum(&before, "tsdb_query_duration_seconds_sum"));
+    {   /* a query of a few thousand rows takes far less than 30 s: it must not sit in the +Inf bucket,
+         * and a fast one is in a bucket at or below 1 s */
+        double agg_inf = mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"+Inf\"");
+        CHECK(agg_inf > 0);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"30\"") == agg_inf);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"1\"") == agg_inf);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"0.0005\"") <= agg_inf);
+    }
+    double inv = mval(&after, "tsdb_request_errors_total", "code=\"invalid\"") - mval(&before, "tsdb_request_errors_total", "code=\"invalid\"");
+    CHECK(inv == 1);
+    if (inv != 1)
+        fprintf(stderr, "invalid errors: %g\n", inv);
+    CHECK(mval(&after, "tsdb_connections_accepted_total", NULL) - mval(&before, "tsdb_connections_accepted_total", NULL) >= M_THREADS);
+    CHECK(mval(&after, "tsdb_rows", "volume=\"0\"") == rows); /* flushed: all in parts */
+    CHECK(mval(&after, "tsdb_memtable_rows", "volume=\"0\"") == 0);
+    CHECK(mval(&after, "tsdb_parts", "volume=\"0\"") >= 1);
+    CHECK(mval(&after, "tsdb_partitions", "volume=\"0\"") >= 1);
+    CHECK(mval(&after, "tsdb_granules", "volume=\"0\"") >= 1);
+    CHECK(mval(&after, "tsdb_disk_bytes", "volume=\"0\"") > 0);
+    CHECK(mval(&after, "tsdb_wal_bytes_total", "volume=\"0\"") >= rows * 16);
+    CHECK(mval(&after, "tsdb_failed", "volume=\"0\"") == 0);
+    CHECK(mval(&after, "tsdb_metrics_scrapes_total", NULL) >= scrapes_during);
+    CHECK(isnan(mval(&after, "tsdb_follow_refresh_age_seconds", NULL))); /* a writer has no lag */
+    mset_free(&before);
+    mset_free(&prev);
+
+    /* a client that went away is no longer a connection */
+    tsdb_stats dummy;
+    OK(tsdbc_stats(c, &dummy));
+    tsdbc_close(c);
+    double conns = 1;
+    for (int i = 0; i < 100 && conns != 0; i++) {
+        mset m;
+        scrape(&m);
+        conns = mval(&m, "tsdb_connections", NULL);
+        mset_free(&m);
+        if (conns != 0)
+            usleep(20000);
+    }
+    CHECK(conns == 0);
+    mset_free(&after);
+
+    /* Hostile scrapers: connections that start a request and never end it, one that sends a byte
+     * every 100 ms, and a crowd of silent ones. The main port is as fast as without them and a
+     * real scrape still works, even with every slot taken. */
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    uint32_t sid;
+    OK(tsdbc_series(c, "metrics.0", 0, &sid));
+    int64_t base_worst = main_port_worst_us(c, sid, 300);
+    enum { SLOW = 30, SILENT = 100 };
+    int slow[SLOW + SILENT];
+    for (int i = 0; i < SLOW + SILENT; i++) {
+        slow[i] = metrics_connect();
+        CHECK(slow[i] >= 0);
+        if (i < SLOW && slow[i] >= 0)
+            CHECK(send(slow[i], "GET /metrics HTTP/1.1\r\nHost: x\r\n", 32, MSG_NOSIGNAL) == 32);
+    }
+    int drip = metrics_connect();
+    int64_t t_start = mono_us();
+    int dripped = 0;
+    int64_t worst = 0;
+    mset m;
+    while (mono_us() - t_start < 1500000) {
+        if (drip >= 0 && send(drip, "G", 1, MSG_NOSIGNAL) == 1)
+            dripped++;
+        int64_t w = main_port_worst_us(c, sid, 20);
+        if (w > worst)
+            worst = w;
+        usleep(100000);
+    }
+    CHECK(dripped >= 5);
+    CHECK(worst < 500000 || worst < 20 * base_worst); /* no stall: a query takes microseconds, allow a noisy machine */
+    int64_t t0s = mono_us();
+    CHECK(scrape(&m));
+    CHECK(mono_us() - t0s < 1000000); /* served at once, not after the idle ones time out */
+    CHECK(mval(&m, "tsdb_metrics_rejected_total", NULL) >= 1); /* the crowd pushed out the oldest */
+    mset_free(&m);
+    /* those that never finished are closed by the server, without a reply, within the deadline */
+    int closed = 0;
+    for (int i = 0; i < SLOW + SILENT; i++) {
+        if (slow[i] < 0)
+            continue;
+        struct timeval tv = {4, 0};
+        setsockopt(slow[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char b1[64];
+        ssize_t rr = recv(slow[i], b1, sizeof b1, 0);
+        closed += rr == 0 || (rr < 0 && errno == ECONNRESET);
+    }
+    CHECK(closed == SLOW + SILENT);
+    if (drip >= 0) {
+        char b1[64];
+        struct timeval tv = {4, 0};
+        setsockopt(drip, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        CHECK(recv(drip, b1, sizeof b1, 0) <= 0);
+    }
+    for (int i = 0; i < SLOW + SILENT; i++)
+        if (slow[i] >= 0)
+            close(slow[i]);
+    if (drip >= 0)
+        close(drip);
+    CHECK(main_port_worst_us(c, sid, 10) < 500000);
+    CHECK(scrape(&m));
+    mset_free(&m);
+
+    /* Stopping the server with a half-finished scrape connection open is as quick as ever. */
+    int hang = metrics_connect();
+    if (hang >= 0)
+        CHECK(send(hang, "GET /met", 8, MSG_NOSIGNAL) == 8);
+    tsdbc_close(c);
+    int64_t ts0 = mono_us();
+    stop_server(srv);
+    CHECK(mono_us() - ts0 < 3000000);
+    if (hang >= 0)
+        close(hang);
+    CHECK(metrics_connect() < 0); /* the port is closed with the server */
+
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (!failures && system(cmd) != 0)
+        failures++;
+}
+
+/* The parts of the metrics that need their own server: the connection limit, a volume path that needs
+ * label escaping, error codes other than "invalid", merges. */
+static void test_metrics_more(const char *dir)
+{
+    char cmd[2400], vol[1100];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0) {
+        failures++;
+        return;
+    }
+    const char *extra[] = {"--metrics-port", "auto", "--metrics-bind", "127.0.0.1", "--max-connections", "6", NULL};
+    pid_t srv = start_server_with(dir, extra);
+    mport = th_mport;
+    CHECK(mport > 0 && mport != port);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+
+    /* a bad or unavailable --metrics-port is an error at startup, not a silent gap in monitoring */
+    {
+        const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+        const char *bad[] = {"abc", "12x", "0", "70000", "-1", ""};
+        for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+            snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port 0 --metrics-port '%s' >/dev/null 2>&1", bin, dir,
+                     bad[i]);
+            int st = system(cmd);
+            CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2);
+        }
+        snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port 0 --metrics-port %d >/dev/null 2>&1", bin, dir,
+                 mport); /* the port the running server holds */
+        int st = system(cmd);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 1);
+        snprintf(cmd, sizeof cmd, "rm -rf '%s.bad'", dir);
+        if (system(cmd) != 0)
+            failures++;
+    }
+
+    /* a volume whose directory name has a double quote and a backslash: the label must be escaped
+     * (Prometheus drops a whole scrape with a malformed line) */
+    snprintf(vol, sizeof vol, "%s.vol\"q\\z", dir);
+    uint32_t vid, sid;
+    OK(tsdbc_series_at(c, "weird", vol, &vid));
+    OK(tsdbc_series(c, "plain", 1, &sid));
+    {
+        mset m;
+        CHECK(scrape(&m)); /* the strict parser rejects an unescaped quote */
+        CHECK(mval(&m, "tsdb_rows", "volume=\"1\"") == 0);
+        bool escaped = false;
+        for (size_t i = 0; i < m.n; i++)
+            escaped |= strcmp(m.s[i].name, "tsdb_rows") == 0 && strstr(m.s[i].labels, ".vol\\\"q\\\\z\"") != NULL;
+        CHECK(escaped);
+        mset_free(&m);
+    }
+
+    /* merges: several parts in a partition, then optimize */
+    for (int k = 0; k < 4; k++) {
+        int64_t ts[100];
+        float v[100];
+        for (int i = 0; i < 100; i++) {
+            ts[i] = 1700000000000 + (int64_t)(k * 100 + i) * 1000;
+            v[i] = (float)i;
+        }
+        OK(tsdbc_insert_series(c, sid, ts, v, 100));
+        OK(tsdbc_flush(c));
+    }
+    OK(tsdbc_optimize(c)); /* (the background merger may have started on its own: only the end state is certain) */
+    {
+        mset m;
+        CHECK(scrape(&m));
+        CHECK(mval(&m, "tsdb_merges_total", "volume=\"0\"") >= 1);
+        CHECK(mval(&m, "tsdb_merged_rows_total", "volume=\"0\"") >= 400);
+        CHECK(mval(&m, "tsdb_parts", "volume=\"0\"") == 1);
+        mset_free(&m);
+    }
+
+    /* error codes: an unknown series and too many buckets, each counted under its own name */
+    {
+        mset b4;
+        scrape(&b4);
+        tsdb_bucket *bk;
+        size_t nb;
+        uint32_t nid;
+        int rc1 = tsdbc_series(c, "no such series", 0, &nid);
+        CHECK(rc1 == TSDB_ERR_NOTFOUND);
+        /* data 200 000 s apart, 1 ms buckets: over the limit of 64 Mi buckets */
+        int64_t far_ts[2] = {1800000000000, 1800000000000 + 200000000};
+        float far_v[2] = {1, 2};
+        OK(tsdbc_insert_series(c, sid, far_ts, far_v, 2));
+        int rc2 = tsdbc_query_agg(c, sid, 0, INT64_MAX / 2, 1, &bk, &nb);
+        CHECK(rc2 == TSDB_ERR_TOO_MANY_BUCKETS);
+        mset af;
+        scrape(&af);
+        double all = 0;
+        for (size_t i = 0; i < af.n; i++)
+            if (strcmp(af.s[i].name, "tsdb_request_errors_total") == 0)
+                all += af.s[i].v;
+        for (size_t i = 0; i < b4.n; i++)
+            if (strcmp(b4.s[i].name, "tsdb_request_errors_total") == 0)
+                all -= b4.s[i].v;
+        CHECK(all == 2);
+        CHECK(mval(&af, "tsdb_request_errors_total", "code=\"too_many_buckets\"") -
+                  mval(&b4, "tsdb_request_errors_total", "code=\"too_many_buckets\"") == 1);
+        CHECK(mval(&af, "tsdb_request_errors_total", "code=\"notfound\"") -
+                  mval(&b4, "tsdb_request_errors_total", "code=\"notfound\"") == 1);
+        mset_free(&b4);
+        mset_free(&af);
+    }
+
+    /* the connection limit: connections over --max-connections are closed and counted */
+    int extra_fd[12];
+    for (int i = 0; i < 12; i++) {
+        extra_fd[i] = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+        inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+        CHECK(connect(extra_fd[i], (struct sockaddr *)&sa, sizeof sa) == 0);
+    }
+    double rej = 0;
+    for (int i = 0; i < 100 && rej < 6; i++) { /* 12 more than the 5 free slots: at least 6 are turned away */
+        mset m;
+        scrape(&m);
+        rej = mval(&m, "tsdb_connections_rejected_total", NULL);
+        CHECK(mval(&m, "tsdb_connections", NULL) <= 6);
+        mset_free(&m);
+        if (rej < 6)
+            usleep(20000);
+    }
+    CHECK(rej >= 6);
+    for (int i = 0; i < 12; i++)
+        close(extra_fd[i]);
+    tsdbc_close(c);
+    stop_server(srv);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", dir, vol);
+    if (!failures && system(cmd) != 0)
+        failures++;
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
     snprintf(dir, sizeof dir, "%s/tsdbd-test-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
-    port = 10000 + (int)(getpid() % 20000); /* below the ephemeral range, where client sockets take ports */
     char cmd[1300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s.volume'", dir, dir);
     if (system(cmd) != 0)
@@ -1139,10 +2607,19 @@ int main(int argc, char **argv)
 
     test_close(c);
     test_framing();
+    test_hello();
+    test_old_server(6);
+    test_old_server(5);
     test_types(c);
+    test_nan(c);
+    test_lttb_remote(c);
     test_pack_roundtrip();
     test_packed_inserts(c);
     test_bounds(c, a, N);
+    test_twa(c);
+    test_spread_remote(c);
+    test_spread_old_server();
+    test_delete(c);
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);
@@ -1187,6 +2664,11 @@ int main(int argc, char **argv)
     printf("fail-stop after a WAL write error\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-failstop-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_wal_failstop(dir);
+    printf("prometheus metrics\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-metrics-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_metrics(dir);
+    snprintf(dir, sizeof dir, "%s/tsdbd-metrics2-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_metrics_more(dir);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

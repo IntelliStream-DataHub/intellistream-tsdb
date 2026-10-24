@@ -324,10 +324,14 @@ static void run(rec *r, codec_ctx *c)
         }
         /* aggregates: whole, every short prefix (the kernels' tails), and the statistics parts store */
         for (size_t m = 0; m <= x->n; m = m < 40 ? m + 1 : m == x->n ? m + 1 : x->n) {
-            agg_state a;
+            struct {
+                agg_state a;
+                agg_dev x;
+            } a; /* the state and its spread, compared together */
             memset(&a, 0, sizeof a);
-            agg_init(&a, x->type);
-            agg_fold(x->type, x->v, m, &a);
+            agg_init(&a.a, x->type);
+            agg_dev_init(&a.x);
+            agg_fold(x->type, x->v, m, &a.a, &a.x);
             snprintf(what, sizeof what, "agg_fold %zu", m);
             put(r, what, x->name, &a, sizeof a);
             granule g;
@@ -336,14 +340,14 @@ static void run(rec *r, codec_ctx *c)
             snprintf(what, sizeof what, "granule_stats %zu", m);
             put(r, what, x->name, &g, sizeof g);
             memset(&a, 0, sizeof a);
-            agg_init(&a, x->type);
-            agg_from_granule(x->type, &g, &a);
+            agg_from_granule(x->type, &g, &a.a, &a.x);
             put(r, "agg_from_granule", x->name, &a, sizeof a);
-            if (m && g.nulls == 0) {
+            for (int sp = 0; m && g.nulls == 0 && sp < 2; sp++) { /* queries without and with the spread */
                 memset(&a, 0, sizeof a);
-                agg_init(&a, x->type);
-                agg_fold_hint(x->type, x->v, m, false, &a);
-                snprintf(what, sizeof what, "agg_fold_hint %zu", m);
+                agg_init(&a.a, x->type);
+                agg_dev_init(&a.x);
+                agg_fold_hint(x->type, x->v, m, false, &a.a, sp ? &a.x : NULL);
+                snprintf(what, sizeof what, "agg_fold_hint %zu%s", m, sp ? " spread" : "");
                 put(r, what, x->name, &a, sizeof a);
             }
         }

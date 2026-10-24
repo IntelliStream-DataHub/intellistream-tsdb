@@ -15,7 +15,14 @@ static void usage(void)
             "                                     (values by the series' type; null or empty: null;\n"
             "                                     new series are float32)\n"
             "  query <series> <start> <end> [raw|count|sum|min|max|avg|all] [group] [--tz ZONE]\n"
+            "        also range, stddev_pop, stddev_samp, var_pop, var_samp (stddev, var: the _pop ones)\n"
             "        [--desc] [--limit N]         newest first; at most N rows or buckets\n"
+            "  query <series> <start> <end> lttb N  N points that keep the shape (for charts)\n"
+            "  query <series> <start> <end> twa [group] [--linear] [--max-gap INTERVAL] [--tz ZONE]\n"
+            "                                     time-weighted average: each value weighted by how\n"
+            "                                     long it held (step; --linear: interpolated), not\n"
+            "                                     across gaps over --max-gap; columns twa, area\n"
+            "                                     (value x ms), covered_ms, count\n"
             "  create <series> [path] [--type T]  create a series of type T (float32, float64, int64,\n"
             "                                     bool, state), in volume <path> if given\n"
             "  series                             list series (type and volume)\n"
@@ -23,6 +30,9 @@ static void usage(void)
             "  parts                              list active parts\n"
             "  optimize                           merge every partition into one part\n"
             "  drop-before <time>                 drop whole partitions ending before <time>\n"
+            "  delete <series> <start> <end>      delete the series' values in [start, end)\n"
+            "  retention <series> [<age>|off]     show or set how long the series keeps values\n"
+            "                                     (e.g. 30d, 12h; off keeps them for ever)\n"
             "\n"
             "times: 1700000000000 (ms), 2024-01-31, \"2024-01-31 12:00:00.250\", 2024-01-31T12:00:00Z,\n"
             "       now, now-1h, min, max.  ranges are [start, end).\n"
@@ -311,6 +321,32 @@ static bool parse_group(const char *s, tsdb_group *g, int64_t *interval_ms)
     return parse_interval(s, interval_ms) && *interval_ms > 0;
 }
 
+static int query_twa(tsdb *db, uint32_t id, int64_t start, int64_t end, const tsdb_group *g, int64_t interval,
+                     tsdb_twa_opts *tw, const tsdb_query_opts *q)
+{
+    tw->order = q->order;
+    tw->limit = q->limit;
+    tsdb_twa_bucket *b;
+    size_t nb;
+    int rc = g ? tsdb_query_twa_group_local(db, id, start, end, g, tw, &b, &nb)
+               : tsdb_query_twa(db, id, start, end, interval, tw, &b, &nb);
+    if (rc)
+        die("query", rc);
+    printf("time\ttwa\tarea\tcovered_ms\tcount\n");
+    char tb[40], twa[32];
+    for (size_t i = 0; i < nb; i++) {
+        format_time(b[i].start, tb, sizeof tb);
+        if (b[i].covered_ms)
+            snprintf(twa, sizeof twa, "%.17g", b[i].twa);
+        else
+            snprintf(twa, sizeof twa, "\\N"); /* readings, but none held for any time */
+        printf("%s\t%s\t%.17g\t%" PRId64 "\t%" PRIu64 "\n", tb, twa, b[i].area, b[i].covered_ms, b[i].count);
+    }
+    free(b);
+    print_stats("buckets");
+    return 0;
+}
+
 static int cmd_query(tsdb *db, int argc, char **argv)
 {
     /* positional arguments, then --tz, --desc, --limit anywhere after them */
@@ -318,8 +354,16 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     int npos = 0;
     tsdb_query_opts q = {TSDB_ASC, 0};
     const char *zone = NULL;
+    tsdb_twa_opts tw = {.method = TSDB_TWA_STEP, .order = TSDB_ASC};
     for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--desc") == 0)
+        if (strcmp(argv[i], "--linear") == 0)
+            tw.method = TSDB_TWA_LINEAR;
+        else if (strcmp(argv[i], "--max-gap") == 0 && i + 1 < argc) {
+            if (!parse_interval(argv[++i], &tw.max_gap_ms) || tw.max_gap_ms < 0) {
+                fprintf(stderr, "tsdb: cannot parse --max-gap \"%s\"\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--desc") == 0)
             q.order = TSDB_DESC;
         else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc)
             q.limit = strtoull(argv[++i], NULL, 10);
@@ -360,50 +404,107 @@ static int cmd_query(tsdb *db, int argc, char **argv)
         print_stats("rows");
         return 0;
     }
-    tsdb_bucket *b;
-    size_t nb;
-    if (grouped)
-        rc = tsdb_query_group_local(db, id, start, end, &g, &q, &b, &nb);
-    else if (interval) {
-        rc = tsdb_query_agg(db, id, start, end, interval, &b, &nb);
-        if (rc == 0) { /* order and limit as tsdb_query_group_ex applies them */
-            if (q.order == TSDB_DESC)
-                for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
-                    tsdb_bucket x = b[i];
-                    b[i] = b[j];
-                    b[j] = x;
-                }
-            if (q.limit && nb > q.limit)
-                nb = q.limit;
+    if (strcmp(mode, "lttb") == 0) { /* the points that keep the shape, printed like raw */
+        char *e = NULL;
+        /* digits only: strtoull would take "-1" as the largest number */
+        unsigned long long n = npos > 4 && pos[4][0] >= '0' && pos[4][0] <= '9' ? strtoull(pos[4], &e, 10) : 0;
+        if (!e || *e || n < 3) {
+            fprintf(stderr, "tsdb: lttb needs a number of points, at least 3\n");
+            return 1;
         }
-    } else
-        rc = tsdb_query_group_ex(db, id, start, end, NULL, &q, &b, &nb);
+        raw_out o = {stdout, 0, db, id};
+        if ((rc = tsdb_query_lttb(db, id, start, end, (size_t)n, print_raw, &o)) != 0)
+            die("query", rc);
+        print_stats("rows");
+        return 0;
+    }
+    if (strcmp(mode, "twa") == 0)
+        return query_twa(db, id, start, end, grouped ? &g : NULL, interval, &tw, &q);
+    /* the spread costs a second pass over the rows: asked for only by the modes that print it */
+    static const char *const spread_modes[] = {"all", "range", "stddev", "stddev_pop", "stddev_samp",
+                                               "var", "var_pop", "var_samp"};
+    bool spread = false;
+    for (size_t i = 0; i < sizeof spread_modes / sizeof *spread_modes; i++)
+        spread = spread || strcmp(mode, spread_modes[i]) == 0;
+    if (strcmp(mode, "stddev") == 0)
+        mode = "stddev_pop";
+    if (strcmp(mode, "var") == 0)
+        mode = "var_pop";
+    tsdb_spread_bucket *b = NULL;
+    tsdb_bucket *pb = NULL;
+    size_t nb = 0;
+    if (spread) {
+        if (grouped)
+            rc = tsdb_query_spread_group_local(db, id, start, end, &g, &q, &b, &nb);
+        else
+            rc = tsdb_query_spread(db, id, start, end, interval, &q, &b, &nb);
+    } else {
+        if (grouped)
+            rc = tsdb_query_group_local(db, id, start, end, &g, &q, &pb, &nb);
+        else if (interval) {
+            rc = tsdb_query_agg(db, id, start, end, interval, &pb, &nb);
+            if (rc == 0) { /* order and limit as tsdb_query_group_ex applies them */
+                if (q.order == TSDB_DESC)
+                    for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
+                        tsdb_bucket x = pb[i];
+                        pb[i] = pb[j];
+                        pb[j] = x;
+                    }
+                if (q.limit && nb > q.limit)
+                    nb = q.limit;
+            }
+        } else
+            rc = tsdb_query_group_ex(db, id, start, end, NULL, &q, &pb, &nb);
+        /* one loop below prints both */
+        if (rc == 0 && (b = calloc(nb ? nb : 1, sizeof *b)) == NULL)
+            rc = TSDB_ERR_NOMEM;
+        for (size_t i = 0; rc == 0 && i < nb; i++)
+            b[i].b = pb[i];
+        free(pb);
+    }
     if (rc)
         die("query", rc);
     tsdb_type type = TSDB_FLOAT32;
     tsdb_series_type(db, id, &type);
     bool all = strcmp(mode, "all") == 0, ints = type == TSDB_INT64 || type == TSDB_BOOL;
     if (all)
-        printf("time\tcount\tsum\tmin\tmax\tavg\n");
+        printf("time\tcount\tsum\tmin\tmax\tavg\trange\tstddev_pop\tstddev_samp\n");
     char tb[40];
     for (size_t i = 0; i < nb; i++) {
-        format_time(b[i].start, tb, sizeof tb);
-        char sum[32], mn[32], mx[32];
-        if (ints) { /* exact */
-            snprintf(sum, sizeof sum, "%" PRId64, b[i].isum);
-            snprintf(mn, sizeof mn, "%" PRId64, b[i].imin);
-            snprintf(mx, sizeof mx, "%" PRId64, b[i].imax);
+        const tsdb_bucket *x = &b[i].b;
+        const tsdb_spread_bucket *y = &b[i];
+        format_time(x->start, tb, sizeof tb);
+        char sum[32], mn[32], mx[32], rg[32], sp[32] = "";
+        if (ints) { /* exact; the range of int64 values fits only in 64 unsigned bits */
+            snprintf(sum, sizeof sum, "%" PRId64, x->isum);
+            snprintf(mn, sizeof mn, "%" PRId64, x->imin);
+            snprintf(mx, sizeof mx, "%" PRId64, x->imax);
+            if (x->count)
+                snprintf(rg, sizeof rg, "%" PRIu64, (uint64_t)x->imax - (uint64_t)x->imin);
+            else
+                snprintf(rg, sizeof rg, "%.17g", y->range);
         } else {
-            snprintf(sum, sizeof sum, "%.17g", b[i].sum);
-            snprintf(mn, sizeof mn, "%.17g", b[i].min);
-            snprintf(mx, sizeof mx, "%.17g", b[i].max);
+            snprintf(sum, sizeof sum, "%.17g", x->sum);
+            snprintf(mn, sizeof mn, "%.17g", x->min);
+            snprintf(mx, sizeof mx, "%.17g", x->max);
+            snprintf(rg, sizeof rg, "%.17g", y->range);
         }
-        if (!b[i].count && !all) /* only nulls */
-            snprintf(sum, sizeof sum, "\\N"), snprintf(mn, sizeof mn, "\\N"), snprintf(mx, sizeof mx, "\\N");
+        if (strcmp(mode, "stddev_pop") == 0)
+            snprintf(sp, sizeof sp, "%.9g", y->stddev_pop);
+        else if (strcmp(mode, "stddev_samp") == 0)
+            snprintf(sp, sizeof sp, "%.9g", y->stddev_samp);
+        else if (strcmp(mode, "var_pop") == 0)
+            snprintf(sp, sizeof sp, "%.9g", y->var_pop);
+        else if (strcmp(mode, "var_samp") == 0)
+            snprintf(sp, sizeof sp, "%.9g", y->var_samp);
+        if (!x->count && !all) /* only nulls */
+            snprintf(sum, sizeof sum, "\\N"), snprintf(mn, sizeof mn, "\\N"), snprintf(mx, sizeof mx, "\\N"),
+                snprintf(rg, sizeof rg, "\\N"), snprintf(sp, sizeof sp, "\\N");
         if (all)
-            printf("%s\t%" PRIu64 "\t%s\t%s\t%s\t%.9g\n", tb, b[i].count, sum, mn, mx, tsdb_bucket_avg(&b[i]));
+            printf("%s\t%" PRIu64 "\t%s\t%s\t%s\t%.9g\t%s\t%.9g\t%.9g\n", tb, x->count, sum, mn, mx,
+                   tsdb_bucket_avg(x), rg, y->stddev_pop, y->stddev_samp);
         else if (strcmp(mode, "count") == 0)
-            printf("%s\t%" PRIu64 "\n", tb, b[i].count);
+            printf("%s\t%" PRIu64 "\n", tb, x->count);
         else if (strcmp(mode, "sum") == 0)
             printf("%s\t%s\n", tb, sum);
         else if (strcmp(mode, "min") == 0)
@@ -411,7 +512,11 @@ static int cmd_query(tsdb *db, int argc, char **argv)
         else if (strcmp(mode, "max") == 0)
             printf("%s\t%s\n", tb, mx);
         else if (strcmp(mode, "avg") == 0)
-            printf("%s\t%.9g\n", tb, tsdb_bucket_avg(&b[i]));
+            printf("%s\t%.9g\n", tb, tsdb_bucket_avg(x));
+        else if (strcmp(mode, "range") == 0)
+            printf("%s\t%s\n", tb, rg);
+        else if (spread)
+            printf("%s\t%s\n", tb, sp);
         else
             usage();
     }
@@ -449,7 +554,8 @@ int main(int argc, char **argv)
         usage();
     const char *dir = argv[1], *cmd = argv[2];
     bool writes = strcmp(cmd, "insert") == 0 || strcmp(cmd, "import") == 0 || strcmp(cmd, "optimize") == 0 ||
-                  strcmp(cmd, "drop-before") == 0 || strcmp(cmd, "create") == 0;
+                  strcmp(cmd, "drop-before") == 0 || strcmp(cmd, "create") == 0 || strcmp(cmd, "delete") == 0 ||
+                  (strcmp(cmd, "retention") == 0 && argc > 4);
     tsdb_options o;
     tsdb_options_init(&o);
     o.read_only = !writes;
@@ -523,6 +629,29 @@ int main(int argc, char **argv)
             usage();
         if ((rc = tsdb_drop_before(db, t)) != 0)
             die("drop-before", rc);
+    } else if (strcmp(cmd, "delete") == 0) {
+        int64_t a, b;
+        uint32_t id;
+        if (argc != 6 || !parse_time(argv[4], &a) || !parse_time(argv[5], &b))
+            usage();
+        if ((rc = tsdb_series_lookup(db, argv[3], &id)) != 0 || (rc = tsdb_delete_range(db, id, a, b)) != 0)
+            die(argv[3], rc);
+    } else if (strcmp(cmd, "retention") == 0) {
+        uint32_t id;
+        int64_t limit = 0;
+        if (argc < 4 || argc > 5 || (argc == 5 && strcmp(argv[4], "off") != 0 &&
+                                     (!parse_interval(argv[4], &limit) || limit <= 0)))
+            usage();
+        if ((rc = tsdb_series_lookup(db, argv[3], &id)) != 0)
+            die(argv[3], rc);
+        if (argc == 5 && (rc = tsdb_set_retention(db, id, limit)) != 0)
+            die(argv[3], rc);
+        if ((rc = tsdb_get_retention(db, id, &limit)) != 0)
+            die(argv[3], rc);
+        if (limit)
+            printf("%s\t%" PRId64 " ms\n", argv[3], limit);
+        else
+            printf("%s\toff\n", argv[3]);
     } else {
         usage();
     }

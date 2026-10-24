@@ -198,6 +198,16 @@ Records follow the checkpoint: `{u32 len, u32 gen, u32 epoch, u8 kind, payload, 
 - **No unlinks of adopted names outside PURGE.** The runtime never unlinks a name `lstate` holds, except through PURGE. With the local backend and a lifetime of 0, `part_unref` may still unlink retired names (part.c:166-167). Only *live* names that are missing make a volume CORRUPT.
 - **Intents.** `txn_*` intent files no longer exist for format-3 volumes. `intents_recover` (part.c:506) stays for legacy volumes.
 
+**Range deletes, replaces and retention** (added after this plan) map onto
+the same edits. A delete or replace commits tombstone parts (and a replace's
+row parts) through `parts_commit` under `publish_lock`, exactly like a direct
+large insert: one COMMIT edit, nothing new to replay. Tombstones only hide rows
+of lower block numbers in their partition, so the ledger's block order is all
+they need. A retention drop of a whole partition is a DROP predicate for that
+one partition and does not raise the drop watermark (D33): a later insert into
+it is a valid write. `RETENTION` is a dictionary like `SERIES`: append-only,
+its length goes into the OWNERS high-water mark with the others.
+
 ### 2.6 fd lifecycle, abandon and the abort rule
 
 **The grant.** The grant object holds the LOCK fd, the chained fds, `dirfd`, a generation `gen` and the engine's thread handles. Queries never use grant fds: they use mmaps and separate unlocked read fds. Pinned `eng`s therefore keep working after the grant is released (finding 19).
@@ -404,6 +414,12 @@ A series is addressed by `(path, name)`: the absolute path of its volume, as lis
 **SIGTERM** does a clean release of every owned volume (§2.6), so a standby takes over within one poll.
 
 ## 9. Protocol changes (version 5)
+
+> Numbering: protocol version 5 has since been used by LTTB downsampling (QUERY_LTTB, 2026-10-24), and 6 by
+> time-weighted averages (QUERY_TWA), 7 by range deletes (DELETE_RANGE) and 8 by the spread fields of
+> QUERY_BUCKETS/QUERY_BOUNDS. The changes in this design ship as the next free version (9 or later); read "version 5"/"v5" in this document
+> as "the failover protocol version".
+
 
 There is no release yet, so version 5 replaces versions 1-4 (D32). The server refuses a HELLO below 5, and any frame before HELLO, with INVALID and closes the connection. The protocol may keep changing before 1.0, provided the C, Rust, Python and Java clients change in the same commit (AGENTS.md). Ops that exist only for older layouts (INSERT, and the float32-only QUERY_RAW and QUERY_AGG) may be removed in the same change; nothing here depends on them. On-disk compatibility is not affected.
 

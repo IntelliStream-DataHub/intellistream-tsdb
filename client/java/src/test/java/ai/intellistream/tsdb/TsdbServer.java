@@ -1,8 +1,6 @@
 package ai.intellistream.tsdb;
 
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -12,7 +10,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
 /**
- * Runs build/tsdbd for the tests: on a free port of 127.0.0.1, on a given directory, stopped with SIGTERM.
+ * Runs build/tsdbd for the tests: on a port tsdbd chose on 127.0.0.1, on a given directory, stopped with SIGTERM.
  *
  * <p>System properties: {@code tsdbd} is the binary (default ../../build/tsdbd), {@code tsdb.test.dir} the parent of
  * the scratch directories (default java.io.tmpdir).
@@ -41,34 +39,42 @@ final class TsdbServer implements AutoCloseable {
         return Files.createTempDirectory(base, prefix);
     }
 
-    /** Starts the server on {@code dir}, retrying with another port if the chosen one was taken meanwhile. */
+    /**
+     * Starts the server on {@code dir} on a port tsdbd chose ({@code --port 0 --port-file}). The port file holds
+     * "PORT PID" once it serves; the pid must be the process started here, so a test never talks to a server it
+     * did not start.
+     */
     static TsdbServer start(Path dir) throws IOException, InterruptedException {
         Path bin = binary();
         if (!Files.isExecutable(bin))
             throw new IllegalStateException(bin + " is missing: run make in the repository root first");
-        for (int attempt = 0; attempt < 5; attempt++) {
-            int port;
-            try (ServerSocket s = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-                port = s.getLocalPort();
+        Path log = dir.resolveSibling(dir.getFileName() + ".log");
+        Path portFile = dir.resolveSibling(dir.getFileName() + ".port");
+        Files.deleteIfExists(portFile);
+        Process p = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", "0", "--port-file",
+                portFile.toString(), "--no-fsync", "--workers", "4")
+                .redirectErrorStream(true)
+                .redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()))
+                .start();
+        for (int i = 0; i < 1500 && p.isAlive(); i++) {
+            if (Files.exists(portFile)) {
+                String[] f = Files.readString(portFile, StandardCharsets.UTF_8).trim().split("\\s+");
+                if (f.length == 2) {
+                    Files.deleteIfExists(portFile);
+                    if (Long.parseLong(f[1]) != p.pid()) {
+                        p.destroyForcibly().waitFor();
+                        throw new IllegalStateException(portFile + " names pid " + f[1]
+                                + ", but the server started here is pid " + p.pid());
+                    }
+                    return new TsdbServer(dir, Integer.parseInt(f[0]), p, log);
+                }
             }
-            Path log = dir.resolveSibling(dir.getFileName() + ".log");
-            int seen = Files.exists(log) ? (int) Files.size(log) : 0; /* earlier runs on the same directory */
-            Process p = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", Integer.toString(port),
-                    "--no-fsync", "--workers", "4")
-                    .redirectErrorStream(true)
-                    .redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()))
-                    .start();
-            /* Wait for its own "serving" line rather than for the port to accept: another process (say, a
-             * server of another test run) may have taken the port, and then this one exits instead. */
-            String ready = "on 127.0.0.1:" + port + ",";
-            for (int i = 0; i < 500 && p.isAlive(); i++) {
-                if (Files.exists(log) && Files.readString(log, StandardCharsets.UTF_8).indexOf(ready, seen) >= 0)
-                    return new TsdbServer(dir, port, p, log);
-                Thread.sleep(20);
-            }
-            p.destroyForcibly().waitFor();
+            Thread.sleep(20);
         }
-        throw new IllegalStateException("tsdbd did not start; see " + dir.resolveSibling(dir.getFileName() + ".log"));
+        boolean alive = p.isAlive();
+        p.destroyForcibly().waitFor();
+        throw new IllegalStateException("tsdbd " + (alive ? "wrote no port file in 30 s" : "exited before it listened")
+                + "; see " + log);
     }
 
     TsdbClient client() throws TsdbException {

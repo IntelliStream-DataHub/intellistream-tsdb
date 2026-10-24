@@ -5,8 +5,12 @@ failure into a pass.
   selftest.py
 
   uring probe   a broken io_uring backend must FAIL the run; only tsdbd's own "io_uring is not offered" is a skip
+  ports         a server never gets a computed port: two at once differ, a port file naming another pid is refused,
+                a server that cannot start is an error
   signals       SIGTERM while the main thread holds the process-list lock must not deadlock the driver
   verdicts      mutate.py counts a crashed driver or a hang as a problem, never as a caught bug
+  float sums    a float sum whose NaN-ness depends on the order of additions is neither compared between layouts
+                nor predicted by the model; one that is NaN in every order is compared bit for bit
 
 Needs build/tsdbd and build/tsdb (make).
 """
@@ -66,6 +70,63 @@ def test_uring_probe():
         b = fake_bin(tmp, "exit 3")
         rc, out = run_py(b, tmp)
         check(rc != 0 and "uring SKIPPED" not in out, "a uring server that exits silently: the run FAILS (rc %d)" % rc)
+
+
+def test_ports():
+    print("ports")
+    code = textwrap.dedent("""
+        import sys, tempfile, types
+        from pathlib import Path
+        sys.path.insert(0, %r)
+        import run
+        tmp = Path(tempfile.mkdtemp(prefix="integ-ports-"))
+        ctx = types.SimpleNamespace(tsdbd=%r)
+        a = run.Server(ctx, tmp / "a", tmp / "a.log", "epoll").start()
+        b = run.Server(ctx, tmp / "b", tmp / "b.log", "epoll").start()
+        try:
+            print("ports", a.port != b.port, a.port > 0 and b.port > 0)
+            print("owned", run.owns_port(a.proc.pid, a.port), run.owns_port(a.proc.pid, b.port))
+        finally:
+            a.stop()
+            b.stop()
+        # a directory below a regular file: tsdbd cannot open it and exits; start() must say so
+        (tmp / "f").write_text("x")
+        try:
+            run.Server(ctx, tmp / "f" / "db", tmp / "c.log", "epoll").start()
+            print("bad dir", "accepted")
+        except RuntimeError as e:
+            print("bad dir", "refused", "exited" in str(e))
+        """) % (str(HERE), str(ROOT / "build/tsdbd"))
+    p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120)
+    check("ports True True" in p.stdout, "two servers started at once listen on different, kernel-chosen ports")
+    check("owned True False" in p.stdout, "the harness sees which process holds a port")
+    check("bad dir refused True" in p.stdout, "a server that cannot start is an error that names the exit (%s)" % p.stderr[-200:])
+    # a server that writes a port file naming another pid (a stale file, or someone else's server) is refused
+    with tempfile.TemporaryDirectory(prefix="integ-self-") as tmp:
+        sh = Path(tmp) / "tsdbd"
+        sh.write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --port-file ] && f=$2; shift; done\n'
+                      'echo "9 $PPID" > "$f"\nsleep 30\n')  # the parent's pid, not this process's
+        sh.chmod(sh.stat().st_mode | stat.S_IXUSR)
+        code = textwrap.dedent("""
+            import sys, types
+            from pathlib import Path
+            sys.path.insert(0, %r)
+            import run
+            ctx = types.SimpleNamespace(tsdbd=%r)
+            try:
+                run.Server(ctx, Path(%r) / "db", Path(%r) / "x.log", "epoll").start()
+                print("result accepted")
+            except RuntimeError as e:
+                print("result refused", "names pid" in str(e))
+            """) % (str(HERE), str(sh), tmp, tmp)
+        p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120)
+        check("result refused True" in p.stdout, "a port file naming another pid is refused (%s)" % (p.stdout + p.stderr)[-200:])
+        # the right pid but a port it does not hold (someone else's server): refused by the /proc ownership check
+        sh.write_text('#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --port-file ] && f=$2; shift; done\n'
+                      'echo "9 $$" > "$f"\nsleep 30\n')
+        code = code.replace('"names pid" in str(e)', '"not held" in str(e)')
+        p = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=120)
+        check("result refused True" in p.stdout, "a port its server does not hold is refused (%s)" % (p.stdout + p.stderr)[-200:])
 
 
 def test_signal_while_locked():
@@ -144,11 +205,41 @@ def test_verdicts():
     check(got == "CAUGHT", "a timeout of a hang mutant -> %s (wanted CAUGHT)" % got)
 
 
+def test_float_sums():
+    print("float sums")
+    import run
+    import gen
+    types = {"f": "float64"}
+    big, nbig, inf, ninf, nan = "7fefffffffffffff", "ffefffffffffffff", "7ff0000000000000", "fff0000000000000", \
+        "7ff8000000000000"
+
+    def out(s, lo, hi):
+        return "## agg f 0 100 10\n" + "\t".join(["0", "4", s, lo, hi, "0", "0", "0"]) + "\n"
+    # DBL_MAX, DBL_MAX, -DBL_MAX, -DBL_MAX: +inf in the memtable, NaN once two parts hold +inf and -inf
+    d = run.diff_outputs("memtable", out(inf, nbig, big), "parts", out(nan, nbig, big), types=types)
+    check(d == [], "an overflowing sum is +inf in one layout and NaN in another: not a difference (%s)" % d)
+    d = run.diff_outputs("a", out(nan, nan, nan), "b", out("7ff8000000000001", nan, nan), types=types)
+    check(d != [], "a bucket of only NaNs: a NaN sum with another payload is a difference")
+    d = run.diff_outputs("a", out(nan, ninf, inf), "b", out("fff8000000000000", ninf, inf), types=types)
+    check(d != [], "a bucket with -inf and +inf: a NaN sum with another sign is a difference")
+    d = run.diff_outputs("a", out(inf, nbig, big), "b", out(inf, nbig, inf), types=types)
+    check(d != [], "a different max is still a difference")
+    # +inf, -DBL_MAX, -DBL_MAX: +inf in one order, NaN in another (-DBL_MAX - DBL_MAX = -inf first)
+    sm = gen.float_aggregates("float64", [inf, nbig, nbig])[0]
+    check(sm is None, "the model does not predict a sum of an infinity and rows that can overflow (%s)" % (sm,))
+    sm = gen.float_aggregates("float64", [inf, "3ff0000000000000"])[0]
+    check(sm is not None and sm[1] == float("inf"), "the model predicts +inf for +inf and small rows (%s)" % (sm,))
+    sm = gen.float_aggregates("float64", [big, ninf, inf])[0]
+    check(sm is not None and sm[1] != sm[1], "the model predicts NaN for -inf and +inf (%s)" % (sm,))
+
+
 def main():
     if not (ROOT / "build/tsdbd").exists() or not (ROOT / "build/tsdb").exists():
         print("build/tsdbd and build/tsdb are missing: run make", file=sys.stderr)
         return 2
     test_verdicts()
+    test_float_sums()
+    test_ports()
     test_signal_while_locked()
     test_signal_during_spawn()
     test_uring_probe()

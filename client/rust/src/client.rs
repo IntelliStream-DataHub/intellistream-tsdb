@@ -25,8 +25,8 @@ use crate::keepalive::{self, KeepAlive};
 use crate::pack;
 use crate::protocol::extend_i64s;
 use crate::protocol::{
-    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PACKED, PROTOCOL_VERSION, REPLY_HEADER, VALID,
-    VALUES_CHUNK_HEADER,
+    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PACKED, PROTOCOL_VERSION, REPLACE_HEADER, REPLY_HEADER,
+    VALID, VALUES_CHUNK_HEADER,
 };
 use crate::types::{Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, Stats};
 use crate::value::{Bitmap, Column, ColumnRef, Native, Value, ValueType};
@@ -1274,6 +1274,146 @@ impl Client {
             });
         }
         Ok(out)
+    }
+
+    // ------------------------------------------------ deletes and retention
+
+    /// Deletes the rows of a series in `range` (protocol version 7).
+    ///
+    /// A delete is a write like any other: a row of the range inserted after it returned is
+    /// kept, one acknowledged before it started is gone. Queries stop returning the rows at once,
+    /// merges remove them from disk later.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] from a server older than version 7 (the client asks HELLO first and
+    /// does not send the request); [`Error::Io`] if the connection fails, [`Error::Protocol`] if
+    /// the reply makes no sense; after either the client refuses further calls.
+    ///
+    /// ```no_run
+    /// # use tsdb_client::Client;
+    /// # let mut c = Client::connect("127.0.0.1:7070")?;
+    /// # let (id, t0) = (1, 1_700_000_000_000);
+    /// c.delete_range(id, t0..t0 + 3_600_000)?; // one hour, its end excluded
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    pub fn delete_range(&mut self, series: u32, range: impl RangeBounds<i64>) -> Result<()> {
+        let (start, end) = self::bounds(&range);
+        self.run(|c| {
+            c.need_deletes()?;
+            c.request(Op::DeleteRange, |f| {
+                f.u32(series).u32(0).i64(start).i64(end);
+            })
+        })
+    }
+
+    /// Replaces the rows of a series in `range` by `ts` and `values`, atomically (protocol
+    /// version 7): a reader sees either the old rows or the new ones. Every timestamp must lie in
+    /// `range`; no rows make it a delete. The values are a column of the series' type, with nulls
+    /// where its validity bitmap says so. It travels as one plain frame of at most 256 MiB.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if the lengths differ or the rows do not fit in one frame;
+    /// [`Status::Invalid`] for a timestamp outside `range`, a column of another type than the
+    /// series, or a server older than version 7; otherwise as [`delete_range`](Client::delete_range).
+    ///
+    /// ```no_run
+    /// # use tsdb_client::{Client, Column};
+    /// # let mut c = Client::connect("127.0.0.1:7070")?;
+    /// # let (id, t0) = (1, 1_700_000_000_000);
+    /// c.replace_range(id, t0..t0 + 3000, &[t0, t0 + 2000], &Column::from_options([Some(1i64), None]))?;
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    pub fn replace_range<'a>(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        ts: &[i64],
+        values: impl Into<ColumnRef<'a>>,
+    ) -> Result<()> {
+        let (start, end) = self::bounds(&range);
+        let col = values.into();
+        self.run(|c| c.replace_req(series, start, end, ts, col))
+    }
+
+    /// REPLACE_RANGE.
+    fn replace_req(&mut self, series: u32, start: i64, end: i64, ts: &[i64], col: ColumnRef<'_>) -> Result<()> {
+        let n = ts.len();
+        check_lengths(None, series, ts, col.len())?;
+        if let Some(v) = col.valid
+            && v.len() != n
+        {
+            return Err(Error::InvalidArgument(format!("validity bitmap of {} bits for {n} values", v.len())));
+        }
+        let ty = col.value_type();
+        let valid = if col.valid.is_some() { n.div_ceil(8) } else { 0 };
+        if REPLACE_HEADER + n * (8 + ty.wire_width()) + valid > MAX_FRAME - 16 {
+            return Err(Error::InvalidArgument(format!("{n} rows do not fit in one request")));
+        }
+        self.need_deletes()?;
+        self.request(Op::ReplaceRange, |f| {
+            f.u32(n as u32)
+                .u32(series)
+                .u8(ty.code())
+                .u8(if col.valid.is_some() { VALID } else { 0 })
+                .u16(0)
+                .u32(0)
+                .i64(start)
+                .i64(end)
+                .i64s(ts);
+            col.values.put(f.raw(), 0, n);
+            if let Some(v) = col.valid {
+                f.bytes(&v.as_bytes()[..valid]);
+            }
+        })
+    }
+
+    /// Sets how long a series keeps its rows, in ms (protocol version 7): rows older than the
+    /// server's clock minus `limit_ms` disappear from queries at once and from disk as merges get
+    /// to them. 0 keeps them forever. Set it right after creating a series to never show older rows.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] for a negative limit or a server older than version 7; otherwise as
+    /// [`delete_range`](Client::delete_range).
+    pub fn set_retention(&mut self, series: u32, limit_ms: i64) -> Result<()> {
+        self.run(|c| {
+            c.need_deletes()?;
+            c.request(Op::SetRetention, |f| {
+                f.u32(series).u32(0).i64(limit_ms);
+            })
+        })
+    }
+
+    /// The retention limit of a series in ms, 0 for none (protocol version 7).
+    ///
+    /// # Errors
+    ///
+    /// As [`set_retention`](Client::set_retention).
+    pub fn retention(&mut self, series: u32) -> Result<i64> {
+        self.run(|c| {
+            c.need_deletes()?;
+            c.request(Op::GetRetention, |f| {
+                f.u32(series);
+            })?;
+            let mut r = Cursor::new(&c.body);
+            let v = r.i64()?;
+            end(&r)?;
+            Ok(v)
+        })
+    }
+
+    /// Deletes and retention need a server of protocol version 7. An older one answers
+    /// [`Status::Invalid`] for an op it does not know; asking HELLO first gives the same answer
+    /// without sending it. Pending inserts are collected first, so that their errors are not
+    /// taken for an old server.
+    fn need_deletes(&mut self) -> Result<()> {
+        self.wait_inner()?;
+        if self.server_version()? < 7 {
+            return Err(Error::Server(Status::Invalid));
+        }
+        Ok(())
     }
 
     // -------------------------------------------------------- maintenance

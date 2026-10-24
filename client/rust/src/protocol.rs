@@ -10,11 +10,14 @@
 //! Version 4: the server knows UTC only. QUERY_BUCKETS refuses a time zone
 //! other than UTC; local periods arrive as their UTC bounds in QUERY_BOUNDS
 //! (`calendar.rs` computes them).
+//! Version 5 and 6 add LTTB and time-weighted averages, which this client does
+//! not offer (it still says 7: the server answers the lower of both versions).
+//! Version 7 adds DELETE_RANGE, REPLACE_RANGE, SET_RETENTION, GET_RETENTION.
 
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 7;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 
@@ -30,6 +33,9 @@ pub(crate) const VALUES_CHUNK_HEADER: usize = 8;
 pub(crate) const VALID: u8 = 1;
 /// Flag: the arrays are packed and zstd compressed (`TSDB_PACKED`, version 3).
 pub(crate) const PACKED: u8 = 2;
+/// Header of a REPLACE_RANGE request: n, series, type, flags, 0, 0, start, end
+/// (`TSDB_REPLACE_HEADER`, version 7).
+pub(crate) const REPLACE_HEADER: usize = 32;
 /// Reply header: len, id, op, status.
 pub(crate) const REPLY_HEADER: usize = 13;
 
@@ -55,6 +61,10 @@ pub(crate) enum Op {
     QueryBuckets = 18,
     LastStats = 19,
     QueryBounds = 20,
+    DeleteRange = 25,
+    ReplaceRange = 26,
+    SetRetention = 27,
+    GetRetention = 28,
 }
 
 /// Builds one request frame in a reusable buffer.

@@ -19,12 +19,20 @@
  * that buffer is over OUT_CAP, so a slow client cannot make the server buffer
  * without bound.
  *
- *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--workers N]
+ *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--port-file FILE] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
- *         [--verify-checksums]
+ *         [--verify-checksums] [--metrics-port N|auto [--metrics-bind ADDR]]
+ *
+ * --metrics-port serves Prometheus metrics (GET /metrics) on a port of its own, from a
+ * thread of its own: see metrics.c. Off by default; binds to --listen unless --metrics-bind.
  *
  * --verify-checksums checks each granule's checksum before a query decodes it
  * (off by default: meant for storage without checksums of its own).
+ *
+ * --port 0 binds a port the kernel chooses; --port-file FILE then holds "PORT PID" (written to a temporary file
+ * and renamed once the listener is up; an old FILE is removed at start), and the banner names the real port.
+ * Scripts and tests start servers this way and never compute a port, so two of them cannot collide.
+ * --metrics-port auto does the same for the metrics port, which the file then names as a third number.
  *
  * --follow serves queries from a directory another process writes (on this
  * host or another one, over NFS), following its parts and WAL as they change.
@@ -51,6 +59,7 @@
 #include "tsdb.h"
 #include "tsdb_protocol.h"
 #include "../client/tsdb_pack.h"
+#include "metrics.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -245,6 +254,8 @@ static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t al
                   const void *d, size_t dlen)
 {
     size_t body = 4 + 1 + 4 + alen + blen + dlen;
+    if (status)
+        metrics_error(status);
     uint8_t hdr[13];
     put32(hdr, (uint32_t)body);
     put32(hdr + 4, id);
@@ -419,27 +430,100 @@ static int insert_packed(const uint8_t *p, size_t len, uint32_t n, uint32_t s)
     return rc;
 }
 
-static void reply_buckets(conn *c, uint32_t id, const tsdb_bucket *b, size_t nb)
+/* fields: 0 (bb: tsdb_bucket) or TSDB_SPREAD (bb: tsdb_spread_bucket, version 8), which appends the spread
+ * to every row */
+static void reply_buckets(conn *c, uint32_t id, const void *bb, size_t nb, uint8_t fields)
 {
-    uint8_t *rows = malloc(nb * TSDB_BUCKET_ROW + 1);
+    size_t row = fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
+    size_t stride = fields & TSDB_SPREAD ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+    uint8_t *rows = malloc(nb * row + 1);
     if (!rows) {
         reply_status(c, id, TSDB_ERR_NOMEM);
         return;
     }
     for (size_t i = 0; i < nb; i++) {
-        uint8_t *o = rows + i * TSDB_BUCKET_ROW;
-        memcpy(o, &b[i].start, 8);
-        memcpy(o + 8, &b[i].count, 8);
-        memcpy(o + 16, &b[i].sum, 8);
-        memcpy(o + 24, &b[i].min, 8);
-        memcpy(o + 32, &b[i].max, 8);
-        memcpy(o + 40, &b[i].isum, 8);
-        memcpy(o + 48, &b[i].imin, 8);
-        memcpy(o + 56, &b[i].imax, 8);
+        uint8_t *o = rows + i * row;
+        const tsdb_bucket *b = (const tsdb_bucket *)((const uint8_t *)bb + i * stride);
+        const tsdb_spread_bucket *sb = (const tsdb_spread_bucket *)b;
+        memcpy(o, &b->start, 8);
+        memcpy(o + 8, &b->count, 8);
+        memcpy(o + 16, &b->sum, 8);
+        memcpy(o + 24, &b->min, 8);
+        memcpy(o + 32, &b->max, 8);
+        memcpy(o + 40, &b->isum, 8);
+        memcpy(o + 48, &b->imin, 8);
+        memcpy(o + 56, &b->imax, 8);
+        if (fields & TSDB_SPREAD) {
+            memcpy(o + 64, &sb->range, 8);
+            memcpy(o + 72, &sb->var_pop, 8);
+            memcpy(o + 80, &sb->var_samp, 8);
+            memcpy(o + 88, &sb->stddev_pop, 8);
+            memcpy(o + 96, &sb->stddev_samp, 8);
+        }
     }
     uint32_t n = (uint32_t)nb;
-    reply(c, id, 0, &n, 4, rows, nb * TSDB_BUCKET_ROW, NULL, 0);
+    reply(c, id, 0, &n, 4, rows, nb * row, NULL, 0);
     free(rows);
+}
+
+static void reply_twa(conn *c, uint32_t id, const tsdb_twa_bucket *b, size_t nb)
+{
+    uint8_t *rows = malloc(nb * TSDB_TWA_ROW + 1);
+    if (!rows) {
+        reply_status(c, id, TSDB_ERR_NOMEM);
+        return;
+    }
+    for (size_t i = 0; i < nb; i++) {
+        uint8_t *o = rows + i * TSDB_TWA_ROW;
+        memcpy(o, &b[i].start, 8);
+        memcpy(o + 8, &b[i].twa, 8);
+        memcpy(o + 16, &b[i].area, 8);
+        memcpy(o + 24, &b[i].covered_ms, 8);
+        memcpy(o + 32, &b[i].count, 8);
+    }
+    uint32_t n = (uint32_t)nb;
+    reply(c, id, 0, &n, 4, rows, nb * TSDB_TWA_ROW, NULL, 0);
+    free(rows);
+}
+
+/* QUERY_TWA: one request for the interval, calendar and bounds forms */
+static int handle_twa(conn *c, uint32_t id, const uint8_t *p, size_t len)
+{
+    uint32_t s, count, n;
+    int64_t start, end, gap, interval;
+    uint64_t lim;
+    if (len < TSDB_TWA_HEADER || (memcpy(&n, p + 52, 4), len != TSDB_TWA_HEADER + (size_t)n * 8) || p[23])
+        return TSDB_ERR_INVALID;
+    memcpy(&s, p, 4);
+    memcpy(&start, p + 4, 8);
+    memcpy(&end, p + 12, 8);
+    memcpy(&gap, p + 24, 8);
+    memcpy(&lim, p + 32, 8);
+    memcpy(&interval, p + 40, 8);
+    memcpy(&count, p + 48, 4);
+    tsdb_twa_opts o = {.method = (tsdb_twa_method)p[20], .max_gap_ms = gap, .order = p[21] ? TSDB_DESC : TSDB_ASC,
+                       .limit = (size_t)lim};
+    uint8_t unit = p[22];
+    tsdb_twa_bucket *b = NULL;
+    size_t nb = 0;
+    int rc;
+    if (n) {
+        int64_t *bounds = malloc((size_t)n * 8); /* aligned copy */
+        if (!bounds)
+            return TSDB_ERR_NOMEM;
+        memcpy(bounds, p + TSDB_TWA_HEADER, (size_t)n * 8);
+        rc = unit || interval ? TSDB_ERR_INVALID : tsdb_query_twa_bounds(db, s, start, end, bounds, n, &o, &b, &nb);
+        free(bounds);
+    } else if (unit) {
+        tsdb_group g = {(tsdb_unit)unit, count, NULL};
+        rc = interval ? TSDB_ERR_INVALID : tsdb_query_twa_group(db, s, start, end, &g, &o, &b, &nb);
+    } else {
+        rc = tsdb_query_twa(db, s, start, end, interval, &o, &b, &nb);
+    }
+    if (rc == 0)
+        reply_twa(c, id, b, nb);
+    free(b);
+    return rc;
 }
 
 static void handle(req *r)
@@ -450,7 +534,14 @@ static void handle(req *r)
     int rc = 0;
     switch (r->op) {
     case TSDB_OP_HELLO: {
-        uint32_t v = TSDB_PROTOCOL_VERSION;
+        /* the version both sides speak: a client never sends what it does not know, so an older one hears
+         * its own version back, as it did from the server it was written against */
+        uint32_t v = TSDB_PROTOCOL_VERSION, theirs;
+        if (len >= 4) {
+            memcpy(&theirs, p, 4);
+            if (theirs && theirs < v)
+                v = theirs;
+        }
         reply(c, r->id, 0, &v, 4, NULL, 0, NULL, 0);
         return;
     }
@@ -682,9 +773,11 @@ static void handle(req *r)
                   : tsdb_insert_series_values(db, s, ts, &col, n);
         break;
     }
-    case TSDB_OP_QUERY_VALUES: {
+    case TSDB_OP_QUERY_VALUES:
+    case TSDB_OP_QUERY_LTTB: { /* the same chunks: LTTB's points are rows of the series */
+        bool lttb = r->op == TSDB_OP_QUERY_LTTB;
         values_out o = {c, r->id, 0, 0, NULL, NULL, 0, false};
-        if (len != 20 && len != 29) {
+        if (lttb ? len != 28 : len != 20 && len != 29) {
             values_flush(&o, true, TSDB_ERR_INVALID);
             return;
         }
@@ -694,6 +787,9 @@ static void handle(req *r)
         memcpy(&s, p, 4);
         memcpy(&start, p + 4, 8);
         memcpy(&end, p + 12, 8);
+        uint64_t threshold = 0;
+        if (lttb)
+            memcpy(&threshold, p + 20, 8);
         if (len == 29) {
             uint64_t lim;
             q.order = p[20] ? TSDB_DESC : TSDB_ASC;
@@ -713,7 +809,12 @@ static void handle(req *r)
             values_flush(&o, true, TSDB_ERR_NOMEM);
             return;
         }
-        rc = tsdb_query_values(db, s, start, end, &q, values_cb, &o);
+        if (!lttb)
+            rc = tsdb_query_values(db, s, start, end, &q, values_cb, &o);
+        else if (threshold > SIZE_MAX)
+            rc = TSDB_ERR_INVALID;
+        else
+            rc = tsdb_query_lttb(db, s, start, end, (size_t)threshold, values_cb, &o);
         if (!o.gone)
             values_flush(&o, true, rc); /* the rest of the rows, or the error */
         free(o.ts);
@@ -759,7 +860,9 @@ static void handle(req *r)
         int64_t start, end, interval;
         uint64_t lim;
         uint16_t zl;
-        if (len < 44 || (memcpy(&zl, p + 42, 2), len != 44u + zl) || memchr(p + 44, 0, zl)) {
+        uint8_t fields = 0; /* version 8: an optional byte after the zone */
+        if (len < 44 || (memcpy(&zl, p + 42, 2), len != 44u + zl && len != 45u + zl) || memchr(p + 44, 0, zl) ||
+            (len == 45u + zl && ((fields = p[44 + zl]) & ~TSDB_SPREAD))) {
             rc = TSDB_ERR_INVALID;
             break;
         }
@@ -772,7 +875,16 @@ static void handle(req *r)
         tsdb_query_opts q = {p[33] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
         tsdb_bucket *b = NULL;
         size_t nb = 0;
-        if (p[28] == 0) {
+        char *zone = zl ? strndup((const char *)p + 44, zl) : NULL;
+        tsdb_group g = {(tsdb_unit)p[28], count, zone};
+        if (zl && !zone) {
+            rc = TSDB_ERR_NOMEM;
+        } else if (fields & TSDB_SPREAD) { /* the spread costs a second pass: only when asked for */
+            tsdb_spread_bucket *sb = NULL;
+            rc = p[28] == 0 ? tsdb_query_spread(db, s, start, end, interval, &q, &sb, &nb)
+                            : tsdb_query_spread_group(db, s, start, end, &g, &q, &sb, &nb);
+            b = (tsdb_bucket *)sb;
+        } else if (p[28] == 0) {
             rc = tsdb_query_agg(db, s, start, end, interval, &b, &nb);
             if (rc == 0 && q.order == TSDB_DESC)
                 for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
@@ -783,13 +895,11 @@ static void handle(req *r)
             if (rc == 0 && q.limit && nb > q.limit)
                 nb = q.limit;
         } else {
-            char *zone = zl ? strndup((const char *)p + 44, zl) : NULL;
-            tsdb_group g = {(tsdb_unit)p[28], count, zone};
-            rc = zl && !zone ? TSDB_ERR_NOMEM : tsdb_query_group_ex(db, s, start, end, &g, &q, &b, &nb);
-            free(zone);
+            rc = tsdb_query_group_ex(db, s, start, end, &g, &q, &b, &nb);
         }
+        free(zone);
         if (rc == 0) {
-            reply_buckets(c, r->id, b, nb);
+            reply_buckets(c, r->id, b, nb, fields);
             free(b);
             return;
         }
@@ -809,7 +919,9 @@ static void handle(req *r)
         uint32_t s, n;
         int64_t start, end;
         uint64_t lim;
-        if (len < 33 || (memcpy(&n, p + 29, 4), len != 33 + (size_t)n * 8) || n == 0) {
+        uint8_t fields = 0; /* version 8: an optional byte after the bounds */
+        if (len < 33 || (memcpy(&n, p + 29, 4), len != 33 + (size_t)n * 8 && len != 34 + (size_t)n * 8) || n == 0 ||
+            (len == 34 + (size_t)n * 8 && ((fields = p[33 + (size_t)n * 8]) & ~TSDB_SPREAD))) {
             rc = TSDB_ERR_INVALID;
             break;
         }
@@ -826,14 +938,86 @@ static void handle(req *r)
             break;
         }
         memcpy(bounds, p + 33, (size_t)n * 8);
-        rc = tsdb_query_bounds(db, s, start, end, bounds, n, &q, &b, &nb);
+        if (fields & TSDB_SPREAD) {
+            tsdb_spread_bucket *sb = NULL;
+            rc = tsdb_query_spread_bounds(db, s, start, end, bounds, n, &q, &sb, &nb);
+            b = (tsdb_bucket *)sb;
+        } else {
+            rc = tsdb_query_bounds(db, s, start, end, bounds, n, &q, &b, &nb);
+        }
         free(bounds);
         if (rc == 0) {
-            reply_buckets(c, r->id, b, nb);
+            reply_buckets(c, r->id, b, nb, fields);
             free(b);
             return;
         }
         free(b);
+        break;
+    }
+    case TSDB_OP_QUERY_TWA:
+        if ((rc = handle_twa(c, r->id, p, len)) == 0)
+            return;
+        break;
+    case TSDB_OP_DELETE_RANGE: {
+        uint32_t s, zero;
+        int64_t start, end;
+        if (len != 24 || (memcpy(&zero, p + 4, 4), zero)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        memcpy(&start, p + 8, 8);
+        memcpy(&end, p + 16, 8);
+        rc = tsdb_delete_range(db, s, start, end);
+        break;
+    }
+    case TSDB_OP_REPLACE_RANGE: {
+        uint32_t n, s;
+        int64_t start, end;
+        static const uint8_t zero[6];
+        if (len < TSDB_REPLACE_HEADER || p[8] > TSDB_STATE || (p[9] & ~TSDB_VALID) || memcmp(p + 10, zero, 6)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&n, p, 4);
+        memcpy(&s, p + 4, 4);
+        memcpy(&start, p + 16, 8);
+        memcpy(&end, p + 24, 8);
+        size_t vb = (size_t)n * tsdb_wire_width(p[8]), valid = (p[9] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0;
+        if (len != TSDB_REPLACE_HEADER + (size_t)n * 8 + vb + valid) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        const int64_t *ts = (const int64_t *)(p + TSDB_REPLACE_HEADER); /* the payload is 8-aligned */
+        const uint8_t *vals = p + TSDB_REPLACE_HEADER + (size_t)n * 8;
+        tsdb_values col = {(tsdb_type)p[8], vals, valid ? vals + vb : NULL};
+        rc = tsdb_replace_range(db, s, start, end, ts, &col, n);
+        break;
+    }
+    case TSDB_OP_SET_RETENTION: {
+        uint32_t s, zero;
+        int64_t limit;
+        if (len != 16 || (memcpy(&zero, p + 4, 4), zero)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        memcpy(&limit, p + 8, 8);
+        rc = tsdb_set_retention(db, s, limit);
+        break;
+    }
+    case TSDB_OP_GET_RETENTION: {
+        uint32_t s;
+        int64_t limit;
+        if (len != 4) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        if ((rc = tsdb_get_retention(db, s, &limit)) == 0) {
+            reply(c, r->id, 0, &limit, 8, NULL, 0, NULL, 0);
+            return;
+        }
         break;
     }
     case TSDB_OP_COMMIT: rc = tsdb_commit(db); break;
@@ -848,6 +1032,11 @@ static void handle(req *r)
         return;
     }
     default: rc = TSDB_ERR_INVALID; break;
+    }
+    if (rc == 0 && (r->op == TSDB_OP_INSERT || r->op == TSDB_OP_INSERT_VALUES)) {
+        uint32_t n;
+        memcpy(&n, p, 4); /* the length was checked: it has the row count */
+        metrics_rows_inserted(n);
     }
     reply_status(c, r->id, rc);
 }
@@ -870,9 +1059,12 @@ static void *worker_main(void *arg)
         if (!work_head)
             work_tail = NULL;
         pthread_mutex_unlock(&work_lock);
+        int64_t began = metrics_request_begin();
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
+        metrics_request_end(r->op, began);
         if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_AGG || r->op == TSDB_OP_QUERY_GROUP ||
-            r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS || r->op == TSDB_OP_QUERY_BOUNDS) {
+            r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS || r->op == TSDB_OP_QUERY_BOUNDS ||
+            r->op == TSDB_OP_QUERY_LTTB || r->op == TSDB_OP_QUERY_TWA) {
             tsdb_query_stats st;
             tsdb_last_query_stats(&st); /* this worker ran it */
             pthread_mutex_lock(&r->c->lock);
@@ -1024,6 +1216,7 @@ static void dispatch(conn *c)
 static void conn_free(conn *c)
 {
     nconns--;
+    metrics_conn_closed();
     if (c->prev)
         c->prev->next = c->next;
     else
@@ -1179,6 +1372,7 @@ static void on_accept(int fd)
 {
     if (nconns >= max_conns) {
         close(fd); /* over the limit: the client sees the connection closed */
+        metrics_conn_rejected();
         return;
     }
     int one = 1;
@@ -1223,6 +1417,7 @@ static void on_accept(int fd)
         conns->prev = c;
     conns = c;
     nconns++;
+    metrics_conn_opened();
     submit_recv(c);
 }
 
@@ -1365,6 +1560,14 @@ static void ep_loop(void)
     }
 }
 
+static size_t workers_now(void)
+{
+    pthread_mutex_lock(&work_lock);
+    size_t n = (size_t)running_workers;
+    pthread_mutex_unlock(&work_lock);
+    return n;
+}
+
 /* Accepts connections until the listening socket is shut down. */
 static void *accept_main(void *arg)
 {
@@ -1432,8 +1635,10 @@ static void on_signal(int sig)
     }
 }
 
-static int listen_on(const char *addr, int port)
+/* Binds and listens; *port_p is updated to the port actually bound, which is the kernel's choice for port 0. */
+static int listen_on(const char *addr, int *port_p)
 {
+    int port = *port_p;
     int fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_in6 sa6 = {.sin6_family = AF_INET6, .sin6_port = htons((uint16_t)port)};
     struct sockaddr_in sa4 = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
@@ -1458,12 +1663,40 @@ static int listen_on(const char *addr, int port)
         close(fd);
         return -1;
     }
+    struct sockaddr_storage bound;
+    socklen_t bl = sizeof bound;
+    if (getsockname(fd, (struct sockaddr *)&bound, &bl) == 0)
+        *port_p = ntohs(bound.ss_family == AF_INET ? ((struct sockaddr_in *)&bound)->sin_port
+                                                   : ((struct sockaddr_in6 *)&bound)->sin6_port);
     return fd;
+}
+
+/* "PORT PID [METRICS_PORT]\n", written to a temporary file and renamed once the listener is up, so a reader sees
+ * all of it or none (a half-written pid would read as another server's, and the harness would refuse a good one). A stale file is removed at startup: whoever finds one now knows this server wrote it. */
+static int write_port_file(const char *path, int port, int mport)
+{
+    char tmp[4096];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp.%d", path, (int)getpid()) >= (int)sizeof tmp)
+        return -1;
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return -1;
+    int ok = fprintf(f, "%d %d", port, (int)getpid()) > 0;
+    if (mport)
+        ok = (fprintf(f, " %d", mport) > 0 && ok);
+    ok = (fputc('\n', f) != EOF && ok);
+    ok = (fflush(f) == 0 && ok);
+    ok = (fclose(f) == 0 && ok);
+    if (!ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
-    const char *dir = NULL, *addr = "127.0.0.1";
+    const char *dir = NULL, *addr = "127.0.0.1", *port_file = NULL;
     int port = TSDB_DEFAULT_PORT, nworkers = (int)sysconf(_SC_NPROCESSORS_ONLN);
     tsdb_options o;
     tsdb_options_init(&o);
@@ -1477,17 +1710,37 @@ int main(int argc, char **argv)
                                    {"send-timeout", required_argument, 0, 'T'},
                                    {"io", required_argument, 0, 'I'},
                                    {"verify-checksums", no_argument, 0, 'V'},
+                                   {"metrics-port", required_argument, 0, 'M'},
+                                   {"metrics-bind", required_argument, 0, 'b'},
+                                   {"port-file", required_argument, 0, 'Q'},
                                    {0, 0, 0, 0}};
-    int ch;
+    int ch, metrics_port = 0, metrics_on = 0;
+    const char *metrics_addr = NULL;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
         case 'd': dir = optarg; break;
         case 'l': addr = optarg; break;
-        case 'p': port = atoi(optarg); break;
+        case 'p': port = atoi(optarg); break; /* 0: any free port, told by --port-file and the banner */
+        case 'Q': port_file = optarg; break;
         case 'w': nworkers = atoi(optarg); break;
         case 's': o.wal_sync_ms = atoi(optarg); break;
         case 'F': o.fsync = 0; break;
         case 'V': o.verify_checksums = 1; break;
+        case 'M': {
+            if (!strcmp(optarg, "auto")) { /* a port the kernel chooses; the port file names it */
+                metrics_on = 1;
+                metrics_port = 0;
+                break;
+            }
+            char *end;
+            long mp = strtol(optarg, &end, 10);
+            if (!*optarg || *end || mp < 1 || mp > 65535)
+                goto usage;
+            metrics_on = 1;
+            metrics_port = (int)mp;
+            break;
+        }
+        case 'b': metrics_addr = optarg; break;
         case 'r': o.read_only = 1; break;
         case 'f': o.follow = 1; break;
         case 'R': o.refresh_ms = atoi(optarg); break;
@@ -1508,14 +1761,19 @@ int main(int argc, char **argv)
         default: goto usage;
         }
     }
-    if (!dir || nworkers < 1 || send_timeout_s < 1) {
+    if (!dir || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
+        (metrics_addr && !metrics_on)) {
     usage:
-        fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d] [--workers N] [--wal-sync-ms MS]\n"
+        fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
+                        "             [--wal-sync-ms MS]\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
-                        "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n",
+                        "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"
+                        "             [--metrics-port N|auto [--metrics-bind ADDR]]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
+    if (port_file)
+        unlink(port_file);
     int rc = tsdb_open(dir, &o, &db);
     if (rc) {
         fprintf(stderr, "tsdbd: %s: %s\n", dir, tsdb_strerror(rc));
@@ -1531,8 +1789,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: descriptor limit %llu: at most %zu connections\n", (unsigned long long)rl.rlim_cur,
                 max_conns);
     }
-    int lfd = listen_on(addr, port);
+    int lfd = listen_on(addr, &port);
     if (lfd < 0)
+        return 1;
+    int mfd = -1;
+    if (metrics_on)
+        metrics_enable(); /* before any connection: the hooks count from the start */
+    if (metrics_on && (mfd = listen_on(metrics_addr ? metrics_addr : addr, &metrics_port)) < 0)
         return 1;
     wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 #ifdef TSDBD_NO_URING
@@ -1575,6 +1838,20 @@ int main(int argc, char **argv)
     signal(SIGHUP, SIG_IGN);  /* nothing to reload; a closing terminal must not take the server down */
     pthread_t *workers = calloc((size_t)nworkers, sizeof *workers);
     base_workers = running_workers = nworkers;
+    if (mfd >= 0) {
+        metrics_cfg mc = {.db = db,
+                          .listen_fd = mfd,
+                          .io = io == IO_URING ? "io_uring" : "epoll",
+                          .role = o.follow ? "follower" : o.read_only ? "read-only" : "writer",
+                          .max_conns = max_conns,
+                          .workers = workers_now};
+        int mrc = metrics_start(&mc);
+        if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
+            fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));
+            return 1;
+        }
+        fprintf(stderr, "tsdbd: metrics on %s:%d\n", metrics_addr ? metrics_addr : addr, metrics_port);
+    }
     for (int i = 0; i < nworkers; i++)
         pthread_create(&workers[i], NULL, worker_main, NULL);
 
@@ -1585,6 +1862,10 @@ int main(int argc, char **argv)
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
             max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll");
+    if (port_file && write_port_file(port_file, port, metrics_on ? metrics_port : 0) != 0) { /* last: whoever reads it finds a server that serves */
+        fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
+        return 1;
+    }
 #ifndef TSDBD_NO_URING
     if (io == IO_URING)
         uring_loop();
@@ -1597,6 +1878,8 @@ int main(int argc, char **argv)
     pthread_join(acceptor, NULL);
     pthread_join(failwatch, NULL);
     close(lfd);
+    if (mfd >= 0)
+        metrics_stop(); /* before tsdb_close: it reads the database */
     pthread_mutex_lock(&work_lock);
     work_stop = true;
     pthread_cond_broadcast(&work_cv);

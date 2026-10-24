@@ -32,7 +32,7 @@ library is enough (no third-party modules, 3.9+).
 
 Processes: every process this script starts is signalled through signal_proc(), which refuses pids <= 1 (kill(0)
 and kill(-1) reach the whole process group or every process of the user), and only by the Popen object it
-started. Nothing is ever killed by name. Ports are 10000 + pid % 20000 upwards, the first one that binds.
+started. Nothing is ever killed by name. Ports are never computed: tsdbd --port 0 --port-file reports the one it got, and the pid it reports must be ours.
 """
 import argparse
 import atexit
@@ -41,6 +41,7 @@ import concurrent.futures
 import copy
 import datetime
 import json
+import math
 import os
 import random
 import re
@@ -130,23 +131,34 @@ def _on_signal(sig, frame):
 signal.signal(signal.SIGINT, _on_signal)
 signal.signal(signal.SIGTERM, _on_signal)
 
-_port_next = [10000 + os.getpid() % 20000]
-
-
-def free_port():
-    while True:
-        port = _port_next[0]
-        _port_next[0] = 10000 + (port - 10000 + 1) % 20000
-        with socket.socket() as s:
+def owns_port(pid, port):
+    """True when process pid holds a listening TCP socket on port (read from /proc)."""
+    inodes = set()
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(f).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            fld = ln.split()
+            if len(fld) > 9 and fld[3] == "0A" and int(fld[1].rsplit(":", 1)[1], 16) == port:
+                inodes.add("socket:[%s]" % fld[9])
+    try:
+        for fd in os.listdir("/proc/%d/fd" % pid):
             try:
-                s.bind(("127.0.0.1", port))
+                if os.readlink("/proc/%d/fd/%s" % (pid, fd)) in inodes:
+                    return True
             except OSError:
-                continue
-        return port
+                pass
+    except OSError:
+        pass
+    return False
 
 
 class Server:
-    """A tsdbd. start() waits for its "serving" line, which comes after the port is bound."""
+    """A tsdbd on a port the kernel chose (--port 0 --port-file). start() waits for the port file, which tsdbd
+    writes once it serves; it names the pid, which must be the process started here and the holder of the port.
+    No port is ever computed here, and a server that did not start is an error, not a reason to try another."""
 
     def __init__(self, ctx, dirpath, log, io, follow=False, extra=()):
         self.ctx, self.dir, self.log, self.io, self.follow, self.extra = ctx, dirpath, Path(log), io, follow, list(extra)
@@ -154,30 +166,40 @@ class Server:
         self.port = None
 
     def start(self):
-        for _ in range(50):
-            self.port = free_port()
-            cmd = [str(self.ctx.tsdbd), "--dir", str(self.dir), "--listen", "127.0.0.1", "--port", str(self.port),
-                   "--workers", "4", "--io", self.io] + (["--follow", "--refresh-ms", "100"] if self.follow else []) + self.extra
-            logf = open(self.log, "ab")
-            logf.write(("$ " + " ".join(cmd) + "\n").encode())
-            logf.flush()
-            self.proc = spawn(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf)
-            logf.close()
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                if "serving" in self.log.read_text(errors="replace").split("$ ")[-1]:
-                    return self
-                if self.proc.poll() is not None:
-                    break
-                time.sleep(0.05)
-            if self.proc.poll() is None:
+        pf = Path(str(self.log) + ".port.%d" % time.monotonic_ns())
+        cmd = [str(self.ctx.tsdbd), "--dir", str(self.dir), "--listen", "127.0.0.1", "--port", "0",
+               "--port-file", str(pf), "--workers", "4", "--io", self.io] + \
+              (["--follow", "--refresh-ms", "100"] if self.follow else []) + self.extra
+        logf = open(self.log, "ab")
+        logf.write(("$ " + " ".join(cmd) + "\n").encode())
+        logf.flush()
+        self.proc = spawn(cmd, stdin=subprocess.DEVNULL, stdout=logf, stderr=logf)
+        logf.close()
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                tail = self.log.read_text(errors="replace").split("$ ")[-1]
+                raise RuntimeError("tsdbd exited: %s" % tail.strip()[-300:])
+            try:
+                port, pid = (int(x) for x in pf.read_text().split())
+            except (OSError, ValueError):
+                time.sleep(0.02)
+                continue
+            why = None
+            if pid != self.proc.pid:
+                why = "%s names pid %d, but the server started here is pid %d" % (pf, pid, self.proc.pid)
+            elif not owns_port(pid, port):
+                why = "port %d is not held by the server started here (pid %d)" % (port, pid)
+            if why:
                 signal_proc(self.proc, signal.SIGKILL)
                 self.proc.wait()
-                raise RuntimeError("tsdbd did not announce itself in 30 s, see %s" % self.log)
-            tail = self.log.read_text(errors="replace").split("$ ")[-1]
-            if "bind" not in tail.lower() and "address" not in tail.lower():
-                raise RuntimeError("tsdbd exited: %s" % tail.strip()[-300:])
-        raise RuntimeError("no free port")
+                raise RuntimeError(why)
+            pf.unlink()
+            self.port = port
+            return self
+        signal_proc(self.proc, signal.SIGKILL)
+        self.proc.wait()
+        raise RuntimeError("tsdbd did not announce itself in 30 s, see %s" % self.log)
 
     def stop(self):
         """SIGTERM and wait: a clean shutdown. Returns the exit status."""
@@ -268,46 +290,40 @@ class Fails:
         self.notes.append(msg)
 
 
-def drop_nan_sums(text):
-    """Bucket lines with every NaN in sum, min and max reduced to "nan". A sum of NaNs has the payload of whichever
-    NaN was added first, which depends on the order of the additions (threads, memtable, parts, merged parts), so
-    it is not the same twice; a NaN is a NaN. Raw lines are never touched."""
-    out = []
-    for ln in text.split("\n"):
-        f = ln.split("\t")
-        if len(f) == 8 and len(f[2]) == 16:
-            for k in (2, 3, 4):
-                x = int(f[k], 16)
-                if (x >> 52) & 0x7FF == 0x7FF and x & ((1 << 52) - 1):
-                    f[k] = "nan"
-            ln = "\t".join(f)
-        out.append(ln)
-    return "\n".join(out)
+def is_nan64(hexbits):
+    x = int(hexbits, 16)
+    return (x >> 52) & 0x7FF == 0x7FF and x & ((1 << 52) - 1) != 0
+
+
+def sum_order_free(lo, hi):
+    """Whether a float bucket with this min and max (hex doubles) has a NaN sum whatever the order of additions."""
+    return (is_nan64(lo) and is_nan64(hi)) or (int(lo, 16) == 0xFFF0000000000000 and int(hi, 16) == 0x7FF0000000000000)
 
 
 def drop_float_sums(text, types):
     """Bucket lines of float series without their sum: the same rows added in another order (memtable, parts,
     merged parts, and tsdbd merges in the background while the clients read) round differently in the last bits.
-    The model checks the sums to 1e-9 instead. A min or max of -0.0 and +0.0 is whichever was met first: both
-    read as +0.0."""
+    The model checks the sums to 1e-9 instead, and NaN as 0x7ff8000000000000 exactly. Whether a sum is NaN at all
+    can depend on the order too: DBL_MAX + DBL_MAX - DBL_MAX - DBL_MAX is +inf in one order and NaN (inf - inf) in
+    another. The sum stays only where it is NaN in every order, which min and max show: the bucket holds only NaNs
+    (both NaN) or both infinities (-inf and +inf); then it is the one quiet NaN and compared bit for bit. A min or
+    max of -0.0 and +0.0 is whichever was met first: both read as +0.0."""
     out = []
     for blk, lines in gen.parse_blocks(text):
         ty = types.get(blk.split(" ")[1])
         if blk.split(" ")[0] in ("agg", "grp", "bnd") and ty in ("float32", "float64"):
-            lines = [("\t".join(f[:2] + ["*"] + [("0" * 16 if int(x, 16) << 1 & (2**64 - 1) == 0 else x) for x in f[3:5]]
+            lines = [("\t".join(f[:2] + [f[2] if sum_order_free(f[3], f[4]) else "*"] + [("0" * 16 if int(x, 16) << 1 & (2**64 - 1) == 0 else x) for x in f[3:5]]
                               + f[5:]) if len(f := ln.split("\t")) == 8 else ln) for ln in lines]
         out.append("## " + blk)
         out.extend(lines)
     return "\n".join(out) + "\n"
 
 
-def diff_outputs(a_name, a, b_name, b, limit=3, nan_sums=True, types=None):
+def diff_outputs(a_name, a, b_name, b, limit=3, types=None):
     """Differences between two canonical outputs, as strings (the first few queries). types: series -> type; with
     it, the sums of float series are left out (answers given by different layouts of the same rows)."""
     if types:
         a, b = drop_float_sums(a, types), drop_float_sums(b, types)
-    if nan_sums:
-        a, b = drop_nan_sums(a), drop_nan_sums(b)
     if a == b:
         return []
     A, B = gen.parse_blocks(a), gen.parse_blocks(b)
@@ -486,6 +502,35 @@ def cli_expected(q, ty, lines):
     return out
 
 
+SPREAD_HEADER = "time\tcount\tsum\tmin\tmax\tavg\trange\tstddev_pop\tstddev_samp"
+
+
+def spread_checked(ln, ty):
+    """A line of `tsdb query ... all` without its spread columns (range, stddev_pop, stddev_samp). The clients do
+    not ask for the spread, so it is checked against the line's own count, min and max instead; a line whose spread
+    is inconsistent comes back marked, so that it differs from the clients' answer."""
+    if ln == SPREAD_HEADER:
+        return ln.rsplit("\t", 3)[0]
+    f = ln.split("\t")
+    if len(f) != 9 or not f[1].isdigit():
+        return ln
+    cnt, rg, sp, ss = int(f[1]), float(f[6]), float(f[7]), float(f[8])
+    nan = lambda x: x != x  # noqa: E731
+    if cnt == 0 or ty == "state":
+        ok = nan(rg) and nan(sp) and nan(ss)
+    else:
+        if ty in ("int64", "bool"):
+            ok = f[6] == str((int(f[4]) - int(f[3])) % (1 << 64))
+        else:
+            mn, mx = float(f[3]), float(f[4])
+            want = mx - mn if mn <= mx else float("nan")  # min > max (both NaN): only NaN values
+            ok = (nan(want) and nan(rg)) or want == rg
+        ok = ok and (nan(sp) or sp >= 0) and (nan(ss) or ss >= 0) and (cnt > 1 or nan(ss))
+        if f[3] == f[4] and math.isfinite(float(f[3])) and math.isfinite(float(f[2])):  # constant data: exactly 0
+            ok = ok and sp == 0  # (NaN values among them make the sum and the spread NaN)
+    return "\t".join(f[:6]) if ok else ln + "\tSPREAD INCONSISTENT"
+
+
 def cli_check(ctx, F, dbdir, model, queries, text, d):
     """Runs every query the CLI understands on the (stopped) server's directory and compares."""
     blocks = gen.parse_blocks(text)
@@ -508,13 +553,13 @@ def cli_check(ctx, F, dbdir, model, queries, text, d):
             ty = model.types[q.split(" ")[1]]
             want = cli_expected(q, ty, lines)
             got = p.stdout.decode("utf-8", "replace").split("\n")[:-1] if p.returncode == 0 else None
+            if got and q.split(" ")[0] != "raw":
+                got = [spread_checked(ln, ty) for ln in got]
             if got and q.split(" ")[0] != "raw" and ty in ("float32", "float64"):
                 got = [("\t".join(f[:2] + ["*"] + [x.replace("-0", "0") if x == "-0" else x for x in f[3:5]] + ["*"])
                         if len(f := ln.split("\t")) == 6 and f[1].isdigit() else ln) for ln in got]
                 want = [("\t".join(f[:2] + ["*"] + [x.replace("-0", "0") if x == "-0" else x for x in f[3:5]] + ["*"])
                          if len(f := ln.split("\t")) == 6 and f[1].isdigit() else ln) for ln in want or []] if want else want
-            if q.split(" ")[0] != "raw" and want and got:  # the sign of a NaN sum is as unspecified as its payload
-                want, got = [x.replace("-nan", "nan") for x in want], [x.replace("-nan", "nan") for x in got]
             if want != got:
                 bad += 1
                 if bad <= 5:

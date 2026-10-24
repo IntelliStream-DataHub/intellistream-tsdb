@@ -23,7 +23,7 @@ bench/clients/run.sh --work /data/cbench   # keep the data on a disk of your cho
 bench/clients/run.sh --series 10 --points 100000 --repeat 1 --seconds 1   # a smoke run: minutes, numbers meaningless
 ```
 
-Options: `--port` (tsdbd, default 17070), `--conns "1 4 16"` (loader connections or threads), `--qthreads "1 32"`,
+Options: `--port` (tsdbd; default 0: any free port, which tsdbd reports through `--port-file`), `--conns "1 4 16"` (loader connections or threads), `--qthreads "1 32"`,
 `--clients "c rust python java"`, `--only load|query`, `--repeat N`, `--seconds S` (per query class), `--no-build`,
 `--force`.
 
@@ -36,7 +36,7 @@ overrides, and the numbers then say nothing). Nothing else should run meanwhile:
 containers. Before every measurement it also waits (up to a minute, then stops the run) until other processes keep
 no more than one CPU busy, measured over a second from `/proc/stat` (the load average cannot be used there: it
 still carries the benchmark's own previous run); the load average and the busy CPUs before every measurement are
-kept and printed with the results. It refuses to start when something already listens on `--port`.
+kept and printed with the results. The port is never guessed: tsdbd binds a free one, the script reads it from the port file and checks that the pid in it is the server it started.
 
 What it does:
 

@@ -1568,6 +1568,122 @@ public final class TsdbClient implements AutoCloseable {
         }
     }
 
+    // ---------------------------------------------------- deletes and retention
+
+    /**
+     * Deletes every row of a series with {@code start <= ts < end} (protocol version 7); {@code start >= end}
+     * deletes nothing. It returns once the delete is durable and visible: queries stop seeing the rows at once,
+     * merges remove them from disk later. {@link Long#MIN_VALUE} and {@link Long#MAX_VALUE} leave a side unbounded.
+     * Pending inserts are collected first.
+     *
+     * @param series the series id
+     * @param start the first timestamp deleted, ms since the epoch
+     * @param end the first timestamp kept after the range
+     * @throws TsdbException with {@link Status#ERR_INVALID} from a server older than version 7 (asked with HELLO;
+     *     the request is not sent); the first error of earlier pipelined inserts
+     */
+    public void deleteRange(int series, long start, long end) throws TsdbException {
+        needDeletes();
+        begin(Protocol.OP_DELETE_RANGE, 24);
+        out.putInt(series).putInt(0).putLong(start).putLong(end);
+        send();
+        int st = frame();
+        endReply();
+        check(st);
+    }
+
+    /**
+     * Replaces the rows of a series in {@code [start, end)} by {@code timestamps} and {@code values}, atomically
+     * (protocol version 7): a reader sees either the old rows or the new ones. Every timestamp must lie in the
+     * range; no rows make it a delete. The column's type must be the series' type; its nulls are written as nulls.
+     * The rows travel in one plain frame of at most 256 MiB.
+     *
+     * @param series the series id
+     * @param start the first timestamp replaced, ms since the epoch
+     * @param end the first timestamp kept after the range
+     * @param timestamps ms since the epoch, each in {@code [start, end)}
+     * @param values the values; as long as {@code timestamps}
+     * @throws IllegalArgumentException if the lengths differ or the rows do not fit in one frame
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a timestamp outside the range, a column of another
+     *     type than the series or a server older than version 7; the first error of earlier pipelined inserts
+     */
+    public void replaceRange(int series, long start, long end, long[] timestamps, Column values)
+            throws TsdbException {
+        int n = sameLength(Objects.requireNonNull(timestamps, "timestamps"), Objects.requireNonNull(values, "values"));
+        ValueType type = values.type();
+        byte[] valid = Values.validity(values, 0, n);
+        long payload = Protocol.REPLACE_HEADER + (long) n * (Long.BYTES + type.width)
+                + (valid != null ? valid.length : 0);
+        if (payload > Protocol.MAX_FRAME - 5)
+            throw new IllegalArgumentException(n + " rows do not fit in one request");
+        needDeletes();
+        begin(Protocol.OP_REPLACE_RANGE, payload);
+        out.putInt(n).putInt(series);
+        out.put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0).putInt(0);
+        out.putLong(start).putLong(end);
+        putLongs(timestamps, 0, n);
+        putColumn(values, 0, n);
+        if (valid != null)
+            putBytes(valid);
+        send();
+        int st = frame();
+        endReply();
+        check(st);
+    }
+
+    /**
+     * Sets how long a series keeps its rows, in ms (protocol version 7): rows older than the server's clock minus
+     * {@code limitMs} disappear from queries at once and from disk as merges get to them; 0 keeps them forever.
+     * Set it right after creating a series to never show older rows. The limit is durable when this returns.
+     *
+     * @param series the series id
+     * @param limitMs the age limit in ms, 0 for none
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative limit or a server older than version 7,
+     *     {@link Status#ERR_NOTFOUND} for an unknown series
+     */
+    public void setRetention(int series, long limitMs) throws TsdbException {
+        needDeletes();
+        begin(Protocol.OP_SET_RETENTION, 16);
+        out.putInt(series).putInt(0).putLong(limitMs);
+        send();
+        int st = frame();
+        endReply();
+        check(st);
+    }
+
+    /**
+     * Returns the retention limit of a series (protocol version 7).
+     *
+     * @param series the series id
+     * @return the age limit in ms, 0 for none
+     * @throws TsdbException as {@link #setRetention(int, long)}
+     */
+    public long retention(int series) throws TsdbException {
+        needDeletes();
+        begin(Protocol.OP_GET_RETENTION, 4);
+        out.putInt(series);
+        send();
+        int st = frame();
+        if (st == 0 && bodyLen != 8)
+            throw lost(Status.ERR_CORRUPT, "GET_RETENTION reply");
+        long v = st == 0 ? in.getLong() : 0;
+        endReply();
+        check(st);
+        return v;
+    }
+
+    /**
+     * Deletes and retention need a server of protocol version 7. An older one answers {@link Status#ERR_INVALID}
+     * for an op it does not know; asking HELLO first gives the same answer without sending it. Pending inserts are
+     * collected first, so that their errors are not taken for an old server.
+     */
+    private void needDeletes() throws TsdbException {
+        request();
+        int v = serverVersion();
+        if (v < 7)
+            throw new TsdbException(Status.ERR_INVALID, "the server speaks protocol " + v + "; deletes need 7", null);
+    }
+
     // ------------------------------------------------------------- maintenance
 
     /**

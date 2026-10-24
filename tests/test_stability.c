@@ -32,6 +32,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "harness.h"
+
 static int failures;
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -42,7 +44,7 @@ static int failures;
     } while (0)
 
 static const char *base = "/tmp";
-static int next_port;
+static char spawn_pf[PATH_MAX]; /* the port file of the server spawn() started last */
 static const int64_t T0 = 1700000000000;
 
 /* every server this test started and has not reaped, for the watchdog */
@@ -145,11 +147,16 @@ static void refuse_io_uring(int err)
     }
 }
 
-/* Starts tsdbd; extra arguments end with NULL. Does not wait for it. */
+/* A restart on the same explicit port (the kill -9 and follower tests) lies in the ephemeral range now. That is
+ * safe in practice because the kernel gives bind(0) odd and connect() even ports, so a client socket does not take
+ * a server's port; another harness's bind(0) could, and then the restart fails loudly (TH_EXITED), never silently.
+ * Starts tsdbd on `port`, 0 for any free one (then tsdbd tells where it listens through spawn_pf, see start());
+ * extra arguments end with NULL. Does not wait for it. */
 static pid_t spawn(const char *dir, int port, const char *extra1, const char *extra2)
 {
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
+    th_portfile(spawn_pf, sizeof spawn_pf, dir);
     pid_t pid = fork();
     if (pid == 0) {
         const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
@@ -162,10 +169,11 @@ static pid_t spawn(const char *dir, int port, const char *extra1, const char *ex
             refuse_io_uring(deny_uring);
         const char *io = getenv("TSDBD_IO"); /* the event loop backend: make test runs uring and epoll */
         if (io)
-            execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--workers", "4", "--io", io, extra1, extra2,
+            execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--port-file", spawn_pf, "--workers", "4", "--io", io, extra1, extra2,
                   (char *)NULL);
         else
-            execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--workers", "4", extra1, extra2, (char *)NULL);
+            execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--port-file", spawn_pf, "--workers", "4",
+                  extra1, extra2, (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 16; i++)
@@ -190,19 +198,25 @@ static bool hello(int port)
     return rc == 0 || rc == TSDB_ERR_NOTFOUND;
 }
 
-static pid_t start(const char *dir, int port, const char *extra1, const char *extra2)
+/* Starts tsdbd on *port (0: any free port, which is stored there) and waits until the server started here
+ * serves: its port file names its pid and the port is its own (th_await), then a request is answered. */
+static pid_t start(const char *dir, int *port, const char *extra1, const char *extra2)
 {
-    pid_t pid = spawn(dir, port, extra1, extra2);
+    pid_t pid = spawn(dir, *port, extra1, extra2);
+    int p = th_await(spawn_pf, pid, 30000);
+    unlink(spawn_pf);
+    if (p <= 0) {
+        fprintf(stderr, "%s: %s", current, th_why);
+        failures++;
+        if (p == TH_BAD)
+            signal_pid(pid, SIGKILL), waitpid(pid, NULL, 0);
+        forget(pid);
+        return -1;
+    }
+    *port = p;
     for (int i = 0; i < 300; i++) {
-        if (hello(port))
+        if (hello(p))
             return pid;
-        int st;
-        if (waitpid(pid, &st, WNOHANG) == pid) {
-            forget(pid);
-            fprintf(stderr, "%s: tsdbd exited at start\n", current);
-            failures++;
-            return -1;
-        }
         sleep_ms(10);
     }
     fprintf(stderr, "%s: tsdbd did not start serving\n", current);
@@ -311,15 +325,15 @@ static void test_graceful(int sig, const char *what)
     alarm(60);
     char dir[512];
     make_dir(dir, sizeof dir, what);
-    int port = next_port++;
-    pid_t pid = start(dir, port, NULL, NULL);
+    int port = 0;
+    pid_t pid = start(dir, &port, NULL, NULL);
     CHECK(insert(port, "g", 0, 100) == 0);      /* through the WAL: in the memtable */
     CHECK(insert(port, "g", 100, 100000) == 0); /* straight to a part */
     signal_pid(pid, sig);
     int st = wait_exit(pid, 10);
     CHECK(clean_exit(st));
     CHECK(port_free(port));
-    pid = start(dir, port, NULL, NULL);
+    pid = start(dir, &port, NULL, NULL);
     CHECK(count_rows(port, "g") == 100100);
     signal_pid(pid, SIGTERM);
     CHECK(clean_exit(wait_exit(pid, 10)));
@@ -336,10 +350,10 @@ static void test_kill9_restart(void)
     alarm(120);
     char dir[512];
     make_dir(dir, sizeof dir, "kill9");
-    int port = next_port++;
+    int port = 0;
     uint64_t acked = 0;
     for (int i = 0; i < 15; i++) {
-        pid_t pid = start(dir, port, NULL, NULL);
+        pid_t pid = start(dir, &port, NULL, NULL);
         CHECK(count_rows(port, "k") == (acked ? acked : UINT64_MAX)); /* the series exists after the first round */
         CHECK(insert(port, "k", (int64_t)acked, 50) == 0);
         acked += 50;
@@ -347,7 +361,7 @@ static void test_kill9_restart(void)
         waitpid(pid, NULL, 0);
         forget(pid);
     }
-    pid_t pid = start(dir, port, NULL, NULL);
+    pid_t pid = start(dir, &port, NULL, NULL);
     CHECK(count_rows(port, "k") == acked);
     signal_pid(pid, SIGTERM);
     CHECK(clean_exit(wait_exit(pid, 10)));
@@ -361,8 +375,8 @@ static void test_hup_and_pipe(void)
     alarm(60);
     char dir[512];
     make_dir(dir, sizeof dir, "hup");
-    int port = next_port++;
-    pid_t pid = start(dir, port, NULL, NULL);
+    int port = 0;
+    pid_t pid = start(dir, &port, NULL, NULL);
     signal_pid(pid, SIGHUP);
     sleep_ms(200);
     CHECK(hello(port));
@@ -407,8 +421,8 @@ static void test_stop_cont(void)
     alarm(60);
     char dir[512];
     make_dir(dir, sizeof dir, "stop");
-    int port = next_port++;
-    pid_t pid = start(dir, port, NULL, NULL);
+    int port = 0;
+    pid_t pid = start(dir, &port, NULL, NULL);
     signal_pid(pid, SIGSTOP);
     pid_t kid = fork();
     if (kid == 0) {
@@ -434,8 +448,8 @@ static void test_shutdown_with_clients(void)
     alarm(60);
     char dir[512];
     make_dir(dir, sizeof dir, "stuck");
-    int port = next_port++;
-    pid_t pid = start(dir, port, NULL, NULL);
+    int port = 0;
+    pid_t pid = start(dir, &port, NULL, NULL);
     CHECK(insert(port, "big", 0, 3000000) == 0);
     tsdbc *c;
     uint32_t id;
@@ -486,15 +500,18 @@ static void test_conflicts(void)
     char dir[512], dir2[512];
     make_dir(dir, sizeof dir, "conflict");
     make_dir(dir2, sizeof dir2, "conflict2");
-    int port = next_port++, port2 = next_port++;
-    pid_t a = start(dir, port, NULL, NULL);
+    int port = 0;
+    pid_t a = start(dir, &port, NULL, NULL);
     pid_t b = spawn(dir2, port, NULL, NULL); /* same port */
     int st = wait_exit(b, 10);
     CHECK(st != -1 && WIFEXITED(st) && WEXITSTATUS(st) != 0);
-    pid_t c = spawn(dir, port2, NULL, NULL); /* same directory */
+    CHECK(access(spawn_pf, F_OK) != 0); /* it never claimed to listen */
+    unlink(spawn_pf);
+    pid_t c = spawn(dir, 0, NULL, NULL); /* same directory */
     st = wait_exit(c, 10);
     CHECK(st != -1 && WIFEXITED(st) && WEXITSTATUS(st) != 0);
-    CHECK(port_free(port2));
+    CHECK(access(spawn_pf, F_OK) != 0); /* nor this one */
+    unlink(spawn_pf);
     CHECK(hello(port)); /* the first one is untouched */
     signal_pid(a, SIGTERM);
     CHECK(clean_exit(wait_exit(a, 10)));
@@ -551,8 +568,8 @@ static void test_storm(void)
     alarm(90);
     char dir[512];
     make_dir(dir, sizeof dir, "storm");
-    int port = next_port++;
-    pid_t pid = start(dir, port, NULL, NULL);
+    int port = 0;
+    pid_t pid = start(dir, &port, NULL, NULL);
     CHECK(insert(port, "q", 0, 10000) == 0);
     /* The server closes its end of the insert connection only once it sees the client's close, so a count taken
      * at once can still include it (seen with epoll): the baseline is the count once it has stopped falling. */
@@ -670,8 +687,8 @@ static void test_slow_readers(void)
     alarm(120);
     char dir[512];
     make_dir(dir, sizeof dir, "slow");
-    int port = next_port++;
-    pid_t pid = start(dir, port, "--workers=1", "--send-timeout=2");
+    int port = 0;
+    pid_t pid = start(dir, &port, "--workers=1", "--send-timeout=2");
     enum { N = 3000000 };
     CHECK(insert(port, "big", 0, N) == 0);
     tsdbc *c;
@@ -737,8 +754,8 @@ static void test_stuck_reader_idle(void)
     alarm(60);
     char dir[512];
     make_dir(dir, sizeof dir, "idle");
-    int port = next_port++;
-    pid_t pid = start(dir, port, NULL, NULL);
+    int port = 0;
+    pid_t pid = start(dir, &port, NULL, NULL);
     enum { N = 1000000 }; /* 12 MB of reply: far beyond both socket buffers */
     CHECK(insert(port, "big", 0, N) == 0);
     tsdbc *c;
@@ -780,8 +797,8 @@ static void test_connection_limit(void)
     alarm(60);
     char dir[512];
     make_dir(dir, sizeof dir, "limit");
-    int port = next_port++;
-    pid_t pid = start(dir, port, "--max-connections=20", NULL);
+    int port = 0;
+    pid_t pid = start(dir, &port, "--max-connections=20", NULL);
     sleep_ms(200); /* until the server has seen start's probe go */
     int fds[20];
     for (int i = 0; i < 20; i++) {
@@ -827,8 +844,8 @@ static void test_half_close_while_stopped(void)
     alarm(60);
     char dir[512];
     make_dir(dir, sizeof dir, "halfclose");
-    int port = next_port++;
-    pid_t pid = start(dir, port, NULL, NULL);
+    int port = 0;
+    pid_t pid = start(dir, &port, NULL, NULL);
     for (int round = 0; round < 3; round++) {
         int fd = raw_connect(port);
         CHECK(fd >= 0 && answers(fd)); /* registered, and idle again */
@@ -894,9 +911,9 @@ static void test_io_fallback(void)
     static const int errs[] = {EPERM, ENOSYS, EINVAL, EACCES};
     enum { NERRS = sizeof errs / sizeof errs[0] };
     for (int i = 0; i < NERRS; i++) {
-        int port = next_port++;
+        int port = 0;
         deny_uring = errs[i];
-        pid_t pid = start(dir, port, "--io", "auto"); /* last wins over TSDBD_IO */
+        pid_t pid = start(dir, &port, "--io", "auto"); /* last wins over TSDBD_IO */
         deny_uring = 0;
         CHECK(pid > 0);
         if (pid <= 0)
@@ -912,7 +929,7 @@ static void test_io_fallback(void)
         CHECK(file_has(log, ", io epoll\n"));
     }
     /* asked for io_uring explicitly: no fallback */
-    int port = next_port++;
+    int port = 0;
     deny_uring = EPERM;
     pid_t pid = spawn(dir, port, "--io", "uring");
     deny_uring = 0;
@@ -920,7 +937,8 @@ static void test_io_fallback(void)
     CHECK(st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 1);
     CHECK(file_has(log, "tsdbd: io_uring: Operation not permitted"));
     CHECK(!file_has(log, "using epoll"));
-    CHECK(port_free(port));
+    CHECK(access(spawn_pf, F_OK) != 0); /* it never claimed to listen */
+    unlink(spawn_pf);
     spawn_log = NULL;
     unlink(log);
     remove_dir(dir);
@@ -934,11 +952,11 @@ static void test_follower(void)
     alarm(60);
     char dir[512];
     make_dir(dir, sizeof dir, "follow");
-    int wport = next_port++, fport = next_port++;
-    pid_t w = start(dir, wport, NULL, NULL);
+    int wport = 0, fport = 0;
+    pid_t w = start(dir, &wport, NULL, NULL);
     CHECK(insert(wport, "f", 0, 5000) == 0);
     for (int i = 0; i < 3; i++) {
-        pid_t f = start(dir, fport, "--follow", NULL);
+        pid_t f = start(dir, &fport, "--follow", NULL);
         uint64_t n = 0;
         for (int k = 0; k < 200 && n != 5000; k++) { /* a few refreshes */
             n = count_rows(fport, "f");
@@ -962,8 +980,6 @@ int main(int argc, char **argv)
         base = argv[1];
     signal(SIGALRM, on_alarm);
     signal(SIGPIPE, SIG_IGN);
-    /* below the ephemeral range (32768 and up): a client socket may hold any port there */
-    next_port = 10000 + (int)(getpid() % 20000);
     test_graceful(SIGTERM, "SIGTERM");
     test_graceful(SIGINT, "SIGINT");
     test_kill9_restart();

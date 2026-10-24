@@ -16,6 +16,8 @@
  * Requests and their successful responses:
  *
  *   HELLO       u32 version                    -> u32 version
+ *               the lower of the client's and the server's (since version 6;
+ *               before, the server's): the version both speak
  *   SERIES      u8 create, u16 len, name [, u16 plen, path]  -> u32 id
  *               (path: the volume to create the series in; see tsdb_series_at)
  *   SERIES_NAME u32 id                         -> u16 len, name
@@ -73,11 +75,44 @@
  *               (bucket i begins at bounds[i]; bounds strictly increase)
  *   LAST_STATS                                 -> f64 elapsed_s, then the ten u64 of
  *               tsdb_query_stats in order: the connection's previous query
+ *   Version 5: LTTB downsampling (tsdb_query_lttb). An older server answers
+ *   the op with TSDB_ERR_INVALID; clients check HELLO for 5 first.
+ *   QUERY_LTTB  u32 series, i64 start, i64 end, u64 threshold
+ *               -> chunks as QUERY_VALUES (never with TSDB_VALID: no nulls),
+ *               the chosen points in time order with their stored values
+ *               (threshold < 3 or a state series: TSDB_ERR_INVALID)
+ *   Version 6: time-weighted averages (tsdb_query_twa in tsdb.h has the rules).
+ *   QUERY_TWA   u32 series, i64 start, i64 end, u8 method (0 STEP, 1 LINEAR), u8 order,
+ *               u8 unit, u8 0, i64 max_gap, u64 limit, i64 interval, u32 count, u32 n,
+ *               i64 bounds[n]                   (TSDB_TWA_HEADER bytes before the bounds)
+ *               buckets: n > 0: bounds as QUERY_BOUNDS (unit and interval 0); else
+ *               unit > 0: UTC calendar groups of `count` units; else buckets of
+ *               `interval` ms, one bucket when 0
+ *               -> u32 n, n x (i64 start, f64 twa, f64 area, i64 covered_ms, u64 count)
+ *               A client sends it only to a server whose HELLO says 6 or more.
+ *   Version 7: deletes and retention (tsdb_delete_range and friends). An older
+ *   server answers these ops with TSDB_ERR_INVALID; clients check HELLO for 7 first.
+ *   DELETE_RANGE u32 series, u32 0, i64 start, i64 end  -> (nothing)
+ *   REPLACE_RANGE u32 n, u32 series, u8 type, u8 flags, u16 0, u32 0, i64 start, i64 end,
+ *               i64 ts[n], values[n], [u8 valid[(n + 7) / 8]]  -> (nothing)
+ *               (as INSERT_VALUES for one series, unpacked; flags: TSDB_VALID only)
+ *   SET_RETENTION u32 series, u32 0, i64 limit_ms      -> (nothing)
+ *   GET_RETENTION u32 series                           -> i64 limit_ms
+ *   Version 8: the spread (range, variances, standard deviations;
+ *   tsdb_spread_bucket). QUERY_BUCKETS and QUERY_BOUNDS take an optional u8
+ *   `fields` after the zone or the bounds; with fields & TSDB_SPREAD each
+ *   bucket of the reply carries
+ *               f64 range, f64 var_pop, f64 var_samp, f64 stddev_pop, f64 stddev_samp
+ *   after its 64 bytes (TSDB_SPREAD_ROW bytes per bucket). Other bits are
+ *   reserved (TSDB_ERR_INVALID). Without the byte the reply is as before (and
+ *   the server does not compute the spread), so older clients read it
+ *   unchanged; a client sends it only to a server whose HELLO says 8 or more
+ *   (an older one answers TSDB_ERR_INVALID).
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
-#define TSDB_PROTOCOL_VERSION 4
+#define TSDB_PROTOCOL_VERSION 8
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
@@ -105,11 +140,24 @@ enum {
     TSDB_OP_QUERY_BUCKETS = 18,
     TSDB_OP_LAST_STATS = 19,
     TSDB_OP_QUERY_BOUNDS = 20,
+    TSDB_OP_QUERY_LTTB = 21,
+    TSDB_OP_QUERY_TWA = 22,
+    /* 23, 24 free */
+    TSDB_OP_DELETE_RANGE = 25,
+    TSDB_OP_REPLACE_RANGE = 26,
+    TSDB_OP_SET_RETENTION = 27,
+    TSDB_OP_GET_RETENTION = 28,
 };
 
 #define TSDB_AGG_ROW 32    /* bytes per bucket in a QUERY_AGG or QUERY_GROUP reply */
 #define TSDB_BUCKET_ROW 64 /* bytes per bucket in a QUERY_BUCKETS reply */
+#define TSDB_SPREAD 1       /* QUERY_BUCKETS/QUERY_BOUNDS fields: the spread follows each bucket (version 8) */
+#define TSDB_SPREAD_ROW 104 /* bytes per bucket in a reply with TSDB_SPREAD */
+
+#define TSDB_TWA_HEADER 56 /* bytes of a QUERY_TWA request before the bounds */
+#define TSDB_TWA_ROW 40    /* bytes per bucket in a QUERY_TWA reply */
 #define TSDB_VALUES_HEADER 16
+#define TSDB_REPLACE_HEADER 32 /* REPLACE_RANGE: the INSERT_VALUES header, then start and end */
 #define TSDB_STATS_REPLY 88 /* bytes in a LAST_STATS reply after the status */
 #define TSDB_VALID 1  /* flags: a validity bitmap follows the values */
 #define TSDB_PACKED 2 /* flags: the arrays are packed and zstd compressed (version 3) */

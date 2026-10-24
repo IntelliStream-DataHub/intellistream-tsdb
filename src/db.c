@@ -50,6 +50,7 @@ void tsdb_options_init(tsdb_options *o)
      * granules are decoded instead of answered from their statistics: a
      * finished partition is worth merging completely soon after its last write. */
     o->merge_idle_s = 300;
+    o->retention_merge_s = 3600;
     o->max_part_bytes = 4ull << 30;
 }
 
@@ -361,6 +362,7 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     eng *db = calloc(1, sizeof *db);
     if (!db)
         return TSDB_ERR_NOMEM;
+    db->ret_fd = -2; /* retention not opened yet */
     if (opts)
         db->opt = *opts;
     else
@@ -374,6 +376,8 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
         db->opt.buffer_rows = 1u << 20;
     if (db->opt.wal_max_batch_rows == 0)
         db->opt.wal_max_batch_rows = 65536;
+    if (db->opt.retention_merge_s == 0)
+        db->opt.retention_merge_s = 3600;
     if (db->opt.merge_idle_s == 0) /* a zeroed struct: merging everything all the time is never meant */
         db->opt.merge_idle_s = 300;
     db->dirfd = db->lockfd = db->wal_fd = -1;
@@ -417,7 +421,8 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     if ((rc = meta_load_or_create(db, ro)) != 0)
         goto fail;
     if ((rc = series_open(&db->series, db->dirfd, "SERIES", ro, db->opt.fsync)) != 0 ||
-        (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0)
+        (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0 ||
+        (rc = ret_open(db, ro)) != 0)
         goto fail;
     bool has_manifest = faccessat(db->dirfd, "MANIFEST", F_OK, 0) == 0;
     if (ro && has_manifest) {
@@ -438,10 +443,12 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     }
     if (!ro) {
         db->wal_flushed = db->wal_seq - 1; /* the replay put every older segment into parts */
+        db->wal_removed = db->wal_removed_synced = db->wal_seq - 1; /* and unlinked them, with a directory fsync */
         if ((rc = manifest_publish(db)) != 0)
             goto fail;
     }
 
+    ret_clock_init(db);
     db->qpool = pool_new(db->opt.query_threads);
     if (!ro && db->opt.merge_threads > 0) {
         db->mergers = calloc((size_t)db->opt.merge_threads, sizeof *db->mergers);
@@ -451,6 +458,7 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     }
     if (!ro && pthread_create(&db->flusher, NULL, flusher_main, db) == 0)
         db->has_flusher = true;
+    atomic_store(&db->follow_ok_ms, eng_mono_ms());
     if (db->opt.follow && pthread_create(&db->follower, NULL, follower_main, db) == 0)
         db->has_follower = true;
     *out = db;
@@ -506,6 +514,8 @@ int eng_close(eng *db)
         series_close(&db->series);
     if (db->states.file)
         series_close(&db->states);
+    if (db->ret_fd != -2)
+        ret_close(db);
     while (db->cc_free) {
         codec_ctx *c = db->cc_free;
         db->cc_free = c->next;
@@ -721,12 +731,18 @@ int eng_drop_before(eng *db, int64_t ts)
     return manifest_publish(db);
 }
 
-int eng_get_stats(eng *db, tsdb_stats *st)
+/* The numbers of tsdb_stats in one pass over the parts; the volume statistics ask for the granule
+ * and merging counts in the same pass (granules and rows then come from one snapshot). */
+static void stats_walk(eng *db, tsdb_stats *st, uint64_t *granules, uint64_t *merging)
 {
     memset(st, 0, sizeof *st);
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < db->nparts; i++) {
         part *p = db->parts[i];
+        if (granules)
+            *granules += p->ng;
+        if (merging)
+            *merging += p->merging;
         st->parts++;
         st->rows += p->rows;
         st->bytes += p->map_len;
@@ -747,6 +763,35 @@ int eng_get_stats(eng *db, tsdb_stats *st)
     st->passthrough_granules = atomic_load(&db->st_passthrough);
     st->broken_parts = atomic_load(&db->st_broken_parts);
     st->follow_errors = atomic_load(&db->st_follow_errors);
+}
+
+int eng_get_stats(eng *db, tsdb_stats *st)
+{
+    stats_walk(db, st, NULL, NULL);
+    return 0;
+}
+
+int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs)
+{
+    memset(vs, 0, sizeof *vs);
+    tsdb_stats st;
+    stats_walk(db, &st, &vs->granules, &vs->merging_parts);
+    vs->parts = st.parts;
+    vs->partitions = st.partitions;
+    vs->rows = st.rows;
+    vs->bytes = st.bytes;
+    vs->memtable_rows = st.memtable_rows;
+    vs->merges = st.merges;
+    vs->merged_rows = st.merged_rows;
+    vs->broken_parts = st.broken_parts;
+    vs->follow_errors = st.follow_errors;
+    vs->wal_bytes = atomic_load_explicit(&db->st_wal_bytes, memory_order_relaxed);
+    vs->wal_syncs = atomic_load_explicit(&db->st_wal_syncs, memory_order_relaxed);
+    vs->failed = atomic_load(&db->failed) ? 1 : 0;
+    if (db->opt.follow) {
+        int64_t lag = eng_mono_ms() - atomic_load(&db->follow_ok_ms);
+        vs->follow_refresh_age_ms = lag > 0 ? lag : 0;
+    }
     return 0;
 }
 

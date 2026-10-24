@@ -41,6 +41,15 @@ signal a process only through a helper that refuses pid 0 and -1: `kill(-1, sig)
 reaches every process of the user, the terminal included, and a server that
 failed to start is exactly when a test holds such a pid.
 
+Ports: no harness picks one. Several worktrees test at once, and a port computed from the pid or found free and
+released again can be taken by another run's tsdbd, whose clients then answer yours (jepsen once reported 192 million
+"lost writes" that way). Start tsdbd with `--port 0 --port-file FILE` and read "PORT PID" from FILE, which tsdbd writes
+(atomically, once it serves; a third number is the metrics port of `--metrics-port auto`). Check that the pid is the child you started (`tests/harness.h` also checks that the child
+holds the port), and fail if the server exited or the file names someone else. A restart gets a new port; clients
+reconnect to the one in the new file. `th_owns_port` remembers the listener's socket inode, so a client that asks on every
+connect scans only the server's descriptors, not `/proc/net/tcp` (which grows with every reconnect). `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
+`tests/integration/run.py` has `Server`, and the client test helpers under `client/*/tests` do the same in their language.
+
 Every bug fix comes with a regression test that fails without the fix (check
 by building the old code). Query timings go on a quiet machine: no builds or
 tests alongside them, and ClickHouse in its own container competes per
@@ -67,6 +76,8 @@ cgroup, so `nice` does not keep your work out of its way.
   the same for embedded use (`tsdb_query_group_local`).
 - `server/tsdbd.c`: the server, one event loop on io_uring or epoll (`--io`; epoll where io_uring
   is disabled, as on RHEL/AlmaLinux 10); `make test` and `make jepsen` run the server tests on both.
+  `server/metrics.c`: the `--metrics-port` thread (Prometheus text format, own poll loop, counters
+  the server bumps through small hooks); `tsdb_get_volume_stats` feeds it. `docs/metrics.md` lists the metrics.
   `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
   A protocol change has to reach all four; `make test-clients` runs their tests.
@@ -89,6 +100,28 @@ cgroup, so `nice` does not keep your work out of its way.
   still in flight and resurrect older values.
 - **Merges** only combine adjacent block ranges within a partition. On equal
   keys the newest source wins.
+- **Range tombstones** (deletes, replaces) live only in parts, never in the WAL
+  or a memtable. A part's tombstones hide rows of lower block numbers in the
+  same partition, never its own rows or memtable rows. Deletes flush the
+  memtable first and commit their parts under `publish_lock` like a large
+  insert; a replace commits tombstones and rows in one `parts_commit`. A
+  granule a tombstone touches is decoded, never answered from its statistics.
+  A merge output with no rows is kept as an empty part: its `wal_seq` stops a
+  stale WAL segment from replaying deleted rows back. It goes (with a partition
+  left with nothing else) only once every segment up to its `wal_seq` is
+  unlinked and the directory synced (`wal_removed_synced`).
+- **Retention** limits live in the append-only `RETENTION` file (beside
+  `SERIES`). Retention "now" (`eng_now_ms`) never goes back; queries clamp to
+  the cutoff, merges drop expired rows, the merge thread drops whole expired
+  partitions by retiring them. A query that reads before its start (TWA's
+  carried-in reading) stops at the cutoff as well.
+- **Snapshot windows.** Readers use the per-part entry windows of their
+  snapshot (`sn.gi`/`sn.gj`, `snap_find`), also to step to granules outside
+  their range; never `part_find` on `sn.parts`: granules a tombstone touches
+  were moved to mem runs with their live rows, and a direct lookup sees them
+  twice, deleted rows included. New granule statistics must be computed by the
+  part writer (merges re-encode every granule a tombstone touched) and read only
+  through these windows.
 - **Inserts are all or nothing.** All parts of one insert are written pending,
   then committed through an intent file (`parts_commit`). Never publish them one
   by one.
@@ -121,8 +154,8 @@ cgroup, so `nice` does not keep your work out of its way.
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
   host may still have them mapped.
-- **Granules** never span series; their count/nulls/sum/min/max must match the
-  rows exactly, because aggregates use them instead of decoding.
+- **Granules** never span series; their count/nulls/sum/min/max, and m2 (floats) or the sum of
+  squares (integers), must match the rows exactly, because aggregates use them instead of decoding.
 - **Value types.** A series' type is fixed at creation and lives in the SERIES
   dictionary, not in the parts. Values travel as slots of `type_width(type)`
   bytes (4: float32, bool, state; 8: float64, int64); the memtable and the WAL
@@ -134,8 +167,8 @@ cgroup, so `nice` does not keep your work out of its way.
   innermost.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- The on-disk format is version 3 (`FORMAT_VERSION`): 80-byte granule entries
-  with typed statistics, a checksum over each part's header, index and footer,
+- The on-disk format is version 5 (`FORMAT_VERSION`): 160-byte granule entries
+  with typed, time-weighted and spread statistics, a checksum over each part's header, index and footer,
   checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Before
   the first release, older formats need not stay readable (the user decided
   this on 2026-10-24): a layout change bumps `FORMAT_VERSION`, and a database of

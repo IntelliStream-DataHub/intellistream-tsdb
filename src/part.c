@@ -2,7 +2,13 @@
  * Part files: immutable, sorted by (series, ts), written once and mmap'd.
  *
  *   header (24 bytes) | ts block, value block, ... per granule | pad to 8 |
- *   granule index (80 bytes per granule) | footer (56 bytes)
+ *   granule index (80 bytes per granule) | [tombstones] | footer (56 bytes)
+ *
+ * The tombstone trailer (24 bytes per range tombstone, then u32 count and u32
+ * TOMB_MAGIC) is there only in parts that hold deletes, so every other part is
+ * byte for byte what it was before deletes existed; a binary that predates
+ * them rejects a part with a trailer at open (its size check), it never reads
+ * one as if nothing were deleted. A part may hold tombstones and no granules.
  *
  * A granule holds rows of one series; its value block is coded for the
  * series' type and its index entry carries the statistics of its known
@@ -28,6 +34,7 @@
 #define PART_MAGIC "TSDBPART"
 #define PART_END_MAGIC "TSDBEND1"
 #define PW_FLUSH_BYTES (4u << 20)
+#define TOMB_MAGIC 0x424d4f54u /* "TOMB" */
 
 static int write_all(int fd, const void *buf, size_t len)
 {
@@ -48,11 +55,41 @@ static int write_all(int fd, const void *buf, size_t len)
 /* ---------------------------------------------------------------- reader */
 
 /* Covers everything open trusts besides the granule blocks: chained over three pieces. */
-static uint64_t part_hash(const part_header *h, const void *index, size_t len, const part_footer *f)
+/* The trailer is hashed only when present: parts without tombstones keep their hash. */
+static uint64_t part_hash(const part_header *h, const void *index, size_t len, const void *trailer, size_t tlen,
+                          const part_footer *f)
 {
     uint64_t x = xxh64(h, sizeof *h, 0);
     x = xxh64(index, len, x);
+    if (tlen)
+        x = xxh64(trailer, tlen, x);
     return xxh64(f, offsetof(part_footer, index_hash), x);
+}
+
+/* Tombstones of the trailer [buf, buf + tlen): checked like the index, since they hide rows. */
+static bool trailer_parse(const uint8_t *buf, size_t tlen, const tomb **t, uint32_t *n)
+{
+    *t = NULL;
+    *n = 0;
+    if (tlen == 0)
+        return true;
+    uint32_t cnt, magic;
+    if (tlen < 8)
+        return false;
+    memcpy(&cnt, buf + tlen - 8, 4);
+    memcpy(&magic, buf + tlen - 4, 4);
+    if (magic != TOMB_MAGIC || cnt == 0 || (uint64_t)cnt * sizeof(tomb) + 8 != tlen)
+        return false;
+    const tomb *x = (const tomb *)buf;
+    for (uint32_t i = 0; i < cnt; i++) {
+        if (x[i].start >= x[i].end)
+            return false;
+        if (i && (x[i].series < x[i - 1].series || (x[i].series == x[i - 1].series && x[i].start < x[i - 1].end)))
+            return false;
+    }
+    *t = x;
+    *n = cnt;
+    return true;
 }
 
 int part_open(int dirfd, const char *name, part **out) { return part_open_as(dirfd, name, name, out); }
@@ -117,11 +154,13 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
         goto fail;
     p->grows = h.granule_rows;
     p->wal_seq = h.wal_seq;
-    if (f.index_off % 8 != 0 || f.index_off < sizeof h ||
-        f.index_off + (uint64_t)f.ngranules * sizeof(granule) + sizeof f != size)
+    uint64_t index_end = f.index_off + (uint64_t)f.ngranules * sizeof(granule);
+    if (f.index_off % 8 != 0 || f.index_off < sizeof h || index_end + sizeof f > (uint64_t)size)
         goto fail;
-    if (part_hash(&h, p->map + f.index_off, (size_t)f.ngranules * sizeof(granule), &f) != f.index_hash ||
-        f.min_ts > f.max_ts)
+    size_t tlen = (size_t)((uint64_t)size - sizeof f - index_end);
+    if (part_hash(&h, p->map + f.index_off, (size_t)f.ngranules * sizeof(granule), p->map + index_end, tlen, &f) !=
+            f.index_hash ||
+        f.min_ts > f.max_ts || !trailer_parse(p->map + index_end, tlen, &p->t, &p->nt))
         goto fail;
     p->g = (const granule *)(p->map + f.index_off);
     p->ng = f.ngranules;
@@ -256,6 +295,7 @@ static int pw_emit(part_writer *w, uint32_t series, int type, const int64_t *ts,
     if (!vl)
         return TSDB_ERR_NOMEM;
     granule_stats(type, v, n, &g);
+    granule_twa(type, ts, v, n, &g);
     g.series = series;
     g.count = (uint32_t)n;
     g.ts_min = ts[0];
@@ -335,6 +375,20 @@ int pw_copy_granule(part_writer *w, const part *src, const granule *g)
     return pw_push_index(w, &ng);
 }
 
+int pw_set_tombs(part_writer *w, const tomb *t, size_t n)
+{
+    free(w->tombs);
+    w->tombs = NULL;
+    w->nt = 0;
+    if (n == 0)
+        return 0;
+    if (n > UINT32_MAX || !(w->tombs = malloc(n * sizeof *t)))
+        return TSDB_ERR_NOMEM;
+    memcpy(w->tombs, t, n * sizeof *t);
+    w->nt = n;
+    return 0;
+}
+
 void pw_abort(part_writer *w)
 {
     if (w->fd >= 0) {
@@ -347,6 +401,7 @@ void pw_abort(part_writer *w)
     free(w->idx);
     free(w->pend_ts);
     free(w->pend_v);
+    free(w->tombs);
     memset(w, 0, sizeof *w);
     w->fd = -1;
 }
@@ -359,7 +414,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     int rc = pw_emit_pending(w);
     if (rc)
         goto fail;
-    if (w->ng == 0) {
+    if (w->ng == 0 && w->nt == 0 && !w->keep_empty) {
         pw_abort(w);
         return 0;
     }
@@ -371,15 +426,36 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     f.rows = w->rows;
     f.min_ts = w->min_ts;
     f.max_ts = w->max_ts;
+    for (size_t i = 0; i < w->nt; i++) { /* the part's time range covers what it deletes: snapshots find it */
+        f.min_ts = MIN(f.min_ts, w->tombs[i].start);
+        f.max_ts = MAX(f.max_ts, w->tombs[i].end - 1);
+    }
+    if (w->ng == 0 && w->nt == 0)
+        f.min_ts = f.max_ts = w->empty_ts;
     f.ngranules = (uint32_t)w->ng;
     f.version = FORMAT_VERSION;
     part_header h;
     pw_header(w, &h);
-    f.index_hash = part_hash(&h, w->idx, w->ng * sizeof(granule), &f);
+    size_t tlen = w->nt ? w->nt * sizeof(tomb) + 8 : 0;
+    uint8_t *trailer = tlen ? malloc(tlen) : NULL;
+    if (tlen && !trailer) {
+        rc = TSDB_ERR_NOMEM;
+        goto fail;
+    }
+    if (tlen) {
+        uint32_t cnt = (uint32_t)w->nt, magic = TOMB_MAGIC;
+        memcpy(trailer, w->tombs, w->nt * sizeof(tomb));
+        memcpy(trailer + tlen - 8, &cnt, 4);
+        memcpy(trailer + tlen - 4, &magic, 4);
+    }
+    f.index_hash = part_hash(&h, w->idx, w->ng * sizeof(granule), trailer, tlen, &f);
     memcpy(f.magic, PART_END_MAGIC, 8);
     if ((rc = pw_flush(w)) != 0 || (rc = write_all(w->fd, w->idx, w->ng * sizeof(granule))) != 0 ||
-        (rc = write_all(w->fd, &f, sizeof f)) != 0)
+        (tlen && (rc = write_all(w->fd, trailer, tlen)) != 0) || (rc = write_all(w->fd, &f, sizeof f)) != 0) {
+        free(trailer);
         goto fail;
+    }
+    free(trailer);
     if (db->opt.fsync && fdatasync(w->fd) != 0) {
         rc = TSDB_ERR_IO;
         goto fail;

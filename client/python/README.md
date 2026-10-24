@@ -178,6 +178,21 @@ With numpy, `query_values` returns a masked array: nulls are masked.
 Aggregates skip nulls. For int64 and bool series, `isum`, `imin` and `imax`
 in a bucket are exact (the float fields may round).
 
+## Delete, replace and retention
+
+```python
+client.delete_range(starts, t0, t0 + 3_600_000)  # one hour, its end excluded; None leaves a side open
+client.replace_range(starts, t0, t0 + 2000, [t0], [7])
+client.set_retention(starts, 30 * 86_400_000)    # keep 30 days; 0 keeps everything
+assert client.retention(starts) == 30 * 86_400_000
+```
+
+A delete returns once it is durable; queries stop seeing the rows at once.
+A replace is atomic: readers see the old rows or the new ones, never a mix.
+Rows older than a series' retention limit disappear from queries at once and
+from disk as merges get to them. These need a server of protocol version 7; an
+older one gets no request and the call fails with an invalid-argument error.
+
 ## Compression
 
 Inserts are compressed with zstd before they are sent (level 1). This makes

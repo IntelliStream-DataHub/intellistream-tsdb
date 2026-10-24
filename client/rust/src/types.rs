@@ -140,7 +140,9 @@ pub struct Bucket {
     pub start: i64,
     /// Number of known values.
     pub count: u64,
-    /// Sum of the values (NaN values propagate into it).
+    /// Sum of the values (NaN values propagate into it). Every NaN `sum`,
+    /// `min` or `max` has the bits `0x7ff8000000000000`, whatever NaNs were
+    /// stored, so results compare bit for bit.
     pub sum: f64,
     /// Smallest value, ignoring NaN (NaN if there is no other value).
     pub min: f64,
