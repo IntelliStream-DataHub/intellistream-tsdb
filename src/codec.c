@@ -1022,7 +1022,8 @@ static double entropy_words(const uint8_t *p, size_t len, size_t width)
  *    allowed): bit-packed zigzag deltas of the integers, with ZSTD on top when
  *    it helps. This won on every such sensor stream measured.
  *  - anything else: Chimp, bit delta, byte-stream split or ALP_rd. Cheap
- *    entropy estimates shortlist two, both are compressed, the smaller stays.
+ *    entropy estimates shortlist three, all three are compressed, the smallest
+ *    stays (docs/design.md, "How AUTO picks").
  */
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out)
 {
