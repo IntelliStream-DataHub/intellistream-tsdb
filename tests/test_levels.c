@@ -166,6 +166,30 @@ static void make_inputs(void)
     x = add("state with nulls", TSDB_STATE, 777);
     for (size_t i = 0; i < 777; i++)
         ((uint32_t *)x->v)[i] = (uint32_t)(next() % 7); /* 0 is null */
+    /* bool and state kernels: nulls at every lane position, codes at the top of uint32 (squares near 2^64),
+     * values a bool should not hold (a damaged block decodes to anything), runs of only nulls */
+    for (size_t k = 0; k < sizeof i64_n / sizeof *i64_n; k++) {
+        snprintf(name, sizeof name, "state near 2^32 with nulls, %zu", i64_n[k]);
+        x = add(name, TSDB_STATE, i64_n[k]);
+        for (size_t i = 0; i < x->n; i++) {
+            uint64_t r = next();
+            ((uint32_t *)x->v)[i] = r % 4 == 0 ? NULL_STATE : r % 4 == 1 ? UINT32_MAX - (uint32_t)(r >> 40) % 3
+                                    : r % 4 == 2 ? 1 + (uint32_t)(r >> 40) % 3 : (uint32_t)(r >> 16);
+        }
+        snprintf(name, sizeof name, "bool odd values with nulls, %zu", i64_n[k]);
+        x = add(name, TSDB_BOOL, i64_n[k]);
+        for (size_t i = 0; i < x->n; i++) {
+            static const uint32_t e[] = {0, 1, NULL_BOOL, 3, UINT32_MAX, 0x80000000u};
+            uint64_t r = next();
+            ((uint32_t *)x->v)[i] = r % 3 ? (uint32_t)(r >> 8) % 3 : e[(r >> 8) % 6];
+        }
+    }
+    x = add("state only nulls", TSDB_STATE, 100);
+    for (size_t i = 0; i < 100; i++)
+        ((uint32_t *)x->v)[i] = NULL_STATE;
+    x = add("bool only nulls", TSDB_BOOL, 99);
+    for (size_t i = 0; i < 99; i++)
+        ((uint32_t *)x->v)[i] = NULL_BOOL;
 
     /* float32 edge cases */
     static const uint32_t f32_special[] = {

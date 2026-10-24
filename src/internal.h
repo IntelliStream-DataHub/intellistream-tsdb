@@ -350,6 +350,8 @@ extern void (*simd_fold_f32)(const float *v, size_t n, size_t nulls, agg_state *
 extern void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *x);
 /* int64 with nulls; NULL where only the scalar loop of values.c is left (exact results, so any order) */
 extern void (*simd_fold_i64)(const int64_t *v, size_t n, agg_state *a, agg_dev *x);
+/* bool and state codes (null: NULL_BOOL, NULL_STATE); NULL as for int64 */
+extern void (*simd_fold_u32)(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *x);
 /* Folds n slots of `type` into a, skipping nulls, with the spread (values.c; granule statistics). */
 void agg_fold(int type, const void *v, size_t n, agg_state *a, agg_dev *x);
 /* the same, skipping the search for nulls when the caller knows there are none (a granule's count), and

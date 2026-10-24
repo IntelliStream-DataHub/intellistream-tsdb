@@ -7,8 +7,9 @@
  * (see agg_state). Integers (int64, bool, state codes) aggregate exactly:
  * a 128-bit sum, a 192-bit sum of squares and int64 min/max. Floats use the
  * SIMD kernels of simd.c, whose order of additions is fixed (lanes, see there)
- * and does not change with the CPU level; the integers a scalar loop the
- * compiler vectorizes where it can (exact, so in any order).
+ * and does not change with the CPU level. The integers too where simd.c has
+ * AVX2 or AVX-512 kernels for them (exact, so in any order); the loops here
+ * are the reference and the code for CPUs without AVX2.
  */
 #include "internal.h"
 
@@ -92,6 +93,10 @@ static void fold_i64(const int64_t *v, size_t n, agg_state *a, agg_dev *dx)
 /* bool (0, 1) and state codes: 4-byte slots with their own null */
 static void fold_u32(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx)
 {
+    if (simd_fold_u32) {
+        simd_fold_u32(v, n, null, a, dx);
+        return;
+    }
     if (!dx) {
         int64_t s = 0, mn = a->imin, mx = a->imax;
         uint64_t c = 0;

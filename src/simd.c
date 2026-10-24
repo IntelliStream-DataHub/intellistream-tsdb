@@ -3,7 +3,11 @@
  *
  * Gorilla and DoubleDelta are bit-serial (each value's bit position depends on
  * the previous one), so they are decoded with scalar code. What vectorizes is
- * everything after decoding: count/sum/min/max over the values.
+ * everything after decoding: count/sum/min/max over the values, and the
+ * spread's deviations (floats) or squares (integers). float32 and float64 have
+ * a scalar kernel that shares the vector kernels' order (below); int64, bool
+ * and state codes are exact, so their scalar reference is values.c's loop and
+ * the vector kernels may add in any order (further down).
  *
  * min/max follow MINPS/MAXPS semantics with the accumulator as the second
  * operand, so NaN inputs are ignored; NaN still propagates into the sum.
@@ -846,6 +850,167 @@ __attribute__((target("avx512f,avx512dq"))) static void fold_i64_avx512(const in
 }
 #endif
 
+/*
+ * bool and state codes: 4-byte unsigned slots with their own null (NULL_BOOL,
+ * NULL_STATE). Exact like int64, so the order is free and values.c's loop is
+ * the reference. A null is masked to 0 for the sum, the squares and the
+ * maximum (0 is the identity of an unsigned maximum; a run without known
+ * values changes nothing) and to UINT32_MAX for the minimum. The 32-bit
+ * values are summed in 64-bit lanes as even and odd halves; a square (below
+ * 2^64, from the unsigned 32x32 multiply) as its two 32-bit halves, so no
+ * lane overflows within U32_BLOCK slots. The squares cost little here, so
+ * they come in the same pass when the spread is asked for.
+ */
+#define U32_BLOCK ((size_t)1 << 26)
+
+static void u32_tail(const uint32_t *v, size_t i, size_t n, uint32_t null, unsigned __int128 *s, uint64_t *c,
+                     unsigned __int128 *q, uint32_t *mn, uint32_t *mx)
+{
+    for (; i < n; i++) {
+        uint32_t x = v[i];
+        if (x == null)
+            continue;
+        ++*c;
+        *s += x;
+        *q += (uint64_t)x * x;
+        *mn = x < *mn ? x : *mn;
+        *mx = x > *mx ? x : *mx;
+    }
+}
+
+static void u32_finish(agg_state *a, agg_dev *dx, unsigned __int128 s, uint64_t c, unsigned __int128 q, uint32_t mn,
+                       uint32_t mx)
+{
+    if (!c)
+        return;
+    a->count += c;
+    a->isum += (__int128)s;
+    a->imin = (int64_t)mn < a->imin ? (int64_t)mn : a->imin;
+    a->imax = (int64_t)mx > a->imax ? (int64_t)mx : a->imax;
+    if (dx)
+        isq_add(dx, q, 0);
+}
+
+#ifdef TSDB_X86
+K_AVX2 void fold_u32_avx2_impl(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx, bool sq)
+{
+    const __m256i nv = _mm256_set1_epi32((int)null), lom = _mm256_set1_epi64x(0xffffffff);
+    __m256i mn0 = _mm256_set1_epi32(-1), mn1 = mn0, mx0 = _mm256_setzero_si256(), mx1 = mx0;
+    unsigned __int128 s = 0, q = 0;
+    uint64_t c = 0;
+    size_t i = 0;
+    while (n - i >= 16) {
+        size_t end = i + ((n - i) < U32_BLOCK ? (n - i) : U32_BLOCK) / 16 * 16, start = i;
+        __m256i s0 = _mm256_setzero_si256(), s1 = s0, nul0 = s0, nul1 = s0, ql0 = s0, ql1 = s0, qh0 = s0, qh1 = s0;
+#define STEP(x, sm, nul, mn, mx, ql, qh)                                                                            \
+    do {                                                                                                           \
+        __m256i m = _mm256_cmpeq_epi32(x, nv), xs = _mm256_andnot_si256(m, x), od = _mm256_srli_epi64(xs, 32);     \
+        nul = _mm256_sub_epi32(nul, m);                                                                            \
+        mn = _mm256_min_epu32(mn, _mm256_or_si256(x, m));                                                          \
+        mx = _mm256_max_epu32(mx, xs);                                                                             \
+        sm = _mm256_add_epi64(sm, _mm256_add_epi64(_mm256_and_si256(xs, lom), od));                                \
+        if (sq) {                                                                                                  \
+            __m256i e = _mm256_mul_epu32(xs, xs), o = _mm256_mul_epu32(od, od);                                    \
+            ql = _mm256_add_epi64(ql, _mm256_add_epi64(_mm256_and_si256(e, lom), _mm256_and_si256(o, lom)));      \
+            qh = _mm256_add_epi64(qh, _mm256_add_epi64(_mm256_srli_epi64(e, 32), _mm256_srli_epi64(o, 32)));      \
+        }                                                                                                          \
+    } while (0)
+        for (; i < end; i += 16) {
+            __m256i x = _mm256_loadu_si256((const __m256i *)(v + i));
+            __m256i y = _mm256_loadu_si256((const __m256i *)(v + i + 8));
+            STEP(x, s0, nul0, mn0, mx0, ql0, qh0);
+            STEP(y, s1, nul1, mn1, mx1, ql1, qh1);
+        }
+#undef STEP
+        uint64_t t[4], u[4], w[4];
+        uint32_t k[8];
+        _mm256_storeu_si256((__m256i *)t, _mm256_add_epi64(s0, s1));
+        _mm256_storeu_si256((__m256i *)u, _mm256_add_epi64(ql0, ql1));
+        _mm256_storeu_si256((__m256i *)w, _mm256_add_epi64(qh0, qh1));
+        _mm256_storeu_si256((__m256i *)k, _mm256_add_epi32(nul0, nul1));
+        uint64_t nulls = 0;
+        for (int j = 0; j < 4; j++) {
+            s += t[j];
+            q += u[j] + ((unsigned __int128)w[j] << 32);
+        }
+        for (int j = 0; j < 8; j++)
+            nulls += k[j];
+        c += (end - start) - nulls;
+    }
+    uint32_t lo[8], hi[8], mn = UINT32_MAX, mx = 0;
+    _mm256_storeu_si256((__m256i *)lo, _mm256_min_epu32(mn0, mn1));
+    _mm256_storeu_si256((__m256i *)hi, _mm256_max_epu32(mx0, mx1));
+    for (int j = 0; j < 8; j++) {
+        mn = lo[j] < mn ? lo[j] : mn;
+        mx = hi[j] > mx ? hi[j] : mx;
+    }
+    u32_tail(v, i, n, null, &s, &c, &q, &mn, &mx);
+    u32_finish(a, dx, s, c, q, mn, mx);
+}
+
+__attribute__((target("avx2"))) static void fold_u32_avx2(const uint32_t *v, size_t n, uint32_t null, agg_state *a,
+                                                          agg_dev *dx)
+{
+    if (dx)
+        fold_u32_avx2_impl(v, n, null, a, dx, true);
+    else
+        fold_u32_avx2_impl(v, n, null, a, NULL, false);
+}
+
+K_AVX512 void fold_u32_avx512_impl(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx, bool sq)
+{
+    const __m512i nv = _mm512_set1_epi32((int)null), lom = _mm512_set1_epi64(0xffffffff),
+                  one = _mm512_set1_epi32(1);
+    __m512i mn0 = _mm512_set1_epi32(-1), mn1 = mn0, mx0 = _mm512_setzero_si512(), mx1 = mx0;
+    unsigned __int128 s = 0, q = 0;
+    uint64_t c = 0;
+    size_t i = 0;
+    while (n - i >= 32) {
+        size_t end = i + ((n - i) < U32_BLOCK ? (n - i) : U32_BLOCK) / 32 * 32;
+        __m512i s0 = _mm512_setzero_si512(), s1 = s0, c0 = s0, c1 = s0, ql0 = s0, ql1 = s0, qh0 = s0, qh1 = s0;
+#define STEP(x, sm, cn, mn, mx, ql, qh)                                                                             \
+    do {                                                                                                           \
+        __mmask16 k = _mm512_cmpneq_epu32_mask(x, nv);                                                             \
+        __m512i xs = _mm512_maskz_mov_epi32(k, x), od = _mm512_srli_epi64(xs, 32);                                 \
+        cn = _mm512_mask_add_epi32(cn, k, cn, one);                                                                \
+        mn = _mm512_mask_min_epu32(mn, k, mn, x);                                                                  \
+        mx = _mm512_max_epu32(mx, xs);                                                                             \
+        sm = _mm512_add_epi64(sm, _mm512_add_epi64(_mm512_and_si512(xs, lom), od));                                \
+        if (sq) {                                                                                                  \
+            __m512i e = _mm512_mul_epu32(xs, xs), o = _mm512_mul_epu32(od, od);                                    \
+            ql = _mm512_add_epi64(ql, _mm512_add_epi64(_mm512_and_si512(e, lom), _mm512_and_si512(o, lom)));      \
+            qh = _mm512_add_epi64(qh, _mm512_add_epi64(_mm512_srli_epi64(e, 32), _mm512_srli_epi64(o, 32)));      \
+        }                                                                                                          \
+    } while (0)
+        for (; i < end; i += 32) {
+            __m512i x = _mm512_loadu_si512((const void *)(v + i));
+            __m512i y = _mm512_loadu_si512((const void *)(v + i + 16));
+            STEP(x, s0, c0, mn0, mx0, ql0, qh0);
+            STEP(y, s1, c1, mn1, mx1, ql1, qh1);
+        }
+#undef STEP
+        s += (uint64_t)_mm512_reduce_add_epi64(_mm512_add_epi64(s0, s1));
+        if (sq)
+            q += (uint64_t)_mm512_reduce_add_epi64(_mm512_add_epi64(ql0, ql1)) +
+                 ((unsigned __int128)(uint64_t)_mm512_reduce_add_epi64(_mm512_add_epi64(qh0, qh1)) << 32);
+        c += (uint32_t)_mm512_reduce_add_epi32(_mm512_add_epi32(c0, c1));
+    }
+    uint32_t mn = (uint32_t)_mm512_reduce_min_epu32(_mm512_min_epu32(mn0, mn1));
+    uint32_t mx = (uint32_t)_mm512_reduce_max_epu32(_mm512_max_epu32(mx0, mx1));
+    u32_tail(v, i, n, null, &s, &c, &q, &mn, &mx);
+    u32_finish(a, dx, s, c, q, mn, mx);
+}
+
+__attribute__((target("avx512f,avx512dq"))) static void fold_u32_avx512(const uint32_t *v, size_t n, uint32_t null,
+                                                                        agg_state *a, agg_dev *dx)
+{
+    if (dx)
+        fold_u32_avx512_impl(v, n, null, a, dx, true);
+    else
+        fold_u32_avx512_impl(v, n, null, a, NULL, false);
+}
+#endif
+
 /* ---------------------------------------------------------------- LTTB */
 
 /* a point's value as LTTB takes it (query.c, lttb_value) */
@@ -897,6 +1062,7 @@ void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *dv) = agg_
 void (*simd_fold_f32)(const float *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv) = fold_f32_scalar;
 void (*simd_fold_f64)(const double *v, size_t n, size_t nulls, agg_state *a, agg_dev *dv) = fold_f64_scalar;
 void (*simd_fold_i64)(const int64_t *v, size_t n, agg_state *a, agg_dev *dx);
+void (*simd_fold_u32)(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx);
 static const char *simd_level = "scalar";
 
 const char *simd_name(void) { return simd_level; }
@@ -938,6 +1104,7 @@ void simd_select(int level)
     void (*f32)(const float *, size_t, size_t, agg_state *, agg_dev *) = fold_f32_scalar;
     void (*f64)(const double *, size_t, size_t, agg_state *, agg_dev *) = fold_f64_scalar;
     void (*i64)(const int64_t *, size_t, agg_state *, agg_dev *) = NULL;
+    void (*u32)(const uint32_t *, size_t, uint32_t, agg_state *, agg_dev *) = NULL;
     const char *name = "scalar";
 #ifdef TSDB_X86
     const char *force = getenv("TSDB_SIMD"); /* "scalar", "avx2" or "avx512", for benchmarking */
@@ -955,12 +1122,14 @@ void simd_select(int level)
         f32 = fold_f32_avx512;
         f64 = fold_f64_avx512;
         i64 = fold_i64_avx512;
+        u32 = fold_u32_avx512;
         name = "avx512";
     } else if (avx2) {
         f = agg_avx2;
         f32 = fold_f32_avx2;
         f64 = fold_f64_avx2;
         i64 = fold_i64_avx2;
+        u32 = fold_u32_avx2;
         name = "avx2";
     }
 #endif
@@ -968,6 +1137,7 @@ void simd_select(int level)
     simd_fold_f32 = f32;
     simd_fold_f64 = f64;
     simd_fold_i64 = i64;
+    simd_fold_u32 = u32;
     simd_level = name;
 #ifdef TSDB_LEVELS
     snprintf(simd_desc, sizeof simd_desc, "%s, codecs x86-64-%s", name, cpu_level_name(level));
