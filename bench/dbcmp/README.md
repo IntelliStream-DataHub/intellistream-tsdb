@@ -173,6 +173,14 @@ curl -sG http://127.0.0.1:9100/exec --data-urlencode "query=ALTER TABLE sensors 
 $H/qdb_wait.sh && FULLS=" " $H/qbench.sh qdb pg "host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb"
 ```
 
+**To add at the release run: QuestDB with Parquet partitions.** The numbers above are QuestDB's default
+native format, which is uncompressed. Its open source version can also convert partitions to compressed
+Parquet by hand (`ALTER TABLE ... CONVERT PARTITION TO PARQUET`, or `FORMAT PARQUET` at `CREATE TABLE`;
+see https://questdb.com/docs/architecture/storage-engine/). Measure both: load as above, then convert every
+partition (check the exact syntax for the version in use; QuestDB does not convert the active partition),
+and record the size, the load plus conversion time, the same query classes and the answer check. Report the
+two as separate rows ("QuestDB" and "QuestDB, Parquet partitions").
+
 ## InfluxDB 2.7.12
 
 The image's setup variables are called `DOCKER_INFLUXDB_INIT_*`; that is only their name. During
