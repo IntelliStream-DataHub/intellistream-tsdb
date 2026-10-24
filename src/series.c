@@ -2,8 +2,13 @@
  * Series dictionary: name <-> dense uint32 id, and each series' value type.
  * Persisted as an append-only file of records; the id is the record index:
  *
- *   [u16 length][name]                  a float32 series (as written by version 1)
- *   [u16 length | 0x8000][u8 type][name] any other type
+ *   [u32 check][u16 length][u8 type][u8 0][name][zeros to a multiple of 8]
+ *
+ * The check (low 32 bits of xxh64 of the rest, seeded with the record's offset)
+ * tells a record from zeros, garbage or a torn append. Open keeps the records
+ * up to the first bad one. That one is a torn tail, cut, unless a valid record
+ * follows it: then it is damage inside what was synced, and the open fails
+ * (TSDB_ERR_CORRUPT) rather than shift every later id or drop names.
  *
  * The state dictionary (STATES: state names and their codes) is the same
  * structure in another file, without types.
@@ -17,7 +22,7 @@
 #include <unistd.h>
 
 #define MAX_NAME 32767
-#define TYPED 0x8000u
+#define REC_HDR 8
 
 static uint32_t name_hash(const char *s, size_t len) { return (uint32_t)xxh64(s, len, 0x5e71e5); }
 
@@ -86,26 +91,54 @@ static int dict_add(series_dict *d, const char *name, size_t len, int type, uint
     return 0;
 }
 
-/* One record at buf[pos..size): its name, length and type; false when torn. */
-static bool parse_record(const uint8_t *buf, size_t pos, size_t size, const char **name, size_t *len, int *type,
-                         size_t *rec)
+static size_t rec_size(size_t len) { return (REC_HDR + len + 7) & ~(size_t)7; }
+
+static uint32_t rec_check(const uint8_t *rec, size_t len, uint64_t off)
 {
-    if (pos + 2 > size)
+    return (uint32_t)xxh64(rec + 4, rec_size(len) - 4, off);
+}
+
+/* The record at buf[pos..size), which is at file offset base + pos: its name,
+ * length and type; false when it is torn, damaged or not a record. */
+static bool parse_record(const uint8_t *buf, size_t pos, size_t size, uint64_t base, const char **name, size_t *len,
+                         int *type, size_t *rec)
+{
+    if (pos + REC_HDR > size)
         return false;
-    size_t h = (size_t)buf[pos] | ((size_t)buf[pos + 1] << 8), hdr = 2;
-    *type = TSDB_FLOAT32;
-    if (h & TYPED) {
-        if (pos + 3 > size)
-            return false;
-        *type = buf[pos + 2];
-        hdr = 3;
-    }
-    *len = h & ~TYPED;
-    if (pos + hdr + *len > size)
+    const uint8_t *r = buf + pos;
+    *len = (size_t)r[4] | ((size_t)r[5] << 8);
+    if (*len == 0 || *len > MAX_NAME || r[7] != 0 || rec_size(*len) > size - pos ||
+        rec_check(r, *len, base + pos) != load32(r))
         return false;
-    *name = (const char *)buf + pos + hdr;
-    *rec = hdr + *len;
+    *type = r[6];
+    *name = (const char *)r + REC_HDR;
+    *rec = rec_size(*len);
     return true;
+}
+
+/* Whether a valid record starts in buf[from, size): records are 8-byte aligned. */
+static bool valid_after(const uint8_t *buf, size_t from, size_t size, uint64_t base)
+{
+    const char *name;
+    size_t len, rec;
+    int type;
+    for (size_t q = ((base + from + 8) & ~(uint64_t)7) - base; q < size; q += 8)
+        if (parse_record(buf, q, size, base, &name, &len, &type, &rec))
+            return true;
+    return false;
+}
+
+static int read_all(int fd, uint8_t *buf, size_t len, uint64_t off)
+{
+    for (size_t got = 0; got < len;) {
+        ssize_t r = pread(fd, buf + got, len - got, (off_t)(off + got));
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0)
+            return TSDB_ERR_IO; /* a short read too: never taken for the end */
+        got += (size_t)r;
+    }
+    return 0;
 }
 
 int series_open(series_dict *d, int dirfd, const char *file, bool read_only, bool fsync)
@@ -124,26 +157,25 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
     uint8_t *buf = malloc(size ? size : 1);
     if (!buf)
         return TSDB_ERR_NOMEM;
-    size_t got = 0;
-    while (got < size) {
-        ssize_t r = pread(d->fd, buf + got, size - got, (off_t)got);
-        if (r <= 0) {
-            free(buf);
-            return TSDB_ERR_IO;
-        }
-        got += (size_t)r;
+    if (read_all(d->fd, buf, size, 0) != 0) {
+        free(buf);
+        return TSDB_ERR_IO;
     }
     int rc = table_grow(d);
     size_t pos = 0, len, rec;
     const char *name;
     int type;
-    /* a torn append at the end is ignored: it was never acknowledged */
-    while (rc == 0 && parse_record(buf, pos, size, &name, &len, &type, &rec)) {
+    while (rc == 0 && parse_record(buf, pos, size, 0, &name, &len, &type, &rec)) {
         uint32_t id;
         rc = type_valid(type) ? dict_add(d, name, len, type, &id) : TSDB_ERR_CORRUPT;
         pos += rec;
     }
+    if (rc == 0 && pos != size && valid_after(buf, pos, size, 0)) {
+        fprintf(stderr, "tsdb: %s is damaged at offset %zu, before valid records\n", file, pos);
+        rc = TSDB_ERR_CORRUPT;
+    }
     free(buf);
+    /* a torn append at the end is cut: it was never acknowledged */
     if (rc == 0 && pos != size && !read_only && ftruncate(d->fd, (off_t)pos) != 0)
         rc = TSDB_ERR_IO;
     d->file_off = pos;
@@ -168,16 +200,18 @@ int series_reload(series_dict *d, int dirfd)
     if (size > off) {
         size_t len = (size_t)(size - off);
         uint8_t *buf = malloc(len);
-        ssize_t got = buf ? pread(fd, buf, len, (off_t)off) : -1;
+        rc = !buf ? TSDB_ERR_NOMEM : read_all(fd, buf, len, off);
         size_t pos = 0, n, rec;
         const char *name;
         int type;
-        /* a record that does not fit is still being appended */
-        while (got > 0 && rc == 0 && parse_record(buf, pos, (size_t)got, &name, &n, &type, &rec)) {
+        /* a record that does not check out is still being appended */
+        while (rc == 0 && parse_record(buf, pos, len, off, &name, &n, &type, &rec)) {
             uint32_t id;
             rc = type_valid(type) ? dict_add(d, name, n, type, &id) : TSDB_ERR_CORRUPT;
             pos += rec;
         }
+        if (rc == 0 && pos != len && valid_after(buf, pos, len, off))
+            rc = TSDB_ERR_CORRUPT; /* reported by the refresh; read again from here next time */
         d->file_off = off + pos;
         free(buf);
     }
@@ -219,22 +253,21 @@ int series_get(series_dict *d, const char *name, bool create, int type, uint32_t
     } else if (d->broken) {
         rc = TSDB_ERR_IO; /* a record after a torn one would be lost at the next open, yet acknowledged */
     } else {
-        size_t hdr = type == TSDB_FLOAT32 ? 2 : 3; /* float32: readable by version 1 */
-        uint8_t *rec = malloc(len + hdr);
+        size_t size = rec_size(len);
+        uint8_t *rec = calloc(1, size);
         if (!rec) {
             rc = TSDB_ERR_NOMEM;
         } else {
-            size_t h = len | (hdr == 3 ? TYPED : 0);
-            rec[0] = (uint8_t)(h & 0xff);
-            rec[1] = (uint8_t)(h >> 8);
-            if (hdr == 3)
-                rec[2] = (uint8_t)type;
-            memcpy(rec + hdr, name, len);
+            rec[4] = (uint8_t)(len & 0xff);
+            rec[5] = (uint8_t)(len >> 8);
+            rec[6] = (uint8_t)type;
+            memcpy(rec + REC_HDR, name, len);
+            store32(rec, rec_check(rec, len, d->file_off));
             int err = 0;
-            ssize_t wr = write(d->fd, rec, len + hdr);
-            if (wr != (ssize_t)(len + hdr) || (d->fsync && fdatasync(d->fd) != 0)) {
+            ssize_t wr = write(d->fd, rec, size);
+            if (wr != (ssize_t)size || (d->fsync && fdatasync(d->fd) != 0)) {
                 rc = TSDB_ERR_IO; /* the caller fails the engine (dict_get): see eng_fail */
-                err = wr >= 0 && wr != (ssize_t)(len + hdr) ? ENOSPC : errno;
+                err = wr >= 0 && wr != (ssize_t)size ? ENOSPC : errno;
             }
             free(rec);
             if (rc == TSDB_ERR_IO) {
@@ -245,8 +278,10 @@ int series_get(series_dict *d, const char *name, bool create, int type, uint32_t
                 errno = err;
                 return rc;
             }
-            if (rc == 0)
+            if (rc == 0) {
+                d->file_off += size;
                 rc = dict_add(d, name, len, type, id);
+            }
         }
     }
     pthread_mutex_unlock(&d->lock);

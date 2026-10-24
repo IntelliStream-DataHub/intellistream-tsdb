@@ -134,7 +134,7 @@ static int cur_load(eng *db, codec_ctx *cc, cursor *c)
     c->type = series_type(&db->series, g->series);
     if (c->type < 0)
         return TSDB_ERR_CORRUPT; /* a granule of a series the dictionary does not have */
-    int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v);
+    int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, true);
     if (rc)
         return rc;
     c->loaded = true;

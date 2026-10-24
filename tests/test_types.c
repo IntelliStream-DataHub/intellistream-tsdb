@@ -1,5 +1,5 @@
 /* Tests: value types (float64, int64, bool, state) and nulls, against a
- * reference; their codecs; and reading what version 1 wrote. */
+ * reference; their codecs; and refusing databases of older formats. */
 #include "internal.h"
 
 #include <fcntl.h>
@@ -551,17 +551,7 @@ static void test_engine(const char *base)
     CHECK(system(cmd) == 0);
 }
 
-/* ------------------------------------------------ reading version 1 files */
-
-static void put(uint8_t **p, size_t *len, size_t *cap, const void *data, size_t n)
-{
-    if (*len + n > *cap) {
-        *cap = MAX(*cap * 2, *len + n);
-        *p = realloc(*p, *cap);
-    }
-    memcpy(*p + *len, data, n);
-    *len += n;
-}
+/* ------------------------------------------------ older formats */
 
 static void write_file(const char *dir, const char *name, const void *data, size_t len)
 {
@@ -572,144 +562,30 @@ static void write_file(const char *dir, const char *name, const void *data, size
     close(fd);
 }
 
-static int meta_version(const char *dir)
+/* No release had the older formats, so they are not read: a database whose
+ * META names another version is refused, by writers and readers alike. */
+static void test_old_version(const char *base)
 {
-    char path[700], buf[256] = "";
-    snprintf(path, sizeof path, "%s/META", dir);
-    FILE *f = fopen(path, "r");
-    size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
-    if (f)
-        fclose(f);
-    buf[n] = '\0';
-    char *v = strstr(buf, "version=");
-    return v ? atoi(v + 8) : -1;
-}
-
-/* A part and a WAL segment in the version 1 formats (float32 values, 64-byte
- * index entries, 16-byte WAL rows), written by hand, are read, merged with
- * new data and survive a reopen. */
-static void test_v1(const char *base)
-{
-    char dir[512];
-    snprintf(dir, sizeof dir, "%s/types-v1-%d", base, (int)getpid());
-    tsdb *db = open_db(dir);
-    uint32_t id;
-    OK(tsdb_series(db, "legacy", &id));
-    CHECK(id == 0);
+    char dir[600], cmd[1300];
+    snprintf(dir, sizeof dir, "%s/types-oldver-%d", base, (int)getpid());
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", dir, dir);
+    CHECK(system(cmd) == 0);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
     OK(tsdb_close(db));
-
-    const int64_t t0 = 1700000000000, pms = 6 * 3600000;
-    enum { NP = 1000, G = 256, NW = 10, WAL_SEQ = 99 };
-    int64_t ts[NP];
-    float v[NP];
-    double want_sum = 0;
-    for (int k = 0; k < NP; k++) {
-        ts[k] = t0 + k * 1000;
-        v[k] = (float)(k % 100) / 4;
-        want_sum += v[k];
+    for (int v = 1; v <= FORMAT_VERSION + 1; v++) {
+        if (v == FORMAT_VERSION)
+            continue;
+        char meta[128];
+        int n = snprintf(meta, sizeof meta, "version=%d\npartition_ms=86400000\ngranule_rows=8192\n", v);
+        write_file(dir, "META", meta, (size_t)n);
+        o.read_only = 0;
+        CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_CORRUPT);
+        o.read_only = 1;
+        CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_CORRUPT);
     }
-    uint8_t *buf = NULL;
-    size_t len = 0, cap = 0;
-    part_header h = {{'T', 'S', 'D', 'B', 'P', 'A', 'R', 'T'}, 1, G, 0};
-    put(&buf, &len, &cap, &h, sizeof h);
-    granule_v1 idx[(NP + G - 1) / G];
-    codec_ctx *c = codec_new();
-    uint8_t *blk = malloc(2 * block_bound(G));
-    size_t ng = 0;
-    for (int k0 = 0; k0 < NP; k0 += G, ng++) {
-        int n = MIN(G, NP - k0);
-        size_t tl = block_encode_ts(c, 1, ts + k0, (size_t)n, blk);
-        size_t vl = block_encode_f32(c, 1, TSDB_VALUES_AUTO, v + k0, (size_t)n, blk + tl);
-        agg_state a;
-        agg_init(&a, TSDB_FLOAT32);
-        simd_agg_f32(v + k0, (size_t)n, &a);
-        idx[ng] = (granule_v1){0, (uint32_t)n, ts[k0], ts[k0 + n - 1], len, (uint32_t)tl, (uint32_t)vl, a.sum,
-                               (float)a.min, (float)a.max, (uint32_t)xxh64(blk, tl + vl, 0), 0};
-        put(&buf, &len, &cap, blk, tl + vl);
-    }
-    while (len % 8)
-        put(&buf, &len, &cap, "", 1);
-    part_footer f = {len, NP, ts[0], ts[NP - 1], (uint32_t)ng, 1, xxh64(idx, ng * sizeof *idx, 0),
-                     {'T', 'S', 'D', 'B', 'E', 'N', 'D', '1'}};
-    put(&buf, &len, &cap, idx, ng * sizeof *idx);
-    put(&buf, &len, &cap, &f, sizeof f);
-    char name[96];
-    snprintf(name, sizeof name, "p%" PRId64 "_1_1_0.part", floor_div(t0, pms));
-    write_file(dir, name, buf, len);
-    /* Regression: a database made by version 1 (META says so) did not open */
-    char meta[128];
-    int ml = snprintf(meta, sizeof meta, "version=1\npartition_ms=%" PRId64 "\ngranule_rows=%d\n", pms, G);
-    write_file(dir, "META", meta, (size_t)ml);
-    free(buf);
-    free(blk);
-    codec_free(c);
-
-    /* a version 1 WAL segment: rows after the part's */
-    uint8_t wal[WAL_HDR + NW * 16];
-    store32(wal, NW);
-    for (int k = 0; k < NW; k++) {
-        uint32_t sid = 0;
-        int64_t t = t0 + NP * 1000 + k * 1000;
-        float x = 100 + (float)k;
-        memcpy(wal + WAL_HDR + 16 * k, &sid, 4);
-        memcpy(wal + WAL_HDR + 16 * k + 4, &t, 8);
-        memcpy(wal + WAL_HDR + 16 * k + 12, &x, 4);
-        want_sum += x;
-    }
-    store32(wal + 4, (uint32_t)xxh64(wal + WAL_HDR, NW * 16, 0));
-    char wname[64];
-    snprintf(wname, sizeof wname, "wal_%016x.log", WAL_SEQ); /* segment numbers are hex in names */
-    write_file(dir, wname, wal, sizeof wal);
-
-    for (int round = 0; round < 3; round++) {
-        if (round == 0) { /* a reader opens it as it is, and changes nothing */
-            /* Regression: the MANIFEST a version 1 writer left (format 1)
-             * was taken for a torn one, and readers saw no data */
-            char man[512];
-            int mlen = snprintf(man, sizeof man,
-                                "tsdb-manifest 1\nversion 7\nseries 1\nwal_flushed %d\nwal_active %d\nparts 1\n%s\n",
-                                WAL_SEQ - 1, WAL_SEQ, name);
-            mlen += snprintf(man + mlen, sizeof man - (size_t)mlen, "checksum %016" PRIx64 "\n",
-                             xxh64(man, (size_t)mlen, 0));
-            write_file(dir, "MANIFEST", man, (size_t)mlen);
-            tsdb_options ro;
-            tsdb_options_init(&ro);
-            ro.read_only = 1;
-            OK(tsdb_open(dir, &ro, &db));
-            tsdb_points p;
-            OK(tsdb_query_points(db, 0, INT64_MIN, INT64_MAX, &p));
-            CHECK(p.n == NP + NW); /* the WAL rows too, replayed into memory */
-            tsdb_points_free(&p);
-            OK(tsdb_close(db));
-            CHECK(meta_version(dir) == 1);
-        }
-        db = open_db(dir);
-        CHECK(meta_version(dir) == FORMAT_VERSION); /* a writer marks it, so version 1 refuses it */
-        if (round == 1) {
-            float x = 7;
-            int64_t t = t0; /* overwrites the first row of the old part */
-            OK(tsdb_insert_series(db, 0, &t, &x, 1));
-            want_sum += 7 - v[0];
-            OK(tsdb_optimize(db));
-        }
-        tsdb_points p;
-        OK(tsdb_query_points(db, 0, INT64_MIN, INT64_MAX, &p));
-        CHECK(p.n == NP + NW);
-        bool same = p.n == NP + NW;
-        for (size_t k = 0; same && k < NP; k++)
-            same = p.ts[k] == ts[k] && (p.values[k] == v[k] || (k == 0 && round > 0 && p.values[k] == 7));
-        for (size_t k = 0; same && k < NW; k++)
-            same = p.values[NP + k] == 100 + (float)k;
-        CHECK(same);
-        tsdb_points_free(&p);
-        tsdb_bucket *b;
-        size_t nb;
-        OK(tsdb_query_agg(db, 0, INT64_MIN, INT64_MAX, 0, &b, &nb));
-        CHECK(nb == 1 && b[0].count == NP + NW && fabs(b[0].sum - want_sum) < 1e-6);
-        free(b);
-        OK(tsdb_close(db));
-    }
-    char cmd[600];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     CHECK(system(cmd) == 0);
 }
@@ -779,7 +655,7 @@ int main(int argc, char **argv)
     const char *base = argc > 1 ? argv[1] : "/tmp";
     test_codecs();
     test_engine(base);
-    test_v1(base);
+    test_old_version(base);
     test_query_stats(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);

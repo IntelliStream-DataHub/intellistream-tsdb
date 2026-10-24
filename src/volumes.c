@@ -9,14 +9,24 @@
  * The root directory is volume 0, so a database without extra volumes is
  * exactly what a single engine stores. The root also holds:
  *
- *   VOLUMES   one line per extra volume: its path (volume i is line i)
- *   CATALOG   one record per series, in global id order: u32 volume, u32 local id
+ *   VOLUMES   one line per extra volume (volume i is line i): "<check> <path>", check
+ *             the low 32 bits of xxh64(path, seed i) in hex
+ *   CATALOG   one 16-byte record per series, in global id order: u32 volume,
+ *             u32 local id, u64 xxh64 of {global id, volume, local id}
  *   ID        a random identifier; every volume holds a copy in ROOT_ID, so a
  *             volume cannot be attached to another database by mistake
  *
  * A series is created in its volume first and then appended to CATALOG; a
  * crash in between leaves a series the catalog does not know, which the next
  * open appends.
+ *
+ * Both files only grow, by appends. At open the writer cuts a torn tail (a
+ * partial or unchecked last record, with no valid one after it), so the next
+ * append starts on a record boundary. A record that fails its check with a
+ * valid one after it, or one naming a volume or series that does not exist,
+ * is damage to durable data: the open fails with TSDB_ERR_CORRUPT rather than
+ * renumber the series that follow. Followers stop at the first record they
+ * cannot use (the writer may still be appending it) and read again later.
  */
 #include "internal.h"
 
@@ -144,6 +154,49 @@ static int append_root(tsdb *t, const char *name, const void *data, size_t len)
     return rc;
 }
 
+#define CAT_REC 16
+
+static uint64_t cat_check(uint64_t gid, uint32_t vol, uint32_t local)
+{
+    uint8_t b[16];
+    memcpy(b, &gid, 8);
+    memcpy(b + 8, &vol, 4);
+    memcpy(b + 12, &local, 4);
+    return xxh64(b, sizeof b, 0x434154414c4f47ull);
+}
+
+static void cat_record(uint8_t rec[CAT_REC], uint64_t gid, uint32_t vol, uint32_t local)
+{
+    uint64_t check = cat_check(gid, vol, local);
+    memcpy(rec, &vol, 4);
+    memcpy(rec + 4, &local, 4);
+    memcpy(rec + 8, &check, 8);
+}
+
+static bool cat_valid(const char *rec, uint64_t gid)
+{
+    uint64_t check;
+    memcpy(&check, rec + 8, 8);
+    return check == cat_check(gid, load32(rec), load32(rec + 4));
+}
+
+/* The check of VOLUMES line i (counting from 1) for this path. */
+static uint32_t vol_check(const char *path, size_t len, size_t i)
+{
+    return (uint32_t)xxh64(path, len, i);
+}
+
+/* Writer at open: cuts a torn tail off name at len. */
+static int cut_tail(tsdb *t, const char *name, size_t len, size_t size)
+{
+    fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes\n", name, size - len);
+    int fd = openat(t->dirfd, name, O_WRONLY | O_CLOEXEC);
+    int rc = fd < 0 || ftruncate(fd, (off_t)len) != 0 || (t->opt.fsync && fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+    if (fd >= 0)
+        close(fd);
+    return rc;
+}
+
 static int read_file_all(int dirfd, const char *name, char **out, size_t *len)
 {
     *out = NULL;
@@ -159,7 +212,7 @@ static int read_file_all(int dirfd, const char *name, char **out, size_t *len)
     *out = malloc((size_t)st.st_size + 1);
     ssize_t got = *out ? pread(fd, *out, (size_t)st.st_size, 0) : -1;
     close(fd);
-    if (got < 0) {
+    if (got != st.st_size) { /* a short read is an error too, never the end of the file */
         free(*out);
         *out = NULL;
         return TSDB_ERR_IO;
@@ -225,6 +278,7 @@ static int volume_open(tsdb *t, const char *path, bool create, uint32_t *index)
  * again to catch up with the writer). Caller holds the write lock. */
 static int load_layout(tsdb *t)
 {
+    bool writer = !t->opt.read_only;
     char *txt;
     size_t len;
     int rc = read_file_all(t->dirfd, VOLUMES_FILE, &txt, &len);
@@ -232,34 +286,93 @@ static int load_layout(tsdb *t)
         rc = 0; /* no extra volumes */
     else if (rc)
         return rc;
-    size_t line_no = 0;
+    size_t line_no = 0, good_end = 0;
+    bool bad = false;
     for (char *line = txt, *next; rc == 0 && line && *line; line = next) {
         next = strchr(line, '\n');
         if (!next)
-            break; /* still being written */
+            break; /* still being written, or torn */
         *next++ = '\0';
+        unsigned check;
+        int pos = 0;
+        size_t plen = strlen(line);
+        if (plen < 10 || sscanf(line, "%8x %n", &check, &pos) != 1 || pos != 9 ||
+            check != vol_check(line + 9, plen - 9, line_no + 1)) {
+            next[-1] = '\n'; /* the scan below looks for the line after this one */
+            bad = true;
+            break;
+        }
+        good_end = (size_t)(next - txt);
         if (++line_no < t->nvols)
             continue; /* already open */
         uint32_t idx;
-        rc = volume_open(t, line, false, &idx);
+        rc = volume_open(t, line + 9, false, &idx);
+    }
+    size_t vols_cut = SIZE_MAX, vols_len = len; /* cut after CATALOG checks out: it may need those lines */
+    if (rc == 0 && writer && good_end < len) {
+        /* damage when the line after the bad one passes its check (as the next volume's) */
+        bool later = false;
+        char *l = bad ? memchr(txt + good_end, '\n', len - good_end) : NULL;
+        char *e = l ? memchr(l + 1, '\n', len - (size_t)(l + 1 - txt)) : NULL;
+        if (e && e - l - 1 >= 10) {
+            unsigned check;
+            int pos = 0;
+            *e = '\0';
+            later = sscanf(l + 1, "%8x %n", &check, &pos) == 1 && pos == 9 &&
+                    check == vol_check(l + 10, (size_t)(e - l - 10), line_no + 2);
+        }
+        if (later) {
+            fprintf(stderr, "tsdb: %s: line %zu is damaged and later lines are not: the open fails\n", VOLUMES_FILE,
+                    line_no + 1);
+            rc = TSDB_ERR_CORRUPT;
+        } else {
+            vols_cut = good_end;
+        }
     }
     free(txt);
     if (rc)
         return rc;
     rc = read_file_all(t->dirfd, CATALOG_FILE, &txt, &len);
     if (rc == TSDB_ERR_NOTFOUND)
-        return 0;
-    for (size_t off = t->ncat * 8; rc == 0 && off + 8 <= len; off += 8) {
+        return vols_cut == SIZE_MAX ? 0 : cut_tail(t, VOLUMES_FILE, vols_cut, vols_len);
+    if (rc)
+        return rc;
+    size_t off = t->ncat * CAT_REC;
+    for (; rc == 0 && off + CAT_REC <= len; off += CAT_REC) {
+        uint64_t gid = off / CAT_REC;
+        if (!cat_valid(txt + off, gid))
+            break;
         uint32_t vol = load32(txt + off), local = load32(txt + off + 4);
         if (vol >= t->nvols || local >= eng_series_count(t->vols[vol])) {
-            if (t->opt.read_only && vol < t->nvols)
+            if (!writer && vol < t->nvols)
                 eng_refresh(t->vols[vol]); /* the writer created it a moment ago */
-            if (vol >= t->nvols || local >= eng_series_count(t->vols[vol]))
+            if (!writer && (vol >= t->nvols || local >= eng_series_count(t->vols[vol])))
                 break; /* not visible to us yet: next time */
+            if (writer) {
+                fprintf(stderr, "tsdb: %s: series %" PRIu64 " names volume %u series %u, which does not exist: the open "
+                        "fails\n", CATALOG_FILE, gid, vol, local);
+                rc = TSDB_ERR_CORRUPT;
+                break;
+            }
         }
         rc = cat_add(t, vol, local);
     }
+    if (rc == 0 && writer && off < len) {
+        /* the record at off is partial or fails its check: a torn tail unless a valid record follows */
+        bool later = false;
+        for (size_t o = off + CAT_REC, g = off / CAT_REC + 1; !later && o + CAT_REC <= len; o += CAT_REC, g++)
+            later = cat_valid(txt + o, g);
+        if (later) {
+            fprintf(stderr, "tsdb: %s: record %zu is damaged and later records are not: the open fails\n",
+                    CATALOG_FILE, off / CAT_REC);
+            rc = TSDB_ERR_CORRUPT;
+        } else {
+            rc = cut_tail(t, CATALOG_FILE, off, len);
+        }
+    }
     free(txt);
+    if (rc == 0 && vols_cut != SIZE_MAX)
+        rc = cut_tail(t, VOLUMES_FILE, vols_cut, vols_len);
     return rc;
 }
 
@@ -278,8 +391,9 @@ static int adopt_orphans(tsdb *t)
         for (uint32_t l = 0; l < n; l++) {
             if (known[l])
                 continue;
-            uint32_t rec[2] = {v, l};
-            int rc = append_file(t->dirfd, CATALOG_FILE, rec, 8, t->opt.fsync);
+            uint8_t rec[CAT_REC];
+            cat_record(rec, t->ncat, v, l);
+            int rc = append_file(t->dirfd, CATALOG_FILE, rec, CAT_REC, t->opt.fsync);
             if (rc == 0)
                 rc = cat_add(t, v, l);
             if (rc) {
@@ -484,13 +598,12 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ui
         pthread_rwlock_unlock(&t->lock);
         if (rc == 0) {
             size_t n = strlen(canon);
-            char *line = malloc(n + 2);
+            char *line = malloc(n + 12);
             if (!line) {
                 rc = TSDB_ERR_NOMEM;
             } else {
-                memcpy(line, canon, n);
-                line[n] = '\n';
-                rc = append_root(t, VOLUMES_FILE, line, n + 1);
+                snprintf(line, n + 12, "%08x %s\n", vol_check(canon, n, vol), canon);
+                rc = append_root(t, VOLUMES_FILE, line, n + 10);
                 free(line);
             }
         }
@@ -499,8 +612,9 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ui
     if (rc == 0)
         rc = eng_series(t->vols[vol], name, type < 0 ? TSDB_FLOAT32 : type, &local); /* the volume, then the catalog */
     if (rc == 0) {
-        uint32_t rec[2] = {vol, local};
-        rc = append_root(t, CATALOG_FILE, rec, 8);
+        uint8_t rec[CAT_REC];
+        cat_record(rec, t->ncat, vol, local);
+        rc = append_root(t, CATALOG_FILE, rec, CAT_REC);
     }
     if (rc == 0) {
         pthread_rwlock_wrlock(&t->lock);
@@ -1080,6 +1194,8 @@ int tsdb_get_stats(tsdb *t, tsdb_stats *st)
         st->merged_rows += s.merged_rows;
         st->passthrough_granules += s.passthrough_granules;
         st->memtable_rows += s.memtable_rows;
+        st->broken_parts += s.broken_parts;
+        st->follow_errors += s.follow_errors;
     }
     pthread_rwlock_unlock(&t->lock);
     return 0;

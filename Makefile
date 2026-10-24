@@ -91,10 +91,11 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
+test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
 	./$(B)/test_tsdb
 	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
+	./$(B)/test_damage
 	./$(B)/test_types
 	./$(B)/test_levels
 	./$(B)/test_group
@@ -248,6 +249,9 @@ $(B)/test_follow: tests/test_follow.c $(LIB)
 $(B)/test_volumes: tests/test_volumes.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
+$(B)/test_damage: tests/test_damage.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
@@ -270,10 +274,13 @@ $(B)/jepsen: tests/jepsen/jepsen.c $(CLIB)
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.
 JEPSEN_DIR ?= /tmp/tsdb-jepsen
+JEPSEN_SEEDS ?= 1 2 3
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20 && \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --crashfs $(B)/libcrashfs.so && \
+	    for seed in $(JEPSEN_SEEDS); do \
+	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --seed $$seed \
+	            --crashfs $(B)/libcrashfs.so || exit 1; done && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis eio   --seconds 20 --crashfs $(B)/libcrashfs.so && \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10 || exit 1; done
 

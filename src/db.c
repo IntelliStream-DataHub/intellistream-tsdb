@@ -224,14 +224,17 @@ static int meta_load_or_create(eng *db, bool read_only)
             pms = strtoll(line + 13, NULL, 10);
         if ((line = strstr(buf, "granule_rows=")))
             grows = (unsigned)strtoul(line + 13, NULL, 10);
-        if (version < 1 || version > FORMAT_VERSION || pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS)
+        if (version != FORMAT_VERSION) {
+            /* no release has the older formats: they are not read */
+            fprintf(stderr, "tsdb: the database has format version %d; this build reads version %d only\n", version,
+                    FORMAT_VERSION);
+            return TSDB_ERR_CORRUPT;
+        }
+        if (pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS)
             return TSDB_ERR_CORRUPT;
         db->partition_ms = pms;
         db->granule_rows = grows;
-        /* A writer will add parts an older version cannot read (and would set
-         * aside as broken): the database is marked as the current version first,
-         * so older versions refuse to open it. Readers change nothing. */
-        return version < FORMAT_VERSION && !read_only ? meta_write(db) : 0;
+        return 0;
     }
     if (errno != ENOENT || read_only)
         return TSDB_ERR_IO;
@@ -290,14 +293,17 @@ static int load_parts(eng *db, bool read_only)
             part_unref(p);
             r = TSDB_ERR_CORRUPT;
         }
+        if (r == 0)
+            p->verify = db->opt.verify_checksums;
         if (r == TSDB_ERR_CORRUPT || r == TSDB_ERR_INVALID) {
-            fprintf(stderr, "tsdb: part %s is broken (%s), renamed to %s.broken\n", name, tsdb_strerror(r), name);
-            if (!read_only) {
-                char broken[300];
-                snprintf(broken, sizeof broken, "%s.broken", name);
-                renameat(db->dirfd, name, db->dirfd, broken);
-            }
-            continue;
+            /* Never left out quietly: its rows would vanish and older values of
+             * the same keys come back, and a merge would make that permanent.
+             * Parts are synced before they are named, so this is damage or a bug
+             * (or a power loss with fsync = 0, which leaves the same to an operator). */
+            fprintf(stderr, "tsdb: part %s is broken (%s): the open fails; rename it to %s.broken to accept the "
+                            "loss of its rows\n", name, tsdb_strerror(r), name);
+            rc = TSDB_ERR_CORRUPT; /* not counted in st_broken_parts: nobody could read it */
+            break;
         }
         if (r != 0) {
             rc = r;
@@ -416,7 +422,10 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     bool has_manifest = faccessat(db->dirfd, "MANIFEST", F_OK, 0) == 0;
     if (ro && has_manifest) {
         /* a reader follows what the writer published, not the directory */
-        if ((rc = follow_refresh(db)) != 0)
+        /* a MANIFEST caught mid-rewrite is read again, but a damaged one is not an empty database */
+        while ((rc = follow_refresh(db)) == 0 && !db->follow_version && db->manifest_bad_since)
+            usleep(10000);
+        if (rc)
             goto fail;
     } else {
         if (!ro && (rc = intents_recover(db)) != 0) /* before tmp files are cleaned up */
@@ -736,6 +745,8 @@ int eng_get_stats(eng *db, tsdb_stats *st)
     st->merges = atomic_load(&db->st_merges);
     st->merged_rows = atomic_load(&db->st_merged_rows);
     st->passthrough_granules = atomic_load(&db->st_passthrough);
+    st->broken_parts = atomic_load(&db->st_broken_parts);
+    st->follow_errors = atomic_load(&db->st_follow_errors);
     return 0;
 }
 

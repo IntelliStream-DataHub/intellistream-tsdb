@@ -6,15 +6,17 @@
  *
  * A granule holds rows of one series; its value block is coded for the
  * series' type and its index entry carries the statistics of its known
- * values. Version 1 parts (float32, 64-byte index entries) are still read:
- * their index is converted to the current layout when they are opened.
- * The header also records the newest WAL segment whose rows the part holds.
+ * values. The header also records the newest WAL segment whose rows the part
+ * holds. One hash in the footer covers the header, the index and the footer,
+ * so a damaged wal_seq, row count or time range is caught at open like a
+ * damaged index; each granule's blocks have a checksum of their own.
  * A part is written to tmp_*.part, fsync'd, and renamed to its final name
  * p<partition>_<min_block>_<max_block>_<level>.part, which makes it visible.
  */
 #include "internal.h"
 
 #include <dirent.h>
+#include <stddef.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -44,6 +46,14 @@ static int write_all(int fd, const void *buf, size_t len)
 }
 
 /* ---------------------------------------------------------------- reader */
+
+/* Covers everything open trusts besides the granule blocks: chained over three pieces. */
+static uint64_t part_hash(const part_header *h, const void *index, size_t len, const part_footer *f)
+{
+    uint64_t x = xxh64(h, sizeof *h, 0);
+    x = xxh64(index, len, x);
+    return xxh64(f, offsetof(part_footer, index_hash), x);
+}
 
 int part_open(int dirfd, const char *name, part **out) { return part_open_as(dirfd, name, name, out); }
 
@@ -102,44 +112,18 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     int rc = TSDB_ERR_CORRUPT;
     if (memcmp(h.magic, PART_MAGIC, 8) != 0 || memcmp(f.magic, PART_END_MAGIC, 8) != 0)
         goto fail;
-    if ((h.version != 1 && h.version != FORMAT_VERSION) || f.version != h.version || h.granule_rows == 0 ||
+    if (h.version != FORMAT_VERSION || f.version != h.version || h.granule_rows == 0 ||
         h.granule_rows > MAX_GRANULE_ROWS)
         goto fail;
     p->grows = h.granule_rows;
     p->wal_seq = h.wal_seq;
-    size_t entry = h.version == 1 ? sizeof(granule_v1) : sizeof(granule);
     if (f.index_off % 8 != 0 || f.index_off < sizeof h ||
-        f.index_off + (uint64_t)f.ngranules * entry + sizeof f != size)
+        f.index_off + (uint64_t)f.ngranules * sizeof(granule) + sizeof f != size)
         goto fail;
-    if (xxh64(p->map + f.index_off, (size_t)f.ngranules * entry, 0) != f.index_hash)
+    if (part_hash(&h, p->map + f.index_off, (size_t)f.ngranules * sizeof(granule), &f) != f.index_hash ||
+        f.min_ts > f.max_ts)
         goto fail;
-    if (h.version == 1) {
-        p->g_owned = malloc((f.ngranules ? f.ngranules : 1) * sizeof(granule));
-        if (!p->g_owned) {
-            rc = TSDB_ERR_NOMEM;
-            goto fail;
-        }
-        for (uint32_t i = 0; i < f.ngranules; i++) {
-            granule_v1 o;
-            memcpy(&o, p->map + f.index_off + (size_t)i * sizeof o, sizeof o);
-            granule *g = &p->g_owned[i];
-            memset(g, 0, sizeof *g);
-            g->series = o.series;
-            g->count = o.count;
-            g->ts_min = o.ts_min;
-            g->ts_max = o.ts_max;
-            g->off = o.off;
-            g->ts_len = o.ts_len;
-            g->val_len = o.val_len;
-            g->crc = o.crc;
-            g->fsum = o.sum;
-            g->fmin = o.vmin;
-            g->fmax = o.vmax;
-        }
-        p->g = p->g_owned;
-    } else {
-        p->g = (const granule *)(p->map + f.index_off);
-    }
+    p->g = (const granule *)(p->map + f.index_off);
     p->ng = f.ngranules;
     p->index_off = f.index_off;
     p->rows = f.rows;
@@ -151,7 +135,6 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     return 0;
 fail:
     munmap((void *)p->map, p->map_len);
-    free(p->g_owned);
     free(p);
     return rc;
 }
@@ -165,19 +148,23 @@ void part_unref(part *p)
     munmap((void *)p->map, p->map_len);
     if (atomic_load(&p->obsolete))
         unlinkat(p->dirfd, p->name, 0);
-    free(p->g_owned);
     free(p);
 }
 
-int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v)
+atomic_uint_fast64_t granule_checks;
+
+int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, bool verify)
 {
     uint64_t len = (uint64_t)g->ts_len + g->val_len;
     if (g->off < sizeof(part_header) || g->off + len > p->index_off || g->count == 0 ||
         g->count > p->grows)
         return TSDB_ERR_CORRUPT;
     const uint8_t *blk = p->map + g->off;
-    if ((uint32_t)xxh64(blk, len, 0) != g->crc)
-        return TSDB_ERR_CORRUPT;
+    if (verify) {
+        atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
+        if ((uint32_t)xxh64(blk, len, 0) != g->crc)
+            return TSDB_ERR_CORRUPT;
+    }
     QS_ADD(rows_decoded, g->count);
     QS_ADD(bytes_read, len);
     int rc = block_decode_ts(c, blk, g->ts_len, g->count, ts);
@@ -187,6 +174,15 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_
 }
 
 /* ---------------------------------------------------------------- writer */
+
+static void pw_header(const part_writer *w, part_header *h)
+{
+    memset(h, 0, sizeof *h);
+    memcpy(h->magic, PART_MAGIC, 8);
+    h->version = FORMAT_VERSION;
+    h->granule_rows = w->grows;
+    h->wal_seq = w->wal_seq;
+}
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq)
 {
@@ -217,10 +213,7 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
         return TSDB_ERR_IO;
     }
     part_header h;
-    memcpy(h.magic, PART_MAGIC, 8);
-    h.version = FORMAT_VERSION;
-    h.granule_rows = w->grows;
-    h.wal_seq = w->wal_seq;
+    pw_header(w, &h);
     memcpy(w->buf, &h, sizeof h);
     w->len = sizeof h;
     return 0;
@@ -380,7 +373,9 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     f.max_ts = w->max_ts;
     f.ngranules = (uint32_t)w->ng;
     f.version = FORMAT_VERSION;
-    f.index_hash = xxh64(w->idx, w->ng * sizeof(granule), 0);
+    part_header h;
+    pw_header(w, &h);
+    f.index_hash = part_hash(&h, w->idx, w->ng * sizeof(granule), &f);
     memcpy(f.magic, PART_END_MAGIC, 8);
     if ((rc = pw_flush(w)) != 0 || (rc = write_all(w->fd, w->idx, w->ng * sizeof(granule))) != 0 ||
         (rc = write_all(w->fd, &f, sizeof f)) != 0)
@@ -396,6 +391,8 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         close(w->fd);
         w->fd = -1; /* the tmp file stays */
         rc = part_open_as(db->dirfd, w->tmp_name, name, out);
+        if (rc == 0)
+            (*out)->verify = db->opt.verify_checksums;
         if (rc == 0)
             snprintf((*out)->pending, sizeof (*out)->pending, "%s", w->tmp_name);
         else
@@ -417,6 +414,8 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         return TSDB_ERR_IO;
     }
     rc = part_open(db->dirfd, name, out);
+    if (rc == 0)
+        (*out)->verify = db->opt.verify_checksums;
     if (rc != 0)
         unlinkat(db->dirfd, name, 0);
     pw_abort(w);
@@ -441,9 +440,24 @@ int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, ui
  * One insert can make several parts (one per partition). They are written
  * and fsync'd under tmp names; then an intent file listing the renames is
  * made durable, which is the commit point; then the renames happen and the
- * intent is removed. After a crash, an intent that is complete (it ends with
- * "end") is rolled forward; tmp files without one are deleted at open. So an
+ * intent is removed. tmp files without an intent are deleted at open. So an
  * insert is all or nothing.
+ *
+ * An intent reads "tsdb-intent 3 <n>", n lines "<tmp> <final>", and
+ * "end <xxh64 of everything before it>". At open, one whose count or
+ * checksum does not match was torn while it was written: no rename can have
+ * followed it (renames start only after the intent and the directory are
+ * synced), so the insert is rolled back whole. A complete intent is rolled
+ * forward only when every one of its parts is still there, under its tmp or
+ * its final name: after a failed directory fsync the intent's name can be
+ * durable while some tmp names are not, and renaming the ones that survived
+ * would publish part of the insert. If a part is missing and none was
+ * renamed yet, the insert is rolled back; if some were renamed, the insert
+ * was published and the missing ones have since been merged or dropped.
+ * Failing I/O (reading the intent, a rename) fails the open.
+ * Not covered: an intent damaged on disk after its renames ran (a synced file
+ * gone bad) also reads as torn, and the parts it renamed are rolled back
+ * although the insert may have been acknowledged.
  */
 
 #define INTENT_PREFIX "txn_"
@@ -483,10 +497,10 @@ int parts_commit(eng *db, part **ps, size_t n)
         char *buf = malloc(cap);
         if (!buf)
             return TSDB_ERR_NOMEM;
-        len += (size_t)snprintf(buf + len, cap - len, "tsdb-intent 1\n");
+        len += (size_t)snprintf(buf + len, cap - len, "tsdb-intent 3 %zu\n", n);
         for (size_t i = 0; i < n; i++)
             len += (size_t)snprintf(buf + len, cap - len, "%s %s\n", ps[i]->pending, ps[i]->name);
-        len += (size_t)snprintf(buf + len, cap - len, "end\n");
+        len += (size_t)snprintf(buf + len, cap - len, "end %016" PRIx64 "\n", xxh64(buf, len, 0));
         snprintf(intent, sizeof intent, INTENT_PREFIX "%d_%u.intent", (int)getpid(),
                  atomic_fetch_add(&db->tmp_counter, 1));
         int fd = openat(db->dirfd, intent, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -515,7 +529,48 @@ int parts_commit(eng *db, part **ps, size_t n)
     return 0;
 }
 
-/* At open: finish committed inserts that a crash interrupted. */
+/* Parses an intent into its n renames; false when it is torn or damaged. */
+static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[128], size_t *n)
+{
+    *tmp = NULL;
+    *fin = NULL;
+    *n = 0;
+    if (len < 4 || buf[len - 1] != '\n' || memchr(buf, '\0', len))
+        return false;
+    buf[len - 1] = '\0';
+    char *end = strrchr(buf, '\n'); /* the line before "end <hash>" */
+    uint64_t want;
+    char extra;
+    if (!end || sscanf(end + 1, "end %16" SCNx64 "%c", &want, &extra) != 1 || strlen(end + 1) != 20 ||
+        xxh64(buf, (size_t)(end + 1 - buf), 0) != want)
+        return false;
+    *end = '\0';
+    char *line = buf, *next = strchr(line, '\n');
+    size_t count;
+    if (!next)
+        return false;
+    *next = '\0';
+    if (sscanf(line, "tsdb-intent 3 %zu%c", &count, &extra) != 1 || count < 2 || count > 1u << 20)
+        return false;
+    *tmp = malloc(count * sizeof **tmp);
+    *fin = malloc(count * sizeof **fin);
+    if (!*tmp || !*fin)
+        return false;
+    for (line = next + 1; *n < count; line = next + 1) {
+        next = strchr(line, '\n');
+        if (next)
+            *next = '\0';
+        if (sscanf(line, "%95s %127s%c", (*tmp)[*n], (*fin)[*n], &extra) != 2 ||
+            strncmp((*tmp)[*n], "tmp_", 4) != 0 || strchr((*fin)[*n], '/'))
+            return false;
+        ++*n;
+        if (!next)
+            break;
+    }
+    return *n == count && !next;
+}
+
+/* At open: finish committed inserts that a crash interrupted, roll back the others. */
 int intents_recover(eng *db)
 {
     DIR *d = fdopendir(dup(db->dirfd));
@@ -524,35 +579,62 @@ int intents_recover(eng *db)
     rewinddir(d);
     struct dirent *e;
     bool any = false;
-    while ((e = readdir(d))) {
+    int rc = 0;
+    while (rc == 0 && (e = readdir(d))) {
         if (strncmp(e->d_name, INTENT_PREFIX, strlen(INTENT_PREFIX)) != 0)
             continue;
         int fd = openat(db->dirfd, e->d_name, O_RDONLY | O_CLOEXEC);
         struct stat st;
         char *buf = NULL;
-        if (fd >= 0 && fstat(fd, &st) == 0 && (buf = malloc((size_t)st.st_size + 1)) &&
-            pread(fd, buf, (size_t)st.st_size, 0) == st.st_size) {
-            buf[st.st_size] = '\0';
-            size_t len = (size_t)st.st_size;
-            bool complete = len >= 4 && strcmp(buf + len - 4, "end\n") == 0 && strncmp(buf, "tsdb-intent 1\n", 14) == 0;
-            for (char *line = buf + 14, *next; complete && *line; line = next) {
-                next = strchr(line, '\n');
-                if (!next)
-                    break;
-                *next++ = '\0';
-                char tmp[96], fin[128];
-                if (sscanf(line, "%95s %127s", tmp, fin) == 2 && faccessat(db->dirfd, tmp, F_OK, 0) == 0)
-                    renameat(db->dirfd, tmp, db->dirfd, fin); /* roll forward */
+        if (fd < 0 || fstat(fd, &st) != 0 || !(buf = malloc((size_t)st.st_size + 1)) ||
+            pread(fd, buf, (size_t)st.st_size, 0) != st.st_size) {
+            fprintf(stderr, "tsdb: cannot read the insert intent %s: %s\n", e->d_name,
+                    buf || fd < 0 ? strerror(errno ? errno : EIO) : "out of memory");
+            rc = buf || fd < 0 ? TSDB_ERR_IO : TSDB_ERR_NOMEM;
+            free(buf);
+            if (fd >= 0)
+                close(fd);
+            break;
+        }
+        close(fd);
+        char (*tmp)[96], (*fin)[128];
+        size_t n;
+        if (!intent_parse(buf, (size_t)st.st_size, &tmp, &fin, &n)) {
+            fprintf(stderr, "tsdb: insert intent %s is torn: the insert is rolled back\n", e->d_name);
+        } else {
+            size_t missing = 0, renamed = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (faccessat(db->dirfd, tmp[i], F_OK, 0) == 0)
+                    continue;
+                if (faccessat(db->dirfd, fin[i], F_OK, 0) == 0)
+                    renamed++;
+                else
+                    missing++;
+            }
+            if (missing && !renamed) {
+                fprintf(stderr, "tsdb: %zu of the %zu parts of insert intent %s are gone: the insert is rolled back\n",
+                        missing, n, e->d_name);
+            } else {
+                for (size_t i = 0; i < n && rc == 0; i++)
+                    if (faccessat(db->dirfd, tmp[i], F_OK, 0) == 0 && renameat(db->dirfd, tmp[i], db->dirfd, fin[i]) != 0) {
+                        fprintf(stderr, "tsdb: rolling insert intent %s forward: rename of %s: %s\n", e->d_name,
+                                tmp[i], strerror(errno));
+                        rc = TSDB_ERR_IO;
+                    }
             }
         }
+        free(tmp);
+        free(fin);
         free(buf);
-        if (fd >= 0)
-            close(fd);
-        unlinkat(db->dirfd, e->d_name, 0);
-        any = true;
+        if (rc == 0) {
+            /* the tmp files of a rolled-back insert go with the other tmp files, after this */
+            if (unlinkat(db->dirfd, e->d_name, 0) != 0 && errno != ENOENT)
+                rc = TSDB_ERR_IO;
+            any = true;
+        }
     }
     closedir(d);
-    if (any && db->opt.fsync && fsync(db->dirfd) != 0)
+    if (rc == 0 && any && db->opt.fsync && fsync(db->dirfd) != 0)
         return TSDB_ERR_IO; /* at open: the open fails */
-    return 0;
+    return rc;
 }

@@ -21,6 +21,10 @@
  *
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
+ *         [--verify-checksums]
+ *
+ * --verify-checksums checks each granule's checksum before a query decodes it
+ * (off by default: meant for storage without checksums of its own).
  *
  * --follow serves queries from a directory another process writes (on this
  * host or another one, over NFS), following its parts and WAL as they change.
@@ -1472,6 +1476,7 @@ int main(int argc, char **argv)
                                    {"partition-ms", required_argument, 0, 'P'},
                                    {"send-timeout", required_argument, 0, 'T'},
                                    {"io", required_argument, 0, 'I'},
+                                   {"verify-checksums", no_argument, 0, 'V'},
                                    {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -1482,6 +1487,7 @@ int main(int argc, char **argv)
         case 'w': nworkers = atoi(optarg); break;
         case 's': o.wal_sync_ms = atoi(optarg); break;
         case 'F': o.fsync = 0; break;
+        case 'V': o.verify_checksums = 1; break;
         case 'r': o.read_only = 1; break;
         case 'f': o.follow = 1; break;
         case 'R': o.refresh_ms = atoi(optarg); break;
@@ -1506,7 +1512,7 @@ int main(int argc, char **argv)
     usage:
         fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d] [--workers N] [--wal-sync-ms MS]\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
-                        "             [--send-timeout 60] [--io auto|uring|epoll]\n",
+                        "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
