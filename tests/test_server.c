@@ -67,6 +67,143 @@ static void stop_server(pid_t pid)
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+/* Raw protocol access, for what the client library never sends. */
+static int raw_connect(void)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        perror("connect");
+        exit(1);
+    }
+    return fd;
+}
+
+static void raw_send(int fd, uint32_t id, uint8_t op, const void *payload, uint32_t len)
+{
+    uint8_t h[9];
+    uint32_t flen = len + 5;
+    memcpy(h, &flen, 4);
+    memcpy(h + 4, &id, 4);
+    h[8] = op;
+    CHECK(write(fd, h, 9) == 9);
+    CHECK(len == 0 || write(fd, payload, len) == (ssize_t)len);
+}
+
+static bool read_full(int fd, void *p, size_t n)
+{
+    for (size_t got = 0; got < n;) {
+        ssize_t r = read(fd, (uint8_t *)p + got, n - got);
+        if (r <= 0)
+            return false;
+        got += (size_t)r;
+    }
+    return true;
+}
+
+/* Reads one reply frame; returns its status, or INT32_MIN at the end of the stream.
+ * The body after the status goes to rest[cap], its length to *nrest. */
+static int32_t raw_reply(int fd, uint32_t *id, uint8_t *rest, size_t cap, size_t *nrest)
+{
+    uint8_t h[13];
+    if (!read_full(fd, h, 13))
+        return INT32_MIN;
+    uint32_t flen;
+    int32_t status;
+    memcpy(&flen, h, 4);
+    memcpy(id, h + 4, 4);
+    memcpy(&status, h + 9, 4);
+    size_t n = flen - 9;
+    CHECK(h[8] == TSDB_OP_REPLY && n <= cap);
+    if (n > cap || !read_full(fd, rest, n))
+        return INT32_MIN;
+    *nrest = n;
+    return status;
+}
+
+static void raw_insert(int fd, uint32_t id, uint32_t series, int64_t ts, float v)
+{
+    uint8_t b[20];
+    uint32_t one = 1;
+    memcpy(b, &one, 4);
+    memcpy(b + 4, &series, 4);
+    memcpy(b + 8, &ts, 8);
+    memcpy(b + 16, &v, 4);
+    raw_send(fd, id, TSDB_OP_INSERT, b, sizeof b);
+}
+
+static uint64_t count_of(tsdbc *c, uint32_t series)
+{
+    tsdb_bucket *b;
+    size_t nb;
+    uint64_t n = 0;
+    if (tsdbc_query_agg(c, series, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0) {
+        n = nb ? b[0].count : 0;
+        free(b);
+    }
+    return n;
+}
+
+/* Regression: requests a client sent before closing were dropped once the
+ * server saw the close, so pipelined inserts without a wait got lost. */
+static void test_close(tsdbc *c)
+{
+    uint32_t d, e;
+    OK(tsdbc_series(c, "close.async", 1, &d));
+    OK(tsdbc_series(c, "close.halfclose", 1, &e));
+    tsdbc *c2;
+    OK(tsdbc_connect("127.0.0.1", port, &c2));
+    enum { NA = 500 };
+    for (int i = 0; i < NA; i++) {
+        int64_t t = T0 + i;
+        float x = (float)i;
+        OK(tsdbc_insert_series_async(c2, d, &t, &x, 1));
+    }
+    tsdbc_close(c2); /* without tsdbc_wait: close collects the acknowledgements */
+    CHECK(count_of(c, d) == NA);
+
+    /* a client that half-closes after sending still gets every request
+     * applied and every reply, then the end of the stream */
+    int rfd = raw_connect();
+    for (int i = 0; i < 50; i++)
+        raw_insert(rfd, (uint32_t)i, e, T0 + i, 2.0f);
+    shutdown(rfd, SHUT_WR);
+    int replies = 0;
+    uint32_t rid;
+    uint8_t rest[64];
+    size_t nrest;
+    for (int32_t st; (st = raw_reply(rfd, &rid, rest, sizeof rest, &nrest)) != INT32_MIN;) {
+        CHECK(st == 0 && rid == (uint32_t)replies);
+        replies++;
+    }
+    CHECK(replies == 50);
+    close(rfd);
+    CHECK(count_of(c, e) == 50);
+}
+
+/* Regressions in request and reply framing. */
+static void test_framing(void)
+{
+    int rfd = raw_connect();
+    uint32_t rid;
+    uint8_t rest[64];
+    size_t nrest = 0;
+
+    /* an invalid QUERY_RAW was answered with a bare status, without the `last`
+     * and `n` fields every raw reply has, so clients misread it */
+    uint8_t q[19] = {0};
+    raw_send(rfd, 7, TSDB_OP_QUERY_RAW, q, sizeof q);
+    CHECK(raw_reply(rfd, &rid, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID);
+    CHECK(rid == 7 && nrest == 5 && rest[0] == 1 && rest[1] == 0 && rest[2] == 0);
+
+    /* a name with a NUL was cut at it, naming another series */
+    uint8_t sq[6] = {1, 3, 0, 'a', 0, 'b'};
+    raw_send(rfd, 8, TSDB_OP_SERIES, sq, sizeof sq);
+    CHECK(raw_reply(rfd, &rid, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID && rid == 8);
+    close(rfd);
+}
+
 typedef struct counter {
     size_t rows, calls, stop_after;
     int64_t last;
@@ -265,10 +402,26 @@ int main(int argc, char **argv)
     char tmp[16];
     CHECK(read(fd, tmp, sizeof tmp) <= 0); /* closed by the server */
     close(fd);
+
+    test_close(c);
+    test_framing();
+
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);
 
     stop_server(srv);
+
+    /* Regression: the listening socket outlived a stopped server for a moment
+     * (io_uring held it), so a server restarted at once could not bind, or
+     * clients reached the old listener and lost their connection. */
+    for (int i = 0; i < 5; i++) {
+        srv = start_server(dir);
+        tsdbc *c3;
+        OK(tsdbc_connect("127.0.0.1", port, &c3));
+        CHECK(count_of(c3, a) == N);
+        tsdbc_close(c3);
+        stop_server(srv);
+    }
 
     /* everything is on disk */
     tsdb_options o;

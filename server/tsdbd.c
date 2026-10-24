@@ -112,6 +112,7 @@ typedef struct conn {
     req *q_head, *q_tail;
     bool busy;          /* a worker owns this connection's current request */
     bool recv_inflight, send_inflight, closed;
+    bool eof;           /* the client sent everything it will: reply to it, then close */
     buf sending;
     size_t sent;
     /* shared with the worker */
@@ -182,7 +183,13 @@ static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t al
     pthread_mutex_lock(&c->lock);
     while (c->out.len > OUT_CAP && !atomic_load(&c->closing))
         pthread_cond_wait(&c->cv, &c->lock);
-    bool ok = !atomic_load(&c->closing) && buf_reserve(&c->out, 13 + alen + blen + dlen) == 0;
+    bool ok = !atomic_load(&c->closing);
+    if (ok && buf_reserve(&c->out, 13 + alen + blen + dlen) != 0) {
+        /* a lost reply would leave the client waiting forever: drop the connection instead */
+        atomic_store(&c->closing, true);
+        shutdown(c->fd, SHUT_RDWR);
+        ok = false;
+    }
     bool wake = false;
     if (ok) {
         memcpy(c->out.p + c->out.len, hdr, 13);
@@ -268,8 +275,9 @@ static void handle(req *r)
         memcpy(&n, p + 1, 2);
         if (len >= 3u + n + 2)
             memcpy(&pn, p + 3 + n, 2);
-        if (n == 0 || (len != 3u + n && len != 3u + n + 2 + pn)) {
-            rc = TSDB_ERR_INVALID;
+        if (n == 0 || (len != 3u + n && len != 3u + n + 2 + pn) || memchr(p + 3, 0, n) ||
+            (len > 3u + n && memchr(p + 5 + n, 0, pn))) {
+            rc = TSDB_ERR_INVALID; /* strndup would cut a name at a NUL and use another series */
             break;
         }
         char *name = strndup((const char *)p + 3, n);
@@ -325,9 +333,10 @@ static void handle(req *r)
         break;
     }
     case TSDB_OP_QUERY_RAW: {
+        raw_out o = {c, r->id, NULL, NULL, 0, false};
         if (len != 20 && len != 29) {
-            rc = TSDB_ERR_INVALID;
-            break;
+            raw_flush(&o, true, TSDB_ERR_INVALID); /* raw replies always carry `last` and `n` */
+            return;
         }
         uint32_t s;
         int64_t start, end;
@@ -341,12 +350,15 @@ static void handle(req *r)
             memcpy(&lim, p + 21, 8);
             q.limit = (size_t)lim;
         }
-        raw_out o = {c, r->id, malloc(RAW_CHUNK_ROWS * 8), malloc(RAW_CHUNK_ROWS * 4), 0, false};
+        o.ts = malloc(RAW_CHUNK_ROWS * 8);
+        o.v = malloc(RAW_CHUNK_ROWS * 4);
         if (!o.ts || !o.v) {
             free(o.ts);
             free(o.v);
-            rc = TSDB_ERR_NOMEM;
-            break;
+            o.ts = NULL;
+            o.v = NULL;
+            raw_flush(&o, true, TSDB_ERR_NOMEM);
+            return;
         }
         rc = tsdb_query_raw_ex(db, s, start, end, &q, raw_cb, &o);
         if (!o.gone)
@@ -377,7 +389,7 @@ static void handle(req *r)
             rc = tsdb_query_agg(db, s, start, end, interval, &b, &nb);
         } else {
             uint16_t zl;
-            if (len < 20 + 1 + 4 + 1 + 8 + 2 || (memcpy(&zl, p + 34, 2), len != 36u + zl)) {
+            if (len < 20 + 1 + 4 + 1 + 8 + 2 || (memcpy(&zl, p + 34, 2), len != 36u + zl) || memchr(p + 36, 0, zl)) {
                 rc = TSDB_ERR_INVALID;
                 break;
             }
@@ -446,8 +458,7 @@ static void *worker_main(void *arg)
         if (!work_head)
             work_tail = NULL;
         pthread_mutex_unlock(&work_lock);
-        if (!atomic_load(&r->c->closing))
-            handle(r);
+        handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
         conn *c = r->c;
         free(r->payload);
         free(r);
@@ -508,7 +519,7 @@ static void submit_send(conn *c)
 
 static void dispatch(conn *c)
 {
-    if (c->busy || !c->q_head || c->closed)
+    if (c->busy || !c->q_head)
         return;
     req *r = c->q_head;
     c->q_head = r->next;
@@ -549,7 +560,10 @@ static void conn_free(conn *c)
     free(c);
 }
 
-/* Starts closing; the memory goes once nothing refers to it any more. */
+/* Starts closing; the memory goes once nothing refers to it any more. Requests
+ * already received still run, one by one, with their replies dropped: a client
+ * that pipelines inserts and closes without reading the acknowledgements should
+ * not lose them depending on how far the server had got. */
 static void conn_close(conn *c)
 {
     if (!c->closed) {
@@ -560,10 +574,18 @@ static void conn_close(conn *c)
         pthread_mutex_unlock(&c->lock);
         shutdown(c->fd, SHUT_RDWR); /* completes the outstanding recv */
     }
-    if (!c->busy && !c->recv_inflight && !c->send_inflight) {
+    dispatch(c);
+    if (!c->busy && !c->q_head && !c->recv_inflight && !c->send_inflight) {
         close(c->fd);
         conn_free(c);
     }
+}
+
+/* After the client's end of stream: close once every request has been answered. */
+static void finish_if_drained(conn *c)
+{
+    if (c->eof && !c->closed && !c->busy && !c->q_head && !c->send_inflight)
+        conn_close(c);
 }
 
 /* Splits received bytes into requests. Returns false on a protocol error. */
@@ -654,6 +676,7 @@ static void on_wake(void)
         submit_send(c);
         if (batch[i].done)
             dispatch(c);
+        finish_if_drained(c);
     }
     free(batch);
 }
@@ -809,9 +832,16 @@ int main(int argc, char **argv)
             case EV_RECV: {
                 conn *c = e->c;
                 c->recv_inflight = false;
-                if (res <= 0 || c->closed) {
+                if (res == 0 && !c->closed) { /* end of stream: what was received still gets its replies */
+                    if (getenv("TSDBD_DEBUG"))
+                        fprintf(stderr, "tsdbd: connection %d: recv end\n", c->fd);
+                    c->eof = true;
+                    finish_if_drained(c);
+                    break;
+                }
+                if (res < 0 || c->closed) {
                     if (getenv("TSDBD_DEBUG") && !c->closed)
-                        fprintf(stderr, "tsdbd: connection %d: recv %s\n", c->fd, res == 0 ? "end" : strerror(-res));
+                        fprintf(stderr, "tsdbd: connection %d: recv %s\n", c->fd, strerror(-res));
                     conn_close(c);
                     break;
                 }
@@ -837,6 +867,7 @@ int main(int argc, char **argv)
                 }
                 c->sent += (size_t)res;
                 submit_send(c);
+                finish_if_drained(c);
                 break;
             }
             }

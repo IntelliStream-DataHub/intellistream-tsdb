@@ -26,7 +26,7 @@ extern "C" {
 typedef struct tsdbc tsdbc;
 
 int tsdbc_connect(const char *host, int port, tsdbc **out);
-void tsdbc_close(tsdbc *c);
+void tsdbc_close(tsdbc *c); /* waits for pipelined inserts first; use tsdbc_wait to see their errors */
 const char *tsdbc_strerror(int err); /* the client does not link the storage engine */
 
 int tsdbc_series(tsdbc *c, const char *name, int create, uint32_t *id);

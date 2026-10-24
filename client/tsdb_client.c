@@ -84,6 +84,10 @@ void tsdbc_close(tsdbc *c)
 {
     if (!c)
         return;
+    /* Closing with acknowledgements unread makes the kernel reset the connection,
+     * which discards requests the server has not read yet: collect them first. */
+    if (c->pending)
+        tsdbc_wait(c);
     close(c->fd);
     free(c->rbuf);
     free(c->frame);
