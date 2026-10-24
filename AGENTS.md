@@ -13,10 +13,11 @@ make asan                 # the tests under AddressSanitizer + UBSan
 make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
 make jepsen               # fault injection: kill -9, simulated power loss, pauses
 make PORTABLE=1           # without -march=native
+make NO_URING=1           # tsdbd on epoll only, without liburing (after make clean)
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 ```
 
-Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only).
+Requirements: C11 (gnu11), pthreads, libzstd, liburing (server only; not with `NO_URING=1`).
 Tests take a scratch directory as their first argument
 (`./build/test_tsdb /tmp/x`); default `/tmp`.
 

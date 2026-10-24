@@ -106,7 +106,7 @@ More detail: [docs/design.md](docs/design.md).
 
 ## Getting started
 
-You need a C compiler (C11), libzstd, and liburing for the server.
+You need a C compiler (C11), libzstd, and liburing for the server (not with `make NO_URING=1`).
 
 ```sh
 make            # builds everything into build/
@@ -149,7 +149,8 @@ build/tsdbd --dir /mnt/sensors --port 7070 --follow    # a read-only copy that f
 ```
 
 On AlmaLinux and RHEL 10, where io_uring is disabled by default, tsdbd runs on epoll by itself
-(`--io auto`, the default; `--io epoll` skips the attempt) and says so when it starts.
+(`--io auto`, the default; `--io epoll` skips the attempt) and says so when it starts;
+`make NO_URING=1` builds it without io_uring, so liburing need not be installed there.
 
 | client | quick start |
 |---|---|

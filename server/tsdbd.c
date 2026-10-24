@@ -44,7 +44,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
+#ifndef TSDBD_NO_URING /* make NO_URING=1: epoll only, no liburing needed at run time */
 #include <liburing.h>
+#endif
 #include <zstd.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -145,10 +147,14 @@ typedef struct conn {
 /* ------------------------------------------------------------ globals */
 
 static tsdb *db;
+#ifndef TSDBD_NO_URING
 static struct io_uring ring;
+#endif
 static int wake_fd = -1;
 static volatile sig_atomic_t stopping;
+#ifndef TSDBD_NO_URING
 static ev wake_ev = {EV_WAKE, NULL};
+#endif
 static conn *conns;
 static size_t nconns, max_conns = 10000;
 
@@ -904,6 +910,7 @@ static size_t fd_conn_cap;
 static conn *ready_head, *ready_tail; /* epoll: connections that can make progress */
 static size_t nready;
 
+#ifndef TSDBD_NO_URING
 static struct io_uring_sqe *sqe_get(void)
 {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -913,6 +920,7 @@ static struct io_uring_sqe *sqe_get(void)
     }
     return sqe;
 }
+#endif
 
 /* epoll: queues c for the next round if a wanted operation can proceed. */
 static void ep_want(conn *c)
@@ -941,9 +949,11 @@ static void submit_recv(conn *c)
         ep_want(c);
         return;
     }
+#ifndef TSDBD_NO_URING
     struct io_uring_sqe *sqe = sqe_get();
     io_uring_prep_recv(sqe, c->fd, c->in.p + c->in.len, c->in.cap - c->in.len, 0);
     io_uring_sqe_set_data(sqe, &c->recv_ev);
+#endif
 }
 
 static void submit_send(conn *c)
@@ -971,9 +981,11 @@ static void submit_send(conn *c)
         ep_want(c);
         return;
     }
+#ifndef TSDBD_NO_URING
     struct io_uring_sqe *sqe = sqe_get();
     io_uring_prep_send(sqe, c->fd, c->sending.p + c->sent, c->sending.len - c->sent, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, &c->send_ev);
+#endif
 }
 
 static void dispatch(conn *c)
@@ -1237,6 +1249,7 @@ static void on_wake(void)
     free(batch);
 }
 
+#ifndef TSDBD_NO_URING
 static void uring_loop(void)
 {
     struct io_uring_sqe *sqe = sqe_get();
@@ -1266,6 +1279,7 @@ static void uring_loop(void)
         io_uring_cq_advance(&ring, seen);
     }
 }
+#endif
 
 /* epoll: one round over the connections that were ready when it started.
  * in_ready stays set while one is handled, so it is not queued twice and a
@@ -1481,6 +1495,13 @@ int main(int argc, char **argv)
     if (lfd < 0)
         return 1;
     wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#ifdef TSDBD_NO_URING
+    if (io == IO_URING) {
+        fprintf(stderr, "tsdbd: io_uring: not in this build (NO_URING=1)\n");
+        return 1;
+    }
+    io = IO_EPOLL;
+#else
     if (io != IO_EPOLL) {
         struct io_uring_params params = {.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN};
         if ((rc = io_uring_queue_init_params(4096, &ring, &params)) < 0) {
@@ -1500,6 +1521,7 @@ int main(int argc, char **argv)
                     rc == -EPERM ? ": see sysctl kernel.io_uring_disabled" : "");
         io = rc < 0 ? IO_EPOLL : IO_URING;
     }
+#endif
     if (io == IO_EPOLL) {
         struct epoll_event e = {.events = EPOLLIN, .data.fd = wake_fd};
         if ((epfd = epoll_create1(EPOLL_CLOEXEC)) < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, wake_fd, &e) != 0) {
@@ -1521,9 +1543,11 @@ int main(int argc, char **argv)
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
             max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll");
+#ifndef TSDBD_NO_URING
     if (io == IO_URING)
         uring_loop();
     else
+#endif
         ep_loop();
 
     fprintf(stderr, "tsdbd: shutting down\n");
@@ -1547,9 +1571,11 @@ int main(int argc, char **argv)
     while (running_workers > 0)
         pthread_cond_wait(&workers_gone_cv, &work_lock);
     pthread_mutex_unlock(&work_lock);
+#ifndef TSDBD_NO_URING
     if (io == IO_URING)
         io_uring_queue_exit(&ring);
     else
+#endif
         close(epfd);
     while (conns)
         conn_free(conns);

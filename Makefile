@@ -16,8 +16,17 @@ LDLIBS  += -lzstd -lpthread -lm
 B       ?= build
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
-# where io_uring is disabled (RHEL and AlmaLinux 10).
+# where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
+# epoll alone, without liburing, for hosts where io_uring is disabled anyway.
+ifeq ($(NO_URING),1)
+IO      ?= epoll
+URING_FLAGS := -DTSDBD_NO_URING
+URING_LIBS  :=
+else
 IO      ?= uring epoll
+URING_FLAGS :=
+URING_LIBS  := -luring
+endif
 
 SRC  := $(wildcard src/*.c)
 OBJ  := $(SRC:src/%.c=$(B)/%.o)
@@ -104,7 +113,7 @@ $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/tsdbd: server/tsdbd.c include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
-	$(CC) $(CFLAGS) -o $@ $< $(B)/tsdb_pack.o $(LIB) $(LDLIBS) -luring
+	$(CC) $(CFLAGS) $(URING_FLAGS) -o $@ $< $(B)/tsdb_pack.o $(LIB) $(LDLIBS) $(URING_LIBS)
 
 CLIB := $(B)/libtsdbclient.a
 
