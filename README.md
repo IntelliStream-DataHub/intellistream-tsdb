@@ -11,7 +11,9 @@ On 100 billion sensor readings, against ClickHouse on the same machine:
 stored in **116 GB instead of 170 GB**, loaded in **15 minutes instead of 45**
 (until merges settled), whole-table aggregates in **0.16 s instead of 59 s**,
 single-series queries **2.3 to 190 times faster**
-([details](#100-billion-rows-tsdb-and-clickhouse)).
+([details](#100-billion-rows-tsdb-and-clickhouse)). On 100 million rows it is
+also smaller and faster on every query than QuestDB, TimescaleDB, InfluxDB 2
+and InfluxDB 3 ([details](#100-million-rows-six-databases)).
 
 How it works: [docs/design.md](docs/design.md).
 
@@ -190,44 +192,79 @@ and UTC days take milliseconds. Hours, minutes and local days that do not line u
 with granules have to decode them, and then both systems read the data from
 disk; tsdb reads less of it.
 
-### 100 million rows
+### 100 million rows, six databases
 
-100 series x 1,000,000 samples of the same seven sensor types at their own
-rates (`tsdb-bench --export`), written once to a RowBinary file that both
-systems load. ClickHouse table: `PARTITION BY toDate(ts) ORDER BY (series, ts)`
-with its recommended time series codecs unless noted. Data on tmpfs, so these
-numbers are CPU, not disk; durable writes on NVMe have their own table.
+The same 100 M rows (100 series x 1 M samples of the seven sensor types at
+their own rates, `tsdb-bench --export`) in each system, one at a time, data on
+the NVMe, every server in Podman on 127.0.0.1, each set up as its docs
+recommend for time series. Every query's answer was checked against tsdb's:
+no differences.
 
-#### Compression
+| | version | setup |
+|---|---|---|
+| tsdb | this repository | defaults; loaded through tsdbd, 4 connections |
+| ClickHouse | 26.8.2.7 | `PARTITION BY toYYYYMM(ts) ORDER BY (series, ts)`, `DoubleDelta`/`Gorilla` + `ZSTD(1)`; one RowBinary insert |
+| QuestDB | 10.1.0 | `series SYMBOL`, `PARTITION BY DAY WAL`; line protocol, 8 connections |
+| TimescaleDB | 2.31.0, PostgreSQL 17.11 | hypertable, 1-day chunks, compressed (`segmentby series, orderby ts`); `timescaledb-parallel-copy`, 16 workers |
+| InfluxDB | 2.7.12 | one measurement, tag `series`; line protocol, 8 writers |
+| InfluxDB 3 Core | 3.12.1 | line protocol, 16 writers; SQL |
 
-| | bytes / row | ratio vs 12 bytes |
-|---|---:|---:|
-| ClickHouse, `ts DoubleDelta, ZSTD(1)`, `value Gorilla, ZSTD(1)` | 2.235 | 5.4x |
-| ClickHouse, `Delta, ZSTD(1)` on both (the best combination found) | 1.799 | 6.7x |
-| **tsdb** | **1.232** | **9.7x** |
+float32 values are stored as 4-byte floats where the system has them, as
+doubles in InfluxDB. tsdb, PostgreSQL and InfluxDB sync to disk before they
+acknowledge a write; ClickHouse and QuestDB by default do not.
 
-tsdb per row: timestamps 2.05 bits, values 7.68 bits, granule index 0.12 bits.
-ClickHouse at its best: timestamps 2.98 bits, values 7.40 bits, and about 4 bits
-of marks, primary index and checksums. The per-sensor value codecs are below.
+| | load | rows/s | background work until settled | size | bytes/row |
+|---|---:|---:|---|---:|---:|
+| **tsdb** (tsdbd) | **1.21 s** | **82.6 M** | none needed | **119 MB** | **1.19** |
+| ClickHouse | 2.31 s | 43 M | merges, 26 s to 45 parts, then 45 min more | 221 MB | 2.21 |
+| QuestDB | 3.08 s (5.9 s to queryable) | 32 M | WAL apply 2.8 s | 1,657 MB (no compression in open source) | 16.6 |
+| TimescaleDB | 29.6 s | 3.4 M | compressing 696 chunks: 12.3 s | 404 MB (7,198 MB before) | 4.04 |
+| InfluxDB 2 | 28.2 s | 3.6 M | 11 min (10 of them its snapshot wait) | 315 MB | 3.15 |
+| InfluxDB 3 Core | 99.6 s | 1.0 M | Parquet only an hour later: 100,001 files | 723 MB (plus 2.8 GB of WAL) | 7.6 |
 
-#### Write speed
+Whole range, all 100 series, one client (tsdb: one query per series, on 1
+or on 16 connections), median of 5:
 
-Loading the 100 M rows:
+| | count/sum/min/max per series | buckets of 3600 samples | buckets of 60 samples (1.67 M buckets) |
+|---|---:|---:|---:|
+| **tsdbd, 16 connections** | **5.2 ms** | **18.3 ms** | **40.7 ms** |
+| tsdbd, 1 connection | 45.7 ms | 63.6 ms | 158 ms |
+| tsdbd, 1 connection, partitions merged | 5.0 ms | 23.7 ms | 116 ms |
+| ClickHouse | 51 ms | 187 ms | 368 ms |
+| QuestDB | 36 ms | 282 ms | 1,288 ms |
+| TimescaleDB | 479 ms | 3,270 ms | 3,827 ms |
+| InfluxDB 2 (Flux; InfluxQL was slower) | 2,294 ms | 2,371 ms | 6,937 ms |
+| InfluxDB 3 Core | 3,199 ms | 45,059 ms | 45,364 ms |
 
-Rates in million rows per second.
+Random windows on random series, queries per second with 1 / 32 clients
+(15 s each, the same 10,000 queries per class for every system):
 
-| | wall time | M rows / s |
-|---|---:|---:|
-| ClickHouse `INSERT ... FORMAT RowBinary` (the server used 10 threads, 8.1 CPU s) | 2.34 s | 43 M |
-| **tsdb, 1 thread, embedded** | **1.85 s** | **54 M** |
-| tsdb, 4 threads, embedded | 0.55 s | 182 M |
-| tsdb, 16 threads, embedded | 0.30 s | 338 M |
-| **tsdbd over TCP, 1 connection** (pipelined 1 M-row batches) | **2.24 s** | **45 M** |
-| tsdbd over TCP, 4 connections | 0.76 s | 131 M |
-| ClickHouse `OPTIMIZE FINAL` (MergeTree / ReplacingMergeTree) | 4.7 / 6.0 s | |
-| tsdb `tsdb_optimize` | 0.64 - 0.94 s | |
+| | raw rows, 3600 samples | 86400 samples into 288 buckets | 604800 samples into 168 buckets | a single row |
+|---|---:|---:|---:|---:|
+| **tsdbd** | **14,574 / 88,029** | **6,468 / 56,631** | **2,490 / 13,835** | **20,192 / 127,187** |
+| tsdbd, partitions merged (1 client) | 16,719 | 8,604 | 5,860 | 24,543 |
+| ClickHouse | 687 / 9,567 | 317 / 3,415 | 167 / 1,025 | 862 / 12,095 |
+| QuestDB | 799 / 10,745 | 188 / 562 | 92 / 177 | 4,122 / 75,208 |
+| TimescaleDB | 978 / 15,018 | 172 / 2,923 | 25 / 390 | 3,482 / 70,412 |
+| InfluxDB 2 (faster of InfluxQL and Flux) | 421 / 4,402 | 188 / 929 | 112 / 409 | 3,127 / 31,590 |
+| InfluxDB 3 Core | 170 / 444 | 13.8 / 23.5 | 3.3 / 4.0 | 607 / 5,052 |
 
-Durable inserts on a real disk: `build/insert-bench`, fsync on, ext4 on a WD
+tsdb was measured with the parts its background merges left a minute after
+the load (1,009 in 696 partitions). Batches from 4 connections arrive
+interleaved in time, and the parts merged from them overlap, so some granules
+had to be decoded rather than answered from their statistics; the "partitions
+merged" rows are the same data after `tsdb_optimize`. Background merges now
+do that by themselves once a partition has had no new rows for 5 minutes
+(`merge_idle_s`). Notes on the others: Flux was only fast written as separate
+pipelines (a shared source disables its pushdown, and the whole-range query
+then ran influxd out of memory); InfluxDB 3 Core keeps 10-minute Parquet files
+without compacting them; TimescaleDB ran the whole-range aggregates without
+parallel workers; a symbol index in QuestDB doubles point lookups at 32
+clients and slows its aggregates up to 4x.
+
+### Durable writes
+
+On a real disk: `build/insert-bench`, fsync on, ext4 on a WD
 SN720 NVMe drive (LUKS), 1000 series of the mixed sensors arriving the way
 collectors send them (every series at time t, then t + 1). One `fdatasync` on
 this drive takes about 0.7 ms.
@@ -255,51 +292,6 @@ Durability options: with `wal_sync_ms = 0` (the default) every write returns
 after its own fsync, shared by concurrent writers (group commit). A periodic
 sync of 10 ms costs no measurable throughput against 100 ms and bounds what a
 power failure can lose to the last 10 ms of acknowledged writes.
-
-#### Read speed
-
-Whole range, all 100 series. Bucket sizes are in samples so each sensor type
-does the same work (`GROUP BY series, intDiv(ts, step * N)` in ClickHouse).
-ClickHouse: best of three; `ReplacingMergeTree ... FINAL` was within a few percent.
-
-| | ClickHouse 1 thread | ClickHouse 32 threads | **tsdb 1 thread** | **tsdb 16 threads** |
-|---|---:|---:|---:|---:|
-| raw rows in time order | 1.491 s | 0.287 s | **0.361 s** | **0.038 s** |
-| count/sum/min/max | 1.225 s | 0.079 s | **0.002 s** | **0.002 s** |
-| buckets of 86400 samples | 1.793 s | 0.210 s | **0.004 s** | **0.003 s** |
-| buckets of 3600 samples | 1.864 s | 0.202 s | **0.246 s** | **0.022 s** |
-| buckets of 60 samples | 2.101 s | 0.248 s | **0.280 s** | **0.036 s** |
-| buckets of 10 samples | 2.630 s | 0.716 s | **0.377 s** | **0.074 s** |
-
-In rows per second: a raw scan that decodes and returns every row runs at
-280 million rows/s on one core and **2.6 billion rows/s** on 16 (one query per
-series, in parallel; a single raw query is single threaded). Aggregation that
-decodes every value (buckets of 60 samples) reaches 2.8 billion rows/s.
-
-Granules that lie inside one bucket are answered from the granule index
-without decompressing, which is why whole-range and coarse aggregates take
-milliseconds: the whole-range count/sum/min/max reads 24,136 index entries
-instead of 100 million rows. Dividing rows by time there gives about 50
-billion rows/s, but that is an effective rate, not a scan rate.
-
-Random time windows on one series, queries per second. Over TCP both run
-behind their protocol on loopback (`clickhouse-benchmark` against
-`tsdbc-bench` and `tsdbd`); the embedded columns call the library directly.
-
-| | ClickHouse c=1 | **tsdbd c=1** | ClickHouse c=32 | **tsdbd c=32** | tsdbd follower c=32 | embedded 1 thr | embedded 32 thr |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| raw, 3600 samples | 643 | **14,131** | 6,772 | **88,469** | 83,733 | 35,640 | 547,204 |
-| 86400 samples into 288 buckets | 241 | **10,511** | 1,588 | **58,476** | 57,650 | 18,488 | 77,025 |
-| 604800 samples into 168 buckets | 106 | **5,210** | 285 | **12,450** | 12,655 | 6,295 | 14,165 |
-
-The 7-day aggregates cover 7.5 billion rows/s over TCP and 8.6 billion rows/s
-embedded, mostly from granule statistics (only the granules at the window's
-edges and inside partial buckets are decoded).
-
-Rewriting existing timestamps has a read cost until merges catch up: with
-every row written twice, aggregates have to merge both copies instead of using
-the granule statistics, and ran about 14x slower until `tsdb_optimize` (or the
-background merges) folded them together.
 
 ### Value codecs
 
