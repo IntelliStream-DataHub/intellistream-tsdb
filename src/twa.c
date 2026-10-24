@@ -424,7 +424,7 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
             /* and the first after it */
             if (gj < sn.gj[i] && p->g[gj].series == series && (gj == gi || p->g[gj - 1].ts_max < end))
                 gj++;
-        } else {
+        } else if (mem_from_memtable(&sn, i - sn.np)) {
             QS_ADD(memtable_rows, sn.mem[i - sn.np].n);
         }
         for (uint32_t k = gi; k < gj; k++) {

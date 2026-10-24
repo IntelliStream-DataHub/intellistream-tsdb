@@ -558,6 +558,22 @@ static void test_stats(void)
     int64_t want = (int64_t)N * (N - 1) / 2 - (1000 + 1999) * 1000 / 2;
     CHECK(agg_count(db, 1, 0, N, &sum, &st) == N - 1000 && sum == want);
     CHECK(st.granules - st.granules_from_stats <= 1000 / 64 + 2 && st.granules_from_stats > 0);
+    /* rows of granules decoded around a tombstone count once, as rows_decoded: no memtable holds any */
+    CHECK(st.memtable_rows == 0);
+    {
+        static rows rr;
+        rr.n = 0;
+        OK(tsdb_query_values(db, 1, 0, 3000, NULL, collect, &rr));
+        tsdb_last_query_stats(&st);
+        CHECK(rr.n == 2000 && st.memtable_rows == 0 && st.rows_decoded > 0);
+        tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
+        tsdb_twa_bucket *tb = NULL;
+        size_t ntb = 0;
+        OK(tsdb_query_twa(db, 1, 0, N, 0, &to, &tb, &ntb));
+        tsdb_last_query_stats(&st);
+        CHECK(ntb == 1 && st.memtable_rows == 0 && st.rows_decoded > 0);
+        free(tb);
+    }
     /* a later insert into the deleted range is visible; the delete hides only what came before it */
     int64_t t1 = 1500, v1 = 7;
     tsdb_values one = {TSDB_INT64, &v1, NULL};
@@ -639,6 +655,29 @@ static int64_t fake_clock(void *arg)
     return __atomic_load_n(&fake_now, __ATOMIC_SEQ_CST);
 }
 
+/* rows of series s in [a, b) that a values query returns, in either order; their first and last timestamps */
+static size_t values_span(tsdb *db, uint32_t s, int64_t a, int64_t b, tsdb_order order, int64_t *first, int64_t *last)
+{
+    static rows rr;
+    rr.n = 0;
+    tsdb_query_opts qo = {order, 0};
+    OK(tsdb_query_values(db, s, a, b, &qo, collect, &rr));
+    *first = rr.n ? rr.ts[0] : -1;
+    *last = rr.n ? rr.ts[rr.n - 1] : -1;
+    return rr.n;
+}
+
+/* series s holds exactly the rows [from, D) to every values query */
+static bool values_from(tsdb *db, uint32_t s, int64_t from)
+{
+    int64_t f, l;
+    bool ok = values_span(db, s, 0, D, TSDB_ASC, &f, &l) == (size_t)(D - from) && f == from && l == D - 1;
+    ok &= values_span(db, s, 0, D, TSDB_DESC, &f, &l) == (size_t)(D - from) && f == D - 1 && l == from;
+    ok &= values_span(db, s, 0, from + 1, TSDB_DESC, &f, &l) == 1 && f == from;
+    ok &= from == 0 || values_span(db, s, 0, from, TSDB_ASC, &f, &l) == 0;
+    return ok;
+}
+
 static void test_retention(void)
 {
     char dir[1024];
@@ -667,9 +706,11 @@ static void test_retention(void)
     OK(tsdb_set_retention(db, 1, 30000)); /* cutoff -10000: keeps everything */
     CHECK(agg_count(db, 0, 0, D, &sum, &st) == D - 10000);
     CHECK(agg_count(db, 1, 0, D, &sum, &st) == D);
+    CHECK(values_from(db, 0, 10000) && values_from(db, 1, 0));
     CHECK(agg_count(db, 2, 0, D, &sum, &st) == D);
     fake_now = 21000; /* forward: one more second expires */
     CHECK(agg_count(db, 0, 0, D, &sum, &st) == D - 11000);
+    CHECK(values_from(db, 0, 11000));
     fake_now = 5000; /* back: nothing comes back */
     CHECK(agg_count(db, 0, 0, D, &sum, &st) == D - 11000);
     OK(tsdb_close(db));
@@ -678,9 +719,12 @@ static void test_retention(void)
     OK(tsdb_get_retention(db, 0, &lim));
     CHECK(lim == 10000);
     CHECK(agg_count(db, 0, 0, D, &sum, &st) == D - 11000);
+    CHECK(values_from(db, 0, 11000));
     OK(tsdb_optimize(db)); /* merges drop the expired rows for good */
+    CHECK(values_from(db, 0, 11000));
     OK(tsdb_set_retention(db, 0, 0));
     CHECK(agg_count(db, 0, 0, D, &sum, &st) == D - 11000);
+    CHECK(values_from(db, 0, 11000));
     CHECK(agg_count(db, 1, 0, D, &sum, &st) == D);
     OK(tsdb_close(db));
 

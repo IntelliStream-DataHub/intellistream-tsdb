@@ -787,6 +787,10 @@ static int cmp_item(const void *a, const void *b)
 
 uint64_t mem_prio(const snapshot *sn, size_t i) { return sn->mprio[i]; }
 
+/* Decoded runs take their part's max_block as priority, far below the memtables' UINT64_MAX - k; their rows are
+ * already counted in rows_decoded. */
+bool mem_from_memtable(const snapshot *sn, size_t i) { return sn->mprio[i] >= UINT64_MAX - sn->nmem; }
+
 int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
                   size_t *nout)
 {
@@ -824,7 +828,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                 QS_ADD(parts, 1);
                 QS_ADD(granules, gj - gi);
             }
-        } else {
+        } else if (mem_from_memtable(&sn, i - sn.np)) {
             QS_ADD(memtable_rows, sn.mem[i - sn.np].n);
         }
         for (uint32_t k = gi; k < gj; k++) {
@@ -1031,7 +1035,8 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
         if (lo >= hi)
             continue;
         clipped[i] = (mem_run){r->ts + lo, r->v + lo * w, hi - lo};
-        QS_ADD(memtable_rows, hi - lo);
+        if (mem_from_memtable(sn, i))
+            QS_ADD(memtable_rows, hi - lo);
         src_init_mem(&cur[nc++], &clipped[i], mem_prio(sn, i), type);
     }
     if (rc || nc == 0)
