@@ -158,7 +158,7 @@ static tsdb *db;
 static struct io_uring ring;
 #endif
 static int wake_fd = -1;
-static volatile sig_atomic_t stopping;
+static atomic_int stopping; /* lock-free, so the signal handler may store it; read by failwatch too */
 #ifndef TSDBD_NO_URING
 static ev wake_ev = {EV_WAKE, NULL};
 #endif

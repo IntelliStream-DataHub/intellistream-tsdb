@@ -69,7 +69,7 @@ static pthread_mutex_t f_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t f_cv = PTHREAD_COND_INITIALIZER;
 static int f_op;          /* the armed operation, 0: none */
 static char f_match[64];  /* substring of the path; "/" with F_FSYNC: the database directory itself */
-static const char *f_dir; /* the database directory */
+static char *f_dir; /* the database directory */
 static bool f_partial;    /* a failing write writes half its bytes first */
 static bool f_drop;       /* a failing fdatasync loses the bytes since the last successful one */
 static int f_fired;
@@ -243,6 +243,7 @@ static tsdb *open_fresh(const char *name, tsdb_options o)
     char real[PATH_MAX];
     if (realpath(dir, real)) {
         pthread_mutex_lock(&f_lock);
+        free(f_dir);
         f_dir = strdup(real);
         pthread_mutex_unlock(&f_lock);
     }

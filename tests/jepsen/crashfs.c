@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -118,6 +119,14 @@ static void on_usr2(int sig)
     crash_requested = 1;
 }
 
+/* 16 GB of address space, touched only as far as used. Not calloc: a sanitizer's allocator
+ * clears it all, which takes seconds when the shim is preloaded into a sanitizer build. */
+static void *zeroed(size_t size)
+{
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    return p == MAP_FAILED ? NULL : p;
+}
+
 __attribute__((constructor)) static void init(void)
 {
 #define LOAD(name) real_##name = dlsym(RTLD_NEXT, #name)
@@ -143,8 +152,8 @@ __attribute__((constructor)) static void init(void)
     warmup = getenv("CRASHFS_WARMUP") ? atol(getenv("CRASHFS_WARMUP")) : 0;
     rng = getenv("CRASHFS_SEED") ? strtoull(getenv("CRASHFS_SEED"), NULL, 10) : (uint64_t)getpid();
     rng = rng * 6364136223846793005ull + 1;
-    files = calloc(MAX_FILES, sizeof *files);
-    dops = calloc(MAX_OPS, sizeof *dops);
+    files = zeroed(MAX_FILES * sizeof *files);
+    dops = zeroed(MAX_OPS * sizeof *dops);
     eio_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "eio");
     if (getenv("CRASHFS_EIO_ONLY"))
         snprintf(eio_only, sizeof eio_only, "%s", getenv("CRASHFS_EIO_ONLY"));
