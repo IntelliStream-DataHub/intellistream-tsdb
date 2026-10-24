@@ -21,9 +21,11 @@ import java.util.Objects;
  *
  * <pre>{@code
  * try (TsdbClient c = TsdbClient.connect("127.0.0.1", 7070)) {
- *     int id = c.series("pump7.flow");
- *     c.insert(id, timestamps, values);
+ *     int id = c.series("pump7.flow");                              // get or create
+ *     c.insert(id, timestamps, values);                             // long[] ms, float[] values
+ *     Points newest = c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE, Order.DESC, 10);
  *     List<Bucket> perMinute = c.queryAgg(id, start, end, 60_000);
+ *     List<Bucket> perDay = c.queryGroup(id, start, end, Group.of(Unit.DAY).in("Europe/Oslo"));
  * }
  * }</pre>
  *
@@ -55,6 +57,11 @@ import java.util.Objects;
  * {@link #queryValues} carry a {@link Column} of any type with its nulls (protocol version 2).
  * {@link #queryAgg} and {@link #queryGroup} work on every type and need a version 2 server.
  *
+ * <p><b>Time zones.</b> The server groups by UTC only (protocol version 4). For local days, weeks, months, quarters
+ * and years, {@link #queryGroup} computes the UTC instant each local period begins, with the JDK's time zone data,
+ * and asks for buckets that begin there ({@link #queryBounds}); a server older than version 4 gets the zone's name
+ * instead and groups by itself.
+ *
  * <p><b>Numbers.</b> Series ids and state codes are unsigned 32-bit integers carried in an {@code int}.
  * Timestamps are milliseconds since the Unix epoch. Time ranges are half open, {@code [start, end)}; use
  * {@link Long#MIN_VALUE} and {@link Long#MAX_VALUE} for "everything".
@@ -69,6 +76,7 @@ public final class TsdbClient implements AutoCloseable {
     private static final int BUF = 1 << 20;               /* send buffer; receive buffer between large replies */
     private static final int INSERT_FRAME_ROWS = 8 << 20; /* as the C client: under 256 MiB for any value type */
     private static final int MAX_STRING = 0xffff;         /* u16 length prefix */
+    private static final int MAX_BOUNDS = (Protocol.MAX_FRAME - 64) / Long.BYTES; /* QUERY_BOUNDS, as the C client */
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
     private final SocketChannel ch;
@@ -179,7 +187,7 @@ public final class TsdbClient implements AutoCloseable {
     /**
      * Exchanges protocol versions with the server.
      *
-     * @return the server's protocol version (3 for the server this client is written for)
+     * @return the server's protocol version (4 for the server this client is written for)
      * @throws TsdbException on a connection failure
      */
     public int hello() throws TsdbException {
@@ -668,7 +676,7 @@ public final class TsdbClient implements AutoCloseable {
      *     {@link Status#ERR_TOO_MANY_BUCKETS} if the range holds too many, and so on
      */
     public List<Bucket> queryAgg(int series, long start, long end, long intervalMs) throws TsdbException {
-        return buckets(series, start, end, intervalMs, null, Order.ASC, 0);
+        return buckets(series, start, end, intervalMs, null, "", Order.ASC, 0);
     }
 
     /**
@@ -686,7 +694,7 @@ public final class TsdbClient implements AutoCloseable {
      */
     public List<Bucket> queryAgg(int series, long start, long end, long intervalMs, Order order, long limit)
             throws TsdbException {
-        return buckets(series, start, end, intervalMs, null, order, limit);
+        return buckets(series, start, end, intervalMs, null, "", order, limit);
     }
 
     /**
@@ -697,7 +705,8 @@ public final class TsdbClient implements AutoCloseable {
      * @param end the first timestamp excluded
      * @param group the calendar grouping, or {@code null} for one bucket over the whole range
      * @return the buckets with rows
-     * @throws TsdbException with {@link Status#ERR_INVALID} for an unknown time zone, and so on
+     * @throws TsdbException with {@link Status#ERR_TOO_MANY_BUCKETS} if the range holds too many buckets, and so on
+     * @see #queryGroup(int, long, long, Group, Order, long)
      */
     public List<Bucket> queryGroup(int series, long start, long end, Group group) throws TsdbException {
         return queryGroup(series, start, end, group, Order.ASC, 0);
@@ -707,6 +716,11 @@ public final class TsdbClient implements AutoCloseable {
      * Aggregates a series over {@code [start, end)} in calendar buckets, in the given order, at most {@code limit}
      * of them. With {@link Order#DESC} and a limit, this is "the last N days" (or months, ...) that have data.
      *
+     * <p>The server groups in UTC only. For another time zone the client asks the series' first and last row in the
+     * range, computes the UTC instants at which the local periods between them begin ({@link Group#bounds}), and
+     * asks for buckets that begin there ({@link #queryBounds}): three requests instead of one. A server older than
+     * protocol version 4 still groups by the zone itself, given by its name.
+     *
      * @param series the series id
      * @param start the first timestamp included
      * @param end the first timestamp excluded
@@ -714,27 +728,117 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest bucket first
      * @param limit the most buckets to return; 0 for all
      * @return the buckets with rows
-     * @throws TsdbException with {@link Status#ERR_INVALID} for an unknown time zone, and so on
+     * @throws TsdbException with {@link Status#ERR_TOO_MANY_BUCKETS} if the range holds too many buckets, and so on
+     * @throws IllegalArgumentException for a negative limit
      */
     public List<Bucket> queryGroup(int series, long start, long end, Group group, Order order, long limit)
             throws TsdbException {
-        return buckets(series, start, end, 0, group, order, limit);
-    }
-
-    /** QUERY_BUCKETS: fixed intervals (group null) or calendar groups, with f64 min/max and exact integers. */
-    private List<Bucket> buckets(int series, long start, long end, long interval, Group group, Order order,
-                                 long limit) throws TsdbException {
         Objects.requireNonNull(order, "order");
         if (limit < 0)
             throw new IllegalArgumentException("negative limit");
-        byte[] zone = group != null && group.timezone() != null ? utf8(group.timezone(), "timezone") : new byte[0];
         request();
-        begin(Protocol.OP_QUERY_BUCKETS, 44 + zone.length);
+        if (group == null || group.utc())
+            return buckets(series, start, end, 0, group, "", order, limit);
+        if (serverVersion() < 4) /* an older server still takes the zone itself */
+            return buckets(series, start, end, 0, group, group.zone().normalized().getId(), order, limit);
+        /* local periods become UTC bounds here; an open range is cut to the rows there are */
+        long[] edge = new long[2];
+        boolean[] found = new boolean[2];
+        for (int i = 0; i < 2; i++) {
+            int j = i;
+            values(series, start, end, i == 0 ? Order.ASC : Order.DESC, 1, (b, type, n, valid) -> {
+                if (n > 0) {
+                    edge[j] = b.getLong(b.position());
+                    found[j] = true;
+                }
+                return true;
+            });
+        }
+        if (!found[0] || !found[1] || edge[0] > edge[1])
+            return Collections.emptyList();
+        /* the newest row may sit at Long.MAX_VALUE: then the range is beyond what bounds cover anyway */
+        long[] bounds = group.bounds(edge[0], edge[1] == Long.MAX_VALUE ? Long.MAX_VALUE : edge[1] + 1);
+        if (bounds.length > MAX_BOUNDS)
+            throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS, bounds.length + " bounds exceed one request", null);
+        return queryBounds(series, start, end, bounds, order, limit);
+    }
+
+    /**
+     * Aggregates a series over {@code [start, end)} in buckets that begin at the given UTC instants, oldest first:
+     * bucket {@code i} holds the rows in {@code [bounds[i], bounds[i + 1])}, the last one every row from
+     * {@code bounds[n - 1]} on. Rows before {@code bounds[0]} belong to no bucket. Only buckets with rows are
+     * returned, each with its bound as start. Needs a server of protocol version 4.
+     *
+     * <p>This is how calendar periods in a time zone reach the server: {@link Group#bounds} computes them.
+     *
+     * <pre>{@code
+     * long[] days = Group.of(Unit.DAY).in("America/St_Johns").bounds(start, end);
+     * List<Bucket> perDay = client.queryBounds(id, start, end, days);
+     * }</pre>
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param bounds the bucket starts in ms since the epoch, strictly increasing; at least one
+     * @return the buckets with rows
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not strictly increase, or the server is
+     *     older than version 4
+     * @throws IllegalArgumentException if there are no bounds, or more than one request can carry (about 33 million)
+     */
+    public List<Bucket> queryBounds(int series, long start, long end, long[] bounds) throws TsdbException {
+        return queryBounds(series, start, end, bounds, Order.ASC, 0);
+    }
+
+    /**
+     * Aggregates a series over {@code [start, end)} in buckets that begin at the given UTC instants, in the given
+     * order, at most {@code limit} of them.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param bounds the bucket starts in ms since the epoch, strictly increasing; at least one
+     * @param order oldest or newest bucket first
+     * @param limit the most buckets to return; 0 for all
+     * @return the buckets with rows
+     * @throws TsdbException as {@link #queryBounds(int, long, long, long[])}
+     * @throws IllegalArgumentException if there are no bounds or too many, or for a negative limit
+     */
+    public List<Bucket> queryBounds(int series, long start, long end, long[] bounds, Order order, long limit)
+            throws TsdbException {
+        Objects.requireNonNull(bounds, "bounds");
+        Objects.requireNonNull(order, "order");
+        if (limit < 0)
+            throw new IllegalArgumentException("negative limit");
+        if (bounds.length == 0 || bounds.length > MAX_BOUNDS)
+            throw new IllegalArgumentException(bounds.length + " bounds: 1 to " + MAX_BOUNDS + " fit in a request");
+        request();
+        begin(Protocol.OP_QUERY_BOUNDS, 33 + (long) bounds.length * Long.BYTES);
+        out.putInt(series).putLong(start).putLong(end);
+        out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit).putInt(bounds.length);
+        putLongs(bounds, 0, bounds.length);
+        send();
+        return bucketsReply("QUERY_BOUNDS");
+    }
+
+    /** QUERY_BUCKETS: fixed intervals (group null) or calendar groups, with f64 min/max and exact integers. */
+    private List<Bucket> buckets(int series, long start, long end, long interval, Group group, String zone,
+                                 Order order, long limit) throws TsdbException {
+        Objects.requireNonNull(order, "order");
+        if (limit < 0)
+            throw new IllegalArgumentException("negative limit");
+        byte[] z = utf8(zone, "timezone");
+        request();
+        begin(Protocol.OP_QUERY_BUCKETS, 44 + z.length);
         out.putInt(series).putLong(start).putLong(end).putLong(interval);
         out.put((byte) (group != null ? group.unit().code : 0)).putInt(group != null ? group.count() : 0);
         out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
-        out.putShort((short) zone.length).put(zone);
+        out.putShort((short) z.length).put(z);
         send();
+        return bucketsReply("QUERY_BUCKETS");
+    }
+
+    /** The reply of QUERY_BUCKETS or QUERY_BOUNDS: u32 n, n buckets of 64 bytes. */
+    private List<Bucket> bucketsReply(String what) throws TsdbException {
         int st = frame();
         if (st != 0) {
             endReply();
@@ -742,7 +846,7 @@ public final class TsdbClient implements AutoCloseable {
         }
         int n = bodyLen >= 4 ? in.getInt() : -1;
         if (n < 0 || bodyLen != 4 + (long) n * Protocol.BUCKET_ROW)
-            throw lost(Status.ERR_CORRUPT, "QUERY_BUCKETS reply of " + bodyLen + " bytes");
+            throw lost(Status.ERR_CORRUPT, what + " reply of " + bodyLen + " bytes");
         Bucket[] b = new Bucket[n];
         for (int i = 0; i < n; i++)
             b[i] = new Bucket(in.getLong(), in.getLong(), in.getDouble(), in.getDouble(), in.getDouble(),
@@ -1065,6 +1169,20 @@ public final class TsdbClient implements AutoCloseable {
     private boolean packing() throws TsdbException {
         if (zlevel == 0 || noZstd)
             return false;
+        if (serverVersion() < 3)
+            return false;
+        if (zstd == null && (zstd = Compressor.create()) == null) {
+            noZstd = true;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * The server's protocol version, asked once (HELLO). Outstanding acknowledgements are collected first; their
+     * errors stay for {@link #await()}.
+     */
+    private int serverVersion() throws TsdbException {
         if (serverVersion == 0) {
             while (pending > 0)
                 collectOne();
@@ -1076,13 +1194,7 @@ public final class TsdbClient implements AutoCloseable {
             endReply();
             serverVersion = v;
         }
-        if (serverVersion < 3)
-            return false;
-        if (zstd == null && (zstd = Compressor.create()) == null) {
-            noZstd = true;
-            return false;
-        }
-        return true;
+        return serverVersion;
     }
 
     /** One packed frame of rows {@code [off, off + m)}: reshape, compress, send. */
@@ -1345,7 +1457,8 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * Returns what the server did for this connection's previous query: {@code queryPoints}, {@code queryRaw},
-     * {@code queryValues}, {@code queryAgg} or {@code queryGroup}. Queries on other connections do not change it;
+     * {@code queryValues}, {@code queryAgg}, {@code queryGroup} or {@code queryBounds} (for a {@code queryGroup} in a
+     * time zone, its last request: the buckets). Queries on other connections do not change it;
      * before the first query every field is 0.
      *
      * @return the statistics of the previous query

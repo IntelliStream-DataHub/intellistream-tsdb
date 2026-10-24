@@ -17,7 +17,7 @@ import ai.intellistream.tsdb.example.Example;
 import ai.intellistream.tsdb.example.TypedExample;
 import org.junit.jupiter.api.Test;
 
-/** The README's quick start is the example class, and the example runs against a live server. */
+/** The README's quick start is the example class, and the examples run against a live server. */
 class ExampleTest {
     static final Path BASE = Paths.get(System.getProperty("basedir", "."));
 
@@ -35,9 +35,40 @@ class ExampleTest {
             blocks.add(quick.substring(open + "```java\n".length(), close + 1));
         }
         String dir = "src/main/java/ai/intellistream/tsdb/example/";
-        assertEquals(List.of(Files.readString(BASE.resolve(dir + "Example.java"), StandardCharsets.UTF_8),
-                Files.readString(BASE.resolve(dir + "TypedExample.java"), StandardCharsets.UTF_8)), blocks,
-                "README.md's quick start must hold Example.java and TypedExample.java, verbatim");
+        assertEquals(List.of(Files.readString(BASE.resolve(dir + "Example.java"), StandardCharsets.UTF_8)), blocks,
+                "README.md's quick start must hold Example.java, verbatim");
+    }
+
+    /**
+     * The README's other Java snippets compile: each becomes a method of one class, whose fields stand for the
+     * variables the snippets share ({@code client}, {@code flow}, ...).
+     */
+    @Test
+    void readmeSnippetsCompile() throws Exception {
+        String readme = Files.readString(BASE.resolve("README.md"), StandardCharsets.UTF_8);
+        int after = readme.indexOf("\n## ", readme.indexOf("\n## Quick start") + 1);
+        StringBuilder src = new StringBuilder("import ai.intellistream.tsdb.*;\nimport java.time.*;\n"
+                + "import java.util.*;\nclass ReadmeSnippets {\n    static TsdbClient client;\n"
+                + "    static int flow, energy;\n    static long t0;\n");
+        int n = 0;
+        for (int open = readme.indexOf("```java\n", after); open >= 0; open = readme.indexOf("```java\n", open + 1)) {
+            int close = readme.indexOf("\n```\n", open);
+            src.append("    static void snippet").append(n++).append("() throws Exception {\n")
+                    .append(readme, open + "```java\n".length(), close + 1).append("    }\n");
+        }
+        src.append("}\n");
+        assertTrue(n >= 8, n + " snippets");
+        Path dir = TsdbServer.scratch("tsdb-readme-");
+        try {
+            Files.writeString(dir.resolve("ReadmeSnippets.java"), src);
+            javax.tools.JavaCompiler javac = javax.tools.ToolProvider.getSystemJavaCompiler();
+            ByteArrayOutputStream err = new ByteArrayOutputStream();
+            int rc = javac.run(null, null, err, "-d", dir.toString(), "-cp", System.getProperty("java.class.path"),
+                    dir.resolve("ReadmeSnippets.java").toString());
+            assertEquals(0, rc, () -> err.toString(StandardCharsets.UTF_8) + "\n" + src);
+        } finally {
+            TsdbServer.delete(dir);
+        }
     }
 
     /** Runs an example's main against the server and returns what it printed. */

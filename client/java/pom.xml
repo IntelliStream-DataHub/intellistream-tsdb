@@ -77,6 +77,16 @@
         </configuration>
       </plugin>
       <plugin>
+        <!-- mvn javadoc:javadoc writes target/reports/apidocs; any doclint warning fails it -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.12.0</version>
+        <configuration>
+          <doclint>all</doclint>
+          <failOnWarnings>true</failOnWarnings>
+        </configuration>
+      </plugin>
+      <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-dependency-plugin</artifactId>
         <version>3.8.0</version>

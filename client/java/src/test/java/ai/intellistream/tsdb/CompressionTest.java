@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Function;
 
 import com.github.luben.zstd.Zstd;
 import org.junit.jupiter.api.AfterAll;
@@ -167,13 +168,22 @@ class CompressionTest {
         }
     }
 
-    /** Answers HELLO with {@code version} and everything else with status 0; records the frames. */
+    /**
+     * Answers HELLO with {@code version} and everything else with status 0 and the body {@code replies} gives for
+     * the request (none if it gives null); records the frames.
+     */
     static final class FakeServer implements AutoCloseable {
         final ServerSocketChannel listener;
         final List<Frame> frames = Collections.synchronizedList(new ArrayList<>());
         final Thread thread;
+        final Function<Frame, byte[]> replies;
 
         FakeServer(int version) throws IOException {
+            this(version, f -> null);
+        }
+
+        FakeServer(int version, Function<Frame, byte[]> replies) throws IOException {
+            this.replies = replies;
             listener = ServerSocketChannel.open().bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
             thread = new Thread(() -> serve(version), "fake-tsdbd");
             thread.setDaemon(true);
@@ -196,12 +206,15 @@ class CompressionTest {
                     if (!readFully(s, p))
                         return;
                     p.flip();
-                    frames.add(new Frame(op, p));
-                    boolean hello = op == Protocol.OP_HELLO;
-                    ByteBuffer r = ByteBuffer.allocate(hello ? 17 : 13).order(ByteOrder.LITTLE_ENDIAN);
-                    r.putInt(hello ? 13 : 9).putInt(id).put(Protocol.OP_REPLY).putInt(0);
-                    if (hello)
-                        r.putInt(version);
+                    Frame f = new Frame(op, p);
+                    frames.add(f);
+                    byte[] body = op == Protocol.OP_HELLO ? null : replies.apply(f);
+                    if (op == Protocol.OP_HELLO)
+                        body = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(version).array();
+                    else if (body == null)
+                        body = new byte[0];
+                    ByteBuffer r = ByteBuffer.allocate(13 + body.length).order(ByteOrder.LITTLE_ENDIAN);
+                    r.putInt(9 + body.length).putInt(id).put(Protocol.OP_REPLY).putInt(0).put(body);
                     r.flip();
                     while (r.hasRemaining())
                         s.write(r);

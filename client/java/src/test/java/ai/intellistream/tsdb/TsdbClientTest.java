@@ -306,9 +306,7 @@ class TsdbClientTest {
         c.insert(id, new long[] {T0}, new float[] {1});
         assertEquals(Status.ERR_INVALID,
                 assertThrows(TsdbException.class, () -> c.queryAgg(id, T0, T0 + 1, -5)).status());
-        assertEquals(Status.ERR_INVALID, assertThrows(TsdbException.class,
-                () -> c.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY).in("Not/A_Zone")))
-                .status());
+        assertThrows(IllegalArgumentException.class, () -> Group.of(Unit.DAY).in("Not/A_Zone"));
         TsdbException e = assertThrows(TsdbException.class, () -> c.seriesName(0x7ffffff0));
         assertEquals(Status.ERR_NOTFOUND, e.status());
         assertTrue(e.getMessage().contains("not found"), e.getMessage());
