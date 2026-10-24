@@ -142,11 +142,14 @@ existing last-write-wins order (a higher block is newer, memtables are newer
 than every part), so a delete needs no ordering of its own:
 
 - A delete runs like a large insert. It flushes the memtable first (rows
-  acknowledged before it get older block numbers), then, under `publish_lock`,
-  finds every listed part with rows of the series in the range, writes one
-  small tombstone-only part per such partition and commits them through
-  `parts_commit` (an intent file when there is more than one). It returns once
-  they are fsync'd and published. Anything published later (a flush, a large
+  acknowledged before it get older block numbers), then finds every listed
+  part with rows of the series in the range and writes one small
+  tombstone-only part per such partition, outside `publish_lock`, so writers
+  and flushes do not wait for those fsyncs. Under `publish_lock` it looks
+  again and writes one more for a partition that got rows of the series in
+  between (rare), then commits them all through `parts_commit` (an intent file
+  when there is more than one). It returns once they are fsync'd and
+  published. Anything published later (a flush, a large
   insert) has a higher block number and is newer than the delete; a partition
   that held no rows of the series in the range needs no tombstone.
 - A replace is the tombstone parts plus the new rows' parts in one
@@ -157,13 +160,21 @@ than every part), so a delete needs no ordering of its own:
   Replay skips a partition by its parts' `wal_seq`; a tombstone part carries
   none, and a merge output that ends up with no rows is still kept as an
   (empty) part, so that the `wal_seq` anchor of the rows it replaced survives
-  and a stale WAL segment cannot replay deleted rows back.
+  and a stale WAL segment cannot replay deleted rows back. Such an anchor is
+  needed only while a segment up to its `wal_seq` may come back at open (an
+  unlink not yet made durable): once every such segment is unlinked and the
+  directory synced, the merge thread retires a partition left with nothing but
+  anchors, so deleted or expired partitions do not stay behind for good.
 
 **On disk.** A part with tombstones has an optional trailer between the index
 and the footer: `n x {u32 series, u32 0, i64 start, i64 end}`, then `u32 n,
 u32 'TOMB'`; `index_hash` covers it. Parts without tombstones are byte for byte
 what they were, so `FORMAT_VERSION` stays; an older binary rejects a part with
-a trailer at open (its size does not match) and never misreads one. A part's
+a trailer at open (its size does not match) and never misreads one. **No
+downgrade while tombstone parts exist**: the older binary calls such a part
+broken and suggests renaming it to `.broken`, which would bring every deleted
+row back. Run `tsdb_optimize` before going back: a merge of a whole partition
+leaves no older part for tombstones to hide, so it drops them all. A part's
 `min_ts`/`max_ts` cover its tombstones, and a part may hold 0 granules.
 
 **Queries.** A snapshot that has no part with tombstones costs one test per

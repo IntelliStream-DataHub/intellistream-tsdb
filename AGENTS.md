@@ -96,7 +96,9 @@ cgroup, so `nice` does not keep your work out of its way.
   insert; a replace commits tombstones and rows in one `parts_commit`. A
   granule a tombstone touches is decoded, never answered from its statistics.
   A merge output with no rows is kept as an empty part: its `wal_seq` stops a
-  stale WAL segment from replaying deleted rows back.
+  stale WAL segment from replaying deleted rows back. It goes (with a partition
+  left with nothing else) only once every segment up to its `wal_seq` is
+  unlinked and the directory synced (`wal_removed_synced`).
 - **Retention** limits live in the append-only `RETENTION` file (beside
   `SERIES`). Retention "now" (`eng_now_ms`) never goes back; queries clamp to
   the cutoff, merges drop expired rows, the merge thread drops whole expired
