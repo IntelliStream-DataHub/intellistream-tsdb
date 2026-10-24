@@ -572,6 +572,19 @@ static void write_file(const char *dir, const char *name, const void *data, size
     close(fd);
 }
 
+static int meta_version(const char *dir)
+{
+    char path[700], buf[256] = "";
+    snprintf(path, sizeof path, "%s/META", dir);
+    FILE *f = fopen(path, "r");
+    size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+    if (f)
+        fclose(f);
+    buf[n] = '\0';
+    char *v = strstr(buf, "version=");
+    return v ? atoi(v + 8) : -1;
+}
+
 /* A part and a WAL segment in the version 1 formats (float32 values, 64-byte
  * index entries, 16-byte WAL rows), written by hand, are read, merged with
  * new data and survive a reopen. */
@@ -586,7 +599,7 @@ static void test_v1(const char *base)
     OK(tsdb_close(db));
 
     const int64_t t0 = 1700000000000, pms = 6 * 3600000;
-    enum { NP = 1000, G = 256, NW = 10 };
+    enum { NP = 1000, G = 256, NW = 10, WAL_SEQ = 99 };
     int64_t ts[NP];
     float v[NP];
     double want_sum = 0;
@@ -623,6 +636,10 @@ static void test_v1(const char *base)
     char name[96];
     snprintf(name, sizeof name, "p%" PRId64 "_1_1_0.part", floor_div(t0, pms));
     write_file(dir, name, buf, len);
+    /* Regression: a database made by version 1 (META says so) did not open */
+    char meta[128];
+    int ml = snprintf(meta, sizeof meta, "version=1\npartition_ms=%" PRId64 "\ngranule_rows=%d\n", pms, G);
+    write_file(dir, "META", meta, (size_t)ml);
     free(buf);
     free(blk);
     codec_free(c);
@@ -640,10 +657,34 @@ static void test_v1(const char *base)
         want_sum += x;
     }
     store32(wal + 4, (uint32_t)xxh64(wal + WAL_HDR, NW * 16, 0));
-    write_file(dir, "wal_0000000000000099.log", wal, sizeof wal);
+    char wname[64];
+    snprintf(wname, sizeof wname, "wal_%016x.log", WAL_SEQ); /* segment numbers are hex in names */
+    write_file(dir, wname, wal, sizeof wal);
 
     for (int round = 0; round < 3; round++) {
+        if (round == 0) { /* a reader opens it as it is, and changes nothing */
+            /* Regression: the MANIFEST a version 1 writer left (format 1)
+             * was taken for a torn one, and readers saw no data */
+            char man[512];
+            int mlen = snprintf(man, sizeof man,
+                                "tsdb-manifest 1\nversion 7\nseries 1\nwal_flushed %d\nwal_active %d\nparts 1\n%s\n",
+                                WAL_SEQ - 1, WAL_SEQ, name);
+            mlen += snprintf(man + mlen, sizeof man - (size_t)mlen, "checksum %016" PRIx64 "\n",
+                             xxh64(man, (size_t)mlen, 0));
+            write_file(dir, "MANIFEST", man, (size_t)mlen);
+            tsdb_options ro;
+            tsdb_options_init(&ro);
+            ro.read_only = 1;
+            OK(tsdb_open(dir, &ro, &db));
+            tsdb_points p;
+            OK(tsdb_query_points(db, 0, INT64_MIN, INT64_MAX, &p));
+            CHECK(p.n == NP + NW); /* the WAL rows too, replayed into memory */
+            tsdb_points_free(&p);
+            OK(tsdb_close(db));
+            CHECK(meta_version(dir) == 1);
+        }
         db = open_db(dir);
+        CHECK(meta_version(dir) == FORMAT_VERSION); /* a writer marks it, so version 1 refuses it */
         if (round == 1) {
             float x = 7;
             int64_t t = t0; /* overwrites the first row of the old part */

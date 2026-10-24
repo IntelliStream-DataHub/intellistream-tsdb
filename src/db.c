@@ -184,6 +184,23 @@ void db_release(part **parts, size_t n)
 
 /* ------------------------------------------------------------------ meta */
 
+/* Writes META for the current format, atomically. */
+static int meta_write(eng *db)
+{
+    char buf[256];
+    int len = snprintf(buf, sizeof buf, "version=%d\npartition_ms=%" PRId64 "\ngranule_rows=%u\n", FORMAT_VERSION,
+                       db->partition_ms, db->granule_rows);
+    int fd = openat(db->dirfd, META_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    bool ok = write(fd, buf, (size_t)len) == len && fsync(fd) == 0;
+    close(fd);
+    if (!ok || renameat(db->dirfd, META_FILE ".tmp", db->dirfd, META_FILE) != 0)
+        return TSDB_ERR_IO;
+    fsync(db->dirfd);
+    return 0;
+}
+
 static int meta_load_or_create(eng *db, bool read_only)
 {
     char buf[512];
@@ -204,11 +221,14 @@ static int meta_load_or_create(eng *db, bool read_only)
             pms = strtoll(line + 13, NULL, 10);
         if ((line = strstr(buf, "granule_rows=")))
             grows = (unsigned)strtoul(line + 13, NULL, 10);
-        if (version != FORMAT_VERSION || pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS)
+        if (version < 1 || version > FORMAT_VERSION || pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS)
             return TSDB_ERR_CORRUPT;
         db->partition_ms = pms;
         db->granule_rows = grows;
-        return 0;
+        /* A writer will add parts an older version cannot read (and would set
+         * aside as broken): the database is marked as the current version first,
+         * so older versions refuse to open it. Readers change nothing. */
+        return version < FORMAT_VERSION && !read_only ? meta_write(db) : 0;
     }
     if (errno != ENOENT || read_only)
         return TSDB_ERR_IO;
@@ -216,17 +236,7 @@ static int meta_load_or_create(eng *db, bool read_only)
     db->granule_rows = db->opt.granule_rows ? db->opt.granule_rows : 8192;
     if (db->granule_rows > MAX_GRANULE_ROWS)
         return TSDB_ERR_INVALID;
-    int len = snprintf(buf, sizeof buf, "version=%d\npartition_ms=%" PRId64 "\ngranule_rows=%u\n", FORMAT_VERSION,
-                       db->partition_ms, db->granule_rows);
-    fd = openat(db->dirfd, META_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0)
-        return TSDB_ERR_IO;
-    bool ok = write(fd, buf, (size_t)len) == len && fsync(fd) == 0;
-    close(fd);
-    if (!ok || renameat(db->dirfd, META_FILE ".tmp", db->dirfd, META_FILE) != 0)
-        return TSDB_ERR_IO;
-    fsync(db->dirfd);
-    return 0;
+    return meta_write(db);
 }
 
 /* Loads every part, removes leftovers of interrupted writes, and removes parts

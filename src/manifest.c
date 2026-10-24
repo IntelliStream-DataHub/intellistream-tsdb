@@ -192,7 +192,8 @@ static int manifest_read(eng *db, manifest *m)
         if (m->nparts < nparts)
             m->parts[m->nparts++] = line;
     }
-    if (fields != 6 || format != FORMAT_VERSION || m->nparts != nparts) {
+    /* version 1 manifests list version 1 parts, which are still read */
+    if (fields != 6 || format < 1 || format > FORMAT_VERSION || m->nparts != nparts) {
         manifest_free(m);
         return TSDB_ERR_CORRUPT;
     }
