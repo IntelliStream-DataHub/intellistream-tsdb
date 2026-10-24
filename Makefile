@@ -7,7 +7,10 @@ else
 ARCH    ?= -march=native
 endif
 CFLAGS  ?= -O3 -g
-override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno $(ARCH) -Iinclude -fPIC
+# -ffp-contract=off: GNU C modes let GCC fuse a*b+c into FMA where the target has it, so a
+# -march=native build and a portable one would round differently; codec choices (and the
+# bytes they write) must not depend on the CPU the code was built for.
+override CFLAGS += -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off $(ARCH) -Iinclude -fPIC
 LDLIBS  += -lzstd -lpthread -lm
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
