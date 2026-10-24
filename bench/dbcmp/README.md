@@ -426,6 +426,15 @@ results through its C API (it may serialise to Arrow or another format in memory
 vectors). `clickhouse local` is the other serverless form, but it is a separate process writing its output, so
 chDB is the fair embedded counterpart.
 
+## To add at the release run: compression per kind of sensor, one column per database
+
+The README's per-sensor table today compares compression methods (codec-bench). At the release run replace it
+with real on-disk sizes: load each sensor data set of tools/datasets.h (1 M readings each, plus random) on its
+own into every system (tsdb, ClickHouse, DuckDB, QuestDB native and Parquet, TimescaleDB, InfluxDB 2 and 3,
+Prometheus), let each settle (merges, compaction, compression jobs), and record the exact size on disk the same
+way as for the main table. One column per database: bytes per reading (and the ratio to 12 raw bytes). Sizes do
+not depend on machine load. Remove the containers and data afterwards.
+
 ## Fairness notes
 
 - **Durability at acknowledgement differs.** tsdb, PostgreSQL and both InfluxDBs flush to disk before

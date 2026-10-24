@@ -112,6 +112,9 @@ over TCP. Each is compared only with systems used the same way.
 - Every method here has zstd on top. ClickHouse adds zstd to Gorilla like this;
   InfluxDB, Prometheus and DuckDB do not, so their real sizes are larger than
   shown: the comparison favours them.
+- This table compares compression methods. The next full measurement replaces
+  it with each database's real size on disk per kind of sensor, one column per
+  database.
 - "-": ALP does not apply to that data (it is not in fixed decimal steps); DuckDB
   then uses another method.
 - The more regular the sensor, the bigger the gain: slow, rounded sensors
