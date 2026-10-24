@@ -146,6 +146,8 @@ one instance at a time; with `--retain-ordering` keep `--parallelism 1`.
 | `deadLetterTopic` | empty | where refused messages go (see above); empty: `record.fail()` |
 | `compressionLevel` | `1` | zstd level of inserts; `0` sends them uncompressed |
 | `seriesCacheSize` | `100000` | series names remembered per connection |
+| `seriesCacheBytes` | `67108864` | heap the remembered series and state names may take per connection (an estimate); the least recently used go first |
+| `stateCacheSize` | `4096` | state names remembered per state series; a forgotten one is asked from tsdbd again (same code) |
 | `closeTimeoutMs` | `30000` | how long stopping waits for batches in flight; what is not written by then stays unacknowledged |
 | `seriesField`, `timestampField`, `valueField`, `typeField`, `pointsField` | `series`, `ts`, `value`, `type`, `points` | field names |
 | `permanentCodes`, `retryableCodes` | empty | tsdb status codes to treat as permanent or retryable, overriding the defaults below |

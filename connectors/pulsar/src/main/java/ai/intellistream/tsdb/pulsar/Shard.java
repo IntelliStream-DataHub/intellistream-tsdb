@@ -70,7 +70,7 @@ final class Shard implements Runnable {
         this.metrics = metrics;
         this.settler = settler;
         this.log = log;
-        this.cache = new SeriesCache(c.seriesCacheSize);
+        this.cache = new SeriesCache(c.seriesCacheSize, c.seriesCacheBytes, c.stateCacheSize);
         this.backoff = new Backoff(c.retryInitialMs, c.retryMaxMs, c.retryJitter);
         this.defaultType = c.defaultValueType();
         this.thread = new Thread(this, "tsdb-sink-shard-" + index);
@@ -351,9 +351,7 @@ final class Shard implements Runnable {
             break;
         case STATE:
             if (v instanceof String) {
-                if (e.states == null)
-                    e.states = new HashMap<>();
-                Integer code = e.states.get(v);
+                Integer code = cache.state(e, (String) v);
                 if (code == null) {
                     try {
                         code = conn.state(e.id, (String) v);
@@ -363,7 +361,7 @@ final class Shard implements Runnable {
                                     Status.ERR_INVALID);
                         throw x;
                     }
-                    e.states.put((String) v, code);
+                    cache.putState(e, (String) v, code);
                 }
                 return code;
             }

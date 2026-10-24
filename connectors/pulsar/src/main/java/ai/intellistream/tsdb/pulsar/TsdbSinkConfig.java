@@ -111,6 +111,15 @@ public class TsdbSinkConfig {
     @FieldDoc(required = false, defaultValue = "100000", help = "series names cached per connection (LRU)")
     public int seriesCacheSize = 100_000;
 
+    /** Bound of the estimated heap of the cached series and state names, per connection. */
+    @FieldDoc(required = false, defaultValue = "67108864",
+            help = "bytes of series and state names cached per connection (estimated heap, LRU)")
+    public long seriesCacheBytes = 64L << 20;
+
+    /** Bound of the state names cached per state series. */
+    @FieldDoc(required = false, defaultValue = "4096", help = "state names cached per state series (LRU)")
+    public int stateCacheSize = 4096;
+
     /** How long close() waits for in-flight batches; what is not written by then stays unacknowledged. */
     @FieldDoc(required = false, defaultValue = "30000",
             help = "ms close() waits for in-flight batches; records not written by then are left unacknowledged")
@@ -179,6 +188,8 @@ public class TsdbSinkConfig {
         require(connectTimeoutMs >= 1, "connectTimeoutMs must be positive");
         require(requestTimeoutMs >= 0, "requestTimeoutMs must not be negative");
         require(seriesCacheSize >= 1, "seriesCacheSize must be positive");
+        require(seriesCacheBytes >= 1, "seriesCacheBytes must be positive");
+        require(stateCacheSize >= 1, "stateCacheSize must be positive");
         require(closeTimeoutMs >= 0, "closeTimeoutMs must not be negative");
         defaultValueType();
         codes(permanentCodes);
