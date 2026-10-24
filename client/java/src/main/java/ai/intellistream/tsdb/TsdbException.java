@@ -45,4 +45,14 @@ public class TsdbException extends IOException {
     public int status() {
         return status;
     }
+
+    /**
+     * Whether the connection failed because the server did not answer in time (see
+     * {@link TsdbClient#setRequestTimeout}). The client is closed then, like after any {@link Status#ERR_IO}.
+     *
+     * @return {@code true} if a wait for the server timed out
+     */
+    public boolean isTimeout() {
+        return getCause() instanceof java.net.SocketTimeoutException;
+    }
 }

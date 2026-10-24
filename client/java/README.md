@@ -109,6 +109,14 @@ try (TsdbClient client = TsdbClient.connect("127.0.0.1", 7070)) {
 One client is one network connection. Use it from one thread at a time. If several threads need the database,
 give each its own client.
 
+By default a request waits as long as the server takes, so a server that hangs (a stalled disk, a dead peer)
+hangs the calling thread. `TsdbClient.connect(host, port, Duration.ofSeconds(10), Duration.ofSeconds(30))` bounds
+the connect and every later wait for the server (the longest silence it puts up with, not a deadline for the whole
+call), and `setRequestTimeout` changes it on a live client. A call that
+times out throws `TsdbException` with `Status.ERR_IO` (`isTimeout()` is true) and closes the client, so make a new
+one. TCP keepalive is on: after 30 seconds of silence the client probes every 10 seconds and drops the connection
+after 3 unanswered probes (`setKeepAlive` changes or turns it off).
+
 ## Create a series
 
 A series has a name and a value type. `series` gets a series of 32-bit floats, and creates it if it is missing.

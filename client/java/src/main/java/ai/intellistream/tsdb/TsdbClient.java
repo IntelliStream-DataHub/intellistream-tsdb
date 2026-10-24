@@ -3,10 +3,13 @@ package ai.intellistream.tsdb;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.net.StandardSocketOptions;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -15,6 +18,8 @@ import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+
+import jdk.net.ExtendedSocketOptions;
 
 /**
  * A connection to {@code tsdbd}.
@@ -78,8 +83,15 @@ public final class TsdbClient implements AutoCloseable {
     private static final int MAX_STRING = 0xffff;         /* u16 length prefix */
     private static final int MAX_BOUNDS = (Protocol.MAX_FRAME - 64) / Long.BYTES; /* QUERY_BOUNDS, as the C client */
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
+    /** TCP keepalive of a new connection: first probe after 30 s of silence, then every 10 s, 3 probes. */
+    private static final Duration KEEPALIVE_IDLE = Duration.ofSeconds(30);
+    private static final Duration KEEPALIVE_INTERVAL = Duration.ofSeconds(10);
+    private static final int KEEPALIVE_COUNT = 3;
 
     private final SocketChannel ch;
+    private final Selector selector;             /* waits for the socket with a timeout; the channel is non-blocking */
+    private final SelectionKey key;
+    private long timeoutNanos;                   /* of each wait for the server; 0: forever */
     private final ByteBuffer out = direct(BUF);  /* write mode; empty between requests */
     private ByteBuffer in = direct(BUF).flip();  /* read mode: [position, limit) is received, unread data */
     private int bodyLen, bodyEnd;                /* of the reply frame being read */
@@ -99,8 +111,43 @@ public final class TsdbClient implements AutoCloseable {
     private byte[] raw = new byte[0];            /* the reshaped body of a packed frame */
     private long bytesSent;
 
-    private TsdbClient(SocketChannel ch) {
+    private TsdbClient(SocketChannel ch, Duration requestTimeout) throws IOException {
         this.ch = ch;
+        this.selector = Selector.open();
+        try {
+            ch.configureBlocking(false);
+            this.key = ch.register(selector, 0);
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(ch);
+            closeQuietly(selector);
+            throw e;
+        }
+        this.timeoutNanos = nanos(requestTimeout);
+    }
+
+    /** A connect timeout in whole milliseconds, at least 1 when positive (0 would mean "the operating system's"). */
+    private static int millis(Duration d) {
+        Objects.requireNonNull(d, "connectTimeout");
+        if (d.isNegative())
+            throw new IllegalArgumentException("negative timeout " + d);
+        if (d.isZero())
+            return 0;
+        try {
+            return (int) Math.max(1, Math.min(Integer.MAX_VALUE, (d.toNanos() + 999_999) / 1_000_000));
+        } catch (ArithmeticException e) {
+            return Integer.MAX_VALUE;
+        }
+    }
+
+    private static long nanos(Duration d) {
+        Objects.requireNonNull(d, "timeout");
+        if (d.isNegative())
+            throw new IllegalArgumentException("negative timeout " + d);
+        try {
+            return d.toNanos();
+        } catch (ArithmeticException e) {
+            return Long.MAX_VALUE / 2; /* centuries: effectively forever, without overflowing the deadline */
+        }
     }
 
     /**
@@ -116,7 +163,8 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * Connects to a server, trying every address of {@code host}.
+     * Connects to a server, trying every address of {@code host}. Requests wait for the server as long as it takes;
+     * see {@link #connect(String, int, Duration, Duration)} to bound them.
      *
      * @param host a host name or address
      * @param port the server's port
@@ -125,8 +173,37 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_IO} if no address accepts the connection
      */
     public static TsdbClient connect(String host, int port, Duration timeout) throws TsdbException {
+        return connect(host, port, timeout, Duration.ZERO);
+    }
+
+    /**
+     * Connects to a server, trying every address of {@code host}, and bounds every later wait for the server.
+     *
+     * <p>A server that stalls (a hung disk, a dead peer that never sent a reset) would otherwise block the caller
+     * for good. With a request timeout, any wait of {@code requestTimeout} on the socket, sending or receiving,
+     * fails the call with a {@link TsdbException} of {@link Status#ERR_IO} ({@link TsdbException#isTimeout()} is
+     * {@code true}) and closes the connection: the reply may still arrive, so the stream cannot be trusted any more.
+     * Later calls fail with {@link Status#ERR_IO} at once; connect again. The bound applies to each wait, not to a
+     * whole call: a large reply that keeps arriving is not cut off.
+     *
+     * <p>TCP keepalive is on for the connection (first probe after 30 s of silence, then every 10 s, dropped after
+     * 3 unanswered probes, where the platform allows); see {@link #setKeepAlive(Duration, Duration, int)}.
+     *
+     * @param host a host name or address
+     * @param port the server's port
+     * @param connectTimeout how long to wait for each address, rounded up to whole milliseconds; zero waits as long as
+     *        the operating system does
+     * @param requestTimeout how long any one wait for the server may take; zero, the default of the other
+     *        {@code connect} methods, waits forever
+     * @return the connected client
+     * @throws TsdbException with {@link Status#ERR_IO} if no address accepts the connection
+     * @throws IllegalArgumentException if a timeout is negative
+     */
+    public static TsdbClient connect(String host, int port, Duration connectTimeout, Duration requestTimeout)
+            throws TsdbException {
         Objects.requireNonNull(host, "host");
-        int ms = (int) Math.min(Integer.MAX_VALUE, Math.max(0, timeout.toMillis()));
+        nanos(requestTimeout);
+        int ms = millis(connectTimeout);
         InetAddress[] addrs;
         try {
             addrs = InetAddress.getAllByName(host);
@@ -140,13 +217,99 @@ public final class TsdbClient implements AutoCloseable {
                 ch = SocketChannel.open();
                 ch.setOption(StandardSocketOptions.TCP_NODELAY, true);
                 ch.socket().connect(new InetSocketAddress(a, port), ms);
-                return new TsdbClient(ch);
-            } catch (IOException e) {
-                last = e;
+                /* before the client exists: its selector is opened last, and only a built client owns it */
+                setKeepAlive(ch, KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_COUNT);
+                return new TsdbClient(ch, requestTimeout);
+            } catch (IOException | RuntimeException e) {
                 closeQuietly(ch);
+                if (e instanceof RuntimeException re)
+                    throw re;
+                last = (IOException) e;
             }
         }
         throw new TsdbException(Status.ERR_IO, "cannot connect to " + host + ":" + port, last);
+    }
+
+    /**
+     * Changes how long any one wait for the server may take; see {@link #connect(String, int, Duration, Duration)}.
+     * Takes effect for the next wait. Like the rest of the client it is not thread safe.
+     *
+     * @param timeout the bound; zero waits forever
+     * @throws IllegalArgumentException if {@code timeout} is negative
+     */
+    public void setRequestTimeout(Duration timeout) {
+        timeoutNanos = nanos(timeout);
+    }
+
+    /**
+     * The bound on each wait for the server.
+     *
+     * @return the request timeout; zero waits forever (the default)
+     */
+    public Duration requestTimeout() {
+        return Duration.ofNanos(timeoutNanos);
+    }
+
+    /**
+     * Sets the TCP keepalive probes of the connection, which notice a peer that vanished without a reset (power
+     * loss, a cut cable, a NAT that forgot the connection) while the connection is idle. They do not bound a
+     * request: {@link #setRequestTimeout} does. New connections use 30 s, 10 s and 3 probes.
+     *
+     * <p>Whether the idle time, interval and count can be set depends on the platform (Linux, macOS and recent
+     * Windows can); where one cannot, the system default stays.
+     *
+     * @param idle silence before the first probe, rounded up to whole seconds
+     * @param interval time between probes, rounded up to whole seconds
+     * @param count unanswered probes before the connection is dropped
+     * @throws IOException if the socket refuses keepalive altogether
+     */
+    public void setKeepAlive(Duration idle, Duration interval, int count) throws IOException {
+        setKeepAlive(ch, idle, interval, count);
+    }
+
+    private static void setKeepAlive(SocketChannel ch, Duration idle, Duration interval, int count)
+            throws IOException {
+        ch.setOption(StandardSocketOptions.SO_KEEPALIVE, true);
+        try {
+            setExtended(ch, ExtendedSocketOptions.TCP_KEEPIDLE, seconds(idle));
+            setExtended(ch, ExtendedSocketOptions.TCP_KEEPINTERVAL, seconds(interval));
+            setExtended(ch, ExtendedSocketOptions.TCP_KEEPCOUNT, Math.max(1, count));
+        } catch (LinkageError e) {
+            /* a runtime image without the jdk.net module: the system defaults stay */
+        }
+    }
+
+    /**
+     * Turns TCP keepalive off, or back on with the settings of a new connection.
+     *
+     * @param on whether the connection sends keepalive probes
+     * @throws IOException if the socket refuses the option
+     */
+    public void setKeepAlive(boolean on) throws IOException {
+        if (on)
+            setKeepAlive(KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_COUNT);
+        else
+            ch.setOption(StandardSocketOptions.SO_KEEPALIVE, false);
+    }
+
+    /** A socket option of the connection, or {@code null} where the platform has none (for the tests). */
+    <T> T socketOption(java.net.SocketOption<T> opt) throws IOException {
+        return ch.supportedOptions().contains(opt) ? ch.getOption(opt) : null;
+    }
+
+    private static int seconds(Duration d) {
+        long s = d.getSeconds() + (d.getNano() > 0 ? 1 : 0);
+        return (int) Math.max(1, Math.min(Integer.MAX_VALUE, s));
+    }
+
+    /** A refinement of keepalive: a platform without the option keeps its default rather than failing the connect. */
+    private static void setExtended(SocketChannel ch, java.net.SocketOption<Integer> opt, int value) {
+        try {
+            if (ch.supportedOptions().contains(opt))
+                ch.setOption(opt, value);
+        } catch (IOException | UnsupportedOperationException | IllegalArgumentException e) {
+            /* keeps the system default */
+        }
     }
 
     /**
@@ -169,6 +332,7 @@ public final class TsdbClient implements AutoCloseable {
         }
         closed = true;
         closeQuietly(ch);
+        closeQuietly(selector);
         if (zstd != null)
             zstd.close();
         if (err != null)
@@ -1500,7 +1664,7 @@ public final class TsdbClient implements AutoCloseable {
             throw new TsdbException(status);
     }
 
-    private static void closeQuietly(SocketChannel ch) {
+    private static void closeQuietly(java.io.Closeable ch) {
         if (ch != null) {
             try {
                 ch.close();
@@ -1530,6 +1694,7 @@ public final class TsdbClient implements AutoCloseable {
     private TsdbException lost(int status, String detail, Throwable cause) {
         broken = true;
         closeQuietly(ch);
+        closeQuietly(selector);
         return new TsdbException(status, detail, cause);
     }
 
@@ -1540,14 +1705,48 @@ public final class TsdbClient implements AutoCloseable {
         out.putInt((int) (5 + payload)).putInt(nextId++).put(op);
     }
 
+    /**
+     * Waits until the (non-blocking) socket is ready for {@code op}, for at most the request timeout.
+     *
+     * @throws SocketTimeoutException if it is not
+     */
+    private void awaitSocket(int op) throws IOException {
+        long deadline = timeoutNanos > 0 ? System.nanoTime() + timeoutNanos : 0;
+        key.interestOps(op);
+        while (true) {
+            long left = Long.MAX_VALUE;
+            int n;
+            if (timeoutNanos > 0) {
+                left = deadline - System.nanoTime();
+                if (left <= 0)
+                    throw new SocketTimeoutException("no progress for " + Duration.ofNanos(timeoutNanos));
+                /* rounded up: select(ms) with 0 would wait forever */
+                n = selector.select(Math.max(1, (left + 999_999) / 1_000_000));
+            } else {
+                n = selector.select();
+            }
+            if (n > 0) {
+                selector.selectedKeys().clear();
+                return;
+            }
+            if (Thread.currentThread().isInterrupted())
+                throw new java.nio.channels.ClosedByInterruptException();
+        }
+    }
+
     /** Writes the send buffer out, completely. */
     private void send() throws TsdbException {
         out.flip();
         try {
-            while (out.hasRemaining())
-                bytesSent += ch.write(out);
+            while (out.hasRemaining()) {
+                int w = ch.write(out);
+                bytesSent += w;
+                if (w == 0)
+                    awaitSocket(SelectionKey.OP_WRITE);
+            }
         } catch (IOException e) {
-            throw lost(Status.ERR_IO, "send failed", e);
+            throw lost(Status.ERR_IO, e instanceof SocketTimeoutException ? "timed out sending to the server"
+                    : "send failed", e);
         } finally {
             out.clear();
         }
@@ -1634,8 +1833,11 @@ public final class TsdbClient implements AutoCloseable {
             int r;
             try {
                 r = ch.read(in);
+                if (r == 0)
+                    awaitSocket(SelectionKey.OP_READ);
             } catch (IOException e) {
-                throw lost(Status.ERR_IO, "receive failed", e);
+                throw lost(Status.ERR_IO, e instanceof SocketTimeoutException ? "timed out waiting for the server"
+                        : "receive failed", e);
             }
             if (r < 0)
                 throw lost(Status.ERR_IO, "connection closed by the server");
