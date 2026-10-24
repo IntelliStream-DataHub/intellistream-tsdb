@@ -4,6 +4,7 @@
 #include "tsdb_client.h"
 #include "tsdb_pack.h"
 #include "tsdb_protocol.h"
+#include "samekeys.h"
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -39,14 +40,20 @@ static int failures;
 static int port;
 static const int64_t T0 = 1699999980000; /* on a minute boundary: buckets below are whole */
 
-static pid_t start_server(const char *dir)
+/* extra: more arguments, NULL-terminated, or NULL */
+static pid_t start_server_with(const char *dir, const char *const *extra)
 {
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     pid_t pid = fork();
     if (pid == 0) {
         const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd"; /* e.g. a sanitizer build */
-        execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--no-fsync", "--workers", "4", (char *)NULL);
+        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", portstr, "--no-fsync", "--workers", "4"};
+        int n = 8;
+        for (int i = 0; extra && extra[i] && n < 31; i++)
+            argv[n++] = extra[i];
+        argv[n] = NULL;
+        execv(bin, (char *const *)argv);
         _exit(127);
     }
     for (int i = 0; i < 100; i++) { /* wait until it accepts */
@@ -60,6 +67,8 @@ static pid_t start_server(const char *dir)
     fprintf(stderr, "tsdbd did not start\n");
     exit(1);
 }
+
+static pid_t start_server(const char *dir) { return start_server_with(dir, NULL); }
 
 /* kill() with pid 0 or -1 signals the process group, or every process of the user. */
 static void signal_pid(pid_t pid, int sig)
@@ -629,6 +638,262 @@ static void test_packed_inserts(tsdbc *c)
     test_hello_keeps_errors(a);
 }
 
+/* ------------------------------------------ concurrent writes to the same keys */
+
+/* Several connections write the same series and timestamps at once
+ * (samekeys.h has the model and the checks): small and large inserts, typed
+ * with nulls, waiting for each or pipelined, packed or plain, while other
+ * connections flush, optimize and query. Pipelined inserts of one connection
+ * are applied in order, so a writer's last round still wins over its others. */
+typedef struct skn {
+    const sk_cfg *c;
+    uint32_t ids[SK_MAX_SERIES];
+    atomic_int started[SK_MAX_WRITERS]; /* rounds sent */
+    atomic_int acked[SK_MAX_WRITERS];   /* rounds acknowledged */
+    int last_kind[SK_MAX_WRITERS];
+    atomic_int writing, errors;
+    atomic_long snapshots, torn_across, aggs, pipelined, packed;
+} skn;
+
+typedef struct sknt {
+    skn *x;
+    int i;
+} sknt;
+
+static tsdbc *sk_connect(void)
+{
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    return c;
+}
+
+static void *skn_writer(void *a)
+{
+    sknt *t = a;
+    skn *x = t->x;
+    const sk_cfg *c = x->c;
+    tsdbc *cn = sk_connect();
+    int w = t->i;
+    for (int r = 0; r < c->rounds; r++) {
+        uint64_t seed = sk_mix(((uint64_t)w << 32) ^ (uint64_t)r ^ 0xc11e47ull);
+        int kind = sk_pick(c, seed >> 40);
+        bool async = (seed >> 8) % 2, packed = (seed >> 9) % 2, plain = c->type == TSDB_FLOAT32 && !c->nulls;
+        OK(tsdbc_set_compression(cn, packed ? 1 : 0));
+        atomic_store(&x->started[w], r + 1);
+        for (uint32_t s = 0; s < (kind == SK_SERIES ? c->nseries : 1); s++) {
+            sk_batch b;
+            bool large = kind == SK_LARGE || (kind == SK_SERIES && (seed >> 24) % 2);
+            sk_build(c, x->ids, w, r, large, (int)(seed % 3), seed, kind == SK_SERIES ? s : UINT32_MAX, &b);
+            tsdb_values col = {(tsdb_type)c->type, b.v, c->nulls ? b.valid : NULL};
+            const float *f = (const float *)(void *)b.v;
+            if (kind == SK_SERIES)
+                OK(async ? tsdbc_insert_series_values_async(cn, b.series[0], b.ts, &col, b.n)
+                         : tsdbc_insert_series_values(cn, b.series[0], b.ts, &col, b.n));
+            else if (plain)
+                OK(async ? tsdbc_insert_async(cn, b.series, b.ts, f, b.n) : tsdbc_insert(cn, b.series, b.ts, f, b.n));
+            else
+                OK(async ? tsdbc_insert_values_async(cn, b.series, b.ts, &col, b.n)
+                         : tsdbc_insert_values(cn, b.series, b.ts, &col, b.n));
+            sk_batch_free(&b);
+        }
+        atomic_fetch_add(&x->pipelined, async);
+        atomic_fetch_add(&x->packed, packed);
+        if (async && (seed >> 10) % 4 == 0) /* else several stay in flight */
+            OK(tsdbc_wait(cn));
+        if (!async || (seed >> 10) % 4 == 0)
+            atomic_store(&x->acked[w], r + 1); /* a wait collects every earlier one too */
+        x->last_kind[w] = kind;
+    }
+    OK(tsdbc_wait(cn));
+    atomic_store(&x->acked[w], c->rounds);
+    tsdbc_close(cn);
+    atomic_fetch_sub(&x->writing, 1);
+    return NULL;
+}
+
+static void *skn_reader(void *a)
+{
+    sknt *t = a;
+    skn *x = t->x;
+    const sk_cfg *c = x->c;
+    tsdbc *cn = sk_connect();
+    uint32_t span = sk_span(c);
+    sk_seen seen;
+    sk_seen_init(&seen, c);
+    sk_val *row = malloc(span * sizeof *row);
+    int started[SK_MAX_WRITERS], acked[SK_MAX_WRITERS];
+    bool batches = !(c->kinds & SK_APPEND);
+    for (uint64_t it = 0; atomic_load(&x->writing) > 0; it++) {
+        int64_t prev = -1;
+        for (uint32_t s = 0; s < c->nseries; s++) {
+            for (int w = 0; w < c->writers; w++)
+                acked[w] = atomic_load(&x->acked[w]);
+            sk_collect k;
+            sk_collect_begin(&k, c, row, false);
+            OK(tsdbc_query_values(cn, x->ids[s], c->t0, sk_end(c), NULL, sk_collect_cb, &k));
+            for (int w = 0; w < c->writers; w++)
+                started[w] = atomic_load(&x->started[w]);
+            int64_t id;
+            int e = k.errors + sk_check_snapshot(c, s, row, acked, started, &seen, &id);
+            if (s > 0 && id >= 0 && prev >= 0 && id != prev)
+                atomic_fetch_add(&x->torn_across, 1);
+            prev = id;
+            atomic_fetch_add(&x->snapshots, 1);
+            if (batches && c->shift == 0 && (it + s) % 3 == (uint64_t)t->i % 3) {
+                tsdb_bucket *b;
+                size_t nb;
+                OK(tsdbc_query_agg(cn, x->ids[s], c->t0, sk_end(c), 0, &b, &nb));
+                for (int w = 0; w < c->writers; w++)
+                    started[w] = atomic_load(&x->started[w]);
+                e += sk_check_agg(c, s, b, nb, started);
+                free(b);
+                atomic_fetch_add(&x->aggs, 1);
+            }
+            if (e)
+                atomic_fetch_add(&x->errors, e);
+        }
+    }
+    free(row);
+    sk_seen_free(&seen);
+    tsdbc_close(cn);
+    return NULL;
+}
+
+static void *skn_maintenance(void *a)
+{
+    skn *x = ((sknt *)a)->x;
+    tsdbc *cn = sk_connect();
+    for (int i = 0; atomic_load(&x->writing) > 0; i++) {
+        usleep(10000);
+        OK(i % 10 == 9 ? tsdbc_optimize(cn) : tsdbc_flush(cn));
+    }
+    tsdbc_close(cn);
+    return NULL;
+}
+
+static void skn_read_all(const sk_cfg *c, const uint32_t *ids, sk_val *st)
+{
+    tsdbc *cn = sk_connect();
+    for (uint32_t s = 0; s < c->nseries; s++) {
+        sk_collect k;
+        sk_collect_begin(&k, c, st + (size_t)s * sk_span(c), false);
+        OK(tsdbc_query_values(cn, ids[s], c->t0, sk_end(c), NULL, sk_collect_cb, &k));
+        CHECK(k.errors == 0);
+    }
+    tsdbc_close(cn);
+}
+
+static void skn_same(const sk_cfg *c, const uint32_t *ids, const sk_val *want, const char *after)
+{
+    size_t nk = sk_nkeys(c);
+    sk_val *st = calloc(nk, sizeof *st);
+    skn_read_all(c, ids, st);
+    bool same = true;
+    for (size_t i = 0; i < nk; i++)
+        same &= st[i].st == want[i].st && st[i].code == want[i].code;
+    if (!same)
+        fprintf(stderr, "  %s: the state changed after %s\n", c->name, after);
+    CHECK(same);
+    free(st);
+}
+
+/* One run: writers, readers, maintenance; the final state is checked and left in st. */
+static void skn_run(skn *x, int k, sk_val *st)
+{
+    const sk_cfg *c = x->c;
+    tsdbc *cn = sk_connect();
+    for (uint32_t s = 0; s < c->nseries; s++) {
+        char name[64];
+        snprintf(name, sizeof name, "same%d.%u", k, s);
+        OK(tsdbc_series_create(cn, name, (tsdb_type)c->type, NULL, &x->ids[s]));
+    }
+    tsdbc_close(cn);
+    enum { READERS = 3 };
+    pthread_t th[SK_MAX_WRITERS + READERS + 1];
+    sknt args[SK_MAX_WRITERS + READERS + 1];
+    int n = 0;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    atomic_store(&x->writing, c->writers);
+    for (int w = 0; w < c->writers; w++, n++) {
+        args[n] = (sknt){x, w};
+        pthread_create(&th[n], NULL, skn_writer, &args[n]);
+    }
+    for (int i = 0; i < READERS; i++, n++) {
+        args[n] = (sknt){x, i};
+        pthread_create(&th[n], NULL, skn_reader, &args[n]);
+    }
+    args[n] = (sknt){x, 0};
+    pthread_create(&th[n], NULL, skn_maintenance, &args[n]);
+    n++;
+    for (int i = 0; i < n; i++)
+        pthread_join(th[i], NULL);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    CHECK(atomic_load(&x->errors) == 0);
+    skn_read_all(c, x->ids, st);
+    CHECK(sk_check_final(c, st, x->last_kind) == 0);
+    printf("  %-28s %d connections x %d rounds (%ld pipelined, %ld packed), %u keys: %ld snapshots (%ld aggregates), "
+           "%ld torn across series, %.2f s\n",
+           c->name, c->writers, c->rounds, (long)x->pipelined, (long)x->packed, sk_nkeys(c), (long)x->snapshots,
+           (long)x->aggs, (long)x->torn_across,
+           (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9);
+}
+
+static void test_same_keys(const char *dir)
+{
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    /* a write of every key once goes WAL + memtable, twice (240 rows) a part per partition */
+    static const char *const args[] = {"--wal-max-batch-rows", "360", "--partition-ms", "3600000", "--workers", "8",
+                                       NULL};
+    pid_t srv = start_server_with(dir, args);
+    const int64_t t0 = T0 + 1234;
+    const unsigned batches = SK_SMALL | SK_LARGE;
+    enum { NC = 5 };
+    static sk_cfg c[NC];
+    c[0] = (sk_cfg){"float32, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_FLOAT32, false, batches};
+    c[1] = (sk_cfg){"int64 + nulls, same keys", 6, 1000, 3, 80, 0, t0, 97000, TSDB_INT64, true, batches};
+    c[2] = (sk_cfg){"float32, shifted keys", 6, 1000, 3, 80, 20, t0, 97000, TSDB_FLOAT32, false, batches};
+    c[3] = (sk_cfg){"float64 + nulls, per series", 6, 600, 3, 80, 37, t0, 97000, TSDB_FLOAT64, true,
+                    batches | SK_SERIES};
+    c[4] = (sk_cfg){"float32, then SIGKILL", 5, 600, 3, 80, 10, t0, 97000, TSDB_FLOAT32, false, batches};
+    skn *x = calloc(NC, sizeof *x);
+    sk_val *st[NC];
+    for (int k = 0; k < NC; k++) {
+        x[k].c = &c[k];
+        st[k] = calloc(sk_nkeys(&c[k]), sizeof *st[k]);
+        skn_run(&x[k], k, st[k]);
+        if (k == NC - 1)
+            break; /* the last one stays in the WAL for the crash below */
+        tsdbc *cn = sk_connect();
+        OK(tsdbc_flush(cn));
+        skn_same(&c[k], x[k].ids, st[k], "a flush");
+        OK(tsdbc_optimize(cn));
+        skn_same(&c[k], x[k].ids, st[k], "an optimize");
+        tsdbc_close(cn);
+    }
+    /* a crash: the memtable comes back from the WAL, next to the parts written meanwhile */
+    signal_pid(srv, SIGKILL);
+    int status;
+    waitpid(srv, &status, 0);
+    srv = start_server_with(dir, args);
+    for (int k = 0; k < NC; k++)
+        skn_same(&c[k], x[k].ids, st[k], "SIGKILL and a restart");
+    tsdbc *cn = sk_connect();
+    OK(tsdbc_optimize(cn));
+    tsdbc_close(cn);
+    stop_server(srv);
+    srv = start_server_with(dir, args);
+    for (int k = 0; k < NC; k++)
+        skn_same(&c[k], x[k].ids, st[k], "an optimize, SIGTERM and a restart");
+    stop_server(srv);
+    for (int k = 0; k < NC; k++)
+        free(st[k]);
+    free(x);
+    CHECK(system(cmd) == 0);
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -816,6 +1081,10 @@ int main(int argc, char **argv)
         return 1;
     free(ts);
     free(v);
+
+    printf("concurrent writes to the same keys\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-samekeys-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_same_keys(dir);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

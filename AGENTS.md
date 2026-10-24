@@ -9,6 +9,7 @@ C (MergeTree-style storage), the `tsdbd` server and its client.
 make                      # library, CLI, server, client, benchmarks (into build/)
 make test                 # all unit, integration and server tests
 make asan                 # the tests under AddressSanitizer + UBSan
+make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
 make jepsen               # fault injection: kill -9, simulated power loss, pauses
 make PORTABLE=1           # without -march=native
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
@@ -21,8 +22,8 @@ Tests take a scratch directory as their first argument
 Run the tests that cover what you changed, and the sanitizers for anything
 concurrent or touching memory layout. A change to how data reaches the disk
 (writes, fsync, renames, recovery, merges, the WAL) also needs `make jepsen`.
-ThreadSanitizer is not wired into make; build it the way `make asan` does,
-with `-fsanitize=thread`. `make asan` starts with `make clean`: while anything
+`make tsan` builds into `build-tsan/`, the server under test included, and
+leaves `build/` alone. `make asan` starts with `make clean`: while anything
 else uses `build/` (a running tsdbd, client tests, another agent), run it in a
 copy of the tree instead. Stop only the tsdbd processes you started (by pid),
 never all of them (and no `pkill -f`: it matches your own shell). In test code,

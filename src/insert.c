@@ -488,6 +488,13 @@ int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const in
         return insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, collect);
     part_list mine = {0};
     int rc = insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, &mine);
+    /* their partitions, for the wait below, are read now: once published, a
+     * part can be merged away and freed at any moment */
+    int64_t *partitions = rc == 0 ? malloc((mine.n ? mine.n : 1) * sizeof *partitions) : NULL;
+    if (rc == 0 && !partitions)
+        rc = TSDB_ERR_NOMEM;
+    for (size_t i = 0; rc == 0 && i < mine.n; i++)
+        partitions[i] = mine.p[i]->partition;
     if (rc == 0)
         rc = parts_publish(db, mine.p, mine.n);
     if (rc) {
@@ -495,8 +502,9 @@ int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const in
     } else {
         /* like parts_to_delay_insert: let merges catch up instead of piling up parts */
         for (size_t i = 0; i < mine.n; i++)
-            db_wait_merges(db, mine.p[i]->partition);
+            db_wait_merges(db, partitions[i]);
     }
+    free(partitions);
     free(mine.p);
     return rc;
 }

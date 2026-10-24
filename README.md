@@ -99,13 +99,13 @@ tsdbc_close(c);                                    /* waits for the acknowledgem
 ```sh
 make test          # unit, crash-recovery, value type, follower, volume and server tests
 make asan          # the same under AddressSanitizer + UBSan
+make tsan          # the same under ThreadSanitizer, built in build-tsan/ (the server too)
 make jepsen        # fault injection: kill -9, simulated power loss, pauses (Jepsen-style checker)
 make test-clients  # the Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 ```
 
 Tests take a scratch directory as their first argument
-(`./build/test_tsdb /tmp/x`); `make` uses /tmp. ThreadSanitizer is not wired
-into make: build the way `make asan` does, with `-fsanitize=thread`.
+(`./build/test_tsdb /tmp/x`); `make` uses /tmp.
 
 ## Benchmarks
 
