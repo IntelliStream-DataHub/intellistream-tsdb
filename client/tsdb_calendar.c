@@ -446,7 +446,16 @@ int tsdb_calendar_bounds(const char *zone, tsdb_unit unit, uint32_t count, int64
         return TSDB_ERR_NOMEM;
     size_t m = 0;
     for (int64_t k = k0; k <= k1; k++) {
-        int64_t t = unit <= TSDB_HOUR ? k * interval - shift : tz_utc(z, cal_local_start(unit, k * c)) * 1000;
+        int64_t t;
+        if (unit <= TSDB_HOUR) {
+            t = k * interval - shift;
+        } else {
+            /* with a huge count the first period can begin far before the range we
+             * take (only the first: the others begin inside it); in ms it would
+             * overflow, so it begins at the beginning of time */
+            int64_t s = tz_utc(z, cal_local_start(unit, k * c));
+            t = s < -limit / 1000 ? INT64_MIN : s * 1000;
+        }
         if (m == 0 || t > b[m - 1]) /* bounds strictly increase */
             b[m++] = t;
     }

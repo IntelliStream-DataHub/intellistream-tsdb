@@ -131,12 +131,13 @@ int main(int argc, char **argv)
     uint32_t id;
     OK(tsdb_series(db, "s", &id));
 
-    /* sparse rows from 1975 to 2105, dense ones around DST changes */
-    size_t cap = 400000, n = 0;
+    /* sparse rows from 1945 to 2105 (Japan's DST 1948-51, China's 1986-91,
+     * Moscow's offset changes), dense ones around DST changes */
+    size_t cap = 500000, n = 0;
     int64_t *ts = malloc(cap * sizeof *ts);
     float *v = malloc(cap * sizeof *v);
     uint64_t r = 99;
-    for (int64_t t = 157766400000LL; t < 4260211200000LL; t += 3LL * 3600000 + (int64_t)(r % 7200000)) {
+    for (int64_t t = -788918400000LL; t < 4260211200000LL; t += 3LL * 3600000 + (int64_t)(r % 7200000)) {
         r = r * 6364136223846793005ull + 1442695040888963407ull;
         ts[n] = t;
         v[n] = (float)(n % 1000);
@@ -177,10 +178,12 @@ int main(int argc, char **argv)
     OK(tsdb_insert_series(db, id, ts, v, n));
     OK(tsdb_flush(db));
 
-    const char *zones[] = {"UTC", "Europe/Oslo", "America/New_York", "Australia/Sydney", "Asia/Kolkata",
-                           "America/St_Johns", "+05:45"};
-    const char *tzenv[] = {"UTC", "Europe/Oslo", "America/New_York", "Australia/Sydney", "Asia/Kolkata",
-                           "America/St_Johns", "<+0545>-5:45"};
+    const char *zones[] = {"UTC", "Europe/Oslo", "America/New_York", "America/Los_Angeles", "Asia/Shanghai",
+                           "Asia/Tokyo", "Europe/Moscow", "Asia/Kolkata", "Australia/Sydney", "America/St_Johns",
+                           "+05:45"};
+    const char *tzenv[] = {"UTC", "Europe/Oslo", "America/New_York", "America/Los_Angeles", "Asia/Shanghai",
+                           "Asia/Tokyo", "Europe/Moscow", "Asia/Kolkata", "Australia/Sydney", "America/St_Johns",
+                           "<+0545>-5:45"};
     tsdb_unit units[] = {TSDB_DAY, TSDB_WEEK, TSDB_MONTH, TSDB_QUARTER, TSDB_YEAR};
     int counts[] = {1, 2, 3};
     rb *ref = malloc(n * sizeof *ref);
@@ -304,6 +307,22 @@ int main(int argc, char **argv)
             CHECK(at_midnight);
             free(bd);
         }
+
+    /* Regression: with a count near 2^32 the period holding a time before 1970
+     * (local time: Oslo's 1970 begins at -3600000) begins billions of months
+     * earlier; that bound overflowed in milliseconds (to one far in the future,
+     * which dropped rows). It is INT64_MIN now. */
+    const tsdb_unit huge_units[3] = {TSDB_MONTH, TSDB_QUARTER, TSDB_YEAR};
+    for (int u = 0; u < 3; u++) {
+        int64_t *bd;
+        size_t nbd;
+        OK(tsdb_calendar_bounds("Europe/Oslo", huge_units[u], UINT32_MAX, -10 * 365 * 86400000LL, -3600000, &bd, &nbd));
+        CHECK(nbd == 1 && bd[0] == INT64_MIN);
+        free(bd);
+        OK(tsdb_calendar_bounds("UTC", huge_units[u], UINT32_MAX, -86400000LL, 86400000LL, &bd, &nbd));
+        CHECK(nbd == 2 && bd[0] == INT64_MIN && bd[1] == 0);
+        free(bd);
+    }
     OK(tsdb_close(db));
     if (system(cmd) != 0)
         return 1;
