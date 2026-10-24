@@ -1,0 +1,18 @@
+# Build and test environment matching production: AlmaLinux 10 (RHEL 10 clone,
+# GCC 14, glibc 2.39). The base image is pinned by digest; the packages are NOT: the
+# base has no compiler, and dnf installs the current 10.x versions from the AlmaLinux
+# mirrors, so a rebuild months later can carry a newer GCC. What was installed is recorded
+# in /etc/tsdb-packages.txt, which almalinux10.sh prints at the start of every step log.
+# Bump the base on purpose (`podman pull docker.io/library/almalinux:10`, then
+# `podman image inspect ... --format '{{.Digest}}'`).
+# AlmaLinux 10.2 as of 2026-10-24.
+FROM docker.io/library/almalinux@sha256:ba31c3299856068f77bc10574cad51b0a4f6a3dafb882668656e1639bee63db6
+
+# liburing-devel lives in the CRB repository, which this image enables by default;
+# `--enablerepo=crb` makes that explicit and keeps working if the default changes.
+# libasan/libubsan/libtsan: the sanitizer runtimes `make asan` and `make tsan` link.
+RUN dnf -y --enablerepo=crb install \
+        gcc make git tzdata python3 diffutils findutils \
+        libzstd-devel liburing-devel libasan libubsan libtsan \
+    && dnf clean all \
+    && rpm -q gcc glibc libzstd-devel liburing-devel libasan libubsan tzdata python3 make git > /etc/tsdb-packages.txt
