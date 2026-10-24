@@ -41,6 +41,7 @@ import concurrent.futures
 import copy
 import datetime
 import json
+import math
 import os
 import random
 import re
@@ -501,6 +502,35 @@ def cli_expected(q, ty, lines):
     return out
 
 
+SPREAD_HEADER = "time\tcount\tsum\tmin\tmax\tavg\trange\tstddev_pop\tstddev_samp"
+
+
+def spread_checked(ln, ty):
+    """A line of `tsdb query ... all` without its spread columns (range, stddev_pop, stddev_samp). The clients do
+    not ask for the spread, so it is checked against the line's own count, min and max instead; a line whose spread
+    is inconsistent comes back marked, so that it differs from the clients' answer."""
+    if ln == SPREAD_HEADER:
+        return ln.rsplit("\t", 3)[0]
+    f = ln.split("\t")
+    if len(f) != 9 or not f[1].isdigit():
+        return ln
+    cnt, rg, sp, ss = int(f[1]), float(f[6]), float(f[7]), float(f[8])
+    nan = lambda x: x != x  # noqa: E731
+    if cnt == 0 or ty == "state":
+        ok = nan(rg) and nan(sp) and nan(ss)
+    else:
+        if ty in ("int64", "bool"):
+            ok = f[6] == str((int(f[4]) - int(f[3])) % (1 << 64))
+        else:
+            mn, mx = float(f[3]), float(f[4])
+            want = mx - mn if mn <= mx else float("nan")  # min > max (both NaN): only NaN values
+            ok = (nan(want) and nan(rg)) or want == rg
+        ok = ok and (nan(sp) or sp >= 0) and (nan(ss) or ss >= 0) and (cnt > 1 or nan(ss))
+        if f[3] == f[4] and math.isfinite(float(f[3])) and math.isfinite(float(f[2])):  # constant data: exactly 0
+            ok = ok and sp == 0  # (NaN values among them make the sum and the spread NaN)
+    return "\t".join(f[:6]) if ok else ln + "\tSPREAD INCONSISTENT"
+
+
 def cli_check(ctx, F, dbdir, model, queries, text, d):
     """Runs every query the CLI understands on the (stopped) server's directory and compares."""
     blocks = gen.parse_blocks(text)
@@ -523,6 +553,8 @@ def cli_check(ctx, F, dbdir, model, queries, text, d):
             ty = model.types[q.split(" ")[1]]
             want = cli_expected(q, ty, lines)
             got = p.stdout.decode("utf-8", "replace").split("\n")[:-1] if p.returncode == 0 else None
+            if got and q.split(" ")[0] != "raw":
+                got = [spread_checked(ln, ty) for ln in got]
             if got and q.split(" ")[0] != "raw" and ty in ("float32", "float64"):
                 got = [("\t".join(f[:2] + ["*"] + [x.replace("-0", "0") if x == "-0" else x for x in f[3:5]] + ["*"])
                         if len(f := ln.split("\t")) == 6 and f[1].isdigit() else ln) for ln in got]
