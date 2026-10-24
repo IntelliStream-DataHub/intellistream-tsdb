@@ -26,6 +26,17 @@ start, the tests and the benchmark results.
 - Aggregates: count, sum, min, max, avg. Integer types (int64, bool as 0/1)
   aggregate exactly (`isum`, `imin`, `imax`; the sum saturates at the int64
   limits, `sum` holds it as a double). For states only the count is meaningful.
+- Float sums are not bit-reproducible. A float sum depends on the order of the
+  additions, and that order follows how parts were merged and how a query was
+  split over threads, so the same rows can give sums that differ in the last
+  bits after a background merge (a sum that hits NaN can also come back with a
+  different NaN bit pattern). ClickHouse, PostgreSQL and DuckDB behave the same.
+  min, max and count are exact. Where reproducible sums matter, store the values
+  as int64 in fixed point (21.3 degC as 21300 milli-degrees): sums are added in
+  a 128-bit integer inside (and kept that way in each granule's statistics), so
+  `isum` is exact whatever the order, as long as the total fits in an int64
+  (about 9.2e18; beyond that it is clamped). int64 series compress as well as
+  the fixed-point floats.
 - Buckets are fixed lengths aligned to the epoch, like `toStartOfInterval`,
   or calendar periods (day, ISO week, month, quarter, year) in UTC
   (`tsdb_query_group`), or buckets that begin at given instants

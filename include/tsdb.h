@@ -193,7 +193,13 @@ void tsdb_free(void *p);
  * propagate into sum. int64 and bool (false 0, true 1): sum, min and max are
  * also exact in isum, imin and imax (isum is the exact sum, clamped to the
  * int64 range when it does not fit, whatever the order of the rows).
- * State: only count is meaningful. */
+ * State: only count is meaningful.
+ * Float sums are not bit-reproducible: rows are added in an order that depends
+ * on how parts were merged and how the query was split over threads, so the
+ * same data can give sums that differ in the last bits (and a NaN sum's bit
+ * pattern can differ), as in ClickHouse. min, max and count are exact. Where
+ * reproducible sums matter, store the values as int64 in fixed point (21.3 degC
+ * as 21300 milli-degrees): isum is then exact. */
 typedef struct tsdb_bucket {
     int64_t start; /* bucket start; with interval 0 this is the query start */
     uint64_t count;
