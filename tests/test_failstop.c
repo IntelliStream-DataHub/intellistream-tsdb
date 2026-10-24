@@ -878,6 +878,32 @@ static void test_intent(const char *base)
         CHECK(rows_after_open() == 0);
     }
 
+    /* damage that still parses (its two renames swapped): only the checksum catches it, and it rolls back */
+    intent_left(name);
+    CHECK(find_file("txn_", ".intent", path, sizeof path));
+    {
+        char text[1024], out[1024];
+        FILE *fp = fopen(path, "r");
+        size_t len = fp ? fread(text, 1, sizeof text - 1, fp) : 0;
+        if (fp)
+            fclose(fp);
+        text[len] = '\0';
+        char *l1 = strchr(text, '\n'), *l2 = l1 ? strchr(l1 + 1, '\n') : NULL, *l3 = l2 ? strchr(l2 + 1, '\n') : NULL;
+        CHECK(l3 != NULL);
+        if (l3) {
+            /* "head\nA\nB\nend..." -> "head\nB\nA\nend..." */
+            int n = snprintf(out, sizeof out, "%.*s%.*s\n%.*s%s", (int)(l1 + 1 - text), text, (int)(l3 - l2 - 1), l2 + 1,
+                             (int)(l2 - l1), l1 + 1, l3 + 1);
+            CHECK(n == (int)len && strcmp(out, text) != 0);
+            fp = fopen(path, "w");
+            CHECK(fp && fwrite(out, 1, len, fp) == len);
+            if (fp)
+                fclose(fp);
+        }
+    }
+    CHECK(rows_after_open() == 0);
+    CHECK(!find_file("txn_", ".intent", path, sizeof path) && !find_file("tmp_", "", path, sizeof path));
+
     /* an intent that is whole is rolled forward */
     intent_left(name);
     CHECK(rows_after_open() == 100);

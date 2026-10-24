@@ -7,7 +7,9 @@
  * it: a torn tail, which a crash leaves, is cut and the open goes on with
  * every record before it; damage with valid records after it fails with
  * TSDB_ERR_CORRUPT and keeps the file, because cutting there would drop
- * acknowledged rows without a word.
+ * acknowledged rows without a word. A valid record moved to another offset
+ * counts as damage; a read error or a short read (injected through pread) is
+ * never taken for the end of a file.
  *
  *   ./build/test_damage [scratch dir]
  */
@@ -16,7 +18,9 @@
 #include "tsdb.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <ftw.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -26,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -144,6 +149,56 @@ static void append_zeros(const char *dir, const char *name, size_t n)
     uint8_t *z = calloc(1, n);
     file_pwrite(dir, name, file_size(dir, name), z, n);
     free(z);
+}
+
+/* The library's pread calls land here (the test binary's definition wins over
+ * libc's): while armed, reads of files whose name starts with fault_name fail
+ * with EIO, or find the file ending after 8 bytes (a short read). */
+enum { FAULT_NONE, FAULT_EIO, FAULT_SHORT };
+static atomic_int fault_mode, fault_fired;
+static char fault_name[32];
+
+static void arm_read_fault(int mode, const char *name)
+{
+    snprintf(fault_name, sizeof fault_name, "%s", name);
+    atomic_store(&fault_fired, 0);
+    atomic_store(&fault_mode, mode);
+}
+
+ssize_t pread(int fd, void *buf, size_t n, off_t off)
+{
+    int mode = atomic_load(&fault_mode);
+    if (mode != FAULT_NONE) {
+        char link[64], target[PATH_MAX];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+        ssize_t l = readlink(link, target, sizeof target - 1);
+        if (l > 0) {
+            target[l] = '\0';
+            const char *base = strrchr(target, '/');
+            base = base ? base + 1 : target;
+            if (strncmp(base, fault_name, strlen(fault_name)) == 0) {
+                atomic_fetch_add(&fault_fired, 1);
+                if (mode == FAULT_EIO) {
+                    errno = EIO;
+                    return -1;
+                }
+                if (off >= 8)
+                    return 0;
+                if (n > (size_t)(8 - off))
+                    n = (size_t)(8 - off);
+            }
+        }
+    }
+    return syscall(SYS_pread64, fd, buf, n, off);
+}
+
+/* the fortified variant, which _FORTIFY_SOURCE builds call where the buffer's size is known */
+ssize_t __pread_chk(int fd, void *buf, size_t n, off_t off, size_t buflen);
+ssize_t __pread_chk(int fd, void *buf, size_t n, off_t off, size_t buflen)
+{
+    if (n > buflen)
+        abort();
+    return pread(fd, buf, n, off);
 }
 
 /* ------------------------------------------------------------- database */
@@ -509,6 +564,50 @@ static void test_parts(const char *scratch)
     rm_rf(dir);
 }
 
+/* A follower that finds a new part broken keeps its previous view, counts and
+ * logs the part once, and its refreshes fail with TSDB_ERR_CORRUPT. */
+static void test_part_follower(const char *scratch)
+{
+    char dir[600], first[256], part[256] = "";
+    snprintf(dir, sizeof dir, "%s/damage-partfollow", scratch);
+    make_part(dir, first, sizeof first);
+    tsdb_options o = opts();
+    tsdb *w, *f = NULL;
+    uint32_t id;
+    OK(tsdb_open(dir, &o, &w));
+    OK(tsdb_series_lookup(w, "part.series", &id));
+    tsdb_options ro = opts();
+    ro.read_only = 1; /* no polling thread: refreshes happen here */
+    OK(tsdb_open(dir, &ro, &f));
+    OK(tsdb_append(w, id, T0 + 2 * PART_ROWS * 1000, 1.0f));
+    OK(tsdb_flush(w));
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (e->d_name[0] == 'p' && n > 5 && strcmp(e->d_name + n - 5, ".part") == 0 && strcmp(e->d_name, first) != 0)
+            snprintf(part, sizeof part, "%s", e->d_name);
+    }
+    if (d)
+        closedir(d);
+    CHECK(part[0] != '\0');
+    if (f && part[0]) {
+        flip(dir, part, (off_t)read_footer(dir, part).index_off + 9);
+        int rc;
+        for (int i = 0; i < 2; i++)
+            RC(tsdb_refresh(f), TSDB_ERR_CORRUPT);
+        tsdb_stats st;
+        OK(tsdb_get_stats(f, &st));
+        CHECK(st.broken_parts == 1 && st.follow_errors >= 2);
+        CHECK(count_rows(f, id, &rc) == PART_ROWS); /* the previous view */
+    }
+    if (f)
+        OK(tsdb_close(f));
+    OK(tsdb_close(w));
+    printf("  parts: a follower keeps its previous view of a broken part and reports it\n");
+    rm_rf(dir);
+}
+
 /* ------------------------------------------------------------- MANIFEST */
 
 struct restore {
@@ -616,6 +715,102 @@ static void test_manifest(const char *scratch)
     printf("  MANIFEST: a follower waits out a torn rewrite, and fails the open on one that stays torn\n");
     free(orig);
     free(junk);
+    rm_rf(dir);
+}
+
+/* ------------------------------------------------------------- shifted records */
+
+/* A valid record at another offset (stale data, a misdirected write) is
+ * damage, not a record: the checks are seeded with the offset. */
+static void test_shifted(const char *scratch)
+{
+    char dir[600], other[600], wal[256];
+    snprintf(dir, sizeof dir, "%s/damage-shift", scratch);
+    snprintf(other, sizeof other, "%s/damage-shift-other", scratch);
+
+    /* WAL: record 5 copied over record 2 would replay rows twice and lose record 2's */
+    crash_with_wal(dir, wal, sizeof wal);
+    uint8_t rec[WAL_RECLEN];
+    file_pread(dir, wal, 5 * WAL_RECLEN, rec, sizeof rec);
+    file_pwrite(dir, wal, 2 * WAL_RECLEN, rec, sizeof rec);
+    RC(try_open(dir), TSDB_ERR_CORRUPT);
+
+    /* SERIES: a record of another dictionary, valid at its own offset, copied to
+     * another one (names of one length, so the records line up) */
+    static const char *const names[] = {"eq.aaaa", "eq.bbbb", "eq.cccc", "eq.dddd"};
+    static const char *const others[] = {"eq.aaaa", "eq.qqqq"};
+    size_t rs = rec_size(strlen(names[0]));
+    make_series(other, others, 2);
+    make_series(dir, names, 4);
+    uint8_t srec[64];
+    file_pread(other, "SERIES", (off_t)rs, srec, rs);
+    file_pwrite(dir, "SERIES", 2 * (off_t)rs, srec, rs);
+    RC(try_open(dir), TSDB_ERR_CORRUPT);
+    printf("  WAL and SERIES: a valid record moved to another offset fails the open\n");
+    rm_rf(dir);
+    rm_rf(other);
+}
+
+/* ------------------------------------------------------------- read errors */
+
+/* A read error, or a file that reads shorter than its size, is never taken
+ * for the end of the file: the open (or the follower's refresh) fails. */
+static void test_read_errors(const char *scratch)
+{
+    char dir[600], wal[256];
+    snprintf(dir, sizeof dir, "%s/damage-eio", scratch);
+
+    crash_with_wal(dir, wal, sizeof wal);
+    for (int mode = FAULT_EIO; mode <= FAULT_SHORT; mode++) {
+        arm_read_fault(mode, "wal_");
+        RC(try_open(dir), TSDB_ERR_IO);
+        atomic_store(&fault_mode, FAULT_NONE);
+        CHECK(atomic_load(&fault_fired) > 0);
+        CHECK(file_size(dir, wal) == WAL_RECS * WAL_RECLEN); /* nothing cut */
+    }
+    CHECK(rows_of(dir, "wal.series") == WAL_RECS * WAL_RECROWS);
+
+    static const char *const names[] = {"pump.inlet.pressure", "pump.outlet.pressure", "pump.speed"};
+    make_series(dir, names, 3);
+    off_t size = file_size(dir, "SERIES");
+    for (int mode = FAULT_EIO; mode <= FAULT_SHORT; mode++) {
+        arm_read_fault(mode, "SERIES");
+        RC(try_open(dir), TSDB_ERR_IO);
+        atomic_store(&fault_mode, FAULT_NONE);
+        CHECK(atomic_load(&fault_fired) > 0);
+        CHECK(file_size(dir, "SERIES") == size);
+    }
+    check_names(dir, names, 3, 3);
+
+    /* a follower that meets rows of a new series and cannot read SERIES: the
+     * refresh fails, and the rows come once it can (not dropped meanwhile) */
+    rm_rf(dir);
+    tsdb_options o = opts();
+    tsdb *w, *f = NULL;
+    uint32_t a, b;
+    OK(tsdb_open(dir, &o, &w));
+    OK(tsdb_series(w, "eio.a", &a));
+    OK(tsdb_append(w, a, T0, 1.0f));
+    tsdb_options ro = opts();
+    ro.read_only = 1; /* no polling thread: refreshes happen here */
+    OK(tsdb_open(dir, &ro, &f));
+    if (f) {
+        OK(tsdb_refresh(f));
+        OK(tsdb_series(w, "eio.b", &b));
+        OK(tsdb_append(w, b, T0, 2.0f));
+        arm_read_fault(FAULT_EIO, "SERIES");
+        RC(tsdb_refresh(f), TSDB_ERR_IO);
+        atomic_store(&fault_mode, FAULT_NONE);
+        CHECK(atomic_load(&fault_fired) > 0);
+        OK(tsdb_refresh(f));
+        uint32_t fb;
+        int rc;
+        OK(tsdb_series_lookup(f, "eio.b", &fb));
+        CHECK(fb == b && count_rows(f, b, &rc) == 1);
+        OK(tsdb_close(f));
+    }
+    OK(tsdb_close(w));
+    printf("  read errors and short reads of the WAL and SERIES fail the open, and a follower's refresh\n");
     rm_rf(dir);
 }
 
@@ -733,7 +928,10 @@ int main(int argc, char **argv)
     test_series(base);
     test_wal(base);
     test_wal_follower(base);
+    test_shifted(base);
+    test_read_errors(base);
     test_parts(base);
+    test_part_follower(base);
     test_manifest(base);
     test_codecs();
     rm_rf(base);
