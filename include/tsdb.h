@@ -56,7 +56,9 @@ typedef struct tsdb_options {
     uint32_t granule_rows;   /* fixed at creation; default 8192 */
     int zstd_level;          /* default 1; 0 disables zstd */
     int value_codec;         /* TSDB_VALUES_AUTO (default), _GORILLA or _CHIMP */
-    int fsync;               /* fsync parts before publishing them; default 1 */
+    int fsync;               /* fsync parts, WAL and dictionaries before relying on them; default 1. With 0,
+                              * a power loss (not a process crash) can leave files that fail their checks
+                              * at the next open, which then needs an operator (docs/design.md) */
     int merge_threads;       /* background merge threads; default 2, 0 disables merges */
     int query_threads;       /* threads for one query; default: every logical CPU */
     size_t buffer_rows;      /* memtable rows before it is flushed into parts; default 1M */
@@ -75,9 +77,10 @@ typedef struct tsdb_options {
                                    * so readers on other hosts (NFS) can finish with them; default 480 */
     int verify_checksums;    /* queries check each granule's checksum before decoding it (TSDB_ERR_CORRUPT
                               * on a mismatch); default 0: storage with checksums of its own (ZFS, ECC
-                              * memory) catches the damage already. Merges always check, so damage is never
-                              * rewritten under a fresh checksum; structural checksums (part header, footer
-                              * and index, WAL, MANIFEST, dictionaries) are always checked. */
+                              * memory) catches the damage already, and without it damaged values can be
+                              * returned without an error. Merges check what they decode, so damage is
+                              * never rewritten under a fresh checksum; structural checksums (part header,
+                              * footer and index, WAL, MANIFEST, dictionaries) are always checked. */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -295,7 +298,8 @@ typedef struct tsdb_stats {
      * makes a writer's or reader's open fail with TSDB_ERR_CORRUPT and a log line
      * naming it, rather than leave its rows out (older values of the same keys
      * would come back); renaming it to <name>.broken accepts the loss. A follower
-     * keeps its previous view instead, logs the part, and counts it here. */
+     * keeps its previous view instead, logs the part, and counts it here (only a
+     * follower: a writer's open fails). */
     uint64_t broken_parts;
     uint64_t follow_errors; /* follower refreshes that failed (MANIFEST, a part or the WAL damaged, or EIO) */
 } tsdb_stats;

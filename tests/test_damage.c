@@ -582,6 +582,110 @@ static void test_manifest(const char *scratch)
     rm_rf(dir);
 }
 
+/* ------------------------------------------------------------- codecs */
+
+/* With verify_checksums off a damaged granule reaches the decoders: they may
+ * return wrong values, but must not overflow or read out of bounds (make asan
+ * runs this with UBSan stopping at the first report). */
+size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out);
+int decimal_bp_decode(const uint8_t *in, size_t len, size_t n, float *out);
+size_t decimal_encode(const float *in, size_t n, uint8_t *out);
+int decimal_decode(const uint8_t *in, size_t len, size_t n, float *out);
+
+static uint64_t rnd_state = 88172645463325252ull;
+static uint64_t rnd(void)
+{
+    rnd_state ^= rnd_state << 13;
+    rnd_state ^= rnd_state >> 7;
+    rnd_state ^= rnd_state << 17;
+    return rnd_state;
+}
+
+static void test_codecs(void)
+{
+    /* the decimal codecs' first integer near INT64_MAX, then rising deltas */
+    enum { N = 256 };
+    float in[N], out[N];
+    for (int i = 0; i < N; i++)
+        in[i] = (float)i * 0.5f;
+    static uint8_t enc[2 * N * 4 + 256];
+    const int64_t big = INT64_MAX - 3;
+    size_t len = decimal_bp_encode(in, N, enc);
+    CHECK(len > 10);
+    if (len > 10) {
+        memcpy(enc + 2, &big, 8);
+        decimal_bp_decode(enc, len, N, out); /* any result but UB */
+    }
+    len = decimal_encode(in, N, enc);
+    CHECK(len > 10);
+    if (len > 10) {
+        memcpy(enc + 2, &big, 8);
+        decimal_decode(enc, len, N, out);
+    }
+
+    /* flipped bits in encoded blocks of every type and codec */
+    codec_ctx *c = codec_new();
+    long blocks = 0, errors = 0;
+    static const size_t ns[] = {7, 100, 1000};
+    for (int ni = 0; ni < 3; ni++) {
+        size_t n = ns[ni], cap = block_bound(n) + 64;
+        int64_t *ts = malloc(n * 8), *ts2 = malloc(n * 8);
+        uint8_t *v = malloc(n * 8), *v2 = malloc(n * 8), *e = malloc(cap), *d = malloc(cap);
+        for (int type = 0; type <= 4; type++)
+            for (int vc = 0; vc <= 2; vc++)
+                for (int level = 0; level <= 3; level += 3) {
+                    int64_t t = T0;
+                    for (size_t i = 0; i < n; i++) {
+                        t += 1000 + (int64_t)(rnd() % 3);
+                        ts[i] = t;
+                        if (type == TSDB_FLOAT32) {
+                            float x = (float)(i % 50) * 0.5f;
+                            memcpy(v + 4 * i, &x, 4);
+                        } else if (type == TSDB_FLOAT64) {
+                            double x = (double)(i % 50) * 0.25;
+                            memcpy(v + 8 * i, &x, 8);
+                        } else if (type == TSDB_INT64) {
+                            int64_t x = (int64_t)(rnd() % 1000);
+                            memcpy(v + 8 * i, &x, 8);
+                        } else {
+                            uint32_t x = (uint32_t)(i / 10 % 2);
+                            memcpy(v + 4 * i, &x, 4);
+                        }
+                    }
+                    size_t lt = block_encode_ts(c, level, ts, n, e);
+                    size_t lv = block_encode_vals(c, level, vc, type, v, n, e + lt);
+                    CHECK(lt > 0 && lv > 0);
+                    if (!lt || !lv)
+                        continue;
+                    for (int it = 0; it < 300; it++) {
+                        memcpy(d, e, lt + lv);
+                        for (int k = 1 + (int)(rnd() % 3); k > 0; k--)
+                            d[rnd() % (lt + lv)] ^= (uint8_t)(1u << (rnd() % 8));
+                        if (rnd() % 8 == 0)
+                            d[rnd() % (lt + lv)] = (uint8_t)rnd();
+                        /* exact-size copies so that ASan sees overreads; a part has >= 16 bytes after any block */
+                        uint8_t *bt = calloc(1, lt + 16), *bv = calloc(1, lv + 16);
+                        memcpy(bt, d, lt);
+                        memcpy(bv, d + lt, lv);
+                        int r1 = block_decode_ts(c, bt, lt, n, ts2);
+                        int r2 = block_decode_vals(c, type, bv, lv, n, v2);
+                        blocks++;
+                        errors += r1 || r2;
+                        free(bt);
+                        free(bv);
+                    }
+                }
+        free(ts);
+        free(ts2);
+        free(v);
+        free(v2);
+        free(e);
+        free(d);
+    }
+    codec_free(c);
+    printf("  codecs: %ld damaged blocks decoded without UB (%ld rejected)\n", blocks, errors);
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
@@ -594,6 +698,7 @@ int main(int argc, char **argv)
     test_wal_follower(base);
     test_parts(base);
     test_manifest(base);
+    test_codecs();
     rm_rf(base);
     if (failures) {
         fprintf(stderr, "%d damage checks FAILED\n", failures);

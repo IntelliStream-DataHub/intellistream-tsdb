@@ -298,11 +298,11 @@ static int load_parts(eng *db, bool read_only)
         if (r == TSDB_ERR_CORRUPT || r == TSDB_ERR_INVALID) {
             /* Never left out quietly: its rows would vanish and older values of
              * the same keys come back, and a merge would make that permanent.
-             * Parts are synced before they are named, so this is damage or a bug. */
+             * Parts are synced before they are named, so this is damage or a bug
+             * (or a power loss with fsync = 0, which leaves the same to an operator). */
             fprintf(stderr, "tsdb: part %s is broken (%s): the open fails; rename it to %s.broken to accept the "
                             "loss of its rows\n", name, tsdb_strerror(r), name);
-            atomic_fetch_add(&db->st_broken_parts, 1);
-            rc = TSDB_ERR_CORRUPT;
+            rc = TSDB_ERR_CORRUPT; /* not counted in st_broken_parts: nobody could read it */
             break;
         }
         if (r != 0) {

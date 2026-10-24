@@ -170,8 +170,17 @@ damage into silently missing or shifted data:
   check each granule's checksum before decoding it and return
   `TSDB_ERR_CORRUPT` on a mismatch. It is off by default: production storage
   (ZFS, ECC memory) has checksums of its own, and hashing every granule read
-  costs query time. Merges always check, so damage is never rewritten under a
-  fresh checksum.
+  costs query time. Without it a damaged granule is decoded as it is: the
+  decoders reject what does not parse and are safe on any input, but most
+  damage decodes to wrong values that queries return without an error. Merges
+  check every granule they decode, so damage is never rewritten under a fresh
+  checksum; a granule a merge passes through unchanged is copied with its
+  checksum, so the damage stays detectable.
+- **Without fsync** (`fsync = 0`) nothing above is synced, so after a power
+  loss (a process crash is fine) a named part, a WAL record or a dictionary
+  record can hold pages that never reached the disk. That looks like damage,
+  and is treated as such: the open fails and names the file, and an operator
+  accepts the loss (renames the part to `*.broken`, moves the segment away).
 - **Followers** reading over NFS may see appends out of order: a bad WAL
   record or MANIFEST is tolerated for a while (2 s or 20 refresh intervals,
   whichever is longer) and then reported as `TSDB_ERR_CORRUPT`, once; an

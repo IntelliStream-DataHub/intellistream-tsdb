@@ -135,7 +135,11 @@ cgroup, so `nice` does not keep your work out of its way.
 - **Damage is never silent.** A torn tail of an append-only file is cut; a bad
   record with a valid one after it, a read error or a broken part fails the open
   (`TSDB_ERR_CORRUPT` / `TSDB_ERR_IO`) with a log line. Never treat a read error
-  as end of file, skip a part or drop a WAL record quietly.
+  as end of file, skip a part or drop a WAL record quietly. The one exception:
+  granule payloads are hashed only with `verify_checksums` (default off), so
+  without it a damaged granule decodes to wrong values; decoders must therefore
+  be safe (no UB, no overread) on any bytes. With `fsync = 0` a power loss looks
+  like damage and fails the open.
 - **Protocol.** There has been no release yet, so the wire protocol may change
   without keeping old clients working (the user decided this on 2026-10-24): no
   legacy paths for earlier protocol versions in new designs. Every change must

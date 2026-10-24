@@ -455,6 +455,9 @@ int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, ui
  * renamed yet, the insert is rolled back; if some were renamed, the insert
  * was published and the missing ones have since been merged or dropped.
  * Failing I/O (reading the intent, a rename) fails the open.
+ * Not covered: an intent damaged on disk after its renames ran (a synced file
+ * gone bad) also reads as torn, and the parts it renamed are rolled back
+ * although the insert may have been acknowledged.
  */
 
 #define INTENT_PREFIX "txn_"
