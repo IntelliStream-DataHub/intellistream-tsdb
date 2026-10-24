@@ -103,7 +103,8 @@ typedef struct cursor {
     bool loaded; /* rows of granule gi are decoded into ts/v */
     size_t pos, n;
     int64_t *ts;
-    float *v;
+    uint8_t *v; /* slots of type */
+    int type;   /* of the loaded granule's series */
 } cursor;
 
 static inline bool cur_done(const cursor *c) { return c->gi >= c->p->ng; }
@@ -121,16 +122,19 @@ static inline bool key_lt(uint32_t s1, int64_t t1, uint32_t s2, int64_t t2)
     return s1 < s2 || (s1 == s2 && t1 < t2);
 }
 
-static int cur_load(codec_ctx *cc, cursor *c)
+static int cur_load(eng *db, codec_ctx *cc, cursor *c)
 {
     if (!c->ts) {
         c->ts = malloc(c->p->grows * sizeof(int64_t));
-        c->v = malloc(c->p->grows * sizeof(float));
+        c->v = malloc(c->p->grows * sizeof(uint64_t));
         if (!c->ts || !c->v)
             return TSDB_ERR_NOMEM;
     }
     const granule *g = &c->p->g[c->gi];
-    int rc = granule_read(cc, c->p, g, c->ts, c->v);
+    c->type = series_type(&db->series, g->series);
+    if (c->type < 0)
+        return TSDB_ERR_CORRUPT; /* a granule of a series the dictionary does not have */
+    int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v);
     if (rc)
         return rc;
     c->loaded = true;
@@ -140,10 +144,10 @@ static int cur_load(codec_ctx *cc, cursor *c)
 }
 
 /* Drops the cursor's current row (a duplicate key replaced by a newer part). */
-static int cur_skip(codec_ctx *cc, cursor *c)
+static int cur_skip(eng *db, codec_ctx *cc, cursor *c)
 {
     int rc;
-    if (!c->loaded && (rc = cur_load(cc, c)) != 0)
+    if (!c->loaded && (rc = cur_load(db, cc, c)) != 0)
         return rc;
     if (++c->pos == c->n) {
         c->loaded = false;
@@ -228,7 +232,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
                 c->gi++;
                 continue;
             }
-            if ((rc = cur_load(cc, c)) != 0)
+            if ((rc = cur_load(db, cc, c)) != 0)
                 break;
         }
         size_t end = c->n;
@@ -241,7 +245,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
                 tie = true;
             }
         }
-        rc = pw_add(&w, g->series, c->ts + c->pos, c->v + c->pos, end - c->pos);
+        rc = pw_add(&w, g->series, c->type, c->ts + c->pos, c->v + c->pos * type_width(c->type), end - c->pos);
         rows += end - c->pos;
         c->pos = end;
         if (c->pos == c->n) {
@@ -255,7 +259,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
             int64_t t;
             cur_key(&cur[i], &s, &t);
             if (s == bs && t == bt)
-                rc = cur_skip(cc, &cur[i]);
+                rc = cur_skip(db, cc, &cur[i]);
         }
     }
 

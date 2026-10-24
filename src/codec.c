@@ -835,7 +835,7 @@ void codec_free(codec_ctx *c)
     free(c);
 }
 
-static int scratch_reserve(codec_ctx *c, size_t need)
+int codec_scratch_reserve(codec_ctx *c, size_t need)
 {
     if (c->scratch_cap >= need)
         return 0;
@@ -861,6 +861,10 @@ static size_t inner_bound(int kind, size_t n)
     case BLK_TS_DELTA: return tsfor_bound(n);
     case BLK_ALPRD: return alprd_bound(n);
     case BLK_DECIMAL_BP: return decimal_bp_bound(n);
+    case BLK_F64_DECIMAL: return f64_decimal_bound(n);
+    case BLK_XOR64: return xor64_bound(n);
+    case BLK_BYTESPLIT64: return 8 * n;
+    case BLK_INT: return int_bp_bound(n);
     default: return 0;
     }
 }
@@ -869,11 +873,12 @@ size_t block_bound(size_t n)
 {
     size_t inner = MAX(MAX(MAX(dd_bound(n), tsfor_bound(n)), chimp_bound(n)), MAX(gorilla_bound(n), decimal_bound(n)));
     inner = MAX(inner, MAX(alprd_bound(n), decimal_bp_bound(n)));
+    inner = MAX(inner, MAX(MAX(f64_decimal_bound(n), xor64_bound(n)), MAX(8 * n, int_bp_bound(n))));
     return 5 + ZSTD_compressBound(inner);
 }
 
 /* Wraps `inner` bytes of transform output (in c->scratch) into a block. */
-static size_t block_wrap(codec_ctx *c, int level, int kind, size_t inner, uint8_t *out)
+size_t block_wrap(codec_ctx *c, int level, int kind, size_t inner, uint8_t *out)
 {
     if (level > 0 && inner >= 64) {
         size_t z = ZSTD_compressCCtx(c->cctx, out + 5, ZSTD_compressBound(inner), c->scratch, inner, level);
@@ -905,7 +910,7 @@ static size_t encode_ts_kind(codec_ctx *c, int kind, const int64_t *ts, size_t n
  * otherwise the candidate with the smallest estimated size. */
 size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uint8_t *out)
 {
-    if (scratch_reserve(c, MAX(dd_bound(n), tsfor_bound(n))) != 0)
+    if (codec_scratch_reserve(c, MAX(dd_bound(n), tsfor_bound(n))) != 0)
         return 0;
     size_t dd = dd_encode(ts, n, c->scratch);
     if (level <= 0 || n < 2 || dd <= 24 + n / 8 + 8)
@@ -991,7 +996,7 @@ static double entropy_words(const uint8_t *p, size_t len, size_t width)
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(chimp_bound(n), gorilla_bound(n)), MAX(alprd_bound(n), decimal_bp_bound(n)));
-    if (scratch_reserve(c, need) != 0)
+    if (codec_scratch_reserve(c, need) != 0)
         return 0;
     if (value_codec == TSDB_VALUES_GORILLA || value_codec == TSDB_VALUES_CHIMP) {
         int kind = value_codec == TSDB_VALUES_GORILLA ? BLK_GORILLA : BLK_CHIMP;
@@ -1047,8 +1052,8 @@ size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v
 }
 
 /* Resolves a block to its transform kind and (decompressed) transform bytes. */
-static int block_open(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int *kind, const uint8_t **p,
-                      size_t *plen)
+int block_open(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int *kind, const uint8_t **p,
+               size_t *plen)
 {
     if (len < 1)
         return TSDB_ERR_CORRUPT;
@@ -1062,7 +1067,7 @@ static int block_open(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, in
     size_t inner = load32(*p);
     if (inner > inner_bound(*kind, n))
         return TSDB_ERR_CORRUPT;
-    if (scratch_reserve(c, inner + BLK_SLACK) != 0)
+    if (codec_scratch_reserve(c, inner + BLK_SLACK) != 0)
         return TSDB_ERR_NOMEM;
     size_t r = ZSTD_decompressDCtx(c->dctx, c->scratch, inner, *p + 4, *plen - 4);
     if (ZSTD_isError(r) || r != inner)

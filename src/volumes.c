@@ -424,12 +424,15 @@ int tsdb_series_lookup(tsdb *t, const char *name, uint32_t *id)
     return 0;
 }
 
-int tsdb_series_at(tsdb *t, const char *name, const char *path, uint32_t *id)
+/* Gets or creates a series. type < 0: any existing type, else created as
+ * float32; otherwise an existing series must have this type. */
+static int series_make(tsdb *t, const char *name, int type, const char *path, uint32_t *id)
 {
-    if (!name || !*name)
+    if (!name || !*name || (type >= 0 && !type_valid(type)))
         return TSDB_ERR_INVALID;
-    if (tsdb_series_lookup(t, name, id) == 0)
-        return 0; /* exists: it stays in the volume it was created in */
+    tsdb_type have;
+    if (tsdb_series_lookup(t, name, id) == 0) /* exists: it stays in the volume it was created in */
+        return type < 0 || (tsdb_series_type(t, *id, &have) == 0 && (int)have == type) ? 0 : TSDB_ERR_INVALID;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
     char canon[PATH_MAX];
@@ -442,7 +445,7 @@ int tsdb_series_at(tsdb *t, const char *name, const char *path, uint32_t *id)
     int rc = 0;
     if (tsdb_series_lookup(t, name, id) == 0) {
         pthread_mutex_unlock(&t->create_lock);
-        return 0;
+        return type < 0 || (tsdb_series_type(t, *id, &have) == 0 && (int)have == type) ? 0 : TSDB_ERR_INVALID;
     }
     /* the volume: an existing one, or a new one */
     uint32_t vol = 0;
@@ -473,7 +476,7 @@ int tsdb_series_at(tsdb *t, const char *name, const char *path, uint32_t *id)
     }
     uint32_t local = 0;
     if (rc == 0)
-        rc = eng_series(t->vols[vol], name, &local); /* first in the volume, then the catalog */
+        rc = eng_series(t->vols[vol], name, type < 0 ? TSDB_FLOAT32 : type, &local); /* the volume, then the catalog */
     if (rc == 0) {
         uint32_t rec[2] = {vol, local};
         rc = append_file(t->dirfd, CATALOG_FILE, rec, 8, t->opt.fsync);
@@ -488,7 +491,17 @@ int tsdb_series_at(tsdb *t, const char *name, const char *path, uint32_t *id)
     return rc;
 }
 
-int tsdb_series(tsdb *t, const char *name, uint32_t *id) { return tsdb_series_at(t, name, NULL, id); }
+int tsdb_series_at(tsdb *t, const char *name, const char *path, uint32_t *id)
+{
+    return series_make(t, name, -1, path, id);
+}
+
+int tsdb_series(tsdb *t, const char *name, uint32_t *id) { return series_make(t, name, -1, NULL, id); }
+
+int tsdb_series_create(tsdb *t, const char *name, tsdb_type type, const char *path, uint32_t *id)
+{
+    return series_make(t, name, (int)type, path, id);
+}
 
 uint32_t tsdb_series_count(tsdb *t)
 {
@@ -505,6 +518,49 @@ const char *tsdb_series_name(tsdb *t, uint32_t id)
     return route(t, id, &e, &local) ? eng_series_name(e, local) : NULL;
 }
 
+int tsdb_series_type(tsdb *t, uint32_t id, tsdb_type *type)
+{
+    eng *e;
+    uint32_t local;
+    int ty = route(t, id, &e, &local) ? eng_series_type(e, local) : -1;
+    if (ty < 0)
+        return TSDB_ERR_NOTFOUND;
+    *type = (tsdb_type)ty;
+    return 0;
+}
+
+/* ---------------------------------------------------------------- states */
+
+static int state_get(tsdb *t, uint32_t series, const char *name, bool create, uint32_t *code)
+{
+    eng *e;
+    uint32_t local;
+    if (!name || !*name)
+        return TSDB_ERR_INVALID;
+    if (!route(t, series, &e, &local))
+        return TSDB_ERR_NOTFOUND;
+    if (create && t->opt.read_only)
+        create = false;
+    return eng_state(e, name, create, code);
+}
+
+int tsdb_state(tsdb *t, uint32_t series, const char *name, uint32_t *code)
+{
+    return state_get(t, series, name, true, code);
+}
+
+int tsdb_state_lookup(tsdb *t, uint32_t series, const char *name, uint32_t *code)
+{
+    return state_get(t, series, name, false, code);
+}
+
+const char *tsdb_state_name(tsdb *t, uint32_t series, uint32_t code)
+{
+    eng *e;
+    uint32_t local;
+    return route(t, series, &e, &local) ? eng_state_name(e, code) : NULL;
+}
+
 const char *tsdb_series_path(tsdb *t, uint32_t id)
 {
     pthread_rwlock_rdlock(&t->lock);
@@ -515,32 +571,51 @@ const char *tsdb_series_path(tsdb *t, uint32_t id)
 
 /* ---------------------------------------------------------------- writes */
 
-int tsdb_insert_series(tsdb *t, uint32_t series, const int64_t *ts, const float *values, size_t n)
+/* A column as slots of its type: the caller's array when it already is one
+ * (no nulls, not bool), else a converted copy in *owned. */
+static int vals_import(const tsdb_values *in, size_t n, const void **slots, void **owned)
 {
-    eng *e;
-    uint32_t local;
-    if (t->opt.read_only)
-        return TSDB_ERR_READONLY;
-    return route(t, series, &e, &local) ? eng_insert_series(e, local, ts, values, n) : TSDB_ERR_INVALID;
+    *owned = NULL;
+    if (!in || !type_valid(in->type) || (n && !in->values))
+        return TSDB_ERR_INVALID;
+    if (!in->valid && in->type != TSDB_BOOL) {
+        *slots = in->values;
+        return 0;
+    }
+    size_t w = type_width(in->type);
+    uint8_t *o = malloc(n ? n * w : 1);
+    if (!o)
+        return TSDB_ERR_NOMEM;
+    uint64_t null = type_null(in->type);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t x = in->type == TSDB_BOOL ? ((const uint8_t *)in->values)[i] != 0 : slot_get(in->values, w, i);
+        if (in->valid && !((in->valid[i >> 3] >> (i & 7)) & 1))
+            x = null;
+        slot_put(o, w, i, x);
+    }
+    *slots = o;
+    *owned = o;
+    return 0;
 }
 
-int tsdb_append(tsdb *t, uint32_t series, int64_t ts, float value)
+static int insert_series_slots(tsdb *t, int type, uint32_t series, const int64_t *ts, const void *v, size_t n)
 {
     eng *e;
     uint32_t local;
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
-    return route(t, series, &e, &local) ? eng_append(e, local, ts, value) : TSDB_ERR_INVALID;
+    return route(t, series, &e, &local) ? eng_insert_series(e, type, local, ts, v, n) : TSDB_ERR_INVALID;
 }
 
 /* Rows of several series: split by volume, local ids, each volume written on
  * its own (a batch that spans volumes is durable per volume). */
-int tsdb_insert(tsdb *t, const uint32_t *series, const int64_t *ts, const float *values, size_t n)
+static int insert_slots(tsdb *t, int type, const uint32_t *series, const int64_t *ts, const void *values, size_t n)
 {
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
     if (n && (!series || !ts || !values))
         return TSDB_ERR_INVALID;
+    size_t w = type_width(type);
     pthread_rwlock_rdlock(&t->lock);
     size_t nv = t->nvols, ncat = t->ncat;
     bool identity = nv == 1; /* the root alone: global ids are its local ids */
@@ -552,12 +627,12 @@ int tsdb_insert(tsdb *t, const uint32_t *series, const int64_t *ts, const float 
     if (identity) {
         eng *root = t->vols[0];
         pthread_rwlock_unlock(&t->lock);
-        return eng_insert(root, series, ts, values, n);
+        return eng_insert(root, type, series, ts, values, n);
     }
     size_t *cnt = calloc(nv + 1, sizeof *cnt);
     uint32_t *ls = malloc(n * sizeof *ls);
     int64_t *lt = malloc(n * sizeof *lt);
-    float *lv = malloc(n * sizeof *lv);
+    uint8_t *lv = malloc(n * w);
     int rc = (!cnt || !ls || !lt || !lv) ? TSDB_ERR_NOMEM : 0;
     if (rc == 0) {
         for (size_t i = 0; i < n; i++)
@@ -573,7 +648,7 @@ int tsdb_insert(tsdb *t, const uint32_t *series, const int64_t *ts, const float 
                 size_t o = pos[t->cat_vol[series[i]]]++;
                 ls[o] = t->cat_local[series[i]];
                 lt[o] = ts[i];
-                lv[o] = values[i];
+                memcpy(lv + o * w, (const uint8_t *)values + i * w, w);
             }
             free(pos);
         }
@@ -584,7 +659,7 @@ int tsdb_insert(tsdb *t, const uint32_t *series, const int64_t *ts, const float 
     pthread_rwlock_unlock(&t->lock);
     for (size_t v = 0; rc == 0 && vols && v < nv; v++)
         if (cnt[v + 1] > cnt[v])
-            rc = eng_insert(vols[v], ls + cnt[v], lt + cnt[v], lv + cnt[v], cnt[v + 1] - cnt[v]);
+            rc = eng_insert(vols[v], type, ls + cnt[v], lt + cnt[v], lv + cnt[v] * w, cnt[v + 1] - cnt[v]);
     if (!vols && rc == 0)
         rc = TSDB_ERR_NOMEM;
     free(vols);
@@ -592,6 +667,43 @@ int tsdb_insert(tsdb *t, const uint32_t *series, const int64_t *ts, const float 
     free(ls);
     free(lt);
     free(lv);
+    return rc;
+}
+
+int tsdb_insert_series(tsdb *t, uint32_t series, const int64_t *ts, const float *values, size_t n)
+{
+    return insert_series_slots(t, TSDB_FLOAT32, series, ts, values, n);
+}
+
+int tsdb_append(tsdb *t, uint32_t series, int64_t ts, float value)
+{
+    return insert_series_slots(t, TSDB_FLOAT32, series, &ts, &value, 1);
+}
+
+int tsdb_insert(tsdb *t, const uint32_t *series, const int64_t *ts, const float *values, size_t n)
+{
+    return insert_slots(t, TSDB_FLOAT32, series, ts, values, n);
+}
+
+int tsdb_insert_values(tsdb *t, const uint32_t *series, const int64_t *ts, const tsdb_values *values, size_t n)
+{
+    const void *slots;
+    void *owned;
+    int rc = vals_import(values, n, &slots, &owned);
+    if (rc == 0)
+        rc = insert_slots(t, values->type, series, ts, slots, n);
+    free(owned);
+    return rc;
+}
+
+int tsdb_insert_series_values(tsdb *t, uint32_t series, const int64_t *ts, const tsdb_values *values, size_t n)
+{
+    const void *slots;
+    void *owned;
+    int rc = vals_import(values, n, &slots, &owned);
+    if (rc == 0)
+        rc = insert_series_slots(t, values->type, series, ts, slots, n);
+    free(owned);
     return rc;
 }
 
@@ -641,11 +753,16 @@ int tsdb_drop_before(tsdb *t, int64_t ts)
 
 /* --------------------------------------------------------------- queries */
 
-int tsdb_query_raw(tsdb *t, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx)
+/* float32 rows to a tsdb_raw_fn: the slots are the floats */
+typedef struct f32_out {
+    tsdb_raw_fn fn;
+    void *ctx;
+} f32_out;
+
+static int f32_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 {
-    eng *e;
-    uint32_t local;
-    return route(t, series, &e, &local) ? eng_query_raw(e, local, start, end, fn, ctx) : 0;
+    f32_out *o = arg;
+    return o->fn(o->ctx, ts, v, n);
 }
 
 int tsdb_query_raw_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
@@ -655,7 +772,16 @@ int tsdb_query_raw_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
     uint32_t local;
     if (!route(t, series, &e, &local))
         return 0;
-    return eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, fn, ctx);
+    if (eng_series_type(e, local) != TSDB_FLOAT32)
+        return TSDB_ERR_INVALID; /* tsdb_query_values reads every type */
+    f32_out o = {fn, ctx};
+    return eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, f32_cb,
+                            &o);
+}
+
+int tsdb_query_raw(tsdb *t, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx)
+{
+    return tsdb_query_raw_ex(t, series, start, end, NULL, fn, ctx);
 }
 
 static int collect_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
@@ -693,13 +819,65 @@ int tsdb_query_points_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, c
 
 int tsdb_query_points(tsdb *t, uint32_t series, int64_t start, int64_t end, tsdb_points *out)
 {
+    return tsdb_query_points_ex(t, series, start, end, NULL, out);
+}
+
+/* Slots to the caller's columns: a validity bitmap when a chunk holds nulls,
+ * bools as bytes. */
+typedef struct vals_out {
+    tsdb_values_fn fn;
+    void *ctx;
+    int type;
+    uint8_t *valid, *bytes;
+    size_t cap;
+} vals_out;
+
+static int vals_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    vals_out *o = arg;
+    if (n > o->cap) {
+        size_t cap = MAX(n, o->cap * 2);
+        uint8_t *va = realloc(o->valid, (cap + 7) / 8);
+        if (!va)
+            return 1;
+        o->valid = va;
+        uint8_t *b = realloc(o->bytes, cap);
+        if (!b)
+            return 1;
+        o->bytes = b;
+        o->cap = cap;
+    }
+    size_t w = type_width(o->type);
+    uint64_t null = type_null(o->type);
+    bool nulls = false;
+    memset(o->valid, 0, (n + 7) / 8);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t x = slot_get(v, w, i);
+        bool known = x != null;
+        o->valid[i >> 3] |= (uint8_t)(known << (i & 7));
+        nulls |= !known;
+        if (o->type == TSDB_BOOL)
+            o->bytes[i] = x == 1;
+    }
+    tsdb_values col = {(tsdb_type)o->type, o->type == TSDB_BOOL ? (const void *)o->bytes : v, nulls ? o->valid : NULL};
+    return o->fn(o->ctx, ts, &col, n);
+}
+
+int tsdb_query_values(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+                      tsdb_values_fn fn, void *ctx)
+{
     eng *e;
     uint32_t local;
-    if (!route(t, series, &e, &local)) {
-        memset(out, 0, sizeof *out);
+    if (!route(t, series, &e, &local))
         return 0;
-    }
-    return eng_query_points(e, local, start, end, out);
+    vals_out o = {fn, ctx, eng_series_type(e, local), NULL, NULL, 0};
+    if (o.type < 0)
+        return 0;
+    int rc = eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, vals_cb,
+                              &o);
+    free(o.valid);
+    free(o.bytes);
+    return rc;
 }
 
 int tsdb_query_agg(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,

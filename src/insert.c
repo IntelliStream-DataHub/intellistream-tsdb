@@ -7,6 +7,10 @@
  * "one row per series per timestamp" batches are sorted by time but not by
  * series; the radix sort then skips every timestamp digit because a stable
  * sort by series keeps the time order.
+ *
+ * Values are slots of the batch's type (4 or 8 bytes). The sort moves 16-byte
+ * records whatever the type: their payload is the value itself for 4-byte
+ * types, and the row's index for 8-byte ones, gathered after sorting.
  */
 #include "internal.h"
 
@@ -57,7 +61,7 @@ static void *scratch_get(int slot, size_t bytes)
 typedef struct rec {
     int64_t ts;
     uint32_t series;
-    float v;
+    uint32_t v; /* 4-byte types: the value's bits; 8-byte types: the row (chunks have < 2^32 rows) */
 } rec;
 
 typedef struct prange {
@@ -93,15 +97,15 @@ int part_list_push(part_list *l, part *p)
 }
 
 /* Adds one series run to w, keeping only the last row of equal timestamps. */
-static int add_run_unique(part_writer *w, uint32_t s, const int64_t *ts, const float *v, size_t n)
+static int add_run_unique(part_writer *w, uint32_t s, int type, const int64_t *ts, const uint8_t *v, size_t n)
 {
-    size_t dup = 1;
+    size_t dup = 1, wd = type_width(type);
     while (dup < n && ts[dup] != ts[dup - 1])
         dup++;
     if (dup >= n)
-        return pw_add(w, s, ts, v, n); /* the common case: no duplicates */
+        return pw_add(w, s, type, ts, v, n); /* the common case: no duplicates */
     int64_t *t2 = malloc(n * sizeof *t2);
-    float *v2 = malloc(n * sizeof *v2);
+    uint8_t *v2 = malloc(n * wd);
     int rc = TSDB_ERR_NOMEM;
     if (t2 && v2) {
         size_t o = 0;
@@ -109,10 +113,10 @@ static int add_run_unique(part_writer *w, uint32_t s, const int64_t *ts, const f
             if (o && t2[o - 1] == ts[i])
                 o--;
             t2[o] = ts[i];
-            v2[o] = v[i];
+            memcpy(v2 + o * wd, v + i * wd, wd);
             o++;
         }
-        rc = pw_add(w, s, t2, v2, o);
+        rc = pw_add(w, s, type, t2, v2, o);
     }
     free(t2);
     free(v2);
@@ -121,9 +125,10 @@ static int add_run_unique(part_writer *w, uint32_t s, const int64_t *ts, const f
 
 /* Writes rows already in (partition, series, ts) order, equal keys in
  * insertion order, as pending parts appended to `collect`. */
-static int write_sorted(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v, size_t n,
-                        uint64_t wal_seq, part_list *collect)
+static int write_sorted(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v,
+                        size_t n, uint64_t wal_seq, part_list *collect)
 {
+    size_t wd = type_width(type);
     size_t i = 0;
     while (i < n) {
         prange r;
@@ -143,7 +148,7 @@ static int write_sorted(eng *db, const uint32_t *series, uint32_t cs, const int6
                     m++;
             else
                 m = j;
-            rc = add_run_unique(&w, s, ts + k, v + k, m - k);
+            rc = add_run_unique(&w, s, type, ts + k, (const uint8_t *)v + k * wd, m - k);
             k = m;
         }
         if (rc) {
@@ -262,9 +267,10 @@ static rec *merge_sort_recs(const eng *db, rec *a, rec *tmp, size_t n)
  * pass straight into the output arrays sort the batch. Returns 1 when a series
  * goes back in time or the key space is too sparse, and the caller falls back
  * to the radix sort. */
-static int bucket_write(eng *db, const uint32_t *series, const int64_t *ts, const float *v, size_t n,
+static int bucket_write(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n,
                         uint64_t wal_seq, part_list *collect)
 {
+    size_t wd = type_width(type);
     uint32_t smin = UINT32_MAX, smax = 0;
     int64_t tmin = INT64_MAX, tmax = INT64_MIN;
     for (size_t i = 0; i < n; i++) {
@@ -283,7 +289,7 @@ static int bucket_write(eng *db, const uint32_t *series, const int64_t *ts, cons
     int64_t *last = scratch_get(SCR_B, ns * sizeof *last);
     uint32_t *os = scratch_get(SCR_S, n * sizeof *os);
     int64_t *ot = scratch_get(SCR_T, n * sizeof *ot);
-    float *ov = scratch_get(SCR_V, n * sizeof *ov);
+    uint8_t *ov = scratch_get(SCR_V, n * wd);
     if (!cnt || !pr || !last || !os || !ot || !ov)
         return TSDB_ERR_NOMEM;
     memset(cnt, 0, (nb + 1) * sizeof *cnt);
@@ -315,23 +321,39 @@ static int bucket_write(eng *db, const uint32_t *series, const int64_t *ts, cons
         size_t o = cnt[(size_t)(pr[k].p - pmin) * ns + k]++;
         os[o] = series[i];
         ot[o] = ts[i];
-        ov[o] = v[i];
+        if (wd == 4)
+            memcpy(ov + 4 * o, (const uint8_t *)v + 4 * i, 4);
+        else
+            memcpy(ov + 8 * o, (const uint8_t *)v + 8 * i, 8);
     }
-    return write_sorted(db, os, 0, ot, ov, n, wal_seq, collect);
+    return write_sorted(db, type, os, 0, ot, ov, n, wal_seq, collect);
 }
 
-static int sort_and_write(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v,
+/* The sorted records' values into ov: in the record, or gathered by row. */
+static inline void gather(const rec *r, size_t n, const void *v, size_t wd, uint8_t *ov)
+{
+    if (wd == 4) {
+        for (size_t i = 0; i < n; i++)
+            memcpy(ov + 4 * i, &r[i].v, 4);
+    } else {
+        for (size_t i = 0; i < n; i++)
+            memcpy(ov + 8 * i, (const uint8_t *)v + 8 * (size_t)r[i].v, 8);
+    }
+}
+
+static int sort_and_write(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v,
                           size_t n, bool ts_sorted, uint64_t wal_seq, part_list *collect)
 {
     if (series) {
-        int rc = bucket_write(db, series, ts, v, n, wal_seq, collect);
+        int rc = bucket_write(db, type, series, ts, v, n, wal_seq, collect);
         if (rc != 1)
             return rc;
     }
+    size_t wd = type_width(type);
     rec *a = scratch_get(SCR_A, n * sizeof *a), *b = scratch_get(SCR_B, n * sizeof *b);
     uint32_t *os = scratch_get(SCR_S, n * sizeof *os);
     int64_t *ot = scratch_get(SCR_T, n * sizeof *ot);
-    float *ov = scratch_get(SCR_V, n * sizeof *ov);
+    uint8_t *ov = scratch_get(SCR_V, n * wd);
     uint32_t *pk = NULL;
     int rc = TSDB_ERR_NOMEM;
     if (!a || !b || !os || !ot || !ov)
@@ -341,7 +363,10 @@ static int sort_and_write(eng *db, const uint32_t *series, uint32_t cs, const in
     for (size_t i = 0; i < n; i++) {
         a[i].ts = ts[i];
         a[i].series = series ? series[i] : cs;
-        a[i].v = v[i];
+        if (wd == 4)
+            memcpy(&a[i].v, (const uint8_t *)v + 4 * i, 4);
+        else
+            a[i].v = (uint32_t)i;
         tmin = MIN(tmin, ts[i]);
         tmax = MAX(tmax, ts[i]);
     }
@@ -355,8 +380,8 @@ static int sort_and_write(eng *db, const uint32_t *series, uint32_t cs, const in
         for (size_t i = 0; i < n; i++) {
             os[i] = res[i].series;
             ot[i] = res[i].ts;
-            ov[i] = res[i].v;
         }
+        gather(res, n, v, wd, ov);
     } else if (np <= (1u << 20) && (pk = malloc(n * sizeof *pk)) != NULL) {
         size_t *cnt = calloc(np + 1, sizeof *cnt);
         if (!cnt)
@@ -384,8 +409,8 @@ static int sort_and_write(eng *db, const uint32_t *series, uint32_t cs, const in
             for (size_t i = 0; i < len; i++) {
                 os[lo + i] = res[i].series;
                 ot[lo + i] = res[i].ts;
-                ov[lo + i] = res[i].v;
             }
+            gather(res, len, v, wd, ov + lo * wd);
         }
         free(cnt);
     } else {
@@ -393,18 +418,19 @@ static int sort_and_write(eng *db, const uint32_t *series, uint32_t cs, const in
         for (size_t i = 0; i < n; i++) {
             os[i] = res[i].series;
             ot[i] = res[i].ts;
-            ov[i] = res[i].v;
         }
+        gather(res, n, v, wd, ov);
     }
-    rc = write_sorted(db, os, 0, ot, ov, n, wal_seq, collect);
+    rc = write_sorted(db, type, os, 0, ot, ov, n, wal_seq, collect);
 out:
     free(pk);
     return rc;
 }
 
-static int insert_rows_into(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v,
-                            size_t n, uint64_t wal_seq, part_list *collect)
+static int insert_rows_into(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts,
+                            const void *v, size_t n, uint64_t wal_seq, part_list *collect)
 {
+    size_t wd = type_width(type);
     bool sorted = true;
     prange r;
     prange_of(db, ts[0], &r);
@@ -422,14 +448,15 @@ static int insert_rows_into(eng *db, const uint32_t *series, uint32_t cs, const 
         }
     }
     if (sorted)
-        return write_sorted(db, series, cs, ts, v, n, wal_seq, collect);
+        return write_sorted(db, type, series, cs, ts, v, n, wal_seq, collect);
     /* chunks are written in order, so a later chunk's part is newer: last write still wins */
     for (size_t off = 0; off < n; off += SORT_CHUNK_ROWS) {
         size_t m = MIN(n - off, SORT_CHUNK_ROWS);
         bool ts_sorted = true; /* lets the radix sort skip the timestamp digits */
         for (size_t i = off + 1; i < off + m && ts_sorted; i++)
             ts_sorted = ts[i] >= ts[i - 1];
-        int rc = sort_and_write(db, series ? series + off : NULL, cs, ts + off, v + off, m, ts_sorted, wal_seq, collect);
+        int rc = sort_and_write(db, type, series ? series + off : NULL, cs, ts + off, (const uint8_t *)v + off * wd, m,
+                                ts_sorted, wal_seq, collect);
         if (rc)
             return rc;
     }
@@ -452,15 +479,15 @@ int parts_publish(eng *db, part **ps, size_t n)
 /* All parts of one insert are committed together (all or nothing) and
  * published together. With `collect`, they are handed back pending instead,
  * for the caller to publish with parts_commit under publish_lock. */
-int insert_rows(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v, size_t n,
+int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t n,
                 uint64_t wal_seq, part_list *collect)
 {
     if (n == 0)
         return 0;
     if (collect)
-        return insert_rows_into(db, series, cs, ts, v, n, wal_seq, collect);
+        return insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, collect);
     part_list mine = {0};
-    int rc = insert_rows_into(db, series, cs, ts, v, n, wal_seq, &mine);
+    int rc = insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, &mine);
     if (rc == 0)
         rc = parts_publish(db, mine.p, mine.n);
     if (rc) {

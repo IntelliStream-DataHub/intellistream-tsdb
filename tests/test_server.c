@@ -204,6 +204,140 @@ static void test_framing(void)
     close(rfd);
 }
 
+/* Value types over the wire (protocol version 2). */
+typedef struct vrows {
+    size_t n;
+    int64_t ts[64];
+    int64_t i[64];
+    bool known[64];
+    int type;
+} vrows;
+
+static int collect_values(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    vrows *r = ctx;
+    r->type = col->type;
+    for (size_t k = 0; k < n && r->n < 64; k++, r->n++) {
+        r->ts[r->n] = ts[k];
+        r->known[r->n] = !col->valid || ((col->valid[k >> 3] >> (k & 7)) & 1);
+        switch (col->type) {
+        case TSDB_FLOAT64: r->i[r->n] = (int64_t)((const double *)col->values)[k]; break;
+        case TSDB_INT64: r->i[r->n] = ((const int64_t *)col->values)[k]; break;
+        case TSDB_BOOL: r->i[r->n] = ((const uint8_t *)col->values)[k]; break;
+        case TSDB_STATE: r->i[r->n] = ((const uint32_t *)col->values)[k]; break;
+        default: r->i[r->n] = (int64_t)((const float *)col->values)[k]; break;
+        }
+    }
+    return 0;
+}
+
+static void test_types(tsdbc *c)
+{
+    uint32_t d, i, b, st, again;
+    OK(tsdbc_series_create(c, "t.f64", TSDB_FLOAT64, NULL, &d));
+    OK(tsdbc_series_create(c, "t.i64", TSDB_INT64, NULL, &i));
+    OK(tsdbc_series_create(c, "t.bool", TSDB_BOOL, NULL, &b));
+    OK(tsdbc_series_create(c, "t.state", TSDB_STATE, NULL, &st));
+    CHECK(tsdbc_series_create(c, "t.f64", TSDB_INT64, NULL, &again) == TSDB_ERR_INVALID);
+    tsdb_type ty;
+    OK(tsdbc_series_type(c, i, &ty));
+    CHECK(ty == TSDB_INT64);
+
+    /* one series, with nulls: rows 3 and 9 unknown */
+    int64_t ts[12];
+    int64_t iv[12];
+    uint8_t valid[2] = {0xff, 0xff};
+    for (int k = 0; k < 12; k++) {
+        ts[k] = T0 + k * 1000;
+        iv[k] = (int64_t)k * 1000000000000 - 5;
+    }
+    valid[0] &= (uint8_t)~(1u << 3);
+    valid[1] &= (uint8_t)~(1u << 1);
+    tsdb_values col = {TSDB_INT64, iv, valid};
+    OK(tsdbc_insert_series_values(c, i, ts, &col, 12));
+    vrows r = {0};
+    OK(tsdbc_query_values(c, i, INT64_MIN, INT64_MAX, NULL, collect_values, &r));
+    CHECK(r.n == 12 && r.type == TSDB_INT64);
+    for (size_t k = 0; k < r.n; k++)
+        CHECK(r.ts[k] == ts[k] && r.known[k] == (k != 3 && k != 9) && (!r.known[k] || r.i[k] == iv[k]));
+    tsdb_query_opts newest = {TSDB_DESC, 2};
+    r.n = 0;
+    OK(tsdbc_query_values(c, i, INT64_MIN, INT64_MAX, &newest, collect_values, &r));
+    CHECK(r.n == 2 && r.ts[0] == ts[11] && r.ts[1] == ts[10]);
+    tsdb_bucket *bk;
+    size_t nb;
+    OK(tsdbc_query_agg(c, i, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    int64_t want = 0;
+    for (int k = 0; k < 12; k++)
+        want += k == 3 || k == 9 ? 0 : iv[k];
+    CHECK(nb == 1 && bk[0].count == 10 && bk[0].isum == want && bk[0].imin == iv[0] && bk[0].imax == iv[11]);
+    free(bk);
+    tsdb_group g = {TSDB_SECOND, 4, "UTC"};
+    tsdb_query_opts last = {TSDB_DESC, 1};
+    OK(tsdbc_query_group(c, i, INT64_MIN, INT64_MAX, &g, &last, &bk, &nb));
+    CHECK(nb == 1 && bk[0].start == T0 + 8000 && bk[0].count == 3 && bk[0].isum == iv[8] + iv[10] + iv[11]);
+    free(bk);
+
+    /* many series in one frame: float64 rows for d, then bools, states */
+    uint32_t sv[4] = {d, d, d, d};
+    double dv[4] = {1.5, 2.25, -3.0, 1e300};
+    OK(tsdbc_insert_values(c, sv, ts, &(tsdb_values){TSDB_FLOAT64, dv, NULL}, 4));
+    OK(tsdbc_query_agg(c, d, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    CHECK(nb == 1 && bk[0].count == 4 && bk[0].min == -3.0 && bk[0].max == 1e300);
+    free(bk);
+    uint8_t bv[5] = {1, 0, 1, 1, 0};
+    uint8_t bvalid = 0x1f & ~0x04;
+    OK(tsdbc_insert_series_values(c, b, ts, &(tsdb_values){TSDB_BOOL, bv, &bvalid}, 5));
+    r.n = 0;
+    OK(tsdbc_query_values(c, b, INT64_MIN, INT64_MAX, NULL, collect_values, &r));
+    CHECK(r.n == 5 && r.type == TSDB_BOOL && r.i[0] == 1 && r.i[1] == 0 && !r.known[2] && r.i[3] == 1);
+    OK(tsdbc_query_agg(c, b, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    CHECK(nb == 1 && bk[0].count == 4 && bk[0].isum == 2);
+    free(bk);
+    uint32_t on, off, code;
+    OK(tsdbc_state(c, st, "on", &on));
+    OK(tsdbc_state(c, st, "off", &off));
+    CHECK(tsdbc_state_lookup(c, st, "standby", &code) == TSDB_ERR_NOTFOUND);
+    OK(tsdbc_state_lookup(c, st, "off", &code));
+    CHECK(code == off && on != off);
+    char name[16];
+    OK(tsdbc_state_name(c, st, on, name, sizeof name));
+    CHECK(strcmp(name, "on") == 0);
+    CHECK(tsdbc_state_name(c, st, 999, name, sizeof name) == TSDB_ERR_NOTFOUND);
+    uint32_t codes[3] = {on, off, on};
+    uint32_t stv[3] = {st, st, st};
+    OK(tsdbc_insert_values(c, stv, ts, &(tsdb_values){TSDB_STATE, codes, NULL}, 3));
+    r.n = 0;
+    OK(tsdbc_query_values(c, st, INT64_MIN, INT64_MAX, NULL, collect_values, &r));
+    CHECK(r.n == 3 && r.i[0] == on && r.i[1] == off && r.i[2] == on);
+
+    /* the version 1 operations: float32 only */
+    float f = 1;
+    CHECK(tsdbc_insert_series(c, d, ts, &f, 1) == TSDB_ERR_INVALID);
+    tsdb_points pts;
+    CHECK(tsdbc_query_points(c, d, INT64_MIN, INT64_MAX, &pts) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_insert_values(c, sv, ts, &(tsdb_values){TSDB_INT64, iv, NULL}, 4) == TSDB_ERR_INVALID);
+
+    /* QUERY_AGG still answers with version 1 rows (f32 min and max) */
+    int fd = raw_connect();
+    uint8_t q[28];
+    int64_t lo = INT64_MIN, hi = INT64_MAX, every = 0;
+    memcpy(q, &d, 4);
+    memcpy(q + 4, &lo, 8);
+    memcpy(q + 12, &hi, 8);
+    memcpy(q + 20, &every, 8);
+    raw_send(fd, 5, TSDB_OP_QUERY_AGG, q, sizeof q);
+    uint32_t rid;
+    uint8_t rest[64];
+    size_t nrest = 0;
+    CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0);
+    float mn, mx;
+    memcpy(&mn, rest + 4 + 24, 4);
+    memcpy(&mx, rest + 4 + 28, 4);
+    CHECK(nrest == 4 + TSDB_AGG_ROW && mn == -3.0f && isinf(mx));
+    close(fd);
+}
+
 typedef struct counter {
     size_t rows, calls, stop_after;
     int64_t last;
@@ -405,6 +539,7 @@ int main(int argc, char **argv)
 
     test_close(c);
     test_framing();
+    test_types(c);
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);

@@ -1,8 +1,11 @@
 /*
  * tsdb - an embedded time series database in the spirit of ClickHouse MergeTree.
  *
- * Data model: named series of (DateTime64(3) timestamp, Float32 value) points.
- * Timestamps are milliseconds since the Unix epoch (int64).
+ * Data model: named series of (DateTime64(3) timestamp, value) points.
+ * Timestamps are milliseconds since the Unix epoch (int64). A series has one
+ * value type, chosen when it is created: float32 (the default), float64,
+ * int64, bool, or state (a string from a small set, stored as a code). Any
+ * value may be null: unknown, skipped by aggregates.
  *
  * Storage: every insert writes an immutable, sorted "part" file. Parts are
  * grouped into time partitions and merged in the background, exactly like
@@ -75,6 +78,33 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out);
 int tsdb_close(tsdb *db);
 const char *tsdb_strerror(int err);
 
+/* ---- value types ---- */
+typedef enum tsdb_type {
+    TSDB_FLOAT32 = 0,
+    TSDB_FLOAT64 = 1,
+    TSDB_INT64 = 2,
+    TSDB_BOOL = 3,
+    TSDB_STATE = 4, /* a code from tsdb_state(); the names live in a per-volume dictionary */
+} tsdb_type;
+
+/* A column of values. `values` points at float, double, int64_t, uint8_t
+ * (bool: 0 or 1) or uint32_t (state codes) according to `type`. `valid` is a
+ * bitmap, bit i (LSB first) set when value i is known; NULL means all are
+ * known. A null's value is ignored on input and unspecified on output.
+ *
+ * Reserved as the representation of null, so they read back as null: the
+ * int64 value INT64_MIN, state code 0, and one NaN payload per float type
+ * (TSDB_NULL_F32_BITS, TSDB_NULL_F64_BITS). Other NaNs are values: ignored
+ * by min/max, they propagate into sum. */
+typedef struct tsdb_values {
+    tsdb_type type;
+    const void *values;
+    const uint8_t *valid;
+} tsdb_values;
+
+#define TSDB_NULL_F32_BITS 0x7fc01001u
+#define TSDB_NULL_F64_BITS 0x7ff8000000001001ull
+
 /* ---- series ----
  * A series is stored in one volume: the database directory itself, or the
  * directory given to tsdb_series_at when the series is created (for example
@@ -83,6 +113,11 @@ const char *tsdb_strerror(int err);
 int tsdb_series(tsdb *db, const char *name, uint32_t *id);        /* get or create in the database directory */
 int tsdb_series_at(tsdb *db, const char *name, const char *path, uint32_t *id); /* get or create in volume `path` */
 int tsdb_series_lookup(tsdb *db, const char *name, uint32_t *id); /* TSDB_ERR_NOTFOUND if missing */
+/* Get or create a series of `type` in volume `path` (NULL: the database
+ * directory). An existing series keeps its type: asking for another one is
+ * TSDB_ERR_INVALID. tsdb_series and tsdb_series_at create float32 series. */
+int tsdb_series_create(tsdb *db, const char *name, tsdb_type type, const char *path, uint32_t *id);
+int tsdb_series_type(tsdb *db, uint32_t id, tsdb_type *type);
 uint32_t tsdb_series_count(tsdb *db);
 const char *tsdb_series_name(tsdb *db, uint32_t id); /* valid until tsdb_close */
 const char *tsdb_series_path(tsdb *db, uint32_t id); /* its volume's directory */
@@ -102,6 +137,19 @@ const char *tsdb_volume_path(tsdb *db, uint32_t index);
 int tsdb_insert(tsdb *db, const uint32_t *series, const int64_t *ts, const float *values, size_t n);
 int tsdb_insert_series(tsdb *db, uint32_t series, const int64_t *ts, const float *values, size_t n);
 
+/* The same for any value type, and with nulls. Every series of one call
+ * must have the column's type (TSDB_ERR_INVALID otherwise); the float32
+ * calls above are these with a float32 column and no nulls. */
+int tsdb_insert_values(tsdb *db, const uint32_t *series, const int64_t *ts, const tsdb_values *values, size_t n);
+int tsdb_insert_series_values(tsdb *db, uint32_t series, const int64_t *ts, const tsdb_values *values, size_t n);
+
+/* State dictionary: names <-> codes (1, 2, ...), shared by the state series
+ * of one volume. tsdb_state creates a name's code if needed; codes never
+ * change. tsdb_state_name returns NULL for an unknown code. */
+int tsdb_state(tsdb *db, uint32_t series, const char *name, uint32_t *code);
+int tsdb_state_lookup(tsdb *db, uint32_t series, const char *name, uint32_t *code); /* TSDB_ERR_NOTFOUND */
+const char *tsdb_state_name(tsdb *db, uint32_t series, uint32_t code);              /* valid until tsdb_close */
+
 /* A single point: WAL + memtable, visible at once, durable per wal_sync_ms. */
 int tsdb_append(tsdb *db, uint32_t series, int64_t ts, float value);
 /* Makes everything written so far durable without creating parts. */
@@ -111,8 +159,9 @@ int tsdb_flush(tsdb *db);
 
 /* ---- reading ---- */
 
-/* Streams points of one series in [start, end) in time order. The arrays are
- * only valid during the call. Return non-zero from fn to stop early. */
+/* Streams points of one float32 series in [start, end) in time order (nulls
+ * read as NaN; other types: TSDB_ERR_INVALID, use tsdb_query_values). The
+ * arrays are only valid during the call. Return non-zero from fn to stop early. */
 typedef int (*tsdb_raw_fn)(void *ctx, const int64_t *ts, const float *values, size_t n);
 int tsdb_query_raw(tsdb *db, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx);
 
@@ -124,11 +173,18 @@ typedef struct tsdb_points {
 int tsdb_query_points(tsdb *db, uint32_t series, int64_t start, int64_t end, tsdb_points *out);
 void tsdb_points_free(tsdb_points *p);
 
+/* Aggregates skip nulls: count is the number of known values, and a bucket
+ * with only nulls is returned with count 0 (buckets without rows are not).
+ * Floats: NaN values are ignored by min/max (NaN if there are none) but
+ * propagate into sum. int64 and bool (false 0, true 1): sum, min and max are
+ * also exact in isum, imin and imax (isum saturates at INT64_MIN/INT64_MAX).
+ * State: only count is meaningful. */
 typedef struct tsdb_bucket {
     int64_t start; /* bucket start; with interval 0 this is the query start */
     uint64_t count;
     double sum;
-    float min, max; /* NaN values are ignored by min/max (NaN if all are NaN), but propagate into sum */
+    double min, max;
+    int64_t isum, imin, imax;
 } tsdb_bucket;
 
 static inline double tsdb_bucket_avg(const tsdb_bucket *b)
@@ -156,6 +212,11 @@ int tsdb_query_raw_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, con
                       tsdb_raw_fn fn, void *ctx);
 int tsdb_query_points_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                          tsdb_points *out);
+
+/* Raw points of a series of any type, with nulls. */
+typedef int (*tsdb_values_fn)(void *ctx, const int64_t *ts, const tsdb_values *values, size_t n);
+int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+                      tsdb_values_fn fn, void *ctx);
 
 /* Calendar grouping: `count` units per bucket, in a time zone.
  *  - TSDB_SECOND, _MINUTE, _HOUR: fixed-length buckets, aligned to multiples

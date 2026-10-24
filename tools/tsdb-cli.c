@@ -11,10 +11,13 @@ static void usage(void)
             "\n"
             "  insert <series>                    read \"time,value\" lines from stdin\n"
             "  import                             read \"series,time,value\" lines from stdin\n"
+            "                                     (values by the series' type; null or empty: null;\n"
+            "                                     new series are float32)\n"
             "  query <series> <start> <end> [raw|count|sum|min|max|avg|all] [group] [--tz ZONE]\n"
             "        [--desc] [--limit N]         newest first; at most N rows or buckets\n"
-            "  create <series> [path]             create a series, in volume <path> if given\n"
-            "  series                             list series (and their volume)\n"
+            "  create <series> [path] [--type T]  create a series of type T (float32, float64, int64,\n"
+            "                                     bool, state), in volume <path> if given\n"
+            "  series                             list series (type and volume)\n"
             "  stats                              rows, parts, size, compression ratio\n"
             "  parts                              list active parts\n"
             "  optimize                           merge every partition into one part\n"
@@ -35,42 +38,119 @@ static void die(const char *what, int rc)
 
 /* ------------------------------------------------------------------ import */
 
+static const char *type_names[] = {"float32", "float64", "int64", "bool", "state"};
+
+static int parse_type(const char *s)
+{
+    for (int t = 0; t < 5; t++)
+        if (strcmp(s, type_names[t]) == 0)
+            return t;
+    return -1;
+}
+
+/* One batch per value type: a batch is written with one tsdb_insert_values. */
 typedef struct batch {
+    tsdb_type type;
     uint32_t *s;
     int64_t *t;
-    float *v;
+    uint8_t *v;     /* values of the type (bool: bytes) */
+    uint8_t *valid; /* bitmap */
+    bool nulls;
     size_t n, cap;
 } batch;
 
-static void batch_push(batch *b, uint32_t s, int64_t t, float v)
+static size_t api_width(tsdb_type t) { return t == TSDB_BOOL ? 1 : t == TSDB_FLOAT32 || t == TSDB_STATE ? 4 : 8; }
+
+static void batch_flush(tsdb *db, batch *b, size_t *total)
+{
+    if (!b->n)
+        return;
+    tsdb_values col = {b->type, b->v, b->nulls ? b->valid : NULL};
+    int rc = tsdb_insert_values(db, b->s, b->t, &col, b->n);
+    if (rc)
+        die("insert", rc);
+    *total += b->n;
+    b->n = 0;
+    b->nulls = false;
+}
+
+static void batch_push(batch *b, uint32_t s, int64_t t, const void *v, bool known)
 {
     if (b->n == b->cap) {
         b->cap = b->cap ? b->cap * 2 : 65536;
         b->s = realloc(b->s, b->cap * sizeof *b->s);
         b->t = realloc(b->t, b->cap * sizeof *b->t);
-        b->v = realloc(b->v, b->cap * sizeof *b->v);
-        if (!b->s || !b->t || !b->v)
+        b->v = realloc(b->v, b->cap * 8);
+        b->valid = realloc(b->valid, b->cap / 8);
+        if (!b->s || !b->t || !b->v || !b->valid)
             die("import", TSDB_ERR_NOMEM);
     }
-    b->s[b->n] = s;
-    b->t[b->n] = t;
-    b->v[b->n] = v;
+    size_t w = api_width(b->type), i = b->n;
+    b->s[i] = s;
+    b->t[i] = t;
+    memcpy(b->v + i * w, v, w);
+    if (i % 8 == 0)
+        b->valid[i / 8] = 0;
+    b->valid[i / 8] |= (uint8_t)(known << (i % 8));
+    b->nulls |= !known;
     b->n++;
+}
+
+/* Parses a value of `type` into out (its API layout); false if it does not parse. */
+static bool parse_value(tsdb *db, uint32_t series, tsdb_type type, const char *vs, uint8_t out[8], bool *known)
+{
+    *known = !(vs[0] == '\0' || strcmp(vs, "null") == 0 || strcmp(vs, "NULL") == 0 || strcmp(vs, "\\N") == 0);
+    memset(out, 0, 8);
+    if (!*known)
+        return true;
+    char *end;
+    switch (type) {
+    case TSDB_FLOAT32: {
+        float f = strtof(vs, &end);
+        memcpy(out, &f, 4);
+        return end != vs && !*end;
+    }
+    case TSDB_FLOAT64: {
+        double d = strtod(vs, &end);
+        memcpy(out, &d, 8);
+        return end != vs && !*end;
+    }
+    case TSDB_INT64: {
+        long long x = strtoll(vs, &end, 10);
+        int64_t i = x;
+        memcpy(out, &i, 8);
+        return end != vs && !*end;
+    }
+    case TSDB_BOOL:
+        out[0] = strcmp(vs, "1") == 0 || strcmp(vs, "true") == 0;
+        return out[0] || strcmp(vs, "0") == 0 || strcmp(vs, "false") == 0;
+    default: {
+        uint32_t code;
+        int rc = tsdb_state(db, series, vs, &code);
+        if (rc)
+            die(vs, rc);
+        memcpy(out, &code, 4);
+        return true;
+    }
+    }
 }
 
 static int cmd_import(tsdb *db, const char *fixed_series)
 {
     uint32_t fixed = 0;
+    tsdb_type fixed_type = TSDB_FLOAT32;
     int rc;
-    if (fixed_series && (rc = tsdb_series(db, fixed_series, &fixed)) != 0)
+    if (fixed_series && ((rc = tsdb_series(db, fixed_series, &fixed)) != 0 ||
+                         (rc = tsdb_series_type(db, fixed, &fixed_type)) != 0))
         die(fixed_series, rc);
-    batch b = {0};
+    batch b[5] = {{.type = TSDB_FLOAT32}, {.type = TSDB_FLOAT64}, {.type = TSDB_INT64}, {.type = TSDB_BOOL}, {.type = TSDB_STATE}};
     char *line = NULL;
     size_t cap = 0, lineno = 0, total = 0;
     ssize_t len;
     /* remember the last series name to avoid a dictionary lookup per line */
     char last_name[1024] = "";
     uint32_t last_id = 0;
+    tsdb_type last_type = TSDB_FLOAT32;
     double t0 = now_s();
     while ((len = getline(&line, &cap, stdin)) > 0) {
         lineno++;
@@ -95,39 +175,39 @@ static int cmd_import(tsdb *db, const char *fixed_series)
             return 1;
         }
         uint32_t id = fixed;
+        tsdb_type type = fixed_type;
         if (!fixed_series) {
             if (strcmp(fields[0], last_name) != 0) {
-                if ((rc = tsdb_series(db, fields[0], &last_id)) != 0)
+                if ((rc = tsdb_series(db, fields[0], &last_id)) != 0 ||
+                    (rc = tsdb_series_type(db, last_id, &last_type)) != 0)
                     die(fields[0], rc);
                 snprintf(last_name, sizeof last_name, "%s", fields[0]);
             }
             id = last_id;
+            type = last_type;
         }
         int64_t t;
-        char *vend;
+        uint8_t v[8];
+        bool known;
         const char *ts = fields[need - 2], *vs = fields[need - 1];
-        float v = strtof(vs, &vend);
-        if (!parse_time(ts, &t) || vend == vs) {
-            fprintf(stderr, "tsdb: line %zu: cannot parse \"%s\"\n", lineno, ts);
+        if (!parse_time(ts, &t) || !parse_value(db, id, type, vs, v, &known)) {
+            fprintf(stderr, "tsdb: line %zu: cannot parse \"%s,%s\" as time, %s\n", lineno, ts, vs, type_names[type]);
             return 1;
         }
-        batch_push(&b, id, t, v);
-        if (b.n >= (1u << 20)) {
-            if ((rc = tsdb_insert(db, b.s, b.t, b.v, b.n)) != 0)
-                die("insert", rc);
-            total += b.n;
-            b.n = 0;
-        }
+        batch_push(&b[type], id, t, v, known);
+        if (b[type].n >= (1u << 20))
+            batch_flush(db, &b[type], &total);
     }
-    if (b.n && (rc = tsdb_insert(db, b.s, b.t, b.v, b.n)) != 0)
-        die("insert", rc);
-    total += b.n;
+    for (int k = 0; k < 5; k++) {
+        batch_flush(db, &b[k], &total);
+        free(b[k].s);
+        free(b[k].t);
+        free(b[k].v);
+        free(b[k].valid);
+    }
     double dt = now_s() - t0;
     fprintf(stderr, "inserted %zu rows in %.2f s (%.0f rows/s)\n", total, dt, total / (dt > 0 ? dt : 1));
     free(line);
-    free(b.s);
-    free(b.t);
-    free(b.v);
     return 0;
 }
 
@@ -136,15 +216,30 @@ static int cmd_import(tsdb *db, const char *fixed_series)
 typedef struct raw_out {
     FILE *f;
     size_t n;
+    tsdb *db;
+    uint32_t series;
 } raw_out;
 
-static int print_raw(void *ctx, const int64_t *ts, const float *v, size_t n)
+static int print_raw(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
 {
     raw_out *o = ctx;
     char tb[40];
     for (size_t i = 0; i < n; i++) {
         format_time(ts[i], tb, sizeof tb);
-        fprintf(o->f, "%s\t%.9g\n", tb, v[i]);
+        if (col->valid && !((col->valid[i >> 3] >> (i & 7)) & 1)) {
+            fprintf(o->f, "%s\t\\N\n", tb); /* null, as ClickHouse writes it in TSV */
+            continue;
+        }
+        switch (col->type) {
+        case TSDB_FLOAT32: fprintf(o->f, "%s\t%.9g\n", tb, ((const float *)col->values)[i]); break;
+        case TSDB_FLOAT64: fprintf(o->f, "%s\t%.17g\n", tb, ((const double *)col->values)[i]); break;
+        case TSDB_INT64: fprintf(o->f, "%s\t%" PRId64 "\n", tb, ((const int64_t *)col->values)[i]); break;
+        case TSDB_BOOL: fprintf(o->f, "%s\t%s\n", tb, ((const uint8_t *)col->values)[i] ? "true" : "false"); break;
+        default: {
+            const char *name = tsdb_state_name(o->db, o->series, ((const uint32_t *)col->values)[i]);
+            fprintf(o->f, "%s\t%s\n", tb, name ? name : "?");
+        }
+        }
     }
     o->n += n;
     return 0;
@@ -216,8 +311,8 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     }
     double t0 = now_s();
     if (strcmp(mode, "raw") == 0) {
-        raw_out o = {stdout, 0};
-        if ((rc = tsdb_query_raw_ex(db, id, start, end, &q, print_raw, &o)) != 0)
+        raw_out o = {stdout, 0, db, id};
+        if ((rc = tsdb_query_values(db, id, start, end, &q, print_raw, &o)) != 0)
             die("query", rc);
         fprintf(stderr, "%zu rows in %.3f ms\n", o.n, (now_s() - t0) * 1e3);
         return 0;
@@ -243,23 +338,36 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     if (rc)
         die("query", rc);
     double dt = now_s() - t0;
-    bool all = strcmp(mode, "all") == 0;
+    tsdb_type type = TSDB_FLOAT32;
+    tsdb_series_type(db, id, &type);
+    bool all = strcmp(mode, "all") == 0, ints = type == TSDB_INT64 || type == TSDB_BOOL;
     if (all)
         printf("time\tcount\tsum\tmin\tmax\tavg\n");
     char tb[40];
     for (size_t i = 0; i < nb; i++) {
         format_time(b[i].start, tb, sizeof tb);
+        char sum[32], mn[32], mx[32];
+        if (ints) { /* exact */
+            snprintf(sum, sizeof sum, "%" PRId64, b[i].isum);
+            snprintf(mn, sizeof mn, "%" PRId64, b[i].imin);
+            snprintf(mx, sizeof mx, "%" PRId64, b[i].imax);
+        } else {
+            snprintf(sum, sizeof sum, "%.17g", b[i].sum);
+            snprintf(mn, sizeof mn, "%.17g", b[i].min);
+            snprintf(mx, sizeof mx, "%.17g", b[i].max);
+        }
+        if (!b[i].count && !all) /* only nulls */
+            snprintf(sum, sizeof sum, "\\N"), snprintf(mn, sizeof mn, "\\N"), snprintf(mx, sizeof mx, "\\N");
         if (all)
-            printf("%s\t%" PRIu64 "\t%.9g\t%.9g\t%.9g\t%.9g\n", tb, b[i].count, b[i].sum, b[i].min, b[i].max,
-                   tsdb_bucket_avg(&b[i]));
+            printf("%s\t%" PRIu64 "\t%s\t%s\t%s\t%.9g\n", tb, b[i].count, sum, mn, mx, tsdb_bucket_avg(&b[i]));
         else if (strcmp(mode, "count") == 0)
             printf("%s\t%" PRIu64 "\n", tb, b[i].count);
         else if (strcmp(mode, "sum") == 0)
-            printf("%s\t%.9g\n", tb, b[i].sum);
+            printf("%s\t%s\n", tb, sum);
         else if (strcmp(mode, "min") == 0)
-            printf("%s\t%.9g\n", tb, b[i].min);
+            printf("%s\t%s\n", tb, mn);
         else if (strcmp(mode, "max") == 0)
-            printf("%s\t%.9g\n", tb, b[i].max);
+            printf("%s\t%s\n", tb, mx);
         else if (strcmp(mode, "avg") == 0)
             printf("%s\t%.9g\n", tb, tsdb_bucket_avg(&b[i]));
         else
@@ -322,15 +430,32 @@ int main(int argc, char **argv)
     } else if (strcmp(cmd, "query") == 0) {
         ret = cmd_query(db, argc - 3, argv + 3);
     } else if (strcmp(cmd, "create") == 0) {
-        if (argc < 4)
+        const char *name = NULL, *path = NULL;
+        int type = TSDB_FLOAT32;
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
+                if ((type = parse_type(argv[++i])) < 0)
+                    usage();
+            } else if (!name) {
+                name = argv[i];
+            } else if (!path) {
+                path = argv[i];
+            } else {
+                usage();
+            }
+        }
+        if (!name)
             usage();
         uint32_t id;
-        if ((rc = tsdb_series_at(db, argv[3], argc > 4 ? argv[4] : NULL, &id)) != 0)
-            die(argv[3], rc);
-        printf("%u\t%s\t%s\n", id, argv[3], tsdb_series_path(db, id));
+        if ((rc = tsdb_series_create(db, name, (tsdb_type)type, path, &id)) != 0)
+            die(name, rc);
+        printf("%u\t%s\t%s\t%s\n", id, name, type_names[type], tsdb_series_path(db, id));
     } else if (strcmp(cmd, "series") == 0) {
-        for (uint32_t i = 0; i < tsdb_series_count(db); i++)
-            printf("%s\t%s\n", tsdb_series_name(db, i), tsdb_series_path(db, i));
+        for (uint32_t i = 0; i < tsdb_series_count(db); i++) {
+            tsdb_type t = TSDB_FLOAT32;
+            tsdb_series_type(db, i, &t);
+            printf("%s\t%s\t%s\n", tsdb_series_name(db, i), type_names[t], tsdb_series_path(db, i));
+        }
     } else if (strcmp(cmd, "stats") == 0) {
         tsdb_stats st;
         tsdb_get_stats(db, &st);

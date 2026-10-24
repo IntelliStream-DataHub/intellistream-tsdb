@@ -1,6 +1,12 @@
 /*
- * Series dictionary: name <-> dense uint32 id. Persisted as an append-only
- * file of [u16 length][name bytes] records; the id is the record index.
+ * Series dictionary: name <-> dense uint32 id, and each series' value type.
+ * Persisted as an append-only file of records; the id is the record index:
+ *
+ *   [u16 length][name]                  a float32 series (as written by version 1)
+ *   [u16 length | 0x8000][u8 type][name] any other type
+ *
+ * The state dictionary (STATES: state names and their codes) is the same
+ * structure in another file, without types.
  */
 #include "internal.h"
 
@@ -10,8 +16,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define SERIES_FILE "SERIES"
-#define MAX_NAME 65535
+#define MAX_NAME 32767
+#define TYPED 0x8000u
 
 static uint32_t name_hash(const char *s, size_t len) { return (uint32_t)xxh64(s, len, 0x5e71e5); }
 
@@ -48,7 +54,7 @@ static int64_t table_find(const series_dict *d, const char *name, size_t len, ui
 }
 
 /* Adds a name in memory; caller holds the lock (or is single threaded). */
-static int dict_add(series_dict *d, const char *name, size_t len, uint32_t *id)
+static int dict_add(series_dict *d, const char *name, size_t len, int type, uint32_t *id)
 {
     uint32_t n = atomic_load(&d->count);
     if ((uint64_t)(n + 1) * 2 > d->tcap && table_grow(d) != 0)
@@ -59,6 +65,10 @@ static int dict_add(series_dict *d, const char *name, size_t len, uint32_t *id)
         if (!names)
             return TSDB_ERR_NOMEM;
         d->names = names;
+        uint8_t *types = realloc(d->types, cap);
+        if (!types)
+            return TSDB_ERR_NOMEM;
+        d->types = types;
         d->cap = cap;
     }
     char *copy = malloc(len + 1);
@@ -69,18 +79,42 @@ static int dict_add(series_dict *d, const char *name, size_t len, uint32_t *id)
     uint32_t slot = 0;
     table_find(d, copy, len, &slot);
     d->names[n] = copy;
+    d->types[n] = (uint8_t)type;
     d->table[slot] = n + 1;
     atomic_store(&d->count, n + 1);
     *id = n;
     return 0;
 }
 
-int series_open(series_dict *d, int dirfd, bool read_only, bool fsync)
+/* One record at buf[pos..size): its name, length and type; false when torn. */
+static bool parse_record(const uint8_t *buf, size_t pos, size_t size, const char **name, size_t *len, int *type,
+                         size_t *rec)
+{
+    if (pos + 2 > size)
+        return false;
+    size_t h = (size_t)buf[pos] | ((size_t)buf[pos + 1] << 8), hdr = 2;
+    *type = TSDB_FLOAT32;
+    if (h & TYPED) {
+        if (pos + 3 > size)
+            return false;
+        *type = buf[pos + 2];
+        hdr = 3;
+    }
+    *len = h & ~TYPED;
+    if (pos + hdr + *len > size)
+        return false;
+    *name = (const char *)buf + pos + hdr;
+    *rec = hdr + *len;
+    return true;
+}
+
+int series_open(series_dict *d, int dirfd, const char *file, bool read_only, bool fsync)
 {
     memset(d, 0, sizeof *d);
     pthread_mutex_init(&d->lock, NULL);
+    d->file = file;
     d->fsync = fsync;
-    d->fd = openat(dirfd, SERIES_FILE, (read_only ? O_RDONLY : O_RDWR | O_CREAT | O_APPEND) | O_CLOEXEC, 0644);
+    d->fd = openat(dirfd, file, (read_only ? O_RDONLY : O_RDWR | O_CREAT | O_APPEND) | O_CLOEXEC, 0644);
     if (d->fd < 0)
         return (read_only && errno == ENOENT) ? table_grow(d) : TSDB_ERR_IO;
     struct stat st;
@@ -100,14 +134,14 @@ int series_open(series_dict *d, int dirfd, bool read_only, bool fsync)
         got += (size_t)r;
     }
     int rc = table_grow(d);
-    size_t pos = 0;
-    while (rc == 0 && pos + 2 <= size) {
-        size_t len = (size_t)buf[pos] | ((size_t)buf[pos + 1] << 8);
-        if (pos + 2 + len > size)
-            break; /* torn append at the end: ignore it, it was never acknowledged */
+    size_t pos = 0, len, rec;
+    const char *name;
+    int type;
+    /* a torn append at the end is ignored: it was never acknowledged */
+    while (rc == 0 && parse_record(buf, pos, size, &name, &len, &type, &rec)) {
         uint32_t id;
-        rc = dict_add(d, (const char *)buf + pos + 2, len, &id);
-        pos += 2 + len;
+        rc = type_valid(type) ? dict_add(d, name, len, type, &id) : TSDB_ERR_CORRUPT;
+        pos += rec;
     }
     free(buf);
     if (rc == 0 && pos != size && !read_only && ftruncate(d->fd, (off_t)pos) != 0)
@@ -120,7 +154,7 @@ int series_open(series_dict *d, int dirfd, bool read_only, bool fsync)
  * NFS that is what revalidates its size (close-to-open consistency). */
 int series_reload(series_dict *d, int dirfd)
 {
-    int fd = openat(dirfd, SERIES_FILE, O_RDONLY | O_CLOEXEC);
+    int fd = openat(dirfd, d->file, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return errno == ENOENT ? 0 : TSDB_ERR_IO;
     struct stat st;
@@ -135,14 +169,14 @@ int series_reload(series_dict *d, int dirfd)
         size_t len = (size_t)(size - off);
         uint8_t *buf = malloc(len);
         ssize_t got = buf ? pread(fd, buf, len, (off_t)off) : -1;
-        size_t pos = 0;
-        while (got > 0 && rc == 0 && pos + 2 <= (size_t)got) {
-            size_t n = (size_t)buf[pos] | ((size_t)buf[pos + 1] << 8);
-            if (pos + 2 + n > (size_t)got)
-                break; /* the writer is still appending this one */
+        size_t pos = 0, n, rec;
+        const char *name;
+        int type;
+        /* a record that does not fit is still being appended */
+        while (got > 0 && rc == 0 && parse_record(buf, pos, (size_t)got, &name, &n, &type, &rec)) {
             uint32_t id;
-            rc = dict_add(d, (const char *)buf + pos + 2, n, &id);
-            pos += 2 + n;
+            rc = type_valid(type) ? dict_add(d, name, n, type, &id) : TSDB_ERR_CORRUPT;
+            pos += rec;
         }
         d->file_off = off + pos;
         free(buf);
@@ -158,16 +192,17 @@ void series_close(series_dict *d)
     for (uint32_t i = 0; i < n; i++)
         free(d->names[i]);
     free(d->names);
+    free(d->types);
     free(d->table);
     if (d->fd >= 0)
         close(d->fd);
     pthread_mutex_destroy(&d->lock);
 }
 
-int series_get(series_dict *d, const char *name, bool create, uint32_t *id)
+int series_get(series_dict *d, const char *name, bool create, int type, uint32_t *id)
 {
     size_t len = strlen(name);
-    if (len == 0 || len > MAX_NAME)
+    if (len == 0 || len > MAX_NAME || (create && !type_valid(type)))
         return TSDB_ERR_INVALID;
     pthread_mutex_lock(&d->lock);
     uint32_t slot;
@@ -175,23 +210,29 @@ int series_get(series_dict *d, const char *name, bool create, uint32_t *id)
     int rc = 0;
     if (found >= 0) {
         *id = (uint32_t)found;
+        if (create && d->types[found] != type)
+            rc = TSDB_ERR_INVALID; /* exists with another type */
     } else if (!create) {
         rc = TSDB_ERR_NOTFOUND;
     } else if (d->fd < 0) {
         rc = TSDB_ERR_READONLY;
     } else {
-        uint8_t *rec = malloc(len + 2);
+        size_t hdr = type == TSDB_FLOAT32 ? 2 : 3; /* float32: readable by version 1 */
+        uint8_t *rec = malloc(len + hdr);
         if (!rec) {
             rc = TSDB_ERR_NOMEM;
         } else {
-            rec[0] = (uint8_t)(len & 0xff);
-            rec[1] = (uint8_t)(len >> 8);
-            memcpy(rec + 2, name, len);
-            if (write(d->fd, rec, len + 2) != (ssize_t)(len + 2) || (d->fsync && fdatasync(d->fd) != 0))
+            size_t h = len | (hdr == 3 ? TYPED : 0);
+            rec[0] = (uint8_t)(h & 0xff);
+            rec[1] = (uint8_t)(h >> 8);
+            if (hdr == 3)
+                rec[2] = (uint8_t)type;
+            memcpy(rec + hdr, name, len);
+            if (write(d->fd, rec, len + hdr) != (ssize_t)(len + hdr) || (d->fsync && fdatasync(d->fd) != 0))
                 rc = TSDB_ERR_IO;
             free(rec);
             if (rc == 0)
-                rc = dict_add(d, name, len, id);
+                rc = dict_add(d, name, len, type, id);
         }
     }
     pthread_mutex_unlock(&d->lock);
@@ -204,4 +245,28 @@ const char *series_name(series_dict *d, uint32_t id)
     const char *name = id < atomic_load(&d->count) ? d->names[id] : NULL;
     pthread_mutex_unlock(&d->lock);
     return name;
+}
+
+int series_type(series_dict *d, uint32_t id)
+{
+    pthread_mutex_lock(&d->lock);
+    int t = id < atomic_load(&d->count) ? d->types[id] : -1;
+    pthread_mutex_unlock(&d->lock);
+    return t;
+}
+
+/* Whether every series of a batch exists and has `type` (series NULL: cs alone). */
+bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n, int type)
+{
+    pthread_mutex_lock(&d->lock);
+    uint32_t count = atomic_load(&d->count);
+    bool ok = true;
+    if (!series)
+        ok = cs < count && d->types[cs] == type;
+    /* rows come grouped by series: checking where the series changes is enough */
+    for (size_t i = 0; series && ok && i < n; i++)
+        if (i == 0 || series[i] != series[i - 1])
+            ok = series[i] < count && d->types[series[i]] == type;
+    pthread_mutex_unlock(&d->lock);
+    return ok;
 }

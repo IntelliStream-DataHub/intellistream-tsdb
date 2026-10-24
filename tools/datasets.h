@@ -81,7 +81,8 @@ static inline void ds_init(ds_state *s, ds_kind kind, uint32_t series, int64_t t
     }
 }
 
-static inline void ds_next(ds_state *s, int64_t *ts_out, float *v_out)
+/* The next sample; the value in double precision, as a float64 series would store it. */
+static inline void ds_next_f64(ds_state *s, int64_t *ts_out, double *v_out)
 {
     int64_t step = ds_info[s->kind].step_ms;
     int jit = ds_info[s->kind].jitter_ms;
@@ -176,6 +177,13 @@ static inline void ds_next(ds_state *s, int64_t *ts_out, float *v_out)
     }
     s->i++;
     *ts_out = ts;
+    *v_out = v;
+}
+
+static inline void ds_next(ds_state *s, int64_t *ts_out, float *v_out)
+{
+    double v;
+    ds_next_f64(s, ts_out, &v);
     *v_out = (float)v;
 }
 

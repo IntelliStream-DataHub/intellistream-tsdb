@@ -6,7 +6,8 @@
  * The memtable becomes parts when it is full or old enough.
  *
  * WAL: one segment file wal_<seq>.log per memtable, holding records of
- * [u32 rows][u32 checksum][rows x (u32 series, i64 ts, f32 value)].
+ * [u32 rows | WAL_WIDE][u32 checksum][rows x (u32 series, i64 ts, u64 value slot)]
+ * (records without WAL_WIDE, from version 1, have f32 values).
  * Durability is group commit: one writer at a time writes everything
  * appended so far and fdatasyncs it, and wakes every waiter whose rows that
  * covered. Waiters sleep on a condition variable rather than queueing on a
@@ -16,6 +17,8 @@
  *
  * Memtables are never modified after they stop being active, and readers
  * never modify them, so queries can read a memtable while it is flushed.
+ * They hold every value as an 8-byte slot (4-byte types zero-extended), so
+ * series of all types share one; a flush writes each type's series apart.
  *
  * Lock order: flush_lock > (the wal_writing role) > db->lock > buf_lock;
  * wal_sync_lock only guards the wal_writing flag.
@@ -30,8 +33,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define WAL_ROW 16
-#define WAL_HDR 8
+#define WAL_ROW_V1 16
+#define WAL_ROW 20
 
 static int64_t mono_ms(void)
 {
@@ -101,7 +104,7 @@ static int mt_reserve(memtable *m, uint32_t id)
     if (!t)
         return TSDB_ERR_NOMEM;
     s->ts = t;
-    float *v = realloc(s->v, cap * sizeof *v);
+    uint64_t *v = realloc(s->v, cap * sizeof *v);
     if (!v)
         return TSDB_ERR_NOMEM;
     s->v = v;
@@ -118,7 +121,8 @@ static int mt_reserve(memtable *m, uint32_t id)
 }
 
 /* Adds rows to a memtable the caller may modify (the active one, under buf_lock). */
-int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v, size_t n, uint64_t lsn0)
+int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
+           uint64_t lsn0)
 {
     for (size_t i = 0; i < n; i++) {
         uint32_t id = series ? series[i] : cs;
@@ -129,7 +133,7 @@ int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         if (s->n && ts[i] < s->ts[s->n - 1])
             s->sorted = false;
         s->ts[s->n] = ts[i];
-        s->v[s->n] = v[i];
+        s->v[s->n] = slot_get(v, w, i);
         s->lsn[s->n] = lsn0 ? lsn0 + i : 0;
         s->n++;
         m->rows++;
@@ -143,7 +147,7 @@ int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, 
 
 typedef struct tv {
     int64_t t;
-    float v;
+    uint64_t v;
     uint32_t i; /* insertion order: equal timestamps keep it, so the last write stays last */
 } tv;
 
@@ -156,7 +160,7 @@ static int cmp_tv(const void *a, const void *b)
 }
 
 /* Stable sort of parallel arrays by time (series that arrived out of order). */
-static int sort_by_time(int64_t *t, float *v, size_t n)
+static int sort_by_time(int64_t *t, uint64_t *v, size_t n)
 {
     tv *a = malloc(n * sizeof *a);
     if (!a)
@@ -173,7 +177,7 @@ static int sort_by_time(int64_t *t, float *v, size_t n)
 }
 
 /* Keeps the last of each run of equal timestamps (input sorted, stable). */
-static size_t keep_last(int64_t *t, float *v, size_t n)
+static size_t keep_last(int64_t *t, uint64_t *v, size_t n)
 {
     size_t o = 0;
     for (size_t i = 0; i < n; i++) {
@@ -186,9 +190,21 @@ static size_t keep_last(int64_t *t, float *v, size_t n)
     return o;
 }
 
+/* The slots of out narrowed to width w, in place. */
+static void narrow(mem_run *out, size_t w)
+{
+    if (w == 8)
+        return;
+    const uint64_t *src = (const uint64_t *)(void *)out->v;
+    for (size_t i = 0; i < out->n; i++) {
+        uint32_t x = (uint32_t)src[i];
+        memcpy(out->v + 4 * i, &x, 4); /* behind the reads: 4 * i <= 8 * i */
+    }
+}
+
 /* Copies the rows of series id in [start, end): sorted by time, last write
  * per timestamp. Reads only; the caller holds buf_lock when m is active. */
-int mt_collect(const memtable *m, uint32_t id, int64_t start, int64_t end, uint64_t visible, mem_run *out)
+int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t end, uint64_t visible, mem_run *out)
 {
     memset(out, 0, sizeof *out);
     if (id >= m->scap || m->s[id].n == 0)
@@ -217,27 +233,30 @@ int mt_collect(const memtable *m, uint32_t id, int64_t start, int64_t end, uint6
             return 0;
     }
     out->ts = malloc((hi - lo) * sizeof *out->ts);
-    out->v = malloc((hi - lo) * sizeof *out->v);
+    out->v = malloc((hi - lo) * sizeof(uint64_t));
     if (!out->ts || !out->v) {
         mem_run_free(out);
         return TSDB_ERR_NOMEM;
     }
+    uint64_t *ov = (uint64_t *)(void *)out->v;
     if (s->sorted) {
         out->n = hi - lo;
         memcpy(out->ts, s->ts + lo, out->n * sizeof *out->ts);
-        memcpy(out->v, s->v + lo, out->n * sizeof *out->v);
-        out->n = keep_last(out->ts, out->v, out->n);
+        memcpy(ov, s->v + lo, out->n * sizeof *ov);
+        out->n = keep_last(out->ts, ov, out->n);
+        narrow(out, w);
         return 0;
     }
     for (size_t i = 0; i < vn; i++) {
         if (s->ts[i] >= start && s->ts[i] < end) {
             out->ts[out->n] = s->ts[i];
-            out->v[out->n] = s->v[i];
+            ov[out->n] = s->v[i];
             out->n++;
         }
     }
-    int rc = sort_by_time(out->ts, out->v, out->n);
-    out->n = keep_last(out->ts, out->v, out->n);
+    int rc = sort_by_time(out->ts, ov, out->n);
+    out->n = keep_last(out->ts, ov, out->n);
+    narrow(out, w);
     return rc;
 }
 
@@ -254,22 +273,27 @@ static int cmp_u32(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
-/* Writes an immutable memtable as parts, returned unpublished in `out`. */
+/* Writes an immutable memtable as parts, returned unpublished in `out`: one
+ * batch per value type, all committed together by the caller. */
 static int mt_write(eng *db, const memtable *m, part_list *out)
 {
     if (m->rows == 0)
         return 0;
     uint32_t *s = malloc(m->rows * sizeof *s);
     int64_t *t = malloc(m->rows * sizeof *t);
-    float *v = malloc(m->rows * sizeof *v);
+    uint64_t *v = malloc(m->rows * sizeof *v);
     uint32_t *ids = malloc((m->nids ? m->nids : 1) * sizeof *ids);
     int rc = (!s || !t || !v || !ids) ? TSDB_ERR_NOMEM : 0;
     if (rc == 0) {
         memcpy(ids, m->ids, m->nids * sizeof *ids);
         qsort(ids, m->nids, sizeof *ids, cmp_u32);
-        size_t k = 0;
+    }
+    for (int type = 0; type < NTYPES && rc == 0; type++) {
+        size_t k = 0, w = type_width(type);
         for (uint32_t i = 0; i < m->nids && rc == 0; i++) {
             const mt_series *ms = &m->s[ids[i]];
+            if (series_type(&db->series, ids[i]) != type)
+                continue;
             for (uint32_t j = 0; j < ms->n; j++)
                 s[k + j] = ids[i];
             memcpy(t + k, ms->ts, ms->n * sizeof *t);
@@ -278,9 +302,15 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
                 rc = sort_by_time(t + k, v + k, ms->n);
             k += ms->n;
         }
-        /* now in (series, ts) order; insert_rows re-sorts only when partitions interleave */
-        if (rc == 0)
-            rc = insert_rows(db, s, 0, t, v, m->rows, m->wal_seq, out);
+        if (rc || !k)
+            continue;
+        if (w == 4) /* the slots to this type's width, in place */
+            for (size_t i = 0; i < k; i++) {
+                uint32_t x = (uint32_t)v[i];
+                memcpy((uint8_t *)v + 4 * i, &x, 4);
+            }
+        /* in (series, ts) order; insert_rows re-sorts only when partitions interleave */
+        rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out);
     }
     free(s);
     free(t);
@@ -324,13 +354,40 @@ static int write_full(int fd, const void *buf, size_t len)
 /* buf holds WAL_HDR spare bytes in front of the rows for the record header. */
 static int wal_write_record(int fd, uint8_t *buf, size_t nrows)
 {
-    store32(buf, (uint32_t)nrows);
+    store32(buf, (uint32_t)nrows | WAL_WIDE);
     store32(buf + 4, (uint32_t)xxh64(buf + WAL_HDR, nrows * WAL_ROW, 0));
     return write_full(fd, buf, WAL_HDR + nrows * WAL_ROW);
 }
 
+size_t wal_record(const uint8_t *p, size_t avail, size_t *nrows, size_t *row)
+{
+    if (avail < WAL_HDR)
+        return 0;
+    uint32_t h = load32(p);
+    size_t n = h & ~WAL_WIDE, rs = (h & WAL_WIDE) ? WAL_ROW : WAL_ROW_V1;
+    if (n > (avail - WAL_HDR) / rs || (uint32_t)xxh64(p + WAL_HDR, n * rs, 0) != load32(p + 4))
+        return 0; /* torn tail: never acknowledged */
+    *nrows = n;
+    *row = rs;
+    return WAL_HDR + n * rs;
+}
+
+void wal_row(const uint8_t *r, size_t row, uint32_t *id, int64_t *ts, uint64_t *slot)
+{
+    memcpy(id, r, 4);
+    memcpy(ts, r + 4, 8);
+    if (row == WAL_ROW) {
+        memcpy(slot, r + 12, 8);
+    } else {
+        uint32_t x;
+        memcpy(&x, r + 12, 4);
+        *slot = x;
+    }
+}
+
 /* Appends rows to the pending WAL buffer; caller holds buf_lock. */
-static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v, size_t n)
+static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
+                      size_t n)
 {
     if (db->wal_len == 0)
         db->wal_len = WAL_HDR; /* room for the record header */
@@ -347,9 +404,10 @@ static int wal_buffer(eng *db, const uint32_t *series, uint32_t cs, const int64_
     uint8_t *p = db->wal_buf + db->wal_len;
     for (size_t i = 0; i < n; i++, p += WAL_ROW) {
         uint32_t id = series ? series[i] : cs;
+        uint64_t x = slot_get(v, w, i);
         memcpy(p, &id, 4);
         memcpy(p + 4, &ts[i], 8);
-        memcpy(p + 12, &v[i], 4);
+        memcpy(p + 12, &x, 8);
     }
     db->wal_len = need;
     return 0;
@@ -419,15 +477,15 @@ int wal_commit(eng *db, uint64_t target)
 
 /* ---------------------------------------------------------------- writes */
 
-int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v, size_t n)
+int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n)
 {
     pthread_mutex_lock(&db->buf_lock);
     int rc = db->bg_error;
     db->bg_error = 0;
     if (rc == 0 && db->wal_enabled)
-        rc = wal_buffer(db, series, cs, ts, v, n); /* first: it can fail without side effects */
+        rc = wal_buffer(db, series, cs, ts, v, w, n); /* first: it can fail without side effects */
     if (rc == 0)
-        rc = mt_add(db->active, series, cs, ts, v, n, db->wal_appended + 1);
+        rc = mt_add(db->active, series, cs, ts, v, w, n, db->wal_appended + 1);
     db->wal_appended += n;
     uint64_t lsn = db->wal_appended;
     size_t rows = db->active->rows;
@@ -683,39 +741,25 @@ int wal_open(eng *db)
         size_t len;
         if ((rc = read_file(db->dirfd, segs[k].name, &buf, &len)) != 0)
             break;
-        size_t nrows = 0, rcap = 0, pos = 0;
-        uint32_t *s = NULL;
-        int64_t *t = NULL;
-        float *v = NULL;
+        /* the segment's rows go into a memtable of their own (the active one
+         * for a reader), which a writer turns into parts in one commit */
+        memtable *m = ro ? db->active : mt_new(segs[k].seq);
+        if (!m) {
+            free(buf);
+            rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        size_t pos = 0, n, row, rec;
         int64_t cached_p = 0;
         uint64_t cached_seq = 0;
         bool have_cache = false;
-        while (rc == 0 && pos + WAL_HDR <= len) {
-            size_t n = load32(buf + pos);
-            uint32_t sum = load32(buf + pos + 4);
-            if (pos + WAL_HDR + n * WAL_ROW > len || (uint32_t)xxh64(buf + pos + WAL_HDR, n * WAL_ROW, 0) != sum)
-                break; /* torn tail: never acknowledged */
+        while (rc == 0 && (rec = wal_record(buf + pos, len - pos, &n, &row)) != 0) {
             const uint8_t *r = buf + pos + WAL_HDR;
-            if (nrows + n > rcap) {
-                rcap = MAX(nrows + n, rcap * 2);
-                uint32_t *s2 = realloc(s, rcap * sizeof *s);
-                int64_t *t2 = s2 ? realloc(t, rcap * sizeof *t) : NULL;
-                float *v2 = t2 ? realloc(v, rcap * sizeof *v) : NULL;
-                if (s2) s = s2;
-                if (t2) t = t2;
-                if (!v2) {
-                    rc = TSDB_ERR_NOMEM;
-                    break;
-                }
-                v = v2;
-            }
-            for (size_t i = 0; i < n; i++, r += WAL_ROW) {
+            for (size_t i = 0; i < n && rc == 0; i++, r += row) {
                 uint32_t id;
                 int64_t ts;
-                float val;
-                memcpy(&id, r, 4);
-                memcpy(&ts, r + 4, 8);
-                memcpy(&val, r + 12, 4);
+                uint64_t slot;
+                wal_row(r, row, &id, &ts, &slot);
                 int64_t p = partition_of(db, ts);
                 if (!have_cache || p != cached_p) {
                     cached_p = p;
@@ -724,23 +768,22 @@ int wal_open(eng *db)
                 }
                 if (cached_seq >= segs[k].seq || id >= eng_series_count(db))
                     continue; /* already in a part (or a series that was never created) */
-                s[nrows] = id;
-                t[nrows] = ts;
-                v[nrows] = val;
-                nrows++;
+                rc = mt_add(m, NULL, id, &ts, &slot, 8, 1, 0);
             }
-            pos += WAL_HDR + n * WAL_ROW;
+            pos += rec;
         }
         free(buf);
-        if (rc == 0 && nrows) {
-            if (ro)
-                rc = mt_add(db->active, s, 0, t, v, nrows, 0);
-            else
-                rc = insert_rows(db, s, 0, t, v, nrows, segs[k].seq, NULL);
+        if (rc == 0 && !ro) {
+            part_list pl = {0};
+            rc = mt_write(db, m, &pl);
+            if (rc == 0)
+                rc = parts_publish(db, pl.p, pl.n);
+            if (rc)
+                parts_discard(db, pl.p, pl.n);
+            free(pl.p);
         }
-        free(s);
-        free(t);
-        free(v);
+        if (!ro)
+            mt_unref(m);
         if (rc == 0 && !ro)
             unlinkat(db->dirfd, segs[k].name, 0);
     }

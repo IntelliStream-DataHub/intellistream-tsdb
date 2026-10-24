@@ -363,7 +363,7 @@ static void check_agg(tsdb *db, ref *r, uint32_t s, int64_t start, int64_t end, 
         if (k == nr) {
             if (nr == cap)
                 e = realloc(e, (cap *= 2) * sizeof *e);
-            e[nr++] = (tsdb_bucket){bs, 0, 0, INFINITY, -INFINITY};
+            e[nr++] = (tsdb_bucket){.start = bs, .min = INFINITY, .max = -INFINITY};
         }
         e[k].count++;
         e[k].sum += x->v;

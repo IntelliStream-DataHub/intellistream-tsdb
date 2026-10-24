@@ -21,7 +21,7 @@
 static void agg_scalar(const float *v, size_t n, agg_state *a)
 {
     double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-    float mn = a->min, mx = a->max;
+    float mn = (float)a->min, mx = (float)a->max; /* the state holds float32 values here */
     size_t i = 0;
     for (; i + 4 <= n; i += 4) {
         s0 += v[i];
@@ -49,7 +49,7 @@ __attribute__((target("avx2"))) static void agg_avx2(const float *v, size_t n, a
 {
     __m256d s0 = _mm256_setzero_pd(), s1 = _mm256_setzero_pd();
     __m256d s2 = _mm256_setzero_pd(), s3 = _mm256_setzero_pd();
-    __m256 mn = _mm256_set1_ps(a->min), mx = _mm256_set1_ps(a->max);
+    __m256 mn = _mm256_set1_ps((float)a->min), mx = _mm256_set1_ps((float)a->max);
     __m256 mn2 = mn, mx2 = mx;
     size_t i = 0;
     for (; i + 16 <= n; i += 16) {
@@ -72,7 +72,11 @@ __attribute__((target("avx2"))) static void agg_avx2(const float *v, size_t n, a
     _mm256_storeu_pd(sums, s0);
     _mm256_storeu_ps(mins, mn);
     _mm256_storeu_ps(maxs, mx);
-    agg_state t = {0, (sums[0] + sums[1]) + (sums[2] + sums[3]), a->min, a->max};
+    agg_state t;
+    agg_init(&t);
+    t.sum = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+    t.min = a->min;
+    t.max = a->max;
     for (int k = 0; k < 8; k++) {
         t.min = mins[k] < t.min ? mins[k] : t.min;
         t.max = maxs[k] > t.max ? maxs[k] : t.max;
@@ -88,7 +92,7 @@ __attribute__((target("avx512f,avx512dq"))) static void agg_avx512(const float *
 {
     __m512d s0 = _mm512_setzero_pd(), s1 = _mm512_setzero_pd();
     __m512d s2 = _mm512_setzero_pd(), s3 = _mm512_setzero_pd();
-    __m512 mn = _mm512_set1_ps(a->min), mx = _mm512_set1_ps(a->max);
+    __m512 mn = _mm512_set1_ps((float)a->min), mx = _mm512_set1_ps((float)a->max);
     __m512 mn2 = mn, mx2 = mx;
     size_t i = 0;
     for (; i + 32 <= n; i += 32) {

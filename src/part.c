@@ -2,8 +2,12 @@
  * Part files: immutable, sorted by (series, ts), written once and mmap'd.
  *
  *   header (24 bytes) | ts block, value block, ... per granule | pad to 8 |
- *   granule index (64 bytes per granule) | footer (56 bytes)
+ *   granule index (80 bytes per granule) | footer (56 bytes)
  *
+ * A granule holds rows of one series; its value block is coded for the
+ * series' type and its index entry carries the statistics of its known
+ * values. Version 1 parts (float32, 64-byte index entries) are still read:
+ * their index is converted to the current layout when they are opened.
  * The header also records the newest WAL segment whose rows the part holds.
  * A part is written to tmp_*.part, fsync'd, and renamed to its final name
  * p<partition>_<min_block>_<max_block>_<level>.part, which makes it visible.
@@ -97,17 +101,44 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     int rc = TSDB_ERR_CORRUPT;
     if (memcmp(h.magic, PART_MAGIC, 8) != 0 || memcmp(f.magic, PART_END_MAGIC, 8) != 0)
         goto fail;
-    if (h.version != FORMAT_VERSION || f.version != FORMAT_VERSION || h.granule_rows == 0 ||
+    if ((h.version != 1 && h.version != FORMAT_VERSION) || f.version != h.version || h.granule_rows == 0 ||
         h.granule_rows > MAX_GRANULE_ROWS)
         goto fail;
     p->grows = h.granule_rows;
     p->wal_seq = h.wal_seq;
+    size_t entry = h.version == 1 ? sizeof(granule_v1) : sizeof(granule);
     if (f.index_off % 8 != 0 || f.index_off < sizeof h ||
-        f.index_off + (uint64_t)f.ngranules * sizeof(granule) + sizeof f != size)
+        f.index_off + (uint64_t)f.ngranules * entry + sizeof f != size)
         goto fail;
-    if (xxh64(p->map + f.index_off, (size_t)f.ngranules * sizeof(granule), 0) != f.index_hash)
+    if (xxh64(p->map + f.index_off, (size_t)f.ngranules * entry, 0) != f.index_hash)
         goto fail;
-    p->g = (const granule *)(p->map + f.index_off);
+    if (h.version == 1) {
+        p->g_owned = malloc((f.ngranules ? f.ngranules : 1) * sizeof(granule));
+        if (!p->g_owned) {
+            rc = TSDB_ERR_NOMEM;
+            goto fail;
+        }
+        for (uint32_t i = 0; i < f.ngranules; i++) {
+            granule_v1 o;
+            memcpy(&o, p->map + f.index_off + (size_t)i * sizeof o, sizeof o);
+            granule *g = &p->g_owned[i];
+            memset(g, 0, sizeof *g);
+            g->series = o.series;
+            g->count = o.count;
+            g->ts_min = o.ts_min;
+            g->ts_max = o.ts_max;
+            g->off = o.off;
+            g->ts_len = o.ts_len;
+            g->val_len = o.val_len;
+            g->crc = o.crc;
+            g->fsum = o.sum;
+            g->fmin = o.vmin;
+            g->fmax = o.vmax;
+        }
+        p->g = p->g_owned;
+    } else {
+        p->g = (const granule *)(p->map + f.index_off);
+    }
     p->ng = f.ngranules;
     p->index_off = f.index_off;
     p->rows = f.rows;
@@ -119,6 +150,7 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     return 0;
 fail:
     munmap((void *)p->map, p->map_len);
+    free(p->g_owned);
     free(p);
     return rc;
 }
@@ -132,10 +164,11 @@ void part_unref(part *p)
     munmap((void *)p->map, p->map_len);
     if (atomic_load(&p->obsolete))
         unlinkat(p->dirfd, p->name, 0);
+    free(p->g_owned);
     free(p);
 }
 
-int granule_read(codec_ctx *c, const part *p, const granule *g, int64_t *ts, float *v)
+int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v)
 {
     uint64_t len = (uint64_t)g->ts_len + g->val_len;
     if (g->off < sizeof(part_header) || g->off + len > p->index_off || g->count == 0 ||
@@ -146,7 +179,7 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int64_t *ts, flo
         return TSDB_ERR_CORRUPT;
     int rc = block_decode_ts(c, blk, g->ts_len, g->count, ts);
     if (rc == 0 && v)
-        rc = block_decode_f32(c, blk + g->ts_len, g->val_len, g->count, v);
+        rc = block_decode_vals(c, type, blk + g->ts_len, g->val_len, g->count, v);
     return rc;
 }
 
@@ -167,7 +200,7 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     w->cap = PW_FLUSH_BYTES + 2 * block_bound(w->grows) + sizeof(part_header) + 8;
     w->buf = malloc(w->cap);
     w->pend_ts = malloc(w->grows * sizeof(int64_t));
-    w->pend_v = malloc(w->grows * sizeof(float));
+    w->pend_v = malloc(w->grows * sizeof(uint64_t)); /* the widest slot */
     w->cc = cc_get(db);
     if (!w->buf || !w->pend_ts || !w->pend_v || !w->cc) {
         pw_abort(w);
@@ -217,18 +250,16 @@ static int pw_push_index(part_writer *w, const granule *g)
     return w->len >= PW_FLUSH_BYTES ? pw_flush(w) : 0;
 }
 
-static int pw_emit(part_writer *w, uint32_t series, const int64_t *ts, const float *v, size_t n)
+static int pw_emit(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n)
 {
     granule g;
     memset(&g, 0, sizeof g);
     uint8_t *start = w->buf + w->len;
     size_t tl = block_encode_ts(w->cc, w->zstd_level, ts, n, start);
-    size_t vl = tl ? block_encode_f32(w->cc, w->zstd_level, w->value_codec, v, n, start + tl) : 0;
+    size_t vl = tl ? block_encode_vals(w->cc, w->zstd_level, w->value_codec, type, v, n, start + tl) : 0;
     if (!vl)
         return TSDB_ERR_NOMEM;
-    agg_state a;
-    agg_init(&a);
-    simd_agg_f32(v, n, &a);
+    granule_stats(type, v, n, &g);
     g.series = series;
     g.count = (uint32_t)n;
     g.ts_min = ts[0];
@@ -236,9 +267,6 @@ static int pw_emit(part_writer *w, uint32_t series, const int64_t *ts, const flo
     g.off = w->off + w->len;
     g.ts_len = (uint32_t)tl;
     g.val_len = (uint32_t)vl;
-    g.sum = a.sum;
-    g.vmin = a.min;
-    g.vmax = a.max;
     g.crc = (uint32_t)xxh64(start, tl + vl, 0);
     w->len += tl + vl;
     return pw_push_index(w, &g);
@@ -248,33 +276,36 @@ static int pw_emit_pending(part_writer *w)
 {
     if (!w->pend_n)
         return 0;
-    int rc = pw_emit(w, w->pend_series, w->pend_ts, w->pend_v, w->pend_n);
+    int rc = pw_emit(w, w->pend_series, w->pend_type, w->pend_ts, w->pend_v, w->pend_n);
     w->pend_n = 0;
     return rc;
 }
 
 /* Rows must be in (series, ts) order across calls. Granules never span series. */
-int pw_add(part_writer *w, uint32_t series, const int64_t *ts, const float *v, size_t n)
+int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n)
 {
     int rc;
+    size_t wd = type_width(type);
+    const uint8_t *vb = v;
     if (w->pend_n && w->pend_series != series && (rc = pw_emit_pending(w)) != 0)
         return rc;
     while (n) {
         if (!w->pend_n && n >= w->grows) {
-            if ((rc = pw_emit(w, series, ts, v, w->grows)) != 0)
+            if ((rc = pw_emit(w, series, type, ts, vb, w->grows)) != 0)
                 return rc;
             ts += w->grows;
-            v += w->grows;
+            vb += w->grows * wd;
             n -= w->grows;
             continue;
         }
         size_t take = MIN(n, w->grows - w->pend_n);
         memcpy(w->pend_ts + w->pend_n, ts, take * sizeof *ts);
-        memcpy(w->pend_v + w->pend_n, v, take * sizeof *v);
+        memcpy(w->pend_v + w->pend_n * wd, vb, take * wd);
         w->pend_series = series;
+        w->pend_type = type;
         w->pend_n += take;
         ts += take;
-        v += take;
+        vb += take * wd;
         n -= take;
         if (w->pend_n == w->grows && (rc = pw_emit_pending(w)) != 0)
             return rc;

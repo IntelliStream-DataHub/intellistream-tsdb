@@ -150,6 +150,96 @@ static bool query_ok(tsdb *db, uint32_t s, size_t *rows, double *sum)
     return ok;
 }
 
+/* A follower sees typed rows and nulls from the writer's WAL, and state names
+ * created after it opened; then the same from parts once they are flushed. */
+typedef struct typed_seen {
+    size_t n, nulls;
+    int64_t last;
+} typed_seen;
+
+static int typed_cb(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    typed_seen *t = ctx;
+    for (size_t i = 0; i < n; i++) {
+        bool known = !col->valid || ((col->valid[i >> 3] >> (i & 7)) & 1);
+        t->nulls += !known;
+        if (known && col->type == TSDB_INT64)
+            t->last = ((const int64_t *)col->values)[i];
+        (void)ts;
+    }
+    t->n += n;
+    return 0;
+}
+
+static void test_typed_follow(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-follow-typed-%d", base, (int)getpid());
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.flush_interval_ms = 600000; /* the rows stay in the WAL until the explicit flush */
+    tsdb *w;
+    if (tsdb_open(dir, &o, &w) != 0) {
+        CHECK(!"open writer");
+        return;
+    }
+    uint32_t cnt, mode;
+    CHECK(tsdb_series_create(w, "typed.count", TSDB_INT64, NULL, &cnt) == 0);
+    tsdb_options fo;
+    tsdb_options_init(&fo);
+    fo.follow = 1;
+    fo.refresh_ms = 20;
+    tsdb *f = NULL;
+    CHECK(tsdb_open(dir, &fo, &f) == 0);
+    if (!f) {
+        tsdb_close(w);
+        return;
+    }
+    /* created after the follower opened */
+    CHECK(tsdb_series_create(w, "typed.mode", TSDB_STATE, NULL, &mode) == 0);
+    uint32_t idle;
+    CHECK(tsdb_state(w, mode, "idle", &idle) == 0);
+    int64_t ts[100], iv[100];
+    uint8_t valid[13];
+    memset(valid, 0xff, sizeof valid);
+    for (int k = 0; k < 100; k++) {
+        ts[k] = T0 + k * 1000;
+        iv[k] = 1000000000000LL + k;
+        if (k % 10 == 0)
+            valid[k >> 3] &= (uint8_t)~(1u << (k & 7));
+    }
+    CHECK(tsdb_insert_series_values(w, cnt, ts, &(tsdb_values){TSDB_INT64, iv, valid}, 100) == 0);
+    uint32_t codes[3] = {idle, idle, idle};
+    CHECK(tsdb_insert_series_values(w, mode, ts, &(tsdb_values){TSDB_STATE, codes, NULL}, 3) == 0);
+    for (int round = 0; round < 2; round++) {
+        typed_seen t = {0, 0, 0};
+        for (int k = 0; k < 200 && t.n < 100; k++) { /* a few refreshes */
+            usleep(10000);
+            t = (typed_seen){0, 0, 0};
+            CHECK(tsdb_query_values(f, cnt, INT64_MIN, INT64_MAX, NULL, typed_cb, &t) == 0);
+        }
+        CHECK(t.n == 100 && t.nulls == 10 && t.last == iv[99]);
+        tsdb_bucket *b;
+        size_t nb;
+        CHECK(tsdb_query_agg(f, cnt, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0);
+        CHECK(nb == 1 && b[0].count == 90 && b[0].imax == iv[99]);
+        free(b);
+        uint32_t fmode, fidle;
+        CHECK(tsdb_series_lookup(f, "typed.mode", &fmode) == 0 && fmode == mode);
+        CHECK(tsdb_state_lookup(f, fmode, "idle", &fidle) == 0 && fidle == idle);
+        const char *name = tsdb_state_name(f, fmode, idle);
+        CHECK(name && strcmp(name, "idle") == 0);
+        if (round == 0)
+            CHECK(tsdb_flush(w) == 0); /* now from parts */
+    }
+    tsdb_close(f);
+    tsdb_close(w);
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -245,6 +335,7 @@ int main(int argc, char **argv)
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     if (system(cmd) != 0)
         return 1;
+    test_typed_follow(argc > 1 ? argv[1] : "/tmp");
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

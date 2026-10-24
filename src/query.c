@@ -21,6 +21,9 @@
  *
  * Raw: sources whose time ranges are disjoint are concatenated; otherwise
  * they are merged by timestamp, again keeping the newest row per timestamp.
+ *
+ * Values move as slots of the series' type (4 or 8 bytes); aggregation skips
+ * nulls, and a bucket whose rows are all null is reported with count 0.
  */
 #include "internal.h"
 
@@ -51,7 +54,7 @@ static void snapshot_release(snapshot *s)
 
 /* Parts and memtables as of one instant: a flush publishes its parts and
  * retires its memtable under db->lock, so nothing is seen twice or missed. */
-static int snapshot_take(eng *db, uint32_t series, int64_t start, int64_t end, snapshot *s)
+static int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
 {
     memset(s, 0, sizeof *s);
     memtable *ms[MAX_FLUSHING];
@@ -81,7 +84,7 @@ static int snapshot_take(eng *db, uint32_t series, int64_t start, int64_t end, s
     if (rc == 0 && (db->active || db->ntails)) {
         pthread_mutex_lock(&db->buf_lock);
         for (size_t i = 0; rc == 0 && i < db->ntails; i++) {
-            rc = mt_collect(db->tails[i].m, series, start, end, UINT64_MAX, &tails[ntails]);
+            rc = mt_collect(db->tails[i].m, series, w, start, end, UINT64_MAX, &tails[ntails]);
             if (tails[ntails].n)
                 ntails++;
             else
@@ -91,7 +94,7 @@ static int snapshot_take(eng *db, uint32_t series, int64_t start, int64_t end, s
          * no reader sees a write that a power failure could still take back */
         uint64_t visible = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
         if (rc == 0 && db->active)
-            rc = mt_collect(db->active, series, start, end, visible, &active);
+            rc = mt_collect(db->active, series, w, start, end, visible, &active);
         pthread_mutex_unlock(&db->buf_lock);
     }
     pthread_mutex_unlock(&db->lock);
@@ -109,7 +112,7 @@ static int snapshot_take(eng *db, uint32_t series, int64_t start, int64_t end, s
         /* flushing memtables are immutable: read them without locks */
         mem_run r = {0};
         if (rc == 0)
-            rc = mt_collect(ms[i], series, start, end, UINT64_MAX, &r); /* synced when it was rotated */
+            rc = mt_collect(ms[i], series, w, start, end, UINT64_MAX, &r); /* synced when it was rotated */
         if (r.n && s->mem)
             s->mem[s->nmem++] = r;
         else
@@ -160,21 +163,25 @@ typedef struct src {
     bool loaded;
     size_t pos, n;   /* rows [pos, n) of ts/v are in range and unread */
     int64_t *ts;
-    float *v;
+    uint8_t *v;      /* slots of `type` */
+    int type;
+    size_t w;        /* slot width */
     bool own;        /* ts/v are decode buffers owned by the cursor */
 } src;
 
-static void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj)
+static void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type)
 {
     memset(c, 0, sizeof *c);
     c->p = p;
     c->gi = gi;
     c->gj = gj;
     c->prio = p->max_block;
+    c->type = type;
+    c->w = type_width(type);
 }
 
 /* Memtable runs are newer than every part; later memtables are newer. */
-static void src_init_mem(src *c, const mem_run *r, uint64_t prio)
+static void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type)
 {
     memset(c, 0, sizeof *c);
     c->prio = prio;
@@ -182,6 +189,8 @@ static void src_init_mem(src *c, const mem_run *r, uint64_t prio)
     c->v = r->v;
     c->n = r->n;
     c->loaded = r->n > 0;
+    c->type = type;
+    c->w = type_width(type);
 }
 
 static void src_free(src *c)
@@ -202,14 +211,14 @@ static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
         return 0;
     if (!c->own && c->gi < c->gj) {
         c->ts = malloc(c->p->grows * sizeof *c->ts);
-        c->v = malloc(c->p->grows * sizeof *c->v);
+        c->v = malloc(c->p->grows * c->w);
         c->own = true;
         if (!c->ts || !c->v)
             return TSDB_ERR_NOMEM;
     }
     while (c->gi < c->gj) {
         const granule *g = &c->p->g[c->gi++];
-        int rc = granule_read(cc, c->p, g, c->ts, c->v);
+        int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v);
         if (rc)
             return rc;
         c->pos = g->ts_min >= start ? 0 : lower_bound_i64(c->ts, g->count, start);
@@ -231,12 +240,11 @@ static int src_advance(codec_ctx *cc, src *c, size_t rows, int64_t start, int64_
     return src_fill(cc, c, start, end);
 }
 
-typedef int (*emit_fn)(void *ctx, const int64_t *ts, const float *v, size_t n);
 
 /* Emits the union of the sources in time order, one row per timestamp: the
  * row of the source with the highest priority. Every live source is kept
  * decoded, so the head timestamps are exact. */
-static int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, emit_fn fn, void *ctx)
+static int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx)
 {
     int rc = 0;
     for (size_t i = 0; i < nc && rc == 0; i++)
@@ -269,7 +277,7 @@ static int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64
         size_t e = c->n;
         if (has_bound)
             e = head < bound ? c->pos + lower_bound_i64(c->ts + c->pos, c->n - c->pos, bound) : c->pos + 1;
-        if (fn(ctx, c->ts + c->pos, c->v + c->pos, e - c->pos))
+        if (fn(ctx, c->ts + c->pos, c->v + c->pos * c->w, e - c->pos))
             return TSDB_ERR_STOPPED;
         rc = src_advance(cc, c, e - c->pos, start, end);
         if (has_bound && head == bound) {
@@ -376,18 +384,24 @@ typedef struct agg_target {
     int64_t start, end, b0;
     const bucketer *bk;
     agg_state *acc;
+    int type;
+    size_t w;
 } agg_target;
+
+
 
 /* Folds time-sorted rows (all within [start, end)) into per-bucket states,
  * one entry per bucket touched; returns the number of entries. */
-static size_t fold_rows(const agg_target *t, const int64_t *ts, const float *v, size_t n, local_bucket *out)
+static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, size_t n, bool may_be_null,
+                        local_bucket *out)
 {
+    const uint8_t *v = vv;
     if (!n)
         return 0;
     if (t->bk->kind == BK_ONE) {
         out[0].b = t->b0;
         agg_init(&out[0].a);
-        simd_agg_f32(v, n, &out[0].a);
+        agg_fold_hint(t->type, v, n, may_be_null, &out[0].a);
         return 1;
     }
     size_t nl = 0;
@@ -406,7 +420,7 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const float *v, 
         }
         out[nl].b = b;
         agg_init(&out[nl].a);
-        simd_agg_f32(v + i, e - i, &out[nl].a);
+        agg_fold_hint(t->type, v + i * t->w, e - i, may_be_null, &out[nl].a);
         nl++;
         i = e;
     }
@@ -416,7 +430,7 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const float *v, 
 static void fold_into(const agg_target *t, const local_bucket *l, size_t nl)
 {
     for (size_t k = 0; k < nl; k++)
-        agg_merge(&t->acc[l[k].b - t->b0], l[k].a.count, l[k].a.sum, l[k].a.min, l[k].a.max);
+        agg_combine(&t->acc[l[k].b - t->b0], &l[k].a);
 }
 
 typedef struct fold_ctx {
@@ -425,7 +439,7 @@ typedef struct fold_ctx {
     size_t cap;
 } fold_ctx;
 
-static int fold_emit(void *ctx, const int64_t *ts, const float *v, size_t n)
+static int fold_emit(void *ctx, const int64_t *ts, const void *v, size_t n)
 {
     fold_ctx *f = ctx;
     if (n > f->cap) {
@@ -435,7 +449,7 @@ static int fold_emit(void *ctx, const int64_t *ts, const float *v, size_t n)
         f->scratch = s;
         f->cap = n;
     }
-    fold_into(f->t, f->scratch, fold_rows(f->t, ts, v, n, f->scratch));
+    fold_into(f->t, f->scratch, fold_rows(f->t, ts, v, n, true, f->scratch));
     return 0;
 }
 
@@ -463,7 +477,7 @@ static void agg_worker(void *arg, int idx)
     codec_ctx *cc = cc_get(db);
     size_t cap = db->granule_rows;
     int64_t *ts = malloc(cap * sizeof *ts);
-    float *v = malloc(cap * sizeof *v);
+    uint8_t *v = malloc(cap * sizeof(uint64_t));
     local_bucket *local = malloc(cap * sizeof *local); /* a granule touches at most count buckets */
     if (!cc || !ts || !v || !local) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
@@ -474,7 +488,7 @@ static void agg_worker(void *arg, int idx)
         if (w >= j->nwork || atomic_load_explicit(&j->err, memory_order_relaxed))
             break;
         const gref *r = &j->work[w];
-        int rc = granule_read(cc, r->p, r->g, ts, v);
+        int rc = granule_read(cc, r->p, r->g, j->t.type, ts, v);
         if (rc) {
             atomic_store(&j->err, rc);
             break;
@@ -482,7 +496,7 @@ static void agg_worker(void *arg, int idx)
         size_t n = r->g->count;
         size_t lo = lower_bound_i64(ts, n, j->t.start);
         size_t hi = lower_bound_i64(ts, n, j->t.end);
-        size_t nl = fold_rows(&j->t, ts + lo, v + lo, hi > lo ? hi - lo : 0, local);
+        size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, r->g->nulls > 0, local);
         if (nl) {
             /* local buckets ascend: fold each run that falls in one stripe under its lock */
             for (size_t a = 0; a < nl;) {
@@ -537,10 +551,11 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
 {
     *out = NULL;
     *nout = 0;
-    if (start >= end)
+    int type = eng_series_type(db, series);
+    if (start >= end || type < 0)
         return 0;
     snapshot sn;
-    int rc = snapshot_take(db, series, start, end, &sn);
+    int rc = snapshot_take(db, series, type_width(type), start, end, &sn);
     if (rc)
         return rc;
 
@@ -583,7 +598,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
     src *srcs = NULL;
     codec_ctx *cc = NULL;
     fold_ctx fc = {0};
-    agg_target t = {.start = start, .end = end, .bk = bk};
+    agg_target t = {.start = start, .end = end, .bk = bk, .type = type, .w = type_width(type)};
     size_t nb = 1;
     if (rc || nitem == 0)
         goto done;
@@ -638,9 +653,11 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                 /* calendar keys can repeat after a DST change at midnight: the
                  * granule must also end before the bucket's next start */
                 bool one = bmin == bmax && (bk->kind != BK_CALENDAR || bk_start(bk, bmin + 1) > g->ts_max);
-                if (inside && one)
-                    agg_merge(&acc[bmin - t.b0], g->count, g->sum, g->vmin, g->vmax);
-                else
+                if (inside && one) {
+                    agg_state ga;
+                    agg_from_granule(type, g, &ga);
+                    agg_combine(&acc[bmin - t.b0], &ga);
+                } else
                     work[nwork++] = (gref){sn.parts[it->src], g};
             }
         } else {
@@ -662,9 +679,9 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                 if (!any)
                     continue;
                 if (s < sn.np)
-                    src_init_part(&srcs[ns++], sn.parts[s], gi, gj);
+                    src_init_part(&srcs[ns++], sn.parts[s], gi, gj, type);
                 else
-                    src_init_mem(&srcs[ns++], &sn.mem[s - sn.np], mem_prio(&sn, s - sn.np));
+                    src_init_mem(&srcs[ns++], &sn.mem[s - sn.np], mem_prio(&sn, s - sn.np), type);
             }
             rc = merge_stream(cc, srcs, ns, start, end, fold_emit, &fc);
             if (rc == TSDB_ERR_STOPPED)
@@ -689,22 +706,17 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
     if (rc == 0) {
         size_t nonempty = 0;
         for (size_t k = 0; k < nb; k++)
-            nonempty += acc[k].count != 0;
+            nonempty += acc[k].rows != 0;
         tsdb_bucket *res = malloc((nonempty ? nonempty : 1) * sizeof *res);
         if (!res) {
             rc = TSDB_ERR_NOMEM;
         } else {
             size_t o = 0;
             for (size_t k = 0; k < nb; k++) {
-                if (!acc[k].count)
+                if (!acc[k].rows)
                     continue;
                 res[o].start = bk_start(bk, t.b0 + (int64_t)k);
-                res[o].count = acc[k].count;
-                res[o].sum = acc[k].sum;
-                res[o].min = acc[k].min;
-                res[o].max = acc[k].max;
-                if (res[o].min > res[o].max) /* only NaN values in this bucket */
-                    res[o].min = res[o].max = __builtin_nanf("");
+                agg_to_bucket(type, &acc[k], &res[o]);
                 o++;
             }
             *out = res;
@@ -732,9 +744,10 @@ static int cmp_src_first(const void *a, const void *b)
 }
 
 /* Streams [start, end) of one series from a snapshot, in time order. */
-static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series, int64_t start, int64_t end,
-                     tsdb_raw_fn fn, void *ctx)
+static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series, int type, int64_t start,
+                     int64_t end, slot_fn fn, void *ctx)
 {
+    size_t w = type_width(type);
     src *cur = calloc(sn->np + sn->nmem + 1, sizeof *cur);
     size_t nc = 0;
     int rc = cur ? 0 : TSDB_ERR_NOMEM;
@@ -743,7 +756,7 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
         uint32_t gi, gj;
         part_find(sn->parts[i], series, start, end, &gi, &gj);
         if (gi < gj)
-            src_init_part(&cur[nc++], sn->parts[i], gi, gj);
+            src_init_part(&cur[nc++], sn->parts[i], gi, gj, type);
     }
     /* memtable runs were cut to the snapshot's range: cut them to this one */
     mem_run *clipped = calloc(sn->nmem + 1, sizeof *clipped);
@@ -754,8 +767,8 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
         size_t lo = lower_bound_i64(r->ts, r->n, start), hi = lower_bound_i64(r->ts, r->n, end);
         if (lo >= hi)
             continue;
-        clipped[i] = (mem_run){r->ts + lo, r->v + lo, hi - lo};
-        src_init_mem(&cur[nc++], &clipped[i], mem_prio(sn, i));
+        clipped[i] = (mem_run){r->ts + lo, r->v + lo * w, hi - lo};
+        src_init_mem(&cur[nc++], &clipped[i], mem_prio(sn, i), type);
     }
     if (rc || nc == 0)
         goto out;
@@ -771,7 +784,7 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
             src *c = &cur[i];
             rc = src_fill(cc, c, start, end);
             while (rc == 0 && c->loaded) {
-                if (fn(ctx, c->ts + c->pos, c->v + c->pos, c->n - c->pos)) {
+                if (fn(ctx, c->ts + c->pos, c->v + c->pos * c->w, c->n - c->pos)) {
                     rc = TSDB_ERR_STOPPED;
                     break;
                 }
@@ -791,13 +804,13 @@ out:
 
 /* ascending with a limit: stop once enough rows went out */
 typedef struct limit_ctx {
-    tsdb_raw_fn fn;
+    slot_fn fn;
     void *ctx;
     size_t left;
     bool done;
 } limit_ctx;
 
-static int limit_cb(void *arg, const int64_t *ts, const float *v, size_t n)
+static int limit_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 {
     limit_ctx *l = arg;
     size_t take = n < l->left ? n : l->left;
@@ -814,11 +827,11 @@ static int limit_cb(void *arg, const int64_t *ts, const float *v, size_t n)
 /* descending: a window of rows is collected in time order, then sent back to front */
 typedef struct window_buf {
     int64_t *ts;
-    float *v;
-    size_t n, cap;
+    uint8_t *v;
+    size_t n, cap, w;
 } window_buf;
 
-static int window_cb(void *arg, const int64_t *ts, const float *v, size_t n)
+static int window_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 {
     window_buf *w = arg;
     if (w->n + n > w->cap) {
@@ -827,14 +840,14 @@ static int window_cb(void *arg, const int64_t *ts, const float *v, size_t n)
         if (!t2)
             return 1;
         w->ts = t2;
-        float *v2 = realloc(w->v, cap * sizeof *v2);
+        uint8_t *v2 = realloc(w->v, cap * w->w);
         if (!v2)
             return 1;
         w->v = v2;
         w->cap = cap;
     }
     memcpy(w->ts + w->n, ts, n * sizeof *ts);
-    memcpy(w->v + w->n, v, n * sizeof *v);
+    memcpy(w->v + w->n * w->w, v, n * w->w);
     w->n += n;
     return 0;
 }
@@ -854,9 +867,10 @@ size_t desc_window_rows = 65536; /* tests make it small to exercise many windows
 
 /* Newest first: walks the range backwards in windows of about
  * desc_window_rows rows, sized from the granule index, all from one snapshot. */
-static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series, int64_t start, int64_t end,
-                    size_t limit, tsdb_raw_fn fn, void *ctx)
+static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series, int type, int64_t start,
+                    int64_t end, size_t limit, slot_fn fn, void *ctx)
 {
+    size_t wd = type_width(type);
     size_t ns = 0, cap = 64;
     span *sp = malloc(cap * sizeof *sp);
     int rc = sp ? 0 : TSDB_ERR_NOMEM;
@@ -881,9 +895,9 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
     }
     if (rc == 0 && ns)
         qsort(sp, ns, sizeof *sp, cmp_span_desc);
-    window_buf w = {0};
+    window_buf w = {.w = wd};
     int64_t *rt = NULL;
-    float *rv = NULL;
+    uint8_t *rv = NULL;
     size_t rcap = 0, sent = 0, k = 0;
     int64_t hi = end;
     while (rc == 0 && hi > start && (limit == 0 || sent < limit)) {
@@ -904,7 +918,7 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
         if (k >= ns && rows < desc_window_rows)
             lo = start;
         w.n = 0;
-        rc = raw_range(db, cc, sn, series, lo, hi, window_cb, &w);
+        rc = raw_range(db, cc, sn, series, type, lo, hi, window_cb, &w);
         if (rc == TSDB_ERR_STOPPED)
             rc = TSDB_ERR_NOMEM; /* window_cb only stops when it cannot allocate */
         if (rc)
@@ -913,7 +927,7 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
             free(rt);
             free(rv);
             rt = malloc(w.n * sizeof *rt);
-            rv = malloc(w.n * sizeof *rv);
+            rv = malloc(w.n * wd);
             rcap = rt && rv ? w.n : 0;
             if (!rcap) {
                 rc = TSDB_ERR_NOMEM;
@@ -925,7 +939,7 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
             m = limit - sent;
         for (size_t i = 0; i < m; i++) {
             rt[i] = w.ts[w.n - 1 - i];
-            rv[i] = w.v[w.n - 1 - i];
+            memcpy(rv + i * wd, w.v + (w.n - 1 - i) * wd, wd);
         }
         if (m && fn(ctx, rt, rv, m)) {
             rc = TSDB_ERR_STOPPED;
@@ -945,12 +959,13 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
 }
 
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
-                     tsdb_raw_fn fn, void *ctx)
+                     slot_fn fn, void *ctx)
 {
-    if (start >= end)
+    int type = eng_series_type(db, series);
+    if (start >= end || type < 0)
         return 0;
     snapshot sn;
-    int rc = snapshot_take(db, series, start, end, &sn);
+    int rc = snapshot_take(db, series, type_width(type), start, end, &sn);
     if (rc)
         return rc;
     codec_ctx *cc = cc_get(db);
@@ -959,55 +974,17 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
         return TSDB_ERR_NOMEM;
     }
     if (descending) {
-        rc = raw_desc(db, cc, &sn, series, start, end, limit, fn, ctx);
+        rc = raw_desc(db, cc, &sn, series, type, start, end, limit, fn, ctx);
     } else if (limit) {
         limit_ctx l = {fn, ctx, limit, false};
-        rc = raw_range(db, cc, &sn, series, start, end, limit_cb, &l);
+        rc = raw_range(db, cc, &sn, series, type, start, end, limit_cb, &l);
         if (rc == TSDB_ERR_STOPPED && l.done)
             rc = 0;
     } else {
-        rc = raw_range(db, cc, &sn, series, start, end, fn, ctx);
+        rc = raw_range(db, cc, &sn, series, type, start, end, fn, ctx);
     }
     cc_put(db, cc);
     snapshot_release(&sn);
-    return rc;
-}
-
-int eng_query_raw(eng *db, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx)
-{
-    return eng_query_raw_ex(db, series, start, end, false, 0, fn, ctx);
-}
-
-static int collect_points(void *ctx, const int64_t *ts, const float *v, size_t n)
-{
-    tsdb_points *p = ctx;
-    if (p->n + n > p->cap) {
-        size_t cap = MAX(p->cap * 2, p->n + n);
-        cap = MAX(cap, (size_t)1024);
-        int64_t *t = realloc(p->ts, cap * sizeof *t);
-        if (!t)
-            return 1;
-        p->ts = t;
-        float *vv = realloc(p->values, cap * sizeof *vv);
-        if (!vv)
-            return 1;
-        p->values = vv;
-        p->cap = cap;
-    }
-    memcpy(p->ts + p->n, ts, n * sizeof *ts);
-    memcpy(p->values + p->n, v, n * sizeof *v);
-    p->n += n;
-    return 0;
-}
-
-int eng_query_points(eng *db, uint32_t series, int64_t start, int64_t end, tsdb_points *out)
-{
-    memset(out, 0, sizeof *out);
-    int rc = eng_query_raw(db, series, start, end, collect_points, out);
-    if (rc == TSDB_ERR_STOPPED)
-        rc = TSDB_ERR_NOMEM; /* collect_points only stops when allocation fails */
-    if (rc)
-        tsdb_points_free(out);
     return rc;
 }
 

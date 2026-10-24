@@ -141,6 +141,10 @@ static inline bool parse_interval(const char *s, int64_t *out)
 /* Formats like ClickHouse DateTime64(3) in UTC: "2024-01-31 23:59:59.123". */
 static inline void format_time(int64_t ms, char *buf, size_t len)
 {
+    if (ms == INT64_MIN || ms == INT64_MAX) { /* the ends of the time line, as parse_time reads them */
+        snprintf(buf, len, "%s", ms == INT64_MIN ? "min" : "max");
+        return;
+    }
     int64_t secs = ms >= 0 ? ms / 1000 : -((-ms + 999) / 1000);
     int frac = (int)(ms - secs * 1000);
     int64_t days = secs >= 0 ? secs / 86400 : -((-secs + 86399) / 86400);

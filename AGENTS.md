@@ -64,15 +64,26 @@ with `-fsanitize=thread`.
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
   host may still have them mapped.
-- **Granules** never span series; their count/sum/min/max must match the rows
-  exactly, because aggregates use them instead of decoding.
+- **Granules** never span series; their count/nulls/sum/min/max must match the
+  rows exactly, because aggregates use them instead of decoding.
+- **Value types.** A series' type is fixed at creation and lives in the SERIES
+  dictionary, not in the parts. Values travel as slots of `type_width(type)`
+  bytes (4: float32, bool, state; 8: float64, int64); the memtable and the WAL
+  hold 8-byte slots for every type. Null is a reserved value per type
+  (`type_null`), so a null written later replaces an older value like any
+  other write. Aggregates skip nulls; integer sums are exact (128 bits).
 - **Lock order:** `flush_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock`. The `crashfs` lock in tests is innermost.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
-- The on-disk format is version 1 (`FORMAT_VERSION`). Value blocks name their
-  codec, so new codecs can be added without a version bump; changing an
-  existing layout needs one.
+- The on-disk format is version 2 (`FORMAT_VERSION`): 80-byte granule entries
+  with typed statistics. Version 1 parts (64-byte entries, float32) and WAL
+  records (16-byte rows) are still read; keep it that way, `test_types` writes
+  both by hand. Value blocks name their codec, so new codecs can be added
+  without a version bump; changing an existing layout needs one.
+- **Protocol** version 2 added operations without changing version 1 ones:
+  old clients keep working. A change to the wire format has to reach the C,
+  Rust, Python and Java clients.
 
 ## Conventions
 

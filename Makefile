@@ -15,7 +15,7 @@ OBJ  := $(SRC:src/%.c=build/%.o)
 LIB  := build/libtsdb.a
 BINS := build/tsdb build/tsdb-bench build/test_tsdb
 
-all: $(LIB) build/tsdb build/tsdb-bench build/codec-bench build/insert-bench build/tsdbd $(CLIB) build/tsdbc-bench build/scale-bench
+all: $(LIB) build/tsdb build/tsdb-bench build/codec-bench build/insert-bench build/tsdbd $(CLIB) build/tsdbc-bench build/scale-bench build/type-bench
 
 build/%.o: src/%.c src/internal.h include/tsdb.h | build
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -32,8 +32,9 @@ build/tsdb-bench: tools/tsdb-bench.c tools/common.h tools/datasets.h $(LIB)
 build/test_tsdb: tests/test_tsdb.c $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
-test: build/test_tsdb build/test_server build/test_follow build/test_volumes build/test_group build/tsdbd
+test: build/test_tsdb build/test_types build/test_server build/test_follow build/test_volumes build/test_group build/tsdbd
 	./build/test_tsdb
+	./build/test_types
 	./build/test_group
 	./build/test_follow
 	./build/test_volumes
@@ -92,6 +93,9 @@ $(CLIB): build/tsdb_client.o
 build/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB)
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) -lpthread -lm
 
+build/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
 build/scale-bench: tools/scale-bench.c client/tsdb_client.h tools/common.h tools/datasets.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
@@ -103,6 +107,9 @@ build/test_follow: tests/test_follow.c $(LIB)
 
 build/test_volumes: tests/test_volumes.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+build/test_types: tests/test_types.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 build/test_group: tests/test_group.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

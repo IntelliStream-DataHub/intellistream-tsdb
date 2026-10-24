@@ -33,8 +33,6 @@
 
 #define MANIFEST_FILE "MANIFEST"
 #define RETIRED_PREFIX "retired_"
-#define WAL_ROW 16
-#define WAL_HDR 8
 
 static int64_t now_s(void) { return (int64_t)time(NULL); }
 
@@ -252,30 +250,27 @@ static int tail_segment(eng *db, wal_tail *t)
     size_t pos = 0;
     int rc = 0;
     bool reloaded = false;
-    while (rc == 0 && pos + WAL_HDR <= (size_t)got) {
-        size_t n = load32(buf + pos);
-        if (pos + WAL_HDR + n * WAL_ROW > (size_t)got ||
-            (uint32_t)xxh64(buf + pos + WAL_HDR, n * WAL_ROW, 0) != load32(buf + pos + 4))
-            break; /* the writer is still writing this record: next poll */
+    size_t n, row, rec;
+    /* a record that does not check out is still being written: next poll */
+    while (rc == 0 && (rec = wal_record(buf + pos, (size_t)got - pos, &n, &row)) != 0) {
         const uint8_t *r = buf + pos + WAL_HDR;
-        for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
+        for (size_t i = 0; i < n && rc == 0; i++, r += row) {
             uint32_t id;
             int64_t ts;
-            float v;
-            memcpy(&id, r, 4);
-            memcpy(&ts, r + 4, 8);
-            memcpy(&v, r + 12, 4);
+            uint64_t slot;
+            wal_row(r, row, &id, &ts, &slot);
             if (id >= eng_series_count(db) && !reloaded) {
                 series_reload(&db->series, db->dirfd); /* created after our last look */
+                series_reload(&db->states, db->dirfd);
                 reloaded = true;
             }
             if (id >= eng_series_count(db))
                 continue;
             pthread_mutex_lock(&db->buf_lock);
-            rc = mt_add(t->m, NULL, id, &ts, &v, 1, 0);
+            rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, 0);
             pthread_mutex_unlock(&db->buf_lock);
         }
-        pos += WAL_HDR + n * WAL_ROW;
+        pos += rec;
     }
     t->off += pos;
     free(buf);
@@ -299,6 +294,7 @@ int follow_refresh(eng *db)
     }
     if (m.version != db->follow_version) {
         series_reload(&db->series, db->dirfd);
+        series_reload(&db->states, db->dirfd);
         /* the new part set: parts we have stay, new ones are opened */
         size_t ncur;
         part **cur = db_snapshot(db, INT64_MIN, INT64_MAX, &ncur);

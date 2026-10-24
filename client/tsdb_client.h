@@ -52,6 +52,22 @@ int tsdbc_query_points_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end,
 int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
+/* Value types and nulls (protocol version 2), as tsdb_series_create,
+ * tsdb_insert_values, tsdb_query_values and the state dictionary. */
+int tsdbc_series_create(tsdbc *c, const char *name, tsdb_type type, const char *path, uint32_t *id);
+int tsdbc_series_type(tsdbc *c, uint32_t id, tsdb_type *type);
+int tsdbc_insert_values(tsdbc *c, const uint32_t *series, const int64_t *ts, const tsdb_values *values, size_t n);
+int tsdbc_insert_series_values(tsdbc *c, uint32_t series, const int64_t *ts, const tsdb_values *values, size_t n);
+int tsdbc_insert_values_async(tsdbc *c, const uint32_t *series, const int64_t *ts, const tsdb_values *values,
+                              size_t n);
+int tsdbc_insert_series_values_async(tsdbc *c, uint32_t series, const int64_t *ts, const tsdb_values *values,
+                                     size_t n);
+int tsdbc_query_values(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+                       tsdb_values_fn fn, void *ctx);
+int tsdbc_state(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
+int tsdbc_state_lookup(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
+int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t len);
+
 int tsdbc_commit(tsdbc *c);
 int tsdbc_flush(tsdbc *c);
 int tsdbc_optimize(tsdbc *c);

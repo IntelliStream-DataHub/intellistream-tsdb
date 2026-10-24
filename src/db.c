@@ -393,7 +393,8 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     }
     if ((rc = meta_load_or_create(db, ro)) != 0)
         goto fail;
-    if ((rc = series_open(&db->series, db->dirfd, ro, db->opt.fsync)) != 0)
+    if ((rc = series_open(&db->series, db->dirfd, "SERIES", ro, db->opt.fsync)) != 0 ||
+        (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0)
         goto fail;
     bool has_manifest = faccessat(db->dirfd, "MANIFEST", F_OK, 0) == 0;
     if (ro && has_manifest) {
@@ -475,8 +476,10 @@ int eng_close(eng *db)
     for (size_t i = 0; i < db->nparts; i++)
         part_unref(db->parts[i]);
     free(db->parts);
-    if (db->dirfd >= 0)
+    if (db->series.file)
         series_close(&db->series);
+    if (db->states.file)
+        series_close(&db->states);
     while (db->cc_free) {
         codec_ctx *c = db->cc_free;
         db->cc_free = c->next;
@@ -505,59 +508,75 @@ int eng_close(eng *db)
 
 /* ---------------------------------------------------------------- series */
 
-int eng_series(eng *db, const char *name, uint32_t *id) { return series_get(&db->series, name, true, id); }
-int eng_series_lookup(eng *db, const char *name, uint32_t *id) { return series_get(&db->series, name, false, id); }
+int eng_series(eng *db, const char *name, int type, uint32_t *id) { return series_get(&db->series, name, true, type, id); }
+int eng_series_lookup(eng *db, const char *name, uint32_t *id) { return series_get(&db->series, name, false, 0, id); }
 uint32_t eng_series_count(eng *db) { return atomic_load(&db->series.count); }
 const char *eng_series_name(eng *db, uint32_t id) { return series_name(&db->series, id); }
+int eng_series_type(eng *db, uint32_t id) { return series_type(&db->series, id); }
+
+/* State codes are dictionary ids + 1: code 0 is null. */
+int eng_state(eng *db, const char *name, bool create, uint32_t *code)
+{
+    uint32_t id;
+    int rc = series_get(&db->states, name, create, 0, &id);
+    if (rc == TSDB_ERR_NOTFOUND && db->opt.read_only) {
+        series_reload(&db->states, db->dirfd); /* the writer may have made it a moment ago */
+        rc = series_get(&db->states, name, false, 0, &id);
+    }
+    if (rc == 0)
+        *code = id + 1;
+    return rc;
+}
+
+const char *eng_state_name(eng *db, uint32_t code)
+{
+    if (code == 0)
+        return NULL;
+    const char *name = series_name(&db->states, code - 1);
+    if (!name && db->opt.read_only) {
+        series_reload(&db->states, db->dirfd);
+        name = series_name(&db->states, code - 1);
+    }
+    return name;
+}
 
 /* ---------------------------------------------------------------- writes */
 
 /* Small batches go through the WAL into the memtable; large ones become
  * parts directly. A non-empty memtable is flushed first, so its rows get
  * older block numbers than the new part and "last write wins" holds. */
-static int write_rows(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v, size_t n)
+static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v,
+                      size_t n)
 {
     if (n == 0)
         return 0;
     if (n < db->opt.wal_max_batch_rows)
-        return mem_insert(db, series, cs, ts, v, n);
+        return mem_insert(db, series, cs, ts, v, type_width(type), n);
     pthread_mutex_lock(&db->buf_lock);
     bool pending = db->active->rows > 0;
     pthread_mutex_unlock(&db->buf_lock);
     int rc = pending || db->nflushing ? mt_flush(db) : 0;
-    return rc ? rc : insert_rows(db, series, cs, ts, v, n, 0, NULL);
+    return rc ? rc : insert_rows(db, type, series, cs, ts, v, n, 0, NULL);
 }
 
-int eng_insert(eng *db, const uint32_t *series, const int64_t *ts, const float *values, size_t n)
+int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *values, size_t n)
 {
     if (db->opt.read_only)
         return TSDB_ERR_READONLY;
     if (n && (!series || !ts || !values))
         return TSDB_ERR_INVALID;
-    uint32_t count = eng_series_count(db), max = 0;
-    for (size_t i = 0; i < n; i++)
-        max = series[i] > max ? series[i] : max;
-    if (n && max >= count)
+    if (n && !series_check(&db->series, series, 0, n, type))
         return TSDB_ERR_INVALID;
-    return write_rows(db, series, 0, ts, values, n);
+    return write_rows(db, type, series, 0, ts, values, n);
 }
 
-int eng_insert_series(eng *db, uint32_t series, const int64_t *ts, const float *values, size_t n)
+int eng_insert_series(eng *db, int type, uint32_t series, const int64_t *ts, const void *values, size_t n)
 {
     if (db->opt.read_only)
         return TSDB_ERR_READONLY;
-    if (series >= eng_series_count(db) || (n && (!ts || !values)))
+    if (!series_check(&db->series, NULL, series, 0, type) || (n && (!ts || !values)))
         return TSDB_ERR_INVALID;
-    return write_rows(db, NULL, series, ts, values, n);
-}
-
-int eng_append(eng *db, uint32_t series, int64_t ts, float value)
-{
-    if (db->opt.read_only)
-        return TSDB_ERR_READONLY;
-    if (series >= eng_series_count(db))
-        return TSDB_ERR_INVALID;
-    return mem_insert(db, NULL, series, &ts, &value, 1);
+    return write_rows(db, type, NULL, series, ts, values, n);
 }
 
 int eng_commit(eng *db)

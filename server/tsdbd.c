@@ -254,6 +254,76 @@ static int raw_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
     return 0;
 }
 
+/* QUERY_VALUES output: chunks of typed rows with a validity bitmap when they hold nulls. */
+typedef struct values_out {
+    conn *c;
+    uint32_t id;
+    uint8_t type, any_null;
+    int64_t *ts;
+    uint8_t *v; /* values, then room for the bitmap */
+    uint32_t n;
+    bool gone;
+} values_out;
+
+static bool values_flush(values_out *o, bool last, int32_t status)
+{
+    unsigned aw = tsdb_wire_width(o->type);
+    size_t vb = (size_t)o->n * aw;
+    uint8_t h[8] = {last, o->type, (uint8_t)(o->any_null ? TSDB_VALID : 0), 0};
+    put32(h + 4, o->n);
+    size_t valid = o->any_null ? ((size_t)o->n + 7) / 8 : 0;
+    if (valid)
+        memmove(o->v + vb, o->v + (size_t)RAW_CHUNK_ROWS * 8, valid); /* the bitmap right after the values */
+    bool ok = reply(o->c, o->id, status, h, 8, o->ts, (size_t)o->n * 8, o->v, vb + valid);
+    o->n = 0;
+    o->any_null = 0;
+    if (o->v) /* NULL for an error reply before any rows */
+        memset(o->v + (size_t)RAW_CHUNK_ROWS * 8, 0, RAW_CHUNK_ROWS / 8);
+    return ok;
+}
+
+static int values_cb(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
+{
+    values_out *o = ctx;
+    unsigned aw = tsdb_wire_width(o->type);
+    uint8_t *bits = o->v + (size_t)RAW_CHUNK_ROWS * 8;
+    for (size_t i = 0; i < n; i++) {
+        bool known = !col->valid || ((col->valid[i >> 3] >> (i & 7)) & 1);
+        o->ts[o->n] = ts[i];
+        memcpy(o->v + (size_t)o->n * aw, (const uint8_t *)col->values + i * aw, aw);
+        bits[o->n >> 3] |= (uint8_t)(known << (o->n & 7));
+        o->any_null |= !known;
+        if (++o->n == RAW_CHUNK_ROWS && !values_flush(o, false, 0)) {
+            o->gone = true;
+            return 1; /* the client went away: stop the query */
+        }
+    }
+    return 0;
+}
+
+static void reply_buckets(conn *c, uint32_t id, const tsdb_bucket *b, size_t nb)
+{
+    uint8_t *rows = malloc(nb * TSDB_BUCKET_ROW + 1);
+    if (!rows) {
+        reply_status(c, id, TSDB_ERR_NOMEM);
+        return;
+    }
+    for (size_t i = 0; i < nb; i++) {
+        uint8_t *o = rows + i * TSDB_BUCKET_ROW;
+        memcpy(o, &b[i].start, 8);
+        memcpy(o + 8, &b[i].count, 8);
+        memcpy(o + 16, &b[i].sum, 8);
+        memcpy(o + 24, &b[i].min, 8);
+        memcpy(o + 32, &b[i].max, 8);
+        memcpy(o + 40, &b[i].isum, 8);
+        memcpy(o + 48, &b[i].imin, 8);
+        memcpy(o + 56, &b[i].imax, 8);
+    }
+    uint32_t n = (uint32_t)nb;
+    reply(c, id, 0, &n, 4, rows, nb * TSDB_BUCKET_ROW, NULL, 0);
+    free(rows);
+}
+
 static void handle(req *r)
 {
     conn *c = r->c;
@@ -414,9 +484,10 @@ static void handle(req *r)
                 uint8_t *o = rows + i * TSDB_AGG_ROW;
                 memcpy(o, &b[i].start, 8);
                 memcpy(o + 8, &b[i].count, 8);
+                float mn = (float)b[i].min, mx = (float)b[i].max; /* version 1 rows: float32 */
                 memcpy(o + 16, &b[i].sum, 8);
-                memcpy(o + 24, &b[i].min, 4);
-                memcpy(o + 28, &b[i].max, 4);
+                memcpy(o + 24, &mn, 4);
+                memcpy(o + 28, &mx, 4);
             }
             uint32_t n = (uint32_t)nb;
             reply(c, r->id, 0, &n, 4, rows, nb * TSDB_AGG_ROW, NULL, 0);
@@ -424,6 +495,180 @@ static void handle(req *r)
             free(b);
             return;
         }
+        break;
+    }
+    case TSDB_OP_SERIES_CREATE: {
+        uint16_t n, pn;
+        if (len < 5 || (memcpy(&n, p + 1, 2), len < 5u + n)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&pn, p + 3 + n, 2);
+        if (n == 0 || len != 5u + n + pn || memchr(p + 3, 0, n) || memchr(p + 5 + n, 0, pn)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        char *name = strndup((const char *)p + 3, n);
+        char *path = pn ? strndup((const char *)p + 5 + n, pn) : NULL;
+        uint32_t id = 0;
+        rc = !name || (pn && !path) ? TSDB_ERR_NOMEM : tsdb_series_create(db, name, (tsdb_type)p[0], path, &id);
+        free(name);
+        free(path);
+        if (rc == 0) {
+            reply(c, r->id, 0, &id, 4, NULL, 0, NULL, 0);
+            return;
+        }
+        break;
+    }
+    case TSDB_OP_SERIES_TYPE: {
+        uint32_t id;
+        tsdb_type t;
+        if (len != 4) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&id, p, 4);
+        if ((rc = tsdb_series_type(db, id, &t)) == 0) {
+            uint8_t t8 = (uint8_t)t;
+            reply(c, r->id, 0, &t8, 1, NULL, 0, NULL, 0);
+            return;
+        }
+        break;
+    }
+    case TSDB_OP_INSERT_VALUES: {
+        uint32_t n, s;
+        if (len < TSDB_VALUES_HEADER || p[8] > TSDB_STATE) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&n, p, 4);
+        memcpy(&s, p + 4, 4);
+        bool many = s == TSDB_MANY_SERIES;
+        size_t vb = (size_t)n * tsdb_wire_width(p[8]), valid = (p[9] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0;
+        size_t end = TSDB_VALUES_HEADER + (size_t)n * 8 + vb + valid, sofs = (end + 3) & ~(size_t)3;
+        if (len != (many ? sofs + (size_t)n * 4 : end)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        const int64_t *ts = (const int64_t *)(p + TSDB_VALUES_HEADER); /* the payload is 8-aligned */
+        const uint8_t *vals = p + TSDB_VALUES_HEADER + (size_t)n * 8;
+        tsdb_values col = {(tsdb_type)p[8], vals, valid ? vals + vb : NULL};
+        rc = many ? tsdb_insert_values(db, (const uint32_t *)(p + sofs), ts, &col, n)
+                  : tsdb_insert_series_values(db, s, ts, &col, n);
+        break;
+    }
+    case TSDB_OP_QUERY_VALUES: {
+        values_out o = {c, r->id, 0, 0, NULL, NULL, 0, false};
+        if (len != 20 && len != 29) {
+            values_flush(&o, true, TSDB_ERR_INVALID);
+            return;
+        }
+        uint32_t s;
+        int64_t start, end;
+        tsdb_query_opts q = {TSDB_ASC, 0};
+        memcpy(&s, p, 4);
+        memcpy(&start, p + 4, 8);
+        memcpy(&end, p + 12, 8);
+        if (len == 29) {
+            uint64_t lim;
+            q.order = p[20] ? TSDB_DESC : TSDB_ASC;
+            memcpy(&lim, p + 21, 8);
+            q.limit = (size_t)lim;
+        }
+        tsdb_type t = TSDB_FLOAT32;
+        tsdb_series_type(db, s, &t); /* an unknown series: no rows */
+        o.type = (uint8_t)t;
+        o.ts = malloc(RAW_CHUNK_ROWS * 8);
+        o.v = calloc((size_t)RAW_CHUNK_ROWS * 8 + RAW_CHUNK_ROWS / 8, 1);
+        if (!o.ts || !o.v) {
+            free(o.ts);
+            free(o.v);
+            o.ts = NULL;
+            o.v = NULL;
+            values_flush(&o, true, TSDB_ERR_NOMEM);
+            return;
+        }
+        rc = tsdb_query_values(db, s, start, end, &q, values_cb, &o);
+        if (!o.gone)
+            values_flush(&o, true, rc); /* the rest of the rows, or the error */
+        free(o.ts);
+        free(o.v);
+        return;
+    }
+    case TSDB_OP_STATE: {
+        uint32_t s, code;
+        uint16_t n;
+        if (len < 7 || (memcpy(&n, p + 5, 2), len != 7u + n) || n == 0 || memchr(p + 7, 0, n)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        char *name = strndup((const char *)p + 7, n);
+        rc = !name ? TSDB_ERR_NOMEM : p[4] ? tsdb_state(db, s, name, &code) : tsdb_state_lookup(db, s, name, &code);
+        free(name);
+        if (rc == 0) {
+            reply(c, r->id, 0, &code, 4, NULL, 0, NULL, 0);
+            return;
+        }
+        break;
+    }
+    case TSDB_OP_STATE_NAME: {
+        uint32_t s, code;
+        if (len != 8) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        memcpy(&code, p + 4, 4);
+        const char *name = tsdb_state_name(db, s, code);
+        if (!name) {
+            rc = TSDB_ERR_NOTFOUND;
+            break;
+        }
+        uint16_t n = (uint16_t)strlen(name);
+        reply(c, r->id, 0, &n, 2, name, n, NULL, 0);
+        return;
+    }
+    case TSDB_OP_QUERY_BUCKETS: {
+        uint32_t s, count;
+        int64_t start, end, interval;
+        uint64_t lim;
+        uint16_t zl;
+        if (len < 44 || (memcpy(&zl, p + 42, 2), len != 44u + zl) || memchr(p + 44, 0, zl)) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        memcpy(&s, p, 4);
+        memcpy(&start, p + 4, 8);
+        memcpy(&end, p + 12, 8);
+        memcpy(&interval, p + 20, 8);
+        memcpy(&count, p + 29, 4);
+        memcpy(&lim, p + 34, 8);
+        tsdb_query_opts q = {p[33] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
+        tsdb_bucket *b = NULL;
+        size_t nb = 0;
+        if (p[28] == 0) {
+            rc = tsdb_query_agg(db, s, start, end, interval, &b, &nb);
+            if (rc == 0 && q.order == TSDB_DESC)
+                for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
+                    tsdb_bucket x = b[i];
+                    b[i] = b[j];
+                    b[j] = x;
+                }
+            if (rc == 0 && q.limit && nb > q.limit)
+                nb = q.limit;
+        } else {
+            char *zone = zl ? strndup((const char *)p + 44, zl) : NULL;
+            tsdb_group g = {(tsdb_unit)p[28], count, zone};
+            rc = zl && !zone ? TSDB_ERR_NOMEM : tsdb_query_group_ex(db, s, start, end, &g, &q, &b, &nb);
+            free(zone);
+        }
+        if (rc == 0) {
+            reply_buckets(c, r->id, b, nb);
+            free(b);
+            return;
+        }
+        free(b);
         break;
     }
     case TSDB_OP_COMMIT: rc = tsdb_commit(db); break;

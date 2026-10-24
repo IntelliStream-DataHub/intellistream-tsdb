@@ -24,7 +24,7 @@ typedef struct eng eng;
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define FORMAT_VERSION 1
+#define FORMAT_VERSION 2 /* 2: 80-byte granules with typed statistics; version 1 parts are still read */
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -51,6 +51,53 @@ static inline int64_t sat_mul(int64_t a, int64_t b)
     return __builtin_mul_overflow(a, b, &r) ? (((a < 0) != (b < 0)) ? INT64_MIN : INT64_MAX) : r;
 }
 
+/* ---- value types (values.c) ----
+ * Values travel through the engine in slots of type_width(type) bytes:
+ * float32 bits, uint32 0/1 for bool, uint32 codes for state (4 bytes);
+ * float64 bits and int64 (8 bytes). A null is a reserved value per type. */
+#define NTYPES 5
+#define NULL_F32 TSDB_NULL_F32_BITS
+#define NULL_F64 TSDB_NULL_F64_BITS
+#define NULL_I64 INT64_MIN
+#define NULL_BOOL 2u
+#define NULL_STATE 0u
+
+static inline size_t type_width(int t) { return t == TSDB_FLOAT64 || t == TSDB_INT64 ? 8 : 4; }
+static inline bool type_valid(int t) { return t >= TSDB_FLOAT32 && t <= TSDB_STATE; }
+static inline bool type_is_int(int t) { return t == TSDB_INT64 || t == TSDB_BOOL || t == TSDB_STATE; }
+/* the null of type t as slot bits (zero-extended for 4-byte types) */
+static inline uint64_t type_null(int t)
+{
+    switch (t) {
+    case TSDB_FLOAT32: return NULL_F32;
+    case TSDB_FLOAT64: return NULL_F64;
+    case TSDB_INT64: return (uint64_t)NULL_I64;
+    case TSDB_BOOL: return NULL_BOOL;
+    default: return NULL_STATE;
+    }
+}
+/* slot i of v (width w) as zero-extended bits */
+static inline uint64_t slot_get(const void *v, size_t w, size_t i)
+{
+    if (w == 4) {
+        uint32_t x;
+        memcpy(&x, (const uint8_t *)v + 4 * i, 4);
+        return x;
+    }
+    uint64_t x;
+    memcpy(&x, (const uint8_t *)v + 8 * i, 8);
+    return x;
+}
+static inline void slot_put(void *v, size_t w, size_t i, uint64_t x)
+{
+    if (w == 4) {
+        uint32_t y = (uint32_t)x;
+        memcpy((uint8_t *)v + 4 * i, &y, 4);
+    } else {
+        memcpy((uint8_t *)v + 8 * i, &x, 8);
+    }
+}
+
 /* ---- hashing (xxhash64) ---- */
 uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 
@@ -65,6 +112,10 @@ uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 #define BLK_TS_GRID 8   /* int64 residuals from a regular grid (clock jitter) */
 #define BLK_ALPRD 9     /* float32 split into dictionary-coded high bits and packed low bits */
 #define BLK_DECIMAL_BP 10 /* fixed-point integers, bit-packed zigzag deltas */
+#define BLK_F64_DECIMAL 11 /* float64 that are exact decimals: integers as in BLK_INT */
+#define BLK_XOR64 12       /* Gorilla over float64 */
+#define BLK_BYTESPLIT64 13 /* byte stream split of float64 */
+#define BLK_INT 14         /* int64: zigzag deltas bit-packed per 1024 values */
 #define BLK_ZSTD 0x10 /* the transform output is additionally ZSTD compressed */
 #define BLK_SLACK 32  /* decoders may read up to this many bytes past a block */
 
@@ -123,32 +174,65 @@ size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uin
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out);
 int block_decode_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out);
 int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, float *out);
+/* any value type, in slots of type_width(type) (codec_typed.c) */
+size_t block_encode_vals(codec_ctx *c, int level, int value_codec, int type, const void *v, size_t n, uint8_t *out);
+int block_decode_vals(codec_ctx *c, int type, const uint8_t *blk, size_t len, size_t n, void *out);
+/* shared by the codec files */
+int codec_scratch_reserve(codec_ctx *c, size_t need);
+size_t block_wrap(codec_ctx *c, int level, int kind, size_t inner, uint8_t *out);
+/* a block's transform kind and its (decompressed) transform bytes */
+int block_open(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int *kind, const uint8_t **p, size_t *plen);
+size_t int_bp_bound(size_t n);
+size_t int_bp_encode(const int64_t *in, size_t n, uint8_t *out);
+int int_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
+size_t f64_decimal_bound(size_t n);
+size_t f64_decimal_encode(const double *in, size_t n, uint8_t *out); /* 0 if not decimal */
+int f64_decimal_decode(const uint8_t *in, size_t len, size_t n, double *out);
+size_t xor64_bound(size_t n);
+size_t xor64_encode(const uint64_t *in, size_t n, uint8_t *out);
+int xor64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out);
 
 /* ---- SIMD kernels (simd.c), dispatched once at startup ---- */
 typedef struct agg_state {
-    uint64_t count;
-    double sum;
-    float min, max;
+    uint64_t rows;  /* rows folded, nulls included */
+    uint64_t count; /* known values */
+    double sum, min, max;     /* floats */
+    __int128 isum;            /* int64, bool, state */
+    int64_t imin, imax;
 } agg_state;
 
 static inline void agg_init(agg_state *a)
 {
-    a->count = 0;
-    a->sum = 0;
-    a->min = __builtin_inff();
-    a->max = -__builtin_inff();
+    memset(a, 0, sizeof *a);
+    a->min = __builtin_inf();
+    a->max = -__builtin_inf();
+    a->imin = INT64_MAX;
+    a->imax = INT64_MIN;
 }
 
-static inline void agg_merge(agg_state *a, uint64_t count, double sum, float mn, float mx)
+static inline void agg_combine(agg_state *a, const agg_state *b)
 {
-    a->count += count;
-    a->sum += sum;
-    if (mn < a->min) a->min = mn;
-    if (mx > a->max) a->max = mx;
+    a->rows += b->rows;
+    a->count += b->count;
+    a->sum += b->sum;
+    if (b->min < a->min) a->min = b->min;
+    if (b->max > a->max) a->max = b->max;
+    a->isum += b->isum;
+    if (b->imin < a->imin) a->imin = b->imin;
+    if (b->imax > a->imax) a->imax = b->imax;
 }
 
-/* Folds v[0..n) into a: count, sum (in double), min and max (NaN ignored). */
+/* Folds float32 values (no nulls) into a: count, sum (in double), min and max (NaN ignored). */
 extern void (*simd_agg_f32)(const float *v, size_t n, agg_state *a);
+/* Folds n slots of `type` into a, skipping nulls (values.c). */
+void agg_fold(int type, const void *v, size_t n, agg_state *a);
+/* the same, skipping the search for nulls when the caller knows there are none (a granule's count) */
+void agg_fold_hint(int type, const void *v, size_t n, bool may_be_null, agg_state *a);
+struct granule;
+/* The statistics of a granule's values; and a granule's statistics as an agg_state. */
+void granule_stats(int type, const void *v, size_t n, struct granule *g);
+void agg_from_granule(int type, const struct granule *g, agg_state *a);
+void agg_to_bucket(int type, const agg_state *a, tsdb_bucket *b);
 const char *simd_name(void);
 void simd_init(void);
 
@@ -188,22 +272,41 @@ enum { BK_ONE, BK_FIXED, BK_CALENDAR };
 
 /* ---- parts ---- */
 
-/* One entry of a part's sparse index; stored on disk exactly like this (little endian). */
+/* One entry of a part's sparse index; stored on disk exactly like this (little
+ * endian). The statistics cover the known values; their type is the series'. */
 typedef struct granule {
     uint32_t series;
-    uint32_t count;
+    uint32_t count;  /* rows, nulls included */
     int64_t ts_min;
     int64_t ts_max;
     uint64_t off;    /* file offset of the timestamp block; the value block follows it */
     uint32_t ts_len;
     uint32_t val_len;
+    uint32_t nulls;
+    uint32_t crc;    /* low 32 bits of xxh64 over both blocks */
+    union { double fmin; int64_t imin; };
+    union { double fmax; int64_t imax; };
+    union { double fsum; uint64_t isum_lo; };
+    int64_t isum_hi; /* integer sums are 128 bits */
+} granule;
+_Static_assert(sizeof(granule) == 80, "granule must be 80 bytes");
+
+/* Format version 1 (float32 only, no nulls); converted when such a part is opened. */
+typedef struct granule_v1 {
+    uint32_t series;
+    uint32_t count;
+    int64_t ts_min;
+    int64_t ts_max;
+    uint64_t off;
+    uint32_t ts_len;
+    uint32_t val_len;
     double sum;
     float vmin;
     float vmax;
-    uint32_t crc;    /* low 32 bits of xxh64 over both blocks */
+    uint32_t crc;
     uint32_t reserved;
-} granule;
-_Static_assert(sizeof(granule) == 64, "granule must be 64 bytes");
+} granule_v1;
+_Static_assert(sizeof(granule_v1) == 64, "a version 1 granule is 64 bytes");
 
 typedef struct part_header {
     char magic[8];
@@ -236,6 +339,7 @@ typedef struct part {
     const uint8_t *map;
     size_t map_len;
     const granule *g;
+    granule *g_owned; /* g converted from a version 1 index */
     uint32_t ng;
     uint64_t index_off;
     uint64_t rows;
@@ -253,7 +357,8 @@ int part_open(int dirfd, const char *name, part **out);
 int part_open_as(int dirfd, const char *file, const char *name, part **out);
 void part_ref(part *p);
 void part_unref(part *p);
-int granule_read(codec_ctx *c, const part *p, const granule *g, int64_t *ts, float *v);
+/* Decodes a granule: timestamps, and values (if v) as slots of `type`. */
+int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v);
 
 typedef struct part_writer {
     struct eng *db;
@@ -267,9 +372,10 @@ typedef struct part_writer {
     size_t ng, idx_cap;
     uint64_t wal_seq;
     uint32_t pend_series;
+    int pend_type;
     size_t pend_n;
     int64_t *pend_ts;
-    float *pend_v;
+    uint8_t *pend_v; /* slots of pend_type */
     uint32_t grows;
     int zstd_level;
     int value_codec;
@@ -279,7 +385,8 @@ typedef struct part_writer {
 } part_writer;
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq);
-int pw_add(part_writer *w, uint32_t series, const int64_t *ts, const float *v, size_t n);
+/* Rows of one series of `type` (v in its slots); (series, ts) order across calls. */
+int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n);
 int pw_copy_granule(part_writer *w, const part *src, const granule *g);
 int pw_finish(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
 /* As pw_finish, but the part stays under its tmp name until parts_commit. */
@@ -294,9 +401,11 @@ void pw_abort(part_writer *w);
 /* ---- series dictionary ---- */
 typedef struct series_dict {
     pthread_mutex_t lock;
+    const char *file;
     int fd;
     bool fsync;
     char **names;
+    uint8_t *types; /* tsdb_type per id */
     uint32_t cap;
     atomic_uint count;
     uint32_t *table; /* open addressing; id + 1, 0 = empty */
@@ -304,11 +413,15 @@ typedef struct series_dict {
     uint64_t file_off; /* bytes of SERIES already loaded */
 } series_dict;
 
-int series_open(series_dict *d, int dirfd, bool read_only, bool fsync);
+/* The series dictionary (file SERIES) and the state names (file STATES) are both these. */
+int series_open(series_dict *d, int dirfd, const char *file, bool read_only, bool fsync);
 int series_reload(series_dict *d, int dirfd); /* readers: names appended by the writer since */
 void series_close(series_dict *d);
-int series_get(series_dict *d, const char *name, bool create, uint32_t *id);
+/* create: make a missing name, of `type` (an existing name of another type is TSDB_ERR_INVALID) */
+int series_get(series_dict *d, const char *name, bool create, int type, uint32_t *id);
 const char *series_name(series_dict *d, uint32_t id);
+int series_type(series_dict *d, uint32_t id); /* -1 for an unknown id */
+bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n, int type);
 
 /* ---- thread pool ---- */
 typedef struct pool pool;
@@ -322,7 +435,7 @@ int pool_run(pool *p, int n, void (*fn)(void *arg, int i), void *arg);
 /* ---- memtable + WAL (memtable.c) ---- */
 typedef struct mt_series {
     int64_t *ts;
-    float *v;
+    uint64_t *v; /* slots, zero-extended */
     uint64_t *lsn; /* WAL sequence of each row; increasing, 0 when already durable */
     uint32_t n, cap;
     bool sorted; /* non-decreasing ts, in insertion order */
@@ -340,10 +453,11 @@ typedef struct memtable {
     int64_t created_ms;
 } memtable;
 
-/* Rows of one series copied out of a memtable: sorted, unique by ts. */
+/* Rows of one series copied out of a memtable: sorted, unique by ts; v in
+ * slots of the series' type. */
 typedef struct mem_run {
     int64_t *ts;
-    float *v;
+    uint8_t *v;
     size_t n;
 } mem_run;
 
@@ -355,13 +469,24 @@ typedef struct part_list {
 memtable *mt_new(uint64_t wal_seq);
 void mt_ref(memtable *m);
 void mt_unref(memtable *m);
-/* lsn0: WAL sequence of the first row (the rest follow), 0 for rows that are durable already */
-int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v, size_t n, uint64_t lsn0);
-/* only rows with a WAL sequence <= visible */
-int mt_collect(const memtable *m, uint32_t id, int64_t start, int64_t end, uint64_t visible, mem_run *out);
+/* v: slots of width w (4 or 8). lsn0: WAL sequence of the first row (the rest
+ * follow), 0 for rows that are durable already */
+int mt_add(memtable *m, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n,
+           uint64_t lsn0);
+/* only rows with a WAL sequence <= visible; values as slots of width w */
+int mt_collect(const memtable *m, uint32_t id, size_t w, int64_t start, int64_t end, uint64_t visible, mem_run *out);
 void mem_run_free(mem_run *r);
 int mt_flush(struct eng *db);
-int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const float *v, size_t n);
+int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
+               size_t n);
+/* WAL records: [u32 rows | WAL_WIDE][u32 checksum][rows]; rows are 16 bytes
+ * (u32 series, i64 ts, f32 value) without WAL_WIDE (version 1), else 20
+ * (u32 series, i64 ts, u64 slot). Returns the record's size, or 0 when the
+ * record is torn or absent; *row the size of one row. */
+#define WAL_HDR 8
+#define WAL_WIDE 0x80000000u
+size_t wal_record(const uint8_t *p, size_t avail, size_t *nrows, size_t *row);
+void wal_row(const uint8_t *r, size_t row, uint32_t *id, int64_t *ts, uint64_t *slot);
 int wal_commit(struct eng *db, uint64_t target);
 int wal_open(struct eng *db);
 void wal_close(struct eng *db);
@@ -420,6 +545,7 @@ struct eng {
     codec_ctx *cc_free;
 
     series_dict series;
+    series_dict states;
     pool *qpool;
 
     /* memtable and WAL (memtable.c) */
@@ -484,56 +610,31 @@ void merge_commit_locked(struct eng *db, part **src, size_t k, part *out);
 
 /* insert.c: sorts (stably), keeps the last row per (series, ts), writes one
  * part per partition. Parts are published, or handed back in `collect`. */
-int insert_rows(struct eng *db, const uint32_t *series, uint32_t const_series, const int64_t *ts,
-                const float *v, size_t n, uint64_t wal_seq, part_list *collect);
+int insert_rows(struct eng *db, int type, const uint32_t *series, uint32_t const_series, const int64_t *ts,
+                const void *v, size_t n, uint64_t wal_seq, part_list *collect);
 int part_list_push(part_list *l, part *p);
 int parts_publish(struct eng *db, part **ps, size_t n);
 
 /* the storage engine for one directory; the public API in tsdb.h wraps these */
 int eng_open(const char *dir, const tsdb_options *opts, eng **out);
 int eng_close(eng *db);
-int eng_series(eng *db, const char *name, uint32_t *id);
+int eng_series(eng *db, const char *name, int type, uint32_t *id);
 int eng_series_lookup(eng *db, const char *name, uint32_t *id);
 uint32_t eng_series_count(eng *db);
 const char *eng_series_name(eng *db, uint32_t id);
-int eng_insert(eng *db, const uint32_t *series, const int64_t *ts, const float *values, size_t n);
-int eng_insert_series(eng *db, uint32_t series, const int64_t *ts, const float *values, size_t n);
-int eng_append(eng *db, uint32_t series, int64_t ts, float value);
+int eng_series_type(eng *db, uint32_t id);
+int eng_state(eng *db, const char *name, bool create, uint32_t *code);
+const char *eng_state_name(eng *db, uint32_t code);
+/* v: slots of `type`; every series must be of that type */
+int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n);
+int eng_insert_series(eng *db, int type, uint32_t series, const int64_t *ts, const void *v, size_t n);
 int eng_commit(eng *db);
 int eng_flush(eng *db);
-int eng_query_raw(eng *db, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx);
-int eng_query_points(eng *db, uint32_t series, int64_t start, int64_t end, tsdb_points *out);
 extern size_t desc_window_rows;
+/* Raw rows in time order; v as slots of the series' type. */
+typedef int (*slot_fn)(void *ctx, const int64_t *ts, const void *v, size_t n);
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
-                     tsdb_raw_fn fn, void *ctx);
-int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
-                  size_t *nout);
-int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
-                    size_t *nout);
-int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g);
-int eng_optimize(eng *db);
-int eng_drop_before(eng *db, int64_t ts);
-int eng_get_stats(eng *db, tsdb_stats *st);
-int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
-int eng_refresh(eng *db);
-
-/* the storage engine for one directory; the public API in tsdb.h wraps these */
-int eng_open(const char *dir, const tsdb_options *opts, eng **out);
-int eng_close(eng *db);
-int eng_series(eng *db, const char *name, uint32_t *id);
-int eng_series_lookup(eng *db, const char *name, uint32_t *id);
-uint32_t eng_series_count(eng *db);
-const char *eng_series_name(eng *db, uint32_t id);
-int eng_insert(eng *db, const uint32_t *series, const int64_t *ts, const float *values, size_t n);
-int eng_insert_series(eng *db, uint32_t series, const int64_t *ts, const float *values, size_t n);
-int eng_append(eng *db, uint32_t series, int64_t ts, float value);
-int eng_commit(eng *db);
-int eng_flush(eng *db);
-int eng_query_raw(eng *db, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx);
-int eng_query_points(eng *db, uint32_t series, int64_t start, int64_t end, tsdb_points *out);
-extern size_t desc_window_rows;
-int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
-                     tsdb_raw_fn fn, void *ctx);
+                     slot_fn fn, void *ctx);
 int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
                   size_t *nout);
 int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
