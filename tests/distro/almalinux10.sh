@@ -29,6 +29,9 @@ mkdir -p "$logdir"
 echo "logs: $logdir"
 [ "${URING:-0}" != 0 ] && echo "NOTE: io_uring is allowed in the container (URING=1); production AlmaLinux 10 disables it."
 
+# The backends the server tests run against: with io_uring blocked, `auto` must fall
+# back to epoll on its own, as tsdbd has to in production.
+if [ "${URING:-0}" != 0 ]; then io="uring epoll"; else io="auto epoll"; fi
 seccomp=()
 if [ "${URING:-0}" != 0 ]; then
     prof="$logdir/seccomp-uring.json"
@@ -78,7 +81,7 @@ rm -f "$logdir/warnings.txt"
 for s in "${steps[@]}"; do
     # --network none: no exposure. --security-opt label=disable: SELinux on the host must not
     # block the bind mount; the container itself has no host data except the read-only source.
-    podman run --rm --network none --security-opt label=disable "${seccomp[@]}" \
+    podman run --rm --network none --security-opt label=disable "${seccomp[@]}" -e IO="$io" \
         -v "$root":/src:ro --tmpfs /tmp:exec,size=8g \
         "$image" bash -c "$inner" _ "$s" >"$logdir/$s.log" 2>&1
     r=$?
