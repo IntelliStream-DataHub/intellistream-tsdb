@@ -387,7 +387,10 @@ five times faster (`build/twa-bench`).
 A TWA bucket needs no reading of its own (a segment across it is enough), so
 two readings far apart could ask for a bucket per millisecond between them. A
 request gets at most 4M buckets (`TSDB_ERR_TOO_MANY_BUCKETS` beyond), which
-fits one reply frame and bounds its memory to some 400 MB.
+fits one reply frame and bounds its memory to some 400 MB. Aggregates, groups,
+bounds and the spread have the same limit, for the same reason: with 64M, one
+37-byte request made tsdbd allocate gigabytes before it found that the reply
+would not fit a frame.
 
 The statistics cost 56 bytes per granule entry (136 instead of 80 bytes): 0.007
 bytes a row in full 8192-row granules, and 0.013 bytes a row measured on
@@ -1008,7 +1011,8 @@ once 4 MB of its requests are waiting, for example behind a large reply its
 client does not read. A frame that is started but not finished within
 `--frame-timeout` seconds (default 60) closes its connection; time in which the
 server, not the client, held it up does not count. A reply that would not fit
-in one frame (256 MB) is `TSDB_ERR_TOO_MANY_BUCKETS`. A compressed (packed)
+in one frame (256 MB), or a query over more than 4M buckets, is
+`TSDB_ERR_TOO_MANY_BUCKETS`. A compressed (packed)
 insert that would be larger than a frame unpacked is refused before anything is
 decompressed. A bad number on the command line (`--port 70000`, `--workers 0`)
 stops the server at once with status 2. Without authentication a client can

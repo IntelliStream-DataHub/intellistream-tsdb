@@ -2488,7 +2488,7 @@ static void test_metrics_more(const char *dir)
         uint32_t nid;
         int rc1 = tsdbc_series(c, "no such series", 0, &nid);
         CHECK(rc1 == TSDB_ERR_NOTFOUND);
-        /* data 200 000 s apart, 1 ms buckets: over the limit of 64 Mi buckets */
+        /* data 200 000 s apart, 1 ms buckets: over the limit of 4 Mi buckets */
         int64_t far_ts[2] = {1800000000000, 1800000000000 + 200000000};
         float far_v[2] = {1, 2};
         OK(tsdbc_insert_series(c, sid, far_ts, far_v, 2));
@@ -2747,7 +2747,8 @@ static void test_hostile(const char *dir)
     }
 
     /* a reply larger than a frame is TOO_MANY_BUCKETS (4.5 million buckets of 64 bytes made a 288 MB frame,
-     * which clients refuse; 64 million wrapped the 32-bit length) */
+     * which clients refuse; 64 million wrapped the 32-bit length); 4.5 million are now over the engine's
+     * limit of 4 Mi buckets as well */
     {
         tsdb_bucket *b = NULL;
         size_t nb = 0;

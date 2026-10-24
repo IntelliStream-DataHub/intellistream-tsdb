@@ -757,6 +757,44 @@ static void test_ends(void)
     rmrf(dir);
 }
 
+/* At most 4 Mi buckets a query, counted between the first and the last reading in range: with 64 Mi, one
+ * QUERY_AGG over two readings far apart made tsdbd allocate 1.3 GB (found by fuzz-frames, whose input is
+ * tests/fuzz/frames/crash-agg-span). */
+static void test_max_buckets(void)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/maxb", base);
+    rmrf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t s;
+    OK(tsdb_series_create(db, "maxb", TSDB_FLOAT32, NULL, &s));
+    const int64_t lim = 4 << 20, t0 = 1700000000000;
+    int64_t ts[3] = {t0, t0 + lim - 1, t0 + lim};
+    float v[3] = {1, 2, 3};
+    OK(tsdb_insert_series(db, s, ts, v, 3));
+    tsdb_bucket *b = NULL;
+    tsdb_spread_bucket *sb = NULL;
+    size_t n = 0;
+    CHECK(tsdb_query_agg(db, s, t0, t0 + lim + 1, 1, &b, &n) == TSDB_ERR_TOO_MANY_BUCKETS && n == 0);
+    free(b), b = NULL;
+    CHECK(tsdb_query_spread(db, s, t0, t0 + lim + 1, 1, NULL, &sb, &n) == TSDB_ERR_TOO_MANY_BUCKETS && n == 0);
+    free(sb), sb = NULL;
+    tsdb_query_opts q = {TSDB_DESC, 2}; /* a limit computes windows, each within the limit: still answered */
+    OK(tsdb_query_agg_ex(db, s, t0, t0 + lim + 1, 1, &q, &b, &n));
+    CHECK(n == 2 && b[0].start == t0 + lim && b[1].start == t0 + lim - 1);
+    free(b), b = NULL;
+    OK(tsdb_query_agg(db, s, t0, t0 + lim, 1, &b, &n)); /* exactly the limit (empty buckets are not returned) */
+    CHECK(n == 2 && b[0].start == t0 && b[1].start == t0 + lim - 1 && b[1].sum == 2);
+    free(b);
+    OK(tsdb_close(db));
+    rmrf(dir);
+}
+
 int main(int argc, char **argv)
 {
     snprintf(base, sizeof base, "%s/tsdb_limits_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
@@ -774,6 +812,7 @@ int main(int argc, char **argv)
 #endif
     test_stats();
     test_ends();
+    test_max_buckets();
     test_lttb_stats();
     test_twa_memtable();
     rmrf(base);
