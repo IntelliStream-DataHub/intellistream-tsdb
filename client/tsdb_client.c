@@ -595,6 +595,113 @@ int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, con
     return rc;
 }
 
+/* ------------------------------------------------- time-weighted averages */
+
+static int twa_req(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval, uint8_t unit,
+                   uint32_t count, const int64_t *bounds, size_t n, const tsdb_twa_opts *opts, tsdb_twa_bucket **out,
+                   size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    if (n > (TSDB_MAX_FRAME - 64 - TSDB_TWA_HEADER) / 8)
+        return TSDB_ERR_INVALID;
+    if (server_version(c) < 6) /* an older server does not know QUERY_TWA */
+        return TSDB_ERR_INVALID;
+    tsdb_twa_opts def = {0};
+    if (!opts)
+        opts = &def;
+    uint8_t q[TSDB_TWA_HEADER] = {0};
+    uint64_t lim = opts->limit;
+    uint32_t n32 = (uint32_t)n;
+    memcpy(q, &series, 4);
+    memcpy(q + 4, &start, 8);
+    memcpy(q + 12, &end, 8);
+    q[20] = (uint8_t)opts->method;
+    q[21] = opts->order == TSDB_DESC;
+    q[22] = unit;
+    memcpy(q + 24, &opts->max_gap_ms, 8);
+    memcpy(q + 32, &lim, 8);
+    memcpy(q + 40, &interval, 8);
+    memcpy(q + 48, &count, 4);
+    memcpy(q + 52, &n32, 4);
+    const uint8_t *b;
+    size_t len;
+    int rc = call(c, TSDB_OP_QUERY_TWA, q, sizeof q, bounds, n * 8, &b, &len);
+    if (rc)
+        return rc;
+    uint32_t m;
+    if (len < 4 || (memcpy(&m, b, 4), len != 4 + (size_t)m * TSDB_TWA_ROW))
+        return TSDB_ERR_CORRUPT;
+    tsdb_twa_bucket *r = malloc((m ? m : 1) * sizeof *r);
+    if (!r)
+        return TSDB_ERR_NOMEM;
+    for (uint32_t i = 0; i < m; i++) {
+        const uint8_t *o = b + 4 + (size_t)i * TSDB_TWA_ROW;
+        memcpy(&r[i].start, o, 8);
+        memcpy(&r[i].twa, o + 8, 8);
+        memcpy(&r[i].area, o + 16, 8);
+        memcpy(&r[i].covered_ms, o + 24, 8);
+        memcpy(&r[i].count, o + 32, 8);
+    }
+    *out = r;
+    *nout = m;
+    return 0;
+}
+
+int tsdbc_query_twa(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                    const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+{
+    if (interval_ms < 0) {
+        *out = NULL;
+        *nout = 0;
+        return TSDB_ERR_INVALID;
+    }
+    return twa_req(c, series, start, end, interval_ms, 0, 0, NULL, 0, opts, out, nout);
+}
+
+int tsdbc_query_twa_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                           const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+{
+    if (!bounds || n == 0) {
+        *out = NULL;
+        *nout = 0;
+        return TSDB_ERR_INVALID;
+    }
+    return twa_req(c, series, start, end, 0, 0, 0, bounds, n, opts, out, nout);
+}
+
+int tsdbc_query_twa_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                          const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    if (!group || group->unit < TSDB_SECOND || group->unit > TSDB_YEAR)
+        return group ? TSDB_ERR_INVALID : twa_req(c, series, start, end, 0, 0, 0, NULL, 0, opts, out, nout);
+    if (!group->timezone || strcmp(group->timezone, "UTC") == 0)
+        return twa_req(c, series, start, end, 0, (uint8_t)group->unit, group->count, NULL, 0, opts, out, nout);
+    /* local periods become UTC bounds over the range; an open end is cut to the rows there are */
+    int64_t lo = start, hi = end == INT64_MAX ? INT64_MIN : end - 1;
+    int rc = 0;
+    if (start == INT64_MIN) {
+        tsdb_query_opts first = {TSDB_ASC, 1};
+        lo = INT64_MAX;
+        rc = tsdbc_query_values(c, series, start, end, &first, first_ts, &lo);
+    }
+    if (rc == 0 && end == INT64_MAX) {
+        tsdb_query_opts last = {TSDB_DESC, 1};
+        rc = tsdbc_query_values(c, series, start, end, &last, first_ts, &hi);
+    }
+    if (rc || lo > hi)
+        return rc;
+    int64_t *bounds;
+    size_t n;
+    rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
+    if (rc == 0)
+        rc = tsdbc_query_twa_bounds(c, series, start, end, bounds, n, opts, out, nout);
+    free(bounds);
+    return rc;
+}
+
 /* ------------------------------------------------------------ value types */
 
 int tsdbc_series_create(tsdbc *c, const char *name, tsdb_type type, const char *path, uint32_t *id)

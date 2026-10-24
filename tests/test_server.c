@@ -790,6 +790,55 @@ static void test_hello_keeps_errors(uint32_t f64)
 }
 
 /* Version 4: the server knows UTC only; clients send the bounds of local periods. */
+/* QUERY_TWA: the interval, calendar, local and bounds forms, against hand-computed values */
+static void test_twa(tsdbc *c)
+{
+    uint32_t s, st;
+    OK(tsdbc_series_create(c, "twa.level", TSDB_FLOAT64, NULL, &s));
+    int64_t t0 = 1700000000000LL / 86400000 * 86400000; /* a UTC midnight */
+    int64_t ts[] = {t0, t0 + 1000, t0 + 2000, t0 + 3000, t0 + 10000};
+    double v[] = {10, 20, 0, 30, 40};
+    uint8_t valid = 0xff & ~(1u << 2);
+    OK(tsdbc_insert_series_values(c, s, ts, &(tsdb_values){TSDB_FLOAT64, v, &valid}, 5));
+    OK(tsdbc_wait(c));
+    tsdb_twa_bucket *b;
+    size_t n;
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 0, NULL, &b, &n));
+    CHECK(n == 1 && b[0].start == t0 && b[0].covered_ms == 9000 && b[0].count == 4 && b[0].area == 240000);
+    free(b);
+    tsdb_twa_opts lin = {.method = TSDB_TWA_LINEAR};
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 4000, &lin, &b, &n));
+    /* [t0, t0 + 4000): 10 -> 20, then 30 -> 40 cut at t0 + 4000 */
+    CHECK(n == 3 && b[0].covered_ms == 2000 && fabs(b[0].area - (15000 + (60 + 10.0 / 7) / 2 * 1000)) < 1e-6 &&
+          b[1].covered_ms == 4000);
+    free(b);
+    tsdb_twa_opts stale = {.max_gap_ms = 5000, .order = TSDB_DESC, .limit = 1};
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 1000, &stale, &b, &n));
+    CHECK(n == 1 && b[0].start == t0 + 10000 && b[0].covered_ms == 0 && b[0].count == 1 && isnan(b[0].twa));
+    free(b);
+    tsdb_group day = {TSDB_DAY, 1, NULL};
+    OK(tsdbc_query_twa_group(c, s, t0 - 5000, t0 + 20000, &day, NULL, &b, &n));
+    CHECK(n == 1 && b[0].start == t0 && b[0].covered_ms == 9000);
+    free(b);
+    tsdb_group oslo = {TSDB_DAY, 1, "Europe/Oslo"}; /* a local day begins at 23:00 UTC in November */
+    OK(tsdbc_query_twa_group(c, s, t0, t0 + 20000, &oslo, NULL, &b, &n));
+    CHECK(n == 1 && b[0].start == t0 - 3600000 && b[0].covered_ms == 9000);
+    free(b);
+    int64_t bounds[] = {t0 + 500, t0 + 2500};
+    OK(tsdbc_query_twa_bounds(c, s, t0, t0 + 20000, bounds, 2, NULL, &b, &n));
+    CHECK(n == 2 && b[0].start == t0 + 500 && b[0].covered_ms == 1500 && b[1].covered_ms == 7000 &&
+          b[1].area == 7000 * 30.0);
+    free(b);
+    OK(tsdbc_series_create(c, "twa.state", TSDB_STATE, NULL, &st));
+    CHECK(tsdbc_query_twa(c, st, t0, t0 + 1, 0, NULL, &b, &n) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_twa(c, s, t0, t0 + 1, 0, &(tsdb_twa_opts){.method = 9}, &b, &n) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_twa_bounds(c, s, t0, t0 + 1, NULL, 0, NULL, &b, &n) == TSDB_ERR_INVALID);
+    /* the connection still works after the errors */
+    OK(tsdbc_query_twa(c, s, t0, t0 + 20000, 0, NULL, &b, &n));
+    CHECK(n == 1);
+    free(b);
+}
+
 static void test_bounds(tsdbc *c, uint32_t a, size_t n)
 {
     tsdb_bucket *bk, *bb;
@@ -1388,6 +1437,7 @@ int main(int argc, char **argv)
     test_pack_roundtrip();
     test_packed_inserts(c);
     test_bounds(c, a, N);
+    test_twa(c);
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);

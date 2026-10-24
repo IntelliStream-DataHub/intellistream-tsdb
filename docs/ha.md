@@ -405,8 +405,8 @@ A series is addressed by `(path, name)`: the absolute path of its volume, as lis
 
 ## 9. Protocol changes (version 5)
 
-> Numbering: protocol version 5 has since been used by LTTB downsampling (QUERY_LTTB, 2026-10-24). The
-> changes in this design ship as the next free version (6 or later); read "version 5"/"v5" in this document
+> Numbering: protocol version 5 has since been used by LTTB downsampling (QUERY_LTTB, 2026-10-24), and 6 by
+> time-weighted averages (QUERY_TWA). The changes in this design ship as the next free version (7 or later); read "version 5"/"v5" in this document
 > as "the failover protocol version".
 
 

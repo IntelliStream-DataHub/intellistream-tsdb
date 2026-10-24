@@ -79,11 +79,20 @@
  *               -> chunks as QUERY_VALUES (never with TSDB_VALID: no nulls),
  *               the chosen points in time order with their stored values
  *               (threshold < 3 or a state series: TSDB_ERR_INVALID)
+ *   Version 6: time-weighted averages (tsdb_query_twa in tsdb.h has the rules). averages (tsdb_query_twa in tsdb.h has the rules).
+ *   QUERY_TWA   u32 series, i64 start, i64 end, u8 method (0 STEP, 1 LINEAR), u8 order,
+ *               u8 unit, u8 0, i64 max_gap, u64 limit, i64 interval, u32 count, u32 n,
+ *               i64 bounds[n]                   (TSDB_TWA_HEADER bytes before the bounds)
+ *               buckets: n > 0: bounds as QUERY_BOUNDS (unit and interval 0); else
+ *               unit > 0: UTC calendar groups of `count` units; else buckets of
+ *               `interval` ms, one bucket when 0
+ *               -> u32 n, n x (i64 start, f64 twa, f64 area, i64 covered_ms, u64 count)
+ *               A client sends it only to a server whose HELLO says 6 or more.
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
-#define TSDB_PROTOCOL_VERSION 5
+#define TSDB_PROTOCOL_VERSION 6
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
@@ -112,10 +121,13 @@ enum {
     TSDB_OP_LAST_STATS = 19,
     TSDB_OP_QUERY_BOUNDS = 20,
     TSDB_OP_QUERY_LTTB = 21,
+    TSDB_OP_QUERY_TWA = 22,
 };
 
 #define TSDB_AGG_ROW 32    /* bytes per bucket in a QUERY_AGG or QUERY_GROUP reply */
 #define TSDB_BUCKET_ROW 64 /* bytes per bucket in a QUERY_BUCKETS reply */
+#define TSDB_TWA_HEADER 56 /* bytes of a QUERY_TWA request before the bounds */
+#define TSDB_TWA_ROW 40    /* bytes per bucket in a QUERY_TWA reply */
 #define TSDB_VALUES_HEADER 16
 #define TSDB_STATS_REPLY 88 /* bytes in a LAST_STATS reply after the status */
 #define TSDB_VALID 1  /* flags: a validity bitmap follows the values */

@@ -442,6 +442,65 @@ static void reply_buckets(conn *c, uint32_t id, const tsdb_bucket *b, size_t nb)
     free(rows);
 }
 
+static void reply_twa(conn *c, uint32_t id, const tsdb_twa_bucket *b, size_t nb)
+{
+    uint8_t *rows = malloc(nb * TSDB_TWA_ROW + 1);
+    if (!rows) {
+        reply_status(c, id, TSDB_ERR_NOMEM);
+        return;
+    }
+    for (size_t i = 0; i < nb; i++) {
+        uint8_t *o = rows + i * TSDB_TWA_ROW;
+        memcpy(o, &b[i].start, 8);
+        memcpy(o + 8, &b[i].twa, 8);
+        memcpy(o + 16, &b[i].area, 8);
+        memcpy(o + 24, &b[i].covered_ms, 8);
+        memcpy(o + 32, &b[i].count, 8);
+    }
+    uint32_t n = (uint32_t)nb;
+    reply(c, id, 0, &n, 4, rows, nb * TSDB_TWA_ROW, NULL, 0);
+    free(rows);
+}
+
+/* QUERY_TWA: one request for the interval, calendar and bounds forms */
+static int handle_twa(conn *c, uint32_t id, const uint8_t *p, size_t len)
+{
+    uint32_t s, count, n;
+    int64_t start, end, gap, interval;
+    uint64_t lim;
+    if (len < TSDB_TWA_HEADER || (memcpy(&n, p + 52, 4), len != TSDB_TWA_HEADER + (size_t)n * 8) || p[23])
+        return TSDB_ERR_INVALID;
+    memcpy(&s, p, 4);
+    memcpy(&start, p + 4, 8);
+    memcpy(&end, p + 12, 8);
+    memcpy(&gap, p + 24, 8);
+    memcpy(&lim, p + 32, 8);
+    memcpy(&interval, p + 40, 8);
+    memcpy(&count, p + 48, 4);
+    tsdb_twa_opts o = {(tsdb_twa_method)p[20], gap, p[21] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
+    uint8_t unit = p[22];
+    tsdb_twa_bucket *b = NULL;
+    size_t nb = 0;
+    int rc;
+    if (n) {
+        int64_t *bounds = malloc((size_t)n * 8); /* aligned copy */
+        if (!bounds)
+            return TSDB_ERR_NOMEM;
+        memcpy(bounds, p + TSDB_TWA_HEADER, (size_t)n * 8);
+        rc = unit || interval ? TSDB_ERR_INVALID : tsdb_query_twa_bounds(db, s, start, end, bounds, n, &o, &b, &nb);
+        free(bounds);
+    } else if (unit) {
+        tsdb_group g = {(tsdb_unit)unit, count, NULL};
+        rc = interval ? TSDB_ERR_INVALID : tsdb_query_twa_group(db, s, start, end, &g, &o, &b, &nb);
+    } else {
+        rc = tsdb_query_twa(db, s, start, end, interval, &o, &b, &nb);
+    }
+    if (rc == 0)
+        reply_twa(c, id, b, nb);
+    free(b);
+    return rc;
+}
+
 static void handle(req *r)
 {
     conn *c = r->c;
@@ -846,6 +905,10 @@ static void handle(req *r)
         free(b);
         break;
     }
+    case TSDB_OP_QUERY_TWA:
+        if ((rc = handle_twa(c, r->id, p, len)) == 0)
+            return;
+        break;
     case TSDB_OP_COMMIT: rc = tsdb_commit(db); break;
     case TSDB_OP_FLUSH: rc = tsdb_flush(db); break;
     case TSDB_OP_OPTIMIZE: rc = tsdb_optimize(db); break;
@@ -883,7 +946,7 @@ static void *worker_main(void *arg)
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
         if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_AGG || r->op == TSDB_OP_QUERY_GROUP ||
             r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS || r->op == TSDB_OP_QUERY_BOUNDS ||
-            r->op == TSDB_OP_QUERY_LTTB) {
+            r->op == TSDB_OP_QUERY_LTTB || r->op == TSDB_OP_QUERY_TWA) {
             tsdb_query_stats st;
             tsdb_last_query_stats(&st); /* this worker ran it */
             pthread_mutex_lock(&r->c->lock);

@@ -67,6 +67,15 @@ int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, con
 /* Buckets beginning at given UTC instants, as tsdb_query_bounds. */
 int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                        const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
+/* Time-weighted averages, as tsdb_query_twa, _twa_group and _twa_bounds (tsdb.h);
+ * a group in a time zone other than UTC is turned into bounds here. Needs a
+ * server of protocol version 5 (TSDB_ERR_INVALID from an older one). */
+int tsdbc_query_twa(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                    const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+int tsdbc_query_twa_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                          const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
+int tsdbc_query_twa_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                           const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 
 /* Value types and nulls (protocol version 2), as tsdb_series_create,
  * tsdb_insert_values, tsdb_query_values and the state dictionary. */
