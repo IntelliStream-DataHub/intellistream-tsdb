@@ -22,8 +22,8 @@ calls). Read AGENTS.md first: its invariants and rules are the contract every tr
    - the gates for this kind of change (below), docs to update, and the commit rules (below).
 3. Run `workflow-template.js` (next to this file) with the Workflow tool:
    `args: {tracks: [{key, wt, br, base: "main", risk?}], agents: "<agents root>", seBin: "<scripts dir>",
-   rules: "<repo>/AGENTS.md"}`. Find seBin with
-   `find ~/.claude -path '*subagent-economy/scripts' -type d -print -quit`.
+   rules: "<repo>/AGENTS.md"}`. seBin is
+   `<repo>/.claude/skills/subagent-economy/scripts` (the subagent-economy skill lives in this repository).
    `risk: "low"` (docs, harness, benchmarks, tooling, test-only, client READMEs) runs build and fix on Sonnet;
    anything that can lose or corrupt data (engine, WAL, merges, server, protocol, FFI bindings, codecs) stays on
    the session's model. Review always runs on the session's model.
