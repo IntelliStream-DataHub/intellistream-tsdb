@@ -992,8 +992,8 @@ free: the AVX2 and AVX-512 kernels add 32-bit halves of the values in 64-bit
 lanes (and, for int64, count the negative ones), which cannot overflow within a
 block, and combine the lanes into the 128-bit sum. The spread's sum of squares
 is exact too: bool and state squares (below 2^64) in the same pass, int64
-squares in vectors when every known value of the run fits in 32 bits and with
-the scalar 128-bit loop otherwise. The scalar loops in `values.c` are the
+squares in a second pass (one 32-bit multiply per value when every known value
+of the run fits in 32 bits, three otherwise). The scalar loops in `values.c` are the
 reference, and the code for CPUs without AVX2.
 
 Before these kernels, float64 and float32 with nulls were summed one value
