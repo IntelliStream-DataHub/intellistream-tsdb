@@ -56,7 +56,7 @@ static void rmrf(const char *d)
         fprintf(stderr, "rm failed\n");
 }
 
-static tsdb *open_db(const char *name, uint32_t granule_rows, char *dir)
+static tsdb *open_db_p(const char *name, uint32_t granule_rows, int64_t partition_ms, char *dir)
 {
     snprintf(dir, 600, "%s/%s", base, name);
     rmrf(dir);
@@ -68,10 +68,15 @@ static tsdb *open_db(const char *name, uint32_t granule_rows, char *dir)
     o.flush_interval_ms = 600000;
     o.buffer_rows = 1 << 22;
     o.wal_max_batch_rows = 64;
-    o.partition_ms = 86400000LL * 3650;
+    o.partition_ms = partition_ms;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
     return db;
+}
+
+static tsdb *open_db(const char *name, uint32_t granule_rows, char *dir)
+{
+    return open_db_p(name, granule_rows, 86400000LL * 3650, dir);
 }
 
 /* ---------------------------------------------------------- reference */
@@ -137,6 +142,18 @@ static rbucket *rb_get(rbucket **v, size_t *n, size_t *cap, int64_t start)
     return r;
 }
 
+/* the value at x on the line from (t0, v0) to (t1, v1); an infinite end makes the line that infinity */
+static long double ref_interp(long double v0, long double v1, int64_t t0, int64_t t1, int64_t x)
+{
+    if (x == t0)
+        return v0;
+    if (x == t1)
+        return v1;
+    if (!isfinite(v0) || !isfinite(v1))
+        return v0 + v1;
+    return v0 + (v1 - v0) * (long double)(x - t0) / (long double)(t1 - t0);
+}
+
 static int cmp_rb(const void *a, const void *b)
 {
     const rbucket *x = a, *y = b;
@@ -168,8 +185,7 @@ static size_t reference(const ref_series *s, int64_t start, int64_t end, const r
             int64_t e = hi < y ? hi : y;
             long double a, len = (long double)(e - x);
             if (linear) {
-                long double va = v0 + (v1 - v0) * (long double)(x - t0) / (long double)(t1 - t0);
-                long double vb = v0 + (v1 - v0) * (long double)(e - t0) / (long double)(t1 - t0);
+                long double va = ref_interp(v0, v1, t0, t1, x), vb = ref_interp(v0, v1, t0, t1, e);
                 a = (va + vb) / 2 * len;
             } else {
                 a = v0 * len;
@@ -198,12 +214,19 @@ static int compare(const char *what, const rbucket *r, size_t nr, const tsdb_twa
         return 1;
     }
     for (size_t i = 0; i < nr && bad < 3; i++) {
-        bool area_ok;
-        if (r[i].nan || !isfinite(r[i].area)) /* inf - inf, inf * 0: NaN or an infinity, both not finite */
-            area_ok = !isfinite(b[i].area);
+        bool area_ok, twa_ok, rnan = r[i].nan || isnan(r[i].area); /* a NaN held, or inf - inf */
+        if (rnan)
+            area_ok = isnan(b[i].area);
+        else if (isinf(r[i].area))
+            area_ok = b[i].area == (double)r[i].area;
         else
             area_ok = fabsl((long double)b[i].area - r[i].area) <= 1e-9L * r[i].absarea + 1e-9L;
-        bool twa_ok = r[i].ms ? (isnan(b[i].twa) == isnan(b[i].area)) : isnan(b[i].twa);
+        if (!r[i].ms || rnan)
+            twa_ok = isnan(b[i].twa);
+        else if (isinf(r[i].area))
+            twa_ok = isnan(b[i].area) ? isnan(b[i].twa) : b[i].twa == b[i].area;
+        else
+            twa_ok = fabsl((long double)b[i].twa - r[i].area / r[i].ms) <= 1e-9L * r[i].absarea / r[i].ms + 1e-9L;
         if (b[i].start != r[i].start || b[i].count != r[i].count || b[i].covered_ms != r[i].ms || !area_ok ||
             !twa_ok) {
             fprintf(stderr,
@@ -458,10 +481,17 @@ static int check_all(tsdb *db, const uint32_t *ids, const ref_series *ss, size_t
             static const int64_t gaps[] = {0, 1500, 4000, 120000};
             ref_bk b = {.kind = q % 5 == 4 ? 2 : (q % 3 ? 1 : 0)};
             b.interval = ivs[1 + rndr(5)];
-            int64_t bounds[16];
+            /* UTC calendar groups of one minute, hour or day: the epoch-aligned buckets of that length */
+            static const tsdb_unit units[] = {TSDB_MINUTE, TSDB_HOUR, TSDB_DAY};
+            int cal = q % 7 == 6 && b.kind == 1 ? 1 + (int)rndr(3) : 0;
+            if (cal)
+                b.interval = ivs[2 + cal];
+            int64_t bounds[16], rstart = start;
             if (b.kind == 2) {
                 b.nb = 1 + (size_t)rndr(15);
-                bounds[0] = start - rndr(span / 4 + 1);
+                /* the first bound before or after start: segments before it belong to no bucket */
+                bounds[0] = start - rndr(span / 4 + 1) + (rndr(3) ? 0 : rndr(span / 4 + 1));
+                rstart = bounds[0] > start ? bounds[0] : start;
                 for (size_t i = 1; i < b.nb; i++)
                     bounds[i] = bounds[i - 1] + 1 + rndr(span / 8 + 1);
                 b.bounds = bounds;
@@ -472,7 +502,10 @@ static int check_all(tsdb *db, const uint32_t *ids, const ref_series *ss, size_t
             tsdb_twa_bucket *res = NULL;
             size_t nres = 0;
             int rc;
-            if (b.kind == 0)
+            if (cal)
+                rc = tsdb_query_twa_group(db, ids[k], start, end, &(tsdb_group){units[cal - 1], 1, NULL}, &o, &res,
+                                          &nres);
+            else if (b.kind == 0)
                 rc = tsdb_query_twa(db, ids[k], start, end, 0, &o, &res, &nres);
             else if (b.kind == 1)
                 rc = tsdb_query_twa(db, ids[k], start, end, b.interval, &o, &res, &nres);
@@ -484,10 +517,10 @@ static int check_all(tsdb *db, const uint32_t *ids, const ref_series *ss, size_t
             }
             CHECK(rc == 0);
             rbucket *r;
-            size_t nr = reference(s, start, end, &b, linear, gap, &r);
+            size_t nr = reference(s, rstart, end, &b, linear, gap, &r);
             char what[256];
-            snprintf(what, sizeof what, "%s: series %zu type %d q %d kind %d iv %lld %s gap %lld [%lld, %lld)", stage,
-                     k, s->type, q, b.kind, (long long)b.interval, linear ? "linear" : "step", (long long)gap,
+            snprintf(what, sizeof what, "%s: series %zu type %d q %d kind %d cal %d iv %lld %s gap %lld [%lld, %lld)",
+                     stage, k, s->type, q, b.kind, cal, (long long)b.interval, linear ? "linear" : "step", (long long)gap,
                      (long long)start, (long long)end);
             int e = compare(what, r, nr, res, nres);
             if (e)
@@ -560,6 +593,124 @@ static void test_random(void)
     rmrf(dir);
 }
 
+/* One TWA query of [start, end) in one bucket against the reference; returns the query's statistics. */
+static tsdb_query_stats check_one(tsdb *db, uint32_t id, const ref_series *rs, int64_t start, int64_t end,
+                                  int method, int64_t gap, const char *what)
+{
+    tsdb_twa_bucket *b;
+    size_t n;
+    query1(db, id, start, end, 0, method, gap, &b, &n);
+    tsdb_query_stats st;
+    tsdb_last_query_stats(&st);
+    rbucket *r;
+    ref_bk rb = {.kind = 0};
+    size_t nr = reference(rs, start, end, &rb, method == TSDB_TWA_LINEAR, gap, &r);
+    char w[200];
+    snprintf(w, sizeof w, "%s %s gap %lld", what, method ? "linear" : "step", (long long)gap);
+    if (compare(w, r, nr, b, n))
+        failures++;
+    free(r);
+    free(b);
+    return st;
+}
+
+/* Without a staleness limit the snapshot spans the whole history, and every part used to add its last
+ * granule before the range or its first after it, decoded: a query cost grew with the series' age. In daily
+ * partitions (the default) only the parts next to the range may be read, and only the cut granules decoded. */
+static void test_history(void)
+{
+    char dir[600];
+    tsdb_options d;
+    tsdb_options_init(&d);
+    CHECK(d.partition_ms == 86400000);
+    tsdb *db = open_db_p("history", 8192, d.partition_ms, dir);
+    uint32_t s;
+    OK(tsdb_series_create(db, "x", TSDB_FLOAT64, NULL, &s));
+    enum { DAYS = 60, PER = 144, N = DAYS * PER }; /* a reading every 10 minutes: a part of one granule a day */
+    const int64_t day = 86400000, step = 600000;
+    int64_t *ts = malloc(N * sizeof *ts);
+    double *v = malloc(N * sizeof *v);
+    ref_series rs = {.type = TSDB_FLOAT64, .n = N, .ts = ts, .v = malloc(N * sizeof(long double)),
+                     .ok = malloc(N * sizeof(bool))};
+    for (int i = 0; i < N; i++) {
+        ts[i] = i * step;
+        v[i] = (double)(i % 7) - 2;
+        rs.v[i] = v[i];
+        rs.ok[i] = true;
+    }
+    OK(tsdb_insert_series_values(db, s, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, N));
+    OK(tsdb_flush(db));
+    /* one hour inside day 30, then from just before day 30 to just before day 31 */
+    int64_t a0 = 30 * day + 5 * 3600000 + 300000, a1 = a0 + 3600000;
+    int64_t b0 = 30 * day - 60000, b1 = 31 * day - 300000;
+    for (int m = 0; m < 2; m++)
+        for (int gi = 0; gi < 3; gi++) {
+            int64_t gap = gi == 0 ? 0 : gi == 1 ? step : step / 2;
+            tsdb_query_stats st = check_one(db, s, &rs, a0, a1, m, gap, "history: an hour");
+            CHECK(st.rows_decoded <= PER && st.granules <= 3 && st.parts <= 3);
+            st = check_one(db, s, &rs, b0, b1, m, gap, "history: a day across partitions");
+            CHECK(st.rows_decoded <= 2 * PER && st.granules <= 4 && st.parts <= 4);
+        }
+    /* Corrections in a newer part at the last reading before b0 and the first after b1 (both in other
+     * partitions): the sources tie on those times, and the newer value wins. */
+    int64_t cts[] = {30 * day - step, 31 * day};
+    double cv[] = {100, -50};
+    OK(tsdb_insert_series_values(db, s, cts, &(tsdb_values){TSDB_FLOAT64, cv, NULL}, 2));
+    OK(tsdb_flush(db));
+    rs.v[30 * PER - 1] = 100;
+    rs.v[31 * PER] = -50;
+    for (int m = 0; m < 2; m++)
+        for (int gi = 0; gi < 2; gi++)
+            check_one(db, s, &rs, b0, b1, m, gi ? step : 0, "history: corrected neighbours");
+    OK(tsdb_optimize(db));
+    for (int m = 0; m < 2; m++)
+        check_one(db, s, &rs, b0, b1, m, 0, "history: merged");
+    OK(tsdb_close(db));
+    free(ts);
+    free(v);
+    free(rs.v);
+    free(rs.ok);
+}
+
+/* A granule's longest gap saturates at 2^32 - 1 ms (49.7 days); a longer gap must not be taken mod 2^32 for a
+ * short one, nor the saturated value for one within a staleness limit above 2^32 ms. */
+static void test_long_gap(void)
+{
+    char dir[600];
+    tsdb *db = open_db("longgap", 8192, dir);
+    uint32_t s;
+    OK(tsdb_series_create(db, "x", TSDB_FLOAT64, NULL, &s));
+    const int64_t g = 60 * 86400000LL; /* 5.18e9 ms; mod 2^32 about 10 days */
+    int64_t ts[] = {0, 1000, 1000 + g, 2000 + g};
+    double v[] = {1, 2, 3, 4};
+    OK(tsdb_insert_series_values(db, s, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, 4));
+    OK(tsdb_flush(db));
+    const int64_t limits[] = {55 * 86400000LL, 20 * 86400000LL, 61 * 86400000LL};
+    for (int i = 0; i < 3; i++)
+        for (int m = 0; m < 2; m++) {
+            tsdb_twa_bucket *b;
+            size_t n;
+            query1(db, s, 0, 3000 + g, 0, m, limits[i], &b, &n);
+            bool held = limits[i] >= g; /* only the 61-day limit lets the value hold across the gap */
+            double area = m ? 1500 + 3500 + (held ? 2.5 * (double)g : 0) : 1000 + 3000 + (held ? 2.0 * (double)g : 0);
+            CHECK(n == 1 && b[0].count == 4 && b[0].covered_ms == 2000 + (held ? g : 0) && near(b[0].area, area));
+            free(b);
+        }
+    /* A bucket needs no reading of its own: two readings two hours apart in 1 ms buckets would be 7.2M
+     * buckets (some 700 MB here, and a reply over the wire frame); the limit refuses them before allocating. */
+    int64_t t2[] = {10 * g, 10 * g + 7200000};
+    OK(tsdb_insert_series_values(db, s, t2, &(tsdb_values){TSDB_FLOAT64, v, NULL}, 2));
+    tsdb_twa_bucket *b = NULL;
+    size_t n = 0;
+    tsdb_twa_opts o = {0};
+    CHECK(tsdb_query_twa(db, s, 10 * g, 10 * g + 7200001, 1, &o, &b, &n) == TSDB_ERR_TOO_MANY_BUCKETS && n == 0);
+    free(b);
+    OK(tsdb_query_twa(db, s, 10 * g, 10 * g + 1000000, 1, &o, &b, &n)); /* 1M buckets still answer */
+    CHECK(n == 1000000 && b[0].area == 1 && b[n - 1].start == 10 * g + 999999 && b[n - 1].area == 1);
+    free(b);
+    OK(tsdb_close(db));
+}
+
 /* Whole granules inside a bucket come from statistics; only the edges decode. */
 static void test_stats_only(void)
 {
@@ -592,9 +743,9 @@ static void test_stats_only(void)
               fabsl(b[0].area - area) < 1e-9L * area);
         free(b);
         /* the benchmark switch decodes everything, to the same result */
-        setenv("TSDB_TWA_DECODE", "1", 1);
-        OK(tsdb_query_twa(db, s, 0, 1000LL * N, 0, &o, &b, &n));
-        unsetenv("TSDB_TWA_DECODE");
+        tsdb_twa_opts all = o;
+        all.no_stats = 1;
+        OK(tsdb_query_twa(db, s, 0, 1000LL * N, 0, &all, &b, &n));
         tsdb_last_query_stats(&st);
         CHECK(st.rows_decoded == N && st.granules_from_stats == 0 && n == 1 && b[0].covered_ms == 1000LL * (N - 1) &&
               b[0].count == N && fabsl(b[0].area - area) < 1e-9L * area);
@@ -685,6 +836,8 @@ int main(int argc, char **argv)
         return 1;
     test_rules();
     test_stats_only();
+    test_history();
+    test_long_gap();
     test_local();
     test_random();
     rmrf(base);

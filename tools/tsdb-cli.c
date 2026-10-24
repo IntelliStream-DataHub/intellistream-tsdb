@@ -350,7 +350,7 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     int npos = 0;
     tsdb_query_opts q = {TSDB_ASC, 0};
     const char *zone = NULL;
-    tsdb_twa_opts tw = {TSDB_TWA_STEP, 0, TSDB_ASC, 0};
+    tsdb_twa_opts tw = {.method = TSDB_TWA_STEP, .order = TSDB_ASC};
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--linear") == 0)
             tw.method = TSDB_TWA_LINEAR;

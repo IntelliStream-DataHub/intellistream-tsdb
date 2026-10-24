@@ -35,8 +35,8 @@ average). You can link tsdb into your program as a library, or run its server,
   and dips stay (LTTB), and every point returned is a real stored point.
 - Time-weighted averages for sensors that report irregularly or only on
   change: each value counts for as long as it held, stepwise or on a straight
-  line between readings, and not across an outage longer than you allow. Whole
-  blocks of readings are answered from stored summaries without reading them.
+  line between readings, and not across an outage longer than you allow. Wide
+  buckets (days of minute readings) come mostly from stored summaries.
 - Sums of int64 values are exact. Sums of float values can differ in the last
   digits from one run to the next, as in ClickHouse, because the order of the
   additions changes. If exact sums matter, store the value as an int64 in fixed

@@ -10,7 +10,7 @@
  * 30-day partitions, merged down. Without --load the queries run on what is
  * there. Each query runs --repeat times and the best time is printed: TWA by
  * hour and by day over all rows, STEP and LINEAR, from statistics and with
- * TSDB_TWA_DECODE=1 (every granule decoded), and tsdb_query_agg's avg.
+ * tsdb_twa_opts.no_stats (every granule decoded), and tsdb_query_agg's avg.
  */
 #include "common.h"
 #include "tsdb.h"
@@ -68,10 +68,8 @@ static double best_twa(tsdb *db, uint32_t s, int64_t interval, int method, bool 
                        tsdb_query_stats *st)
 {
     double best = 1e30;
-    if (decode)
-        setenv("TSDB_TWA_DECODE", "1", 1);
     for (int r = 0; r < repeat; r++) {
-        tsdb_twa_opts o = {.method = method};
+        tsdb_twa_opts o = {.method = method, .no_stats = decode};
         tsdb_twa_bucket *b;
         size_t n;
         double t0 = now_s();
@@ -87,7 +85,6 @@ static double best_twa(tsdb *db, uint32_t s, int64_t interval, int method, bool 
         free(b);
         best = t < best ? t : best;
     }
-    unsetenv("TSDB_TWA_DECODE");
     return best;
 }
 

@@ -209,11 +209,32 @@ the segment joining it to its neighbour comes from its first and last value
 and the neighbour's. Only granules that a bucket edge or the range cuts, and
 time spans where sources overlap (corrections: last write wins, merged
 exactly as the raw query does), are decoded, in parallel on the query pool.
-`TSDB_TWA_DECODE=1` turns the fast path off for benchmarks
+`tsdb_twa_opts.no_stats` turns the fast path off for benchmarks
 (`build/twa-bench`).
 
-The statistics cost 56 bytes per granule entry (136 instead of 80 bytes per
-8192 rows: under 0.01 bytes a row). They made the on-disk format version 4.
+Outside the range only two readings matter: the latest before it and the
+earliest after it. Of the granules outside the range a query keeps those that
+hold them (several only where sources tie on that time, merged by last write
+wins), and takes their first and last values from the index entry without
+decoding. So a query without a staleness limit, whose snapshot spans the whole
+history, costs the same for a series of ten years in daily partitions as for
+one of a day: otherwise every part would add a decoded granule.
+
+The fast path pays off for buckets much wider than a granule. A granule of
+8192 on-change readings can span hours; hourly buckets then cut nearly every
+granule and run at decode speed (about 1.4 G rows a second, one series of 1 G
+rows), while daily buckets take 82% of the granules from statistics and run
+five times faster (`build/twa-bench`).
+
+A TWA bucket needs no reading of its own (a segment across it is enough), so
+two readings far apart could ask for a bucket per millisecond between them. A
+request gets at most 4M buckets (`TSDB_ERR_TOO_MANY_BUCKETS` beyond), which
+fits one reply frame and bounds its memory to some 400 MB.
+
+The statistics cost 56 bytes per granule entry (136 instead of 80 bytes): 0.007
+bytes a row in full 8192-row granules, and 0.013 bytes a row measured on
+on-change data with partly filled granules (1.189 to 1.202 bytes a row, +1.1%).
+They made the on-disk format version 4.
 
 ## Storage
 

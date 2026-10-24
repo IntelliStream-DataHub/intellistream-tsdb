@@ -28,11 +28,18 @@
  * parts of segments outside [start, end) are cut off.
  */
 #include "internal.h"
+#include "tsdb_protocol.h"
 
 #include <math.h>
 #include <stdlib.h>
 
 #define TWA_PARALLEL_MIN 8
+
+/* A TWA bucket needs no reading of its own (a segment across it is enough), so two readings far apart can ask
+ * for a bucket per millisecond between them: the limit is what one reply can carry over the wire, far below
+ * the aggregates' MAX_BUCKETS, and bounds a request's memory (about 100 bytes a bucket) to some 400 MB. */
+#define TWA_MAX_BUCKETS (4u << 20)
+_Static_assert((uint64_t)TWA_MAX_BUCKETS * TSDB_TWA_ROW + 64 <= TSDB_MAX_FRAME, "a TWA reply must fit a frame");
 
 /* ------------------------------------------------------------- slots */
 
@@ -201,6 +208,10 @@ static inline double interp(twa_pt a, twa_pt b, int64_t x)
         return a.v;
     if (x == b.t)
         return b.v;
+    /* a line to an infinity is that infinity throughout (+inf to -inf: NaN), so that a segment comes out the
+     * same wherever bucket edges cut it, and as granule_twa's uncut trapezoid */
+    if (!isfinite(a.v) || !isfinite(b.v))
+        return a.v + b.v;
     return a.v + (b.v - a.v) * ((double)((uint64_t)x - (uint64_t)a.t) / (double)((uint64_t)b.t - (uint64_t)a.t));
 }
 
@@ -277,11 +288,11 @@ static int rows_cb(void *ctx, const int64_t *ts, const void *v, size_t n)
 }
 
 /* One step of the walk: a granule from statistics, a decoded granule, a memtable run or a merged cluster. */
-enum { PC_STATS, PC_DECODE, PC_MEM, PC_MERGE };
+enum { PC_STATS, PC_POINT, PC_DECODE, PC_MEM, PC_MERGE };
 typedef struct twa_piece {
     int kind;
     uint32_t src;
-    const granule *g;  /* PC_STATS, PC_DECODE */
+    const granule *g;  /* PC_STATS, PC_POINT, PC_DECODE */
     size_t a, b;       /* PC_MERGE: items [a, b) */
     /* PC_DECODE, filled by the workers */
     twa_pt first, last;
@@ -361,19 +372,19 @@ out:
     cur_qstats = mine;
 }
 
-int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, int method,
-                  int64_t max_gap, tsdb_twa_bucket **out, size_t *nout)
+int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                  const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
     *out = NULL;
     *nout = 0;
+    int method = (int)opts->method;
+    int64_t max_gap = opts->max_gap_ms;
+    bool force_decode = opts->no_stats;
     int type = eng_series_type(db, series);
     if (type == TSDB_STATE || max_gap < 0 || (method != TSDB_TWA_STEP && method != TSDB_TWA_LINEAR))
         return TSDB_ERR_INVALID;
     if (start >= end || type < 0)
         return 0;
-    /* TSDB_TWA_DECODE=1 decodes every granule instead of using its statistics, to benchmark the fast path */
-    const char *env = getenv("TSDB_TWA_DECODE");
-    bool force_decode = env && *env && strcmp(env, "0") != 0;
     twa_q q = {.bk = bk, .linear = method == TSDB_TWA_LINEAR, .max_gap = (uint64_t)max_gap, .start = start,
                .end = end, .type = type, .w = type_width(type)};
     /* the readings around the range that bound its first and last segments */
@@ -406,10 +417,6 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
             /* and the first after it */
             if (gj < p->ng && p->g[gj].series == series && (gj == gi || p->g[gj - 1].ts_max < end))
                 gj++;
-            if (gi < gj) {
-                QS_ADD(parts, 1);
-                QS_ADD(granules, gj - gi);
-            }
         } else {
             QS_ADD(memtable_rows, sn.mem[i - sn.np].n);
         }
@@ -435,10 +442,35 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
                 it->lo = r->ts[0];
                 it->hi = r->ts[r->n - 1];
             }
-            dmin = MIN(dmin, it->lo);
-            dmax = MAX(dmax, it->hi);
         }
     }
+    /* Outside the range, only the latest reading before it and the earliest after it bound segments that reach
+     * into it: keep the items that hold them (several where sources tie on that time: last write wins there).
+     * Without a staleness limit the snapshot spans all history, and every part would add a granule. */
+    int64_t mb = INT64_MIN, ma = INT64_MAX;
+    for (size_t k = 0; k < nitem; k++) {
+        if (items[k].hi < start)
+            mb = MAX(mb, items[k].hi);
+        if (items[k].lo >= end)
+            ma = MIN(ma, items[k].lo);
+    }
+    size_t kept = 0;
+    uint32_t last_src = UINT32_MAX;
+    for (size_t k = 0; k < nitem; k++) {
+        const twa_item *it = &items[k];
+        if (it->hi < mb || it->lo > ma)
+            continue;
+        if (it->g) {
+            QS_ADD(granules, 1);
+            if (it->src != last_src) /* items come grouped by source */
+                QS_ADD(parts, 1);
+            last_src = it->src;
+        }
+        dmin = MIN(dmin, it->lo);
+        dmax = MAX(dmax, it->hi);
+        items[kept++] = *it;
+    }
+    nitem = kept;
     dmin = MAX(dmin, start);
     dmax = MIN(dmax, end - 1);
     if (rc || nitem == 0 || dmin > dmax)
@@ -448,7 +480,7 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
     if (bk->kind != BK_ONE) {
         o.b0 = bucketer_key(bk, dmin);
         uint64_t span = (uint64_t)bucketer_key(bk, dmax) - (uint64_t)o.b0 + 1;
-        if (span > (64u << 20)) {
+        if (span > TWA_MAX_BUCKETS) {
             rc = TSDB_ERR_TOO_MANY_BUCKETS;
             goto done;
         }
@@ -485,6 +517,10 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
                 if (!it->g)
                     continue;
                 const granule *g = it->g;
+                if (!force_decode && (g->ts_max < start || g->ts_min >= end)) {
+                    x->kind = PC_POINT;
+                    continue;
+                }
                 bool usable = !force_decode && g->ts_min >= start && g->ts_max < end &&
                               bucketer_key(bk, g->ts_min) == bucketer_key(bk, g->ts_max) &&
                               (!max_gap || (g->tw_gap < UINT32_MAX && g->tw_gap <= (uint64_t)max_gap));
@@ -525,6 +561,16 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
             cur_bucket(&q, &c, g->ts_min);
             cur_add(&c, q.linear ? g->tw_lin : g->tw_step, q.linear ? g->tw_lin_ms : g->tw_step_ms,
                     g->count - g->nulls);
+            c.p = (twa_pt){g->ts_max, g->tw_last, !(g->tw_flags & GT_LAST_NULL)};
+            c.have = true;
+            break;
+        }
+        case PC_POINT: {
+            /* before or after the range: the segments inside it do not reach into the range */
+            const granule *g = x->g;
+            twa_pt first = {g->ts_min, g->tw_first, !(g->tw_flags & GT_FIRST_NULL)};
+            if (c.have)
+                seg(&q, &c, c.p, first);
             c.p = (twa_pt){g->ts_max, g->tw_last, !(g->tw_flags & GT_LAST_NULL)};
             c.have = true;
             break;

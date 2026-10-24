@@ -1176,7 +1176,7 @@ static int query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, const
     int rc = 0, type = -1;
     if (route(t, series, &e, &local)) {
         type = eng_series_type(e, local);
-        rc = eng_query_twa(e, local, start, end, bk, (int)opts->method, opts->max_gap_ms, out, nout);
+        rc = eng_query_twa(e, local, start, end, bk, opts, out, nout);
     }
     if (rc == 0 && opts->order == TSDB_DESC)
         for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {

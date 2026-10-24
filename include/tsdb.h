@@ -331,9 +331,12 @@ int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, c
  *    count      = non-null readings in the bucket and in [start, end)
  * area and covered_ms add up across buckets: the average over several buckets is
  * the sum of their areas over the sum of their covered_ms. A bucket is returned
- * when covered_ms or count is not 0.
+ * when covered_ms or count is not 0. Since a segment alone fills a bucket, a
+ * query may span at most 4M buckets between its first and last reading in range
+ * (TSDB_ERR_TOO_MANY_BUCKETS beyond).
  * NaN propagates: a NaN value held for any time makes the area and twa NaN;
- * infinities follow IEEE arithmetic. A NaN result is the canonical quiet NaN.
+ * infinities follow IEEE arithmetic, and a LINEAR segment with an infinite end
+ * is that infinity throughout (+inf to -inf: NaN), wherever buckets cut it. A NaN result is the canonical quiet NaN.
  * Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:
  * twa is the fraction of covered time that it was true); state series are
  * TSDB_ERR_INVALID. Whole granules inside one bucket are answered from stored
@@ -345,6 +348,7 @@ typedef struct tsdb_twa_opts {
     int64_t max_gap_ms; /* 0: no staleness limit */
     tsdb_order order;   /* of the buckets */
     size_t limit;       /* 0: no limit */
+    int no_stats;       /* nonzero: decode every granule, never its statistics (benchmarks, checks) */
 } tsdb_twa_opts;
 
 typedef struct tsdb_twa_bucket {

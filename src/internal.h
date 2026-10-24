@@ -799,8 +799,8 @@ int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n);
 int64_t bucketer_key(const bucketer *bk, int64_t ts);    /* the bucket of ts */
 int64_t bucketer_start(const bucketer *bk, int64_t key); /* the first instant of bucket key */
 /* Time-weighted averages (twa.c). */
-int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, int method,
-                  int64_t max_gap, tsdb_twa_bucket **out, size_t *nout);
+int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                  const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
 int eng_get_stats(eng *db, tsdb_stats *st);
