@@ -84,9 +84,10 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_failstop $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
+test: $(B)/test_tsdb $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
 	./$(B)/test_tsdb
 	./$(B)/test_failstop
+	./$(B)/test_damage
 	./$(B)/test_types
 	./$(B)/test_levels
 	./$(B)/test_group
@@ -231,6 +232,9 @@ $(B)/test_follow: tests/test_follow.c $(LIB)
 
 $(B)/test_volumes: tests/test_volumes.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
+$(B)/test_damage: tests/test_damage.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)

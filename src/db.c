@@ -293,6 +293,8 @@ static int load_parts(eng *db, bool read_only)
             part_unref(p);
             r = TSDB_ERR_CORRUPT;
         }
+        if (r == 0)
+            p->verify = db->opt.verify_checksums;
         if (r == TSDB_ERR_CORRUPT || r == TSDB_ERR_INVALID) {
             /* Never left out quietly: its rows would vanish and older values of
              * the same keys come back, and a merge would make that permanent.
