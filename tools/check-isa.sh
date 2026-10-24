@@ -66,7 +66,8 @@ done
 for o in "$dir"/*.o; do
     case "$o" in *.v3.o | *.v4.o) continue ;; esac
     above_v2 "$o" | while read -r fn cnt; do
-        case "$(basename "$o"):$fn" in simd.o:agg_avx2 | simd.o:agg_avx512) continue ;; esac
+        # gcc may split a kernel (agg_avx2.part.0): the clone keeps the kernel's target and only it calls the clone
+        case "$(basename "$o"):${fn%%.*}" in simd.o:agg_avx2 | simd.o:agg_avx512) continue ;; esac
         echo "$o: $fn: $cnt instructions beyond x86-64-v2" >&2
         echo x >>"$tmp/bad"
     done
