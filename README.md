@@ -193,6 +193,6 @@ tsdbc_close(c);
 make test          # all unit, crash-recovery and server tests
 make asan          # the same, checking for memory errors
 make tsan          # the same, checking threads for data races
-make jepsen        # crash tests: kill -9, power loss, pauses
+make jepsen        # crash tests: kill -9, power loss, pauses, disk errors
 make test-clients  # the Rust, Python and Java clients (needs cargo, python3, mvn)
 ```

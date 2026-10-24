@@ -11,7 +11,7 @@ make test                 # all unit, integration and server tests
 make test IO=epoll        # server tests on epoll only (where io_uring is disabled)
 make asan                 # the tests under AddressSanitizer + UBSan
 make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
-make jepsen               # fault injection: kill -9, simulated power loss, pauses
+make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO
 make PORTABLE=1           # without -march=native
 make NO_URING=1           # tsdbd on epoll only, without liburing (after make clean)
 make dist                 # portable tarball (x86-64-v2 + v3/v4 codecs) in build-dist/; checks glibc and ISA
@@ -87,6 +87,23 @@ cgroup, so `nice` does not keep your work out of its way.
   directory; a rename after fsync of the directory. In sync mode
   (`wal_sync_ms = 0`) a memtable row is visible to queries only once the WAL is
   synced up to it (`mt_collect` with `visible`).
+- **Fail-stop** ("fsyncgate"). A failed write or sync whose data an
+  acknowledgement may already rely on (the WAL, a directory fsync after names
+  became visible, MANIFEST, SERIES, STATES, CATALOG) calls `eng_fail`: after it
+  the engine acknowledges nothing, names no new file (a merge in flight drops
+  its output), and `tsdb_failed` reports it;
+  tsdbd exits with status 1. A retried fsync can return 0 after the kernel
+  dropped the dirty pages, so it proves nothing; only a reopen, which replays
+  from what is on disk, is safe. Errors on files nothing relies on yet (a
+  `tmp_*` part, a merge output before it is named) fail just the call; the
+  directory fsync after naming a merged part is fail-stop. A dictionary marks
+  itself `broken` under its own lock before the engine fails, so a creator
+  waiting for that lock cannot append behind a torn record. ENOSPC on the WAL,
+  MANIFEST or a dictionary is fail-stop too. A failed flush leaves its
+  memtable in `flushing` for a retry, and the next `mt_flush` must still flush
+  the active memtable after it, or a large insert lands under older memtable
+  rows. Parts already listed are never discarded after a failure
+  (`db_add_parts` cannot fail). `test_failstop` and `jepsen --nemesis eio`.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

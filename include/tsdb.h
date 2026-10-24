@@ -291,13 +291,15 @@ int tsdb_get_stats(tsdb *db, tsdb_stats *st);
 
 /* Fail-stop. A storage error after which it is unknown what reached the disk
  * (a failed WAL write or fsync, a failed fsync of the directory after new
- * parts were named, a failed MANIFEST, series dictionary or CATALOG write)
+ * parts were named, a failed MANIFEST, series or state dictionary or CATALOG
+ * write; ENOSPC there counts too)
  * puts the database, or the volume it happened in, in a failed state for good:
  * after a failed fsync Linux may drop the unwritten pages and report success
  * the next time, so retrying could acknowledge data that is not on disk.
  * From then on every insert, append, series creation, commit, flush, optimize
  * and drop of that volume returns TSDB_ERR_IO, including the writes that were
- * waiting for the failed sync; queries keep working. Close and reopen to
+ * waiting for the failed sync; creating a series or state that already exists
+ * still returns its id. Queries keep working. Close and reopen to
  * recover: every write that returned 0 is there.
  * Returns 0 while healthy; TSDB_ERR_IO once failed, with what failed (the
  * directory, the operation, the errno text) in msg. */

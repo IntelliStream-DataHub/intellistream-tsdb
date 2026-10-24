@@ -110,6 +110,29 @@ Each part records the WAL segment it contains, so recovery replays a segment
 only into partitions that do not already hold its rows, even after a crash in
 the middle of a flush.
 
+### Storage errors
+
+A failed `fsync` is not something to retry: Linux may have dropped the dirty
+pages and marked them clean, so the next `fsync` succeeds while the data is
+gone (PostgreSQL's "fsyncgate", 2018). tsdb therefore stops. When a write or
+sync fails on a file that an acknowledgement may rely on (a WAL segment, the
+directory after new names became visible, MANIFEST, the series and state
+dictionaries, CATALOG), the engine is marked failed: the writers whose rows
+went through the failed call get `TSDB_ERR_IO`, no later write is acknowledged,
+no new file is named (a merge that finishes afterwards deletes its output),
+and `tsdb_failed` says what failed. tsdbd exits with status 1, and a restart
+recovers from what is on disk; replay stops at a torn WAL record, and nothing
+was written after it. Errors on files nothing relies on yet (a new part before
+it is committed, a merge output before it is named) fail only that insert,
+flush or merge; a failed flush keeps its memtable and retries it first. The
+directory fsync after naming a merged part is fail-stop, because the sources
+would be retired next. A full disk (ENOSPC) on the WAL, MANIFEST or a
+dictionary is fail-stop as well, as in PostgreSQL: under systemd a full disk
+means restarts that serve reads in between, until space is freed. The failure
+message goes to stderr once, possibly while the caller holds engine locks;
+it is one short line per engine lifetime. With several volumes,
+a failure stops only the volume it happened in (the root volume for CATALOG).
+
 ### Compression
 
 Every granule picks its own encodings, with ZSTD (level 1) on top whenever it
