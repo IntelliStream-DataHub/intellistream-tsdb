@@ -67,6 +67,16 @@ int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, con
 /* Buckets beginning at given UTC instants, as tsdb_query_bounds. */
 int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                        const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
+/* The spread (range, variances, standard deviations), as tsdb_query_spread,
+ * _spread_group and _spread_bounds (tsdb.h); a group in a time zone other than
+ * UTC is turned into bounds here. Needs a server of protocol version 8
+ * (TSDB_ERR_INVALID from an older one, without asking it). */
+int tsdbc_query_spread(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                       const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
+int tsdbc_query_spread_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                             const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
+int tsdbc_query_spread_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds,
+                              size_t n, const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
 /* Time-weighted averages, as tsdb_query_twa, _twa_group and _twa_bounds (tsdb.h);
  * a group in a time zone other than UTC is turned into bounds here. Needs a
  * server of protocol version 5 (TSDB_ERR_INVALID from an older one). */

@@ -90,11 +90,22 @@
  *               `interval` ms, one bucket when 0
  *               -> u32 n, n x (i64 start, f64 twa, f64 area, i64 covered_ms, u64 count)
  *               A client sends it only to a server whose HELLO says 6 or more.
+ *   Version 7 is taken by deletes and retention (the range-delete branch).
+ *   Version 8: the spread (range, variances, standard deviations;
+ *   tsdb_spread_bucket). QUERY_BUCKETS and QUERY_BOUNDS take an optional u8
+ *   `fields` after the zone or the bounds; with fields & TSDB_SPREAD each
+ *   bucket of the reply carries
+ *               f64 range, f64 var_pop, f64 var_samp, f64 stddev_pop, f64 stddev_samp
+ *   after its 64 bytes (TSDB_SPREAD_ROW bytes per bucket). Other bits are
+ *   reserved (TSDB_ERR_INVALID). Without the byte the reply is as before (and
+ *   the server does not compute the spread), so older clients read it
+ *   unchanged; a client sends it only to a server whose HELLO says 8 or more
+ *   (an older one answers TSDB_ERR_INVALID).
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
-#define TSDB_PROTOCOL_VERSION 6
+#define TSDB_PROTOCOL_VERSION 8
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
@@ -128,6 +139,9 @@ enum {
 
 #define TSDB_AGG_ROW 32    /* bytes per bucket in a QUERY_AGG or QUERY_GROUP reply */
 #define TSDB_BUCKET_ROW 64 /* bytes per bucket in a QUERY_BUCKETS reply */
+#define TSDB_SPREAD 1       /* QUERY_BUCKETS/QUERY_BOUNDS fields: the spread follows each bucket (version 8) */
+#define TSDB_SPREAD_ROW 104 /* bytes per bucket in a reply with TSDB_SPREAD */
+
 #define TSDB_TWA_HEADER 56 /* bytes of a QUERY_TWA request before the bounds */
 #define TSDB_TWA_ROW 40    /* bytes per bucket in a QUERY_TWA reply */
 #define TSDB_VALUES_HEADER 16

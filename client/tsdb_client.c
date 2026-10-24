@@ -476,39 +476,56 @@ int tsdbc_query_points_ex(tsdbc *c, uint32_t series, int64_t start, int64_t end,
     return rc;
 }
 
-static int read_buckets(const uint8_t *b, size_t len, tsdb_bucket **out, size_t *nout)
+/* Rows of TSDB_BUCKET_ROW bytes into tsdb_bucket; with fields & TSDB_SPREAD rows of TSDB_SPREAD_ROW bytes
+ * into tsdb_spread_bucket. */
+static int read_buckets(const uint8_t *b, size_t len, uint8_t fields, void **out, size_t *nout)
 {
     uint32_t n;
-    if (len < 4 || (memcpy(&n, b, 4), len != 4 + (size_t)n * TSDB_BUCKET_ROW))
+    bool spread = fields & TSDB_SPREAD;
+    size_t row = spread ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
+    size_t stride = spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+    if (len < 4 || (memcpy(&n, b, 4), len != 4 + (size_t)n * row))
         return TSDB_ERR_CORRUPT;
-    tsdb_bucket *r = malloc((n ? n : 1) * sizeof *r);
-    if (!r)
+    uint8_t *res = malloc((n ? n : 1) * stride);
+    if (!res)
         return TSDB_ERR_NOMEM;
     for (uint32_t i = 0; i < n; i++) {
-        const uint8_t *o = b + 4 + (size_t)i * TSDB_BUCKET_ROW;
-        memcpy(&r[i].start, o, 8);
-        memcpy(&r[i].count, o + 8, 8);
-        memcpy(&r[i].sum, o + 16, 8);
-        memcpy(&r[i].min, o + 24, 8);
-        memcpy(&r[i].max, o + 32, 8);
-        memcpy(&r[i].isum, o + 40, 8);
-        memcpy(&r[i].imin, o + 48, 8);
-        memcpy(&r[i].imax, o + 56, 8);
+        const uint8_t *o = b + 4 + (size_t)i * row;
+        tsdb_bucket *r = (tsdb_bucket *)(res + (size_t)i * stride);
+        memcpy(&r->start, o, 8);
+        memcpy(&r->count, o + 8, 8);
+        memcpy(&r->sum, o + 16, 8);
+        memcpy(&r->min, o + 24, 8);
+        memcpy(&r->max, o + 32, 8);
+        memcpy(&r->isum, o + 40, 8);
+        memcpy(&r->imin, o + 48, 8);
+        memcpy(&r->imax, o + 56, 8);
+        if (spread) {
+            tsdb_spread_bucket *x = (tsdb_spread_bucket *)r;
+            memcpy(&x->range, o + 64, 8);
+            memcpy(&x->var_pop, o + 72, 8);
+            memcpy(&x->var_samp, o + 80, 8);
+            memcpy(&x->stddev_pop, o + 88, 8);
+            memcpy(&x->stddev_samp, o + 96, 8);
+        }
     }
-    *out = r;
+    *out = res;
     *nout = n;
     return 0;
 }
 
-/* QUERY_BUCKETS: fixed intervals (group NULL) or calendar groups */
+/* QUERY_BUCKETS: fixed intervals (group NULL) or calendar groups. The fields byte follows the zone only when
+ * the caller asks for the spread: without it the request is the one every server version takes. */
 static int buckets_req(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval,
-                       const tsdb_group *group, const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+                       const tsdb_group *group, const tsdb_query_opts *opts, uint8_t fields, void **out, size_t *nout)
 {
     *out = NULL;
     *nout = 0;
     const char *zone = group && group->timezone ? group->timezone : "";
     size_t zl = strlen(zone);
     if (zl > 65535)
+        return TSDB_ERR_INVALID;
+    if (fields && server_version(c) < 8) /* an older server has no spread (and refuses the byte) */
         return TSDB_ERR_INVALID;
     uint8_t q[44];
     memcpy(q, &series, 4);
@@ -523,29 +540,27 @@ static int buckets_req(tsdbc *c, uint32_t series, int64_t start, int64_t end, in
     memcpy(q + 34, &lim, 8);
     uint16_t z16 = (uint16_t)zl;
     memcpy(q + 42, &z16, 2);
+    uint8_t *tail = malloc(zl + 1);
+    if (!tail)
+        return TSDB_ERR_NOMEM;
+    memcpy(tail, zone, zl);
+    tail[zl] = fields;
     const uint8_t *b;
     size_t len;
-    int rc = call(c, TSDB_OP_QUERY_BUCKETS, q, 44, zone, zl, &b, &len);
-    return rc ? rc : read_buckets(b, len, out, nout);
+    int rc = call(c, TSDB_OP_QUERY_BUCKETS, q, 44, tail, zl + (fields != 0), &b, &len);
+    free(tail);
+    return rc ? rc : read_buckets(b, len, fields, out, nout);
 }
 
-int tsdbc_query_agg(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
-                    size_t *nout)
-{
-    if (interval_ms < 0) {
-        *out = NULL;
-        *nout = 0;
-        return TSDB_ERR_INVALID;
-    }
-    return buckets_req(c, series, start, end, interval_ms, NULL, NULL, out, nout);
-}
-
-int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
-                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+/* QUERY_BOUNDS, the fields byte after the bounds as in buckets_req */
+static int bounds_req(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                      const tsdb_query_opts *opts, uint8_t fields, void **out, size_t *nout)
 {
     *out = NULL;
     *nout = 0;
     if (!bounds || n == 0 || n > (TSDB_MAX_FRAME - 64) / 8)
+        return TSDB_ERR_INVALID;
+    if (fields && server_version(c) < 8)
         return TSDB_ERR_INVALID;
     uint8_t q[33];
     uint32_t n32 = (uint32_t)n;
@@ -556,10 +571,33 @@ int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, co
     q[20] = opts && opts->order == TSDB_DESC;
     memcpy(q + 21, &lim, 8);
     memcpy(q + 29, &n32, 4);
+    uint8_t *tail = malloc(n * 8 + 1);
+    if (!tail)
+        return TSDB_ERR_NOMEM;
+    memcpy(tail, bounds, n * 8);
+    tail[n * 8] = fields;
     const uint8_t *b;
     size_t len;
-    int rc = call(c, TSDB_OP_QUERY_BOUNDS, q, 33, bounds, n * 8, &b, &len);
-    return rc ? rc : read_buckets(b, len, out, nout);
+    int rc = call(c, TSDB_OP_QUERY_BOUNDS, q, 33, tail, n * 8 + (fields != 0), &b, &len);
+    free(tail);
+    return rc ? rc : read_buckets(b, len, fields, out, nout);
+}
+
+int tsdbc_query_agg(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
+                    size_t *nout)
+{
+    if (interval_ms < 0) {
+        *out = NULL;
+        *nout = 0;
+        return TSDB_ERR_INVALID;
+    }
+    return buckets_req(c, series, start, end, interval_ms, NULL, NULL, 0, (void **)out, nout);
+}
+
+int tsdbc_query_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+{
+    return bounds_req(c, series, start, end, bounds, n, opts, 0, (void **)out, nout);
 }
 
 static int first_ts(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
@@ -570,12 +608,12 @@ static int first_ts(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n
     return 0;
 }
 
-int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
-                      const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+static int group_req(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                     const tsdb_query_opts *opts, uint8_t fields, void **out, size_t *nout)
 {
     bool local = group && group->timezone && strcmp(group->timezone, "UTC") != 0;
     if (!local || server_version(c) < 4) /* an older server still takes the zone itself */
-        return buckets_req(c, series, start, end, 0, group, opts, out, nout);
+        return buckets_req(c, series, start, end, 0, group, opts, fields, out, nout);
     *out = NULL;
     *nout = 0;
     /* local periods become UTC bounds here; an open range is cut to the rows there are */
@@ -590,9 +628,40 @@ int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, con
     size_t n;
     rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
     if (rc == 0)
-        rc = tsdbc_query_bounds(c, series, start, end, bounds, n, opts, out, nout);
+        rc = bounds_req(c, series, start, end, bounds, n, opts, fields, out, nout);
     free(bounds);
     return rc;
+}
+
+int tsdbc_query_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                      const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+{
+    return group_req(c, series, start, end, group, opts, 0, (void **)out, nout);
+}
+
+/* --------------------------------------------------------------- spread */
+
+int tsdbc_query_spread(tsdbc *c, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                       const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
+{
+    if (interval_ms < 0) {
+        *out = NULL;
+        *nout = 0;
+        return TSDB_ERR_INVALID;
+    }
+    return buckets_req(c, series, start, end, interval_ms, NULL, opts, TSDB_SPREAD, (void **)out, nout);
+}
+
+int tsdbc_query_spread_group(tsdbc *c, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+                             const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
+{
+    return group_req(c, series, start, end, group, opts, TSDB_SPREAD, (void **)out, nout);
+}
+
+int tsdbc_query_spread_bounds(tsdbc *c, uint32_t series, int64_t start, int64_t end, const int64_t *bounds,
+                              size_t n, const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
+{
+    return bounds_req(c, series, start, end, bounds, n, opts, TSDB_SPREAD, (void **)out, nout);
 }
 
 /* ------------------------------------------------- time-weighted averages */

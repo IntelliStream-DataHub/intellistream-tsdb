@@ -430,26 +430,39 @@ static int insert_packed(const uint8_t *p, size_t len, uint32_t n, uint32_t s)
     return rc;
 }
 
-static void reply_buckets(conn *c, uint32_t id, const tsdb_bucket *b, size_t nb)
+/* fields: 0 (bb: tsdb_bucket) or TSDB_SPREAD (bb: tsdb_spread_bucket, version 8), which appends the spread
+ * to every row */
+static void reply_buckets(conn *c, uint32_t id, const void *bb, size_t nb, uint8_t fields)
 {
-    uint8_t *rows = malloc(nb * TSDB_BUCKET_ROW + 1);
+    size_t row = fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
+    size_t stride = fields & TSDB_SPREAD ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+    uint8_t *rows = malloc(nb * row + 1);
     if (!rows) {
         reply_status(c, id, TSDB_ERR_NOMEM);
         return;
     }
     for (size_t i = 0; i < nb; i++) {
-        uint8_t *o = rows + i * TSDB_BUCKET_ROW;
-        memcpy(o, &b[i].start, 8);
-        memcpy(o + 8, &b[i].count, 8);
-        memcpy(o + 16, &b[i].sum, 8);
-        memcpy(o + 24, &b[i].min, 8);
-        memcpy(o + 32, &b[i].max, 8);
-        memcpy(o + 40, &b[i].isum, 8);
-        memcpy(o + 48, &b[i].imin, 8);
-        memcpy(o + 56, &b[i].imax, 8);
+        uint8_t *o = rows + i * row;
+        const tsdb_bucket *b = (const tsdb_bucket *)((const uint8_t *)bb + i * stride);
+        const tsdb_spread_bucket *sb = (const tsdb_spread_bucket *)b;
+        memcpy(o, &b->start, 8);
+        memcpy(o + 8, &b->count, 8);
+        memcpy(o + 16, &b->sum, 8);
+        memcpy(o + 24, &b->min, 8);
+        memcpy(o + 32, &b->max, 8);
+        memcpy(o + 40, &b->isum, 8);
+        memcpy(o + 48, &b->imin, 8);
+        memcpy(o + 56, &b->imax, 8);
+        if (fields & TSDB_SPREAD) {
+            memcpy(o + 64, &sb->range, 8);
+            memcpy(o + 72, &sb->var_pop, 8);
+            memcpy(o + 80, &sb->var_samp, 8);
+            memcpy(o + 88, &sb->stddev_pop, 8);
+            memcpy(o + 96, &sb->stddev_samp, 8);
+        }
     }
     uint32_t n = (uint32_t)nb;
-    reply(c, id, 0, &n, 4, rows, nb * TSDB_BUCKET_ROW, NULL, 0);
+    reply(c, id, 0, &n, 4, rows, nb * row, NULL, 0);
     free(rows);
 }
 
@@ -847,7 +860,9 @@ static void handle(req *r)
         int64_t start, end, interval;
         uint64_t lim;
         uint16_t zl;
-        if (len < 44 || (memcpy(&zl, p + 42, 2), len != 44u + zl) || memchr(p + 44, 0, zl)) {
+        uint8_t fields = 0; /* version 8: an optional byte after the zone */
+        if (len < 44 || (memcpy(&zl, p + 42, 2), len != 44u + zl && len != 45u + zl) || memchr(p + 44, 0, zl) ||
+            (len == 45u + zl && ((fields = p[44 + zl]) & ~TSDB_SPREAD))) {
             rc = TSDB_ERR_INVALID;
             break;
         }
@@ -860,7 +875,16 @@ static void handle(req *r)
         tsdb_query_opts q = {p[33] ? TSDB_DESC : TSDB_ASC, (size_t)lim};
         tsdb_bucket *b = NULL;
         size_t nb = 0;
-        if (p[28] == 0) {
+        char *zone = zl ? strndup((const char *)p + 44, zl) : NULL;
+        tsdb_group g = {(tsdb_unit)p[28], count, zone};
+        if (zl && !zone) {
+            rc = TSDB_ERR_NOMEM;
+        } else if (fields & TSDB_SPREAD) { /* the spread costs a second pass: only when asked for */
+            tsdb_spread_bucket *sb = NULL;
+            rc = p[28] == 0 ? tsdb_query_spread(db, s, start, end, interval, &q, &sb, &nb)
+                            : tsdb_query_spread_group(db, s, start, end, &g, &q, &sb, &nb);
+            b = (tsdb_bucket *)sb;
+        } else if (p[28] == 0) {
             rc = tsdb_query_agg(db, s, start, end, interval, &b, &nb);
             if (rc == 0 && q.order == TSDB_DESC)
                 for (size_t i = 0, j = nb ? nb - 1 : 0; i < j; i++, j--) {
@@ -871,13 +895,11 @@ static void handle(req *r)
             if (rc == 0 && q.limit && nb > q.limit)
                 nb = q.limit;
         } else {
-            char *zone = zl ? strndup((const char *)p + 44, zl) : NULL;
-            tsdb_group g = {(tsdb_unit)p[28], count, zone};
-            rc = zl && !zone ? TSDB_ERR_NOMEM : tsdb_query_group_ex(db, s, start, end, &g, &q, &b, &nb);
-            free(zone);
+            rc = tsdb_query_group_ex(db, s, start, end, &g, &q, &b, &nb);
         }
+        free(zone);
         if (rc == 0) {
-            reply_buckets(c, r->id, b, nb);
+            reply_buckets(c, r->id, b, nb, fields);
             free(b);
             return;
         }
@@ -897,7 +919,9 @@ static void handle(req *r)
         uint32_t s, n;
         int64_t start, end;
         uint64_t lim;
-        if (len < 33 || (memcpy(&n, p + 29, 4), len != 33 + (size_t)n * 8) || n == 0) {
+        uint8_t fields = 0; /* version 8: an optional byte after the bounds */
+        if (len < 33 || (memcpy(&n, p + 29, 4), len != 33 + (size_t)n * 8 && len != 34 + (size_t)n * 8) || n == 0 ||
+            (len == 34 + (size_t)n * 8 && ((fields = p[33 + (size_t)n * 8]) & ~TSDB_SPREAD))) {
             rc = TSDB_ERR_INVALID;
             break;
         }
@@ -914,10 +938,16 @@ static void handle(req *r)
             break;
         }
         memcpy(bounds, p + 33, (size_t)n * 8);
-        rc = tsdb_query_bounds(db, s, start, end, bounds, n, &q, &b, &nb);
+        if (fields & TSDB_SPREAD) {
+            tsdb_spread_bucket *sb = NULL;
+            rc = tsdb_query_spread_bounds(db, s, start, end, bounds, n, &q, &sb, &nb);
+            b = (tsdb_bucket *)sb;
+        } else {
+            rc = tsdb_query_bounds(db, s, start, end, bounds, n, &q, &b, &nb);
+        }
         free(bounds);
         if (rc == 0) {
-            reply_buckets(c, r->id, b, nb);
+            reply_buckets(c, r->id, b, nb, fields);
             free(b);
             return;
         }

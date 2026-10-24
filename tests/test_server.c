@@ -928,6 +928,218 @@ static void test_bounds(tsdbc *c, uint32_t a, size_t n)
     close(fd);
 }
 
+/* The spread (protocol version 8): through the client, and by hand: without the fields byte the reply keeps
+ * its 64-byte rows (what older clients read), with TSDB_SPREAD the rows carry it, other bits are refused. */
+static void test_spread_remote(tsdbc *c)
+{
+    uint32_t d;
+    OK(tsdbc_series_create(c, "spread.f64", TSDB_FLOAT64, NULL, &d));
+    int64_t ts[5];
+    double v[5] = {101326, 101324, 101327, 101323, 0};
+    uint8_t valid = 0x0f; /* the last one null */
+    for (int k = 0; k < 5; k++)
+        ts[k] = T0 + k * 1000;
+    OK(tsdbc_insert_series_values(c, d, ts, &(tsdb_values){TSDB_FLOAT64, v, &valid}, 5));
+    CHECK(tsdbc_server_version(c) == TSDB_PROTOCOL_VERSION);
+    tsdb_spread_bucket *bk;
+    size_t nb;
+    OK(tsdbc_query_spread(c, d, INT64_MIN, INT64_MAX, 0, NULL, &bk, &nb));
+    CHECK(nb == 1 && bk[0].b.count == 4 && bk[0].range == 4 && bk[0].var_pop == 2.5 && bk[0].var_samp == 10.0 / 3);
+    CHECK(nb == 1 && bk[0].stddev_pop == sqrt(2.5) && bk[0].stddev_samp == sqrt(10.0 / 3));
+    tsdb_bucket *pb;
+    size_t np;
+    OK(tsdbc_query_agg(c, d, INT64_MIN, INT64_MAX, 0, &pb, &np));
+    CHECK(np == 1 && nb == 1 && memcmp(&pb[0], &bk[0].b, sizeof *pb) == 0);
+    free(pb);
+    int64_t bounds[2] = {T0, T0 + 2000};
+    tsdb_spread_bucket *bb;
+    size_t nbb;
+    tsdb_query_opts desc = {TSDB_DESC, 1};
+    OK(tsdbc_query_spread_bounds(c, d, INT64_MIN, INT64_MAX, bounds, 2, NULL, &bb, &nbb));
+    CHECK(nbb == 2 && bb[0].b.count == 2 && bb[0].range == 2 && bb[0].var_pop == 1 && bb[1].var_samp == 8);
+    free(bb);
+    OK(tsdbc_query_spread_bounds(c, d, INT64_MIN, INT64_MAX, bounds, 2, &desc, &bb, &nbb));
+    CHECK(nbb == 1 && bb[0].b.start == T0 + 2000 && bb[0].var_samp == 8);
+    free(bb);
+    tsdb_group sec2 = {TSDB_SECOND, 2, NULL}, berlin = {TSDB_DAY, 1, "Europe/Berlin"};
+    tsdb_query_opts desc_all = {TSDB_DESC, 0};
+    OK(tsdbc_query_spread_group(c, d, INT64_MIN, T0 + 4000, &sec2, &desc_all, &bb, &nbb));
+    CHECK(nbb == 2 && bb[0].b.start == T0 + 2000 && bb[0].var_samp == 8 && bb[1].var_pop == 1);
+    free(bb);
+    OK(tsdbc_query_spread_group(c, d, INT64_MIN, INT64_MAX, &berlin, NULL, &bb, &nbb)); /* local: bounds */
+    CHECK(nbb == 1 && bb[0].b.count == 4 && bb[0].var_pop == 2.5);
+    free(bb);
+
+    int fd = raw_connect();
+    for (int fields = -1; fields <= 2; fields++) {
+        uint8_t q[45] = {0};
+        int64_t lo = INT64_MIN, hi = INT64_MAX;
+        memcpy(q, &d, 4);
+        memcpy(q + 4, &lo, 8);
+        memcpy(q + 12, &hi, 8);
+        q[44] = (uint8_t)fields;
+        raw_send(fd, 40 + (uint32_t)(fields + 1), TSDB_OP_QUERY_BUCKETS, q, fields < 0 ? 44 : 45);
+        uint32_t rid, n = 0;
+        uint8_t rest[256];
+        size_t nrest = 0;
+        int32_t st = raw_reply(fd, &rid, rest, sizeof rest, &nrest);
+        CHECK(rid == 40u + (uint32_t)(fields + 1));
+        if (fields == 2) {
+            CHECK(st == TSDB_ERR_INVALID);
+            continue;
+        }
+        memcpy(&n, rest, 4);
+        size_t row = fields == TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
+        CHECK(st == 0 && n == 1 && nrest == 4 + row);
+        if (st == 0 && n == 1 && nrest == 4 + row && row == TSDB_SPREAD_ROW) {
+            double x[5];
+            memcpy(x, rest + 4 + 64, sizeof x);
+            CHECK(x[0] == bk[0].range && x[1] == bk[0].var_pop && x[2] == bk[0].var_samp &&
+                  x[3] == bk[0].stddev_pop && x[4] == bk[0].stddev_samp);
+        }
+    }
+    /* QUERY_BOUNDS with the byte after the bounds; a reserved bit is refused */
+    for (int fields = 1; fields <= 3; fields++) {
+        uint8_t q[33 + 16 + 1] = {0};
+        int64_t lo = INT64_MIN, hi = INT64_MAX;
+        uint32_t n2 = 2;
+        memcpy(q, &d, 4);
+        memcpy(q + 4, &lo, 8);
+        memcpy(q + 12, &hi, 8);
+        memcpy(q + 29, &n2, 4);
+        memcpy(q + 33, bounds, 16);
+        q[49] = (uint8_t)fields;
+        raw_send(fd, 50 + (uint32_t)fields, TSDB_OP_QUERY_BOUNDS, q, sizeof q);
+        uint32_t rid, n = 0;
+        uint8_t rest[512];
+        size_t nrest = 0;
+        int32_t st = raw_reply(fd, &rid, rest, sizeof rest, &nrest);
+        CHECK(rid == 50u + (uint32_t)fields);
+        if (fields != TSDB_SPREAD) {
+            CHECK(st == TSDB_ERR_INVALID);
+            continue;
+        }
+        memcpy(&n, rest, 4);
+        CHECK(st == 0 && n == 2 && nrest == 4 + 2 * TSDB_SPREAD_ROW);
+    }
+    close(fd);
+    free(bk);
+}
+
+/* A server of protocol version 6 (before the spread), as far as bucket queries go: HELLO answers 6, a
+ * QUERY_BUCKETS or QUERY_BOUNDS with a byte after the zone or bounds is refused as such a server does, one
+ * without it gets a bucket of 64 bytes. Counts the bucket requests it sees. */
+static const int64_t t0_old = 1700000000000;
+
+typedef struct old_server {
+    int lfd, port;
+    int bucket_reqs, refused;
+} old_server;
+
+static void old_reply(int fd, uint32_t id, int32_t st, const void *body, uint32_t n)
+{
+    uint8_t h[13];
+    uint32_t flen = 9 + n;
+    memcpy(h, &flen, 4);
+    memcpy(h + 4, &id, 4);
+    h[8] = TSDB_OP_REPLY;
+    memcpy(h + 9, &st, 4);
+    CHECK(write(fd, h, 13) == 13);
+    CHECK(n == 0 || write(fd, body, n) == (ssize_t)n);
+}
+
+static void *old_server_run(void *arg)
+{
+    old_server *o = arg;
+    int fd = accept(o->lfd, NULL, NULL);
+    uint8_t h[9], p[4096];
+    while (fd >= 0 && read_full(fd, h, 9)) {
+        uint32_t flen, id;
+        memcpy(&flen, h, 4);
+        memcpy(&id, h + 4, 4);
+        uint32_t len = flen - 5;
+        if (len > sizeof p || !read_full(fd, p, len))
+            break;
+        if (h[8] == TSDB_OP_HELLO) {
+            uint32_t six = 6;
+            old_reply(fd, id, 0, &six, 4);
+            continue;
+        }
+        bool exact = false;
+        if (h[8] == TSDB_OP_QUERY_BUCKETS && len >= 44) {
+            uint16_t zl;
+            memcpy(&zl, p + 42, 2);
+            exact = len == 44u + zl;
+        } else if (h[8] == TSDB_OP_QUERY_BOUNDS && len >= 33) {
+            uint32_t n;
+            memcpy(&n, p + 29, 4);
+            exact = len == 33 + (size_t)n * 8;
+        } else {
+            old_reply(fd, id, TSDB_ERR_INVALID, NULL, 0);
+            continue;
+        }
+        o->bucket_reqs++;
+        if (!exact) {
+            o->refused++;
+            old_reply(fd, id, TSDB_ERR_INVALID, NULL, 0);
+            continue;
+        }
+        uint8_t body[4 + TSDB_BUCKET_ROW] = {0};
+        uint32_t one = 1;
+        uint64_t count = 3;
+        memcpy(body, &one, 4);
+        memcpy(body + 4, &t0_old, 8);
+        memcpy(body + 12, &count, 8);
+        old_reply(fd, id, 0, body, sizeof body);
+    }
+    if (fd >= 0)
+        close(fd);
+    return NULL;
+}
+
+/* The client against a version 6 server: plain bucket queries send exactly what such a server takes and read
+ * its 64-byte rows; the spread is refused by the client without a request (the server would refuse it). */
+static void test_spread_old_server(void)
+{
+    old_server o = {0};
+    o.lfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET};
+    socklen_t sl = sizeof sa;
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    CHECK(bind(o.lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(o.lfd, 1) == 0);
+    CHECK(getsockname(o.lfd, (struct sockaddr *)&sa, &sl) == 0);
+    o.port = ntohs(sa.sin_port);
+    pthread_t th;
+    pthread_create(&th, NULL, old_server_run, &o);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", o.port, &c));
+    CHECK(tsdbc_server_version(c) == 6);
+    tsdb_bucket *b;
+    size_t n;
+    int64_t bounds[1] = {0};
+    tsdb_group g = {TSDB_SECOND, 1, NULL};
+    OK(tsdbc_query_agg(c, 1, 0, INT64_MAX, 1000, &b, &n));
+    CHECK(n == 1 && b[0].start == t0_old && b[0].count == 3);
+    free(b);
+    OK(tsdbc_query_group(c, 1, 0, INT64_MAX, &g, NULL, &b, &n));
+    CHECK(n == 1 && b[0].count == 3);
+    free(b);
+    OK(tsdbc_query_bounds(c, 1, 0, INT64_MAX, bounds, 1, NULL, &b, &n));
+    CHECK(n == 1 && b[0].count == 3);
+    free(b);
+    tsdb_spread_bucket *sb = (tsdb_spread_bucket *)1;
+    n = 7;
+    CHECK(tsdbc_query_spread(c, 1, 0, INT64_MAX, 1000, NULL, &sb, &n) == TSDB_ERR_INVALID && !sb && !n);
+    CHECK(tsdbc_query_spread_group(c, 1, 0, INT64_MAX, &g, NULL, &sb, &n) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_query_spread_bounds(c, 1, 0, INT64_MAX, bounds, 1, NULL, &sb, &n) == TSDB_ERR_INVALID);
+    tsdbc_close(c);
+    pthread_join(th, NULL);
+    close(o.lfd);
+    CHECK(o.bucket_reqs == 3 && o.refused == 0);
+    if (o.bucket_reqs != 3 || o.refused)
+        fprintf(stderr, "old server: %d bucket requests, %d refused\n", o.bucket_reqs, o.refused);
+}
+
 static void test_packed_inserts(tsdbc *c)
 {
     uint32_t a, b;
@@ -2284,6 +2496,8 @@ int main(int argc, char **argv)
     test_packed_inserts(c);
     test_bounds(c, a, N);
     test_twa(c);
+    test_spread_remote(c);
+    test_spread_old_server();
 
     OK(tsdbc_stats(c, &st));
     tsdbc_close(c);
