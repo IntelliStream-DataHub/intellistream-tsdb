@@ -21,3 +21,7 @@ native = ["embedded", "tsdb-sys/native"]
 # packed inserts (protocol version 3); the bundled libzstd, no optional features
 zstd = { version = "0.13", default-features = false }
 tsdb-sys = { path = "../rust-sys", optional = true }
+
+[[example]]
+name = "embedded_quickstart"
+required-features = ["embedded"]

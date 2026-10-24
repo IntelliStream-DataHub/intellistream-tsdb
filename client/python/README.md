@@ -193,6 +193,35 @@ Servers older than protocol version 3 always get uncompressed inserts.
 
 It prints rows per second and bytes sent per row. Try `--compression 0` to compare.
 
+## Embedded
+
+`tsdb_client.Db` is the database itself inside your Python process: no
+tsdbd, no network. Give it a directory; it has the same methods as
+`Client`, so code switches between the two by changing one line. The
+engine is compiled into the module, runs on any x86-64 and picks AVX2 or
+AVX-512 code at run time.
+
+```python
+import tsdb_client
+
+with tsdb_client.Db("/tmp/tsdb-embedded") as db:
+    s = db.series("pump7.flow")
+    t0 = 1_700_000_000_000  # one row a minute for a day
+    db.insert_series(s, [t0 + i * 60_000 for i in range(1440)], [float(i % 60) for i in range(1440)])
+    ts, values = db.query_raw(s, t0, t0 + 180_000, numpy=False)
+    for t, v in zip(ts, values):
+        print("raw ", t, v)
+    for b in db.query_group(s, unit="day", timezone="Europe/Oslo"):
+        print("day ", b.start, b.count, b.sum)
+```
+
+The engine works with the GIL released, and threads sharing one `Db` run
+in parallel. One process at a time can open a directory for writing
+(others get `ERR_LOCKED`); readers open it with `Db(path, read_only=True)`
+and call `refresh()` to see new data. The keyword arguments of `Db` are
+the engine's options, such as `fsync=False` or `wal_sync_ms=100`;
+`help(tsdb_client.Db)` lists them.
+
 ## API documentation
 
 Every class and method has a docstring, and `tsdb_client.pyi` gives editors
