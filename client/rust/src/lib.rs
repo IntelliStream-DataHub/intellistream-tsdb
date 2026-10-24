@@ -59,12 +59,13 @@
 //!
 //! The protocol is described in `include/tsdb_protocol.h` of the tsdb
 //! repository; this crate mirrors the C client in `client/tsdb_client.h`.
-//! Its only dependency is `zstd`.
+//! Its dependencies are `zstd` and, on Unix, `libc` (for the TCP keepalive options).
 #![warn(missing_docs)]
 
 mod calendar;
 mod client;
 mod error;
+mod keepalive;
 mod pack;
 mod protocol;
 mod types;
@@ -73,6 +74,7 @@ mod value;
 pub use calendar::calendar_bounds;
 pub use client::{Client, DEFAULT_COMPRESSION};
 pub use error::{Error, Result, Status, strerror};
+pub use keepalive::KeepAlive;
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};
 pub use types::{Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, Stats, Unit};
 pub use value::{Bitmap, Column, ColumnRef, NULL_F32_BITS, NULL_F64_BITS, Native, Value, ValueType, Values, ValuesRef};

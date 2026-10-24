@@ -56,6 +56,7 @@ interface TsdbConnection extends AutoCloseable {
     static Factory client(TsdbSinkConfig c) {
         List<Map.Entry<String, Integer>> endpoints = c.endpoints();
         Duration timeout = Duration.ofMillis(c.connectTimeoutMs);
+        Duration requestTimeout = Duration.ofMillis(c.requestTimeoutMs);
         AtomicInteger first = new AtomicInteger();
         return () -> {
             TsdbException last = null;
@@ -64,7 +65,7 @@ interface TsdbConnection extends AutoCloseable {
                 int k = (from + i) % n;
                 Map.Entry<String, Integer> e = endpoints.get(k);
                 try {
-                    TsdbClient cl = TsdbClient.connect(e.getKey(), e.getValue(), timeout);
+                    TsdbClient cl = TsdbClient.connect(e.getKey(), e.getValue(), timeout, requestTimeout);
                     cl.setCompression(c.compressionLevel);
                     return new ClientConnection(cl, () -> first.compareAndSet(k, (k + 1) % n));
                 } catch (TsdbException x) {

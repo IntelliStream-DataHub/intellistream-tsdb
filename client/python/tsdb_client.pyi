@@ -220,15 +220,38 @@ class Client:
         host: Server name or address.
         port: Server port (7070 by default).
         timeout: Seconds to wait for the connection and for every later read
-            or write; None waits forever. A call that times out closes the
-            client.
+            or write; None (the default) waits forever. A call that times out
+            raises TsdbError (ERR_IO) and closes the client.
+        keepalive: Turn TCP keepalive on (the default): after 30 s of silence
+            the client probes every 10 s and drops the connection after 3
+            unanswered probes, where the platform allows.
 
     Raises:
         TsdbError: The connection failed.
         ValueError: timeout is not a positive number.
     """
 
-    def __new__(cls, host: str = "127.0.0.1", port: int = 7070, timeout: float | None = None) -> Client: ...
+    def __new__(
+        cls, host: str = "127.0.0.1", port: int = 7070, timeout: float | None = None, keepalive: bool = True
+    ) -> Client: ...
+    def set_timeout(self, timeout: float | None) -> None:
+        """Changes how long a call waits for the server, in seconds; None waits forever.
+
+        The limit applies to each wait for the server (sending or receiving), not
+        to a whole call. A call that times out raises TsdbError (ERR_IO) and closes
+        the client: connect again.
+
+        Raises:
+            ValueError: timeout is not a positive number.
+            TsdbError: The client is closed.
+        """
+    @property
+    def timeout(self) -> float | None:
+        """The timeout in seconds set at connect or by set_timeout; None waits forever.
+
+        Raises:
+            TsdbError: The client is closed.
+        """
     def close(self) -> None:
         """Waits for pending inserts, then closes the connection.
 

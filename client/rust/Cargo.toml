@@ -12,3 +12,7 @@ categories = ["database"]
 [dependencies]
 # packed inserts (protocol version 3); the bundled libzstd, no optional features
 zstd = { version = "0.13", default-features = false }
+
+# TCP keepalive options, which std does not expose
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
