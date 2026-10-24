@@ -57,8 +57,8 @@ static size_t select_merge_locked(eng *db, part **sel)
         if (nparts >= 2) {
             time_t newest = 0;
             for (size_t i = a; i < b; i++)
-                newest = MAX(newest, db->parts[i]->created);
-            bool idle = now - newest >= IDLE_PARTITION_FORCE_MERGE_S;
+                newest = MAX(newest, db->parts[i]->written);
+            bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
             for (size_t i = a; i < b; i++) {
                 double sum = 0, max_size = 0, min_age = INFINITY;
                 for (size_t j = i; j < b && j - i < MAX_MERGE_PARTS; j++) {
@@ -275,6 +275,12 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         return rc;
     }
     rc = pw_finish(&w, min_block, max_block, level + 1, out);
+    if (rc == 0 && *out) {
+        time_t written = 0;
+        for (size_t i = 0; i < k; i++)
+            written = MAX(written, src[i]->written);
+        (*out)->written = written; /* a merge is not a write: the partition stays as idle as it was */
+    }
     if (rc == 0) {
         atomic_fetch_add(&db->st_merges, 1);
         atomic_fetch_add(&db->st_merged_rows, rows);

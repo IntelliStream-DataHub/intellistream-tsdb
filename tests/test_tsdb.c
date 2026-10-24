@@ -883,6 +883,76 @@ static void test_concurrency(const char *dir)
     OK(tsdb_close(db));
 }
 
+typedef struct part_count {
+    int n;
+    int64_t created, written;
+} part_count;
+
+static void count_parts(void *ctx, const tsdb_part_info *p)
+{
+    part_count *c = ctx;
+    c->n++;
+    c->created = p->created_s;
+    c->written = p->written_s;
+}
+
+/* Regression: batches committed out of time order (several loaders) left
+ * parts whose merged granules overlap in time; background merges stopped
+ * there for an hour, and every aggregate decoded those granules instead of
+ * using their statistics. An idle partition is now merged down soon. */
+static void test_idle_merge(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-idle-%d", base, (int)getpid());
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.granule_rows = 256;
+    o.fsync = 0;
+    o.wal_max_batch_rows = 100; /* every batch becomes a part */
+    o.merge_idle_s = 1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    /* two parts of the same size whose rows interleave in time: the merge
+     * heuristics leave a pair like this for about an hour */
+    enum { B = 1000 };
+    int64_t ts[B];
+    float v[B];
+    const int64_t t0 = 1700000000000;
+    for (int k = 0; k < 2; k++) {
+        for (int i = 0; i < B; i++) {
+            ts[i] = t0 + (int64_t)(2 * i + k) * 1000;
+            v[i] = (float)i;
+        }
+        OK(tsdb_insert_series(db, id, ts, v, B));
+    }
+    part_count pc = {0, 0, 0};
+    for (int tries = 0; tries < 100; tries++) { /* idle after 1 s; merges look every second */
+        pc.n = 0;
+        tsdb_foreach_part(db, count_parts, &pc);
+        if (pc.n == 1)
+            break;
+        usleep(100000);
+    }
+    CHECK(pc.n == 1);
+    /* Regression: a merge's output counted as a new write, so a partition
+     * needing several merges waited merge_idle_s again after each. The part
+     * keeps the time its rows were written, a second or more before the merge. */
+    CHECK(pc.written < pc.created);
+    tsdb_bucket *b;
+    size_t nb;
+    OK(tsdb_query_agg(db, id, INT64_MIN + 1, INT64_MAX, 0, &b, &nb));
+    tsdb_query_stats st;
+    tsdb_last_query_stats(&st);
+    CHECK(nb == 1 && b[0].count == 2 * B && st.rows_decoded == 0 && st.rows_from_stats == 2 * B);
+    free(b);
+    OK(tsdb_close(db));
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -902,6 +972,8 @@ int main(int argc, char **argv)
     printf("concurrency\n");
     test_concurrency(dir);
     rm_rf(dir);
+    printf("idle partitions merged\n");
+    test_idle_merge(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

@@ -45,6 +45,11 @@ void tsdb_options_init(tsdb_options *o)
     o->wal_max_batch_rows = 65536;
     o->refresh_ms = 100;
     o->obsolete_part_lifetime_s = 480; /* like ClickHouse's old_parts_lifetime */
+    /* Parts written side by side (several loaders, or a memtable flush next to
+     * a batch) overlap in time once merged in block order, and overlapping
+     * granules are decoded instead of answered from their statistics: a
+     * finished partition is worth merging completely soon after its last write. */
+    o->merge_idle_s = 300;
     o->max_part_bytes = 4ull << 30;
 }
 
@@ -365,6 +370,8 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
         db->opt.buffer_rows = 1u << 20;
     if (db->opt.wal_max_batch_rows == 0)
         db->opt.wal_max_batch_rows = 65536;
+    if (db->opt.merge_idle_s == 0) /* a zeroed struct: merging everything all the time is never meant */
+        db->opt.merge_idle_s = 300;
     db->dirfd = db->lockfd = db->wal_fd = -1;
     db->series.fd = -1;
     db->wal_enabled = !ro && db->opt.wal_sync_ms >= 0;
@@ -672,7 +679,8 @@ int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info),
         return TSDB_ERR_NOMEM;
     for (size_t i = 0; i < n; i++) {
         part *p = ps[i];
-        tsdb_part_info info = {p->name, p->partition, p->min_ts, p->max_ts, p->rows, p->map_len, p->ng, p->level};
+        tsdb_part_info info = {p->name, p->partition, p->min_ts,  p->max_ts,  p->rows,
+                               p->map_len, p->ng,     p->level, p->created, p->written};
         fn(ctx, &info);
     }
     db_release(ps, n);

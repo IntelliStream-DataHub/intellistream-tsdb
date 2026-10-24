@@ -69,6 +69,8 @@ typedef struct tsdb_options {
     int read_only;           /* open without writing, merging or locking exclusively */
     int follow;              /* read_only, and keep following a writer: new parts, merges and WAL rows */
     int refresh_ms;          /* how often a follower polls the writer's MANIFEST; default 100 */
+    int merge_idle_s;        /* a partition that got no new part for this long is merged down to one part
+                              * (up to max_part_bytes) in the background; default 300 (0 too), -1 never */
     int obsolete_part_lifetime_s; /* writer: parts replaced by merges are deleted this long after,
                                    * so readers on other hosts (NFS) can finish with them; default 480 */
 } tsdb_options;
@@ -287,6 +289,8 @@ typedef struct tsdb_part_info {
     int64_t partition, min_ts, max_ts;
     uint64_t rows, bytes, granules;
     uint32_t level;
+    int64_t created_s; /* when the file was written (Unix seconds) */
+    int64_t written_s; /* when its newest rows were inserted; idle merges go by this */
 } tsdb_part_info;
 int tsdb_foreach_part(tsdb *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 

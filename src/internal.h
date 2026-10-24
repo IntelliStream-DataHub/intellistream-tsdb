@@ -28,7 +28,6 @@ typedef struct eng eng;
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
-#define IDLE_PARTITION_FORCE_MERGE_S 3600
 
 static inline uint32_t load32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline void store32(void *p, uint32_t v) { memcpy(p, &v, 4); }
@@ -394,6 +393,7 @@ typedef struct part {
     uint64_t rows;
     int64_t min_ts, max_ts;
     time_t created;
+    time_t written; /* when its newest rows were inserted: a merge keeps its sources' (after a reopen, created) */
     atomic_int refs;
     /* protected by tsdb.lock */
     bool merging;

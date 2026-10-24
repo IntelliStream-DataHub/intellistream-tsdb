@@ -93,6 +93,7 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     p->map = map;
     p->map_len = size;
     p->created = st.st_mtime;
+    p->written = st.st_mtime;
 
     part_header h;
     part_footer f;
