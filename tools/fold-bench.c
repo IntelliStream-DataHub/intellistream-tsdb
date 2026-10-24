@@ -3,7 +3,7 @@
  * CPU level and kernels this process runs with (TSDB_CPU=v2|v3|v4 in a
  * `make dist` build, TSDB_SIMD=scalar|sse|avx|avx2|avx512):
  *
- *   fold-bench [--rows 8192] [--ms 200] [--only SUBSTRING]
+ *   fold-bench [--rows 8192] [--ms 200] [--only SUBSTRING] [--vary]
  *
  * Each case folds one granule's worth of decoded values (--rows, 8192 as the
  * engine writes them, so they sit in L1/L2 as after a decode) over and over
@@ -16,6 +16,11 @@
  *
  * for float32, float64, int64, bool and state, each without nulls and with
  * 10% nulls. tools/fold-bench.sh runs it at every level interleaved.
+ *
+ * With --vary, agg, spread and twa cycle through up to 256 different granules
+ * (other values, null positions and gaps, about 256 KB in all), so branches on
+ * the data are not learned from one granule repeated: short granules otherwise
+ * favour branchy code that the predictor has memorised.
  */
 #include "../src/internal.h"
 #include "common.h"
@@ -102,6 +107,7 @@ int main(int argc, char **argv)
     size_t rows = 8192;
     double ms = 200;
     const char *only = NULL;
+    bool vary = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--rows") && i + 1 < argc)
             rows = (size_t)strtoull(argv[++i], NULL, 10);
@@ -109,24 +115,40 @@ int main(int argc, char **argv)
             ms = atof(argv[++i]);
         else if (!strcmp(argv[i], "--only") && i + 1 < argc)
             only = argv[++i];
+        else if (!strcmp(argv[i], "--vary"))
+            vary = true;
         else {
-            fprintf(stderr, "usage: fold-bench [--rows N] [--ms MS] [--only SUBSTRING]\n");
+            fprintf(stderr, "usage: fold-bench [--rows N] [--ms MS] [--only SUBSTRING] [--vary]\n");
             return 2;
         }
     }
     simd_init();
-    printf("# kernels: %s\n", tsdb_simd_level());
+    printf("# kernels: %s%s\n", tsdb_simd_level(), vary ? ", varied granules" : "");
     static const int types[] = {TSDB_FLOAT32, TSDB_FLOAT64, TSDB_INT64, TSDB_BOOL, TSDB_STATE};
-    void *v = malloc(rows * 8 + 64);
-    int64_t *ts = malloc(rows * 8 + 64);
+    /* np granules (a power of two) of rows each, one after the other */
+    size_t np = 1;
+    while (vary && np < 256 && (np * 2) * rows * 16 <= (256u << 10))
+        np *= 2;
+    void *pool = malloc(np * rows * 8 + 64);
+    int64_t *tpool = malloc(np * rows * 8 + 64);
+    void *v = pool;
+    int64_t *ts = malloc(rows * 8 + 64); /* LTTB's points */
     uint64_t *slots = malloc(rows * 8 + 64);
-    for (size_t i = 0; i < rows; i++)
-        ts[i] = INT64_C(1700000000000) + (int64_t)i * 1000 + (int64_t)(rnd() % 100);
+    for (size_t p = 0; p < np; p++)
+        for (size_t i = 0; i < rows; i++) /* varied: gaps of 1 to 5 s, now and then a minute */
+            tpool[p * rows + i] = INT64_C(1700000000000) + (int64_t)i * (vary ? 5000 : 1000) +
+                                  (int64_t)(rnd() % (vary ? (rnd() % 8 ? 4000 : 60000) : 100));
+    for (size_t p = 0; vary && p < np; p++) /* keep each granule strictly increasing */
+        for (size_t i = 1; i < rows; i++)
+            if (tpool[p * rows + i] <= tpool[p * rows + i - 1])
+                tpool[p * rows + i] = tpool[p * rows + i - 1] + 1;
+    size_t pi = 0;
     for (size_t t = 0; t < sizeof types / sizeof *types; t++)
         for (int nulls = 0; nulls <= 1; nulls++) {
             int type = types[t];
-            fill(type, v, rows, nulls);
             size_t w = type_width(type);
+            for (size_t p = 0; p < np; p++)
+                fill(type, (uint8_t *)pool + p * rows * w, rows, nulls);
             for (int k = 0; k < 4; k++) {
                 static const char *const what[] = {"agg", "spread", "twa", "lttb"};
                 char name[64];
@@ -142,13 +164,15 @@ int main(int argc, char **argv)
                         agg_dev x;
                         agg_init(&a, type);
                         agg_dev_init(&x);
-                        agg_fold(type, v, rows, &a, k ? &x : NULL);
+                        size_t q_ = pi++ & (np - 1);
+                        agg_fold(type, (const uint8_t *)pool + q_ * rows * w, rows, &a, k ? &x : NULL);
                         sink += (double)a.count;
                     });
                 } else if (k == 2) {
                     r = TIME(rows, ms, {
                         granule g;
-                        granule_twa(type, ts, v, rows, &g);
+                        size_t q_ = pi++ & (np - 1);
+                        granule_twa(type, tpool + q_ * rows, (const uint8_t *)pool + q_ * rows * w, rows, &g);
                         sink += g.tw_step;
                     });
                 } else {
@@ -168,14 +192,13 @@ int main(int argc, char **argv)
                                                21);
                         sink += (double)j;
                     });
-                    for (size_t i = 0; i < rows; i++)
-                        ts[i] = INT64_C(1700000000000) + (int64_t)i * 1000 + (int64_t)(rnd() % 100);
                 }
                 printf("%-24s %10.1f M rows/s\n", name, r);
                 fflush(stdout);
             }
         }
-    free(v);
+    free(pool);
+    free(tpool);
     free(ts);
     free(slots);
     return 0;

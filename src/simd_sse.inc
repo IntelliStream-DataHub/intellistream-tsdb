@@ -797,9 +797,11 @@ KI void KN(twa_seg)(__m128d vp, __m128i eqp, __m128d x, __m128i eqx, __m128i dt,
 }
 
 /* segments [s, n - 1), at most 2Q of them, into vectors 0 .. Q - 1; c, eqc: points s, s + 1 (point s + 1 only
- * if it exists), each point converted once */
+ * if it exists), each point converted once. With R = Q / 2 accumulators, vector q + R is added straight onto
+ * vector q, which is the first halving of KN(twa_out): vector q then holds 0.0 + its segment, never -0.0, and
+ * x + (0.0 + y) == x + y for any x that is not -0.0. Half the registers, no lane arrays in memory. */
 KI void KN(twa_pairs)(int type, const int64_t *ts, const void *v, size_t s, size_t n, __m128d *st, __m128d *li,
-                      KN(twa_acc) *a, __m128d c, __m128i eqc, const int Q)
+                      KN(twa_acc) *a, __m128d c, __m128i eqc, const int Q, const int R)
 {
     _Pragma("GCC unroll 8") for (int q = 0; q < Q; q++)
     {
@@ -825,7 +827,7 @@ KI void KN(twa_pairs)(int type, const int64_t *ts, const void *v, size_t s, size
                                _mm_loadl_epi64((const __m128i *)(ts + p)));
             eqp = _mm_or_si128(eqp, _mm_set_epi64x(-1, 0));
         }
-        KN(twa_seg)(c, eqp, _mm_shuffle_pd(c, nx, 1), eqx, dt, &st[q], &li[q], a);
+        KN(twa_seg)(c, eqp, _mm_shuffle_pd(c, nx, 1), eqx, dt, &st[q & (R - 1)], &li[q & (R - 1)], a);
         c = nx;
         eqc = eqn;
     }
@@ -869,39 +871,26 @@ __attribute__((target(KTARGET), noinline, cold)) static void KN(twa_exact_any)(i
 }
 
 /* one per number of vectors Q, so that the lane arrays have their exact size and stay in registers */
-#define KTWA_Q(Q)                                                                                                     \
+#define KTWA_Q(Q, R)                                                                                                  \
     KI void KCAT(KN(twa_q), Q)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)                 \
     {                                                                                                                 \
-        __m128d st[Q], li[Q];                                                                                         \
+        __m128d st[R], li[R];                                                                                         \
         KN(twa_acc) a = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_pd()};          \
-        for (int q = 0; q < Q; q++)                                                                                   \
+        for (int q = 0; q < R; q++)                                                                                   \
             st[q] = li[q] = _mm_setzero_pd();                                                                         \
         __m128i eqc;                                                                                                  \
         __m128d c = KN(twa_cv)(type, v, 0, &eqc);                                                                     \
-        KN(twa_pairs)(type, ts, v, 0, n, st, li, &a, c, eqc, Q);                                                      \
+        KN(twa_pairs)(type, ts, v, 0, n, st, li, &a, c, eqc, Q, R);                                                   \
         if (KN(twa_wide)(&a))                                                                                         \
             KN(twa_exact_any)(type, ts, v, n, o);                                                                     \
         else                                                                                                          \
-            KN(twa_out)(st, li, &a, o, Q);                                                                            \
+            KN(twa_out)(st, li, &a, o, R);                                                                            \
     }
-KTWA_Q(1)
-KTWA_Q(2)
-KTWA_Q(4)
-KTWA_Q(8)
+KTWA_Q(1, 1)
+KTWA_Q(2, 1)
+KTWA_Q(4, 2)
+KTWA_Q(8, 4)
 #undef KTWA_Q
-
-/* 10 to 17 points: their eight vectors of each sum stay in memory; out of line, so that the shorter ones do not
- * pay for that frame */
-__attribute__((target(KTARGET), noinline)) static void KN(twa_q8_any)(int type, const int64_t *ts, const void *v,
-                                                                      size_t n, twa_sums *o)
-{
-    switch (type) {
-    case TSDB_FLOAT32: KCAT(KN(twa_q), 8)(TSDB_FLOAT32, ts, v, n, o); break;
-    case TSDB_FLOAT64: KCAT(KN(twa_q), 8)(TSDB_FLOAT64, ts, v, n, o); break;
-    case TSDB_INT64: KCAT(KN(twa_q), 8)(TSDB_INT64, ts, v, n, o); break;
-    default: KCAT(KN(twa_q), 8)(TSDB_BOOL, ts, v, n, o); break;
-    }
-}
 
 /* at most L64 + 1 points */
 KI void KN(twa_few)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
@@ -915,7 +904,7 @@ KI void KN(twa_few)(int type, const int64_t *ts, const void *v, size_t n, twa_su
     else if (n <= 9)
         KCAT(KN(twa_q), 4)(type, ts, v, n, o);
     else
-        KN(twa_q8_any)(type, ts, v, n, o);
+        KCAT(KN(twa_q), 8)(type, ts, v, n, o);
 }
 
 KI void KN(twa_impl)(int type, const int64_t *ts, const void *v, size_t n, twa_sums *o)
@@ -943,7 +932,7 @@ KI void KN(twa_impl)(int type, const int64_t *ts, const void *v, size_t n, twa_s
             c = nx;
             eqc = eqn;
         }
-    KN(twa_pairs)(type, ts, v, s, n, st, li, &a, c, eqc, 8);
+    KN(twa_pairs)(type, ts, v, s, n, st, li, &a, c, eqc, 8, 8);
     if (KN(twa_wide)(&a))
         KN(twa_exact_any)(type, ts, v, n, o);
     else

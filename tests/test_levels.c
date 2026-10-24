@@ -526,6 +526,14 @@ static void run(rec *r, codec_ctx *c)
                                 x->name, m, wide == 1 ? " wide" : wide ? " narrow" : "", simd_name());
                         failures++;
                     }
+                    /* granule_twa adds one or two segments itself (twa.c twa_few): the kernel's bits too */
+                    uint32_t gap = o2.gap > UINT32_MAX ? UINT32_MAX : (uint32_t)o2.gap;
+                    if (memcmp(&g.tw_step, &o2.step, 8) || memcmp(&g.tw_lin, &o2.lin, 8) ||
+                        g.tw_step_ms != o2.sms || g.tw_lin_ms != o2.lms || g.tw_gap != gap) {
+                        fprintf(stderr, "%s, %zu points%s: granule_twa differs from the kernel %s\n", x->name, m,
+                                wide == 1 ? " wide" : wide ? " narrow" : "", simd_name());
+                        failures++;
+                    }
                 }
                 size_t k[2] = {
                     lttb_argmax(x->type, ts, sl, m, ts[0] - 5000, 0, 1.5, (double)(t - (uint64_t)ts[0]), -3),
