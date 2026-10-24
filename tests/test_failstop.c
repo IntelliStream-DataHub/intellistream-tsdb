@@ -316,6 +316,17 @@ static bool is_failed(tsdb *db, const char *expect)
         fprintf(stderr, "failure message \"%s\" lacks \"%s\"\n", msg, expect);
         failures++;
     }
+    /* the per-volume flag that tsdbd --metrics-port reports as tsdb_failed agrees */
+    int any = 0;
+    for (uint32_t i = 0; i < tsdb_volume_count(db); i++) {
+        tsdb_volume_stats vs;
+        if (tsdb_get_volume_stats(db, i, &vs) == 0)
+            any |= vs.failed;
+    }
+    if (any != (rc == TSDB_ERR_IO)) {
+        fprintf(stderr, "tsdb_get_volume_stats: failed=%d, tsdb_failed=%d\n", any, rc);
+        failures++;
+    }
     return rc == TSDB_ERR_IO;
 }
 

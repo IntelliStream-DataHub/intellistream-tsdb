@@ -21,7 +21,10 @@
  *
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
- *         [--verify-checksums]
+ *         [--verify-checksums] [--metrics-port N [--metrics-bind ADDR]]
+ *
+ * --metrics-port serves Prometheus metrics (GET /metrics) on a port of its own, from a
+ * thread of its own: see metrics.c. Off by default; binds to --listen unless --metrics-bind.
  *
  * --verify-checksums checks each granule's checksum before a query decodes it
  * (off by default: meant for storage without checksums of its own).
@@ -51,6 +54,7 @@
 #include "tsdb.h"
 #include "tsdb_protocol.h"
 #include "../client/tsdb_pack.h"
+#include "metrics.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -245,6 +249,8 @@ static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t al
                   const void *d, size_t dlen)
 {
     size_t body = 4 + 1 + 4 + alen + blen + dlen;
+    if (status)
+        metrics_error(status);
     uint8_t hdr[13];
     put32(hdr, (uint32_t)body);
     put32(hdr + 4, id);
@@ -859,6 +865,11 @@ static void handle(req *r)
     }
     default: rc = TSDB_ERR_INVALID; break;
     }
+    if (rc == 0 && (r->op == TSDB_OP_INSERT || r->op == TSDB_OP_INSERT_VALUES)) {
+        uint32_t n;
+        memcpy(&n, p, 4); /* the length was checked: it has the row count */
+        metrics_rows_inserted(n);
+    }
     reply_status(c, r->id, rc);
 }
 
@@ -880,7 +891,9 @@ static void *worker_main(void *arg)
         if (!work_head)
             work_tail = NULL;
         pthread_mutex_unlock(&work_lock);
+        int64_t began = metrics_request_begin();
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
+        metrics_request_end(r->op, began);
         if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_AGG || r->op == TSDB_OP_QUERY_GROUP ||
             r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS || r->op == TSDB_OP_QUERY_BOUNDS ||
             r->op == TSDB_OP_QUERY_LTTB) {
@@ -1035,6 +1048,7 @@ static void dispatch(conn *c)
 static void conn_free(conn *c)
 {
     nconns--;
+    metrics_conn_closed();
     if (c->prev)
         c->prev->next = c->next;
     else
@@ -1190,6 +1204,7 @@ static void on_accept(int fd)
 {
     if (nconns >= max_conns) {
         close(fd); /* over the limit: the client sees the connection closed */
+        metrics_conn_rejected();
         return;
     }
     int one = 1;
@@ -1234,6 +1249,7 @@ static void on_accept(int fd)
         conns->prev = c;
     conns = c;
     nconns++;
+    metrics_conn_opened();
     submit_recv(c);
 }
 
@@ -1376,6 +1392,14 @@ static void ep_loop(void)
     }
 }
 
+static size_t workers_now(void)
+{
+    pthread_mutex_lock(&work_lock);
+    size_t n = (size_t)running_workers;
+    pthread_mutex_unlock(&work_lock);
+    return n;
+}
+
 /* Accepts connections until the listening socket is shut down. */
 static void *accept_main(void *arg)
 {
@@ -1488,8 +1512,11 @@ int main(int argc, char **argv)
                                    {"send-timeout", required_argument, 0, 'T'},
                                    {"io", required_argument, 0, 'I'},
                                    {"verify-checksums", no_argument, 0, 'V'},
+                                   {"metrics-port", required_argument, 0, 'M'},
+                                   {"metrics-bind", required_argument, 0, 'b'},
                                    {0, 0, 0, 0}};
-    int ch;
+    int ch, metrics_port = 0;
+    const char *metrics_addr = NULL;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
         case 'd': dir = optarg; break;
@@ -1499,6 +1526,15 @@ int main(int argc, char **argv)
         case 's': o.wal_sync_ms = atoi(optarg); break;
         case 'F': o.fsync = 0; break;
         case 'V': o.verify_checksums = 1; break;
+        case 'M': {
+            char *end;
+            long mp = strtol(optarg, &end, 10);
+            if (!*optarg || *end || mp < 1 || mp > 65535)
+                goto usage;
+            metrics_port = (int)mp;
+            break;
+        }
+        case 'b': metrics_addr = optarg; break;
         case 'r': o.read_only = 1; break;
         case 'f': o.follow = 1; break;
         case 'R': o.refresh_ms = atoi(optarg); break;
@@ -1519,11 +1555,13 @@ int main(int argc, char **argv)
         default: goto usage;
         }
     }
-    if (!dir || nworkers < 1 || send_timeout_s < 1) {
+    if (!dir || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
+        (metrics_addr && !metrics_port)) {
     usage:
         fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d] [--workers N] [--wal-sync-ms MS]\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
-                        "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n",
+                        "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"
+                        "             [--metrics-port N [--metrics-bind ADDR]]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
@@ -1544,6 +1582,11 @@ int main(int argc, char **argv)
     }
     int lfd = listen_on(addr, port);
     if (lfd < 0)
+        return 1;
+    int mfd = -1;
+    if (metrics_port)
+        metrics_enable(); /* before any connection: the hooks count from the start */
+    if (metrics_port && (mfd = listen_on(metrics_addr ? metrics_addr : addr, metrics_port)) < 0)
         return 1;
     wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 #ifdef TSDBD_NO_URING
@@ -1586,6 +1629,20 @@ int main(int argc, char **argv)
     signal(SIGHUP, SIG_IGN);  /* nothing to reload; a closing terminal must not take the server down */
     pthread_t *workers = calloc((size_t)nworkers, sizeof *workers);
     base_workers = running_workers = nworkers;
+    if (mfd >= 0) {
+        metrics_cfg mc = {.db = db,
+                          .listen_fd = mfd,
+                          .io = io == IO_URING ? "io_uring" : "epoll",
+                          .role = o.follow ? "follower" : o.read_only ? "read-only" : "writer",
+                          .max_conns = max_conns,
+                          .workers = workers_now};
+        int mrc = metrics_start(&mc);
+        if (mrc != 0) { /* the operator asked for it: a monitoring gap must not be silent */
+            fprintf(stderr, "tsdbd: metrics thread: %s\n", strerror(-mrc));
+            return 1;
+        }
+        fprintf(stderr, "tsdbd: metrics on %s:%d\n", metrics_addr ? metrics_addr : addr, metrics_port);
+    }
     for (int i = 0; i < nworkers; i++)
         pthread_create(&workers[i], NULL, worker_main, NULL);
 
@@ -1608,6 +1665,8 @@ int main(int argc, char **argv)
     pthread_join(acceptor, NULL);
     pthread_join(failwatch, NULL);
     close(lfd);
+    if (mfd >= 0)
+        metrics_stop(); /* before tsdb_close: it reads the database */
     pthread_mutex_lock(&work_lock);
     work_stop = true;
     pthread_cond_broadcast(&work_cv);

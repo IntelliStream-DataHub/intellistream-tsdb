@@ -1220,6 +1220,14 @@ int tsdb_get_stats(tsdb *t, tsdb_stats *st)
     return 0;
 }
 
+int tsdb_get_volume_stats(tsdb *t, uint32_t volume, tsdb_volume_stats *st)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    int rc = volume < t->nvols ? eng_get_volume_stats(t->vols[volume], st) : TSDB_ERR_INVALID;
+    pthread_rwlock_unlock(&t->lock);
+    return rc;
+}
+
 int tsdb_foreach_part(tsdb *t, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx)
 {
     pthread_rwlock_rdlock(&t->lock);

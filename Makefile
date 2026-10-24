@@ -251,8 +251,11 @@ $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/tsdbd: server/tsdbd.c include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -o $@ $< $(B)/tsdb_pack.o $(LIB) $(LDLIBS) $(URING_LIBS)
+# The version shown by tsdb_build_info; part of the tsdbd.o flags, so a change rebuilds only that.
+TSDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
+
+$(B)/tsdbd: server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c $(B)/tsdb_pack.o $(LIB) $(LDLIBS) $(URING_LIBS)
 
 CLIB := $(B)/libtsdbclient.a
 
@@ -277,8 +280,8 @@ $(B)/scale-bench: tools/scale-bench.c client/tsdb_client.h tools/common.h tools/
 $(B)/test_stability: tests/test_stability.c $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
-$(B)/test_server: tests/test_server.c tests/samekeys.h tests/lttb_ref.h $(CLIB) $(LIB)
-	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+$(B)/test_server: tests/test_server.c tests/samekeys.h tests/lttb_ref.h server/metrics.c server/metrics.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/metrics.c $(CLIB) $(LIB) $(LDLIBS)
 
 $(B)/test_follow: tests/test_follow.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

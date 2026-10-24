@@ -344,6 +344,21 @@ typedef struct tsdb_stats {
 } tsdb_stats;
 int tsdb_get_stats(tsdb *db, tsdb_stats *st);
 
+/* One volume's numbers, for monitoring (tsdbd --metrics-port). Cheap: counters are atomics, the
+ * part list is walked once under its lock. TSDB_ERR_INVALID for a volume >= tsdb_volume_count. */
+typedef struct tsdb_volume_stats {
+    uint64_t parts, partitions, rows, bytes, granules;
+    uint64_t memtable_rows;
+    uint64_t merges, merged_rows;
+    uint64_t merging_parts;  /* parts a running merge is reading now (gauge) */
+    uint64_t wal_bytes;      /* written to the WAL since open, record headers included */
+    uint64_t wal_syncs;      /* WAL fdatasyncs since open (0 with fsync off) */
+    uint64_t broken_parts, follow_errors;
+    int64_t follow_refresh_age_ms;   /* follower: time since its last successful refresh; 0 for a writer */
+    int failed;              /* fail-stop state of this volume (see tsdb_failed) */
+} tsdb_volume_stats;
+int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
+
 /* Fail-stop. A storage error after which it is unknown what reached the disk
  * (a failed WAL write or fsync, a failed fsync of the directory after new
  * parts were named, a failed MANIFEST, series or state dictionary or CATALOG
