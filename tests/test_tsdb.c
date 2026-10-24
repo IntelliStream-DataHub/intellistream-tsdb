@@ -618,9 +618,16 @@ static void test_db(const char *dir)
         closedir(d);
     }
     snprintf(path, sizeof path, "%s/p0_999999_999999_0.part", dir);
-    fd = open(path, O_CREAT | O_WRONLY, 0644); /* garbage part: moved aside */
+    fd = open(path, O_CREAT | O_WRONLY, 0644); /* garbage part: the open fails until it is moved aside */
     CHECK(fd >= 0 && write(fd, "garbage garbage garbage garbage garbage garbage garbage garbage garbage", 71) == 71);
     close(fd);
+    CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_CORRUPT);
+    CHECK(count_files(dir, ".broken") == 0);
+    {
+        char broken[600];
+        snprintf(broken, sizeof broken, "%s.broken", path);
+        CHECK(rename(path, broken) == 0);
+    }
     OK(tsdb_open(dir, &o, &db));
     CHECK(count_files(dir, ".broken") == 1);
     snprintf(path, sizeof path, "%s/tmp_1_1.part", dir);
