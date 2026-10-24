@@ -1082,6 +1082,25 @@ int tsdb_query_values(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
     return rc;
 }
 
+int tsdb_query_lttb(tsdb *t, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+                    void *ctx)
+{
+    if (threshold < 3)
+        return TSDB_ERR_INVALID;
+    eng *e;
+    uint32_t local;
+    qrun qr;
+    qs_begin(&qr);
+    vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
+    int rc = 0;
+    if (route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0)
+        rc = eng_query_lttb(e, local, start, end, threshold, vals_cb, &o);
+    qs_end(&qr, o.type, o.rows);
+    free(o.valid);
+    free(o.bytes);
+    return rc;
+}
+
 int tsdb_query_agg(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
                    size_t *nout)
 {

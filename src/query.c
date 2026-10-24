@@ -27,6 +27,7 @@
  */
 #include "internal.h"
 
+#include <math.h>
 #include <stdlib.h>
 
 #define MAX_BUCKETS (64u << 20)
@@ -1050,6 +1051,438 @@ int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool 
             rc = 0;
     } else {
         rc = raw_range(db, cc, &sn, series, type, start, end, fn, ctx);
+    }
+    cc_put(db, cc);
+    snapshot_release(&sn);
+    return rc;
+}
+
+/* ------------------------------------------------------------------- lttb */
+
+/* Largest-Triangle-Three-Buckets (Steinarsson 2013) over the known, finite
+ * points of one series: point 0 and point n - 1 are kept; points 1 .. n - 2
+ * fall into nb = threshold - 2 buckets, bucket b holding [lttb_start(b),
+ * lttb_start(b + 1)) as the paper bounds them; from each bucket the point
+ * with the largest triangle (previously chosen point, the point, the mean of
+ * the next bucket) is kept.
+ * The bucket after the last one, whose mean the last choice uses, is
+ * [lttb_start(nb), n): the last point, or the last two where nb * every
+ * rounds below n - 2.
+ *
+ * The bucket boundaries need n, so a first pass counts the points: from the
+ * granule index where a granule lies inside the range, overlaps no other
+ * source and its statistics show no NaN or infinity (its float sum is finite),
+ * by streaming the rest. Choosing in bucket b needs the mean of bucket b + 1,
+ * known only once that bucket is read. Two exact ways, both on one snapshot:
+ *  - buffered: one pass that keeps the points of two buckets (16 bytes each);
+ *  - two passes: the means of every bucket first, then the choice while
+ *    streaming again, with O(threshold) memory.
+ * Buffered is used while two buckets fit in lttb_buffer_bytes; it decodes the
+ * range once instead of twice. Both add the coordinates in time order, so they
+ * choose the same points. */
+size_t lttb_buffer_bytes = 32u << 20;
+
+typedef struct lttb_buf {
+    int64_t *ts;
+    uint64_t *v; /* slot bits, zero-extended */
+    size_t n;
+} lttb_buf;
+
+typedef struct lttb_run {
+    int type;
+    size_t w;
+    uint64_t n, nb; /* points, buckets (threshold - 2) */
+    double every;   /* (n - 2) / nb, the paper's bucket width */
+    bool buffered;
+    int pass;       /* two passes: 1 sums the buckets, 2 chooses */
+    uint64_t i;     /* index of the next point */
+    uint64_t b;     /* bucket of the points being read; nb is the last point */
+    uint64_t bend;  /* first point of bucket b + 1 */
+    int64_t t0;     /* x is milliseconds since the first point */
+    double ax, ay;  /* the point chosen last */
+    double sx, sy;  /* sums of bucket b */
+    uint64_t cnt;
+    lttb_buf cur, nxt; /* buffered: bucket b - 1 (to choose from) and bucket b */
+    double *mx, *my;   /* two passes: mean of bucket b at [b - 1], b = 1 .. nb */
+    double best;       /* two passes: the choice so far in bucket b */
+    int64_t bts;
+    uint64_t bv;
+    double bx, by;
+    int64_t lts;       /* the last point read */
+    uint64_t lv;
+    int64_t ots[256];  /* chosen points not yet sent */
+    uint64_t ov[256];
+    uint8_t oslots[256 * 8];
+    size_t on;
+    slot_fn fn;
+    void *ctx;
+    int err;
+} lttb_run;
+
+/* A point's value as a double; false for nulls, NaN and infinities, which are
+ * not points (they have no place on a chart and would poison the means). */
+static inline bool lttb_value(int type, uint64_t x, double *y)
+{
+    switch (type) {
+    case TSDB_FLOAT32: {
+        float f;
+        uint32_t u = (uint32_t)x;
+        memcpy(&f, &u, 4);
+        *y = f;
+        return u != NULL_F32 && isfinite(f);
+    }
+    case TSDB_FLOAT64: {
+        double d;
+        memcpy(&d, &x, 8);
+        *y = d;
+        return x != NULL_F64 && isfinite(d);
+    }
+    case TSDB_INT64: *y = (double)(int64_t)x; return x != (uint64_t)NULL_I64;
+    default: *y = (double)x; return x != NULL_BOOL;
+    }
+}
+
+/* first point of bucket b (b <= nb): floor(b * every) + 1 in doubles, as in the
+ * paper's code, ClickHouse and the TimescaleDB toolkit, so that the same
+ * points come out. Exact integer division would differ where b * every rounds
+ * below an integer (n = 17, threshold 13: bucket 11 starts at 15, not 16). */
+static inline uint64_t lttb_start(const lttb_run *r, uint64_t b)
+{
+    return (uint64_t)floor((double)b * r->every) + 1;
+}
+
+static inline double lttb_x(const lttb_run *r, int64_t ts) { return (double)((uint64_t)ts - (uint64_t)r->t0); }
+
+/* the triangle's area, computed as in the paper */
+static inline double lttb_area(double ax, double ay, double cx, double cy, double x, double y)
+{
+    return fabs((ax - cx) * (y - ay) - (ax - x) * (cy - ay)) * 0.5;
+}
+
+static int lttb_flush_out(lttb_run *r)
+{
+    if (!r->on)
+        return 0;
+    for (size_t k = 0; k < r->on; k++)
+        slot_put(r->oslots, r->w, k, r->ov[k]);
+    size_t n = r->on;
+    r->on = 0;
+    if (r->fn(r->ctx, r->ots, r->oslots, n)) {
+        r->err = TSDB_ERR_STOPPED;
+        return 1;
+    }
+    return 0;
+}
+
+static int lttb_emit(lttb_run *r, int64_t ts, uint64_t v)
+{
+    r->ots[r->on] = ts;
+    r->ov[r->on++] = v;
+    return r->on == 256 ? lttb_flush_out(r) : 0;
+}
+
+/* buffered: bucket b is complete; choose from bucket b - 1 with its mean */
+static int lttb_choose_buffered(lttb_run *r)
+{
+    if (r->b >= 1) {
+        double cx = r->sx / (double)r->cnt, cy = r->sy / (double)r->cnt, best = -1;
+        size_t k = 0;
+        for (size_t j = 0; j < r->cur.n; j++) {
+            double y;
+            lttb_value(r->type, r->cur.v[j], &y);
+            double a = lttb_area(r->ax, r->ay, cx, cy, lttb_x(r, r->cur.ts[j]), y);
+            if (a > best) { /* the first of equal areas wins */
+                best = a;
+                k = j;
+            }
+        }
+        lttb_value(r->type, r->cur.v[k], &r->ay);
+        r->ax = lttb_x(r, r->cur.ts[k]);
+        if (lttb_emit(r, r->cur.ts[k], r->cur.v[k]))
+            return 1;
+    }
+    lttb_buf t = r->cur;
+    r->cur = r->nxt;
+    r->nxt = t;
+    r->nxt.n = 0;
+    return 0;
+}
+
+/* bucket b is complete */
+static int lttb_finish_bucket(lttb_run *r)
+{
+    if (r->buffered) {
+        if (lttb_choose_buffered(r))
+            return 1;
+    } else if (r->pass == 1) {
+        if (r->b >= 1) {
+            r->mx[r->b - 1] = r->sx / (double)r->cnt;
+            r->my[r->b - 1] = r->sy / (double)r->cnt;
+        }
+    } else if (r->b < r->nb) {
+        r->ax = r->bx;
+        r->ay = r->by;
+        if (lttb_emit(r, r->bts, r->bv))
+            return 1;
+    }
+    r->sx = r->sy = 0;
+    r->cnt = 0;
+    r->best = -1;
+    return 0;
+}
+
+static int lttb_point(lttb_run *r, int64_t ts, uint64_t v, double y)
+{
+    uint64_t i = r->i++;
+    r->lts = ts;
+    r->lv = v;
+    if (i >= r->n) {
+        r->err = TSDB_ERR_CORRUPT; /* the count disagrees with the rows */
+        return 1;
+    }
+    if (i == 0) {
+        r->t0 = ts;
+        r->ax = 0;
+        r->ay = y;
+        r->b = 0;
+        r->bend = lttb_start(r, 1);
+        r->best = -1;
+        return r->pass == 1 ? 0 : lttb_emit(r, ts, v);
+    }
+    if (i == r->bend) {
+        if (lttb_finish_bucket(r))
+            return 1;
+        r->b++;
+        r->bend = r->b < r->nb ? lttb_start(r, r->b + 1) : r->n;
+    }
+    double x = lttb_x(r, ts);
+    if (r->buffered) {
+        r->nxt.ts[r->nxt.n] = ts;
+        r->nxt.v[r->nxt.n++] = v;
+    } else if (r->pass == 2 && r->b < r->nb) {
+        double a = lttb_area(r->ax, r->ay, r->mx[r->b], r->my[r->b], x, y);
+        if (a > r->best || r->cnt == 0) { /* the first of equal areas wins */
+            r->best = a > r->best ? a : r->best;
+            r->bts = ts;
+            r->bv = v;
+            r->bx = x;
+            r->by = y;
+        }
+    }
+    r->sx += x;
+    r->sy += y;
+    r->cnt++;
+    return 0;
+}
+
+/* raw rows to lttb_point, without nulls, NaN and infinities */
+static int lttb_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_run *r = arg;
+    for (size_t k = 0; k < n; k++) {
+        uint64_t x = slot_get(v, r->w, k);
+        double y;
+        if (lttb_value(r->type, x, &y) && lttb_point(r, ts[k], x, y))
+            return 1;
+    }
+    return 0;
+}
+
+/* n <= threshold: every point, in runs straight from the decode buffers */
+static int lttb_all_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_run *r = arg;
+    size_t k = 0;
+    while (k < n) {
+        double y;
+        while (k < n && !lttb_value(r->type, slot_get(v, r->w, k), &y))
+            k++;
+        size_t a = k;
+        while (k < n && lttb_value(r->type, slot_get(v, r->w, k), &y))
+            k++;
+        if (k > a) {
+            r->i += k - a;
+            if (r->fn(r->ctx, ts + a, (const uint8_t *)v + a * r->w, k - a)) {
+                r->err = TSDB_ERR_STOPPED;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int lttb_count_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_run *r = arg;
+    for (size_t k = 0; k < n; k++) {
+        double y;
+        r->n += lttb_value(r->type, slot_get(v, r->w, k), &y);
+    }
+    return 0;
+}
+
+/* The known, finite points in [start, end), as one read of the snapshot would
+ * see them: granules alone in their time span count from the index. */
+static int lttb_count(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series, lttb_run *r, int64_t start,
+                      int64_t end)
+{
+    size_t cap = sn->nmem + 16, nitem = 0;
+    item *items = malloc(cap * sizeof *items);
+    int rc = items ? 0 : TSDB_ERR_NOMEM;
+    for (uint32_t s = 0; rc == 0 && s < sn->np; s++) {
+        uint32_t gi, gj;
+        part_find(sn->parts[s], series, start, end, &gi, &gj);
+        for (uint32_t k = gi; k < gj; k++) {
+            if (nitem == cap) {
+                item *i2 = realloc(items, (cap *= 2) * sizeof *items);
+                if (!i2) {
+                    rc = TSDB_ERR_NOMEM;
+                    break;
+                }
+                items = i2;
+            }
+            const granule *g = &sn->parts[s]->g[k];
+            items[nitem++] = (item){g->ts_min, g->ts_max, s, g};
+        }
+    }
+    for (size_t m = 0; rc == 0 && m < sn->nmem; m++) {
+        const mem_run *mr = &sn->mem[m];
+        size_t lo = lower_bound_i64(mr->ts, mr->n, start), hi = lower_bound_i64(mr->ts, mr->n, end);
+        if (lo >= hi)
+            continue;
+        if (nitem == cap) {
+            item *i2 = realloc(items, (cap *= 2) * sizeof *items);
+            if (!i2) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            items = i2;
+        }
+        items[nitem++] = (item){mr->ts[lo], mr->ts[hi - 1], (uint32_t)(sn->np + m), NULL};
+    }
+    if (rc == 0)
+        qsort(items, nitem, sizeof *items, cmp_item);
+    for (size_t a = 0; a < nitem && rc == 0;) {
+        size_t b = a + 1;
+        int64_t hi = items[a].hi;
+        bool multi = false;
+        while (b < nitem && items[b].lo <= hi) {
+            multi |= items[b].src != items[a].src;
+            hi = MAX(hi, items[b].hi);
+            b++;
+        }
+        for (size_t k = a; k < b && rc == 0; k++) {
+            const granule *g = items[k].g;
+            if (!multi && g && g->ts_min >= start && g->ts_max < end &&
+                (type_is_int(r->type) || isfinite(g->fsum))) {
+                r->n += g->count - g->nulls; /* a NaN or an infinity makes the sum NaN or infinite */
+                continue;
+            }
+            /* a cluster of several sources goes through the deduplicating merge at once */
+            int64_t lo = multi ? items[a].lo : items[k].lo, h = multi ? hi : items[k].hi;
+            lo = MAX(lo, start);
+            h = MIN(h, end - 1);
+            if (lo <= h)
+                rc = raw_range(db, cc, sn, series, r->type, lo, h + 1, lttb_count_cb, r);
+            if (multi)
+                break;
+        }
+        a = b;
+    }
+    free(items);
+    return rc;
+}
+
+int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, slot_fn fn, void *ctx)
+{
+    if (threshold < 3)
+        return TSDB_ERR_INVALID;
+    int type = eng_series_type(db, series);
+    if (type == TSDB_STATE)
+        return TSDB_ERR_INVALID;
+    if (start >= end || type < 0)
+        return 0;
+    snapshot sn;
+    int rc = snapshot_take(db, series, type_width(type), start, end, &sn);
+    if (rc)
+        return rc;
+    codec_ctx *cc = cc_get(db);
+    if (!cc) {
+        snapshot_release(&sn);
+        return TSDB_ERR_NOMEM;
+    }
+    lttb_run *r = calloc(1, sizeof *r);
+    if (!r) {
+        rc = TSDB_ERR_NOMEM;
+        goto out;
+    }
+    r->type = type;
+    r->w = type_width(type);
+    r->fn = fn;
+    r->ctx = ctx;
+    /* statistics describe one read of the range: the count and the means are extra passes */
+    qstats *mine = cur_qstats;
+    cur_qstats = NULL;
+    rc = lttb_count(db, cc, &sn, series, r, start, end);
+    cur_qstats = mine;
+    if (rc || r->n == 0)
+        goto out;
+    if (r->n <= threshold) {
+        rc = raw_range(db, cc, &sn, series, type, start, end, lttb_all_cb, r);
+    } else {
+        r->nb = threshold - 2;
+        r->every = (double)(r->n - 2) / (double)r->nb;
+        /* the largest bucket: floor(e) + 1 points, one more for rounding; bucket nb (the
+         * last mean) holds n - lttb_start(nb) <= 2 */
+        uint64_t per = (r->n - 2) / r->nb + 2;
+        r->buffered = per <= lttb_buffer_bytes / 32;
+        if (r->buffered) {
+            r->cur.ts = malloc(per * sizeof(int64_t));
+            r->cur.v = malloc(per * sizeof(uint64_t));
+            r->nxt.ts = malloc(per * sizeof(int64_t));
+            r->nxt.v = malloc(per * sizeof(uint64_t));
+            if (!r->cur.ts || !r->cur.v || !r->nxt.ts || !r->nxt.v) {
+                rc = TSDB_ERR_NOMEM;
+                goto out;
+            }
+        } else {
+            r->mx = malloc(r->nb * sizeof *r->mx);
+            r->my = malloc(r->nb * sizeof *r->my);
+            if (!r->mx || !r->my) {
+                rc = TSDB_ERR_NOMEM;
+                goto out;
+            }
+            r->pass = 1;
+            cur_qstats = NULL;
+            rc = raw_range(db, cc, &sn, series, type, start, end, lttb_cb, r);
+            cur_qstats = mine;
+            if (rc == 0 && r->i != r->n)
+                rc = TSDB_ERR_CORRUPT; /* no means for the last buckets: send nothing */
+            if (rc == 0)
+                lttb_finish_bucket(r); /* the mean of the last bucket */
+            r->pass = 2;
+            r->i = 0;
+            r->sx = r->sy = 0;
+            r->cnt = 0;
+        }
+        if (rc == 0)
+            rc = raw_range(db, cc, &sn, series, type, start, end, lttb_cb, r);
+        if (rc == 0 && r->i == r->n && !lttb_finish_bucket(r) && !lttb_emit(r, r->lts, r->lv))
+            lttb_flush_out(r);
+    }
+    if (rc == TSDB_ERR_STOPPED || (rc == 0 && r->err))
+        rc = r->err ? r->err : TSDB_ERR_STOPPED;
+    if (rc == 0 && r->i != r->n)
+        rc = TSDB_ERR_CORRUPT; /* the granule index promised more points than the parts hold */
+out:
+    if (r) {
+        free(r->cur.ts);
+        free(r->cur.v);
+        free(r->nxt.ts);
+        free(r->nxt.v);
+        free(r->mx);
+        free(r->my);
+        free(r);
     }
     cc_put(db, cc);
     snapshot_release(&sn);

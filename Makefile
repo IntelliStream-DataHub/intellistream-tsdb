@@ -91,7 +91,7 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/tsdbd $(B)/libcrashfs.so
+test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/tsdbd $(B)/libcrashfs.so
 	./$(B)/test_tsdb
 	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
@@ -99,6 +99,7 @@ test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/t
 	./$(B)/test_types
 	./$(B)/test_levels
 	./$(B)/test_group
+	./$(B)/test_lttb
 	./$(B)/test_follow
 	./$(B)/test_volumes
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
@@ -153,7 +154,7 @@ GLIBC_MAX  ?= 2.34
 DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tools/glibc-compat.h" \
               CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
 DIST_BINS   = tsdbd tsdb codec-bench type-bench tsdb-bench insert-bench tsdbc-bench scale-bench
-DIST_TESTS  = test_tsdb test_types test_levels test_group test_follow test_volumes test_server test_stability
+DIST_TESTS  = test_tsdb test_types test_levels test_group test_lttb test_follow test_volumes test_server test_stability
 DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS))
 
 DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
@@ -296,6 +297,9 @@ $(B)/test_levels: tests/test_levels.c tools/datasets.h src/internal.h src/levels
 # links against libtsdb.so, as the embedded bindings do; run with LD_LIBRARY_PATH=$(B)
 $(B)/test_shared: tests/test_shared.c $(B)/libtsdb.so
 	$(CC) $(CFLAGS) -o $@ $< -L$(B) -ltsdb -ldl
+
+$(B)/test_lttb: tests/test_lttb.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/test_group: tests/test_group.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
