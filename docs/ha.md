@@ -405,6 +405,11 @@ A series is addressed by `(path, name)`: the absolute path of its volume, as lis
 
 ## 9. Protocol changes (version 5)
 
+> Numbering: protocol version 5 has since been used by LTTB downsampling (QUERY_LTTB, 2026-10-24). The
+> changes in this design ship as the next free version (6 or later); read "version 5"/"v5" in this document
+> as "the failover protocol version".
+
+
 There is no release yet, so version 5 replaces versions 1-4 (D32). The server refuses a HELLO below 5, and any frame before HELLO, with INVALID and closes the connection. The protocol may keep changing before 1.0, provided the C, Rust, Python and Java clients change in the same commit (AGENTS.md). Ops that exist only for older layouts (INSERT, and the float32-only QUERY_RAW and QUERY_AGG) may be removed in the same change; nothing here depends on them. On-disk compatibility is not affected.
 
 **HELLO.**
