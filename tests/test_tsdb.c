@@ -1617,6 +1617,119 @@ static void test_idle_merge(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+/* tsdb_get_volume_stats: what tsdbd --metrics-port reports. */
+static void test_volume_stats(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-vstats-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.granule_rows = 256;
+    o.fsync = 1;
+    o.wal_sync_ms = 0;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    CHECK(tsdb_volume_count(db) == 1);
+    tsdb_volume_stats vs;
+    CHECK(tsdb_get_volume_stats(db, 1, &vs) == TSDB_ERR_INVALID);
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    CHECK(vs.rows == 0 && vs.parts == 0 && vs.wal_bytes == 0 && vs.failed == 0 && vs.follow_refresh_age_ms == 0);
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    enum { N = 2000 };
+    int64_t ts[N];
+    float v[N];
+    for (int i = 0; i < N; i++) {
+        ts[i] = 1700000000000 + (int64_t)i * 1000;
+        v[i] = (float)i;
+    }
+    OK(tsdb_insert_series(db, id, ts, v, N));
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    CHECK(vs.memtable_rows == N && vs.rows == 0);
+    CHECK(vs.wal_bytes >= (uint64_t)N * 16); /* a WAL row is at least 16 bytes */
+    CHECK(vs.wal_syncs >= 1);               /* sync mode: the insert returned after an fdatasync */
+    uint64_t wal1 = vs.wal_bytes;
+    OK(tsdb_flush(db));
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    CHECK(vs.memtable_rows == 0 && vs.rows == N && vs.parts == 1 && vs.partitions == 1);
+    CHECK(vs.bytes > 0 && vs.granules == (N + 255) / 256);
+    CHECK(vs.wal_bytes == wal1); /* a flush writes no WAL */
+    tsdb_stats st;
+    OK(tsdb_get_stats(db, &st));
+    CHECK(st.rows == vs.rows && st.bytes == vs.bytes && st.parts == vs.parts);
+    tsdb_close(db);
+
+    /* a follower reports its lag; a writer does not */
+    tsdb_options f;
+    tsdb_options_init(&f);
+    f.follow = 1;
+    f.read_only = 1;
+    f.refresh_ms = 50;
+    OK(tsdb_open(dir, &f, &db));
+    usleep(1000000);
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    /* Refreshing every 50 ms: the age is small. Opening alone would leave it above the 1000 ms slept
+     * (this is what fails if a successful refresh does not update it). */
+    CHECK(vs.rows == N && vs.follow_refresh_age_ms >= 0 && vs.follow_refresh_age_ms < 700);
+    tsdb_close(db);
+    rm_rf(dir);
+}
+
+static void *optimize_thread(void *arg)
+{
+    OK(tsdb_optimize((tsdb *)arg));
+    return NULL;
+}
+
+/* tsdb_volume_stats.merging_parts is non-zero while a merge runs, and 0 again after. */
+static void test_merging_parts(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-mparts-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0; /* only tsdb_optimize merges: the part count stays what the test made */
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    enum { PARTS = 8, N = 100000 };
+    int64_t *ts = malloc(N * sizeof *ts);
+    float *v = malloc(N * sizeof *v);
+    for (int k = 0; k < PARTS; k++) {
+        for (int i = 0; i < N; i++) {
+            ts[i] = 1700000000000 + ((int64_t)k * N + i) * 10;
+            v[i] = (float)((i * 7919) % 1000) * 0.37f;
+        }
+        OK(tsdb_insert_series(db, id, ts, v, N));
+        OK(tsdb_flush(db));
+    }
+    tsdb_volume_stats vs;
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    CHECK(vs.parts >= PARTS && vs.merging_parts == 0); /* the 8 s of data may cross a partition boundary */
+    pthread_t th;
+    pthread_create(&th, NULL, optimize_thread, db);
+    uint64_t most = 0;
+    for (int i = 0; i < 2000000; i++) { /* sample until the merge is over */
+        OK(tsdb_get_volume_stats(db, 0, &vs));
+        if (vs.merging_parts > most)
+            most = vs.merging_parts;
+        if (vs.parts == vs.partitions && vs.merges >= 1)
+            break;
+    }
+    pthread_join(th, NULL);
+    CHECK(most >= 2); /* a merge reads at least two parts */
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    CHECK(vs.merging_parts == 0 && vs.merges >= 1 && vs.parts == vs.partitions);
+    free(ts);
+    free(v);
+    tsdb_close(db);
+    rm_rf(dir);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -1647,6 +1760,9 @@ int main(int argc, char **argv)
     test_same_keys(base);
     printf("idle partitions merged\n");
     test_idle_merge(base);
+    printf("volume statistics\n");
+    test_volume_stats(base);
+    test_merging_parts(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

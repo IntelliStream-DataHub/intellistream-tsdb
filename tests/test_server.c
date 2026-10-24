@@ -4,10 +4,12 @@
 #include "tsdb_client.h"
 #include "tsdb_pack.h"
 #include "tsdb_protocol.h"
+#include "metrics.h"
 #include "samekeys.h"
 #include "lttb_ref.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -20,6 +22,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static int failures;
@@ -1308,6 +1312,822 @@ static void test_wal_failstop(const char *dir)
         failures++;
 }
 
+/* ------------------------------------------------------------ metrics endpoint */
+
+static int mport;
+
+static int metrics_connect(void)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)mport)};
+    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Sends req (n bytes) and reads until the server closes or `wait_s` passes. Returns the
+ * malloc'd reply (NUL-terminated), its length in *len; NULL when the connection failed. */
+static char *http_exchange(const char *req, size_t n, int wait_s, size_t *len)
+{
+    int fd = metrics_connect();
+    if (fd < 0)
+        return NULL;
+    struct timeval tv = {wait_s, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    for (size_t sent = 0; sent < n;) {
+        ssize_t w = send(fd, req + sent, n - sent, MSG_NOSIGNAL);
+        if (w <= 0)
+            break; /* the server may already have answered and closed */
+        sent += (size_t)w;
+    }
+    size_t cap = 1 << 16, got = 0;
+    char *buf = malloc(cap);
+    for (;;) {
+        if (got + 4096 > cap)
+            buf = realloc(buf, cap *= 2);
+        ssize_t r = recv(fd, buf + got, cap - got - 1, 0);
+        if (r <= 0)
+            break;
+        got += (size_t)r;
+    }
+    buf[got] = '\0';
+    close(fd);
+    *len = got;
+    return buf;
+}
+
+#define HTTP_EXCHANGE(req, wait_s, len) http_exchange(req, sizeof(req) - 1, wait_s, len)
+
+static int http_status(const char *reply) { return strncmp(reply, "HTTP/1.1 ", 9) == 0 ? atoi(reply + 9) : -1; }
+
+/* One parsed sample. */
+typedef struct {
+    char name[96], labels[256];
+    double v;
+} msample;
+typedef struct {
+    msample *s;
+    size_t n, cap;
+} mset;
+
+static bool name_char(char ch, bool first)
+{
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || ch == ':' || (!first && ch >= '0' && ch <= '9');
+}
+
+/* A strict reader of the text exposition format 0.0.4 (what promtool check metrics enforces for the
+ * parts we emit): HELP and TYPE before the samples of a family and once each, names and labels
+ * well formed, quoted label values with only \\ \" \n escapes, numeric values, histogram buckets
+ * cumulative with le="+Inf" equal to _count. Fills `out`; returns false (after saying why) if not. */
+static bool parse_exposition(const char *body, mset *out)
+{
+    struct fam {
+        char name[96], type[16];
+        bool help, sampled;
+    } fams[128];
+    size_t nf = 0;
+    memset(out, 0, sizeof *out);
+    const char *p = body;
+    int lineno = 0;
+#define BAD(...)                                           \
+    do {                                                   \
+        fprintf(stderr, "metrics line %d: ", lineno);      \
+        fprintf(stderr, __VA_ARGS__);                      \
+        fprintf(stderr, "\n");                             \
+        return false;                                      \
+    } while (0)
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        if (!e)
+            BAD("no newline at the end");
+        lineno++;
+        size_t ll = (size_t)(e - p);
+        char line[1024];
+        if (ll >= sizeof line)
+            BAD("line too long");
+        memcpy(line, p, ll);
+        line[ll] = '\0';
+        p = e + 1;
+        if (ll == 0)
+            continue;
+        if (line[0] == '#') {
+            char kind[8], name[96], rest[600] = "";
+            int k = sscanf(line, "# %7s %95s %599[^\n]", kind, name, rest);
+            if (k < 2)
+                continue; /* a plain comment */
+            size_t i;
+            for (i = 0; i < nf && strcmp(fams[i].name, name); i++)
+                ;
+            if (strcmp(kind, "TYPE") == 0) {
+                if (i < nf && fams[i].type[0])
+                    BAD("TYPE of %s twice", name);
+                if (i < nf && fams[i].sampled)
+                    BAD("TYPE of %s after its samples", name);
+                if (k < 3 || !(strcmp(rest, "counter") == 0 || strcmp(rest, "gauge") == 0 || strcmp(rest, "histogram") == 0))
+                    BAD("TYPE %s: unknown type '%s'", name, rest);
+                if (i == nf) {
+                    if (nf == 128)
+                        BAD("too many families");
+                    fams[nf++] = (struct fam){0};
+                    snprintf(fams[i].name, sizeof fams[i].name, "%s", name);
+                }
+                snprintf(fams[i].type, sizeof fams[i].type, "%s", rest);
+                if (strcmp(rest, "counter") == 0 && (strlen(name) < 6 || strcmp(name + strlen(name) - 6, "_total")))
+                    BAD("counter %s does not end in _total", name);
+            } else if (strcmp(kind, "HELP") == 0) {
+                if (i == nf) {
+                    fams[nf] = (struct fam){0};
+                    snprintf(fams[nf].name, sizeof fams[nf].name, "%s", name);
+                    i = nf++;
+                }
+                if (fams[i].help)
+                    BAD("HELP of %s twice", name);
+                fams[i].help = true;
+            }
+            continue;
+        }
+        /* sample: name[{labels}] value */
+        msample sm = {0};
+        const char *q = line;
+        size_t nl = 0;
+        while (name_char(*q, nl == 0) && nl < sizeof sm.name - 1)
+            sm.name[nl++] = *q++;
+        if (nl == 0)
+            BAD("sample without a name: %s", line);
+        if (*q == '{') {
+            const char *lb = ++q;
+            while (*q != '}') {
+                size_t kl = 0;
+                while (name_char(q[kl], kl == 0) && q[kl] != ':')
+                    kl++;
+                if (kl == 0 || q[kl] != '=' || q[kl + 1] != '"')
+                    BAD("bad label in: %s", line);
+                q += kl + 2;
+                for (;;) {
+                    if (*q == '\0')
+                        BAD("unterminated label value: %s", line);
+                    if (*q == '\\') {
+                        if (q[1] != '\\' && q[1] != '"' && q[1] != 'n')
+                            BAD("bad escape: %s", line);
+                        q += 2;
+                    } else if (*q == '"') {
+                        q++;
+                        break;
+                    } else {
+                        q++;
+                    }
+                }
+                if (*q == ',')
+                    q++;
+                else if (*q != '}')
+                    BAD("bad label list: %s", line);
+            }
+            size_t lablen = (size_t)(q - lb);
+            if (lablen >= sizeof sm.labels)
+                BAD("labels too long");
+            memcpy(sm.labels, lb, lablen);
+            q++;
+        }
+        if (*q != ' ')
+            BAD("no space before the value: %s", line);
+        char *endp;
+        sm.v = strtod(q + 1, &endp);
+        if (endp == q + 1 || *endp != '\0')
+            BAD("bad value: %s", line);
+        /* the family: the name itself, or a histogram's _bucket, _sum, _count */
+        size_t i;
+        for (i = 0; i < nf; i++) {
+            size_t fl = strlen(fams[i].name);
+            if (strcmp(fams[i].name, sm.name) == 0 ||
+                (strcmp(fams[i].type, "histogram") == 0 && strncmp(sm.name, fams[i].name, fl) == 0 &&
+                 (strcmp(sm.name + fl, "_bucket") == 0 || strcmp(sm.name + fl, "_sum") == 0 ||
+                  strcmp(sm.name + fl, "_count") == 0)))
+                break;
+        }
+        if (i == nf || !fams[i].type[0] || !fams[i].help)
+            BAD("sample %s without HELP and TYPE before it", sm.name);
+        fams[i].sampled = true;
+        if (out->n == out->cap) {
+            out->cap = out->cap ? out->cap * 2 : 256;
+            out->s = realloc(out->s, out->cap * sizeof *out->s);
+        }
+        out->s[out->n++] = sm;
+    }
+    /* histograms: per label set, buckets cumulative in file order, +Inf last and equal to _count */
+    for (size_t i = 0; i < out->n; i++) {
+        const msample *a = &out->s[i];
+        size_t nl = strlen(a->name);
+        if (nl < 7 || strcmp(a->name + nl - 7, "_bucket"))
+            continue;
+        char base[96], series[256], inf_labels[300];
+        snprintf(base, sizeof base, "%.*s", (int)nl - 7, a->name);
+        const char *le = strstr(a->labels, ",le=\"");
+        if (!le)
+            BAD("bucket without le: %s", a->labels);
+        snprintf(series, sizeof series, "%.*s", (int)(le - a->labels), a->labels);
+        snprintf(inf_labels, sizeof inf_labels, "%s,le=\"+Inf\"", series);
+        if (i + 1 < out->n && strcmp(out->s[i + 1].name, a->name) == 0 && strncmp(out->s[i + 1].labels, series, strlen(series)) == 0 &&
+            out->s[i + 1].v < a->v)
+            BAD("%s buckets decrease", base);
+        if (strcmp(a->labels, inf_labels) == 0) {
+            char cname[128];
+            snprintf(cname, sizeof cname, "%s_count", base);
+            bool found = false;
+            for (size_t j = 0; j < out->n; j++)
+                if (strcmp(out->s[j].name, cname) == 0 && strcmp(out->s[j].labels, series) == 0) {
+                    found = true;
+                    if (out->s[j].v != a->v)
+                        BAD("%s{%s}: _count %g != +Inf bucket %g", base, series, out->s[j].v, a->v);
+                }
+            if (!found)
+                BAD("%s{%s} has no _count", base, series);
+        }
+    }
+#undef BAD
+    return true;
+}
+
+/* Value of the first sample called `name` whose labels contain `lab` (NULL: any); NAN if none. */
+static double mval(const mset *m, const char *name, const char *lab)
+{
+    for (size_t i = 0; i < m->n; i++)
+        if (strcmp(m->s[i].name, name) == 0 && (!lab || strstr(m->s[i].labels, lab)))
+            return m->s[i].v;
+    return NAN;
+}
+
+/* Sum of the values of every sample called `name` (labels ignored). */
+static double msum(const mset *m, const char *name)
+{
+    double t = 0;
+    for (size_t i = 0; i < m->n; i++)
+        if (strcmp(m->s[i].name, name) == 0)
+            t += m->s[i].v;
+    return t;
+}
+
+/* Scrapes /metrics and parses it; fails the test if it does not work. */
+static bool scrape(mset *out)
+{
+    static const char req[] = "GET /metrics HTTP/1.1\r\nHost: x\r\nAccept: text/plain\r\n\r\n";
+    size_t len;
+    char *r = http_exchange(req, sizeof req - 1, 5, &len);
+    if (!r) {
+        CHECK(!"metrics port refused the connection");
+        memset(out, 0, sizeof *out);
+        return false;
+    }
+    char *body = strstr(r, "\r\n\r\n");
+    bool ok = http_status(r) == 200 && body && strstr(r, "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n");
+    if (ok) {
+        body += 4;
+        const char *cl = strstr(r, "Content-Length: ");
+        ok = cl && (size_t)atol(cl + 16) == strlen(body) && parse_exposition(body, out);
+    }
+    if (!ok) {
+        free(out->s); /* a parse that failed halfway has filled it in part */
+        memset(out, 0, sizeof *out);
+    }
+    free(r);
+    CHECK(ok);
+    return ok;
+}
+
+static void mset_free(mset *m)
+{
+    free(m->s);
+    memset(m, 0, sizeof *m);
+}
+
+/* Counters never go down between two scrapes. */
+static void check_monotone(const mset *a, const mset *b)
+{
+    for (size_t i = 0; i < a->n; i++) {
+        size_t nl = strlen(a->s[i].name);
+        bool counter = (nl > 6 && strcmp(a->s[i].name + nl - 6, "_total") == 0) ||
+                       (nl > 7 && strcmp(a->s[i].name + nl - 7, "_bucket") == 0) ||
+                       (nl > 6 && strcmp(a->s[i].name + nl - 6, "_count") == 0) ||
+                       (nl > 4 && strcmp(a->s[i].name + nl - 4, "_sum") == 0);
+        if (!counter)
+            continue;
+        for (size_t j = 0; j < b->n; j++)
+            if (strcmp(b->s[j].name, a->s[i].name) == 0 && strcmp(b->s[j].labels, a->s[i].labels) == 0) {
+                if (b->s[j].v < a->s[i].v) {
+                    fprintf(stderr, "%s{%s} went down: %g -> %g\n", a->s[i].name, a->s[i].labels, a->s[i].v, b->s[j].v);
+                    failures++;
+                }
+                break;
+            }
+    }
+}
+
+typedef struct {
+    uint32_t id;
+    int errors;
+} mjob;
+
+enum { M_THREADS = 4, M_ROUNDS = 20, M_ROWS = 1000, M_QUERIES = 5 };
+
+/* Every TSDB_OP_X in tsdb_protocol.h must have a tsdb_requests_total{op="x"} sample: an op added to the
+ * protocol (by this or another branch) and left out of the table in metrics.c would be counted as
+ * "other" and a query op would miss the latency histogram. */
+static void check_ops_named(const mset *m)
+{
+    const char *paths[] = {"include/tsdb_protocol.h", "../include/tsdb_protocol.h", NULL};
+    FILE *f = NULL;
+    for (int i = 0; paths[i] && !f; i++)
+        f = fopen(paths[i], "r");
+    CHECK(f != NULL);
+    if (!f)
+        return;
+    char line[256];
+    int seen = 0;
+    while (fgets(line, sizeof line, f)) {
+        char name[64];
+        int num;
+        if (sscanf(line, " TSDB_OP_%63[A-Z_] = %d", name, &num) != 2 || strcmp(name, "REPLY") == 0)
+            continue;
+        char want[96];
+        size_t k = 0;
+        for (const char *q = name; *q && k < 60; q++)
+            want[k++] = (char)(*q >= 'A' && *q <= 'Z' ? *q - 'A' + 'a' : *q);
+        want[k] = 0;
+        char lab[128];
+        snprintf(lab, sizeof lab, "op=\"%s\"", want);
+        double v = mval(m, "tsdb_requests_total", lab);
+        CHECK(!isnan(v));
+        if (isnan(v))
+            fprintf(stderr, "TSDB_OP_%s = %d has no tsdb_requests_total{%s}: add it to the ops table in server/metrics.c\n",
+                    name, num, lab);
+        if (strncmp(want, "query_", 6) == 0) /* every query op has a latency histogram */
+            CHECK(!isnan(mval(m, "tsdb_query_duration_seconds_count", lab)));
+        seen++;
+    }
+    fclose(f);
+    CHECK(seen >= 20);
+}
+
+static void *metrics_load_thread(void *arg)
+{
+    mjob *j = arg;
+    tsdbc *c;
+    if (tsdbc_connect("127.0.0.1", port, &c)) {
+        j->errors++;
+        return NULL;
+    }
+    int64_t ts[M_ROWS];
+    float v[M_ROWS];
+    for (int round = 0; round < M_ROUNDS; round++) {
+        for (int i = 0; i < M_ROWS; i++) {
+            ts[i] = T0 + (int64_t)(round * M_ROWS + i) * 1000;
+            v[i] = (float)i;
+        }
+        if (tsdbc_insert_series(c, j->id, ts, v, M_ROWS))
+            j->errors++;
+        if (round % (M_ROUNDS / M_QUERIES) == 0) {
+            tsdb_bucket *b;
+            size_t nb;
+            if (tsdbc_query_agg(c, j->id, INT64_MIN, INT64_MAX, 0, &b, &nb))
+                j->errors++;
+            else
+                free(b);
+        }
+    }
+    tsdb_points p;
+    if (tsdbc_query_points(c, j->id, INT64_MIN, INT64_MAX, &p))
+        j->errors++;
+    else {
+        free(p.ts);
+        free(p.values);
+    }
+    tsdbc_close(c);
+    return NULL;
+}
+
+static int64_t mono_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+}
+
+/* Slowest of n small queries on the main port, microseconds. */
+static int64_t main_port_worst_us(tsdbc *c, uint32_t id, int n)
+{
+    int64_t worst = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t t = mono_us();
+        tsdb_bucket *b;
+        size_t nb;
+        if (tsdbc_query_agg(c, id, T0, T0 + 60000, 0, &b, &nb) == 0)
+            free(b);
+        else
+            CHECK(!"main port query failed");
+        int64_t d = mono_us() - t;
+        if (d > worst)
+            worst = d;
+    }
+    return worst;
+}
+
+static void test_metrics_buckets(void)
+{
+    CHECK(metrics_bucket_for(0) == 0 && metrics_bucket_for(0.0004) == 0 && metrics_bucket_for(0.0005) == 0);
+    CHECK(metrics_bucket_for(0.0006) == 1 && metrics_bucket_for(0.001) == 1);
+    CHECK(metrics_bucket_for(0.003) == 3 && metrics_bucket_for(0.1) == 7 && metrics_bucket_for(0.5) == 9);
+    CHECK(metrics_bucket_for(1) == 10 && metrics_bucket_for(30) == 14); /* bounds are inclusive, as in Prometheus */
+    CHECK(metrics_bucket_for(30.1) == 15 && metrics_bucket_for(1e9) == 15);
+}
+
+static void test_metrics(const char *dir)
+{
+    test_metrics_buckets();
+    char cmd[1200], mps[16];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0) {
+        failures++;
+        return;
+    }
+    mport = port + 1;
+    snprintf(mps, sizeof mps, "%d", mport);
+    const char *extra[] = {"--metrics-port", mps, "--metrics-bind", "127.0.0.1", NULL};
+    pid_t srv = start_server_with(dir, extra);
+
+    /* the endpoint: format, headers, the paths and methods it refuses */
+    mset m0;
+    scrape(&m0);
+    CHECK(mval(&m0, "tsdb_build_info", "version=\"") == 1);
+    CHECK(mval(&m0, "tsdb_role_info", "role=\"writer\"") == 1);
+    const char *iob = getenv("TSDBD_IO");
+    if (iob && strcmp(iob, "auto") != 0 && strcmp(iob, "uring") != 0)
+        CHECK(mval(&m0, "tsdb_io_backend_info", "backend=\"epoll\"") == 1);
+    CHECK(mval(&m0, "tsdb_io_backend_info", NULL) == 1);
+    CHECK(mval(&m0, "tsdb_workers", NULL) == 4);
+    CHECK(mval(&m0, "tsdb_connections_max", NULL) == 10000);
+    CHECK(mval(&m0, "tsdb_failed", NULL) == 0);
+    CHECK(mval(&m0, "tsdb_rows", "volume=\"0\"") == 0);
+    CHECK(mval(&m0, "tsdb_start_time_seconds", NULL) > 1e9);
+    check_ops_named(&m0);
+    mset_free(&m0);
+    size_t len;
+    char *r = HTTP_EXCHANGE("GET /nothing HTTP/1.1\r\n\r\n", 5, &len);
+    CHECK(r && http_status(r) == 404);
+    free(r);
+    r = HTTP_EXCHANGE("GET /metrics?x=1 HTTP/1.0\r\n\r\n", 5, &len);
+    CHECK(r && http_status(r) == 200 && strstr(r, "tsdb_build_info"));
+    free(r);
+    r = HTTP_EXCHANGE("POST /metrics HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody", 5, &len);
+    CHECK(r && http_status(r) == 405);
+    free(r);
+    r = HTTP_EXCHANGE("HEAD /metrics HTTP/1.1\r\n\r\n", 5, &len);
+    CHECK(r && http_status(r) == 200 && strstr(r, "Content-Length: ") && !strstr(r, "tsdb_build_info"));
+    free(r);
+    r = HTTP_EXCHANGE("\x01\xff\xfe garbage\r\n\r\n", 5, &len);
+    CHECK(r && http_status(r) == 400);
+    free(r);
+    {
+        char big[9000];
+        memset(big, 'a', sizeof big);
+        memcpy(big, "GET /metrics HTTP/1.1\r\nX: ", 26);
+        r = http_exchange(big, sizeof big, 5, &len); /* a head that never ends */
+        CHECK(r && http_status(r) == 431);
+        free(r);
+    }
+
+    /* scraping while clients insert and query from several connections */
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    pthread_t th[M_THREADS];
+    mjob jobs[M_THREADS];
+    mset before, prev;
+    scrape(&before);
+    prev = (mset){0};
+    for (int i = 0; i < M_THREADS; i++) {
+        char sname[32];
+        snprintf(sname, sizeof sname, "metrics.%d", i);
+        OK(tsdbc_series(c, sname, 1, &jobs[i].id));
+        jobs[i].errors = 0;
+        pthread_create(&th[i], NULL, metrics_load_thread, &jobs[i]);
+    }
+    int scrapes_during = 0, saw_conns = 0, saw_busy = 0;
+    for (int done = 0; done < 1;) {
+        mset cur;
+        if (scrape(&cur)) {
+            scrapes_during++;
+            if (prev.s)
+                check_monotone(&prev, &cur);
+            saw_conns += mval(&cur, "tsdb_connections", NULL) >= 2; /* mine and the load threads' */
+            saw_busy += mval(&cur, "tsdb_workers_busy", NULL) >= 1;
+            CHECK(mval(&cur, "tsdb_workers_busy", NULL) <= mval(&cur, "tsdb_workers", NULL));
+            mset_free(&prev);
+            prev = cur;
+        }
+        if (scrapes_during >= 400)
+            break;
+        done = 1;
+        for (int i = 0; i < M_THREADS; i++) {
+            /* a thread is finished when its series has all its rows */
+            tsdb_bucket *b;
+            size_t nb;
+            if (tsdbc_query_agg(c, jobs[i].id, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0) {
+                done &= nb == 1 && b[0].count == (uint64_t)M_ROUNDS * M_ROWS;
+                free(b);
+            }
+        }
+    }
+    for (int i = 0; i < M_THREADS; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(jobs[i].errors == 0);
+    }
+    CHECK(scrapes_during >= 3);
+    CHECK(saw_conns >= 1);
+    OK(tsdbc_flush(c));
+    {   /* one request the server refuses: a counted error */
+        int rfd = raw_connect();
+        uint8_t short_payload[3] = {1, 2, 3};
+        uint8_t rest[64];
+        size_t nrest;
+        uint32_t rid;
+        raw_send(rfd, 7, TSDB_OP_QUERY_AGG, short_payload, sizeof short_payload);
+        CHECK(raw_reply(rfd, &rid, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID);
+        close(rfd);
+    }
+    (void)saw_busy; /* busy workers are a snapshot: reported, but too fast here to rely on */
+
+    mset after;
+    scrape(&after);
+    check_monotone(&before, &after);
+    double rows = (double)M_THREADS * M_ROUNDS * M_ROWS;
+    CHECK(mval(&after, "tsdb_inserted_rows_total", NULL) - mval(&before, "tsdb_inserted_rows_total", NULL) == rows);
+    double ins = mval(&after, "tsdb_requests_total", "op=\"insert\"") + mval(&after, "tsdb_requests_total", "op=\"insert_values\"") -
+                 mval(&before, "tsdb_requests_total", "op=\"insert\"") - mval(&before, "tsdb_requests_total", "op=\"insert_values\"");
+    CHECK(ins == (double)M_THREADS * M_ROUNDS);
+    double qcount = 0;
+    for (size_t i = 0; i < after.n; i++)
+        if (strcmp(after.s[i].name, "tsdb_query_duration_seconds_count") == 0)
+            qcount += after.s[i].v;
+    double q0 = msum(&before, "tsdb_query_duration_seconds_count");
+    CHECK(qcount - q0 >= (double)M_THREADS * (M_QUERIES + 1));
+    CHECK(msum(&after, "tsdb_query_duration_seconds_sum") > msum(&before, "tsdb_query_duration_seconds_sum"));
+    {   /* a query of a few thousand rows takes far less than 30 s: it must not sit in the +Inf bucket,
+         * and a fast one is in a bucket at or below 1 s */
+        double agg_inf = mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"+Inf\"");
+        CHECK(agg_inf > 0);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"30\"") == agg_inf);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"1\"") == agg_inf);
+        CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_agg\",le=\"0.0005\"") <= agg_inf);
+    }
+    double inv = mval(&after, "tsdb_request_errors_total", "code=\"invalid\"") - mval(&before, "tsdb_request_errors_total", "code=\"invalid\"");
+    CHECK(inv == 1);
+    if (inv != 1)
+        fprintf(stderr, "invalid errors: %g\n", inv);
+    CHECK(mval(&after, "tsdb_connections_accepted_total", NULL) - mval(&before, "tsdb_connections_accepted_total", NULL) >= M_THREADS);
+    CHECK(mval(&after, "tsdb_rows", "volume=\"0\"") == rows); /* flushed: all in parts */
+    CHECK(mval(&after, "tsdb_memtable_rows", "volume=\"0\"") == 0);
+    CHECK(mval(&after, "tsdb_parts", "volume=\"0\"") >= 1);
+    CHECK(mval(&after, "tsdb_partitions", "volume=\"0\"") >= 1);
+    CHECK(mval(&after, "tsdb_granules", "volume=\"0\"") >= 1);
+    CHECK(mval(&after, "tsdb_disk_bytes", "volume=\"0\"") > 0);
+    CHECK(mval(&after, "tsdb_wal_bytes_total", "volume=\"0\"") >= rows * 16);
+    CHECK(mval(&after, "tsdb_failed", "volume=\"0\"") == 0);
+    CHECK(mval(&after, "tsdb_metrics_scrapes_total", NULL) >= scrapes_during);
+    CHECK(isnan(mval(&after, "tsdb_follow_refresh_age_seconds", NULL))); /* a writer has no lag */
+    mset_free(&before);
+    mset_free(&prev);
+
+    /* a client that went away is no longer a connection */
+    tsdb_stats dummy;
+    OK(tsdbc_stats(c, &dummy));
+    tsdbc_close(c);
+    double conns = 1;
+    for (int i = 0; i < 100 && conns != 0; i++) {
+        mset m;
+        scrape(&m);
+        conns = mval(&m, "tsdb_connections", NULL);
+        mset_free(&m);
+        if (conns != 0)
+            usleep(20000);
+    }
+    CHECK(conns == 0);
+    mset_free(&after);
+
+    /* Hostile scrapers: connections that start a request and never end it, one that sends a byte
+     * every 100 ms, and a crowd of silent ones. The main port is as fast as without them and a
+     * real scrape still works, even with every slot taken. */
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    uint32_t sid;
+    OK(tsdbc_series(c, "metrics.0", 0, &sid));
+    int64_t base_worst = main_port_worst_us(c, sid, 300);
+    enum { SLOW = 30, SILENT = 100 };
+    int slow[SLOW + SILENT];
+    for (int i = 0; i < SLOW + SILENT; i++) {
+        slow[i] = metrics_connect();
+        CHECK(slow[i] >= 0);
+        if (i < SLOW && slow[i] >= 0)
+            CHECK(send(slow[i], "GET /metrics HTTP/1.1\r\nHost: x\r\n", 32, MSG_NOSIGNAL) == 32);
+    }
+    int drip = metrics_connect();
+    int64_t t_start = mono_us();
+    int dripped = 0;
+    int64_t worst = 0;
+    mset m;
+    while (mono_us() - t_start < 1500000) {
+        if (drip >= 0 && send(drip, "G", 1, MSG_NOSIGNAL) == 1)
+            dripped++;
+        int64_t w = main_port_worst_us(c, sid, 20);
+        if (w > worst)
+            worst = w;
+        usleep(100000);
+    }
+    CHECK(dripped >= 5);
+    CHECK(worst < 500000 || worst < 20 * base_worst); /* no stall: a query takes microseconds, allow a noisy machine */
+    int64_t t0s = mono_us();
+    CHECK(scrape(&m));
+    CHECK(mono_us() - t0s < 1000000); /* served at once, not after the idle ones time out */
+    CHECK(mval(&m, "tsdb_metrics_rejected_total", NULL) >= 1); /* the crowd pushed out the oldest */
+    mset_free(&m);
+    /* those that never finished are closed by the server, without a reply, within the deadline */
+    int closed = 0;
+    for (int i = 0; i < SLOW + SILENT; i++) {
+        if (slow[i] < 0)
+            continue;
+        struct timeval tv = {4, 0};
+        setsockopt(slow[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        char b1[64];
+        ssize_t rr = recv(slow[i], b1, sizeof b1, 0);
+        closed += rr == 0 || (rr < 0 && errno == ECONNRESET);
+    }
+    CHECK(closed == SLOW + SILENT);
+    if (drip >= 0) {
+        char b1[64];
+        struct timeval tv = {4, 0};
+        setsockopt(drip, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        CHECK(recv(drip, b1, sizeof b1, 0) <= 0);
+    }
+    for (int i = 0; i < SLOW + SILENT; i++)
+        if (slow[i] >= 0)
+            close(slow[i]);
+    if (drip >= 0)
+        close(drip);
+    CHECK(main_port_worst_us(c, sid, 10) < 500000);
+    CHECK(scrape(&m));
+    mset_free(&m);
+
+    /* Stopping the server with a half-finished scrape connection open is as quick as ever. */
+    int hang = metrics_connect();
+    if (hang >= 0)
+        CHECK(send(hang, "GET /met", 8, MSG_NOSIGNAL) == 8);
+    tsdbc_close(c);
+    int64_t ts0 = mono_us();
+    stop_server(srv);
+    CHECK(mono_us() - ts0 < 3000000);
+    if (hang >= 0)
+        close(hang);
+    CHECK(metrics_connect() < 0); /* the port is closed with the server */
+
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (!failures && system(cmd) != 0)
+        failures++;
+}
+
+/* The parts of the metrics that need their own server: the connection limit, a volume path that needs
+ * label escaping, error codes other than "invalid", merges. */
+static void test_metrics_more(const char *dir)
+{
+    char cmd[2400], mps[16], vol[1100];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0) {
+        failures++;
+        return;
+    }
+    mport = port + 1;
+    snprintf(mps, sizeof mps, "%d", mport);
+    const char *extra[] = {"--metrics-port", mps, "--metrics-bind", "127.0.0.1", "--max-connections", "6", NULL};
+    pid_t srv = start_server_with(dir, extra);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+
+    /* a bad or unavailable --metrics-port is an error at startup, not a silent gap in monitoring */
+    {
+        const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+        const char *bad[] = {"abc", "12x", "0", "70000", "-1", ""};
+        for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+            snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port %d --metrics-port '%s' >/dev/null 2>&1", bin, dir,
+                     port + 7, bad[i]);
+            int st = system(cmd);
+            CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2);
+        }
+        snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port %d --metrics-port %d >/dev/null 2>&1", bin, dir,
+                 port + 7, mport); /* the port the running server holds */
+        int st = system(cmd);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 1);
+        snprintf(cmd, sizeof cmd, "rm -rf '%s.bad'", dir);
+        if (system(cmd) != 0)
+            failures++;
+    }
+
+    /* a volume whose directory name has a double quote and a backslash: the label must be escaped
+     * (Prometheus drops a whole scrape with a malformed line) */
+    snprintf(vol, sizeof vol, "%s.vol\"q\\z", dir);
+    uint32_t vid, sid;
+    OK(tsdbc_series_at(c, "weird", vol, &vid));
+    OK(tsdbc_series(c, "plain", 1, &sid));
+    {
+        mset m;
+        CHECK(scrape(&m)); /* the strict parser rejects an unescaped quote */
+        CHECK(mval(&m, "tsdb_rows", "volume=\"1\"") == 0);
+        bool escaped = false;
+        for (size_t i = 0; i < m.n; i++)
+            escaped |= strcmp(m.s[i].name, "tsdb_rows") == 0 && strstr(m.s[i].labels, ".vol\\\"q\\\\z\"") != NULL;
+        CHECK(escaped);
+        mset_free(&m);
+    }
+
+    /* merges: several parts in a partition, then optimize */
+    for (int k = 0; k < 4; k++) {
+        int64_t ts[100];
+        float v[100];
+        for (int i = 0; i < 100; i++) {
+            ts[i] = 1700000000000 + (int64_t)(k * 100 + i) * 1000;
+            v[i] = (float)i;
+        }
+        OK(tsdbc_insert_series(c, sid, ts, v, 100));
+        OK(tsdbc_flush(c));
+    }
+    OK(tsdbc_optimize(c)); /* (the background merger may have started on its own: only the end state is certain) */
+    {
+        mset m;
+        CHECK(scrape(&m));
+        CHECK(mval(&m, "tsdb_merges_total", "volume=\"0\"") >= 1);
+        CHECK(mval(&m, "tsdb_merged_rows_total", "volume=\"0\"") >= 400);
+        CHECK(mval(&m, "tsdb_parts", "volume=\"0\"") == 1);
+        mset_free(&m);
+    }
+
+    /* error codes: an unknown series and too many buckets, each counted under its own name */
+    {
+        mset b4;
+        scrape(&b4);
+        tsdb_bucket *bk;
+        size_t nb;
+        uint32_t nid;
+        int rc1 = tsdbc_series(c, "no such series", 0, &nid);
+        CHECK(rc1 == TSDB_ERR_NOTFOUND);
+        /* data 200 000 s apart, 1 ms buckets: over the limit of 64 Mi buckets */
+        int64_t far_ts[2] = {1800000000000, 1800000000000 + 200000000};
+        float far_v[2] = {1, 2};
+        OK(tsdbc_insert_series(c, sid, far_ts, far_v, 2));
+        int rc2 = tsdbc_query_agg(c, sid, 0, INT64_MAX / 2, 1, &bk, &nb);
+        CHECK(rc2 == TSDB_ERR_TOO_MANY_BUCKETS);
+        mset af;
+        scrape(&af);
+        double all = 0;
+        for (size_t i = 0; i < af.n; i++)
+            if (strcmp(af.s[i].name, "tsdb_request_errors_total") == 0)
+                all += af.s[i].v;
+        for (size_t i = 0; i < b4.n; i++)
+            if (strcmp(b4.s[i].name, "tsdb_request_errors_total") == 0)
+                all -= b4.s[i].v;
+        CHECK(all == 2);
+        CHECK(mval(&af, "tsdb_request_errors_total", "code=\"too_many_buckets\"") -
+                  mval(&b4, "tsdb_request_errors_total", "code=\"too_many_buckets\"") == 1);
+        CHECK(mval(&af, "tsdb_request_errors_total", "code=\"notfound\"") -
+                  mval(&b4, "tsdb_request_errors_total", "code=\"notfound\"") == 1);
+        mset_free(&b4);
+        mset_free(&af);
+    }
+
+    /* the connection limit: connections over --max-connections are closed and counted */
+    int extra_fd[12];
+    for (int i = 0; i < 12; i++) {
+        extra_fd[i] = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+        inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+        CHECK(connect(extra_fd[i], (struct sockaddr *)&sa, sizeof sa) == 0);
+    }
+    double rej = 0;
+    for (int i = 0; i < 100 && rej < 6; i++) { /* 12 more than the 5 free slots: at least 6 are turned away */
+        mset m;
+        scrape(&m);
+        rej = mval(&m, "tsdb_connections_rejected_total", NULL);
+        CHECK(mval(&m, "tsdb_connections", NULL) <= 6);
+        mset_free(&m);
+        if (rej < 6)
+            usleep(20000);
+    }
+    CHECK(rej >= 6);
+    for (int i = 0; i < 12; i++)
+        close(extra_fd[i]);
+    tsdbc_close(c);
+    stop_server(srv);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", dir, vol);
+    if (!failures && system(cmd) != 0)
+        failures++;
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -1506,6 +2326,11 @@ int main(int argc, char **argv)
     printf("fail-stop after a WAL write error\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-failstop-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_wal_failstop(dir);
+    printf("prometheus metrics\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-metrics-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_metrics(dir);
+    snprintf(dir, sizeof dir, "%s/tsdbd-metrics2-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_metrics_more(dir);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

@@ -67,6 +67,8 @@ cgroup, so `nice` does not keep your work out of its way.
   the same for embedded use (`tsdb_query_group_local`).
 - `server/tsdbd.c`: the server, one event loop on io_uring or epoll (`--io`; epoll where io_uring
   is disabled, as on RHEL/AlmaLinux 10); `make test` and `make jepsen` run the server tests on both.
+  `server/metrics.c`: the `--metrics-port` thread (Prometheus text format, own poll loop, counters
+  the server bumps through small hooks); `tsdb_get_volume_stats` feeds it. `docs/metrics.md` lists the metrics.
   `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
   A protocol change has to reach all four; `make test-clients` runs their tests.

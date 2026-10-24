@@ -356,6 +356,10 @@ On AlmaLinux and RHEL 10, where io_uring is disabled by default, tsdbd runs on e
 (`--io auto`, the default; `--io epoll` skips the attempt) and says so when it starts;
 `make NO_URING=1` builds it without io_uring, so liburing need not be installed there.
 
+`--metrics-port N` serves Prometheus metrics (`GET /metrics`) on a second port of its own: rows and
+bytes on disk, parts, merges, WAL, request and error counters, a query latency histogram, connections,
+fail-stop and follower refresh age. See [docs/metrics.md](docs/metrics.md).
+
 | client | quick start |
 |---|---|
 | C | [`client/tsdb_client.h`](client/tsdb_client.h), [`examples/client.c`](examples/client.c) |

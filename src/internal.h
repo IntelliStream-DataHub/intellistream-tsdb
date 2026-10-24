@@ -654,6 +654,8 @@ struct eng {
     pthread_t flusher;
 
     atomic_uint_fast64_t st_merges, st_merged_rows, st_passthrough;
+    atomic_uint_fast64_t st_wal_bytes, st_wal_syncs; /* tsdb_get_volume_stats; bumped by the WAL writer role */
+    atomic_int_fast64_t follow_ok_ms; /* follower: mono_ms() of the last refresh that succeeded */
     atomic_uint_fast64_t st_broken_parts, st_follow_errors;
 
     /* writer: MANIFEST for followers, delayed deletion of replaced parts */
@@ -804,6 +806,14 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
 int eng_optimize(eng *db);
 int eng_drop_before(eng *db, int64_t ts);
 int eng_get_stats(eng *db, tsdb_stats *st);
+int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs);
+
+static inline int64_t eng_mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
 
