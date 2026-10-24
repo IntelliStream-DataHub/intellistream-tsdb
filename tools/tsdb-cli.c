@@ -245,6 +245,49 @@ static int print_raw(void *ctx, const int64_t *ts, const tsdb_values *col, size_
     return 0;
 }
 
+/* 1234567 -> "1.23 million", ClickHouse style */
+static void readable(double x, const char *unit, char *buf, size_t len)
+{
+    static const char *big[] = {"", " thousand", " million", " billion", " trillion"};
+    int k = 0;
+    while (x >= 1000 && k < 4) {
+        x /= 1000;
+        k++;
+    }
+    snprintf(buf, len, k ? "%.2f%s%s" : "%.0f%s%s", x, big[k], unit);
+}
+
+static void readable_bytes(double b, char *buf, size_t len)
+{
+    static const char *u[] = {"B", "KB", "MB", "GB", "TB"};
+    int k = 0;
+    while (b >= 1000 && k < 4) {
+        b /= 1000;
+        k++;
+    }
+    snprintf(buf, len, "%.2f %s", b, u[k]);
+}
+
+/* What the query did, as ClickHouse's client reports it, plus where the rows came from. */
+static void print_stats(const char *what)
+{
+    tsdb_query_stats st;
+    tsdb_last_query_stats(&st);
+    double t = st.elapsed_s > 0 ? st.elapsed_s : 1e-9;
+    char rows[48], bytes[32], rate[48], brate[32], read[32];
+    readable((double)st.rows, " rows", rows, sizeof rows);
+    readable_bytes((double)st.bytes, bytes, sizeof bytes);
+    readable((double)st.rows / t, " rows/s", rate, sizeof rate);
+    readable_bytes((double)st.bytes / t, brate, sizeof brate);
+    readable_bytes((double)st.bytes_read, read, sizeof read);
+    fprintf(stderr,
+            "%" PRIu64 " %s in set. Elapsed: %.*f sec. Processed %s, %s (%s, %s/s)\n"
+            "%" PRIu64 " parts, %" PRIu64 " granules (%" PRIu64 " from their statistics); %" PRIu64
+            " rows decoded from %s, %" PRIu64 " in memory\n",
+            st.result_rows, what, st.elapsed_s < 0.01 ? 6 : 3, st.elapsed_s, rows, bytes, rate, brate, st.parts, st.granules,
+            st.granules_from_stats, st.rows_decoded, read, st.memtable_rows);
+}
+
 /* "15m", "6h", "1d", "1w", "1mo", "1q", "1y" -> a group; plain numbers and
  * "500ms" give a fixed interval in milliseconds instead. */
 static bool parse_group(const char *s, tsdb_group *g, int64_t *interval_ms)
@@ -309,12 +352,11 @@ static int cmd_query(tsdb *db, int argc, char **argv)
         }
         grouped = g.unit != 0;
     }
-    double t0 = now_s();
     if (strcmp(mode, "raw") == 0) {
         raw_out o = {stdout, 0, db, id};
         if ((rc = tsdb_query_values(db, id, start, end, &q, print_raw, &o)) != 0)
             die("query", rc);
-        fprintf(stderr, "%zu rows in %.3f ms\n", o.n, (now_s() - t0) * 1e3);
+        print_stats("rows");
         return 0;
     }
     tsdb_bucket *b;
@@ -337,7 +379,6 @@ static int cmd_query(tsdb *db, int argc, char **argv)
         rc = tsdb_query_group_ex(db, id, start, end, NULL, &q, &b, &nb);
     if (rc)
         die("query", rc);
-    double dt = now_s() - t0;
     tsdb_type type = TSDB_FLOAT32;
     tsdb_series_type(db, id, &type);
     bool all = strcmp(mode, "all") == 0, ints = type == TSDB_INT64 || type == TSDB_BOOL;
@@ -373,7 +414,7 @@ static int cmd_query(tsdb *db, int argc, char **argv)
         else
             usage();
     }
-    fprintf(stderr, "%zu buckets in %.3f ms\n", nb, dt * 1e3);
+    print_stats("buckets");
     free(b);
     return 0;
 }

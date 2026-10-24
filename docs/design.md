@@ -32,6 +32,19 @@ start, the tests and the benchmark results.
 - All functions are thread safe. One process opens a database for writing
   (`flock`); any number may open it `read_only` or follow it (below).
 
+## Query statistics
+
+Every query counts what it touched, on the thread that runs it and on the
+pool's workers that help it: the parts and granules with rows of the series in
+the range, the granules answered from their index entry, the rows and
+compressed bytes decoded, the rows read from memtables, and the rows or
+buckets returned. `tsdb_last_query_stats` returns them for the calling
+thread's last query; `tsdbd` keeps them per connection for `LAST_STATS`, and
+the command line prints them after each query. "Rows" are the rows a query
+covered, as ClickHouse counts processed rows: a granule answered from its
+statistics counts its rows without reading them, which is how a scan can
+report billions of rows a second.
+
 ## Storage
 
 A database is a directory:

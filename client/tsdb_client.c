@@ -724,6 +724,31 @@ int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t
     return 0;
 }
 
+int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st)
+{
+    const uint8_t *b;
+    size_t n;
+    int rc = call(c, TSDB_OP_LAST_STATS, NULL, 0, NULL, 0, &b, &n);
+    if (rc)
+        return rc;
+    if (n != TSDB_STATS_REPLY)
+        return TSDB_ERR_CORRUPT;
+    uint64_t v[10];
+    memcpy(&st->elapsed_s, b, 8);
+    memcpy(v, b + 8, sizeof v);
+    st->rows = v[0];
+    st->rows_decoded = v[1];
+    st->rows_from_stats = v[2];
+    st->memtable_rows = v[3];
+    st->bytes = v[4];
+    st->bytes_read = v[5];
+    st->parts = v[6];
+    st->granules = v[7];
+    st->granules_from_stats = v[8];
+    st->result_rows = v[9];
+    return 0;
+}
+
 int tsdbc_commit(tsdbc *c) { return call(c, TSDB_OP_COMMIT, NULL, 0, NULL, 0, NULL, NULL); }
 int tsdbc_flush(tsdbc *c) { return call(c, TSDB_OP_FLUSH, NULL, 0, NULL, 0, NULL, NULL); }
 int tsdbc_optimize(tsdbc *c) { return call(c, TSDB_OP_OPTIMIZE, NULL, 0, NULL, 0, NULL, NULL); }

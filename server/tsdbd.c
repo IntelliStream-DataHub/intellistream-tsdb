@@ -121,6 +121,7 @@ typedef struct conn {
     buf out;
     atomic_bool closing;
     bool notified;      /* an output event is queued for the main thread */
+    tsdb_query_stats last_stats; /* of the previous query (LAST_STATS) */
 } conn;
 
 /* ------------------------------------------------------------ globals */
@@ -673,6 +674,15 @@ static void handle(req *r)
         free(b);
         break;
     }
+    case TSDB_OP_LAST_STATS: {
+        pthread_mutex_lock(&c->lock);
+        tsdb_query_stats st = c->last_stats;
+        pthread_mutex_unlock(&c->lock);
+        uint64_t v[10] = {st.rows,  st.rows_decoded, st.rows_from_stats, st.memtable_rows,       st.bytes,
+                          st.bytes_read, st.parts,  st.granules,        st.granules_from_stats, st.result_rows};
+        reply(c, r->id, 0, &st.elapsed_s, 8, v, sizeof v, NULL, 0);
+        return;
+    }
     case TSDB_OP_COMMIT: rc = tsdb_commit(db); break;
     case TSDB_OP_FLUSH: rc = tsdb_flush(db); break;
     case TSDB_OP_OPTIMIZE: rc = tsdb_optimize(db); break;
@@ -706,6 +716,14 @@ static void *worker_main(void *arg)
             work_tail = NULL;
         pthread_mutex_unlock(&work_lock);
         handle(r); /* even for a closed connection: the client sent it, and replies are dropped */
+        if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_AGG || r->op == TSDB_OP_QUERY_GROUP ||
+            r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS) {
+            tsdb_query_stats st;
+            tsdb_last_query_stats(&st); /* this worker ran it */
+            pthread_mutex_lock(&r->c->lock);
+            r->c->last_stats = st;
+            pthread_mutex_unlock(&r->c->lock);
+        }
         conn *c = r->c;
         free(r->payload);
         free(r);

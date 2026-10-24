@@ -98,6 +98,21 @@ static inline void slot_put(void *v, size_t w, size_t i, uint64_t x)
     }
 }
 
+/* ---- query statistics (volumes.c) ----
+ * Counters of the query a thread works for: the thread that called the query
+ * and, while they help it, the pool's workers. NULL elsewhere (merges). */
+typedef struct qstats {
+    atomic_uint_fast64_t rows_decoded, rows_from_stats, memtable_rows, bytes_read;
+    atomic_uint_fast64_t parts, granules, granules_from_stats;
+} qstats;
+extern __thread qstats *cur_qstats;
+#define QS_ADD(field, v)                                                                 \
+    do {                                                                                 \
+        qstats *q_ = cur_qstats;                                                         \
+        if (q_)                                                                          \
+            atomic_fetch_add_explicit(&q_->field, (uint64_t)(v), memory_order_relaxed); \
+    } while (0)
+
 /* ---- hashing (xxhash64) ---- */
 uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 

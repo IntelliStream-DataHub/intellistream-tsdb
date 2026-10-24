@@ -714,12 +714,73 @@ static void test_v1(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+static void sum_granules(void *ctx, const tsdb_part_info *p) { *(uint64_t *)ctx += p->granules; }
+
+/* tsdb_last_query_stats: what each kind of query reads. */
+static void test_query_stats(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/types-stats-%d", base, (int)getpid());
+    tsdb *db = open_db(dir); /* 256-row granules; batches of 1000+ rows become parts */
+    uint32_t id;
+    OK(tsdb_series_create(db, "s", TSDB_FLOAT64, NULL, &id));
+    enum { N = 100000 };
+    const int64_t t0 = 1700000000000;
+    int64_t *ts = malloc(N * sizeof *ts);
+    double *v = malloc(N * sizeof *v);
+    for (int k = 0; k < N; k++) {
+        ts[k] = t0 + k * 1000;
+        v[k] = k % 100;
+    }
+    OK(tsdb_insert_series_values(db, id, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, N));
+    tsdb_query_stats st;
+    tsdb_bucket *b;
+    size_t nb;
+    /* one bucket over everything: every granule from its statistics */
+    OK(tsdb_query_agg(db, id, t0, t0 + (int64_t)N * 1000, 0, &b, &nb));
+    free(b);
+    tsdb_last_query_stats(&st);
+    CHECK(st.rows == N && st.rows_from_stats == N && st.rows_decoded == 0 && st.bytes_read == 0);
+    uint64_t granules = 0;
+    OK(tsdb_foreach_part(db, sum_granules, &granules));
+    CHECK(st.granules == granules && st.granules_from_stats == granules && st.result_rows == 1);
+    CHECK(st.parts >= 1 && st.bytes == (uint64_t)N * 16 && st.elapsed_s > 0);
+    /* buckets of 1 s: every granule decoded, by the pool's workers too */
+    OK(tsdb_query_agg(db, id, t0, t0 + (int64_t)N * 1000, 1000, &b, &nb));
+    free(b);
+    tsdb_last_query_stats(&st);
+    CHECK(st.rows_decoded == N && st.rows_from_stats == 0 && st.granules_from_stats == 0 && st.bytes_read > 0);
+    CHECK(st.result_rows == N && nb == N);
+    /* a raw window inside one granule: that granule */
+    int64_t lo = t0 + 1000 * 1000;
+    got g = {TSDB_FLOAT64, NULL, 0, 0};
+    OK(tsdb_query_values(db, id, lo, lo + 10 * 1000, NULL, collect, &g));
+    free(g.rows);
+    tsdb_last_query_stats(&st);
+    CHECK(st.granules == 1 && st.rows_decoded == 256 && st.result_rows == 10);
+    /* rows in the memtable */
+    int64_t tm = t0 + (int64_t)N * 1000;
+    double vm = 1;
+    OK(tsdb_insert_series_values(db, id, &tm, &(tsdb_values){TSDB_FLOAT64, &vm, NULL}, 1));
+    OK(tsdb_query_agg(db, id, tm, tm + 1, 0, &b, &nb));
+    free(b);
+    tsdb_last_query_stats(&st);
+    CHECK(st.memtable_rows == 1 && st.rows == 1 && st.parts == 0 && st.result_rows == 1);
+    free(ts);
+    free(v);
+    OK(tsdb_close(db));
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
     test_codecs();
     test_engine(base);
     test_v1(base);
+    test_query_stats(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

@@ -252,6 +252,25 @@ int tsdb_query_group(tsdb *db, uint32_t series, int64_t start, int64_t end, cons
 int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
+/* ---- query statistics ----
+ * What the calling thread's last query did, like ClickHouse's "Processed N
+ * rows, M MB": rows it covered (decoded, answered from granule statistics, or
+ * in memory), what it decompressed, and how long it took. */
+typedef struct tsdb_query_stats {
+    double elapsed_s;
+    uint64_t rows;                /* rows covered: rows_decoded + rows_from_stats + memtable_rows */
+    uint64_t rows_decoded;        /* rows decompressed (whole granules) */
+    uint64_t rows_from_stats;     /* rows answered from granule statistics, without decoding */
+    uint64_t memtable_rows;       /* rows read from memtables (not yet in parts) */
+    uint64_t bytes;               /* uncompressed size of the rows covered (timestamp + value) */
+    uint64_t bytes_read;          /* compressed bytes of the granules decoded */
+    uint64_t parts;               /* parts with rows of the series in the range */
+    uint64_t granules;            /* their granules in the range */
+    uint64_t granules_from_stats; /* granules answered from their index entry */
+    uint64_t result_rows;         /* rows, or buckets, returned */
+} tsdb_query_stats;
+void tsdb_last_query_stats(tsdb_query_stats *out);
+
 /* ---- maintenance ---- */
 int tsdb_optimize(tsdb *db);                /* merge every partition down to one part */
 int tsdb_drop_before(tsdb *db, int64_t ts); /* drop whole partitions that end at or before ts */

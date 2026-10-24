@@ -753,15 +753,61 @@ int tsdb_drop_before(tsdb *t, int64_t ts)
 
 /* --------------------------------------------------------------- queries */
 
+__thread qstats *cur_qstats;
+static __thread tsdb_query_stats last_stats;
+
+/* One query's statistics. Queries built on others (points on raw, _ex on
+ * plain) are counted once, by the outermost call. */
+typedef struct qrun {
+    qstats q;
+    bool outer;
+    struct timespec t0;
+} qrun;
+
+static void qs_begin(qrun *r)
+{
+    r->outer = cur_qstats == NULL;
+    if (!r->outer)
+        return;
+    memset(&r->q, 0, sizeof r->q);
+    cur_qstats = &r->q;
+    clock_gettime(CLOCK_MONOTONIC, &r->t0);
+}
+
+static void qs_end(qrun *r, int type, uint64_t result_rows)
+{
+    if (!r->outer)
+        return;
+    cur_qstats = NULL;
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    tsdb_query_stats *s = &last_stats;
+    s->elapsed_s = (double)(t1.tv_sec - r->t0.tv_sec) + (double)(t1.tv_nsec - r->t0.tv_nsec) * 1e-9;
+    s->rows_decoded = atomic_load(&r->q.rows_decoded);
+    s->rows_from_stats = atomic_load(&r->q.rows_from_stats);
+    s->memtable_rows = atomic_load(&r->q.memtable_rows);
+    s->rows = s->rows_decoded + s->rows_from_stats + s->memtable_rows;
+    s->bytes = s->rows * (8 + (type >= 0 ? type_width(type) : 4));
+    s->bytes_read = atomic_load(&r->q.bytes_read);
+    s->parts = atomic_load(&r->q.parts);
+    s->granules = atomic_load(&r->q.granules);
+    s->granules_from_stats = atomic_load(&r->q.granules_from_stats);
+    s->result_rows = result_rows;
+}
+
+void tsdb_last_query_stats(tsdb_query_stats *out) { *out = last_stats; }
+
 /* float32 rows to a tsdb_raw_fn: the slots are the floats */
 typedef struct f32_out {
     tsdb_raw_fn fn;
     void *ctx;
+    uint64_t rows;
 } f32_out;
 
 static int f32_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 {
     f32_out *o = arg;
+    o->rows += n;
     return o->fn(o->ctx, ts, v, n);
 }
 
@@ -770,13 +816,19 @@ int tsdb_query_raw_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
 {
     eng *e;
     uint32_t local;
-    if (!route(t, series, &e, &local))
-        return 0;
-    if (eng_series_type(e, local) != TSDB_FLOAT32)
-        return TSDB_ERR_INVALID; /* tsdb_query_values reads every type */
-    f32_out o = {fn, ctx};
-    return eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, f32_cb,
-                            &o);
+    qrun qr;
+    qs_begin(&qr);
+    f32_out o = {fn, ctx, 0};
+    int rc = 0;
+    if (route(t, series, &e, &local)) {
+        if (eng_series_type(e, local) != TSDB_FLOAT32)
+            rc = TSDB_ERR_INVALID; /* tsdb_query_values reads every type */
+        else
+            rc = eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
+                                  f32_cb, &o);
+    }
+    qs_end(&qr, TSDB_FLOAT32, o.rows);
+    return rc;
 }
 
 int tsdb_query_raw(tsdb *t, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx)
@@ -830,11 +882,13 @@ typedef struct vals_out {
     int type;
     uint8_t *valid, *bytes;
     size_t cap;
+    uint64_t rows;
 } vals_out;
 
 static int vals_cb(void *arg, const int64_t *ts, const void *v, size_t n)
 {
     vals_out *o = arg;
+    o->rows += n;
     if (n > o->cap) {
         size_t cap = MAX(n, o->cap * 2);
         uint8_t *va = realloc(o->valid, (cap + 7) / 8);
@@ -868,13 +922,14 @@ int tsdb_query_values(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
 {
     eng *e;
     uint32_t local;
-    if (!route(t, series, &e, &local))
-        return 0;
-    vals_out o = {fn, ctx, eng_series_type(e, local), NULL, NULL, 0};
-    if (o.type < 0)
-        return 0;
-    int rc = eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, vals_cb,
+    qrun qr;
+    qs_begin(&qr);
+    vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
+    int rc = 0;
+    if (route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0)
+        rc = eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, vals_cb,
                               &o);
+    qs_end(&qr, o.type, o.rows);
     free(o.valid);
     free(o.bytes);
     return rc;
@@ -889,13 +944,23 @@ int tsdb_query_agg(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t
     *nout = 0;
     if (interval_ms < 0)
         return TSDB_ERR_INVALID;
-    return route(t, series, &e, &local) ? eng_query_agg(e, local, start, end, interval_ms, out, nout) : 0;
+    qrun qr;
+    qs_begin(&qr);
+    int rc = 0, type = -1;
+    if (route(t, series, &e, &local)) {
+        type = eng_series_type(e, local);
+        rc = eng_query_agg(e, local, start, end, interval_ms, out, nout);
+    }
+    qs_end(&qr, type, *nout);
+    return rc;
 }
 
 int tsdb_query_group_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
     int rc = tsdb_query_group(t, series, start, end, group, out, nout);
+    if (opts && opts->limit && *nout > opts->limit)
+        last_stats.result_rows = opts->limit;
     if (rc || !opts)
         return rc;
     if (opts->order == TSDB_DESC)
@@ -920,7 +985,15 @@ int tsdb_query_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const
     int rc = bucketer_init(&bk, start, group); /* NULL: one bucket */
     if (rc)
         return rc;
-    return route(t, series, &e, &local) ? eng_query_group(e, local, start, end, &bk, out, nout) : 0;
+    qrun qr;
+    qs_begin(&qr);
+    int type = -1;
+    if (route(t, series, &e, &local)) {
+        type = eng_series_type(e, local);
+        rc = eng_query_group(e, local, start, end, &bk, out, nout);
+    }
+    qs_end(&qr, type, *nout);
+    return rc;
 }
 
 /* ----------------------------------------------------------- inspection */

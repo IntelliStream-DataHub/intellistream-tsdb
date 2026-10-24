@@ -68,6 +68,9 @@ int tsdbc_state(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
 int tsdbc_state_lookup(tsdbc *c, uint32_t series, const char *name, uint32_t *code);
 int tsdbc_state_name(tsdbc *c, uint32_t series, uint32_t code, char *buf, size_t len);
 
+/* What the server did for this connection's previous query (tsdb_last_query_stats there). */
+int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st);
+
 int tsdbc_commit(tsdbc *c);
 int tsdbc_flush(tsdbc *c);
 int tsdbc_optimize(tsdbc *c);

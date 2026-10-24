@@ -267,6 +267,10 @@ static void test_types(tsdbc *c)
     tsdb_bucket *bk;
     size_t nb;
     OK(tsdbc_query_agg(c, i, INT64_MIN, INT64_MAX, 0, &bk, &nb));
+    tsdb_query_stats qs;
+    OK(tsdbc_last_query_stats(c, &qs)); /* the server's account of that query */
+    CHECK(qs.result_rows == 1 && qs.rows == 12 && qs.memtable_rows + qs.rows_decoded + qs.rows_from_stats == 12 &&
+          qs.bytes == 12 * 16 && qs.elapsed_s > 0);
     int64_t want = 0;
     for (int k = 0; k < 12; k++)
         want += k == 3 || k == 9 ? 0 : iv[k];

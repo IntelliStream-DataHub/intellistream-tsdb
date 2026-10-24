@@ -61,6 +61,8 @@
  *               calendar grouping as QUERY_GROUP)
  *               -> u32 n, n x (i64 start, u64 count, f64 sum, f64 min, f64 max,
  *                              i64 isum, i64 imin, i64 imax)
+ *   LAST_STATS                                 -> f64 elapsed_s, then the ten u64 of
+ *               tsdb_query_stats in order: the connection's previous query
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
@@ -91,11 +93,13 @@ enum {
     TSDB_OP_STATE = 16,
     TSDB_OP_STATE_NAME = 17,
     TSDB_OP_QUERY_BUCKETS = 18,
+    TSDB_OP_LAST_STATS = 19,
 };
 
 #define TSDB_AGG_ROW 32    /* bytes per bucket in a QUERY_AGG or QUERY_GROUP reply */
 #define TSDB_BUCKET_ROW 64 /* bytes per bucket in a QUERY_BUCKETS reply */
 #define TSDB_VALUES_HEADER 16
+#define TSDB_STATS_REPLY 88 /* bytes in a LAST_STATS reply after the status */
 #define TSDB_VALID 1 /* flags: a validity bitmap follows the values */
 
 /* bytes per value on the wire: bool is one byte */

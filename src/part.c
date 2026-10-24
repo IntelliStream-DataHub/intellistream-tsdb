@@ -177,6 +177,8 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_
     const uint8_t *blk = p->map + g->off;
     if ((uint32_t)xxh64(blk, len, 0) != g->crc)
         return TSDB_ERR_CORRUPT;
+    QS_ADD(rows_decoded, g->count);
+    QS_ADD(bytes_read, len);
     int rc = block_decode_ts(c, blk, g->ts_len, g->count, ts);
     if (rc == 0 && v)
         rc = block_decode_vals(c, type, blk + g->ts_len, g->val_len, g->count, v);

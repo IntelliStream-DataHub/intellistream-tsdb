@@ -33,6 +33,18 @@ build/tsdb /data/sensors query pump7.flow now-1h now raw --desc --limit 10
 build/tsdb /data/sensors query pump7.flow 2024-01-01 2025-01-01 all 1mo --tz Europe/Oslo
 ```
 
+Every query reports what it read, as ClickHouse's client does
+(`tsdb_last_query_stats`, or `LAST_STATS` over TCP). One series of the
+100-billion-row benchmark, by day in UTC and then in Oslo, where the granules
+around local midnight have to be decoded:
+
+```
+116 buckets in set. Elapsed: 0.000366 sec. Processed 10.00 million rows, 120.00 MB (27.32 billion rows/s, 327.80 GB/s)
+116 parts, 1273 granules (1273 from their statistics); 0 rows decoded from 0.00 B, 0 in memory
+116 buckets in set. Elapsed: 0.001737 sec. Processed 10.00 million rows, 120.00 MB (5.76 billion rows/s, 69.08 GB/s)
+116 parts, 1273 granules (1158 from their statistics); 608001 rows decoded from 692.52 KB, 0 in memory
+```
+
 Embedded in C ([`include/tsdb.h`](include/tsdb.h)):
 
 ```c

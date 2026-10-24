@@ -486,6 +486,7 @@ typedef struct gref {
 
 typedef struct agg_job {
     eng *db;
+    qstats *qs; /* the caller's: workers count into it too */
     const gref *work;
     size_t nwork;
     atomic_size_t next;
@@ -500,6 +501,8 @@ static void agg_worker(void *arg, int idx)
     (void)idx;
     agg_job *j = arg;
     eng *db = j->db;
+    qstats *mine = cur_qstats;
+    cur_qstats = j->qs;
     codec_ctx *cc = cc_get(db);
     size_t cap = db->granule_rows;
     int64_t *ts = malloc(cap * sizeof *ts);
@@ -544,6 +547,7 @@ out:
     free(ts);
     free(v);
     free(local);
+    cur_qstats = mine;
 }
 
 /* One granule, or one memtable run, with its time range and source. */
@@ -591,8 +595,15 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
     int64_t dmin = INT64_MAX, dmax = INT64_MIN;
     for (size_t i = 0; i < sn.np + sn.nmem && rc == 0; i++) {
         uint32_t gi = 0, gj = 1;
-        if (i < sn.np)
+        if (i < sn.np) {
             part_find(sn.parts[i], series, start, end, &gi, &gj);
+            if (gi < gj) {
+                QS_ADD(parts, 1);
+                QS_ADD(granules, gj - gi);
+            }
+        } else {
+            QS_ADD(memtable_rows, sn.mem[i - sn.np].n);
+        }
         for (uint32_t k = gi; k < gj; k++) {
             if (nitem == cap) {
                 cap = cap ? cap * 2 : 256;
@@ -681,6 +692,8 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
                 bool one = bmin == bmax && (bk->kind != BK_CALENDAR || bk_start(bk, bmin + 1) > g->ts_max);
                 if (inside && one) {
                     agg_state ga;
+                    QS_ADD(granules_from_stats, 1);
+                    QS_ADD(rows_from_stats, g->count);
                     agg_from_granule(type, g, &ga);
                     agg_combine(&acc[bmin - t.b0], &ga, type);
                 } else
@@ -718,7 +731,7 @@ int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const 
         a = b;
     }
     if (rc == 0 && nwork) {
-        agg_job j = {.db = db, .work = work, .nwork = nwork, .t = t};
+        agg_job j = {.db = db, .qs = cur_qstats, .work = work, .nwork = nwork, .t = t};
         atomic_init(&j.next, 0);
         atomic_init(&j.err, 0);
         for (int k = 0; k < AGG_STRIPES; k++)
@@ -781,8 +794,11 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
     for (size_t i = 0; rc == 0 && i < sn->np; i++) {
         uint32_t gi, gj;
         part_find(sn->parts[i], series, start, end, &gi, &gj);
-        if (gi < gj)
+        if (gi < gj) {
             src_init_part(&cur[nc++], sn->parts[i], gi, gj, type);
+            QS_ADD(parts, 1);
+            QS_ADD(granules, gj - gi);
+        }
     }
     /* memtable runs were cut to the snapshot's range: cut them to this one */
     mem_run *clipped = calloc(sn->nmem + 1, sizeof *clipped);
@@ -794,6 +810,7 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
         if (lo >= hi)
             continue;
         clipped[i] = (mem_run){r->ts + lo, r->v + lo * w, hi - lo};
+        QS_ADD(memtable_rows, hi - lo);
         src_init_mem(&cur[nc++], &clipped[i], mem_prio(sn, i), type);
     }
     if (rc || nc == 0)
