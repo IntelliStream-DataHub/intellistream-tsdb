@@ -1,0 +1,290 @@
+package ai.intellistream.tsdb.embedded;
+
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+
+import static ai.intellistream.tsdb.embedded.Native.OPTIONS;
+import static ai.intellistream.tsdb.embedded.Native.offset;
+import static java.lang.foreign.ValueLayout.JAVA_INT;
+import static java.lang.foreign.ValueLayout.JAVA_LONG;
+
+/**
+ * Options for {@link EmbeddedDb#open(String, EmbeddedOptions)}: {@code tsdb_options} of {@code tsdb.h}. A new
+ * instance holds the library's defaults ({@code tsdb_options_init}); each setter changes one field and returns this
+ * instance, so options read as a chain:
+ *
+ * <pre>{@code
+ * EmbeddedOptions o = new EmbeddedOptions().walSyncMs(10).mergeThreads(1);
+ * }</pre>
+ *
+ * Partition length and granule size are fixed when a database is created; later opens ignore them.
+ */
+public final class EmbeddedOptions {
+    private long partitionMs;
+    private int granuleRows;
+    private int zstdLevel;
+    private int valueCodec;
+    private boolean fsync;
+    private int mergeThreads;
+    private int queryThreads;
+    private long bufferRows;
+    private int flushIntervalMs;
+    private int walSyncMs;
+    private long walMaxBatchRows;
+    private long maxPartBytes;
+    private boolean readOnly;
+    private boolean follow;
+    private int refreshMs;
+    private int mergeIdleS;
+    private int obsoletePartLifetimeS;
+
+    /** The library's defaults. */
+    public EmbeddedOptions() {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment o = a.allocate(OPTIONS);
+            try {
+                Native.OPTIONS_INIT.invokeExact(o);
+            } catch (Throwable t) {
+                throw Native.rethrow(t);
+            }
+            partitionMs = o.get(JAVA_LONG, offset(OPTIONS, "partition_ms"));
+            granuleRows = o.get(JAVA_INT, offset(OPTIONS, "granule_rows"));
+            zstdLevel = o.get(JAVA_INT, offset(OPTIONS, "zstd_level"));
+            valueCodec = o.get(JAVA_INT, offset(OPTIONS, "value_codec"));
+            fsync = o.get(JAVA_INT, offset(OPTIONS, "fsync")) != 0;
+            mergeThreads = o.get(JAVA_INT, offset(OPTIONS, "merge_threads"));
+            queryThreads = o.get(JAVA_INT, offset(OPTIONS, "query_threads"));
+            bufferRows = o.get(JAVA_LONG, offset(OPTIONS, "buffer_rows"));
+            flushIntervalMs = o.get(JAVA_INT, offset(OPTIONS, "flush_interval_ms"));
+            walSyncMs = o.get(JAVA_INT, offset(OPTIONS, "wal_sync_ms"));
+            walMaxBatchRows = o.get(JAVA_LONG, offset(OPTIONS, "wal_max_batch_rows"));
+            maxPartBytes = o.get(JAVA_LONG, offset(OPTIONS, "max_part_bytes"));
+            readOnly = o.get(JAVA_INT, offset(OPTIONS, "read_only")) != 0;
+            follow = o.get(JAVA_INT, offset(OPTIONS, "follow")) != 0;
+            refreshMs = o.get(JAVA_INT, offset(OPTIONS, "refresh_ms"));
+            mergeIdleS = o.get(JAVA_INT, offset(OPTIONS, "merge_idle_s"));
+            obsoletePartLifetimeS = o.get(JAVA_INT, offset(OPTIONS, "obsolete_part_lifetime_s"));
+        }
+    }
+
+    /** The options as a {@code tsdb_options} struct in {@code arena}. */
+    MemorySegment toNative(Arena arena) {
+        MemorySegment o = arena.allocate(OPTIONS);
+        o.set(JAVA_LONG, offset(OPTIONS, "partition_ms"), partitionMs);
+        o.set(JAVA_INT, offset(OPTIONS, "granule_rows"), granuleRows);
+        o.set(JAVA_INT, offset(OPTIONS, "zstd_level"), zstdLevel);
+        o.set(JAVA_INT, offset(OPTIONS, "value_codec"), valueCodec);
+        o.set(JAVA_INT, offset(OPTIONS, "fsync"), fsync ? 1 : 0);
+        o.set(JAVA_INT, offset(OPTIONS, "merge_threads"), mergeThreads);
+        o.set(JAVA_INT, offset(OPTIONS, "query_threads"), queryThreads);
+        o.set(JAVA_LONG, offset(OPTIONS, "buffer_rows"), bufferRows);
+        o.set(JAVA_INT, offset(OPTIONS, "flush_interval_ms"), flushIntervalMs);
+        o.set(JAVA_INT, offset(OPTIONS, "wal_sync_ms"), walSyncMs);
+        o.set(JAVA_LONG, offset(OPTIONS, "wal_max_batch_rows"), walMaxBatchRows);
+        o.set(JAVA_LONG, offset(OPTIONS, "max_part_bytes"), maxPartBytes);
+        o.set(JAVA_INT, offset(OPTIONS, "read_only"), readOnly ? 1 : 0);
+        o.set(JAVA_INT, offset(OPTIONS, "follow"), follow ? 1 : 0);
+        o.set(JAVA_INT, offset(OPTIONS, "refresh_ms"), refreshMs);
+        o.set(JAVA_INT, offset(OPTIONS, "merge_idle_s"), mergeIdleS);
+        o.set(JAVA_INT, offset(OPTIONS, "obsolete_part_lifetime_s"), obsoletePartLifetimeS);
+        return o;
+    }
+
+    /**
+     * Partition length, fixed at creation.
+     *
+     * @param ms milliseconds per partition; default one day
+     * @return this
+     */
+    public EmbeddedOptions partitionMs(long ms) {
+        partitionMs = ms;
+        return this;
+    }
+
+    /**
+     * Rows per granule, fixed at creation.
+     *
+     * @param rows default 8192
+     * @return this
+     */
+    public EmbeddedOptions granuleRows(int rows) {
+        granuleRows = rows;
+        return this;
+    }
+
+    /**
+     * zstd level for parts.
+     *
+     * @param level default 1; 0 disables zstd
+     * @return this
+     */
+    public EmbeddedOptions zstdLevel(int level) {
+        zstdLevel = level;
+        return this;
+    }
+
+    /**
+     * Value codec: 0 auto (default), 1 Gorilla, 2 Chimp ({@code TSDB_VALUES_*}).
+     *
+     * @param codec the codec number
+     * @return this
+     */
+    public EmbeddedOptions valueCodec(int codec) {
+        valueCodec = codec;
+        return this;
+    }
+
+    /**
+     * Whether parts are fsync'd before they are published.
+     *
+     * @param on default true
+     * @return this
+     */
+    public EmbeddedOptions fsync(boolean on) {
+        fsync = on;
+        return this;
+    }
+
+    /**
+     * Background merge threads.
+     *
+     * @param n default 2; 0 disables merges
+     * @return this
+     */
+    public EmbeddedOptions mergeThreads(int n) {
+        mergeThreads = n;
+        return this;
+    }
+
+    /**
+     * Threads one aggregation may use.
+     *
+     * @param n default: every logical CPU
+     * @return this
+     */
+    public EmbeddedOptions queryThreads(int n) {
+        queryThreads = n;
+        return this;
+    }
+
+    /**
+     * Memtable rows before it is flushed into parts.
+     *
+     * @param rows default 1 Mi
+     * @return this
+     */
+    public EmbeddedOptions bufferRows(long rows) {
+        bufferRows = rows;
+        return this;
+    }
+
+    /**
+     * Memtable age before it is flushed into parts.
+     *
+     * @param ms default 5000
+     * @return this
+     */
+    public EmbeddedOptions flushIntervalMs(int ms) {
+        flushIntervalMs = ms;
+        return this;
+    }
+
+    /**
+     * WAL durability: 0, every small write waits for fsync (group commit, the default); N &gt; 0, the WAL is
+     * fsync'd every N ms in the background; -1, no WAL.
+     *
+     * @param ms the mode
+     * @return this
+     */
+    public EmbeddedOptions walSyncMs(int ms) {
+        walSyncMs = ms;
+        return this;
+    }
+
+    /**
+     * Inserts below this many rows go through the WAL and memtable, larger ones straight to parts.
+     *
+     * @param rows default 65536
+     * @return this
+     */
+    public EmbeddedOptions walMaxBatchRows(long rows) {
+        walMaxBatchRows = rows;
+        return this;
+    }
+
+    /**
+     * Background merges never produce parts larger than this.
+     *
+     * @param bytes default 4 GiB
+     * @return this
+     */
+    public EmbeddedOptions maxPartBytes(long bytes) {
+        maxPartBytes = bytes;
+        return this;
+    }
+
+    /**
+     * Opens without writing, merging or locking exclusively.
+     *
+     * @param on default false
+     * @return this
+     */
+    public EmbeddedOptions readOnly(boolean on) {
+        readOnly = on;
+        return this;
+    }
+
+    /**
+     * Read only, and keep following a writer: new parts, merges and WAL rows.
+     *
+     * @param on default false
+     * @return this
+     */
+    public EmbeddedOptions follow(boolean on) {
+        follow = on;
+        return this;
+    }
+
+    /**
+     * How often a follower polls the writer's MANIFEST.
+     *
+     * @param ms default 100
+     * @return this
+     */
+    public EmbeddedOptions refreshMs(int ms) {
+        refreshMs = ms;
+        return this;
+    }
+
+    /**
+     * A partition without a new part for this long is merged down to one part.
+     *
+     * @param seconds default 300; -1 never
+     * @return this
+     */
+    public EmbeddedOptions mergeIdleS(int seconds) {
+        mergeIdleS = seconds;
+        return this;
+    }
+
+    /**
+     * How long parts replaced by merges are kept for readers on other hosts.
+     *
+     * @param seconds default 480
+     * @return this
+     */
+    public EmbeddedOptions obsoletePartLifetimeS(int seconds) {
+        obsoletePartLifetimeS = seconds;
+        return this;
+    }
+
+    @Override
+    public String toString() {
+        return "EmbeddedOptions[partitionMs=" + partitionMs + ", granuleRows=" + granuleRows + ", zstdLevel="
+                + zstdLevel + ", valueCodec=" + valueCodec + ", fsync=" + fsync + ", mergeThreads=" + mergeThreads
+                + ", queryThreads=" + queryThreads + ", bufferRows=" + bufferRows + ", flushIntervalMs="
+                + flushIntervalMs + ", walSyncMs=" + walSyncMs + ", walMaxBatchRows=" + walMaxBatchRows
+                + ", maxPartBytes=" + maxPartBytes + ", readOnly=" + readOnly + ", follow=" + follow + ", refreshMs="
+                + refreshMs + ", mergeIdleS=" + mergeIdleS + ", obsoletePartLifetimeS=" + obsoletePartLifetimeS + "]";
+    }
+}

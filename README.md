@@ -314,6 +314,7 @@ On AlmaLinux and RHEL 10, where io_uring is disabled by default, tsdbd runs on e
 | Rust | [client/rust](client/rust/README.md) |
 | Python | [client/python](client/python/README.md) |
 | Java 17+ | [client/java](client/java/README.md) |
+| Java 22+, embedded (no server) | [client/java-embedded](client/java-embedded/README.md) |
 
 The key lines of the C client (link with `build/libtsdbclient.a -lzstd -lpthread -lm`):
 
