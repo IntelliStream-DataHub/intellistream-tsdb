@@ -26,7 +26,9 @@ typedef struct eng eng;
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define FORMAT_VERSION 2 /* 2: 80-byte granules with typed statistics; version 1 parts are still read */
+/* 3: checksummed part header and footer, WAL records and dictionary records; databases
+ * of older versions are refused (no release had them) */
+#define FORMAT_VERSION 3
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -348,23 +350,6 @@ typedef struct granule {
 } granule;
 _Static_assert(sizeof(granule) == 80, "granule must be 80 bytes");
 
-/* Format version 1 (float32 only, no nulls); converted when such a part is opened. */
-typedef struct granule_v1 {
-    uint32_t series;
-    uint32_t count;
-    int64_t ts_min;
-    int64_t ts_max;
-    uint64_t off;
-    uint32_t ts_len;
-    uint32_t val_len;
-    double sum;
-    float vmin;
-    float vmax;
-    uint32_t crc;
-    uint32_t reserved;
-} granule_v1;
-_Static_assert(sizeof(granule_v1) == 64, "a version 1 granule is 64 bytes");
-
 typedef struct part_header {
     char magic[8];
     uint32_t version;
@@ -379,7 +364,7 @@ typedef struct part_footer {
     int64_t max_ts;
     uint32_t ngranules;
     uint32_t version;
-    uint64_t index_hash;
+    uint64_t index_hash; /* xxh64 of the header, the index and the footer up to here */
     char magic[8];
 } part_footer;
 _Static_assert(sizeof(part_footer) == 56, "footer must be 56 bytes");
@@ -396,11 +381,11 @@ typedef struct part {
     const uint8_t *map;
     size_t map_len;
     const granule *g;
-    granule *g_owned; /* g converted from a version 1 index */
     uint32_t ng;
     uint64_t index_off;
     uint64_t rows;
     int64_t min_ts, max_ts;
+    bool verify; /* queries check each granule's checksum (tsdb_options.verify_checksums) */
     time_t created;
     time_t written; /* when its newest rows were inserted: a merge keeps its sources' (after a reopen, created) */
     atomic_int refs;
@@ -415,8 +400,10 @@ int part_open(int dirfd, const char *name, part **out);
 int part_open_as(int dirfd, const char *file, const char *name, part **out);
 void part_ref(part *p);
 void part_unref(part *p);
-/* Decodes a granule: timestamps, and values (if v) as slots of `type`. */
-int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v);
+/* Decodes a granule: timestamps, and values (if v) as slots of `type`; checks
+ * the granule's checksum first if verify. */
+int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, bool verify);
+extern atomic_uint_fast64_t granule_checks; /* granule checksums computed, for tests */
 
 typedef struct part_writer {
     struct eng *db;
@@ -542,14 +529,17 @@ void mem_run_free(mem_run *r);
 int mt_flush(struct eng *db);
 int mem_insert(struct eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w,
                size_t n);
-/* WAL records: [u32 rows | WAL_WIDE][u32 checksum][rows]; rows are 16 bytes
- * (u32 series, i64 ts, f32 value) without WAL_WIDE (version 1), else 20
- * (u32 series, i64 ts, u64 slot). Returns the record's size, or 0 when the
- * record is torn or absent; *row the size of one row. */
-#define WAL_HDR 8
-#define WAL_WIDE 0x80000000u
-size_t wal_record(const uint8_t *p, size_t avail, size_t *nrows, size_t *row);
-void wal_row(const uint8_t *r, size_t row, uint32_t *id, int64_t *ts, uint64_t *slot);
+/* WAL records: [u32 rows][u32 header check][u64 rows hash][rows of 20 bytes:
+ * u32 series, i64 ts, u64 slot]. The header check covers the row count and the
+ * hash, and binds the record to its segment and offset. wal_record returns the
+ * size of the record at segment offset `off`, or 0 when it is torn or absent. */
+#define WAL_HDR 16
+#define WAL_ROW 20
+size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, size_t *nrows);
+/* Whether a valid record starts anywhere in p[from, len) (p at segment offset
+ * base): then a bad record before it is damage, not a torn tail. */
+bool wal_valid_after(const uint8_t *p, size_t len, size_t from, uint64_t seq, uint64_t base);
+void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot);
 int wal_commit(struct eng *db, uint64_t target);
 int wal_open(struct eng *db);
 void wal_close(struct eng *db);
@@ -565,6 +555,9 @@ typedef struct wal_tail {
     uint64_t seq;
     memtable *m; /* contents guarded by buf_lock */
     uint64_t off; /* bytes of the segment consumed */
+    uint64_t bad_off;  /* a bad record seen here, with valid ones after it, */
+    int64_t bad_since; /* since then (monotonic ms) */
+    bool reported;
 } wal_tail;
 
 typedef struct graveyard_entry {
@@ -624,6 +617,7 @@ struct eng {
     bool wal_enabled;
     int wal_fd;
     uint64_t wal_seq;
+    uint64_t wal_off; /* bytes in segment wal_seq (the WAL writer role) */
     uint8_t *wal_buf, *wal_spare;
     size_t wal_len, wal_cap, wal_spare_cap;
     uint64_t wal_appended;            /* rows appended (buf_lock) */
@@ -635,6 +629,7 @@ struct eng {
     pthread_t flusher;
 
     atomic_uint_fast64_t st_merges, st_merged_rows, st_passthrough;
+    atomic_uint_fast64_t st_broken_parts, st_follow_errors;
 
     /* writer: MANIFEST for followers, delayed deletion of replaced parts */
     pthread_mutex_t manifest_lock;
@@ -649,6 +644,8 @@ struct eng {
     pthread_t follower;
     pthread_mutex_t refresh_lock;
     uint64_t follow_version;
+    int64_t manifest_bad_since; /* follower: MANIFEST failed its checks since (monotonic ms), else 0 */
+    char broken_reported[96];   /* follower: the last broken part logged */
     uint64_t follow_flushed, follow_active;
     wal_tail tails[MAX_TAILS]; /* oldest first; the array is changed under db->lock + buf_lock */
     size_t ntails;

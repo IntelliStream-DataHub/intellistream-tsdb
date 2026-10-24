@@ -73,6 +73,11 @@ typedef struct tsdb_options {
                               * (up to max_part_bytes) in the background; default 300 (0 too), -1 never */
     int obsolete_part_lifetime_s; /* writer: parts replaced by merges are deleted this long after,
                                    * so readers on other hosts (NFS) can finish with them; default 480 */
+    int verify_checksums;    /* queries check each granule's checksum before decoding it (TSDB_ERR_CORRUPT
+                              * on a mismatch); default 0: storage with checksums of its own (ZFS, ECC
+                              * memory) catches the damage already. Merges always check, so damage is never
+                              * rewritten under a fresh checksum; structural checksums (part header, footer
+                              * and index, WAL, MANIFEST, dictionaries) are always checked. */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -286,6 +291,13 @@ typedef struct tsdb_stats {
     uint64_t parts, partitions, rows, bytes;
     uint64_t merges, merged_rows, passthrough_granules;
     uint64_t memtable_rows; /* rows in the WAL-backed memtable, not yet in parts */
+    /* Not sent by tsdbd's STATS. A part that fails its checks (checksums, layout)
+     * makes a writer's or reader's open fail with TSDB_ERR_CORRUPT and a log line
+     * naming it, rather than leave its rows out (older values of the same keys
+     * would come back); renaming it to <name>.broken accepts the loss. A follower
+     * keeps its previous view instead, logs the part, and counts it here. */
+    uint64_t broken_parts;
+    uint64_t follow_errors; /* follower refreshes that failed (MANIFEST, a part or the WAL damaged, or EIO) */
 } tsdb_stats;
 int tsdb_get_stats(tsdb *db, tsdb_stats *st);
 

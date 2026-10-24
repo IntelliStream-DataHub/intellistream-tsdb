@@ -36,6 +36,17 @@
 
 static int64_t now_s(void) { return (int64_t)time(NULL); }
 
+static int64_t mono_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* How long a follower lets something look damaged before it reports it: a
+ * writer's appends and rewrites can reach it out of order and torn (NFS). */
+static int64_t follow_patience_ms(const eng *db) { return MAX(2000, 20 * (int64_t)db->opt.refresh_ms); }
+
 /* ------------------------------------------------------------- writer */
 
 /* A failure fails the engine: the file may be torn, and followers would see
@@ -210,8 +221,7 @@ static int manifest_read(eng *db, manifest *m)
         if (m->nparts < nparts)
             m->parts[m->nparts++] = line;
     }
-    /* version 1 manifests list version 1 parts, which are still read */
-    if (fields != 6 || format < 1 || format > FORMAT_VERSION || m->nparts != nparts) {
+    if (fields != 6 || format != FORMAT_VERSION || m->nparts != nparts) {
         manifest_free(m);
         return TSDB_ERR_CORRUPT;
     }
@@ -242,6 +252,8 @@ static int open_listed_part(eng *db, const char *name, part **out)
         snprintf(retired, sizeof retired, RETIRED_PREFIX "%s", name);
         rc = part_open_as(db->dirfd, retired, name, out);
     }
+    if (rc == 0)
+        (*out)->verify = db->opt.verify_checksums;
     return rc;
 }
 
@@ -261,41 +273,65 @@ static int tail_segment(eng *db, wal_tail *t)
     size_t len = (size_t)((uint64_t)st.st_size - t->off);
     uint8_t *buf = malloc(len);
     ssize_t got = buf ? pread(fd, buf, len, (off_t)t->off) : -1;
+    int err = errno;
     close(fd);
     if (got <= 0) {
         free(buf);
-        return buf ? 0 : TSDB_ERR_NOMEM;
+        if (!buf)
+            return TSDB_ERR_NOMEM;
+        if (got < 0)
+            fprintf(stderr, "tsdb: follower: reading %s at offset %" PRIu64 ": %s\n", name, t->off, strerror(err));
+        return got < 0 ? TSDB_ERR_IO : 0; /* an error is reported (and retried), never taken for the end */
     }
     size_t pos = 0;
     int rc = 0;
     bool reloaded = false;
-    size_t n, row, rec;
+    size_t n, rec;
     /* a record that does not check out is still being written: next poll */
-    while (rc == 0 && (rec = wal_record(buf + pos, (size_t)got - pos, &n, &row)) != 0) {
+    while (rc == 0 && (rec = wal_record(buf + pos, (size_t)got - pos, t->seq, t->off + pos, &n)) != 0) {
         const uint8_t *r0 = buf + pos + WAL_HDR, *r = r0;
         uint32_t id;
         int64_t ts;
         uint64_t slot;
-        for (size_t i = 0; i < n && !reloaded; i++, r += row) {
-            wal_row(r, row, &id, &ts, &slot);
+        for (size_t i = 0; i < n && !reloaded; i++, r += WAL_ROW) {
+            wal_row(r, &id, &ts, &slot);
             if (id >= eng_series_count(db)) {
-                series_reload(&db->series, db->dirfd); /* created after our last look */
-                series_reload(&db->states, db->dirfd);
+                /* created after our last look; without the names the rows would be lost */
+                rc = series_reload(&db->series, db->dirfd);
+                if (rc == 0)
+                    rc = series_reload(&db->states, db->dirfd);
                 reloaded = true;
             }
         }
+        if (rc)
+            break;
         /* A record holds whole inserts (the writer appends an insert to the WAL
          * buffer in one step, and writes what it took of it as one record): its
          * rows become visible together, so queries never see part of an insert. */
         pthread_mutex_lock(&db->buf_lock);
         r = r0;
-        for (size_t i = 0; i < n && rc == 0; i++, r += row) {
-            wal_row(r, row, &id, &ts, &slot);
+        for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
+            wal_row(r, &id, &ts, &slot);
             if (id < eng_series_count(db))
                 rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, 0);
         }
         pthread_mutex_unlock(&db->buf_lock);
         pos += rec;
+    }
+    /* A bad record with a valid one after it is damage, unless the writer's
+     * appends reach us out of order (NFS): reported once it outlasts that. */
+    if (rc == 0 && pos < (size_t)got && wal_valid_after(buf, (size_t)got, pos, t->seq, t->off)) {
+        int64_t now = mono_ms();
+        if (t->bad_off != t->off + pos || !t->bad_since) {
+            t->bad_off = t->off + pos;
+            t->bad_since = now;
+        } else if (now - t->bad_since >= follow_patience_ms(db)) {
+            if (!t->reported)
+                fprintf(stderr, "tsdb: follower: WAL segment %s is damaged at offset %" PRIu64
+                                ", before valid records; its later rows are not shown\n", name, t->bad_off);
+            t->reported = true;
+            rc = TSDB_ERR_CORRUPT;
+        }
     }
     t->off += pos;
     free(buf);
@@ -309,17 +345,33 @@ int follow_refresh(eng *db)
     pthread_mutex_lock(&db->refresh_lock);
     manifest m;
     int rc = manifest_read(db, &m);
-    if (rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_CORRUPT) {
+    if (rc == TSDB_ERR_CORRUPT) {
+        /* caught mid-rewrite: next time, unless it stays so */
+        int64_t now = mono_ms();
+        if (!db->manifest_bad_since)
+            db->manifest_bad_since = now;
+        if (now - db->manifest_bad_since < follow_patience_ms(db))
+            rc = 0;
+        else if (now - db->manifest_bad_since < follow_patience_ms(db) + db->opt.refresh_ms)
+            fprintf(stderr, "tsdb: follower: MANIFEST has failed its checks for %" PRId64 " ms\n",
+                    now - db->manifest_bad_since);
+    } else if (rc == 0) {
+        db->manifest_bad_since = 0;
+    }
+    if (rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_CORRUPT || (rc == 0 && db->manifest_bad_since)) {
         pthread_mutex_unlock(&db->refresh_lock);
-        return 0; /* no writer yet, or caught mid-write: next time */
+        if (rc == TSDB_ERR_CORRUPT)
+            atomic_fetch_add(&db->st_follow_errors, 1);
+        return rc == TSDB_ERR_CORRUPT ? rc : 0; /* no writer yet: next time */
     }
     if (rc) {
         pthread_mutex_unlock(&db->refresh_lock);
         return rc;
     }
     if (m.version != db->follow_version) {
-        series_reload(&db->series, db->dirfd);
-        series_reload(&db->states, db->dirfd);
+        rc = series_reload(&db->series, db->dirfd);
+        if (rc == 0)
+            rc = series_reload(&db->states, db->dirfd);
         /* the new part set: parts we have stay, new ones are opened */
         size_t ncur;
         part **cur = db_snapshot(db, INT64_MIN, INT64_MAX, &ncur);
@@ -346,7 +398,19 @@ int follow_refresh(eng *db)
             } else {
                 if (r == 0)
                     part_unref(p);
-                rc = TSDB_ERR_STOPPED; /* gone before we opened it: newer manifest next time */
+                if (r == TSDB_ERR_NOTFOUND) {
+                    rc = TSDB_ERR_STOPPED; /* gone before we opened it: newer manifest next time */
+                } else if (r == 0 || r == TSDB_ERR_CORRUPT || r == TSDB_ERR_INVALID) {
+                    /* the previous view stays: better older than with rows missing */
+                    if (strcmp(db->broken_reported, m.parts[i]) != 0) {
+                        fprintf(stderr, "tsdb: follower: part %s is broken; keeping the previous view\n", m.parts[i]);
+                        snprintf(db->broken_reported, sizeof db->broken_reported, "%s", m.parts[i]);
+                        atomic_fetch_add(&db->st_broken_parts, 1);
+                    }
+                    rc = TSDB_ERR_CORRUPT;
+                } else {
+                    rc = r;
+                }
             }
         }
         if (rc == 0) {
@@ -409,13 +473,15 @@ int follow_refresh(eng *db)
             pthread_mutex_lock(&db->lock);
             pthread_mutex_lock(&db->buf_lock);
             t = &db->tails[db->ntails++];
-            *t = (wal_tail){seq, mt, 0};
+            *t = (wal_tail){.seq = seq, .m = mt};
             pthread_mutex_unlock(&db->buf_lock);
             pthread_mutex_unlock(&db->lock);
         }
         rc = tail_segment(db, t);
     }
     pthread_mutex_unlock(&db->refresh_lock);
+    if (rc)
+        atomic_fetch_add(&db->st_follow_errors, 1);
     return rc;
 }
 
@@ -424,7 +490,7 @@ int eng_refresh(eng *db) { return follow_refresh(db); }
 void *follower_main(void *arg)
 {
     eng *db = arg;
-    int ms = db->opt.refresh_ms > 0 ? db->opt.refresh_ms : 100;
+    int ms = db->opt.refresh_ms > 0 ? db->opt.refresh_ms : 100, last = 0;
     pthread_mutex_lock(&db->buf_lock);
     while (!db->follower_stop) {
         struct timespec ts;
@@ -440,8 +506,9 @@ void *follower_main(void *arg)
             break;
         pthread_mutex_unlock(&db->buf_lock);
         int rc = follow_refresh(db);
-        if (rc)
-            fprintf(stderr, "tsdb: refresh: %s\n", tsdb_strerror(rc));
+        if (rc && rc != last)
+            fprintf(stderr, "tsdb: refresh: %s\n", tsdb_strerror(rc)); /* each new error once: polled often */
+        last = rc;
         pthread_mutex_lock(&db->buf_lock);
     }
     pthread_mutex_unlock(&db->buf_lock);

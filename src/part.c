@@ -6,15 +6,17 @@
  *
  * A granule holds rows of one series; its value block is coded for the
  * series' type and its index entry carries the statistics of its known
- * values. Version 1 parts (float32, 64-byte index entries) are still read:
- * their index is converted to the current layout when they are opened.
- * The header also records the newest WAL segment whose rows the part holds.
+ * values. The header also records the newest WAL segment whose rows the part
+ * holds. One hash in the footer covers the header, the index and the footer,
+ * so a damaged wal_seq, row count or time range is caught at open like a
+ * damaged index; each granule's blocks have a checksum of their own.
  * A part is written to tmp_*.part, fsync'd, and renamed to its final name
  * p<partition>_<min_block>_<max_block>_<level>.part, which makes it visible.
  */
 #include "internal.h"
 
 #include <dirent.h>
+#include <stddef.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -44,6 +46,14 @@ static int write_all(int fd, const void *buf, size_t len)
 }
 
 /* ---------------------------------------------------------------- reader */
+
+/* Covers everything open trusts besides the granule blocks: chained over three pieces. */
+static uint64_t part_hash(const part_header *h, const void *index, size_t len, const part_footer *f)
+{
+    uint64_t x = xxh64(h, sizeof *h, 0);
+    x = xxh64(index, len, x);
+    return xxh64(f, offsetof(part_footer, index_hash), x);
+}
 
 int part_open(int dirfd, const char *name, part **out) { return part_open_as(dirfd, name, name, out); }
 
@@ -102,44 +112,18 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     int rc = TSDB_ERR_CORRUPT;
     if (memcmp(h.magic, PART_MAGIC, 8) != 0 || memcmp(f.magic, PART_END_MAGIC, 8) != 0)
         goto fail;
-    if ((h.version != 1 && h.version != FORMAT_VERSION) || f.version != h.version || h.granule_rows == 0 ||
+    if (h.version != FORMAT_VERSION || f.version != h.version || h.granule_rows == 0 ||
         h.granule_rows > MAX_GRANULE_ROWS)
         goto fail;
     p->grows = h.granule_rows;
     p->wal_seq = h.wal_seq;
-    size_t entry = h.version == 1 ? sizeof(granule_v1) : sizeof(granule);
     if (f.index_off % 8 != 0 || f.index_off < sizeof h ||
-        f.index_off + (uint64_t)f.ngranules * entry + sizeof f != size)
+        f.index_off + (uint64_t)f.ngranules * sizeof(granule) + sizeof f != size)
         goto fail;
-    if (xxh64(p->map + f.index_off, (size_t)f.ngranules * entry, 0) != f.index_hash)
+    if (part_hash(&h, p->map + f.index_off, (size_t)f.ngranules * sizeof(granule), &f) != f.index_hash ||
+        f.min_ts > f.max_ts)
         goto fail;
-    if (h.version == 1) {
-        p->g_owned = malloc((f.ngranules ? f.ngranules : 1) * sizeof(granule));
-        if (!p->g_owned) {
-            rc = TSDB_ERR_NOMEM;
-            goto fail;
-        }
-        for (uint32_t i = 0; i < f.ngranules; i++) {
-            granule_v1 o;
-            memcpy(&o, p->map + f.index_off + (size_t)i * sizeof o, sizeof o);
-            granule *g = &p->g_owned[i];
-            memset(g, 0, sizeof *g);
-            g->series = o.series;
-            g->count = o.count;
-            g->ts_min = o.ts_min;
-            g->ts_max = o.ts_max;
-            g->off = o.off;
-            g->ts_len = o.ts_len;
-            g->val_len = o.val_len;
-            g->crc = o.crc;
-            g->fsum = o.sum;
-            g->fmin = o.vmin;
-            g->fmax = o.vmax;
-        }
-        p->g = p->g_owned;
-    } else {
-        p->g = (const granule *)(p->map + f.index_off);
-    }
+    p->g = (const granule *)(p->map + f.index_off);
     p->ng = f.ngranules;
     p->index_off = f.index_off;
     p->rows = f.rows;
@@ -151,7 +135,6 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     return 0;
 fail:
     munmap((void *)p->map, p->map_len);
-    free(p->g_owned);
     free(p);
     return rc;
 }
@@ -165,19 +148,23 @@ void part_unref(part *p)
     munmap((void *)p->map, p->map_len);
     if (atomic_load(&p->obsolete))
         unlinkat(p->dirfd, p->name, 0);
-    free(p->g_owned);
     free(p);
 }
 
-int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v)
+atomic_uint_fast64_t granule_checks;
+
+int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, bool verify)
 {
     uint64_t len = (uint64_t)g->ts_len + g->val_len;
     if (g->off < sizeof(part_header) || g->off + len > p->index_off || g->count == 0 ||
         g->count > p->grows)
         return TSDB_ERR_CORRUPT;
     const uint8_t *blk = p->map + g->off;
-    if ((uint32_t)xxh64(blk, len, 0) != g->crc)
-        return TSDB_ERR_CORRUPT;
+    if (verify) {
+        atomic_fetch_add_explicit(&granule_checks, 1, memory_order_relaxed);
+        if ((uint32_t)xxh64(blk, len, 0) != g->crc)
+            return TSDB_ERR_CORRUPT;
+    }
     QS_ADD(rows_decoded, g->count);
     QS_ADD(bytes_read, len);
     int rc = block_decode_ts(c, blk, g->ts_len, g->count, ts);
@@ -187,6 +174,15 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_
 }
 
 /* ---------------------------------------------------------------- writer */
+
+static void pw_header(const part_writer *w, part_header *h)
+{
+    memset(h, 0, sizeof *h);
+    memcpy(h->magic, PART_MAGIC, 8);
+    h->version = FORMAT_VERSION;
+    h->granule_rows = w->grows;
+    h->wal_seq = w->wal_seq;
+}
 
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq)
 {
@@ -217,10 +213,7 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
         return TSDB_ERR_IO;
     }
     part_header h;
-    memcpy(h.magic, PART_MAGIC, 8);
-    h.version = FORMAT_VERSION;
-    h.granule_rows = w->grows;
-    h.wal_seq = w->wal_seq;
+    pw_header(w, &h);
     memcpy(w->buf, &h, sizeof h);
     w->len = sizeof h;
     return 0;
@@ -380,7 +373,9 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     f.max_ts = w->max_ts;
     f.ngranules = (uint32_t)w->ng;
     f.version = FORMAT_VERSION;
-    f.index_hash = xxh64(w->idx, w->ng * sizeof(granule), 0);
+    part_header h;
+    pw_header(w, &h);
+    f.index_hash = part_hash(&h, w->idx, w->ng * sizeof(granule), &f);
     memcpy(f.magic, PART_END_MAGIC, 8);
     if ((rc = pw_flush(w)) != 0 || (rc = write_all(w->fd, w->idx, w->ng * sizeof(granule))) != 0 ||
         (rc = write_all(w->fd, &f, sizeof f)) != 0)
@@ -396,6 +391,8 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         close(w->fd);
         w->fd = -1; /* the tmp file stays */
         rc = part_open_as(db->dirfd, w->tmp_name, name, out);
+        if (rc == 0)
+            (*out)->verify = db->opt.verify_checksums;
         if (rc == 0)
             snprintf((*out)->pending, sizeof (*out)->pending, "%s", w->tmp_name);
         else
@@ -417,6 +414,8 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         return TSDB_ERR_IO;
     }
     rc = part_open(db->dirfd, name, out);
+    if (rc == 0)
+        (*out)->verify = db->opt.verify_checksums;
     if (rc != 0)
         unlinkat(db->dirfd, name, 0);
     pw_abort(w);

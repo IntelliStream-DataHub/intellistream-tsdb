@@ -220,7 +220,7 @@ static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
     }
     while (c->gi < c->gj) {
         const granule *g = &c->p->g[c->gi++];
-        int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v);
+        int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, c->p->verify);
         if (rc)
             return rc;
         c->pos = g->ts_min >= start ? 0 : lower_bound_i64(c->ts, g->count, start);
@@ -544,7 +544,7 @@ static void agg_worker(void *arg, int idx)
         if (w >= j->nwork || atomic_load_explicit(&j->err, memory_order_relaxed))
             break;
         const gref *r = &j->work[w];
-        int rc = granule_read(cc, r->p, r->g, j->t.type, ts, v);
+        int rc = granule_read(cc, r->p, r->g, j->t.type, ts, v, r->p->verify);
         if (rc) {
             atomic_store(&j->err, rc);
             break;

@@ -1080,6 +1080,8 @@ int tsdb_get_stats(tsdb *t, tsdb_stats *st)
         st->merged_rows += s.merged_rows;
         st->passthrough_granules += s.passthrough_granules;
         st->memtable_rows += s.memtable_rows;
+        st->broken_parts += s.broken_parts;
+        st->follow_errors += s.follow_errors;
     }
     pthread_rwlock_unlock(&t->lock);
     return 0;
