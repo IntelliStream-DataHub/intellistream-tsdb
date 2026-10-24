@@ -193,6 +193,9 @@ Servers older than protocol version 3 always get uncompressed inserts.
 
 It prints rows per second and bytes sent per row. Try `--compression 0` to compare.
 
+`bench_query.py` runs the random query windows of `tsdbc-bench query` (`--conns N` threads, which share the GIL;
+see the file). `../../bench/clients/run.sh` runs both next to the other clients and the embedded library.
+
 ## API documentation
 
 Every class and method has a docstring, and `tsdb_client.pyi` gives editors

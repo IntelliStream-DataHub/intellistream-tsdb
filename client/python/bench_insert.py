@@ -10,7 +10,8 @@ it sends); each connection sends batches with the many-series layout,
 keeping up to --inflight of them unacknowledged. --compression 0 sends plain
 arrays; any other zstd level packs them (protocol version 3). Series
 `bench.<n>` are created first, outside the timing. Reports rows/s and the
-bytes written to the sockets per row. Uses numpy if it is installed (much
+bytes written to the sockets per row and the CPU time of the process, in the
+format of tsdbc-bench (see bench_common.py). Uses numpy if it is installed (much
 faster to slice the file); without it, rows are unpacked in Python.
 """
 
@@ -21,6 +22,8 @@ import threading
 import time
 
 import tsdb_client
+
+import bench_common as bc
 
 try:
     import numpy as np
@@ -91,7 +94,7 @@ def main():
         ids = np.array(ids, dtype=np.uint32)
 
     sent, errors = [], []
-    t0 = time.perf_counter()
+    t0, cpu0 = time.perf_counter(), bc.cpu_s()
     threads = [
         threading.Thread(
             target=load, args=(args, rows, ids, n * k // args.conns, n * (k + 1) // args.conns, sent, errors)
@@ -102,13 +105,18 @@ def main():
         t.start()
     for t in threads:
         t.join()
-    dt = time.perf_counter() - t0
+    dt, cpu = time.perf_counter() - t0, bc.cpu_s() - cpu0
     if errors:
         sys.exit(f"insert: {errors[0]}")
-    print(
-        f"python insert: {n} rows in {dt:.2f} s = {n / dt / 1e6:.2f} M rows/s, "
-        f"{sum(sent) / max(n, 1):.2f} bytes/row on the wire ({args.conns} connections, batches of {args.batch}, "
-        f"compression {args.compression}, {args.inflight} in flight, numpy {'yes' if np is not None else 'no'})"
+    bc.report_load(
+        "python",
+        args.conns,
+        args.compression,
+        n,
+        dt,
+        sum(sent),
+        cpu,
+        f", batches of {args.batch}, {args.inflight} in flight, numpy {'yes' if np is not None else 'no'}",
     )
 
 

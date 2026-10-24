@@ -248,6 +248,9 @@ java --enable-native-access=ALL-UNNAMED -cp target/tsdb-client-0.1.0-SNAPSHOT.ja
 `--compression off` sends rows uncompressed. Use a large file (hundreds of millions of rows): small runs mostly
 measure Java warming up.
 
+`QueryBench` runs the random query windows of `tsdbc-bench query` (`--conns N`, `--seconds S`).
+`../../bench/clients/run.sh` runs both next to the other clients and the embedded library.
+
 ## Build, test and docs
 
 ```sh
