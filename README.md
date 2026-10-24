@@ -44,7 +44,8 @@ average). You can link tsdb into your program as a library, or run its server,
 - Delete the values of one series in a time range, or replace them with new
   ones in one step (readers see the old values or the new ones, never a mix).
   Give a series a retention period, and values older than that disappear on
-  their own.
+  their own. Over the wire these need protocol version 7 (tsdbd and the C
+  client of this release; the CLI has `delete` and `retention`).
 - Safe writes: data is on disk when a write returns. We test this by killing
   the server and by simulating power loss.
 - One writer and any number of read-only followers can share a directory,

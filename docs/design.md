@@ -362,6 +362,20 @@ they are, and aggregates keep using their statistics. So granule statistics
 are never used for a granule a tombstone touches, and once a merge has removed
 the rows they are exact again with no special case.
 
+The snapshot records, per part, the window of index entries the query may use
+(`sn.gi`/`sn.gj`, found with `snap_find`): the granules of the series in
+range, minus those moved to mem runs. Every reader that goes past its range
+(TWA looking for the readings before and after it, LTTB's counting pass) must
+stay inside that window. Looking a part up directly (`part_find` on
+`sn.parts`) would see a tombstoned granule a second time, deleted rows
+included: LTTB counted such granules twice and read garbage, TWA carried a
+deleted reading into the range. Inside the window, the nearest granule before
+or after the range is the nearest live reading, because tombstoned granules
+are mem runs holding only their live rows. TWA's fast path therefore applies
+unchanged to the untouched granules; a TWA query without a staleness limit
+takes a snapshot of the whole history and so decodes every tombstoned granule
+of the series until merges remove the deleted rows.
+
 **Merges** drop the rows of each source hidden by the tombstones of a newer
 source, and never copy a granule that intersects them. The output keeps the
 union of the sources' tombstones (clipped by retention), unless no part of the
@@ -379,7 +393,11 @@ open: after the clock is stepped back nothing expired reappears; a clock
 stepped forward expires rows early, and for good once a merge has removed
 them. A series' cutoff is `now - limit`:
 
-- queries clamp their start to the cutoff, so expired rows vanish at once;
+- queries clamp their start to the cutoff, so expired rows vanish at once.
+  A query that reads before its start stops at the cutoff too: TWA carries no
+  reading in from before it (a decoded granule straddling the cutoff starts no
+  segment at an expired reading), and LTTB counts and buckets only rows from
+  the cutoff on;
 - every merge drops rows below the cutoff;
 - the merge thread, at most once a second, drops a whole partition once every
   series in it (its rows and its tombstones) has expired (retired like

@@ -300,6 +300,8 @@ int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, con
  *    the value as a double (int64 rounded, bool 0 or 1).
  *  - n <= threshold returns every point. threshold < 3 or a state series:
  *    TSDB_ERR_INVALID.
+ * Deleted and expired values are not points: the buckets are cut over the
+ * live rows only, as if the others had never been written.
  * It reads one snapshot, so concurrent writes and merges do not tear the
  * result. Query statistics describe one read of the range (the counting pass,
  * and for very large buckets a second pass for the means, are not counted). */
@@ -358,6 +360,10 @@ int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, c
  *    is stale; LINEAR does not interpolate across it). 0: no limit.
  *  - The last reading of a series has no segment: it holds until a later
  *    reading arrives, never up to "now".
+ *  - Deleted readings do not exist: the segment before a deleted range runs
+ *    from the last live reading to the next live one. Expired readings
+ *    (retention) do not either, and nothing is carried in from before the
+ *    retention cutoff: the first segment starts at the first unexpired reading.
  * A bucket [b0, b1) integrates every segment over its intersection with the
  * bucket and with [start, end): segments are cut exactly at bucket edges and at
  * start and end (LINEAR interpolates the value at the cut), and the value in
@@ -378,7 +384,8 @@ int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, c
  * Types: float32, float64, int64 (as double: exact up to 2^53), bool (0 or 1:
  * twa is the fraction of covered time that it was true); state series are
  * TSDB_ERR_INVALID. Whole granules inside one bucket are answered from stored
- * statistics without decoding (see docs/design.md). */
+ * statistics without decoding, except where a delete overlaps them and until a
+ * merge has removed the deleted rows (see docs/design.md). */
 typedef enum { TSDB_TWA_STEP = 0, TSDB_TWA_LINEAR = 1 } tsdb_twa_method;
 
 typedef struct tsdb_twa_opts {

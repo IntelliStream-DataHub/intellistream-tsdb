@@ -104,7 +104,15 @@ cgroup, so `nice` does not keep your work out of its way.
 - **Retention** limits live in the append-only `RETENTION` file (beside
   `SERIES`). Retention "now" (`eng_now_ms`) never goes back; queries clamp to
   the cutoff, merges drop expired rows, the merge thread drops whole expired
-  partitions by retiring them.
+  partitions by retiring them. A query that reads before its start (TWA's
+  carried-in reading) stops at the cutoff as well.
+- **Snapshot windows.** Readers use the per-part entry windows of their
+  snapshot (`sn.gi`/`sn.gj`, `snap_find`), also to step to granules outside
+  their range; never `part_find` on `sn.parts`: granules a tombstone touches
+  were moved to mem runs with their live rows, and a direct lookup sees them
+  twice, deleted rows included. New granule statistics must be computed by the
+  part writer (merges re-encode every granule a tombstone touched) and read only
+  through these windows.
 - **Inserts are all or nothing.** All parts of one insert are written pending,
   then committed through an intent file (`parts_commit`). Never publish them one
   by one.
