@@ -1132,8 +1132,29 @@ int tsdb_query_values(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
     return rc;
 }
 
-int tsdb_query_lttb(tsdb *t, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
-                    void *ctx)
+/* LTTB's points newest first, or only the first `limit` of them: the engine sends them in the order asked for
+ * (newest first is a backwards read when every point is kept, else a ring of at most min(limit, threshold)
+ * chosen points), and this cuts them to the limit. */
+typedef struct lttb_limit {
+    vals_out *o;
+    size_t limit, sent;
+    bool stopped; /* by the caller's callback, not by the limit */
+} lttb_limit;
+
+static int lttb_limit_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_limit *l = arg;
+    size_t m = l->limit ? MIN(n, l->limit - l->sent) : n;
+    l->sent += m;
+    if (m && vals_cb(l->o, ts, v, m)) {
+        l->stopped = true;
+        return 1;
+    }
+    return l->limit && l->sent >= l->limit;
+}
+
+int tsdb_query_lttb_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, size_t threshold,
+                       const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx)
 {
     if (threshold < 3)
         return TSDB_ERR_INVALID;
@@ -1142,74 +1163,77 @@ int tsdb_query_lttb(tsdb *t, uint32_t series, int64_t start, int64_t end, size_t
     qrun qr;
     qs_begin(&qr);
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
+    lttb_limit l = {.o = &o, .limit = opts ? opts->limit : 0};
+    bool desc = opts && opts->order == TSDB_DESC;
     int rc = 0;
-    if (route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0)
-        rc = eng_query_lttb(e, local, start, end, threshold, vals_cb, &o);
+    if (route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0) {
+        rc = eng_query_lttb(e, local, start, end, threshold, desc, l.limit, l.limit ? lttb_limit_cb : vals_cb,
+                            l.limit ? (void *)&l : &o);
+        if (rc == TSDB_ERR_STOPPED && l.limit && l.sent >= l.limit && !l.stopped)
+            rc = 0; /* stopped at the limit */
+    }
     qs_end(&qr, o.type, o.rows);
     free(o.valid);
     free(o.bytes);
     return rc;
 }
 
-int tsdb_query_agg(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
-                   size_t *nout)
+int tsdb_query_lttb(tsdb *t, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+                    void *ctx)
+{
+    return tsdb_query_lttb_ex(t, series, start, end, threshold, NULL, fn, ctx);
+}
+
+/* Aggregates, calendar groups and bounds: one router. The engine applies order and limit, computing only
+ * about the buckets it returns (bucket_windows in src/query.c). */
+static int query_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
     eng *e;
     uint32_t local;
-    *out = NULL;
-    *nout = 0;
-    if (interval_ms < 0)
-        return TSDB_ERR_INVALID;
     qrun qr;
     qs_begin(&qr);
     int rc = 0, type = -1;
     if (route(t, series, &e, &local)) {
         type = eng_series_type(e, local);
-        rc = eng_query_agg(e, local, start, end, interval_ms, out, nout);
+        rc = eng_query_group(e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
+                             out, nout);
     }
     qs_end(&qr, type, *nout);
     return rc;
+}
+
+int tsdb_query_agg_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                      const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    if (interval_ms < 0)
+        return TSDB_ERR_INVALID;
+    bucketer bk = {.kind = interval_ms ? BK_FIXED : BK_ONE, .start = start, .interval = interval_ms};
+    return query_group(t, series, start, end, &bk, opts, out, nout);
+}
+
+int tsdb_query_agg(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
+                   size_t *nout)
+{
+    return tsdb_query_agg_ex(t, series, start, end, interval_ms, NULL, out, nout);
 }
 
 int tsdb_query_group_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
-    int rc = tsdb_query_group(t, series, start, end, group, out, nout);
-    if (opts && opts->limit && *nout > opts->limit)
-        last_stats.result_rows = opts->limit;
-    if (rc || !opts)
-        return rc;
-    if (opts->order == TSDB_DESC)
-        for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {
-            tsdb_bucket x = (*out)[i];
-            (*out)[i] = (*out)[j];
-            (*out)[j] = x;
-        }
-    if (opts->limit && *nout > opts->limit)
-        *nout = opts->limit;
-    return 0;
+    *out = NULL;
+    *nout = 0;
+    bucketer bk;
+    int rc = bucketer_init(&bk, start, group); /* NULL: one bucket */
+    return rc ? rc : query_group(t, series, start, end, &bk, opts, out, nout);
 }
 
 int tsdb_query_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                      tsdb_bucket **out, size_t *nout)
 {
-    eng *e;
-    uint32_t local;
-    *out = NULL;
-    *nout = 0;
-    bucketer bk;
-    int rc = bucketer_init(&bk, start, group); /* NULL: one bucket */
-    if (rc)
-        return rc;
-    qrun qr;
-    qs_begin(&qr);
-    int type = -1;
-    if (route(t, series, &e, &local)) {
-        type = eng_series_type(e, local);
-        rc = eng_query_group(e, local, start, end, &bk, out, nout);
-    }
-    qs_end(&qr, type, *nout);
-    return rc;
+    return tsdb_query_group_ex(t, series, start, end, group, NULL, out, nout);
 }
 
 /* Time-weighted averages: one router for the interval, group and bounds forms. */
@@ -1228,14 +1252,6 @@ static int query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, const
         type = eng_series_type(e, local);
         rc = eng_query_twa(e, local, start, end, bk, opts, out, nout);
     }
-    if (rc == 0 && opts->order == TSDB_DESC)
-        for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {
-            tsdb_twa_bucket x = (*out)[i];
-            (*out)[i] = (*out)[j];
-            (*out)[j] = x;
-        }
-    if (rc == 0 && opts->limit && *nout > opts->limit)
-        *nout = opts->limit;
     qs_end(&qr, type, *nout);
     return rc;
 }
@@ -1278,8 +1294,6 @@ int tsdb_query_twa_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, 
 int tsdb_query_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
-    eng *e;
-    uint32_t local;
     *out = NULL;
     *nout = 0;
     bucketer bk;
@@ -1288,25 +1302,7 @@ int tsdb_query_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
         return rc;
     if (start < bounds[0]) /* rows before the first bound belong to no bucket */
         start = bounds[0];
-    qrun qr;
-    qs_begin(&qr);
-    int type = -1;
-    if (route(t, series, &e, &local)) {
-        type = eng_series_type(e, local);
-        rc = eng_query_group(e, local, start, end, &bk, out, nout);
-    }
-    if (rc == 0 && opts) {
-        if (opts->order == TSDB_DESC)
-            for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {
-                tsdb_bucket x = (*out)[i];
-                (*out)[i] = (*out)[j];
-                (*out)[j] = x;
-            }
-        if (opts->limit && *nout > opts->limit)
-            *nout = opts->limit;
-    }
-    qs_end(&qr, type, *nout);
-    return rc;
+    return query_group(t, series, start, end, &bk, opts, out, nout);
 }
 
 /* The spread: one router for the interval, group and bounds forms, like query_twa. */
@@ -1320,16 +1316,9 @@ static int query_spread(tsdb *t, uint32_t series, int64_t start, int64_t end, co
     int rc = 0, type = -1;
     if (route(t, series, &e, &local)) {
         type = eng_series_type(e, local);
-        rc = eng_query_spread(e, local, start, end, bk, out, nout);
+        rc = eng_query_spread(e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
+                              out, nout);
     }
-    if (rc == 0 && opts && opts->order == TSDB_DESC)
-        for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {
-            tsdb_spread_bucket x = (*out)[i];
-            (*out)[i] = (*out)[j];
-            (*out)[j] = x;
-        }
-    if (rc == 0 && opts && opts->limit && *nout > opts->limit)
-        *nout = opts->limit;
     qs_end(&qr, type, *nout);
     return rc;
 }

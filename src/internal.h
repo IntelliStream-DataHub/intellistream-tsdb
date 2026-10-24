@@ -942,16 +942,32 @@ typedef int (*slot_fn)(void *ctx, const int64_t *ts, const void *v, size_t n);
 int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx);
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
                      slot_fn fn, void *ctx);
-/* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID */
-int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, slot_fn fn, void *ctx);
+/* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID.
+ * desc: the same points newest first; `keep` (0: all) is how many of them the caller takes at most, which bounds
+ * what newest first holds in memory (fn still decides when to stop). */
+int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, bool desc, size_t keep,
+                   slot_fn fn, void *ctx);
 extern size_t lttb_buffer_bytes; /* tests make it small to exercise the two-pass way */
-int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
-                  size_t *nout);
-int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
-                    size_t *nout);
+/* Buckets newest first with desc; at most limit non-empty ones (0: all), computing only about as many. */
+int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool desc,
+                    size_t limit, tsdb_bucket **out, size_t *nout);
 /* the same with the spread: tsdb_spread_bucket results */
-int eng_query_spread(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
-                     tsdb_spread_bucket **out, size_t *nout);
+int eng_query_spread(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool desc,
+                     size_t limit, tsdb_spread_bucket **out, size_t *nout);
+/* Order and limit for a bucketed query (query.c has the design): run computes the non-empty buckets of
+ * [lo, hi), whose ends are bucket edges or the query's, ascending, as rows of `row` bytes (malloc'ed; NULL
+ * when none); bound finds the newest (newest true) or oldest time in [lo, hi) after or before which every
+ * bucket is empty, false when all are (a sentinel such as lo - 1 would overflow at lo = INT64_MIN). */
+typedef struct bk_windows {
+    const bucketer *bk;
+    bool desc;
+    size_t limit;
+    size_t row;
+    void *ctx;
+    int (*run)(void *ctx, int64_t lo, int64_t hi, void **res, size_t *n);
+    bool (*bound)(void *ctx, int64_t lo, int64_t hi, bool newest, int64_t *at);
+} bk_windows;
+int bucket_windows(const bk_windows *w, int64_t start, int64_t end, void **out, size_t *nout);
 int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g);
 int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n);
 int64_t bucketer_key(const bucketer *bk, int64_t ts);    /* the bucket of ts */

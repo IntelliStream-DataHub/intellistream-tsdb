@@ -236,8 +236,9 @@ void tsdb_free(void *p);
  * int64 range when it does not fit, whatever the order of the rows).
  * State: only count is meaningful.
  * Float sums are not bit-reproducible: rows are added in an order that depends
- * on how parts were merged and how the query was split over threads, so the
- * same data can give sums that differ in the last bits, as in ClickHouse; where
+ * on how parts were merged (not on the number of query threads, nor on the
+ * order or limit of the query), so the same rows written differently can give
+ * sums that differ in the last bits, as in ClickHouse; where
  * the running sum overflows (rows near DBL_MAX), one order gives +inf and
  * another NaN. min, max and count are exact. Where
  * reproducible sums matter, store the values as int64 in fixed point (21.3 degC
@@ -263,13 +264,23 @@ int tsdb_query_agg(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_
 
 /* Order (by timestamp) and limit, for raw rows and for buckets. Descending
  * raw queries read backwards window by window, so "the newest N points"
- * touches about N rows. */
+ * touches about N rows. Bucketed queries (aggregates, groups, bounds, the
+ * spread, TWA) with a limit stop early the same way: ascending after the
+ * limit-th non-empty bucket, descending walking back from the end, so "the
+ * last 10 hours" of a year reads about 10 hours of granules. The result is
+ * exactly that of computing every bucket and then cutting (whatever the
+ * deletes, retention, memtable rows or merges); only the query statistics
+ * and TSDB_ERR_TOO_MANY_BUCKETS, which counts the buckets computed, differ. */
 typedef enum { TSDB_ASC = 0, TSDB_DESC = 1 } tsdb_order;
 
 typedef struct tsdb_query_opts {
     tsdb_order order;
     size_t limit; /* 0: no limit */
 } tsdb_query_opts;
+
+/* tsdb_query_agg with order and limit (opts NULL: as tsdb_query_agg). */
+int tsdb_query_agg_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+                      const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
 int tsdb_query_raw_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_raw_fn fn, void *ctx);
@@ -307,6 +318,12 @@ int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, con
  * and for very large buckets a second pass for the means, are not counted). */
 int tsdb_query_lttb(tsdb *db, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
                     void *ctx);
+/* The same points newest first (TSDB_DESC), or only the first `limit` of them in that order: the choice
+ * does not change, since it needs every point of the range anyway (opts NULL: as tsdb_query_lttb). Newest first
+ * holds at most min(limit, threshold) chosen points in memory, and none where the threshold keeps every point
+ * (a backwards read that stops at the limit). */
+int tsdb_query_lttb_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, size_t threshold,
+                       const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx);
 
 /* Calendar grouping, in UTC: `count` units per bucket.
  *  - TSDB_SECOND, _MINUTE, _HOUR: fixed lengths, aligned to multiples of their
@@ -359,7 +376,7 @@ int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, c
  *    deviations from the mean, granule by granule with the parallel formula of
  *    Chan et al.), so a large offset (pressure in Pa around 101325) costs no
  *    precision. Like sums, they may differ in the last bits with the order in
- *    which rows were combined (parts, merges, threads). Constant data gives
+ *    which rows were combined (parts, merges). Constant data gives
  *    exactly 0.
  *  - int64 and bool keep exact integer sums of x and x^2: the variance is
  *    computed from exact moments, with a few roundings at the end (in long

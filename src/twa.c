@@ -375,30 +375,48 @@ out:
     cur_qstats = mine;
 }
 
-int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
-                  const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+/* One TWA query over one snapshot, window by window (bucket_windows in query.c: order, limit, early stop).
+ * A window [start, end) between bucket edges is computed exactly as a query of that range: the readings
+ * around it come from the same snapshot, which reaches around the whole query range. */
+typedef struct twa_run {
+    eng *db;
+    snapshot sn;
+    twa_q q;
+    uint32_t series;
+    int64_t lo, hi; /* the snapshot's reach */
+    int64_t max_gap;
+    bool force_decode;
+    int64_t first, last; /* the earliest and the latest reading in the snapshot (granule bounds) */
+} twa_run;
+
+/* Covered time lies between two readings and a counted reading is one: no bucket before the first reading or
+ * after the last is returned. Empty stretches between readings may still be covered, so only the ends skip. */
+static bool twa_bound(void *ctx, int64_t lo, int64_t hi, bool newest, int64_t *at)
 {
+    const twa_run *R = ctx;
+    if (R->last < lo || R->first >= hi)
+        return false;
+    *at = newest ? MIN(R->last, hi - 1) : MAX(R->first, lo);
+    return true;
+}
+
+static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t *nout)
+{
+    const twa_run *R = ctx;
+    eng *db = R->db;
+    snapshot sn = R->sn; /* a copy to read: eng_query_twa releases it */
+    uint32_t series = R->series;
+    int64_t lo = R->lo, hi = R->hi, max_gap = R->max_gap;
+    bool force_decode = R->force_decode;
+    twa_q q = R->q;
+    q.start = start;
+    q.end = end;
+    const bucketer *bk = q.bk;
+    int type = q.type;
+    tsdb_twa_bucket **out = (tsdb_twa_bucket **)outp;
     *out = NULL;
     *nout = 0;
-    int method = (int)opts->method;
-    int64_t max_gap = opts->max_gap_ms;
-    bool force_decode = opts->no_stats;
-    int type = eng_series_type(db, series);
-    if (type == TSDB_STATE || max_gap < 0 || (method != TSDB_TWA_STEP && method != TSDB_TWA_LINEAR))
-        return TSDB_ERR_INVALID;
-    int64_t cutoff = eng_cutoff(db, series); /* expired rows are gone at once, merged away or not */
-    start = MAX(start, cutoff);
-    if (start >= end || type < 0)
-        return 0;
-    twa_q q = {.bk = bk, .linear = method == TSDB_TWA_LINEAR, .max_gap = (uint64_t)max_gap, .start = start,
-               .end = end, .floor = cutoff, .type = type, .w = type_width(type)};
-    /* the readings around the range that bound its first and last segments; none expired */
-    int64_t lo = MAX(max_gap ? sat_add(start, -max_gap) : INT64_MIN, cutoff);
-    int64_t hi = max_gap ? sat_add(sat_add(end, max_gap), 1) : INT64_MAX;
-    snapshot sn;
-    int rc = snapshot_take(db, series, q.w, lo, hi, &sn);
-    if (rc)
-        return rc;
+    int rc = 0;
 
     size_t nitem = 0, cap = 0;
     twa_item *items = NULL;
@@ -669,6 +687,46 @@ done:
     free(srcs);
     free(acc);
     free(items);
-    snapshot_release(&sn);
+    return rc;
+}
+
+int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+                  const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    int method = (int)opts->method;
+    int64_t max_gap = opts->max_gap_ms;
+    int type = eng_series_type(db, series);
+    if (type == TSDB_STATE || max_gap < 0 || (method != TSDB_TWA_STEP && method != TSDB_TWA_LINEAR))
+        return TSDB_ERR_INVALID;
+    int64_t cutoff = eng_cutoff(db, series); /* expired rows are gone at once, merged away or not */
+    start = MAX(start, cutoff);
+    if (start >= end || type < 0)
+        return 0;
+    twa_run R = {.db = db, .series = series, .max_gap = max_gap, .force_decode = opts->no_stats,
+                 .first = INT64_MAX, .last = INT64_MIN};
+    R.q = (twa_q){.bk = bk, .linear = method == TSDB_TWA_LINEAR, .max_gap = (uint64_t)max_gap, .start = start,
+                  .end = end, .floor = cutoff, .type = type, .w = type_width(type)};
+    /* the readings around the range that bound its first and last segments; none expired */
+    R.lo = MAX(max_gap ? sat_add(start, -max_gap) : INT64_MIN, cutoff);
+    R.hi = max_gap ? sat_add(sat_add(end, max_gap), 1) : INT64_MAX;
+    int rc = snapshot_take(db, series, R.q.w, R.lo, R.hi, &R.sn);
+    if (rc)
+        return rc;
+    for (size_t i = 0; i < R.sn.np; i++)
+        if (R.sn.gi[i] < R.sn.gj[i]) {
+            R.first = MIN(R.first, R.sn.parts[i]->g[R.sn.gi[i]].ts_min);
+            R.last = MAX(R.last, R.sn.parts[i]->g[R.sn.gj[i] - 1].ts_max);
+        }
+    for (size_t i = 0; i < R.sn.nmem; i++)
+        if (R.sn.mem[i].n) {
+            R.first = MIN(R.first, R.sn.mem[i].ts[0]);
+            R.last = MAX(R.last, R.sn.mem[i].ts[R.sn.mem[i].n - 1]);
+        }
+    bk_windows w = {.bk = bk, .desc = opts->order == TSDB_DESC, .limit = opts->limit, .ctx = &R,
+                    .run = twa_window, .bound = twa_bound, .row = sizeof(tsdb_twa_bucket)};
+    rc = bucket_windows(&w, start, end, (void **)out, nout);
+    snapshot_release(&R.sn);
     return rc;
 }

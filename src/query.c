@@ -804,6 +804,12 @@ typedef struct agg_job {
     agg_target t;
     /* striped by bucket range: workers decoding different time ranges rarely meet */
     pthread_mutex_t locks[AGG_STRIPES];
+    /* Each granule's first and last bucket, the only ones other items may share, folded in work order once
+     * the workers are done: a bucket's states combine in one order, however the threads ran (the spread and
+     * float sums depend on it), and a window of the range (bucket_windows) combines as the whole range. */
+    local_bucket *edge; /* 2 per work item, nedge of them set (a count, not a key sentinel: every int64 is a key) */
+    agg_dev *edgex;
+    uint8_t *nedge;
     atomic_int err;
 } agg_job;
 
@@ -839,12 +845,22 @@ static void agg_worker(void *arg, int idx)
         size_t hi = lower_bound_i64(ts, n, j->t.end);
         size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, r->g->nulls > 0, local,
                               localx);
+        j->nedge[w] = nl > 1 ? 2 : (uint8_t)nl;
         if (nl) {
-            /* local buckets ascend: fold each run that falls in one stripe under its lock */
-            for (size_t a = 0; a < nl;) {
+            j->edge[2 * w] = local[0];
+            if (localx)
+                j->edgex[2 * w] = localx[0];
+            if (nl > 1) {
+                j->edge[2 * w + 1] = local[nl - 1];
+                if (localx)
+                    j->edgex[2 * w + 1] = localx[nl - 1];
+            }
+            /* local buckets ascend: fold each run that falls in one stripe under its lock (the buckets between
+             * the edges are this granule's alone: anything else with rows there would overlap it) */
+            for (size_t a = 1; a + 1 < nl;) {
                 size_t stripe = (size_t)((local[a].b - j->t.b0) >> AGG_STRIPE_SHIFT);
                 size_t e = a + 1;
-                while (e < nl && (size_t)((local[e].b - j->t.b0) >> AGG_STRIPE_SHIFT) == stripe)
+                while (e + 1 < nl && (size_t)((local[e].b - j->t.b0) >> AGG_STRIPE_SHIFT) == stripe)
                     e++;
                 pthread_mutex_t *m = &j->locks[stripe % AGG_STRIPES];
                 pthread_mutex_lock(m);
@@ -883,82 +899,261 @@ uint64_t mem_prio(const snapshot *sn, size_t i) { return sn->mprio[i]; }
  * already counted in rows_decoded. */
 bool mem_from_memtable(const snapshot *sn, size_t i) { return sn->mprio[i] >= UINT64_MAX - sn->nmem; }
 
-int eng_query_agg(eng *db, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
-                  size_t *nout)
+/* ------------------------------------------------- order, limit, early stop
+ *
+ * A bucketed query with a limit computes only the buckets it returns, plus
+ * a few: one snapshot of the whole range, then windows whose edges are bucket
+ * edges, from the start (ascending) or from the end (descending), each
+ * computed on its own as if it were the query range, until `limit` non-empty
+ * buckets are in. A bucket lies inside one window, so it is computed from the
+ * same rows, the same granule statistics and in the same order as by one pass
+ * over the whole range: the results are those of computing everything and
+ * cutting. A window spans max(still needed, twice the previous) buckets
+ * counted from the nearest data (w->bound skips empty time), so a sparse
+ * range takes a few windows, and the last N of a long range touch about N
+ * buckets' granules (plus those a window edge cuts, which are decoded). */
+int bucket_windows(const bk_windows *w, int64_t start, int64_t end, void **out, size_t *nout)
 {
     *out = NULL;
     *nout = 0;
-    if (interval < 0)
-        return TSDB_ERR_INVALID;
-    bucketer bk = {.kind = interval ? BK_FIXED : BK_ONE, .start = start, .interval = interval};
-    return eng_query_group(db, series, start, end, &bk, out, nout);
+    if (start >= end)
+        return 0;
+    if (w->limit == 0 || w->bk->kind == BK_ONE) { /* everything, then order and cut */
+        int rc = w->run(w->ctx, start, end, out, nout);
+        if (rc == 0 && w->desc)
+            for (size_t i = 0, j = *nout ? *nout - 1 : 0; i < j; i++, j--) {
+                uint8_t x[sizeof(tsdb_spread_bucket) > sizeof(tsdb_twa_bucket) ? sizeof(tsdb_spread_bucket)
+                                                                                : sizeof(tsdb_twa_bucket)];
+                uint8_t *a = (uint8_t *)*out + i * w->row, *b = (uint8_t *)*out + j * w->row;
+                memcpy(x, a, w->row);
+                memcpy(a, b, w->row);
+                memcpy(b, x, w->row);
+            }
+        if (rc == 0 && w->limit && *nout > w->limit)
+            *nout = w->limit;
+        return rc;
+    }
+    uint8_t *res = NULL;
+    size_t got = 0, span = 0;
+    int64_t kfirst = bk_key(w->bk, start), klast = bk_key(w->bk, end - 1);
+    int64_t lo = start, hi = end;
+    int rc = 0;
+    while (rc == 0 && got < w->limit && lo < hi) {
+        size_t need = w->limit - got;
+        span = MAX(need, span > SIZE_MAX / 2 ? SIZE_MAX : span * 2);
+        uint64_t n = MIN(span, (uint64_t)INT64_MAX);
+        int64_t p; /* the nearest data: buckets before it are empty */
+        if (!w->bound(w->ctx, lo, hi, w->desc, &p))
+            break;
+        int64_t kp = bk_key(w->bk, p), a = lo, b = hi;
+        if (w->desc) {
+            if ((uint64_t)kp - (uint64_t)kfirst >= n)
+                a = bk_start(w->bk, kp - (int64_t)(n - 1));
+        } else if ((uint64_t)klast - (uint64_t)kp >= n) {
+            b = bk_start(w->bk, kp + (int64_t)n);
+        }
+        void *wr;
+        size_t wn;
+        rc = w->run(w->ctx, a, b, &wr, &wn);
+        if (rc)
+            break;
+        uint8_t *r2 = wn ? realloc(res, (got + wn) * w->row) : res;
+        if (wn && !r2) {
+            free(wr);
+            rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        res = r2;
+        for (size_t i = 0; i < wn; i++) /* a window's buckets are ascending */
+            memcpy(res + (got + i) * w->row, (uint8_t *)wr + (w->desc ? wn - 1 - i : i) * w->row, w->row);
+        got += wn;
+        free(wr);
+        if (w->desc)
+            hi = a;
+        else
+            lo = b;
+    }
+    if (rc) {
+        free(res);
+        return rc;
+    }
+    *out = res ? res : malloc(w->row);
+    if (!*out)
+        return TSDB_ERR_NOMEM;
+    *nout = MIN(got, w->limit);
+    return 0;
 }
 
-/* out: tsdb_bucket, or with spread tsdb_spread_bucket (which begins with one) */
-static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool spread,
-                         void **out, size_t *nout)
-{
-    *out = NULL;
-    *nout = 0;
-    int type = eng_series_type(db, series);
-    start = MAX(start, eng_cutoff(db, series)); /* expired rows are gone at once, merged away or not */
-    if (start >= end || type < 0)
-        return 0;
-    snapshot sn;
-    int rc = snapshot_take(db, series, type_width(type), start, end, &sn);
-    if (rc)
-        return rc;
+/* Items that overlap in time form a cluster; one with items of several sources is merged (last write wins).
+ * Clusters are found once for the whole range: a window takes each from it as it is, so every row is folded
+ * the same way (from statistics, decoded, merged) and in the same order as without windows. */
+typedef struct cluster {
+    size_t a, b; /* items [a, b) */
+    int64_t lo, hi;
+    bool multi;
+} cluster;
 
-    /* every granule and memtable run of the series in the range */
-    size_t nitem = 0, cap = 0;
-    item *items = NULL;
-    int64_t dmin = INT64_MAX, dmax = INT64_MIN;
-    for (size_t i = 0; i < sn.np + sn.nmem && rc == 0; i++) {
-        uint32_t gi = 0, gj = 1;
-        if (i < sn.np) {
-            snap_find(&sn, i, series, start, end, &gi, &gj);
-            if (gi < gj) {
-                QS_ADD(parts, 1);
-                QS_ADD(granules, gj - gi);
-            }
-        } else if (mem_from_memtable(&sn, i - sn.np)) {
-            QS_ADD(memtable_rows, sn.mem[i - sn.np].n);
-        }
+/* One bucketed query (aggregates, the spread) over one snapshot, window by window. */
+typedef struct bq {
+    eng *db;
+    const snapshot *sn;
+    uint32_t series;
+    int type;
+    const bucketer *bk;
+    bool spread;
+    item *items; /* every granule and memtable run of the series in the range, by time */
+    size_t nitem;
+    cluster *cl; /* ascending and disjoint in time */
+    size_t ncl;
+} bq;
+
+static int bq_items(bq *q, int64_t start, int64_t end)
+{
+    const snapshot *sn = q->sn;
+    size_t cap = 0;
+    for (size_t i = 0; i < sn->np + sn->nmem; i++) {
+        uint32_t gi = 0, gj;
+        if (i < sn->np)
+            snap_find(sn, i, q->series, start, end, &gi, &gj);
+        else
+            gj = sn->mem[i - sn->np].n > 0;
         for (uint32_t k = gi; k < gj; k++) {
-            if (nitem == cap) {
+            if (q->nitem == cap) {
                 cap = cap ? cap * 2 : 256;
-                item *it = realloc(items, cap * sizeof *it);
-                if (!it) {
-                    rc = TSDB_ERR_NOMEM;
-                    break;
-                }
-                items = it;
+                item *it = realloc(q->items, cap * sizeof *it);
+                if (!it)
+                    return TSDB_ERR_NOMEM;
+                q->items = it;
             }
-            item *it = &items[nitem++];
+            item *it = &q->items[q->nitem++];
             it->src = (uint32_t)i;
-            if (i < sn.np) {
-                it->g = &sn.parts[i]->g[k];
+            if (i < sn->np) {
+                it->g = &sn->parts[i]->g[k];
                 it->lo = it->g->ts_min;
                 it->hi = it->g->ts_max;
             } else {
-                const mem_run *r = &sn.mem[i - sn.np];
+                const mem_run *r = &sn->mem[i - sn->np];
                 it->g = NULL;
                 it->lo = r->ts[0];
                 it->hi = r->ts[r->n - 1];
             }
-            dmin = MIN(dmin, MAX(it->lo, start));
-            dmax = MAX(dmax, MIN(it->hi, end - 1));
         }
     }
+    if (!q->nitem)
+        return 0;
+    qsort(q->items, q->nitem, sizeof *q->items, cmp_item);
+    if (!(q->cl = malloc(q->nitem * sizeof *q->cl)))
+        return TSDB_ERR_NOMEM;
+    const item *items = q->items;
+    for (size_t a = 0; a < q->nitem;) {
+        size_t b = a + 1;
+        int64_t hi = items[a].hi;
+        bool multi = false;
+        while (b < q->nitem && items[b].lo <= hi) {
+            multi |= items[b].src != items[a].src;
+            hi = MAX(hi, items[b].hi);
+            b++;
+        }
+        q->cl[q->ncl++] = (cluster){a, b, items[a].lo, hi, multi};
+        a = b;
+    }
+    return 0;
+}
+
+/* A memtable run's rows in [start, end): a view */
+static mem_run run_cut(const mem_run *r, int64_t start, int64_t end, size_t w)
+{
+    size_t a = lower_bound_i64(r->ts, r->n, start), b = lower_bound_i64(r->ts, r->n, end);
+    return (mem_run){r->ts + a, r->v + a * w, b - a};
+}
+
+/* The newest (oldest) row time in [lo, hi), from the granule index and the memtable runs; a granule that
+ * reaches out of the range answers with the range's edge. False when there is none. */
+static bool bq_bound(void *ctx, int64_t lo, int64_t hi, bool newest, int64_t *at)
+{
+    const bq *q = ctx;
+    const snapshot *sn = q->sn;
+    bool any = false;
+    int64_t best = newest ? INT64_MIN : INT64_MAX;
+    for (size_t i = 0; i < sn->np; i++) {
+        uint32_t gi, gj;
+        snap_find(sn, i, q->series, lo, hi, &gi, &gj);
+        if (gi < gj) {
+            any = true;
+            best = newest ? MAX(best, MIN(sn->parts[i]->g[gj - 1].ts_max, hi - 1))
+                          : MIN(best, MAX(sn->parts[i]->g[gi].ts_min, lo));
+        }
+    }
+    for (size_t i = 0; i < sn->nmem; i++) {
+        mem_run r = run_cut(&sn->mem[i], lo, hi, type_width(q->type));
+        if (r.n) {
+            any = true;
+            best = newest ? MAX(best, r.ts[r.n - 1]) : MIN(best, r.ts[0]);
+        }
+    }
+    *at = best;
+    return any;
+}
+
+/* The buckets of [start, end) (bucket edges, or the query's ends), ascending. out: tsdb_bucket, or with
+ * spread tsdb_spread_bucket (which begins with one) */
+static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *nout)
+{
+    const bq *q = ctx;
+    eng *db = q->db;
+    const snapshot *sn = q->sn;
+    int type = q->type;
+    size_t wd = type_width(type);
+    const bucketer *bk = q->bk;
+    const item *items = q->items;
+    *out = NULL;
+    *nout = 0;
+    if (!q->ncl)
+        return 0;
+    /* the clusters that reach into the window */
+    size_t c0 = 0, c1 = q->ncl;
+    while (c0 < c1) {
+        size_t m = c0 + (c1 - c0) / 2;
+        if (q->cl[m].hi < start)
+            c0 = m + 1;
+        else
+            c1 = m;
+    }
+    for (c1 = c0; c1 < q->ncl && q->cl[c1].lo < end;)
+        c1++;
+    int rc = 0;
+    size_t nin = 0;
+    int64_t dmin = INT64_MAX, dmax = INT64_MIN;
+    uint8_t *seen = calloc(sn->np + 1, 1);
+    if (!seen)
+        return TSDB_ERR_NOMEM;
+    for (size_t k = c0 < c1 ? q->cl[c0].a : 0; c0 < c1 && k < q->cl[c1 - 1].b; k++) {
+        const item *it = &items[k];
+        if (it->hi < start || it->lo >= end)
+            continue;
+        nin++;
+        dmin = MIN(dmin, MAX(it->lo, start));
+        dmax = MAX(dmax, MIN(it->hi, end - 1));
+        if (it->g) {
+            QS_ADD(granules, 1);
+            if (!seen[it->src])
+                QS_ADD(parts, 1);
+            seen[it->src] = 1;
+        } else if (mem_from_memtable(sn, it->src - sn->np)) {
+            QS_ADD(memtable_rows, run_cut(&sn->mem[it->src - sn->np], start, end, wd).n);
+        }
+    }
+    free(seen);
     agg_state *acc = NULL;
     agg_dev *accx = NULL;
     gref *work = NULL;
     src *srcs = NULL;
     codec_ctx *cc = NULL;
     fold_ctx fc = {0};
-    agg_target t = {.start = start, .end = end, .bk = bk, .type = type, .w = type_width(type)};
+    agg_job *j = NULL;
+    agg_target t = {.start = start, .end = end, .bk = bk, .type = type, .w = wd};
     size_t nb = 1;
-    if (rc || nitem == 0)
+    if (nin == 0)
         goto done;
 
     if (bk->kind != BK_ONE) {
@@ -971,40 +1166,33 @@ static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, c
         nb = (size_t)span;
     }
     acc = malloc(nb * sizeof *acc);
-    accx = spread ? malloc(nb * sizeof *accx) : NULL;
-    work = malloc(nitem * sizeof *work);
-    srcs = malloc((sn.np + sn.nmem) * sizeof *srcs);
+    accx = q->spread ? malloc(nb * sizeof *accx) : NULL;
+    work = malloc(nin * sizeof *work);
+    srcs = malloc((sn->np + sn->nmem) * sizeof *srcs);
     cc = cc_get(db);
-    if (!acc || (spread && !accx) || !work || !srcs || !cc) {
+    if (!acc || (q->spread && !accx) || !work || !srcs || !cc) {
         rc = TSDB_ERR_NOMEM;
         goto done;
     }
     for (size_t k = 0; k < nb; k++)
         agg_init(&acc[k], type);
-    for (size_t k = 0; spread && k < nb; k++)
+    for (size_t k = 0; accx && k < nb; k++)
         agg_dev_init(&accx[k]);
     t.acc = acc;
     t.accx = accx;
     fc.t = &t;
 
-    /* clusters of items with overlapping time ranges */
-    qsort(items, nitem, sizeof *items, cmp_item);
     size_t nwork = 0;
-    for (size_t a = 0; a < nitem && rc == 0;) {
-        size_t b = a + 1;
-        int64_t hi = items[a].hi;
-        bool multi = false;
-        while (b < nitem && items[b].lo <= hi) {
-            multi |= items[b].src != items[a].src;
-            hi = MAX(hi, items[b].hi);
-            b++;
-        }
-        if (!multi) {
-            for (size_t k = a; k < b && rc == 0; k++) {
+    for (size_t ci = c0; ci < c1 && rc == 0; ci++) {
+        const cluster *c = &q->cl[ci];
+        if (!c->multi) {
+            for (size_t k = c->a; k < c->b && rc == 0; k++) {
                 const item *it = &items[k];
-                if (!it->g) { /* a memtable run: already clipped to the range */
-                    const mem_run *r = &sn.mem[it->src - sn.np];
-                    if (fold_emit(&fc, r->ts, r->v, r->n))
+                if (it->hi < start || it->lo >= end)
+                    continue;
+                if (!it->g) {
+                    mem_run r = run_cut(&sn->mem[it->src - sn->np], start, end, wd);
+                    if (r.n && fold_emit(&fc, r.ts, r.v, r.n))
                         rc = TSDB_ERR_NOMEM;
                     continue;
                 }
@@ -1021,56 +1209,77 @@ static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, c
                     agg_from_granule(type, g, &ga, accx ? &gx : NULL);
                     agg_combine(&acc[bmin - t.b0], accx ? &accx[bmin - t.b0] : NULL, &ga, &gx, type);
                 } else
-                    work[nwork++] = (gref){sn.parts[it->src], g};
+                    work[nwork++] = (gref){sn->parts[it->src], g};
             }
-        } else {
-            /* sources overlap here: merge them so replaced rows are not counted */
-            size_t ns = 0;
-            for (uint32_t s = 0; s < sn.np + sn.nmem; s++) {
-                uint32_t gi = UINT32_MAX, gj = 0;
-                bool any = false;
-                for (size_t k = a; k < b; k++) {
-                    if (items[k].src != s)
-                        continue;
-                    any = true;
-                    if (s < sn.np) {
-                        uint32_t idx = (uint32_t)(items[k].g - sn.parts[s]->g);
-                        gi = MIN(gi, idx);
-                        gj = MAX(gj, idx + 1);
-                    }
-                }
-                if (!any)
-                    continue;
-                if (s < sn.np)
-                    src_init_part(&srcs[ns++], sn.parts[s], gi, gj, type);
-                else
-                    src_init_mem(&srcs[ns++], &sn.mem[s - sn.np], mem_prio(&sn, s - sn.np), type);
-            }
-            rc = merge_stream(cc, srcs, ns, start, end, fold_emit, &fc);
-            if (rc == TSDB_ERR_STOPPED)
-                rc = TSDB_ERR_NOMEM;
-            for (size_t k = 0; k < ns; k++)
-                src_free(&srcs[k]);
+            continue;
         }
-        a = b;
+        /* sources overlap here: merge them so replaced rows are not counted */
+        size_t ns = 0;
+        for (uint32_t s = 0; s < sn->np + sn->nmem; s++) {
+            uint32_t gi = UINT32_MAX, gj = 0;
+            bool any = false;
+            for (size_t k = c->a; k < c->b; k++) {
+                const item *it = &items[k];
+                if (it->src != s || it->hi < start || it->lo >= end)
+                    continue;
+                any = true;
+                if (s < sn->np) {
+                    uint32_t idx = (uint32_t)(it->g - sn->parts[s]->g);
+                    gi = MIN(gi, idx);
+                    gj = MAX(gj, idx + 1);
+                }
+            }
+            if (!any)
+                continue;
+            if (s < sn->np) {
+                src_init_part(&srcs[ns++], sn->parts[s], gi, gj, type);
+            } else {
+                mem_run r = run_cut(&sn->mem[s - sn->np], start, end, wd);
+                if (r.n)
+                    src_init_mem(&srcs[ns++], &r, mem_prio(sn, s - sn->np), type);
+            }
+        }
+        rc = merge_stream(cc, srcs, ns, start, end, fold_emit, &fc);
+        if (rc == TSDB_ERR_STOPPED)
+            rc = TSDB_ERR_NOMEM;
+        for (size_t k = 0; k < ns; k++)
+            src_free(&srcs[k]);
     }
     if (rc == 0 && nwork) {
-        agg_job j = {.db = db, .qs = cur_qstats, .work = work, .nwork = nwork, .t = t};
-        atomic_init(&j.next, 0);
-        atomic_init(&j.err, 0);
+        j = calloc(1, sizeof *j);
+        local_bucket *edge = j ? malloc(2 * nwork * sizeof *edge) : NULL;
+        agg_dev *edgex = j && accx ? malloc(2 * nwork * sizeof *edgex) : NULL;
+        uint8_t *nedge = j ? calloc(nwork, 1) : NULL;
+        if (!edge || !nedge || (accx && !edgex)) {
+            free(edge);
+            free(edgex);
+            free(nedge);
+            rc = TSDB_ERR_NOMEM;
+            goto done;
+        }
+        *j = (agg_job){.db = db, .qs = cur_qstats, .work = work, .nwork = nwork, .t = t, .edge = edge,
+                       .edgex = edgex, .nedge = nedge};
+        atomic_init(&j->next, 0);
+        atomic_init(&j->err, 0);
         for (int k = 0; k < AGG_STRIPES; k++)
-            pthread_mutex_init(&j.locks[k], NULL);
+            pthread_mutex_init(&j->locks[k], NULL);
         int threads = nwork >= PARALLEL_MIN_GRANULES ? (int)MIN((size_t)db->opt.query_threads, nwork) : 1;
-        pool_run(db->qpool, threads, agg_worker, &j);
+        pool_run(db->qpool, threads, agg_worker, j);
         for (int k = 0; k < AGG_STRIPES; k++)
-            pthread_mutex_destroy(&j.locks[k]);
-        rc = atomic_load(&j.err);
+            pthread_mutex_destroy(&j->locks[k]);
+        rc = atomic_load(&j->err);
+        for (size_t w = 0; rc == 0 && w < nwork; w++)
+            for (size_t k = 2 * w; k < 2 * w + nedge[w]; k++)
+                fold_into(&t, &edge[k], edgex ? &edgex[k] : NULL, 1);
+        free(edge);
+        free(edgex);
+        free(nedge);
     }
     if (rc == 0) {
         size_t nonempty = 0;
         for (size_t k = 0; k < nb; k++)
             nonempty += acc[k].rows != 0;
-        size_t row = spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
+        size_t row = q->spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
         uint8_t *res = malloc((nonempty ? nonempty : 1) * row);
         if (!res) {
             rc = TSDB_ERR_NOMEM;
@@ -1082,7 +1291,7 @@ static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, c
                 tsdb_bucket *r = (tsdb_bucket *)(res + o * row);
                 r->start = bk_start(bk, t.b0 + (int64_t)k);
                 agg_to_bucket(type, &acc[k], r);
-                if (spread)
+                if (q->spread)
                     agg_spread(type, &acc[k], &accx[k], (tsdb_spread_bucket *)r);
                 o++;
             }
@@ -1093,27 +1302,51 @@ static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, c
 done:
     if (cc)
         cc_put(db, cc);
+    free(j);
     free(fc.scratch);
     free(fc.scratchx);
     free(acc);
     free(accx);
     free(work);
     free(srcs);
-    free(items);
+    return rc;
+}
+
+static int query_buckets(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool spread,
+                         bool desc, size_t limit, void **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    int type = eng_series_type(db, series);
+    start = MAX(start, eng_cutoff(db, series)); /* expired rows are gone at once, merged away or not */
+    if (start >= end || type < 0)
+        return 0;
+    snapshot sn;
+    int rc = snapshot_take(db, series, type_width(type), start, end, &sn);
+    if (rc)
+        return rc;
+    bq q = {.db = db, .sn = &sn, .series = series, .type = type, .bk = bk, .spread = spread};
+    rc = bq_items(&q, start, end);
+    bk_windows w = {.bk = bk, .desc = desc, .limit = limit, .ctx = &q, .run = bq_window, .bound = bq_bound,
+                    .row = spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket)};
+    if (rc == 0)
+        rc = bucket_windows(&w, start, end, out, nout);
+    free(q.items);
+    free(q.cl);
     snapshot_release(&sn);
     return rc;
 }
 
-int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, tsdb_bucket **out,
-                    size_t *nout)
+int eng_query_group(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool desc,
+                    size_t limit, tsdb_bucket **out, size_t *nout)
 {
-    return query_buckets(db, series, start, end, bk, false, (void **)out, nout);
+    return query_buckets(db, series, start, end, bk, false, desc, limit, (void **)out, nout);
 }
 
-int eng_query_spread(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
-                     tsdb_spread_bucket **out, size_t *nout)
+int eng_query_spread(eng *db, uint32_t series, int64_t start, int64_t end, const bucketer *bk, bool desc,
+                     size_t limit, tsdb_spread_bucket **out, size_t *nout)
 {
-    return query_buckets(db, series, start, end, bk, true, (void **)out, nout);
+    return query_buckets(db, series, start, end, bk, true, desc, limit, (void **)out, nout);
 }
 
 /* -------------------------------------------------------------------- raw */
@@ -1711,7 +1944,67 @@ static int lttb_count(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t serie
     return rc;
 }
 
-int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, slot_fn fn, void *ctx)
+/* Newest first: the choice runs oldest first (each point depends on the one chosen before it), so the last `cap`
+ * chosen points are kept in a ring, grown as they come (never more than were chosen), and sent backwards. */
+typedef struct lttb_ring {
+    size_t w, cap, alloc, total;
+    int err;
+    int64_t *ts;
+    uint8_t *v;
+} lttb_ring;
+
+static int lttb_ring_cb(void *arg, const int64_t *ts, const void *v, size_t n)
+{
+    lttb_ring *g = arg;
+    for (size_t k = 0; k < n; k++, g->total++) {
+        if (g->total < g->cap && g->total == g->alloc) {
+            size_t a = MIN(g->cap, MAX(g->alloc * 2, (size_t)1024));
+            int64_t *t2 = realloc(g->ts, a * sizeof *t2);
+            if (t2)
+                g->ts = t2;
+            uint8_t *v2 = t2 ? realloc(g->v, a * g->w) : NULL;
+            if (!v2) {
+                g->err = TSDB_ERR_NOMEM;
+                return 1;
+            }
+            g->v = v2;
+            g->alloc = a;
+        }
+        size_t i = g->total % g->cap;
+        g->ts[i] = ts[k];
+        memcpy(g->v + i * g->w, (const uint8_t *)v + k * g->w, g->w);
+    }
+    return 0;
+}
+
+static void reverse_slots(int64_t *ts, uint8_t *v, size_t w, size_t n)
+{
+    for (size_t i = 0, j = n; i + 1 < j; i++, j--) {
+        int64_t x = ts[i];
+        ts[i] = ts[j - 1];
+        ts[j - 1] = x;
+        uint8_t tmp[8];
+        memcpy(tmp, v + i * w, w);
+        memcpy(v + i * w, v + (j - 1) * w, w);
+        memcpy(v + (j - 1) * w, tmp, w);
+    }
+}
+
+/* the ring newest first: [0, head) holds the newest, [head, kept) the older ones */
+static int lttb_ring_send(lttb_ring *g, slot_fn fn, void *ctx)
+{
+    size_t kept = MIN(g->total, g->cap), head = g->total > g->cap ? g->total % g->cap : kept;
+    reverse_slots(g->ts, g->v, g->w, head);
+    reverse_slots(g->ts + head, g->v + head * g->w, g->w, kept - head);
+    if (head && fn(ctx, g->ts, g->v, head))
+        return TSDB_ERR_STOPPED;
+    if (kept > head && fn(ctx, g->ts + head, g->v + head * g->w, kept - head))
+        return TSDB_ERR_STOPPED;
+    return 0;
+}
+
+int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t threshold, bool desc, size_t keep,
+                   slot_fn fn, void *ctx)
 {
     if (threshold < 3)
         return TSDB_ERR_INVALID;
@@ -1730,6 +2023,7 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
         snapshot_release(&sn);
         return TSDB_ERR_NOMEM;
     }
+    lttb_ring ring = {0};
     lttb_run *r = calloc(1, sizeof *r);
     if (!r) {
         rc = TSDB_ERR_NOMEM;
@@ -1747,8 +2041,15 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
     if (rc || r->n == 0)
         goto out;
     if (r->n <= threshold) {
-        rc = raw_range(db, cc, &sn, series, type, start, end, lttb_all_cb, r);
+        /* every point: newest first is a backwards read, which stops early with the caller */
+        rc = desc ? raw_desc(db, cc, &sn, series, type, start, end, 0, lttb_all_cb, r)
+                  : raw_range(db, cc, &sn, series, type, start, end, lttb_all_cb, r);
     } else {
+        if (desc) {
+            ring = (lttb_ring){.w = r->w, .cap = keep ? MIN(keep, threshold) : threshold};
+            r->fn = lttb_ring_cb;
+            r->ctx = &ring;
+        }
         r->nb = threshold - 2;
         r->every = (double)(r->n - 2) / (double)r->nb;
         /* the largest bucket: floor(e) + 1 points, one more for rounding; bucket nb (the
@@ -1793,7 +2094,13 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
         rc = r->err ? r->err : TSDB_ERR_STOPPED;
     if (rc == 0 && r->i != r->n)
         rc = TSDB_ERR_CORRUPT; /* the granule index promised more points than the parts hold */
+    if (rc == TSDB_ERR_STOPPED && ring.err)
+        rc = ring.err;
+    if (rc == 0 && r->fn == lttb_ring_cb)
+        rc = lttb_ring_send(&ring, fn, ctx);
 out:
+    free(ring.ts);
+    free(ring.v);
     if (r) {
         free(r->cur.ts);
         free(r->cur.v);
