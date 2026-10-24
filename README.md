@@ -93,6 +93,30 @@ over TCP. Each is compared only with systems used the same way.
   table, Prometheus in the second, and columns for LTTB downsampling and
   time-weighted averages.
 
+**Compression per kind of sensor (values only)**
+
+| sensor | tsdb: bits per reading | compression | 1 million readings | Gorilla (InfluxDB, Prometheus, ClickHouse) | ALP (DuckDB) |
+|---|---:|---:|---:|---:|---:|
+| SMART disk temperature, 0.1 °C, every 60 s | **0.88** | 36.4x | 110 KB | 2.66 | 2.36 |
+| CPU temperature with spikes, every 1 s | **2.99** | 10.7x | 374 KB | 10.82 | 4.97 |
+| tank pressure, 0.001 bar, every 10 s | **1.82** | 17.6x | 228 KB | 9.09 | 5.97 |
+| tank pressure converted to psi (not rounded) | **19.50** | 1.6x | 2.44 MB | 23.77 | - |
+| vibration, 16-bit sensor at 1000 readings/s | **14.02** | 2.3x | 1.75 MB | 21.51 | - |
+| pipeline flow rate, 0.01 m³/h | **10.72** | 3.0x | 1.34 MB | 23.08 | 12.29 |
+| pipeline flow totalizer, m³ | **1.68** | 19.0x | 210 KB | 8.68 | - |
+| random numbers (no pattern at all) | **27.29** | 1.2x | 3.41 MB | 32.32 | - |
+
+- Bits per reading for the value alone: a raw float takes 32. Timestamps come
+  on top and cost almost nothing on a steady clock. Measured with
+  `build/codec-bench`; sizes are exact.
+- Every method here has zstd on top. ClickHouse adds zstd to Gorilla like this;
+  InfluxDB, Prometheus and DuckDB do not, so their real sizes are larger than
+  shown: the comparison favours them.
+- "-": ALP does not apply to that data (it is not in fixed decimal steps); DuckDB
+  then uses another method.
+- The more regular the sensor, the bigger the gain: slow, rounded sensors
+  shrink 10 to 36 times; noisy or unrounded data has less pattern to remove.
+
 At 100 billion rows, tsdb needs 116 GB where ClickHouse needs 170 GB. A summary
 of the whole table takes 0.17 seconds instead of 59.
 
