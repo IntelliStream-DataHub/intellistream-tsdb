@@ -700,13 +700,18 @@ typedef struct agg_target {
 
 
 /* One run of rows into a: float32 without nulls goes straight to the SIMD
- * kernel, which matters when buckets hold a handful of rows each. */
+ * kernel, which matters when buckets hold a handful of rows each. A short run takes the short-run kernel (the
+ * same bits, as values.c's fold_f32 picks it): the long kernel's setup and 32-lane combine cost more than the
+ * fold itself at a few rows (tsdb-bench "agg buckets of 10", AVX-512: 10% faster). */
 static inline void fold_run(const agg_target *t, const uint8_t *v, size_t n, bool may_be_null, agg_state *a,
                             agg_dev *x)
 {
     if (t->type == TSDB_FLOAT32 && !may_be_null) {
         a->rows += n;
-        simd_agg_f32((const float *)v, n, a, x);
+        if (n < simd_short)
+            simd_small_f32((const float *)v, n, false, a, x);
+        else
+            simd_agg_f32((const float *)v, n, a, x);
     } else {
         agg_fold_hint(t->type, v, n, may_be_null, a, x);
     }
