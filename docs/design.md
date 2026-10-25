@@ -920,15 +920,28 @@ These are indicative only (measured on a busy machine):
 |---|---|
 | ALP | per vector: unpack, `(float)(int32)(u + base) * 10^f * 10^-e`, patch the exceptions; no value depends on another |
 | ALP_rd | unpack indexes and low parts, OR in `dict[idx & 7] << r` without a branch, patch the exceptions |
-| `decimal_bp` | per vector: unpack, running sum `k += unzigzag(z)`, `(float)((double)k * inv)`; exceptions patched at the end |
+| `decimal_bp` | per vector: unpack, prefix sum of the zigzag deltas four lanes at a time relative to the vector's first integer, `(float)((base + r) * inv)`; exceptions patched at the end |
 | `decimal` | after ZSTD, a running sum over 1-, 2- or 4-byte deltas |
-| float64 fixed point | the integer codec straight into the output buffer, then converted to doubles in place |
+| float64 fixed point | the integer codec straight into the output buffer (the same prefix sum, added to the vector's first integer in 64 bits), then converted to doubles in place |
 
 Unpacking is one function per bit width, with the width a compile-time
 constant and one unaligned 8-byte load per value (src/bitpack.h). The running
-sum is the serial step of `decimal_bp`, which is why ALP, with the same
-unpacking and no sum, decodes twice as fast (codec alone; 1.5 times with
-ZSTD).
+sum was the serial step of `decimal_bp`: one add chain through every value,
+which is why ALP, with the same unpacking and no sum, decoded twice as fast.
+`zz_prefix32` (src/bitpack.h) now sums four lanes at a time with SSE2, which
+every x86-64 has, so the same code runs at every CPU level: two shifted adds
+give the prefix within four values, the last lane of the previous four is
+added as the carry. The sums are taken relative to the vector's first integer
+`k`, in 32 bits; that is exact when the vector's deltas are at most 22 bits
+wide (1024 deltas in [-2^21, 2^21) sum to within int32). The float is then
+`(float)((k + r) * inv)` with `k + r` computed in double: `k` (at most 2^53)
+and `r` are exact doubles, so their sum is one rounding of the integer
+`k + r`, which is what the sequential loop converted, and the bits are
+identical. Wider vectors, or a damaged block whose `k` lies beyond 2^53, take
+the sequential loop. The int64 codec (int64, bool, state, and float64 fixed
+point) uses the same sum, added to `k` in 64-bit integers.
+`tests/test_levels.c` checks both against the sequential loops on crafted
+blocks at every width and at the limits.
 
 A portable build (`make dist`, baseline x86-64-v2) compiles the codec files
 (codec.c, codec_alp.c, codec_typed.c, codec_xor.c, values.c) three times, for

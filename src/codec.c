@@ -499,6 +499,8 @@ size_t decimal_encode(const float *in, size_t n, uint8_t *out)
  *   u8 scale | u8 0 | i64 first | u32 nexc | per vector: u8 bits, packed deltas | exceptions
  */
 #define DBP_VEC 1024
+#define DBP_REL_LIMIT 9007199254740992ll /* 2^53: integers up to it are exact doubles */
+_Static_assert(DBP_VEC <= 1024, "zz_prefix32 sums at most 1024 deltas");
 
 size_t decimal_bp_bound(size_t n) { return DEC_HDR + n * 4 + (n / DBP_VEC + 1) * 5 + (n / 16 + 1) * 8 + 16; }
 
@@ -565,7 +567,19 @@ int decimal_bp_decode(const uint8_t *in, size_t len, size_t n, float *out)
         unpack(p, nv, w, z);
         p += pb;
         float *o = out + v0 + 1;
-        for (size_t i = 0; i < nv; i++) {
+        int64_t ks = (int64_t)k;
+        if (w <= ZZ_PREFIX32_MAX_W && ks >= -DBP_REL_LIMIT && ks <= DBP_REL_LIMIT) {
+            /* the sums r relative to k fit an int32 (zz_prefix32); k is exact in a double, so base + r
+             * is one rounding of the integer k + r, as (double)(k + r) is: the running sum's bits, with
+             * its dependency chain gone and the conversion vectorized */
+            uint32_t total = zz_prefix32(z, nv);
+            const double base = (double)ks;
+            for (size_t i = 0; i < nv; i++)
+                o[i] = (float)((base + (double)(int32_t)z[i]) * inv);
+            k += (uint64_t)(int64_t)(int32_t)total;
+            continue;
+        }
+        for (size_t i = 0; i < nv; i++) { /* wide deltas, or a damaged first value */
             k += (uint64_t)unzigzag(z[i]);
             o[i] = (float)((double)(int64_t)k * inv);
         }

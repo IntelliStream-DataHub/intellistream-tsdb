@@ -17,6 +17,7 @@
  *   test_levels            (TSDB_CPU caps the levels it can reach)
  */
 #include "internal.h"
+#include "bitpack.h"
 #include "../tools/datasets.h"
 
 #include <float.h>
@@ -473,6 +474,112 @@ static void codec(rec *r, const input *x, const char *what, enc_fn enc, dec_fn d
 
 #define CODEC(name, src, w) codec(r, x, #name, (enc_fn)name##_encode, (dec_fn)name##_decode, src, w)
 
+/* ---- the running sums of the bit-packed decoders, against plain sequential loops ----
+ * decimal_bp and int_bp sum zigzag deltas four lanes at a time, relative to the vector's start, where the
+ * widths and the starting value allow it (bitpack.h, zz_prefix32). Crafted blocks put every width and the
+ * extremes of the widest deltas it takes (and the next width) at vectors of every length, from starting
+ * values at and beyond 2^53, where a double stops being exact: the output must equal these references. */
+static int ref_dbp_decode(const uint8_t *in, size_t len, size_t n, float *out)
+{
+    uint64_t k;
+    memcpy(&k, in + 2, 8);
+    static const double inv[] = {1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10};
+    const double sc = in[0] <= 10 ? inv[in[0]] : 1.0 / (double)(1L << (in[0] - 10));
+    const uint8_t *p = in + 14, *end = in + len;
+    uint32_t z[1024];
+    out[0] = (float)((double)(int64_t)k * sc);
+    for (size_t v0 = 0; v0 + 1 < n; v0 += 1024) {
+        size_t nv = MIN((size_t)1024, n - 1 - v0);
+        int w = *p++;
+        unpack(p, nv, w, z);
+        p += packed_bytes(nv, w);
+        for (size_t i = 0; i < nv; i++) {
+            k += (uint64_t)((int64_t)(z[i] >> 1) ^ -(int64_t)(z[i] & 1));
+            out[v0 + 1 + i] = (float)((double)(int64_t)k * sc);
+        }
+    }
+    return p == end ? 0 : -1;
+}
+
+static int ref_ibp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out)
+{
+    uint64_t k;
+    memcpy(&k, in, 8);
+    const uint8_t *p = in + 8, *end = in + len;
+    uint32_t z[1024];
+    out[0] = (int64_t)k;
+    for (size_t v0 = 1; v0 < n; v0 += 1024) {
+        size_t nv = MIN((size_t)1024, n - v0);
+        int w = *p++;
+        unpack(p, nv, w, z);
+        p += packed_bytes(nv, w);
+        for (size_t i = 0; i < nv; i++) {
+            k += (uint64_t)((int64_t)(z[i] >> 1) ^ -(int64_t)(z[i] & 1));
+            out[v0 + i] = (int64_t)k;
+        }
+    }
+    return p == end ? 0 : -1;
+}
+
+static void crafted_sums(rec *r)
+{
+    static const size_t lens[] = {2, 3, 4, 5, 6, 7, 8, 9, 1024, 1025, 1026, 1027, 1028, 1029, 2049, 2050, 3075, 8192};
+    const int64_t P53 = 9007199254740992ll;
+    const int64_t firsts[] = {0, 1, -1, 123456789, P53 - 1, P53, P53 + 1, P53 + 3, -P53 + 1, -P53, -P53 - 1, -P53 - 3,
+                              INT64_MAX, INT64_MIN, (int64_t)1 << 62};
+    enum { NF = sizeof firsts / sizeof *firsts };
+    uint64_t s = 99;
+    uint32_t *z = malloc(1024 * sizeof *z);
+    uint8_t *blk = malloc(14 + 9 * (1024 * 4 + 8) + BLK_SLACK);
+    for (int c = 0; c < 600; c++) {
+        size_t n = lens[c % (sizeof lens / sizeof *lens)];
+        int64_t first = c % 4 == 3 ? (int64_t)(s = ds_mix(s + c)) : firsts[(c / 4) % NF];
+        bool dbp = c & 1;
+        size_t hdr = dbp ? 14 : 8;
+        memset(blk, 0, 14);
+        if (dbp) {
+            blk[0] = (uint8_t)(c / 2 % 35);
+            memcpy(blk + 2, &first, 8);
+        } else {
+            memcpy(blk, &first, 8);
+        }
+        uint8_t *o = blk + hdr;
+        for (size_t v0 = 0; v0 + 1 < n; v0 += 1024) {
+            size_t nv = MIN((size_t)1024, n - 1 - v0);
+            s = ds_mix(s + v0 + 1);
+            int mode = (int)(s % 5);
+            /* widths around the widest the relative sums take, or any; deltas the most negative (odd zigzags),
+             * the most positive (even), or random */
+            int w = mode < 3 ? ZZ_PREFIX32_MAX_W - 1 + (int)(s >> 8) % 3 : (int)((s >> 8) % 33);
+            uint32_t top = w == 32 ? UINT32_MAX : (uint32_t)((1ull << w) - 1);
+            for (size_t i = 0; i < nv; i++) {
+                s = ds_mix(s + i);
+                z[i] = mode == 0 ? top : mode == 1 ? top & ~1u : (uint32_t)s & top;
+            }
+            *o++ = (uint8_t)w;
+            pack(z, nv, w, o);
+            o += packed_bytes(nv, w);
+        }
+        size_t len = (size_t)(o - blk);
+        memset(o, 0x5a, BLK_SLACK);
+        memset(dec, 0xa5, n * 8);
+        memset(dec + n * 8, 0xa5, n * 8);
+        int rc = dbp ? decimal_bp_decode(blk, len, n, (float *)dec) : int_bp_decode(blk, len, n, (int64_t *)dec);
+        int rc2 = dbp ? ref_dbp_decode(blk, len, n, (float *)(dec + n * 8))
+                      : ref_ibp_decode(blk, len, n, (int64_t *)(dec + n * 8));
+        size_t w = dbp ? 4 : 8;
+        char what[64];
+        snprintf(what, sizeof what, "crafted %s %d", dbp ? "decimal_bp" : "int_bp", c);
+        put(r, what, "running sums", dec, n * w);
+        if (rc != 0 || rc2 != 0 || memcmp(dec, dec + n * 8, n * w) != 0) {
+            fprintf(stderr, "%s (n %zu, first %lld): differs from the sequential sum\n", what, n, (long long)first);
+            failures++;
+        }
+    }
+    free(z);
+    free(blk);
+}
+
 /* The lengths of the prefixes folded and searched: every one up to SHORT_LENS (the short runs, the kernels' tails,
  * most of the sets' thresholds), the longer thresholds on both sides (check_thresholds), then all of it. */
 #define SHORT_LENS 66
@@ -529,6 +636,7 @@ static void twa_ref(int type, const int64_t *ts, const void *v, size_t n, twa_su
 
 static void run(rec *r, codec_ctx *c)
 {
+    crafted_sums(r);
     for (int k = 0; k < nin; k++) {
         const input *x = &in[k];
         size_t w = type_width(x->type);
@@ -785,7 +893,7 @@ int main(void)
     check_dispatch();
     make_inputs();
     buf = malloc(BUF(GR) + BLK_SLACK);
-    dec = malloc(GR * 8 + BLK_SLACK);
+    dec = malloc(GR * 16 + BLK_SLACK);
     static const char *const kernels[] = {"scalar", "sse", "avx", "avx2", "avx512"};
     static const int kmin[] = {CPU_BASE, CPU_BASE, CPU_BASE, CPU_V3, CPU_V4}; /* the lowest level of each */
     rec base = {0};

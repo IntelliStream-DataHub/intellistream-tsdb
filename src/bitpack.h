@@ -4,6 +4,9 @@
 
 #include <stdint.h>
 #include <string.h>
+#if defined(__SSE2__)
+#include <emmintrin.h> /* x86-64 baseline: every CPU level has it */
+#endif
 
 
 static inline int bits_for(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
@@ -63,6 +66,42 @@ static inline void unpack(const uint8_t *in, size_t n, int w, uint32_t *out)
         memset(out, 0, n * sizeof *out);
     else
         unpack_fn[w](in, n, out);
+}
+
+/*
+ * In place: z[i], a zigzag delta, becomes the sum of the decoded deltas
+ * z[0..i] modulo 2^32; returns the sum of all n. Four lanes at a time (a
+ * prefix sum by two shifted adds, then the carry of the previous four): the
+ * running sum is the loop-carried dependency that made decoding run at the
+ * speed of one scalar add chain. Integer arithmetic, so every CPU level gets
+ * the same bits. Callers that need the sums as signed integers must keep them
+ * within int32: zigzag deltas below 2^22 decode to [-2^21, 2^21), and 1024 of
+ * them sum to [-2^31, 2^31 - 1024].
+ */
+#define ZZ_PREFIX32_MAX_W 22 /* for up to 1024 values */
+static inline uint32_t zz_prefix32(uint32_t *z, size_t n)
+{
+    uint32_t acc = 0;
+    size_t i = 0;
+#if defined(__SSE2__)
+    const __m128i one = _mm_set1_epi32(1), zero = _mm_setzero_si128();
+    __m128i carry = zero;
+    for (; i + 4 <= n; i += 4) {
+        __m128i x = _mm_loadu_si128((const __m128i *)(const void *)(z + i));
+        x = _mm_xor_si128(_mm_srli_epi32(x, 1), _mm_sub_epi32(zero, _mm_and_si128(x, one)));
+        x = _mm_add_epi32(x, _mm_slli_si128(x, 4));
+        x = _mm_add_epi32(x, _mm_slli_si128(x, 8));
+        x = _mm_add_epi32(x, carry);
+        _mm_storeu_si128((__m128i *)(void *)(z + i), x);
+        carry = _mm_shuffle_epi32(x, 0xff);
+    }
+    acc = (uint32_t)_mm_cvtsi128_si32(carry);
+#endif
+    for (; i < n; i++) {
+        acc += (z[i] >> 1) ^ (0u - (z[i] & 1));
+        z[i] = acc;
+    }
+    return acc;
 }
 
 #endif

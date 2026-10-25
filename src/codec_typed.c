@@ -29,6 +29,7 @@
 #include <stdlib.h>
 
 #define IBP_VEC 1024
+_Static_assert(IBP_VEC <= 1024, "zz_prefix32 sums at most 1024 deltas");
 
 static inline uint64_t zz(int64_t x) { return ((uint64_t)x << 1) ^ (uint64_t)(x >> 63); }
 static inline int64_t unzz(uint64_t z) { return (int64_t)(z >> 1) ^ -(int64_t)(z & 1); }
@@ -103,6 +104,13 @@ static size_t int_bp_decode_prefix(const uint8_t *in, size_t len, size_t n, int6
             return 0;
         unpack(p, nv, w, z);
         p += pb;
+        if (w <= ZZ_PREFIX32_MAX_W) { /* the sums relative to k fit an int32: no add chain (bitpack.h) */
+            uint32_t total = zz_prefix32(z, nv);
+            for (size_t i = 0; i < nv; i++)
+                out[v0 + i] = (int64_t)((uint64_t)k + (uint64_t)(int64_t)(int32_t)z[i]);
+            k = (int64_t)((uint64_t)k + (uint64_t)(int64_t)(int32_t)total);
+            continue;
+        }
         for (size_t i = 0; i < nv; i++) {
             k = (int64_t)((uint64_t)k + (uint64_t)unzz(z[i]));
             out[v0 + i] = k;
