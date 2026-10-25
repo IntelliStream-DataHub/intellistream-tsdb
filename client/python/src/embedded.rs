@@ -15,10 +15,11 @@ use std::sync::{Mutex, RwLock};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyList, PyTuple};
 
 use ::tsdb_client as tc;
 
+use crate::arrays::{BucketsMany, Insert, agg_queries, inserts, many_cols, points_list, range_queries};
 use tc::ValueType;
 
 use crate::{
@@ -553,6 +554,89 @@ impl Db {
         let o = opts(order, limit)?;
         let bounds = ts_column(bounds)?;
         self.query(py, |d| d.query_bounds(series, range(start, end), &bounds, o).map(buckets))
+    }
+
+    /// Runs many raw float32 queries at once, in parallel on every CPU.
+    ///
+    /// One call answers a query per entry of series, with the GIL released
+    /// for all of them: a single Python thread uses every core, and the
+    /// interpreter is crossed once per call rather than once per query.
+    ///
+    /// Args:
+    ///     series: Series ids: a list or a numpy array (uint32), one per query.
+    ///     start, end: None (unbounded), one timestamp for every query, or a
+    ///         list or int64 array with one per query; [start, end) in ms.
+    ///     order: "asc" or "desc".
+    ///     limit: At most this many rows per query; None is all.
+    ///
+    /// Returns:
+    ///     A list with (timestamps, values) of each query, in query order: an
+    ///     int64 and a float32 numpy array, as query_raw() returns them.
+    ///     Needs numpy.
+    ///
+    /// Raises:
+    ///     TsdbError: The first failing query's error (in query order).
+    #[pyo3(signature = (series, start = None, end = None, *, order = "asc", limit = None))]
+    fn query_raw_many<'py>(
+        &self,
+        py: Python<'py>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let (o, q) = (opts(order, limit)?, range_queries(series, start, end)?);
+        let p = self.with(py, |d| d.query_points_many(&q, o))?;
+        points_list(py, p)
+    }
+
+    /// Runs many aggregate queries at once, in parallel on every CPU.
+    ///
+    /// Args:
+    ///     series: Series ids, one per query (a list or a uint32 array).
+    ///     start, end: As in query_raw_many().
+    ///     interval_ms: Bucket length in ms: one for every query, or a list or
+    ///         int64 array of one per query; 0 (the default) is one bucket for
+    ///         the query's range.
+    ///
+    /// Returns:
+    ///     BucketsMany: result[i] is the Buckets of query i; result.buckets
+    ///     holds every bucket (numpy columns) and result.offsets where each
+    ///     query's begin.
+    ///
+    /// Raises:
+    ///     TsdbError: The first failing query's error (in query order).
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = None))]
+    fn query_agg_many(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        interval_ms: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<BucketsMany> {
+        let q = agg_queries(series, start, end, interval_ms)?;
+        let b = self.with(py, |d| d.query_agg_many(&q).map(many_cols))?;
+        BucketsMany::new(py, b)
+    }
+
+    /// Runs many inserts at once, in parallel on every CPU.
+    ///
+    /// Each insert is all or nothing on its own; if one fails, the error of
+    /// the first failing one is raised and the others may have been committed.
+    ///
+    /// Args:
+    ///     batches: A list of (series, ts, values) tuples: series is one id or
+    ///         a column of ids (one per row), ts int64 timestamps, values one
+    ///         per timestamp. numpy arrays are read in place, without a copy.
+    ///     value_type: The type of every batch's values; None takes it from
+    ///         each values array's dtype (float32, float64, int64, bool,
+    ///         uint32 for states), float32 for lists.
+    #[pyo3(signature = (batches, *, value_type = None))]
+    fn insert_many(&self, py: Python<'_>, batches: &Bound<'_, PyAny>, value_type: Option<&str>) -> PyResult<()> {
+        let b = inserts(batches, value_type.map(crate::value_type).transpose()?)?;
+        self.with(py, |d| d.insert_many(&b.iter().map(Insert::as_batch).collect::<Vec<_>>()))
     }
 
     /// Makes every insert so far durable (syncs the WAL).

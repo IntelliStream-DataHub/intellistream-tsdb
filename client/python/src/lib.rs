@@ -33,6 +33,7 @@ use tc::{Column, ValueType, Values};
 
 mod arrays;
 mod embedded;
+mod pool;
 
 use arrays::{Buckets, Col, values_column, vec_to_py};
 
@@ -1483,8 +1484,10 @@ fn calendar_bounds(
 fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<embedded::Db>()?;
+    m.add_class::<pool::Pool>()?;
     m.add_class::<Bucket>()?;
     m.add_class::<Buckets>()?;
+    m.add_class::<arrays::BucketsMany>()?;
     m.add_class::<Stats>()?;
     m.add_class::<QueryStats>()?;
     m.add("TsdbError", m.py().get_type::<TsdbError>())?;

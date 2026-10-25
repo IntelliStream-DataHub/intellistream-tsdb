@@ -20,7 +20,7 @@ import os
 import pathlib
 from collections.abc import Sequence
 from types import TracebackType
-from typing import Any, Literal, final
+from typing import Any, Literal, final, overload
 from zoneinfo import ZoneInfo
 
 from typing_extensions import Buffer
@@ -137,6 +137,71 @@ class Bucket:
     @property
     def avg(self) -> float:
         """The mean, sum / count (0 for an empty bucket)."""
+
+@final
+class Buckets(Sequence[Bucket]):
+    """The buckets of an aggregate query, a column per field.
+
+    It reads as a sequence of Bucket (len(), indexing, slicing, iteration,
+    == against a list of Bucket), so code written for a list keeps working,
+    and each field is a numpy array over all buckets (a list without numpy):
+    ``b = db.query_agg(s, start, end, 60_000); b.count.sum(); b.max.max()``.
+    Reading a column copies it out of the result; keep it in a variable
+    rather than reading it in a loop.
+    """
+
+    @property
+    def start(self) -> Any:
+        """Bucket starts, ms since the epoch (int64)."""
+    @property
+    def count(self) -> Any:
+        """Number of known values per bucket (uint64)."""
+    @property
+    def sum(self) -> Any:
+        """Sums (float64)."""
+    @property
+    def min(self) -> Any:
+        """Smallest values (float64)."""
+    @property
+    def max(self) -> Any:
+        """Largest values (float64)."""
+    @property
+    def isum(self) -> Any:
+        """Exact sums of int64 and bool series (int64)."""
+    @property
+    def imin(self) -> Any:
+        """Exact minimums of int64 and bool series (int64)."""
+    @property
+    def imax(self) -> Any:
+        """Exact maximums of int64 and bool series (int64)."""
+    @property
+    def avg(self) -> Any:
+        """Means, sum / count (0 for a bucket of nulls only) (float64)."""
+    def __len__(self) -> int: ...
+    @overload
+    def __getitem__(self, i: int) -> Bucket: ...
+    @overload
+    def __getitem__(self, i: slice) -> Buckets: ...
+
+@final
+class BucketsMany(Sequence[Buckets]):
+    """The buckets of many aggregate queries (query_agg_many()).
+
+    result[i] is the Buckets of query i, and len(result) the number of
+    queries. For whole-batch numpy work, result.buckets holds every query's
+    buckets concatenated (columns start, count, sum, ...) and result.offsets
+    (int64, one more than the queries) where each query's begin:
+    ``b.buckets.count[b.offsets[i]:b.offsets[i + 1]]`` are query i's counts.
+    """
+
+    @property
+    def buckets(self) -> Buckets:
+        """Every query's buckets, concatenated in query order."""
+    @property
+    def offsets(self) -> Any:
+        """Where each query's buckets begin in buckets (int64, queries + 1 entries)."""
+    def __len__(self) -> int: ...
+    def __getitem__(self, i: int) -> Buckets: ...  # type: ignore[override]
 
 @final
 class Stats:
@@ -510,7 +575,7 @@ class Client:
         """
     def query_agg(
         self, series: int, start: int | None = None, end: int | None = None, interval_ms: int = 0
-    ) -> list[Bucket]:
+    ) -> Buckets:
         """Aggregates a series into buckets of a fixed length.
 
         Args:
@@ -521,7 +586,8 @@ class Client:
                 since the epoch. 0 gives one bucket for the whole range.
 
         Returns:
-            A list of Bucket, oldest first; empty buckets are left out.
+            Buckets, oldest first: a sequence of Bucket with a numpy array per
+            field (b.count, b.sum, ...); empty buckets are left out.
 
         Raises:
             TsdbError: ERR_INVALID for a negative interval, ERR_TOO_MANY_BUCKETS
@@ -538,7 +604,7 @@ class Client:
         timezone: _TimeZone | None = None,
         order: _Order = "asc",
         limit: int | None = None,
-    ) -> list[Bucket]:
+    ) -> Buckets:
         """Aggregates a series by calendar periods, such as days in a time zone.
 
         Days, weeks (from Monday), months, quarters and years follow the local
@@ -562,7 +628,8 @@ class Client:
             limit: At most this many buckets; None for all.
 
         Returns:
-            A list of Bucket; empty buckets are left out. A bucket's start is
+            Buckets (a sequence of Bucket, with numpy columns); empty buckets
+            are left out. A bucket's start is
             the UTC time its local period begins.
 
         Raises:
@@ -578,7 +645,7 @@ class Client:
         *,
         order: _Order = "asc",
         limit: int | None = None,
-    ) -> list[Bucket]:
+    ) -> Buckets:
         """Aggregates a series into buckets that start at the given times.
 
         Bucket i holds the rows from bounds[i] up to bounds[i + 1]; the last
@@ -597,7 +664,8 @@ class Client:
             limit: At most this many buckets; None for all.
 
         Returns:
-            A list of Bucket; empty buckets are left out.
+            Buckets (a sequence of Bucket, with numpy columns); empty buckets
+            are left out.
 
         Raises:
             TsdbError: ERR_INVALID if bounds is empty or does not increase, or
@@ -860,9 +928,10 @@ class Db:
         """
     def query_agg(
         self, series: int, start: int | None = None, end: int | None = None, interval_ms: int = 0
-    ) -> list[Bucket]:
-        """Aggregates a series: one Bucket per interval_ms, or one for the whole
-        range when interval_ms is 0. Empty buckets are left out.
+    ) -> Buckets:
+        """Aggregates a series: one bucket per interval_ms, or one for the whole
+        range when interval_ms is 0, as Buckets (a sequence of Bucket with
+        numpy columns). Empty buckets are left out.
         """
     def query_group(
         self,
@@ -875,7 +944,7 @@ class Db:
         timezone: _TimeZone | None = None,
         order: _Order = "asc",
         limit: int | None = None,
-    ) -> list[Bucket]:
+    ) -> Buckets:
         """Aggregates a series by calendar units, as Client.query_group() does.
 
         Args:
@@ -893,8 +962,78 @@ class Db:
         *,
         order: _Order = "asc",
         limit: int | None = None,
-    ) -> list[Bucket]:
+    ) -> Buckets:
         """Aggregates a series into buckets between ascending bounds (ms)."""
+    def query_raw_many(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> list[tuple[Any, Any]]:
+        """Runs many raw float32 queries at once, in parallel on every CPU.
+
+        One call answers a query per entry of series, with the GIL released
+        for all of them: a single Python thread uses every core, and the
+        interpreter is crossed once per call rather than once per query.
+
+        Args:
+            series: Series ids: a list or a numpy array (uint32), one per query.
+            start, end: None (unbounded), one timestamp for every query, or a
+                list or int64 array with one per query; [start, end) in ms.
+            order: "asc" or "desc".
+            limit: At most this many rows per query; None is all.
+
+        Returns:
+            A list with (timestamps, values) of each query, in query order: an
+            int64 and a float32 numpy array, as query_raw() returns them.
+            Needs numpy.
+
+        Raises:
+            TsdbError: The first failing query's error (in query order).
+        """
+    def query_agg_many(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+    ) -> BucketsMany:
+        """Runs many aggregate queries at once, in parallel on every CPU.
+
+        Args:
+            series: Series ids, one per query (a list or a uint32 array).
+            start, end: As in query_raw_many().
+            interval_ms: Bucket length in ms: one for every query, or a list or
+                int64 array of one per query; 0 (the default) is one bucket for
+                the query's range.
+
+        Returns:
+            BucketsMany: result[i] is the Buckets of query i; result.buckets
+            holds every bucket (numpy columns) and result.offsets where each
+            query's begin.
+
+        Raises:
+            TsdbError: The first failing query's error (in query order).
+        """
+    def insert_many(
+        self, batches: Sequence[tuple[int | _SeriesIds, _Timestamps, _TypedValues]], *, value_type: _ValueType | None = None
+    ) -> None:
+        """Runs many inserts at once, in parallel on every CPU.
+
+        Each insert is all or nothing on its own; if one fails, the error of
+        the first failing one is raised and the others may have been committed.
+
+        Args:
+            batches: A list of (series, ts, values) tuples: series is one id or
+                a column of ids (one per row), ts int64 timestamps, values one
+                per timestamp. numpy arrays are read in place, without a copy.
+            value_type: The type of every batch's values; None takes it from
+                each values array's dtype (float32, float64, int64, bool,
+                uint32 for states), float32 for lists.
+        """
     def commit(self) -> None:
         """Makes every insert so far durable (syncs the WAL)."""
     def flush(self) -> None:
@@ -919,3 +1058,93 @@ class Db:
     @property
     def pending(self) -> int:
         """Always 0: embedded inserts are done when they return."""
+
+@final
+class Pool:
+    """A pool of connections to tsdbd for batch calls that use them all at once.
+
+    One call runs many queries (or inserts) spread over the connections, in
+    parallel and with the GIL released, so a single Python thread can keep
+    the server's cores busy. Use it as a context manager or call close().
+
+    Args:
+        host: Server name or address.
+        port: Server port.
+        connections: Number of connections (default: the number of CPUs here).
+        timeout: Seconds for the connect and every later read or write, as in
+            Client; None waits forever after a 10 s connect.
+        keepalive: TCP keepalive, as in Client.
+
+    A connection that breaks (an I/O error or a timeout) is replaced by a new
+    one before its next query.
+
+    Raises:
+        TsdbError: A connection failed.
+        ValueError: connections is 0 or timeout is not positive.
+    """
+
+    def __new__(
+        cls,
+        host: str = "127.0.0.1",
+        port: int = 7070,
+        connections: int | None = None,
+        *,
+        timeout: float | None = None,
+        keepalive: bool = True,
+    ) -> Pool: ...
+    @property
+    def connections(self) -> int:
+        """Number of connections."""
+    def close(self) -> None:
+        """Closes every connection; later calls raise TsdbError (ERR_IO)."""
+    def __enter__(self) -> Pool:
+        """Returns the pool itself, to use in a with statement."""
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        """Closes the pool at the end of a with block."""
+    def query_raw_many(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> list[tuple[Any, Any]]:
+        """Runs many raw float32 queries over the connections at once.
+
+        Takes and returns what Db.query_raw_many() does: series (one id per
+        query), start and end (None, one timestamp, or one per query), order,
+        limit; a list of (timestamps, values) numpy arrays, one per query.
+        Needs numpy.
+
+        Raises:
+            TsdbError: The first failing query's error (in query order).
+        """
+    def query_agg_many(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+    ) -> BucketsMany:
+        """Runs many aggregate queries over the connections at once.
+
+        As Db.query_agg_many(): a bucket length for every query or one per
+        query (0: one bucket for the range); returns a BucketsMany.
+
+        Raises:
+            TsdbError: The first failing query's error (in query order).
+        """
+    def insert_many(
+        self, batches: Sequence[tuple[int | _SeriesIds, _Timestamps, _TypedValues]], *, value_type: _ValueType | None = None
+    ) -> None:
+        """Runs many inserts over the connections at once.
+
+        As Db.insert_many(): a list of (series, ts, values) tuples, each all or
+        nothing on its own; on an error the others may have been committed.
+        """
