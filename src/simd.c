@@ -1618,7 +1618,13 @@ static bool avx512_downclocks(void)
  * (Sandy Bridge, Ivy Bridge) and SSE4.2 at every level, as a CPU with them
  * is still v2 (TSDB_CPU caps it through cpu.c). TSDB_SIMD caps the choice
  * further, for benchmarks and tests: "scalar", "sse", "avx", "avx2" or
- * "avx512" picks the best kernels up to that one this CPU has. */
+ * "avx512" picks the best kernels up to that one this CPU has.
+ *
+ * The globals below are stored one at a time, and some belong together (simd_short with simd_small_*, the
+ * thresholds with the kernels they were measured for), so a fold running during a select could pair a kernel
+ * with another set's limit. That cannot happen where this runs: in production simd_init calls it once through
+ * pthread_once, when the first database opens and before any fold. Only the tests call it again, through
+ * cpu_set_level, and only while no fold is running. Do not call it from a running server. */
 void simd_select(int level)
 {
     void (*f)(const float *, size_t, agg_state *, agg_dev *) = agg_scalar;
