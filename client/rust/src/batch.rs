@@ -99,6 +99,7 @@ impl<'a> InsertBatch<'a> {
 }
 
 /// Runs `f` for 0..n on rayon's global pool; the results in order, or the first error.
+#[cfg(feature = "embedded")]
 fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync + Send) -> Result<Vec<T>> {
     if n == 1 {
         return Ok(vec![f(0)?]); // no hand-off for a batch of one
