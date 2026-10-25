@@ -72,21 +72,21 @@ over TCP. Each is compared only with systems used the same way.
 
 **Embedded: a library inside your program, no network**
 
-| database | insert (rows per second) | query (rows per second) | query time | size on disk | compression |
+| database | insert (rows per second) | query (rows per second) | query time | size on disk | size compared to tsdb |
 |---|---:|---:|---:|---:|---:|
-| **tsdb** | **101 million** | **2.5 billion** | **0.07 ms** | **119 MB** | **10x** |
-| DuckDB | 28 million | 552 million | 3.7 ms | 307 MB | 3.9x |
+| **tsdb** | **101 million** | **2.5 billion** | **0.07 ms** | **119 MB** | **1x** |
+| DuckDB | 28 million | 552 million | 3.7 ms | 307 MB | 2.6x |
 
 **Server: through the clients over TCP**
 
-| database | insert (rows per second) | query (rows per second) | query time | size on disk | compression |
+| database | insert (rows per second) | query (rows per second) | query time | size on disk | size compared to tsdb |
 |---|---:|---:|---:|---:|---:|
-| **tsdb** (tsdbd) | **82.6 million** | **862 million** | **0.15 ms** | **119 MB** | **10x** |
-| ClickHouse | 43 million | 272 million | 3.2 ms | 221 MB | 5.4x |
-| InfluxDB 2 | 3.6 million | 14 million | 5.3 ms | 315 MB | 3.8x |
-| TimescaleDB | 3.4 million | 26 million | 5.8 ms | 404 MB | 3.0x |
-| InfluxDB 3 Core | 1.0 million | 2.2 million | 72 ms | 723 MB | 1.7x |
-| QuestDB (\*) | 32 million | 78 million | 5.3 ms | 1,657 MB | 0.7x |
+| **tsdb** (tsdbd) | **82.6 million** | **862 million** | **0.15 ms** | **119 MB** | **1x** |
+| ClickHouse | 43 million | 272 million | 3.2 ms | 221 MB | 1.9x |
+| InfluxDB 2 | 3.6 million | 14 million | 5.3 ms | 315 MB | 2.6x |
+| TimescaleDB | 3.4 million | 26 million | 5.8 ms | 404 MB | 3.4x |
+| InfluxDB 3 Core | 1.0 million | 2.2 million | 72 ms | 723 MB | 6.1x |
+| QuestDB (\*) | 32 million | 78 million | 5.3 ms | 1,657 MB | 13.9x |
 
 - **Query (rows per second):** all 100 sensors over the whole range in buckets
   of 60 readings, a query that has to read every row: 100 million rows divided
@@ -96,8 +96,9 @@ over TCP. Each is compared only with systems used the same way.
   block's summary without reading the rows.
 - **Query time:** one day of one sensor as 5-minute averages (86,400 readings
   into 288 buckets), one client, average over thousands of random days.
-- **Compression:** the raw size (8 bytes of time and 4 bytes of value per
-  reading, 1.2 GB) divided by the size on disk.
+- **Size compared to tsdb:** each system's size on disk divided by tsdb's: 2.6x
+  means 2.6 times as much disk for the same data. The raw data (8 bytes of time
+  and 4 bytes of value per reading) is 1.2 GB, 10 times tsdb's size.
 - **Inserts:** embedded, 4 threads (DuckDB got its rows sorted beforehand, not
   counted); server, 4 connections for tsdb, each system's recommended loader
   for the others.
@@ -112,18 +113,19 @@ over TCP. Each is compared only with systems used the same way.
 
 **Compression per kind of sensor (values only)**
 
-| sensor | tsdb: bits per reading | compression | 1 million readings | Gorilla (InfluxDB, Prometheus, ClickHouse) | ALP (DuckDB) |
-|---|---:|---:|---:|---:|---:|
-| SMART disk temperature, 0.1 °C, every 60 s | **0.88** | 36.4x | 110 KB | 2.66 | 2.36 |
-| CPU temperature with spikes, every 1 s | **2.99** | 10.7x | 374 KB | 10.82 | 4.97 |
-| tank pressure, 0.001 bar, every 10 s | **1.82** | 17.6x | 228 KB | 9.09 | 5.97 |
-| tank pressure converted to psi (not rounded) | **19.50** | 1.6x | 2.44 MB | 23.77 | - |
-| vibration, 16-bit sensor at 1000 readings/s | **14.02** | 2.3x | 1.75 MB | 21.51 | - |
-| pipeline flow rate, 0.01 m³/h | **10.72** | 3.0x | 1.34 MB | 23.08 | 12.29 |
-| pipeline flow totalizer, m³ | **1.68** | 19.0x | 210 KB | 8.68 | - |
-| random numbers (no pattern at all) | **27.29** | 1.2x | 3.41 MB | 32.32 | - |
+| sensor | tsdb: bits per reading | tsdb: 1 million readings | Gorilla (InfluxDB, Prometheus, ClickHouse): bits, size compared to tsdb | ALP (DuckDB): bits, size compared to tsdb |
+|---|---:|---:|---:|---:|
+| SMART disk temperature, 0.1 °C, every 60 s | **0.88** (1x) | 110 KB | 2.66 (3.0x) | 2.36 (2.7x) |
+| CPU temperature with spikes, every 1 s | **2.99** (1x) | 374 KB | 10.82 (3.6x) | 4.97 (1.7x) |
+| tank pressure, 0.001 bar, every 10 s | **1.82** (1x) | 228 KB | 9.09 (5.0x) | 5.97 (3.3x) |
+| tank pressure converted to psi (not rounded) | **19.50** (1x) | 2.44 MB | 23.77 (1.2x) | - |
+| vibration, 16-bit sensor at 1000 readings/s | **14.02** (1x) | 1.75 MB | 21.51 (1.5x) | - |
+| pipeline flow rate, 0.01 m³/h | **10.72** (1x) | 1.34 MB | 23.08 (2.2x) | 12.29 (1.1x) |
+| pipeline flow totalizer, m³ | **1.68** (1x) | 210 KB | 8.68 (5.2x) | - |
+| random numbers (no pattern at all) | **27.29** (1x) | 3.41 MB | 32.32 (1.2x) | - |
 
-- Bits per reading for the value alone: a raw float takes 32. Timestamps come
+- Bits per reading for the value alone: a raw float takes 32. In brackets: the
+  size compared to tsdb's (3.0x: three times as many bits for the same readings). Timestamps come
   on top and cost almost nothing on a steady clock. Measured with
   `build/codec-bench`; sizes are exact.
 - Every method here has zstd on top. ClickHouse adds zstd to Gorilla like this;

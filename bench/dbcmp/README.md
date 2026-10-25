@@ -432,7 +432,8 @@ The README's per-sensor table today compares compression methods (codec-bench). 
 with real on-disk sizes: load each sensor data set of tools/datasets.h (1 M readings each, plus random) on its
 own into every system (tsdb, ClickHouse, DuckDB, QuestDB native and Parquet, TimescaleDB, InfluxDB 2 and 3,
 Prometheus), let each settle (merges, compaction, compression jobs), and record the exact size on disk the same
-way as for the main table. One column per database: bytes per reading (and the ratio to 12 raw bytes). Sizes do
+way as for the main table. One column per database: bytes per reading and the size compared to tsdb (tsdb is 1x; 2.6x means 2.6 times tsdb's
+size). Every table of sizes in the README is shown that way, never as a ratio to the raw size. Sizes do
 not depend on machine load. Remove the containers and data afterwards.
 
 ## Fairness notes
