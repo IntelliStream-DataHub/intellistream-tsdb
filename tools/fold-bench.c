@@ -28,6 +28,49 @@
 #include <math.h>
 #include <stdlib.h>
 
+#ifdef MAIN_LTTB
+/* Built against main (f5abccc), which has no lttb_argmax: its bucket scan (query.c, lttb_choose_buffered with
+ * lttb_value, lttb_x and lttb_area), as a function of the same shape, so that the A/B compares the same work. */
+static inline bool main_lttb_value(int type, uint64_t x, double *y)
+{
+    switch (type) {
+    case TSDB_FLOAT32: {
+        float f;
+        uint32_t u = (uint32_t)x;
+        memcpy(&f, &u, 4);
+        *y = f;
+        return u != NULL_F32 && isfinite(f);
+    }
+    case TSDB_FLOAT64: {
+        double d;
+        memcpy(&d, &x, 8);
+        *y = d;
+        return x != NULL_F64 && isfinite(d);
+    }
+    case TSDB_INT64: *y = (double)(int64_t)x; return x != (uint64_t)NULL_I64;
+    default: *y = (double)x; return x != NULL_BOOL;
+    }
+}
+
+__attribute__((noinline)) static size_t lttb_argmax(int type, const int64_t *ts, const uint64_t *v, size_t n,
+                                                    int64_t t0, double ax, double ay, double cx, double cy)
+{
+    double best = -1;
+    size_t k = 0;
+    for (size_t j = 0; j < n; j++) {
+        double y;
+        main_lttb_value(type, v[j], &y);
+        double x = (double)((uint64_t)ts[j] - (uint64_t)t0);
+        double a = fabs((ax - cx) * (y - ay) - (ax - x) * (cy - ay)) * 0.5;
+        if (a > best) {
+            best = a;
+            k = j;
+        }
+    }
+    return k;
+}
+#endif
+
 static uint64_t rng = 0x9e3779b97f4a7c15ull;
 static uint64_t rnd(void)
 {

@@ -68,11 +68,15 @@ typedef struct input {
     int64_t *ts; /* n sorted timestamps */
 } input;
 
-static input in[256];
+static input in[512];
 static int nin;
 
 static input *add(const char *name, int type, size_t n)
 {
+    if (nin == (int)(sizeof in / sizeof *in)) {
+        fprintf(stderr, "test_levels: more than %zu inputs\n", sizeof in / sizeof *in);
+        exit(1);
+    }
     input *x = &in[nin++];
     snprintf(x->name, sizeof x->name, "%s", name);
     x->type = type;
@@ -353,6 +357,21 @@ static void make_inputs(void)
                     ((uint64_t *)x->v)[i] = sp64[k];
             }
         }
+
+    /* ties of zeros: which lane min/max keep is the tree's priority order (the bit-reversed lane order); input t has
+     * nulls in the first t lanes of that order, -0.0 in lane t of it and +0.0 elsewhere, so -0.0 must win both
+     * min and max, and a tiny path that visits any two lanes out of order gets +0.0 for some t */
+    static const int prio16[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    _Static_assert(SIMD_LANES_F64 == 16, "the order above is for 16 lanes");
+    for (int t = 0; t < 16; t++) {
+        snprintf(name, sizeof name, "f64 zero ties %d", t);
+        x = add(name, TSDB_FLOAT64, 34);
+        for (size_t i = 0; i < 34; i++)
+            ((uint64_t *)x->v)[i] = 0;
+        for (int k = 0; k < t; k++)
+            ((uint64_t *)x->v)[prio16[k]] = NULL_F64;
+        ((uint64_t *)x->v)[prio16[t]] = 0x8000000000000000ull;
+    }
 
     /* timestamps: regular, jittered, random gaps, duplicates, negative, extremes */
     x = add("ts jitter", TSDB_INT64, GR);

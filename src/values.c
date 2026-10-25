@@ -21,11 +21,11 @@ static size_t count_null_f32(const uint32_t *v, size_t n)
     return k;
 }
 
-static inline bool null_f64(double x)
+static inline bool null_f64_at(const double *v, size_t j, uint64_t null)
 {
     uint64_t b;
-    memcpy(&b, &x, 8);
-    return b == NULL_F64;
+    memcpy(&b, v + j, 8);
+    return b == null;
 }
 
 static size_t count_null_f64(const uint64_t *v, size_t n)
@@ -47,7 +47,7 @@ static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, a
 }
 
 /*
- * float64 runs of at most TINY_F64 = 4 values (buckets of a few rows; from 5 on the short-run kernels are faster):
+ * float64 runs of at most TINY_F64 = 12 values (buckets of a few rows; above, the short-run kernels are faster):
  * every value has a lane of its own (simd.c), so the kernels' result is a fixed tree over the n values: the
  * halving of k = the next power of two >= n lanes, where lanes n to k - 1 hold +0.0 (sums, deviations) or a's
  * bounds (min, max). Evaluated as that tree directly, it costs n - 1 operations per result, like a loop, without
@@ -63,49 +63,75 @@ static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, a
  * A null adds +0.0 to its lane and is NaN to min/max, as in the kernels; overflow to inf and NaN follow the same
  * tree. test_levels compares this with every set's kernels at every n, signed zeros and bounds included.
  */
-#define TINY_F64 4
-_Static_assert(TINY_F64 <= SIMD_LANES_F64, "one value per lane");
+#define TINY_F64 12
+_Static_assert(TINY_F64 <= SIMD_LANES_F64 && SIMD_LANES_F64 == 16, "one value per lane, a tree of up to 16");
 
 /* The lanes as plain variables (GCC turned arrays of them into stack slots and reloaded pairs as vectors, a store
  * forwarding stall per call). min/max: lane j holds x_j if x_j < a->min, else a->min itself (NaN: a->min), and a
  * halving step keeps the lower lane unless the upper one is strictly less; so the tree returns, among the lanes
- * holding the least value, the one first in the tree's priority order (0, 2, 1, 3 for four lanes: the bit-reversed
- * order), and a->min when no value is below it. A chain from a->min through the values in that order, each
+ * holding the least value, the one first in the tree's priority order (the bit-reversed order: 0, 8, 4, 12, 2,
+ * 10, ... for sixteen lanes; 0, 2, 1, 3 for four), and a->min when no value is below it. A chain from a->min through the values in that order, each
  * replacing the bound only when strictly less, returns the same lane: n operations instead of 2n. */
-#define TMIN(x, y) ((x) < (y) ? (x) : (y))
-#define TMAX(x, y) ((x) > (y) ? (x) : (y))
+/* MINSD/MAXSD (x < y ? x : y, x > y ? x : y) in asm: GCC turned the conditionals into branches, and the
+ * intrinsics into extra register moves (zeroing the upper lane) */
+#ifdef __AVX__
+#define TMINMAX(op, x, y)                                                                                          \
+    ({                                                                                                             \
+        double r_;                                                                                                 \
+        __asm__("v" op " %2, %1, %0" : "=x"(r_) : "x"(x), "x"(y));                                                 \
+        r_;                                                                                                        \
+    })
+#else
+#define TMINMAX(op, x, y)                                                                                          \
+    ({                                                                                                             \
+        double r_ = (x);                                                                                           \
+        __asm__(op " %1, %0" : "+x"(r_) : "x"(y));                                                                 \
+        r_;                                                                                                        \
+    })
+#endif
+#define TMIN(x, y) TMINMAX("minsd", x, y)
+#define TMAX(x, y) TMINMAX("maxsd", x, y)
 #define TLEAF(j)                                                                                                   \
     double x##j = v[(j) < n ? (j) : 0], s##j = x##j; /* lanes from n on: unused, optimised out */                \
-    bool z##j = (j) < n && null_f64(x##j);                                                                        \
-    if (__builtin_expect(z##j, 0)) { /* a null adds +0.0 to its lane (rare: a branch, as in main's loop) */       \
+    bool z##j = (j) < n && null_f64_at(v, j, nl); /* the bits from memory: no move from an xmm */          \
+    if (z##j) { /* a null adds +0.0 to its lane (rare: a branch, as in main's loop) */                    \
         s##j = 0.0;                                                                                                \
         c--;                                                                                                       \
     }
 #define TDEV(j) double e##j = z##j ? 0.0 : x##j - m, q##j = e##j * e##j;
-/* a tree over lanes 0..n-1 of l (n = 1 to 4): the first halving pairs lane j with lane j + 2 where there is one */
-#define TTREE(l) (n == 1 ? l##0 : n == 2 ? l##0 + l##1 : n == 3 ? (l##0 + l##2) + l##1 : (l##0 + l##2) + (l##1 + l##3))
+/* r = the tree over lanes 0..n-1 of l (n = 1 to 16): a halving pairs lane j with lane j + 8, then j + 4, j + 2 and
+ * j + 1, where there is one (lanes from n on are padding, left out) */
+#define TH(a, b, k) ((k) < n ? (a) + (b) : (a))
+#define TTREE(l, r)                                                                                                \
+    double r;                                                                                                      \
+    {                                                                                                              \
+        double h0 = TH(l##0, l##8, 8), h1 = TH(l##1, l##9, 9), h2 = TH(l##2, l##10, 10), h3 = TH(l##3, l##11, 11);  \
+        double h4 = TH(l##4, l##12, 12), h5 = TH(l##5, l##13, 13), h6 = TH(l##6, l##14, 14);                       \
+        double h7 = TH(l##7, l##15, 15);                                                                           \
+        double g0 = TH(h0, h4, 4), g1 = TH(h1, h5, 5), g2 = TH(h2, h6, 6), g3 = TH(h3, h7, 7);                     \
+        double f0 = TH(g0, g2, 2), f1 = TH(g1, g3, 3);                                                             \
+        r = TH(f0, f1, 1);                                                                                         \
+    }
+#define TCHAIN(j)                                                                                                  \
+    if ((j) < n) {                                                                                                 \
+        mn = TMIN(x##j, mn);                                                                                       \
+        mx = TMAX(x##j, mx);                                                                                       \
+    }
+#define TLANES(m) m(0) m(1) m(2) m(3) m(4) m(5) m(6) m(7) m(8) m(9) m(10) m(11) m(12) m(13) m(14) m(15)
 
 static inline __attribute__((always_inline)) void tiny_f64_n(const double *v, const int n, agg_state *a,
                                                              agg_dev *dv)
 {
-    uint64_t c = (uint64_t)n;
-    TLEAF(0)
-    TLEAF(1)
-    TLEAF(2)
-    TLEAF(3)
+    uint64_t c = (uint64_t)n, nl = NULL_F64;
+    __asm__("" : "+r"(nl)); /* the null in one register (GCC loaded the 64-bit constant again for every value) */
+    TLANES(TLEAF)
     double mn = TMIN(x0, a->min), mx = TMAX(x0, a->max);
-    if (n >= 3) {
-        mn = TMIN(x2, mn), mx = TMAX(x2, mx);
-    }
-    if (n >= 2) {
-        mn = TMIN(x1, mn), mx = TMAX(x1, mx);
-    }
-    if (n >= 4) {
-        mn = TMIN(x3, mn), mx = TMAX(x3, mx);
-    }
+    TCHAIN(8) TCHAIN(4) TCHAIN(12) TCHAIN(2) TCHAIN(10) TCHAIN(6) TCHAIN(14) /* the bit-reversed order */
+    TCHAIN(1) TCHAIN(9) TCHAIN(5) TCHAIN(13) TCHAIN(3) TCHAIN(11) TCHAIN(7) TCHAIN(15)
     a->min = mn;
     a->max = mx;
-    double sum = TTREE(s) + 0.0; /* -0.0 to +0.0 (above) */
+    TTREE(s, sum0)
+    double sum = sum0 + 0.0; /* -0.0 to +0.0 (above) */
     if (!dv) {
         a->count += c;
         a->sum = canon_nan(a->sum + sum);
@@ -114,23 +140,66 @@ static inline __attribute__((always_inline)) void tiny_f64_n(const double *v, co
     if (!c)
         return;
     double m = sum / (double)c;
-    TDEV(0)
-    TDEV(1)
-    TDEV(2)
-    TDEV(3)
-    agg_add_run(a, dv, c, sum, TTREE(e), TTREE(q));
+    TLANES(TDEV)
+    TTREE(e, d1)
+    TTREE(q, d2)
+    agg_add_run(a, dv, c, sum, d1, d2);
     a->sum = canon_nan(a->sum);
 }
 
 static void fold_f64(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
-    switch (n) { /* inlined, n a constant in each (an indirect call cost more); nulls are looked for anyway */
-    case 0: return;
-    case 1: tiny_f64_n(v, 1, a, x); return;
-    case 2: tiny_f64_n(v, 2, a, x); return;
-    case 3: tiny_f64_n(v, 3, a, x); return;
-    case 4: tiny_f64_n(v, 4, a, x); return;
-    default: break;
+    /* inlined, n a constant in each, behind compares (a jump table or an indirect call cost more); nulls are looked
+     * for anyway */
+    if (n <= TINY_F64) {
+        if (!n)
+            return;
+        if (n >= 7) {
+            if (n >= 10) {
+                if (n >= 11) {
+                    if (n >= 12) {
+                        tiny_f64_n(v, 12, a, x);
+                    } else {
+                        tiny_f64_n(v, 11, a, x);
+                    }
+                } else {
+                    tiny_f64_n(v, 10, a, x);
+                }
+            } else {
+                if (n >= 8) {
+                    if (n >= 9) {
+                        tiny_f64_n(v, 9, a, x);
+                    } else {
+                        tiny_f64_n(v, 8, a, x);
+                    }
+                } else {
+                    tiny_f64_n(v, 7, a, x);
+                }
+            }
+        } else {
+            if (n >= 4) {
+                if (n >= 5) {
+                    if (n >= 6) {
+                        tiny_f64_n(v, 6, a, x);
+                    } else {
+                        tiny_f64_n(v, 5, a, x);
+                    }
+                } else {
+                    tiny_f64_n(v, 4, a, x);
+                }
+            } else {
+                if (n >= 2) {
+                    if (n >= 3) {
+                        tiny_f64_n(v, 3, a, x);
+                    } else {
+                        tiny_f64_n(v, 2, a, x);
+                    }
+                } else {
+                    tiny_f64_n(v, 1, a, x);
+                }
+            }
+        }
+        return;
     }
     if (n < simd_short)
         simd_small_f64(v, n, may_be_null, a, x);

@@ -80,13 +80,16 @@ static inline double slot_val(int type, const uint8_t *p)
 
 /* ------------------------------------------------- granule statistics */
 
-/* a short granule's sums: the segments in order, as seg() below adds a segment inside one bucket */
-static inline void twa_seq(int type, const int64_t *ts, const uint8_t *v, size_t n, size_t w, twa_sums *o)
+/* A short granule: the segments in order, as seg() below adds a segment inside one bucket, and the first and last
+ * readings from the same loop (main's loop exactly: no reading is loaded twice). */
+static inline void twa_seq(int type, const int64_t *ts, const uint8_t *v, size_t n, size_t w, granule *g)
 {
     bool okp = slot_ok(type, v);
     double vp = okp ? slot_val(type, v) : 0;
     double step = 0, lin = 0;
     uint64_t sms = 0, lms = 0, gap = 0;
+    g->tw_first = vp;
+    g->tw_flags = okp ? 0 : GT_FIRST_NULL;
     for (size_t i = 1; i < n; i++) {
         uint64_t dt = (uint64_t)ts[i] - (uint64_t)ts[i - 1];
         gap = dt > gap ? dt : gap;
@@ -103,7 +106,18 @@ static inline void twa_seq(int type, const int64_t *ts, const uint8_t *v, size_t
         vp = x;
         okp = ok;
     }
-    *o = (twa_sums){.step = canon_nan(step), .lin = canon_nan(lin), .sms = sms, .lms = lms, .gap = gap};
+    g->tw_last = vp;
+    if (!okp)
+        g->tw_flags |= GT_LAST_NULL;
+    if (__builtin_expect(isunordered(step, lin), 0)) { /* canon_nan on both, behind one test */
+        step = canon_nan(step);
+        lin = canon_nan(lin);
+    }
+    g->tw_step = step;
+    g->tw_lin = lin;
+    g->tw_step_ms = sms;
+    g->tw_lin_ms = lms;
+    g->tw_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
 }
 
 static inline __attribute__((always_inline)) void granule_twa_t(int type, const int64_t *ts, const void *vv, size_t n,
@@ -117,12 +131,13 @@ static inline __attribute__((always_inline)) void granule_twa_t(int type, const 
     g->tw_flags = GT_FIRST_NULL | GT_LAST_NULL;
     if (n == 0 || type == TSDB_STATE)
         return;
+    if (n <= TWA_SEQ_MAX) {
+        twa_seq(type, ts, v, n, w, g);
+        return;
+    }
     bool ok0 = slot_ok(type, v), okl = slot_ok(type, v + (n - 1) * w);
     twa_sums o;
-    if (n <= TWA_SEQ_MAX)
-        twa_seq(type, ts, v, n, w, &o);
-    else
-        simd_twa(type, ts, v, n, &o);
+    simd_twa(type, ts, v, n, &o);
     g->tw_first = ok0 ? slot_val(type, v) : 0;
     g->tw_flags = (ok0 ? 0 : GT_FIRST_NULL) | (okl ? 0 : GT_LAST_NULL);
     g->tw_last = okl ? slot_val(type, v + (n - 1) * w) : 0;
