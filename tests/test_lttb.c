@@ -528,7 +528,13 @@ static void test_concurrent(const char *base)
     for (int off = 0; off < CN; off += 10000)
         OK(tsdb_insert_series_values(cdb, cs, cts + off, &(tsdb_values){TSDB_FLOAT64, v + off, NULL}, 10000));
     pthread_t w;
-    CHECK(pthread_create(&w, NULL, conc_writer, NULL) == 0);
+    /* join only a writer that started: joining the uninitialized handle of a failed create (the process limit ran
+     * out) hung the test for 10 hours */
+    int prc = pthread_create(&w, NULL, conc_writer, NULL);
+    if (prc != 0) {
+        fprintf(stderr, "concurrent: cannot start the writer thread: %s\n", strerror(prc));
+        failures++;
+    }
     size_t ths[] = {3, 100, 5000, CN - 1}, saved = lttb_buffer_bytes;
     int bad = 0;
     for (int it = 0; it < 160; it++) {
@@ -544,7 +550,8 @@ static void test_concurrent(const char *base)
     }
     lttb_buffer_bytes = saved;
     atomic_store(&cstop, 1);
-    pthread_join(w, NULL);
+    if (prc == 0)
+        pthread_join(w, NULL);
     CHECK(bad == 0);
     OK(tsdb_close(cdb));
     char cmd[700];
