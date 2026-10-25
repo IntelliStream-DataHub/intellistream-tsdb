@@ -1359,8 +1359,9 @@ static inline double lttb_y(int type, uint64_t x)
     }
 }
 
-static size_t lttb_scalar(int type, const int64_t *ts, const uint64_t *v, size_t n, int64_t t0, double ax,
-                          double ay, double cx, double cy)
+static inline __attribute__((always_inline)) size_t lttb_scalar_t(int type, const int64_t *ts, const uint64_t *v,
+                                                                  size_t n, int64_t t0, double ax, double ay,
+                                                                  double cx, double cy)
 {
     double best = -1;
     size_t k = 0;
@@ -1373,6 +1374,18 @@ static size_t lttb_scalar(int type, const int64_t *ts, const uint64_t *v, size_t
         }
     }
     return k;
+}
+
+/* one copy per type: no switch per point (GCC did not unswitch it) */
+static size_t lttb_scalar(int type, const int64_t *ts, const uint64_t *v, size_t n, int64_t t0, double ax,
+                          double ay, double cx, double cy)
+{
+    switch (type) {
+    case TSDB_FLOAT32: return lttb_scalar_t(TSDB_FLOAT32, ts, v, n, t0, ax, ay, cx, cy);
+    case TSDB_FLOAT64: return lttb_scalar_t(TSDB_FLOAT64, ts, v, n, t0, ax, ay, cx, cy);
+    case TSDB_INT64: return lttb_scalar_t(TSDB_INT64, ts, v, n, t0, ax, ay, cx, cy);
+    default: return lttb_scalar_t(TSDB_BOOL, ts, v, n, t0, ax, ay, cx, cy);
+    }
 }
 
 #ifdef TSDB_X86
