@@ -25,6 +25,11 @@ while IFS= read -r line; do
     if printf '%s\n' "$line" | grep -Eq "${pos}pkill([[:space:]][^;&|]*)?[[:space:]]-[a-zA-Z]*f"; then
         deny "pkill -f matches its own shell (and can kill the session); stop processes you started by pid (AGENTS.md)."
     fi
+    # the same match by another route: kill $(pgrep -f ...), kill `pgrep -f ...`, pgrep -f ... | xargs kill
+    if printf '%s\n' "$line" | grep -Eq "${pos}kill[^;&|]*(\\\$\(|\`)[[:space:]]*pgrep([[:space:]][^;&|)]*)?[[:space:]]-[a-zA-Z]*f" ||
+        printf '%s\n' "$line" | grep -Eq "${pos}pgrep([[:space:]][^;&|]*)?[[:space:]]-[a-zA-Z]*f[^;&]*\|[[:space:]]*xargs[[:space:]]+([^;&|]*[[:space:]])?kill"; then
+        deny "pgrep -f matches its own shell, so killing what it prints can kill the session; stop processes you started by pid (AGENTS.md)."
+    fi
     if printf '%s\n' "$line" | grep -Eq "${pos}killall([[:space:]]|$)"; then
         deny "killall is not allowed here; stop only the processes you started, by pid (AGENTS.md)."
     fi
