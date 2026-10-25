@@ -4,8 +4,7 @@ import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
 
 import java.io.IOException;
-import java.nio.ByteOrder;
-import java.nio.MappedByteBuffer;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -25,16 +24,16 @@ import java.util.concurrent.atomic.AtomicReference;
  * FILE holds rows of (u32 series, i64 ts ms, f32 value), 16 bytes each, as {@code tsdb-bench --export} writes
  * them. The series are created first, named as tsdbc-bench names them; then the file is split into contiguous
  * slices, one per connection, and each connection sends its slice in batches with the many-series layout, with up
- * to four batches in flight before it waits for their acknowledgements. Rows are read from the memory-mapped file
- * during the run. The result is rows per second, the bytes written to the connections per row and the CPU time of the
+ * to four batches in flight before it waits for their acknowledgements. The file is mapped and read in before the
+ * clock starts, as tsdbc-bench does (MAP_POPULATE), and so is the JIT compilation of the loop that copies its rows
+ * into the arrays; rows are copied from the mapping during the run. The result is rows per second, the bytes written to the connections per row and the CPU time of the
  * process, in the format of tsdbc-bench ({@code BenchCommon}).
  */
 public final class InsertBench {
     private static final String[] KINDS = {"hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate",
         "flow_total"}; /* tools/datasets.h, as tsdbc-bench names its series */
-    private static final int ROW = 16;
+    private static final int ROW = BenchCommon.ROW;
     private static final int INFLIGHT = 4;
-    private static final long SEGMENT = 1L << 30; /* bytes mapped at a time */
 
     private InsertBench() {
     }
@@ -75,7 +74,9 @@ public final class InsertBench {
             if (size % ROW != 0)
                 usage(file + ": " + size + " bytes is not a whole number of 16-byte rows");
             long n = size / ROW;
-            int[] ids = createSeries(fc, n, host, port);
+            ByteBuffer[] rows = BenchCommon.mapRows(fc);
+            int[] ids = createSeries(rows, n, host, port);
+            BenchCommon.warmFill(rows, ids, batch);
 
             long[] bytes = new long[conns];
             AtomicReference<Throwable> failed = new AtomicReference<>();
@@ -89,7 +90,7 @@ public final class InsertBench {
                 int k = c;
                 Thread t = new Thread(() -> {
                     try {
-                        bytes[k] = load(fc, from, to, ids, h, p, b, l);
+                        bytes[k] = load(rows, from, to, ids, h, p, b, l);
                     } catch (Throwable e) {
                         failed.compareAndSet(null, e);
                     }
@@ -121,15 +122,11 @@ public final class InsertBench {
     }
 
     /** Creates series 0 .. the largest id in the first 10M rows, as tsdbc-bench does; returns file id to id. */
-    private static int[] createSeries(FileChannel fc, long n, String host, int port) throws IOException {
+    private static int[] createSeries(ByteBuffer[] rows, long n, String host, int port) throws IOException {
         int max = 0;
         long scan = Math.min(n, 10_000_000);
-        for (long seg = 0; seg < scan; seg += SEGMENT / ROW) {
-            int rows = (int) Math.min(SEGMENT / ROW, scan - seg);
-            MappedByteBuffer m = map(fc, seg, rows);
-            for (int i = 0; i < rows; i++)
-                max = Math.max(max, m.getInt(i * ROW));
-        }
+        for (long r = 0; r < scan; r++)
+            max = Math.max(max, BenchCommon.seriesAt(rows, r));
         int[] ids = new int[max + 1];
         try (TsdbClient c = TsdbClient.connect(host, port)) {
             for (int i = 0; i <= max; i++)
@@ -138,43 +135,26 @@ public final class InsertBench {
         return ids;
     }
 
-    private static MappedByteBuffer map(FileChannel fc, long row, int rows) throws IOException {
-        MappedByteBuffer m = fc.map(FileChannel.MapMode.READ_ONLY, row * ROW, (long) rows * ROW);
-        m.order(ByteOrder.LITTLE_ENDIAN);
-        return m;
-    }
-
     /** Sends rows [from, to) over one connection; returns the bytes written to it. */
-    private static long load(FileChannel fc, long from, long to, int[] ids, String host, int port, int batch,
+    private static long load(ByteBuffer[] rows, long from, long to, int[] ids, String host, int port, int batch,
                              int level) throws IOException {
         int[] s = new int[batch];
         long[] t = new long[batch];
         float[] v = new float[batch];
-        long segRows = Math.max(batch, SEGMENT / ROW / batch * batch); /* whole batches per mapping */
         try (TsdbClient c = TsdbClient.connect(host, port)) {
             c.setCompression(level);
             int inflight = 0;
-            for (long seg = from; seg < to; seg += segRows) {
-                int rows = (int) Math.min(segRows, to - seg);
-                MappedByteBuffer m = map(fc, seg, rows);
-                for (int off = 0; off < rows; off += batch) {
-                    int k = Math.min(batch, rows - off);
-                    if (inflight == INFLIGHT) { /* bound the pipeline, as tsdbc-bench */
-                        c.await();
-                        inflight = 0;
-                    }
-                    for (int i = 0, o = off * ROW; i < k; i++, o += ROW) {
-                        int id = m.getInt(o);
-                        if (id < 0 || id >= ids.length)
-                            throw new TsdbException(-4, "series " + Integer.toUnsignedString(id)
-                                    + " beyond those created from the first rows", null);
-                        s[i] = ids[id];
-                        t[i] = m.getLong(o + 4);
-                        v[i] = m.getFloat(o + 12);
-                    }
-                    c.insertAsync(s, t, v, 0, k); /* sent before it returns: the arrays may be refilled */
-                    inflight++;
+            for (long r = from; r < to; r += batch) {
+                int k = (int) Math.min(batch, to - r);
+                if (inflight == INFLIGHT) { /* bound the pipeline, as tsdbc-bench */
+                    c.await();
+                    inflight = 0;
                 }
+                long bad = BenchCommon.fill(rows, r, k, ids, s, t, v);
+                if (bad >= 0)
+                    throw new TsdbException(-4, "series " + bad + " beyond those created from the first rows", null);
+                c.insertAsync(s, t, v, 0, k); /* sent before it returns: the arrays may be refilled */
+                inflight++;
             }
             c.await();
             return c.bytesSent();

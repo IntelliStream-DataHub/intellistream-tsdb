@@ -9,6 +9,8 @@ import ai.intellistream.tsdb.embedded.EmbeddedDb;
 import ai.intellistream.tsdb.embedded.EmbeddedOptions;
 
 import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -151,20 +153,19 @@ public final class EmbeddedBench {
             }
         }
         try (FileChannel ch = FileChannel.open(Paths.get(file), StandardOpenOption.READ);
+             Arena arena = Arena.ofShared();
              EmbeddedDb db = EmbeddedDb.open(dir, new EmbeddedOptions().fsync(fsync).zstdLevel(zstd))) {
-            long rows = ch.size() / 16;
+            MemorySegment m = BenchCommon.mapRows(ch, arena);
+            long rows = m.byteSize() / BenchCommon.ROW;
             int nseries = 0; /* the file's highest series index + 1, as cb_expect_make */
-            for (long r0 = 0; r0 < rows; r0 += batch) {
-                int n = (int) Math.min(batch, rows - r0);
-                ByteBuffer m = ch.map(FileChannel.MapMode.READ_ONLY, r0 * 16, n * 16L).order(ByteOrder.LITTLE_ENDIAN);
-                for (int i = 0; i < n; i++)
-                    nseries = Math.max(nseries, m.getInt(i * 16) + 1);
-            }
+            for (long r = 0; r < rows; r++)
+                nseries = Math.max(nseries, BenchCommon.seriesAt(m, r) + 1);
             for (int s = 0; s < nseries; s++) {
                 int id = db.series(BenchCommon.seriesName(s));
                 if (id != s)
                     throw new IllegalStateException("series " + BenchCommon.seriesName(s) + " got id " + id);
             }
+            BenchCommon.warmFill(m, null, batch);
             Thread[] th = new Thread[threads];
             Exception[] err = new Exception[1];
             double cpu0 = BenchCommon.cpuSeconds();
@@ -179,13 +180,7 @@ public final class EmbeddedBench {
                     try {
                         for (long r0 = a; r0 < b; r0 += batch) {
                             int n = (int) Math.min(batch, b - r0);
-                            ByteBuffer m = ch.map(FileChannel.MapMode.READ_ONLY, r0 * 16, n * 16L)
-                                    .order(ByteOrder.LITTLE_ENDIAN);
-                            for (int i = 0, off = 0; i < n; i++, off += 16) {
-                                sv[i] = m.getInt(off);
-                                tv[i] = m.getLong(off + 4);
-                                vv[i] = m.getFloat(off + 12);
-                            }
+                            BenchCommon.fill(m, r0, n, null, sv, tv, vv);
                             db.insert(sv, tv, vv, 0, n);
                         }
                     } catch (IOException e) { /* TsdbException included */

@@ -1,6 +1,12 @@
 package ai.intellistream.tsdb.embedded.bench;
 
+import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.lang.management.ManagementFactory;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.util.Locale;
 
 /**
@@ -97,5 +103,72 @@ final class BenchCommon {
         System.out.println(String.format(Locale.ROOT,
                 "RESULT kind=load client=%s conns=%d compression=0 rows=%d secs=%.4f bytes=0 cpu=%.4f", client, conns,
                 rows, secs, cpu));
+    }
+
+    /*
+     * The RowBinary file of the loads (u32 series, i64 ts, f32 value; 16 bytes a row), as tools/cbench.h's
+     * cb_file_open reads it: mapped whole and populated before the clock starts (MAP_POPULATE there, load() here),
+     * so a load measures inserting, not page faults on the file.
+     */
+    static final int ROW = 16;
+    private static final ValueLayout.OfInt U32 = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfLong I64 = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfFloat F32 = ValueLayout.JAVA_FLOAT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+    /** The whole file, mapped in {@code arena} and read in. */
+    static MemorySegment mapRows(FileChannel ch, Arena arena) throws IOException {
+        MemorySegment m = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size(), arena);
+        m.load();
+        return m;
+    }
+
+    /** The series index of row {@code r}. */
+    static int seriesAt(MemorySegment m, long r) {
+        return m.get(U32, r * ROW);
+    }
+
+    /**
+     * Rows {@code [r, r + n)} into the arrays from index 0, the series through {@code ids} when it is not null.
+     * Returns the first series index that ids does not cover, or -1.
+     */
+    static long fill(MemorySegment m, long r, int n, int[] ids, int[] s, long[] t, float[] v) {
+        long o = r * ROW;
+        for (int i = 0; i < n; i++, o += ROW) {
+            int id = m.get(U32, o);
+            if (ids != null) {
+                if (id < 0 || id >= ids.length)
+                    return Integer.toUnsignedLong(id);
+                id = ids[id];
+            }
+            s[i] = id;
+            t[i] = m.get(I64, o + 4);
+            v[i] = m.get(F32, o + 12);
+        }
+        return -1;
+    }
+
+    /**
+     * Runs {@link #fill} on the first rows on this thread until it is compiled (its time per call stops falling),
+     * before the clock starts. The C benchmarks' copy loop is compiled ahead of time; without this the load's
+     * threads would start it in the interpreter and in profiled code at once, and count that as loading.
+     */
+    static void warmFill(MemorySegment m, int[] ids, int batch) {
+        int n = (int) Math.min(Math.min(batch, 1 << 16), m.byteSize() / ROW);
+        int[] s = new int[n];
+        long[] t = new long[n];
+        float[] v = new float[n];
+        long best = Long.MAX_VALUE;
+        long deadline = System.nanoTime() + 3_000_000_000L;
+        for (int calls = 0, still = 0; still < 200 && System.nanoTime() < deadline; calls++) {
+            long t0 = System.nanoTime();
+            fill(m, 0, n, ids, s, t, v);
+            long dt = System.nanoTime() - t0;
+            if (dt < best * 9 / 10) {
+                best = dt;
+                still = 0;
+            } else {
+                still++;
+            }
+        }
     }
 }
