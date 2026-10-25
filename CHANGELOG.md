@@ -42,7 +42,8 @@ Server (`tsdbd`)
 - `--port 0 --port-file FILE` for scripts and tests; `tsdbd --version`.
 
 Clients and bindings
-- Clients of tsdbd in C, Rust, Python and Java, all at protocol 9.
+- Clients of tsdbd in C (protocol 9), Rust, Python and Java (protocol 7; protocol 9 before this release:
+  the spread, LTTB and TWA with order and limit).
 - Embedded bindings (no server): Rust, Python and Java 22+.
 - Command-line tool `tsdb` (create, import, query, delete, retention, volumes, stats, optimize).
 - Apache Pulsar 5 sink (`connectors/pulsar`): Pulsar holds the points while tsdb is down, and a point is

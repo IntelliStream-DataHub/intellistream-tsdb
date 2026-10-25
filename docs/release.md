@@ -32,6 +32,9 @@ and `build/tsdb --version` print; `make test` runs it too.
 - `CHANGELOG.md`: move "Unreleased" under the new version with its date; list what changed in plain
   language (Added, Changed, Fixed, Removed); keep "Known limitations" true; say the format and protocol
   versions.
+- Check every line of the changelog entry against the code, not against plans: e.g. each client's protocol
+  version (`include/tsdb_protocol.h`, `client/rust/src/protocol.rs`, `client/java/.../Protocol.java`), and
+  features the roadmap still lists as to do.
 - `docs/compatibility.md`: the table at the top; what this release reads.
 - `docs/roadmap.md`: what is done, what is next. README and AGENTS.md: numbers that changed.
 
