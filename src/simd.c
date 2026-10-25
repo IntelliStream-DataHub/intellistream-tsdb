@@ -30,7 +30,7 @@
  * One order for all five sets: the lanes are the same (float32 in 32 double lanes, float64 and TWA segments in
  * 16), only how many of them one instruction holds differs (SSE and AVX's 128-bit code: two float64 lanes per
  * vector, eight vectors; AVX2: four; AVX-512: eight; scalar: one), and every set halves them in the same steps.
- * A short run (below simd_short: SIMD_SHORT, or AVX_SHORT and AVX2_SHORT where simd_small_* are 128-bit
+ * A short run (below simd_short, simd_short_f64 for float64: SIMD_SHORT, or AVX_SHORT and AVX2_SHORT where simd_small_* are 128-bit
  * kernels) starts the halving at the smallest power of two that holds it. TWA has two orders, chosen by the
  * granule's length alone: up to TWA_SEQ_MAX points twa.c adds the segments one after another (compiled once, so
  * the same bits on every CPU), beyond it simd_twa's 16 lanes in every set. Where the integer kernels and LTTB's take over from values.c's
@@ -1575,6 +1575,11 @@ typedef struct {
 /* AVX2's 256-bit kernels start later: below 128 rows the 128-bit ones are 1.1-1.8x faster on Zen 4 (float32 and
  * float64, agg and spread); at 128 the 256-bit float64 spread is ahead (fold-bench --rows 64..1024) */
 #define AVX2_SHORT 128
+/* AVX-512: the 128-bit float32 kernels are 1.04-2.3x faster than the 512-bit ones up to 127 rows (with nulls the
+ * most); the 512-bit float64 kernels are as fast at 80 rows and up to 1.19x faster at 96 and 112, the 128-bit ones
+ * 1.08x faster at 64 (fold-bench --rows 64..128, Zen 4) */
+#define AVX512_SHORT AVX2_SHORT
+#define AVX512_SHORT_F64 AVX_SHORT
 
 static size_t (*simd_lttb)(int, const int64_t *, const uint64_t *, size_t, int64_t, double, double, double,
                            double) = lttb_scalar;
@@ -1603,7 +1608,7 @@ void (*simd_fold_i64)(const int64_t *v, size_t n, agg_state *a, agg_dev *dx);
 void (*simd_fold_u32)(const uint32_t *v, size_t n, uint32_t null, agg_state *a, agg_dev *dx);
 void (*simd_small_f32)(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv) = small_f32_scalar;
 void (*simd_small_f64)(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *dv) = small_f64_scalar;
-size_t simd_short = SIMD_SHORT;
+size_t simd_short = SIMD_SHORT, simd_short_f64 = SIMD_SHORT;
 size_t simd_i64_min = SIZE_MAX, simd_i64_dev_min = SIZE_MAX, simd_u32_min = SIZE_MAX;
 size_t simd_lttb_small = 16;
 static const char *simd_level = "scalar";
@@ -1662,7 +1667,7 @@ void simd_select(int level)
         lttb_scalar;
     void (*sf32)(const float *, size_t, bool, agg_state *, agg_dev *) = small_f32_scalar;
     void (*sf64)(const double *, size_t, bool, agg_state *, agg_dev *) = small_f64_scalar;
-    size_t shortn = SIMD_SHORT;
+    size_t shortn = SIMD_SHORT, shortn64 = 0; /* 0: as shortn */
     simd_thresholds thr = THR_SCALAR;
     const char *name = "scalar";
 #ifdef TSDB_X86
@@ -1694,7 +1699,8 @@ void simd_select(int level)
         lttb = lttb_avx512;
         sf32 = small_f32_avx; /* the 128-bit (VEX) short-run kernels: less fixed cost than the scalar ones */
         sf64 = small_f64_avx;
-        shortn = AVX_SHORT;
+        shortn = AVX512_SHORT;
+        shortn64 = AVX512_SHORT_F64;
         name = "avx512";
         thr = THR_AVX512;
         break;
@@ -1753,6 +1759,7 @@ void simd_select(int level)
     simd_small_f32 = sf32;
     simd_small_f64 = sf64;
     simd_short = shortn;
+    simd_short_f64 = shortn64 ? shortn64 : shortn;
     simd_i64_min = thr.i64;
     simd_i64_dev_min = thr.i64_dev;
     simd_u32_min = thr.u32;

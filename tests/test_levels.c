@@ -395,7 +395,7 @@ typedef int (*dec_fn)(const uint8_t *, size_t, size_t, void *);
 static uint8_t *buf, *dec;
 #define BUF(n) ((n) * 16 + 4096)
 
-/* A run shorter than simd_short takes values.c's tiny path (float64, n <= 4) or simd_small_*: it must give the
+/* A run shorter than simd_short (simd_short_f64 for float64) takes values.c's tiny path (float64, n <= 4) or simd_small_*: it must give the
  * bits of the lane kernels of the level, which it skips, with and without the spread and the search for nulls,
  * from a new state and from states whose bounds and sum are zeros of either sign. */
 static void short_run(const input *x, size_t m)
@@ -591,7 +591,7 @@ static void run(rec *r, codec_ctx *c)
             memset(&a, 0, sizeof a);
             agg_from_granule(x->type, &g, &a.a, &a.x);
             put(r, "agg_from_granule", x->name, &a, sizeof a);
-            if (m < simd_short && (x->type == TSDB_FLOAT32 || x->type == TSDB_FLOAT64))
+            if ((x->type == TSDB_FLOAT32 && m < simd_short) || (x->type == TSDB_FLOAT64 && m < simd_short_f64))
                 short_run(x, m);
             for (int sp = 0; m && g.nulls == 0 && sp < 2; sp++) { /* queries without and with the spread */
                 memset(&a, 0, sizeof a);
@@ -748,7 +748,8 @@ static void check_dispatch(void) {}
 static void check_thresholds(void)
 {
     /* TWA_SEQ_MAX is the same for every set; SIZE_MAX means the set never takes that kernel (its loop is faster) */
-    const size_t t[] = {simd_i64_min, simd_i64_dev_min, simd_u32_min, simd_lttb_small, simd_short, TWA_SEQ_MAX + 1};
+    const size_t t[] = {simd_i64_min, simd_i64_dev_min, simd_u32_min, simd_lttb_small, simd_short, simd_short_f64,
+                        TWA_SEQ_MAX + 1};
     for (size_t i = 0; i < sizeof t / sizeof *t; i++) {
         if (t[i] == SIZE_MAX)
             continue;

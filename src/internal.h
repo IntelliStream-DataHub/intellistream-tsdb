@@ -351,11 +351,13 @@ SIMD_VAR void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *x
 /* The lanes of simd.c's float kernels (their order of additions). A run of fewer than simd_short values goes to
  * simd_small_*: the same bits as the kernels at a fraction of their fixed cost; values.c picks. simd_short is
  * SIMD_SHORT (the scalar short path's limit: the float32 lanes taken 16 at a time) or, where simd_small_* are the
- * SSE/AVX kernels of any length, the length from which the set's wider kernels win. */
+ * SSE/AVX kernels of any length, the length from which the set's wider kernels win; simd_short_f64 the same for
+ * float64 (AVX-512: its 512-bit float32 kernels lose to the 128-bit ones up to 127 rows, its float64 ones win from
+ * 80). */
 #define SIMD_LANES_F32 32
 #define SIMD_LANES_F64 16
 #define SIMD_SHORT 32
-SIMD_VAR size_t simd_short;
+SIMD_VAR size_t simd_short, simd_short_f64;
 SIMD_VAR void (*simd_small_f32)(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
 SIMD_VAR void (*simd_small_f64)(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x);
 /* the same with nulls: `nulls` of the n slots hold the type's null (0: none, the kernel above) */

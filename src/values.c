@@ -201,7 +201,7 @@ static void fold_f64(const double *v, size_t n, bool may_be_null, agg_state *a, 
         }
         return;
     }
-    if (n < simd_short)
+    if (n < simd_short_f64)
         simd_small_f64(v, n, may_be_null, a, x);
     else
         simd_fold_f64(v, n, may_be_null ? count_null_f64((const uint64_t *)v, n) : 0, a, x);
