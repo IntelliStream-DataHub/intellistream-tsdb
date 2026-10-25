@@ -123,6 +123,7 @@ try (TsdbClient client = TsdbClient.connect("127.0.0.1", 7070)) {
 One client is one network connection. Use it from one thread at a time. If several threads need the database,
 give each its own client.
 
+`TsdbClient.connect(host, port)` gives up on the connect after 10 seconds.
 By default a request waits as long as the server takes, so a server that hangs (a stalled disk, a dead peer)
 hangs the calling thread. `TsdbClient.connect(host, port, Duration.ofSeconds(10), Duration.ofSeconds(30))` bounds
 the connect and every later wait for the server (the longest silence it puts up with, not a deadline for the whole

@@ -25,7 +25,23 @@ extern "C" {
 
 typedef struct tsdbc tsdbc;
 
+/* Connects, giving up on each address after TSDBC_CONNECT_TIMEOUT_MS (10 s, as
+ * the Rust, Python and Java clients do). TCP keepalive is on: the first probe
+ * after 30 s of silence, then every 10 s, and the connection is dropped after 3
+ * unanswered probes, so a server that vanished without a reset is noticed
+ * about a minute later instead of never. Requests wait without a time limit
+ * unless tsdbc_set_timeout says otherwise. */
+#define TSDBC_CONNECT_TIMEOUT_MS 10000
+#define TSDBC_KEEPALIVE_IDLE_S 30
+#define TSDBC_KEEPALIVE_INTERVAL_S 10
+#define TSDBC_KEEPALIVE_COUNT 3
 int tsdbc_connect(const char *host, int port, tsdbc **out);
+/* The same with its own connect timeout; 0 waits as long as the kernel does. */
+int tsdbc_connect_timeout(const char *host, int port, int connect_ms, tsdbc **out);
+/* Keepalive probes: idle_s of silence before the first, interval_s between
+ * them, count unanswered before the connection is dropped; idle_s = 0 turns
+ * keepalive off. */
+int tsdbc_set_keepalive(tsdbc *c, int idle_s, int interval_s, int count);
 void tsdbc_close(tsdbc *c); /* waits for pipelined inserts first; use tsdbc_wait to see their errors */
 const char *tsdbc_strerror(int err); /* the client does not link the storage engine */
 
@@ -33,6 +49,7 @@ int tsdbc_series(tsdbc *c, const char *name, int create, uint32_t *id);
 /* Creates the series in the volume `path` on the server (see tsdb_series_at), one the operator added with
  * `tsdb <dir> volume add`: tsdbd never adds one (TSDB_ERR_NOTFOUND). */
 int tsdbc_series_at(tsdbc *c, const char *name, const char *path, uint32_t *id);
+/* TSDB_ERR_INVALID if the name and its NUL do not fit in len bytes (65536 always do). */
 int tsdbc_series_name(tsdbc *c, uint32_t id, char *buf, size_t len);
 
 /* Inserts travel packed and zstd compressed (level 1 by default) when the
@@ -43,7 +60,9 @@ int tsdbc_set_compression(tsdbc *c, int level);
 uint64_t tsdbc_bytes_sent(const tsdbc *c);
 /* Bounds every wait for the server (send or receive) to ms milliseconds; 0, the
  * default, waits forever. A call that times out returns TSDB_ERR_IO and the
- * connection is of no further use: close it. */
+ * connection is of no further use: the reply may still come, so every later
+ * call on it fails with TSDB_ERR_IO too (as after any I/O or protocol error).
+ * Close it and connect again. */
 int tsdbc_set_timeout(tsdbc *c, int ms);
 
 int tsdbc_insert(tsdbc *c, const uint32_t *series, const int64_t *ts, const float *values, size_t n);

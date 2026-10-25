@@ -75,6 +75,7 @@ day  1700002800000 1380 40710.0
 `with` block, or call `client.close()` when you are done. Threads can share
 a client (they take turns) or open one each. `timeout` is in seconds.
 
+The connect gives up after 10 seconds even without a `timeout`.
 Without a `timeout` a call waits as long as the server takes, so a server that
 hangs (a stalled disk, a dead peer) hangs your program. With one, the connect
 and every later wait for the server is bounded: the longest silence it puts

@@ -256,6 +256,33 @@ class TsdbSinkTest {
     }
 
     @Test
+    void stateNamesFromTheTopicStayWithinTheCacheBounds() throws Exception {
+        TsdbSinkConfig c = config();
+        c.stateCacheSize = 3;
+        c.seriesCacheBytes = 256 << 10;
+        open(c);
+        List<FakeRecord> rs = new ArrayList<>();
+        for (int i = 0; i < 60; i++) { /* 60 KB state names, and the first three again at the end */
+            String v = (i < 57 ? "v" + i : "v" + (i - 57)) + "x".repeat(60_000);
+            rs.add(new FakeRecord(i, "{\"series\":\"mode\",\"ts\":" + i + ",\"value\":\"" + v
+                    + "\",\"type\":\"state\"}"));
+            sink.write(rs.get(i));
+        }
+        eventually(() -> allSettled(rs), "all settled");
+        assertEquals(0, dlq.records.size(), String.valueOf(dlq.reasons));
+        assertEquals(60, tsdb.last().size());
+        assertEquals(60, tsdb.stateCalls.get(), "v0 to v2 were evicted and asked again");
+        for (int i = 60; i < 63; i++) { /* the latest name stays cached (two of 120 KB fit): no request */
+            rs.add(new FakeRecord(i, "{\"series\":\"mode\",\"ts\":" + i + ",\"value\":\"v2"
+                    + "x".repeat(60_000) + "\",\"type\":\"state\"}"));
+            sink.write(rs.get(i));
+        }
+        eventually(() -> allSettled(rs), "all settled");
+        assertEquals(63, tsdb.last().size());
+        assertEquals(60, tsdb.stateCalls.get(), "cached state names were asked again");
+    }
+
+    @Test
     void autoCreateOffSendsUnknownSeriesToTheDeadLetterTopic() throws Exception {
         TsdbSinkConfig c = config();
         c.autoCreate = false;
