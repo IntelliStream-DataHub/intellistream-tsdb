@@ -27,7 +27,7 @@ directory) and `path`.
 
 | metric | type | meaning |
 |---|---|---|
-| `tsdb_build_info{version,simd,cpu_level}` | gauge | always 1; `cpu_level` is `native`, or the codec level of a portable build |
+| `tsdb_build_info{version,build,simd,cpu_level}` | gauge | always 1; `version` is the release (0.9.0), `build` the git describe of the build; `cpu_level` is `native`, or the codec level of a portable build |
 | `tsdb_io_backend_info{backend}` | gauge | `io_uring` or `epoll` |
 | `tsdb_role_info{role}` | gauge | `writer`, `read-only` or `follower` |
 | `tsdb_start_time_seconds` | gauge | Unix time of the start |

@@ -2287,7 +2287,8 @@ static void test_metrics(const char *dir)
     /* the endpoint: format, headers, the paths and methods it refuses */
     mset m0;
     scrape(&m0);
-    CHECK(mval(&m0, "tsdb_build_info", "version=\"") == 1);
+    CHECK(mval(&m0, "tsdb_build_info", "version=\"" TSDB_VERSION "\",build=\"") == 1); /* the release, then the build id */
+    CHECK(strcmp(tsdb_version(), TSDB_VERSION) == 0);
     CHECK(mval(&m0, "tsdb_role_info", "role=\"writer\"") == 1);
     const char *iob = getenv("TSDBD_IO");
     if (iob && strcmp(iob, "auto") != 0 && strcmp(iob, "uring") != 0)

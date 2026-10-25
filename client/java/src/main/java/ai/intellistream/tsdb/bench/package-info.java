@@ -4,8 +4,8 @@
  * runs the random query windows of {@code tsdbc-bench query}.
  *
  * <pre>{@code
- * java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar ai.intellistream.tsdb.bench.InsertBench /tmp/x.rb --conns 4
- * java -cp target/tsdb-client-0.1.0-SNAPSHOT.jar ai.intellistream.tsdb.bench.QueryBench --conns 32
+ * java -cp target/tsdb-client-0.9.0.jar ai.intellistream.tsdb.bench.InsertBench /tmp/x.rb --conns 4
+ * java -cp target/tsdb-client-0.9.0.jar ai.intellistream.tsdb.bench.QueryBench --conns 32
  * }</pre>
  */
 package ai.intellistream.tsdb.bench;

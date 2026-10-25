@@ -199,6 +199,10 @@ have to be unpacked are unpacked in parallel.
 
 More detail: [docs/design.md](docs/design.md).
 
+**Version 0.9.0** is the first release ([CHANGELOG.md](CHANGELOG.md)). The disk format and the wire protocol
+may still change in a 0.9.x release and freeze at 1.0; what that means for your data is in
+[docs/compatibility.md](docs/compatibility.md). `tsdbd --version` and `tsdb --version` print the version.
+
 ## Getting started
 
 You need a C compiler (C11), libzstd, and liburing for the server (not with `make NO_URING=1`).

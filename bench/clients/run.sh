@@ -93,8 +93,8 @@ SPID=""
 
 # ------------------------------------------------------------------ build
 RUSTX=$ROOT/client/rust/target/release/examples
-JAR=$ROOT/client/java/target/tsdb-client-0.1.0-SNAPSHOT.jar
-EJAR=$ROOT/client/java-embedded/target/tsdb-embedded-0.1.0-SNAPSHOT.jar
+JAR=$ROOT/client/java/target/tsdb-client-0.9.0.jar
+EJAR=$ROOT/client/java-embedded/target/tsdb-embedded-0.9.0.jar
 JM2="-Dmaven.repo.local=$B/m2 -Dmaven.repo.local.tail=$HOME/.m2/repository"
 PY=$PYVENV/bin/python
 if [ "$BUILD" = 1 ]; then

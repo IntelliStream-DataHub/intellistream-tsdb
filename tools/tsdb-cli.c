@@ -6,10 +6,15 @@
 #include <math.h>
 #include <unistd.h>
 
+#ifndef TSDB_BUILD_VERSION
+#define TSDB_BUILD_VERSION "dev"
+#endif
+
 static void usage(void)
 {
     fprintf(stderr,
             "usage: tsdb <dir> <command> [args]\n"
+            "       tsdb --version\n"
             "\n"
             "  insert <series>                    read \"time,value\" lines from stdin\n"
             "  import                             read \"series,time,value\" lines from stdin\n"
@@ -609,6 +614,10 @@ static void human(double bytes, char *buf, size_t len)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+        printf("tsdb %s (build %s)\n", tsdb_version(), TSDB_BUILD_VERSION);
+        return 0;
+    }
     if (argc < 3)
         usage();
     const char *dir = argv[1], *cmd = argv[2];

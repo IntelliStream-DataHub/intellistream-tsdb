@@ -116,7 +116,7 @@ suite:
 ```sh
 build/tsdb-bench --export /data/rows.rowbinary --series 100 --points 1000000
 java --enable-native-access=ALL-UNNAMED \
-  -cp target/tsdb-embedded-0.1.0-SNAPSHOT.jar:target/lib/tsdb-client-0.1.0-SNAPSHOT.jar \
+  -cp target/tsdb-embedded-0.9.0.jar:target/lib/tsdb-client-0.9.0.jar \
   ai.intellistream.tsdb.embedded.bench.EmbeddedBench --dir /data/emb --file /data/rows.rowbinary \
   --series 100 --points 1000000
 ```
