@@ -15,6 +15,11 @@
  *
  * bench/clients/run.sh runs both next to the TCP clients.
  *
+ * --type float32|float64|int64 stores the series as that type, written with tsdb_insert_values and read with
+ * tsdb_query_values (float32 too, so the runs differ only in the stored type): float64 holds the same values
+ * widened, int64 the values in thousandths (llround(v * 1000)), as a meter reporting milli-units would. Without
+ * it, float32 through tsdb_insert and tsdb_query_raw.
+ *
  * Query windows are given in samples, so every sensor kind gets comparable
  * work: a "3600 sample" window is an hour of 1 s data, 1.2 s of vibration.
  */
@@ -44,6 +49,7 @@ typedef struct cfg {
     int qps;        /* --qps: threads of the random-window queries; 0: off */
     double seconds; /* per window class, --qps */
     bool optimize;  /* --load: merge after the load, as the server benchmark does */
+    int vtype;      /* --type: a tsdb_type; -1 the float32 calls */
 } cfg;
 
 static const int64_t T0 = 1704067200000; /* 2024-01-01 */
@@ -76,6 +82,7 @@ static void *writer(void *arg)
     uint32_t *sv = malloc(c->batch * sizeof *sv);
     int64_t *tv = malloc(c->batch * sizeof *tv);
     float *vv = malloc(c->batch * sizeof *vv);
+    void *tv64 = c->vtype == TSDB_FLOAT64 || c->vtype == TSDB_INT64 ? malloc(c->batch * 8) : NULL;
     uint64_t window = c->batch / ns ? c->batch / ns : 1;
     for (uint64_t i0 = 0; i0 < c->points; i0 += window) {
         size_t n = 0;
@@ -93,7 +100,17 @@ static void *writer(void *arg)
                 fwrite(&vv[k], 4, 1, j->out);
             }
         } else {
-            int rc = tsdb_insert(j->db, sv, tv, vv, n);
+            int rc;
+            if (c->vtype < 0) {
+                rc = tsdb_insert(j->db, sv, tv, vv, n);
+            } else {
+                tsdb_values col = {(tsdb_type)c->vtype, tv64 ? tv64 : vv, NULL};
+                for (size_t k = 0; k < n && c->vtype == TSDB_FLOAT64; k++)
+                    ((double *)tv64)[k] = vv[k];
+                for (size_t k = 0; k < n && c->vtype == TSDB_INT64; k++)
+                    ((int64_t *)tv64)[k] = isfinite(vv[k]) ? llround((double)vv[k] * 1000) : 0;
+                rc = tsdb_insert_values(j->db, sv, tv, &col, n);
+            }
             if (rc) {
                 fprintf(stderr, "insert: %s\n", tsdb_strerror(rc));
                 exit(1);
@@ -104,6 +121,7 @@ static void *writer(void *arg)
     free(sv);
     free(tv);
     free(vv);
+    free(tv64);
     free(st);
     return NULL;
 }
@@ -115,6 +133,26 @@ static int count_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
     acc[1] += v[n - 1]; /* touch the data */
     (void)ts;
     return 0;
+}
+
+static int count_values(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
+{
+    double *acc = ctx;
+    acc[0] += (double)n;
+    if (n) /* touch the data */
+        acc[1] += v->type == TSDB_FLOAT64 ? ((const double *)v->values)[n - 1]
+                  : v->type == TSDB_INT64 ? (double)((const int64_t *)v->values)[n - 1]
+                                          : ((const float *)v->values)[n - 1];
+    (void)ts;
+    return 0;
+}
+
+/* raw rows of one series into acc (count, a sum of values touched) */
+static int scan_raw(tsdb *db, const cfg *c, uint32_t s, int64_t start, int64_t end, double *acc)
+{
+    if (c->vtype < 0)
+        return tsdb_query_raw(db, s, start, end, count_rows, acc);
+    return tsdb_query_values(db, s, start, end, NULL, count_values, acc);
 }
 
 typedef struct qjob {
@@ -142,7 +180,7 @@ static void *query_loop(void *arg)
             int64_t end = start + (int64_t)q->window * step;
             if (q->kind == 0) {
                 double acc[2] = {0, 0};
-                tsdb_query_raw(q->db, s, start, end, count_rows, acc);
+                scan_raw(q->db, q->c, s, start, end, acc);
                 q->rows += (uint64_t)acc[0];
             } else {
                 tsdb_bucket *b;
@@ -435,7 +473,7 @@ static int mode_qps(const cfg *c)
 int main(int argc, char **argv)
 {
     cfg c = {.series = 100, .points = 1000000, .dataset = -1, .batch = 1000000, .threads = 4, .zstd = 1, .fsync = 1,
-             .seconds = CB_DEFAULT_SECONDS};
+             .seconds = CB_DEFAULT_SECONDS, .vtype = -1};
     static struct option opts[] = {
         {"dir", required_argument, 0, 'd'},     {"series", required_argument, 0, 's'},
         {"points", required_argument, 0, 'p'},  {"dataset", required_argument, 0, 'v'},
@@ -445,7 +483,7 @@ int main(int argc, char **argv)
         {"export", required_argument, 0, 'e'},  {"query-threads", required_argument, 0, 'Q'},
         {"load", required_argument, 0, 'L'},    {"qps", required_argument, 0, 'S'},
         {"seconds", required_argument, 0, 'T'}, {"optimize", no_argument, 0, 'O'},
-        {"verify", required_argument, 0, 'V'},
+        {"verify", required_argument, 0, 'V'},  {"type", required_argument, 0, 'Y'},
         {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -473,10 +511,21 @@ int main(int argc, char **argv)
         case 'T': c.seconds = atof(optarg); break;
         case 'O': c.optimize = true; break;
         case 'V': c.verify_path = optarg; break;
+        case 'Y':
+            c.vtype = strcmp(optarg, "float32") == 0   ? TSDB_FLOAT32
+                      : strcmp(optarg, "float64") == 0 ? TSDB_FLOAT64
+                      : strcmp(optarg, "int64") == 0   ? TSDB_INT64
+                                                       : -2;
+            if (c.vtype == -2) {
+                fprintf(stderr, "--type: float32, float64 or int64\n");
+                return 2;
+            }
+            break;
         default:
             fprintf(stderr,
                     "usage: tsdb-bench --dir DIR [--series N] [--points N] [--dataset mixed|hdd_temp|cpu_temp|...]\n"
                     "       [--batch ROWS] [--threads N] [--zstd LEVEL] [--no-fsync] [--keep] [--query-only]\n"
+                    "       [--type float32|float64|int64]\n"
                     "       tsdb-bench --export FILE [--series N] [--points N] [--dataset ...]\n"
                     "       tsdb-bench --dir DIR --load FILE [--threads N] [--batch ROWS] [--no-fsync] [--optimize]\n"
                     "       tsdb-bench --dir DIR --verify FILE\n"
@@ -486,6 +535,10 @@ int main(int argc, char **argv)
     }
     if ((!c.dir && !c.export_path) || c.series == 0 || c.points == 0 || c.threads < 1)
         return 2;
+    if (c.vtype >= 0 && (c.export_path || c.load_path || c.verify_path || c.qps > 0)) {
+        fprintf(stderr, "--type: only for a generated load (the files and --qps are float32)\n");
+        return 2;
+    }
     if (c.verify_path && c.dir)
         return mode_verify(&c);
     if (c.load_path && c.dir)
@@ -530,11 +583,16 @@ int main(int argc, char **argv)
         char name[64];
         uint32_t id;
         snprintf(name, sizeof name, "%s.%u", ds_info[kind_of(&c, s)].name, s);
-        tsdb_series(db, name, &id);
+        rc = c.vtype < 0 ? tsdb_series(db, name, &id) : tsdb_series_create(db, name, (tsdb_type)c.vtype, NULL, &id);
+        if (rc) {
+            fprintf(stderr, "series %s: %s\n", name, tsdb_strerror(rc));
+            return 1;
+        }
     }
-    printf("tsdb-bench: %u series x %" PRIu64 " points = %.1f M rows, dataset %s,\n"
+    printf("tsdb-bench: %u series x %" PRIu64 " points = %.1f M rows, dataset %s, %s,\n"
            "            batch %zu rows, %d writer threads, zstd %d, fsync %d, simd %s\n\n",
-           c.series, c.points, total / 1e6, c.dataset < 0 ? "mixed" : ds_info[c.dataset].name, c.batch, c.threads,
+           c.series, c.points, total / 1e6, c.dataset < 0 ? "mixed" : ds_info[c.dataset].name,
+           c.vtype == TSDB_FLOAT64 ? "float64" : c.vtype == TSDB_INT64 ? "int64" : "float32", c.batch, c.threads,
            c.zstd, c.fsync, tsdb_simd_level());
 
     tsdb_stats st;
@@ -566,7 +624,7 @@ int main(int argc, char **argv)
     double t0 = now_s();
     double acc[2] = {0, 0};
     for (uint32_t s = 0; s < c.series; s++)
-        tsdb_query_raw(db, s, INT64_MIN, INT64_MAX, count_rows, acc);
+        scan_raw(db, &c, s, INT64_MIN, INT64_MAX, acc);
     double tr = now_s() - t0;
     printf("raw scan, all series, 1 thread            %8.3f s  %7.1f M rows/s  (%.0f rows)\n", tr, acc[0] / tr / 1e6,
            acc[0]);

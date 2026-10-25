@@ -237,7 +237,7 @@ a change could move, on a quiet machine, and update the numbers.
 |---|---|
 | `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed |
 | `build/type-bench` | the float64, int64, bool and state codecs |
-| `build/tsdb-bench` | load, compression and queries on 100 M rows; `--export` writes the rows for ClickHouse |
+| `build/tsdb-bench` | load, compression and queries on 100 M rows; `--type float64` or `int64` stores another value type; `--export` writes the rows for ClickHouse |
 | `build/insert-bench` | durable inserts on a real disk, 1 row to 1 billion rows per call |
 | `build/tsdbc-bench` | the server: loading, queries, 10,000 connections |
 | `build/scale-bench` | 100 billion rows: load, then a query suite, with the same queries as SQL for ClickHouse |
