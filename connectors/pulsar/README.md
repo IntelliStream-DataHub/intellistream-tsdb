@@ -104,7 +104,7 @@ Build the client and the NAR (needs Maven):
 
 ```sh
 (cd client/java && mvn -q install -DskipTests)
-(cd connectors/pulsar && mvn -q package)          # target/tsdb-pulsar-sink-0.1.0-SNAPSHOT.nar
+(cd connectors/pulsar && mvn -q package)          # target/tsdb-pulsar-sink-0.9.0.nar
 ```
 
 Create the topics and start the sink:
@@ -112,7 +112,7 @@ Create the topics and start the sink:
 ```sh
 bin/pulsar-admin scalable-topics create -s 4 public/default/points
 bin/pulsar-admin scalable-topics create public/default/points-dlq
-bin/pulsar-admin sinks create --archive tsdb-pulsar-sink-0.1.0-SNAPSHOT.nar \
+bin/pulsar-admin sinks create --archive tsdb-pulsar-sink-0.9.0.nar \
     --tenant public --namespace default --name tsdb \
     --inputs topic://public/default/points --subs-name tsdb --retain-key-ordering \
     --sink-config '{"hosts": "tsdb1:7070", "connections": 4,

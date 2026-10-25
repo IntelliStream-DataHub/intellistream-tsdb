@@ -20,6 +20,7 @@ make dist                 # portable tarball (x86-64-v2 + v3/v4 codecs) in build
 make dist-test            # the tarball's own test suite, at every CPU level (TSDB_CPU=v2|v3|v4)
 make dist-check-almalinux10   # that suite in an AlmaLinux 10 container (Podman)
 make dist-check-sandybridge   # TSDB_CPU=v2, and under qemu-x86_64 -cpu Westmere/SandyBridge if installed
+make check-version        # VERSION, tsdb.h, tsdbd/tsdb --version and the client manifests agree (make test runs it)
 make test-clients         # Rust, Python and Java clients against build/tsdbd (needs cargo, python3, mvn)
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
 make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end, uring and epoll (~2 min, same tools);
@@ -177,12 +178,16 @@ cgroup, so `nice` does not keep your work out of its way.
   innermost.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
+- **Versions.** The release version is the file `VERSION` (0.9.0); `tools/check-version.sh` compares it with
+  `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
+  `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
+  `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
 - The on-disk format is version 5 (`FORMAT_VERSION`): 160-byte granule entries
   with typed, time-weighted and spread statistics, a checksum over each part's header, index and footer,
-  checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Before
-  the first release, older formats need not stay readable (the user decided
-  this on 2026-10-24): a layout change bumps `FORMAT_VERSION`, and a database of
-  another version is refused at open. Value blocks name their codec, so new
+  checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Until
+  1.0 (the format freezes there; the user decided this on 2026-10-25) older formats need not stay readable: a
+  layout change bumps `FORMAT_VERSION` and goes in the changelog with a way to carry data over, and a database
+  of another version is refused at open with a message that names both versions. Value blocks name their codec, so new
   codecs need no version bump.
 - **Damage is never silent.** A torn tail of an append-only file is cut; a bad
   record with a valid one after it, a read error or a broken part fails the open

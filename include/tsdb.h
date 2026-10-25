@@ -27,6 +27,17 @@
 extern "C" {
 #endif
 
+/* The release version, also in the file VERSION; `make check-version` makes sure they agree. 0.9.x may still
+ * change the on-disk format and the wire protocol; 1.0 freezes them (docs/compatibility.md). */
+#define TSDB_VERSION_MAJOR 0
+#define TSDB_VERSION_MINOR 9
+#define TSDB_VERSION_PATCH 0
+#define TSDB_VERSION "0.9.0"
+
+/* The version of the library that is linked in, "MAJOR.MINOR.PATCH" (the macros above are the version the
+ * header was written for). */
+const char *tsdb_version(void);
+
 typedef struct tsdb tsdb;
 
 enum {

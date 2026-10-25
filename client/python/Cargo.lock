@@ -183,7 +183,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tsdb-client"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "tsdb-sys",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "tsdb-client-python"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "pyo3",
  "tsdb-client",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "tsdb-sys"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "cc",
  "zstd-sys",

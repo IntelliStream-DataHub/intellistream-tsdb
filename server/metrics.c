@@ -265,8 +265,10 @@ static void render(sb *b)
         snprintf(codecs, sizeof codecs, "%s", cp + 9);
         *cp = '\0';
     }
-    family(b, "tsdb_build_info", "gauge", "Build and runtime: version, SIMD kernel set, codec CPU level (always 1).");
+    family(b, "tsdb_build_info", "gauge", "Build and runtime: release version, build id, SIMD kernel set, codec CPU level (always 1).");
     sb_add(b, "tsdb_build_info{version=\"");
+    sb_label(b, tsdb_version());
+    sb_add(b, "\",build=\"");
     sb_label(b, TSDB_BUILD_VERSION);
     sb_add(b, "\",simd=\"");
     sb_label(b, simd);

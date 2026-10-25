@@ -14,7 +14,7 @@ Contents
   tests/               the test suite of this build; tests/run-tests.sh runs it (libcrashfs.so there is a
                        test-only shim that fails a write on purpose; nothing else loads it)
   systemd/tsdbd.service
-  BUILDINFO            version, compiler, glibc
+  BUILDINFO            version, build id, compiler, glibc
 
 Requirements
   CPU     x86-64-v2: SSE4.2 and POPCNT, AVX not needed (Intel Nehalem and

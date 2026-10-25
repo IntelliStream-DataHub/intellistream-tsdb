@@ -1,0 +1,79 @@
+# Changelog
+
+All notable changes to tsdb are listed here, newest first. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the versions follow
+[Semantic Versioning](https://semver.org/), with the exception described in
+[docs/compatibility.md](docs/compatibility.md): before 1.0, a 0.9.x release may still change the
+disk format and the wire protocol.
+
+## [Unreleased]
+
+## [0.9.0] - unreleased (tag v0.9.0 when the checklist in docs/release.md is done)
+
+The first release. Disk format version 5, wire protocol version 9.
+
+### What it contains
+
+Engine (the library, `libtsdb`)
+- Series of (time in milliseconds, value) points. A series has one value type: float32, float64, int64, bool
+  or state (a text label from a small set). Any value may be null.
+- MergeTree-style storage: every insert writes an immutable, sorted part; parts live in time partitions and
+  are merged in the background. Last write wins: a value written for a time that exists replaces it.
+- Compression chosen per block (fixed point, XOR, byte split, bit-packed deltas, ZSTD): about 1.2 bytes per
+  row on mixed sensor data.
+- Queries: raw points (oldest or newest first, with a limit), count/sum/min/max/average per bucket (fixed
+  buckets and calendar buckets in a time zone), the spread (range, standard deviation, variance), LTTB
+  downsampling and time-weighted averages. Aggregates come from stored granule statistics wherever a bucket
+  covers whole granules; sums of int64 are exact.
+- Range delete and atomic replace of one series, retention per series, several volumes (directories or
+  mounts).
+- Durable writes: a write is on disk when it returns (WAL with group commit, or a periodic sync). A failed
+  fsync is fail-stop. Tested by killing the process, simulated power loss and injected I/O errors
+  (`make jepsen`).
+- One writer and any number of read-only followers on other hosts over NFS.
+- SIMD aggregation kernels for float32, float64, int64 and bool at four CPU levels (AVX-512, AVX2, AVX,
+  SSE4.2) that give identical results on every CPU.
+
+Server (`tsdbd`)
+- One event loop on io_uring or epoll (epoll is chosen by itself where io_uring is disabled, as on
+  AlmaLinux 10 and RHEL 10).
+- Compressed, packed inserts; the clients send about 6 bytes per point.
+- Prometheus metrics on a port of their own (`--metrics-port`, docs/metrics.md).
+- `--port 0 --port-file FILE` for scripts and tests; `tsdbd --version`.
+
+Clients and bindings
+- Clients of tsdbd in C, Rust, Python and Java, all at protocol 9.
+- Embedded bindings (no server): Rust, Python and Java 22+.
+- Command-line tool `tsdb` (create, import, query, delete, retention, volumes, stats, optimize).
+- Apache Pulsar 5 sink (`connectors/pulsar`): Pulsar holds the points while tsdb is down, and a point is
+  taken off Pulsar once it is on disk.
+
+Security hardening (input safety)
+- Volume paths chosen by a client are checked; a client can never make the server add a volume.
+- Query memory follows the rows and buckets a query really has; request memory, frame size and the time to
+  deliver a frame are bounded; flags and numbers on the server, CLI and clients are checked.
+- Crafted files do not corrupt memory: decoders and file loaders are fuzzed, and damage is never silent
+  (a damaged part or log fails the open, it is not skipped).
+
+Portable build and tooling
+- `make dist` makes a tarball (`tsdb-0.9.0-x86_64-linux.tar.gz`) for x86-64-v2 CPUs and newer, with
+  glibc 2.34 or newer, and the test suite that runs from it. It is checked on AlmaLinux 10 (Podman) and
+  under an emulated Westmere and Sandy Bridge.
+- `make integration-tests` runs tsdbd, the CLI and all clients end to end.
+- One version: the file `VERSION`; `make check-version` makes sure the header, the binaries and the client
+  manifests agree.
+
+### Known limitations
+
+- No authentication, no TLS and no access control: tsdbd belongs on a trusted network only. Put it behind a
+  firewall or a private network, and bind it to the interface you mean (`--listen`).
+- One writing server per database. Read-only followers can read the same directory; automatic failover is
+  designed (docs/ha.md) but not built.
+- The disk format (version 5) and the wire protocol (version 9) may still change in a 0.9.x release, with
+  export and import, or a migration, to carry data over. A database of another format version is refused
+  when it is opened, with a message that says so. They freeze at 1.0. See docs/compatibility.md.
+- Client and server of different 0.9.x releases may not understand each other: use the same release on both
+  sides.
+- No SQL, no tables, no latest-value lookups or series metadata (the industrial context belongs to the
+  DataHub platform).
+- Linux on x86-64 only for the tarball; other platforms build from source.

@@ -12,6 +12,8 @@
 
 #define META_FILE "META"
 
+const char *tsdb_version(void) { return TSDB_VERSION; }
+
 const char *tsdb_strerror(int err)
 {
     switch (err) {
@@ -227,9 +229,12 @@ static int meta_load_or_create(eng *db, bool read_only)
         if ((line = strstr(buf, "granule_rows=")))
             grows = (unsigned)strtoul(line + 13, NULL, 10);
         if (version != FORMAT_VERSION) {
-            /* no release has the older formats: they are not read */
-            fprintf(stderr, "tsdb: the database has format version %d; this build reads version %d only\n", version,
-                    FORMAT_VERSION);
+            /* the format may change in a 0.9.x release (docs/compatibility.md): another version is refused, never
+             * read as if it were ours */
+            fprintf(stderr,
+                    "tsdb: the database has disk format version %d; tsdb %s reads version %d only. Export the data "
+                    "with the release that wrote it and import it here (docs/compatibility.md)\n",
+                    version, TSDB_VERSION, FORMAT_VERSION);
             return TSDB_ERR_CORRUPT;
         }
         if (pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS)

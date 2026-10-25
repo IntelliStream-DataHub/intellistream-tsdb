@@ -1,11 +1,13 @@
 #!/bin/sh
 # Packs a `make dist` build into tsdb-VERSION-x86_64-linux.tar.gz (README.dist
-# describes the contents and the requirements).
+# describes the contents and the requirements). VERSION is the release (the file
+# VERSION, e.g. 0.9.0); BUILD_ID (default: git describe) goes into BUILDINFO.
 #
 #   tools/mkdist.sh build-dir [version]
 set -eu
 b=$1
-version=${2:-$(git describe --always --dirty 2>/dev/null || echo dev)}
+version=${2:-$(cat "$(dirname "$0")/../VERSION")}
+build_id=${BUILD_ID:-$(git describe --always --dirty 2>/dev/null || echo dev)}
 name=tsdb-$version-x86_64-linux
 stage=$b/$name
 # One tarball per build dir: `make dist-test` and dist-check-almalinux10 find it by tsdb-*.
@@ -24,6 +26,7 @@ cp dist/tsdbd.service "$stage/systemd/"
 cp dist/README.dist "$stage/README.dist"
 {
     echo "version  $version"
+    echo "build    $build_id"
     echo "built    $(date -u +%Y-%m-%dT%H:%MZ) on $(uname -sr)"
     echo "compiler $(${CC:-cc} --version | head -n 1)"
     echo "glibc    built against $(getconf GNU_LIBC_VERSION | cut -d' ' -f2); needs at most $(objdump -T "$b/tsdbd" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)"

@@ -76,6 +76,10 @@
 #include "../client/tsdb_pack.h"
 #include "metrics.h"
 
+#ifndef TSDB_BUILD_VERSION
+#define TSDB_BUILD_VERSION "dev"
+#endif
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -2044,6 +2048,7 @@ int main(int argc, char **argv)
                                    {"port-file", required_argument, 0, 'Q'},
                                    {"max-request-memory", required_argument, 0, 'X'},
                                    {"frame-timeout", required_argument, 0, 'D'},
+                                   {"version", no_argument, 0, 'v'},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0;
     const char *metrics_addr = NULL;
@@ -2052,6 +2057,7 @@ int main(int argc, char **argv)
         req_budget = (size_t)pages / 8 * (size_t)page; /* 1024 MB slowed 32 connections loading at full speed */
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
+        case 'v': printf("tsdbd %s (build %s)\n", tsdb_version(), TSDB_BUILD_VERSION); return 0;
         case 'd': dir = optarg; break;
         case 'l': addr = optarg; break;
         case 'p': port = (int)num_arg("port", optarg, 0, 65535); break; /* 0: any free port, told by --port-file and the banner */
@@ -2098,7 +2104,8 @@ int main(int argc, char **argv)
     if (!dir || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
         (metrics_addr && !metrics_on)) {
     usage:
-        fprintf(stderr, "usage: tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
+        fprintf(stderr, "usage: tsdbd --version\n"
+                        "       tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
                         "             [--wal-sync-ms MS]\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
                         "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"

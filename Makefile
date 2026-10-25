@@ -89,7 +89,7 @@ $(B)/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsd
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(B)/tsdb: tools/tsdb-cli.c tools/common.h $(LIB)
-	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+	$(CC) $(CFLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/tsdb-bench: tools/tsdb-bench.c tools/common.h tools/datasets.h tools/cbench.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -251,7 +251,7 @@ dist:
 	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%) $(DIST_B)/libcrashfs.so
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
-	CC="$(CC)" tools/mkdist.sh $(DIST_B)
+	CC="$(CC)" BUILD_ID="$(TSDB_VERSION)" tools/mkdist.sh $(DIST_B) $(RELEASE_VERSION)
 
 # The tarball's own test suite on this machine, every CPU level included.
 dist-test: dist
@@ -348,7 +348,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -356,7 +356,9 @@ $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-# The version shown by tsdb_build_info; part of the tsdbd.o flags, so a change rebuilds only that.
+# The release version is the file VERSION (also in include/tsdb.h and the client manifests: `make check-version`).
+# TSDB_VERSION is the build id shown next to it by `tsdbd --version`, `tsdb --version` and tsdb_build_info.
+RELEASE_VERSION := $(shell cat VERSION)
 TSDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
 
 $(B)/tsdbd: server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
@@ -517,5 +519,10 @@ all: $(B)/embedded-example $(B)/client-example
 test: test-quickstart
 test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 	B=$(B) tests/test_quickstart.sh
+
+# The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.
+test: check-version
+check-version: $(B)/tsdbd $(B)/tsdb
+	tools/check-version.sh $(B)
 
 .PHONY: test-quickstart
