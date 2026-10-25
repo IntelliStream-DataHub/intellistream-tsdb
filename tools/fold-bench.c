@@ -52,8 +52,10 @@ static inline bool main_lttb_value(int type, uint64_t x, double *y)
     }
 }
 
-__attribute__((noinline)) static size_t lttb_argmax(int type, const int64_t *ts, const uint64_t *v, size_t n,
-                                                    int64_t t0, double ax, double ay, double cx, double cy)
+/* noipa: with the bench's constant arguments, GCC otherwise specializes it (one multiply fewer per point, as
+ * cy - ay is 1 here) where main's real loop in query.c has them at run time, as the library's lttb_argmax does */
+__attribute__((noipa)) static size_t lttb_argmax(int type, const int64_t *ts, const uint64_t *v, size_t n,
+                                                 int64_t t0, double ax, double ay, double cx, double cy)
 {
     double best = -1;
     size_t k = 0;

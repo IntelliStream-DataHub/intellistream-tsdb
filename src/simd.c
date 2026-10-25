@@ -1582,9 +1582,18 @@ static size_t (*simd_lttb)(int, const int64_t *, const uint64_t *, size_t, int64
 size_t lttb_argmax(int type, const int64_t *ts, const uint64_t *v, size_t n, int64_t t0, double ax, double ay,
                    double cx, double cy)
 {
-    if (n < simd_lttb_small) /* the same pick (the first largest area) without the kernels' setup and lane combine */
-        return lttb_scalar(type, ts, v, n, t0, ax, ay, cx, cy);
-    return simd_lttb(type, ts, v, n, t0, ax, ay, cx, cy);
+    if (n >= simd_lttb_small)
+        return simd_lttb(type, ts, v, n, t0, ax, ay, cx, cy);
+    /* the same pick (the first largest area) without the kernels' setup and lane combine: the loops right here,
+     * not behind another jump; the type tested first gains about 2% at 2 to 4 points (fold-bench, Zen 4): float32,
+     * then float64 */
+    if (type == TSDB_FLOAT32)
+        return lttb_scalar_t(TSDB_FLOAT32, ts, v, n, t0, ax, ay, cx, cy);
+    if (type == TSDB_FLOAT64)
+        return lttb_scalar_t(TSDB_FLOAT64, ts, v, n, t0, ax, ay, cx, cy);
+    if (type == TSDB_INT64)
+        return lttb_scalar_t(TSDB_INT64, ts, v, n, t0, ax, ay, cx, cy);
+    return lttb_scalar_t(TSDB_BOOL, ts, v, n, t0, ax, ay, cx, cy);
 }
 
 void (*simd_agg_f32)(const float *v, size_t n, agg_state *a, agg_dev *dv) = agg_scalar;
