@@ -30,10 +30,10 @@
  * One order for all five sets: the lanes are the same (float32 in 32 double lanes, float64 and TWA segments in
  * 16), only how many of them one instruction holds differs (SSE and AVX's 128-bit code: two float64 lanes per
  * vector, eight vectors; AVX2: four; AVX-512: eight; scalar: one), and every set halves them in the same steps.
- * A short run (below simd_short: SIMD_SHORT, or AVX_SHORT where simd_small_* are 128-bit kernels) starts the
- * halving at the smallest power of two that holds it. TWA has two orders, chosen by the granule's length alone:
- * up to TWA_SEQ_MAX points twa.c adds the segments one after another (compiled once, so the same bits on every
- * CPU), beyond it simd_twa's 16 lanes in every set. Where the integer kernels and LTTB's take over from values.c's
+ * A short run (below simd_short: SIMD_SHORT, or AVX_SHORT and AVX2_SHORT where simd_small_* are 128-bit
+ * kernels) starts the halving at the smallest power of two that holds it. TWA has two orders, chosen by the
+ * granule's length alone: up to TWA_SEQ_MAX points twa.c adds the segments one after another (compiled once, so
+ * the same bits on every CPU), beyond it simd_twa's 16 lanes in every set. Where the integer kernels and LTTB's take over from values.c's
  * loops and lttb_scalar is set per set (simd_thresholds; SIZE_MAX: never), as is everything else that only changes
  * speed.
  */
@@ -1572,6 +1572,9 @@ typedef struct {
 /* the SSE and AVX sets: runs shorter than this take simd_sse.inc's short-run kernels (small_*), whose fixed cost is
  * lower than that of the long-run ones (and for AVX of its 256-bit ones): fold-bench --rows 32, 64 */
 #define AVX_SHORT 64
+/* AVX2's 256-bit kernels start later: below 128 rows the 128-bit ones are 1.1-1.8x faster on Zen 4 (float32 and
+ * float64, agg and spread); at 128 the 256-bit float64 spread is ahead (fold-bench --rows 64..1024) */
+#define AVX2_SHORT 128
 
 static size_t (*simd_lttb)(int, const int64_t *, const uint64_t *, size_t, int64_t, double, double, double,
                            double) = lttb_scalar;
@@ -1696,7 +1699,7 @@ void simd_select(int level)
         lttb = lttb_avx2;
         sf32 = small_f32_avx; /* the 128-bit (VEX) short-run kernels: less fixed cost than the scalar ones */
         sf64 = small_f64_avx;
-        shortn = AVX_SHORT;
+        shortn = AVX2_SHORT;
         name = "avx2";
         thr = THR_AVX2;
         break;
