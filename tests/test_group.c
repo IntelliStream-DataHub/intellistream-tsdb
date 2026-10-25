@@ -236,7 +236,10 @@ int main(int argc, char **argv)
         tsdb_group g = {TSDB_MINUTE, 15, "+05:45"};
         tsdb_bucket *b;
         size_t nb;
-        OK(tsdb_query_group_local(db, id, INT64_MIN, INT64_MAX, &g, NULL, &b, &nb));
+        /* 160 years of 15-minute buckets are 5.6 M, more than a query may span (4 Mi); 40 years are 1.4 M */
+        CHECK(tsdb_query_group_local(db, id, INT64_MIN, INT64_MAX, &g, NULL, &b, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+        OK(tsdb_query_group_local(db, id, days_from_civil(1990, 1, 1) * 86400000LL,
+                                  days_from_civil(2030, 1, 1) * 86400000LL, &g, NULL, &b, &nb));
         bool ok = nb > 0;
         for (size_t i = 0; i < nb; i++)
             ok &= floordiv64(b[i].start + (5 * 3600 + 45 * 60) * 1000LL, 900000) * 900000 == b[i].start + (5 * 3600 + 45 * 60) * 1000LL;

@@ -6,12 +6,15 @@
  * workers and the main port never see a scraper. What a slow or hostile client
  * can do is bounded:
  *   - one poll loop watches up to MAX_PEND connections that have not finished
- *     their request; a request must be complete within REQ_DEADLINE_MS of the
+ *     their request or reply; a request must be complete within REQ_DEADLINE_MS of the
  *     accept (a total, so one byte a second does not help) and fits in REQ_MAX
  *     bytes; when the slots are full the oldest connection is dropped, so a
  *     crowd of idle connections cannot lock real scrapers out;
- *   - the reply is handed to the kernel within SEND_BUDGET_MS or dropped;
- *   - only GET and HEAD of /metrics are answered, the connection always closes.
+ *   - the reply is handed to the kernel within SEND_BUDGET_MS or dropped; it is
+ *     sent without blocking, as the socket takes it (POLLOUT in the same loop), so
+ *     a client that does not read delays nobody else;
+ *   - only GET and HEAD of /metrics are answered, the connection always closes;
+ *   - a slot holds at most one rendered reply, so at most MAX_PEND of them exist.
  * The thread never runs a query: it reads atomic counters and
  * tsdb_get_volume_stats (one short lock per volume).
  *
@@ -361,6 +364,11 @@ static void render(sb *b)
     int64_t busy = atomic_load_explicit(&M.workers_busy, memory_order_relaxed);
     family(b, "tsdb_workers", "gauge", "Worker threads (the --workers count, plus extras started for slow clients).");
     sb_add(b, "tsdb_workers %zu\n", cfg.workers ? cfg.workers() : 0);
+    family(b, "tsdb_request_memory_bytes", "gauge",
+           "Requests received and not yet run, large receive buffers and packed inserts being unpacked.");
+    sb_add(b, "tsdb_request_memory_bytes %zu\n", cfg.request_memory ? cfg.request_memory() : 0);
+    family(b, "tsdb_request_memory_limit_bytes", "gauge", "--max-request-memory.");
+    sb_add(b, "tsdb_request_memory_limit_bytes %zu\n", cfg.request_memory_limit);
     family(b, "tsdb_workers_busy", "gauge", "Worker threads running a request now.");
     sb_add(b, "tsdb_workers_busy %lld\n", (long long)(busy > 0 ? busy : 0));
     family(b, "tsdb_metrics_scrapes_total", "counter", "Scrapes of this endpoint answered.");
@@ -375,91 +383,18 @@ static void render(sb *b)
 
 static int64_t mono_ms_now(void) { return now_ns() / 1000000; }
 
-/* Sends the reply, waiting for the socket until `deadline` (monotonic ms). */
-static bool send_all(int fd, const char *p, size_t n, int64_t deadline)
-{
-    while (n) {
-        ssize_t w = send(fd, p, n, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (w >= 0) {
-            p += w;
-            n -= (size_t)w;
-            continue;
-        }
-        if (errno == EINTR)
-            continue;
-        int64_t left = deadline - mono_ms_now();
-        if (errno != EAGAIN || left <= 0)
-            return false;
-        struct pollfd pf = {.fd = fd, .events = POLLOUT};
-        poll(&pf, 1, (int)left);
-    }
-    return true;
-}
-
-/* An error reply is small: one try, and the client that cannot take it loses it. */
-static void send_simple(int fd, int code, const char *text)
-{
-    char h[256];
-    int n = snprintf(h, sizeof h,
-                     "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s\n",
-                     code, text, strlen(text) + 1, text);
-    send(fd, h, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT);
-}
-
-/* The request head is complete: answers it. */
-static void answer(int fd, const char *buf, size_t n)
-{
-    /* request line: METHOD SP target SP HTTP/1.x */
-    const char *sp1 = memchr(buf, ' ', n);
-    const char *eol = memchr(buf, '\n', n);
-    const char *sp2 = sp1 && eol && sp1 + 1 < eol ? memchr(sp1 + 1, ' ', (size_t)(eol - sp1 - 1)) : NULL;
-    if (!sp1 || !eol || !sp2 || memchr(buf, 0, n)) {
-        atomic_fetch_add(&M.scrape_rejects, 1);
-        send_simple(fd, 400, "Bad Request");
-        return;
-    }
-    bool get = sp1 - buf == 3 && memcmp(buf, "GET", 3) == 0, head = sp1 - buf == 4 && memcmp(buf, "HEAD", 4) == 0;
-    if (!get && !head) {
-        atomic_fetch_add(&M.scrape_rejects, 1);
-        send_simple(fd, 405, "Method Not Allowed");
-        return;
-    }
-    size_t tl = (size_t)(sp2 - sp1 - 1), pl = 0;
-    const char *t = sp1 + 1;
-    while (pl < tl && t[pl] != '?')
-        pl++;
-    if (pl != 8 || memcmp(t, "/metrics", 8) != 0) {
-        atomic_fetch_add(&M.scrape_rejects, 1);
-        send_simple(fd, 404, "Not Found");
-        return;
-    }
-    sb b = {0};
-    render(&b);
-    if (b.oom) {
-        free(b.p);
-        send_simple(fd, 500, "Internal Server Error");
-        return;
-    }
-    char h[256];
-    int hn = snprintf(h, sizeof h,
-                      "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
-                      "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-                      b.len);
-    int64_t deadline = mono_ms_now() + SEND_BUDGET_MS; /* one budget for header and body together */
-    if (send_all(fd, h, (size_t)hn, deadline) && (head || send_all(fd, b.p, b.len, deadline)))
-        atomic_fetch_add(&M.scrapes, 1);
-    free(b.p);
-}
-
-/* Connections that have not sent a whole request head yet. One thread watches them all
- * with poll, so a client that sends nothing, or a byte a second, holds a slot for
- * REQ_DEADLINE_MS and nothing else: other scrapers are served meanwhile. When all
- * slots are taken the oldest connection (the likeliest to be dead weight) is closed
- * to make room. */
+/* Connections that have not sent a whole request head yet, or not taken the whole reply. One thread
+ * watches them all with poll, so a client that sends nothing, or a byte a second, holds a slot for
+ * REQ_DEADLINE_MS and nothing else, and one that does not read its reply holds it for SEND_BUDGET_MS:
+ * other scrapers are served meanwhile. When all slots are taken the oldest connection (the likeliest
+ * to be dead weight) is closed to make room. */
 #define MAX_PEND 64
 typedef struct {
     int fd;
-    int64_t deadline; /* monotonic ms */
+    int64_t deadline; /* monotonic ms: of the request head, then of the reply */
+    char *out;        /* the reply (malloc'd); NULL while the request is read */
+    size_t out_len, out_off;
+    bool scrape; /* a 200 for /metrics: counted once all of it was sent */
     size_t n;
     char buf[REQ_MAX];
 } pend;
@@ -469,9 +404,88 @@ static size_t npend;
 static void pend_close(size_t i)
 {
     close(P[i].fd);
+    free(P[i].out);
     if (i + 1 < npend)
         memcpy(&P[i], &P[npend - 1], offsetof(pend, buf) + P[npend - 1].n); /* header and the bytes so far */
     npend--;
+}
+
+/* Sends what the socket takes now: 1 all sent, 0 the rest waits for POLLOUT, -1 failed. */
+static int send_some(pend *q)
+{
+    while (q->out_off < q->out_len) {
+        ssize_t w = send(q->fd, q->out + q->out_off, q->out_len - q->out_off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0)
+            q->out_off += (size_t)w;
+        else if (w < 0 && errno == EAGAIN)
+            return 0;
+        else if (w == 0 || errno != EINTR)
+            return -1;
+    }
+    return 1;
+}
+
+/* An error reply: a status line and the text. */
+static void reply_simple(pend *q, int code, const char *text)
+{
+    q->out = malloc(256);
+    if (!q->out)
+        return; /* closed without a reply */
+    int n = snprintf(q->out, 256,
+                     "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n%s\n",
+                     code, text, strlen(text) + 1, text);
+    q->out_len = (size_t)n;
+}
+
+/* The request head in q->buf is complete: puts the reply in q->out. */
+static void answer(pend *q)
+{
+    const char *buf = q->buf;
+    size_t n = q->n;
+    /* request line: METHOD SP target SP HTTP/1.x */
+    const char *sp1 = memchr(buf, ' ', n);
+    const char *eol = memchr(buf, '\n', n);
+    const char *sp2 = sp1 && eol && sp1 + 1 < eol ? memchr(sp1 + 1, ' ', (size_t)(eol - sp1 - 1)) : NULL;
+    if (!sp1 || !eol || !sp2 || memchr(buf, 0, n)) {
+        atomic_fetch_add(&M.scrape_rejects, 1);
+        reply_simple(q, 400, "Bad Request");
+        return;
+    }
+    bool get = sp1 - buf == 3 && memcmp(buf, "GET", 3) == 0, head = sp1 - buf == 4 && memcmp(buf, "HEAD", 4) == 0;
+    if (!get && !head) {
+        atomic_fetch_add(&M.scrape_rejects, 1);
+        reply_simple(q, 405, "Method Not Allowed");
+        return;
+    }
+    size_t tl = (size_t)(sp2 - sp1 - 1), pl = 0;
+    const char *t = sp1 + 1;
+    while (pl < tl && t[pl] != '?')
+        pl++;
+    if (pl != 8 || memcmp(t, "/metrics", 8) != 0) {
+        atomic_fetch_add(&M.scrape_rejects, 1);
+        reply_simple(q, 404, "Not Found");
+        return;
+    }
+    sb b = {0};
+    render(&b);
+    char h[256];
+    int hn = snprintf(h, sizeof h,
+                      "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                      "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                      b.len);
+    size_t body = head ? 0 : b.len;
+    q->out = b.oom ? NULL : malloc((size_t)hn + body);
+    if (!q->out) {
+        free(b.p);
+        reply_simple(q, 500, "Internal Server Error");
+        return;
+    }
+    memcpy(q->out, h, (size_t)hn);
+    if (body)
+        memcpy(q->out + hn, b.p, body);
+    free(b.p);
+    q->out_len = (size_t)hn + body;
+    q->scrape = true;
 }
 
 static pthread_t thread;
@@ -502,6 +516,9 @@ static void accept_some(void)
         P[npend].fd = fd;
         P[npend].deadline = mono_ms_now() + REQ_DEADLINE_MS;
         P[npend].n = 0;
+        P[npend].out = NULL;
+        P[npend].out_len = P[npend].out_off = 0;
+        P[npend].scrape = false;
         npend++;
     }
 }
@@ -514,7 +531,7 @@ static void *metrics_main(void *arg)
         pf[0] = (struct pollfd){.fd = cfg.listen_fd, .events = POLLIN};
         int64_t now = mono_ms_now(), wake = now + 200; /* also the latency of stopping */
         for (size_t i = 0; i < npend; i++) {
-            pf[i + 1] = (struct pollfd){.fd = P[i].fd, .events = POLLIN};
+            pf[i + 1] = (struct pollfd){.fd = P[i].fd, .events = P[i].out ? POLLOUT : POLLIN};
             if (P[i].deadline < wake)
                 wake = P[i].deadline;
         }
@@ -526,23 +543,42 @@ static void *metrics_main(void *arg)
         for (size_t i = polled; i-- > 0;) {
             pend *q = &P[i];
             bool done = false;
-            if (r > 0 && (pf[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            if (q->out) {
+                if (r > 0 && pf[i + 1].revents) {
+                    int s = send_some(q);
+                    if (s == 1 && q->scrape)
+                        atomic_fetch_add(&M.scrapes, 1);
+                    done = s != 0;
+                }
+                if (!done && mono_ms_now() >= q->deadline)
+                    done = true; /* did not take its reply in time */
+            } else if (r > 0 && (pf[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) {
                 ssize_t got = recv(q->fd, q->buf + q->n, REQ_MAX - q->n, MSG_DONTWAIT);
                 if (got > 0) {
                     q->n += (size_t)got;
+                    bool answered = true;
                     if (memmem(q->buf, q->n, "\r\n\r\n", 4) || memmem(q->buf, q->n, "\n\n", 2)) {
-                        answer(q->fd, q->buf, q->n);
-                        done = true;
+                        answer(q);
                     } else if (q->n == REQ_MAX) {
                         atomic_fetch_add(&M.scrape_rejects, 1);
-                        send_simple(q->fd, 431, "Request Header Fields Too Large");
-                        done = true;
+                        reply_simple(q, 431, "Request Header Fields Too Large");
+                    } else {
+                        answered = false;
+                    }
+                    if (answered && q->out) { /* most replies fit the socket buffer at once */
+                        q->deadline = mono_ms_now() + SEND_BUDGET_MS;
+                        int s = send_some(q);
+                        if (s == 1 && q->scrape)
+                            atomic_fetch_add(&M.scrapes, 1);
+                        done = s != 0;
+                    } else if (answered) {
+                        done = true; /* no memory for the reply */
                     }
                 } else if (got == 0 || (errno != EAGAIN && errno != EINTR)) {
                     done = true; /* gone before it finished */
                 }
             }
-            if (!done && mono_ms_now() >= q->deadline) {
+            if (!done && !q->out && mono_ms_now() >= q->deadline) {
                 atomic_fetch_add(&M.scrape_rejects, 1);
                 done = true; /* too slow: closed without a reply */
             }

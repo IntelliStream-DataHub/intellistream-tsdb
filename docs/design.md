@@ -387,7 +387,10 @@ five times faster (`build/twa-bench`).
 A TWA bucket needs no reading of its own (a segment across it is enough), so
 two readings far apart could ask for a bucket per millisecond between them. A
 request gets at most 4M buckets (`TSDB_ERR_TOO_MANY_BUCKETS` beyond), which
-fits one reply frame and bounds its memory to some 400 MB.
+fits one reply frame and bounds its memory to some 400 MB. Aggregates, groups,
+bounds and the spread have the same limit, for the same reason: with 64M, one
+37-byte request made tsdbd allocate gigabytes before it found that the reply
+would not fit a frame.
 
 The statistics cost 56 bytes per granule entry (136 instead of 80 bytes): 0.007
 bytes a row in full 8192-row granules, and 0.013 bytes a row measured on
@@ -1017,6 +1020,26 @@ in their connection's queue. Measured with `tsdbc-bench connections`: 10,000
 connections open at once, all querying, 85,000 queries/s in total, no
 failures; the server's resident memory went from 148 MB at 1,000 connections
 to 231 MB at 10,000.
+
+Memory for requests is bounded, so a client cannot make the server run out of
+it. Requests received but not yet run (empty ones included), receive buffers
+larger than 64 KB and compressed inserts being unpacked share
+`--max-request-memory` (default an eighth of the RAM, at least 1024 MB): above
+it the server stops reading from connections that want more until requests
+finish, and it always lets one frame through. Outside the limit are 64 KB of
+receive buffer per connection and the replies a client has not read yet (up to
+about 8 MB per connection; then the request waits). A connection reads no more
+once 4 MB of its requests are waiting, for example behind a large reply its
+client does not read. A frame that is started but not finished within
+`--frame-timeout` seconds (default 60) closes its connection; time in which the
+server, not the client, held it up does not count. A reply that would not fit
+in one frame (256 MB), or a query over more than 4M buckets, is
+`TSDB_ERR_TOO_MANY_BUCKETS`. A compressed (packed)
+insert that would be larger than a frame unpacked is refused before anything is
+decompressed. A bad number on the command line (`--port 70000`, `--workers 0`)
+stops the server at once with status 2. Without authentication a client can
+still take the whole limit with large frames it sends slowly, for
+`--frame-timeout` at a time, so that other clients' large frames wait.
 
 There is no authentication or TLS: listen on loopback or a trusted network.
 

@@ -279,7 +279,10 @@ static inline double tsdb_bucket_avg(const tsdb_bucket *b)
 
 /* Aggregates one series over [start, end). interval_ms == 0 gives a single
  * bucket; otherwise buckets are aligned to the epoch like toStartOfInterval.
- * Only non-empty buckets are returned, in time order. Free with free(). */
+ * Only non-empty buckets are returned, in time order. Free with free().
+ * At most 4M buckets lie between the first and the last reading in range
+ * (TSDB_ERR_TOO_MANY_BUCKETS beyond; the same for groups, bounds, the spread
+ * and TWA), which bounds a query's memory to some 400 MB. */
 int tsdb_query_agg(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
                    tsdb_bucket **out, size_t *nout);
 

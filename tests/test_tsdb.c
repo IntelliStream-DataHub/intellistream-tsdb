@@ -351,9 +351,23 @@ static void check_agg(tsdb *db, ref *r, uint32_t s, int64_t start, int64_t end, 
 {
     tsdb_bucket *b;
     size_t nb;
-    OK(tsdb_query_agg(db, s, start, end, interval, &b, &nb));
-    /* reference buckets */
+    int rc = tsdb_query_agg(db, s, start, end, interval, &b, &nb);
     ref_final(r);
+    if (rc == TSDB_ERR_TOO_MANY_BUCKETS && interval) {
+        /* only when more than 4 Mi buckets lie between the first and the last reading in range */
+        int64_t lo = INT64_MAX, hi = INT64_MIN;
+        for (size_t i = 0; i < r->nfin; i++) {
+            const row *x = &r->fin[i];
+            if (x->s == s && x->t >= start && x->t < end) {
+                lo = x->t < lo ? x->t : lo;
+                hi = x->t > hi ? x->t : hi;
+            }
+        }
+        CHECK(lo <= hi && floor_div(hi, interval) - floor_div(lo, interval) + 1 > (4 << 20));
+        return;
+    }
+    OK(rc);
+    /* reference buckets */
     size_t cap = 16, nr = 0;
     tsdb_bucket *e = malloc(cap * sizeof *e);
     for (size_t i = 0; i < r->nfin; i++) {

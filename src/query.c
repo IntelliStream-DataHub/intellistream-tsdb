@@ -26,11 +26,18 @@
  * nulls, and a bucket whose rows are all null is reported with count 0.
  */
 #include "internal.h"
+#include "tsdb_protocol.h"
 
 #include <math.h>
 #include <stdlib.h>
 
-#define MAX_BUCKETS (64u << 20)
+/* The buckets one query may compute (TSDB_ERR_TOO_MANY_BUCKETS beyond), counted from the first to the last
+ * reading in range: two readings far apart in 1 ms buckets ask for one per millisecond between them. 64 Mi
+ * let a 37-byte request make tsdbd allocate gigabytes (48 bytes of state and 48 of result a bucket, more with
+ * the spread) before it found that the reply would not fit a frame; 4 Mi, as for TWA, keep a query's memory to
+ * some 400 MB, and their reply fits a frame. */
+#define MAX_BUCKETS (4u << 20)
+_Static_assert((uint64_t)MAX_BUCKETS * TSDB_AGG_ROW + 64 <= TSDB_MAX_FRAME, "an aggregate reply must fit a frame");
 #define PARALLEL_MIN_GRANULES 8
 #define AGG_STRIPES 64
 #define AGG_STRIPE_SHIFT 10 /* 1024 consecutive buckets share a lock */
