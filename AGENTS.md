@@ -149,6 +149,13 @@ cgroup, so `nice` does not keep your work out of its way.
   the active memtable after it, or a large insert lands under older memtable
   rows. Parts already listed are never discarded after a failure
   (`db_add_parts` cannot fail). `test_failstop` and `jepsen --nemesis eio`.
+- **Volumes** are added only by an operator (`tsdb <dir> volume add`, `tsdb_volume_add[_dir]`) or by embedded
+  `tsdb_series_at` with `create_volumes` (tsdbd and the CLI set it to 0: a client naming an unknown path gets
+  `TSDB_ERR_NOTFOUND`, and no directory or file is made). Every add checks the path (`path_valid`: absolute, no
+  control bytes, no `.`/`..`; not in or around the root or another volume; not another database's directory) and
+  appends to VOLUMES under an OFD write lock, which a writer's open also takes (not held while the directory is
+  made; its parent is synced before the line is appended); a running writer picks new lines up when a request names
+  a path it does not know (`volume_resolve`), having resolved the client's path before `create_lock`.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never

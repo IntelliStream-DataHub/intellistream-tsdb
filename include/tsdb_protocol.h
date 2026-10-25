@@ -19,7 +19,8 @@
  *               the lower of the client's and the server's (since version 6;
  *               before, the server's): the version both speak
  *   SERIES      u8 create, u16 len, name [, u16 plen, path]  -> u32 id
- *               (path: the volume to create the series in; see tsdb_series_at)
+ *               (path: the volume to create the series in, one the operator added with
+ *               `tsdb <dir> volume add`: tsdbd never adds one, NOTFOUND otherwise; see tsdb_series_at)
  *   SERIES_NAME u32 id                         -> u16 len, name
  *   INSERT      u32 n, u32 series, i64 ts[n], f32 v[n]           -> (nothing)
  *               or, with a series per row (series == TSDB_MANY_SERIES):

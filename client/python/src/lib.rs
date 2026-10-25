@@ -892,8 +892,9 @@ impl Client {
     ///
     /// Args:
     ///     name: The series name.
-    ///     path: A directory on the server for the new series (a volume);
-    ///         it only matters when the series is created.
+    ///     path: A volume on the server for the new series, one the operator
+    ///         added (`tsdb <dir> volume add`; else ERR_NOTFOUND); it only
+    ///         matters when the series is created.
     fn series_at(&self, py: Python<'_>, name: &str, path: &str) -> PyResult<u32> {
         self.with(py, |c| c.series_at(name, path))
     }
@@ -903,8 +904,9 @@ impl Client {
     /// Args:
     ///     name: The series name.
     ///     value_type: "float32", "float64", "int64", "bool" or "state".
-    ///     path: A directory on the server for the new series (a volume);
-    ///         None means the database directory.
+    ///     path: A volume on the server for the new series, one the operator
+    ///         added (`tsdb <dir> volume add`; else ERR_NOTFOUND); None
+    ///         means the database directory.
     ///
     /// Raises:
     ///     TsdbError: ERR_INVALID if the series exists with another type.

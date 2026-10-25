@@ -183,6 +183,7 @@ impl Db {
             obsolete_part_lifetime_s: obsolete_part_lifetime_s.unwrap_or(d.obsolete_part_lifetime_s),
             verify_checksums: verify_checksums.unwrap_or(d.verify_checksums),
             retention_merge_s: retention_merge_s.unwrap_or(d.retention_merge_s),
+            create_volumes: d.create_volumes,
         };
         let db = py.detach(|| tc::Db::open(&path, &o)).map_err(|e| to_pyerr(py, e))?;
         Ok(Db { db: RwLock::new(Some(db)), path, last: Mutex::default() })

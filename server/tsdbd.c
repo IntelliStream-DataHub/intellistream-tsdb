@@ -1693,6 +1693,7 @@ int main(int argc, char **argv)
     int port = TSDB_DEFAULT_PORT, nworkers = (int)sysconf(_SC_NPROCESSORS_ONLN);
     tsdb_options o;
     tsdb_options_init(&o);
+    o.create_volumes = 0; /* a client names a volume an operator added (tsdb-cli volume add), never a new one */
     static struct option opts[] = {{"dir", required_argument, 0, 'd'},        {"listen", required_argument, 0, 'l'},
                                    {"port", required_argument, 0, 'p'},       {"workers", required_argument, 0, 'w'},
                                    {"wal-sync-ms", required_argument, 0, 's'}, {"no-fsync", no_argument, 0, 'F'},

@@ -369,8 +369,10 @@ impl Client {
     /// `path` on the server if needed.
     ///
     /// A volume is another directory, such as one on another disk (see
-    /// `tsdb_series_at` in `include/tsdb.h`). The path only matters when the
-    /// series is created; an empty path means the database directory.
+    /// `tsdb_series_at` in `include/tsdb.h`), which the operator added with
+    /// `tsdb <dir> volume add`: tsdbd never adds one, and answers NotFound for
+    /// any other path. The path only matters when the series is created; an
+    /// empty path means the database directory.
     ///
     /// # Errors
     ///

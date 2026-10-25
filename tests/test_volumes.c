@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <limits.h>
 #include <unistd.h>
 
 static int failures;
@@ -105,6 +107,520 @@ static void flip_byte(const char *path, off_t off)
     CHECK(fd >= 0 && pwrite(fd, &c, 1, off) == 1);
     if (fd >= 0)
         close(fd);
+}
+
+static off_t file_size(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_size : -1;
+}
+
+static bool exists(const char *path)
+{
+    struct stat st;
+    return lstat(path, &st) == 0;
+}
+
+/* Volume paths are checked wherever a volume is added, and a database opened
+ * with create_volumes = 0 (tsdbd) never adds one for a path it is given. */
+static void test_paths(const char *base)
+{
+    char top[512], root[600], vols[700], p[900], q[1200], other[600], cmd[700];
+    snprintf(top, sizeof top, "%s/tsdb-volp-%d", base, (int)getpid());
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", top);
+    if (system(cmd) != 0 || mkdir(top, 0755) != 0)
+        exit(1);
+    snprintf(root, sizeof root, "%s/root", top);
+    snprintf(vols, sizeof vols, "%s/VOLUMES", root);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    CHECK(o.create_volumes == 1); /* embedded default */
+    tsdb *db;
+    uint32_t id, v;
+    OK(tsdb_open(root, &o, &db));
+    OK(tsdb_series(db, "plain", &id));
+
+    /* the audit's proof of concept: a newline split the VOLUMES line and the database never opened again */
+    snprintf(p, sizeof p, "%s/vol\ny", top);
+    CHECK(tsdb_series_at(db, "evil", p, &id) == TSDB_ERR_INVALID);
+    CHECK(!exists(p));
+    CHECK(file_size(vols) <= 0);
+    const char *bad_chars[] = {"\t", "\r", "\x01", "\x1f", "\x7f"};
+    for (size_t i = 0; i < sizeof bad_chars / sizeof *bad_chars; i++) {
+        snprintf(p, sizeof p, "%s/v%sz", top, bad_chars[i]);
+        CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+        CHECK(tsdb_volume_add_dir(root, p, &v) == TSDB_ERR_INVALID);
+        CHECK(!exists(p));
+    }
+    /* relative, ".", "..", the root itself, inside it, the file system root */
+    snprintf(p, sizeof p, "%s/root/../va", top);
+    CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+    CHECK(!exists(p));
+    snprintf(p, sizeof p, "%s/./va", top);
+    CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add(db, "relative/va", &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add(db, "", &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add(db, NULL, &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add(db, root, &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add(db, top, &v) == TSDB_ERR_INVALID); /* contains the root */
+    CHECK(tsdb_volume_add(db, "/", &v) == TSDB_ERR_INVALID);
+    snprintf(p, sizeof p, "%s/inside", root);
+    CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+    CHECK(!exists(p)); /* refused: the directory it made is gone again */
+    CHECK(file_size(vols) <= 0);
+
+    /* a good one; then nested in it, containing it, and the same one again */
+    char va[600];
+    snprintf(va, sizeof va, "%s/va", top);
+    OK(tsdb_volume_add(db, va, &v));
+    CHECK(v == 1 && tsdb_volume_count(db) == 2);
+    snprintf(p, sizeof p, "%s/nested", va);
+    CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+    CHECK(!exists(p));
+    snprintf(p, sizeof p, "%s//va/", top); /* the same, spelled differently */
+    OK(tsdb_volume_add(db, p, &v));
+    CHECK(v == 1 && tsdb_volume_count(db) == 2);
+
+    /* another database's root (the audit's second finding): refused, and nothing written into it */
+    snprintf(other, sizeof other, "%s/other", top);
+    tsdb *db2;
+    OK(tsdb_open(other, &o, &db2));
+    OK(tsdb_series(db2, "b.own", &id));
+    OK(tsdb_close(db2));
+    CHECK(tsdb_series_at(db, "x", other, &id) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add_dir(root, other, &v) == TSDB_ERR_INVALID);
+    snprintf(q, sizeof q, "%s/ROOT_ID", other);
+    CHECK(!exists(q));
+    OK(tsdb_open(other, &o, &db2));
+    CHECK(tsdb_series_count(db2) == 1);
+    OK(tsdb_close(db2));
+    /* a directory with tsdb files of no database */
+    snprintf(p, sizeof p, "%s/stray", top);
+    CHECK(mkdir(p, 0755) == 0);
+    snprintf(q, sizeof q, "%s/MANIFEST", p);
+    int mfd = open(q, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    CHECK(mfd >= 0);
+    close(mfd);
+    CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+    snprintf(q, sizeof q, "%s/ROOT_ID", p);
+    CHECK(!exists(q));
+    OK(tsdb_close(db));
+    OK(tsdb_open(root, &o, &db)); /* nothing above damaged the database */
+    CHECK(tsdb_volume_count(db) == 2);
+    OK(tsdb_close(db));
+
+    /* create_volumes = 0, as in tsdbd: a path that is not a volume is NOTFOUND and creates nothing */
+    o.create_volumes = 0;
+    OK(tsdb_open(root, &o, &db));
+    snprintf(p, sizeof p, "%s/not_a_volume", top);
+    off_t before = file_size(vols);
+    CHECK(tsdb_series_at(db, "n", p, &id) == TSDB_ERR_NOTFOUND);
+    CHECK(tsdb_series_create(db, "n", TSDB_INT64, p, &id) == TSDB_ERR_NOTFOUND);
+    CHECK(!exists(p) && file_size(vols) == before && tsdb_volume_count(db) == 2);
+    CHECK(tsdb_series_lookup(db, "n", &id) == TSDB_ERR_NOTFOUND);
+    snprintf(p, sizeof p, "%s/vol\ny", top);
+    CHECK(tsdb_series_at(db, "evil", p, &id) == TSDB_ERR_INVALID);
+    /* an existing volume is matched as before: spelled with extra slashes, or through a symlink */
+    uint32_t on_a;
+    snprintf(p, sizeof p, "%s//va/", top);
+    OK(tsdb_series_at(db, "on.a", p, &on_a));
+    CHECK(strcmp(tsdb_series_path(db, on_a), va) == 0);
+    snprintf(q, sizeof q, "%s/link_to_va", top);
+    CHECK(symlink(va, q) == 0);
+    OK(tsdb_series_create(db, "on.a2", TSDB_INT64, q, &id));
+    CHECK(strcmp(tsdb_series_path(db, id), va) == 0);
+    /* added while the database is open elsewhere (tsdb-cli while tsdbd runs): found when first named */
+    char vb[600], vc[600];
+    snprintf(vb, sizeof vb, "%s/vb", top);
+    snprintf(vc, sizeof vc, "%s/vc", top);
+    OK(tsdb_volume_add_dir(root, vb, &v));
+    CHECK(v == 2 && tsdb_volume_count(db) == 2);
+    uint32_t on_b;
+    OK(tsdb_series_at(db, "on.b", vb, &on_b));
+    CHECK(tsdb_volume_count(db) == 3 && strcmp(tsdb_series_path(db, on_b), vb) == 0);
+    OK(tsdb_append(db, on_b, T0, 2.0));
+    /* one added outside, then one by the open writer: the writer opens both, in order */
+    OK(tsdb_volume_add_dir(root, vc, &v));
+    CHECK(v == 3);
+    char vd[600];
+    snprintf(vd, sizeof vd, "%s/vd", top);
+    OK(tsdb_volume_add(db, vd, &v));
+    CHECK(v == 4 && tsdb_volume_count(db) == 5);
+    CHECK(strcmp(tsdb_volume_path(db, 3), vc) == 0 && strcmp(tsdb_volume_path(db, 4), vd) == 0);
+    OK(tsdb_close(db));
+    /* a reader opens a volume no writer has opened yet (it holds META and ROOT_ID) */
+    char ve[600];
+    snprintf(ve, sizeof ve, "%s/ve", top);
+    OK(tsdb_volume_add_dir(root, ve, &v));
+    CHECK(v == 5);
+    tsdb_options ro = o;
+    ro.read_only = 1;
+    OK(tsdb_open(root, &ro, &db));
+    CHECK(tsdb_volume_count(db) == 6);
+    OK(tsdb_close(db));
+    OK(tsdb_open(root, &o, &db));
+    CHECK(tsdb_volume_count(db) == 6);
+    OK(tsdb_series_lookup(db, "on.b", &id));
+    CHECK(id == on_b);
+    tsdb_points pts;
+    OK(tsdb_query_points(db, on_b, INT64_MIN, INT64_MAX, &pts));
+    CHECK(pts.n == 1);
+    tsdb_points_free(&pts);
+    OK(tsdb_close(db));
+    /* not a database */
+    snprintf(p, sizeof p, "%s/none", top);
+    CHECK(tsdb_volume_add_dir(p, vb, &v) == TSDB_ERR_NOTFOUND);
+    CHECK(tsdb_volume_add_dir(va, vb, &v) == TSDB_ERR_NOTFOUND); /* a volume, not a root */
+
+    if (system(cmd) != 0)
+        exit(1);
+    printf("  volume paths checked where volumes are added, none added with create_volumes = 0\n");
+}
+
+/* A fresh directory top = base/tsdb-<tag>-<pid> holding an empty database top/root. */
+static void fresh(const char *base, const char *tag, char *top, size_t cap, char *root, size_t rcap)
+{
+    char cmd[1200];
+    snprintf(top, cap, "%s/tsdb-%s-%d", base, tag, (int)getpid());
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", top);
+    if (system(cmd) != 0 || mkdir(top, 0755) != 0)
+        exit(1);
+    char canon[PATH_MAX];
+    if (!realpath(top, canon)) /* VOLUMES holds canonical paths, and the tests compare with them */
+        exit(1);
+    snprintf(top, cap, "%.500s", canon);
+    snprintf(root, rcap, "%s/root", top);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    tsdb *db;
+    OK(tsdb_open(root, &o, &db));
+    OK(tsdb_close(db));
+}
+
+static void remove_tree(const char *top)
+{
+    char cmd[1200];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", top);
+    if (system(cmd) != 0)
+        exit(1);
+}
+
+static void write_file(const char *path, const char *text)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    CHECK(fd >= 0 && write(fd, text, strlen(text)) == (ssize_t)strlen(text));
+    if (fd >= 0)
+        close(fd);
+}
+
+/* What an add refuses beyond the path's spelling: a directory that contains a
+ * volume, another database's volume, a second path to (a copy of) one of ours,
+ * a symlink to a name with a newline. Nothing is written into a refused one. */
+static void test_refused_dirs(const char *base)
+{
+    char top[600], root[700], p[900], q[1000], id_txt[64] = {0};
+    fresh(base, "volr", top, sizeof top, root, sizeof root);
+    snprintf(p, sizeof p, "%s/ID", root);
+    int fd = open(p, O_RDONLY);
+    CHECK(fd >= 0 && read(fd, id_txt, sizeof id_txt - 1) > 0);
+    close(fd);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.create_volumes = 0;
+    tsdb *db;
+    uint32_t v, id;
+    OK(tsdb_open(root, &o, &db));
+
+    /* contains a volume, but not the root */
+    snprintf(p, sizeof p, "%s/ns", top);
+    CHECK(mkdir(p, 0755) == 0);
+    snprintf(p, sizeof p, "%s/ns/x", top);
+    CHECK(mkdir(p, 0755) == 0);
+    snprintf(q, sizeof q, "%s/ns/x/v", top);
+    OK(tsdb_volume_add(db, q, &v));
+    CHECK(v == 1);
+    CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add_dir(root, p, &v) == TSDB_ERR_INVALID);
+    snprintf(q, sizeof q, "%s/ROOT_ID", p);
+    CHECK(!exists(q));
+
+    /* a volume of another database (its ROOT_ID) */
+    snprintf(p, sizeof p, "%s/foreign", top);
+    CHECK(mkdir(p, 0755) == 0);
+    snprintf(q, sizeof q, "%s/ROOT_ID", p);
+    write_file(q, strncmp(id_txt, "0123456789abcdef", 16) ? "0123456789abcdef\n" : "fedcba9876543210\n");
+    CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add_dir(root, p, &v) == TSDB_ERR_INVALID);
+    snprintf(q, sizeof q, "%s/META", p);
+    CHECK(!exists(q));
+
+    /* ours (our ROOT_ID, engine files), but not listed: the same volume under a second path, or a copy */
+    snprintf(p, sizeof p, "%s/second", top);
+    CHECK(mkdir(p, 0755) == 0);
+    snprintf(q, sizeof q, "%s/ROOT_ID", p);
+    write_file(q, id_txt);
+    snprintf(q, sizeof q, "%s/MANIFEST", p);
+    write_file(q, "");
+    CHECK(tsdb_volume_add(db, p, &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add_dir(root, p, &v) == TSDB_ERR_INVALID);
+    /* ours without engine files is a crashed add: taken over */
+    snprintf(p, sizeof p, "%s/crashed", top);
+    CHECK(mkdir(p, 0755) == 0);
+    snprintf(q, sizeof q, "%s/ROOT_ID", p);
+    write_file(q, id_txt);
+    OK(tsdb_volume_add_dir(root, p, &v));
+    CHECK(v == 2);
+
+    /* a symlink to a name with a newline: refused after realpath, VOLUMES unharmed */
+    snprintf(p, sizeof p, "%s/nl\nname", top);
+    CHECK(mkdir(p, 0755) == 0);
+    snprintf(q, sizeof q, "%s/link_nl", top);
+    CHECK(symlink(p, q) == 0);
+    CHECK(tsdb_volume_add(db, q, &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_volume_add_dir(root, q, &v) == TSDB_ERR_INVALID);
+    CHECK(tsdb_series_at(db, "s", q, &id) == TSDB_ERR_NOTFOUND);
+    snprintf(q, sizeof q, "%s/ROOT_ID", p);
+    CHECK(!exists(q));
+    OK(tsdb_close(db));
+    OK(tsdb_open(root, &o, &db));
+    CHECK(tsdb_volume_count(db) == 3);
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  adds refuse a directory containing a volume, another database's volume, a copy of ours, a link to a "
+           "bad name\n");
+}
+
+/* VOLUMES changed under a running writer: a torn tail (an add killed in its
+ * write) is cut, so volumes still come and go as before; a line rewritten to
+ * name another directory is damage, reported once per change. */
+static void test_volumes_under_writer(const char *base)
+{
+    char top[600], root[700], vols[800], v1[800], v2[800], v3[800], w[800], line[1000];
+    fresh(base, "volw", top, sizeof top, root, sizeof root);
+    snprintf(vols, sizeof vols, "%s/VOLUMES", root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    snprintf(v2, sizeof v2, "%s/v2", top);
+    snprintf(v3, sizeof v3, "%s/v3", top);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.create_volumes = 0;
+    tsdb *db;
+    uint32_t v, id;
+    OK(tsdb_open(root, &o, &db));
+    OK(tsdb_volume_add_dir(root, v1, &v));
+    off_t good = file_size(vols);
+    append_bytes(vols, "1234abcd /half", 14);
+    OK(tsdb_series_at(db, "on.v1", v1, &id)); /* the writer reads VOLUMES, and cuts the tail */
+    CHECK(tsdb_volume_count(db) == 2 && file_size(vols) == good);
+    append_bytes(vols, "1234abcd /half", 14);
+    OK(tsdb_volume_add_dir(root, v2, &v)); /* an add cuts it too */
+    CHECK(v == 2);
+    OK(tsdb_series_at(db, "on.v2", v2, &id));
+    CHECK(tsdb_volume_count(db) == 3);
+    snprintf(w, sizeof w, "%s/nowhere", top);
+    CHECK(tsdb_series_at(db, "x", w, &id) == TSDB_ERR_NOTFOUND);
+    OK(tsdb_close(db));
+
+    /* line 1 rewritten (with a check that passes) to name another directory, while a writer runs */
+    OK(tsdb_open(root, &o, &db));
+    char *txt = NULL;
+    size_t len = 0;
+    FILE *f = fopen(vols, "r");
+    CHECK(f && getdelim(&txt, &len, '\0', f) > 0);
+    if (f)
+        fclose(f);
+    char *rest = txt ? strchr(txt, '\n') : NULL;
+    snprintf(w, sizeof w, "%s/v9", top);
+    snprintf(line, sizeof line, "%08x %s%s", (uint32_t)xxh64(w, strlen(w), 1), w, rest ? rest : "\n");
+    write_file(vols, line);
+    free(txt);
+    OK(tsdb_volume_add_dir(root, v3, &v));
+    CHECK(v == 3);
+    CHECK(tsdb_series_at(db, "on.v3", v3, &id) == TSDB_ERR_CORRUPT);
+    CHECK(tsdb_series_at(db, "on.v3", v3, &id) == TSDB_ERR_CORRUPT); /* not read again, but still refused */
+    CHECK(tsdb_series_lookup(db, "on.v3", &id) == TSDB_ERR_NOTFOUND);
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  a torn VOLUMES tail under a running writer is cut; a rewritten line is damage\n");
+}
+
+/* Adds from several processes at once, while a writer has the database open:
+ * the lock on VOLUMES keeps their lines whole and numbered, so none is lost. */
+static void test_concurrent_adds(const char *base)
+{
+    enum { PROCS = 8, EACH = 15 };
+    char top[600], root[700], p[800];
+    fresh(base, "volc", top, sizeof top, root, sizeof root);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.create_volumes = 0;
+    tsdb *db;
+    uint32_t v, id;
+    OK(tsdb_open(root, &o, &db));
+    pid_t kids[PROCS];
+    for (int k = 0; k < PROCS; k++) {
+        if ((kids[k] = fork()) == 0) {
+            int bad = 0;
+            for (int i = 0; i < EACH; i++) {
+                snprintf(p, sizeof p, "%s/c%d_%d", top, k, i);
+                bad += tsdb_volume_add_dir(root, p, &v) != 0;
+            }
+            _exit(bad);
+        }
+        CHECK(kids[k] > 0);
+    }
+    for (int k = 0; k < PROCS; k++) {
+        int st = -1;
+        CHECK(kids[k] > 0 && waitpid(kids[k], &st, 0) == kids[k] && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    for (int k = 0; k < PROCS; k++)
+        for (int i = 0; i < EACH; i++) {
+            char name[32];
+            snprintf(p, sizeof p, "%s/c%d_%d", top, k, i);
+            snprintf(name, sizeof name, "s%d_%d", k, i);
+            CHECK(tsdb_series_at(db, name, p, &id) == 0);
+        }
+    CHECK(tsdb_volume_count(db) == 1 + PROCS * EACH);
+    OK(tsdb_close(db));
+    OK(tsdb_open(root, &o, &db));
+    CHECK(tsdb_volume_count(db) == 1 + PROCS * EACH && tsdb_series_count(db) == PROCS * EACH);
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  %d processes added %d volumes at once, none lost\n", PROCS, PROCS * EACH);
+}
+
+struct opener {
+    const char *root;
+    tsdb_options o;
+    tsdb *db;
+    int rc;
+    volatile int done;
+};
+
+static void *open_thread(void *arg)
+{
+    struct opener *x = arg;
+    x->rc = tsdb_open(x->root, &x->o, &x->db);
+    __atomic_store_n(&x->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* A writer opening while an add is half way through its line waits for it,
+ * rather than cutting the line as a torn tail. */
+static void test_open_waits_for_add(const char *base)
+{
+    char top[600], root[700], vols[800], v1[800], *txt = NULL;
+    size_t len = 0;
+    fresh(base, "volo", top, sizeof top, root, sizeof root);
+    snprintf(vols, sizeof vols, "%s/VOLUMES", root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    uint32_t v;
+    OK(tsdb_volume_add_dir(root, v1, &v));
+    FILE *f = fopen(vols, "r");
+    CHECK(f && getdelim(&txt, &len, '\0', f) > 0);
+    if (f)
+        fclose(f);
+    size_t n = txt ? strlen(txt) : 0;
+    int fd = open(vols, O_RDWR | O_TRUNC);
+    struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    CHECK(fd >= 0 && fcntl(fd, F_OFD_SETLK, &fl) == 0); /* as an add holds it */
+    CHECK(n > 4 && write(fd, txt, n / 2) == (ssize_t)(n / 2));
+    struct opener x = {.root = root};
+    tsdb_options_init(&x.o);
+    x.o.fsync = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, open_thread, &x) == 0);
+    usleep(300000);
+    CHECK(!__atomic_load_n(&x.done, __ATOMIC_ACQUIRE));
+    CHECK(write(fd, txt + n / 2, n - n / 2) == (ssize_t)(n - n / 2));
+    close(fd); /* and the lock */
+    pthread_join(th, NULL);
+    CHECK(x.rc == 0);
+    if (x.rc == 0) {
+        CHECK(tsdb_volume_count(x.db) == 2);
+        OK(tsdb_close(x.db));
+    }
+    free(txt);
+    remove_tree(top);
+    printf("  a writer's open waits for an add in progress\n");
+}
+
+/* Power lost at every step of "tsdb <dir> volume add" (the crashfs shim), and
+ * just after it reported success: the database opens again each time, and
+ * the volume it reported is there. A VOLUMES line whose directory entry was
+ * not yet durable used to fail every later open. */
+static void test_add_power_loss(const char *base, const char *argv0)
+{
+    char dir[PATH_MAX], cli[PATH_MAX + 16], shim[PATH_MAX + 32];
+    snprintf(dir, sizeof dir, "%.*s", (int)(strrchr(argv0, '/') ? strrchr(argv0, '/') - argv0 : 1),
+             strrchr(argv0, '/') ? argv0 : ".");
+    snprintf(cli, sizeof cli, "%s/tsdb", dir);
+    snprintf(shim, sizeof shim, "%s/libcrashfs.so", dir);
+    char shim_abs[PATH_MAX];
+    if (access(cli, X_OK) != 0 || !realpath(shim, shim_abs)) {
+        printf("  power loss during volume add: skipped (no %s or %s)\n", cli, shim);
+        return;
+    }
+    char top[600], root[700], p[800];
+    fresh(base, "volpl", top, sizeof top, root, sizeof root);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.create_volumes = 0;
+    int crashes = 0, finished = 0;
+    for (int k = 0; k < 200 && !finished; k++) {
+        snprintf(p, sizeof p, "%s/v%d", top, k);
+        char warm[16];
+        snprintf(warm, sizeof warm, "%d", k);
+        pid_t pid = fork();
+        if (pid == 0) {
+            char asan[512];
+            snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0",
+                     getenv("ASAN_OPTIONS") ? getenv("ASAN_OPTIONS") : "");
+            setenv("ASAN_OPTIONS", asan, 1);
+            setenv("LD_PRELOAD", shim_abs, 1);
+            setenv("CRASHFS_ROOT", top, 1);
+            setenv("CRASHFS_PROB", "1", 1);
+            setenv("CRASHFS_WARMUP", warm, 1);
+            setenv("CRASHFS_AT_EXIT", "1", 1);
+            int null = open("/dev/null", O_WRONLY);
+            if (null >= 0) {
+                dup2(null, 1);
+                dup2(null, 2);
+            }
+            execl(cli, "tsdb", root, "volume", "add", p, (char *)NULL);
+            _exit(127);
+        }
+        int st = -1;
+        CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st));
+        int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        CHECK(code == 99 || code == 0);
+        if (code != 99 && code != 0)
+            break;
+        crashes += code == 99;
+        finished = code == 0;
+        tsdb *db;
+        int rc = tsdb_open(root, &o, &db);
+        if (rc != 0)
+            fprintf(stderr, "  open after a power loss at step %d of volume add: %s\n", k + 1, tsdb_strerror(rc));
+        CHECK(rc == 0);
+        if (rc == 0 && finished) {
+            bool listed = false;
+            for (uint32_t i = 0; i < tsdb_volume_count(db); i++)
+                listed |= strcmp(tsdb_volume_path(db, i), p) == 0;
+            CHECK(listed); /* it said so: it is on disk */
+            uint32_t id;
+            CHECK(tsdb_series_at(db, "after", p, &id) == 0);
+        }
+        if (rc == 0)
+            OK(tsdb_close(db));
+    }
+    CHECK(finished && crashes > 3);
+    remove_tree(top);
+    printf("  power lost at each of %d steps of volume add and after it: the database opens\n", crashes);
 }
 
 int main(int argc, char **argv)
@@ -331,6 +847,13 @@ int main(int argc, char **argv)
     OK(tsdb_open(root, &o, &db));
     OK(tsdb_close(db));
     printf("  torn CATALOG and VOLUMES tails cut, damage before good records fails the open\n");
+
+    test_paths(base);
+    test_refused_dirs(base);
+    test_volumes_under_writer(base);
+    test_concurrent_adds(base);
+    test_open_waits_for_add(base);
+    test_add_power_loss(base, argv[0]);
 
     if (system(cmd) != 0)
         return 1;

@@ -410,7 +410,29 @@ p<partition>_<minblock>_<maxblock>_<level>.part
 
 A database with volumes (`tsdb_series_at`) also has `VOLUMES` (their paths)
 and `CATALOG` (global series id -> volume and local id) in the root; each
-volume is a directory of the layout above.
+volume is a directory of the layout above, with `ROOT_ID` (the root's `ID`).
+
+Volumes are added on purpose: `tsdb <dir> volume add <path>` (`tsdb_volume_add_dir`,
+also while tsdbd has the database open) or `tsdb_volume_add`. tsdbd and the CLI
+open the database with `create_volumes = 0`, so a series request naming a path
+that is not a volume gets NOTFOUND and creates nothing: a client never chooses
+where the server writes. The embedded library adds a volume for a new path by
+default (the program chooses its paths), with the same checks. An add takes an
+OFD lock on `VOLUMES`, so the CLI and a running writer append in turn, and
+refuses (INVALID) a path that is not absolute, holds a control character (a
+newline would split its line) or a `.` or `..` component, lies inside the root
+or another volume or contains one, or is the directory of another database or
+holds tsdb files. It makes the directory and syncs its parent, writes the
+root's `META` and `ROOT_ID` into it and then appends the line, so a line never
+names a directory a power loss can take back; the engine files come with the
+first writer that opens it. The lock is held only to read the list and to
+append, not while the new directory (perhaps on a slow NFS server) is made. A
+running writer reads the lines added since when a request names a path it
+does not know (VOLUMES grew), so `volume add` needs no restart; it resolves the
+client's path (realpath, for a symlink to a volume) before it takes the lock
+that serialises series creation. Whoever holds the write lock cuts a torn
+last line (an add that died in its write), so one does not stop a running
+writer until a restart.
 
 Each part is one immutable file holding the rows of every series written in
 one insert (or produced by one merge), sorted by `(series, ts)`:

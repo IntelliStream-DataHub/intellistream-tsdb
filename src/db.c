@@ -52,6 +52,7 @@ void tsdb_options_init(tsdb_options *o)
     o->merge_idle_s = 300;
     o->retention_merge_s = 3600;
     o->max_part_bytes = 4ull << 30;
+    o->create_volumes = 1; /* the embedding program chooses the paths; tsdbd sets 0 */
 }
 
 /* ------------------------------------------------------------ codec pool */

@@ -10,6 +10,7 @@
 #include "tsdb.h"
 
 #include <getopt.h>
+#include <limits.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -103,12 +104,21 @@ static tsdb *open_fresh(int wal_sync_ms, size_t wal_max_batch)
         fprintf(stderr, "open: %s\n", tsdb_strerror(rc));
         exit(1);
     }
+    char abs[PATH_MAX]; /* volume paths are absolute */
+    if (!realpath(dir, abs)) {
+        perror(dir);
+        exit(1);
+    }
     for (uint32_t i = 0; i < nseries; i++) {
-        char name[64], vol[1100];
+        char name[64], vol[PATH_MAX + 32];
         uint32_t id;
         snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
-        snprintf(vol, sizeof vol, "%s.vol%u", dir, i % (uint32_t)nvolumes);
-        tsdb_series_at(db, name, nvolumes > 1 ? vol : NULL, &id);
+        snprintf(vol, sizeof vol, "%s.vol%u", abs, i % (uint32_t)nvolumes);
+        rc = tsdb_series_at(db, name, nvolumes > 1 ? vol : NULL, &id);
+        if (rc) {
+            fprintf(stderr, "series %s in %s: %s\n", name, nvolumes > 1 ? vol : dir, tsdb_strerror(rc));
+            exit(1);
+        }
     }
     return db;
 }

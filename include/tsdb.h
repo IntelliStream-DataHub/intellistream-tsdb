@@ -86,6 +86,10 @@ typedef struct tsdb_options {
     int64_t (*clock_ms)(void *arg); /* the wall clock retention reads, ms since the epoch; NULL: CLOCK_REALTIME.
                                      * For tests: it may step back and forth like a real clock */
     void *clock_arg;
+    int create_volumes;      /* 1 (default): tsdb_series_at and tsdb_series_create add a volume for a path that
+                              * is not one yet, with the checks of tsdb_volume_add. 0: such a path is
+                              * TSDB_ERR_NOTFOUND, and volumes are added only by tsdb_volume_add(_dir). tsdbd and
+                              * tsdb-cli set 0: a client must not choose where the server writes */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -124,7 +128,10 @@ typedef struct tsdb_values {
  * A series is stored in one volume: the database directory itself, or the
  * directory given to tsdb_series_at when the series is created (for example
  * one per NFS mount, to spread writes over them). Series created with the
- * same path share that volume. The path only matters at creation. */
+ * same path share that volume. The path only matters at creation: it must be
+ * absolute, without control characters or "." and ".." components
+ * (TSDB_ERR_INVALID), and name a volume (TSDB_ERR_NOTFOUND otherwise, unless
+ * create_volumes adds it). A symlink to a volume names that volume. */
 int tsdb_series(tsdb *db, const char *name, uint32_t *id);        /* get or create in the database directory */
 int tsdb_series_at(tsdb *db, const char *name, const char *path, uint32_t *id); /* get or create in volume `path` */
 int tsdb_series_lookup(tsdb *db, const char *name, uint32_t *id); /* TSDB_ERR_NOTFOUND if missing */
@@ -138,6 +145,16 @@ const char *tsdb_series_name(tsdb *db, uint32_t id); /* valid until tsdb_close *
 const char *tsdb_series_path(tsdb *db, uint32_t id); /* its volume's directory */
 uint32_t tsdb_volume_count(tsdb *db);                /* 1 + the extra volumes */
 const char *tsdb_volume_path(tsdb *db, uint32_t index);
+/* Adds volume `path` (made if missing, one level; its parent must exist) and
+ * returns its number; a path that is a volume already returns its number.
+ * TSDB_ERR_INVALID for a path that is not absolute, holds a control character
+ * or a "." or ".." component, lies inside the database directory or another
+ * volume or contains one, or is a directory of another database (its root or
+ * a volume) or holds tsdb files. tsdb_volume_add_dir does the same without
+ * opening the database, also while another process (tsdbd) has it open: that
+ * writer opens the volume when a request first names it. */
+int tsdb_volume_add(tsdb *db, const char *path, uint32_t *index);
+int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index);
 
 /* ---- writing ----
  * (series, ts) is a unique key, as in ReplacingMergeTree read with FINAL:
