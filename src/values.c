@@ -235,6 +235,17 @@ __attribute__((noinline)) static void fold_i64_dev(const int64_t *v, size_t n, a
     a->imax = mx;
 }
 
+/* The row index kept as such in the v4 copy of make dist (AVX-512: min/max as VPMINSQ/VPMAXSQ): GCC turned it into a
+ * moving pointer, and that loop, called from the x86-64-v2 code, took 31.7 cycles for 4 rows against 26.3 indexed
+ * (Zen 4: pipeline restarts and front-end stalls, perf -M PipelineL2), 8 rows 38.1 against 34.7. Indexed, the cmov
+ * loop of the v2 copy lost 5.6 cycles at 4 rows, and the native build (the same VPMINSQ loop, called from native
+ * code) 1-1.5 cycles at 2-4 rows: they keep the pointer. */
+#if defined(TSDB_LEVELS) && defined(__AVX512VL__)
+#define LV_KEEP_INDEX(i) __asm__("" : "+r"(i))
+#else
+#define LV_KEEP_INDEX(i) ((void)0)
+#endif
+
 __attribute__((noinline)) static void fold_i64_agg(const int64_t *v, size_t n, agg_state *a)
 {
     __int128 s = 0;
@@ -248,6 +259,7 @@ __attribute__((noinline)) static void fold_i64_agg(const int64_t *v, size_t n, a
         s += x;
         mn = x < mn ? x : mn;
         mx = x > mx ? x : mx;
+        LV_KEEP_INDEX(i);
     }
     a->count += c;
     a->isum += s;
