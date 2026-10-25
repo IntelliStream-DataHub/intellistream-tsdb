@@ -336,7 +336,7 @@ static void make_inputs(void)
     for (size_t i = 0; i < GR; i++)
         ((uint64_t *)x->v)[i] = next();
 
-    /* short runs: values.c's tiny path (a fixed tree, n <= 4) and the short-run kernels must give the kernels'
+    /* short runs: values.c's tiny path (a fixed tree, n <= 12) and the short-run kernels must give the kernels'
      * bits for every prefix of these (short_run): signed zeros, infinities, NaNs and nulls at every position (11
      * rotations of 11 specials: each special at each position), and random draws from them */
     static const uint64_t sp64[11] = {0, 0x8000000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
@@ -372,6 +372,16 @@ static void make_inputs(void)
             ((uint64_t *)x->v)[prio16[k]] = NULL_F64;
         ((uint64_t *)x->v)[prio16[t]] = 0x8000000000000000ull;
     }
+    /* float32 (simd_small_f32): a run of up to 16 uses lanes 0-15 of the 32, in the same order */
+    for (int t = 0; t < 16; t++) {
+        snprintf(name, sizeof name, "f32 zero ties %d", t);
+        x = add(name, TSDB_FLOAT32, 34);
+        for (size_t i = 0; i < 34; i++)
+            ((uint32_t *)x->v)[i] = 0;
+        for (int k = 0; k < t; k++)
+            ((uint32_t *)x->v)[prio16[k]] = NULL_F32;
+        ((uint32_t *)x->v)[prio16[t]] = 0x80000000u;
+    }
 
     /* timestamps: regular, jittered, random gaps, duplicates, negative, extremes */
     x = add("ts jitter", TSDB_INT64, GR);
@@ -395,7 +405,7 @@ typedef int (*dec_fn)(const uint8_t *, size_t, size_t, void *);
 static uint8_t *buf, *dec;
 #define BUF(n) ((n) * 16 + 4096)
 
-/* A run shorter than simd_short (simd_short_f64 for float64) takes values.c's tiny path (float64, n <= 4) or simd_small_*: it must give the
+/* A run shorter than simd_short (simd_short_f64 for float64) takes values.c's tiny path (float64, n <= 12) or simd_small_*: it must give the
  * bits of the lane kernels of the level, which it skips, with and without the spread and the search for nulls,
  * from a new state and from states whose bounds and sum are zeros of either sign. */
 static void short_run(const input *x, size_t m)
