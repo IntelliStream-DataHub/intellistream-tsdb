@@ -424,6 +424,26 @@ A request waits as long as the server takes unless you set a timeout
 (`tsdbc_set_timeout`); after a timeout or any connection error the client
 refuses further calls on that connection, so close it and connect again.
 
+### Backup and moving to a new version
+
+`export` writes the whole database (or some series) into one file; `import` reads it into another database.
+Use it for backups, to move a database to another disk or machine, and when a new tsdb version cannot open
+the files of an older one (before 1.0 that can happen in a 0.9.x release; the release notes say so):
+
+```sh
+build/tsdb /data/sensors export -o sensors.tsdbdump      # with the OLD tsdb; also while tsdbd is running
+build/tsdb /data/sensors-new import sensors.tsdbdump     # with the NEW tsdb, into a new directory
+build/tsdb /data/sensors export --series 'pump7.*' --from 2024-01-01 --to 2024-02-01 | ssh other \
+    tsdb /data/sensors import                             # some series and one month, straight to another host
+```
+
+The file has what your queries see (deleted rows are gone), with each series' type, retention and state names,
+every value exactly as stored, and a checksum on every piece. Every later tsdb can import it. `import` checks
+the whole file before it writes anything, so a damaged file changes nothing; `import --check FILE` only checks.
+Series that already exist are refused unless you pass `--skip-existing`, `--merge` or `--replace`. Series of
+other volumes go to the same paths; `--volume OLD=NEW` moves them. Stop tsdbd before importing into its
+directory. [docs/export-format.md](docs/export-format.md) describes the file.
+
 ## Tests
 
 ```sh
