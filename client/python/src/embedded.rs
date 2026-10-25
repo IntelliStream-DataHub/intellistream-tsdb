@@ -18,10 +18,11 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 
 use ::tsdb_client as tc;
+
 use tc::ValueType;
 
 use crate::{
-    Bucket, QueryStats, Stats, buckets, closed, column_to_py, f32_column, numpy_module, opts, points_to_py, py_column,
+    Buckets, QueryStats, Stats, buckets, values_column, closed, column_to_py, f32_column, numpy_module, opts, points_to_py, py_column,
     range, series_column, to_pyerr, ts_column, ts_to_py, unit, value_type, zone_name,
 };
 
@@ -121,7 +122,7 @@ impl Db {
             (None, Some(id)) => self.with(py, |d| d.series_type(id))?,
             (None, None) => ValueType::Float32,
         };
-        let col = py_column(values, ty)?;
+        let col = values_column(values, ty)?;
         self.with(py, |d| match (&many, one) {
             (Some(s), _) => d.insert_values(s, &ts, &col),
             (None, Some(id)) => d.insert_series_values(id, &ts, &col),
@@ -490,11 +491,12 @@ impl Db {
         let o = opts(order, limit)?;
         let rows = self.query(py, |d| d.query_rows(series, range(start, end), o))?;
         let np = numpy_module(py, numpy)?;
-        PyTuple::new(py, [ts_to_py(py, np.as_ref(), &rows.ts)?, column_to_py(py, np.as_ref(), &rows.values)?])
+        PyTuple::new(py, [ts_to_py(py, np, rows.ts)?, column_to_py(py, np, rows.values)?])
     }
 
-    /// Aggregates a series: one Bucket per interval_ms, or one for the whole
-    /// range when interval_ms is 0. Empty buckets are left out.
+    /// Aggregates a series: one bucket per interval_ms, or one for the whole
+    /// range when interval_ms is 0, as Buckets (a sequence of Bucket with
+    /// numpy columns). Empty buckets are left out.
     #[pyo3(signature = (series, start = None, end = None, interval_ms = 0))]
     fn query_agg(
         &self,
@@ -503,8 +505,8 @@ impl Db {
         start: Option<i64>,
         end: Option<i64>,
         interval_ms: i64,
-    ) -> PyResult<Vec<Bucket>> {
-        self.query(py, |d| d.query_agg(series, range(start, end), interval_ms)).map(buckets)
+    ) -> PyResult<Buckets> {
+        self.query(py, |d| d.query_agg(series, range(start, end), interval_ms).map(buckets))
     }
 
     /// Aggregates a series by calendar units, as Client.query_group() does.
@@ -528,11 +530,11 @@ impl Db {
         timezone: Option<&Bound<'_, PyAny>>,
         order: &str,
         limit: Option<u64>,
-    ) -> PyResult<Vec<Bucket>> {
+    ) -> PyResult<Buckets> {
         let o = opts(order, limit)?;
         let timezone = timezone.map(zone_name).transpose()?;
         let group = unit.map(self::unit).transpose()?.map(|u| tc::Group { unit: u, count, timezone });
-        self.query(py, |d| d.query_group(series, range(start, end), group.as_ref(), o)).map(buckets)
+        self.query(py, |d| d.query_group(series, range(start, end), group.as_ref(), o).map(buckets))
     }
 
     /// Aggregates a series into buckets between ascending bounds (ms).
@@ -547,10 +549,10 @@ impl Db {
         end: Option<i64>,
         order: &str,
         limit: Option<u64>,
-    ) -> PyResult<Vec<Bucket>> {
+    ) -> PyResult<Buckets> {
         let o = opts(order, limit)?;
         let bounds = ts_column(bounds)?;
-        self.query(py, |d| d.query_bounds(series, range(start, end), &bounds, o)).map(buckets)
+        self.query(py, |d| d.query_bounds(series, range(start, end), &bounds, o).map(buckets))
     }
 
     /// Makes every insert so far durable (syncs the WAL).
