@@ -637,7 +637,14 @@ static void test_codecs(void)
 
 int main(int argc, char **argv)
 {
-    const char *base = argc > 1 ? argv[1] : "/tmp";
+    /* a directory of this run's own: the fixed names below collided between worktrees testing at once */
+    char base[400];
+    snprintf(base, sizeof base, "%s/tsdb-crafted-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    rm_rf(base);
+    if (mkdir(base, 0755) != 0) {
+        perror(base);
+        return 1;
+    }
     test_manifest(base);
     test_parts(base);
     test_intents(base);
@@ -649,6 +656,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_crafted: %d failures\n", failures);
         return 1;
     }
+    rm_rf(base);
     printf("test_crafted: ok\n");
     return 0;
 }

@@ -985,8 +985,15 @@ static void test_anchors(void)
 
 int main(int argc, char **argv)
 {
-    if (argc > 1)
-        scratch = argv[1];
+    /* a directory of this run's own: the fixed names below collided between worktrees testing at once */
+    static char own[600];
+    snprintf(own, sizeof own, "%s/tsdb-delete-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    rmrf(own);
+    if (mkdir(own, 0755) != 0) {
+        perror(own);
+        return 1;
+    }
+    scratch = own;
     int rounds = getenv("TSDB_DELETE_ROUNDS") ? atoi(getenv("TSDB_DELETE_ROUNDS")) : 6;
     test_stats();
     test_wal_replay();
@@ -1009,6 +1016,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_delete: %d failures\n", failures);
         return 1;
     }
+    rmrf(own);
     printf("test_delete: ok\n");
     return 0;
 }
