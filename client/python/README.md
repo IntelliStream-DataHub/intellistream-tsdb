@@ -135,6 +135,10 @@ for b in client.query_agg(series, t0, t1, interval_ms=3_600_000):  # one bucket 
 (total,) = client.query_agg(series)                                 # one bucket for everything
 ```
 
+The result also has a numpy array per field, which is faster than a loop
+when there are many buckets: `b = client.query_agg(...)`, then
+`b.count.sum()` or `b.max.max()`.
+
 ## Group by day in a time zone
 
 A day in Oslo starts at 23:00 or 22:00 UTC, depending on daylight saving
@@ -251,6 +255,47 @@ in parallel. One process at a time can open a directory for writing
 and call `refresh()` to see new data. The keyword arguments of `Db` are
 the engine's options, such as `fsync=False` or `wal_sync_ms=100`;
 `help(tsdb_client.Db)` lists them.
+
+## Many queries at once
+
+Each call into the module costs a few microseconds of Python time, and
+Python runs one thread at a time. With hundreds of thousands of small
+queries a second, that becomes the limit. The `_many` calls take a whole
+list of queries in one call and run them in parallel on every CPU, with
+Python out of the way: one Python thread then does as much as many.
+
+```python
+import numpy as np
+import tsdb_client
+
+with tsdb_client.Db("/tmp/tsdb-many") as db:
+    t0 = 1_700_000_000_000
+    ts = t0 + np.arange(1440, dtype=np.int64) * 60_000  # one row a minute for a day
+    pumps = [db.series(f"pump{i}.flow") for i in range(3)]
+    db.insert_many([(s, ts, np.full(1440, i + 1.0, dtype=np.float32)) for i, s in enumerate(pumps)])
+
+    # the first hour of every pump: one (timestamps, values) pair per query
+    for s, (t, v) in zip(pumps, db.query_raw_many(pumps, t0, t0 + 3_600_000)):
+        print("raw  ", s, len(t), v.sum())
+
+    # hourly buckets of every pump, then numpy over all of them at once
+    hours = db.query_agg_many(pumps, t0, t0 + 86_400_000, 3_600_000)
+    print("hours", len(hours), len(hours[0]), hours.buckets.sum.sum())
+```
+
+`start`, `end` and `interval_ms` are one number for every query or a list
+(or numpy array) with one per query. The answers come back in the order
+of the queries; if one query fails, the call raises its error.
+
+Over the network, `tsdb_client.Pool` does the same with several
+connections to one server (by default one per CPU of this machine):
+
+```python
+with tsdb_client.Pool("127.0.0.1", 7070, connections=16) as pool:
+    hours = pool.query_agg_many(pumps, t0, t0 + 86_400_000, 3_600_000)
+```
+
+A connection that breaks is replaced on its next use.
 
 ## API documentation
 

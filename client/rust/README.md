@@ -293,6 +293,33 @@ run in parallel. One process at a time can open a directory for writing;
 others get `Status::Locked`, readers open it with `read_only: true`.
 `query_chunks` hands out the engine's own buffers without copying.
 
+## Many queries at once
+
+`query_points_many`, `query_agg_many` and `insert_many` take a whole list
+of queries (or inserts) and run them in parallel: `Db` on every CPU,
+`Pool` on its connections to tsdbd. The answers come back in the order of
+the queries; if one fails, the call returns the error of the first that
+failed. This is what the Python client builds on, but a Rust program that
+wants many answers at once gets them the same way:
+
+```rust
+use tsdb_client::{AggQuery, Pool};
+
+fn main() -> tsdb_client::Result<()> {
+    let pool = Pool::connect("127.0.0.1:7070", 16)?; // 16 connections, one thread each
+    let day = 86_400_000;
+    let queries: Vec<AggQuery> = (0..100).map(|s| AggQuery::new(s, 0, day, 3_600_000)).collect();
+    let hourly = pool.query_agg_many(&queries)?; // hourly[i]: the buckets of queries[i]
+    println!("{} buckets for series 0", hourly[0].len());
+    Ok(())
+}
+```
+
+A connection of the pool that breaks is replaced before its next query.
+`Pool::with_connector` takes your own function to open connections (to
+set a timeout, say), and `Pool::map` runs any calls of your own spread
+over the connections.
+
 ## API documentation
 
 ```sh
