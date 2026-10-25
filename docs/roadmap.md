@@ -29,10 +29,13 @@ series store underneath; tsdb does not duplicate it.
 - Prometheus metrics: tsdbd serves `/metrics` in Prometheus text format on a
   separate port (`--metrics-port`, docs/metrics.md).
 
-## Release 1.0
+## Releases 0.9.0 and 1.0
 
-Decided with the user on 2026-10-24: 1.0 is one writing server per database (read-only followers on other hosts
-over NFS); failover comes after it. What 1.0 still needs:
+Decided with the user on 2026-10-24 and 2026-10-25: the first release is 0.9.0. The disk format and the wire
+protocol freeze at 1.0, not before: a 0.9.x release may still change them, with a way to carry data over
+(export and import, or a migration) and a database of another format refused with a clear message. 1.0 is one
+writing server per database (read-only followers on other hosts over NFS); failover comes after it. What 0.9.0
+and 1.0 still need (the format and protocol changes may land in a 0.9.x, but before 1.0):
 
 - Input safety: client-chosen volume paths, query memory that follows rows, crafted files, network frames,
   client and CLI parsing; fuzzing of decoders, file loaders and frames (in progress).
@@ -44,7 +47,7 @@ over NFS); failover comes after it. What 1.0 still needs:
   the protocol, the on-disk layout and every client, so it lands before the formats are frozen, and failover
   can follow in 1.1 without a break.
 - Release mechanics: version and tag, release notes, the compatibility promise (which formats and protocol
-  versions 1.x reads), the portable tarball checked on AlmaLinux 10.
+  versions 1.x reads), the portable tarball checked on AlmaLinux 10; export and import for 0.9.x format changes.
 - The release benchmarks: the full comparison (bench/dbcmp) and the internal numbers on a quiet machine.
 
 ## After the first release
