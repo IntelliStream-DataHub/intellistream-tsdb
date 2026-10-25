@@ -159,6 +159,102 @@ static void test_codecs(void)
         }
     }
 
+    /* packed bit deltas (float32 and float64) and float64 ALP_rd: every length around the 1024-value vectors, on
+     * smooth unrounded values, random bits, the specials (NaN payloads, -0, infinities, denormals, the nulls) and
+     * values that jump between them, which widen a vector to the full 32 or 64 bits */
+    {
+        enum { M = 4100 };
+        uint64_t *d = malloc(M * 8), *d2 = malloc(M * 8);
+        uint32_t *f2 = malloc(M * 4);
+        uint8_t *e32 = malloc(delta_bp32_bound(M) + BLK_SLACK), *e64 = malloc(delta_bp64_bound(M) + BLK_SLACK);
+        uint8_t *erd = malloc(alprd64_bound(M) + BLK_SLACK);
+        static const uint64_t sp64[] = {0x7ff8000000000000ull, 0xfff0000000000001ull, 0x7ff0000000000000ull,
+                                        0xfff0000000000000ull, 0x8000000000000000ull, 0, 1, 0x000fffffffffffffull,
+                                        0x7fefffffffffffffull, 0x7ff4000000000123ull};
+        static const uint32_t sp32[] = {0x7fc00000u, 0xff800001u, 0x7f800000u, 0xff800000u, 0x80000000u, 0, 1,
+                                        0x007fffffu, 0x7f7fffffu, 0x7fa00123u};
+        static const size_t lens[] = {0, 1, 2, 3, 4, 5, 1023, 1024, 1025, 1026, 1027, 2047, 2048, 2049, 2050, 4100};
+        for (int shape = 0; shape < 5; shape++) {
+            for (int i = 0; i < M; i++) {
+                double x = 14.503773773 * (1.5 + 0.2 * sin(i / 300.0)); /* bar to psi, unrounded */
+                switch (shape) {
+                case 0: memcpy(&d[i], &x, 8); u[i] = 0; f[i] = (float)x; break;
+                case 1: d[i] = rnd(); u[i] = (uint32_t)rnd(); break;
+                case 2: d[i] = sp64[rnd() % 10]; u[i] = sp32[rnd() % 10]; break;
+                case 3: /* smooth, with specials in between */
+                    memcpy(&d[i], &x, 8);
+                    f[i] = (float)x;
+                    if (i % 97 == 5) {
+                        d[i] = sp64[rnd() % 10];
+                        u[i] = sp32[rnd() % 10];
+                    }
+                    break;
+                default: { double y = -x * 1e-310; memcpy(&d[i], &y, 8); f[i] = (float)(-x * 1e-40); } break;
+                }
+            }
+            for (size_t li = 0; li < sizeof lens / sizeof *lens; li++) {
+                size_t m = lens[li];
+                size_t len = delta_bp32_encode(u, m, e32);
+                CHECK(m == 0 ? len == 0 : len > 0);
+                CHECK(len <= delta_bp32_bound(m));
+                memset(f2, 0xa5, M * 4);
+                CHECK(delta_bp32_decode(e32, len, m, f2) == 0 && !memcmp(u, f2, m * 4));
+                if (m > 1)
+                    CHECK(delta_bp32_decode(e32, len - 1, m, f2) != 0); /* truncated */
+                len = delta_bp64_encode(d, m, e64);
+                CHECK(len <= delta_bp64_bound(m));
+                memset(d2, 0xa5, M * 8);
+                CHECK(delta_bp64_decode(e64, len, m, d2) == 0 && !memcmp(d, d2, m * 8));
+                if (m > 1)
+                    CHECK(delta_bp64_decode(e64, len - 1, m, d2) != 0);
+                len = alprd64_encode(d, m, erd);
+                CHECK(m == 0 ? len == 0 : len > 0);
+                CHECK(len <= alprd64_bound(m));
+                memset(d2, 0xa5, M * 8);
+                CHECK(alprd64_decode(erd, len, m, d2) == 0 && !memcmp(d, d2, m * 8));
+            }
+            /* AUTO, as parts store them: float64 and float32 through the block layer, with and without ZSTD */
+            codec_ctx *bc = codec_new();
+            uint8_t *blk = malloc(block_bound(M) + BLK_SLACK);
+            for (int level = 0; level <= 1; level++) {
+                size_t len = block_encode_vals(bc, level, 0, TSDB_FLOAT64, d, M, blk);
+                CHECK(len > 0 && block_decode_vals(bc, TSDB_FLOAT64, blk, len, M, d2) == 0 && !memcmp(d, d2, M * 8));
+                len = block_encode_vals(bc, level, 0, TSDB_FLOAT32, u, M, blk);
+                CHECK(len > 0 && block_decode_vals(bc, TSDB_FLOAT32, blk, len, M, f2) == 0 && !memcmp(u, f2, M * 4));
+            }
+            free(blk);
+            codec_free(bc);
+        }
+        /* the smooth values pick the packed bit deltas, the random doubles ALP_rd */
+        codec_ctx *bc = codec_new();
+        uint8_t *blk = malloc(block_bound(M) + BLK_SLACK);
+        for (int i = 0; i < M; i++) {
+            /* a filling tank in bar with sensor noise, converted to psi (codec-bench's tank_psi) */
+            double x = 14.5037738 * (0.2 + 0.00007 * i + 0.0004 * ((double)(rnd() % 2001) / 1000 - 1));
+            memcpy(&d[i], &x, 8);
+            f[i] = (float)x;
+        }
+        size_t len = block_encode_vals(bc, 1, 0, TSDB_FLOAT64, d, M, blk);
+        CHECK((blk[0] & 0x0f) == BLK_DELTA_BP);
+        len = block_encode_vals(bc, 1, 0, TSDB_FLOAT32, u, M, blk);
+        CHECK((blk[0] & 0x0f) == BLK_DELTA_BP);
+        for (int i = 0; i < M; i++) {
+            double x = (double)(rnd() >> 11) / 9007199254740992.0 * 1000;
+            memcpy(&d[i], &x, 8);
+        }
+        len = block_encode_vals(bc, 1, 0, TSDB_FLOAT64, d, M, blk);
+        CHECK((blk[0] & 0x0f) == BLK_ALPRD);
+        CHECK(block_decode_vals(bc, TSDB_FLOAT64, blk, len, M, d2) == 0 && !memcmp(d, d2, M * 8));
+        free(blk);
+        codec_free(bc);
+        free(d);
+        free(d2);
+        free(f2);
+        free(e32);
+        free(e64);
+        free(erd);
+    }
+
     /* timestamp candidates: grid residual and frame-of-reference delta */
     for (int shape = 0; shape < 5; shape++) {
         for (int i = 0; i < N; i++) {

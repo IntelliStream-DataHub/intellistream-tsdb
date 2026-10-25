@@ -131,12 +131,14 @@ uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 #define BLK_BYTESPLIT 6 /* byte stream split of float32 */
 #define BLK_TS_DELTA 7  /* int64 deltas, frame of reference */
 #define BLK_TS_GRID 8   /* int64 residuals from a regular grid (clock jitter) */
-#define BLK_ALPRD 9     /* float32 split into dictionary-coded high bits and packed low bits */
+#define BLK_ALPRD 9     /* float32 or float64 split into dictionary-coded high bits and packed low bits */
 #define BLK_DECIMAL_BP 10 /* fixed-point integers, bit-packed zigzag deltas */
 #define BLK_F64_DECIMAL 11 /* float64 that are exact decimals: integers as in BLK_INT */
 #define BLK_XOR64 12       /* Gorilla over float64 */
 #define BLK_BYTESPLIT64 13 /* byte stream split of float64 */
 #define BLK_INT 14         /* int64: zigzag deltas bit-packed per 1024 values */
+#define BLK_DELTA_BP 15    /* float32 or float64: zigzag deltas of the bit patterns, bit-packed per 1024 */
+/* A kind names the transform; the series' type gives the width where both exist (BLK_ALPRD, BLK_DELTA_BP). */
 #define BLK_ZSTD 0x10 /* the transform output is additionally ZSTD compressed */
 #define BLK_SLACK 32  /* decoders may read up to this many bytes past a block */
 
@@ -167,6 +169,9 @@ size_t patas_encode(const uint32_t *in, size_t n, uint8_t *out);
 int patas_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
 size_t delta32_encode(const uint32_t *in, size_t n, uint8_t *out);
 int delta32_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
+size_t delta_bp32_bound(size_t n);
+size_t delta_bp32_encode(const uint32_t *in, size_t n, uint8_t *out);
+int delta_bp32_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
 size_t bytesplit_encode(const uint32_t *in, size_t n, uint8_t *out);
 int bytesplit_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
 size_t tsfor_bound(size_t n);
@@ -183,6 +188,9 @@ int alp_decode(const uint8_t *in, size_t len, size_t n, float *out);
 size_t alprd_bound(size_t n);
 size_t alprd_encode(const uint32_t *in, size_t n, uint8_t *out);
 int alprd_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out);
+size_t alprd64_bound(size_t n);
+size_t alprd64_encode(const uint64_t *in, size_t n, uint8_t *out);
+int alprd64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out);
 size_t decimal_bound(size_t n);
 size_t decimal_encode(const float *in, size_t n, uint8_t *out); /* 0 if not applicable */
 int decimal_decode(const uint8_t *in, size_t len, size_t n, float *out);
@@ -212,6 +220,9 @@ int f64_decimal_decode(const uint8_t *in, size_t len, size_t n, double *out);
 size_t xor64_bound(size_t n);
 size_t xor64_encode(const uint64_t *in, size_t n, uint8_t *out);
 int xor64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out);
+size_t delta_bp64_bound(size_t n);
+size_t delta_bp64_encode(const uint64_t *in, size_t n, uint8_t *out);
+int delta_bp64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out);
 
 /* ---- SIMD kernels (simd.c), dispatched once at startup ---- */
 /* The statistics of one bucket. Only the half of the type is in use: buckets

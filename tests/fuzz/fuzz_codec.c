@@ -22,7 +22,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     return cc && out ? 0 : -1;
 }
 
-enum { NSEL = 22 };
+enum { NSEL = 25 };
 
 static int decode(int sel, const uint8_t *p, size_t len, size_t n)
 {
@@ -44,7 +44,10 @@ static int decode(int sel, const uint8_t *p, size_t len, size_t n)
     case 18: return decimal_decode(p, len, n, out);
     case 19: return int_bp_decode(p, len, n, out);
     case 20: return f64_decimal_decode(p, len, n, out);
-    default: return xor64_decode(p, len, n, out);
+    case 21: return xor64_decode(p, len, n, out);
+    case 22: return delta_bp32_decode(p, len, n, out);
+    case 23: return delta_bp64_decode(p, len, n, out);
+    default: return alprd64_decode(p, len, n, out);
     }
 }
 
@@ -81,9 +84,10 @@ static void seed(const char *dir, int sel, size_t n, const uint8_t *blk, size_t 
     free(b);
 }
 
-/* the raw decoder for a block kind, or -1 */
-static int raw_sel(int kind)
+/* the raw decoder for a block kind of a type, or -1 */
+static int raw_sel(int kind, int type)
 {
+    bool f64 = type == TSDB_FLOAT64;
     switch (kind) {
     case BLK_DD: return 6;
     case BLK_GORILLA: return 7;
@@ -93,7 +97,8 @@ static int raw_sel(int kind)
     case BLK_BYTESPLIT: return 12;
     case BLK_TS_DELTA: return 14;
     case BLK_TS_GRID: return 13;
-    case BLK_ALPRD: return 17;
+    case BLK_ALPRD: return f64 ? 24 : 17;
+    case BLK_DELTA_BP: return f64 ? 23 : 22;
     case BLK_DECIMAL_BP: return 15;
     case BLK_F64_DECIMAL: return 20;
     case BLK_XOR64: return 21;
@@ -108,8 +113,9 @@ static void seed_block(const char *dir, int sel, size_t n, const uint8_t *blk, s
     int kind;
     const uint8_t *p;
     size_t plen;
-    if (block_open(cc, blk, len, n, &kind, &p, &plen) == 0 && raw_sel(kind) >= 0)
-        seed(dir, raw_sel(kind), n, p, plen);
+    int type = sel - 1; /* the block dispatchers by type */
+    if (block_open(cc, blk, len, n, &kind, &p, &plen) == 0 && raw_sel(kind, type) >= 0)
+        seed(dir, raw_sel(kind, type), n, p, plen);
 }
 
 void fuzz_seeds(const char *dir)
@@ -122,17 +128,23 @@ void fuzz_seeds(const char *dir)
     uint32_t st[N];
     uint8_t *blk = malloc(block_bound(N) + BLK_SLACK);
     uint64_t r = 1;
-    for (int shape = 0; shape < 3; shape++) {
+    for (int shape = 0; shape < 4; shape++) {
         for (int i = 0; i < N; i++) {
             r = r * 6364136223846793005ull + 1442695040888963407ull;
             int jitter = (int)(r >> 60);
             ts[i] = 1700000000000 + (int64_t)i * (shape == 2 ? 997 : 1000) + (shape == 1 ? jitter : 0);
             double x = shape == 0 ? 20 + i * 0.1 : shape == 1 ? (double)(r >> 40) / 1e3 : (double)(r >> 11) / 1e15;
+            if (shape == 3) /* converted units, unrounded: packed bit deltas */
+                x = 14.503773773 * (1.5 + 0.001 * (double)(i % 37) + 0.0001 * (double)(r >> 61));
             d[i] = shape == 0 ? (double)(int64_t)(x * 10) / 10 : x;
             f[i] = (float)d[i];
             iv[i] = shape == 0 ? 1000 + i : shape == 1 ? (int64_t)(r >> 45) : (int64_t)r;
             st[i] = shape == 0 ? (uint32_t)(i / 50 & 1) : (uint32_t)(r >> 62);
         }
+        /* the transforms AUTO may pass over on these values, directly */
+        seed(dir, 22, N, blk, delta_bp32_encode((const uint32_t *)f, N, blk));
+        seed(dir, 23, N, blk, delta_bp64_encode((const uint64_t *)d, N, blk));
+        seed(dir, 24, N, blk, alprd64_encode((const uint64_t *)d, N, blk));
         for (int lvl = 0; lvl <= 1; lvl++) {
             size_t len = block_encode_ts(cc, lvl, ts, N, blk);
             seed_block(dir, 0, N, blk, len);

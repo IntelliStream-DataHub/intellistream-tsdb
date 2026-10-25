@@ -678,10 +678,13 @@ static void run(rec *r, codec_ctx *c)
             CODEC(decimal, x->v, 4);
             CODEC(decimal_bp, x->v, 4);
             CODEC(alp, x->v, 4);
+            CODEC(delta_bp32, x->v, 4);
             break;
         case TSDB_FLOAT64:
             CODEC(f64_decimal, x->v, 8);
             CODEC(xor64, x->v, 8);
+            CODEC(delta_bp64, x->v, 8);
+            CODEC(alprd64, x->v, 8);
             break;
         case TSDB_INT64:
             CODEC(int_bp, x->v, 8);

@@ -18,6 +18,10 @@
  *      u8 scale | 0x80 for the second way | u32 nexc | nexc x (u32 pos, u64 bits) | BLK_INT stream
  *  - BLK_XOR64: Gorilla's XOR encoding of the 64-bit patterns.
  *  - BLK_BYTESPLIT64: the eight byte planes, for ZSTD.
+ *  - BLK_DELTA_BP: zigzag deltas of the 64-bit patterns, packed per vector of
+ *    1024 at up to 64 bits (values converted to other units, unrounded).
+ *  - BLK_ALPRD: ALP_rd at a cut of 48 to 63 bits (codec_alp.c; random-looking
+ *    doubles, where only the exponent repeats).
  * Decimal wins outright when it needs at most 16 bits a value; otherwise the
  * candidates are all compressed and the smallest stays.
  */
@@ -301,6 +305,64 @@ int f64_decimal_decode(const uint8_t *in, size_t len, size_t n, double *out)
     return 0;
 }
 
+/* ------------------------------------------------- BLK_DELTA_BP (float64) */
+
+/* As delta_bp32 (codec.c), on the 64-bit patterns: zigzag deltas packed at
+ * up to 64 bits a value.
+ *   u64 first | per vector of up to 1024 deltas: u8 bits (0..64), packed zigzags */
+size_t delta_bp64_bound(size_t n) { return 8 + (n / IBP_VEC + 1) + 8 * n + 8; }
+
+size_t delta_bp64_encode(const uint64_t *in, size_t n, uint8_t *out)
+{
+    if (n == 0)
+        return 0;
+    memcpy(out, &in[0], 8);
+    uint8_t *o = out + 8;
+    uint64_t z[IBP_VEC];
+    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        uint64_t all = 0;
+        for (size_t i = 0; i < nv; i++) {
+            z[i] = zz((int64_t)(in[v0 + i] - in[v0 + i - 1])); /* wraps; the decoder's sum wraps back */
+            all |= z[i];
+        }
+        int w = bits_for64(all);
+        *o++ = (uint8_t)w;
+        pack64(z, nv, w, o);
+        o += packed_bytes(nv, w);
+    }
+    return (size_t)(o - out);
+}
+
+int delta_bp64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out)
+{
+    if (n == 0)
+        return 0;
+    if (len < 8)
+        return TSDB_ERR_CORRUPT;
+    uint64_t k;
+    memcpy(&k, in, 8);
+    out[0] = k;
+    const uint8_t *p = in + 8, *end = in + len;
+    uint64_t z[IBP_VEC];
+    for (size_t v0 = 1; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        if (p >= end || *p > 64)
+            return TSDB_ERR_CORRUPT;
+        int w = *p++;
+        size_t pb = packed_bytes(nv, w);
+        if ((size_t)(end - p) < pb)
+            return TSDB_ERR_CORRUPT;
+        unpack64(p, nv, w, z);
+        p += pb;
+        uint64_t total = zz_prefix64(z, nv);
+        for (size_t i = 0; i < nv; i++)
+            out[v0 + i] = k + z[i];
+        k += total;
+    }
+    return p == end ? 0 : TSDB_ERR_CORRUPT;
+}
+
 /* ---------------------------------------------------------------- BLK_XOR64 */
 
 typedef struct bitw {
@@ -459,6 +521,8 @@ static size_t encode_f64_kind(codec_ctx *c, int kind, const double *v, size_t n)
     switch (kind) {
     case BLK_F64_DECIMAL: return f64_decimal_encode(v, n, c->scratch);
     case BLK_XOR64: return xor64_encode((const uint64_t *)v, n, c->scratch);
+    case BLK_DELTA_BP: return delta_bp64_encode((const uint64_t *)v, n, c->scratch);
+    case BLK_ALPRD: return alprd64_encode((const uint64_t *)v, n, c->scratch);
     default: bytesplit64((const uint64_t *)v, n, c->scratch); return 8 * n;
     }
 }
@@ -466,6 +530,7 @@ static size_t encode_f64_kind(codec_ctx *c, int kind, const double *v, size_t n)
 static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(f64_decimal_bound(n), xor64_bound(n)), 8 * n);
+    need = MAX(need, MAX(delta_bp64_bound(n), alprd64_bound(n)));
     if (codec_scratch_reserve(c, need) != 0)
         return 0;
     size_t inner = f64_decimal_encode(v, n, c->scratch);
@@ -478,7 +543,7 @@ static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uin
         c->alt = alt;
         c->alt_cap = block_bound(n);
     }
-    static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64};
+    static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64, BLK_DELTA_BP, BLK_ALPRD};
     size_t best = 0;
     for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++) {
         if (kinds[k] == BLK_F64_DECIMAL && !inner)
@@ -539,6 +604,8 @@ int block_decode_vals(codec_ctx *c, int type, const uint8_t *blk, size_t len, si
         case BLK_F64_DECIMAL: return f64_decimal_decode(p, plen, n, out);
         case BLK_XOR64: return xor64_decode(p, plen, n, out);
         case BLK_BYTESPLIT64: return unsplit64(p, plen, n, out);
+        case BLK_DELTA_BP: return delta_bp64_decode(p, plen, n, out);
+        case BLK_ALPRD: return alprd64_decode(p, plen, n, out);
         default: return TSDB_ERR_CORRUPT;
         }
     }

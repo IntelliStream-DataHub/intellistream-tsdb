@@ -698,9 +698,10 @@ What tsdb takes from ALP, codec by codec:
 | codec | on disk | from ALP | ours |
 |---|---|---|---|
 | fixed point, `decimal_bp` | kind 10, AUTO's first choice | choosing the scale on samples; exceptions; bit-packing per vector of 1024 | binary scales; zigzag deltas instead of frame of reference; round trip in double |
-| ALP_rd | kind 9, an AUTO candidate | the codec, in float32 | a dictionary sized by the data |
+| ALP_rd | kind 9, an AUTO candidate | the codec, in float32 and float64 | a dictionary sized by the data |
 | ALP | never written | the codec, in float32 as DuckDB does | (implemented and measured, not chosen; see below) |
 | float64 fixed point | kind 11 | as `decimal_bp` | two ways to rebuild a value |
+| packed bit delta | kind 15, an AUTO candidate | bit-packing per vector of 1024 | zigzag deltas of the raw bit patterns, float32 and float64 |
 | `decimal` | kind 3, still read | sampling; exceptions | 1/2/4-byte deltas left to ZSTD; AUTO no longer writes it |
 
 #### Fixed point: `decimal_bp` (src/codec.c)
@@ -846,16 +847,46 @@ candidates. `build/codec-bench` shows what the other way costs: its `alp|rd`
 column takes ALP whenever ALP accepts the granule, and on `flow_total` that is
 19.02 bits a value against 18.02 for ALP_rd alone (codec alone, without ZSTD).
 ALP_rd is what AUTO picks for every granule of uniform random floats (27.29
-bits with ZSTD, against 32.90 for Chimp); on the sensor data sets fixed point
-wins, except the unrounded psi conversion, where Chimp takes 121 granules of
-128.
+bits with ZSTD, against 32.90 for Chimp), in float32 and in float64 (56.29
+against 59.10 for byte split); on the sensor data sets fixed point wins,
+except the unrounded psi conversion, where the packed bit delta takes every
+granule (below).
+
+#### Packed bit delta (kind 15, src/codec.c and src/codec_typed.c)
+
+A reading converted to other units and left unrounded (bar to psi, liters to
+gallons) is no longer a decimal at any scale, so fixed point does not apply,
+yet it still moves smoothly: neighbours share the sign, the exponent and the
+top of the mantissa. The difference of their raw bit patterns, as integers, is
+then narrow. The packed bit delta stores the first pattern and the zigzag of
+each difference (modulo 2^32 or 2^64), bit-packed per vector of 1024 at the
+vector's widest:
+
+```
+u32 first (u64 for float64) | per vector: u8 bits (0..32, or 0..64) | packed zigzags
+```
+
+XOR codecs (Chimp, Gorilla) pay for a window of changed bits on every value;
+the delta pays only for its width, and a vector's width adapts to the signal's
+rate of change. On `tank_psi` that is 17.49 bits a value in float32 against
+19.50 for Chimp, AUTO's earlier pick, and 46.51 in float64 against 48.87 for
+byte split. ZSTD finds nothing more in it, and it decodes without an entropy
+decoder: unpacking, the four-lane prefix sum (two lanes for float64), an add
+(1,317 against 222 million values a second for `tank_psi` float32). The
+`delta32` candidate is the same difference left whole for ZSTD (22.23 bits).
+Values that are not smooth widen every vector to 32 or 64 bits and lose to
+the others, which is why it is a candidate and not a rule. It is the transform
+only: the study behind it (2026-10) also tried patching the few widest deltas
+of a vector as exceptions, which saved 0.16 bits a value on `tank_psi`, not
+enough for a second layout.
 
 #### How AUTO picks (src/codec.c, `block_encode_f32`)
 
 1. **Fixed point first.** If `decimal_bp` fits in 16 bits a value or less, it
    is kept without comparing anything else.
-2. **Otherwise compare.** Chimp, bit delta (deltas of the bit patterns),
-   byte-stream split, ALP_rd and `decimal_bp` (at any width) are each encoded.
+2. **Otherwise compare.** Chimp, bit delta (deltas of the bit patterns,
+   whole for ZSTD, and packed per vector), byte-stream split, ALP_rd and
+   `decimal_bp` (at any width) are each encoded.
    Each is estimated as the smaller of its length and the order-0 entropy of
    its bytes on a 1-in-3 sample (byte-stream split per byte plane). The
    entropy uses a portable `log2`, so every CPU makes the same choice. The
@@ -869,7 +900,7 @@ What AUTO picked, on 128 granules of each data set:
 | data set | AUTO's codec | kept ZSTD |
 |---|---|---:|
 | hdd_temp, cpu_temp, tank_bar | `decimal_bp` | 128 |
-| tank_psi (converted, unrounded) | Chimp 121, `decimal_bp` 7 | 1 |
+| tank_psi (converted, unrounded) | packed bit delta | 0 |
 | vibration | `decimal_bp` at 2^-13 | 0 |
 | flow_rate | `decimal_bp` | 14 |
 | flow_total | `decimal_bp` at 10^-3 | 128 |
@@ -886,7 +917,7 @@ and without ZSTD. Bits per value with ZSTD(1); sizes are exact:
 | SMART disk temperature, 0.1 degC, 60 s | 2.66 | 2.33 | 5.93 | 3.39 | 2.36 | 3.11 | **0.88** |
 | CPU temperature, spikes to 100 degC, 1 s | 10.82 | 11.34 | 11.86 | 10.75 | 4.97 | 8.47 | **2.99** |
 | tank pressure, 0.001 bar, 10 s | 9.09 | 8.85 | 8.79 | 7.45 | 5.97 | 9.81 | **1.82** |
-| tank pressure in psi (converted, unrounded) | 23.77 | 19.57 | 19.62 | 27.24 | n/a | 21.55 | **19.50** |
+| tank pressure in psi (converted, unrounded) | 23.77 | 19.57 | 19.62 | 27.24 | n/a | 21.55 | **17.49** |
 | vibration, 16-bit ADC at 1 kHz | 21.51 | 23.58 | 30.78 | 27.87 | n/a | 18.52 | **14.02** |
 | pipeline flow rate, 0.01 m3/h | 23.08 | 20.85 | 19.94 | 17.76 | 12.29 | 18.76 | **10.72** |
 | pipeline flow totalizer, m3 | 8.68 | 6.07 | 6.10 | 8.40 | n/a | 16.05 | **1.68** |
@@ -919,13 +950,16 @@ These are indicative only (measured on a busy machine):
 | codec | decoding |
 |---|---|
 | ALP | per vector: unpack, `(float)(int32)(u + base) * 10^f * 10^-e`, patch the exceptions; no value depends on another |
-| ALP_rd | unpack indexes and low parts, OR in `dict[idx & 7] << r` without a branch, patch the exceptions |
+| ALP_rd | unpack indexes and low parts, OR in `dict[idx & 7] << r` without a branch, patch the exceptions; float64 unpacks its 48- to 63-bit low parts with the wide unpacker |
+| packed bit delta | unpack, prefix sum of the zigzags (four 32-bit lanes, or two 64-bit ones), add the vector's first pattern |
 | `decimal_bp` | per vector: unpack, prefix sum of the zigzag deltas four lanes at a time relative to the vector's first integer, `(float)((base + r) * inv)`; exceptions patched at the end |
 | `decimal` | after ZSTD, a running sum over 1-, 2- or 4-byte deltas |
 | float64 fixed point | the integer codec straight into the output buffer (the same prefix sum, added to the vector's first integer in 64 bits), then converted to doubles in place |
 
 Unpacking is one function per bit width, with the width a compile-time
-constant and one unaligned 8-byte load per value (src/bitpack.h). The running
+constant and one unaligned 8-byte load per value (src/bitpack.h); the 64-bit
+unpacker for widths up to 64 adds a ninth byte for a value that straddles the
+load, possible only beyond 57 bits. The running
 sum was the serial step of `decimal_bp`: one add chain through every value,
 which is why ALP, with the same unpacking and no sum, decoded twice as fast.
 `zz_prefix32` (src/bitpack.h) now sums four lanes at a time with SSE2, which
@@ -990,11 +1024,26 @@ u8 scale|flag | u32 nexc | nexc x (u32 pos, u64 bits) | int64 block
 ```
 
 AUTO keeps fixed point outright at 16 bits a value or less; otherwise it
-compresses fixed point, Gorilla's XOR encoding of the 64-bit patterns and
-byte-stream split for real and keeps the smallest. With ZSTD, from
-`build/type-bench`: hdd_temp 0.88, cpu_temp 3.10, tank_bar 1.82, vibration
-14.03, flow_rate 10.80 and flow_total 1.56 bits a value, all fixed point;
-tank_psi 48.87 and random 59.10, byte-stream split.
+compresses fixed point, Gorilla's XOR encoding of the 64-bit patterns,
+byte-stream split, the packed bit delta and ALP_rd for real and keeps the
+smallest. With ZSTD, from `build/type-bench`: hdd_temp 0.88, cpu_temp 3.10,
+tank_bar 1.82, vibration 14.03, flow_rate 10.80 and flow_total 1.56 bits a
+value, all fixed point; tank_psi 46.51, packed bit delta (byte split took
+48.87); random 56.29, ALP_rd (byte split took 59.10).
+
+**ALP_rd for float64** (src/codec_alp.c) is the paper's: the high 1 to 16
+bits (sign, exponent, a few mantissa bits) are dictionary coded, up to 8
+entries at 0 to 3 bits an index, and the low 48 to 63 bits packed as they
+are, the cut chosen on a sample of 256 values; high parts missing from the
+dictionary are exceptions (u16 position, u16 high part). For doubles that
+are random in their mantissa only the exponent repeats, and ALP_rd stores it
+in about 3 bits where byte split and ZSTD leave nearly 8. It loses on the
+smooth psi values (50.53 against 46.51 for the bit delta), so AUTO's
+comparison decides.
+
+Block kinds name the transform; for kinds that exist at both widths (ALP_rd,
+the packed bit delta) the series' type, which lives in the SERIES dictionary,
+gives the width.
 
 **int64, bool and state codes**: zigzag deltas bit-packed per vector of 1024
 values. Counters, codes that rarely change and flags come down to a few bits a

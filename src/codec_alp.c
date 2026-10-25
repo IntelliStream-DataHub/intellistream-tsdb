@@ -224,13 +224,13 @@ int alp_decode(const uint8_t *in, size_t len, size_t n, float *out)
 size_t alprd_bound(size_t n) { return RD_HDR + n * 4 + n * 4 + 16; }
 
 /* Most frequent high parts of a sample for split r; returns the estimated bits. */
-static double rd_plan(const uint32_t *in, size_t n, size_t stride, int r, uint16_t *dict, int *ndict)
+static double rd_plan(const void *in, int width, size_t n, size_t stride, int r, uint16_t *dict, int *ndict)
 {
     uint16_t vals[512];
     uint32_t cnt[512];
     size_t nv = 0, m = 0;
     for (size_t i = 0; i < n; i += stride, m++) {
-        uint16_t left = (uint16_t)(in[i] >> r);
+        uint16_t left = (uint16_t)(width == 4 ? ((const uint32_t *)in)[i] >> r : ((const uint64_t *)in)[i] >> r);
         size_t k = 0;
         while (k < nv && vals[k] != left)
             k++;
@@ -261,7 +261,7 @@ static double rd_plan(const uint32_t *in, size_t n, size_t stride, int r, uint16
     }
     *ndict = nd;
     int b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
-    return (double)m * (r + b) + (double)(m - covered) * 32;
+    return (double)m * (r + b) + (double)(m - covered) * 32; /* an exception: u16 position, u16 high part */
 }
 
 size_t alprd_encode(const uint32_t *in, size_t n, uint8_t *out)
@@ -274,7 +274,7 @@ size_t alprd_encode(const uint32_t *in, size_t n, uint8_t *out)
     double best = INFINITY;
     for (int r = 16; r <= 31; r++) { /* the high part keeps 1 to 16 bits */
         int n2;
-        double c = rd_plan(in, n, stride, r, d2, &n2);
+        double c = rd_plan(in, 4, n, stride, r, d2, &n2);
         if (c < best) {
             best = c;
             best_r = r;
@@ -361,6 +361,123 @@ int alprd_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
         if (pos >= n)
             return TSDB_ERR_CORRUPT;
         out[pos] = ((uint32_t)lv << r) | (out[pos] & ((1u << r) - 1));
+    }
+    return 0;
+}
+
+/*
+ * ALP_rd for float64, as the paper has it: the high part keeps 1 to 16 bits
+ * (the sign, the exponent and a few mantissa bits: a cut at 48 to 63), the
+ * low 48 to 63 bits are packed as they are. For random-looking doubles, where
+ * byte split and XOR find next to nothing, the dictionary still takes the
+ * exponent's few values down to 0-3 bits.
+ *
+ *   u8 r | u8 b | u8 ndict | u8 0 | u16 dict[8] | u32 nexc | packed indexes (b bits) |
+ *   packed low parts (r bits) | nexc x (u16 position, u16 high part)
+ */
+#define RD64_MAX_N 65536 /* u16 positions: a granule's rows */
+
+size_t alprd64_bound(size_t n) { return RD_HDR + n / 2 + 8 + n * 8 + 8 + n * 4 + 16; }
+
+size_t alprd64_encode(const uint64_t *in, size_t n, uint8_t *out)
+{
+    if (n == 0 || n > RD64_MAX_N)
+        return 0;
+    size_t stride = n > 256 ? n / 256 : 1;
+    int best_r = 63, nd = 0;
+    uint16_t dict[RD_DICT], d2[RD_DICT];
+    double best = INFINITY;
+    for (int r = 48; r <= 63; r++) {
+        int n2;
+        double c = rd_plan(in, 8, n, stride, r, d2, &n2);
+        if (c < best) {
+            best = c;
+            best_r = r;
+            nd = n2;
+            memcpy(dict, d2, sizeof dict);
+        }
+    }
+    int r = best_r, b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
+    uint32_t *idx = malloc(n * sizeof *idx);
+    uint64_t *right = malloc(n * sizeof *right);
+    uint8_t *exc = malloc(n * 4);
+    if (!idx || !right || !exc) {
+        free(idx);
+        free(right);
+        free(exc);
+        return 0;
+    }
+    uint32_t nexc = 0;
+    const uint64_t low = (1ull << r) - 1;
+    for (size_t i = 0; i < n; i++) {
+        uint16_t left = (uint16_t)(in[i] >> r);
+        int k = 0;
+        while (k < nd && dict[k] != left)
+            k++;
+        if (k == nd) {
+            uint16_t pos16 = (uint16_t)i, lv = left;
+            memcpy(exc + 4 * nexc, &pos16, 2);
+            memcpy(exc + 4 * nexc + 2, &lv, 2);
+            nexc++;
+            k = 0;
+        }
+        idx[i] = (uint32_t)k;
+        right[i] = in[i] & low;
+    }
+    out[0] = (uint8_t)r;
+    out[1] = (uint8_t)b;
+    out[2] = (uint8_t)nd;
+    out[3] = 0;
+    memset(out + 4, 0, 16);
+    memcpy(out + 4, dict, (size_t)nd * 2);
+    store32(out + 20, nexc);
+    uint8_t *o = out + RD_HDR;
+    pack(idx, n, b, o);
+    o += packed_bytes(n, b);
+    pack64(right, n, r, o);
+    o += packed_bytes(n, r);
+    memcpy(o, exc, (size_t)nexc * 4);
+    o += (size_t)nexc * 4;
+    free(idx);
+    free(right);
+    free(exc);
+    return (size_t)(o - out);
+}
+
+int alprd64_decode(const uint8_t *in, size_t len, size_t n, uint64_t *out)
+{
+    if (n == 0)
+        return 0;
+    if (len < RD_HDR)
+        return TSDB_ERR_CORRUPT;
+    int r = in[0], b = in[1], nd = in[2];
+    uint16_t dict[RD_DICT];
+    memcpy(dict, in + 4, 16);
+    uint32_t nexc = load32(in + 20);
+    size_t pi = packed_bytes(n, b), pr = packed_bytes(n, r);
+    if (r < 48 || r > 63 || b > 3 || nd > RD_DICT || nexc > n || len != RD_HDR + pi + pr + (size_t)nexc * 4)
+        return TSDB_ERR_CORRUPT;
+    uint32_t *idx = malloc(n * sizeof *idx);
+    if (!idx)
+        return TSDB_ERR_NOMEM;
+    const uint8_t *p = in + RD_HDR;
+    unpack(p, n, b, idx);
+    unpack64(p + pi, n, r, out); /* the low parts, high parts OR'd in below */
+    uint64_t left[RD_DICT];
+    for (int k = 0; k < RD_DICT; k++)
+        left[k] = k < nd ? (uint64_t)dict[k] << r : 0;
+    for (size_t i = 0; i < n; i++)
+        out[i] |= left[idx[i] & (RD_DICT - 1)];
+    free(idx);
+    const uint8_t *x = p + pi + pr;
+    const uint64_t low = (1ull << r) - 1;
+    for (uint32_t j = 0; j < nexc; j++) {
+        uint16_t pos, lv;
+        memcpy(&pos, x + 4 * j, 2);
+        memcpy(&lv, x + 4 * j + 2, 2);
+        if (pos >= n)
+            return TSDB_ERR_CORRUPT;
+        out[pos] = ((uint64_t)lv << r) | (out[pos] & low);
     }
     return 0;
 }

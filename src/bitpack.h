@@ -68,6 +68,77 @@ static inline void unpack(const uint8_t *in, size_t n, int w, uint32_t *out)
         unpack_fn[w](in, n, out);
 }
 
+/* Values of w bits, w up to 64, in the same LSB-first stream as pack(); writes
+ * packed_bytes(n, w) bytes plus up to 7 of padding. */
+static inline void pack64(const uint64_t *in, size_t n, int w, uint8_t *out)
+{
+    if (!w)
+        return;
+    uint64_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t v = in[i];
+        acc |= v << bits; /* bits < 64 */
+        bits += w;
+        if (bits >= 64) {
+            memcpy(out, &acc, 8);
+            out += 8;
+            bits -= 64;
+            acc = bits ? v >> (w - bits) : 0; /* the part of v that did not fit; w - bits is 1..63 */
+        }
+    }
+    if (bits > 0)
+        memcpy(out, &acc, 8);
+}
+
+/* One 8-byte load per value, and a ninth byte when the value straddles it
+ * (only possible beyond 57 bits). Reads up to 7 bytes past the packed data. */
+#define UNPACK64_W(W)                                                                   \
+    static inline void unpack64_##W(const uint8_t *in, size_t n, uint64_t *out)         \
+    {                                                                                   \
+        const uint64_t mask = (W) == 64 ? ~0ull : ((1ull << ((W) & 63)) - 1);          \
+        for (size_t i = 0; i < n; i++) {                                                \
+            uint64_t bit = (uint64_t)i * (W), x;                                        \
+            unsigned s = (unsigned)(bit & 7);                                           \
+            const uint8_t *p = in + (bit >> 3);                                         \
+            memcpy(&x, p, 8);                                                           \
+            x >>= s;                                                                    \
+            if ((W) > 57 && (W) + s > 64)                                               \
+                x |= (uint64_t)p[8] << ((64 - s) & 63);                                 \
+            out[i] = x & mask;                                                          \
+        }                                                                               \
+    }
+UNPACK64_W(1) UNPACK64_W(2) UNPACK64_W(3) UNPACK64_W(4) UNPACK64_W(5) UNPACK64_W(6) UNPACK64_W(7) UNPACK64_W(8)
+UNPACK64_W(9) UNPACK64_W(10) UNPACK64_W(11) UNPACK64_W(12) UNPACK64_W(13) UNPACK64_W(14) UNPACK64_W(15)
+UNPACK64_W(16) UNPACK64_W(17) UNPACK64_W(18) UNPACK64_W(19) UNPACK64_W(20) UNPACK64_W(21) UNPACK64_W(22)
+UNPACK64_W(23) UNPACK64_W(24) UNPACK64_W(25) UNPACK64_W(26) UNPACK64_W(27) UNPACK64_W(28) UNPACK64_W(29)
+UNPACK64_W(30) UNPACK64_W(31) UNPACK64_W(32) UNPACK64_W(33) UNPACK64_W(34) UNPACK64_W(35) UNPACK64_W(36)
+UNPACK64_W(37) UNPACK64_W(38) UNPACK64_W(39) UNPACK64_W(40) UNPACK64_W(41) UNPACK64_W(42) UNPACK64_W(43)
+UNPACK64_W(44) UNPACK64_W(45) UNPACK64_W(46) UNPACK64_W(47) UNPACK64_W(48) UNPACK64_W(49) UNPACK64_W(50)
+UNPACK64_W(51) UNPACK64_W(52) UNPACK64_W(53) UNPACK64_W(54) UNPACK64_W(55) UNPACK64_W(56) UNPACK64_W(57)
+UNPACK64_W(58) UNPACK64_W(59) UNPACK64_W(60) UNPACK64_W(61) UNPACK64_W(62) UNPACK64_W(63) UNPACK64_W(64)
+
+static void (*const unpack64_fn[65])(const uint8_t *, size_t, uint64_t *) = {
+    NULL,        unpack64_1,  unpack64_2,  unpack64_3,  unpack64_4,  unpack64_5,  unpack64_6,  unpack64_7,
+    unpack64_8,  unpack64_9,  unpack64_10, unpack64_11, unpack64_12, unpack64_13, unpack64_14, unpack64_15,
+    unpack64_16, unpack64_17, unpack64_18, unpack64_19, unpack64_20, unpack64_21, unpack64_22, unpack64_23,
+    unpack64_24, unpack64_25, unpack64_26, unpack64_27, unpack64_28, unpack64_29, unpack64_30, unpack64_31,
+    unpack64_32, unpack64_33, unpack64_34, unpack64_35, unpack64_36, unpack64_37, unpack64_38, unpack64_39,
+    unpack64_40, unpack64_41, unpack64_42, unpack64_43, unpack64_44, unpack64_45, unpack64_46, unpack64_47,
+    unpack64_48, unpack64_49, unpack64_50, unpack64_51, unpack64_52, unpack64_53, unpack64_54, unpack64_55,
+    unpack64_56, unpack64_57, unpack64_58, unpack64_59, unpack64_60, unpack64_61, unpack64_62, unpack64_63,
+    unpack64_64};
+
+static inline void unpack64(const uint8_t *in, size_t n, int w, uint64_t *out)
+{
+    if (w == 0)
+        memset(out, 0, n * sizeof *out);
+    else
+        unpack64_fn[w](in, n, out);
+}
+
+static inline int bits_for64(uint64_t x) { return x ? 64 - __builtin_clzll(x) : 0; }
+
 /*
  * In place: z[i], a zigzag delta, becomes the sum of the decoded deltas
  * z[0..i] modulo 2^32; returns the sum of all n. Four lanes at a time (a
@@ -99,6 +170,31 @@ static inline uint32_t zz_prefix32(uint32_t *z, size_t n)
 #endif
     for (; i < n; i++) {
         acc += (z[i] >> 1) ^ (0u - (z[i] & 1));
+        z[i] = acc;
+    }
+    return acc;
+}
+
+/* As zz_prefix32 for 64-bit zigzags, two lanes at a time, modulo 2^64. */
+static inline uint64_t zz_prefix64(uint64_t *z, size_t n)
+{
+    uint64_t acc = 0;
+    size_t i = 0;
+#if defined(__SSE2__)
+    const __m128i one = _mm_set1_epi64x(1), zero = _mm_setzero_si128();
+    __m128i carry = zero;
+    for (; i + 2 <= n; i += 2) {
+        __m128i x = _mm_loadu_si128((const __m128i *)(const void *)(z + i));
+        x = _mm_xor_si128(_mm_srli_epi64(x, 1), _mm_sub_epi64(zero, _mm_and_si128(x, one)));
+        x = _mm_add_epi64(x, _mm_slli_si128(x, 8));
+        x = _mm_add_epi64(x, carry);
+        _mm_storeu_si128((__m128i *)(void *)(z + i), x);
+        carry = _mm_unpackhi_epi64(x, x);
+    }
+    acc = (uint64_t)_mm_cvtsi128_si64(carry);
+#endif
+    for (; i < n; i++) {
+        acc += (z[i] >> 1) ^ (0ull - (z[i] & 1));
         z[i] = acc;
     }
     return acc;

@@ -26,6 +26,8 @@ static const char *kind_name(int k)
     case BLK_XOR64: return "gorilla";
     case BLK_BYTESPLIT64: return "bytesplit";
     case BLK_INT: return "int-bp";
+    case BLK_DELTA_BP: return "bit-delta";
+    case BLK_ALPRD: return "alp_rd";
     default: return "?";
     }
 }

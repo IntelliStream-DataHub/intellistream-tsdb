@@ -97,6 +97,9 @@ static int alpx_d(const uint8_t *in, size_t len, size_t n, float *o)
 static size_t dbp_e(const float *in, size_t n, uint8_t *o) { return decimal_bp_encode(in, n, o); }
 static int dbp_d(const uint8_t *in, size_t len, size_t n, float *o) { return decimal_bp_decode(in, len, n, o); }
 
+static size_t dbd_e(const float *in, size_t n, uint8_t *o) { return delta_bp32_encode((const uint32_t *)in, n, o); }
+static int dbd_d(const uint8_t *in, size_t len, size_t n, float *o) { return delta_bp32_decode(in, len, n, (uint32_t *)o); }
+
 static size_t dec_e(const float *in, size_t n, uint8_t *o) { return decimal_encode(in, n, o); }
 static int dec_d(const uint8_t *in, size_t len, size_t n, float *o) { return decimal_decode(in, len, n, o); }
 
@@ -117,7 +120,7 @@ static const codec codecs[] = {
     {"gorilla", gorilla_e, gorilla_d},  {"chimp", chimp_e, chimp_d},     {"chimp128", chimp128_e, chimp128_d},
     {"patas", patas_e, patas_d},        {"alp", alp_e, alp_d},           {"alp_rd", alprd_e, alprd_d},
     {"alp|rd", alpx_e, alpx_d},         {"decimal", dec_e, dec_d},       {"dec-bp", dbp_e, dbp_d},
-    {"auto", auto_e, auto_d},
+    {"bitdelta", dbd_e, dbd_d},         {"auto", auto_e, auto_d},
 };
 #define NC (sizeof codecs / sizeof *codecs)
 
@@ -133,6 +136,7 @@ static result run(const codec *c, const float *v, int zlevel, ZSTD_CCtx *cc, ZST
     if (self_zstd)
         zlevel = 0;
     size_t cap = MAX(MAX(block_bound(GR), decimal_bp_bound(GR)), MAX(alp_bound(GR), alprd_bound(GR))) + 64;
+    cap = MAX(cap, delta_bp32_bound(GR) + 64);
     uint8_t *inner = calloc(1, cap + BLK_SLACK), *z = calloc(1, ZSTD_compressBound(cap) + BLK_SLACK);
     uint8_t **blocks = calloc(NGR, sizeof *blocks);
     size_t *blen = calloc(NGR, sizeof *blen), *ilen = calloc(NGR, sizeof *ilen);

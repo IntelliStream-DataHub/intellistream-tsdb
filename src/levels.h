@@ -71,6 +71,15 @@
     X(size_t, alprd_bound, (size_t n), (n))                                                                   \
     X(size_t, alprd_encode, (const uint32_t *in, size_t n, uint8_t *out), (in, n, out))                       \
     X(int, alprd_decode, (const uint8_t *in, size_t len, size_t n, uint32_t *out), (in, len, n, out))         \
+    X(size_t, alprd64_bound, (size_t n), (n))                                                                 \
+    X(size_t, alprd64_encode, (const uint64_t *in, size_t n, uint8_t *out), (in, n, out))                     \
+    X(int, alprd64_decode, (const uint8_t *in, size_t len, size_t n, uint64_t *out), (in, len, n, out))       \
+    X(size_t, delta_bp32_bound, (size_t n), (n))                                                              \
+    X(size_t, delta_bp32_encode, (const uint32_t *in, size_t n, uint8_t *out), (in, n, out))                  \
+    X(int, delta_bp32_decode, (const uint8_t *in, size_t len, size_t n, uint32_t *out), (in, len, n, out))    \
+    X(size_t, delta_bp64_bound, (size_t n), (n))                                                              \
+    X(size_t, delta_bp64_encode, (const uint64_t *in, size_t n, uint8_t *out), (in, n, out))                  \
+    X(int, delta_bp64_decode, (const uint8_t *in, size_t len, size_t n, uint64_t *out), (in, len, n, out))    \
     X(size_t, decimal_bound, (size_t n), (n))                                                                 \
     X(size_t, decimal_encode, (const float *in, size_t n, uint8_t *out), (in, n, out))                        \
     X(int, decimal_decode, (const uint8_t *in, size_t len, size_t n, float *out), (in, len, n, out))          \

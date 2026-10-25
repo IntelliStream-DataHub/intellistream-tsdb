@@ -688,6 +688,74 @@ int bytesplit_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
     return 0;
 }
 
+/*
+ * Packed bit delta (BLK_DELTA_BP): zigzag deltas of the raw bit patterns,
+ * bit-packed per vector of 1024 like decimal_bp's integers. For values that
+ * are not decimals but move smoothly (a reading converted to other units and
+ * left unrounded): neighbours share sign, exponent and the top of the
+ * mantissa, so their difference is narrow where XOR (Chimp) still pays for a
+ * window of changed bits on every value. delta32 is the same difference left
+ * whole for ZSTD; packing to the vector's width does better and decodes
+ * without an entropy decoder. Values that are not smooth widen the vectors
+ * to 32 bits and lose: AUTO compares it with the others.
+ *
+ *   u32 first | per vector of up to 1024 deltas: u8 bits (0..32), packed zigzags
+ */
+#define DBP32_VEC 1024
+
+size_t delta_bp32_bound(size_t n) { return 4 + (n / DBP32_VEC + 1) + 4 * n + 4; }
+
+size_t delta_bp32_encode(const uint32_t *in, size_t n, uint8_t *out)
+{
+    if (n == 0)
+        return 0;
+    store32(out, in[0]);
+    uint8_t *o = out + 4;
+    uint32_t z[DBP32_VEC];
+    for (size_t v0 = 1; v0 < n; v0 += DBP32_VEC) {
+        size_t nv = MIN((size_t)DBP32_VEC, n - v0);
+        uint32_t all = 0;
+        for (size_t i = 0; i < nv; i++) {
+            uint32_t d = in[v0 + i] - in[v0 + i - 1]; /* wraps; the decoder's sum wraps back */
+            z[i] = (d << 1) ^ (uint32_t)((int32_t)d >> 31);
+            all |= z[i];
+        }
+        int w = bits_for(all);
+        *o++ = (uint8_t)w;
+        pack(z, nv, w, o);
+        o += packed_bytes(nv, w);
+    }
+    return (size_t)(o - out);
+}
+
+int delta_bp32_decode(const uint8_t *in, size_t len, size_t n, uint32_t *out)
+{
+    if (n == 0)
+        return 0;
+    if (len < 4)
+        return TSDB_ERR_CORRUPT;
+    uint32_t prev = load32(in);
+    out[0] = prev;
+    const uint8_t *p = in + 4, *end = in + len;
+    uint32_t z[DBP32_VEC];
+    for (size_t v0 = 1; v0 < n; v0 += DBP32_VEC) {
+        size_t nv = MIN((size_t)DBP32_VEC, n - v0);
+        if (p >= end || *p > 32)
+            return TSDB_ERR_CORRUPT;
+        int w = *p++;
+        size_t pb = packed_bytes(nv, w);
+        if ((size_t)(end - p) < pb)
+            return TSDB_ERR_CORRUPT;
+        unpack(p, nv, w, z);
+        p += pb;
+        uint32_t total = zz_prefix32(z, nv); /* modulo 2^32, as the encoder's differences */
+        for (size_t i = 0; i < nv; i++)
+            out[v0 + i] = prev + z[i];
+        prev += total;
+    }
+    return p == end ? 0 : TSDB_ERR_CORRUPT;
+}
+
 /* ------------------------------------------------ timestamps with jitter */
 /*
  * DoubleDelta is ideal for a regular clock, but i.i.d. jitter doubles in
@@ -878,12 +946,13 @@ static size_t inner_bound(int kind, size_t n)
     case BLK_BYTESPLIT: return 4 * n;
     case BLK_TS_GRID:
     case BLK_TS_DELTA: return tsfor_bound(n);
-    case BLK_ALPRD: return alprd_bound(n);
+    case BLK_ALPRD: return MAX(alprd_bound(n), alprd64_bound(n)); /* by type: float32 or float64 */
     case BLK_DECIMAL_BP: return decimal_bp_bound(n);
     case BLK_F64_DECIMAL: return f64_decimal_bound(n);
     case BLK_XOR64: return xor64_bound(n);
     case BLK_BYTESPLIT64: return 8 * n;
     case BLK_INT: return int_bp_bound(n);
+    case BLK_DELTA_BP: return MAX(delta_bp32_bound(n), delta_bp64_bound(n));
     default: return 0;
     }
 }
@@ -893,6 +962,7 @@ size_t block_bound(size_t n)
     size_t inner = MAX(MAX(MAX(dd_bound(n), tsfor_bound(n)), chimp_bound(n)), MAX(gorilla_bound(n), decimal_bound(n)));
     inner = MAX(inner, MAX(alprd_bound(n), decimal_bp_bound(n)));
     inner = MAX(inner, MAX(MAX(f64_decimal_bound(n), xor64_bound(n)), MAX(8 * n, int_bp_bound(n))));
+    inner = MAX(inner, MAX(alprd64_bound(n), MAX(delta_bp32_bound(n), delta_bp64_bound(n))));
     return 5 + ZSTD_compressBound(inner);
 }
 
@@ -961,6 +1031,7 @@ static size_t encode_f32_kind(codec_ctx *c, int kind, const float *v, size_t n)
     case BLK_BYTESPLIT: return bytesplit_encode((const uint32_t *)v, n, c->scratch);
     case BLK_ALPRD: return alprd_encode((const uint32_t *)v, n, c->scratch);
     case BLK_DECIMAL_BP: return decimal_bp_encode(v, n, c->scratch);
+    case BLK_DELTA_BP: return delta_bp32_encode((const uint32_t *)v, n, c->scratch);
     default: return 0;
     }
 }
@@ -1035,13 +1106,14 @@ static double entropy_words(const uint8_t *p, size_t len, size_t width)
  *  - values that are fixed point (decimal or binary scale, a few exceptions
  *    allowed): bit-packed zigzag deltas of the integers, with ZSTD on top when
  *    it helps. This won on every such sensor stream measured.
- *  - anything else: Chimp, bit delta, byte-stream split or ALP_rd. Cheap
- *    entropy estimates shortlist three, all three are compressed, the smallest
- *    stays (docs/design.md, "How AUTO picks").
+ *  - anything else: Chimp, bit delta (whole, for ZSTD, or packed), byte-stream
+ *    split or ALP_rd. Cheap entropy estimates shortlist three, all three are
+ *    compressed, the smallest stays (docs/design.md, "How AUTO picks").
  */
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(chimp_bound(n), gorilla_bound(n)), MAX(alprd_bound(n), decimal_bp_bound(n)));
+    need = MAX(need, delta_bp32_bound(n));
     if (codec_scratch_reserve(c, need) != 0)
         return 0;
     if (value_codec == TSDB_VALUES_GORILLA || value_codec == TSDB_VALUES_CHIMP) {
@@ -1052,7 +1124,7 @@ size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v
     if (inner && inner * 8 <= 16 * n) /* compact fixed point: nothing else came close */
         return block_wrap(c, level, BLK_DECIMAL_BP, inner, out);
     /* every float32 is "decimal" at ~8 digits; then it is just one more candidate */
-    static const int kinds[] = {BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DECIMAL_BP};
+    static const int kinds[] = {BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DECIMAL_BP, BLK_DELTA_BP};
     enum { NK = sizeof kinds / sizeof *kinds };
     double est[NK];
     for (size_t k = 0; k < NK; k++) {
@@ -1154,6 +1226,7 @@ int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, flo
     case BLK_BYTESPLIT: return bytesplit_decode(p, plen, n, (uint32_t *)out);
     case BLK_ALPRD: return alprd_decode(p, plen, n, (uint32_t *)out);
     case BLK_DECIMAL_BP: return decimal_bp_decode(p, plen, n, out);
+    case BLK_DELTA_BP: return delta_bp32_decode(p, plen, n, (uint32_t *)out);
     default: return TSDB_ERR_CORRUPT;
     }
 }
