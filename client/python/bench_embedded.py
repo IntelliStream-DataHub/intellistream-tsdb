@@ -5,7 +5,7 @@ tsdb_client.Db (the engine in this process, no tsdbd).
     python bench_embedded.py --dir /data/emb --load /data/x.rowbinary [--threads 4] [--batch 1000000] [--zstd 1]
         [--no-fsync] [--optimize]
     python bench_embedded.py --dir /data/emb --qps THREADS [--series 100] [--points 1000000] [--seconds 3]
-        [--query-threads N]
+        [--query-threads N] [--many N]
 
 --load wipes --dir, creates the series under tsdb-bench's names (ids in file order), and has each of --threads
 writers (Python threads: Db releases the GIL while the engine works) insert one contiguous slice of the file's rows
@@ -18,6 +18,10 @@ threads sharing one Db, --seconds per class: the same generator, seeds and windo
 come back as numpy arrays and are only counted; aggregates are counted from the returned buckets. The threads share
 the GIL outside the engine, as in bench_query.py. Both modes print tsdb-bench's lines and a RESULT line (client
 embedded-python...) for bench/clients/run.sh. Needs numpy.
+
+--many N asks the same windows N at a time with query_raw_many / query_agg_many (client embedded-python-batch):
+each of the THREADS Python threads draws N windows, and one call runs them on every CPU with the GIL released.
+THREADS then counts the Python threads calling, not the threads that run the queries.
 """
 
 import argparse
@@ -144,6 +148,8 @@ def load(a):
 
 def querier(db, a, klass, thread, out, errors):
     """One thread's queries of one class for --seconds (tools/tsdb-bench.c qw_loop)."""
+    if a.many:
+        return batch_querier(db, a, klass, thread, out, errors)
     try:
         _, _, agg, window, bucket = klass
         r = bc.seed(thread)
@@ -158,8 +164,30 @@ def querier(db, a, klass, thread, out, errors):
                     if len(v):
                         float(v[-1])  # touch the data, as tsdb-bench does
                 else:
-                    rows += sum(b.count for b in db.query_agg(s, start, end, bucket * bc.step_ms(s)))
+                    rows += int(db.query_agg(s, start, end, bucket * bc.step_ms(s)).count.sum())
                 queries += 1
+        out.append((queries, rows, time.perf_counter() - t0))
+    except Exception as e:  # noqa: BLE001 - reported by the main thread
+        errors.append(e)
+
+
+def batch_querier(db, a, klass, thread, out, errors):
+    """As querier(), --many windows per call."""
+    try:
+        _, _, agg, window, bucket = klass
+        r = bc.seed(thread)
+        queries = rows = 0
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < a.seconds:
+            r, s, start, end, interval = bc.batch(r, a.many, a.series, a.points, window, bucket)
+            if not agg:
+                for ts, v in db.query_raw_many(s, start, end):
+                    rows += len(ts)
+                    if len(v):
+                        float(v[-1])
+            else:
+                rows += int(db.query_agg_many(s, start, end, interval).buckets.count.sum())
+            queries += a.many
         out.append((queries, rows, time.perf_counter() - t0))
     except Exception as e:  # noqa: BLE001 - reported by the main thread
         errors.append(e)
@@ -182,7 +210,8 @@ def qps(a):
             sys.exit(f"query: {errors[0]}")
         rows = sum(o[1] for o in out)
         secs = max(o[2] for o in out)
-        bc.report_query("embedded-python", klass, a.qps, sum(o[0] for o in out), rows, secs, bc.cpu_s() - cpu0, "thr")
+        name = "embedded-python-batch" if a.many else "embedded-python"
+        bc.report_query(name, klass, a.qps, sum(o[0] for o in out), rows, secs, bc.cpu_s() - cpu0, "thr")
         if rows == 0:
             print(f"qps: class {klass[0]} returned no rows: the database is empty or does not hold the data set",
                   file=sys.stderr)
@@ -205,8 +234,9 @@ def main():
     p.add_argument("--points", type=int, default=1_000_000)
     p.add_argument("--seconds", type=float, default=3.0)
     p.add_argument("--query-threads", type=int, default=0)
+    p.add_argument("--many", type=int, default=0)
     a = p.parse_args()
-    if (not a.load and a.qps < 1) or a.threads < 1 or a.batch < 1 or a.series < 1:
+    if (not a.load and a.qps < 1) or a.threads < 1 or a.batch < 1 or a.series < 1 or a.many < 0:
         p.error("give --load FILE or --qps THREADS; counts must be positive")
     sys.exit(0 if (load(a) if a.load else qps(a)) else 1)
 
