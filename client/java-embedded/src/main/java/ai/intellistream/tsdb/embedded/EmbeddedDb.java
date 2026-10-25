@@ -17,6 +17,7 @@ import ai.intellistream.tsdb.ValuesConsumer;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SegmentAllocator;
 import java.lang.invoke.MethodHandles;
 import java.nio.file.Path;
 import java.time.ZoneOffset;
@@ -75,6 +76,7 @@ public final class EmbeddedDb implements AutoCloseable {
     /* Read: a call is using the handle; write: close. Close cannot free the engine under a running call. */
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     private MemorySegment db; /* NULL once closed */
+    private final Scratch.Pool scratch = new Scratch.Pool(); /* native copies of inserted arrays */
 
     private EmbeddedDb(String dir, MemorySegment db) {
         this.dir = dir;
@@ -152,6 +154,7 @@ public final class EmbeddedDb implements AutoCloseable {
                 return;
             MemorySegment d = db;
             db = null;
+            scratch.clear();
             try {
                 rc = (int) Native.CLOSE.invokeExact(d);
             } catch (Throwable t) {
@@ -573,8 +576,9 @@ public final class EmbeddedDb implements AutoCloseable {
         Objects.checkFromIndexSize(offset, length, timestamps.length);
         Objects.checkFromIndexSize(offset, length, values.length);
         MemorySegment d = enter();
+        Scratch a = scratch.take();
         int rc;
-        try (Arena a = Arena.ofConfined()) {
+        try {
             if (length == 0)
                 return;
             MemorySegment ts = a.allocateFrom(JAVA_LONG, MemorySegment.ofArray(timestamps), JAVA_LONG, offset * 8L, length);
@@ -586,6 +590,7 @@ public final class EmbeddedDb implements AutoCloseable {
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
+            scratch.give(a);
             exit();
         }
     }
@@ -618,8 +623,9 @@ public final class EmbeddedDb implements AutoCloseable {
         Objects.checkFromIndexSize(offset, length, timestamps.length);
         Objects.checkFromIndexSize(offset, length, values.length);
         MemorySegment d = enter();
+        Scratch a = scratch.take();
         int rc;
-        try (Arena a = Arena.ofConfined()) {
+        try {
             if (length == 0)
                 return;
             MemorySegment s = a.allocateFrom(JAVA_INT, MemorySegment.ofArray(series), JAVA_INT, offset * 4L, length);
@@ -632,6 +638,7 @@ public final class EmbeddedDb implements AutoCloseable {
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
+            scratch.give(a);
             exit();
         }
     }
@@ -766,12 +773,13 @@ public final class EmbeddedDb implements AutoCloseable {
         if (many != null)
             Objects.checkFromIndexSize(off, n, many.length);
         MemorySegment d = enter();
+        Scratch a = scratch.take();
         int rc;
-        try (Arena a = Arena.ofConfined()) {
+        try {
             if (n == 0)
                 return;
             MemorySegment ts = a.allocateFrom(JAVA_LONG, MemorySegment.ofArray(timestamps), JAVA_LONG, off * 8L, n);
-            MemorySegment col = a.allocate(Native.VALUES);
+            MemorySegment col = a.allocate(Native.VALUES).fill((byte) 0); /* scratch memory is not zeroed */
             col.set(JAVA_INT, 0, c.type().code());
             col.set(PTR, 8, columnValues(a, c, off, n));
             col.set(PTR, 16, validity(a, c, off, n));
@@ -787,11 +795,12 @@ public final class EmbeddedDb implements AutoCloseable {
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
+            scratch.give(a);
             exit();
         }
     }
 
-    private static MemorySegment columnValues(Arena a, Column c, int off, int n) {
+    private static MemorySegment columnValues(SegmentAllocator a, Column c, int off, int n) {
         switch (c.type()) {
         case FLOAT32: return a.allocateFrom(JAVA_FLOAT, MemorySegment.ofArray(c.floats()), JAVA_FLOAT, off * 4L, n);
         case FLOAT64: return a.allocateFrom(JAVA_DOUBLE, MemorySegment.ofArray(c.doubles()), JAVA_DOUBLE, off * 8L, n);
@@ -808,7 +817,7 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /** The validity bitmap of values {@code off .. off + n}: bit i set when known; NULL when all are. */
-    private static MemorySegment validity(Arena a, Column c, int off, int n) {
+    private static MemorySegment validity(SegmentAllocator a, Column c, int off, int n) {
         if (!c.hasNulls())
             return MemorySegment.NULL;
         BitSet nulls = c.nulls();
