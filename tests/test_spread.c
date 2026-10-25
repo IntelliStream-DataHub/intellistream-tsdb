@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 static int failures;
@@ -1073,6 +1074,163 @@ static void test_state_size(void)
     }
 }
 
+static long maxrss_mb(void)
+{
+    struct rusage u;
+    getrusage(RUSAGE_SELF, &u);
+    return u.ru_maxrss / 1024;
+}
+
+/* The buckets of a series bit for bit the same with one dense array and in chunks of `dense` buckets: aggregates
+ * and the spread, by interval, bounds and with a limit either way. */
+static void same_in_chunks(tsdb *db, uint32_t id, int64_t iv, size_t dense, const char *what)
+{
+    static int64_t bounds[NROWS];
+    size_t nbd = 0;
+    for (int64_t t = 5; t < NROWS * 10 && nbd < NROWS; t += iv * 3 + 1)
+        bounds[nbd++] = t;
+    tsdb_query_opts o = {.order = rndr(2) ? TSDB_DESC : TSDB_ASC, .limit = 1 + (size_t)rndr(50)};
+    for (int form = 0; form < 4; form++) {
+        void *r[2];
+        size_t n[2], row = form == 0 ? sizeof(tsdb_bucket) : sizeof(tsdb_spread_bucket);
+        for (int k = 0; k < 2; k++) {
+            agg_dense_buckets = k ? dense : 0;
+            switch (form) {
+            case 0: OK(tsdb_query_agg(db, id, 0, INT64_MAX, iv, (tsdb_bucket **)&r[k], &n[k])); break;
+            case 1: OK(tsdb_query_spread(db, id, 0, INT64_MAX, iv, NULL, (tsdb_spread_bucket **)&r[k], &n[k])); break;
+            case 2:
+                OK(tsdb_query_spread_bounds(db, id, 0, INT64_MAX, bounds, nbd, NULL, (tsdb_spread_bucket **)&r[k],
+                                            &n[k]));
+                break;
+            default: OK(tsdb_query_spread(db, id, 0, INT64_MAX, iv, &o, (tsdb_spread_bucket **)&r[k], &n[k]));
+            }
+        }
+        agg_dense_buckets = 0;
+        if (n[0] != n[1] || (n[0] && memcmp(r[0], r[1], n[0] * row))) {
+            fprintf(stderr, "%s, interval %lld, form %d: %zu buckets in chunks of %zu, %zu in one array, or not the "
+                            "same\n", what, (long long)iv, form, n[1], dense, n[0]);
+            failures++;
+        }
+        free(r[0]);
+        free(r[1]);
+    }
+}
+
+/* A query's memory follows the buckets that have rows, not the span between its first and last row: two rows
+ * 64 M buckets apart took 3 GB of bucket states for the aggregates and 5 GB for the spread; 4 Mi apart, the most a
+ * query may span (query.c MAX_BUCKETS), 200 and 320 MB. A span longer than one dense array is computed in chunks,
+ * with the same results bit for bit. */
+static void test_sparse_span(void)
+{
+    char dir[600];
+    tsdb *db = open_db("sparse", dir);
+    uint32_t id;
+    OK(tsdb_series_create(db, "two", TSDB_FLOAT32, NULL, &id));
+    int64_t ts[2] = {0, (4 << 20) - 1};
+    float v[2] = {1.5f, 2.5f};
+    OK(tsdb_insert_series(db, id, ts, v, 2));
+    long before = maxrss_mb();
+    for (int flushed = 0; flushed < 2; flushed++) { /* memtable rows, then one granule reaching across */
+        if (flushed)
+            OK(tsdb_flush(db));
+        tsdb_bucket *b;
+        tsdb_spread_bucket *sb;
+        size_t nb, ns;
+        OK(tsdb_query_agg(db, id, 0, INT64_MAX, 1, &b, &nb));
+        CHECK(nb == 2 && b[0].start == 0 && b[0].sum == 1.5 && b[1].start == ts[1] && b[1].count == 1);
+        free(b);
+        OK(tsdb_query_spread(db, id, 0, INT64_MAX, 1, NULL, &sb, &ns));
+        CHECK(ns == 2 && sb[1].b.start == ts[1] && sb[1].b.max == 2.5 && sb[1].range == 0);
+        free(sb);
+        tsdb_query_opts o = {.order = TSDB_DESC, .limit = 1};
+        OK(tsdb_query_spread(db, id, 0, INT64_MAX, 1, &o, &sb, &ns));
+        CHECK(ns == 1 && sb[0].b.start == ts[1]);
+        free(sb);
+    }
+    long grew = maxrss_mb() - before;
+    if (grew > 128) {
+        fprintf(stderr, "two rows 4 M buckets apart: the queries took %ld MB\n", grew);
+        failures++;
+    }
+    /* the span is still capped */
+    int64_t t3 = 4 << 20;
+    OK(tsdb_insert_series(db, id, &t3, v, 1));
+    tsdb_bucket *b;
+    size_t nb;
+    CHECK(tsdb_query_agg(db, id, 0, INT64_MAX, 1, &b, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+    CHECK(tsdb_query_agg(db, id, 0, INT64_MAX, 2, &b, &nb) == 0 && nb == 3);
+    free(b);
+
+    /* The work follows the rows too: 40 granules of 64 rows, 100 s apart, by the millisecond (3.9 M buckets).
+     * A chunk takes whole granules and ends at a gap, so the dense arrays hold about the 2560 buckets with rows,
+     * not a dense limit's worth per chunk, nor the span. The limit is 4096 buckets here: a query spans 4 Mi buckets
+     * at most, so the gaps are shorter than the default limit (699 K), within which one dense array is the plan. */
+    OK(tsdb_series_create(db, "bursts", TSDB_FLOAT32, NULL, &id));
+    enum { BURSTS = 40, BURST = 64 };
+    static int64_t bt[BURSTS * BURST];
+    static float bv[BURSTS * BURST];
+    for (int i = 0; i < BURSTS * BURST; i++)
+        bt[i] = (int64_t)(i / BURST) * 100000 + i % BURST, bv[i] = (float)i;
+    OK(tsdb_insert_series(db, id, bt, bv, BURSTS * BURST));
+    OK(tsdb_flush(db));
+    agg_dense_buckets = 4096;
+    for (int k = 0; k < 4; k++) {
+        size_t states = agg_dense_states;
+        tsdb_spread_bucket *sb = NULL;
+        tsdb_query_opts o = {k == 3 ? TSDB_DESC : TSDB_ASC, k >= 2 ? 1000 : 0};
+        b = NULL;
+        if (k == 0)
+            OK(tsdb_query_agg(db, id, INT64_MIN, INT64_MAX, 1, &b, &nb));
+        else
+            OK(tsdb_query_spread(db, id, INT64_MIN, INT64_MAX, 1, &o, &sb, &nb));
+        states = agg_dense_states - states;
+        if (states > 2 * BURSTS * BURST)
+            fprintf(stderr, "  %d bursts of %d rows, query %d: %zu bucket states\n", BURSTS, BURST, k, states);
+        CHECK(states <= 2 * BURSTS * BURST);
+        size_t want = k >= 2 ? 1000 : BURSTS * BURST, last = k == 3 ? BURSTS * BURST - 1000 : want - 1;
+        CHECK(nb == want);
+        if (nb == want && k == 0)
+            CHECK(b[0].start == 0 && b[last].start == bt[last] && b[last].sum == bv[last]);
+        if (nb == want && k > 0)
+            CHECK(sb[0].b.start == bt[k == 3 ? BURSTS * BURST - 1 : 0] && sb[nb - 1].b.start == bt[last] &&
+                  sb[nb - 1].b.count == 1);
+        free(b);
+        free(sb);
+    }
+    agg_dense_buckets = 0;
+    tsdb_close(db);
+
+    /* many granules, parts that overlap (merged), memtable rows, deletes, several threads */
+    tsdb_options opt;
+    tsdb_options_init(&opt);
+    opt.fsync = 0;
+    opt.granule_rows = 64;
+    opt.merge_threads = 0;
+    opt.query_threads = 4;
+    opt.flush_interval_ms = 600000;
+    opt.buffer_rows = 1 << 22;
+    opt.wal_max_batch_rows = 64;
+    snprintf(dir, sizeof dir, "%s/chunks", base);
+    rmrf(dir);
+    OK(tsdb_open(dir, &opt, &db));
+    static ref_series s;
+    for (int t = 0; t < NT; t++)
+        for (int shape = 0; shape < NSHAPE; shape += 2) {
+            char name[32];
+            snprintf(name, sizeof name, "c%d_%d", t, shape);
+            OK(tsdb_series_create(db, name, (tsdb_type)types[t], NULL, &id));
+            gen_series(&s, types[t], shape);
+            put_rows(db, id, &s, 0, NROWS, true, false);
+            put_rows(db, id, &s, 0, NROWS / 2, false, false);
+            put_rows(db, id, &s, NROWS / 3, NROWS, false, true);
+            OK(tsdb_delete_range(db, id, 20000, 20000 + rndr(5000)));
+            static const int64_t ivs[] = {1, 7, 640, 777};
+            for (size_t q = 0; q < sizeof ivs / sizeof ivs[0]; q++)
+                same_in_chunks(db, id, ivs[q], 1 + (size_t)rndr(ivs[q] < 100 ? 3000 : 20), name);
+        }
+    tsdb_close(db);
+}
+
 int main(int argc, char **argv)
 {
     snprintf(base, sizeof base, "%s/tsdb_spread_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
@@ -1087,6 +1245,7 @@ int main(int argc, char **argv)
     test_single_runs();
     test_random();
     test_fast_path();
+    test_sparse_span();
     test_deletes(false);
     test_deletes(true);
     free(btype);

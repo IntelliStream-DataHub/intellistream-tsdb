@@ -11,6 +11,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$here/.." && pwd)
 scratch=${1:-/tmp}
 export TSDBD="$top/bin/tsdbd"
+export TSDB_TEST_NO_CRASHFS=1 # the fault-injection shim is not shipped; make test runs that test
 fail=0
 run() {
     echo "=== $*"
