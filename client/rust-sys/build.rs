@@ -41,18 +41,13 @@ fn main() {
     let src = root.join("src");
     println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed={}", root.join("client/tsdb_calendar.c").display());
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&src)
-        .expect("read src/")
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|x| x == "c"))
-        .collect();
-    files.sort();
-    for f in &files {
+    let entries: Vec<PathBuf> = std::fs::read_dir(&src).expect("read src/").map(|e| e.unwrap().path()).collect();
+    // headers and the kernel bodies simd.c includes (*.inc) are inputs too
+    for f in entries.iter().filter(|p| p.extension().is_some_and(|x| x == "c" || x == "h" || x == "inc")) {
         println!("cargo:rerun-if-changed={}", f.display());
     }
-    for h in ["internal.h", "levels.h", "bits.h", "bitpack.h"] {
-        println!("cargo:rerun-if-changed={}", src.join(h).display());
-    }
+    let mut files: Vec<PathBuf> = entries.into_iter().filter(|p| p.extension().is_some_and(|x| x == "c")).collect();
+    files.sort();
     files.push(root.join("client/tsdb_calendar.c"));
 
     let native = env::var_os("CARGO_FEATURE_NATIVE").is_some();

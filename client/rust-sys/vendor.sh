@@ -8,5 +8,5 @@ root=$here/../..
 rm -rf "$here/csrc"
 mkdir -p "$here/csrc/include" "$here/csrc/src" "$here/csrc/client"
 cp "$root"/include/*.h "$here/csrc/include/"
-cp "$root"/src/*.c "$root"/src/*.h "$here/csrc/src/"
+cp "$root"/src/*.c "$root"/src/*.h "$root"/src/*.inc "$here/csrc/src/"
 cp "$root/client/tsdb_calendar.c" "$here/csrc/client/"
