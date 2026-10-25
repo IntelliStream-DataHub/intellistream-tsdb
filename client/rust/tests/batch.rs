@@ -1,0 +1,170 @@
+//! Batch calls: `Db::*_many` (rayon over one handle) and `Pool` (connections to tsdbd) answer
+//! exactly what the one-query calls answer, in query order, and fail with the first error.
+#![cfg(feature = "embedded")]
+
+mod common;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use common::{Server, T0, test_dir};
+use tsdb_client::{
+    AggQuery, Bucket, Client, Db, Error, InsertBatch, Options, Pool, QueryOpts, RangeQuery, Status, Target, ValueType,
+};
+
+const SERIES: u32 = 24;
+const ROWS: i64 = 5000;
+
+fn rows(s: u32) -> (Vec<i64>, Vec<f32>) {
+    let ts = (0..ROWS).map(|i| T0 + i * 1000 + i64::from(s)).collect();
+    let v = (0..ROWS).map(|i| (i * i64::from(s + 1) % 977) as f32 * 0.5).collect();
+    (ts, v)
+}
+
+/// A query per series, some over part of the range, one empty, one twice.
+fn queries() -> Vec<RangeQuery> {
+    let mut q: Vec<RangeQuery> = (0..SERIES).map(|s| RangeQuery::new(s, T0 + i64::from(s) * 77_000, T0 + 4_000_000)).collect();
+    q.push(RangeQuery::new(3, i64::MIN, i64::MAX));
+    q.push(RangeQuery::new(5, T0 - 10, T0 - 5));
+    q.push(RangeQuery::new(3, i64::MIN, i64::MAX));
+    q
+}
+
+fn data() -> Vec<(Vec<i64>, Vec<f32>)> {
+    (0..SERIES).map(rows).collect()
+}
+
+/// Half the series one insert each, the other half in one insert of a series column.
+fn batches<'a>(d: &'a [(Vec<i64>, Vec<f32>)], each: &'a (Vec<u32>, Vec<i64>, Vec<f32>)) -> Vec<InsertBatch<'a>> {
+    let mut b: Vec<InsertBatch> = (0..SERIES / 2).map(|s| InsertBatch::series(s, &d[s as usize].0, &d[s as usize].1)).collect();
+    b.push(InsertBatch::each(&each.0, &each.1, &each.2));
+    b
+}
+
+fn each_column(d: &[(Vec<i64>, Vec<f32>)]) -> (Vec<u32>, Vec<i64>, Vec<f32>) {
+    let mut c = (Vec::new(), Vec::new(), Vec::new());
+    for s in SERIES / 2..SERIES {
+        let (ts, v) = &d[s as usize];
+        c.0.extend(std::iter::repeat_n(s, ts.len()));
+        c.1.extend_from_slice(ts);
+        c.2.extend_from_slice(v);
+    }
+    c
+}
+
+fn agg(q: &[RangeQuery], interval_ms: i64) -> Vec<AggQuery> {
+    q.iter().map(|x| AggQuery::new(x.series, x.start, x.end, interval_ms)).collect()
+}
+
+fn key(b: &[Bucket]) -> String {
+    format!("{b:?}")
+}
+
+#[test]
+fn db_batches_match_single_queries() {
+    let db = Db::open(test_dir("tsdb-batch"), &Options { fsync: false, ..Default::default() }).unwrap();
+    for s in 0..SERIES {
+        assert_eq!(db.series_create(&format!("s{s}"), ValueType::Float32, None).unwrap(), s);
+    }
+    let int64 = db.series_create("i", ValueType::Int64, None).unwrap();
+    let d = data();
+    let each = each_column(&d);
+    db.insert_many(&batches(&d, &each)).unwrap();
+    db.insert_many(&[]).unwrap();
+
+    let q = queries();
+    let p = db.query_points_many(&q, QueryOpts::asc()).unwrap();
+    assert_eq!(p.len(), q.len());
+    for (i, x) in q.iter().enumerate() {
+        assert_eq!(p[i], db.query_points(x.series, x.start..x.end, QueryOpts::asc()).unwrap(), "query {i}");
+    }
+    assert_eq!(p[q.len() - 2].ts.len(), 0);
+    assert_eq!(p[q.len() - 1].ts.len() as i64, ROWS);
+    let desc = db.query_points_many(&q, QueryOpts::desc().limit(3)).unwrap();
+    assert_eq!(desc[0], db.query_points(0, q[0].start..q[0].end, QueryOpts::desc().limit(3)).unwrap());
+
+    let b = db.query_agg_many(&agg(&q, 60_000)).unwrap();
+    for (i, x) in q.iter().enumerate() {
+        assert_eq!(key(&b[i]), key(&db.query_agg(x.series, x.start..x.end, 60_000).unwrap()), "query {i}");
+    }
+    let whole = db.query_agg_many(&agg(&q, 0)).unwrap();
+    // each query its own bucket length
+    let mixed: Vec<AggQuery> = q.iter().enumerate().map(|(i, x)| AggQuery::new(x.series, x.start, x.end, i as i64 * 1000)).collect();
+    let m = db.query_agg_many(&mixed).unwrap();
+    for (i, x) in mixed.iter().enumerate() {
+        assert_eq!(key(&m[i]), key(&db.query_agg(x.series, x.start..x.end, x.interval_ms).unwrap()));
+    }
+    assert_eq!(whole[SERIES as usize][0].count, ROWS as u64);
+
+    // the first failing query's error, whatever finished first
+    let mut bad = q.clone();
+    // a raw float32 query of an int64 series fails
+    bad.insert(7, RangeQuery::new(int64, 0, 1));
+    assert!(matches!(db.query_points_many(&bad, QueryOpts::asc()), Err(Error::Server(Status::Invalid))));
+    assert!(matches!(db.query_agg_many(&[AggQuery::new(0, 0, 1, -1)]), Err(Error::Server(Status::Invalid))));
+    // an insert of the wrong type fails; the call reports it
+    let one = [1i64];
+    let r = db.insert_many(&[InsertBatch { target: Target::Series(0), ts: &one, values: (&[1i64][..]).into() }]);
+    assert!(r.is_err());
+    let dir = db.path().to_path_buf();
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn pool_batches_match_single_queries() {
+    let srv = Server::start();
+    let mut c = srv.client();
+    for s in 0..SERIES {
+        assert_eq!(c.series_create(&format!("s{s}"), ValueType::Float32, None).unwrap(), s);
+    }
+    let int64 = c.series_create("i", ValueType::Int64, None).unwrap();
+    let connects = Arc::new(AtomicUsize::new(0));
+    let (n, addr) = (connects.clone(), srv.addr());
+    let pool = Pool::with_connector(4, move || {
+        n.fetch_add(1, Ordering::Relaxed);
+        Client::connect(addr.as_str())
+    })
+    .unwrap();
+    assert_eq!((pool.size(), connects.load(Ordering::Relaxed)), (4, 4));
+    let d = data();
+    let each = each_column(&d);
+    pool.insert_many(&batches(&d, &each)).unwrap();
+
+    let q = queries();
+    let p = pool.query_points_many(&q, QueryOpts::asc()).unwrap();
+    let b = pool.query_agg_many(&agg(&q, 60_000)).unwrap();
+    assert_eq!((p.len(), b.len()), (q.len(), q.len()));
+    for (i, x) in q.iter().enumerate() {
+        assert_eq!(p[i], c.query_points(x.series, x.start..x.end, QueryOpts::asc()).unwrap(), "query {i}");
+        assert_eq!(key(&b[i]), key(&c.query_agg(x.series, x.start..x.end, 60_000).unwrap()), "query {i}");
+    }
+    let mut bad = q.clone();
+    bad.insert(3, RangeQuery::new(int64, 0, 1));
+    assert!(matches!(pool.query_points_many(&bad, QueryOpts::asc()), Err(Error::Server(Status::Invalid))));
+    // a server error leaves the connections usable: nothing reconnects
+    assert_eq!(pool.query_agg_many(&agg(&q, 0)).unwrap().len(), q.len());
+    assert_eq!(connects.load(Ordering::Relaxed), 4);
+    assert!(matches!(Pool::connect(srv.addr(), 0), Err(Error::InvalidArgument(_))));
+}
+
+#[test]
+fn pool_replaces_a_broken_connection() {
+    let mut srv = Server::start();
+    srv.client().series_create("x", ValueType::Float32, None).unwrap();
+    let addr = Arc::new(std::sync::Mutex::new(srv.addr()));
+    let a = addr.clone();
+    let pool = Pool::with_connector(2, move || Client::connect(a.lock().unwrap().as_str())).unwrap();
+    let q = [RangeQuery::new(0, i64::MIN, i64::MAX), RangeQuery::new(0, 0, 1)];
+    assert_eq!(pool.query_agg_many(&agg(&q, 0)).unwrap().len(), 2);
+    // the server goes away: the calls fail with I/O errors, and the connections are broken
+    srv.stop();
+    assert!(matches!(pool.query_agg_many(&agg(&q, 0)), Err(Error::Io(_))));
+    // another server (another port): the broken connections are replaced through the connector
+    let srv2 = Server::start();
+    srv2.client().series_create("x", ValueType::Float32, None).unwrap();
+    *addr.lock().unwrap() = srv2.addr();
+    for _ in 0..3 {
+        assert_eq!(pool.query_agg_many(&agg(&q, 0)).unwrap().len(), 2);
+    }
+}

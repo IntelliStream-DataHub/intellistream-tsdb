@@ -62,6 +62,7 @@
 //! Its dependencies are `zstd` and, on Unix, `libc` (for the TCP keepalive options).
 #![warn(missing_docs)]
 
+mod batch;
 mod calendar;
 mod client;
 mod database;
@@ -74,6 +75,7 @@ mod protocol;
 mod types;
 mod value;
 
+pub use batch::{AggQuery, InsertBatch, Pool, RangeQuery, Target};
 pub use calendar::calendar_bounds;
 pub use client::{Client, CONNECT_TIMEOUT, DEFAULT_COMPRESSION};
 pub use database::Database;
