@@ -49,7 +49,8 @@
  *               -> (nothing)
  *               values are f32, f64, i64, u8 (bool) or u32 (state codes); with
  *               flags & TSDB_VALID a bitmap follows, bit i (LSB first) set when
- *               value i is known
+ *               value i is known; a ts of INT64_MAX fails the whole batch with
+ *               TSDB_ERR_INVALID (no half-open query range reaches it)
  *   QUERY_VALUES as QUERY_RAW
  *               -> chunks: u8 last, u8 type, u8 flags, u8 0, u32 n, i64 ts[n], values[n],
  *                  [u8 valid[(n + 7) / 8] when flags & TSDB_VALID]

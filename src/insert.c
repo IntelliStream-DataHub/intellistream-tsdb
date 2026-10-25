@@ -268,7 +268,7 @@ static rec *merge_sort_recs(const eng *db, rec *a, rec *tmp, size_t n)
  * goes back in time or the key space is too sparse, and the caller falls back
  * to the radix sort. */
 static int bucket_write(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n,
-                        uint64_t wal_seq, part_list *collect)
+                        uint64_t wal_seq, part_list *collect, bool refuse)
 {
     size_t wd = type_width(type);
     uint32_t smin = UINT32_MAX, smax = 0;
@@ -279,6 +279,8 @@ static int bucket_write(eng *db, int type, const uint32_t *series, const int64_t
         tmin = ts[i] < tmin ? ts[i] : tmin;
         tmax = ts[i] > tmax ? ts[i] : tmax;
     }
+    if (refuse && tmax == TS_UNREACHABLE)
+        return TSDB_ERR_INVALID;
     int64_t pmin = floor_div(tmin, db->partition_ms), pmax = floor_div(tmax, db->partition_ms);
     uint64_t ns = (uint64_t)smax - smin + 1, np = (uint64_t)pmax - (uint64_t)pmin + 1;
     if (np > (1u << 20) || ns * np > MAX(n / 2, (size_t)65536))
@@ -342,10 +344,10 @@ static inline void gather(const rec *r, size_t n, const void *v, size_t wd, uint
 }
 
 static int sort_and_write(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v,
-                          size_t n, bool ts_sorted, uint64_t wal_seq, part_list *collect)
+                          size_t n, bool ts_sorted, uint64_t wal_seq, part_list *collect, bool refuse)
 {
     if (series) {
-        int rc = bucket_write(db, type, series, ts, v, n, wal_seq, collect);
+        int rc = bucket_write(db, type, series, ts, v, n, wal_seq, collect, refuse);
         if (rc != 1)
             return rc;
     }
@@ -369,6 +371,10 @@ static int sort_and_write(eng *db, int type, const uint32_t *series, uint32_t cs
             a[i].v = (uint32_t)i;
         tmin = MIN(tmin, ts[i]);
         tmax = MAX(tmax, ts[i]);
+    }
+    if (refuse && tmax == TS_UNREACHABLE) {
+        rc = TSDB_ERR_INVALID;
+        goto out;
     }
     int64_t pmin = floor_div(tmin, db->partition_ms), pmax = floor_div(tmax, db->partition_ms);
     uint64_t np = (uint64_t)pmax - (uint64_t)pmin + 1;
@@ -427,17 +433,24 @@ out:
     return rc;
 }
 
+/* `refuse`: the rows come from a caller, and one at TS_UNREACHABLE fails the whole insert. A flush writes what the
+ * WAL holds, as it was acknowledged (an older build accepted such rows), so it does not refuse. The checks ride on
+ * passes made anyway: the sort's minimum and maximum per chunk, and here a partition change, since only the last
+ * partition can hold TS_UNREACHABLE; a batch that reaches it (292 million years from now) is scanned once more. */
 static int insert_rows_into(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts,
-                            const void *v, size_t n, uint64_t wal_seq, part_list *collect)
+                            const void *v, size_t n, uint64_t wal_seq, part_list *collect, bool refuse)
 {
     size_t wd = type_width(type);
+    int64_t ptop = floor_div(TS_UNREACHABLE, db->partition_ms);
     bool sorted = true;
     prange r;
     prange_of(db, ts[0], &r);
+    bool top = r.p == ptop;
     for (size_t i = 1; i < n && sorted; i++) {
         if (!in_prange(&r, ts[i])) {
             int64_t prev = r.p;
             prange_of(db, ts[i], &r);
+            top |= r.p == ptop;
             if (r.p < prev)
                 sorted = false;
         } else if (series && series[i] != series[i - 1]) {
@@ -447,8 +460,12 @@ static int insert_rows_into(eng *db, int type, const uint32_t *series, uint32_t 
             sorted = false;
         }
     }
-    if (sorted)
+    if (sorted) {
+        for (size_t i = 0; refuse && top && i < n; i++)
+            if (ts[i] == TS_UNREACHABLE)
+                return TSDB_ERR_INVALID;
         return write_sorted(db, type, series, cs, ts, v, n, wal_seq, collect);
+    }
     /* chunks are written in order, so a later chunk's part is newer: last write still wins */
     for (size_t off = 0; off < n; off += SORT_CHUNK_ROWS) {
         size_t m = MIN(n - off, SORT_CHUNK_ROWS);
@@ -456,7 +473,7 @@ static int insert_rows_into(eng *db, int type, const uint32_t *series, uint32_t 
         for (size_t i = off + 1; i < off + m && ts_sorted; i++)
             ts_sorted = ts[i] >= ts[i - 1];
         int rc = sort_and_write(db, type, series ? series + off : NULL, cs, ts + off, (const uint8_t *)v + off * wd, m,
-                                ts_sorted, wal_seq, collect);
+                                ts_sorted, wal_seq, collect, refuse);
         if (rc)
             return rc;
     }
@@ -480,14 +497,14 @@ int parts_publish(eng *db, part **ps, size_t n)
  * published together. With `collect`, they are handed back pending instead,
  * for the caller to publish with parts_commit under publish_lock. */
 int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t n,
-                uint64_t wal_seq, part_list *collect)
+                uint64_t wal_seq, part_list *collect, bool refuse)
 {
     if (n == 0)
         return 0;
     if (collect)
-        return insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, collect);
+        return insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, collect, refuse);
     part_list mine = {0};
-    int rc = insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, &mine);
+    int rc = insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, &mine, refuse);
     /* their partitions, for the wait below, are read now: once published, a
      * part can be merged away and freed at any moment */
     int64_t *partitions = rc == 0 ? malloc((mine.n ? mine.n : 1) * sizeof *partitions) : NULL;

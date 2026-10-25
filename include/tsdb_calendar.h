@@ -22,13 +22,18 @@ extern "C" {
  * in the zone's standard time. Multiples count from 1970 in local time, like
  * ClickHouse's toStartOfInterval. A period runs from its first instant to the
  * next period's. *bounds is malloc'd (free it); TSDB_ERR_INVALID for an
- * unknown zone, TSDB_ERR_TOO_MANY_BUCKETS beyond 64 M periods. */
+ * unknown zone or a range beyond TSDB_CALENDAR_LIMIT_MS either side of 1970,
+ * TSDB_ERR_TOO_MANY_BUCKETS beyond 64 M periods. Zone names are at most 255
+ * bytes of [A-Za-z0-9_+-/] (no '.', no empty component); fixed offsets at
+ * most 26 hours. */
+#define TSDB_CALENDAR_LIMIT_MS (1000LL * 86400 * 366 * 200000) /* about 200,000 years */
 int tsdb_calendar_bounds(const char *zone, tsdb_unit unit, uint32_t count, int64_t start, int64_t end,
                          int64_t **bounds, size_t *n);
 
 /* Embedded: tsdb_query_group_ex with a time zone, done with the above and
  * tsdb_query_bounds. An unbounded range is cut to the series' first and last
- * rows first. */
+ * rows first; rows beyond TSDB_CALENDAR_LIMIT_MS fall into the first or the
+ * last period (the first then begins at INT64_MIN). */
 int tsdb_query_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
                            const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 /* The same for the spread (tsdb_query_spread_group, tsdb_query_spread_bounds). */

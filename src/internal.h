@@ -592,6 +592,11 @@ void parts_discard(struct eng *db, part **ps, size_t n);
 int intents_recover(struct eng *db);
 void pw_abort(part_writer *w);
 
+/* Every range is half-open with an int64 end, so a row at INT64_MAX could never be read, counted or deleted:
+   inserts refuse it (TSDB_ERR_INVALID) rather than keep a row no query reaches. A WAL written before this rule
+   may still hold one; replay and flush keep it, as the build that acknowledged it did. */
+#define TS_UNREACHABLE INT64_MAX
+
 /* ---- series dictionary ---- */
 typedef struct series_dict {
     pthread_mutex_t lock;
@@ -600,10 +605,11 @@ typedef struct series_dict {
     bool fsync;
     char **names;
     uint8_t *types; /* tsdb_type per id */
-    uint32_t cap;
+    size_t cap;
     atomic_uint count;
     uint32_t *table; /* open addressing; id + 1, 0 = empty */
-    uint32_t tcap;
+    size_t tcap;
+    uint64_t seed;   /* random per open: names chosen to collide cannot be planted (nothing persists the hash) */
     uint64_t file_off; /* bytes of SERIES already loaded */
     bool broken;       /* an append failed (under lock): the file may end in a torn record, append no more */
 } series_dict;
@@ -876,9 +882,10 @@ int merge_parts(struct eng *db, part **src, size_t k, part **out);
 void merge_commit_locked(struct eng *db, part **src, size_t k, part *out);
 
 /* insert.c: sorts (stably), keeps the last row per (series, ts), writes one
- * part per partition. Parts are published, or handed back in `collect`. */
+ * part per partition. Parts are published, or handed back in `collect`. With `refuse` (rows from a caller, not
+ * a flush of the WAL), a row at TS_UNREACHABLE fails the insert with TSDB_ERR_INVALID. */
 int insert_rows(struct eng *db, int type, const uint32_t *series, uint32_t const_series, const int64_t *ts,
-                const void *v, size_t n, uint64_t wal_seq, part_list *collect);
+                const void *v, size_t n, uint64_t wal_seq, part_list *collect, bool refuse);
 int part_list_push(part_list *l, part *p);
 int parts_publish(struct eng *db, part **ps, size_t n);
 

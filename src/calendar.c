@@ -11,6 +11,9 @@
 
 #include <stdlib.h>
 
+static int local_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group, int64_t lo,
+                        int64_t hi, int64_t **bounds, size_t *n);
+
 static int first_ts(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
 {
     (void)v;
@@ -40,7 +43,7 @@ static int group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, co
         return 0; /* no rows */
     int64_t *bounds;
     size_t n;
-    rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
+    rc = local_bounds(db, series, start, end, group, lo, hi, &bounds, &n);
     if (rc == 0)
         rc = spread ? tsdb_query_spread_bounds(db, series, start, end, bounds, n, opts, (tsdb_spread_bucket **)out,
                                                nout)
@@ -112,9 +115,39 @@ int tsdb_query_twa_group_local(tsdb *db, uint32_t series, int64_t start, int64_t
         return 0; /* nothing in range, and no segment crosses it */
     int64_t *bounds;
     size_t n;
-    rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
+    rc = local_bounds(db, series, start, end, group, lo, hi, &bounds, &n);
     if (rc == 0)
         rc = tsdb_query_twa_bounds(db, series, start, end, bounds, n, opts, out, nout);
     free(bounds);
+    return rc;
+}
+
+/* The bounds of the local periods from lo to hi (inclusive). The calendar places instants within
+ * TSDB_CALENDAR_LIMIT_MS of 1970 only, and lists every period between: an edge beyond moves in to the first (last)
+ * row within the limits, rows before them join the first period, which then begins at INT64_MIN, and rows after
+ * them the last, which runs to the end anyway. One such row used to make every grouping over an open range fail. */
+static int local_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group, int64_t lo,
+                        int64_t hi, int64_t **bounds, size_t *n)
+{
+    const int64_t lim = TSDB_CALENDAR_LIMIT_MS;
+    bool cut = lo < -lim;
+    if (cut || lo >= lim || hi < -lim || hi >= lim) {
+        int64_t ilo = 0, ihi = 0, s = start > -lim ? start : -lim, e = end < lim ? end : lim;
+        bool inner = false;
+        int rc = edge_ts(db, series, s, e, TSDB_ASC, &ilo, &inner);
+        if (rc == 0 && inner)
+            rc = edge_ts(db, series, s, e, TSDB_DESC, &ihi, &inner);
+        if (rc)
+            return rc;
+        if (lo < -lim || lo >= lim)
+            lo = inner ? ilo : (lo < -lim ? -lim : lim - 1);
+        if (hi < -lim || hi >= lim)
+            hi = inner ? ihi : lo;
+        if (hi < lo)
+            hi = lo;
+    }
+    int rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, bounds, n);
+    if (rc == 0 && cut && *n)
+        (*bounds)[0] = INT64_MIN;
     return rc;
 }

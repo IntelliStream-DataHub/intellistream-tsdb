@@ -18,6 +18,8 @@ URING_LIB ?= -luring
 LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
+# the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
+FUZZ_HARNESSES := codec part manifest wal dict volumes tz
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -91,11 +93,14 @@ $(B)/test_tsdb: tests/test_tsdb.c tests/samekeys.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_ports $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb
+test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_ports $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_crafted $(B)/test_tzfiles $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb
 	./$(B)/test_tsdb
 	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
 	./$(B)/test_damage
+	./$(B)/test_crafted
+	./$(B)/test_tzfiles
+	for h in $(FUZZ_HARNESSES); do ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 	./$(B)/test_types
 	./$(B)/test_delete
 	./$(B)/test_levels
@@ -112,6 +117,62 @@ test: $(B)/test_tsdb $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/t
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
+
+# ------------------------------------------------------------------ fuzzing
+# tests/fuzz/: one harness per decoder or loader of what lies on disk (driver.c has the details).
+# `make fuzz FUZZ_SECONDS=N [FUZZ="codec part"]` runs each for N seconds, built in build-fuzz/ with
+# ASan + UBSan and GCC's trace-pc coverage (or libFuzzer when FUZZ_CC=clang); new inputs and
+# crash-*/timeout-* files go to build-fuzz/out/<harness>/. `make test` replays the committed corpus
+# (tests/fuzz/corpus/<harness>/) through the normal build; `make asan` does so under the sanitizers.
+# Every input a run found a bug with is copied into the corpus with its fix.
+FUZZ           ?= $(FUZZ_HARNESSES)
+FUZZ_SECONDS   ?= 60
+FUZZ_B         := build-fuzz
+FUZZ_CC        ?= $(CC)
+FUZZ_SAN       := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+FUZZ_COMMON    := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off -Iinclude -Isrc -Iclient
+ifeq ($(findstring clang,$(FUZZ_CC)),clang)
+FUZZ_COV  := -fsanitize=fuzzer-no-link
+FUZZ_LINK := -fsanitize=fuzzer
+FUZZ_DRV  :=
+else
+FUZZ_COV  := -fsanitize-coverage=trace-pc
+FUZZ_LINK :=
+FUZZ_DRV  := tests/fuzz/driver.c
+endif
+
+$(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuzz/template.h src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -Iclient -o $@ $< tests/fuzz/driver.c $(LIB) $(LDLIBS)
+
+fuzz-replay: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
+	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(or $(TMPDIR),/tmp) ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
+
+ifneq ($(B),$(FUZZ_B))
+$(FUZZ_B)/libtsdb.a: FORCE
+	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH= CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@
+
+# the driver is built without coverage: it holds the hook
+$(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
+	$(FUZZ_CC) $(FUZZ_COMMON) $(FUZZ_SAN) -c -o $@ $<
+
+$(FUZZ_B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/fuzz.h tests/fuzz/template.h src/internal.h $(FUZZ_B)/libtsdb.a \
+                  $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o)
+	$(FUZZ_CC) $(FUZZ_COMMON) $(FUZZ_SAN) $(FUZZ_COV) -c -o $@.o $<
+	$(FUZZ_CC) $(FUZZ_SAN) $(FUZZ_LINK) -o $@ $@.o $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o) $(FUZZ_B)/libtsdb.a $(LDLIBS)
+
+fuzz: $(FUZZ:%=$(FUZZ_B)/fuzz-%)
+	for h in $(FUZZ); do echo "== fuzz $$h, $(FUZZ_SECONDS) s"; mkdir -p $(FUZZ_B)/out/$$h; \
+	    ASAN_OPTIONS=abort_on_error=1:detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+	    $(FUZZ_B)/fuzz-$$h $(if $(FUZZ_DRV),-t $(FUZZ_SECONDS) -o $(FUZZ_B)/out/$$h,-max_total_time=$(FUZZ_SECONDS) \
+	        -artifact_prefix=$(FUZZ_B)/out/$$h/) $(FUZZ_B)/out/$$h tests/fuzz/corpus/$$h || exit 1; done
+
+# writes each harness's generated seeds into tests/fuzz/corpus/<harness>/ (after a format change)
+fuzz-seeds: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
+	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(or $(TMPDIR),/tmp) ./$(B)/fuzz-$$h -seeds tests/fuzz/corpus/$$h || exit 1; done
+
+endif
+FORCE:
+.PHONY: fuzz fuzz-replay fuzz-seeds FORCE
 
 # Without -march=native: with it, GCC 15.2's AddressSanitizer crashes in memcpy into
 # fake-stack frames (use-after-return detection), in code that did not change.
@@ -145,7 +206,7 @@ $(B):
 	mkdir -p $(B)
 
 clean:
-	rm -rf build build-tsan $(DIST_B)
+	rm -rf build build-tsan build-fuzz $(DIST_B)
 
 # ---- portable binaries (dist/README.dist): built here, run on AlmaLinux 10 ----
 # x86-64-v2 for CPUs as old as Nehalem (no AVX needed), with the codecs also compiled for
@@ -162,7 +223,7 @@ DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tool
               CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
 DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench tsdb-bench insert-bench tsdbc-bench scale-bench
 DIST_TESTS  = test_tsdb test_types test_levels test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
-DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS))
+DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS) libcrashfs.so)
 
 DIST_SIG    = $$($(CC) --version | head -n 1) | $(CC) | $(CFLAGS) | $(subst ",,$(DIST_VARS)) | $(LV_FLAGS_v3) | $(LV_FLAGS_v4) \
               | $$(cksum <tools/glibc-compat.h)
@@ -173,7 +234,7 @@ dist:
 	    [ -d $(DIST_B) ] && echo "dist: compiler or flags changed since the last build: rebuilding $(DIST_B)"; \
 	    rm -rf $(DIST_B) && mkdir -p $(DIST_B) && printf '%s\n' "$$sig" >$(DIST_B)/.flags; \
 	fi
-	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%)
+	$(MAKE) $(DIST_VARS) all $(DIST_TESTS:%=$(DIST_B)/%) $(DIST_B)/libcrashfs.so
 	tools/check-glibc.sh -c $(GLIBC_MAX) $(DIST_FILES)
 	tools/check-isa.sh $(DIST_B) $(DIST_FILES)
 	CC="$(CC)" tools/mkdist.sh $(DIST_B)
@@ -328,6 +389,14 @@ $(B)/test_volumes: tests/test_volumes.c $(LIB)
 $(B)/test_damage: tests/test_damage.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+# Crafted files in the data directory and extreme inputs (internals: -Isrc)
+$(B)/test_crafted: tests/test_crafted.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# Crafted TZif files, rules and zone names; includes the calendar's source to see its cache
+$(B)/test_tzfiles: tests/test_tzfiles.c client/tsdb_calendar.c include/tsdb_calendar.h
+	$(CC) $(CFLAGS) -Iclient -o $@ $< -lpthread
+
 $(B)/test_types: tests/test_types.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
@@ -356,8 +425,9 @@ $(B)/test_spread: tests/test_spread.c src/internal.h $(LIB)
 $(B)/test_limits: tests/test_limits.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
+# with ARCH: in `make dist` it carries the glibc-compat header, since the tarball's test_server preloads it
 $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
-	$(CC) -O2 -g -std=gnu11 -Wall -fPIC -shared -o $@ $< -ldl -lpthread
+	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
 
 $(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)

@@ -321,7 +321,7 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
                 memcpy((uint8_t *)v + 4 * i, &x, 4);
             }
         /* in (series, ts) order; insert_rows re-sorts only when partitions interleave */
-        rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out);
+        rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false);
     }
     free(s);
     free(t);

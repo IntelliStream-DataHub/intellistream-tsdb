@@ -57,6 +57,9 @@ struct tz {
 
 static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static tz *cache;
+static size_t cache_n;
+#define MAX_CACHED_ZONES 1024 /* about 600 zones exist, and some fixed offsets */
+#define MAX_ZONE_NAME 255
 
 static int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
 {
@@ -98,26 +101,34 @@ static const char *parse_name(const char *p)
     return p - s >= 3 ? p : NULL;
 }
 
-/* [+-]hh[:mm[:ss]] -> seconds */
+/* Two digits below 60 (minutes, seconds); NULL otherwise. */
+static const char *parse_2digits(const char *p, int *v)
+{
+    if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]) || isdigit((unsigned char)p[2]))
+        return NULL;
+    *v = (p[0] - '0') * 10 + (p[1] - '0');
+    return *v < 60 ? p + 2 : NULL;
+}
+
+/* [+-]hh[:mm[:ss]] -> seconds. Hours have 1 to 3 digits up to 167 (RFC 8536 allows that much for the time of
+ * a rule's change), minutes and seconds 2 digits below 60: anything else is no offset, never an overflow. */
 static const char *parse_hms(const char *p, int32_t *out)
 {
     int sign = 1;
     if (*p == '+' || *p == '-')
         sign = *p++ == '-' ? -1 : 1;
-    if (!isdigit((unsigned char)*p))
-        return NULL;
-    int h = 0, m = 0, s = 0;
-    while (isdigit((unsigned char)*p))
+    int h = 0, m = 0, s = 0, digits = 0;
+    while (isdigit((unsigned char)*p) && digits < 4) {
         h = h * 10 + (*p++ - '0');
+        digits++;
+    }
+    if (digits == 0 || digits > 3 || h > 167)
+        return NULL;
     if (*p == ':') {
-        p++;
-        while (isdigit((unsigned char)*p))
-            m = m * 10 + (*p++ - '0');
-        if (*p == ':') {
-            p++;
-            while (isdigit((unsigned char)*p))
-                s = s * 10 + (*p++ - '0');
-        }
+        if (!(p = parse_2digits(p + 1, &m)))
+            return NULL;
+        if (*p == ':' && !(p = parse_2digits(p + 1, &s)))
+            return NULL;
     }
     *out = sign * (h * 3600 + m * 60 + s);
     return p;
@@ -127,8 +138,9 @@ static const char *parse_rule(const char *p, posix_rule *r)
 {
     if (*p != 'M')
         return NULL; /* the Jn and n forms are not used by current zones */
-    if (sscanf(p, "M%d.%d.%d", &r->month, &r->week, &r->wday) != 3)
-        return NULL;
+    if (sscanf(p, "M%d.%d.%d", &r->month, &r->week, &r->wday) != 3 || r->month < 1 || r->month > 12 ||
+        r->week < 1 || r->week > 5 || r->wday < 0 || r->wday > 6)
+        return NULL; /* rule_utc counts on these ranges */
     p++;
     while (*p && *p != '/' && *p != ',')
         p++;
@@ -197,6 +209,9 @@ static int64_t be(const uint8_t *p, int n)
     return n == 4 ? (int64_t)(int32_t)v : (int64_t)v;
 }
 
+/* A header count: unsigned, as RFC 8536 has it (be() would make 0xffffffff -1). */
+static uint64_t be_count(const uint8_t *p) { return (uint64_t)p[0] << 24 | (uint64_t)p[1] << 16 | p[2] << 8 | p[3]; }
+
 static int load_tzif(tz *z, const uint8_t *b, size_t len)
 {
     if (len < 44 || memcmp(b, "TZif", 4) != 0)
@@ -207,10 +222,12 @@ static int load_tzif(tz *z, const uint8_t *b, size_t len)
     for (int pass = 0; pass < 2; pass++) {
         if ((size_t)(h - b) + 44 > len)
             return TSDB_ERR_CORRUPT;
-        int64_t isutc = be(h + 20, 4), isstd = be(h + 24, 4), leap = be(h + 28, 4);
-        int64_t timecnt = be(h + 32, 4), typecnt = be(h + 36, 4), charcnt = be(h + 40, 4);
-        size_t body = (size_t)(timecnt * tsize + timecnt + typecnt * 6 + charcnt + leap * (tsize + 4) + isstd + isutc);
-        if ((size_t)(h - b) + 44 + body > len || typecnt <= 0)
+        /* below 2^32 each, so the sum cannot wrap in 64 bits; checked against what is left before any use */
+        uint64_t isutc = be_count(h + 20), isstd = be_count(h + 24), leap = be_count(h + 28);
+        uint64_t timecnt = be_count(h + 32), typecnt = be_count(h + 36), charcnt = be_count(h + 40);
+        uint64_t body = timecnt * (uint64_t)tsize + timecnt + typecnt * 6 + charcnt + leap * (uint64_t)(tsize + 4) +
+                        isstd + isutc;
+        if (body > len - (size_t)(h - b) - 44 || typecnt == 0)
             return TSDB_ERR_CORRUPT;
         if (version >= 2 && pass == 0) { /* skip the 32-bit data: the 64-bit copy follows */
             h += 44 + body;
@@ -218,6 +235,12 @@ static int load_tzif(tz *z, const uint8_t *b, size_t len)
             continue;
         }
         const uint8_t *tt = h + 44, *idx = tt + timecnt * tsize, *types = idx + timecnt;
+        /* RFC 8536: offsets lie within -25 and +26 hours; beyond them the bounds arithmetic means nothing */
+        for (uint64_t k = 0; k < typecnt; k++) {
+            int32_t off = (int32_t)be(types + k * 6, 4);
+            if (off < -89999 || off > 93599)
+                return TSDB_ERR_CORRUPT;
+        }
         z->ntrans = (size_t)timecnt;
         z->trans = malloc((z->ntrans + 1) * sizeof *z->trans);
         z->after = malloc((z->ntrans + 1) * sizeof *z->after);
@@ -232,7 +255,7 @@ static int load_tzif(tz *z, const uint8_t *b, size_t len)
         }
         /* before the first transition: the first standard type, or type 0 */
         z->before = (int32_t)be(types, 4);
-        for (int64_t k = 0; k < typecnt; k++)
+        for (uint64_t k = 0; k < typecnt; k++)
             if (!types[k * 6 + 4]) {
                 z->before = (int32_t)be(types + k * 6, 4);
                 break;
@@ -255,12 +278,27 @@ static int load_tzif(tz *z, const uint8_t *b, size_t len)
     return 0;
 }
 
+/* A zone name as IANA spells them: [A-Za-z0-9_+-] components joined by single '/', no '.' (so no "..", no
+ * "./"), short. Every name then names one file, and the cache holds one entry per zone, not per spelling. */
+static bool zone_name_valid(const char *name)
+{
+    size_t n = strlen(name);
+    if (n == 0 || n > MAX_ZONE_NAME || name[0] == '/' || name[n - 1] == '/' || strstr(name, "//"))
+        return false;
+    for (const char *p = name; *p; p++)
+        if (!isalnum((unsigned char)*p) && !strchr("_+-/", *p))
+            return false;
+    return true;
+}
+
 static int load_zone(const char *name, tz *z)
 {
     int32_t off;
     const char *p;
     if (!strcmp(name, "UTC") || !strcmp(name, "Z") || !strcmp(name, "GMT") || !strcmp(name, "Etc/UTC"))
         return 0;
+    if (strlen(name) > MAX_ZONE_NAME)
+        return TSDB_ERR_INVALID;
     /* +0530 before +hh[:mm[:ss]]: read as hours, "0530" would be 530 of them */
     if ((name[0] == '+' || name[0] == '-') && strlen(name) == 5 && strspn(name + 1, "0123456789") == 4) {
         char buf[8] = {name[0], name[1], name[2], ':', name[3], name[4], 0};
@@ -269,15 +307,21 @@ static int load_zone(const char *name, tz *z)
             return 0;
         }
     }
-    if ((name[0] == '+' || name[0] == '-') && (p = parse_hms(name, &off)) && !*p) {
-        z->before = off;
-        return 0;
+    if (name[0] == '+' || name[0] == '-') {
+        /* real offsets lie within -12 and +14 hours; 26 leaves room and keeps the arithmetic far from overflow */
+        if ((p = parse_hms(name, &off)) && !*p && strlen(name) <= 9 && off >= -26 * 3600 && off <= 26 * 3600) {
+            z->before = off;
+            return 0;
+        }
+        return TSDB_ERR_INVALID;
     }
-    if (strstr(name, "..") || name[0] == '/')
+    if (!zone_name_valid(name))
         return TSDB_ERR_INVALID;
     const char *dir = getenv("TZDIR") ? getenv("TZDIR") : "/usr/share/zoneinfo";
-    char path[512];
-    snprintf(path, sizeof path, "%s/%s", dir, name);
+    char path[4096];
+    int pl = snprintf(path, sizeof path, "%s/%s", dir, name);
+    if (pl < 0 || (size_t)pl >= sizeof path)
+        return TSDB_ERR_INVALID; /* cut, it would name another file */
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return TSDB_ERR_NOTFOUND;
@@ -292,10 +336,36 @@ static int load_zone(const char *name, tz *z)
     return rc;
 }
 
-static int tz_get(const char *name, const tz **out)
+static void tz_free(tz *z)
+{
+    if (z) {
+        free(z->name);
+        free(z->trans);
+        free(z->after);
+        free(z);
+    }
+}
+
+/* The zone called name, from the cache when it is there. Only zones read from a file are cached: each must name
+ * a real file, so the cache holds at most one entry per file under TZDIR. Fixed offsets cost no I/O and are parsed
+ * on every call (*owned, the caller frees the zone), so callers cannot fill the cache with "+00:00:01"... and push
+ * the real zones out. A full cache does not grow either: such a zone is loaded for the call alone. */
+static int tz_get(const char *name, const tz **out, bool *owned)
 {
     if (!name || !*name)
         name = "UTC";
+    *owned = false;
+    if (name[0] == '+' || name[0] == '-') {
+        tz *z = calloc(1, sizeof *z);
+        int rc = z && (z->name = strdup(name)) ? load_zone(name, z) : TSDB_ERR_NOMEM;
+        if (rc) {
+            tz_free(z);
+            return rc;
+        }
+        *out = z;
+        *owned = true;
+        return 0;
+    }
     pthread_mutex_lock(&cache_lock);
     for (tz *z = cache; z; z = z->next)
         if (!strcmp(z->name, name)) {
@@ -306,17 +376,17 @@ static int tz_get(const char *name, const tz **out)
     tz *z = calloc(1, sizeof *z);
     int rc = z && (z->name = strdup(name)) ? load_zone(name, z) : TSDB_ERR_NOMEM;
     if (rc) {
-        if (z) {
-            free(z->name);
-            free(z->trans);
-            free(z->after);
-            free(z);
-        }
+        tz_free(z);
         pthread_mutex_unlock(&cache_lock);
         return rc;
     }
-    z->next = cache;
-    cache = z;
+    if (cache_n < MAX_CACHED_ZONES) {
+        z->next = cache;
+        cache = z;
+        cache_n++;
+    } else {
+        *owned = true;
+    }
     pthread_mutex_unlock(&cache_lock);
     *out = z;
     return 0;
@@ -411,6 +481,9 @@ static int64_t cal_local_start(tsdb_unit unit, int64_t idx)
     }
 }
 
+static int calendar_bounds(const tz *z, tsdb_unit unit, uint32_t count, int64_t start, int64_t end, int64_t limit,
+                           int64_t **bounds, size_t *n);
+
 int tsdb_calendar_bounds(const char *zone, tsdb_unit unit, uint32_t count, int64_t start, int64_t end,
                          int64_t **bounds, size_t *n)
 {
@@ -421,13 +494,23 @@ int tsdb_calendar_bounds(const char *zone, tsdb_unit unit, uint32_t count, int64
     if (start >= end)
         return 0;
     /* beyond a few hundred thousand years the arithmetic below would overflow */
-    const int64_t limit = 1000LL * 86400 * 366 * 200000;
+    const int64_t limit = TSDB_CALENDAR_LIMIT_MS;
     if (start < -limit || end > limit)
         return TSDB_ERR_INVALID;
     const tz *z;
-    int rc = tz_get(zone, &z);
+    bool owned;
+    int rc = tz_get(zone, &z, &owned);
     if (rc)
         return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_INVALID : rc;
+    rc = calendar_bounds(z, unit, count, start, end, limit, bounds, n);
+    if (owned)
+        tz_free((tz *)z);
+    return rc;
+}
+
+static int calendar_bounds(const tz *z, tsdb_unit unit, uint32_t count, int64_t start, int64_t end, int64_t limit,
+                           int64_t **bounds, size_t *n)
+{
     int64_t c = count ? count : 1, k0, k1, interval = 0, shift = 0;
     if (unit <= TSDB_HOUR) {
         bool fixed;
@@ -438,6 +521,12 @@ int tsdb_calendar_bounds(const char *zone, tsdb_unit unit, uint32_t count, int64
     } else {
         k0 = floor_div(cal_index(z, unit, start), c);
         k1 = floor_div(cal_index(z, unit, end - 1), c);
+        /* local time can go back by a day (Alaska in 1867: +15:02 to -08:57), and the range's end then lies in
+         * an earlier local day than its start: take every period from the lower to the higher */
+        if (k1 < k0) {
+            int64_t k = k0;
+            k0 = k1, k1 = k;
+        }
     }
     if (k1 - k0 + 1 > (int64_t)MAX_BOUNDS)
         return TSDB_ERR_TOO_MANY_BUCKETS;

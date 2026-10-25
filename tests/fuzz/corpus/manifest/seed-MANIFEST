@@ -1,0 +1,20 @@
+tsdb-manifest 5
+version 8
+series 4
+wal_flushed 1
+wal_active 2
+parts 14
+p19723_1_1_0.part
+p19723_4_4_0.part
+p19723_7_7_0.part
+p19723_10_10_0.part
+p19723_13_13_0.part
+p19724_2_2_0.part
+p19724_5_5_0.part
+p19724_8_8_0.part
+p19724_11_11_0.part
+p19725_3_3_0.part
+p19725_6_6_0.part
+p19725_9_9_0.part
+p19725_12_12_0.part
+p19725_14_14_0.part

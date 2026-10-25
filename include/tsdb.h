@@ -42,6 +42,8 @@ enum {
     TSDB_ERR_READONLY = -9,
 };
 
+/* The ends of the time axis, for query ranges. Ranges are half-open, [start, end), so no range reaches a row at
+ * TSDB_TS_MAX: writes refuse one (TSDB_ERR_INVALID), and the last instant a row may have is TSDB_TS_MAX - 1. */
 #define TSDB_TS_MIN INT64_MIN
 #define TSDB_TS_MAX INT64_MAX
 
@@ -164,7 +166,9 @@ int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index);
  * tsdb_insert returns once the rows are durable (per fsync / wal_sync_ms)
  * and visible. Large batches are written as one part per partition; small
  * ones go through the WAL into the memtable. Rows may be in any order;
- * sorted input (by series, then time) skips the sort.
+ * sorted input (by series, then time) skips the sort. A row at TSDB_TS_MAX
+ * fails the whole call with TSDB_ERR_INVALID (and so does tsdb_append, and
+ * a replace): no query range could reach it.
  */
 int tsdb_insert(tsdb *db, const uint32_t *series, const int64_t *ts, const float *values, size_t n);
 int tsdb_insert_series(tsdb *db, uint32_t series, const int64_t *ts, const float *values, size_t n);
