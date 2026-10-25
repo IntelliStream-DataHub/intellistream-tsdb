@@ -1774,10 +1774,6 @@ static void test_same_keys(const char *dir)
  * more, and a restart has every acknowledged row. */
 static void test_wal_failstop(const char *dir)
 {
-    if (getenv("TSDB_TEST_NO_CRASHFS")) { /* a dist tarball ships no shim; make test runs this */
-        printf("  skipped: no crashfs shim\n");
-        return;
-    }
     char cmd[1200], mark[600];
     snprintf(cmd, sizeof cmd, "rm -rf '%s' && mkdir -p '%s'", dir, dir);
     if (system(cmd) != 0) {

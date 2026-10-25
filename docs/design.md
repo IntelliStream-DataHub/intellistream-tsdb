@@ -106,9 +106,11 @@ What is bit-reproducible:
 
 - int64 and bool: every spread value, in every order, path and CPU.
 - Floats: the m2 of one run of rows is the same on every CPU level and kernel
-  (`TSDB_CPU`, `TSDB_SIMD`): the scalar, AVX2 and AVX-512 kernels keep 32
-  lanes and halve them in the same order, as for sums (test_spread checks all
-  of them bit for bit, on varied runs and on whole databases). How runs and granules combine follows how parts were
+  (`TSDB_CPU`, `TSDB_SIMD`): all five kernel sets (scalar, SSE4.2, AVX,
+  AVX2, AVX-512) keep 32 lanes (float32) or 16 (float64) and halve them in
+  the same order, as for
+  sums (test_spread and test_levels check all of them bit for bit, on varied
+  runs, with and without nulls, and on whole databases). How runs and granules combine follows how parts were
   merged and the query split over threads, so like float sums the variances
   may differ in the last bits after a merge.
 - range comes from min and max and is exact (for int64 the difference of two
@@ -991,12 +993,75 @@ sampled at 1 Hz 0.06, a machine mode 0.13.
 
 Gorilla, Chimp and DoubleDelta decoding is bit-serial: where value i+1 starts
 depends on value i, so it cannot be vectorized. The aggregation kernels are
-dispatched at runtime to AVX-512, AVX2 or scalar code, and the fixed-point
-encoder is written so the compiler vectorizes it. AVX-512 is not used on
-Skylake-SP, Cascade Lake and Cooper Lake Xeons, which lower the clock of the
-core after 512-bit instructions. `TSDB_SIMD=avx512|avx2|scalar` overrides the
-choice. In a portable build the codecs are compiled per CPU level instead (see
+dispatched at runtime to one of five sets: AVX-512, AVX2, AVX (Sandy and
+Ivy Bridge, which have AVX but not AVX2), SSE4.2 (any x86-64-v2 CPU) or
+scalar code; the fixed-point encoder is written so the compiler vectorizes
+it. AVX-512 is not used on Skylake-SP, Cascade Lake and Cooper Lake Xeons,
+which lower the clock of the core after 512-bit instructions.
+`TSDB_SIMD=avx512|avx2|avx|sse|scalar` overrides the choice. In a portable build the codecs are compiled per CPU level instead (see
 "Decoding and CPU levels" above).
+
+Every kernel gives the same bits, so a granule's statistics do not depend on
+the CPU that wrote them. Float additions are not associative, so floats are
+summed in one fixed order on every path: float32 in 32 double lanes, float64
+in 16 (lane j takes values j, j+16, j+32, ...; 16 because AVX2 then still
+holds sums, minima and maxima in its 16 registers), then the lanes are halved
+(lane j + lane j+8, j + j+4, ...). The scalar code is written in the same
+lanes, and so are the SSE and AVX kernels: their 128-bit registers hold two
+float64 lanes each (eight registers for the 16 lanes), AVX2's four. A wider
+register only changes how many lanes one instruction works on, never which
+value goes to which lane or the order in which lanes are added. min and max
+are compared lane by lane the same way, which decides the
+sign of a zero minimum. A null (a reserved value, a NaN for floats) adds +0.0
+to its lane instead of being skipped: a lane starts at +0.0 and never becomes
+-0.0, so +0.0 changes nothing and the lane order stays by position, without a
+branch per row. The kernels take the number of nulls (one quick pass counts
+them first) and mask only when there are any.
+
+A run shorter than the lanes (a bucket of a few rows, folded once per bucket)
+skips the kernels: value j alone in lane j, and the halving starts at the
+smallest power of two that holds the run, since an empty lane (+0.0, or the
+running minimum and maximum) changes nothing in it. The bits are those of the
+kernels; setting up and reducing 32 lanes would cost more than the values.
+On SSE and AVX the short path is itself a 128-bit kernel and is used up to
+64 values. The integer loops below likewise take short runs, and short LTTB
+buckets are scanned by the scalar loop; where each set's kernels start to pay
+was measured per set (`fold-bench --vary`): int64 from 16 to 48 values (with
+the spread from 16 or 24 on AVX-512 and AVX2; never on SSE and AVX, which have
+no 64-bit multiply for the squares and lose to the loop at every length), bool
+and state codes from 24 or 32, LTTB from 8 to 48 points.
+
+Integers (int64, bool and state codes) are summed exactly, so their order is
+free: the vector kernels add 32-bit halves of the values in 64-bit
+lanes (and, for int64, count the negative ones), which cannot overflow within a
+block, and combine the lanes into the 128-bit sum. The spread's sum of squares
+is exact too: bool and state squares (below 2^64) in the same pass, int64
+squares in a second pass (one 32-bit multiply per value when every known value
+of the run fits in 32 bits, three otherwise). The scalar loops in `values.c` are the
+reference, and the code for short runs.
+
+A granule's time-weighted areas (`tw_step`, `tw_lin`, written with the
+granule) are float sums too, in one of two orders fixed by the granule's
+length alone, the same on every CPU and kernel set. Up to `TWA_SEQ_MAX` (383)
+points the segments are added one after the other, starting from +0.0, by a
+plain loop in `twa.c`; that file is compiled once, so every CPU runs the same
+instructions on the same values. Beyond that, segment s (from reading s to
+s + 1) adds to lane s % 16 of the float64 scheme, a segment that does not count
+adds +0.0, and the lanes are halved the same way, in every kernel set. The
+limit is where the slowest kernel set (SSE, int64 with nulls) first matches
+the loop; below it the loop's fixed cost is lower. The milliseconds and the
+longest gap are integers. LTTB's scan for the largest triangle computes each point's area with
+the same expression in every kernel (timestamps and int64 values converted to
+double rounded once, as the scalar conversion does); each lane keeps its first
+largest area and the lanes are then combined by area and lowest index, so the
+pick is always the first point with the largest area, and a NaN never wins.
+The areas of longer granules were summed one segment after the other before;
+like the float64 sums, they may differ from those in the last bits once.
+
+Before these kernels, float64 and float32 with nulls were summed one value
+after the other; their sums and spreads may now differ from those in the last
+bits (there has been no release, so stored granule statistics were not
+rewritten). Since the order is fixed, this is a one-time change.
 
 ## Server and clients
 

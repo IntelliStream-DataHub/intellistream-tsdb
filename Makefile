@@ -52,10 +52,18 @@ endif
 LIB  := $(B)/libtsdb.a
 BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
-all: $(LIB) $(B)/libtsdb.so $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench $(B)/twa-bench
+all: $(LIB) $(B)/libtsdb.so $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench
 
 $(B)/%.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
+# simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
+$(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
+# Its lanes start at zero (arrays of 16 and 32 doubles): GCC's generic tuning (the dist build) clears 33 to 8192
+# known bytes with `rep stosq`, whose startup (some 30 cycles) was a third of a short run's fold (fold-bench --rows
+# 32, sse kernels); -march=native picks vector stores itself. Vector stores up to 512 bytes, memset beyond.
+MEMSET_FLAG := $(shell $(CC) -mmemset-strategy=vector_loop:512:noalign,libcall:-1:noalign -E -x c /dev/null \
+                 >/dev/null 2>&1 && echo -mmemset-strategy=vector_loop:512:noalign,libcall:-1:noalign)
+$(B)/simd.o: override CFLAGS += $(MEMSET_FLAG)
 
 $(B)/%.base.o: src/%.c src/internal.h src/levels.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -DTSDB_LV=base -c -o $@ $<
@@ -227,7 +235,7 @@ DIST_ARCH  ?= -march=x86-64-v2 -mtune=generic
 GLIBC_MAX  ?= 2.34
 DIST_VARS   = B=$(DIST_B) TSDBD=$(DIST_B)/tsdbd ARCH="$(DIST_ARCH) -include tools/glibc-compat.h" \
               CPU_LEVELS="v3 v4" ZSTD_LIB=-l:libzstd.a URING_LIB=-l:liburing.a LINK_EXTRA=-static-libgcc
-DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench tsdb-bench insert-bench tsdbc-bench scale-bench
+DIST_BINS   = tsdbd tsdb codec-bench type-bench twa-bench fold-bench tsdb-bench insert-bench tsdbc-bench scale-bench
 DIST_TESTS  = test_tsdb test_types test_levels test_group test_lttb test_twa test_spread test_limits test_follow test_volumes test_server test_stability test_ports
 DIST_FILES  = $(addprefix $(DIST_B)/,$(DIST_BINS) $(DIST_TESTS) libcrashfs.so)
 
@@ -392,6 +400,9 @@ $(B)/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/
 	$(CC) $(CFLAGS) -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 $(B)/type-bench: tools/type-bench.c tools/common.h tools/datasets.h src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+$(B)/fold-bench: tools/fold-bench.c tools/common.h src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/twa-bench: tools/twa-bench.c tools/common.h include/tsdb.h $(LIB)

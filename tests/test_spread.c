@@ -609,12 +609,13 @@ static void check_levels(tsdb *db, const uint32_t *ids, ref_series *const *ss, c
 {
     tsdb_spread_bucket *b;
     size_t nb;
-    static const char *const kernels[] = {"scalar", "avx2", "avx512"};
+    static const char *const kernels[] = {"scalar", "sse", "avx", "avx2", "avx512"};
+    static const int kmin[] = {CPU_BASE, CPU_BASE, CPU_BASE, CPU_V3, CPU_V4}; /* the lowest level of each */
     tsdb_spread_bucket *lv0 = NULL;
     size_t nlv0 = 0;
     int configs = 0;
     for (int level = CPU_BASE; level <= cpu_level_max(); level++)
-        for (int kk = 0; kk <= level && kk < 3; kk++) {
+        for (int kk = 0; kk < 5 && kmin[kk] <= level; kk++) {
             setenv("TSDB_SIMD", kernels[kk], 1);
             if (cpu_set_level(level) != 0) {
                 simd_select(level);
@@ -952,7 +953,8 @@ static void test_kernels(void)
         for (size_t i = 0; i < len[r]; i++)
             v[r][i] = (float)(off + amp * ((double)rndr(2000001) / 1e6 - 1) + (r % 3 == 0 ? (double)i * 0.25 : 0));
     }
-    static const char *const kernels[] = {"scalar", "avx2", "avx512"};
+    static const char *const kernels[] = {"scalar", "sse", "avx", "avx2", "avx512"};
+    static const int kmin[] = {CPU_BASE, CPU_BASE, CPU_BASE, CPU_V3, CPU_V4}; /* the lowest level of each */
     typedef struct {
         agg_state a;
         agg_dev x;
@@ -961,7 +963,7 @@ static void test_kernels(void)
     granule gbase[NRUN];
     int configs = 0;
     for (int level = CPU_BASE; level <= cpu_level_max(); level++)
-        for (int kk = 0; kk <= level && kk < 3; kk++) {
+        for (int kk = 0; kk < 5 && kmin[kk] <= level; kk++) {
             setenv("TSDB_SIMD", kernels[kk], 1);
             if (cpu_set_level(level) != 0) {
                 simd_select(level);

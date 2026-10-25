@@ -3,10 +3,11 @@
 # (constructors), per-level code whose rounding depends on the CPU (FMA, libm's
 # dispatched functions), or uses instructions beyond x86-64-v2 outside the code
 # that is only reached after a CPU check: the per-level compiles (*.v3.o,
-# *.v4.o, functions *_v3/_v4), simd.c's agg_avx2/agg_avx512, and zstd's BMI2
-# variants. An emulator finds most such slips (qemu -cpu SandyBridge raises
-# SIGILL), but not LZCNT: older CPUs run it as BSR and silently get another
-# result. So this reads the machine code.
+# *.v4.o, functions *_v3/_v4), simd.c's kernels (functions *_avx/*_avx2/*_avx512,
+# and GCC's .part/.constprop clones of them), and zstd's BMI2 variants. An
+# emulator finds most such slips (qemu -cpu SandyBridge raises SIGILL), but not
+# LZCNT: older CPUs run it as BSR and silently get another result. So this
+# reads the machine code.
 #
 #   tools/check-isa.sh build-dir binary...
 set -eu
@@ -66,8 +67,9 @@ done
 for o in "$dir"/*.o; do
     case "$o" in *.v3.o | *.v4.o) continue ;; esac
     above_v2 "$o" | while read -r fn cnt; do
-        # GCC may split a kernel (agg_avx2.part.0): the piece keeps its target and only the kernel calls it
-        case "$(basename "$o"):${fn%%.*}" in simd.o:agg_avx2 | simd.o:agg_avx512) continue ;; esac
+        # simd.c's kernels carry their own targets (*_avx, *_avx2, *_avx512); GCC may split one (agg_avx2.part.0):
+        # the piece keeps its target and only the kernel calls it
+        case "$(basename "$o"):${fn%%.*}" in simd.o:*_avx | simd.o:*_avx2 | simd.o:*_avx512) continue ;; esac
         echo "$o: $fn: $cnt instructions beyond x86-64-v2" >&2
         echo x >>"$tmp/bad"
     done
@@ -78,13 +80,18 @@ done
 for o in "$dir"/*.v3.o "$dir"/*.v4.o; do
     [ -e "$o" ] && nm --defined-only "$o" | awk '$2 ~ /^[tT]$/ {print $3}'
 done | sort -u >"$tmp/level_fns"
+# simd.c's kernels by name, so a zstd or libc function that happens to end in
+# _avx2 is not let through
+nm --defined-only "$dir/simd.o" | awk '$2 ~ /^[tT]$/ {sub(/\..*/, "", $3); print $3}' |
+    grep -E '_avx$|_avx2$|_avx512$' | sort -u >"$tmp/simd_fns"
 for b in "$@"; do
     above_v2 "$b" | while read -r fn cnt; do
         base=${fn%%.*} # foo.part.0, foo.constprop.0
         case "$base" in
-        *_v3 | *_v4 | agg_avx2 | agg_avx512) continue ;;
+        *_v3 | *_v4) continue ;;
         HUF_*_bmi2 | FSE_*_bmi2 | ZSTD_*_bmi2 | HUF_*_fast | HUF_*_fast_c_loop | HUF_*_fast_asm_loop) continue ;;
         esac
+        grep -qx "$base" "$tmp/simd_fns" && continue
         grep -qx "$fn" "$tmp/level_fns" && continue # a static helper of a level compile (its base copy is step 1's)
         echo "$b: $fn: $cnt instructions beyond x86-64-v2" >&2
         echo x >>"$tmp/bad"

@@ -80,16 +80,10 @@ static inline double slot_val(int type, const uint8_t *p)
 
 /* ------------------------------------------------- granule statistics */
 
-void granule_twa(int type, const int64_t *ts, const void *vv, size_t n, granule *g)
+/* A short granule: the segments in order, as seg() below adds a segment inside one bucket, and the first and last
+ * readings from the same loop (main's loop exactly: no reading is loaded twice). */
+static inline void twa_seq(int type, const int64_t *ts, const uint8_t *v, size_t n, size_t w, granule *g)
 {
-    const uint8_t *v = vv;
-    size_t w = type_width(type);
-    g->tw_first = g->tw_last = g->tw_step = g->tw_lin = 0;
-    g->tw_step_ms = g->tw_lin_ms = 0;
-    g->tw_gap = 0;
-    g->tw_flags = GT_FIRST_NULL | GT_LAST_NULL;
-    if (n == 0 || type == TSDB_STATE)
-        return;
     bool okp = slot_ok(type, v);
     double vp = okp ? slot_val(type, v) : 0;
     double step = 0, lin = 0;
@@ -101,7 +95,6 @@ void granule_twa(int type, const int64_t *ts, const void *vv, size_t n, granule 
         gap = dt > gap ? dt : gap;
         bool ok = slot_ok(type, v + i * w);
         double x = ok ? slot_val(type, v + i * w) : 0;
-        /* the same expressions as seg() below for a segment inside one bucket */
         if (okp) {
             step += vp * (double)dt;
             sms += dt;
@@ -116,11 +109,56 @@ void granule_twa(int type, const int64_t *ts, const void *vv, size_t n, granule 
     g->tw_last = vp;
     if (!okp)
         g->tw_flags |= GT_LAST_NULL;
+    if (__builtin_expect(isunordered(step, lin), 0)) { /* canon_nan on both, behind one test */
+        step = canon_nan(step);
+        lin = canon_nan(lin);
+    }
     g->tw_step = step;
     g->tw_lin = lin;
     g->tw_step_ms = sms;
     g->tw_lin_ms = lms;
     g->tw_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
+}
+
+static inline __attribute__((always_inline)) void granule_twa_t(int type, const int64_t *ts, const void *vv, size_t n,
+                                                                 granule *g)
+{
+    const uint8_t *v = vv;
+    size_t w = type_width(type);
+    g->tw_first = g->tw_last = g->tw_step = g->tw_lin = 0;
+    g->tw_step_ms = g->tw_lin_ms = 0;
+    g->tw_gap = 0;
+    g->tw_flags = GT_FIRST_NULL | GT_LAST_NULL;
+    if (n == 0 || type == TSDB_STATE)
+        return;
+    if (n <= TWA_SEQ_MAX) {
+        twa_seq(type, ts, v, n, w, g);
+        return;
+    }
+    bool ok0 = slot_ok(type, v), okl = slot_ok(type, v + (n - 1) * w);
+    twa_sums o;
+    simd_twa(type, ts, v, n, &o);
+    g->tw_first = ok0 ? slot_val(type, v) : 0;
+    g->tw_flags = (ok0 ? 0 : GT_FIRST_NULL) | (okl ? 0 : GT_LAST_NULL);
+    g->tw_last = okl ? slot_val(type, v + (n - 1) * w) : 0;
+    g->tw_step = o.step;
+    g->tw_lin = o.lin;
+    g->tw_step_ms = o.sms;
+    g->tw_lin_ms = o.lms;
+    uint64_t gap = o.gap;
+    g->tw_gap = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
+}
+
+/* one copy per type: the slots' loads and null tests then cost no switch (short granules are mostly that) */
+void granule_twa(int type, const int64_t *ts, const void *v, size_t n, granule *g)
+{
+    switch (type) {
+    case TSDB_FLOAT32: granule_twa_t(TSDB_FLOAT32, ts, v, n, g); break;
+    case TSDB_FLOAT64: granule_twa_t(TSDB_FLOAT64, ts, v, n, g); break;
+    case TSDB_INT64: granule_twa_t(TSDB_INT64, ts, v, n, g); break;
+    case TSDB_BOOL: granule_twa_t(TSDB_BOOL, ts, v, n, g); break;
+    default: granule_twa_t(type, ts, v, n, g); break;
+    }
 }
 
 /* ------------------------------------------------------------ query */
