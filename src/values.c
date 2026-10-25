@@ -21,6 +21,13 @@ static size_t count_null_f32(const uint32_t *v, size_t n)
     return k;
 }
 
+static inline bool null_f64(double x)
+{
+    uint64_t b;
+    memcpy(&b, &x, 8);
+    return b == NULL_F64;
+}
+
 static size_t count_null_f64(const uint64_t *v, size_t n)
 {
     size_t k = 0;
@@ -39,8 +46,92 @@ static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, a
         simd_fold_f32(v, n, may_be_null ? count_null_f32((const uint32_t *)v, n) : 0, a, x);
 }
 
+/*
+ * float64 runs of at most TINY_F64 = 4 values (buckets of a few rows; from 5 on the short-run kernels are faster):
+ * every value has a lane of its own (simd.c), so the kernels' result is a fixed tree over the n values: the
+ * halving of k = the next power of two >= n lanes, where lanes n to k - 1 hold +0.0 (sums, deviations) or a's
+ * bounds (min, max). Evaluated as that tree directly, it costs n - 1 operations per result, like a loop, without
+ * the kernels' setup or an indirect call. The padding only ever meets a lane below n in the first halving
+ * (k / 2 < n), as the right operand:
+ *  - min/max (the second operand wins unless the first is strictly beyond it, MINPD/MAXPD with the accumulator
+ *    second): a lane holds a value or a's bound, never beyond the bound, so the padding (the bound) loses and
+ *    the lane is kept as it is. Its order also decides which of -0.0 and +0.0 wins: kept exactly.
+ *  - sums: x + +0.0 is x except for x = -0.0. A kernel lane starts at +0.0, so no lane and no sum of lanes is
+ *    ever -0.0; leaving out the +0.0s (here and in each lane's first addition) changes only the sign of a zero
+ *    result, and only to -0.0 when every value is -0.0: adding +0.0 to the root gives the kernels' bits. The
+ *    deviations' sign does not matter (d1 is squared, and d * d is never -0.0).
+ * A null adds +0.0 to its lane and is NaN to min/max, as in the kernels; overflow to inf and NaN follow the same
+ * tree. test_levels compares this with every set's kernels at every n, signed zeros and bounds included.
+ */
+#define TINY_F64 4
+_Static_assert(TINY_F64 <= SIMD_LANES_F64, "one value per lane");
+
+/* The lanes as plain variables (GCC turned arrays of them into stack slots and reloaded pairs as vectors, a store
+ * forwarding stall per call). min/max: lane j holds x_j if x_j < a->min, else a->min itself (NaN: a->min), and a
+ * halving step keeps the lower lane unless the upper one is strictly less; so the tree returns, among the lanes
+ * holding the least value, the one first in the tree's priority order (0, 2, 1, 3 for four lanes: the bit-reversed
+ * order), and a->min when no value is below it. A chain from a->min through the values in that order, each
+ * replacing the bound only when strictly less, returns the same lane: n operations instead of 2n. */
+#define TMIN(x, y) ((x) < (y) ? (x) : (y))
+#define TMAX(x, y) ((x) > (y) ? (x) : (y))
+#define TLEAF(j)                                                                                                   \
+    double x##j = v[(j) < n ? (j) : 0], s##j = x##j; /* lanes from n on: unused, optimised out */                \
+    bool z##j = (j) < n && null_f64(x##j);                                                                        \
+    if (__builtin_expect(z##j, 0)) { /* a null adds +0.0 to its lane (rare: a branch, as in main's loop) */       \
+        s##j = 0.0;                                                                                                \
+        c--;                                                                                                       \
+    }
+#define TDEV(j) double e##j = z##j ? 0.0 : x##j - m, q##j = e##j * e##j;
+/* a tree over lanes 0..n-1 of l (n = 1 to 4): the first halving pairs lane j with lane j + 2 where there is one */
+#define TTREE(l) (n == 1 ? l##0 : n == 2 ? l##0 + l##1 : n == 3 ? (l##0 + l##2) + l##1 : (l##0 + l##2) + (l##1 + l##3))
+
+static inline __attribute__((always_inline)) void tiny_f64_n(const double *v, const int n, agg_state *a,
+                                                             agg_dev *dv)
+{
+    uint64_t c = (uint64_t)n;
+    TLEAF(0)
+    TLEAF(1)
+    TLEAF(2)
+    TLEAF(3)
+    double mn = TMIN(x0, a->min), mx = TMAX(x0, a->max);
+    if (n >= 3) {
+        mn = TMIN(x2, mn), mx = TMAX(x2, mx);
+    }
+    if (n >= 2) {
+        mn = TMIN(x1, mn), mx = TMAX(x1, mx);
+    }
+    if (n >= 4) {
+        mn = TMIN(x3, mn), mx = TMAX(x3, mx);
+    }
+    a->min = mn;
+    a->max = mx;
+    double sum = TTREE(s) + 0.0; /* -0.0 to +0.0 (above) */
+    if (!dv) {
+        a->count += c;
+        a->sum = canon_nan(a->sum + sum);
+        return;
+    }
+    if (!c)
+        return;
+    double m = sum / (double)c;
+    TDEV(0)
+    TDEV(1)
+    TDEV(2)
+    TDEV(3)
+    agg_add_run(a, dv, c, sum, TTREE(e), TTREE(q));
+    a->sum = canon_nan(a->sum);
+}
+
 static void fold_f64(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
+    switch (n) { /* inlined, n a constant in each (an indirect call cost more); nulls are looked for anyway */
+    case 0: return;
+    case 1: tiny_f64_n(v, 1, a, x); return;
+    case 2: tiny_f64_n(v, 2, a, x); return;
+    case 3: tiny_f64_n(v, 3, a, x); return;
+    case 4: tiny_f64_n(v, 4, a, x); return;
+    default: break;
+    }
     if (n < simd_short)
         simd_small_f64(v, n, may_be_null, a, x);
     else

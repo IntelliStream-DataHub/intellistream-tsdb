@@ -332,6 +332,28 @@ static void make_inputs(void)
     for (size_t i = 0; i < GR; i++)
         ((uint64_t *)x->v)[i] = next();
 
+    /* short runs: values.c's tiny path (a fixed tree, n <= 4) and the short-run kernels must give the kernels'
+     * bits for every prefix of these (short_run): signed zeros, infinities, NaNs and nulls at every position (11
+     * rotations of 11 specials: each special at each position), and random draws from them */
+    static const uint64_t sp64[11] = {0, 0x8000000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+                                      0x7ff8000000000000ull, 0xfff8000000000001ull, NULL_F64, 0x3ff0000000000000ull,
+                                      0xbff0000000000000ull, 0x7fefffffffffffffull, 0xffefffffffffffffull};
+    static const uint32_t sp32[11] = {0, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00001u,
+                                      NULL_F32, 0x3f800000u, 0xbf800000u, 0x7f7fffffu, 0xff7fffffu};
+    for (int t = 0; t < 2; t++)
+        for (int r = 0; r < 15; r++) {
+            snprintf(name, sizeof name, "%s short specials %d", t ? "f32" : "f64", r);
+            x = add(name, t ? TSDB_FLOAT32 : TSDB_FLOAT64, 34);
+            for (size_t i = 0; i < 34; i++) {
+                /* 0-10: rotations; 11, 12: zeros of both signs and nulls; 13, 14: anything */
+                size_t k = r < 11 ? (i + (size_t)r) % 11 : r < 13 ? next() % 3 == 2 ? 6 : next() % 2 : next() % 11;
+                if (t)
+                    ((uint32_t *)x->v)[i] = sp32[k];
+                else
+                    ((uint64_t *)x->v)[i] = sp64[k];
+            }
+        }
+
     /* timestamps: regular, jittered, random gaps, duplicates, negative, extremes */
     x = add("ts jitter", TSDB_INT64, GR);
     for (size_t i = 0; i < GR; i++)
@@ -354,10 +376,12 @@ typedef int (*dec_fn)(const uint8_t *, size_t, size_t, void *);
 static uint8_t *buf, *dec;
 #define BUF(n) ((n) * 16 + 4096)
 
-/* A run shorter than simd_short takes simd_small_* (values.c): it must give the bits of the lane kernels of the
- * level, which it skips, with and without the spread and the search for nulls. */
+/* A run shorter than simd_short takes values.c's tiny path (float64, n <= 4) or simd_small_*: it must give the
+ * bits of the lane kernels of the level, which it skips, with and without the spread and the search for nulls,
+ * from a new state and from states whose bounds and sum are zeros of either sign. */
 static void short_run(const input *x, size_t m)
 {
+    for (int st = 0; st < 3; st++)
     for (int sp = 0; sp < 2; sp++)
         for (int hint = 0; hint < 2; hint++) {
             size_t nulls = 0;
@@ -374,8 +398,14 @@ static void short_run(const input *x, size_t m)
             memset(&b, 0, sizeof b);
             agg_init(&a.a, x->type);
             agg_dev_init(&a.x);
-            agg_init(&b.a, x->type);
-            agg_dev_init(&b.x);
+            if (st) { /* a state with zeros of either sign as bounds and sum: which operand wins on ties */
+                a.a.count = 3;
+                a.a.sum = st == 1 ? -0.0 : 0.0;
+                a.a.min = st == 1 ? 0.0 : -0.0;
+                a.a.max = st == 1 ? -0.0 : 0.0;
+                a.x.m2 = 1;
+            }
+            b = a;
             agg_fold_hint(x->type, x->v, m, !hint, &a.a, sp ? &a.x : NULL);
             b.a.rows += m;
             if (x->type == TSDB_FLOAT32)
@@ -383,8 +413,8 @@ static void short_run(const input *x, size_t m)
             else
                 simd_fold_f64(x->v, m, nulls, &b.a, sp ? &b.x : NULL);
             if (memcmp(&a, &b, sizeof a) != 0) {
-                fprintf(stderr, "%s, %zu values%s%s: the short path differs from the kernel %s\n", x->name, m,
-                        sp ? ", spread" : "", hint ? ", no nulls" : "", simd_name());
+                fprintf(stderr, "%s, %zu values%s%s, state %d: the short path differs from the kernel %s\n", x->name,
+                        m, sp ? ", spread" : "", hint ? ", no nulls" : "", st, simd_name());
                 failures++;
             }
         }

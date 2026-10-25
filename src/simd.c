@@ -1667,6 +1667,9 @@ void simd_select(int level)
         u32 = fold_u32_avx512;
         twa = twa_avx512;
         lttb = lttb_avx512;
+        sf32 = small_f32_avx; /* the 128-bit (VEX) short-run kernels: less fixed cost than the scalar ones */
+        sf64 = small_f64_avx;
+        shortn = AVX_SHORT;
         name = "avx512";
         thr = THR_AVX512;
         break;
@@ -1678,6 +1681,9 @@ void simd_select(int level)
         u32 = fold_u32_avx2;
         twa = twa_avx2;
         lttb = lttb_avx2;
+        sf32 = small_f32_avx; /* the 128-bit (VEX) short-run kernels: less fixed cost than the scalar ones */
+        sf64 = small_f64_avx;
+        shortn = AVX_SHORT;
         name = "avx2";
         thr = THR_AVX2;
         break;
