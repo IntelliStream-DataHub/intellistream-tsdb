@@ -302,6 +302,22 @@ The two programs are short and worth reading. Each is a complete program that `m
 
 The Rust, Python and Java clients have their own quick starts (see "As a server" below).
 
+### Which value type to choose
+
+A series gets its type when you create it, and keeps it. Series created without a type are float32.
+
+| your values | type | why |
+|---|---|---|
+| most sensors: temperatures, pressures, flows, levels (a PLC's REAL, most OPC UA values) | **float32** (the default) | smallest and fastest; about 7 significant digits, more than a sensor delivers |
+| values that need more than 7 significant digits: a totalizer at 12,345,678.9 m³, energy counters, long running sums | **float64** | about 15 significant digits |
+| counters and amounts in a fixed unit: liters, Wh, events | **int64** | exact, sums included; a totalizer in whole liters takes about 1.2 bits per reading |
+| on/off, open/closed | **bool** | |
+| modes and status: "running", "stopped", "fault" | **state** | stored as small codes, with the names kept once |
+
+Store a value in the type it comes in. A float32 reading stored as float64 does not get more precise: 35.1
+becomes 35.0999999…, which takes up to 2.6 times the space of the same readings as float32, and is slower to
+read.
+
 ### On another machine
 
 `make` builds for this machine's CPU. To run tsdb on another one, AlmaLinux 10
