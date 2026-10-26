@@ -90,7 +90,9 @@ cgroup, so `nice` does not keep your work out of its way.
   `killall`, `kill` with pid -1 or 0, `docker`) and `hooks/guard-push.sh` (refuses a push while unpushed
   commits carry a session link); `skills/tsdb-tracks/` is how changes are built, reviewed, gated and merged
   with subagents; `skills/subagent-economy/` keeps those subagents cheap (detached runs, a waiter, checkpoints;
-  copy it to `~/.claude/skills/` to use it in other projects); `agents/iso-waiter.md` waits on detached runs. Personal settings go in the ignored
+  copy it to `~/.claude/skills/` to use it in other projects); `skills/jepsen-review/` is the adversarial
+  review of durability, recovery and failover code in the Jepsen style (claims, faults, histories, a checker,
+  evidence); `agents/iso-waiter.md` waits on detached runs. Personal settings go in the ignored
   `.claude/settings.local.json`. `.githooks/commit-msg`: the commit rules for everyone (`make hooks`).
 - `tools/`: CLI and benchmarks. `tests/`: tests; `tests/jepsen/`: the
   fault-injection harness and the `crashfs` LD_PRELOAD power-loss simulator.
