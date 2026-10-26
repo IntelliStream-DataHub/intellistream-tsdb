@@ -20,8 +20,10 @@
 #include "dump.h"
 #include "tsdb.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zstd.h>
@@ -43,6 +45,7 @@
 #define DUMP_CHUNK_MAX (1u << 20) /* rows per chunk a reader accepts */
 #define DUMP_CHUNK_ROWS 65536     /* rows per chunk this exporter writes */
 #define DUMP_NAME_MAX 65536       /* bytes of a series, path or state name */
+#define DUMP_STATES_SPLIT (1u << 20) /* this exporter starts a new STATES record beyond this many bytes */
 
 enum { REC_SERIES = 1, REC_STATES = 2, REC_CHUNK = 3, REC_END = 4, REC_TRAILER = 5 };
 enum { REC_F_OPTIONAL = 1 };
@@ -294,6 +297,10 @@ static void ex_write(exporter *x, const void *p, size_t n)
 
 static void ex_record(exporter *x, uint8_t kind, const buf *payload)
 {
+    if (payload->n > DUMP_PAYLOAD_MAX) { /* a reader refuses it: a bug here, never a stream that cannot be read */
+        fprintf(stderr, "tsdb: export: record of %zu bytes exceeds the format's limit\n", payload->n);
+        abort();
+    }
     uint8_t h[16] = {kind, 0, 0, 0};
     for (int i = 0; i < 4; i++) {
         h[4 + i] = (uint8_t)(payload->n >> (8 * i));
@@ -307,8 +314,18 @@ static void ex_record(exporter *x, uint8_t kind, const buf *payload)
     x->seq++;
 }
 
-/* Names every state code of the chunk the stream has not named yet in this series, in one STATES record before
- * the chunk. */
+static void ex_states_flush(exporter *x, uint32_t count)
+{
+    if (!count)
+        return;
+    for (int i = 0; i < 4; i++)
+        x->rec.p[i] = (uint8_t)(count >> (8 * i));
+    ex_record(x, REC_STATES, &x->rec);
+}
+
+/* Names every state code of the chunk the stream has not named yet in this series, in STATES records before the
+ * chunk: as many as it takes to keep each under DUMP_STATES_SPLIT bytes (names may be up to 32 KiB, so the names of
+ * one chunk could exceed the record limit). */
 static int ex_states(exporter *x)
 {
     x->rec.n = 0;
@@ -338,16 +355,23 @@ static int ex_states(exporter *x)
             fprintf(stderr, "tsdb: export: series %u: state code %u has no name\n", x->series, code);
             return TSDB_ERR_CORRUPT;
         }
+        if (strlen(name) > DUMP_NAME_MAX) {
+            fprintf(stderr, "tsdb: export: series %u: state code %u has a name longer than the format allows\n",
+                    x->series, code);
+            return TSDB_ERR_INVALID;
+        }
+        if (count && x->rec.n + 8 + strlen(name) > DUMP_STATES_SPLIT) {
+            ex_states_flush(x, count);
+            x->rec.n = 0;
+            count = 0;
+            put_u32(&x->rec, 0);
+        }
         x->named[code >> 3] |= (uint8_t)(1u << (code & 7));
         put_u32(&x->rec, code);
         put_str32(&x->rec, name);
         count++;
     }
-    if (count) {
-        for (int i = 0; i < 4; i++)
-            x->rec.p[i] = (uint8_t)(count >> (8 * i));
-        ex_record(x, REC_STATES, &x->rec);
-    }
+    ex_states_flush(x, count);
     return 0;
 }
 
@@ -446,7 +470,7 @@ static bool matches(const char *name, char **pat, int npat)
 static void export_usage(void)
 {
     fprintf(stderr, "usage: tsdb <dir> export [-o FILE] [--series PATTERN]... [--from TIME] [--to TIME] "
-                    "[--zstd-level N]\n");
+                    "[--zstd-level N] [--force]\n");
     exit(2);
 }
 
@@ -455,11 +479,14 @@ int dump_export_main(const char *dir, int argc, char **argv)
     const char *out_name = NULL;
     char **pat = calloc((size_t)argc + 1, sizeof *pat);
     int npat = 0, level = 1;
+    bool force = false;
     int64_t from = TSDB_TS_MIN, to = TSDB_TS_MAX;
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if ((strcmp(a, "-o") == 0 || strcmp(a, "--output") == 0) && v)
             out_name = argv[++i];
+        else if (strcmp(a, "--force") == 0)
+            force = true;
         else if (strcmp(a, "--series") == 0 && v)
             pat[npat++] = argv[++i];
         else if (strcmp(a, "--from") == 0 && v && parse_time(v, &from))
@@ -504,8 +531,18 @@ int dump_export_main(const char *dir, int argc, char **argv)
     char *tmp = NULL;
     FILE *out = stdout;
     if (out_name && strcmp(out_name, "-") != 0) {
-        if (asprintf(&tmp, "%s.partial", out_name) < 0 || !(out = fopen(tmp, "wb"))) {
-            fprintf(stderr, "tsdb: export: %s: %s\n", tmp ? tmp : out_name, strerror(errno));
+        /* an existing FILE.partial may be another export writing it now: not truncated without --force */
+        int fd = -1;
+        if (asprintf(&tmp, "%s.partial", out_name) < 0 ||
+            (fd = open(tmp, O_WRONLY | O_CREAT | O_CLOEXEC | (force ? O_TRUNC : O_EXCL), 0644)) < 0 ||
+            !(out = fdopen(fd, "wb"))) {
+            if (errno == EEXIST)
+                fprintf(stderr, "tsdb: export: %s exists: another export may be writing it, or one was "
+                                "interrupted; remove it or pass --force\n", tmp);
+            else
+                fprintf(stderr, "tsdb: export: %s: %s\n", tmp ? tmp : out_name, strerror(errno));
+            if (fd >= 0)
+                close(fd);
             tsdb_close(db);
             free(tmp);
             free(pat);
@@ -569,6 +606,11 @@ int dump_export_main(const char *dir, int argc, char **argv)
         const char *name = tsdb_series_name(db, id), *path = tsdb_series_path(db, id);
         if (!name || !matches(name, pat, npat))
             continue;
+        if (strlen(name) > DUMP_NAME_MAX || (path && strlen(path) > DUMP_NAME_MAX)) {
+            fprintf(stderr, "tsdb: export: series %u: its name or volume path is longer than the format allows\n", id);
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
         int64_t keep = 0;
         if ((rc = tsdb_series_type(db, id, &x.type)) != 0 || (rc = tsdb_get_retention(db, id, &keep)) != 0)
             break;
@@ -670,22 +712,39 @@ int dump_export_main(const char *dir, int argc, char **argv)
 enum { EXIST_ERROR, EXIST_SKIP, EXIST_MERGE, EXIST_REPLACE };
 
 typedef struct vmap {
-    const char *from, *to;
+    char *from, *to;
 } vmap;
+
+/* The source's state codes of the series being read -> the target's: open addressing sized by the names the stream
+ * gives, never by the code values (a stream may use any u32); a new generation empties it for the next series. */
+typedef struct code_slot {
+    uint32_t key, val, gen;
+} code_slot;
+
+/* The series names read so far, as two independent 64-bit hashes (16 bytes per series): a stream naming a series
+ * twice is refused before anything is written. */
+typedef struct name_slot {
+    uint64_t a, b;
+} name_slot;
 
 typedef struct importer {
     tsdb *db;
+    char root[PATH_MAX]; /* the target's directory, canonical */
     FILE *in;
     const char *in_name;
-    bool apply; /* false: the verifying pass, which writes nothing */
+    bool apply;  /* false: the verifying pass, which writes nothing */
+    bool report; /* this pass warns about rows past retention (the first pass only) */
     int existing;
-    bool create_volumes;
-    vmap *maps;
-    int nmaps;
+    bool create_volumes, no_retention;
+    vmap *maps, *roots;
+    int nmaps, nroots;
+    char **vols_ok; /* target volume paths checked already */
+    int nvols_ok;
     size_t batch_rows;
     ZSTD_DCtx *zd;
     uint64_t off; /* bytes of the stream read */
     uint32_t seq;
+    int64_t now_ms;
     char err[1024];
     /* header */
     uint32_t version, src_format;
@@ -696,27 +755,34 @@ typedef struct importer {
     /* the series being read */
     bool in_series;
     char *name, *path;
+    char vpath[PATH_MAX]; /* its volume in the target */
     tsdb_type type;
-    int64_t retention;
-    uint32_t id;     /* in the target, when apply */
-    bool skip;       /* existing, --skip-existing */
-    bool created;    /* by this import */
-    uint32_t *code;  /* source state code -> target code (0: not named yet) */
-    size_t code_cap;
+    int64_t retention, keep; /* the stream's; the one that will apply in the target (0: none) */
+    uint32_t id;             /* in the target, when apply */
+    bool skip;               /* existing, --skip-existing */
+    bool created;            /* by this import */
+    bool replacing, deleted; /* existing, --replace; its range deleted already (it did not fit one batch) */
+    code_slot *codes;
+    size_t codes_cap, codes_n;
+    uint32_t codes_gen;
+    name_slot *names;
+    size_t names_cap, names_n;
     int64_t last_ts;
     bool any_rows;
     int64_t min_written, max_written;
     bool written;
-    uint64_t s_rows, s_nulls;
+    uint64_t s_rows, s_nulls, s_expired;
     uint32_t s_chunks;
-    /* the batch to insert */
-    size_t n;
+    /* the batch: rows of whole series of one type, then from cur0 those of the series being read */
+    size_t n, cur0;
+    tsdb_type btype;
+    uint32_t *sid;
     int64_t *ts;
     uint8_t *val;
     uint8_t *valid;
     bool nulls;
     /* totals */
-    uint64_t t_series, t_rows, t_created, t_skipped, t_written_rows;
+    uint64_t t_series, t_rows, t_created, t_skipped, t_written_rows, t_expired, t_expired_series;
 } importer;
 
 #define IFAIL(im, ...) (snprintf((im)->err, sizeof (im)->err, __VA_ARGS__), -1)
@@ -774,31 +840,309 @@ static int im_header(importer *im, bool magic_read)
     return 0;
 }
 
+/* --------------------------------------------------------- volume paths */
+
+/* As the engine checks a volume path (tsdb_volume_add): absolute, no control characters, no . or .. */
+static bool vpath_valid(const char *p)
+{
+    if (p[0] != '/' || strlen(p) >= PATH_MAX)
+        return false;
+    for (const unsigned char *s = (const unsigned char *)p; *s; s++)
+        if (*s < 0x20 || *s == 0x7f)
+            return false;
+    for (const char *c = p; *c;) {
+        while (*c == '/')
+            c++;
+        size_t n = strcspn(c, "/");
+        if ((n == 1 && c[0] == '.') || (n == 2 && c[0] == '.' && c[1] == '.'))
+            return false;
+        c += n;
+    }
+    return true;
+}
+
+/* Repeated '/' collapsed, a trailing '/' dropped (in place): "/a//b/" and "/a/b" are the same volume. */
+static char *vpath_norm(char *p)
+{
+    size_t n = 0;
+    for (const char *s = p; *s; s++)
+        if (*s != '/' || n == 0 || p[n - 1] != '/')
+            p[n++] = *s;
+    if (n > 1 && p[n - 1] == '/')
+        n--;
+    p[n] = 0;
+    return p;
+}
+
+/* a is b or lies under it */
+static bool vpath_within(const char *a, const char *b)
+{
+    size_t n = strlen(b);
+    return (n == 1 && b[0] == '/') || (strncmp(a, b, n) == 0 && (a[n] == 0 || a[n] == '/'));
+}
+
 static bool is_volume(tsdb *db, const char *path)
 {
-    for (uint32_t i = 0; i < tsdb_volume_count(db); i++)
-        if (strcmp(tsdb_volume_path(db, i), path) == 0)
+    char canon[PATH_MAX];
+    bool c = realpath(path, canon) != NULL;
+    for (uint32_t i = 0; i < tsdb_volume_count(db); i++) {
+        const char *v = tsdb_volume_path(db, i);
+        if (strcmp(v, path) == 0 || (c && strcmp(v, canon) == 0))
             return true;
+    }
     return false;
 }
 
+/* Whether --create-volumes can add `path` (valid, not a volume yet): what tsdb_volume_add would refuse, checked
+ * before anything is written. NULL if it can, else why not. */
+static const char *vpath_creatable(importer *im, const char *path)
+{
+    static const char *const tsdb_files[] = {"ID", "CATALOG", "VOLUMES", "ROOT_ID", "MANIFEST", "SERIES", "LOCK",
+                                             "META"};
+    char canon[PATH_MAX];
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (!S_ISDIR(st.st_mode))
+            return "is not a directory";
+        if (!realpath(path, canon))
+            return strerror(errno);
+        int fd = open(canon, O_RDONLY | O_DIRECTORY);
+        if (fd < 0)
+            return strerror(errno);
+        bool has = false;
+        for (size_t i = 0; i < sizeof tsdb_files / sizeof *tsdb_files && !has; i++)
+            has = faccessat(fd, tsdb_files[i], F_OK, AT_SYMLINK_NOFOLLOW) == 0;
+        close(fd);
+        if (has)
+            return "holds tsdb files (a volume or the directory of another database?)";
+        if (access(canon, W_OK) != 0)
+            return "is not writable";
+    } else if (errno == ENOENT) { /* made one level deep: the parent must exist */
+        char parent[PATH_MAX], pcanon[PATH_MAX];
+        snprintf(parent, sizeof parent, "%s", path);
+        char *slash = strrchr(parent, '/');
+        const char *base = path + (slash - parent) + 1;
+        slash[slash == parent] = 0; /* "/a" -> "/", "/a/b" -> "/a" */
+        if (stat(parent, &st) != 0 || !S_ISDIR(st.st_mode))
+            return "does not exist, nor does its parent directory (a volume is made one level deep only)";
+        if (access(parent, W_OK) != 0)
+            return "does not exist, and its parent directory is not writable";
+        if (!realpath(parent, pcanon))
+            return strerror(errno);
+        if (snprintf(canon, sizeof canon, "%s/%s", strcmp(pcanon, "/") ? pcanon : "", base) >= (int)sizeof canon)
+            return "is too long";
+    } else {
+        return strerror(errno);
+    }
+    if (vpath_within(canon, im->root) || vpath_within(im->root, canon))
+        return "lies inside the database directory or contains it";
+    for (uint32_t i = 1; i < tsdb_volume_count(im->db); i++) {
+        const char *v = tsdb_volume_path(im->db, i);
+        if (vpath_within(canon, v) || vpath_within(v, canon))
+            return "lies inside another volume of this database or contains one";
+    }
+    return NULL;
+}
+
+/* The target volume of the series being read (--volume, then --volume-root, else its own path) into im->vpath,
+ * checked: a valid path that is a volume of the target, or one --create-volumes can add. */
+static int im_volume(importer *im, const char *name)
+{
+    char e1[256], e2[256];
+    char src[PATH_MAX];
+    snprintf(src, sizeof src, "%s", im->path);
+    vpath_norm(src);
+    const char *to = NULL;
+    for (int i = 0; i < im->nmaps && !to; i++)
+        if (strcmp(im->maps[i].from, src) == 0)
+            to = im->maps[i].to;
+    int root = -1; /* the longest --volume-root that holds the path */
+    for (int i = 0; i < im->nroots && !to && src[0]; i++)
+        if (vpath_within(src, im->roots[i].from) && (root < 0 || strlen(im->roots[i].from) > strlen(im->roots[root].from)))
+            root = i;
+    if (root >= 0) {
+        size_t k = strlen(im->roots[root].from);
+        const char *rest = src + (k == 1 ? 0 : k), *nw = strcmp(im->roots[root].to, "/") ? im->roots[root].to : "";
+        if (snprintf(im->vpath, sizeof im->vpath, "%s%s", nw, rest[0] || nw[0] ? rest : "/") >= (int)sizeof im->vpath)
+            return IFAIL(im, "series %s: volume %s mapped by --volume-root is too long", name,
+                         esc(src, e1, sizeof e1));
+        to = im->vpath;
+    }
+    if (to != im->vpath)
+        snprintf(im->vpath, sizeof im->vpath, "%s", to ? to : src);
+    vpath_norm(im->vpath);
+    if (!im->vpath[0])
+        return 0; /* the database directory */
+    if (!vpath_valid(im->vpath))
+        return IFAIL(im, "series %s: volume %s (from %s) is not a valid volume path: it must be absolute, without . "
+                         "or .. components", name, esc(im->vpath, e1, sizeof e1), esc(src, e2, sizeof e2));
+    if (!im->db)
+        return 0; /* --check: volumes are the target's business */
+    for (int i = 0; i < im->nvols_ok; i++)
+        if (strcmp(im->vols_ok[i], im->vpath) == 0)
+            return 0;
+    if (!is_volume(im->db, im->vpath)) {
+        if (!im->create_volumes)
+            return IFAIL(im, "series %s lives in volume %s, which is not a volume of this database: map it "
+                             "(--volume %s=NEW, --volume %s= for the database directory, or --volume-root OLD=NEW "
+                             "for every volume under OLD), add it (tsdb DIR volume add PATH) or pass "
+                             "--create-volumes", name, esc(im->vpath, e1, sizeof e1), esc(src, e2, sizeof e2),
+                         e2);
+        const char *why = vpath_creatable(im, im->vpath);
+        if (why)
+            return IFAIL(im, "series %s: volume %s %s: it cannot be added; map it elsewhere (--volume %s=NEW or "
+                             "--volume-root OLD=NEW)", name, esc(im->vpath, e1, sizeof e1), why,
+                         esc(src, e2, sizeof e2));
+    }
+    char **p = realloc(im->vols_ok, (size_t)(im->nvols_ok + 1) * sizeof *p);
+    if (!p || !(p[im->nvols_ok] = strdup(im->vpath))) {
+        if (p)
+            im->vols_ok = p;
+        return IFAIL(im, "out of memory");
+    }
+    im->vols_ok = p;
+    im->nvols_ok++;
+    return 0;
+}
+
+/* ------------------------------------------------- names and state codes */
+
+static void name_hash(const char *s, uint64_t *a, uint64_t *b)
+{
+    uint64_t x = 0xcbf29ce484222325ull, y = strlen(s) * 0x9e3779b97f4a7c15ull;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        x = (x ^ *p) * 0x100000001b3ull;
+        y = (y + *p + 1) * 0xbf58476d1ce4e5b9ull;
+        y ^= y >> 31;
+    }
+    y ^= y >> 29;
+    *a = x;
+    *b = y | 1; /* never 0: an empty slot is {0, 0} */
+}
+
+/* 1: the stream named this series before; 0: it is new (and noted); -1: out of memory */
+static int name_seen(importer *im, const char *name)
+{
+    if ((im->names_n + 1) * 2 > im->names_cap) {
+        size_t cap = im->names_cap ? im->names_cap * 2 : 1024;
+        name_slot *t = calloc(cap, sizeof *t);
+        if (!t)
+            return -1;
+        for (size_t i = 0; i < im->names_cap; i++)
+            if (im->names[i].b) {
+                size_t j = im->names[i].a & (cap - 1);
+                while (t[j].b)
+                    j = (j + 1) & (cap - 1);
+                t[j] = im->names[i];
+            }
+        free(im->names);
+        im->names = t;
+        im->names_cap = cap;
+    }
+    uint64_t a, b;
+    name_hash(name, &a, &b);
+    size_t j = a & (im->names_cap - 1);
+    for (; im->names[j].b; j = (j + 1) & (im->names_cap - 1))
+        if (im->names[j].a == a && im->names[j].b == b)
+            return 1;
+    im->names[j] = (name_slot){a, b};
+    im->names_n++;
+    return 0;
+}
+
+static size_t code_hash(uint32_t key, size_t cap) { return (size_t)(((uint64_t)key * 0x9e3779b97f4a7c15ull) >> 32) & (cap - 1); }
+
+/* The slot of a source code in this series: with add, made (val 0) if missing; NULL if missing or out of memory. */
+static uint32_t *code_slot_of(importer *im, uint32_t key, bool add)
+{
+    if (add && (im->codes_n + 1) * 2 > im->codes_cap) {
+        size_t cap = im->codes_cap ? im->codes_cap * 2 : 64;
+        code_slot *t = calloc(cap, sizeof *t);
+        if (!t)
+            return NULL;
+        for (size_t i = 0; i < im->codes_cap; i++)
+            if (im->codes[i].gen == im->codes_gen) {
+                size_t j = code_hash(im->codes[i].key, cap);
+                while (t[j].gen)
+                    j = (j + 1) & (cap - 1);
+                t[j] = im->codes[i];
+                t[j].gen = 1;
+            }
+        free(im->codes);
+        im->codes = t;
+        im->codes_cap = cap;
+        im->codes_gen = 1;
+    }
+    if (!im->codes_cap)
+        return NULL;
+    for (size_t j = code_hash(key, im->codes_cap);; j = (j + 1) & (im->codes_cap - 1)) {
+        code_slot *s = &im->codes[j];
+        if (s->gen != im->codes_gen) {
+            if (!add)
+                return NULL;
+            *s = (code_slot){key, 0, im->codes_gen};
+            im->codes_n++;
+            return &s->val;
+        }
+        if (s->key == key)
+            return &s->val;
+    }
+}
+
+static void codes_clear(importer *im)
+{
+    im->codes_n = 0;
+    if (++im->codes_gen == 0) { /* wrapped: slots of generation 0 would look current */
+        if (im->codes)
+            memset(im->codes, 0, im->codes_cap * sizeof *im->codes);
+        im->codes_gen = 1;
+    }
+}
+
+/* ------------------------------------------------------------ writing */
+
+/* Writes the first n rows of the batch and drops them. */
+static int im_write(importer *im, size_t n)
+{
+    if (!n)
+        return 0;
+    tsdb_values v = {im->btype, im->val, im->nulls ? im->valid : NULL};
+    int rc = tsdb_insert_values(im->db, im->sid, im->ts, &v, n);
+    if (rc)
+        return IFAIL(im, "writing rows: %s", tsdb_strerror(rc));
+    im->t_written_rows += n;
+    return 0;
+}
+
+/* Writes the whole batch: the series before the current one and the current one's rows so far. */
 static int im_insert(importer *im)
 {
+    char e[256];
     if (!im->n)
         return 0;
-    if (im->apply && !im->skip) {
-        tsdb_values v = {im->type, im->val, im->nulls ? im->valid : NULL};
-        int rc = tsdb_insert_series_values(im->db, im->id, im->ts, &v, im->n);
+    if (!im->apply) {
+        im->n = im->cur0 = 0;
+        return 0;
+    }
+    if (im->in_series && im->replacing && !im->deleted && im->n > im->cur0) {
+        /* more rows than one batch: the range is deleted first, so a crash before the import ends leaves it
+         * partly written; rerunning the import (from the file) restores it */
+        int rc = tsdb_delete_range(im->db, im->id, im->from, im->to);
         if (rc)
-            return IFAIL(im, "writing series: %s", tsdb_strerror(rc));
-        if (!im->written || im->ts[0] < im->min_written)
-            im->min_written = im->ts[0];
+            return IFAIL(im, "series %s: deleting the values it replaces: %s", esc(im->name, e, sizeof e),
+                         tsdb_strerror(rc));
+        im->deleted = true;
+    }
+    if (im_write(im, im->n))
+        return -1;
+    if (im->in_series && im->n > im->cur0) {
+        if (!im->written || im->ts[im->cur0] < im->min_written)
+            im->min_written = im->ts[im->cur0];
         if (!im->written || im->ts[im->n - 1] > im->max_written)
             im->max_written = im->ts[im->n - 1];
         im->written = true;
-        im->t_written_rows += im->n;
     }
-    im->n = 0;
+    im->n = im->cur0 = 0;
     im->nulls = false;
     return 0;
 }
@@ -817,18 +1161,25 @@ static int im_series(importer *im, cur *c)
     if (im->path[0] && im->path[0] != '/')
         return IFAIL(im, "record %u (a series) is damaged: volume path %s is not absolute", im->seq,
                      esc(im->path, e1, sizeof e1));
-    im->type = (tsdb_type)type;
-    im->in_series = true;
-    im->skip = im->created = im->written = im->any_rows = false;
-    im->s_rows = im->s_nulls = 0;
-    im->s_chunks = 0;
-    im->n = 0;
-    im->nulls = false;
-    if (im->code)
-        memset(im->code, 0, im->code_cap * sizeof *im->code);
     const char *name = esc(im->name, e1, sizeof e1);
+    int seen = name_seen(im, im->name);
+    if (seen < 0)
+        return IFAIL(im, "out of memory");
+    if (seen)
+        return IFAIL(im, "the stream holds series %s twice: it is damaged", name);
+    /* a batch holds one value type */
+    if (im->n && im->btype != (tsdb_type)type && im_insert(im))
+        return -1;
+    im->type = im->btype = (tsdb_type)type;
+    im->cur0 = im->n;
+    im->in_series = true;
+    im->skip = im->created = im->written = im->any_rows = im->replacing = im->deleted = false;
+    im->s_rows = im->s_nulls = im->s_expired = 0;
+    im->s_chunks = 0;
+    im->keep = im->no_retention ? 0 : im->retention;
+    codes_clear(im);
     if (!im->db)
-        return 0;
+        return im_volume(im, name);
 
     uint32_t id;
     int rc = tsdb_series_lookup(im->db, im->name, &id);
@@ -841,36 +1192,38 @@ static int im_series(importer *im, cur *c)
                          type_name[im->type]);
         if (im->existing == EXIST_ERROR)
             return IFAIL(im, "series %s exists; pass --skip-existing, --merge or --replace", name);
-        im->skip = im->existing == EXIST_SKIP;
         im->id = id;
-        if (im->apply && im->existing == EXIST_REPLACE && (rc = tsdb_delete_range(im->db, id, im->from, im->to)) != 0)
-            return IFAIL(im, "series %s: deleting the values it replaces: %s", name, tsdb_strerror(rc));
-        if (im->apply && im->existing == EXIST_REPLACE && (rc = tsdb_set_retention(im->db, id, im->retention)) != 0)
-            return IFAIL(im, "series %s: setting its retention: %s", name, tsdb_strerror(rc));
+        im->skip = im->existing == EXIST_SKIP;
+        if (im->skip) {
+            im->keep = 0;
+        } else if (im->existing == EXIST_MERGE) {
+            int64_t keep = 0;
+            im->keep = tsdb_get_retention(im->db, id, &keep) == 0 ? keep : 0;
+        } else {
+            im->replacing = true;
+            /* the series' rows start a batch of their own, so that they can replace the range in one call */
+            if (im->apply && im->n && im_insert(im))
+                return -1;
+            if (im->apply && !im->no_retention && (rc = tsdb_set_retention(im->db, id, im->retention)) != 0)
+                return IFAIL(im, "series %s: setting its retention: %s", name, tsdb_strerror(rc));
+        }
         return 0;
     }
     if (rc != TSDB_ERR_NOTFOUND)
         return IFAIL(im, "series %s: %s", name, tsdb_strerror(rc));
-    const char *path = im->path;
-    for (int i = 0; i < im->nmaps; i++)
-        if (strcmp(im->maps[i].from, path) == 0) {
-            path = im->maps[i].to;
-            break;
-        }
-    if (path[0] && !is_volume(im->db, path) && !im->create_volumes)
-        return IFAIL(im, "series %s lives in volume %s, which is not a volume of this database: add it (tsdb DIR "
-                         "volume add PATH), map it to another (--volume %s=NEW, or =  for the database directory) "
-                         "or pass --create-volumes", name, esc(path, e2, sizeof e2), esc(im->path, e2, sizeof e2));
+    if (im_volume(im, name))
+        return -1;
     if (!im->apply)
         return 0;
+    const char *path = im->vpath;
     uint32_t vol;
     if (path[0] && !is_volume(im->db, path) && (rc = tsdb_volume_add(im->db, path, &vol)) != 0)
-        return IFAIL(im, "adding volume %s: %s", esc(path, e2, sizeof e2), tsdb_strerror(rc));
+        return IFAIL(im, "series %s: adding volume %s: %s", name, esc(path, e2, sizeof e2), tsdb_strerror(rc));
     if ((rc = tsdb_series_create(im->db, im->name, im->type, path[0] ? path : NULL, &im->id)) != 0)
         return IFAIL(im, "creating series %s: %s", name, tsdb_strerror(rc));
     im->created = true;
     im->t_created++;
-    if (im->retention && (rc = tsdb_set_retention(im->db, im->id, im->retention)) != 0)
+    if (im->keep && (rc = tsdb_set_retention(im->db, im->id, im->keep)) != 0)
         return IFAIL(im, "series %s: setting its retention: %s", name, tsdb_strerror(rc));
     return 0;
 }
@@ -886,20 +1239,12 @@ static int im_states(importer *im, cur *c)
         uint32_t code = take_u32(c), len = take_u32(c);
         if (c->bad || !take_str(c, len, &name) || code == 0 || !name[0])
             break;
-        if (code >= im->code_cap) {
-            size_t cap = im->code_cap ? im->code_cap : 1024;
-            while (cap <= code)
-                cap *= 2;
-            uint32_t *p = realloc(im->code, cap * sizeof *p);
-            if (!p) {
-                free(name);
-                return IFAIL(im, "out of memory");
-            }
-            memset(p + im->code_cap, 0, (cap - im->code_cap) * sizeof *p);
-            im->code = p;
-            im->code_cap = cap;
+        uint32_t *slot = code_slot_of(im, code, true);
+        if (!slot) {
+            free(name);
+            return IFAIL(im, "out of memory");
         }
-        if (im->code[code]) {
+        if (*slot) {
             free(name);
             return IFAIL(im, "record %u names state code %u twice: the stream is damaged", im->seq, code);
         }
@@ -910,7 +1255,7 @@ static int im_states(importer *im, cur *c)
             free(name);
             return -1;
         }
-        im->code[code] = target;
+        *slot = target;
     }
     free(name);
     if (c->bad || c->p != c->end)
@@ -951,7 +1296,8 @@ static int im_chunk(importer *im, cur *c)
     if (im->n + rows > im->batch_rows && im_insert(im))
         return -1;
     int64_t *ts = im->ts + im->n;
-    uint64_t z;
+    int64_t cutoff = im->keep ? im->now_ms - im->keep : INT64_MIN;
+    uint64_t z, expired = 0;
     for (uint32_t i = 0; i < rows; i++) {
         if (!take_varint(&r, &z))
             return IFAIL(im, "record %u (rows) is damaged", im->seq);
@@ -960,6 +1306,7 @@ static int im_chunk(importer *im, cur *c)
             t == TSDB_TS_MAX)
             return IFAIL(im, "record %u (rows): times out of order or out of range: the stream is damaged", im->seq);
         ts[i] = t;
+        expired += t < cutoff;
     }
     im->any_rows = true;
     im->last_ts = ts[rows - 1];
@@ -978,12 +1325,13 @@ static int im_chunk(importer *im, cur *c)
         if (d % 8 == 0)
             im->valid[d >> 3] = 0;
         im->valid[d >> 3] |= (uint8_t)(ok << (d & 7));
+        im->sid[d] = im->id;
         if (!ok) {
             nulls++;
             continue;
         }
         const uint8_t *v = val + (size_t)i * w;
-        uint32_t u32;
+        uint32_t u32, *slot;
         uint64_t u64;
         bool bad = false;
         switch (im->type) {
@@ -1004,23 +1352,25 @@ static int im_chunk(importer *im, cur *c)
             break;
         case TSDB_STATE:
             memcpy(&u32, v, 4);
-            if (u32 == 0 || u32 >= im->code_cap || !im->code[u32])
+            if (u32 == 0 || !(slot = code_slot_of(im, u32, false)))
                 return IFAIL(im, "record %u (rows) has a state code without a name: the stream is damaged",
                              im->seq);
-            u32 = im->code[u32];
-            memcpy((uint8_t *)v, &u32, 4);
+            memcpy((uint8_t *)v, slot, 4);
             break;
         }
         if (bad)
             return IFAIL(im, "record %u (rows) holds a value reserved for null: the stream is damaged", im->seq);
     }
     /* the values were copied in the stream's byte order, little-endian, which is the host's (x86-64, arm64) */
+    im->s_rows += rows;
+    im->s_nulls += nulls;
+    im->s_expired += expired;
+    im->s_chunks++;
+    if (!im->apply || im->skip)
+        return 0; /* checked; nothing to write */
     if (nulls)
         im->nulls = true;
     im->n += rows;
-    im->s_rows += rows;
-    im->s_nulls += nulls;
-    im->s_chunks++;
     if (im->n >= im->batch_rows)
         return im_insert(im);
     return 0;
@@ -1028,17 +1378,37 @@ static int im_chunk(importer *im, cur *c)
 
 static int im_end(importer *im, cur *c)
 {
+    char e[256];
     if (!im->in_series)
         return IFAIL(im, "record %u (end of series) is out of place: the stream is damaged", im->seq);
     uint64_t rows = take_u64(c), nulls = take_u64(c);
     uint32_t chunks = take_u32(c);
-    if (c->bad || rows != im->s_rows || nulls != im->s_nulls || chunks != im->s_chunks)
+    if (c->bad || c->p != c->end || rows != im->s_rows || nulls != im->s_nulls || chunks != im->s_chunks)
         return IFAIL(im, "series %s: the stream says %" PRIu64 " rows, %" PRIu64 " nulls in %u chunks, but holds %"
-                         PRIu64 ", %" PRIu64 " in %u: it is damaged", im->name, rows, nulls, chunks, im->s_rows,
-                     im->s_nulls, im->s_chunks);
-    if (im_insert(im))
-        return -1;
+                         PRIu64 ", %" PRIu64 " in %u: it is damaged", esc(im->name, e, sizeof e), rows, nulls,
+                     chunks, im->s_rows, im->s_nulls, im->s_chunks);
+    if (im->apply && im->replacing && !im->deleted) { /* the whole series in one batch: replaced atomically */
+        tsdb_values v = {im->type, im->val + im->cur0 * type_width[im->type], NULL};
+        if (im->nulls) /* cur0 is 0 here: the batch was written before the series began */
+            v.valid = im->valid;
+        int rc = tsdb_replace_range(im->db, im->id, im->from, im->to, im->ts + im->cur0, &v, im->n - im->cur0);
+        if (rc)
+            return IFAIL(im, "series %s: replacing its values: %s", esc(im->name, e, sizeof e), tsdb_strerror(rc));
+        im->t_written_rows += im->n - im->cur0;
+        im->n = im->cur0;
+        im->nulls = false;
+    }
+    if (im->report && im->s_expired) {
+        if (im->t_expired_series < 20)
+            fprintf(stderr, "tsdb: import: warning: series %s: %" PRIu64 " of its %" PRIu64 " rows are older than "
+                            "its retention (%" PRId64 " ms) and will not be visible (--no-retention imports them "
+                            "without the stream's retention)\n", esc(im->name, e, sizeof e), im->s_expired, rows,
+                    im->keep);
+        im->t_expired_series++;
+        im->t_expired += im->s_expired;
+    }
     im->in_series = false;
+    im->cur0 = im->n; /* the series is whole: its rows in the batch may be written with the next ones */
     im->t_series++;
     im->t_rows += rows;
     if (im->skip)
@@ -1049,11 +1419,18 @@ static int im_end(importer *im, cur *c)
 /* One pass over the stream (after its magic, when magic_read). */
 static int im_pass(importer *im, bool magic_read)
 {
+    char e[256];
     if (im_header(im, magic_read))
         return -1;
     im->seq = 0;
     im->in_series = false;
+    im->n = im->cur0 = 0;
+    im->nulls = false;
+    im->names_n = 0;
+    if (im->names)
+        memset(im->names, 0, im->names_cap * sizeof *im->names);
     im->t_series = im->t_rows = im->t_created = im->t_skipped = im->t_written_rows = 0;
+    im->t_expired = im->t_expired_series = 0;
     for (;;) {
         uint8_t h[16];
         if (im_read(im, h, 16, "a record header"))
@@ -1070,12 +1447,15 @@ static int im_pass(importer *im, bool magic_read)
         if (seq != im->seq || h[2] || h[3])
             return IFAIL(im, "record %u at byte %" PRIu64 " is out of sequence: the stream is damaged", im->seq,
                          im->off - 16 - len);
+        if (h[1] & ~REC_F_OPTIONAL)
+            return IFAIL(im, "record %u uses features this tsdb does not know (flags %#x): import it with a newer "
+                             "tsdb", im->seq, h[1]);
         cur c = {im->rec.p, im->rec.p + len, false};
         int rc = 0;
         switch (h[0]) {
         case REC_SERIES:
             if (im->in_series)
-                return IFAIL(im, "series %s has no end record: the stream is damaged", im->name);
+                return IFAIL(im, "series %s has no end record: the stream is damaged", esc(im->name, e, sizeof e));
             rc = im_series(im, &c);
             break;
         case REC_STATES:
@@ -1090,18 +1470,19 @@ static int im_pass(importer *im, bool magic_read)
         case REC_TRAILER: {
             uint64_t series = take_u64(&c), rows = take_u64(&c), records = take_u64(&c);
             if (im->in_series)
-                return IFAIL(im, "series %s has no end record: the stream is damaged", im->name);
+                return IFAIL(im, "series %s has no end record: the stream is damaged", esc(im->name, e, sizeof e));
             if (c.bad || series != im->t_series || rows != im->t_rows || records != im->seq)
                 return IFAIL(im, "the trailer does not match the stream (%" PRIu64 " series, %" PRIu64
                                  " rows): it is damaged", series, rows);
             if (fgetc(im->in) != EOF)
                 return IFAIL(im, "bytes follow the trailer at byte %" PRIu64 ": the stream is damaged", im->off);
-            return 0;
+            return im_insert(im);
         }
         default:
             if (!(h[1] & REC_F_OPTIONAL))
                 return IFAIL(im, "record %u has kind %u, which this tsdb does not know: import it with a newer tsdb "
-                                 "(the stream was written by tsdb %s)", im->seq, h[0], im->src_version);
+                                 "(the stream was written by tsdb %s)", im->seq, h[0],
+                             esc(im->src_version, e, sizeof e));
         }
         if (rc)
             return -1;
@@ -1112,7 +1493,8 @@ static int im_pass(importer *im, bool magic_read)
 static void import_usage(void)
 {
     fprintf(stderr, "usage: tsdb <dir> import [FILE|-] [--skip-existing|--merge|--replace] [--volume OLD=NEW]... "
-                    "[--create-volumes] [--no-verify] [--batch-rows N]\n"
+                    "[--volume-root OLD=NEW]... [--create-volumes] [--no-retention] [--no-verify] "
+                    "[--batch-rows N]\n"
                     "       tsdb <dir> import --check [FILE|-]\n");
     exit(2);
 }
@@ -1145,13 +1527,73 @@ static int prefixed_close(void *arg)
     return rc;
 }
 
+/* The target does not exist yet or is an empty directory. */
+static bool dir_is_new(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d)
+        return errno == ENOENT;
+    struct dirent *e;
+    bool empty = true;
+    while (empty && (e = readdir(d)))
+        empty = strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0;
+    closedir(d);
+    return empty;
+}
+
+/* Makes a database written with fsync = 0 durable: every file system it lives on (syncfs reports the writeback
+ * errors of each since Linux 5.8), its directories, and the entry of its root in the parent directory. */
+static bool sync_all(const char *dir, char **vols, uint32_t nv)
+{
+    bool ok = true;
+    for (uint32_t i = 0; i <= nv; i++) {
+        const char *p = i < nv ? vols[i] : dir;
+        int fd = p ? open(p, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
+        if (fd < 0 || syncfs(fd) != 0 || fsync(fd) != 0)
+            ok = false;
+        if (fd >= 0)
+            close(fd);
+    }
+    char *parent = strdup(dir), *slash = parent ? strrchr(parent, '/') : NULL;
+    if (slash)
+        slash[slash == parent] = 0;
+    int fd = !parent ? -1 : open(slash ? parent : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0 || fsync(fd) != 0)
+        ok = false;
+    if (fd >= 0)
+        close(fd);
+    free(parent);
+    return ok;
+}
+
+/* --volume and --volume-root: OLD=NEW, both normalised ("/a/b/" is "/a/b"); NEW may be empty for --volume (the
+ * database directory). */
+static bool add_map(vmap *m, int *n, const char *v, bool root)
+{
+    const char *eq = strchr(v, '=');
+    if (!eq || eq == v)
+        return false;
+    char *from = strndup(v, (size_t)(eq - v)), *to = strdup(eq + 1);
+    if (!from || !to || !vpath_valid(vpath_norm(from)) || (to[0] && !vpath_valid(vpath_norm(to))) ||
+        (root && !to[0])) {
+        fprintf(stderr, "tsdb: import: %s %s: OLD and NEW must be absolute paths without . or .. components%s\n",
+                root ? "--volume-root" : "--volume", v, root ? "" : " (NEW may be empty: the database directory)");
+        free(from);
+        free(to);
+        exit(2);
+    }
+    m[(*n)++] = (vmap){from, to};
+    return true;
+}
+
 /* Everything the importer owns is freed by dump_import_main, so that no return path can leak it. */
 static int import_run(const char *dir, int argc, char **argv, FILE **csv, importer *im)
 {
     const char *in_name = NULL;
     bool check = false, verify = true, dump_opts = false;
     im->maps = calloc((size_t)argc + 1, sizeof *im->maps);
-    if (!im->maps) {
+    im->roots = calloc((size_t)argc + 1, sizeof *im->roots);
+    if (!im->maps || !im->roots) {
         fprintf(stderr, "tsdb: out of memory\n");
         return 1;
     }
@@ -1169,14 +1611,15 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
             im->existing = EXIST_REPLACE;
         else if (strcmp(a, "--create-volumes") == 0)
             im->create_volumes = true;
+        else if (strcmp(a, "--no-retention") == 0)
+            im->no_retention = true;
         else if (strcmp(a, "--no-verify") == 0)
             verify = false;
-        else if (strcmp(a, "--volume") == 0 && v && strchr(v, '=')) {
-            char *s = strdup(v), *eq = strchr(s, '=');
-            *eq = 0;
-            im->maps[im->nmaps++] = (vmap){s, eq + 1};
+        else if (strcmp(a, "--volume") == 0 && v && add_map(im->maps, &im->nmaps, v, false))
             i++;
-        } else if (strcmp(a, "--batch-rows") == 0 && v) {
+        else if (strcmp(a, "--volume-root") == 0 && v && add_map(im->roots, &im->nroots, v, true))
+            i++;
+        else if (strcmp(a, "--batch-rows") == 0 && v) {
             char *end;
             unsigned long long n = strtoull(v, &end, 10);
             if (*end || end == v || n < 1 || n > 100000000)
@@ -1189,13 +1632,14 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
             import_usage();
     }
     FILE *in = stdin;
-    if (in_name && strcmp(in_name, "-") != 0) {
+    bool named = in_name && strcmp(in_name, "-") != 0;
+    if (named) {
         if (!(in = fopen(in_name, "rb"))) {
             fprintf(stderr, "tsdb: import: %s: %s\n", in_name, strerror(errno));
             return 1;
         }
     } else {
-        in_name = "standard input";
+        in_name = "standard input"; /* a terminal: CSV typed in ends with ^D (the first 16 bytes are read first) */
     }
     static char ibuf[1 << 20];
     setvbuf(in, ibuf, _IOFBF, sizeof ibuf);
@@ -1207,10 +1651,24 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
         return 1;
     }
     pre->f = in;
-    /* 16 bytes: an export stream has NUL bytes there (its version), CSV text never has; so a stream whose magic
-     * is damaged is refused rather than read as CSV */
     pre->n = fread(pre->head, 1, 16, in);
-    if (pre->n < 8 || memcmp(pre->head, DUMP_MAGIC, 8) != 0) {
+    /* An empty input imports nothing, and a backup cut to a few bytes must not "restore" as such */
+    if (pre->n == 0 || (named && pre->n < 16)) {
+        if (ferror(in))
+            fprintf(stderr, "tsdb: import: %s: %s\n", in_name, strerror(errno));
+        else
+            fprintf(stderr, "tsdb: import: %s %s: not an export stream or CSV\n", in_name,
+                    pre->n ? "is shorter than a stream header" : "is empty");
+        free(pre);
+        if (in != stdin)
+            fclose(in);
+        return 1;
+    }
+    /* A stream has its version, with NUL bytes, in bytes 8..15; CSV text never has NUL bytes, so a CSV line that
+     * happens to start with the magic is still CSV, and a stream whose magic is damaged is refused, not read as
+     * CSV */
+    bool stream = pre->n == 16 && memcmp(pre->head, DUMP_MAGIC, 8) == 0 && memchr(pre->head + 8, 0, 8);
+    if (!stream) {
         if (check || dump_opts || memchr(pre->head, 0, pre->n)) {
             fprintf(stderr, "tsdb: import: %s is not a tsdb export stream%s\n", in_name,
                     check || !dump_opts ? (check ? "" : ", nor CSV text (a damaged stream?)")
@@ -1226,6 +1684,16 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
     crc_init();
     struct stat st;
     bool seekable = fstat(fileno(in), &st) == 0 && S_ISREG(st.st_mode);
+    if (im->existing == EXIST_REPLACE && !check && (!seekable || !verify)) {
+        fprintf(stderr, "tsdb: import: --replace %s: it deletes what each series holds in the stream's time range, "
+                        "so the whole stream must be checked before anything is deleted, and a pipe cannot be read "
+                        "twice; save the stream to a file and import that, or use --merge\n",
+                !verify ? "cannot be used with --no-verify" : "needs the stream in a file");
+        free(pre);
+        if (in != stdin)
+            fclose(in);
+        return 2;
+    }
     /* up to 8 bytes after the magic were read too: a file seeks back to them, a pipe gets them in front */
     if (seekable) {
         free(pre);
@@ -1250,13 +1718,28 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
     im->in_name = in_name;
     im->off = 8;
     im->zd = ZSTD_createDCtx();
+    struct timespec tsn; /* retention's "now": the wall clock, as the engine's */
+    clock_gettime(CLOCK_REALTIME, &tsn);
+    im->now_ms = (int64_t)tsn.tv_sec * 1000 + tsn.tv_nsec / 1000000;
     double t0 = now_s();
     int ret = 1;
     tsdb *db = NULL; /* none with --check: every series is taken as new and every volume as present */
+    bool fresh = false;
     if (!check) {
         tsdb_options o;
         tsdb_options_init(&o);
         o.create_volumes = 0; /* volumes only through --create-volumes */
+        /* Into a new database, nothing is synced file by file (two syncs per new series and one per part
+         * otherwise: they bound small series to ~700 per second); every file system of it is synced once at the
+         * end instead. A power loss before that leaves a database that fails its checks at open: it held
+         * nothing else, so it is removed and the import rerun. An existing database keeps every sync. */
+        fresh = dir_is_new(dir);
+        if (fresh)
+            o.fsync = 0;
+        /* No WAL: rows of small series collect in the memtable and reach the disk as parts, synced, at the
+         * flush at the end (large batches go straight to synced parts). A crash before that loses rows of this
+         * import only: rerun it with --merge, which writes the same rows again. */
+        o.wal_sync_ms = -1;
         int rc = tsdb_open(dir, &o, &db);
         if (rc) {
             fprintf(stderr, "tsdb: %s: %s\n", dir, tsdb_strerror(rc));
@@ -1264,12 +1747,16 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
                 fclose(in);
             return 1;
         }
+        if (!realpath(dir, im->root))
+            snprintf(im->root, sizeof im->root, "%s", tsdb_volume_path(db, 0));
     }
     im->db = db;
-    im->ts = malloc(im->batch_rows * 8 + DUMP_CHUNK_MAX * 8);
-    im->val = malloc(im->batch_rows * 8 + DUMP_CHUNK_MAX * 8);
-    im->valid = malloc((im->batch_rows + DUMP_CHUNK_MAX) / 8 + 1);
-    if (!im->ts || !im->val || !im->valid || !im->zd) {
+    size_t cap = im->batch_rows + DUMP_CHUNK_MAX;
+    im->ts = malloc(cap * 8);
+    im->val = malloc(cap * 8);
+    im->sid = malloc(cap * 4);
+    im->valid = malloc(cap / 8 + 1);
+    if (!im->ts || !im->val || !im->sid || !im->valid || !im->zd) {
         fprintf(stderr, "tsdb: out of memory\n");
         if (db)
             tsdb_close(db);
@@ -1277,11 +1764,14 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
             fclose(in);
         return 1;
     }
-    char e[256];
+    char e[256], e2[256];
     int rc = 0;
+    bool verified = false;
     if (check || (seekable && verify)) {
         im->apply = false;
+        im->report = true;
         rc = im_pass(im, true);
+        verified = !rc;
         if (!rc && !check) {
             if (fseek(in, 0, SEEK_SET) != 0) {
                 fprintf(stderr, "tsdb: import: %s: %s\n", in_name, strerror(errno));
@@ -1296,40 +1786,72 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
     }
     if (!rc && !check) {
         im->apply = true;
-        rc = im_pass(im, !(seekable && verify));
+        im->report = !verified;
+        rc = im_pass(im, !verified);
     }
+    if (im->t_expired_series > 20)
+        fprintf(stderr, "tsdb: import: warning: %" PRIu64 " series in all have %" PRIu64 " rows older than their "
+                        "retention\n", im->t_expired_series, im->t_expired);
     if (rc) {
         fprintf(stderr, "tsdb: import: %s: %s\n", in_name, im->err);
         if (im->apply) {
-            if (im->in_series && im->created && im->written) {
-                int drc = tsdb_delete_range(db, im->id, im->min_written, im->max_written + 1);
-                fprintf(stderr, "tsdb: import: series %s, which this import created, %s\n", esc(im->name, e, sizeof e),
-                        drc ? "could not be emptied again" : "was emptied again");
-            } else if (im->in_series && im->written) {
-                fprintf(stderr, "tsdb: import: series %s is partly imported\n", esc(im->name, e, sizeof e));
+            /* the series read whole are written; the rows of the one that failed are not */
+            uint64_t whole = im->t_series;
+            size_t keep = im->in_series ? im->cur0 : im->n;
+            if (keep && im_write(im, keep)) {
+                fprintf(stderr, "tsdb: import: %s\n", im->err);
+                whole = 0;
             }
-            fprintf(stderr, "tsdb: import: %" PRIu64 " series before it were imported completely\n", im->t_series);
+            if (im->in_series && im->created) {
+                const char *name = esc(im->name, e, sizeof e);
+                int drc = im->written ? tsdb_delete_range(db, im->id, im->min_written, im->max_written + 1) : 0;
+                if (drc)
+                    fprintf(stderr, "tsdb: import: series %s, which this import created, could not be emptied "
+                                    "again: %s\n", name, tsdb_strerror(drc));
+                else
+                    fprintf(stderr, "tsdb: import: series %s, which this import created, is left empty: rerun "
+                                    "the import with --merge\n", name);
+            } else if (im->in_series && (im->written || im->deleted)) {
+                fprintf(stderr, "tsdb: import: series %s is partly imported: rerun the import with --merge%s\n",
+                        esc(im->name, e2, sizeof e2), im->replacing ? " or --replace" : "");
+            }
+            fprintf(stderr, "tsdb: import: %" PRIu64 " series before it were imported completely\n", whole);
         } else if (!check) {
             fprintf(stderr, "tsdb: import: nothing was written\n");
         }
+    } else if (check) {
+        fprintf(stderr, "%s: a whole tsdb export stream, version %u, from tsdb %s (format %u): %" PRIu64 " series, %"
+                        PRIu64 " rows\n", in_name, im->version, esc(im->src_version, e, sizeof e), im->src_format,
+                im->t_series, im->t_rows);
+        ret = 0;
+    } else if ((rc = tsdb_flush(db)) != 0) {
+        fprintf(stderr, "tsdb: import: writing the last rows: %s\n", tsdb_strerror(rc));
     } else {
         double dt = now_s() - t0;
-        if (check)
-            fprintf(stderr, "%s: a whole tsdb export stream, version %u, from tsdb %s (format %u): %" PRIu64
-                            " series, %" PRIu64 " rows\n", in_name, im->version, im->src_version, im->src_format,
-                    im->t_series, im->t_rows);
-        else
-            fprintf(stderr, "imported %" PRIu64 " series (%" PRIu64 " created, %" PRIu64 " skipped), %" PRIu64
-                            " rows in %.2f s (%.1f M rows/s)\n", im->t_series, im->t_created, im->t_skipped,
-                    im->t_written_rows, dt, dt > 0 ? (double)im->t_written_rows / dt / 1e6 : 0.0);
+        fprintf(stderr, "imported %" PRIu64 " series (%" PRIu64 " created, %" PRIu64 " skipped), %" PRIu64
+                        " rows in %.2f s (%.1f M rows/s)\n", im->t_series, im->t_created, im->t_skipped,
+                im->t_written_rows, dt, dt > 0 ? (double)im->t_written_rows / dt / 1e6 : 0.0);
         ret = 0;
     }
     if (db) {
-        int crc = tsdb_close(db);
+        char **vols = NULL;
+        uint32_t nv = fresh ? tsdb_volume_count(db) : 0;
+        if (nv && !(vols = calloc(nv, sizeof *vols)))
+            nv = 0;
+        for (uint32_t i = 0; i < nv; i++)
+            vols[i] = strdup(tsdb_volume_path(db, i));
+        int crc = tsdb_close(db); /* flushes what the error path left in the memtable */
         if (crc) {
             fprintf(stderr, "tsdb: close: %s\n", tsdb_strerror(crc));
             ret = 1;
         }
+        if (fresh && !sync_all(dir, vols, nv)) {
+            fprintf(stderr, "tsdb: import: syncing %s: %s\n", dir, strerror(errno));
+            ret = 1;
+        }
+        for (uint32_t i = 0; i < nv; i++)
+            free(vols[i]);
+        free(vols);
     }
     if (in != stdin)
         fclose(in);
@@ -1344,15 +1866,27 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
         ZSTD_freeDCtx(im.zd);
     free(im.ts);
     free(im.val);
+    free(im.sid);
     free(im.valid);
-    free(im.code);
+    free(im.codes);
+    free(im.names);
     free(im.rec.p);
     free(im.raw.p);
     free(im.name);
     free(im.path);
     free(im.src_version);
-    for (int i = 0; i < im.nmaps; i++)
-        free((char *)im.maps[i].from);
+    for (int i = 0; i < im.nmaps; i++) {
+        free(im.maps[i].from);
+        free(im.maps[i].to);
+    }
+    for (int i = 0; i < im.nroots; i++) {
+        free(im.roots[i].from);
+        free(im.roots[i].to);
+    }
+    for (int i = 0; i < im.nvols_ok; i++)
+        free(im.vols_ok[i]);
+    free(im.vols_ok);
     free(im.maps);
+    free(im.roots);
     return ret;
 }

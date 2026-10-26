@@ -269,6 +269,9 @@ static uint32_t lookup(tsdb *db, const char *name)
     return id;
 }
 
+/* strcmp that a NULL (a series missing) makes false instead of a crash */
+static bool same_str(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
+
 /* The series `name` reads the same in both databases over [a, b): type, retention, every row bit for bit, state
  * codes by name. */
 static bool same_series(tsdb *s, tsdb *d, const char *name, int64_t a, int64_t b)
@@ -578,8 +581,8 @@ static void test_round_trip(void)
     CHECK(tsdb_series_count(d) == NALL);
     for (int i = 0; i < NALL; i++)
         CHECK(same_series(s, d, all_series[i], TSDB_TS_MIN, TSDB_TS_MAX));
-    CHECK(strcmp(tsdb_series_path(d, lookup(d, "f64")), path("vol2")) == 0);
-    CHECK(strcmp(tsdb_series_path(d, lookup(d, "temp/a")), dst) == 0);
+    CHECK(same_str(tsdb_series_path(d, lookup(d, "f64")), path("vol2")));
+    CHECK(same_str(tsdb_series_path(d, lookup(d, "temp/a")), dst));
     /* deletes were applied and the memtable's rows won */
     CHECK(rows_of(d, "temp/a") == BIG - 1000 + 1);
     col c = read_series(d, lookup(d, "temp/a"), T0, T0 + 1);
@@ -645,7 +648,7 @@ static void test_filters_and_existing(void)
     int64_t a = T0 + 50000 * 1000LL, b = T0 + 60000 * 1000LL;
     CHECK(same_series(s, d, "mode", a, b) && same_series(s, d, "mode2", a, b) && same_series(s, d, "i64", a, b));
     CHECK(rows_of(d, "mode") == 10000);
-    CHECK(strcmp(tsdb_series_path(d, lookup(d, "mode2")), dst) == 0);
+    CHECK(same_str(tsdb_series_path(d, lookup(d, "mode2")), dst));
     tsdb_close(d);
 
     /* existing series: refused by default (nothing written), skipped, merged, or the range replaced */
@@ -979,6 +982,527 @@ static void test_memory(void)
     printf("constant memory: ok\n");
 }
 
+/* ------------------------------------------------------------------ crafted streams */
+
+/* Streams written here byte by byte (checksums right), each with one defect, so that every check of the reader is
+ * seen to refuse it: the export of a real database never has these defects. */
+typedef struct sbuf {
+    uint8_t *p;
+    size_t n, cap;
+} sbuf;
+
+static void sb_put(sbuf *b, const void *p, size_t n)
+{
+    if (b->n + n > b->cap) {
+        b->cap = (b->n + n) * 2 + 64;
+        b->p = realloc(b->p, b->cap);
+        if (!b->p)
+            exit(1);
+    }
+    memcpy(b->p + b->n, p, n);
+    b->n += n;
+}
+
+static void sb_le(sbuf *b, uint64_t v, int bytes)
+{
+    uint8_t x[8];
+    for (int i = 0; i < bytes; i++)
+        x[i] = (uint8_t)(v >> (8 * i));
+    sb_put(b, x, (size_t)bytes);
+}
+
+static void sb_str(sbuf *b, const char *s)
+{
+    sb_le(b, strlen(s), 4);
+    sb_put(b, s, strlen(s));
+}
+
+static void sb_varint(sbuf *b, uint64_t v)
+{
+    while (v >= 0x80) {
+        uint8_t x = (uint8_t)(v | 0x80);
+        sb_put(b, &x, 1);
+        v >>= 7;
+    }
+    uint8_t x = (uint8_t)v;
+    sb_put(b, &x, 1);
+}
+
+typedef struct crafter {
+    sbuf out, rec;
+    uint32_t seq;
+    uint64_t series, rows, s_rows, s_nulls;
+    uint32_t s_chunks;
+} crafter;
+
+static void cr_header(crafter *c, uint32_t flags, int64_t from, int64_t to)
+{
+    sbuf p = {0};
+    sb_le(&p, 5, 4);
+    sb_le(&p, flags, 4);
+    sb_le(&p, 0, 8);
+    sb_le(&p, (uint64_t)from, 8);
+    sb_le(&p, (uint64_t)to, 8);
+    sb_le(&p, 4, 2);
+    sb_put(&p, "test", 4);
+    sb_put(&c->out, "TSDBDUMP", 8);
+    sb_le(&c->out, 1, 4);
+    sb_le(&c->out, p.n, 4);
+    sb_put(&c->out, p.p, p.n);
+    sb_le(&c->out, crc32c(c->out.p, c->out.n), 4);
+    free(p.p);
+}
+
+static void cr_record(crafter *c, uint8_t kind, uint8_t flags)
+{
+    sbuf r = {0};
+    uint8_t h[16] = {kind, flags};
+    st32(h + 4, (uint32_t)c->rec.n);
+    st32(h + 8, c->seq++);
+    sb_put(&r, h, 12);
+    sb_put(&r, c->rec.p, c->rec.n);
+    st32(h + 12, crc32c(r.p, r.n));
+    sb_put(&c->out, h, 16);
+    sb_put(&c->out, c->rec.p, c->rec.n);
+    c->rec.n = 0;
+    free(r.p);
+}
+
+static void cr_series(crafter *c, const char *name, const char *vol, tsdb_type type, int64_t retention)
+{
+    sb_str(&c->rec, name);
+    sb_str(&c->rec, vol);
+    sb_le(&c->rec, type, 1);
+    sb_le(&c->rec, (uint64_t)retention, 8);
+    cr_record(c, 1, 0);
+    c->s_rows = c->s_nulls = 0;
+    c->s_chunks = 0;
+}
+
+static void cr_state(crafter *c, uint32_t code, const char *name)
+{
+    sb_le(&c->rec, 1, 4);
+    sb_le(&c->rec, code, 4);
+    sb_str(&c->rec, name);
+    cr_record(c, 2, 0);
+}
+
+/* rows uncompressed: values of `w` bytes each; valid NULL: no nulls */
+static void cr_chunk(crafter *c, unsigned w, const int64_t *ts, const void *vals, const uint8_t *valid, uint32_t rows,
+                     uint8_t flags)
+{
+    sbuf raw = {0};
+    uint8_t f = (uint8_t)(flags | (valid ? 1 : 0));
+    sb_put(&raw, &f, 1);
+    for (uint32_t i = 0; i < rows; i++)
+        sb_varint(&raw, i ? (uint64_t)ts[i] - (uint64_t)ts[i - 1] : (uint64_t)ts[0] << 1 ^ (uint64_t)(ts[0] >> 63));
+    for (unsigned k = 0; k < w; k++)
+        for (uint32_t i = 0; i < rows; i++)
+            sb_put(&raw, (const uint8_t *)vals + (size_t)i * w + k, 1);
+    if (valid)
+        sb_put(&raw, valid, (rows + 7) / 8);
+    sb_le(&c->rec, rows, 4);
+    sb_le(&c->rec, raw.n, 4);
+    sb_le(&c->rec, 0, 1);
+    sb_put(&c->rec, raw.p, raw.n);
+    cr_record(c, 3, 0);
+    free(raw.p);
+    c->s_rows += rows;
+    c->s_chunks++;
+    for (uint32_t i = 0; valid && i < rows; i++)
+        c->s_nulls += !(valid[i >> 3] >> (i & 7) & 1);
+}
+
+static void cr_end(crafter *c, int64_t rows_delta)
+{
+    sb_le(&c->rec, c->s_rows + (uint64_t)rows_delta, 8);
+    sb_le(&c->rec, c->s_nulls, 8);
+    sb_le(&c->rec, c->s_chunks, 4);
+    cr_record(c, 4, 0);
+    c->series++;
+    c->rows += c->s_rows;
+}
+
+static void cr_finish(crafter *c, const char *file)
+{
+    sb_le(&c->rec, c->series, 8);
+    sb_le(&c->rec, c->rows, 8);
+    sb_le(&c->rec, c->seq, 8);
+    cr_record(c, 5, 0);
+    spit(file, c->out.p, c->out.n);
+    free(c->out.p);
+    free(c->rec.p);
+}
+
+/* One defect each; all zero: a good stream of a float32 series "f" (2 chunks), a bool "b" and a state "s". */
+typedef struct knobs {
+    uint32_t hdr_flags, chunk_flags, state_code;
+    uint8_t rec_flags;
+    int64_t end_delta, retention;
+    bool seq_skip, unordered, unordered_chunks, out_of_range, null_f32, null_i64, bool2, dup, unnamed;
+    bool optional_rec, unknown_rec;
+    const char *vol;
+} knobs;
+
+#define CR_FROM (T0 - 1000000)
+#define CR_TO (T0 + 1000000)
+
+static void craft(const char *file, const knobs *k)
+{
+    crafter c = {0};
+    cr_header(&c, k->hdr_flags, CR_FROM, CR_TO);
+    cr_series(&c, "f", k->vol ? k->vol : "", TSDB_FLOAT32, k->retention);
+    int64_t ts[3] = {T0, T0 + 1000, T0 + 2000};
+    float fv[3] = {1.5f, -2.0f, 3.25f};
+    if (k->unordered)
+        ts[2] = T0 + 500;
+    if (k->out_of_range)
+        ts[2] = CR_TO;
+    if (k->null_f32) {
+        uint32_t bits = TSDB_NULL_F32_BITS;
+        memcpy(&fv[1], &bits, 4);
+    }
+    cr_chunk(&c, 4, ts, fv, NULL, 3, (uint8_t)k->chunk_flags);
+    if (k->optional_rec || k->unknown_rec) {
+        sb_le(&c.rec, 42, 4);
+        cr_record(&c, 9, k->optional_rec ? 1 : 0);
+    }
+    int64_t ts2[2] = {k->unordered_chunks ? T0 + 1500 : T0 + 3000, T0 + 4000};
+    uint8_t valid = 0x2; /* the first row null */
+    cr_chunk(&c, 4, ts2, fv, &valid, 2, 0);
+    if (k->seq_skip)
+        c.seq++;
+    cr_end(&c, k->end_delta);
+    cr_series(&c, "b", "", TSDB_BOOL, 0);
+    uint8_t bv[3] = {1, 0, (uint8_t)(k->bool2 ? 2 : 1)};
+    cr_chunk(&c, 1, ts, bv, NULL, 3, 0);
+    cr_end(&c, 0);
+    cr_series(&c, "s", "", TSDB_STATE, 0);
+    uint32_t code = k->state_code ? k->state_code : 3;
+    if (!k->unnamed)
+        cr_state(&c, code, "on");
+    uint32_t sv[3] = {code, code, code};
+    cr_chunk(&c, 4, ts, sv, NULL, 3, 0);
+    cr_end(&c, 0);
+    cr_series(&c, "i", "", TSDB_INT64, 0);
+    int64_t iv[3] = {INT64_MAX, k->null_i64 ? INT64_MIN : INT64_MIN + 1, 0};
+    cr_chunk(&c, 8, ts, iv, NULL, 3, 0);
+    cr_end(&c, 0);
+    if (k->dup) {
+        cr_series(&c, "b", "", TSDB_BOOL, 0);
+        cr_chunk(&c, 1, ts, bv, NULL, 3, 0);
+        cr_end(&c, 0);
+    }
+    cr_finish(&c, file);
+}
+
+static int crafted_no;
+
+/* The crafted stream with defect k is refused from a file, naming `what`, and nothing is written. */
+static void craft_refused(const knobs *k, const char *what, const char *why)
+{
+    char *f = path("crafted.dump"), dst[PATH_MAX + 64];
+    craft(f, k);
+    snprintf(dst, sizeof dst, "%s/crafted%d", base, crafted_no++);
+    if (RUN(NULL, NULL, dst, "import", f) == 0) {
+        fprintf(stderr, "  crafted (%s): accepted\n", why);
+        failures++;
+        return;
+    }
+    if (!err_has(what)) {
+        fprintf(stderr, "  crafted (%s): refused for another reason\n", why);
+        failures++;
+    }
+    struct stat st;
+    if (stat(dst, &st) == 0) {
+        tsdb *d = open_db(dst, true);
+        if (tsdb_series_count(d) != 0) {
+            fprintf(stderr, "  crafted (%s): %u series written\n", why, tsdb_series_count(d));
+            failures++;
+        }
+        tsdb_close(d);
+    }
+}
+
+static void test_crafted(void)
+{
+    char *f = path("crafted.dump");
+    /* the good one imports, values intact */
+    craft(f, &(knobs){0});
+    const char *good = path("crafted-good");
+    CHECK(RUN(NULL, NULL, good, "import", f) == 0);
+    tsdb *d = open_db(good, true);
+    CHECK(rows_of(d, "f") == 5 && rows_of(d, "b") == 3 && rows_of(d, "s") == 3 && rows_of(d, "i") == 3);
+    col c = read_series(d, lookup(d, "s"), TSDB_TS_MIN, TSDB_TS_MAX);
+    CHECK(c.n == 3 && same_str(tsdb_state_name(d, lookup(d, "s"), (uint32_t)c.v[0]), "on"));
+    col_free(&c);
+    c = read_series(d, lookup(d, "f"), TSDB_TS_MIN, TSDB_TS_MAX);
+    CHECK(c.n == 5 && c.ok[0] && !c.ok[3] && c.ok[4]);
+    col_free(&c);
+    tsdb_close(d);
+    /* an optional record of an unknown kind is skipped */
+    craft(f, &(knobs){.optional_rec = true});
+    CHECK(RUN(NULL, NULL, path("crafted-opt"), "import", f) == 0);
+
+    craft_refused(&(knobs){.unknown_rec = true}, "kind 9", "unknown kind");
+    craft_refused(&(knobs){.hdr_flags = 2}, "header flags", "header flags");
+    craft_refused(&(knobs){.chunk_flags = 2}, "newer tsdb", "chunk flags");
+    craft_refused(&(knobs){.end_delta = 1}, "the stream says", "END rows");
+    craft_refused(&(knobs){.seq_skip = true}, "out of sequence", "sequence");
+    craft_refused(&(knobs){.unordered = true}, "out of order", "times out of order in a chunk");
+    craft_refused(&(knobs){.unordered_chunks = true}, "out of order", "times out of order across chunks");
+    craft_refused(&(knobs){.out_of_range = true}, "out of range", "time past the header's range");
+    craft_refused(&(knobs){.null_f32 = true}, "reserved for null", "float32 null bits as a value");
+    craft_refused(&(knobs){.null_i64 = true}, "reserved for null", "INT64_MIN as a value");
+    craft_refused(&(knobs){.bool2 = true}, "reserved for null", "bool 2");
+    craft_refused(&(knobs){.dup = true}, "twice", "a series twice");
+    craft_refused(&(knobs){.unnamed = true}, "without a name", "a state code without a name");
+
+    /* a record flag this version does not know (bit 1) */
+    craft(f, &(knobs){0});
+    {
+        size_t n;
+        uint8_t *s = (uint8_t *)slurp(f, &n);
+        size_t first = 16 + le32(s + 12) + 4, len = le32(s + first + 4);
+        s[first + 1] = 2;
+        uint8_t *tmp = malloc(12 + len);
+        memcpy(tmp, s + first, 12);
+        memcpy(tmp + 12, s + first + 16, len);
+        st32(s + first + 12, crc32c(tmp, 12 + len));
+        free(tmp);
+        spit(path("recflag.dump"), s, n);
+        CHECK(RUN(NULL, NULL, path("recflag"), "import", path("recflag.dump")) != 0);
+        CHECK(err_has("flags 0x2"));
+        /* the magic damaged, the NUL bytes of the version intact: refused, not read as CSV */
+        s[0] = 'X';
+        spit(path("magic.dump"), s, n);
+        CHECK(RUN(NULL, NULL, path("magic"), "import", path("magic.dump")) != 0);
+        CHECK(err_has("nor CSV"));
+        CHECK(access(path("magic"), F_OK) != 0);
+        free(s);
+    }
+
+    /* state codes anywhere in u32: memory by the names, not by the code */
+    long peak = 0;
+    craft(f, &(knobs){.state_code = 0x0FFFFFFF});
+    CHECK(RUN_PEAK(&peak, NULL, NULL, path("bigcode1"), "import", f) == 0);
+    CHECK(SANITIZED || peak < 64 * 1024);
+    long peak2 = 0;
+    craft(f, &(knobs){.state_code = 0xFFFFFFFF});
+    CHECK(RUN_PEAK(&peak2, NULL, NULL, path("bigcode2"), "import", f) == 0);
+    CHECK(SANITIZED || peak2 < 64 * 1024);
+    d = open_db(path("bigcode2"), true);
+    c = read_series(d, lookup(d, "s"), TSDB_TS_MIN, TSDB_TS_MAX);
+    CHECK(c.n == 3 && same_str(tsdb_state_name(d, lookup(d, "s"), (uint32_t)c.v[2]), "on"));
+    col_free(&c);
+    tsdb_close(d);
+    printf("  state codes 0x0FFFFFFF / 0xFFFFFFFF: import peak %ld / %ld kB anonymous\n", peak, peak2);
+
+    /* retention: rows already past it are reported; --no-retention imports them without it */
+    craft(f, &(knobs){.retention = 1000});
+    CHECK(RUN(NULL, NULL, path("ret1"), "import", f) == 0);
+    CHECK(err_has("series f: 5 of its 5 rows are older than its retention"));
+    CHECK(RUN(NULL, NULL, path("ret2"), "import", f, "--no-retention") == 0);
+    d = open_db(path("ret2"), true);
+    int64_t keep = -1;
+    CHECK(rows_of(d, "f") == 5 && tsdb_get_retention(d, lookup(d, "f"), &keep) == 0 && keep == 0);
+    tsdb_close(d);
+
+    /* --replace: from a file only; sets the stream's retention (or keeps the target's with --no-retention); a
+     * series larger than one batch is deleted, then written */
+    craft(f, &(knobs){.retention = 365LL * 24 * 3600 * 1000 * 100});
+    const char *rp = path("replace");
+    d = open_db(rp, false);
+    uint32_t id;
+    OK(tsdb_series_create(d, "f", TSDB_FLOAT32, NULL, &id));
+    int64_t old_ts[2] = {T0 + 500, CR_TO + 5};
+    float old_v[2] = {9, 9};
+    insert(d, id, TSDB_FLOAT32, old_ts, old_v, NULL, 2);
+    tsdb_close(d);
+    CHECK(sh("cat '%s' | '%s' '%s' import --replace 2>%s", f, cli, rp, errfile) != 0);
+    CHECK(err_has("needs the stream in a file"));
+    CHECK(RUN(NULL, NULL, rp, "import", f, "--replace", "--no-verify") != 0);
+    CHECK(err_has("--no-verify"));
+    d = open_db(rp, true);
+    CHECK(rows_of(d, "f") == 2 && tsdb_series_count(d) == 1);
+    tsdb_close(d);
+    CHECK(RUN(NULL, NULL, rp, "import", f, "--replace", "--no-retention") == 0);
+    d = open_db(rp, true);
+    CHECK(rows_of(d, "f") == 6); /* the row inside the range replaced, the one after it kept */
+    CHECK(tsdb_get_retention(d, lookup(d, "f"), &keep) == 0 && keep == 0);
+    tsdb_close(d);
+    CHECK(RUN(NULL, NULL, rp, "import", f, "--replace", "--batch-rows", "2") == 0);
+    d = open_db(rp, true);
+    CHECK(rows_of(d, "f") == 6);
+    CHECK(tsdb_get_retention(d, lookup(d, "f"), &keep) == 0 && keep == 365LL * 24 * 3600 * 1000 * 100);
+    tsdb_close(d);
+
+    /* a pipe that breaks inside a series of several batches: the whole series before it stay, that one is emptied
+     * again and named; a rerun with --merge completes it */
+    {
+        crafter cr = {0};
+        cr_header(&cr, 0, CR_FROM, CR_TO);
+        cr_series(&cr, "first", "", TSDB_FLOAT32, 0);
+        int64_t t1[3] = {T0, T0 + 1, T0 + 2};
+        float v1[3] = {1, 2, 3};
+        cr_chunk(&cr, 4, t1, v1, NULL, 3, 0);
+        cr_end(&cr, 0);
+        cr_series(&cr, "big", "", TSDB_FLOAT32, 0);
+        int64_t tb[1000];
+        float vb[1000];
+        for (int ch = 0; ch < 6; ch++) {
+            for (int i = 0; i < 1000; i++) {
+                tb[i] = T0 + ch * 1000 + i;
+                vb[i] = (float)(ch * 1000 + i);
+            }
+            cr_chunk(&cr, 4, tb, vb, NULL, 1000, 0);
+        }
+        size_t whole = cr.out.n;
+        cr_end(&cr, 0);
+        cr_finish(&cr, path("pipe-good.dump"));
+        size_t n;
+        uint8_t *s = (uint8_t *)slurp(path("pipe-good.dump"), &n);
+        s[whole - 5] ^= 1; /* in the last chunk: its checksum fails */
+        spit(path("pipe-bad.dump"), s, n);
+        free(s);
+        const char *pd = path("pipe-dst");
+        CHECK(sh("cat '%s' | '%s' '%s' import --batch-rows 1000 2>%s", path("pipe-bad.dump"), cli, pd, errfile) != 0);
+        CHECK(err_has("series big, which this import created, is left empty") && err_has("--merge"));
+        CHECK(err_has("1 series before it"));
+        d = open_db(pd, true);
+        CHECK(rows_of(d, "first") == 3 && lookup(d, "big") != UINT32_MAX && rows_of(d, "big") == 0);
+        tsdb_close(d);
+        CHECK(sh("cat '%s' | '%s' '%s' import --merge --batch-rows 1000 2>%s", path("pipe-good.dump"), cli, pd,
+                 errfile) == 0);
+        d = open_db(pd, true);
+        CHECK(rows_of(d, "first") == 3 && rows_of(d, "big") == 6000);
+        tsdb_close(d);
+    }
+
+    /* empty and short inputs are refused, not "imported" */
+    spit(path("empty.dump"), "", 0);
+    CHECK(RUN(NULL, NULL, path("empty"), "import", path("empty.dump")) != 0);
+    CHECK(err_has("is empty"));
+    CHECK(RUN("/dev/null", NULL, path("empty"), "import") != 0);
+    CHECK(err_has("is empty"));
+    spit(path("short.dump"), "TSDBD", 5);
+    CHECK(RUN(NULL, NULL, path("empty"), "import", path("short.dump")) != 0);
+    CHECK(err_has("shorter than a stream header"));
+    CHECK(access(path("empty"), F_OK) != 0);
+    /* CSV whose first series happens to start with the magic: still CSV */
+    spit(path("magic.csv"), "TSDBDUMPster,1000,1.5\n", 22);
+    CHECK(RUN(NULL, NULL, path("magiccsv"), "import", path("magic.csv")) == 0);
+    d = open_db(path("magiccsv"), true);
+    CHECK(rows_of(d, "TSDBDUMPster") == 1);
+    tsdb_close(d);
+    printf("crafted streams: ok\n");
+}
+
+/* Volume paths are checked before anything is written; --volume-root maps a whole tree. */
+static void test_volumes(void)
+{
+    char *f = path("vol.dump"), map[2 * PATH_MAX + 16];
+    craft(f, &(knobs){.vol = "/old/mnt/vol"});
+    /* not a volume of the target: the message names both paths and the ways out */
+    CHECK(RUN(NULL, NULL, path("v0"), "import", f) != 0);
+    CHECK(err_has("volume /old/mnt/vol, which is not") && err_has("--volume /old/mnt/vol=NEW") &&
+          err_has("--volume-root"));
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", path("v0vol"));
+    CHECK(RUN(NULL, NULL, path("v0"), "import", f, "--volume", map) != 0);
+    CHECK(err_has(path("v0vol")) && err_has("(--volume /old/mnt/vol=NEW"));
+    /* invalid maps */
+    CHECK(RUN(NULL, NULL, path("v1"), "import", f, "--volume", "/old/mnt/vol=rel/dir", "--create-volumes") == 2);
+    CHECK(RUN(NULL, NULL, path("v1"), "import", f, "--volume", "/old/mnt/vol=/a/../b", "--create-volumes") == 2);
+    CHECK(access(path("v1"), F_OK) != 0);
+    /* paths that cannot be added: refused before anything is written */
+    spit(path("afile"), "x", 1);
+    snprintf(map, sizeof map, "/old/mnt/vol=%s/sub", path("afile"));
+    CHECK(RUN(NULL, NULL, path("v2"), "import", f, "--volume", map, "--create-volumes") != 0);
+    CHECK(err_has("cannot be added"));
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", path("src")); /* another database */
+    CHECK(RUN(NULL, NULL, path("v2"), "import", f, "--volume", map, "--create-volumes") != 0);
+    CHECK(err_has("holds tsdb files"));
+    snprintf(map, sizeof map, "/old/mnt/vol=%s/inside", path("v2")); /* inside the target */
+    CHECK(RUN(NULL, NULL, path("v2"), "import", f, "--volume", map, "--create-volumes") != 0);
+    CHECK(err_has("inside the database directory"));
+    tsdb *d = open_db(path("v2"), true);
+    CHECK(tsdb_series_count(d) == 0);
+    tsdb_close(d);
+    /* trailing slashes are the same path */
+    snprintf(map, sizeof map, "/old/mnt/vol/=%s/", path("v3vol"));
+    CHECK(RUN(NULL, NULL, path("v3"), "import", f, "--volume", map, "--create-volumes") == 0);
+    d = open_db(path("v3"), true);
+    CHECK(same_str(tsdb_series_path(d, lookup(d, "f")), path("v3vol")));
+    CHECK(same_str(tsdb_series_path(d, lookup(d, "b")), path("v3")));
+    tsdb_close(d);
+    /* --volume-root: every volume under OLD to the same place under NEW (here /old/mnt/vol -> NEW/mnt/vol) */
+    sh("mkdir -p '%s/mnt'", path("root4"));
+    snprintf(map, sizeof map, "/old=%s", path("root4"));
+    CHECK(RUN(NULL, NULL, path("v4"), "import", f, "--volume-root", map, "--create-volumes") == 0);
+    d = open_db(path("v4"), true);
+    CHECK(same_str(tsdb_series_path(d, lookup(d, "f")), path("root4/mnt/vol")));
+    tsdb_close(d);
+
+    /* two state series of one volume share its dictionary: each stream names its own codes */
+    const char *src = path("shared-src");
+    d = open_db(src, false);
+    uint32_t a, b, on, off;
+    OK(tsdb_series_create(d, "s1", TSDB_STATE, NULL, &a));
+    OK(tsdb_series_create(d, "s2", TSDB_STATE, NULL, &b));
+    OK(tsdb_state(d, a, "on", &on));
+    OK(tsdb_state(d, a, "off", &off));
+    int64_t ts[2] = {T0, T0 + 1};
+    uint32_t v[2] = {on, off};
+    insert(d, a, TSDB_STATE, ts, v, NULL, 2);
+    insert(d, b, TSDB_STATE, ts, v, NULL, 2);
+    /* names long enough that one chunk's names exceed a STATES record of this exporter: split */
+    uint32_t lg;
+    OK(tsdb_series_create(d, "long", TSDB_STATE, NULL, &lg));
+    enum { NLONG = 60, LLEN = 20000 };
+    int64_t lts[NLONG];
+    uint32_t lv[NLONG];
+    char *nm = malloc(LLEN + 1);
+    for (int i = 0; i < NLONG; i++) {
+        memset(nm, 'a' + i % 26, LLEN);
+        snprintf(nm, LLEN, "%02d", i);
+        nm[2] = 'x';
+        nm[LLEN] = 0;
+        OK(tsdb_state(d, lg, nm, &lv[i]));
+        lts[i] = T0 + i;
+    }
+    free(nm);
+    insert(d, lg, TSDB_STATE, lts, lv, NULL, NLONG);
+    tsdb_close(d);
+    char *sf = path("shared.dump");
+    CHECK(RUN(NULL, NULL, src, "export", "-o", sf) == 0);
+    size_t n;
+    uint8_t *s = (uint8_t *)slurp(sf, &n);
+    int states = 0;
+    for (size_t at = 16 + le32(s + 12) + 4; at + 16 <= n; at += 16 + le32(s + at + 4))
+        states += s[at] == 2;
+    free(s);
+    CHECK(states >= 4); /* s1, s2, and long in two or more */
+    CHECK(RUN(NULL, NULL, path("shared-dst"), "import", sf) == 0);
+    tsdb *x = open_db(src, true);
+    d = open_db(path("shared-dst"), true);
+    CHECK(same_series(x, d, "s1", TSDB_TS_MIN, TSDB_TS_MAX) && same_series(x, d, "s2", TSDB_TS_MIN, TSDB_TS_MAX) &&
+          same_series(x, d, "long", TSDB_TS_MIN, TSDB_TS_MAX));
+    tsdb_close(d);
+    tsdb_close(x);
+
+    /* export never overwrites a FILE.partial it did not make, unless --force */
+    char *out = path("p.dump"), *part = path("p.dump.partial");
+    spit(part, "keep", 4);
+    CHECK(RUN(NULL, NULL, src, "export", "-o", out) != 0);
+    CHECK(err_has("exists") && access(out, F_OK) != 0);
+    s = (uint8_t *)slurp(part, &n);
+    CHECK(n == 4);
+    free(s);
+    CHECK(RUN(NULL, NULL, src, "export", "-o", out, "--force") == 0);
+    CHECK(access(out, F_OK) == 0 && access(part, F_OK) != 0);
+    printf("volumes, shared dictionaries, partial files: ok\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *cli_env = getenv("TSDB_CLI");
@@ -1023,6 +1547,8 @@ int main(int argc, char **argv)
     test_round_trip();
     test_filters_and_existing();
     test_damage();
+    test_crafted();
+    test_volumes();
     test_golden(golden);
     test_concurrent();
     test_memory();
