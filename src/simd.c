@@ -447,6 +447,26 @@ static void small_f64_scalar(const double *v, size_t n, bool may_be_null, agg_st
 #define K_AVX2 static inline __attribute__((target("avx2"), always_inline))
 #define K_AVX512 static inline __attribute__((target("avx512f,avx512dq"), always_inline))
 
+/* Horizontal sums of lanes that wrap as unsigned. Not _mm512_reduce_add_epi64/epi32: GCC adds their lanes as
+ * signed long long / int, so a sum meant to wrap is undefined behaviour (UBSan stops there). Once per call. */
+K_AVX512 uint64_t hsum_u64x8(__m512i x)
+{
+    uint64_t t[8], s = 0;
+    _mm512_storeu_si512(t, x);
+    for (int j = 0; j < 8; j++)
+        s += t[j];
+    return s;
+}
+
+K_AVX512 uint32_t hsum_u32x16(__m512i x)
+{
+    uint32_t t[16], s = 0;
+    _mm512_storeu_si512(t, x);
+    for (int j = 0; j < 16; j++)
+        s += t[j];
+    return s;
+}
+
 /* the 256-bit float32 and float64 kernels: AVX2, and AVX without AVX2 (Sandy Bridge, Ivy Bridge) */
 #define KSUF avx2
 #define KTARGET "avx2"
@@ -870,9 +890,8 @@ __attribute__((target("avx512f,avx512dq"))) static void fold_i64_avx512(const in
                 c0 = _mm512_add_epi64(c0, _mm512_and_si512(hh, lom));
                 c1 = _mm512_add_epi64(c1, _mm512_srli_epi64(hh, 32));
             }
-            i64_sq_wide(dx, (uint64_t)_mm512_reduce_add_epi64(a0), (uint64_t)_mm512_reduce_add_epi64(a1),
-                        (uint64_t)_mm512_reduce_add_epi64(b0), (uint64_t)_mm512_reduce_add_epi64(b1),
-                        (uint64_t)_mm512_reduce_add_epi64(c0), (uint64_t)_mm512_reduce_add_epi64(c1));
+            i64_sq_wide(dx, hsum_u64x8(a0), hsum_u64x8(a1), hsum_u64x8(b0), hsum_u64x8(b1), hsum_u64x8(c0),
+                        hsum_u64x8(c1));
         }
         i64_squares(v, i, n, dx);
         return;
@@ -887,8 +906,7 @@ __attribute__((target("avx512f,avx512dq"))) static void fold_i64_avx512(const in
             qlo = _mm512_add_epi64(qlo, _mm512_and_si512(sq, lom));
             qhi = _mm512_add_epi64(qhi, _mm512_srli_epi64(sq, 32));
         }
-        q += (unsigned __int128)(uint64_t)_mm512_reduce_add_epi64(qlo) +
-             ((unsigned __int128)(uint64_t)_mm512_reduce_add_epi64(qhi) << 32);
+        q += (unsigned __int128)hsum_u64x8(qlo) + ((unsigned __int128)hsum_u64x8(qhi) << 32);
     }
     isq_add(dx, q, 0);
     i64_squares(v, i, n, dx);
@@ -1034,11 +1052,11 @@ K_AVX512 void fold_u32_avx512_impl(const uint32_t *v, size_t n, uint32_t null, a
             STEP(y, s1, c1, mn1, mx1, ql1, qh1);
         }
 #undef STEP
-        s += (uint64_t)_mm512_reduce_add_epi64(_mm512_add_epi64(s0, s1));
+        s += hsum_u64x8(_mm512_add_epi64(s0, s1));
         if (sq)
-            q += (uint64_t)_mm512_reduce_add_epi64(_mm512_add_epi64(ql0, ql1)) +
-                 ((unsigned __int128)(uint64_t)_mm512_reduce_add_epi64(_mm512_add_epi64(qh0, qh1)) << 32);
-        c += (uint32_t)_mm512_reduce_add_epi32(_mm512_add_epi32(c0, c1));
+            q += hsum_u64x8(_mm512_add_epi64(ql0, ql1)) +
+                 ((unsigned __int128)hsum_u64x8(_mm512_add_epi64(qh0, qh1)) << 32);
+        c += hsum_u32x16(_mm512_add_epi32(c0, c1));
     }
     uint32_t mn = (uint32_t)_mm512_reduce_min_epu32(_mm512_min_epu32(mn0, mn1));
     uint32_t mx = (uint32_t)_mm512_reduce_max_epu32(_mm512_max_epu32(mx0, mx1));
@@ -1317,8 +1335,8 @@ K_AVX512 void twa_avx512_impl(int type, const int64_t *ts, const void *v, size_t
         _mm512_storeu_pd(ll + 8 * q, li[q]);
     }
     *o = (twa_sums){0};
-    o->sms = (uint64_t)_mm512_reduce_add_epi64(sms);
-    o->lms = (uint64_t)_mm512_reduce_add_epi64(lms);
+    o->sms = hsum_u64x8(sms);
+    o->lms = hsum_u64x8(lms);
     o->gap = (uint64_t)_mm512_reduce_max_epu64(gap);
     twa_tail(type, ts, v, s, n, sl, ll, o, L64);
 }
