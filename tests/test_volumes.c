@@ -392,6 +392,58 @@ static void test_refused_dirs(const char *base)
            "bad name\n");
 }
 
+/* A volume may be a directory that already held the user's files (tsdb_volume_add_dir takes one with no engine
+ * files): the cleanup at open removes the engine's own leftovers by their exact names and nothing else of theirs. */
+static void test_user_files_in_volume(const char *base)
+{
+    char top[600], root[700], vol[800], p[1000];
+    fresh(base, "volf", top, sizeof top, root, sizeof root);
+    snprintf(vol, sizeof vol, "%s/data", top);
+    CHECK(mkdir(vol, 0755) == 0);
+    static const char *const users[] = {"tmp_notes.txt",  "tmp_x",       "tmp_1_2.part.bak", "tmp_1_x.part",
+                                        "META.tmpfile",   "txn_list",    "txn_notes.intent", "retired_old.csv",
+                                        "retired_p1.part", "wal_cafe.log", "wal_0000000000000001.log.bak",
+                                        "plan.part",      "p1_2.part"};
+    size_t nu = sizeof users / sizeof *users;
+    for (size_t i = 0; i < nu; i++) {
+        snprintf(p, sizeof p, "%s/%s", vol, users[i]);
+        write_file(p, "the user's\n");
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    uint32_t v, id;
+    OK(tsdb_volume_add_dir(root, vol, &v));
+    tsdb *db;
+    OK(tsdb_open(root, &o, &db));
+    OK(tsdb_series_at(db, "s", vol, &id));
+    for (int i = 0; i < 100; i++)
+        OK(tsdb_append(db, id, T0 + i * 1000, (float)i));
+    OK(tsdb_close(db));
+    /* what a crash leaves behind: a part writer's tmp file and a half-written META */
+    char leftover[1000], meta_tmp[1000];
+    snprintf(leftover, sizeof leftover, "%s/tmp_%d_7.part", vol, (int)getpid());
+    write_file(leftover, "junk");
+    snprintf(meta_tmp, sizeof meta_tmp, "%s/META.tmp", vol);
+    write_file(meta_tmp, "junk");
+    OK(tsdb_open(root, &o, &db));
+    tsdb_points pts;
+    OK(tsdb_query_points(db, id, INT64_MIN, INT64_MAX, &pts));
+    CHECK(pts.n == 100);
+    tsdb_points_free(&pts);
+    OK(tsdb_close(db));
+    CHECK(!exists(leftover) && !exists(meta_tmp));
+    for (size_t i = 0; i < nu; i++) {
+        snprintf(p, sizeof p, "%s/%s", vol, users[i]);
+        CHECK(exists(p) && file_size(p) == 11);
+        if (!exists(p))
+            fprintf(stderr, "  %s was deleted\n", users[i]);
+    }
+    remove_tree(top);
+    printf("  a volume directory's own files (tmp_notes.txt, txn_list, retired_old.csv, wal_cafe.log...) survive "
+           "the open; the engine's leftovers go\n");
+}
+
 /* VOLUMES changed under a running writer: a torn tail (an add killed in its
  * write) is cut, so volumes still come and go as before; a line rewritten to
  * name another directory is damage, reported once per change. */
@@ -850,6 +902,7 @@ int main(int argc, char **argv)
 
     test_paths(base);
     test_refused_dirs(base);
+    test_user_files_in_volume(base);
     test_volumes_under_writer(base);
     test_concurrent_adds(base);
     test_open_waits_for_add(base);

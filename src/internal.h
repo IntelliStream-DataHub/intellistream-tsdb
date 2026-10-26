@@ -635,6 +635,9 @@ int pw_finish_pending(part_writer *w, uint64_t min_block, uint64_t max_block, ui
 int parts_commit(struct eng *db, part **ps, size_t n);
 void parts_discard(struct eng *db, part **ps, size_t n);
 int intents_recover(struct eng *db);
+/* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
+bool part_tmp_name(const char *name);
+bool part_file_name(const char *name);
 void pw_abort(part_writer *w);
 
 /* Every range is half-open with an int64 end, so a row at INT64_MAX could never be read, counted or deleted:

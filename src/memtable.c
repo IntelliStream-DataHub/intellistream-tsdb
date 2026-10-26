@@ -792,7 +792,11 @@ int wal_open(eng *db)
     while ((e = readdir(d))) {
         uint64_t seq;
         int consumed = 0;
-        if (sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &consumed) != 1 || e->d_name[consumed])
+        /* exactly what wal_name writes (16 lowercase hex digits): a user's wal_x.log in a volume directory is
+         * neither replayed (and cut at a "torn tail") nor deleted */
+        if (strlen(e->d_name) != 24 || strncmp(e->d_name, "wal_", 4) != 0 ||
+            strspn(e->d_name + 4, "0123456789abcdef") != 16 || strcmp(e->d_name + 20, ".log") != 0 ||
+            sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &consumed) != 1 || e->d_name[consumed])
             continue;
         if (nseg == cap) {
             cap = cap ? cap * 2 : 16;
