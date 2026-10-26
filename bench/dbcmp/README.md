@@ -4,6 +4,8 @@ The harness behind the README's "100 million rows" tables: tsdb (through tsdbd a
 ClickHouse, TimescaleDB, QuestDB, InfluxDB 2, InfluxDB 3 Core and Prometheus, each loaded with the
 same 100 M rows and asked the same queries, with every answer checked against tsdb's; and DuckDB,
 embedded like tsdb, compared with tsdb's library in the same process.
+For compression on real measurements rather than generated data, see [`../hydraulic`](../hydraulic):
+a public data set from a hydraulic test rig, with the steps to reproduce its table.
 
 Every server runs in **Podman** (never Docker), with `--network host` and its own listen setting
 bound to 127.0.0.1. Run one system at a time: stop each container before starting the next, and

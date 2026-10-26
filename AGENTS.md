@@ -242,8 +242,9 @@ a change could move, on a quiet machine, and update the numbers.
 
 | tool | measures |
 |---|---|
-| `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed |
-| `build/type-bench` | the float64, int64, bool and state codecs |
+| `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed; `--file F` for raw float32 values from a file |
+| `build/type-bench` | the float64, int64, bool and state codecs; `--file F float32\|float64` for raw values from a file |
+| [`bench/hydraulic`](bench/hydraulic) | the codecs on real sensor data (UCI hydraulic test rig, 17 sensors): `get.sh`, `convert.py`, `run.sh` |
 | `build/tsdb-bench` | load, compression and queries on 100 M rows; `--type float64` or `int64` stores another value type; `--export` writes the rows for ClickHouse |
 | `build/insert-bench` | durable inserts on a real disk, 1 row to 1 billion rows per call |
 | `build/tsdbc-bench` | the server: loading, queries, 10,000 connections |

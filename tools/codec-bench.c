@@ -1,6 +1,10 @@
 /*
  * Float32 codec comparison: size and speed per 8192-value granule, the unit
  * tsdb stores. Every result is checked to round-trip bit for bit.
+ *
+ *   codec-bench                 the synthetic sensor streams of datasets.h
+ *   codec-bench --file F        F holds raw float32 values (little-endian), one series in time order;
+ *                               prints one line per setting (codec alone, + ZSTD(1)): codec=bits per value
  */
 #include "../src/internal.h"
 #include "common.h"
@@ -9,15 +13,15 @@
 #include <math.h>
 
 #define GR 8192
-#define NGR 128
-#define N (GR * NGR)
+static size_t NGR = 128;
+static size_t N = GR * 128;
 
 /* ---- datasets: the sensor streams of datasets.h ---- */
 static void gen(int kind, float *v)
 {
     ds_state st;
     ds_init(&st, (ds_kind)kind, 3, 1704067200000);
-    for (int i = 0; i < N; i++) {
+    for (size_t i = 0; i < N; i++) {
         int64_t t;
         ds_next(&st, &t, &v[i]);
     }
@@ -136,8 +140,9 @@ static result run(const codec *c, const float *v, int zlevel, ZSTD_CCtx *cc, ZST
     result r = {0, 0, 0};
     size_t total = 0;
     double t0 = now_s();
-    for (int g = 0; g < NGR; g++) {
-        size_t n = c->enc(v + (size_t)g * GR, GR, inner);
+    for (size_t g = 0; g < NGR; g++) {
+        size_t m = MIN((size_t)GR, N - (size_t)g * GR);
+        size_t n = c->enc(v + (size_t)g * GR, m, inner);
         if (!n) {
             r.bits = NAN;
             goto out;
@@ -160,7 +165,7 @@ static result run(const codec *c, const float *v, int zlevel, ZSTD_CCtx *cc, ZST
     int rounds = 5;
     t0 = now_s();
     for (int k = 0; k < rounds; k++) {
-        for (int g = 0; g < NGR; g++) {
+        for (size_t g = 0; g < NGR; g++) {
             const uint8_t *src = blocks[g];
             size_t len = blen[g];
             if (zlevel) {
@@ -169,8 +174,9 @@ static result run(const codec *c, const float *v, int zlevel, ZSTD_CCtx *cc, ZST
                 src = inner;
                 len = ilen[g];
             }
-            if (c->dec(src, len, GR, out) != 0 || (k == 0 && memcmp(out, v + (size_t)g * GR, GR * 4) != 0)) {
-                fprintf(stderr, "ROUND TRIP FAILED: %s granule %d\n", c->name, g);
+            size_t m = MIN((size_t)GR, N - (size_t)g * GR);
+            if (c->dec(src, len, m, out) != 0 || (k == 0 && memcmp(out, v + (size_t)g * GR, m * 4) != 0)) {
+                fprintf(stderr, "ROUND TRIP FAILED: %s granule %zu\n", c->name, g);
                 exit(1);
             }
         }
@@ -180,7 +186,7 @@ static result run(const codec *c, const float *v, int zlevel, ZSTD_CCtx *cc, ZST
     r.enc_mvs = N / te / 1e6;
     r.dec_mvs = N / td / 1e6;
 out:
-    for (int g = 0; g < NGR; g++)
+    for (size_t g = 0; g < NGR; g++)
         free(blocks[g]);
     free(blocks);
     free(blen);
@@ -191,8 +197,38 @@ out:
     return r;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "--file")) { /* raw little-endian float32 values: one line of bits/value */
+        FILE *f = fopen(argv[2], "rb");
+        if (!f || fseek(f, 0, SEEK_END) || (N = (size_t)ftell(f) / 4) == 0) {
+            fprintf(stderr, "%s: cannot read, or empty\n", argv[2]);
+            return 1;
+        }
+        rewind(f);
+        NGR = (N + GR - 1) / GR;
+        float *fv = malloc(N * 4);
+        if (!fv || fread(fv, 4, N, f) != N) {
+            fprintf(stderr, "%s: short read\n", argv[2]);
+            return 1;
+        }
+        fclose(f);
+        ZSTD_CCtx *zc = ZSTD_createCCtx();
+        ZSTD_DCtx *zd = ZSTD_createDCtx();
+        auto_cc = codec_new();
+        for (int z = 0; z < 2; z++) {
+            const char *base = strrchr(argv[2], '/');
+            printf("%s zstd=%d", base ? base + 1 : argv[2], z);
+            for (size_t c = 0; c < NC; c++)
+                printf(" %s=%.3f", codecs[c].name, run(&codecs[c], fv, z, zc, zd).bits);
+            printf("\n");
+        }
+        return 0;
+    }
+    if (argc > 1) {
+        fprintf(stderr, "usage: codec-bench [--file FLOAT32_FILE]\n");
+        return 2;
+    }
     float *v = malloc(N * sizeof *v);
     ZSTD_CCtx *cc = ZSTD_createCCtx();
     ZSTD_DCtx *dc = ZSTD_createDCtx();
