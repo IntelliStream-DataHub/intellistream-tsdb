@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <ftw.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -730,6 +731,7 @@ typedef struct name_slot {
 typedef struct importer {
     tsdb *db;
     char root[PATH_MAX]; /* the target's directory, canonical */
+    char final[PATH_MAX]; /* a new database built in a sibling: the name it gets at the end, canonical */
     FILE *in;
     const char *in_name;
     bool apply;  /* false: the verifying pass, which writes nothing */
@@ -901,6 +903,9 @@ static const char *vpath_creatable(importer *im, const char *path)
                                              "META"};
     char canon[PATH_MAX];
     struct stat st;
+    /* a new database is not there yet (it is built beside its name): a volume inside it would block the rename */
+    if (im->final[0] && (vpath_within(path, im->final) || vpath_within(im->final, path)))
+        return "lies inside the database directory or contains it";
     if (stat(path, &st) == 0) {
         if (!S_ISDIR(st.st_mode))
             return "is not a directory";
@@ -934,7 +939,8 @@ static const char *vpath_creatable(importer *im, const char *path)
     } else {
         return strerror(errno);
     }
-    if (vpath_within(canon, im->root) || vpath_within(im->root, canon))
+    if (vpath_within(canon, im->root) || vpath_within(im->root, canon) ||
+        (im->final[0] && (vpath_within(canon, im->final) || vpath_within(im->final, canon))))
         return "lies inside the database directory or contains it";
     for (uint32_t i = 1; i < tsdb_volume_count(im->db); i++) {
         const char *v = tsdb_volume_path(im->db, i);
@@ -1541,9 +1547,142 @@ static bool dir_is_new(const char *dir)
     return empty;
 }
 
+/* A new database is built in a sibling directory, <target>.importing-<pid>, and renamed to <target> only once all
+ * of it is on disk: an interrupted import (a kill, a crash, a power loss, an error) leaves nothing under the
+ * target's name. A sibling left behind is reported by the next import into the target. Volumes are named by
+ * absolute path in VOLUMES and know the database by its ID (ROOT_ID), so renaming the root does not move or detach
+ * them. An empty target directory is replaced by the rename (rename(2) allows that), unless it is a mount point. */
+typedef struct {
+    bool on;
+    char parent[PATH_MAX], stage[PATH_MAX + 64];
+} staging;
+
+#define STAGE_SUFFIX ".importing-"
+
+/* Names the volumes a left-behind sibling lists in its VOLUMES ("<check> <path>" per line). */
+static void stage_volumes(const char *stage)
+{
+    char f[2 * PATH_MAX + 16], line[PATH_MAX + 32], e[256];
+    snprintf(f, sizeof f, "%s/VOLUMES", stage);
+    FILE *v = fopen(f, "r");
+    while (v && fgets(line, sizeof line, v)) {
+        char *sp = strchr(line, ' '), *nl = strchr(line, '\n');
+        if (sp && nl && sp[1] == '/') {
+            *nl = 0;
+            fprintf(stderr, "tsdb: import: it made volume %s: delete that too\n", esc(sp + 1, e, sizeof e));
+        }
+    }
+    if (v)
+        fclose(v);
+}
+
+static bool fsync_dir(const char *p)
+{
+    char e[256];
+    int fd = open(p, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    bool ok = fd >= 0 && fsync(fd) == 0;
+    int err = errno;
+    if (!ok)
+        fprintf(stderr, "tsdb: import: fsync %s: %s\n", esc(p, e, sizeof e), strerror(err));
+    if (fd >= 0)
+        close(fd);
+    return ok;
+}
+
+/* Plans a new database in a sibling and makes the sibling: 1 staged (st filled in, im->final set), 0 built in
+ * place (the target is "/", "." or "..", or an empty directory that cannot be replaced: a mount point, a parent
+ * that is not writable), -1 refused (said why). */
+static int stage_make(const char *dir, staging *st, importer *im)
+{
+    char d[PATH_MAX], e[256], e2[256];
+    if (snprintf(d, sizeof d, "%s", dir) >= (int)sizeof d)
+        return 0;
+    size_t n = strlen(d);
+    while (n > 1 && d[n - 1] == '/')
+        d[--n] = 0;
+    char *slash = strrchr(d, '/');
+    const char *base = slash ? slash + 1 : d;
+    if (!base[0] || strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
+        return 0;
+    snprintf(st->parent, sizeof st->parent, "%.*s", slash ? (int)(slash - d) + (slash == d) : 1, slash ? d : ".");
+    struct stat ts, ps;
+    bool exists = stat(dir, &ts) == 0;
+    if (stat(st->parent, &ps) != 0) {
+        fprintf(stderr, "tsdb: import: %s: %s\n", esc(st->parent, e, sizeof e), strerror(errno));
+        return -1;
+    }
+    if (exists && ts.st_dev != ps.st_dev)
+        return 0;
+    char pc[PATH_MAX];
+    if (!realpath(st->parent, pc)) {
+        fprintf(stderr, "tsdb: import: %s: %s\n", esc(st->parent, e, sizeof e), strerror(errno));
+        return -1;
+    }
+    if (snprintf(im->final, sizeof im->final, "%s/%s", strcmp(pc, "/") ? pc : "", base) >= (int)sizeof im->final) {
+        im->final[0] = 0;
+        return 0;
+    }
+    DIR *pd = opendir(st->parent);
+    struct dirent *de;
+    size_t bl = strlen(base);
+    while (pd && (de = readdir(pd))) {
+        if (strncmp(de->d_name, base, bl) != 0 || strncmp(de->d_name + bl, STAGE_SUFFIX, strlen(STAGE_SUFFIX)) != 0)
+            continue;
+        char left[2 * PATH_MAX];
+        snprintf(left, sizeof left, "%s/%s", st->parent, de->d_name);
+        fprintf(stderr, "tsdb: import: %s is left from an import into %s that was interrupted (or is still running): "
+                        "delete it, and any volume directory it made, and import again\n", esc(left, e, sizeof e),
+                esc(dir, e2, sizeof e2));
+        stage_volumes(left);
+        closedir(pd);
+        im->final[0] = 0;
+        return -1;
+    }
+    if (pd)
+        closedir(pd);
+    snprintf(st->stage, sizeof st->stage, "%s/%s" STAGE_SUFFIX "%d", st->parent, base, (int)getpid());
+    if (mkdir(st->stage, exists ? ts.st_mode & 07777 : 0755) != 0) {
+        im->final[0] = 0;
+        if (exists)
+            return 0;
+        fprintf(stderr, "tsdb: import: %s: %s\n", esc(st->stage, e, sizeof e), strerror(errno));
+        return -1;
+    }
+    if (exists)
+        (void)chmod(st->stage, ts.st_mode & 07777); /* the empty directory's mode, not the umask's */
+    /* the sibling's name on disk at once: what a power loss leaves of the import is under it, for the next import
+     * to report */
+    if (!fsync_dir(st->parent)) {
+        rmdir(st->stage);
+        im->final[0] = 0;
+        return -1;
+    }
+    st->on = true;
+    return 1;
+}
+
+static int rm_entry(const char *p, const struct stat *s, int flag, struct FTW *f)
+{
+    (void)s, (void)flag, (void)f;
+    return remove(p) != 0 && errno != ENOENT ? -1 : 0;
+}
+
+/* The import failed: the sibling goes (it is this import's own), the volumes it made are named. */
+static void stage_drop(const staging *st, const char *dir, char **vols, uint32_t nv)
+{
+    char e[256];
+    if (nftw(st->stage, rm_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT) != 0)
+        fprintf(stderr, "tsdb: import: removing %s: %s: delete it before importing again\n",
+                esc(st->stage, e, sizeof e), strerror(errno));
+    fprintf(stderr, "tsdb: import: %s was not created\n", esc(dir, e, sizeof e));
+    for (uint32_t i = 1; i < nv; i++)
+        fprintf(stderr, "tsdb: import: volume %s was made by this import: delete it before importing again\n",
+                esc(vols[i], e, sizeof e));
+}
+
+
 /* Makes a database written with fsync = 0 durable: every file system it lives on (syncfs reports the writeback
- * errors of each since Linux 5.8), its directories, and the entry of its root in the parent directory. Says what
- * failed; the import has failed then. */
+ * errors of each since Linux 5.8) and its directories. Says what failed; the import has failed then. */
 static bool sync_all(const char *dir, char **vols, uint32_t nv)
 {
     char e[256];
@@ -1559,19 +1698,7 @@ static bool sync_all(const char *dir, char **vols, uint32_t nv)
             return false;
         }
     }
-    char *parent = strdup(dir), *slash = parent ? strrchr(parent, '/') : NULL;
-    if (slash)
-        slash[slash == parent] = 0;
-    int fd = !parent ? -1 : open(slash ? parent : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    bool ok = fd >= 0 && fsync(fd) == 0;
-    int err = errno;
-    if (!ok)
-        fprintf(stderr, "tsdb: import: fsync %s: %s\n", parent ? esc(slash ? parent : ".", e, sizeof e) : "the parent "
-                "directory", strerror(err));
-    if (fd >= 0)
-        close(fd);
-    free(parent);
-    return ok;
+    return true;
 }
 
 /* --volume and --volume-root: OLD=NEW, both normalised ("/a/b/" is "/a/b"); NEW may be empty for --volume (the
@@ -1733,29 +1860,41 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
     int ret = 1;
     tsdb *db = NULL; /* none with --check: every series is taken as new and every volume as present */
     bool fresh = false;
+    staging stg = {0};
     if (!check) {
         tsdb_options o;
         tsdb_options_init(&o);
         o.create_volumes = 0; /* volumes only through --create-volumes */
-        /* Into a new database, nothing is synced file by file (two syncs per new series and one per part
-         * otherwise: they bound small series to ~700 per second); every file system of it is synced once at the
-         * end instead. A power loss before that leaves a database that fails its checks at open: it held
-         * nothing else, so it is removed and the import rerun. An existing database keeps every sync. */
-        fresh = dir_is_new(dir);
+        /* A new database is built in a sibling directory that becomes the target only once it is complete, so
+         * nothing in it is synced file by file (two syncs per new series and one per part otherwise: they bound
+         * small series to ~700 per second); every file system of it is synced once at the end instead. An
+         * existing database, or an empty directory that cannot be replaced, keeps every sync. */
+        if (dir_is_new(dir)) {
+            int sr = stage_make(dir, &stg, im);
+            if (sr < 0) {
+                if (in != stdin)
+                    fclose(in);
+                return 1;
+            }
+            fresh = sr > 0;
+        }
         if (fresh)
             o.fsync = 0;
         /* No WAL: rows of small series collect in the memtable and reach the disk as parts, synced, at the
          * flush at the end (large batches go straight to synced parts). A crash before that loses rows of this
          * import only: rerun it with --merge, which writes the same rows again. */
         o.wal_sync_ms = -1;
-        int rc = tsdb_open(dir, &o, &db);
+        const char *at = fresh ? stg.stage : dir;
+        int rc = tsdb_open(at, &o, &db);
         if (rc) {
-            fprintf(stderr, "tsdb: %s: %s\n", dir, tsdb_strerror(rc));
+            fprintf(stderr, "tsdb: %s: %s\n", at, tsdb_strerror(rc));
+            if (fresh)
+                stage_drop(&stg, dir, NULL, 0);
             if (in != stdin)
                 fclose(in);
             return 1;
         }
-        if (!realpath(dir, im->root))
+        if (!realpath(at, im->root))
             snprintf(im->root, sizeof im->root, "%s", tsdb_volume_path(db, 0));
     }
     im->db = db;
@@ -1802,7 +1941,9 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
                         "retention\n", im->t_expired_series, im->t_expired);
     if (rc) {
         fprintf(stderr, "tsdb: import: %s: %s\n", in_name, im->err);
-        if (im->apply) {
+        if (im->apply && fresh) {
+            /* the new database goes, below */
+        } else if (im->apply) {
             /* the series read whole are written; the rows of the one that failed are not */
             uint64_t whole = im->t_series;
             size_t keep = im->in_series ? im->cur0 : im->n;
@@ -1849,11 +1990,18 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
             fprintf(stderr, "tsdb: close: %s\n", tsdb_strerror(crc));
             ret = 1;
         }
-        if (fresh && (oom || !sync_all(dir, vols, nv))) {
-            if (oom)
-                fprintf(stderr, "tsdb: import: out of memory\n");
-            fprintf(stderr, "tsdb: import: %s: the new database is not on disk: delete it and import again\n",
-                    esc(dir, e, sizeof e));
+        if (fresh && oom)
+            fprintf(stderr, "tsdb: import: out of memory\n");
+        if (fresh && (ret || oom || !sync_all(stg.stage, vols, nv))) {
+            stage_drop(&stg, dir, vols, oom ? 0 : nv);
+            ret = 1;
+        } else if (fresh && rename(stg.stage, dir) != 0) {
+            int err = errno;
+            fprintf(stderr, "tsdb: import: rename %s to %s: %s: the imported database is whole in %s\n",
+                    esc(stg.stage, e, sizeof e), esc(dir, e2, sizeof e2), strerror(err), e);
+            ret = 1;
+        } else if (fresh && !fsync_dir(stg.parent)) {
+            fprintf(stderr, "tsdb: import: %s may not be on disk: delete it and import again\n", esc(dir, e, sizeof e));
             ret = 1;
         }
         for (uint32_t i = 0; vols && i < nv; i++)

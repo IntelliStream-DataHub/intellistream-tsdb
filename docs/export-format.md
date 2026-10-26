@@ -118,17 +118,23 @@ A reader refuses, with an error that says why, a stream:
 
 How `tsdb import` writes: from a file it reads the stream twice, once to verify all of it and once to write, so a
 damaged file writes nothing ("nothing was written"). From a pipe it cannot look ahead: it writes each batch (up
-to `--batch-rows`, 1 M rows by default) atomically after checking it; when the stream turns out damaged, the
-series being imported is emptied again if the import created it, the error names it, and the series before it
-are whole. It exits with status 1 in every such case.
+to `--batch-rows`, 1 M rows by default) atomically after checking it; when the stream turns out damaged, into an
+existing database the series being imported is emptied again if the import created it, the error names it, and
+the series before it are whole; a new database is not created at all. It exits with status 1 in every such case.
 
 Into an existing database `import` keeps every sync of the engine: a crash or failure midway leaves the series
 before it whole, and the same import rerun with `--merge` writes the same rows again. Into a new database (a
-directory that is missing or empty) it writes without syncing file by file and syncs every file system the
-database lives on (its directory and every volume) once at the end: that is much faster for many small series.
-It reports success and exits 0 only once that sync succeeded; a failed sync is an error (exit 1). A new database
-whose import was interrupted (a crash, power loss or kill) is incomplete: after a power loss it fails its checks at
-open, after a kill it may open with part of the data. Either way, delete it and import again.
+directory that is missing or empty) it builds the database in a sibling directory, `DIR.importing-PID`, writes
+without syncing file by file, syncs every file system the database lives on (that directory and every volume)
+once at the end, which is much faster for many small series, and then renames the sibling to `DIR` and syncs
+the parent directory. It reports success and exits 0 only after that; a failed sync is an error (exit 1), after
+which the sibling is removed. Whatever stops it (an error, a crash, a power loss, a kill), there is no database
+named `DIR` until it is complete. Volumes are named by absolute path in the root's `VOLUMES` and know the
+database by its ID (`ROOT_ID`), so the rename does not detach them. A sibling left by a kill or power loss
+makes the next import into `DIR` stop with a message naming it (and the volumes it lists): delete it, and the
+volume directories that import made, and import again. An empty directory is replaced by the rename, unless it
+is a mount point or its parent is not writable: then the import writes into it with every sync, as into an
+existing database.
 
 A stream on an interactive terminal is recognised only after 16 bytes or the end of input.
 

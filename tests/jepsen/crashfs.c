@@ -107,6 +107,7 @@ typedef struct dirop {
     char b[PATH_MAX];     /* renamed to */
     char saved[PATH_MAX]; /* a file this op replaced or removed, kept aside */
     bool done;            /* made durable */
+    bool undone;          /* rolled back by the power loss */
 } dirop;
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -292,6 +293,28 @@ static void keep_old(file *f, int fd, off_t off, off_t end)
     }
 }
 
+/* A path inside directory `from` (not `from` itself) moved to the same place under `to`. */
+static void rekey(char *p, const char *from, const char *to)
+{
+    size_t n = strlen(from);
+    char t[PATH_MAX];
+    if (n && !strncmp(p, from, n) && p[n] == '/' && snprintf(t, sizeof t, "%s%s", to, p + n) < (int)sizeof t)
+        memcpy(p, t, strlen(t) + 1);
+}
+
+/* Path p, recorded by operation i, under the name it has now: moved by every directory rename after operation i
+ * that is in effect (while running, all of them; during a power loss, those not undone). Operations record the
+ * names they saw; a directory renamed later (a database built beside its name, then renamed to it) moves them. */
+static void op_now(size_t i, const char *p, char *out)
+{
+    char t[PATH_MAX];
+    snprintf(t, sizeof t, "%s", p);
+    for (size_t j = i + 1; j < ndops; j++)
+        if (dops[j].kind == OP_RENAME && !dops[j].undone)
+            rekey(t, dops[j].a, dops[j].b);
+    memcpy(out, t, strlen(t) + 1);
+}
+
 static void add_dirop(op_kind k, const char *a, const char *b, const char *saved)
 {
     if (ndops == MAX_OPS)
@@ -463,6 +486,10 @@ static void rollback(void)
         dirop *d = &dops[i];
         if (d->done)
             continue;
+        op_now(i, d->a, d->a);
+        op_now(i, d->b, d->b);
+        op_now(i, d->saved, d->saved);
+        d->undone = true;
         switch (d->kind) {
         case OP_CREATE: real_unlink(d->a); break;
         case OP_MKDIR: rm_tree(d->a); break;
@@ -703,8 +730,9 @@ static int do_sync(int fd, bool data_only)
                 return 0;
             }
             /* the directory's entries are durable now */
+            char now[PATH_MAX];
             for (size_t i = 0; i < ndops; i++)
-                if (!dops[i].done && !strcmp(dops[i].dir, fdpath[fd])) {
+                if (!dops[i].done && (op_now(i, dops[i].dir, now), !strcmp(now, fdpath[fd]))) {
                     dops[i].done = true;
                     if (dops[i].kind == OP_RENAME && dops[i].a[0]) {
                         /* the old name is gone for good too, if it was in another dir */
@@ -784,6 +812,22 @@ static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool 
     if (r == 0) {
         add_dirop(OP_RENAME, a, b, saved[0] ? saved : NULL);
         file_get(b, false);
+        if (stat(b, &st) == 0 && S_ISDIR(st.st_mode)) { /* what is inside moved with it */
+            for (size_t i = 0; i < nfiles; i++)
+                rekey(files[i].path, a, b);
+            for (int fd = 0; fd < MAX_FDS; fd++) {
+                char p[PATH_MAX];
+                if (!fdpath[fd])
+                    continue;
+                snprintf(p, sizeof p, "%s", fdpath[fd]);
+                rekey(p, a, b);
+                char *n = strcmp(p, fdpath[fd]) ? strdup(p) : NULL;
+                if (n) {
+                    free(fdpath[fd]);
+                    fdpath[fd] = n;
+                }
+            }
+        }
     } else if (saved[0]) {
         real_unlink(saved);
     }

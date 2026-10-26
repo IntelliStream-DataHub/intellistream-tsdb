@@ -14,7 +14,8 @@ disk format and the wire protocol.
   to a new format version. Every later tsdb reads every stream an earlier one wrote
   ([docs/export-format.md](docs/export-format.md)). An import from a file is checked whole before anything is
   written; `--skip-existing`, `--merge`, `--replace`, `--volume OLD=NEW`, `--volume-root OLD=NEW`,
-  `--create-volumes`, `--no-retention`, `--check`. An import into a new database is synced once at the end.
+  `--create-volumes`, `--no-retention`, `--check`. An import into a new database is built beside it,
+  synced once at the end and then renamed to its name, so an interrupted one leaves no database under that name.
 
 ## [0.9.0] - unreleased (tag v0.9.0 when the checklist in docs/release.md is done)
 

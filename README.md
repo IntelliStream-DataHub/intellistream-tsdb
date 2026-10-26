@@ -443,12 +443,12 @@ the whole file before it writes anything, so a damaged file changes nothing; `im
 Series that already exist are refused unless you pass `--skip-existing`, `--merge` or `--replace`. Stop tsdbd
 before importing into its directory. [docs/export-format.md](docs/export-format.md) describes the file.
 
-**If an import stops halfway.** Into a new database (a directory that is missing or empty), `import` writes
-without waiting for the disk and makes everything safe on disk once, at the end. That is what makes it fast,
-and it means the new database is finished only when `import` says "imported ..." and exits with status 0. If
-it was interrupted (a crash, a power loss, a kill, or an error such as a failed sync), the new database is
-incomplete: after a power loss it does not even open. Delete it and run the same import again. Into an
-existing database, `import` writes as carefully as tsdbd does: if it stops halfway, run it again with
+**If an import stops halfway.** Into a new database (a directory that is missing or empty), `import` builds
+the database in a directory beside it, `DIR.importing-<number>`, without waiting for the disk, makes it safe
+on disk once at the end, and only then gives it its name. So an interrupted import (a crash, a power loss, a
+kill, an error) leaves no database under that name. It may leave the `.importing` directory, and volume
+directories it made; the next import into the same directory says so. Delete them and run the import again.
+Into an existing database, `import` writes as carefully as tsdbd does: if it stops halfway, run it again with
 `--merge`, which writes the same rows again.
 
 **Upgrading a database with volumes.** Series in volumes (other directories, such as NFS mounts) keep their

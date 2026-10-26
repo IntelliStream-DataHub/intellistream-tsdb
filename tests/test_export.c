@@ -28,6 +28,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -201,6 +202,8 @@ static bool err_has(const char *what)
     free(e);
     return ok;
 }
+
+static bool err_lacks(const char *what);
 
 static tsdb *open_db(const char *dir, bool ro)
 {
@@ -1372,6 +1375,13 @@ static void test_crafted(void)
         spit(path("pipe-bad.dump"), s, n);
         free(s);
         const char *pd = path("pipe-dst");
+        /* into a new database: nothing is left, under the target's name or beside it */
+        CHECK(sh("cat '%s' | '%s' '%s' import --batch-rows 1000 2>%s", path("pipe-bad.dump"), cli, pd, errfile) != 0);
+        CHECK(err_has("fails its checksum") && err_has("pipe-dst was not created") && err_lacks("--merge"));
+        CHECK(access(pd, F_OK) != 0 && errno == ENOENT);
+        CHECK(sh("ls -d '%s'.importing-* 2>/dev/null", pd) != 0);
+        /* into an existing one: the series before it are whole, the one that failed is emptied again */
+        tsdb_close(open_db(pd, false));
         CHECK(sh("cat '%s' | '%s' '%s' import --batch-rows 1000 2>%s", path("pipe-bad.dump"), cli, pd, errfile) != 0);
         CHECK(err_has("series big, which this import created, is left empty") && err_has("--merge"));
         CHECK(err_has("1 series before it"));
@@ -1431,13 +1441,14 @@ static void test_volumes(void)
     snprintf(map, sizeof map, "/old/mnt/vol=%s/inside", path("v2")); /* inside the target */
     CHECK(RUN(NULL, NULL, path("v2"), "import", f, "--volume", map, "--create-volumes") != 0);
     CHECK(err_has("inside the database directory"));
-    tsdb *d = open_db(path("v2"), true);
-    CHECK(tsdb_series_count(d) == 0);
-    tsdb_close(d);
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", path("v2")); /* the new database's own name */
+    CHECK(RUN(NULL, NULL, path("v2"), "import", f, "--volume", map, "--create-volumes") != 0);
+    CHECK(err_has("inside the database directory") && err_has("v2 was not created"));
+    CHECK(access(path("v2"), F_OK) != 0);
     /* trailing slashes are the same path */
     snprintf(map, sizeof map, "/old/mnt/vol/=%s/", path("v3vol"));
     CHECK(RUN(NULL, NULL, path("v3"), "import", f, "--volume", map, "--create-volumes") == 0);
-    d = open_db(path("v3"), true);
+    tsdb *d = open_db(path("v3"), true);
     CHECK(same_str(tsdb_series_path(d, lookup(d, "f")), path("v3vol")));
     CHECK(same_str(tsdb_series_path(d, lookup(d, "b")), path("v3")));
     tsdb_close(d);
@@ -1576,8 +1587,22 @@ static void crafted_whole(const char *dir, const char *vol)
     tsdb_close(d);
 }
 
-/* An import into a new database writes unsynced and syncs every file system once at the end; it says it is done
- * only after that sync, and a failed sync fails the import. An existing database keeps every sync. */
+/* A sibling <db>.importing-* is there. */
+static bool sibling_left(const char *db) { return sh("ls -d '%s'.importing-* >/dev/null 2>&1", db) == 0; }
+
+static bool missing(const char *p) { return access(p, F_OK) != 0 && errno == ENOENT; }
+
+/* Signals a child; never pid 0 or -1 (every process of the user). */
+static void kill_child(pid_t pid, int sig)
+{
+    if (pid > 0)
+        kill(pid, sig);
+}
+
+/* An import into a new database is built beside its name, written unsynced, synced once at the end (every file
+ * system) and only then renamed to its name: it says it is done only after that, a failed sync fails it, and
+ * whatever stops it (an error, a kill, a power loss) leaves no database under the name, or a whole one. A sibling
+ * left by a kill or power loss is reported by the next import. An existing database keeps every sync. */
 static void test_sync(void)
 {
     char *f = path("sync.dump"), *top = path("crash"), map[2 * PATH_MAX + 16];
@@ -1591,6 +1616,7 @@ static void test_sync(void)
           0);
     CHECK(err_has("imported 4 series") && err_has("unsynced data lost"));
     crafted_whole(db, vol);
+    CHECK(!sibling_left(db));
     /* the same into an existing database, synced by the engine as it goes */
     db = path("crash/existing"), vol = path("crash/existingvol");
     tsdb_close(open_db(db, false));
@@ -1599,7 +1625,15 @@ static void test_sync(void)
           0);
     CHECK(err_has("imported 4 series") && err_has("unsynced data lost"));
     crafted_whole(db, vol);
-    /* the final sync fails (EIO) on the database directory, then on a volume: the import fails and says so */
+    /* an empty directory is a new database too: the rename replaces it */
+    db = path("crash/emptydir"), vol = path("crash/emptydirvol");
+    sh("mkdir -p '%s'", db);
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", vol);
+    CHECK(run_crashfs(loss, (const char *const[]){cli, db, "import", f, "--volume", map, "--create-volumes", NULL}) ==
+          0);
+    crafted_whole(db, vol);
+    /* the final sync fails (EIO) on the database directory, then on a volume: the import fails, says so, and
+     * leaves nothing under the name nor beside it */
     const char *eio[] = {"CRASHFS_ROOT", top, "CRASHFS_MODE", "eio", "CRASHFS_PROB", "1", "CRASHFS_EIO_ONLY",
                          "syncfail", "CRASHFS_EIO_ON", "syncfs", NULL};
     for (int k = 0; k < 2; k++) {
@@ -1608,10 +1642,113 @@ static void test_sync(void)
         snprintf(map, sizeof map, "/old/mnt/vol=%s", vol);
         CHECK(run_crashfs(eio, (const char *const[]){cli, db, "import", f, "--volume", map, "--create-volumes",
                                                      NULL}) == 1);
-        CHECK(err_has("crashfs: EIO on syncfs") && err_has("Input/output error") &&
-              err_has("not on disk: delete it and import again") && err_lacks("imported "));
+        CHECK(err_has("crashfs: EIO on syncfs") && err_has("Input/output error") && err_has("was not created") &&
+              err_has("was made by this import: delete it") && err_lacks("imported "));
+        CHECK(missing(db) && !sibling_left(db));
     }
+    /* power lost at every point of the import, with and without torn writes: the database is missing (perhaps
+     * with a sibling left, which the next import reports) or whole */
+    int lost = 0, whole = 0, reported = 0, w, done = 0;
+    for (w = 0; w < 3000 && done < 2; w++) {
+        char name[64], vname[64], warm[32], seed[32];
+        snprintf(name, sizeof name, "crash/pl%d", w);
+        snprintf(vname, sizeof vname, "crash/pl%dvol", w);
+        snprintf(warm, sizeof warm, "%d", w / 2);
+        snprintf(seed, sizeof seed, "%d", w + 1);
+        db = path(name), vol = path(vname);
+        snprintf(map, sizeof map, "/old/mnt/vol=%s", vol);
+        const char *pl[] = {"CRASHFS_ROOT", top, "CRASHFS_PROB", "1", "CRASHFS_WARMUP", warm, "CRASHFS_TEAR",
+                            w % 2 ? "1" : "0", "CRASHFS_SEED", seed, NULL};
+        int rc = run_crashfs(pl, (const char *const[]){cli, db, "import", f, "--volume", map, "--create-volumes",
+                                                      NULL});
+        if (rc != 0 && rc != 99) {
+            fprintf(stderr, "  power loss after %d operations: import exited %d\n", w, rc);
+            CHECK(rc == 0 || rc == 99);
+            break;
+        }
+        if (!missing(db)) {
+            whole++;
+            crafted_whole(db, vol);
+        } else {
+            lost++;
+            if (sibling_left(db)) { /* the next import names it and its volume, and writes nothing */
+                reported++;
+                CHECK(RUN(NULL, NULL, db, "import", f, "--volume", map, "--create-volumes") == 1);
+                CHECK(err_has("is left from an import into") && err_has("and import again") &&
+                      err_has("any volume directory it made") && missing(db));
+            }
+        }
+        if (rc == 0) /* it got to the end, with and without torn writes */
+            done++;
+        sh("rm -rf '%s' '%s'.importing-* '%s'", db, db, vol);
+    }
+    printf("  power loss at %d points, torn and not: %d without the database (%d with a sibling reported), %d whole\n",
+           w / 2, lost, reported, whole);
+    CHECK(w < 3000 && lost > 0 && reported > 0 && whole > 0);
     printf("new databases synced at the end: ok\n");
+}
+
+/* Killed midway (here while it waits for the end of a pipe, its volume made): no database under the name; the
+ * sibling it leaves is reported, with its volume, by the next import, which writes nothing; deleted, the import
+ * succeeds. */
+static void test_kill(void)
+{
+    char *f = path("kill.dump"), *fifo = path("kill.fifo"), *db = path("killed"), *vol = path("killedvol");
+    char map[2 * PATH_MAX + 16];
+    crafter cr = {0}; /* large enough that all but its end is read while the end is held back */
+    cr_header(&cr, 0, CR_FROM, CR_TO);
+    cr_series(&cr, "f", "/old/mnt/vol", TSDB_FLOAT32, 0);
+    int64_t tb[1000];
+    float vb[1000];
+    for (int ch = 0; ch < 200; ch++) {
+        for (int i = 0; i < 1000; i++) {
+            tb[i] = T0 + ch * 1000 + i;
+            vb[i] = (float)(next() % 1000000);
+        }
+        cr_chunk(&cr, 4, tb, vb, NULL, 1000, 0);
+    }
+    cr_end(&cr, 0);
+    cr_finish(&cr, f);
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", vol);
+    size_t n;
+    char *s = slurp(f, &n);
+    CHECK(s && n > 100000 && mkfifo(fifo, 0600) == 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int i = open(fifo, O_RDONLY), e = open(errfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (i < 0 || e < 0)
+            _exit(126);
+        dup2(i, 0);
+        dup2(e, 2);
+        execv(cli, (char *const[]){cli, db, "import", "--volume", map, "--create-volumes", NULL});
+        _exit(127);
+    }
+    CHECK(pid > 0);
+    int o = pid > 0 ? open(fifo, O_WRONLY) : -1;
+    CHECK(o >= 0 && write(o, s, n - 64) == (ssize_t)(n - 64));
+    for (int i = 0; i < 1000 && missing(vol); i++)
+        usleep(5000);
+    CHECK(!missing(vol) && sibling_left(db) && missing(db));
+    usleep(50000);
+    kill_child(pid, SIGKILL);
+    int st;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFSIGNALED(st));
+    if (o >= 0)
+        close(o);
+    free(s);
+    CHECK(missing(db) && sibling_left(db));
+    CHECK(RUN(NULL, NULL, db, "import", f, "--volume", map, "--create-volumes") == 1);
+    CHECK(err_has("killed.importing-") && err_has("is left from an import into") &&
+          err_has("and import again") && err_has(vol));
+    CHECK(missing(db));
+    sh("rm -rf '%s'.importing-* '%s'", db, vol);
+    CHECK(RUN(NULL, NULL, db, "import", f, "--volume", map, "--create-volumes") == 0);
+    CHECK(!sibling_left(db));
+    tsdb *d = open_db(db, true);
+    CHECK(rows_of(d, "f") == 200000 && same_str(tsdb_series_path(d, lookup(d, "f")), vol));
+    tsdb_close(d);
+    printf("killed imports: ok\n");
 }
 
 int main(int argc, char **argv)
@@ -1661,6 +1798,7 @@ int main(int argc, char **argv)
     test_crafted();
     test_volumes();
     test_sync();
+    test_kill();
     test_golden(golden);
     test_concurrent();
     test_memory();
