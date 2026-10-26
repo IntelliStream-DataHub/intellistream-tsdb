@@ -320,7 +320,7 @@ pub(crate) fn inserts(
                     let e = known
                         .remove(&id)
                         .and_then(Result::err)
-                        .unwrap_or_else(|| tc::Error::Server(tc::Status::NotFound));
+                        .unwrap_or(tc::Error::Server(tc::Status::NotFound));
                     return Err(crate::to_pyerr(py, tc::Error::Batch { index: i, error: Box::new(e) }));
                 }
             },
