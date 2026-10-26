@@ -40,6 +40,13 @@ disk format and the wire protocol.
 - Python: numpy input arrays are copied once with the GIL released instead of while holding it.
 
 ### Fixed
+- `tsdb import` into a new database: after a failure it no longer tells you to delete a volume directory that was
+  there before the import (it may hold your other files). It removes only the files the import provably wrote in
+  the volumes it added (tsdb's own file names, not there before), leaves and names anything else, also what another
+  process put there meanwhile, and removes the directory only if the import made it and it is empty then; a sibling
+  left by a kill names the tsdb files to remove.
+  A target that is a symlink to an empty directory, or a dangling symlink, imports at the end of the link instead
+  of failing at the final rename.
 - Python: big-endian numpy arrays (`>i8`, `>f4`) were read byte-swapped (PyO3 takes '>' for native on
   little-endian machines); they are now converted element by element.
 

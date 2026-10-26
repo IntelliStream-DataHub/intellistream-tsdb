@@ -446,8 +446,10 @@ before importing into its directory. [docs/export-format.md](docs/export-format.
 **If an import stops halfway.** Into a new database (a directory that is missing or empty), `import` builds
 the database in a directory beside it, `DIR.importing-<number>`, without waiting for the disk, makes it safe
 on disk once at the end, and only then gives it its name. So an interrupted import (a crash, a power loss, a
-kill, an error) leaves no database under that name. It may leave the `.importing` directory, and volume
-directories it made; the next import into the same directory says so. Delete them and run the import again.
+kill, an error) leaves no database under that name. After an error it removes the files it wrote itself, in the
+volumes too, and nothing else: your other files, and a volume directory that was there before, stay. After a
+crash or a kill it may leave the `.importing` directory and tsdb files in the volumes it added; the next import
+into the same directory names them. Delete them and run the import again.
 Into an existing database, `import` writes as carefully as tsdbd does: if it stops halfway, run it again with
 `--merge`, which writes the same rows again.
 

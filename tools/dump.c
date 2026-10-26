@@ -728,6 +728,18 @@ typedef struct name_slot {
     uint64_t a, b;
 } name_slot;
 
+/* A volume --create-volumes adds, and what its directory held before the import: if the import fails, it removes
+ * only files it provably wrote there (vol_drop), and the directory only if it made it and nothing else is in it. */
+typedef struct vnote {
+    char *path;     /* canonical, as the database names it */
+    bool existed;   /* the directory was there before the import */
+    bool listed;    /* it could be listed (keep and seen are complete) */
+    char **keep;    /* the entries with names the engine writes that were there before: never removed */
+    size_t nkeep;
+    uint64_t *seen; /* hashes of every name that was there before, sorted: only to tell the user what is new */
+    size_t nseen;
+} vnote;
+
 typedef struct importer {
     tsdb *db;
     char root[PATH_MAX]; /* the target's directory, canonical */
@@ -742,6 +754,8 @@ typedef struct importer {
     int nmaps, nroots;
     char **vols_ok; /* target volume paths checked already */
     int nvols_ok;
+    vnote *vnotes; /* the volumes --create-volumes will add: what was there before */
+    int nvnotes;
     size_t batch_rows;
     ZSTD_DCtx *zd;
     uint64_t off; /* bytes of the stream read */
@@ -897,18 +911,19 @@ static bool is_volume(tsdb *db, const char *path)
 
 /* Whether --create-volumes can add `path` (valid, not a volume yet): what tsdb_volume_add would refuse, checked
  * before anything is written. NULL if it can, else why not. */
-static const char *vpath_creatable(importer *im, const char *path)
+static const char *vpath_creatable(importer *im, const char *path, char *canon, bool *existed)
 {
     static const char *const tsdb_files[] = {"ID", "CATALOG", "VOLUMES", "ROOT_ID", "MANIFEST", "SERIES", "LOCK",
                                              "META"};
-    char canon[PATH_MAX];
     struct stat st;
+    *existed = false;
     /* a new database is not there yet (it is built beside its name): a volume inside it would block the rename */
     if (im->final[0] && (vpath_within(path, im->final) || vpath_within(im->final, path)))
         return "lies inside the database directory or contains it";
     if (stat(path, &st) == 0) {
         if (!S_ISDIR(st.st_mode))
             return "is not a directory";
+        *existed = true;
         if (!realpath(path, canon))
             return strerror(errno);
         int fd = open(canon, O_RDONLY | O_DIRECTORY);
@@ -934,7 +949,7 @@ static const char *vpath_creatable(importer *im, const char *path)
             return "does not exist, and its parent directory is not writable";
         if (!realpath(parent, pcanon))
             return strerror(errno);
-        if (snprintf(canon, sizeof canon, "%s/%s", strcmp(pcanon, "/") ? pcanon : "", base) >= (int)sizeof canon)
+        if (snprintf(canon, PATH_MAX, "%s/%s", strcmp(pcanon, "/") ? pcanon : "", base) >= PATH_MAX)
             return "is too long";
     } else {
         return strerror(errno);
@@ -948,6 +963,125 @@ static const char *vpath_creatable(importer *im, const char *path)
             return "lies inside another volume of this database or contains one";
     }
     return NULL;
+}
+
+/* Decimal digits (at least one, at most 20) after an optional '-' if `sign`: the end, or NULL. */
+static const char *vname_dec(const char *s, bool sign)
+{
+    if (sign && *s == '-')
+        s++;
+    const char *d = s;
+    while (*s >= '0' && *s <= '9' && s - d < 21)
+        s++;
+    return s > d && s - d <= 20 ? s : NULL;
+}
+
+/* p<partition>_<min_block>_<max_block>_<level>.part (src/part.c), from `s` to its end. */
+static bool vname_part(const char *s)
+{
+    if (*s++ != 'p' || !(s = vname_dec(s, true)))
+        return false;
+    for (int i = 0; i < 3; i++)
+        if (*s++ != '_' || !(s = vname_dec(s, false)))
+            return false;
+    return strcmp(s, ".part") == 0;
+}
+
+/* <prefix><pid>_<seq><suffix> with this process's pid: the tmp files of its part writers and its insert intents. */
+static bool vname_ours(const char *s, const char *prefix, const char *suffix)
+{
+    size_t pl = strlen(prefix);
+    char pid[24];
+    int n = snprintf(pid, sizeof pid, "%d_", (int)getpid());
+    if (strncmp(s, prefix, pl) != 0 || strncmp(s + pl, pid, (size_t)n) != 0 || !(s = vname_dec(s + pl + n, false)))
+        return false;
+    return strcmp(s, suffix) == 0;
+}
+
+/* A name the engine writes in a volume directory, exactly (src/db.c, part.c, manifest.c, memtable.c, retention.c,
+ * series.c, volumes.c): the import may remove such a file if it was not there before, and nothing else. All are
+ * regular files; the engine makes no directories in a volume. */
+static bool vname_engine(const char *s)
+{
+    static const char *const fixed[] = {"LOCK", "MANIFEST", "META", "META.tmp", "ROOT_ID", "SERIES", "STATES",
+                                        "RETENTION"};
+    for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++)
+        if (strcmp(s, fixed[i]) == 0)
+            return true;
+    if (vname_part(s) || (strncmp(s, "retired_", 8) == 0 && vname_part(s + 8)) ||
+        vname_ours(s, "tmp_", ".part") || vname_ours(s, "txn_", ".intent"))
+        return true;
+    if (strncmp(s, "wal_", 4) != 0)
+        return false;
+    for (int i = 4; i < 20; i++)
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f')))
+            return false;
+    return strcmp(s + 20, ".log") == 0;
+}
+
+static uint64_t vname_hash(const char *s)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        h = (h ^ *p) * 0x100000001b3ull;
+    return h;
+}
+
+static int u64_cmp(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* Notes the volume `canon` that --create-volumes will add; an existing directory is listed, so that a failed
+ * import can tell what it wrote there from what the user keeps there. 0, or -1 out of memory. */
+static int vnote_add(importer *im, const char *canon, bool existed)
+{
+    vnote *n = realloc(im->vnotes, (size_t)(im->nvnotes + 1) * sizeof *n);
+    if (!n)
+        return -1;
+    im->vnotes = n;
+    n += im->nvnotes;
+    *n = (vnote){.path = strdup(canon), .existed = existed, .listed = true};
+    if (!n->path)
+        return -1;
+    im->nvnotes++;
+    if (!existed)
+        return 0;
+    DIR *d = opendir(canon);
+    struct dirent *de;
+    size_t cap = 0;
+    int ret = 0;
+    for (errno = 0; d && (de = readdir(d)); errno = 0) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (n->nseen == cap) {
+            uint64_t *h = realloc(n->seen, (cap = cap ? cap * 2 : 64) * sizeof *h);
+            if (!h) {
+                ret = -1;
+                break;
+            }
+            n->seen = h;
+        }
+        n->seen[n->nseen++] = vname_hash(de->d_name);
+        if (!vname_engine(de->d_name))
+            continue;
+        char **k = realloc(n->keep, (n->nkeep + 1) * sizeof *k);
+        if (k)
+            n->keep = k;
+        if (!k || !(k[n->nkeep] = strdup(de->d_name))) {
+            ret = -1;
+            break;
+        }
+        n->nkeep++;
+    }
+    if (!d || (ret == 0 && errno)) /* not known what was there: nothing is removed, the user is told what to */
+        n->listed = false;
+    if (d)
+        closedir(d);
+    if (n->nseen)
+        qsort(n->seen, n->nseen, sizeof *n->seen, u64_cmp);
+    return ret;
 }
 
 /* The target volume of the series being read (--volume, then --volume-root, else its own path) into im->vpath,
@@ -994,11 +1128,15 @@ static int im_volume(importer *im, const char *name)
                              "for every volume under OLD), add it (tsdb DIR volume add PATH) or pass "
                              "--create-volumes", name, esc(im->vpath, e1, sizeof e1), esc(src, e2, sizeof e2),
                          e2);
-        const char *why = vpath_creatable(im, im->vpath);
+        char canon[PATH_MAX];
+        bool existed;
+        const char *why = vpath_creatable(im, im->vpath, canon, &existed);
         if (why)
             return IFAIL(im, "series %s: volume %s %s: it cannot be added; map it elsewhere (--volume %s=NEW or "
                              "--volume-root OLD=NEW)", name, esc(im->vpath, e1, sizeof e1), why,
                          esc(src, e2, sizeof e2));
+        if (vnote_add(im, canon, existed))
+            return IFAIL(im, "out of memory");
     }
     char **p = realloc(im->vols_ok, (size_t)(im->nvols_ok + 1) * sizeof *p);
     if (!p || !(p[im->nvols_ok] = strdup(im->vpath))) {
@@ -1569,7 +1707,9 @@ static void stage_volumes(const char *stage)
         char *sp = strchr(line, ' '), *nl = strchr(line, '\n');
         if (sp && nl && sp[1] == '/') {
             *nl = 0;
-            fprintf(stderr, "tsdb: import: it made volume %s: delete that too\n", esc(sp + 1, e, sizeof e));
+            /* a sibling left by a kill cannot tell a directory the import made from one that was there before */
+            fprintf(stderr, "tsdb: import: it added volume %s: remove the tsdb files it wrote there (or the "
+                            "directory, if the import made it)\n", esc(sp + 1, e, sizeof e));
         }
     }
     if (v)
@@ -1631,7 +1771,7 @@ static int stage_make(const char *dir, staging *st, importer *im)
         char left[2 * PATH_MAX];
         snprintf(left, sizeof left, "%s/%s", st->parent, de->d_name);
         fprintf(stderr, "tsdb: import: %s is left from an import into %s that was interrupted (or is still running): "
-                        "delete it, and any volume directory it made, and import again\n", esc(left, e, sizeof e),
+                        "delete it, undo its volumes (named below), and import again\n", esc(left, e, sizeof e),
                 esc(dir, e2, sizeof e2));
         stage_volumes(left);
         closedir(pd);
@@ -1667,17 +1807,128 @@ static int rm_entry(const char *p, const struct stat *s, int flag, struct FTW *f
     return remove(p) != 0 && errno != ENOENT ? -1 : 0;
 }
 
-/* The import failed: the sibling goes (it is this import's own), the volumes it made are named. */
-static void stage_drop(const staging *st, const char *dir, char **vols, uint32_t nv)
+static bool vnote_kept(const vnote *vn, const char *name)
+{
+    for (size_t i = 0; i < vn->nkeep; i++)
+        if (strcmp(vn->keep[i], name) == 0)
+            return true;
+    return false;
+}
+
+static bool vnote_seen(const vnote *vn, const char *name)
+{
+    uint64_t h = vname_hash(name);
+    return vn->nseen && bsearch(&h, vn->seen, vn->nseen, sizeof h, u64_cmp);
+}
+
+#define VOL_TSDB_FILES "LOCK, MANIFEST, META, ROOT_ID, SERIES, STATES, RETENTION, p*.part, wal_*.log, tmp_*, txn_*, " \
+                       "retired_*"
+
+/* The import failed: undoes what it did to volume `vn`, removing only what it provably wrote: a regular file, on the
+ * directory's file system, with a name the engine writes in a volume (vname_engine), that was not there before. Any
+ * other entry stays, whoever made it (another process may write there during the import: a shared --volume-root);
+ * one that is new is named. The directory goes only if the import made it and nothing else is in it. Nothing is
+ * followed and nothing is entered: the engine makes no directories in a volume. What cannot be undone is named,
+ * with what to do about it. */
+static void vol_drop(const vnote *vn)
+{
+    char e[256], e2[256], p[2 * PATH_MAX];
+    const char *vp = esc(vn->path, e, sizeof e);
+    if (vn->existed && !vn->listed) {
+        fprintf(stderr, "tsdb: import: volume %s was a directory before this import and could not be listed then, so "
+                        "the import cannot tell what it wrote there: remove the tsdb files it wrote there ("
+                        VOL_TSDB_FILES "), not the directory, before importing again\n", vp);
+        return;
+    }
+    int fd = open(vn->path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), dfd = fd < 0 ? -1 : dup(fd);
+    DIR *d = dfd < 0 ? NULL : fdopendir(dfd);
+    struct stat ds;
+    if (!d || fstat(fd, &ds) != 0) {
+        int err = errno;
+        if (dfd >= 0 && !d)
+            close(dfd);
+        if (d)
+            closedir(d);
+        if (fd >= 0)
+            close(fd);
+        if (err != ENOENT)
+            fprintf(stderr, "tsdb: import: volume %s: %s: remove the tsdb files the import wrote there (" VOL_TSDB_FILES
+                            ")%s before importing again\n", vp, strerror(err),
+                    vn->existed ? ", not the directory" : ", and the directory if nothing else is in it");
+        return;
+    }
+    rewinddir(d); /* the dup shares its offset with fd */
+    bool left = false;
+    size_t foreign = 0;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        const char *name = de->d_name;
+        struct stat es;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || vnote_kept(vn, name))
+            continue;
+        if (!vname_engine(name)) {
+            foreign++;
+            if (!vnote_seen(vn, name))
+                fprintf(stderr, "tsdb: import: volume %s: %s is not written by tsdb: left as it is\n", vp,
+                        esc(name, e2, sizeof e2));
+            continue;
+        }
+        if (fstatat(fd, name, &es, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT)
+                continue;
+            fprintf(stderr, "tsdb: import: volume %s: %s: %s: remove it before importing again if this import wrote "
+                            "it\n", vp, esc(name, e2, sizeof e2), strerror(errno));
+            left = true;
+        } else if (!S_ISREG(es.st_mode) || es.st_dev != ds.st_dev) { /* the engine writes only files there */
+            foreign++;
+            if (!vnote_seen(vn, name))
+                fprintf(stderr, "tsdb: import: volume %s: %s is not written by tsdb (not a file on the volume's file "
+                                "system): left as it is\n", vp, esc(name, e2, sizeof e2));
+        } else if (snprintf(p, sizeof p, "%s/%s", vn->path, name) >= (int)sizeof p ? (errno = ENAMETOOLONG)
+                   : remove(p) != 0 && errno != ENOENT) {
+            /* remove(3) by path, as for the stage: the tests' crashfs keeps what unlinkat removes aside in the
+             * directory, which would then not be empty for the rmdir */
+            fprintf(stderr, "tsdb: import: volume %s: %s was written by this import and could not be removed: %s: "
+                            "remove it before importing again\n", vp, esc(name, e2, sizeof e2), strerror(errno));
+            left = true;
+        }
+    }
+    closedir(d);
+    if (!vn->existed && !left && !foreign && unlinkat(AT_FDCWD, vn->path, AT_REMOVEDIR) != 0 && errno != ENOENT) {
+        fprintf(stderr, "tsdb: import: volume %s: %s: remove it before importing again if nothing is in it\n", vp,
+                strerror(errno));
+        left = true;
+    }
+    close(fd);
+    if (!left)
+        fprintf(stderr, "tsdb: import: volume %s was %s\n", vp,
+                vn->existed ? "a directory before this import: the files it wrote there were removed, the rest is "
+                              "as it was"
+                : foreign ? "made by this import: the files it wrote there were removed, the directory is kept for "
+                            "what else is in it"
+                          : "made by this import and was removed");
+}
+
+/* The import failed: the sibling goes (it is this import's own), and so do the volumes it added (vol_drop). */
+static void stage_drop(const staging *st, const char *dir, const importer *im, char **vols, uint32_t nv)
 {
     char e[256];
     if (nftw(st->stage, rm_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT) != 0)
         fprintf(stderr, "tsdb: import: removing %s: %s: delete it before importing again\n",
                 esc(st->stage, e, sizeof e), strerror(errno));
     fprintf(stderr, "tsdb: import: %s was not created\n", esc(dir, e, sizeof e));
-    for (uint32_t i = 1; i < nv; i++)
-        fprintf(stderr, "tsdb: import: volume %s was made by this import: delete it before importing again\n",
-                esc(vols[i], e, sizeof e));
+    for (uint32_t i = 1; i < nv; i++) {
+        const vnote *vn = NULL;
+        for (int k = 0; k < im->nvnotes && !vn; k++)
+            if (strcmp(im->vnotes[k].path, vols[i]) == 0)
+                vn = &im->vnotes[k];
+        if (vn)
+            vol_drop(vn);
+        else /* not noted: not known to be the import's */
+            fprintf(stderr, "tsdb: import: volume %s was added by this import: remove the tsdb files it wrote "
+                            "there (or the directory, if the import made it) before importing again\n",
+                    esc(vols[i], e, sizeof e));
+    }
 }
 
 
@@ -1719,6 +1970,46 @@ static bool add_map(vmap *m, int *n, const char *v, bool root)
     }
     m[(*n)++] = (vmap){from, to};
     return true;
+}
+
+/* A target that is a symlink (to an empty directory, or dangling) is imported at the end of the link, so that the
+ * link keeps pointing at the data: the new database is built beside the real directory and renamed onto it
+ * (rename(2) cannot replace a symlink with a directory). Follows relative and chained links; the parent of the
+ * end is resolved later, as for any target. 0 and `out` (the target itself if it is no link), or -1 said why. */
+static int target_resolve(const char *dir, char *out)
+{
+    char cur[PATH_MAX], t[PATH_MAX], e[256];
+    if (snprintf(cur, sizeof cur, "%s", dir) >= (int)sizeof cur)
+        return snprintf(out, PATH_MAX, "%s", dir) >= PATH_MAX ? -1 : 0;
+    for (int hops = 0;; hops++) {
+        size_t n = strlen(cur);
+        while (n > 1 && cur[n - 1] == '/')
+            cur[--n] = 0; /* "link/" would be followed by lstat */
+        struct stat ls;
+        if (lstat(cur, &ls) != 0 || !S_ISLNK(ls.st_mode))
+            break;
+        if (hops == 40) {
+            fprintf(stderr, "tsdb: import: %s: %s\n", esc(dir, e, sizeof e), strerror(ELOOP));
+            return -1;
+        }
+        ssize_t k = readlink(cur, t, sizeof t - 1);
+        if (k <= 0) {
+            fprintf(stderr, "tsdb: import: %s: %s\n", esc(cur, e, sizeof e), k < 0 ? strerror(errno) : "empty link");
+            return -1;
+        }
+        t[k] = 0;
+        char next[PATH_MAX];
+        const char *slash = strrchr(cur, '/');
+        int w = t[0] == '/' || !slash ? snprintf(next, sizeof next, "%s", t) /* relative to the link's directory: */
+                                      : snprintf(next, sizeof next, "%.*s/%s", (int)(slash - cur), cur, t);
+        if (w >= (int)sizeof next) {
+            fprintf(stderr, "tsdb: import: %s: link target too long\n", esc(cur, e, sizeof e));
+            return -1;
+        }
+        memcpy(cur, next, (size_t)w + 1);
+    }
+    snprintf(out, PATH_MAX, "%s", cur);
+    return 0;
 }
 
 /* Everything the importer owns is freed by dump_import_main, so that no return path can leak it. */
@@ -1861,6 +2152,7 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
     tsdb *db = NULL; /* none with --check: every series is taken as new and every volume as present */
     bool fresh = false;
     staging stg = {0};
+    char rdir[PATH_MAX]; /* the target, if it is a symlink: where the link ends */
     if (!check) {
         tsdb_options o;
         tsdb_options_init(&o);
@@ -1869,6 +2161,12 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
          * nothing in it is synced file by file (two syncs per new series and one per part otherwise: they bound
          * small series to ~700 per second); every file system of it is synced once at the end instead. An
          * existing database, or an empty directory that cannot be replaced, keeps every sync. */
+        if (target_resolve(dir, rdir) != 0) {
+            if (in != stdin)
+                fclose(in);
+            return 1;
+        }
+        dir = rdir;
         if (dir_is_new(dir)) {
             int sr = stage_make(dir, &stg, im);
             if (sr < 0) {
@@ -1889,7 +2187,7 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
         if (rc) {
             fprintf(stderr, "tsdb: %s: %s\n", at, tsdb_strerror(rc));
             if (fresh)
-                stage_drop(&stg, dir, NULL, 0);
+                stage_drop(&stg, dir, im, NULL, 0);
             if (in != stdin)
                 fclose(in);
             return 1;
@@ -1993,7 +2291,7 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
         if (fresh && oom)
             fprintf(stderr, "tsdb: import: out of memory\n");
         if (fresh && (ret || oom || !sync_all(stg.stage, vols, nv))) {
-            stage_drop(&stg, dir, vols, oom ? 0 : nv);
+            stage_drop(&stg, dir, im, vols, oom ? 0 : nv);
             ret = 1;
         } else if (fresh && rename(stg.stage, dir) != 0) {
             int err = errno;
@@ -2047,6 +2345,14 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
     for (int i = 0; i < im.nvols_ok; i++)
         free(im.vols_ok[i]);
     free(im.vols_ok);
+    for (int i = 0; i < im.nvnotes; i++) {
+        for (size_t k = 0; k < im.vnotes[i].nkeep; k++)
+            free(im.vnotes[i].keep[k]);
+        free(im.vnotes[i].keep);
+        free(im.vnotes[i].seen);
+        free(im.vnotes[i].path);
+    }
+    free(im.vnotes);
     free(im.maps);
     free(im.roots);
     return ret;
