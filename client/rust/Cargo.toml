@@ -21,6 +21,8 @@ native = ["embedded", "tsdb-sys/native"]
 # packed inserts (protocol version 3); the bundled libzstd, no optional features
 zstd = { version = "0.13", default-features = false }
 tsdb-sys = { path = "../rust-sys", optional = true }
+# batch calls (Pool, Db::*_many) run their queries and inserts on a thread pool
+rayon = "1"
 
 # TCP keepalive options, which std does not expose
 [target.'cfg(unix)'.dependencies]

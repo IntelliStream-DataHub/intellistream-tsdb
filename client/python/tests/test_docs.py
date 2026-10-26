@@ -24,7 +24,8 @@ def stub_docs():
             docs[node.name] = ast.get_docstring(node)
         if isinstance(node, ast.ClassDef):
             for item in node.body:
-                if isinstance(item, ast.FunctionDef):
+                # sequence operators (__len__, __getitem__, +) are typing only: Python documents them
+                if isinstance(item, ast.FunctionDef) and item.name not in ("__len__", "__getitem__", "__add__", "__radd__"):
                     docs[f"{node.name}.{item.name}"] = ast.get_docstring(item)
     return docs
 
@@ -53,6 +54,7 @@ def test_the_stub_has_the_same_docstrings():
     stub, runtime = stub_docs(), runtime_docs()
     stub.pop("Client.__new__")  # documented on the class
     stub.pop("Db.__new__")
+    stub.pop("Pool.__new__")
     assert sorted(stub) == sorted(runtime), "the stub and the module name different things"
     differ = [name for name in runtime if stub[name] != runtime[name]]
     assert not differ, f"docstrings differ between tsdb_client.pyi and the module: {differ}"

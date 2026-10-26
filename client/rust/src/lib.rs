@@ -59,9 +59,12 @@
 //!
 //! The protocol is described in `include/tsdb_protocol.h` of the tsdb
 //! repository; this crate mirrors the C client in `client/tsdb_client.h`.
-//! Its dependencies are `zstd` and, on Unix, `libc` (for the TCP keepalive options).
+//! Its dependencies are `zstd`, `rayon` (the thread pool of the batch calls: [`Pool`] and the
+//! `*_many` calls of `Db`) and, on Unix, `libc` (for the TCP keepalive options); with the
+//! `embedded` feature also `tsdb-sys`, the engine.
 #![warn(missing_docs)]
 
+mod batch;
 mod calendar;
 mod client;
 mod database;
@@ -74,8 +77,9 @@ mod protocol;
 mod types;
 mod value;
 
+pub use batch::{AggQuery, InsertBatch, Pool, RangeQuery, Target};
 pub use calendar::calendar_bounds;
-pub use client::{Client, CONNECT_TIMEOUT, DEFAULT_COMPRESSION};
+pub use client::{CONNECT_TIMEOUT, Client, DEFAULT_COMPRESSION};
 pub use database::Database;
 #[cfg(feature = "embedded")]
 pub use embedded::{ChunkRef, Db, Options, PartInfo, RawValues, ValueCodec};

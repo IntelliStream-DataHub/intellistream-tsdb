@@ -106,6 +106,14 @@ pub enum Error {
     Protocol(String),
     /// The arguments were rejected before anything was sent.
     InvalidArgument(String),
+    /// Entry `index` of a batch call (a query or an insert of `*_many`) failed with `error`.
+    /// It is the lowest failing entry: every entry below it ran and succeeded.
+    Batch {
+        /// The failing entry's position in the batch.
+        index: usize,
+        /// Its error.
+        error: Box<Error>,
+    },
 }
 
 impl Error {
@@ -117,6 +125,7 @@ impl Error {
             Error::Io(_) => -1,
             Error::Protocol(_) => -3,
             Error::InvalidArgument(_) => -4,
+            Error::Batch { error, .. } => error.code(),
         }
     }
 
@@ -124,6 +133,15 @@ impl Error {
     pub fn status(&self) -> Option<Status> {
         match self {
             Error::Server(s) => Some(*s),
+            Error::Batch { error, .. } => error.status(),
+            _ => None,
+        }
+    }
+
+    /// For an error of a batch call, the failing entry's position in the batch.
+    pub fn batch_index(&self) -> Option<usize> {
+        match self {
+            Error::Batch { index, .. } => Some(*index),
             _ => None,
         }
     }
@@ -136,6 +154,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
             Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
+            Error::Batch { index, error } => write!(f, "batch entry {index}: {error}"),
         }
     }
 }
@@ -144,6 +163,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
+            Error::Batch { error, .. } => Some(error.as_ref()),
             _ => None,
         }
     }

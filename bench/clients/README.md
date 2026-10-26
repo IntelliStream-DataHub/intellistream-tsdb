@@ -8,9 +8,11 @@ One data set, loaded and queried by the same program in twelve ways:
 | embedded Java (FFM), fsync on / off | `client/java-embedded/.../bench/EmbeddedBench.java --load`, `--qps` | `EmbeddedDb`: libtsdb in the JVM through the FFM API (Java 22+) |
 | embedded Rust, fsync on / off | `client/rust/examples/embedded_bench.rs --load`, `--qps` | `tsdb_client::Db` (feature `embedded`): the engine compiled into the crate |
 | embedded Python, fsync on / off | `client/python/bench_embedded.py --load`, `--qps` | `tsdb_client.Db` over the Rust `Db`, threads |
+| embedded Python, batch calls | `client/python/bench_embedded.py --qps --many 256` | `Db.query_raw_many`, `query_agg_many`: 256 queries per call, run on every CPU |
 | C over TCP | `build/tsdbc-bench` | `client/tsdb_client.c` to tsdbd |
 | Rust over TCP | `client/rust/examples/insert_bench.rs`, `query_bench.rs` | `tsdb-client` crate |
 | Python over TCP | `client/python/bench_insert.py`, `bench_query.py` | `tsdb_client` (PyO3 over the Rust crate), threads |
+| Python over TCP, batch calls | `client/python/bench_query.py --many 256` | `tsdb_client.Pool`: one connection per CPU, 256 queries per call |
 | Java over TCP | `client/java/.../bench/InsertBench.java`, `QueryBench.java` | `TsdbClient` |
 
 The difference between the first and the other rows is what the server and the network path cost; between the
@@ -26,7 +28,7 @@ bench/clients/run.sh --series 10 --points 100000 --repeat 1 --seconds 1   # a sm
 
 Options: `--port` (tsdbd; default 0: any free port, which tsdbd reports through `--port-file`), `--conns "1 4 16"` (loader connections or threads), `--qthreads "1 32"`,
 `--clients "c rust python java java-embedded"`, `--only load|query`, `--repeat N`, `--seconds S` (per query class), `--no-build`,
-`--force`.
+`--force`, `--many N` (queries per call of the Python batch rows; 0 leaves them out; default 256).
 
 It needs cargo (Rust), python3 with venv and pip (a virtual environment `build/pyvenv` gets maturin and numpy;
 set `PYVENV` to use another), and Java 17+ with Maven; zstd-jni is taken from `~/.m2`. The Python client
@@ -87,6 +89,11 @@ warms up only its loop that copies the file into arrays; the insert calls compil
 would in a real loader); with `query_threads` at its
 default each query of the library or the server uses all CPUs for its own decoding, so 32 concurrent queries
 compete for them, embedded or not.
+
+The Python batch rows measure what one call of many queries gives where one query per call is held back by the
+interpreter: 1 or 32 is the number of Python threads calling, while the queries of each call run on every CPU
+(embedded) or on every connection of the Pool (one per CPU). Their µs/q is therefore per calling thread, not per
+CPU; compare their q/s with the 32-thread rows of the other systems.
 
 ## The programs
 

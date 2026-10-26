@@ -16,8 +16,8 @@ ROWS_PER_QUERY_TOLERANCE = 0.10
 ORDER = ["embedded-fsync", "embedded-nofsync", "embedded",
          "embedded-java-fsync", "embedded-java-nofsync", "embedded-java",
          "embedded-rust-fsync", "embedded-rust-nofsync", "embedded-rust",
-         "embedded-python-fsync", "embedded-python-nofsync", "embedded-python",
-         "c", "rust", "python", "java"]
+         "embedded-python-fsync", "embedded-python-nofsync", "embedded-python", "embedded-python-batch",
+         "c", "rust", "python", "python-batch", "java"]
 NAMES = {
     "embedded-fsync": "embedded C, fsync on",
     "embedded-nofsync": "embedded C, fsync off",
@@ -31,9 +31,11 @@ NAMES = {
     "embedded-python-fsync": "embedded Python, fsync on",
     "embedded-python-nofsync": "embedded Python, fsync off",
     "embedded-python": "embedded Python",
+    "embedded-python-batch": "embedded Python, batch calls on every CPU",
     "c": "C over TCP",
     "rust": "Rust over TCP",
     "python": "Python over TCP",
+    "python-batch": "Python over TCP, batch calls on a Pool",
     "java": "Java over TCP",
 }
 CLASSES = [

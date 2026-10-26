@@ -8,6 +8,28 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Added
+- Batch calls: many queries or inserts in one call, run in parallel. Rust: `Db::query_points_many`,
+  `query_agg_many`, `insert_many` (on every CPU) and `Pool`, a fixed set of connections to one tsdbd with the
+  same three calls. Python: `Db.query_raw_many`, `query_agg_many`, `insert_many` and `tsdb_client.Pool`, with
+  the GIL released for the whole batch. A failed batch raises the error of its lowest failing entry and names
+  it (Rust `Error::Batch`, Python `TsdbError.index`); every entry below it ran. Inserts that share a series keep
+  their list order. `Db.last_query_stats()` after a batch reports the totals of its queries.
+- `Pool`: after a connection breaks (a server restart), every connection made before it is replaced before its
+  next use, and a query whose connection broke runs once more; inserts are not retried.
+
+### Changed
+- Python: aggregate queries (`query_agg`, `query_group`, `query_bounds` and the rest) return `Buckets` instead of
+  a list of `Bucket`: a `collections.abc.Sequence` of `Bucket` (indexing, slices, iteration, `+` and `==` with
+  lists, `count()`, `index()`), with a numpy column per field (`start`, `counts`, `sum`, `min`, `max`, `avg`,
+  `isum`, `imin`, `imax`). It is no longer a `list` (`isinstance(b, list)` is false, `append` is gone) and does
+  not pickle. Raw query results are numpy arrays over the result vectors, without a copy.
+- Python: numpy input arrays are copied once with the GIL released instead of while holding it.
+
+### Fixed
+- Python: big-endian numpy arrays (`>i8`, `>f4`) were read byte-swapped (PyO3 takes '>' for native on
+  little-endian machines); they are now converted element by element.
+
 ## [0.9.0] - unreleased (tag v0.9.0 when the checklist in docs/release.md is done)
 
 The first release. Disk format version 5, wire protocol version 9.

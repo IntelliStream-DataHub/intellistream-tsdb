@@ -43,6 +43,19 @@ def window(r, nseries, points, window_samples):
     return r, s, start, start + window_samples * STEPS[s % 7]
 
 
+def batch(r, n, nseries, points, window_samples, bucket_samples):
+    """The next n windows of a thread, as the columns of one batch call: (new state, series, starts, ends,
+    bucket lengths in ms). The same windows, in the same order, as n calls of window()."""
+    series, starts, ends, intervals = [], [], [], []
+    for _ in range(n):
+        r, s, a, b = window(r, nseries, points, window_samples)
+        series.append(s)
+        starts.append(a)
+        ends.append(b)
+        intervals.append(bucket_samples * STEPS[s % 7])
+    return r, series, starts, ends, intervals
+
+
 def cpu_s():
     """CPU seconds (user + system, all threads) this process has used."""
     return time.process_time()

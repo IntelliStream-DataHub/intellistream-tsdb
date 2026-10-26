@@ -4,7 +4,7 @@
 # See README.md. Usage:
 #   bench/clients/run.sh [--work DIR] [--port N|0] [--series 100] [--points 1000000] [--repeat 3] [--seconds 3]
 #                        [--conns "1 4 16"] [--qthreads "1 32"] [--clients "c rust python java java-embedded"]
-#                        [--only load|query] [--no-build] [--force]
+#                        [--only load|query] [--no-build] [--force] [--many 256]
 set -u -o pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -22,6 +22,7 @@ CLIENTS="c rust python java java-embedded"
 ONLY=""
 BUILD=1
 FORCE=0
+MANY=256    # queries per batch call of the Python batch rows (0: none)
 MAXLOAD=2   # load average at the start
 MAXBUSY=1   # CPUs other processes may keep busy before a measurement (see quiet_wait)
 PYVENV=${PYVENV:-$B/pyvenv}
@@ -41,6 +42,7 @@ while [ $# -gt 0 ]; do
     --only) ONLY=$2; shift 2 ;;
     --no-build) BUILD=0; shift ;;
     --force) FORCE=1; shift ;;
+    --many) MANY=$2; shift 2 ;;
     *) usage ;;
     esac
 done
@@ -286,6 +288,12 @@ if [ "$ONLY" != load ]; then
                 echo "  embedded $e"
                 # shellcheck disable=SC2046
                 record "phase=query rep=$rep" $(embedded_cmd "$e") --dir "$EMB" --qps "$q" --series "$SERIES" --points "$POINTS" --seconds "$SECONDS_PER_CLASS"
+                if [ "$e" = python ] && [ "$MANY" -gt 0 ]; then
+                    # batch calls: $q Python threads, each asking $MANY windows per call, run on every CPU
+                    echo "  embedded python, batches of $MANY"
+                    # shellcheck disable=SC2046
+                    record "phase=query rep=$rep" $(embedded_cmd "$e") --dir "$EMB" --qps "$q" --series "$SERIES" --points "$POINTS" --seconds "$SECONDS_PER_CLASS" --many "$MANY"
+                fi
             done
             for c in $CLIENTS; do
                 if [ "$c" = java-embedded ]; then # the same database as embedded C, in turn
@@ -297,6 +305,12 @@ if [ "$ONLY" != load ]; then
                 echo "  $c"
                 # shellcheck disable=SC2046
                 record "phase=query rep=$rep" $(client_query_cmd "$c" "$q")
+                if [ "$c" = python ] && [ "$MANY" -gt 0 ]; then
+                    # batch calls through a Pool of one connection per CPU, shared by $q Python threads
+                    echo "  python, batches of $MANY"
+                    # shellcheck disable=SC2046
+                    record "phase=query rep=$rep" $(client_query_cmd "$c" "$q") --many "$MANY"
+                fi
             done
         done
     done

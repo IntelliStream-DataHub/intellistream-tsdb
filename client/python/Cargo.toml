@@ -13,3 +13,5 @@ crate-type = ["cdylib"]
 [dependencies]
 tsdb-client = { path = "../rust", features = ["embedded"] }
 pyo3 = "0.29"
+# results handed to numpy without a copy (PyArray from a Vec)
+numpy = "0.29"
