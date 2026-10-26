@@ -184,5 +184,35 @@ void fuzz_seeds(const char *dir)
         size_t len = block_encode_vals(cc, k & 1, 0, TSDB_FLOAT64, d, N, blk);
         seed_block(dir, 1 + TSDB_FLOAT64, N, blk, len);
     }
+    /* fixed point of a few codes far apart, with exceptions (-0.0, NaN payloads, nulls, infinities): a dictionary
+     * whose exceptions get ranks of their own (dict_encode_q), written by merges */
+    static const uint32_t sp32[] = {0x80000000u, 0x7fc00001u, NULL_F32, 0x7f800000u, 0x00000001u};
+    static const uint64_t sp64[] = {0x8000000000000000ull, 0x7ff8000000000001ull, NULL_F64, 0xfff0000000000000ull, 1};
+    for (int i = 0; i < N; i++) {
+        static const int codes[] = {0, 977, 4100, 12345, 30001, 45678, 59999};
+        d[i] = 1.5 + 0.001 * codes[(i / 5) % 7];
+        f[i] = (float)d[i];
+        if (i % 23 == 5) {
+            memcpy(&f[i], &sp32[i % 5], 4);
+            memcpy(&d[i], &sp64[i % 5], 8);
+        }
+    }
+    cc->effort = CODEC_MERGE;
+    for (int lvl = 0; lvl <= 1; lvl++) {
+        size_t len = block_encode_vals(cc, lvl, 0, TSDB_FLOAT32, f, N, blk);
+        seed_block(dir, 1 + TSDB_FLOAT32, N, blk, len);
+        len = block_encode_vals(cc, lvl, 0, TSDB_FLOAT64, d, N, blk);
+        seed_block(dir, 1 + TSDB_FLOAT64, N, blk, len);
+    }
+    /* float32 readings that are no compact fixed point, in a float64 series: float64 kinds at insert */
+    for (int i = 0; i < N; i++) {
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        d[i] = (float)(20 + 0.1 * (double)(i * 37 % 300) + (r >> 62 ? 0 : 1e-3 * (double)(r >> 54)));
+    }
+    for (int k = 0; k < 4; k++) {
+        cc->effort = k >> 1 ? CODEC_MERGE : CODEC_FAST;
+        size_t len = block_encode_vals(cc, k & 1, 0, TSDB_FLOAT64, d, N, blk);
+        seed_block(dir, 1 + TSDB_FLOAT64, N, blk, len);
+    }
     free(blk);
 }

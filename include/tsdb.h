@@ -70,7 +70,7 @@ typedef struct tsdb_options {
     int64_t partition_ms;    /* fixed at creation; default 1 day */
     uint32_t granule_rows;   /* fixed at creation; default 8192 */
     int zstd_level;          /* default 1; 0 disables zstd */
-    int value_codec;         /* TSDB_VALUES_AUTO (default), _GORILLA or _CHIMP */
+    int value_codec;         /* TSDB_VALUES_AUTO (default), _GORILLA or _CHIMP; tsdb_open refuses others */
     int fsync;               /* fsync parts, WAL and dictionaries before relying on them; default 1. With 0,
                               * a power loss (not a process crash) can leave files that fail their checks
                               * at the next open, which then needs an operator (docs/design.md) */

@@ -374,6 +374,11 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
         db->opt = *opts;
     else
         tsdb_options_init(&db->opt);
+    if (db->opt.value_codec < TSDB_VALUES_AUTO || db->opt.value_codec > TSDB_VALUES_CHIMP) {
+        /* other numbers are the codec's own modes (VALUES_FIXED_ONLY), never a choice for every granule */
+        free(db);
+        return TSDB_ERR_INVALID;
+    }
     if (db->opt.follow)
         db->opt.read_only = 1;
     bool ro = db->opt.read_only;

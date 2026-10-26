@@ -1197,6 +1197,126 @@ static void test_nan_canonical(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+/* -------------------------------------------------- exceptions, round trips */
+
+/* Values off a block's fixed-point grid: -0.0, NaN payloads, signalling NaNs, the type's null, infinities,
+ * subnormals, the largest finite value; for float64 also the double the float32 null widens to. */
+static const uint32_t rt_f32_special[] = {0x80000000u, 0x7fc00000u, 0x7fc00001u, 0xffc00123u, 0x7f800001u,
+                                          0x7fa00000u, 0x7f800000u, 0xff800000u, 0x00000001u, 0x807fffffu,
+                                          0x7f7fffffu, TSDB_NULL_F32_BITS};
+static const uint64_t rt_f64_special[] = {0x8000000000000000ull, 0x7ff8000000000000ull, 0x7ff8000000000001ull,
+                                          0xfff8000020000000ull, 0x7ff0000000000001ull, 0x7ff4000000000000ull,
+                                          0x7ff0000000000000ull, 0xfff0000000000000ull, 1, 0x800fffffffffffffull,
+                                          TSDB_NULL_F64_BITS, 0x7ff8000020000000ull};
+
+static void rt_put(int type, void *v, size_t i, double x, bool special)
+{
+    if (type == TSDB_FLOAT32) {
+        float y = (float)x;
+        memcpy((uint32_t *)v + i, &y, 4);
+        if (special)
+            ((uint32_t *)v)[i] = rt_f32_special[rnd() % (sizeof rt_f32_special / sizeof *rt_f32_special)];
+    } else {
+        memcpy((uint64_t *)v + i, &x, 8);
+        if (special)
+            ((uint64_t *)v)[i] = rt_f64_special[rnd() % (sizeof rt_f64_special / sizeof *rt_f64_special)];
+    }
+}
+
+/* the values of shape s: 0 a decimal grid of 50 codes, 1 in 40 values a special; 1 few codes spread over a wide
+ * span (no dense integers), 1 in 50 a special; 2 float32 readings in a float64 series, a third of them off a grid
+ * of 0.1 over 30 units, so that neither the float64 nor the float32 fixed point is compact, now and then a widened
+ * float32 special or the float64 null; 3 a dictionary of a few random patterns, specials among them */
+static const char *rt_fill(int s, int type, void *v, size_t n)
+{
+    uint64_t pool[64];
+    for (size_t j = 0; j < 64; j++)
+        pool[j] = rnd();
+    for (size_t i = 0; i < n; i++)
+        switch (s) {
+        case 0:
+            rt_put(type, v, i, 20 + 0.1 * (double)((i / 3) % 50), rnd() % 40 == 0);
+            break;
+        case 1:
+            rt_put(type, v, i, 1.5 + 0.001 * (double)(pool[(i / 5) % 64] % (pool[0] % 2 ? 60000 : 3000)),
+                   rnd() % 50 == 0);
+            break;
+        case 2:
+            rt_put(type, v, i,
+                   (float)(20 + 0.1 * (double)((i / 3) % 300) + (rnd() % 3 ? 0 : 1e-3 * (double)(rnd() % 1000))), false);
+            if (type == TSDB_FLOAT64 && rnd() % 60 == 0) { /* still float32 values: widened specials, or the null */
+                float y;
+                memcpy(&y, &rt_f32_special[rnd() % (sizeof rt_f32_special / sizeof *rt_f32_special)], 4);
+                double x = y;
+                memcpy((uint64_t *)v + i, rnd() % 4 ? (void *)&x : (void *)&(uint64_t){TSDB_NULL_F64_BITS}, 8);
+            }
+            break;
+        default:
+            if (type == TSDB_FLOAT32)
+                ((uint32_t *)v)[i] = (uint32_t)pool[i < 7 ? i : rnd() % 7];
+            else
+                ((uint64_t *)v)[i] = pool[i < 7 ? i : rnd() % 7];
+            if (i % 7 == 3)
+                rt_put(type, v, i, 0, true);
+        }
+    static const char *names[] = {"grid with specials", "sparse codes with specials", "float32 readings",
+                                  "few patterns"};
+    return names[s];
+}
+
+/* Bit for bit at both efforts, and the same bytes from a context that encoded other blocks before as from a fresh
+ * one. Regressions (review of the dictionary and float32-in-float64 blocks): with an exception that stood for its
+ * integer kept as the dictionary value of that integer, or its rank searched one off, merges wrote other values
+ * (dict_encode_q); with float64 fixed point not put back after a failed float32 attempt, inserts of float32
+ * readings that are no compact fixed point wrote blocks that do not decode (f32_wide); and at 65536 rows the
+ * dictionary's 16-bit row index wrapped (fixed_or_dict). Every one of these went through the tests above. */
+static void test_exceptions_rt(void)
+{
+    static const size_t ns[] = {64, 100, 1023, 1024, 1025, 8192, 65535, 65536};
+    enum { NMAX = 65536 };
+    void *v = malloc(NMAX * 8), *out = malloc(NMAX * 8 + BLK_SLACK);
+    uint8_t *blk = malloc(block_bound(NMAX) + BLK_SLACK), *blk2 = malloc(block_bound(NMAX) + BLK_SLACK);
+    codec_ctx *c = codec_new();
+    int blocks = 0;
+    for (int round = 0; round < 3; round++)
+        for (size_t ni = 0; ni < sizeof ns / sizeof *ns; ni++)
+            for (int s = 0; s < 4; s++)
+                for (int type = TSDB_FLOAT32; type <= TSDB_FLOAT64; type++) {
+                    size_t n = ns[ni], w = type_width(type);
+                    const char *what = rt_fill(s, type, v, n);
+                    for (int eff = CODEC_FAST; eff <= CODEC_MERGE; eff++)
+                        for (int level = 0; level <= 1; level++) {
+                            c->effort = eff;
+                            size_t len = block_encode_vals(c, level, TSDB_VALUES_AUTO, type, v, n, blk);
+                            CHECK(len > 0 && len <= block_bound(n));
+                            memset(blk + len, 0xa5, BLK_SLACK);
+                            memset(out, 0x5a, n * w);
+                            int rc = block_decode_vals(c, type, blk, len, n, out);
+                            if (rc != 0 || memcmp(v, out, n * w) != 0) {
+                                size_t i = 0;
+                                while (rc == 0 && i < n && !memcmp((uint8_t *)v + i * w, (uint8_t *)out + i * w, w))
+                                    i++;
+                                fprintf(stderr, "  %s round trip failed: %s (n=%zu, level %d, effort %d, rc %d, "
+                                                "kind %d, row %zu)\n",
+                                        type_name[type], what, n, level, eff, rc, blk[0], i);
+                                CHECK(0);
+                            }
+                            codec_ctx *f = codec_new();
+                            f->effort = eff;
+                            size_t len2 = block_encode_vals(f, level, TSDB_VALUES_AUTO, type, v, n, blk2);
+                            codec_free(f);
+                            CHECK(len2 == len && memcmp(blk, blk2, len) == 0);
+                            blocks++;
+                        }
+                }
+    CHECK(blocks == 3 * 8 * 4 * 2 * 4);
+    codec_free(c);
+    free(v);
+    free(out);
+    free(blk);
+    free(blk2);
+}
+
 /* A float64 series fed float32 readings: stored as the float32 block, one byte more, at both efforts; any value
  * that is not a float32 (or is the double the float32 null widens to) keeps the float64 kinds; damage fails. */
 static void test_f32_wide(void)
@@ -1274,6 +1394,52 @@ static void test_f32_wide(void)
     codec_free(c);
 }
 
+/* value_codec takes the three public choices only. Regression (review of the dictionary): -1 is the codec's own
+ * "compact fixed point or nothing" mode, and a database opened with it failed every insert of other float32
+ * values with "out of memory". */
+static void test_value_codec_option(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-vc-%d", base, (int)getpid());
+    static const int bad[] = {-1, -2, 3, 1000};
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.value_codec = bad[i];
+        tsdb *db = NULL;
+        CHECK(tsdb_open(dir, &o, &db) == TSDB_ERR_INVALID && db == NULL);
+        CHECK(access(dir, F_OK) != 0); /* refused before anything is made */
+    }
+    for (int vc = TSDB_VALUES_AUTO; vc <= TSDB_VALUES_CHIMP; vc++) {
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.value_codec = vc;
+        o.fsync = 0;
+        o.wal_max_batch_rows = 100; /* straight to a part */
+        tsdb *db;
+        OK(tsdb_open(dir, &o, &db));
+        uint32_t id;
+        OK(tsdb_series(db, "random", &id));
+        enum { N = 10000 };
+        int64_t ts[N];
+        float v[N];
+        for (int i = 0; i < N; i++) {
+            ts[i] = 1700000000000 + (int64_t)i * 1000;
+            uint32_t b = (uint32_t)rnd() & 0xbf7fffffu; /* finite */
+            memcpy(&v[i], &b, 4);
+        }
+        OK(tsdb_insert_series(db, id, ts, v, N));
+        tsdb_points p = {0};
+        OK(tsdb_query_points(db, id, INT64_MIN + 1, INT64_MAX, &p));
+        CHECK(p.n == N && memcmp(p.values, v, sizeof v) == 0);
+        tsdb_points_free(&p);
+        OK(tsdb_close(db));
+        char cmd[600];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+        CHECK(system(cmd) == 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -1283,8 +1449,10 @@ int main(int argc, char **argv)
         test_f32_sample();
     }
     test_dict();
+    test_exceptions_rt();
     test_f32_wide();
     test_engine(base);
+    test_value_codec_option(base);
     test_old_version(base);
     test_query_stats(base);
     test_nan_canonical(base);

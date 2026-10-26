@@ -54,6 +54,8 @@ disk format and the wire protocol.
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
+- `tsdb_open` refuses a `value_codec` other than `TSDB_VALUES_AUTO`, `_GORILLA` and `_CHIMP` (`TSDB_ERR_INVALID`)
+  instead of taking any other number as AUTO.
 - `tsdb import` refuses a target directory that has files in it and holds no database, before writing anything,
   also through a symlink to one (it used to build the database among those files). A missing or empty directory
   and an existing database are imported into as before; volume directories are unchanged.
