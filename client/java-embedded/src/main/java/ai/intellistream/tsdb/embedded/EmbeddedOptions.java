@@ -40,6 +40,10 @@ public final class EmbeddedOptions {
     private boolean verifyChecksums;
     private int retentionMergeS;
     private boolean createVolumes;
+    private long scratchBytes = DEFAULT_SCRATCH_BYTES;
+
+    /** The default of {@link #scratchBytes(long)}: 256 MiB. */
+    public static final long DEFAULT_SCRATCH_BYTES = 256L << 20;
 
     /** The library's defaults. */
     public EmbeddedOptions() {
@@ -323,6 +327,27 @@ public final class EmbeddedOptions {
         return this;
     }
 
+    /**
+     * Native memory an {@link EmbeddedDb} keeps for copying inserted arrays, reused from call to call (not a
+     * {@code tsdb_options} field). Each thread inserting at once uses its own block of up to 32 MiB (a call that
+     * needs more copies into memory of its own, as every call beyond this limit does); the blocks stay until
+     * {@link EmbeddedDb#close}.
+     *
+     * @param bytes default 256 MiB; 0 keeps nothing, so every insert allocates and frees its own copy
+     * @return this
+     * @throws IllegalArgumentException if negative
+     */
+    public EmbeddedOptions scratchBytes(long bytes) {
+        if (bytes < 0)
+            throw new IllegalArgumentException("scratchBytes < 0");
+        scratchBytes = bytes;
+        return this;
+    }
+
+    long scratchBytes() {
+        return scratchBytes;
+    }
+
     @Override
     public String toString() {
         return "EmbeddedOptions[partitionMs=" + partitionMs + ", granuleRows=" + granuleRows + ", zstdLevel="
@@ -332,6 +357,6 @@ public final class EmbeddedOptions {
                 + ", maxPartBytes=" + maxPartBytes + ", readOnly=" + readOnly + ", follow=" + follow + ", refreshMs="
                 + refreshMs + ", mergeIdleS=" + mergeIdleS + ", obsoletePartLifetimeS=" + obsoletePartLifetimeS
                 + ", verifyChecksums=" + verifyChecksums + ", retentionMergeS=" + retentionMergeS
-                + ", createVolumes=" + createVolumes + "]";
+                + ", createVolumes=" + createVolumes + ", scratchBytes=" + scratchBytes + "]";
     }
 }

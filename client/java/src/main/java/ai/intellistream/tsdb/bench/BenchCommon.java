@@ -1,6 +1,11 @@
 package ai.intellistream.tsdb.bench;
 
+import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.util.Locale;
 
 /**
@@ -85,5 +90,87 @@ final class BenchCommon {
         System.out.println(String.format(Locale.ROOT,
                 "RESULT kind=load client=%s conns=%d compression=%d rows=%d secs=%.4f bytes=%d cpu=%.4f", client, conns,
                 compression, rows, secs, bytes, cpu));
+    }
+
+    /*
+     * The RowBinary file of the loads (u32 series, i64 ts, f32 value; 16 bytes a row), as tools/cbench.h's
+     * cb_file_open reads it: mapped whole and read in before the clock starts (MAP_POPULATE there, load() here), so
+     * a load measures inserting, not page faults on the file. A ByteBuffer holds at most 2 GiB: 1 GiB pieces.
+     */
+    static final int ROW = 16;
+    private static final int PIECE_SHIFT = 26; /* rows per mapping: 1 GiB */
+
+    /** The whole file, mapped and read in. */
+    static ByteBuffer[] mapRows(FileChannel ch) throws IOException {
+        long rows = ch.size() / ROW;
+        ByteBuffer[] m = new ByteBuffer[(int) ((rows + (1L << PIECE_SHIFT) - 1) >>> PIECE_SHIFT)];
+        for (int i = 0; i < m.length; i++) {
+            long r = (long) i << PIECE_SHIFT;
+            MappedByteBuffer b = ch.map(FileChannel.MapMode.READ_ONLY, r * ROW,
+                    Math.min(1L << PIECE_SHIFT, rows - r) * ROW);
+            b.load();
+            m[i] = b.order(ByteOrder.LITTLE_ENDIAN);
+        }
+        return m;
+    }
+
+    /** The series index of row {@code r}. */
+    static int seriesAt(ByteBuffer[] m, long r) {
+        return m[(int) (r >>> PIECE_SHIFT)].getInt((int) (r & ((1 << PIECE_SHIFT) - 1)) * ROW);
+    }
+
+    /**
+     * Rows {@code [r, r + n)} into the arrays from index 0, the series through {@code ids}. Returns the first
+     * series index that ids does not cover, or -1.
+     */
+    static long fill(ByteBuffer[] m, long r, int n, int[] ids, int[] s, long[] t, float[] v) {
+        for (int i = 0; i < n;) {
+            ByteBuffer b = m[(int) (r >>> PIECE_SHIFT)];
+            int first = (int) (r & ((1 << PIECE_SHIFT) - 1));
+            int k = Math.min(n - i, (b.capacity() / ROW) - first);
+            long bad = fill(b, first * ROW, k, ids, s, t, v, i);
+            if (bad >= 0)
+                return bad;
+            i += k;
+            r += k;
+        }
+        return -1;
+    }
+
+    private static long fill(ByteBuffer b, int o, int k, int[] ids, int[] s, long[] t, float[] v, int i0) {
+        for (int i = i0, end = i0 + k; i < end; i++, o += ROW) {
+            int id = b.getInt(o);
+            if (id < 0 || id >= ids.length)
+                return Integer.toUnsignedLong(id);
+            s[i] = ids[id];
+            t[i] = b.getLong(o + 4);
+            v[i] = b.getFloat(o + 12);
+        }
+        return -1;
+    }
+
+    /**
+     * Runs {@link #fill} on the first rows on this thread until it is compiled (its time per call stops falling),
+     * before the clock starts. The C benchmarks' copy loop is compiled ahead of time; without this the load's
+     * threads would start it in the interpreter and in profiled code at once, and count that as loading.
+     */
+    static void warmFill(ByteBuffer[] m, int[] ids, int batch) {
+        int n = (int) Math.min(Math.min(batch, 1 << 16), m.length == 0 ? 0 : m[0].capacity() / ROW);
+        int[] s = new int[n];
+        long[] t = new long[n];
+        float[] v = new float[n];
+        long best = Long.MAX_VALUE;
+        long deadline = System.nanoTime() + 3_000_000_000L;
+        for (int still = 0; n > 0 && still < 200 && System.nanoTime() < deadline;) {
+            long t0 = System.nanoTime();
+            fill(m, 0, n, ids, s, t, v);
+            long dt = System.nanoTime() - t0;
+            if (dt < best * 9 / 10) {
+                best = dt;
+                still = 0;
+            } else {
+                still++;
+            }
+        }
     }
 }

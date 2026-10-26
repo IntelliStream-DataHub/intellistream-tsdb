@@ -86,9 +86,13 @@ machine's CPU (`-march=native`). For a jar that runs on other machines, build th
   `tsdb_query_group_local` (the tests compare the two).
 - **Query statistics.** `lastQueryStats()` describes the calling thread's last query, and that includes a
   virtual thread's own.
-- **Memory.** Arguments are copied into native memory for the length of one call. This uses a confined arena,
-  whose release never has to synchronize with other threads. Arrays the engine returns are copied into Java
-  objects and freed with `tsdb_free` at once.
+- **Memory.** Arguments are copied into native memory for the length of one call. Inserts copy into blocks the
+  database keeps for reuse, one per thread inserting at once and each up to 32 MiB, because allocating and freeing
+  the copy of a million rows on every call cost more than the copying. The blocks of one `EmbeddedDb` stay below
+  `EmbeddedOptions.scratchBytes` (256 MiB by default; 0 keeps none) and are freed by `close()`. A call that needs
+  more than 32 MiB, or arrives when the limit is used up, gets native memory of its own that is freed when it
+  returns, as every call did before. Arrays the engine returns are copied into Java objects and freed with
+  `tsdb_free` at once.
 - **Embedded only.** `append`, `dropBefore`, `refresh`, `failed()`, `parts()`, `seriesPath`, `volumeCount`,
   `volumePath`, `simdLevel()` and every field of `EmbeddedOptions` (`tsdb_options`).
 
