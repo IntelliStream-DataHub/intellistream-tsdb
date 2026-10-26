@@ -906,11 +906,25 @@ public final class TsdbClient implements AutoCloseable {
             return buckets(series, start, end, 0, group, "", order, limit);
         if (serverVersion() < 4) /* an older server still takes the zone itself */
             return buckets(series, start, end, 0, group, group.zone().normalized().getId(), order, limit);
-        /* local periods become UTC bounds here; an open range is cut to the rows there are */
-        long[] edge = new long[2];
-        boolean[] found = new boolean[2];
+        long[] bounds = localBounds(series, start, end, group, false);
+        return bounds == null ? Collections.emptyList() : queryBounds(series, start, end, bounds, order, limit);
+    }
+
+    /**
+     * The UTC instants at which the local periods of {@code group} begin, for a query over {@code [start, end)};
+     * {@code null} if there is nothing to ask for. The aggregates cut an open range to the first and last row there
+     * is; the time-weighted averages ({@code bounded}) cover a bounded side to its end, since a reading before the
+     * range carries into it, and cut only an open side.
+     */
+    private long[] localBounds(int series, long start, long end, Group group, boolean bounded)
+            throws TsdbException {
+        long[] edge = {start, end == Long.MAX_VALUE ? Long.MIN_VALUE : end - 1};
+        boolean[] found = {true, true};
         for (int i = 0; i < 2; i++) {
+            if (bounded && (i == 0 ? start != Long.MIN_VALUE : end != Long.MAX_VALUE))
+                continue;
             int j = i;
+            found[j] = false;
             values(series, start, end, i == 0 ? Order.ASC : Order.DESC, 1, (b, type, n, valid) -> {
                 if (n > 0) {
                     edge[j] = b.getLong(b.position());
@@ -920,12 +934,12 @@ public final class TsdbClient implements AutoCloseable {
             });
         }
         if (!found[0] || !found[1] || edge[0] > edge[1])
-            return Collections.emptyList();
+            return null;
         /* the newest row may sit at Long.MAX_VALUE: then the range is beyond what bounds cover anyway */
         long[] bounds = group.bounds(edge[0], edge[1] == Long.MAX_VALUE ? Long.MAX_VALUE : edge[1] + 1);
         if (bounds.length > MAX_BOUNDS)
             throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS, bounds.length + " bounds exceed one request", null);
-        return queryBounds(series, start, end, bounds, order, limit);
+        return bounds;
     }
 
     /**
@@ -977,12 +991,20 @@ public final class TsdbClient implements AutoCloseable {
         if (bounds.length == 0 || bounds.length > MAX_BOUNDS)
             throw new IllegalArgumentException(bounds.length + " bounds: 1 to " + MAX_BOUNDS + " fit in a request");
         request();
-        begin(Protocol.OP_QUERY_BOUNDS, 33 + (long) bounds.length * Long.BYTES);
+        boundsSend(series, start, end, bounds, order, limit, 0);
+        return bucketsReply("QUERY_BOUNDS");
+    }
+
+    /** Sends QUERY_BOUNDS, with the {@code fields} byte when it is not 0. */
+    private void boundsSend(int series, long start, long end, long[] bounds, Order order, long limit, int fields)
+            throws TsdbException {
+        begin(Protocol.OP_QUERY_BOUNDS, 33 + (long) bounds.length * Long.BYTES + (fields != 0 ? 1 : 0));
         out.putInt(series).putLong(start).putLong(end);
         out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit).putInt(bounds.length);
         putLongs(bounds, 0, bounds.length);
+        if (fields != 0)
+            out.put((byte) fields);
         send();
-        return bucketsReply("QUERY_BOUNDS");
     }
 
     /** QUERY_BUCKETS: fixed intervals (group null) or calendar groups, with f64 min/max and exact integers. */
@@ -993,13 +1015,21 @@ public final class TsdbClient implements AutoCloseable {
             throw new IllegalArgumentException("negative limit");
         byte[] z = utf8(zone, "timezone");
         request();
-        begin(Protocol.OP_QUERY_BUCKETS, 44 + z.length);
+        bucketsSend(series, start, end, interval, group, z, order, limit, 0);
+        return bucketsReply("QUERY_BUCKETS");
+    }
+
+    /** Sends QUERY_BUCKETS, with the {@code fields} byte when it is not 0. */
+    private void bucketsSend(int series, long start, long end, long interval, Group group, byte[] z, Order order,
+                             long limit, int fields) throws TsdbException {
+        begin(Protocol.OP_QUERY_BUCKETS, 44 + z.length + (fields != 0 ? 1 : 0));
         out.putInt(series).putLong(start).putLong(end).putLong(interval);
         out.put((byte) (group != null ? group.unit().code : 0)).putInt(group != null ? group.count() : 0);
         out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
         out.putShort((short) z.length).put(z);
+        if (fields != 0)
+            out.put((byte) fields);
         send();
-        return bucketsReply("QUERY_BUCKETS");
     }
 
     /** The reply of QUERY_BUCKETS or QUERY_BOUNDS: u32 n, n buckets of 64 bytes. */
@@ -1014,10 +1044,276 @@ public final class TsdbClient implements AutoCloseable {
             throw lost(Status.ERR_CORRUPT, what + " reply of " + bodyLen + " bytes");
         Bucket[] b = new Bucket[n];
         for (int i = 0; i < n; i++)
-            b[i] = new Bucket(in.getLong(), in.getLong(), in.getDouble(), in.getDouble(), in.getDouble(),
-                    in.getLong(), in.getLong(), in.getLong());
+            b[i] = readBucket();
         endReply();
         return Collections.unmodifiableList(Arrays.asList(b));
+    }
+
+    private Bucket readBucket() {
+        return new Bucket(in.getLong(), in.getLong(), in.getDouble(), in.getDouble(), in.getDouble(), in.getLong(),
+                in.getLong(), in.getLong());
+    }
+
+    /** The reply of QUERY_BUCKETS or QUERY_BOUNDS with {@link Protocol#SPREAD}: u32 n, n buckets of 104 bytes. */
+    private List<SpreadBucket> spreadReply(String what) throws TsdbException {
+        int st = frame();
+        if (st != 0) {
+            endReply();
+            throw new TsdbException(st);
+        }
+        int n = bodyLen >= 4 ? in.getInt() : -1;
+        if (n < 0 || bodyLen != 4 + (long) n * Protocol.SPREAD_ROW)
+            throw lost(Status.ERR_CORRUPT, what + " reply of " + bodyLen + " bytes");
+        SpreadBucket[] b = new SpreadBucket[n];
+        for (int i = 0; i < n; i++)
+            b[i] = new SpreadBucket(readBucket(), in.getDouble(), in.getDouble(), in.getDouble(), in.getDouble(),
+                    in.getDouble());
+        endReply();
+        return Collections.unmodifiableList(Arrays.asList(b));
+    }
+
+    // ------------------------------------------------------------------ spread
+
+    /**
+     * Aggregates a series over {@code [start, end)} in fixed intervals, oldest first, with the spread of each bucket:
+     * range, population and sample variance and standard deviation (protocol version 8).
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param intervalMs the bucket length in ms; 0 for a single bucket starting at {@code start}
+     * @return the buckets with rows
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval or from a server older than
+     *     version 8 (asked with HELLO; the request is not sent)
+     */
+    public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs) throws TsdbException {
+        return querySpread(series, start, end, intervalMs, Order.ASC, 0);
+    }
+
+    /**
+     * As {@link #querySpread(int, long, long, long)}, in the given order, at most {@code limit} buckets.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param intervalMs the bucket length in ms; 0 for a single bucket starting at {@code start}
+     * @param order oldest or newest bucket first
+     * @param limit the most buckets to return; 0 for all
+     * @return the buckets with rows
+     * @throws TsdbException as {@link #querySpread(int, long, long, long)}
+     * @throws IllegalArgumentException for a negative limit
+     */
+    public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs, Order order, long limit)
+            throws TsdbException {
+        checkOpts(order, limit);
+        needVersion(8, "the spread");
+        bucketsSend(series, start, end, intervalMs, null, new byte[0], order, limit, Protocol.SPREAD);
+        return spreadReply("QUERY_BUCKETS");
+    }
+
+    /**
+     * The spread in calendar buckets, as {@link #queryGroup(int, long, long, Group, Order, long)} groups (local
+     * periods become bounds here) (protocol version 8).
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param group the calendar grouping, or {@code null} for one bucket over the whole range
+     * @param order oldest or newest bucket first
+     * @param limit the most buckets to return; 0 for all
+     * @return the buckets with rows
+     * @throws TsdbException with {@link Status#ERR_INVALID} from a server older than version 8
+     * @throws IllegalArgumentException for a negative limit
+     */
+    public List<SpreadBucket> querySpreadGroup(int series, long start, long end, Group group, Order order,
+                                               long limit) throws TsdbException {
+        checkOpts(order, limit);
+        needVersion(8, "the spread");
+        if (group == null || group.utc()) {
+            bucketsSend(series, start, end, 0, group, new byte[0], order, limit, Protocol.SPREAD);
+            return spreadReply("QUERY_BUCKETS");
+        }
+        long[] bounds = localBounds(series, start, end, group, false);
+        return bounds == null ? Collections.emptyList() : querySpreadBounds(series, start, end, bounds, order, limit);
+    }
+
+    /**
+     * The spread in buckets that begin at the given UTC instants, as {@link #queryBounds(int, long, long, long[],
+     * Order, long)} (protocol version 8).
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param bounds the bucket starts in ms since the epoch, strictly increasing; at least one
+     * @param order oldest or newest bucket first
+     * @param limit the most buckets to return; 0 for all
+     * @return the buckets with rows
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not increase or the server is older
+     *     than version 8
+     * @throws IllegalArgumentException if there are no bounds or too many, or for a negative limit
+     */
+    public List<SpreadBucket> querySpreadBounds(int series, long start, long end, long[] bounds, Order order,
+                                                long limit) throws TsdbException {
+        checkBounds(bounds);
+        checkOpts(order, limit);
+        needVersion(8, "the spread");
+        boundsSend(series, start, end, bounds, order, limit, Protocol.SPREAD);
+        return spreadReply("QUERY_BOUNDS");
+    }
+
+    // ------------------------------------------------- time-weighted averages
+
+    /**
+     * Time-weighted averages of a series over {@code [start, end)} in fixed intervals (protocol version 6): each
+     * reading weighted by how long it held, so a reading made once an hour counts as much as an hour of readings
+     * made every second. A reading before the range carries into it.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param intervalMs the bucket length in ms; 0 for a single bucket starting at {@code start}
+     * @param opts method, gap limit, order and limit
+     * @return the buckets with readings or coverage
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval, a state series or a server
+     *     older than version 6 (asked with HELLO; the request is not sent)
+     */
+    public List<TwaBucket> queryTwa(int series, long start, long end, long intervalMs, TwaOptions opts)
+            throws TsdbException {
+        Objects.requireNonNull(opts, "opts");
+        if (intervalMs < 0)
+            throw new TsdbException(Status.ERR_INVALID, "negative interval", null);
+        return twa(series, start, end, intervalMs, 0, 0, new long[0], opts);
+    }
+
+    /**
+     * Time-weighted averages in calendar buckets (protocol version 6). For a time zone other than UTC the client
+     * computes the local periods' bounds: over a bounded range to its ends, over an open side to the first or last
+     * row there is.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param group the calendar grouping, or {@code null} for one bucket over the whole range
+     * @param opts method, gap limit, order and limit
+     * @return the buckets with readings or coverage
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a state series or a server older than version 6
+     */
+    public List<TwaBucket> queryTwaGroup(int series, long start, long end, Group group, TwaOptions opts)
+            throws TsdbException {
+        Objects.requireNonNull(opts, "opts");
+        if (group == null)
+            return twa(series, start, end, 0, 0, 0, new long[0], opts);
+        if (group.utc())
+            return twa(series, start, end, 0, group.unit().code, group.count(), new long[0], opts);
+        needVersion(6, "time-weighted averages");
+        long[] bounds = localBounds(series, start, end, group, true);
+        return bounds == null ? Collections.emptyList() : twa(series, start, end, 0, 0, 0, bounds, opts);
+    }
+
+    /**
+     * Time-weighted averages in buckets that begin at the given UTC instants (protocol version 6).
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param bounds the bucket starts in ms since the epoch, strictly increasing; at least one
+     * @param opts method, gap limit, order and limit
+     * @return the buckets with readings or coverage
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not increase, for a state series or a
+     *     server older than version 6
+     * @throws IllegalArgumentException if there are no bounds or too many
+     */
+    public List<TwaBucket> queryTwaBounds(int series, long start, long end, long[] bounds, TwaOptions opts)
+            throws TsdbException {
+        Objects.requireNonNull(opts, "opts");
+        checkBounds(bounds);
+        return twa(series, start, end, 0, 0, 0, bounds, opts);
+    }
+
+    /** QUERY_TWA and its reply: u32 n, n buckets of 40 bytes. */
+    private List<TwaBucket> twa(int series, long start, long end, long interval, int unit, int count, long[] bounds,
+                                TwaOptions o) throws TsdbException {
+        needVersion(6, "time-weighted averages");
+        begin(Protocol.OP_QUERY_TWA, Protocol.TWA_HEADER + (long) bounds.length * Long.BYTES);
+        out.putInt(series).putLong(start).putLong(end);
+        out.put((byte) (o.method() == TwaMethod.LINEAR ? 1 : 0)).put((byte) (o.order() == Order.DESC ? 1 : 0));
+        out.put((byte) unit).put((byte) 0).putLong(o.maxGapMs()).putLong(o.limit()).putLong(interval);
+        out.putInt(count).putInt(bounds.length);
+        putLongs(bounds, 0, bounds.length);
+        send();
+        int st = frame();
+        if (st != 0) {
+            endReply();
+            throw new TsdbException(st);
+        }
+        int n = bodyLen >= 4 ? in.getInt() : -1;
+        if (n < 0 || bodyLen != 4 + (long) n * Protocol.TWA_ROW)
+            throw lost(Status.ERR_CORRUPT, "QUERY_TWA reply of " + bodyLen + " bytes");
+        TwaBucket[] b = new TwaBucket[n];
+        for (int i = 0; i < n; i++)
+            b[i] = new TwaBucket(in.getLong(), in.getDouble(), in.getDouble(), in.getLong(), in.getLong());
+        endReply();
+        return Collections.unmodifiableList(Arrays.asList(b));
+    }
+
+    private static void checkOpts(Order order, long limit) {
+        Objects.requireNonNull(order, "order");
+        if (limit < 0)
+            throw new IllegalArgumentException("negative limit");
+    }
+
+    private static void checkBounds(long[] bounds) {
+        Objects.requireNonNull(bounds, "bounds");
+        if (bounds.length == 0 || bounds.length > MAX_BOUNDS)
+            throw new IllegalArgumentException(bounds.length + " bounds: 1 to " + MAX_BOUNDS + " fit in a request");
+    }
+
+    // -------------------------------------------------------------------- LTTB
+
+    /**
+     * Downsamples a series for a chart (protocol version 5): at most {@code threshold} points of {@code [start,
+     * end)} that keep the shape of the line (Largest-Triangle-Three-Buckets), oldest first, with their stored
+     * values. The first and last points are always kept; a range of {@code threshold} points or fewer comes back
+     * whole.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param threshold the most points to keep; 0 keeps all of them
+     * @return the chosen points
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold of 1 or 2, a state series or a server
+     *     older than version 5
+     */
+    public ValuePoints queryLttb(int series, long start, long end, long threshold) throws TsdbException {
+        return queryLttb(series, start, end, threshold, Order.ASC, 0);
+    }
+
+    /**
+     * As {@link #queryLttb(int, long, long, long)}, newest first with {@link Order#DESC} and only the first
+     * {@code limit} of the chosen points in that order; the choice does not change. Needs protocol version 9 with
+     * {@link Order#DESC} or a limit.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param threshold the most points to keep; 0 keeps all of them
+     * @param order oldest or newest first
+     * @param limit the most points to return; 0 for all
+     * @return the chosen points
+     * @throws TsdbException as {@link #queryLttb(int, long, long, long)}, and from a server older than version 9
+     *     with an order or a limit
+     */
+    public ValuePoints queryLttb(int series, long start, long end, long threshold, Order order, long limit)
+            throws TsdbException {
+        checkOpts(order, limit);
+        needVersion(5, "LTTB");
+        if (order == Order.DESC || limit != 0)
+            needVersion(9, "LTTB with an order or a limit");
+        ValueCollector c = new ValueCollector();
+        valuesStream(Protocol.OP_QUERY_LTTB, series, start, end, order, limit, threshold, c);
+        if (c.overflow || c.mixed)
+            throw new TsdbException(c.mixed ? Status.ERR_CORRUPT : Status.ERR_NOMEM, "QUERY_LTTB reply", null);
+        return c.result();
     }
 
     // ------------------------------------------------------------- value types
@@ -1519,13 +1815,20 @@ public final class TsdbClient implements AutoCloseable {
 
     private boolean values(int series, long start, long end, Order order, long limit, ValueSink sink)
             throws TsdbException {
-        Objects.requireNonNull(order, "order");
-        if (limit < 0)
-            throw new IllegalArgumentException("negative limit");
+        checkOpts(order, limit);
         request();
+        return valuesStream(Protocol.OP_QUERY_VALUES, series, start, end, order, limit, 0, sink);
+    }
+
+    /** QUERY_VALUES, or QUERY_LTTB with {@code threshold}, and its chunks. */
+    private boolean valuesStream(byte op, int series, long start, long end, Order order, long limit, long threshold,
+                                 ValueSink sink) throws TsdbException {
         boolean opts = order != Order.ASC || limit != 0;
-        begin(Protocol.OP_QUERY_VALUES, opts ? 29 : 20);
+        boolean lttb = op == Protocol.OP_QUERY_LTTB;
+        begin(op, (opts ? 29 : 20) + (lttb ? 8 : 0));
         out.putInt(series).putLong(start).putLong(end);
+        if (lttb)
+            out.putLong(threshold);
         if (opts)
             out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
         send();
@@ -1679,10 +1982,16 @@ public final class TsdbClient implements AutoCloseable {
      * collected first, so that their errors are not taken for an old server.
      */
     private void needDeletes() throws TsdbException {
+        needVersion(7, "deletes");
+    }
+
+    /** As {@link #needDeletes}, for any op newer than version 1: a server older than {@code v} is not asked. */
+    private void needVersion(int v, String what) throws TsdbException {
         request();
-        int v = serverVersion();
-        if (v < 7)
-            throw new TsdbException(Status.ERR_INVALID, "the server speaks protocol " + v + "; deletes need 7", null);
+        int have = serverVersion();
+        if (have < v)
+            throw new TsdbException(Status.ERR_INVALID,
+                    "the server speaks protocol " + have + "; " + what + ": protocol " + v, null);
     }
 
     // ------------------------------------------------------------- maintenance
