@@ -8,6 +8,14 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Added
+- `tsdb <dir> export` and `tsdb <dir> import FILE`: a versioned, checksummed stream of whole databases or some
+  series (types, volumes, retention, state names, values bit for bit), for backups and for carrying a database
+  to a new format version. Every later tsdb reads every stream an earlier one wrote
+  ([docs/export-format.md](docs/export-format.md)). An import from a file is checked whole before anything is
+  written; `--skip-existing`, `--merge`, `--replace`, `--volume OLD=NEW`, `--volume-root OLD=NEW`,
+  `--create-volumes`, `--no-retention`, `--check`. An import into a new database is synced once at the end.
+
 ## [0.9.0] - unreleased (tag v0.9.0 when the checklist in docs/release.md is done)
 
 The first release. Disk format version 5, wire protocol version 9.

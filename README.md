@@ -440,9 +440,39 @@ build/tsdb /data/sensors export --series 'pump7.*' --from 2024-01-01 --to 2024-0
 The file has what your queries see (deleted rows are gone), with each series' type, retention and state names,
 every value exactly as stored, and a checksum on every piece. Every later tsdb can import it. `import` checks
 the whole file before it writes anything, so a damaged file changes nothing; `import --check FILE` only checks.
-Series that already exist are refused unless you pass `--skip-existing`, `--merge` or `--replace`. Series of
-other volumes go to the same paths; `--volume OLD=NEW` moves them. Stop tsdbd before importing into its
-directory. [docs/export-format.md](docs/export-format.md) describes the file.
+Series that already exist are refused unless you pass `--skip-existing`, `--merge` or `--replace`. Stop tsdbd
+before importing into its directory. [docs/export-format.md](docs/export-format.md) describes the file.
+
+**If an import stops halfway.** Into a new database (a directory that is missing or empty), `import` writes
+without waiting for the disk and makes everything safe on disk once, at the end. That is what makes it fast,
+and it means the new database is finished only when `import` says "imported ..." and exits with status 0. If
+it was interrupted (a crash, a power loss, a kill, or an error such as a failed sync), the new database is
+incomplete: after a power loss it does not even open. Delete it and run the same import again. Into an
+existing database, `import` writes as carefully as tsdbd does: if it stops halfway, run it again with
+`--merge`, which writes the same rows again.
+
+**Upgrading a database with volumes.** Series in volumes (other directories, such as NFS mounts) keep their
+volume path in the file. The volume directories of the old database belong to it, so the new database needs
+volume directories of its own, and you need room for two copies of the data until you delete the old one.
+Tell `import` where each old volume goes: `--volume OLD=NEW` for one volume, or `--volume-root OLD=NEW` for
+every volume under the directory OLD, and `--create-volumes` to add the new ones to the new database:
+
+```sh
+# old database /data/sensors with volumes /mnt/nfs1/tsdb/sensors and /mnt/nfs2/tsdb/sensors
+build/tsdb /data/sensors export -o /backup/sensors.tsdbdump                 # with the OLD tsdb
+build/tsdb /data/sensors-new import /backup/sensors.tsdbdump --create-volumes \
+    --volume /mnt/nfs1/tsdb/sensors=/mnt/nfs1/tsdb/sensors-new \
+    --volume /mnt/nfs2/tsdb/sensors=/mnt/nfs2/tsdb/sensors-new                # with the NEW tsdb
+# or, when all volumes live under one directory, one rule for all of them:
+build/tsdb /data/sensors-new import /backup/sensors.tsdbdump --create-volumes \
+    --volume-root /mnt/tsdb/sensors=/mnt/tsdb/sensors-new
+```
+
+Then point tsdbd at the new directory, check your queries, and only then delete the old database and its
+volume directories. To keep the old paths instead: export, then move the old directories aside (`mv /data/sensors
+/data/sensors-old`, the same for each volume directory), then import into `/data/sensors` with `--create-volumes`
+and no `--volume`: the volumes are created again at their old paths.
+`--volume OLD=` (nothing after `=`) puts that volume's series into the database directory itself.
 
 ## Tests
 

@@ -18,9 +18,9 @@ volume path, for example, changes both). So:
 - **A 0.9.x release may change the disk format and the wire protocol.** Each change is in the changelog
   under "Changed", and the format or protocol version goes up by one.
 - **Data does not get lost silently.** A release that changes the format says how to carry the data over:
-  an export from the old release and an import into the new one (the building blocks today: `tsdb <dir>
-  query <series> min max raw` writes a series as text, `tsdb <dir> import` reads `series,time,value`
-  lines), or a migration tool shipped with the release. Keep the old release's binaries until the data is
+  an export from the old release and an import into the new one (`tsdb <dir> export -o FILE` with the
+  old release, `tsdb <newdir> import FILE` with the new; [export-format.md](export-format.md)), or a
+  migration tool shipped with the release. Keep the old release's binaries until the data is
   in the new database.
 - **A database of another format version is refused, never read as if it were the new one.**
   `tsdb_open` returns `TSDB_ERR_CORRUPT` and writes one line to stderr:

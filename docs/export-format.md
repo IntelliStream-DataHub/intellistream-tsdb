@@ -62,7 +62,7 @@ record; after the last series a TRAILER record, and nothing after it.
 | kind | name | payload |
 |---:|---|---|
 | 1 | SERIES | `str32 name`, `str32 volume path` (empty: the database directory; else the absolute path of the volume), `u8 type` (0 float32, 1 float64, 2 int64, 3 bool, 4 state), `i64 retention` (ms; 0: none) |
-| 2 | STATES | `u32 count`, then `count` times `u32 code`, `str32 name`: names of state codes, each before the first CHUNK that uses it; a code is named once per series |
+| 2 | STATES | `u32 count`, then `count` times `u32 code`, `str32 name`: names of state codes, each before the first CHUNK that uses it; a code is named once per series; the names of one series may be split over several STATES records (tsdb starts a new one beyond 1 MiB) |
 | 3 | CHUNK | `u32 rows` (1 to 1,048,576), `u32 raw length`, `u8 compression` (0: none, 1: zstd), then the chunk's raw bytes, compressed as one zstd frame or as they are |
 | 4 | END | `u64 rows`, `u64 nulls`, `u32 chunks`: the totals of the series, which the reader checks |
 | 5 | TRAILER | `u64 series`, `u64 rows`, `u64 records` (records before the trailer) |
@@ -79,6 +79,26 @@ values                    rows x width bytes in byte planes: all rows' byte 0, t
                           state 4 (the code, named by a STATES record before)
 validity                  with flag bit 0 only: (rows + 7) / 8 bytes, bit i (LSB first) set when row i has a value
 ```
+
+### Limits
+
+What a reader accepts, and so the most a writer may write (tsdb's exporter checks these before it writes a record):
+
+| what | at most |
+|---|---|
+| header fields (`L`) | 65,536 bytes |
+| a record's payload (`P`) | 64 MiB (67,108,864 bytes) |
+| a series name, volume path or state name | 65,536 bytes |
+| rows in a CHUNK | 1,048,576 (tsdb writes 65,536) |
+| a CHUNK's raw length | 1 + rows x (11 + width) bytes: the flags byte, a varint of at most 10 bytes per timestamp, the values and a validity bit per row, rounded up |
+
+A zstd CHUNK is written as one zstd frame whose content size is the raw length. A reader decompresses its data
+with zstd's one-shot decoder and checks that it yields exactly the raw length, so concatenated and skippable
+frames are accepted too; a writer must not rely on that.
+
+Record flags other than bit 0 are refused, as are header and chunk flags a reader does not know.
+
+### Nulls and reserved values
 
 A null's value bytes are zero. A known value never equals the value tsdb reserves for null (the float32 NaN
 0x7fc01001, the float64 NaN 0x7ff8000000001001, INT64_MIN, state code 0); every timestamp lies in `[from, to)`
@@ -101,6 +121,16 @@ damaged file writes nothing ("nothing was written"). From a pipe it cannot look 
 to `--batch-rows`, 1 M rows by default) atomically after checking it; when the stream turns out damaged, the
 series being imported is emptied again if the import created it, the error names it, and the series before it
 are whole. It exits with status 1 in every such case.
+
+Into an existing database `import` keeps every sync of the engine: a crash or failure midway leaves the series
+before it whole, and the same import rerun with `--merge` writes the same rows again. Into a new database (a
+directory that is missing or empty) it writes without syncing file by file and syncs every file system the
+database lives on (its directory and every volume) once at the end: that is much faster for many small series.
+It reports success and exits 0 only once that sync succeeded; a failed sync is an error (exit 1). A new database
+whose import was interrupted (a crash, power loss or kill) is incomplete: after a power loss it fails its checks at
+open, after a kill it may open with part of the data. Either way, delete it and import again.
+
+A stream on an interactive terminal is recognised only after 16 bytes or the end of input.
 
 Series that exist in the target are refused unless `--skip-existing` (left as they are), `--merge` (the rows are
 written into them; the last write wins, their other rows stay) or `--replace` (their values in the exported range
