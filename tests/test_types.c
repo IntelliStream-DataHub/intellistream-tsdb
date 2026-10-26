@@ -1,6 +1,8 @@
 /* Tests: value types (float64, int64, bool, state) and nulls, against a
  * reference; their codecs; and refusing databases of older formats. */
 #include "internal.h"
+#include "../tools/datasets.h"
+#include "hydraulic_psi.h"
 
 #include <fcntl.h>
 #include <inttypes.h>
@@ -121,6 +123,16 @@ static void test_codecs(void)
             }
         }
         both_levels(TSDB_FLOAT64, d, n, "specials");
+        /* no fixed point but compressible (AUTO then compresses every candidate), and not applicable kinds
+         * (estimates of INFINITY) must not be taken for the smallest */
+        for (size_t k = 0; k < n; k++) {
+            static const double few[] = {1.0 / 3, M_PI, 1.4142135623730951, -2.0 / 7};
+            d[k] = few[(k / 5 + rnd() % 2) % 4];
+        }
+        both_levels(TSDB_FLOAT64, d, n, "a few odd doubles");
+        for (size_t k = 0; k < n; k++)
+            d[k] = (float)(20 + 5 * sin((double)k / 50) + (double)(rnd() % 100) / 1000);
+        both_levels(TSDB_FLOAT64, d, n, "float32 readings");
         /* bool and state */
         for (size_t k = 0; k < n; k++)
             u[k] = (k / 37) % 2;
@@ -155,6 +167,159 @@ static void test_codecs(void)
     free(i);
     free(d);
     free(u);
+}
+
+/* The smallest float64 block of any kind, every one encoded and compressed in
+ * full: what AUTO's sample test has to come close to. */
+static size_t f64_full_try(codec_ctx *c, const double *d, size_t n, uint8_t *blk)
+{
+    static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64, BLK_DELTA_BP, BLK_ALPRD};
+    size_t best = SIZE_MAX;
+    CHECK(codec_scratch_reserve(c, block_bound(n)) == 0);
+    for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++) {
+        size_t len = 0;
+        switch (kinds[k]) {
+        case BLK_F64_DECIMAL: len = f64_decimal_encode(d, n, c->scratch); break;
+        case BLK_XOR64: len = xor64_encode((const uint64_t *)d, n, c->scratch); break;
+        case BLK_DELTA_BP: len = delta_bp64_encode((const uint64_t *)d, n, c->scratch); break;
+        case BLK_ALPRD: len = alprd64_encode((const uint64_t *)d, n, c->scratch); break;
+        default:
+            for (size_t i = 0; i < n; i++)
+                for (int b = 0; b < 8; b++)
+                    c->scratch[(size_t)b * n + i] = (uint8_t)(((const uint64_t *)d)[i] >> (8 * b));
+            len = 8 * n;
+        }
+        if (len)
+            best = MIN(best, block_wrap(c, 1, kinds[k], len, blk));
+    }
+    return best;
+}
+
+/* AUTO ranks float64 candidates on a sample and encodes only the one or two
+ * that can win: the blocks must stay within a hair of trying every kind in full. */
+static void test_f64_sample(void)
+{
+    enum { N = 8192 };
+    double *d = malloc(N * sizeof *d);
+    uint8_t *blk = malloc(block_bound(N) + BLK_SLACK);
+    codec_ctx *c = codec_new();
+    for (int set = 0; set < 10; set++) {
+        static const char *names[] = {"random bits", "random in a range", "unrounded walk", "calibrated counts",
+                                      "noisy sine", "unit conversion", "a few odd doubles", "float32 readings",
+                                      "smooth unrounded", "a walk that comes back"};
+        double x = 1000;
+        for (size_t k = 0; k < N; k++) {
+            uint64_t r = rnd();
+            switch (set) {
+            case 0: memcpy(&d[k], &r, 8); break;
+            case 1: d[k] = (double)(r >> 11) / 9007199254740992.0 * 100; break;
+            case 2: x += ((double)(r % 2001) - 1000) / 7777.0; d[k] = x - 990; break;
+            case 3: x += (double)(r % 2001) - 1000; d[k] = x * 0.0123456789; break; /* ADC counts times a factor */
+            case 4: d[k] = 50 + 10 * sin((double)k / 500) + (double)(r % 1000) / 3333.0; break;
+            case 5: d[k] = round((2 + sin((double)k / 300) + (double)(r % 10) / 1000) * 1000) / 1000 * 14.503773773; break;
+            case 6: d[k] = (double[]){1.0 / 3, M_PI, 1.4142135623730951, -2.0 / 7}[(k / 5 + r % 2) % 4]; break;
+            case 7: d[k] = (float)(20 + 5 * sin((double)k / 50) + (double)(r % 100) / 1000); break;
+            case 8: d[k] = 100 + 30 * sin((double)k / 2000) + (double)(r % 1000) * 1e-9; break;
+            default: /* ZSTD's matches lie 3000 values apart, which no run of the sample spans */
+                x += ((double)(r % 2001) - 1000) / 7777.0;
+                d[k] = k < 3000 ? x : d[k - 3000];
+            }
+        }
+        size_t len = roundtrip(TSDB_FLOAT64, d, N, 1, names[set]), full = f64_full_try(c, d, N, blk);
+        if (len > full + full / 100)
+            fprintf(stderr, "  float64 %s: AUTO %zu bytes, the best kind %zu\n", names[set], len, full);
+        CHECK(len <= full + full / 100);
+    }
+    /* Sensor readings in float32 offset by 2^-30 (so not float32 any more): compressible and
+     * without fixed point, where the estimates are least sure and AUTO compresses every candidate.
+     * Over 16 blocks, as one block may favour the other. */
+    for (int ds = 0; ds < DS_KINDS; ds++) {
+        ds_state st;
+        int64_t ts;
+        float f;
+        size_t sum = 0, sum_full = 0;
+        ds_init(&st, (ds_kind)ds, 3, 1704067200000);
+        for (int g = 0; g < 16; g++) {
+            for (size_t k = 0; k < N; k++) {
+                ds_next(&st, &ts, &f);
+                d[k] = f + 0x1p-30;
+            }
+            sum += roundtrip(TSDB_FLOAT64, d, N, 1, ds_info[ds].name);
+            sum_full += f64_full_try(c, d, N, blk);
+        }
+        if (sum > sum_full + sum_full / 100)
+            fprintf(stderr, "  float64 %s + 2^-30: AUTO %zu bytes, the best kinds %zu\n", ds_info[ds].name, sum, sum_full);
+        CHECK(sum <= sum_full + sum_full / 100);
+    }
+    codec_free(c);
+    free(blk);
+    free(d);
+}
+
+/* The smallest float32 block of AUTO's candidate kinds, every one encoded and compressed in full. */
+static size_t f32_full_try(codec_ctx *c, const float *f, size_t n, uint8_t *blk)
+{
+    static const int kinds[] = {BLK_DECIMAL_BP, BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DELTA_BP};
+    const uint32_t *u = (const uint32_t *)f;
+    size_t best = SIZE_MAX;
+    CHECK(codec_scratch_reserve(c, block_bound(n)) == 0);
+    for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++) {
+        size_t len = 0;
+        switch (kinds[k]) {
+        case BLK_DECIMAL_BP: len = decimal_bp_encode(f, n, c->scratch); break;
+        case BLK_CHIMP: len = chimp_encode(u, n, c->scratch); break;
+        case BLK_DELTA32: len = delta32_encode(u, n, c->scratch); break;
+        case BLK_BYTESPLIT: len = bytesplit_encode(u, n, c->scratch); break;
+        case BLK_ALPRD: len = alprd_encode(u, n, c->scratch); break;
+        default: len = delta_bp32_encode(u, n, c->scratch);
+        }
+        if (len)
+            best = MIN(best, block_wrap(c, 1, kinds[k], len, blk));
+    }
+    return best;
+}
+
+/* float32 AUTO ranks its candidates on a sample compressed with ZSTD. Real
+ * pressures converted from bar to psi repeat their deltas across the block:
+ * ranked by entropy estimates, AUTO took bit-packed deltas 1.5 times the size
+ * of plain deltas with ZSTD on these two granules. */
+static void test_f32_sample(void)
+{
+    enum { N = HYD_N };
+    float *f = malloc(N * sizeof *f);
+    uint8_t *blk = malloc(block_bound(N) + BLK_SLACK);
+    codec_ctx *c = codec_new();
+    static const struct {
+        const char *name;
+        const int32_t *mbar;
+    } real[] = {{"PS2 in psi", hyd_ps2}, {"PS3 in psi", hyd_ps3}};
+    for (size_t r = 0; r < sizeof real / sizeof *real; r++) {
+        for (size_t k = 0; k < N; k++)
+            f[k] = (float)(real[r].mbar[k] / 1000.0 * 14.503773773);
+        size_t len = roundtrip(TSDB_FLOAT32, f, N, 1, real[r].name), full = f32_full_try(c, f, N, blk);
+        if (len > full + full / 100)
+            fprintf(stderr, "  float32 %s: AUTO %zu bytes, the best kind %zu\n", real[r].name, len, full);
+        CHECK(len <= full + full / 100);
+    }
+    /* the generated sensors, 16 blocks each */
+    for (int ds = 0; ds < DS_KINDS; ds++) {
+        ds_state st;
+        int64_t ts;
+        size_t sum = 0, sum_full = 0;
+        ds_init(&st, (ds_kind)ds, 3, 1704067200000);
+        for (int g = 0; g < 16; g++) {
+            for (size_t k = 0; k < N; k++)
+                ds_next(&st, &ts, &f[k]);
+            sum += roundtrip(TSDB_FLOAT32, f, N, 1, ds_info[ds].name);
+            sum_full += f32_full_try(c, f, N, blk);
+        }
+        if (sum > sum_full + sum_full / 100)
+            fprintf(stderr, "  float32 %s: AUTO %zu bytes, the best kinds %zu\n", ds_info[ds].name, sum, sum_full);
+        CHECK(sum <= sum_full + sum_full / 100);
+    }
+    codec_free(c);
+    free(blk);
+    free(f);
 }
 
 /* --------------------------------------------------------- engine, typed */
@@ -876,6 +1041,8 @@ int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
     test_codecs();
+    test_f64_sample();
+    test_f32_sample();
     test_engine(base);
     test_old_version(base);
     test_query_stats(base);

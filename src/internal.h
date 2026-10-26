@@ -211,6 +211,10 @@ int codec_scratch_reserve(codec_ctx *c, size_t need);
 size_t block_wrap(codec_ctx *c, int level, int kind, size_t inner, uint8_t *out);
 /* a block's transform kind and its (decompressed) transform bytes */
 int block_open(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int *kind, const uint8_t **p, size_t *plen);
+/* AUTO's choice among transforms (codec_typed.c): enc encodes n values with one kind, 0 if not applicable */
+typedef size_t (*codec_kind_fn)(int kind, const void *v, size_t n, uint8_t *out);
+size_t auto_pick(codec_ctx *c, int level, const int *kinds, size_t nk, codec_kind_fn enc, const void *v, size_t n,
+                 size_t width, int pre_kind, size_t pre_inner, double all_bits, double surprise, uint8_t *out);
 size_t int_bp_bound(size_t n);
 size_t int_bp_encode(const int64_t *in, size_t n, uint8_t *out);
 int int_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);

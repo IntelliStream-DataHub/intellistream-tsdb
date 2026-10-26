@@ -827,9 +827,12 @@ slowest (the 66-pair search; with ZSTD, Patas and ALP_rd are slower).
   `32 - r` bits, which repeat and are dictionary encoded. `r` runs from 16 to
   31, so the high part keeps 1 to 16 bits and fits a `u16`.
 - `r` is chosen on every (n/256)-th value: for each `r`, count the distinct
-  high parts (up to 512), take the 8 most frequent as the dictionary, and
-  estimate `r + b` bits a value plus 32 for each value the dictionary misses.
-  The cheapest `r` wins.
+  high parts, take the 8 most frequent as the dictionary, and estimate `r + b`
+  bits a value plus 32 for each value the dictionary misses. The cheapest `r`
+  wins. The sample's top 16 bits are sorted once (a radix sort); every `r`'s
+  high part is a shift of them, so equal ones stay adjacent and each `r` costs
+  one pass. Counting them by linear search for each `r` took a third of the
+  encode time of random doubles.
 - The dictionary has up to 8 entries and the index `b = bits_for(nd - 1)`, 0 to
   3 bits: it follows the number of entries found rather than being weighed
   against exceptions.
@@ -885,13 +888,24 @@ enough for a second layout.
 1. **Fixed point first.** If `decimal_bp` fits in 16 bits a value or less, it
    is kept without comparing anything else.
 2. **Otherwise compare.** Chimp, bit delta (deltas of the bit patterns,
-   whole for ZSTD, and packed per vector), byte-stream split, ALP_rd and
-   `decimal_bp` (at any width) are each encoded.
-   Each is estimated as the smaller of its length and the order-0 entropy of
-   its bytes on a 1-in-3 sample (byte-stream split per byte plane). The
-   entropy uses a portable `log2`, so every CPU makes the same choice. The
-   three most promising are compressed for real, with ZSTD, and the smallest
-   is kept; without ZSTD (level 0) the shortest wins.
+   whole for ZSTD, and packed per vector), byte-stream split and ALP_rd each
+   encode a sample of 8 KB (16 runs of 128 consecutive values spread over the
+   granule; the packed delta per run, so that the seams do not widen its
+   vectors), compressed with ZSTD as its block would be. The sample's size,
+   scaled to the granule, ranks them against the real block of `decimal_bp`
+   (at any width). Only the best and any within 3% of it are encoded in full,
+   and the smallest block is kept (`auto_pick` in src/codec_typed.c, shared
+   with float64, which explains the ZSTD probe in front of each attempt).
+   Order-0 entropy estimates ranked the candidates until October 2026; they
+   cannot see ZSTD's matches, and on real pressures converted to psi (UCI
+   hydraulic rig, `bench/hydraulic`) they took the packed bit delta, which
+   hides the repeated deltas, where plain deltas and ZSTD were 27% smaller.
+   Float32 leaves out float64's two rules for encoding every candidate in full
+   (under 24 bits a value; a full block 10% below its estimate): on those
+   pressures nearly every block came out 10% below its sample's estimate,
+   since values repeat across the whole granule, and encoding everything
+   changed sizes by under 0.1% at half the encode speed. Half the sample
+   (8 runs) chose blocks 5% larger there.
 3. **ZSTD(1)** wraps a block of at least 64 bytes, and stays only if it saves
    4 bytes plus 1/32.
 
@@ -1023,10 +1037,28 @@ for a vector with a delta wider than 32 bits):
 u8 scale|flag | u32 nexc | nexc x (u32 pos, u64 bits) | int64 block
 ```
 
-AUTO keeps fixed point outright at 16 bits a value or less; otherwise it
-compresses fixed point, Gorilla's XOR encoding of the 64-bit patterns,
-byte-stream split, the packed bit delta and ALP_rd for real and keeps the
-smallest. With ZSTD, from `build/type-bench`: hdd_temp 0.88, cpu_temp 3.10,
+AUTO keeps fixed point outright at 16 bits a value or less. Otherwise the
+other candidates (Gorilla's XOR encoding of the 64-bit patterns, byte-stream
+split, the packed bit delta and ALP_rd) first encode a sample: 8 runs of 128
+consecutive values spread over the granule, the delta per run so that the
+seams do not widen its vectors, each compressed with ZSTD as its block would
+be. The sample's size, scaled to the granule, ranks them; only the best and any
+within 3% of it are encoded in full (with ZSTD where it saves 3%), alongside
+fixed point if it applies, and the smallest block is kept. Two cases encode
+every candidate in full: a sample under 24 bits a value, where ZSTD's matches
+decide and a sample's small window underrates some transforms more than
+others; and a full block that comes out more than 10% below its estimate,
+where matches farther apart than the runs (a random walk that comes back)
+decide and may favour another transform. Against encoding every candidate in
+full, sizes stay within 0.11% on the test sets and random doubles encode
+about 3.5 times as fast (24.8 to 87 M values/s). Where the probe, ZSTD at
+level -1, finds less than 1/128 to save (noisy doubles after any transform),
+the real attempt is skipped: it would not save the 1/32 `block_wrap` asks for
+either, and costs ten times as much on such bytes. An order-0 entropy
+estimate in place of ZSTD on the sample was tried and ranked badly where
+ZSTD's matches decide (repeated deltas of calibrated readings, the low byte
+planes of a split), losing up to 9%. With ZSTD, from `build/type-bench`:
+hdd_temp 0.88, cpu_temp 3.10,
 tank_bar 1.82, vibration 14.03, flow_rate 10.80 and flow_total 1.56 bits a
 value, all fixed point; tank_psi 46.51, packed bit delta (byte split took
 48.87); random 56.29, ALP_rd (byte split took 59.10).

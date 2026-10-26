@@ -1020,18 +1020,18 @@ size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uin
     return block_wrap(c, level, best, encode_ts_kind(c, best, ts, n), out);
 }
 
-/* Encodes v with one transform into c->scratch; returns 0 if not applicable. */
-static size_t encode_f32_kind(codec_ctx *c, int kind, const float *v, size_t n)
+/* Encodes v with one transform into out; returns 0 if not applicable. */
+static size_t encode_f32_kind(int kind, const void *v, size_t n, uint8_t *out)
 {
     switch (kind) {
-    case BLK_GORILLA: return gorilla_encode((const uint32_t *)v, n, c->scratch);
-    case BLK_CHIMP: return chimp_encode((const uint32_t *)v, n, c->scratch);
-    case BLK_DECIMAL: return decimal_encode(v, n, c->scratch);
-    case BLK_DELTA32: return delta32_encode((const uint32_t *)v, n, c->scratch);
-    case BLK_BYTESPLIT: return bytesplit_encode((const uint32_t *)v, n, c->scratch);
-    case BLK_ALPRD: return alprd_encode((const uint32_t *)v, n, c->scratch);
-    case BLK_DECIMAL_BP: return decimal_bp_encode(v, n, c->scratch);
-    case BLK_DELTA_BP: return delta_bp32_encode((const uint32_t *)v, n, c->scratch);
+    case BLK_GORILLA: return gorilla_encode(v, n, out);
+    case BLK_CHIMP: return chimp_encode(v, n, out);
+    case BLK_DECIMAL: return decimal_encode(v, n, out);
+    case BLK_DELTA32: return delta32_encode(v, n, out);
+    case BLK_BYTESPLIT: return bytesplit_encode(v, n, out);
+    case BLK_ALPRD: return alprd_encode(v, n, out);
+    case BLK_DECIMAL_BP: return decimal_bp_encode(v, n, out);
+    case BLK_DELTA_BP: return delta_bp32_encode(v, n, out);
     default: return 0;
     }
 }
@@ -1107,9 +1107,19 @@ static double entropy_words(const uint8_t *p, size_t len, size_t width)
  *    allowed): bit-packed zigzag deltas of the integers, with ZSTD on top when
  *    it helps. This won on every such sensor stream measured.
  *  - anything else: Chimp, bit delta (whole, for ZSTD, or packed), byte-stream
- *    split or ALP_rd. Cheap entropy estimates shortlist three, all three are
- *    compressed, the smallest stays (docs/design.md, "How AUTO picks").
+ *    split or ALP_rd, ranked by compressing a sample of each (auto_pick,
+ *    codec_typed.c; docs/design.md, "How AUTO picks").
  */
+/*
+ * Unlike float64, float32 skips auto_pick's two ways of encoding every
+ * candidate in full: on the pressures of a real hydraulic rig converted to
+ * psi, full blocks came out more than 10% below their sample's estimate in
+ * most granules (values repeat across the whole block), yet encoding every
+ * candidate changed the sizes by under 0.1% and halved the encode speed;
+ * encoding all below 12 bits a value saved 1-2% at 20-40% of the speed.
+ */
+#define F32_ALL_BITS 0
+#define F32_SURPRISE 0
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(chimp_bound(n), gorilla_bound(n)), MAX(alprd_bound(n), decimal_bp_bound(n)));
@@ -1118,55 +1128,15 @@ size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v
         return 0;
     if (value_codec == TSDB_VALUES_GORILLA || value_codec == TSDB_VALUES_CHIMP) {
         int kind = value_codec == TSDB_VALUES_GORILLA ? BLK_GORILLA : BLK_CHIMP;
-        return block_wrap(c, level, kind, encode_f32_kind(c, kind, v, n), out);
+        return block_wrap(c, level, kind, encode_f32_kind(kind, v, n, c->scratch), out);
     }
     size_t inner = decimal_bp_encode(v, n, c->scratch);
     if (inner && inner * 8 <= 16 * n) /* compact fixed point: nothing else came close */
         return block_wrap(c, level, BLK_DECIMAL_BP, inner, out);
     /* every float32 is "decimal" at ~8 digits; then it is just one more candidate */
-    static const int kinds[] = {BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DECIMAL_BP, BLK_DELTA_BP};
-    enum { NK = sizeof kinds / sizeof *kinds };
-    double est[NK];
-    for (size_t k = 0; k < NK; k++) {
-        size_t len = encode_f32_kind(c, kinds[k], v, n);
-        est[k] = len ? (double)len : INFINITY;
-        if (!len || level <= 0)
-            continue;
-        if (kinds[k] == BLK_BYTESPLIT) /* planes differ (exponent vs mantissa): estimate each */
-            est[k] = entropy_bytes(c->scratch, n) + entropy_bytes(c->scratch + n, n) +
-                     entropy_bytes(c->scratch + 2 * n, n) + entropy_bytes(c->scratch + 3 * n, n);
-        else
-            est[k] = MIN(est[k], entropy_bytes(c->scratch, len));
-    }
-    /* estimates only shortlist: the three most promising are really compressed */
-    size_t order[NK];
-    for (size_t k = 0; k < NK; k++)
-        order[k] = k;
-    for (size_t i = 1; i < NK; i++)
-        for (size_t j = i; j > 0 && est[order[j]] < est[order[j - 1]]; j--) {
-            size_t t = order[j];
-            order[j] = order[j - 1];
-            order[j - 1] = t;
-        }
-    size_t best = block_wrap(c, level, kinds[order[0]], encode_f32_kind(c, kinds[order[0]], v, n), out);
-    if (level <= 0)
-        return best;
-    if (c->alt_cap < block_bound(n)) {
-        uint8_t *alt = realloc(c->alt, block_bound(n));
-        if (!alt)
-            return best;
-        c->alt = alt;
-        c->alt_cap = block_bound(n);
-    }
-    for (size_t r = 1; r < 3 && est[order[r]] < INFINITY; r++) {
-        int kind = kinds[order[r]];
-        size_t len = block_wrap(c, level, kind, encode_f32_kind(c, kind, v, n), c->alt);
-        if (len < best) {
-            memcpy(out, c->alt, len);
-            best = len;
-        }
-    }
-    return best;
+    static const int kinds[] = {BLK_DECIMAL_BP, BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DELTA_BP};
+    return auto_pick(c, level, kinds, sizeof kinds / sizeof *kinds, encode_f32_kind, v, n, 4, BLK_DECIMAL_BP, inner,
+                     F32_ALL_BITS, F32_SURPRISE, out);
 }
 
 /* Resolves a block to its transform kind and (decompressed) transform bytes. */

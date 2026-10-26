@@ -223,66 +223,78 @@ int alp_decode(const uint8_t *in, size_t len, size_t n, float *out)
 
 size_t alprd_bound(size_t n) { return RD_HDR + n * 4 + n * 4 + 16; }
 
-/* Most frequent high parts of a sample for split r; returns the estimated bits. */
-static double rd_plan(const void *in, int width, size_t n, size_t stride, int r, uint16_t *dict, int *ndict)
+/*
+ * The split for ALP_rd: the r (rmin to rmin + 15) whose dictionary of the
+ * RD_DICT most frequent high parts, over a sample of about 256 values, gives
+ * the fewest estimated bits; its dictionary, most frequent first, in dict.
+ * The sample's top 16 bits are sorted once: the high part of every r is a
+ * shift of them, so equal high parts stay adjacent and each r is one pass.
+ * (Counting by linear search per r cost random doubles a third of their
+ * encode time.)
+ */
+static int rd_choose(const void *in, int width, size_t n, int rmin, uint16_t *dict, int *ndict)
 {
-    uint16_t vals[512];
-    uint32_t cnt[512];
-    size_t nv = 0, m = 0;
-    for (size_t i = 0; i < n; i += stride, m++) {
-        uint16_t left = (uint16_t)(width == 4 ? ((const uint32_t *)in)[i] >> r : ((const uint64_t *)in)[i] >> r);
-        size_t k = 0;
-        while (k < nv && vals[k] != left)
-            k++;
-        if (k == nv) {
-            if (nv == 512)
+    uint16_t key[1024], tmp[1024];
+    size_t stride = n > 256 ? n / 256 : 1, m = 0;
+    for (size_t i = 0; i < n && m < 1024; i += stride)
+        key[m++] = (uint16_t)(width == 4 ? ((const uint32_t *)in)[i] >> rmin : ((const uint64_t *)in)[i] >> rmin);
+    for (int sh = 0; sh < 16; sh += 8) { /* LSD radix sort, two bytes */
+        size_t cnt[257] = {0};
+        for (size_t i = 0; i < m; i++)
+            cnt[((key[i] >> sh) & 255) + 1]++;
+        for (int k = 0; k < 256; k++)
+            cnt[k + 1] += cnt[k];
+        for (size_t i = 0; i < m; i++)
+            tmp[cnt[(key[i] >> sh) & 255]++] = key[i];
+        memcpy(key, tmp, m * sizeof *key);
+    }
+    double best = INFINITY;
+    int best_r = rmin + 15;
+    *ndict = 0;
+    for (int s = 0; s < 16; s++) {
+        uint16_t tv[RD_DICT];
+        size_t tc[RD_DICT];
+        int nd = 0;
+        for (size_t i = 0; i < m;) {
+            uint16_t left = (uint16_t)(key[i] >> s);
+            size_t j = i + 1;
+            while (j < m && key[j] >> s == left)
+                j++;
+            size_t c = j - i;
+            i = j;
+            /* into the top RD_DICT, most frequent first; ties keep the smaller high part first */
+            if (nd == RD_DICT && c <= tc[RD_DICT - 1])
                 continue;
-            vals[nv] = left;
-            cnt[nv++] = 0;
+            int k = nd < RD_DICT ? nd++ : RD_DICT - 1;
+            for (; k > 0 && tc[k - 1] < c; k--) {
+                tv[k] = tv[k - 1];
+                tc[k] = tc[k - 1];
+            }
+            tv[k] = left;
+            tc[k] = c;
         }
-        cnt[k]++;
+        size_t covered = 0;
+        for (int k = 0; k < nd; k++)
+            covered += tc[k];
+        int r = rmin + s, b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
+        double cost = (double)m * (r + b) + (double)(m - covered) * 32; /* an exception: u16 position, u16 high part */
+        if (cost < best) {
+            best = cost;
+            best_r = r;
+            *ndict = nd;
+            memcpy(dict, tv, (size_t)nd * sizeof *dict);
+        }
     }
-    /* the RD_DICT most frequent */
-    int nd = 0;
-    size_t covered = 0;
-    for (; nd < RD_DICT && nd < (int)nv; nd++) {
-        size_t bi = (size_t)nd;
-        for (size_t k = (size_t)nd + 1; k < nv; k++)
-            if (cnt[k] > cnt[bi])
-                bi = k;
-        uint16_t tv = vals[nd];
-        uint32_t tc = cnt[nd];
-        vals[nd] = vals[bi];
-        cnt[nd] = cnt[bi];
-        vals[bi] = tv;
-        cnt[bi] = tc;
-        dict[nd] = vals[nd];
-        covered += cnt[nd];
-    }
-    *ndict = nd;
-    int b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
-    return (double)m * (r + b) + (double)(m - covered) * 32; /* an exception: u16 position, u16 high part */
+    return best_r;
 }
 
 size_t alprd_encode(const uint32_t *in, size_t n, uint8_t *out)
 {
     if (n == 0)
         return 0;
-    size_t stride = n > 256 ? n / 256 : 1;
-    int best_r = 31, nd = 0;
-    uint16_t dict[RD_DICT], d2[RD_DICT];
-    double best = INFINITY;
-    for (int r = 16; r <= 31; r++) { /* the high part keeps 1 to 16 bits */
-        int n2;
-        double c = rd_plan(in, 4, n, stride, r, d2, &n2);
-        if (c < best) {
-            best = c;
-            best_r = r;
-            nd = n2;
-            memcpy(dict, d2, sizeof dict);
-        }
-    }
-    int r = best_r, b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
+    int nd;
+    uint16_t dict[RD_DICT];
+    int r = rd_choose(in, 4, n, 16, dict, &nd), b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
     uint32_t *idx = malloc(n * sizeof *idx), *right = malloc(n * sizeof *right);
     uint8_t *exc = malloc(n * 4);
     if (!idx || !right || !exc) {
@@ -383,21 +395,9 @@ size_t alprd64_encode(const uint64_t *in, size_t n, uint8_t *out)
 {
     if (n == 0 || n > RD64_MAX_N)
         return 0;
-    size_t stride = n > 256 ? n / 256 : 1;
-    int best_r = 63, nd = 0;
-    uint16_t dict[RD_DICT], d2[RD_DICT];
-    double best = INFINITY;
-    for (int r = 48; r <= 63; r++) {
-        int n2;
-        double c = rd_plan(in, 8, n, stride, r, d2, &n2);
-        if (c < best) {
-            best = c;
-            best_r = r;
-            nd = n2;
-            memcpy(dict, d2, sizeof dict);
-        }
-    }
-    int r = best_r, b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
+    int nd;
+    uint16_t dict[RD_DICT];
+    int r = rd_choose(in, 8, n, 48, dict, &nd), b = nd <= 1 ? 0 : bits_for((uint32_t)(nd - 1));
     uint32_t *idx = malloc(n * sizeof *idx);
     uint64_t *right = malloc(n * sizeof *right);
     uint8_t *exc = malloc(n * 4);

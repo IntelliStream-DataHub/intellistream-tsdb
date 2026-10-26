@@ -29,6 +29,7 @@
 
 #include "bitpack.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 
@@ -516,17 +517,157 @@ static int unsplit64(const uint8_t *in, size_t len, size_t n, uint64_t *out)
     return 0;
 }
 
-static size_t encode_f64_kind(codec_ctx *c, int kind, const double *v, size_t n)
+static size_t encode_f64_kind(int kind, const void *v, size_t n, uint8_t *out)
 {
     switch (kind) {
-    case BLK_F64_DECIMAL: return f64_decimal_encode(v, n, c->scratch);
-    case BLK_XOR64: return xor64_encode((const uint64_t *)v, n, c->scratch);
-    case BLK_DELTA_BP: return delta_bp64_encode((const uint64_t *)v, n, c->scratch);
-    case BLK_ALPRD: return alprd64_encode((const uint64_t *)v, n, c->scratch);
-    default: bytesplit64((const uint64_t *)v, n, c->scratch); return 8 * n;
+    case BLK_XOR64: return xor64_encode((const uint64_t *)v, n, out);
+    case BLK_DELTA_BP: return delta_bp64_encode((const uint64_t *)v, n, out);
+    case BLK_ALPRD: return alprd64_encode((const uint64_t *)v, n, out);
+    default: bytesplit64((const uint64_t *)v, n, out); return 8 * n;
     }
 }
 
+/*
+ * AUTO's choice among transforms, for float32 (block_encode_f32) and float64
+ * (encode_f64), once fixed point that fits in 16 bits a value has been ruled
+ * out. Each candidate encodes a sample (runs of AUTO_RUN consecutive values
+ * spread over the block, AUTO_SAMPLE_BYTES in all: 16 runs of float32, 8 of
+ * float64), compressed as its block would be: the sample's size, scaled to
+ * the block, ranks them. Only the best, and any other within AUTO_CLOSE of it,
+ * are encoded in full (with ZSTD where it saves). Half the sample (8 runs of
+ * float32) chose blocks 5% larger on real pressures in psi.
+ * Encoding and compressing all five float64 candidates in full halved the
+ * encode speed of random doubles for nothing: with the sample ranking them,
+ * sizes stayed within 0.11% on every test set. An entropy estimate instead of
+ * ZSTD ranked badly where ZSTD's matches decide: repeated deltas of calibrated
+ * readings, the low byte planes of a byte-stream split, and float32 pressures
+ * converted from bar to psi (real data: bit-packed deltas, which hide the
+ * repeats, chosen where plain deltas and ZSTD were 27% smaller). ZSTD is tried on the full
+ * blocks even where it gained nothing on the sample: matches far apart in the
+ * block (a random walk that comes back) can save 17% that eight short runs
+ * never show. Where a full block comes out more than 10% below its estimate,
+ * such matches decide and may favour another transform, so every candidate is
+ * encoded in full.
+ */
+enum { AUTO_RUN = 128, AUTO_SAMPLE_BYTES = 8192, AUTO_SAMPLE_MAX = AUTO_SAMPLE_BYTES / 4 };
+#define AUTO_CLOSE 1.03
+
+/*
+ * Whether ZSTD can save on `len` bytes at src, judged by its fastest
+ * level: where it finds less than 1/AUTO_PROBE_GAIN (most of what is left
+ * after the transforms of noisy values), `level` would not gain the 1/32
+ * block_wrap asks for either, and a probe costs a tenth of a real attempt
+ * on such bytes. Sizes stayed the same on every test set.
+ */
+#define AUTO_PROBE_LEVEL (-1)
+#define AUTO_PROBE_GAIN 128
+static bool zstd_may_gain(codec_ctx *c, const uint8_t *src, size_t len, uint8_t *tmp)
+{
+    size_t z = ZSTD_compressCCtx(c->cctx, tmp, ZSTD_compressBound(len), src, len, AUTO_PROBE_LEVEL);
+    return !ZSTD_isError(z) && z + 4 < len - len / AUTO_PROBE_GAIN;
+}
+
+/* The size of block_wrap's block of the `len` transform bytes at c->alt (ZSTD's output goes to tmp). */
+static size_t sample_block_size(codec_ctx *c, int level, size_t len, uint8_t *tmp)
+{
+    if (level <= 0 || len < 64 || !zstd_may_gain(c, c->alt, len, tmp))
+        return 1 + len;
+    size_t z = ZSTD_compressCCtx(c->cctx, tmp, ZSTD_compressBound(len), c->alt, len, level);
+    if (ZSTD_isError(z))
+        return 1 + len;
+    return z + 4 < len - len / 32 ? 5 + z : 1 + len;
+}
+
+/*
+ * Picks among kinds[0..nk) for the n values of `width` bytes at v, encoding
+ * each with enc. pre_kind's transform is already in c->scratch (pre_inner
+ * bytes, 0 if it failed): its real block competes, no sample needed. Below
+ * all_bits a value, ZSTD's matches decide, and a sample (a smaller window)
+ * underrates them more for some transforms than for others: there every
+ * candidate is encoded. Such blocks also compress fast. Returns the block's
+ * size in out, 0 when out of memory.
+ */
+size_t auto_pick(codec_ctx *c, int level, const int *kinds, size_t nk, codec_kind_fn enc, const void *v, size_t n,
+                 size_t width, int pre_kind, size_t pre_inner, double all_bits, double surprise, uint8_t *out)
+{
+    enum { NK_MAX = 8 };
+    if (nk > NK_MAX)
+        nk = NK_MAX;
+    /* c->alt: a sample's transform, its ZSTD output after it; later the second block */
+    size_t sb = block_bound(AUTO_SAMPLE_MAX), alt_need = MAX(block_bound(n), 2 * sb); /* any width */
+    if (c->alt_cap < alt_need) {
+        uint8_t *alt = realloc(c->alt, alt_need);
+        if (!alt)
+            return 0;
+        c->alt = alt;
+        c->alt_cap = alt_need;
+    }
+    _Alignas(8) uint8_t smp[AUTO_SAMPLE_BYTES];
+    const size_t runs = AUTO_SAMPLE_BYTES / (AUTO_RUN * width), sample = runs * AUTO_RUN;
+    const uint8_t *s = v;
+    size_t ns = n;
+    if (n > sample) {
+        for (size_t r = 0; r < runs; r++)
+            memcpy(smp + r * AUTO_RUN * width, (const uint8_t *)v + (n - AUTO_RUN) * r / (runs - 1) * width,
+                   AUTO_RUN * width);
+        s = smp;
+        ns = sample;
+    }
+    double est[NK_MAX] = {INFINITY, INFINITY, INFINITY, INFINITY, INFINITY, INFINITY, INFINITY, INFINITY};
+    bool zs[NK_MAX] = {false}; /* ZSTD saved on the sample */
+    size_t best = 0;
+    for (size_t k = 0; k < nk; k++) {
+        size_t len = 0;
+        if (kinds[k] == pre_kind) {
+            /* already encoded in full: its real block (a sample can miss the scale or fail) */
+            if (pre_inner)
+                est[k] = (double)(best = block_wrap(c, level, pre_kind, pre_inner, out));
+            continue;
+        }
+        if (kinds[k] == BLK_DELTA_BP && s == smp) {
+            /* deltas across the seams of the runs would widen whole vectors: one run at a time */
+            for (size_t r = 0; r < runs; r++)
+                len += enc(kinds[k], smp + r * AUTO_RUN * width, AUTO_RUN, c->alt + len);
+        } else {
+            len = enc(kinds[k], s, ns, c->alt);
+        }
+        if (len) {
+            size_t z = sample_block_size(c, level, len, c->alt + sb);
+            zs[k] = z != 1 + len;
+            est[k] = (double)z * (double)n / (double)ns;
+        }
+    }
+    size_t b1 = 0;
+    for (size_t k = 1; k < nk; k++)
+        if (est[k] < est[b1])
+            b1 = k;
+    double limit = level > 0 && est[b1] < all_bits / 8 * (double)n ? DBL_MAX : est[b1] * AUTO_CLOSE;
+    bool done[NK_MAX] = {false};
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t k = 0; k < nk; k++) {
+            if (kinds[k] == pre_kind || done[k] || !(est[k] <= limit))
+                continue;
+            done[k] = true;
+            uint8_t *dst = best ? c->alt : out;
+            size_t inner_k = enc(kinds[k], v, n, c->scratch);
+            /* ZSTD that saved nothing on the sample is still tried (far matches), behind a probe */
+            int lv = zs[k] || (level > 0 && inner_k >= 64 && zstd_may_gain(c, c->scratch, inner_k, dst)) ? level : 0;
+            size_t len = block_wrap(c, lv, kinds[k], inner_k, dst);
+            /* far below its estimate: matches the sample cannot see decide, and may favour another kind */
+            if ((double)len < est[k] * surprise)
+                limit = DBL_MAX;
+            if (!best) {
+                best = len;
+            } else if (len < best) {
+                memcpy(out, c->alt, len);
+                best = len;
+            }
+        }
+    }
+    return best;
+}
+
+/* AUTO for float64: fixed point that fits in 16 bits a value is kept at once, otherwise auto_pick. */
 static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(f64_decimal_bound(n), xor64_bound(n)), 8 * n);
@@ -536,30 +677,9 @@ static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uin
     size_t inner = f64_decimal_encode(v, n, c->scratch);
     if (inner && inner * 8 <= 16 * n)
         return block_wrap(c, level, BLK_F64_DECIMAL, inner, out);
-    if (c->alt_cap < block_bound(n)) {
-        uint8_t *alt = realloc(c->alt, block_bound(n));
-        if (!alt)
-            return 0;
-        c->alt = alt;
-        c->alt_cap = block_bound(n);
-    }
     static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64, BLK_DELTA_BP, BLK_ALPRD};
-    size_t best = 0;
-    for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++) {
-        if (kinds[k] == BLK_F64_DECIMAL && !inner)
-            continue;
-        size_t len = encode_f64_kind(c, kinds[k], v, n);
-        if (!len)
-            continue;
-        len = block_wrap(c, level, kinds[k], len, best ? c->alt : out);
-        if (!best) {
-            best = len;
-        } else if (len < best) {
-            memcpy(out, c->alt, len);
-            best = len;
-        }
-    }
-    return best;
+    return auto_pick(c, level, kinds, sizeof kinds / sizeof *kinds, encode_f64_kind, v, n, 8, BLK_F64_DECIMAL, inner,
+                     24, 0.9, out);
 }
 
 static size_t encode_int(codec_ctx *c, int level, const int64_t *v, size_t n, uint8_t *out)

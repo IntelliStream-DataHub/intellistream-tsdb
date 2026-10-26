@@ -103,6 +103,10 @@
       (c, level, kind, inner, out))                                                                           \
     X(int, block_open, (codec_ctx * c, const uint8_t *blk, size_t len, size_t n, int *kind,                   \
                         const uint8_t **p, size_t *plen), (c, blk, len, n, kind, p, plen))                    \
+    X(size_t, auto_pick, (codec_ctx * c, int level, const int *kinds, size_t nk, codec_kind_fn enc,             \
+                          const void *v, size_t n, size_t width, int pre_kind, size_t pre_inner, double all_bits,   \
+                          double surprise, uint8_t *out),                                                           \
+      (c, level, kinds, nk, enc, v, n, width, pre_kind, pre_inner, all_bits, surprise, out))                        \
     X(size_t, int_bp_bound, (size_t n), (n))                                                                  \
     X(size_t, int_bp_encode, (const int64_t *in, size_t n, uint8_t *out), (in, n, out))                       \
     X(int, int_bp_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))         \
