@@ -407,10 +407,11 @@ static uint8_t *buf, *dec;
 
 /* A run shorter than simd_short (simd_short_f64 for float64) takes values.c's tiny path (float64, n <= 12) or simd_small_*: it must give the
  * bits of the lane kernels of the level, which it skips, with and without the spread and the search for nulls,
- * from a new state and from states whose bounds and sum are zeros of either sign. */
+ * from a new state, from states whose bounds and sum are zeros of either sign, and from one whose bounds are no
+ * float32 values (the float32 kernels start their lanes at the bounds rounded to float: here zeros of either sign). */
 static void short_run(const input *x, size_t m)
 {
-    for (int st = 0; st < 3; st++)
+    for (int st = 0; st < 4; st++)
     for (int sp = 0; sp < 2; sp++)
         for (int hint = 0; hint < 2; hint++) {
             size_t nulls = 0;
@@ -433,6 +434,10 @@ static void short_run(const input *x, size_t m)
                 a.a.min = st == 1 ? 0.0 : -0.0;
                 a.a.max = st == 1 ? -0.0 : 0.0;
                 a.x.m2 = 1;
+            }
+            if (st == 3) {
+                a.a.min = 1e-300;
+                a.a.max = -1e-300;
             }
             b = a;
             agg_fold_hint(x->type, x->v, m, !hint, &a.a, sp ? &a.x : NULL);

@@ -4,6 +4,7 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <math.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -1757,6 +1758,89 @@ static void test_merging_parts(const char *base)
     rm_rf(dir);
 }
 
+/* Heap in use while a raw query runs over many small parts. */
+typedef struct {
+    size_t base, peak, rows;
+    int64_t last;
+    int ordered;
+} heap_watch;
+
+static size_t heap_in_use(void)
+{
+    struct mallinfo2 mi = mallinfo2();
+    return mi.uordblks + mi.hblkhd;
+}
+
+static int heap_watch_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
+{
+    heap_watch *h = ctx;
+    (void)v;
+    for (size_t i = 0; i < n; i++) {
+        if (ts[i] <= h->last)
+            h->ordered = 0;
+        h->last = ts[i];
+    }
+    h->rows += n;
+    size_t now = heap_in_use();
+    if (now > h->peak)
+        h->peak = now;
+    return 0;
+}
+
+/* A raw query holds one source per part of its range. Each used to get buffers of granule_rows rows (8192: 96 KB
+ * for float32) whatever its granules held, and the disjoint path kept them all to the end: 1,000 parts of 10 rows
+ * took ~100 MB per query. The buffers now fit the largest granule read, and a drained source frees its buffers.
+ * Disjoint parts check the freeing (one source alive at a time), interleaved ones (merge_stream keeps every source
+ * decoded) the sizing. Without the sanitizers' allocators mallinfo2 sees the heap; with them the check is moot. */
+static void test_raw_many_parts(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-manyparts-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0; /* the parts stay as written */
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t sd, si;
+    OK(tsdb_series(db, "disjoint", &sd));
+    OK(tsdb_series(db, "interleaved", &si));
+    /* disjoint parts of 2,048 rows (without the freeing: 24 MB of buffers even at the right size), interleaved
+       ones of 10 rows (sized by granule_rows: 98 MB); one partition */
+    enum { PARTS = 1000, ND = 2048, NI = 10 };
+    const int64_t t0 = 1699920000000 + 3600000;
+    int64_t *ts = malloc(ND * sizeof *ts);
+    float *v = malloc(ND * sizeof *v);
+    for (int k = 0; k < PARTS; k++) {
+        for (int i = 0; i < ND; i++) {
+            ts[i] = t0 + (int64_t)k * ND + i;
+            v[i] = (float)i;
+        }
+        OK(tsdb_insert_series(db, sd, ts, v, ND));
+        for (int i = 0; i < NI; i++)
+            ts[i] = t0 + ((int64_t)i * PARTS + k) * 1000; /* every part spans the whole range */
+        OK(tsdb_insert_series(db, si, ts, v, NI));
+        OK(tsdb_flush(db));
+    }
+    free(ts);
+    free(v);
+    const uint32_t ids[2] = {sd, si};
+    for (int s = 0; s < 2; s++) {
+        heap_watch h = {.last = INT64_MIN, .ordered = 1};
+        h.base = h.peak = heap_in_use();
+        OK(tsdb_query_raw(db, ids[s], t0, t0 + (int64_t)PARTS * NI * 1000, heap_watch_cb, &h));
+        tsdb_query_stats qs;
+        tsdb_last_query_stats(&qs);
+        CHECK(h.rows == (size_t)PARTS * (s ? NI : ND) && h.ordered && qs.parts == PARTS);
+        if (h.peak - h.base > (size_t)8 << 20)
+            printf("  %s: %zu MB of heap during the query\n", s ? "interleaved" : "disjoint", (h.peak - h.base) >> 20);
+        CHECK(h.peak - h.base <= (size_t)8 << 20);
+    }
+    tsdb_close(db);
+    rm_rf(dir);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -1790,6 +1874,8 @@ int main(int argc, char **argv)
     printf("volume statistics\n");
     test_volume_stats(base);
     test_merging_parts(base);
+    printf("raw queries over many parts\n");
+    test_raw_many_parts(base);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

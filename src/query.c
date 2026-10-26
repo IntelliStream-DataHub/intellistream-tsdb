@@ -411,8 +411,17 @@ static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
     if (c->loaded || !c->p)
         return 0;
     if (!c->own && c->gi < c->gj) {
-        c->ts = malloc(c->p->grows * sizeof *c->ts);
-        c->v = malloc(c->p->grows * c->w);
+        /* as many rows as its largest granule, not the part's granule size: a query holds a source per part of
+           its range at once, and parts of small batches (unmerged, or many series each) have granules of a few
+           hundred rows. Sized by granule_rows, 4,500 such parts asked for 576 MB per query, and the heap's trim
+           and the page faults after it were a third of a raw scan. A count above grows is refused by
+           granule_read before it decodes. */
+        uint32_t rows = 1;
+        for (uint32_t k = c->gi; k < c->gj; k++)
+            rows = MAX(rows, c->p->g[k].count);
+        rows = MIN(rows, c->p->grows);
+        c->ts = malloc(rows * sizeof *c->ts);
+        c->v = malloc(rows * c->w);
         c->own = true;
         if (!c->ts || !c->v)
             return TSDB_ERR_NOMEM;
@@ -1532,6 +1541,11 @@ static int raw_range(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series
                 }
                 rc = src_advance(cc, c, c->n - c->pos, start, end);
             }
+            /* drained: its buffers go back now, for the next source's malloc to reuse (kept to the end, a query
+               over thousands of small parts grew the heap by all of them, and the trim after it faulted them in
+               again on the next query) */
+            src_free(c);
+            c->own = false;
         }
     } else {
         rc = merge_stream(cc, cur, nc, start, end, fn, ctx);
