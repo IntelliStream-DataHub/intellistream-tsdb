@@ -58,12 +58,16 @@ baseline (VBMI, VBMI2, GFNI, BITALG, VPOPCNTDQ, BF16), plus AVX512-VP2INTERSECT 
    `tests/test_levels.c`, including random bit widths 0-64 and lengths around block edges), and decoders must
    stay safe on any bytes (`make fuzz`). Measure decode speed with codec-bench and type-bench against today's
    v4 path, on the 9950X and the 7950X.
-4. **Look for uses of VP2INTERSECT** (finding equal elements of two vectors): merging sorted timestamps or
+4. **The v4 code layout at 7-16 rows.** After the short-run work of October 2026, float32 aggregates of 7-16
+   values on the v4 copy are 1-2.5% below the code before it (medians 0.975-0.992, on the 7950X), from how the
+   compiler lays out the v4 copy of `src/values.c` (the user accepted this for 0.9.0). Check it on Zen 5 and,
+   with steps 2 and 3 changing the same code, try to remove it.
+5. **Look for uses of VP2INTERSECT** (finding equal elements of two vectors): merging sorted timestamps or
    series ids are candidates. Only if a measurement shows a gain.
 
 ## Done when
 
-- A report (`docs/tasks/ryzen-9950x-results.md`): the tables of steps 1-3 (means, sd, min-max), what is worth
+- A report (`docs/tasks/ryzen-9950x-results.md`): the tables of steps 1-4 (means, sd, min-max), what is worth
   changing, and what is not and why.
 - Any code change on its own branch, with tests, passing `make test`, `make asan`, `make tsan`, `make dist`,
   `make dist-test` and `make dist-check-sandybridge`, and identical results at every CPU level.
