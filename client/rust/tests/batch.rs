@@ -193,6 +193,39 @@ fn pool_replaces_a_broken_connection() {
     }
 }
 
+/// A panic inside a batch closure leaves its connection's slot poisoned: that connection (which may
+/// be in the middle of a reply) is dropped and replaced, not reused, and the pool keeps working.
+#[test]
+fn pool_drops_a_connection_left_by_a_panic() {
+    let srv = Server::start();
+    srv.client().series_create("x", ValueType::Float32, None).unwrap();
+    let addr = srv.addr();
+    let connects = Arc::new(AtomicUsize::new(0));
+    let n = connects.clone();
+    // one connection, so the panicking closure's slot is the one every later call uses
+    let pool = Pool::with_connector(1, move || {
+        n.fetch_add(1, Ordering::SeqCst);
+        Client::connect(addr.as_str())
+    })
+    .unwrap();
+    let q = AggQuery::new(0, i64::MIN, i64::MAX, 0);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pool.map(3, |c, i| {
+            let b = c.query_agg(q.series, q.start..q.end, q.interval_ms)?;
+            if i == 1 {
+                panic!("a closure panics");
+            }
+            Ok(b.len())
+        })
+    }));
+    assert!(panicked.is_err(), "the panic reaches the caller");
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    for _ in 0..3 {
+        assert_eq!(pool.query_agg_many(&[q, q]).unwrap().len(), 2);
+    }
+    assert_eq!(connects.load(Ordering::SeqCst), 2, "the poisoned slot's connection was replaced once");
+}
+
 /// The index and code of a batch call's error.
 fn failed_at<T: std::fmt::Debug>(r: Result<T, Error>) -> (usize, i32) {
     match r {

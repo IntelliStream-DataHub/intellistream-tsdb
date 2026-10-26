@@ -285,7 +285,16 @@ with tsdb_client.Db("/tmp/tsdb-many") as db:
 
 `start`, `end` and `interval_ms` are one number for every query or a list
 (or numpy array) with one per query. The answers come back in the order
-of the queries; if one query fails, the call raises its error.
+of the queries. If queries fail, the call raises the error of the first
+failing one, and `err.index` says which one it was (it is `None` for
+errors of the one-query calls). Every entry before it has run; later
+ones may have run too.
+
+The call copies your arrays once, before it lets go of Python, so other
+Python threads keep running while it works, and changing an array from
+another thread during the call cannot hurt it. In `insert_many`, entries
+for the same series are written in list order, so where two of them have
+a row at the same time, the later entry wins, as with separate inserts.
 
 Over the network, `tsdb_client.Pool` does the same with several
 connections to one server (by default one per CPU of this machine):
@@ -295,7 +304,11 @@ with tsdb_client.Pool("127.0.0.1", 7070, connections=16) as pool:
     hours = pool.query_agg_many(pumps, t0, t0 + 86_400_000, 3_600_000)
 ```
 
-A connection that breaks is replaced on its next use.
+A connection that breaks is replaced on its next use. When the server
+restarts, every connection is replaced: a query that failed because its
+connection broke is sent once more on a new one, so queries keep working.
+An insert is not sent again (the server may already have written it), so
+the first insert after a restart can fail; send it again.
 
 ## API documentation
 
