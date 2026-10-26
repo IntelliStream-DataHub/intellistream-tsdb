@@ -19,8 +19,8 @@ and of many cloud VMs. Questions:
 3. Does BMI2 (PDEP/PEXT, fast on Intel) unpack bit-packed integers faster than today's v3 code in the decimal
    and integer codecs (`src/codec.c`, `src/codec_typed.c`)? (PDEP/PEXT are slow on AMD before Zen 3, so a PDEP
    path must be chosen by CPU, not by the instruction being present.)
-4. The float64 decimal encode and decode paths that need AVX-512 today run at v2 speed on v3 CPUs; an AVX2
-   version (planned in the codec work) should be checked here.
+4. The float64 decimal encode and decode paths that need AVX-512 today run at v2 speed on v3 CPUs. The codec
+   work of 2026-10-26 did not add AVX2 versions (no AVX2-only CPU to tune them on): they are step 4 below.
 
 ## Set up the machine
 
@@ -65,8 +65,10 @@ and of many cloud VMs. Questions:
    identical to today's decoder for every input (cases in `tests/test_levels.c`: random bit widths 0-64,
    lengths around block edges), decoders safe on any bytes (`make fuzz`). Measure decode speed with codec-bench
    and type-bench against today's v3 path.
-4. **AVX2 float64 decimal paths** (if the codec work has added them by then): measure them here against the
-   v2 path they replace on v3 CPUs.
+4. **AVX2 float64 decimal paths** (not written yet): AVX2 versions of the float64 fixed-point encode (the scale
+   test and the conversion to integers) and decode (integers to doubles), byte-identical to the v2 path and
+   checked in `tests/test_levels.c`; measure them here against the v2 path they replace on v3 CPUs, and keep
+   them only if they are faster here.
 
 ## Done when
 
