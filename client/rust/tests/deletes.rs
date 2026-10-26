@@ -172,3 +172,76 @@ fn newer_queries_are_not_sent_to_an_older_server() {
         assert_eq!(h.join().unwrap(), vec![1], "version {version}: HELLO only");
     }
 }
+
+/// A server of `version` that knows only the 28-byte QUERY_LTTB of versions 5 to 8: it answers that with the last
+/// chunk of no points and the 37-byte form of version 9 with INVALID. Returns the payload lengths of the LTTB requests.
+fn lttb_server(version: u32) -> (String, thread::JoinHandle<Vec<usize>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let h = thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut lens = Vec::new();
+        let mut h = [0u8; 9];
+        while s.read_exact(&mut h).is_ok() {
+            let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+            let mut payload = vec![0; len - 5];
+            s.read_exact(&mut payload).unwrap();
+            let (status, body): (i32, Vec<u8>) = match h[8] {
+                1 => (0, version.to_le_bytes().to_vec()),
+                21 => {
+                    lens.push(payload.len());
+                    // last, FLOAT32, no flags, 0; no points
+                    if payload.len() == 28 {
+                        (0, vec![1, 0, 0, 0, 0, 0, 0, 0])
+                    } else {
+                        (Status::Invalid.code(), vec![])
+                    }
+                }
+                _ => (0, vec![]),
+            };
+            let mut reply = ((9 + body.len()) as u32).to_le_bytes().to_vec();
+            reply.extend_from_slice(&h[4..8]);
+            reply.push(0);
+            reply.extend_from_slice(&status.to_le_bytes());
+            reply.extend_from_slice(&body);
+            s.write_all(&reply).unwrap();
+        }
+        lens
+    });
+    (addr, h)
+}
+
+#[test]
+fn plain_lttb_is_the_short_request() {
+    for version in 5..=9u32 {
+        let (addr, h) = lttb_server(version);
+        let mut c = Client::connect(addr).unwrap();
+        assert_eq!(c.query_lttb(1, .., 100, QueryOpts::asc()).unwrap().ts.len(), 0, "version {version}");
+        assert_eq!(c.query_lttb(1, T0..T0 + 1000, 3, QueryOpts::asc()).unwrap().ts.len(), 0, "version {version}");
+        c.close().unwrap();
+        assert_eq!(h.join().unwrap(), vec![28, 28], "version {version}");
+    }
+}
+
+/// More local periods than one request carries (QUERY_BOUNDS takes 32 Mi bounds, QUERY_TWA 56 bytes' worth fewer; the
+/// calendar stops at 64 Mi): every grouped call fails with TOO_MANY_BUCKETS, as in the C and Java clients.
+#[test]
+fn over_wide_local_ranges_are_too_many_buckets() {
+    let srv = Server::start();
+    let mut c = srv.client();
+    let too_many = |e: Error| assert_eq!(e.status(), Some(Status::TooManyBuckets), "{e:?}");
+    let secs = Group::new(Unit::Second).timezone("Europe/Oslo");
+    let wide = c.series_create("wide", ValueType::Float64, None).unwrap();
+    c.insert_series_values(wide, &[T0, T0 + 450 * 86_400_000], &[1.0f64, 2.0]).unwrap(); // 38.9 M seconds
+    let wider = c.series_create("wider", ValueType::Float64, None).unwrap();
+    c.insert_series_values(wider, &[T0, T0 + 800 * 86_400_000], &[1.0f64, 2.0]).unwrap(); // 69.1 M seconds
+    for id in [wide, wider] {
+        too_many(c.query_group(id, .., Some(&secs), QueryOpts::asc()).unwrap_err());
+        too_many(c.query_spread_group(id, .., Some(&secs), QueryOpts::asc()).unwrap_err());
+        too_many(c.query_twa_group(id, .., Some(&secs), TwaOpts::step()).unwrap_err());
+    }
+    // bounded on both sides, TWA covers the range: 33,554,418 seconds is one past QUERY_TWA's cap
+    too_many(c.query_twa_group(wide, T0..T0 + 33_554_418_000, Some(&secs), TwaOpts::step()).unwrap_err());
+    assert!(!c.is_broken());
+    c.close().unwrap();
+}

@@ -82,6 +82,8 @@ public final class TsdbClient implements AutoCloseable {
     private static final int INSERT_FRAME_ROWS = 8 << 20; /* as the C client: under 256 MiB for any value type */
     private static final int MAX_STRING = 0xffff;         /* u16 length prefix */
     private static final int MAX_BOUNDS = (Protocol.MAX_FRAME - 64) / Long.BYTES; /* QUERY_BOUNDS, as the C client */
+    /* QUERY_TWA carries 56 bytes before its bounds, as the C client */
+    private static final int MAX_TWA_BOUNDS = (Protocol.MAX_FRAME - 64 - 56) / Long.BYTES;
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
     /** TCP keepalive of a new connection: first probe after 30 s of silence, then every 10 s, 3 probes. */
     private static final Duration KEEPALIVE_IDLE = Duration.ofSeconds(30);
@@ -937,7 +939,8 @@ public final class TsdbClient implements AutoCloseable {
             return null;
         /* the newest row may sit at Long.MAX_VALUE: then the range is beyond what bounds cover anyway */
         long[] bounds = group.bounds(edge[0], edge[1] == Long.MAX_VALUE ? Long.MAX_VALUE : edge[1] + 1);
-        if (bounds.length > MAX_BOUNDS)
+        /* more local periods than one request carries: the same status as more than the calendar computes */
+        if (bounds.length > (bounded ? MAX_TWA_BOUNDS : MAX_BOUNDS))
             throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS, bounds.length + " bounds exceed one request", null);
         return bounds;
     }
@@ -1106,6 +1109,8 @@ public final class TsdbClient implements AutoCloseable {
     public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs, Order order, long limit)
             throws TsdbException {
         checkOpts(order, limit);
+        if (intervalMs < 0) /* as the C and Rust clients: the server's status, without asking it */
+            throw new TsdbException(Status.ERR_INVALID, "negative interval", null);
         needVersion(8, "the spread");
         bucketsSend(series, start, end, intervalMs, null, new byte[0], order, limit, Protocol.SPREAD);
         return spreadReply("QUERY_BUCKETS");
@@ -1226,7 +1231,7 @@ public final class TsdbClient implements AutoCloseable {
     public List<TwaBucket> queryTwaBounds(int series, long start, long end, long[] bounds, TwaOptions opts)
             throws TsdbException {
         Objects.requireNonNull(opts, "opts");
-        checkBounds(bounds);
+        checkBounds(bounds, MAX_TWA_BOUNDS);
         return twa(series, start, end, 0, 0, 0, bounds, opts);
     }
 
@@ -1263,9 +1268,13 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     private static void checkBounds(long[] bounds) {
+        checkBounds(bounds, MAX_BOUNDS);
+    }
+
+    private static void checkBounds(long[] bounds, int max) {
         Objects.requireNonNull(bounds, "bounds");
-        if (bounds.length == 0 || bounds.length > MAX_BOUNDS)
-            throw new IllegalArgumentException(bounds.length + " bounds: 1 to " + MAX_BOUNDS + " fit in a request");
+        if (bounds.length == 0 || bounds.length > max)
+            throw new IllegalArgumentException(bounds.length + " bounds: 1 to " + max + " fit in a request");
     }
 
     // -------------------------------------------------------------------- LTTB

@@ -1469,16 +1469,8 @@ public final class EmbeddedDb implements AutoCloseable {
             Objects.requireNonNull(order, "order");
             if (limit < 0)
                 throw new IllegalArgumentException("negative limit");
-            ValuePoints first = queryValues(series, start, end, Order.ASC, 1);
-            ValuePoints last = queryValues(series, start, end, Order.DESC, 1);
-            if (first.size() == 0 || last.size() == 0)
-                return new ArrayList<>();
-            long lo = first.timestamps()[0];
-            long hi = last.timestamps()[0];
-            long[] bounds = group.bounds(lo, hi == Long.MAX_VALUE ? Long.MAX_VALUE : hi + 1);
-            if (bounds.length == 0)
-                return new ArrayList<>();
-            return queryBounds(series, start, end, bounds, order, limit);
+            long[] bounds = localBounds(series, start, end, group, false);
+            return bounds == null ? new ArrayList<>() : queryBounds(series, start, end, bounds, order, limit);
         }
         MemorySegment d = enter();
         int rc;
@@ -1674,20 +1666,52 @@ public final class EmbeddedDb implements AutoCloseable {
                 m.get(JAVA_LONG, o + 24), m.get(JAVA_LONG, o + 32));
     }
 
-    /** True for a group in a zone other than UTC: the engine's {@code _local} functions compute its bounds. */
+    /**
+     * True for a group in a zone other than UTC. Its periods become bounds here, with {@link Group#bounds}
+     * (java.time), as in {@link #queryGroup(int, long, long, Group, Order, long)} and {@link TsdbClient}: the
+     * engine's calendar reads the system's tzdata and knows other zone ids than the JDK ("UTC+2", "GMT-05:30"), so
+     * handing it the zone would group differently from those.
+     */
     private static boolean local(Group g) {
         return g != null && g.zone() != null && !g.zone().normalized().equals(ZoneOffset.UTC);
     }
 
-    /** A {@code tsdb_group}, with its zone when {@code local(g)}; NULL for no group. */
+    /** A {@code tsdb_group} in UTC; NULL for no group. */
     private static MemorySegment group(Arena a, Group g) {
         if (g == null)
             return MemorySegment.NULL;
         MemorySegment s = a.allocate(Native.GROUP);
         s.set(JAVA_INT, 0, g.unit().code());
         s.set(JAVA_INT, 4, g.count());
-        s.set(PTR, 8, local(g) ? a.allocateFrom(g.zone().getId()) : MemorySegment.NULL);
+        s.set(PTR, 8, MemorySegment.NULL);
         return s;
+    }
+
+    /**
+     * The UTC instants at which the local periods of {@code group} begin, for a query over {@code [start, end)};
+     * {@code null} if there is nothing to ask for. As {@code TsdbClient.localBounds}: the aggregates cut the range
+     * to the first and last row there is; the time-weighted averages ({@code bounded}) cover a bounded side to its
+     * end, since a reading before the range carries into it, and cut only an open side.
+     */
+    private long[] localBounds(int series, long start, long end, Group group, boolean bounded) throws TsdbException {
+        long lo = start, hi = end == Long.MAX_VALUE ? Long.MIN_VALUE : end - 1;
+        if (!bounded || start == Long.MIN_VALUE) {
+            ValuePoints first = queryValues(series, start, end, Order.ASC, 1);
+            if (first.size() == 0)
+                return null;
+            lo = first.timestamps()[0];
+        }
+        if (!bounded || end == Long.MAX_VALUE) {
+            ValuePoints last = queryValues(series, start, end, Order.DESC, 1);
+            if (last.size() == 0)
+                return null;
+            hi = last.timestamps()[0];
+        }
+        if (lo > hi)
+            return null;
+        /* the newest row may sit at Long.MAX_VALUE: then the range is beyond what bounds cover anyway */
+        long[] bounds = group.bounds(lo, hi == Long.MAX_VALUE ? Long.MAX_VALUE : hi + 1);
+        return bounds.length == 0 ? null : bounds;
     }
 
     private static void checkBounds(long[] bounds) {
@@ -1733,8 +1757,8 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /**
-     * The spread in calendar buckets, as {@link #queryGroup(int, long, long, Group, Order, long)} groups; a zone
-     * other than UTC through the engine's calendar ({@code tsdb_query_spread_group_local}).
+     * The spread in calendar buckets, as {@link #queryGroup(int, long, long, Group, Order, long)} groups; the
+     * periods of a zone other than UTC become bounds here ({@link Group#bounds}) over the rows there are.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1749,12 +1773,13 @@ public final class EmbeddedDb implements AutoCloseable {
     public List<SpreadBucket> querySpreadGroup(int series, long start, long end, Group group, Order order,
                                                long limit) throws TsdbException {
         checkOpts(order, limit);
-        boolean zoned = local(group);
-        return arrayQuery((d, a, out, nout) -> zoned
-                ? (int) Native.QUERY_SPREAD_GROUP_LOCAL.invokeExact(d, series, start, end, group(a, group),
-                        opts(a, order, limit), out, nout)
-                : (int) Native.QUERY_SPREAD_GROUP.invokeExact(d, series, start, end, group(a, group),
-                        opts(a, order, limit), out, nout), Native.SPREAD_BUCKET.byteSize(), EmbeddedDb::spreadBucket);
+        if (local(group)) {
+            long[] bounds = localBounds(series, start, end, group, false);
+            return bounds == null ? new ArrayList<>() : querySpreadBounds(series, start, end, bounds, order, limit);
+        }
+        return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_SPREAD_GROUP.invokeExact(d, series, start, end,
+                group(a, group), opts(a, order, limit), out, nout), Native.SPREAD_BUCKET.byteSize(),
+                EmbeddedDb::spreadBucket);
     }
 
     /**
@@ -1811,8 +1836,8 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /**
-     * Time-weighted averages in calendar buckets; a zone other than UTC through the engine's calendar
-     * ({@code tsdb_query_twa_group_local}: an open side of the range is cut to where segments cover time).
+     * Time-weighted averages in calendar buckets; the periods of a zone other than UTC become bounds here
+     * ({@link Group#bounds}) over {@code [start, end)}, an open side cut to the rows there are.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1825,12 +1850,12 @@ public final class EmbeddedDb implements AutoCloseable {
     public List<TwaBucket> queryTwaGroup(int series, long start, long end, Group group, TwaOptions opts)
             throws TsdbException {
         Objects.requireNonNull(opts, "opts");
-        boolean zoned = local(group);
-        return arrayQuery((d, a, out, nout) -> zoned
-                ? (int) Native.QUERY_TWA_GROUP_LOCAL.invokeExact(d, series, start, end, group(a, group),
-                        twaOpts(a, opts), out, nout)
-                : (int) Native.QUERY_TWA_GROUP.invokeExact(d, series, start, end, group(a, group), twaOpts(a, opts),
-                        out, nout), Native.TWA_BUCKET.byteSize(), EmbeddedDb::twaBucket);
+        if (local(group)) {
+            long[] bounds = localBounds(series, start, end, group, true);
+            return bounds == null ? new ArrayList<>() : queryTwaBounds(series, start, end, bounds, opts);
+        }
+        return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_TWA_GROUP.invokeExact(d, series, start, end,
+                group(a, group), twaOpts(a, opts), out, nout), Native.TWA_BUCKET.byteSize(), EmbeddedDb::twaBucket);
     }
 
     /**
@@ -1867,7 +1892,8 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param end the first timestamp excluded
      * @param threshold the most points to keep, at least 3
      * @return the chosen points
-     * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold below 3 or a state series
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold below 3 or a state series; an unknown
+     *     series has no points, as over TCP
      */
     public ValuePoints queryLttb(int series, long start, long end, long threshold) throws TsdbException {
         return queryLttb(series, start, end, threshold, Order.ASC, 0);
@@ -1890,7 +1916,17 @@ public final class EmbeddedDb implements AutoCloseable {
     public ValuePoints queryLttb(int series, long start, long end, long threshold, Order order, long limit)
             throws TsdbException {
         checkOpts(order, limit);
-        ValueType type = seriesType(series);
+        /* as tsdbd and the Rust Db: the threshold is checked first, and an unknown series has no points */
+        if (Long.compareUnsigned(threshold, 3) < 0) /* a size_t: -1 is a huge threshold, as over TCP */
+            throw new TsdbException(Status.ERR_INVALID, "an LTTB threshold below 3", null);
+        ValueType type;
+        try {
+            type = seriesType(series);
+        } catch (TsdbException e) {
+            if (e.status() != Status.ERR_NOTFOUND)
+                throw e;
+            return new ValuePoints(new long[0], Column.ofFloats());
+        }
         Sink s = new Sink();
         s.collect = true;
         s.type = type;

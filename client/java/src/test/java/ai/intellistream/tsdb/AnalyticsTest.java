@@ -101,6 +101,58 @@ class AnalyticsTest {
     }
 
     @Test
+    void aNegativeSpreadIntervalIsRefusedWithoutAskingTheServer() throws Exception {
+        try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(9)) {
+            try (TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
+                invalid(() -> o.querySpread(1, MIN, MAX, -1));
+                invalid(() -> o.querySpread(1, MIN, MAX, -5, Order.DESC, 3));
+                o.commit();
+            }
+            /* HELLO may go out or not (the client asks for the version when it needs it); no query does */
+            assertEquals(List.of((int) Protocol.OP_COMMIT),
+                    f.ops().stream().filter(op -> op != Protocol.OP_HELLO).toList());
+        }
+    }
+
+    /* More local periods than one request carries (32 Mi bounds; the calendar itself stops at 64 Mi): every grouped
+     * call fails with TOO_MANY_BUCKETS, as in the C and Rust clients, before it sends the bounds. */
+    @Test
+    void overWideLocalRangesAreTooManyBuckets() throws Exception {
+        int wide = c.seriesCreate("wide", ValueType.FLOAT64);
+        c.insertSeriesValues(wide, new long[] {T0, T0 + 450 * 86_400_000L}, Column.ofDoubles(1, 2)); /* 38.9 M s */
+        int wider = c.seriesCreate("wider", ValueType.FLOAT64);
+        c.insertSeriesValues(wider, new long[] {T0, T0 + 800 * 86_400_000L}, Column.ofDoubles(1, 2)); /* 69.1 M s */
+        Group secs = Group.of(Unit.SECOND).in("Europe/Oslo");
+        for (int s : new int[] {wide, wider}) {
+            tooMany(() -> c.queryGroup(s, MIN, MAX, secs, Order.ASC, 0));
+            tooMany(() -> c.querySpreadGroup(s, MIN, MAX, secs, Order.ASC, 0));
+            tooMany(() -> c.queryTwaGroup(s, MIN, MAX, secs, TwaOptions.step()));
+        }
+        c.commit(); /* the connection is still good */
+        /* bounded on both sides, TWA covers the range: 33,554,418 seconds is one past QUERY_TWA's (MAX_FRAME - 120) / 8
+         * (and below QUERY_BOUNDS' cap). The client refuses it without sending it: tsdbd would refuse it too. */
+        try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(9)) {
+            try (TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
+                tooMany(() -> o.queryTwaGroup(wide, T0, T0 + 33_554_418_000L, secs, TwaOptions.step()));
+            }
+            assertTrue(!f.ops().contains((int) Protocol.OP_QUERY_TWA), "" + f.ops());
+        }
+    }
+
+    static void tooMany(Executable e) {
+        TsdbException x = assertThrows(TsdbException.class, e);
+        assertEquals(Status.ERR_TOO_MANY_BUCKETS, x.status(), x.getMessage());
+    }
+
+    /* QUERY_TWA carries 56 bytes more than QUERY_BOUNDS before its bounds, so it takes fewer: as the C client. */
+    @Test
+    void twaBoundsCapIsTheCClients() throws Exception {
+        long[] b = new long[(Protocol.MAX_FRAME - 120) / 8 + 1];
+        assertThrows(IllegalArgumentException.class, () -> c.queryTwaBounds(calc, MIN, MAX, b, TwaOptions.step()));
+        c.commit();
+    }
+
+    @Test
     void timeWeightedAverages() throws Exception {
         long end = T0 + 5000;
         /* 10 for 1 s, 20 for 2 s, 30 for 1 s; 40 has no segment */
@@ -182,6 +234,29 @@ class AnalyticsTest {
                 assertArrayEquals(new Object[] {(int) Protocol.OP_HELLO, (int) Protocol.OP_COMMIT},
                         f.ops().toArray(), "version " + version + ": HELLO and COMMIT only");
             }
+        }
+    }
+
+    /* A server of version 5 to 8 knows only the 28-byte QUERY_LTTB: this one answers it with no points and the
+     * 37-byte form of version 9 with INVALID. A plain queryLttb must still work there. */
+    @Test
+    void plainLttbIsTheShortRequest() throws Exception {
+        for (int version = 5; version <= 9; version++) {
+            List<Integer> lengths = new java.util.ArrayList<>();
+            try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(version,
+                    fr -> new byte[] {1, 0, 0, 0, 0, 0, 0, 0}, /* the last chunk: FLOAT32, no points */
+                    fr -> fr.op() == Protocol.OP_QUERY_LTTB && fr.payload().remaining() != 28 ? Status.ERR_INVALID : 0);
+                 TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
+                ValuePoints p = o.queryLttb(1, MIN, MAX, 100);
+                assertEquals(0, p.size(), "version " + version);
+                assertEquals(0, o.queryLttb(1, MIN, MAX, 100, Order.ASC, 0).size(), "version " + version);
+                synchronized (f.frames) {
+                    for (CompressionTest.Frame fr : f.frames)
+                        if (fr.op() == Protocol.OP_QUERY_LTTB)
+                            lengths.add(fr.payload().remaining());
+                }
+            }
+            assertEquals(List.of(28, 28), lengths, "version " + version);
         }
     }
 }

@@ -4,6 +4,9 @@ its answers with tsdbd's; the last test checks that a server older than a call's
 version is not asked."""
 
 import math
+import socket
+import struct
+import threading
 
 import pytest
 
@@ -19,6 +22,14 @@ def code(fn, *args, **kw):
     with pytest.raises(TsdbError) as e:
         fn(*args, **kw)
     return e.value.code
+
+
+def same_floats(a, b):
+    """Equal lists of floats, NaN equal to NaN; the others to within 1e-12."""
+    return len(a) == len(b) and all(
+        (math.isnan(x) and math.isnan(y)) or (not math.isnan(x) and not math.isnan(y) and x == pytest.approx(y, abs=1e-12))
+        for x, y in zip(a, b)
+    )
 
 
 def calc(client):
@@ -51,7 +62,21 @@ def test_spread(client):
     assert math.isnan(per_2s[0].var_samp)  # one value has no sample variance
     assert list(per_2s.range) == [0.0, 0.0, 10.0]
     assert list(per_2s.var_pop) == [0.0, 0.0, 25.0]
-    assert len(per_2s.var_samp) == len(per_2s.stddev_pop) == len(per_2s.stddev_samp) == 3
+    # every spread column is its buckets' field, and the right one: NaN where one value has no sample spread
+    cols = ("range", "var_pop", "var_samp", "stddev_pop", "stddev_samp")
+    known = {
+        "range": [0.0, 0.0, 10.0],
+        "var_pop": [0.0, 0.0, 25.0],
+        "var_samp": [math.nan, math.nan, 50.0],
+        "stddev_pop": [0.0, 0.0, 5.0],
+        "stddev_samp": [math.nan, math.nan, math.sqrt(50)],
+    }
+    for col in cols:
+        column = list(getattr(per_2s, col))
+        assert same_floats(column, [getattr(b, col) for b in per_2s]), col
+        assert same_floats(column, known[col]), col
+        whole = list(getattr(client.query_spread(s), col))
+        assert same_floats(whole, [getattr(client.query_spread(s)[0], col)]), col
     g = client.query_spread_group(s, unit="second", count=2, order="desc")
     assert g == per_2s  # bit for bit, NaN included
     assert per_2s[1:] == client.query_spread(s, interval_ms=2000, order="desc", limit=3)[1:]
@@ -150,3 +175,60 @@ def test_an_older_server_is_not_asked(version):
         assert c.protocol_version() == version  # the client is still usable
     th.join(5)
     assert {op for op, _ in seen} == {1}, f"version {version}: HELLO only"
+
+
+def lttb_server(version):
+    """A server of `version` that knows only the 28-byte QUERY_LTTB of versions 5 to 8: it answers that with the last
+    chunk of no points, the 37-byte form of version 9 with INVALID. Returns (port, LTTB payload lengths, thread)."""
+    lst = socket.socket()
+    lst.bind(("127.0.0.1", 0))
+    lst.listen(1)
+    lens = []
+
+    def serve():
+        s, _ = lst.accept()
+        f = s.makefile("rb")
+        while hdr := f.read(9):
+            length, rid, op = struct.unpack("<IIB", hdr)
+            payload = f.read(length - 5)
+            status, body = 0, b""
+            if op == 1:
+                body = struct.pack("<I", version)
+            elif op == 21:
+                lens.append(len(payload))
+                if len(payload) == 28:
+                    body = bytes([1, 0, 0, 0]) + struct.pack("<I", 0)  # last, FLOAT32; no points
+                else:
+                    status = tsdb_client.ERR_INVALID
+            s.sendall(struct.pack("<IIBi", 9 + len(body), rid, 0, status) + body)
+        s.close()
+        lst.close()
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    return lst.getsockname()[1], lens, th
+
+
+@pytest.mark.parametrize("version", range(5, 10))
+def test_plain_lttb_is_the_short_request(version):
+    port, lens, th = lttb_server(version)
+    with Client(port=port) as c:
+        assert c.query_lttb(1, 100, numpy=False) == ([], [])
+        assert c.query_lttb(1, 3, T0, T0 + 1000, order="asc", numpy=False) == ([], [])
+    th.join(5)
+    assert lens == [28, 28]
+
+
+def test_over_wide_local_ranges_are_too_many_buckets(client):
+    """More local periods than one request carries (32 Mi bounds; QUERY_TWA 56 bytes' worth fewer; the calendar stops
+    at 64 Mi): TOO_MANY_BUCKETS from every grouped call, as in the C, Rust and Java clients."""
+    secs = dict(unit="second", timezone="Europe/Oslo")
+    for name, days in (("wide", 450), ("wider", 800)):  # 38.9 M and 69.1 M seconds
+        s = client.series_create(name, "float64")
+        client.insert_series_values(s, [T0, T0 + days * 86_400_000], [1.0, 2.0])
+        assert code(client.query_group, s, **secs) == tsdb_client.ERR_TOO_MANY_BUCKETS
+        assert code(client.query_spread_group, s, **secs) == tsdb_client.ERR_TOO_MANY_BUCKETS
+        assert code(client.query_twa_group, s, **secs) == tsdb_client.ERR_TOO_MANY_BUCKETS
+    # bounded on both sides, TWA covers the range: 33,554,418 seconds is one past QUERY_TWA's cap
+    s = client.series("wide")
+    assert code(client.query_twa_group, s, T0, T0 + 33_554_418_000, **secs) == tsdb_client.ERR_TOO_MANY_BUCKETS

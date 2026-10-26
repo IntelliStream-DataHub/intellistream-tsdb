@@ -1201,8 +1201,8 @@ impl Client {
     /// # Errors
     ///
     /// [`Error::InvalidArgument`] for an unknown time zone (even on a series
-    /// without rows); [`Status::TooManyBuckets`] or [`Error::InvalidArgument`] if
-    /// the range holds too many periods; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
+    /// without rows); [`Status::TooManyBuckets`] if the range holds too many
+    /// periods (more than one request carries); [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
     /// after either the client refuses further calls.
     ///
     /// ```no_run
@@ -1264,6 +1264,7 @@ impl Client {
             return Ok(false);
         };
         let b = calendar::calendar_bounds(zone, g.unit, g.count, first..last.saturating_add(1))?;
+        fits_request(&b, (MAX_FRAME - 64) / 8)?;
         self.bounds_send(series, start, end, &b, opts, fields)
     }
 
@@ -1597,6 +1598,7 @@ impl Client {
                 return Ok(Vec::new());
             }
             let b = calendar::calendar_bounds(zone, g.unit, g.count, lo..hi.saturating_add(1))?;
+            fits_request(&b, (MAX_FRAME - 64 - TWA_HEADER) / 8)?;
             check_bounds(&b)?;
             c.twa_req(series, start, end, 0, 0, 0, &b, opts)
         })
@@ -1987,6 +1989,15 @@ fn read_bucket(r: &mut Cursor<'_>) -> Result<Bucket> {
         imin: r.i64()?,
         imax: r.i64()?,
     })
+}
+
+/// Local periods beyond what one request carries fail with [`Status::TooManyBuckets`], as
+/// more periods than the calendar computes do, and as in the C and Java clients.
+fn fits_request(b: &[i64], max: usize) -> Result<()> {
+    if b.len() > max {
+        return Err(Error::Server(Status::TooManyBuckets));
+    }
+    Ok(())
 }
 
 /// Bucket bounds a request can carry: some, strictly increasing.

@@ -1333,6 +1333,38 @@ static void test_spread_remote(tsdbc *c)
     free(bk);
 }
 
+/* More local periods than one request carries (QUERY_BOUNDS takes 32 Mi bounds, QUERY_TWA 56 bytes' worth fewer; the
+ * calendar itself stops at 64 Mi): every grouped call fails with TOO_MANY_BUCKETS, as in the Rust and Java clients. */
+static void test_wide_local_ranges(tsdbc *c)
+{
+    uint32_t wide, wider;
+    OK(tsdbc_series_create(c, "wide.local", TSDB_FLOAT64, NULL, &wide));
+    OK(tsdbc_series_create(c, "wider.local", TSDB_FLOAT64, NULL, &wider));
+    int64_t ts[2] = {T0, T0 + 450 * 86400000LL}; /* 38.9 M seconds */
+    double v[2] = {1, 2};
+    OK(tsdbc_insert_series_values(c, wide, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, 2));
+    ts[1] = T0 + 800 * 86400000LL; /* 69.1 M seconds */
+    OK(tsdbc_insert_series_values(c, wider, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, 2));
+    tsdb_group secs = {TSDB_SECOND, 1, "Europe/Oslo"};
+    uint32_t ids[2] = {wide, wider};
+    for (int k = 0; k < 2; k++) {
+        tsdb_bucket *b;
+        tsdb_spread_bucket *sb;
+        tsdb_twa_bucket *tb;
+        size_t n;
+        CHECK(tsdbc_query_group(c, ids[k], INT64_MIN, INT64_MAX, &secs, NULL, &b, &n) == TSDB_ERR_TOO_MANY_BUCKETS);
+        CHECK(tsdbc_query_spread_group(c, ids[k], INT64_MIN, INT64_MAX, &secs, NULL, &sb, &n) ==
+              TSDB_ERR_TOO_MANY_BUCKETS);
+        CHECK(tsdbc_query_twa_group(c, ids[k], INT64_MIN, INT64_MAX, &secs, NULL, &tb, &n) ==
+              TSDB_ERR_TOO_MANY_BUCKETS);
+    }
+    /* bounded on both sides, TWA covers the range: 33,554,418 seconds is one past QUERY_TWA's cap */
+    tsdb_twa_bucket *tb;
+    size_t n;
+    CHECK(tsdbc_query_twa_group(c, wide, T0, T0 + 33554418000LL, &secs, NULL, &tb, &n) == TSDB_ERR_TOO_MANY_BUCKETS);
+    OK(tsdbc_commit(c)); /* the connection is still good */
+}
+
 /* A server of protocol version 6 (before the spread), as far as bucket queries go: HELLO answers 6, a
  * QUERY_BUCKETS or QUERY_BOUNDS with a byte after the zone or bounds is refused as such a server does, one
  * without it gets a bucket of 64 bytes. Counts the bucket requests it sees. */
@@ -3326,6 +3358,7 @@ int main(int argc, char **argv)
     test_twa(c);
     test_limits_remote(c);
     test_spread_remote(c);
+    test_wide_local_ranges(c);
     test_spread_old_server();
     test_delete(c);
     test_frame_cap(c);

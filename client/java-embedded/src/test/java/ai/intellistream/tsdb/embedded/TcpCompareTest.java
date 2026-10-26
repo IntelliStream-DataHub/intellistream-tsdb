@@ -131,7 +131,10 @@ class TcpCompareTest {
                             assertEquals(tcp.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, o, limit),
                                     db.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, o, limit));
                             for (Group g : new Group[] {null, Group.of(Unit.DAY), Group.of(Unit.WEEK).in("Europe/Oslo"),
-                                Group.of(Unit.HOUR, 5).in("America/St_Johns"), Group.of(Unit.MONTH).in("Asia/Kolkata")}) {
+                                Group.of(Unit.HOUR, 5).in("America/St_Johns"), Group.of(Unit.MONTH).in("Asia/Kolkata"),
+                                /* zone ids of java.time that the engine's calendar does not know: the embedded
+                                 * calls must compute the bounds in Java, as TsdbClient does */
+                                Group.of(Unit.DAY).in("UTC+2"), Group.of(Unit.HOUR, 7).in("GMT-05:30")}) {
                                 assertEquals(tcp.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, g, o, limit),
                                         db.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, g, o, limit), "" + g);
                                 long gl = limit;
@@ -173,6 +176,10 @@ class TcpCompareTest {
                         }
                     }
                 }
+                for (long th : new long[] {2, 10}) /* an unknown series: no points, after the threshold check */
+                    same("lttb of an unknown series " + th, () -> points(tcp.queryLttb(987_654, Long.MIN_VALUE,
+                            Long.MAX_VALUE, th)), () -> points(db.queryLttb(987_654, Long.MIN_VALUE, Long.MAX_VALUE,
+                            th)));
                 var p = db.queryPoints(ids[0], Long.MIN_VALUE, Long.MAX_VALUE);
                 var q = tcp.queryPoints(ids[0], Long.MIN_VALUE, Long.MAX_VALUE);
                 assertArrayEquals(q.timestamps(), p.timestamps());

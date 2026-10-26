@@ -391,6 +391,11 @@ class EmbeddedDbTest {
         assertEquals(Status.ERR_INVALID, status(() -> db.queryLttb(l, T0, T0 + 1, 2)));
         assertEquals(Status.ERR_INVALID, status(() -> db.queryLttb(st, T0, T0 + 1, 10)));
         assertEquals(0, db.queryLttb(l, 0, 1, 10).size());
+        /* as tsdbd and the Rust Db: the threshold first, then an unknown series has no points */
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryLttb(987_654, T0, T0 + 1, 2)));
+        ValuePoints none = db.queryLttb(987_654, Long.MIN_VALUE, Long.MAX_VALUE, 10, Order.DESC, 3);
+        assertEquals(0, none.size());
+        assertEquals(ValueType.FLOAT32, none.values().type());
 
         List<Bucket> asc = db.queryAgg(l, T0, T0 + 1_000_000, 60_000);
         List<Bucket> top = db.queryAgg(l, T0, T0 + 1_000_000, 60_000, Order.DESC, 3);
@@ -485,6 +490,17 @@ class EmbeddedDbTest {
                         Group.of(u).in(z).bounds(T0, T0 + 400 * 86_400_000L), z + " " + u);
             }
         }
+        /* more local periods than the calendar computes (64 Mi seconds is 777 days): TOO_MANY_BUCKETS from every
+         * grouped call, as from the TCP clients */
+        int wide = db.series("wide");
+        db.insert(wide, new long[] {T0, T0 + 800 * 86_400_000L}, new float[] {1, 2});
+        Group secs = Group.of(Unit.SECOND).in("Europe/Oslo");
+        assertEquals(Status.ERR_TOO_MANY_BUCKETS, status(() -> db.queryGroup(wide, Long.MIN_VALUE, Long.MAX_VALUE,
+                secs)));
+        assertEquals(Status.ERR_TOO_MANY_BUCKETS, status(() -> db.querySpreadGroup(wide, Long.MIN_VALUE,
+                Long.MAX_VALUE, secs, Order.ASC, 0)));
+        assertEquals(Status.ERR_TOO_MANY_BUCKETS, status(() -> db.queryTwaGroup(wide, Long.MIN_VALUE, Long.MAX_VALUE,
+                secs, TwaOptions.step())));
         int empty = db.series("empty");
         assertEquals(0, db.queryGroup(empty, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY).in("Europe/Oslo"))
                 .size());

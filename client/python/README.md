@@ -196,7 +196,12 @@ how long it held, which suits readings sent only when the value changes.
 `query_lttb` thins a series out for a chart: at most the number of points you
 ask for, chosen so the line keeps its shape.
 
-All aggregates take `order="desc"` (newest first) and `limit`. Over TCP the
+Every query of one series takes `order="desc"` (newest first) and `limit`:
+`query_raw`, `query_values`, `query_points`, `query_agg`, `query_group`,
+`query_bounds`, the `query_spread*` and `query_twa*` calls and `query_lttb`.
+Of the batch calls, `query_raw_many` takes them too; `query_agg_many` does
+not. There is no batch call for the spread or time-weighted averages in
+0.9.0: run `query_spread` or `query_twa` per series. Over TCP the
 spread needs a server of protocol version 8, time-weighted averages 6, LTTB 5
 (9 with `order` or `limit`); an older server gets no request and the call
 fails with an invalid-argument error.

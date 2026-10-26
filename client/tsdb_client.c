@@ -720,6 +720,9 @@ static int group_req(tsdbc *c, uint32_t series, int64_t start, int64_t end, cons
     int64_t *bounds;
     size_t n;
     rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
+    /* more local periods than one request carries: the status of more than the calendar computes, in every client */
+    if (rc == 0 && n > (TSDB_MAX_FRAME - 64) / 8)
+        rc = TSDB_ERR_TOO_MANY_BUCKETS;
     if (rc == 0)
         rc = bounds_req(c, series, start, end, bounds, n, opts, fields, out, nout);
     free(bounds);
@@ -858,6 +861,8 @@ int tsdbc_query_twa_group(tsdbc *c, uint32_t series, int64_t start, int64_t end,
     int64_t *bounds;
     size_t n;
     rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
+    if (rc == 0 && n > (TSDB_MAX_FRAME - 64 - TSDB_TWA_HEADER) / 8) /* as in group_req */
+        rc = TSDB_ERR_TOO_MANY_BUCKETS;
     if (rc == 0)
         rc = tsdbc_query_twa_bounds(c, series, start, end, bounds, n, opts, out, nout);
     free(bounds);
