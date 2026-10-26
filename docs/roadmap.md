@@ -59,6 +59,7 @@ and 1.0 still need (the format and protocol changes may land in a 0.9.x, but bef
 |---|---|
 | Failover with one writer per volume, NFS outage handling | designed in docs/ha.md |
 | Authentication, TLS, access control | until then tsdbd belongs on a trusted network only |
+| Store on change (opt-in, per series) | keep a row only when the value changes, plus a heartbeat row after a maximum gap so a silent sensor is not mistaken for a steady one (decided with the user on 2026-10-26). Measured first: what it saves in bytes, rows and query time on flat data with regular and jittery timestamps. Exact equality only by default (a deadband threshold would be lossy compression). Counts and plain averages then count stored rows; time-weighted averages and the `state` type stay right. Start in the clients and the Pulsar connector (no engine or format change); an engine option in the series dictionary only if that is not enough, before the 1.0 freeze |
 
 ## When hardware is available
 
