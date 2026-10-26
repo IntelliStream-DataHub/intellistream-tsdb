@@ -28,22 +28,19 @@ static inline bool null_f64_at(const double *v, size_t j, uint64_t null)
     return b == null;
 }
 
+static inline bool null_f32_at(const float *v, size_t j, uint64_t null)
+{
+    uint32_t b;
+    memcpy(&b, v + j, 4);
+    return b == null;
+}
+
 static size_t count_null_f64(const uint64_t *v, size_t n)
 {
     size_t k = 0;
     for (size_t i = 0; i < n; i++)
         k += v[i] == NULL_F64;
     return k;
-}
-
-/* the null count first (a quick pass the compiler vectorizes): without nulls the kernels skip the masking.
- * Runs shorter than the lanes take simd_small_* (same bits, less fixed cost: buckets of a few rows). */
-static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
-{
-    if (n < simd_short)
-        simd_small_f32(v, n, may_be_null, a, x);
-    else
-        simd_fold_f32(v, n, may_be_null ? count_null_f32((const uint32_t *)v, n) : 0, a, x);
 }
 
 /*
@@ -92,8 +89,9 @@ _Static_assert(TINY_F64 <= SIMD_LANES_F64 && SIMD_LANES_F64 == 16, "one value pe
 #define TMIN(x, y) TMINMAX("minsd", x, y)
 #define TMAX(x, y) TMINMAX("maxsd", x, y)
 #define TLEAF(j)                                                                                                   \
-    double x##j = v[(j) < n ? (j) : 0], s##j = x##j; /* lanes from n on: unused, optimised out */                \
-    bool z##j = (j) < n && null_f64_at(v, j, nl); /* the bits from memory: no move from an xmm */          \
+    double x##j = f32 ? (double)((const float *)v)[(j) < n ? (j) : 0] : ((const double *)v)[(j) < n ? (j) : 0];    \
+    double s##j = x##j; /* lanes from n on: unused, optimised out */                                               \
+    bool z##j = (j) < n && (f32 ? null_f32_at(v, j, nl) : null_f64_at(v, j, nl)); /* the bits from memory */      \
     if (z##j) { /* a null adds +0.0 to its lane (rare: a branch, as in main's loop) */                    \
         s##j = 0.0;                                                                                                \
         c--;                                                                                                       \
@@ -119,17 +117,19 @@ _Static_assert(TINY_F64 <= SIMD_LANES_F64 && SIMD_LANES_F64 == 16, "one value pe
     }
 #define TLANES(m) m(0) m(1) m(2) m(3) m(4) m(5) m(6) m(7) m(8) m(9) m(10) m(11) m(12) m(13) m(14) m(15)
 
-static inline __attribute__((always_inline)) void tiny_f64_n(const double *v, const int n, agg_state *a,
-                                                             agg_dev *dv)
+static inline __attribute__((always_inline)) void tiny_n(const void *v, const int n, const bool f32, agg_state *a,
+                                                         agg_dev *dv)
 {
-    uint64_t c = (uint64_t)n, nl = NULL_F64;
+    uint64_t c = (uint64_t)n, nl = f32 ? NULL_F32 : NULL_F64;
     __asm__("" : "+r"(nl)); /* the null in one register (GCC loaded the 64-bit constant again for every value) */
     TLANES(TLEAF)
-    double mn = TMIN(x0, a->min), mx = TMAX(x0, a->max);
+    /* float32: the kernels' lanes start at (float)a->min, compared as floats (the same order as doubles) */
+    double lo = f32 ? (double)(float)a->min : a->min, hi = f32 ? (double)(float)a->max : a->max;
+    double mn = TMIN(x0, lo), mx = TMAX(x0, hi);
     TCHAIN(8) TCHAIN(4) TCHAIN(12) TCHAIN(2) TCHAIN(10) TCHAIN(6) TCHAIN(14) /* the bit-reversed order */
     TCHAIN(1) TCHAIN(9) TCHAIN(5) TCHAIN(13) TCHAIN(3) TCHAIN(11) TCHAIN(7) TCHAIN(15)
-    a->min = mn;
-    a->max = mx;
+    a->min = f32 ? (mn < a->min ? mn : a->min) : mn;
+    a->max = f32 ? (mx > a->max ? mx : a->max) : mx;
     TTREE(s, sum0)
     double sum = sum0 + 0.0; /* -0.0 to +0.0 (above) */
     if (!dv) {
@@ -147,6 +147,48 @@ static inline __attribute__((always_inline)) void tiny_f64_n(const double *v, co
     a->sum = canon_nan(a->sum);
 }
 
+/* float32 runs of at most TINY_F32 values: the same tree as tiny_n's float64 one, as for n <= 16 the kernels' 32
+ * lanes halve over padding (+0.0, a's bounds) twice before lanes below n meet (test_levels compares them) */
+#define TINY_F32 7
+/* out of line: inlined, its frame (registers for the lanes' null flags) moved to the top of agg_fold_hint for
+ * every type */
+__attribute__((noinline)) static void fold_f32_tiny(const float *v, size_t n, agg_state *a, agg_dev *x)
+{
+    if (n >= 5) {
+        if (n >= 7) {
+            tiny_n(v, 7, true, a, x);
+        } else {
+            if (n >= 6)
+                tiny_n(v, 6, true, a, x);
+            else
+                tiny_n(v, 5, true, a, x);
+        }
+    } else if (n >= 3) {
+        if (n >= 4)
+            tiny_n(v, 4, true, a, x);
+        else
+            tiny_n(v, 3, true, a, x);
+    } else if (n >= 2) {
+        tiny_n(v, 2, true, a, x);
+    } else if (n) {
+        tiny_n(v, 1, true, a, x);
+    }
+}
+
+/* Up to TINY_F32 values: the tree. Then the null count first (a quick pass the compiler vectorizes): without nulls
+ * the kernels skip the masking. Runs shorter than the lanes take simd_small_* (same bits, less fixed cost). */
+static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
+{
+    if (n <= TINY_F32) {
+        fold_f32_tiny(v, n, a, x);
+        return;
+    }
+    if (n < simd_short)
+        simd_small_f32(v, n, may_be_null, a, x);
+    else
+        simd_fold_f32(v, n, may_be_null ? count_null_f32((const uint32_t *)v, n) : 0, a, x);
+}
+
 static void fold_f64(const double *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
     /* inlined, n a constant in each, behind compares (a jump table or an indirect call cost more); nulls are looked
@@ -158,44 +200,44 @@ static void fold_f64(const double *v, size_t n, bool may_be_null, agg_state *a, 
             if (n >= 10) {
                 if (n >= 11) {
                     if (n >= 12) {
-                        tiny_f64_n(v, 12, a, x);
+                        tiny_n(v, 12, false, a, x);
                     } else {
-                        tiny_f64_n(v, 11, a, x);
+                        tiny_n(v, 11, false, a, x);
                     }
                 } else {
-                    tiny_f64_n(v, 10, a, x);
+                    tiny_n(v, 10, false, a, x);
                 }
             } else {
                 if (n >= 8) {
                     if (n >= 9) {
-                        tiny_f64_n(v, 9, a, x);
+                        tiny_n(v, 9, false, a, x);
                     } else {
-                        tiny_f64_n(v, 8, a, x);
+                        tiny_n(v, 8, false, a, x);
                     }
                 } else {
-                    tiny_f64_n(v, 7, a, x);
+                    tiny_n(v, 7, false, a, x);
                 }
             }
         } else {
             if (n >= 4) {
                 if (n >= 5) {
                     if (n >= 6) {
-                        tiny_f64_n(v, 6, a, x);
+                        tiny_n(v, 6, false, a, x);
                     } else {
-                        tiny_f64_n(v, 5, a, x);
+                        tiny_n(v, 5, false, a, x);
                     }
                 } else {
-                    tiny_f64_n(v, 4, a, x);
+                    tiny_n(v, 4, false, a, x);
                 }
             } else {
                 if (n >= 2) {
                     if (n >= 3) {
-                        tiny_f64_n(v, 3, a, x);
+                        tiny_n(v, 3, false, a, x);
                     } else {
-                        tiny_f64_n(v, 2, a, x);
+                        tiny_n(v, 2, false, a, x);
                     }
                 } else {
-                    tiny_f64_n(v, 1, a, x);
+                    tiny_n(v, 1, false, a, x);
                 }
             }
         }
