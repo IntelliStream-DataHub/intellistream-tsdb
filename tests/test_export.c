@@ -1139,7 +1139,7 @@ typedef struct knobs {
     uint32_t hdr_flags, chunk_flags, state_code;
     uint8_t rec_flags;
     int64_t end_delta, retention;
-    bool seq_skip, unordered, unordered_chunks, out_of_range, null_f32, null_i64, bool2, dup, unnamed;
+    bool seq_skip, unordered, unordered_chunks, out_of_range, before_range, null_f32, null_i64, bool2, dup, unnamed;
     bool optional_rec, unknown_rec;
     const char *vol;
 } knobs;
@@ -1156,8 +1156,8 @@ static void craft(const char *file, const knobs *k)
     float fv[3] = {1.5f, -2.0f, 3.25f};
     if (k->unordered)
         ts[2] = T0 + 500;
-    if (k->out_of_range)
-        ts[2] = CR_TO;
+    if (k->before_range)
+        ts[0] = CR_FROM - 1;
     if (k->null_f32) {
         uint32_t bits = TSDB_NULL_F32_BITS;
         memcpy(&fv[1], &bits, 4);
@@ -1167,7 +1167,8 @@ static void craft(const char *file, const knobs *k)
         sb_le(&c.rec, 42, 4);
         cr_record(&c, 9, k->optional_rec ? 1 : 0);
     }
-    int64_t ts2[2] = {k->unordered_chunks ? T0 + 1500 : T0 + 3000, T0 + 4000};
+    /* past the range only in the last chunk of f, where no later row is out of order because of it */
+    int64_t ts2[2] = {k->unordered_chunks ? T0 + 1500 : T0 + 3000, k->out_of_range ? CR_TO : T0 + 4000};
     uint8_t valid = 0x2; /* the first row null */
     cr_chunk(&c, 4, ts2, fv, &valid, 2, 0);
     if (k->seq_skip)
@@ -1252,6 +1253,7 @@ static void test_crafted(void)
     craft_refused(&(knobs){.unordered = true}, "out of order", "times out of order in a chunk");
     craft_refused(&(knobs){.unordered_chunks = true}, "out of order", "times out of order across chunks");
     craft_refused(&(knobs){.out_of_range = true}, "out of range", "time past the header's range");
+    craft_refused(&(knobs){.before_range = true}, "out of range", "time before the header's range");
     craft_refused(&(knobs){.null_f32 = true}, "reserved for null", "float32 null bits as a value");
     craft_refused(&(knobs){.null_i64 = true}, "reserved for null", "INT64_MIN as a value");
     craft_refused(&(knobs){.bool2 = true}, "reserved for null", "bool 2");
@@ -1330,6 +1332,10 @@ static void test_crafted(void)
     d = open_db(rp, true);
     CHECK(rows_of(d, "f") == 6); /* the row inside the range replaced, the one after it kept */
     CHECK(tsdb_get_retention(d, lookup(d, "f"), &keep) == 0 && keep == 0);
+    tsdb_close(d);
+    d = open_db(rp, false); /* the row inside the range again: the batched path must delete it too */
+    insert(d, lookup(d, "f"), TSDB_FLOAT32, old_ts, old_v, NULL, 1);
+    CHECK(rows_of(d, "f") == 7);
     tsdb_close(d);
     CHECK(RUN(NULL, NULL, rp, "import", f, "--replace", "--batch-rows", "2") == 0);
     d = open_db(rp, true);
