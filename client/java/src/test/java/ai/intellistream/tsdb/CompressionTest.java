@@ -177,13 +177,20 @@ class CompressionTest {
         final List<Frame> frames = Collections.synchronizedList(new ArrayList<>());
         final Thread thread;
         final Function<Frame, byte[]> replies;
+        final Function<Frame, Integer> statuses;
 
         FakeServer(int version) throws IOException {
             this(version, f -> null);
         }
 
         FakeServer(int version, Function<Frame, byte[]> replies) throws IOException {
+            this(version, replies, f -> 0);
+        }
+
+        /** {@code statuses} gives the status of each reply after HELLO; a reply with a status other than 0 is empty. */
+        FakeServer(int version, Function<Frame, byte[]> replies, Function<Frame, Integer> statuses) throws IOException {
             this.replies = replies;
+            this.statuses = statuses;
             listener = ServerSocketChannel.open().bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
             thread = new Thread(() -> serve(version), "fake-tsdbd");
             thread.setDaemon(true);
@@ -208,13 +215,14 @@ class CompressionTest {
                     p.flip();
                     Frame f = new Frame(op, p);
                     frames.add(f);
-                    byte[] body = op == Protocol.OP_HELLO ? null : replies.apply(f);
+                    int status = op == Protocol.OP_HELLO ? 0 : statuses.apply(f);
+                    byte[] body = op == Protocol.OP_HELLO || status != 0 ? null : replies.apply(f);
                     if (op == Protocol.OP_HELLO)
                         body = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(version).array();
                     else if (body == null)
                         body = new byte[0];
                     ByteBuffer r = ByteBuffer.allocate(13 + body.length).order(ByteOrder.LITTLE_ENDIAN);
-                    r.putInt(9 + body.length).putInt(id).put(Protocol.OP_REPLY).putInt(0).put(body);
+                    r.putInt(9 + body.length).putInt(id).put(Protocol.OP_REPLY).putInt(status).put(body);
                     r.flip();
                     while (r.hasRemaining())
                         s.write(r);

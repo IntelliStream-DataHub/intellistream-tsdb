@@ -45,6 +45,7 @@ VALUE_TYPES: list[str]
 
 _Order = Literal["asc", "desc"]
 _Unit = Literal["second", "minute", "hour", "day", "week", "month", "quarter", "year"]
+_TwaMethod = Literal["step", "linear"]
 # Columns: a numpy array or array.array of the right element type (copied
 # without iterating), or any sequence of numbers.
 _Timestamps = Buffer | Sequence[int]
@@ -142,6 +143,21 @@ class Bucket:
     @property
     def avg(self) -> float:
         """The mean, sum / count (0 for an empty bucket)."""
+    @property
+    def range(self) -> float:
+        """max - min (spread queries only; AttributeError otherwise)."""
+    @property
+    def var_pop(self) -> float:
+        """Population variance (spread queries only). NaN when count is 0."""
+    @property
+    def var_samp(self) -> float:
+        """Sample variance (spread queries only). NaN when count is below 2."""
+    @property
+    def stddev_pop(self) -> float:
+        """Population standard deviation (spread queries only)."""
+    @property
+    def stddev_samp(self) -> float:
+        """Sample standard deviation (spread queries only)."""
 
 @final
 class Buckets(Sequence[Bucket]):
@@ -154,7 +170,10 @@ class Buckets(Sequence[Bucket]):
     min, max, avg, isum, imin, imax, and counts for the counts (count() is the
     sequence method): ``b = db.query_agg(s, start, end, 60_000);
     b.counts.sum(); b.max.max()``. Reading a column copies it out of the
-    result; keep it in a variable rather than reading it in a loop.
+    result; keep it in a variable rather than reading it in a loop. The
+    buckets of the spread queries (query_spread*()) have five more columns:
+    range, var_pop, var_samp, stddev_pop and stddev_samp; on other buckets
+    reading them raises AttributeError.
     """
 
     @property
@@ -184,6 +203,21 @@ class Buckets(Sequence[Bucket]):
     @property
     def avg(self) -> Any:
         """Means, sum / count (0 for a bucket of nulls only) (float64)."""
+    @property
+    def range(self) -> Any:
+        """max - min (float64; spread queries only)."""
+    @property
+    def var_pop(self) -> Any:
+        """Population variances (float64; spread queries only)."""
+    @property
+    def var_samp(self) -> Any:
+        """Sample variances (float64; spread queries only)."""
+    @property
+    def stddev_pop(self) -> Any:
+        """Population standard deviations (float64; spread queries only)."""
+    @property
+    def stddev_samp(self) -> Any:
+        """Sample standard deviations (float64; spread queries only)."""
     def count(self, value: Any) -> int:
         """Number of buckets equal to `value` (the sequence method; the column is counts)."""
     def index(self, value: Any, start: int = 0, stop: int = ...) -> int:
@@ -224,6 +258,69 @@ class BucketsMany(Sequence[Buckets]):
     def __getitem__(self, i: int) -> Buckets: ...
     @overload
     def __getitem__(self, i: slice) -> list[Buckets]: ...
+
+@final
+class TwaBucket:
+    """One bucket of a time-weighted average (query_twa*()).
+
+    The value is weighted by how long it held: area is its integral over
+    time (value x ms), covered_ms the time the segments cover, and twa
+    area / covered_ms (NaN when nothing is covered). count is the number of
+    known readings in the bucket. Equal when every field is (floats bit for bit).
+    """
+
+    @property
+    def start(self) -> int:
+        """Start of the bucket, ms since the epoch (UTC); for a single bucket over
+        the whole range, the start of the range.
+        """
+    @property
+    def twa(self) -> float:
+        """The time-weighted average, area / covered_ms (NaN when nothing is covered)."""
+    @property
+    def area(self) -> float:
+        """The integral of the value over time, in value x ms."""
+    @property
+    def covered_ms(self) -> int:
+        """The time covered by segments, in ms."""
+    @property
+    def count(self) -> int:
+        """Known readings in the bucket (and in the query's range)."""
+
+@final
+class TwaBuckets(Sequence[TwaBucket]):
+    """The buckets of a time-weighted average query, a column per field.
+
+    A sequence of TwaBucket (len(), indexing, slicing, iteration, == with
+    another TwaBuckets or a list of TwaBucket), and a numpy array per field
+    over all buckets (a list without numpy): start, twa, area, covered_ms
+    and counts (count() is the sequence method).
+    """
+
+    @property
+    def start(self) -> Any:
+        """Bucket starts, ms since the epoch (int64)."""
+    @property
+    def twa(self) -> Any:
+        """Time-weighted averages (float64; NaN where nothing is covered)."""
+    @property
+    def area(self) -> Any:
+        """Integrals of the value over time, value x ms (float64)."""
+    @property
+    def covered_ms(self) -> Any:
+        """Time covered by segments, ms (int64)."""
+    @property
+    def counts(self) -> Any:
+        """Known readings per bucket (uint64)."""
+    def count(self, value: Any) -> int:
+        """Number of buckets equal to `value` (the sequence method; the column is counts)."""
+    def index(self, value: Any, start: int = 0, stop: int = ...) -> int:
+        """Position of the first bucket equal to `value`; ValueError if there is none."""
+    def __len__(self) -> int: ...
+    @overload
+    def __getitem__(self, i: int) -> TwaBucket: ...
+    @overload
+    def __getitem__(self, i: slice) -> TwaBuckets: ...
 
 @final
 class Stats:
@@ -596,7 +693,14 @@ class Client:
             bool or uint32 (state codes). Without: two lists, None for nulls.
         """
     def query_agg(
-        self, series: int, start: int | None = None, end: int | None = None, interval_ms: int = 0
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        interval_ms: int = 0,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
     ) -> Buckets:
         """Aggregates a series into buckets of a fixed length.
 
@@ -606,10 +710,12 @@ class Client:
             end: Timestamp to stop before (ms); None for no upper limit.
             interval_ms: Bucket length in ms; buckets start at multiples of it
                 since the epoch. 0 gives one bucket for the whole range.
+            order: "asc" (oldest first) or "desc" (newest first).
+            limit: At most this many buckets; None for all, 0 for none.
 
         Returns:
-            Buckets, oldest first: a sequence of Bucket with a numpy array per
-            field (b.counts, b.sum, ...); empty buckets are left out.
+            Buckets: a sequence of Bucket with a numpy array per field
+            (b.counts, b.sum, ...); empty buckets are left out.
 
         Raises:
             TsdbError: ERR_INVALID for a negative interval, ERR_TOO_MANY_BUCKETS
@@ -692,6 +798,167 @@ class Client:
         Raises:
             TsdbError: ERR_INVALID if bounds is empty or does not increase, or
                 from a server older than version 4.
+        """
+    def query_spread(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        interval_ms: int = 0,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> Buckets:
+        """Count, sum, min and max like query_agg(), and the spread of the values
+        in each bucket: range (max - min), population and sample variance and
+        standard deviation (protocol version 8).
+
+        Takes the arguments of query_agg(). The variance is computed from the
+        granule statistics where whole granules fall in a bucket, so it costs
+        about what query_agg() does.
+
+        Returns:
+            Buckets with the columns range, var_pop, var_samp, stddev_pop and
+            stddev_samp beside the usual ones (and Bucket objects with those
+            fields). Variances are NaN for a bucket of nulls only, the sample
+            ones also for a single value.
+
+        Raises:
+            TsdbError: ERR_INVALID for a negative interval or from a server
+                older than version 8 (the client does not send the request).
+        """
+    def query_spread_group(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> Buckets:
+        """The spread by calendar periods: query_group() with the columns of
+        query_spread(). Takes the arguments of query_group().
+        """
+    def query_spread_bounds(
+        self,
+        series: int,
+        bounds: _Timestamps,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> Buckets:
+        """The spread in buckets that start at the given times: query_bounds()
+        with the columns of query_spread(). Takes the arguments of query_bounds().
+        """
+    def query_twa(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        interval_ms: int = 0,
+        *,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> TwaBuckets:
+        """Time-weighted averages: each reading weighted by how long it held
+        (protocol version 6; order and limit need no newer server).
+
+        A reading made once an hour counts as much as an hour of readings made
+        every second. Use it for values sampled irregularly or on change.
+
+        Args:
+            series: The series id.
+            start: First timestamp to include (ms); None for no lower limit.
+            end: Timestamp to stop before (ms); None for no upper limit.
+            interval_ms: Bucket length in ms; 0 gives one bucket for the range.
+            method: "step" (a value holds until the next reading) or "linear"
+                (a straight line between readings).
+            max_gap_ms: A gap between readings longer than this covers nothing
+                (the value is stale there); 0 for no limit.
+            order: "asc" (oldest first) or "desc" (newest first).
+            limit: At most this many buckets; None for all, 0 for none.
+
+        Returns:
+            TwaBuckets: a sequence of TwaBucket with numpy columns start,
+            twa, area, covered_ms and counts.
+
+        Raises:
+            TsdbError: ERR_INVALID for a negative interval or a server older
+                than version 6.
+            ValueError: Unknown method or order.
+        """
+    def query_twa_group(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> TwaBuckets:
+        """Time-weighted averages by calendar periods (days in a time zone, ...).
+        Takes the arguments of query_group() and method and max_gap_ms of query_twa().
+        """
+    def query_twa_bounds(
+        self,
+        series: int,
+        bounds: _Timestamps,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> TwaBuckets:
+        """Time-weighted averages in buckets that start at the given times.
+        Takes the arguments of query_bounds() and method and max_gap_ms of query_twa().
+        """
+    def query_lttb(
+        self,
+        series: int,
+        threshold: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        numpy: bool | None = None,
+    ) -> tuple[Any, Any]:
+        """Downsamples a series for a chart: at most threshold rows that keep the
+        shape of the line (Largest-Triangle-Three-Buckets; protocol version 5).
+
+        The first and last rows are always kept; a range of threshold rows or
+        fewer comes back whole.
+
+        Args:
+            series: The series id.
+            threshold: How many rows to keep at most, at least 3.
+            start: First timestamp to include (ms); None for no lower limit.
+            end: Timestamp to stop before (ms); None for no upper limit.
+            order: "asc" (oldest first) or "desc" (newest first): the same
+                rows, in that order.
+            limit: At most this many of the chosen rows; None for all.
+            numpy: As for query_values().
+
+        Returns:
+            (timestamps, values), as query_values() returns them.
+
+        Raises:
+            TsdbError: ERR_INVALID from a server older than version 5, or
+                older than 9 with order="desc" or a limit.
         """
     def delete_range(self, series: int, start: int | None, end: int | None) -> None:
         """Deletes the rows of a series with start <= ts < end (protocol version 7).
@@ -949,11 +1216,19 @@ class Db:
         or a list with None for nulls; the arguments are those of query_raw().
         """
     def query_agg(
-        self, series: int, start: int | None = None, end: int | None = None, interval_ms: int = 0
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        interval_ms: int = 0,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
     ) -> Buckets:
         """Aggregates a series: one bucket per interval_ms, or one for the whole
         range when interval_ms is 0, as Buckets (a sequence of Bucket with
-        numpy columns). Empty buckets are left out.
+        numpy columns), oldest first or newest first with order="desc", at
+        most limit of them. Empty buckets are left out.
         """
     def query_group(
         self,
@@ -986,6 +1261,188 @@ class Db:
         limit: int | None = None,
     ) -> Buckets:
         """Aggregates a series into buckets between ascending bounds (ms)."""
+    def query_spread(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        interval_ms: int = 0,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> Buckets:
+        """Count, sum, min and max like query_agg(), and the spread of the values
+        in each bucket: range (max - min), population and sample variance and
+        standard deviation.
+
+        Takes the arguments of query_agg(). The variance is computed from the
+        granule statistics where whole granules fall in a bucket, so it costs
+        about what query_agg() does.
+
+        Returns:
+            Buckets with the columns range, var_pop, var_samp, stddev_pop and
+            stddev_samp beside the usual ones (and Bucket objects with those
+            fields). Variances are NaN for a bucket of nulls only, the sample
+            ones also for a single value.
+
+        Raises:
+            TsdbError: ERR_INVALID for a negative interval.
+        """
+    def query_spread_group(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> Buckets:
+        """The spread by calendar periods: query_group() with the columns of
+        query_spread(). Takes the arguments of query_group().
+        """
+    def query_spread_bounds(
+        self,
+        series: int,
+        bounds: _Timestamps,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> Buckets:
+        """The spread in buckets that start at the given times: query_bounds()
+        with the columns of query_spread(). Takes the arguments of query_bounds().
+        """
+    def query_twa(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        interval_ms: int = 0,
+        *,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> TwaBuckets:
+        """Time-weighted averages: each reading weighted by how long it held.
+
+        A reading made once an hour counts as much as an hour of readings made
+        every second. Use it for values sampled irregularly or on change.
+
+        Args:
+            series: The series id.
+            start: First timestamp to include (ms); None for no lower limit.
+            end: Timestamp to stop before (ms); None for no upper limit.
+            interval_ms: Bucket length in ms; 0 gives one bucket for the range.
+            method: "step" (a value holds until the next reading) or "linear"
+                (a straight line between readings).
+            max_gap_ms: A gap between readings longer than this covers nothing
+                (the value is stale there); 0 for no limit.
+            order: "asc" (oldest first) or "desc" (newest first).
+            limit: At most this many buckets; None for all, 0 for none.
+
+        Returns:
+            TwaBuckets: a sequence of TwaBucket with numpy columns start,
+            twa, area, covered_ms and counts.
+
+        Raises:
+            TsdbError: ERR_INVALID for a negative interval.
+            ValueError: Unknown method or order.
+        """
+    def query_twa_group(
+        self,
+        series: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> TwaBuckets:
+        """Time-weighted averages by calendar periods (days in a time zone, ...).
+        Takes the arguments of query_group() and method and max_gap_ms of query_twa().
+        """
+    def query_twa_bounds(
+        self,
+        series: int,
+        bounds: _Timestamps,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+    ) -> TwaBuckets:
+        """Time-weighted averages in buckets that start at the given times.
+        Takes the arguments of query_bounds() and method and max_gap_ms of query_twa().
+        """
+    def query_lttb(
+        self,
+        series: int,
+        threshold: int,
+        start: int | None = None,
+        end: int | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        numpy: bool | None = None,
+    ) -> tuple[Any, Any]:
+        """Downsamples a series for a chart: at most threshold rows that keep the
+        shape of the line (Largest-Triangle-Three-Buckets).
+
+        The first and last rows are always kept; a range of threshold rows or
+        fewer comes back whole.
+
+        Args:
+            series: The series id.
+            threshold: How many rows to keep at most, at least 3.
+            start: First timestamp to include (ms); None for no lower limit.
+            end: Timestamp to stop before (ms); None for no upper limit.
+            order: "asc" (oldest first) or "desc" (newest first): the same
+                rows, in that order.
+            limit: At most this many of the chosen rows; None for all.
+            numpy: As for query_values().
+
+        Returns:
+            (timestamps, values), as query_values() returns them.
+        """
+    def delete_range(self, series: int, start: int | None, end: int | None) -> None:
+        """Deletes the rows of a series with start <= ts < end; None is unbounded.
+        A row inserted after the call returned is kept.
+        """
+    def replace_range(
+        self,
+        series: int,
+        start: int | None,
+        end: int | None,
+        ts: _Timestamps,
+        values: Any,
+        *,
+        value_type: _ValueType | None = None,
+    ) -> None:
+        """Replaces the rows of a series with start <= ts < end by ts and values,
+        atomically, as Client.replace_range() does. No rows make it a delete.
+
+        Raises:
+            TsdbError: ERR_INVALID for a timestamp outside the range or a
+                value_type other than the series'.
+        """
+    def set_retention(self, series: int, limit_ms: int) -> None:
+        """Sets how long a series keeps its rows, in ms; 0 keeps them for ever.
+        Rows older than the clock minus limit_ms disappear from queries at
+        once and from disk as merges get to them.
+        """
+    def retention(self, series: int) -> int:
+        """Returns the retention limit of a series in ms, 0 for none."""
     def query_raw_many(
         self,
         series: _SeriesIds,

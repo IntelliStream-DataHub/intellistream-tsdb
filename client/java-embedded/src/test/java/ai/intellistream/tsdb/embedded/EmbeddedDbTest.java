@@ -7,8 +7,11 @@ import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.QueryStats;
 import ai.intellistream.tsdb.Stats;
+import ai.intellistream.tsdb.SpreadBucket;
 import ai.intellistream.tsdb.Status;
 import ai.intellistream.tsdb.TsdbException;
+import ai.intellistream.tsdb.TwaBucket;
+import ai.intellistream.tsdb.TwaOptions;
 import ai.intellistream.tsdb.Unit;
 import ai.intellistream.tsdb.ValuePoints;
 import ai.intellistream.tsdb.ValueType;
@@ -319,6 +322,137 @@ class EmbeddedDbTest {
     }
 
     @Test
+    void spreadTwaAndLttb() throws TsdbException {
+        int s = db.seriesCreate("sp", ValueType.FLOAT64);
+        db.insertSeriesValues(s, new long[] {T0, T0 + 1000, T0 + 2000, T0 + 3000}, Column.ofDoubles(1, 2, 3, 4));
+        SpreadBucket all = db.querySpread(s, T0, T0 + 4000, 0).get(0);
+        assertEquals(4, all.bucket().count());
+        assertEquals(3, all.range());
+        assertEquals(1.25, all.varPop(), 1e-12);
+        assertEquals(5.0 / 3, all.varSamp(), 1e-12);
+        assertEquals(Math.sqrt(1.25), all.stddevPop(), 1e-12);
+        List<SpreadBucket> last = db.querySpread(s, T0, T0 + 4000, 2000, Order.DESC, 1);
+        assertEquals(1, last.size());
+        assertEquals(T0 + 2000, last.get(0).bucket().start());
+        assertEquals(0.25, last.get(0).varPop(), 1e-12);
+        assertEquals(db.querySpread(s, T0, T0 + 4000, 2000), db.querySpreadBounds(s, T0, T0 + 4000,
+                new long[] {T0, T0 + 2000}, Order.ASC, 0));
+        assertEquals(db.querySpread(s, T0, T0 + 4000, 0).get(0).bucket(), db.queryAgg(s, T0, T0 + 4000, 0).get(0));
+        assertEquals(1, db.querySpreadGroup(s, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY).in("Europe/Oslo"),
+                Order.ASC, 0).size());
+        assertEquals(Status.ERR_INVALID, status(() -> db.querySpreadBounds(s, T0, T0 + 1, new long[] {5, 5},
+                Order.ASC, 0)));
+        assertThrows(IllegalArgumentException.class, () -> db.querySpreadBounds(s, T0, T0 + 1, new long[0],
+                Order.ASC, 0));
+        assertThrows(IllegalArgumentException.class, () -> db.querySpread(s, T0, T0 + 1, 0, Order.ASC, -1));
+
+        int t = db.seriesCreate("tw", ValueType.FLOAT64);
+        db.insertSeriesValues(t, new long[] {T0, T0 + 1000, T0 + 3000}, Column.ofDoubles(0, 10, 10));
+        TwaBucket step = db.queryTwa(t, T0, T0 + 3000, 0, TwaOptions.step()).get(0);
+        assertEquals(20_000, step.area(), 1e-9);
+        assertEquals(3000, step.coveredMs());
+        assertEquals(2, step.count());
+        assertEquals(20.0 / 3, step.twa(), 1e-12);
+        assertEquals(25_000, db.queryTwa(t, T0, T0 + 3000, 0, TwaOptions.linear()).get(0).area(), 1e-9);
+        TwaBucket gap = db.queryTwa(t, T0, T0 + 3000, 0, TwaOptions.step().maxGap(1500)).get(0);
+        assertEquals(1000, gap.coveredMs(), "the 2 s segment is stale");
+        List<TwaBucket> desc = db.queryTwa(t, T0, T0 + 3000, 1000, TwaOptions.step().order(Order.DESC).limit(2));
+        assertEquals(List.of(T0 + 2000, T0 + 1000), desc.stream().map(TwaBucket::start).toList());
+        assertEquals(db.queryTwa(t, T0, T0 + 3000, 1000, TwaOptions.linear()),
+                db.queryTwaBounds(t, T0, T0 + 3000, new long[] {T0, T0 + 1000, T0 + 2000}, TwaOptions.linear()));
+        assertEquals(db.queryTwa(t, T0, T0 + 3000, 0, TwaOptions.linear()),
+                db.queryTwaGroup(t, T0, T0 + 3000, null, TwaOptions.linear()));
+        assertEquals(1, db.queryTwaGroup(t, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY).in("Asia/Tokyo"),
+                TwaOptions.step()).size());
+        int st = db.seriesCreate("st", ValueType.STATE);
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryTwa(st, T0, T0 + 1, 0, TwaOptions.step())));
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryTwa(t, T0, T0 + 1, -1, TwaOptions.step())));
+
+        int l = db.series("lt");
+        long[] ts = new long[1000];
+        float[] v = new float[1000];
+        for (int i = 0; i < ts.length; i++) {
+            ts[i] = T0 + i * 1000L;
+            v[i] = (float) Math.sin(i / 30.0);
+        }
+        db.insert(l, ts, v);
+        ValuePoints p = db.queryLttb(l, Long.MIN_VALUE, Long.MAX_VALUE, 50);
+        assertEquals(50, p.size());
+        assertEquals(ts[0], p.timestamps()[0]);
+        assertEquals(ts[999], p.timestamps()[49]);
+        ValuePoints newest = db.queryLttb(l, Long.MIN_VALUE, Long.MAX_VALUE, 50, Order.DESC, 10);
+        assertEquals(10, newest.size());
+        for (int i = 0; i < 10; i++) {
+            assertEquals(p.timestamps()[49 - i], newest.timestamps()[i]);
+            assertEquals(p.values().getDouble(49 - i), newest.values().getDouble(i));
+        }
+        assertEquals(1000, db.queryLttb(l, Long.MIN_VALUE, Long.MAX_VALUE, 5000).size(), "fewer points than asked");
+        assertEquals(1000, db.queryLttb(l, Long.MIN_VALUE, Long.MAX_VALUE, -1).size(), "as tsdbd: a huge size_t");
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryLttb(l, T0, T0 + 1, 2)));
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryLttb(st, T0, T0 + 1, 10)));
+        assertEquals(0, db.queryLttb(l, 0, 1, 10).size());
+        /* as tsdbd and the Rust Db: the threshold first, then an unknown series has no points */
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryLttb(987_654, T0, T0 + 1, 2)));
+        ValuePoints none = db.queryLttb(987_654, Long.MIN_VALUE, Long.MAX_VALUE, 10, Order.DESC, 3);
+        assertEquals(0, none.size());
+        assertEquals(ValueType.FLOAT32, none.values().type());
+
+        List<Bucket> asc = db.queryAgg(l, T0, T0 + 1_000_000, 60_000);
+        List<Bucket> top = db.queryAgg(l, T0, T0 + 1_000_000, 60_000, Order.DESC, 3);
+        assertEquals(List.of(asc.get(asc.size() - 1), asc.get(asc.size() - 2), asc.get(asc.size() - 3)), top);
+        assertEquals(asc.subList(0, 2), db.queryAgg(l, T0, T0 + 1_000_000, 60_000, Order.ASC, 2));
+    }
+
+    @Test
+    void deleteReplaceAndRetention() throws TsdbException {
+        int s = db.seriesCreate("d", ValueType.INT64);
+        long[] ts = new long[10];
+        long[] v = new long[10];
+        for (int i = 0; i < 10; i++) {
+            ts[i] = T0 + i * 1000L;
+            v[i] = i;
+        }
+        db.insertSeriesValues(s, ts, Column.ofLongs(v));
+        db.deleteRange(s, T0 + 2000, T0 + 5000);
+        ValuePoints left = db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE);
+        assertArrayEquals(new long[] {ts[0], ts[1], ts[5], ts[6], ts[7], ts[8], ts[9]}, left.timestamps());
+        assertEquals(7, db.queryAgg(s, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0).count());
+        db.deleteRange(s, T0 + 9000, T0 + 1000); /* start >= end deletes nothing */
+        assertEquals(7, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
+        db.insertSeriesValues(s, new long[] {T0 + 3000}, Column.ofLongs(33)); /* a write after the delete is seen */
+        assertEquals(8, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
+
+        db.replaceRange(s, T0, T0 + 6000, new long[] {T0 + 500, T0 + 5999}, Column.ofLongs(-1, -2)
+                .withNulls(BitSet.valueOf(new long[] {2})));
+        ValuePoints r = db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE);
+        assertArrayEquals(new long[] {T0 + 500, T0 + 5999, ts[6], ts[7], ts[8], ts[9]}, r.timestamps());
+        assertEquals(-1, r.values().longs()[0]);
+        assertTrue(r.values().isNull(1), "a null replaces like a value");
+        db.replaceRange(s, T0 + 9000, T0 + 10_000, new long[0], Column.ofLongs()); /* no rows: a delete */
+        assertEquals(5, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
+        assertEquals(Status.ERR_INVALID, status(() -> db.replaceRange(s, T0, T0 + 10, new long[] {T0 + 10},
+                Column.ofLongs(1))));
+        assertEquals(Status.ERR_INVALID, status(() -> db.replaceRange(s, T0, T0 + 10, new long[] {T0},
+                Column.ofDoubles(1))));
+        assertThrows(IllegalArgumentException.class, () -> db.replaceRange(s, T0, T0 + 10, new long[] {T0, T0 + 1},
+                Column.ofLongs(1)));
+        assertEquals(5, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size(), "a refused replace changes nothing");
+
+        assertEquals(0, db.retention(s));
+        db.setRetention(s, 1000); /* the rows are from 2024: all expired */
+        assertEquals(1000, db.retention(s));
+        assertEquals(0, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
+        db.setRetention(s, 0); /* merges have not removed them yet */
+        assertEquals(5, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
+        assertEquals(Status.ERR_INVALID, status(() -> db.setRetention(s, -1)));
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.retention(12345)));
+        db.close();
+        db = EmbeddedDb.open(tmp.resolve("db").toString(), new EmbeddedOptions().readOnly(true));
+        assertEquals(Status.ERR_READONLY, status(() -> db.deleteRange(s, T0, T0 + 1)));
+        assertEquals(5, db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).size(), "durable");
+    }
+
+    @Test
     void groupInUtcAndInZones() throws TsdbException {
         int s = db.series("x");
         int n = 24 * 400; /* hourly for 400 days: DST changes both ways, month and year ends */
@@ -356,6 +490,17 @@ class EmbeddedDbTest {
                         Group.of(u).in(z).bounds(T0, T0 + 400 * 86_400_000L), z + " " + u);
             }
         }
+        /* more local periods than the calendar computes (64 Mi seconds is 777 days): TOO_MANY_BUCKETS from every
+         * grouped call, as from the TCP clients */
+        int wide = db.series("wide");
+        db.insert(wide, new long[] {T0, T0 + 800 * 86_400_000L}, new float[] {1, 2});
+        Group secs = Group.of(Unit.SECOND).in("Europe/Oslo");
+        assertEquals(Status.ERR_TOO_MANY_BUCKETS, status(() -> db.queryGroup(wide, Long.MIN_VALUE, Long.MAX_VALUE,
+                secs)));
+        assertEquals(Status.ERR_TOO_MANY_BUCKETS, status(() -> db.querySpreadGroup(wide, Long.MIN_VALUE,
+                Long.MAX_VALUE, secs, Order.ASC, 0)));
+        assertEquals(Status.ERR_TOO_MANY_BUCKETS, status(() -> db.queryTwaGroup(wide, Long.MIN_VALUE, Long.MAX_VALUE,
+                secs, TwaOptions.step())));
         int empty = db.series("empty");
         assertEquals(0, db.queryGroup(empty, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY).in("Europe/Oslo"))
                 .size());

@@ -25,6 +25,9 @@ fn structs_match_the_c_header() {
         tsdb_bucket { start, count, sum, min, max, isum, imin, imax }
         tsdb_query_opts { order, limit }
         tsdb_group { unit, count, timezone }
+        tsdb_spread_bucket { b, range, var_pop, var_samp, stddev_pop, stddev_samp }
+        tsdb_twa_opts { method, max_gap_ms, order, limit, no_stats }
+        tsdb_twa_bucket { start, twa, area, covered_ms, count }
         tsdb_query_stats { elapsed_s, rows, rows_decoded, rows_from_stats, memtable_rows, bytes, bytes_read, parts,
             granules, granules_from_stats, result_rows }
         tsdb_stats { parts, partitions, rows, bytes, merges, merged_rows, passthrough_granules, memtable_rows,
@@ -34,6 +37,7 @@ fn structs_match_the_c_header() {
     rust.push(("tsdb_type", "sizeof", size_of::<tsdb_type>()));
     rust.push(("tsdb_order", "sizeof", size_of::<tsdb_order>()));
     rust.push(("tsdb_unit", "sizeof", size_of::<tsdb_unit>()));
+    rust.push(("tsdb_twa_method", "sizeof", size_of::<tsdb_twa_method>()));
     let c = unsafe {
         let mut n = 0;
         let p = layout::tsdb_sys_layout(&mut n);

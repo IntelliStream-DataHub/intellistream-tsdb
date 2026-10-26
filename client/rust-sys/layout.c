@@ -22,6 +22,12 @@ static const size_t layout[] = {
     O(tsdb_bucket, max), O(tsdb_bucket, isum), O(tsdb_bucket, imin), O(tsdb_bucket, imax),
     S(tsdb_query_opts), O(tsdb_query_opts, order), O(tsdb_query_opts, limit),
     S(tsdb_group), O(tsdb_group, unit), O(tsdb_group, count), O(tsdb_group, timezone),
+    S(tsdb_spread_bucket), O(tsdb_spread_bucket, b), O(tsdb_spread_bucket, range), O(tsdb_spread_bucket, var_pop),
+    O(tsdb_spread_bucket, var_samp), O(tsdb_spread_bucket, stddev_pop), O(tsdb_spread_bucket, stddev_samp),
+    S(tsdb_twa_opts), O(tsdb_twa_opts, method), O(tsdb_twa_opts, max_gap_ms), O(tsdb_twa_opts, order),
+    O(tsdb_twa_opts, limit), O(tsdb_twa_opts, no_stats),
+    S(tsdb_twa_bucket), O(tsdb_twa_bucket, start), O(tsdb_twa_bucket, twa), O(tsdb_twa_bucket, area),
+    O(tsdb_twa_bucket, covered_ms), O(tsdb_twa_bucket, count),
     S(tsdb_query_stats), O(tsdb_query_stats, elapsed_s), O(tsdb_query_stats, rows), O(tsdb_query_stats, rows_decoded),
     O(tsdb_query_stats, rows_from_stats), O(tsdb_query_stats, memtable_rows), O(tsdb_query_stats, bytes),
     O(tsdb_query_stats, bytes_read), O(tsdb_query_stats, parts), O(tsdb_query_stats, granules),
@@ -32,7 +38,7 @@ static const size_t layout[] = {
     S(tsdb_part_info), O(tsdb_part_info, name), O(tsdb_part_info, partition), O(tsdb_part_info, min_ts),
     O(tsdb_part_info, max_ts), O(tsdb_part_info, rows), O(tsdb_part_info, bytes), O(tsdb_part_info, granules),
     O(tsdb_part_info, level), O(tsdb_part_info, created_s), O(tsdb_part_info, written_s),
-    S(tsdb_type), S(tsdb_order), S(tsdb_unit),
+    S(tsdb_type), S(tsdb_order), S(tsdb_unit), S(tsdb_twa_method),
 };
 
 const size_t *tsdb_sys_layout(size_t *n)

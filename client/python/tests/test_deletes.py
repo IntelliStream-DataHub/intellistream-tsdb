@@ -17,8 +17,11 @@ def invalid(fn, *args, **kw):
     return e.value.code == tsdb_client.ERR_INVALID
 
 
-def test_delete_and_replace(server, client):
+def test_the_server_speaks_version_7(client):
     assert client.protocol_version() >= 7
+
+
+def test_delete_and_replace(client):
     sid = client.series_create("d", "int64")
     ts = [T0 + k * 1000 for k in range(10)]
     client.insert_series_values(sid, ts, list(range(10)))
@@ -46,7 +49,7 @@ def test_delete_and_replace(server, client):
     assert client.query_values(sid, numpy=False) == ([], [])
 
 
-def test_retention(server, client):
+def test_retention(client):
     sid = client.series_create("r", "float64")
     assert client.retention(sid) == 0
     now = int(time.time() * 1000)

@@ -165,6 +165,47 @@ pub struct tsdb_group {
     pub timezone: *const c_char,
 }
 
+/// A bucket and the spread of its known values (`tsdb_query_spread*`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tsdb_spread_bucket {
+    pub b: tsdb_bucket,
+    /// max - min.
+    pub range: f64,
+    pub var_pop: f64,
+    pub var_samp: f64,
+    pub stddev_pop: f64,
+    pub stddev_samp: f64,
+}
+
+pub type tsdb_twa_method = c_int;
+pub const TSDB_TWA_STEP: tsdb_twa_method = 0;
+pub const TSDB_TWA_LINEAR: tsdb_twa_method = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tsdb_twa_opts {
+    pub method: tsdb_twa_method,
+    /// 0: no staleness limit.
+    pub max_gap_ms: i64,
+    /// Of the buckets.
+    pub order: tsdb_order,
+    /// 0: no limit.
+    pub limit: usize,
+    /// Nonzero: decode every granule, never its statistics.
+    pub no_stats: c_int,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct tsdb_twa_bucket {
+    pub start: i64,
+    pub twa: f64,
+    pub area: f64,
+    pub covered_ms: i64,
+    pub count: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct tsdb_query_stats {
@@ -330,6 +371,111 @@ unsafe extern "C" {
         nout: *mut usize,
     ) -> c_int;
 
+    pub fn tsdb_query_agg_ex(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        interval_ms: i64,
+        opts: *const tsdb_query_opts,
+        out: *mut *mut tsdb_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_query_lttb(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        threshold: usize,
+        f: tsdb_values_fn,
+        ctx: *mut c_void,
+    ) -> c_int;
+    pub fn tsdb_query_lttb_ex(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        threshold: usize,
+        opts: *const tsdb_query_opts,
+        f: tsdb_values_fn,
+        ctx: *mut c_void,
+    ) -> c_int;
+    pub fn tsdb_query_spread(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        interval_ms: i64,
+        opts: *const tsdb_query_opts,
+        out: *mut *mut tsdb_spread_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_query_spread_group(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        group: *const tsdb_group,
+        opts: *const tsdb_query_opts,
+        out: *mut *mut tsdb_spread_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_query_spread_bounds(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        bounds: *const i64,
+        n: usize,
+        opts: *const tsdb_query_opts,
+        out: *mut *mut tsdb_spread_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_query_twa(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        interval_ms: i64,
+        opts: *const tsdb_twa_opts,
+        out: *mut *mut tsdb_twa_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_query_twa_group(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        group: *const tsdb_group,
+        opts: *const tsdb_twa_opts,
+        out: *mut *mut tsdb_twa_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_query_twa_bounds(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        bounds: *const i64,
+        n: usize,
+        opts: *const tsdb_twa_opts,
+        out: *mut *mut tsdb_twa_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+
+    pub fn tsdb_delete_range(db: *mut tsdb, series: u32, start: i64, end: i64) -> c_int;
+    pub fn tsdb_replace_range(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        ts: *const i64,
+        values: *const tsdb_values,
+        n: usize,
+    ) -> c_int;
+    pub fn tsdb_set_retention(db: *mut tsdb, series: u32, limit_ms: i64) -> c_int;
+    pub fn tsdb_get_retention(db: *mut tsdb, series: u32, limit_ms: *mut i64) -> c_int;
+
     /// What the calling thread's last query did.
     pub fn tsdb_last_query_stats(out: *mut tsdb_query_stats);
 
@@ -360,6 +506,26 @@ unsafe extern "C" {
         group: *const tsdb_group,
         opts: *const tsdb_query_opts,
         out: *mut *mut tsdb_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_query_spread_group_local(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        group: *const tsdb_group,
+        opts: *const tsdb_query_opts,
+        out: *mut *mut tsdb_spread_bucket,
+        nout: *mut usize,
+    ) -> c_int;
+    pub fn tsdb_query_twa_group_local(
+        db: *mut tsdb,
+        series: u32,
+        start: i64,
+        end: i64,
+        group: *const tsdb_group,
+        opts: *const tsdb_twa_opts,
+        out: *mut *mut tsdb_twa_bucket,
         nout: *mut usize,
     ) -> c_int;
 }

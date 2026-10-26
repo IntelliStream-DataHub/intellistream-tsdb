@@ -151,9 +151,34 @@ final class Native {
             JAVA_LONG.withName("created_s"),
             JAVA_LONG.withName("written_s")).withName("tsdb_part_info");
 
+    static final StructLayout SPREAD_BUCKET = MemoryLayout.structLayout(
+            BUCKET.withName("b"),
+            JAVA_DOUBLE.withName("range"),
+            JAVA_DOUBLE.withName("var_pop"),
+            JAVA_DOUBLE.withName("var_samp"),
+            JAVA_DOUBLE.withName("stddev_pop"),
+            JAVA_DOUBLE.withName("stddev_samp")).withName("tsdb_spread_bucket");
+
+    static final StructLayout TWA_OPTS = MemoryLayout.structLayout(
+            JAVA_INT.withName("method"),
+            MemoryLayout.paddingLayout(4),
+            JAVA_LONG.withName("max_gap_ms"),
+            JAVA_INT.withName("order"),
+            MemoryLayout.paddingLayout(4),
+            SIZE_T.withName("limit"),
+            JAVA_INT.withName("no_stats"),
+            MemoryLayout.paddingLayout(4)).withName("tsdb_twa_opts");
+
+    static final StructLayout TWA_BUCKET = MemoryLayout.structLayout(
+            JAVA_LONG.withName("start"),
+            JAVA_DOUBLE.withName("twa"),
+            JAVA_DOUBLE.withName("area"),
+            JAVA_LONG.withName("covered_ms"),
+            JAVA_LONG.withName("count")).withName("tsdb_twa_bucket");
+
     /** Every struct, for the layout test, in the order of the C enum tsdb_struct_kind (tsdb_struct_size). */
     static final StructLayout[] ALL_STRUCTS = {OPTIONS, VALUES, BUCKET, POINTS, GROUP, QUERY_OPTS, QUERY_STATS, STATS,
-        PART_INFO};
+        PART_INFO, SPREAD_BUCKET, TWA_OPTS, TWA_BUCKET};
 
     static long offset(StructLayout s, String field) {
         return s.byteOffset(MemoryLayout.PathElement.groupElement(field));
@@ -346,6 +371,33 @@ final class Native {
             i(PTR, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR));
     static final MethodHandle QUERY_GROUP_LOCAL = fn("tsdb_query_group_local",
             i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+
+    static final MethodHandle QUERY_AGG_EX = fn("tsdb_query_agg_ex",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+    static final MethodHandle QUERY_SPREAD = fn("tsdb_query_spread",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+    static final MethodHandle QUERY_SPREAD_GROUP = fn("tsdb_query_spread_group",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+    static final MethodHandle QUERY_SPREAD_GROUP_LOCAL = fn("tsdb_query_spread_group_local",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+    static final MethodHandle QUERY_SPREAD_BOUNDS = fn("tsdb_query_spread_bounds",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
+    static final MethodHandle QUERY_TWA = fn("tsdb_query_twa",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+    static final MethodHandle QUERY_TWA_GROUP = fn("tsdb_query_twa_group",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+    static final MethodHandle QUERY_TWA_GROUP_LOCAL = fn("tsdb_query_twa_group_local",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+    static final MethodHandle QUERY_TWA_BOUNDS = fn("tsdb_query_twa_bounds",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
+    static final MethodHandle QUERY_LTTB_EX = fn("tsdb_query_lttb_ex",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, SIZE_T, PTR, PTR, PTR));
+
+    static final MethodHandle DELETE_RANGE = fn("tsdb_delete_range", i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG));
+    static final MethodHandle REPLACE_RANGE = fn("tsdb_replace_range",
+            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, SIZE_T));
+    static final MethodHandle SET_RETENTION = fn("tsdb_set_retention", i(PTR, JAVA_INT, JAVA_LONG));
+    static final MethodHandle GET_RETENTION = fn("tsdb_get_retention", i(PTR, JAVA_INT, PTR));
 
     // ------------------------------------------------------------------------------------------------ callbacks
 

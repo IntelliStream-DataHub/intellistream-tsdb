@@ -9,6 +9,12 @@ disk format and the wire protocol.
 ## [Unreleased]
 
 ### Added
+- The Rust, Python and Java clients and the three embedded bindings at protocol 9: the spread (range, variance,
+  standard deviation) in fixed, calendar and bounds buckets; time-weighted averages (step or linear, a gap limit,
+  order and limit); LTTB with an order and a limit; aggregates with an order and a limit that stop early. The
+  embedded bindings also gain range delete, replace and retention. A call that needs a newer server than the one
+  connected fails with `Invalid` before anything is sent. Embedded and TCP answers are compared in each client's
+  tests. Python returns the spread as extra numpy columns of `Buckets` and TWA as `TwaBuckets`.
 - Batch calls: many queries or inserts in one call, run in parallel. Rust: `Db::query_points_many`,
   `query_agg_many`, `insert_many` (on every CPU) and `Pool`, a fixed set of connections to one tsdbd with the
   same three calls. Python: `Db.query_raw_many`, `query_agg_many`, `insert_many` and `tsdb_client.Pool`, with
@@ -71,9 +77,8 @@ Server (`tsdbd`)
 - `--port 0 --port-file FILE` for scripts and tests; `tsdbd --version`.
 
 Clients and bindings
-- Clients of tsdbd in C (protocol 9), Rust, Python and Java (protocol 7; protocol 9 before this release:
-  the spread, LTTB and TWA with order and limit).
-- Embedded bindings (no server): Rust, Python and Java 22+.
+- Clients of tsdbd in C, Rust, Python and Java, all at protocol 9.
+- Embedded bindings (no server): Rust, Python and Java 22+, with the same operations as the clients.
 - Command-line tool `tsdb` (create, import, query, delete, retention, volumes, stats, optimize).
 - Apache Pulsar 5 sink (`connectors/pulsar`): Pulsar holds the points while tsdb is down, and a point is
   taken off Pulsar once it is on disk.

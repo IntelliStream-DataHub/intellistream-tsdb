@@ -17,7 +17,7 @@
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 9;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 
@@ -27,6 +27,14 @@ pub(crate) const MAX_FRAME: usize = 256 << 20;
 pub(crate) const MANY_SERIES: u32 = u32::MAX;
 /// Bytes per bucket in a QUERY_BUCKETS reply (`TSDB_BUCKET_ROW`).
 pub(crate) const BUCKET_ROW: usize = 64;
+/// QUERY_BUCKETS/QUERY_BOUNDS fields: the spread follows each bucket (version 8).
+pub(crate) const SPREAD: u8 = 1;
+/// Bytes per bucket in a reply with [`SPREAD`].
+pub(crate) const SPREAD_ROW: usize = 104;
+/// Bytes of a QUERY_TWA request before the bounds.
+pub(crate) const TWA_HEADER: usize = 56;
+/// Bytes per bucket in a QUERY_TWA reply.
+pub(crate) const TWA_ROW: usize = 40;
 /// Header of a QUERY_VALUES chunk: last, type, flags, 0, n.
 pub(crate) const VALUES_CHUNK_HEADER: usize = 8;
 /// Flag: a validity bitmap follows the values (`TSDB_VALID`).
@@ -61,6 +69,8 @@ pub(crate) enum Op {
     QueryBuckets = 18,
     LastStats = 19,
     QueryBounds = 20,
+    QueryLttb = 21,
+    QueryTwa = 22,
     DeleteRange = 25,
     ReplaceRange = 26,
     SetRetention = 27,

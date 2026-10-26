@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, Status};
 use crate::types::Unit;
 
 /// Most periods one call returns (`MAX_BOUNDS` in the C file).
@@ -464,9 +464,10 @@ fn cal_local_start(unit: Unit, idx: i64) -> Option<i64> {
 ///
 /// # Errors
 ///
-/// [`Error::InvalidArgument`] for an unknown zone, a range beyond about
-/// 200,000 years either side of 1970 (an unbounded one included), or more
-/// than 64 Mi periods. An empty range gives no bounds.
+/// [`Error::InvalidArgument`] for an unknown zone or a range beyond about
+/// 200,000 years either side of 1970 (an unbounded one included);
+/// [`Status::TooManyBuckets`] (as [`Error::Server`], the C calendar's status) for
+/// more than 64 Mi periods. An empty range gives no bounds.
 ///
 /// # Examples
 ///
@@ -503,7 +504,8 @@ fn bounds_in(z: &Zone, unit: Unit, count: u32, start: i64, end: i64) -> Result<V
         (floor_div(cal_index(z, unit, start), c), floor_div(cal_index(z, unit, end - 1), c))
     };
     if k1 - k0 + 1 > MAX_BOUNDS as i64 {
-        return Err(invalid(format!("{} periods: more than {MAX_BOUNDS} (too many buckets)", k1 - k0 + 1)));
+        // the engine's and the C calendar's status, so that every client fails an over-wide range alike
+        return Err(Error::Server(Status::TooManyBuckets));
     }
     let mut b: Vec<i64> = Vec::with_capacity((k1 - k0 + 1) as usize);
     for k in k0..=k1 {

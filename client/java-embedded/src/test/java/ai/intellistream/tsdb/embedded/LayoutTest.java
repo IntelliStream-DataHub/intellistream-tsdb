@@ -1,5 +1,6 @@
 package ai.intellistream.tsdb.embedded;
 
+import ai.intellistream.tsdb.TwaMethod;
 import ai.intellistream.tsdb.Unit;
 import ai.intellistream.tsdb.ValueType;
 
@@ -65,7 +66,7 @@ class LayoutTest {
         }
         assertEquals(4L, c.get("enum"), "enums are 4 bytes");
         Set<String> checked = new HashSet<>();
-        for (StructLayout s : Native.ALL_STRUCTS) {
+        for (StructLayout s : structs()) {
             String name = s.name().orElseThrow();
             assertEquals(c.get(name), s.byteSize(), name + " size");
             checked.add(name);
@@ -75,7 +76,9 @@ class LayoutTest {
                 String field = name + "." + m.name().orElseThrow();
                 assertEquals(c.get(field), Native.offset(s, m.name().get()), field + " offset");
                 checked.add(field);
-                assertTrue(!(m instanceof GroupLayout), "flat structs only");
+                /* flat structs, but for a tsdb_bucket embedded whole (tsdb_spread_bucket.b) */
+                assertTrue(!(m instanceof GroupLayout) || m.equals(Native.BUCKET.withName(m.name().get())),
+                        field + ": flat structs only");
             }
         }
         for (String k : c.keySet())
@@ -86,6 +89,9 @@ class LayoutTest {
             assertEquals(c.get("type." + t.name()), (long) t.code(), "tsdb_type of " + t);
         for (Unit u : Unit.values())
             assertEquals(c.get("unit." + u.name()), (long) u.code(), "tsdb_unit of " + u);
+        for (TwaMethod t : TwaMethod.values())
+            assertEquals(c.get("twa." + t.name()), (long) t.ordinal(), "tsdb_twa_method of " + t + " (Native.twaOpts)");
+        assertEquals(TwaMethod.values().length, c.keySet().stream().filter(k -> k.startsWith("twa.")).count());
         assertEquals(0L, c.get("order.ASC"));
         assertEquals(1L, c.get("order.DESC"));
         assertEquals(5, c.keySet().stream().filter(k -> k.startsWith("type.")).count(), "a C type Java lacks");
@@ -93,6 +99,11 @@ class LayoutTest {
         for (int i = 0; i < Native.ALL_STRUCTS.length; i++)
             assertEquals(c.get("kind." + Native.ALL_STRUCTS[i].name().orElseThrow()), (long) i,
                     "tsdb_struct_kind of " + Native.ALL_STRUCTS[i].name().orElseThrow());
+    }
+
+    /** Every struct Native lays out; each has a tsdb_struct_kind. */
+    private static List<StructLayout> structs() {
+        return List.of(Native.ALL_STRUCTS);
     }
 
     private static String include() {
@@ -116,7 +127,7 @@ class LayoutTest {
     @Test
     void everyFieldOfTheHeaderIsLaidOut() throws IOException {
         String h = headers();
-        for (StructLayout s : Native.ALL_STRUCTS) {
+        for (StructLayout s : structs()) {
             String name = s.name().orElseThrow();
             Matcher m = Pattern.compile("typedef struct " + name + " \\{(.*?)\\} " + name + ";", Pattern.DOTALL)
                     .matcher(h);

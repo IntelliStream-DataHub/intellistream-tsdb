@@ -50,3 +50,19 @@ def test_many(tmp_path):
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.splitlines() == ["raw   0 60 60.0", "raw   1 60 120.0", "raw   2 60 180.0", "hours 3 25 8640.0"]
+
+
+def test_analytics(tmp_path):
+    text = README.read_text()
+    section = text[text.index("## Spread, time-weighted") :]
+    code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
+    assert '"/tmp/tsdb-analytics"' in code
+    code = code.replace('"/tmp/tsdb-analytics"', repr(str(tmp_path / "db")))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [
+        "spread 30.0 125.0 11.180339887498949",
+        "twa 20.0 4000",
+        "chart [0, 1000, 4000]",
+        "last 4000 40.0",
+    ], out.stdout

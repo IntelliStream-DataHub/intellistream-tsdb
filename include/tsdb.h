@@ -605,6 +605,9 @@ typedef enum tsdb_struct_kind {
     TSDB_STRUCT_QUERY_STATS = 6,
     TSDB_STRUCT_STATS = 7,
     TSDB_STRUCT_PART_INFO = 8,
+    TSDB_STRUCT_SPREAD_BUCKET = 9,
+    TSDB_STRUCT_TWA_OPTS = 10,
+    TSDB_STRUCT_TWA_BUCKET = 11,
 } tsdb_struct_kind;
 size_t tsdb_struct_size(int kind);
 
