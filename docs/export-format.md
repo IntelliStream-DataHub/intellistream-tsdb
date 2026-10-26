@@ -122,6 +122,11 @@ to `--batch-rows`, 1 M rows by default) atomically after checking it; when the s
 existing database the series being imported is emptied again if the import created it, the error names it, and
 the series before it are whole; a new database is not created at all. It exits with status 1 in every such case.
 
+The target `DIR` is a directory that is missing, empty or an existing database (it has tsdb's `ID` or `META`).
+A directory with other files in it is refused before anything is written ("is not empty and holds no database"),
+also when `DIR` is a symlink to one: the database's files would be mixed with yours. Volume directories
+(`--volume`, `--volume-root` with `--create-volumes`) may hold other files, as before.
+
 Into an existing database `import` keeps every sync of the engine: a crash or failure midway leaves the series
 before it whole, and the same import rerun with `--merge` writes the same rows again. Into a new database (a
 directory that is missing or empty) it builds the database in a sibling directory, `DIR.importing-PID`, writes

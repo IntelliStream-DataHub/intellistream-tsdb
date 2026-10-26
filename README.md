@@ -440,8 +440,9 @@ build/tsdb /data/sensors export --series 'pump7.*' --from 2024-01-01 --to 2024-0
 The file has what your queries see (deleted rows are gone), with each series' type, retention and state names,
 every value exactly as stored, and a checksum on every piece. Every later tsdb can import it. `import` checks
 the whole file before it writes anything, so a damaged file changes nothing; `import --check FILE` only checks.
-Series that already exist are refused unless you pass `--skip-existing`, `--merge` or `--replace`. Stop tsdbd
-before importing into its directory. [docs/export-format.md](docs/export-format.md) describes the file.
+Series that already exist are refused unless you pass `--skip-existing`, `--merge` or `--replace`. Import into
+a new or empty directory, or into an existing database: a directory with other files in it is refused, and
+nothing is written there. Stop tsdbd before importing into its directory. [docs/export-format.md](docs/export-format.md) describes the file.
 
 **If an import stops halfway.** Into a new database (a directory that is missing or empty), `import` builds
 the database in a directory beside it, `DIR.importing-<number>`, without waiting for the disk, makes it safe

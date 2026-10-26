@@ -40,6 +40,9 @@ disk format and the wire protocol.
 - Python: numpy input arrays are copied once with the GIL released instead of while holding it.
 
 ### Fixed
+- `tsdb import` refuses a target directory that has files in it and holds no database, before writing anything,
+  also through a symlink to one (it used to build the database among those files). A missing or empty directory
+  and an existing database are imported into as before; volume directories are unchanged.
 - Opening a database no longer deletes a user's files in a volume directory (a volume may be a directory that held
   other files before it was added). The cleanup at open used to remove every name starting with `tmp_` and read
   (then remove) every `txn_*` file as an insert intent; it now touches only the exact names tsdb writes

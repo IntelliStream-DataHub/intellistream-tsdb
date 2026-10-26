@@ -1685,6 +1685,31 @@ static bool dir_is_new(const char *dir)
     return empty;
 }
 
+/* The target must be missing, an empty directory or a database (its ID or META): tsdb_open would otherwise make a
+ * database among the files of a directory that is no database, and leave its files mixed with them. 0, or -1 said
+ * why. Checked before anything is written; a directory filled after this is still caught by the rename at the end,
+ * which does not replace a non-empty directory. */
+static int target_check(const char *dir)
+{
+    char e[256];
+    DIR *d = opendir(dir);
+    if (!d)
+        return 0; /* missing, or no directory: the open says why */
+    int fd = dirfd(d);
+    bool db = faccessat(fd, "ID", F_OK, AT_SYMLINK_NOFOLLOW) == 0 ||
+              faccessat(fd, "META", F_OK, AT_SYMLINK_NOFOLLOW) == 0;
+    struct dirent *de;
+    bool empty = true;
+    while (!db && empty && (de = readdir(d)))
+        empty = strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0;
+    closedir(d);
+    if (db || empty)
+        return 0;
+    fprintf(stderr, "tsdb: import: %s is not empty and holds no database: import into a new or empty directory, or "
+                    "into an existing database\n", esc(dir, e, sizeof e));
+    return -1;
+}
+
 /* A new database is built in a sibling directory, <target>.importing-<pid>, and renamed to <target> only once all
  * of it is on disk: an interrupted import (a kill, a crash, a power loss, an error) leaves nothing under the
  * target's name. A sibling left behind is reported by the next import into the target. Volumes are named by
@@ -2167,6 +2192,11 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
             return 1;
         }
         dir = rdir;
+        if (target_check(dir) != 0) {
+            if (in != stdin)
+                fclose(in);
+            return 1;
+        }
         if (dir_is_new(dir)) {
             int sr = stage_make(dir, &stg, im);
             if (sr < 0) {

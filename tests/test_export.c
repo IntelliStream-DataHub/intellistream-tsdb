@@ -1925,6 +1925,36 @@ static void test_symlink_target(void)
     printf("symlinked targets: ok\n");
 }
 
+/* A target directory with files in it and no database is refused before anything is written, also through a
+   symlink; a missing or empty directory, and an existing database, are imported into. */
+static void test_nonempty_target(void)
+{
+    char *good = path("ne-good.dump");
+    craft(good, &(knobs){0});
+    char *top = path("ne");
+    CHECK(sh("mkdir -p '%s/full/sub' '%s/empty' && echo mine > '%s/full/notes.txt' && echo mine > '%s/full/sub/x' && "
+             "ln -s full '%s/tofull'", top, top, top, top, top) == 0);
+    const char *refused[] = {"full", "tofull", "full/"};
+    for (int i = 0; i < 3; i++) {
+        char t[PATH_MAX];
+        snprintf(t, sizeof t, "%s/%s", top, refused[i]);
+        CHECK(RUN(NULL, NULL, t, "import", good) == 1);
+        CHECK(err_has("is not empty and holds no database"));
+        CHECK(err_has("/full"));
+        CHECK(sh("cd '%s' && test \"$(ls -A full | tr '\\n' ' ')\" = 'notes.txt sub ' && test \"$(cat full/notes.txt)\" = "
+                 "mine && test \"$(ls -A full/sub)\" = x && test -L tofull && ! ls -d *.importing-* >/dev/null 2>&1",
+                 top) == 0);
+    }
+    /* still imported into: an empty directory, a missing one, and an existing database (with --merge) */
+    CHECK(RUN(NULL, NULL, path("ne/empty"), "import", good) == 0);
+    CHECK(RUN(NULL, NULL, path("ne/missing"), "import", good) == 0);
+    CHECK(RUN(NULL, NULL, path("ne/empty"), "import", good, "--merge") == 0);
+    tsdb *d = open_db(path("ne/missing"), true);
+    CHECK(rows_of(d, "b") == 3);
+    tsdb_close(d);
+    printf("non-empty targets refused: ok\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *cli_env = getenv("TSDB_CLI");
@@ -1976,6 +2006,7 @@ int main(int argc, char **argv)
     test_failed_volumes();
     test_intruder();
     test_symlink_target();
+    test_nonempty_target();
     test_golden(golden);
     test_concurrent();
     test_memory();
