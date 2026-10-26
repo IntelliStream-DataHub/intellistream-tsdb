@@ -122,17 +122,30 @@ to `--batch-rows`, 1 M rows by default) atomically after checking it; when the s
 existing database the series being imported is emptied again if the import created it, the error names it, and
 the series before it are whole; a new database is not created at all. It exits with status 1 in every such case.
 
+The target `DIR` is a directory that is missing, empty or an existing database (it has tsdb's `ID` or `META`).
+A directory with other files in it is refused before anything is written ("is not empty and holds no database"),
+also when `DIR` is a symlink to one: the database's files would be mixed with yours. Volume directories
+(`--volume`, `--volume-root` with `--create-volumes`) may hold other files, as before.
+
 Into an existing database `import` keeps every sync of the engine: a crash or failure midway leaves the series
 before it whole, and the same import rerun with `--merge` writes the same rows again. Into a new database (a
 directory that is missing or empty) it builds the database in a sibling directory, `DIR.importing-PID`, writes
 without syncing file by file, syncs every file system the database lives on (that directory and every volume)
 once at the end, which is much faster for many small series, and then renames the sibling to `DIR` and syncs
 the parent directory. It reports success and exits 0 only after that; a failed sync is an error (exit 1), after
-which the sibling is removed. Whatever stops it (an error, a crash, a power loss, a kill), there is no database
+which the sibling is removed, and so is what the import wrote in the volumes it added. There it removes only files
+it provably wrote: regular files with the names tsdb writes in a volume (`LOCK`, `MANIFEST`, `META`, `ROOT_ID`,
+`SERIES`, `STATES`, `RETENTION`, parts `p<partition>_<min>_<max>_<level>.part`, `wal_<16 hex digits>.log`, its own
+`tmp_`/`txn_` files, `retired_` parts) that were not in the directory before the import. Anything else stays, also
+what another process put there during the import (the message names such entries: "not written by tsdb: left as it
+is"). A volume directory the import made is removed when nothing else is left in it; one that was there before
+always stays. If `DIR` is a symlink to an empty directory, or a dangling one, the database is built at the end of the
+link, which keeps pointing at it. Whatever stops it (an error, a crash, a power loss, a kill), there is no database
 named `DIR` until it is complete. Volumes are named by absolute path in the root's `VOLUMES` and know the
 database by its ID (`ROOT_ID`), so the rename does not detach them. A sibling left by a kill or power loss
-makes the next import into `DIR` stop with a message naming it (and the volumes it lists): delete it, and the
-volume directories that import made, and import again. An empty directory is replaced by the rename, unless it
+makes the next import into `DIR` stop with a message naming it (and the volumes it lists): delete it, remove the
+tsdb files it wrote in those volumes (the directory too, if that import made it; one that was there before may
+hold other files of yours), and import again. An empty directory is replaced by the rename, unless it
 is a mount point or its parent is not writable: then the import writes into it with every sync, as into an
 existing database.
 

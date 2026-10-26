@@ -610,18 +610,47 @@ int parts_commit(eng *db, part **ps, size_t n)
 
 /* An intent renames a part writer's tmp file to a part name, nothing else: the hash is no authentication, and a
  * crafted intent must not rename over MANIFEST or SERIES, or pull a file in from another directory. */
-static bool intent_names_valid(const char *tmp, const char *fin)
+static bool intent_names_valid(const char *tmp, const char *fin) { return part_tmp_name(tmp) && part_file_name(fin); }
+
+/* The names the engine writes, matched exactly. A volume may be a directory that held the user's files before
+ * (tsdb_volume_add_dir), so a cleanup at open touches only these, never a user's tmp_notes.txt or txn_list. */
+static const char *skip_digits(const char *s)
 {
-    int a = 0, b = 0;
-    unsigned pid, seq, level;
-    int64_t partition;
-    uint64_t lo, hi;
-    if (strchr(tmp, '/') || strchr(fin, '/'))
-        return false;
-    return sscanf(tmp, "tmp_%u_%u.part%n", &pid, &seq, &a) == 2 && a > 0 && tmp[a] == '\0' &&
-           sscanf(fin, "p%" SCNd64 "_%" SCNu64 "_%" SCNu64 "_%u.part%n", &partition, &lo, &hi, &level, &b) == 4 &&
-           b > 0 && fin[b] == '\0';
+    const char *d = s;
+    while (*d >= '0' && *d <= '9')
+        d++;
+    return d > s && d - s <= 20 ? d : NULL;
 }
+
+/* PREFIX <digits>_<digits> SUFFIX, as written with "%d_%u" from getpid() and a counter */
+static bool two_numbers_name(const char *name, const char *prefix, const char *suffix)
+{
+    size_t lp = strlen(prefix);
+    if (strncmp(name, prefix, lp) != 0)
+        return false;
+    const char *s = skip_digits(name + lp);
+    if (!s || *s != '_' || !(s = skip_digits(s + 1)))
+        return false;
+    return strcmp(s, suffix) == 0;
+}
+
+bool part_tmp_name(const char *name) { return two_numbers_name(name, "tmp_", ".part"); }
+
+/* p<partition>_<min_block>_<max_block>_<level>.part; the partition may be negative (before 1970) */
+bool part_file_name(const char *name)
+{
+    if (name[0] != 'p')
+        return false;
+    const char *s = name + 1 + (name[1] == '-');
+    for (int i = 0; i < 4; i++) {
+        if (!(s = skip_digits(s)) || *s != (i < 3 ? '_' : '.'))
+            return false;
+        s++;
+    }
+    return strcmp(s, "part") == 0;
+}
+
+static bool intent_file_name(const char *name) { return two_numbers_name(name, INTENT_PREFIX, ".intent"); }
 
 /* Parses an intent into its n renames; false when it is torn or damaged. */
 static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[128], size_t *n)
@@ -674,8 +703,8 @@ int intents_recover(eng *db)
     bool any = false;
     int rc = 0;
     while (rc == 0 && (e = readdir(d))) {
-        if (strncmp(e->d_name, INTENT_PREFIX, strlen(INTENT_PREFIX)) != 0)
-            continue;
+        if (!intent_file_name(e->d_name))
+            continue; /* only the names parts_commit writes: a user's txn_* file in a volume is not read, nor deleted */
         int fd = openat(db->dirfd, e->d_name, O_RDONLY | O_CLOEXEC);
         struct stat st;
         char *buf = NULL;

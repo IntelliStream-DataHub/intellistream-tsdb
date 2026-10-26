@@ -395,7 +395,7 @@ static void write_intent(const char *dir, const char *lines, int count)
     int n = snprintf(text, sizeof text, "tsdb-intent 3 %d\n%s", count, lines);
     n += snprintf(text + n, sizeof text - (size_t)n, "end %016llx\n",
                   (unsigned long long)xxh64(text, (size_t)n, 0));
-    snprintf(path, sizeof path, "%s/txn_evil.intent", dir);
+    snprintf(path, sizeof path, "%s/txn_99_99.intent", dir); /* a name parts_commit writes: others are not read */
     spit(path, text, (size_t)n);
 }
 

@@ -1643,7 +1643,7 @@ static void test_sync(void)
         CHECK(run_crashfs(eio, (const char *const[]){cli, db, "import", f, "--volume", map, "--create-volumes",
                                                      NULL}) == 1);
         CHECK(err_has("crashfs: EIO on syncfs") && err_has("Input/output error") && err_has("was not created") &&
-              err_has("was made by this import: delete it") && err_lacks("imported "));
+              err_has("made by this import and was removed") && err_lacks("imported "));
         CHECK(missing(db) && !sibling_left(db));
     }
     /* power lost at every point of the import, with and without torn writes: the database is missing (perhaps
@@ -1675,7 +1675,7 @@ static void test_sync(void)
                 reported++;
                 CHECK(RUN(NULL, NULL, db, "import", f, "--volume", map, "--create-volumes") == 1);
                 CHECK(err_has("is left from an import into") && err_has("and import again") &&
-                      err_has("any volume directory it made") && missing(db));
+                      err_has("undo its volumes") && missing(db));
             }
         }
         if (rc == 0) /* it got to the end, with and without torn writes */
@@ -1740,7 +1740,7 @@ static void test_kill(void)
     CHECK(missing(db) && sibling_left(db));
     CHECK(RUN(NULL, NULL, db, "import", f, "--volume", map, "--create-volumes") == 1);
     CHECK(err_has("killed.importing-") && err_has("is left from an import into") &&
-          err_has("and import again") && err_has(vol));
+          err_has("and import again") && err_has(vol) && err_has("remove the tsdb files it wrote there"));
     CHECK(missing(db));
     sh("rm -rf '%s'.importing-* '%s'", db, vol);
     CHECK(RUN(NULL, NULL, db, "import", f, "--volume", map, "--create-volumes") == 0);
@@ -1749,6 +1749,210 @@ static void test_kill(void)
     CHECK(rows_of(d, "f") == 200000 && same_str(tsdb_series_path(d, lookup(d, "f")), vol));
     tsdb_close(d);
     printf("killed imports: ok\n");
+}
+
+/* A failed import into a new database undoes what it did to the volumes it added: a directory it made goes, one that
+ * was there before keeps everything the user had in it (and the advice never says to delete it); a rerun works. */
+static void test_failed_volumes(void)
+{
+    char *bad = path("adv-bad.dump"), *good = path("adv-good.dump"), map[2 * PATH_MAX + 16];
+    craft(bad, &(knobs){.vol = "/old/mnt/vol", .end_delta = 1}); /* fails at the end of the series in the volume */
+    craft(good, &(knobs){.vol = "/old/mnt/vol"});
+    sh("mkdir -p '%s'", path("adv"));
+    char *db = path("adv/db"), *ex = path("adv/existing"), *made = path("adv/made");
+
+    /* a directory that was there before, with the user's files in it */
+    CHECK(sh("mkdir -p '%s/sub' && echo mine > '%s/precious' && echo mine > '%s/sub/keep'", ex, ex, ex) == 0);
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", ex);
+    CHECK(RUN(NULL, NULL, db, "import", bad, "--no-verify", "--volume", map, "--create-volumes") == 1);
+    CHECK(err_has("the stream says") && err_has("adv/db was not created") && err_has("a directory before this import"));
+    CHECK(err_lacks("delete it") && err_lacks("was made by this import"));
+    CHECK(missing(db) && !sibling_left(db));
+    CHECK(sh("test \"$(cat '%s/precious')\" = mine && test \"$(cat '%s/sub/keep')\" = mine", ex, ex) == 0);
+    CHECK(sh("test \"$(ls '%s' | sort | tr '\\n' ' ')\" = 'precious sub '", ex) == 0); /* nothing of the import's */
+    CHECK(RUN(NULL, NULL, db, "import", good, "--no-verify", "--volume", map, "--create-volumes") == 0);
+    tsdb *d = open_db(db, true);
+    CHECK(rows_of(d, "b") == 3 && same_str(tsdb_series_path(d, lookup(d, "f")), ex));
+    tsdb_close(d);
+    CHECK(sh("test \"$(cat '%s/precious')\" = mine", ex) == 0);
+
+    /* a directory the import made goes with it */
+    sh("rm -rf '%s'", db);
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", made);
+    CHECK(RUN(NULL, NULL, db, "import", bad, "--no-verify", "--volume", map, "--create-volumes") == 1);
+    CHECK(err_has("made by this import and was removed") && err_lacks("delete it"));
+    CHECK(missing(made) && missing(db) && !sibling_left(db));
+    CHECK(RUN(NULL, NULL, db, "import", good, "--no-verify", "--volume", map, "--create-volumes") == 0);
+
+    /* many files of the user's in the old directory: all stay, the import's go, and none is named */
+    char *big = path("adv/big"), *db2 = path("adv/db2");
+    CHECK(sh("mkdir -p '%s' && cd '%s' && seq 1 5000 | xargs touch && echo mine > precious", big, big) == 0);
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", big);
+    CHECK(RUN(NULL, NULL, db2, "import", bad, "--no-verify", "--volume", map, "--create-volumes") == 1);
+    CHECK(err_has("a directory before this import: the files it wrote there were removed") && err_lacks("delete it") &&
+          err_lacks("left as it is") && err_lacks("was made by this import"));
+    CHECK(sh("test \"$(cat '%s/precious')\" = mine && test $(ls '%s' | wc -l) = 5001", big, big) == 0);
+    CHECK(missing(db2) && !sibling_left(db2));
+    printf("failed imports and volumes: ok\n");
+}
+
+/* Imports a stream that fails at its end through a pipe into a new database, its series in volume `vol`; once the
+ * import has written parts there, another process puts files and a directory into `vol`, some with names close to
+ * the engine's. The import removes only what it wrote: the others stay, and those that are new are named. */
+static void intruded_import(const char *db, const char *vol, const char *stream, size_t n)
+{
+    char map[2 * PATH_MAX + 16], *fifo = path("intrude.fifo");
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", vol);
+    unlink(fifo);
+    CHECK(mkfifo(fifo, 0600) == 0);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int i = open(fifo, O_RDONLY), e = open(errfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (i < 0 || e < 0)
+            _exit(126);
+        dup2(i, 0);
+        dup2(e, 2);
+        execv(cli, (char *const[]){cli, (char *)db, "import", "--volume", map, "--create-volumes", "--batch-rows",
+                                   "1000", NULL});
+        _exit(127);
+    }
+    CHECK(pid > 0);
+    int o = pid > 0 ? open(fifo, O_WRONLY) : -1;
+    CHECK(o >= 0 && write(o, stream, n - 64) == (ssize_t)(n - 64));
+    bool parts = false;
+    for (int i = 0; i < 2000 && !parts; i++) {
+        parts = sh("ls '%s'/p*.part >/dev/null 2>&1", vol) == 0;
+        if (!parts)
+            usleep(5000);
+    }
+    CHECK(parts);
+    CHECK(sh("cd '%s' && echo theirs > other.log && mkdir other && echo theirs > other/inside && touch tmp_x "
+             "p1_2.part wal_0000000000000001.log.bak retired_notes METADATA", vol) == 0);
+    CHECK(o >= 0 && write(o, stream + n - 64, 64) == 64); /* the damaged end */
+    if (o >= 0)
+        close(o);
+    int st;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 1);
+    CHECK(err_has("the stream says") && err_has("was not created") && err_lacks("delete it"));
+    CHECK(err_has("other.log is not written by tsdb: left as it is") && err_has("other is not written by tsdb") &&
+          err_has("p1_2.part is not written by tsdb"));
+    CHECK(sh("test \"$(cat '%s/other.log')\" = theirs && test \"$(cat '%s/other/inside')\" = theirs", vol, vol) == 0);
+    CHECK(sh("cd '%s' && test -f tmp_x && test -f p1_2.part && test -f wal_0000000000000001.log.bak && "
+             "test -f retired_notes && test -f METADATA", vol) == 0);
+    /* nothing of the import's is left */
+    CHECK(sh("cd '%s' && ! ls LOCK MANIFEST META ROOT_ID SERIES STATES p*_*_*_*.part wal_*.log tmp_*.part >/dev/null "
+             "2>&1", vol) == 0);
+    CHECK(missing(db) && !sibling_left(db));
+    unlink(fifo);
+}
+
+static void test_intruder(void)
+{
+    crafter cr = {0};
+    cr_header(&cr, 0, CR_FROM, CR_TO);
+    cr_series(&cr, "f", "/old/mnt/vol", TSDB_FLOAT32, 0);
+    int64_t tb[1000];
+    float vb[1000];
+    for (int ch = 0; ch < 50; ch++) {
+        for (int i = 0; i < 1000; i++) {
+            tb[i] = T0 + ch * 1000 + i;
+            vb[i] = (float)(next() % 1000000);
+        }
+        cr_chunk(&cr, 4, tb, vb, NULL, 1000, 0);
+    }
+    cr_end(&cr, 1); /* fails at the end */
+    char *f = path("intrude.dump");
+    cr_finish(&cr, f);
+    size_t n;
+    char *s = slurp(f, &n);
+    CHECK(s && n > 10000);
+    sh("mkdir -p '%s'", path("intr"));
+
+    /* a directory that was there before: it and the user's files in it stay */
+    char *ex = path("intr/existing"), *db = path("intr/db");
+    CHECK(sh("mkdir -p '%s/sub' && echo mine > '%s/precious' && echo mine > '%s/sub/keep'", ex, ex, ex) == 0);
+    intruded_import(db, ex, s, n);
+    CHECK(err_has("a directory before this import: the files it wrote there were removed") &&
+          err_lacks("precious") && err_lacks("sub "));
+    CHECK(sh("test \"$(cat '%s/precious')\" = mine && test \"$(cat '%s/sub/keep')\" = mine", ex, ex) == 0);
+
+    /* a directory the import made: kept for what the other process put there, with only that in it */
+    char *made = path("intr/made"), *db2 = path("intr/db2");
+    intruded_import(db2, made, s, n);
+    CHECK(err_has("made by this import: the files it wrote there were removed, the directory is kept") &&
+          err_lacks("and was removed"));
+    CHECK(sh("test \"$(ls '%s' | sort | tr '\\n' ' ')\" = 'METADATA other other.log p1_2.part retired_notes tmp_x "
+             "wal_0000000000000001.log.bak '", made) == 0);
+    free(s);
+    printf("failed imports with others writing in their volumes: ok\n");
+}
+
+/* A target that is a symlink (to an empty directory, or dangling, relative or not, a chain) is imported at the end of
+ * the link, which keeps pointing at the data. */
+static void test_symlink_target(void)
+{
+    char *good = path("lnk-good.dump"), *bad = path("lnk-bad.dump");
+    craft(good, &(knobs){0});
+    craft(bad, &(knobs){.end_delta = 1});
+    char *top = path("lnk");
+    sh("mkdir -p '%s/emptydir' '%s/sub'", top, top);
+    CHECK(sh("cd '%s' && ln -s emptydir tolink && ln -s %s/gone abs && ln -s nothing-yet rel && ln -s rel2 chain && ln -s final rel2 && "
+             "ln -s ../gone2 sub/up", top, top) == 0);
+    const char *links[] = {"tolink", "abs", "rel", "chain", "sub/up"};
+    const char *data[] = {"emptydir", "gone", "nothing-yet", "final", "gone2"};
+    for (int i = 0; i < 5; i++) {
+        char link[PATH_MAX], real[PATH_MAX + 8];
+        snprintf(link, sizeof link, "%s/%s", top, links[i]);
+        snprintf(real, sizeof real, "%s/%s", top, data[i]);
+        /* a failed import leaves the link where it was, nothing beside it */
+        CHECK(RUN(NULL, NULL, link, "import", bad, "--no-verify") == 1);
+        CHECK(sh("test -L '%s' && ! ls '%s'/*.importing-* '%s'/sub/*.importing-* >/dev/null 2>&1", link, top, top) == 0);
+        CHECK(RUN(NULL, NULL, link, "import", good) == 0);
+        CHECK(sh("test -L '%s'", link) == 0);
+        tsdb *d = open_db(link, true);
+        CHECK(rows_of(d, "b") == 3);
+        tsdb_close(d);
+        CHECK(sh("test -d '%s' && test -f '%s/MANIFEST'", real, real) == 0);
+    }
+    /* a link to an existing database is imported into, as before */
+    CHECK(sh("cd '%s' && ln -s emptydir again", top) == 0);
+    CHECK(RUN(NULL, NULL, path("lnk/again"), "import", good, "--merge") == 0);
+    /* a loop is refused */
+    CHECK(sh("cd '%s' && ln -s loop2 loop1 && ln -s loop1 loop2", top) == 0);
+    CHECK(RUN(NULL, NULL, path("lnk/loop1"), "import", good) == 1);
+    CHECK(err_has("Too many levels of symbolic links"));
+    printf("symlinked targets: ok\n");
+}
+
+/* A target directory with files in it and no database is refused before anything is written, also through a
+   symlink; a missing or empty directory, and an existing database, are imported into. */
+static void test_nonempty_target(void)
+{
+    char *good = path("ne-good.dump");
+    craft(good, &(knobs){0});
+    char *top = path("ne");
+    CHECK(sh("mkdir -p '%s/full/sub' '%s/empty' && echo mine > '%s/full/notes.txt' && echo mine > '%s/full/sub/x' && "
+             "ln -s full '%s/tofull'", top, top, top, top, top) == 0);
+    const char *refused[] = {"full", "tofull", "full/"};
+    for (int i = 0; i < 3; i++) {
+        char t[PATH_MAX];
+        snprintf(t, sizeof t, "%s/%s", top, refused[i]);
+        CHECK(RUN(NULL, NULL, t, "import", good) == 1);
+        CHECK(err_has("is not empty and holds no database"));
+        CHECK(err_has("/full"));
+        CHECK(sh("cd '%s' && test \"$(ls -A full | tr '\\n' ' ')\" = 'notes.txt sub ' && test \"$(cat full/notes.txt)\" = "
+                 "mine && test \"$(ls -A full/sub)\" = x && test -L tofull && ! ls -d *.importing-* >/dev/null 2>&1",
+                 top) == 0);
+    }
+    /* still imported into: an empty directory, a missing one, and an existing database (with --merge) */
+    CHECK(RUN(NULL, NULL, path("ne/empty"), "import", good) == 0);
+    CHECK(RUN(NULL, NULL, path("ne/missing"), "import", good) == 0);
+    CHECK(RUN(NULL, NULL, path("ne/empty"), "import", good, "--merge") == 0);
+    tsdb *d = open_db(path("ne/missing"), true);
+    CHECK(rows_of(d, "b") == 3);
+    tsdb_close(d);
+    printf("non-empty targets refused: ok\n");
 }
 
 int main(int argc, char **argv)
@@ -1799,6 +2003,10 @@ int main(int argc, char **argv)
     test_volumes();
     test_sync();
     test_kill();
+    test_failed_volumes();
+    test_intruder();
+    test_symlink_target();
+    test_nonempty_target();
     test_golden(golden);
     test_concurrent();
     test_memory();

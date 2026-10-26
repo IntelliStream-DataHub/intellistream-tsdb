@@ -265,13 +265,14 @@ static int load_parts(eng *db, bool read_only)
     int rc = 0;
     while ((e = readdir(d)) != NULL) {
         const char *name = e->d_name;
-        size_t len = strlen(name);
-        if (strncmp(name, "tmp_", 4) == 0 || strcmp(name, META_FILE ".tmp") == 0) {
+        /* Only names the engine writes: a volume may be a directory with the user's own files in it
+         * (tsdb_volume_add_dir), and their tmp_notes.txt or retired_old.csv is not ours to delete. */
+        if (part_tmp_name(name) || strcmp(name, META_FILE ".tmp") == 0) {
             if (!read_only)
                 unlinkat(db->dirfd, name, 0);
             continue;
         }
-        if (strncmp(name, "retired_", 8) == 0) {
+        if (strncmp(name, "retired_", 8) == 0 && part_file_name(name + 8)) {
             /* replaced before the last shutdown: followers may still read it */
             if (!read_only && db->ngraveyard < 1u << 20) {
                 if (db->ngraveyard == db->graveyard_cap) {
@@ -290,7 +291,7 @@ static int load_parts(eng *db, bool read_only)
             }
             continue;
         }
-        if (name[0] != 'p' || len < 6 || strcmp(name + len - 5, ".part") != 0)
+        if (!part_file_name(name))
             continue;
         part *p;
         int r = part_open(db->dirfd, name, &p);
