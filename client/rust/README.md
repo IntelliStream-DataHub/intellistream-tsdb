@@ -214,6 +214,69 @@ Rows older than a series' retention limit disappear from queries at once and
 from disk as merges get to them. These need a server of protocol version 7; an
 older one gets no request and the call fails with `Status::Invalid`.
 
+## Time-weighted averages, spread and charts
+
+A sensor that reports only when its value changes needs a time-weighted
+average (`query_twa`): each value counts for as long as it held, not once per
+reading. `query_spread` adds the range, variance and standard deviation to
+each bucket, and `query_lttb` picks a few points that keep the shape of a long
+line, for a chart. This is `examples/analytics.rs`:
+
+```rust
+use tsdb_client::{Client, QueryOpts, TwaOpts, ValueType};
+
+fn main() -> Result<(), tsdb_client::Error> {
+    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let mut client = Client::connect(addr.as_str())?;
+    let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC
+    let hour = 3_600_000;
+
+    // A tank level, sent only when it changes: 10 until 22:45, then 70, then 40 at midnight.
+    let tank = client.series_create("tank3.level", ValueType::Float64, None)?;
+    let at = [t0, t0 + 45 * 60_000, t0 + hour, t0 + 2 * hour];
+    client.insert_series_values(tank, &at, &[10.0f64, 70.0, 70.0, 40.0])?;
+
+    // The plain average counts each reading once; the time-weighted one counts how long each value held.
+    let plain = client.query_agg(tank, t0..t0 + 2 * hour, hour)?;
+    let twa = client.query_twa(tank, t0..t0 + 2 * hour, hour, TwaOpts::step())?;
+    for (p, w) in plain.iter().zip(&twa) {
+        println!("hour {} avg {:.1} twa {:.1}", p.start, p.avg(), w.twa);
+    }
+
+    // How far the readings spread: range and standard deviation of the whole series.
+    let s = &client.query_spread(tank, .., 0, QueryOpts::asc())?[0];
+    println!("spread range {} stddev {:.2}", s.range, s.stddev_samp);
+
+    // 10,000 vibration readings cut to 100 points that keep the shape of the line, for a chart.
+    let vib = client.series("pump7.vibration")?;
+    let ts: Vec<i64> = (0..10_000).map(|i| t0 + i * 1000).collect();
+    let values: Vec<f32> = (0..10_000).map(|i| (i as f32 / 300.0).sin()).collect();
+    client.insert_series(vib, &ts, &values)?;
+    let chart = client.query_lttb(vib, .., 100, QueryOpts::asc())?;
+    println!("chart {} of {} points", chart.len(), ts.len());
+
+    client.close()
+}
+```
+
+It prints:
+
+```text
+hour 1699999200000 avg 40.0 twa 25.0
+hour 1700002800000 avg 70.0 twa 70.0
+spread range 60 stddev 28.72
+chart 100 of 10000 points
+```
+
+`TwaOpts::linear()` draws straight lines between readings instead of steps,
+`.max_gap(ms)` treats a longer silence as unknown, and `.desc()` and
+`.limit(n)` order and cut the buckets. The `_group` and `_bounds` forms take
+calendar groups and bucket starts as `query_group` and `query_bounds` do, and
+`query_agg_ex` is `query_agg` with an order and a limit. These need a server of
+protocol version 6 (TWA), 8 (spread) or 5 (LTTB; 9 with an order or a limit);
+an older one gets no request and the call fails with `Status::Invalid`. The
+embedded `Db` has all of them, with the same answers.
+
 ## Compression
 
 Inserts are compressed with zstd before they are sent (level 1). This makes
