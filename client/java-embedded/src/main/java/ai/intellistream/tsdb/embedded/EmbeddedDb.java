@@ -76,11 +76,12 @@ public final class EmbeddedDb implements AutoCloseable {
     /* Read: a call is using the handle; write: close. Close cannot free the engine under a running call. */
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     private MemorySegment db; /* NULL once closed */
-    private final Scratch.Pool scratch = new Scratch.Pool(); /* native copies of inserted arrays */
+    private final Scratch.Pool scratch; /* native copies of inserted arrays */
 
-    private EmbeddedDb(String dir, MemorySegment db) {
+    private EmbeddedDb(String dir, MemorySegment db, long scratchBytes) {
         this.dir = dir;
         this.db = db;
+        this.scratch = new Scratch.Pool(scratchBytes);
     }
 
     // ------------------------------------------------------------------------------------------------ opening
@@ -133,7 +134,8 @@ public final class EmbeddedDb implements AutoCloseable {
             handle = out.get(PTR, 0);
         }
         check(rc, dir);
-        return new EmbeddedDb(dir, handle);
+        return new EmbeddedDb(dir, handle,
+                options == null ? EmbeddedOptions.DEFAULT_SCRATCH_BYTES : options.scratchBytes());
     }
 
     /**
@@ -576,9 +578,10 @@ public final class EmbeddedDb implements AutoCloseable {
         Objects.checkFromIndexSize(offset, length, timestamps.length);
         Objects.checkFromIndexSize(offset, length, values.length);
         MemorySegment d = enter();
-        Scratch a = scratch.take();
+        Scratch a = null;
         int rc;
         try {
+            a = scratch.take();
             if (length == 0)
                 return;
             MemorySegment ts = a.allocateFrom(JAVA_LONG, MemorySegment.ofArray(timestamps), JAVA_LONG, offset * 8L, length);
@@ -590,8 +593,12 @@ public final class EmbeddedDb implements AutoCloseable {
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
-            scratch.give(a);
-            exit();
+            try {
+                if (a != null)
+                    scratch.give(a);
+            } finally {
+                exit(); /* even if give failed: a held read lock would block close() forever */
+            }
         }
     }
 
@@ -623,9 +630,10 @@ public final class EmbeddedDb implements AutoCloseable {
         Objects.checkFromIndexSize(offset, length, timestamps.length);
         Objects.checkFromIndexSize(offset, length, values.length);
         MemorySegment d = enter();
-        Scratch a = scratch.take();
+        Scratch a = null;
         int rc;
         try {
+            a = scratch.take();
             if (length == 0)
                 return;
             MemorySegment s = a.allocateFrom(JAVA_INT, MemorySegment.ofArray(series), JAVA_INT, offset * 4L, length);
@@ -638,8 +646,12 @@ public final class EmbeddedDb implements AutoCloseable {
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
-            scratch.give(a);
-            exit();
+            try {
+                if (a != null)
+                    scratch.give(a);
+            } finally {
+                exit(); /* even if give failed: a held read lock would block close() forever */
+            }
         }
     }
 
@@ -773,9 +785,10 @@ public final class EmbeddedDb implements AutoCloseable {
         if (many != null)
             Objects.checkFromIndexSize(off, n, many.length);
         MemorySegment d = enter();
-        Scratch a = scratch.take();
+        Scratch a = null;
         int rc;
         try {
+            a = scratch.take();
             if (n == 0)
                 return;
             MemorySegment ts = a.allocateFrom(JAVA_LONG, MemorySegment.ofArray(timestamps), JAVA_LONG, off * 8L, n);
@@ -795,8 +808,12 @@ public final class EmbeddedDb implements AutoCloseable {
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
-            scratch.give(a);
-            exit();
+            try {
+                if (a != null)
+                    scratch.give(a);
+            } finally {
+                exit(); /* even if give failed: a held read lock would block close() forever */
+            }
         }
     }
 

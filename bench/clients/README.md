@@ -82,7 +82,9 @@ What it does:
 Caveats worth knowing when reading the tables: the Python threads share one interpreter (the client releases
 the GIL while it waits for the server or sends, but the code around each call does not run in parallel), so
 32 Python connections measure the interpreter as much as the server; Java is warmed up for 1.5 s per class
-(untimed, one connection, `--warmup`) before it is measured, which is most but not all of the JIT's work; with `query_threads` at its
+(untimed, one connection, `--warmup`) before it is measured, which is most but not all of the JIT's work (a load
+warms up only its loop that copies the file into arrays; the insert calls compile inside the timed part, as they
+would in a real loader); with `query_threads` at its
 default each query of the library or the server uses all CPUs for its own decoding, so 32 concurrent queries
 compete for them, embedded or not.
 
