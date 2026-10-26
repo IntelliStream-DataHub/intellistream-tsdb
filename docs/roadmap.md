@@ -60,6 +60,18 @@ and 1.0 still need (the format and protocol changes may land in a 0.9.x, but bef
 | Failover with one writer per volume, NFS outage handling | designed in docs/ha.md |
 | Authentication, TLS, access control | until then tsdbd belongs on a trusted network only |
 
+## When hardware is available
+
+New CPU features to use once there is hardware to test on (decided with the user on 2026-10-26). Every
+kernel keeps the rule of identical results on every CPU level.
+
+| feature | where | what tsdb gains |
+|---|---|---|
+| AVX-512 VBMI/VBMI2, GFNI, BITALG, VPOPCNTDQ (beyond x86-64-v4) | Intel Ice Lake and later, AMD Zen 4 and later (testable on today's machine) | faster bit unpacking in the decimal and integer codecs (VPMULTISHIFTQB, byte permutes) |
+| AVX10.2 | Intel Nova Lake (late 2026), Diamond Rapids | AVX-512 on every core, desktops and laptops included; IEEE 754-2019 min/max for the min/max kernels; saturating float-to-integer conversions for the decimal and ALP codecs |
+| APX | Intel Nova Lake, Diamond Rapids | 32 general registers and conditional loads/stores for the bit-serial decoders (Gorilla, Chimp, DoubleDelta); a CPU level of its own in the portable build |
+| aarch64 (AWS Graviton, NEON/SVE2) | rentable now | instances about 29% cheaper than comparable x86 ones; needs an aarch64 build and kernels with the same results as x86 |
+
 ## Not planned
 
 Latest-value lookups, series metadata, quality codes, interpolated and
