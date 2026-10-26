@@ -23,8 +23,9 @@ use crate::arrays::{BucketsMany, Col, agg_queries, inserts, many_cols, points_li
 use tc::ValueType;
 
 use crate::{
-    Buckets, QueryStats, Stats, buckets, closed, column_to_py, f32_column, numpy_module, opts, points_to_py, py_column,
-    range, series_column, to_pyerr, ts_column, ts_to_py, unit, value_type, values_column, zone_name,
+    Buckets, QueryStats, Stats, TwaBuckets, buckets, closed, column_to_py, f32_column, group, numpy_module, opts,
+    points_to_py, py_column, range, rows_to_py, series_column, to_pyerr, ts_column, ts_to_py, twa_opts, value_type,
+    values_column,
 };
 
 fn value_codec(name: &str) -> PyResult<tc::ValueCodec> {
@@ -500,8 +501,10 @@ impl Db {
 
     /// Aggregates a series: one bucket per interval_ms, or one for the whole
     /// range when interval_ms is 0, as Buckets (a sequence of Bucket with
-    /// numpy columns). Empty buckets are left out.
-    #[pyo3(signature = (series, start = None, end = None, interval_ms = 0))]
+    /// numpy columns), oldest first or newest first with order="desc", at
+    /// most limit of them. Empty buckets are left out.
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = 0, *, order = "asc", limit = None))]
+    #[allow(clippy::too_many_arguments)]
     fn query_agg(
         &self,
         py: Python<'_>,
@@ -509,8 +512,11 @@ impl Db {
         start: Option<i64>,
         end: Option<i64>,
         interval_ms: i64,
+        order: &str,
+        limit: Option<u64>,
     ) -> PyResult<Buckets> {
-        self.query(py, |d| d.query_agg(series, range(start, end), interval_ms).map(buckets))
+        let o = opts(order, limit)?;
+        self.query(py, |d| d.query_agg_ex(series, range(start, end), interval_ms, o).map(buckets))
     }
 
     /// Aggregates a series by calendar units, as Client.query_group() does.
@@ -536,8 +542,7 @@ impl Db {
         limit: Option<u64>,
     ) -> PyResult<Buckets> {
         let o = opts(order, limit)?;
-        let timezone = timezone.map(zone_name).transpose()?;
-        let group = unit.map(self::unit).transpose()?.map(|u| tc::Group { unit: u, count, timezone });
+        let group = group(unit, count, timezone)?;
         self.query(py, |d| d.query_group(series, range(start, end), group.as_ref(), o).map(buckets))
     }
 
@@ -557,6 +562,251 @@ impl Db {
         let o = opts(order, limit)?;
         let bounds = ts_column(bounds)?;
         self.query(py, |d| d.query_bounds(series, range(start, end), &bounds.snap(), o).map(buckets))
+    }
+
+    /// Count, sum, min and max like query_agg(), and the spread of the values
+    /// in each bucket: range (max - min), population and sample variance and
+    /// standard deviation.
+    ///
+    /// Takes the arguments of query_agg(). The variance is computed from the
+    /// granule statistics where whole granules fall in a bucket, so it costs
+    /// about what query_agg() does.
+    ///
+    /// Returns:
+    ///     Buckets with the columns range, var_pop, var_samp, stddev_pop and
+    ///     stddev_samp beside the usual ones (and Bucket objects with those
+    ///     fields). Variances are NaN for a bucket of nulls only, the sample
+    ///     ones also for a single value.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for a negative interval.
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = 0, *, order = "asc", limit = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_spread(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        start: Option<i64>,
+        end: Option<i64>,
+        interval_ms: i64,
+        order: &str,
+        limit: Option<u64>,
+    ) -> PyResult<Buckets> {
+        let o = opts(order, limit)?;
+        self.query(py, |d| d.query_spread(series, range(start, end), interval_ms, o).map(Buckets::from))
+    }
+
+    /// The spread by calendar periods: query_group() with the columns of
+    /// query_spread(). Takes the arguments of query_group().
+    #[pyo3(signature = (series, start = None, end = None, *, unit = None, count = 1, timezone = None,
+                        order = "asc", limit = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_spread_group(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        start: Option<i64>,
+        end: Option<i64>,
+        unit: Option<&str>,
+        count: u32,
+        timezone: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+    ) -> PyResult<Buckets> {
+        let o = opts(order, limit)?;
+        let group = group(unit, count, timezone)?;
+        self.query(py, |d| d.query_spread_group(series, range(start, end), group.as_ref(), o).map(Buckets::from))
+    }
+
+    /// The spread in buckets that start at the given times: query_bounds()
+    /// with the columns of query_spread(). Takes the arguments of query_bounds().
+    #[pyo3(signature = (series, bounds, start = None, end = None, *, order = "asc", limit = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_spread_bounds(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        bounds: &Bound<'_, PyAny>,
+        start: Option<i64>,
+        end: Option<i64>,
+        order: &str,
+        limit: Option<u64>,
+    ) -> PyResult<Buckets> {
+        let o = opts(order, limit)?;
+        let bounds = ts_column(bounds)?;
+        self.query(py, |d| d.query_spread_bounds(series, range(start, end), &bounds.snap(), o).map(Buckets::from))
+    }
+
+    /// Time-weighted averages: each reading weighted by how long it held.
+    ///
+    /// A reading made once an hour counts as much as an hour of readings made
+    /// every second. Use it for values sampled irregularly or on change.
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     start: First timestamp to include (ms); None for no lower limit.
+    ///     end: Timestamp to stop before (ms); None for no upper limit.
+    ///     interval_ms: Bucket length in ms; 0 gives one bucket for the range.
+    ///     method: "step" (a value holds until the next reading) or "linear"
+    ///         (a straight line between readings).
+    ///     max_gap_ms: A gap between readings longer than this covers nothing
+    ///         (the value is stale there); 0 for no limit.
+    ///     order: "asc" (oldest first) or "desc" (newest first).
+    ///     limit: At most this many buckets; None for all, 0 for none.
+    ///
+    /// Returns:
+    ///     TwaBuckets: a sequence of TwaBucket with numpy columns start,
+    ///     twa, area, covered_ms and counts.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for a negative interval.
+    ///     ValueError: Unknown method or order.
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = 0, *, method = "step", max_gap_ms = 0,
+                        order = "asc", limit = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_twa(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        start: Option<i64>,
+        end: Option<i64>,
+        interval_ms: i64,
+        method: &str,
+        max_gap_ms: i64,
+        order: &str,
+        limit: Option<u64>,
+    ) -> PyResult<TwaBuckets> {
+        let o = twa_opts(method, max_gap_ms, order, limit)?;
+        self.query(py, |d| d.query_twa(series, range(start, end), interval_ms, o).map(TwaBuckets::from))
+    }
+
+    /// Time-weighted averages by calendar periods (days in a time zone, ...).
+    /// Takes the arguments of query_group() and method and max_gap_ms of query_twa().
+    #[pyo3(signature = (series, start = None, end = None, *, unit = None, count = 1, timezone = None,
+                        method = "step", max_gap_ms = 0, order = "asc", limit = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_twa_group(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        start: Option<i64>,
+        end: Option<i64>,
+        unit: Option<&str>,
+        count: u32,
+        timezone: Option<&Bound<'_, PyAny>>,
+        method: &str,
+        max_gap_ms: i64,
+        order: &str,
+        limit: Option<u64>,
+    ) -> PyResult<TwaBuckets> {
+        let o = twa_opts(method, max_gap_ms, order, limit)?;
+        let group = group(unit, count, timezone)?;
+        self.query(py, |d| d.query_twa_group(series, range(start, end), group.as_ref(), o).map(TwaBuckets::from))
+    }
+
+    /// Time-weighted averages in buckets that start at the given times.
+    /// Takes the arguments of query_bounds() and method and max_gap_ms of query_twa().
+    #[pyo3(signature = (series, bounds, start = None, end = None, *, method = "step", max_gap_ms = 0,
+                        order = "asc", limit = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_twa_bounds(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        bounds: &Bound<'_, PyAny>,
+        start: Option<i64>,
+        end: Option<i64>,
+        method: &str,
+        max_gap_ms: i64,
+        order: &str,
+        limit: Option<u64>,
+    ) -> PyResult<TwaBuckets> {
+        let o = twa_opts(method, max_gap_ms, order, limit)?;
+        let bounds = ts_column(bounds)?;
+        self.query(py, |d| d.query_twa_bounds(series, range(start, end), &bounds.snap(), o).map(TwaBuckets::from))
+    }
+
+    /// Downsamples a series for a chart: at most threshold rows that keep the
+    /// shape of the line (Largest-Triangle-Three-Buckets).
+    ///
+    /// The first and last rows are always kept; a range of threshold rows or
+    /// fewer comes back whole.
+    ///
+    /// Args:
+    ///     series: The series id.
+    ///     threshold: How many rows to keep at most; 0 keeps all of them.
+    ///     start: First timestamp to include (ms); None for no lower limit.
+    ///     end: Timestamp to stop before (ms); None for no upper limit.
+    ///     order: "asc" (oldest first) or "desc" (newest first): the same
+    ///         rows, in that order.
+    ///     limit: At most this many of the chosen rows; None for all.
+    ///     numpy: As for query_values().
+    ///
+    /// Returns:
+    ///     (timestamps, values), as query_values() returns them.
+    ///
+    #[pyo3(signature = (series, threshold, start = None, end = None, *, order = "asc", limit = None, numpy = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_lttb<'py>(
+        &self,
+        py: Python<'py>,
+        series: u32,
+        threshold: u64,
+        start: Option<i64>,
+        end: Option<i64>,
+        order: &str,
+        limit: Option<u64>,
+        numpy: Option<bool>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let o = opts(order, limit)?;
+        let rows = self.query(py, |d| d.query_lttb(series, range(start, end), threshold, o))?;
+        rows_to_py(py, rows, numpy)
+    }
+
+    /// Deletes the rows of a series with start <= ts < end; None is unbounded.
+    /// A row inserted after the call returned is kept.
+    #[pyo3(signature = (series, start, end))]
+    fn delete_range(&self, py: Python<'_>, series: u32, start: Option<i64>, end: Option<i64>) -> PyResult<()> {
+        self.with(py, |d| d.delete_range(series, range(start, end)))
+    }
+
+    /// Replaces the rows of a series with start <= ts < end by ts and values,
+    /// atomically, as Client.replace_range() does. No rows make it a delete.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_INVALID for a timestamp outside the range or a
+    ///         value_type other than the series'.
+    #[pyo3(signature = (series, start, end, ts, values, *, value_type = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn replace_range(
+        &self,
+        py: Python<'_>,
+        series: u32,
+        start: Option<i64>,
+        end: Option<i64>,
+        ts: &Bound<'_, PyAny>,
+        values: &Bound<'_, PyAny>,
+        value_type: Option<&str>,
+    ) -> PyResult<()> {
+        let ts = ts_column(ts)?;
+        let ty = match value_type {
+            Some(t) => self::value_type(t)?,
+            None => self.with(py, |d| d.series_type(series))?,
+        };
+        let col = values_column(values, ty)?;
+        self.with(py, |d| d.replace_range(series, range(start, end), &ts.snap(), &col.snap()))
+    }
+
+    /// Sets how long a series keeps its rows, in ms; 0 keeps them for ever.
+    /// Rows older than the clock minus limit_ms disappear from queries at
+    /// once and from disk as merges get to them.
+    fn set_retention(&self, py: Python<'_>, series: u32, limit_ms: i64) -> PyResult<()> {
+        self.with(py, |d| d.set_retention(series, limit_ms))
+    }
+
+    /// Returns the retention limit of a series in ms, 0 for none.
+    fn retention(&self, py: Python<'_>, series: u32) -> PyResult<i64> {
+        self.with(py, |d| d.retention(series))
     }
 
     /// Runs many raw float32 queries at once, in parallel on every CPU.

@@ -35,6 +35,13 @@ from test_types import (  # noqa: F401
     test_states,
     test_type_mismatches,
 )
+from test_analytics import (  # noqa: F401
+    test_aggregates_with_order_and_limit,
+    test_lttb,
+    test_spread,
+    test_time_weighted_averages,
+)
+from test_deletes import test_delete_and_replace, test_retention  # noqa: F401
 from test_zones import test_groups_are_those_of_the_c_client, test_oslo_days, test_query_bounds  # noqa: F401
 
 T0 = 1_699_999_980_000
@@ -237,7 +244,47 @@ def answers(db, ids):
         out.append(db.query_group(s, unit="hour", count=2, timezone="Europe/Oslo"))
         out.append(db.query_group(s, unit="day", order="desc", limit=1))
         out.append(db.query_bounds(s, [T0, T0 + 5_000, T0 + 3_600_000, T0 + 86_400_000]))
+        out += protocol9(db, s)
     out.append(db.state_names(ids[-1], [1, 2, None]))
+    return out
+
+
+def outcome(fn, *args, **kw):
+    """The answer, or the error code: a state series has no spread, TWA or LTTB."""
+    try:
+        return fn(*args, **kw)
+    except TsdbError as e:
+        return ("error", e.code)
+
+
+def protocol9(db, s):
+    """The protocol 9 queries, on open and bounded ranges and in a zone (the client computes
+    local bounds over TCP, the engine itself when embedded)."""
+    bounds = [T0, T0 + 5_000, T0 + 3_600_000, T0 + 86_400_000]
+    day = 86_400_000
+    out = [
+        outcome(db.query_agg, s, None, None, 600_000, order="desc", limit=5),
+        outcome(db.query_spread, s),
+        outcome(db.query_spread, s, T0, T0 + day, 600_000, order="desc", limit=7),
+        outcome(db.query_spread_group, s, unit="hour", count=3, timezone="Europe/Oslo"),
+        outcome(db.query_spread_group, s, T0 + 1, T0 + 2 * day, unit="day", timezone="America/New_York"),
+        outcome(db.query_spread_bounds, s, bounds, order="desc"),
+    ]
+    for method in ("step", "linear"):
+        for gap in (0, 90_000):
+            out += [
+                outcome(db.query_twa, s, None, None, 0, method=method, max_gap_ms=gap),
+                outcome(db.query_twa, s, T0 + 500, T0 + day, 3_600_000, method=method, max_gap_ms=gap, limit=4),
+                outcome(db.query_twa_group, s, unit="day", timezone="Europe/Oslo", method=method, max_gap_ms=gap),
+                outcome(db.query_twa_group, s, T0 + 1, T0 + day, unit="hour", timezone="Asia/Kolkata",
+                        method=method, max_gap_ms=gap, order="desc"),
+                outcome(db.query_twa_bounds, s, bounds, method=method, max_gap_ms=gap),
+            ]
+    out += [
+        outcome(db.query_lttb, s, 20, numpy=False),
+        outcome(db.query_lttb, s, 5, T0 + 2, T0 + day, order="desc", limit=3, numpy=False),
+        outcome(db.query_lttb, s, 20, limit=0, numpy=False),
+    ]
     return out
 
 

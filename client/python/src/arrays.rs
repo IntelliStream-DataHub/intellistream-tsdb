@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::buffer::{Element, PyBuffer};
-use pyo3::exceptions::{PyImportError, PyIndexError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyImportError, PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyList, PySlice, PyTuple};
@@ -376,7 +376,15 @@ pub(crate) struct Cols {
     isum: Vec<i64>,
     imin: Vec<i64>,
     imax: Vec<i64>,
+    /// Only in the results of the spread queries.
+    spread: Option<SpreadCols>,
 }
+
+/// range, var_pop, var_samp, stddev_pop, stddev_samp, a vector each.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct SpreadCols([Vec<f64>; 5]);
+
+const SPREAD_NAMES: [&str; 5] = ["range", "var_pop", "var_samp", "stddev_pop", "stddev_samp"];
 
 impl Cols {
     fn len(&self) -> usize {
@@ -384,7 +392,8 @@ impl Cols {
     }
 
     fn bucket(&self, i: usize) -> Bucket {
-        Bucket::from(tc::Bucket {
+        let spread = self.spread.as_ref().map(|s| s.0.each_ref().map(|v| v[i]));
+        let b = Bucket::from(tc::Bucket {
             start: self.start[i],
             count: self.count[i],
             sum: self.sum[i],
@@ -393,7 +402,8 @@ impl Cols {
             isum: self.isum[i],
             imin: self.imin[i],
             imax: self.imax[i],
-        })
+        });
+        Bucket { spread, ..b }
     }
 
     fn pick(&self, idx: impl Iterator<Item = usize> + Clone) -> Cols {
@@ -408,7 +418,8 @@ impl Cols {
             max: p(&self.max, idx.clone()),
             isum: p(&self.isum, idx.clone()),
             imin: p(&self.imin, idx.clone()),
-            imax: p(&self.imax, idx),
+            imax: p(&self.imax, idx.clone()),
+            spread: self.spread.as_ref().map(|s| SpreadCols(s.0.each_ref().map(|v| p(v, idx.clone())))),
         }
     }
 
@@ -418,6 +429,8 @@ impl Cols {
         (&self.start, &self.count, &self.isum, &self.imin, &self.imax)
             == (&o.start, &o.count, &o.isum, &o.imin, &o.imax)
             && (bits(&self.sum), bits(&self.min), bits(&self.max)) == (bits(&o.sum), bits(&o.min), bits(&o.max))
+            && self.spread.as_ref().map(|s| s.0.each_ref().map(|v| bits(v)))
+                == o.spread.as_ref().map(|s| s.0.each_ref().map(|v| bits(v)))
     }
 }
 
@@ -438,6 +451,19 @@ impl From<&[tc::Bucket]> for Cols {
     }
 }
 
+impl From<&[tc::SpreadBucket]> for Cols {
+    fn from(b: &[tc::SpreadBucket]) -> Cols {
+        let plain: Vec<tc::Bucket> = b.iter().map(|x| x.bucket).collect();
+        let mut s = SpreadCols::default();
+        for x in b {
+            for (v, f) in s.0.iter_mut().zip([x.range, x.var_pop, x.var_samp, x.stddev_pop, x.stddev_samp]) {
+                v.push(f);
+            }
+        }
+        Cols { spread: Some(s), ..Cols::from(&plain[..]) }
+    }
+}
+
 /// The buckets of an aggregate query, a column per field.
 ///
 /// It is a sequence of Bucket (a collections.abc.Sequence: len(), indexing,
@@ -447,7 +473,10 @@ impl From<&[tc::Bucket]> for Cols {
 /// min, max, avg, isum, imin, imax, and counts for the counts (count() is the
 /// sequence method): ``b = db.query_agg(s, start, end, 60_000);
 /// b.counts.sum(); b.max.max()``. Reading a column copies it out of the
-/// result; keep it in a variable rather than reading it in a loop.
+/// result; keep it in a variable rather than reading it in a loop. The
+/// buckets of the spread queries (query_spread*()) have five more columns:
+/// range, var_pop, var_samp, stddev_pop and stddev_samp; on other buckets
+/// reading them raises AttributeError.
 #[pyclass(frozen, sequence, module = "tsdb_client")]
 pub(crate) struct Buckets {
     cols: Cols,
@@ -459,7 +488,23 @@ impl From<Vec<tc::Bucket>> for Buckets {
     }
 }
 
+impl From<Vec<tc::SpreadBucket>> for Buckets {
+    fn from(b: Vec<tc::SpreadBucket>) -> Buckets {
+        Buckets { cols: Cols::from(&b[..]) }
+    }
+}
+
 impl Buckets {
+    fn spread_column<'py>(&self, py: Python<'py>, i: usize) -> PyResult<Bound<'py, PyAny>> {
+        match &self.cols.spread {
+            Some(s) => self.column(py, &s.0[i]),
+            None => Err(PyAttributeError::new_err(format!(
+                "{}: only the buckets of the query_spread*() calls have it",
+                SPREAD_NAMES[i]
+            ))),
+        }
+    }
+
     fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         PyList::new(py, (0..self.cols.len()).map(|i| self.cols.bucket(i)))
     }
@@ -529,6 +574,36 @@ impl Buckets {
         let avg: Vec<f64> =
             c.sum.iter().zip(&c.count).map(|(&s, &n)| if n == 0 { 0.0 } else { s / n as f64 }).collect();
         self.column(py, &avg)
+    }
+
+    /// max - min (float64; spread queries only).
+    #[getter]
+    fn range<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.spread_column(py, 0)
+    }
+
+    /// Population variances (float64; spread queries only).
+    #[getter]
+    fn var_pop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.spread_column(py, 1)
+    }
+
+    /// Sample variances (float64; spread queries only).
+    #[getter]
+    fn var_samp<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.spread_column(py, 2)
+    }
+
+    /// Population standard deviations (float64; spread queries only).
+    #[getter]
+    fn stddev_pop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.spread_column(py, 3)
+    }
+
+    /// Sample standard deviations (float64; spread queries only).
+    #[getter]
+    fn stddev_samp<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.spread_column(py, 4)
     }
 
     fn __len__(&self) -> usize {
@@ -736,5 +811,229 @@ impl BucketsMany {
 
     fn __repr__(&self, py: Python<'_>) -> String {
         format!("BucketsMany({} queries, {} buckets)", self.__len__(), self.all.bind(py).get().cols.len())
+    }
+}
+
+// ------------------------------------------------------ time-weighted averages
+
+/// The fields of many time-weighted buckets, a vector each.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct TwaCols {
+    start: Vec<i64>,
+    twa: Vec<f64>,
+    area: Vec<f64>,
+    covered_ms: Vec<i64>,
+    count: Vec<u64>,
+}
+
+impl TwaCols {
+    fn bucket(&self, i: usize) -> TwaBucket {
+        TwaBucket {
+            start: self.start[i],
+            twa: self.twa[i],
+            area: self.area[i],
+            covered_ms: self.covered_ms[i],
+            count: self.count[i],
+        }
+    }
+}
+
+/// One bucket of a time-weighted average (query_twa*()).
+///
+/// The value is weighted by how long it held: area is its integral over
+/// time (value x ms), covered_ms the time the segments cover, and twa
+/// area / covered_ms (NaN when nothing is covered). count is the number of
+/// known readings in the bucket. Equal when every field is (floats bit for bit).
+#[pyclass(frozen, module = "tsdb_client")]
+pub(crate) struct TwaBucket {
+    start: i64,
+    twa: f64,
+    area: f64,
+    covered_ms: i64,
+    count: u64,
+}
+
+impl TwaBucket {
+    fn key(&self) -> (i64, u64, u64, i64, u64) {
+        (self.start, self.twa.to_bits(), self.area.to_bits(), self.covered_ms, self.count)
+    }
+}
+
+#[pymethods]
+impl TwaBucket {
+    /// Start of the bucket, ms since the epoch (UTC); for a single bucket over
+    /// the whole range, the start of the range.
+    #[getter]
+    fn start(&self) -> i64 {
+        self.start
+    }
+
+    /// The time-weighted average, area / covered_ms (NaN when nothing is covered).
+    #[getter]
+    fn twa(&self) -> f64 {
+        self.twa
+    }
+
+    /// The integral of the value over time, in value x ms.
+    #[getter]
+    fn area(&self) -> f64 {
+        self.area
+    }
+
+    /// The time covered by segments, in ms.
+    #[getter]
+    fn covered_ms(&self) -> i64 {
+        self.covered_ms
+    }
+
+    /// Known readings in the bucket (and in the query's range).
+    #[getter]
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TwaBucket(start={}, twa={:?}, area={:?}, covered_ms={}, count={})",
+            self.start, self.twa, self.area, self.covered_ms, self.count
+        )
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other.cast::<TwaBucket>().is_ok_and(|o| o.get().key() == self.key())
+    }
+}
+
+/// The buckets of a time-weighted average query, a column per field.
+///
+/// A sequence of TwaBucket (len(), indexing, slicing, iteration, == with
+/// another TwaBuckets or a list of TwaBucket), and a numpy array per field
+/// over all buckets (a list without numpy): start, twa, area, covered_ms
+/// and counts (count() is the sequence method).
+#[pyclass(frozen, sequence, module = "tsdb_client")]
+pub(crate) struct TwaBuckets {
+    cols: TwaCols,
+}
+
+impl From<Vec<tc::TwaBucket>> for TwaBuckets {
+    fn from(b: Vec<tc::TwaBucket>) -> TwaBuckets {
+        let mut c = TwaCols::default();
+        for x in b {
+            c.start.push(x.start);
+            c.twa.push(x.twa);
+            c.area.push(x.area);
+            c.covered_ms.push(x.covered_ms);
+            c.count.push(x.count);
+        }
+        TwaBuckets { cols: c }
+    }
+}
+
+impl TwaBuckets {
+    fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        PyList::new(py, (0..self.cols.start.len()).map(|i| self.cols.bucket(i)))
+    }
+
+    fn column<'py, T>(&self, py: Python<'py>, v: &[T]) -> PyResult<Bound<'py, PyAny>>
+    where
+        T: numpy::Element + Copy + IntoPyObject<'py>,
+    {
+        slice_to_py(py, use_numpy(py, None)?, v)
+    }
+}
+
+#[pymethods]
+impl TwaBuckets {
+    /// Bucket starts, ms since the epoch (int64).
+    #[getter]
+    fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.column(py, &self.cols.start)
+    }
+
+    /// Time-weighted averages (float64; NaN where nothing is covered).
+    #[getter]
+    fn twa<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.column(py, &self.cols.twa)
+    }
+
+    /// Integrals of the value over time, value x ms (float64).
+    #[getter]
+    fn area<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.column(py, &self.cols.area)
+    }
+
+    /// Time covered by segments, ms (int64).
+    #[getter]
+    fn covered_ms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.column(py, &self.cols.covered_ms)
+    }
+
+    /// Known readings per bucket (uint64).
+    #[getter]
+    fn counts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.column(py, &self.cols.count)
+    }
+
+    fn __len__(&self) -> usize {
+        self.cols.start.len()
+    }
+
+    /// A TwaBucket, or the TwaBuckets of a slice.
+    fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let n = self.cols.start.len();
+        if let Ok(s) = key.cast::<PySlice>() {
+            let ix = s.indices(n as isize)?;
+            let c = &self.cols;
+            let mut out = TwaCols::default();
+            for k in 0..ix.slicelength {
+                let i = (ix.start + k as isize * ix.step) as usize;
+                out.start.push(c.start[i]);
+                out.twa.push(c.twa[i]);
+                out.area.push(c.area[i]);
+                out.covered_ms.push(c.covered_ms[i]);
+                out.count.push(c.count[i]);
+            }
+            return Ok(Bound::new(py, TwaBuckets { cols: out })?.into_any());
+        }
+        let i: isize = key.extract()?;
+        let j = if i < 0 { i + n as isize } else { i };
+        if j < 0 || j >= n as isize {
+            return Err(PyIndexError::new_err("bucket index out of range"));
+        }
+        Ok(Bound::new(py, self.cols.bucket(j as usize))?.into_any())
+    }
+
+    fn __iter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.list(py)?.try_iter().map(Bound::into_any)
+    }
+
+    /// Equal to another TwaBuckets (floats bit for bit) or to a list of equal TwaBucket objects.
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if let Ok(o) = other.cast::<TwaBuckets>() {
+            let o = &o.get().cols;
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            let c = &self.cols;
+            return Ok((&c.start, &c.covered_ms, &c.count) == (&o.start, &o.covered_ms, &o.count)
+                && (bits(&c.twa), bits(&c.area)) == (bits(&o.twa), bits(&o.area)));
+        }
+        match other.cast::<PyList>() {
+            Ok(l) => self.list(py)?.eq(l),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Number of buckets equal to `value` (the sequence method; the column is counts).
+    fn count(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<usize> {
+        self.list(py)?.call_method1("count", (value,))?.extract()
+    }
+
+    /// Position of the first bucket equal to `value`; ValueError if there is none.
+    #[pyo3(signature = (value, start = 0, stop = isize::MAX))]
+    fn index(&self, py: Python<'_>, value: &Bound<'_, PyAny>, start: isize, stop: isize) -> PyResult<usize> {
+        self.list(py)?.call_method1("index", (value, start, stop))?.extract()
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!("TwaBuckets({})", self.list(py)?.repr()?))
     }
 }

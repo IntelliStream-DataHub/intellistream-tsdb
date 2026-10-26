@@ -159,6 +159,48 @@ and sends those times (`tsdb_client.calendar_bounds` and `query_bounds` let
 you do the two steps yourself). With a server older than protocol version 4,
 the client sends the zone name instead.
 
+## Spread, time-weighted averages and charts
+
+```python
+from tsdb_client import Db
+
+with Db("/tmp/tsdb-analytics") as db:
+    s = db.series_create("tank1.level", "float64")
+    db.insert_series_values(s, [0, 1000, 3000, 4000], [10.0, 20.0, 30.0, 40.0])
+
+    (b,) = db.query_spread(s)                        # count, sum, min, max and the spread
+    print("spread", b.range, b.var_pop, b.stddev_pop)
+
+    (w,) = db.query_twa(s, 0, 5000)                  # each value weighted by how long it held
+    print("twa", w.twa, w.covered_ms)
+
+    ts, values = db.query_lttb(s, 3, numpy=False)    # at most 3 points that keep the shape
+    print("chart", ts)
+
+    last = db.query_agg(s, None, None, 1000, order="desc", limit=1)
+    print("last", last[0].start, last[0].sum)
+```
+
+`query_spread` gives what `query_agg` gives plus `range` (max - min), the
+population and sample variance (`var_pop`, `var_samp`) and standard deviation
+(`stddev_pop`, `stddev_samp`); `query_spread_group` and `query_spread_bounds`
+do the same by calendar periods and between given times. With numpy each is
+also a column: `db.query_spread(s, 0, t1, 60_000).stddev_pop.max()`.
+
+`query_twa` (and `query_twa_group`, `query_twa_bounds`) weighs each reading by
+how long it held, which suits readings sent only when the value changes.
+`method="linear"` draws straight lines between readings instead of steps;
+`max_gap_ms` makes a longer silence count as unknown. The result is a
+`TwaBuckets` with `start`, `twa`, `area` (value x ms), `covered_ms` and `counts`.
+
+`query_lttb` thins a series out for a chart: at most the number of points you
+ask for, chosen so the line keeps its shape.
+
+All aggregates take `order="desc"` (newest first) and `limit`. Over TCP the
+spread needs a server of protocol version 8, time-weighted averages 6, LTTB 5
+(9 with `order` or `limit`); an older server gets no request and the call
+fails with an invalid-argument error.
+
 ## Value types and nulls
 
 `series()` makes series of 32-bit floats. For other types, use
