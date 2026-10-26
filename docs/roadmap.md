@@ -63,7 +63,8 @@ and 1.0 still need (the format and protocol changes may land in a 0.9.x, but bef
 ## When hardware is available
 
 New CPU features to use once there is hardware to test on (decided with the user on 2026-10-26). Every
-kernel keeps the rule of identical results on every CPU level.
+kernel keeps the rule of identical results on every CPU level. The Zen 5 work has a task file of its own for the test machine:
+[docs/tasks/ryzen-9950x.md](tasks/ryzen-9950x.md).
 
 | feature | where | what tsdb gains |
 |---|---|---|
