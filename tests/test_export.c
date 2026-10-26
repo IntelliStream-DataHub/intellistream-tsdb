@@ -1503,6 +1503,111 @@ static void test_volumes(void)
     printf("volumes, shared dictionaries, partial files: ok\n");
 }
 
+/* ------------------------------------------------------------------ syncing a new database */
+
+/* Runs the CLI under the crashfs shim (tests/jepsen/crashfs.c, beside the CLI) with the CRASHFS_* settings in env
+ * (name, value, ..., NULL). */
+static int run_crashfs(const char *const *env, const char *const *args)
+{
+    char shim[PATH_MAX + 16], abs[PATH_MAX], self[PATH_MAX];
+    const char *slash = strrchr(cli, '/');
+    snprintf(shim, sizeof shim, "%.*s/libcrashfs.so", slash ? (int)(slash - cli) : 1, slash ? cli : ".");
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    self[n > 0 ? n : 0] = 0;
+    if (!realpath(shim, abs) && strrchr(self, '/')) { /* a TSDB_CLI elsewhere: the shim beside this test */
+        snprintf(shim, sizeof shim, "%.*s/libcrashfs.so", (int)(strrchr(self, '/') - self), self);
+    }
+    if (!realpath(shim, abs)) {
+        fprintf(stderr, "  no crashfs shim at %s (make %s)\n", shim, shim);
+        return -1;
+    }
+    const char *old = getenv("ASAN_OPTIONS");
+    char *saved = old ? strdup(old) : NULL, asan[1024];
+    snprintf(asan, sizeof asan, "%s:verify_asan_link_order=0", saved ? saved : "");
+    setenv("ASAN_OPTIONS", asan, 1);
+    setenv("LD_PRELOAD", abs, 1);
+    for (int i = 0; env[i]; i += 2)
+        setenv(env[i], env[i + 1], 1);
+    int rc = run(NULL, NULL, NULL, args);
+    unsetenv("LD_PRELOAD");
+    for (int i = 0; env[i]; i += 2)
+        unsetenv(env[i]);
+    if (saved)
+        setenv("ASAN_OPTIONS", saved, 1);
+    else
+        unsetenv("ASAN_OPTIONS");
+    free(saved);
+    return rc;
+}
+
+static bool err_lacks(const char *what)
+{
+    char *e = slurp(errfile, NULL);
+    bool lacks = !e || !strstr(e, what);
+    if (!lacks)
+        fprintf(stderr, "  (stderr mentions \"%s\": %s)\n", what, e);
+    free(e);
+    return lacks;
+}
+
+/* The crafted stream's rows, read back after a power loss: every series whole, f in the volume. Opened as the
+ * writer, which recovers: MANIFEST, rewritten in place for followers, may be torn, and a read-only open waits for
+ * a writer to publish it again. */
+static void crafted_whole(const char *dir, const char *vol)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    tsdb *d;
+    int rc = tsdb_open(dir, &o, &d);
+    if (rc)
+        fprintf(stderr, "  %s after the power loss: %s\n", dir, tsdb_strerror(rc));
+    CHECK(rc == 0);
+    if (rc)
+        return;
+    CHECK(rows_of(d, "f") == 5 && rows_of(d, "b") == 3 && rows_of(d, "s") == 3 && rows_of(d, "i") == 3);
+    CHECK(same_str(tsdb_series_path(d, lookup(d, "f")), vol));
+    tsdb_close(d);
+}
+
+/* An import into a new database writes unsynced and syncs every file system once at the end; it says it is done
+ * only after that sync, and a failed sync fails the import. An existing database keeps every sync. */
+static void test_sync(void)
+{
+    char *f = path("sync.dump"), *top = path("crash"), map[2 * PATH_MAX + 16];
+    craft(f, &(knobs){.vol = "/old/mnt/vol"});
+    sh("mkdir -p '%s'", top);
+    /* power lost the moment import exits 0: all of it is on disk, the volume it created included */
+    const char *loss[] = {"CRASHFS_ROOT", top, "CRASHFS_AT_EXIT", "1", NULL};
+    char *db = path("crash/new"), *vol = path("crash/newvol");
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", vol);
+    CHECK(run_crashfs(loss, (const char *const[]){cli, db, "import", f, "--volume", map, "--create-volumes", NULL}) ==
+          0);
+    CHECK(err_has("imported 4 series") && err_has("unsynced data lost"));
+    crafted_whole(db, vol);
+    /* the same into an existing database, synced by the engine as it goes */
+    db = path("crash/existing"), vol = path("crash/existingvol");
+    tsdb_close(open_db(db, false));
+    snprintf(map, sizeof map, "/old/mnt/vol=%s", vol);
+    CHECK(run_crashfs(loss, (const char *const[]){cli, db, "import", f, "--volume", map, "--create-volumes", NULL}) ==
+          0);
+    CHECK(err_has("imported 4 series") && err_has("unsynced data lost"));
+    crafted_whole(db, vol);
+    /* the final sync fails (EIO) on the database directory, then on a volume: the import fails and says so */
+    const char *eio[] = {"CRASHFS_ROOT", top, "CRASHFS_MODE", "eio", "CRASHFS_PROB", "1", "CRASHFS_EIO_ONLY",
+                         "syncfail", "CRASHFS_EIO_ON", "syncfs", NULL};
+    for (int k = 0; k < 2; k++) {
+        db = path(k ? "crash/new2" : "crash/syncfail-db");
+        vol = path(k ? "crash/syncfail-vol" : "crash/new2vol");
+        snprintf(map, sizeof map, "/old/mnt/vol=%s", vol);
+        CHECK(run_crashfs(eio, (const char *const[]){cli, db, "import", f, "--volume", map, "--create-volumes",
+                                                     NULL}) == 1);
+        CHECK(err_has("crashfs: EIO on syncfs") && err_has("Input/output error") &&
+              err_has("not on disk: delete it and import again") && err_lacks("imported "));
+    }
+    printf("new databases synced at the end: ok\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *cli_env = getenv("TSDB_CLI");
@@ -1549,6 +1654,7 @@ int main(int argc, char **argv)
     test_damage();
     test_crafted();
     test_volumes();
+    test_sync();
     test_golden(golden);
     test_concurrent();
     test_memory();

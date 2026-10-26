@@ -1542,24 +1542,32 @@ static bool dir_is_new(const char *dir)
 }
 
 /* Makes a database written with fsync = 0 durable: every file system it lives on (syncfs reports the writeback
- * errors of each since Linux 5.8), its directories, and the entry of its root in the parent directory. */
+ * errors of each since Linux 5.8), its directories, and the entry of its root in the parent directory. Says what
+ * failed; the import has failed then. */
 static bool sync_all(const char *dir, char **vols, uint32_t nv)
 {
-    bool ok = true;
+    char e[256];
     for (uint32_t i = 0; i <= nv; i++) {
         const char *p = i < nv ? vols[i] : dir;
-        int fd = p ? open(p, O_RDONLY | O_DIRECTORY | O_CLOEXEC) : -1;
-        if (fd < 0 || syncfs(fd) != 0 || fsync(fd) != 0)
-            ok = false;
+        int fd = open(p, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        const char *what = fd < 0 ? "open" : syncfs(fd) != 0 ? "syncfs" : fsync(fd) != 0 ? "fsync" : NULL;
+        int err = errno;
         if (fd >= 0)
             close(fd);
+        if (what) {
+            fprintf(stderr, "tsdb: import: %s %s: %s\n", what, esc(p, e, sizeof e), strerror(err));
+            return false;
+        }
     }
     char *parent = strdup(dir), *slash = parent ? strrchr(parent, '/') : NULL;
     if (slash)
         slash[slash == parent] = 0;
     int fd = !parent ? -1 : open(slash ? parent : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0 || fsync(fd) != 0)
-        ok = false;
+    bool ok = fd >= 0 && fsync(fd) == 0;
+    int err = errno;
+    if (!ok)
+        fprintf(stderr, "tsdb: import: fsync %s: %s\n", parent ? esc(slash ? parent : ".", e, sizeof e) : "the parent "
+                "directory", strerror(err));
     if (fd >= 0)
         close(fd);
     free(parent);
@@ -1827,31 +1835,36 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
     } else if ((rc = tsdb_flush(db)) != 0) {
         fprintf(stderr, "tsdb: import: writing the last rows: %s\n", tsdb_strerror(rc));
     } else {
-        double dt = now_s() - t0;
-        fprintf(stderr, "imported %" PRIu64 " series (%" PRIu64 " created, %" PRIu64 " skipped), %" PRIu64
-                        " rows in %.2f s (%.1f M rows/s)\n", im->t_series, im->t_created, im->t_skipped,
-                im->t_written_rows, dt, dt > 0 ? (double)im->t_written_rows / dt / 1e6 : 0.0);
-        ret = 0;
+        ret = 0; /* reported below, once it is on disk */
     }
     if (db) {
+        /* the volumes' paths outlive the handle: they are synced after the close */
         char **vols = NULL;
         uint32_t nv = fresh ? tsdb_volume_count(db) : 0;
-        if (nv && !(vols = calloc(nv, sizeof *vols)))
-            nv = 0;
-        for (uint32_t i = 0; i < nv; i++)
-            vols[i] = strdup(tsdb_volume_path(db, i));
+        bool oom = nv && !(vols = calloc(nv, sizeof *vols));
+        for (uint32_t i = 0; i < nv && !oom; i++)
+            oom = !(vols[i] = strdup(tsdb_volume_path(db, i)));
         int crc = tsdb_close(db); /* flushes what the error path left in the memtable */
         if (crc) {
             fprintf(stderr, "tsdb: close: %s\n", tsdb_strerror(crc));
             ret = 1;
         }
-        if (fresh && !sync_all(dir, vols, nv)) {
-            fprintf(stderr, "tsdb: import: syncing %s: %s\n", dir, strerror(errno));
+        if (fresh && (oom || !sync_all(dir, vols, nv))) {
+            if (oom)
+                fprintf(stderr, "tsdb: import: out of memory\n");
+            fprintf(stderr, "tsdb: import: %s: the new database is not on disk: delete it and import again\n",
+                    esc(dir, e, sizeof e));
             ret = 1;
         }
-        for (uint32_t i = 0; i < nv; i++)
+        for (uint32_t i = 0; vols && i < nv; i++)
             free(vols[i]);
         free(vols);
+        if (ret == 0 && !check) {
+            double dt = now_s() - t0;
+            fprintf(stderr, "imported %" PRIu64 " series (%" PRIu64 " created, %" PRIu64 " skipped), %" PRIu64
+                            " rows in %.2f s (%.1f M rows/s)\n", im->t_series, im->t_created, im->t_skipped,
+                    im->t_written_rows, dt, dt > 0 ? (double)im->t_written_rows / dt / 1e6 : 0.0);
+        }
     }
     if (in != stdin)
         fclose(in);

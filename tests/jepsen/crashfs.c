@@ -28,7 +28,8 @@
  * the error, on the strength of a sync that lied, is lost and a checker sees
  * it. One fault per process; SIGUSR2 after it is a power loss at the next
  * tracked operation, for a process that carries on. With $CRASHFS_EIO_ONLY, only files whose name
- * starts with it fail (e.g. "wal_"). If $CRASHFS_MARK is set, the path of the
+ * starts with it fail (e.g. "wal_"); with $CRASHFS_EIO_ON, only that call (write, pwrite, fsync, fdatasync
+ * or syncfs). If $CRASHFS_MARK is set, the path of the
  * file that failed is written there, so a harness knows the fault happened.
  *
  * With CRASHFS_TEAR=1 a power loss keeps what a real disk may keep rather
@@ -44,6 +45,10 @@
  *  - of the directory operations not made durable, a random subset, in the
  *    order they were made for each name: once one on a name is undone,
  *    every later one on that name (or inside it) is undone too.
+ *
+ * syncfs of a tracked file or directory makes everything on its file system
+ * durable (files that lie after an injected EIO excepted), and is a point
+ * where the EIO can be injected.
  *
  * With CRASHFS_AT_EXIT=1 the power also fails as the process exits normally:
  * what a command reported done must already be durable.
@@ -117,7 +122,7 @@ static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the powe
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
 static bool loss_at_exit;       /* CRASHFS_AT_EXIT=1 */
 static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error */
-static char mark[PATH_MAX], eio_only[64];
+static char mark[PATH_MAX], eio_only[64], eio_on[16];
 static char *fdpath[MAX_FDS];
 static file *files;
 static size_t nfiles;
@@ -132,6 +137,7 @@ REAL(write);
 REAL(pwrite);
 REAL(fsync);
 REAL(fdatasync);
+REAL(syncfs);
 REAL(rename);
 REAL(renameat);
 REAL(unlink);
@@ -164,6 +170,7 @@ __attribute__((constructor)) static void init(void)
     LOAD(pwrite);
     LOAD(fsync);
     LOAD(fdatasync);
+    LOAD(syncfs);
     LOAD(rename);
     LOAD(renameat);
     LOAD(unlink);
@@ -185,6 +192,8 @@ __attribute__((constructor)) static void init(void)
     eio_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "eio");
     if (getenv("CRASHFS_EIO_ONLY"))
         snprintf(eio_only, sizeof eio_only, "%s", getenv("CRASHFS_EIO_ONLY"));
+    if (getenv("CRASHFS_EIO_ON"))
+        snprintf(eio_on, sizeof eio_on, "%s", getenv("CRASHFS_EIO_ON"));
     if (getenv("CRASHFS_MARK"))
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
@@ -513,6 +522,8 @@ static bool eio_now(int fd, const char *what)
     const char *base = strrchr(fdpath[fd], '/') ? strrchr(fdpath[fd], '/') + 1 : fdpath[fd];
     if (eio_only[0] && strncmp(base, eio_only, strlen(eio_only)) != 0)
         return false;
+    if (eio_on[0] && strcmp(what, eio_on) != 0)
+        return false;
     eio_done = true;
     crash_requested = 0;
     struct stat st;
@@ -714,6 +725,40 @@ static int do_sync(int fd, bool data_only)
 
 int fsync(int fd) { return do_sync(fd, false); }
 int fdatasync(int fd) { return do_sync(fd, true); }
+
+int syncfs(int fd)
+{
+    if (!fd_tracked(fd))
+        return real_syncfs(fd);
+    pthread_mutex_lock(&lock);
+    maybe_crash();
+    if (eio_now(fd, "syncfs")) {
+        pthread_mutex_unlock(&lock);
+        errno = EIO;
+        return -1;
+    }
+    int r = real_syncfs(fd);
+    struct stat fs;
+    if (r == 0 && fstat(fd, &fs) == 0) {
+        for (size_t i = 0; i < nfiles; i++) {
+            file *f = &files[i];
+            struct stat st;
+            if (f->used && !f->lying && stat(f->path, &st) == 0 && st.st_dev == fs.st_dev && st.st_ino == f->ino) {
+                f->durable = st.st_size;
+                f->ndirty = 0;
+                f->nold = 0;
+            }
+        }
+        for (size_t i = 0; i < ndops; i++) {
+            struct stat st;
+            if (!dops[i].done && !(lying_dir[0] && !strcmp(lying_dir, dops[i].dir)) &&
+                (stat(dops[i].dir, &st) != 0 || st.st_dev == fs.st_dev))
+                dops[i].done = true;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return r;
+}
 
 static int do_rename(int ofd, const char *oldp, int nfd, const char *newp, bool at)
 {
