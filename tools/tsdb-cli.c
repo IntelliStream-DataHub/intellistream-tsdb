@@ -685,6 +685,8 @@ int main(int argc, char **argv)
         ret = cmd_import(db, argv[3], stdin);
     } else if (strcmp(cmd, "import") == 0) {
         ret = cmd_import(db, NULL, csv);
+        if (csv != stdin)
+            fclose(csv); /* the cookie stream of dump_import_main frees its read-ahead buffer */
     } else if (strcmp(cmd, "query") == 0) {
         ret = cmd_query(db, argc - 3, argv + 3);
     } else if (strcmp(cmd, "create") == 0) {

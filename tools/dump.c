@@ -478,11 +478,13 @@ int dump_export_main(const char *dir, int argc, char **argv)
     }
     if (from >= to) {
         fprintf(stderr, "tsdb: export: --from must be before --to\n");
+        free(pat);
         return 2;
     }
     crc_init();
     if (access(dir, F_OK) != 0) {
         fprintf(stderr, "tsdb: %s does not exist\n", dir);
+        free(pat);
         return 1;
     }
     tsdb_options o;
@@ -494,6 +496,7 @@ int dump_export_main(const char *dir, int argc, char **argv)
     int rc = tsdb_open(dir, &o, &db);
     if (rc) {
         fprintf(stderr, "tsdb: %s: %s\n", dir, tsdb_strerror(rc));
+        free(pat);
         return 1;
     }
 
@@ -503,12 +506,17 @@ int dump_export_main(const char *dir, int argc, char **argv)
     if (out_name && strcmp(out_name, "-") != 0) {
         if (asprintf(&tmp, "%s.partial", out_name) < 0 || !(out = fopen(tmp, "wb"))) {
             fprintf(stderr, "tsdb: export: %s: %s\n", tmp ? tmp : out_name, strerror(errno));
+            tsdb_close(db);
+            free(tmp);
+            free(pat);
             return 1;
         }
     } else {
         out_name = "standard output";
         if (isatty(STDOUT_FILENO)) {
             fprintf(stderr, "tsdb: export: not writing a binary stream to a terminal; use -o FILE or a pipe\n");
+            tsdb_close(db);
+            free(pat);
             return 2;
         }
     }
@@ -522,6 +530,18 @@ int dump_export_main(const char *dir, int argc, char **argv)
     x.valid = malloc(DUMP_CHUNK_ROWS / 8);
     if (!x.zc || !x.ts || !x.val || !x.valid) {
         fprintf(stderr, "tsdb: out of memory\n");
+        if (tmp) {
+            fclose(out);
+            unlink(tmp);
+        }
+        tsdb_close(db);
+        if (x.zc)
+            ZSTD_freeCCtx(x.zc);
+        free(x.ts);
+        free(x.val);
+        free(x.valid);
+        free(tmp);
+        free(pat);
         return 1;
     }
     double t0 = now_s();
@@ -1125,12 +1145,16 @@ static int prefixed_close(void *arg)
     return rc;
 }
 
-int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
+/* Everything the importer owns is freed by dump_import_main, so that no return path can leak it. */
+static int import_run(const char *dir, int argc, char **argv, FILE **csv, importer *im)
 {
     const char *in_name = NULL;
     bool check = false, verify = true, dump_opts = false;
-    importer im = {.existing = EXIST_ERROR, .batch_rows = 1 << 20};
-    im.maps = calloc((size_t)argc + 1, sizeof *im.maps);
+    im->maps = calloc((size_t)argc + 1, sizeof *im->maps);
+    if (!im->maps) {
+        fprintf(stderr, "tsdb: out of memory\n");
+        return 1;
+    }
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (a[0] == '-' && a[1])
@@ -1138,26 +1162,26 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
         if (strcmp(a, "--check") == 0)
             check = true;
         else if (strcmp(a, "--skip-existing") == 0)
-            im.existing = EXIST_SKIP;
+            im->existing = EXIST_SKIP;
         else if (strcmp(a, "--merge") == 0)
-            im.existing = EXIST_MERGE;
+            im->existing = EXIST_MERGE;
         else if (strcmp(a, "--replace") == 0)
-            im.existing = EXIST_REPLACE;
+            im->existing = EXIST_REPLACE;
         else if (strcmp(a, "--create-volumes") == 0)
-            im.create_volumes = true;
+            im->create_volumes = true;
         else if (strcmp(a, "--no-verify") == 0)
             verify = false;
         else if (strcmp(a, "--volume") == 0 && v && strchr(v, '=')) {
             char *s = strdup(v), *eq = strchr(s, '=');
             *eq = 0;
-            im.maps[im.nmaps++] = (vmap){s, eq + 1};
+            im->maps[im->nmaps++] = (vmap){s, eq + 1};
             i++;
         } else if (strcmp(a, "--batch-rows") == 0 && v) {
             char *end;
             unsigned long long n = strtoull(v, &end, 10);
             if (*end || end == v || n < 1 || n > 100000000)
                 import_usage();
-            im.batch_rows = (size_t)n;
+            im->batch_rows = (size_t)n;
             i++;
         } else if (!in_name && (a[0] != '-' || strcmp(a, "-") == 0)) {
             in_name = a;
@@ -1176,6 +1200,12 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
     static char ibuf[1 << 20];
     setvbuf(in, ibuf, _IOFBF, sizeof ibuf);
     prefixed *pre = calloc(1, sizeof *pre);
+    if (!pre) {
+        fprintf(stderr, "tsdb: out of memory\n");
+        if (in != stdin)
+            fclose(in);
+        return 1;
+    }
     pre->f = in;
     /* 16 bytes: an export stream has NUL bytes there (its version), CSV text never has; so a stream whose magic
      * is damaged is refused rather than read as CSV */
@@ -1185,6 +1215,9 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
             fprintf(stderr, "tsdb: import: %s is not a tsdb export stream%s\n", in_name,
                     check || !dump_opts ? (check ? "" : ", nor CSV text (a damaged stream?)")
                                         : " (the options are for export streams; CSV takes none)");
+            free(pre);
+            if (in != stdin)
+                fclose(in);
             return 1;
         }
         *csv = fopencookie(pre, "r", (cookie_io_functions_t){.read = prefixed_read, .close = prefixed_close});
@@ -1198,6 +1231,8 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
         free(pre);
         if (fseek(in, 8, SEEK_SET) != 0) {
             fprintf(stderr, "tsdb: import: %s: %s\n", in_name, strerror(errno));
+            if (in != stdin)
+                fclose(in);
             return 1;
         }
     } else {
@@ -1205,13 +1240,16 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
         in = fopencookie(pre, "r", (cookie_io_functions_t){.read = prefixed_read, .close = prefixed_close});
         if (!in) {
             fprintf(stderr, "tsdb: import: %s\n", strerror(errno));
+            if (pre->f != stdin)
+                fclose(pre->f);
+            free(pre);
             return 1;
         }
     }
-    im.in = in;
-    im.in_name = in_name;
-    im.off = 8;
-    im.zd = ZSTD_createDCtx();
+    im->in = in;
+    im->in_name = in_name;
+    im->off = 8;
+    im->zd = ZSTD_createDCtx();
     double t0 = now_s();
     int ret = 1;
     tsdb *db = NULL; /* none with --check: every series is taken as new and every volume as present */
@@ -1222,45 +1260,55 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
         int rc = tsdb_open(dir, &o, &db);
         if (rc) {
             fprintf(stderr, "tsdb: %s: %s\n", dir, tsdb_strerror(rc));
+            if (in != stdin)
+                fclose(in);
             return 1;
         }
     }
-    im.db = db;
-    im.ts = malloc(im.batch_rows * 8 + DUMP_CHUNK_MAX * 8);
-    im.val = malloc(im.batch_rows * 8 + DUMP_CHUNK_MAX * 8);
-    im.valid = malloc((im.batch_rows + DUMP_CHUNK_MAX) / 8 + 1);
-    if (!im.ts || !im.val || !im.valid || !im.zd) {
+    im->db = db;
+    im->ts = malloc(im->batch_rows * 8 + DUMP_CHUNK_MAX * 8);
+    im->val = malloc(im->batch_rows * 8 + DUMP_CHUNK_MAX * 8);
+    im->valid = malloc((im->batch_rows + DUMP_CHUNK_MAX) / 8 + 1);
+    if (!im->ts || !im->val || !im->valid || !im->zd) {
         fprintf(stderr, "tsdb: out of memory\n");
+        if (db)
+            tsdb_close(db);
+        if (in != stdin)
+            fclose(in);
         return 1;
     }
     char e[256];
     int rc = 0;
     if (check || (seekable && verify)) {
-        im.apply = false;
-        rc = im_pass(&im, true);
+        im->apply = false;
+        rc = im_pass(im, true);
         if (!rc && !check) {
             if (fseek(in, 0, SEEK_SET) != 0) {
                 fprintf(stderr, "tsdb: import: %s: %s\n", in_name, strerror(errno));
+                if (db)
+                    tsdb_close(db);
+                if (in != stdin)
+                    fclose(in);
                 return 1;
             }
-            im.off = 0;
+            im->off = 0;
         }
     }
     if (!rc && !check) {
-        im.apply = true;
-        rc = im_pass(&im, !(seekable && verify));
+        im->apply = true;
+        rc = im_pass(im, !(seekable && verify));
     }
     if (rc) {
-        fprintf(stderr, "tsdb: import: %s: %s\n", in_name, im.err);
-        if (im.apply) {
-            if (im.in_series && im.created && im.written) {
-                int drc = tsdb_delete_range(db, im.id, im.min_written, im.max_written + 1);
-                fprintf(stderr, "tsdb: import: series %s, which this import created, %s\n", esc(im.name, e, sizeof e),
+        fprintf(stderr, "tsdb: import: %s: %s\n", in_name, im->err);
+        if (im->apply) {
+            if (im->in_series && im->created && im->written) {
+                int drc = tsdb_delete_range(db, im->id, im->min_written, im->max_written + 1);
+                fprintf(stderr, "tsdb: import: series %s, which this import created, %s\n", esc(im->name, e, sizeof e),
                         drc ? "could not be emptied again" : "was emptied again");
-            } else if (im.in_series && im.written) {
-                fprintf(stderr, "tsdb: import: series %s is partly imported\n", esc(im.name, e, sizeof e));
+            } else if (im->in_series && im->written) {
+                fprintf(stderr, "tsdb: import: series %s is partly imported\n", esc(im->name, e, sizeof e));
             }
-            fprintf(stderr, "tsdb: import: %" PRIu64 " series before it were imported completely\n", im.t_series);
+            fprintf(stderr, "tsdb: import: %" PRIu64 " series before it were imported completely\n", im->t_series);
         } else if (!check) {
             fprintf(stderr, "tsdb: import: nothing was written\n");
         }
@@ -1268,12 +1316,12 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
         double dt = now_s() - t0;
         if (check)
             fprintf(stderr, "%s: a whole tsdb export stream, version %u, from tsdb %s (format %u): %" PRIu64
-                            " series, %" PRIu64 " rows\n", in_name, im.version, im.src_version, im.src_format,
-                    im.t_series, im.t_rows);
+                            " series, %" PRIu64 " rows\n", in_name, im->version, im->src_version, im->src_format,
+                    im->t_series, im->t_rows);
         else
             fprintf(stderr, "imported %" PRIu64 " series (%" PRIu64 " created, %" PRIu64 " skipped), %" PRIu64
-                            " rows in %.2f s (%.1f M rows/s)\n", im.t_series, im.t_created, im.t_skipped,
-                    im.t_written_rows, dt, dt > 0 ? (double)im.t_written_rows / dt / 1e6 : 0.0);
+                            " rows in %.2f s (%.1f M rows/s)\n", im->t_series, im->t_created, im->t_skipped,
+                    im->t_written_rows, dt, dt > 0 ? (double)im->t_written_rows / dt / 1e6 : 0.0);
         ret = 0;
     }
     if (db) {
@@ -1285,7 +1333,15 @@ int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
     }
     if (in != stdin)
         fclose(in);
-    ZSTD_freeDCtx(im.zd);
+    return ret;
+}
+
+int dump_import_main(const char *dir, int argc, char **argv, FILE **csv)
+{
+    importer im = {.existing = EXIST_ERROR, .batch_rows = 1 << 20};
+    int ret = import_run(dir, argc, argv, csv, &im);
+    if (im.zd)
+        ZSTD_freeDCtx(im.zd);
     free(im.ts);
     free(im.val);
     free(im.valid);
