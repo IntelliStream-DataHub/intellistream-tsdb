@@ -702,6 +702,7 @@ What tsdb takes from ALP, codec by codec:
 | ALP | never written | the codec, in float32 as DuckDB does | (implemented and measured, not chosen; see below) |
 | float64 fixed point | kind 11 | as `decimal_bp` | two ways to rebuild a value |
 | packed bit delta | kind 15, an AUTO candidate | bit-packing per vector of 1024 | zigzag deltas of the raw bit patterns, float32 and float64 |
+| dictionary | kind 16, a merge candidate | bit-packing per vector of 1024 | ranks among the distinct values, float32 and float64 |
 | `decimal` | kind 3, still read | sampling; exceptions | 1/2/4-byte deltas left to ZSTD; AUTO no longer writes it |
 
 #### Fixed point: `decimal_bp` (src/codec.c)
@@ -883,10 +884,79 @@ only: the study behind it (2026-10) also tried patching the few widest deltas
 of a vector as exceptions, which saved 0.16 bits a value on `tank_psi`, not
 enough for a second layout.
 
+#### Dictionary (kind 16, src/codec_typed.c) and two efforts
+
+A pressure read by an ADC and converted to psi, or printed at 0.001 bar while the
+instrument resolves about 0.05, takes only the few hundred values the sensor's
+integer steps map to. Neither fixed point (no decimal scale fits the psi values;
+the bar values pay for codes that never occur) nor the bit delta (it pays for the
+scale as well as the step) sees that. The dictionary stores the distinct values in
+numeric order and then each value's rank among them, as zigzag deltas packed per
+vector of 1024 the way `BLK_INT` packs integers: neighbouring readings have
+neighbouring ranks, so a delta takes as few bits as the sensor's step.
+
+```
+u32 nd | BLK_INT stream of the nd sorted keys | per vector: u8 bits (0..22), packed rank deltas
+```
+
+A key is the bit pattern made monotone as an unsigned integer, so 0.0 and -0.0,
+or NaNs with other payloads, stay apart and come back bit for bit. A block takes
+at most 2048 distinct values and at most a quarter of its rows. On the UCI
+hydraulic rig (`bench/hydraulic`) the six pressures in psi shrink to 0.14-0.20
+times their float64 size and 0.44-0.63 times their float32 size, PS3 in bar to
+0.69 times; the whole rig to 0.65 times (float32) and 0.29 times (float64). On the
+synthetic sensors of `tsdb-bench`, which have no such steps, it changes 3%
+(float32) and 16% (float64).
+
+Building it costs several times the encode of the codecs it competes with (a hash
+of every value, or a table indexed by the fixed-point integer, then a ZSTD pass of
+its own), so AUTO has two efforts (`codec_ctx.effort`), chosen by who writes:
+
+- **Inserts and memtable flushes write `CODEC_FAST`**: float32 as described
+  below without the dictionary; float64 fixed point up to 16 bits a value, else
+  wider fixed point, Gorilla's XOR and byte split, each compressed in full and the
+  smallest kept. Insert speed is that of the codecs before the dictionary (means
+  of 5: hydraulic float32 load 2.87 to 2.52 s, float64 2.28 to 2.28 s;
+  `insert-bench` and `tsdb-bench` loads equal or faster).
+- **Merges write `CODEC_MERGE`**: the dictionary joins the candidates, and
+  float64 ranks bit delta and ALP_rd on a sample as float32 does. Fixed point up
+  to 16 bits a value is replaced by the dictionary only when its integers are not
+  dense (two runs of 64 fill at most half the codes they span), span under 65536
+  and the ranks come out smaller than the integers before compression. Merges
+  never copy a granule of a part no merge has written: they re-encode it, once,
+  and copy granules of their own outputs as before.
+
+A part an insert wrote that has nothing to merge with (the only part of its
+partition) is rewritten alone once its partition has been idle for
+`merge_idle_s`, and by `tsdb_optimize`, so every part at rest ends up encoded at
+merge effort. That rewrite is the only background write the main branch did not
+do: 0.70 bytes per byte loaded where each partition got a single insert (PS3,
+float32), nothing where partitions got several parts. Merges write less in total,
+since their sources shrink after the first: loading the hydraulic rig in windows of
+98304 values with background merges until they settle, merges wrote 3.4 bytes per
+byte loaded against 5.2 (float32) and 1.6 against 4.6 (float64). The cost is CPU
+in the merge thread: `tsdb_optimize` of the whole rig, granules aligned so that
+the main branch copied every one, took 1.36 to 2.72 s (float32) and 1.68 to 3.42 s
+(float64), 65 and 51 million rows a second on one thread, still above what inserts
+deliver (the `tsdb-bench` load, 4 writers, ran the same 192 merges in the same
+time as before).
+
+Tried and left out: the old byte decimal (kind 3) with ZSTD as a merge candidate
+(5-20% smaller on some pressures, at 2-4 times the encode); plain values with
+ZSTD and Chimp128 after the dictionary (they won 54 and 9 of 1614 granules of one
+sensor); a sample to gate the dictionary (runs see a fraction of a block's
+distinct values: 700 of 2000 on a sine in psi); a density gate on the whole block
+that also skips fixed point of more than half its codes (PS4 in psi 20% larger).
+
+Block headers: a byte whose low 7 bits name the kind and whose high bit says the
+block is ZSTD-compressed (format 6; format 5 had 4 bits of kind and kinds 0 to 15
+were all taken).
+
 #### How AUTO picks (src/codec.c, `block_encode_f32`)
 
 1. **Fixed point first.** If `decimal_bp` fits in 16 bits a value or less, it
-   is kept without comparing anything else.
+   is kept without comparing anything else (in merges, unless the dictionary
+   of its integers comes out smaller, see above).
 2. **Otherwise compare.** Chimp, bit delta (deltas of the bit patterns,
    whole for ZSTD, and packed per vector), byte-stream split and ALP_rd each
    encode a sample of 8 KB (16 runs of 128 consecutive values spread over the
@@ -1037,14 +1107,18 @@ for a vector with a delta wider than 32 bits):
 u8 scale|flag | u32 nexc | nexc x (u32 pos, u64 bits) | int64 block
 ```
 
-AUTO keeps fixed point outright at 16 bits a value or less. Otherwise the
-other candidates (Gorilla's XOR encoding of the 64-bit patterns, byte-stream
+AUTO keeps fixed point outright at 16 bits a value or less (merges try the
+dictionary of its integers too). Otherwise inserts (`CODEC_FAST`) encode wider
+fixed point, Gorilla's XOR and byte split in full and keep the smallest; merges
+(`CODEC_MERGE`) rank the candidates (Gorilla's XOR encoding of the 64-bit patterns, byte-stream
 split, the packed bit delta and ALP_rd) first encode a sample: 8 runs of 128
 consecutive values spread over the granule, the delta per run so that the
 seams do not widen its vectors, each compressed with ZSTD as its block would
 be. The sample's size, scaled to the granule, ranks them; only the best and any
 within 3% of it are encoded in full (with ZSTD where it saves 3%), alongside
-fixed point if it applies, and the smallest block is kept. Two cases encode
+fixed point if it applies and the dictionary if the block has few enough
+distinct values, and the smallest block is kept; a candidate whose estimate is
+25% above the dictionary's real block is not encoded. Two cases encode
 every candidate in full: a sample under 24 bits a value, where ZSTD's matches
 decide and a sample's small window underrates some transforms more than
 others; and a full block that comes out more than 10% below its estimate,

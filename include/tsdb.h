@@ -60,8 +60,10 @@ enum {
 
 /* Value encodings. AUTO stores a granule as scaled decimal integers when that
  * is exactly lossless (typical for sensor readings); otherwise it keeps the
- * smallest of Chimp, bit-delta and byte-split after ZSTD. GORILLA and CHIMP
- * force one XOR codec for every granule. All are lossless. */
+ * smallest of XOR, bit deltas, byte split and ALP_rd after ZSTD. Background
+ * merges also try a dictionary of the granule's distinct values (readings
+ * converted to other units), and re-encode what inserts wrote. GORILLA and
+ * CHIMP force one XOR codec for every granule. All are lossless. */
 enum { TSDB_VALUES_AUTO = 0, TSDB_VALUES_GORILLA = 1, TSDB_VALUES_CHIMP = 2 };
 
 typedef struct tsdb_options {

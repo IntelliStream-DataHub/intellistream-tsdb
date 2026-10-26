@@ -293,6 +293,7 @@ static int pw_emit(part_writer *w, uint32_t series, int type, const int64_t *ts,
     granule g;
     memset(&g, 0, sizeof g);
     uint8_t *start = w->buf + w->len;
+    w->cc->effort = w->effort; /* the context comes from a pool shared with other writers */
     size_t tl = block_encode_ts(w->cc, w->zstd_level, ts, n, start);
     size_t vl = tl ? block_encode_vals(w->cc, w->zstd_level, w->value_codec, type, v, n, start + tl) : 0;
     if (!vl)

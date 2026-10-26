@@ -216,7 +216,9 @@ static void test_codecs(void)
             /* AUTO, as parts store them: float64 and float32 through the block layer, with and without ZSTD */
             codec_ctx *bc = codec_new();
             uint8_t *blk = malloc(block_bound(M) + BLK_SLACK);
-            for (int level = 0; level <= 1; level++) {
+            for (int le = 0; le < 4; le++) { /* ZSTD off and on, as inserts and as merges write them */
+                int level = le & 1;
+                bc->effort = le >> 1 ? CODEC_MERGE : CODEC_FAST;
                 size_t len = block_encode_vals(bc, level, 0, TSDB_FLOAT64, d, M, blk);
                 CHECK(len > 0 && block_decode_vals(bc, TSDB_FLOAT64, blk, len, M, d2) == 0 && !memcmp(d, d2, M * 8));
                 len = block_encode_vals(bc, level, 0, TSDB_FLOAT32, u, M, blk);
@@ -225,8 +227,10 @@ static void test_codecs(void)
             free(blk);
             codec_free(bc);
         }
-        /* the smooth values pick the packed bit deltas, the random doubles ALP_rd */
+        /* the smooth values pick the packed bit deltas, the random doubles ALP_rd; float64 only in merges,
+         * inserts keep the kinds that compress fast */
         codec_ctx *bc = codec_new();
+        bc->effort = CODEC_MERGE;
         uint8_t *blk = malloc(block_bound(M) + BLK_SLACK);
         for (int i = 0; i < M; i++) {
             /* a filling tank in bar with sensor noise, converted to psi (codec-bench's tank_psi) */
@@ -235,15 +239,21 @@ static void test_codecs(void)
             f[i] = (float)x;
         }
         size_t len = block_encode_vals(bc, 1, 0, TSDB_FLOAT64, d, M, blk);
-        CHECK((blk[0] & 0x0f) == BLK_DELTA_BP);
+        CHECK((blk[0] & BLK_KIND_MASK) == BLK_DELTA_BP);
         len = block_encode_vals(bc, 1, 0, TSDB_FLOAT32, u, M, blk);
-        CHECK((blk[0] & 0x0f) == BLK_DELTA_BP);
+        CHECK((blk[0] & BLK_KIND_MASK) == BLK_DELTA_BP);
+        bc->effort = CODEC_FAST;
+        len = block_encode_vals(bc, 1, 0, TSDB_FLOAT64, d, M, blk);
+        CHECK((blk[0] & BLK_KIND_MASK) == BLK_XOR64 || (blk[0] & BLK_KIND_MASK) == BLK_BYTESPLIT64);
+        len = block_encode_vals(bc, 1, 0, TSDB_FLOAT32, u, M, blk);
+        CHECK((blk[0] & BLK_KIND_MASK) == BLK_DELTA_BP);
+        bc->effort = CODEC_MERGE;
         for (int i = 0; i < M; i++) {
             double x = (double)(rnd() >> 11) / 9007199254740992.0 * 1000;
             memcpy(&d[i], &x, 8);
         }
         len = block_encode_vals(bc, 1, 0, TSDB_FLOAT64, d, M, blk);
-        CHECK((blk[0] & 0x0f) == BLK_ALPRD);
+        CHECK((blk[0] & BLK_KIND_MASK) == BLK_ALPRD);
         CHECK(block_decode_vals(bc, TSDB_FLOAT64, blk, len, M, d2) == 0 && !memcmp(d, d2, M * 8));
         free(blk);
         codec_free(bc);
@@ -1741,6 +1751,88 @@ static void test_idle_merge(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+typedef struct solo_info {
+    int n;
+    uint32_t level;
+    uint64_t bytes;
+} solo_info;
+
+static void solo_part(void *ctx, const tsdb_part_info *p)
+{
+    solo_info *s = ctx;
+    s->n++;
+    s->level = p->level;
+    s->bytes = p->bytes;
+}
+
+/* A part only an insert wrote is encoded at insert speed (CODEC_FAST, no dictionary). With nothing to merge it
+ * with it is rewritten alone at merge effort once its partition is idle, and by tsdb_optimize; the rewritten part
+ * (level 1) is left alone after that. Values of few distinct patterns (psi from an ADC) shrink. */
+static void test_solo_rewrite(const char *base)
+{
+    enum { N = 20000 };
+    int64_t *ts = malloc(N * sizeof *ts);
+    float *v = malloc(N * sizeof *v);
+    const int64_t t0 = 1700006400000;
+    uint64_t r = 7;
+    int code = 2000; /* an ADC's codes walking, 0.0125 bar a step, converted to psi */
+    for (int i = 0; i < N; i++) {
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        code += (int)(r >> 62) - 1 - (code > 2100) + (code < 1900);
+        ts[i] = t0 + (int64_t)i * 1000;
+        v[i] = (float)(14.503773773 * 0.0125 * code);
+    }
+    for (int optimize = 0; optimize <= 1; optimize++) {
+        char dir[512];
+        snprintf(dir, sizeof dir, "%s/tsdb-solo-%d-%d", base, (int)getpid(), optimize);
+        rm_rf(dir);
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.granule_rows = 1024;
+        o.fsync = 0;
+        o.wal_max_batch_rows = 100; /* the insert becomes a part */
+        o.merge_idle_s = optimize ? -1 : 1;
+        tsdb *db;
+        OK(tsdb_open(dir, &o, &db));
+        uint32_t id;
+        OK(tsdb_series(db, "psi", &id));
+        OK(tsdb_insert_series(db, id, ts, v, N));
+        solo_info a = {0, 0, 0}, b = {0, 0, 0};
+        tsdb_foreach_part(db, solo_part, &a);
+        CHECK(a.n == 1 && a.level == 0);
+        if (optimize) {
+            OK(tsdb_optimize(db));
+        } else {
+            for (int tries = 0; tries < 100 && b.level == 0; tries++) { /* idle after 1 s; merges look every second */
+                usleep(100000);
+                b.n = 0;
+                tsdb_foreach_part(db, solo_part, &b);
+            }
+        }
+        b.n = 0;
+        tsdb_foreach_part(db, solo_part, &b);
+        CHECK(b.n == 1 && b.level == 1);
+        CHECK(b.bytes * 10 < a.bytes * 9); /* the dictionary: 26456 to 22624 bytes */
+        tsdb_stats st;
+        OK(tsdb_get_stats(db, &st));
+        uint64_t merges = st.merges;
+        if (!optimize)
+            usleep(2500000); /* idle merges look again: a part a merge wrote is not rewritten */
+        else
+            OK(tsdb_optimize(db));
+        OK(tsdb_get_stats(db, &st));
+        CHECK(st.merges == merges);
+        tsdb_points p = {0};
+        OK(tsdb_query_points(db, id, INT64_MIN + 1, INT64_MAX, &p));
+        CHECK(p.n == N && memcmp(p.ts, ts, N * sizeof *ts) == 0 && memcmp(p.values, v, N * sizeof *v) == 0);
+        tsdb_points_free(&p);
+        OK(tsdb_close(db));
+        rm_rf(dir);
+    }
+    free(ts);
+    free(v);
+}
+
 /* tsdb_get_volume_stats: what tsdbd --metrics-port reports. */
 static void test_volume_stats(const char *base)
 {
@@ -1967,6 +2059,7 @@ int main(int argc, char **argv)
     test_same_keys(base);
     printf("idle partitions merged\n");
     test_idle_merge(base);
+    test_solo_rewrite(base);
     printf("volume statistics\n");
     test_volume_stats(base);
     test_merging_parts(base);

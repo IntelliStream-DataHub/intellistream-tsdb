@@ -31,7 +31,7 @@ typedef struct eng eng;
  * between the index and the footer; 5: the spread (m2 or the sum of squares) in
  * granule entries (160 bytes), tombstones as in 4. Databases of older versions
  * are refused (no release had them). */
-#define FORMAT_VERSION 5
+#define FORMAT_VERSION 6
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -138,8 +138,11 @@ uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 #define BLK_BYTESPLIT64 13 /* byte stream split of float64 */
 #define BLK_INT 14         /* int64: zigzag deltas bit-packed per 1024 values */
 #define BLK_DELTA_BP 15    /* float32 or float64: zigzag deltas of the bit patterns, bit-packed per 1024 */
-/* A kind names the transform; the series' type gives the width where both exist (BLK_ALPRD, BLK_DELTA_BP). */
-#define BLK_ZSTD 0x10 /* the transform output is additionally ZSTD compressed */
+#define BLK_DICT 16        /* float32 or float64: sorted distinct values, ranks as bit-packed zigzag deltas */
+/* A kind names the transform; the series' type gives the width where both exist (BLK_ALPRD, BLK_DELTA_BP,
+ * BLK_DICT). The header byte holds the kind in its low 7 bits (format 6; 4 bits before). */
+#define BLK_KIND_MASK 0x7f
+#define BLK_ZSTD 0x80 /* the transform output is additionally ZSTD compressed */
 #define BLK_SLACK 32  /* decoders may read up to this many bytes past a block */
 
 typedef struct codec_ctx {
@@ -150,7 +153,17 @@ typedef struct codec_ctx {
     size_t scratch_cap;
     uint8_t *alt; /* candidate block while choosing a value encoding */
     size_t alt_cap;
+    uint8_t *work; /* fixed point's integers and the dictionary's table of them (fixed_or_dict) */
+    size_t work_cap;
+    int effort; /* CODEC_FAST or CODEC_MERGE, an input of AUTO like the values: the part writer sets it */
 } codec_ctx;
+
+/* How hard AUTO looks. Inserts and memtable flushes write CODEC_FAST: the candidates that pay for themselves
+ * at insert speed. Merges re-encode every row they write (granules of parts no merge has written yet included,
+ * see merge_parts) and add the candidates that cost several times the encode: the dictionary. Decoding does
+ * not depend on it; the same values and effort give the same bytes on every CPU level. */
+#define CODEC_FAST 0
+#define CODEC_MERGE 1
 
 size_t dd_bound(size_t n);
 size_t gorilla_bound(size_t n);
@@ -209,13 +222,29 @@ int block_decode_vals(codec_ctx *c, int type, const uint8_t *blk, size_t len, si
 /* shared by the codec files */
 int codec_scratch_reserve(codec_ctx *c, size_t need);
 size_t block_wrap(codec_ctx *c, int level, int kind, size_t inner, uint8_t *out);
+size_t block_wrap_src(codec_ctx *c, int level, int kind, const uint8_t *src, size_t inner, uint8_t *out);
+int codec_alt_reserve(codec_ctx *c, size_t need);
+int codec_work_reserve(codec_ctx *c, size_t need);
 /* a block's transform kind and its (decompressed) transform bytes */
 int block_open(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int *kind, const uint8_t **p, size_t *plen);
 /* AUTO's choice among transforms (codec_typed.c): enc encodes n values with one kind, 0 if not applicable */
 typedef size_t (*codec_kind_fn)(int kind, const void *v, size_t n, uint8_t *out);
 size_t auto_pick(codec_ctx *c, int level, const int *kinds, size_t nk, codec_kind_fn enc, const void *v, size_t n,
-                 size_t width, int pre_kind, size_t pre_inner, double all_bits, double surprise, uint8_t *out);
+                 size_t width, int pre_kind, size_t pre_inner, size_t have, double all_bits, double surprise,
+                 uint8_t *out);
+size_t dict_block(codec_ctx *c, int level, const void *v, size_t n, int width, uint8_t *out);
 size_t int_bp_bound(size_t n);
+size_t dict_bound(size_t n);
+size_t dict_encode(const void *v, size_t n, int width, uint8_t *out);
+int dict_decode(const uint8_t *in, size_t len, size_t n, int width, void *out);
+#define DICT_SPAN 65536 /* fixed point whose integers span more goes without a dictionary */
+#define DICT_WORK(n) (16 * (size_t)(n) / 8 + 8 * (size_t)(n) + 2 * (size_t)DICT_SPAN + 16) /* c->work: fixed_or_dict */
+/* q: the integers of pre_kind's fixed point, one per value (NULL if not kept), nexc of them exceptions */
+size_t fixed_or_dict(codec_ctx *c, int level, int pre_kind, size_t pre_inner, const int64_t *q, size_t nexc,
+                     const void *v, size_t n, int width, uint8_t *out);
+/* as decimal_bp_encode / f64_decimal_encode, keeping the integers in keep[n] (its exceptions in *nexc) */
+size_t decimal_bp_encode_keep(const float *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc);
+size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc);
 size_t int_bp_encode(const int64_t *in, size_t n, uint8_t *out);
 int int_bp_decode(const uint8_t *in, size_t len, size_t n, int64_t *out);
 size_t f64_decimal_bound(size_t n);
@@ -629,6 +658,7 @@ typedef struct part_writer {
     tomb *tombs; /* written after the index; sorted, disjoint per series */
     size_t nt;
     bool keep_empty;  /* write a part even with no rows and no tombstones (a merge's wal_seq anchor) */
+    int effort;       /* CODEC_FAST (pw_begin) or CODEC_MERGE */
     int64_t empty_ts; /* its min_ts = max_ts then */
 } part_writer;
 

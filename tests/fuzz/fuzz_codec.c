@@ -22,7 +22,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     return cc && out ? 0 : -1;
 }
 
-enum { NSEL = 25 };
+enum { NSEL = 27 };
 
 static int decode(int sel, const uint8_t *p, size_t len, size_t n)
 {
@@ -47,7 +47,9 @@ static int decode(int sel, const uint8_t *p, size_t len, size_t n)
     case 21: return xor64_decode(p, len, n, out);
     case 22: return delta_bp32_decode(p, len, n, out);
     case 23: return delta_bp64_decode(p, len, n, out);
-    default: return alprd64_decode(p, len, n, out);
+    case 24: return alprd64_decode(p, len, n, out);
+    case 25: return dict_decode(p, len, n, 4, out);
+    default: return dict_decode(p, len, n, 8, out);
     }
 }
 
@@ -103,6 +105,7 @@ static int raw_sel(int kind, int type)
     case BLK_F64_DECIMAL: return 20;
     case BLK_XOR64: return 21;
     case BLK_INT: return 19;
+    case BLK_DICT: return f64 ? 26 : 25;
     default: return -1;
     }
 }
@@ -128,7 +131,7 @@ void fuzz_seeds(const char *dir)
     uint32_t st[N];
     uint8_t *blk = malloc(block_bound(N) + BLK_SLACK);
     uint64_t r = 1;
-    for (int shape = 0; shape < 4; shape++) {
+    for (int shape = 0; shape < 5; shape++) {
         for (int i = 0; i < N; i++) {
             r = r * 6364136223846793005ull + 1442695040888963407ull;
             int jitter = (int)(r >> 60);
@@ -136,6 +139,8 @@ void fuzz_seeds(const char *dir)
             double x = shape == 0 ? 20 + i * 0.1 : shape == 1 ? (double)(r >> 40) / 1e3 : (double)(r >> 11) / 1e15;
             if (shape == 3) /* converted units, unrounded: packed bit deltas */
                 x = 14.503773773 * (1.5 + 0.001 * (double)(i % 37) + 0.0001 * (double)(r >> 61));
+            if (shape == 4) /* the same, of few distinct values: a dictionary at merge effort */
+                x = 14.503773773 * (1.5 + 0.001 * (double)(i % 23));
             d[i] = shape == 0 ? (double)(int64_t)(x * 10) / 10 : x;
             f[i] = (float)d[i];
             iv[i] = shape == 0 ? 1000 + i : shape == 1 ? (int64_t)(r >> 45) : (int64_t)r;
@@ -145,7 +150,11 @@ void fuzz_seeds(const char *dir)
         seed(dir, 22, N, blk, delta_bp32_encode((const uint32_t *)f, N, blk));
         seed(dir, 23, N, blk, delta_bp64_encode((const uint64_t *)d, N, blk));
         seed(dir, 24, N, blk, alprd64_encode((const uint64_t *)d, N, blk));
-        for (int lvl = 0; lvl <= 1; lvl++) {
+        seed(dir, 25, N, blk, dict_encode(f, N, 4, blk));
+        seed(dir, 26, N, blk, dict_encode(d, N, 8, blk));
+        for (int k = 0; k < 4; k++) {
+            int lvl = k & 1;
+            cc->effort = k >> 1 ? CODEC_MERGE : CODEC_FAST; /* the kinds of both efforts */
             size_t len = block_encode_ts(cc, lvl, ts, N, blk);
             seed_block(dir, 0, N, blk, len);
             for (int vc = 0; vc <= 2; vc++) {

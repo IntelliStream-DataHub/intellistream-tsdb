@@ -8,6 +8,8 @@
  *   type-bench --file F float32|float64   F holds raw values of that type (little-endian), one series in
  *                                         time order: AUTO as above, the block kinds it chose, and for
  *                                         float64 each transform alone and with ZSTD(1)
+ *   type-bench --merge [...]              AUTO as background merges write (CODEC_MERGE: with the
+ *                                         dictionary) instead of as inserts write (CODEC_FAST)
  */
 #include "../src/internal.h"
 #include "common.h"
@@ -21,32 +23,35 @@
 
 static const char *kind_name(int k)
 {
-    switch (k & 0x0f) {
+    switch (k & BLK_KIND_MASK) {
     case BLK_F64_DECIMAL: return "decimal";
     case BLK_XOR64: return "gorilla";
     case BLK_BYTESPLIT64: return "bytesplit";
     case BLK_INT: return "int-bp";
     case BLK_DELTA_BP: return "bit-delta";
     case BLK_ALPRD: return "alp_rd";
+    case BLK_DICT: return "dict";
     default: return "?";
     }
 }
 
 static int show_kinds;
+static int effort = CODEC_FAST;
 
 /* bits per value and decode speed of n values of `type`, granule by granule */
 static void measure(const char *name, int type, const void *v, size_t n)
 {
     size_t w = type_width(type);
     codec_ctx *c = codec_new();
+    c->effort = effort;
     uint8_t *blk = malloc(block_bound(GR) + BLK_SLACK);
     uint8_t *out = malloc(GR * 8 + BLK_SLACK);
-    size_t bytes = 0, kinds[16] = {0};
+    size_t bytes = 0, kinds[BLK_KIND_MASK + 1] = {0};
     for (size_t g = 0; g < n; g += GR) {
         size_t m = MIN((size_t)GR, n - g);
         size_t len = block_encode_vals(c, 1, TSDB_VALUES_AUTO, type, (const uint8_t *)v + g * w, m, blk);
         bytes += len;
-        kinds[blk[0] & 0x0f]++;
+        kinds[blk[0] & BLK_KIND_MASK]++;
     }
     /* decode speed: one granule decoded repeatedly, each in turn */
     double t0 = now_s(), decoded = 0;
@@ -63,14 +68,14 @@ static void measure(const char *name, int type, const void *v, size_t n)
         }
     (void)t0;
     int top = 0;
-    for (int k = 0; k < 16; k++)
+    for (int k = 0; k <= BLK_KIND_MASK; k++)
         top = kinds[k] > kinds[top] ? k : top;
     printf("%-24s %-8s %8.2f %7.1fx %8.0f   %s\n", name, (const char *[]){"float32", "float64", "int64", "bool", "state"}[type],
            8.0 * (double)bytes / (double)n, (double)(n * (type == TSDB_BOOL ? 1 : w)) / (double)bytes,
            3.0 * (double)n / decoded / 1e6, kind_name(top));
     if (show_kinds) {
         printf("    kinds:");
-        for (int k = 0; k < 16; k++)
+        for (int k = 0; k <= BLK_KIND_MASK; k++)
             if (kinds[k])
                 printf(" %s(%d)=%zu", kind_name(k), k, kinds[k]);
         printf("\n");
@@ -103,6 +108,7 @@ out:
     free(z);
 }
 static size_t dec64_w(const uint64_t *in, size_t n, uint8_t *o) { return f64_decimal_encode((const double *)in, n, o); }
+static size_t dict64_w(const uint64_t *in, size_t n, uint8_t *o) { return dict_encode(in, n, 8, o); }
 static size_t bss64_w(const uint64_t *in, size_t n, uint8_t *o)
 {
     const uint8_t *b = (const uint8_t *)in;
@@ -114,6 +120,11 @@ static size_t bss64_w(const uint64_t *in, size_t n, uint8_t *o)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--merge")) {
+        effort = CODEC_MERGE;
+        argv++;
+        argc--;
+    }
     if (argc == 4 && !strcmp(argv[1], "--file")) { /* raw values of type argv[3]: float32 or float64 */
         if (strcmp(argv[3], "float64") && strcmp(argv[3], "float32")) {
             fprintf(stderr, "type-bench --file: the type is float32 or float64\n");
@@ -141,15 +152,14 @@ int main(int argc, char **argv)
             one64("decimal", dec64_w, v, n);
             one64("gorilla64", xor64_encode, v, n);
             one64("bytesplit", bss64_w, v, n);
-#ifdef TB_CODECS
             one64("alp_rd64", alprd64_encode, v, n);
             one64("bitdelta64", delta_bp64_encode, v, n);
-#endif
+            one64("dict64", dict64_w, v, n);
         }
         return 0;
     }
     if (argc > 1) {
-        fprintf(stderr, "usage: type-bench [--file FILE float32|float64]\n");
+        fprintf(stderr, "usage: type-bench [--merge] [--file FILE float32|float64]\n");
         return 2;
     }
     double *d = malloc(N * sizeof *d);

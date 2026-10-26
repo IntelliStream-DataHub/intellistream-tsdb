@@ -52,21 +52,29 @@ static double merge_score(double count, double sum) { return (sum + MERGE_FIXED_
 
 /* Picks the best range over all partitions. Caller holds db->lock. The chosen
  * parts are marked merging and referenced. */
+/* A part no merge has written holds blocks encoded at insert speed (CODEC_FAST). Once its partition is idle,
+ * or on tsdb_optimize, it is rewritten alone when it has nothing to merge with, so that every part at rest
+ * ends up encoded at CODEC_MERGE. */
+static bool solo_rewrite(const part *p) { return p->level == 0 && p->ng > 0 && !p->merging; }
+
 static size_t select_merge_locked(eng *db, part **sel)
 {
     time_t now = time(NULL);
     double best = INFINITY;
-    size_t best_i = 0, best_n = 0;
+    size_t best_i = 0, best_n = 0, solo = SIZE_MAX;
     for (size_t a = 0; a < db->nparts;) {
         size_t b = a + 1;
         while (b < db->nparts && db->parts[b]->partition == db->parts[a]->partition)
             b++;
         size_t nparts = b - a;
+        time_t newest = 0;
+        for (size_t i = a; i < b; i++)
+            newest = MAX(newest, db->parts[i]->written);
+        bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
+        for (size_t i = a; i < b && idle && solo == SIZE_MAX; i++)
+            if (solo_rewrite(db->parts[i]))
+                solo = i;
         if (nparts >= 2) {
-            time_t newest = 0;
-            for (size_t i = a; i < b; i++)
-                newest = MAX(newest, db->parts[i]->written);
-            bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
             for (size_t i = a; i < b; i++) {
                 double sum = 0, max_size = 0, min_age = INFINITY;
                 for (size_t j = i; j < b && j - i < MAX_MERGE_PARTS; j++) {
@@ -94,6 +102,10 @@ static size_t select_merge_locked(eng *db, part **sel)
             }
         }
         a = b;
+    }
+    if (best_n == 0 && solo != SIZE_MAX) { /* nothing to merge: re-encode a part only inserts wrote */
+        best_i = solo;
+        best_n = 1;
     }
     for (size_t k = 0; k < best_n; k++) {
         sel[k] = db->parts[best_i + k];
@@ -196,6 +208,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         return rc;
     }
     w.keep_empty = true; /* replaces its sources even when nothing is left */
+    w.effort = CODEC_MERGE;
     w.empty_ts = min_ts;
     if (tombs) {
         bool older = false; /* a listed part of the partition below the merge: the tombstones still hide it */
@@ -282,7 +295,9 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         if (!c->loaded) {
             bool before_rest = !has_bound || g->series < bs || (g->series == bs && g->ts_max < bt);
             bool full = g->count >= w.grows;
-            if (!filter && before_rest && full && (w.pend_n == 0 || w.pend_series != g->series)) {
+            /* a part no merge has written was encoded at insert speed (CODEC_FAST): re-encoded once here */
+            bool merged = c->p->level > 0;
+            if (!filter && before_rest && full && merged && (w.pend_n == 0 || w.pend_series != g->series)) {
                 rc = pw_copy_granule(&w, c->p, g);
                 rows += g->count;
                 copied++;
@@ -554,14 +569,14 @@ int eng_optimize(eng *db)
     part *sel[MAX_MERGE_PARTS];
     pthread_mutex_lock(&db->lock);
     for (;;) {
-        /* first partition with several parts and no merge in flight */
+        /* first partition with several parts, or with one only inserts wrote (solo_rewrite), and no merge in flight */
         size_t a = SIZE_MAX, k = 0;
         bool waiting = false;
         for (size_t i = 0, j; i < db->nparts && a == SIZE_MAX; i = j) {
             bool busy = db->parts[i]->merging;
             for (j = i + 1; j < db->nparts && db->parts[j]->partition == db->parts[i]->partition; j++)
                 busy |= db->parts[j]->merging;
-            if (j - i < 2)
+            if (j - i < 2 && !solo_rewrite(db->parts[i]))
                 continue;
             if (busy)
                 waiting = true;

@@ -1,6 +1,7 @@
 /* Tests: value types (float64, int64, bool, state) and nulls, against a
  * reference; their codecs; and refusing databases of older formats. */
 #include "internal.h"
+#include "bitpack.h"
 #include "../tools/datasets.h"
 #include "hydraulic_psi.h"
 
@@ -41,10 +42,14 @@ static const char *type_name[] = {"float32", "float64", "int64", "bool", "state"
 
 /* ------------------------------------------------------------------ codecs */
 
+/* AUTO's effort in roundtrip and blk_kind: the codec tests run at both (main) */
+static int effort = CODEC_FAST;
+
 static size_t roundtrip(int type, const void *v, size_t n, int level, const char *what)
 {
     size_t w = type_width(type);
     codec_ctx *c = codec_new();
+    c->effort = effort;
     uint8_t *blk = calloc(block_bound(n) + BLK_SLACK, 1);
     uint8_t *out = calloc(n * w + BLK_SLACK, 1);
     size_t len = block_encode_vals(c, level, TSDB_VALUES_AUTO, type, v, n, blk);
@@ -52,8 +57,8 @@ static size_t roundtrip(int type, const void *v, size_t n, int level, const char
     int rc = block_decode_vals(c, type, blk, len, n, out);
     bool same = rc == 0 && memcmp(v, out, n * w) == 0;
     if (!same)
-        fprintf(stderr, "  %s round trip failed: %s (n=%zu, level %d, rc %d, kind %d)\n", type_name[type], what, n,
-                level, rc, blk[0]);
+        fprintf(stderr, "  %s round trip failed: %s (n=%zu, level %d, effort %d, rc %d, kind %d)\n", type_name[type],
+                what, n, level, effort, rc, blk[0]);
     CHECK(same);
     /* a truncated block must not decode */
     if (len > 1)
@@ -173,16 +178,19 @@ static void test_codecs(void)
  * full: what AUTO's sample test has to come close to. */
 static size_t f64_full_try(codec_ctx *c, const double *d, size_t n, uint8_t *blk)
 {
-    static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64, BLK_DELTA_BP, BLK_ALPRD};
+    static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64, BLK_DELTA_BP, BLK_ALPRD, BLK_DICT};
     size_t best = SIZE_MAX;
     CHECK(codec_scratch_reserve(c, block_bound(n)) == 0);
     for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++) {
         size_t len = 0;
+        if ((kinds[k] == BLK_DICT || kinds[k] == BLK_DELTA_BP || kinds[k] == BLK_ALPRD) && effort != CODEC_MERGE)
+            continue; /* merges' candidates only (f64_fast) */
         switch (kinds[k]) {
         case BLK_F64_DECIMAL: len = f64_decimal_encode(d, n, c->scratch); break;
         case BLK_XOR64: len = xor64_encode((const uint64_t *)d, n, c->scratch); break;
         case BLK_DELTA_BP: len = delta_bp64_encode((const uint64_t *)d, n, c->scratch); break;
         case BLK_ALPRD: len = alprd64_encode((const uint64_t *)d, n, c->scratch); break;
+        case BLK_DICT: len = dict_encode(d, n, 8, c->scratch); break;
         default:
             for (size_t i = 0; i < n; i++)
                 for (int b = 0; b < 8; b++)
@@ -259,18 +267,21 @@ static void test_f64_sample(void)
 /* The smallest float32 block of AUTO's candidate kinds, every one encoded and compressed in full. */
 static size_t f32_full_try(codec_ctx *c, const float *f, size_t n, uint8_t *blk)
 {
-    static const int kinds[] = {BLK_DECIMAL_BP, BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DELTA_BP};
+    static const int kinds[] = {BLK_DECIMAL_BP, BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DELTA_BP, BLK_DICT};
     const uint32_t *u = (const uint32_t *)f;
     size_t best = SIZE_MAX;
     CHECK(codec_scratch_reserve(c, block_bound(n)) == 0);
     for (size_t k = 0; k < sizeof kinds / sizeof *kinds; k++) {
         size_t len = 0;
+        if (kinds[k] == BLK_DICT && effort != CODEC_MERGE) /* a merge's candidate only */
+            continue;
         switch (kinds[k]) {
         case BLK_DECIMAL_BP: len = decimal_bp_encode(f, n, c->scratch); break;
         case BLK_CHIMP: len = chimp_encode(u, n, c->scratch); break;
         case BLK_DELTA32: len = delta32_encode(u, n, c->scratch); break;
         case BLK_BYTESPLIT: len = bytesplit_encode(u, n, c->scratch); break;
         case BLK_ALPRD: len = alprd_encode(u, n, c->scratch); break;
+        case BLK_DICT: len = dict_encode(f, n, 4, c->scratch); break;
         default: len = delta_bp32_encode(u, n, c->scratch);
         }
         if (len)
@@ -320,6 +331,155 @@ static void test_f32_sample(void)
     codec_free(c);
     free(blk);
     free(f);
+}
+
+/* ---------------------------------------------------------------- BLK_DICT */
+
+/* dict_encode and dict_decode directly: bit for bit, or 0 when there are too many distinct values. */
+static size_t dict_rt(const void *v, size_t n, int width, const char *what)
+{
+    uint8_t *b = calloc(dict_bound(n) + BLK_SLACK, 1);
+    uint8_t *o = calloc(n * (size_t)width + BLK_SLACK, 1);
+    size_t len = dict_encode(v, n, width, b);
+    if (len) {
+        CHECK(len <= dict_bound(n));
+        int rc = dict_decode(b, len, n, width, o);
+        if (rc != 0 || memcmp(v, o, n * (size_t)width) != 0) {
+            fprintf(stderr, "  dict %s (width %d, n=%zu): rc %d\n", what, width, n, rc);
+            CHECK(0);
+        }
+        CHECK(dict_decode(b, len - 1, n, width, o) != 0);
+    }
+    free(b);
+    free(o);
+    return len;
+}
+
+static int blk_kind(int type, const void *v, size_t n)
+{
+    codec_ctx *c = codec_new();
+    c->effort = effort;
+    uint8_t *blk = malloc(block_bound(n) + BLK_SLACK);
+    block_encode_vals(c, 1, TSDB_VALUES_AUTO, type, v, n, blk);
+    int k = blk[0] & BLK_KIND_MASK;
+    free(blk);
+    codec_free(c);
+    return k;
+}
+
+static void test_dict(void)
+{
+    enum { N = 8192, BIG = MAX_GRANULE_ROWS };
+    float *f = malloc(BIG * sizeof *f);
+    double *d = malloc(BIG * sizeof *d);
+    /* edge values: both zeros, NaN payloads, infinities, subnormals, the extremes: each its own entry */
+    const uint32_t f_edge[] = {0x00000000, 0x80000000, 0x7fc00000, 0x7fc00001, 0xffc00000, 0x7f800000, 0xff800000,
+                               0x00000001, 0x80000001, 0x7f7fffff, 0xff7fffff, 0x3f800000, 0xbf800000};
+    const uint64_t d_edge[] = {0, 0x8000000000000000ull, 0x7ff8000000000000ull, 0x7ff8000000000001ull,
+                               0xfff8000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull, 1,
+                               0x8000000000000001ull, 0x7fefffffffffffffull, 0xffefffffffffffffull,
+                               0x3ff0000000000000ull, 0xbff0000000000000ull};
+    const size_t ne = sizeof f_edge / sizeof *f_edge;
+    for (size_t i = 0; i < N; i++) {
+        uint32_t u = f_edge[(i * 7 + i / 100) % ne];
+        uint64_t x = d_edge[(i * 7 + i / 100) % ne];
+        memcpy(&f[i], &u, 4);
+        memcpy(&d[i], &x, 8);
+    }
+    static const size_t lens[] = {4, 52, 64, 1023, 1024, 1025, 1500, 3000, N};
+    for (size_t l = 0; l < sizeof lens / sizeof *lens; l++) {
+        CHECK(dict_rt(f, lens[l], 4, "edge values") > 0 || lens[l] < 4 * ne);
+        CHECK(dict_rt(d, lens[l], 8, "edge values") > 0 || lens[l] < 4 * ne);
+        both_levels(TSDB_FLOAT32, f, lens[l], "edge values, few distinct");
+        both_levels(TSDB_FLOAT64, d, lens[l], "edge values, few distinct");
+    }
+    CHECK(dict_rt(f, 3, 4, "below 4 values") == 0);
+    /* one value only */
+    for (size_t i = 0; i < N; i++)
+        f[i] = 1.5f, d[i] = -2.25;
+    CHECK(dict_rt(f, N, 4, "constant") > 0);
+    CHECK(dict_rt(d, N, 8, "constant") > 0);
+    /* at most a quarter of the values distinct, and at most 2048 */
+    for (size_t i = 0; i < N; i++)
+        f[i] = (float)((i * 2654435761u) % (N / 4)) * 0.37f, d[i] = (double)((i * 2654435761u) % (N / 4)) * 0.37;
+    CHECK(dict_rt(f, N, 4, "n/4 distinct") > 0);
+    CHECK(dict_rt(d, N, 8, "n/4 distinct") > 0);
+    f[N - 1] = 1e30f, d[N - 1] = 1e300;
+    CHECK(dict_rt(f, N, 4, "n/4 + 1 distinct") == 0);
+    CHECK(dict_rt(d, N, 8, "n/4 + 1 distinct") == 0);
+    for (size_t i = 0; i < BIG; i++)
+        d[i] = (double)(rnd() % 2048) * 1.1 - 1000;
+    for (size_t i = 0; i < 2048; i++)
+        d[i * 31 % BIG] = (double)i * 1.1 - 1000; /* every one of the 2048 present */
+    CHECK(dict_rt(d, BIG, 8, "2048 distinct") > 0);
+    both_levels(TSDB_FLOAT64, d, BIG, "2048 distinct of 65536");
+    d[7] = 0.5;
+    CHECK(dict_rt(d, BIG, 8, "2049 distinct") == 0);
+    /* ranks jump the whole table: deltas of nearly 2 * 2048 in zigzag */
+    for (size_t i = 0; i < N; i++)
+        f[i] = i % 2 ? (float)(i % 2048) : -(float)(i % 2048) - 1;
+    CHECK(dict_rt(f, N, 4, "rank jumps") > 0);
+
+    /* damage: a rank past the table, no table, a table larger than the block, a rank width over 22 */
+    uint8_t *b = calloc(dict_bound(N) + BLK_SLACK, 1);
+    float *o = calloc(N + BLK_SLACK, sizeof *o);
+    for (size_t i = 0; i < 64; i++)
+        f[i] = (float)(i % 4);
+    size_t len = dict_encode(f, 64, 4, b);
+    CHECK(len > 0 && dict_decode(b, len, 64, 4, o) == 0);
+    uint8_t *bad = malloc(len + BLK_SLACK);
+    uint32_t nd;
+    memcpy(bad, b, len);
+    nd = 3; /* the ranks now reach past it */
+    memcpy(bad, &nd, 4);
+    CHECK(dict_decode(bad, len, 64, 4, o) != 0);
+    nd = 0;
+    memcpy(bad, &nd, 4);
+    CHECK(dict_decode(bad, len, 64, 4, o) != 0);
+    nd = 65;
+    memcpy(bad, &nd, 4);
+    CHECK(dict_decode(bad, len, 64, 4, o) != 0);
+    memcpy(bad, b, len);
+    int wpos = -1; /* the one vector's width byte: values 0..3 repeating, rank deltas of 1 and -3 take 3 bits */
+    for (int w = 0; w <= 22; w++)
+        if (len > packed_bytes(64, w) && bad[len - packed_bytes(64, w) - 1] == w)
+            wpos = (int)(len - packed_bytes(64, w) - 1);
+    CHECK(wpos > 0 && bad[wpos] == 3);
+    bad[wpos] = 23;
+    CHECK(dict_decode(bad, len, 64, 4, o) != 0);
+    free(bad);
+    free(o);
+    free(b);
+
+    /* Real pressures at 0.001 bar from an ADC step near 0.05 bar (PS3): fixed point fits in 16 bits a value,
+     * which AUTO used to keep at once, yet the ranks of the 226 values the granule takes pack 30% tighter.
+     * In psi (unrounded conversions) the same ranks beat every other kind by more. Merges look for them
+     * (CODEC_MERGE); inserts keep fixed point at insert speed. */
+    codec_ctx *c = codec_new();
+    uint8_t *blk = malloc(block_bound(HYD_N) + BLK_SLACK);
+    for (size_t k = 0; k < HYD_N; k++)
+        f[k] = (float)(hyd_ps3[k] / 1000.0), d[k] = hyd_ps3[k] / 1000.0;
+    effort = CODEC_FAST;
+    CHECK(blk_kind(TSDB_FLOAT32, f, HYD_N) == BLK_DECIMAL_BP && blk_kind(TSDB_FLOAT64, d, HYD_N) == BLK_F64_DECIMAL);
+    effort = CODEC_MERGE;
+    size_t lf = roundtrip(TSDB_FLOAT32, f, HYD_N, 1, "PS3 in bar"), ld = roundtrip(TSDB_FLOAT64, d, HYD_N, 1, "PS3 in bar");
+    CHECK(codec_scratch_reserve(c, block_bound(HYD_N)) == 0);
+    size_t fixed_f = block_wrap(c, 1, BLK_DECIMAL_BP, decimal_bp_encode(f, HYD_N, c->scratch), blk);
+    size_t fixed_d = block_wrap(c, 1, BLK_F64_DECIMAL, f64_decimal_encode(d, HYD_N, c->scratch), blk);
+    if (lf * 10 > fixed_f * 8 || ld * 10 > fixed_d * 8)
+        fprintf(stderr, "  PS3 in bar: AUTO %zu / %zu bytes, fixed point %zu / %zu\n", lf, ld, fixed_f, fixed_d);
+    CHECK(lf * 10 <= fixed_f * 8 && ld * 10 <= fixed_d * 8);
+    CHECK(blk_kind(TSDB_FLOAT32, f, HYD_N) == BLK_DICT && blk_kind(TSDB_FLOAT64, d, HYD_N) == BLK_DICT);
+    for (size_t k = 0; k < HYD_N; k++)
+        f[k] = (float)(hyd_ps3[k] / 1000.0 * 14.503773773), d[k] = hyd_ps3[k] / 1000.0 * 14.503773773;
+    CHECK(blk_kind(TSDB_FLOAT32, f, HYD_N) == BLK_DICT && blk_kind(TSDB_FLOAT64, d, HYD_N) == BLK_DICT);
+    lf = roundtrip(TSDB_FLOAT32, f, HYD_N, 1, "PS3 in psi");
+    ld = roundtrip(TSDB_FLOAT64, d, HYD_N, 1, "PS3 in psi");
+    CHECK(lf * 8 < (size_t)HYD_N * 6 && ld * 8 < (size_t)HYD_N * 6); /* under 6 bits a value */
+    free(blk);
+    codec_free(c);
+    free(f);
+    free(d);
 }
 
 /* --------------------------------------------------------- engine, typed */
@@ -1040,9 +1200,12 @@ static void test_nan_canonical(const char *base)
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
-    test_codecs();
-    test_f64_sample();
-    test_f32_sample();
+    for (effort = CODEC_FAST; effort <= CODEC_MERGE; effort++) {
+        test_codecs();
+        test_f64_sample();
+        test_f32_sample();
+    }
+    test_dict();
     test_engine(base);
     test_old_version(base);
     test_query_stats(base);

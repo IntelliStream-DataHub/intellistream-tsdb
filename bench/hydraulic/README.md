@@ -95,65 +95,68 @@ same size as tsdb, 2.9x is 2.9 times larger. You can also call the tools on one 
 
 ## Results
 
-Measured on commit c821848 (tsdb's codecs do not depend on the CPU, so you should get the same
+Measured on the codecs branch, 2026-10-26, as background merges leave the parts (tsdb's codecs do not depend on the CPU, so you should get the same
 numbers on any x86-64 machine).
 
 | series | type | values | tsdb, bits/value | Gorilla + ZSTD | Chimp + ZSTD | byte split + ZSTD |
 |---|---|---:|---:|---:|---:|---:|
 | PS1 | float32 | 13230000 | **6.69** | 19.61 (2.9x) | 16.31 (2.4x) | 13.28 (2.0x) |
 | PS1 | float64 | 13230000 | **6.70** | 31.10 (4.6x) | - | 35.20 (5.3x) |
-| PS1 psi | float32 | 13230000 | **15.52** | 20.00 (1.3x) | 16.58 (1.1x) | 15.73 (1.0x) |
-| PS1 psi | float64 | 13230000 | **43.63** | 43.73 (1.0x) | - | 46.96 (1.1x) |
-| PS2 | float32 | 13230000 | **7.56** | 19.32 (2.6x) | 15.69 (2.1x) | 12.55 (1.7x) |
-| PS2 | float64 | 13230000 | **7.73** | 29.30 (3.8x) | - | 31.67 (4.1x) |
-| PS2 psi | float32 | 13230000 | **12.89** | 20.07 (1.6x) | 16.16 (1.3x) | 14.75 (1.1x) |
-| PS2 psi | float64 | 13230000 | **41.39** | 43.48 (1.1x) | - | 41.45 (1.0x) |
-| PS3 | float32 | 13230000 | **7.83** | 20.04 (2.6x) | 18.55 (2.4x) | 15.68 (2.0x) |
-| PS3 | float64 | 13230000 | **7.83** | 22.79 (2.9x) | - | 35.99 (4.6x) |
-| PS3 psi | float32 | 13230000 | **14.51** | 21.22 (1.5x) | 19.32 (1.3x) | 17.28 (1.2x) |
-| PS3 psi | float64 | 13230000 | **30.21** | 30.23 (1.0x) | - | 39.59 (1.3x) |
-| PS4 | float32 | 13230000 | **2.50** | 7.29 (2.9x) | 6.78 (2.7x) | 5.86 (2.3x) |
-| PS4 | float64 | 13230000 | **2.57** | 15.82 (6.2x) | - | 15.09 (5.9x) |
-| PS4 psi | float32 | 13230000 | **5.21** | 7.15 (1.4x) | 6.74 (1.3x) | 5.85 (1.1x) |
-| PS4 psi | float64 | 13230000 | **15.85** | 16.43 (1.0x) | - | 15.85 (1.0x) |
-| PS5 | float32 | 13230000 | **6.13** | 20.07 (3.3x) | 19.11 (3.1x) | 14.98 (2.4x) |
+| PS1 psi | float32 | 13230000 | **7.00** | 20.00 (2.9x) | 16.58 (2.4x) | 15.73 (2.2x) |
+| PS1 psi | float64 | 13230000 | **7.19** | 43.73 (6.1x) | - | 46.96 (6.5x) |
+| PS2 | float32 | 13230000 | **7.39** | 19.32 (2.6x) | 15.69 (2.1x) | 12.55 (1.7x) |
+| PS2 | float64 | 13230000 | **7.60** | 29.30 (3.9x) | - | 31.67 (4.2x) |
+| PS2 psi | float32 | 13230000 | **7.04** | 20.07 (2.9x) | 16.16 (2.3x) | 14.75 (2.1x) |
+| PS2 psi | float64 | 13230000 | **7.40** | 43.48 (5.9x) | - | 41.45 (5.6x) |
+| PS3 | float32 | 13230000 | **5.41** | 20.04 (3.7x) | 18.55 (3.4x) | 15.68 (2.9x) |
+| PS3 | float64 | 13230000 | **5.43** | 22.79 (4.2x) | - | 35.99 (6.6x) |
+| PS3 psi | float32 | 13230000 | **5.45** | 21.22 (3.9x) | 19.32 (3.5x) | 17.28 (3.2x) |
+| PS3 psi | float64 | 13230000 | **5.59** | 30.23 (5.4x) | - | 39.59 (7.1x) |
+| PS4 | float32 | 13230000 | **2.49** | 7.29 (2.9x) | 6.78 (2.7x) | 5.86 (2.4x) |
+| PS4 | float64 | 13230000 | **2.50** | 15.82 (6.3x) | - | 15.09 (6.0x) |
+| PS4 psi | float32 | 13230000 | **2.71** | 7.15 (2.6x) | 6.74 (2.5x) | 5.85 (2.2x) |
+| PS4 psi | float64 | 13230000 | **2.85** | 16.43 (5.8x) | - | 15.85 (5.6x) |
+| PS5 | float32 | 13230000 | **6.12** | 20.07 (3.3x) | 19.11 (3.1x) | 14.98 (2.4x) |
 | PS5 | float64 | 13230000 | **6.13** | 43.60 (7.1x) | - | 44.02 (7.2x) |
-| PS5 psi | float32 | 13230000 | **12.52** | 20.25 (1.6x) | 19.65 (1.6x) | 14.85 (1.2x) |
-| PS5 psi | float64 | 13230000 | **44.47** | 44.63 (1.0x) | - | 45.75 (1.0x) |
-| PS6 | float32 | 13230000 | **6.15** | 20.09 (3.3x) | 19.11 (3.1x) | 15.12 (2.5x) |
+| PS5 psi | float32 | 13230000 | **6.17** | 20.25 (3.3x) | 19.65 (3.2x) | 14.85 (2.4x) |
+| PS5 psi | float64 | 13230000 | **6.18** | 44.63 (7.2x) | - | 45.75 (7.4x) |
+| PS6 | float32 | 13230000 | **6.14** | 20.09 (3.3x) | 19.11 (3.1x) | 15.12 (2.5x) |
 | PS6 | float64 | 13230000 | **6.15** | 44.09 (7.2x) | - | 44.03 (7.2x) |
-| PS6 psi | float32 | 13230000 | **12.77** | 19.88 (1.6x) | 19.59 (1.5x) | 14.90 (1.2x) |
-| PS6 psi | float64 | 13230000 | **44.73** | 44.93 (1.0x) | - | 45.70 (1.0x) |
+| PS6 psi | float32 | 13230000 | **6.19** | 19.88 (3.2x) | 19.59 (3.2x) | 14.90 (2.4x) |
+| PS6 psi | float64 | 13230000 | **6.20** | 44.93 (7.2x) | - | 45.70 (7.4x) |
 | EPS1 | float32 | 13230000 | **2.49** | 5.01 (2.0x) | 4.38 (1.8x) | 4.08 (1.6x) |
 | EPS1 | float64 | 13230000 | **2.49** | 6.27 (2.5x) | - | 4.83 (1.9x) |
-| FS1 | float32 | 1323000 | **10.93** | 27.20 (2.5x) | 22.89 (2.1x) | 21.14 (1.9x) |
+| FS1 | float32 | 1323000 | **10.89** | 27.20 (2.5x) | 22.89 (2.1x) | 21.14 (1.9x) |
 | FS1 | float64 | 1323000 | **10.93** | 51.72 (4.7x) | - | 45.97 (4.2x) |
-| FS2 | float32 | 1323000 | **6.84** | 19.93 (2.9x) | 18.95 (2.8x) | 15.07 (2.2x) |
+| FS2 | float32 | 1323000 | **6.83** | 19.93 (2.9x) | 18.95 (2.8x) | 15.07 (2.2x) |
 | FS2 | float64 | 1323000 | **6.84** | 45.28 (6.6x) | - | 43.45 (6.4x) |
-| TS1 | float32 | 132300 | **7.90** | 18.34 (2.3x) | 16.36 (2.1x) | 13.62 (1.7x) |
-| TS1 | float64 | 132300 | **7.90** | 32.75 (4.1x) | - | 42.49 (5.4x) |
-| TS2 | float32 | 132300 | **7.30** | 17.97 (2.5x) | 15.96 (2.2x) | 13.57 (1.9x) |
-| TS2 | float64 | 132300 | **7.30** | 32.54 (4.5x) | - | 42.50 (5.8x) |
-| TS3 | float32 | 132300 | **5.29** | 16.54 (3.1x) | 14.77 (2.8x) | 12.98 (2.5x) |
-| TS3 | float64 | 132300 | **5.29** | 28.01 (5.3x) | - | 41.61 (7.9x) |
-| TS4 | float32 | 132300 | **5.50** | 16.09 (2.9x) | 14.36 (2.6x) | 12.69 (2.3x) |
-| TS4 | float64 | 132300 | **5.50** | 26.09 (4.7x) | - | 41.28 (7.5x) |
+| TS1 | float32 | 132300 | **5.92** | 18.34 (3.1x) | 16.36 (2.8x) | 13.62 (2.3x) |
+| TS1 | float64 | 132300 | **6.60** | 32.75 (5.0x) | - | 42.49 (6.4x) |
+| TS2 | float32 | 132300 | **5.66** | 17.97 (3.2x) | 15.96 (2.8x) | 13.57 (2.4x) |
+| TS2 | float64 | 132300 | **6.07** | 32.54 (5.4x) | - | 42.50 (7.0x) |
+| TS3 | float32 | 132300 | **5.02** | 16.54 (3.3x) | 14.77 (2.9x) | 12.98 (2.6x) |
+| TS3 | float64 | 132300 | **5.05** | 28.01 (5.5x) | - | 41.61 (8.2x) |
+| TS4 | float32 | 132300 | **5.04** | 16.09 (3.2x) | 14.36 (2.8x) | 12.69 (2.5x) |
+| TS4 | float64 | 132300 | **5.31** | 26.09 (4.9x) | - | 41.28 (7.8x) |
 | VS1 | float32 | 132300 | **6.78** | 24.05 (3.5x) | 22.32 (3.3x) | 21.83 (3.2x) |
 | VS1 | float64 | 132300 | **6.78** | 45.95 (6.8x) | - | 46.42 (6.8x) |
 | CE | float32 | 132300 | **10.29** | 22.55 (2.2x) | 20.41 (2.0x) | 19.74 (1.9x) |
 | CE | float64 | 132300 | **10.29** | 51.26 (5.0x) | - | 46.76 (4.5x) |
 | CP | float32 | 132300 | **6.29** | 22.06 (3.5x) | 20.25 (3.2x) | 19.78 (3.1x) |
 | CP | float64 | 132300 | **6.29** | 43.99 (7.0x) | - | 44.86 (7.1x) |
-| SE | float32 | 132300 | **8.74** | 12.88 (1.5x) | 12.12 (1.4x) | 16.45 (1.9x) |
+| SE | float32 | 132300 | **8.75** | 12.88 (1.5x) | 12.12 (1.4x) | 16.45 (1.9x) |
 | SE | float64 | 132300 | **8.75** | 26.72 (3.1x) | - | 41.11 (4.7x) |
 
 What it shows:
 
 - On the values as the rig wrote them (decimals), tsdb takes 2.5 to 11 bits per value, against 32
   or 64 uncompressed: it recognises the decimals and stores them as small whole numbers. Gorilla
-  and Chimp take 1.4 to 3.5 times more space in float32 and 2.5 to 7 times more in float64.
-- float32 and float64 are almost exactly the same size in tsdb on this data: a decimal costs the
-  same whatever type it is stored in.
-- Converted to psi, the values are no longer short decimals. In float32 tsdb still stays
-  ahead (1.0 to 1.6 times smaller than the others); in float64 every codec, tsdb's included, needs
-  16 to 45 bits per value.
+  and Chimp take 1.4 to 3.7 times more space in float32 and 2.5 to 7.2 times more in float64.
+- float32 and float64 are nearly the same size in tsdb on this data (within 0.7 bits per value): a
+  decimal costs about the same whatever type it is stored in.
+- Converted to psi, the values are no longer short decimals, but they still take only the few
+  hundred values the pressure sensor's steps map to. tsdb's background merges store such a series
+  as a dictionary of those values and each value's position in it: 2.7 to 7.4 bits per value in
+  float32 and float64 alike, 2.1 to 3.9 times smaller than the others in float32 and 5.4 to 7.4
+  times in float64. Freshly inserted data is stored at insert speed without the dictionary
+  (about twice the bits in float32, up to eight times in float64) until a merge rewrites it.

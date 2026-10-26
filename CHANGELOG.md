@@ -38,6 +38,17 @@ disk format and the wire protocol.
   `isum`, `imin`, `imax`). It is no longer a `list` (`isinstance(b, list)` is false, `append` is gone) and does
   not pickle. Raw query results are numpy arrays over the result vectors, without a copy.
 - Python: numpy input arrays are copied once with the GIL released instead of while holding it.
+- **Disk format version 6.** Block headers name their codec in 7 bits instead of 4, and a new codec, the
+  dictionary (the distinct values of a block and each value's rank among them), stores readings that take few
+  distinct values: pressures converted to psi come down to 0.14-0.20 times their float64 size and 0.44-0.63 times
+  their float32 size, the whole UCI hydraulic rig to 0.29 times (float64) and 0.65 times (float32). Background
+  merges try it (inserts keep their speed and encode as before), re-encode the granules of parts inserts wrote
+  instead of copying them, and rewrite a partition's only insert-written part once the partition is idle
+  (`merge_idle_s`) or on `tsdb_optimize`. A database of format 5 is refused at open; carry it over with
+  `tsdb <dir> export` from the release that wrote it and `tsdb <newdir> import` with this one
+  ([docs/compatibility.md](docs/compatibility.md)).
+- Values: float32 and float64 decode faster (fixed point with a 4-lane prefix sum), and AUTO adds packed bit
+  deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
 - `tsdb import` refuses a target directory that has files in it and holds no database, before writing anything,

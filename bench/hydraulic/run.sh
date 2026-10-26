@@ -5,7 +5,8 @@
 #
 # Builds build/codec-bench and build/type-bench, codes every series in
 # granules of 8192 values the way parts store them, and prints one table:
-# bits per value of tsdb (AUTO, the default) and of other codecs with ZSTD(1),
+# bits per value of tsdb (AUTO, the default, as background merges leave parts at
+# rest: type-bench --merge) and of other codecs with ZSTD(1),
 # each also as a size compared to tsdb (tsdb = 1x; 2.0x is twice as large).
 # Every coded granule is decoded again and checked bit for bit.
 set -eu
@@ -30,14 +31,15 @@ row() {
 
 f32() { # FILE -> "values tsdb gorilla chimp bytesplit", all with ZSTD(1)
     n=$(($(wc -c < "$1") / 4))
-    "$cb" --file "$1" | awk -v n="$n" '/ zstd=1 / {
+    a=$("$tb" --merge --file "$1" float32 | awk 'NR == 1 { print $3 }')
+    "$cb" --file "$1" | awk -v n="$n" -v a="$a" '/ zstd=1 / {
         for (i = 3; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
-        print n, v["auto"], v["gorilla"], v["chimp"], v["bytesplit"] }'
+        print n, a, v["gorilla"], v["chimp"], v["bytesplit"] }'
 }
 
 f64() { # FILE -> "values tsdb gorilla - bytesplit"
     n=$(($(wc -c < "$1") / 8))
-    "$tb" --file "$1" float64 | awk -v n="$n" '
+    "$tb" --merge --file "$1" float64 | awk -v n="$n" '
         NR == 1 { a = $3 }
         $1 == "gorilla64" { g = $5 }
         $1 == "bytesplit" { b = $5 }

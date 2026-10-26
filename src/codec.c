@@ -389,7 +389,7 @@ typedef struct dec_res {
     size_t nexc;
 } dec_res;
 
-static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_res *r)
+static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_res *r, int64_t *keep)
 {
     int best_e = -1;
     double best = INFINITY;
@@ -404,10 +404,11 @@ static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_r
         return false;
     /* two loops: a branch-free one the compiler vectorizes (integer and
      * exactness of every value), then deltas and exceptions */
-    int64_t *kk = malloc(n * sizeof *kk); /* small enough for malloc's fast path */
+    int64_t *kk = keep ? keep : malloc(n * sizeof *kk); /* small enough for malloc's fast path */
     uint8_t *okv = malloc(n);
     if (!kk || !okv) {
-        free(kk);
+        if (!keep)
+            free(kk);
         free(okv);
         return false;
     }
@@ -439,6 +440,7 @@ static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_r
             memcpy(exc + 8 * nexc + 4, &in[i], 4);
             nexc++;
             k = i ? prev : 0; /* a zero delta keeps the stream smooth */
+            kk[i] = k;
         }
         if (i == 0) {
             first = k;
@@ -449,7 +451,8 @@ static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_r
         }
         prev = k;
     }
-    free(kk);
+    if (!keep)
+        free(kk);
     free(okv);
     if (!ok || maxz >= (1ull << 32))
         return false;
@@ -464,7 +467,7 @@ size_t decimal_encode(const float *in, size_t n, uint8_t *out)
     uint32_t *z = malloc(n * sizeof *z);
     uint8_t *exc = malloc((n / 16 + 1) * 8);
     dec_res r;
-    if (!z || !exc || !dec_core(in, n, z, exc, &r)) {
+    if (!z || !exc || !dec_core(in, n, z, exc, &r, NULL)) {
         free(z);
         free(exc);
         return 0;
@@ -506,12 +509,18 @@ size_t decimal_bp_bound(size_t n) { return DEC_HDR + n * 4 + (n / DBP_VEC + 1) *
 
 size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out)
 {
+    size_t nexc;
+    return decimal_bp_encode_keep(in, n, out, NULL, &nexc);
+}
+
+size_t decimal_bp_encode_keep(const float *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc)
+{
     if (n < 2)
         return 0;
     uint32_t *z = malloc(n * sizeof *z);
     uint8_t *exc = malloc((n / 16 + 1) * 8);
     dec_res r;
-    if (!z || !exc || !dec_core(in, n, z, exc, &r)) {
+    if (!z || !exc || !dec_core(in, n, z, exc, &r, keep)) {
         free(z);
         free(exc);
         return 0;
@@ -535,6 +544,7 @@ size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out)
     o += r.nexc * 8;
     free(z);
     free(exc);
+    *nexc = r.nexc;
     return (size_t)(o - out);
 }
 
@@ -919,6 +929,7 @@ void codec_free(codec_ctx *c)
     ZSTD_freeDCtx(c->dctx);
     free(c->scratch);
     free(c->alt);
+    free(c->work);
     free(c);
 }
 
@@ -953,6 +964,7 @@ static size_t inner_bound(int kind, size_t n)
     case BLK_BYTESPLIT64: return 8 * n;
     case BLK_INT: return int_bp_bound(n);
     case BLK_DELTA_BP: return MAX(delta_bp32_bound(n), delta_bp64_bound(n));
+    case BLK_DICT: return dict_bound(n);
     default: return 0;
     }
 }
@@ -963,14 +975,45 @@ size_t block_bound(size_t n)
     inner = MAX(inner, MAX(alprd_bound(n), decimal_bp_bound(n)));
     inner = MAX(inner, MAX(MAX(f64_decimal_bound(n), xor64_bound(n)), MAX(8 * n, int_bp_bound(n))));
     inner = MAX(inner, MAX(alprd64_bound(n), MAX(delta_bp32_bound(n), delta_bp64_bound(n))));
+    inner = MAX(inner, dict_bound(n));
     return 5 + ZSTD_compressBound(inner);
+}
+
+int codec_alt_reserve(codec_ctx *c, size_t need)
+{
+    if (c->alt_cap >= need)
+        return 0;
+    uint8_t *a = realloc(c->alt, need);
+    if (!a)
+        return TSDB_ERR_NOMEM;
+    c->alt = a;
+    c->alt_cap = need;
+    return 0;
+}
+
+int codec_work_reserve(codec_ctx *c, size_t need)
+{
+    if (c->work_cap >= need)
+        return 0;
+    uint8_t *w = realloc(c->work, need);
+    if (!w)
+        return TSDB_ERR_NOMEM;
+    c->work = w;
+    c->work_cap = need;
+    return 0;
 }
 
 /* Wraps `inner` bytes of transform output (in c->scratch) into a block. */
 size_t block_wrap(codec_ctx *c, int level, int kind, size_t inner, uint8_t *out)
 {
+    return block_wrap_src(c, level, kind, c->scratch, inner, out);
+}
+
+/* As block_wrap, of the transform output at src (not overlapping out). */
+size_t block_wrap_src(codec_ctx *c, int level, int kind, const uint8_t *src, size_t inner, uint8_t *out)
+{
     if (level > 0 && inner >= 64) {
-        size_t z = ZSTD_compressCCtx(c->cctx, out + 5, ZSTD_compressBound(inner), c->scratch, inner, level);
+        size_t z = ZSTD_compressCCtx(c->cctx, out + 5, ZSTD_compressBound(inner), src, inner, level);
         /* keep zstd only when it saves a few percent: decoding costs too */
         if (!ZSTD_isError(z) && z + 4 < inner - inner / 32) {
             out[0] = (uint8_t)(kind | BLK_ZSTD);
@@ -979,7 +1022,7 @@ size_t block_wrap(codec_ctx *c, int level, int kind, size_t inner, uint8_t *out)
         }
     }
     out[0] = (uint8_t)kind;
-    memcpy(out + 1, c->scratch, inner);
+    memcpy(out + 1, src, inner);
     return 1 + inner;
 }
 
@@ -1032,6 +1075,7 @@ static size_t encode_f32_kind(int kind, const void *v, size_t n, uint8_t *out)
     case BLK_ALPRD: return alprd_encode(v, n, out);
     case BLK_DECIMAL_BP: return decimal_bp_encode(v, n, out);
     case BLK_DELTA_BP: return delta_bp32_encode(v, n, out);
+    case BLK_DICT: return dict_encode(v, n, 4, out);
     default: return 0;
     }
 }
@@ -1123,20 +1167,23 @@ static double entropy_words(const uint8_t *p, size_t len, size_t width)
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(chimp_bound(n), gorilla_bound(n)), MAX(alprd_bound(n), decimal_bp_bound(n)));
-    need = MAX(need, delta_bp32_bound(n));
+    need = MAX(need, MAX(delta_bp32_bound(n), dict_bound(n)));
     if (codec_scratch_reserve(c, need) != 0)
         return 0;
     if (value_codec == TSDB_VALUES_GORILLA || value_codec == TSDB_VALUES_CHIMP) {
         int kind = value_codec == TSDB_VALUES_GORILLA ? BLK_GORILLA : BLK_CHIMP;
         return block_wrap(c, level, kind, encode_f32_kind(kind, v, n, c->scratch), out);
     }
-    size_t inner = decimal_bp_encode(v, n, c->scratch);
-    if (inner && inner * 8 <= 16 * n) /* compact fixed point: nothing else came close */
-        return block_wrap(c, level, BLK_DECIMAL_BP, inner, out);
+    bool merge = c->effort == CODEC_MERGE;
+    int64_t *q = merge && codec_work_reserve(c, DICT_WORK(n)) == 0 ? (int64_t *)(void *)c->work : NULL;
+    size_t nexc = 0, inner = decimal_bp_encode_keep(v, n, c->scratch, q, &nexc);
+    if (inner && inner * 8 <= 16 * n) /* compact fixed point: only a dictionary comes close */
+        return merge ? fixed_or_dict(c, level, BLK_DECIMAL_BP, inner, q, nexc, v, n, 4, out)
+                     : block_wrap(c, level, BLK_DECIMAL_BP, inner, out);
     /* every float32 is "decimal" at ~8 digits; then it is just one more candidate */
     static const int kinds[] = {BLK_DECIMAL_BP, BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DELTA_BP};
     return auto_pick(c, level, kinds, sizeof kinds / sizeof *kinds, encode_f32_kind, v, n, 4, BLK_DECIMAL_BP, inner,
-                     F32_ALL_BITS, F32_SURPRISE, out);
+                     merge ? dict_block(c, level, v, n, 4, out) : 0, F32_ALL_BITS, F32_SURPRISE, out);
 }
 
 /* Resolves a block to its transform kind and (decompressed) transform bytes. */
@@ -1145,7 +1192,7 @@ int block_open(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int *kind
 {
     if (len < 1)
         return TSDB_ERR_CORRUPT;
-    *kind = blk[0] & 0x0f;
+    *kind = blk[0] & BLK_KIND_MASK;
     *p = blk + 1;
     *plen = len - 1;
     if (!(blk[0] & BLK_ZSTD))
@@ -1197,6 +1244,7 @@ int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, flo
     case BLK_ALPRD: return alprd_decode(p, plen, n, (uint32_t *)out);
     case BLK_DECIMAL_BP: return decimal_bp_decode(p, plen, n, out);
     case BLK_DELTA_BP: return delta_bp32_decode(p, plen, n, (uint32_t *)out);
+    case BLK_DICT: return dict_decode(p, plen, n, 4, out);
     default: return TSDB_ERR_CORRUPT;
     }
 }

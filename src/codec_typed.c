@@ -246,13 +246,19 @@ static int f64_pick_scale(const double *in, size_t n, bool *mul)
 
 size_t f64_decimal_encode(const double *in, size_t n, uint8_t *out)
 {
+    size_t nexc;
+    return f64_decimal_encode_keep(in, n, out, NULL, &nexc);
+}
+
+size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexcp)
+{
     if (n < 2)
         return 0;
     bool mul = false;
     int e = f64_pick_scale(in, n, &mul);
     if (e < 0)
         return 0;
-    int64_t *k = malloc(n * sizeof *k);
+    int64_t *k = keep ? keep : malloc(n * sizeof *k);
     if (!k)
         return 0;
     size_t max_exc = n / 16, nexc = 0;
@@ -261,7 +267,8 @@ size_t f64_decimal_encode(const double *in, size_t n, uint8_t *out)
         if (f64_int(in[i], e, mul, &k[i]))
             continue;
         if (nexc == max_exc) {
-            free(k);
+            if (!keep)
+                free(k);
             return 0;
         }
         store32(x, (uint32_t)i);
@@ -273,7 +280,9 @@ size_t f64_decimal_encode(const double *in, size_t n, uint8_t *out)
     out[0] = (uint8_t)(e | (mul ? F64_MUL : 0));
     store32(out + 1, (uint32_t)nexc);
     size_t len = int_bp_encode(k, n, x);
-    free(k);
+    if (!keep)
+        free(k);
+    *nexcp = nexc;
     return len ? (size_t)(x - out) + len : 0;
 }
 
@@ -517,9 +526,301 @@ static int unsplit64(const uint8_t *in, size_t len, size_t n, uint64_t *out)
     return 0;
 }
 
+/* ----------------------------------------------------------------- BLK_DICT */
+
+/*
+ * Values that take few distinct bit patterns (readings converted to other units, unrounded: each is
+ * one of the few hundred the sensor's integer steps map to). The distinct values, in numeric order,
+ * then each value's rank among them as zigzag deltas packed per vector of 1024, as BLK_INT does:
+ * neighbouring readings have neighbouring ranks, so a rank delta takes as few bits as the sensor's
+ * integer step would, where deltas of the bit patterns pay for the scale as well.
+ *   u32 nd | BLK_INT stream of the nd sorted keys | per vector: u8 bits (0..22), packed rank deltas
+ * A key is the bit pattern made unsigned-monotone (sign bit flipped, or all bits of a negative
+ * value), so equal values with other patterns (0.0 and -0.0, NaN payloads) stay apart.
+ */
+#define DICT_MAX 2048 /* at most this many distinct values, and at most a quarter of the block */
+_Static_assert(DICT_MAX < 65535 && 2 * DICT_MAX < (1 << ZZ_PREFIX32_MAX_W), "ranks: uint16 slots, prefix sums");
+
+static inline uint64_t dict_key(uint64_t u, int width)
+{
+    uint64_t sign = width == 4 ? 0x80000000u : 0x8000000000000000u, all = width == 4 ? 0xffffffffu : ~0ull;
+    return u & sign ? ~u & all : u | sign;
+}
+
+static inline uint64_t dict_unkey(uint64_t k, int width)
+{
+    uint64_t sign = width == 4 ? 0x80000000u : 0x8000000000000000u, all = width == 4 ? 0xffffffffu : ~0ull;
+    return k & sign ? k ^ sign : ~k & all;
+}
+
+static inline uint64_t dict_load(const void *v, size_t i, int width)
+{
+    if (width == 4) {
+        uint32_t x;
+        memcpy(&x, (const uint8_t *)v + 4 * i, 4);
+        return x;
+    }
+    uint64_t x;
+    memcpy(&x, (const uint8_t *)v + 8 * i, 8);
+    return x;
+}
+
+static inline size_t dict_hash(uint64_t k, int bits) { return (size_t)((k * 0x9E3779B97F4A7C15ull) >> (64 - bits)); }
+
+size_t dict_bound(size_t n) { return 4 + int_bp_bound(MIN(n, (size_t)DICT_MAX)) + (n / IBP_VEC + 1) + 4 * n + 8; }
+
+/* LSD radix sort of n keys, a byte at a time, skipping bytes all keys share. */
+static void dict_sort(uint64_t *k, size_t n, int width)
+{
+    uint64_t tmp[DICT_MAX], *a = k, *b = tmp;
+    for (int sh = 0; sh < 8 * width; sh += 8) {
+        size_t cnt[256] = {0};
+        for (size_t i = 0; i < n; i++)
+            cnt[a[i] >> sh & 255]++;
+        if (cnt[a[0] >> sh & 255] == n)
+            continue;
+        size_t pos = 0;
+        for (int d = 0; d < 256; d++) {
+            size_t c = cnt[d];
+            cnt[d] = pos;
+            pos += c;
+        }
+        for (size_t i = 0; i < n; i++)
+            b[cnt[a[i] >> sh & 255]++] = a[i];
+        uint64_t *t = a;
+        a = b;
+        b = t;
+    }
+    if (a != k)
+        memcpy(k, a, n * sizeof *k);
+}
+
+/* One vector of ranks as zigzag deltas from the previous rank, packed at the width of the widest. */
+static uint8_t *dict_put_ranks(const uint32_t *r, size_t nv, int64_t *prev, uint8_t *o)
+{
+    uint32_t z[IBP_VEC], all = 0;
+    int64_t p = *prev;
+    for (size_t i = 0; i < nv; i++) {
+        z[i] = (uint32_t)zz((int64_t)r[i] - p);
+        all |= z[i];
+        p = r[i];
+    }
+    *prev = p;
+    int w = bits_for(all);
+    *o++ = (uint8_t)w;
+    pack(z, nv, w, o);
+    return o + packed_bytes(nv, w);
+}
+
+/* Encodes n values of `width` bytes; 0 when they have more than cap distinct values (at most DICT_MAX).
+ * *table: the bytes of the header and the distinct values. */
+static size_t dict_encode_t(const void *v, size_t n, int width, uint8_t *out, size_t *table, size_t cap)
+{
+    cap = MIN(MIN(cap, n), (size_t)DICT_MAX);
+    if (cap == 0)
+        return 0;
+    int bits = 1;
+    while (((size_t)1 << bits) < 2 * cap)
+        bits++;
+    const size_t mask = ((size_t)1 << bits) - 1;
+    uint64_t keys[2 * DICT_MAX], sorted[DICT_MAX];
+    sorted[0] = 0; /* n > 0 puts a key there; the compiler cannot tell */
+    uint16_t slot[2 * DICT_MAX]; /* 0: empty; 1 + the key's rank once sorted */
+    memset(slot, 0, (mask + 1) * sizeof *slot);
+    size_t nd = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t k = dict_key(dict_load(v, i, width), width);
+        size_t h = dict_hash(k, bits);
+        while (slot[h] && keys[h] != k)
+            h = (h + 1) & mask;
+        if (!slot[h]) {
+            if (nd == cap)
+                return 0;
+            slot[h] = 1;
+            keys[h] = k;
+            sorted[nd++] = k;
+        }
+    }
+    dict_sort(sorted, nd, width);
+    for (size_t r = 0; r < nd; r++) {
+        size_t h = dict_hash(sorted[r], bits);
+        while (keys[h] != sorted[r])
+            h = (h + 1) & mask;
+        slot[h] = (uint16_t)(1 + r);
+    }
+    uint32_t nd32 = (uint32_t)nd;
+    memcpy(out, &nd32, 4);
+    uint8_t *o = out + 4;
+    o += int_bp_encode((const int64_t *)sorted, nd, o);
+    *table = (size_t)(o - out);
+    uint32_t r[IBP_VEC];
+    int64_t prev = 0;
+    for (size_t v0 = 0; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        for (size_t i = 0; i < nv; i++) {
+            uint64_t k = dict_key(dict_load(v, v0 + i, width), width);
+            size_t h = dict_hash(k, bits);
+            while (keys[h] != k)
+                h = (h + 1) & mask;
+            r[i] = slot[h] - 1u;
+        }
+        o = dict_put_ranks(r, nv, &prev, o);
+    }
+    return (size_t)(o - out);
+}
+
+/*
+ * The same block from the integers q of its fixed point: equal integers are equal values, in the
+ * values' order, so a table indexed by integer replaces the hash and the sort. The nx exceptions
+ * (positions xpos, ascending; q holds a neighbour's integer there) are values off the grid: sorted
+ * apart and merged in. tab: span entries (span at most DICT_SPAN) and n / 64 + 1 words after them;
+ * n below 65536.
+ */
+static size_t dict_encode_q(const int64_t *q, const void *v, size_t n, int width, int64_t lo, size_t span,
+                            const uint32_t *xpos, size_t nx, uint16_t *tab, uint8_t *out, size_t cap)
+{
+    cap = MIN(MIN(cap, n), (size_t)DICT_MAX);
+    if (nx > cap)
+        return 0;
+    size_t span4 = (span + 3) / 4 * 4;
+    memset(tab, 0, span4 * sizeof *tab);
+    for (size_t i = 0; i < n; i++)
+        tab[q[i] - lo] = (uint16_t)(i + 1); /* any of the equal values will do */
+    uint64_t xk[DICT_MAX], sorted[DICT_MAX];
+    uint16_t xr[DICT_MAX];
+    size_t nu = 0;
+    if (nx) {
+        uint64_t *isx = (uint64_t *)(void *)(tab + span4);
+        memset(isx, 0, (n / 64 + 1) * sizeof *isx);
+        for (size_t t = 0; t < nx; t++) {
+            isx[xpos[t] >> 6] |= 1ull << (xpos[t] & 63);
+            xk[t] = dict_key(dict_load(v, xpos[t], width), width);
+        }
+        for (size_t t = 0; t < nx; t++) { /* an exception standing for an integer: another value of it, or none */
+            uint16_t *e = &tab[q[xpos[t]] - lo];
+            if (*e != xpos[t] + 1)
+                continue;
+            *e = 0;
+            for (size_t j = xpos[t]; j-- > 0;)
+                if (q[j] == q[xpos[t]] && !(isx[j >> 6] >> (j & 63) & 1)) {
+                    *e = (uint16_t)(j + 1);
+                    break;
+                }
+        }
+        dict_sort(xk, nx, width);
+        for (size_t t = 0; t < nx; t++)
+            if (t == 0 || xk[t] != xk[nu - 1])
+                xk[nu++] = xk[t];
+    }
+    size_t nd = 0, u = 0;
+    for (size_t j = 0; j < span; j += 4) {
+        uint64_t four;
+        memcpy(&four, tab + j, 8);
+        if (!four)
+            continue; /* sparse: most integers in the span are unused */
+        for (size_t t = j; t < j + 4; t++) {
+            if (!tab[t])
+                continue;
+            uint64_t k = dict_key(dict_load(v, tab[t] - 1u, width), width);
+            for (; u < nu && xk[u] < k; u++) {
+                if (nd == cap)
+                    return 0;
+                xr[u] = (uint16_t)nd;
+                sorted[nd++] = xk[u];
+            }
+            if (nd == cap)
+                return 0;
+            sorted[nd] = k;
+            tab[t] = (uint16_t)nd++;
+        }
+    }
+    for (; u < nu; u++) {
+        if (nd == cap)
+            return 0;
+        xr[u] = (uint16_t)nd;
+        sorted[nd++] = xk[u];
+    }
+    uint32_t nd32 = (uint32_t)nd;
+    memcpy(out, &nd32, 4);
+    uint8_t *o = out + 4;
+    o += int_bp_encode((const int64_t *)sorted, nd, o);
+    uint32_t r[IBP_VEC];
+    int64_t prev = 0;
+    size_t x = 0;
+    for (size_t v0 = 0; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        for (size_t i = 0; i < nv; i++)
+            r[i] = tab[q[v0 + i] - lo];
+        for (; x < nx && xpos[x] < v0 + nv; x++) {
+            uint64_t k = dict_key(dict_load(v, xpos[x], width), width);
+            size_t a = 0, b = nu; /* k is among xk[0..nu) */
+            while (b - a > 1) {
+                size_t m = (a + b) / 2;
+                if (xk[m] <= k)
+                    a = m;
+                else
+                    b = m;
+            }
+            r[xpos[x] - v0] = xr[a];
+        }
+        o = dict_put_ranks(r, nv, &prev, o);
+    }
+    return (size_t)(o - out);
+}
+
+size_t dict_encode(const void *v, size_t n, int width, uint8_t *out)
+{
+    size_t table;
+    return dict_encode_t(v, n, width, out, &table, n / 4);
+}
+
+int dict_decode(const uint8_t *in, size_t len, size_t n, int width, void *out)
+{
+    if (len < 4)
+        return TSDB_ERR_CORRUPT;
+    uint32_t nd;
+    memcpy(&nd, in, 4);
+    if (nd == 0 || nd > DICT_MAX || nd > n)
+        return TSDB_ERR_CORRUPT;
+    int64_t tab[DICT_MAX];
+    size_t used = int_bp_decode_prefix(in + 4, len - 4, nd, tab);
+    if (!used)
+        return TSDB_ERR_CORRUPT;
+    for (size_t r = 0; r < nd; r++)
+        tab[r] = (int64_t)dict_unkey((uint64_t)tab[r], width);
+    const uint8_t *p = in + 4 + used, *end = in + len;
+    uint32_t z[IBP_VEC];
+    uint64_t k = 0;
+    for (size_t v0 = 0; v0 < n; v0 += IBP_VEC) {
+        size_t nv = MIN((size_t)IBP_VEC, n - v0);
+        if (p >= end)
+            return TSDB_ERR_CORRUPT;
+        int w = *p++;
+        size_t pb = packed_bytes(nv, w);
+        /* rank deltas stay below 2 * DICT_MAX: anything wider is damage, and the int32 sums below hold */
+        if (w > ZZ_PREFIX32_MAX_W || (size_t)(end - p) < pb)
+            return TSDB_ERR_CORRUPT;
+        unpack(p, nv, w, z);
+        p += pb;
+        uint32_t total = zz_prefix32(z, nv);
+        for (size_t i = 0; i < nv; i++) {
+            uint64_t r = k + (uint64_t)(int64_t)(int32_t)z[i];
+            if (r >= nd)
+                return TSDB_ERR_CORRUPT;
+            if (width == 4)
+                ((uint32_t *)out)[v0 + i] = (uint32_t)tab[r];
+            else
+                ((uint64_t *)out)[v0 + i] = (uint64_t)tab[r];
+        }
+        k += (uint64_t)(int64_t)(int32_t)total;
+    }
+    return p == end ? 0 : TSDB_ERR_CORRUPT;
+}
+
 static size_t encode_f64_kind(int kind, const void *v, size_t n, uint8_t *out)
 {
     switch (kind) {
+    case BLK_DICT: return dict_encode(v, n, 8, out);
     case BLK_XOR64: return xor64_encode((const uint64_t *)v, n, out);
     case BLK_DELTA_BP: return delta_bp64_encode((const uint64_t *)v, n, out);
     case BLK_ALPRD: return alprd64_encode((const uint64_t *)v, n, out);
@@ -551,6 +852,9 @@ static size_t encode_f64_kind(int kind, const void *v, size_t n, uint8_t *out)
  */
 enum { AUTO_RUN = 128, AUTO_SAMPLE_BYTES = 8192, AUTO_SAMPLE_MAX = AUTO_SAMPLE_BYTES / 4 };
 #define AUTO_CLOSE 1.03
+/* a candidate estimated this far above a block in hand (the dictionary) is not encoded: psi in merges went from
+ * 15 to 53-66 M values/s at the same sizes */
+#define AUTO_HAVE_MARGIN 1.25
 
 /*
  * Whether ZSTD can save on `len` bytes at src, judged by its fastest
@@ -588,20 +892,16 @@ static size_t sample_block_size(codec_ctx *c, int level, size_t len, uint8_t *tm
  * size in out, 0 when out of memory.
  */
 size_t auto_pick(codec_ctx *c, int level, const int *kinds, size_t nk, codec_kind_fn enc, const void *v, size_t n,
-                 size_t width, int pre_kind, size_t pre_inner, double all_bits, double surprise, uint8_t *out)
+                 size_t width, int pre_kind, size_t pre_inner, size_t have, double all_bits, double surprise,
+                 uint8_t *out)
 {
-    enum { NK_MAX = 8 };
+    enum { NK_MAX = 10 };
     if (nk > NK_MAX)
         nk = NK_MAX;
     /* c->alt: a sample's transform, its ZSTD output after it; later the second block */
-    size_t sb = block_bound(AUTO_SAMPLE_MAX), alt_need = MAX(block_bound(n), 2 * sb); /* any width */
-    if (c->alt_cap < alt_need) {
-        uint8_t *alt = realloc(c->alt, alt_need);
-        if (!alt)
-            return 0;
-        c->alt = alt;
-        c->alt_cap = alt_need;
-    }
+    size_t sb = block_bound(AUTO_SAMPLE_MAX); /* any width */
+    if (codec_alt_reserve(c, MAX(block_bound(n), 2 * sb)) != 0)
+        return have;
     _Alignas(8) uint8_t smp[AUTO_SAMPLE_BYTES];
     const size_t runs = AUTO_SAMPLE_BYTES / (AUTO_RUN * width), sample = runs * AUTO_RUN;
     const uint8_t *s = v;
@@ -613,15 +913,22 @@ size_t auto_pick(codec_ctx *c, int level, const int *kinds, size_t nk, codec_kin
         s = smp;
         ns = sample;
     }
-    double est[NK_MAX] = {INFINITY, INFINITY, INFINITY, INFINITY, INFINITY, INFINITY, INFINITY, INFINITY};
+    double est[NK_MAX];
+    for (size_t k = 0; k < NK_MAX; k++)
+        est[k] = INFINITY;
     bool zs[NK_MAX] = {false}; /* ZSTD saved on the sample */
-    size_t best = 0;
+    size_t best = have;
     for (size_t k = 0; k < nk; k++) {
         size_t len = 0;
         if (kinds[k] == pre_kind) {
             /* already encoded in full: its real block (a sample can miss the scale or fail) */
-            if (pre_inner)
-                est[k] = (double)(best = block_wrap(c, level, pre_kind, pre_inner, out));
+            if (pre_inner) {
+                len = block_wrap(c, level, pre_kind, pre_inner, best ? c->alt : out);
+                if (best && len < best)
+                    memcpy(out, c->alt, len);
+                best = best ? MIN(best, len) : len;
+                est[k] = (double)len;
+            }
             continue;
         }
         if (kinds[k] == BLK_DELTA_BP && s == smp) {
@@ -642,6 +949,8 @@ size_t auto_pick(codec_ctx *c, int level, const int *kinds, size_t nk, codec_kin
         if (est[k] < est[b1])
             b1 = k;
     double limit = level > 0 && est[b1] < all_bits / 8 * (double)n ? DBL_MAX : est[b1] * AUTO_CLOSE;
+    if (have) /* a dictionary block, in full: only what may beat it, its estimate's error allowed for */
+        limit = MIN(limit, (double)have * AUTO_HAVE_MARGIN);
     bool done[NK_MAX] = {false};
     for (int pass = 0; pass < 2; pass++) {
         for (size_t k = 0; k < nk; k++) {
@@ -650,6 +959,10 @@ size_t auto_pick(codec_ctx *c, int level, const int *kinds, size_t nk, codec_kin
             done[k] = true;
             uint8_t *dst = best ? c->alt : out;
             size_t inner_k = enc(kinds[k], v, n, c->scratch);
+            if (!inner_k) { /* the sample passed, the block does not: the others get their turn */
+                limit = DBL_MAX;
+                continue;
+            }
             /* ZSTD that saved nothing on the sample is still tried (far matches), behind a probe */
             int lv = zs[k] || (level > 0 && inner_k >= 64 && zstd_may_gain(c, c->scratch, inner_k, dst)) ? level : 0;
             size_t len = block_wrap(c, lv, kinds[k], inner_k, dst);
@@ -667,19 +980,145 @@ size_t auto_pick(codec_ctx *c, int level, const int *kinds, size_t nk, codec_kin
     return best;
 }
 
-/* AUTO for float64: fixed point that fits in 16 bits a value is kept at once, otherwise auto_pick. */
+/*
+ * Whether the integers fill most of the range they span where sampled (noise moves a reading by a
+ * step or two): their ranks then pack no tighter than the integers do. Two runs of 64, about 1% of
+ * a block's encode; nearly constant runs say nothing.
+ */
+static bool dict_dense(const int64_t *q, size_t n)
+{
+    enum { RUNS = 2, RUN = 64, SPAN = 1024 };
+    size_t d = 0, span = 0;
+    for (size_t r = 0; r < RUNS; r++) {
+        const int64_t *p = q + (n - RUN) * (2 * r + 1) / (2 * RUNS);
+        int64_t lo = p[0], hi = p[0];
+        for (size_t i = 1; i < RUN; i++) {
+            lo = MIN(lo, p[i]);
+            hi = MAX(hi, p[i]);
+        }
+        uint64_t s = (uint64_t)hi - (uint64_t)lo + 1;
+        if (s < 8)
+            continue;
+        if (s > SPAN) {
+            span += SPAN;
+            continue;
+        }
+        uint64_t bm[SPAN / 64];
+        size_t nw = (size_t)(s + 63) / 64;
+        memset(bm, 0, nw * sizeof *bm);
+        for (size_t i = 0; i < RUN; i++) {
+            uint64_t o = (uint64_t)p[i] - (uint64_t)lo;
+            bm[o >> 6] |= 1ull << (o & 63);
+        }
+        for (size_t w = 0; w < nw; w++)
+            d += (size_t)__builtin_popcountll(bm[w]);
+        span += (size_t)s;
+    }
+    return 2 * d > span; /* more than half the codes taken */
+}
+
+/*
+ * Fixed point that fits in 16 bits a value (pre_kind's pre_inner bytes in c->scratch, its integers
+ * in q) is kept, unless the values take so few distinct codes that their ranks pack tighter than the
+ * integers: readings printed at a finer resolution than the instrument has (pressures at 0.001 bar
+ * from an ADC step of about 0.05 bar), or slow sensors that stay on a few values. Dense integers
+ * (dict_dense) are kept at once; otherwise the dictionary is built from the integers, and it is
+ * compressed and compared only if it came out small enough to have a chance.
+ */
+size_t fixed_or_dict(codec_ctx *c, int level, int pre_kind, size_t pre_inner, const int64_t *q, size_t nexc,
+                     const void *v, size_t n, int width, uint8_t *out)
+{
+    size_t len = block_wrap(c, level, pre_kind, pre_inner, out);
+    if (len == 0 || !q || n < 64 || n > 65535 || c->work_cap < DICT_WORK(n) || dict_dense(q, n))
+        return len;
+    int64_t lo = q[0], hi = q[0];
+    for (size_t i = 1; i < n; i++) {
+        lo = MIN(lo, q[i]);
+        hi = MAX(hi, q[i]);
+    }
+    if ((uint64_t)hi - (uint64_t)lo >= DICT_SPAN || nexc > DICT_MAX || codec_alt_reserve(c, block_bound(n)) != 0)
+        return len;
+    /* the exceptions' positions, from the fixed-point block before c->scratch is overwritten */
+    uint32_t xpos[DICT_MAX];
+    const uint8_t *x = pre_kind == BLK_DECIMAL_BP ? c->scratch + pre_inner - 8 * nexc : c->scratch + 5;
+    for (size_t t = 0; t < nexc; t++)
+        xpos[t] = load32(x + (pre_kind == BLK_DECIMAL_BP ? 8 : 12) * t);
+    size_t inner = dict_encode_q(q, v, n, width, lo, (size_t)((uint64_t)hi - (uint64_t)lo) + 1, xpos, nexc,
+                                 (uint16_t *)(void *)(c->work + 8 * n), c->scratch, n / 4);
+    /* ZSTD saves about as much on ranks as on the integers (PS2: 36% on both): the dictionary is compressed
+     * when it is smaller than the fixed point before compression */
+    if (!inner || inner >= pre_inner)
+        return len;
+    size_t dl = block_wrap(c, level, BLK_DICT, inner, c->alt);
+    if (dl && dl < len) {
+        memcpy(out, c->alt, dl);
+        len = dl;
+    }
+    return len;
+}
+
+/*
+ * The dictionary block of values that are not compact fixed point, in out (0 if they have too many
+ * distinct values), built from c->alt so that c->scratch keeps what the caller put there. A sample
+ * cannot tell: runs of consecutive values see a fraction of the distinct values a block has (on a
+ * sine converted to psi, 700 of 2000), so the whole block is tried; it stops at the first value past
+ * the cap, after about n / 4 values where nearly every one is new (random bits: 5% of their encode).
+ */
+size_t dict_block(codec_ctx *c, int level, const void *v, size_t n, int width, uint8_t *out)
+{
+    if (codec_alt_reserve(c, block_bound(n)) != 0)
+        return 0;
+    size_t inner = dict_encode(v, n, width, c->alt);
+    return inner ? block_wrap_src(c, level, BLK_DICT, c->alt, inner, out) : 0;
+}
+
+/*
+ * float64 AUTO at insert speed (CODEC_FAST), beyond compact fixed point (its transform, `inner` bytes, in
+ * c->scratch): wider fixed point, Gorilla's XOR and the byte split, each compressed in full, the smallest
+ * kept. A sample ranking with ALP_rd and bit-packed deltas among the candidates (merges, auto_pick) makes
+ * pressures converted to psi three times smaller, but ZSTD then has far more to find: 0.7 times the encode
+ * speed on those, and where two kinds come close the sample is paid on top of both full encodes.
+ */
+static size_t f64_fast(codec_ctx *c, int level, const double *v, size_t n, size_t inner, uint8_t *out)
+{
+    if (codec_alt_reserve(c, block_bound(n)) != 0)
+        return 0;
+    size_t best = inner ? block_wrap(c, level, BLK_F64_DECIMAL, inner, out) : 0;
+    static const int kinds[] = {BLK_XOR64, BLK_BYTESPLIT64};
+    for (size_t k = 0; k < 2; k++) {
+        size_t inner_k = encode_f64_kind(kinds[k], v, n, c->scratch);
+        if (!inner_k)
+            continue;
+        size_t len = block_wrap(c, level, kinds[k], inner_k, best ? c->alt : out);
+        if (!best) {
+            best = len;
+        } else if (len < best) {
+            memcpy(out, c->alt, len);
+            best = len;
+        }
+    }
+    return best;
+}
+
+/* AUTO for float64: fixed point that fits in 16 bits a value is kept at once, otherwise f64_fast or, in
+ * merges, auto_pick with a dictionary. */
 static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(f64_decimal_bound(n), xor64_bound(n)), 8 * n);
-    need = MAX(need, MAX(delta_bp64_bound(n), alprd64_bound(n)));
+    need = MAX(need, MAX(MAX(delta_bp64_bound(n), alprd64_bound(n)), dict_bound(n)));
     if (codec_scratch_reserve(c, need) != 0)
         return 0;
-    size_t inner = f64_decimal_encode(v, n, c->scratch);
+    bool merge = c->effort == CODEC_MERGE;
+    int64_t *q = merge && codec_work_reserve(c, DICT_WORK(n)) == 0 ? (int64_t *)(void *)c->work : NULL;
+    size_t nexc = 0, inner = f64_decimal_encode_keep(v, n, c->scratch, q, &nexc);
     if (inner && inner * 8 <= 16 * n)
-        return block_wrap(c, level, BLK_F64_DECIMAL, inner, out);
+        return merge ? fixed_or_dict(c, level, BLK_F64_DECIMAL, inner, q, nexc, v, n, 8, out)
+                     : block_wrap(c, level, BLK_F64_DECIMAL, inner, out);
+    if (!merge)
+        return f64_fast(c, level, v, n, inner, out);
     static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64, BLK_DELTA_BP, BLK_ALPRD};
     return auto_pick(c, level, kinds, sizeof kinds / sizeof *kinds, encode_f64_kind, v, n, 8, BLK_F64_DECIMAL, inner,
-                     24, 0.9, out);
+                     dict_block(c, level, v, n, 8, out), 24, 0.9, out);
 }
 
 static size_t encode_int(codec_ctx *c, int level, const int64_t *v, size_t n, uint8_t *out)
@@ -726,6 +1165,7 @@ int block_decode_vals(codec_ctx *c, int type, const uint8_t *blk, size_t len, si
         case BLK_BYTESPLIT64: return unsplit64(p, plen, n, out);
         case BLK_DELTA_BP: return delta_bp64_decode(p, plen, n, out);
         case BLK_ALPRD: return alprd64_decode(p, plen, n, out);
+        case BLK_DICT: return dict_decode(p, plen, n, 8, out);
         default: return TSDB_ERR_CORRUPT;
         }
     }

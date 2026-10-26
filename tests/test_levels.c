@@ -19,6 +19,7 @@
 #include "internal.h"
 #include "bitpack.h"
 #include "../tools/datasets.h"
+#include "hydraulic_psi.h"
 
 #include <float.h>
 #include <stdio.h>
@@ -384,6 +385,48 @@ static void make_inputs(void)
         ((uint32_t *)x->v)[prio16[t]] = 0x80000000u;
     }
 
+    /* few distinct values, where merges (CODEC_MERGE) pick the dictionary: real pressures at 0.001 bar from a
+     * coarse ADC (fixed point), the same in psi (unrounded), edge values cycling, and one past the cap */
+    for (int t = 0; t < 2; t++) {
+        bool f32 = t == 0;
+        x = add(f32 ? "f32 PS3 bar" : "f64 PS3 bar", f32 ? TSDB_FLOAT32 : TSDB_FLOAT64, HYD_N);
+        for (size_t i = 0; i < HYD_N; i++) {
+            double v = hyd_ps3[i] / 1000.0;
+            if (f32)
+                ((float *)x->v)[i] = (float)v;
+            else
+                ((double *)x->v)[i] = v;
+        }
+        x = add(f32 ? "f32 PS3 psi" : "f64 PS3 psi", f32 ? TSDB_FLOAT32 : TSDB_FLOAT64, HYD_N);
+        for (size_t i = 0; i < HYD_N; i++) {
+            double v = hyd_ps3[i] / 1000.0 * 14.503773773;
+            if (f32)
+                ((float *)x->v)[i] = (float)v;
+            else
+                ((double *)x->v)[i] = v;
+        }
+        x = add(f32 ? "f32 edge values cycling" : "f64 edge values cycling", f32 ? TSDB_FLOAT32 : TSDB_FLOAT64, GR);
+        for (size_t i = 0; i < GR; i++) {
+            static const uint64_t e64[] = {0x8000000000000000ull, 0x7ff8000000000001ull, 0xfff0000000000000ull,
+                                           0x7ff0000000000000ull, 1, 0x3ff0000000000000ull, 0x7ff4000000000000ull};
+            static const uint32_t e32[] = {0x80000000u, 0x7fc00001u, 0xff800000u, 0x7f800000u, 1, 0x3f800000u,
+                                           0x7fa00000u};
+            size_t j = (i / 7 + next() % 3) % 7;
+            if (f32)
+                ((uint32_t *)x->v)[i] = e32[j];
+            else
+                ((uint64_t *)x->v)[i] = e64[j];
+        }
+        x = add(f32 ? "f32 2049 distinct" : "f64 2049 distinct", f32 ? TSDB_FLOAT32 : TSDB_FLOAT64, 65536);
+        for (size_t i = 0; i < 65536; i++) {
+            double v = (double)(i < 2049 ? i : next() % 2049) * 0.37 + 1e-7;
+            if (f32)
+                ((float *)x->v)[i] = (float)v;
+            else
+                ((double *)x->v)[i] = v;
+        }
+    }
+
     /* timestamps: regular, jittered, random gaps, duplicates, negative, extremes */
     x = add("ts jitter", TSDB_INT64, GR);
     for (size_t i = 0; i < GR; i++)
@@ -472,6 +515,10 @@ static void codec(rec *r, const input *x, const char *what, enc_fn enc, dec_fn d
     }
 }
 
+static size_t dict32_encode(const void *v, size_t n, uint8_t *out) { return dict_encode(v, n, 4, out); }
+static int dict32_decode(const uint8_t *in, size_t len, size_t n, void *out) { return dict_decode(in, len, n, 4, out); }
+static size_t dict64_encode(const void *v, size_t n, uint8_t *out) { return dict_encode(v, n, 8, out); }
+static int dict64_decode(const uint8_t *in, size_t len, size_t n, void *out) { return dict_decode(in, len, n, 8, out); }
 #define CODEC(name, src, w) codec(r, x, #name, (enc_fn)name##_encode, (dec_fn)name##_decode, src, w)
 
 /* ---- the running sums of the bit-packed decoders, against plain sequential loops ----
@@ -641,13 +688,16 @@ static void run(rec *r, codec_ctx *c)
         const input *x = &in[k];
         size_t w = type_width(x->type);
         char what[64];
-        /* the block layer, as parts store values and timestamps, with and without ZSTD */
+        /* the block layer, as parts store values and timestamps, with and without ZSTD, as inserts and
+         * merges write them */
         for (int level = 0; level <= 3; level += 3) {
             int ncodecs = x->type == TSDB_FLOAT32 ? 3 : 1;
-            for (int vc = 0; vc < ncodecs; vc++) {
+            for (int ve = 0; ve < 2 * ncodecs; ve++) {
+                int vc = ve / 2;
+                c->effort = ve % 2 ? CODEC_MERGE : CODEC_FAST;
                 memset(buf, 0, BUF(x->n));
                 size_t len = block_encode_vals(c, level, vc, x->type, x->v, x->n, buf);
-                snprintf(what, sizeof what, "block zstd %d codec %d", level, vc);
+                snprintf(what, sizeof what, "block zstd %d codec %d effort %d", level, vc, c->effort);
                 put(r, what, x->name, buf, len);
                 CHECK(len > 0);
                 memset(dec, 0xa5, x->n * w);
@@ -679,12 +729,14 @@ static void run(rec *r, codec_ctx *c)
             CODEC(decimal_bp, x->v, 4);
             CODEC(alp, x->v, 4);
             CODEC(delta_bp32, x->v, 4);
+            CODEC(dict32, x->v, 4);
             break;
         case TSDB_FLOAT64:
             CODEC(f64_decimal, x->v, 8);
             CODEC(xor64, x->v, 8);
             CODEC(delta_bp64, x->v, 8);
             CODEC(alprd64, x->v, 8);
+            CODEC(dict64, x->v, 8);
             break;
         case TSDB_INT64:
             CODEC(int_bp, x->v, 8);
@@ -895,8 +947,11 @@ int main(void)
 {
     check_dispatch();
     make_inputs();
-    buf = malloc(BUF(GR) + BLK_SLACK);
-    dec = malloc(GR * 16 + BLK_SLACK);
+    size_t maxn = GR;
+    for (int k = 0; k < nin; k++)
+        maxn = MAX(maxn, in[k].n);
+    buf = malloc(BUF(maxn) + BLK_SLACK);
+    dec = malloc(maxn * 16 + BLK_SLACK);
     static const char *const kernels[] = {"scalar", "sse", "avx", "avx2", "avx512"};
     static const int kmin[] = {CPU_BASE, CPU_BASE, CPU_BASE, CPU_V3, CPU_V4}; /* the lowest level of each */
     rec base = {0};

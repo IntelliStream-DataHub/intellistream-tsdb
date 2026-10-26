@@ -186,7 +186,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
-- The on-disk format is version 5 (`FORMAT_VERSION`): 160-byte granule entries
+- The on-disk format is version 6 (`FORMAT_VERSION`; 6: a 7-bit codec kind in block headers): 160-byte granule entries
   with typed, time-weighted and spread statistics, a checksum over each part's header, index and footer,
   checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Until
   1.0 (the format freezes there; the user decided this on 2026-10-25) older formats need not stay readable: a

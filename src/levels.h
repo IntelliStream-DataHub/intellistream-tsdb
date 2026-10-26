@@ -101,15 +101,32 @@
     X(int, codec_scratch_reserve, (codec_ctx * c, size_t need), (c, need))                                    \
     X(size_t, block_wrap, (codec_ctx * c, int level, int kind, size_t inner, uint8_t *out),                   \
       (c, level, kind, inner, out))                                                                           \
+    X(size_t, block_wrap_src, (codec_ctx * c, int level, int kind, const uint8_t *src, size_t inner,          \
+                               uint8_t *out), (c, level, kind, src, inner, out))                              \
+    X(int, codec_alt_reserve, (codec_ctx * c, size_t need), (c, need))                                        \
+    X(int, codec_work_reserve, (codec_ctx * c, size_t need), (c, need))                                       \
+    X(size_t, decimal_bp_encode_keep, (const float *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc),  \
+      (in, n, out, keep, nexc))                                                                               \
+    X(size_t, f64_decimal_encode_keep, (const double *in, size_t n, uint8_t *out, int64_t *keep,               \
+                                        size_t *nexc), (in, n, out, keep, nexc))                              \
     X(int, block_open, (codec_ctx * c, const uint8_t *blk, size_t len, size_t n, int *kind,                   \
                         const uint8_t **p, size_t *plen), (c, blk, len, n, kind, p, plen))                    \
     X(size_t, auto_pick, (codec_ctx * c, int level, const int *kinds, size_t nk, codec_kind_fn enc,             \
-                          const void *v, size_t n, size_t width, int pre_kind, size_t pre_inner, double all_bits,   \
-                          double surprise, uint8_t *out),                                                           \
-      (c, level, kinds, nk, enc, v, n, width, pre_kind, pre_inner, all_bits, surprise, out))                        \
+                          const void *v, size_t n, size_t width, int pre_kind, size_t pre_inner, size_t have,       \
+                          double all_bits, double surprise, uint8_t *out),                                          \
+      (c, level, kinds, nk, enc, v, n, width, pre_kind, pre_inner, have, all_bits, surprise, out))                  \
+    X(size_t, dict_block, (codec_ctx * c, int level, const void *v, size_t n, int width, uint8_t *out),          \
+      (c, level, v, n, width, out))                                                                           \
     X(size_t, int_bp_bound, (size_t n), (n))                                                                  \
     X(size_t, int_bp_encode, (const int64_t *in, size_t n, uint8_t *out), (in, n, out))                       \
     X(int, int_bp_decode, (const uint8_t *in, size_t len, size_t n, int64_t *out), (in, len, n, out))         \
+    X(size_t, dict_bound, (size_t n), (n))                                                                    \
+    X(size_t, dict_encode, (const void *v, size_t n, int width, uint8_t *out), (v, n, width, out))            \
+    X(int, dict_decode, (const uint8_t *in, size_t len, size_t n, int width, void *out),                      \
+      (in, len, n, width, out))                                                                               \
+    X(size_t, fixed_or_dict, (codec_ctx * c, int level, int pre_kind, size_t pre_inner, const int64_t *q,      \
+                              size_t nexc, const void *v, size_t n, int width, uint8_t *out),                 \
+      (c, level, pre_kind, pre_inner, q, nexc, v, n, width, out))                                             \
     X(size_t, f64_decimal_bound, (size_t n), (n))                                                             \
     X(size_t, f64_decimal_encode, (const double *in, size_t n, uint8_t *out), (in, n, out))                   \
     X(int, f64_decimal_decode, (const uint8_t *in, size_t len, size_t n, double *out), (in, len, n, out))     \
