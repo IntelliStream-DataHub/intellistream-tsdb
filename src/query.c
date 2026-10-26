@@ -2243,6 +2243,9 @@ size_t tsdb_struct_size(int kind)
     case TSDB_STRUCT_QUERY_STATS: return sizeof(tsdb_query_stats);
     case TSDB_STRUCT_STATS: return sizeof(tsdb_stats);
     case TSDB_STRUCT_PART_INFO: return sizeof(tsdb_part_info);
+    case TSDB_STRUCT_SPREAD_BUCKET: return sizeof(tsdb_spread_bucket);
+    case TSDB_STRUCT_TWA_OPTS: return sizeof(tsdb_twa_opts);
+    case TSDB_STRUCT_TWA_BUCKET: return sizeof(tsdb_twa_bucket);
     default: return 0;
     }
 }

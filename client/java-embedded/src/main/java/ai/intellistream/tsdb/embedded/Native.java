@@ -151,12 +151,6 @@ final class Native {
             JAVA_LONG.withName("created_s"),
             JAVA_LONG.withName("written_s")).withName("tsdb_part_info");
 
-    /** Every struct, for the layout test, in the order of the C enum tsdb_struct_kind (tsdb_struct_size). */
-    static final StructLayout[] ALL_STRUCTS = {OPTIONS, VALUES, BUCKET, POINTS, GROUP, QUERY_OPTS, QUERY_STATS, STATS,
-        PART_INFO};
-
-    /* Structs the library has no tsdb_struct_kind for: checked against the compiler by LayoutTest only. A library
-     * without their functions fails to load in fn() below. */
     static final StructLayout SPREAD_BUCKET = MemoryLayout.structLayout(
             BUCKET.withName("b"),
             JAVA_DOUBLE.withName("range"),
@@ -182,7 +176,9 @@ final class Native {
             JAVA_LONG.withName("covered_ms"),
             JAVA_LONG.withName("count")).withName("tsdb_twa_bucket");
 
-    static final StructLayout[] MORE_STRUCTS = {SPREAD_BUCKET, TWA_OPTS, TWA_BUCKET};
+    /** Every struct, for the layout test, in the order of the C enum tsdb_struct_kind (tsdb_struct_size). */
+    static final StructLayout[] ALL_STRUCTS = {OPTIONS, VALUES, BUCKET, POINTS, GROUP, QUERY_OPTS, QUERY_STATS, STATS,
+        PART_INFO, SPREAD_BUCKET, TWA_OPTS, TWA_BUCKET};
 
     static long offset(StructLayout s, String field) {
         return s.byteOffset(MemoryLayout.PathElement.groupElement(field));

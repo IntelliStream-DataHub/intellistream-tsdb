@@ -101,11 +101,9 @@ class LayoutTest {
                     "tsdb_struct_kind of " + Native.ALL_STRUCTS[i].name().orElseThrow());
     }
 
-    /** Every struct Native lays out: those with a tsdb_struct_kind, then the others. */
+    /** Every struct Native lays out; each has a tsdb_struct_kind. */
     private static List<StructLayout> structs() {
-        List<StructLayout> all = new ArrayList<>(List.of(Native.ALL_STRUCTS));
-        all.addAll(List.of(Native.MORE_STRUCTS));
-        return all;
+        return List.of(Native.ALL_STRUCTS);
     }
 
     private static String include() {

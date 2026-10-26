@@ -69,6 +69,7 @@ int main(void)
     E("kind", tsdb_bucket, TSDB_STRUCT_BUCKET); E("kind", tsdb_points, TSDB_STRUCT_POINTS);
     E("kind", tsdb_group, TSDB_STRUCT_GROUP); E("kind", tsdb_query_opts, TSDB_STRUCT_QUERY_OPTS);
     E("kind", tsdb_query_stats, TSDB_STRUCT_QUERY_STATS); E("kind", tsdb_stats, TSDB_STRUCT_STATS);
-    E("kind", tsdb_part_info, TSDB_STRUCT_PART_INFO);
+    E("kind", tsdb_part_info, TSDB_STRUCT_PART_INFO); E("kind", tsdb_spread_bucket, TSDB_STRUCT_SPREAD_BUCKET);
+    E("kind", tsdb_twa_opts, TSDB_STRUCT_TWA_OPTS); E("kind", tsdb_twa_bucket, TSDB_STRUCT_TWA_BUCKET);
     return 0;
 }
