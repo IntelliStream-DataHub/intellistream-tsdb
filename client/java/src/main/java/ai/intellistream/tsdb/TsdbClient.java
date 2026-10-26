@@ -1279,9 +1279,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param series the series id
      * @param start the first timestamp included
      * @param end the first timestamp excluded
-     * @param threshold the most points to keep; 0 keeps all of them
+     * @param threshold the most points to keep, at least 3
      * @return the chosen points
-     * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold of 1 or 2, a state series or a server
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold below 3, a state series or a server
      *     older than version 5
      */
     public ValuePoints queryLttb(int series, long start, long end, long threshold) throws TsdbException {
@@ -1296,7 +1296,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param series the series id
      * @param start the first timestamp included
      * @param end the first timestamp excluded
-     * @param threshold the most points to keep; 0 keeps all of them
+     * @param threshold the most points to keep, at least 3
      * @param order oldest or newest first
      * @param limit the most points to return; 0 for all
      * @return the chosen points

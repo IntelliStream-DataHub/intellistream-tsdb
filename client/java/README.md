@@ -206,6 +206,26 @@ The server only knows UTC. The client looks up the time zone in Java's own time 
 out when each local day begins, and sends those times to the server. `osloDays.bounds(start, end)` returns these
 times if you want them, and `queryBounds` takes your own list of start times.
 
+## Spread, time-weighted averages and charts
+
+```java
+// range, variance and standard deviation per hour, newest hour first, the last 24 only
+List<SpreadBucket> spread = client.querySpread(energy, t0, t0 + 86_400_000, 3_600_000, Order.DESC, 24);
+double sd = spread.get(0).stddevSamp();
+
+// time-weighted average per hour: each reading counts for as long as it held
+List<TwaBucket> twa = client.queryTwa(energy, t0, t0 + 86_400_000, 3_600_000,
+        TwaOptions.linear().maxGap(600_000));   // straight lines between readings; gaps over 10 minutes count as unknown
+double avg = twa.get(0).twa();
+
+// at most 500 points that keep the shape of the line, for a chart
+ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);
+```
+
+`querySpreadGroup`, `querySpreadBounds`, `queryTwaGroup` and `queryTwaBounds` take calendar groups and bucket
+starts as `queryGroup` and `queryBounds` do. These need a server of protocol version 8 (the spread), 6 (TWA) or 5
+(LTTB; 9 with an order or a limit); an older one gets no request and the call fails with `Status.ERR_INVALID`.
+
 ## Value types and nulls
 
 A series holds one type of value, chosen when it is created:

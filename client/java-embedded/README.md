@@ -59,6 +59,8 @@ The library is looked up in this order. The first match wins:
 
 Whichever it is, the binding asks the library for the size of every public struct (`tsdb_struct_size`) when it
 loads it and refuses one built from other headers with an `UnsatisfiedLinkError`, instead of corrupting memory.
+(The spread and TWA structs have no such size yet; the tests check them against the headers, and a library
+without their functions fails to load.)
 The library needs `libzstd.so.1` at run time (`apt install libzstd1`, `dnf install libzstd`).
 
 `EmbeddedDb.librarySource()` tells you which one was used. The bundled copy is whatever `build/libtsdb.so` was
@@ -93,6 +95,11 @@ machine's CPU (`-march=native`). For a jar that runs on other machines, build th
   more than 32 MiB, or arrives when the limit is used up, gets native memory of its own that is freed when it
   returns, as every call did before. Arrays the engine returns are copied into Java objects and freed with
   `tsdb_free` at once.
+- **The same queries as over TCP.** `querySpread*`, `queryTwa*`, `queryLttb`, `queryAgg` with an order and a
+  limit, `deleteRange`, `replaceRange`, `setRetention` and `retention` take the TCP client's arguments and return
+  its types (`SpreadBucket`, `TwaBucket`, `TwaOptions`, `ValuePoints`); `TcpCompareTest` checks that both give
+  the same answers. Spread and TWA groups in a time zone use the engine's calendar
+  (`tsdb_query_spread_group_local`, `tsdb_query_twa_group_local`), which gives the TCP client's buckets.
 - **Embedded only.** `append`, `dropBefore`, `refresh`, `failed()`, `parts()`, `seriesPath`, `volumeCount`,
   `volumePath`, `simdLevel()` and every field of `EmbeddedOptions` (`tsdb_options`).
 

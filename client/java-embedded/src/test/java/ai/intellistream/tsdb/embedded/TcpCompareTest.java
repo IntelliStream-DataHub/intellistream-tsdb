@@ -4,6 +4,8 @@ import ai.intellistream.tsdb.Column;
 import ai.intellistream.tsdb.Group;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.TsdbClient;
+import ai.intellistream.tsdb.TsdbException;
+import ai.intellistream.tsdb.TwaOptions;
 import ai.intellistream.tsdb.Unit;
 import ai.intellistream.tsdb.ValuePoints;
 import ai.intellistream.tsdb.ValueType;
@@ -13,7 +15,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Assumptions;
@@ -75,6 +79,19 @@ class TcpCompareTest {
                 st[i] = codes[i % 3];
             db.insertSeriesValues(ids[4], ts, Column.ofStates(st).withNulls(nulls));
             db.insert(ids[0], new long[] {T0}, new float[] {123}); /* a correction, in the memtable */
+            /* tombstones both doors must apply: a delete and a replace in every type, a retention limit */
+            for (int k = 0; k < 4; k++) {
+                db.deleteRange(ids[k], T0 + 1000 * 60_000L, T0 + 1500 * 60_000L);
+                long[] rts = {T0 + 2000 * 60_000L + 1, T0 + 2000 * 60_000L + 30_000};
+                Column rc = switch (k) {
+                case 0 -> Column.ofFloats(new float[] {1.5f, -2});
+                case 1 -> Column.ofDoubles(new double[] {1e9, -7}).withNulls(BitSet.valueOf(new long[] {2}));
+                case 2 -> Column.ofLongs(new long[] {Long.MAX_VALUE - 1, 3});
+                default -> Column.ofBools(new boolean[] {true, true});
+                };
+                db.replaceRange(ids[k], T0 + 2000 * 60_000L, T0 + 2600 * 60_000L, rts, rc);
+            }
+            db.setRetention(ids[1], 1000L * 86400 * 365 * 200); /* long enough to keep every row */
         }
         /* tsdbd picks a free port itself (--port 0) and writes "PORT PID" to the port file once it serves: a port
          * picked here and released could be taken by another tree's tsdbd, whose answers this test would then check */
@@ -114,12 +131,45 @@ class TcpCompareTest {
                             assertEquals(tcp.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, o, limit),
                                     db.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, o, limit));
                             for (Group g : new Group[] {null, Group.of(Unit.DAY), Group.of(Unit.WEEK).in("Europe/Oslo"),
-                                Group.of(Unit.HOUR, 5).in("America/St_Johns"), Group.of(Unit.MONTH).in("Asia/Kolkata")})
+                                Group.of(Unit.HOUR, 5).in("America/St_Johns"), Group.of(Unit.MONTH).in("Asia/Kolkata")}) {
                                 assertEquals(tcp.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, g, o, limit),
                                         db.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, g, o, limit), "" + g);
+                                long gl = limit;
+                                for (long[] r : new long[][] {{Long.MIN_VALUE, Long.MAX_VALUE},
+                                    {T0 + 12_345_678L, T0 + 2_000_000_000L}}) {
+                                    same(names[k] + " spread " + g, () -> tcp.querySpreadGroup(id, r[0], r[1], g, o,
+                                            gl), () -> db.querySpreadGroup(id, r[0], r[1], g, o, gl));
+                                    TwaOptions to = TwaOptions.linear().order(o).limit(gl);
+                                    same(names[k] + " twa " + g, () -> tcp.queryTwaGroup(id, r[0], r[1], g, to),
+                                            () -> db.queryTwaGroup(id, r[0], r[1], g, to));
+                                }
+                            }
                             long[] bounds = {T0 - 1, T0 + 1_000_000, T0 + 9_999_999};
                             assertEquals(tcp.queryBounds(id, T0, T0 + 20_000_000L, bounds, o, limit),
                                     db.queryBounds(id, T0, T0 + 20_000_000L, bounds, o, limit));
+                            long ol = limit;
+                            long lo = T0 + 999 * 60_000L, hi = T0 + 30_000 * 60_000L;
+                            same(names[k] + " spread", () -> tcp.querySpread(id, lo, hi, 3_600_000L, o, ol),
+                                    () -> db.querySpread(id, lo, hi, 3_600_000L, o, ol));
+                            same(names[k] + " spread 0", () -> tcp.querySpread(id, Long.MIN_VALUE, Long.MAX_VALUE, 0,
+                                    o, ol), () -> db.querySpread(id, Long.MIN_VALUE, Long.MAX_VALUE, 0, o, ol));
+                            same(names[k] + " spread bounds", () -> tcp.querySpreadBounds(id, T0, hi, bounds, o, ol),
+                                    () -> db.querySpreadBounds(id, T0, hi, bounds, o, ol));
+                            for (TwaOptions t : new TwaOptions[] {TwaOptions.step(), TwaOptions.linear(),
+                                TwaOptions.step().maxGap(90_000), TwaOptions.linear().maxGap(30 * 60_000L)}) {
+                                TwaOptions to = t.order(o).limit(ol);
+                                same(names[k] + " twa " + to, () -> tcp.queryTwa(id, lo + 7, hi, 3_600_000L, to),
+                                        () -> db.queryTwa(id, lo + 7, hi, 3_600_000L, to));
+                                same(names[k] + " twa 0 " + to, () -> tcp.queryTwa(id, Long.MIN_VALUE,
+                                        Long.MAX_VALUE, 0, to), () -> db.queryTwa(id, Long.MIN_VALUE, Long.MAX_VALUE,
+                                        0, to));
+                                same(names[k] + " twa bounds " + to, () -> tcp.queryTwaBounds(id, T0, hi, bounds, to),
+                                        () -> db.queryTwaBounds(id, T0, hi, bounds, to));
+                            }
+                            for (long th : new long[] {0, 2, 3, 100, 49_000, 1_000_000, -1})
+                                same(names[k] + " lttb " + th, () -> points(tcp.queryLttb(id, Long.MIN_VALUE,
+                                        Long.MAX_VALUE, th, o, ol)), () -> points(db.queryLttb(id, Long.MIN_VALUE,
+                                        Long.MAX_VALUE, th, o, ol)));
                         }
                     }
                 }
@@ -128,6 +178,8 @@ class TcpCompareTest {
                 assertArrayEquals(q.timestamps(), p.timestamps());
                 assertArrayEquals(q.values(), p.values());
                 assertEquals(123f, p.value(0));
+                assertEquals(tcp.retention(ids[1]), db.retention(ids[1]));
+                assertEquals(0, db.retention(ids[0]));
                 assertEquals(tcp.stateName(ids[4], 2), db.stateName(ids[4], 2));
                 assertEquals(tcp.stateLookup(ids[4], "stop"), db.stateLookup(ids[4], "stop"));
             }
@@ -136,6 +188,37 @@ class TcpCompareTest {
             if (!server.waitFor(60, TimeUnit.SECONDS))
                 server.destroyForcibly().waitFor();
         }
+    }
+
+    interface Query<T> {
+        T run() throws TsdbException;
+    }
+
+    /** Both answer alike, or both fail with the same status. */
+    private static <T> void same(String what, Query<T> tcp, Query<T> embedded) {
+        Object a, b;
+        try {
+            a = tcp.run();
+        } catch (TsdbException e) {
+            a = "status " + e.status();
+        }
+        try {
+            b = embedded.run();
+        } catch (TsdbException e) {
+            b = "status " + e.status();
+        }
+        assertEquals(a, b, what);
+    }
+
+    /** A comparable form of points: timestamps, then each value's bits or null. */
+    private static List<Object> points(ValuePoints p) {
+        List<Object> l = new ArrayList<>();
+        l.add(p.values().type());
+        for (int i = 0; i < p.size(); i++) {
+            l.add(p.timestamps()[i]);
+            l.add(p.values().isNull(i) ? null : Double.doubleToRawLongBits(p.values().getDouble(i)));
+        }
+        return l;
     }
 
     private static String read(Path p) {

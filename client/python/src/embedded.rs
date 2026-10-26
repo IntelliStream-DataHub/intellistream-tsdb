@@ -734,7 +734,7 @@ impl Db {
     ///
     /// Args:
     ///     series: The series id.
-    ///     threshold: How many rows to keep at most; 0 keeps all of them.
+    ///     threshold: How many rows to keep at most, at least 3.
     ///     start: First timestamp to include (ms); None for no lower limit.
     ///     end: Timestamp to stop before (ms); None for no upper limit.
     ///     order: "asc" (oldest first) or "desc" (newest first): the same

@@ -8,9 +8,13 @@ import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.QueryStats;
 import ai.intellistream.tsdb.RawConsumer;
 import ai.intellistream.tsdb.Stats;
+import ai.intellistream.tsdb.SpreadBucket;
 import ai.intellistream.tsdb.Status;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
+import ai.intellistream.tsdb.TwaBucket;
+import ai.intellistream.tsdb.TwaMethod;
+import ai.intellistream.tsdb.TwaOptions;
 import ai.intellistream.tsdb.ValuePoints;
 import ai.intellistream.tsdb.ValueType;
 import ai.intellistream.tsdb.ValuesConsumer;
@@ -24,7 +28,6 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
-import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -1128,6 +1131,14 @@ public final class EmbeddedDb implements AutoCloseable {
     /** Runs a streaming query and returns true unless the consumer stopped it. */
     private boolean stream(Sink s, int series, long start, long end, Order order, long limit, boolean typed)
             throws TsdbException {
+        return stream(s, series, start, end, order, limit, typed ? VALUES : RAW, 0);
+    }
+
+    private static final int RAW = 0, VALUES = 1, LTTB = 2;
+
+    /** Runs a streaming query of {@code kind} ({@code threshold} for LTTB only). */
+    private boolean stream(Sink s, int series, long start, long end, Order order, long limit, int kind,
+                           long threshold) throws TsdbException {
         MemorySegment d = enter();
         long id = IDS.getAndIncrement();
         int rc;
@@ -1135,10 +1146,13 @@ public final class EmbeddedDb implements AutoCloseable {
             MemorySegment o = opts(a, order, limit);
             SINKS.put(id, s);
             try {
-                rc = typed ? (int) Native.QUERY_VALUES.invokeExact(d, series, start, end, o, VALUES_STUB,
-                        MemorySegment.ofAddress(id))
-                        : (int) Native.QUERY_RAW_EX.invokeExact(d, series, start, end, o, RAW_STUB,
-                                MemorySegment.ofAddress(id));
+                MemorySegment ctx = MemorySegment.ofAddress(id);
+                if (kind == LTTB) /* a negative threshold is a huge size_t, as tsdbd reads it: every point */
+                    rc = (int) Native.QUERY_LTTB_EX.invokeExact(d, series, start, end, threshold, o, VALUES_STUB, ctx);
+                else if (kind == VALUES)
+                    rc = (int) Native.QUERY_VALUES.invokeExact(d, series, start, end, o, VALUES_STUB, ctx);
+                else
+                    rc = (int) Native.QUERY_RAW_EX.invokeExact(d, series, start, end, o, RAW_STUB, ctx);
             } catch (Throwable t) {
                 throw rethrow(t);
             } finally {
@@ -1353,6 +1367,18 @@ public final class EmbeddedDb implements AutoCloseable {
 
     // ------------------------------------------------------------------------------------------------ aggregates
 
+    private static Bucket bucket(MemorySegment m, long o) {
+        return new Bucket(m.get(JAVA_LONG, o), m.get(JAVA_LONG, o + 8), m.get(JAVA_DOUBLE, o + 16),
+                m.get(JAVA_DOUBLE, o + 24), m.get(JAVA_DOUBLE, o + 32), m.get(JAVA_LONG, o + 40),
+                m.get(JAVA_LONG, o + 48), m.get(JAVA_LONG, o + 56));
+    }
+
+    private static void checkOpts(Order order, long limit) {
+        Objects.requireNonNull(order, "order");
+        if (limit < 0)
+            throw new IllegalArgumentException("negative limit");
+    }
+
     /** Reads and frees the engine's bucket array. */
     private static List<Bucket> buckets(MemorySegment out, MemorySegment nout) {
         MemorySegment b = out.get(PTR, 0);
@@ -1403,31 +1429,9 @@ public final class EmbeddedDb implements AutoCloseable {
      */
     public List<Bucket> queryAgg(int series, long start, long end, long intervalMs, Order order, long limit)
             throws TsdbException {
-        Objects.requireNonNull(order, "order");
-        if (limit < 0)
-            throw new IllegalArgumentException("negative limit");
-        MemorySegment d = enter();
-        int rc;
-        List<Bucket> list;
-        try (Arena a = Arena.ofConfined()) {
-            MemorySegment out = a.allocate(PTR);
-            MemorySegment nout = a.allocate(SIZE_T);
-            try {
-                rc = (int) Native.QUERY_AGG.invokeExact(d, series, start, end, intervalMs, out, nout);
-            } catch (Throwable t) {
-                throw rethrow(t);
-            }
-            saveStats();
-            check(rc, "query");
-            list = buckets(out, nout);
-        } finally {
-            exit();
-        }
-        if (order == Order.DESC) /* as tsdbd does it: the engine aggregates by interval oldest first */
-            Collections.reverse(list);
-        if (limit > 0 && list.size() > limit)
-            list = new ArrayList<>(list.subList(0, (int) limit));
-        return list;
+        checkOpts(order, limit);
+        return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_AGG_EX.invokeExact(d, series, start, end,
+                intervalMs, opts(a, order, limit), out, nout), BUCKET.byteSize(), EmbeddedDb::bucket);
     }
 
     /**
@@ -1611,6 +1615,406 @@ public final class EmbeddedDb implements AutoCloseable {
             exit();
         }
     }
+
+    // ------------------------------------------------------------------------------------------------ the spread
+
+    /** An engine call that returns an array through {@code out} and {@code nout}. */
+    private interface ArrayCall {
+        int invoke(MemorySegment d, Arena a, MemorySegment out, MemorySegment nout) throws Throwable;
+    }
+
+    /** One element of an engine array at byte offset {@code o}. */
+    private interface Element<T> {
+        T read(MemorySegment m, long o);
+    }
+
+    /** Runs {@code call} under the read lock and reads and frees the array it returned. */
+    private <T> List<T> arrayQuery(ArrayCall call, long size, Element<T> element) throws TsdbException {
+        MemorySegment d = enter();
+        int rc;
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment out = a.allocate(PTR);
+            MemorySegment nout = a.allocate(SIZE_T);
+            try {
+                rc = call.invoke(d, a, out, nout);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            saveStats();
+            check(rc, "query");
+            MemorySegment b = out.get(PTR, 0);
+            long n = nout.get(SIZE_T, 0);
+            if (b.address() == 0)
+                return new ArrayList<>();
+            Native.OUTSTANDING.incrementAndGet();
+            try {
+                MemorySegment m = b.reinterpret(n * size);
+                List<T> list = new ArrayList<>((int) n);
+                for (long i = 0; i < n; i++)
+                    list.add(element.read(m, i * size));
+                return list;
+            } finally {
+                Native.free(b);
+            }
+        } finally {
+            exit();
+        }
+    }
+
+    private static SpreadBucket spreadBucket(MemorySegment m, long o) {
+        Bucket b = new Bucket(m.get(JAVA_LONG, o), m.get(JAVA_LONG, o + 8), m.get(JAVA_DOUBLE, o + 16),
+                m.get(JAVA_DOUBLE, o + 24), m.get(JAVA_DOUBLE, o + 32), m.get(JAVA_LONG, o + 40),
+                m.get(JAVA_LONG, o + 48), m.get(JAVA_LONG, o + 56));
+        return new SpreadBucket(b, m.get(JAVA_DOUBLE, o + 64), m.get(JAVA_DOUBLE, o + 72), m.get(JAVA_DOUBLE, o + 80),
+                m.get(JAVA_DOUBLE, o + 88), m.get(JAVA_DOUBLE, o + 96));
+    }
+
+    private static TwaBucket twaBucket(MemorySegment m, long o) {
+        return new TwaBucket(m.get(JAVA_LONG, o), m.get(JAVA_DOUBLE, o + 8), m.get(JAVA_DOUBLE, o + 16),
+                m.get(JAVA_LONG, o + 24), m.get(JAVA_LONG, o + 32));
+    }
+
+    /** True for a group in a zone other than UTC: the engine's {@code _local} functions compute its bounds. */
+    private static boolean local(Group g) {
+        return g != null && g.zone() != null && !g.zone().normalized().equals(ZoneOffset.UTC);
+    }
+
+    /** A {@code tsdb_group}, with its zone when {@code local(g)}; NULL for no group. */
+    private static MemorySegment group(Arena a, Group g) {
+        if (g == null)
+            return MemorySegment.NULL;
+        MemorySegment s = a.allocate(Native.GROUP);
+        s.set(JAVA_INT, 0, g.unit().code());
+        s.set(JAVA_INT, 4, g.count());
+        s.set(PTR, 8, local(g) ? a.allocateFrom(g.zone().getId()) : MemorySegment.NULL);
+        return s;
+    }
+
+    private static void checkBounds(long[] bounds) {
+        if (Objects.requireNonNull(bounds, "bounds").length == 0)
+            throw new IllegalArgumentException("no bounds");
+    }
+
+    /**
+     * Aggregates a series over {@code [start, end)} in fixed intervals, oldest first, with the spread of each bucket:
+     * range, population and sample variance and standard deviation. As {@link TsdbClient#querySpread(int, long,
+     * long, long)}.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param intervalMs the bucket length, or 0 for one bucket
+     * @return the buckets with rows
+     * @throws TsdbException e.g. {@link Status#ERR_INVALID} for a negative interval
+     */
+    public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs) throws TsdbException {
+        return querySpread(series, start, end, intervalMs, Order.ASC, 0);
+    }
+
+    /**
+     * As {@link #querySpread(int, long, long, long)}, in the given order, at most {@code limit} buckets.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param intervalMs the bucket length, or 0 for one bucket
+     * @param order by bucket start
+     * @param limit at most this many buckets; 0 for all
+     * @return the buckets with rows
+     * @throws TsdbException e.g. {@link Status#ERR_INVALID} for a negative interval
+     * @throws IllegalArgumentException for a negative limit
+     */
+    public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs, Order order, long limit)
+            throws TsdbException {
+        checkOpts(order, limit);
+        return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_SPREAD.invokeExact(d, series, start, end,
+                intervalMs, opts(a, order, limit), out, nout), Native.SPREAD_BUCKET.byteSize(),
+                EmbeddedDb::spreadBucket);
+    }
+
+    /**
+     * The spread in calendar buckets, as {@link #queryGroup(int, long, long, Group, Order, long)} groups; a zone
+     * other than UTC through the engine's calendar ({@code tsdb_query_spread_group_local}).
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param group the periods, or {@code null} for one bucket over the range
+     * @param order by bucket start
+     * @param limit at most this many buckets; 0 for all
+     * @return the buckets with rows
+     * @throws TsdbException e.g. {@link Status#ERR_TOO_MANY_BUCKETS}
+     * @throws IllegalArgumentException for a negative limit
+     */
+    public List<SpreadBucket> querySpreadGroup(int series, long start, long end, Group group, Order order,
+                                               long limit) throws TsdbException {
+        checkOpts(order, limit);
+        boolean zoned = local(group);
+        return arrayQuery((d, a, out, nout) -> zoned
+                ? (int) Native.QUERY_SPREAD_GROUP_LOCAL.invokeExact(d, series, start, end, group(a, group),
+                        opts(a, order, limit), out, nout)
+                : (int) Native.QUERY_SPREAD_GROUP.invokeExact(d, series, start, end, group(a, group),
+                        opts(a, order, limit), out, nout), Native.SPREAD_BUCKET.byteSize(), EmbeddedDb::spreadBucket);
+    }
+
+    /**
+     * The spread in buckets that begin at the given UTC instants, as
+     * {@link #queryBounds(int, long, long, long[], Order, long)}.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param bounds the bucket starts, strictly increasing; at least one
+     * @param order by bucket start
+     * @param limit at most this many buckets; 0 for all
+     * @return the buckets with rows
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not strictly increase
+     * @throws IllegalArgumentException if there are no bounds, or for a negative limit
+     */
+    public List<SpreadBucket> querySpreadBounds(int series, long start, long end, long[] bounds, Order order,
+                                                long limit) throws TsdbException {
+        checkBounds(bounds);
+        checkOpts(order, limit);
+        return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_SPREAD_BOUNDS.invokeExact(d, series, start, end,
+                a.allocateFrom(JAVA_LONG, bounds), (long) bounds.length, opts(a, order, limit), out, nout),
+                Native.SPREAD_BUCKET.byteSize(), EmbeddedDb::spreadBucket);
+    }
+
+    // ------------------------------------------------------------------------------------- time-weighted averages
+
+    private static MemorySegment twaOpts(Arena a, TwaOptions o) {
+        MemorySegment s = a.allocate(Native.TWA_OPTS).fill((byte) 0);
+        s.set(JAVA_INT, 0, o.method() == TwaMethod.LINEAR ? 1 : 0);
+        s.set(JAVA_LONG, 8, o.maxGapMs());
+        s.set(JAVA_INT, 16, o.order() == Order.DESC ? 1 : 0);
+        s.set(SIZE_T, 24, o.limit());
+        return s;
+    }
+
+    /**
+     * Time-weighted averages of a series over {@code [start, end)} in fixed intervals: each reading weighted by how
+     * long it held. As {@link TsdbClient#queryTwa(int, long, long, long, TwaOptions)}.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param intervalMs the bucket length, or 0 for one bucket starting at {@code start}
+     * @param opts method, gap limit, order and limit
+     * @return the buckets with readings or coverage
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval or a state series
+     */
+    public List<TwaBucket> queryTwa(int series, long start, long end, long intervalMs, TwaOptions opts)
+            throws TsdbException {
+        Objects.requireNonNull(opts, "opts");
+        return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_TWA.invokeExact(d, series, start, end, intervalMs,
+                twaOpts(a, opts), out, nout), Native.TWA_BUCKET.byteSize(), EmbeddedDb::twaBucket);
+    }
+
+    /**
+     * Time-weighted averages in calendar buckets; a zone other than UTC through the engine's calendar
+     * ({@code tsdb_query_twa_group_local}: an open side of the range is cut to where segments cover time).
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param group the periods, or {@code null} for one bucket over the range
+     * @param opts method, gap limit, order and limit
+     * @return the buckets with readings or coverage
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a state series
+     */
+    public List<TwaBucket> queryTwaGroup(int series, long start, long end, Group group, TwaOptions opts)
+            throws TsdbException {
+        Objects.requireNonNull(opts, "opts");
+        boolean zoned = local(group);
+        return arrayQuery((d, a, out, nout) -> zoned
+                ? (int) Native.QUERY_TWA_GROUP_LOCAL.invokeExact(d, series, start, end, group(a, group),
+                        twaOpts(a, opts), out, nout)
+                : (int) Native.QUERY_TWA_GROUP.invokeExact(d, series, start, end, group(a, group), twaOpts(a, opts),
+                        out, nout), Native.TWA_BUCKET.byteSize(), EmbeddedDb::twaBucket);
+    }
+
+    /**
+     * Time-weighted averages in buckets that begin at the given UTC instants; segments before {@code bounds[0]}
+     * do not count.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param bounds the bucket starts, strictly increasing; at least one
+     * @param opts method, gap limit, order and limit
+     * @return the buckets with readings or coverage
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not increase or for a state series
+     * @throws IllegalArgumentException if there are no bounds
+     */
+    public List<TwaBucket> queryTwaBounds(int series, long start, long end, long[] bounds, TwaOptions opts)
+            throws TsdbException {
+        Objects.requireNonNull(opts, "opts");
+        checkBounds(bounds);
+        return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_TWA_BOUNDS.invokeExact(d, series, start, end,
+                a.allocateFrom(JAVA_LONG, bounds), (long) bounds.length, twaOpts(a, opts), out, nout),
+                Native.TWA_BUCKET.byteSize(), EmbeddedDb::twaBucket);
+    }
+
+    // ------------------------------------------------------------------------------------------------ LTTB
+
+    /**
+     * Downsamples a series for a chart: at most {@code threshold} points of {@code [start, end)} that keep the shape
+     * of the line (Largest-Triangle-Three-Buckets), oldest first, with their stored values. As
+     * {@link TsdbClient#queryLttb(int, long, long, long)}.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param threshold the most points to keep, at least 3
+     * @return the chosen points
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold below 3 or a state series
+     */
+    public ValuePoints queryLttb(int series, long start, long end, long threshold) throws TsdbException {
+        return queryLttb(series, start, end, threshold, Order.ASC, 0);
+    }
+
+    /**
+     * As {@link #queryLttb(int, long, long, long)}, newest first with {@link Order#DESC} and only the first
+     * {@code limit} of the chosen points in that order; the choice does not change.
+     *
+     * @param series the series id
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param threshold the most points to keep, at least 3
+     * @param order oldest or newest first
+     * @param limit the most points to return; 0 for all
+     * @return the chosen points
+     * @throws TsdbException as {@link #queryLttb(int, long, long, long)}
+     * @throws IllegalArgumentException for a negative limit
+     */
+    public ValuePoints queryLttb(int series, long start, long end, long threshold, Order order, long limit)
+            throws TsdbException {
+        checkOpts(order, limit);
+        ValueType type = seriesType(series);
+        Sink s = new Sink();
+        s.collect = true;
+        s.type = type;
+        s.room(1);
+        stream(s, series, start, end, order, limit, LTTB, threshold);
+        int n = s.fill;
+        return new ValuePoints(Arrays.copyOf(s.ts, n), s.column(n, true));
+    }
+
+    // ------------------------------------------------------------------------------------------- deletes, retention
+
+    /**
+     * Deletes every row of a series with {@code start <= ts < end}; {@code start >= end} deletes nothing. It returns
+     * once the delete is durable and visible; merges remove the rows from disk later. A delete flushes the memtable
+     * and writes a small part per partition, about what a large insert costs.
+     *
+     * @param series the series id
+     * @param start the first timestamp deleted
+     * @param end the first timestamp kept after the range
+     * @throws TsdbException e.g. {@link Status#ERR_READONLY}
+     */
+    public void deleteRange(int series, long start, long end) throws TsdbException {
+        MemorySegment d = enter();
+        try {
+            int rc;
+            try {
+                rc = (int) Native.DELETE_RANGE.invokeExact(d, series, start, end);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            checkWrite(d, rc, "delete");
+        } finally {
+            exit();
+        }
+    }
+
+    /**
+     * Replaces the rows of a series in {@code [start, end)} by {@code timestamps} and {@code values}, atomically: a
+     * reader, and a crash, sees either the old rows or the new ones. Every timestamp must lie in the range; no rows
+     * make it a delete. The column's type must be the series' type; its nulls are written as nulls.
+     *
+     * @param series the series id
+     * @param start the first timestamp replaced
+     * @param end the first timestamp kept after the range
+     * @param timestamps ms since the epoch, each in {@code [start, end)}
+     * @param values the values; as long as {@code timestamps}
+     * @throws IllegalArgumentException if the lengths differ
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a timestamp outside the range or a column of another
+     *     type than the series
+     */
+    public void replaceRange(int series, long start, long end, long[] timestamps, Column values)
+            throws TsdbException {
+        Objects.requireNonNull(timestamps, "timestamps");
+        Objects.requireNonNull(values, "values");
+        int n = timestamps.length;
+        if (values.size() != n)
+            throw new IllegalArgumentException(n + " timestamps and " + values.size() + " values");
+        MemorySegment d = enter();
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment ts = a.allocateFrom(JAVA_LONG, timestamps);
+            MemorySegment col = a.allocate(Native.VALUES).fill((byte) 0);
+            col.set(JAVA_INT, 0, values.type().code());
+            col.set(PTR, 8, columnValues(a, values, 0, n));
+            col.set(PTR, 16, validity(a, values, 0, n));
+            int rc;
+            try {
+                rc = (int) Native.REPLACE_RANGE.invokeExact(d, series, start, end, ts, col, (long) n);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            checkWrite(d, rc, "replace");
+        } finally {
+            exit();
+        }
+    }
+
+    /**
+     * Sets how long a series keeps its rows, in ms: rows older than the wall clock minus {@code limitMs} disappear
+     * from queries at once and from disk as merges get to them; 0 keeps them forever. Durable when this returns.
+     *
+     * @param series the series id
+     * @param limitMs the age limit in ms, 0 for none
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative limit, {@link Status#ERR_NOTFOUND} for an
+     *     unknown series
+     */
+    public void setRetention(int series, long limitMs) throws TsdbException {
+        MemorySegment d = enter();
+        try {
+            int rc;
+            try {
+                rc = (int) Native.SET_RETENTION.invokeExact(d, series, limitMs);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            checkWrite(d, rc, "retention");
+        } finally {
+            exit();
+        }
+    }
+
+    /**
+     * Returns the retention limit of a series.
+     *
+     * @param series the series id
+     * @return the age limit in ms, 0 for none
+     * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown series
+     */
+    public long retention(int series) throws TsdbException {
+        MemorySegment d = enter();
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment v = a.allocate(JAVA_LONG);
+            int rc;
+            try {
+                rc = (int) Native.GET_RETENTION.invokeExact(d, series, v);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            check(rc, "retention");
+            return v.get(JAVA_LONG, 0);
+        } finally {
+            exit();
+        }
+    }
+
 
     // ------------------------------------------------------------------------------------------------ maintenance
 

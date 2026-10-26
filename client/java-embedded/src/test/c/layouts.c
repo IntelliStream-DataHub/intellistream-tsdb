@@ -44,6 +44,15 @@ int main(void)
     F(tsdb_part_info, name); F(tsdb_part_info, partition); F(tsdb_part_info, min_ts); F(tsdb_part_info, max_ts);
     F(tsdb_part_info, rows); F(tsdb_part_info, bytes); F(tsdb_part_info, granules); F(tsdb_part_info, level);
     F(tsdb_part_info, created_s); F(tsdb_part_info, written_s);
+    S(tsdb_spread_bucket);
+    F(tsdb_spread_bucket, b); F(tsdb_spread_bucket, range); F(tsdb_spread_bucket, var_pop);
+    F(tsdb_spread_bucket, var_samp); F(tsdb_spread_bucket, stddev_pop); F(tsdb_spread_bucket, stddev_samp);
+    S(tsdb_twa_opts);
+    F(tsdb_twa_opts, method); F(tsdb_twa_opts, max_gap_ms); F(tsdb_twa_opts, order); F(tsdb_twa_opts, limit);
+    F(tsdb_twa_opts, no_stats);
+    S(tsdb_twa_bucket);
+    F(tsdb_twa_bucket, start); F(tsdb_twa_bucket, twa); F(tsdb_twa_bucket, area); F(tsdb_twa_bucket, covered_ms);
+    F(tsdb_twa_bucket, count);
     /* enum and value-type widths the binding assumes */
     printf("enum %zu\n", sizeof(tsdb_type));
     /* the codes it passes: "type.FLOAT64 1" is ValueType.FLOAT64.code(), "unit.DAY 4" Unit.DAY.code(), "order.DESC 1",
@@ -55,6 +64,7 @@ int main(void)
     E("unit", WEEK, TSDB_WEEK); E("unit", MONTH, TSDB_MONTH); E("unit", QUARTER, TSDB_QUARTER);
     E("unit", YEAR, TSDB_YEAR);
     E("order", ASC, TSDB_ASC); E("order", DESC, TSDB_DESC);
+    E("twa", STEP, TSDB_TWA_STEP); E("twa", LINEAR, TSDB_TWA_LINEAR);
     E("kind", tsdb_options, TSDB_STRUCT_OPTIONS); E("kind", tsdb_values, TSDB_STRUCT_VALUES);
     E("kind", tsdb_bucket, TSDB_STRUCT_BUCKET); E("kind", tsdb_points, TSDB_STRUCT_POINTS);
     E("kind", tsdb_group, TSDB_STRUCT_GROUP); E("kind", tsdb_query_opts, TSDB_STRUCT_QUERY_OPTS);
