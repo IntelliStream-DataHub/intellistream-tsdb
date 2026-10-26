@@ -436,7 +436,11 @@ own into every system (tsdb, ClickHouse, DuckDB, QuestDB native and Parquet, Tim
 Prometheus), let each settle (merges, compaction, compression jobs), and record the exact size on disk the same
 way as for the main table. One column per database: bytes per reading and the size compared to tsdb (tsdb is 1x; 2.6x means 2.6 times tsdb's
 size). Every table of sizes in the README is shown that way, never as a ratio to the raw size. Sizes do
-not depend on machine load. Remove the containers and data afterwards.
+not depend on machine load. The real data of [`../hydraulic`](../hydraulic) (the 17 sensors of the test rig in bar, and the pressures converted
+to psi) goes through the same steps, one sensor at a time, with tsdb's background merges settled like the others'
+work: tsdb's dictionary codec runs in merges, and DuckDB, Parquet (QuestDB's Parquet partitions, InfluxDB 3) and
+ClickHouse's `LowCardinality` have dictionaries too, so data with few distinct values must be in the comparison
+before any claim about compression. Remove the containers and data afterwards.
 
 ## Fairness notes
 
