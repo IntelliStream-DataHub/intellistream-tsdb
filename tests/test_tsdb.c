@@ -576,7 +576,7 @@ static void check_all(tsdb *db, ref *r, uint32_t nseries, int64_t t0, int64_t sp
 
 static void rm_rf(const char *dir)
 {
-    char cmd[512];
+    char cmd[600];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
     if (system(cmd) != 0)
         exit(1);
@@ -1733,7 +1733,10 @@ static void test_idle_merge(const char *base)
             break;
         usleep(100000);
     }
-    CHECK(pc.n == 1);
+    tsdb_stats st0;
+    OK(tsdb_get_stats(db, &st0));
+    /* one merge of both: a rewrite of one part alone (to re-encode it) never runs ahead of a merge */
+    CHECK(pc.n == 1 && st0.merges == 1);
     /* Regression: a merge's output counted as a new write, so a partition
      * needing several merges waited merge_idle_s again after each. The part
      * keeps the time its rows were written, a second or more before the merge. */
@@ -1829,6 +1832,116 @@ static void test_solo_rewrite(const char *base)
         OK(tsdb_close(db));
         rm_rf(dir);
     }
+    free(ts);
+    free(v);
+}
+
+/* Solo rewrites come after the retention work. Regression (review of the solo rewrite): the merge thread looked
+ * at retention only when it found nothing to merge, and an idle part only an insert wrote always counted as
+ * something, so after a bulk load an expired partition was rewritten (to an empty part) before it was dropped,
+ * and dropping partitions and making the WAL's removal durable waited for every such part. */
+static void test_solo_after_retention(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-solo-ttl-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.granule_rows = 256;
+    o.fsync = 0;
+    o.wal_max_batch_rows = 100; /* the insert becomes a part */
+    o.merge_threads = 0;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    enum { N = 1000 };
+    int64_t ts[N];
+    float v[N];
+    for (int i = 0; i < N; i++) {
+        ts[i] = 1600000000000 + (int64_t)i * 1000; /* 2020: long expired */
+        v[i] = (float)i;
+    }
+    OK(tsdb_insert_series(db, id, ts, v, N));
+    OK(tsdb_set_retention(db, id, 86400000));
+    OK(tsdb_close(db));
+    usleep(1200000); /* the part is idle when merges start */
+    o.merge_threads = 1; /* a rewrite that runs first is counted before the partition can go */
+    o.merge_idle_s = 1;
+    OK(tsdb_open(dir, &o, &db));
+    part_count pc = {0, 0, 0};
+    for (int tries = 0; tries < 50; tries++) {
+        pc.n = 0;
+        tsdb_foreach_part(db, count_parts, &pc);
+        if (pc.n == 0)
+            break;
+        usleep(100000);
+    }
+    tsdb_stats st;
+    OK(tsdb_get_stats(db, &st));
+    CHECK(pc.n == 0 && st.merges == 0);
+    OK(tsdb_close(db));
+    rm_rf(dir);
+}
+
+typedef struct level_info {
+    int n, level0;
+} level_info;
+
+static void count_level0(void *ctx, const tsdb_part_info *p)
+{
+    level_info *l = ctx;
+    l->n++;
+    l->level0 += p->level == 0;
+}
+
+/* tsdb_optimize waits for a part a merge thread is rewriting alone. Regression (review of the solo rewrite): it
+ * skipped such a partition instead of waiting, and returned with the part still encoded at insert speed. */
+static void test_optimize_waits_for_solo(const char *base)
+{
+    enum { N = 4000000 };
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-solo-opt-%d", base, (int)getpid());
+    rm_rf(dir);
+    int64_t *ts = malloc(N * sizeof *ts);
+    float *v = malloc(N * sizeof *v);
+    uint64_t r = 11;
+    for (int i = 0; i < N; i++) {
+        r = r * 6364136223846793005ull + 1442695040888963407ull;
+        ts[i] = 1700006400000 + (int64_t)i * 10; /* one partition */
+        v[i] = (float)(14.503773773 * 0.0125 * (double)(2000 + (r >> 58)));
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.wal_max_batch_rows = 100;
+    o.merge_threads = 1;
+    o.merge_idle_s = 1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t id;
+    OK(tsdb_series(db, "psi", &id));
+    OK(tsdb_insert_series(db, id, ts, v, N));
+    /* the merge thread's output is a tmp_ file until it is named: optimize is called while it exists */
+    bool in_flight = false;
+    for (int tries = 0; tries < 4000 && !in_flight; tries++) {
+        DIR *d = opendir(dir);
+        struct dirent *e;
+        while (d && (e = readdir(d)))
+            in_flight |= strncmp(e->d_name, "tmp_", 4) == 0;
+        if (d)
+            closedir(d);
+        if (!in_flight)
+            usleep(1000);
+    }
+    OK(tsdb_optimize(db));
+    level_info l = {0, 0};
+    tsdb_foreach_part(db, count_level0, &l);
+    CHECK(l.n == 1 && l.level0 == 0);
+    if (!in_flight)
+        printf("  (the merge thread's rewrite was not caught in flight)\n");
+    OK(tsdb_close(db));
+    rm_rf(dir);
     free(ts);
     free(v);
 }
@@ -2060,6 +2173,8 @@ int main(int argc, char **argv)
     printf("idle partitions merged\n");
     test_idle_merge(base);
     test_solo_rewrite(base);
+    test_solo_after_retention(base);
+    test_optimize_waits_for_solo(base);
     printf("volume statistics\n");
     test_volume_stats(base);
     test_merging_parts(base);

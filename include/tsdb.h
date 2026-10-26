@@ -87,7 +87,10 @@ typedef struct tsdb_options {
     int follow;              /* read_only, and keep following a writer: new parts, merges and WAL rows */
     int refresh_ms;          /* how often a follower polls the writer's MANIFEST; default 100 */
     int merge_idle_s;        /* a partition that got no new part for this long is merged down to one part
-                              * (up to max_part_bytes) in the background; default 300 (0 too), -1 never */
+                              * (up to max_part_bytes) in the background, and a part an insert wrote that is
+                              * left with nothing to merge with is rewritten alone, once, at merge effort
+                              * (whatever its size: this rewrite ignores max_part_bytes); default 300 (0 too),
+                              * -1 never */
     int obsolete_part_lifetime_s; /* writer: parts replaced by merges are deleted this long after,
                                    * so readers on other hosts (NFS) can finish with them; default 480 */
     int verify_checksums;    /* queries check each granule's checksum before decoding it (TSDB_ERR_CORRUPT

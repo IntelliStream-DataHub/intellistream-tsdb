@@ -50,14 +50,16 @@ static bool merge_allowed(double sum, double max_size, double min_age, double pa
 
 static double merge_score(double count, double sum) { return (sum + MERGE_FIXED_COST * count) / (count - 1.9); }
 
-/* Picks the best range over all partitions. Caller holds db->lock. The chosen
- * parts are marked merging and referenced. */
 /* A part no merge has written holds blocks encoded at insert speed (CODEC_FAST). Once its partition is idle,
  * or on tsdb_optimize, it is rewritten alone when it has nothing to merge with, so that every part at rest
  * ends up encoded at CODEC_MERGE. */
-static bool solo_rewrite(const part *p) { return p->level == 0 && p->ng > 0 && !p->merging; }
+static bool insert_written(const part *p) { return p->level == 0 && p->ng > 0; }
 
-static size_t select_merge_locked(eng *db, part **sel)
+/* Picks the best range over all partitions, or with `solo`, when there is none, one part to rewrite alone.
+ * Solo rewrites come last (merge_thread_main): after real merges and after the retention work, so that an
+ * expired partition is dropped rather than rewritten and the WAL's removal is made durable without waiting
+ * for every part of a bulk load. Caller holds db->lock. The chosen parts are marked merging and referenced. */
+static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
 {
     time_t now = time(NULL);
     double best = INFINITY;
@@ -71,8 +73,8 @@ static size_t select_merge_locked(eng *db, part **sel)
         for (size_t i = a; i < b; i++)
             newest = MAX(newest, db->parts[i]->written);
         bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
-        for (size_t i = a; i < b && idle && solo == SIZE_MAX; i++)
-            if (solo_rewrite(db->parts[i]))
+        for (size_t i = a; i < b && solo_ok && idle && solo == SIZE_MAX; i++)
+            if (insert_written(db->parts[i]) && !db->parts[i]->merging)
                 solo = i;
         if (nparts >= 2) {
             for (size_t i = a; i < b; i++) {
@@ -507,10 +509,12 @@ void *merge_thread_main(void *arg)
     part *sel[MAX_MERGE_PARTS];
     pthread_mutex_lock(&db->lock);
     while (!atomic_load(&db->stop)) {
-        size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel); /* a failed engine writes nothing more */
+        size_t k = eng_check(db) ? 0 : select_merge_locked(db, sel, false); /* a failed engine writes nothing more */
         bool dropped = false, sync_wal = false;
         if (!k && !eng_check(db))
             k = ttl_select_locked(db, sel, &dropped, &sync_wal);
+        if (!k && !dropped && !sync_wal && !eng_check(db))
+            k = select_merge_locked(db, sel, true);
         if (dropped || sync_wal) {
             uint64_t removed = db->wal_removed;
             pthread_mutex_unlock(&db->lock);
@@ -569,14 +573,15 @@ int eng_optimize(eng *db)
     part *sel[MAX_MERGE_PARTS];
     pthread_mutex_lock(&db->lock);
     for (;;) {
-        /* first partition with several parts, or with one only inserts wrote (solo_rewrite), and no merge in flight */
+        /* first partition with several parts, or with one only inserts wrote, and no merge in flight; one a merge
+         * thread is rewriting alone right now is waited for like any other busy partition */
         size_t a = SIZE_MAX, k = 0;
         bool waiting = false;
         for (size_t i = 0, j; i < db->nparts && a == SIZE_MAX; i = j) {
             bool busy = db->parts[i]->merging;
             for (j = i + 1; j < db->nparts && db->parts[j]->partition == db->parts[i]->partition; j++)
                 busy |= db->parts[j]->merging;
-            if (j - i < 2 && !solo_rewrite(db->parts[i]))
+            if (j - i < 2 && !insert_written(db->parts[i]))
                 continue;
             if (busy)
                 waiting = true;

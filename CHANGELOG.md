@@ -44,7 +44,8 @@ disk format and the wire protocol.
   their float32 size, the whole UCI hydraulic rig to 0.29 times (float64) and 0.65 times (float32). Background
   merges try it (inserts keep their speed and encode as before), re-encode the granules of parts inserts wrote
   instead of copying them, and rewrite a partition's only insert-written part once the partition is idle
-  (`merge_idle_s`) or on `tsdb_optimize`. A database of format 5 is refused at open; carry it over with
+  (`merge_idle_s`; after real merges and retention drops) or on `tsdb_optimize`, which waits for such a rewrite in
+  flight. A database of format 5 is refused at open; carry it over with
   `tsdb <dir> export` from the release that wrote it and `tsdb <newdir> import` with this one
   ([docs/compatibility.md](docs/compatibility.md)).
 - Values: a float64 series fed float32 readings (a collector that widens what the sensor gives it) stores them as
