@@ -49,6 +49,9 @@ and 1.0 still need (the format and protocol changes may land in a 0.9.x, but bef
 - Release mechanics: version and tag, release notes, the compatibility promise (which formats and protocol
   versions 1.x reads), the portable tarball checked on AlmaLinux 10; export and import for 0.9.x format changes.
 - The release benchmarks: the full comparison (bench/dbcmp) and the internal numbers on a quiet machine.
+- VALUE_PROPOSITION.md for decision makers, written from the full comparison: storage cost compared to the most
+  popular systems (InfluxDB first, per the DB-Engines ranking), servers needed, and the honest limits (one writer
+  per database until failover; results to confirm with a pilot on the customer's data).
 
 ## After the first release
 
