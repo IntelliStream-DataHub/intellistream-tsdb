@@ -294,6 +294,36 @@ static void merge_refused(const char *dir)
     tsdb_close(db);
 }
 
+/* One series of 40 rows in granules of 16, 16 and 8 rows (one part). */
+static void make_db_3_granules(const char *dir)
+{
+    rm_rf(dir);
+    tsdb_options o = opts();
+    o.granule_rows = 16;
+    o.wal_max_batch_rows = 4; /* straight to a part */
+    tsdb *db;
+    uint32_t id;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "s1", &id));
+    int64_t ts[40];
+    float v[40];
+    for (int i = 0; i < 40; i++) {
+        ts[i] = 1700000000000LL + i * 1000;
+        v[i] = (float)(i * 3 % 17);
+    }
+    OK(tsdb_insert_series(db, id, ts, v, 40));
+    OK(tsdb_close(db));
+}
+
+/* a crafted index may be refused or answered, but never overflow a buffer (ASan) */
+static void query_safe(const char *dir)
+{
+    int rc;
+    long rows;
+    query_rows(dir, &rc, &rows);
+    CHECK(rc == 0 || rc == TSDB_ERR_CORRUPT);
+}
+
 static void test_parts(const char *base)
 {
     snprintf(part_dir, sizeof part_dir, "%s/crafted_part", base);
@@ -334,6 +364,26 @@ static void test_parts(const char *base)
     /* the same granule in a merge, which copies whole granules without decoding them: it copied from 8 GB before
        the mapping (a shorter one goes through memcpy) */
     CHECK(in_child(merge_refused, part_dir));
+
+    /* the 8-row granule first in the index (entries 0 and 2 swapped, hash recomputed): the raw query sizes its decode
+       buffers by the largest granule it reads; sized by the first, it decoded 16 rows into room for 8 */
+    make_db_3_granules(part_dir);
+    CHECK(find_part(part_dir, name, sizeof name));
+    snprintf(path, sizeof path, "%s/%s", part_dir, name);
+    buf = slurp(path, &len);
+    memcpy(&f, buf + len - sizeof f, sizeof f);
+    granule gs[3];
+    CHECK(f.ngranules == 3);
+    if (f.ngranules == 3) {
+        memcpy(gs, buf + f.index_off, sizeof gs);
+        CHECK(gs[0].count == 16 && gs[1].count == 16 && gs[2].count == 8);
+        memcpy(buf + f.index_off, &gs[2], sizeof(granule));
+        memcpy(buf + f.index_off + 2 * sizeof(granule), &gs[0], sizeof(granule));
+    }
+    spit(path, buf, len);
+    free(buf);
+    rehash_part(path);
+    CHECK(in_child(query_safe, part_dir));
     rm_rf(part_dir);
 }
 

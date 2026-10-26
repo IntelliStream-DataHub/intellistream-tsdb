@@ -147,8 +147,9 @@ static inline __attribute__((always_inline)) void tiny_n(const void *v, const in
     a->sum = canon_nan(a->sum);
 }
 
-/* float32 runs of at most TINY_F32 values: the same tree as tiny_n's float64 one, as for n <= 16 the kernels' 32
- * lanes halve over padding (+0.0, a's bounds) twice before lanes below n meet (test_levels compares them) */
+/* float32 runs of at most TINY_F32 values: the same tree as tiny_n's float64 one, as the kernels' 32 lanes halve over
+ * padding (+0.0, a's bounds) before lanes below n meet: once for n = 9 to 16, twice for n <= 8 (test_levels compares
+ * them) */
 #define TINY_F32 7
 /* out of line: inlined, its frame (registers for the lanes' null flags) moved to the top of agg_fold_hint for
  * every type */
@@ -177,9 +178,21 @@ __attribute__((noinline)) static void fold_f32_tiny(const float *v, size_t n, ag
 
 /* Up to TINY_F32 values: the tree. Then the null count first (a quick pass the compiler vectorizes): without nulls
  * the kernels skip the masking. Runs shorter than the lanes take simd_small_* (same bits, less fixed cost). */
+/* An aggregate (no deviation) of exactly 4 values stays on simd_small_f32 in the v2 copy, where its SSE kernel
+ * takes them in one register and beats the tree by 8%, and in make dist's v4 copy (2%). Same bits either way. */
+#if !defined(__AVX__) || (defined(TSDB_LEVELS) && defined(__AVX512VL__))
+#define TINY_F32_AGG4 0
+#else
+#define TINY_F32_AGG4 1
+#endif
+
 static void fold_f32(const float *v, size_t n, bool may_be_null, agg_state *a, agg_dev *x)
 {
-    if (n <= TINY_F32) {
+    if (__builtin_expect(n <= TINY_F32, 0)) { /* the longer runs fall through, as before the tree took the short */
+        if (!TINY_F32_AGG4 && n == 4 && !x) { /* below simd_short (32 or more) */
+            simd_small_f32(v, n, may_be_null, a, x);
+            return;
+        }
         fold_f32_tiny(v, n, a, x);
         return;
     }
