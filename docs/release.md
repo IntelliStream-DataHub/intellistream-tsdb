@@ -38,7 +38,14 @@ and `build/tsdb --version` print; `make test` runs it too.
 - `docs/compatibility.md`: the table at the top; what this release reads.
 - `docs/roadmap.md`: what is done, what is next. README and AGENTS.md: numbers that changed.
 
-## 4. Gates
+## 4. Security review, then gates
+
+Before the gates and the release benchmarks: a security review of everything changed since the previous
+release (or the previous review). tsdb runs on backend systems behind network isolation, never on the
+internet, and performance comes first, so the review reports major issues only: memory corruption from
+network frames, files, export streams or client replies; one request or file that crashes the server or
+exhausts its memory; data loss or corruption; writes outside the directories the user named. Fix those (at
+the boundary, at no cost on hot paths) before tagging; hardening can wait.
 
 From a clean checkout of the release commit, one after the other (run them detached and wait; the
 long ones take minutes to an hour; see `.claude/skills/subagent-economy`):
