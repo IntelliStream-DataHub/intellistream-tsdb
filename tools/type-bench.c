@@ -5,6 +5,9 @@
  * (AUTO, with ZSTD(1) where it pays).
  *
  *   type-bench
+ *   type-bench --file F float32|float64   F holds raw values of that type (little-endian), one series in
+ *                                         time order: AUTO as above, the block kinds it chose, and for
+ *                                         float64 each transform alone and with ZSTD(1)
  */
 #include "../src/internal.h"
 #include "common.h"
@@ -26,6 +29,8 @@ static const char *kind_name(int k)
     default: return "?";
     }
 }
+
+static int show_kinds;
 
 /* bits per value and decode speed of n values of `type`, granule by granule */
 static void measure(const char *name, int type, const void *v, size_t n)
@@ -61,13 +66,90 @@ static void measure(const char *name, int type, const void *v, size_t n)
     printf("%-24s %-8s %8.2f %7.1fx %8.0f   %s\n", name, (const char *[]){"float32", "float64", "int64", "bool", "state"}[type],
            8.0 * (double)bytes / (double)n, (double)(n * (type == TSDB_BOOL ? 1 : w)) / (double)bytes,
            3.0 * (double)n / decoded / 1e6, kind_name(top));
+    if (show_kinds) {
+        printf("    kinds:");
+        for (int k = 0; k < 16; k++)
+            if (kinds[k])
+                printf(" %s(%d)=%zu", kind_name(k), k, kinds[k]);
+        printf("\n");
+    }
     free(blk);
     free(out);
     codec_free(c);
 }
 
-int main(void)
+/* one float64 transform alone and + ZSTD(1), granule by granule; NAN if it refuses a granule */
+static void one64(const char *name, size_t (*enc)(const uint64_t *, size_t, uint8_t *), const double *v, size_t n)
 {
+    uint8_t *o = malloc(GR * 16 + 4096), *z = malloc(ZSTD_compressBound(GR * 16 + 4096));
+    ZSTD_CCtx *zc = ZSTD_createCCtx();
+    size_t raw = 0, zs = 0;
+    for (size_t g = 0; g < n; g += GR) {
+        size_t m = MIN((size_t)GR, n - g), len = enc((const uint64_t *)(v + g), m, o);
+        if (!len) {
+            printf("    %-10s n/a\n", name);
+            goto out;
+        }
+        size_t zl = ZSTD_compressCCtx(zc, z, ZSTD_compressBound(len), o, len, 1);
+        raw += len;
+        zs += MIN(zl, len);
+    }
+    printf("    %-10s alone %.3f  +zstd %.3f bits/value\n", name, 8.0 * raw / n, 8.0 * zs / n);
+out:
+    ZSTD_freeCCtx(zc);
+    free(o);
+    free(z);
+}
+static size_t dec64_w(const uint64_t *in, size_t n, uint8_t *o) { return f64_decimal_encode((const double *)in, n, o); }
+static size_t bss64_w(const uint64_t *in, size_t n, uint8_t *o)
+{
+    const uint8_t *b = (const uint8_t *)in;
+    for (size_t i = 0; i < n; i++)
+        for (int k = 0; k < 8; k++)
+            o[k * n + i] = b[8 * i + k];
+    return n * 8;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 4 && !strcmp(argv[1], "--file")) { /* raw values of type argv[3]: float32 or float64 */
+        if (strcmp(argv[3], "float64") && strcmp(argv[3], "float32")) {
+            fprintf(stderr, "type-bench --file: the type is float32 or float64\n");
+            return 2;
+        }
+        int type = !strcmp(argv[3], "float64") ? TSDB_FLOAT64 : TSDB_FLOAT32;
+        size_t w = type_width(type);
+        FILE *f = fopen(argv[2], "rb");
+        size_t n;
+        if (!f || fseek(f, 0, SEEK_END) || (n = (size_t)ftell(f) / w) == 0) {
+            fprintf(stderr, "%s: cannot read, or empty\n", argv[2]);
+            return 1;
+        }
+        rewind(f);
+        void *v = malloc(n * w);
+        if (!v || fread(v, w, n, f) != n) {
+            fprintf(stderr, "%s: short read\n", argv[2]);
+            return 1;
+        }
+        fclose(f);
+        show_kinds = 1;
+        const char *base = strrchr(argv[2], '/');
+        measure(base ? base + 1 : argv[2], type, v, n);
+        if (type == TSDB_FLOAT64) {
+            one64("decimal", dec64_w, v, n);
+            one64("gorilla64", xor64_encode, v, n);
+            one64("bytesplit", bss64_w, v, n);
+#ifdef TB_CODECS
+            one64("alp_rd64", alprd64_encode, v, n);
+            one64("bitdelta64", delta_bp64_encode, v, n);
+#endif
+        }
+        return 0;
+    }
+    if (argc > 1) {
+        fprintf(stderr, "usage: type-bench [--file FILE float32|float64]\n");
+        return 2;
+    }
     double *d = malloc(N * sizeof *d);
     int64_t *iv = malloc(N * sizeof *iv);
     uint32_t *u = malloc(N * sizeof *u);
