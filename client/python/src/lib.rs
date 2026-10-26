@@ -29,7 +29,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyTuple};
 
 use ::tsdb_client as tc;
-use tc::{Column, ValueType, Values};
+use tc::{Column, ColumnRef, ValueType, Values};
 
 mod arrays;
 mod embedded;
@@ -47,6 +47,9 @@ create_exception!(
 fn to_pyerr(py: Python<'_>, e: tc::Error) -> PyErr {
     let err = TsdbError::new_err(e.to_string());
     if let Err(set) = err.value(py).setattr("code", e.code()) {
+        return set;
+    }
+    if let Err(set) = err.value(py).setattr("index", e.batch_index()) {
         return set;
     }
     err
@@ -83,7 +86,7 @@ fn f32_column(obj: &Bound<'_, PyAny>) -> PyResult<Col<f32>> {
     if let Some(c) = Col::buffer(obj)? {
         return Ok(c);
     }
-    if let Ok(b) = PyBuffer::<f64>::get(obj) {
+    if let Some(b) = arrays::native::<f64>(obj) {
         return Ok(Col::Owned(b.to_vec(obj.py())?.into_iter().map(|v| v as f32).collect()));
     }
     Ok(Col::Owned(obj.extract::<Vec<f64>>()?.into_iter().map(|v| v as f32).collect()))
@@ -140,34 +143,34 @@ fn py_column(obj: &Bound<'_, PyAny>, ty: ValueType) -> PyResult<Column> {
 fn plain_column(obj: &Bound<'_, PyAny>, ty: ValueType) -> PyResult<Column> {
     let py = obj.py();
     Ok(match ty {
-        ValueType::Float32 => match PyBuffer::<f32>::get(obj) {
-            Ok(b) => Column::new(b.to_vec(py)?),
-            Err(_) => match PyBuffer::<f64>::get(obj) {
-                Ok(b) => Column::new(b.to_vec(py)?.into_iter().map(|v| v as f32).collect()),
-                Err(_) => seq_column(obj, |x| Ok(x.extract::<f64>()? as f32))?,
+        ValueType::Float32 => match arrays::native::<f32>(obj) {
+            Some(b) => Column::new(b.to_vec(py)?),
+            None => match arrays::native::<f64>(obj) {
+                Some(b) => Column::new(b.to_vec(py)?.into_iter().map(|v| v as f32).collect()),
+                None => seq_column(obj, |x| Ok(x.extract::<f64>()? as f32))?,
             },
         },
-        ValueType::Float64 => match PyBuffer::<f64>::get(obj) {
-            Ok(b) => Column::new(b.to_vec(py)?),
-            Err(_) => match PyBuffer::<f32>::get(obj) {
-                Ok(b) => Column::new(b.to_vec(py)?.into_iter().map(f64::from).collect()),
-                Err(_) => seq_column(obj, |x| x.extract::<f64>())?,
+        ValueType::Float64 => match arrays::native::<f64>(obj) {
+            Some(b) => Column::new(b.to_vec(py)?),
+            None => match arrays::native::<f32>(obj) {
+                Some(b) => Column::new(b.to_vec(py)?.into_iter().map(f64::from).collect()),
+                None => seq_column(obj, |x| x.extract::<f64>())?,
             },
         },
-        ValueType::Int64 => match PyBuffer::<i64>::get(obj) {
-            Ok(b) => Column::new(b.to_vec(py)?),
-            Err(_) => match PyBuffer::<i32>::get(obj) {
-                Ok(b) => Column::new(b.to_vec(py)?.into_iter().map(i64::from).collect()),
-                Err(_) => seq_column(obj, |x| x.extract::<i64>())?,
+        ValueType::Int64 => match arrays::native::<i64>(obj) {
+            Some(b) => Column::new(b.to_vec(py)?),
+            None => match arrays::native::<i32>(obj) {
+                Some(b) => Column::new(b.to_vec(py)?.into_iter().map(i64::from).collect()),
+                None => seq_column(obj, |x| x.extract::<i64>())?,
             },
         },
         ValueType::Bool => match numpy_bools(obj)? {
             Some(v) => Column::new(v),
             None => seq_column(obj, |x| x.extract::<bool>())?,
         },
-        ValueType::State => match PyBuffer::<u32>::get(obj) {
-            Ok(b) => Column::new(b.to_vec(py)?),
-            Err(_) => seq_column(obj, |x| x.extract::<u32>())?,
+        ValueType::State => match arrays::native::<u32>(obj) {
+            Some(b) => Column::new(b.to_vec(py)?),
+            None => seq_column(obj, |x| x.extract::<u32>())?,
         },
         t => return Err(PyValueError::new_err(format!("value type {t} is not supported by this binding"))),
     })
@@ -670,7 +673,13 @@ impl Client {
         F: FnOnce(&mut Inner) -> tc::Result<T> + Send,
     {
         py.detach(|| {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock().unwrap_or_else(|e| {
+                // a panic left the connection possibly in the middle of a reply: drop it
+                self.inner.clear_poison();
+                let mut g = e.into_inner();
+                g.conn = None;
+                g
+            });
             let r = f(&mut inner);
             // after an I/O error (a timeout included) the stream is out of step: close it
             if inner.conn.as_ref().is_some_and(tc::Client::is_broken) {
@@ -704,18 +713,22 @@ impl Client {
     ) -> PyResult<()> {
         let ts = ts_column(ts)?;
         let many = many.map(series_column).transpose()?;
-        let ty = match (value_type, one.or_else(|| many.as_ref().and_then(|s| s.first().copied()))) {
+        let ty = match (value_type, one.or_else(|| many.as_ref().and_then(Col::first))) {
             (Some(t), _) => self::value_type(t)?,
             (None, Some(id)) => self.with_inner(py, |i| i.series_type(id))?,
             (None, None) => ValueType::Float32,
         };
         let col = values_column(values, ty)?;
-        self.with(py, |c| match (&many, one) {
-            (Some(s), _) if wait => c.insert_values(s, &ts, &col),
-            (Some(s), _) => c.insert_values_async(s, &ts, &col),
-            (None, Some(id)) if wait => c.insert_series_values(id, &ts, &col),
-            (None, Some(id)) => c.insert_series_values_async(id, &ts, &col),
-            (None, None) => unreachable!("one of the two is given"),
+        self.with(py, |c| {
+            let (ts, col, many) = (ts.snap(), col.snap(), many.as_ref().map(Col::snap));
+            let col = ColumnRef::from(&col);
+            match (&many, one) {
+                (Some(s), _) if wait => c.insert_values(s, &ts, col),
+                (Some(s), _) => c.insert_values_async(s, &ts, col),
+                (None, Some(id)) if wait => c.insert_series_values(id, &ts, col),
+                (None, Some(id)) => c.insert_series_values_async(id, &ts, col),
+                (None, None) => unreachable!("one of the two is given"),
+            }
         })
     }
 
@@ -736,7 +749,7 @@ impl Client {
             None => self.with_inner(py, |i| i.series_type(series))?,
         };
         let col = values_column(values, ty)?;
-        self.with(py, |c| c.replace_range(series, range(start, end), &ts, &col))
+        self.with(py, |c| c.replace_range(series, range(start, end), &ts.snap(), &col.snap()))
     }
 }
 
@@ -978,7 +991,7 @@ impl Client {
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let (ts, values) = (ts_column(ts)?, f32_column(values)?);
-        self.with(py, |c| c.insert_series(series, &ts, &values))
+        self.with(py, |c| c.insert_series(series, &ts.snap(), &values.snap()))
     }
 
     /// Inserts float32 rows into many series and waits.
@@ -995,7 +1008,7 @@ impl Client {
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let (series, ts, values) = (series_column(series)?, ts_column(ts)?, f32_column(values)?);
-        self.with(py, |c| c.insert(&series, &ts, &values))
+        self.with(py, |c| c.insert(&series.snap(), &ts.snap(), &values.snap()))
     }
 
     /// Sends float32 rows of one series without waiting for the answer.
@@ -1010,7 +1023,7 @@ impl Client {
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let (ts, values) = (ts_column(ts)?, f32_column(values)?);
-        self.with(py, |c| c.insert_series_async(series, &ts, &values))
+        self.with(py, |c| c.insert_series_async(series, &ts.snap(), &values.snap()))
     }
 
     /// Sends float32 rows of many series without waiting; see insert_series_async().
@@ -1022,7 +1035,7 @@ impl Client {
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let (series, ts, values) = (series_column(series)?, ts_column(ts)?, f32_column(values)?);
-        self.with(py, |c| c.insert_async(&series, &ts, &values))
+        self.with(py, |c| c.insert_async(&series.snap(), &ts.snap(), &values.snap()))
     }
 
     /// Inserts values of any type, with nulls, into one series and waits.
@@ -1217,7 +1230,7 @@ impl Client {
     ///
     /// Returns:
     ///     Buckets, oldest first: a sequence of Bucket with a numpy array per
-    ///     field (b.count, b.sum, ...); empty buckets are left out.
+    ///     field (b.counts, b.sum, ...); empty buckets are left out.
     ///
     /// Raises:
     ///     TsdbError: ERR_INVALID for a negative interval, ERR_TOO_MANY_BUCKETS
@@ -1323,7 +1336,7 @@ impl Client {
     ) -> PyResult<Buckets> {
         let o = opts(order, limit)?;
         let bounds = ts_column(bounds)?;
-        self.with(py, |c| c.query_bounds(series, range(start, end), &bounds, o).map(buckets))
+        self.with(py, |c| c.query_bounds(series, range(start, end), &bounds.snap(), o).map(buckets))
     }
 
     /// Deletes the rows of a series with start <= ts < end (protocol version 7).
@@ -1488,6 +1501,10 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Bucket>()?;
     m.add_class::<Buckets>()?;
     m.add_class::<arrays::BucketsMany>()?;
+    // they are sequences, as the lists they replace were
+    let seq = m.py().import("collections.abc")?.getattr("Sequence")?;
+    seq.call_method1("register", (m.getattr("Buckets")?,))?;
+    seq.call_method1("register", (m.getattr("BucketsMany")?,))?;
     m.add_class::<Stats>()?;
     m.add_class::<QueryStats>()?;
     m.add("TsdbError", m.py().get_type::<TsdbError>())?;

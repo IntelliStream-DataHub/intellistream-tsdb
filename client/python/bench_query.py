@@ -51,7 +51,7 @@ def querier(args, klass, thread, out, errors, pool=None):
                     rows += len(ts)
                 else:
                     b = c.query_agg(s, start, end, bucket * bc.step_ms(s))
-                    rows += int(b.count.sum()) if np is not None else sum(b.count)
+                    rows += int(b.counts.sum()) if np is not None else sum(b.count)
                 queries += 1
         secs = time.perf_counter() - t0
         c.close()
@@ -72,7 +72,7 @@ def batch_querier(args, klass, thread, out, errors, pool):
             if not agg:
                 rows += sum(len(ts) for ts, _v in pool.query_raw_many(s, start, end))
             else:
-                rows += int(pool.query_agg_many(s, start, end, interval).buckets.count.sum())
+                rows += int(pool.query_agg_many(s, start, end, interval).buckets.counts.sum())
             queries += args.many
         out.append((queries, rows, time.perf_counter() - t0))
     except Exception as e:  # noqa: BLE001 - reported by the main thread

@@ -164,7 +164,7 @@ def querier(db, a, klass, thread, out, errors):
                     if len(v):
                         float(v[-1])  # touch the data, as tsdb-bench does
                 else:
-                    rows += int(db.query_agg(s, start, end, bucket * bc.step_ms(s)).count.sum())
+                    rows += int(db.query_agg(s, start, end, bucket * bc.step_ms(s)).counts.sum())
                 queries += 1
         out.append((queries, rows, time.perf_counter() - t0))
     except Exception as e:  # noqa: BLE001 - reported by the main thread
@@ -186,7 +186,7 @@ def batch_querier(db, a, klass, thread, out, errors):
                     if len(v):
                         float(v[-1])
             else:
-                rows += int(db.query_agg_many(s, start, end, interval).buckets.count.sum())
+                rows += int(db.query_agg_many(s, start, end, interval).buckets.counts.sum())
             queries += a.many
         out.append((queries, rows, time.perf_counter() - t0))
     except Exception as e:  # noqa: BLE001 - reported by the main thread

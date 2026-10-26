@@ -62,6 +62,11 @@ class TsdbError(Exception):
     code: int
     """The TSDB_ERR_* number (negative), such as ERR_NOTFOUND."""
 
+    index: int | None
+    """For an error of a batch call (*_many), the failing entry's position in
+    the batch: the lowest one that failed; every entry below it ran and
+    succeeded. None for other calls."""
+
 def strerror(code: int) -> str:
     """Returns the text for a TSDB_ERR_* code, such as ERR_NOTFOUND."""
 
@@ -142,20 +147,22 @@ class Bucket:
 class Buckets(Sequence[Bucket]):
     """The buckets of an aggregate query, a column per field.
 
-    It reads as a sequence of Bucket (len(), indexing, slicing, iteration,
-    == against a list of Bucket), so code written for a list keeps working,
-    and each field is a numpy array over all buckets (a list without numpy):
-    ``b = db.query_agg(s, start, end, 60_000); b.count.sum(); b.max.max()``.
-    Reading a column copies it out of the result; keep it in a variable
-    rather than reading it in a loop.
+    It is a sequence of Bucket (a collections.abc.Sequence: len(), indexing,
+    slicing, iteration, index(), count(), + and == with a list of Bucket), so
+    code written for the list it replaces keeps working. Each field is also a
+    column over all buckets, a numpy array (a list without numpy): start, sum,
+    min, max, avg, isum, imin, imax, and counts for the counts (count() is the
+    sequence method): ``b = db.query_agg(s, start, end, 60_000);
+    b.counts.sum(); b.max.max()``. Reading a column copies it out of the
+    result; keep it in a variable rather than reading it in a loop.
     """
 
     @property
     def start(self) -> Any:
         """Bucket starts, ms since the epoch (int64)."""
     @property
-    def count(self) -> Any:
-        """Number of known values per bucket (uint64)."""
+    def counts(self) -> Any:
+        """Number of known values per bucket (uint64); count() is the sequence method."""
     @property
     def sum(self) -> Any:
         """Sums (float64)."""
@@ -177,11 +184,17 @@ class Buckets(Sequence[Bucket]):
     @property
     def avg(self) -> Any:
         """Means, sum / count (0 for a bucket of nulls only) (float64)."""
+    def count(self, value: Any) -> int:
+        """Number of buckets equal to `value` (the sequence method; the column is counts)."""
+    def index(self, value: Any, start: int = 0, stop: int = ...) -> int:
+        """Position of the first bucket equal to `value`; ValueError if there is none."""
     def __len__(self) -> int: ...
     @overload
     def __getitem__(self, i: int) -> Bucket: ...
     @overload
     def __getitem__(self, i: slice) -> Buckets: ...
+    def __add__(self, other: list[Bucket] | Buckets) -> list[Bucket]: ...
+    def __radd__(self, other: list[Bucket]) -> list[Bucket]: ...
 
 @final
 class BucketsMany(Sequence[Buckets]):
@@ -191,7 +204,9 @@ class BucketsMany(Sequence[Buckets]):
     queries. For whole-batch numpy work, result.buckets holds every query's
     buckets concatenated (columns start, count, sum, ...) and result.offsets
     (int64, one more than the queries) where each query's begin:
-    ``b.buckets.count[b.offsets[i]:b.offsets[i + 1]]`` are query i's counts.
+    ``b.buckets.counts[b.offsets[i]:b.offsets[i + 1]]`` are query i's counts.
+    Without numpy the columns and offsets are lists. It is a
+    collections.abc.Sequence of Buckets: a slice gives a list of them.
     """
 
     @property
@@ -200,8 +215,15 @@ class BucketsMany(Sequence[Buckets]):
     @property
     def offsets(self) -> Any:
         """Where each query's buckets begin in buckets (int64, queries + 1 entries)."""
+    def count(self, value: Any) -> int:
+        """Number of queries whose buckets equal `value` (the sequence method)."""
+    def index(self, value: Any, start: int = 0, stop: int = ...) -> int:
+        """Position of the first query whose buckets equal `value`; ValueError if there is none."""
     def __len__(self) -> int: ...
-    def __getitem__(self, i: int) -> Buckets: ...  # type: ignore[override]
+    @overload
+    def __getitem__(self, i: int) -> Buckets: ...
+    @overload
+    def __getitem__(self, i: slice) -> list[Buckets]: ...
 
 @final
 class Stats:
@@ -587,7 +609,7 @@ class Client:
 
         Returns:
             Buckets, oldest first: a sequence of Bucket with a numpy array per
-            field (b.count, b.sum, ...); empty buckets are left out.
+            field (b.counts, b.sum, ...); empty buckets are left out.
 
         Raises:
             TsdbError: ERR_INVALID for a negative interval, ERR_TOO_MANY_BUCKETS
@@ -989,10 +1011,14 @@ class Db:
         Returns:
             A list with (timestamps, values) of each query, in query order: an
             int64 and a float32 numpy array, as query_raw() returns them.
-            Needs numpy.
+            Needs numpy (ImportError without it).
+
+        Afterwards last_query_stats() holds the totals of the batch's queries,
+        with the whole batch's time as elapsed_s; so does query_agg_many().
 
         Raises:
-            TsdbError: The first failing query's error (in query order).
+            TsdbError: The lowest failing query's error; its index attribute is
+                that query's position, and every query below it succeeded.
         """
     def query_agg_many(
         self,
@@ -1013,26 +1039,38 @@ class Db:
         Returns:
             BucketsMany: result[i] is the Buckets of query i; result.buckets
             holds every bucket (numpy columns) and result.offsets where each
-            query's begin.
+            query's begin. Without numpy, columns and offsets are lists.
 
         Raises:
-            TsdbError: The first failing query's error (in query order).
+            TsdbError: The lowest failing query's error; its index attribute is
+                that query's position, and every query below it succeeded.
         """
     def insert_many(
         self, batches: Sequence[tuple[int | _SeriesIds, _Timestamps, _TypedValues]], *, value_type: _ValueType | None = None
     ) -> None:
         """Runs many inserts at once, in parallel on every CPU.
 
-        Each insert is all or nothing on its own; if one fails, the error of
-        the first failing one is raised and the others may have been committed.
+        Each insert is all or nothing on its own. Inserts that share a series
+        run one after another in list order, so where two write the same row,
+        the later one in the list wins, as if they ran one at a time.
 
         Args:
             batches: A list of (series, ts, values) tuples: series is one id or
                 a column of ids (one per row), ts int64 timestamps, values one
-                per timestamp. numpy arrays are read in place, without a copy.
-            value_type: The type of every batch's values; None takes it from
-                each values array's dtype (float32, float64, int64, bool,
-                uint32 for states), float32 for lists.
+                per timestamp. numpy arrays are copied once, without the GIL.
+            value_type: The type of every batch's values; None takes each
+                batch's from its series (the first row's for a column of ids),
+                as insert_series_values() does, converting the values to it
+                (float64 into a float32 series, a list into an int64 series).
+
+        Raises:
+            TsdbError: The lowest failing insert's error; its index attribute is
+                that insert's position. Every insert below it was committed;
+                later ones may have been. Errors found before anything is
+                inserted name their entry too ("batch entry 3: ...", index 3),
+                and then nothing was: arguments that do not convert (TypeError,
+                ValueError), and without value_type a series that does not
+                exist (its type is looked up first).
         """
     def commit(self) -> None:
         """Makes every insert so far durable (syncs the WAL)."""
@@ -1047,7 +1085,12 @@ class Db:
     def stats(self) -> Stats:
         """Returns the storage statistics."""
     def last_query_stats(self) -> QueryStats:
-        """Returns what the last query through this Db read (all zero before the first)."""
+        """Returns what the last query through this Db read (all zero before the first).
+
+        After a batch call (query_raw_many, query_agg_many) the totals of its
+        queries, with the whole batch's time as elapsed_s. With several
+        threads querying, the query (or batch) that finished last.
+        """
     def failed(self) -> str | None:
         """None while healthy; after a storage error that leaves it unknown what
         reached the disk, what failed (writes then fail until reopened).
@@ -1076,7 +1119,13 @@ class Pool:
         keepalive: TCP keepalive, as in Client.
 
     A connection that breaks (an I/O error or a timeout) is replaced by a new
-    one before its next query.
+    one before its next query, and so is every other connection made before
+    it broke (after a server restart all of them are dead). A query whose
+    connection broke runs once more on a new connection; an insert does not
+    (the server may have applied it), so after a restart one insert_many()
+    can fail with ERR_IO and the next works. Errors of batch calls name the
+    lowest failing entry (TsdbError.index), as Db's do. A Pool has no
+    last_query_stats(); a Client has.
 
     Raises:
         TsdbError: A connection failed.
@@ -1120,10 +1169,11 @@ class Pool:
         Takes and returns what Db.query_raw_many() does: series (one id per
         query), start and end (None, one timestamp, or one per query), order,
         limit; a list of (timestamps, values) numpy arrays, one per query.
-        Needs numpy.
+        Needs numpy (ImportError without it).
 
         Raises:
-            TsdbError: The first failing query's error (in query order).
+            TsdbError: The lowest failing query's error; its index attribute is
+                that query's position, and every query below it succeeded.
         """
     def query_agg_many(
         self,
@@ -1135,10 +1185,12 @@ class Pool:
         """Runs many aggregate queries over the connections at once.
 
         As Db.query_agg_many(): a bucket length for every query or one per
-        query (0: one bucket for the range); returns a BucketsMany.
+        query (0: one bucket for the range); returns a BucketsMany (lists
+        instead of numpy columns without numpy).
 
         Raises:
-            TsdbError: The first failing query's error (in query order).
+            TsdbError: The lowest failing query's error; its index attribute is
+                that query's position, and every query below it succeeded.
         """
     def insert_many(
         self, batches: Sequence[tuple[int | _SeriesIds, _Timestamps, _TypedValues]], *, value_type: _ValueType | None = None
@@ -1146,5 +1198,12 @@ class Pool:
         """Runs many inserts over the connections at once.
 
         As Db.insert_many(): a list of (series, ts, values) tuples, each all or
-        nothing on its own; on an error the others may have been committed.
+        nothing on its own; inserts that share a series run in list order (on
+        one connection); without value_type each takes its series' type.
+
+        Raises:
+            TsdbError: The lowest failing insert's error, with its index; every
+                insert below it was committed, later ones may have been (errors
+                found before inserting, as in Db.insert_many(), insert nothing).
+                An insert whose connection broke is not retried.
         """

@@ -1,5 +1,7 @@
 //! Batch calls: `Db::*_many` (rayon over one handle) and `Pool` (connections to tsdbd) answer
-//! exactly what the one-query calls answer, in query order, and fail with the first error.
+//! exactly what the one-query calls answer, in query order, and fail with the lowest failing
+//! entry's index and error; inserts into one series keep their list order; a pool survives a
+//! server restart without failing a query.
 #![cfg(feature = "embedded")]
 
 mod common;
@@ -23,7 +25,8 @@ fn rows(s: u32) -> (Vec<i64>, Vec<f32>) {
 
 /// A query per series, some over part of the range, one empty, one twice.
 fn queries() -> Vec<RangeQuery> {
-    let mut q: Vec<RangeQuery> = (0..SERIES).map(|s| RangeQuery::new(s, T0 + i64::from(s) * 77_000, T0 + 4_000_000)).collect();
+    let mut q: Vec<RangeQuery> =
+        (0..SERIES).map(|s| RangeQuery::new(s, T0 + i64::from(s) * 77_000, T0 + 4_000_000)).collect();
     q.push(RangeQuery::new(3, i64::MIN, i64::MAX));
     q.push(RangeQuery::new(5, T0 - 10, T0 - 5));
     q.push(RangeQuery::new(3, i64::MIN, i64::MAX));
@@ -36,7 +39,8 @@ fn data() -> Vec<(Vec<i64>, Vec<f32>)> {
 
 /// Half the series one insert each, the other half in one insert of a series column.
 fn batches<'a>(d: &'a [(Vec<i64>, Vec<f32>)], each: &'a (Vec<u32>, Vec<i64>, Vec<f32>)) -> Vec<InsertBatch<'a>> {
-    let mut b: Vec<InsertBatch> = (0..SERIES / 2).map(|s| InsertBatch::series(s, &d[s as usize].0, &d[s as usize].1)).collect();
+    let mut b: Vec<InsertBatch> =
+        (0..SERIES / 2).map(|s| InsertBatch::series(s, &d[s as usize].0, &d[s as usize].1)).collect();
     b.push(InsertBatch::each(&each.0, &each.1, &each.2));
     b
 }
@@ -89,19 +93,33 @@ fn db_batches_match_single_queries() {
     }
     let whole = db.query_agg_many(&agg(&q, 0)).unwrap();
     // each query its own bucket length
-    let mixed: Vec<AggQuery> = q.iter().enumerate().map(|(i, x)| AggQuery::new(x.series, x.start, x.end, i as i64 * 1000)).collect();
+    let mixed: Vec<AggQuery> =
+        q.iter().enumerate().map(|(i, x)| AggQuery::new(x.series, x.start, x.end, i as i64 * 1000)).collect();
     let m = db.query_agg_many(&mixed).unwrap();
     for (i, x) in mixed.iter().enumerate() {
         assert_eq!(key(&m[i]), key(&db.query_agg(x.series, x.start..x.end, x.interval_ms).unwrap()));
     }
     assert_eq!(whole[SERIES as usize][0].count, ROWS as u64);
 
+    // a batch counts as one query: last_query_stats holds the totals of its queries
+    let p = db.query_points_many(&q, QueryOpts::asc()).unwrap();
+    let st = db.last_query_stats();
+    assert_eq!(st.result_rows, p.iter().map(|x| x.ts.len() as u64).sum::<u64>());
+    assert!(st.result_rows > ROWS as u64 && st.rows >= st.result_rows);
+
     // the first failing query's error, whatever finished first
     let mut bad = q.clone();
     // a raw float32 query of an int64 series fails
     bad.insert(7, RangeQuery::new(int64, 0, 1));
-    assert!(matches!(db.query_points_many(&bad, QueryOpts::asc()), Err(Error::Server(Status::Invalid))));
-    assert!(matches!(db.query_agg_many(&[AggQuery::new(0, 0, 1, -1)]), Err(Error::Server(Status::Invalid))));
+    assert_eq!(failed_at(db.query_points_many(&bad, QueryOpts::asc())), (7, Status::Invalid.code()));
+    assert_eq!(failed_at(db.query_agg_many(&[AggQuery::new(0, 0, 1, -1)])), (0, Status::Invalid.code()));
+    // two failures, the higher one first in the list of a different error: always the lower one
+    let mut two = agg(&q, 60_000);
+    two[3] = AggQuery::new(0, 0, i64::MAX, 1); // too many buckets
+    two[7].interval_ms = -1; // invalid
+    for _ in 0..20 {
+        assert_eq!(failed_at(db.query_agg_many(&two)), (3, Status::TooManyBuckets.code()));
+    }
     // an insert of the wrong type fails; the call reports it
     let one = [1i64];
     let r = db.insert_many(&[InsertBatch { target: Target::Series(0), ts: &one, values: (&[1i64][..]).into() }]);
@@ -141,7 +159,13 @@ fn pool_batches_match_single_queries() {
     }
     let mut bad = q.clone();
     bad.insert(3, RangeQuery::new(int64, 0, 1));
-    assert!(matches!(pool.query_points_many(&bad, QueryOpts::asc()), Err(Error::Server(Status::Invalid))));
+    assert_eq!(failed_at(pool.query_points_many(&bad, QueryOpts::asc())), (3, Status::Invalid.code()));
+    let mut two = agg(&q, 60_000);
+    two[3] = AggQuery::new(0, 0, i64::MAX, 1); // too many buckets
+    two[7].interval_ms = -1; // invalid
+    for _ in 0..20 {
+        assert_eq!(failed_at(pool.query_agg_many(&two)), (3, Status::TooManyBuckets.code()));
+    }
     // a server error leaves the connections usable: nothing reconnects
     assert_eq!(pool.query_agg_many(&agg(&q, 0)).unwrap().len(), q.len());
     assert_eq!(connects.load(Ordering::Relaxed), 4);
@@ -157,9 +181,9 @@ fn pool_replaces_a_broken_connection() {
     let pool = Pool::with_connector(2, move || Client::connect(a.lock().unwrap().as_str())).unwrap();
     let q = [RangeQuery::new(0, i64::MIN, i64::MAX), RangeQuery::new(0, 0, 1)];
     assert_eq!(pool.query_agg_many(&agg(&q, 0)).unwrap().len(), 2);
-    // the server goes away: the calls fail with I/O errors, and the connections are broken
+    // the server goes away: the calls fail with I/O errors (the retry finds no server either)
     srv.stop();
-    assert!(matches!(pool.query_agg_many(&agg(&q, 0)), Err(Error::Io(_))));
+    assert_eq!(failed_at(pool.query_agg_many(&agg(&q, 0))).1, Status::Io.code());
     // another server (another port): the broken connections are replaced through the connector
     let srv2 = Server::start();
     srv2.client().series_create("x", ValueType::Float32, None).unwrap();
@@ -167,4 +191,71 @@ fn pool_replaces_a_broken_connection() {
     for _ in 0..3 {
         assert_eq!(pool.query_agg_many(&agg(&q, 0)).unwrap().len(), 2);
     }
+}
+
+/// The index and code of a batch call's error.
+fn failed_at<T: std::fmt::Debug>(r: Result<T, Error>) -> (usize, i32) {
+    match r {
+        Err(e @ Error::Batch { .. }) => (e.batch_index().unwrap(), e.code()),
+        other => panic!("expected a batch error, got {other:?}"),
+    }
+}
+
+#[test]
+fn inserts_into_one_series_keep_their_list_order() {
+    let dir = test_dir("batch-order");
+    let db = Db::open(&dir, &Options { fsync: false, ..Options::default() }).unwrap();
+    for s in 0..4 {
+        db.series_create(&format!("s{s}"), ValueType::Float32, None).unwrap();
+    }
+    let ts = [T0];
+    let vals: Vec<[f32; 1]> = (0..64).map(|k| [k as f32]).collect();
+    let both = [0u32, 1];
+    let each_ts = [T0, T0];
+    let each_v = [100f32, 101.0];
+    for round in 0..50 {
+        // 64 batches writing one row of series 0, 1 or 2 in turn; one more writes series 0 and 1
+        // through a column of ids, which ties their chains together
+        let mut b: Vec<InsertBatch<'_>> =
+            (0..64).map(|k| InsertBatch::series(k as u32 % 3, &ts, &vals[k][..])).collect();
+        if round % 2 == 1 {
+            b.insert(40, InsertBatch::each(&both, &each_ts, &each_v[..]));
+        }
+        db.insert_many(&b).unwrap();
+        let last = |s: u32| db.query_points(s, T0..T0 + 1, QueryOpts::asc()).unwrap().values[0];
+        // the last batch of each series in the list wins (63, 61, 62: k % 3)
+        assert_eq!((last(0), last(1), last(2)), (63.0, 61.0, 62.0), "round {round}");
+    }
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn pool_survives_a_server_restart() {
+    let srv = Server::start();
+    srv.client().series_create("x", ValueType::Float32, None).unwrap();
+    let addr = Arc::new(std::sync::Mutex::new(srv.addr()));
+    let a = addr.clone();
+    let pool = Pool::with_connector(4, move || Client::connect(a.lock().unwrap().as_str())).unwrap();
+    let q = [AggQuery::new(0, i64::MIN, i64::MAX, 0)];
+    assert_eq!(pool.query_agg_many(&q).unwrap().len(), 1);
+    // a restart (on another port): every connection is dead, yet no single-query batch fails:
+    // the first broken connection marks all four for replacement, and its query runs again
+    let restart = |old: Server| {
+        drop(old);
+        let s = Server::start();
+        s.client().series_create("x", ValueType::Float32, None).unwrap();
+        *addr.lock().unwrap() = s.addr();
+        s
+    };
+    let srv = restart(srv);
+    for i in 0..8 {
+        assert_eq!(pool.query_agg_many(&q).map(|b| b.len()).unwrap(), 1, "query batch {i}");
+    }
+    // inserts are not retried (the server may have applied one): at most one fails
+    let srv = restart(srv);
+    let ts = [T0];
+    let failed = (0..8).filter(|_| pool.insert_many(&[InsertBatch::series(0, &ts, &[1.0f32][..])]).is_err()).count();
+    assert!(failed <= 1, "{failed} of 8 insert batches failed");
+    drop(srv);
 }

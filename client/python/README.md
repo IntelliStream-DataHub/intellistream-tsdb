@@ -137,7 +137,7 @@ for b in client.query_agg(series, t0, t1, interval_ms=3_600_000):  # one bucket 
 
 The result also has a numpy array per field, which is faster than a loop
 when there are many buckets: `b = client.query_agg(...)`, then
-`b.count.sum()` or `b.max.max()`.
+`b.counts.sum()` or `b.max.max()`.
 
 ## Group by day in a time zone
 

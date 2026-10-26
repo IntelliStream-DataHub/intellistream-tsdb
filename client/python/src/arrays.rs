@@ -1,21 +1,28 @@
 //! Columns in and out without work under the GIL.
 //!
-//! In: a C-contiguous buffer of the right element type (a numpy array, `array.array`) is read in
-//! place: the call holds the buffer export, which keeps the exporter from freeing or resizing it,
-//! and the engine or the network reads it with the GIL released. Anything else (other dtypes,
-//! strided views, masked arrays, sequences) is converted into a Rust vector first, as before.
+//! In: a C-contiguous buffer of the right element type in native byte order (a numpy array,
+//! `array.array`) is kept as a buffer export, which keeps the exporter from freeing or resizing
+//! it, and copied once with the GIL released, where the call uses it (`Col::snap`). The engine
+//! and the network only ever read that copy: another thread may write the array meanwhile
+//! (another Python thread, or numpy's own loops, which run without the GIL), and the engine
+//! reads some inputs twice (a series id checked, then used as an index), so reading the
+//! caller's memory in place could let it act on two different values of one element. Anything
+//! else (other dtypes, strided views, masked arrays, sequences, big-endian arrays) is converted
+//! into a Rust vector while the GIL is held, as before.
 //!
 //! Out: query results are vectors filled with the GIL released; numpy takes them over without a
 //! copy (`IntoPyArray`: the array's base owns the vector). Aggregates come back as `Buckets`, a
 //! column per field instead of an object per bucket; it still reads as a sequence of `Bucket`.
 //! Batch calls return a pair of arrays per raw query (each over its own vector), and the buckets
-//! of all aggregate queries as one set of columns with offsets.
+//! of all aggregate queries as one set of columns with offsets. Without numpy, columns and
+//! offsets are lists; raw batch results need numpy.
 
-use std::ops::Deref;
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::buffer::{Element, PyBuffer};
-use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyList, PySlice, PyTuple};
@@ -27,37 +34,67 @@ use crate::{Bucket, py_column};
 
 // ------------------------------------------------------------------ in
 
-/// A column read in place from a Python buffer, or converted into a vector.
+/// `obj`'s buffer as T, or `None` if it is none or not in native byte order.
+///
+/// PyO3 (0.29) accepts a big-endian format ('>' or '!') on a little-endian machine as native
+/// and rejects '<' (`is_matching_endian` has them the wrong way round): its elements would be
+/// read byte-swapped. Those go the slow way instead, element by element through Python.
+pub(crate) fn native<T: Element>(obj: &Bound<'_, PyAny>) -> Option<PyBuffer<T>> {
+    let b = PyBuffer::<T>::get(obj).ok()?;
+    let foreign: &[u8] = if cfg!(target_endian = "little") { b">!" } else { b"<" };
+    match b.format().to_bytes().first() {
+        Some(c) if foreign.contains(c) => None,
+        _ => Some(b),
+    }
+}
+
+/// A column kept as a Python buffer (copied where it is used), or converted into a vector.
 pub(crate) enum Col<T: Element> {
     Borrowed(PyBuffer<T>),
     Owned(Vec<T>),
 }
 
-impl<T: Element + Copy> Deref for Col<T> {
-    type Target = [T];
-
-    fn deref(&self) -> &[T] {
-        match self {
-            Col::Owned(v) => v,
-            Col::Borrowed(b) if b.item_count() == 0 => &[],
-            // SAFETY: PyBuffer::get checked the element type and alignment, and `buffer` only
-            // borrows a C-contiguous one, so it holds item_count() Ts at buf_ptr(). The export
-            // lasts as long as `self`: the exporter can neither free nor resize the memory. Another
-            // Python thread writing to the array during the call leaves the values read undefined,
-            // as in numpy's own loops that run without the GIL.
-            Col::Borrowed(b) => unsafe { std::slice::from_raw_parts(b.buf_ptr() as *const T, b.item_count()) },
+impl<T: Element + Copy> Col<T> {
+    /// `obj` as a buffer of T: kept when C-contiguous, else copied; `None` for an object that
+    /// is not a native buffer of T.
+    pub(crate) fn buffer(obj: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
+        match native::<T>(obj) {
+            Some(b) if b.is_c_contiguous() => Ok(Some(Col::Borrowed(b))),
+            Some(b) => Ok(Some(Col::Owned(b.to_vec(obj.py())?))),
+            None => Ok(None),
         }
     }
-}
 
-impl<T: Element + Copy> Col<T> {
-    /// `obj` as a buffer of T: read in place when C-contiguous, else copied; `None` for an
-    /// object that is not a buffer of T.
-    pub(crate) fn buffer(obj: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
-        match PyBuffer::<T>::get(obj) {
-            Ok(b) if b.is_c_contiguous() => Ok(Some(Col::Borrowed(b))),
-            Ok(b) => Ok(Some(Col::Owned(b.to_vec(obj.py())?))),
-            Err(_) => Ok(None),
+    /// The column, read once: a buffer is copied (one memcpy). Call it where the column is
+    /// used, with the GIL released, and pass on only the result (see the file header).
+    pub(crate) fn snap(&self) -> Cow<'_, [T]> {
+        match self {
+            Col::Owned(v) => Cow::Borrowed(v),
+            Col::Borrowed(b) if b.item_count() == 0 => Cow::Owned(Vec::new()),
+            Col::Borrowed(b) => {
+                let n = b.item_count();
+                let mut v = Vec::<T>::with_capacity(n);
+                // SAFETY: native() checked the element type and alignment, and buffer() keeps only
+                // a C-contiguous buffer, so it holds n Ts at buf_ptr(); the export lasts as long as
+                // self, so the exporter can neither free nor resize it. The bytes are copied through
+                // raw pointers, never a reference into memory another thread may be writing; a racing
+                // write leaves an element old, new or torn, each a valid i64, u32, f32 or f64.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(b.buf_ptr() as *const T, v.as_mut_ptr(), n);
+                    v.set_len(n);
+                }
+                Cow::Owned(v)
+            }
+        }
+    }
+
+    /// The first element, read once.
+    pub(crate) fn first(&self) -> Option<T> {
+        match self {
+            Col::Owned(v) => v.first().copied(),
+            Col::Borrowed(b) if b.item_count() == 0 => None,
+            // SAFETY: as in snap(), for one element
+            Col::Borrowed(b) => Some(unsafe { std::ptr::read(b.buf_ptr() as *const T) }),
         }
     }
 }
@@ -71,14 +108,36 @@ pub(crate) enum ValCol {
     Owned(Column),
 }
 
-impl<'a> From<&'a ValCol> for ColumnRef<'a> {
-    fn from(c: &'a ValCol) -> ColumnRef<'a> {
+/// Typed insert values read once (`ValCol::snap`).
+pub(crate) enum ValSnap<'a> {
+    F32(Cow<'a, [f32]>),
+    F64(Cow<'a, [f64]>),
+    I64(Cow<'a, [i64]>),
+    State(Cow<'a, [u32]>),
+    Owned(&'a Column),
+}
+
+impl ValCol {
+    /// The values, read once; see `Col::snap`.
+    pub(crate) fn snap(&self) -> ValSnap<'_> {
+        match self {
+            ValCol::F32(v) => ValSnap::F32(v.snap()),
+            ValCol::F64(v) => ValSnap::F64(v.snap()),
+            ValCol::I64(v) => ValSnap::I64(v.snap()),
+            ValCol::State(v) => ValSnap::State(v.snap()),
+            ValCol::Owned(c) => ValSnap::Owned(c),
+        }
+    }
+}
+
+impl<'a> From<&'a ValSnap<'_>> for ColumnRef<'a> {
+    fn from(c: &'a ValSnap<'_>) -> ColumnRef<'a> {
         match c {
-            ValCol::F32(v) => ColumnRef::new(ValuesRef::Float32(v)),
-            ValCol::F64(v) => ColumnRef::new(ValuesRef::Float64(v)),
-            ValCol::I64(v) => ColumnRef::new(ValuesRef::Int64(v)),
-            ValCol::State(v) => ColumnRef::new(ValuesRef::State(v)),
-            ValCol::Owned(c) => c.into(),
+            ValSnap::F32(v) => ColumnRef::new(ValuesRef::Float32(v)),
+            ValSnap::F64(v) => ColumnRef::new(ValuesRef::Float64(v)),
+            ValSnap::I64(v) => ColumnRef::new(ValuesRef::Int64(v)),
+            ValSnap::State(v) => ColumnRef::new(ValuesRef::State(v)),
+            ValSnap::Owned(c) => (*c).into(),
         }
     }
 }
@@ -101,21 +160,6 @@ pub(crate) fn values_column(obj: &Bound<'_, PyAny>, ty: ValueType) -> PyResult<V
     Ok(ValCol::Owned(py_column(obj, ty)?))
 }
 
-/// The type a numpy array's dtype names (float32, float64, int64, bool, uint32 for state codes);
-/// `None` for anything else.
-pub(crate) fn dtype_type(obj: &Bound<'_, PyAny>) -> PyResult<Option<ValueType>> {
-    let Ok(dtype) = obj.getattr("dtype") else { return Ok(None) };
-    let (kind, size): (String, usize) = (dtype.getattr("kind")?.extract()?, dtype.getattr("itemsize")?.extract()?);
-    Ok(match (kind.as_str(), size) {
-        ("f", 4) => Some(ValueType::Float32),
-        ("f", 8) => Some(ValueType::Float64),
-        ("i", 8) => Some(ValueType::Int64),
-        ("b", 1) => Some(ValueType::Bool),
-        ("u", 4) => Some(ValueType::State),
-        _ => None,
-    })
-}
-
 /// Bucket starts or query bounds: None (every query gets `default`), one int for every query,
 /// or a sequence or int64 array of one per query.
 pub(crate) fn per_query(obj: Option<&Bound<'_, PyAny>>, n: usize, default: i64, what: &str) -> PyResult<Vec<i64>> {
@@ -123,11 +167,11 @@ pub(crate) fn per_query(obj: Option<&Bound<'_, PyAny>>, n: usize, default: i64, 
     if let Ok(v) = obj.extract::<i64>() {
         return Ok(vec![v; n]);
     }
-    let v = crate::ts_column(obj)?;
+    let v = crate::ts_column(obj)?.snap().into_owned();
     if v.len() != n {
         return Err(PyValueError::new_err(format!("{what} has {} entries for {n} queries", v.len())));
     }
-    Ok(v.to_vec())
+    Ok(v)
 }
 
 /// The queries of a batch call: one per entry of `series`.
@@ -136,8 +180,9 @@ pub(crate) fn range_queries(
     start: Option<&Bound<'_, PyAny>>,
     end: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Vec<tc::RangeQuery>> {
-    let series = crate::series_column(series)?;
-    let (start, end) = (per_query(start, series.len(), i64::MIN, "start")?, per_query(end, series.len(), i64::MAX, "end")?);
+    let series = crate::series_column(series)?.snap().into_owned();
+    let (start, end) =
+        (per_query(start, series.len(), i64::MIN, "start")?, per_query(end, series.len(), i64::MAX, "end")?);
     Ok(series.iter().zip(start).zip(end).map(|((&s, a), b)| tc::RangeQuery::new(s, a, b)).collect())
 }
 
@@ -160,6 +205,16 @@ pub(crate) enum Dest {
     Each(Col<u32>),
 }
 
+impl Dest {
+    /// The series whose type the values take: the only one, or the first row's.
+    fn first(&self) -> Option<u32> {
+        match self {
+            Dest::One(s) => Some(*s),
+            Dest::Each(c) => c.first(),
+        }
+    }
+}
+
 /// One insert of insert_many(), converted while the GIL is held.
 pub(crate) struct Insert {
     dest: Dest,
@@ -167,39 +222,111 @@ pub(crate) struct Insert {
     values: ValCol,
 }
 
+/// An insert's columns read once (`Insert::snap`).
+pub(crate) struct InsertSnap<'a> {
+    one: u32,
+    each: Option<Cow<'a, [u32]>>,
+    ts: Cow<'a, [i64]>,
+    values: ValSnap<'a>,
+}
+
 impl Insert {
-    pub(crate) fn as_batch(&self) -> tc::InsertBatch<'_> {
-        let target = match &self.dest {
-            Dest::One(s) => tc::Target::Series(*s),
-            Dest::Each(s) => tc::Target::Each(s),
+    fn snap(&self) -> InsertSnap<'_> {
+        let (one, each) = match &self.dest {
+            Dest::One(s) => (*s, None),
+            Dest::Each(c) => (0, Some(c.snap())),
+        };
+        InsertSnap { one, each, ts: self.ts.snap(), values: self.values.snap() }
+    }
+}
+
+impl InsertSnap<'_> {
+    fn as_batch(&self) -> tc::InsertBatch<'_> {
+        let target = match &self.each {
+            None => tc::Target::Series(self.one),
+            Some(s) => tc::Target::Each(s),
         };
         tc::InsertBatch { target, ts: &self.ts, values: (&self.values).into() }
     }
 }
 
+/// Runs `f` on the inserts as the client library's batches, each column read once (see
+/// `Col::snap`): call it with the GIL released.
+pub(crate) fn with_batches<T>(b: &[Insert], f: impl FnOnce(&[tc::InsertBatch<'_>]) -> T) -> T {
+    let snaps: Vec<InsertSnap<'_>> = b.iter().map(Insert::snap).collect();
+    f(&snaps.iter().map(InsertSnap::as_batch).collect::<Vec<_>>())
+}
+
+/// `e`, raised for entry `index` of a batch call, as the same exception naming the entry: the
+/// message starts with "batch entry {index}: " and the `index` attribute holds it.
+pub(crate) fn entry_err(py: Python<'_>, index: usize, e: PyErr) -> PyErr {
+    let err = PyErr::from_type(e.get_type(py), format!("batch entry {index}: {}", e.value(py)));
+    let _ = err.value(py).setattr("index", index);
+    if let Ok(code) = e.value(py).getattr("code") {
+        let _ = err.value(py).setattr("code", code);
+    }
+    err.set_cause(py, Some(e));
+    err
+}
+
 /// The batches of insert_many(): `(series, ts, values)` tuples, series an id or a column of ids.
-/// Without `value_type` the type comes from the values' numpy dtype (float32 for anything else).
-pub(crate) fn inserts(batches: &Bound<'_, PyAny>, value_type: Option<ValueType>) -> PyResult<Vec<Insert>> {
-    let mut out = Vec::with_capacity(batches.len().unwrap_or(0));
-    for b in batches.try_iter()? {
-        let b = b?;
-        let t = b.cast::<PyTuple>().map_err(|_| PyTypeError::new_err("each batch is a tuple (series, ts, values)"))?;
-        if t.len() != 3 {
-            return Err(PyTypeError::new_err("each batch is a tuple (series, ts, values)"));
-        }
-        let (s, ts, v) = (t.get_item(0)?, t.get_item(1)?, t.get_item(2)?);
-        let dest = match s.extract::<u32>() {
-            Ok(id) => Dest::One(id),
-            Err(_) => Dest::Each(crate::series_column(&s)?),
-        };
-        let ty = match value_type {
-            Some(ty) => ty,
-            None => {
-                let data = if v.hasattr("mask")? { v.getattr("data")? } else { v.clone() };
-                dtype_type(&data)?.unwrap_or(ValueType::Float32)
+///
+/// The values' type is `value_type`, else the series' (the first row's for a column of ids;
+/// float32 without rows), as the one-insert calls take it: `types` looks up each series once,
+/// one result per id. Values of another type are converted (float64 into a float32 series, a
+/// list into an int64 series), as insert_series_values() converts them.
+pub(crate) fn inserts(
+    batches: &Bound<'_, PyAny>,
+    value_type: Option<ValueType>,
+    types: impl FnOnce(&[u32]) -> PyResult<Vec<tc::Result<ValueType>>>,
+) -> PyResult<Vec<Insert>> {
+    let py = batches.py();
+    let mut parsed = Vec::with_capacity(batches.len().unwrap_or(0));
+    for (i, b) in batches.try_iter()?.enumerate() {
+        let parse = || -> PyResult<(Dest, Col<i64>, Bound<'_, PyAny>)> {
+            let b = b?;
+            let t =
+                b.cast::<PyTuple>().map_err(|_| PyTypeError::new_err("each batch is a tuple (series, ts, values)"))?;
+            if t.len() != 3 {
+                return Err(PyTypeError::new_err("each batch is a tuple (series, ts, values)"));
             }
+            let (s, ts, v) = (t.get_item(0)?, t.get_item(1)?, t.get_item(2)?);
+            let dest = match s.extract::<u32>() {
+                Ok(id) => Dest::One(id),
+                Err(_) => Dest::Each(crate::series_column(&s)?),
+            };
+            Ok((dest, crate::ts_column(&ts)?, v))
         };
-        out.push(Insert { dest, ts: crate::ts_column(&ts)?, values: values_column(&v, ty)? });
+        parsed.push(parse().map_err(|e| entry_err(py, i, e))?);
+    }
+    let mut known: HashMap<u32, tc::Result<ValueType>> = HashMap::new();
+    if value_type.is_none() {
+        let mut ids: Vec<u32> = parsed.iter().filter_map(|p| p.0.first()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if !ids.is_empty() {
+            let t = types(&ids)?;
+            known = ids.into_iter().zip(t).collect();
+        }
+    }
+    let mut out = Vec::with_capacity(parsed.len());
+    for (i, (dest, ts, v)) in parsed.into_iter().enumerate() {
+        let ty = match (value_type, dest.first()) {
+            (Some(t), _) => t,
+            (None, None) => ValueType::Float32,
+            (None, Some(id)) => match known.get(&id) {
+                Some(Ok(t)) => *t,
+                _ => {
+                    let e = known
+                        .remove(&id)
+                        .and_then(Result::err)
+                        .unwrap_or_else(|| tc::Error::Server(tc::Status::NotFound));
+                    return Err(crate::to_pyerr(py, tc::Error::Batch { index: i, error: Box::new(e) }));
+                }
+            },
+        };
+        let values = values_column(&v, ty).map_err(|e| entry_err(py, i, e))?;
+        out.push(Insert { dest, ts, values });
     }
     Ok(out)
 }
@@ -288,7 +415,8 @@ impl Cols {
     /// Equal when every field is, floats bit for bit (as Bucket.__eq__).
     fn same(&self, o: &Cols) -> bool {
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        (&self.start, &self.count, &self.isum, &self.imin, &self.imax) == (&o.start, &o.count, &o.isum, &o.imin, &o.imax)
+        (&self.start, &self.count, &self.isum, &self.imin, &self.imax)
+            == (&o.start, &o.count, &o.isum, &o.imin, &o.imax)
             && (bits(&self.sum), bits(&self.min), bits(&self.max)) == (bits(&o.sum), bits(&o.min), bits(&o.max))
     }
 }
@@ -312,12 +440,14 @@ impl From<&[tc::Bucket]> for Cols {
 
 /// The buckets of an aggregate query, a column per field.
 ///
-/// It reads as a sequence of Bucket (len(), indexing, slicing, iteration,
-/// == against a list of Bucket), so code written for a list keeps working,
-/// and each field is a numpy array over all buckets (a list without numpy):
-/// ``b = db.query_agg(s, start, end, 60_000); b.count.sum(); b.max.max()``.
-/// Reading a column copies it out of the result; keep it in a variable
-/// rather than reading it in a loop.
+/// It is a sequence of Bucket (a collections.abc.Sequence: len(), indexing,
+/// slicing, iteration, index(), count(), + and == with a list of Bucket), so
+/// code written for the list it replaces keeps working. Each field is also a
+/// column over all buckets, a numpy array (a list without numpy): start, sum,
+/// min, max, avg, isum, imin, imax, and counts for the counts (count() is the
+/// sequence method): ``b = db.query_agg(s, start, end, 60_000);
+/// b.counts.sum(); b.max.max()``. Reading a column copies it out of the
+/// result; keep it in a variable rather than reading it in a loop.
 #[pyclass(frozen, sequence, module = "tsdb_client")]
 pub(crate) struct Buckets {
     cols: Cols,
@@ -350,9 +480,9 @@ impl Buckets {
         self.column(py, &self.cols.start)
     }
 
-    /// Number of known values per bucket (uint64).
+    /// Number of known values per bucket (uint64); count() is the sequence method.
     #[getter]
-    fn count<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn counts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.column(py, &self.cols.count)
     }
 
@@ -425,15 +555,46 @@ impl Buckets {
         self.list(py)?.try_iter().map(Bound::into_any)
     }
 
-    /// Equal to another Buckets or to a sequence of equal Bucket objects.
+    /// Equal to another Buckets or to a list of equal Bucket objects (as a list: never to a tuple).
     fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
         if let Ok(o) = other.cast::<Buckets>() {
             return Ok(self.cols.same(&o.get().cols));
         }
-        if other.len().is_err() || other.is_instance_of::<pyo3::types::PyString>() {
-            return Ok(false);
+        match other.cast::<PyList>() {
+            Ok(l) => self.list(py)?.eq(l),
+            Err(_) => Ok(false),
         }
-        self.list(py)?.eq(PyList::new(py, other.try_iter()?.collect::<PyResult<Vec<_>>>()?)?)
+    }
+
+    /// A list of the buckets of both, as list + list.
+    fn __add__<'py>(&self, py: Python<'py>, other: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        if !(other.is_instance_of::<PyList>() || other.is_instance_of::<Buckets>()) {
+            return Ok(py.NotImplemented().into_bound(py));
+        }
+        let l = self.list(py)?;
+        for x in other.try_iter()? {
+            l.append(x?)?;
+        }
+        Ok(l.into_any())
+    }
+
+    /// list + Buckets: a list.
+    fn __radd__<'py>(&self, py: Python<'py>, other: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        match other.cast::<PyList>() {
+            Ok(l) => Ok(l.add(self.list(py)?)?),
+            Err(_) => Ok(py.NotImplemented().into_bound(py)),
+        }
+    }
+
+    /// Number of buckets equal to `value` (the sequence method; the column is counts).
+    fn count(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<usize> {
+        self.list(py)?.call_method1("count", (value,))?.extract()
+    }
+
+    /// Position of the first bucket equal to `value`; ValueError if there is none.
+    #[pyo3(signature = (value, start = 0, stop = isize::MAX))]
+    fn index(&self, py: Python<'_>, value: &Bound<'_, PyAny>, start: isize, stop: isize) -> PyResult<usize> {
+        self.list(py)?.call_method1("index", (value, start, stop))?.extract()
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
@@ -441,9 +602,10 @@ impl Buckets {
     }
 }
 
-/// Offsets as an int64 array: `offsets[i]:offsets[i + 1]` is query i.
-fn offsets_array(py: Python<'_>, o: &[usize]) -> Py<PyAny> {
-    o.iter().map(|&x| x as i64).collect::<Vec<_>>().into_pyarray(py).into_any().unbind()
+/// Offsets as an int64 array (a list without numpy): `offsets[i]:offsets[i + 1]` is query i.
+fn offsets_array(py: Python<'_>, o: &[usize]) -> PyResult<Py<PyAny>> {
+    let v: Vec<i64> = o.iter().map(|&x| x as i64).collect();
+    Ok(vec_to_py(py, use_numpy(py, None)?, v)?.unbind())
 }
 
 /// The buckets of many aggregate queries (query_agg_many()).
@@ -452,7 +614,9 @@ fn offsets_array(py: Python<'_>, o: &[usize]) -> Py<PyAny> {
 /// queries. For whole-batch numpy work, result.buckets holds every query's
 /// buckets concatenated (columns start, count, sum, ...) and result.offsets
 /// (int64, one more than the queries) where each query's begin:
-/// ``b.buckets.count[b.offsets[i]:b.offsets[i + 1]]`` are query i's counts.
+/// ``b.buckets.counts[b.offsets[i]:b.offsets[i + 1]]`` are query i's counts.
+/// Without numpy the columns and offsets are lists. It is a
+/// collections.abc.Sequence of Buckets: a slice gives a list of them.
 #[pyclass(frozen, sequence, module = "tsdb_client")]
 pub(crate) struct BucketsMany {
     all: Py<Buckets>,
@@ -461,9 +625,14 @@ pub(crate) struct BucketsMany {
 }
 
 impl BucketsMany {
+    /// The Buckets of query j (< len).
+    fn query(&self, j: usize) -> Buckets {
+        Buckets { cols: self.all.get().cols.pick(self.offsets[j]..self.offsets[j + 1]) }
+    }
+
     /// The result of a batch call; `cols` was built with the GIL released.
     pub(crate) fn new(py: Python<'_>, (cols, offsets): (Cols, Vec<usize>)) -> PyResult<BucketsMany> {
-        Ok(BucketsMany { all: Py::new(py, Buckets { cols })?, offsets_py: offsets_array(py, &offsets), offsets })
+        Ok(BucketsMany { all: Py::new(py, Buckets { cols })?, offsets_py: offsets_array(py, &offsets)?, offsets })
     }
 }
 
@@ -485,7 +654,11 @@ pub(crate) fn many_cols(parts: Vec<Vec<tc::Bucket>>) -> (Cols, Vec<usize>) {
 /// The rows of a batch of raw queries: a (timestamps, values) tuple of numpy arrays per query,
 /// each taking over its query's vectors.
 pub(crate) fn points_list(py: Python<'_>, parts: Vec<tc::Points>) -> PyResult<Bound<'_, PyList>> {
-    numpy(py)?;
+    numpy(py).map_err(|e| {
+        let err = PyImportError::new_err("query_raw_many() returns numpy arrays: it needs numpy (pip install numpy)");
+        err.set_cause(py, Some(e));
+        err
+    })?;
     let items = parts
         .into_iter()
         .map(|p| PyTuple::new(py, [p.ts.into_pyarray(py).into_any(), p.values.into_pyarray(py).into_any()]))
@@ -511,15 +684,54 @@ impl BucketsMany {
         self.offsets.len().saturating_sub(1)
     }
 
-    /// The Buckets of query i.
-    fn __getitem__(&self, i: isize) -> PyResult<Buckets> {
-        let n = self.__len__() as isize;
-        let j = if i < 0 { i + n } else { i };
-        if j < 0 || j >= n {
+    /// The Buckets of query i; a list of them for a slice.
+    fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let n = self.__len__();
+        if let Ok(s) = key.cast::<PySlice>() {
+            let ix = s.indices(n as isize)?;
+            let idx = (0..ix.slicelength).map(|k| (ix.start + k as isize * ix.step) as usize);
+            return Ok(PyList::new(py, idx.map(|j| self.query(j)))?.into_any());
+        }
+        let i: isize = key.extract()?;
+        let j = if i < 0 { i + n as isize } else { i };
+        if j < 0 || j >= n as isize {
             return Err(PyIndexError::new_err("query index out of range"));
         }
-        let (a, b) = (self.offsets[j as usize], self.offsets[j as usize + 1]);
-        Ok(Buckets { cols: self.all.get().cols.pick(a..b) })
+        Ok(Bound::new(py, self.query(j as usize))?.into_any())
+    }
+
+    /// Equal to another BucketsMany or a list of equal Buckets (or lists of Bucket).
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if let Ok(o) = other.cast::<BucketsMany>() {
+            let o = o.get();
+            return Ok(self.offsets == o.offsets && self.all.get().cols.same(&o.all.get().cols));
+        }
+        let Ok(l) = other.cast::<PyList>() else { return Ok(false) };
+        if l.len() != self.__len__() {
+            return Ok(false);
+        }
+        for (j, x) in l.iter().enumerate() {
+            if !Bound::new(py, self.query(j))?.eq(x)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Number of queries whose buckets equal `value` (the sequence method).
+    fn count(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<usize> {
+        let mut k = 0;
+        for j in 0..self.__len__() {
+            k += usize::from(Bound::new(py, self.query(j))?.eq(value)?);
+        }
+        Ok(k)
+    }
+
+    /// Position of the first query whose buckets equal `value`; ValueError if there is none.
+    #[pyo3(signature = (value, start = 0, stop = isize::MAX))]
+    fn index(&self, py: Python<'_>, value: &Bound<'_, PyAny>, start: isize, stop: isize) -> PyResult<usize> {
+        let all = PyList::new(py, (0..self.__len__()).map(|j| self.query(j)))?;
+        all.call_method1("index", (value, start, stop))?.extract()
     }
 
     fn __repr__(&self, py: Python<'_>) -> String {

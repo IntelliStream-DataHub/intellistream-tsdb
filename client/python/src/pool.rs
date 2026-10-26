@@ -5,7 +5,8 @@
 //! whole batch. One Python thread thereby keeps every connection busy, which threads each making
 //! one call at a time cannot do past a few connections: each call crosses the GIL twice.
 
-use std::sync::RwLock;
+use std::collections::HashMap;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
@@ -13,8 +14,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use ::tsdb_client as tc;
+use tc::ValueType;
 
-use crate::arrays::{BucketsMany, Insert, agg_queries, inserts, many_cols, points_list, range_queries};
+use crate::arrays::{BucketsMany, agg_queries, inserts, many_cols, points_list, range_queries, with_batches};
 use crate::{closed, connect, opts, seconds, to_pyerr};
 
 /// A pool of connections to tsdbd for batch calls that use them all at once.
@@ -32,7 +34,13 @@ use crate::{closed, connect, opts, seconds, to_pyerr};
 ///     keepalive: TCP keepalive, as in Client.
 ///
 /// A connection that breaks (an I/O error or a timeout) is replaced by a new
-/// one before its next query.
+/// one before its next query, and so is every other connection made before
+/// it broke (after a server restart all of them are dead). A query whose
+/// connection broke runs once more on a new connection; an insert does not
+/// (the server may have applied it), so after a restart one insert_many()
+/// can fail with ERR_IO and the next works. Errors of batch calls name the
+/// lowest failing entry (TsdbError.index), as Db's do. A Pool has no
+/// last_query_stats(); a Client has.
 ///
 /// Raises:
 ///     TsdbError: A connection failed.
@@ -41,6 +49,8 @@ use crate::{closed, connect, opts, seconds, to_pyerr};
 pub(crate) struct Pool {
     pool: RwLock<Option<tc::Pool>>,
     addr: String,
+    /// Series types, which never change: insert_many() converts values to them.
+    types: Mutex<HashMap<u32, ValueType>>,
 }
 
 impl Pool {
@@ -51,6 +61,33 @@ impl Pool {
     {
         py.detach(|| f(self.pool.read().unwrap_or_else(|e| e.into_inner()).as_ref().ok_or_else(closed)?))
             .map_err(|e| to_pyerr(py, e))
+    }
+
+    /// The type of each series in `ids`, looked up once (a lookup that failed is an error of its
+    /// own, not of the call: insert_many() reports it for the insert that needed it).
+    fn types(&self, py: Python<'_>, ids: &[u32]) -> PyResult<Vec<tc::Result<ValueType>>> {
+        let known = self.types.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let missing: Vec<u32> = ids.iter().copied().filter(|id| !known.contains_key(id)).collect();
+        let mut found = HashMap::new();
+        if !missing.is_empty() {
+            let got = self.with(py, |p| {
+                p.map_retry(missing.len(), |c, i| match c.series_type(missing[i]) {
+                    Err(e) if c.is_broken() => Err(e), // retried once on a new connection
+                    r => Ok(r),
+                })
+            })?;
+            let mut cache = self.types.lock().unwrap_or_else(|e| e.into_inner());
+            for (&id, r) in missing.iter().zip(got) {
+                if let Ok(t) = &r {
+                    cache.insert(id, *t);
+                }
+                found.insert(id, r);
+            }
+        }
+        Ok(ids
+            .iter()
+            .map(|id| known.get(id).copied().map(Ok).unwrap_or_else(|| found.remove(id).expect("looked up")))
+            .collect())
     }
 }
 
@@ -76,7 +113,7 @@ impl Pool {
         let pool = py
             .detach(|| tc::Pool::with_connector(n, move || connect(&h, port, timeout, keepalive)))
             .map_err(|e| to_pyerr(py, e))?;
-        Ok(Pool { pool: RwLock::new(Some(pool)), addr: format!("{host}:{port}") })
+        Ok(Pool { pool: RwLock::new(Some(pool)), addr: format!("{host}:{port}"), types: Mutex::default() })
     }
 
     /// Number of connections.
@@ -111,10 +148,11 @@ impl Pool {
     /// Takes and returns what Db.query_raw_many() does: series (one id per
     /// query), start and end (None, one timestamp, or one per query), order,
     /// limit; a list of (timestamps, values) numpy arrays, one per query.
-    /// Needs numpy.
+    /// Needs numpy (ImportError without it).
     ///
     /// Raises:
-    ///     TsdbError: The first failing query's error (in query order).
+    ///     TsdbError: The lowest failing query's error; its index attribute is
+    ///         that query's position, and every query below it succeeded.
     #[pyo3(signature = (series, start = None, end = None, *, order = "asc", limit = None))]
     fn query_raw_many<'py>(
         &self,
@@ -133,10 +171,12 @@ impl Pool {
     /// Runs many aggregate queries over the connections at once.
     ///
     /// As Db.query_agg_many(): a bucket length for every query or one per
-    /// query (0: one bucket for the range); returns a BucketsMany.
+    /// query (0: one bucket for the range); returns a BucketsMany (lists
+    /// instead of numpy columns without numpy).
     ///
     /// Raises:
-    ///     TsdbError: The first failing query's error (in query order).
+    ///     TsdbError: The lowest failing query's error; its index attribute is
+    ///         that query's position, and every query below it succeeded.
     #[pyo3(signature = (series, start = None, end = None, interval_ms = None))]
     fn query_agg_many(
         &self,
@@ -154,10 +194,17 @@ impl Pool {
     /// Runs many inserts over the connections at once.
     ///
     /// As Db.insert_many(): a list of (series, ts, values) tuples, each all or
-    /// nothing on its own; on an error the others may have been committed.
+    /// nothing on its own; inserts that share a series run in list order (on
+    /// one connection); without value_type each takes its series' type.
+    ///
+    /// Raises:
+    ///     TsdbError: The lowest failing insert's error, with its index; every
+    ///         insert below it was committed, later ones may have been (errors
+    ///         found before inserting, as in Db.insert_many(), insert nothing).
+    ///         An insert whose connection broke is not retried.
     #[pyo3(signature = (batches, *, value_type = None))]
     fn insert_many(&self, py: Python<'_>, batches: &Bound<'_, PyAny>, value_type: Option<&str>) -> PyResult<()> {
-        let b = inserts(batches, value_type.map(crate::value_type).transpose()?)?;
-        self.with(py, |p| p.insert_many(&b.iter().map(Insert::as_batch).collect::<Vec<_>>()))
+        let b = inserts(batches, value_type.map(crate::value_type).transpose()?, |ids| self.types(py, ids))?;
+        self.with(py, |p| with_batches(&b, |b| p.insert_many(b)))
     }
 }
