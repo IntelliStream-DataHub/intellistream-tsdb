@@ -424,6 +424,56 @@ A request waits as long as the server takes unless you set a timeout
 (`tsdbc_set_timeout`); after a timeout or any connection error the client
 refuses further calls on that connection, so close it and connect again.
 
+### Backup and moving to a new version
+
+`export` writes the whole database (or some series) into one file; `import` reads it into another database.
+Use it for backups, to move a database to another disk or machine, and when a new tsdb version cannot open
+the files of an older one (before 1.0 that can happen in a 0.9.x release; the release notes say so):
+
+```sh
+build/tsdb /data/sensors export -o sensors.tsdbdump      # with the OLD tsdb; also while tsdbd is running
+build/tsdb /data/sensors-new import sensors.tsdbdump     # with the NEW tsdb, into a new directory
+build/tsdb /data/sensors export --series 'pump7.*' --from 2024-01-01 --to 2024-02-01 | ssh other \
+    tsdb /data/sensors import                             # some series and one month, straight to another host
+```
+
+The file has what your queries see (deleted rows are gone), with each series' type, retention and state names,
+every value exactly as stored, and a checksum on every piece. Every later tsdb can import it. `import` checks
+the whole file before it writes anything, so a damaged file changes nothing; `import --check FILE` only checks.
+Series that already exist are refused unless you pass `--skip-existing`, `--merge` or `--replace`. Stop tsdbd
+before importing into its directory. [docs/export-format.md](docs/export-format.md) describes the file.
+
+**If an import stops halfway.** Into a new database (a directory that is missing or empty), `import` builds
+the database in a directory beside it, `DIR.importing-<number>`, without waiting for the disk, makes it safe
+on disk once at the end, and only then gives it its name. So an interrupted import (a crash, a power loss, a
+kill, an error) leaves no database under that name. It may leave the `.importing` directory, and volume
+directories it made; the next import into the same directory says so. Delete them and run the import again.
+Into an existing database, `import` writes as carefully as tsdbd does: if it stops halfway, run it again with
+`--merge`, which writes the same rows again.
+
+**Upgrading a database with volumes.** Series in volumes (other directories, such as NFS mounts) keep their
+volume path in the file. The volume directories of the old database belong to it, so the new database needs
+volume directories of its own, and you need room for two copies of the data until you delete the old one.
+Tell `import` where each old volume goes: `--volume OLD=NEW` for one volume, or `--volume-root OLD=NEW` for
+every volume under the directory OLD, and `--create-volumes` to add the new ones to the new database:
+
+```sh
+# old database /data/sensors with volumes /mnt/nfs1/tsdb/sensors and /mnt/nfs2/tsdb/sensors
+build/tsdb /data/sensors export -o /backup/sensors.tsdbdump                 # with the OLD tsdb
+build/tsdb /data/sensors-new import /backup/sensors.tsdbdump --create-volumes \
+    --volume /mnt/nfs1/tsdb/sensors=/mnt/nfs1/tsdb/sensors-new \
+    --volume /mnt/nfs2/tsdb/sensors=/mnt/nfs2/tsdb/sensors-new                # with the NEW tsdb
+# or, when all volumes live under one directory, one rule for all of them:
+build/tsdb /data/sensors-new import /backup/sensors.tsdbdump --create-volumes \
+    --volume-root /mnt/tsdb/sensors=/mnt/tsdb/sensors-new
+```
+
+Then point tsdbd at the new directory, check your queries, and only then delete the old database and its
+volume directories. To keep the old paths instead: export, then move the old directories aside (`mv /data/sensors
+/data/sensors-old`, the same for each volume directory), then import into `/data/sensors` with `--create-volumes`
+and no `--volume`: the volumes are created again at their old paths.
+`--volume OLD=` (nothing after `=`) puts that volume's series into the database directory itself.
+
 ## Tests
 
 ```sh

@@ -1,5 +1,6 @@
 /* Command line client for a tsdb directory. */
 #include "common.h"
+#include "dump.h"
 #include "tsdb.h"
 #include "tsdb_calendar.h"
 
@@ -17,9 +18,33 @@ static void usage(void)
             "       tsdb --version\n"
             "\n"
             "  insert <series>                    read \"time,value\" lines from stdin\n"
-            "  import                             read \"series,time,value\" lines from stdin\n"
+            "  import [FILE]                      read \"series,time,value\" lines from FILE or stdin\n"
             "                                     (values by the series' type; null or empty: null;\n"
-            "                                     new series are float32)\n"
+            "                                     new series are float32), or a stream of export:\n"
+            "  export [-o FILE] [--series PATTERN]... [--from TIME] [--to TIME] [--zstd-level N] [--force]\n"
+            "                                     write the series (all, or those matching a glob\n"
+            "                                     PATTERN) with type, volume, retention and states to\n"
+            "                                     FILE or stdout: what queries see, deletes applied;\n"
+            "                                     read-only, also while tsdbd runs (one snapshot per\n"
+            "                                     series). For backups and moving to a new version.\n"
+            "                                     FILE is written as FILE.partial, then renamed; an\n"
+            "                                     existing FILE.partial is refused unless --force\n"
+            "  import [FILE] [--skip-existing|--merge|--replace] [--volume OLD=NEW]... [--volume-root OLD=NEW]...\n"
+            "                [--create-volumes] [--no-retention] [--no-verify] [--batch-rows N]\n"
+            "                                     read an export stream (checked first when FILE is a\n"
+            "                                     file: a damaged one writes nothing). A series that\n"
+            "                                     exists is refused, skipped, written into (last write\n"
+            "                                     wins) or has the exported range replaced (FILE only);\n"
+            "                                     --volume moves series of volume OLD to NEW (empty:\n"
+            "                                     the database directory), --volume-root every volume\n"
+            "                                     under OLD to the same place under NEW. Into an\n"
+            "                                     existing database: a crash or a failure midway,\n"
+            "                                     rerun it with --merge. Into a new database (missing\n"
+            "                                     or empty directory): built in DIR.importing-PID,\n"
+            "                                     synced once at the end, then renamed to DIR; an\n"
+            "                                     interrupted import leaves no DIR (delete what the\n"
+            "                                     next import names, then import again)\n"
+            "  import --check [FILE]              verify an export stream without writing anything\n"
             "  query <series> <start> <end> [raw|count|sum|min|max|avg|all] [group] [--tz ZONE]\n"
             "        also range, stddev_pop, stddev_samp, var_pop, var_samp (stddev, var: the _pop ones)\n"
             "        [--desc] [--limit N]         newest first; at most N rows or buckets\n"
@@ -193,7 +218,7 @@ static bool parse_value(tsdb *db, uint32_t series, tsdb_type type, const char *v
     }
 }
 
-static int cmd_import(tsdb *db, const char *fixed_series)
+static int cmd_import(tsdb *db, const char *fixed_series, FILE *in)
 {
     uint32_t fixed = 0;
     tsdb_type fixed_type = TSDB_FLOAT32;
@@ -212,7 +237,7 @@ static int cmd_import(tsdb *db, const char *fixed_series)
     uint32_t last_id = 0;
     tsdb_type last_type = TSDB_FLOAT32;
     double t0 = now_s();
-    while ((len = getline(&line, &cap, stdin)) > 0) {
+    while ((len = getline(&line, &cap, in)) > 0) {
         lineno++;
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             line[--len] = '\0';
@@ -635,6 +660,18 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "volume") == 0 && (argc != 4 || strcmp(argv[3], "list") != 0))
         usage();
+    if (strcmp(cmd, "export") == 0)
+        return dump_export_main(dir, argc - 3, argv + 3);
+    FILE *csv = stdin;
+    if (strcmp(cmd, "import") == 0) {
+        int st = dump_import_main(dir, argc - 3, argv + 3, &csv);
+        if (st >= 0)
+            return st;
+        if (!csv) {
+            fprintf(stderr, "tsdb: import: %s\n", strerror(errno));
+            return 1;
+        }
+    }
     bool writes = strcmp(cmd, "insert") == 0 || strcmp(cmd, "import") == 0 || strcmp(cmd, "optimize") == 0 ||
                   strcmp(cmd, "drop-before") == 0 || strcmp(cmd, "create") == 0 || strcmp(cmd, "delete") == 0 ||
                   (strcmp(cmd, "retention") == 0 && argc > 4);
@@ -655,9 +692,11 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "insert") == 0) {
         if (argc < 4)
             usage();
-        ret = cmd_import(db, argv[3]);
+        ret = cmd_import(db, argv[3], stdin);
     } else if (strcmp(cmd, "import") == 0) {
-        ret = cmd_import(db, NULL);
+        ret = cmd_import(db, NULL, csv);
+        if (csv != stdin)
+            fclose(csv); /* the cookie stream of dump_import_main frees its read-ahead buffer */
     } else if (strcmp(cmd, "query") == 0) {
         ret = cmd_query(db, argc - 3, argv + 3);
     } else if (strcmp(cmd, "create") == 0) {

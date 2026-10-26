@@ -94,6 +94,8 @@ cgroup, so `nice` does not keep your work out of its way.
   review of durability, recovery and failover code in the Jepsen style (claims, faults, histories, a checker,
   evidence); `agents/iso-waiter.md` waits on detached runs. Personal settings go in the ignored
   `.claude/settings.local.json`. `.githooks/commit-msg`: the commit rules for everyone (`make hooks`).
+- `tools/dump.c`: `tsdb export` / `import` (public API only), the stream of `docs/export-format.md`, which every
+  later version must keep reading (`tests/data/export-v1.tsdbdump`, `tests/test_export.c`).
 - `tools/`: CLI and benchmarks. `tests/`: tests; `tests/jepsen/`: the
   fault-injection harness and the `crashfs` LD_PRELOAD power-loss simulator.
 

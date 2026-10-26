@@ -17,6 +17,13 @@ disk format and the wire protocol.
   their list order. `Db.last_query_stats()` after a batch reports the totals of its queries.
 - `Pool`: after a connection breaks (a server restart), every connection made before it is replaced before its
   next use, and a query whose connection broke runs once more; inserts are not retried.
+- `tsdb <dir> export` and `tsdb <dir> import FILE`: a versioned, checksummed stream of whole databases or some
+  series (types, volumes, retention, state names, values bit for bit), for backups and for carrying a database
+  to a new format version. Every later tsdb reads every stream an earlier one wrote
+  ([docs/export-format.md](docs/export-format.md)). An import from a file is checked whole before anything is
+  written; `--skip-existing`, `--merge`, `--replace`, `--volume OLD=NEW`, `--volume-root OLD=NEW`,
+  `--create-volumes`, `--no-retention`, `--check`. An import into a new database is built beside it,
+  synced once at the end and then renamed to its name, so an interrupted one leaves no database under that name.
 
 ### Changed
 - Python: aggregate queries (`query_agg`, `query_group`, `query_bounds` and the rest) return `Buckets` instead of
