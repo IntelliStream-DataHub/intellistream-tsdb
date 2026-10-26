@@ -41,7 +41,7 @@ baseline (VBMI, VBMI2, GFNI, BITALG, VPOPCNTDQ, BF16), plus AVX512-VP2INTERSECT 
 1. **Baseline, every level.** On a `make dist` build:
    - `tools/fold-bench.sh build-dist 11` (the folds: every type, aggregate, spread, TWA, LTTB, at v2 scalar,
      SSE, AVX, v3 and v4);
-   - `build-dist/bin/codec-bench` and `build-dist/bin/type-bench` (or the `build/` binaries of `make`), with
+   - `build-dist/codec-bench` and `build-dist/type-bench` (the portable build; `build/` has the `make` ones), with
      `TSDB_CPU=v2`, `v3`, `v4`;
    - `build/tsdb-bench --dir /var/tmp/b --series 100 --points 1000000` and with `--type float64` and
      `--type int64` (load and query classes);
