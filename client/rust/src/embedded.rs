@@ -29,7 +29,9 @@ use tsdb_sys as sys;
 
 use crate::client::bounds;
 use crate::error::{Error, Result, Status};
-use crate::types::{Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, Stats};
+use crate::types::{
+    Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaMethod, TwaOpts,
+};
 use crate::value::{Bitmap, Column, ColumnRef, Value, ValueType, Values, ValuesRef};
 
 /// How the engine encodes float values (`TSDB_VALUES_*`); all are lossless.
@@ -405,6 +407,92 @@ fn bucket(b: &sys::tsdb_bucket) -> Bucket {
         imin: b.imin,
         imax: b.imax,
     }
+}
+
+/// Runs an engine call that returns a malloc'd array, converts its elements and frees it.
+fn engine_array<T, U>(f: impl FnOnce(*mut *mut T, *mut usize) -> c_int, conv: impl Fn(&T) -> U) -> Result<Vec<U>> {
+    let (mut p, mut n) = (ptr::null_mut(), 0usize);
+    let rc = f(&mut p, &mut n);
+    let out = if p.is_null() { Vec::new() } else { unsafe { slice(p, n) }.iter().map(conv).collect() };
+    unsafe { sys::tsdb_free(p.cast()) };
+    check(rc)?;
+    Ok(out)
+}
+
+fn spread_bucket(b: &sys::tsdb_spread_bucket) -> SpreadBucket {
+    SpreadBucket {
+        bucket: bucket(&b.b),
+        range: b.range,
+        var_pop: b.var_pop,
+        var_samp: b.var_samp,
+        stddev_pop: b.stddev_pop,
+        stddev_samp: b.stddev_samp,
+    }
+}
+
+fn twa_bucket(b: &sys::tsdb_twa_bucket) -> TwaBucket {
+    TwaBucket { start: b.start, twa: b.twa, area: b.area, covered_ms: b.covered_ms, count: b.count }
+}
+
+/// The C options of a TWA query, or `None` for a limit of 0.
+fn c_twa_opts(o: TwaOpts) -> Option<sys::tsdb_twa_opts> {
+    let q = c_opts(o.query_opts())?;
+    Some(sys::tsdb_twa_opts {
+        method: match o.method {
+            TwaMethod::Step => sys::TSDB_TWA_STEP,
+            TwaMethod::Linear => sys::TSDB_TWA_LINEAR,
+        },
+        max_gap_ms: o.max_gap_ms,
+        order: q.order,
+        limit: q.limit,
+        no_stats: 0,
+    })
+}
+
+/// A [`Group`] as the engine takes it; `g.timezone` points into `_zone`, which lives as long.
+struct CGroup {
+    _zone: Option<CString>,
+    g: Option<sys::tsdb_group>,
+    /// In a time zone other than UTC: the `_local` functions of tsdb_calendar.h.
+    local: bool,
+}
+
+impl CGroup {
+    fn new(group: Option<&Group>) -> Result<CGroup> {
+        let zone = match group.and_then(|g| g.timezone.as_deref()) {
+            Some(z) => {
+                Some(CString::new(z).map_err(|_| Error::InvalidArgument("time zone contains a NUL byte".into()))?)
+            }
+            None => None,
+        };
+        let g = group.map(|g| sys::tsdb_group {
+            unit: g.unit as u8 as c_int,
+            count: g.count,
+            timezone: zone.as_ref().map_or(ptr::null(), |z| z.as_ptr()),
+        });
+        let local = zone.as_ref().is_some_and(|z| z.as_bytes() != b"UTC");
+        if let Some(z) = zone.as_ref().filter(|_| local) {
+            // the _local functions read the zone only when there are rows; over TCP an unknown
+            // zone is an error whatever the series holds and whatever the limit
+            check_zone(z)?;
+        }
+        Ok(CGroup { _zone: zone, g, local })
+    }
+
+    fn ptr(&self) -> *const sys::tsdb_group {
+        self.g.as_ref().map_or(ptr::null(), |g| g as *const sys::tsdb_group)
+    }
+}
+
+/// Bucket bounds as the TCP client checks them.
+fn check_bounds(bounds: &[i64]) -> Result<()> {
+    if bounds.is_empty() {
+        return Err(Error::InvalidArgument("0 bucket bounds".into()));
+    }
+    if let Some(i) = bounds.windows(2).position(|w| w[0] >= w[1]) {
+        return Err(Error::InvalidArgument(format!("bucket bounds do not increase at index {}", i + 1)));
+    }
+    Ok(())
 }
 
 /// Runs an engine call that returns malloc'd buckets, copies them and frees the array.
@@ -815,24 +903,8 @@ impl Db {
         opts: QueryOpts,
     ) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
-        let zone = match group.and_then(|g| g.timezone.as_deref()) {
-            Some(z) => {
-                Some(CString::new(z).map_err(|_| Error::InvalidArgument("time zone contains a NUL byte".into()))?)
-            }
-            None => None,
-        };
-        let g = group.map(|g| sys::tsdb_group {
-            unit: g.unit as u8 as c_int,
-            count: g.count,
-            timezone: zone.as_ref().map_or(ptr::null(), |z| z.as_ptr()),
-        });
-        let gp = g.as_ref().map_or(ptr::null(), |g| g as *const sys::tsdb_group);
-        let local = zone.as_ref().is_some_and(|z| z.as_bytes() != b"UTC");
-        if let Some(z) = zone.as_ref().filter(|_| local) {
-            // tsdb_query_group_local reads the zone only when there are rows; over TCP an unknown
-            // zone is an error whatever the series holds and whatever the limit
-            check_zone(z)?;
-        }
+        let cg = CGroup::new(group)?;
+        let (gp, local) = (cg.ptr(), cg.local);
         let Some(o) = c_opts(opts) else {
             return Ok(Vec::new());
         };
@@ -862,18 +934,266 @@ impl Db {
         opts: QueryOpts,
     ) -> Result<Vec<Bucket>> {
         let (start, end) = self::bounds(&range);
-        if bounds.is_empty() {
-            return Err(Error::InvalidArgument("0 bucket bounds".into()));
-        }
-        if let Some(i) = bounds.windows(2).position(|w| w[0] >= w[1]) {
-            return Err(Error::InvalidArgument(format!("bucket bounds do not increase at index {}", i + 1)));
-        }
+        check_bounds(bounds)?;
         let Some(o) = c_opts(opts) else { return Ok(Vec::new()) };
         let r = buckets(|out, n| unsafe {
             sys::tsdb_query_bounds(self.p(), series, start, end, bounds.as_ptr(), bounds.len(), &o, out, n)
         });
         self.record();
         r
+    }
+
+    /// As [`query_agg`](Db::query_agg), in `opts.order` and at most `opts.limit` buckets.
+    pub fn query_agg_ex(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: QueryOpts,
+    ) -> Result<Vec<Bucket>> {
+        let (start, end) = bounds(&range);
+        if interval_ms < 0 {
+            return Err(Error::Server(Status::Invalid));
+        }
+        let Some(o) = c_opts(opts) else { return Ok(Vec::new()) };
+        let r =
+            buckets(|out, n| unsafe { sys::tsdb_query_agg_ex(self.p(), series, start, end, interval_ms, &o, out, n) });
+        self.record();
+        r
+    }
+
+    /// The spread (range, variances, standard deviations) in buckets of `interval_ms`, as
+    /// [`Client::query_spread`](crate::Client::query_spread).
+    pub fn query_spread(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>> {
+        let (start, end) = bounds(&range);
+        if interval_ms < 0 {
+            return Err(Error::Server(Status::Invalid));
+        }
+        let Some(o) = c_opts(opts) else { return Ok(Vec::new()) };
+        let r = engine_array(
+            |out, n| unsafe { sys::tsdb_query_spread(self.p(), series, start, end, interval_ms, &o, out, n) },
+            spread_bucket,
+        );
+        self.record();
+        r
+    }
+
+    /// The spread by calendar periods, as [`query_group`](Db::query_group).
+    pub fn query_spread_group(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        group: Option<&Group>,
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>> {
+        let (start, end) = bounds(&range);
+        let cg = CGroup::new(group)?;
+        let Some(o) = c_opts(opts) else { return Ok(Vec::new()) };
+        let r = engine_array(
+            |out, n| unsafe {
+                if cg.local {
+                    sys::tsdb_query_spread_group_local(self.p(), series, start, end, cg.ptr(), &o, out, n)
+                } else {
+                    sys::tsdb_query_spread_group(self.p(), series, start, end, cg.ptr(), &o, out, n)
+                }
+            },
+            spread_bucket,
+        );
+        self.record();
+        r
+    }
+
+    /// The spread in buckets with the given bounds, as [`query_bounds`](Db::query_bounds).
+    pub fn query_spread_bounds(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        bounds: &[i64],
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>> {
+        let (start, end) = self::bounds(&range);
+        check_bounds(bounds)?;
+        let Some(o) = c_opts(opts) else { return Ok(Vec::new()) };
+        let r = engine_array(
+            |out, n| unsafe {
+                sys::tsdb_query_spread_bounds(self.p(), series, start, end, bounds.as_ptr(), bounds.len(), &o, out, n)
+            },
+            spread_bucket,
+        );
+        self.record();
+        r
+    }
+
+    /// Time-weighted averages in buckets of `interval_ms` (0: one bucket), as
+    /// [`Client::query_twa`](crate::Client::query_twa).
+    pub fn query_twa(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>> {
+        let (start, end) = bounds(&range);
+        if interval_ms < 0 {
+            return Err(Error::Server(Status::Invalid));
+        }
+        let Some(o) = c_twa_opts(opts) else { return Ok(Vec::new()) };
+        let r = engine_array(
+            |out, n| unsafe { sys::tsdb_query_twa(self.p(), series, start, end, interval_ms, &o, out, n) },
+            twa_bucket,
+        );
+        self.record();
+        r
+    }
+
+    /// Time-weighted averages by calendar periods (`None`: one bucket), in any time zone.
+    pub fn query_twa_group(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        group: Option<&Group>,
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>> {
+        let (start, end) = bounds(&range);
+        let cg = CGroup::new(group)?;
+        let Some(o) = c_twa_opts(opts) else { return Ok(Vec::new()) };
+        let r = engine_array(
+            |out, n| unsafe {
+                if cg.local {
+                    sys::tsdb_query_twa_group_local(self.p(), series, start, end, cg.ptr(), &o, out, n)
+                } else {
+                    sys::tsdb_query_twa_group(self.p(), series, start, end, cg.ptr(), &o, out, n)
+                }
+            },
+            twa_bucket,
+        );
+        self.record();
+        r
+    }
+
+    /// Time-weighted averages in buckets with the given bounds.
+    pub fn query_twa_bounds(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        bounds: &[i64],
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>> {
+        let (start, end) = self::bounds(&range);
+        check_bounds(bounds)?;
+        let Some(o) = c_twa_opts(opts) else { return Ok(Vec::new()) };
+        let r = engine_array(
+            |out, n| unsafe {
+                sys::tsdb_query_twa_bounds(self.p(), series, start, end, bounds.as_ptr(), bounds.len(), &o, out, n)
+            },
+            twa_bucket,
+        );
+        self.record();
+        r
+    }
+
+    /// LTTB downsampling: at most `threshold` points that keep the shape of the line, newest
+    /// first or cut to a limit with `opts`, as [`Client::query_lttb`](crate::Client::query_lttb).
+    pub fn query_lttb(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        threshold: u64,
+        opts: QueryOpts,
+    ) -> Result<Rows> {
+        let (start, end) = bounds(&range);
+        // a limit of 0 still asks (for one point, dropped) so that errors match tsdbd's
+        let none = opts.limit == Some(0);
+        let o = c_opts(if none { QueryOpts { limit: Some(1), ..opts } } else { opts }).expect("a limit above 0");
+        let threshold = usize::try_from(threshold).unwrap_or(usize::MAX);
+        let mut rows: Option<Rows> = None;
+        self.lttb_chunks(series, start, end, threshold, &o, |ts, chunk| {
+            let r = rows.get_or_insert_with(|| Rows { ts: Vec::new(), values: Column::empty(chunk.value_type()) });
+            if !none {
+                r.ts.extend_from_slice(ts);
+                chunk.append_to(&mut r.values);
+            }
+            ControlFlow::Continue(())
+        })?;
+        match rows {
+            Some(r) => Ok(r),
+            None => match self.series_type(series) {
+                Err(e) if e.status() == Some(Status::NotFound) => {
+                    Ok(Rows { ts: Vec::new(), values: Column::empty(ValueType::Float32) })
+                }
+                t => Ok(Rows { ts: Vec::new(), values: Column::empty(t?) }),
+            },
+        }
+    }
+
+    fn lttb_chunks<F>(
+        &self,
+        series: u32,
+        start: i64,
+        end: i64,
+        threshold: usize,
+        o: &sys::tsdb_query_opts,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[i64], ChunkRef<'_>) -> ControlFlow<()>,
+    {
+        let mut call = Call::new(f);
+        let rc = unsafe {
+            sys::tsdb_query_lttb_ex(
+                self.p(),
+                series,
+                start,
+                end,
+                threshold,
+                o,
+                Some(values_fn::<F>),
+                (&raw mut call).cast(),
+            )
+        };
+        self.record();
+        call.finish(rc)
+    }
+
+    // ------------------------------------------------ deletes and retention
+
+    /// Deletes the rows of a series in `range`, as [`Client::delete_range`](crate::Client::delete_range).
+    pub fn delete_range(&self, series: u32, range: impl RangeBounds<i64>) -> Result<()> {
+        let (start, end) = bounds(&range);
+        check(unsafe { sys::tsdb_delete_range(self.p(), series, start, end) })
+    }
+
+    /// Replaces the rows of a series in `range` by the given ones, atomically; every `ts` must lie
+    /// in the range. As [`Client::replace_range`](crate::Client::replace_range).
+    pub fn replace_range<'a>(
+        &self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        ts: &[i64],
+        values: impl Into<ColumnRef<'a>>,
+    ) -> Result<()> {
+        let (start, end) = bounds(&range);
+        let col = values.into();
+        let c = c_values(&col, ts)?;
+        check(unsafe { sys::tsdb_replace_range(self.p(), series, start, end, ts.as_ptr(), &c, ts.len()) })
+    }
+
+    /// Sets how long a series keeps its values (0: for ever), durably.
+    pub fn set_retention(&self, series: u32, limit_ms: i64) -> Result<()> {
+        check(unsafe { sys::tsdb_set_retention(self.p(), series, limit_ms) })
+    }
+
+    /// A series' retention limit in ms (0: none).
+    pub fn retention(&self, series: u32) -> Result<i64> {
+        let mut v = 0i64;
+        check(unsafe { sys::tsdb_get_retention(self.p(), series, &mut v) })?;
+        Ok(v)
     }
 
     // ------------------------------------------------------------- maintenance

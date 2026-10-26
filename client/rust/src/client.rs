@@ -26,9 +26,11 @@ use crate::pack;
 use crate::protocol::extend_i64s;
 use crate::protocol::{
     BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PACKED, PROTOCOL_VERSION, REPLACE_HEADER, REPLY_HEADER,
-    VALID, VALUES_CHUNK_HEADER,
+    SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW, VALID, VALUES_CHUNK_HEADER,
 };
-use crate::types::{Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, Stats};
+use crate::types::{
+    Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts,
+};
 use crate::value::{Bitmap, Column, ColumnRef, Native, Value, ValueType};
 
 /// Rows per INSERT frame: 8M rows of the many-series layout make 128 MiB,
@@ -942,10 +944,51 @@ impl Client {
     /// ```
     pub fn query_rows(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Rows> {
         let (start, end) = bounds(&range);
+        self.run(|c| c.rows_stream(series, start, end, opts, None))
+    }
+
+    /// LTTB downsampling (protocol version 5): at most `threshold` points of `series` in
+    /// `range` that keep the shape of its line (the first and last always), with their
+    /// stored values. `opts` returns them newest first or only the first `limit` of them in
+    /// that order (version 9); the choice of points does not change.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] for a threshold below 3, for a state series, from a server older than
+    /// version 5, and from one older than 9 when `opts` asks for an order or a limit (the client
+    /// asks HELLO first and does not send the request).
+    ///
+    /// ```no_run
+    /// # use tsdb_client::{Client, QueryOpts};
+    /// # let mut c = Client::connect("127.0.0.1:7070")?;
+    /// # let id = 1;
+    /// let chart = c.query_lttb(id, .., 1000, QueryOpts::asc())?; // 1000 points for a chart
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    pub fn query_lttb(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        threshold: u64,
+        opts: QueryOpts,
+    ) -> Result<Rows> {
+        let (start, end) = bounds(&range);
         self.run(|c| {
+            c.need_version(5)?;
+            if opts.order == Order::Desc || opts.limit.is_some() {
+                c.need_version(9)?;
+            }
+            c.rows_stream(series, start, end, opts, Some(threshold))
+        })
+    }
+
+    /// The rows of QUERY_VALUES, or of QUERY_LTTB with `lttb` as the threshold.
+    fn rows_stream(&mut self, series: u32, start: i64, end: i64, opts: QueryOpts, lttb: Option<u64>) -> Result<Rows> {
+        {
+            let c = self;
             let mut rows = Rows { ts: Vec::new(), values: Column::empty(ValueType::Float32) };
             let mut first = true;
-            c.values_stream(series, start, end, opts, |chunk| {
+            c.chunk_stream(series, start, end, opts, lttb, |chunk| {
                 let col = &mut rows.values;
                 if first {
                     *col = Column::empty(chunk.ty);
@@ -966,7 +1009,7 @@ impl Client {
                 Ok(ControlFlow::Continue(()))
             })?;
             Ok(rows)
-        })
+        }
     }
 
     /// Streams the rows of `series` (any type, with nulls) in `range` to `f`, a
@@ -1018,7 +1061,24 @@ impl Client {
     /// Sends a QUERY_VALUES and passes every chunk, empty ones included (they
     /// still carry the type), to `sink` until it breaks. A limit of `Some(0)`
     /// asks for one row and passes none, so the type still arrives.
-    fn values_stream<F>(&mut self, series: u32, start: i64, end: i64, opts: QueryOpts, mut sink: F) -> Result<()>
+    fn values_stream<F>(&mut self, series: u32, start: i64, end: i64, opts: QueryOpts, sink: F) -> Result<()>
+    where
+        F: FnMut(Chunk<'_>) -> Result<ControlFlow<()>>,
+    {
+        self.chunk_stream(series, start, end, opts, None, sink)
+    }
+
+    /// The chunks of QUERY_VALUES, or of QUERY_LTTB with `lttb` as the threshold (the caller has
+    /// checked the server's version), to `sink` as [`values_stream`](Client::values_stream).
+    fn chunk_stream<F>(
+        &mut self,
+        series: u32,
+        start: i64,
+        end: i64,
+        opts: QueryOpts,
+        lttb: Option<u64>,
+        mut sink: F,
+    ) -> Result<()>
     where
         F: FnMut(Chunk<'_>) -> Result<ControlFlow<()>>,
     {
@@ -1027,7 +1087,17 @@ impl Client {
             Some(l) => (l, false),
             None => (1, true),
         };
-        self.send_range_query(Op::QueryValues, series, start, end, opts.order, limit)?;
+        match lttb {
+            None => self.send_range_query(Op::QueryValues, series, start, end, opts.order, limit)?,
+            Some(t) => {
+                // order and limit only when they change something: the 28-byte form is what every server takes
+                let f = self.req.begin(self.next_id, Op::QueryLttb).u32(series).i64(start).i64(end).u64(t);
+                if opts.order == Order::Desc || opts.limit.is_some() {
+                    f.u8((opts.order == Order::Desc) as u8).u64(limit);
+                }
+                self.send()?;
+            }
+        }
         let mut status = 0;
         let mut first = true;
         loop {
@@ -1090,8 +1160,31 @@ impl Client {
     /// # Ok::<(), tsdb_client::Error>(())
     /// ```
     pub fn query_agg(&mut self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64) -> Result<Vec<Bucket>> {
+        self.query_agg_ex(series, range, interval_ms, QueryOpts::asc())
+    }
+
+    /// As [`query_agg`](Client::query_agg), in `opts.order` and at most
+    /// `opts.limit` buckets (QUERY_BUCKETS, which every server version takes).
+    ///
+    /// ```no_run
+    /// # use tsdb_client::{Client, QueryOpts};
+    /// # let mut c = Client::connect("127.0.0.1:7070")?;
+    /// # let id = 1;
+    /// let last_hour = c.query_agg_ex(id, .., 3_600_000, QueryOpts::desc().limit(1))?;
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    pub fn query_agg_ex(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: QueryOpts,
+    ) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
-        self.run(|c| c.buckets(series, start, end, interval_ms, None, QueryOpts::asc()))
+        if interval_ms < 0 {
+            return Err(Error::Server(Status::Invalid));
+        }
+        self.run(|c| c.buckets(series, start, end, interval_ms, None, opts))
     }
 
     /// Aggregates `series` over `range` by calendar periods, such as days in a
@@ -1133,7 +1226,10 @@ impl Client {
         let (start, end) = bounds(&range);
         self.run(|c| match group {
             Some(g) if g.timezone.as_deref().is_some_and(|z| z != "UTC") && c.server_version()? >= 4 => {
-                c.group_local(series, start, end, g, opts)
+                if !c.group_local(series, start, end, g, opts, 0)? {
+                    return Ok(Vec::new());
+                }
+                c.read_buckets()
             }
             // UTC, or an older server, which still takes the zone itself
             _ => c.buckets(series, start, end, 0, group, opts),
@@ -1143,20 +1239,32 @@ impl Client {
     /// Calendar groups in a time zone for a version 4 server: their UTC
     /// bounds, computed over the rows there are (an open range would be
     /// millennia of periods), go out in QUERY_BOUNDS.
-    fn group_local(&mut self, series: u32, start: i64, end: i64, g: &Group, opts: QueryOpts) -> Result<Vec<Bucket>> {
+    /// The reply is left in `self.body`; `false`: there is none (no rows, or a limit of 0).
+    fn group_local(
+        &mut self,
+        series: u32,
+        start: i64,
+        end: i64,
+        g: &Group,
+        opts: QueryOpts,
+        fields: u8,
+    ) -> Result<bool> {
         let zone = g.timezone.as_deref().unwrap_or("");
         calendar::zone(zone)?; // an unknown zone is an error even for a series without rows
+        if fields != 0 {
+            self.need_version(8)?;
+        }
         let Some(_) = opts.wire_limit() else {
             self.wait_inner()?;
-            return Ok(Vec::new());
+            return Ok(false);
         };
         let (Some(first), Some(last)) =
             (self.edge_ts(series, start, end, Order::Asc)?, self.edge_ts(series, start, end, Order::Desc)?)
         else {
-            return Ok(Vec::new());
+            return Ok(false);
         };
         let b = calendar::calendar_bounds(zone, g.unit, g.count, first..last.saturating_add(1))?;
-        self.bounds_req(series, start, end, &b, opts)
+        self.bounds_send(series, start, end, &b, opts, fields)
     }
 
     /// The timestamp of the first (`Asc`) or last (`Desc`) row of `series` in `[start, end)`.
@@ -1209,20 +1317,30 @@ impl Client {
         opts: QueryOpts,
     ) -> Result<Vec<Bucket>> {
         let (start, end) = self::bounds(&range);
-        self.run(|c| c.bounds_req(series, start, end, bounds, opts))
+        self.run(
+            |c| if c.bounds_send(series, start, end, bounds, opts, 0)? { c.read_buckets() } else { Ok(Vec::new()) },
+        )
     }
 
-    /// QUERY_BOUNDS.
-    fn bounds_req(&mut self, series: u32, start: i64, end: i64, b: &[i64], opts: QueryOpts) -> Result<Vec<Bucket>> {
-        if b.is_empty() || b.len() > (MAX_FRAME - 64) / 8 {
-            return Err(Error::InvalidArgument(format!("{} bucket bounds", b.len())));
-        }
-        if let Some(i) = b.windows(2).position(|w| w[0] >= w[1]) {
-            return Err(Error::InvalidArgument(format!("bucket bounds do not increase at index {}", i + 1)));
+    /// QUERY_BOUNDS; the reply is left in `self.body`, `false` when there is none (a limit of 0).
+    /// The fields byte goes out only when it asks for something: without it the request is the one
+    /// every server version takes.
+    fn bounds_send(
+        &mut self,
+        series: u32,
+        start: i64,
+        end: i64,
+        b: &[i64],
+        opts: QueryOpts,
+        fields: u8,
+    ) -> Result<bool> {
+        check_bounds(b)?;
+        if fields != 0 {
+            self.need_version(8)?;
         }
         let Some(limit) = opts.wire_limit() else {
             self.wait_inner()?;
-            return Ok(Vec::new());
+            return Ok(false);
         };
         self.request(Op::QueryBounds, |f| {
             f.u32(series)
@@ -1232,9 +1350,12 @@ impl Client {
                 .u64(limit)
                 .u32(b.len() as u32)
                 .i64s(b);
+            if fields != 0 {
+                f.u8(fields);
+            }
         })?;
         self.req.shrink();
-        self.read_buckets()
+        Ok(true)
     }
 
     /// QUERY_BUCKETS: fixed intervals (no group) or calendar groups.
@@ -1247,10 +1368,33 @@ impl Client {
         group: Option<&Group>,
         opts: QueryOpts,
     ) -> Result<Vec<Bucket>> {
+        if self.buckets_send(series, start, end, interval, group, opts, 0)? {
+            self.read_buckets()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// QUERY_BUCKETS with a fields byte; the reply is left in `self.body`, `false` when there is
+    /// none (a limit of 0). The byte goes out only when it asks for something.
+    #[allow(clippy::too_many_arguments)]
+    fn buckets_send(
+        &mut self,
+        series: u32,
+        start: i64,
+        end: i64,
+        interval: i64,
+        group: Option<&Group>,
+        opts: QueryOpts,
+        fields: u8,
+    ) -> Result<bool> {
         let tz = wire_str("time zone", group.and_then(|g| g.timezone.as_deref()).unwrap_or(""), true)?;
+        if fields != 0 {
+            self.need_version(8)?;
+        }
         let Some(limit) = opts.wire_limit() else {
             self.wait_inner()?;
-            return Ok(Vec::new());
+            return Ok(false);
         };
         self.request(Op::QueryBuckets, |f| {
             f.u32(series)
@@ -1263,8 +1407,11 @@ impl Client {
                 .u64(limit)
                 .u16(tz.len() as u16)
                 .bytes(tz);
+            if fields != 0 {
+                f.u8(fields);
+            }
         })?;
-        self.read_buckets()
+        Ok(true)
     }
 
     /// A QUERY_BUCKETS or QUERY_BOUNDS reply.
@@ -1276,15 +1423,248 @@ impl Client {
         }
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            out.push(Bucket {
+            out.push(read_bucket(&mut r)?);
+        }
+        Ok(out)
+    }
+
+    /// A QUERY_BUCKETS or QUERY_BOUNDS reply with the spread.
+    fn read_spread(&self) -> Result<Vec<SpreadBucket>> {
+        let mut r = Cursor::new(&self.body);
+        let n = r.u32()? as usize;
+        if r.remaining() != n * SPREAD_ROW {
+            return Err(Error::Protocol(format!("{n} spread buckets in {} bytes", r.remaining())));
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(SpreadBucket {
+                bucket: read_bucket(&mut r)?,
+                range: r.f64()?,
+                var_pop: r.f64()?,
+                var_samp: r.f64()?,
+                stddev_pop: r.f64()?,
+                stddev_samp: r.f64()?,
+            });
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------- spread
+
+    /// The spread of `series` over `range` in buckets of `interval_ms` (0: one
+    /// bucket): count, sum, min and max as [`query_agg_ex`](Client::query_agg_ex),
+    /// and the range, variances and standard deviations of the known values
+    /// (protocol version 8).
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] from a server older than version 8 (asked through HELLO, the
+    /// request is not sent) and for a negative interval; otherwise as `query_agg`.
+    ///
+    /// ```no_run
+    /// # use tsdb_client::{Client, QueryOpts};
+    /// # let mut c = Client::connect("127.0.0.1:7070")?;
+    /// # let id = 1;
+    /// for b in c.query_spread(id, .., 3_600_000, QueryOpts::asc())? {
+    ///     println!("{} mean {} stddev {}", b.bucket.start, b.bucket.avg(), b.stddev_samp);
+    /// }
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    pub fn query_spread(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>> {
+        let (start, end) = bounds(&range);
+        if interval_ms < 0 {
+            return Err(Error::Server(Status::Invalid));
+        }
+        self.run(|c| {
+            if c.buckets_send(series, start, end, interval_ms, None, opts, SPREAD)? {
+                c.read_spread()
+            } else {
+                Ok(Vec::new())
+            }
+        })
+    }
+
+    /// The spread by calendar periods, as [`query_group`](Client::query_group): the client
+    /// turns periods in a time zone other than UTC into bounds.
+    pub fn query_spread_group(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        group: Option<&Group>,
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>> {
+        let (start, end) = bounds(&range);
+        self.run(|c| {
+            let sent = match group {
+                Some(g) if g.timezone.as_deref().is_some_and(|z| z != "UTC") => {
+                    c.group_local(series, start, end, g, opts, SPREAD)?
+                }
+                _ => c.buckets_send(series, start, end, 0, group, opts, SPREAD)?,
+            };
+            if sent { c.read_spread() } else { Ok(Vec::new()) }
+        })
+    }
+
+    /// The spread in buckets with the given bounds, as [`query_bounds`](Client::query_bounds).
+    pub fn query_spread_bounds(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        bounds: &[i64],
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>> {
+        let (start, end) = self::bounds(&range);
+        self.run(|c| {
+            if c.bounds_send(series, start, end, bounds, opts, SPREAD)? { c.read_spread() } else { Ok(Vec::new()) }
+        })
+    }
+
+    // ------------------------------------------------ time-weighted averages
+
+    /// Time-weighted averages of `series` over `range` in buckets of `interval_ms`
+    /// (0: one bucket), with the method, staleness limit, order and limit of
+    /// `opts` (protocol version 6; tsdb.h, `tsdb_query_twa`, has the rules).
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Invalid`] from a server older than version 6 (the request is not sent), for a
+    /// negative interval and for a state series.
+    ///
+    /// ```no_run
+    /// # use tsdb_client::{Client, TwaOpts};
+    /// # let mut c = Client::connect("127.0.0.1:7070")?;
+    /// # let id = 1;
+    /// for b in c.query_twa(id, 0..86_400_000, 3_600_000, TwaOpts::step().max_gap(600_000))? {
+    ///     println!("{} {} over {} ms", b.start, b.twa, b.covered_ms);
+    /// }
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    pub fn query_twa(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>> {
+        let (start, end) = bounds(&range);
+        if interval_ms < 0 {
+            return Err(Error::Server(Status::Invalid));
+        }
+        self.run(|c| c.twa_req(series, start, end, interval_ms, 0, 0, &[], opts))
+    }
+
+    /// Time-weighted averages by calendar periods (`None`: one bucket). Periods in a time
+    /// zone other than UTC become bounds here, over the range, or over the rows there are
+    /// where the range is open.
+    pub fn query_twa_group(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        group: Option<&Group>,
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>> {
+        let (start, end) = bounds(&range);
+        self.run(|c| {
+            let Some(g) = group else {
+                return c.twa_req(series, start, end, 0, 0, 0, &[], opts);
+            };
+            let zone = match g.timezone.as_deref() {
+                None | Some("UTC") => return c.twa_req(series, start, end, 0, g.unit as u8, g.count, &[], opts),
+                Some(z) => z,
+            };
+            calendar::zone(zone)?;
+            c.need_version(6)?;
+            let (mut lo, mut hi) = (start, if end == i64::MAX { i64::MIN } else { end - 1 });
+            if start == i64::MIN {
+                match c.edge_ts(series, start, end, Order::Asc)? {
+                    Some(t) => lo = t,
+                    None => return Ok(Vec::new()),
+                }
+            }
+            if end == i64::MAX {
+                match c.edge_ts(series, start, end, Order::Desc)? {
+                    Some(t) => hi = t,
+                    None => return Ok(Vec::new()),
+                }
+            }
+            if lo > hi {
+                return Ok(Vec::new());
+            }
+            let b = calendar::calendar_bounds(zone, g.unit, g.count, lo..hi.saturating_add(1))?;
+            check_bounds(&b)?;
+            c.twa_req(series, start, end, 0, 0, 0, &b, opts)
+        })
+    }
+
+    /// Time-weighted averages in buckets with the given bounds: segments before `bounds[0]`
+    /// do not count, the last bucket ends at the end of the range.
+    pub fn query_twa_bounds(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        bounds: &[i64],
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>> {
+        let (start, end) = self::bounds(&range);
+        check_bounds(bounds)?;
+        self.run(|c| c.twa_req(series, start, end, 0, 0, 0, bounds, opts))
+    }
+
+    /// QUERY_TWA.
+    #[allow(clippy::too_many_arguments)]
+    fn twa_req(
+        &mut self,
+        series: u32,
+        start: i64,
+        end: i64,
+        interval: i64,
+        unit: u8,
+        count: u32,
+        b: &[i64],
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>> {
+        if b.len() > (MAX_FRAME - 64 - TWA_HEADER) / 8 {
+            return Err(Error::InvalidArgument(format!("{} bucket bounds", b.len())));
+        }
+        self.need_version(6)?;
+        let Some(limit) = opts.query_opts().wire_limit() else {
+            return Ok(Vec::new());
+        };
+        self.request(Op::QueryTwa, |f| {
+            f.u32(series)
+                .i64(start)
+                .i64(end)
+                .u8(opts.method as u8)
+                .u8((opts.order == Order::Desc) as u8)
+                .u8(unit)
+                .u8(0)
+                .i64(opts.max_gap_ms)
+                .u64(limit)
+                .i64(interval)
+                .u32(count)
+                .u32(b.len() as u32)
+                .i64s(b);
+        })?;
+        self.req.shrink();
+        let mut r = Cursor::new(&self.body);
+        let n = r.u32()? as usize;
+        if r.remaining() != n * TWA_ROW {
+            return Err(Error::Protocol(format!("{n} TWA buckets in {} bytes", r.remaining())));
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(TwaBucket {
                 start: r.i64()?,
+                twa: r.f64()?,
+                area: r.f64()?,
+                covered_ms: r.i64()?,
                 count: r.u64()?,
-                sum: r.f64()?,
-                min: r.f64()?,
-                max: r.f64()?,
-                isum: r.i64()?,
-                imin: r.i64()?,
-                imax: r.i64()?,
             });
         }
         Ok(out)
@@ -1423,8 +1803,14 @@ impl Client {
     /// without sending it. Pending inserts are collected first, so that their errors are not
     /// taken for an old server.
     fn need_deletes(&mut self) -> Result<()> {
+        self.need_version(7)
+    }
+
+    /// [`Status::Invalid`], as an older server would answer the unknown op or the longer
+    /// request, without sending it to a server whose HELLO says less than `v`.
+    fn need_version(&mut self, v: u32) -> Result<()> {
         self.wait_inner()?;
-        if self.server_version()? < 7 {
+        if self.server_version()? < v {
             return Err(Error::Server(Status::Invalid));
         }
         Ok(())
@@ -1587,6 +1973,31 @@ impl Client {
         self.stream.read_exact(&mut self.body)?;
         Ok(word(9) as i32)
     }
+}
+
+/// The 64 bytes of a bucket in a QUERY_BUCKETS or QUERY_BOUNDS reply.
+fn read_bucket(r: &mut Cursor<'_>) -> Result<Bucket> {
+    Ok(Bucket {
+        start: r.i64()?,
+        count: r.u64()?,
+        sum: r.f64()?,
+        min: r.f64()?,
+        max: r.f64()?,
+        isum: r.i64()?,
+        imin: r.i64()?,
+        imax: r.i64()?,
+    })
+}
+
+/// Bucket bounds a request can carry: some, strictly increasing.
+fn check_bounds(b: &[i64]) -> Result<()> {
+    if b.is_empty() || b.len() > (MAX_FRAME - 64) / 8 {
+        return Err(Error::InvalidArgument(format!("{} bucket bounds", b.len())));
+    }
+    if let Some(i) = b.windows(2).position(|w| w[0] >= w[1]) {
+        return Err(Error::InvalidArgument(format!("bucket bounds do not increase at index {}", i + 1)));
+    }
+    Ok(())
 }
 
 fn status_result(status: i32) -> Result<()> {

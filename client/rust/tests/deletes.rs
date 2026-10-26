@@ -1,5 +1,5 @@
 //! Range deletes, replaces and retention (protocol version 7) against a real tsdbd, and what the
-//! client does with an older server.
+//! client does with an older server, for these and the queries of versions 5 to 9.
 
 mod common;
 
@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{Server, T0};
-use tsdb_client::{Bitmap, Client, Column, ColumnRef, Error, QueryOpts, Status, ValueType};
+use tsdb_client::{Bitmap, Client, Column, ColumnRef, Error, Group, QueryOpts, Status, TwaOpts, Unit, ValueType};
 
 fn invalid<T: std::fmt::Debug>(r: Result<T, Error>) -> bool {
     r.unwrap_err().status() == Some(Status::Invalid)
@@ -136,6 +136,37 @@ fn an_older_server_is_not_asked() {
         assert!(invalid(c.replace_range(1, .., &[T0], &[1i64])));
         assert!(invalid(c.set_retention(1, 1000)));
         assert!(invalid(c.retention(1)));
+        assert!(!c.is_broken());
+        c.close().unwrap();
+        assert_eq!(h.join().unwrap(), vec![1], "version {version}: HELLO only");
+    }
+}
+
+#[test]
+fn newer_queries_are_not_sent_to_an_older_server() {
+    for version in 4..=8u32 {
+        let (addr, h) = old_server(version);
+        let mut c = Client::connect(addr).unwrap();
+        let day = Group::new(Unit::Day).timezone("Europe/Oslo");
+        if version < 5 {
+            assert!(invalid(c.query_lttb(1, .., 100, QueryOpts::asc())));
+        }
+        if version < 6 {
+            assert!(invalid(c.query_twa(1, .., 0, TwaOpts::step())));
+            assert!(invalid(c.query_twa_group(1, .., Some(&Group::new(Unit::Hour)), TwaOpts::linear())));
+            assert!(invalid(c.query_twa_group(1, 0..1000, Some(&day), TwaOpts::step())));
+            assert!(invalid(c.query_twa_bounds(1, .., &[0, 10], TwaOpts::step())));
+        }
+        // the spread needs 8, LTTB with order or limit 9, whatever the limit
+        if version < 8 {
+            assert!(invalid(c.query_spread(1, .., 0, QueryOpts::asc())));
+            assert!(invalid(c.query_spread(1, .., 0, QueryOpts::asc().limit(0))));
+            assert!(invalid(c.query_spread_group(1, .., Some(&Group::new(Unit::Hour)), QueryOpts::desc())));
+            assert!(invalid(c.query_spread_group(1, .., Some(&day), QueryOpts::asc())));
+            assert!(invalid(c.query_spread_bounds(1, .., &[0, 10], QueryOpts::asc())));
+        }
+        assert!(invalid(c.query_lttb(1, .., 100, QueryOpts::desc())));
+        assert!(invalid(c.query_lttb(1, .., 100, QueryOpts::asc().limit(10))));
         assert!(!c.is_broken());
         c.close().unwrap();
         assert_eq!(h.join().unwrap(), vec![1], "version {version}: HELLO only");

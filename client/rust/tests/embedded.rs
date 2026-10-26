@@ -13,7 +13,7 @@ use std::sync::Arc;
 use common::{Server, T0, test_dir};
 use tsdb_client::{
     Bitmap, Bucket, Column, ColumnRef, Database, Db, Error, Group, NULL_F32_BITS, NULL_F64_BITS, Options, QueryOpts,
-    RawValues, Rows, Status, Unit, ValueType,
+    RawValues, Rows, Status, TwaOpts, Unit, ValueType,
 };
 
 const DAY: i64 = 86_400_000;
@@ -294,6 +294,106 @@ fn maintenance(db: &mut impl Database) {
     assert!(q.rows_from_stats > 0, "{q:?}");
 }
 
+fn spread_twa_and_lttb(db: &mut impl Database) {
+    let id = db.series_create("calc", ValueType::Float64, None).unwrap();
+    db.insert_series_values(id, &[T0, T0 + 1000, T0 + 3000, T0 + 4000], &[10.0, 20.0, 30.0, 40.0][..]).unwrap();
+
+    // aggregates with order and limit
+    let sec = db.query_agg_ex(id, .., 1000, QueryOpts::desc().limit(2)).unwrap();
+    assert_eq!(sec.iter().map(|b| (b.start, b.sum)).collect::<Vec<_>>(), vec![(T0 + 4000, 40.0), (T0 + 3000, 30.0)]);
+    assert!(db.query_agg_ex(id, .., 1000, QueryOpts::asc().limit(0)).unwrap().is_empty());
+    assert_eq!(db.query_agg_ex(id, .., 0, QueryOpts::asc()).unwrap(), db.query_agg(id, .., 0).unwrap());
+    assert_eq!(status(db.query_agg_ex(id, .., -1, QueryOpts::asc())), Some(Status::Invalid));
+
+    // the spread of 10, 20, 30, 40
+    let s = db.query_spread(id, .., 0, QueryOpts::asc()).unwrap();
+    assert_eq!(s.len(), 1);
+    assert_eq!((s[0].bucket.count, s[0].bucket.sum, s[0].range), (4, 100.0, 30.0));
+    assert_eq!((s[0].var_pop, s[0].stddev_pop), (125.0, 125f64.sqrt()));
+    assert!((s[0].var_samp - 500.0 / 3.0).abs() < 1e-9, "{s:?}");
+    let per_2s = db.query_spread(id, .., 2000, QueryOpts::desc()).unwrap();
+    assert_eq!(per_2s.iter().map(|b| b.bucket.start).collect::<Vec<_>>(), vec![T0 + 4000, T0 + 2000, T0]);
+    assert!(per_2s[0].var_samp.is_nan(), "one value has no sample variance");
+    let g = db.query_spread_group(id, .., Some(&Group::new(Unit::Second).count(2)), QueryOpts::desc()).unwrap();
+    assert_eq!(format!("{g:?}"), format!("{per_2s:?}")); // NaN != NaN
+    let day = db.query_spread_group(id, .., Some(&Group::new(Unit::Day).timezone("Europe/Oslo")), QueryOpts::asc());
+    assert_eq!(day.unwrap()[0].var_pop, 125.0);
+    let b = db.query_spread_bounds(id, .., &[T0, T0 + 3000], QueryOpts::asc().limit(1)).unwrap();
+    assert_eq!((b.len(), b[0].bucket.count, b[0].range, b[0].var_pop), (1, 2, 10.0, 25.0));
+    assert!(db.query_spread(id, .., 0, QueryOpts::asc().limit(0)).unwrap().is_empty());
+    assert!(matches!(db.query_spread_bounds(id, .., &[], QueryOpts::asc()), Err(Error::InvalidArgument(_))));
+
+    // time-weighted: 10 for 1 s, 20 for 2 s, 30 for 1 s; 40 has no segment
+    let r = T0..T0 + 5000;
+    let step = db.query_twa(id, r.clone(), 0, TwaOpts::step()).unwrap();
+    assert_eq!((step[0].area, step[0].covered_ms, step[0].count), (80_000.0, 4000, 4));
+    assert_eq!(step[0].twa, 20.0);
+    let lin = db.query_twa(id, r.clone(), 0, TwaOpts::linear()).unwrap();
+    assert_eq!((lin[0].area, lin[0].covered_ms), (15_000.0 + 50_000.0 + 35_000.0, 4000));
+    let gap = db.query_twa(id, r.clone(), 0, TwaOpts::step().max_gap(1500)).unwrap();
+    assert_eq!((gap[0].area, gap[0].covered_ms), (40_000.0, 2000));
+    let secs = db.query_twa(id, r.clone(), 1000, TwaOpts::step().desc().limit(2)).unwrap();
+    // the last reading holds nothing (no later reading ends its segment) but is counted
+    assert_eq!((secs.len(), secs[0].start, secs[0].count, secs[0].covered_ms), (2, T0 + 4000, 1, 0));
+    assert!(secs[0].twa.is_nan());
+    assert_eq!((secs[1].start, secs[1].twa), (T0 + 3000, 30.0));
+    let g = db.query_twa_group(id, r.clone(), Some(&Group::new(Unit::Second)), TwaOpts::step()).unwrap();
+    assert_eq!(format!("{g:?}"), format!("{:?}", db.query_twa(id, r.clone(), 1000, TwaOpts::step()).unwrap()));
+    assert_eq!(db.query_twa_group(id, r.clone(), None, TwaOpts::step()).unwrap(), step);
+    let local =
+        db.query_twa_group(id, r.clone(), Some(&Group::new(Unit::Day).timezone("Europe/Oslo")), TwaOpts::step());
+    assert_eq!(local.unwrap().iter().map(|b| b.area).sum::<f64>(), 80_000.0);
+    let b = db.query_twa_bounds(id, r.clone(), &[T0 + 500, T0 + 2000], TwaOpts::step()).unwrap();
+    assert_eq!(
+        b.iter().map(|b| (b.start, b.area)).collect::<Vec<_>>(),
+        vec![(T0 + 500, 25_000.0), (T0 + 2000, 50_000.0)]
+    );
+    assert!(db.query_twa(id, r.clone(), 0, TwaOpts::step().limit(0)).unwrap().is_empty());
+    assert_eq!(status(db.query_twa(id, r.clone(), -1, TwaOpts::step())), Some(Status::Invalid));
+    let st = db.series_create("calc.state", ValueType::State, None).unwrap();
+    assert_eq!(status(db.query_twa(st, .., 0, TwaOpts::step())), Some(Status::Invalid));
+
+    // LTTB: the first and last points always, the same choice in any order and limit
+    let wave = db.series_create("wave", ValueType::Float32, None).unwrap();
+    let ts: Vec<i64> = (0..1000).map(|i| T0 + i * 1000).collect();
+    let v: Vec<f32> = (0..1000).map(|i| ((i as f32) / 30.0).sin() * 100.0).collect();
+    db.insert_series(wave, &ts, &v).unwrap();
+    let all = db.query_lttb(wave, .., 50, QueryOpts::asc()).unwrap();
+    assert_eq!(all.len(), 50);
+    assert_eq!((all.ts[0], all.ts[49]), (T0, T0 + 999_000));
+    let desc = db.query_lttb(wave, .., 50, QueryOpts::desc()).unwrap();
+    assert_eq!(desc.ts, all.ts.iter().rev().copied().collect::<Vec<_>>());
+    let last3 = db.query_lttb(wave, .., 50, QueryOpts::desc().limit(3)).unwrap();
+    assert_eq!(last3.ts, desc.ts[..3]);
+    let first3 = db.query_lttb(wave, .., 50, QueryOpts::asc().limit(3)).unwrap();
+    assert_eq!(first3.ts, all.ts[..3]);
+    let none = db.query_lttb(wave, .., 50, QueryOpts::asc().limit(0)).unwrap();
+    assert_eq!((none.len(), none.value_type()), (0, ValueType::Float32));
+    let few = db.query_lttb(wave, T0..T0 + 10_000, 50, QueryOpts::asc()).unwrap();
+    assert_eq!(few.len(), 10, "fewer points than the threshold: all of them");
+    assert_eq!(status(db.query_lttb(wave, .., 2, QueryOpts::asc())), Some(Status::Invalid));
+    assert_eq!(status(db.query_lttb(st, .., 10, QueryOpts::asc())), Some(Status::Invalid));
+}
+
+fn deletes_and_retention(db: &mut impl Database) {
+    let id = db.series_create("del", ValueType::Int64, None).unwrap();
+    let ts: Vec<i64> = (0..10).map(|i| T0 + i * 1000).collect();
+    db.insert_series_values(id, &ts, &(0..10).collect::<Vec<i64>>()[..]).unwrap();
+    db.delete_range(id, T0 + 2000..T0 + 5000).unwrap();
+    let r = db.query_rows(id, .., QueryOpts::asc()).unwrap();
+    assert_eq!(r.ts, [0, 1, 5, 6, 7, 8, 9].map(|i| T0 + i * 1000));
+    db.replace_range(id, T0 + 5000..T0 + 8000, &[T0 + 5500], &[55i64][..]).unwrap();
+    let r = db.query_rows(id, .., QueryOpts::asc()).unwrap();
+    assert_eq!(r.ts, vec![T0, T0 + 1000, T0 + 5500, T0 + 8000, T0 + 9000]);
+    assert_eq!(rows_key(&r), rows_key(&Rows { ts: r.ts.clone(), values: Column::new(vec![0i64, 1, 55, 8, 9]) }));
+    let outside = db.replace_range(id, T0..T0 + 1000, &[T0 + 1000], &[1i64][..]);
+    assert_eq!(status(outside), Some(Status::Invalid));
+    assert_eq!(db.retention(id).unwrap(), 0);
+    db.set_retention(id, 30 * DAY).unwrap();
+    assert_eq!(db.retention(id).unwrap(), 30 * DAY);
+    assert!(db.query_rows(id, .., QueryOpts::asc()).unwrap().is_empty(), "T0 is long before now - 30 days");
+}
+
 macro_rules! both {
     ($($name:ident),*) => {
         mod on_embedded {
@@ -313,6 +413,8 @@ both!(
     last_write_wins,
     order_and_limit,
     aggregates_groups_and_bounds,
+    spread_twa_and_lttb,
+    deletes_and_retention,
     maintenance
 );
 
@@ -558,5 +660,44 @@ fn answers(db: &mut impl Database, name: &str, range: std::ops::Range<i64>, grou
     for interval in [0, 60_000, 86_400_000] {
         out.push(buckets_key(&db.query_agg(id, range.clone(), interval).unwrap()));
     }
+    // protocol 8 and 9: aggregates with order and limit, the spread, time-weighted averages, LTTB
+    let b = [range.start, range.start + 3_600_000, range.start + 90_000_000];
+    for o in [QueryOpts::asc(), QueryOpts::desc().limit(7), QueryOpts::asc().limit(1)] {
+        for interval in [0, 60_000, 86_400_000] {
+            out.push(buckets_key(&db.query_agg_ex(id, range.clone(), interval, o).unwrap()));
+            out.push(key(db.query_spread(id, range.clone(), interval, o)));
+        }
+        for g in groups {
+            out.push(key(db.query_spread_group(id, range.clone(), Some(g), o)));
+        }
+        out.push(key(db.query_spread_bounds(id, .., &b, o)));
+        for t in [3, 100, 5000] {
+            out.push(key(db.query_lttb(id, range.clone(), t, o).map(|r| rows_key(&r))));
+        }
+        out.push(key(db.query_lttb(id, .., 500, o).map(|r| rows_key(&r))));
+    }
+    for t in [
+        TwaOpts::step(),
+        TwaOpts::linear(),
+        TwaOpts::step().max_gap(10_000).desc(),
+        TwaOpts::linear().max_gap(7_000).limit(5),
+    ] {
+        for interval in [0, 60_000, 86_400_000] {
+            out.push(key(db.query_twa(id, range.clone(), interval, t)));
+        }
+        for g in groups {
+            out.push(key(db.query_twa_group(id, range.clone(), Some(g), t)));
+            out.push(key(db.query_twa_group(id, .., Some(g), t)));
+        }
+        out.push(key(db.query_twa_bounds(id, range.clone(), &b, t)));
+    }
     out
+}
+
+/// An answer or the error, to compare as text (Debug prints floats exactly).
+fn key<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
+    match r {
+        Ok(v) => format!("{v:?}"),
+        Err(e) => format!("error {:?}", e.status()),
+    }
 }

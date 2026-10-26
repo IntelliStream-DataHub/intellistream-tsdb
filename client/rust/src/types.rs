@@ -163,6 +163,111 @@ impl Bucket {
     }
 }
 
+/// A [`Bucket`] with the spread of its known values (protocol version 8):
+/// `range` is max - min; the population variance and standard deviation
+/// divide by `count`, the sample ones by `count - 1` (NaN for one value). All
+/// are NaN for a bucket without known values and for state series; a NaN or an
+/// infinity among the values makes the variances NaN, not the range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpreadBucket {
+    /// Count, sum, min and max, as from the plain queries.
+    pub bucket: Bucket,
+    /// `max - min`.
+    pub range: f64,
+    /// Population variance.
+    pub var_pop: f64,
+    /// Sample variance.
+    pub var_samp: f64,
+    /// Population standard deviation.
+    pub stddev_pop: f64,
+    /// Sample standard deviation.
+    pub stddev_samp: f64,
+}
+
+/// How a time-weighted average joins two readings (`tsdb_twa_method`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TwaMethod {
+    /// Each value holds until the next reading (last observation carried
+    /// forward); a null reading ends the previous value.
+    #[default]
+    Step,
+    /// The value runs on a straight line from one reading to the next; a
+    /// segment with a null at either end covers nothing.
+    Linear,
+}
+
+/// Options of the time-weighted average queries.
+///
+/// ```
+/// use tsdb_client::{TwaMethod, TwaOpts};
+/// let o = TwaOpts::linear().max_gap(60_000).desc().limit(10);
+/// assert_eq!(o.method, TwaMethod::Linear);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct TwaOpts {
+    /// Step (the default) or linear.
+    pub method: TwaMethod,
+    /// A segment longer than this covers nothing (the value is stale); 0: no limit.
+    pub max_gap_ms: i64,
+    /// Order of the buckets.
+    pub order: Order,
+    /// At most this many buckets; `None` returns all of them, `Some(0)` none.
+    pub limit: Option<u64>,
+}
+
+impl TwaOpts {
+    /// Step, no gap limit, ascending, no limit.
+    pub fn step() -> Self {
+        TwaOpts::default()
+    }
+
+    /// Linear interpolation, otherwise as [`step`](TwaOpts::step).
+    pub fn linear() -> Self {
+        TwaOpts { method: TwaMethod::Linear, ..TwaOpts::default() }
+    }
+
+    /// Sets the longest segment that still counts.
+    pub fn max_gap(mut self, ms: i64) -> Self {
+        self.max_gap_ms = ms;
+        self
+    }
+
+    /// Newest bucket first.
+    pub fn desc(mut self) -> Self {
+        self.order = Order::Desc;
+        self
+    }
+
+    /// Sets the limit.
+    pub fn limit(mut self, n: u64) -> Self {
+        self.limit = Some(n);
+        self
+    }
+
+    /// The order and limit as [`QueryOpts`].
+    pub(crate) fn query_opts(&self) -> QueryOpts {
+        QueryOpts { order: self.order, limit: self.limit }
+    }
+}
+
+/// One bucket of a time-weighted average.
+///
+/// `area` and `covered_ms` add up across buckets: the average over several
+/// buckets is the sum of their areas over the sum of their `covered_ms`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TwaBucket {
+    /// The bucket's start in ms since the epoch; for a single bucket, the query's start.
+    pub start: i64,
+    /// `area / covered_ms`, NaN when nothing is covered.
+    pub twa: f64,
+    /// The integral of the value over time, in value x ms.
+    pub area: f64,
+    /// The time covered by segments, in ms.
+    pub covered_ms: i64,
+    /// Known readings in the bucket and in the query's range.
+    pub count: u64,
+}
+
 /// Raw points of one series, as two columns of equal length.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Points {

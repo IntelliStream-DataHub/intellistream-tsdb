@@ -6,7 +6,7 @@ use std::ops::{ControlFlow, RangeBounds};
 
 use crate::client::Client;
 use crate::error::Result;
-use crate::types::{Bucket, Group, Points, QueryOpts, QueryStats, Rows, Stats};
+use crate::types::{Bucket, Group, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts};
 use crate::value::{Column, ColumnRef, Value, ValueType};
 
 /// What both a remote [`Client`] and an embedded `Db` (feature `embedded`) can do.
@@ -60,6 +60,72 @@ pub trait Database {
         bounds: &[i64],
         opts: QueryOpts,
     ) -> Result<Vec<Bucket>>;
+    fn query_agg_ex(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: QueryOpts,
+    ) -> Result<Vec<Bucket>>;
+    fn query_spread(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>>;
+    fn query_spread_group(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        group: Option<&Group>,
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>>;
+    fn query_spread_bounds(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        bounds: &[i64],
+        opts: QueryOpts,
+    ) -> Result<Vec<SpreadBucket>>;
+    fn query_twa(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>>;
+    fn query_twa_group(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        group: Option<&Group>,
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>>;
+    fn query_twa_bounds(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        bounds: &[i64],
+        opts: TwaOpts,
+    ) -> Result<Vec<TwaBucket>>;
+    fn query_lttb(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        threshold: u64,
+        opts: QueryOpts,
+    ) -> Result<Rows>;
+    fn delete_range(&mut self, series: u32, range: impl RangeBounds<i64>) -> Result<()>;
+    fn replace_range<'a>(
+        &mut self,
+        series: u32,
+        range: impl RangeBounds<i64>,
+        ts: &[i64],
+        values: impl Into<ColumnRef<'a>>,
+    ) -> Result<()>;
+    fn set_retention(&mut self, series: u32, limit_ms: i64) -> Result<()>;
+    fn retention(&mut self, series: u32) -> Result<i64>;
     fn commit(&mut self) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
     fn optimize(&mut self) -> Result<()>;
@@ -152,6 +218,48 @@ macro_rules! forward {
                 opts: QueryOpts,
             ) -> Result<Vec<Bucket>> {
                 <$t>::query_bounds(self, series, range, bounds, opts)
+            }
+            fn query_agg_ex(&mut self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64, opts: QueryOpts) -> Result<Vec<Bucket>> {
+                <$t>::query_agg_ex(self, series, range, interval_ms, opts)
+            }
+            fn query_spread(&mut self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64, opts: QueryOpts) -> Result<Vec<SpreadBucket>> {
+                <$t>::query_spread(self, series, range, interval_ms, opts)
+            }
+            fn query_spread_group(&mut self, series: u32, range: impl RangeBounds<i64>, group: Option<&Group>, opts: QueryOpts) -> Result<Vec<SpreadBucket>> {
+                <$t>::query_spread_group(self, series, range, group, opts)
+            }
+            fn query_spread_bounds(&mut self, series: u32, range: impl RangeBounds<i64>, bounds: &[i64], opts: QueryOpts) -> Result<Vec<SpreadBucket>> {
+                <$t>::query_spread_bounds(self, series, range, bounds, opts)
+            }
+            fn query_twa(&mut self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64, opts: TwaOpts) -> Result<Vec<TwaBucket>> {
+                <$t>::query_twa(self, series, range, interval_ms, opts)
+            }
+            fn query_twa_group(&mut self, series: u32, range: impl RangeBounds<i64>, group: Option<&Group>, opts: TwaOpts) -> Result<Vec<TwaBucket>> {
+                <$t>::query_twa_group(self, series, range, group, opts)
+            }
+            fn query_twa_bounds(&mut self, series: u32, range: impl RangeBounds<i64>, bounds: &[i64], opts: TwaOpts) -> Result<Vec<TwaBucket>> {
+                <$t>::query_twa_bounds(self, series, range, bounds, opts)
+            }
+            fn query_lttb(&mut self, series: u32, range: impl RangeBounds<i64>, threshold: u64, opts: QueryOpts) -> Result<Rows> {
+                <$t>::query_lttb(self, series, range, threshold, opts)
+            }
+            fn delete_range(&mut self, series: u32, range: impl RangeBounds<i64>) -> Result<()> {
+                <$t>::delete_range(self, series, range)
+            }
+            fn replace_range<'a>(
+                &mut self,
+                series: u32,
+                range: impl RangeBounds<i64>,
+                ts: &[i64],
+                values: impl Into<ColumnRef<'a>>,
+            ) -> Result<()> {
+                <$t>::replace_range(self, series, range, ts, values)
+            }
+            fn set_retention(&mut self, series: u32, limit_ms: i64) -> Result<()> {
+                <$t>::set_retention(self, series, limit_ms)
+            }
+            fn retention(&mut self, series: u32) -> Result<i64> {
+                <$t>::retention(self, series)
             }
             fn commit(&mut self) -> Result<()> {
                 <$t>::commit(self)
