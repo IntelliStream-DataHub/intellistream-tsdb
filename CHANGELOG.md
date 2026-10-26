@@ -47,6 +47,9 @@ disk format and the wire protocol.
   (`merge_idle_s`) or on `tsdb_optimize`. A database of format 5 is refused at open; carry it over with
   `tsdb <dir> export` from the release that wrote it and `tsdb <newdir> import` with this one
   ([docs/compatibility.md](docs/compatibility.md)).
+- Values: a float64 series fed float32 readings (a collector that widens what the sensor gives it) stores them as
+  float32, exactly (every bit of every value comes back): the UCI hydraulic rig widened to float64 takes 0.45 times
+  the space (as much as stored as float32) and inserts in 0.67 times the time; real doubles are unaffected.
 - Values: float32 and float64 decode faster (fixed point with a 4-lane prefix sum), and AUTO adds packed bit
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 

@@ -427,6 +427,30 @@ static void make_inputs(void)
         }
     }
 
+    /* float64 series fed float32 readings (BLK_F32_WIDE): the sensor streams widened, with the specials that
+     * survive the float32 round trip, and with one value that does not, late in the block */
+    for (int k = 0; k < DS_KINDS; k++) {
+        ds_state st;
+        snprintf(name, sizeof name, "f64 widened %s", ds_info[k].name);
+        x = add(name, TSDB_FLOAT64, GR);
+        ds_init(&st, (ds_kind)k, 5, 1704067200000);
+        for (size_t i = 0; i < GR; i++) {
+            float f;
+            ds_next(&st, &x->ts[i], &f);
+            ((double *)x->v)[i] = f;
+        }
+    }
+    static const uint64_t wide_sp[] = {NULL_F64, 0x8000000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+                                       0x7ff8000000000000ull, 0xfff8000000000000ull, 0x36a0000000000000ull,
+                                       0x47efffffe0000000ull /* FLT_MAX */, 0x3fb99999a0000000ull /* 0.1f */};
+    for (int t = 0; t < 2; t++) {
+        x = add(t ? "f64 widened specials and a double" : "f64 widened specials", TSDB_FLOAT64, GR);
+        for (size_t i = 0; i < GR; i++)
+            ((uint64_t *)x->v)[i] = wide_sp[next() % 9];
+        if (t)
+            ((uint64_t *)x->v)[GR - 5] = 0x7ff8020020000000ull; /* the float32 null widened: not one */
+    }
+
     /* timestamps: regular, jittered, random gaps, duplicates, negative, extremes */
     x = add("ts jitter", TSDB_INT64, GR);
     for (size_t i = 0; i < GR; i++)

@@ -349,8 +349,9 @@ static inline bool dec_int(float v, int e, int64_t *k)
 
 static int dec_width(uint64_t maxz) { return maxz < (1u << 8) ? 1 : maxz < (1u << 16) ? 2 : maxz < (1ull << 32) ? 4 : 8; }
 
-/* Cost in bytes of scale e on a few runs of consecutive values. */
-static double dec_sample_cost(const float *in, size_t n, int e)
+/* Cost in bytes of scale e on a few runs of consecutive values: whole bytes a delta (as `decimal` stores them), or
+ * with `bits` the bits bit-packing needs, in bytes. */
+static double dec_sample_cost(const float *in, size_t n, int e, bool bits)
 {
     enum { RUNS = 4, RUN = 16 };
     size_t run = MIN((size_t)RUN, n), tried = 0, exc = 0;
@@ -376,7 +377,8 @@ static double dec_sample_cost(const float *in, size_t n, int e)
     }
     if (exc * 4 > tried)
         return INFINITY;
-    return (double)dec_width(maxz) + 8.0 * (double)exc / (double)tried;
+    double w = !bits ? dec_width(maxz) : maxz >> 32 ? 8.0 : bits_for((uint32_t)maxz) / 8.0;
+    return w + 8.0 * (double)exc / (double)tried;
 }
 
 /* The integers of in at the best scale, as zigzag deltas z[0..n-1) (z[i] is
@@ -389,18 +391,19 @@ typedef struct dec_res {
     size_t nexc;
 } dec_res;
 
-static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_res *r, int64_t *keep)
+/* compact: only for deltas the sample puts under 16 bits (a block that bit-packs into 16 bits a value or less) */
+static bool dec_core(const float *in, size_t n, uint32_t *z, uint8_t *exc, dec_res *r, int64_t *keep, bool compact)
 {
     int best_e = -1;
     double best = INFINITY;
     for (int e = 0; e <= DEC_MAX_EXP && best > 1.0; e++) { /* 1.0: 1-byte deltas, no exceptions */
-        double cost = dec_sample_cost(in, n, e);
+        double cost = dec_sample_cost(in, n, e, false);
         if (cost < best - 1e-9) {
             best = cost;
             best_e = e;
         }
     }
-    if (best_e < 0 || best >= 4.5)
+    if (best_e < 0 || best >= 4.5 || (compact && dec_sample_cost(in, n, best_e, true) >= 2.0))
         return false;
     /* two loops: a branch-free one the compiler vectorizes (integer and
      * exactness of every value), then deltas and exceptions */
@@ -467,7 +470,7 @@ size_t decimal_encode(const float *in, size_t n, uint8_t *out)
     uint32_t *z = malloc(n * sizeof *z);
     uint8_t *exc = malloc((n / 16 + 1) * 8);
     dec_res r;
-    if (!z || !exc || !dec_core(in, n, z, exc, &r, NULL)) {
+    if (!z || !exc || !dec_core(in, n, z, exc, &r, NULL, false)) {
         free(z);
         free(exc);
         return 0;
@@ -513,14 +516,15 @@ size_t decimal_bp_encode(const float *in, size_t n, uint8_t *out)
     return decimal_bp_encode_keep(in, n, out, NULL, &nexc);
 }
 
-size_t decimal_bp_encode_keep(const float *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc)
+/* compact: see dec_core */
+static size_t dbp_encode(const float *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc, bool compact)
 {
     if (n < 2)
         return 0;
     uint32_t *z = malloc(n * sizeof *z);
     uint8_t *exc = malloc((n / 16 + 1) * 8);
     dec_res r;
-    if (!z || !exc || !dec_core(in, n, z, exc, &r, keep)) {
+    if (!z || !exc || !dec_core(in, n, z, exc, &r, keep, compact)) {
         free(z);
         free(exc);
         return 0;
@@ -546,6 +550,11 @@ size_t decimal_bp_encode_keep(const float *in, size_t n, uint8_t *out, int64_t *
     free(exc);
     *nexc = r.nexc;
     return (size_t)(o - out);
+}
+
+size_t decimal_bp_encode_keep(const float *in, size_t n, uint8_t *out, int64_t *keep, size_t *nexc)
+{
+    return dbp_encode(in, n, out, keep, nexc, false);
 }
 
 int decimal_bp_decode(const uint8_t *in, size_t len, size_t n, float *out)
@@ -930,6 +939,7 @@ void codec_free(codec_ctx *c)
     free(c->scratch);
     free(c->alt);
     free(c->work);
+    free(c->narrow);
     free(c);
 }
 
@@ -1174,12 +1184,14 @@ size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v
         int kind = value_codec == TSDB_VALUES_GORILLA ? BLK_GORILLA : BLK_CHIMP;
         return block_wrap(c, level, kind, encode_f32_kind(kind, v, n, c->scratch), out);
     }
-    bool merge = c->effort == CODEC_MERGE;
+    bool merge = c->effort == CODEC_MERGE, fixed_only = value_codec == VALUES_FIXED_ONLY;
     int64_t *q = merge && codec_work_reserve(c, DICT_WORK(n)) == 0 ? (int64_t *)(void *)c->work : NULL;
-    size_t nexc = 0, inner = decimal_bp_encode_keep(v, n, c->scratch, q, &nexc);
+    size_t nexc = 0, inner = dbp_encode(v, n, c->scratch, q, &nexc, fixed_only);
     if (inner && inner * 8 <= 16 * n) /* compact fixed point: only a dictionary comes close */
         return merge ? fixed_or_dict(c, level, BLK_DECIMAL_BP, inner, q, nexc, v, n, 4, out)
                      : block_wrap(c, level, BLK_DECIMAL_BP, inner, out);
+    if (fixed_only)
+        return 0;
     /* every float32 is "decimal" at ~8 digits; then it is just one more candidate */
     static const int kinds[] = {BLK_DECIMAL_BP, BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DELTA_BP};
     return auto_pick(c, level, kinds, sizeof kinds / sizeof *kinds, encode_f32_kind, v, n, 4, BLK_DECIMAL_BP, inner,

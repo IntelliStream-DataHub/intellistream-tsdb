@@ -703,6 +703,7 @@ What tsdb takes from ALP, codec by codec:
 | float64 fixed point | kind 11 | as `decimal_bp` | two ways to rebuild a value |
 | packed bit delta | kind 15, an AUTO candidate | bit-packing per vector of 1024 | zigzag deltas of the raw bit patterns, float32 and float64 |
 | dictionary | kind 16, a merge candidate | bit-packing per vector of 1024 | ranks among the distinct values, float32 and float64 |
+| float32 in float64 | kind 17, tried after float64 fixed point | | a float32 block inside a float64 one, for widened float32 readings |
 | `decimal` | kind 3, still read | sampling; exceptions | 1/2/4-byte deltas left to ZSTD; AUTO no longer writes it |
 
 #### Fixed point: `decimal_bp` (src/codec.c)
@@ -1146,6 +1147,22 @@ are random in their mantissa only the exponent repeats, and ALP_rd stores it
 in about 3 bits where byte split and ZSTD leave nearly 8. It loses on the
 smooth psi values (50.53 against 46.51 for the bit delta), so AUTO's
 comparison decides.
+
+**float32 readings in a float64 series** (kind 17, src/codec_typed.c): a collector that widens what a float32
+sensor gives it writes doubles like 35.099998474121094, which are no longer decimals and carry 29 zero bits at
+the bottom of every mantissa that XOR and byte split pay for anyway. When every value of a block widens back
+from a float32 to its exact bits (the float64 null maps to the float32 null; the double the float32 null widens
+to does not qualify, so the mapping is one to one), the block is stored as a whole float32 block behind one
+header byte, and decoding widens it back. NaN payloads, -0.0 and infinities survive. AUTO tries it after
+compact float64 fixed point, which real decimals take first, and 32 values probed across the block turn real
+doubles away before the full check (zeros and whole numbers are float32 too, so a scan from the start can run
+far). Inserts take it only when the float32 block is compact fixed point, which costs a sample and one pass;
+readings that are not (pressures converted to psi in float32, then widened) are left to inserts' float64
+candidates, and merges, which pick among all the float32 kinds, store them as float32. On the hydraulic rig's
+float32 files widened to float64 (17 sensors and the psi conversions), the merged database takes 0.45 times the
+space of format 5's (279.2 to 125.9 MB, about what the same readings take as float32) and the inserts 0.67 times
+the time; tsdb-bench's float32 readings stored as float64 come down from 144.1 to 111.4 MiB. True doubles insert
+at the speed they had.
 
 Block kinds name the transform; for kinds that exist at both widths (ALP_rd,
 the packed bit delta) the series' type, which lives in the SERIES dictionary,

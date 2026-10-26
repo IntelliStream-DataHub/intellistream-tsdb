@@ -139,6 +139,7 @@ uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 #define BLK_INT 14         /* int64: zigzag deltas bit-packed per 1024 values */
 #define BLK_DELTA_BP 15    /* float32 or float64: zigzag deltas of the bit patterns, bit-packed per 1024 */
 #define BLK_DICT 16        /* float32 or float64: sorted distinct values, ranks as bit-packed zigzag deltas */
+#define BLK_F32_WIDE 17    /* float64 that are all float32 values: a float32 block (never ZSTD-wrapped itself) */
 /* A kind names the transform; the series' type gives the width where both exist (BLK_ALPRD, BLK_DELTA_BP,
  * BLK_DICT). The header byte holds the kind in its low 7 bits (format 6; 4 bits before). */
 #define BLK_KIND_MASK 0x7f
@@ -155,6 +156,8 @@ typedef struct codec_ctx {
     size_t alt_cap;
     uint8_t *work; /* fixed point's integers and the dictionary's table of them (fixed_or_dict) */
     size_t work_cap;
+    uint8_t *narrow; /* float64 values as float32 (BLK_F32_WIDE), both ways */
+    size_t narrow_cap;
     int effort; /* CODEC_FAST or CODEC_MERGE, an input of AUTO like the values: the part writer sets it */
 } codec_ctx;
 
@@ -213,6 +216,8 @@ void codec_free(codec_ctx *c);
 size_t block_bound(size_t n);
 size_t block_encode_ts(codec_ctx *c, int level, const int64_t *ts, size_t n, uint8_t *out);
 /* Both return 0 when out of memory. */
+/* value_codec: TSDB_VALUES_*, or VALUES_FIXED_ONLY for compact fixed point (16 bits a value at most) or nothing */
+#define VALUES_FIXED_ONLY (-1)
 size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out);
 int block_decode_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int64_t *out);
 int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, float *out);

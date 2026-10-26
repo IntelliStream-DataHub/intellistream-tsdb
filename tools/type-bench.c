@@ -31,6 +31,7 @@ static const char *kind_name(int k)
     case BLK_DELTA_BP: return "bit-delta";
     case BLK_ALPRD: return "alp_rd";
     case BLK_DICT: return "dict";
+    case BLK_F32_WIDE: return "float32";
     default: return "?";
     }
 }

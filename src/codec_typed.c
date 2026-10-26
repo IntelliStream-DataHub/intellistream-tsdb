@@ -1100,8 +1100,114 @@ static size_t f64_fast(codec_ctx *c, int level, const double *v, size_t n, size_
     return best;
 }
 
-/* AUTO for float64: fixed point that fits in 16 bits a value is kept at once, otherwise f64_fast or, in
- * merges, auto_pick with a dictionary. */
+/* ------------------------------------------------------------- BLK_F32_WIDE */
+
+/*
+ * A float64 series fed float32 readings (a collector that widens what the sensor gives it) holds doubles like
+ * 35.099998474121094: no longer decimals, and with 29 zero bits at the bottom of every mantissa that XOR and
+ * byte split pay for anyway. Such a block is stored as the float32 values: a whole float32 block (its own kind,
+ * ZSTD and all, at the block's effort) behind one header byte, decoded and widened back to the same bits.
+ * Only values whose float32 widens back to their exact bits qualify, so NaN payloads, -0.0 and infinities
+ * survive; the float64 null maps to the float32 null, and the double that the float32 null widens to does not
+ * qualify, so the mapping is one to one. Compact float64 fixed point is kept as such before this is tried,
+ * and 32 probes across the block turn real doubles away (zeros and whole numbers are float32 too, so a scan from
+ * the start can run far): inserts of real doubles pay for a few dozen conversions a block. Inserts take only a
+ * compact fixed-point float32 block, decided on a sample before the full pass; float32 values that are not
+ * (pressures converted to psi, widened) go on to f64_fast at the speed they had, as the full float32 AUTO there
+ * ran at 0.6-0.75 times it, and merges, which pick among all the float32 kinds, store them as float32.
+ */
+static int narrow_reserve(codec_ctx *c, size_t need)
+{
+    if (c->narrow_cap >= need)
+        return 0;
+    uint8_t *p = realloc(c->narrow, need);
+    if (!p)
+        return TSDB_ERR_NOMEM;
+    c->narrow = p;
+    c->narrow_cap = need;
+    return 0;
+}
+
+/* Whether 32 values spread over the block are all float32 (or the null). */
+static bool f64_probe_f32(const double *v, size_t n)
+{
+    enum { PROBES = 32 };
+    size_t step = n > PROBES ? n / PROBES : 1;
+    uint32_t bad = 0;
+    for (size_t i = 0; i < n; i += step) {
+        uint64_t b, wb;
+        double w = (double)(float)v[i];
+        memcpy(&b, &v[i], 8);
+        memcpy(&wb, &w, 8);
+        bad |= (uint32_t)(wb != b) & (uint32_t)(b != NULL_F64);
+    }
+    return !bad;
+}
+
+/* The float32 bits of n doubles into f; false as soon as a run of them holds one that is not a float32. */
+static bool f64_narrow(const double *v, size_t n, uint32_t *f)
+{
+    enum { RUN = 64 }; /* vectorized within, an early exit between */
+    for (size_t i0 = 0; i0 < n; i0 += RUN) {
+        size_t end = MIN(n, i0 + RUN);
+        uint32_t bad = 0;
+        for (size_t i = i0; i < end; i++) {
+            uint64_t b, wb;
+            uint32_t u;
+            float x = (float)v[i];
+            double w = (double)x;
+            memcpy(&b, &v[i], 8);
+            memcpy(&u, &x, 4);
+            memcpy(&wb, &w, 8);
+            bool null = b == NULL_F64;
+            f[i] = null ? NULL_F32 : u;
+            bad |= null ? 0u : (uint32_t)(wb != b) | (uint32_t)(u == NULL_F32);
+        }
+        if (bad)
+            return false;
+    }
+    return true;
+}
+
+static void f32_widen(const uint32_t *f, size_t n, double *out)
+{
+    for (size_t i = 0; i < n; i++) {
+        float x;
+        memcpy(&x, &f[i], 4);
+        double w = (double)x;
+        uint64_t b;
+        memcpy(&b, &w, 8);
+        b = f[i] == NULL_F32 ? NULL_F64 : b;
+        memcpy(&out[i], &b, 8);
+    }
+}
+
+/* float32 values as a float32 block (at insert only compact fixed point), or 0. The first `keep` bytes of
+ * c->scratch survive at insert (they are copied aside); *tried: in merges, c->scratch and c->work were used. */
+static size_t f32_wide(codec_ctx *c, int level, const double *v, size_t n, uint8_t *out, size_t keep, bool *tried)
+{
+    if (!f64_probe_f32(v, n) || narrow_reserve(c, 4 * n) != 0 || !f64_narrow(v, n, (uint32_t *)(void *)c->narrow))
+        return 0;
+    bool merge = c->effort == CODEC_MERGE;
+    if (!merge && keep) {
+        if (codec_alt_reserve(c, MAX(keep, block_bound(n))) != 0)
+            return 0;
+        memcpy(c->alt, c->scratch, keep);
+    }
+    *tried = merge;
+    size_t len = block_encode_f32(c, level, merge ? TSDB_VALUES_AUTO : VALUES_FIXED_ONLY,
+                                  (const float *)(void *)c->narrow, n, out + 1);
+    if (len) {
+        out[0] = BLK_F32_WIDE;
+        return 1 + len;
+    }
+    if (!merge && keep)
+        memcpy(c->scratch, c->alt, keep);
+    return 0;
+}
+
+/* AUTO for float64: fixed point that fits in 16 bits a value is kept at once, then float32 values as a float32
+ * block, otherwise f64_fast or, in merges, auto_pick with a dictionary. */
 static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(f64_decimal_bound(n), xor64_bound(n)), 8 * n);
@@ -1114,6 +1220,12 @@ static size_t encode_f64(codec_ctx *c, int level, const double *v, size_t n, uin
     if (inner && inner * 8 <= 16 * n)
         return merge ? fixed_or_dict(c, level, BLK_F64_DECIMAL, inner, q, nexc, v, n, 8, out)
                      : block_wrap(c, level, BLK_F64_DECIMAL, inner, out);
+    bool tried = false;
+    size_t wide = f32_wide(c, level, v, n, out, inner, &tried);
+    if (wide)
+        return wide;
+    if (inner && tried) /* the float32 encoder wrote over it */
+        inner = f64_decimal_encode_keep(v, n, c->scratch, q, &nexc);
     if (!merge)
         return f64_fast(c, level, v, n, inner, out);
     static const int kinds[] = {BLK_F64_DECIMAL, BLK_XOR64, BLK_BYTESPLIT64, BLK_DELTA_BP, BLK_ALPRD};
@@ -1154,6 +1266,14 @@ int block_decode_vals(codec_ctx *c, int type, const uint8_t *blk, size_t len, si
     if (type == TSDB_FLOAT32)
         return block_decode_f32(c, blk, len, n, out);
     int kind, rc;
+    if (type == TSDB_FLOAT64 && len > 0 && blk[0] == BLK_F32_WIDE) { /* the inner block cannot be one */
+        if (narrow_reserve(c, 4 * n) != 0)
+            return TSDB_ERR_NOMEM;
+        if ((rc = block_decode_f32(c, blk + 1, len - 1, n, (float *)(void *)c->narrow)) != 0)
+            return rc;
+        f32_widen((const uint32_t *)(void *)c->narrow, n, out);
+        return 0;
+    }
     const uint8_t *p;
     size_t plen;
     if ((rc = block_open(c, blk, len, n, &kind, &p, &plen)) != 0)

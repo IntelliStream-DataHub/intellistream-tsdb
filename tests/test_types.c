@@ -1197,6 +1197,83 @@ static void test_nan_canonical(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+/* A float64 series fed float32 readings: stored as the float32 block, one byte more, at both efforts; any value
+ * that is not a float32 (or is the double the float32 null widens to) keeps the float64 kinds; damage fails. */
+static void test_f32_wide(void)
+{
+    enum { N = 8192 };
+    float *f = malloc(N * sizeof *f);
+    double *d = malloc(N * sizeof *d);
+    uint8_t *blk = malloc(block_bound(N) + BLK_SLACK), *bad = malloc(block_bound(N) + BLK_SLACK);
+    double *o = malloc(N * sizeof *o + BLK_SLACK);
+    codec_ctx *c = codec_new();
+    for (size_t k = 0; k < N; k++) {
+        f[k] = (float)(round((35 + 5 * sin((double)k / 500)) * 10 + (double)(rnd() % 10)) / 10); /* 0.1 steps */
+        d[k] = f[k];
+    }
+    for (effort = CODEC_FAST; effort <= CODEC_MERGE; effort++) {
+        c->effort = effort;
+        size_t lf = block_encode_vals(c, 1, TSDB_VALUES_AUTO, TSDB_FLOAT32, f, N, blk);
+        size_t ld = roundtrip(TSDB_FLOAT64, d, N, 1, "float32 readings");
+        CHECK(blk_kind(TSDB_FLOAT64, d, N) == BLK_F32_WIDE && ld == lf + 1);
+        CHECK(lf * 8 < (size_t)N * 8); /* the float32 decimal: under 8 bits a value, where float64 had 30 */
+    }
+    /* float32 that are not fixed point (converted, unrounded): float32 only in merges, where AUTO can afford its
+     * pick among the float32 kinds; inserts keep f64_fast's speed */
+    for (size_t k = 0; k < N; k++)
+        d[k] = (float)((35 + 5 * sin((double)k / 500) + (double)(rnd() % 1000) / 1000) * 14.503773773);
+    for (effort = CODEC_FAST; effort <= CODEC_MERGE; effort++) {
+        roundtrip(TSDB_FLOAT64, d, N, 1, "float32 not fixed point");
+        CHECK((blk_kind(TSDB_FLOAT64, d, N) == BLK_F32_WIDE) == (effort == CODEC_MERGE));
+    }
+    for (size_t k = 0; k < N; k++)
+        d[k] = f[k];
+    effort = CODEC_FAST;
+    c->effort = CODEC_FAST;
+    /* nulls, signed zeros, infinities and quiet NaNs whose float32 widens back: still float32 (and fixed point
+     * with exceptions, under one in 16 values, as inserts need it) */
+    static const uint64_t sp[] = {NULL_F64, 0x8000000000000000ull, 0, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+                                  0x7ff8000000000000ull, 0x36a0000000000000ull /* the smallest float32 */};
+    for (size_t k = 0; k < N; k += 41)
+        memcpy(&d[k], &sp[(k / 41) % 7], 8);
+    for (effort = CODEC_FAST; effort <= CODEC_MERGE; effort++)
+        CHECK(blk_kind(TSDB_FLOAT64, d, N) == BLK_F32_WIDE);
+    effort = CODEC_FAST;
+    both_levels(TSDB_FLOAT64, d, N, "float32 readings with specials");
+    /* one value that is not a float32, late in the block, or the float32 null's widening: float64 kinds */
+    static const uint64_t notf32[] = {0x4041800000000001ull, 0x7ff8000000000001ull, 0x7ff8020020000000ull,
+                                      0x7ff4000000000000ull /* signalling: float32 would quiet it */};
+    for (size_t t = 0; t < 4; t++) {
+        double keep = d[N - 3];
+        memcpy(&d[N - 3], &notf32[t], 8);
+        CHECK(blk_kind(TSDB_FLOAT64, d, N) != BLK_F32_WIDE);
+        both_levels(TSDB_FLOAT64, d, N, "float32 readings and one double");
+        d[N - 3] = keep;
+    }
+    for (size_t k = 0; k < N; k++)
+        d[k] = (double)(int64_t)(rnd() % 100000) / 1000; /* decimals as doubles are not float32 */
+    CHECK(blk_kind(TSDB_FLOAT64, d, N) == BLK_F64_DECIMAL);
+    /* damage: the header with ZSTD's bit, a float32 block that is itself one, truncation */
+    for (size_t k = 0; k < N; k++)
+        d[k] = f[k];
+    size_t len = block_encode_vals(c, 1, TSDB_VALUES_AUTO, TSDB_FLOAT64, d, N, blk);
+    CHECK(len > 2 && blk[0] == BLK_F32_WIDE);
+    memcpy(bad, blk, len);
+    bad[0] = BLK_F32_WIDE | BLK_ZSTD;
+    CHECK(block_decode_vals(c, TSDB_FLOAT64, bad, len, N, o) != 0);
+    bad[0] = BLK_F32_WIDE;
+    bad[1] = BLK_F32_WIDE;
+    CHECK(block_decode_vals(c, TSDB_FLOAT64, bad, len, N, o) != 0);
+    CHECK(block_decode_vals(c, TSDB_FLOAT64, blk, 1, N, o) != 0);
+    CHECK(block_decode_vals(c, TSDB_FLOAT32, blk, len, N, o) != 0); /* a float32 series never holds one */
+    free(f);
+    free(d);
+    free(blk);
+    free(bad);
+    free(o);
+    codec_free(c);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -1206,6 +1283,7 @@ int main(int argc, char **argv)
         test_f32_sample();
     }
     test_dict();
+    test_f32_wide();
     test_engine(base);
     test_old_version(base);
     test_query_stats(base);

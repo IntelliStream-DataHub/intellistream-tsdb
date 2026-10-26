@@ -106,6 +106,7 @@ static int raw_sel(int kind, int type)
     case BLK_XOR64: return 21;
     case BLK_INT: return 19;
     case BLK_DICT: return f64 ? 26 : 25;
+    case BLK_F32_WIDE: return 1 + TSDB_FLOAT32; /* a float32 block inside */
     default: return -1;
     }
 }
@@ -170,6 +171,18 @@ void fuzz_seeds(const char *dir)
             len = block_encode_vals(cc, lvl, 0, TSDB_STATE, st, N, blk);
             seed_block(dir, 1 + TSDB_STATE, N, blk, len);
         }
+    }
+    /* float64 series of float32 readings (BLK_F32_WIDE), with nulls, at both efforts and levels */
+    for (int i = 0; i < N; i++) {
+        float x = (float)(20 + (double)(i % 50) * 0.1);
+        d[i] = x;
+        if (i % 17 == 0)
+            memcpy(&d[i], &(uint64_t){NULL_F64}, 8);
+    }
+    for (int k = 0; k < 4; k++) {
+        cc->effort = k >> 1 ? CODEC_MERGE : CODEC_FAST;
+        size_t len = block_encode_vals(cc, k & 1, 0, TSDB_FLOAT64, d, N, blk);
+        seed_block(dir, 1 + TSDB_FLOAT64, N, blk, len);
     }
     free(blk);
 }
