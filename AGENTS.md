@@ -206,7 +206,12 @@ cgroup, so `nice` does not keep your work out of its way.
   legacy paths for earlier protocol versions in new designs. Every change must
   reach the C, Rust, Python and Java clients in the same commit, with
   `make test-clients` green. History so far: version 2 typed operations, 3
-  packed inserts, 4 QUERY_BOUNDS (the server knows UTC only).
+  packed inserts, 4 QUERY_BOUNDS (the server knows UTC only), 5 LTTB, 6 TWA,
+  7 range delete, replace and retention, 8 the spread in bucket replies, 9
+  order and limit for LTTB (and early-stopping limits on bucketed queries).
+  All four clients speak 9 and gate each call on the version HELLO answered;
+  the embedded bindings (Rust `Db`, Python `Db`, Java `EmbeddedDb`) have the
+  same operations, and their tests compare them with tsdbd's answers.
 
 - **CPU levels.** `make dist` compiles for x86-64-v2 and compiles codec.c,
   codec_alp.c, codec_typed.c, codec_xor.c and values.c again for v3 and v4;

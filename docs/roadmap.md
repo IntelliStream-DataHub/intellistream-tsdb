@@ -17,6 +17,8 @@ series store underneath; tsdb does not duplicate it.
 - Limits: raw, bucketed, bounds, calendar, time-weighted, spread and LTTB queries take an order and a limit;
   bucketed queries with a limit stop early (protocol 9, C client and CLI).
 - Embedded bindings: Rust (`tsdb_client::Db`), Python (`tsdb_client.Db`) and Java 22+ (FFM, client/java-embedded).
+- The Rust, Python and Java clients and the embedded bindings at protocol 9: the spread, LTTB and TWA with
+  order and limit, range delete, replace and retention; embedded and TCP answers compared in the tests.
 - Delete or replace a time range of one series: atomic replace (delete plus
   insert), in the library, tsdbd (protocol 7), the C, Rust, Python and Java
   clients and the CLI.
@@ -41,8 +43,6 @@ and 1.0 still need (the format and protocol changes may land in a 0.9.x, but bef
   client and CLI parsing; fuzzing of decoders, file loaders and frames (in progress).
 - SIMD kernels for float64, int64 and bool, the spread, time-weighted averages and LTTB, at every CPU level
   (AVX-512, AVX2, x86-64-v2), with identical results on every CPU (in progress).
-- The Rust, Python and Java clients and the embedded bindings at protocol 9: the spread, LTTB and TWA with
-  order and limit, range delete, replace and retention.
 - Series addressed by volume path and name with 64-bit ids, from the failover design (docs/ha.md §5): it changes
   the protocol, the on-disk layout and every client, so it lands before the formats are frozen, and failover
   can follow in 1.1 without a break.
