@@ -152,6 +152,22 @@ int tsdbc_replace_range(tsdbc *c, uint32_t series, int64_t start, int64_t end, c
 int tsdbc_set_retention(tsdbc *c, uint32_t series, int64_t limit_ms);
 int tsdbc_get_retention(tsdbc *c, uint32_t series, int64_t *limit_ms);
 
+/* Many series in one request (protocol version 10; with an older server TSDB_ERR_INVALID, without asking), with
+ * the types, calls and statuses of tsdb_query_multi (tsdb.h). mo->threads and mo->max_rows go to the server
+ * (0: its --request-threads and --multi-max-rows; larger values are clamped there); mo->cancelled is polled after
+ * each delivery; the other hooks are the server's own. A list over 65,536 series goes in several requests, with
+ * the indexes running on. Local periods (q->group with a zone other than UTC) cost two more requests (the first
+ * and last row of every series) to make one union of UTC bounds, which the server trims per series; bounds too
+ * many for a frame go series by series. fn returning nonzero sends CANCEL, reads the rest of the reply and
+ * returns TSDB_ERR_STOPPED; the connection stays usable. */
+int tsdbc_query_multi(tsdbc *c, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+                      const tsdb_multi_opts *mo, tsdb_multi_fn fn, void *ctx);
+/* The same into out[n], as tsdb_query_multi_collect; free with tsdbc_series_results_free (the client does not
+ * link the engine). On TSDB_ERR_STOPPED or TOO_MANY_BUCKETS out holds the series answered before. */
+int tsdbc_query_multi_collect(tsdbc *c, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+                              const tsdb_multi_opts *mo, tsdb_series_result **out);
+void tsdbc_series_results_free(tsdb_series_result *r, size_t n);
+
 int tsdbc_commit(tsdbc *c);
 int tsdbc_flush(tsdbc *c);
 int tsdbc_optimize(tsdbc *c);

@@ -392,6 +392,8 @@ static void run_ahead(mcall *c, size_t i)
     }
     pthread_cond_broadcast(&c->cv);
     pthread_mutex_unlock(&c->m);
+    if (!ok && mo && mo->on_deferred)
+        mo->on_deferred(mo->hook_ctx);
     if (!ok) {
         if (r.charged)
             mo->budget_give(mo->hook_ctx, r.bytes);

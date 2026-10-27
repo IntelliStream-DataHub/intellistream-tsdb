@@ -25,7 +25,9 @@ def stub_docs():
         if isinstance(node, ast.ClassDef):
             for item in node.body:
                 # sequence operators (__len__, __getitem__, +) are typing only: Python documents them
-                if isinstance(item, ast.FunctionDef) and item.name not in ("__len__", "__getitem__", "__add__", "__radd__"):
+                if isinstance(item, ast.FunctionDef) and item.name not in (
+                    "__len__", "__getitem__", "__add__", "__radd__", "__getattr__"
+                ):
                     docs[f"{node.name}.{item.name}"] = ast.get_docstring(item)
     return docs
 

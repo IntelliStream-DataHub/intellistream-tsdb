@@ -70,6 +70,7 @@ typedef struct {
     atomic_uint_fast64_t conns_accepted, conns_rejected;
     atomic_int_fast64_t conns_active, workers_busy;
     atomic_uint_fast64_t rows_inserted;
+    atomic_uint_fast64_t multi_series, multi_deferred;
     atomic_uint_fast64_t scrapes, scrape_rejects;
 } counters;
 static counters M;
@@ -103,6 +104,8 @@ static const struct {
     [TSDB_OP_QUERY_BOUNDS] = {"query_bounds", true},
     [TSDB_OP_QUERY_LTTB] = {"query_lttb", true},
     [TSDB_OP_QUERY_TWA] = {"query_twa", true},
+    [TSDB_OP_QUERY_MULTI] = {"query_multi", true},
+    [TSDB_OP_CANCEL] = {"cancel"},
     [TSDB_OP_DELETE_RANGE] = {"delete_range"},
     [TSDB_OP_REPLACE_RANGE] = {"replace_range"},
     [TSDB_OP_SET_RETENTION] = {"set_retention"},
@@ -183,6 +186,18 @@ void metrics_rows_inserted(uint64_t n)
 {
     HOOK_OFF();
     atomic_fetch_add_explicit(&M.rows_inserted, n, memory_order_relaxed);
+}
+
+void metrics_multi_series(uint64_t n)
+{
+    HOOK_OFF();
+    atomic_fetch_add_explicit(&M.multi_series, n, memory_order_relaxed);
+}
+
+void metrics_multi_deferred(void)
+{
+    HOOK_OFF();
+    atomic_fetch_add_explicit(&M.multi_deferred, 1, memory_order_relaxed);
 }
 
 /* ------------------------------------------------------ text rendering */
@@ -326,6 +341,13 @@ static void render(sb *b)
     family(b, "tsdb_inserted_rows_total", "counter", "Rows accepted by successful insert requests.");
     sb_add(b, "tsdb_inserted_rows_total %llu\n",
            (unsigned long long)atomic_load_explicit(&M.rows_inserted, memory_order_relaxed));
+    family(b, "tsdb_multi_series_total", "counter", "Series answered by QUERY_MULTI requests.");
+    sb_add(b, "tsdb_multi_series_total %llu\n",
+           (unsigned long long)atomic_load_explicit(&M.multi_series, memory_order_relaxed));
+    family(b, "tsdb_multi_deferred_total", "counter",
+           "QUERY_MULTI series too large to hold ahead of their turn, run again at it.");
+    sb_add(b, "tsdb_multi_deferred_total %llu\n",
+           (unsigned long long)atomic_load_explicit(&M.multi_deferred, memory_order_relaxed));
     family(b, "tsdb_request_errors_total", "counter", "Replies with an error status, by TSDB_ERR_* code.");
     for (unsigned k = 1; k < NERR; k++)
         sb_add(b, "tsdb_request_errors_total{code=\"%s\"} %llu\n", err_name[k],

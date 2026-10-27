@@ -44,5 +44,7 @@ void metrics_request_end(uint8_t op, int64_t began);
 int metrics_bucket_for(double seconds);
 void metrics_error(int32_t status); /* a reply with a non-zero status */
 void metrics_rows_inserted(uint64_t n);
+void metrics_multi_series(uint64_t n); /* series a QUERY_MULTI answered */
+void metrics_multi_deferred(void);      /* a QUERY_MULTI series rerun at its turn */
 
 #endif

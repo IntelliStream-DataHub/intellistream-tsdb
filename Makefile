@@ -111,7 +111,7 @@ $(B)/test_multi: tests/test_multi.c src/internal.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_crafted $(B)/test_tzfiles $(B)/test_export $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_crafted $(B)/test_tzfiles $(B)/test_export $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
@@ -141,6 +141,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_shared $(B)/test_
 	./$(B)/test_client
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server && \
+	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server_multi && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
 
 # ------------------------------------------------------------------ fuzzing
@@ -438,6 +439,9 @@ $(B)/test_ports: tests/test_ports.c tests/harness.h $(CLIB)
 
 $(B)/test_client: tests/test_client.c $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+
+$(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LDLIBS)
 
 $(B)/test_server: tests/test_server.c tests/harness.h tests/samekeys.h tests/lttb_ref.h server/metrics.c server/metrics.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/metrics.c $(CLIB) $(LIB) $(LDLIBS)

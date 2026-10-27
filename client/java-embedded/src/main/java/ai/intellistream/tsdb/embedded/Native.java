@@ -176,9 +176,54 @@ final class Native {
             JAVA_LONG.withName("covered_ms"),
             JAVA_LONG.withName("count")).withName("tsdb_twa_bucket");
 
+    static final StructLayout MULTI_QUERY = MemoryLayout.structLayout(
+            JAVA_INT.withName("kind"),
+            MemoryLayout.paddingLayout(4),
+            JAVA_LONG.withName("start"),
+            JAVA_LONG.withName("end"),
+            PTR.withName("starts"),
+            PTR.withName("ends"),
+            QUERY_OPTS.withName("opts"),
+            JAVA_LONG.withName("interval_ms"),
+            PTR.withName("intervals"),
+            PTR.withName("group"),
+            PTR.withName("bounds"),
+            SIZE_T.withName("nbounds"),
+            JAVA_INT.withName("trim"),
+            MemoryLayout.paddingLayout(4),
+            SIZE_T.withName("threshold"),
+            TWA_OPTS.withName("twa")).withName("tsdb_multi_query");
+
+    static final StructLayout SERIES_RESULT = MemoryLayout.structLayout(
+            SIZE_T.withName("index"),
+            JAVA_INT.withName("series"),
+            JAVA_INT.withName("status"),
+            JAVA_INT.withName("last"),
+            MemoryLayout.paddingLayout(4),
+            SIZE_T.withName("n"),
+            PTR.withName("ts"),
+            VALUES.withName("values"),
+            PTR.withName("buckets")).withName("tsdb_series_result");
+
+    static final StructLayout MULTI_OPTS = MemoryLayout.structLayout(
+            JAVA_INT.withName("threads"),
+            MemoryLayout.paddingLayout(4),
+            JAVA_LONG.withName("max_rows"),
+            SIZE_T.withName("max_held_bytes"),
+            PTR.withName("cancelled"),
+            PTR.withName("on_wait"),
+            PTR.withName("budget_take"),
+            PTR.withName("budget_give"),
+            PTR.withName("on_deferred"),
+            PTR.withName("hook_ctx")).withName("tsdb_multi_opts");
+
+    /* tsdb_multi_kind and the trim flags */
+    static final int MULTI_VALUES = 1, MULTI_BUCKETS = 2, MULTI_SPREAD = 3, MULTI_TWA = 4, MULTI_LTTB = 5;
+    static final int MULTI_TRIM_LO = 1, MULTI_TRIM_HI = 2;
+
     /** Every struct, for the layout test, in the order of the C enum tsdb_struct_kind (tsdb_struct_size). */
     static final StructLayout[] ALL_STRUCTS = {OPTIONS, VALUES, BUCKET, POINTS, GROUP, QUERY_OPTS, QUERY_STATS, STATS,
-        PART_INFO, SPREAD_BUCKET, TWA_OPTS, TWA_BUCKET};
+        PART_INFO, SPREAD_BUCKET, TWA_OPTS, TWA_BUCKET, MULTI_QUERY, SERIES_RESULT, MULTI_OPTS};
 
     static long offset(StructLayout s, String field) {
         return s.byteOffset(MemoryLayout.PathElement.groupElement(field));
@@ -390,6 +435,9 @@ final class Native {
             i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
     static final MethodHandle QUERY_TWA_BOUNDS = fn("tsdb_query_twa_bounds",
             i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
+    static final MethodHandle QUERY_MULTI_COLLECT = fn("tsdb_query_multi_collect", i(PTR, PTR, PTR, SIZE_T, PTR, PTR));
+    static final MethodHandle SERIES_RESULTS_FREE = fn("tsdb_series_results_free",
+            FunctionDescriptor.ofVoid(PTR, SIZE_T));
     static final MethodHandle QUERY_LTTB_EX = fn("tsdb_query_lttb_ex",
             i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, SIZE_T, PTR, PTR, PTR));
 

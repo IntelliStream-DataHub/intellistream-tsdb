@@ -540,7 +540,8 @@ int tsdb_query_twa_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end,
  *  - max_rows: 0 means no limit. max_held_bytes: results finished ahead of their turn, held at most (0: 64 MiB).
  *  - cancelled: polled between series. on_wait(+1 / -1): around the caller's waits for another thread's series.
  *    budget_take (nonzero: refused) and budget_give: memory held ahead, for a server's request budget; when it is
- *    refused, the call goes on one series at a time. */
+ *    refused, the call goes on one series at a time. on_deferred: a series that ran ahead was too large to hold
+ *    (or its memory was refused) and runs again at its turn. Hooks may be NULL. */
 typedef enum {
     TSDB_MULTI_VALUES = 1,
     TSDB_MULTI_BUCKETS,
@@ -588,6 +589,7 @@ typedef struct tsdb_multi_opts {
     void (*on_wait)(void *ctx, int delta);
     int (*budget_take)(void *ctx, size_t bytes);
     void (*budget_give)(void *ctx, size_t bytes);
+    void (*on_deferred)(void *ctx); /* a series is rerun at its turn (for a server's metrics) */
     void *hook_ctx;
 } tsdb_multi_opts;
 
@@ -702,6 +704,9 @@ typedef enum tsdb_struct_kind {
     TSDB_STRUCT_SPREAD_BUCKET = 9,
     TSDB_STRUCT_TWA_OPTS = 10,
     TSDB_STRUCT_TWA_BUCKET = 11,
+    TSDB_STRUCT_MULTI_QUERY = 12,
+    TSDB_STRUCT_SERIES_RESULT = 13,
+    TSDB_STRUCT_MULTI_OPTS = 14,
 } tsdb_struct_kind;
 size_t tsdb_struct_size(int kind);
 

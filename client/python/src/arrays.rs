@@ -317,10 +317,7 @@ pub(crate) fn inserts(
             (None, Some(id)) => match known.get(&id) {
                 Some(Ok(t)) => *t,
                 _ => {
-                    let e = known
-                        .remove(&id)
-                        .and_then(Result::err)
-                        .unwrap_or(tc::Error::Server(tc::Status::NotFound));
+                    let e = known.remove(&id).and_then(Result::err).unwrap_or(tc::Error::Server(tc::Status::NotFound));
                     return Err(crate::to_pyerr(py, tc::Error::Batch { index: i, error: Box::new(e) }));
                 }
             },
@@ -387,7 +384,7 @@ pub(crate) struct SpreadCols([Vec<f64>; 5]);
 const SPREAD_NAMES: [&str; 5] = ["range", "var_pop", "var_samp", "stddev_pop", "stddev_samp"];
 
 impl Cols {
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.start.len()
     }
 
@@ -495,6 +492,16 @@ impl From<Vec<tc::SpreadBucket>> for Buckets {
 }
 
 impl Buckets {
+    /// Buckets over these columns (the multi-series calls build them with the GIL released).
+    pub(crate) fn from_cols(cols: Cols) -> Buckets {
+        Buckets { cols }
+    }
+
+    /// Buckets a..b, as their own Buckets.
+    pub(crate) fn slice(&self, a: usize, b: usize) -> Buckets {
+        Buckets { cols: self.cols.pick(a..b) }
+    }
+
     fn spread_column<'py>(&self, py: Python<'py>, i: usize) -> PyResult<Bound<'py, PyAny>> {
         match &self.cols.spread {
             Some(s) => self.column(py, &s.0[i]),
@@ -930,6 +937,20 @@ impl From<Vec<tc::TwaBucket>> for TwaBuckets {
 }
 
 impl TwaBuckets {
+    /// Buckets a..b, as their own TwaBuckets.
+    pub(crate) fn slice(&self, a: usize, b: usize) -> TwaBuckets {
+        let c = &self.cols;
+        TwaBuckets {
+            cols: TwaCols {
+                start: c.start[a..b].to_vec(),
+                twa: c.twa[a..b].to_vec(),
+                area: c.area[a..b].to_vec(),
+                covered_ms: c.covered_ms[a..b].to_vec(),
+                count: c.count[a..b].to_vec(),
+            },
+        }
+    }
+
     fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         PyList::new(py, (0..self.cols.start.len()).map(|i| self.cols.bucket(i)))
     }

@@ -25,13 +25,15 @@ use crate::keepalive::{self, KeepAlive};
 use crate::pack;
 use crate::protocol::extend_i64s;
 use crate::protocol::{
-    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, Op, PACKED, PROTOCOL_VERSION, REPLACE_HEADER, REPLY_HEADER,
-    SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW, VALID, VALUES_CHUNK_HEADER,
+    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, MULTI_PREFIX, Op, PACKED, PROTOCOL_VERSION, REPLACE_HEADER,
+    REPLY_HEADER, SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW, VALID, VALUES_CHUNK_HEADER,
 };
 use crate::types::{
     Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts,
 };
 use crate::value::{Bitmap, Column, ColumnRef, Native, Value, ValueType};
+
+mod multi;
 
 /// Rows per INSERT frame: 8M rows of the many-series layout make 128 MiB,
 /// half of the largest frame the server accepts.
@@ -1417,37 +1419,12 @@ impl Client {
 
     /// A QUERY_BUCKETS or QUERY_BOUNDS reply.
     fn read_buckets(&self) -> Result<Vec<Bucket>> {
-        let mut r = Cursor::new(&self.body);
-        let n = r.u32()? as usize;
-        if r.remaining() != n * BUCKET_ROW {
-            return Err(Error::Protocol(format!("{n} buckets in {} bytes", r.remaining())));
-        }
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(read_bucket(&mut r)?);
-        }
-        Ok(out)
+        parse_buckets(&self.body)
     }
 
     /// A QUERY_BUCKETS or QUERY_BOUNDS reply with the spread.
     fn read_spread(&self) -> Result<Vec<SpreadBucket>> {
-        let mut r = Cursor::new(&self.body);
-        let n = r.u32()? as usize;
-        if r.remaining() != n * SPREAD_ROW {
-            return Err(Error::Protocol(format!("{n} spread buckets in {} bytes", r.remaining())));
-        }
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(SpreadBucket {
-                bucket: read_bucket(&mut r)?,
-                range: r.f64()?,
-                var_pop: r.f64()?,
-                var_samp: r.f64()?,
-                stddev_pop: r.f64()?,
-                stddev_samp: r.f64()?,
-            });
-        }
-        Ok(out)
+        parse_spread(&self.body)
     }
 
     // ------------------------------------------------------------- spread
@@ -1654,22 +1631,7 @@ impl Client {
                 .i64s(b);
         })?;
         self.req.shrink();
-        let mut r = Cursor::new(&self.body);
-        let n = r.u32()? as usize;
-        if r.remaining() != n * TWA_ROW {
-            return Err(Error::Protocol(format!("{n} TWA buckets in {} bytes", r.remaining())));
-        }
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            out.push(TwaBucket {
-                start: r.i64()?,
-                twa: r.f64()?,
-                area: r.f64()?,
-                covered_ms: r.i64()?,
-                count: r.u64()?,
-            });
-        }
-        Ok(out)
+        parse_twa(&self.body)
     }
 
     // ------------------------------------------------ deletes and retention
@@ -1964,7 +1926,8 @@ impl Client {
         self.stream.read_exact(&mut h)?;
         let word = |i: usize| u32::from_le_bytes(h[i..i + 4].try_into().expect("4 bytes"));
         let (len, id, op) = (word(0) as usize, word(4), h[8]);
-        if !(9..=MAX_FRAME).contains(&len) || op != Op::Reply as u8 {
+        // a QUERY_MULTI reply frame may be MULTI_PREFIX longer than the single op's largest
+        if !(9..=MAX_FRAME + MULTI_PREFIX).contains(&len) || op != Op::Reply as u8 {
             return Err(Error::Protocol(format!("bad reply frame: length {len}, op {op}")));
         }
         if id != self.reply_id {
@@ -1975,6 +1938,55 @@ impl Client {
         self.stream.read_exact(&mut self.body)?;
         Ok(word(9) as i32)
     }
+}
+
+/// A QUERY_BUCKETS or QUERY_BOUNDS reply.
+fn parse_buckets(body: &[u8]) -> Result<Vec<Bucket>> {
+    let mut r = Cursor::new(body);
+    let n = r.u32()? as usize;
+    if r.remaining() != n * BUCKET_ROW {
+        return Err(Error::Protocol(format!("{n} buckets in {} bytes", r.remaining())));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(read_bucket(&mut r)?);
+    }
+    Ok(out)
+}
+
+/// A QUERY_BUCKETS or QUERY_BOUNDS reply with the spread.
+fn parse_spread(body: &[u8]) -> Result<Vec<SpreadBucket>> {
+    let mut r = Cursor::new(body);
+    let n = r.u32()? as usize;
+    if r.remaining() != n * SPREAD_ROW {
+        return Err(Error::Protocol(format!("{n} spread buckets in {} bytes", r.remaining())));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(SpreadBucket {
+            bucket: read_bucket(&mut r)?,
+            range: r.f64()?,
+            var_pop: r.f64()?,
+            var_samp: r.f64()?,
+            stddev_pop: r.f64()?,
+            stddev_samp: r.f64()?,
+        });
+    }
+    Ok(out)
+}
+
+/// A QUERY_TWA reply.
+fn parse_twa(body: &[u8]) -> Result<Vec<TwaBucket>> {
+    let mut r = Cursor::new(body);
+    let n = r.u32()? as usize;
+    if r.remaining() != n * TWA_ROW {
+        return Err(Error::Protocol(format!("{n} TWA buckets in {} bytes", r.remaining())));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(TwaBucket { start: r.i64()?, twa: r.f64()?, area: r.f64()?, covered_ms: r.i64()?, count: r.u64()? });
+    }
+    Ok(out)
 }
 
 /// The 64 bytes of a bucket in a QUERY_BUCKETS or QUERY_BOUNDS reply.

@@ -277,7 +277,7 @@ static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *b
     uint32_t len, id;
     memcpy(&len, hdr, 4);
     memcpy(&id, hdr + 4, 4);
-    if (len < 9 || len > TSDB_MAX_FRAME || hdr[8] != TSDB_OP_REPLY || id != c->expect) {
+    if (len < 9 || len > TSDB_MAX_FRAME + TSDB_MULTI_PREFIX || hdr[8] != TSDB_OP_REPLY || id != c->expect) {
         c->broken = true;
         return TSDB_ERR_CORRUPT;
     }
@@ -1343,4 +1343,553 @@ int tsdbc_stats(tsdbc *c, tsdb_stats *st)
     memcpy(v, b, 64);
     *st = (tsdb_stats){v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], 0, 0}; /* the last two are local only */
     return 0;
+}
+
+/* ------------------------------------------------------- many series (protocol 10) */
+
+/*
+ * tsdbc_query_multi sends QUERY_MULTI: the inner op's payload once as a template, the series (and per-series
+ * starts, ends, intervals) as arrays, at most TSDB_MULTI_MAX_SERIES per request (a longer list is split, and the
+ * indexes run on). The reply is the single op's frames per series in index order, each with the series' index
+ * after the status, then an END frame. Local periods become one union of UTC bounds (two VALUES probes give the
+ * first and last row of every series), which the server trims per series as group_req does for one.
+ */
+
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ && sizeof(tsdb_bucket) == TSDB_BUCKET_ROW &&
+                   sizeof(tsdb_spread_bucket) == TSDB_SPREAD_ROW && sizeof(tsdb_twa_bucket) == TSDB_TWA_ROW,
+               "bucket structs are the wire rows (tsdbd checks every offset)");
+
+typedef struct mrun {
+    tsdbc *c;
+    const tsdb_multi_opts *mo;
+    tsdb_multi_fn fn;
+    void *ctx;
+    uint64_t max_rows, rows; /* rows or buckets delivered, over all requests of the call */
+    bool stopped;
+    int64_t *ts; /* aligned copies of a VALUES chunk */
+    uint8_t *v;
+    size_t cap;
+} mrun;
+
+static int send_cancel(tsdbc *c, uint32_t id)
+{
+    /* the frame carries the id of the query it stops: it gets no reply, so it must not take an id of its own */
+    uint8_t f[13];
+    uint32_t len = 9;
+    memcpy(f, &len, 4);
+    memcpy(f + 4, &id, 4);
+    f[8] = TSDB_OP_CANCEL;
+    memcpy(f + 9, &id, 4);
+    struct iovec v = {f, sizeof f};
+    return send_iov(c, &v, 1);
+}
+
+static bool deliver(mrun *m, const tsdb_series_result *r)
+{
+    if (m->stopped)
+        return false;
+    m->rows += r->n;
+    if (m->fn(m->ctx, r) != 0 || (m->mo && m->mo->cancelled && m->mo->cancelled(m->mo->hook_ctx)))
+        m->stopped = true;
+    return !m->stopped;
+}
+
+/* Reads the reply of the QUERY_MULTI `id` for series[0 .. n-1] (indexes reported from base). */
+static int multi_read(mrun *m, uint32_t id, uint8_t op, uint8_t fields, const uint32_t *series, size_t n, size_t base)
+{
+    tsdbc *c = m->c;
+    bool values = op == TSDB_OP_QUERY_VALUES || op == TSDB_OP_QUERY_LTTB;
+    size_t row = op == TSDB_OP_QUERY_TWA ? TSDB_TWA_ROW : fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
+    size_t next = 0;   /* the lowest index the next frame may have */
+    bool open = false; /* series `next` has had frames, but not its last */
+    bool cancel_sent = false;
+    for (;;) {
+        int32_t st;
+        const uint8_t *b;
+        size_t len;
+        uint32_t ix;
+        int rc = read_reply(c, &st, &b, &len);
+        if (rc)
+            return rc;
+        if (len < TSDB_MULTI_PREFIX)
+            goto corrupt;
+        memcpy(&ix, b, 4);
+        b += 4;
+        len -= 4;
+        if (ix == TSDB_MULTI_END) {
+            if (len != 4 || open)
+                goto corrupt;
+            return st ? st : m->stopped ? TSDB_ERR_STOPPED : 0;
+        }
+        stream_more(c);
+        if (ix >= n || ix < next || (open && ix != next))
+            goto corrupt;
+        tsdb_series_result r = {.index = base + ix, .series = series[ix], .status = st, .last = 1};
+        if (values) {
+            uint32_t k;
+            if (len < 8 || b[1] > TSDB_STATE)
+                goto corrupt;
+            memcpy(&k, b + 4, 4);
+            unsigned aw = tsdb_wire_width(b[1]);
+            size_t valid = (b[2] & TSDB_VALID) ? ((size_t)k + 7) / 8 : 0;
+            if (len != 8 + (size_t)k * (8 + aw) + valid || (st && !b[0]))
+                goto corrupt;
+            r.values.type = (tsdb_type)b[1];
+            r.last = b[0];
+            if (k && !m->stopped) {
+                if (k > m->cap) {
+                    free(m->ts);
+                    free(m->v);
+                    m->ts = malloc((size_t)k * 8);
+                    m->v = malloc((size_t)k * 8 + (size_t)k / 8 + 1);
+                    m->cap = m->ts && m->v ? k : 0;
+                    if (!m->cap) {
+                        c->broken = true; /* the rest of the reply stays unread */
+                        return TSDB_ERR_NOMEM;
+                    }
+                }
+                memcpy(m->ts, b + 8, (size_t)k * 8);
+                memcpy(m->v, b + 8 + (size_t)k * 8, (size_t)k * aw + valid);
+                tsdb_series_result rows = r;
+                rows.status = 0;
+                rows.last = st ? 0 : r.last; /* rows before an error come first, as from tsdb_query_multi */
+                rows.n = k;
+                rows.ts = m->ts;
+                rows.values.values = m->v;
+                rows.values.valid = valid ? m->v + (size_t)k * aw : NULL;
+                if (deliver(m, &rows) && st)
+                    deliver(m, &r);
+            } else if (!m->stopped && (r.last || st)) {
+                deliver(m, &r); /* the end of the series, or its error */
+            }
+            open = !r.last;
+            next = r.last ? (size_t)ix + 1 : ix;
+        } else {
+            uint32_t k = 0;
+            if (st ? len != 0 : len < 4 || (memcpy(&k, b, 4), len != 4 + (size_t)k * row))
+                goto corrupt;
+            r.n = k;
+            r.buckets = st ? NULL : b + 4; /* 8-aligned in the frame buffer: the structs are the wire rows */
+            deliver(m, &r);
+            next = (size_t)ix + 1;
+        }
+        if (m->stopped && !cancel_sent) {
+            if ((rc = send_cancel(c, id)) != 0)
+                return rc;
+            cancel_sent = true;
+        }
+    }
+corrupt:
+    c->broken = true;
+    return TSDB_ERR_CORRUPT;
+}
+
+static void put64(uint8_t *p, int64_t v) { memcpy(p, &v, 8); }
+
+static uint32_t c_next_id(const tsdbc *c) { return c->next_id; } /* the id send_reqv gives the next request */
+
+/* The template of q: the inner op's payload for series 0xffffffff, with 0 where per-series arrays take over.
+ * bounds (n > 0) replace q's group by client bounds. */
+static int multi_template(const tsdb_multi_query *q, const int64_t *bounds, size_t nb, uint8_t *op, uint8_t *fields,
+                          uint8_t **out, size_t *tlen)
+{
+    int64_t start = q->starts ? 0 : q->start, end = q->ends ? 0 : q->end;
+    bool spread = q->kind == TSDB_MULTI_SPREAD;
+    const tsdb_group *g = q->group;
+    if (g && g->unit == 0)
+        g = NULL; /* as tsdb_query_group: no unit, one bucket */
+    int64_t interval = q->intervals ? 0 : q->interval_ms;
+    size_t len;
+    *fields = spread ? TSDB_SPREAD : 0;
+    switch (q->kind) {
+    case TSDB_MULTI_VALUES: *op = TSDB_OP_QUERY_VALUES, len = 29; break;
+    case TSDB_MULTI_LTTB: *op = TSDB_OP_QUERY_LTTB, len = 37; break;
+    case TSDB_MULTI_BUCKETS:
+    case TSDB_MULTI_SPREAD:
+        if (nb)
+            *op = TSDB_OP_QUERY_BOUNDS, len = 33 + nb * 8 + spread;
+        else
+            *op = TSDB_OP_QUERY_BUCKETS, len = 44 + spread;
+        break;
+    case TSDB_MULTI_TWA: *op = TSDB_OP_QUERY_TWA, len = TSDB_TWA_HEADER + nb * 8; break;
+    default: return TSDB_ERR_INVALID;
+    }
+    uint8_t *t = calloc(len, 1);
+    if (!t)
+        return TSDB_ERR_NOMEM;
+    uint32_t any = TSDB_MANY_SERIES, cnt = g ? g->count : 0, n32 = (uint32_t)nb;
+    memcpy(t, &any, 4);
+    put64(t + 4, start);
+    put64(t + 12, end);
+    uint64_t lim = q->opts.limit;
+    uint8_t desc = q->opts.order == TSDB_DESC;
+    switch (*op) {
+    case TSDB_OP_QUERY_VALUES:
+        t[20] = desc;
+        memcpy(t + 21, &lim, 8);
+        break;
+    case TSDB_OP_QUERY_LTTB: {
+        uint64_t th = q->threshold;
+        memcpy(t + 20, &th, 8);
+        t[28] = desc;
+        memcpy(t + 29, &lim, 8);
+        break;
+    }
+    case TSDB_OP_QUERY_BOUNDS:
+        t[20] = desc;
+        memcpy(t + 21, &lim, 8);
+        memcpy(t + 29, &n32, 4);
+        memcpy(t + 33, bounds, nb * 8);
+        if (spread)
+            t[33 + nb * 8] = TSDB_SPREAD;
+        break;
+    case TSDB_OP_QUERY_BUCKETS:
+        put64(t + 20, g ? 0 : interval);
+        t[28] = g ? (uint8_t)g->unit : 0;
+        memcpy(t + 29, &cnt, 4);
+        t[33] = desc;
+        memcpy(t + 34, &lim, 8);
+        if (spread)
+            t[44] = TSDB_SPREAD;
+        break;
+    case TSDB_OP_QUERY_TWA: {
+        uint64_t tl = q->twa.limit;
+        t[20] = (uint8_t)q->twa.method;
+        t[21] = q->twa.order == TSDB_DESC;
+        t[22] = nb || !g ? 0 : (uint8_t)g->unit;
+        put64(t + 24, q->twa.max_gap_ms);
+        memcpy(t + 32, &tl, 8);
+        put64(t + 40, nb || g ? 0 : interval);
+        uint32_t c2 = nb ? 0 : cnt;
+        memcpy(t + 48, &c2, 4);
+        memcpy(t + 52, &n32, 4);
+        memcpy(t + TSDB_TWA_HEADER, bounds, nb * 8);
+        break;
+    }
+    }
+    *out = t;
+    *tlen = len;
+    return 0;
+}
+
+/* q over series[0 .. n-1] in requests of at most TSDB_MULTI_MAX_SERIES; bounds as in multi_template, trimmed
+ * per series by the server as `trim` asks. */
+static int multi_send_all(mrun *m, const tsdb_multi_query *q, const uint32_t *series, size_t n, const int64_t *bounds,
+                          size_t nb, unsigned trim)
+{
+    uint8_t op, fields, *t;
+    size_t tlen;
+    int rc = multi_template(q, bounds, nb, &op, &fields, &t, &tlen);
+    if (rc)
+        return rc;
+    bool interval_mode = !nb && !(q->group && q->group->unit) &&
+                         (q->kind == TSDB_MULTI_BUCKETS || q->kind == TSDB_MULTI_SPREAD || q->kind == TSDB_MULTI_TWA);
+    uint8_t flags = (q->starts ? TSDB_MULTI_PER_START : 0) | (q->ends ? TSDB_MULTI_PER_END : 0) |
+                    (q->intervals && interval_mode ? TSDB_MULTI_PER_INTERVAL : 0) |
+                    (nb && (trim & TSDB_MULTI_TRIM_LO) ? TSDB_MULTI_WIRE_TRIM_LO : 0) |
+                    (nb && (trim & TSDB_MULTI_TRIM_HI) ? TSDB_MULTI_WIRE_TRIM_HI : 0);
+    int threads = m->mo ? m->mo->threads : 0;
+    uint16_t th = threads <= 0 ? 0 : threads > 65535 ? 65535 : (uint16_t)threads;
+    static const uint8_t zeros[8];
+    for (size_t at = 0; at < n && rc == 0; at += TSDB_MULTI_MAX_SERIES) {
+        size_t k = n - at < TSDB_MULTI_MAX_SERIES ? n - at : TSDB_MULTI_MAX_SERIES;
+        uint64_t left = 0;
+        if (m->max_rows) {
+            if (m->rows >= m->max_rows) {
+                rc = TSDB_ERR_TOO_MANY_BUCKETS;
+                break;
+            }
+            left = m->max_rows - m->rows;
+        }
+        uint8_t h[TSDB_MULTI_HEADER] = {op, flags};
+        uint32_t k32 = (uint32_t)k, tl32 = (uint32_t)tlen;
+        memcpy(h + 2, &th, 2);
+        memcpy(h + 4, &k32, 4);
+        memcpy(h + 8, &left, 8);
+        memcpy(h + 16, &tl32, 4);
+        struct iovec parts[8];
+        int np = 1;
+        parts[np++] = (struct iovec){h, sizeof h};
+        if (q->starts)
+            parts[np++] = (struct iovec){(void *)(q->starts + at), k * 8};
+        if (q->ends)
+            parts[np++] = (struct iovec){(void *)(q->ends + at), k * 8};
+        if (flags & TSDB_MULTI_PER_INTERVAL)
+            parts[np++] = (struct iovec){(void *)(q->intervals + at), k * 8};
+        parts[np++] = (struct iovec){(void *)(series + at), k * 4};
+        parts[np++] = (struct iovec){(void *)zeros, (8 - (k * 4) % 8) % 8};
+        parts[np++] = (struct iovec){t, tlen};
+        size_t body = 5;
+        for (int i = 1; i < np; i++)
+            body += parts[i].iov_len;
+        if (body > TSDB_MAX_FRAME) {
+            rc = TSDB_ERR_TOO_MANY_BUCKETS; /* bounds that no frame carries */
+            break;
+        }
+        uint32_t id = c_next_id(m->c);
+        if ((rc = send_reqv(m->c, TSDB_OP_QUERY_MULTI, parts, np)) == 0)
+            rc = multi_read(m, id, op, fields, series + at, k, at);
+    }
+    free(t);
+    return rc;
+}
+
+/* ---- local periods ---- */
+
+typedef struct probe {
+    int64_t *lo, *hi;
+    bool desc;
+} probe;
+
+static int probe_fn(void *ctx, const tsdb_series_result *r)
+{
+    probe *p = ctx;
+    if (r->n && !r->status)
+        (p->desc ? p->hi : p->lo)[r->index] = r->ts[0];
+    return 0;
+}
+
+/* One series of a local-period query, by the single-series calls: for bounds no frame carries, and for TWA
+ * ranges whose closed sides differ between series. */
+static int multi_single(mrun *m, const tsdb_multi_query *q, const uint32_t *series, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        int64_t s = q->starts ? q->starts[i] : q->start, e = q->ends ? q->ends[i] : q->end;
+        void *b = NULL;
+        size_t nb = 0;
+        int st;
+        if (q->kind == TSDB_MULTI_TWA)
+            st = tsdbc_query_twa_group(m->c, series[i], s, e, q->group, &q->twa, (tsdb_twa_bucket **)&b, &nb);
+        else if (q->kind == TSDB_MULTI_SPREAD)
+            st = tsdbc_query_spread_group(m->c, series[i], s, e, q->group, &q->opts, (tsdb_spread_bucket **)&b, &nb);
+        else
+            st = tsdbc_query_group(m->c, series[i], s, e, q->group, &q->opts, (tsdb_bucket **)&b, &nb);
+        if (m->c->broken) {
+            free(b);
+            return st ? st : TSDB_ERR_IO;
+        }
+        if (st == 0 && m->max_rows && m->rows + nb > m->max_rows) {
+            free(b);
+            return TSDB_ERR_TOO_MANY_BUCKETS;
+        }
+        tsdb_series_result r = {.index = i, .series = series[i], .status = st, .last = 1, .n = st ? 0 : nb,
+                                .buckets = st ? NULL : b};
+        bool go = deliver(m, &r);
+        free(b);
+        if (!go)
+            return TSDB_ERR_STOPPED;
+    }
+    return 0;
+}
+
+/* all equal (*v set), all open (INT64_MIN / INT64_MAX: *v that), or mixed (false) */
+static bool uniform(const int64_t *a, int64_t one, size_t n, int64_t *v)
+{
+    *v = a ? a[0] : one;
+    for (size_t i = 1; a && i < n; i++)
+        if (a[i] != a[0])
+            return false;
+    return true;
+}
+
+static int multi_local(mrun *m, const tsdb_multi_query *q, const uint32_t *series, size_t n)
+{
+    bool twa = q->kind == TSDB_MULTI_TWA;
+    int64_t s0, e0;
+    bool us = uniform(q->starts, q->start, n, &s0), ue = uniform(q->ends, q->end, n, &e0);
+    /* buckets cut both sides to the rows; TWA only open sides (a closed one is the range's own edge) */
+    bool open_lo = !twa || (us && s0 == INT64_MIN), open_hi = !twa || (ue && e0 == INT64_MAX);
+    if (twa && ((!us && !open_lo) || (!ue && !open_hi)))
+        return multi_single(m, q, series, n);
+    int64_t *lo = malloc(n * 8), *hi = malloc(n * 8);
+    int rc = lo && hi ? 0 : TSDB_ERR_NOMEM;
+    for (size_t i = 0; rc == 0 && i < n; i++)
+        lo[i] = INT64_MAX, hi[i] = INT64_MIN;
+    if (rc == 0 && (open_lo || open_hi)) {
+        mrun pm = {.c = m->c};
+        probe p = {lo, hi, false};
+        tsdb_multi_query vq = {.kind = TSDB_MULTI_VALUES, .start = q->start, .end = q->end, .starts = q->starts,
+                               .ends = q->ends, .opts = {TSDB_ASC, 1}};
+        pm.fn = probe_fn;
+        pm.ctx = &p;
+        if (open_lo)
+            rc = multi_send_all(&pm, &vq, series, n, NULL, 0, 0);
+        if (rc == 0 && open_hi) {
+            p.desc = true;
+            vq.opts.order = TSDB_DESC;
+            rc = multi_send_all(&pm, &vq, series, n, NULL, 0, 0);
+        }
+        free(pm.ts);
+        free(pm.v);
+    }
+    int64_t L = INT64_MAX, H = INT64_MIN;
+    for (size_t i = 0; rc == 0 && i < n; i++) {
+        if (open_lo && lo[i] < L)
+            L = lo[i];
+        if (open_hi && hi[i] > H)
+            H = hi[i];
+    }
+    if (!open_lo)
+        L = s0;
+    if (!open_hi)
+        H = e0 == INT64_MIN ? INT64_MIN : e0 - 1;
+    free(lo);
+    free(hi);
+    if (rc)
+        return rc;
+    if (L > H) { /* no rows anywhere (or an empty range): no buckets, as the single call answers */
+        for (size_t i = 0; i < n; i++) {
+            tsdb_series_result r = {.index = i, .series = series[i], .last = 1};
+            if (!deliver(m, &r))
+                return TSDB_ERR_STOPPED;
+        }
+        return 0;
+    }
+    int64_t *bounds;
+    size_t nb;
+    rc = tsdb_calendar_bounds(q->group->timezone, q->group->unit, q->group->count, L, H + 1, &bounds, &nb);
+    if (rc)
+        return rc;
+    if (nb > (TSDB_MAX_FRAME - ((size_t)8 << 20)) / 8) /* the union is too long for one frame: one by one */
+        rc = multi_single(m, q, series, n);
+    else
+        rc = multi_send_all(m, q, series, n, bounds, nb,
+                            (open_lo ? TSDB_MULTI_TRIM_LO : 0) | (open_hi ? TSDB_MULTI_TRIM_HI : 0));
+    free(bounds);
+    return rc;
+}
+
+int tsdbc_query_multi(tsdbc *c, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+                      const tsdb_multi_opts *mo, tsdb_multi_fn fn, void *ctx)
+{
+    int rc = tsdbc_wait(c);
+    if (rc)
+        return rc;
+    if (!q || !fn || (n && !series) || (q->nbounds && !q->bounds) ||
+        (q->trim & ~(TSDB_MULTI_TRIM_LO | TSDB_MULTI_TRIM_HI)))
+        return TSDB_ERR_INVALID;
+    if (server_version(c) < 10)
+        return c->broken ? TSDB_ERR_IO : TSDB_ERR_INVALID;
+    if (n == 0)
+        return 0;
+    mrun m = {.c = c, .mo = mo, .fn = fn, .ctx = ctx, .max_rows = mo ? mo->max_rows : 0};
+    bool buckets = q->kind == TSDB_MULTI_BUCKETS || q->kind == TSDB_MULTI_SPREAD || q->kind == TSDB_MULTI_TWA;
+    bool local = buckets && !q->nbounds && q->group && q->group->unit && q->group->timezone &&
+                 strcmp(q->group->timezone, "UTC") != 0;
+    if (local)
+        rc = multi_local(&m, q, series, n);
+    else
+        rc = multi_send_all(&m, q, series, n, buckets ? q->bounds : NULL, buckets ? q->nbounds : 0, q->trim);
+    free(m.ts);
+    free(m.v);
+    return rc;
+}
+
+/* ---- collected ---- */
+
+typedef struct mcollect {
+    tsdb_series_result *r;
+    size_t stride; /* bytes per bucket; 0: rows */
+    size_t *cap;   /* rows allocated per series */
+    bool *nulls;   /* the series had a null */
+    int err;
+} mcollect;
+
+static int collect_fn(void *ctx, const tsdb_series_result *in)
+{
+    mcollect *k = ctx;
+    tsdb_series_result *o = &k->r[in->index];
+    o->status = in->status;
+    if (in->status || !in->n)
+        return 0;
+    if (k->stride) {
+        void *b = malloc(in->n * k->stride);
+        if (!b)
+            return k->err = TSDB_ERR_NOMEM;
+        memcpy(b, in->buckets, in->n * k->stride);
+        o->buckets = b;
+        o->n = in->n;
+        return 0;
+    }
+    unsigned aw = tsdb_wire_width(in->values.type);
+    size_t need = o->n + in->n, *cap = &k->cap[in->index];
+    if (need > *cap) {
+        size_t nc = *cap ? *cap * 2 : 1024;
+        while (nc < need)
+            nc *= 2;
+        int64_t *ts = realloc((void *)o->ts, nc * 8);
+        if (ts)
+            o->ts = ts;
+        uint8_t *v = realloc((void *)o->values.values, nc * aw);
+        if (v)
+            o->values.values = v;
+        uint8_t *bits = realloc((void *)o->values.valid, (nc + 7) / 8);
+        if (bits)
+            o->values.valid = bits;
+        if (!ts || !v || !bits)
+            return k->err = TSDB_ERR_NOMEM;
+        memset(bits + (*cap + 7) / 8, 0, (nc + 7) / 8 - (*cap + 7) / 8);
+        *cap = nc;
+    }
+    uint8_t *bits = (uint8_t *)o->values.valid;
+    memcpy((int64_t *)o->ts + o->n, in->ts, in->n * 8);
+    memcpy((uint8_t *)o->values.values + o->n * aw, in->values.values, in->n * aw);
+    for (size_t i = 0; i < in->n; i++) {
+        bool known = !in->values.valid || ((in->values.valid[i >> 3] >> (i & 7)) & 1);
+        size_t j = o->n + i;
+        bits[j >> 3] = (uint8_t)((bits[j >> 3] & ~(1u << (j & 7))) | ((unsigned)known << (j & 7)));
+        k->nulls[in->index] |= !known;
+    }
+    o->values.type = in->values.type;
+    o->n = need;
+    return 0;
+}
+
+int tsdbc_query_multi_collect(tsdbc *c, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+                              const tsdb_multi_opts *mo, tsdb_series_result **out)
+{
+    *out = NULL;
+    if (!q)
+        return TSDB_ERR_INVALID;
+    mcollect k = {calloc(n ? n : 1, sizeof *k.r), 0, calloc(n ? n : 1, sizeof(size_t)), calloc(n ? n : 1, 1), 0};
+    k.stride = q->kind == TSDB_MULTI_TWA      ? sizeof(tsdb_twa_bucket)
+               : q->kind == TSDB_MULTI_SPREAD ? sizeof(tsdb_spread_bucket)
+               : q->kind == TSDB_MULTI_BUCKETS ? sizeof(tsdb_bucket)
+                                               : 0;
+    int rc = k.r && k.cap && k.nulls ? 0 : TSDB_ERR_NOMEM;
+    for (size_t i = 0; rc == 0 && i < n; i++) {
+        k.r[i].index = i;
+        k.r[i].series = series[i];
+        k.r[i].last = 1;
+    }
+    if (rc == 0)
+        rc = tsdbc_query_multi(c, q, series, n, mo, collect_fn, &k);
+    if (rc == TSDB_ERR_STOPPED && k.err)
+        rc = k.err;
+    for (size_t i = 0; k.r && k.nulls && i < n; i++)
+        if (!k.nulls[i]) { /* no nulls: no bitmap, as tsdb_values has it */
+            free((void *)k.r[i].values.valid);
+            k.r[i].values.valid = NULL;
+        }
+    free(k.cap);
+    free(k.nulls);
+    if (rc && rc != TSDB_ERR_STOPPED && rc != TSDB_ERR_TOO_MANY_BUCKETS) {
+        tsdbc_series_results_free(k.r, k.r ? n : 0);
+        return rc;
+    }
+    *out = k.r;
+    return rc;
+}
+
+void tsdbc_series_results_free(tsdb_series_result *r, size_t n)
+{
+    if (!r)
+        return;
+    for (size_t i = 0; i < n; i++) {
+        free((void *)r[i].ts);
+        free((void *)r[i].values.values);
+        free((void *)r[i].values.valid);
+        free((void *)r[i].buckets);
+    }
+    free(r);
 }

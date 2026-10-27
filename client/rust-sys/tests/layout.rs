@@ -33,6 +33,11 @@ fn structs_match_the_c_header() {
         tsdb_stats { parts, partitions, rows, bytes, merges, merged_rows, passthrough_granules, memtable_rows,
             broken_parts, follow_errors }
         tsdb_part_info { name, partition, min_ts, max_ts, rows, bytes, granules, level, created_s, written_s }
+        tsdb_multi_query { kind, start, end, starts, ends, opts, interval_ms, intervals, group, bounds, nbounds,
+            trim, threshold, twa }
+        tsdb_series_result { index, series, status, last, n, ts, values, buckets }
+        tsdb_multi_opts { threads, max_rows, max_held_bytes, cancelled, on_wait, budget_take, budget_give,
+            on_deferred, hook_ctx }
     };
     rust.push(("tsdb_type", "sizeof", size_of::<tsdb_type>()));
     rust.push(("tsdb_order", "sizeof", size_of::<tsdb_order>()));

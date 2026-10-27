@@ -27,6 +27,7 @@ public final class EmbeddedOptions {
     private boolean fsync;
     private int mergeThreads;
     private int queryThreads;
+    private int requestThreads;
     private long bufferRows;
     private int flushIntervalMs;
     private int walSyncMs;
@@ -61,6 +62,7 @@ public final class EmbeddedOptions {
             fsync = o.get(JAVA_INT, offset(OPTIONS, "fsync")) != 0;
             mergeThreads = o.get(JAVA_INT, offset(OPTIONS, "merge_threads"));
             queryThreads = o.get(JAVA_INT, offset(OPTIONS, "query_threads"));
+            requestThreads = o.get(JAVA_INT, offset(OPTIONS, "request_threads"));
             bufferRows = o.get(JAVA_LONG, offset(OPTIONS, "buffer_rows"));
             flushIntervalMs = o.get(JAVA_INT, offset(OPTIONS, "flush_interval_ms"));
             walSyncMs = o.get(JAVA_INT, offset(OPTIONS, "wal_sync_ms"));
@@ -87,6 +89,7 @@ public final class EmbeddedOptions {
         o.set(JAVA_INT, offset(OPTIONS, "fsync"), fsync ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "merge_threads"), mergeThreads);
         o.set(JAVA_INT, offset(OPTIONS, "query_threads"), queryThreads);
+        o.set(JAVA_INT, offset(OPTIONS, "request_threads"), requestThreads);
         o.set(JAVA_LONG, offset(OPTIONS, "buffer_rows"), bufferRows);
         o.set(JAVA_INT, offset(OPTIONS, "flush_interval_ms"), flushIntervalMs);
         o.set(JAVA_INT, offset(OPTIONS, "wal_sync_ms"), walSyncMs);
@@ -171,13 +174,25 @@ public final class EmbeddedOptions {
     }
 
     /**
-     * Threads one aggregation may use.
+     * Threads of the database's query scheduler, shared by every query of this database.
      *
      * @param n default: every logical CPU
      * @return this
      */
     public EmbeddedOptions queryThreads(int n) {
         queryThreads = n;
+        return this;
+    }
+
+    /**
+     * Threads one query, or one query over many series ({@link EmbeddedDb#queryValuesMulti} and the others), uses
+     * at most; a {@link ai.intellistream.tsdb.MultiOptions#threads} of 0 means this.
+     *
+     * @param n default: the library's (0)
+     * @return this
+     */
+    public EmbeddedOptions requestThreads(int n) {
+        requestThreads = n;
         return this;
     }
 
@@ -352,7 +367,7 @@ public final class EmbeddedOptions {
     public String toString() {
         return "EmbeddedOptions[partitionMs=" + partitionMs + ", granuleRows=" + granuleRows + ", zstdLevel="
                 + zstdLevel + ", valueCodec=" + valueCodec + ", fsync=" + fsync + ", mergeThreads=" + mergeThreads
-                + ", queryThreads=" + queryThreads + ", bufferRows=" + bufferRows + ", flushIntervalMs="
+                + ", queryThreads=" + queryThreads + ", requestThreads=" + requestThreads + ", bufferRows=" + bufferRows + ", flushIntervalMs="
                 + flushIntervalMs + ", walSyncMs=" + walSyncMs + ", walMaxBatchRows=" + walMaxBatchRows
                 + ", maxPartBytes=" + maxPartBytes + ", readOnly=" + readOnly + ", follow=" + follow + ", refreshMs="
                 + refreshMs + ", mergeIdleS=" + mergeIdleS + ", obsoletePartLifetimeS=" + obsoletePartLifetimeS

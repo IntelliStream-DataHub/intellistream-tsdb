@@ -54,6 +54,19 @@ int main(void)
     S(tsdb_twa_bucket);
     F(tsdb_twa_bucket, start); F(tsdb_twa_bucket, twa); F(tsdb_twa_bucket, area); F(tsdb_twa_bucket, covered_ms);
     F(tsdb_twa_bucket, count);
+    S(tsdb_multi_query);
+    F(tsdb_multi_query, kind); F(tsdb_multi_query, start); F(tsdb_multi_query, end); F(tsdb_multi_query, starts);
+    F(tsdb_multi_query, ends); F(tsdb_multi_query, opts); F(tsdb_multi_query, interval_ms);
+    F(tsdb_multi_query, intervals); F(tsdb_multi_query, group); F(tsdb_multi_query, bounds);
+    F(tsdb_multi_query, nbounds); F(tsdb_multi_query, trim); F(tsdb_multi_query, threshold); F(tsdb_multi_query, twa);
+    S(tsdb_series_result);
+    F(tsdb_series_result, index); F(tsdb_series_result, series); F(tsdb_series_result, status);
+    F(tsdb_series_result, last); F(tsdb_series_result, n); F(tsdb_series_result, ts); F(tsdb_series_result, values);
+    F(tsdb_series_result, buckets);
+    S(tsdb_multi_opts);
+    F(tsdb_multi_opts, threads); F(tsdb_multi_opts, max_rows); F(tsdb_multi_opts, max_held_bytes);
+    F(tsdb_multi_opts, cancelled); F(tsdb_multi_opts, on_wait); F(tsdb_multi_opts, budget_take);
+    F(tsdb_multi_opts, budget_give); F(tsdb_multi_opts, on_deferred); F(tsdb_multi_opts, hook_ctx);
     /* enum and value-type widths the binding assumes */
     printf("enum %zu\n", sizeof(tsdb_type));
     /* the codes it passes: "type.FLOAT64 1" is ValueType.FLOAT64.code(), "unit.DAY 4" Unit.DAY.code(), "order.DESC 1",
@@ -72,5 +85,10 @@ int main(void)
     E("kind", tsdb_query_stats, TSDB_STRUCT_QUERY_STATS); E("kind", tsdb_stats, TSDB_STRUCT_STATS);
     E("kind", tsdb_part_info, TSDB_STRUCT_PART_INFO); E("kind", tsdb_spread_bucket, TSDB_STRUCT_SPREAD_BUCKET);
     E("kind", tsdb_twa_opts, TSDB_STRUCT_TWA_OPTS); E("kind", tsdb_twa_bucket, TSDB_STRUCT_TWA_BUCKET);
+    E("kind", tsdb_multi_query, TSDB_STRUCT_MULTI_QUERY); E("kind", tsdb_series_result, TSDB_STRUCT_SERIES_RESULT);
+    E("kind", tsdb_multi_opts, TSDB_STRUCT_MULTI_OPTS);
+    E("multi", VALUES, TSDB_MULTI_VALUES); E("multi", BUCKETS, TSDB_MULTI_BUCKETS); E("multi", SPREAD, TSDB_MULTI_SPREAD);
+    E("multi", TWA, TSDB_MULTI_TWA); E("multi", LTTB, TSDB_MULTI_LTTB);
+    E("multi", TRIM_LO, TSDB_MULTI_TRIM_LO); E("multi", TRIM_HI, TSDB_MULTI_TRIM_HI);
     return 0;
 }

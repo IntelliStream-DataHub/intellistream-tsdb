@@ -303,6 +303,51 @@ and call `refresh()` to see new data. The keyword arguments of `Db` are
 the engine's options, such as `fsync=False` or `wal_sync_ms=100`;
 `help(tsdb_client.Db)` lists them.
 
+## Many series in one request
+
+The `_multi` calls ask for many series at once: one request, one answer,
+in the order of your list. The server (or, for `Db`, the database in this
+process) reads the series in parallel and from one moment in time, so an
+insert that wrote several series at once is seen whole or not at all.
+They need tsdbd 0.9 with protocol version 10.
+
+```python
+import numpy as np
+import tsdb_client
+
+with tsdb_client.Db("/tmp/tsdb-multi") as db:
+    t0 = 1_700_000_000_000
+    ts = t0 + np.arange(1440, dtype=np.int64) * 60_000  # one row a minute for a day
+    pumps = [db.series(f"pump{i}.flow") for i in range(3)]
+    for i, s in enumerate(pumps):
+        db.insert_series(s, ts, np.full(1440, i + 1.0, dtype=np.float32))
+
+    # hourly buckets of every pump in one call; numpy over all of them at once
+    r = db.query_buckets_multi(pumps, t0, t0 + 86_400_000, interval_ms=3_600_000)
+    print(len(r), r.offsets.tolist(), r.sum.sum())
+    print(len(r[1]), r[1].sum[0])  # pump 1 alone, as query_agg() gives it
+
+    # the newest row of every pump
+    last = db.query_values_multi(pumps, order="desc", limit=1)
+    print(last.values.tolist())
+```
+
+There are five: `query_values_multi`, `query_buckets_multi`,
+`query_spread_multi`, `query_twa_multi` and `query_lttb_multi`, on
+`Client`, `Pool` and `Db`. `series` is a list or a numpy `uint32` array.
+`start`, `end` and `interval_ms` are one number for every series or one
+per series. The bucket calls take `interval_ms`, or `unit`, `count` and
+`timezone` (as `query_group`), or `bounds` (as `query_bounds`).
+
+The answer `r` holds every series' rows (`r.ts`, `r.values`) or buckets
+(`r.buckets`, and its columns such as `r.sum` straight from `r`) one after
+the other; series `i` is at `r.offsets[i]:r.offsets[i + 1]`, and `r[i]` is
+what the one-series call returns. Each series succeeds or fails on its own:
+`r.status[i]` is 0 or the error code. By default (`errors="raise"`) a
+failed series raises `TsdbError`, with `err.index` (which series) and
+`err.result` (the whole answer); with `errors="status"` you get the answer
+and check `r.status` yourself.
+
 ## Many queries at once
 
 Each call into the module costs a few microseconds of Python time, and

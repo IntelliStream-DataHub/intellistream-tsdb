@@ -66,7 +66,13 @@ class TsdbError(Exception):
     index: int | None
     """For an error of a batch call (*_many), the failing entry's position in
     the batch: the lowest one that failed; every entry below it ran and
-    succeeded. None for other calls."""
+    succeeded. For a series of a multi-series call (query_*_multi), that
+    series' position in the list. None for other calls."""
+
+    result: Many | None
+    """For a series of a multi-series call that failed with errors="raise",
+    the whole answer (the other series' results and statuses). None for
+    other calls."""
 
 def strerror(code: int) -> str:
     """Returns the text for a TSDB_ERR_* code, such as ERR_NOTFOUND."""
@@ -258,6 +264,54 @@ class BucketsMany(Sequence[Buckets]):
     def __getitem__(self, i: int) -> Buckets: ...
     @overload
     def __getitem__(self, i: slice) -> list[Buckets]: ...
+
+@final
+class Many(Sequence[Any]):
+    """The answer of a multi-series call (query_*_multi()).
+
+    len(r) is the number of series, r.status their statuses (int32, 0 for
+    success, else the TSDB_ERR_* code) and r.offsets (int64, one more than
+    the series) where each series' rows or buckets begin in the columns,
+    which hold every series' results concatenated in series order. r[i] is
+    series i's result as the single call returns it, and raises TsdbError
+    for a series that failed. Columns: r.ts and r.values for the values and
+    LTTB calls; r.buckets (a Buckets or TwaBuckets) for the bucket calls,
+    whose columns read straight from r too (r.counts, r.sum, r.twa, ...).
+    Without numpy the columns are lists.
+    """
+
+    @property
+    def kind(self) -> Literal["values", "buckets", "spread", "twa", "lttb"]:
+        """The call that answered: "values", "buckets", "spread", "twa" or "lttb"."""
+    @property
+    def series(self) -> list[int]:
+        """The series ids, in the order asked."""
+    @property
+    def status(self) -> Any:
+        """Each series' status: 0, or the TSDB_ERR_* code it failed with (int32)."""
+    @property
+    def offsets(self) -> Any:
+        """Where each series' rows or buckets begin in the columns (int64, series + 1 entries)."""
+    @property
+    def ok(self) -> bool:
+        """True when every series succeeded."""
+    def error_of(self, i: int) -> TsdbError | None:
+        """The TsdbError of series i, or None if it succeeded."""
+    @property
+    def ts(self) -> Any:
+        """Every series' timestamps, concatenated (the values and LTTB calls)."""
+    @property
+    def values(self) -> Any:
+        """Every series' values, concatenated; TypeError when the series have different types (use r[i])."""
+    @property
+    def buckets(self) -> Buckets | TwaBuckets:
+        """Every series' buckets, concatenated: a Buckets (TwaBuckets for query_twa_multi())."""
+    def __getattr__(self, name: str) -> Any: ...
+    def __len__(self) -> int: ...
+    @overload
+    def __getitem__(self, i: int) -> Any: ...
+    @overload
+    def __getitem__(self, i: slice) -> list[Any]: ...
 
 @final
 class TwaBucket:
@@ -1017,6 +1071,154 @@ class Client:
         """Merges the parts of every partition into one (slow on big databases)."""
     def stats(self) -> Stats:
         """Returns database statistics (a Stats)."""
+    def query_values_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> Many:
+        """Reads the rows of many series in one request (protocol version 10).
+
+        The server reads the series in parallel, from one consistent point in
+        time, and answers them in the order asked. Lists of more than 65,536
+        series go as several requests.
+
+        Args:
+            series: Series ids: a list of ints or a uint32 array.
+            start: First timestamp to include (ms): one for every series, or a
+                list or int64 array with one per series; None for no limit.
+            end: Timestamp to stop before, like start.
+            order: "asc" or "desc", for each series.
+            limit: At most this many rows of each series; None for all.
+            threads: Threads the request uses at most; 0 for the server's
+                --request-threads (Db: the database's request_threads).
+            max_rows: Rows of all series together, at most (ERR_TOO_MANY_BUCKETS
+                past it); 0 for the server's --multi-max-rows (Db: no limit).
+            errors: "raise" raises TsdbError (with .index and .result, the
+                Many) for the first series that failed; "status" returns the
+                Many, whose .status tells which failed.
+            numpy: As for query_values().
+
+        Returns:
+            Many: r.ts and r.values hold every series' rows, r.offsets where
+            each begins; r[i] is series i's (timestamps, values).
+
+        Raises:
+            TsdbError: A series failed (errors="raise"), the whole request
+                failed, or the server is older than version 10.
+        """
+    def query_buckets_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """Aggregates many series in one request (protocol version 10).
+
+        Each series is bucketed as query_agg() (interval_ms), query_group()
+        (unit, count, timezone) or query_bounds() (bounds) would; with none of
+        them every series gets one bucket over its range. For a zone other than
+        UTC the client computes the local periods' bounds over all the series.
+
+        Args:
+            series, start, end, order, limit, threads, max_rows, errors: As for
+                query_values_multi(); limit counts buckets.
+            interval_ms: Bucket length in ms: one for all, or one per series.
+            unit, count, timezone: Calendar periods, as for query_group().
+            bounds: Bucket starts for every series, as for query_bounds().
+
+        Returns:
+            Many: r.buckets (a Buckets) holds every series' buckets, whose
+            columns also read from r (r.counts, r.sum, ...); r[i] is series i's
+            Buckets.
+
+        Raises:
+            TsdbError: As for query_values_multi().
+            ValueError: More than one of interval_ms, unit and bounds.
+        """
+    def query_spread_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """The spread aggregates (query_spread()) of many series in one request.
+
+        Arguments and result as for query_buckets_multi(); the buckets have the
+        spread columns (range, var_pop, ...).
+        """
+    def query_twa_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """Time-weighted averages (query_twa()) of many series in one request.
+
+        Arguments as for query_buckets_multi(), with method and max_gap_ms as
+        for query_twa(). r.buckets is a TwaBuckets; r[i] is series i's.
+        """
+    def query_lttb_multi(
+        self,
+        series: _SeriesIds,
+        threshold: int,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> Many:
+        """Downsamples many series with LTTB (query_lttb()) in one request.
+
+        Arguments and result as for query_values_multi(), with threshold as for
+        query_lttb().
+        """
     def last_query_stats(self) -> QueryStats:
         """Returns what the server did for this connection's previous query (a QueryStats).
 
@@ -1043,7 +1245,10 @@ class Db:
         wal_sync_ms: 0: every small write waits for the WAL fsync (the
             default); N > 0: the WAL is synced every N ms; -1: no WAL.
         merge_threads: Background merge threads; 0 disables merges.
-        query_threads: Threads for one query (default: every CPU).
+        query_threads: Query threads of the database, shared by all queries
+            (default: every CPU).
+        request_threads: Threads one query or one multi-series call uses at
+            most, its caller included (default: query_threads).
         The other keywords are the engine's tsdb_options fields of the same
         name; None keeps the engine's default. partition_ms and granule_rows
         are fixed when the database is created. value_codec is "auto",
@@ -1078,6 +1283,7 @@ class Db:
         obsolete_part_lifetime_s: int | None = None,
         verify_checksums: bool | None = None,
         retention_merge_s: int | None = None,
+        request_threads: int | None = None,
     ) -> Db: ...
     def close(self) -> None:
         """Flushes the memtable and closes the database.
@@ -1541,6 +1747,91 @@ class Db:
         """A read-only database: picks up what the writer published since the last refresh."""
     def stats(self) -> Stats:
         """Returns the storage statistics."""
+    def query_values_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> Many:
+        """As Client.query_values_multi(), in this process."""
+    def query_buckets_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """As Client.query_buckets_multi(), in this process."""
+    def query_spread_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """As Client.query_spread_multi(), in this process."""
+    def query_twa_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """As Client.query_twa_multi(), in this process."""
+    def query_lttb_multi(
+        self,
+        series: _SeriesIds,
+        threshold: int,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> Many:
+        """As Client.query_lttb_multi(), in this process."""
     def last_query_stats(self) -> QueryStats:
         """Returns what the last query through this Db read (all zero before the first).
 
@@ -1664,3 +1955,88 @@ class Pool:
                 found before inserting, as in Db.insert_many(), insert nothing).
                 An insert whose connection broke is not retried.
         """
+    def query_values_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> Many:
+        """As Client.query_values_multi() (on one of the connections)."""
+    def query_buckets_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """As Client.query_buckets_multi() (on one of the connections)."""
+    def query_spread_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """As Client.query_spread_multi() (on one of the connections)."""
+    def query_twa_multi(
+        self,
+        series: _SeriesIds,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        interval_ms: int | _Timestamps | None = None,
+        *,
+        unit: _Unit | None = None,
+        count: int = 1,
+        timezone: _TimeZone | None = None,
+        bounds: _Timestamps | None = None,
+        method: _TwaMethod = "step",
+        max_gap_ms: int = 0,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+    ) -> Many:
+        """As Client.query_twa_multi() (on one of the connections)."""
+    def query_lttb_multi(
+        self,
+        series: _SeriesIds,
+        threshold: int,
+        start: int | _Timestamps | None = None,
+        end: int | _Timestamps | None = None,
+        *,
+        order: _Order = "asc",
+        limit: int | None = None,
+        threads: int = 0,
+        max_rows: int = 0,
+        errors: Literal["raise", "status"] = "raise",
+        numpy: bool | None = None,
+    ) -> Many:
+        """As Client.query_lttb_multi() (on one of the connections)."""

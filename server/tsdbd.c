@@ -94,6 +94,8 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,6 +107,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -166,6 +169,7 @@ typedef struct req {
     uint8_t op;
     uint8_t *payload; /* malloc'd, so 16-byte aligned */
     size_t len;
+    bool cancelled; /* a QUERY_MULTI a CANCEL named while it was queued (main thread) */
 } req;
 
 /* What a request costs beyond its payload: the struct and two allocations. Counted with the payload, so frames
@@ -194,7 +198,10 @@ typedef struct conn {
     bool readable, writable, rdhup; /* epoll: what the socket can do, as far as we know */
     bool in_ready, dead;            /* epoll: in the ready list; freed while in it */
     struct conn *ready_next;
+    uint32_t run_id;    /* the request a worker runs (while busy), for CANCEL */
+    uint8_t run_op;
     /* shared with the worker */
+    atomic_bool cancel_running; /* CANCEL named the running QUERY_MULTI */
     pthread_mutex_t lock;
     pthread_cond_t cv;
     buf out;
@@ -331,24 +338,13 @@ static void notify(conn *c, bool done)
 
 static inline void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
-/* Appends a complete reply frame to c's output, waiting while the output is
- * over OUT_CAP. Returns false when the connection is going away. */
-static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t alen, const void *b, size_t blen,
-                  const void *d, size_t dlen)
+/* Appends n pieces to c's output, waiting while the output is over OUT_CAP. Returns false when the connection
+ * is going away. */
+static bool out_put(conn *c, const struct iovec *iov, int n)
 {
-    size_t body = 4 + 1 + 4 + alen + blen + dlen;
-    if (body > TSDB_MAX_FRAME) { /* callers check: a client could not read it, and the length would wrap */
-        atomic_store(&c->closing, true);
-        shutdown(c->fd, SHUT_RDWR);
-        return false;
-    }
-    if (status)
-        metrics_error(status);
-    uint8_t hdr[13];
-    put32(hdr, (uint32_t)body);
-    put32(hdr + 4, id);
-    hdr[8] = TSDB_OP_REPLY;
-    memcpy(hdr + 9, &status, 4);
+    size_t total = 0;
+    for (int i = 0; i < n; i++)
+        total += iov[i].iov_len;
     pthread_mutex_lock(&c->lock);
     if (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
         worker_waits(1);
@@ -364,7 +360,7 @@ static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t al
         worker_waits(-1);
     }
     bool ok = !atomic_load(&c->closing);
-    if (ok && buf_reserve(&c->out, 13 + alen + blen + dlen) != 0) {
+    if (ok && buf_reserve(&c->out, total) != 0) {
         /* a lost reply would leave the client waiting forever: drop the connection instead */
         atomic_store(&c->closing, true);
         shutdown(c->fd, SHUT_RDWR);
@@ -372,17 +368,11 @@ static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t al
     }
     bool wake = false;
     if (ok) {
-        memcpy(c->out.p + c->out.len, hdr, 13);
-        c->out.len += 13;
-        if (alen)
-            memcpy(c->out.p + c->out.len, a, alen);
-        c->out.len += alen;
-        if (blen)
-            memcpy(c->out.p + c->out.len, b, blen);
-        c->out.len += blen;
-        if (dlen)
-            memcpy(c->out.p + c->out.len, d, dlen);
-        c->out.len += dlen;
+        for (int i = 0; i < n; i++) {
+            if (iov[i].iov_len)
+                memcpy(c->out.p + c->out.len, iov[i].iov_base, iov[i].iov_len);
+            c->out.len += iov[i].iov_len;
+        }
         wake = !c->notified;
         c->notified = true;
     }
@@ -390,6 +380,89 @@ static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t al
     if (wake)
         notify(c, false);
     return ok;
+}
+
+/* Small frames of one QUERY_MULTI are gathered here and reach c->out in batches of at least OB_FLUSH bytes: one
+ * lock and one wakeup per batch rather than per series. Frames larger than OB_DIRECT go straight to the output. */
+#define OB_FLUSH (64u << 10)
+#define OB_DIRECT (64u << 10)
+typedef struct obatch {
+    conn *c;
+    uint8_t *p;
+    size_t len, cap;
+} obatch;
+
+static bool ob_flush(obatch *ob)
+{
+    if (!ob || !ob->len)
+        return !ob || !atomic_load(&ob->c->closing);
+    struct iovec v = {ob->p, ob->len};
+    ob->len = 0;
+    return out_put(ob->c, &v, 1);
+}
+
+/* One reply frame: status, the u32 index of a QUERY_MULTI series when ix is not NULL, then up to three pieces of
+ * body. With ob, a small frame is gathered there. Returns false when the connection is going away. */
+static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const uint32_t *ix, const void *a,
+                      size_t alen, const void *b, size_t blen, const void *d, size_t dlen)
+{
+    size_t pre = ix ? TSDB_MULTI_PREFIX : 0;
+    size_t body = 4 + 1 + 4 + pre + alen + blen + dlen;
+    if (body > TSDB_MAX_FRAME + pre) { /* callers check: a client could not read it, and the length would wrap */
+        atomic_store(&c->closing, true);
+        shutdown(c->fd, SHUT_RDWR);
+        return false;
+    }
+    if (status)
+        metrics_error(status);
+    uint8_t hdr[17];
+    put32(hdr, (uint32_t)body);
+    put32(hdr + 4, id);
+    hdr[8] = TSDB_OP_REPLY;
+    memcpy(hdr + 9, &status, 4);
+    if (ix)
+        put32(hdr + 13, *ix);
+    size_t hl = 13 + pre;
+    if (ob && 4 + body <= OB_DIRECT) {
+        if (ob->len + 4 + body > ob->cap) {
+            size_t cap = ob->cap ? ob->cap : OB_FLUSH + OB_DIRECT;
+            while (cap < ob->len + 4 + body)
+                cap *= 2;
+            uint8_t *np = realloc(ob->p, cap);
+            if (!np) {
+                atomic_store(&c->closing, true);
+                shutdown(c->fd, SHUT_RDWR);
+                return false;
+            }
+            ob->p = np;
+            ob->cap = cap;
+        }
+        uint8_t *o = ob->p + ob->len;
+        memcpy(o, hdr, hl);
+        o += hl;
+        if (alen)
+            memcpy(o, a, alen);
+        o += alen;
+        if (blen)
+            memcpy(o, b, blen);
+        o += blen;
+        if (dlen)
+            memcpy(o, d, dlen);
+        ob->len += 4 + body;
+        return ob->len >= OB_FLUSH ? ob_flush(ob) : !atomic_load(&c->closing);
+    }
+    if (ob && !ob_flush(ob))
+        return false;
+    struct iovec v[4] = {{hdr, hl}, {(void *)a, alen}, {(void *)b, blen}, {(void *)d, dlen}};
+    return out_put(c, v, 4);
+}
+
+/* Appends a complete reply frame to c's output, waiting while the output is over OUT_CAP. Returns false when the
+ * connection is going away. */
+static bool reply(conn *c, uint32_t id, int32_t status, const void *a, size_t alen, const void *b, size_t blen,
+                  const void *d, size_t dlen)
+{
+    return frame_put(c, NULL, id, status, NULL, a, alen, b, blen, d, dlen);
 }
 
 static void reply_status(conn *c, uint32_t id, int32_t status) { reply(c, id, status, NULL, 0, NULL, 0, NULL, 0); }
@@ -443,6 +516,8 @@ typedef struct values_out {
     uint8_t *v; /* values, then room for the bitmap */
     uint32_t n;
     bool gone;
+    obatch *ob;        /* QUERY_MULTI: frames gathered here, each with the series' index */
+    const uint32_t *ix;
 } values_out;
 
 static bool values_flush(values_out *o, bool last, int32_t status)
@@ -454,7 +529,7 @@ static bool values_flush(values_out *o, bool last, int32_t status)
     size_t valid = o->any_null ? ((size_t)o->n + 7) / 8 : 0;
     if (valid)
         memmove(o->v + vb, o->v + (size_t)RAW_CHUNK_ROWS * 8, valid); /* the bitmap right after the values */
-    bool ok = reply(o->c, o->id, status, h, 8, o->ts, (size_t)o->n * 8, o->v, vb + valid);
+    bool ok = frame_put(o->c, o->ob, o->id, status, o->ix, h, 8, o->ts, (size_t)o->n * 8, o->v, vb + valid);
     o->n = 0;
     o->any_null = 0;
     if (o->v) /* NULL for an error reply before any rows */
@@ -541,106 +616,406 @@ static size_t frame_limit(uint64_t lim, size_t row)
     return lim > cap ? cap + 1 : (size_t)lim;
 }
 
+/* Bucket and TWA replies are the structs themselves: their layout is the wire's (little endian, no padding). */
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the wire is little endian");
+_Static_assert(sizeof(tsdb_bucket) == TSDB_BUCKET_ROW && offsetof(tsdb_bucket, count) == 8 &&
+                   offsetof(tsdb_bucket, sum) == 16 && offsetof(tsdb_bucket, min) == 24 &&
+                   offsetof(tsdb_bucket, max) == 32 && offsetof(tsdb_bucket, isum) == 40 &&
+                   offsetof(tsdb_bucket, imin) == 48 && offsetof(tsdb_bucket, imax) == 56,
+               "tsdb_bucket is a QUERY_BUCKETS row");
+_Static_assert(sizeof(tsdb_spread_bucket) == TSDB_SPREAD_ROW && offsetof(tsdb_spread_bucket, range) == 64 &&
+                   offsetof(tsdb_spread_bucket, var_pop) == 72 && offsetof(tsdb_spread_bucket, var_samp) == 80 &&
+                   offsetof(tsdb_spread_bucket, stddev_pop) == 88 && offsetof(tsdb_spread_bucket, stddev_samp) == 96,
+               "tsdb_spread_bucket is a TSDB_SPREAD row");
+_Static_assert(sizeof(tsdb_twa_bucket) == TSDB_TWA_ROW && offsetof(tsdb_twa_bucket, twa) == 8 &&
+                   offsetof(tsdb_twa_bucket, area) == 16 && offsetof(tsdb_twa_bucket, covered_ms) == 24 &&
+                   offsetof(tsdb_twa_bucket, count) == 32,
+               "tsdb_twa_bucket is a QUERY_TWA row");
+
+/* nb rows of `row` bytes in one frame (with the index of a QUERY_MULTI series when ix is not NULL); too many for a
+ * frame: TOO_MANY_BUCKETS. Returns false when the connection is going away. */
+static bool reply_rows(conn *c, obatch *ob, uint32_t id, const uint32_t *ix, const void *rows, size_t nb, size_t row)
+{
+    if (nb > frame_rows(row))
+        return frame_put(c, ob, id, TSDB_ERR_TOO_MANY_BUCKETS, ix, NULL, 0, NULL, 0, NULL, 0);
+    uint32_t n = (uint32_t)nb;
+    return frame_put(c, ob, id, 0, ix, &n, 4, rows, nb * row, NULL, 0);
+}
+
 static void reply_buckets(conn *c, uint32_t id, const void *bb, size_t nb, uint8_t fields)
 {
-    size_t row = fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
-    size_t stride = fields & TSDB_SPREAD ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
-    if (nb > frame_rows(row)) {
-        reply_status(c, id, TSDB_ERR_TOO_MANY_BUCKETS);
-        return;
-    }
-    uint8_t *rows = malloc(nb * row + 1);
-    if (!rows) {
-        reply_status(c, id, TSDB_ERR_NOMEM);
-        return;
-    }
-    for (size_t i = 0; i < nb; i++) {
-        uint8_t *o = rows + i * row;
-        const tsdb_bucket *b = (const tsdb_bucket *)((const uint8_t *)bb + i * stride);
-        const tsdb_spread_bucket *sb = (const tsdb_spread_bucket *)b;
-        memcpy(o, &b->start, 8);
-        memcpy(o + 8, &b->count, 8);
-        memcpy(o + 16, &b->sum, 8);
-        memcpy(o + 24, &b->min, 8);
-        memcpy(o + 32, &b->max, 8);
-        memcpy(o + 40, &b->isum, 8);
-        memcpy(o + 48, &b->imin, 8);
-        memcpy(o + 56, &b->imax, 8);
-        if (fields & TSDB_SPREAD) {
-            memcpy(o + 64, &sb->range, 8);
-            memcpy(o + 72, &sb->var_pop, 8);
-            memcpy(o + 80, &sb->var_samp, 8);
-            memcpy(o + 88, &sb->stddev_pop, 8);
-            memcpy(o + 96, &sb->stddev_samp, 8);
-        }
-    }
-    uint32_t n = (uint32_t)nb;
-    reply(c, id, 0, &n, 4, rows, nb * row, NULL, 0);
-    free(rows);
+    reply_rows(c, NULL, id, NULL, bb, nb, fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW);
 }
 
-static void reply_twa(conn *c, uint32_t id, const tsdb_twa_bucket *b, size_t nb)
+/* A query request, parsed. The single handlers and QUERY_MULTI (whose template is the same payload) share the
+ * parsers below, so both accept exactly the same requests. */
+typedef struct qreq {
+    uint32_t series;
+    int64_t start, end, interval;
+    tsdb_query_opts q;
+    uint64_t threshold; /* LTTB */
+    uint8_t unit, fields;
+    uint32_t count;
+    char *zone;       /* QUERY_BUCKETS; owned */
+    int64_t *bounds;  /* QUERY_BOUNDS, QUERY_TWA; owned, aligned */
+    uint32_t nbounds;
+    tsdb_twa_opts twa;
+} qreq;
+
+static void qreq_free(qreq *r)
 {
-    if (nb > frame_rows(TSDB_TWA_ROW)) {
-        reply_status(c, id, TSDB_ERR_TOO_MANY_BUCKETS);
-        return;
-    }
-    uint8_t *rows = malloc(nb * TSDB_TWA_ROW + 1);
-    if (!rows) {
-        reply_status(c, id, TSDB_ERR_NOMEM);
-        return;
-    }
-    for (size_t i = 0; i < nb; i++) {
-        uint8_t *o = rows + i * TSDB_TWA_ROW;
-        memcpy(o, &b[i].start, 8);
-        memcpy(o + 8, &b[i].twa, 8);
-        memcpy(o + 16, &b[i].area, 8);
-        memcpy(o + 24, &b[i].covered_ms, 8);
-        memcpy(o + 32, &b[i].count, 8);
-    }
-    uint32_t n = (uint32_t)nb;
-    reply(c, id, 0, &n, 4, rows, nb * TSDB_TWA_ROW, NULL, 0);
-    free(rows);
+    free(r->zone);
+    free(r->bounds);
 }
 
-/* QUERY_TWA: one request for the interval, calendar and bounds forms */
-static int handle_twa(conn *c, uint32_t id, const uint8_t *p, size_t len)
+static int copy_bounds(qreq *r, const uint8_t *p, uint32_t n)
 {
-    uint32_t s, count, n;
-    int64_t start, end, gap, interval;
+    r->nbounds = n;
+    if (!n)
+        return 0;
+    r->bounds = malloc((size_t)n * 8);
+    if (!r->bounds)
+        return TSDB_ERR_NOMEM;
+    memcpy(r->bounds, p, (size_t)n * 8);
+    return 0;
+}
+
+/* QUERY_VALUES and QUERY_LTTB (the latter: the threshold, then optional order and limit since version 9) */
+static int parse_values(const uint8_t *p, size_t len, bool lttb, qreq *r)
+{
+    *r = (qreq){.q = {TSDB_ASC, 0}};
+    if (lttb ? len != 28 && len != 37 : len != 20 && len != 29)
+        return TSDB_ERR_INVALID;
+    memcpy(&r->series, p, 4);
+    memcpy(&r->start, p + 4, 8);
+    memcpy(&r->end, p + 12, 8);
+    if (lttb)
+        memcpy(&r->threshold, p + 20, 8);
+    if (len == 29 || len == 37) {
+        uint64_t lim;
+        size_t at = lttb ? 28 : 20;
+        r->q.order = p[at] ? TSDB_DESC : TSDB_ASC;
+        memcpy(&lim, p + at + 1, 8);
+        r->q.limit = lim > SIZE_MAX ? SIZE_MAX : (size_t)lim;
+    }
+    return lttb && r->threshold > SIZE_MAX ? TSDB_ERR_INVALID : 0;
+}
+
+/* QUERY_BUCKETS: interval or UTC calendar groups, optional fields (version 8) after the zone */
+static int parse_buckets(const uint8_t *p, size_t len, qreq *r)
+{
+    *r = (qreq){0};
+    uint16_t zl;
+    uint64_t lim;
+    if (len < 44 || (memcpy(&zl, p + 42, 2), len != 44u + zl && len != 45u + zl) || memchr(p + 44, 0, zl) ||
+        (len == 45u + zl && ((r->fields = p[44 + zl]) & ~TSDB_SPREAD)))
+        return TSDB_ERR_INVALID;
+    memcpy(&r->series, p, 4);
+    memcpy(&r->start, p + 4, 8);
+    memcpy(&r->end, p + 12, 8);
+    memcpy(&r->interval, p + 20, 8);
+    r->unit = p[28];
+    memcpy(&r->count, p + 29, 4);
+    memcpy(&lim, p + 34, 8);
+    r->q = (tsdb_query_opts){p[33] ? TSDB_DESC : TSDB_ASC,
+                             frame_limit(lim, r->fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW)};
+    if (zl && !(r->zone = strndup((const char *)p + 44, zl)))
+        return TSDB_ERR_NOMEM;
+    return 0;
+}
+
+/* QUERY_BOUNDS: client bounds, optional fields after them */
+static int parse_bounds(const uint8_t *p, size_t len, qreq *r)
+{
+    *r = (qreq){0};
+    uint32_t n;
+    uint64_t lim;
+    if (len < 33 || (memcpy(&n, p + 29, 4), len != 33 + (size_t)n * 8 && len != 34 + (size_t)n * 8) || n == 0 ||
+        (len == 34 + (size_t)n * 8 && ((r->fields = p[33 + (size_t)n * 8]) & ~TSDB_SPREAD)))
+        return TSDB_ERR_INVALID;
+    memcpy(&r->series, p, 4);
+    memcpy(&r->start, p + 4, 8);
+    memcpy(&r->end, p + 12, 8);
+    memcpy(&lim, p + 21, 8);
+    r->q = (tsdb_query_opts){p[20] ? TSDB_DESC : TSDB_ASC,
+                             frame_limit(lim, r->fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW)};
+    return copy_bounds(r, p + 33, n);
+}
+
+/* QUERY_TWA: the interval, calendar and bounds forms */
+static int parse_twa(const uint8_t *p, size_t len, qreq *r)
+{
+    *r = (qreq){0};
+    uint32_t n;
+    int64_t gap;
     uint64_t lim;
     if (len < TSDB_TWA_HEADER || (memcpy(&n, p + 52, 4), len != TSDB_TWA_HEADER + (size_t)n * 8) || p[23])
         return TSDB_ERR_INVALID;
-    memcpy(&s, p, 4);
-    memcpy(&start, p + 4, 8);
-    memcpy(&end, p + 12, 8);
+    memcpy(&r->series, p, 4);
+    memcpy(&r->start, p + 4, 8);
+    memcpy(&r->end, p + 12, 8);
     memcpy(&gap, p + 24, 8);
     memcpy(&lim, p + 32, 8);
-    memcpy(&interval, p + 40, 8);
-    memcpy(&count, p + 48, 4);
-    tsdb_twa_opts o = {.method = (tsdb_twa_method)p[20], .max_gap_ms = gap, .order = p[21] ? TSDB_DESC : TSDB_ASC,
-                       .limit = (size_t)lim};
-    uint8_t unit = p[22];
+    memcpy(&r->interval, p + 40, 8);
+    memcpy(&r->count, p + 48, 4);
+    r->twa = (tsdb_twa_opts){.method = (tsdb_twa_method)p[20], .max_gap_ms = gap,
+                             .order = p[21] ? TSDB_DESC : TSDB_ASC, .limit = (size_t)lim};
+    r->unit = p[22];
+    if ((n && (r->unit || r->interval)) || (r->unit && r->interval))
+        return TSDB_ERR_INVALID;
+    return copy_bounds(r, p + TSDB_TWA_HEADER, n);
+}
+
+static int handle_twa(conn *c, uint32_t id, const uint8_t *p, size_t len)
+{
+    qreq r;
     tsdb_twa_bucket *b = NULL;
     size_t nb = 0;
-    int rc;
-    if (n) {
-        int64_t *bounds = malloc((size_t)n * 8); /* aligned copy */
-        if (!bounds)
-            return TSDB_ERR_NOMEM;
-        memcpy(bounds, p + TSDB_TWA_HEADER, (size_t)n * 8);
-        rc = unit || interval ? TSDB_ERR_INVALID : tsdb_query_twa_bounds(db, s, start, end, bounds, n, &o, &b, &nb);
-        free(bounds);
-    } else if (unit) {
-        tsdb_group g = {(tsdb_unit)unit, count, NULL};
-        rc = interval ? TSDB_ERR_INVALID : tsdb_query_twa_group(db, s, start, end, &g, &o, &b, &nb);
-    } else {
-        rc = tsdb_query_twa(db, s, start, end, interval, &o, &b, &nb);
+    int rc = parse_twa(p, len, &r);
+    if (rc == 0) {
+        if (r.nbounds) {
+            rc = tsdb_query_twa_bounds(db, r.series, r.start, r.end, r.bounds, r.nbounds, &r.twa, &b, &nb);
+        } else if (r.unit) {
+            tsdb_group g = {(tsdb_unit)r.unit, r.count, NULL};
+            rc = tsdb_query_twa_group(db, r.series, r.start, r.end, &g, &r.twa, &b, &nb);
+        } else {
+            rc = tsdb_query_twa(db, r.series, r.start, r.end, r.interval, &r.twa, &b, &nb);
+        }
     }
+    qreq_free(&r);
     if (rc == 0)
-        reply_twa(c, id, b, nb);
+        reply_rows(c, NULL, id, NULL, b, nb, TSDB_TWA_ROW);
     free(b);
     return rc;
+}
+
+/* ------------------------------------------------------------ QUERY_MULTI */
+
+static uint64_t multi_max_rows = 268435456; /* --multi-max-rows */
+
+typedef struct mctx {
+    conn *c;
+    uint32_t id;
+    uint8_t op, fields;
+    obatch ob;
+    values_out vo; /* VALUES, LTTB: the chunks of the series at the head */
+    size_t cur;    /* the index vo is for, or SIZE_MAX */
+    uint32_t answered;
+    bool gone;
+} mctx;
+
+static int multi_fn(void *ctx, const tsdb_series_result *r)
+{
+    mctx *m = ctx;
+    if (m->gone)
+        return 1;
+    uint32_t ix = (uint32_t)r->index;
+    bool ok = true;
+    if (m->op == TSDB_OP_QUERY_VALUES || m->op == TSDB_OP_QUERY_LTTB) {
+        values_out *o = &m->vo;
+        if (m->cur != r->index) { /* a new series: its frames carry its type, as a single request's do */
+            tsdb_type t = TSDB_FLOAT32;
+            tsdb_series_type(db, r->series, &t);
+            o->type = (uint8_t)t;
+            m->cur = r->index;
+        }
+        o->ix = &ix;
+        if (r->n && !r->status && values_cb(o, r->ts, &r->values, r->n) != 0)
+            ok = false;
+        if (ok && r->last)
+            ok = values_flush(o, true, r->status); /* the rest of the rows, or the error */
+        o->ix = NULL;
+    } else if (r->status) {
+        ok = frame_put(m->c, &m->ob, m->id, r->status, &ix, NULL, 0, NULL, 0, NULL, 0);
+    } else {
+        size_t row = m->op == TSDB_OP_QUERY_TWA ? TSDB_TWA_ROW
+                     : m->fields & TSDB_SPREAD  ? TSDB_SPREAD_ROW
+                                                : TSDB_BUCKET_ROW;
+        ok = reply_rows(m->c, &m->ob, m->id, &ix, r->buckets, r->n, row);
+    }
+    if (!ok) {
+        m->gone = true;
+        return 1;
+    }
+    if (r->last)
+        m->answered++;
+    return 0;
+}
+
+static int multi_cancelled(void *ctx)
+{
+    conn *c = ((mctx *)ctx)->c;
+    return atomic_load_explicit(&c->cancel_running, memory_order_relaxed) || atomic_load(&c->closing);
+}
+
+static void multi_on_wait(void *ctx, int delta)
+{
+    mctx *m = ctx;
+    if (delta > 0 && !ob_flush(&m->ob)) /* what is ready goes out while the head is computed */
+        m->gone = true;
+    worker_waits(delta);
+}
+
+/* Results held ahead of the head count against --max-request-memory; refused, the request goes on head-only. */
+static int multi_budget_take(void *ctx, size_t n)
+{
+    (void)ctx;
+    size_t cur = atomic_load_explicit(&req_held, memory_order_relaxed);
+    do {
+        if (cur + n > req_budget)
+            return 1;
+    } while (!atomic_compare_exchange_weak_explicit(&req_held, &cur, cur + n, memory_order_relaxed,
+                                                    memory_order_relaxed));
+    return 0;
+}
+
+static void multi_budget_give(void *ctx, size_t n)
+{
+    (void)ctx;
+    atomic_fetch_sub_explicit(&req_held, n, memory_order_relaxed);
+}
+
+static void multi_on_deferred(void *ctx)
+{
+    (void)ctx;
+    metrics_multi_deferred();
+}
+
+/* The multi query of a QUERY_MULTI request: the header's arrays (aligned in the payload, which malloc returned)
+ * and the template, parsed by the single op's parser into qr. */
+static int multi_parse(const uint8_t *p, size_t len, tsdb_multi_query *q, qreq *qr, const uint32_t **series,
+                       uint32_t *np, uint8_t *op, uint16_t *threads, uint64_t *max_rows)
+{
+    *qr = (qreq){0};
+    if (len < TSDB_MULTI_HEADER)
+        return TSDB_ERR_INVALID;
+    uint8_t flags = p[1];
+    uint32_t n, tlen, zero;
+    *op = p[0];
+    memcpy(threads, p + 2, 2);
+    memcpy(&n, p + 4, 4);
+    memcpy(max_rows, p + 8, 8);
+    memcpy(&tlen, p + 16, 4);
+    memcpy(&zero, p + 20, 4);
+    if (zero || n == 0 || n > TSDB_MULTI_MAX_SERIES || (flags & ~31u))
+        return TSDB_ERR_INVALID;
+    size_t at = TSDB_MULTI_HEADER;
+    const int64_t *arr[3] = {NULL, NULL, NULL};
+    for (int k = 0; k < 3; k++)
+        if (flags & (1u << k)) {
+            arr[k] = (const int64_t *)(const void *)(p + at);
+            at += (size_t)n * 8;
+        }
+    size_t sat = at;
+    at = (at + (size_t)n * 4 + 7) & ~(size_t)7;
+    if (len < at || len - at != tlen)
+        return TSDB_ERR_INVALID;
+    for (size_t i = sat + (size_t)n * 4; i < at; i++)
+        if (p[i])
+            return TSDB_ERR_INVALID;
+    *series = (const uint32_t *)(const void *)(p + sat);
+    *np = n;
+    const uint8_t *t = p + at;
+    bool per_iv = flags & TSDB_MULTI_PER_INTERVAL;
+    unsigned trim = (flags & TSDB_MULTI_WIRE_TRIM_LO ? TSDB_MULTI_TRIM_LO : 0) |
+                    (flags & TSDB_MULTI_WIRE_TRIM_HI ? TSDB_MULTI_TRIM_HI : 0);
+    int rc;
+    *q = (tsdb_multi_query){0};
+    switch (*op) {
+    case TSDB_OP_QUERY_VALUES:
+    case TSDB_OP_QUERY_LTTB:
+        rc = parse_values(t, tlen, *op == TSDB_OP_QUERY_LTTB, qr);
+        if (rc == 0 && (per_iv || trim))
+            rc = TSDB_ERR_INVALID;
+        q->kind = *op == TSDB_OP_QUERY_LTTB ? TSDB_MULTI_LTTB : TSDB_MULTI_VALUES;
+        q->opts = qr->q;
+        q->threshold = (size_t)qr->threshold;
+        break;
+    case TSDB_OP_QUERY_BUCKETS:
+        rc = parse_buckets(t, tlen, qr);
+        /* the server knows UTC only: a zone other than UTC is the single request's INVALID */
+        if (rc == 0 && ((qr->zone && strcmp(qr->zone, "UTC") != 0) || trim || (per_iv && (qr->unit || qr->interval))))
+            rc = TSDB_ERR_INVALID;
+        q->kind = qr->fields & TSDB_SPREAD ? TSDB_MULTI_SPREAD : TSDB_MULTI_BUCKETS;
+        q->opts = qr->q;
+        q->interval_ms = qr->interval;
+        break;
+    case TSDB_OP_QUERY_BOUNDS:
+        rc = parse_bounds(t, tlen, qr);
+        if (rc == 0 && per_iv)
+            rc = TSDB_ERR_INVALID;
+        q->kind = qr->fields & TSDB_SPREAD ? TSDB_MULTI_SPREAD : TSDB_MULTI_BUCKETS;
+        q->opts = qr->q;
+        break;
+    case TSDB_OP_QUERY_TWA:
+        rc = parse_twa(t, tlen, qr);
+        if (rc == 0 && ((trim && !qr->nbounds) || (per_iv && (qr->nbounds || qr->unit || qr->interval))))
+            rc = TSDB_ERR_INVALID;
+        q->kind = TSDB_MULTI_TWA;
+        q->twa = qr->twa;
+        q->interval_ms = qr->interval;
+        break;
+    default: return TSDB_ERR_INVALID;
+    }
+    if (rc)
+        return rc;
+    /* the template names no series, and a field a per-series array replaces is 0 in it */
+    if (qr->series != TSDB_MANY_SERIES || (arr[0] && qr->start) || (arr[1] && qr->end))
+        return TSDB_ERR_INVALID;
+    q->start = qr->start;
+    q->end = qr->end;
+    q->starts = arr[0];
+    q->ends = arr[1];
+    q->intervals = arr[2];
+    q->bounds = qr->bounds;
+    q->nbounds = qr->nbounds;
+    q->trim = trim;
+    return 0;
+}
+
+static void handle_multi(conn *c, req *r)
+{
+    static const uint32_t end_ix = TSDB_MULTI_END;
+    mctx m = {.c = c, .id = r->id, .ob = {.c = c}, .cur = SIZE_MAX};
+    tsdb_multi_query q;
+    qreq qr;
+    tsdb_group g = {0};
+    const uint32_t *series = NULL;
+    uint32_t n = 0;
+    uint16_t threads = 0;
+    uint64_t max_rows = 0;
+    int rc = multi_parse(r->payload, r->len, &q, &qr, &series, &n, &m.op, &threads, &max_rows);
+    if (rc == 0 && (m.op == TSDB_OP_QUERY_VALUES || m.op == TSDB_OP_QUERY_LTTB)) {
+        m.vo = (values_out){.c = c, .id = r->id, .ob = &m.ob};
+        m.vo.ts = malloc(RAW_CHUNK_ROWS * 8);
+        m.vo.v = calloc((size_t)RAW_CHUNK_ROWS * 8 + RAW_CHUNK_ROWS / 8, 1);
+        if (!m.vo.ts || !m.vo.v)
+            rc = TSDB_ERR_NOMEM;
+    }
+    if (rc == 0) {
+        m.fields = qr.fields;
+        if ((m.op == TSDB_OP_QUERY_BUCKETS || m.op == TSDB_OP_QUERY_TWA) && qr.unit) {
+            g = (tsdb_group){(tsdb_unit)qr.unit, qr.count, NULL}; /* UTC */
+            q.group = &g;
+        }
+        tsdb_multi_opts mo = {.threads = threads,
+                              .max_rows = max_rows == 0 || max_rows > multi_max_rows ? multi_max_rows : max_rows,
+                              .cancelled = multi_cancelled,
+                              .on_wait = multi_on_wait,
+                              .budget_take = multi_budget_take,
+                              .budget_give = multi_budget_give,
+                              .on_deferred = multi_on_deferred,
+                              .hook_ctx = &m};
+        rc = tsdb_query_multi(db, &q, series, n, &mo, multi_fn, &m);
+    }
+    qreq_free(&qr);
+    free(m.vo.ts);
+    free(m.vo.v);
+    metrics_multi_series(m.answered);
+    if (!m.gone)
+        frame_put(c, &m.ob, r->id, rc, &end_ix, &m.answered, 4, NULL, 0, NULL, 0);
+    ob_flush(&m.ob);
+    free(m.ob.p);
 }
 
 static void handle(req *r)
@@ -898,27 +1273,13 @@ static void handle(req *r)
     case TSDB_OP_QUERY_VALUES:
     case TSDB_OP_QUERY_LTTB: { /* the same chunks: LTTB's points are rows of the series */
         bool lttb = r->op == TSDB_OP_QUERY_LTTB;
-        values_out o = {c, r->id, 0, 0, NULL, NULL, 0, false};
-        if (lttb ? len != 28 && len != 37 : len != 20 && len != 29) { /* version 9: LTTB's order and limit */
+        values_out o = {c, r->id, 0, 0, NULL, NULL, 0, false, NULL, NULL};
+        qreq qr;
+        if (parse_values(p, len, lttb, &qr) != 0) {
             values_flush(&o, true, TSDB_ERR_INVALID);
             return;
         }
-        uint32_t s;
-        int64_t start, end;
-        tsdb_query_opts q = {TSDB_ASC, 0};
-        memcpy(&s, p, 4);
-        memcpy(&start, p + 4, 8);
-        memcpy(&end, p + 12, 8);
-        uint64_t threshold = 0;
-        if (lttb)
-            memcpy(&threshold, p + 20, 8);
-        if (len == 29 || len == 37) {
-            uint64_t lim;
-            size_t at = lttb ? 28 : 20;
-            q.order = p[at] ? TSDB_DESC : TSDB_ASC;
-            memcpy(&lim, p + at + 1, 8);
-            q.limit = lim > SIZE_MAX ? SIZE_MAX : (size_t)lim;
-        }
+        uint32_t s = qr.series;
         tsdb_type t = TSDB_FLOAT32;
         tsdb_series_type(db, s, &t); /* an unknown series: no rows */
         o.type = (uint8_t)t;
@@ -933,11 +1294,9 @@ static void handle(req *r)
             return;
         }
         if (!lttb)
-            rc = tsdb_query_values(db, s, start, end, &q, values_cb, &o);
-        else if (threshold > SIZE_MAX)
-            rc = TSDB_ERR_INVALID;
+            rc = tsdb_query_values(db, s, qr.start, qr.end, &qr.q, values_cb, &o);
         else
-            rc = tsdb_query_lttb_ex(db, s, start, end, (size_t)threshold, &q, values_cb, &o);
+            rc = tsdb_query_lttb_ex(db, s, qr.start, qr.end, (size_t)qr.threshold, &qr.q, values_cb, &o);
         if (!o.gone)
             values_flush(&o, true, rc); /* the rest of the rows, or the error */
         free(o.ts);
@@ -979,47 +1338,28 @@ static void handle(req *r)
         return;
     }
     case TSDB_OP_QUERY_BUCKETS: {
-        uint32_t s, count;
-        int64_t start, end, interval;
-        uint64_t lim;
-        uint16_t zl;
-        uint8_t fields = 0; /* version 8: an optional byte after the zone */
-        if (len < 44 || (memcpy(&zl, p + 42, 2), len != 44u + zl && len != 45u + zl) || memchr(p + 44, 0, zl) ||
-            (len == 45u + zl && ((fields = p[44 + zl]) & ~TSDB_SPREAD))) {
-            rc = TSDB_ERR_INVALID;
-            break;
-        }
-        memcpy(&s, p, 4);
-        memcpy(&start, p + 4, 8);
-        memcpy(&end, p + 12, 8);
-        memcpy(&interval, p + 20, 8);
-        memcpy(&count, p + 29, 4);
-        memcpy(&lim, p + 34, 8);
-        tsdb_query_opts q = {p[33] ? TSDB_DESC : TSDB_ASC,
-                             frame_limit(lim, fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW)};
+        qreq qr;
         tsdb_bucket *b = NULL;
         size_t nb = 0;
-        char *zone = zl ? strndup((const char *)p + 44, zl) : NULL;
-        tsdb_group g = {(tsdb_unit)p[28], count, zone};
-        if (zl && !zone) {
-            rc = TSDB_ERR_NOMEM;
-        } else if (fields & TSDB_SPREAD) { /* the spread costs a second pass: only when asked for */
-            tsdb_spread_bucket *sb = NULL;
-            rc = p[28] == 0 ? tsdb_query_spread(db, s, start, end, interval, &q, &sb, &nb)
-                            : tsdb_query_spread_group(db, s, start, end, &g, &q, &sb, &nb);
-            b = (tsdb_bucket *)sb;
-        } else if (p[28] == 0) {
-            rc = tsdb_query_agg_ex(db, s, start, end, interval, &q, &b, &nb);
-        } else {
-            rc = tsdb_query_group_ex(db, s, start, end, &g, &q, &b, &nb);
+        if ((rc = parse_buckets(p, len, &qr)) == 0) {
+            tsdb_group g = {(tsdb_unit)qr.unit, qr.count, qr.zone};
+            if (qr.fields & TSDB_SPREAD) { /* the spread costs a second pass: only when asked for */
+                tsdb_spread_bucket *sb = NULL;
+                rc = qr.unit == 0 ? tsdb_query_spread(db, qr.series, qr.start, qr.end, qr.interval, &qr.q, &sb, &nb)
+                                  : tsdb_query_spread_group(db, qr.series, qr.start, qr.end, &g, &qr.q, &sb, &nb);
+                b = (tsdb_bucket *)sb;
+            } else if (qr.unit == 0) {
+                rc = tsdb_query_agg_ex(db, qr.series, qr.start, qr.end, qr.interval, &qr.q, &b, &nb);
+            } else {
+                rc = tsdb_query_group_ex(db, qr.series, qr.start, qr.end, &g, &qr.q, &b, &nb);
+            }
         }
-        free(zone);
-        if (rc == 0) {
-            reply_buckets(c, r->id, b, nb, fields);
-            free(b);
-            return;
-        }
+        if (rc == 0)
+            reply_buckets(c, r->id, b, nb, qr.fields);
+        qreq_free(&qr);
         free(b);
+        if (rc == 0)
+            return;
         break;
     }
     case TSDB_OP_LAST_STATS: {
@@ -1032,49 +1372,32 @@ static void handle(req *r)
         return;
     }
     case TSDB_OP_QUERY_BOUNDS: {
-        uint32_t s, n;
-        int64_t start, end;
-        uint64_t lim;
-        uint8_t fields = 0; /* version 8: an optional byte after the bounds */
-        if (len < 33 || (memcpy(&n, p + 29, 4), len != 33 + (size_t)n * 8 && len != 34 + (size_t)n * 8) || n == 0 ||
-            (len == 34 + (size_t)n * 8 && ((fields = p[33 + (size_t)n * 8]) & ~TSDB_SPREAD))) {
-            rc = TSDB_ERR_INVALID;
-            break;
-        }
-        memcpy(&s, p, 4);
-        memcpy(&start, p + 4, 8);
-        memcpy(&end, p + 12, 8);
-        memcpy(&lim, p + 21, 8);
-        tsdb_query_opts q = {p[20] ? TSDB_DESC : TSDB_ASC,
-                             frame_limit(lim, fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW)};
-        int64_t *bounds = malloc((size_t)n * 8); /* aligned copy */
+        qreq qr;
         tsdb_bucket *b = NULL;
         size_t nb = 0;
-        if (!bounds) {
-            rc = TSDB_ERR_NOMEM;
-            break;
+        if ((rc = parse_bounds(p, len, &qr)) == 0) {
+            if (qr.fields & TSDB_SPREAD) {
+                tsdb_spread_bucket *sb = NULL;
+                rc = tsdb_query_spread_bounds(db, qr.series, qr.start, qr.end, qr.bounds, qr.nbounds, &qr.q, &sb,
+                                              &nb);
+                b = (tsdb_bucket *)sb;
+            } else {
+                rc = tsdb_query_bounds(db, qr.series, qr.start, qr.end, qr.bounds, qr.nbounds, &qr.q, &b, &nb);
+            }
         }
-        memcpy(bounds, p + 33, (size_t)n * 8);
-        if (fields & TSDB_SPREAD) {
-            tsdb_spread_bucket *sb = NULL;
-            rc = tsdb_query_spread_bounds(db, s, start, end, bounds, n, &q, &sb, &nb);
-            b = (tsdb_bucket *)sb;
-        } else {
-            rc = tsdb_query_bounds(db, s, start, end, bounds, n, &q, &b, &nb);
-        }
-        free(bounds);
-        if (rc == 0) {
-            reply_buckets(c, r->id, b, nb, fields);
-            free(b);
-            return;
-        }
+        if (rc == 0)
+            reply_buckets(c, r->id, b, nb, qr.fields);
+        qreq_free(&qr);
         free(b);
+        if (rc == 0)
+            return;
         break;
     }
     case TSDB_OP_QUERY_TWA:
         if ((rc = handle_twa(c, r->id, p, len)) == 0)
             return;
         break;
+    case TSDB_OP_QUERY_MULTI: handle_multi(c, r); return;
     case TSDB_OP_DELETE_RANGE: {
         uint32_t s, zero;
         int64_t start, end;
@@ -1181,7 +1504,7 @@ static void *worker_main(void *arg)
         metrics_request_end(r->op, began);
         if (r->op == TSDB_OP_QUERY_RAW || r->op == TSDB_OP_QUERY_AGG || r->op == TSDB_OP_QUERY_GROUP ||
             r->op == TSDB_OP_QUERY_VALUES || r->op == TSDB_OP_QUERY_BUCKETS || r->op == TSDB_OP_QUERY_BOUNDS ||
-            r->op == TSDB_OP_QUERY_LTTB || r->op == TSDB_OP_QUERY_TWA) {
+            r->op == TSDB_OP_QUERY_LTTB || r->op == TSDB_OP_QUERY_TWA || r->op == TSDB_OP_QUERY_MULTI) {
             tsdb_query_stats st;
             tsdb_last_query_stats(&st); /* this worker ran it */
             pthread_mutex_lock(&r->c->lock);
@@ -1406,6 +1729,9 @@ static void dispatch(conn *c)
     r->next = NULL;
     c->q_bytes -= REQ_COST(r);
     c->busy = true;
+    c->run_id = r->id;
+    c->run_op = r->op;
+    atomic_store(&c->cancel_running, r->cancelled);
     pthread_mutex_lock(&work_lock);
     if (work_tail)
         work_tail->next = r;
@@ -1480,6 +1806,17 @@ static void finish_if_drained(conn *c)
 
 /* Splits received bytes into requests. Returns 0, -1 on a protocol error, or 1 when the frame begun needs a
  * buffer that the request memory cannot have yet (the connection is then parked, unread). */
+/* CANCEL: the QUERY_MULTI with that id ends after the series in flight, whether a worker runs it or it waits in
+ * the connection's queue. Main thread. */
+static void cancel_multi(conn *c, uint32_t id)
+{
+    for (req *r = c->q_head; r; r = r->next)
+        if (r->op == TSDB_OP_QUERY_MULTI && r->id == id)
+            r->cancelled = true;
+    if (c->busy && c->run_op == TSDB_OP_QUERY_MULTI && c->run_id == id)
+        atomic_store(&c->cancel_running, true);
+}
+
 static int parse(conn *c)
 {
     size_t off = 0;
@@ -1516,6 +1853,17 @@ static int parse(conn *c)
                 in_account(c);
             }
             break;
+        }
+        if (c->in.p[off + 8] == TSDB_OP_CANCEL) { /* no reply, and it must not wait behind the query it stops */
+            if (flen == 9) {
+                uint32_t target;
+                memcpy(&target, c->in.p + off + 9, 4);
+                cancel_multi(c, target);
+            }
+            metrics_request_end(TSDB_OP_CANCEL, metrics_request_begin());
+            off += need;
+            consumed = true;
+            continue;
         }
         req *r = calloc(1, sizeof *r);
         if (!r)
@@ -2050,6 +2398,7 @@ int main(int argc, char **argv)
                                    {"frame-timeout", required_argument, 0, 'D'},
                                    {"query-threads", required_argument, 0, 'q'},
                                    {"request-threads", required_argument, 0, 'L'},
+                                   {"multi-max-rows", required_argument, 0, 'U'},
                                    {"version", no_argument, 0, 'v'},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0;
@@ -2090,6 +2439,7 @@ int main(int argc, char **argv)
         case 'T': send_timeout_s = (int)num_arg("send-timeout", optarg, 1, 86400); break;
         case 'q': o.query_threads = (int)num_arg("query-threads", optarg, 1, 4096); break;
         case 'L': o.request_threads = (int)num_arg("request-threads", optarg, 1, 4096); break;
+        case 'U': multi_max_rows = (uint64_t)num_arg("multi-max-rows", optarg, 1, LLONG_MAX); break;
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'X': req_budget = (size_t)num_arg("max-request-memory", optarg, 1, (long long)1 << 24) << 20; break;
         case 'I':
@@ -2115,7 +2465,7 @@ int main(int argc, char **argv)
                         "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"
                         "             [--metrics-port N|auto [--metrics-bind ADDR]]\n"
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
-                        "             [--query-threads N] [--request-threads N]\n",
+                        "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }

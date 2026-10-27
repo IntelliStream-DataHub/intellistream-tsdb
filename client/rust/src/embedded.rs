@@ -99,6 +99,8 @@ pub struct Options {
     /// [`series_at`](Db::series_at) and [`series_create`](Db::series_create) add a volume for a path that is
     /// not one yet (with the checks of `tsdb_volume_add`); false: such a path is NotFound. Default true.
     pub create_volumes: bool,
+    /// Threads one query (or one multi-series call) uses at most, its caller included; 0: `query_threads`.
+    pub request_threads: i32,
 }
 
 impl Default for Options {
@@ -130,6 +132,7 @@ impl Default for Options {
             verify_checksums: o.verify_checksums != 0,
             retention_merge_s: o.retention_merge_s,
             create_volumes: o.create_volumes != 0,
+            request_threads: o.request_threads,
         }
     }
 }
@@ -164,9 +167,12 @@ impl Options {
             clock_ms: None,
             clock_arg: std::ptr::null_mut(),
             create_volumes: self.create_volumes as c_int,
+            request_threads: self.request_threads,
         }
     }
 }
+
+mod multi;
 
 /// One part file, as [`Db::parts`] lists them (`tsdb_part_info`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1244,43 +1250,6 @@ impl Db {
         let mut s = sys::tsdb_query_stats::default();
         unsafe { sys::tsdb_last_query_stats(&mut s) };
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) = s;
-    }
-
-    /// Runs the queries of a batch call (`run` calls the function it gets on each query's
-    /// thread right after the query), then sets last_query_stats to their totals, with the
-    /// batch's wall time as `elapsed_s`: a batch counts as one query.
-    pub(crate) fn batch_stats<T>(&self, run: impl FnOnce(&(dyn Fn() + Sync)) -> Result<T>) -> Result<T> {
-        fn add(t: &mut sys::tsdb_query_stats, s: &sys::tsdb_query_stats) {
-            t.rows += s.rows;
-            t.rows_decoded += s.rows_decoded;
-            t.rows_from_stats += s.rows_from_stats;
-            t.memtable_rows += s.memtable_rows;
-            t.bytes += s.bytes;
-            t.bytes_read += s.bytes_read;
-            t.parts += s.parts;
-            t.granules += s.granules;
-            t.granules_from_stats += s.granules_from_stats;
-            t.result_rows += s.result_rows;
-        }
-        // one total per worker thread (and one for the caller's), so no two threads share one
-        let slots: Vec<Mutex<sys::tsdb_query_stats>> =
-            (0..rayon::current_num_threads() + 1).map(|_| Mutex::default()).collect();
-        let t0 = std::time::Instant::now();
-        let after_query = || {
-            let mut s = sys::tsdb_query_stats::default();
-            // SAFETY: the stats of the calling thread's last query, written into `s`
-            unsafe { sys::tsdb_last_query_stats(&mut s) };
-            let k = rayon::current_thread_index().map_or(slots.len() - 1, |k| k.min(slots.len() - 2));
-            add(&mut slots[k].lock().unwrap_or_else(|e| e.into_inner()), &s);
-        };
-        let r = run(&after_query);
-        let mut total = sys::tsdb_query_stats::default();
-        for s in slots {
-            add(&mut total, &s.into_inner().unwrap_or_else(|e| e.into_inner()));
-        }
-        total.elapsed_s = t0.elapsed().as_secs_f64();
-        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = total;
-        r
     }
 
     /// What the last query on this Db did (rows covered, decoded, bytes read, time), all zero

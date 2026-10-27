@@ -53,7 +53,10 @@ int main(int argc, char **argv)
     CHECK(tsdb_struct_size(TSDB_STRUCT_SPREAD_BUCKET) == sizeof(tsdb_spread_bucket));
     CHECK(tsdb_struct_size(TSDB_STRUCT_TWA_OPTS) == sizeof(tsdb_twa_opts));
     CHECK(tsdb_struct_size(TSDB_STRUCT_TWA_BUCKET) == sizeof(tsdb_twa_bucket));
-    CHECK(tsdb_struct_size(-1) == 0 && tsdb_struct_size(TSDB_STRUCT_TWA_BUCKET + 1) == 0);
+    CHECK(tsdb_struct_size(TSDB_STRUCT_MULTI_QUERY) == sizeof(tsdb_multi_query));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_SERIES_RESULT) == sizeof(tsdb_series_result));
+    CHECK(tsdb_struct_size(TSDB_STRUCT_MULTI_OPTS) == sizeof(tsdb_multi_opts));
+    CHECK(tsdb_struct_size(-1) == 0 && tsdb_struct_size(TSDB_STRUCT_MULTI_OPTS + 1) == 0);
 
     tsdb *db;
     OK(tsdb_open(dir, NULL, &db));
