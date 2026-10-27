@@ -732,6 +732,8 @@ typedef struct qbudget {
 } qbudget;
 extern __thread const qbudget *cur_budget;
 extern size_t multi_defer_bytes, multi_defer_rows; /* 16 MiB, 65536; tests lower them to force deferral */
+/* the most bounds one series of a TRIM request may keep: what one client request carries (tests lower it) */
+extern size_t multi_max_bounds;
 
 /* Threads for a query step that decodes `rows` rows in `items` independent pieces (granules): one per
  * query_rows_per_thread rows, at most one per item and query_threads. Small reads are fastest on the calling

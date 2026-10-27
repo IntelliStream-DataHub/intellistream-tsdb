@@ -836,6 +836,28 @@ static void bounds(const char *base)
     CHECK(sc.rows == 9 * 3);
     fprintf(stderr, "  LTTB ahead: %ld deferred\n", atomic_load(&b.deferred));
     CHECK(atomic_load(&b.deferred) >= 1);
+
+    /* TRIM keeps a series' bounds within one request's: 49 hourly bounds, of which 5.6 hours of rows need 7 */
+    int64_t hb[49];
+    for (int i = 0; i < 49; i++)
+        hb[i] = T0 - 24 * 3600000LL + (int64_t)i * 3600000;
+    size_t sm = multi_max_bounds;
+    multi_max_bounds = 8;
+    tsdb_multi_query qt = {.kind = TSDB_MULTI_BUCKETS, .start = INT64_MIN, .end = INT64_MAX, .bounds = hb,
+                           .nbounds = 49, .trim = TSDB_MULTI_TRIM_LO | TSDB_MULTI_TRIM_HI};
+    OK(tsdb_query_bounds(db, good[0], qt.start, qt.end, hb, 49, NULL, &one, &n0));
+    tsdb_free(one);
+    CHECK(n0 == 6);
+    for (int trim = 0; trim < 3; trim++) {
+        qt.trim = trim == 0 ? TSDB_MULTI_TRIM_LO | TSDB_MULTI_TRIM_HI : trim == 1 ? TSDB_MULTI_TRIM_LO
+                                                                                    : TSDB_MULTI_TRIM_HI;
+        memset(&sc, 0, sizeof sc);
+        OK(tsdb_query_multi(db, &qt, good, 8, NULL, slow_head, &sc));
+        for (int i = 0; i < 8; i++)
+            CHECK(sc.status[i] == (trim == 0 ? 0 : TSDB_ERR_TOO_MANY_BUCKETS));
+        CHECK(sc.rows == (trim == 0 ? 8 * n0 : 0));
+    }
+    multi_max_bounds = sm;
     OK(tsdb_close(db));
     free(ts);
     free(v);

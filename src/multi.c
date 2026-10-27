@@ -28,6 +28,7 @@
 __thread const qbudget *cur_budget;
 size_t multi_defer_bytes = 16u << 20;
 size_t multi_defer_rows = 65536;
+size_t multi_max_bounds = (TSDB_MAX_FRAME - 64) / 8;
 
 #define MULTI_HELD_DEFAULT ((size_t)64 << 20)
 
@@ -238,7 +239,7 @@ static int trim_bounds(mcall *c, uint32_t id, int64_t s, int64_t e, const int64_
     *b = q->bounds + i0;
     *nb = i1 - i0 + 1;
     /* as many local periods as one client request carries at most, as the clients check */
-    size_t cap = q->kind == TSDB_MULTI_TWA ? (TSDB_MAX_FRAME - 64 - TSDB_TWA_HEADER) / 8 : (TSDB_MAX_FRAME - 64) / 8;
+    size_t cap = q->kind == TSDB_MULTI_TWA ? multi_max_bounds - TSDB_TWA_HEADER / 8 : multi_max_bounds;
     return *nb > cap ? TSDB_ERR_TOO_MANY_BUCKETS : 0;
 }
 
