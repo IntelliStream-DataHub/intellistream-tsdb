@@ -375,7 +375,11 @@ int sched_run(sched *s, int n, void (*fn)(void *arg, int i), void *arg)
     if (s && s->nh && n > 1)
         n = fair_want(s, n);
     if (!s || n <= 1 || s->nh == 0) {
+        /* this thread is the job's caller even on a helper: if sched_leave let it go, the items would be lost */
+        bool helper = cur_helper;
+        cur_helper = false;
         fn(arg, 0);
+        cur_helper = helper;
         return 1;
     }
     sjob j;

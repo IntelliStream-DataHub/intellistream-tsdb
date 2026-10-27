@@ -307,6 +307,65 @@ static void test_nesting(void)
     sched_free(s);
 }
 
+/* A helper that runs a job of its own inline (one thread asked, or its share under load is one) is that job's
+ * caller and must finish it: when another request made the helper leave its outer job, the inner job's items
+ * were dropped (a series aggregate in a multi call lost granules). */
+typedef struct outer {
+    sched *s;
+    atomic_int next, inner_runs, short_runs;
+    int n;
+} outer;
+
+static void outer_fn(void *arg, int i)
+{
+    (void)i;
+    outer *o = arg;
+    for (;;) {
+        if (atomic_fetch_add(&o->next, 1) >= o->n)
+            break;
+        job in;
+        job_init(&in, 20, 200);
+        sched_run(o->s, 1, job_fn, &in); /* inline: this thread is its caller */
+        atomic_fetch_add(&o->inner_runs, 1);
+        if (atomic_load(&in.done) != in.n)
+            atomic_fetch_add(&o->short_runs, 1);
+        if (sched_leave())
+            break;
+    }
+}
+
+static void *outer_thread(void *a)
+{
+    outer *o = a;
+    sgroup g;
+    sched_group_begin(o->s, &g, 0);
+    sched_run(o->s, 32, outer_fn, o);
+    sched_group_end(&g);
+    return NULL;
+}
+
+static void test_inline_inner(void)
+{
+    sched *s = sched_new(8, 0);
+    outer o = {.s = s, .n = 400}; /* 400 items of 4 ms: 200 ms on eight threads */
+    atomic_init(&o.next, 0);
+    atomic_init(&o.inner_runs, 0);
+    atomic_init(&o.short_runs, 0);
+    pthread_t th;
+    pthread_create(&th, NULL, outer_thread, &o);
+    while (atomic_load(&o.inner_runs) < 16)
+        spin_us(100);
+    run_arg small = {.s = s, .n = 100, .us = 1000}; /* opens a job no idle helper can staff: helpers rebalance */
+    run_thread(&small);
+    pthread_join(th, NULL);
+    fprintf(stderr, "  inline inner jobs: %d runs, %d cut short\n", atomic_load(&o.inner_runs),
+            atomic_load(&o.short_runs));
+    CHECK(atomic_load(&small.j.done) == 100);
+    CHECK(atomic_load(&o.inner_runs) == 400);
+    CHECK(atomic_load(&o.short_runs) == 0);
+    sched_free(s);
+}
+
 /* 10^5 tiny jobs, from 4 threads at once, without a group (queries outside qs_begin: merges, tests). */
 static void tiny_fn(void *arg, int i)
 {
@@ -475,6 +534,7 @@ int main(int argc, char **argv)
     test_load();
     test_newcomer();
     test_nesting();
+    test_inline_inner();
     test_tiny();
     test_cancel();
     test_reopen();
