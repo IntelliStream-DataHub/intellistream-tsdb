@@ -21,13 +21,14 @@ QDB_HTTP = os.environ.get("QDB_HTTP_PORT", "9100")
 I2_PORT = os.environ.get("I2_PORT", "8086")
 I3_PORT = os.environ.get("I3_PORT", "8181")
 PROM_PORT = os.environ.get("PROM_PORT", "9090")
+IOT_REST = os.environ.get("IOT_REST_PORT", "18080")
 NSERIES = int(os.environ.get("NSERIES", "100"))  # series in the file, as for spec.py
 
 def f32(x):  # values are float32, and some servers print the shortest float32 text ("30.8")
     return struct.unpack('<f', struct.pack('<f', x))[0]
 
 sysname = sys.argv[1] if len(sys.argv) > 1 else ""
-per = int(sys.argv[2]) if len(sys.argv) > 2 and sysname != "--dumps" else 200
+per = int(sys.argv[2]) if len(sys.argv) > 2 and sysname not in ("--dumps", "--batch") else 200
 
 def ms_of(t):  # '2024-01-01 00:00:00.123' or RFC 3339, UTC
     t = t.strip().replace("T", " ").rstrip("Z").replace("+00:00", "").replace("+00", "")
@@ -177,6 +178,27 @@ class I3:
         r = self.q(f"SELECT series, sum(c) AS c, sum(s) AS s, sum(mn) AS mn, sum(mx) AS mx, count(*) AS n FROM ({inner}) GROUP BY series ORDER BY series")
         return {int(x[0]): tuple(float(v) for v in x[1:]) for x in r}
 
+class IOT:
+    """IoTDB's REST API (table model): a line is "POST path<TAB>application/json<TAB>{database, sql}" (mkq.py)."""
+    def q(self, sql):
+        body = json.dumps({"database": "cmp", "sql": sql})
+        r = json.loads(http(f"http://127.0.0.1:{IOT_REST}/rest/table/v1/query", body,
+                            {"Content-Type": "application/json", "Authorization": "Basic cm9vdDpyb290"}))
+        if "values" not in r:
+            raise RuntimeError(f"iot: {r}")
+        return r["values"]
+    def sql(self, line):
+        return json.loads(line.split("\t", 2)[2])["sql"]
+    def rows(self, cls, line):
+        r = self.q(self.sql(line))
+        if cls in ("raw", "point"):
+            return [(int(x[0]), float(x[1])) for x in r]
+        return [(int(x[0]), int(x[1]), float(x[2]), float(x[3]), float(x[4])) for x in r]
+    def digest(self, n, line):
+        inner = self.sql(line).rsplit(" ORDER BY ", 1)[0]
+        r = self.q(f"SELECT series, sum(c) AS c, sum(s) AS s, sum(mn) AS mn, sum(mx) AS mx, count(*) AS n FROM ({inner}) y GROUP BY series ORDER BY series")
+        return {int(x[0]): tuple(float(v) for v in x[1:]) for x in r}
+
 
 class Prom:
     """PromQL over Prometheus' HTTP API: a line is one or more requests joined by " && " (mkq.py)."""
@@ -215,7 +237,7 @@ class Prom:
                     sum(x["max"] for x in bs.values()), float(len(bs)))
                 for s, bs in self.buckets(line).items()}
 
-RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day"), "prom": Prom}
+RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day"), "prom": Prom, "iot": IOT}
 
 def close(a, b, rel):  # False for NaN on either side: a NaN answer is a mismatch
     return a == b or abs(a - b) <= rel * max(abs(a), abs(b), 1e-300)
@@ -316,9 +338,9 @@ def split_batch(run, sysname, line, cls):
     """One batch request (mkbatch.py) run once; its raw answer split per member, in the form the runner's q()
     returns for a single query: {member: raw}."""
     by = {}
-    if sysname in ("ch", "chday", "ts", "qdb", "i3"):
+    if sysname in ("ch", "chday", "ts", "qdb", "i3", "iot"):
         if sysname in ("ch", "chday"): raw = run.q(line + " FORMAT TSV")
-        elif sysname == "i3": raw = run.q(run.sql(line))
+        elif sysname in ("i3", "iot"): raw = run.q(run.sql(line))
         else: raw = run.q(line)
         for x in raw:
             by.setdefault(int(x[0]), []).append(x[1:])

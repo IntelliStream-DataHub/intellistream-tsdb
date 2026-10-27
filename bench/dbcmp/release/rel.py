@@ -15,7 +15,8 @@
 # window carried in and the first one after it closing the last segment (tsdb.h), buckets cut at the window's ends
 # (rows bucket_ms, area, covered_ms; keyed by the window's line). SYS: ch, ts (the toolkit for whole-range kinds,
 # plain SQL for windows), qdb (native twap() for STEP buckets), qdbseg (the 0.9.0 run's lead() CTE), i3, i2flux
-# (LINEAR only), duck (DuckDB, embedded), chdb (embedded ClickHouse; the ch SQL on table t).
+# (LINEAR only), duck (DuckDB, embedded), chdb (embedded ClickHouse; the ch SQL on table t), iot (IoTDB, lead() and
+# a split at most once, as qdbseg; LINEAR too).
 # Systems without a built-in function or a window-function recipe have none here ("-" in the table):
 # LTTB is sequential (each bucket's pick depends on the previous pick), so it has no window-function recipe;
 # InfluxDB 2 (Flux timeWeightedAvg interpolates linearly only) and Prometheus have no STEP TWA.
@@ -120,13 +121,16 @@ def w_ts(s, a, b, bk):
 
 # ---- QuestDB: no ARRAY JOIN / unnest, so a segment is split at most once (true for this data: the longest step
 # is 60 s + jitter, buckets are an hour or longer, window buckets 300 samples or more)
-def split_once(I, area1, area2, key="series, "):
-    """Rows (key, b, a, c) of the segments in seg (columns lo, hi, ...): the piece in lo's bucket and the piece in hi's."""
+def split_once(I, area1, area2, key="series, ", group=False):
+    """Rows (key, b, a, c) of the segments in seg (columns lo, hi, ...): the piece in lo's bucket and the piece in hi's.
+    group: an explicit GROUP BY (QuestDB groups by the non-aggregate columns by itself), and no "WHERE c > 0" (IoTDB
+    2.0.11 answers a filter over a UNION ALL subquery with extra groups whose b is null; a piece with c = 0 adds 0, and
+    a bucket covering 0 ms is left out by the check as by tsdb)."""
     b0, b1 = f"lo / {I} * {I}", f"hi / {I} * {I}"
     return (f"SELECT {key}b, sum(a) area, sum(c) covered FROM ("
             f"SELECT {key}{b0} b, {area1} a, least(hi, {b0} + {I}) - lo c FROM seg WHERE hi > lo "
-            f"UNION ALL SELECT {key}{b1} b, {area2} a, hi - {b1} c FROM seg WHERE hi > lo AND hi / {I} > lo / {I}) "
-            f"WHERE c > 0 ORDER BY {key}b")
+            f"UNION ALL SELECT {key}{b1} b, {area2} a, hi - {b1} c FROM seg WHERE hi > lo AND hi / {I} > lo / {I}"
+            + (f") u GROUP BY {key}b" if group else ") WHERE c > 0") + f" ORDER BY {key}b")
 
 def q_qdb(kind):
     if kind == "lttb":
@@ -206,6 +210,37 @@ def q_duck(kind):
     v1 = f", CAST(lead(value) {w} AS DOUBLE) AS v1" if kind == "twal" else ""
     return unnest_q(kind, f"SELECT series, CAST(value AS DOUBLE) AS v0, epoch_ms(ts) AS t0, epoch_ms(lead(ts) {w}) AS t1{v1} FROM t", "//")
 
+# ---- IoTDB 2.0 (table model): no TWA function and no row generator (unnest, generate_series, ARRAY JOIN), but
+# lead() and WITH: QuestDB's recipe, a segment split at most once (true for this data, as for QuestDB)
+def q_iot(kind):
+    if kind == "lttb":
+        return None
+    I = IV[kind]
+    w = "OVER (PARTITION BY series ORDER BY time)"
+    seg = (f"SELECT series, CAST(value AS DOUBLE) AS v0, CAST(time AS INT64) AS lo, CAST(lead(time) {w} AS INT64) AS hi, "
+           f"CAST(lead(value) {w} AS DOUBLE) AS v1 FROM sensors")
+    pre = f"WITH seg AS (SELECT * FROM ({seg}) s WHERE hi IS NOT NULL) "
+    if kind == "twal":
+        b0, b1 = f"lo / {I} * {I}", f"hi / {I} * {I}"
+        # lin() without its CASE (IoTDB 2.0.11 fails CASE over these columns with ArrayIndexOutOfBoundsException in
+        # ConstantColumnTransformer): at x = t1 the ratio is exactly 1, so v0 + (v1 - v0) differs from v1 by at most
+        # an ulp, far inside the check's 1e-9
+        def at(x):
+            return f"(v0 + (v1 - v0) * (CAST({x} - lo AS DOUBLE) / CAST(hi - lo AS DOUBLE)))"
+        L = lambda p, q: f"({at(p)} + {at(q)}) * 0.5 * CAST({q} - {p} AS DOUBLE)"
+        return pre + split_once(I, L("lo", f"least(hi, {b0} + {I})"), L(b1, "hi"), group=True)
+    return pre + split_once(I, f"v0 * (least(hi, lo / {I} * {I} + {I}) - lo)", f"v0 * (hi - hi / {I} * {I})", group=True)
+
+def w_iot(s, a, b, bk):
+    # the reading before the window and the first one after it as scalar subqueries (a UNION ALL of LIMIT 1 branches
+    # fails in IoTDB 2.0.11 with ArrayIndexOutOfBoundsException); no reading before: the window's start
+    one = f"FROM sensors WHERE series = '{s}' AND time"
+    pts = (f"SELECT CAST(time AS INT64) AS t, CAST(value AS DOUBLE) AS v {one} >= coalesce((SELECT max(time) {one} < {a}), "
+           f"CAST({a} AS TIMESTAMP)) AND time <= coalesce((SELECT min(time) {one} >= {b}), CAST({b} AS TIMESTAMP))")
+    seg = (f"SELECT greatest(t, {a}) AS lo, least(t1, {b}) AS hi, v FROM (SELECT t, v, lead(t) OVER (ORDER BY t) AS t1 "
+           f"FROM ({pts}) p) q WHERE t1 IS NOT NULL AND t < t1")
+    return f"WITH seg AS ({seg}) " + split_once(bk, f"v * (least(hi, lo / {bk} * {bk} + {bk}) - lo)", f"v * (hi - hi / {bk} * {bk})", key="", group=True)
+
 # ---- InfluxDB 2: Flux timeWeightedAvg (LINEAR only; aggregateWindow hands it each window's own rows, so the edges
 # are whatever timeWeightedAvg makes of them: rel.py check shows whether that matches tsdb's cut-and-interpolate)
 def q_i2flux(kind):
@@ -217,8 +252,8 @@ def q_i2flux(kind):
             'createEmpty: false, timeSrc: "_start") |> keep(columns: ["series", "_time", "_value"])')
 
 Q = {"ch": q_ch, "ts": q_ts, "qdb": q_qdb, "qdbseg": q_qdbseg, "i3": q_i3, "i2flux": q_i2flux, "duck": q_duck,
-     "chdb": lambda k: q_ch(k, "t")}
-W = {"ch": w_ch, "ts": w_ts, "qdb": w_qdb, "i3": w_i3}
+     "chdb": lambda k: q_ch(k, "t"), "iot": q_iot}
+W = {"ch": w_ch, "ts": w_ts, "qdb": w_qdb, "i3": w_i3, "iot": w_iot}
 
 def query(sysname, kind):
     """The whole-range query, or for window kinds the list of (line, query), one per window."""
@@ -231,6 +266,8 @@ def wire(sysname, q):
     """A query as one line of a qdrive / clickhouse-benchmark input file."""
     if sysname in ("i3",):
         return "GET /api/v3/query_sql?db=cmp&format=csv&q=" + urllib.parse.quote(q, safe="")
+    if sysname == "iot":
+        return "POST /rest/table/v1/query\tapplication/json\t" + json.dumps({"database": "cmp", "sql": q}, separators=(",", ":"))
     if sysname == "i2flux":
         return "POST /api/v2/query?org=bench\tapplication/json\t" + json.dumps({"query": q, "type": "flux", "dialect": {"annotations": []}})
     return q
@@ -257,6 +294,12 @@ def run_sql(sysname, sql):
     if sysname == "i3":
         url = f"http://127.0.0.1:{os.environ.get('I3_PORT', '8181')}/api/v3/query_sql?db=cmp&format=json&q=" + urllib.parse.quote(sql, safe="")
         return [list(r.values()) for r in json.loads(http(url))]
+    if sysname == "iot":
+        out = json.loads(http(f"http://127.0.0.1:{os.environ.get('IOT_REST_PORT', '18080')}/rest/table/v1/query",
+                              json.dumps({"database": "cmp", "sql": sql}),
+                              {"Content-Type": "application/json", "Authorization": "Basic cm9vdDpyb290"}))
+        if "values" not in out: raise RuntimeError(f"iot: {out}")
+        return out["values"]
     if sysname == "i2flux":
         import csv, io
         body = json.dumps({"query": sql, "type": "flux", "dialect": {"annotations": []}})

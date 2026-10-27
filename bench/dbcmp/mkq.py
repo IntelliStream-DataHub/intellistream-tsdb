@@ -4,7 +4,7 @@
 #
 # SYS: ch, chday (ClickHouse, monthly / daily partitions), ts (TimescaleDB), qdb (QuestDB, PostgreSQL
 # wire), qdbh (QuestDB, HTTP /exec), i2ql (InfluxDB 2, InfluxQL), i2flux (InfluxDB 2, Flux), i3 (InfluxDB 3),
-# prom (Prometheus, PromQL).
+# prom (Prometheus, PromQL), iot (IoTDB, table model SQL over REST).
 #
 # Every system answers the same logical query: rows in [start, end) of one series, and buckets
 # aligned to the epoch whose width is a number of the series' own samples. For HTTP systems a line
@@ -93,6 +93,23 @@ def i3_get(q):
     return "GET /api/v3/query_sql?db=cmp&format=csv&q=" + urllib.parse.quote(q, safe="")
 
 
+# IoTDB 2.0, table model (table sensors: time, series STRING TAG, value FLOAT FIELD), SQL over its REST API
+# (POST /rest/table/v1/query, JSON {"database", "sql"}); times as epoch milliseconds, date_bin buckets from the epoch.
+IOT_PATH = "/rest/table/v1/query"
+
+def iot(cls, s, a, b, bk):
+    w = f"series = '{s}' AND time >= {a} AND time < {b}"
+    if cls == "raw":
+        return f"SELECT time, value FROM sensors WHERE {w} ORDER BY time"
+    if cls == "point":
+        return f"SELECT time, value FROM sensors WHERE series = '{s}' AND time = {a}"
+    return (f"SELECT date_bin({bk}ms, time) AS b, count(value) AS c, sum(value) AS s, min(value) AS mn, max(value) AS mx "
+            f"FROM sensors WHERE {w} GROUP BY b ORDER BY b")
+
+def iot_post(q):
+    import json
+    return f"POST {IOT_PATH}\tapplication/json\t" + json.dumps({"database": "cmp", "sql": q}, separators=(",", ":"))
+
 # Prometheus: PromQL over the HTTP API. A range selector m[r] evaluated at t covers (t - r, t], so the
 # rows in [a, b) are m[b - a] at t = b - 1 ms, and a bucket [k*w, (k+1)*w) is evaluated at (k+1)*w - 1
 # with range w; range selectors return the stored samples, so lookback and staleness play no part.
@@ -143,7 +160,7 @@ def prom(cls, s, a, b, bk):
         reqs.append(prom_get("/api/v1/query", query=" or ".join(edges), time=psec(b - 1)))
     return " && ".join(reqs)
 
-GEN = {"i3": lambda *x: i3_get(i3(*x)), "i2ql": lambda *x: i2ql_get(influxql(*x)), "i2flux": lambda *x: flux_post(flux(*x)), "qdb": qdb, "qdbh": lambda *x: http_get("/exec?query=", qdb(*x)), "ts": ts, "ch": ch, "chday": lambda *x: ch(*x, table="cmp.t100m_day"), "prom": prom}
+GEN = {"i3": lambda *x: i3_get(i3(*x)), "i2ql": lambda *x: i2ql_get(influxql(*x)), "i2flux": lambda *x: flux_post(flux(*x)), "qdb": qdb, "qdbh": lambda *x: http_get("/exec?query=", qdb(*x)), "ts": ts, "ch": ch, "chday": lambda *x: ch(*x, table="cmp.t100m_day"), "prom": prom, "iot": lambda *x: iot_post(iot(*x))}
 
 # ---- whole-range queries (a: one bucket per series, b: buckets of n samples)
 def step_sql(col, kind):  # the sample step of a series, as SQL (kind = series % 7)
@@ -230,6 +247,14 @@ def i3_full(n):  # date_bin needs a constant stride, hence one branch per step
         f"max(value) AS mx FROM sensors WHERE series IN ({', '.join(repr(str(x)) for x in sset() if x % 7 in k)}) GROUP BY series, b)"
         for st, k in groups().items()) + " ORDER BY series, b"
 
+def iot_full(n):  # date_bin takes a constant interval: one branch per step, as for InfluxDB 3
+    if n == 0:
+        return f"SELECT series, count(value) AS c, sum(value) AS s, min(value) AS mn, max(value) AS mx FROM sensors{where_set('series', True)} GROUP BY series ORDER BY series"
+    return "SELECT * FROM (" + " UNION ALL ".join(
+        f"(SELECT series, date_bin({st * n}ms, time) AS b, count(value) AS c, sum(value) AS s, min(value) AS mn, "
+        f"max(value) AS mx FROM sensors WHERE series IN ({', '.join(repr(str(x)) for x in sset() if x % 7 in k)}) GROUP BY series, b)"
+        for st, k in groups().items()) + ") x ORDER BY series, b"
+
 
 PROM_LO, PROM_HI = 1703980800000, 1767225600000  # 2023-12-31 and 2026-01-01, as for InfluxQL
 
@@ -247,7 +272,7 @@ def prom_full(n):
         reqs += prom_buckets(sel, lo, hi, w)
     return " && ".join(reqs)
 
-FULL = {"i3": lambda n: i3_get(i3_full(n)), "i2ql": lambda n: i2ql_get(influxql_full(n)), "i2flux": lambda n: flux_post(flux_full(n)), "qdb": qdb_full, "qdbh": lambda n: http_get("/exec?query=", qdb_full(n)), "ts": ts_full, "ch": ch_full, "chday": lambda n: ch_full(n, "cmp.t100m_day"), "prom": prom_full}
+FULL = {"i3": lambda n: i3_get(i3_full(n)), "i2ql": lambda n: i2ql_get(influxql_full(n)), "i2flux": lambda n: flux_post(flux_full(n)), "qdb": qdb_full, "qdbh": lambda n: http_get("/exec?query=", qdb_full(n)), "ts": ts_full, "ch": ch_full, "chday": lambda n: ch_full(n, "cmp.t100m_day"), "prom": prom_full, "iot": lambda n: iot_post(iot_full(n))}
 
 if __name__ == "__main__":
     import os

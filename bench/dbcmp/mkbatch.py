@@ -5,7 +5,7 @@
 #
 # A batch is one request wherever the query language allows it, built from mkq.py's single queries so that
 # every member is answered exactly as it is alone:
-#   SQL (ch, chday, ts, qdb, qdbh, i3)  the members' queries as UNION ALL branches, each with its member number
+#   SQL (ch, chday, ts, qdb, qdbh, i3, iot)  the members' queries as UNION ALL branches, each with its member number
 #                                       as the first column ("mb"), so every branch still uses the primary key;
 #   InfluxQL (i2ql)                     the statements joined by "; " in one request (statement_id = member);
 #   Flux (i2flux)                       one script, each member's results yielded as m<member>_<name>;
@@ -20,7 +20,7 @@ import batches, mkq
 
 SQL = {"ch": (mkq.ch, None), "chday": (lambda *x: mkq.ch(*x, table="cmp.t100m_day"), None), "ts": (mkq.ts, None),
        "qdb": (mkq.qdb, None), "qdbh": (mkq.qdb, lambda q: mkq.http_get("/exec?query=", q)),
-       "i3": (mkq.i3, mkq.i3_get)}
+       "i3": (mkq.i3, mkq.i3_get), "iot": (mkq.iot, mkq.iot_post)}
 
 def tag(m, q):  # the member number as the first column of a single SQL query
     assert q.startswith("SELECT ")
