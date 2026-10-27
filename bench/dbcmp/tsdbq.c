@@ -3,10 +3,16 @@
  *   tsdbq qps  SPEC CLASS THREADS SECONDS     random windows / point lookups of CLASS, like qdrive
  *   tsdbq dump SPEC N                         reference answers of the first N queries of each class
  *                                             (JSON lines on stdout: ref/windows.jsonl for check.py)
- *   tsdbq full CONNS REPS [dump]              whole range: count/sum/min/max and buckets of 3600 / 60
- *                                             samples, series spread over CONNS connections; median of
- *                                             REPS after a warm-up; with dump, per-series digests on
- *                                             stderr (ref/full.jsonl)
+ *   tsdbq full CONNS REPS [dump] [--batch K]  whole range: count/sum/min/max and buckets of 3600 / 60
+ *                                             samples, series spread over CONNS connections; mean, sd,
+ *                                             median, min and max of REPS after a warm-up; with dump,
+ *                                             per-series digests on stderr (ref/full.jsonl)
+ *   tsdbq twa CONNS REPS [OUT] [--batch K]    STEP time-weighted average by hour over the whole range;
+ *                                             OUT gets the buckets (ref/twa.jsonl, relq's format)
+ * --batch K sends a connection's series K at a time as one QUERY_MULTI with per-series intervals (K = 1:
+ * one plain request per series, as without it), so --batch 100 on 1 connection is one request. A qps
+ * CLASS of the form NAME.bK (raw.b10) runs NAME's windows K at a time as one QUERY_MULTI with
+ * per-series starts and ends; q/s then counts windows, and the latencies are of whole requests.
  * tsdbd is at TSDB_HOST:TSDB_PORT (127.0.0.1:7070). Series ids are taken to equal the series
  * numbers of the RowBinary file, which holds when tsdbc-bench load created them in a fresh database.
  * NSERIES (100) is the number of series for the whole-range queries, as for spec.py.
@@ -26,6 +32,7 @@ static size_t nq;
 static int threads;
 static double seconds;
 static uint32_t nseries = 100;
+static size_t batch = 1; /* --batch K, or K of a qps class NAME.bK */
 #define MAXSERIES 1024
 
 static double now(void)
@@ -74,6 +81,34 @@ static int run_one(tsdbc *c, const q *x, rawacc *r, tsdb_bucket **b, size_t *nb)
     return tsdbc_query_agg(c, x->s, x->a, x->b, x->bucket, b, nb);
 }
 
+static void die_rc(const char *what, int rc)
+{
+    fprintf(stderr, "%s: %s\n", what, tsdbc_strerror(rc));
+    exit(1);
+}
+static int count_fn(void *ctx, const tsdb_series_result *r)
+{
+    if (r->status) die_rc("query multi, series", r->status);
+    *(size_t *)ctx += r->n;
+    return 0;
+}
+/* qs[at], qs[at + 1], ... (k of them, wrapping) as one QUERY_MULTI */
+static void run_batch(tsdbc *c, size_t at, size_t k)
+{
+    uint32_t ss[k];
+    int64_t st[k], en[k], iv[k];
+    for (size_t i = 0; i < k; i++) {
+        const q *x = &qs[(at + i) % nq];
+        ss[i] = x->s; st[i] = x->a; en[i] = x->b; iv[i] = x->bucket;
+    }
+    int agg = qs[at % nq].bucket != 0;
+    tsdb_multi_query m = {.kind = agg ? TSDB_MULTI_BUCKETS : TSDB_MULTI_VALUES, .starts = st, .ends = en,
+                          .intervals = agg ? iv : NULL};
+    size_t rows = 0;
+    int rc = tsdbc_query_multi(c, &m, ss, k, NULL, count_fn, &rows);
+    if (rc) die_rc("query multi", rc);
+}
+
 typedef struct job { int id; double *lat; size_t n; double secs; } job;
 static void *qps_run(void *arg)
 {
@@ -86,9 +121,13 @@ static void *qps_run(void *arg)
         tsdb_bucket *b;
         size_t nb;
         double a = now();
-        int rc = run_one(c, &qs[i % nq], &r, &b, &nb);
-        if (rc) { fprintf(stderr, "query: %s\n", tsdbc_strerror(rc)); exit(1); }
-        free(b);
+        if (batch > 1) {
+            run_batch(c, i * batch, batch);
+        } else {
+            int rc = run_one(c, &qs[i % nq], &r, &b, &nb);
+            if (rc) { fprintf(stderr, "query: %s\n", tsdbc_strerror(rc)); exit(1); }
+            free(b);
+        }
         if (j->n == cap) j->lat = realloc(j->lat, (cap = cap ? cap * 2 : 4096) * sizeof(double));
         j->lat[j->n++] = now() - a;
     }
@@ -103,32 +142,116 @@ static int cmpd(const void *a, const void *b)
 }
 
 /* ---- whole range ---- */
-typedef struct fjob { int id, conns; int64_t nsamp; /* 0: one bucket */ double digest[MAXSERIES][5]; } fjob;
+typedef struct fjob { int id, conns, twa; int64_t nsamp; /* 0: one bucket */ double digest[MAXSERIES][5]; } fjob;
+static tsdb_twa_bucket *twa_out[MAXSERIES];
+static size_t twa_n[MAXSERIES];
+static void full_digest(fjob *j, uint32_t s, const tsdb_bucket *b, size_t nb)
+{
+    double *d = j->digest[s];
+    memset(d, 0, 5 * sizeof *d);
+    if (j->nsamp == 0 && nb) {
+        d[0] = (double)b[0].count; d[1] = b[0].sum; d[2] = b[0].min; d[3] = b[0].max; d[4] = 1;
+    } else
+        for (size_t i = 0; i < nb; i++) { d[0] += b[i].count; d[1] += b[i].sum; d[2] += b[i].min; d[3] += b[i].max; d[4] += 1; }
+}
+static void full_keep(fjob *j, uint32_t s, void *b, size_t nb)
+{
+    if (j->twa) {
+        free(twa_out[s]);
+        twa_out[s] = b;
+        twa_n[s] = nb;
+        return;
+    }
+    full_digest(j, s, b, nb);
+    free(b);
+}
+static int64_t full_interval(const fjob *j, uint32_t s) { return j->twa ? 3600000 : j->nsamp * STEP[s % 7]; }
 static void *full_run(void *arg)
 {
     fjob *j = arg;
     tsdbc *c = conn();
+    tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
+    uint32_t ss[MAXSERIES];
+    int64_t iv[MAXSERIES];
+    size_t k = 0;
     for (uint32_t s = (uint32_t)j->id; s < nseries; s += (uint32_t)j->conns) {
-        tsdb_bucket *b;
+        if (batch > 1) {
+            ss[k] = s;
+            iv[k++] = full_interval(j, s);
+            continue;
+        }
+        void *b;
         size_t nb;
-        int rc = tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, j->nsamp * STEP[s % 7], &b, &nb);
-        if (rc) { fprintf(stderr, "agg: %s\n", tsdbc_strerror(rc)); exit(1); }
-        double *d = j->digest[s];
-        memset(d, 0, 5 * sizeof *d);
-        if (j->nsamp == 0) {
-            d[0] = (double)b[0].count; d[1] = b[0].sum; d[2] = b[0].min; d[3] = b[0].max; d[4] = 1;
-        } else
-            for (size_t i = 0; i < nb; i++) { d[0] += b[i].count; d[1] += b[i].sum; d[2] += b[i].min; d[3] += b[i].max; d[4] += 1; }
-        free(b);
+        int rc = j->twa ? tsdbc_query_twa(c, s, INT64_MIN, INT64_MAX, 3600000, &to, (tsdb_twa_bucket **)&b, &nb)
+                        : tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, full_interval(j, s), (tsdb_bucket **)&b, &nb);
+        if (rc) die_rc(j->twa ? "twa" : "agg", rc);
+        full_keep(j, s, b, nb);
+    }
+    for (size_t at = 0; at < k; at += batch) {
+        size_t m = k - at < batch ? k - at : batch;
+        tsdb_multi_query mq = {.kind = j->twa ? TSDB_MULTI_TWA : TSDB_MULTI_BUCKETS, .start = INT64_MIN,
+                               .end = INT64_MAX, .intervals = iv + at, .twa = to};
+        tsdb_series_result *r;
+        int rc = tsdbc_query_multi_collect(c, &mq, ss + at, m, NULL, &r);
+        if (rc) die_rc("multi", rc);
+        for (size_t i = 0; i < m; i++) {
+            if (r[i].status) die_rc("multi, series", r[i].status);
+            size_t row = j->twa ? sizeof(tsdb_twa_bucket) : sizeof(tsdb_bucket);
+            void *b = malloc(r[i].n * row + 1);
+            if (!b) die_rc("multi", TSDB_ERR_NOMEM);
+            if (r[i].n) memcpy(b, r[i].buckets, r[i].n * row);
+            full_keep(j, ss[at + i], b, r[i].n);
+        }
+        tsdbc_series_results_free(r, m);
     }
     tsdbc_close(c);
     return NULL;
 }
+/* REPS timed runs of one class after a warm-up; prints mean, sd, median, min and max */
+static void full_time(const char *name, int conns, int reps, int twa, int64_t nsamp, fjob *jobs)
+{
+    double t[101], sum = 0, ss = 0;
+    for (int r = 0; r <= reps; r++) {
+        pthread_t th[256];
+        double a = now();
+        for (int i = 0; i < conns; i++) {
+            jobs[i].id = i; jobs[i].conns = conns; jobs[i].nsamp = nsamp; jobs[i].twa = twa;
+            pthread_create(&th[i], NULL, full_run, &jobs[i]);
+        }
+        for (int i = 0; i < conns; i++) pthread_join(th[i], NULL);
+        if (r) t[r - 1] = now() - a; /* run 0 is the warm-up */
+    }
+    for (int r = 0; r < reps; r++) sum += t[r];
+    double mean = sum / reps;
+    for (int r = 0; r < reps; r++) ss += (t[r] - mean) * (t[r] - mean);
+    qsort(t, (size_t)reps, sizeof *t, cmpd);
+    printf("%s %-30s %3d conns batch %zu: mean %.4f s sd %.4f, median %.4f (min %.4f, max %.4f, %d runs)\n",
+           twa ? "twa " : "full", name, conns, batch, mean, reps > 1 ? sqrt(ss / (reps - 1)) : 0.0, t[reps / 2], t[0],
+           t[reps - 1], reps);
+}
+/* trailing --batch K */
+static int take_batch(int *argc, char **argv)
+{
+    if (*argc >= 2 && !strcmp(argv[*argc - 2], "--batch")) {
+        long k = atol(argv[*argc - 1]);
+        if (k < 1 || k > MAXSERIES) { fprintf(stderr, "--batch: 1 to %d\n", MAXSERIES); return -1; }
+        batch = (size_t)k;
+        *argc -= 2;
+    }
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
+    if (take_batch(&argc, argv)) return 2;
     if (argc >= 6 && !strcmp(argv[1], "qps")) {
-        load(argv[2], argv[3]);
+        char base[16];
+        snprintf(base, sizeof base, "%s", argv[3]);
+        char *dot = strstr(base, ".b");
+        if (dot) { batch = (size_t)atol(dot + 2); *dot = 0; }
+        if (batch < 1 || batch > 65536) { fprintf(stderr, "class NAME.bK: K from 1 to 65536\n"); return 2; }
+        load(argv[2], base);
+        if (!nq) { fprintf(stderr, "no queries of class %s\n", base); return 2; }
         threads = atoi(argv[4]);
         seconds = atof(argv[5]);
         job *jobs = calloc((size_t)threads, sizeof *jobs);
@@ -145,8 +268,9 @@ int main(int argc, char **argv)
         size_t m = 0;
         for (int i = 0; i < threads; i++) for (size_t k = 0; k < jobs[i].n; k++) all[m++] = jobs[i].lat[k];
         qsort(all, m, sizeof *all, cmpd);
-        printf("%s c=%d: %zu queries in %.2f s = %.1f q/s, median %.3f ms, p99 %.3f ms\n", argv[3], threads, total, secs,
-               total / secs, all[m / 2] * 1e3, all[(size_t)(m * 0.99)] * 1e3);
+        printf("%s c=%d: %zu queries in %.2f s = %.1f q/s, median %.3f ms, p99 %.3f ms%s\n", argv[3], threads,
+               total * batch, secs, total * batch / secs, all[m / 2] * 1e3, all[(size_t)(m * 0.99)] * 1e3,
+               batch > 1 ? " per request" : "");
         return 0;
     }
     if (argc == 4 && !strcmp(argv[1], "dump")) {
@@ -185,21 +309,8 @@ int main(int argc, char **argv)
         int64_t sizes[3] = {0, 3600, 60};
         const char *names[3] = {"count/sum/min/max per series", "buckets of 3600 samples", "buckets of 60 samples"};
         for (int k = 0; k < 3; k++) {
-            double t[64];
             fjob *jobs = calloc((size_t)conns, sizeof *jobs);
-            for (int r = 0; r <= reps; r++) {
-                pthread_t th[256];
-                double a = now();
-                for (int i = 0; i < conns; i++) {
-                    jobs[i].id = i; jobs[i].conns = conns; jobs[i].nsamp = sizes[k];
-                    pthread_create(&th[i], NULL, full_run, &jobs[i]);
-                }
-                for (int i = 0; i < conns; i++) pthread_join(th[i], NULL);
-                if (r) t[r - 1] = now() - a; /* run 0 is the warm-up */
-            }
-            qsort(t, (size_t)reps, sizeof *t, cmpd);
-            printf("full %-30s %3d conns: median %.4f s (min %.4f, max %.4f, %d runs)\n", names[k], conns, t[reps / 2],
-                   t[0], t[reps - 1], reps);
+            full_time(names[k], conns, reps, 0, sizes[k], jobs);
             if (dump)
                 for (uint32_t s = 0; s < nseries; s++) {
                     double *d = jobs[s % conns].digest[s];
@@ -208,6 +319,30 @@ int main(int argc, char **argv)
                 }
             free(jobs);
         }
+        return 0;
+    }
+    if (argc >= 4 && !strcmp(argv[1], "twa")) {
+        int conns = atoi(argv[2]), reps = atoi(argv[3]);
+        if (getenv("NSERIES")) nseries = (uint32_t)atoi(getenv("NSERIES"));
+        if (nseries < 1 || nseries > MAXSERIES || conns < 1 || conns > 256 || reps < 1 || reps > 100) return 2;
+        fjob *jobs = calloc((size_t)conns, sizeof *jobs);
+        full_time("STEP by hour", conns, reps, 1, 0, jobs);
+        size_t tot = 0;
+        for (uint32_t s = 0; s < nseries; s++) tot += twa_n[s];
+        printf("twa: %zu buckets\n", tot);
+        if (argc > 4) {
+            FILE *f = fopen(argv[4], "w");
+            if (!f) { perror(argv[4]); return 1; }
+            for (uint32_t s = 0; s < nseries; s++) {
+                fprintf(f, "{\"s\":%u,\"b\":[", s);
+                for (size_t i = 0; i < twa_n[s]; i++)
+                    fprintf(f, "%s[%ld,%.17g,%ld,%lu]", i ? "," : "", (long)twa_out[s][i].start, twa_out[s][i].area,
+                            (long)twa_out[s][i].covered_ms, (unsigned long)twa_out[s][i].count);
+                fprintf(f, "]}\n");
+            }
+            fclose(f);
+        }
+        free(jobs);
         return 0;
     }
     fprintf(stderr, "usage: see source\n");
