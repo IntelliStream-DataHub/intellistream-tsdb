@@ -252,6 +252,47 @@ qline() { # NAME DIR FILE DRIVER-ARGS...: one query (LTTB, TWA): a warm-up, then
     "$B/qdrive" "$@" "$F" 1 100000 1 > "$D/warm.$N" 2>&1 9>&- || { fail "$N warm-up failed (see $D/warm.$N)"; return 1; }
     reps "$N" "$D" -- "$B/qdrive" "$@" "$F" 1 100000 1
 }
+TWA_KINDS=${TWA_KINDS-twad twal}       # whole-range TWA kinds besides the hourly STEP twa (rel.py, relq)
+TWA_WKINDS=${TWA_WKINDS-twa1d twa7d}   # TWA over random windows: the first TWA_N (1000) agg1d / agg7d windows
+twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (rel.py has), checked against tsdb's
+             # answers in $WORK/ref first and timed only when they agree; a kind without a query is noted in DIR/dash.txt
+    local S=$1 D=$2 k f r
+    shift 2
+    cd "$WORK" || return 1
+    for k in $TWA_KINDS; do
+        REL has "$S" "$k" || { echo "$k: no query in rel.py for $S" >> "$D/dash.txt"; continue; }
+        f=$D/q.$k.txt
+        REL q "$S" "$k" > "$f"
+        case " ${TWA_LOOSE-i2flux} " in
+        *" $S "*) # the built-in TWA with its own edges (InfluxDB 2's timeWeightedAvg sees only its window's rows):
+                  # timed whatever the check says; a difference goes to DIR/loose.txt for the tables, not a failure
+            REL check "$S" "$k" "ref/$k.jsonl" > "$D/check-$k.txt" 2>&1 9>&- ||
+                echo "$k: answers differ from tsdb's ($(grep -m1 "^$k:" "$D/check-$k.txt"))" >> "$D/loose.txt";;
+        *) untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { log "  $S $k: not timed (answers differ)"; continue; };;
+        esac
+        if [ "$1" = ch ]; then
+            chbench1 1 1 0 "$f" > /dev/null 2> "$D/warm.$k" 9>&-
+            for r in $(seq "$REPS"); do tstep "$k r$r" "$D/$k.$r" -- chbench_tag "$k.$r.$$" 1 1 0 "$f"; done
+        else
+            qline "$k" "$D" "$f" "$@"
+        fi
+    done
+    for k in $TWA_WKINDS; do
+        REL has "$S" "$k" || { echo "$k: no query in rel.py for $S" >> "$D/dash.txt"; continue; }
+        REL q "$S" "$k" > "q/$S.$k.txt"
+        untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { log "  $S $k: not timed (answers differ)"; continue; }
+        if [ "$1" = ch ]; then FULLS="" CLASSES="$k" chsuite "$S" "$D" "$S"
+        else FULLS="" CLASSES="$k" qsuite "$S" "$S" "$D" "$@"; fi
+    done
+}
+tsdbtwa() { # DIR PREFIX CONNS...: relq for every TWA kind (windows at 1 and 32 connections), timed
+    local D=$1 P=$2 k c
+    shift 2
+    for k in $TWA_KINDS; do for c in "$@"; do tstep "p2 tsdb $P$k c$c" "$D/$P$k.c$c.txt" -- "$B/relq" "$k" "$c" "$REPS"; done; done
+    for k in $TWA_WKINDS; do for c in 1 32; do
+        tstep "p2 tsdb $P$k c$c" "$D/$P$k.c$c.txt" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" "$c" "$REPS"
+    done; done
+}
 chbench1() { # CONC ITER|0 SECONDS|0 FILE: clickhouse-benchmark; raw output to stderr, one summary line to stdout
     local args=(--host 127.0.0.1 --delay 0 -c "$1" ${CHB_EXTRA:-})
     [ "$2" != 0 ] && args+=(-i "$2")
@@ -623,12 +664,14 @@ p2_tsdb() {
     untimed "$D/ref-full.log" sh -c "'$TB/tsdbq' full 1 1 dump 2> ref/full.jsonl"
     untimed "$D/ref-lttb.log" "$B/relq" lttb 1 1 ref/lttb.jsonl
     untimed "$D/ref-twa.log" "$B/relq" twa 1 1 ref/twa.jsonl
+    for k in $TWA_KINDS $TWA_WKINDS; do untimed "$D/ref-$k.log" env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" 1 1 "ref/$k.jsonl"; done
     tstep "p2 tsdb full c1" "$D/full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
     tstep "p2 tsdb full c16" "$D/full.c16.txt" -- "$TB/tsdbq" full 16 "$REPS"
     tstep "p2 tsdb lttb c1" "$D/lttb.c1.txt" -- "$B/relq" lttb 1 "$REPS"
     tstep "p2 tsdb lttb c16" "$D/lttb.c16.txt" -- "$B/relq" lttb 16 "$REPS"
     tstep "p2 tsdb twa c1" "$D/twa.c1.txt" -- "$B/relq" twa 1 "$REPS"
     tstep "p2 tsdb twa c16" "$D/twa.c16.txt" -- "$B/relq" twa 16 "$REPS"
+    tsdbtwa "$D" "" 1 16
     tsdbsuite tsdbq "$D" "1 32"
     tsdbbsuite tsdbq "$D"
     tstep "p2 tsdbc-bench query c1" "$D/tsdbc-bench.c1.txt" -- "$T/tsdbc-bench" query --conns 1 --seconds 5 --port "$TSDB_PORT"
@@ -641,6 +684,7 @@ p2_tsdb() {
     tstep "p2 tsdb merged lttb c16" "$D/merged.lttb.c16.txt" -- "$B/relq" lttb 16 "$REPS"
     tstep "p2 tsdb merged twa c1" "$D/merged.twa.c1.txt" -- "$B/relq" twa 1 "$REPS"
     tstep "p2 tsdb merged twa c16" "$D/merged.twa.c16.txt" -- "$B/relq" twa 16 "$REPS"
+    tsdbtwa "$D" merged. 1 16
     tsdbsuite merged "$D" "1"
     tsdbbsuite merged "$D"
     tsdbd_percore "$W/db" && PC=1 tsdbbsuite merged "$D"
@@ -676,8 +720,11 @@ p2_ch() {
     REL q ch lttb > "$D/q.lttb.sql"; REL q ch twa > "$D/q.twa.sql"
     untimed "$D/check-lttb.txt" REL check ch lttb ref/lttb.jsonl
     untimed "$D/check-twa.txt" REL check ch twa ref/twa.jsonl
-    chbench1 1 1 0 "$D/q.lttb.sql" > /dev/null 2> "$D/warm.lttb"; reps lttb "$D" -- chbench1 1 1 0 "$D/q.lttb.sql"
-    chbench1 1 1 0 "$D/q.twa.sql" > /dev/null 2> "$D/warm.twa"; reps twa "$D" -- chbench1 1 1 0 "$D/q.twa.sql"
+    for k in lttb twa; do  # timed by the server (query_log), not the client (REPORT §3)
+        chbench1 1 1 0 "$D/q.$k.sql" > /dev/null 2> "$D/warm.$k" 9>&-
+        for r in $(seq "$REPS"); do tstep "$k r$r" "$D/$k.$r" -- chbench_tag "$k.$r.$$" 1 1 0 "$D/q.$k.sql"; done
+    done
+    twasuite ch "$D" ch
     CHC -q "SELECT count(), sum(bytes_on_disk) FROM system.parts WHERE database = 'cmp' AND table = 't100m' AND active" > "$D/size-end.txt"
     cd "$OUT" || true
     crm rb-ch; rmdata "$W"
@@ -723,9 +770,11 @@ p2_qdb() { # PARQUET(0|1)
     local PG="host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb"
     qsuite qdb "$P" "$D" pg "$PG"
     bcheck qdb "$D" && { bsuite qdb "$P" "$D" pg "$PG"; pc_pin rb-qdb && PC=1 bsuite qdb "$P" "$D" pg "$PG"; pc_unpin rb-qdb; }
-    REL q qdb twa > "$D/q.twa.sql"
-    untimed "$D/check-twa.txt" REL check qdb twa ref/twa.jsonl
-    qline twa "$D" "$D/q.twa.sql" pg "$PG"
+    REL q qdb twa > "$D/q.twa.sql"  # native twap() + SAMPLE BY 1h (REPORT §5.10), timed only when it agrees
+    untimed "$D/check-twa.txt" REL check qdb twa ref/twa.jsonl && qline twa "$D" "$D/q.twa.sql" pg "$PG"
+    REL q qdbseg twa > "$D/q.twaseg.sql"  # the 0.9.0 run's lead() CTE, for comparison
+    untimed "$D/check-twaseg.txt" REL check qdbseg twa ref/twa.jsonl && qline twaseg "$D" "$D/q.twaseg.sql" pg "$PG"
+    twasuite qdb "$D" pg "$PG"
     if [ "$pq" = 0 ]; then
         # HTTP API cross-check (README: within 10% of the PostgreSQL protocol): one run per measurement
         REPS=1 qsuite qdbh "$P-http" "$D" http 127.0.0.1 9100 ""
@@ -799,6 +848,7 @@ p2_ts() {
     local PG="host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
     qline lttb "$D" "$D/q.lttb.sql" pg "$PG"
     qline twa "$D" "$D/q.twa.sql" pg "$PG"
+    twasuite ts "$D" pg "$PG"
     cd "$OUT" || true
     crm rb-tsha; rmdata "$W"
     runstats "$D"
@@ -836,6 +886,7 @@ p2_i2() {
         [ $x = 0 ] && { pc_pin rb-i2 || break; }
     done
     pc_unpin rb-i2
+    TWA_WKINDS="" twasuite i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
     cd "$OUT" || true
     crm rb-i2; rmdata "$W"
     runstats "$D"
@@ -865,6 +916,7 @@ p2_i3() {
     REL q i3 twa > "$D/q.twa.http"
     untimed "$D/check-twa.txt" REL check i3 twa ref/twa.jsonl
     qline twa "$D" "$D/q.twa.http" http 127.0.0.1 8181 ""
+    twasuite i3 "$D" http 127.0.0.1 8181 ""
     cd "$OUT" || true
     crm rb-i3; rmdata "$W"
     runstats "$D"
