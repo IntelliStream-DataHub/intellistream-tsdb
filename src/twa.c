@@ -33,8 +33,6 @@
 #include <math.h>
 #include <stdlib.h>
 
-#define TWA_PARALLEL_MIN 8
-
 /* A TWA bucket needs no reading of its own (a segment across it is enough), so two readings far apart can ask
  * for a bucket per millisecond between them: the limit is what one reply can carry over the wire, far below
  * the aggregates' MAX_BUCKETS, and bounds a request's memory (about 100 bytes a bucket) to some 400 MB. */
@@ -608,8 +606,10 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
         twa_job j = {.db = db, .qs = cur_qstats, .q = &q, .sn = &sn, .pc = pc, .work = work, .nwork = nwork};
         atomic_init(&j.next, 0);
         atomic_init(&j.err, 0);
-        int threads = nwork >= TWA_PARALLEL_MIN ? (int)MIN((size_t)db->opt.query_threads, nwork) : 1;
-        sched_run(db->sched, threads, twa_worker, &j);
+        uint64_t rows = 0;
+        for (size_t w = 0; w < nwork; w++)
+            rows += (uint64_t)pc[work[w]].g->count * TWA_ROW_WEIGHT;
+        sched_run(db->sched, query_threads_for(db, rows, nwork), twa_worker, &j);
         rc = atomic_load(&j.err);
         if (rc)
             goto done;

@@ -732,6 +732,18 @@ typedef struct qbudget {
 } qbudget;
 extern __thread const qbudget *cur_budget;
 extern size_t multi_defer_bytes, multi_defer_rows; /* 16 MiB, 65536; tests lower them to force deferral */
+
+/* Threads for a query step that decodes `rows` rows in `items` independent pieces (granules): one per
+ * query_rows_per_thread rows, at most one per item and query_threads. Small reads are fastest on the calling
+ * thread alone (no wake-up, no cache traffic), large ones on many. Every query kind that fans out uses it; what a
+ * thread folds does not depend on the count (results are bit-identical at any count). query_rows_per_thread is
+ * QUERY_ROWS_PER_THREAD, measured with tools/threads-bench (docs/design.md has the sweep); the bench changes it. */
+#define QUERY_ROWS_PER_THREAD 16384
+/* A TWA decodes and integrates every row (areas, gaps): about 12 times an aggregate's work per row, so its rows
+ * count that many times over (threads-bench). */
+#define TWA_ROW_WEIGHT 12
+extern uint64_t query_rows_per_thread;
+int query_threads_for(const eng *db, uint64_t rows, size_t items);
 static inline bool qbudget_ok(size_t bytes)
 {
     const qbudget *b = cur_budget;

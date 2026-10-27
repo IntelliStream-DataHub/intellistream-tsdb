@@ -38,7 +38,6 @@
 #define MAX_BUCKETS (4u << 20)
 _Static_assert((uint64_t)MAX_BUCKETS * TSDB_AGG_ROW + 64 <= TSDB_MAX_FRAME, "an aggregate reply must fit a frame");
 #define AGG_DENSE_BYTES (32u << 20) /* one dense array of bucket states (bq_window) */
-#define PARALLEL_MIN_GRANULES 8
 #define AGG_STRIPES 64
 #define AGG_STRIPE_SHIFT 10 /* 1024 consecutive buckets share a lock */
 
@@ -970,6 +969,17 @@ typedef struct agg_job {
     atomic_int err;
 } agg_job;
 
+uint64_t query_rows_per_thread = QUERY_ROWS_PER_THREAD;
+
+int query_threads_for(const eng *db, uint64_t rows, size_t items)
+{
+    uint64_t per = query_rows_per_thread ? query_rows_per_thread : 1;
+    uint64_t t = rows / per;
+    t = MIN(t, (uint64_t)items);
+    t = MIN(t, (uint64_t)db->opt.query_threads);
+    return t > 1 ? (int)t : 1;
+}
+
 static void agg_worker(void *arg, int idx)
 {
     (void)idx;
@@ -1420,8 +1430,10 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
         atomic_init(&j->err, 0);
         for (int k = 0; k < AGG_STRIPES; k++)
             pthread_mutex_init(&j->locks[k], NULL);
-        int threads = nwork >= PARALLEL_MIN_GRANULES ? (int)MIN((size_t)db->opt.query_threads, nwork) : 1;
-        sched_run(db->sched, threads, agg_worker, j);
+        uint64_t rows = 0;
+        for (size_t w = 0; w < nwork; w++)
+            rows += work[w].g->count;
+        sched_run(db->sched, query_threads_for(db, rows, nwork), agg_worker, j);
         for (int k = 0; k < AGG_STRIPES; k++)
             pthread_mutex_destroy(&j->locks[k]);
         rc = atomic_load(&j->err);
