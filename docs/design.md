@@ -23,6 +23,11 @@ start, the tests and the benchmark results.
   replaces too), the last write wins (within one batch, the later row), and
   queries never return duplicates.
 - Time ranges are half open, `[start, end)`.
+- A query reads one **snapshot**: what was committed when it started, nothing
+  written after. A query over many series in one call (`tsdb_query_multi`,
+  QUERY_MULTI) reads all of them from one snapshot of each volume, so an
+  insert that wrote several series in one call is seen by all of them or by
+  none. Separate queries, one per series, each take their own.
 - A time range of one series can be deleted (`tsdb_delete_range`) or replaced
   atomically (`tsdb_replace_range`). A delete is a write: a value written
   after it returned is kept, one written before it is gone. A series can have
@@ -1323,6 +1328,64 @@ Clients in other languages, each with a quick start in its README:
 | Rust (std only, blocking) | [`client/rust`](client/rust) | `make test-rust` |
 | Python (PyO3 over the Rust client, numpy optional) | [`client/python`](client/python) | `make test-python` |
 | Java 17+ (Maven, no runtime dependencies) | [`client/java`](client/java) | `make test-java` |
+
+## Many series in one request
+
+A dashboard or a report asks the same question of many series: the last
+hour of 200 sensors, a day of every pump by hour. One request per series
+costs a round trip and a request's fixed work each; `tsdb_query_multi`
+(embedded) and QUERY_MULTI (protocol 10) ask it once for a list of up to
+65,536 series (the clients split longer lists).
+
+```c
+tsdb_multi_query q = {.kind = TSDB_MULTI_BUCKETS, .start = t0, .end = t1, .interval_ms = 3600000};
+tsdb_query_multi(db, &q, ids, n, NULL, on_series, ctx);     /* on_series(ctx, r) in index order */
+tsdbc_query_multi(c, &q, ids, n, NULL, on_series, ctx);     /* the same over TCP */
+```
+
+- **Same answers as one query per series.** Each series runs the unchanged
+  single-series function (values, buckets, spread, TWA, LTTB; fixed, calendar
+  or bounds buckets), with its own status: a bad or unknown series does not
+  end the request. Start, end and interval may differ per series.
+- **One snapshot.** The call takes one cut of every volume (parts and
+  memtables) and every series reads from it.
+- **In order, in parallel.** The caller delivers results in index order;
+  the database's scheduler runs up to 2 x threads series ahead of it. Small
+  series run one per thread; a large one still spreads its granules over
+  threads inside its task.
+- **Bounded memory.** A series that runs ahead keeps its result until its
+  turn, at most 64 MiB for the whole request (charged to
+  `--max-request-memory` in tsdbd). One that would need more (over 65,536
+  rows or points, or 16 MiB of bucket accumulators) stops and runs again at
+  its turn, streaming like a single request. `max_rows` (tsdbd:
+  `--multi-max-rows`, default 268,435,456) caps the rows or buckets of a
+  request; past it the request ends with `TOO_MANY_BUCKETS`.
+- **Stopping.** A callback that returns nonzero ends the call; a client
+  sends CANCEL and the server ends the request after the series in flight.
+- **Local time zones.** The server knows UTC only. For calendar buckets in a
+  zone, a client asks for the first and last row of every series (two
+  QUERY_MULTI VALUES with a limit of 1), builds one list of bounds for the
+  union of those ranges and sends it with TRIM, which cuts each series'
+  bounds to its own rows; above the bounds limit it falls back to one
+  request per series.
+
+### Threads
+
+Every database has one query scheduler with `query_threads - 1` helper
+threads (tsdbd `--query-threads`, default one per CPU). One query, or one
+multi-series call, uses at most `request_threads` of them, the caller
+included (`--request-threads`, default all), so that many concurrent
+requests share the CPUs instead of each taking all of them. The caller of a
+job always works on it: a job finishes even when every helper is busy.
+
+How many threads one query step uses follows its work
+(`query_threads_for` in src/query.c): small reads run on the calling thread
+alone, with no wake-up and no cache traffic; large ones spread out, one
+thread per `QUERY_ROWS_PER_THREAD` rows to decode (a TWA's rows count
+`TWA_ROW_WEIGHT` times, since it integrates every row). Both constants come
+from `build/threads-bench`, which times one thread against many across
+work sizes. What a thread adds up does not depend on the count, so answers
+are bit-identical at any thread count (`tests/test_threads.c`).
 
 ## Command line
 

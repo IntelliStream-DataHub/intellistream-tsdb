@@ -73,6 +73,9 @@ machine's CPU (`-march=native`). For a jar that runs on other machines, build th
 - **Threads.** Every method is thread safe, and one `EmbeddedDb` is meant to be shared by all threads, like the C
   handle. `close()` waits for the calls already running, and later calls fail with `ERR_IO`. Calling `close()`
   from inside a query's consumer throws `IllegalStateException` instead of deadlocking.
+- **Many series in one call.** The `...Multi` methods of `TsdbClient` exist here too, with the same answers: one
+  downcall runs the whole list on the database's query threads (`EmbeddedOptions.queryThreads`; one call uses at
+  most `requestThreads` of them) and reads every series at the same instant.
 - **One writer per directory.** A second open of a directory that is open for writing fails with `ERR_LOCKED`,
   whether it comes from this process or another one. `new EmbeddedOptions().readOnly(true)` opens the directory
   beside a writer, for example beside a running tsdbd.

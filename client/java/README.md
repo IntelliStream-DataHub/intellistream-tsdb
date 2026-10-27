@@ -283,6 +283,34 @@ long sent = client.bytesSent();
 zstd-jni loads native code. On Java 22 and newer, run with `--enable-native-access=ALL-UNNAMED` to avoid a
 warning.
 
+## Many series in one request
+
+The `...Multi` methods ask one question of a whole list of series in a single request (protocol version 10):
+`queryValuesMulti`, `queryLttbMulti`, `queryBucketsMulti`, `querySpreadMulti` and `queryTwaMulti`. The server
+works on the series in parallel, sends the answers back in the order of the list, and reads every series at the
+same instant. Each series has its own result, so an unknown or bad series does not spoil the others:
+
+```java
+int[] pumps = new int[200];
+for (int i = 0; i < pumps.length; i++) pumps[i] = i;
+long day = 86_400_000L;
+// every pump by hour over one day
+List<SeriesResult<List<Bucket>>> hourly =
+        client.queryBucketsMulti(pumps, 0, day, Buckets.every(3_600_000), Order.ASC, 0, MultiOptions.defaults());
+for (int i = 0; i < pumps.length; i++) {
+    SeriesResult<List<Bucket>> r = hourly.get(i);
+    if (r.ok()) System.out.println("pump " + pumps[i] + ": " + r.get().size() + " hours");
+    else System.out.println("pump " + pumps[i] + ": status " + r.status());
+}
+```
+
+`Buckets` says how to cut each range: `one()`, `every(ms)`, per-series `intervals(...)`, calendar periods of a
+`group(...)` in any time zone, or explicit `bounds(...)`. `MultiOptions` can give each series its own start and
+end, cap the threads the request uses (`threads(n)`) and the rows or buckets of all series together
+(`maxRows(n)`). `get()` throws the series' error. A list longer than 65,536 series is split into several
+requests for you. `queryValuesMulti` with a `MultiValuesConsumer` streams raw rows as they arrive; a consumer that
+returns `false` stops the request on the server too. `EmbeddedDb` (client/java-embedded) has the same methods.
+
 ## Errors
 
 A failed request throws `TsdbException`. Its `status()` is one of the `Status.ERR_*` codes, and `getMessage()`

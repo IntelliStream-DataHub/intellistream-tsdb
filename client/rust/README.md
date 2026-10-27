@@ -383,6 +383,45 @@ A connection of the pool that breaks is replaced before its next query.
 set a timeout, say), and `Pool::map` runs any calls of your own spread
 over the connections.
 
+## Many series in one request
+
+The `_multi` calls ask one question of a whole list of series in a single
+request (protocol version 10): `query_rows_multi`, `query_lttb_multi`,
+`query_buckets_multi`, `query_spread_multi` and `query_twa_multi`, on
+`Client`, `Pool` and the embedded `Db`. The server works on the series in
+parallel, sends the answers back in the order of the list, and reads every
+series at the same instant. Each series has its own result: an unknown or
+bad one does not spoil the others.
+
+```rust
+use tsdb_client::{Buckets, Client, MultiOpts, QueryOpts};
+
+fn main() -> tsdb_client::Result<()> {
+    let mut c = Client::connect("127.0.0.1:7070")?;
+    let pumps: Vec<u32> = (0..200).collect();
+    let day = 86_400_000;
+    // every pump by hour over one day: hourly[i] is pumps[i]'s answer
+    let hourly = c.query_buckets_multi(&pumps, 0..day, Buckets::Every(3_600_000), QueryOpts::default(),
+                                       MultiOpts::default())?;
+    for (id, r) in pumps.iter().zip(&hourly) {
+        match r {
+            Ok(b) => println!("pump {id}: {} hours", b.len()),
+            Err(e) => println!("pump {id}: {e}"),
+        }
+    }
+    Ok(())
+}
+```
+
+`Buckets` says how to cut each range: `One` bucket, `Every(ms)`, per-series
+`Intervals`, calendar periods of a `Group` in any time zone, or explicit
+`Bounds`. `MultiOpts` can give each series its own `starts` and `ends`, cap
+the `threads` the request uses, and cap `max_rows`, the rows or buckets of
+all series together. A list longer than 65,536 series is split into several
+requests for you. `query_chunks_multi` streams raw rows to a closure as
+they arrive; returning `ControlFlow::Break` stops the request on the server
+too.
+
 ## API documentation
 
 ```sh

@@ -98,6 +98,19 @@ $T/tsdb-bench --dir $DBCMP/tsdb-embedded --threads 4 --keep   # embedded; delete
 The size is the `bytes` of `tsdbstat`, or `du -sb --exclude='retired_*' $DBCMP/tsdb` (replaced
 parts stay as `retired_*` for `obsolete_part_lifetime_s`).
 
+Many series in one request (protocol 10), the way the SQL systems get one query for 10 or 100 series:
+`--batch K` sends a connection's series K at a time as one QUERY_MULTI (`--batch 1` is one plain request per
+series, as without it; `full 1 5 --batch 100` is one request for all 100 series), and a qps class `NAME.bK`
+(`raw.b10`, `agg1d.b100`) runs K random windows of NAME, on K series, as one request. `twa` is the
+time-weighted average (step, by hour, over the whole range) with the same `--batch`; its answers go to
+`ref/twa.jsonl`. Timings are the mean, sd, median, min and max of the repetitions.
+
+```sh
+$B/tsdbq full 1 5 --batch 100; $B/tsdbq full 16 5 --batch 7
+$B/tsdbq twa 1 5 ref/twa.jsonl; $B/tsdbq twa 1 5 --batch 100
+for c in raw agg1d agg7d point; do for k in 10 100; do $B/tsdbq qps spec.tsv $c.b$k 1 15; done; done
+```
+
 ## ClickHouse 26.8.2.7
 
 ```sh
@@ -391,6 +404,10 @@ for c in raw agg1d agg7d point; do
   for t in 1 32; do $B/embq duckdb qps $DBCMP/duckdb/t.duckdb spec.tsv $c $t 15; done
 done
 ```
+
+tsdb embedded takes the same `--batch K` for `full` and `twa` and the same `NAME.bK` qps classes, through
+`tsdb_query_multi`; `--threads T` caps the threads one call uses (`request_threads`):
+`$B/embq tsdb full $DBCMP/tsdb-embq 5 1 --batch 100 --threads 32`.
 
 Variants: `EMBQ_NOPREP=1` sends literal SQL instead of prepared statements (within a few percent of
 each other here); `DUCK_THREADS=1` runs DuckDB with one thread per query instead of 32;
