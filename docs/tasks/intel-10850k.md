@@ -69,6 +69,11 @@ and of many cloud VMs. Questions:
    test and the conversion to integers) and decode (integers to doubles), byte-identical to the v2 path and
    checked in `tests/test_levels.c`; measure them here against the v2 path they replace on v3 CPUs, and keep
    them only if they are faster here.
+5. **Hyper-Threading.** The 10850K has 10 cores and 20 threads. With the query scheduler (`--query-threads`, after
+   the multi-series work of October 2026), time large and small queries and multi-series requests at 1, 2, 4, 5,
+   10 and 20 query threads, means of 5: does the second thread per core help (decode is integer and AVX2 work, and
+   the two threads share the core's units) or hurt? Should the default be one thread per physical core
+   (`/sys/devices/system/cpu/cpu*/topology/thread_siblings_list`) on this CPU? Compare with the 7950X's 16 vs 32.
 
 ## Done when
 

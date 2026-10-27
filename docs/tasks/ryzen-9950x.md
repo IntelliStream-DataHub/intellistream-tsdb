@@ -64,6 +64,13 @@ baseline (VBMI, VBMI2, GFNI, BITALG, VPOPCNTDQ, BF16), plus AVX512-VP2INTERSECT 
    with steps 2 and 3 changing the same code, try to remove it.
 5. **Look for uses of VP2INTERSECT** (finding equal elements of two vectors): merging sorted timestamps or
    series ids are candidates. Only if a measurement shows a gain.
+6. **SMT (two threads per core).** With the query scheduler (`--query-threads`, after the multi-series work of
+   October 2026), time large and small queries and multi-series requests at 1, 2, 4, 8, 16 and 32 query threads
+   (16 = one per core, 32 = both SMT threads), means of 5. Zen 5 runs AVX-512 at full width, so two threads on one
+   core compete for the same vector units: check whether 32 threads beat 16 for decode-heavy queries, and whether
+   the default (one thread per logical CPU) should become one per physical core
+   (`/sys/devices/system/cpu/cpu*/topology/thread_siblings_list`). Compare with the same sweep on the 7950X, and
+   note the two CCDs (8 cores each, L3 per CCD): does keeping one query on one CCD help?
 
 ## Done when
 
