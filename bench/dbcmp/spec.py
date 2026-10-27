@@ -12,7 +12,7 @@ STEP = [60000, 1000, 10000, 10000, 1, 1000, 1000]  # kind = series % 7
 path, n = sys.argv[1], int(sys.argv[2])
 rnd = random.Random(20261024)
 NSERIES = int(os.environ.get("NSERIES", "100"))
-POINTS = 1000000
+POINTS = int(os.environ.get("POINTS", "1000000"))  # samples per series (smoke runs: fewer, > 604800 for agg7d)
 out = sys.stdout
 for cls, win, nb in (("raw", 3600, 0), ("agg1d", 86400, 300), ("agg7d", 604800, 3600)):
     for _ in range(n):
