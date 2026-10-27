@@ -11,16 +11,16 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 TOOLS=$RDIR
 DSLIST=${DSLIST:-"$DS_KINDS $DS_HYD"}
-P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom"}
-P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3"}
+P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom iot iotz"}
+P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3 iot iotz"}
 I3_P2_FLAGS=${I3_P2_FLAGS:-}            # smoke runs only: e.g. --force-snapshot-max-age 2m
 I3_P2_MIN=${I3_P2_MIN:-600}
 I3_P1_AGE=${I3_P1_AGE:-5m} I3_P1_MIN=${I3_P1_MIN:-420}
 I2_EXTRA=${I2_EXTRA:-}                  # smoke runs only: e.g. -e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s
 PROM_SETTLE_TIMEOUT=${PROM_SETTLE_TIMEOUT:-36000}
 P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320}
-CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig"
-PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091)\b'
+CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot"
+PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080)\b'
 mkdir -p "$OUT"
 
 # ------------------------------------------------------------------ logging, quiet gate, timed steps
@@ -40,6 +40,7 @@ QMAX=$QUIET_MAX
 reset_quiet() { QMAX=$QUIET_MAX; }
 quiet() { # LABEL: wait for the performance governor and < 1.5 busy CPUs; after QMAX s measure anyway (logged)
     local t0 b
+    [ "${SMOKE:-0}" = 1 ] && { BUSY=smoke; return 0; }   # smoke runs check, they do not time: no gates
     t0=$(date +%s)
     until gov_ok; do
         if [ $(($(date +%s) - t0)) -ge 600 ]; then log "WARN governor is not performance on every CPU before: $1"; break; fi
@@ -342,7 +343,7 @@ REL() { python3 -I "$TOOLS/rel.py" "$@"; }
 # A batch is one request of K series (K = 1, 10, 100; mkbatch.py says how each language does it). Whole-range
 # batch files are run whole, one client, REPS times: "N queries in X s" is the total time of the set; window
 # classes run their batch file at 1 and 32 clients for SECS. PC=1 is the per-core run: the server pinned to
-# PERCORE_CPU (containers by podman update --cpuset-cpus, tsdbd by taskset plus --query-threads 1), the engine's
+# PERCORE_CPU (containers by ctr_taskset, tsdbd by taskset plus --query-threads 1), the engine's
 # own thread knob where it has one, one client pinned to PERCORE_CLIENT_CPU; names get ".pc".
 KS=${KS:-"1 10 100"}
 BCLASSES=${BCLASSES-$CLASSES_DEFAULT}
@@ -350,11 +351,27 @@ PERCORE_CPU=${PERCORE_CPU:-2} PERCORE_CLIENT_CPU=${PERCORE_CLIENT_CPU:-3}
 pc_client() { # CMD...: on PERCORE_CLIENT_CPU in a per-core run (shell functions too: those used are exported)
     if [ "${PC:-0}" = 1 ]; then taskset -c "$PERCORE_CLIENT_CPU" bash -c '"$@"' pc_client "$@"; else "$@"; fi
 }
+# Rootless Podman here has no cpuset controller (the user slice delegates cpu, memory and pids only), so
+# --cpuset-cpus and podman update --cpuset-cpus fail; the container's processes are ours, so taskset pins every
+# thread of every process in its tree (threads and processes made later inherit the mask).
+ctr_taskset() { # CPUS CONTAINER: pin the container's process tree; fails if the container has no pid or nothing moved
+    local cpus=$1 root p n=0 kids
+    root=$(podman inspect -f '{{.State.Pid}}' "$2" 2> /dev/null)
+    [[ "$root" =~ ^[1-9][0-9]*$ ]] || return 1
+    local todo=("$root")
+    while [ ${#todo[@]} -gt 0 ]; do
+        p=${todo[0]}; todo=("${todo[@]:1}")
+        taskset -a -cp "$cpus" "$p" > /dev/null 2>&1 && n=$((n + 1))
+        kids=$(cat /proc/"$p"/task/*/children 2> /dev/null)
+        for k in $kids; do todo+=("$k"); done
+    done
+    [ "$n" -gt 0 ] && [ "$(taskset -cp "$root" 2> /dev/null | sed 's/.*: //')" = "$cpus" ]
+}
 pc_pin() { # CONTAINER...: to PERCORE_CPU
     local c
-    for c; do podman update --cpuset-cpus "$PERCORE_CPU" "$c" > /dev/null || { fail "per-core: podman update $c"; return 1; }; done
+    for c; do ctr_taskset "$PERCORE_CPU" "$c" || { fail "per-core: taskset $c"; return 1; }; done
 }
-pc_unpin() { local c; for c; do podman update --cpuset-cpus "0-$(( $(nproc) - 1 ))" "$c" > /dev/null; done; }
+pc_unpin() { local c; for c; do ctr_taskset "0-$(( $(nproc) - 1 ))" "$c"; done; }
 bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
     local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 32}
     shift 3
@@ -1176,6 +1193,9 @@ phase_checktest() {
     return $rc
 }
 
+# ================================================================== the systems added for the 0.9.0 rerun
+. "$RDIR/sys_iot.sh"
+
 # ================================================================== main
 machine() {
     {
@@ -1184,7 +1204,7 @@ machine() {
         echo "tsdb tree: $TSDB_TREE $(git -C "$TSDB_TREE" rev-parse HEAD) ($(git -C "$TSDB_TREE" diff --stat | tail -1))"
         echo "harness: $ROOT $(git -C "$ROOT" rev-parse HEAD)"
         podman --version
-        for i in $CH_IMG $TS_IMG $TSHA_IMG $QDB_IMG $I2_IMG $I3_IMG "$PROM_IMG"; do echo "$i $(podman image inspect --format '{{.Digest}} {{.Created}}' "$i" 2> /dev/null)"; done
+        for i in $CH_IMG $TS_IMG $TSHA_IMG $QDB_IMG $I2_IMG $I3_IMG "$PROM_IMG" $IOT_IMG; do echo "$i $(podman image inspect --format '{{.Digest}} {{.Created}}' "$i" 2> /dev/null)"; done
         echo "duckdb: $DUCKDB_DIR (libduckdb-linux-amd64.zip sha256 $DUCKDB_SHA)"
         echo "chdb: $CHDB_DIR (chdb-core v26.9.0 of 2026-09-28, linux-x86_64-libchdb.tar.gz sha256 $CHDB_SHA)"
         echo "REPS=$REPS SECS=$SECS QUIET_MAX=$QUIET_MAX"

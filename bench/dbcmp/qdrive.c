@@ -34,6 +34,8 @@ void PQfinish(PGconn *conn);
 
 static int mode_pg;
 static const char *host, *headers, *conninfo;
+static const char *err_prefix; /* QDRIVE_ERR: a reply body starting with it is a failed query */
+static size_t err_len;
 static int port, threads;
 static double seconds;
 static long maxq = -1;  /* queries per thread; 0: every query of the file once, taken from a shared queue */
@@ -115,8 +117,11 @@ static void *run(void *arg)
                 size_t rb = 0;
                 resp.n = 0;
                 int st = h_request(&c, method, path, hdrs, body, strlen(body), &resp, &rb);
-                if (st != 200) {
-                    fprintf(stderr, "query failed: status %d: %.500s\n%.300s\n", st, resp.p ? resp.p : "", one);
+                /* IoTDB's REST service answers a failed query (out of query memory, say) with status 200 and a body
+                 * {"code":...}: QDRIVE_ERR names such a prefix, so a failure is never timed as a fast answer */
+                if (st != 200 || (err_prefix && resp.n >= err_len && !memcmp(resp.p, err_prefix, err_len))) {
+                    fprintf(stderr, "query failed: status %d: %.*s\n%.300s\n", st, (int)(resp.n < 500 ? resp.n : 500),
+                            resp.p ? resp.p : "", one);
                     exit(1);
                 }
                 j->bytes += rb;
@@ -139,6 +144,9 @@ static int cmpd(const void *a, const void *b)
 int main(int argc, char **argv)
 {
     int k;
+    err_prefix = getenv("QDRIVE_ERR");
+    if (err_prefix && !*err_prefix) err_prefix = NULL;
+    err_len = err_prefix ? strlen(err_prefix) : 0;
     if (argc >= 8 && !strcmp(argv[1], "http")) {
         host = argv[2];
         port = atoi(argv[3]);

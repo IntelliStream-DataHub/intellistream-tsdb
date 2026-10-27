@@ -26,7 +26,7 @@
 # relative. NaN, a missing or an extra bucket or series is a mismatch. Only the TimescaleDB toolkit may differ in
 # the last bucket of a series (its interpolated_average holds the last value to the bucket end): counted apart.
 # Checked with clickhouse local and DuckDB on 7 series x 650,000 rows: twa, twad, twal, twa1d, twa7d all exact.
-import datetime, json, os, subprocess, sys, urllib.parse, urllib.request
+import datetime, json, os, subprocess, sys, time, urllib.parse, urllib.request
 
 H = 3600000
 IV = {"twa": H, "twad": 86400000, "twal": H}  # bucket width of the whole-range TWA kinds (twal: LINEAR)
@@ -295,9 +295,16 @@ def run_sql(sysname, sql):
         url = f"http://127.0.0.1:{os.environ.get('I3_PORT', '8181')}/api/v3/query_sql?db=cmp&format=json&q=" + urllib.parse.quote(sql, safe="")
         return [list(r.values()) for r in json.loads(http(url))]
     if sysname == "iot":
-        out = json.loads(http(f"http://127.0.0.1:{os.environ.get('IOT_REST_PORT', '18080')}/rest/table/v1/query",
-                              json.dumps({"database": "cmp", "sql": sql}),
-                              {"Content-Type": "application/json", "Authorization": "Basic cm9vdDpyb290"}))
+        # 719 is IoTDB refusing a query whose memory estimate exceeds what the query operators have free at that
+        # moment (enable_query_memory_estimation, the default); right after a 32-client run the queries the clients
+        # left behind still hold it, so the check waits for them (up to 2 minutes) instead of failing; it says so
+        for attempt in range(25):
+            out = json.loads(http(f"http://127.0.0.1:{os.environ.get('IOT_REST_PORT', '18080')}/rest/table/v1/query",
+                                  json.dumps({"database": "cmp", "sql": sql}),
+                                  {"Content-Type": "application/json", "Authorization": "Basic cm9vdDpyb290"}))
+            if out.get("code") != 719: break
+            print(f"iot: 719 (query memory), retry {attempt + 1} in 5 s", file=sys.stderr)
+            time.sleep(5)
         if "values" not in out: raise RuntimeError(f"iot: {out}")
         return out["values"]
     if sysname == "i2flux":
