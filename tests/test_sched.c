@@ -160,6 +160,53 @@ static void test_caps(void)
     sched_free(s);
 }
 
+/* As many requests in flight as there are threads: each runs on its own thread, waking no helper (they would only
+ * steal CPUs from the other requests). One request alone gets every helper, through the wake tree. */
+typedef struct load_arg {
+    sched *s;
+    pthread_barrier_t *in, *out;
+    job j;
+} load_arg;
+
+static void *load_thread(void *a)
+{
+    load_arg *r = a;
+    sgroup g;
+    sched_group_begin(r->s, &g, 0);
+    pthread_barrier_wait(r->in); /* every request is in flight before any job opens */
+    job_init(&r->j, 64, 20);
+    sched_run(r->s, 32, job_fn, &r->j);
+    pthread_barrier_wait(r->out);
+    sched_group_end(&g);
+    return NULL;
+}
+
+static void test_load(void)
+{
+    sched *s = sched_new(8, 0);
+    pthread_barrier_t in, out;
+    pthread_barrier_init(&in, NULL, 8);
+    pthread_barrier_init(&out, NULL, 8);
+    load_arg a[8];
+    pthread_t th[8];
+    for (int i = 0; i < 8; i++) {
+        a[i] = (load_arg){.s = s, .in = &in, .out = &out};
+        pthread_create(&th[i], NULL, load_thread, &a[i]);
+    }
+    for (int i = 0; i < 8; i++)
+        pthread_join(th[i], NULL);
+    for (int i = 0; i < 8; i++)
+        CHECK(atomic_load(&a[i].j.done) == 64 && a[i].j.nids == 1 && atomic_load(&a[i].j.max_inside) == 1);
+    pthread_barrier_destroy(&in);
+    pthread_barrier_destroy(&out);
+
+    run_arg r = {.s = s, .n = 2000, .us = 100}; /* 200 ms of items; the tree staffs all 7 helpers in far less */
+    run_thread(&r);
+    CHECK(atomic_load(&r.j.done) == 2000);
+    CHECK(atomic_load(&r.j.max_inside) >= 7 && atomic_load(&r.j.max_inside) <= 8);
+    sched_free(s);
+}
+
 /* A request that comes while another holds every helper gets one within about one item. */
 static void test_newcomer(void)
 {
@@ -414,6 +461,7 @@ int main(int argc, char **argv)
     const char *base = argc > 1 ? argv[1] : "/tmp";
     test_two_jobs();
     test_caps();
+    test_load();
     test_newcomer();
     test_nesting();
     test_tiny();

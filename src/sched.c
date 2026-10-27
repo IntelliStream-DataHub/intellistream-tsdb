@@ -13,6 +13,15 @@
  * Picking. An idle helper takes the group with the fewest active threads below its cap (ties: the oldest), and
  * within it the newest open job with room: decode for series already started before new series.
  *
+ * Load. Outermost groups count themselves in `live` (an atomic, no lock). A job asks for at most its share
+ * of the helpers, 1 + helpers / live: under as many concurrent requests as there are CPUs every request runs on
+ * its own thread, as fast as it can (waking helpers that are all busy costs locks, wake-ups and caches for
+ * nothing), and a lone request gets every helper.
+ *
+ * Waking. The opener wakes at most WAKE_FANOUT idle helpers and each helper that joins wakes WAKE_FANOUT more
+ * while the job has room: a tree, so the opener starts its own items after two wake-ups, not after one per
+ * helper. The signals go out after the scheduler's mutex is released.
+ *
  * Rebalancing. Workers call sched_leave() after each item: a relaxed load of the group's cancel flag and of a
  * generation counter, which bumps only when a group opens a job that idle helpers cannot staff. On a change a
  * helper whose group holds more than its share, while another group wants help, returns and picks again. The
@@ -43,6 +52,7 @@ struct sched {
     int ngroups;
     uint64_t seq;
     atomic_uint_fast64_t gen;
+    atomic_int live; /* outermost groups begun and not ended: requests in flight */
     int request_threads;
     bool stop;
 };
@@ -112,6 +122,10 @@ void sched_group_begin(sched *s, sgroup *g, int cap)
     g->cap = cap > 0 ? cap : s ? s->request_threads : 1;
     g->active = 1; /* the thread that began it */
     atomic_init(&g->cancel, 0);
+    if (s && !cur_group) {
+        atomic_fetch_add_explicit(&s->live, 1, memory_order_relaxed);
+        g->counted = true;
+    }
     g->outer = cur_group;
     cur_group = g;
 }
@@ -119,6 +133,8 @@ void sched_group_begin(sched *s, sgroup *g, int cap)
 void sched_group_end(sgroup *g)
 {
     /* every job of the group was closed, and a group is linked only while it has jobs */
+    if (g->counted)
+        atomic_fetch_sub_explicit(&g->s->live, 1, memory_order_relaxed);
     cur_group = g->outer;
 }
 
@@ -183,6 +199,10 @@ static sjob *pick(sched *s)
 /* a group's fair share of the helpers when n groups want them */
 static int share(const sched *s, int n) { return n ? (s->nh + n - 1) / n : s->nh; }
 
+#define WAKE_FANOUT 2
+static int wake(sched *s, sgroup *g, sjob *j, helper **w, bool opener);
+static void signal_all(helper **w, int n);
+
 static void *helper_main(void *a)
 {
     helper *h = a;
@@ -207,7 +227,10 @@ static void *helper_main(void *a)
         g->active++;
         int id = ++j->ids;
         uint64_t opens = j->opens;
+        helper *w[WAKE_FANOUT];
+        int nw = job_room(g, j) ? wake(s, g, j, w, false) : 0;
         pthread_mutex_unlock(&s->m);
+        signal_all(w, nw);
 
         cur_group = g;
         cur_job = j;
@@ -232,21 +255,42 @@ static void *helper_main(void *a)
     return NULL;
 }
 
-/* wakes the idle helpers the group's open job can use (lock held) */
-static void wake(sched *s, sgroup *g, sjob *j)
+/* Takes up to WAKE_FANOUT idle helpers the group's open job can use off the idle stack into w (lock held); the
+ * caller signals them with signal_all once it has released the lock. */
+static int wake(sched *s, sgroup *g, sjob *j, helper **w, bool opener)
 {
     int room = MIN(j->want - 1 - j->helpers, g->cap - g->active);
-    int k = MIN(room, s->nidle);
+    int avail = MIN(room, s->nidle);
+    int k = MIN(avail, WAKE_FANOUT);
     for (int i = 0; i < k; i++) {
         helper *h = s->idle;
         s->idle = h->next_idle;
         s->nidle--;
         h->wake = true;
-        pthread_cond_signal(&h->cv);
+        w[i] = h;
     }
-    /* busy helpers rebalance only if this group is below its share and could use more */
-    if (room > k && g->active - 1 + k < share(s, s->ngroups))
+    /* busy helpers rebalance only if this group is below its share and idle ones cannot fill its room (asked once,
+     * by the opener: the helpers it wakes do not ask again) */
+    if (opener && room > avail && g->active - 1 + avail < share(s, s->ngroups))
         atomic_fetch_add_explicit(&s->gen, 1, memory_order_relaxed);
+    return k;
+}
+
+/* h->wake was set under the lock and the helper waits for it in a loop, so a signal after the unlock is not lost;
+ * helpers live as long as the scheduler */
+static void signal_all(helper **w, int n)
+{
+    for (int i = 0; i < n; i++)
+        pthread_cond_signal(&w[i]->cv);
+}
+
+/* a job's participants under the current load: its share of the helpers among the requests in flight */
+static int fair_want(sched *s, int want)
+{
+    int live = atomic_load_explicit(&s->live, memory_order_relaxed);
+    if (live > 1)
+        want = MIN(want, 1 + s->nh / live);
+    return want;
 }
 
 /* ------------------------------------------------------------ jobs */
@@ -267,18 +311,22 @@ void sched_open(sched *s, sjob *j, int want, void (*fn)(void *arg, int i), void 
     j->g = cur_group;
     cur_job = j;
     cur_helper = false;
+    if (s && s->nh)
+        j->want = want = fair_want(s, want);
     if (!s || s->nh == 0 || want <= 1 || j->g->cap <= 1)
         return; /* nothing to share: the caller works alone */
     pthread_cond_init(&j->done, NULL);
     j->shared = true;
+    helper *w[WAKE_FANOUT];
     pthread_mutex_lock(&s->m);
     sgroup *g = j->g;
     group_link(s, g);
     j->next = g->jobs;
     g->jobs = j;
     j->open = true;
-    wake(s, g, j);
+    int nw = wake(s, g, j, w, true);
     pthread_mutex_unlock(&s->m);
+    signal_all(w, nw);
 }
 
 void sched_reopen(sjob *j)
@@ -286,11 +334,13 @@ void sched_reopen(sjob *j)
     if (!j->shared)
         return;
     sched *s = j->s;
+    helper *w[WAKE_FANOUT];
     pthread_mutex_lock(&s->m);
     j->opens++;
     j->open = true;
-    wake(s, j->g, j);
+    int nw = wake(s, j->g, j, w, true);
     pthread_mutex_unlock(&s->m);
+    signal_all(w, nw);
 }
 
 void sched_close(sjob *j)
@@ -320,6 +370,8 @@ void sched_close(sjob *j)
 
 int sched_run(sched *s, int n, void (*fn)(void *arg, int i), void *arg)
 {
+    if (s && s->nh && n > 1)
+        n = fair_want(s, n);
     if (!s || n <= 1 || s->nh == 0) {
         fn(arg, 0);
         return 1;
@@ -374,6 +426,7 @@ sched *sched_new(int query_threads, int request_threads)
         return NULL;
     pthread_mutex_init(&s->m, NULL);
     atomic_init(&s->gen, 0);
+    atomic_init(&s->live, 0);
     if (query_threads < 1)
         query_threads = 1;
     s->request_threads = request_threads > 0 ? MIN(request_threads, query_threads) : query_threads;

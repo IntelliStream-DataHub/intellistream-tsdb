@@ -766,6 +766,7 @@ typedef struct sgroup {
     int active; /* threads working for it now: the one that began it and its helpers */
     uint64_t seq;
     bool linked;
+    bool counted; /* an outermost group: counted in the scheduler's live requests */
     atomic_int cancel;
 } sgroup;
 struct sjob {
