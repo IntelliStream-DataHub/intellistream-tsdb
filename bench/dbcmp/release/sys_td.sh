@@ -154,15 +154,30 @@ p2_td() {
     bcheck td "$D" && bsuite td "$v" "$D" $Q "$TD_HDR"
     REL q td twa > "$D/q.twa.http"
     untimed "$D/check-twa.txt" REL check td twa ref/twa.jsonl && qline twa "$D" "$D/q.twa.http" $Q "$TD_HDR"
-    twasuite td "$D" $Q "$TD_HDR"
-    # per core: restarted with one vnode query thread (taosd reads TAOS_<PARAMETER> from the environment; config.pc.txt
-    # shows what taosd took) and pinned to PERCORE_CPU
-    crm rb-td
-    if td_start "$W" -e TAOS_NUM_OF_VNODE_QUERY_THREADS=1 && pc_pin rb-td; then
-        td_sql "" "SHOW DNODE 1 VARIABLES LIKE 'numOfVnodeQueryThreads'" > "$D/config.pc.txt"
-        jq -e '.data[] | select(.[1] == "numOfVnodeQueryThreads") | .[2] == "1"' "$D/config.pc.txt" > /dev/null ||
-            fail "p2 $v per core: numOfVnodeQueryThreads is not 1 (see $D/config.pc.txt)"
+    ctr_alive rb-td "p2 $v after the query suites" && twasuite td "$D" $Q "$TD_HDR"
+    ctr_mem rb-td "$D/mem.txt"
+    # per core: one vnode query thread, pinned to PERCORE_CPU. Since 3.4.0 taosd reads taos.cfg and TAOS_* only at its
+    # first start and keeps its local configuration in dnode/config/local.json (taosd.md "Additional Notes" 3; the 3.4.1
+    # notes: forceReadConfig removed), so: ALTER DNODE (persisted, takes effect after a restart), restart, and check the
+    # value and taosd's vnode-query threads. SHOW right after the start can still answer the mnode's copy of the old value.
+    local pc=0 i n
+    if ctr_alive rb-td "p2 $v before per core" &&
+        td_sql "" "ALTER DNODE 1 'numOfVnodeQueryThreads' '1'" > "$D/config.pc.txt" && { crm rb-td; td_start "$W"; }; then
+        for i in $(seq 60); do
+            td_sql "" "SHOW DNODE 1 VARIABLES LIKE 'numOfVnodeQueryThreads'" > "$D/config.pc.show.txt"
+            jq -e '.data[] | select(.[1] == "numOfVnodeQueryThreads") | .[2] == "1"' "$D/config.pc.show.txt" > /dev/null &&
+                break
+            sleep 0.5
+        done
+        n=$(podman exec rb-td sh -c 'for t in /proc/$(pidof taosd)/task/*; do cat "$t/comm"; done' | grep -c '^vnode-query')
+        { cat "$D/config.pc.show.txt"; echo; echo "taosd vnode-query threads: $n"; } >> "$D/config.pc.txt"
+        if [ "$n" = 1 ] && jq -e '.data[] | select(.[1] == "numOfVnodeQueryThreads") | .[2] == "1"' \
+            "$D/config.pc.show.txt" > /dev/null; then pc=1
+        else fail "p2 $v per core: numOfVnodeQueryThreads is not 1 (see $D/config.pc.txt)"; fi
+    fi
+    if [ "$pc" = 1 ] && pc_pin rb-td; then
         [ -s "$D/check-batch-td.txt" ] && ! grep -qE 'mismatches [1-9]' "$D/check-batch-td.txt" && PC=1 bsuite td "$v" "$D" $Q "$TD_HDR"
+        ctr_alive rb-td "p2 $v per core" && ctr_mem rb-td "$D/mem.txt"
     fi
     cd "$OUT" || true
     crm rb-td

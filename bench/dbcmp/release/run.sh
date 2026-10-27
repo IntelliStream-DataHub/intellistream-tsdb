@@ -361,6 +361,21 @@ PERCORE_CPU=${PERCORE_CPU:-2} PERCORE_CLIENT_CPU=${PERCORE_CLIENT_CPU:-3}
 pc_client() { # CMD...: on PERCORE_CLIENT_CPU in a per-core run (shell functions too: those used are exported)
     if [ "${PC:-0}" = 1 ]; then taskset -c "$PERCORE_CLIENT_CPU" bash -c '"$@"' pc_client "$@"; else "$@"; fi
 }
+ctr_mem() { # CONTAINER FILE: the container's cgroup memory (peak, limit, OOM kills so far) appended to FILE, while it runs
+    local p
+    p=/sys/fs/cgroup$(podman inspect -f '{{.State.CgroupPath}}' "$1" 2> /dev/null)
+    [ -r "$p/memory.peak" ] || { echo "$1: no cgroup memory files (not running?)" >> "$2"; return 1; }
+    echo "$1 peak $(cat "$p/memory.peak") limit $(cat "$p/memory.max") $(grep '^oom_kill ' "$p/memory.events")" >> "$2"
+}
+ctr_alive() { # CONTAINER WHAT: fails (into FAILS) when the container no longer runs, with the kernel's OOM kills in it
+    local st id n=0
+    st=$(podman inspect -f '{{.State.Status}} exit {{.State.ExitCode}}' "$1" 2> /dev/null)
+    case $st in running*) return 0 ;; esac
+    id=$(podman inspect -f '{{.Id}}' "$1" 2> /dev/null)
+    [ -n "$id" ] && n=$(journalctl -k --since "-6h" 2> /dev/null | grep -cE "oom-kill:.*libpod-$id\.scope")
+    fail "$2: $1 stopped by itself (${st:-gone}; kernel OOM kills in its cgroup: $n); the steps after it skipped"
+    return 1
+}
 # Rootless Podman here has no cpuset controller (the user slice delegates cpu, memory and pids only), so
 # --cpuset-cpus and podman update --cpuset-cpus fail; the container's processes are ours, so taskset pins every
 # thread of every process in its tree (threads and processes made later inherit the mask).
