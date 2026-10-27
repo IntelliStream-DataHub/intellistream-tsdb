@@ -4,7 +4,8 @@
 #   BIN        this directory's tools and bench/dbcmp's (qdrive, loadlp, relq, relemb, chq; make -C bench/dbcmp)
 #   DBCMP      data directories and converted inputs (/var/tmp/dbcmp; never /tmp, a RAM tmpfs here)
 #   OUT        results ($DBCMP/results)
-#   BENCH_LOCK the lock every timed step takes exclusively (flock -x); builds and smoke runs take it shared
+#   BENCH_LOCK the lock every timed step takes exclusively (flock -x) and every other step shared (flock -s), per
+#              step; builds take it shared; a smoke run (SMOKE=1) takes it shared for each step, never for the run
 RDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 H=$(cd "$RDIR/.." && pwd)                     # bench/dbcmp: ch_load.sh, mkq.py, check.py, i2_settle.sh, ...
 ROOT=$(cd "$H/../.." && pwd)
@@ -12,6 +13,11 @@ TSDB_TREE=${TSDB_TREE:-$ROOT}
 T=$TSDB_TREE/build
 BIN=${BIN:-$ROOT/build/dbcmp}
 B=$BIN
+# every curl of the driver and its helpers stops after CURL_HOME/.curlrc's max-time (1800 s): a server that never
+# answers fails a step instead of holding the run (and BENCH.lock); qdrive has QDRIVE_TIMEOUT (600 s) per query, and
+# run.sh a wall-clock limit per step (STEP_TIMEOUT, UNTIMED_TIMEOUT, CHECK_TIMEOUT) for every other client
+export CURL_HOME=${CURL_HOME:-$RDIR/curlhome}
+export QDRIVE_TIMEOUT=${QDRIVE_TIMEOUT:-600}
 TB=${TB:-$TSDB_TREE/build/dbcmp}             # tsdbq, tsdbstat, embq of the tsdb under test
 export DBCMP=${DBCMP:-/var/tmp/dbcmp}
 export WORK=${WORK:-$DBCMP/work} DATA=${DATA:-$DBCMP/input/mixed.rowbinary} BIN CLICKHOUSE=${CLICKHOUSE:-$DBCMP/clickhouse-bin}

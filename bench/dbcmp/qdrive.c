@@ -11,6 +11,11 @@
  * failed query stops the run rather than being counted. Prints queries, q/s, and the median and
  * p99 latency over all queries.
  *
+ * A query that runs longer than QDRIVE_TIMEOUT seconds (default 600; 0: no limit) fails the run with exit status
+ * 124 and names the query: a server that never answers (TDengine with one vnode-query thread deadlocked on a batch
+ * query for 90 minutes) must not hold the run and the shared benchmark lock forever. A watchdog in the main thread
+ * checks, so the limit covers HTTP and libpq alike without touching their I/O.
+ *
  * SQL goes through PQexec, the simple query protocol with literals, as an application would send
  * it; prepared statements could plan differently (TimescaleDB chunk exclusion, for one). The libpq
  * functions are declared here so only the shared library is needed, not its headers.
@@ -45,6 +50,7 @@ static int port, threads;
 static double seconds;
 static long maxq = -1;  /* queries per thread; 0: every query of the file once, taken from a shared queue */
 static size_t next_q;
+static double qtimeout = 600;
 static char **qs;
 static size_t nq;
 
@@ -57,6 +63,9 @@ static double now(void)
 
 typedef struct job {
     int id;
+    double busy_since; /* start of the query in flight, 0 between queries; read by the watchdog */
+    const char *cur;
+    int done;
     double *lat;
     size_t n, cap;
     double secs;
@@ -86,6 +95,8 @@ static void *run(void *arg)
             break;
         const char *q = qs[i % nq];
         double a = now(), untimed = 0;
+        __atomic_store_n(&j->cur, q, __ATOMIC_RELAXED);
+        __atomic_store(&j->busy_since, &a, __ATOMIC_RELEASE);
         if (mode_pg) {
             PGresult *r = PQexec(pg, q);
             int st = PQresultStatus(r);
@@ -138,12 +149,15 @@ static void *run(void *arg)
                 }
                 j->bytes += rb;
             }
+        double idle = 0;
+        __atomic_store(&j->busy_since, &idle, __ATOMIC_RELEASE);
         double dt = now() - a - untimed;
         if (j->n == j->cap) j->lat = realloc(j->lat, (j->cap = j->cap ? j->cap * 2 : 4096) * sizeof(double));
         j->lat[j->n++] = dt;
     }
     j->secs = now() - t0;
     if (pg) PQfinish(pg);
+    __atomic_store_n(&j->done, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -176,6 +190,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: see source\n");
         return 2;
     }
+    const char *to = getenv("QDRIVE_TIMEOUT");
+    if (to && *to) qtimeout = atof(to);
     FILE *f = fopen(argv[k], "r");
     threads = atoi(argv[k + 1]);
     seconds = atof(argv[k + 2]);
@@ -194,6 +210,25 @@ int main(int argc, char **argv)
     for (int i = 0; i < threads; i++) {
         jobs[i].id = i;
         pthread_create(&th[i], NULL, run, &jobs[i]);
+    }
+    for (;;) { /* watchdog: fail the run on a query that never ends */
+        int alive = 0;
+        double t = now();
+        for (int i = 0; i < threads; i++) {
+            if (__atomic_load_n(&jobs[i].done, __ATOMIC_ACQUIRE)) continue;
+            alive++;
+            double b;
+            __atomic_load(&jobs[i].busy_since, &b, __ATOMIC_ACQUIRE);
+            if (qtimeout > 0 && b > 0 && t - b > qtimeout) {
+                const char *q = __atomic_load_n(&jobs[i].cur, __ATOMIC_RELAXED);
+                fprintf(stderr, "query timed out after %.0f s (QDRIVE_TIMEOUT): %.300s\n", t - b, q ? q : "");
+                fflush(NULL);
+                _exit(124);
+            }
+        }
+        if (!alive) break;
+        struct timespec ts = {0, 200 * 1000 * 1000};
+        nanosleep(&ts, NULL);
     }
     size_t total = 0;
     double secs = 0;

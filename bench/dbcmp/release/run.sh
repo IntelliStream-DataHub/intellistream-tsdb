@@ -3,7 +3,7 @@
 # one command per phase (run.sh with no arguments lists them), e.g.
 #   BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p2
 # Every phase logs "PHASE n DONE" or "PHASE n FAILED: why" in results/driver.log; a failed phase does not stop the
-# later ones. Every timing step runs under flock -x BENCH.lock, after the governor check (performance) and the idle
+# later ones. Every timing step runs under flock -x BENCH.lock (other steps under flock -s, step by step), after the governor check (performance) and the idle
 # check (busy CPUs < 1.5 over 2 s, from /proc/stat); steps.log has one line per step (label, rc, seconds, busy).
 # Raw output of every run is kept under results/p<n>/; <name>.<run> files are summarized by runstats.py into
 # <name>.mean.txt (mean, sd %, min-max per number).
@@ -25,7 +25,7 @@ mkdir -p "$OUT"
 
 # ------------------------------------------------------------------ logging, quiet gate, timed steps
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/driver.log"; }
-fail() { echo "$(date '+%T') $*" >> "$PH_DIR/FAILS"; log "  FAIL: $*"; }
+fail() { mkdir -p "$PH_DIR"; echo "$(date '+%T') $*" >> "$PH_DIR/FAILS"; log "  FAIL: $*"; }
 gov_ok() { local g; for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ "$(cat "$g")" = performance ] || return 1; done; }
 cpu_busy() { # busy CPUs over 2 s, from two reads of /proc/stat
     local c u n s i w q sq st r
@@ -56,20 +56,63 @@ quiet() { # LABEL: wait for the performance governor and < 1.5 busy CPUs; after 
         fi
     done
 }
+# Every step has a wall-clock limit (a server that never answers once held a smoke run, and the shared benchmark lock,
+# for 90 minutes): STEP_TIMEOUT for timed steps, UNTIMED_TIMEOUT for the others (settles wait up to their own limits,
+# Prometheus' 10 h among them), CHECK_TIMEOUT for answer checks. A step over its limit is killed with its whole process
+# tree (shell functions too, so not timeout(1)), and fails with rc 124 and "STEP TIMEOUT" in its output.
+STEP_TIMEOUT=${STEP_TIMEOUT:-3600} UNTIMED_TIMEOUT=${UNTIMED_TIMEOUT:-43200} CHECK_TIMEOUT=${CHECK_TIMEOUT:-3600}
+ptree() { # PID: PID's descendants, deepest first, then PID
+    local k
+    for k in $(cat /proc/"$1"/task/*/children 2> /dev/null); do ptree "$k"; done
+    echo "$1"
+}
+killtree() { # PID [now]: TERM, 3 s, then KILL ("now": KILL only) to a process tree this script started (never 0, 1, -1)
+    local p sig ps sigs="TERM KILL"
+    [ "${2:-}" = now ] && sigs=KILL
+    ps=$(ptree "$1")   # once: a child whose parent died is reparented and out of reach of a second walk
+    for sig in $sigs; do
+        for p in $ps; do [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -gt 1 ] && kill -"$sig" "$p" 2> /dev/null; done
+        [ "$sig" = TERM ] && sleep 3
+    done
+}
+limited() { # SECONDS OUTFILE CMD...: CMD (shell functions too) with stdout+stderr to OUTFILE; rc 124 past SECONDS
+    local lim=$1 out=$2 pid wpid flag rc
+    shift 2
+    flag=$(mktemp "$OUT/.timeout.XXXXXX") && rm -f "$flag"
+    IN_STEP=1 "$@" > "$out" 2>&1 8>&- 9>&- &
+    pid=$!
+    ( sleep "$lim"; : > "$flag"; killtree "$pid" ) > /dev/null 2>&1 8>&- 9>&- &
+    wpid=$!
+    wait "$pid"
+    rc=$?
+    if [ -e "$flag" ]; then
+        wait "$wpid" 2> /dev/null   # the watcher finishes its TERM, then KILL
+        rm -f "$flag"; echo "STEP TIMEOUT: killed after $lim s" >> "$out"; return 124
+    fi
+    killtree "$wpid" now 2> /dev/null; wait "$wpid" 2> /dev/null   # the watcher: a subshell and its sleep
+    return "$rc"
+}
+# Steps take BENCH.lock: timed ones exclusively (after the quiet gate), the others shared, so no other track times
+# while this one loads, settles or checks. A smoke run (SMOKE=1) times nothing that is reported and takes it shared for
+# every step, never for the whole run. A step inside a step (IN_STEP) takes no lock: it would wait for its own.
+steplock() { # MODE(-s|-x): BENCH.lock on fd 9 unless inside a step
+    [ "${IN_STEP:-0}" = 1 ] && return 0
+    exec 9>>"$LOCK"
+    flock "$1" 9
+}
+stepunlock() { [ "${IN_STEP:-0}" = 1 ] && return 0; flock -u 9; exec 9>&-; }
 tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout+stderr to OUTFILE (fd 9 closed)
     local label=$1 out=$2 s e rc
     shift 3
-    exec 9>>"$LOCK"
-    flock -x 9
+    if [ "${SMOKE:-0}" = 1 ]; then steplock -s; else steplock -x; fi
     quiet "$label"
     s=$(date +%s.%N)
-    "$@" > "$out" 2>&1 9>&-
+    limited "$STEP_TIMEOUT" "$out" "$@"
     rc=$?
     e=$(date +%s.%N)
-    flock -u 9
-    exec 9>&-
+    stepunlock
     printf '%s\t%s\trc=%d\t%.1fs\tbusy=%s\n' "$(date '+%F %T')" "$label" "$rc" "$(echo "$e - $s" | bc)" "$BUSY" >> "$OUT/steps.log"
-    if [ "$rc" != 0 ] && [ -n "${QREFUSE-}" ] && grep -qE -- "$QREFUSE" "$out"; then
+    if [ "$rc" != 0 ] && [ "$rc" != 124 ] && [ -n "${QREFUSE-}" ] && grep -qE -- "$QREFUSE" "$out"; then
         # the server refused the query by its own limits (QREFUSE, set per system, e.g. IoTDB's code 719 "not enough
         # memory"): a result to report as "refused", not a harness failure; renamed so runstats averages no error text
         mv "$out" "$out.refused"
@@ -77,7 +120,7 @@ tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout
         log "  REFUSED: $label (see $out.refused)"
         return "$rc"
     fi
-    [ "$rc" = 0 ] || fail "$label: rc $rc (see $out)"
+    [ "$rc" = 0 ] || fail "$label: rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${STEP_TIMEOUT}s)") (see $out)"
     return "$rc"
 }
 reps() { # NAME DIR -- CMD...: REPS timed runs into DIR/NAME.<run>
@@ -86,9 +129,14 @@ reps() { # NAME DIR -- CMD...: REPS timed runs into DIR/NAME.<run>
     for r in $(seq "$REPS"); do tstep "$name r$r" "$dir/$name.$r" -- "$@"; done
 }
 untimed() { # OUTFILE CMD...: a step that is not a timing (checks, dumps, sizes); no lock
-    local out=$1
+    local out=$1 lim=$UNTIMED_TIMEOUT rc
     shift
-    "$@" > "$out" 2>&1 9>&- || { fail "$(basename "$out"): rc $? (see $out)"; return 1; }
+    case $(basename "$out") in check*) lim=$CHECK_TIMEOUT ;; esac
+    steplock -s
+    limited "$lim" "$out" "$@"
+    rc=$?
+    stepunlock
+    [ "$rc" = 0 ] || { fail "$(basename "$out"): rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${lim}s)") (see $out)"; return 1; }
     case $(basename "$out") in check*) grep -qE 'mismatches [1-9]|MISMATCH|Traceback' "$out" && { fail "answer check: $(grep -m1 -E 'mismatches [1-9]|MISMATCH|Traceback' "$out" | cut -c1-150) ($out)"; return 1; } ;; esac
     return 0
 }
@@ -691,10 +739,10 @@ phase1() {
     for s in $P1_SYSTEMS; do
         done_mark "$OUT/p1/$s.done" && { log "p1 $s already done"; continue; }
         log "p1 $s start"
-        local nf=$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)
+        local nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
         "p1_$s" || fail "p1 $s returned an error"
         cleanup_all
-        [ "$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)" = "$nf" ] && date > "$OUT/p1/$s.done"
+        [ "$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)" = "$nf" ] && date > "$OUT/p1/$s.done"
         log "p1 $s end"
     done
     python3 -I "$TOOLS/sizes_summary.py" "$OUT/p1" > "$OUT/p1/sizes.md" 2>&1 || fail "sizes_summary"
@@ -985,10 +1033,10 @@ phase2() {
         reset_quiet
         done_mark "$OUT/p2/$s.done" && { log "p2 $s already done"; continue; }
         log "p2 $s start"
-        local nf=$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)
+        local nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
         case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; qdb2) p2_qdb 2 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
         cleanup_all
-        [ "$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)" = "$nf" ] && date > "$OUT/p2/$s.done"
+        [ "$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)" = "$nf" ] && date > "$OUT/p2/$s.done"
         log "p2 $s end"
     done
 }
@@ -1272,7 +1320,7 @@ runphase() { # N: one phase in a subshell, FAILS per phase, done marker when it 
     if [ "$rc" = 0 ] && [ ! -s "$PH_DIR/FAILS" ]; then
         log "PHASE $n DONE"; date > "$OUT/p$n.done"
     else
-        log "PHASE $n FAILED: rc=$rc; $(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0) failures, first: $(head -3 "$PH_DIR/FAILS" 2> /dev/null | cut -c1-200 | tr '\n' ';')"
+        log "PHASE $n FAILED: rc=$rc; $(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l) failures, first: $(head -3 "$PH_DIR/FAILS" 2> /dev/null | cut -c1-200 | tr '\n' ';')"
         return 1
     fi
 }
@@ -1280,7 +1328,7 @@ runphase() { # N: one phase in a subshell, FAILS per phase, done marker when it 
 # in this worktree) during a run of several hours otherwise runs half old and half new lines (seen: a syntax error).
 main() {
 [ $# -gt 0 ] || { usage; exit 2; }
-trap 'log "driver interrupted"; cleanup_all; exit 130' INT TERM
+trap 'log "driver interrupted"; for j in $(jobs -p); do killtree "$j"; done; cleanup_all; exit 130' INT TERM
 machine
 log "run.sh $* start: REPS=$REPS, SECS=$SECS, results in $OUT"
 RC=0
