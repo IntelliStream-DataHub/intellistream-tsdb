@@ -903,6 +903,9 @@ p2_i2() {
     done
     ports_check "$D/ports.txt"
     podman exec rb-i2 influxd version > "$D/version.txt" 2>&1
+    # InfluxDB 2 answers a failed InfluxQL statement with status 200 and "error": in its results, and a Flux error
+    # raised after the reply started as a CSV table headed ,error,reference: qdrive fails on either (untimed search)
+    local QDRIVE_ERR_SUB='"error":|,error,reference'; export QDRIVE_ERR_SUB
     cd "$WORK" || return 1
     python3 -I "$H/mkq.py" i2ql && python3 -I "$H/mkq.py" i2flux
     untimed "$D/check-i2ql.txt" python3 -I "$H/check.py" i2ql 200

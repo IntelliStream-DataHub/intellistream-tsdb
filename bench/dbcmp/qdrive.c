@@ -36,6 +36,11 @@ static int mode_pg;
 static const char *host, *headers, *conninfo;
 static const char *err_prefix; /* QDRIVE_ERR: a reply body starting with it is a failed query */
 static size_t err_len;
+/* QDRIVE_ERR_SUB: substrings, separated by '|', whose presence anywhere in a reply marks a failed query (InfluxDB 2
+ * answers a failed InfluxQL statement with status 200 and "error": in its results, and a Flux error raised mid-stream
+ * as a CSV table headed ,error,reference). The search is not timed. */
+static char *err_sub[8];
+static int n_err_sub;
 static int port, threads;
 static double seconds;
 static long maxq = -1;  /* queries per thread; 0: every query of the file once, taken from a shared queue */
@@ -80,7 +85,7 @@ static void *run(void *arg)
         } else if ((maxq > 0 && (long)j->n >= maxq) || now() - t0 >= seconds)
             break;
         const char *q = qs[i % nq];
-        double a = now();
+        double a = now(), untimed = 0;
         if (mode_pg) {
             PGresult *r = PQexec(pg, q);
             int st = PQresultStatus(r);
@@ -119,14 +124,21 @@ static void *run(void *arg)
                 int st = h_request(&c, method, path, hdrs, body, strlen(body), &resp, &rb);
                 /* IoTDB's REST service answers a failed query (out of query memory, say) with status 200 and a body
                  * {"code":...}: QDRIVE_ERR names such a prefix, so a failure is never timed as a fast answer */
-                if (st != 200 || (err_prefix && resp.n >= err_len && !memcmp(resp.p, err_prefix, err_len))) {
+                int bad = st != 200 || (err_prefix && resp.n >= err_len && !memcmp(resp.p, err_prefix, err_len));
+                if (!bad && n_err_sub) {
+                    double s0 = now();
+                    for (int e = 0; e < n_err_sub && !bad; e++)
+                        bad = resp.n && memmem(resp.p, resp.n, err_sub[e], strlen(err_sub[e])) != NULL;
+                    untimed += now() - s0;
+                }
+                if (bad) {
                     fprintf(stderr, "query failed: status %d: %.*s\n%.300s\n", st, (int)(resp.n < 500 ? resp.n : 500),
                             resp.p ? resp.p : "", one);
                     exit(1);
                 }
                 j->bytes += rb;
             }
-        double dt = now() - a;
+        double dt = now() - a - untimed;
         if (j->n == j->cap) j->lat = realloc(j->lat, (j->cap = j->cap ? j->cap * 2 : 4096) * sizeof(double));
         j->lat[j->n++] = dt;
     }
@@ -147,6 +159,10 @@ int main(int argc, char **argv)
     err_prefix = getenv("QDRIVE_ERR");
     if (err_prefix && !*err_prefix) err_prefix = NULL;
     err_len = err_prefix ? strlen(err_prefix) : 0;
+    const char *es = getenv("QDRIVE_ERR_SUB");
+    if (es && *es)
+        for (char *d = strdup(es), *t; n_err_sub < 8 && (t = strsep(&d, "|"));)
+            if (*t) err_sub[n_err_sub++] = t;
     if (argc >= 8 && !strcmp(argv[1], "http")) {
         host = argv[2];
         port = atoi(argv[3]);
