@@ -1,0 +1,1014 @@
+#!/bin/bash
+# Release benchmark driver for tsdb 0.9.0 (main f26b5ed, tree /var/tmp/rb-src): the full comparison of
+# bench/dbcmp/README.md plus the release additions, unattended, in phases. Start with
+#   bgrun.sh relbench bash run.sh            (PHASES="1 2" REPS=5 SECS=15 override)
+# Every phase logs "PHASE n DONE" or "PHASE n FAILED: why" in results/driver.log; a failed phase does not stop the
+# later ones. Every timing step runs under flock -x BENCH.lock, after the governor check (performance) and the idle
+# check (busy CPUs < 1.5 over 2 s, from /proc/stat); steps.log has one line per step (label, rc, seconds, busy).
+# Raw output of every run is kept under results/p<n>/; <name>.<run> files are summarized by runstats.py into
+# <name>.mean.txt (mean, sd %, min-max per number).
+set -u
+ST=/home/olav/.local/state/subagent-economy/agents/tsdb/release-bench
+TOOLS=$ST/tools
+SRC=/var/tmp/rb-src
+T=$SRC/build B=$SRC/build/dbcmp H=$SRC/bench/dbcmp
+export DBCMP=${DBCMP:-/var/tmp/dbcmp}
+export WORK=$DBCMP/work DATA=$DBCMP/input/mixed.rowbinary BIN=$B CLICKHOUSE=$DBCMP/clickhouse-bin
+export PGPASSWORD=bench
+IN=${IN:-$DBCMP/sizes/in}
+OUT=${OUT:-$ST/results}
+LOCK=/home/olav/.local/state/subagent-economy/BENCH.lock
+REPS=${REPS:-5}
+SECS=${SECS:-15}
+PHASES=${PHASES:-"1 2 3 4 5"}
+QUIET_MAX=${QUIET_MAX:-600}
+CH_IMG=docker.io/clickhouse/clickhouse-server:26.8.2.7
+TS_IMG=docker.io/timescale/timescaledb:2.31.0-pg17
+TSHA_IMG=docker.io/timescale/timescaledb-ha:pg17.11-ts2.31.0
+QDB_IMG=docker.io/questdb/questdb:10.1.0
+I2_IMG=docker.io/library/influxdb:2.7.12
+I3_IMG=docker.io/library/influxdb:3.12.1-core
+PROM_IMG=docker.io/prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+DS_KINDS="hdd_temp cpu_temp tank_bar tank_psi vibration flow_rate flow_total random"
+DS_HYD="hyd_PS1 hyd_PS2 hyd_PS3 hyd_PS4 hyd_PS5 hyd_PS6 hyd_EPS1 hyd_FS1 hyd_FS2 hyd_TS1 hyd_TS2 hyd_TS3 hyd_TS4 hyd_VS1 hyd_CE hyd_CP hyd_SE hyd_PS1_psi hyd_PS2_psi hyd_PS3_psi hyd_PS4_psi hyd_PS5_psi hyd_PS6_psi"
+DSLIST=${DSLIST:-"$DS_KINDS $DS_HYD"}
+P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb ts i2 i3 prom"}
+P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 ts i2 i3"}
+I3_P2_FLAGS=${I3_P2_FLAGS:-}            # smoke runs only: e.g. --force-snapshot-max-age 2m
+I3_P2_MIN=${I3_P2_MIN:-600}
+I3_P1_AGE=${I3_P1_AGE:-5m} I3_P1_MIN=${I3_P1_MIN:-420}
+I2_EXTRA=${I2_EXTRA:-}                  # smoke runs only: e.g. -e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s
+PROM_SETTLE_TIMEOUT=${PROM_SETTLE_TIMEOUT:-36000}
+P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320}
+CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig"
+PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091)\b'
+mkdir -p "$OUT"
+
+# ------------------------------------------------------------------ logging, quiet gate, timed steps
+log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/driver.log"; }
+fail() { echo "$(date '+%T') $*" >> "$PH_DIR/FAILS"; log "  FAIL: $*"; }
+gov_ok() { local g; for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ "$(cat "$g")" = performance ] || return 1; done; }
+cpu_busy() { # busy CPUs over 2 s, from two reads of /proc/stat
+    local c u n s i w q sq st r
+    read -r c u n s i w q sq st r < /proc/stat
+    local t1=$((u + n + s + i + w + q + sq + st)) i1=$((i + w))
+    sleep 2
+    read -r c u n s i w q sq st r < /proc/stat
+    local t2=$((u + n + s + i + w + q + sq + st)) i2=$((i + w))
+    echo "scale=2; (($t2 - $t1) - ($i2 - $i1)) * $(nproc) / ($t2 - $t1)" | bc
+}
+QMAX=$QUIET_MAX
+reset_quiet() { QMAX=$QUIET_MAX; }
+quiet() { # LABEL: wait for the performance governor and < 1.5 busy CPUs; after QMAX s measure anyway (logged)
+    local t0 b
+    t0=$(date +%s)
+    until gov_ok; do
+        if [ $(($(date +%s) - t0)) -ge 600 ]; then log "WARN governor is not performance on every CPU before: $1"; break; fi
+        sleep 10
+    done
+    while :; do
+        b=$(cpu_busy)
+        if [ "$(echo "$b < 1.5" | bc)" = 1 ]; then BUSY=$b; return 0; fi
+        if [ $(($(date +%s) - t0)) -ge "$QMAX" ]; then
+            log "WARN not quiet before '$1': $b busy CPUs after ${QMAX} s; measuring anyway (top: $(ps -eo pcpu,comm --sort=-pcpu | sed -n 2,4p | tr -s ' ' | tr '\n' ';'))"
+            BUSY="$b(NOT-QUIET)"; QMAX=60  # this system keeps the machine busy: shorter waits for its later steps
+            return 0
+        fi
+    done
+}
+tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout+stderr to OUTFILE (fd 9 closed)
+    local label=$1 out=$2 s e rc
+    shift 3
+    exec 9>>"$LOCK"
+    flock -x 9
+    quiet "$label"
+    s=$(date +%s.%N)
+    "$@" > "$out" 2>&1 9>&-
+    rc=$?
+    e=$(date +%s.%N)
+    flock -u 9
+    exec 9>&-
+    printf '%s\t%s\trc=%d\t%.1fs\tbusy=%s\n' "$(date '+%F %T')" "$label" "$rc" "$(echo "$e - $s" | bc)" "$BUSY" >> "$OUT/steps.log"
+    [ "$rc" = 0 ] || fail "$label: rc $rc (see $out)"
+    return "$rc"
+}
+reps() { # NAME DIR -- CMD...: REPS timed runs into DIR/NAME.<run>
+    local name=$1 dir=$2 r
+    shift 3
+    for r in $(seq "$REPS"); do tstep "$name r$r" "$dir/$name.$r" -- "$@"; done
+}
+untimed() { # OUTFILE CMD...: a step that is not a timing (checks, dumps, sizes); no lock
+    local out=$1
+    shift
+    "$@" > "$out" 2>&1 9>&- || { fail "$(basename "$out"): rc $? (see $out)"; return 1; }
+    case $(basename "$out") in check*) grep -qE 'mismatches [1-9]|MISMATCH|Traceback' "$out" && { fail "answer check: $(grep -m1 -E 'mismatches [1-9]|MISMATCH|Traceback' "$out" | cut -c1-150) ($out)"; return 1; } ;; esac
+    return 0
+}
+runstats() { python3 -I "$TOOLS/runstats.py" "$1" >> "$OUT/driver.log" 2>&1; }
+
+# ------------------------------------------------------------------ processes and containers we own
+TPID=
+tsdbd_start() { # DIR [ARGS]: tsdbd on --port 0 --port-file; sets TPID and TSDB_PORT
+    local d=$1 p pid i
+    shift
+    rm -f "$d.pf"
+    "$T/tsdbd" --dir "$d" --listen 127.0.0.1 --port 0 --port-file "$d.pf" "$@" > "$d.log" 2>&1 9>&- &
+    TPID=$!
+    echo "$TPID tsdbd $d" >> "$OUT/pids"
+    for i in $(seq 600); do [ -s "$d.pf" ] && break; kill -0 "$TPID" 2>/dev/null || break; sleep 0.1; done
+    read -r p pid _ < "$d.pf" 2>/dev/null || { fail "tsdbd did not start on $d (log $d.log)"; TPID=; return 1; }
+    if [ "$pid" != "$TPID" ]; then fail "port file of $d names pid $pid, not our $TPID"; tsdbd_stop; return 1; fi
+    export TSDB_PORT=$p TSDB_HOST=127.0.0.1
+}
+tsdbd_stop() {
+    if [ -n "$TPID" ] && [ "$TPID" -gt 1 ] 2>/dev/null; then kill -INT "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null; fi
+    TPID=
+}
+crm() { # stop and remove containers by name; only the rb-* names this script creates
+    local c
+    for c in "$@"; do
+        case $c in rb-*) podman stop -t 60 "$c" > /dev/null 2>&1; podman rm -f "$c" > /dev/null 2>&1 ;; esac
+    done
+}
+cleanup_all() { tsdbd_stop; crm $CONTAINERS; }
+rmdata() { local d; for d in "$@"; do case $d in "$DBCMP"/s[0-9]*|/var/tmp/big|/var/tmp/ch-big) podman unshare rm -rf "$d" ;; esac; done; }
+ports_check() { # FILE: listeners on the benchmark ports; anything not on 127.0.0.1 is a failure
+    ss -ltnp 2> /dev/null | grep -E "$PORTS_RE" > "$1"
+    if grep -E "$PORTS_RE" "$1" | awk '{print $4}' | grep -vqE '^127\.0\.0\.1:'; then fail "a port is not bound to 127.0.0.1: $(tr '\n' ' ' < "$1")"; fi
+}
+warm() { cat "$@" > /dev/null; sync; }
+
+# ------------------------------------------------------------------ servers
+ch_start() { # DATADIR
+    local W=$1 i
+    mkdir -p "$W/data"
+    printf '<clickhouse>\n    <listen_host replace="replace">127.0.0.1</listen_host>\n</clickhouse>\n' > "$W/listen.xml"
+    podman run -d --name rb-ch --network host --ulimit nofile=262144:262144 -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+        -v "$W/data:/var/lib/clickhouse" -v "$W/listen.xml:/etc/clickhouse-server/config.d/zz-listen.xml" "$CH_IMG" > /dev/null 9>&- || { fail "clickhouse start"; return 1; }
+    for i in $(seq 120); do curl -sf http://127.0.0.1:8123/ping > /dev/null && break; sleep 0.5; done
+    curl -sf http://127.0.0.1:8123/ping > /dev/null || { fail "clickhouse not ready"; return 1; }
+    [ -x "$CLICKHOUSE" ] || podman cp rb-ch:/usr/bin/clickhouse "$CLICKHOUSE"
+}
+CHC() { "$CLICKHOUSE" client --host 127.0.0.1 "$@"; }
+qdb_start() { # DATADIR
+    local W=$1 i
+    mkdir -p "$W"
+    podman run -d --name rb-qdb --network host -v "$W:/var/lib/questdb" \
+        -e QDB_HTTP_NET_BIND_TO=127.0.0.1:9100 -e QDB_HTTP_MIN_NET_BIND_TO=127.0.0.1:9103 \
+        -e QDB_PG_NET_BIND_TO=127.0.0.1:8812 -e QDB_LINE_TCP_NET_BIND_TO=127.0.0.1:9109 \
+        -e QDB_LINE_UDP_ENABLED=false -e QDB_TELEMETRY_ENABLED=false "$QDB_IMG" > /dev/null 9>&- || { fail "questdb start"; return 1; }
+    for i in $(seq 120); do curl -sf 'http://127.0.0.1:9100/exec?query=select%201' > /dev/null && return 0; sleep 0.5; done
+    fail "questdb not ready"; return 1
+}
+QX() { curl -sG http://127.0.0.1:9100/exec --data-urlencode "query=$1"; echo; }
+qdb_wait_table() { # TABLE: until every WAL transaction is applied
+    local r w q s i
+    for i in $(seq 36000); do
+        r=$(curl -sG http://127.0.0.1:9100/exec --data-urlencode "query=select writerTxn, sequencerTxn, suspended from wal_tables() where name='$1'" | jq -c '.dataset[0]')
+        w=$(echo "$r" | jq '.[0]'); q=$(echo "$r" | jq '.[1]'); s=$(echo "$r" | jq '.[2]')
+        [ "$s" = true ] && { echo "SUSPENDED $1 $r"; return 1; }
+        [ "$w" = "$q" ] && [ "$w" != null ] && { echo "WAL applied for $1 ($r)"; return 0; }
+        sleep 0.1
+    done
+    return 1
+}
+ts_start() { # NAME IMAGE DATADIR MOUNTPOINT: TimescaleDB on 127.0.0.1:5434 with $IN or $DBCMP/input on /data
+    local name=$1 img=$2 W=$3 mnt=$4 i
+    mkdir -p "$W"
+    if [ "$name" = rb-tsha ]; then
+        podman unshare chown 1000:1000 "$W"
+        podman run -d --name "$name" --network host -v "$W:/home/postgres/pgdata" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
+            -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 > /dev/null 9>&- || { fail "$name start"; return 1; }
+    else
+        podman run -d --name "$name" --network host -v "$W:/var/lib/postgresql/data" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
+            -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 > /dev/null 9>&- || { fail "$name start"; return 1; }
+    fi
+    # the image runs initdb and its init scripts on a temporary server first: wait for the extension, then again
+    for i in $(seq 300); do
+        [ "$(psql -h 127.0.0.1 -p 5434 -U postgres -Atc "select count(*) from pg_extension where extname='timescaledb'" 2> /dev/null)" = 1 ] && break
+        sleep 1
+    done
+    sleep 5
+    for i in $(seq 120); do psql -h 127.0.0.1 -p 5434 -U postgres -Atc 'select 1' > /dev/null 2>&1 && return 0; sleep 1; done
+    fail "$name not ready"; return 1
+}
+PSQL() { psql -h 127.0.0.1 -p 5434 -U postgres "$@"; }
+i2_start() { # DATADIR
+    local W=$1 i
+    mkdir -p "$W/data" "$W/config"
+    podman run -d --name rb-i2 --network host --memory 24g --memory-swap 24g \
+        -v "$W/data:/var/lib/influxdb2" -v "$W/config:/etc/influxdb2" \
+        -e DOCKER_INFLUXDB_INIT_MODE=setup -e DOCKER_INFLUXDB_INIT_USERNAME=bench \
+        -e DOCKER_INFLUXDB_INIT_PASSWORD=benchbench -e DOCKER_INFLUXDB_INIT_ORG=bench \
+        -e DOCKER_INFLUXDB_INIT_BUCKET=cmp -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=benchtoken \
+        -e INFLUXD_HTTP_BIND_ADDRESS=127.0.0.1:8086 -e INFLUXD_REPORTING_DISABLED=true \
+        -e INFLUXD_STORAGE_COMPACT_FULL_WRITE_COLD_DURATION=1m $I2_EXTRA "$I2_IMG" > /dev/null 9>&- || { fail "influxdb2 start"; return 1; }
+    for i in $(seq 240); do
+        curl -sf -H 'Authorization: Token benchtoken' 'http://127.0.0.1:8086/api/v2/buckets?name=cmp' 2> /dev/null | grep -q '"name": *"cmp"' && break
+        sleep 0.5
+    done
+    sleep 3  # the setup step restarts the server
+    for i in $(seq 240); do
+        curl -sf -H 'Authorization: Token benchtoken' 'http://127.0.0.1:8086/api/v2/buckets?name=cmp' 2> /dev/null | grep -q '"name": *"cmp"' && return 0
+        sleep 0.5
+    done
+    fail "influxdb2 not ready"; return 1
+}
+I2() { podman exec rb-i2 influx "$@" --host http://127.0.0.1:8086 --token benchtoken --org bench; }
+i3_start() { # DATADIR [EXTRA FLAGS]
+    local W=$1 i
+    shift
+    mkdir -p "$W" && podman unshare chown -R 1500:1500 "$W"
+    podman run -d --name rb-i3 --network host --memory 28g --memory-swap 28g -v "$W:/var/lib/influxdb3" "$I3_IMG" \
+        influxdb3 serve --node-id node0 --object-store file --data-dir /var/lib/influxdb3/data \
+        --http-bind 127.0.0.1:8181 --without-auth --query-file-limit 1000000 \
+        --exec-mem-pool-size 8GB --file-cache-size 4GB --force-snapshot-mem-size 10GB --disable-telemetry-upload "$@" > /dev/null 9>&- || { fail "influxdb3 start"; return 1; }
+    for i in $(seq 240); do curl -sf http://127.0.0.1:8181/health > /dev/null && return 0; sleep 0.5; done
+    fail "influxdb3 not ready"; return 1
+}
+i3_parquet() { # DATADIR: "count bytes" of the Parquet files
+    echo "$(podman unshare find "$1" -name '*.parquet' | wc -l) $(podman unshare find "$1" -name '*.parquet' -printf '%s\n' | awk '{s += $1} END {print s + 0}')"
+}
+i3_wait_snapshot() { # DATADIR MIN_S STABLE_S MAX_S: Parquet present and unchanged for STABLE_S, at least MIN_S after now
+    local W=$1 min=$2 stable=$3 max=$4 t0 last cur changed
+    t0=$(date +%s); last=""; changed=$t0
+    while :; do
+        cur=$(i3_parquet "$W")
+        echo "$(date -u +%T) +$(($(date +%s) - t0))s parquet(count bytes)=$cur mem=$(podman stats --no-stream --format '{{.MemUsage}}' rb-i3 2> /dev/null | cut -d/ -f1)"
+        [ "$cur" != "$last" ] && { last=$cur; changed=$(date +%s); }
+        if [ "${cur%% *}" -gt 0 ] && [ $(($(date +%s) - t0)) -ge "$min" ] && [ $(($(date +%s) - changed)) -ge "$stable" ]; then
+            echo "snapshot settled: last change $((changed - t0)) s after the load ended ($cur)"; return 0
+        fi
+        [ $(($(date +%s) - t0)) -ge "$max" ] && { echo "NOT settled after $max s ($cur)"; return 1; }
+        sleep 20
+    done
+}
+prom_run() { # NAME PORT DATADIR
+    podman run -d --name "$1" --network host -v "$3:/prometheus" -v "$DBCMP/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+        "$PROM_IMG" --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --web.listen-address=127.0.0.1:$2 \
+        --web.enable-remote-write-receiver --web.enable-admin-api --query.max-concurrency=32 > /dev/null 9>&-
+}
+prom_ready() { local i; for i in $(seq 36000); do curl -sf "127.0.0.1:$1/-/ready" > /dev/null && return 0; sleep 0.1; done; return 1; }
+
+# ------------------------------------------------------------------ query suites (qdrive / tsdbq / clickhouse-benchmark)
+FULLS_DEFAULT="0 3600 60"
+CLASSES_DEFAULT="raw agg1d agg7d point"
+qsuite() { # SYS PREFIX DIR DRIVER-ARGS...: whole range (warm-up, REPS runs of one query) and classes (3 s warm-up,
+           # REPS x SECS at 1 and 32 clients); FULLS / CLASSES select ("" skips)
+    local S=$1 P=$2 D=$3 n c t
+    shift 3
+    for n in ${FULLS-$FULLS_DEFAULT}; do
+        "$B/qdrive" "$@" "$WORK/q/$S.full$n.txt" 1 100000 1 > "$D/warm.$P.full$n" 2>&1 9>&- || { fail "$P full$n warm-up failed (see $D/warm.$P.full$n)"; continue; }
+        reps "$P.full$n" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.full$n.txt" 1 100000 1
+    done
+    for c in ${CLASSES-$CLASSES_DEFAULT}; do
+        "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" 1 3 > "$D/warm.$P.$c" 2>&1 9>&- || { fail "$P $c warm-up failed (see $D/warm.$P.$c)"; continue; }
+        for t in 1 32; do reps "$P.$c.c$t" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" "$t" "$SECS"; done
+    done
+}
+qline() { # NAME DIR FILE DRIVER-ARGS...: one query (LTTB, TWA): a warm-up, then REPS runs
+    local N=$1 D=$2 F=$3
+    shift 3
+    "$B/qdrive" "$@" "$F" 1 100000 1 > "$D/warm.$N" 2>&1 9>&- || { fail "$N warm-up failed (see $D/warm.$N)"; return 1; }
+    reps "$N" "$D" -- "$B/qdrive" "$@" "$F" 1 100000 1
+}
+chbench1() { # CONC ITER|0 SECONDS|0 FILE: clickhouse-benchmark; raw output to stderr, one summary line to stdout
+    local args=(--host 127.0.0.1 --delay 0 -c "$1")
+    [ "$2" != 0 ] && args+=(-i "$2")
+    [ "$3" != 0 ] && args+=(--timelimit "$3")
+    local raw
+    raw=$("$CLICKHOUSE" benchmark "${args[@]}" < "$4" 2>&1)
+    echo "$raw" >&2
+    echo "$raw" | grep -qE 'Exception|Code: [0-9]+' && return 1
+    echo "$raw" | grep -E "queries: [0-9]+, QPS|^50%|^99%" | tr '\n' ' ' |
+        sed -E 's/.*queries: ([0-9]+), QPS: ([0-9.]+).*50%[^0-9]*([0-9.]+) sec.*99%[^0-9]*([0-9.]+) sec.*/\1 queries, \2 q\/s, median \3 s, p99 \4 s/'
+    echo
+}
+chsuite() { # PREFIX DIR TABLE-SYS(ch): ch_bench.sh with REPS runs per measurement
+    local P=$1 D=$2 S=$3 n c t
+    for n in ${FULLS-$FULLS_DEFAULT}; do
+        chbench1 1 1 0 "$WORK/q/$S.full$n.txt" > /dev/null 2> "$D/warm.$P.full$n" 9>&-
+        reps "$P.full$n" "$D" -- chbench1 1 1 0 "$WORK/q/$S.full$n.txt"
+    done
+    for c in ${CLASSES-$CLASSES_DEFAULT}; do
+        chbench1 1 0 3 "$WORK/q/$S.$c.txt" > /dev/null 2> "$D/warm.$P.$c" 9>&-
+        for t in 1 32; do reps "$P.$c.c$t" "$D" -- chbench1 "$t" 0 "$SECS" "$WORK/q/$S.$c.txt"; done
+    done
+}
+tsdbsuite() { # PREFIX DIR CLASS-THREADS("1 32"): tsdbq qps classes against $TSDB_PORT
+    local P=$1 D=$2 ths=$3 c t
+    for c in ${CLASSES-$CLASSES_DEFAULT}; do
+        "$B/tsdbq" qps "$WORK/spec.tsv" "$c" 1 2 > "$D/warm.$P.$c" 2>&1 9>&-
+        for t in $ths; do reps "$P.$c.c$t" "$D" -- "$B/tsdbq" qps "$WORK/spec.tsv" "$c" "$t" "$SECS"; done
+    done
+}
+REL() { python3 -I "$TOOLS/rel.py" "$@"; }
+
+# ================================================================== phase 1: sizes per kind of sensor
+p1_tsdb() {
+    local D=$OUT/p1/tsdb W=$DBCMP/s1/tsdb ds f rows bs bo du1 du2
+    mkdir -p "$D"; rmdata "$W"; mkdir -p "$W"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/tsdb.tsv"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/tsdb-settled.tsv"
+    for ds in $DSLIST; do
+        tsdbd_start "$W/$ds" || continue
+        f=$D/$ds.txt
+        { "$T/tsdbc-bench" load "$IN/$ds.rowbinary" --conns 1 --port "$TSDB_PORT" && "$B/tsdbstat" settle &&
+            du -sb --exclude='retired_*' "$W/$ds" && "$B/tsdbstat" optimize && sleep 1 && du -sb --exclude='retired_*' "$W/$ds"; } > "$f" 2>&1 9>&- ||
+            fail "p1 tsdb $ds (see $f)"
+        tsdbd_stop
+        rows=$(awk '/^optimized:/ {for (i = 1; i <= NF; i++) if ($i == "rows") print $(i + 1)}' "$f")
+        bs=$(awk '/^settled:/ {for (i = 1; i <= NF; i++) if ($i == "bytes") print $(i + 1)}' "$f")
+        bo=$(awk '/^optimized:/ {for (i = 1; i <= NF; i++) if ($i == "bytes") print $(i + 1)}' "$f")
+        du1=$(awk -F'\t' -v p="$W/$ds" '$2 == p {print $1}' "$f" | head -1)
+        du2=$(awk -F'\t' -v p="$W/$ds" '$2 == p {print $1}' "$f" | tail -1)
+        printf '%s\t%s\t%s\ttsdb_optimize (one part per partition, what merge_idle_s merges do); du %s\n' "$ds" "$rows" "$bo" "$du2" >> "$OUT/p1/tsdb.tsv"
+        printf '%s\t%s\t%s\tafter tsdbstat settle (background merges idle 3 s); du %s\n' "$ds" "$rows" "$bs" "$du1" >> "$OUT/p1/tsdb-settled.tsv"
+    done
+    rmdata "$W"
+}
+ch_settle() { # DB: until active part counts and running merges are unchanged for 60 s
+    local s last prev cur
+    s=$(date +%s); last=$s; prev=""
+    while :; do
+        cur=$(CHC -q "SELECT (SELECT count() FROM system.parts WHERE database='$1' AND active), (SELECT count() FROM system.merges WHERE database='$1')")
+        [ "$cur" != "$prev" ] && { last=$(date +%s); prev=$cur; }
+        [ $(($(date +%s) - last)) -ge 60 ] && break
+        sleep 0.5
+    done
+    echo "merges settled $((last - s)) s after the start of the wait (parts, merges: $prev)"
+}
+p1_ch() {
+    local D=$OUT/p1/ch W=$DBCMP/s1/ch ds t
+    mkdir -p "$D"; rmdata "$W"
+    ch_start "$W" || return 1
+    ports_check "$D/ports.txt"
+    CHC -q "CREATE DATABASE s1"
+    for ds in $DSLIST; do
+        CHC -q "CREATE TABLE s1.c_$ds (series UInt32, ts DateTime64(3, 'UTC') CODEC(DoubleDelta, ZSTD(1)), value Float32 CODEC(Gorilla, ZSTD(1))) ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (series, ts)"
+        CHC -q "CREATE TABLE s1.l_$ds (series UInt32, ts DateTime64(3, 'UTC'), value Float32) ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (series, ts)"
+        CHC -q "INSERT INTO s1.c_$ds FORMAT RowBinary" < "$IN/$ds.rowbinary" || fail "p1 ch insert c_$ds"
+        CHC -q "INSERT INTO s1.l_$ds FORMAT RowBinary" < "$IN/$ds.rowbinary" || fail "p1 ch insert l_$ds"
+    done
+    sync -f "$DBCMP"
+    ch_settle s1 > "$D/settle.txt" 2>&1
+    local Q="SELECT table, sum(rows), sum(bytes_on_disk), count() FROM system.parts WHERE database='s1' AND active GROUP BY table ORDER BY table FORMAT TSV"
+    CHC -q "$Q" > "$D/settled.tsv"
+    CHC -q "SELECT table, name, data_compressed_bytes, data_uncompressed_bytes FROM system.columns WHERE database='s1' ORDER BY table, name FORMAT TSV" > "$D/columns-settled.tsv"
+    for t in $(CHC -q "SELECT name FROM system.tables WHERE database='s1'"); do CHC -q "OPTIMIZE TABLE s1.$t FINAL" || fail "p1 ch optimize $t"; done
+    sleep 10
+    CHC -q "$Q" > "$D/optimized.tsv"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/ch.tsv"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/ch-optimized.tsv"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/ch-lz4.tsv"
+    awk -F'\t' '$1 ~ /^c_/ {sub(/^c_/, "", $1); printf "%s\t%s\t%s\tactive parts after merges settled (60 s unchanged): %s; DoubleDelta/Gorilla + ZSTD(1)\n", $1, $2, $3, $4}' "$D/settled.tsv" >> "$OUT/p1/ch.tsv"
+    awk -F'\t' '$1 ~ /^c_/ {sub(/^c_/, "", $1); printf "%s\t%s\t%s\tafter OPTIMIZE FINAL: %s parts\n", $1, $2, $3, $4}' "$D/optimized.tsv" >> "$OUT/p1/ch-optimized.tsv"
+    awk -F'\t' '$1 ~ /^l_/ {sub(/^l_/, "", $1); printf "%s\t%s\t%s\tdefault codecs (LZ4), merges settled: %s parts\n", $1, $2, $3, $4}' "$D/settled.tsv" >> "$OUT/p1/ch-lz4.tsv"
+    crm rb-ch; rmdata "$W"
+}
+p1_duck() {
+    local D=$OUT/p1/duckdb W=$DBCMP/s1/duck ds f
+    mkdir -p "$D" "$W"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/duckdb.tsv"
+    for ds in $DSLIST; do
+        f=$D/$ds.txt; rm -f "$W/$ds.duckdb" "$W/$ds.duckdb.wal"
+        "$B/embq" duckdb load "$W/$ds.duckdb" "$IN/$ds.rowbinary" 1 > "$f" 2>&1 9>&- || { fail "p1 duckdb $ds (see $f)"; continue; }
+        awk -v ds="$ds" '/checkpoint:/ {for (i = 1; i <= NF; i++) { if ($i == "file") fb = $(i + 1); if ($i == "WAL") wb = $(i + 1) }}
+            /load:/ {for (i = 1; i <= NF; i++) if ($i == "rows") r = $(i - 1)}
+            END {printf "%s\t%s\t%d\tfile after CHECKPOINT %s + WAL %s\n", ds, r, fb + wb, fb, wb}' "$f" >> "$OUT/p1/duckdb.tsv"
+        rm -f "$W/$ds.duckdb" "$W/$ds.duckdb.wal"
+    done
+    rmdata "$W"
+}
+p1_qdb() {
+    local D=$OUT/p1/qdb W=$DBCMP/s1/qdb ds i prev cur
+    mkdir -p "$D"; rmdata "$W"
+    qdb_start "$W" || return 1
+    ports_check "$D/ports.txt"
+    for ds in $DSLIST; do
+        QX "CREATE TABLE s_$ds (series SYMBOL CAPACITY 128 CACHE, value FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL" >> "$D/ddl.txt"
+        "$B/loadlp" "$IN/$ds.ilp32" 127.0.0.1 9100 "/write?precision=ms" "" 100000 8 >> "$D/load.txt" 2>&1 9>&- || fail "p1 qdb load $ds"
+    done
+    for ds in $DSLIST; do qdb_wait_table "s_$ds" >> "$D/wal.txt" || fail "p1 qdb wal $ds"; done
+    podman exec rb-qdb sync -f /var/lib/questdb/db
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/qdb.tsv"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/qdb-parquet.tsv"
+    for ds in $DSLIST; do
+        QX "SELECT count() FROM s_$ds" > "$D/rows.$ds.json"
+        QX "SELECT isParquet, count(), sum(diskSize), sum(parquetFileSize) FROM table_partitions('s_$ds')" > "$D/native.$ds.json"
+        jq -r --arg ds "$ds" --argjson rows "$(jq '.dataset[0][0]' "$D/rows.$ds.json")" \
+            '[.dataset[] | .[2]] | add as $b | "\($ds)\t\($rows)\t\($b)\tnative, sum(diskSize) of table_partitions"' "$D/native.$ds.json" >> "$OUT/p1/qdb.tsv"
+        podman unshare du -sb "$W"/db/s_"$ds"~* >> "$D/du-native.txt" 2>&1
+    done
+    for ds in $DSLIST; do
+        QX "ALTER TABLE s_$ds CONVERT PARTITION TO PARQUET WHERE ts >= 0" >> "$D/convert.txt"
+    done
+    for ds in $DSLIST; do qdb_wait_table "s_$ds" >> "$D/wal-convert.txt" || fail "p1 qdb convert wal $ds"; done
+    prev=""
+    for i in $(seq 120); do  # until the partition listing is unchanged for 30 s
+        cur=$(for ds in $DSLIST; do QX "SELECT isParquet, count(), sum(diskSize) FROM table_partitions('s_$ds')"; done | md5sum)
+        [ "$cur" = "$prev" ] && break
+        prev=$cur; sleep 30
+    done
+    sleep 60  # old native partition files go asynchronously
+    podman exec rb-qdb sync -f /var/lib/questdb/db
+    for ds in $DSLIST; do
+        QX "SELECT count() FROM s_$ds" > "$D/rows-pq.$ds.json"
+        QX "SELECT isParquet, count(), sum(diskSize), sum(parquetFileSize) FROM table_partitions('s_$ds')" > "$D/parquet.$ds.json"
+        jq -r --arg ds "$ds" --argjson rows "$(jq '.dataset[0][0]' "$D/rows-pq.$ds.json")" \
+            '([.dataset[] | .[2]] | add) as $b | ([.dataset[] | select(.[0]) | .[1]] | add // 0) as $np | ([.dataset[] | .[1]] | add) as $n | ([.dataset[] | .[3]] | add) as $pq
+             | "\($ds)\t\($rows)\t\($b)\tsum(diskSize) after CONVERT PARTITION TO PARQUET: \($np) of \($n) partitions Parquet, parquetFileSize \($pq)"' "$D/parquet.$ds.json" >> "$OUT/p1/qdb-parquet.tsv"
+        podman unshare du -sb "$W"/db/s_"$ds"~* >> "$D/du-parquet.txt" 2>&1
+    done
+    crm rb-qdb; rmdata "$W"
+}
+p1_ts() {
+    local D=$OUT/p1/ts W=$DBCMP/s1/ts ds tn
+    mkdir -p "$D"; rmdata "$W"
+    ts_start rb-ts "$TS_IMG" "$W" "$IN" || return 1
+    ports_check "$D/ports.txt"
+    PSQL -c "ALTER SYSTEM SET max_wal_size = '16GB'" -c "SELECT pg_reload_conf()" > /dev/null
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/ts.tsv"
+    for ds in $DSLIST; do
+        tn=ts_${ds,,}  # PostgreSQL folds unquoted names to lower case; timescaledb-parallel-copy quotes them
+        {
+            PSQL -c "CREATE TABLE $tn (series int NOT NULL, ts timestamptz NOT NULL, value real NOT NULL)" \
+                -c "SELECT create_hypertable('$tn', by_range('ts', INTERVAL '1 day'))" \
+                -c "ALTER TABLE $tn SET (timescaledb.compress, timescaledb.compress_segmentby = 'series', timescaledb.compress_orderby = 'ts')" &&
+                podman exec rb-ts timescaledb-parallel-copy -connection "host=127.0.0.1 port=5434 user=postgres password=bench sslmode=disable dbname=postgres" \
+                    -table "$tn" -file "/data/$ds.csv" -workers 8 -batch-size 10000 -columns series,ts,value -disable-direct-compress &&
+                echo "before compression: $(PSQL -Atc "SELECT hypertable_size('$tn')")" &&
+                PSQL -Atq -c "select c from show_chunks('$tn') c" | xargs -P 16 -I{} psql -h 127.0.0.1 -p 5434 -U postgres -Atq -c "select compress_chunk('{}')" > /dev/null &&
+                PSQL -c "VACUUM ANALYZE $tn" &&
+                PSQL -Atc "SELECT 'rows', count(*) FROM $tn" -c "SELECT 'size', hypertable_size('$tn')" -c "select 'chunks', status, count(*) from _timescaledb_catalog.chunk where hypertable_id = (select id from _timescaledb_catalog.hypertable where table_name='$tn') group by 2"
+        } > "$D/$ds.txt" 2>&1 9>&- || fail "p1 ts $ds (see $D/$ds.txt)"
+        awk -F'|' -v ds="$ds" '/^rows\|/ {r = $2} /^size\|/ {s = $2} /^before compression:/ {b = substr($0, 20)}
+            END {printf "%s\t%s\t%s\tcompressed (segmentby series, orderby ts), after VACUUM; before compression%s\n", ds, r, s, b}' "$D/$ds.txt" >> "$OUT/p1/ts.tsv"
+    done
+    crm rb-ts; rmdata "$W"
+}
+p1_i2() {
+    local D=$OUT/p1/i2 W=$DBCMP/s1/i2 ds id
+    mkdir -p "$D"; rmdata "$W"
+    i2_start "$W" || return 1
+    ports_check "$D/ports.txt"
+    for ds in $DSLIST; do
+        I2 bucket create --name "$ds" --hide-headers >> "$D/buckets.txt" 2>&1 9>&-
+        "$B/loadlp" "$IN/$ds.lp" 127.0.0.1 8086 "/api/v2/write?org=bench&bucket=$ds&precision=ms" $'Authorization: Token benchtoken\r\n' 5000 8 >> "$D/load.txt" 2>&1 9>&- || fail "p1 i2 load $ds"
+    done
+    I2_PORT=8086 "$H/i2_settle.sh" "$(date +%s)" > "$D/settle.txt" 2>&1 9>&- || fail "p1 i2 compaction did not settle (see $D/settle.txt); sizes taken anyway"
+    I2 bucket list --hide-headers > "$D/bucket-list.txt" 2>&1 9>&-
+    podman unshare sh -c "cd $W/data/engine && du -sb data/* wal/* 2>/dev/null" > "$D/du.txt"
+    podman unshare sh -c "cd $W/data/engine && du -sB1 data/* 2>/dev/null" > "$D/du-allocated.txt"
+    podman unshare sh -c "cd $W/data/engine && find data -type f -printf '%s\t%p\n'" > "$D/files.txt"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/i2.tsv"
+    for ds in $DSLIST; do
+        id=$(awk -v n="$ds" '$2 == n {print $1}' "$D/bucket-list.txt")
+        awk -v ds="$ds" -v id="$id" -v rows=$(($(stat -c %s "$IN/$ds.rowbinary") / 16)) '$2 == "data/" id {d = $1} $2 == "wal/" id {w = $1}
+            END {printf "%s\t%d\t%d\tTSM + index (engine/data/%s, du -sb) after compaction settled; WAL %d; allocated blocks in du-allocated.txt, files in files.txt\n", ds, rows, d, id, w}' "$D/du.txt" >> "$OUT/p1/i2.tsv"
+    done
+    crm rb-i2; rmdata "$W"
+}
+p1_i3() {
+    local D=$OUT/p1/i3 W=$DBCMP/s1/i3 ds
+    mkdir -p "$D"; rmdata "$W"
+    # --force-snapshot-max-age 5m: the snapshot that writes Parquet comes after 5 min instead of 1 h; the Parquet
+    # layout (gen1 files of 10 min of data time) does not depend on it
+    i3_start "$W" --force-snapshot-max-age "$I3_P1_AGE" || return 1
+    ports_check "$D/ports.txt"
+    for ds in $DSLIST; do
+        curl -s -X POST http://127.0.0.1:8181/api/v3/configure/database -H 'Content-Type: application/json' -d "{\"db\":\"s_$ds\"}" >> "$D/ddl.txt"
+        "$B/loadlp" "$IN/$ds.lp" 127.0.0.1 8181 "/api/v3/write_lp?db=s_$ds&precision=millisecond" "" 100000 16 >> "$D/load.txt" 2>&1 9>&- || fail "p1 i3 load $ds"
+    done
+    i3_wait_snapshot "$W" "$I3_P1_MIN" 180 5400 > "$D/snapshot.txt" 2>&1 || fail "p1 i3 snapshot did not settle (see $D/snapshot.txt)"
+    podman unshare find "$W/data" -maxdepth 4 -type d > "$D/dirs.txt"
+    podman unshare sh -c "cd $W/data && du -sb */* */*/* 2>/dev/null" > "$D/du.txt"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/i3.tsv"
+    for ds in $DSLIST; do
+        curl -s "http://127.0.0.1:8181/api/v3/query_sql?db=s_$ds&format=json" --data-urlencode "q=SELECT count(*) AS files, sum(size_bytes) AS bytes, sum(row_count) AS rows FROM system.parquet_files WHERE table_name = 'sensors'" -G > "$D/pq.$ds.json"
+        jq -r --arg ds "$ds" '.[0] | "\($ds)\t\(.rows)\t\(.bytes)\tParquet files (system.parquet_files): \(.files); WAL apart (du.txt)"' "$D/pq.$ds.json" >> "$OUT/p1/i3.tsv" 2>> "$D/errors.txt" || fail "p1 i3 size $ds"
+    done
+    crm rb-i3; rmdata "$W"
+}
+p1_prom() {
+    local D=$OUT/p1/prom W=$DBCMP/s1/prom ds
+    mkdir -p "$D" "$W"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/prom.tsv"
+    for ds in $DSLIST; do
+        mkdir -p "$W/$ds" && podman unshare chown 65534:65534 "$W/$ds"
+        podman run --rm --name rb-promtool --network none -v "$IN:/input:ro" -v "$W/$ds:/prometheus" --entrypoint /bin/promtool "$PROM_IMG" \
+            tsdb create-blocks-from openmetrics --max-block-duration=744h -q "/input/$ds.om" /prometheus > "$D/$ds.txt" 2>&1 9>&- || { fail "p1 prom $ds"; continue; }
+        podman unshare sh -c "cd $W/$ds && du -scb 01* | tail -1; ls -d 01* | wc -l" >> "$D/$ds.txt"
+        awk -v ds="$ds" -v rows=$(($(stat -c %s "$IN/$ds.rowbinary") / 16)) '/total$/ {b = $1} /^[0-9]+$/ {n = $1} END {printf "%s\t%d\t%d\tpromtool backfill blocks (%d), float64\n", ds, rows, b, n}' "$D/$ds.txt" >> "$OUT/p1/prom.tsv"
+        podman unshare rm -rf "$W/$ds"
+    done
+    rmdata "$W"
+}
+phase1() {
+    reset_quiet
+    local s
+    for s in $P1_SYSTEMS; do
+        log "p1 $s start"
+        "p1_$s" || fail "p1 $s returned an error"
+        cleanup_all
+        log "p1 $s end"
+    done
+    python3 -I "$TOOLS/sizes_summary.py" "$OUT/p1" > "$OUT/p1/sizes.md" 2>&1 || fail "sizes_summary"
+}
+
+# ================================================================== phase 2: the 100 M-row table
+p2_tsdb() {
+    local D=$OUT/p2/tsdb W=$DBCMP/s2/tsdb r
+    mkdir -p "$D" "$WORK/ref"
+    for r in $(seq "$REPS"); do
+        rmdata "$W"; mkdir -p "$W"
+        tsdbd_start "$W/db" || return 1
+        warm "$DATA"
+        tstep "p2 tsdb load r$r" "$D/load.$r" -- bash -c "'$T/tsdbc-bench' load '$DATA' --conns 4 --port $TSDB_PORT && sync -f '$DBCMP' && '$B/tsdbstat' settle && du -sb --exclude='retired_*' '$W/db'"
+        [ "$r" -lt "$REPS" ] && tsdbd_stop
+    done
+    ports_check "$D/ports.txt"
+    cd "$WORK" || return 1
+    untimed "$D/ref-windows.log" sh -c "'$B/tsdbq' dump spec.tsv 200 > ref/windows.jsonl"
+    untimed "$D/ref-full.log" sh -c "'$B/tsdbq' full 1 1 dump 2> ref/full.jsonl"
+    untimed "$D/ref-lttb.log" "$B/relq" lttb 1 1 ref/lttb.jsonl
+    untimed "$D/ref-twa.log" "$B/relq" twa 1 1 ref/twa.jsonl
+    tstep "p2 tsdb full c1" "$D/full.c1.txt" -- "$B/tsdbq" full 1 "$REPS"
+    tstep "p2 tsdb full c16" "$D/full.c16.txt" -- "$B/tsdbq" full 16 "$REPS"
+    tstep "p2 tsdb lttb c1" "$D/lttb.c1.txt" -- "$B/relq" lttb 1 "$REPS"
+    tstep "p2 tsdb lttb c16" "$D/lttb.c16.txt" -- "$B/relq" lttb 16 "$REPS"
+    tstep "p2 tsdb twa c1" "$D/twa.c1.txt" -- "$B/relq" twa 1 "$REPS"
+    tstep "p2 tsdb twa c16" "$D/twa.c16.txt" -- "$B/relq" twa 16 "$REPS"
+    tsdbsuite tsdbq "$D" "1 32"
+    tstep "p2 tsdbc-bench query c1" "$D/tsdbc-bench.c1.txt" -- "$T/tsdbc-bench" query --conns 1 --seconds 5 --port "$TSDB_PORT"
+    tstep "p2 tsdbc-bench query c32" "$D/tsdbc-bench.c32.txt" -- "$T/tsdbc-bench" query --conns 32 --seconds 5 --port "$TSDB_PORT"
+    # partitions merged (README row "tsdbd, 1 connection, partitions merged")
+    tstep "p2 tsdb optimize" "$D/optimize.txt" -- bash -c "'$B/tsdbstat' optimize && du -sb --exclude='retired_*' '$W/db'"
+    tstep "p2 tsdb merged full c1" "$D/merged.full.c1.txt" -- "$B/tsdbq" full 1 "$REPS"
+    tsdbsuite merged "$D" "1"
+    tsdbd_stop
+    cd "$OUT" || true
+    runstats "$D"
+    rmdata "$W"
+}
+ch_load_rep() { # one load: fresh server and table, ch_load.sh (insert, syncfs, merges), size
+    local W=$1
+    rmdata "$W"
+    ch_start "$W" || return 1
+    CHC -n -q "CREATE DATABASE cmp; CREATE TABLE cmp.t100m (series UInt32, ts DateTime64(3, 'UTC') CODEC(DoubleDelta, ZSTD(1)), value Float32 CODEC(Gorilla, ZSTD(1))) ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (series, ts)" || return 1
+}
+p2_ch() {
+    local D=$OUT/p2/ch W=$DBCMP/s2/ch r
+    mkdir -p "$D"
+    for r in $(seq "$REPS"); do
+        crm rb-ch
+        ch_load_rep "$W" || { fail "p2 ch start r$r"; return 1; }
+        warm "$DATA"
+        tstep "p2 ch load r$r" "$D/load.$r" -- bash -c "'$H/ch_load.sh' t100m && '$CLICKHOUSE' client --host 127.0.0.1 -q \"SELECT 'size', count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'cmp' AND table = 't100m' AND active\""
+        [ "$r" -lt "$REPS" ] && { crm rb-ch; rmdata "$W"; }
+    done
+    ports_check "$D/ports.txt"
+    CHC -q "SELECT version()" > "$D/version.txt"
+    cd "$WORK" || return 1
+    python3 -I "$H/mkq.py" ch
+    untimed "$D/check.txt" python3 -I "$H/check.py" ch 200
+    chsuite ch "$D" ch
+    REL q ch lttb > "$D/q.lttb.sql"; REL q ch twa > "$D/q.twa.sql"
+    untimed "$D/check-lttb.txt" REL check ch lttb ref/lttb.jsonl
+    untimed "$D/check-twa.txt" REL check ch twa ref/twa.jsonl
+    chbench1 1 1 0 "$D/q.lttb.sql" > /dev/null 2> "$D/warm.lttb"; reps lttb "$D" -- chbench1 1 1 0 "$D/q.lttb.sql"
+    chbench1 1 1 0 "$D/q.twa.sql" > /dev/null 2> "$D/warm.twa"; reps twa "$D" -- chbench1 1 1 0 "$D/q.twa.sql"
+    CHC -q "SELECT count(), sum(bytes_on_disk) FROM system.parts WHERE database = 'cmp' AND table = 't100m' AND active" > "$D/size-end.txt"
+    cd "$OUT" || true
+    crm rb-ch; rmdata "$W"
+    runstats "$D"
+}
+qdb_load_rep() { # W PARQUET(0|1): fresh server, table, load, WAL applied, [convert], sync, size
+    local W=$1 pq=$2 s e
+    s=$(date +%s.%N)
+    "$B/loadlp" "$DBCMP/input/mixed.ilp32" 127.0.0.1 9100 "/write?precision=ms" "" 100000 8 || return 1
+    "$H/qdb_wait.sh" || return 1
+    if [ "$pq" = 1 ]; then
+        e=$(date +%s.%N)
+        QX "ALTER TABLE sensors CONVERT PARTITION TO PARQUET WHERE ts >= 0"
+        qdb_wait_table sensors || return 1
+        echo "conversion to Parquet applied $(echo "$(date +%s.%N) - $e" | bc) s after the WAL apply (load + WAL + conversion $(echo "$(date +%s.%N) - $s" | bc) s)"
+    fi
+    local t=$(date +%s.%N)
+    podman exec rb-qdb sync -f /var/lib/questdb/db
+    echo "sync $(echo "$(date +%s.%N) - $t" | bc) s"
+    QX "SELECT isParquet, count(), sum(diskSize), sum(parquetFileSize) FROM table_partitions('sensors')"
+}
+p2_qdb() { # PARQUET(0|1)
+    local pq=$1 P=qdb D W r
+    [ "$pq" = 1 ] && P=qdb-parquet
+    D=$OUT/p2/$P W=$DBCMP/s2/$P
+    mkdir -p "$D"
+    for r in $(seq "$REPS"); do
+        crm rb-qdb; rmdata "$W"
+        qdb_start "$W" || return 1
+        QX "CREATE TABLE sensors (series SYMBOL CAPACITY 128 CACHE, value FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL" > "$D/ddl.$r.txt"
+        warm "$DBCMP/input/mixed.ilp32"
+        tstep "p2 $P load r$r" "$D/load.$r" -- qdb_load_rep "$W" "$pq"
+        [ "$r" -lt "$REPS" ] && { crm rb-qdb; rmdata "$W"; }
+    done
+    ports_check "$D/ports.txt"
+    sleep 60  # converted partitions' old files go asynchronously
+    QX "SELECT isParquet, count(), sum(diskSize), sum(parquetFileSize) FROM table_partitions('sensors')" > "$D/size-final.json"
+    podman unshare du -sb "$W"/db/sensors~* > "$D/du-final.txt" 2>&1
+    QX "select build()" > "$D/version.txt"
+    cd "$WORK" || return 1
+    python3 -I "$H/mkq.py" qdb && python3 -I "$H/mkq.py" qdbh
+    untimed "$D/check.txt" python3 -I "$H/check.py" qdb 200
+    local PG="host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb"
+    qsuite qdb "$P" "$D" pg "$PG"
+    REL q qdb twa > "$D/q.twa.sql"
+    untimed "$D/check-twa.txt" REL check qdb twa ref/twa.jsonl
+    qline twa "$D" "$D/q.twa.sql" pg "$PG"
+    if [ "$pq" = 0 ]; then
+        # HTTP API cross-check (README: within 10% of the PostgreSQL protocol): one run per measurement
+        REPS=1 qsuite qdbh "$P-http" "$D" http 127.0.0.1 9100 ""
+        # variant: an index on the symbol (README), classes only
+        QX "ALTER TABLE sensors ALTER COLUMN series ADD INDEX" > "$D/index.txt"
+        qdb_wait_table sensors >> "$D/index.txt"
+        FULLS="" qsuite qdb "$P-index" "$D" pg "$PG"
+    fi
+    cd "$OUT" || true
+    crm rb-qdb; rmdata "$W"
+    runstats "$D"
+}
+ts_load_rep() { # one load into rb-ts (fresh): COPY, size, compress, VACUUM, size
+    PSQL -c "ALTER SYSTEM SET max_wal_size = '16GB'" -c "SELECT pg_reload_conf()" > /dev/null
+    PSQL -c "CREATE TABLE t100m (series int NOT NULL, ts timestamptz NOT NULL, value real NOT NULL)" \
+        -c "SELECT create_hypertable('t100m', by_range('ts', INTERVAL '1 day'))" \
+        -c "ALTER TABLE t100m SET (timescaledb.compress, timescaledb.compress_segmentby = 'series', timescaledb.compress_orderby = 'ts')" || return 1
+}
+ts_timed() { # CONTAINER: the timed part of a load
+    sync
+    local s=$(date +%s.%N)
+    podman exec "$1" timescaledb-parallel-copy -connection "host=127.0.0.1 port=5434 user=postgres password=bench sslmode=disable dbname=postgres" \
+        -table t100m -file /data/mixed.csv -workers 16 -batch-size 10000 -columns series,ts,value -disable-direct-compress || return 1
+    echo "copy $(echo "$(date +%s.%N) - $s" | bc) s"
+    echo "before compression: $(PSQL -Atc "SELECT hypertable_size('t100m')")"
+    TS_PORT=5434 "$H/ts_compress.sh" 16 || return 1
+    PSQL -c "VACUUM t100m" && echo "after VACUUM: $(PSQL -Atc "SELECT hypertable_size('t100m')")"
+}
+p2_ts() {
+    local D=$OUT/p2/ts W=$DBCMP/s2/ts r
+    mkdir -p "$D"
+    for r in $(seq "$REPS"); do
+        crm rb-ts; rmdata "$W"
+        ts_start rb-ts "$TS_IMG" "$W" "$DBCMP/input" || return 1
+        ts_load_rep > "$D/setup.$r.txt" 2>&1 || { fail "p2 ts setup r$r"; return 1; }
+        warm "$DBCMP/input/mixed.csv"
+        tstep "p2 ts load r$r" "$D/load.$r" -- ts_timed rb-ts
+        [ "$r" -lt "$REPS" ] && { crm rb-ts; rmdata "$W"; }
+    done
+    ports_check "$D/ports.txt"
+    PSQL -Atc "select version()" -c "select extversion from pg_extension where extname='timescaledb'" > "$D/version.txt"
+    cd "$WORK" || return 1
+    python3 -I "$H/mkq.py" ts
+    untimed "$D/check.txt" python3 -I "$H/check.py" ts 200
+    qsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
+    cd "$OUT" || true
+    crm rb-ts; rmdata "$W"
+    # LTTB and TWA need the toolkit, which is in the -ha image (same TimescaleDB 2.31.0, PostgreSQL 17.11) only:
+    # one more load there (timed once, for the record), then the two queries
+    W=$DBCMP/s2/tsha
+    rmdata "$W"
+    ts_start rb-tsha "$TSHA_IMG" "$W" "$DBCMP/input" || return 1
+    { PSQL -c "CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit"; ts_load_rep; } > "$D/ha-setup.txt" 2>&1 || { fail "p2 tsha setup"; return 1; }
+    ports_check "$D/ports-ha.txt"
+    warm "$DBCMP/input/mixed.csv"
+    tstep "p2 tsha load" "$D/ha-load.txt" -- ts_timed rb-tsha
+    PSQL -Atc "select version()" -c "select extname, extversion from pg_extension" -c "show shared_buffers" -c "show work_mem" > "$D/ha-version.txt"
+    cd "$WORK" || return 1
+    REL q ts lttb > "$D/q.lttb.sql"; REL q ts twa > "$D/q.twa.sql"
+    untimed "$D/check-lttb.txt" REL check ts lttb ref/lttb.jsonl
+    untimed "$D/check-twa.txt" REL check ts twa ref/twa.jsonl
+    local PG="host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
+    qline lttb "$D" "$D/q.lttb.sql" pg "$PG"
+    qline twa "$D" "$D/q.twa.sql" pg "$PG"
+    cd "$OUT" || true
+    crm rb-tsha; rmdata "$W"
+    runstats "$D"
+}
+i2_timed() {
+    local s=$(date +%s)
+    "$B/loadlp" "$DBCMP/input/mixed.lp" 127.0.0.1 8086 "/api/v2/write?org=bench&bucket=cmp&precision=ms" $'Authorization: Token benchtoken\r\n' 5000 8 || return 1
+    I2_PORT=8086 "$H/i2_settle.sh" "$(date +%s)" || return 1
+    echo "size: $(podman unshare du -sb "$1/data" | cut -f1) bytes (du -sb of the data directory)"
+}
+p2_i2() {
+    local D=$OUT/p2/i2 W=$DBCMP/s2/i2 r bid
+    mkdir -p "$D"
+    for r in $(seq "$REPS"); do
+        crm rb-i2; rmdata "$W"
+        i2_start "$W" || return 1
+        bid=$(I2 bucket list --name cmp --hide-headers 9>&- | awk '{print $1}')
+        I2 v1 dbrp create --db cmp --rp autogen --bucket-id "$bid" --default > "$D/dbrp.$r.txt" 2>&1 9>&-
+        warm "$DBCMP/input/mixed.lp"
+        tstep "p2 i2 load r$r" "$D/load.$r" -- i2_timed "$W"
+        [ "$r" -lt "$REPS" ] && { crm rb-i2; rmdata "$W"; }
+    done
+    ports_check "$D/ports.txt"
+    podman exec rb-i2 influxd version > "$D/version.txt" 2>&1
+    cd "$WORK" || return 1
+    python3 -I "$H/mkq.py" i2ql && python3 -I "$H/mkq.py" i2flux
+    untimed "$D/check-i2ql.txt" python3 -I "$H/check.py" i2ql 200
+    untimed "$D/check-i2flux.txt" python3 -I "$H/check.py" i2flux 200
+    qsuite i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'
+    qsuite i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
+    cd "$OUT" || true
+    crm rb-i2; rmdata "$W"
+    runstats "$D"
+}
+p2_i3() {
+    local D=$OUT/p2/i3 W=$DBCMP/s2/i3 r
+    mkdir -p "$D"
+    for r in $(seq "$REPS"); do
+        crm rb-i3; rmdata "$W"
+        i3_start "$W" $I3_P2_FLAGS || return 1
+        curl -s -X POST http://127.0.0.1:8181/api/v3/configure/database -H 'Content-Type: application/json' -d '{"db":"cmp"}' > "$D/ddl.$r.txt"
+        warm "$DBCMP/input/mixed.lp"
+        tstep "p2 i3 load r$r" "$D/load.$r" -- "$B/loadlp" "$DBCMP/input/mixed.lp" 127.0.0.1 8181 "/api/v3/write_lp?db=cmp&precision=millisecond" "" 100000 16
+        [ "$r" -lt "$REPS" ] && { crm rb-i3; rmdata "$W"; }
+    done
+    # default --force-snapshot-max-age (1 h): Parquet appears about an hour after the load (README); waited once
+    i3_wait_snapshot "$W" "$I3_P2_MIN" 300 9000 > "$D/snapshot.txt" 2>&1 || fail "p2 i3 snapshot did not settle (see $D/snapshot.txt)"
+    ports_check "$D/ports.txt"
+    podman unshare sh -c "cd $W/data/node0 2>/dev/null && du -sb * */* 2>/dev/null" > "$D/du.txt"
+    podman exec rb-i3 influxdb3 --version > "$D/version.txt" 2>&1
+    cd "$WORK" || return 1
+    python3 -I "$H/mkq.py" i3
+    untimed "$D/check.txt" python3 -I "$H/check.py" i3 200
+    CLASSES="" qsuite i3 i3 "$D" http 127.0.0.1 8181 ""
+    FULLS="" qsuite i3 i3 "$D" http 127.0.0.1 8181 ""
+    REL q i3 twa > "$D/q.twa.http"
+    untimed "$D/check-twa.txt" REL check i3 twa ref/twa.jsonl
+    qline twa "$D" "$D/q.twa.http" http 127.0.0.1 8181 ""
+    cd "$OUT" || true
+    crm rb-i3; rmdata "$W"
+    runstats "$D"
+}
+phase2() {
+    local s
+    for s in $P2_SYSTEMS; do
+        reset_quiet
+        log "p2 $s start"
+        case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
+        cleanup_all
+        log "p2 $s end"
+    done
+}
+
+# ================================================================== phase 3: embedded (tsdb, DuckDB, chDB)
+p3() {
+    local D=$OUT/p3 E=$DBCMP/s3 r e
+    mkdir -p "$D" "$E"
+    rmdata "$E"; mkdir -p "$E"
+    warm "$DATA"
+    for r in $(seq "$REPS"); do
+        rm -rf "$E/tsdb"; sync
+        tstep "p3 tsdb load r$r" "$D/tsdb.load.$r" -- "$B/embq" tsdb load "$E/tsdb" "$DATA" 4
+        rm -f "$E/t.duckdb" "$E/t.duckdb.wal"; sync
+        tstep "p3 duckdb load r$r" "$D/duckdb.load.$r" -- "$B/embq" duckdb load "$E/t.duckdb" "$DATA" 4
+        rm -rf "$E/chdb"; sync
+        tstep "p3 chdb load r$r" "$D/chdb.load.$r" -- "$B/chq" load "$E/chdb" "$DATA" 1
+        rm -rf "$E/chdb-lz4"; sync
+        tstep "p3 chdb-lz4 load r$r" "$D/chdb-lz4.load.$r" -- "$B/chq" load "$E/chdb-lz4" "$DATA" 0
+    done
+    du -sb "$E"/* > "$D/du.txt"
+    cd "$WORK" || return 1
+    mkdir -p dump
+    local RW=ref/windows.jsonl RF=ref/full.jsonl RL=ref/lttb.jsonl RT=ref/twa.jsonl
+    untimed "$D/dump-tsdb.log" sh -c "'$B/embq' tsdb dump '$E/tsdb' spec.tsv > dump/tsdb-windows.jsonl"
+    untimed "$D/dump-tsdb-full.log" "$B/embq" tsdb full "$E/tsdb" 1 1 dump/tsdb-full.jsonl
+    untimed "$D/ref-lttb-emb.log" env TSDB_DIR="$E/tsdb" "$B/relemb" lttb 1 1 dump/tsdb-lttb.jsonl
+    untimed "$D/ref-twa-emb.log" env TSDB_DIR="$E/tsdb" "$B/relemb" twa 1 1 dump/tsdb-twa.jsonl
+    if [ ! -s "$RW" ] || [ ! -s "$RT" ]; then  # phase 2 gave no tsdbd reference: the embedded tsdb answers stand in
+        log "p3: no tsdbd reference in ref/; checking against embedded tsdb's answers"
+        RW=dump/tsdb-windows.jsonl RF=dump/tsdb-full.jsonl RL=dump/tsdb-lttb.jsonl RT=dump/tsdb-twa.jsonl
+    fi
+    untimed "$D/dump-duckdb.log" sh -c "'$B/embq' duckdb dump '$E/t.duckdb' spec.tsv > dump/duckdb-windows.jsonl"
+    untimed "$D/dump-duckdb-full.log" "$B/embq" duckdb full "$E/t.duckdb" 1 1 dump/duckdb-full.jsonl
+    for e in chdb chdb-lz4; do
+        untimed "$D/dump-$e.log" sh -c "'$B/chq' dump '$E/$e' spec.tsv > dump/$e-windows.jsonl"
+        untimed "$D/dump-$e-full.log" "$B/chq" full "$E/$e" 1 "dump/$e-full.jsonl"
+    done
+    {
+        python3 -I "$H/check.py" --dumps "$RW" "$RF" dump/tsdb-windows.jsonl dump/tsdb-full.jsonl
+        # as README: the other engines against embedded tsdb's answers to every query (tsdbd's ref has 200 per class)
+        for e in duckdb chdb chdb-lz4; do python3 -I "$H/check.py" --dumps dump/tsdb-windows.jsonl dump/tsdb-full.jsonl "dump/$e-windows.jsonl" "dump/$e-full.jsonl"; done
+        REL jsonl lttb "$RL" dump/tsdb-lttb.jsonl
+        REL jsonl twa "$RT" dump/tsdb-twa.jsonl
+    } > "$D/check.txt" 2>&1
+    grep -E 'mismatches [1-9]|MISMATCH|Traceback|Error' "$D/check.txt" > /dev/null && fail "p3 answer check found mismatches (see $D/check.txt)"
+    # whole range
+    tstep "p3 tsdb full t1" "$D/tsdb.full.t1.txt" -- "$B/embq" tsdb full "$E/tsdb" "$REPS" 1
+    tstep "p3 tsdb full t32" "$D/tsdb.full.t32.txt" -- "$B/embq" tsdb full "$E/tsdb" "$REPS" 32
+    tstep "p3 duckdb full" "$D/duckdb.full.txt" -- "$B/embq" duckdb full "$E/t.duckdb" "$REPS" 1
+    tstep "p3 chdb full" "$D/chdb.full.txt" -- "$B/chq" full "$E/chdb" "$REPS" /dev/null
+    tstep "p3 chdb-lz4 full" "$D/chdb-lz4.full.txt" -- "$B/chq" full "$E/chdb-lz4" "$REPS" /dev/null
+    # random windows and points
+    local c t
+    for c in raw agg1d agg7d point; do
+        "$B/embq" tsdb qps "$E/tsdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
+        for t in 1 32; do reps "tsdb.$c.t$t" "$D" -- "$B/embq" tsdb qps "$E/tsdb" spec.tsv "$c" "$t" "$SECS"; done
+        "$B/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
+        for t in 1 32; do reps "duckdb.$c.t$t" "$D" -- "$B/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" "$t" "$SECS"; done
+        for e in chdb chdb-lz4; do
+            "$B/chq" qps "$E/$e" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
+            for t in 1 32; do reps "$e.$c.t$t" "$D" -- "$B/chq" qps "$E/$e" spec.tsv "$c" "$t" "$SECS"; done
+        done
+    done
+    # LTTB and TWA
+    tstep "p3 tsdb lttb t1" "$D/tsdb.lttb.t1.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" lttb 1 "$REPS"
+    tstep "p3 tsdb lttb t32" "$D/tsdb.lttb.t32.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" lttb 32 "$REPS"
+    tstep "p3 tsdb twa t1" "$D/tsdb.twa.t1.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" twa 1 "$REPS"
+    tstep "p3 tsdb twa t32" "$D/tsdb.twa.t32.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" twa 32 "$REPS"
+    tstep "p3 duckdb twa" "$D/duckdb.twa.txt" -- "$B/embq" duckdb sqlt "$E/t.duckdb" "$REPS" dump/duckdb-twa.tsv "$(REL sql duck twa)"
+    for e in chdb chdb-lz4; do
+        tstep "p3 $e lttb" "$D/$e.lttb.txt" -- "$B/chq" sqlt "$E/$e" "$REPS" "dump/$e-lttb.tsv" "$(REL sql chdb lttb)"
+        tstep "p3 $e twa" "$D/$e.twa.txt" -- "$B/chq" sqlt "$E/$e" "$REPS" "dump/$e-twa.tsv" "$(REL sql chdb twa)"
+    done
+    {
+        REL tsv twa "$RT" dump/duckdb-twa.tsv
+        for e in chdb chdb-lz4; do REL tsv lttb "$RL" "dump/$e-lttb.tsv"; REL tsv twa "$RT" "dump/$e-twa.tsv"; done
+    } > "$D/check-rel.txt" 2>&1
+    grep -qE 'MISMATCH|Traceback|Error' "$D/check-rel.txt" && fail "p3 LTTB/TWA check found mismatches (see $D/check-rel.txt)"
+    cd "$OUT" || true
+    runstats "$D"
+    rmdata "$E"
+}
+phase3() { reset_quiet; p3 || fail "p3 returned an error"; }
+
+# ================================================================== phase 4: Prometheus
+prom_bf_timed() { # DIR: promtool backfill, sync, server start until ready
+    local s=$(date +%s.%N) t
+    podman run --rm --name rb-promtool --network none -v "$DBCMP/input:/input:ro" -v "$1:/prometheus" --entrypoint /bin/promtool "$PROM_IMG" \
+        tsdb create-blocks-from openmetrics --max-block-duration=744h -q /input/mixed.om /prometheus || return 1
+    t=$(date +%s.%N); echo "promtool $(echo "$t - $s" | bc) s"
+    sync -f "$1"; s=$(date +%s.%N); echo "sync $(echo "$s - $t" | bc) s"
+    prom_run rb-prom-bf 9091 "$1" && prom_ready 9091 || return 1
+    echo "server ready $(echo "$(date +%s.%N) - $s" | bc) s"
+    podman unshare sh -c "cd $1 && du -scb 01* | tail -1 && du -sb wal wbl chunks_head 2>/dev/null"
+}
+prom_rw_timed() { # DIR SAMPLES SHARDS
+    "$B/loadprw" "$DATA" 127.0.0.1 9090 "$2" "$3" || return 1
+    local s=$(date +%s.%N)
+    sync -f "$1"
+    echo "sync after the load $(echo "$(date +%s.%N) - $s" | bc) s"
+}
+p4() {
+    local D=$OUT/p4 P=$DBCMP/s4 r c S
+    mkdir -p "$D"; rmdata "$P"; mkdir -p "$P"
+    cp "$H/prometheus.yml" "$DBCMP/prometheus.yml"
+    cd "$WORK" || return 1
+    python3 -I "$H/mkq.py" prom
+    # (b) backfill, REPS times into fresh directories; the last stays for the queries
+    for r in $(seq "$REPS"); do
+        crm rb-prom-bf; podman unshare rm -rf "$P/data-bf"
+        mkdir -p "$P/data-bf" && podman unshare chown 65534:65534 "$P/data-bf"
+        warm "$DBCMP/input/mixed.om"
+        tstep "p4 backfill r$r" "$D/bf.load.$r" -- prom_bf_timed "$P/data-bf"
+    done
+    ports_check "$D/ports-bf.txt"
+    untimed "$D/check-bf.txt" env PROM_PORT=9091 python3 -I "$H/check.py" prom 200
+    qsuite prom bf "$D" http 127.0.0.1 9091 ""
+    crm rb-prom-bf; podman unshare rm -rf "$P/data-bf"
+    # (a) remote write: REPS loads (load + sync) into fresh directories; the last one settles (hours) and is queried
+    for r in $(seq "$REPS"); do
+        crm rb-prom; podman unshare rm -rf "$P/data"
+        mkdir -p "$P/data" && podman unshare chown 65534:65534 "$P/data"
+        prom_run rb-prom 9090 "$P/data" && prom_ready 9090 || { fail "p4 prom start r$r"; return 1; }
+        warm "$DATA"
+        tstep "p4 remote write r$r" "$D/rw.load.$r" -- prom_rw_timed "$P/data" 2000 16
+    done
+    ports_check "$D/ports-rw.txt"
+    # not under the lock (hours): the machine's load is sampled in rw-settle-load.txt
+    ( while sleep 300; do echo "$(date +%T) busy $(cpu_busy)"; done ) > "$D/rw-settle-load.txt" 2>&1 9>&- &
+    local mon=$!
+    timeout "$PROM_SETTLE_TIMEOUT" env PROM_PORT=9090 "$H/prom_settle.sh" "$(date +%s)" > "$D/rw-settle.txt" 2>&1 9>&- || fail "p4 remote write did not settle in $PROM_SETTLE_TIMEOUT s (see $D/rw-settle.txt)"
+    kill "$mon" 2> /dev/null
+    podman unshare sh -c "cd $P/data && du -scb 01* | tail -1 && du -sb wal wbl chunks_head" > "$D/rw-size.txt" 2>&1
+    S=$(curl -s -m 3600 -XPOST 127.0.0.1:9090/api/v1/admin/tsdb/snapshot | jq -r .data.name)
+    [ -n "$S" ] && [ "$S" != null ] && podman unshare du -sb "$P/data/snapshots/$S" >> "$D/rw-size.txt" && podman unshare rm -rf "$P/data/snapshots/$S"
+    untimed "$D/check-rw.txt" env PROM_PORT=9090 python3 -I "$H/check.py" prom 200
+    qsuite prom rw "$D" http 127.0.0.1 9090 ""
+    crm rb-prom; podman unshare rm -rf "$P/data"
+    # (a') more shards and larger requests: load time only, fresh directories
+    for c in "2000 50" "20000 16" "20000 50"; do
+        for r in $(seq "$REPS"); do
+            crm rb-prom-sweep; podman unshare rm -rf "$P/data-sweep"
+            mkdir -p "$P/data-sweep" && podman unshare chown 65534:65534 "$P/data-sweep"
+            prom_run rb-prom-sweep 9090 "$P/data-sweep" && prom_ready 9090 || { fail "p4 sweep start"; continue; }
+            warm "$DATA"
+            tstep "p4 sweep $c r$r" "$D/sweep.${c// /x}.$r" -- prom_rw_timed "$P/data-sweep" $c
+        done
+    done
+    crm rb-prom-sweep
+    cd "$OUT" || true
+    rmdata "$P"
+    runstats "$D"
+}
+phase4() { reset_quiet; p4 || fail "p4 returned an error"; }
+
+# ================================================================== phase 5: 100 billion rows, tsdb and ClickHouse
+ch_big_load() { # 8 streams of 1250 series, RowBinary from scale-bench export; syncfs; merges settled
+    local s e f i
+    s=$(date +%s.%N)
+    for i in 0 1 2 3 4 5 6 7; do
+        ( "$T/scale-bench" export --series "$P5_SERIES" --points "$P5_POINTS" --from $((i * P5_SERIES / 8)) --to $(((i + 1) * P5_SERIES / 8)) |
+            "$CLICKHOUSE" client --host 127.0.0.1 -q "INSERT INTO scale.big FORMAT RowBinary" ) &
+    done
+    local bad=0
+    for i in 0 1 2 3 4 5 6 7; do wait -n || bad=1; done
+    e=$(date +%s.%N)
+    sync -f /var/tmp
+    f=$(date +%s.%N)
+    echo "insert (8 streams) $(echo "$e - $s" | bc) s, syncfs $(echo "$f - $e" | bc) s, failed streams: $bad"
+    local last prev cur
+    last=$(date +%s); prev=""
+    while :; do
+        cur=$(CHC -q "SELECT (SELECT count() FROM system.parts WHERE database='scale' AND active), (SELECT count() FROM system.merges WHERE database='scale')")
+        [ "$cur" != "$prev" ] && { last=$(date +%s); prev=$cur; }
+        [ $(($(date +%s) - last)) -ge 60 ] && break
+        sleep 1
+    done
+    echo "merges settled $(echo "$last - $e" | bc) s after the insert returned (parts, merges: $prev)"
+    CHC -q "SELECT count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'scale' AND table = 'big' AND active"
+    return $bad
+}
+p5() {
+    local D=$OUT/p5 W=/var/tmp/big C=/var/tmp/ch-big r avail
+    mkdir -p "$D"
+    avail=$(df -B1G --output=avail /var/tmp | tail -1 | tr -d ' ')
+    echo "free on /var/tmp: $avail GB" > "$D/disk.txt"
+    [ "$avail" -ge "$P5_MINFREE" ] || { fail "p5: only $avail GB free on /var/tmp, need about $P5_MINFREE (tsdb 116 GB + ClickHouse 170 GB + margin)"; return 1; }
+    rmdata "$W" "$C"
+    tstep "p5 tsdb load" "$D/tsdb.load.txt" -- "$T/scale-bench" load --dir "$W" --series "$P5_SERIES" --points "$P5_POINTS" --threads 8
+    du -sb --exclude='retired_*' "$W" > "$D/tsdb.du.txt"
+    mkdir -p "$D/sql"
+    "$T/scale-bench" query --dir "$W" --series "$P5_SERIES" --threads 32 --sql "$D/sql" > "$D/warm.tsdb-emb" 2>&1 9>&-  # warm-up, writes the SQL
+    reps tsdb-emb "$D" -- "$T/scale-bench" query --dir "$W" --series "$P5_SERIES" --threads 32
+    tsdbd_start "$W" || return 1
+    "$T/scale-bench" query --port "$TSDB_PORT" --series "$P5_SERIES" --threads 32 > "$D/warm.tsdbd" 2>&1 9>&-
+    reps tsdbd "$D" -- "$T/scale-bench" query --port "$TSDB_PORT" --series "$P5_SERIES" --threads 32
+    tsdbd_stop
+    # ClickHouse on the same file system
+    crm rb-ch
+    mkdir -p "$C/data"
+    ch_start "$C" || return 1
+    ports_check "$D/ports.txt"
+    CHC -n -q "CREATE DATABASE scale; CREATE TABLE scale.big (series UInt32, ts DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)), value Float32 CODEC(Delta, ZSTD(1))) ENGINE = MergeTree PARTITION BY toDate(ts) ORDER BY (series, ts)" || { fail "p5 ch create"; return 1; }
+    tstep "p5 ch load" "$D/ch.load.txt" -- ch_big_load
+    "$SRC/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE" > "$D/warm.ch" 2>&1 9>&-
+    reps ch "$D" -- "$SRC/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE"
+    CHC -q "SELECT count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'scale' AND active" > "$D/ch.size-end.txt"
+    CHC -q "SELECT name, data_compressed_bytes, data_uncompressed_bytes FROM system.columns WHERE database = 'scale' AND table = 'big'" > "$D/ch.columns.txt"
+    crm rb-ch
+    runstats "$D"
+    rmdata "$W" "$C"
+    cp /var/tmp/big.log "$D/tsdbd.log" 2> /dev/null
+    rm -f /var/tmp/big.log /var/tmp/big.pf
+}
+phase5() { reset_quiet; p5 || fail "p5 returned an error"; }
+
+# ================================================================== main
+machine() {
+    {
+        date; uname -a; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|MHz'; free -g | head -2; df -h /var/tmp
+        echo "governor: $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort | uniq -c | tr '\n' ' ')"
+        echo "tree: $SRC $(git -C "$SRC" rev-parse HEAD) (scratch changes: $(git -C "$SRC" diff --stat | tail -1))"
+        podman --version
+        for i in $CH_IMG $TS_IMG $TSHA_IMG $QDB_IMG $I2_IMG $I3_IMG "$PROM_IMG"; do echo "$i $(podman image inspect --format '{{.Digest}} {{.Created}}' "$i" 2> /dev/null)"; done
+        echo "duckdb: $DBCMP/duckdb/v1.5.6 (libduckdb-linux-amd64.zip sha256 b845005f5132a7d8180057c35e14a7626632258782f871a90861b19c1c03841b)"
+        echo "chdb: chdb-core v26.9.0 (2026-09-28) linux-x86_64-libchdb.tar.gz sha256 c6398bcc71dc58d12fb81548540aacd5d8248830ec81cec537f51c114670543b"
+        echo "REPS=$REPS SECS=$SECS QUIET_MAX=$QUIET_MAX PHASES=$PHASES"
+    } > "$OUT/machine.txt" 2>&1
+}
+trap 'log "driver interrupted"; cleanup_all; exit 130' INT TERM
+machine
+log "relbench start: phases $PHASES, REPS=$REPS, SECS=$SECS, results in $OUT"
+for n in $PHASES; do
+    PH_DIR=$OUT/p$n
+    mkdir -p "$PH_DIR"
+    rm -f "$PH_DIR/FAILS"
+    log "PHASE $n START"
+    ( "phase$n" )
+    rc=$?
+    PH_DIR=$OUT/p$n
+    cleanup_all
+    # tsdbd processes this script started and a failed phase left behind (pid file, checked by command line)
+    while read -r pid what dir; do
+        [ "${pid:-0}" -gt 1 ] 2> /dev/null && kill -0 "$pid" 2> /dev/null && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "tsdbd --dir $dir " && kill -INT "$pid"
+    done 2> /dev/null < <(cat "$OUT/pids" 2> /dev/null)
+    rmdata "$DBCMP/s$n"
+    if [ "$rc" = 0 ] && [ ! -s "$PH_DIR/FAILS" ]; then
+        log "PHASE $n DONE"
+    else
+        log "PHASE $n FAILED: rc=$rc; $(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0) failures, first: $(head -3 "$PH_DIR/FAILS" 2> /dev/null | cut -c1-200 | tr '\n' ';')"
+    fi
+done
+log "relbench END"
