@@ -5,6 +5,8 @@
 # pkg-config it links libpq.so.5 by name (Debian/Ubuntu: libpq5; Fedora: libpq). loadprw, the Prometheus
 # remote write loader, likewise needs only snappy's shared library (libsnappy1v5; Fedora: snappy).
 #
+# chq (release/chq.c) is built only when CHDB names a directory holding chdb.h and libchdb.so (chdb-core).
+#
 # embq, the embedded tsdb / DuckDB driver, is built only when DUCKDB names a directory holding
 # duckdb.h and libduckdb.so from a DuckDB C library release (see README.md); the path to the
 # library is recorded in the binary, so nothing is installed.
@@ -18,10 +20,14 @@ SNAPPY  ?= $(shell pkg-config --libs snappy 2>/dev/null || echo -l:libsnappy.so.
 CLIB    := $(ROOT)/build/libtsdbclient.a
 LIB     := $(ROOT)/build/libtsdb.a
 DUCKDB  ?= /var/tmp/dbcmp/duckdb/v1.5.6/lib
+CHDB    ?= /var/tmp/dbcmp/chdb/v26.9.0/lib
 
-PROGS := $(addprefix $(OUT)/,conv loadlp loadprw qdrive tsdbq tsdbstat)
+PROGS := $(addprefix $(OUT)/,conv loadlp loadprw qdrive tsdbq tsdbstat relq relemb)
 ifneq ($(wildcard $(DUCKDB)/duckdb.h),)
 PROGS += $(OUT)/embq
+endif
+ifneq ($(wildcard $(CHDB)/chdb.h),)
+PROGS += $(OUT)/chq
 endif
 
 all: $(PROGS)
@@ -50,6 +56,16 @@ $(OUT)/tsdbstat: tsdbstat.c $(CLIB) | $(OUT)
 $(OUT)/embq: embq.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) -I$(ROOT)/include -I$(DUCKDB) -o $@ $< $(LIB) -L$(DUCKDB) -lduckdb -Wl,-rpath,$(abspath $(DUCKDB)) \
 		-lzstd -lpthread -lm
+
+# release/: LTTB and TWA for tsdbd (relq) and embedded tsdb (relemb); chDB's counterpart of embq (chq)
+$(OUT)/relq: release/relq.c $(CLIB) | $(OUT)
+	$(CC) $(CFLAGS) -I$(ROOT)/client -I$(ROOT)/include -o $@ $< $(CLIB) -lzstd -lpthread -lm
+
+$(OUT)/relemb: release/relq.c $(LIB) | $(OUT)
+	$(CC) $(CFLAGS) -DEMBEDDED -I$(ROOT)/include -o $@ $< $(LIB) -lzstd -lpthread -lm
+
+$(OUT)/chq: release/chq.c | $(OUT)
+	$(CC) $(CFLAGS) -I$(CHDB) -o $@ $< -L$(CHDB) -lchdb -Wl,-rpath,$(abspath $(CHDB)) -lpthread -lm
 
 $(CLIB) $(LIB):
 	$(MAKE) -C $(ROOT) $(patsubst $(ROOT)/%,%,$@)

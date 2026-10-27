@@ -1,36 +1,15 @@
 #!/bin/bash
-# Release benchmark driver for tsdb 0.9.0 (main f26b5ed, tree /var/tmp/rb-src): the full comparison of
-# bench/dbcmp/README.md plus the release additions, unattended, in phases. Start with
-#   bgrun.sh relbench bash run.sh            (PHASES="1 2" REPS=5 SECS=15 override)
+# Release comparison driver: the full comparison of bench/dbcmp/README.md plus the release additions, unattended,
+# one command per phase (run.sh with no arguments lists them), e.g.
+#   BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p2
 # Every phase logs "PHASE n DONE" or "PHASE n FAILED: why" in results/driver.log; a failed phase does not stop the
 # later ones. Every timing step runs under flock -x BENCH.lock, after the governor check (performance) and the idle
 # check (busy CPUs < 1.5 over 2 s, from /proc/stat); steps.log has one line per step (label, rc, seconds, busy).
 # Raw output of every run is kept under results/p<n>/; <name>.<run> files are summarized by runstats.py into
 # <name>.mean.txt (mean, sd %, min-max per number).
 set -u
-ST=/home/olav/.local/state/subagent-economy/agents/tsdb/release-bench
-TOOLS=$ST/tools
-SRC=/var/tmp/rb-src
-T=$SRC/build B=$SRC/build/dbcmp H=$SRC/bench/dbcmp
-export DBCMP=${DBCMP:-/var/tmp/dbcmp}
-export WORK=$DBCMP/work DATA=$DBCMP/input/mixed.rowbinary BIN=$B CLICKHOUSE=$DBCMP/clickhouse-bin
-export PGPASSWORD=bench
-IN=${IN:-$DBCMP/sizes/in}
-OUT=${OUT:-$ST/results}
-LOCK=/home/olav/.local/state/subagent-economy/BENCH.lock
-REPS=${REPS:-5}
-SECS=${SECS:-15}
-PHASES=${PHASES:-"1 2 3 4 5"}
-QUIET_MAX=${QUIET_MAX:-600}
-CH_IMG=docker.io/clickhouse/clickhouse-server:26.8.2.7
-TS_IMG=docker.io/timescale/timescaledb:2.31.0-pg17
-TSHA_IMG=docker.io/timescale/timescaledb-ha:pg17.11-ts2.31.0
-QDB_IMG=docker.io/questdb/questdb:10.1.0
-I2_IMG=docker.io/library/influxdb:2.7.12
-I3_IMG=docker.io/library/influxdb:3.12.1-core
-PROM_IMG=docker.io/prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
-DS_KINDS="hdd_temp cpu_temp tank_bar tank_psi vibration flow_rate flow_total random"
-DS_HYD="hyd_PS1 hyd_PS2 hyd_PS3 hyd_PS4 hyd_PS5 hyd_PS6 hyd_EPS1 hyd_FS1 hyd_FS2 hyd_TS1 hyd_TS2 hyd_TS3 hyd_TS4 hyd_VS1 hyd_CE hyd_CP hyd_SE hyd_PS1_psi hyd_PS2_psi hyd_PS3_psi hyd_PS4_psi hyd_PS5_psi hyd_PS6_psi"
+. "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+TOOLS=$RDIR
 DSLIST=${DSLIST:-"$DS_KINDS $DS_HYD"}
 P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb ts i2 i3 prom"}
 P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 ts i2 i3"}
@@ -298,8 +277,8 @@ chsuite() { # PREFIX DIR TABLE-SYS(ch): ch_bench.sh with REPS runs per measureme
 tsdbsuite() { # PREFIX DIR CLASS-THREADS("1 32"): tsdbq qps classes against $TSDB_PORT
     local P=$1 D=$2 ths=$3 c t
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
-        "$B/tsdbq" qps "$WORK/spec.tsv" "$c" 1 2 > "$D/warm.$P.$c" 2>&1 9>&-
-        for t in $ths; do reps "$P.$c.c$t" "$D" -- "$B/tsdbq" qps "$WORK/spec.tsv" "$c" "$t" "$SECS"; done
+        "$TB/tsdbq" qps "$WORK/spec.tsv" "$c" 1 2 > "$D/warm.$P.$c" 2>&1 9>&-
+        for t in $ths; do reps "$P.$c.c$t" "$D" -- "$TB/tsdbq" qps "$WORK/spec.tsv" "$c" "$t" "$SECS"; done
     done
 }
 REL() { python3 -I "$TOOLS/rel.py" "$@"; }
@@ -313,8 +292,8 @@ p1_tsdb() {
     for ds in $DSLIST; do
         tsdbd_start "$W/$ds" || continue
         f=$D/$ds.txt
-        { "$T/tsdbc-bench" load "$IN/$ds.rowbinary" --conns 1 --port "$TSDB_PORT" && "$B/tsdbstat" settle &&
-            du -sb --exclude='retired_*' "$W/$ds" && "$B/tsdbstat" optimize && sleep 1 && du -sb --exclude='retired_*' "$W/$ds"; } > "$f" 2>&1 9>&- ||
+        { "$T/tsdbc-bench" load "$IN/$ds.rowbinary" --conns 1 --port "$TSDB_PORT" && "$TB/tsdbstat" settle &&
+            du -sb --exclude='retired_*' "$W/$ds" && "$TB/tsdbstat" optimize && sleep 1 && du -sb --exclude='retired_*' "$W/$ds"; } > "$f" 2>&1 9>&- ||
             fail "p1 tsdb $ds (see $f)"
         tsdbd_stop
         rows=$(awk '/^optimized:/ {for (i = 1; i <= NF; i++) if ($i == "rows") print $(i + 1)}' "$f")
@@ -372,7 +351,7 @@ p1_duck() {
     printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/duckdb.tsv"
     for ds in $DSLIST; do
         f=$D/$ds.txt; rm -f "$W/$ds.duckdb" "$W/$ds.duckdb.wal"
-        "$B/embq" duckdb load "$W/$ds.duckdb" "$IN/$ds.rowbinary" 1 > "$f" 2>&1 9>&- || { fail "p1 duckdb $ds (see $f)"; continue; }
+        "$TB/embq" duckdb load "$W/$ds.duckdb" "$IN/$ds.rowbinary" 1 > "$f" 2>&1 9>&- || { fail "p1 duckdb $ds (see $f)"; continue; }
         awk -v ds="$ds" '/checkpoint:/ {for (i = 1; i <= NF; i++) { if ($i == "file") fb = $(i + 1); if ($i == "WAL") wb = $(i + 1) }}
             /load:/ {for (i = 1; i <= NF; i++) if ($i == "rows") r = $(i - 1)}
             END {printf "%s\t%s\t%d\tfile after CHECKPOINT %s + WAL %s\n", ds, r, fb + wb, fb, wb}' "$f" >> "$OUT/p1/duckdb.tsv"
@@ -508,9 +487,12 @@ phase1() {
     reset_quiet
     local s
     for s in $P1_SYSTEMS; do
+        done_mark "$OUT/p1/$s.done" && { log "p1 $s already done"; continue; }
         log "p1 $s start"
+        local nf=$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)
         "p1_$s" || fail "p1 $s returned an error"
         cleanup_all
+        [ "$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)" = "$nf" ] && date > "$OUT/p1/$s.done"
         log "p1 $s end"
     done
     python3 -I "$TOOLS/sizes_summary.py" "$OUT/p1" > "$OUT/p1/sizes.md" 2>&1 || fail "sizes_summary"
@@ -524,17 +506,17 @@ p2_tsdb() {
         rmdata "$W"; mkdir -p "$W"
         tsdbd_start "$W/db" || return 1
         warm "$DATA"
-        tstep "p2 tsdb load r$r" "$D/load.$r" -- bash -c "'$T/tsdbc-bench' load '$DATA' --conns 4 --port $TSDB_PORT && sync -f '$DBCMP' && '$B/tsdbstat' settle && du -sb --exclude='retired_*' '$W/db'"
+        tstep "p2 tsdb load r$r" "$D/load.$r" -- bash -c "'$T/tsdbc-bench' load '$DATA' --conns 4 --port $TSDB_PORT && sync -f '$DBCMP' && '$TB/tsdbstat' settle && du -sb --exclude='retired_*' '$W/db'"
         [ "$r" -lt "$REPS" ] && tsdbd_stop
     done
     ports_check "$D/ports.txt"
     cd "$WORK" || return 1
-    untimed "$D/ref-windows.log" sh -c "'$B/tsdbq' dump spec.tsv 200 > ref/windows.jsonl"
-    untimed "$D/ref-full.log" sh -c "'$B/tsdbq' full 1 1 dump 2> ref/full.jsonl"
+    untimed "$D/ref-windows.log" sh -c "'$TB/tsdbq' dump spec.tsv 200 > ref/windows.jsonl"
+    untimed "$D/ref-full.log" sh -c "'$TB/tsdbq' full 1 1 dump 2> ref/full.jsonl"
     untimed "$D/ref-lttb.log" "$B/relq" lttb 1 1 ref/lttb.jsonl
     untimed "$D/ref-twa.log" "$B/relq" twa 1 1 ref/twa.jsonl
-    tstep "p2 tsdb full c1" "$D/full.c1.txt" -- "$B/tsdbq" full 1 "$REPS"
-    tstep "p2 tsdb full c16" "$D/full.c16.txt" -- "$B/tsdbq" full 16 "$REPS"
+    tstep "p2 tsdb full c1" "$D/full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
+    tstep "p2 tsdb full c16" "$D/full.c16.txt" -- "$TB/tsdbq" full 16 "$REPS"
     tstep "p2 tsdb lttb c1" "$D/lttb.c1.txt" -- "$B/relq" lttb 1 "$REPS"
     tstep "p2 tsdb lttb c16" "$D/lttb.c16.txt" -- "$B/relq" lttb 16 "$REPS"
     tstep "p2 tsdb twa c1" "$D/twa.c1.txt" -- "$B/relq" twa 1 "$REPS"
@@ -543,8 +525,8 @@ p2_tsdb() {
     tstep "p2 tsdbc-bench query c1" "$D/tsdbc-bench.c1.txt" -- "$T/tsdbc-bench" query --conns 1 --seconds 5 --port "$TSDB_PORT"
     tstep "p2 tsdbc-bench query c32" "$D/tsdbc-bench.c32.txt" -- "$T/tsdbc-bench" query --conns 32 --seconds 5 --port "$TSDB_PORT"
     # partitions merged (README row "tsdbd, 1 connection, partitions merged")
-    tstep "p2 tsdb optimize" "$D/optimize.txt" -- bash -c "'$B/tsdbstat' optimize && du -sb --exclude='retired_*' '$W/db'"
-    tstep "p2 tsdb merged full c1" "$D/merged.full.c1.txt" -- "$B/tsdbq" full 1 "$REPS"
+    tstep "p2 tsdb optimize" "$D/optimize.txt" -- bash -c "'$TB/tsdbstat' optimize && du -sb --exclude='retired_*' '$W/db'"
+    tstep "p2 tsdb merged full c1" "$D/merged.full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
     tsdbsuite merged "$D" "1"
     tsdbd_stop
     cd "$OUT" || true
@@ -755,9 +737,12 @@ phase2() {
     local s
     for s in $P2_SYSTEMS; do
         reset_quiet
+        done_mark "$OUT/p2/$s.done" && { log "p2 $s already done"; continue; }
         log "p2 $s start"
+        local nf=$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)
         case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
         cleanup_all
+        [ "$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)" = "$nf" ] && date > "$OUT/p2/$s.done"
         log "p2 $s end"
     done
 }
@@ -770,9 +755,9 @@ p3() {
     warm "$DATA"
     for r in $(seq "$REPS"); do
         rm -rf "$E/tsdb"; sync
-        tstep "p3 tsdb load r$r" "$D/tsdb.load.$r" -- "$B/embq" tsdb load "$E/tsdb" "$DATA" 4
+        tstep "p3 tsdb load r$r" "$D/tsdb.load.$r" -- "$TB/embq" tsdb load "$E/tsdb" "$DATA" 4
         rm -f "$E/t.duckdb" "$E/t.duckdb.wal"; sync
-        tstep "p3 duckdb load r$r" "$D/duckdb.load.$r" -- "$B/embq" duckdb load "$E/t.duckdb" "$DATA" 4
+        tstep "p3 duckdb load r$r" "$D/duckdb.load.$r" -- "$TB/embq" duckdb load "$E/t.duckdb" "$DATA" 4
         rm -rf "$E/chdb"; sync
         tstep "p3 chdb load r$r" "$D/chdb.load.$r" -- "$B/chq" load "$E/chdb" "$DATA" 1
         rm -rf "$E/chdb-lz4"; sync
@@ -782,16 +767,16 @@ p3() {
     cd "$WORK" || return 1
     mkdir -p dump
     local RW=ref/windows.jsonl RF=ref/full.jsonl RL=ref/lttb.jsonl RT=ref/twa.jsonl
-    untimed "$D/dump-tsdb.log" sh -c "'$B/embq' tsdb dump '$E/tsdb' spec.tsv > dump/tsdb-windows.jsonl"
-    untimed "$D/dump-tsdb-full.log" "$B/embq" tsdb full "$E/tsdb" 1 1 dump/tsdb-full.jsonl
+    untimed "$D/dump-tsdb.log" sh -c "'$TB/embq' tsdb dump '$E/tsdb' spec.tsv > dump/tsdb-windows.jsonl"
+    untimed "$D/dump-tsdb-full.log" "$TB/embq" tsdb full "$E/tsdb" 1 1 dump/tsdb-full.jsonl
     untimed "$D/ref-lttb-emb.log" env TSDB_DIR="$E/tsdb" "$B/relemb" lttb 1 1 dump/tsdb-lttb.jsonl
     untimed "$D/ref-twa-emb.log" env TSDB_DIR="$E/tsdb" "$B/relemb" twa 1 1 dump/tsdb-twa.jsonl
     if [ ! -s "$RW" ] || [ ! -s "$RT" ]; then  # phase 2 gave no tsdbd reference: the embedded tsdb answers stand in
         log "p3: no tsdbd reference in ref/; checking against embedded tsdb's answers"
         RW=dump/tsdb-windows.jsonl RF=dump/tsdb-full.jsonl RL=dump/tsdb-lttb.jsonl RT=dump/tsdb-twa.jsonl
     fi
-    untimed "$D/dump-duckdb.log" sh -c "'$B/embq' duckdb dump '$E/t.duckdb' spec.tsv > dump/duckdb-windows.jsonl"
-    untimed "$D/dump-duckdb-full.log" "$B/embq" duckdb full "$E/t.duckdb" 1 1 dump/duckdb-full.jsonl
+    untimed "$D/dump-duckdb.log" sh -c "'$TB/embq' duckdb dump '$E/t.duckdb' spec.tsv > dump/duckdb-windows.jsonl"
+    untimed "$D/dump-duckdb-full.log" "$TB/embq" duckdb full "$E/t.duckdb" 1 1 dump/duckdb-full.jsonl
     for e in chdb chdb-lz4; do
         untimed "$D/dump-$e.log" sh -c "'$B/chq' dump '$E/$e' spec.tsv > dump/$e-windows.jsonl"
         untimed "$D/dump-$e-full.log" "$B/chq" full "$E/$e" 1 "dump/$e-full.jsonl"
@@ -805,18 +790,18 @@ p3() {
     } > "$D/check.txt" 2>&1
     grep -E 'mismatches [1-9]|MISMATCH|Traceback|Error' "$D/check.txt" > /dev/null && fail "p3 answer check found mismatches (see $D/check.txt)"
     # whole range
-    tstep "p3 tsdb full t1" "$D/tsdb.full.t1.txt" -- "$B/embq" tsdb full "$E/tsdb" "$REPS" 1
-    tstep "p3 tsdb full t32" "$D/tsdb.full.t32.txt" -- "$B/embq" tsdb full "$E/tsdb" "$REPS" 32
-    tstep "p3 duckdb full" "$D/duckdb.full.txt" -- "$B/embq" duckdb full "$E/t.duckdb" "$REPS" 1
+    tstep "p3 tsdb full t1" "$D/tsdb.full.t1.txt" -- "$TB/embq" tsdb full "$E/tsdb" "$REPS" 1
+    tstep "p3 tsdb full t32" "$D/tsdb.full.t32.txt" -- "$TB/embq" tsdb full "$E/tsdb" "$REPS" 32
+    tstep "p3 duckdb full" "$D/duckdb.full.txt" -- "$TB/embq" duckdb full "$E/t.duckdb" "$REPS" 1
     tstep "p3 chdb full" "$D/chdb.full.txt" -- "$B/chq" full "$E/chdb" "$REPS" /dev/null
     tstep "p3 chdb-lz4 full" "$D/chdb-lz4.full.txt" -- "$B/chq" full "$E/chdb-lz4" "$REPS" /dev/null
     # random windows and points
     local c t
     for c in raw agg1d agg7d point; do
-        "$B/embq" tsdb qps "$E/tsdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
-        for t in 1 32; do reps "tsdb.$c.t$t" "$D" -- "$B/embq" tsdb qps "$E/tsdb" spec.tsv "$c" "$t" "$SECS"; done
-        "$B/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
-        for t in 1 32; do reps "duckdb.$c.t$t" "$D" -- "$B/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" "$t" "$SECS"; done
+        "$TB/embq" tsdb qps "$E/tsdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
+        for t in 1 32; do reps "tsdb.$c.t$t" "$D" -- "$TB/embq" tsdb qps "$E/tsdb" spec.tsv "$c" "$t" "$SECS"; done
+        "$TB/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
+        for t in 1 32; do reps "duckdb.$c.t$t" "$D" -- "$TB/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" "$t" "$SECS"; done
         for e in chdb chdb-lz4; do
             "$B/chq" qps "$E/$e" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
             for t in 1 32; do reps "$e.$c.t$t" "$D" -- "$B/chq" qps "$E/$e" spec.tsv "$c" "$t" "$SECS"; done
@@ -827,7 +812,7 @@ p3() {
     tstep "p3 tsdb lttb t32" "$D/tsdb.lttb.t32.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" lttb 32 "$REPS"
     tstep "p3 tsdb twa t1" "$D/tsdb.twa.t1.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" twa 1 "$REPS"
     tstep "p3 tsdb twa t32" "$D/tsdb.twa.t32.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" twa 32 "$REPS"
-    tstep "p3 duckdb twa" "$D/duckdb.twa.txt" -- "$B/embq" duckdb sqlt "$E/t.duckdb" "$REPS" dump/duckdb-twa.tsv "$(REL sql duck twa)"
+    tstep "p3 duckdb twa" "$D/duckdb.twa.txt" -- "$TB/embq" duckdb sqlt "$E/t.duckdb" "$REPS" dump/duckdb-twa.tsv "$(REL sql duck twa)"
     for e in chdb chdb-lz4; do
         tstep "p3 $e lttb" "$D/$e.lttb.txt" -- "$B/chq" sqlt "$E/$e" "$REPS" "dump/$e-lttb.tsv" "$(REL sql chdb lttb)"
         tstep "p3 $e twa" "$D/$e.twa.txt" -- "$B/chq" sqlt "$E/$e" "$REPS" "dump/$e-twa.tsv" "$(REL sql chdb twa)"
@@ -963,8 +948,8 @@ p5() {
     ports_check "$D/ports.txt"
     CHC -n -q "CREATE DATABASE scale; CREATE TABLE scale.big (series UInt32, ts DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)), value Float32 CODEC(Delta, ZSTD(1))) ENGINE = MergeTree PARTITION BY toDate(ts) ORDER BY (series, ts)" || { fail "p5 ch create"; return 1; }
     tstep "p5 ch load" "$D/ch.load.txt" -- ch_big_load
-    "$SRC/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE" > "$D/warm.ch" 2>&1 9>&-
-    reps ch "$D" -- "$SRC/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE"
+    "$ROOT/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE" > "$D/warm.ch" 2>&1 9>&-
+    reps ch "$D" -- "$ROOT/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE"
     CHC -q "SELECT count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'scale' AND active" > "$D/ch.size-end.txt"
     CHC -q "SELECT name, data_compressed_bytes, data_uncompressed_bytes FROM system.columns WHERE database = 'scale' AND table = 'big'" > "$D/ch.columns.txt"
     crm rb-ch
@@ -980,19 +965,33 @@ machine() {
     {
         date; uname -a; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|MHz'; free -g | head -2; df -h /var/tmp
         echo "governor: $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort | uniq -c | tr '\n' ' ')"
-        echo "tree: $SRC $(git -C "$SRC" rev-parse HEAD) (scratch changes: $(git -C "$SRC" diff --stat | tail -1))"
+        echo "tsdb tree: $TSDB_TREE $(git -C "$TSDB_TREE" rev-parse HEAD) ($(git -C "$TSDB_TREE" diff --stat | tail -1))"
+        echo "harness: $ROOT $(git -C "$ROOT" rev-parse HEAD)"
         podman --version
         for i in $CH_IMG $TS_IMG $TSHA_IMG $QDB_IMG $I2_IMG $I3_IMG "$PROM_IMG"; do echo "$i $(podman image inspect --format '{{.Digest}} {{.Created}}' "$i" 2> /dev/null)"; done
-        echo "duckdb: $DBCMP/duckdb/v1.5.6 (libduckdb-linux-amd64.zip sha256 b845005f5132a7d8180057c35e14a7626632258782f871a90861b19c1c03841b)"
-        echo "chdb: chdb-core v26.9.0 (2026-09-28) linux-x86_64-libchdb.tar.gz sha256 c6398bcc71dc58d12fb81548540aacd5d8248830ec81cec537f51c114670543b"
-        echo "REPS=$REPS SECS=$SECS QUIET_MAX=$QUIET_MAX PHASES=$PHASES"
+        echo "duckdb: $DUCKDB_DIR (libduckdb-linux-amd64.zip sha256 $DUCKDB_SHA)"
+        echo "chdb: $CHDB_DIR (chdb-core v26.9.0 of 2026-09-28, linux-x86_64-libchdb.tar.gz sha256 $CHDB_SHA)"
+        echo "REPS=$REPS SECS=$SECS QUIET_MAX=$QUIET_MAX"
     } > "$OUT/machine.txt" 2>&1
 }
-trap 'log "driver interrupted"; cleanup_all; exit 130' INT TERM
-machine
-log "relbench start: phases $PHASES, REPS=$REPS, SECS=$SECS, results in $OUT"
-for n in $PHASES; do
+usage() {
+    cat <<'U'
+usage: run.sh PHASE...      (env.sh has the paths; REPS, SECS, FORCE=1, P1_SYSTEMS, P2_SYSTEMS override)
+  prep       inputs (not timed): mixed.*, spec.tsv, batches.tsv, per-sensor sets; under flock -s
+  p1         sizes per kind of sensor           p2   the 100 M-row table, every server system
+  p3         embedded (tsdb, DuckDB, chDB)      p4   Prometheus (backfill, remote write)
+  p5         100 billion rows (only when named; not in "all")
+  all        prep p1 p2 p3 p4
+  smoke      every system end to end on tiny data, every check must pass (DBCMP=/var/tmp/dbcmp-smoke)
+  checktest  the answer checker against a crafted data set and mutated answers
+A phase or system with a done marker ($OUT/p<n>/<system>.done, $OUT/p<n>.done) is skipped; FORCE=1 runs it again.
+U
+}
+done_mark() { [ "${FORCE:-0}" != 1 ] && [ -e "$1" ]; }
+runphase() { # N: one phase in a subshell, FAILS per phase, done marker when it had no failures
+    local n=$1 rc
     PH_DIR=$OUT/p$n
+    if done_mark "$OUT/p$n.done"; then log "PHASE $n already done ($OUT/p$n.done); FORCE=1 runs it again"; return 0; fi
     mkdir -p "$PH_DIR"
     rm -f "$PH_DIR/FAILS"
     log "PHASE $n START"
@@ -1006,9 +1005,30 @@ for n in $PHASES; do
     done 2> /dev/null < <(cat "$OUT/pids" 2> /dev/null)
     rmdata "$DBCMP/s$n"
     if [ "$rc" = 0 ] && [ ! -s "$PH_DIR/FAILS" ]; then
-        log "PHASE $n DONE"
+        log "PHASE $n DONE"; date > "$OUT/p$n.done"
     else
         log "PHASE $n FAILED: rc=$rc; $(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0) failures, first: $(head -3 "$PH_DIR/FAILS" 2> /dev/null | cut -c1-200 | tr '\n' ';')"
+        return 1
     fi
+}
+[ $# -gt 0 ] || { usage; exit 2; }
+trap 'log "driver interrupted"; cleanup_all; exit 130' INT TERM
+machine
+log "run.sh $* start: REPS=$REPS, SECS=$SECS, results in $OUT"
+RC=0
+for a in "$@"; do
+    case $a in
+        all) set -- prep p1 p2 p3 p4 ;;
+    esac
 done
-log "relbench END"
+for a in "$@"; do
+    case $a in
+        prep) flock -s "$LOCK" "$RDIR/prep.sh" > "$OUT/prep.log" 2>&1 || { log "prep failed (see $OUT/prep.log)"; RC=1; } ;;
+        p[1-5]) runphase "${a#p}" || RC=1 ;;
+        smoke) phase_smoke || RC=1 ;;
+        checktest) phase_checktest || RC=1 ;;
+        *) usage; exit 2 ;;
+    esac
+done
+log "run.sh END rc=$RC"
+exit $RC
