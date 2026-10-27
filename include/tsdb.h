@@ -529,8 +529,10 @@ int tsdb_query_twa_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end,
  * Calls to fn: VALUES and LTTB send rows (ts, values in the API widths, valid as in tsdb_values) in one or more
  * calls with last = 0 and then one with n = 0 and last = 1, or all of them in one call with last = 1; the other
  * kinds send one call with `buckets` pointing at n tsdb_bucket, tsdb_spread_bucket or tsdb_twa_bucket. status is
- * the series' error (n = 0, last = 1): one series failing does not end the call. An unknown id has status 0 and
- * no rows. The pointers are valid during the call only. fn returning nonzero ends the call (TSDB_ERR_STOPPED).
+ * the series' error (n = 0, last = 1): one series failing does not end the call. Rows sent for a series before
+ * its error status are not an answer: drop them (whether any come first depends on timing). An unknown id has
+ * status 0 and no rows. The pointers are valid during the call only. fn returning nonzero ends the call
+ * (TSDB_ERR_STOPPED).
  * Every series of one call reads the same instant of each volume: an insert is seen by all of them or by none
  * (volumes are written independently, so this holds per volume).
  * Returns 0, TSDB_ERR_STOPPED (fn or mo->cancelled), TSDB_ERR_TOO_MANY_BUCKETS (more than max_rows rows or buckets

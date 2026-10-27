@@ -821,6 +821,21 @@ static void bounds(const char *base)
     tsdb_free(one);
     CHECK(sc.rows == n0 + 8 * nw);
     CHECK(atomic_load(&b.deferred) >= 1);
+
+    /* so does LTTB's buffer of two buckets: 3 points of 20,000 rows buffer 2 x 20,000 points (640 KiB) */
+    multi_defer_bytes = 64 << 10;
+    tsdb_multi_query ql = {.kind = TSDB_MULTI_LTTB, .start = INT64_MIN, .end = INT64_MAX, .threshold = 3};
+    for (int i = 0; i < 9; i++)
+        list[i] = good[i % 8];
+    memset(&b, 0, sizeof b);
+    memset(&sc, 0, sizeof sc);
+    OK(tsdb_query_multi(db, &ql, list, 9, &mo, slow_head, &sc));
+    multi_defer_bytes = sb;
+    for (int i = 0; i < 9; i++)
+        CHECK(sc.status[i] == 0);
+    CHECK(sc.rows == 9 * 3);
+    fprintf(stderr, "  LTTB ahead: %ld deferred\n", atomic_load(&b.deferred));
+    CHECK(atomic_load(&b.deferred) >= 1);
     OK(tsdb_close(db));
     free(ts);
     free(v);

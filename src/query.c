@@ -2348,6 +2348,10 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
          * last mean) holds n - lttb_start(nb) <= 2 */
         uint64_t per = (r->n - 2) / r->nb + 2;
         r->buffered = per <= lttb_buffer_bytes / 32;
+        if (r->buffered && !qbudget_ok(per * 32)) {
+            rc = TSDB_ERR_DEFER; /* a multi-series task ahead of the head: run it at its turn */
+            goto out;
+        }
         if (r->buffered) {
             r->cur.ts = malloc(per * sizeof(int64_t));
             r->cur.v = malloc(per * sizeof(uint64_t));

@@ -8,8 +8,8 @@
  *
  * A series ahead of the head must not take more memory than a small share:
  * it runs with a budget (cur_budget). Where a query would allocate more
- * (bucket accumulators over multi_defer_bytes, more than multi_defer_rows
- * collected rows, LTTB over multi_defer_rows points) it gives up with
+ * (bucket accumulators or LTTB's buffer over multi_defer_bytes, more than
+ * multi_defer_rows collected rows, LTTB over multi_defer_rows points) it gives up with
  * TSDB_ERR_DEFER, and the conductor runs it again at its turn, streaming
  * rows as a single request does. Finished results wait in a ring of W slots;
  * what they hold is charged to max_held and to the caller's budget hooks,

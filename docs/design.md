@@ -1356,8 +1356,9 @@ tsdbc_query_multi(c, &q, ids, n, NULL, on_series, ctx);     /* the same over TCP
 - **Bounded memory.** A series that runs ahead keeps its result until its
   turn, at most 64 MiB for the whole request (charged to
   `--max-request-memory` in tsdbd). One that would need more (over 65,536
-  rows or points, or 16 MiB of bucket accumulators) stops and runs again at
-  its turn, streaming like a single request. `max_rows` (tsdbd:
+  rows or points, or 16 MiB of bucket accumulators or LTTB buffers) stops
+  and runs again at its turn, streaming like a single request. The working
+  memory in flight is thus at most 16 MiB per thread running a task. `max_rows` (tsdbd:
   `--multi-max-rows`, default 268,435,456) caps the rows or buckets of a
   request; past it the request ends with `TOO_MANY_BUCKETS`.
 - **Stopping.** A callback that returns nonzero ends the call; a client
