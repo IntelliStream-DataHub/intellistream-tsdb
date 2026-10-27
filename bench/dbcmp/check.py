@@ -312,8 +312,99 @@ def dumps(ref_w, ref_f, got_w, got_f):
             print("MISMATCH full", k[0], k[1], "missing")
     print(got_w, "checked", checked, "mismatches", bad, "not in the reference", missing)
 
+def split_batch(run, sysname, line, cls):
+    """One batch request (mkbatch.py) run once; its raw answer split per member, in the form the runner's q()
+    returns for a single query: {member: raw}."""
+    by = {}
+    if sysname in ("ch", "chday", "ts", "qdb", "i3"):
+        if sysname in ("ch", "chday"): raw = run.q(line + " FORMAT TSV")
+        elif sysname == "i3": raw = run.q(run.sql(line))
+        else: raw = run.q(line)
+        for x in raw:
+            by.setdefault(int(x[0]), []).append(x[1:])
+    elif sysname == "i2ql":
+        for r in run.q(line):
+            by[int(r.get("statement_id", 0))] = [r]
+    elif sysname == "i2flux":
+        for x in run.q(line):
+            m, _, name = x["result"].partition("_")
+            by.setdefault(int(m[1:]), []).append(dict(x, result=name))
+    else:
+        raise SystemExit(f"check.py: no batch splitter for {sysname}")
+    return by
+
+def batch_main(sysname, ngroups):
+    """check.py --batch SYS [GROUPS]: the batches of q/SYS.*.bK.txt against the reference, per member: the
+    first GROUPS (5) groups of each window class and K whose members all have a reference answer, and every
+    whole-range batch. A member answered by a request of another member, missing or extra fails."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import batches, mkq
+    run = RUNNERS[sysname]()
+    gen = mkq.GEN[sysname]
+    ref = {}
+    for l in open(os.environ.get("REF_WINDOWS", "ref/windows.jsonl")):
+        x = json.loads(l); ref[x["i"]] = x
+    fref = {}
+    for l in open("ref/full.jsonl"):
+        x = json.loads(l); fref[(x["full"], x["s"])] = x["d"]
+    bad, checked = 0, {}
+    for (st, k), grps in sorted(batches.read().items()):
+        if st == "full":
+            for n in [int(x) for x in os.environ.get("FULLS", "0 3600 60").split()]:
+                lines = open(f"q/{sysname}.full{n}.b{k}.txt").read().splitlines()
+                assert len(lines) == len(grps), f"q/{sysname}.full{n}.b{k}.txt: {len(lines)} lines, {len(grps)} batches"
+                for line, g in zip(lines, grps):
+                    d = run.digest(n, line); want = [x["series"] for x in g]
+                    ok = sorted(d) == sorted(want)
+                    for s in want:
+                        e, x = fref[(n, s)], d.get(s)
+                        if x is None or not (x[0] == e[0] and x[4] == e[4] and close(x[1], e[1], 1e-9) and close(x[2], e[2], 1e-7) and close(x[3], e[3], 1e-7)):
+                            ok = False
+                    if not ok: print("MISMATCH batch", f"full{n}.b{k}", want[:3], "got", sorted(d)[:5])
+                    bad += not ok
+                    checked[f"full{n}.b{k}"] = checked.get(f"full{n}.b{k}", 0) + 1
+            continue
+        lines = open(f"q/{sysname}.{st}.b{k}.txt").read().splitlines()
+        assert len(lines) == len(grps), f"q/{sysname}.{st}.b{k}.txt: {len(lines)} lines, {len(grps)} batches"
+        done = 0
+        for line, g in zip(lines, grps):
+            if done >= ngroups: break
+            if any(x["i"] not in ref for x in g): continue
+            singles = [gen(st, x["series"], x["start"], x["end"], x["bk"]) for x in g]
+            if sysname == "prom":  # K requests on one connection: the batch is the members' requests in order
+                ok = line == " && ".join(singles)
+                answers = {m: run.rows(st, q) for m, q in enumerate(singles)}
+            else:
+                parts = split_batch(run, sysname, line, st)
+                ok = set(parts) <= set(range(len(g)))
+                answers = {}
+                for m, q in enumerate(singles):
+                    raw = parts.get(m, [])
+                    run.q = lambda *_a, _r=raw: _r  # the member's share of the answer, through the single-query parser
+                    try:
+                        answers[m] = run.rows(st, q)
+                    finally:
+                        del run.q
+            for m, x in enumerate(g):
+                r, got = ref[x["i"]], answers.get(m, [])
+                if st in ("raw", "point"):
+                    got = sorted(got)
+                    w = {"cls": st, "n": len(got), "first": got[0][0] if got else None, "last": got[-1][0] if got else None,
+                         "sum": sum(f32(v) for _, v in got), "v": got[0][1] if got else None}
+                else:
+                    w = {"cls": st, "b": [list(b) for b in sorted(got)]}
+                if not same_window(r, w):
+                    ok = False
+                    print("MISMATCH batch", f"{st}.b{k}", "member", m, "spec line", x["i"], "got", json.dumps(w)[:200], "ref", json.dumps(r)[:200])
+            bad += not ok
+            done += 1
+            checked[f"{st}.b{k}"] = checked.get(f"{st}.b{k}", 0) + 1
+    print(sysname, "batches checked", checked, "mismatches", bad)
+
 if __name__ == "__main__":
     if sysname == "--dumps":
         dumps(*sys.argv[2:6])
+    elif sysname == "--batch":
+        batch_main(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 5)
     else:
         main()

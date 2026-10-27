@@ -15,7 +15,7 @@ run() { echo "+ $*"; "$@" || { echo "FAILED: $*"; fail=1; }; }
 DATA=$DBCMP/input/mixed.rowbinary
 [ -s $DATA ] || run $T/tsdb-bench --export $DATA --series $PREP_SERIES --points $PREP_POINTS
 for f in lp ilp32 csv om; do [ -s $DBCMP/input/mixed.$f ] || $B/conv $f $DATA $DBCMP/input/mixed.$f & done; wait
-(cd $WORK && python3 -I $H/spec.py $DATA $PREP_SPEC > spec.tsv) || fail=1
+(cd $WORK && python3 -I $H/spec.py $DATA $PREP_SPEC > spec.tsv && python3 -I $H/batches.py spec.tsv > batches.tsv) || fail=1
 
 # datasets.h kinds: one series of 1 M readings each
 for k in $DS_KINDS; do

@@ -91,7 +91,7 @@ tsdbd_start() { # DIR [ARGS]: tsdbd on --port 0 --port-file; sets TPID and TSDB_
     local d=$1 p pid i
     shift
     rm -f "$d.pf"
-    "$T/tsdbd" --dir "$d" --listen 127.0.0.1 --port 0 --port-file "$d.pf" "$@" > "$d.log" 2>&1 9>&- &
+    ${TSDBD_WRAP:-} "$T/tsdbd" --dir "$d" --listen 127.0.0.1 --port 0 --port-file "$d.pf" "$@" > "$d.log" 2>&1 9>&- &
     TPID=$!
     echo "$TPID tsdbd $d" >> "$OUT/pids"
     for i in $(seq 600); do [ -s "$d.pf" ] && break; kill -0 "$TPID" 2>/dev/null || break; sleep 0.1; done
@@ -252,7 +252,7 @@ qline() { # NAME DIR FILE DRIVER-ARGS...: one query (LTTB, TWA): a warm-up, then
     reps "$N" "$D" -- "$B/qdrive" "$@" "$F" 1 100000 1
 }
 chbench1() { # CONC ITER|0 SECONDS|0 FILE: clickhouse-benchmark; raw output to stderr, one summary line to stdout
-    local args=(--host 127.0.0.1 --delay 0 -c "$1")
+    local args=(--host 127.0.0.1 --delay 0 -c "$1" ${CHB_EXTRA:-})
     [ "$2" != 0 ] && args+=(-i "$2")
     [ "$3" != 0 ] && args+=(--timelimit "$3")
     local raw
@@ -282,6 +282,106 @@ tsdbsuite() { # PREFIX DIR CLASS-THREADS("1 32"): tsdbq qps classes against $TSD
     done
 }
 REL() { python3 -I "$TOOLS/rel.py" "$@"; }
+
+# ------------------------------------------------------------------ batches (batches.tsv, mkbatch.py) and one core
+# A batch is one request of K series (K = 1, 10, 100; mkbatch.py says how each language does it). Whole-range
+# batch files are run whole, one client, REPS times: "N queries in X s" is the total time of the set; window
+# classes run their batch file at 1 and 32 clients for SECS. PC=1 is the per-core run: the server pinned to
+# PERCORE_CPU (containers by podman update --cpuset-cpus, tsdbd by taskset plus --query-threads 1), the engine's
+# own thread knob where it has one, one client pinned to PERCORE_CLIENT_CPU; names get ".pc".
+KS=${KS:-"1 10 100"}
+BCLASSES=${BCLASSES-$CLASSES_DEFAULT}
+PERCORE_CPU=${PERCORE_CPU:-2} PERCORE_CLIENT_CPU=${PERCORE_CLIENT_CPU:-3}
+pc_client() { # CMD...: on PERCORE_CLIENT_CPU in a per-core run (shell functions too: those used are exported)
+    if [ "${PC:-0}" = 1 ]; then taskset -c "$PERCORE_CLIENT_CPU" bash -c '"$@"' pc_client "$@"; else "$@"; fi
+}
+pc_pin() { # CONTAINER...: to PERCORE_CPU
+    local c
+    for c; do podman update --cpuset-cpus "$PERCORE_CPU" "$c" > /dev/null || { fail "per-core: podman update $c"; return 1; }; done
+}
+pc_unpin() { local c; for c; do podman update --cpuset-cpus "0-$(( $(nproc) - 1 ))" "$c" > /dev/null; done; }
+bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
+    local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 32}
+    shift 3
+    [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
+    for k in $KS; do
+        for n in ${FULLS-$FULLS_DEFAULT}; do
+            f=$WORK/q/$S.full$n.b$k.txt; nl=$(wc -l < "$f")
+            pc_client "$B/qdrive" "$@" "$f" 1 100000 "$nl" > "$D/warm.$P.full$n.b$k$sfx" 2>&1 9>&- || { fail "$P full$n.b$k warm-up failed (see $D/warm.$P.full$n.b$k$sfx)"; continue; }
+            reps "$P.full$n.b$k$sfx" "$D" -- pc_client "$B/qdrive" "$@" "$f" 1 100000 "$nl"
+        done
+        for c in $BCLASSES; do
+            f=$WORK/q/$S.$c.b$k.txt
+            pc_client "$B/qdrive" "$@" "$f" 1 3 > "$D/warm.$P.$c.b$k$sfx" 2>&1 9>&- || { fail "$P $c.b$k warm-up failed (see $D/warm.$P.$c.b$k$sfx)"; continue; }
+            for t in $ths; do reps "$P.$c.b$k.c$t$sfx" "$D" -- pc_client "$B/qdrive" "$@" "$f" "$t" "$SECS"; done
+        done
+    done
+}
+bcheck() { # SYS DIR: batch files and their answer check (check.py --batch); 0 when they agree with the reference
+    (cd "$WORK" && python3 -I "$H/mkbatch.py" "$1") || { fail "mkbatch $1"; return 1; }
+    untimed "$2/check-batch-$1.txt" bash -c "cd '$WORK' && python3 -I '$H/check.py' --batch '$1' 5"
+}
+# ClickHouse: clickhouse-benchmark drives, and the server's own latency comes from system.query_log, every
+# query of a run tagged with log_comment (REPORT §3: never 1/QPS alone)
+chqlog() { # TAG: server-side count, mean, median and p99 duration (ms) and mean CPU (ms) of the queries tagged TAG
+    "$CLICKHOUSE" client --host 127.0.0.1 -q "SYSTEM FLUSH LOGS" &&
+    "$CLICKHOUSE" client --host 127.0.0.1 -q "SELECT 'server', count(), 'queries, mean', round(avg(query_duration_ms), 3), 'ms, median',
+        quantile(0.5)(query_duration_ms), 'ms, p99', quantile(0.99)(query_duration_ms), 'ms, cpu',
+        round(avg(ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']) / 1000, 3), 'ms'
+        FROM system.query_log WHERE type = 'QueryFinish' AND log_comment = '$1' FORMAT TSV" | tr '\t' ' '
+}
+chbench_tag() { # TAG CONC ITER|0 SECONDS|0 FILE [SETTING...]: chbench1 with log_comment=TAG, then chqlog TAG
+    local tag=$1 c=$2 i=$3 s=$4 f=$5
+    shift 5
+    CHB_EXTRA="--log_comment=$tag $*" chbench1 "$c" "$i" "$s" "$f" && chqlog "$tag"
+}
+export -f chbench1 chbench_tag chqlog
+tsdb_has_batch() { "$TB/tsdbq" 2>&1 | grep -q -- '--batch'; }
+tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI: "full ... --batch K", CLASS.bK).
+               # A tsdbq without --batch answers K = 1 only (the 10 single series, one request each; the window
+               # classes one window per request) and the log says the rest is pending.
+    local P=$1 D=$2 k c t sfx= ths=${BTHREADS:-1 32} n
+    [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
+    tsdb_has_batch || log "  $P: tsdbq in $TB has no --batch: tsdb batches K > 1 pending (K = 1 only)"
+    for k in $KS; do
+        if [ "$k" = 1 ]; then
+            reps "$P.full.b1$sfx" "$D" -- pc_client env NSERIES="$(python3 -I "$H/batches.py" --count-full1)" "$TB/tsdbq" full 1 1
+        elif tsdb_has_batch; then
+            reps "$P.full.b$k$sfx" "$D" -- pc_client "$TB/tsdbq" full 1 1 --batch "$k"
+        else continue; fi
+        for c in $BCLASSES; do
+            n=$c; [ "$k" = 1 ] || n=$c.b$k
+            pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" 1 2 > "$D/warm.$P.$n$sfx" 2>&1 9>&-
+            for t in $ths; do reps "$P.$n.c$t$sfx" "$D" -- pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" "$t" "$SECS"; done
+        done
+    done
+}
+tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (where tsdbd has --query-threads)
+    local qt=()
+    "$T/tsdbd" --help 2>&1 | grep -q -- '--query-threads' && qt=(--query-threads 1)
+    tsdbd_stop
+    TSDBD_WRAP="taskset -c $PERCORE_CPU" tsdbd_start "$1" "${qt[@]}"
+}
+chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through clickhouse-benchmark (PC=1: max_threads=1, pinned)
+    local P=$1 D=$2 S=$3 n k c t f nl sfx= ths=${BTHREADS:-1 32} set=() r
+    [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; set=(--max_threads=1); }
+    for k in $KS; do
+        for n in ${FULLS-$FULLS_DEFAULT}; do
+            f=$WORK/q/$S.full$n.b$k.txt; nl=$(wc -l < "$f")
+            pc_client chbench1 1 "$nl" 0 "$f" > /dev/null 2> "$D/warm.$P.full$n.b$k$sfx" 9>&-
+            for r in $(seq "$REPS"); do
+                tstep "$P.full$n.b$k$sfx r$r" "$D/$P.full$n.b$k$sfx.$r" -- pc_client chbench_tag "$P.full$n.b$k$sfx.$r.$$" 1 "$nl" 0 "$f" "${set[@]}"
+            done
+        done
+        for c in $BCLASSES; do
+            f=$WORK/q/$S.$c.b$k.txt
+            pc_client chbench1 1 0 3 "$f" > /dev/null 2> "$D/warm.$P.$c.b$k$sfx" 9>&-
+            for t in $ths; do for r in $(seq "$REPS"); do
+                tstep "$P.$c.b$k.c$t$sfx r$r" "$D/$P.$c.b$k.c$t$sfx.$r" -- pc_client chbench_tag "$P.$c.b$k.c$t$sfx.$r.$$" "$t" 0 "$SECS" "$f" "${set[@]}"
+            done; done
+        done
+    done
+}
 
 # ================================================================== phase 1: sizes per kind of sensor
 p1_tsdb() {
@@ -522,12 +622,15 @@ p2_tsdb() {
     tstep "p2 tsdb twa c1" "$D/twa.c1.txt" -- "$B/relq" twa 1 "$REPS"
     tstep "p2 tsdb twa c16" "$D/twa.c16.txt" -- "$B/relq" twa 16 "$REPS"
     tsdbsuite tsdbq "$D" "1 32"
+    tsdbbsuite tsdbq "$D"
     tstep "p2 tsdbc-bench query c1" "$D/tsdbc-bench.c1.txt" -- "$T/tsdbc-bench" query --conns 1 --seconds 5 --port "$TSDB_PORT"
     tstep "p2 tsdbc-bench query c32" "$D/tsdbc-bench.c32.txt" -- "$T/tsdbc-bench" query --conns 32 --seconds 5 --port "$TSDB_PORT"
     # partitions merged (README row "tsdbd, 1 connection, partitions merged")
     tstep "p2 tsdb optimize" "$D/optimize.txt" -- bash -c "'$TB/tsdbstat' optimize && du -sb --exclude='retired_*' '$W/db'"
     tstep "p2 tsdb merged full c1" "$D/merged.full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
     tsdbsuite merged "$D" "1"
+    tsdbbsuite merged "$D"
+    tsdbd_percore "$W/db" && PC=1 tsdbbsuite merged "$D"
     tsdbd_stop
     cd "$OUT" || true
     runstats "$D"
@@ -555,6 +658,7 @@ p2_ch() {
     python3 -I "$H/mkq.py" ch
     untimed "$D/check.txt" python3 -I "$H/check.py" ch 200
     chsuite ch "$D" ch
+    bcheck ch "$D" && { chbsuite ch "$D" ch; pc_pin rb-ch && PC=1 chbsuite ch "$D" ch; pc_unpin rb-ch; }
     REL q ch lttb > "$D/q.lttb.sql"; REL q ch twa > "$D/q.twa.sql"
     untimed "$D/check-lttb.txt" REL check ch lttb ref/lttb.jsonl
     untimed "$D/check-twa.txt" REL check ch twa ref/twa.jsonl
@@ -604,6 +708,7 @@ p2_qdb() { # PARQUET(0|1)
     untimed "$D/check.txt" python3 -I "$H/check.py" qdb 200
     local PG="host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb"
     qsuite qdb "$P" "$D" pg "$PG"
+    bcheck qdb "$D" && { bsuite qdb "$P" "$D" pg "$PG"; pc_pin rb-qdb && PC=1 bsuite qdb "$P" "$D" pg "$PG"; pc_unpin rb-qdb; }
     REL q qdb twa > "$D/q.twa.sql"
     untimed "$D/check-twa.txt" REL check qdb twa ref/twa.jsonl
     qline twa "$D" "$D/q.twa.sql" pg "$PG"
@@ -652,6 +757,10 @@ p2_ts() {
     python3 -I "$H/mkq.py" ts
     untimed "$D/check.txt" python3 -I "$H/check.py" ts 200
     qsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
+    bcheck ts "$D" && {
+        bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
+        pc_pin rb-ts && PC=1 bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC -c max_parallel_workers_per_gather=0'"
+        pc_unpin rb-ts; }
     cd "$OUT" || true
     crm rb-ts; rmdata "$W"
     # LTTB and TWA need the toolkit, which is in the -ha image (same TimescaleDB 2.31.0, PostgreSQL 17.11) only:
@@ -701,6 +810,13 @@ p2_i2() {
     untimed "$D/check-i2flux.txt" python3 -I "$H/check.py" i2flux 200
     qsuite i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'
     qsuite i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
+    local x
+    for x in 0 1; do
+        bcheck i2ql "$D" && PC=$x bsuite i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'
+        bcheck i2flux "$D" && PC=$x bsuite i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
+        [ $x = 0 ] && { pc_pin rb-i2 || break; }
+    done
+    pc_unpin rb-i2
     cd "$OUT" || true
     crm rb-i2; rmdata "$W"
     runstats "$D"
@@ -726,6 +842,7 @@ p2_i3() {
     untimed "$D/check.txt" python3 -I "$H/check.py" i3 200
     CLASSES="" qsuite i3 i3 "$D" http 127.0.0.1 8181 ""
     FULLS="" qsuite i3 i3 "$D" http 127.0.0.1 8181 ""
+    bcheck i3 "$D" && { bsuite i3 i3 "$D" http 127.0.0.1 8181 ""; pc_pin rb-i3 && PC=1 bsuite i3 i3 "$D" http 127.0.0.1 8181 ""; pc_unpin rb-i3; }
     REL q i3 twa > "$D/q.twa.http"
     untimed "$D/check-twa.txt" REL check i3 twa ref/twa.jsonl
     qline twa "$D" "$D/q.twa.http" http 127.0.0.1 8181 ""

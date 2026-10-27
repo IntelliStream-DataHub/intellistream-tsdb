@@ -153,14 +153,27 @@ def step_sql(col, kind):  # the sample step of a series, as SQL (kind = series %
 
 def ch_full(n, table="cmp.t100m"):
     if n == 0:
-        return f"SELECT series, count() AS c, sum(value) AS s, min(value) AS mn, max(value) AS mx FROM {table} GROUP BY series ORDER BY series"
+        return f"SELECT series, count() AS c, sum(value) AS s, min(value) AS mn, max(value) AS mx FROM {table}{where_set('series')} GROUP BY series ORDER BY series"
     return (f"SELECT series, intDiv(toUnixTimestamp64Milli(ts), {step_sql('series', 'ch')} * {n}) AS b, count() AS c, sum(value) AS s, "
-            f"min(value) AS mn, max(value) AS mx FROM {table} GROUP BY series, b ORDER BY series, b")
+            f"min(value) AS mn, max(value) AS mx FROM {table}{where_set('series')} GROUP BY series, b ORDER BY series, b")
 
 GROUPS = {60000: [0], 1000: [1, 5, 6], 10000: [2, 3], 1: [4]}  # step -> series % 7
 
+# Whole-range queries cover the series in SET (mkbatch.py sets it to one batch of series); None means all of them.
+SET = None
+
+def sset():
+    return list(range(NSERIES)) if SET is None else SET
+
+def groups():  # GROUPS, without the steps no series of SET has
+    return {st: k for st, k in GROUPS.items() if any(x % 7 in k for x in sset())}
+
+def where_set(col, quote=False, op="WHERE"):  # "" for all series, else a filter on SET
+    if SET is None: return ""
+    return f" {op} {col} IN ({', '.join(repr(str(x)) if quote else str(x) for x in SET)})"
+
 def series_of(kinds):
-    return ", ".join(str(x) for x in range(NSERIES) if x % 7 in kinds)
+    return ", ".join(str(x) for x in sset() if x % 7 in kinds)
 
 def ts_full(n):
     if n:  # one branch per step, so each time_bucket has a constant width: a width computed per row
@@ -168,38 +181,39 @@ def ts_full(n):
         return " UNION ALL ".join(
             f"(SELECT series, time_bucket(INTERVAL '{st * n} milliseconds', ts, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS b, count(*) AS c, "
             f"sum(value::float8) AS s, min(value) AS mn, max(value) AS mx FROM t100m WHERE series IN ({series_of(k)}) GROUP BY series, b)"
-            for st, k in GROUPS.items()) + " ORDER BY series, b"
+            for st, k in groups().items()) + " ORDER BY series, b"
     return ts_full_case(n)
 
 def ts_full_case(n):  # kept for comparison; mkq writes ts_full
     if n == 0:
-        return "SELECT series, count(*) AS c, sum(value::float8) AS s, min(value) AS mn, max(value) AS mx FROM t100m GROUP BY series ORDER BY series"
+        return f"SELECT series, count(*) AS c, sum(value::float8) AS s, min(value) AS mn, max(value) AS mx FROM t100m{where_set('series')} GROUP BY series ORDER BY series"
     return (f"SELECT series, time_bucket({step_sql('series', 'pg')} * {n} * INTERVAL '1 millisecond', ts, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS b, "
             f"count(*) AS c, sum(value::float8) AS s, min(value) AS mn, max(value) AS mx FROM t100m GROUP BY series, b ORDER BY series, b")
 
 def qdb_full(n):
     if n == 0:
-        return "SELECT series, count() c, sum(cast(value AS double)) s, min(value) mn, max(value) mx FROM sensors GROUP BY series ORDER BY series"
+        return f"SELECT series, count() c, sum(cast(value AS double)) s, min(value) mn, max(value) mx FROM sensors{where_set('series', True)} GROUP BY series ORDER BY series"
     return "SELECT * FROM (" + " UNION ALL ".join(
         f"(SELECT series, ts, count() c, sum(cast(value AS double)) s, min(value) mn, max(value) mx FROM sensors "
-        f"WHERE series IN ({', '.join(repr(str(x)) for x in range(NSERIES) if x % 7 in k)}) SAMPLE BY {st * n}T)"
-        for st, k in GROUPS.items()) + ") ORDER BY series, ts"
+        f"WHERE series IN ({', '.join(repr(str(x)) for x in sset() if x % 7 in k)}) SAMPLE BY {st * n}T)"
+        for st, k in groups().items()) + ") ORDER BY series, ts"
 
 def influxql_full(n):
     if n == 0:
-        return 'SELECT count(value), sum(value), min(value), max(value) FROM sensors GROUP BY "series"'
+        w = "" if SET is None else " WHERE (" + " OR ".join(f'"series" = {chr(39)}{x}{chr(39)}' for x in SET) + ")"
+        return f'SELECT count(value), sum(value), min(value), max(value) FROM sensors{w} GROUP BY "series"'
     # GROUP BY time() needs a time range (the first jittered sample is 5 ms before 2024) and a
     # constant interval: one statement per step, all in one request
     return "; ".join(
-        f"SELECT count(value), sum(value), min(value), max(value) FROM sensors WHERE ({' OR '.join(f'{chr(34)}series{chr(34)} = {chr(39)}{x}{chr(39)}' for x in range(NSERIES) if x % 7 in k)}) "
+        f"SELECT count(value), sum(value), min(value), max(value) FROM sensors WHERE ({' OR '.join(f'{chr(34)}series{chr(34)} = {chr(39)}{x}{chr(39)}' for x in sset() if x % 7 in k)}) "
         f"AND time >= '2023-12-31T00:00:00Z' AND time < '2026-01-01T00:00:00Z' GROUP BY time({st * n}ms), \"series\" fill(none)"
-        for st, k in GROUPS.items())
+        for st, k in groups().items())
 
 def flux_full(n):  # independent pipelines again, so every aggregate is pushed down
     out = []
-    groups = {0: list(range(7))} if n == 0 else {st: k for st, k in GROUPS.items()}
-    for st, k in groups.items():
-        f = "true" if n == 0 else " or ".join(f'r.series == "{x}"' for x in range(NSERIES) if x % 7 in k)
+    gs = {0: list(range(7))} if n == 0 else groups()
+    for st, k in gs.items():
+        f = "true" if n == 0 and SET is None else " or ".join(f'r.series == "{x}"' for x in sset() if x % 7 in k)
         src = FLUX_SRC.format(a="2023-12-31T00:00:00Z", b="2026-01-01T00:00:00Z", f=f)
         for fn in ("count", "sum", "min", "max"):
             if n == 0:
@@ -210,24 +224,25 @@ def flux_full(n):  # independent pipelines again, so every aggregate is pushed d
 
 def i3_full(n):  # date_bin needs a constant stride, hence one branch per step
     if n == 0:
-        return "SELECT series, count(value) AS c, sum(value) AS s, min(value) AS mn, max(value) AS mx FROM sensors GROUP BY series ORDER BY series"
+        return f"SELECT series, count(value) AS c, sum(value) AS s, min(value) AS mn, max(value) AS mx FROM sensors{where_set('series', True)} GROUP BY series ORDER BY series"
     return " UNION ALL ".join(
         f"(SELECT series, date_bin(INTERVAL '{st * n} milliseconds', time) AS b, count(value) AS c, sum(value) AS s, min(value) AS mn, "
-        f"max(value) AS mx FROM sensors WHERE series IN ({', '.join(repr(str(x)) for x in range(NSERIES) if x % 7 in k)}) GROUP BY series, b)"
-        for st, k in GROUPS.items()) + " ORDER BY series, b"
+        f"max(value) AS mx FROM sensors WHERE series IN ({', '.join(repr(str(x)) for x in sset() if x % 7 in k)}) GROUP BY series, b)"
+        for st, k in groups().items()) + " ORDER BY series, b"
 
 
 PROM_LO, PROM_HI = 1703980800000, 1767225600000  # 2023-12-31 and 2026-01-01, as for InfluxQL
 
 def prom_full(n):
     if n == 0:  # one instant query over everything
-        return prom_get("/api/v1/query", query=prom_aggs("sensors", PROM_HI - PROM_LO), time=psec(PROM_HI - 1))
+        sel = "sensors" if SET is None else 'sensors{series=~"' + "|".join(str(x) for x in SET) + '"}'
+        return prom_get("/api/v1/query", query=prom_aggs(sel, PROM_HI - PROM_LO), time=psec(PROM_HI - 1))
     # query_range evaluates every step, empty or not, so each step group spans only its own data
     # (spec.py's samples, with a margin for the jitter) instead of the two years
     reqs = []
-    for st, k in GROUPS.items():
+    for st, k in groups().items():
         w = st * n
-        sel = 'sensors{series=~"' + "|".join(str(x) for x in range(NSERIES) if x % 7 in k) + '"}'
+        sel = 'sensors{series=~"' + "|".join(str(x) for x in sset() if x % 7 in k) + '"}'
         lo, hi = (PROM_T0 - 1000) // w * w, -(-(PROM_T0 + PROM_POINTS * st + 1000) // w) * w
         reqs += prom_buckets(sel, lo, hi, w)
     return " && ".join(reqs)
