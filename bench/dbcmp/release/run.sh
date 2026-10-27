@@ -960,6 +960,21 @@ p5() {
 }
 phase5() { reset_quiet; p5 || fail "p5 returned an error"; }
 
+# ================================================================== checktest: the answer checkers have teeth
+phase_checktest() {
+    local D=$OUT/checktest rc=0
+    PH_DIR=$D; mkdir -p "$D"; rm -f "$D/FAILS"
+    log "CHECKTEST START"
+    python3 -I "$RDIR/checktest.py" mutate > "$D/mutate-builtin.txt" 2>&1 || fail "checktest: built-in reference (see $D/mutate-builtin.txt)"
+    if [ -s "$WORK/ref/twa.jsonl" ] && [ -s "$WORK/ref/windows.jsonl" ]; then
+        python3 -I "$RDIR/checktest.py" mutate "$WORK/ref/twa.jsonl" "$WORK/ref/windows.jsonl" "$WORK/ref/full.jsonl" > "$D/mutate-ref.txt" 2>&1 ||
+            fail "checktest: tsdb's references in $WORK/ref (see $D/mutate-ref.txt)"
+    fi
+    [ -s "$D/FAILS" ] && rc=1
+    log "CHECKTEST $([ $rc = 0 ] && echo DONE || echo FAILED)"
+    return $rc
+}
+
 # ================================================================== main
 machine() {
     {

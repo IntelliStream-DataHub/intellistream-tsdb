@@ -217,7 +217,7 @@ class Prom:
 
 RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day"), "prom": Prom}
 
-def close(a, b, rel):
+def close(a, b, rel):  # False for NaN on either side: a NaN answer is a mismatch
     return a == b or abs(a - b) <= rel * max(abs(a), abs(b), 1e-300)
 
 def main():
@@ -288,7 +288,8 @@ def dumps(ref_w, ref_f, got_w, got_f):
     checked, bad, missing = {}, 0, 0
     for l in open(got_w):
         g = json.loads(l); r = ref.get(g["i"])
-        if r is None: missing += 1; continue
+        if r is None:  # an answer to a query the reference never asked is a failure too
+            missing += 1; bad += 1; continue
         ok = r["cls"] == g["cls"] and same_window(r, g)
         if not ok:
             bad += 1
@@ -297,12 +298,18 @@ def dumps(ref_w, ref_f, got_w, got_f):
     fref = {}
     for l in open(ref_f):
         x = json.loads(l); fref[(x["full"], x["s"])] = x["d"]
+    seen = set()
     for l in open(got_f):
-        x = json.loads(l); e = fref[(x["full"], x["s"])]; g = x["d"]
-        if not (g[0] == e[0] and g[4] == e[4] and close(g[1], e[1], 1e-9) and close(g[2], e[2], 1e-7) and close(g[3], e[3], 1e-7)):
+        x = json.loads(l); e = fref.get((x["full"], x["s"])); g = x["d"]
+        seen.add((x["full"], x["s"]))
+        if e is None or not (g[0] == e[0] and g[4] == e[4] and close(g[1], e[1], 1e-9) and close(g[2], e[2], 1e-7) and close(g[3], e[3], 1e-7)):
             bad += 1
             print("MISMATCH full", x["full"], x["s"], "got", g, "ref", e)
         checked[f"full{x['full']}"] = checked.get(f"full{x['full']}", 0) + 1
+    for k in sorted(set(fref) - seen):  # every whole-range answer of the reference must be there
+        if k[0] in {f for f, _ in seen}:
+            bad += 1
+            print("MISMATCH full", k[0], k[1], "missing")
     print(got_w, "checked", checked, "mismatches", bad, "not in the reference", missing)
 
 if __name__ == "__main__":

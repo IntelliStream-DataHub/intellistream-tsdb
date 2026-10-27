@@ -15,8 +15,9 @@
 # InfluxDB 2 (Flux timeWeightedAvg interpolates linearly only) and Prometheus have no STEP TWA.
 #
 # Check: LTTB the same timestamps per series and values within 1e-7 relative; TWA per bucket with covered
-# time > 0 the same bucket starts and twa within 1e-9 relative. Mismatches are counted, the last bucket of
-# each series apart (the toolkit's interpolated_average may hold the last value to the bucket end).
+# time > 0 the same bucket starts, the covered time exactly (where the system returns it) and twa within 1e-9
+# relative. NaN, a missing or an extra bucket or series is a mismatch. Only the TimescaleDB toolkit may differ in
+# the last bucket of a series (its interpolated_average holds the last value to the bucket end): counted apart.
 import json, os, subprocess, sys, urllib.parse, urllib.request
 
 H = 3600000
@@ -106,8 +107,20 @@ def fetch(sysname, kind):
 def load_ref(path):
     return {x["s"]: x for x in map(json.loads, open(path))}
 
-def compare(kind, ref, rows):
-    """rows: lists (series, t|b, v|area, [covered]); ref: relq dump."""
+def num(x):
+    """A number from an answer cell; empty, null and NaN become NaN, which never matches."""
+    if x in ("", None): return float("nan")
+    return float(x)
+
+def near(x, y, rel):
+    """Within rel of each other; False for NaN on either side (abs(nan - y) > tol is False, so never test that way)."""
+    return x == y or abs(x - y) <= rel * max(abs(x), abs(y), 1e-30)
+
+def compare(kind, ref, rows, lenient_last=False):
+    """rows: lists (series, t|b, v|area, [covered]); ref: relq dump. TWA rows with covered time compare it exactly;
+    rows without it (series, b, twa: the TimescaleDB toolkit) compare the average only. A bucket missing on either
+    side, an extra series, a NaN or a covered time off by one ms is a mismatch. lenient_last: the last bucket of a
+    series may differ (the toolkit's interpolated_average holds the last value to the bucket end); counted apart."""
     got = {}
     for r in rows:
         got.setdefault(int(float(r[0])), []).append(r[1:])
@@ -116,34 +129,42 @@ def compare(kind, ref, rows):
         g = got.get(s, [])
         if kind == "lttb":
             et, ev = e["t"], e["v"]
-            gt = [int(float(x[0])) for x in g]; gv = [float(x[1]) for x in g]
+            gt = [int(float(x[0])) for x in g]; gv = [num(x[1]) for x in g]
             total += len(et)
             nb = 0 if len(gt) == len(et) else abs(len(gt) - len(et))
             for a, b, x, y in zip(et, gt, ev, gv):
-                if a != b or abs(x - y) > 1e-7 * max(abs(x), abs(y), 1e-30): nb += 1
+                if a != b or not near(x, y, 1e-7): nb += 1
             if nb:
                 bad_series += 1; bad_pts += nb
                 if bad_series <= 5: print(f"MISMATCH lttb series {s}: {nb} points differ (ref {len(et)}, got {len(gt)})")
         else:
-            eb = {b[0]: b[1] / b[2] for b in e["b"] if b[2] > 0}
+            eb = {b[0]: (b[1] / b[2], b[2]) for b in e["b"] if b[2] > 0}
             last = max(eb) if eb else None
-            if len(g[0]) == 2 if g else False:  # series, b, twa
-                gb = {int(float(x[0])): float(x[1]) for x in g if x[1] not in ("", None, "NaN", "nan")}
+            if g and len(g[0]) == 2:  # series, b, twa
+                gb = {int(float(x[0])): (num(x[1]), None) for x in g}
             else:
-                gb = {int(float(x[0])): float(x[1]) / float(x[2]) for x in g if float(x[2]) > 0}
+                gb = {}
+                for x in g:
+                    c = num(x[2])
+                    if c == 0: continue  # a bucket with no covered time has no average; the reference leaves it out
+                    gb[int(float(x[0]))] = (num(x[1]) / c if c == c else c, c)
             total += len(eb)
             nb = nl = 0
             for b in set(eb) | set(gb):
                 x, y = eb.get(b), gb.get(b)
-                if x is None or y is None or abs(x - y) > 1e-9 * max(abs(x), abs(y), 1e-30):
-                    if b == last or (x is None and b > (last or 0)): nl += 1
-                    else: nb += 1
+                ok = x is not None and y is not None and near(x[0], y[0], 1e-9) and (y[1] is None or y[1] == x[1])
+                if not ok:
+                    if lenient_last and (b == last or (x is None and b > (last or 0))): nl += 1
+                    else:
+                        nb += 1
+                        if nb <= 3 and bad_series < 5: print(f"  series {s} bucket {b}: ref (twa, covered) {x}, got {y}")
             if nb or nl:
                 bad_series += nb > 0; bad_pts += nb; bad_last += nl
                 if nb and bad_series <= 5: print(f"MISMATCH twa series {s}: {nb} buckets differ, {nl} at the end (ref {len(eb)}, got {len(gb)})")
     extra = sorted(set(got) - set(ref))
     print(f"{kind}: {len(ref)} series, {total} reference {'points' if kind == 'lttb' else 'buckets'}; series with mismatches "
-          f"{bad_series}, mismatched {bad_pts}, last-bucket differences {bad_last}, unexpected series {len(extra)}")
+          f"{bad_series}, mismatched {bad_pts}, last-bucket differences {bad_last}{' (allowed: toolkit)' if lenient_last else ''}, "
+          f"unexpected series {len(extra)}")
     return bad_series == 0 and not extra
 
 def main():
@@ -157,7 +178,7 @@ def main():
         print(s)
     elif cmd == "check":
         sysname, kind, ref = sys.argv[2:5]
-        ok = compare(kind, load_ref(ref), fetch(sysname, kind))
+        ok = compare(kind, load_ref(ref), fetch(sysname, kind), lenient_last=sysname == "ts")
         print(sysname, kind, "OK" if ok else "MISMATCH")
     elif cmd == "tsv":
         kind, ref, f = sys.argv[2:5]
