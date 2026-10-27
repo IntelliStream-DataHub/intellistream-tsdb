@@ -1250,6 +1250,9 @@ runphase() { # N: one phase in a subshell, FAILS per phase, done marker when it 
         return 1
     fi
 }
+# The main part is one function, parsed whole before it runs: bash reads a script as it goes, and an edit (a commit
+# in this worktree) during a run of several hours otherwise runs half old and half new lines (seen: a syntax error).
+main() {
 [ $# -gt 0 ] || { usage; exit 2; }
 trap 'log "driver interrupted"; cleanup_all; exit 130' INT TERM
 machine
@@ -1271,3 +1274,5 @@ for a in "$@"; do
 done
 log "run.sh END rc=$RC"
 exit $RC
+}
+main "$@"; exit

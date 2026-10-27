@@ -5,6 +5,11 @@
 #                        CompactionTaskManager), so settling measures the compaction, not the cap
 #   query_timeout_threshold=3600000             whole-range queries over 100 M rows may take longer than 60 s
 #   enable_rest_service=true, rest_query_default_row_size_limit=2000000   the REST API (18080) that qdrive drives
+#   chunk_timeseriesmeta_free_memory_proportion=1:100:200:50:800:200:200:50:250   the Operators share of the query
+#                        memory 4x its default 200: with the default, 32 concurrent window queries (lead() OVER, the
+#                        TWA classes) are refused with code 719 "not enough memory to execute current fragment
+#                        instance" at a 4 GB and at a 16 GB heap alike (the estimate grows with the heap); IoTDB's FAQ
+#                        (latest-Table/FAQ, "not enough memory") says to raise the heap or this proportion (IOT_QMEM)
 #   compressor=ZSTD      only in the iotz variant (default LZ4); float encoding stays GORILLA (lossless; never RLE or
 #                        TS_2DIFF on floats: they round to float_precision=2)
 # The REST service binds every address and has no bind setting, so IoTDB runs in its own network namespace
@@ -12,6 +17,8 @@
 IOT_HDR=$'Authorization: Basic cm9vdDpyb290\r\n'   # root:root, the default user
 IOT_MEM=${IOT_MEM:-24g}                             # container limit, as InfluxDB 2's 24g; heap below
 IOT_JMX=${IOT_JMX:--Xms16G -Xmx16G -XX:MaxDirectMemorySize=4G}
+IOT_QMEM=${IOT_QMEM-1:100:200:50:800:200:200:50:250}   # read memory: BloomFilter:ChunkCache:TSMetaCache:
+                                                      # Coordinator:Operators:DataExchange:timeIndex:..:Subscription
 IOT_STABLE=${IOT_STABLE:-180}                       # settle: TsFiles unchanged this long (3 compaction schedules)
 IOT_SETTLE_MAX=${IOT_SETTLE_MAX:-10800}
 IOT_PROCS=${IOT_PROCS:-8} IOT_TABLET=${IOT_TABLET:-100000}
@@ -20,6 +27,7 @@ iot_start() { # DATADIR [PODMAN ARGS...]: rb-iot; IOT_Z=1 for compressor=ZSTD
     local W=$1 i z=
     shift
     [ "${IOT_Z:-0}" = 1 ] && z="-e compressor=ZSTD"
+    [ -n "$IOT_QMEM" ] && z="$z -e chunk_timeseriesmeta_free_memory_proportion=$IOT_QMEM"
     mkdir -p "$W/data" "$W/logs"
     podman run -d --name rb-iot --memory "$IOT_MEM" --memory-swap "$IOT_MEM" \
         -p 127.0.0.1:18080:18080 -p 127.0.0.1:6667:6667 \
@@ -117,6 +125,9 @@ p2_iot() {
     done
     ports_check "$D/ports.txt"
     podman exec rb-iot sh -c 'ls /iotdb/lib | grep -m1 iotdb-server' > "$D/version.txt" 2>&1
+    # how it ran: every setting passed to the container (the image's entrypoint writes them into iotdb-system.properties)
+    podman inspect rb-iot --format '{{range .Config.Env}}{{println .}}{{end}}' |
+        grep -E '^(IOTDB_JMX_OPTS|[a-z_]+)=' > "$D/config.txt" 2>&1
     cd "$WORK" || return 1
     python3 -I "$H/mkq.py" iot
     if untimed "$D/check.txt" python3 -I "$H/check.py" iot 200; then
