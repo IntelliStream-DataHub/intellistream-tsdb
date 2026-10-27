@@ -11,8 +11,8 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 TOOLS=$RDIR
 DSLIST=${DSLIST:-"$DS_KINDS $DS_HYD"}
-P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb ts i2 i3 prom"}
-P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 ts i2 i3"}
+P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom"}
+P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3"}
 I3_P2_FLAGS=${I3_P2_FLAGS:-}            # smoke runs only: e.g. --force-snapshot-max-age 2m
 I3_P2_MIN=${I3_P2_MIN:-600}
 I3_P1_AGE=${I3_P1_AGE:-5m} I3_P1_MIN=${I3_P1_MIN:-420}
@@ -129,10 +129,16 @@ ch_start() { # DATADIR
     [ -x "$CLICKHOUSE" ] || podman cp rb-ch:/usr/bin/clickhouse "$CLICKHOUSE"
 }
 CHC() { "$CLICKHOUSE" client --host 127.0.0.1 "$@"; }
-qdb_start() { # DATADIR
+# QuestDB converts partitions to Parquet with LZ4_RAW unless told otherwise; the ZSTD variant (qdbz in p1, qdb2 in p2)
+# sets the codec and level (QuestDB 10.1.0 PropServerConfiguration: codec default LZ4_RAW, ZSTD level default 9,
+# levels 1-22; a partition compressing by less than min.compression.ratio 1.2 stays native)
+QDB_ZSTD_LEVEL=${QDB_ZSTD_LEVEL:-22}
+qdb_zstd_env() { echo "-e QDB_CAIRO_PARTITION_ENCODER_PARQUET_COMPRESSION_CODEC=ZSTD -e QDB_CAIRO_PARTITION_ENCODER_PARQUET_COMPRESSION_LEVEL=$QDB_ZSTD_LEVEL"; }
+qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD
     local W=$1 i
     mkdir -p "$W"
-    podman run -d --name rb-qdb --network host -v "$W:/var/lib/questdb" \
+    # shellcheck disable=SC2046
+    podman run -d --name rb-qdb --network host -v "$W:/var/lib/questdb" $([ "${QDB_ZSTD:-0}" = 1 ] && qdb_zstd_env) \
         -e QDB_HTTP_NET_BIND_TO=127.0.0.1:9100 -e QDB_HTTP_MIN_NET_BIND_TO=127.0.0.1:9103 \
         -e QDB_PG_NET_BIND_TO=127.0.0.1:8812 -e QDB_LINE_TCP_NET_BIND_TO=127.0.0.1:9109 \
         -e QDB_LINE_UDP_ENABLED=false -e QDB_TELEMETRY_ENABLED=false "$QDB_IMG" > /dev/null 9>&- || { fail "questdb start"; return 1; }
@@ -508,8 +514,10 @@ p1_duck() {
     done
     rmdata "$W"
 }
+p1_qdbz() { QDB_ZSTD=1 p1_qdb; }  # Parquet with ZSTD: its own server, sizes in p1/qdb-parquet-zstd.tsv
 p1_qdb() {
-    local D=$OUT/p1/qdb W=$DBCMP/s1/qdb ds i prev cur
+    local D=$OUT/p1/qdb W=$DBCMP/s1/qdb ds i prev cur pqt=$OUT/p1/qdb-parquet.tsv nt=$OUT/p1/qdb.tsv
+    [ "${QDB_ZSTD:-0}" = 1 ] && { D=$OUT/p1/qdbz W=$DBCMP/s1/qdbz pqt=$OUT/p1/qdb-parquet-zstd.tsv nt=$D/native.tsv; }
     mkdir -p "$D"; rmdata "$W"
     qdb_start "$W" || return 1
     ports_check "$D/ports.txt"
@@ -519,13 +527,13 @@ p1_qdb() {
     done
     for ds in $DSLIST; do qdb_wait_table "s_$ds" >> "$D/wal.txt" || fail "p1 qdb wal $ds"; done
     podman exec rb-qdb sync -f /var/lib/questdb/db
-    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/qdb.tsv"
-    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/qdb-parquet.tsv"
+    printf 'ds\trows\tbytes\tnote\n' > "$nt"
+    printf 'ds\trows\tbytes\tnote\n' > "$pqt"
     for ds in $DSLIST; do
         QX "SELECT count() FROM s_$ds" > "$D/rows.$ds.json"
         QX "SELECT isParquet, count(), sum(diskSize), sum(parquetFileSize) FROM table_partitions('s_$ds')" > "$D/native.$ds.json"
         jq -r --arg ds "$ds" --argjson rows "$(jq '.dataset[0][0]' "$D/rows.$ds.json")" \
-            '[.dataset[] | .[2]] | add as $b | "\($ds)\t\($rows)\t\($b)\tnative, sum(diskSize) of table_partitions"' "$D/native.$ds.json" >> "$OUT/p1/qdb.tsv"
+            '[.dataset[] | .[2]] | add as $b | "\($ds)\t\($rows)\t\($b)\tnative, sum(diskSize) of table_partitions"' "$D/native.$ds.json" >> "$nt"
         podman unshare du -sb "$W"/db/s_"$ds"~* >> "$D/du-native.txt" 2>&1
     done
     for ds in $DSLIST; do
@@ -545,7 +553,7 @@ p1_qdb() {
         QX "SELECT isParquet, count(), sum(diskSize), sum(parquetFileSize) FROM table_partitions('s_$ds')" > "$D/parquet.$ds.json"
         jq -r --arg ds "$ds" --argjson rows "$(jq '.dataset[0][0]' "$D/rows-pq.$ds.json")" \
             '([.dataset[] | .[2]] | add) as $b | ([.dataset[] | select(.[0]) | .[1]] | add // 0) as $np | ([.dataset[] | .[1]] | add) as $n | ([.dataset[] | .[3]] | add) as $pq
-             | "\($ds)\t\($rows)\t\($b)\tsum(diskSize) after CONVERT PARTITION TO PARQUET: \($np) of \($n) partitions Parquet, parquetFileSize \($pq)"' "$D/parquet.$ds.json" >> "$OUT/p1/qdb-parquet.tsv"
+             | "\($ds)\t\($rows)\t\($b)\tsum(diskSize) after CONVERT PARTITION TO PARQUET: \($np) of \($n) partitions Parquet, parquetFileSize \($pq)"' "$D/parquet.$ds.json" >> "$pqt"
         podman unshare du -sb "$W"/db/s_"$ds"~* >> "$D/du-parquet.txt" 2>&1
     done
     crm rb-qdb; rmdata "$W"
@@ -604,16 +612,19 @@ p1_i3() {
     # layout (gen1 files of 10 min of data time) does not depend on it
     i3_start "$W" --force-snapshot-max-age "$I3_P1_AGE" || return 1
     ports_check "$D/ports.txt"
+    # one database, one table per data set: InfluxDB 3 Core allows 5 databases (the 0.9.0 run's database per data
+    # set failed past the fifth); the line protocol names the table, so each data set gets its own copy, s_<ds>
+    curl -s -X POST http://127.0.0.1:8181/api/v3/configure/database -H 'Content-Type: application/json' -d '{"db":"sizes"}' >> "$D/ddl.txt"
     for ds in $DSLIST; do
-        curl -s -X POST http://127.0.0.1:8181/api/v3/configure/database -H 'Content-Type: application/json' -d "{\"db\":\"s_$ds\"}" >> "$D/ddl.txt"
-        "$B/loadlp" "$IN/$ds.lp" 127.0.0.1 8181 "/api/v3/write_lp?db=s_$ds&precision=millisecond" "" 100000 16 >> "$D/load.txt" 2>&1 9>&- || fail "p1 i3 load $ds"
+        [ -s "$IN/$ds.tbl.lp" ] || sed "s/^sensors,/s_$ds,/" "$IN/$ds.lp" > "$IN/$ds.tbl.lp"
+        "$B/loadlp" "$IN/$ds.tbl.lp" 127.0.0.1 8181 "/api/v3/write_lp?db=sizes&precision=millisecond" "" 100000 16 >> "$D/load.txt" 2>&1 9>&- || fail "p1 i3 load $ds"
     done
     i3_wait_snapshot "$W" "$I3_P1_MIN" 180 5400 > "$D/snapshot.txt" 2>&1 || fail "p1 i3 snapshot did not settle (see $D/snapshot.txt)"
     podman unshare find "$W/data" -maxdepth 4 -type d > "$D/dirs.txt"
     podman unshare sh -c "cd $W/data && du -sb */* */*/* 2>/dev/null" > "$D/du.txt"
     printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/i3.tsv"
     for ds in $DSLIST; do
-        curl -s "http://127.0.0.1:8181/api/v3/query_sql?db=s_$ds&format=json" --data-urlencode "q=SELECT count(*) AS files, sum(size_bytes) AS bytes, sum(row_count) AS rows FROM system.parquet_files WHERE table_name = 'sensors'" -G > "$D/pq.$ds.json"
+        curl -s "http://127.0.0.1:8181/api/v3/query_sql?db=sizes&format=json" --data-urlencode "q=SELECT count(*) AS files, sum(size_bytes) AS bytes, sum(row_count) AS rows FROM system.parquet_files WHERE table_name = 's_$ds'" -G > "$D/pq.$ds.json"
         jq -r --arg ds "$ds" '.[0] | "\($ds)\t\(.rows)\t\(.bytes)\tParquet files (system.parquet_files): \(.files); WAL apart (du.txt)"' "$D/pq.$ds.json" >> "$OUT/p1/i3.tsv" 2>> "$D/errors.txt" || fail "p1 i3 size $ds"
     done
     crm rb-i3; rmdata "$W"
@@ -730,12 +741,12 @@ p2_ch() {
     crm rb-ch; rmdata "$W"
     runstats "$D"
 }
-qdb_load_rep() { # W PARQUET(0|1): fresh server, table, load, WAL applied, [convert], sync, size
+qdb_load_rep() { # W PARQUET(0|1|2): fresh server, table, load, WAL applied, [convert], sync, size
     local W=$1 pq=$2 s e
     s=$(date +%s.%N)
     "$B/loadlp" "$DBCMP/input/mixed.ilp32" 127.0.0.1 9100 "/write?precision=ms" "" 100000 8 || return 1
     "$H/qdb_wait.sh" || return 1
-    if [ "$pq" = 1 ]; then
+    if [ "$pq" != 0 ]; then
         e=$(date +%s.%N)
         QX "ALTER TABLE sensors CONVERT PARTITION TO PARQUET WHERE ts >= 0"
         qdb_wait_table sensors || return 1
@@ -746,9 +757,11 @@ qdb_load_rep() { # W PARQUET(0|1): fresh server, table, load, WAL applied, [conv
     echo "sync $(echo "$(date +%s.%N) - $t" | bc) s"
     QX "SELECT isParquet, count(), sum(diskSize), sum(parquetFileSize) FROM table_partitions('sensors')"
 }
-p2_qdb() { # PARQUET(0|1)
+p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), Parquet ZSTD (QDB_ZSTD_LEVEL)
     local pq=$1 P=qdb D W r
     [ "$pq" = 1 ] && P=qdb-parquet
+    [ "$pq" = 2 ] && P=qdb-parquet-zstd
+    local QDB_ZSTD=0; [ "$pq" = 2 ] && QDB_ZSTD=1
     D=$OUT/p2/$P W=$DBCMP/s2/$P
     mkdir -p "$D"
     for r in $(seq "$REPS"); do
@@ -928,7 +941,7 @@ phase2() {
         done_mark "$OUT/p2/$s.done" && { log "p2 $s already done"; continue; }
         log "p2 $s start"
         local nf=$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)
-        case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
+        case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; qdb2) p2_qdb 2 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
         cleanup_all
         [ "$(wc -l < "$PH_DIR/FAILS" 2> /dev/null || echo 0)" = "$nf" ] && date > "$OUT/p2/$s.done"
         log "p2 $s end"
