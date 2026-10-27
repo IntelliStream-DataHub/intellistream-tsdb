@@ -160,8 +160,9 @@ static void test_caps(void)
     sched_free(s);
 }
 
-/* As many requests in flight as there are threads: each runs on its own thread, waking no helper (they would only
- * steal CPUs from the other requests). One request alone gets every helper, through the wake tree. */
+/* As many requests in flight as there are threads, or 6 of 8 (a server's requests spend part of their time outside a
+ * query): each runs on its own thread, waking no helper (they would only steal CPUs from the other requests). 4 of 8
+ * share the threads, two each. One request alone gets every helper, through the wake tree. */
 typedef struct load_arg {
     sched *s;
     pthread_barrier_t *in, *out;
@@ -181,24 +182,34 @@ static void *load_thread(void *a)
     return NULL;
 }
 
-static void test_load(void)
+static void load_requests(sched *s, int n, int share)
 {
-    sched *s = sched_new(8, 0);
     pthread_barrier_t in, out;
-    pthread_barrier_init(&in, NULL, 8);
-    pthread_barrier_init(&out, NULL, 8);
+    pthread_barrier_init(&in, NULL, (unsigned)n);
+    pthread_barrier_init(&out, NULL, (unsigned)n);
     load_arg a[8];
     pthread_t th[8];
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < n; i++) {
         a[i] = (load_arg){.s = s, .in = &in, .out = &out};
         pthread_create(&th[i], NULL, load_thread, &a[i]);
     }
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < n; i++)
         pthread_join(th[i], NULL);
-    for (int i = 0; i < 8; i++)
-        CHECK(atomic_load(&a[i].j.done) == 64 && a[i].j.nids == 1 && atomic_load(&a[i].j.max_inside) == 1);
+    for (int i = 0; i < n; i++) {
+        CHECK(atomic_load(&a[i].j.done) == 64 && atomic_load(&a[i].j.max_inside) <= share);
+        if (share == 1)
+            CHECK(a[i].j.nids == 1);
+    }
     pthread_barrier_destroy(&in);
     pthread_barrier_destroy(&out);
+}
+
+static void test_load(void)
+{
+    sched *s = sched_new(8, 0);
+    load_requests(s, 8, 1);
+    load_requests(s, 6, 1);
+    load_requests(s, 4, 2);
 
     run_arg r = {.s = s, .n = 2000, .us = 100}; /* 200 ms of items; the tree staffs all 7 helpers in far less */
     run_thread(&r);

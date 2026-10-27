@@ -14,9 +14,11 @@
  * within it the newest open job with room: decode for series already started before new series.
  *
  * Load. Outermost groups count themselves in `live` (an atomic, no lock). A job asks for at most its share
- * of the helpers, 1 + helpers / live: under as many concurrent requests as there are CPUs every request runs on
- * its own thread, as fast as it can (waking helpers that are all busy costs locks, wake-ups and caches for
- * nothing), and a lone request gets every helper.
+ * of the threads, (helpers + 1) / live, its caller included: the callers of the other requests occupy CPUs too,
+ * so the shares add up to the threads and no more. Under as many concurrent requests as there are CPUs, or
+ * somewhat fewer (a server's requests spend part of their time outside a query), every request runs on its own
+ * thread, as fast as it can (waking helpers that are all busy costs locks, wake-ups and caches for nothing), and
+ * a lone request gets every helper.
  *
  * Waking. The opener wakes at most WAKE_FANOUT idle helpers and each helper that joins wakes WAKE_FANOUT more
  * while the job has room: a tree, so the opener starts its own items after two wake-ups, not after one per
@@ -284,12 +286,12 @@ static void signal_all(helper **w, int n)
         pthread_cond_signal(&w[i]->cv);
 }
 
-/* a job's participants under the current load: its share of the helpers among the requests in flight */
+/* a job's participants under the current load: its share of the threads among the requests in flight */
 static int fair_want(sched *s, int want)
 {
     int live = atomic_load_explicit(&s->live, memory_order_relaxed);
     if (live > 1)
-        want = MIN(want, 1 + s->nh / live);
+        want = MIN(want, MAX(1, (s->nh + 1) / live));
     return want;
 }
 
