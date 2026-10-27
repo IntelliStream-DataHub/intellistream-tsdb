@@ -79,8 +79,10 @@ static void cut_release(qcut *c)
 
 void qcuts_free(qcuts *cs)
 {
-    for (size_t i = 0; i < cs->n; i++)
-        cut_release(&cs->c[i]);
+    for (size_t i = 0; i < cs->n; i++) {
+        cut_release(cs->c[i]);
+        free(cs->c[i]);
+    }
     free(cs->c);
     pthread_mutex_destroy(&cs->lock);
     memset(cs, 0, sizeof *cs);
@@ -124,18 +126,19 @@ static int cut_take(eng *db, qcut *c)
     return 0;
 }
 
-/* The request's cut of db, taken by its first series there. */
+/* The request's cut of db, taken by its first series there. Each cut is allocated on its own: threads read theirs
+ * after the lock is dropped while another volume's first series grows the array of pointers. */
 static int cut_get(qcuts *cs, eng *db, qcut **out)
 {
     int rc = 0;
     pthread_mutex_lock(&cs->lock);
     size_t i = 0;
-    while (i < cs->n && cs->c[i].db != db)
+    while (i < cs->n && cs->c[i]->db != db)
         i++;
     if (i == cs->n) {
         if (cs->n == cs->cap) {
             size_t cap = cs->cap ? 2 * cs->cap : 4;
-            qcut *c = realloc(cs->c, cap * sizeof *c);
+            qcut **c = realloc(cs->c, cap * sizeof *c);
             if (!c)
                 rc = TSDB_ERR_NOMEM;
             else {
@@ -143,10 +146,15 @@ static int cut_get(qcuts *cs, eng *db, qcut **out)
                 cs->cap = cap;
             }
         }
-        if (rc == 0 && (rc = cut_take(db, &cs->c[i])) == 0)
-            cs->n++;
+        qcut *c = rc ? NULL : calloc(1, sizeof *c);
+        if (rc == 0 && !c)
+            rc = TSDB_ERR_NOMEM;
+        if (rc == 0 && (rc = cut_take(db, c)) == 0)
+            cs->c[cs->n++] = c;
+        else
+            free(c);
     }
-    *out = rc ? NULL : &cs->c[i];
+    *out = rc ? NULL : cs->c[i];
     pthread_mutex_unlock(&cs->lock);
     return rc;
 }

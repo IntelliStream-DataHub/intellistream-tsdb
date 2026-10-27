@@ -1,7 +1,7 @@
 /* tsdb_query_multi: every kind, mode, order and limit equals the single-series call, byte for byte, on data with
  * all five types, nulls, memtable rows, unmerged overlaps, deletes, replaces, retention and two volumes; for 1, 2,
  * 7 and 32 threads and with forced deferral; stop, cancel, max_rows, statistics, TRIM against *_group_local
- * across DST, and one cut per request (no insert seen by some series of a request and not by others). */
+ * across DST, and one cut per request (no insert seen by some series of a request and not by others), also over 12 volumes. */
 #include "internal.h"
 #include "tsdb.h"
 #include "tsdb_calendar.h"
@@ -597,6 +597,71 @@ static void cuts(tsdb *db, double secs)
     free(r.s);
 }
 
+/* More volumes than the request's first room for cuts (4): the first series of the 5th, 9th... volume grows the
+ * array while other threads read their cuts (a use-after-free before each cut was allocated on its own; make asan
+ * sees it). Series interleaved over the volumes, so first touches race; answers equal single queries. */
+static void many_volumes(const char *base)
+{
+    enum { NV = 12, PER = 6, ROWS = 6000 };
+    char r[600], vol[700], name[64], cmd[1400];
+    snprintf(r, sizeof r, "%s/test_multi-%d-nv", base, (int)getpid());
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'*", r);
+    if (system(cmd)) {
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.query_threads = 32;
+    o.granule_rows = 1024;
+    tsdb *db;
+    OK(tsdb_open(r, &o, &db));
+    uint32_t vids[NV * PER], order[NV * PER];
+    int64_t *ts = malloc(ROWS * sizeof *ts);
+    float *v = malloc(ROWS * sizeof *v);
+    uint32_t *sid = malloc(ROWS * sizeof *sid);
+    CHECK(ts && v && sid);
+    for (int k = 0; k < NV; k++) {
+        snprintf(vol, sizeof vol, "%s-vol%d", r, k);
+        for (int j = 0; j < PER; j++) {
+            snprintf(name, sizeof name, "nv%d_%d", k, j);
+            uint32_t id;
+            OK(tsdb_series_create(db, name, TSDB_FLOAT32, k ? vol : NULL, &id));
+            for (int i = 0; i < ROWS; i++)
+                ts[i] = T0 + (int64_t)i * 1000, v[i] = (float)(i % 97 + k + j), sid[i] = id;
+            OK(tsdb_insert(db, sid, ts, v, ROWS));
+            vids[k * PER + j] = id;
+        }
+    }
+    free(ts);
+    free(v);
+    free(sid);
+    size_t m = 0;
+    for (int j = 0; j < PER; j++)
+        for (int k = 0; k < NV; k++)
+            order[m++] = vids[k * PER + j];
+    tsdb_multi_query q = {.kind = TSDB_MULTI_BUCKETS, .start = INT64_MIN, .end = INT64_MAX, .interval_ms = 60000};
+    tsdb_bucket *ref[NV * PER];
+    size_t nref[NV * PER];
+    for (size_t i = 0; i < m; i++)
+        OK(tsdb_query_agg_ex(db, order[i], q.start, q.end, q.interval_ms, NULL, &ref[i], &nref[i]));
+    for (int it = 0; it < 60; it++) {
+        tsdb_series_result *out;
+        tsdb_multi_opts mo = {.threads = 32};
+        OK(tsdb_query_multi_collect(db, &q, order, m, &mo, &out));
+        for (size_t i = 0; i < m; i++) {
+            CHECK(out[i].status == 0 && out[i].n == nref[i]);
+            CHECK(memcmp(out[i].buckets, ref[i], nref[i] * sizeof(tsdb_bucket)) == 0);
+        }
+        tsdb_series_results_free(out, m);
+    }
+    for (size_t i = 0; i < m; i++)
+        tsdb_free(ref[i]);
+    OK(tsdb_close(db));
+    if (system(cmd)) {
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -648,6 +713,8 @@ int main(int argc, char **argv)
     OK(tsdb_open(root, &o, &db));
     cuts(db, 2.0);
     OK(tsdb_close(db));
+    many_volumes(base);
+    printf("  %d volumes in one request\n", 12);
     snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", root, vol2);
     if (system(cmd)) {
     }

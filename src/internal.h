@@ -1132,7 +1132,7 @@ typedef struct qcut {
 } qcut;
 typedef struct qcuts {
     pthread_mutex_t lock;
-    qcut *c;
+    qcut **c; /* each cut on its own: a pointer handed out stays valid while the array grows */
     size_t n, cap;
 } qcuts;
 extern __thread qcuts *cur_cuts; /* the multi-series request this thread works for; NULL elsewhere */
