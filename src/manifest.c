@@ -314,7 +314,7 @@ static int tail_segment(eng *db, wal_tail *t)
         for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
             wal_row(r, &id, &ts, &slot);
             if (id < eng_series_count(db))
-                rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, 0);
+                rc = mt_add(t->m, NULL, id, &ts, &slot, 8, 1, ++db->tail_lsn);
         }
         pthread_mutex_unlock(&db->buf_lock);
         pos += rec;

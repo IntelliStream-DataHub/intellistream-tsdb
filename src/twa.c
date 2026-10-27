@@ -552,6 +552,10 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
             rc = TSDB_ERR_TOO_MANY_BUCKETS;
             goto done;
         }
+        if (!qbudget_ok(span * (sizeof *acc + sizeof(tsdb_twa_bucket)))) {
+            rc = TSDB_ERR_DEFER; /* a multi-series task ahead of the head: run it at its turn */
+            goto done;
+        }
         o.nb = (size_t)span;
     }
     acc = calloc(o.nb, sizeof *acc);

@@ -1377,13 +1377,6 @@ static __thread tsdb_query_stats last_stats;
 
 /* One query's statistics. Queries built on others (points on raw, _ex on
  * plain) are counted once, by the outermost call. */
-typedef struct qrun {
-    qstats q;
-    bool outer;
-    struct timespec t0;
-    sgroup g; /* the threads it may use (request_threads); a query inside a multi call uses the call's */
-} qrun;
-
 static void qs_begin(tsdb *t, qrun *r)
 {
     r->outer = cur_qstats == NULL;
@@ -1394,6 +1387,17 @@ static void qs_begin(tsdb *t, qrun *r)
     sched_group_begin(t->sched, &r->g, 0);
     clock_gettime(CLOCK_MONOTONIC, &r->t0);
 }
+
+void query_run_begin(tsdb *t, qrun *r, int cap)
+{
+    r->outer = true;
+    memset(&r->q, 0, sizeof r->q);
+    cur_qstats = &r->q;
+    sched_group_begin(t->sched, &r->g, cap);
+    clock_gettime(CLOCK_MONOTONIC, &r->t0);
+}
+
+sched *query_sched(tsdb *t) { return t->sched; }
 
 static void qs_end(qrun *r, int type, uint64_t result_rows)
 {
@@ -1416,6 +1420,8 @@ static void qs_end(qrun *r, int type, uint64_t result_rows)
     s->granules_from_stats = atomic_load(&r->q.granules_from_stats);
     s->result_rows = result_rows;
 }
+
+void query_run_end(qrun *r, int type, uint64_t result_rows) { qs_end(r, type, result_rows); }
 
 void tsdb_last_query_stats(tsdb_query_stats *out) { *out = last_stats; }
 

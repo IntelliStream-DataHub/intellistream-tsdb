@@ -59,11 +59,147 @@ void snapshot_release(snapshot *s)
 
 static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start, int64_t end);
 
+/* --------------------------------------------------------------- cuts */
+
+__thread qcuts *cur_cuts;
+
+void qcuts_init(qcuts *cs)
+{
+    memset(cs, 0, sizeof *cs);
+    pthread_mutex_init(&cs->lock, NULL);
+}
+
+static void cut_release(qcut *c)
+{
+    db_release(c->parts, c->np); /* frees the array */
+    for (size_t i = 0; i < c->nms; i++)
+        mt_unref(c->ms[i]);
+    for (size_t i = 0; i < c->ntails; i++)
+        mt_unref(c->tails[i]);
+}
+
+void qcuts_free(qcuts *cs)
+{
+    for (size_t i = 0; i < cs->n; i++)
+        cut_release(&cs->c[i]);
+    free(cs->c);
+    pthread_mutex_destroy(&cs->lock);
+    memset(cs, 0, sizeof *cs);
+}
+
+/* The engine as snapshot_take sees it, for every series and time (TWA reads before its start): what a later
+ * snapshot_take would add is a newer part, a new memtable, or rows with a higher lsn. */
+static int cut_take(eng *db, qcut *c)
+{
+    memset(c, 0, sizeof *c);
+    c->db = db;
+    pthread_mutex_lock(&db->lock);
+    c->parts = malloc((db->nparts ? db->nparts : 1) * sizeof *c->parts);
+    if (!c->parts) {
+        pthread_mutex_unlock(&db->lock);
+        return TSDB_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < db->nparts; i++) {
+        part_ref(db->parts[i]);
+        c->parts[c->np++] = db->parts[i];
+    }
+    for (size_t i = 0; i < db->nflushing; i++) {
+        mt_ref(db->flushing[i]);
+        c->ms[c->nms++] = db->flushing[i];
+    }
+    uint64_t visible = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
+    pthread_mutex_lock(&db->buf_lock);
+    c->visible = MIN(visible, db->wal_appended);
+    if (db->active) {
+        mt_ref(db->active);
+        c->ms[c->nms++] = db->active;
+        c->has_active = true;
+    }
+    for (size_t i = 0; i < db->ntails; i++) {
+        mt_ref(db->tails[i].m);
+        c->tails[c->ntails++] = db->tails[i].m;
+    }
+    c->tail_visible = db->tail_lsn;
+    pthread_mutex_unlock(&db->buf_lock);
+    pthread_mutex_unlock(&db->lock);
+    return 0;
+}
+
+/* The request's cut of db, taken by its first series there. */
+static int cut_get(qcuts *cs, eng *db, qcut **out)
+{
+    int rc = 0;
+    pthread_mutex_lock(&cs->lock);
+    size_t i = 0;
+    while (i < cs->n && cs->c[i].db != db)
+        i++;
+    if (i == cs->n) {
+        if (cs->n == cs->cap) {
+            size_t cap = cs->cap ? 2 * cs->cap : 4;
+            qcut *c = realloc(cs->c, cap * sizeof *c);
+            if (!c)
+                rc = TSDB_ERR_NOMEM;
+            else {
+                cs->c = c;
+                cs->cap = cap;
+            }
+        }
+        if (rc == 0 && (rc = cut_take(db, &cs->c[i])) == 0)
+            cs->n++;
+    }
+    *out = rc ? NULL : &cs->c[i];
+    pthread_mutex_unlock(&cs->lock);
+    return rc;
+}
+
+/* snapshot_take from a cut: the same memtable order (tails, flushing, active), each bounded by the cut's lsn */
+static int snapshot_cut(eng *db, const qcut *c, uint32_t series, size_t w, int64_t start, int64_t end,
+                        snapshot *s)
+{
+    int rc = 0;
+    s->parts = malloc((c->np ? c->np : 1) * sizeof *s->parts);
+    s->mem = calloc(c->ntails + c->nms + 1, sizeof *s->mem);
+    if (!s->parts || !s->mem)
+        rc = TSDB_ERR_NOMEM;
+    for (size_t i = 0; rc == 0 && i < c->np; i++) {
+        part *p = c->parts[i];
+        if (p->max_ts >= start && p->min_ts < end) {
+            part_ref(p);
+            s->parts[s->np++] = p;
+        }
+    }
+    bool locked = rc == 0 && (c->ntails || c->has_active);
+    if (locked)
+        pthread_mutex_lock(&db->buf_lock); /* tails and the active memtable may still grow */
+    for (size_t i = 0; rc == 0 && i < c->ntails + c->nms; i++) {
+        bool tail = i < c->ntails;
+        const memtable *m = tail ? c->tails[i] : c->ms[i - c->ntails];
+        mem_run r = {0};
+        rc = mt_collect(m, series, w, start, end, tail ? c->tail_visible : c->visible, &r);
+        if (r.n)
+            s->mem[s->nmem++] = r;
+        else
+            mem_run_free(&r);
+    }
+    if (locked)
+        pthread_mutex_unlock(&db->buf_lock);
+    if (rc == 0)
+        rc = snapshot_prepare(db, s, series, start, end);
+    if (rc)
+        snapshot_release(s);
+    return rc;
+}
+
 /* Parts and memtables as of one instant: a flush publishes its parts and
  * retires its memtable under db->lock, so nothing is seen twice or missed. */
 int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
 {
     memset(s, 0, sizeof *s);
+    if (cur_cuts) {
+        qcut *c;
+        int rc = cut_get(cur_cuts, db, &c);
+        return rc ? rc : snapshot_cut(db, c, series, w, start, end, s);
+    }
     memtable *ms[MAX_FLUSHING];
     size_t nms = 0;
     int rc = 0;
@@ -1393,6 +1529,9 @@ static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *
     uint64_t span = (uint64_t)klast - (uint64_t)kfirst + 1;
     if (span > MAX_BUCKETS)
         return TSDB_ERR_TOO_MANY_BUCKETS;
+    if (!qbudget_ok(span * (sizeof(agg_state) + (q->spread ? sizeof(agg_dev) + sizeof(tsdb_spread_bucket)
+                                                            : sizeof(tsdb_bucket)))))
+        return TSDB_ERR_DEFER; /* a multi-series task ahead of the head: run it at its turn */
     size_t dense = agg_dense_buckets ? agg_dense_buckets
                                      : AGG_DENSE_BYTES / (sizeof(agg_state) + (q->spread ? sizeof(agg_dev) : 0));
     if (span <= dense)

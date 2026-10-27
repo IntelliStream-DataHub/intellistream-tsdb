@@ -722,6 +722,22 @@ const char *series_name(series_dict *d, uint32_t id);
 int series_type(series_dict *d, uint32_t id); /* -1 for an unknown id */
 bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n, int type);
 
+/* ---- working memory of multi-series tasks (multi.c) ----
+ * A series that is not at the head of a multi-series request runs with a budget: where it would allocate more
+ * (bucket accumulators, collected rows) it gives up with TSDB_ERR_DEFER and is run again at its turn, streaming,
+ * as a single request. NULL on single-series paths. */
+#define TSDB_ERR_DEFER (-100)
+typedef struct qbudget {
+    size_t bytes;
+} qbudget;
+extern __thread const qbudget *cur_budget;
+extern size_t multi_defer_bytes, multi_defer_rows; /* 16 MiB, 65536; tests lower them to force deferral */
+static inline bool qbudget_ok(size_t bytes)
+{
+    const qbudget *b = cur_budget;
+    return !b || bytes <= b->bytes;
+}
+
 /* ---- query scheduler (sched.c) ---- */
 typedef struct sched sched;
 typedef struct sjob sjob;
@@ -776,6 +792,19 @@ int sched_leave(void);
  * buffer that is live at once (0..3). */
 void *qscratch_get(int slot, size_t bytes);
 void qscratch_put(void *p);
+
+/* One outermost query's statistics and scheduler group (volumes.c). */
+typedef struct qrun {
+    qstats q;
+    bool outer;
+    struct timespec t0;
+    sgroup g; /* the threads it may use (request_threads); a query inside a multi call uses the call's */
+} qrun;
+/* For tsdb_query_multi: begins the call's group (cap <= 0: request_threads) and totals; the end sets
+ * tsdb_last_query_stats. */
+void query_run_begin(tsdb *t, qrun *r, int cap);
+void query_run_end(qrun *r, int type, uint64_t result_rows);
+sched *query_sched(tsdb *t);
 
 /* ---- memtable + WAL (memtable.c) ---- */
 typedef struct mt_series {
@@ -970,6 +999,7 @@ struct eng {
     uint64_t follow_flushed, follow_active;
     wal_tail tails[MAX_TAILS]; /* oldest first; the array is changed under db->lock + buf_lock */
     size_t ntails;
+    uint64_t tail_lsn; /* rows added to tails (buf_lock): their lsn, so a cut (qcut) can bound them */
 
     /* fail-stop (eng_fail): set once, never cleared; fail_msg is written under
      * fail_lock before `failed` is stored, so whoever sees `failed` can read it */
@@ -1068,6 +1098,30 @@ typedef struct snapshot {
 } snapshot;
 int snapshot_take(struct eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s);
 void snapshot_release(snapshot *s);
+
+/* One engine as of one instant, for every series of a multi-series request (tsdb_query_multi): the parts list,
+ * the memtables with the last WAL sequence they may show, taken under db->lock like a snapshot. Snapshots of the
+ * request's series are cut from it, so an insert is seen by all of them or by none. The parts are referenced once
+ * per engine, not per series. */
+typedef struct qcut {
+    struct eng *db;
+    part **parts;
+    size_t np;
+    memtable *ms[MAX_FLUSHING + 1]; /* the flushing memtables, oldest first, then the active one */
+    size_t nms;
+    bool has_active;               /* ms[nms - 1] was the active memtable: read under buf_lock */
+    memtable *tails[MAX_TAILS];
+    size_t ntails;
+    uint64_t visible, tail_visible; /* rows with a higher lsn came after the cut */
+} qcut;
+typedef struct qcuts {
+    pthread_mutex_t lock;
+    qcut *c;
+    size_t n, cap;
+} qcuts;
+extern __thread qcuts *cur_cuts; /* the multi-series request this thread works for; NULL elsewhere */
+void qcuts_init(qcuts *cs);
+void qcuts_free(qcuts *cs);
 uint64_t mem_prio(const snapshot *sn, size_t i);
 /* whether mem run i came from a memtable, not from part granules decoded around tombstones */
 bool mem_from_memtable(const snapshot *sn, size_t i);
