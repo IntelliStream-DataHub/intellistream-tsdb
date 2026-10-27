@@ -137,6 +137,7 @@ p2_td() {
         td_du "$W" cmp > "$D/du.$r.txt"
         [ "$r" -lt "$REPS" ] && { crm rb-td; rmdata "$W"; }
     done
+    load_ok "p2 $v" || return 1
     ports_check "$D/ports.txt"
     td_sql "" "SELECT server_version()" > "$D/version.txt"
     { podman inspect rb-td --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E '^TAOS_'

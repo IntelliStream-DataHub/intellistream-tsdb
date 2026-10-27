@@ -72,8 +72,16 @@ int main(int argc, char **argv)
     int threads = atoi(argv[7]);
     int fd = open(argv[1], O_RDONLY);
     struct stat st;
-    fstat(fd, &st);
+    /* a missing or empty input is an error, not a crash (a smoke run once went on without its inputs) */
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0) {
+        fprintf(stderr, "%s: %s\n", argv[1], fd < 0 ? strerror(errno) : "empty or unreadable");
+        return 1;
+    }
     data = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
+    if (data == MAP_FAILED) {
+        perror(argv[1]);
+        return 1;
+    }
     size_t cap = 1024, nl = 0, rows = 0;
     bounds = malloc(cap * sizeof *bounds);
     bounds[0] = 0;

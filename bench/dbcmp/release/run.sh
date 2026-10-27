@@ -15,6 +15,8 @@ P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom iot iotz td tdz vm
 P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3 iot iotz td tdz vm"}
 I3_P2_FLAGS=${I3_P2_FLAGS:-}            # smoke runs only: e.g. --force-snapshot-max-age 2m
 I3_P2_MIN=${I3_P2_MIN:-600}
+I3_P2_STABLE=${I3_P2_STABLE:-300} I3_P2_MAX=${I3_P2_MAX:-9000}     # Parquet unchanged for STABLE s; give up after MAX s
+I3_P1_STABLE=${I3_P1_STABLE:-180} I3_P1_MAX=${I3_P1_MAX:-5400}
 I3_P1_AGE=${I3_P1_AGE:-5m} I3_P1_MIN=${I3_P1_MIN:-420}
 I2_EXTRA=${I2_EXTRA:-}                  # smoke runs only: e.g. -e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s
 PROM_SETTLE_TIMEOUT=${PROM_SETTLE_TIMEOUT:-36000}
@@ -121,7 +123,26 @@ tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout
         return "$rc"
     fi
     [ "$rc" = 0 ] || fail "$label: rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${STEP_TIMEOUT}s)") (see $out)"
+    case "$rc $label" in 0\ *) ;; *" load r"*) LOAD_FAILED=1 ;; esac
     return "$rc"
+}
+load_ok() { # LABEL: after a system's load loop: a failed load skips its settle waits and queries (one FAIL, no waits)
+    local f=${LOAD_FAILED:-0}
+    LOAD_FAILED=0
+    [ "$f" = 0 ] && return 0
+    fail "$1: a load failed; settle waits and queries skipped"
+    return 1
+}
+inputs_ok() { # N: the inputs prep makes for phase N; a phase without them fails at once instead of loading nothing
+    local f miss=""
+    case $1 in
+        1) for f in $DSLIST; do [ -s "$DBCMP/sizes/in/$f.rowbinary" ] || miss="$miss sizes/in/$f.rowbinary"; done ;;
+        2|3|4) for f in "$DBCMP"/input/mixed.{rowbinary,lp,ilp32,csv,om} "$WORK/spec.tsv" "$WORK/batches.tsv"; do
+                   [ -s "$f" ] || miss="$miss $f"; done ;;
+    esac
+    [ -z "$miss" ] && return 0
+    fail "phase $1: inputs missing (run.sh prep; see $OUT/prep.log):$miss"
+    return 1
 }
 reps() { # NAME DIR -- CMD...: REPS timed runs into DIR/NAME.<run>
     local name=$1 dir=$2 r
@@ -203,15 +224,16 @@ qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD
     fail "questdb not ready"; return 1
 }
 QX() { curl -sG http://127.0.0.1:9100/exec --data-urlencode "query=$1"; echo; }
-qdb_wait_table() { # TABLE: until every WAL transaction is applied
-    local r w q s i
-    for i in $(seq 36000); do
+qdb_wait_table() { # TABLE: until every WAL transaction is applied; fails after QDB_WAIT_MAX s (a missing table never applies)
+    local r w q s t0=$SECONDS
+    while [ $((SECONDS - t0)) -lt "${QDB_WAIT_MAX:-3600}" ]; do
         r=$(curl -sG http://127.0.0.1:9100/exec --data-urlencode "query=select writerTxn, sequencerTxn, suspended from wal_tables() where name='$1'" | jq -c '.dataset[0]')
         w=$(echo "$r" | jq '.[0]'); q=$(echo "$r" | jq '.[1]'); s=$(echo "$r" | jq '.[2]')
         [ "$s" = true ] && { echo "SUSPENDED $1 $r"; return 1; }
         [ "$w" = "$q" ] && [ "$w" != null ] && { echo "WAL applied for $1 ($r)"; return 0; }
         sleep 0.1
     done
+    echo "WAL of $1 not applied after ${QDB_WAIT_MAX:-3600} s ($r)"
     return 1
 }
 TS_WORK_MEM=${TS_WORK_MEM:-256MB}  # REPORT §5.11: the default (timescaledb-tune: 6 MB) spills TWA's window sorts to disk
@@ -565,6 +587,7 @@ ch_settle() { # DB: until active part counts and running merges are unchanged fo
         cur=$(CHC -q "SELECT (SELECT count() FROM system.parts WHERE database='$1' AND active), (SELECT count() FROM system.merges WHERE database='$1')")
         [ "$cur" != "$prev" ] && { last=$(date +%s); prev=$cur; }
         [ $(($(date +%s) - last)) -ge 60 ] && break
+        [ $(($(date +%s) - s)) -ge "${CH_SETTLE_MAX:-7200}" ] && { echo "merges NOT settled after ${CH_SETTLE_MAX:-7200} s ($prev)"; return 1; }
         sleep 0.5
     done
     echo "merges settled $((last - s)) s after the start of the wait (parts, merges: $prev)"
@@ -582,7 +605,7 @@ p1_ch() {
         CHC -q "INSERT INTO s1.l_$ds FORMAT RowBinary" < "$IN/$ds.rowbinary" || fail "p1 ch insert l_$ds"
     done
     sync -f "$DBCMP"
-    ch_settle s1 > "$D/settle.txt" 2>&1
+    ch_settle s1 > "$D/settle.txt" 2>&1 || fail "p1 ch merges did not settle (see $D/settle.txt)"
     local Q="SELECT table, sum(rows), sum(bytes_on_disk), count() FROM system.parts WHERE database='s1' AND active GROUP BY table ORDER BY table FORMAT TSV"
     CHC -q "$Q" > "$D/settled.tsv"
     CHC -q "SELECT table, name, data_compressed_bytes, data_uncompressed_bytes FROM system.columns WHERE database='s1' ORDER BY table, name FORMAT TSV" > "$D/columns-settled.tsv"
@@ -716,7 +739,7 @@ p1_i3() {
         [ -s "$IN/$ds.tbl.lp" ] || sed "s/^sensors,/s_$ds,/" "$IN/$ds.lp" > "$IN/$ds.tbl.lp"
         "$B/loadlp" "$IN/$ds.tbl.lp" 127.0.0.1 8181 "/api/v3/write_lp?db=sizes&precision=millisecond" "" 100000 16 >> "$D/load.txt" 2>&1 9>&- || fail "p1 i3 load $ds"
     done
-    i3_wait_snapshot "$W" "$I3_P1_MIN" 180 5400 > "$D/snapshot.txt" 2>&1 || fail "p1 i3 snapshot did not settle (see $D/snapshot.txt)"
+    i3_wait_snapshot "$W" "$I3_P1_MIN" "$I3_P1_STABLE" "$I3_P1_MAX" > "$D/snapshot.txt" 2>&1 || fail "p1 i3 snapshot did not settle (see $D/snapshot.txt)"
     podman unshare find "$W/data" -maxdepth 4 -type d > "$D/dirs.txt"
     podman unshare sh -c "cd $W/data && du -sb */* */*/* 2>/dev/null" > "$D/du.txt"
     printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/i3.tsv"
@@ -767,6 +790,7 @@ p2_tsdb() {
         tstep "p2 tsdb load r$r" "$D/load.$r" -- bash -c "'$T/tsdbc-bench' load '$DATA' --conns 4 --port $TSDB_PORT && sync -f '$DBCMP' && '$TB/tsdbstat' settle && du -sb --exclude='retired_*' '$W/db'"
         [ "$r" -lt "$REPS" ] && tsdbd_stop
     done
+    load_ok "p2 tsdb" || return 1
     ports_check "$D/ports.txt"
     cd "$WORK" || return 1
     untimed "$D/ref-windows.log" sh -c "'$TB/tsdbq' dump spec.tsv 200 > ref/windows.jsonl"
@@ -818,6 +842,7 @@ p2_ch() {
         tstep "p2 ch load r$r" "$D/load.$r" -- bash -c "'$H/ch_load.sh' t100m && '$CLICKHOUSE' client --host 127.0.0.1 -q \"SELECT 'size', count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'cmp' AND table = 't100m' AND active\""
         [ "$r" -lt "$REPS" ] && { crm rb-ch; rmdata "$W"; }
     done
+    load_ok "p2 ch" || return 1
     ports_check "$D/ports.txt"
     CHC -q "SELECT version()" > "$D/version.txt"
     cd "$WORK" || return 1
@@ -870,6 +895,7 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
         tstep "p2 $P load r$r" "$D/load.$r" -- qdb_load_rep "$W" "$pq"
         [ "$r" -lt "$REPS" ] && { crm rb-qdb; rmdata "$W"; }
     done
+    load_ok "p2 $P" || return 1
     ports_check "$D/ports.txt"
     sleep 60  # converted partitions' old files go asynchronously
     QX "SELECT isParquet, count(), sum(diskSize), sum(parquetFileSize) FROM table_partitions('sensors')" > "$D/size-final.json"
@@ -925,6 +951,7 @@ p2_ts() {
         tstep "p2 ts load r$r" "$D/load.$r" -- ts_timed rb-ts
         [ "$r" -lt "$REPS" ] && { crm rb-ts; rmdata "$W"; }
     done
+    load_ok "p2 ts" || return 1
     ports_check "$D/ports.txt"
     PSQL -Atc "select version()" -c "select extversion from pg_extension where extname='timescaledb'" > "$D/version.txt"
     cd "$WORK" || return 1
@@ -982,6 +1009,7 @@ p2_i2() {
         tstep "p2 i2 load r$r" "$D/load.$r" -- i2_timed "$W"
         [ "$r" -lt "$REPS" ] && { crm rb-i2; rmdata "$W"; }
     done
+    load_ok "p2 i2" || return 1
     ports_check "$D/ports.txt"
     podman exec rb-i2 influxd version > "$D/version.txt" 2>&1
     # InfluxDB 2 answers a failed InfluxQL statement with status 200 and "error": in its results, and a Flux error
@@ -1016,8 +1044,9 @@ p2_i3() {
         tstep "p2 i3 load r$r" "$D/load.$r" -- "$B/loadlp" "$DBCMP/input/mixed.lp" 127.0.0.1 8181 "/api/v3/write_lp?db=cmp&precision=millisecond" "" 100000 16
         [ "$r" -lt "$REPS" ] && { crm rb-i3; rmdata "$W"; }
     done
+    load_ok "p2 i3" || return 1
     # default --force-snapshot-max-age (1 h): Parquet appears about an hour after the load (README); waited once
-    i3_wait_snapshot "$W" "$I3_P2_MIN" 300 9000 > "$D/snapshot.txt" 2>&1 || fail "p2 i3 snapshot did not settle (see $D/snapshot.txt)"
+    i3_wait_snapshot "$W" "$I3_P2_MIN" "$I3_P2_STABLE" "$I3_P2_MAX" > "$D/snapshot.txt" 2>&1 || fail "p2 i3 snapshot did not settle (see $D/snapshot.txt)"
     ports_check "$D/ports.txt"
     podman unshare sh -c "cd $W/data/node0 2>/dev/null && du -sb * */* 2>/dev/null" > "$D/du.txt"
     podman exec rb-i3 influxdb3 --version > "$D/version.txt" 2>&1
@@ -1041,6 +1070,7 @@ phase2() {
         reset_quiet
         done_mark "$OUT/p2/$s.done" && { log "p2 $s already done"; continue; }
         log "p2 $s start"
+        LOAD_FAILED=0
         local nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
         case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; qdb2) p2_qdb 2 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
         cleanup_all
@@ -1066,6 +1096,7 @@ p3() {
         rm -rf "$E/chdb-lz4"; sync
         tstep "p3 chdb-lz4 load r$r" "$D/chdb-lz4.load.$r" -- "$B/chq" load "$E/chdb-lz4" "$DATA" 0
     done
+    load_ok "p3" || return 1
     du -sb "$E"/* > "$D/du.txt"
     cd "$WORK" || return 1
     mkdir -p dump
@@ -1295,8 +1326,9 @@ phase_smoke() {
         SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10" \
         PREP_SERIES=10 PREP_POINTS=650000 PREP_SIZE_POINTS=200000 PREP_SPEC=400 \
         DSLIST="${SMOKE_DS:-hdd_temp vibration hyd_CE hyd_PS1}" \
-        IOT_STABLE=40 TD_STABLE=20 VM_STABLE=10 \
+        IOT_STABLE=40 TD_STABLE=20 VM_STABLE=10 QDB_WAIT_MAX=300 CH_SETTLE_MAX=600 \
         I3_P2_FLAGS="--force-snapshot-max-age 2m" I3_P2_MIN=150 I3_P1_AGE=2m I3_P1_MIN=150 \
+        I3_P2_STABLE=60 I3_P2_MAX=600 I3_P1_STABLE=60 I3_P1_MAX=600 \
         I2_EXTRA="-e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s" PROM_SETTLE_TIMEOUT=1800 \
         STEP_TIMEOUT=900 UNTIMED_TIMEOUT=1800 CHECK_TIMEOUT=900 QDRIVE_TIMEOUT=300 \
         "$RDIR/run.sh" prep p1 p2 p3 p4 || rc=1
@@ -1345,8 +1377,7 @@ runphase() { # N: one phase in a subshell, FAILS per phase, done marker when it 
     mkdir -p "$PH_DIR"
     rm -f "$PH_DIR/FAILS"
     log "PHASE $n START"
-    ( "phase$n" )
-    rc=$?
+    if inputs_ok "$n"; then ( "phase$n" ); rc=$?; else rc=1; fi
     PH_DIR=$OUT/p$n
     cleanup_all
     # tsdbd processes this script started and a failed phase left behind (pid file, checked by command line)
@@ -1376,8 +1407,10 @@ for a in "$@"; do
 done
 for a in "$@"; do
     case $a in
-        prep) flock -s "$LOCK" "$RDIR/prep.sh" > "$OUT/prep.log" 2>&1 || { log "prep failed (see $OUT/prep.log)"; RC=1; } ;;
-        p[1-5]) runphase "${a#p}" || RC=1; TABLES=1 ;;
+        # bash, not the file's mode: a checkout without the executable bit once ran every phase with no inputs
+        prep) flock -s "$LOCK" bash "$RDIR/prep.sh" > "$OUT/prep.log" 2>&1 || { log "prep failed (see $OUT/prep.log); later phases stop"; RC=1; PREP_FAILED=1; } ;;
+        p[1-5]) [ "${PREP_FAILED:-0}" = 1 ] && { log "PHASE ${a#p} not run: prep failed"; RC=1; continue; }
+                runphase "${a#p}" || RC=1; TABLES=1 ;;
         smoke) phase_smoke || RC=1 ;;
         checktest) phase_checktest || RC=1 ;;
         *) usage; exit 2 ;;

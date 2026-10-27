@@ -741,9 +741,11 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "load") && argc == 6) {
         int fd = open(argv[4], O_RDONLY);
         struct stat st;
-        if (fd < 0 || fstat(fd, &st) != 0)
-            die(argv[4], "cannot open");
+        if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0)
+            die(argv[4], "missing, empty or unreadable");
         const rbrow *rows = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
+        if (rows == MAP_FAILED)
+            die(argv[4], "cannot map");
         size_t n = (size_t)st.st_size / sizeof(rbrow);
         if (is_duck)
             duck_load(rows, n, atoi(argv[5]));

@@ -30,8 +30,15 @@ int main(int argc, char **argv)
     if (argc != 4) return 2;
     int fd = open(argv[2], O_RDONLY);
     struct stat st;
-    fstat(fd, &st);
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0) {
+        fprintf(stderr, "%s: missing, empty or unreadable\n", argv[2]);
+        return 1;
+    }
     const row *r = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
+    if (r == MAP_FAILED) {
+        perror(argv[2]);
+        return 1;
+    }
     size_t n = st.st_size / sizeof(row);
     FILE *o = fopen(argv[3], "w");
     static char obuf[1 << 22];

@@ -128,6 +128,7 @@ p2_iot() {
         iot_du "$W" > "$D/du.$r.txt"
         [ "$r" -lt "$REPS" ] && { crm rb-iot; rmdata "$W"; }
     done
+    load_ok "p2 $v" || return 1
     ports_check "$D/ports.txt"
     podman exec rb-iot sh -c 'ls /iotdb/lib | grep -m1 iotdb-server' > "$D/version.txt" 2>&1
     # how it ran: every setting passed to the container (the image's entrypoint writes them into iotdb-system.properties)

@@ -112,6 +112,7 @@ p2_vm() {
         vm_du "$W" > "$D/du.$r.txt"
         [ "$r" -lt "$REPS" ] && { crm rb-vm; rmdata "$W"; }
     done
+    load_ok "p2 vm" || return 1
     ports_check "$D/ports.txt"
     { podman inspect rb-vm --format '{{json .Config.Cmd}}'; vm_get /metrics | grep -E '^(vm_app_version|vm_available_cpu_cores|vm_available_memory_bytes|go_gomaxprocs)'
       echo "rows $(vm_count)"; } > "$D/config.txt" 2>&1
