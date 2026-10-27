@@ -444,6 +444,13 @@ pc_pin() { # CONTAINER...: to PERCORE_CPU
     local c
     for c; do ctr_taskset "$PERCORE_CPU" "$c" || { fail "per-core: taskset $c"; return 1; }; done
 }
+how_write() { # PHASE SYS: how.json of the system's results (how.py: settings, durability, clients, per core, '-')
+    env CH_IMG="$CH_IMG" TS_IMG="$TS_IMG" QDB_IMG="$QDB_IMG" I2_IMG="$I2_IMG" I3_IMG="$I3_IMG" IOT_IMG="$IOT_IMG" \
+        TD_IMG="$TD_IMG" VM_IMG="$VM_IMG" PROM_IMG="$PROM_IMG" T="$T" TSDB_TREE="$TSDB_TREE" DUCKDB_DIR="$DUCKDB_DIR" \
+        DUCKDB_SHA="$DUCKDB_SHA" CHDB_DIR="$CHDB_DIR" CHDB_SHA="$CHDB_SHA" REPS="$REPS" SECS="$SECS" KS="$KS" \
+        SMOKE="${SMOKE:-0}" PERCORE_CPU="$PERCORE_CPU" PERCORE_CLIENT_CPU="$PERCORE_CLIENT_CPU" \
+        python3 -I "$RDIR/how.py" write "$1" "$2" "$OUT" >> "$OUT/driver.log" 2>&1 || fail "how.json of $2 (phase $1)"
+}
 pc_unpin() { local c; for c; do ctr_taskset "0-$(( $(nproc) - 1 ))" "$c"; done; }
 bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
     local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 32}
@@ -742,6 +749,7 @@ phase1() {
         local nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
         "p1_$s" || fail "p1 $s returned an error"
         cleanup_all
+        how_write 1 "$s"
         [ "$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)" = "$nf" ] && date > "$OUT/p1/$s.done"
         log "p1 $s end"
     done
@@ -1036,6 +1044,7 @@ phase2() {
         local nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
         case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; qdb2) p2_qdb 2 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
         cleanup_all
+        how_write 2 "$s"
         [ "$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)" = "$nf" ] && date > "$OUT/p2/$s.done"
         log "p2 $s end"
     done
@@ -1120,7 +1129,7 @@ p3() {
     runstats "$D"
     rmdata "$E"
 }
-phase3() { reset_quiet; p3 || fail "p3 returned an error"; }
+phase3() { reset_quiet; p3 || fail "p3 returned an error"; local e; for e in tsdb-emb duckdb chdb chdb-lz4; do how_write 3 "$e"; done; }
 
 # ================================================================== phase 4: Prometheus
 prom_bf_timed() { # DIR: promtool backfill, sync, server start until ready
@@ -1191,7 +1200,7 @@ p4() {
     rmdata "$P"
     runstats "$D"
 }
-phase4() { reset_quiet; p4 || fail "p4 returned an error"; }
+phase4() { reset_quiet; p4 || fail "p4 returned an error"; how_write 4 prom; }
 
 # ================================================================== phase 5: 100 billion rows, tsdb and ClickHouse
 ch_big_load() { # 8 streams of 1250 series, RowBinary from scale-bench export; syncfs; merges settled
@@ -1269,6 +1278,33 @@ phase_checktest() {
     return $rc
 }
 
+# ================================================================== smoke: every phase and system on tiny data
+# run.sh again in its own DBCMP (SMOKE_DIR, under /var/tmp): prep p1 p2 p3 p4 with every system and variant, 10 series
+# x 650 k rows (agg7d windows need > 604800), 4 data sets for p1, REPS=1, SECS=1, batches of 1 and 10, short settles,
+# SMOKE=1 (no quiet gate; BENCH.lock shared, per step). Nothing it measures is a result: it passes when every phase
+# is DONE, i.e. every answer check passed and no step failed. The tools and downloads (ClickHouse binary, DuckDB,
+# chDB, IoTDB's venv, the hydraulic text files) stay the main DBCMP's; the images must be pulled.
+phase_smoke() {
+    local S=${SMOKE_DIR:-/var/tmp/dbcmp-smoke/full} t0=$SECONDS rc=0
+    case $S in /var/tmp/?*) ;; *) log "smoke: SMOKE_DIR must be under /var/tmp, not $S"; return 1 ;; esac
+    rm -rf "$S/results"; mkdir -p "$S/results"
+    log "SMOKE START: run.sh prep p1 p2 p3 p4 in $S (log $S/results/driver.log)"
+    env DBCMP="$S" WORK="$S/work" DATA="$S/input/mixed.rowbinary" IN="$S/sizes/in" OUT="$S/results" \
+        CLICKHOUSE="$CLICKHOUSE" DUCKDB_DIR="$DUCKDB_DIR" CHDB_DIR="$CHDB_DIR" IOT_VENV="$IOT_VENV" HYD_RAW="$HYD_RAW" \
+        BENCH_LOCK="$LOCK" TSDB_TREE="$TSDB_TREE" TB="$TB" BIN="$BIN" \
+        SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10" \
+        PREP_SERIES=10 PREP_POINTS=650000 PREP_SIZE_POINTS=200000 PREP_SPEC=400 \
+        DSLIST="${SMOKE_DS:-hdd_temp vibration hyd_CE hyd_PS1}" \
+        IOT_STABLE=40 TD_STABLE=20 VM_STABLE=10 \
+        I3_P2_FLAGS="--force-snapshot-max-age 2m" I3_P2_MIN=150 I3_P1_AGE=2m I3_P1_MIN=150 \
+        I2_EXTRA="-e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s" PROM_SETTLE_TIMEOUT=1800 \
+        STEP_TIMEOUT=900 UNTIMED_TIMEOUT=1800 CHECK_TIMEOUT=900 QDRIVE_TIMEOUT=300 \
+        "$RDIR/run.sh" prep p1 p2 p3 p4 || rc=1
+    grep -E 'PHASE|FAIL|prep failed|END' "$S/results/driver.log" | tail -n 30 | sed 's/^/  smoke: /' >> "$OUT/driver.log"
+    log "SMOKE $([ $rc = 0 ] && echo DONE || echo FAILED) in $(( (SECONDS - t0) / 60 )) min $(( (SECONDS - t0) % 60 )) s"
+    return $rc
+}
+
 # ================================================================== the systems added for the 0.9.0 rerun
 . "$RDIR/sys_iot.sh"
 . "$RDIR/sys_td.sh"
@@ -1341,12 +1377,15 @@ done
 for a in "$@"; do
     case $a in
         prep) flock -s "$LOCK" "$RDIR/prep.sh" > "$OUT/prep.log" 2>&1 || { log "prep failed (see $OUT/prep.log)"; RC=1; } ;;
-        p[1-5]) runphase "${a#p}" || RC=1 ;;
+        p[1-5]) runphase "${a#p}" || RC=1; TABLES=1 ;;
         smoke) phase_smoke || RC=1 ;;
         checktest) phase_checktest || RC=1 ;;
         *) usage; exit 2 ;;
     esac
 done
+if [ "${TABLES:-0}" = 1 ]; then  # every table with how it was run; a result without its how.json fails the run
+    python3 -I "$RDIR/tables.py" "$OUT" > "$OUT/tables.md" 2> "$OUT/tables.err" || { log "tables.py failed: $(head -3 "$OUT/tables.err" | tr '\n' ';')"; RC=1; }
+fi
 log "run.sh END rc=$RC"
 exit $RC
 }
