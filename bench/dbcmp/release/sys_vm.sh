@@ -5,8 +5,9 @@
 #                                 to the step for its cache (app/vmselect/promql/eval.go AdjustStartEnd)
 #   -search.maxQueryDuration, -search.maxQueueDuration   30 s and 10 s by default: whole-range queries and 32
 #                                 clients over -search.maxConcurrentRequests (16, its default here) would be refused
-#   per core                      a second start with --cpuset-cpus=PERCORE_CPU (Go sees one CPU) and
-#                                 -search.maxWorkersPerQuery=1
+#   per core                      a second start with GOMAXPROCS=1 and -search.maxWorkersPerQuery=1, its process
+#                                 tree pinned to PERCORE_CPU by taskset (pc_pin: rootless Podman has no cpuset
+#                                 controller here, so --cpuset-cpus fails at container init)
 # Durability: an insert is acknowledged from memory; samples reach disk within -inmemoryDataFlushInterval (5 s), and
 # a part is fsynced before parts.json lists it. The timed load ends at the last acknowledgement; force_flush and
 # sync -f after it are timed apart, as for the other systems that do not sync at ack.
@@ -128,11 +129,14 @@ p2_vm() {
     done
     bcheck vm "$D" && bsuite vm vm "$D" $Q ""
     ctr_alive rb-vm "p2 vm after the query suites" && ctr_mem rb-vm "$D/mem.txt"
-    # per core: a fresh start on one CPU (the Go runtime then sees one CPU) with one worker per query
+    # per core: a fresh start with one Go P (GOMAXPROCS=1, which VictoriaMetrics' cgroup code keeps) and one worker per
+    # query, every thread pinned to PERCORE_CPU by taskset as the other containers
     if [ -s "$D/check-batch-vm.txt" ] && ! grep -qE 'mismatches [1-9]' "$D/check-batch-vm.txt"; then
         crm rb-vm
-        if vm_start "$W" --cpuset-cpus "$PERCORE_CPU" -- -search.maxWorkersPerQuery=1; then
-            { podman inspect rb-vm --format '{{json .Config.Cmd}} cpuset {{.HostConfig.CpusetCpus}}'
+        if vm_start "$W" -e GOMAXPROCS=1 -- -search.maxWorkersPerQuery=1 && pc_pin rb-vm; then
+            { podman inspect rb-vm --format '{{json .Config.Cmd}} env {{json .Config.Env}}'
+              echo "pinned to CPU $PERCORE_CPU (taskset, whole container tree): $(taskset -cp \
+                  "$(podman inspect -f '{{.State.Pid}}' rb-vm)" 2>&1)"
               vm_get /metrics | grep -E '^(vm_available_cpu_cores|go_gomaxprocs)'; echo "rows $(vm_count)"; } > "$D/config.pc.txt" 2>&1
             PC=1 bsuite vm vm "$D" $Q ""
             ctr_alive rb-vm "p2 vm per core" && ctr_mem rb-vm "$D/mem.txt"
