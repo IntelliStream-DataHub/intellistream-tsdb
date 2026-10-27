@@ -260,10 +260,19 @@ class TD:
             g[0] += c; g[1] += s_; g[2] += mn; g[3] += mx; g[4] += 1
         return {k: tuple(float(v) for v in g) for k, g in d.items()}
 
-RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day"), "prom": Prom, "iot": IOT, "td": TD}
+RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day"), "prom": Prom, "vm": Prom, "iot": IOT, "td": TD}
 
 def close(a, b, rel):  # False for NaN on either side: a NaN answer is a mismatch
     return a == b or abs(a - b) <= rel * max(abs(a), abs(b), 1e-300)
+
+# VictoriaMetrics stores each value as a decimal of about 12 significant digits (lib/decimal FromFloat: conversion
+# precision 1e12), so every value it sums may be off by 1e-12 of itself; a float32 still reads back exactly. Its sums
+# are therefore also accepted within n * max|value| * 2e-12, which only matters where positive and negative values
+# cancel (a sum near zero); counts, min and max are checked as for every system.
+DECIMAL_REL = {"vm": 2e-12}.get(sys.argv[2] if sysname == "--batch" and len(sys.argv) > 2 else sysname, 0.0)
+
+def sum_close(g, e, n, mn, mx):
+    return close(g, e, 1e-9) or (DECIMAL_REL > 0 and abs(g - e) <= n * max(abs(mn), abs(mx)) * DECIMAL_REL)
 
 def main():
     run = RUNNERS[sysname]()
@@ -285,14 +294,14 @@ def main():
                 ok = n == 1 and got[0][0] == r["first"] and close(got[0][1], r["v"], 1e-7)
             else:
                 ok = n == r["n"] and (n == 0 or (got[0][0] == r["first"] and got[-1][0] == r["last"]))
-                ok = ok and close(s, r["sum"], 1e-9)
+                ok = ok and sum_close(s, r["sum"], n, min((v for _, v in got), default=0), max((v for _, v in got), default=0))
                 worst_sum = max(worst_sum, abs(s - r["sum"]) / max(abs(r["sum"]), 1e-300))
             if not ok: print("MISMATCH", cls, k, "got", n, s, got[:1], got[-1:], "ref", r)
         else:
             b = r["b"]
             ok = len(got) == len(b)
             for g, e in zip(got, b):
-                if not (g[0] == e[0] and g[1] == e[1] and close(g[2], e[2], 1e-9) and close(g[3], e[3], 1e-7) and close(g[4], e[4], 1e-7)):
+                if not (g[0] == e[0] and g[1] == e[1] and sum_close(g[2], e[2], e[1], e[3], e[4]) and close(g[3], e[3], 1e-7) and close(g[4], e[4], 1e-7)):
                     ok = False
                 worst_sum = max(worst_sum, abs(g[2] - e[2]) / max(abs(e[2]), 1e-300))
             if not ok: print("MISMATCH", cls, k, "got", len(got), got[:2], "ref", len(b), b[:2])
@@ -307,7 +316,7 @@ def main():
         okc = len(d) == NSERIES
         for s in range(NSERIES):
             e = fref[(n, s)]; g = d.get(s)
-            if g is None or not (g[0] == e[0] and g[4] == e[4] and close(g[1], e[1], 1e-9) and close(g[2], e[2], 1e-7) and close(g[3], e[3], 1e-7)):
+            if g is None or not (g[0] == e[0] and g[4] == e[4] and sum_close(g[1], e[1], e[0], e[2], e[3]) and close(g[2], e[2], 1e-7) and close(g[3], e[3], 1e-7)):
                 okc = False
                 print("MISMATCH full", n, s, "got", g, "ref", e)
                 break
@@ -321,9 +330,9 @@ def same_window(r, g):
         if r["n"] != g["n"]: return False
         if r["n"] == 0: return True
         if r["cls"] == "point": return g["first"] == r["first"] and close(g["v"], r["v"], 1e-7)
-        return g["first"] == r["first"] and g["last"] == r["last"] and close(g["sum"], r["sum"], 1e-9)
+        return g["first"] == r["first"] and g["last"] == r["last"] and sum_close(g["sum"], r["sum"], r["n"], g.get("mn", 0), g.get("mx", 0))
     return len(g["b"]) == len(r["b"]) and all(
-        x[0] == y[0] and x[1] == y[1] and close(x[2], y[2], 1e-9) and close(x[3], y[3], 1e-7) and close(x[4], y[4], 1e-7)
+        x[0] == y[0] and x[1] == y[1] and sum_close(x[2], y[2], y[1], y[3], y[4]) and close(x[3], y[3], 1e-7) and close(x[4], y[4], 1e-7)
         for x, y in zip(g["b"], r["b"]))
 
 def dumps(ref_w, ref_f, got_w, got_f):
@@ -347,7 +356,7 @@ def dumps(ref_w, ref_f, got_w, got_f):
     for l in open(got_f):
         x = json.loads(l); e = fref.get((x["full"], x["s"])); g = x["d"]
         seen.add((x["full"], x["s"]))
-        if e is None or not (g[0] == e[0] and g[4] == e[4] and close(g[1], e[1], 1e-9) and close(g[2], e[2], 1e-7) and close(g[3], e[3], 1e-7)):
+        if e is None or not (g[0] == e[0] and g[4] == e[4] and sum_close(g[1], e[1], e[0], e[2], e[3]) and close(g[2], e[2], 1e-7) and close(g[3], e[3], 1e-7)):
             bad += 1
             print("MISMATCH full", x["full"], x["s"], "got", g, "ref", e)
         checked[f"full{x['full']}"] = checked.get(f"full{x['full']}", 0) + 1
@@ -403,7 +412,7 @@ def batch_main(sysname, ngroups):
                     ok = sorted(d) == sorted(want)
                     for s in want:
                         e, x = fref[(n, s)], d.get(s)
-                        if x is None or not (x[0] == e[0] and x[4] == e[4] and close(x[1], e[1], 1e-9) and close(x[2], e[2], 1e-7) and close(x[3], e[3], 1e-7)):
+                        if x is None or not (x[0] == e[0] and x[4] == e[4] and sum_close(x[1], e[1], e[0], e[2], e[3]) and close(x[2], e[2], 1e-7) and close(x[3], e[3], 1e-7)):
                             ok = False
                     if not ok: print("MISMATCH batch", f"full{n}.b{k}", want[:3], "got", sorted(d)[:5])
                     bad += not ok
@@ -416,7 +425,7 @@ def batch_main(sysname, ngroups):
             if done >= ngroups: break
             if any(x["i"] not in ref for x in g): continue
             singles = [gen(st, x["series"], x["start"], x["end"], x["bk"]) for x in g]
-            if sysname == "prom":  # K requests on one connection: the batch is the members' requests in order
+            if sysname in ("prom", "vm"):  # K requests on one connection: the batch is the members' requests in order
                 ok = line == " && ".join(singles)
                 answers = {m: run.rows(st, q) for m, q in enumerate(singles)}
             else:

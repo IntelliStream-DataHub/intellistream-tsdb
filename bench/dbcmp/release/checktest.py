@@ -110,6 +110,20 @@ def windows_cases(ref_w, ref_f):
         m = copy.deepcopy(F); del m[0]; case("full: a series missing", False, run(W, m))
     shutil.rmtree(d)
 
+def decimal_cases():
+    """check.py's sum tolerance for VictoriaMetrics' 12-digit decimals: only for vm (also under --batch), only within
+    n * max|value| * 2e-12."""
+    def sum_close(argv, *x):
+        code = ("import json, sys; sys.argv = %r; sys.path.insert(0, %r); import check; print(check.sum_close(*json.loads(%r)))"
+                % (argv, os.path.join(HERE, ".."), json.dumps(x)))
+        return subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, check=True).stdout.strip() == "True"
+    near0 = (1e-4 + 5e-13, 1e-4, 300, -1.24, 1.17)   # a cancelling sum, off by VictoriaMetrics' rounding
+    case("decimal: vm near-zero sum off by its rounding", True, sum_close(["check.py", "vm"], *near0))
+    case("decimal: vm --batch near-zero sum off by its rounding", True, sum_close(["check.py", "--batch", "vm"], *near0))
+    case("decimal: prom near-zero sum off by 5e-13 (exact doubles)", False, sum_close(["check.py", "prom"], *near0))
+    case("decimal: vm sum off by 1e-9 relative", False, sum_close(["check.py", "vm"], 100.0 * (1 + 1e-9), 100.0, 100, 0.5, 1.5))
+    case("decimal: vm NaN sum", False, sum_close(["check.py", "vm"], float("nan"), 1e-4, 300, -1.24, 1.17))
+
 def main():
     a = sys.argv[1:]
     if not a or a[0] != "mutate": raise SystemExit("usage: checktest.py mutate [TWA_REF WINDOWS_REF FULL_REF]")
@@ -119,6 +133,7 @@ def main():
     else:
         ref = builtin_twa(); print("TWA reference: built in")
     twa_cases(ref)
+    decimal_cases()
     if len(a) >= 4:
         windows_cases(a[2], a[3])
     print("checktest", "OK" if failures == 0 else f"FAILED ({failures} cases)")

@@ -46,7 +46,7 @@ def window_line(sysname, members):
         return mkq.i2ql_get("; ".join(mkq.influxql(*x) for x in members))
     if sysname == "i2flux":
         return mkq.flux_post("\n".join(flux_member(m, mkq.flux(*x)) for m, x in enumerate(members)))
-    if sysname == "prom":
+    if sysname in ("prom", "vm"):
         return " && ".join(mkq.prom(*x) for x in members)
     raise SystemExit(f"mkbatch: no batch form for {sysname}")
 

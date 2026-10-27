@@ -4,7 +4,7 @@
 #
 # SYS: ch, chday (ClickHouse, monthly / daily partitions), ts (TimescaleDB), qdb (QuestDB, PostgreSQL
 # wire), qdbh (QuestDB, HTTP /exec), i2ql (InfluxDB 2, InfluxQL), i2flux (InfluxDB 2, Flux), i3 (InfluxDB 3),
-# prom (Prometheus, PromQL), iot (IoTDB, table model SQL over REST), td (TDengine, SQL over taosAdapter's REST).
+# prom (Prometheus, PromQL; vm: VictoriaMetrics, the same PromQL), iot (IoTDB, table model SQL over REST), td (TDengine, SQL over taosAdapter's REST).
 #
 # Every system answers the same logical query: rows in [start, end) of one series, and buckets
 # aligned to the epoch whose width is a number of the series' own samples. For HTTP systems a line
@@ -178,7 +178,7 @@ def prom(cls, s, a, b, bk):
         reqs.append(prom_get("/api/v1/query", query=" or ".join(edges), time=psec(b - 1)))
     return " && ".join(reqs)
 
-GEN = {"i3": lambda *x: i3_get(i3(*x)), "i2ql": lambda *x: i2ql_get(influxql(*x)), "i2flux": lambda *x: flux_post(flux(*x)), "qdb": qdb, "qdbh": lambda *x: http_get("/exec?query=", qdb(*x)), "ts": ts, "ch": ch, "chday": lambda *x: ch(*x, table="cmp.t100m_day"), "prom": prom, "iot": lambda *x: iot_post(iot(*x)), "td": lambda *x: td_post(td(*x))}
+GEN = {"i3": lambda *x: i3_get(i3(*x)), "i2ql": lambda *x: i2ql_get(influxql(*x)), "i2flux": lambda *x: flux_post(flux(*x)), "qdb": qdb, "qdbh": lambda *x: http_get("/exec?query=", qdb(*x)), "ts": ts, "ch": ch, "chday": lambda *x: ch(*x, table="cmp.t100m_day"), "prom": prom, "vm": prom, "iot": lambda *x: iot_post(iot(*x)), "td": lambda *x: td_post(td(*x))}
 
 # ---- whole-range queries (a: one bucket per series, b: buckets of n samples)
 def step_sql(col, kind):  # the sample step of a series, as SQL (kind = series % 7)
@@ -300,7 +300,7 @@ def prom_full(n):
         reqs += prom_buckets(sel, lo, hi, w)
     return " && ".join(reqs)
 
-FULL = {"i3": lambda n: i3_get(i3_full(n)), "i2ql": lambda n: i2ql_get(influxql_full(n)), "i2flux": lambda n: flux_post(flux_full(n)), "qdb": qdb_full, "qdbh": lambda n: http_get("/exec?query=", qdb_full(n)), "ts": ts_full, "ch": ch_full, "chday": lambda n: ch_full(n, "cmp.t100m_day"), "prom": prom_full, "iot": lambda n: iot_post(iot_full(n)), "td": lambda n: td_post(td_full(n))}
+FULL = {"i3": lambda n: i3_get(i3_full(n)), "i2ql": lambda n: i2ql_get(influxql_full(n)), "i2flux": lambda n: flux_post(flux_full(n)), "qdb": qdb_full, "qdbh": lambda n: http_get("/exec?query=", qdb_full(n)), "ts": ts_full, "ch": ch_full, "chday": lambda n: ch_full(n, "cmp.t100m_day"), "prom": prom_full, "vm": prom_full, "iot": lambda n: iot_post(iot_full(n)), "td": lambda n: td_post(td_full(n))}
 
 if __name__ == "__main__":
     import os

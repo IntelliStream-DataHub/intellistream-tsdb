@@ -11,16 +11,16 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 TOOLS=$RDIR
 DSLIST=${DSLIST:-"$DS_KINDS $DS_HYD"}
-P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom iot iotz td tdz"}
-P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3 iot iotz td tdz"}
+P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom iot iotz td tdz vm"}
+P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3 iot iotz td tdz vm"}
 I3_P2_FLAGS=${I3_P2_FLAGS:-}            # smoke runs only: e.g. --force-snapshot-max-age 2m
 I3_P2_MIN=${I3_P2_MIN:-600}
 I3_P1_AGE=${I3_P1_AGE:-5m} I3_P1_MIN=${I3_P1_MIN:-420}
 I2_EXTRA=${I2_EXTRA:-}                  # smoke runs only: e.g. -e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s
 PROM_SETTLE_TIMEOUT=${PROM_SETTLE_TIMEOUT:-36000}
 P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320}
-CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot rb-td"
-PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080|6041)\b'
+CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot rb-td rb-vm"
+PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080|6041|8428)\b'
 mkdir -p "$OUT"
 
 # ------------------------------------------------------------------ logging, quiet gate, timed steps
@@ -1272,6 +1272,7 @@ phase_checktest() {
 # ================================================================== the systems added for the 0.9.0 rerun
 . "$RDIR/sys_iot.sh"
 . "$RDIR/sys_td.sh"
+. "$RDIR/sys_vm.sh"
 
 # ================================================================== main
 machine() {
@@ -1281,7 +1282,7 @@ machine() {
         echo "tsdb tree: $TSDB_TREE $(git -C "$TSDB_TREE" rev-parse HEAD) ($(git -C "$TSDB_TREE" diff --stat | tail -1))"
         echo "harness: $ROOT $(git -C "$ROOT" rev-parse HEAD)"
         podman --version
-        for i in $CH_IMG $TS_IMG $TSHA_IMG $QDB_IMG $I2_IMG $I3_IMG "$PROM_IMG" $IOT_IMG; do echo "$i $(podman image inspect --format '{{.Digest}} {{.Created}}' "$i" 2> /dev/null)"; done
+        for i in $CH_IMG $TS_IMG $TSHA_IMG $QDB_IMG $I2_IMG $I3_IMG "$PROM_IMG" $IOT_IMG $TD_IMG $VM_IMG; do echo "$i $(podman image inspect --format '{{.Digest}} {{.Created}}' "$i" 2> /dev/null)"; done
         echo "duckdb: $DUCKDB_DIR (libduckdb-linux-amd64.zip sha256 $DUCKDB_SHA)"
         echo "chdb: $CHDB_DIR (chdb-core v26.9.0 of 2026-09-28, linux-x86_64-libchdb.tar.gz sha256 $CHDB_SHA)"
         echo "REPS=$REPS SECS=$SECS QUIET_MAX=$QUIET_MAX"
