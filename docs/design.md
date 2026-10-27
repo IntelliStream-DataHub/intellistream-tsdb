@@ -1378,6 +1378,15 @@ included (`--request-threads`, default all), so that many concurrent
 requests share the CPUs instead of each taking all of them. The caller of a
 job always works on it: a job finishes even when every helper is busy.
 
+Under load a job asks for no more than its share: 1 + helpers / requests
+in flight. With as many concurrent requests as CPUs, each runs on its own
+thread and wakes nobody: the helpers would be busy with the other requests,
+and waking them costs locks, wake-ups and caches for nothing (an A/B run
+showed small aggregates 10 to 38 % slower at 32 clients before this rule).
+A lone request still gets every helper. The opener of a job wakes two
+helpers and each helper that joins wakes two more, so the opener starts on
+its own items after two wake-ups instead of one per helper.
+
 How many threads one query step uses follows its work
 (`query_threads_for` in src/query.c): small reads run on the calling thread
 alone, with no wake-up and no cache traffic; large ones spread out, one
