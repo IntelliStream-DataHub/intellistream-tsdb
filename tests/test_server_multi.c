@@ -8,6 +8,8 @@
 #include "harness.h"
 
 #include <limits.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -618,6 +620,101 @@ static void test_cancel_pipeline(void)
     close(fd);
 }
 
+typedef struct {
+    int fd;
+    const uint8_t *fill;
+    size_t nfill;
+    atomic_bool stop;
+} flood;
+
+static bool send_all(int fd, const uint8_t *p, size_t n)
+{
+    while (n) {
+        ssize_t k = send(fd, p, n, MSG_NOSIGNAL);
+        if (k <= 0)
+            return false;
+        p += k;
+        n -= (size_t)k;
+    }
+    return true;
+}
+
+static void *flood_fn(void *arg)
+{
+    flood *f = arg;
+    static uint8_t cancels[4096 * 13];
+    for (int i = 0; i < 4096; i++) {
+        uint32_t l = 9, id = 0, nobody = 77;
+        memcpy(cancels + i * 13, &l, 4);
+        memcpy(cancels + i * 13 + 4, &id, 4);
+        cancels[i * 13 + 8] = TSDB_OP_CANCEL;
+        memcpy(cancels + i * 13 + 9, &nobody, 4);
+    }
+    if (!send_all(f->fd, f->fill, f->nfill))
+        return NULL;
+    while (!atomic_load(&f->stop) && send_all(f->fd, cancels, sizeof cancels)) {
+    }
+    return NULL;
+}
+
+/* A connection stalls its reply (it does not read), queues many requests behind it and floods CANCELs naming
+ * nobody: the loop thread must not walk the queue for every CANCEL (it did: 350 ms for a point query on another
+ * connection with 30,000 LAST_STATS queued). Queued with 30,000 LAST_STATS, then with 20,000 small multis. */
+static void test_cancel_flood(void)
+{
+    uint32_t d[32];
+    for (int i = 0; i < 32; i++)
+        d[i] = big_id;
+    for (int kind = 0; kind < 2; kind++) {
+        size_t nreq = kind ? 20000 : 30000, per = 0;
+        uint8_t m[128], t[29];
+        if (kind) {
+            values_tmpl(t, TSDB_MANY_SERIES, T0, T0 + 1);
+            per = multi_frame(m + 9, TSDB_OP_QUERY_VALUES, 0, 1, ids, t, 29);
+        }
+        uint8_t *fill = malloc(nreq * (9 + per));
+        CHECK(fill != NULL);
+        for (size_t i = 0; i < nreq; i++) {
+            uint8_t *f = fill + i * (9 + per);
+            uint32_t l = (uint32_t)(5 + per), id = (uint32_t)(5000 + i);
+            memcpy(f, &l, 4);
+            memcpy(f + 4, &id, 4);
+            f[8] = kind ? TSDB_OP_QUERY_MULTI : TSDB_OP_LAST_STATS;
+            memcpy(f + 9, m + 9, per);
+        }
+        int fd = raw_connect();
+        int small = 4096;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+        raw_values_multi(fd, 1, d, 32); /* its reply stalls the connection's worker */
+        flood f = {.fd = fd, .fill = fill, .nfill = nreq * (9 + per)};
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, flood_fn, &f) == 0);
+        usleep(500000);
+        tsdbc *c2;
+        OK(tsdbc_connect("127.0.0.1", port, &c2));
+        double sum = 0, worst = 0;
+        for (int k = 0; k < 20; k++) {
+            one o = {0};
+            double a = now_ms();
+            CHECK(tsdbc_query_values(c2, ids[0], T0, T0 + 1, NULL, one_rows, &o) == 0 && o.n == 1);
+            double dt = now_ms() - a;
+            sum += dt;
+            worst = dt > worst ? dt : worst;
+            free(o.ts);
+            free(o.v);
+        }
+        fprintf(stderr, "CANCEL flood behind %zu %s: point query on another connection mean %.2f ms, max %.2f\n",
+                nreq, kind ? "multis" : "LAST_STATS", sum / 20, worst);
+        CHECK(SANITIZED || sum / 20 < 50);
+        atomic_store(&f.stop, true);
+        shutdown(fd, SHUT_RDWR);
+        pthread_join(th, NULL);
+        close(fd);
+        free(fill);
+        tsdbc_close(c2);
+    }
+}
+
 /* Clients that go away in the middle of large replies (more of them than workers) leave the server serving. */
 static void test_disconnect(tsdbc *c, pid_t pid)
 {
@@ -787,6 +884,7 @@ int main(int argc, char **argv)
     load_big(c);
     test_full_frame(c);
     test_cancel_pipeline();
+    test_cancel_flood();
     test_disconnect(c, pid);
     test_stall(c, pid, 3);
 

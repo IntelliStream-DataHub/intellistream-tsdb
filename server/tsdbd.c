@@ -61,8 +61,9 @@
  * fits), and neither is one with requests waiting while the total is over it; a packed insert waits to unpack
  * while the total would exceed it, unless no other is unpacking. Outside it: up to IN_KEEP of receive buffer per
  * connection, and the replies waiting for a client that does not read them (up to OUT_CAP and one reply per
- * connection, after which its worker waits). A connection with more than PIPE_CAP of requests waiting reads no
- * more until they run, and one whose frame has been started but not completed for --frame-timeout seconds
+ * connection, after which its worker waits). A connection with more than PIPE_CAP of requests (or MULTI_QUEUED
+ * multi-series queries) waiting reads no more until they run, so a CANCEL behind them waits too, and one whose
+ * frame has been started but not completed for --frame-timeout seconds
  * (default 60) while the server waits for its bytes is closed (slow senders); time the server itself held the
  * connection unread does not count. Replies never exceed a frame: a result too large for one is
  * TSDB_ERR_TOO_MANY_BUCKETS. Without authentication, a client can still hold the whole limit with large frames it
@@ -118,6 +119,9 @@
 #endif
 #define RAW_CHUNK_ROWS 16384
 #define PIPE_CAP (4u << 20) /* bytes of requests waiting on one connection before it is read no further */
+/* QUERY_MULTIs waiting on one connection before it is read no further: a CANCEL looks only at them, so what one
+ * CANCEL costs the loop is bounded by this and the multis of one receive buffer, not by the queue's length. */
+#define MULTI_QUEUED 16
 /* A receive buffer up to this size is not counted in the request memory; a frame larger than it gets a buffer of
  * its own size, which is (see the file header). */
 #define IN_KEEP (64u << 10)
@@ -170,6 +174,7 @@ typedef struct req {
     uint8_t *payload; /* malloc'd, so 16-byte aligned */
     size_t len;
     bool cancelled; /* a QUERY_MULTI a CANCEL named while it was queued (main thread) */
+    struct req *mnext; /* the next QUERY_MULTI in the connection's queue (main thread) */
 } req;
 
 /* What a request costs beyond its payload: the struct and two allocations. Counted with the payload, so frames
@@ -183,6 +188,8 @@ typedef struct conn {
     /* main thread only */
     buf in;
     req *q_head, *q_tail;
+    req *mq_head, *mq_tail; /* the QUERY_MULTIs in q, in order (through mnext), for CANCEL */
+    size_t q_multi;         /* how many */
     bool busy;          /* a worker owns this connection's current request */
     bool recv_inflight, send_inflight, closed;
     bool eof;           /* the client sent everything it will: reply to it, then close */
@@ -1649,7 +1656,7 @@ static void submit_recv(conn *c)
 {
     if (c->recv_inflight || c->closed || c->eof || c->parked)
         return;
-    if (c->q_bytes > PIPE_CAP) {
+    if (c->q_bytes > PIPE_CAP || c->q_multi >= MULTI_QUEUED) {
         c->held = true;
         return; /* on_wake resumes it as its requests run */
     }
@@ -1728,6 +1735,13 @@ static void dispatch(conn *c)
         c->q_tail = NULL;
     r->next = NULL;
     c->q_bytes -= REQ_COST(r);
+    if (r->op == TSDB_OP_QUERY_MULTI) { /* the queue's order, so it is the first multi */
+        c->mq_head = r->mnext;
+        if (!c->mq_head)
+            c->mq_tail = NULL;
+        r->mnext = NULL;
+        c->q_multi--;
+    }
     c->busy = true;
     c->run_id = r->id;
     c->run_op = r->op;
@@ -1759,6 +1773,8 @@ static void conn_free(conn *c)
         c->q_head = r->next;
         req_free(r);
     }
+    c->q_tail = c->mq_head = c->mq_tail = NULL;
+    c->q_multi = 0;
     unpark(c);
     free(c->in.p);
     c->in = (buf){0};
@@ -1810,8 +1826,8 @@ static void finish_if_drained(conn *c)
  * the connection's queue. Main thread. */
 static void cancel_multi(conn *c, uint32_t id)
 {
-    for (req *r = c->q_head; r; r = r->next)
-        if (r->op == TSDB_OP_QUERY_MULTI && r->id == id)
+    for (req *r = c->mq_head; r; r = r->mnext)
+        if (r->id == id)
             r->cancelled = true;
     if (c->busy && c->run_op == TSDB_OP_QUERY_MULTI && c->run_id == id)
         atomic_store(&c->cancel_running, true);
@@ -1859,6 +1875,8 @@ static int parse(conn *c)
                 uint32_t target;
                 memcpy(&target, c->in.p + off + 9, 4);
                 cancel_multi(c, target);
+            } else {
+                metrics_error(TSDB_ERR_INVALID); /* no reply to send it in, but a client's bug shows */
             }
             metrics_request_end(TSDB_OP_CANCEL, metrics_request_begin());
             off += need;
@@ -1885,6 +1903,14 @@ static int parse(conn *c)
         else
             c->q_head = r;
         c->q_tail = r;
+        if (r->op == TSDB_OP_QUERY_MULTI) {
+            if (c->mq_tail)
+                c->mq_tail->mnext = r;
+            else
+                c->mq_head = r;
+            c->mq_tail = r;
+            c->q_multi++;
+        }
         off += need;
         consumed = true;
     }

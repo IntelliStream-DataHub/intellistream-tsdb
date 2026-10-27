@@ -143,6 +143,8 @@
  *   CANCEL      u32 id                          -> no reply
  *               a QUERY_MULTI with that id, running or queued on this connection, ends with END STOPPED after the
  *               series in flight; other ids are ignored. Clients send both only to a server whose HELLO says 10.
+ *               tsdbd reads a connection in order and stops reading it while 4 MiB of requests or 16 QUERY_MULTIs
+ *               wait on it: a CANCEL sent behind those is read only as they run.
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H

@@ -1362,6 +1362,9 @@ tsdbc_query_multi(c, &q, ids, n, NULL, on_series, ctx);     /* the same over TCP
   request; past it the request ends with `TOO_MANY_BUCKETS`.
 - **Stopping.** A callback that returns nonzero ends the call; a client
   sends CANCEL and the server ends the request after the series in flight.
+  A CANCEL looks only at the connection's queued QUERY_MULTIs, of which
+  tsdbd reads at most 16 (and 4 MiB of requests) ahead: a CANCEL sent behind
+  more waits until they run.
 - **Local time zones.** The server knows UTC only. For calendar buckets in a
   zone, a client asks for the first and last row of every series (two
   QUERY_MULTI VALUES with a limit of 1), builds one list of bounds for the
