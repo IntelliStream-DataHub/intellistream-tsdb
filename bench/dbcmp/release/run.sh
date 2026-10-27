@@ -69,6 +69,14 @@ tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout
     flock -u 9
     exec 9>&-
     printf '%s\t%s\trc=%d\t%.1fs\tbusy=%s\n' "$(date '+%F %T')" "$label" "$rc" "$(echo "$e - $s" | bc)" "$BUSY" >> "$OUT/steps.log"
+    if [ "$rc" != 0 ] && [ -n "${QREFUSE-}" ] && grep -qE -- "$QREFUSE" "$out"; then
+        # the server refused the query by its own limits (QREFUSE, set per system, e.g. IoTDB's code 719 "not enough
+        # memory"): a result to report as "refused", not a harness failure; renamed so runstats averages no error text
+        mv "$out" "$out.refused"
+        echo "$label: refused by the server: $(grep -m1 -oE -- "$QREFUSE.{0,160}" "$out.refused")" >> "$(dirname "$out")/REFUSED.txt"
+        log "  REFUSED: $label (see $out.refused)"
+        return "$rc"
+    fi
     [ "$rc" = 0 ] || fail "$label: rc $rc (see $out)"
     return "$rc"
 }

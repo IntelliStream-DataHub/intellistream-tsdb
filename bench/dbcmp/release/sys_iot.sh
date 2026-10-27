@@ -5,11 +5,12 @@
 #                        CompactionTaskManager), so settling measures the compaction, not the cap
 #   query_timeout_threshold=3600000             whole-range queries over 100 M rows may take longer than 60 s
 #   enable_rest_service=true, rest_query_default_row_size_limit=2000000   the REST API (18080) that qdrive drives
-#   chunk_timeseriesmeta_free_memory_proportion=1:100:200:50:800:200:200:50:250   the Operators share of the query
-#                        memory 4x its default 200: with the default, 32 concurrent window queries (lead() OVER, the
-#                        TWA classes) are refused with code 719 "not enough memory to execute current fragment
-#                        instance" at a 4 GB and at a 16 GB heap alike (the estimate grows with the heap); IoTDB's FAQ
-#                        (latest-Table/FAQ, "not enough memory") says to raise the heap or this proportion (IOT_QMEM)
+#   query memory proportions: IoTDB's defaults. 32 concurrent window queries (lead() OVER, the TWA classes twa1d and
+#                        twa7d) are refused with code 719 "not enough memory to execute current fragment instance"
+#                        at a 4 GB and a 16 GB heap, and with the Operators share at 4x its default
+#                        (chunk_timeseriesmeta_free_memory_proportion=1:100:200:50:800:200:200:50:250): the estimate
+#                        per fragment grows with the pool (4.4, 16, 34 MB). Those runs are reported as refused
+#                        (QREFUSE, REFUSED.txt), not timed. IOT_QMEM sets the proportion for a trial.
 #   compressor=ZSTD      only in the iotz variant (default LZ4); float encoding stays GORILLA (lossless; never RLE or
 #                        TS_2DIFF on floats: they round to float_precision=2)
 # The REST service binds every address and has no bind setting, so IoTDB runs in its own network namespace
@@ -17,8 +18,8 @@
 IOT_HDR=$'Authorization: Basic cm9vdDpyb290\r\n'   # root:root, the default user
 IOT_MEM=${IOT_MEM:-24g}                             # container limit, as InfluxDB 2's 24g; heap below
 IOT_JMX=${IOT_JMX:--Xms16G -Xmx16G -XX:MaxDirectMemorySize=4G}
-IOT_QMEM=${IOT_QMEM-1:100:200:50:800:200:200:50:250}   # read memory: BloomFilter:ChunkCache:TSMetaCache:
-                                                      # Coordinator:Operators:DataExchange:timeIndex:..:Subscription
+IOT_QMEM=${IOT_QMEM-}   # empty: IoTDB's default; else BloomFilter:ChunkCache:TSMetaCache:Coordinator:Operators:
+                        # DataExchange:timeIndex:..:Subscription (default 1:100:200:50:200:200:200:50:250)
 IOT_STABLE=${IOT_STABLE:-180}                       # settle: TsFiles unchanged this long (3 compaction schedules)
 IOT_SETTLE_MAX=${IOT_SETTLE_MAX:-10800}
 IOT_PROCS=${IOT_PROCS:-8} IOT_TABLET=${IOT_TABLET:-100000}
@@ -112,6 +113,10 @@ p2_iot() {
     local D=$OUT/p2/$v W=$DBCMP/s2/$v r n Q="http 127.0.0.1 18080"
     # IoTDB's REST service answers a failed query with status 200 and {"code":...}: qdrive fails on that prefix
     local QDRIVE_ERR='{"code":'; export QDRIVE_ERR
+    # code 719: IoTDB refuses a fragment whose estimated operator memory exceeds what is left of its pool. 32
+    # concurrent lead()-window TWA queries (twa1d, twa7d) hit it at a 16 GB heap with the Operators share at 4x the
+    # default (smokes iot2-iot4: the estimate grows with the pool); reported as refused at that concurrency
+    local QREFUSE='"code":719'; export QREFUSE
     mkdir -p "$D"
     for r in $(seq "$REPS"); do
         crm rb-iot; rmdata "$W"
