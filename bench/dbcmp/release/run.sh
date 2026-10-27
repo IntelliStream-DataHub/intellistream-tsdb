@@ -151,16 +151,17 @@ qdb_wait_table() { # TABLE: until every WAL transaction is applied
     done
     return 1
 }
+TS_WORK_MEM=${TS_WORK_MEM:-256MB}  # REPORT §5.11: the default (timescaledb-tune: 6 MB) spills TWA's window sorts to disk
 ts_start() { # NAME IMAGE DATADIR MOUNTPOINT: TimescaleDB on 127.0.0.1:5434 with $IN or $DBCMP/input on /data
     local name=$1 img=$2 W=$3 mnt=$4 i
     mkdir -p "$W"
     if [ "$name" = rb-tsha ]; then
         podman unshare chown 1000:1000 "$W"
         podman run -d --name "$name" --network host -v "$W:/home/postgres/pgdata" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
-            -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 > /dev/null 9>&- || { fail "$name start"; return 1; }
+            -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 -c work_mem=$TS_WORK_MEM > /dev/null 9>&- || { fail "$name start"; return 1; }
     else
         podman run -d --name "$name" --network host -v "$W:/var/lib/postgresql/data" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
-            -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 > /dev/null 9>&- || { fail "$name start"; return 1; }
+            -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 -c work_mem=$TS_WORK_MEM > /dev/null 9>&- || { fail "$name start"; return 1; }
     fi
     # the image runs initdb and its init scripts on a temporary server first: wait for the extension, then again
     for i in $(seq 300); do
@@ -267,11 +268,18 @@ chsuite() { # PREFIX DIR TABLE-SYS(ch): ch_bench.sh with REPS runs per measureme
     local P=$1 D=$2 S=$3 n c t
     for n in ${FULLS-$FULLS_DEFAULT}; do
         chbench1 1 1 0 "$WORK/q/$S.full$n.txt" > /dev/null 2> "$D/warm.$P.full$n" 9>&-
-        reps "$P.full$n" "$D" -- chbench1 1 1 0 "$WORK/q/$S.full$n.txt"
+        for r in $(seq "$REPS"); do tstep "$P.full$n r$r" "$D/$P.full$n.$r" -- chbench_tag "$P.full$n.$r.$$" 1 1 0 "$WORK/q/$S.full$n.txt"; done
+        # like with like (REPORT §3): one query per series, 16 at a time, as tsdbq full 16 sends them
+        for r in $(seq "$REPS"); do
+            sed "s/@TAG@/$P.full$n.per.c16.$r.$$/" "$WORK/q/$S.full$n.per.http" > "$D/per.http"
+            tstep "$P.full$n.per.c16 r$r" "$D/$P.full$n.per.c16.$r" -- bash -c "'$B/qdrive' http 127.0.0.1 8123 '' '$D/per.http' 16 100000 0 && chqlog '$P.full$n.per.c16.$r.$$'"
+        done
     done
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
         chbench1 1 0 3 "$WORK/q/$S.$c.txt" > /dev/null 2> "$D/warm.$P.$c" 9>&-
-        for t in 1 32; do reps "$P.$c.c$t" "$D" -- chbench1 "$t" 0 "$SECS" "$WORK/q/$S.$c.txt"; done
+        for t in 1 32; do for r in $(seq "$REPS"); do
+            tstep "$P.$c.c$t r$r" "$D/$P.$c.c$t.$r" -- chbench_tag "$P.$c.c$t.$r.$$" "$t" 0 "$SECS" "$WORK/q/$S.$c.txt"
+        done; done
     done
 }
 tsdbsuite() { # PREFIX DIR CLASS-THREADS("1 32"): tsdbq qps classes against $TSDB_PORT
@@ -628,6 +636,11 @@ p2_tsdb() {
     # partitions merged (README row "tsdbd, 1 connection, partitions merged")
     tstep "p2 tsdb optimize" "$D/optimize.txt" -- bash -c "'$TB/tsdbstat' optimize && du -sb --exclude='retired_*' '$W/db'"
     tstep "p2 tsdb merged full c1" "$D/merged.full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
+    tstep "p2 tsdb merged full c16" "$D/merged.full.c16.txt" -- "$TB/tsdbq" full 16 "$REPS"
+    tstep "p2 tsdb merged lttb c1" "$D/merged.lttb.c1.txt" -- "$B/relq" lttb 1 "$REPS"
+    tstep "p2 tsdb merged lttb c16" "$D/merged.lttb.c16.txt" -- "$B/relq" lttb 16 "$REPS"
+    tstep "p2 tsdb merged twa c1" "$D/merged.twa.c1.txt" -- "$B/relq" twa 1 "$REPS"
+    tstep "p2 tsdb merged twa c16" "$D/merged.twa.c16.txt" -- "$B/relq" twa 16 "$REPS"
     tsdbsuite merged "$D" "1"
     tsdbbsuite merged "$D"
     tsdbd_percore "$W/db" && PC=1 tsdbbsuite merged "$D"
@@ -657,6 +670,7 @@ p2_ch() {
     cd "$WORK" || return 1
     python3 -I "$H/mkq.py" ch
     untimed "$D/check.txt" python3 -I "$H/check.py" ch 200
+    (cd "$WORK" && python3 -I "$H/mkbatch.py" ch) || fail "mkbatch ch"
     chsuite ch "$D" ch
     bcheck ch "$D" && { chbsuite ch "$D" ch; pc_pin rb-ch && PC=1 chbsuite ch "$D" ch; pc_unpin rb-ch; }
     REL q ch lttb > "$D/q.lttb.sql"; REL q ch twa > "$D/q.twa.sql"
@@ -758,6 +772,9 @@ p2_ts() {
     untimed "$D/check.txt" python3 -I "$H/check.py" ts 200
     qsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
     bcheck ts "$D" && {
+        for n in ${FULLS-$FULLS_DEFAULT}; do  # like with like (REPORT §3, §5.11): one query per series, 16 connections
+            reps "ts.full$n.per.c16" "$D" -- "$B/qdrive" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'" "$WORK/q/ts.full$n.per.txt" 16 100000 0
+        done
         bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
         pc_pin rb-ts && PC=1 bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC -c max_parallel_workers_per_gather=0'"
         pc_unpin rb-ts; }
@@ -777,6 +794,8 @@ p2_ts() {
     REL q ts lttb > "$D/q.lttb.sql"; REL q ts twa > "$D/q.twa.sql"
     untimed "$D/check-lttb.txt" REL check ts lttb ref/lttb.jsonl
     untimed "$D/check-twa.txt" REL check ts twa ref/twa.jsonl
+    untimed "$D/explain-twa.txt" PSQL -c "EXPLAIN (ANALYZE, BUFFERS) $(cat "$D/q.twa.sql")"
+    grep -q 'Disk' "$D/explain-twa.txt" && log "  ts: the TWA plan still spills to disk with work_mem=$TS_WORK_MEM (see $D/explain-twa.txt)"
     local PG="host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
     qline lttb "$D" "$D/q.lttb.sql" pg "$PG"
     qline twa "$D" "$D/q.twa.sql" pg "$PG"

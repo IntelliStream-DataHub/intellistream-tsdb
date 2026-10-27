@@ -1,5 +1,6 @@
 # Writes the batches of batches.tsv in one system's dialect, one request per line (the input of qdrive and
-# clickhouse-benchmark):  q/SYS.fullN.bK.txt (N = 0, 3600, 60) and q/SYS.CLASS.bK.txt (K = 1, 10, 100).
+# clickhouse-benchmark):  q/SYS.fullN.bK.txt (N = 0, 3600, 60) and q/SYS.CLASS.bK.txt (K = 1, 10, 100), and
+# q/SYS.fullN.per.txt, the whole range as one query per series.
 # Run in $WORK:  python3 -I mkbatch.py SYS      (SYS as for mkq.py)
 #
 # A batch is one request wherever the query language allows it, built from mkq.py's single queries so that
@@ -63,6 +64,13 @@ def write(path, lines):
 if __name__ == "__main__":
     sysname = sys.argv[1]
     os.makedirs("q", exist_ok=True)
+    # the whole range as one query per series (REPORT §3: tsdb's 16 connections against 16 parallel per-series
+    # queries); ClickHouse's also as HTTP lines for qdrive, tagged @TAG@ (run.sh puts in each run's log_comment)
+    for n in (0, 3600, 60):
+        per = [full_line(sysname, n, [x]) for x in range(mkq.NSERIES)]
+        write(f"q/{sysname}.full{n}.per.txt", per)
+        if sysname in ("ch", "chday"):
+            write(f"q/{sysname}.full{n}.per.http", ["POST /?log_comment=@TAG@\ttext/plain\t" + q for q in per])
     for (st, k), grps in batches.read().items():
         if st == "full":
             for n in (0, 3600, 60):

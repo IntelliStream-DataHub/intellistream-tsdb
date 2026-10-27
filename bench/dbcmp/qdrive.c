@@ -6,7 +6,8 @@
  *
  * Each thread has its own connection; thread i runs queries i, i+T, i+2T, ... of the file
  * (wrapping) until SECONDS have passed or it has run MAXQ queries, so all threads together walk
- * the file in order. Every response is read completely (libpq fetches whole results), and any
+ * the file in order. MAXQ 0 runs every query of the file exactly once instead, each thread taking the
+ * next one when it is free (100 per-series queries on 16 connections, say). Every response is read completely (libpq fetches whole results), and any
  * failed query stops the run rather than being counted. Prints queries, q/s, and the median and
  * p99 latency over all queries.
  *
@@ -35,7 +36,8 @@ static int mode_pg;
 static const char *host, *headers, *conninfo;
 static int port, threads;
 static double seconds;
-static long maxq = -1;
+static long maxq = -1;  /* queries per thread; 0: every query of the file once, taken from a shared queue */
+static size_t next_q;
 static char **qs;
 static size_t nq;
 
@@ -70,7 +72,11 @@ static void *run(void *arg)
         exit(1);
     double t0 = now();
     for (size_t i = (size_t)j->id;; i += (size_t)threads) {
-        if ((maxq >= 0 && (long)j->n >= maxq) || now() - t0 >= seconds) break;
+        if (maxq == 0) { /* the file once, as a shared queue: the next query goes to the first free thread */
+            i = __atomic_fetch_add(&next_q, 1, __ATOMIC_RELAXED);
+            if (i >= nq) break;
+        } else if ((maxq > 0 && (long)j->n >= maxq) || now() - t0 >= seconds)
+            break;
         const char *q = qs[i % nq];
         double a = now();
         if (mode_pg) {
