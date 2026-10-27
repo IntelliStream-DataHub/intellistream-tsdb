@@ -31,6 +31,7 @@ TSHA_IMG=docker.io/timescale/timescaledb-ha:pg17.11-ts2.31.0
 QDB_IMG=docker.io/questdb/questdb:10.1.0
 I2_IMG=docker.io/library/influxdb:2.7.12
 I3_IMG=docker.io/library/influxdb:3.12.1-core
+TD_IMG=docker.io/tdengine/tsdb:3.4.2.8@sha256:44f58e6f9b013bccb94c4a27dd0ec7bca2982474fd3b390cafb48f709db1f0b1
 IOT_IMG=docker.io/apache/iotdb:2.0.11-standalone@sha256:5ace0f3eceff892dd349d02288224c966f3fdeb11d08c4f575b642a110b82338
 PROM_IMG=docker.io/prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
 IOT_VENV=${IOT_VENV:-/var/tmp/dbcmp/venv-iotdb}   # python3 -m venv + pip install -r iotdb-requirements.txt

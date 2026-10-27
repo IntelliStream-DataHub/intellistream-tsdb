@@ -16,7 +16,8 @@
 # (rows bucket_ms, area, covered_ms; keyed by the window's line). SYS: ch, ts (the toolkit for whole-range kinds,
 # plain SQL for windows), qdb (native twap() for STEP buckets), qdbseg (the 0.9.0 run's lead() CTE), i3, i2flux
 # (LINEAR only), duck (DuckDB, embedded), chdb (embedded ClickHouse; the ch SQL on table t), iot (IoTDB, lead() and
-# a split at most once, as qdbseg; LINEAR too).
+# a split at most once, as qdbseg; LINEAR too), td (TDengine: its native TWA() for LINEAR, lead() and scalar subqueries
+# for STEP, without WITH, which TDengine 3.4 lacks).
 # Systems without a built-in function or a window-function recipe have none here ("-" in the table):
 # LTTB is sequential (each bucket's pick depends on the previous pick), so it has no window-function recipe;
 # InfluxDB 2 (Flux timeWeightedAvg interpolates linearly only) and Prometheus have no STEP TWA.
@@ -241,6 +242,37 @@ def w_iot(s, a, b, bk):
            f"FROM ({pts}) p) q WHERE t1 IS NOT NULL AND t < t1")
     return f"WITH seg AS ({seg}) " + split_once(bk, f"v * (least(hi, lo / {bk} * {bk} + {bk}) - lo)", f"v * (hi - hi / {bk} * {bk})", key="", group=True)
 
+# ---- TDengine 3.4: TWA() is LINEAR with interpolation at the window edges (builtinsimpl.c), answered per series
+# (PARTITION BY) and hour as (series, b, twa). STEP: lead() per series (PARTITION BY) and the split-once recipe as for
+# IoTDB, the segment subquery written out where a CTE would be (no WITH); arithmetic on BIGINT gives DOUBLE in
+# TDengine, so bucket starts are CAST(x / I AS BIGINT) * I (exact: epoch milliseconds are far below 2^53)
+def td_split(I, seg, area1, area2, key="`series`, "):
+    b0, b1 = f"CAST(lo / {I} AS BIGINT) * {I}", f"CAST(hi / {I} AS BIGINT) * {I}"
+    return (f"SELECT {key}b, sum(a) area, sum(c) covered FROM ("
+            f"SELECT {key}{b0} b, {area1} a, least(hi, {b0} + {I}) - lo c FROM ({seg}) seg WHERE hi > lo "
+            f"UNION ALL SELECT {key}{b1} b, {area2} a, hi - {b1} c FROM ({seg}) seg WHERE hi > lo AND "
+            f"CAST(hi / {I} AS BIGINT) > CAST(lo / {I} AS BIGINT)) u GROUP BY {key}b ORDER BY {key}b")
+
+def q_td(kind):
+    if kind == "lttb":
+        return None
+    I = IV[kind]
+    if kind == "twal":
+        return f"SELECT `series`, CAST(_wstart AS BIGINT) b, twa(value) FROM sensors PARTITION BY `series` INTERVAL({I}a)"
+    seg = ("SELECT * FROM (SELECT `series`, CAST(_ts AS BIGINT) lo, CAST(lead(_ts) AS BIGINT) hi, CAST(value AS DOUBLE) v0 "
+           "FROM sensors PARTITION BY `series`) s WHERE hi IS NOT NULL")
+    return td_split(I, seg, f"v0 * (least(hi, CAST(lo / {I} AS BIGINT) * {I} + {I}) - lo)",
+                    f"v0 * (hi - CAST(hi / {I} AS BIGINT) * {I})")
+
+def w_td(s, a, b, bk):
+    # the reading before the window and the first one after it by scalar subqueries, as for IoTDB
+    one = f"FROM sensors WHERE `series` = '{s}' AND _ts"
+    pts = (f"SELECT CAST(_ts AS BIGINT) t, CAST(value AS DOUBLE) v, CAST(lead(_ts) AS BIGINT) t1 {one} >= "
+           f"coalesce((SELECT max(_ts) {one} < {a}), {a}) AND _ts <= coalesce((SELECT min(_ts) {one} >= {b}), {b})")
+    seg = f"SELECT greatest(t, {a}) lo, least(t1, {b}) hi, v FROM ({pts}) p WHERE t1 IS NOT NULL AND t < t1"
+    return td_split(bk, seg, f"v * (least(hi, CAST(lo / {bk} AS BIGINT) * {bk} + {bk}) - lo)",
+                    f"v * (hi - CAST(hi / {bk} AS BIGINT) * {bk})", key="")
+
 # ---- InfluxDB 2: Flux timeWeightedAvg (LINEAR only; aggregateWindow hands it each window's own rows, so the edges
 # are whatever timeWeightedAvg makes of them: rel.py check shows whether that matches tsdb's cut-and-interpolate)
 def q_i2flux(kind):
@@ -252,8 +284,8 @@ def q_i2flux(kind):
             'createEmpty: false, timeSrc: "_start") |> keep(columns: ["series", "_time", "_value"])')
 
 Q = {"ch": q_ch, "ts": q_ts, "qdb": q_qdb, "qdbseg": q_qdbseg, "i3": q_i3, "i2flux": q_i2flux, "duck": q_duck,
-     "chdb": lambda k: q_ch(k, "t"), "iot": q_iot}
-W = {"ch": w_ch, "ts": w_ts, "qdb": w_qdb, "i3": w_i3, "iot": w_iot}
+     "chdb": lambda k: q_ch(k, "t"), "iot": q_iot, "td": q_td}
+W = {"ch": w_ch, "ts": w_ts, "qdb": w_qdb, "i3": w_i3, "iot": w_iot, "td": w_td}
 
 def query(sysname, kind):
     """The whole-range query, or for window kinds the list of (line, query), one per window."""
@@ -268,6 +300,8 @@ def wire(sysname, q):
         return "GET /api/v3/query_sql?db=cmp&format=csv&q=" + urllib.parse.quote(q, safe="")
     if sysname == "iot":
         return "POST /rest/table/v1/query\tapplication/json\t" + json.dumps({"database": "cmp", "sql": q}, separators=(",", ":"))
+    if sysname == "td":
+        return "POST /rest/sql/cmp\ttext/plain\t" + q
     if sysname == "i2flux":
         return "POST /api/v2/query?org=bench\tapplication/json\t" + json.dumps({"query": q, "type": "flux", "dialect": {"annotations": []}})
     return q
@@ -307,6 +341,11 @@ def run_sql(sysname, sql):
             time.sleep(5)
         if "values" not in out: raise RuntimeError(f"iot: {out}")
         return out["values"]
+    if sysname == "td":
+        out = json.loads(http(f"http://127.0.0.1:{os.environ.get('TD_REST_PORT', '6041')}/rest/sql/cmp", sql,
+                              {"Authorization": "Basic cm9vdDp0YW9zZGF0YQ=="}))
+        if out.get("code") != 0 or "data" not in out: raise RuntimeError(f"td: {out}")
+        return out["data"]
     if sysname == "i2flux":
         import csv, io
         body = json.dumps({"query": sql, "type": "flux", "dialect": {"annotations": []}})

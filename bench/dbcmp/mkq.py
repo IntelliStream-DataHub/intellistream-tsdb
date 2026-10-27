@@ -4,7 +4,7 @@
 #
 # SYS: ch, chday (ClickHouse, monthly / daily partitions), ts (TimescaleDB), qdb (QuestDB, PostgreSQL
 # wire), qdbh (QuestDB, HTTP /exec), i2ql (InfluxDB 2, InfluxQL), i2flux (InfluxDB 2, Flux), i3 (InfluxDB 3),
-# prom (Prometheus, PromQL), iot (IoTDB, table model SQL over REST).
+# prom (Prometheus, PromQL), iot (IoTDB, table model SQL over REST), td (TDengine, SQL over taosAdapter's REST).
 #
 # Every system answers the same logical query: rows in [start, end) of one series, and buckets
 # aligned to the epoch whose width is a number of the series' own samples. For HTTP systems a line
@@ -110,6 +110,24 @@ def iot_post(q):
     import json
     return f"POST {IOT_PATH}\tapplication/json\t" + json.dumps({"database": "cmp", "sql": q}, separators=(",", ":"))
 
+# TDengine 3.4: the supertable sensors that schemaless line protocol made (_ts, value FLOAT, tag series NCHAR; the
+# tag name is a keyword, hence the backquotes), SQL over taosAdapter's REST API (POST /rest/sql/cmp, the SQL as the
+# body). Times as epoch milliseconds (the database's precision); INTERVAL in milliseconds ("a") is aligned to the
+# epoch and leaves empty windows out (no FILL). Timestamps are cast to BIGINT so the answers carry numbers.
+TD_PATH = "/rest/sql/cmp"
+
+def td(cls, s, a, b, bk):
+    w = f"`series` = '{s}' AND _ts >= {a} AND _ts < {b}"
+    if cls == "raw":
+        return f"SELECT CAST(_ts AS BIGINT) t, value FROM sensors WHERE {w} ORDER BY _ts"
+    if cls == "point":
+        return f"SELECT CAST(_ts AS BIGINT) t, value FROM sensors WHERE `series` = '{s}' AND _ts = {a}"
+    return (f"SELECT CAST(_wstart AS BIGINT) b, count(value) c, sum(value) s, min(value) mn, max(value) mx "
+            f"FROM sensors WHERE {w} INTERVAL({bk}a)")
+
+def td_post(q):
+    return f"POST {TD_PATH}\ttext/plain\t{q}"
+
 # Prometheus: PromQL over the HTTP API. A range selector m[r] evaluated at t covers (t - r, t], so the
 # rows in [a, b) are m[b - a] at t = b - 1 ms, and a bucket [k*w, (k+1)*w) is evaluated at (k+1)*w - 1
 # with range w; range selectors return the stored samples, so lookback and staleness play no part.
@@ -160,7 +178,7 @@ def prom(cls, s, a, b, bk):
         reqs.append(prom_get("/api/v1/query", query=" or ".join(edges), time=psec(b - 1)))
     return " && ".join(reqs)
 
-GEN = {"i3": lambda *x: i3_get(i3(*x)), "i2ql": lambda *x: i2ql_get(influxql(*x)), "i2flux": lambda *x: flux_post(flux(*x)), "qdb": qdb, "qdbh": lambda *x: http_get("/exec?query=", qdb(*x)), "ts": ts, "ch": ch, "chday": lambda *x: ch(*x, table="cmp.t100m_day"), "prom": prom, "iot": lambda *x: iot_post(iot(*x))}
+GEN = {"i3": lambda *x: i3_get(i3(*x)), "i2ql": lambda *x: i2ql_get(influxql(*x)), "i2flux": lambda *x: flux_post(flux(*x)), "qdb": qdb, "qdbh": lambda *x: http_get("/exec?query=", qdb(*x)), "ts": ts, "ch": ch, "chday": lambda *x: ch(*x, table="cmp.t100m_day"), "prom": prom, "iot": lambda *x: iot_post(iot(*x)), "td": lambda *x: td_post(td(*x))}
 
 # ---- whole-range queries (a: one bucket per series, b: buckets of n samples)
 def step_sql(col, kind):  # the sample step of a series, as SQL (kind = series % 7)
@@ -256,6 +274,16 @@ def iot_full(n):  # date_bin takes a constant interval: one branch per step, as 
         for st, k in groups().items()) + ") x ORDER BY series, b"
 
 
+def td_full(n):  # INTERVAL takes a constant width: one PARTITION BY branch per step, joined by UNION ALL
+    if n == 0:
+        return (f"SELECT `series`, count(value) c, sum(value) s, min(value) mn, max(value) mx FROM sensors"
+                f"{where_set('`series`', True)} PARTITION BY `series`")
+    return " UNION ALL ".join(
+        f"SELECT `series`, CAST(_wstart AS BIGINT) b, count(value) c, sum(value) s, min(value) mn, max(value) mx "
+        f"FROM sensors WHERE `series` IN ({', '.join(repr(str(x)) for x in sset() if x % 7 in k)}) PARTITION BY `series` "
+        f"INTERVAL({st * n}a)" for st, k in groups().items())
+
+
 PROM_LO, PROM_HI = 1703980800000, 1767225600000  # 2023-12-31 and 2026-01-01, as for InfluxQL
 
 def prom_full(n):
@@ -272,7 +300,7 @@ def prom_full(n):
         reqs += prom_buckets(sel, lo, hi, w)
     return " && ".join(reqs)
 
-FULL = {"i3": lambda n: i3_get(i3_full(n)), "i2ql": lambda n: i2ql_get(influxql_full(n)), "i2flux": lambda n: flux_post(flux_full(n)), "qdb": qdb_full, "qdbh": lambda n: http_get("/exec?query=", qdb_full(n)), "ts": ts_full, "ch": ch_full, "chday": lambda n: ch_full(n, "cmp.t100m_day"), "prom": prom_full, "iot": lambda n: iot_post(iot_full(n))}
+FULL = {"i3": lambda n: i3_get(i3_full(n)), "i2ql": lambda n: i2ql_get(influxql_full(n)), "i2flux": lambda n: flux_post(flux_full(n)), "qdb": qdb_full, "qdbh": lambda n: http_get("/exec?query=", qdb_full(n)), "ts": ts_full, "ch": ch_full, "chday": lambda n: ch_full(n, "cmp.t100m_day"), "prom": prom_full, "iot": lambda n: iot_post(iot_full(n)), "td": lambda n: td_post(td_full(n))}
 
 if __name__ == "__main__":
     import os

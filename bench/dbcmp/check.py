@@ -22,6 +22,7 @@ I2_PORT = os.environ.get("I2_PORT", "8086")
 I3_PORT = os.environ.get("I3_PORT", "8181")
 PROM_PORT = os.environ.get("PROM_PORT", "9090")
 IOT_REST = os.environ.get("IOT_REST_PORT", "18080")
+TD_REST = os.environ.get("TD_REST_PORT", "6041")
 NSERIES = int(os.environ.get("NSERIES", "100"))  # series in the file, as for spec.py
 
 def f32(x):  # values are float32, and some servers print the shortest float32 text ("30.8")
@@ -237,7 +238,29 @@ class Prom:
                     sum(x["max"] for x in bs.values()), float(len(bs)))
                 for s, bs in self.buckets(line).items()}
 
-RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day"), "prom": Prom, "iot": IOT}
+class TD:
+    """TDengine's REST API (taosAdapter): a line is "POST /rest/sql/cmp<TAB>text/plain<TAB>SQL" (mkq.py)."""
+    def q(self, sql):
+        r = json.loads(http(f"http://127.0.0.1:{TD_REST}/rest/sql/cmp", sql, {"Authorization": "Basic cm9vdDp0YW9zZGF0YQ=="}))
+        if r.get("code") != 0 or "data" not in r:
+            raise RuntimeError(f"td: {r} in {sql[:300]}")
+        return r["data"]
+    def sql(self, line):
+        return line.split("\t", 2)[2]
+    def rows(self, cls, line):
+        r = self.q(self.sql(line))
+        if cls in ("raw", "point"):
+            return [(int(x[0]), float(x[1])) for x in r]
+        return [(int(x[0]), int(x[1]), float(x[2]), float(x[3]), float(x[4])) for x in r]
+    def digest(self, n, line):  # summed here: TDengine's answer is the per-series (and per-bucket) rows
+        d = {}
+        for x in self.q(self.sql(line)):
+            c, s_, mn, mx = (x[1:5] if n == 0 else x[2:6])
+            g = d.setdefault(int(x[0]), [0.0, 0.0, 0.0, 0.0, 0])
+            g[0] += c; g[1] += s_; g[2] += mn; g[3] += mx; g[4] += 1
+        return {k: tuple(float(v) for v in g) for k, g in d.items()}
+
+RUNNERS = {"i3": I3, "i2ql": I2QL, "i2flux": I2Flux, "qdb": QDB, "ts": TS, "ch": lambda: CH("cmp.t100m"), "chday": lambda: CH("cmp.t100m_day"), "prom": Prom, "iot": IOT, "td": TD}
 
 def close(a, b, rel):  # False for NaN on either side: a NaN answer is a mismatch
     return a == b or abs(a - b) <= rel * max(abs(a), abs(b), 1e-300)
@@ -338,9 +361,9 @@ def split_batch(run, sysname, line, cls):
     """One batch request (mkbatch.py) run once; its raw answer split per member, in the form the runner's q()
     returns for a single query: {member: raw}."""
     by = {}
-    if sysname in ("ch", "chday", "ts", "qdb", "i3", "iot"):
+    if sysname in ("ch", "chday", "ts", "qdb", "i3", "iot", "td"):
         if sysname in ("ch", "chday"): raw = run.q(line + " FORMAT TSV")
-        elif sysname in ("i3", "iot"): raw = run.q(run.sql(line))
+        elif sysname in ("i3", "iot", "td"): raw = run.q(run.sql(line))
         else: raw = run.q(line)
         for x in raw:
             by.setdefault(int(x[0]), []).append(x[1:])

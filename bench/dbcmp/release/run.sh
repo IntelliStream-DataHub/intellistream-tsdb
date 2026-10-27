@@ -11,16 +11,16 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 TOOLS=$RDIR
 DSLIST=${DSLIST:-"$DS_KINDS $DS_HYD"}
-P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom iot iotz"}
-P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3 iot iotz"}
+P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom iot iotz td tdz"}
+P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3 iot iotz td tdz"}
 I3_P2_FLAGS=${I3_P2_FLAGS:-}            # smoke runs only: e.g. --force-snapshot-max-age 2m
 I3_P2_MIN=${I3_P2_MIN:-600}
 I3_P1_AGE=${I3_P1_AGE:-5m} I3_P1_MIN=${I3_P1_MIN:-420}
 I2_EXTRA=${I2_EXTRA:-}                  # smoke runs only: e.g. -e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s
 PROM_SETTLE_TIMEOUT=${PROM_SETTLE_TIMEOUT:-36000}
 P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320}
-CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot"
-PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080)\b'
+CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot rb-td"
+PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080|6041)\b'
 mkdir -p "$OUT"
 
 # ------------------------------------------------------------------ logging, quiet gate, timed steps
@@ -278,7 +278,9 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
         REL has "$S" "$k" || { echo "$k: no query in rel.py for $S" >> "$D/dash.txt"; continue; }
         f=$D/q.$k.txt
         REL q "$S" "$k" > "$f"
-        case " ${TWA_LOOSE-i2flux} " in
+        # td: TDengine's TWA() (LINEAR) has tsdb's edges but accumulates with less precision: smoke 10 x 650 k,
+        # hourly, relative differences 1e-9 to 5e-8, and 1.7e-4 on an average near 0 (vibration, 8e-9 absolute)
+        case " ${TWA_LOOSE-i2flux td} " in
         *" $S "*) # the built-in TWA with its own edges (InfluxDB 2's timeWeightedAvg sees only its window's rows):
                   # timed whatever the check says; a difference goes to DIR/loose.txt for the tables, not a failure
             REL check "$S" "$k" "ref/$k.jsonl" > "$D/check-$k.txt" 2>&1 9>&- ||
@@ -1206,6 +1208,7 @@ phase_checktest() {
 
 # ================================================================== the systems added for the 0.9.0 rerun
 . "$RDIR/sys_iot.sh"
+. "$RDIR/sys_td.sh"
 
 # ================================================================== main
 machine() {
