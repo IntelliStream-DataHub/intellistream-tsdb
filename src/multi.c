@@ -541,7 +541,9 @@ int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const uint32_t *series
     c.qs = &qr.q;
     c.cuts = cut ? &cuts : NULL;
     cur_cuts = c.cuts;
-    sched_open(query_sched(db), &c.job, threads, task_fn, &c);
+    /* helpers only run series ahead of the head: one series alone wakes none (a wakeup costs more than a
+     * small query), though its own parallel work still has the group's cap */
+    sched_open(query_sched(db), &c.job, (int)MIN((size_t)threads, n), task_fn, &c);
     int rc = conduct(&c);
     if (rc) {
         pthread_mutex_lock(&c.m);
