@@ -24,7 +24,7 @@ CHDB    ?= /var/tmp/dbcmp/chdb/v26.9.0/lib
 
 PROGS := $(addprefix $(OUT)/,conv loadlp loadprw qdrive tsdbq tsdbstat relq relemb)
 ifneq ($(wildcard $(DUCKDB)/duckdb.h),)
-PROGS += $(OUT)/embq
+PROGS += $(OUT)/embq $(OUT)/duckq
 endif
 ifneq ($(wildcard $(CHDB)/chdb.h),)
 PROGS += $(OUT)/chq
@@ -57,7 +57,11 @@ $(OUT)/embq: embq.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) -I$(ROOT)/include -I$(DUCKDB) -o $@ $< $(LIB) -L$(DUCKDB) -lduckdb -Wl,-rpath,$(abspath $(DUCKDB)) \
 		-lzstd -lpthread -lm
 
-# release/: LTTB and TWA for tsdbd (relq) and embedded tsdb (relemb); chDB's counterpart of embq (chq)
+# release/: LTTB and TWA for tsdbd (relq) and embedded tsdb (relemb); chDB's counterpart of embq (chq); one timed
+# DuckDB statement (duckq)
+$(OUT)/duckq: release/duckq.c | $(OUT)
+	$(CC) $(CFLAGS) -I$(DUCKDB) -o $@ $< -L$(DUCKDB) -lduckdb -Wl,-rpath,$(abspath $(DUCKDB)) -lm
+
 $(OUT)/relq: release/relq.c $(CLIB) | $(OUT)
 	$(CC) $(CFLAGS) -I$(ROOT)/client -I$(ROOT)/include -o $@ $< $(CLIB) -lzstd -lpthread -lm
 

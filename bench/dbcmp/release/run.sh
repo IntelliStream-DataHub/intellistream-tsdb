@@ -1106,7 +1106,7 @@ p3() {
     tstep "p3 tsdb lttb t32" "$D/tsdb.lttb.t32.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" lttb 32 "$REPS"
     tstep "p3 tsdb twa t1" "$D/tsdb.twa.t1.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" twa 1 "$REPS"
     tstep "p3 tsdb twa t32" "$D/tsdb.twa.t32.txt" -- env TSDB_DIR="$E/tsdb" "$B/relemb" twa 32 "$REPS"
-    tstep "p3 duckdb twa" "$D/duckdb.twa.txt" -- "$TB/embq" duckdb sqlt "$E/t.duckdb" "$REPS" dump/duckdb-twa.tsv "$(REL sql duck twa)"
+    tstep "p3 duckdb twa" "$D/duckdb.twa.txt" -- "$B/duckq" sqlt "$E/t.duckdb" "$REPS" dump/duckdb-twa.tsv "$(REL sql duck twa)"
     for e in chdb chdb-lz4; do
         tstep "p3 $e lttb" "$D/$e.lttb.txt" -- "$B/chq" sqlt "$E/$e" "$REPS" "dump/$e-lttb.tsv" "$(REL sql chdb lttb)"
         tstep "p3 $e twa" "$D/$e.twa.txt" -- "$B/chq" sqlt "$E/$e" "$REPS" "dump/$e-twa.tsv" "$(REL sql chdb twa)"
