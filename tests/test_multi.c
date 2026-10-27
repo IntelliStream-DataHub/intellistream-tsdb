@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -662,6 +664,170 @@ static void many_volumes(const char *base)
     }
 }
 
+/* The memory bounds of one request and a series that fails ahead of the head. The head's first delivery waits, so
+ * helpers run the others ahead (at most W = 2 x threads). Budget hooks count what results ahead hold. */
+typedef struct {
+    atomic_long out, peak, takes, deferred;
+} budget;
+static int b_take(void *ctx, size_t n)
+{
+    budget *b = ctx;
+    long o = atomic_fetch_add(&b->out, (long)n) + (long)n, p = atomic_load(&b->peak);
+    while (o > p && !atomic_compare_exchange_weak(&b->peak, &p, o)) {
+    }
+    atomic_fetch_add(&b->takes, 1);
+    return 0;
+}
+static void b_give(void *ctx, size_t n) { atomic_fetch_sub(&((budget *)ctx)->out, (long)n); }
+static void b_deferred(void *ctx) { atomic_fetch_add(&((budget *)ctx)->deferred, 1); }
+typedef struct {
+    int status[64];
+    uint64_t rows;
+} slow_ctx;
+static int slow_head(void *ctx, const tsdb_series_result *r)
+{
+    slow_ctx *s = ctx;
+    if (r->index == 0 && r->last)
+        usleep(300000);
+    s->rows += r->status ? 0 : r->n;
+    if (r->last && r->index < 64)
+        s->status[r->index] = r->status;
+    return 0;
+}
+
+static void find_part(const char *dir, char *out, size_t len)
+{
+    DIR *d = opendir(dir);
+    CHECK(d != NULL);
+    struct dirent *e;
+    bool found = false;
+    while (!found && (e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (e->d_name[0] == 'p' && n > 5 && strcmp(e->d_name + n - 5, ".part") == 0)
+            found = snprintf(out, len, "%s/%s", dir, e->d_name) > 0;
+    }
+    closedir(d);
+    CHECK(found);
+}
+
+static void bounds(const char *base)
+{
+    enum { ROWS = 20000 };
+    char r[600], vol[700], cmd[1400], pfile[1000];
+    snprintf(r, sizeof r, "%s/test_multi-%d-bd", base, (int)getpid());
+    snprintf(vol, sizeof vol, "%s-bad", r);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'*", r);
+    if (system(cmd)) {
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.query_threads = 8;
+    o.granule_rows = 1024;
+    tsdb *db;
+    OK(tsdb_open(r, &o, &db));
+    uint32_t good[8], wide, bad;
+    int64_t *ts = malloc(ROWS * sizeof *ts);
+    float *v = malloc(ROWS * sizeof *v);
+    CHECK(ts && v);
+    for (int i = 0; i < ROWS; i++)
+        ts[i] = T0 + (int64_t)i * 1000, v[i] = (float)(i % 101);
+    char name[32];
+    for (int k = 0; k < 8; k++) {
+        snprintf(name, sizeof name, "bd%d", k);
+        OK(tsdb_series_create(db, name, TSDB_FLOAT32, NULL, &good[k]));
+        OK(tsdb_insert_series(db, good[k], ts, v, ROWS));
+    }
+    OK(tsdb_series_create(db, "bd_bad", TSDB_FLOAT32, vol, &bad)); /* alone in its volume: one part to damage */
+    OK(tsdb_insert_series(db, bad, ts, v, ROWS));
+    int64_t two[2] = {T0, T0 + 20000000};
+    float tv[2] = {1, 2};
+    OK(tsdb_series_create(db, "bd_wide", TSDB_FLOAT32, NULL, &wide)); /* 20,000 buckets of 1 s for two rows */
+    OK(tsdb_insert_series(db, wide, two, tv, 2));
+    OK(tsdb_close(db));
+    find_part(vol, pfile, sizeof pfile);
+    {
+        /* a flipped byte in the last granule's values: rows come, then CORRUPT */
+        int dfd = open(vol, O_RDONLY | O_DIRECTORY);
+        part *pt;
+        CHECK(dfd >= 0);
+        OK(part_open(dfd, strrchr(pfile, '/') + 1, &pt));
+        CHECK(pt->ng >= 10);
+        const granule *g = &pt->g[pt->ng - 1];
+        off_t at = (off_t)(g->off + g->ts_len + g->val_len / 2);
+        part_unref(pt);
+        int fd = openat(dfd, strrchr(pfile, '/') + 1, O_RDWR);
+        uint8_t b;
+        CHECK(fd >= 0 && pread(fd, &b, 1, at) == 1);
+        b ^= 0x5a;
+        CHECK(pwrite(fd, &b, 1, at) == 1);
+        close(fd);
+        close(dfd);
+    }
+    o.verify_checksums = 1;
+    OK(tsdb_open(r, &o, &db));
+    uint32_t list[17];
+    tsdb_multi_query qv = {.kind = TSDB_MULTI_VALUES, .start = INT64_MIN, .end = INT64_MAX};
+
+    /* a series that fails ahead holds nothing, and is never charged for the rows it had before the error */
+    list[0] = good[0];
+    for (int i = 1; i < 9; i++)
+        list[i] = bad;
+    budget b = {0};
+    tsdb_multi_opts mo = {.threads = 8, .budget_take = b_take, .budget_give = b_give, .on_deferred = b_deferred,
+                          .hook_ctx = &b};
+    slow_ctx sc = {0};
+    OK(tsdb_query_multi(db, &qv, list, 9, &mo, slow_head, &sc));
+    CHECK(sc.status[0] == 0);
+    for (int i = 1; i < 9; i++)
+        CHECK(sc.status[i] == TSDB_ERR_CORRUPT);
+    CHECK(atomic_load(&b.takes) == 0 && atomic_load(&b.out) == 0);
+    CHECK(atomic_load(&b.deferred) == 0); /* and nothing flipped the call to one series at a time */
+
+    /* results ahead stop at max_held_bytes: a refused one makes the call head-only */
+    for (int i = 0; i < 16; i++)
+        list[i] = good[i % 8];
+    memset(&b, 0, sizeof b);
+    memset(&sc, 0, sizeof sc);
+    mo.max_held_bytes = 600 << 10; /* one result of 20,000 float32 rows (room for 32,768: 384 KiB) fits */
+    OK(tsdb_query_multi(db, &qv, list, 16, &mo, slow_head, &sc));
+    CHECK(sc.rows == 16 * (uint64_t)ROWS);
+    fprintf(stderr, "  held ahead: peak %ld KiB of %zu KiB, %ld deferred\n", atomic_load(&b.peak) >> 10,
+            mo.max_held_bytes >> 10, atomic_load(&b.deferred));
+    /* each helper takes its result's 384 KiB before the check against max_held and gives it back when refused */
+    CHECK(atomic_load(&b.peak) <= (long)mo.max_held_bytes + 8 * (400 << 10));
+    CHECK(atomic_load(&b.deferred) >= 1 && atomic_load(&b.out) == 0); /* refused, not merely held less */
+    mo.max_held_bytes = 0;
+
+    /* bucket accumulators over multi_defer_bytes ahead of the head defer to its turn, before allocating */
+    size_t sb = multi_defer_bytes;
+    multi_defer_bytes = 64 << 10;
+    tsdb_multi_query qb = {.kind = TSDB_MULTI_BUCKETS, .start = INT64_MIN, .end = INT64_MAX, .interval_ms = 1000};
+    list[0] = good[0];
+    for (int i = 1; i < 9; i++)
+        list[i] = wide;
+    memset(&b, 0, sizeof b);
+    memset(&sc, 0, sizeof sc);
+    OK(tsdb_query_multi(db, &qb, list, 9, &mo, slow_head, &sc));
+    multi_defer_bytes = sb;
+    for (int i = 0; i < 9; i++)
+        CHECK(sc.status[i] == 0);
+    tsdb_bucket *one;
+    size_t n0, nw;
+    OK(tsdb_query_agg_ex(db, good[0], qb.start, qb.end, qb.interval_ms, NULL, &one, &n0));
+    tsdb_free(one);
+    OK(tsdb_query_agg_ex(db, wide, qb.start, qb.end, qb.interval_ms, NULL, &one, &nw));
+    tsdb_free(one);
+    CHECK(sc.rows == n0 + 8 * nw);
+    CHECK(atomic_load(&b.deferred) >= 1);
+    OK(tsdb_close(db));
+    free(ts);
+    free(v);
+    if (system(cmd)) {
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -715,6 +881,8 @@ int main(int argc, char **argv)
     OK(tsdb_close(db));
     many_volumes(base);
     printf("  %d volumes in one request\n", 12);
+    bounds(base);
+    printf("  held results, deferral and failures ahead\n");
     snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s'", root, vol2);
     if (system(cmd)) {
     }

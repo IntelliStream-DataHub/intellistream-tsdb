@@ -366,6 +366,11 @@ static void run_ahead(mcall *c, size_t i)
     cur_budget = saved;
     const tsdb_multi_opts *mo = c->mo;
     bool ok = st != TSDB_ERR_DEFER, refused = false;
+    if (ok && st) { /* a failed series holds nothing: not counted in held, not charged to the budget */
+        int type = r.type;
+        mres_free(&r);
+        r.type = type;
+    }
     if (ok && r.bytes && mo && mo->budget_take && mo->budget_give) {
         if (mo->budget_take(mo->hook_ctx, r.bytes) == 0)
             r.charged = true;
@@ -377,11 +382,6 @@ static void run_ahead(mcall *c, size_t i)
         ok = false, refused = true; /* the head always fits: held is 0 when it waits for it */
     if (ok) {
         r.status = st;
-        if (st) { /* a failed series holds nothing */
-            free(r.ts), free(r.vals), free(r.valid), free(r.buckets);
-            r.ts = NULL, r.vals = NULL, r.valid = NULL, r.buckets = NULL;
-            r.n = 0;
-        }
         c->held += r.bytes;
         sl->r = r;
         sl->state = S_DONE;
