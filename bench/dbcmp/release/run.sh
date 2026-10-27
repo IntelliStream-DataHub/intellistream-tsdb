@@ -488,7 +488,7 @@ chbench_tag() { # TAG CONC ITER|0 SECONDS|0 FILE [SETTING...]: chbench1 with log
     CHB_EXTRA="--log_comment=$tag $*" chbench1 "$c" "$i" "$s" "$f" && chqlog "$tag"
 }
 export -f chbench1 chbench_tag chqlog
-tsdb_has_batch() { "$TB/tsdbq" 2>&1 | grep -q -- '--batch'; }
+tsdb_has_batch() { grep -aq -- '--batch' "$TB/tsdbq"; }  # its usage says only "see source": the option's string
 tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI: "full ... --batch K", CLASS.bK).
                # A tsdbq without --batch answers K = 1 only (the 10 single series, one request each; the window
                # classes one window per request) and the log says the rest is pending.
