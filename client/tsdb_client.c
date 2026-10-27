@@ -1563,7 +1563,8 @@ static int multi_template(const tsdb_multi_query *q, const int64_t *bounds, size
         uint32_t c2 = nb ? 0 : cnt;
         memcpy(t + 48, &c2, 4);
         memcpy(t + 52, &n32, 4);
-        memcpy(t + TSDB_TWA_HEADER, bounds, nb * 8);
+        if (nb) /* bounds is NULL without them, and memcpy from NULL is undefined even for 0 bytes */
+            memcpy(t + TSDB_TWA_HEADER, bounds, nb * 8);
         break;
     }
     }
