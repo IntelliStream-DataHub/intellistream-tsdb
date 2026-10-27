@@ -1387,6 +1387,27 @@ from `build/threads-bench`, which times one thread against many across
 work sizes. What a thread adds up does not depend on the count, so answers
 are bit-identical at any thread count (`tests/test_threads.c`).
 
+The sweep on the 7950X (16 cores, 32 threads), one query at a time over
+windows of 8192-row granules, 5 runs of 100 ms each, time per query and its
+ratio to one thread:
+
+| granules | aggregate, 1 thread | at 16384 rows per thread | TWA, 1 thread | at 16384 rows per thread |
+|---:|---:|---:|---:|---:|
+| 1 | 8.1 us | 8.0 us (1.00) | 105 us | 105 us (1.00) |
+| 2 | 15.4 us | 15.4 us (1.00) | 208 us | 106 us (0.51) |
+| 4 | 30.0 us | 21.6 us (0.72) | 415 us | 111 us (0.27) |
+| 8 | 59.8 us | 25.0 us (0.42) | 833 us | 117 us (0.14) |
+| 32 | 243 us | 59.5 us (0.25) | 3.33 ms | 244 us (0.07) |
+| 128 | 969 us | 158 us (0.16) | 13.3 ms | 654 us (0.05) |
+| 1024 | 7.76 ms | 834 us (0.11) | 104 ms | 4.45 ms (0.04) |
+
+No window got slower than on one thread at 8192 or at 16384 rows per thread;
+16384 is as fast over the whole sweep and wakes half as many helpers for
+small windows. The second thread of each core (SMT) helps large reads: with
+16 instead of 32 threads, the 1024-granule aggregate takes 944 us instead of
+834 and the TWA 7.13 ms instead of 4.45. For aggregates of 32 to 128
+granules 16 threads were up to 20 % faster than 32.
+
 ## Command line
 
 ```sh
