@@ -75,7 +75,9 @@ typedef struct tsdb_options {
                               * a power loss (not a process crash) can leave files that fail their checks
                               * at the next open, which then needs an operator (docs/design.md) */
     int merge_threads;       /* background merge threads; default 2, 0 disables merges */
-    int query_threads;       /* threads for one query; default: every logical CPU */
+    int query_threads;       /* threads of the database's query scheduler, the calling threads included (it
+                              * starts query_threads - 1 helpers, shared by every volume); default: every
+                              * logical CPU */
     size_t buffer_rows;      /* memtable rows before it is flushed into parts; default 1M */
     int flush_interval_ms;   /* memtable age before it is flushed into parts; default 5000 */
     int wal_sync_ms;         /* 0: every small write waits for fsync (group commit, default);
@@ -108,6 +110,8 @@ typedef struct tsdb_options {
                               * is not one yet, with the checks of tsdb_volume_add. 0: such a path is
                               * TSDB_ERR_NOTFOUND, and volumes are added only by tsdb_volume_add(_dir). tsdbd and
                               * tsdb-cli set 0: a client must not choose where the server writes */
+    int request_threads;     /* threads one query (or one tsdb_query_multi call) uses at most, its caller
+                              * included; 0 (default): query_threads */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);

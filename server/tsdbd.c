@@ -2048,6 +2048,8 @@ int main(int argc, char **argv)
                                    {"port-file", required_argument, 0, 'Q'},
                                    {"max-request-memory", required_argument, 0, 'X'},
                                    {"frame-timeout", required_argument, 0, 'D'},
+                                   {"query-threads", required_argument, 0, 'q'},
+                                   {"request-threads", required_argument, 0, 'L'},
                                    {"version", no_argument, 0, 'v'},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0;
@@ -2086,6 +2088,8 @@ int main(int argc, char **argv)
             o.partition_ms = num_arg("partition-ms", optarg, 1, (long long)1 << 50);
             break;
         case 'T': send_timeout_s = (int)num_arg("send-timeout", optarg, 1, 86400); break;
+        case 'q': o.query_threads = (int)num_arg("query-threads", optarg, 1, 4096); break;
+        case 'L': o.request_threads = (int)num_arg("request-threads", optarg, 1, 4096); break;
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'X': req_budget = (size_t)num_arg("max-request-memory", optarg, 1, (long long)1 << 24) << 20; break;
         case 'I':
@@ -2110,7 +2114,8 @@ int main(int argc, char **argv)
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
                         "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"
                         "             [--metrics-port N|auto [--metrics-bind ADDR]]\n"
-                        "             [--max-request-memory MB] [--frame-timeout 60]\n",
+                        "             [--max-request-memory MB] [--frame-timeout 60]\n"
+                        "             [--query-threads N] [--request-threads N]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }

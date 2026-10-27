@@ -373,8 +373,8 @@ static void twa_worker(void *arg, int idx)
     cur_qstats = j->qs;
     codec_ctx *cc = cc_get(j->db);
     size_t cap = j->db->granule_rows;
-    int64_t *ts = malloc(cap * sizeof *ts);
-    uint8_t *v = malloc(cap * sizeof(uint64_t));
+    int64_t *ts = qscratch_get(0, cap * sizeof *ts);
+    uint8_t *v = qscratch_get(1, cap * sizeof(uint64_t));
     if (!cc || !ts || !v) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
         goto out;
@@ -404,12 +404,17 @@ static void twa_worker(void *arg, int idx)
         pc->last = (twa_pt){ts[n - 1], ok1 ? slot_val(j->q->type, v + (n - 1) * j->q->w) : 0, ok1};
         pc->v = c.v;
         pc->n = c.n;
+        int lv = sched_leave();
+        if (lv < 0)
+            atomic_store(&j->err, lv);
+        if (lv)
+            break;
     }
 out:
     if (cc)
         cc_put(j->db, cc);
-    free(ts);
-    free(v);
+    qscratch_put(ts);
+    qscratch_put(v);
     cur_qstats = mine;
 }
 
@@ -600,7 +605,7 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
         atomic_init(&j.next, 0);
         atomic_init(&j.err, 0);
         int threads = nwork >= TWA_PARALLEL_MIN ? (int)MIN((size_t)db->opt.query_threads, nwork) : 1;
-        pool_run(db->qpool, threads, twa_worker, &j);
+        sched_run(db->sched, threads, twa_worker, &j);
         rc = atomic_load(&j.err);
         if (rc)
             goto done;

@@ -722,14 +722,60 @@ const char *series_name(series_dict *d, uint32_t id);
 int series_type(series_dict *d, uint32_t id); /* -1 for an unknown id */
 bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n, int type);
 
-/* ---- thread pool ---- */
-typedef struct pool pool;
-pool *pool_new(int nthreads);
-void pool_free(pool *p);
-/* Runs fn(arg, i) for i in [0, n) where n <= the pool size + 1, the caller
- * acting as i == 0. Returns n actually used: it falls back to 1 when the pool
- * is busy with another query. */
-int pool_run(pool *p, int n, void (*fn)(void *arg, int i), void *arg);
+/* ---- query scheduler (sched.c) ---- */
+typedef struct sched sched;
+typedef struct sjob sjob;
+/* One request's share of the scheduler: its jobs, the threads working for it and its cancel flag. Lives on the
+ * stack of the call that began it (qs_begin, tsdb_query_multi). */
+typedef struct sgroup {
+    sched *s;
+    struct sgroup *next, *prev, *outer;
+    sjob *jobs; /* open or running, newest first */
+    int cap;    /* threads working for it at most */
+    int active; /* threads working for it now: the one that began it and its helpers */
+    uint64_t seq;
+    bool linked;
+    atomic_int cancel;
+} sgroup;
+struct sjob {
+    sched *s;
+    sjob *next;
+    sgroup *g;
+    void (*fn)(void *arg, int i);
+    void *arg;
+    int want;     /* participants at most, the caller included */
+    int helpers;  /* helpers inside fn now */
+    int ids;      /* helpers that joined so far */
+    uint64_t opens;
+    bool open, closing, shared, implicit, saved_helper;
+    sjob *saved_job;
+    sgroup own; /* the group of a job opened outside any */
+    pthread_cond_t done;
+};
+extern __thread sgroup *cur_group;
+sched *sched_new(int query_threads, int request_threads);
+void sched_free(sched *s);
+int sched_helpers(const sched *s);
+int sched_request_threads(const sched *s);
+/* Begins a group on this thread (cap <= 0: request_threads); jobs opened under it belong to it. */
+void sched_group_begin(sched *s, sgroup *g, int cap);
+void sched_group_end(sgroup *g);
+void sched_cancel(sgroup *g);
+/* Runs fn(arg, i) on the caller (i == 0) and on up to n - 1 helpers, within the group's cap; fn claims items until
+ * none are left. Returns the participants. */
+int sched_run(sched *s, int n, void (*fn)(void *arg, int i), void *arg);
+/* The parts of sched_run, for a caller that does other work while helpers run fn (tsdb_query_multi): open, then
+ * reopen whenever fn may find items again after a helper found none, then close (waits for the helpers). */
+void sched_open(sched *s, sjob *j, int want, void (*fn)(void *arg, int i), void *arg);
+void sched_reopen(sjob *j);
+void sched_close(sjob *j);
+/* After each item of fn: 0 go on; 1 return now (a helper another group needs); TSDB_ERR_STOPPED the group was
+ * cancelled. */
+int sched_leave(void);
+/* Decode buffers: cached per helper thread (helpers join and leave often), malloc'd elsewhere. One slot per
+ * buffer that is live at once (0..3). */
+void *qscratch_get(int slot, size_t bytes);
+void qscratch_put(void *p);
 
 /* ---- memtable + WAL (memtable.c) ---- */
 typedef struct mt_series {
@@ -870,7 +916,8 @@ struct eng {
     atomic_int_fast64_t clock_floor; /* now never goes below this */
     atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
     int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
-    pool *qpool;
+    sched *sched;
+    bool own_sched; /* opened alone (eng_open), not by a tsdb that shares its scheduler */
 
     /* memtable and WAL (memtable.c) */
     pthread_mutex_t flush_lock;    /* one memtable flush at a time */
@@ -989,6 +1036,8 @@ int parts_publish(struct eng *db, part **ps, size_t n);
 
 /* the storage engine for one directory; the public API in tsdb.h wraps these */
 int eng_open(const char *dir, const tsdb_options *opts, eng **out);
+/* the same with the scheduler of the tsdb that owns the engine */
+int eng_open_sched(const char *dir, const tsdb_options *opts, sched *s, eng **out);
 int eng_close(eng *db);
 int eng_series(eng *db, const char *name, int type, uint32_t *id);
 int eng_series_lookup(eng *db, const char *name, uint32_t *id);

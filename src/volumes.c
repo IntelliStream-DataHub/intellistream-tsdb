@@ -60,6 +60,7 @@ struct tsdb {
     pthread_mutex_t create_lock; /* one series or volume creation at a time */
     off_t vols_seen;             /* the size of VOLUMES when a writer last read it (create_lock) */
     int vols_rc;                 /* and what that read gave: damage is reported once per change, not per request */
+    sched *sched;                /* the query helpers of every volume */
 };
 
 /* ---------------------------------------------------------------- helpers */
@@ -565,7 +566,7 @@ static int volume_open(tsdb *t, const char *path, uint32_t *index)
     if (rc)
         return rc;
     eng *e;
-    if ((rc = eng_open(path, &t->opt, &e)) != 0)
+    if ((rc = eng_open_sched(path, &t->opt, t->sched, &e)) != 0)
         return rc;
     t->vols[t->nvols] = e;
     t->paths[t->nvols] = strdup(path);
@@ -718,8 +719,13 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     pthread_rwlock_init(&t->lock, NULL);
     pthread_mutex_init(&t->create_lock, NULL);
     t->dirfd = -1;
+    t->sched = sched_new(t->opt.query_threads, t->opt.request_threads);
+    if (!t->sched) {
+        tsdb_close(t);
+        return TSDB_ERR_NOMEM;
+    }
     eng *root;
-    int rc = eng_open(dir, &t->opt, &root); /* creates the directory for a writer */
+    int rc = eng_open_sched(dir, &t->opt, t->sched, &root); /* creates the directory for a writer */
     if (rc) {
         tsdb_close(t);
         return rc;
@@ -796,6 +802,7 @@ int tsdb_close(tsdb *t)
         rc = rc ? rc : r;
         free(t->paths[i]);
     }
+    sched_free(t->sched); /* after the volumes: none of them runs a query now */
     free(t->vols);
     free(t->paths);
     free(t->cat_vol);
@@ -1374,15 +1381,17 @@ typedef struct qrun {
     qstats q;
     bool outer;
     struct timespec t0;
+    sgroup g; /* the threads it may use (request_threads); a query inside a multi call uses the call's */
 } qrun;
 
-static void qs_begin(qrun *r)
+static void qs_begin(tsdb *t, qrun *r)
 {
     r->outer = cur_qstats == NULL;
     if (!r->outer)
         return;
     memset(&r->q, 0, sizeof r->q);
     cur_qstats = &r->q;
+    sched_group_begin(t->sched, &r->g, 0);
     clock_gettime(CLOCK_MONOTONIC, &r->t0);
 }
 
@@ -1391,6 +1400,7 @@ static void qs_end(qrun *r, int type, uint64_t result_rows)
     if (!r->outer)
         return;
     cur_qstats = NULL;
+    sched_group_end(&r->g);
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     tsdb_query_stats *s = &last_stats;
@@ -1429,7 +1439,7 @@ int tsdb_query_raw_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
     eng *e;
     uint32_t local;
     qrun qr;
-    qs_begin(&qr);
+    qs_begin(t, &qr);
     f32_out o = {fn, ctx, 0};
     int rc = 0;
     if (route(t, series, &e, &local)) {
@@ -1535,7 +1545,7 @@ int tsdb_query_values(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
     eng *e;
     uint32_t local;
     qrun qr;
-    qs_begin(&qr);
+    qs_begin(t, &qr);
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
     int rc = 0;
     if (route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0)
@@ -1576,7 +1586,7 @@ int tsdb_query_lttb_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, siz
     eng *e;
     uint32_t local;
     qrun qr;
-    qs_begin(&qr);
+    qs_begin(t, &qr);
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
     lttb_limit l = {.o = &o, .limit = opts ? opts->limit : 0};
     bool desc = opts && opts->order == TSDB_DESC;
@@ -1607,7 +1617,7 @@ static int query_group(tsdb *t, uint32_t series, int64_t start, int64_t end, con
     eng *e;
     uint32_t local;
     qrun qr;
-    qs_begin(&qr);
+    qs_begin(t, &qr);
     int rc = 0, type = -1;
     if (route(t, series, &e, &local)) {
         type = eng_series_type(e, local);
@@ -1661,7 +1671,7 @@ static int query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, const
     if (!opts)
         opts = &def;
     qrun qr;
-    qs_begin(&qr);
+    qs_begin(t, &qr);
     int rc = 0, type = -1;
     if (route(t, series, &e, &local)) {
         type = eng_series_type(e, local);
@@ -1727,7 +1737,7 @@ static int query_spread(tsdb *t, uint32_t series, int64_t start, int64_t end, co
     eng *e;
     uint32_t local;
     qrun qr;
-    qs_begin(&qr);
+    qs_begin(t, &qr);
     int rc = 0, type = -1;
     if (route(t, series, &e, &local)) {
         type = eng_series_type(e, local);

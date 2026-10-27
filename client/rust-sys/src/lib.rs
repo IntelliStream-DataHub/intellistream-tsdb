@@ -74,6 +74,7 @@ pub struct tsdb_options {
     pub clock_ms: Option<unsafe extern "C" fn(arg: *mut c_void) -> i64>,
     pub clock_arg: *mut c_void,
     pub create_volumes: c_int,
+    pub request_threads: c_int,
 }
 
 impl Default for tsdb_options {

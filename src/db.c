@@ -362,7 +362,9 @@ static int load_parts(eng *db, bool read_only)
 
 /* ------------------------------------------------------------- open/close */
 
-int eng_open(const char *dir, const tsdb_options *opts, eng **out)
+int eng_open(const char *dir, const tsdb_options *opts, eng **out) { return eng_open_sched(dir, opts, NULL, out); }
+
+int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **out)
 {
     *out = NULL;
     simd_init();
@@ -461,7 +463,16 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out)
     }
 
     ret_clock_init(db);
-    db->qpool = pool_new(db->opt.query_threads);
+    if (qs) {
+        db->sched = qs;
+    } else {
+        db->sched = sched_new(db->opt.query_threads, db->opt.request_threads);
+        db->own_sched = true;
+        if (!db->sched) {
+            rc = TSDB_ERR_NOMEM;
+            goto fail;
+        }
+    }
     if (!ro && db->opt.merge_threads > 0) {
         db->mergers = calloc((size_t)db->opt.merge_threads, sizeof *db->mergers);
         for (int i = 0; db->mergers && i < db->opt.merge_threads; i++)
@@ -510,7 +521,8 @@ int eng_close(eng *db)
     for (int i = 0; i < db->nmergers; i++)
         pthread_join(db->mergers[i], NULL);
     free(db->mergers);
-    pool_free(db->qpool);
+    if (db->own_sched)
+        sched_free(db->sched);
     wal_close(db);
     for (size_t i = 0; i < db->ntails; i++)
         mt_unref(db->tails[i].m);

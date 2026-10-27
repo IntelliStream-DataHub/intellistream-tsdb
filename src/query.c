@@ -843,10 +843,10 @@ static void agg_worker(void *arg, int idx)
     cur_qstats = j->qs;
     codec_ctx *cc = cc_get(db);
     size_t cap = db->granule_rows;
-    int64_t *ts = malloc(cap * sizeof *ts);
-    uint8_t *v = malloc(cap * sizeof(uint64_t));
-    local_bucket *local = malloc(cap * sizeof *local); /* a granule touches at most count buckets */
-    agg_dev *localx = j->t.accx ? malloc(cap * sizeof *localx) : NULL;
+    int64_t *ts = qscratch_get(0, cap * sizeof *ts);
+    uint8_t *v = qscratch_get(1, cap * sizeof(uint64_t));
+    local_bucket *local = qscratch_get(2, cap * sizeof *local); /* a granule touches at most count buckets */
+    agg_dev *localx = j->t.accx ? qscratch_get(3, cap * sizeof *localx) : NULL;
     if (!cc || !ts || !v || !local || (j->t.accx && !localx)) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
         goto out;
@@ -890,14 +890,19 @@ static void agg_worker(void *arg, int idx)
                 a = e;
             }
         }
+        int lv = sched_leave();
+        if (lv < 0)
+            atomic_store(&j->err, lv);
+        if (lv)
+            break;
     }
 out:
     if (cc)
         cc_put(db, cc);
-    free(ts);
-    free(v);
-    free(local);
-    free(localx);
+    qscratch_put(ts);
+    qscratch_put(v);
+    qscratch_put(local);
+    qscratch_put(localx);
     cur_qstats = mine;
 }
 
@@ -1280,7 +1285,7 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
         for (int k = 0; k < AGG_STRIPES; k++)
             pthread_mutex_init(&j->locks[k], NULL);
         int threads = nwork >= PARALLEL_MIN_GRANULES ? (int)MIN((size_t)db->opt.query_threads, nwork) : 1;
-        pool_run(db->qpool, threads, agg_worker, j);
+        sched_run(db->sched, threads, agg_worker, j);
         for (int k = 0; k < AGG_STRIPES; k++)
             pthread_mutex_destroy(&j->locks[k]);
         rc = atomic_load(&j->err);
