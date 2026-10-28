@@ -4,13 +4,15 @@
   python3 -I tables.py OUT > tables.md
 
 For every phase directory OUT/p<n> that has results: the results (phase 1: sizes.md of sizes_summary.py; phases 2
-to 4: one table per system of its measurements, the first line of every *.mean.txt, i.e. the mean over the runs
-with sd and min-max where runstats.py gives them), and under them a "How it was run" table built from the how.json
+to 4: one table per system of its measurements: every timing line of every *.mean.txt (the mean over the runs) with
+its sd and min-max, the run count, and flags for runs on a busy machine, refused or OOM-killed runs and text that
+differs between runs; a mean file without a timing line fails the script; then loose.txt, answers that differ from
+tsdb's within a stated bound), and under them a "How it was run" table built from the how.json
 files (how.py) plus footnotes: the '-' reasons, refusals and the per-core method. A system directory with results
 but no how.json, or a how.json without one of how.py's REQUIRED fields, fails the script (exit 1): no number goes
 out without the way it was measured.
 """
-import glob, json, os, sys
+import glob, json, os, re, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from how import REQUIRED  # noqa: E402
@@ -66,21 +68,65 @@ def how_table(hows, cols):
     return out + ["", "Notes:", ""] + notes + [""]
 
 
-def first_line(f):
-    for l in open(f):
-        if l.strip() and not l.startswith("#"):
-            return l.strip()
-    return ""
+TIME = re.compile(r"\d(?:\.\d+)?\s*(?:ms|us|s|sec|min)\b|q/s|rows/s")
+CH_PCT = re.compile(r"^\d+(?:\.\d+)?%\s")  # an old clickhouse-benchmark percentile line: its summary line has them
+
+
+def picked(f):
+    """The timing lines of a runstats mean file, each with its '#   sd% [min-max]' line, the run count and flags."""
+    lines, nruns, flags = [], None, []
+    for l in open(f, errors="replace"):
+        l = l.rstrip("\n")
+        if l.startswith("#   "):
+            if lines and not lines[-1][1]:
+                lines[-1][1] = l[4:].strip()
+            continue
+        m = re.match(r"# mean over (\d+) runs", l)
+        if m:
+            nruns = int(m.group(1))
+            continue
+        if "TEXT DIFFERS" in l:
+            flags.append("TEXT DIFFERS between runs (see the raw files)")
+        if l.startswith("#") or not l.strip() or CH_PCT.match(l) or not TIME.search(l):
+            continue
+        lines.append([l.replace("   # TEXT DIFFERS between runs", "").strip(), ""])
+    base = f[:-len(".mean.txt")]
+    nq = sorted(glob.glob(base + ".*.notquiet"))
+    if nq:
+        flags.append("measured on a busy machine in %d run(s): %s" % (len(nq), "; ".join(
+            "%s %s" % (os.path.basename(x).split(".")[-2], open(x).read().strip()) for x in nq)))
+    for ext, what in (("refused", "refused by the server"), ("oom", "killed out of memory")):
+        n = len(glob.glob(base + ".*." + ext))
+        if n:
+            flags.append("%d run(s) %s, not averaged" % (n, what))
+    return lines, nruns, flags
 
 
 def results_table(d, prefix=""):
     rows = []
     for f in sorted(glob.glob(os.path.join(d, prefix + "*.mean.txt"))):
         name = os.path.basename(f)[:-len(".mean.txt")]
-        rows.append("| %s | %s |" % (cell(name), cell(first_line(f))[:240]))
+        lines, nruns, flags = picked(f)
+        if not lines:
+            errors.append("%s: no timing in it (a failed or empty run?)" % f)
+            flags.append("NO TIMING")
+        res = "<br>".join(cell(t)[:240] for t, _ in lines) or "-"
+        spread = "<br>".join(cell(st)[:240] or "(one run or no spread)" for _, st in lines) or "-"
+        rows.append("| %s | %s | %s | %s | %s |" % (cell(name), res, spread, nruns if nruns is not None else "?",
+                                                   cell("; ".join(flags)) or ""))
     if not rows:
         return []
-    return ["| measurement | mean over the runs (sd, min-max where more than one) |", "|---|---|"] + rows
+    return ["| measurement | mean over the runs | sd %, [min-max] per number | runs | flags |",
+            "|---|---|---|---|---|"] + rows
+
+
+def loose_notes(d):
+    """loose.txt: TWA kinds timed although their answers differ from tsdb's within the stated bound."""
+    f = os.path.join(d, "loose.txt")
+    if not os.path.exists(f):
+        return []
+    return ["", "Answers that differ from tsdb's (timed, within the stated bound; see check-*.txt):", ""] + \
+        ["- " + cell(l.strip()) for l in open(f) if l.strip()]
 
 
 def phase1(out, p):
@@ -118,7 +164,7 @@ def phase2(out, p):
         if not h:
             continue
         hows.append(h)
-        out += ["### %s" % h["system"], ""] + (t or ["(no timed measurements)"]) + [""]
+        out += ["### %s" % h["system"], ""] + (t or ["(no timed measurements)"]) + loose_notes(d) + [""]
     out += how_table(hows, COLS)
 
 

@@ -8,7 +8,7 @@
  * (wrapping) until SECONDS have passed or it has run MAXQ queries, so all threads together walk
  * the file in order. MAXQ 0 runs every query of the file exactly once instead, each thread taking the
  * next one when it is free (100 per-series queries on 16 connections, say). Every response is read completely (libpq fetches whole results), and any
- * failed query stops the run rather than being counted. Prints queries, q/s, and the median and
+ * failed query stops the run rather than being counted. Prints queries, q/s, and the mean, median and
  * p99 latency over all queries.
  *
  * A query that runs longer than QDRIVE_TIMEOUT seconds (default 600; 0: no limit) fails the run with exit status
@@ -266,7 +266,11 @@ int main(int argc, char **argv)
     for (int i = 0; i < threads; i++)
         for (size_t x = 0; x < jobs[i].n; x++) all[m++] = jobs[i].lat[x];
     qsort(all, m, sizeof *all, cmpd);
-    printf("%s c=%d: %zu queries in %.2f s = %.1f q/s, median %.3f ms, p99 %.3f ms (rows %llu, bytes %llu)\n",
-           argv[k], threads, total, secs, total / secs, all[m / 2] * 1e3, all[(size_t)(m * 0.99)] * 1e3, rows, bytes);
+    double sum = 0;
+    for (size_t x = 0; x < m; x++) sum += all[x];
+    /* the mean is the number the tables compare (the average time of one request, i.e. of one batch) */
+    printf("%s c=%d: %zu queries in %.2f s = %.1f q/s, mean %.3f ms, median %.3f ms, p99 %.3f ms (rows %llu, bytes %llu)\n",
+           argv[k], threads, total, secs, total / secs, m ? sum / m * 1e3 : 0.0, all[m / 2] * 1e3,
+           all[(size_t)(m * 0.99)] * 1e3, rows, bytes);
     return 0;
 }

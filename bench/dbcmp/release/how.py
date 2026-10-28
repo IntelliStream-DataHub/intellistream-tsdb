@@ -42,8 +42,9 @@ SYSTEMS = {
                   "(series, ts); DoubleDelta / Gorilla + ZSTD(1)"],
         durability="not fsynced at acknowledgement (fsync_after_insert 0, the default); syncfs after the load, timed",
         loader="ch_load.sh: one RowBinary INSERT through clickhouse client (native protocol); merges settled",
-        query_client="clickhouse-benchmark (native protocol); times from the server's query_log (query_duration_ms), "
-                     "not 1/QPS",
+        query_client="qdrive over HTTP (port 8123, TabSeparated replies), the same driver and client wall time as "
+                     "every other HTTP system; beside it 'server only': the server's query_log in microseconds. "
+                     "Not clickhouse-benchmark: it rounds latencies to whole ms and its 1/QPS has a fixed 100 ms wait",
         connections="random-window classes 1 and 32; whole range 1 query on max_threads 32 (default)",
         one_query="one SQL statement per series; " + BATCH_SQL,
         per_core="max_threads=1; " + PIN,

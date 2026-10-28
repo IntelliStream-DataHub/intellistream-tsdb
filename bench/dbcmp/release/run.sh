@@ -114,6 +114,8 @@ tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout
     e=$(date +%s.%N)
     stepunlock
     printf '%s\t%s\trc=%d\t%.1fs\tbusy=%s\n' "$(date '+%F %T')" "$label" "$rc" "$(echo "$e - $s" | bc)" "$BUSY" >> "$OUT/steps.log"
+    # a run measured on a busy machine says so beside its output (OUT.notquiet), which tables.py prints with the mean
+    case $BUSY in *NOT-QUIET*) echo "busy=$BUSY" > "$out.notquiet" ;; *) rm -f "$out.notquiet" ;; esac
     if [ "$rc" != 0 ] && [ "$rc" != 124 ] && [ -n "${QREFUSE-}" ] && grep -qE -- "$QREFUSE" "$out"; then
         # the server refused the query by its own limits (QREFUSE, set per system, e.g. IoTDB's code 719 "not enough
         # memory"): a result to report as "refused", not a harness failure; renamed so runstats averages no error text
@@ -398,19 +400,24 @@ tsdbtwa() { # DIR PREFIX CONNS...: relq for every TWA kind (windows at 1 and 32 
         tstep "p2 tsdb $P$k c$c" "$D/$P$k.c$c.txt" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" "$c" "$REPS"
     done; done
 }
-chbench1() { # CONC ITER|0 SECONDS|0 FILE: clickhouse-benchmark; raw output to stderr, one summary line to stdout
-    local args=(--host 127.0.0.1 --delay 0 -c "$1" ${CHB_EXTRA:-})
-    [ "$2" != 0 ] && args+=(-i "$2")
-    [ "$3" != 0 ] && args+=(--timelimit "$3")
-    local raw
-    raw=$("$CLICKHOUSE" benchmark "${args[@]}" < "$4" 2>&1)
-    echo "$raw" >&2
-    echo "$raw" | grep -qE 'Exception|Code: [0-9]+' && return 1
-    echo "$raw" | grep -E "queries: [0-9]+, QPS|^50%|^99%" | tr '\n' ' ' |
-        sed -E 's/.*queries: ([0-9]+), QPS: ([0-9.]+).*50%[^0-9]*([0-9.]+) sec.*99%[^0-9]*([0-9.]+) sec.*/\1 queries, \2 q\/s, median \3 s, p99 \4 s/'
-    echo
+chbench1() { # CONC ITER|0 SECONDS|0 FILE [SETTING=V...]: FILE's SQL lines as HTTP POSTs through qdrive, its summary
+    # line to stdout. ClickHouse is timed like every other HTTP system here: qdrive's client wall time per request, from
+    # send to the last byte (clickhouse-benchmark rounds latencies to whole ms, and its 1/QPS has a fixed 100 ms wait).
+    # ITER > 0: the first ITER lines once, in order (clickhouse-benchmark -i); else SECONDS on CONC connections.
+    local c=$1 i=$2 s=$3 f=$4 q="" a h rc
+    shift 4
+    for a in "$@"; do q="$q&${a#--}"; done
+    q=${q#&}
+    h=$(mktemp "$WORK/.chq.XXXXXX") || return 1
+    awk -v p="POST /?$q" '{ print p "\ttext/plain\t" $0 }' "$f" > "$h"
+    # an exception after the first rows comes with status 200: a reply with an exception text in it is a failure
+    if [ "$i" != 0 ]; then QDRIVE_ERR_SUB='DB::Exception' "$BIN/qdrive" http 127.0.0.1 8123 '' "$h" 1 100000 "$i"
+    else QDRIVE_ERR_SUB='DB::Exception' "$BIN/qdrive" http 127.0.0.1 8123 '' "$h" "$c" "$s"; fi
+    rc=$?
+    rm -f "$h"
+    return $rc
 }
-chsuite() { # PREFIX DIR TABLE-SYS(ch): ch_bench.sh with REPS runs per measurement
+chsuite() { # PREFIX DIR TABLE-SYS(ch): chbench1 (qdrive over HTTP) with REPS runs per measurement
     local P=$1 D=$2 S=$3 n c t
     for n in ${FULLS-$FULLS_DEFAULT}; do
         chbench1 1 1 0 "$WORK/q/$S.full$n.txt" > /dev/null 2> "$D/warm.$P.full$n" 9>&-
@@ -533,20 +540,23 @@ bcheck() { # SYS DIR: batch files and their answer check (check.py --batch); 0 w
     (cd "$WORK" && python3 -I "$H/mkbatch.py" "$1") || { fail "mkbatch $1"; return 1; }
     untimed "$2/check-batch-$1.txt" bash -c "cd '$WORK' && python3 -I '$H/check.py' --batch '$1' 5"
 }
-# ClickHouse: clickhouse-benchmark drives, and the server's own latency comes from system.query_log, every
-# query of a run tagged with log_comment (REPORT §3: never 1/QPS alone)
-chqlog() { # TAG: server-side count, mean, median and p99 duration (ms) and mean CPU (ms) of the queries tagged TAG
+# ClickHouse: qdrive drives over HTTP (chbench1), and the server's own latency comes from system.query_log, every
+# query of a run tagged with log_comment (REPORT §3: never 1/QPS alone), in microseconds: query_duration_ms counts
+# whole ms, and most of these queries take less than that
+chqlog() { # TAG: server-side count, mean, median and p99 duration (ms, from us) and mean CPU (ms) of the queries tagged TAG
     "$CLICKHOUSE" client --host 127.0.0.1 -q "SYSTEM FLUSH LOGS" &&
-    "$CLICKHOUSE" client --host 127.0.0.1 -q "SELECT 'server', count(), 'queries, mean', round(avg(query_duration_ms), 3), 'ms, median',
-        quantile(0.5)(query_duration_ms), 'ms, p99', quantile(0.99)(query_duration_ms), 'ms, cpu',
+    "$CLICKHOUSE" client --host 127.0.0.1 -q "WITH dateDiff('microsecond', query_start_time_microseconds,
+        event_time_microseconds) / 1000 AS d SELECT 'server only', count(), 'queries, mean', round(avg(d), 3),
+        'ms, median', round(quantile(0.5)(d), 3), 'ms, p99', round(quantile(0.99)(d), 3), 'ms, cpu',
         round(avg(ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds']) / 1000, 3), 'ms'
         FROM system.query_log WHERE type = 'QueryFinish' AND log_comment = '$1' FORMAT TSV" | tr '\t' ' '
 }
 chbench_tag() { # TAG CONC ITER|0 SECONDS|0 FILE [SETTING...]: chbench1 with log_comment=TAG, then chqlog TAG
     local tag=$1 c=$2 i=$3 s=$4 f=$5
     shift 5
-    CHB_EXTRA="--log_comment=$tag $*" chbench1 "$c" "$i" "$s" "$f" && chqlog "$tag"
+    chbench1 "$c" "$i" "$s" "$f" "log_comment=$tag" "$@" && chqlog "$tag"
 }
+export BIN WORK
 export -f chbench1 chbench_tag chqlog
 tsdb_has_batch() { grep -aq -- '--batch' "$TB/tsdbq"; }  # its usage says only "see source": the option's string
 tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI: "full ... --batch K", CLASS.bK).
@@ -574,7 +584,7 @@ tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (whe
     tsdbd_stop
     TSDBD_WRAP="taskset -c $PERCORE_CPU" tsdbd_start "$1" "${qt[@]}"
 }
-chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through clickhouse-benchmark (PC=1: max_threads=1, pinned)
+chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through chbench1 (PC=1: max_threads=1, pinned)
     local P=$1 D=$2 S=$3 n k c t f nl sfx= ths=${BTHREADS:-1 32} set=() r
     [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; set=(--max_threads=1); }
     for k in $KS; do
@@ -1378,7 +1388,7 @@ phase_smoke() {
     env DBCMP="$S" WORK="$S/work" DATA="$S/input/mixed.rowbinary" IN="$S/sizes/in" OUT="$so" \
         CLICKHOUSE="$CLICKHOUSE" DUCKDB_DIR="$DUCKDB_DIR" CHDB_DIR="$CHDB_DIR" IOT_VENV="$IOT_VENV" HYD_RAW="$HYD_RAW" \
         BENCH_LOCK="$LOCK" TSDB_TREE="$TSDB_TREE" TB="$TB" BIN="$BIN" \
-        SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10" \
+        SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10 100" \
         PREP_SERIES=10 PREP_POINTS=650000 PREP_SIZE_POINTS=200000 PREP_SPEC=400 \
         DSLIST="${SMOKE_DS:-hdd_temp vibration hyd_CE hyd_PS1}" \
         IOT_STABLE=40 TD_STABLE=20 VM_STABLE=10 QDB_WAIT_MAX=900 CH_SETTLE_MAX=600 \
