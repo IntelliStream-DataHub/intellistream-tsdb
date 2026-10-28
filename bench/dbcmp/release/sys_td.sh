@@ -197,6 +197,8 @@ p2_td() {
     cd "$OUT" || true
     crm rb-td
     podman unshare sh -c 'tail -n 300 "$1"/log/taosdlog.0' sh "$W" > "$D/taosd.log" 2> /dev/null
+    podman unshare sh -c 'f=$(ls -t "$1"/log/taosadapter* 2> /dev/null | head -n 1); [ -n "$f" ] && tail -n 300 "$f"' sh "$W" \
+        > "$D/taosadapter.log" 2> /dev/null
     rmdata "$W"
     runstats "$D"
 }

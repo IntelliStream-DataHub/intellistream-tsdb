@@ -24,6 +24,11 @@ P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_M
 CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot rb-td rb-vm"
 PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080|6041|8428)\b'
 mkdir -p "$OUT"
+# Every container without Podman's default limit of 2048 processes (threads count): TDengine with 16 vgroups and
+# taosAdapter at 32 connections most likely ran into it in the 2026-10-28 smoke (EAGAIN, "Resource temporarily unavailable", on a
+# 100-series raw batch). The limit is Podman's, not a server's setting, so no system gets it; ctr_mem records pids.peak.
+printf '[containers]\npids_limit = 0\n' > "$OUT/containers.conf"
+export CONTAINERS_CONF_OVERRIDE=$OUT/containers.conf
 
 # ------------------------------------------------------------------ logging, quiet gate, timed steps
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/driver.log"; }
@@ -168,6 +173,8 @@ untimed() { # OUTFILE CMD...: a step that is not a timing (checks, dumps, sizes)
     limited "$lim" "$out" "$@"
     rc=$?
     stepunlock
+    # UNTIMED_SOFT: an answer check whose mismatch is a result to report (a stated bound missed), not a harness failure
+    [ "$rc" = 1 ] && [ -n "${UNTIMED_SOFT-}" ] && grep -q MISMATCH "$out" && ! grep -q Traceback "$out" && return 2
     [ "$rc" = 0 ] || { fail "$(basename "$out"): rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${lim}s)") (see $out)"; return 1; }
     case $(basename "$out") in check*) grep -qE 'mismatches [1-9]|MISMATCH|Traceback' "$out" && { fail "answer check: $(grep -m1 -E 'mismatches [1-9]|MISMATCH|Traceback' "$out" | cut -c1-150) ($out)"; return 1; } ;; esac
     return 0
@@ -374,14 +381,21 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
             echo "$k: InfluxDB 2's timeWeightedAvg interpolates only between the bucket's own rows, not across its edges (a third of the buckets differ from tsdb's LINEAR TWA); not timed" >> "$D/dash.txt"
             continue ;;
         esac
-        # td: TDengine's TWA() (LINEAR) has tsdb's edges but accumulates with less precision: smoke 10 x 650 k,
-        # hourly, relative differences 1e-9 to 5e-8, and 1.7e-4 on an average near 0 (vibration, 8e-9 absolute).
-        # It is checked against a stated bound (TWA_TOL), timed only within it, and the bound and the largest
-        # difference go to DIR/loose.txt, which tables.py prints under the system's table
+        # td: TDengine's TWA() (LINEAR) has tsdb's edges but accumulates with less precision (relative differences
+        # 1e-9 to 5e-8 in most hourly buckets); in the 2026-10-28 smoke (10 x 650 k) 125 of 27,811 buckets differed by
+        # up to 4.6e-4 relative (0.011 absolute), at the same hours in different series. It is checked against a stated
+        # bound (TWA_TOL) and timed only within it: within, the bound and the largest difference go to DIR/loose.txt
+        # (printed under the system's table); beyond, the kind is '-' with the check's summary in DIR/dash.txt, a
+        # result like a refusal, not a harness failure
         case " ${TWA_LOOSE-td} " in
         *" $S "*)
-            REL_TOL=${TWA_TOL:-1e-6,1e-6} untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" ||
-                { log "  $S $k: not timed (answers differ beyond ${TWA_TOL:-1e-6,1e-6})"; continue; }
+            REL_TOL=${TWA_TOL:-1e-6,1e-6} UNTIMED_SOFT=1 untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl"
+            case $? in
+            0) ;;
+            2) echo "$k: answers differ from tsdb's beyond ${TWA_TOL:-1e-6,1e-6} (relative, absolute), not timed: $(grep -m1 -E "^$k: [0-9]+ series" "$D/check-$k.txt" | cut -d: -f2- | tr -s ' ' | sed 's/^ //; s/ (bound.*//')" >> "$D/dash.txt"
+               log "  $S $k: not timed (answers differ beyond ${TWA_TOL:-1e-6,1e-6}; dash.txt)"; continue ;;
+            *) continue ;;
+            esac
             echo "$k: agrees with tsdb within ${TWA_TOL:-1e-6,1e-6} (relative, absolute) only, not 1e-9: $(grep -o 'largest difference.*' "$D/check-$k.txt" | head -1)" >> "$D/loose.txt";;
         *) untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { log "  $S $k: not timed (answers differ)"; continue; };;
         esac
@@ -468,7 +482,8 @@ ctr_mem() { # CONTAINER FILE: the container's cgroup memory (peak, limit, OOM ki
     local p
     p=/sys/fs/cgroup$(podman inspect -f '{{.State.CgroupPath}}' "$1" 2> /dev/null)
     [ -r "$p/memory.peak" ] || { echo "$1: no cgroup memory files (not running?)" >> "$2"; return 1; }
-    echo "$1 peak $(cat "$p/memory.peak") limit $(cat "$p/memory.max") $(grep '^oom_kill ' "$p/memory.events")" >> "$2"
+    echo "$1 peak $(cat "$p/memory.peak") limit $(cat "$p/memory.max") $(grep '^oom_kill ' "$p/memory.events")" \
+        "pids peak $(cat "$p/pids.peak" 2> /dev/null) limit $(cat "$p/pids.max" 2> /dev/null) $(grep '^max ' "$p/pids.events" 2> /dev/null)" >> "$2"
 }
 oom_killed() { # CONTAINER: 0 when it no longer runs and the kernel OOM-killed a process in its cgroup
     local st id
