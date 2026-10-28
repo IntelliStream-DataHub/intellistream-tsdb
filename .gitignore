@@ -17,3 +17,4 @@ perf.data*
 /.claude/settings.local.json
 __pycache__/
 /build-fuzz-frames/
+.corbienest/
