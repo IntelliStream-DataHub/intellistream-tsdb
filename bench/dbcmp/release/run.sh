@@ -20,7 +20,11 @@ I3_P1_STABLE=${I3_P1_STABLE:-180} I3_P1_MAX=${I3_P1_MAX:-5400}
 I3_P1_AGE=${I3_P1_AGE:-5m} I3_P1_MIN=${I3_P1_MIN:-420}
 I2_EXTRA=${I2_EXTRA:-}                  # smoke runs only: e.g. -e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s
 PROM_SETTLE_TIMEOUT=${PROM_SETTLE_TIMEOUT:-36000}
-P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320}
+P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320} P5_DIR=${P5_DIR:-/var/tmp}
+# the many-client counts: 32 clients (window classes, TWA windows) and 16 connections (per-series whole range); the
+# smoke test runs 2 and 2 (NHI, NPER): it checks that every step works, and 32 clients of 100-series batches on its
+# data only made it slow (and ran unlimited containers out of host memory)
+NHI=${NHI:-32} NPER=${NPER:-16}
 CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot rb-td rb-vm"
 PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080|6041|8428)\b'
 mkdir -p "$OUT"
@@ -289,11 +293,12 @@ qdb_wait_table() { # TABLE: until every WAL transaction is applied; fails after 
     return 1
 }
 # REPORT §5.11: timescaledb-tune's work_mem (6 MB) spills TWA's window sorts to disk, so the timescaledb-ha server,
-# which runs TWA and LTTB, gets 256 MB. The plain server keeps tune's value: work_mem is per sort or hash node, and a
-# batch of 100 series is 100 UNION ALL branches; at 256 MB, 32 clients of 7-day batches grew to ~1.7 GB per backend
-# (most likely through it), and the kernel's OOM killer ended the 2026-10-28 smoke (64 GB host, no memory limit
-# under cgroupfs).
-TS_WORK_MEM=${TS_WORK_MEM:-256MB}
+# which runs TWA and LTTB, gets 256 MB. The plain server keeps tune's value. Neither bounds a 100-series batch: 100
+# UNION ALL branches over compressed chunks, 32 clients of 7-day batches grew to ~1.7 GB per backend at 256 MB and
+# again at tune's 6 MB (2026-10-28 smokes, no memory limit under cgroupfs; the host's OOM killer ended both). So both
+# servers get a memory limit (TS_MEM) like the other containers: an OOM kill is then a result in REFUSED.txt, and the
+# steps after it wait until PostgreSQL serves again (QCTR rb-ts).
+TS_WORK_MEM=${TS_WORK_MEM:-256MB} TS_MEM=${TS_MEM:-24g}
 # Podman gives a container 64 MB of /dev/shm; PostgreSQL's parallel workers share their hash tables there, and a
 # batch of 100 series failed with "could not resize shared memory segment ... No space left on device". A server on a
 # host has the host's /dev/shm (half the RAM); 8 GB is plenty here.
@@ -303,10 +308,10 @@ ts_start() { # NAME IMAGE DATADIR MOUNTPOINT: TimescaleDB on 127.0.0.1:5434 with
     mkdir -p "$W"
     if [ "$name" = rb-tsha ]; then
         podman unshare chown 1000:1000 "$W"
-        podman run -d --name "$name" --network host --shm-size=$TS_SHM -v "$W:/home/postgres/pgdata" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
+        podman run -d --name "$name" --network host $(memlim "$TS_MEM") --shm-size=$TS_SHM -v "$W:/home/postgres/pgdata" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
             -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 -c work_mem=$TS_WORK_MEM > /dev/null 9>&- || { fail "$name start"; return 1; }
     else
-        podman run -d --name "$name" --network host --shm-size=$TS_SHM -v "$W:/var/lib/postgresql/data" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
+        podman run -d --name "$name" --network host $(memlim "$TS_MEM") --shm-size=$TS_SHM -v "$W:/var/lib/postgresql/data" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
             -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 > /dev/null 9>&- || { fail "$name start"; return 1; }
     fi
     # the image runs initdb and its init scripts on a temporary server first: wait for the extension, then again
@@ -389,7 +394,7 @@ qsuite() { # SYS PREFIX DIR DRIVER-ARGS...: whole range (warm-up, REPS runs of o
     done
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
         "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" 1 3 > "$D/warm.$P.$c" 2>&1 9>&- || { fail "$P $c warm-up failed (see $D/warm.$P.$c)"; continue; }
-        for t in 1 32; do reps "$P.$c.c$t" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" "$t" "$SECS"; done
+        for t in 1 $NHI; do reps "$P.$c.c$t" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" "$t" "$SECS"; done
     done
 }
 qline() { # NAME DIR FILE DRIVER-ARGS...: one query (LTTB, TWA): a warm-up, then REPS runs
@@ -452,7 +457,7 @@ tsdbtwa() { # DIR PREFIX CONNS...: relq for every TWA kind (windows at 1 and 32 
     local D=$1 P=$2 k c
     shift 2
     for k in $TWA_KINDS; do for c in "$@"; do tstep "p2 tsdb $P$k c$c" "$D/$P$k.c$c.txt" -- "$B/relq" "$k" "$c" "$REPS"; done; done
-    for k in $TWA_WKINDS; do for c in 1 32; do
+    for k in $TWA_WKINDS; do for c in 1 $NHI; do
         tstep "p2 tsdb $P$k c$c" "$D/$P$k.c$c.txt" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" "$c" "$REPS"
     done; done
 }
@@ -480,13 +485,13 @@ chsuite() { # PREFIX DIR TABLE-SYS(ch): chbench1 (qdrive over HTTP) with REPS ru
         for r in $(seq "$REPS"); do tstep "$P.full$n r$r" "$D/$P.full$n.$r" -- chbench_tag "$P.full$n.$r.$$" 1 1 0 "$WORK/q/$S.full$n.txt"; done
         # like with like (REPORT §3): one query per series, 16 at a time, as tsdbq full 16 sends them
         for r in $(seq "$REPS"); do
-            sed "s/@TAG@/$P.full$n.per.c16.$r.$$/" "$WORK/q/$S.full$n.per.http" > "$D/per.http"
-            tstep "$P.full$n.per.c16 r$r" "$D/$P.full$n.per.c16.$r" -- bash -c "'$B/qdrive' http 127.0.0.1 8123 '' '$D/per.http' 16 100000 0 && chqlog '$P.full$n.per.c16.$r.$$'"
+            sed "s/@TAG@/$P.full$n.per.c$NPER.$r.$$/" "$WORK/q/$S.full$n.per.http" > "$D/per.http"
+            tstep "$P.full$n.per.c$NPER r$r" "$D/$P.full$n.per.c$NPER.$r" -- bash -c "'$B/qdrive' http 127.0.0.1 8123 '' '$D/per.http' $NPER 100000 0 && chqlog '$P.full$n.per.c$NPER.$r.$$'"
         done
     done
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
         chbench1 1 0 3 "$WORK/q/$S.$c.txt" > /dev/null 2> "$D/warm.$P.$c" 9>&-
-        for t in 1 32; do for r in $(seq "$REPS"); do
+        for t in 1 $NHI; do for r in $(seq "$REPS"); do
             tstep "$P.$c.c$t r$r" "$D/$P.$c.c$t.$r" -- chbench_tag "$P.$c.c$t.$r.$$" "$t" 0 "$SECS" "$WORK/q/$S.$c.txt"
         done; done
     done
@@ -519,17 +524,27 @@ ctr_mem() { # CONTAINER FILE: the container's cgroup memory (peak, limit, OOM ki
     echo "$1 peak $(cat "$p/memory.peak") limit $(cat "$p/memory.max") $(grep '^oom_kill ' "$p/memory.events")" \
         "pids peak $(cat "$p/pids.peak" 2> /dev/null) limit $(cat "$p/pids.max" 2> /dev/null) $(grep '^max ' "$p/pids.events" 2> /dev/null)" >> "$2"
 }
-oom_killed() { # CONTAINER: 0 when it no longer runs and the kernel OOM-killed a process in its cgroup
-    local st id
+oom_killed() { # CONTAINER: 0 when the kernel OOM-killed a process in its cgroup: it no longer runs, or it still runs
+    # and its cgroup's oom_kill count grew since the last call (PostgreSQL's postmaster outlives a killed backend and
+    # restarts the others itself, in recovery for a moment)
+    local st id p n f
     st=$(podman inspect -f '{{.State.Status}}' "$1" 2> /dev/null)
-    case $st in running | '') return 1 ;; esac
+    case $st in '') return 1 ;; running)
+        p=/sys/fs/cgroup$(podman inspect -f '{{.State.CgroupPath}}' "$1" 2> /dev/null)
+        n=$(awk '$1 == "oom_kill" { print $2 }' "$p/memory.events" 2> /dev/null)
+        f=$OUT/.oomseen.$1
+        [ -n "$n" ] && [ "$n" -gt "$(cat "$f" 2> /dev/null || echo 0)" ] || return 1
+        echo "$n" > "$f"
+        return 0 ;;
+    esac
     id=$(podman inspect -f '{{.Id}}' "$1" 2> /dev/null)
     [ -n "$id" ] && journalctl -k --since "-6h" 2> /dev/null | grep -qE "oom-kill:.*libpod-$id\.scope"
 }
 ctr_restart() { # CONTAINER: start it again (same settings and data), then wait up to 300 s for QREADY
     local i
     steplock -s
-    podman start "$1" > /dev/null 2>&1 9>&-
+    # a container that still runs (oom_killed) only waits; a new start makes a new cgroup, whose count starts at 0
+    [ "$(podman inspect -f '{{.State.Status}}' "$1" 2> /dev/null)" = running ] || { rm -f "$OUT/.oomseen.$1"; podman start "$1" > /dev/null 2>&1 9>&-; }
     for i in $(seq 600); do
         ${QREADY:-true} > /dev/null 2>&1 || { sleep 0.5; continue; }
         stepunlock
@@ -588,7 +603,7 @@ pc_restart() { # CONTAINER CONFIG_FILE START_CMD...: the per-core start: runtime
       echo "threads: $(podman exec "$c" sh -c 'ls /proc/[0-9]*/task 2> /dev/null | grep -c "^[0-9]"' 2>&1)"; } > "$f" 2>&1
 }
 bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
-    local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 32}
+    local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI}
     shift 3
     [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
     for k in $KS; do
@@ -608,7 +623,7 @@ perc16() { # SYS PREFIX DIR DRIVER-ARGS...: the whole range as 100 per-series qu
             # wrote q/SYS.fullN.per.txt), each system's fastest correct form of it, as for tsdb and ClickHouse
     local S=$1 P=$2 D=$3 n
     shift 3
-    for n in ${FULLS-$FULLS_DEFAULT}; do reps "$P.full$n.per.c16" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.full$n.per.txt" 16 100000 0; done
+    for n in ${FULLS-$FULLS_DEFAULT}; do reps "$P.full$n.per.c$NPER" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.full$n.per.txt" "$NPER" 100000 0; done
     return 0   # a failed run is in FAILS already; the batches still run
 }
 bcheck() { # SYS DIR: batch files and their answer check (check.py --batch); 0 when they agree with the reference
@@ -637,7 +652,7 @@ tsdb_has_batch() { grep -aq -- '--batch' "$TB/tsdbq"; }  # its usage says only "
 tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI: "full ... --batch K", CLASS.bK).
                # A tsdbq without --batch answers K = 1 only (the 10 single series, one request each; the window
                # classes one window per request) and the log says the rest is pending.
-    local P=$1 D=$2 k c t sfx= ths=${BTHREADS:-1 32} n
+    local P=$1 D=$2 k c t sfx= ths=${BTHREADS:-1 $NHI} n
     [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
     # a release run must time tsdb's batches: without protocol 10's --batch the phase fails (smoke only logs it)
     tsdb_has_batch || { [ "${SMOKE:-0}" = 1 ] && log "  $P: tsdbq in $TB has no --batch: K > 1 not timed" \
@@ -692,7 +707,7 @@ tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (whe
     TSDBD_WRAP="taskset -c $PERCORE_CPU" tsdbd_start "$1" "${qt[@]}"
 }
 chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through chbench1 (PC=1: max_threads=1, pinned)
-    local P=$1 D=$2 S=$3 n k c t f nl sfx= ths=${BTHREADS:-1 32} set=() r
+    local P=$1 D=$2 S=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} set=() r
     [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; set=(--max_threads=1); }
     for k in $KS; do
         for n in ${FULLS-$FULLS_DEFAULT}; do
@@ -960,21 +975,21 @@ p2_tsdb() {
     untimed "$D/ref-twa.log" "$B/relq" twa 1 1 ref/twa.jsonl
     for k in $TWA_KINDS $TWA_WKINDS; do untimed "$D/ref-$k.log" env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" 1 1 "ref/$k.jsonl"; done
     tstep "p2 tsdb full c1" "$D/full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
-    tstep "p2 tsdb full c16" "$D/full.c16.txt" -- "$TB/tsdbq" full 16 "$REPS"
+    tstep "p2 tsdb full c$NPER" "$D/full.c$NPER.txt" -- "$TB/tsdbq" full $NPER "$REPS"
     tstep "p2 tsdb lttb c1" "$D/lttb.c1.txt" -- "$B/relq" lttb 1 "$REPS"
     tstep "p2 tsdb lttb c16" "$D/lttb.c16.txt" -- "$B/relq" lttb 16 "$REPS"
     tstep "p2 tsdb twa c1" "$D/twa.c1.txt" -- "$B/relq" twa 1 "$REPS"
     tstep "p2 tsdb twa c16" "$D/twa.c16.txt" -- "$B/relq" twa 16 "$REPS"
     tsdbtwa "$D" "" 1 16
-    tsdbsuite tsdbq "$D" "1 32"
+    tsdbsuite tsdbq "$D" "1 $NHI"
     untimed "$D/check-self.txt" tsdb_self "" && tsdbbsuite tsdbq "$D"
     tstep "p2 tsdbc-bench query c1" "$D/tsdbc-bench.c1.txt" -- "$T/tsdbc-bench" query --conns 1 --seconds 5 --port "$TSDB_PORT"
-    tstep "p2 tsdbc-bench query c32" "$D/tsdbc-bench.c32.txt" -- "$T/tsdbc-bench" query --conns 32 --seconds 5 --port "$TSDB_PORT"
+    tstep "p2 tsdbc-bench query c$NHI" "$D/tsdbc-bench.c$NHI.txt" -- "$T/tsdbc-bench" query --conns $NHI --seconds 5 --port "$TSDB_PORT"
     # partitions merged (README row "tsdbd, 1 connection, partitions merged")
     tstep "p2 tsdb optimize" "$D/optimize.txt" -- bash -c "'$TB/tsdbstat' optimize && du -sb --exclude='retired_*' '$W/db'"
     untimed "$D/check-self.merged.txt" tsdb_self merged || { cd "$OUT"; tsdbd_stop; runstats "$D"; return 1; }
     tstep "p2 tsdb merged full c1" "$D/merged.full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
-    tstep "p2 tsdb merged full c16" "$D/merged.full.c16.txt" -- "$TB/tsdbq" full 16 "$REPS"
+    tstep "p2 tsdb merged full c$NPER" "$D/merged.full.c$NPER.txt" -- "$TB/tsdbq" full $NPER "$REPS"
     tstep "p2 tsdb merged lttb c1" "$D/merged.lttb.c1.txt" -- "$B/relq" lttb 1 "$REPS"
     tstep "p2 tsdb merged lttb c16" "$D/merged.lttb.c16.txt" -- "$B/relq" lttb 16 "$REPS"
     tstep "p2 tsdb merged twa c1" "$D/merged.twa.c1.txt" -- "$B/relq" twa 1 "$REPS"
@@ -1108,7 +1123,9 @@ ts_timed() { # CONTAINER: the timed part of a load
     TS_PORT=5434 "$H/ts_compress.sh" 16 || return 1
     PSQL -c "VACUUM t100m" && echo "after VACUUM: $(PSQL -Atc "SELECT hypertable_size('t100m')")"
 }
+ts_ready() { [ "$(psql -h 127.0.0.1 -p 5434 -U postgres -Atc 'select 1' 2> /dev/null)" = 1 ]; }  # QREADY of rb-ts
 p2_ts() {
+    local QCTR=rb-ts QREADY=ts_ready
     local D=$OUT/p2/ts W=$DBCMP/s2/ts r
     mkdir -p "$D"
     for r in $(seq "$REPS"); do
@@ -1128,7 +1145,7 @@ p2_ts() {
     qsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
     bcheck ts "$D" && {
         for n in ${FULLS-$FULLS_DEFAULT}; do  # like with like (REPORT §3, §5.11): one query per series, 16 connections
-            reps "ts.full$n.per.c16" "$D" -- "$B/qdrive" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'" "$WORK/q/ts.full$n.per.txt" 16 100000 0
+            reps "ts.full$n.per.c$NPER" "$D" -- "$B/qdrive" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'" "$WORK/q/ts.full$n.per.txt" "$NPER" 100000 0
         done
         bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
         pc_pin rb-ts && PC=1 bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC -c max_parallel_workers_per_gather=0'"
@@ -1323,12 +1340,12 @@ sys.stdout.writelines(l for l in open(sys.argv[2]) if json.loads(l)["i"] in ids)
     local c t
     for c in raw agg1d agg7d point; do
         "$TB/embq" tsdb qps "$E/tsdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
-        for t in 1 32; do reps "tsdb.$c.t$t" "$D" -- "$TB/embq" tsdb qps "$E/tsdb" spec.tsv "$c" "$t" "$SECS"; done
+        for t in 1 $NHI; do reps "tsdb.$c.t$t" "$D" -- "$TB/embq" tsdb qps "$E/tsdb" spec.tsv "$c" "$t" "$SECS"; done
         "$TB/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
-        for t in 1 32; do reps "duckdb.$c.t$t" "$D" -- "$TB/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" "$t" "$SECS"; done
+        for t in 1 $NHI; do reps "duckdb.$c.t$t" "$D" -- "$TB/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" "$t" "$SECS"; done
         for e in chdb chdb-lz4; do
             "$B/chq" qps "$E/$e" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
-            for t in 1 32; do reps "$e.$c.t$t" "$D" -- "$B/chq" qps "$E/$e" spec.tsv "$c" "$t" "$SECS"; done
+            for t in 1 $NHI; do reps "$e.$c.t$t" "$D" -- "$B/chq" qps "$E/$e" spec.tsv "$c" "$t" "$SECS"; done
         done
     done
     # LTTB and TWA
@@ -1450,11 +1467,13 @@ ch_big_load() { # 8 streams of 1250 series, RowBinary from scale-bench export; s
     return $bad
 }
 p5() {
-    local D=$OUT/p5 W=/var/tmp/big C=/var/tmp/ch-big r avail
+    local D=$OUT/p5 W=$P5_DIR/big C=$P5_DIR/ch-big r avail
     mkdir -p "$D"
-    avail=$(df -B1G --output=avail /var/tmp | tail -1 | tr -d ' ')
-    echo "free on /var/tmp: $avail GB" > "$D/disk.txt"
-    [ "$avail" -ge "$P5_MINFREE" ] || { fail "p5: only $avail GB free on /var/tmp, need about $P5_MINFREE (tsdb 116 GB + ClickHouse 170 GB + margin)"; return 1; }
+    case $P5_DIR in /var/tmp | /var/tmp/?*) ;; *) fail "p5: P5_DIR must be under /var/tmp, not $P5_DIR"; return 1 ;; esac
+    mkdir -p "$P5_DIR"
+    avail=$(df -B1G --output=avail "$P5_DIR" | tail -1 | tr -d ' ')
+    echo "free on $P5_DIR: $avail GB" > "$D/disk.txt"
+    [ "$avail" -ge "$P5_MINFREE" ] || { fail "p5: only $avail GB free on $P5_DIR, need about $P5_MINFREE (tsdb 116 GB + ClickHouse 170 GB + margin)"; return 1; }
     rmdata "$W" "$C"
     tstep "p5 tsdb load" "$D/tsdb.load.txt" -- "$T/scale-bench" load --dir "$W" --series "$P5_SERIES" --points "$P5_POINTS" --threads 8
     du -sb --exclude='retired_*' "$W" > "$D/tsdb.du.txt"
@@ -1479,8 +1498,8 @@ p5() {
     crm rb-ch
     runstats "$D"
     rmdata "$W" "$C"
-    cp /var/tmp/big.log "$D/tsdbd.log" 2> /dev/null
-    rm -f /var/tmp/big.log /var/tmp/big.pf
+    cp "$W.log" "$D/tsdbd.log" 2> /dev/null
+    rm -f "$W.log" "$W.pf"
 }
 phase5() { reset_quiet; p5 || fail "p5 returned an error"; }
 
@@ -1500,30 +1519,34 @@ phase_checktest() {
 }
 
 # ================================================================== smoke: every phase and system on tiny data
-# run.sh again in its own DBCMP (SMOKE_DIR, under /var/tmp): prep p1 p2 p3 p4 with every system and variant, 10 series
-# x 650 k rows (agg7d windows need > 604800), 4 data sets for p1, REPS=1, SECS=1, batches of 1 and 10, short settles,
-# SMOKE=1 (no quiet gate; BENCH.lock shared, per step). Nothing it measures is a result: it passes when every phase
+# run.sh again in its own DBCMP (SMOKE_DIR, under /var/tmp): prep p1 p2 p3 p4 p5 with every system and variant, 10
+# series x 20,000 rows with every window and bucket 60 times shorter (SPEC_DIV), 2 data sets for p1, p5 at 100 series
+# x 100,000 rows, REPS=1, SECS=1, batches of 1, 10 and 100, 2 clients where the release run has 32 or 16 (NHI, NPER),
+# short settles and a 120 s step timeout, SMOKE=1 (no quiet gate; BENCH.lock shared, per step). It is the builder's
+# test and should take about 20 minutes: a system that is slow at full size is a result of the release run, not a
+# reason for a slow smoke. Nothing it measures is a result: it passes when every phase
 # is DONE, i.e. every answer check passed and no step failed. The tools and downloads (ClickHouse binary, DuckDB,
 # chDB, IoTDB's venv, the hydraulic text files) stay the main DBCMP's; the images must be pulled.
 phase_smoke() {
-    local S=${SMOKE_DIR:-/var/tmp/dbcmp-smoke/full} t0=$SECONDS rc=0
+    local S=${SMOKE_DIR:-/var/tmp/dbcmp-smoke/small} t0=$SECONDS rc=0
     case $S in /var/tmp/?*) ;; *) log "smoke: SMOKE_DIR must be under /var/tmp, not $S"; return 1 ;; esac
     # SMOKE_PHASES and SMOKE_OUT rerun a part (P2_SYSTEMS etc. pass through) on the inputs of an earlier smoke run
-    local ph=${SMOKE_PHASES:-prep p1 p2 p3 p4} so=${SMOKE_OUT:-$S/results}
+    local ph=${SMOKE_PHASES:-prep p1 p2 p3 p4 p5} so=${SMOKE_OUT:-$S/results}
     case $so in "$S"/?*) ;; *) log "smoke: SMOKE_OUT must be under $S, not $so"; return 1 ;; esac
     rm -rf "$so"; mkdir -p "$so"
     log "SMOKE START: run.sh $ph in $S (log $so/driver.log)"
     env DBCMP="$S" WORK="$S/work" DATA="$S/input/mixed.rowbinary" IN="$S/sizes/in" OUT="$so" \
         CLICKHOUSE="$CLICKHOUSE" DUCKDB_DIR="$DUCKDB_DIR" CHDB_DIR="$CHDB_DIR" IOT_VENV="$IOT_VENV" HYD_RAW="$HYD_RAW" \
         BENCH_LOCK="$LOCK" TSDB_TREE="$TSDB_TREE" TB="$TB" BIN="$BIN" \
-        SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10 100" \
-        PREP_SERIES=10 PREP_POINTS=650000 PREP_SIZE_POINTS=200000 PREP_SPEC=400 \
-        DSLIST="${SMOKE_DS:-hdd_temp vibration hyd_CE hyd_PS1}" \
-        IOT_STABLE=40 TD_STABLE=20 VM_STABLE=10 QDB_WAIT_MAX=900 CH_SETTLE_MAX=600 \
-        I3_P2_FLAGS="--force-snapshot-max-age 2m" I3_P2_MIN=150 I3_P1_AGE=2m I3_P1_MIN=150 \
-        I3_P2_STABLE=60 I3_P2_MAX=600 I3_P1_STABLE=60 I3_P1_MAX=600 \
-        I2_EXTRA="-e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s" PROM_SETTLE_TIMEOUT=3600 \
-        STEP_TIMEOUT=900 UNTIMED_TIMEOUT=1800 CHECK_TIMEOUT=900 QDRIVE_TIMEOUT=300 \
+        SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10 100" NHI=2 NPER=2 \
+        PREP_SERIES=10 PREP_POINTS=20000 POINTS=20000 SPEC_DIV=60 PREP_SIZE_POINTS=50000 PREP_SPEC=200 \
+        DSLIST="${SMOKE_DS:-hdd_temp hyd_PS1}" \
+        IOT_STABLE=15 TD_STABLE=10 VM_STABLE=10 QDB_WAIT_MAX=300 CH_SETTLE_MAX=300 \
+        I3_P2_FLAGS="--force-snapshot-max-age 30s" I3_P2_MIN=45 I3_P1_AGE=30s I3_P1_MIN=45 \
+        I3_P2_STABLE=20 I3_P2_MAX=300 I3_P1_STABLE=20 I3_P1_MAX=300 \
+        I2_EXTRA="-e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s" PROM_SETTLE_TIMEOUT=900 \
+        P5_SERIES=100 P5_POINTS=100000 P5_MINFREE=5 P5_DIR="$S/p5" \
+        STEP_TIMEOUT=120 UNTIMED_TIMEOUT=600 CHECK_TIMEOUT=300 QDRIVE_TIMEOUT=60 \
         "$RDIR/run.sh" $ph || rc=1
     grep -E 'PHASE|FAIL|prep failed|END' "$so/driver.log" | tail -n 30 | sed 's/^/  smoke: /' >> "$OUT/driver.log"
     log "SMOKE $([ $rc = 0 ] && echo DONE || echo FAILED) in $(( (SECONDS - t0) / 60 )) min $(( (SECONDS - t0) % 60 )) s"

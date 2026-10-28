@@ -155,7 +155,7 @@ p2_td() {
     echo "lttb: TDengine has no LTTB function" >> "$D/dash.txt"
     bcheck td "$D" && {  # bcheck writes q/td.full$n.per.txt (mkbatch.py), so the per-series runs come after it
         for n in ${FULLS-$FULLS_DEFAULT}; do   # 100 per-series queries on 16 connections, as tsdb and ClickHouse
-            reps "$v.full$n.per.c16" "$D" -- "$B/qdrive" $Q "$TD_HDR" "$WORK/q/td.full$n.per.txt" 16 100000 0
+            reps "$v.full$n.per.c$NPER" "$D" -- "$B/qdrive" $Q "$TD_HDR" "$WORK/q/td.full$n.per.txt" "$NPER" 100000 0
         done
         bsuite td "$v" "$D" $Q "$TD_HDR"
     }

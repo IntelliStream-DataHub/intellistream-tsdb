@@ -12,9 +12,14 @@ STEP = [60000, 1000, 10000, 10000, 1, 1000, 1000]  # kind = series % 7
 path, n = sys.argv[1], int(sys.argv[2])
 rnd = random.Random(20261024)
 NSERIES = int(os.environ.get("NSERIES", "100"))
-POINTS = int(os.environ.get("POINTS", "1000000"))  # samples per series (smoke runs: fewer, > 604800 for agg7d)
+POINTS = int(os.environ.get("POINTS", "1000000"))  # samples per series (> the agg7d window, 604800 / SPEC_DIV)
+# SPEC_DIV (1) divides every window and bucket, in samples, for the smoke test's tiny data (run.sh smoke: 60, so
+# raw 60, agg1d 1440 in buckets of 5, agg7d 10080 in buckets of 60); the class names stay
+DIV = int(os.environ.get("SPEC_DIV", "1"))
+if 604800 // DIV >= POINTS:
+    sys.exit(f"spec.py: POINTS {POINTS} must exceed the agg7d window of {604800 // DIV} samples (SPEC_DIV {DIV})")
 out = sys.stdout
-for cls, win, nb in (("raw", 3600, 0), ("agg1d", 86400, 300), ("agg7d", 604800, 3600)):
+for cls, win, nb in (("raw", 3600 // DIV, 0), ("agg1d", 86400 // DIV, 300 // DIV), ("agg7d", 604800 // DIV, 3600 // DIV)):
     for _ in range(n):
         s = rnd.randrange(NSERIES); st = STEP[s % 7]
         a = T0 + rnd.randrange(POINTS - win) * st

@@ -133,7 +133,7 @@ p2_vm() {
     done
     bcheck vm "$D" && {  # bcheck writes q/vm.full$n.per.txt (mkbatch.py), so the per-series runs come after it
         for n in ${FULLS-$FULLS_DEFAULT}; do   # 100 per-series queries on 16 connections, as tsdb and ClickHouse
-            reps "vm.full$n.per.c16" "$D" -- "$B/qdrive" $Q "" "$WORK/q/vm.full$n.per.txt" 16 100000 0
+            reps "vm.full$n.per.c$NPER" "$D" -- "$B/qdrive" $Q "" "$WORK/q/vm.full$n.per.txt" "$NPER" 100000 0
         done
         bsuite vm vm "$D" $Q ""
     }
@@ -143,7 +143,7 @@ p2_vm() {
     if [ -s "$D/check.txt" ] && ! grep -qE 'mismatches [1-9]' "$D/check.txt"; then
         crm rb-vm
         if VM_PASTA=1 vm_start "$W"; then
-            local t; for t in 1 32; do reps "vm.pasta.point.c$t" "$D" -- "$B/qdrive" $Q "" "$WORK/q/vm.point.txt" "$t" "$SECS"; done
+            local t; for t in 1 $NHI; do reps "vm.pasta.point.c$t" "$D" -- "$B/qdrive" $Q "" "$WORK/q/vm.point.txt" "$t" "$SECS"; done
             ctr_alive rb-vm "p2 vm through pasta" && ctr_mem rb-vm "$D/mem.txt"
         fi
         crm rb-vm

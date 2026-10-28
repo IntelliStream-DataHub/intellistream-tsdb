@@ -135,7 +135,7 @@ def td_post(q):
 # the window starts or ends inside a bucket, are clipped with their own ranges at fixed times
 # (@) in one instant query: the line holds both requests, joined by " && ". The four aggregates
 # are one expression, told apart by a label fn (and b, the bucket start, for the clipped ones).
-PROM_T0, PROM_POINTS = 1704067200000, 1000000  # spec.py's time origin and samples per series
+PROM_T0, PROM_POINTS = 1704067200000, int(os.environ.get("POINTS", "1000000"))  # spec.py's origin, samples per series
 
 def psec(ms):  # exact milliseconds as the API's float seconds
     return f"{ms // 1000}.{ms % 1000:03d}"
