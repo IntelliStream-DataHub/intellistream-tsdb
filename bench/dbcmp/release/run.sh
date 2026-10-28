@@ -122,6 +122,15 @@ tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout
         log "  REFUSED: $label (see $out.refused)"
         return "$rc"
     fi
+    if [ "$rc" != 0 ] && [ -n "${QCTR-}" ] && [ "${label#* load r}" = "$label" ] && oom_killed "$QCTR"; then
+        # the kernel killed the server out of memory (its container limit) on this load: a result like a refusal, the
+        # server started again on the same data for the steps after it (QREADY: a command that succeeds once it serves)
+        mv "$out" "$out.oom"
+        echo "$label: the server was killed out of memory (container limit $(podman inspect -f '{{.HostConfig.Memory}}' "$QCTR" | awk '{printf "%.0f GB", $1 / 2^30}'))" >> "$(dirname "$out")/REFUSED.txt"
+        log "  OOM: $label killed $QCTR (see $out.oom); restarting it"
+        ctr_restart "$QCTR" || fail "$label: $QCTR did not serve again after its OOM kill"
+        return "$rc"
+    fi
     [ "$rc" = 0 ] || fail "$label: rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${STEP_TIMEOUT}s)") (see $out)"
     case "$rc $label" in 0\ *) ;; *" load r"*) LOAD_FAILED=1 ;; esac
     return "$rc"
@@ -445,6 +454,26 @@ ctr_mem() { # CONTAINER FILE: the container's cgroup memory (peak, limit, OOM ki
     p=/sys/fs/cgroup$(podman inspect -f '{{.State.CgroupPath}}' "$1" 2> /dev/null)
     [ -r "$p/memory.peak" ] || { echo "$1: no cgroup memory files (not running?)" >> "$2"; return 1; }
     echo "$1 peak $(cat "$p/memory.peak") limit $(cat "$p/memory.max") $(grep '^oom_kill ' "$p/memory.events")" >> "$2"
+}
+oom_killed() { # CONTAINER: 0 when it no longer runs and the kernel OOM-killed a process in its cgroup
+    local st id
+    st=$(podman inspect -f '{{.State.Status}}' "$1" 2> /dev/null)
+    case $st in running | '') return 1 ;; esac
+    id=$(podman inspect -f '{{.Id}}' "$1" 2> /dev/null)
+    [ -n "$id" ] && journalctl -k --since "-6h" 2> /dev/null | grep -qE "oom-kill:.*libpod-$id\.scope"
+}
+ctr_restart() { # CONTAINER: start it again (same settings and data), then wait up to 300 s for QREADY
+    local i
+    steplock -s
+    podman start "$1" > /dev/null 2>&1 9>&-
+    for i in $(seq 600); do
+        ${QREADY:-true} > /dev/null 2>&1 || { sleep 0.5; continue; }
+        stepunlock
+        [ "${PC:-0}" = 1 ] && { pc_pin "$1" || return 1; }  # new processes: pinned again for the per-core runs
+        return 0
+    done
+    stepunlock
+    return 1
 }
 ctr_alive() { # CONTAINER WHAT: fails (into FAILS) when the container no longer runs, with the kernel's OOM kills in it
     local st id n=0
@@ -1043,6 +1072,9 @@ p2_i2() {
     runstats "$D"
 }
 p2_i3() {
+    # InfluxDB 3 Core was OOM-killed at its 28 GB limit by 32 concurrent batch queries over 65,000 Parquet files
+    # (smoke): recorded as such and restarted (tstep), not a harness failure
+    local QCTR=rb-i3 QREADY="curl -sf http://127.0.0.1:8181/health"
     local D=$OUT/p2/i3 W=$DBCMP/s2/i3 r
     mkdir -p "$D"
     for r in $(seq "$REPS"); do
