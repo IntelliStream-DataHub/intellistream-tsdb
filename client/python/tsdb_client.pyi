@@ -1249,6 +1249,9 @@ class Db:
             (default: every CPU).
         request_threads: Threads one query or one multi-series call uses at
             most, its caller included (default: query_threads).
+        partition_classes: Slow series get partitions of 7, 28 or 364 base
+            partitions, chosen from their rate (default True; fixed when the
+            database is created).
         The other keywords are the engine's tsdb_options fields of the same
         name; None keeps the engine's default. partition_ms and granule_rows
         are fixed when the database is created. value_codec is "auto",
@@ -1284,6 +1287,7 @@ class Db:
         verify_checksums: bool | None = None,
         retention_merge_s: int | None = None,
         request_threads: int | None = None,
+        partition_classes: bool | None = None,
     ) -> Db: ...
     def close(self) -> None:
         """Flushes the memtable and closes the database.

@@ -75,6 +75,7 @@ pub struct tsdb_options {
     pub clock_arg: *mut c_void,
     pub create_volumes: c_int,
     pub request_threads: c_int,
+    pub partition_classes: c_int,
 }
 
 impl Default for tsdb_options {
@@ -251,6 +252,11 @@ pub struct tsdb_part_info {
     pub level: u32,
     pub created_s: i64,
     pub written_s: i64,
+    /// Partition class 0..3: 1, 7, 28 or 364 base partitions (`tsdb_options.partition_classes`).
+    pub cls: c_int,
+    /// The partition's time range `[start_ms, end_ms)`.
+    pub start_ms: i64,
+    pub end_ms: i64,
 }
 
 unsafe extern "C" {
@@ -270,6 +276,7 @@ unsafe extern "C" {
         id: *mut u32,
     ) -> c_int;
     pub fn tsdb_series_type(db: *mut tsdb, id: u32, type_: *mut tsdb_type) -> c_int;
+    pub fn tsdb_series_class(db: *mut tsdb, series: u32, cls: *mut c_int) -> c_int;
     pub fn tsdb_series_count(db: *mut tsdb) -> u32;
     pub fn tsdb_series_name(db: *mut tsdb, id: u32) -> *const c_char;
     pub fn tsdb_series_path(db: *mut tsdb, id: u32) -> *const c_char;

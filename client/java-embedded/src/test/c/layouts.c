@@ -20,7 +20,7 @@ int main(void)
     F(tsdb_options, read_only); F(tsdb_options, follow); F(tsdb_options, refresh_ms); F(tsdb_options, merge_idle_s);
     F(tsdb_options, obsolete_part_lifetime_s); F(tsdb_options, verify_checksums); F(tsdb_options, retention_merge_s);
     F(tsdb_options, clock_ms); F(tsdb_options, clock_arg); F(tsdb_options, create_volumes);
-    F(tsdb_options, request_threads);
+    F(tsdb_options, request_threads); F(tsdb_options, partition_classes);
     S(tsdb_values);
     F(tsdb_values, type); F(tsdb_values, values); F(tsdb_values, valid);
     S(tsdb_bucket);
@@ -44,7 +44,8 @@ int main(void)
     S(tsdb_part_info);
     F(tsdb_part_info, name); F(tsdb_part_info, partition); F(tsdb_part_info, min_ts); F(tsdb_part_info, max_ts);
     F(tsdb_part_info, rows); F(tsdb_part_info, bytes); F(tsdb_part_info, granules); F(tsdb_part_info, level);
-    F(tsdb_part_info, created_s); F(tsdb_part_info, written_s);
+    F(tsdb_part_info, created_s); F(tsdb_part_info, written_s); F(tsdb_part_info, cls);
+    F(tsdb_part_info, start_ms); F(tsdb_part_info, end_ms);
     S(tsdb_spread_bucket);
     F(tsdb_spread_bucket, b); F(tsdb_spread_bucket, range); F(tsdb_spread_bucket, var_pop);
     F(tsdb_spread_bucket, var_samp); F(tsdb_spread_bucket, stddev_pop); F(tsdb_spread_bucket, stddev_samp);

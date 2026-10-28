@@ -19,7 +19,7 @@ fn structs_match_the_c_header() {
         tsdb_options { partition_ms, granule_rows, zstd_level, value_codec, fsync, merge_threads, query_threads,
             buffer_rows, flush_interval_ms, wal_sync_ms, wal_max_batch_rows, max_part_bytes, read_only, follow,
             refresh_ms, merge_idle_s, obsolete_part_lifetime_s, verify_checksums, retention_merge_s, clock_ms,
-            clock_arg, create_volumes, request_threads }
+            clock_arg, create_volumes, request_threads, partition_classes }
         tsdb_values { type_, values, valid }
         tsdb_points { ts, values, n, cap }
         tsdb_bucket { start, count, sum, min, max, isum, imin, imax }
@@ -32,7 +32,8 @@ fn structs_match_the_c_header() {
             granules, granules_from_stats, result_rows }
         tsdb_stats { parts, partitions, rows, bytes, merges, merged_rows, passthrough_granules, memtable_rows,
             broken_parts, follow_errors }
-        tsdb_part_info { name, partition, min_ts, max_ts, rows, bytes, granules, level, created_s, written_s }
+        tsdb_part_info { name, partition, min_ts, max_ts, rows, bytes, granules, level, created_s, written_s, cls,
+            start_ms, end_ms }
         tsdb_multi_query { kind, start, end, starts, ends, opts, interval_ms, intervals, group, bounds, nbounds,
             trim, threshold, twa }
         tsdb_series_result { index, series, status, last, n, ts, values, buckets }

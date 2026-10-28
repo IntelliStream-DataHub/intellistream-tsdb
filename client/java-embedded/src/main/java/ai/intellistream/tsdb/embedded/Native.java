@@ -79,7 +79,9 @@ final class Native {
             PTR.withName("clock_ms"), /* int64_t (*)(void *): left NULL, the wall clock */
             PTR.withName("clock_arg"),
             JAVA_INT.withName("create_volumes"),
-            JAVA_INT.withName("request_threads")).withName("tsdb_options");
+            JAVA_INT.withName("request_threads"),
+            JAVA_INT.withName("partition_classes"),
+            MemoryLayout.paddingLayout(4)).withName("tsdb_options");
 
     static final StructLayout VALUES = MemoryLayout.structLayout(
             JAVA_INT.withName("type"),
@@ -149,7 +151,11 @@ final class Native {
             JAVA_INT.withName("level"),
             MemoryLayout.paddingLayout(4),
             JAVA_LONG.withName("created_s"),
-            JAVA_LONG.withName("written_s")).withName("tsdb_part_info");
+            JAVA_LONG.withName("written_s"),
+            JAVA_INT.withName("cls"),
+            MemoryLayout.paddingLayout(4),
+            JAVA_LONG.withName("start_ms"),
+            JAVA_LONG.withName("end_ms")).withName("tsdb_part_info");
 
     static final StructLayout SPREAD_BUCKET = MemoryLayout.structLayout(
             BUCKET.withName("b"),
@@ -365,6 +371,7 @@ final class Native {
     static final MethodHandle SERIES_LOOKUP = fn("tsdb_series_lookup", i(PTR, PTR, PTR));
     static final MethodHandle SERIES_CREATE = fn("tsdb_series_create", i(PTR, PTR, JAVA_INT, PTR, PTR));
     static final MethodHandle SERIES_TYPE = fn("tsdb_series_type", i(PTR, JAVA_INT, PTR));
+    static final MethodHandle SERIES_CLASS = fn("tsdb_series_class", i(PTR, JAVA_INT, PTR));
     static final MethodHandle SERIES_COUNT = fn("tsdb_series_count", i(PTR));
     static final MethodHandle SERIES_NAME = fn("tsdb_series_name", FunctionDescriptor.of(PTR, PTR, JAVA_INT));
     static final MethodHandle SERIES_PATH = fn("tsdb_series_path", FunctionDescriptor.of(PTR, PTR, JAVA_INT));

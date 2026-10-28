@@ -57,6 +57,9 @@ fn value_codec(name: &str) -> PyResult<tc::ValueCodec> {
 ///         (default: every CPU).
 ///     request_threads: Threads one query or one multi-series call uses at
 ///         most, its caller included (default: query_threads).
+///     partition_classes: Slow series get partitions of 7, 28 or 364 base
+///         partitions, chosen from their rate (default True; fixed when the
+///         database is created).
 ///     The other keywords are the engine's tsdb_options fields of the same
 ///     name; None keeps the engine's default. partition_ms and granule_rows
 ///     are fixed when the database is created. value_codec is "auto",
@@ -153,7 +156,7 @@ impl Db {
                         zstd_level = None, value_codec = None, buffer_rows = None, flush_interval_ms = None,
                         wal_max_batch_rows = None, max_part_bytes = None, refresh_ms = None, merge_idle_s = None,
                         obsolete_part_lifetime_s = None, verify_checksums = None, retention_merge_s = None,
-                        request_threads = None))]
+                        request_threads = None, partition_classes = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -178,6 +181,7 @@ impl Db {
         verify_checksums: Option<bool>,
         retention_merge_s: Option<i32>,
         request_threads: Option<i32>,
+        partition_classes: Option<bool>,
     ) -> PyResult<Self> {
         let d = tc::Options::default();
         let o = tc::Options {
@@ -202,6 +206,7 @@ impl Db {
             retention_merge_s: retention_merge_s.unwrap_or(d.retention_merge_s),
             create_volumes: d.create_volumes,
             request_threads: request_threads.unwrap_or(d.request_threads),
+            partition_classes: partition_classes.unwrap_or(d.partition_classes),
         };
         let db = py.detach(|| tc::Db::open(&path, &o)).map_err(|e| to_pyerr(py, e))?;
         Ok(Db { db: RwLock::new(Some(db)), path, last: Mutex::default() })

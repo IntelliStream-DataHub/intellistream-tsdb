@@ -21,6 +21,7 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  */
 public final class EmbeddedOptions {
     private long partitionMs;
+    private boolean partitionClasses;
     private int granuleRows;
     private int zstdLevel;
     private int valueCodec;
@@ -56,6 +57,7 @@ public final class EmbeddedOptions {
                 throw Native.rethrow(t);
             }
             partitionMs = o.get(JAVA_LONG, offset(OPTIONS, "partition_ms"));
+            partitionClasses = o.get(JAVA_INT, offset(OPTIONS, "partition_classes")) != 0;
             granuleRows = o.get(JAVA_INT, offset(OPTIONS, "granule_rows"));
             zstdLevel = o.get(JAVA_INT, offset(OPTIONS, "zstd_level"));
             valueCodec = o.get(JAVA_INT, offset(OPTIONS, "value_codec"));
@@ -83,6 +85,7 @@ public final class EmbeddedOptions {
     MemorySegment toNative(Arena arena) {
         MemorySegment o = arena.allocate(OPTIONS);
         o.set(JAVA_LONG, offset(OPTIONS, "partition_ms"), partitionMs);
+        o.set(JAVA_INT, offset(OPTIONS, "partition_classes"), partitionClasses ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "granule_rows"), granuleRows);
         o.set(JAVA_INT, offset(OPTIONS, "zstd_level"), zstdLevel);
         o.set(JAVA_INT, offset(OPTIONS, "value_codec"), valueCodec);
@@ -115,6 +118,18 @@ public final class EmbeddedOptions {
      */
     public EmbeddedOptions partitionMs(long ms) {
         partitionMs = ms;
+        return this;
+    }
+
+    /**
+     * Partition classes, fixed at creation: a series slower than about one row per 1.3 s (at the defaults: under
+     * eight granules per partition) gets partitions of 7, 28 or 364 base partitions, chosen from its rate.
+     *
+     * @param on default true; false keeps every series in base partitions
+     * @return this
+     */
+    public EmbeddedOptions partitionClasses(boolean on) {
+        partitionClasses = on;
         return this;
     }
 

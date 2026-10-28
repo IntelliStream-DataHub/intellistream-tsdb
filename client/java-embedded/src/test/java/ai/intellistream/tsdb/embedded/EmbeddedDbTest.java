@@ -598,8 +598,14 @@ class EmbeddedDbTest {
             rows += p.rows();
             assertTrue(p.name().length() > 0);
             assertTrue(p.minTs() <= p.maxTs());
+            /* a row a day: class 0 (too few rows to measure a rate), the day the row lies in */
+            assertEquals(0, p.cls());
+            assertEquals(p.partition() * 86_400_000L, p.startMs());
+            assertEquals(p.startMs() + 86_400_000L, p.endMs());
+            assertTrue(p.startMs() <= p.minTs() && p.maxTs() < p.endMs(), p.toString());
         }
         assertEquals(3, rows);
+        assertEquals(0, db.seriesClass(s));
         db.dropBefore(T0 + 86_400_000L);
         assertEquals(2, db.queryPoints(s, Long.MIN_VALUE, Long.MAX_VALUE).size());
         db.queryAgg(s, Long.MIN_VALUE, Long.MAX_VALUE, 0);

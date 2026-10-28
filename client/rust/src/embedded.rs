@@ -57,6 +57,10 @@ pub enum ValueCodec {
 pub struct Options {
     /// Width of a time partition in ms; fixed when the database is created. Default 1 day.
     pub partition_ms: i64,
+    /// Partition classes; fixed when the database is created. Default true: a series slower than about one
+    /// row per 1.3 s (at the defaults: under eight granules per partition) gets partitions of 7, 28 or 364
+    /// base partitions, chosen from its rate. False: every series in base partitions.
+    pub partition_classes: bool,
     /// Rows per granule; fixed when the database is created. Default 8192.
     pub granule_rows: u32,
     /// zstd level of the blocks; 0 disables zstd. Default 1.
@@ -109,6 +113,7 @@ impl Default for Options {
         unsafe { sys::tsdb_options_init(&mut o) };
         Options {
             partition_ms: o.partition_ms,
+            partition_classes: o.partition_classes != 0,
             granule_rows: o.granule_rows,
             zstd_level: o.zstd_level,
             value_codec: match o.value_codec {
@@ -168,6 +173,7 @@ impl Options {
             clock_arg: std::ptr::null_mut(),
             create_volumes: self.create_volumes as c_int,
             request_threads: self.request_threads,
+            partition_classes: self.partition_classes as c_int,
         }
     }
 }
@@ -179,7 +185,8 @@ mod multi;
 pub struct PartInfo {
     /// File name.
     pub name: String,
-    /// Start of its time partition (ms).
+    /// The number of the base partition (`partition_ms`) its partition starts in; with partition classes a
+    /// partition is (`partition`, `cls`).
     pub partition: i64,
     /// Oldest timestamp in it.
     pub min_ts: i64,
@@ -197,6 +204,12 @@ pub struct PartInfo {
     pub created_s: i64,
     /// When its newest rows were inserted (Unix seconds).
     pub written_s: i64,
+    /// Partition class 0 to 3: 1, 7, 28 or 364 base partitions.
+    pub cls: i32,
+    /// The partition's time range `[start_ms, end_ms)`.
+    pub start_ms: i64,
+    /// End of the partition (exclusive).
+    pub end_ms: i64,
 }
 
 /// Borrowed values of one chunk of a raw query, as the engine holds them: no copy.
@@ -595,6 +608,9 @@ unsafe extern "C" fn part_fn(ctx: *mut c_void, info: *const sys::tsdb_part_info)
         level: i.level,
         created_s: i.created_s,
         written_s: i.written_s,
+        cls: i.cls,
+        start_ms: i.start_ms,
+        end_ms: i.end_ms,
     });
 }
 
@@ -699,6 +715,13 @@ impl Db {
         let mut ty = 0;
         check(unsafe { sys::tsdb_series_type(self.p(), id, &mut ty) })?;
         u8::try_from(ty).ok().and_then(ValueType::from_code).ok_or(Error::Server(Status::Corrupt))
+    }
+
+    /// The partition class of the newest rows of series `id`, 0 to 3 (see [`PartInfo::cls`]).
+    pub fn series_class(&self, id: u32) -> Result<i32> {
+        let mut c = 0;
+        check(unsafe { sys::tsdb_series_class(self.p(), id, &mut c) })?;
+        Ok(c)
     }
 
     /// The name of series `id`; [`Status::NotFound`] if there is none.

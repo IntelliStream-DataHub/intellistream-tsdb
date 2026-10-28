@@ -381,6 +381,30 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /**
+     * The partition class of a series' newest rows: 0 to 3 for partitions of 1, 7, 28 or 364 base partitions
+     * ({@link EmbeddedOptions#partitionClasses(boolean)}, {@link PartInfo#cls()}).
+     *
+     * @param id the series id
+     * @return its class
+     * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
+     */
+    public int seriesClass(int id) throws TsdbException {
+        MemorySegment d = enter();
+        int rc;
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment c = a.allocate(JAVA_INT);
+            rc = (int) Native.SERIES_CLASS.invokeExact(d, id, c);
+            if (rc == 0)
+                return c.get(JAVA_INT, 0);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        } finally {
+            exit();
+        }
+        throw new TsdbException(rc, "series " + Integer.toUnsignedString(id), null);
+    }
+
+    /**
      * The name of a series.
      *
      * @param id the series id
@@ -932,7 +956,8 @@ public final class EmbeddedDb implements AutoCloseable {
             MemorySegment p = info.reinterpret(Native.PART_INFO.byteSize());
             out.add(new PartInfo(Native.string(p.get(PTR, 0)), p.get(JAVA_LONG, 8), p.get(JAVA_LONG, 16),
                     p.get(JAVA_LONG, 24), p.get(JAVA_LONG, 32), p.get(JAVA_LONG, 40), p.get(JAVA_LONG, 48),
-                    p.get(JAVA_INT, 56), p.get(JAVA_LONG, 64), p.get(JAVA_LONG, 72)));
+                    p.get(JAVA_INT, 56), p.get(JAVA_LONG, 64), p.get(JAVA_LONG, 72), p.get(JAVA_INT, 80),
+                    p.get(JAVA_LONG, 88), p.get(JAVA_LONG, 96)));
         } catch (Throwable t) {
             out.add(t);
         }

@@ -481,11 +481,32 @@ fn parts_and_query_stats_belong_to_their_db() {
     let span: Vec<_> = parts.iter().map(|p| (p.rows, p.min_ts, p.max_ts, p.level)).collect();
     assert_eq!(span, [(2, T0, T0 + 1000, 0), (1, T0 + 2000, T0 + 2000, 0)]);
     assert!(parts.iter().all(|p| p.bytes > 0 && p.granules == 1 && !p.name.is_empty() && p.partition <= T0));
+    // a few rows: class 0, the base partition (a day) the rows lie in
+    const DAY: i64 = 86_400_000;
+    assert_eq!(a.series_class(id).unwrap(), 0);
+    assert!(parts.iter().all(|p| p.cls == 0
+        && p.start_ms == p.partition * DAY
+        && p.end_ms == p.start_ms + DAY
+        && p.start_ms <= p.min_ts
+        && p.max_ts < p.end_ms));
+    // a reading every 10 minutes, loaded at once: a longer class, its partition a multiple of a day
+    let slow = a.series("slow").unwrap();
+    let ts: Vec<i64> = (0..200).map(|i| T0 + i * 600_000).collect();
+    a.insert_series(slow, &ts, &vec![1.0; ts.len()]).unwrap();
+    a.flush().unwrap();
+    let c = a.series_class(slow).unwrap();
+    assert!(c > 0, "class {c}");
+    let sp: Vec<_> = a.parts().unwrap().into_iter().filter(|p| p.cls == c).collect();
+    assert!(!sp.is_empty() && sp.iter().all(|p| p.start_ms == p.partition * DAY && p.end_ms - p.start_ms > DAY));
+    assert_eq!(sp.iter().map(|p| p.rows).sum::<u64>(), 200);
     a.optimize().unwrap();
-    let merged = a.parts().unwrap();
-    assert_eq!(merged.len(), 1);
-    assert_eq!((merged[0].rows, merged[0].min_ts, merged[0].max_ts), (3, T0, T0 + 2000));
+    // one part per partition: x's day (class 0) and slow's longer one; no row in both
+    let mut merged = a.parts().unwrap();
+    merged.sort_by_key(|p| p.cls);
+    assert_eq!(merged.len(), 2, "{merged:?}");
+    assert_eq!((merged[0].cls, merged[0].rows, merged[0].min_ts, merged[0].max_ts), (0, 3, T0, T0 + 2000));
     assert!(merged[0].level >= 1, "{merged:?}");
+    assert_eq!((merged[1].cls, merged[1].rows), (c, 200), "{merged:?}");
 
     // a query on another Db in the same thread leaves a's statistics alone
     assert_eq!(a.last_query_stats().result_rows, 0);
