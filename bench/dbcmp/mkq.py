@@ -143,23 +143,31 @@ def psec(ms):  # exact milliseconds as the API's float seconds
 def prom_get(path, **params):
     return "GET " + path + "?" + "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in params.items())
 
-def prom_aggs(sel, rng, at=None, b=None):
+VM_MAXSTEPS = 30000  # VictoriaMetrics' -search.maxPointsPerTimeseries default; Prometheus allows 11,000 steps
+
+def prom_aggs(sel, rng, at=None, b=None, vm=False):
+    if vm:  # MetricsQL computes the listed rollups in one pass over the samples; label "rollup" names each
+        at_ = " @ " + psec(at) if at is not None else ""
+        e = (f'label_replace(aggr_over_time(("count_over_time", "sum_over_time", "min_over_time", "max_over_time"), '
+             f'{sel}[{rng}ms]{at_}), "fn", "$1", "rollup", "(.+)_over_time")')
+        return e if b is None else f'label_replace({e}, "b", "{b}", "", "")'
     out = []
     for fn in ("count", "sum", "min", "max"):
         e = f'label_replace({fn}_over_time({sel}[{rng}ms]{" @ " + psec(at) if at is not None else ""}), "fn", "{fn}", "", "")'
         out.append(e if b is None else f'label_replace({e}, "b", "{b}", "", "")')
     return " or ".join(out)
 
-def prom_buckets(sel, lo, hi, w, maxsteps=11000):
+def prom_buckets(sel, lo, hi, w, vm=False):
     """query_range requests for the whole buckets of width w in [lo, hi) (lo and hi multiples of w),
-    in pieces of at most maxsteps steps, Prometheus' limit per series."""
+    in pieces of at most maxsteps steps, the system's limit per series."""
+    maxsteps = VM_MAXSTEPS if vm else 11000
     reqs = []
     for x in range(lo, hi, w * maxsteps):
         y = min(hi, x + w * maxsteps)
-        reqs.append(prom_get("/api/v1/query_range", query=prom_aggs(sel, w), start=psec(x + w - 1), end=psec(y - 1), step=f"{w}ms"))
+        reqs.append(prom_get("/api/v1/query_range", query=prom_aggs(sel, w, vm=vm), start=psec(x + w - 1), end=psec(y - 1), step=f"{w}ms"))
     return reqs
 
-def prom(cls, s, a, b, bk):
+def prom(cls, s, a, b, bk, vm=False):
     sel = f'sensors{{series="{s}"}}'
     if cls == "raw":
         return prom_get("/api/v1/query", query=f"{sel}[{b - a}ms]", time=psec(b - 1))
@@ -167,18 +175,18 @@ def prom(cls, s, a, b, bk):
         return prom_get("/api/v1/query", query=f"{sel}[1ms]", time=psec(a))
     w = bk
     first, last = -(-a // w) * w, b // w * w  # the first and last bucket boundaries inside [a, b]
-    reqs = prom_buckets(sel, first, last, w) if first < last else []
+    reqs = prom_buckets(sel, first, last, w, vm) if first < last else []
     edges = []
     if a < first or first > last:  # [a, first) or, inside one bucket, [a, b)
         e = min(first, b)
-        edges.append(prom_aggs(sel, e - a, e - 1, a // w * w))
+        edges.append(prom_aggs(sel, e - a, e - 1, a // w * w, vm))
     if first <= last < b:
-        edges.append(prom_aggs(sel, b - last, b - 1, last))
+        edges.append(prom_aggs(sel, b - last, b - 1, last, vm))
     if edges:
         reqs.append(prom_get("/api/v1/query", query=" or ".join(edges), time=psec(b - 1)))
     return " && ".join(reqs)
 
-GEN = {"i3": lambda *x: i3_get(i3(*x)), "i2ql": lambda *x: i2ql_get(influxql(*x)), "i2flux": lambda *x: flux_post(flux(*x)), "qdb": qdb, "qdbh": lambda *x: http_get("/exec?query=", qdb(*x)), "ts": ts, "ch": ch, "chday": lambda *x: ch(*x, table="cmp.t100m_day"), "prom": prom, "vm": prom, "iot": lambda *x: iot_post(iot(*x)), "td": lambda *x: td_post(td(*x))}
+GEN = {"i3": lambda *x: i3_get(i3(*x)), "i2ql": lambda *x: i2ql_get(influxql(*x)), "i2flux": lambda *x: flux_post(flux(*x)), "qdb": qdb, "qdbh": lambda *x: http_get("/exec?query=", qdb(*x)), "ts": ts, "ch": ch, "chday": lambda *x: ch(*x, table="cmp.t100m_day"), "prom": prom, "vm": lambda *x: prom(*x, vm=True), "iot": lambda *x: iot_post(iot(*x)), "td": lambda *x: td_post(td(*x))}
 
 # ---- whole-range queries (a: one bucket per series, b: buckets of n samples)
 def step_sql(col, kind):  # the sample step of a series, as SQL (kind = series % 7)
@@ -286,10 +294,10 @@ def td_full(n):  # INTERVAL takes a constant width: one PARTITION BY branch per 
 
 PROM_LO, PROM_HI = 1703980800000, 1767225600000  # 2023-12-31 and 2026-01-01, as for InfluxQL
 
-def prom_full(n):
+def prom_full(n, vm=False):
     if n == 0:  # one instant query over everything
         sel = "sensors" if SET is None else 'sensors{series=~"' + "|".join(str(x) for x in SET) + '"}'
-        return prom_get("/api/v1/query", query=prom_aggs(sel, PROM_HI - PROM_LO), time=psec(PROM_HI - 1))
+        return prom_get("/api/v1/query", query=prom_aggs(sel, PROM_HI - PROM_LO, vm=vm), time=psec(PROM_HI - 1))
     # query_range evaluates every step, empty or not, so each step group spans only its own data
     # (spec.py's samples, with a margin for the jitter) instead of the two years
     reqs = []
@@ -297,10 +305,10 @@ def prom_full(n):
         w = st * n
         sel = 'sensors{series=~"' + "|".join(str(x) for x in sset() if x % 7 in k) + '"}'
         lo, hi = (PROM_T0 - 1000) // w * w, -(-(PROM_T0 + PROM_POINTS * st + 1000) // w) * w
-        reqs += prom_buckets(sel, lo, hi, w)
+        reqs += prom_buckets(sel, lo, hi, w, vm)
     return " && ".join(reqs)
 
-FULL = {"i3": lambda n: i3_get(i3_full(n)), "i2ql": lambda n: i2ql_get(influxql_full(n)), "i2flux": lambda n: flux_post(flux_full(n)), "qdb": qdb_full, "qdbh": lambda n: http_get("/exec?query=", qdb_full(n)), "ts": ts_full, "ch": ch_full, "chday": lambda n: ch_full(n, "cmp.t100m_day"), "prom": prom_full, "vm": prom_full, "iot": lambda n: iot_post(iot_full(n)), "td": lambda n: td_post(td_full(n))}
+FULL = {"i3": lambda n: i3_get(i3_full(n)), "i2ql": lambda n: i2ql_get(influxql_full(n)), "i2flux": lambda n: flux_post(flux_full(n)), "qdb": qdb_full, "qdbh": lambda n: http_get("/exec?query=", qdb_full(n)), "ts": ts_full, "ch": ch_full, "chday": lambda n: ch_full(n, "cmp.t100m_day"), "prom": prom_full, "vm": lambda n: prom_full(n, vm=True), "iot": lambda n: iot_post(iot_full(n)), "td": lambda n: td_post(td_full(n))}
 
 if __name__ == "__main__":
     import os

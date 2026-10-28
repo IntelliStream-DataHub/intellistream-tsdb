@@ -232,9 +232,14 @@ CHC() { "$CLICKHOUSE" client --host 127.0.0.1 "$@"; }
 # qdb_wait_table's QDB_WAIT_MAX covers that.
 QDB_ZSTD_LEVEL=${QDB_ZSTD_LEVEL:-22}
 qdb_zstd_env() { echo "-e QDB_CAIRO_PARTITION_ENCODER_PARQUET_COMPRESSION_CODEC=ZSTD -e QDB_CAIRO_PARTITION_ENCODER_PARQUET_COMPRESSION_LEVEL=$QDB_ZSTD_LEVEL"; }
-qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD
-    local W=$1 i
+qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD; QDB_PC=1: every worker pool at 1 thread (per core)
+    local W=$1 i pc=()
     mkdir -p "$W"
+    # QuestDB sizes its pools at start, and its workers spin before they sleep: per core gets one thread per pool
+    # (shared, query, network, write, WAL apply) and a JVM that sees one CPU (GC and compiler threads)
+    [ "${QDB_PC:-0}" = 1 ] && pc=(-e QDB_SHARED_WORKER_COUNT=1 -e QDB_SHARED_QUERY_WORKER_COUNT=1
+        -e QDB_SHARED_NETWORK_WORKER_COUNT=1 -e QDB_SHARED_WRITE_WORKER_COUNT=1 -e QDB_WAL_APPLY_WORKER_COUNT=1
+        -e JVM_PREPEND=-XX:ActiveProcessorCount=1)
     # shellcheck disable=SC2046
     # the HTTP header buffer (default 64 KB) holds the URL: check.py sends a batch of 100 series as one GET /exec,
     # which QuestDB otherwise drops ("URL query string is too long"); the timed queries go over PostgreSQL wire
@@ -242,7 +247,7 @@ qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD
         -e QDB_HTTP_NET_BIND_TO=127.0.0.1:9100 -e QDB_HTTP_MIN_NET_BIND_TO=127.0.0.1:9103 \
         -e QDB_PG_NET_BIND_TO=127.0.0.1:8812 -e QDB_LINE_TCP_NET_BIND_TO=127.0.0.1:9109 \
         -e QDB_LINE_UDP_ENABLED=false -e QDB_TELEMETRY_ENABLED=false -e QDB_HTTP_REQUEST_HEADER_BUFFER_SIZE=1048576 \
-        "$QDB_IMG" > /dev/null 9>&- || { fail "questdb start"; return 1; }
+        "${pc[@]}" "$QDB_IMG" > /dev/null 9>&- || { fail "questdb start"; return 1; }
     for i in $(seq 120); do curl -sf 'http://127.0.0.1:9100/exec?query=select%201' > /dev/null && return 0; sleep 0.5; done
     fail "questdb not ready"; return 1
 }
@@ -542,6 +547,17 @@ how_write() { # PHASE SYS: how.json of the system's results (how.py: settings, d
         python3 -I "$RDIR/how.py" write "$1" "$2" "$OUT" >> "$OUT/driver.log" 2>&1 || fail "how.json of $2 (phase $1)"
 }
 pc_unpin() { local c; for c; do ctr_taskset "0-$(( $(nproc) - 1 ))" "$c"; done; }
+pc_restart() { # CONTAINER CONFIG_FILE START_CMD...: the per-core start: runtimes size their thread pools at start, so
+    # pinning a running server leaves it 32-wide pools on one CPU (REVIEW-fairness M7). START_CMD starts the container
+    # with its thread knobs at 1; the container's configuration and pinning go to CONFIG_FILE.
+    local c=$1 f=$2
+    shift 2
+    crm "$c"
+    "$@" && pc_pin "$c" || { fail "per-core start of $c"; return 1; }
+    { podman inspect "$c" --format '{{json .Config.Cmd}} env {{json .Config.Env}}'
+      echo "pinned to CPU $PERCORE_CPU (taskset, whole container tree): $(taskset -cp "$(podman inspect -f '{{.State.Pid}}' "$c")" 2>&1)"
+      echo "threads: $(podman exec "$c" sh -c 'ls /proc/[0-9]*/task 2> /dev/null | grep -c "^[0-9]"' 2>&1)"; } > "$f" 2>&1
+}
 bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
     local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 32}
     shift 3
@@ -1023,12 +1039,18 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
     untimed "$D/check.txt" python3 -I "$H/check.py" qdb 200
     local PG="host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb"
     qsuite qdb "$P" "$D" pg "$PG"
-    bcheck qdb "$D" && { perc16 qdb "$P" "$D" pg "$PG"; bsuite qdb "$P" "$D" pg "$PG"; pc_pin rb-qdb && PC=1 bsuite qdb "$P" "$D" pg "$PG"; pc_unpin rb-qdb; }
+    local bok=0
+    bcheck qdb "$D" && { bok=1; perc16 qdb "$P" "$D" pg "$PG"; bsuite qdb "$P" "$D" pg "$PG"; }
     REL q qdb twa > "$D/q.twa.sql"  # native twap() + SAMPLE BY 1h (REPORT §5.10), timed only when it agrees
     untimed "$D/check-twa.txt" REL check qdb twa ref/twa.jsonl && qline twa "$D" "$D/q.twa.sql" pg "$PG"
     REL q qdbseg twa > "$D/q.twaseg.sql"  # the 0.9.0 run's lead() CTE, for comparison
     untimed "$D/check-twaseg.txt" REL check qdbseg twa ref/twa.jsonl && qline twaseg "$D" "$D/q.twaseg.sql" pg "$PG"
     twasuite qdb "$D" pg "$PG"
+    # per core: a restart with every worker pool at one thread (the data stays), then a normal start for what follows
+    if [ $bok = 1 ]; then
+        QDB_PC=1 pc_restart rb-qdb "$D/config.pc.txt" qdb_start "$W" && PC=1 bsuite qdb "$P" "$D" pg "$PG"
+        crm rb-qdb; [ "$pq" = 0 ] && { qdb_start "$W" || return 1; }
+    fi
     if [ "$pq" = 0 ]; then
         # HTTP API cross-check (README: within 10% of the PostgreSQL protocol): one run per measurement
         REPS=1 qsuite qdbh "$P-http" "$D" http 127.0.0.1 9100 ""
@@ -1142,9 +1164,10 @@ p2_i2() {
     for x in 0 1; do
         bcheck i2ql "$D" && { [ $x = 1 ] || perc16 i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'; } && PC=$x bsuite i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'
         bcheck i2flux "$D" && { [ $x = 1 ] || perc16 i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'; } && PC=$x bsuite i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
-        [ $x = 0 ] && { pc_pin rb-i2 || break; }
+        # per core: a restart with one Go P (GOMAXPROCS=1; influxd has no query-thread knob), pinned
+        [ $x = 0 ] && { I2_EXTRA="$I2_EXTRA -e GOMAXPROCS=1" pc_restart rb-i2 "$D/config.pc.txt" i2_start "$W" || break; }
     done
-    pc_unpin rb-i2
+    crm rb-i2; i2_start "$W" || return 1
     TWA_WKINDS="" twasuite i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
     cd "$OUT" || true
     crm rb-i2; rmdata "$W"
@@ -1175,7 +1198,13 @@ p2_i3() {
     untimed "$D/check.txt" python3 -I "$H/check.py" i3 200
     CLASSES="" qsuite i3 i3 "$D" http 127.0.0.1 8181 ""
     FULLS="" qsuite i3 i3 "$D" http 127.0.0.1 8181 ""
-    bcheck i3 "$D" && { perc16 i3 i3 "$D" http 127.0.0.1 8181 ""; bsuite i3 i3 "$D" http 127.0.0.1 8181 ""; pc_pin rb-i3 && PC=1 bsuite i3 i3 "$D" http 127.0.0.1 8181 ""; pc_unpin rb-i3; }
+    if bcheck i3 "$D"; then
+        perc16 i3 i3 "$D" http 127.0.0.1 8181 ""; bsuite i3 i3 "$D" http 127.0.0.1 8181 ""
+        # per core: a restart with one DataFusion thread (its runtime sizes itself at start), pinned; then a normal start
+        pc_restart rb-i3 "$D/config.pc.txt" i3_start "$W" $I3_P2_FLAGS --num-datafusion-threads 1 &&
+            PC=1 bsuite i3 i3 "$D" http 127.0.0.1 8181 ""
+        crm rb-i3; i3_start "$W" $I3_P2_FLAGS || return 1
+    fi
     REL q i3 twa > "$D/q.twa.http"
     untimed "$D/check-twa.txt" REL check i3 twa ref/twa.jsonl
     qline twa "$D" "$D/q.twa.http" http 127.0.0.1 8181 ""

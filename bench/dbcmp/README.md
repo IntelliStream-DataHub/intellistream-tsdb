@@ -590,8 +590,12 @@ alone several); run it under `tmux` or `nohup`.
 - **One core.** Next to the parallel numbers each system also runs on one core: the server pinned to one CPU
   with `taskset` (rootless Podman cannot use `--cpuset-cpus` here) and its own thread setting where it has
   one (tsdbd `--query-threads 1`, ClickHouse `max_threads=1`, TimescaleDB without parallel workers, IoTDB
-  one query thread, VictoriaMetrics `GOMAXPROCS=1`), the client on another CPU. `how.json` says which.
-- **Timing.** ClickHouse is timed by its own server latency from `system.query_log`, not by 1/QPS. tsdb is
+  one query thread, VictoriaMetrics `GOMAXPROCS=1`), the client on another CPU. Servers that size their thread
+  pools at start are started again for this with those pools at one thread: QuestDB (every worker pool, and a
+  JVM that sees one CPU), InfluxDB 2 (`GOMAXPROCS=1`), InfluxDB 3 (`--num-datafusion-threads 1`), IoTDB and
+  VictoriaMetrics. TDengine is only pinned (its query-thread setting deadlocked). `how.json` says which.
+- **Timing.** ClickHouse is timed over HTTP by `qdrive`, like the others, with its own server latency from
+  `system.query_log` beside it ("server only"), not by 1/QPS. tsdb is
   measured both as loaded and after its merges settled. Every number is the mean of at least 5 runs, with
   sd and min-max.
 - **The three added systems.** IoTDB and TDengine sync their WAL before they say yes (set that way; it is
@@ -599,14 +603,19 @@ alone several); run it under `tmux` or `nohup`.
   its flush after the load is timed apart. TDengine is loaded through line protocol, not its faster
   WebSocket path. IoTDB refuses some heavy 32-client queries with its default memory settings; those are
   reported as refused.
-- **Clients.** ClickHouse uses its own native client (`clickhouse-benchmark`), tsdbd the C client,
-  the others `qdrive` over HTTP or libpq. InfluxDB 3's Flight SQL was not tried. PromQL cannot clip a
+- **Clients.** tsdbd uses the C client, the others `qdrive` over HTTP or libpq (in the release run
+  ClickHouse too; the older tables above used `clickhouse-benchmark`). InfluxDB 3's Flight SQL was not tried. PromQL cannot clip a
   bucket to a window that starts or ends inside it, so Prometheus answers an aggregate window with
   two requests (whole buckets, then the clipped ends), timed together as one query; its whole-range
   bucket queries are 4 or 8 `query_range` requests (11,000 points per series at most), each
   limited to its step group's data span (± 1 s), because `query_range` evaluates every step, empty
   or not, where the others take fixed bounds or none. Its JSON answers are larger than the others'
-  (buckets of 60 samples: about 11 MB per series).
+  (buckets of 60 samples: about 11 MB per series). VictoriaMetrics gets MetricsQL's `aggr_over_time`, which
+  computes count, sum, min and max in one pass, and up to 30,000 points per request (its default limit).
+- **Data shape.** Every answer is checked against tsdb's, but only on this data, which has no duplicate
+  timestamps, no nulls and no gap longer than the narrowest bucket (`prep.sh` checks it with `shape` and stops
+  otherwise). Some TWA recipes (QuestDB's `twap()` with `SAMPLE BY`, the segment recipes of `rel.py`) would
+  be wrong on gaps that span buckets, and last-write-wins is not exercised for any system.
 
 ## Cleaning up
 

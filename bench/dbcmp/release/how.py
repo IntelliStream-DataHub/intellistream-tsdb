@@ -62,7 +62,8 @@ SYSTEMS = {
         query_client=QDRIVE + "; PostgreSQL wire protocol (8812)",
         connections="random-window classes 1 and 32; whole range 1",
         one_query="one SQL statement per series; " + BATCH_SQL,
-        per_core=PIN + " (QuestDB has no single query-thread knob)",
+        per_core="a restart with shared, shared query, network, write and WAL-apply worker pools at 1 thread each and "
+                 "-XX:ActiveProcessorCount=1; " + PIN,
     ),
     "ts": dict(
         system="TimescaleDB", image_env="TS_IMG",
@@ -86,7 +87,7 @@ SYSTEMS = {
         connections="random-window classes 1 and 32; whole range 1",
         one_query="one query per series; a batch of K: InfluxQL K statements joined by ';' in one request, Flux K "
                   "yields in one request",
-        per_core=PIN + " (no query-thread knob)",
+        per_core="a restart with GOMAXPROCS=1 (influxd has no query-thread knob); " + PIN,
     ),
     "i3": dict(
         system="InfluxDB 3 Core", image_env="I3_IMG",
@@ -99,7 +100,7 @@ SYSTEMS = {
         query_client=QDRIVE + "; HTTP SQL (/api/v3/query_sql)",
         connections="random-window classes 1 and 32; whole range 1",
         one_query="one SQL statement per series; " + BATCH_SQL,
-        per_core=PIN + " (no query-thread knob)",
+        per_core="a restart with --num-datafusion-threads 1; " + PIN,
     ),
     "iot": dict(
         system="Apache IoTDB (table model)", image_env="IOT_IMG",
@@ -135,7 +136,8 @@ SYSTEMS = {
                   "--network host, -httpListenAddr=127.0.0.1:8428"],
         durability="acknowledged from memory (flushed within 5 s); force_flush and sync after the load, timed",
         loader="loadprw: Prometheus remote write, 10000 samples per request, 8 shards",
-        query_client=QDRIVE + "; Prometheus HTTP API (MetricsQL)",
+        query_client=QDRIVE + "; Prometheus HTTP API (MetricsQL): aggr_over_time computes count, sum, min and max in "
+                     "one pass; query_range in pieces of up to 30,000 steps (-search.maxPointsPerTimeseries)",
         connections="random-window classes 1 and 32; whole range 1",
         one_query="one HTTP query per series; a batch of K is K requests joined in one qdrive line (no multi-series "
                   "query with per-series windows in PromQL): those K requests run one after another on one "

@@ -22,7 +22,7 @@ LIB     := $(ROOT)/build/libtsdb.a
 DUCKDB  ?= /var/tmp/dbcmp/duckdb/v1.5.6/lib
 CHDB    ?= /var/tmp/dbcmp/chdb/v26.9.0/lib
 
-PROGS := $(addprefix $(OUT)/,conv loadlp loadprw qdrive tsdbq tsdbstat relq relemb)
+PROGS := $(addprefix $(OUT)/,conv loadlp loadprw qdrive tsdbq tsdbstat relq relemb shape)
 ifneq ($(wildcard $(DUCKDB)/duckdb.h),)
 PROGS += $(OUT)/embq $(OUT)/duckq
 endif
@@ -67,6 +67,10 @@ $(OUT)/relq: release/relq.c $(CLIB) | $(OUT)
 
 $(OUT)/relemb: release/relq.c $(LIB) | $(OUT)
 	$(CC) $(CFLAGS) -DEMBEDDED -I$(ROOT)/include -o $@ $< $(LIB) -lzstd -lpthread -lm
+
+# the shape of a RowBinary input: duplicates, order, nulls and gaps per series (prep.sh checks it)
+$(OUT)/shape: release/shape.c | $(OUT)
+	$(CC) $(CFLAGS) -o $@ $< -lm
 
 $(OUT)/chq: release/chq.c | $(OUT)
 	$(CC) $(CFLAGS) -I$(CHDB) -o $@ $< -L$(CHDB) -lchdb -Wl,-rpath,$(abspath $(CHDB)) -lpthread -lm

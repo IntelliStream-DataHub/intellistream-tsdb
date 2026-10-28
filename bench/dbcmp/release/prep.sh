@@ -16,6 +16,17 @@ DATA=$DBCMP/input/mixed.rowbinary
 [ -s $DATA ] || run $T/tsdb-bench --export $DATA --series $PREP_SERIES --points $PREP_POINTS
 for f in lp ilp32 csv om; do [ -s $DBCMP/input/mixed.$f ] || $B/conv $f $DATA $DBCMP/input/mixed.$f & done; wait
 (cd $WORK && NSERIES=$PREP_SERIES POINTS=$PREP_POINTS python3 -I $H/spec.py $DATA $PREP_SPEC > spec.tsv && NSERIES=$PREP_SERIES python3 -I $H/batches.py spec.tsv > batches.tsv) || fail=1
+# The answers are checked on this data only, and some recipes hold only for its shape (shape.c): no duplicate or
+# out-of-order timestamp, no null, and no gap longer than the narrowest bucket a TWA kind gives that series
+# (twa1d: 300 samples of its step, spec.py's STEP by series % 7; twa and twal: 1 h). Another shape stops the run.
+if $B/shape $DATA > $WORK/shape.txt; then
+  awk 'BEGIN { split("60000 1000 10000 10000 1 1000 1000", st, " ") }
+       /^#/ { next }
+       { b = 300 * st[$1 % 7 + 1]; if (b > 3600000) b = 3600000
+         if ($3 || $4 || $5 || $6 > b) { bad++; print "shape: series " $1 ": duplicates " $3 ", unordered " $4 ", nulls " $5 ", largest gap " $6 " ms (bound " b ")" } }
+       END { if (bad) { print "shape: " bad " series outside what the recipes handle"; exit 1 }
+             print "shape: " NR - 1 " series, no duplicates, nulls or gaps beyond the narrowest bucket" }' $WORK/shape.txt || fail=1
+else echo "FAILED: shape $DATA"; fail=1; fi
 
 # datasets.h kinds: one series of 1 M readings each
 for k in $DS_KINDS; do
