@@ -234,6 +234,8 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     w->partition = partition;
     w->wal_seq = wal_seq;
     w->grows = db->granule_rows;
+    int64_t cut = db->partition_ms * GRANULE_CUT; /* cls_len is partition_ms for every class without classes */
+    w->cut_ms = db->cls_len[partition_class(db, partition)] > cut ? cut : 0;
     w->zstd_level = db->opt.zstd_level;
     w->value_codec = db->opt.value_codec;
     w->min_ts = INT64_MAX;
@@ -341,7 +343,7 @@ static int pw_emit_pending(part_writer *w)
     return rc;
 }
 
-/* Rows must be in (series, ts) order across calls. Granules never span series. */
+/* Rows must be in (series, ts) order across calls. Granules never span series, nor a multiple of cut_ms. */
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n)
 {
     int rc;
@@ -350,7 +352,18 @@ int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const v
     if (w->pend_n && w->pend_series != series && (rc = pw_emit_pending(w)) != 0)
         return rc;
     while (n) {
-        if (!w->pend_n && n >= w->grows) {
+        size_t lim = n; /* rows that may join the current granule */
+        if (w->cut_ms) {
+            int64_t first = w->pend_n ? w->pend_ts[0] : ts[0];
+            int64_t q = floor_div(first, w->cut_ms) + 1; /* the next edge is q x cut_ms, if representable */
+            lim = q > INT64_MAX / w->cut_ms ? n : lower_bound_i64(ts, n, q * w->cut_ms);
+            if (lim == 0) { /* only with pending rows: they end at the edge */
+                if ((rc = pw_emit_pending(w)) != 0)
+                    return rc;
+                continue;
+            }
+        }
+        if (!w->pend_n && lim >= w->grows) {
             if ((rc = pw_emit(w, series, type, ts, vb, w->grows)) != 0)
                 return rc;
             ts += w->grows;
@@ -358,7 +371,7 @@ int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const v
             n -= w->grows;
             continue;
         }
-        size_t take = MIN(n, w->grows - w->pend_n);
+        size_t take = MIN(lim, w->grows - w->pend_n);
         memcpy(w->pend_ts + w->pend_n, ts, take * sizeof *ts);
         memcpy(w->pend_v + w->pend_n * wd, vb, take * wd);
         w->pend_series = series;
@@ -367,7 +380,7 @@ int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const v
         ts += take;
         vb += take * wd;
         n -= take;
-        if (w->pend_n == w->grows && (rc = pw_emit_pending(w)) != 0)
+        if ((w->pend_n == w->grows || (take == lim && n)) && (rc = pw_emit_pending(w)) != 0)
             return rc;
     }
     return 0;

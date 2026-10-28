@@ -665,6 +665,7 @@ typedef struct part_writer {
     int64_t *pend_ts;
     uint8_t *pend_v; /* slots of pend_type */
     uint32_t grows;
+    int64_t cut_ms; /* > 0: granules end at multiples of it (GRANULE_CUT); 0 in a base partition */
     int zstd_level;
     int value_codec;
     codec_ctx *cc;
@@ -944,6 +945,17 @@ void graveyard_purge(struct eng *db, bool all);
  * compared for equality as before. A series' class may change at a time T (a switch, appended to CLASSES and
  * synced before anything uses it); rows never move: earlier rows stay where they are. */
 #define PART_CLASSES 4
+/* In a partition longer than a base partition (classes 1-3), a granule ends at every multiple of GRANULE_CUT base
+ * partitions (aligned as partitions are) as well as at 8192 rows. A slow series' 8192 rows span days, and a bucket
+ * that cuts through a granule must decode it instead of answering from its statistics. With a cut at every base
+ * partition (a day by default), a bucket a class 0 partition answers from statistics (UTC days, and anything coarser
+ * made of whole days) is answered from statistics in a class partition too. A week cut (7) made a 60 s series 43%
+ * smaller (hdd_temp 0.152 against 0.268 bytes/row) but decoded nearly every granule for day and 2.5-day buckets.
+ * Part of the layout the writer makes, not of the format: readers take any granule boundaries, and a merge
+ * re-encodes a granule that crosses a cut instead of copying it. */
+#ifndef GRANULE_CUT
+#define GRANULE_CUT 1
+#endif
 #define CLS_MASK 3u     /* class byte: the class at the series' newest switch */
 #define CLS_HIST 4u     /* it has a switch after INT64_MIN: the history is in the map (cls_mu) */
 #define CLS_DECIDED 8u  /* not fresh: its class was decided (or it existed at open) */
@@ -1350,6 +1362,14 @@ void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
 /* test hook: the WAL tail kept for switches, and how far segments are unlinked (durably) */
 void tsdb_test_wal_state(struct tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced);
+/* test hook: every granule of the first volume, with its partition's class (tests/test_classes.c) */
+typedef struct tsdb_test_granule {
+    uint32_t series, count;
+    int64_t ts_min, ts_max;
+    uint32_t grows;
+} tsdb_test_granule;
+void tsdb_test_granules(struct tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, const tsdb_test_granule *g),
+                        void *ctx);
 
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);

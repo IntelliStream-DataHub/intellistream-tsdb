@@ -296,7 +296,9 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         bool filter = gcut > g->ts_min || (c->hide.n && tomb_set_hits(&c->hide, g->series, g->ts_min, g->ts_max));
         if (!c->loaded) {
             bool before_rest = !has_bound || g->series < bs || (g->series == bs && g->ts_max < bt);
-            bool full = g->count >= w.grows;
+            /* a granule across a cut (written before the cut, or by another GRANULE_CUT) is re-cut, not copied */
+            bool full = g->count >= w.grows &&
+                        (!w.cut_ms || floor_div(g->ts_min, w.cut_ms) == floor_div(g->ts_max, w.cut_ms));
             /* a part no merge has written was encoded at insert speed (CODEC_FAST): re-encoded once here */
             bool merged = c->p->level > 0;
             if (!filter && before_rest && full && merged && (w.pend_n == 0 || w.pend_series != g->series)) {

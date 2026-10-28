@@ -1126,6 +1126,22 @@ void tsdb_test_wal_state(tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *r
     pthread_mutex_unlock(&e->lock);
 }
 
+/* Every granule of the first volume's parts: i is its index in its part (0 starts a part). */
+void tsdb_test_granules(tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, const tsdb_test_granule *g), void *ctx)
+{
+    eng *e = t->vols[0];
+    size_t n;
+    part **ps = db_snapshot(e, INT64_MIN, INT64_MAX, &n);
+    for (size_t k = 0; ps && k < n; k++)
+        for (uint32_t i = 0; i < ps[k]->ng; i++) {
+            const granule *g = &ps[k]->g[i];
+            tsdb_test_granule tg = {g->series, g->count, g->ts_min, g->ts_max, ps[k]->grows};
+            fn(ctx, partition_class(e, ps[k]->partition), i, &tg);
+        }
+    if (ps)
+        db_release(ps, n);
+}
+
 /* ---------------------------------------------------------------- states */
 
 static int state_get(tsdb *t, uint32_t series, const char *name, bool create, uint32_t *code)

@@ -177,8 +177,10 @@ cgroup, so `nice` does not keep your work out of its way.
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
   host may still have them mapped.
-- **Granules** never span series; their count/nulls/sum/min/max, and m2 (floats) or the sum of
-  squares (integers), must match the rows exactly, because aggregates use them instead of decoding.
+- **Granules** never span series, and in class 1-3 partitions never a base partition (day) edge either
+  (`GRANULE_CUT`, `pw_add`; a merge copies a granule verbatim only inside one day): day and coarser buckets then
+  answer from statistics as in day partitions, bit for bit. Their count/nulls/sum/min/max, and m2 (floats) or the
+  sum of squares (integers), must match the rows exactly, because aggregates use them instead of decoding.
 - **Value types.** A series' type is fixed at creation and lives in the SERIES
   dictionary, not in the parts. Values travel as slots of `type_width(type)`
   bytes (4: float32, bool, state; 8: float64, int64); the memtable and the WAL

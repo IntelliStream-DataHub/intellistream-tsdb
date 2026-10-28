@@ -656,7 +656,8 @@ static void test_history(int classes)
             CHECK(classes ? st.rows_decoded <= 8192 && st.granules <= 2 && st.parts == 1
                           : st.rows_decoded <= PER && st.granules <= 3 && st.parts <= 3);
             st = check_one(db, s, &rs, b0, b1, m, gap, "history: a day across partitions");
-            CHECK(classes ? st.rows_decoded <= 8192 && st.granules <= 2 && st.parts == 1
+            /* with classes one part holds every day, but its granules still end at day edges */
+            CHECK(classes ? st.rows_decoded <= 2 * PER && st.granules <= 4 && st.parts == 1
                           : st.rows_decoded <= 2 * PER && st.granules <= 4 && st.parts <= 4);
         }
     /* Corrections in a newer part at the last reading before b0 and the first after b1 (both in other

@@ -539,6 +539,23 @@ key is the base partition number.
 - **Retention and `tsdb_drop_before`** work on whole partitions: a slow
   series' rows go in steps of its partition length (retention caps that at an
   eighth of the limit; queries still clamp to the exact cutoff).
+- **Granules end at day edges.** In a class 1-3 partition the part writer ends
+  a granule at every base partition boundary (`GRANULE_CUT`, aligned as
+  partitions are) as well as at 8192 rows, so a series' granules there are the
+  ones a day partition would hold. A bucket that cuts through a granule must
+  decode it; with granules of a slow series spanning days, day and coarser
+  buckets would decode nearly all of them, and the longer partitions would make
+  bucketed queries slower than day partitions. With the cut, every bucket a day
+  partition answers from granule statistics (UTC days, weeks, months, anything
+  made of whole days) is answered from them here too, and the answers are the
+  same bit for bit (the same rows in the same granules, added in the same
+  order). It costs one granule per series and day, which is what classes save
+  for series of fewer than 8192 rows a day: a disk temperature read every minute
+  takes 0.268 bytes per reading instead of 0.326 (what is left to save is the
+  overhead of a part per day). A week cut was measured as well: 0.152 bytes per reading,
+  but day and 2.5-day buckets decoded nearly every granule. The cut is layout,
+  not format: readers take any granule boundaries, a merge copies only granules
+  inside one day and re-encodes (and so re-cuts) the rest.
 
 Writes are published atomically (`tmp_*.part`, fsync, rename, fsync dir).
 An insert that makes several parts (one per partition) commits through an

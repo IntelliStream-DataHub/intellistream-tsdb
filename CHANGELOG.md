@@ -12,9 +12,10 @@ disk format and the wire protocol.
 - Partition classes: each series gets partitions of 1, 7, 28 or 364 base partitions (`partition_ms`), the
   shortest that holds at least eight granules of it, chosen from its rate (a fresh series from its first batch,
   others when an idle merge measures them; a band widened 2x either way keeps them from flapping, and a class is
-  at most an eighth of the series' retention). A slow series no longer pays a granule and two blocks per day: a
-  disk temperature read every minute takes 0.133 instead of 0.326 bytes per reading; fast series keep their day
-  partitions exactly. `tsdb_options.partition_classes` (default 1, fixed at creation), `tsdb_series_class`,
+  at most an eighth of the series' retention). In class partitions granules still end at every day edge, so
+  bucketed queries answer from granule statistics wherever day partitions do, with the same answers bit for bit:
+  a disk temperature read every minute takes 0.268 instead of 0.326 bytes per reading, and every query measured
+  is as fast as with day partitions or faster; fast series keep their day partitions exactly. `tsdb_options.partition_classes` (default 1, fixed at creation), `tsdb_series_class`,
   `tsdb_part_info.cls`, `.start_ms` and `.end_ms`; `partition_classes` and the part fields in the Rust, Python
   and Java embedded bindings (`series_class`, `seriesClass`); `tsdb <dir> parts` and `series` print the class.
   tsdbd `--granule-rows N` (at creation), `--merge-idle-s N` and `--flush-interval-ms N`. `make jepsen` runs a
