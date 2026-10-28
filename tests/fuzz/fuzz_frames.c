@@ -3,8 +3,11 @@
  * and runs each request against a real database) without sockets or threads, and checks the replies.
  *
  * It includes server/tsdbd.c itself, so the code under test is the server's own, static functions included;
- * the only differences are OUT_CAP (replies are drained after every request instead of by a send) and a guard
- * on volume paths (the fuzzer must not create directories outside its scratch directory).
+ * the only differences are OUT_WAIT (where a worker would wait for a send to drain its output, the replies so far
+ * are checked and dropped here, and after every request) and a guard on volume paths (the fuzzer must not create
+ * directories outside its scratch directory). OUT_CAP is smaller than the server's, so replies go out in pieces
+ * more often; what a connection buffers is then bounded as in the server (an allocation over the 300 MB that
+ * `make fuzz-frames` allows is a finding).
  *
  *   fuzz_frames seeds DIR                       write a valid seed frame file per request form
  *   fuzz_frames replay [--dir D] FILE|DIR...    run each input once (make test: the committed corpus)
@@ -41,7 +44,10 @@ static int fz_series_create(tsdb *d, const char *name, tsdb_type t, const char *
 }
 #define tsdb_series_at fz_series_at
 #define tsdb_series_create fz_series_create
-#define OUT_CAP SIZE_MAX
+struct conn;
+static void fz_out_wait(struct conn *c);
+#define OUT_WAIT fz_out_wait
+#define OUT_CAP (256u << 10)
 #define main tsdbd_main
 #include "../../server/tsdbd.c"
 #undef main
@@ -181,26 +187,61 @@ static void db_stop(void)
 }
 
 /* Checks the replies to request `seq` in out[0, len): REPLY frames with its id, at least one. */
-static void check_replies(const uint8_t *out, size_t len, uint32_t seq, uint8_t op)
+/* The reply stream of the request running (id fz_seq), checked as it is drained: REPLY frames carrying its id,
+ * each of a valid length; fz_skip is what remains of the frame being drained. */
+static uint32_t fz_seq;
+static uint8_t fz_op;
+static size_t fz_skip, fz_frames, fz_bytes;
+static int32_t fz_status; /* of the first frame */
+
+static void bad_replies(void)
 {
-    size_t off = 0, frames = 0;
-    while (off < len) {
-        uint32_t flen, id;
-        if (len - off < 4 + 9)
-            goto bad;
-        memcpy(&flen, out + off, 4);
-        memcpy(&id, out + off + 4, 4);
-        if (flen < 9 || flen > TSDB_MAX_FRAME || len - off - 4 < flen || id != seq || out[off + 8] != TSDB_OP_REPLY)
-            goto bad;
-        off += 4 + (size_t)flen;
-        frames++;
-    }
-    if (frames)
-        return;
-bad:
-    fprintf(stderr, "fuzz_frames: bad reply stream for op %u (%zu bytes, %zu frames)\n", op, len, frames);
+    fprintf(stderr, "fuzz_frames: bad reply stream for op %u (%zu bytes, %zu frames)\n", fz_op, fz_bytes, fz_frames);
     fail_dump();
     abort();
+}
+
+/* Checks and drops the complete frames and frame pieces of c's output; what is left is the start of a frame
+ * header. The server's out_put calls it where a worker would wait for the client to read. */
+static void fz_out_wait(struct conn *c)
+{
+    const uint8_t *out = c->out.p;
+    size_t off = 0, len = c->out.len;
+    while (off < len) {
+        if (fz_skip) {
+            size_t take = len - off < fz_skip ? len - off : fz_skip;
+            off += take;
+            fz_skip -= take;
+            continue;
+        }
+        if (len - off < 4 + 9)
+            break;
+        uint32_t flen, id;
+        memcpy(&flen, out + off, 4);
+        memcpy(&id, out + off + 4, 4);
+        if (flen < 9 || flen > TSDB_MAX_FRAME + TSDB_MULTI_PREFIX || id != fz_seq || out[off + 8] != TSDB_OP_REPLY)
+            bad_replies();
+        if (!fz_frames)
+            memcpy(&fz_status, out + off + 9, 4);
+        fz_frames++;
+        fz_skip = 4 + (size_t)flen;
+    }
+    fz_bytes += off;
+    memmove(c->out.p, out + off, len - off);
+    c->out.len = len - off;
+}
+
+/* After a request: its replies complete, at least one frame. */
+static void check_replies(conn *c, uint32_t seq, uint8_t op)
+{
+    fz_out_wait(c);
+    if (c->out.len || fz_skip || !fz_frames)
+        bad_replies();
+    if (verbose)
+        fprintf(stderr, "  op %u: status %d, %zu reply bytes\n", op, fz_status, fz_bytes);
+    fz_seq = seq + 1;
+    fz_op = 0;
+    fz_frames = fz_bytes = 0;
 }
 
 /* One input: what a client sends on one connection. Requests run in order, as a worker would run them. */
@@ -234,15 +275,10 @@ static void run_one(const uint8_t *in, size_t len)
             c->q_bytes -= r->len;
             atomic_store(&c->cancel_running, r->cancelled); /* as dispatch() does: a CANCEL that came first */
             r->id = seq;
+            fz_seq = seq;
+            fz_op = r->op;
             handle(r);
-            check_replies(c->out.p, c->out.len, seq, r->op);
-            if (verbose) {
-                int32_t st;
-                memcpy(&st, c->out.p + 9, 4);
-                fprintf(stderr, "  op %u: %u bytes, status %d, %zu reply bytes\n", r->op, (unsigned)r->len, st,
-                        c->out.len);
-            }
-            c->out.len = 0;
+            check_replies(c, seq, r->op);
             seq++;
             req_free(r);
         }
@@ -549,6 +585,26 @@ static int cmd_seeds(const char *dir)
                      p64(&p, 30000);
                  }
              }));
+    }
+    /* TWA every 5 ms over series 0's 200 s: some 40,000 buckets, a frame of 1.6 MB that reaches the output in
+     * pieces (OUT_PIECE) with the output drained between them (OUT_CAP); alone and as one series of a QUERY_MULTI */
+    for (int multi = 0; multi < 2; multi++) {
+        fb t = {0};
+        p32(&t, multi ? TSDB_MANY_SERIES : 0);
+        p64(&t, 0);
+        p64(&t, 200000);
+        p8(&t, 0), p8(&t, 0), p8(&t, 0), p8(&t, 0);
+        p64(&t, 0);
+        p64(&t, 0);
+        p64(&t, 5);
+        p32(&t, 0);
+        p32(&t, 0);
+        f.len = p.len = 0;
+        if (multi)
+            multi_payload(&p, TSDB_OP_QUERY_TWA, 0, 0, 2, 0, &t);
+        frame(&f, multi ? TSDB_OP_QUERY_MULTI : TSDB_OP_QUERY_TWA, multi ? &p : &t);
+        seed_write(dir, multi ? "multi-twa-large" : "query-twa-large", &f);
+        free(t.p);
     }
     /* QUERY_MULTI: every inner op, every flag; then CANCEL of a queued one, and of nobody */
     {

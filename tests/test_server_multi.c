@@ -521,6 +521,36 @@ static long rss_anon_kb(pid_t pid)
     return kb;
 }
 
+/* a field of /proc/PID/status in KiB (RssAnon, VmHWM), -1 if missing */
+static long status_kb(pid_t pid, const char *key)
+{
+    char path[64], line[256];
+    snprintf(path, sizeof path, "/proc/%d/status", (int)pid);
+    FILE *f = fopen(path, "r");
+    long kb = -1;
+    size_t kl = strlen(key);
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, key, kl) && line[kl] == ':') {
+            kb = atol(line + kl + 1);
+            break;
+        }
+    if (f)
+        fclose(f);
+    return kb;
+}
+
+/* Starts the peak RSS (VmHWM) over at the current RSS; false where the kernel does not allow it. */
+static bool reset_hwm(pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/clear_refs", (int)pid);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return false;
+    bool ok = fputs("5", f) >= 0;
+    return fclose(f) == 0 && ok;
+}
+
 /* The largest bucket reply a frame carries (with the index, TSDB_MAX_FRAME + 4 at most) goes out whole; one bucket
  * more is TOO_MANY_BUCKETS for that series alone. VALUES chunks that end exactly at a chunk's size. */
 static void test_full_frame(tsdbc *c)
@@ -653,6 +683,41 @@ static void test_stall_small(pid_t pid)
     close(fd);
     free(list);
     free(req);
+}
+
+/* One request whose reply is a full frame of buckets (256 MiB), from a client that reads nothing: the server holds
+ * the engine's result and at most its output cap of the reply, not a second copy of the frame (nor a buffer
+ * rounded up to 512 MiB). The same for the single QUERY_BUCKETS and for a QUERY_MULTI of that series. */
+static void test_stall_buckets(pid_t pid)
+{
+    const size_t full = (TSDB_MAX_FRAME - 13) / TSDB_BUCKET_ROW;
+    const long result_kb = (long)(full * TSDB_BUCKET_ROW >> 10);
+    for (int multi = 0; multi < 2; multi++) {
+        uint8_t t[44] = {0}, req[24 + 8 + 44];
+        uint32_t s = multi ? TSDB_MANY_SERIES : big_id;
+        int64_t start = TB, end = TB + (int64_t)full, iv = 1;
+        memcpy(t, &s, 4);
+        memcpy(t + 4, &start, 8);
+        memcpy(t + 12, &end, 8);
+        memcpy(t + 20, &iv, 8);
+        usleep(300000); /* what the previous step freed is gone */
+        long before = status_kb(pid, "RssAnon");
+        bool hwm = reset_hwm(pid);
+        long hwm0 = status_kb(pid, "VmHWM");
+        int fd = raw_connect();
+        if (multi)
+            raw_send(fd, 11, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_BUCKETS, 0, 1, &big_id, t, 44));
+        else
+            raw_send(fd, 11, TSDB_OP_QUERY_BUCKETS, t, 44);
+        usleep(2000000);
+        long grown = status_kb(pid, "RssAnon") - before, peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
+        fprintf(stderr, "stalled reader, a full frame of buckets (%s): server anonymous memory grew %ld KiB, "
+                        "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS", grown,
+                peak, result_kb);
+        CHECK(SANITIZED || grown <= result_kb + 48 * 1024L);
+        CHECK(SANITIZED || !hwm || peak <= result_kb + 64 * 1024L);
+        close(fd);
+    }
 }
 
 /* On one connection, sent before anything is read: A (large), B, a single query C, then CANCEL B (queued) and
@@ -965,6 +1030,7 @@ int main(int argc, char **argv)
     test_disconnect(c, pid);
     test_stall(c, pid, 3);
     test_stall_small(pid);
+    test_stall_buckets(pid);
 
     /* more than one request's worth of series: split, indexes running on */
     size_t big = TSDB_MULTI_MAX_SERIES + 3;

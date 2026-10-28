@@ -79,6 +79,11 @@ disk format and the wire protocol.
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
+- tsdbd no longer copies a large reply whole into a connection's output buffer: a bucket, aggregate or TWA reply of up
+  to a frame (256 MB) went in at once, in a buffer rounded up to 512 MB, while the engine's result was still held,
+  so one request peaked at about 500 MB of server memory. Replies now reach the output in pieces of 1 MB, the
+  worker waiting while the output is over its cap (8 MB), as for streamed rows; the peak is the result plus a few
+  MB. The wire format is unchanged.
 - `tsdb_open` refuses a `value_codec` other than `TSDB_VALUES_AUTO`, `_GORILLA` and `_CHIMP` (`TSDB_ERR_INVALID`)
   instead of taking any other number as AUTO.
 - `tsdb import` refuses a target directory that has files in it and holds no database, before writing anything,

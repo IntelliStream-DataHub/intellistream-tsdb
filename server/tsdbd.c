@@ -60,8 +60,9 @@
  * large frame beyond it is not read from until memory frees (unless nothing else holds any, so one frame always
  * fits), and neither is one with requests waiting while the total is over it; a packed insert waits to unpack
  * while the total would exceed it, unless no other is unpacking. Outside it: up to IN_KEEP of receive buffer per
- * connection, and the replies waiting for a client that does not read them (up to OUT_CAP and one reply per
- * connection, after which its worker waits). A connection with more than PIPE_CAP of requests (or MULTI_QUEUED
+ * connection, and the replies waiting for a client that does not read them (two buffers per connection, the one
+ * being sent and the one its worker fills, each up to OUT_CAP + OUT_PIECE: a larger reply goes in pieces, its
+ * worker waiting between them). A connection with more than PIPE_CAP of requests (or MULTI_QUEUED
  * multi-series queries) waiting reads no more until they run, so a CANCEL behind them waits too, and one whose
  * frame has been started but not completed for --frame-timeout seconds
  * (default 60) while the server waits for its bytes is closed (slow senders); time the server itself held the
@@ -345,48 +346,81 @@ static void notify(conn *c, bool done)
 
 static inline void put32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
-/* Appends n pieces to c's output, waiting while the output is over OUT_CAP. Returns false when the connection
- * is going away. */
+#ifndef OUT_WAIT /* tests/fuzz/fuzz_frames.c drains the output instead of waiting for a send */
+#define OUT_WAIT out_wait
+/* Waits, under c->lock, while c's output is over OUT_CAP; a client that reads nothing for send_timeout_s loses
+ * the connection. */
+static void out_wait(conn *c)
+{
+    worker_waits(1);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += send_timeout_s;
+    while (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
+        if (pthread_cond_timedwait(&c->cv, &c->lock, &deadline) == ETIMEDOUT) {
+            atomic_store(&c->closing, true); /* the client reads nothing: give the worker back */
+            shutdown(c->fd, SHUT_RDWR);
+        }
+    }
+    worker_waits(-1);
+}
+#endif
+
+/* Appends n pieces to c's output, waiting while the output is over OUT_CAP. A frame larger than OUT_PIECE goes in
+ * pieces of that size, each after the output fell to OUT_CAP, so a connection's output buffer stays under OUT_CAP +
+ * OUT_PIECE whatever its replies' size: a bucket reply of up to a frame (256 MB) is not copied whole into a buffer
+ * rounded up to 512 MB while the engine's result is held too. Only the worker running the connection's request
+ * appends to its output (a QUERY_MULTI's callbacks all run on it), so the pieces of a frame follow each other.
+ * Returns false when the connection is going away. */
+#define OUT_PIECE (1u << 20)
 static bool out_put(conn *c, const struct iovec *iov, int n)
 {
-    size_t total = 0;
-    for (int i = 0; i < n; i++)
-        total += iov[i].iov_len;
-    pthread_mutex_lock(&c->lock);
-    if (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
-        worker_waits(1);
-        struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += send_timeout_s;
-        while (c->out.len > OUT_CAP && !atomic_load(&c->closing)) {
-            if (pthread_cond_timedwait(&c->cv, &c->lock, &deadline) == ETIMEDOUT) {
-                atomic_store(&c->closing, true); /* the client reads nothing: give the worker back */
-                shutdown(c->fd, SHUT_RDWR);
+    int i = 0;
+    size_t at = 0; /* in iov[i] */
+    for (;;) {
+        while (i < n && at == iov[i].iov_len) {
+            i++;
+            at = 0;
+        }
+        if (i == n)
+            return true;
+        size_t total = 0;
+        for (int k = i; k < n && total < OUT_PIECE; k++)
+            total += iov[k].iov_len - (k == i ? at : 0);
+        if (total > OUT_PIECE)
+            total = OUT_PIECE;
+        pthread_mutex_lock(&c->lock);
+        if (c->out.len > OUT_CAP && !atomic_load(&c->closing))
+            OUT_WAIT(c);
+        bool ok = !atomic_load(&c->closing);
+        if (ok && buf_reserve(&c->out, total) != 0) {
+            /* a lost reply would leave the client waiting forever: drop the connection instead */
+            atomic_store(&c->closing, true);
+            shutdown(c->fd, SHUT_RDWR);
+            ok = false;
+        }
+        bool wake = false;
+        if (ok) {
+            for (size_t left = total; left;) {
+                size_t take = iov[i].iov_len - at < left ? iov[i].iov_len - at : left;
+                if (take)
+                    memcpy(c->out.p + c->out.len, (const uint8_t *)iov[i].iov_base + at, take);
+                c->out.len += take;
+                left -= take;
+                if ((at += take) == iov[i].iov_len) {
+                    i++;
+                    at = 0;
+                }
             }
+            wake = !c->notified;
+            c->notified = true;
         }
-        worker_waits(-1);
+        pthread_mutex_unlock(&c->lock);
+        if (wake)
+            notify(c, false);
+        if (!ok)
+            return false;
     }
-    bool ok = !atomic_load(&c->closing);
-    if (ok && buf_reserve(&c->out, total) != 0) {
-        /* a lost reply would leave the client waiting forever: drop the connection instead */
-        atomic_store(&c->closing, true);
-        shutdown(c->fd, SHUT_RDWR);
-        ok = false;
-    }
-    bool wake = false;
-    if (ok) {
-        for (int i = 0; i < n; i++) {
-            if (iov[i].iov_len)
-                memcpy(c->out.p + c->out.len, iov[i].iov_base, iov[i].iov_len);
-            c->out.len += iov[i].iov_len;
-        }
-        wake = !c->notified;
-        c->notified = true;
-    }
-    pthread_mutex_unlock(&c->lock);
-    if (wake)
-        notify(c, false);
-    return ok;
 }
 
 /* Small frames of one QUERY_MULTI are gathered here and reach c->out in batches of at least OB_FLUSH bytes: one
