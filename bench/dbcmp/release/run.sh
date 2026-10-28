@@ -685,6 +685,9 @@ p1_ch() {
     for ds in $DSLIST; do
         CHC -q "CREATE TABLE s1.c_$ds (series UInt32, ts DateTime64(3, 'UTC') CODEC(DoubleDelta, ZSTD(1)), value Float32 CODEC(Gorilla, ZSTD(1))) ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (series, ts)"
         CHC -q "CREATE TABLE s1.l_$ds (series UInt32, ts DateTime64(3, 'UTC'), value Float32) ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (series, ts)"
+        # ClickHouse's smallest lossless setting: the same codecs with ZSTD's highest level, 22
+        CHC -q "CREATE TABLE s1.z_$ds (series UInt32, ts DateTime64(3, 'UTC') CODEC(DoubleDelta, ZSTD(22)), value Float32 CODEC(Gorilla, ZSTD(22))) ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (series, ts)" || fail "p1 ch create z_$ds"
+        CHC -q "INSERT INTO s1.z_$ds FORMAT RowBinary" < "$IN/$ds.rowbinary" || fail "p1 ch insert z_$ds"
         CHC -q "INSERT INTO s1.c_$ds FORMAT RowBinary" < "$IN/$ds.rowbinary" || fail "p1 ch insert c_$ds"
         CHC -q "INSERT INTO s1.l_$ds FORMAT RowBinary" < "$IN/$ds.rowbinary" || fail "p1 ch insert l_$ds"
     done
@@ -699,6 +702,8 @@ p1_ch() {
     printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/ch.tsv"
     printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/ch-optimized.tsv"
     printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/ch-lz4.tsv"
+    printf 'ds\trows\tbytes\tnote\n' > "$OUT/p1/ch-zstd22.tsv"
+    awk -F'\t' '$1 ~ /^z_/ {sub(/^z_/, "", $1); printf "%s\t%s\t%s\tDoubleDelta/Gorilla + ZSTD(22), after OPTIMIZE FINAL: %s parts\n", $1, $2, $3, $4}' "$D/optimized.tsv" >> "$OUT/p1/ch-zstd22.tsv"
     awk -F'\t' '$1 ~ /^c_/ {sub(/^c_/, "", $1); printf "%s\t%s\t%s\tactive parts after merges settled (60 s unchanged): %s; DoubleDelta/Gorilla + ZSTD(1)\n", $1, $2, $3, $4}' "$D/settled.tsv" >> "$OUT/p1/ch.tsv"
     awk -F'\t' '$1 ~ /^c_/ {sub(/^c_/, "", $1); printf "%s\t%s\t%s\tafter OPTIMIZE FINAL: %s parts\n", $1, $2, $3, $4}' "$D/optimized.tsv" >> "$OUT/p1/ch-optimized.tsv"
     awk -F'\t' '$1 ~ /^l_/ {sub(/^l_/, "", $1); printf "%s\t%s\t%s\tdefault codecs (LZ4), merges settled: %s parts\n", $1, $2, $3, $4}' "$D/settled.tsv" >> "$OUT/p1/ch-lz4.tsv"

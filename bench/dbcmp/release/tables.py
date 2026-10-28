@@ -139,7 +139,7 @@ def phase1(out, p):
         k = os.path.basename(f)[:-4]
         # p1_duck writes duckdb.tsv, p1_qdb both qdb tsvs, p1_ch the LZ4 and OPTIMIZE FINAL variants, p1_tsdb the
         # settled sizes; each row's note says which variant it is
-        k = {"duckdb": "duck", "qdb-parquet": "qdb", "ch-lz4": "ch", "ch-optimized": "ch",
+        k = {"duckdb": "duck", "qdb-parquet": "qdb", "ch-lz4": "ch", "ch-optimized": "ch", "ch-zstd22": "ch",
              "tsdb-settled": "tsdb"}.get(k, k)
         if k not in have:
             errors.append("%s: results without how-%s.json" % (f, k))

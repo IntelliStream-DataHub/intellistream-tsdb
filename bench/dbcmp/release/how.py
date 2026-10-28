@@ -41,7 +41,8 @@ SYSTEMS = {
     "ch": dict(
         system="ClickHouse (server)", image_env="CH_IMG",
         settings=["listen_host 127.0.0.1; server defaults otherwise", "MergeTree PARTITION BY toYYYYMM(ts) ORDER BY "
-                  "(series, ts); DoubleDelta / Gorilla + ZSTD(1)"],
+                  "(series, ts); DoubleDelta / Gorilla + ZSTD(1)", "phase 1 also: default LZ4, OPTIMIZE FINAL, and "
+                  "ZSTD(22) after OPTIMIZE FINAL (ClickHouse's smallest lossless setting)"],
         durability="not fsynced at acknowledgement (fsync_after_insert 0, the default); syncfs after the load, timed",
         loader="ch_load.sh: one RowBinary INSERT through clickhouse client (native protocol); merges settled",
         query_client="qdrive over HTTP (port 8123, TabSeparated replies), the same driver and client wall time as "
