@@ -237,15 +237,19 @@ qdb_wait_table() { # TABLE: until every WAL transaction is applied; fails after 
     return 1
 }
 TS_WORK_MEM=${TS_WORK_MEM:-256MB}  # REPORT §5.11: the default (timescaledb-tune: 6 MB) spills TWA's window sorts to disk
+# Podman gives a container 64 MB of /dev/shm; PostgreSQL's parallel workers share their hash tables there, and a
+# batch of 100 series failed with "could not resize shared memory segment ... No space left on device". A server on a
+# host has the host's /dev/shm (half the RAM); 8 GB is plenty here.
+TS_SHM=${TS_SHM:-8g}
 ts_start() { # NAME IMAGE DATADIR MOUNTPOINT: TimescaleDB on 127.0.0.1:5434 with $IN or $DBCMP/input on /data
     local name=$1 img=$2 W=$3 mnt=$4 i
     mkdir -p "$W"
     if [ "$name" = rb-tsha ]; then
         podman unshare chown 1000:1000 "$W"
-        podman run -d --name "$name" --network host -v "$W:/home/postgres/pgdata" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
+        podman run -d --name "$name" --network host --shm-size=$TS_SHM -v "$W:/home/postgres/pgdata" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
             -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 -c work_mem=$TS_WORK_MEM > /dev/null 9>&- || { fail "$name start"; return 1; }
     else
-        podman run -d --name "$name" --network host -v "$W:/var/lib/postgresql/data" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
+        podman run -d --name "$name" --network host --shm-size=$TS_SHM -v "$W:/var/lib/postgresql/data" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
             -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 -c work_mem=$TS_WORK_MEM > /dev/null 9>&- || { fail "$name start"; return 1; }
     fi
     # the image runs initdb and its init scripts on a temporary server first: wait for the extension, then again

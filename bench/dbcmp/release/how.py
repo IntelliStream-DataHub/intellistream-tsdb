@@ -62,7 +62,7 @@ SYSTEMS = {
     "ts": dict(
         system="TimescaleDB", image_env="TS_IMG",
         settings=["listen_addresses 127.0.0.1", "timescaledb-tune 24GB / 32 CPUs", "work_mem 256MB (default 6 MB "
-                  "spills TWA's window sorts)", "max_wal_size 16GB", "hypertable, 1-day chunks, compressed "
+                  "spills TWA's window sorts)", "max_wal_size 16GB", "/dev/shm 8 GB (Podman's default 64 MB fails parallel queries)", "hypertable, 1-day chunks, compressed "
                   "(segmentby series, orderby ts)", "TWA and LTTB of the toolkit run in the timescaledb-ha image"],
         durability="fsync at commit (synchronous_commit on, the default)",
         loader="timescaledb-parallel-copy: CSV, 16 workers, batches of 10000 rows; then compression of every chunk",

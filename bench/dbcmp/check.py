@@ -69,8 +69,9 @@ class PG:
     def q(self, sql):
         import subprocess
         out = subprocess.run(["psql", "-h", "127.0.0.1", "-p", str(self.port), "-U", "postgres", "-d", self.db, "-At", "-F", "\t", "-c", sql],
-                             capture_output=True, text=True, env={"PGPASSWORD": self.pw, "PGTZ": "UTC", "PATH": os.environ.get("PATH", "/usr/bin:/bin")}, check=True).stdout
-        return [l.split("\t") for l in out.splitlines() if l]
+                             capture_output=True, text=True, env={"PGPASSWORD": self.pw, "PGTZ": "UTC", "PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+        if out.returncode: raise RuntimeError(f"psql rc {out.returncode}: {out.stderr.strip()[:500]} in {sql[:300]}")
+        return [l.split("\t") for l in out.stdout.splitlines() if l]
     def rows(self, cls, q):
         r = self.q(q)
         if cls in ("raw", "point"):
