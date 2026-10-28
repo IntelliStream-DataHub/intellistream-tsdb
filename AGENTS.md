@@ -11,7 +11,8 @@ make test                 # all unit, integration and server tests
 make test IO=epoll        # server tests on epoll only (where io_uring is disabled)
 make asan                 # the tests under AddressSanitizer + UBSan
 make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
-make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO
+make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO; workloads kv and classes
+                          # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
 make PORTABLE=1           # without -march=native
@@ -184,9 +185,31 @@ cgroup, so `nice` does not keep your work out of its way.
   hold 8-byte slots for every type. Null is a reserved value per type
   (`type_null`), so a null written later replaces an older value like any
   other write. Aggregates skip nulls; integer sums are exact (128 bits).
-- **Lock order:** `flush_lock` > the WAL writer role > `publish_lock` >
-  `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`. The `crashfs` lock in tests is
-  innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
+- **Partition classes** (`src/classes.c`). A series' rows go to partitions of 1, 7, 28 or 364 base partitions by
+  its class; the key is `4 x first base partition + class` (`partition_classes = 0`: the base number). A switch
+  (series, T, class) never rewrites rows: T is past every row of the series in parts and memtables and every row
+  of a flushed memtable whose WAL segment may still replay (`db->wtail`, per series, kept until
+  `wal_removed_synced` passes its segment), so a replay maps each WAL row to the key its flush used: a deleted row
+  merged away cannot come back under another key. A segment counts as gone only when it was unlinked before a
+  directory fsync (`eng_sync_dir` moves `wal_removed_synced` to the `wal_removed` it read before the fsync); a
+  failed unlink holds `wal_removed` back until a later flush removes it. A T more than 366 days ahead of now is not
+  written (the series keeps its class until the far row is gone).
+  **One (series, ts) is never in two keys**: queries rank rows by part `max_block`, which is right only within a
+  key (a merge in one key can span another key's tombstone and let an older copy win). So **every placement reads
+  one frozen history**: a large insert, a replace and a flush hold `cls_rw` for reading (`cls_freeze`/`cls_thaw`)
+  from their first class lookup until their parts are listed, never while waiting for a merge or a flush, and a
+  switch takes it for writing; never re-read the live history in the middle of a placement. Backstops: the part
+  writer refuses rows out of (series, ts) order (`TSDB_ERR_CORRUPT`, nothing written), and the open checks every
+  part against CLASSES (`cls_check_parts`; a granule that spans a switch is decoded and judged by its rows). A
+  replace classifies a fresh series like a large insert. `CLASSES` is append-only (24-byte checksummed records),
+  synced (and its directory, when new) before anything relies on a record, fail-stop on error, torn tail cut,
+  loaded before the WAL replay.
+  `tsdb_part_info.partition` stays the base partition number (where the partition starts); `cls`, `start_ms`,
+  `end_ms` say the rest. Tests that count parts per base partition or name `p<N>_` files set
+  `partition_classes = 0`.
+- **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
+  `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
+  is a leaf. The `crashfs` lock in tests is innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
   `fn`, a query or the callback runs, nor while an engine lock is taken. A job's `fn` waits only for the items of its
   own nested jobs (a fork/join tree), never for a lock another job's worker may hold while waiting for helpers.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
@@ -195,7 +218,8 @@ cgroup, so `nice` does not keep your work out of its way.
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
-- The on-disk format is version 6 (`FORMAT_VERSION`; 6: a 7-bit codec kind in block headers): 160-byte granule entries
+- The on-disk format is version 7 (`FORMAT_VERSION`; 6: a 7-bit codec kind in block headers; 7: partition keys with
+  a class, CLASSES, zstd frames without magic and content size): 160-byte granule entries
   with typed, time-weighted and spread statistics, a checksum over each part's header, index and footer,
   checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Until
   1.0 (the format freezes there; the user decided this on 2026-10-25) older formats need not stay readable: a

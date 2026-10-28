@@ -409,13 +409,15 @@ They made the on-disk format version 4.
 A database is a directory:
 
 ```
-META                       format version, partition size, granule size
+META                       format version, partition size, granule size, partition classes on or off
 SERIES                     append-only series dictionary (name -> dense id, value type)
 STATES                     append-only dictionary of state names (name -> code)
+RETENTION                  append-only retention limits per series
+CLASSES                    append-only partition class switches per series (series, from, class)
 LOCK
 MANIFEST                   the published part set, for followers
 wal_<seq>.log              write-ahead log of the current memtable
-p<partition>_<minblock>_<maxblock>_<level>.part
+p<key>_<minblock>_<maxblock>_<level>.part   key: 4 x first base partition + class
 ```
 
 A database with volumes (`tsdb_series_at`) also has `VOLUMES` (their paths)
@@ -460,15 +462,83 @@ time they cover and the longest gap between rows: see "Time-weighted
 averages"). The
 header, the index and the footer (WAL segment, row count, time range) are
 covered by one more checksum, checked when the part is opened. The on-disk
-format is version 4; a database of another version is refused at open
-(there is no release yet, so no older format is read). The index is the sparse primary index of MergeTree: finding a series'
+format is version 7; a database of another version is refused at open
+(until 1.0 an older format is carried over by export and import). The index is the sparse primary index of MergeTree: finding a series'
 rows in a time range is a binary search, and aggregates over whole granules
 are answered from the stored statistics without decompressing anything.
 
-Parts are grouped by time partition (one day by default) and merged in the
+Parts are grouped by time partition (one day by default, or longer for slow
+series: see "Partition classes") and merged in the
 background with ClickHouse's `SimpleMergeSelector` heuristics: only adjacent
 block ranges are merged, so "newest part wins" stays well defined. A merge
 copies granules that need no re-encoding as compressed bytes.
+
+### Partition classes (src/classes.c)
+
+Every series pays per partition at least one granule: a 160-byte index entry
+and two framed blocks. A series with a reading a minute writes 1440 rows a day,
+so in day partitions it pays that for 1440 rows, in short blocks that compress
+worse than 8192-row ones. So each series has a class c, and its rows go to
+partitions of `partition_ms` x {1, 7, 28, 364} (a day, a week, four weeks, 52
+weeks), the shortest that holds at least eight granules of it (65,536 rows at
+the defaults: one row per 1.3 s for a day). A class-c partition holds only
+series of class c: fast series keep exactly their day partitions. A partition's
+key is `4 x first base partition + c`, so keys sort by time and every rule
+keyed by partition (merges, tombstones, WAL replay by `wal_seq`, retention)
+compares keys as before. With `partition_classes = 0` (fixed at creation) the
+key is the base partition number.
+
+- **The choice.** A fresh series (created since the open, in no flush, large
+  insert or replace yet) whose first one brings at least 64 rows gets its class
+  from their rate, from the beginning of time: a backfill or an import lands in
+  its final partitions at once. Otherwise it starts in class 0, and the idle
+  merge of a partition (one part left) measures each series in it; one whose
+  rate lies outside its class's band, widened 2x either way (no flapping),
+  moves. A long-class series that gets much faster is caught at the next flush.
+  A class is never longer than an eighth of the series' retention.
+- **Switches never rewrite rows.** A switch (series, T, class) applies to
+  timestamps >= T, T being the next base partition boundary after the newest row
+  the series has anywhere (parts, memtables) and after its newest row in every
+  flushed memtable whose WAL segment may still be replayed. So a replay maps
+  every WAL row to the partition its flush used, and a series' rows do not
+  straddle T. Without that bound, a row deleted and merged away (the empty part
+  that stops its segment sits in the old partition) would come back in the new
+  class's partition after a power loss. A segment can still be replayed until it
+  is unlinked and a directory fsync has followed (every `eng_sync_dir` records
+  how far that is); an unlink that fails is retried at a later flush, and the
+  segment counts as present until then. The bound is kept per series, so one
+  series' far-future row does not hold back the others' switches, and a T more
+  than a year ahead of now is not written at all: the series keeps its class
+  until the wrong row is gone, rather than for good.
+- **One (series, ts) is never in two partitions.** Queries rank a part's rows by
+  its `max_block`, which orders rows correctly only between parts whose block
+  ranges do not interleave, and merges keep that within a partition only: a merge
+  in one partition can span a tombstone of another, so the older of two copies of
+  a row in two partitions could outrank the newer one. So every placement (a
+  large insert, a replace, a memtable flush) reads one frozen history: it holds a
+  read lock (`cls_rw`) from its first class lookup until its parts are listed, and
+  a switch takes it for writing. A switch thus sees every placed row in a listed
+  part or a memtable when it computes T, and no placement mixes two histories.
+  (An earlier design let a large insert read the history without a lock and check
+  at its commit whether a switch had overtaken it; rereading the live history
+  while grouping rows once wrote a part whose series run went back in time.)
+  Placements never wait for a merge or a flush while they hold the lock;
+  switches are rare. Two backstops: the part writer refuses rows out of (series,
+  ts) order, and the open checks every part against CLASSES (series and granules
+  sorted, rows inside the partition, the class the history gives each row; a
+  granule that spans a switch is decoded, since a series can come back to a class
+  within one long partition) and fails with `TSDB_ERR_CORRUPT` and a log line.
+- **CLASSES** is append-only like `RETENTION`: 24-byte checksummed records
+  (series, from, class). A record is written and synced (and the directory when
+  the file is new) before any part or flush relies on it; a failed write or sync
+  fails the engine (the WAL's rows map through it). A torn tail is cut; a bad
+  record before a valid one fails the open. It is loaded before the WAL is
+  replayed; a follower reloads it with MANIFEST. In memory each series has one
+  byte (its class at its newest switch); the few series with a switch after the
+  beginning of time keep their history in a small hash map.
+- **Retention and `tsdb_drop_before`** work on whole partitions: a slow
+  series' rows go in steps of its partition length (retention caps that at an
+  eighth of the limit; queries still clamp to the exact cutoff).
 
 Writes are published atomically (`tmp_*.part`, fsync, rename, fsync dir).
 An insert that makes several parts (one per partition) commits through an

@@ -9,6 +9,19 @@ disk format and the wire protocol.
 ## [Unreleased]
 
 ### Added
+- Partition classes: each series gets partitions of 1, 7, 28 or 364 base partitions (`partition_ms`), the
+  shortest that holds at least eight granules of it, chosen from its rate (a fresh series from its first batch,
+  others when an idle merge measures them; a band widened 2x either way keeps them from flapping, and a class is
+  at most an eighth of the series' retention). A slow series no longer pays a granule and two blocks per day: a
+  disk temperature read every minute takes 0.133 instead of 0.326 bytes per reading; fast series keep their day
+  partitions exactly. `tsdb_options.partition_classes` (default 1, fixed at creation), `tsdb_series_class`,
+  `tsdb_part_info.cls`, `.start_ms` and `.end_ms`; `partition_classes` and the part fields in the Rust, Python
+  and Java embedded bindings (`series_class`, `seriesClass`); `tsdb <dir> parts` and `series` print the class.
+  tsdbd `--granule-rows N` (at creation), `--merge-idle-s N` and `--flush-interval-ms N`. `make jepsen` runs a
+  second workload, `classes`: series whose rate changes switch classes under every nemesis while large inserts,
+  replaces and deletes race the switches. Every placement (a large insert, a replace, a flush) reads one frozen
+  class history; the part writer refuses rows out of (series, time) order, and the open checks every part
+  against `CLASSES` (`TSDB_ERR_CORRUPT` with a log line).
 - Many series in one request (protocol 10): QUERY_MULTI answers values, buckets (fixed, calendar in any zone,
   bounds), the spread, TWA and LTTB for up to 65,536 series in one request, in the order asked, every series
   read from one snapshot (an insert into several series is seen by all of them or none), with a status per
@@ -48,6 +61,11 @@ disk format and the wire protocol.
   synced once at the end and then renamed to its name, so an interrupted one leaves no database under that name.
 
 ### Changed
+- Disk format 7: part keys are `4 x first base partition + class`, the new `CLASSES` file, and zstd frames
+  without magic number and content size. A version-6 database is refused at open; carry it over with
+  `tsdb export` (old release) and `tsdb import` (this one), which gives every series its class on its first
+  batch. `tsdb_drop_before` drops whole partitions as before, so a slow series' rows go in steps of its
+  partition length (7, 28 or 364 days); retention still clamps queries to the exact cutoff.
 - The wire protocol is version 10. Clients of this release speak it and gate the new calls on the server's HELLO.
 - One query scheduler per database instead of a thread pool per volume: concurrent queries share the CPUs by
   groups capped at `request_threads`, the calling thread always works, and decoding of series already started
@@ -84,6 +102,9 @@ disk format and the wire protocol.
   so one request peaked at about 500 MB of server memory. Replies now reach the output in pieces of 1 MB, the
   worker waiting while the output is over its cap (8 MB), as for streamed rows; the peak is the result plus a few
   MB. The wire format is unchanged.
+- A WAL segment whose unlink failed after its flush (an I/O error) was counted as removed: an empty merge output
+  that keeps the segment's deleted rows from replaying could then be dropped, and the rows came back at the next
+  open. The segment now stays counted until a later flush removes it.
 - `tsdb_open` refuses a `value_codec` other than `TSDB_VALUES_AUTO`, `_GORILLA` and `_CHIMP` (`TSDB_ERR_INVALID`)
   instead of taking any other number as AUTO.
 - `tsdb import` refuses a target directory that has files in it and holds no database, before writing anything,
