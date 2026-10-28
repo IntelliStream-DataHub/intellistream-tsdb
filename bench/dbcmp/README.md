@@ -520,7 +520,10 @@ before any claim about compression. Remove the containers and data afterwards.
 ## Release run
 
 `release/run.sh` runs the whole comparison unattended, one phase per command. `release/env.sh` holds the
-paths and the pinned images; pull the images first.
+paths and the pinned images; pull the images first. Every image is pinned by digest, and every release and
+image build was at least two weeks old when the run was planned. So the release run uses TimescaleDB 2.30.1,
+QuestDB 10.0.1 and InfluxDB 3 Core 3.12.0, not the newer versions in the sections above. Their tags are
+rebuilt in place, so a tag alone does not name the image.
 
 ```sh
 BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh prep p1 p2 p3 p4   # or: all

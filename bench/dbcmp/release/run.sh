@@ -226,7 +226,7 @@ ch_start() { # DATADIR
 }
 CHC() { "$CLICKHOUSE" client --host 127.0.0.1 "$@"; }
 # QuestDB converts partitions to Parquet with LZ4_RAW unless told otherwise; the ZSTD variant (qdbz in p1, qdb2 in p2)
-# sets the codec and level (QuestDB 10.1.0 PropServerConfiguration: codec default LZ4_RAW, ZSTD level default 9,
+# sets the codec and level (QuestDB 10.x PropServerConfiguration: codec default LZ4_RAW, ZSTD level default 9,
 # levels 1-22; a partition compressing by less than min.compression.ratio 1.2 stays native)
 # Level 22 converts about one partition per second whatever its size (smoke: 450 small partitions took > 300 s);
 # qdb_wait_table's QDB_WAIT_MAX covers that.
@@ -1084,7 +1084,7 @@ p2_ts() {
         pc_unpin rb-ts; }
     cd "$OUT" || true
     crm rb-ts; rmdata "$W"
-    # LTTB and TWA need the toolkit, which is in the -ha image (same TimescaleDB 2.31.0, PostgreSQL 17.11) only:
+    # LTTB and TWA need the toolkit, which is in the -ha image (same TimescaleDB 2.30.1, PostgreSQL 17.11, toolkit 1.26.0) only:
     # one more load there (timed once, for the record), then the two queries
     W=$DBCMP/s2/tsha
     rmdata "$W"

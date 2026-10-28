@@ -30,13 +30,17 @@ REPS=${REPS:-5}
 SECS=${SECS:-15}
 QUIET_MAX=${QUIET_MAX:-600}
 
-# Pins: exact versions, each at least two weeks old when the run was planned (2026-10-27); digests in machine.txt
-CH_IMG=docker.io/clickhouse/clickhouse-server:26.8.2.7
-TS_IMG=docker.io/timescale/timescaledb:2.31.0-pg17
-TSHA_IMG=docker.io/timescale/timescaledb-ha:pg17.11-ts2.31.0
-QDB_IMG=docker.io/questdb/questdb:10.1.0
-I2_IMG=docker.io/library/influxdb:2.7.12
-I3_IMG=docker.io/library/influxdb:3.12.1-core
+# Pins: exact versions by digest, each release and each image build at least two weeks old when the run was planned
+# (2026-10-27). QuestDB 10.1.0 (2026-10-22), TimescaleDB 2.31.0 (2026-10-20) and InfluxDB 3.12.1 (image 2026-10-17)
+# were too new, and their tags are rebuilt in place, so a tag alone does not name the bytes. Built on: ClickHouse
+# 2026-09-01, TimescaleDB 2.30.1 2026-09-17 (both images), QuestDB 10.0.1 2026-08-24, InfluxDB 2.7.12 2026-05-04,
+# InfluxDB 3.12.0 2026-10-02; machine.txt records digest and build date of each image the run used.
+CH_IMG=docker.io/clickhouse/clickhouse-server:26.8.2.7@sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb
+TS_IMG=docker.io/timescale/timescaledb:2.30.1-pg17@sha256:c79fa5891443d1cdf6de5258d4c2bdb8cde29052c45df2062b13d351e0202005
+TSHA_IMG=docker.io/timescale/timescaledb-ha:pg17.11-ts2.30.1@sha256:3e3440ab4c2aa585e743b1d8466cda9bbf18b6c598ec7806cf61e02fa5cd1d1a
+QDB_IMG=docker.io/questdb/questdb:10.0.1@sha256:67eaed863ebb2383227919ea9a5499a4a39ceca3862c20b974c84a10e11cdf89
+I2_IMG=docker.io/library/influxdb:2.7.12@sha256:b8d940ca9376f85118260f5b6bd236b8a00b1749c3350c5578d4cde8e27f31f2
+I3_IMG=docker.io/library/influxdb:3.12.0-core@sha256:624d69bca6bf6fb174aca5a974e1d96e5c5486994e6ae35bc9b4fe02b9520076
 TD_IMG=docker.io/tdengine/tsdb:3.4.2.8@sha256:44f58e6f9b013bccb94c4a27dd0ec7bca2982474fd3b390cafb48f709db1f0b1
 IOT_IMG=docker.io/apache/iotdb:2.0.11-standalone@sha256:5ace0f3eceff892dd349d02288224c966f3fdeb11d08c4f575b642a110b82338
 VM_IMG=docker.io/victoriametrics/victoria-metrics:v1.154.0@sha256:d83112326f700fe65f6fe66b12348406191cb20826ae0df72d676a2e69d3f3c9
