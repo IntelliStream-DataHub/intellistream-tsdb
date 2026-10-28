@@ -586,6 +586,34 @@ tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI
         done
     done
 }
+tsdb_self() { # TAG: tsdbd's answers now against its references (cwd WORK): the protocol-10 batches of the whole range,
+               # and with TAG merged, after optimize, every class, LTTB and TWA kind too. The headline numbers are
+               # these paths, so they are checked like every other system's.
+    local G=$1 k w=self rc=0
+    mkdir -p "$w"
+    if [ "$G" = merged ]; then
+        { "$TB/tsdbq" dump spec.tsv 200 > "$w/$G-windows.jsonl" && "$TB/tsdbq" full 1 1 dump 2> "$w/$G-full.jsonl"; } \
+            || { echo "MISMATCH: tsdbq dump failed"; rc=1; }
+        python3 -I "$H/check.py" --dumps ref/windows.jsonl ref/full.jsonl "$w/$G-windows.jsonl" "$w/$G-full.jsonl" || rc=1
+        "$B/relq" lttb 1 1 "$w/$G-lttb.jsonl" > /dev/null && REL jsonl lttb ref/lttb.jsonl "$w/$G-lttb.jsonl" || rc=1
+        "$B/relq" twa 1 1 "$w/$G-twa.jsonl" > /dev/null && REL jsonl twa ref/twa.jsonl "$w/$G-twa.jsonl" || rc=1
+        for k in $TWA_KINDS $TWA_WKINDS; do
+            env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" 1 1 "$w/$G-$k.jsonl" > /dev/null \
+                && REL jsonl "$k" "ref/$k.jsonl" "$w/$G-$k.jsonl" || rc=1
+        done
+    fi
+    if tsdb_has_batch; then
+        for k in $KS; do
+            [ "$k" = 1 ] && continue
+            "$TB/tsdbq" full 1 1 dump --batch "$k" 2> "$w/$G-full.b$k.jsonl" > /dev/null || { echo "MISMATCH: --batch $k dump failed"; rc=1; }
+            echo "whole range, --batch $k:"
+            python3 -I "$H/check.py" --dumps ref/windows.jsonl ref/full.jsonl ref/windows.jsonl "$w/$G-full.b$k.jsonl" || rc=1
+        done
+    else
+        echo "tsdbq has no --batch: batch answers not checked (and not timed)"
+    fi
+    return "$rc"
+}
 tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (where tsdbd has --query-threads)
     local qt=()
     "$T/tsdbd" --help 2>&1 | grep -q -- '--query-threads' && qt=(--query-threads 1)
@@ -863,11 +891,12 @@ p2_tsdb() {
     tstep "p2 tsdb twa c16" "$D/twa.c16.txt" -- "$B/relq" twa 16 "$REPS"
     tsdbtwa "$D" "" 1 16
     tsdbsuite tsdbq "$D" "1 32"
-    tsdbbsuite tsdbq "$D"
+    untimed "$D/check-self.txt" tsdb_self "" && tsdbbsuite tsdbq "$D"
     tstep "p2 tsdbc-bench query c1" "$D/tsdbc-bench.c1.txt" -- "$T/tsdbc-bench" query --conns 1 --seconds 5 --port "$TSDB_PORT"
     tstep "p2 tsdbc-bench query c32" "$D/tsdbc-bench.c32.txt" -- "$T/tsdbc-bench" query --conns 32 --seconds 5 --port "$TSDB_PORT"
     # partitions merged (README row "tsdbd, 1 connection, partitions merged")
     tstep "p2 tsdb optimize" "$D/optimize.txt" -- bash -c "'$TB/tsdbstat' optimize && du -sb --exclude='retired_*' '$W/db'"
+    untimed "$D/check-self.merged.txt" tsdb_self merged || { cd "$OUT"; tsdbd_stop; runstats "$D"; return 1; }
     tstep "p2 tsdb merged full c1" "$D/merged.full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
     tstep "p2 tsdb merged full c16" "$D/merged.full.c16.txt" -- "$TB/tsdbq" full 16 "$REPS"
     tstep "p2 tsdb merged lttb c1" "$D/merged.lttb.c1.txt" -- "$B/relq" lttb 1 "$REPS"
