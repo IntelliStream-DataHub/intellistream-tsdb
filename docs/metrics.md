@@ -43,6 +43,8 @@ directory) and `path`.
 | `tsdb_follow_errors_total`, `tsdb_follow_refresh_age_seconds` | counter, gauge | followers only: failed refreshes, and time since the last good one (the age of the follower's refresh, not of the writer's data: a stopped writer leaves it near 0) |
 | `tsdb_requests_total{op}` | counter | requests handled, by operation (`insert`, `query_raw`, `query_agg`, ...) |
 | `tsdb_inserted_rows_total` | counter | rows in successful insert requests |
+| `tsdb_multi_series_total` | counter | series answered by many-series requests (QUERY_MULTI, `op="query_multi"` in the request counters) |
+| `tsdb_multi_deferred_total` | counter | series of such requests too large to hold ahead of their turn, run again at it (streaming); a high rate next to `tsdb_multi_series_total` means the requests are mostly large series |
 | `tsdb_request_errors_total{code}` | counter | replies with an error status: `io`, `invalid`, `notfound`, ... |
 | `tsdb_query_duration_seconds{op}` | histogram | time a worker spent on a query request (0.5 ms to 30 s), up to handing the reply to the kernel, so a slow client taking a large result adds to it |
 | `tsdb_connections`, `tsdb_connections_max` | gauge | open connections on the main port, and the limit |

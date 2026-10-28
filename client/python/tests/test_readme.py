@@ -66,3 +66,14 @@ def test_analytics(tmp_path):
         "chart [0, 1000, 4000]",
         "last 4000 40.0",
     ], out.stdout
+
+
+def test_multi(tmp_path):
+    text = README.read_text()
+    section = text[text.index("## Many series in one request") :]
+    code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
+    assert '"/tmp/tsdb-multi"' in code
+    code = code.replace('"/tmp/tsdb-multi"', repr(str(tmp_path / "db")))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == ["3 [0, 25, 50, 75] 8640.0", "25 94.0", "[1.0, 2.0, 3.0]"]

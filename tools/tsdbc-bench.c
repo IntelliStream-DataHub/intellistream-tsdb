@@ -4,13 +4,16 @@
  *   tsdbc-bench load  FILE.rowbinary [--conns 4] [--batch 1000000] [--compression 1]
  *   tsdbc-bench verify FILE.rowbinary     the server holds exactly the rows of FILE (count, sum, every timestamp and value)
  *   tsdbc-bench optimize                  flush and merge, as tsdb-bench does after its load
- *   tsdbc-bench query [--series 100] [--points 1000000] [--conns 1] [--seconds 3]
+ *   tsdbc-bench query [--series 100] [--points 1000000] [--conns 1] [--seconds 3] [--multi K [--multi-one]]
  *   tsdbc-bench connections --conns 5000 [--seconds 5]
  *
  * load sends a RowBinary file (u32 series, i64 ts, f32 value per row), split
  * into contiguous slices, one per connection, with up to 4 batches in flight.
  * query runs the random windows of cbench.h (mixed dataset intervals); tsdb-bench --qps runs the same ones
- * in-process, and the Rust, Python and Java query benchmarks the same again.
+ * in-process, and the Rust, Python and Java query benchmarks the same again; then TWA by the hour and the whole
+ * range. --multi K sends K windows per QUERY_MULTI request; 0 is one request per window as always, 1 the plain op
+ * that QUERY_MULTI wraps (QUERY_VALUES for raw rows), and --multi-one with K = 1 QUERY_MULTI of one series (its
+ * overhead over the plain op).
  * connections holds --conns connections open at once (from up to 64 threads)
  * and keeps sending small aggregate queries through all of them.
  */
@@ -172,6 +175,18 @@ static int optimize(void)
 
 /* ---------------------------------------------------------------- query */
 
+/* With --multi K (K >= 2, or K = 1 with --multi-one) a connection sends its windows K at a time as one
+ * QUERY_MULTI with per-series starts, ends and intervals; queries still count windows, so the q/s of K = 0
+ * (one request per window) and of K are the same work. The extra classes are tsdbc-bench's own (tsdb-bench
+ * --qps and the other clients run cb_classes only): TWA by the hour of a week, and the whole range. */
+static int multi_k = 0, multi_one = 0;
+
+static const cb_class extra_classes[] = {
+    {"twa3600", "twa, 604800 samples in buckets of 3600", 2, 604800, 3600},
+    {"full0", "agg, the whole range in one bucket", 1, 0, 0},
+};
+#define EXTRA_NCLASSES 2
+
 typedef struct qjob {
     const cb_class *k;
     int seed;
@@ -187,6 +202,47 @@ static int count_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
     return 0;
 }
 
+static void next_window(uint64_t *r, const cb_class *k, uint32_t *s, int64_t *start, int64_t *end)
+{
+    if (k->window == 0) { /* the whole range of a random series */
+        *r = ds_mix(*r);
+        *s = (uint32_t)(*r % nseries);
+        *start = INT64_MIN;
+        *end = INT64_MAX;
+        return;
+    }
+    cb_window(r, nseries, points, k->window, s, start, end);
+}
+
+typedef struct multi_ctx {
+    int agg; /* as cb_class.agg */
+    uint64_t rows;
+} multi_ctx;
+
+static int values_cb(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
+{
+    (void)ts;
+    (void)v;
+    *(uint64_t *)ctx += n;
+    return 0;
+}
+
+static int multi_fn(void *ctx, const tsdb_series_result *r)
+{
+    multi_ctx *m = ctx;
+    if (r->status)
+        die("query multi, series", r->status);
+    if (!m->agg)
+        m->rows += r->n;
+    else if (m->agg == 2)
+        for (size_t i = 0; i < r->n; i++)
+            m->rows += ((const tsdb_twa_bucket *)r->buckets)[i].count;
+    else
+        for (size_t i = 0; i < r->n; i++)
+            m->rows += ((const tsdb_bucket *)r->buckets)[i].count;
+    return 0;
+}
+
 static void *querier(void *arg)
 {
     qjob *q = arg;
@@ -195,17 +251,47 @@ static void *querier(void *arg)
     if (rc)
         die("connect", rc);
     uint64_t r = cb_seed(q->seed);
+    tsdb_twa_opts twa = {.method = TSDB_TWA_STEP};
+    int use_multi = multi_k >= 2 || (multi_k == 1 && multi_one);
+    int kk = use_multi ? multi_k : 1;
+    uint32_t *ss = malloc((size_t)kk * sizeof *ss);
+    int64_t *st = malloc((size_t)kk * 3 * sizeof *st), *en = st + kk, *iv = en + kk;
     double t0 = now_s();
     while (now_s() - t0 < seconds) {
         for (int k = 0; k < 16; k++) {
             uint32_t s;
             int64_t start, end;
-            cb_window(&r, nseries, points, q->k->window, &s, &start, &end);
+            if (use_multi) {
+                for (int i = 0; i < kk; i++) {
+                    next_window(&r, q->k, &ss[i], &st[i], &en[i]);
+                    iv[i] = (int64_t)q->k->bucket * cb_step_ms(ss[i]);
+                }
+                tsdb_multi_query mq = {.kind = !q->k->agg ? TSDB_MULTI_VALUES
+                                               : q->k->agg == 2 ? TSDB_MULTI_TWA
+                                                                : TSDB_MULTI_BUCKETS,
+                                       .starts = st, .ends = en, .intervals = q->k->agg ? iv : NULL, .twa = twa};
+                multi_ctx mc = {q->k->agg, 0};
+                if ((rc = tsdbc_query_multi(c, &mq, ss, (size_t)kk, NULL, multi_fn, &mc)) != 0)
+                    die("query multi", rc);
+                q->rows += mc.rows;
+                q->queries += (uint64_t)kk;
+                continue;
+            }
+            next_window(&r, q->k, &s, &start, &end);
             if (!q->k->agg) {
-                uint64_t n = 0;
-                if ((rc = tsdbc_query_raw(c, s, start, end, count_cb, &n)) != 0)
+                uint64_t n = 0; /* --multi 1: QUERY_VALUES, the op QUERY_MULTI wraps; else QUERY_RAW as always */
+                if ((rc = multi_k == 1 ? tsdbc_query_values(c, s, start, end, NULL, values_cb, &n)
+                                       : tsdbc_query_raw(c, s, start, end, count_cb, &n)) != 0)
                     die("query", rc);
                 q->rows += n;
+            } else if (q->k->agg == 2) {
+                tsdb_twa_bucket *b;
+                size_t nb;
+                if ((rc = tsdbc_query_twa(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(s), &twa, &b, &nb)) != 0)
+                    die("query", rc);
+                for (size_t i = 0; i < nb; i++)
+                    q->rows += b[i].count;
+                free(b);
             } else {
                 tsdb_bucket *b;
                 size_t nb;
@@ -219,6 +305,8 @@ static void *querier(void *arg)
         }
     }
     q->secs = now_s() - t0;
+    free(ss);
+    free(st);
     tsdbc_close(c);
     return NULL;
 }
@@ -240,7 +328,15 @@ static int run_queries(const cb_class *k)
         rows += jobs[i].rows;
         secs = jobs[i].secs > secs ? jobs[i].secs : secs;
     }
-    cb_report_query("c", k, "conn", conns, nq, rows, secs, cb_cpu_s() - cpu0);
+    cb_class shown = *k;
+    char id[64], label[96];
+    if (multi_k >= 1) {
+        snprintf(id, sizeof id, "%s.%s%d", k->id, multi_one || multi_k > 1 ? "m" : "p", multi_k);
+        snprintf(label, sizeof label, "%.32s %s%d", k->label, multi_one || multi_k > 1 ? "x" : "plain ", multi_k);
+        shown.id = id;
+        shown.label = label;
+    }
+    cb_report_query("c", &shown, "conn", conns, nq, rows, secs, cb_cpu_s() - cpu0);
     if (rows == 0) {
         fprintf(stderr, "query: class %s returned no rows: the server is empty or does not hold the data set\n", k->id);
         return 1;
@@ -331,6 +427,7 @@ int main(int argc, char **argv)
                                    {"conns", required_argument, 0, 'c'},  {"batch", required_argument, 0, 'b'},
                                    {"series", required_argument, 0, 's'}, {"points", required_argument, 0, 'n'},
                                    {"seconds", required_argument, 0, 't'}, {"compression", required_argument, 0, 'z'},
+                                   {"multi", required_argument, 0, 'm'}, {"multi-one", no_argument, 0, 'o'},
                                    {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -343,15 +440,17 @@ int main(int argc, char **argv)
         case 'n': points = strtoull(optarg, NULL, 10); break;
         case 't': seconds = atof(optarg); break;
         case 'z': compression = atoi(optarg); break;
+        case 'm': multi_k = atoi(optarg); break;
+        case 'o': multi_one = 1; break;
         default: return 2;
         }
     }
     if (optind < argc && strcmp(argv[optind], "connections") == 0 && conns >= 1)
         return connections();
-    if (conns < 1 || conns > 256 || optind >= argc) {
+    if (conns < 1 || conns > 256 || optind >= argc || multi_k < 0 || multi_k > 65536) {
         fprintf(stderr, "usage: tsdbc-bench load FILE [--conns N] [--batch ROWS] [--compression LEVEL]\n"
                         "       tsdbc-bench verify FILE | optimize\n"
-                        "       tsdbc-bench query [--series N] [--points N] [--conns N] [--seconds S]\n"
+                        "       tsdbc-bench query [--series N] [--points N] [--conns N] [--seconds S] [--multi K [--multi-one]]\n"
                         "       tsdbc-bench connections --conns N [--seconds S]\n"
                         "       [--host H] [--port P]\n");
         return 2;
@@ -366,6 +465,8 @@ int main(int argc, char **argv)
         int bad = 0;
         for (int k = 0; k < CB_NCLASSES; k++)
             bad |= run_queries(&cb_classes[k]);
+        for (int k = 0; k < EXTRA_NCLASSES; k++)
+            bad |= run_queries(&extra_classes[k]);
         return bad;
     }
     return 2;

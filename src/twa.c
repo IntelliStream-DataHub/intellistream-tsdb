@@ -33,8 +33,6 @@
 #include <math.h>
 #include <stdlib.h>
 
-#define TWA_PARALLEL_MIN 8
-
 /* A TWA bucket needs no reading of its own (a segment across it is enough), so two readings far apart can ask
  * for a bucket per millisecond between them: the limit is what one reply can carry over the wire, far below
  * the aggregates' MAX_BUCKETS, and bounds a request's memory (about 100 bytes a bucket) to some 400 MB. */
@@ -373,8 +371,8 @@ static void twa_worker(void *arg, int idx)
     cur_qstats = j->qs;
     codec_ctx *cc = cc_get(j->db);
     size_t cap = j->db->granule_rows;
-    int64_t *ts = malloc(cap * sizeof *ts);
-    uint8_t *v = malloc(cap * sizeof(uint64_t));
+    int64_t *ts = qscratch_get(0, cap * sizeof *ts);
+    uint8_t *v = qscratch_get(1, cap * sizeof(uint64_t));
     if (!cc || !ts || !v) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
         goto out;
@@ -404,12 +402,17 @@ static void twa_worker(void *arg, int idx)
         pc->last = (twa_pt){ts[n - 1], ok1 ? slot_val(j->q->type, v + (n - 1) * j->q->w) : 0, ok1};
         pc->v = c.v;
         pc->n = c.n;
+        int lv = sched_leave();
+        if (lv < 0)
+            atomic_store(&j->err, lv);
+        if (lv)
+            break;
     }
 out:
     if (cc)
         cc_put(j->db, cc);
-    free(ts);
-    free(v);
+    qscratch_put(ts);
+    qscratch_put(v);
     cur_qstats = mine;
 }
 
@@ -547,6 +550,10 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
             rc = TSDB_ERR_TOO_MANY_BUCKETS;
             goto done;
         }
+        if (!qbudget_ok(span * (sizeof *acc + sizeof(tsdb_twa_bucket)))) {
+            rc = TSDB_ERR_DEFER; /* a multi-series task ahead of the head: run it at its turn */
+            goto done;
+        }
         o.nb = (size_t)span;
     }
     acc = calloc(o.nb, sizeof *acc);
@@ -599,8 +606,10 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
         twa_job j = {.db = db, .qs = cur_qstats, .q = &q, .sn = &sn, .pc = pc, .work = work, .nwork = nwork};
         atomic_init(&j.next, 0);
         atomic_init(&j.err, 0);
-        int threads = nwork >= TWA_PARALLEL_MIN ? (int)MIN((size_t)db->opt.query_threads, nwork) : 1;
-        pool_run(db->qpool, threads, twa_worker, &j);
+        uint64_t rows = 0;
+        for (size_t w = 0; w < nwork; w++)
+            rows += (uint64_t)pc[work[w]].g->count * TWA_ROW_WEIGHT;
+        sched_run(db->sched, query_threads_for(db, rows, nwork), twa_worker, &j);
         rc = atomic_load(&j.err);
         if (rc)
             goto done;

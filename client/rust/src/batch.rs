@@ -33,8 +33,11 @@ use rayon::prelude::*;
 
 use crate::client::Client;
 use crate::error::{Error, Result};
-use crate::types::{Bucket, Points, QueryOpts};
-use crate::value::ColumnRef;
+use std::ops::{ControlFlow, RangeBounds};
+
+use crate::client::bounds;
+use crate::types::{Bucket, Buckets, MultiOpts, Points, QueryOpts, Rows, SpreadBucket, TwaBucket, TwaOpts};
+use crate::value::{Column, ColumnRef};
 
 /// One query of a batch: `series` over the half-open range `[start, end)` in ms since the
 /// epoch. `i64::MIN` and `i64::MAX` leave a side open.
@@ -230,7 +233,7 @@ fn chains(batches: &[InsertBatch<'_>]) -> Vec<Vec<usize>> {
 
 #[cfg(feature = "embedded")]
 impl crate::Db {
-    /// The rows of many float32 queries, run in parallel on every CPU.
+    /// The rows of many float32 queries, in one `tsdb_query_multi` on the database's query threads.
     ///
     /// # Errors
     ///
@@ -240,31 +243,51 @@ impl crate::Db {
     /// Afterwards [`last_query_stats`](crate::Db::last_query_stats) reports the totals of the
     /// batch's queries; so does it after [`query_agg_many`](crate::Db::query_agg_many).
     pub fn query_points_many(&self, queries: &[RangeQuery], opts: QueryOpts) -> Result<Vec<Points>> {
-        self.batch_stats(|after| {
-            par_map(queries.len(), None, |i| {
-                let q = queries[i];
-                let r = self.query_points(q.series, q.start..q.end, opts);
-                after();
-                r
+        // one tsdb_query_multi: the database's query scheduler runs the series, all from one cut
+        let series: Vec<u32> = queries.iter().map(|q| q.series).collect();
+        let starts: Vec<i64> = queries.iter().map(|q| q.start).collect();
+        let ends: Vec<i64> = queries.iter().map(|q| q.end).collect();
+        let m = MultiOpts { starts: Some(&starts), ends: Some(&ends), ..MultiOpts::default() };
+        let rows = self.rows_multi(tsdb_sys::TSDB_MULTI_VALUES, &series, 0, 0, 0, opts, m)?;
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, r)| {
+                let batch = |error| Error::Batch { index, error: Box::new(error) };
+                let r = r.map_err(batch)?;
+                // query_points reads float32 only, nulls as the null NaN
+                let crate::Values::Float32(mut v) = r.values.values else {
+                    return Err(batch(Error::Server(crate::Status::Invalid)));
+                };
+                if let Some(valid) = &r.values.valid {
+                    for (i, x) in v.iter_mut().enumerate() {
+                        if !valid.get(i) {
+                            *x = f32::from_bits(crate::NULL_F32_BITS);
+                        }
+                    }
+                }
+                Ok(Points { ts: r.ts, values: v })
             })
-        })
+            .collect()
     }
 
-    /// Aggregates many queries, each into buckets of its own length, in parallel.
+    /// Aggregates many queries, each into buckets of its own length, in one `tsdb_query_multi`
+    /// on the database's query threads.
     ///
     /// # Errors
     ///
     /// [`Error::Batch`] with the lowest failing query's index and error (as
     /// [`query_agg`](crate::Db::query_agg)); every query below it succeeded.
     pub fn query_agg_many(&self, queries: &[AggQuery]) -> Result<Vec<Vec<Bucket>>> {
-        self.batch_stats(|after| {
-            par_map(queries.len(), None, |i| {
-                let q = queries[i];
-                let r = self.query_agg(q.series, q.start..q.end, q.interval_ms);
-                after();
-                r
-            })
-        })
+        let series: Vec<u32> = queries.iter().map(|q| q.series).collect();
+        let starts: Vec<i64> = queries.iter().map(|q| q.start).collect();
+        let ends: Vec<i64> = queries.iter().map(|q| q.end).collect();
+        let intervals: Vec<i64> = queries.iter().map(|q| q.interval_ms).collect();
+        let m = MultiOpts { starts: Some(&starts), ends: Some(&ends), ..MultiOpts::default() };
+        let r = self.query_buckets_multi(&series, .., Buckets::Intervals(&intervals), QueryOpts::asc(), m)?;
+        r.into_iter()
+            .enumerate()
+            .map(|(index, r)| r.map_err(|error| Error::Batch { index, error: Box::new(error) }))
+            .collect()
     }
 
     /// Runs many inserts in parallel, each all or nothing on its own. Inserts that share a
@@ -363,6 +386,126 @@ impl Pool {
     }
 
     /// Connection `k`; one left behind by a panic (possibly in the middle of a reply) is dropped.
+    /// Runs `f` on the connection in `slot` (made first if it has none or an old one); with
+    /// `retry`, once more on a new connection if this one broke.
+    fn attempt<T>(&self, slot: &mut Option<Conn>, retry: bool, f: impl Fn(&mut Client) -> Result<T>) -> Result<T> {
+        let mut tries = if retry { 2 } else { 1 };
+        loop {
+            tries -= 1;
+            let epoch = self.epoch.load(Ordering::Acquire);
+            if slot.as_ref().is_none_or(|c| c.epoch != epoch || c.client.is_broken()) {
+                *slot = None;
+                *slot = Some(Conn { client: (self.connect)()?, epoch });
+            }
+            let c = slot.as_mut().expect("connected above");
+            let r = f(&mut c.client);
+            if c.client.is_broken() {
+                // the server may have gone away, and with it every connection made before
+                let _ = self.epoch.compare_exchange(c.epoch, c.epoch + 1, Ordering::AcqRel, Ordering::Relaxed);
+                *slot = None;
+                if tries > 0 && r.is_err() {
+                    continue;
+                }
+            }
+            return r;
+        }
+    }
+
+    /// Runs the query `f` on one connection, a free one if there is one (on the caller's thread:
+    /// a multi-series request is one request, which the server spreads over its threads).
+    fn one<T>(&self, f: impl Fn(&mut Client) -> Result<T>) -> Result<T> {
+        let mut slot =
+            (0..self.conns.len()).find_map(|k| self.conns[k].try_lock().ok()).unwrap_or_else(|| self.slot(0));
+        self.attempt(&mut slot, true, f)
+    }
+
+    /// [`Client::query_rows_multi`] on one of the pool's connections (retried once on a new one if it breaks).
+    pub fn query_rows_multi(
+        &self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Rows>>> {
+        let (s, e) = bounds(&range);
+        self.one(|c| c.query_rows_multi(series, s..e, opts, m))
+    }
+
+    /// [`Client::query_lttb_multi`] on one of the pool's connections.
+    pub fn query_lttb_multi(
+        &self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        threshold: u64,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Rows>>> {
+        let (s, e) = bounds(&range);
+        self.one(|c| c.query_lttb_multi(series, s..e, threshold, opts, m))
+    }
+
+    /// [`Client::query_chunks_multi`] on one of the pool's connections (not retried: `f` may have
+    /// seen chunks).
+    pub fn query_chunks_multi<F>(
+        &self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, Result<(&[i64], &Column)>) -> ControlFlow<()>,
+    {
+        let (s, e) = bounds(&range);
+        let f = Mutex::new(f);
+        let mut slot =
+            (0..self.conns.len()).find_map(|k| self.conns[k].try_lock().ok()).unwrap_or_else(|| self.slot(0));
+        self.attempt(&mut slot, false, |c| {
+            let mut f = f.lock().unwrap_or_else(|e| e.into_inner());
+            c.query_chunks_multi(series, s..e, opts, m, &mut *f)
+        })
+    }
+
+    /// [`Client::query_buckets_multi`] on one of the pool's connections.
+    pub fn query_buckets_multi(
+        &self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        b: Buckets<'_>,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Vec<Bucket>>>> {
+        let (s, e) = bounds(&range);
+        self.one(|c| c.query_buckets_multi(series, s..e, b, opts, m))
+    }
+
+    /// [`Client::query_spread_multi`] on one of the pool's connections.
+    pub fn query_spread_multi(
+        &self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        b: Buckets<'_>,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Vec<SpreadBucket>>>> {
+        let (s, e) = bounds(&range);
+        self.one(|c| c.query_spread_multi(series, s..e, b, opts, m))
+    }
+
+    /// [`Client::query_twa_multi`] on one of the pool's connections.
+    pub fn query_twa_multi(
+        &self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        b: Buckets<'_>,
+        opts: TwaOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Vec<TwaBucket>>>> {
+        let (s, e) = bounds(&range);
+        self.one(|c| c.query_twa_multi(series, s..e, b, opts, m))
+    }
+
     fn slot(&self, k: usize) -> MutexGuard<'_, Option<Conn>> {
         self.conns[k].lock().unwrap_or_else(|e| {
             self.conns[k].clear_poison();
@@ -418,26 +561,7 @@ impl Pool {
         let run = |i: usize| {
             // inside the pool every worker has an index of its own, so its connection is its own
             let mut slot = self.slot(rayon::current_thread_index().unwrap_or(0) % self.conns.len());
-            let mut tries = if retry { 2 } else { 1 };
-            loop {
-                tries -= 1;
-                let epoch = self.epoch.load(Ordering::Acquire);
-                if slot.as_ref().is_none_or(|c| c.epoch != epoch || c.client.is_broken()) {
-                    *slot = None;
-                    *slot = Some(Conn { client: (self.connect)()?, epoch });
-                }
-                let c = slot.as_mut().expect("connected above");
-                let r = f(&mut c.client, i);
-                if c.client.is_broken() {
-                    // the server may have gone away, and with it every connection made before
-                    let _ = self.epoch.compare_exchange(c.epoch, c.epoch + 1, Ordering::AcqRel, Ordering::Relaxed);
-                    *slot = None;
-                    if tries > 0 && r.is_err() {
-                        continue;
-                    }
-                }
-                return r;
-            }
+            self.attempt(&mut slot, retry, |c| f(c, i))
         };
         claim_map(Some(&self.workers), self.conns.len(), n, chains, run)
     }

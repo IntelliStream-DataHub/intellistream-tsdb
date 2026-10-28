@@ -38,7 +38,6 @@
 #define MAX_BUCKETS (4u << 20)
 _Static_assert((uint64_t)MAX_BUCKETS * TSDB_AGG_ROW + 64 <= TSDB_MAX_FRAME, "an aggregate reply must fit a frame");
 #define AGG_DENSE_BYTES (32u << 20) /* one dense array of bucket states (bq_window) */
-#define PARALLEL_MIN_GRANULES 8
 #define AGG_STRIPES 64
 #define AGG_STRIPE_SHIFT 10 /* 1024 consecutive buckets share a lock */
 
@@ -59,11 +58,155 @@ void snapshot_release(snapshot *s)
 
 static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start, int64_t end);
 
+/* --------------------------------------------------------------- cuts */
+
+__thread qcuts *cur_cuts;
+
+void qcuts_init(qcuts *cs)
+{
+    memset(cs, 0, sizeof *cs);
+    pthread_mutex_init(&cs->lock, NULL);
+}
+
+static void cut_release(qcut *c)
+{
+    db_release(c->parts, c->np); /* frees the array */
+    for (size_t i = 0; i < c->nms; i++)
+        mt_unref(c->ms[i]);
+    for (size_t i = 0; i < c->ntails; i++)
+        mt_unref(c->tails[i]);
+}
+
+void qcuts_free(qcuts *cs)
+{
+    for (size_t i = 0; i < cs->n; i++) {
+        cut_release(cs->c[i]);
+        free(cs->c[i]);
+    }
+    free(cs->c);
+    pthread_mutex_destroy(&cs->lock);
+    memset(cs, 0, sizeof *cs);
+}
+
+/* The engine as snapshot_take sees it, for every series and time (TWA reads before its start): what a later
+ * snapshot_take would add is a newer part, a new memtable, or rows with a higher lsn. */
+static int cut_take(eng *db, qcut *c)
+{
+    memset(c, 0, sizeof *c);
+    c->db = db;
+    pthread_mutex_lock(&db->lock);
+    c->parts = malloc((db->nparts ? db->nparts : 1) * sizeof *c->parts);
+    if (!c->parts) {
+        pthread_mutex_unlock(&db->lock);
+        return TSDB_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < db->nparts; i++) {
+        part_ref(db->parts[i]);
+        c->parts[c->np++] = db->parts[i];
+    }
+    for (size_t i = 0; i < db->nflushing; i++) {
+        mt_ref(db->flushing[i]);
+        c->ms[c->nms++] = db->flushing[i];
+    }
+    uint64_t visible = db->wal_enabled && db->opt.wal_sync_ms == 0 ? atomic_load(&db->wal_durable) : UINT64_MAX;
+    pthread_mutex_lock(&db->buf_lock);
+    c->visible = MIN(visible, db->wal_appended);
+    if (db->active) {
+        mt_ref(db->active);
+        c->ms[c->nms++] = db->active;
+        c->has_active = true;
+    }
+    for (size_t i = 0; i < db->ntails; i++) {
+        mt_ref(db->tails[i].m);
+        c->tails[c->ntails++] = db->tails[i].m;
+    }
+    c->tail_visible = db->tail_lsn;
+    pthread_mutex_unlock(&db->buf_lock);
+    pthread_mutex_unlock(&db->lock);
+    return 0;
+}
+
+/* The request's cut of db, taken by its first series there. Each cut is allocated on its own: threads read theirs
+ * after the lock is dropped while another volume's first series grows the array of pointers. */
+static int cut_get(qcuts *cs, eng *db, qcut **out)
+{
+    int rc = 0;
+    pthread_mutex_lock(&cs->lock);
+    size_t i = 0;
+    while (i < cs->n && cs->c[i]->db != db)
+        i++;
+    if (i == cs->n) {
+        if (cs->n == cs->cap) {
+            size_t cap = cs->cap ? 2 * cs->cap : 4;
+            qcut **c = realloc(cs->c, cap * sizeof *c);
+            if (!c)
+                rc = TSDB_ERR_NOMEM;
+            else {
+                cs->c = c;
+                cs->cap = cap;
+            }
+        }
+        qcut *c = rc ? NULL : calloc(1, sizeof *c);
+        if (rc == 0 && !c)
+            rc = TSDB_ERR_NOMEM;
+        if (rc == 0 && (rc = cut_take(db, c)) == 0)
+            cs->c[cs->n++] = c;
+        else
+            free(c);
+    }
+    *out = rc ? NULL : cs->c[i];
+    pthread_mutex_unlock(&cs->lock);
+    return rc;
+}
+
+/* snapshot_take from a cut: the same memtable order (tails, flushing, active), each bounded by the cut's lsn */
+static int snapshot_cut(eng *db, const qcut *c, uint32_t series, size_t w, int64_t start, int64_t end,
+                        snapshot *s)
+{
+    int rc = 0;
+    s->parts = malloc((c->np ? c->np : 1) * sizeof *s->parts);
+    s->mem = calloc(c->ntails + c->nms + 1, sizeof *s->mem);
+    if (!s->parts || !s->mem)
+        rc = TSDB_ERR_NOMEM;
+    for (size_t i = 0; rc == 0 && i < c->np; i++) {
+        part *p = c->parts[i];
+        if (p->max_ts >= start && p->min_ts < end) {
+            part_ref(p);
+            s->parts[s->np++] = p;
+        }
+    }
+    bool locked = rc == 0 && (c->ntails || c->has_active);
+    if (locked)
+        pthread_mutex_lock(&db->buf_lock); /* tails and the active memtable may still grow */
+    for (size_t i = 0; rc == 0 && i < c->ntails + c->nms; i++) {
+        bool tail = i < c->ntails;
+        const memtable *m = tail ? c->tails[i] : c->ms[i - c->ntails];
+        mem_run r = {0};
+        rc = mt_collect(m, series, w, start, end, tail ? c->tail_visible : c->visible, &r);
+        if (r.n)
+            s->mem[s->nmem++] = r;
+        else
+            mem_run_free(&r);
+    }
+    if (locked)
+        pthread_mutex_unlock(&db->buf_lock);
+    if (rc == 0)
+        rc = snapshot_prepare(db, s, series, start, end);
+    if (rc)
+        snapshot_release(s);
+    return rc;
+}
+
 /* Parts and memtables as of one instant: a flush publishes its parts and
  * retires its memtable under db->lock, so nothing is seen twice or missed. */
 int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end, snapshot *s)
 {
     memset(s, 0, sizeof *s);
+    if (cur_cuts) {
+        qcut *c;
+        int rc = cut_get(cur_cuts, db, &c);
+        return rc ? rc : snapshot_cut(db, c, series, w, start, end, s);
+    }
     memtable *ms[MAX_FLUSHING];
     size_t nms = 0;
     int rc = 0;
@@ -834,6 +977,17 @@ typedef struct agg_job {
     atomic_int err;
 } agg_job;
 
+uint64_t query_rows_per_thread = QUERY_ROWS_PER_THREAD;
+
+int query_threads_for(const eng *db, uint64_t rows, size_t items)
+{
+    uint64_t per = query_rows_per_thread ? query_rows_per_thread : 1;
+    uint64_t t = rows / per;
+    t = MIN(t, (uint64_t)items);
+    t = MIN(t, (uint64_t)db->opt.query_threads);
+    return t > 1 ? (int)t : 1;
+}
+
 static void agg_worker(void *arg, int idx)
 {
     (void)idx;
@@ -843,10 +997,10 @@ static void agg_worker(void *arg, int idx)
     cur_qstats = j->qs;
     codec_ctx *cc = cc_get(db);
     size_t cap = db->granule_rows;
-    int64_t *ts = malloc(cap * sizeof *ts);
-    uint8_t *v = malloc(cap * sizeof(uint64_t));
-    local_bucket *local = malloc(cap * sizeof *local); /* a granule touches at most count buckets */
-    agg_dev *localx = j->t.accx ? malloc(cap * sizeof *localx) : NULL;
+    int64_t *ts = qscratch_get(0, cap * sizeof *ts);
+    uint8_t *v = qscratch_get(1, cap * sizeof(uint64_t));
+    local_bucket *local = qscratch_get(2, cap * sizeof *local); /* a granule touches at most count buckets */
+    agg_dev *localx = j->t.accx ? qscratch_get(3, cap * sizeof *localx) : NULL;
     if (!cc || !ts || !v || !local || (j->t.accx && !localx)) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
         goto out;
@@ -890,14 +1044,19 @@ static void agg_worker(void *arg, int idx)
                 a = e;
             }
         }
+        int lv = sched_leave();
+        if (lv < 0)
+            atomic_store(&j->err, lv);
+        if (lv)
+            break;
     }
 out:
     if (cc)
         cc_put(db, cc);
-    free(ts);
-    free(v);
-    free(local);
-    free(localx);
+    qscratch_put(ts);
+    qscratch_put(v);
+    qscratch_put(local);
+    qscratch_put(localx);
     cur_qstats = mine;
 }
 
@@ -1279,8 +1438,10 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
         atomic_init(&j->err, 0);
         for (int k = 0; k < AGG_STRIPES; k++)
             pthread_mutex_init(&j->locks[k], NULL);
-        int threads = nwork >= PARALLEL_MIN_GRANULES ? (int)MIN((size_t)db->opt.query_threads, nwork) : 1;
-        pool_run(db->qpool, threads, agg_worker, j);
+        uint64_t rows = 0;
+        for (size_t w = 0; w < nwork; w++)
+            rows += work[w].g->count;
+        sched_run(db->sched, query_threads_for(db, rows, nwork), agg_worker, j);
         for (int k = 0; k < AGG_STRIPES; k++)
             pthread_mutex_destroy(&j->locks[k]);
         rc = atomic_load(&j->err);
@@ -1388,6 +1549,9 @@ static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *
     uint64_t span = (uint64_t)klast - (uint64_t)kfirst + 1;
     if (span > MAX_BUCKETS)
         return TSDB_ERR_TOO_MANY_BUCKETS;
+    if (!qbudget_ok(span * (sizeof(agg_state) + (q->spread ? sizeof(agg_dev) + sizeof(tsdb_spread_bucket)
+                                                            : sizeof(tsdb_bucket)))))
+        return TSDB_ERR_DEFER; /* a multi-series task ahead of the head: run it at its turn */
     size_t dense = agg_dense_buckets ? agg_dense_buckets
                                      : AGG_DENSE_BYTES / (sizeof(agg_state) + (q->spread ? sizeof(agg_dev) : 0));
     if (span <= dense)
@@ -2184,6 +2348,10 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
          * last mean) holds n - lttb_start(nb) <= 2 */
         uint64_t per = (r->n - 2) / r->nb + 2;
         r->buffered = per <= lttb_buffer_bytes / 32;
+        if (r->buffered && !qbudget_ok(per * 32)) {
+            rc = TSDB_ERR_DEFER; /* a multi-series task ahead of the head: run it at its turn */
+            goto out;
+        }
         if (r->buffered) {
             r->cur.ts = malloc(per * sizeof(int64_t));
             r->cur.v = malloc(per * sizeof(uint64_t));
@@ -2260,6 +2428,9 @@ size_t tsdb_struct_size(int kind)
     case TSDB_STRUCT_SPREAD_BUCKET: return sizeof(tsdb_spread_bucket);
     case TSDB_STRUCT_TWA_OPTS: return sizeof(tsdb_twa_opts);
     case TSDB_STRUCT_TWA_BUCKET: return sizeof(tsdb_twa_bucket);
+    case TSDB_STRUCT_MULTI_QUERY: return sizeof(tsdb_multi_query);
+    case TSDB_STRUCT_SERIES_RESULT: return sizeof(tsdb_series_result);
+    case TSDB_STRUCT_MULTI_OPTS: return sizeof(tsdb_multi_opts);
     default: return 0;
     }
 }

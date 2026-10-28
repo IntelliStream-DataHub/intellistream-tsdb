@@ -17,7 +17,7 @@
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 
@@ -46,6 +46,20 @@ pub(crate) const PACKED: u8 = 2;
 pub(crate) const REPLACE_HEADER: usize = 32;
 /// Reply header: len, id, op, status.
 pub(crate) const REPLY_HEADER: usize = 13;
+/// QUERY_MULTI bytes before the per-series arrays (`TSDB_MULTI_HEADER`).
+pub(crate) const MULTI_HEADER: usize = 24;
+/// Series in one QUERY_MULTI (`TSDB_MULTI_MAX_SERIES`); longer lists are split.
+pub(crate) const MULTI_MAX_SERIES: usize = 65536;
+/// A QUERY_MULTI reply frame has the series' u32 index after its status (`TSDB_MULTI_PREFIX`).
+pub(crate) const MULTI_PREFIX: usize = 4;
+/// The index of the END frame (`TSDB_MULTI_END`).
+pub(crate) const MULTI_END: u32 = u32::MAX;
+/// QUERY_MULTI flags (`TSDB_MULTI_PER_START` ...).
+pub(crate) const MULTI_PER_START: u8 = 1;
+pub(crate) const MULTI_PER_END: u8 = 2;
+pub(crate) const MULTI_PER_INTERVAL: u8 = 4;
+pub(crate) const MULTI_TRIM_LO: u8 = 8;
+pub(crate) const MULTI_TRIM_HI: u8 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -71,6 +85,8 @@ pub(crate) enum Op {
     QueryBounds = 20,
     QueryLttb = 21,
     QueryTwa = 22,
+    QueryMulti = 23,
+    Cancel = 24,
     DeleteRange = 25,
     ReplaceRange = 26,
     SetRetention = 27,

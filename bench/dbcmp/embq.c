@@ -7,10 +7,17 @@
  *   embq ENGINE dump DB SPEC [N]            answers of the first N queries of each class (default
  *                                           all), JSON lines in tsdbq's format, for check.py --dumps
  *   embq ENGINE full DB REPS THREADS [OUT]  whole range: count/sum/min/max, buckets of 3600 and 60
- *                                           samples; median of REPS after a warm-up; OUT gets the
- *                                           per-series digests
+ *                                           samples; mean, sd, median, min and max of REPS after a
+ *                                           warm-up; OUT gets the per-series digests
+ *   embq tsdb twa DB REPS THREADS [OUT]     STEP time-weighted average by hour over the whole range;
+ *                                           OUT gets the buckets (ref/twa.jsonl, relq's format)
  *   embq duckdb sql DB "SQL"                run one statement and print the result (EXPLAIN, sizes)
  * ENGINE is tsdb or duckdb; DB is a directory for tsdb and a file for DuckDB.
+ * tsdb only, anywhere after ENGINE: --batch K hands a thread's series to tsdb_query_multi K at a time, with
+ * per-series intervals (full, twa; K = 1: one plain query per series, as without it), and --threads T is
+ * that call's thread cap (tsdb_multi_opts.threads; 0, the default: request_threads). A qps CLASS of the form
+ * NAME.bK (raw.b10) runs NAME's windows K at a time through tsdb_query_multi with per-series starts and
+ * ends; q/s then counts windows, and the latencies are of whole calls.
  *
  * Loading. tsdb takes the file as it is (time-major: every series at sample i, then i + 1),
  * THREADS slices of it through tsdb_insert in batches of 1 M rows, and settles with tsdb_optimize
@@ -74,6 +81,8 @@ static int is_duck;
 static const char *dbpath;
 static q *qs;
 static size_t nq;
+static size_t batch = 1;  /* --batch K, or K of a qps class NAME.bK */
+static int mthreads;      /* --threads T: tsdb_multi_opts.threads */
 
 static double now(void)
 {
@@ -167,6 +176,46 @@ static void tsdb_run(const q *x, ans *r)
     }
     if (rc)
         die("query", tsdb_strerror(rc));
+}
+
+static int multi_count(void *ctx, const tsdb_series_result *r)
+{
+    if (r->status)
+        die("query multi, series", tsdb_strerror(r->status));
+    uint64_t *rows = ctx;
+    if (r->buckets) /* rows in buckets, as tsdb_run counts them */
+        for (size_t i = 0; i < r->n; i++)
+            *rows += ((const tsdb_bucket *)r->buckets)[i].count;
+    else
+        *rows += r->n;
+    return 0;
+}
+
+/* qs[at], qs[at + 1], ... (k of them, wrapping) as one tsdb_query_multi; returns the rows */
+static uint64_t tsdb_batch(size_t at, size_t k)
+{
+    uint32_t *ss = malloc(k * sizeof *ss);
+    int64_t *st = malloc(k * sizeof *st), *en = malloc(k * sizeof *en), *iv = malloc(k * sizeof *iv);
+    for (size_t i = 0; i < k; i++) {
+        const q *x = &qs[(at + i) % nq];
+        ss[i] = x->s;
+        st[i] = x->a;
+        en[i] = x->b;
+        iv[i] = x->bucket;
+    }
+    int agg = qs[at % nq].bucket != 0;
+    tsdb_multi_query m = {.kind = agg ? TSDB_MULTI_BUCKETS : TSDB_MULTI_VALUES, .starts = st, .ends = en,
+                          .intervals = agg ? iv : NULL};
+    tsdb_multi_opts mo = {.threads = mthreads};
+    uint64_t rows = 0;
+    int rc = tsdb_query_multi(tdb, &m, ss, k, &mo, multi_count, &rows);
+    if (rc)
+        die("query multi", tsdb_strerror(rc));
+    free(ss);
+    free(st);
+    free(en);
+    free(iv);
+    return rows;
 }
 
 typedef struct tload {
@@ -522,8 +571,12 @@ static void *qps_run(void *arg)
     double t0 = now();
     for (size_t i = (size_t)j->id; now() - t0 < j->seconds; i += (size_t)j->threads) {
         double a = now();
-        run_one(c, &qs[i % nq], &r);
-        j->rows += r.n;
+        if (batch > 1)
+            j->rows += tsdb_batch(i * batch, batch);
+        else {
+            run_one(c, &qs[i % nq], &r);
+            j->rows += r.n;
+        }
         if (j->n == cap)
             j->lat = realloc(j->lat, (cap = cap ? cap * 2 : 4096) * sizeof(double));
         j->lat[j->n++] = now() - a;
@@ -557,9 +610,9 @@ static void qps(const char *cls, int threads, double seconds)
         for (size_t k = 0; k < jobs[i].n; k++)
             all[m++] = jobs[i].lat[k];
     qsort(all, m, sizeof *all, cmpd);
-    printf("%s %s c=%d: %zu queries in %.2f s = %.1f q/s, median %.3f ms, p99 %.3f ms (%" PRIu64 " rows)\n",
-           is_duck ? "duckdb" : "tsdb", cls, threads, total, secs, total / secs, all[m / 2] * 1e3,
-           all[(size_t)(m * 0.99)] * 1e3, rows);
+    printf("%s %s c=%d: %zu queries in %.2f s = %.1f q/s, median %.3f ms, p99 %.3f ms%s (%" PRIu64 " rows)\n",
+           is_duck ? "duckdb" : "tsdb", cls, threads, total * batch, secs, total * batch / secs, all[m / 2] * 1e3,
+           all[(size_t)(m * 0.99)] * 1e3, batch > 1 ? " per call" : "", rows);
 }
 
 static void dump(size_t per)
@@ -638,32 +691,117 @@ static void duck_full(dctx *d, int64_t nsamp, digest out)
 }
 
 typedef struct fjob {
-    int id, threads;
+    int id, threads, twa;
     int64_t nsamp;
     double (*out)[5];
 } fjob;
 
+static tsdb_twa_bucket *twa_out[100];
+static size_t twa_n[100];
+
+static void full_keep(const fjob *j, uint32_t s, const void *b, size_t nb)
+{
+    if (j->twa) {
+        free(twa_out[s]);
+        twa_out[s] = malloc(nb * sizeof(tsdb_twa_bucket) + 1);
+        if (nb)
+            memcpy(twa_out[s], b, nb * sizeof(tsdb_twa_bucket));
+        twa_n[s] = nb;
+        return;
+    }
+    double *o = j->out[s];
+    memset(o, 0, 5 * sizeof *o);
+    for (size_t i = 0; i < nb; i++) {
+        const tsdb_bucket *x = (const tsdb_bucket *)b + i;
+        o[0] += (double)x->count;
+        o[1] += x->sum;
+        o[2] += x->min;
+        o[3] += x->max;
+        o[4] += 1;
+    }
+}
+
+static int64_t full_interval(const fjob *j, uint32_t s) { return j->twa ? 3600000 : j->nsamp * STEP[s % 7]; }
+
 static void *tsdb_full_run(void *arg)
 {
     fjob *j = arg;
+    tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
+    uint32_t ss[100];
+    int64_t iv[100];
+    size_t k = 0;
     for (uint32_t s = (uint32_t)j->id; s < 100; s += (uint32_t)j->threads) {
-        tsdb_bucket *b;
-        size_t nb;
-        int rc = tsdb_query_agg(tdb, s, INT64_MIN, INT64_MAX, j->nsamp * STEP[s % 7], &b, &nb);
-        if (rc)
-            die("agg", tsdb_strerror(rc));
-        double *o = j->out[s];
-        memset(o, 0, 5 * sizeof *o);
-        for (size_t i = 0; i < nb; i++) {
-            o[0] += (double)b[i].count;
-            o[1] += b[i].sum;
-            o[2] += b[i].min;
-            o[3] += b[i].max;
-            o[4] += 1;
+        if (batch > 1) {
+            ss[k] = s;
+            iv[k++] = full_interval(j, s);
+            continue;
         }
+        void *b;
+        size_t nb;
+        int rc = j->twa ? tsdb_query_twa(tdb, s, INT64_MIN, INT64_MAX, 3600000, &to, (tsdb_twa_bucket **)&b, &nb)
+                        : tsdb_query_agg(tdb, s, INT64_MIN, INT64_MAX, full_interval(j, s), (tsdb_bucket **)&b, &nb);
+        if (rc)
+            die(j->twa ? "twa" : "agg", tsdb_strerror(rc));
+        full_keep(j, s, b, nb);
         free(b);
     }
+    for (size_t at = 0; at < k; at += batch) {
+        size_t m = k - at < batch ? k - at : batch;
+        tsdb_multi_query mq = {.kind = j->twa ? TSDB_MULTI_TWA : TSDB_MULTI_BUCKETS, .start = INT64_MIN,
+                               .end = INT64_MAX, .intervals = iv + at, .twa = to};
+        tsdb_multi_opts mo = {.threads = mthreads};
+        tsdb_series_result *r;
+        int rc = tsdb_query_multi_collect(tdb, &mq, ss + at, m, &mo, &r);
+        if (rc)
+            die("query multi", tsdb_strerror(rc));
+        for (size_t i = 0; i < m; i++) {
+            if (r[i].status)
+                die("query multi, series", tsdb_strerror(r[i].status));
+            full_keep(j, ss[at + i], r[i].buckets, r[i].n);
+        }
+        tsdb_series_results_free(r, m);
+    }
     return NULL;
+}
+
+/* REPS timed runs after a warm-up (run 0); prints mean, sd, median, min and max */
+static void full_time(const char *name, int reps, int threads, int twa, int64_t nsamp, dctx *d, digest dg)
+{
+    double t[101], sum = 0, ss = 0;
+    if (reps < 1 || reps > 100 || threads < 1 || threads > 256)
+        die("full", "REPS from 1 to 100, THREADS from 1 to 256");
+    for (int r = 0; r <= reps; r++) {
+        double a = now();
+        if (is_duck)
+            duck_full(d, nsamp, dg);
+        else {
+            pthread_t th[256];
+            fjob jobs[256];
+            for (int i = 0; i < threads; i++) {
+                jobs[i] = (fjob){.id = i, .threads = threads, .twa = twa, .nsamp = nsamp, .out = dg};
+                pthread_create(&th[i], NULL, tsdb_full_run, &jobs[i]);
+            }
+            for (int i = 0; i < threads; i++)
+                pthread_join(th[i], NULL);
+        }
+        if (r)
+            t[r - 1] = now() - a;
+    }
+    for (int r = 0; r < reps; r++)
+        sum += t[r];
+    double mean = sum / reps;
+    for (int r = 0; r < reps; r++)
+        ss += (t[r] - mean) * (t[r] - mean);
+    qsort(t, (size_t)reps, sizeof *t, cmpd);
+    char how[64];
+    if (is_duck)
+        snprintf(how, sizeof how, "one query");
+    else
+        snprintf(how, sizeof how, "%d thread%s batch %zu threads %d", threads, threads == 1 ? "" : "s", batch,
+                 mthreads);
+    printf("%s %s %-30s %s: mean %.4f s sd %.4f, median %.4f (min %.4f, max %.4f, %d runs)\n",
+           is_duck ? "duckdb" : "tsdb", twa ? "twa " : "full", name, how, mean,
+           reps > 1 ? sqrt(ss / (reps - 1)) : 0.0, t[reps / 2], t[0], t[reps - 1], reps);
 }
 
 static void full(int reps, int threads, const char *outpath)
@@ -674,30 +812,7 @@ static void full(int reps, int threads, const char *outpath)
     dctx *d = is_duck ? duck_ctx() : NULL;
     static digest dg;
     for (int k = 0; k < 3; k++) {
-        double t[64];
-        for (int r = 0; r <= reps; r++) {
-            double a = now();
-            if (is_duck)
-                duck_full(d, sizes[k], dg);
-            else {
-                pthread_t th[256];
-                fjob jobs[256];
-                for (int i = 0; i < threads; i++) {
-                    jobs[i] = (fjob){i, threads, sizes[k], dg};
-                    pthread_create(&th[i], NULL, tsdb_full_run, &jobs[i]);
-                }
-                for (int i = 0; i < threads; i++)
-                    pthread_join(th[i], NULL);
-            }
-            if (r)
-                t[r - 1] = now() - a; /* run 0 is the warm-up */
-        }
-        qsort(t, (size_t)reps, sizeof *t, cmpd);
-        printf("%s full %-30s %s: median %.4f s (min %.4f, max %.4f, %d runs)\n", is_duck ? "duckdb" : "tsdb",
-               names[k], is_duck ? "one query" : threads == 1 ? "1 thread" : "threads", t[reps / 2], t[0],
-               t[reps - 1], reps);
-        if (!is_duck && threads > 1)
-            printf("  (%d threads, one series per query)\n", threads);
+        full_time(names[k], reps, threads, 0, sizes[k], d, dg);
         if (out)
             for (int s = 0; s < 100; s++)
                 fprintf(out, "{\"full\":%" PRId64 ",\"s\":%d,\"d\":[%.17g,%.17g,%.17g,%.17g,%.17g]}\n", sizes[k], s,
@@ -707,6 +822,29 @@ static void full(int reps, int threads, const char *outpath)
         duck_ctx_free(d);
     if (out)
         fclose(out);
+}
+
+static void twa(int reps, int threads, const char *outpath)
+{
+    static digest dg;
+    full_time("STEP by hour", reps, threads, 1, 0, NULL, dg);
+    size_t tot = 0;
+    for (int s = 0; s < 100; s++)
+        tot += twa_n[s];
+    printf("twa: %zu buckets\n", tot);
+    if (!outpath)
+        return;
+    FILE *f = fopen(outpath, "w");
+    if (!f)
+        die(outpath, "cannot open");
+    for (int s = 0; s < 100; s++) {
+        fprintf(f, "{\"s\":%d,\"b\":[", s);
+        for (size_t i = 0; i < twa_n[s]; i++)
+            fprintf(f, "%s[%ld,%.17g,%ld,%lu]", i ? "," : "", (long)twa_out[s][i].start, twa_out[s][i].area,
+                    (long)twa_out[s][i].covered_ms, (unsigned long)twa_out[s][i].count);
+        fprintf(f, "]}\n");
+    }
+    fclose(f);
 }
 
 static void sql(const char *text)
@@ -728,14 +866,43 @@ static void sql(const char *text)
     duckdb_disconnect(&c);
 }
 
+/* removes --batch K and --threads T from argv */
+static int take_opts(int *argc, char **argv)
+{
+    int o = 1;
+    for (int i = 1; i < *argc; i++) {
+        if (i + 1 < *argc && (!strcmp(argv[i], "--batch") || !strcmp(argv[i], "--threads"))) {
+            long v = atol(argv[i + 1]);
+            if (argv[i][2] == 'b' ? v < 1 || v > 100 : v < 0 || v > 1024) {
+                fprintf(stderr, "embq: %s %s: out of range\n", argv[i], argv[i + 1]);
+                return -1;
+            }
+            if (argv[i][2] == 'b')
+                batch = (size_t)v;
+            else
+                mthreads = (int)v;
+            i++;
+            continue;
+        }
+        argv[o++] = argv[i];
+    }
+    *argc = o;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (take_opts(&argc, argv))
+        return 2;
     if (argc < 4 || (strcmp(argv[1], "tsdb") && strcmp(argv[1], "duckdb"))) {
         fprintf(stderr, "usage: embq tsdb|duckdb load DB DATA THREADS | qps DB SPEC CLASS THREADS SECONDS |\n"
-                        "       dump DB SPEC [N] | full DB REPS THREADS [OUT] | sql DB SQL (duckdb)\n");
+                        "       dump DB SPEC [N] | full DB REPS THREADS [OUT] | twa DB REPS THREADS [OUT] (tsdb) |\n"
+                        "       sql DB SQL (duckdb); tsdb: --batch K, --threads T, qps class NAME.bK\n");
         return 2;
     }
     is_duck = !strcmp(argv[1], "duckdb");
+    if (is_duck && (batch > 1 || mthreads))
+        die("duckdb", "--batch and --threads are for tsdb");
     const char *cmd = argv[2];
     dbpath = argv[3];
     if (!strcmp(cmd, "load") && argc == 6) {
@@ -757,13 +924,27 @@ int main(int argc, char **argv)
     } else
         tdb = tsdb_open_or_die(dbpath);
     if (!strcmp(cmd, "qps") && argc == 8) {
-        load_spec(argv[4], argv[5]);
+        char base[16];
+        snprintf(base, sizeof base, "%s", argv[5]);
+        char *dot = strstr(base, ".b");
+        if (dot) {
+            long k = atol(dot + 2);
+            if (is_duck || k < 1 || k > 65536)
+                die(argv[5], "class NAME.bK: tsdb only, K from 1 to 65536");
+            batch = (size_t)k;
+            *dot = 0;
+        }
+        load_spec(argv[4], base);
+        if (!nq)
+            die(argv[5], "no queries of that class");
         qps(argv[5], atoi(argv[6]), atof(argv[7]));
     } else if (!strcmp(cmd, "dump") && argc >= 5) {
         load_spec(argv[4], NULL);
         dump(argc > 5 ? strtoull(argv[5], NULL, 10) : SIZE_MAX);
     } else if (!strcmp(cmd, "full") && argc >= 6)
         full(atoi(argv[4]), atoi(argv[5]), argc > 6 ? argv[6] : NULL);
+    else if (!strcmp(cmd, "twa") && argc >= 6 && !is_duck)
+        twa(atoi(argv[4]), atoi(argv[5]), argc > 6 ? argv[6] : NULL);
     else if (!strcmp(cmd, "sql") && argc == 5 && is_duck)
         sql(argv[4]);
     else {

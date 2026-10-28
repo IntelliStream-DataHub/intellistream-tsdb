@@ -75,7 +75,9 @@ typedef struct tsdb_options {
                               * a power loss (not a process crash) can leave files that fail their checks
                               * at the next open, which then needs an operator (docs/design.md) */
     int merge_threads;       /* background merge threads; default 2, 0 disables merges */
-    int query_threads;       /* threads for one query; default: every logical CPU */
+    int query_threads;       /* threads of the database's query scheduler, the calling threads included (it
+                              * starts query_threads - 1 helpers, shared by every volume); default: every
+                              * logical CPU */
     size_t buffer_rows;      /* memtable rows before it is flushed into parts; default 1M */
     int flush_interval_ms;   /* memtable age before it is flushed into parts; default 5000 */
     int wal_sync_ms;         /* 0: every small write waits for fsync (group commit, default);
@@ -108,6 +110,8 @@ typedef struct tsdb_options {
                               * is not one yet, with the checks of tsdb_volume_add. 0: such a path is
                               * TSDB_ERR_NOTFOUND, and volumes are added only by tsdb_volume_add(_dir). tsdbd and
                               * tsdb-cli set 0: a client must not choose where the server writes */
+    int request_threads;     /* threads one query (or one tsdb_query_multi call) uses at most, its caller
+                              * included; 0 (default): query_threads */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -510,6 +514,95 @@ int tsdb_query_twa_group(tsdb *db, uint32_t series, int64_t start, int64_t end, 
 int tsdb_query_twa_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                           const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 
+/* ---- many series in one call ----
+ * tsdb_query_multi answers series[0 .. n-1] with one query each, as the single-series function of q->kind would
+ * (the same arguments, results, statuses and statistics), on up to `threads` threads of the database's query
+ * scheduler, and hands the results to fn in index order: every call for series i before the first for i + 1.
+ *  - TSDB_MULTI_VALUES: tsdb_query_values with q->opts. LTTB: tsdb_query_lttb_ex with q->threshold, q->opts.
+ *  - BUCKETS, SPREAD, TWA: with bounds (nbounds > 0) tsdb_query_bounds, _spread_bounds, _twa_bounds; else with a
+ *    group tsdb_query_group_local, _spread_group_local, _twa_group_local (any zone); else tsdb_query_agg_ex,
+ *    _spread, _twa with interval_ms (0: one bucket). TWA takes q->twa (its order and limit), the others q->opts.
+ *  - starts, ends, intervals: per-series values instead of start, end and interval_ms where not NULL.
+ *  - trim (with bounds): TSDB_MULTI_TRIM_LO starts series i's bounds at the last one at or before its first row
+ *    in range, TSDB_MULTI_TRIM_HI ends them at the last one at or before its last row (a series without rows then
+ *    has no buckets). That is what a client does for local periods, so one union of bounds serves every series.
+ * Calls to fn: VALUES and LTTB send rows (ts, values in the API widths, valid as in tsdb_values) in one or more
+ * calls with last = 0 and then one with n = 0 and last = 1, or all of them in one call with last = 1; the other
+ * kinds send one call with `buckets` pointing at n tsdb_bucket, tsdb_spread_bucket or tsdb_twa_bucket. status is
+ * the series' error (n = 0, last = 1): one series failing does not end the call. Rows sent for a series before
+ * its error status are not an answer: drop them (whether any come first depends on timing). An unknown id has
+ * status 0 and no rows. The pointers are valid during the call only. fn returning nonzero ends the call
+ * (TSDB_ERR_STOPPED).
+ * Every series of one call reads the same instant of each volume: an insert is seen by all of them or by none
+ * (volumes are written independently, so this holds per volume).
+ * Returns 0, TSDB_ERR_STOPPED (fn or mo->cancelled), TSDB_ERR_TOO_MANY_BUCKETS (more than max_rows rows or buckets
+ * in total; the series that would pass it is not sent), TSDB_ERR_INVALID or TSDB_ERR_NOMEM. Statistics
+ * (tsdb_last_query_stats) are the sums over the series. mo may be NULL:
+ *  - threads: 0 means tsdb_options.request_threads; more is clamped to it.
+ *  - max_rows: 0 means no limit. max_held_bytes: results finished ahead of their turn, held at most (0: 64 MiB).
+ *  - cancelled: polled between series. on_wait(+1 / -1): around the caller's waits for another thread's series.
+ *    budget_take (nonzero: refused) and budget_give: memory held ahead, for a server's request budget; when it is
+ *    refused, the call goes on one series at a time. on_deferred: a series that ran ahead was too large to hold
+ *    (or its memory was refused) and runs again at its turn. Hooks may be NULL. */
+typedef enum {
+    TSDB_MULTI_VALUES = 1,
+    TSDB_MULTI_BUCKETS,
+    TSDB_MULTI_SPREAD,
+    TSDB_MULTI_TWA,
+    TSDB_MULTI_LTTB,
+} tsdb_multi_kind;
+
+#define TSDB_MULTI_TRIM_LO 1u
+#define TSDB_MULTI_TRIM_HI 2u
+
+typedef struct tsdb_multi_query {
+    tsdb_multi_kind kind;
+    int64_t start, end;
+    const int64_t *starts, *ends; /* per series, or NULL */
+    tsdb_query_opts opts;
+    int64_t interval_ms;
+    const int64_t *intervals; /* per series, or NULL */
+    const tsdb_group *group;  /* any zone */
+    const int64_t *bounds;
+    size_t nbounds;
+    unsigned trim;
+    size_t threshold; /* LTTB */
+    tsdb_twa_opts twa;
+} tsdb_multi_query;
+
+typedef struct tsdb_series_result {
+    size_t index; /* into series[] */
+    uint32_t series;
+    int status;
+    int last; /* the series' last call */
+    size_t n;
+    const int64_t *ts;  /* VALUES, LTTB */
+    tsdb_values values; /* VALUES, LTTB */
+    const void *buckets; /* BUCKETS, SPREAD, TWA */
+} tsdb_series_result;
+
+typedef int (*tsdb_multi_fn)(void *ctx, const tsdb_series_result *r);
+
+typedef struct tsdb_multi_opts {
+    int threads;
+    uint64_t max_rows;
+    size_t max_held_bytes;
+    int (*cancelled)(void *ctx);
+    void (*on_wait)(void *ctx, int delta);
+    int (*budget_take)(void *ctx, size_t bytes);
+    void (*budget_give)(void *ctx, size_t bytes);
+    void (*on_deferred)(void *ctx); /* a series is rerun at its turn (for a server's metrics) */
+    void *hook_ctx;
+} tsdb_multi_opts;
+
+int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+                     const tsdb_multi_opts *mo, tsdb_multi_fn fn, void *ctx);
+/* The same into out[n] (index order, one result per series, rows of VALUES joined); free with
+ * tsdb_series_results_free. A per-series status is in out[i].status; the return value is the call's. */
+int tsdb_query_multi_collect(tsdb *db, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+                             const tsdb_multi_opts *mo, tsdb_series_result **out);
+void tsdb_series_results_free(tsdb_series_result *r, size_t n);
+
 /* ---- query statistics ----
  * What the calling thread's last query did, like ClickHouse's "Processed N
  * rows, M MB": rows it covered (decoded, answered from granule statistics, or
@@ -613,6 +706,9 @@ typedef enum tsdb_struct_kind {
     TSDB_STRUCT_SPREAD_BUCKET = 9,
     TSDB_STRUCT_TWA_OPTS = 10,
     TSDB_STRUCT_TWA_BUCKET = 11,
+    TSDB_STRUCT_MULTI_QUERY = 12,
+    TSDB_STRUCT_SERIES_RESULT = 13,
+    TSDB_STRUCT_MULTI_OPTS = 14,
 } tsdb_struct_kind;
 size_t tsdb_struct_size(int kind);
 

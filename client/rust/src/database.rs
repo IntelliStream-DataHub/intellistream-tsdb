@@ -6,7 +6,9 @@ use std::ops::{ControlFlow, RangeBounds};
 
 use crate::client::Client;
 use crate::error::Result;
-use crate::types::{Bucket, Group, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts};
+use crate::types::{
+    Bucket, Buckets, Group, MultiOpts, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts,
+};
 use crate::value::{Column, ColumnRef, Value, ValueType};
 
 /// What both a remote [`Client`] and an embedded `Db` (feature `embedded`) can do.
@@ -116,6 +118,55 @@ pub trait Database {
         threshold: u64,
         opts: QueryOpts,
     ) -> Result<Rows>;
+    fn query_rows_multi(
+        &mut self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Rows>>>;
+    fn query_lttb_multi(
+        &mut self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        threshold: u64,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Rows>>>;
+    fn query_chunks_multi<F>(
+        &mut self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+        f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, Result<(&[i64], &Column)>) -> ControlFlow<()>;
+    fn query_buckets_multi(
+        &mut self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        b: Buckets<'_>,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Vec<Bucket>>>>;
+    fn query_spread_multi(
+        &mut self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        b: Buckets<'_>,
+        opts: QueryOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Vec<SpreadBucket>>>>;
+    fn query_twa_multi(
+        &mut self,
+        series: &[u32],
+        range: impl RangeBounds<i64>,
+        b: Buckets<'_>,
+        opts: TwaOpts,
+        m: MultiOpts<'_>,
+    ) -> Result<Vec<Result<Vec<TwaBucket>>>>;
     fn delete_range(&mut self, series: u32, range: impl RangeBounds<i64>) -> Result<()>;
     fn replace_range<'a>(
         &mut self,
@@ -242,6 +293,27 @@ macro_rules! forward {
             }
             fn query_lttb(&mut self, series: u32, range: impl RangeBounds<i64>, threshold: u64, opts: QueryOpts) -> Result<Rows> {
                 <$t>::query_lttb(self, series, range, threshold, opts)
+            }
+            fn query_rows_multi(&mut self, series: &[u32], range: impl RangeBounds<i64>, opts: QueryOpts, m: MultiOpts<'_>) -> Result<Vec<Result<Rows>>> {
+                <$t>::query_rows_multi(self, series, range, opts, m)
+            }
+            fn query_lttb_multi(&mut self, series: &[u32], range: impl RangeBounds<i64>, threshold: u64, opts: QueryOpts, m: MultiOpts<'_>) -> Result<Vec<Result<Rows>>> {
+                <$t>::query_lttb_multi(self, series, range, threshold, opts, m)
+            }
+            fn query_chunks_multi<F>(&mut self, series: &[u32], range: impl RangeBounds<i64>, opts: QueryOpts, m: MultiOpts<'_>, f: F) -> Result<()>
+            where
+                F: FnMut(usize, Result<(&[i64], &Column)>) -> ControlFlow<()>,
+            {
+                <$t>::query_chunks_multi(self, series, range, opts, m, f)
+            }
+            fn query_buckets_multi(&mut self, series: &[u32], range: impl RangeBounds<i64>, b: Buckets<'_>, opts: QueryOpts, m: MultiOpts<'_>) -> Result<Vec<Result<Vec<Bucket>>>> {
+                <$t>::query_buckets_multi(self, series, range, b, opts, m)
+            }
+            fn query_spread_multi(&mut self, series: &[u32], range: impl RangeBounds<i64>, b: Buckets<'_>, opts: QueryOpts, m: MultiOpts<'_>) -> Result<Vec<Result<Vec<SpreadBucket>>>> {
+                <$t>::query_spread_multi(self, series, range, b, opts, m)
+            }
+            fn query_twa_multi(&mut self, series: &[u32], range: impl RangeBounds<i64>, b: Buckets<'_>, opts: TwaOpts, m: MultiOpts<'_>) -> Result<Vec<Result<Vec<TwaBucket>>>> {
+                <$t>::query_twa_multi(self, series, range, b, opts, m)
             }
             fn delete_range(&mut self, series: u32, range: impl RangeBounds<i64>) -> Result<()> {
                 <$t>::delete_range(self, series, range)

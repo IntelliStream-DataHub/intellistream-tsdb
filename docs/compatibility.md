@@ -8,7 +8,7 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 |---|---|---|
 | release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.9.0 |
 | disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 6 |
-| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 9 |
+| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 10 |
 
 ## What 0.9.x promises
 
@@ -35,7 +35,7 @@ volume path, for example, changes both). So:
 - **Use the same release for the server and its clients.** On connect a client sends `HELLO` with the
   protocol version it speaks, and the server answers with the lower of its own and the client's. A client
   never sends what that version does not know. If a client asks for something that needs a newer server
-  (the spread needs 8, a limit with an order needs 9), the call fails with `TSDB_ERR_INVALID` without
+  (the spread needs 8, a limit with an order needs 9, many series in one request 10), the call fails with `TSDB_ERR_INVALID` without
   sending it. A server of an older protocol than the client's, and a client of an older protocol than the
   server's, thus work for the operations both know; operations that came later fail. Across a 0.9.x
   release that changed the protocol we do not promise more than that: upgrade the server and its clients

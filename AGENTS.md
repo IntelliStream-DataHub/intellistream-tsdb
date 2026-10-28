@@ -68,6 +68,13 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable.
 - `src/merge.c`: merge selection and execution. `src/query.c`: snapshots, raw
   queries, aggregation, bucketing. `src/manifest.c`: MANIFEST, retired parts, followers.
+- `src/sched.c`: the query scheduler, one per `tsdb` handle (`query_threads - 1` helpers): fork/join jobs, one
+  group per outermost query or multi-series call capped at `request_threads`, the caller always works.
+  `query_threads_for` (query.c) picks the threads one query step uses from the rows it decodes
+  (`QUERY_ROWS_PER_THREAD`, `TWA_ROW_WEIGHT`, measured with `build/threads-bench`; `tests/test_threads.c` checks
+  that answers are bit-identical at every count).
+- `src/multi.c`: `tsdb_query_multi`, many series in one call from one cut of every volume (`cur_cuts`), delivered
+  in index order; series ahead of the head run under a memory budget (`cur_budget`) or are deferred to their turn.
 - `src/codec*.c`: codecs; `src/simd.c`: dispatched aggregation kernels.
   `src/levels.h`: the functions compiled once per CPU level in `make dist`;
   `src/cpu.c`: picks the level at startup and dispatches to it.
@@ -179,7 +186,9 @@ cgroup, so `nice` does not keep your work out of its way.
   other write. Aggregates skip nulls; integer sums are exact (128 bits).
 - **Lock order:** `flush_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`. The `crashfs` lock in tests is
-  innermost.
+  innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
+  `fn`, a query or the callback runs, nor while an engine lock is taken. A job's `fn` waits only for the items of its
+  own nested jobs (a fork/join tree), never for a lock another job's worker may hold while waiting for helpers.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
 - **Versions.** The release version is the file `VERSION` (0.9.0); `tools/check-version.sh` compares it with
@@ -208,8 +217,9 @@ cgroup, so `nice` does not keep your work out of its way.
   `make test-clients` green. History so far: version 2 typed operations, 3
   packed inserts, 4 QUERY_BOUNDS (the server knows UTC only), 5 LTTB, 6 TWA,
   7 range delete, replace and retention, 8 the spread in bucket replies, 9
-  order and limit for LTTB (and early-stopping limits on bucketed queries).
-  All four clients speak 9 and gate each call on the version HELLO answered;
+  order and limit for LTTB (and early-stopping limits on bucketed queries), 10
+  QUERY_MULTI (many series in one request, one snapshot) and CANCEL.
+  All four clients speak 10 and gate each call on the version HELLO answered;
   the embedded bindings (Rust `Db`, Python `Db`, Java `EmbeddedDb`) have the
   same operations, and their tests compare them with tsdbd's answers.
 

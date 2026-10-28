@@ -9,6 +9,22 @@ disk format and the wire protocol.
 ## [Unreleased]
 
 ### Added
+- Many series in one request (protocol 10): QUERY_MULTI answers values, buckets (fixed, calendar in any zone,
+  bounds), the spread, TWA and LTTB for up to 65,536 series in one request, in the order asked, every series
+  read from one snapshot (an insert into several series is seen by all of them or none), with a status per
+  series. The server runs the series in parallel under a memory budget (results held ahead of their turn are
+  charged to `--max-request-memory`; large series run at their turn, streaming). CANCEL stops a running
+  request. Embedded: `tsdb_query_multi`, `tsdb_query_multi_collect`. Clients: `tsdbc_query_multi` (C),
+  `query_{rows,buckets,spread,twa,lttb}_multi` and `query_chunks_multi` (Rust `Client`, `Pool`, `Db`), the
+  same five in Python with numpy columns and `errors="raise"|"status"`, `query*Multi` in Java `TsdbClient` and
+  `EmbeddedDb`. Longer lists are split by the clients; local time zones are handled by the clients as for
+  single series.
+- tsdbd `--query-threads N` (threads for queries, default one per CPU), `--request-threads N` (at most this many
+  for one request, default all) and `--multi-max-rows N` (rows or buckets of one QUERY_MULTI, default
+  268,435,456); `tsdb_options.request_threads`. Metrics `tsdb_multi_series_total`, `tsdb_multi_deferred_total`
+  and `tsdb_requests_total{op="query_multi"}`.
+- Benchmarks: `tsdbc-bench query --multi K`, TWA and whole-range classes; `bench/dbcmp` `tsdbq`/`embq`
+  `--batch K`, `twa` and qps classes `NAME.bK`; `build/threads-bench`, one thread against many per work size.
 - The Rust, Python and Java clients and the three embedded bindings at protocol 9: the spread (range, variance,
   standard deviation) in fixed, calendar and bounds buckets; time-weighted averages (step or linear, a gap limit,
   order and limit); LTTB with an order and a limit; aggregates with an order and a limit that stop early. The
@@ -32,6 +48,14 @@ disk format and the wire protocol.
   synced once at the end and then renamed to its name, so an interrupted one leaves no database under that name.
 
 ### Changed
+- The wire protocol is version 10. Clients of this release speak it and gate the new calls on the server's HELLO.
+- One query scheduler per database instead of a thread pool per volume: concurrent queries share the CPUs by
+  groups capped at `request_threads`, the calling thread always works, and decoding of series already started
+  comes before new series.
+- The threads one query step uses follow the rows it decodes (`QUERY_ROWS_PER_THREAD`, measured) instead of a
+  fixed cliff at 8 granules: small reads stay on one thread. Answers are bit-identical at any thread count.
+- Rust `Db::query_points_many` and `query_agg_many` (and Python's `Db` batch calls over them) run through
+  `tsdb_query_multi` instead of one query per rayon task.
 - Python: aggregate queries (`query_agg`, `query_group`, `query_bounds` and the rest) return `Buckets` instead of
   a list of `Bucket`: a `collections.abc.Sequence` of `Bucket` (indexing, slices, iteration, `+` and `==` with
   lists, `count()`, `index()`), with a numpy column per field (`start`, `counts`, `sum`, `min`, `max`, `avg`,

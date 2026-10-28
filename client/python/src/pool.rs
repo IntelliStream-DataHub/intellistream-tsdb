@@ -17,7 +17,7 @@ use ::tsdb_client as tc;
 use tc::ValueType;
 
 use crate::arrays::{BucketsMany, agg_queries, inserts, many_cols, points_list, range_queries, with_batches};
-use crate::{closed, connect, opts, seconds, to_pyerr};
+use crate::{closed, connect, multi, opts, seconds, to_pyerr};
 
 /// A pool of connections to tsdbd for batch calls that use them all at once.
 ///
@@ -61,6 +61,12 @@ impl Pool {
     {
         py.detach(|| f(self.pool.read().unwrap_or_else(|e| e.into_inner()).as_ref().ok_or_else(closed)?))
             .map_err(|e| to_pyerr(py, e))
+    }
+
+    /// Runs a multi-series call (query_*_multi()) on one of the connections.
+    fn multi(&self, py: Python<'_>, q: multi::Req) -> PyResult<Py<multi::Many>> {
+        let p = self.with(py, |pool| multi::run(multi::Target::Pool(pool), &q))?;
+        multi::finish(py, q, p)
     }
 
     /// The type of each series in `ids`, looked up once (a lookup that failed is an error of its
@@ -206,5 +212,130 @@ impl Pool {
     fn insert_many(&self, py: Python<'_>, batches: &Bound<'_, PyAny>, value_type: Option<&str>) -> PyResult<()> {
         let b = inserts(batches, value_type.map(crate::value_type).transpose()?, |ids| self.types(py, ids))?;
         self.with(py, |p| with_batches(&b, |b| p.insert_many(b)))
+    }
+
+    /// As Client.query_values_multi() (on one of the connections).
+    #[pyo3(signature = (series, start = None, end = None, *, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise", numpy = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_values_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<multi::Many>> {
+        self.multi(
+            py,
+            multi::Req::new(multi::Kind::Values, series, start, end, order, limit, threads, max_rows, errors)?
+                .numpy(numpy),
+        )
+    }
+
+    /// As Client.query_lttb_multi() (on one of the connections).
+    #[pyo3(signature = (series, threshold, start = None, end = None, *, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise", numpy = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_lttb_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        threshold: u64,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<multi::Many>> {
+        self.multi(
+            py,
+            multi::Req::new(multi::Kind::Lttb, series, start, end, order, limit, threads, max_rows, errors)?
+                .threshold(threshold)
+                .numpy(numpy),
+        )
+    }
+
+    /// As Client.query_buckets_multi() (on one of the connections).
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = None, *, unit = None, count = 1,
+                        timezone = None, bounds = None, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise"))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_buckets_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        interval_ms: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+        count: u32,
+        timezone: Option<&Bound<'_, PyAny>>,
+        bounds: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+    ) -> PyResult<Py<multi::Many>> {
+        let q = multi::Req::new(multi::Kind::Buckets, series, start, end, order, limit, threads, max_rows, errors)?;
+        self.multi(py, q.buckets(interval_ms, unit, count, timezone, bounds)?)
+    }
+
+    /// As Client.query_spread_multi() (on one of the connections).
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = None, *, unit = None, count = 1,
+                        timezone = None, bounds = None, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise"))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_spread_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        interval_ms: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+        count: u32,
+        timezone: Option<&Bound<'_, PyAny>>,
+        bounds: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+    ) -> PyResult<Py<multi::Many>> {
+        let q = multi::Req::new(multi::Kind::Spread, series, start, end, order, limit, threads, max_rows, errors)?;
+        self.multi(py, q.buckets(interval_ms, unit, count, timezone, bounds)?)
+    }
+
+    /// As Client.query_twa_multi() (on one of the connections).
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = None, *, unit = None, count = 1,
+                        timezone = None, bounds = None, method = "step", max_gap_ms = 0, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise"))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_twa_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        interval_ms: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+        count: u32,
+        timezone: Option<&Bound<'_, PyAny>>,
+        bounds: Option<&Bound<'_, PyAny>>,
+        method: &str,
+        max_gap_ms: i64,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+    ) -> PyResult<Py<multi::Many>> {
+        let q = multi::Req::new(multi::Kind::Twa, series, start, end, order, limit, threads, max_rows, errors)?;
+        self.multi(py, q.buckets(interval_ms, unit, count, timezone, bounds)?.twa(method, max_gap_ms)?)
     }
 }

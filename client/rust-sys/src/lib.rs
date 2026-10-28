@@ -16,7 +16,7 @@
 #![allow(non_camel_case_types)]
 #![no_std]
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_uint, c_void};
 
 // The bundled libzstd: referenced so that it is linked.
 #[cfg(feature = "bundled-zstd")]
@@ -74,6 +74,7 @@ pub struct tsdb_options {
     pub clock_ms: Option<unsafe extern "C" fn(arg: *mut c_void) -> i64>,
     pub clock_arg: *mut c_void,
     pub create_volumes: c_int,
+    pub request_threads: c_int,
 }
 
 impl Default for tsdb_options {
@@ -528,6 +529,129 @@ unsafe extern "C" {
         out: *mut *mut tsdb_twa_bucket,
         nout: *mut usize,
     ) -> c_int;
+}
+
+pub type tsdb_multi_kind = c_int;
+pub const TSDB_MULTI_VALUES: tsdb_multi_kind = 1;
+pub const TSDB_MULTI_BUCKETS: tsdb_multi_kind = 2;
+pub const TSDB_MULTI_SPREAD: tsdb_multi_kind = 3;
+pub const TSDB_MULTI_TWA: tsdb_multi_kind = 4;
+pub const TSDB_MULTI_LTTB: tsdb_multi_kind = 5;
+pub const TSDB_MULTI_TRIM_LO: c_uint = 1;
+pub const TSDB_MULTI_TRIM_HI: c_uint = 2;
+
+/// One query over many series (`tsdb_query_multi`); the per-series arrays are null or as long as the list.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct tsdb_multi_query {
+    pub kind: tsdb_multi_kind,
+    pub start: i64,
+    pub end: i64,
+    pub starts: *const i64,
+    pub ends: *const i64,
+    pub opts: tsdb_query_opts,
+    pub interval_ms: i64,
+    pub intervals: *const i64,
+    /// Any zone.
+    pub group: *const tsdb_group,
+    pub bounds: *const i64,
+    pub nbounds: usize,
+    pub trim: c_uint,
+    /// LTTB.
+    pub threshold: usize,
+    pub twa: tsdb_twa_opts,
+}
+
+impl Default for tsdb_multi_query {
+    fn default() -> Self {
+        tsdb_multi_query {
+            kind: 0,
+            start: 0,
+            end: 0,
+            starts: core::ptr::null(),
+            ends: core::ptr::null(),
+            opts: tsdb_query_opts::default(),
+            interval_ms: 0,
+            intervals: core::ptr::null(),
+            group: core::ptr::null(),
+            bounds: core::ptr::null(),
+            nbounds: 0,
+            trim: 0,
+            threshold: 0,
+            twa: tsdb_twa_opts::default(),
+        }
+    }
+}
+
+/// One call of a `tsdb_multi_fn`: rows (VALUES, LTTB) or buckets of the series at `index`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct tsdb_series_result {
+    pub index: usize,
+    pub series: u32,
+    pub status: c_int,
+    /// The series' last call.
+    pub last: c_int,
+    pub n: usize,
+    pub ts: *const i64,
+    pub values: tsdb_values,
+    pub buckets: *const c_void,
+}
+
+pub type tsdb_multi_fn = Option<unsafe extern "C" fn(ctx: *mut c_void, r: *const tsdb_series_result) -> c_int>;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct tsdb_multi_opts {
+    /// 0: tsdb_options.request_threads.
+    pub threads: c_int,
+    /// 0: no limit.
+    pub max_rows: u64,
+    /// 0: 64 MiB.
+    pub max_held_bytes: usize,
+    pub cancelled: Option<unsafe extern "C" fn(ctx: *mut c_void) -> c_int>,
+    pub on_wait: Option<unsafe extern "C" fn(ctx: *mut c_void, delta: c_int)>,
+    pub budget_take: Option<unsafe extern "C" fn(ctx: *mut c_void, bytes: usize) -> c_int>,
+    pub budget_give: Option<unsafe extern "C" fn(ctx: *mut c_void, bytes: usize)>,
+    pub on_deferred: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
+    pub hook_ctx: *mut c_void,
+}
+
+impl Default for tsdb_multi_opts {
+    fn default() -> Self {
+        tsdb_multi_opts {
+            threads: 0,
+            max_rows: 0,
+            max_held_bytes: 0,
+            cancelled: None,
+            on_wait: None,
+            budget_take: None,
+            budget_give: None,
+            on_deferred: None,
+            hook_ctx: core::ptr::null_mut(),
+        }
+    }
+}
+
+unsafe extern "C" {
+    pub fn tsdb_query_multi(
+        db: *mut tsdb,
+        q: *const tsdb_multi_query,
+        series: *const u32,
+        n: usize,
+        mo: *const tsdb_multi_opts,
+        fn_: tsdb_multi_fn,
+        ctx: *mut c_void,
+    ) -> c_int;
+    pub fn tsdb_query_multi_collect(
+        db: *mut tsdb,
+        q: *const tsdb_multi_query,
+        series: *const u32,
+        n: usize,
+        mo: *const tsdb_multi_opts,
+        out: *mut *mut tsdb_series_result,
+    ) -> c_int;
+    pub fn tsdb_series_results_free(r: *mut tsdb_series_result, n: usize);
 }
 
 /// For tests/layout.rs: sizes and field offsets as the C compiler sees them (layout.c).

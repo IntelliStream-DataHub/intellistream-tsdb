@@ -13,6 +13,7 @@ import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.Collections;
@@ -1881,6 +1882,690 @@ public final class TsdbClient implements AutoCloseable {
         }
     }
 
+    // ------------------------------------------------------------ many series
+
+    /*
+     * Many series in one request (protocol version 10), as tsdbc_query_multi in client/tsdb_client.c sends them.
+     * QUERY_MULTI carries the single op's payload once, as a template with series 0xffffffff, and the series (with
+     * per-series starts, ends and intervals) as arrays; a list longer than MULTI_MAX_SERIES goes in successive
+     * requests, and the indexes run on. The reply is the single op's frames for every series in index order, each
+     * with the series' index before the body, then an END frame. A caller that stops early sends CANCEL (with the
+     * id of the query it stops, so it takes no id of its own) and reads the reply to its END.
+     *
+     * Calendar periods in a zone other than UTC become one union of UTC bounds: two VALUES probes give the first and
+     * last row of every series, and the server trims the union per series (TRIM_LO, TRIM_HI) as the single call
+     * computes bounds over the rows of one. Where the union is too long for one frame, or where TWA's closed range
+     * sides differ between series, the series go one by one through the single calls.
+     */
+
+    private static final int K_VALUES = 0, K_LTTB = 1, K_BUCKETS = 2, K_SPREAD = 3, K_TWA = 4;
+    private static final long[] NO_BOUNDS = new long[0];
+    /* a union of local bounds longer than this goes series by series (the frame needs room for the series list) */
+    private static final int MULTI_MAX_UNION = (Protocol.MAX_FRAME - (8 << 20)) / Long.BYTES;
+
+    /** One query over many series, as the caller gave it. */
+    private static final class MultiQ {
+        final int kind;
+        final long start, end;
+        Order order = Order.ASC;
+        long limit;
+        TwaOptions twa = TwaOptions.step();
+        long threshold;
+        Buckets buckets = Buckets.one();
+
+        MultiQ(int kind, long start, long end) {
+            this.kind = kind;
+            this.start = start;
+            this.end = end;
+        }
+    }
+
+    /** What a multi reply hands on; false from any method stops the query (CANCEL). */
+    private interface MultiSink {
+        /** Rows of VALUES or LTTB for series {@code ix}, at the buffer's position (also an empty chunk). */
+        default boolean chunk(int ix, ByteBuffer b, ValueType type, int n, boolean valid) {
+            return true;
+        }
+
+        /** The bucket reply of series {@code ix}: {@code n} rows at the buffer's position. */
+        default boolean body(int ix, int n) {
+            return true;
+        }
+
+        /** Series {@code ix} is complete, with this status. */
+        boolean end(int ix, int status);
+    }
+
+    /** The rows of one bucket kind, read from the reply buffer, and the single call for local periods. */
+    private interface BucketKind<T> {
+        T read();
+
+        List<T> single(int series, long start, long end, Group g, MultiQ q) throws TsdbException;
+    }
+
+    private final BucketKind<Bucket> bucketKind = new BucketKind<>() {
+        public Bucket read() {
+            return readBucket();
+        }
+
+        public List<Bucket> single(int s, long start, long end, Group g, MultiQ q) throws TsdbException {
+            return queryGroup(s, start, end, g, q.order, q.limit);
+        }
+    };
+
+    private final BucketKind<SpreadBucket> spreadKind = new BucketKind<>() {
+        public SpreadBucket read() {
+            return new SpreadBucket(readBucket(), in.getDouble(), in.getDouble(), in.getDouble(), in.getDouble(),
+                    in.getDouble());
+        }
+
+        public List<SpreadBucket> single(int s, long start, long end, Group g, MultiQ q) throws TsdbException {
+            return querySpreadGroup(s, start, end, g, q.order, q.limit);
+        }
+    };
+
+    private final BucketKind<TwaBucket> twaKind = new BucketKind<>() {
+        public TwaBucket read() {
+            return new TwaBucket(in.getLong(), in.getDouble(), in.getDouble(), in.getLong(), in.getLong());
+        }
+
+        public List<TwaBucket> single(int s, long start, long end, Group g, MultiQ q) throws TsdbException {
+            return queryTwaGroup(s, start, end, g, q.twa);
+        }
+    };
+
+    /**
+     * The rows of every series in {@code series} over {@code [start, end)}, as {@link #queryValues(int, long, long)}
+     * gives them for one, in one request.
+     *
+     * @param series the series ids; an id may come more than once, an unknown id has no rows
+     * @param start the first timestamp included, ms
+     * @param end the first timestamp excluded, ms
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException as {@link #queryValuesMulti(int[], long, long, Order, long, MultiOptions)}
+     */
+    public List<SeriesResult<ValuePoints>> queryValuesMulti(int[] series, long start, long end)
+            throws TsdbException {
+        return queryValuesMulti(series, start, end, Order.ASC, 0, MultiOptions.defaults());
+    }
+
+    /**
+     * The rows of every series in {@code series} over {@code [start, end)} (or each series' own range from
+     * {@code m}), as {@link #queryValues(int, long, long, Order, long)} gives them for one, in one request
+     * (protocol version 10).
+     *
+     * <p>Each series has its rows or the error the single call would give for it. Every series of one request reads
+     * the same instant of each volume, so an insert is seen in all of them or in none. Lists longer than 65,536
+     * series go in several requests.
+     *
+     * @param series the series ids; an id may come more than once, an unknown id has no rows
+     * @param start the first timestamp included, ms
+     * @param end the first timestamp excluded, ms
+     * @param order the order of each series' rows
+     * @param limit rows per series at most (0: all)
+     * @param m threads, a cap on all rows, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException {@link Status#ERR_INVALID} from a server older than version 10 (nothing is sent),
+     *     {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} rows in all, or a connection error
+     */
+    public List<SeriesResult<ValuePoints>> queryValuesMulti(int[] series, long start, long end, Order order,
+                                                            long limit, MultiOptions m) throws TsdbException {
+        MultiQ q = new MultiQ(K_VALUES, start, end);
+        q.order = order;
+        q.limit = limit;
+        return rowsMulti(q, series, m);
+    }
+
+    /**
+     * As {@link #queryValuesMulti(int[], long, long, Order, long, MultiOptions)}, handing the rows to
+     * {@code consumer} as they arrive. A consumer that returns false cancels the rest of the query.
+     *
+     * @param series the series ids
+     * @param start the first timestamp included, ms
+     * @param end the first timestamp excluded, ms
+     * @param order the order of each series' rows
+     * @param limit rows per series at most (0: all)
+     * @param m threads, a cap on all rows, per-series ranges
+     * @param consumer receives the rows and the end of each series
+     * @return true if every series was read, false if the consumer stopped
+     * @throws TsdbException as {@link #queryValuesMulti(int[], long, long, Order, long, MultiOptions)}
+     */
+    public boolean queryValuesMulti(int[] series, long start, long end, Order order, long limit, MultiOptions m,
+                                    MultiValuesConsumer consumer) throws TsdbException {
+        Objects.requireNonNull(consumer, "consumer");
+        MultiQ q = new MultiQ(K_VALUES, start, end);
+        q.order = order;
+        q.limit = limit;
+        startMulti(series, m);
+        checkOpts(order, limit);
+        return !multiSendAll(q, series, m, NO_BOUNDS, 0, new MultiSink() {
+            @Override
+            public boolean chunk(int ix, ByteBuffer b, ValueType type, int n, boolean valid) {
+                if (chunkTs.length < n)
+                    chunkTs = new long[n];
+                if (chunkColumn == null || chunkColumn.type() != type || chunkColumn.capacity() < n)
+                    chunkColumn = Column.allocate(type, Math.max(n, chunkTs.length));
+                getLongs(b, chunkTs, 0, n);
+                Values.get(b, chunkColumn, 0, n);
+                chunkNulls.clear();
+                chunkColumn.nulls = chunkNulls;
+                if (valid)
+                    Values.getValidity(b, chunkColumn, 0, n);
+                if (chunkNulls.isEmpty())
+                    chunkColumn.nulls = null;
+                chunkColumn.size = n;
+                return consumer.accept(ix, chunkTs, chunkColumn, n);
+            }
+
+            @Override
+            public boolean end(int ix, int status) {
+                return consumer.done(ix, status);
+            }
+        });
+    }
+
+    /**
+     * LTTB of every series in {@code series}, as {@link #queryLttb(int, long, long, long, Order, long)} gives it for
+     * one, in one request (protocol version 10).
+     *
+     * @param series the series ids
+     * @param start the first timestamp included, ms
+     * @param end the first timestamp excluded, ms
+     * @param threshold points per series to keep
+     * @param order the order of each series' points
+     * @param limit points per series at most (0: all)
+     * @param m threads, a cap on all rows, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException as {@link #queryValuesMulti(int[], long, long, Order, long, MultiOptions)}
+     */
+    public List<SeriesResult<ValuePoints>> queryLttbMulti(int[] series, long start, long end, long threshold,
+                                                          Order order, long limit, MultiOptions m)
+            throws TsdbException {
+        MultiQ q = new MultiQ(K_LTTB, start, end);
+        q.order = order;
+        q.limit = limit;
+        q.threshold = threshold;
+        return rowsMulti(q, series, m);
+    }
+
+    /**
+     * Buckets of every series in {@code series}, as {@link #queryAgg}, {@link #queryGroup} or {@link #queryBounds}
+     * give them for one, in one request (protocol version 10).
+     *
+     * @param series the series ids; an id may come more than once, an unknown id has no buckets
+     * @param start the first timestamp included, ms
+     * @param end the first timestamp excluded, ms
+     * @param b the buckets
+     * @param order the order of each series' buckets
+     * @param limit buckets per series at most (0: all)
+     * @param m threads, a cap on all buckets, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException {@link Status#ERR_INVALID} from a server older than version 10 or for a negative
+     *     {@link Buckets#every} interval, {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} buckets in
+     *     all, or a connection error
+     */
+    public List<SeriesResult<List<Bucket>>> queryBucketsMulti(int[] series, long start, long end, Buckets b,
+                                                              Order order, long limit, MultiOptions m)
+            throws TsdbException {
+        MultiQ q = new MultiQ(K_BUCKETS, start, end);
+        q.order = order;
+        q.limit = limit;
+        q.buckets = Objects.requireNonNull(b, "buckets");
+        return bucketMulti(q, series, m, bucketKind);
+    }
+
+    /**
+     * Buckets with the spread of every series in {@code series}, as {@link #querySpread} gives them for one, in one
+     * request (protocol version 10).
+     *
+     * @param series the series ids
+     * @param start the first timestamp included, ms
+     * @param end the first timestamp excluded, ms
+     * @param b the buckets
+     * @param order the order of each series' buckets
+     * @param limit buckets per series at most (0: all)
+     * @param m threads, a cap on all buckets, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException as {@link #queryBucketsMulti}
+     */
+    public List<SeriesResult<List<SpreadBucket>>> querySpreadMulti(int[] series, long start, long end, Buckets b,
+                                                                   Order order, long limit, MultiOptions m)
+            throws TsdbException {
+        MultiQ q = new MultiQ(K_SPREAD, start, end);
+        q.order = order;
+        q.limit = limit;
+        q.buckets = Objects.requireNonNull(b, "buckets");
+        return bucketMulti(q, series, m, spreadKind);
+    }
+
+    /**
+     * Time-weighted averages of every series in {@code series}, as {@link #queryTwa}, {@link #queryTwaGroup} or
+     * {@link #queryTwaBounds} give them for one, in one request (protocol version 10).
+     *
+     * @param series the series ids
+     * @param start the first timestamp included, ms
+     * @param end the first timestamp excluded, ms
+     * @param b the buckets
+     * @param opts the method, the longest gap, order and limit per series
+     * @param m threads, a cap on all buckets, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException as {@link #queryBucketsMulti}
+     */
+    public List<SeriesResult<List<TwaBucket>>> queryTwaMulti(int[] series, long start, long end, Buckets b,
+                                                             TwaOptions opts, MultiOptions m) throws TsdbException {
+        MultiQ q = new MultiQ(K_TWA, start, end);
+        q.twa = Objects.requireNonNull(opts, "opts");
+        q.buckets = Objects.requireNonNull(b, "buckets");
+        return bucketMulti(q, series, m, twaKind);
+    }
+
+    /** Checks the arguments and the server's version. */
+    private void startMulti(int[] series, MultiOptions m) throws TsdbException {
+        Objects.requireNonNull(series, "series");
+        Objects.requireNonNull(m, "options");
+        if (m.starts() != null && m.starts().length != series.length)
+            throw new IllegalArgumentException(m.starts().length + " starts for " + series.length + " series");
+        if (m.ends() != null && m.ends().length != series.length)
+            throw new IllegalArgumentException(m.ends().length + " ends for " + series.length + " series");
+        needVersion(10, "many series in one request");
+    }
+
+    private List<SeriesResult<ValuePoints>> rowsMulti(MultiQ q, int[] series, MultiOptions m) throws TsdbException {
+        checkOpts(q.order, q.limit);
+        startMulti(series, m);
+        List<SeriesResult<ValuePoints>> out = new ArrayList<>(series.length);
+        ValueCollector[] cur = {null};
+        multiSendAll(q, series, m, NO_BOUNDS, 0, new MultiSink() {
+            @Override
+            public boolean chunk(int ix, ByteBuffer b, ValueType type, int n, boolean valid) {
+                if (cur[0] == null)
+                    cur[0] = new ValueCollector();
+                ValueCollector c = cur[0];
+                if (!c.overflow && !c.mixed)
+                    c.chunk(b, type, n, valid);
+                return true;
+            }
+
+            @Override
+            public boolean end(int ix, int status) {
+                ValueCollector c = cur[0] != null ? cur[0] : new ValueCollector();
+                cur[0] = null;
+                if (status != Status.OK)
+                    out.add(SeriesResult.failed(status, null));
+                else if (c.overflow)
+                    out.add(SeriesResult.failed(Status.ERR_NOMEM, "more points than one array holds"));
+                else if (c.mixed)
+                    out.add(SeriesResult.failed(Status.ERR_CORRUPT, "chunks of different value types"));
+                else
+                    out.add(SeriesResult.of(c.result()));
+                return true;
+            }
+        });
+        return complete(out, series.length);
+    }
+
+    private <T> List<SeriesResult<List<T>>> bucketMulti(MultiQ q, int[] series, MultiOptions m, BucketKind<T> k)
+            throws TsdbException {
+        if (q.kind == K_TWA)
+            checkOpts(q.twa.order(), q.twa.limit());
+        else
+            checkOpts(q.order, q.limit);
+        Buckets b = q.buckets;
+        if (b.kind() == Buckets.Kind.INTERVALS && b.intervals().length != series.length)
+            throw new IllegalArgumentException(b.intervals().length + " intervals for " + series.length + " series");
+        if (b.kind() == Buckets.Kind.BOUNDS)
+            checkBounds(b.bounds(), q.kind == K_TWA ? MAX_TWA_BOUNDS : MAX_BOUNDS);
+        startMulti(series, m);
+        if (b.kind() == Buckets.Kind.EVERY && b.interval() < 0)
+            throw new TsdbException(Status.ERR_INVALID, "negative interval", null);
+        List<SeriesResult<List<T>>> out = new ArrayList<>(series.length);
+        if (series.length == 0)
+            return out;
+        if (b.kind() == Buckets.Kind.GROUP && !b.group().utc())
+            multiLocal(q, series, m, k, out);
+        else
+            collectBuckets(q, series, m, b.kind() == Buckets.Kind.BOUNDS ? b.bounds() : NO_BOUNDS, 0, k, out);
+        return complete(out, series.length);
+    }
+
+    /** Bucket replies of {@code q} for {@code series} into {@code out}. */
+    private <T> void collectBuckets(MultiQ q, int[] series, MultiOptions m, long[] bounds, int trim, BucketKind<T> k,
+                                    List<SeriesResult<List<T>>> out) throws TsdbException {
+        @SuppressWarnings("unchecked")
+        List<T>[] cur = new List[1];
+        multiSendAll(q, series, m, bounds, trim, new MultiSink() {
+            @Override
+            public boolean body(int ix, int n) {
+                @SuppressWarnings("unchecked")
+                T[] rows = (T[]) new Object[n];
+                for (int i = 0; i < n; i++)
+                    rows[i] = k.read();
+                cur[0] = Collections.unmodifiableList(Arrays.asList(rows));
+                return true;
+            }
+
+            @Override
+            public boolean end(int ix, int status) {
+                out.add(status == Status.OK ? SeriesResult.of(cur[0] != null ? cur[0] : Collections.emptyList())
+                        : SeriesResult.failed(status, null));
+                cur[0] = null;
+                return true;
+            }
+        });
+    }
+
+    /** Calendar periods in a time zone: one union of bounds, trimmed per series by the server. */
+    private <T> void multiLocal(MultiQ q, int[] series, MultiOptions m, BucketKind<T> k,
+                                List<SeriesResult<List<T>>> out) throws TsdbException {
+        boolean twa = q.kind == K_TWA;
+        long[] starts = m.starts(), ends = m.ends();
+        boolean us = uniform(starts), ue = uniform(ends);
+        long s0 = starts != null && starts.length > 0 ? starts[0] : q.start;
+        long e0 = ends != null && ends.length > 0 ? ends[0] : q.end;
+        /* buckets are cut to the rows on both sides; TWA only on open sides (a closed one is the range's edge) */
+        boolean openLo = !twa || (us && s0 == Long.MIN_VALUE);
+        boolean openHi = !twa || (ue && e0 == Long.MAX_VALUE);
+        if (twa && ((!us && !openLo) || (!ue && !openHi))) {
+            multiSingle(q, series, m, k, out);
+            return;
+        }
+        int n = series.length;
+        long[] lo = new long[n], hi = new long[n];
+        Arrays.fill(lo, Long.MAX_VALUE);
+        Arrays.fill(hi, Long.MIN_VALUE);
+        MultiOptions pm = new MultiOptions(m.threads(), 0, starts, ends);
+        for (int side = 0; side < 2; side++) {
+            if (side == 0 ? !openLo : !openHi)
+                continue;
+            long[] edge = side == 0 ? lo : hi;
+            MultiQ vq = new MultiQ(K_VALUES, q.start, q.end);
+            vq.order = side == 0 ? Order.ASC : Order.DESC;
+            vq.limit = 1;
+            multiSendAll(vq, series, pm, NO_BOUNDS, 0, new MultiSink() {
+                @Override
+                public boolean chunk(int ix, ByteBuffer b, ValueType type, int c, boolean valid) {
+                    if (c > 0)
+                        edge[ix] = b.getLong(b.position());
+                    return true;
+                }
+
+                @Override
+                public boolean end(int ix, int status) {
+                    return true;
+                }
+            });
+        }
+        long l = s0, h = e0 == Long.MIN_VALUE ? Long.MIN_VALUE : e0 - 1;
+        if (openLo) {
+            l = Long.MAX_VALUE;
+            for (long v : lo)
+                l = Math.min(l, v);
+        }
+        if (openHi) {
+            h = Long.MIN_VALUE;
+            for (long v : hi)
+                h = Math.max(h, v);
+        }
+        if (l > h) { /* no rows anywhere (or an empty range): no buckets, as the single call answers */
+            for (int i = 0; i < n; i++)
+                out.add(SeriesResult.of(Collections.emptyList()));
+            return;
+        }
+        long[] bounds;
+        try {
+            bounds = q.buckets.group().bounds(l, h == Long.MAX_VALUE ? Long.MAX_VALUE : h + 1);
+        } catch (TsdbException e) {
+            if (e.status() != Status.ERR_TOO_MANY_BUCKETS)
+                throw e;
+            bounds = null;
+        }
+        if (bounds == null || bounds.length > MULTI_MAX_UNION) { /* the union is too long for one frame */
+            multiSingle(q, series, m, k, out);
+            return;
+        }
+        int trim = (openLo ? Protocol.MULTI_TRIM_LO : 0) | (openHi ? Protocol.MULTI_TRIM_HI : 0);
+        collectBuckets(q, series, m, bounds, trim, k, out);
+    }
+
+    /** The series one by one through the single calls. */
+    private <T> void multiSingle(MultiQ q, int[] series, MultiOptions m, BucketKind<T> k,
+                                 List<SeriesResult<List<T>>> out) throws TsdbException {
+        long rows = 0;
+        for (int i = 0; i < series.length; i++) {
+            long s = m.starts() != null ? m.starts()[i] : q.start;
+            long e = m.ends() != null ? m.ends()[i] : q.end;
+            try {
+                List<T> v = k.single(series[i], s, e, q.buckets.group(), q);
+                rows += v.size();
+                if (m.maxRows() != 0 && rows > m.maxRows())
+                    throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS);
+                out.add(SeriesResult.of(v));
+            } catch (TsdbException x) {
+                if (broken || (m.maxRows() != 0 && rows > m.maxRows()))
+                    throw x;
+                out.add(SeriesResult.failed(x.status(), x.getMessage()));
+            }
+        }
+    }
+
+    private static boolean uniform(long[] a) {
+        if (a == null)
+            return true;
+        for (long v : a)
+            if (v != a[0])
+                return false;
+        return true;
+    }
+
+    private <T> List<T> complete(List<T> out, int n) throws TsdbException {
+        if (out.size() != n)
+            throw lost(Status.ERR_CORRUPT, out.size() + " of " + n + " series answered");
+        return Collections.unmodifiableList(out);
+    }
+
+    /**
+     * The single op's payload for series 0xffffffff, with 0 in every field a per-series array replaces.
+     * {@code bounds} (non-empty) replace the bucket form of {@code q}.
+     */
+    private static byte[] multiTemplate(MultiQ q, MultiOptions m, long[] bounds) {
+        long start = m.starts() != null ? 0 : q.start, end = m.ends() != null ? 0 : q.end;
+        Buckets b = q.buckets;
+        long interval = b.kind() == Buckets.Kind.EVERY ? b.interval() : 0;
+        Group g = b.kind() == Buckets.Kind.GROUP ? b.group() : null;
+        byte unit = (byte) (g != null ? g.unit().code : 0);
+        int count = g != null ? g.count() : 0;
+        Order order = q.kind == K_TWA ? q.twa.order() : q.order;
+        byte desc = (byte) (order == Order.DESC ? 1 : 0);
+        long limit = q.kind == K_TWA ? q.twa.limit() : q.limit;
+        int nb = bounds.length;
+        ByteBuffer t = ByteBuffer.allocate(Protocol.TWA_HEADER + 16 + nb * Long.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+        t.putInt(Protocol.MANY_SERIES).putLong(start).putLong(end);
+        switch (q.kind) {
+        case K_VALUES:
+            t.put(desc).putLong(limit);
+            break;
+        case K_LTTB:
+            t.putLong(q.threshold).put(desc).putLong(limit);
+            break;
+        case K_TWA:
+            t.put((byte) (q.twa.method() == TwaMethod.LINEAR ? 1 : 0)).put(desc).put(nb > 0 ? 0 : unit).put((byte) 0);
+            t.putLong(q.twa.maxGapMs()).putLong(limit).putLong(nb > 0 || g != null ? 0 : interval);
+            t.putInt(nb > 0 ? 0 : count).putInt(nb);
+            t.asLongBuffer().put(bounds);
+            t.position(t.position() + nb * Long.BYTES);
+            break;
+        default:
+            if (nb > 0) {
+                t.put(desc).putLong(limit).putInt(nb);
+                t.asLongBuffer().put(bounds);
+                t.position(t.position() + nb * Long.BYTES);
+            } else {
+                t.putLong(g != null ? 0 : interval).put(unit).putInt(count).put(desc).putLong(limit);
+                t.putShort((short) 0); /* no zone: UTC (others come as bounds) */
+            }
+            if (q.kind == K_SPREAD)
+                t.put((byte) Protocol.SPREAD);
+        }
+        return Arrays.copyOf(t.array(), t.position());
+    }
+
+    /**
+     * Sends {@code q} for {@code series} in requests of at most MULTI_MAX_SERIES and reads each reply, passing every
+     * item to {@code sink} with the index into {@code series}. {@code bounds} (with {@code trim}) replace the bucket
+     * form. Returns whether the sink stopped.
+     */
+    private boolean multiSendAll(MultiQ q, int[] series, MultiOptions m, long[] bounds, int trim, MultiSink sink)
+            throws TsdbException {
+        byte op;
+        if (q.kind == K_VALUES)
+            op = Protocol.OP_QUERY_VALUES;
+        else if (q.kind == K_LTTB)
+            op = Protocol.OP_QUERY_LTTB;
+        else if (q.kind == K_TWA)
+            op = Protocol.OP_QUERY_TWA;
+        else
+            op = bounds.length > 0 ? Protocol.OP_QUERY_BOUNDS : Protocol.OP_QUERY_BUCKETS;
+        byte[] t = multiTemplate(q, m, bounds);
+        long[] iv = q.buckets.kind() == Buckets.Kind.INTERVALS && bounds.length == 0 && q.kind >= K_BUCKETS
+                ? q.buckets.intervals() : null;
+        int flags = (m.starts() != null ? Protocol.MULTI_PER_START : 0) | (m.ends() != null ? Protocol.MULTI_PER_END : 0)
+                | (iv != null ? Protocol.MULTI_PER_INTERVAL : 0)
+                | (bounds.length > 0 ? trim & (Protocol.MULTI_TRIM_LO | Protocol.MULTI_TRIM_HI) : 0);
+        boolean values = q.kind == K_VALUES || q.kind == K_LTTB;
+        int row = q.kind == K_TWA ? Protocol.TWA_ROW : q.kind == K_SPREAD ? Protocol.SPREAD_ROW : Protocol.BUCKET_ROW;
+        int narrays = (m.starts() != null ? 1 : 0) + (m.ends() != null ? 1 : 0) + (iv != null ? 1 : 0);
+        long[] rows = {0};
+        for (int at = 0; at < series.length; at += Protocol.MULTI_MAX_SERIES) {
+            int k = Math.min(series.length - at, Protocol.MULTI_MAX_SERIES);
+            long left = 0;
+            if (m.maxRows() != 0) {
+                if (rows[0] >= m.maxRows())
+                    throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS);
+                left = m.maxRows() - rows[0];
+            }
+            int pad = (8 - (k * 4) % 8) % 8;
+            long payload = Protocol.MULTI_HEADER + (long) narrays * k * Long.BYTES + (long) k * Integer.BYTES + pad
+                    + t.length;
+            if (payload > Protocol.MAX_FRAME - 5) /* bounds that no frame carries */
+                throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS, "a request of " + payload + " bytes", null);
+            begin(Protocol.OP_QUERY_MULTI, payload);
+            out.put(op).put((byte) flags).putShort((short) m.threads()).putInt(k).putLong(left).putInt(t.length)
+                    .putInt(0);
+            if (m.starts() != null)
+                putLongs(m.starts(), at, k);
+            if (m.ends() != null)
+                putLongs(m.ends(), at, k);
+            if (iv != null)
+                putLongs(iv, at, k);
+            putInts(series, at, k);
+            putBytes(new byte[pad]);
+            putBytes(t);
+            send();
+            if (multiRead(values, row, k, at, rows, sink))
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * Reads the reply of the QUERY_MULTI just sent for {@code n} series (indexes from {@code at}). Returns whether
+     * {@code sink} stopped it (a CANCEL went out and the reply was read to its END); an error status of the END is
+     * the error.
+     */
+    private boolean multiRead(boolean values, int row, int n, int at, long[] rows, MultiSink sink)
+            throws TsdbException {
+        int id = ackId, next = 0;
+        boolean open = false, stopped = false, cancelSent = false;
+        RuntimeException thrown = null;
+        for (;;) {
+            int st = frame(Protocol.MAX_FRAME + 4);
+            int p = in.position(), blen = bodyLen - 4;
+            if (blen < 0)
+                throw lost(Status.ERR_CORRUPT, "QUERY_MULTI reply frame of " + bodyLen + " bytes");
+            int ix = in.getInt(p);
+            if (ix == Protocol.MULTI_END) {
+                if (blen != 4 || open)
+                    throw lost(Status.ERR_CORRUPT, "QUERY_MULTI END frame in the middle of a series");
+                int answered = in.getInt(p + 4);
+                endReply();
+                if (thrown != null)
+                    throw thrown;
+                if (st == Status.OK) {
+                    if (answered != n && !stopped)
+                        throw lost(Status.ERR_CORRUPT, answered + " of " + n + " series answered without an error");
+                    return stopped;
+                }
+                if (stopped && st == Status.ERR_STOPPED)
+                    return true;
+                throw new TsdbException(st);
+            }
+            if (ix != next || ix >= n)
+                throw lost(Status.ERR_CORRUPT, "QUERY_MULTI series " + Integer.toUnsignedString(ix) + " out of order"
+                        + " (next " + next + " of " + n + ")");
+            boolean last = true;
+            if (values) {
+                ValueType type = blen >= 8 ? ValueType.of(in.get(p + 5)) : null;
+                int k = blen >= 8 ? in.getInt(p + 8) : -1;
+                boolean valid = blen >= 8 && (in.get(p + 6) & Protocol.VALID) != 0;
+                last = blen >= 8 && in.get(p + 4) != 0;
+                if (type == null || k < 0
+                        || blen != 8 + (long) k * (Long.BYTES + type.width) + (valid ? (k + 7) / 8 : 0)
+                        || (st != Status.OK && !last))
+                    throw lost(Status.ERR_CORRUPT, "QUERY_MULTI values chunk of " + blen + " bytes");
+                in.position(p + 12);
+                if (!stopped) {
+                    try {
+                        rows[0] += k;
+                        stopped = !sink.chunk(at + ix, in, type, k, valid);
+                        if (last && !stopped)
+                            stopped = !sink.end(at + ix, st);
+                    } catch (RuntimeException e) {
+                        thrown = e;
+                        stopped = true;
+                    } catch (Error e) {
+                        lost(Status.ERR_IO, "consumer failed");
+                        throw e;
+                    }
+                }
+            } else {
+                int k = blen >= 4 ? in.getInt(p + 4) : -1;
+                if (st != Status.OK ? blen != 0 : k < 0 || blen != 4 + (long) k * row)
+                    throw lost(Status.ERR_CORRUPT, "QUERY_MULTI bucket reply of " + blen + " bytes for status " + st);
+                in.position(p + 4 + (st == Status.OK ? 4 : 0));
+                if (!stopped) {
+                    try {
+                        if (st == Status.OK) {
+                            rows[0] += k;
+                            stopped = !sink.body(at + ix, k);
+                        }
+                        if (!stopped)
+                            stopped = !sink.end(at + ix, st);
+                    } catch (RuntimeException e) {
+                        thrown = e;
+                        stopped = true;
+                    } catch (Error e) {
+                        lost(Status.ERR_IO, "consumer failed");
+                        throw e;
+                    }
+                }
+            }
+            open = !last;
+            if (last)
+                next++;
+            in.position(bodyEnd); /* the reply goes on: the same id until END */
+            if (stopped && !cancelSent) {
+                sendCancel(id);
+                cancelSent = true;
+            }
+        }
+    }
+
+    /** CANCEL of the QUERY_MULTI {@code id}. It gets no reply, so it carries the id of the query it stops. */
+    private void sendCancel(int id) throws TsdbException {
+        out.putInt(5 + Integer.BYTES).putInt(id).put(Protocol.OP_CANCEL).putInt(id);
+        send();
+    }
+
     // ---------------------------------------------------- deletes and retention
 
     /**
@@ -2287,11 +2972,16 @@ public final class TsdbClient implements AutoCloseable {
      * @return the status
      */
     private int frame() throws TsdbException {
+        return frame(Protocol.MAX_FRAME);
+    }
+
+    /** Reads the header of the next reply frame, of at most {@code max} bytes (a QUERY_MULTI frame: 4 more). */
+    private int frame(int max) throws TsdbException {
         fill(Protocol.REPLY_HEADER);
         int len = in.getInt(), id = in.getInt();
         byte op = in.get();
         int status = in.getInt();
-        if (len < 9 || len > Protocol.MAX_FRAME || op != Protocol.OP_REPLY)
+        if (len < 9 || len > max || op != Protocol.OP_REPLY)
             throw lost(Status.ERR_CORRUPT, "malformed reply frame");
         if (id != ackId)
             throw lost(Status.ERR_CORRUPT, "reply to request " + Integer.toUnsignedString(id) + ", expected "

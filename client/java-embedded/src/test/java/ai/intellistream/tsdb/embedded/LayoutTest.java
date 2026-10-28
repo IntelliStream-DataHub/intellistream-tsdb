@@ -76,9 +76,12 @@ class LayoutTest {
                 String field = name + "." + m.name().orElseThrow();
                 assertEquals(c.get(field), Native.offset(s, m.name().get()), field + " offset");
                 checked.add(field);
-                /* flat structs, but for a tsdb_bucket embedded whole (tsdb_spread_bucket.b) */
-                assertTrue(!(m instanceof GroupLayout) || m.equals(Native.BUCKET.withName(m.name().get())),
-                        field + ": flat structs only");
+                /* flat structs, but for structs of their own embedded whole (tsdb_spread_bucket.b,
+                 * tsdb_multi_query.opts and .twa, tsdb_series_result.values), whose fields are checked as theirs */
+                assertTrue(!(m instanceof GroupLayout) || m.equals(Native.BUCKET.withName(m.name().get()))
+                        || m.equals(Native.QUERY_OPTS.withName(m.name().get()))
+                        || m.equals(Native.TWA_OPTS.withName(m.name().get()))
+                        || m.equals(Native.VALUES.withName(m.name().get())), field + ": flat structs only");
             }
         }
         for (String k : c.keySet())
@@ -92,6 +95,13 @@ class LayoutTest {
         for (TwaMethod t : TwaMethod.values())
             assertEquals(c.get("twa." + t.name()), (long) t.ordinal(), "tsdb_twa_method of " + t + " (Native.twaOpts)");
         assertEquals(TwaMethod.values().length, c.keySet().stream().filter(k -> k.startsWith("twa.")).count());
+        assertEquals((long) Native.MULTI_VALUES, c.get("multi.VALUES"));
+        assertEquals((long) Native.MULTI_BUCKETS, c.get("multi.BUCKETS"));
+        assertEquals((long) Native.MULTI_SPREAD, c.get("multi.SPREAD"));
+        assertEquals((long) Native.MULTI_TWA, c.get("multi.TWA"));
+        assertEquals((long) Native.MULTI_LTTB, c.get("multi.LTTB"));
+        assertEquals((long) Native.MULTI_TRIM_LO, c.get("multi.TRIM_LO"));
+        assertEquals((long) Native.MULTI_TRIM_HI, c.get("multi.TRIM_HI"));
         assertEquals(0L, c.get("order.ASC"));
         assertEquals(1L, c.get("order.DESC"));
         assertEquals(5, c.keySet().stream().filter(k -> k.startsWith("type.")).count(), "a C type Java lacks");

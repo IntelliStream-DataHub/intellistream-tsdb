@@ -368,3 +368,41 @@ pub struct QueryStats {
     /// Rows, or buckets, returned.
     pub result_rows: u64,
 }
+
+/// How a multi-series bucket query ([`Client::query_buckets_multi`](crate::Client::query_buckets_multi),
+/// `_spread_multi`, `_twa_multi`) cuts each series' range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Buckets<'a> {
+    /// One bucket for the whole range.
+    One,
+    /// Fixed buckets of this many ms (0: one bucket), the same for every series.
+    Every(i64),
+    /// Fixed buckets, `intervals[i]` ms for series `i` (as long as the series list).
+    Intervals(&'a [i64]),
+    /// Calendar periods, in any time zone (as `query_group`).
+    Group(&'a Group),
+    /// These bucket bounds for every series (as `query_bounds`).
+    Bounds(&'a [i64]),
+}
+
+/// Options of the multi-series calls (protocol version 10).
+///
+/// ```
+/// use tsdb_client::MultiOpts;
+/// let starts = [0, 1_000];
+/// let m = MultiOpts { starts: Some(&starts), max_rows: 1_000_000, ..MultiOpts::default() };
+/// assert_eq!(m.threads, 0);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MultiOpts<'a> {
+    /// Threads the request uses at most; 0: the server's (or the database's) `request_threads`.
+    pub threads: u16,
+    /// Rows or buckets in all series together, at most; past it the call fails with
+    /// [`Status::TooManyBuckets`](crate::Status::TooManyBuckets). 0: the server's `--multi-max-rows`
+    /// (embedded: no limit).
+    pub max_rows: u64,
+    /// The start of series `i`'s range instead of the range's (as long as the series list).
+    pub starts: Option<&'a [i64]>,
+    /// The end (exclusive) of series `i`'s range instead of the range's.
+    pub ends: Option<&'a [i64]>,
+}

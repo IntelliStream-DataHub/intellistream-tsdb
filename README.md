@@ -52,6 +52,11 @@ average). You can link tsdb into your program as a library, or run its server,
   their own. Over the wire these need protocol version 7 (tsdbd and the C,
   Rust, Python and Java clients of this release; the CLI has `delete` and
   `retention`).
+- Ask about many series in one request: the last hour of 200 sensors, or a
+  day of every pump by hour. The server works on the series in parallel and
+  sends the answers back in your order, all read at the same instant, so a
+  write to several series shows up in all of them or in none. Over the wire
+  this needs protocol version 10 (tsdbd and the clients of this release).
 - Safe writes: data is on disk when a write returns. We test this by killing
   the server and by simulating power loss.
 - One writer and any number of read-only followers can share a directory,
@@ -397,6 +402,10 @@ On AlmaLinux and RHEL 10, where io_uring is disabled by default, tsdbd runs on e
 `--metrics-port N` serves Prometheus metrics (`GET /metrics`) on a second port of its own: rows and
 bytes on disk, parts, merges, WAL, request and error counters, a query latency histogram, connections,
 fail-stop and follower refresh age. See [docs/metrics.md](docs/metrics.md).
+
+Queries run on `--query-threads` threads (default one per CPU). One request uses at most `--request-threads` of
+them (default all), so that a few large requests leave room for the others. A small query runs on one thread; a
+large one, or a request for many series, spreads over more.
 
 | client | quick start |
 |---|---|

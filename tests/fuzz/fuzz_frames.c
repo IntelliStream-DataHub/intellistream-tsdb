@@ -232,6 +232,7 @@ static void run_one(const uint8_t *in, size_t len)
             if (!c->q_head)
                 c->q_tail = NULL;
             c->q_bytes -= r->len;
+            atomic_store(&c->cancel_running, r->cancelled); /* as dispatch() does: a CANCEL that came first */
             r->id = seq;
             handle(r);
             check_replies(c->out.p, c->out.len, seq, r->op);
@@ -355,6 +356,29 @@ static void values_header(fb *b, uint32_t n, uint32_t s, unsigned type, uint8_t 
     p8(b, flags);
     p16(b, 0);
     p32(b, 0);
+}
+
+/* A QUERY_MULTI payload (version 10): header, the arrays its flags ask for, the series, padding, the template t
+ * (an inner op's payload with series TSDB_MANY_SERIES). */
+static void multi_payload(fb *p, uint8_t op, uint8_t flags, uint16_t threads, uint32_t n, uint64_t max_rows,
+                          const fb *t)
+{
+    p8(p, op);
+    p8(p, flags);
+    p16(p, threads);
+    p32(p, n);
+    p64(p, (int64_t)max_rows);
+    p32(p, (uint32_t)t->len);
+    p32(p, 0);
+    for (int a = 0; a < 3; a++)
+        if (flags & (1 << a))
+            for (uint32_t i = 0; i < n; i++)
+                p64(p, a == 0 ? (int64_t)i * 1000 : a == 1 ? 900000 - (int64_t)i * 1000 : 10000 * (int64_t)(i + 1));
+    for (uint32_t i = 0; i < n; i++)
+        p32(p, i == 2 ? 77 : i % 5); /* 77: unknown */
+    while (p->len % 8)
+        p8(p, 0);
+    put(p, t->p, t->len);
 }
 
 static int cmd_seeds(const char *dir)
@@ -525,6 +549,89 @@ static int cmd_seeds(const char *dir)
                      p64(&p, 30000);
                  }
              }));
+    }
+    /* QUERY_MULTI: every inner op, every flag; then CANCEL of a queued one, and of nobody */
+    {
+        fb t = {0};
+        struct {
+            const char *name;
+            uint8_t op, flags, form;
+            uint16_t threads;
+            uint64_t max_rows;
+        } mq[] = {
+            {"multi-values", TSDB_OP_QUERY_VALUES, 0, 0, 0, 0},
+            {"multi-values-per", TSDB_OP_QUERY_VALUES, TSDB_MULTI_PER_START | TSDB_MULTI_PER_END, 1, 2, 0},
+            {"multi-values-max-rows", TSDB_OP_QUERY_VALUES, 0, 0, 1, 5},
+            {"multi-buckets", TSDB_OP_QUERY_BUCKETS, 0, 0, 0, 0},
+            {"multi-buckets-per", TSDB_OP_QUERY_BUCKETS,
+             TSDB_MULTI_PER_START | TSDB_MULTI_PER_END | TSDB_MULTI_PER_INTERVAL, 1, 3, 0},
+            {"multi-buckets-group", TSDB_OP_QUERY_BUCKETS, TSDB_MULTI_PER_END, 2, 0, 0},
+            {"multi-bounds", TSDB_OP_QUERY_BOUNDS, 0, 0, 0, 0},
+            {"multi-bounds-trim", TSDB_OP_QUERY_BOUNDS, TSDB_MULTI_WIRE_TRIM_LO | TSDB_MULTI_WIRE_TRIM_HI, 0, 2, 0},
+            {"multi-lttb", TSDB_OP_QUERY_LTTB, TSDB_MULTI_PER_START, 1, 0, 0},
+            {"multi-twa-interval", TSDB_OP_QUERY_TWA, TSDB_MULTI_PER_INTERVAL, 0, 0, 0},
+            {"multi-twa-unit", TSDB_OP_QUERY_TWA, TSDB_MULTI_PER_START, 1, 4, 0},
+            {"multi-twa-bounds-trim", TSDB_OP_QUERY_TWA, TSDB_MULTI_WIRE_TRIM_LO, 2, 0, 3},
+        };
+        for (size_t k = 0; k < sizeof mq / sizeof mq[0]; k++) {
+            bool ps = mq[k].flags & TSDB_MULTI_PER_START, pe = mq[k].flags & TSDB_MULTI_PER_END,
+                 pi = mq[k].flags & TSDB_MULTI_PER_INTERVAL;
+            int form = mq[k].form;
+            t.len = 0;
+            p32(&t, TSDB_MANY_SERIES);
+            p64(&t, ps ? 0 : 0);
+            p64(&t, pe ? 0 : 1000000);
+            switch (mq[k].op) {
+            case TSDB_OP_QUERY_VALUES: p8(&t, (uint8_t)form), p64(&t, form ? 7 : 0); break;
+            case TSDB_OP_QUERY_LTTB: p64(&t, 10), p8(&t, 1), p64(&t, 4); break;
+            case TSDB_OP_QUERY_BUCKETS:
+                p64(&t, pi || form == 2 ? 0 : 20000);
+                p8(&t, form == 2 ? 1 : 0); /* unit: hours */
+                p32(&t, form == 2 ? 1 : 0);
+                p8(&t, (uint8_t)(form & 1));
+                p64(&t, form ? 2 : 0);
+                if (form == 2)
+                    pstr16(&t, "UTC");
+                else
+                    p16(&t, 0);
+                p8(&t, form == 1 ? TSDB_SPREAD : 0);
+                break;
+            case TSDB_OP_QUERY_BOUNDS:
+                p8(&t, 0), p64(&t, 0), p32(&t, 3), p64(&t, 0), p64(&t, 50000), p64(&t, 100000);
+                break;
+            case TSDB_OP_QUERY_TWA:
+                p8(&t, (uint8_t)(form & 1)); /* method */
+                p8(&t, 0);
+                p8(&t, form == 1 ? 1 : 0); /* unit */
+                p8(&t, 0);
+                p64(&t, 5000);
+                p64(&t, 0);
+                p64(&t, form == 0 && !pi ? 10000 : 0);
+                p32(&t, form == 1 ? 1 : 0);
+                p32(&t, form == 2 ? 2 : 0);
+                if (form == 2)
+                    p64(&t, 0), p64(&t, 30000);
+                break;
+            }
+            SEED(mq[k].name, TSDB_OP_QUERY_MULTI,
+                 multi_payload(&p, mq[k].op, mq[k].flags, mq[k].threads, 6, mq[k].max_rows, &t));
+        }
+        /* a QUERY_MULTI, a second one cancelled while queued, a CANCEL of nobody, then a query */
+        f.len = p.len = 0;
+        t.len = 0;
+        p32(&t, TSDB_MANY_SERIES), p64(&t, 0), p64(&t, 1000000), p8(&t, 0), p64(&t, 0);
+        multi_payload(&p, TSDB_OP_QUERY_VALUES, 0, 0, 3, 0, &t);
+        frame(&f, TSDB_OP_QUERY_MULTI, &p);
+        frame(&f, TSDB_OP_QUERY_MULTI, &p);
+        p.len = 0;
+        p32(&p, 1);
+        frame(&f, TSDB_OP_CANCEL, &p);
+        p.len = 0;
+        p32(&p, 12345);
+        frame(&f, TSDB_OP_CANCEL, &p);
+        frame(&f, TSDB_OP_LAST_STATS, &(fb){0});
+        seed_write(dir, "multi-cancel", &f);
+        free(t.p);
     }
     SEED("delete-range", TSDB_OP_DELETE_RANGE, (p32(&p, 0), p32(&p, 0), p64(&p, 10000), p64(&p, 20000)));
     SEED("set-retention", TSDB_OP_SET_RETENTION, (p32(&p, 1), p32(&p, 0), p64(&p, 86400000)));

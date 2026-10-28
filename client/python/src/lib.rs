@@ -33,6 +33,7 @@ use tc::{Column, ColumnRef, ValueType, Values};
 
 mod arrays;
 mod embedded;
+mod multi;
 mod pool;
 
 use arrays::{Buckets, Col, TwaBuckets, values_column, vec_to_py};
@@ -50,6 +51,9 @@ fn to_pyerr(py: Python<'_>, e: tc::Error) -> PyErr {
         return set;
     }
     if let Err(set) = err.value(py).setattr("index", e.batch_index()) {
+        return set;
+    }
+    if let Err(set) = err.value(py).setattr("result", py.None()) {
         return set;
     }
     err
@@ -449,10 +453,7 @@ impl From<tc::Bucket> for Bucket {
 
 impl From<tc::SpreadBucket> for Bucket {
     fn from(s: tc::SpreadBucket) -> Self {
-        Bucket {
-            spread: Some([s.range, s.var_pop, s.var_samp, s.stddev_pop, s.stddev_samp]),
-            ..Bucket::from(s.bucket)
-        }
+        Bucket { spread: Some([s.range, s.var_pop, s.var_samp, s.stddev_pop, s.stddev_samp]), ..Bucket::from(s.bucket) }
     }
 }
 
@@ -773,6 +774,12 @@ impl Client {
         F: FnOnce(&mut tc::Client) -> tc::Result<T> + Send,
     {
         self.with_inner(py, |i| f(i.conn()?))
+    }
+
+    /// Runs a multi-series call (query_*_multi()).
+    fn multi(&self, py: Python<'_>, q: multi::Req) -> PyResult<Py<multi::Many>> {
+        let p = self.with(py, |c| multi::run(multi::Target::Client(c), &q))?;
+        multi::finish(py, q, p)
     }
 
     /// Typed inserts: into `one` series, or into `many` (a column of series ids).
@@ -1713,6 +1720,189 @@ impl Client {
     fn last_query_stats(&self, py: Python<'_>) -> PyResult<QueryStats> {
         self.with(py, |c| c.last_query_stats()).map(QueryStats::from)
     }
+
+    /// Reads the rows of many series in one request (protocol version 10).
+    ///
+    /// The server reads the series in parallel, from one consistent point in
+    /// time, and answers them in the order asked. Lists of more than 65,536
+    /// series go as several requests.
+    ///
+    /// Args:
+    ///     series: Series ids: a list of ints or a uint32 array.
+    ///     start: First timestamp to include (ms): one for every series, or a
+    ///         list or int64 array with one per series; None for no limit.
+    ///     end: Timestamp to stop before, like start.
+    ///     order: "asc" or "desc", for each series.
+    ///     limit: At most this many rows of each series; None for all.
+    ///     threads: Threads the request uses at most; 0 for the server's
+    ///         --request-threads (Db: the database's request_threads).
+    ///     max_rows: Rows of all series together, at most (ERR_TOO_MANY_BUCKETS
+    ///         past it); 0 for the server's --multi-max-rows (Db: no limit).
+    ///     errors: "raise" raises TsdbError (with .index and .result, the
+    ///         Many) for the first series that failed; "status" returns the
+    ///         Many, whose .status tells which failed.
+    ///     numpy: As for query_values().
+    ///
+    /// Returns:
+    ///     Many: r.ts and r.values hold every series' rows, r.offsets where
+    ///     each begins; r[i] is series i's (timestamps, values).
+    ///
+    /// Raises:
+    ///     TsdbError: A series failed (errors="raise"), the whole request
+    ///         failed, or the server is older than version 10.
+    #[pyo3(signature = (series, start = None, end = None, *, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise", numpy = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_values_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<multi::Many>> {
+        self.multi(
+            py,
+            multi::Req::new(multi::Kind::Values, series, start, end, order, limit, threads, max_rows, errors)?
+                .numpy(numpy),
+        )
+    }
+
+    /// Downsamples many series with LTTB (query_lttb()) in one request.
+    ///
+    /// Arguments and result as for query_values_multi(), with threshold as for
+    /// query_lttb().
+    #[pyo3(signature = (series, threshold, start = None, end = None, *, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise", numpy = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_lttb_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        threshold: u64,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+        numpy: Option<bool>,
+    ) -> PyResult<Py<multi::Many>> {
+        self.multi(
+            py,
+            multi::Req::new(multi::Kind::Lttb, series, start, end, order, limit, threads, max_rows, errors)?
+                .threshold(threshold)
+                .numpy(numpy),
+        )
+    }
+
+    /// Aggregates many series in one request (protocol version 10).
+    ///
+    /// Each series is bucketed as query_agg() (interval_ms), query_group()
+    /// (unit, count, timezone) or query_bounds() (bounds) would; with none of
+    /// them every series gets one bucket over its range. For a zone other than
+    /// UTC the client computes the local periods' bounds over all the series.
+    ///
+    /// Args:
+    ///     series, start, end, order, limit, threads, max_rows, errors: As for
+    ///         query_values_multi(); limit counts buckets.
+    ///     interval_ms: Bucket length in ms: one for all, or one per series.
+    ///     unit, count, timezone: Calendar periods, as for query_group().
+    ///     bounds: Bucket starts for every series, as for query_bounds().
+    ///
+    /// Returns:
+    ///     Many: r.buckets (a Buckets) holds every series' buckets, whose
+    ///     columns also read from r (r.counts, r.sum, ...); r[i] is series i's
+    ///     Buckets.
+    ///
+    /// Raises:
+    ///     TsdbError: As for query_values_multi().
+    ///     ValueError: More than one of interval_ms, unit and bounds.
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = None, *, unit = None, count = 1,
+                        timezone = None, bounds = None, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise"))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_buckets_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        interval_ms: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+        count: u32,
+        timezone: Option<&Bound<'_, PyAny>>,
+        bounds: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+    ) -> PyResult<Py<multi::Many>> {
+        let q = multi::Req::new(multi::Kind::Buckets, series, start, end, order, limit, threads, max_rows, errors)?;
+        self.multi(py, q.buckets(interval_ms, unit, count, timezone, bounds)?)
+    }
+
+    /// The spread aggregates (query_spread()) of many series in one request.
+    ///
+    /// Arguments and result as for query_buckets_multi(); the buckets have the
+    /// spread columns (range, var_pop, ...).
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = None, *, unit = None, count = 1,
+                        timezone = None, bounds = None, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise"))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_spread_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        interval_ms: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+        count: u32,
+        timezone: Option<&Bound<'_, PyAny>>,
+        bounds: Option<&Bound<'_, PyAny>>,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+    ) -> PyResult<Py<multi::Many>> {
+        let q = multi::Req::new(multi::Kind::Spread, series, start, end, order, limit, threads, max_rows, errors)?;
+        self.multi(py, q.buckets(interval_ms, unit, count, timezone, bounds)?)
+    }
+
+    /// Time-weighted averages (query_twa()) of many series in one request.
+    ///
+    /// Arguments as for query_buckets_multi(), with method and max_gap_ms as
+    /// for query_twa(). r.buckets is a TwaBuckets; r[i] is series i's.
+    #[pyo3(signature = (series, start = None, end = None, interval_ms = None, *, unit = None, count = 1,
+                        timezone = None, bounds = None, method = "step", max_gap_ms = 0, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise"))]
+    #[allow(clippy::too_many_arguments)]
+    fn query_twa_multi(
+        &self,
+        py: Python<'_>,
+        series: &Bound<'_, PyAny>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        interval_ms: Option<&Bound<'_, PyAny>>,
+        unit: Option<&str>,
+        count: u32,
+        timezone: Option<&Bound<'_, PyAny>>,
+        bounds: Option<&Bound<'_, PyAny>>,
+        method: &str,
+        max_gap_ms: i64,
+        order: &str,
+        limit: Option<u64>,
+        threads: u16,
+        max_rows: u64,
+        errors: &str,
+    ) -> PyResult<Py<multi::Many>> {
+        let q = multi::Req::new(multi::Kind::Twa, series, start, end, order, limit, threads, max_rows, errors)?;
+        self.multi(py, q.buckets(interval_ms, unit, count, timezone, bounds)?.twa(method, max_gap_ms)?)
+    }
 }
 
 /// Returns the text for a TSDB_ERR_* code, such as ERR_NOTFOUND.
@@ -1787,6 +1977,7 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Bucket>()?;
     m.add_class::<Buckets>()?;
     m.add_class::<arrays::BucketsMany>()?;
+    m.add_class::<multi::Many>()?;
     m.add_class::<arrays::TwaBucket>()?;
     m.add_class::<TwaBuckets>()?;
     // they are sequences, as the lists they replace were

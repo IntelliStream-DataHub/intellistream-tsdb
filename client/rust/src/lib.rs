@@ -87,6 +87,7 @@ pub use error::{Error, Result, Status, strerror};
 pub use keepalive::KeepAlive;
 pub use protocol::{DEFAULT_PORT, PROTOCOL_VERSION};
 pub use types::{
-    Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaMethod, TwaOpts, Unit,
+    Bucket, Buckets, Group, MultiOpts, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket,
+    TwaMethod, TwaOpts, Unit,
 };
 pub use value::{Bitmap, Column, ColumnRef, NULL_F32_BITS, NULL_F64_BITS, Native, Value, ValueType, Values, ValuesRef};

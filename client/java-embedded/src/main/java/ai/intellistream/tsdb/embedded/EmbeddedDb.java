@@ -1,12 +1,15 @@
 package ai.intellistream.tsdb.embedded;
 
 import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.Buckets;
 import ai.intellistream.tsdb.Column;
 import ai.intellistream.tsdb.Group;
+import ai.intellistream.tsdb.MultiOptions;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.QueryStats;
 import ai.intellistream.tsdb.RawConsumer;
+import ai.intellistream.tsdb.SeriesResult;
 import ai.intellistream.tsdb.Stats;
 import ai.intellistream.tsdb.SpreadBucket;
 import ai.intellistream.tsdb.Status;
@@ -28,7 +31,10 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -1934,6 +1940,466 @@ public final class EmbeddedDb implements AutoCloseable {
         stream(s, series, start, end, order, limit, LTTB, threshold);
         int n = s.fill;
         return new ValuePoints(Arrays.copyOf(s.ts, n), s.column(n, true));
+    }
+
+    // ------------------------------------------------------------------------------------------- many series
+
+    /*
+     * Many series in one call: tsdb_query_multi_collect, one downcall that answers every series (on the database's
+     * query threads) and returns one result per series. Calendar periods in a zone other than UTC go as in
+     * TsdbClient: two VALUES probes give the first and last row of every series, Group.bounds (java.time) one union
+     * of bounds, and the engine trims it per series (TSDB_MULTI_TRIM_*), so the periods are those of the single
+     * calls; TWA with closed range sides that differ between series goes series by series.
+     */
+
+    /** One call of tsdb_query_multi_collect. */
+    private static final class MultiCall {
+        final int kind;
+        final long start, end;
+        Order order = Order.ASC;
+        long limit;
+        long interval;
+        long[] intervals;
+        Group group; /* UTC only */
+        long[] bounds;
+        int trim;
+        long threshold;
+        TwaOptions twa;
+
+        MultiCall(int kind, long start, long end) {
+            this.kind = kind;
+            this.start = start;
+            this.end = end;
+        }
+    }
+
+    /** The result of one series, from its tsdb_series_result (status 0). */
+    private interface SeriesReader<T> {
+        T read(MemorySegment r);
+    }
+
+    private static final long RESULT = Native.SERIES_RESULT.byteSize();
+
+    private static MemorySegment longs(Arena a, long[] v) {
+        return v == null ? MemorySegment.NULL : a.allocateFrom(JAVA_LONG, v);
+    }
+
+    private <T> List<SeriesResult<T>> multiCollect(MultiCall q, int[] series, MultiOptions m, SeriesReader<T> reader)
+            throws TsdbException {
+        int n = series.length;
+        MemorySegment d = enter();
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment qs = a.allocate(Native.MULTI_QUERY).fill((byte) 0);
+            qs.set(JAVA_INT, Native.offset(Native.MULTI_QUERY, "kind"), q.kind);
+            qs.set(JAVA_LONG, Native.offset(Native.MULTI_QUERY, "start"), q.start);
+            qs.set(JAVA_LONG, Native.offset(Native.MULTI_QUERY, "end"), q.end);
+            qs.set(PTR, Native.offset(Native.MULTI_QUERY, "starts"), longs(a, m.starts()));
+            qs.set(PTR, Native.offset(Native.MULTI_QUERY, "ends"), longs(a, m.ends()));
+            MemorySegment.copy(opts(a, q.order, q.limit), 0, qs, Native.offset(Native.MULTI_QUERY, "opts"),
+                    Native.QUERY_OPTS.byteSize());
+            qs.set(JAVA_LONG, Native.offset(Native.MULTI_QUERY, "interval_ms"), q.interval);
+            qs.set(PTR, Native.offset(Native.MULTI_QUERY, "intervals"), longs(a, q.intervals));
+            qs.set(PTR, Native.offset(Native.MULTI_QUERY, "group"), group(a, q.group));
+            qs.set(PTR, Native.offset(Native.MULTI_QUERY, "bounds"), longs(a, q.bounds));
+            qs.set(SIZE_T, Native.offset(Native.MULTI_QUERY, "nbounds"), q.bounds == null ? 0 : q.bounds.length);
+            qs.set(JAVA_INT, Native.offset(Native.MULTI_QUERY, "trim"), q.trim);
+            qs.set(SIZE_T, Native.offset(Native.MULTI_QUERY, "threshold"), q.threshold);
+            if (q.twa != null)
+                MemorySegment.copy(twaOpts(a, q.twa), 0, qs, Native.offset(Native.MULTI_QUERY, "twa"),
+                        Native.TWA_OPTS.byteSize());
+            MemorySegment ids = n == 0 ? MemorySegment.NULL : a.allocateFrom(JAVA_INT, series);
+            MemorySegment mo = a.allocate(Native.MULTI_OPTS).fill((byte) 0);
+            mo.set(JAVA_INT, Native.offset(Native.MULTI_OPTS, "threads"), m.threads());
+            mo.set(JAVA_LONG, Native.offset(Native.MULTI_OPTS, "max_rows"), m.maxRows());
+            MemorySegment out = a.allocate(PTR);
+            out.set(PTR, 0, MemorySegment.NULL);
+            int rc;
+            try {
+                rc = (int) Native.QUERY_MULTI_COLLECT.invokeExact(d, qs, ids, (long) n, mo, out);
+            } catch (Throwable t) {
+                throw rethrow(t);
+            }
+            saveStats();
+            MemorySegment r = out.get(PTR, 0);
+            try {
+                check(rc, "query");
+                MemorySegment all = r.reinterpret(n * RESULT);
+                List<SeriesResult<T>> list = new ArrayList<>(n);
+                for (int i = 0; i < n; i++) {
+                    MemorySegment one = all.asSlice(i * RESULT, RESULT);
+                    int st = one.get(JAVA_INT, Native.offset(Native.SERIES_RESULT, "status"));
+                    list.add(st != 0 ? SeriesResult.failed(st, null) : SeriesResult.of(reader.read(one)));
+                }
+                return list;
+            } finally {
+                if (r.address() != 0) {
+                    try {
+                        Native.SERIES_RESULTS_FREE.invokeExact(r, (long) n);
+                    } catch (Throwable t) {
+                        throw rethrow(t);
+                    }
+                }
+            }
+        } finally {
+            exit();
+        }
+    }
+
+    private static ValuePoints readValues(MemorySegment r) {
+        int n = (int) r.get(SIZE_T, Native.offset(Native.SERIES_RESULT, "n"));
+        long vo = Native.offset(Native.SERIES_RESULT, "values");
+        ValueType t = typeOf(r.get(JAVA_INT, vo));
+        long[] ts = new long[n];
+        if (n == 0)
+            return null; /* typed afterwards: the engine sends no type with no rows */
+        MemorySegment.copy(r.get(PTR, Native.offset(Native.SERIES_RESULT, "ts")).reinterpret(n * 8L), JAVA_LONG, 0,
+                ts, 0, n);
+        MemorySegment vm = r.get(PTR, vo + 8);
+        Column c;
+        switch (t) {
+        case FLOAT32: {
+            float[] v = new float[n];
+            MemorySegment.copy(vm.reinterpret(n * 4L), JAVA_FLOAT, 0, v, 0, n);
+            c = Column.ofFloats(v);
+            break;
+        }
+        case FLOAT64: {
+            double[] v = new double[n];
+            MemorySegment.copy(vm.reinterpret(n * 8L), JAVA_DOUBLE, 0, v, 0, n);
+            c = Column.ofDoubles(v);
+            break;
+        }
+        case INT64: {
+            long[] v = new long[n];
+            MemorySegment.copy(vm.reinterpret(n * 8L), JAVA_LONG, 0, v, 0, n);
+            c = Column.ofLongs(v);
+            break;
+        }
+        case BOOL: {
+            boolean[] v = new boolean[n];
+            MemorySegment b = vm.reinterpret(n);
+            for (int i = 0; i < n; i++)
+                v[i] = b.get(JAVA_BYTE, i) != 0;
+            c = Column.ofBools(v);
+            break;
+        }
+        default: {
+            int[] v = new int[n];
+            MemorySegment.copy(vm.reinterpret(n * 4L), JAVA_INT, 0, v, 0, n);
+            c = Column.ofStates(v);
+        }
+        }
+        MemorySegment valid = r.get(PTR, vo + 16);
+        if (valid.address() != 0) {
+            MemorySegment bits = valid.reinterpret((n + 7) >>> 3);
+            BitSet nulls = new BitSet();
+            for (int i = 0; i < n; i++)
+                if ((bits.get(JAVA_BYTE, i >>> 3) >>> (i & 7) & 1) == 0)
+                    nulls.set(i);
+            if (!nulls.isEmpty())
+                c = c.withNulls(nulls);
+        }
+        return new ValuePoints(ts, c);
+    }
+
+    private static Column emptyColumn(ValueType t) {
+        switch (t) {
+        case FLOAT32: return Column.ofFloats();
+        case FLOAT64: return Column.ofDoubles();
+        case INT64: return Column.ofLongs();
+        case BOOL: return Column.ofBools();
+        default: return Column.ofStates();
+        }
+    }
+
+    private static <T> SeriesReader<List<T>> bucketsOf(long size, Element<T> element) {
+        return r -> {
+            int n = (int) r.get(SIZE_T, Native.offset(Native.SERIES_RESULT, "n"));
+            List<T> list = new ArrayList<>(n);
+            if (n > 0) {
+                MemorySegment m = r.get(PTR, Native.offset(Native.SERIES_RESULT, "buckets")).reinterpret(n * size);
+                for (int i = 0; i < n; i++)
+                    list.add(element.read(m, i * size));
+            }
+            return Collections.unmodifiableList(list);
+        };
+    }
+
+    private static void checkMulti(int[] series, MultiOptions m) {
+        Objects.requireNonNull(series, "series");
+        Objects.requireNonNull(m, "options");
+        if (m.starts() != null && m.starts().length != series.length)
+            throw new IllegalArgumentException(m.starts().length + " starts for " + series.length + " series");
+        if (m.ends() != null && m.ends().length != series.length)
+            throw new IllegalArgumentException(m.ends().length + " ends for " + series.length + " series");
+    }
+
+    private List<SeriesResult<ValuePoints>> rowsMulti(MultiCall q, int[] series, MultiOptions m)
+            throws TsdbException {
+        checkOpts(q.order, q.limit);
+        checkMulti(series, m);
+        List<SeriesResult<ValuePoints>> r = multiCollect(q, series, m, EmbeddedDb::readValues);
+        Map<Integer, ValueType> types = new HashMap<>();
+        for (int i = 0; i < r.size(); i++) {
+            if (!r.get(i).ok() || r.get(i).get() != null)
+                continue;
+            ValueType t = types.get(series[i]);
+            if (t == null) {
+                try {
+                    t = seriesType(series[i]);
+                } catch (TsdbException e) {
+                    if (e.status() != Status.ERR_NOTFOUND)
+                        throw e;
+                    t = ValueType.FLOAT32; /* an unknown id has no rows, as over TCP */
+                }
+                types.put(series[i], t);
+            }
+            r.set(i, SeriesResult.of(new ValuePoints(new long[0], emptyColumn(t))));
+        }
+        return Collections.unmodifiableList(r);
+    }
+
+    /**
+     * The rows of every series in {@code series} over {@code [start, end)} (or each series' own range from
+     * {@code m}), as {@link #queryValues(int, long, long, Order, long)} gives them for one, in one call, on up to
+     * {@code m.threads()} threads ({@link EmbeddedOptions#requestThreads}). As
+     * {@link TsdbClient#queryValuesMulti(int[], long, long, Order, long, MultiOptions)}: every series reads the
+     * same instant of each volume, an unknown id has no rows.
+     *
+     * @param series the series ids; an id may come more than once
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param order the order of each series' rows
+     * @param limit rows per series at most (0: all)
+     * @param m threads, a cap on all rows, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} rows in all
+     */
+    public List<SeriesResult<ValuePoints>> queryValuesMulti(int[] series, long start, long end, Order order,
+                                                            long limit, MultiOptions m) throws TsdbException {
+        MultiCall q = new MultiCall(Native.MULTI_VALUES, start, end);
+        q.order = order;
+        q.limit = limit;
+        return rowsMulti(q, series, m);
+    }
+
+    /**
+     * LTTB of every series in {@code series}, as {@link #queryLttb(int, long, long, long, Order, long)} gives it for
+     * one, in one call. As {@link TsdbClient#queryLttbMulti}.
+     *
+     * @param series the series ids
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param threshold points per series to keep
+     * @param order the order of each series' points
+     * @param limit points per series at most (0: all)
+     * @param m threads, a cap on all rows, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} rows in all
+     */
+    public List<SeriesResult<ValuePoints>> queryLttbMulti(int[] series, long start, long end, long threshold,
+                                                          Order order, long limit, MultiOptions m)
+            throws TsdbException {
+        MultiCall q = new MultiCall(Native.MULTI_LTTB, start, end);
+        q.order = order;
+        q.limit = limit;
+        q.threshold = threshold;
+        return rowsMulti(q, series, m);
+    }
+
+    /**
+     * Buckets of every series in {@code series}, as {@link #queryAgg}, {@link #queryGroup} or {@link #queryBounds}
+     * give them for one, in one call. As {@link TsdbClient#queryBucketsMulti}.
+     *
+     * @param series the series ids
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param b the buckets
+     * @param order the order of each series' buckets
+     * @param limit buckets per series at most (0: all)
+     * @param m threads, a cap on all buckets, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException {@link Status#ERR_INVALID} for a negative {@link Buckets#every} interval,
+     *     {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} buckets in all
+     */
+    public List<SeriesResult<List<Bucket>>> queryBucketsMulti(int[] series, long start, long end, Buckets b,
+                                                              Order order, long limit, MultiOptions m)
+            throws TsdbException {
+        MultiCall q = new MultiCall(Native.MULTI_BUCKETS, start, end);
+        q.order = order;
+        q.limit = limit;
+        return bucketMulti(q, b, series, m, bucketsOf(BUCKET.byteSize(), EmbeddedDb::bucket),
+                (s, lo, hi, g) -> queryGroup(s, lo, hi, g, order, limit));
+    }
+
+    /**
+     * Buckets with the spread of every series in {@code series}, as {@link #querySpread} gives them for one, in
+     * one call. As {@link TsdbClient#querySpreadMulti}.
+     *
+     * @param series the series ids
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param b the buckets
+     * @param order the order of each series' buckets
+     * @param limit buckets per series at most (0: all)
+     * @param m threads, a cap on all buckets, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException as {@link #queryBucketsMulti}
+     */
+    public List<SeriesResult<List<SpreadBucket>>> querySpreadMulti(int[] series, long start, long end, Buckets b,
+                                                                   Order order, long limit, MultiOptions m)
+            throws TsdbException {
+        MultiCall q = new MultiCall(Native.MULTI_SPREAD, start, end);
+        q.order = order;
+        q.limit = limit;
+        return bucketMulti(q, b, series, m, bucketsOf(Native.SPREAD_BUCKET.byteSize(), EmbeddedDb::spreadBucket),
+                (s, lo, hi, g) -> querySpreadGroup(s, lo, hi, g, order, limit));
+    }
+
+    /**
+     * Time-weighted averages of every series in {@code series}, as {@link #queryTwa} gives them for one, in one
+     * call. As {@link TsdbClient#queryTwaMulti}.
+     *
+     * @param series the series ids
+     * @param start the first timestamp included
+     * @param end the first timestamp excluded
+     * @param b the buckets
+     * @param opts the method, the longest gap, order and limit per series
+     * @param m threads, a cap on all buckets, per-series ranges
+     * @return one result per series, in the order of {@code series}
+     * @throws TsdbException as {@link #queryBucketsMulti}
+     */
+    public List<SeriesResult<List<TwaBucket>>> queryTwaMulti(int[] series, long start, long end, Buckets b,
+                                                             TwaOptions opts, MultiOptions m) throws TsdbException {
+        Objects.requireNonNull(opts, "opts");
+        MultiCall q = new MultiCall(Native.MULTI_TWA, start, end);
+        q.twa = opts;
+        return bucketMulti(q, b, series, m, bucketsOf(Native.TWA_BUCKET.byteSize(), EmbeddedDb::twaBucket),
+                (s, lo, hi, g) -> queryTwaGroup(s, lo, hi, g, opts));
+    }
+
+    /** The single call of a bucket kind for one series and a local group. */
+    private interface SingleGroup<T> {
+        List<T> call(int series, long start, long end, Group g) throws TsdbException;
+    }
+
+    private <T> List<SeriesResult<List<T>>> bucketMulti(MultiCall q, Buckets b, int[] series, MultiOptions m,
+                                                        SeriesReader<List<T>> reader, SingleGroup<T> single)
+            throws TsdbException {
+        Objects.requireNonNull(b, "buckets");
+        boolean twa = q.kind == Native.MULTI_TWA;
+        if (twa)
+            checkOpts(q.twa.order(), q.twa.limit());
+        else
+            checkOpts(q.order, q.limit);
+        checkMulti(series, m);
+        switch (b.kind()) {
+        case EVERY:
+            if (b.interval() < 0)
+                throw new TsdbException(Status.ERR_INVALID, "negative interval", null);
+            q.interval = b.interval();
+            break;
+        case INTERVALS:
+            if (b.intervals().length != series.length)
+                throw new IllegalArgumentException(b.intervals().length + " intervals for " + series.length
+                        + " series");
+            q.intervals = b.intervals();
+            break;
+        case BOUNDS:
+            checkBounds(b.bounds());
+            q.bounds = b.bounds();
+            break;
+        case GROUP:
+            if (local(b.group()))
+                return Collections.unmodifiableList(multiLocal(q, b.group(), series, m, reader, single));
+            q.group = b.group();
+            break;
+        default:
+            break;
+        }
+        if (series.length == 0)
+            return List.of();
+        return Collections.unmodifiableList(multiCollect(q, series, m, reader));
+    }
+
+    /** Calendar periods in a zone: one union of bounds, trimmed per series by the engine. */
+    private <T> List<SeriesResult<List<T>>> multiLocal(MultiCall q, Group g, int[] series, MultiOptions m,
+                                                       SeriesReader<List<T>> reader, SingleGroup<T> single)
+            throws TsdbException {
+        int n = series.length;
+        List<SeriesResult<List<T>>> out = new ArrayList<>(n);
+        if (n == 0)
+            return out;
+        boolean twa = q.kind == Native.MULTI_TWA;
+        long[] starts = m.starts(), ends = m.ends();
+        boolean us = uniform(starts), ue = uniform(ends);
+        long s0 = starts != null ? starts[0] : q.start, e0 = ends != null ? ends[0] : q.end;
+        /* buckets are cut to the rows on both sides; TWA only on open sides (a closed one is the range's edge) */
+        boolean openLo = !twa || (us && s0 == Long.MIN_VALUE);
+        boolean openHi = !twa || (ue && e0 == Long.MAX_VALUE);
+        long[] bounds = null;
+        if (!twa || !((!us && !openLo) || (!ue && !openHi))) {
+            long l = s0, h = e0 == Long.MIN_VALUE ? Long.MIN_VALUE : e0 - 1;
+            MultiOptions pm = new MultiOptions(m.threads(), 0, starts, ends);
+            for (int side = 0; side < 2; side++) {
+                if (side == 0 ? !openLo : !openHi)
+                    continue;
+                MultiCall vq = new MultiCall(Native.MULTI_VALUES, q.start, q.end);
+                vq.order = side == 0 ? Order.ASC : Order.DESC;
+                vq.limit = 1;
+                long edge = side == 0 ? Long.MAX_VALUE : Long.MIN_VALUE;
+                for (SeriesResult<ValuePoints> r : multiCollect(vq, series, pm, EmbeddedDb::readValues)) {
+                    ValuePoints p = r.ok() ? r.get() : null;
+                    if (p != null && p.size() > 0)
+                        edge = side == 0 ? Math.min(edge, p.timestamps()[0]) : Math.max(edge, p.timestamps()[0]);
+                }
+                if (side == 0)
+                    l = edge;
+                else
+                    h = edge;
+            }
+            if (l > h) { /* no rows anywhere (or an empty range): no buckets, as the single call answers */
+                for (int i = 0; i < n; i++)
+                    out.add(SeriesResult.of(List.of()));
+                return out;
+            }
+            try {
+                bounds = g.bounds(l, h == Long.MAX_VALUE ? Long.MAX_VALUE : h + 1);
+            } catch (TsdbException e) {
+                if (e.status() != Status.ERR_TOO_MANY_BUCKETS)
+                    throw e;
+            }
+        }
+        if (bounds == null) { /* series by series through the single calls */
+            long rows = 0;
+            for (int i = 0; i < n; i++) {
+                try {
+                    List<T> v = single.call(series[i], starts != null ? starts[i] : q.start,
+                            ends != null ? ends[i] : q.end, g);
+                    rows += v.size();
+                    if (m.maxRows() != 0 && rows > m.maxRows())
+                        throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS);
+                    out.add(SeriesResult.of(v));
+                } catch (TsdbException e) {
+                    if (m.maxRows() != 0 && rows > m.maxRows())
+                        throw e;
+                    out.add(SeriesResult.failed(e.status(), e.getMessage()));
+                }
+            }
+            return out;
+        }
+        q.bounds = bounds;
+        q.trim = (openLo ? Native.MULTI_TRIM_LO : 0) | (openHi ? Native.MULTI_TRIM_HI : 0);
+        return multiCollect(q, series, m, reader);
+    }
+
+    private static boolean uniform(long[] a) {
+        if (a == null)
+            return true;
+        for (long v : a)
+            if (v != a[0])
+                return false;
+        return true;
     }
 
     // ------------------------------------------------------------------------------------------- deletes, retention

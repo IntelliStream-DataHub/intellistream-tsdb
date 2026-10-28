@@ -2767,6 +2767,18 @@ static double request_memory(void)
     return v;
 }
 
+/* Waits up to 20 s for tsdb_request_memory_bytes to fall below `lim`; returns the last value. A connection closed
+ * with requests queued is freed only once its worker has run through them, so the next check would see them. */
+static double request_memory_below(double lim)
+{
+    double v = request_memory();
+    for (int i = 0; i < 2000 && (v < 0 || v >= lim); i++) {
+        usleep(10000);
+        v = request_memory();
+    }
+    return v;
+}
+
 /* Sends `fr` (`total` bytes, repeated) without blocking until the server stops taking it for a second or `cap`
  * bytes went; returns the bytes sent. */
 static size_t send_until_stalled(int fd, const uint8_t *fr, size_t total, size_t cap)
@@ -3137,6 +3149,9 @@ static void test_hostile(const char *dir)
         int64_t end = (int64_t)nbig;
         memcpy(q, &big, 4);
         memcpy(q + 12, &end, 8);
+        /* the empty frames of the connection before, up to 4 MB, may still be held: they would count here */
+        double before = request_memory_below(256 << 10);
+        CHECK(before >= 0 && before < (256 << 10));
         raw_send(fd, 1, TSDB_OP_QUERY_RAW, q, sizeof q); /* about 54 MB of reply, not read */
         size_t total;
         uint8_t *fr = insert_frame(s, 87000, 2, &total);

@@ -123,11 +123,33 @@
  *   A server of version 9 also stops bucketed queries with a limit early
  *   (QUERY_BUCKETS, QUERY_BOUNDS, QUERY_TWA compute only about the buckets
  *   they return); their replies do not change.
+ *   Version 10: many series in one request (tsdb_query_multi in tsdb.h has the rules).
+ *   QUERY_MULTI u8 op (QUERY_VALUES, QUERY_BUCKETS, QUERY_BOUNDS, QUERY_LTTB or QUERY_TWA), u8 flags,
+ *               u16 threads (0: the server's --request-threads; more is clamped to it), u32 n (1..65536),
+ *               u64 max_rows (rows or buckets sent in all; 0: --multi-max-rows; more is clamped), u32 tlen, u32 0,
+ *               [i64 starts[n]] [i64 ends[n]] [i64 intervals[n]] (each with its flag: PER_START, PER_END,
+ *               PER_INTERVAL), u32 series[n], zero bytes to a multiple of 8, then template[tlen]: the inner op's
+ *               payload with series 0xffffffff, and 0 in every field a flag replaces. The length is exactly that.
+ *               PER_INTERVAL: only the interval form of QUERY_BUCKETS and QUERY_TWA; TRIM_LO / TRIM_HI (bounds
+ *               of QUERY_BOUNDS or QUERY_TWA only): series i's bounds start at the last one at or before its first
+ *               row in range / end at the last one at or before its last row, as a client trims local periods.
+ *               Other flag bits are reserved. Duplicate series are answered each time.
+ *               -> for each series in index order, exactly the frames the inner op sends for it, each with
+ *                  u32 index after the status (TSDB_MULTI_PREFIX; frames up to TSDB_MAX_FRAME + 4); a series'
+ *                  status is its own (INVALID for a bad per-series value; an unknown id: 0 and no rows); then
+ *                  the END frame, last: index 0xffffffff, the request's status (0, INVALID, STOPPED,
+ *                  TOO_MANY_BUCKETS past max_rows, NOMEM) and u32 answered (series sent). A bad header or
+ *                  template gets the END frame alone, with INVALID.
+ *   CANCEL      u32 id                          -> no reply
+ *               a QUERY_MULTI with that id, running or queued on this connection, ends with END STOPPED after the
+ *               series in flight; other ids are ignored. Clients send both only to a server whose HELLO says 10.
+ *               tsdbd reads a connection in order and stops reading it while 4 MiB of requests or 16 QUERY_MULTIs
+ *               wait on it: a CANCEL sent behind those is read only as they run.
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
-#define TSDB_PROTOCOL_VERSION 9
+#define TSDB_PROTOCOL_VERSION 10
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
@@ -157,7 +179,8 @@ enum {
     TSDB_OP_QUERY_BOUNDS = 20,
     TSDB_OP_QUERY_LTTB = 21,
     TSDB_OP_QUERY_TWA = 22,
-    /* 23, 24 free */
+    TSDB_OP_QUERY_MULTI = 23,
+    TSDB_OP_CANCEL = 24,
     TSDB_OP_DELETE_RANGE = 25,
     TSDB_OP_REPLACE_RANGE = 26,
     TSDB_OP_SET_RETENTION = 27,
@@ -176,6 +199,16 @@ enum {
 #define TSDB_STATS_REPLY 88 /* bytes in a LAST_STATS reply after the status */
 #define TSDB_VALID 1  /* flags: a validity bitmap follows the values */
 #define TSDB_PACKED 2 /* flags: the arrays are packed and zstd compressed (version 3) */
+
+#define TSDB_MULTI_HEADER 24            /* QUERY_MULTI bytes before the per-series arrays (version 10) */
+#define TSDB_MULTI_MAX_SERIES 65536u     /* series in one QUERY_MULTI */
+#define TSDB_MULTI_PREFIX 4              /* a QUERY_MULTI reply frame: u32 index after the status */
+#define TSDB_MULTI_END 0xffffffffu       /* the index of the END frame */
+#define TSDB_MULTI_PER_START 1           /* QUERY_MULTI flags */
+#define TSDB_MULTI_PER_END 2
+#define TSDB_MULTI_PER_INTERVAL 4
+#define TSDB_MULTI_WIRE_TRIM_LO 8
+#define TSDB_MULTI_WIRE_TRIM_HI 16
 
 /* bytes per value on the wire: bool is one byte */
 static inline unsigned tsdb_wire_width(unsigned type) { return type == 3 ? 1 : type == 1 || type == 2 ? 8 : 4; }

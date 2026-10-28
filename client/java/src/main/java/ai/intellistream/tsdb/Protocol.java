@@ -3,7 +3,7 @@ package ai.intellistream.tsdb;
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */
 final class Protocol {
     /* HELLO answers the lower of both versions; each newer op is sent only to a server that named its version */
-    static final int VERSION = 9;
+    static final int VERSION = 10;
     static final int DEFAULT_PORT = 7070;
     static final int MAX_FRAME = 256 << 20;
     static final int HEADER = 9;           /* u32 length, u32 id, u8 op */
@@ -20,6 +20,15 @@ final class Protocol {
     static final int STATS_REPLY = 88;     /* LAST_STATS: f64 elapsed_s, 10 x u64 */
     static final int VALID = 1;            /* flags: a validity bitmap follows the values */
     static final int PACKED = 2;           /* flags: u32 raw_len and a zstd frame of the packed arrays (v3) */
+    /* QUERY_MULTI (v10): u8 op, u8 flags, u16 threads, u32 n, u64 max_rows, u32 tlen, u32 0, then the arrays */
+    static final int MULTI_HEADER = 24;
+    static final int MULTI_MAX_SERIES = 65536;
+    static final int MULTI_END = 0xffffffff;  /* the index of the reply's last frame: u32 series answered */
+    static final int MULTI_PER_START = 1;
+    static final int MULTI_PER_END = 2;
+    static final int MULTI_PER_INTERVAL = 4;
+    static final int MULTI_TRIM_LO = 8;
+    static final int MULTI_TRIM_HI = 16;
 
     static final byte OP_REPLY = 0;
     static final byte OP_HELLO = 1;
@@ -44,6 +53,8 @@ final class Protocol {
     static final byte OP_QUERY_BOUNDS = 20;
     static final byte OP_QUERY_LTTB = 21;     /* version 5; order and limit version 9 */
     static final byte OP_QUERY_TWA = 22;      /* version 6 */
+    static final byte OP_QUERY_MULTI = 23;    /* version 10 */
+    static final byte OP_CANCEL = 24;         /* version 10: no reply; its id is the id of the query it stops */
     static final byte OP_DELETE_RANGE = 25;   /* version 7 */
     static final byte OP_REPLACE_RANGE = 26;
     static final byte OP_SET_RETENTION = 27;
