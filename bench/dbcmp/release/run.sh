@@ -1370,9 +1370,12 @@ phase_checktest() {
 phase_smoke() {
     local S=${SMOKE_DIR:-/var/tmp/dbcmp-smoke/full} t0=$SECONDS rc=0
     case $S in /var/tmp/?*) ;; *) log "smoke: SMOKE_DIR must be under /var/tmp, not $S"; return 1 ;; esac
-    rm -rf "$S/results"; mkdir -p "$S/results"
-    log "SMOKE START: run.sh prep p1 p2 p3 p4 in $S (log $S/results/driver.log)"
-    env DBCMP="$S" WORK="$S/work" DATA="$S/input/mixed.rowbinary" IN="$S/sizes/in" OUT="$S/results" \
+    # SMOKE_PHASES and SMOKE_OUT rerun a part (P2_SYSTEMS etc. pass through) on the inputs of an earlier smoke run
+    local ph=${SMOKE_PHASES:-prep p1 p2 p3 p4} so=${SMOKE_OUT:-$S/results}
+    case $so in "$S"/?*) ;; *) log "smoke: SMOKE_OUT must be under $S, not $so"; return 1 ;; esac
+    rm -rf "$so"; mkdir -p "$so"
+    log "SMOKE START: run.sh $ph in $S (log $so/driver.log)"
+    env DBCMP="$S" WORK="$S/work" DATA="$S/input/mixed.rowbinary" IN="$S/sizes/in" OUT="$so" \
         CLICKHOUSE="$CLICKHOUSE" DUCKDB_DIR="$DUCKDB_DIR" CHDB_DIR="$CHDB_DIR" IOT_VENV="$IOT_VENV" HYD_RAW="$HYD_RAW" \
         BENCH_LOCK="$LOCK" TSDB_TREE="$TSDB_TREE" TB="$TB" BIN="$BIN" \
         SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10" \
@@ -1383,8 +1386,8 @@ phase_smoke() {
         I3_P2_STABLE=60 I3_P2_MAX=600 I3_P1_STABLE=60 I3_P1_MAX=600 \
         I2_EXTRA="-e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s" PROM_SETTLE_TIMEOUT=3600 \
         STEP_TIMEOUT=900 UNTIMED_TIMEOUT=1800 CHECK_TIMEOUT=900 QDRIVE_TIMEOUT=300 \
-        "$RDIR/run.sh" prep p1 p2 p3 p4 || rc=1
-    grep -E 'PHASE|FAIL|prep failed|END' "$S/results/driver.log" | tail -n 30 | sed 's/^/  smoke: /' >> "$OUT/driver.log"
+        "$RDIR/run.sh" $ph || rc=1
+    grep -E 'PHASE|FAIL|prep failed|END' "$so/driver.log" | tail -n 30 | sed 's/^/  smoke: /' >> "$OUT/driver.log"
     log "SMOKE $([ $rc = 0 ] && echo DONE || echo FAILED) in $(( (SECONDS - t0) / 60 )) min $(( (SECONDS - t0) % 60 )) s"
     return $rc
 }
