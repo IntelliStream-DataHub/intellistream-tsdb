@@ -544,6 +544,13 @@ bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
         done
     done
 }
+perc16() { # SYS PREFIX DIR DRIVER-ARGS...: the whole range as 100 per-series queries on 16 connections (after bcheck
+            # wrote q/SYS.fullN.per.txt), each system's fastest correct form of it, as for tsdb and ClickHouse
+    local S=$1 P=$2 D=$3 n
+    shift 3
+    for n in ${FULLS-$FULLS_DEFAULT}; do reps "$P.full$n.per.c16" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.full$n.per.txt" 16 100000 0; done
+    return 0   # a failed run is in FAILS already; the batches still run
+}
 bcheck() { # SYS DIR: batch files and their answer check (check.py --batch); 0 when they agree with the reference
     (cd "$WORK" && python3 -I "$H/mkbatch.py" "$1") || { fail "mkbatch $1"; return 1; }
     untimed "$2/check-batch-$1.txt" bash -c "cd '$WORK' && python3 -I '$H/check.py' --batch '$1' 5"
@@ -1001,7 +1008,7 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
     untimed "$D/check.txt" python3 -I "$H/check.py" qdb 200
     local PG="host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb"
     qsuite qdb "$P" "$D" pg "$PG"
-    bcheck qdb "$D" && { bsuite qdb "$P" "$D" pg "$PG"; pc_pin rb-qdb && PC=1 bsuite qdb "$P" "$D" pg "$PG"; pc_unpin rb-qdb; }
+    bcheck qdb "$D" && { perc16 qdb "$P" "$D" pg "$PG"; bsuite qdb "$P" "$D" pg "$PG"; pc_pin rb-qdb && PC=1 bsuite qdb "$P" "$D" pg "$PG"; pc_unpin rb-qdb; }
     REL q qdb twa > "$D/q.twa.sql"  # native twap() + SAMPLE BY 1h (REPORT §5.10), timed only when it agrees
     untimed "$D/check-twa.txt" REL check qdb twa ref/twa.jsonl && qline twa "$D" "$D/q.twa.sql" pg "$PG"
     REL q qdbseg twa > "$D/q.twaseg.sql"  # the 0.9.0 run's lead() CTE, for comparison
@@ -1118,8 +1125,8 @@ p2_i2() {
     qsuite i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
     local x
     for x in 0 1; do
-        bcheck i2ql "$D" && PC=$x bsuite i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'
-        bcheck i2flux "$D" && PC=$x bsuite i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
+        bcheck i2ql "$D" && { [ $x = 1 ] || perc16 i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'; } && PC=$x bsuite i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'
+        bcheck i2flux "$D" && { [ $x = 1 ] || perc16 i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'; } && PC=$x bsuite i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
         [ $x = 0 ] && { pc_pin rb-i2 || break; }
     done
     pc_unpin rb-i2
@@ -1153,7 +1160,7 @@ p2_i3() {
     untimed "$D/check.txt" python3 -I "$H/check.py" i3 200
     CLASSES="" qsuite i3 i3 "$D" http 127.0.0.1 8181 ""
     FULLS="" qsuite i3 i3 "$D" http 127.0.0.1 8181 ""
-    bcheck i3 "$D" && { bsuite i3 i3 "$D" http 127.0.0.1 8181 ""; pc_pin rb-i3 && PC=1 bsuite i3 i3 "$D" http 127.0.0.1 8181 ""; pc_unpin rb-i3; }
+    bcheck i3 "$D" && { perc16 i3 i3 "$D" http 127.0.0.1 8181 ""; bsuite i3 i3 "$D" http 127.0.0.1 8181 ""; pc_pin rb-i3 && PC=1 bsuite i3 i3 "$D" http 127.0.0.1 8181 ""; pc_unpin rb-i3; }
     REL q i3 twa > "$D/q.twa.http"
     untimed "$D/check-twa.txt" REL check i3 twa ref/twa.jsonl
     qline twa "$D" "$D/q.twa.http" http 127.0.0.1 8181 ""
