@@ -29,6 +29,21 @@ mkdir -p "$OUT"
 # 100-series raw batch). The limit is Podman's, not a server's setting, so no system gets it; ctr_mem records pids.peak.
 printf '[containers]\npids_limit = 0\n' > "$OUT/containers.conf"
 export CONTAINERS_CONF_OVERRIDE=$OUT/containers.conf
+# Podman's systemd cgroup manager asks the user's systemd manager for a scope per container; when that manager is gone
+# (the login session ended: "Connection refused" on the user bus) no container starts. A smoke run then uses cgroupfs,
+# without a cgroup per container: no memory or pids peaks and no OOM records (ctr_mem says "no cgroup memory files").
+# A release run refuses, since those records belong to its results.
+if ! systemctl --user show-environment > /dev/null 2>&1; then
+    case " $* " in *" smoke "*) SMOKE=1 ;; esac
+    if [ "${SMOKE:-0}" != 1 ]; then
+        echo "run.sh: no systemd user manager (systemctl --user fails); Podman cannot give containers their own" \
+            "cgroups, so memory peaks and OOM kills would go unrecorded. Log in again (or loginctl enable-linger)." >&2
+        exit 1
+    fi
+    printf '[engine]\ncgroup_manager = "cgroupfs"\n' >> "$OUT/containers.conf"
+    echo "$(date '+%F %T') no systemd user manager: smoke run with cgroup_manager cgroupfs (no memory/OOM records)" \
+        >> "$OUT/driver.log"
+fi
 
 # ------------------------------------------------------------------ logging, quiet gate, timed steps
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/driver.log"; }
@@ -242,11 +257,15 @@ qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD; QDB_PC=1: ev
         -e JVM_PREPEND=-XX:ActiveProcessorCount=1)
     # shellcheck disable=SC2046
     # the HTTP header buffer (default 64 KB) holds the URL: check.py sends a batch of 100 series as one GET /exec,
-    # which QuestDB otherwise drops ("URL query string is too long"); the timed queries go over PostgreSQL wire
+    # which QuestDB otherwise drops ("URL query string is too long"); the timed queries go over PostgreSQL wire.
+    # Every SELECT of a batch's UNION ALL holds a table reader: 32 connections x 100 series need 3200, and the
+    # default pool (cairo.reader.pool.max.segments 10 x 32 readers) refused them ("table busy [reason=pool size
+    # exceeded]", 2026-10-28 smoke). 128 segments (4096 readers) is a limit, not a cache: readers open on demand.
     podman run -d --name rb-qdb --network host -v "$W:/var/lib/questdb" $([ "${QDB_ZSTD:-0}" = 1 ] && qdb_zstd_env) \
         -e QDB_HTTP_NET_BIND_TO=127.0.0.1:9100 -e QDB_HTTP_MIN_NET_BIND_TO=127.0.0.1:9103 \
         -e QDB_PG_NET_BIND_TO=127.0.0.1:8812 -e QDB_LINE_TCP_NET_BIND_TO=127.0.0.1:9109 \
         -e QDB_LINE_UDP_ENABLED=false -e QDB_TELEMETRY_ENABLED=false -e QDB_HTTP_REQUEST_HEADER_BUFFER_SIZE=1048576 \
+        -e QDB_CAIRO_READER_POOL_MAX_SEGMENTS=128 \
         "${pc[@]}" "$QDB_IMG" > /dev/null 9>&- || { fail "questdb start"; return 1; }
     for i in $(seq 120); do curl -sf 'http://127.0.0.1:9100/exec?query=select%201' > /dev/null && return 0; sleep 0.5; done
     fail "questdb not ready"; return 1
