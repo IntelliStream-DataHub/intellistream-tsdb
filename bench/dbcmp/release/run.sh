@@ -11,7 +11,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 TOOLS=$RDIR
 DSLIST=${DSLIST:-"$DS_KINDS $DS_HYD"}
-P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom iot iotz td tdz vm"}
+P1_SYSTEMS=${P1_SYSTEMS:-"tsdb ch duck qdb qdbz ts i2 i3 prom iot iotz td tdz tdx vm"}
 P2_SYSTEMS=${P2_SYSTEMS:-"tsdb ch qdb0 qdb1 qdb2 ts i2 i3 iot iotz td tdz vm"}
 I3_P2_FLAGS=${I3_P2_FLAGS:-}            # smoke runs only: e.g. --force-snapshot-max-age 2m
 I3_P2_MIN=${I3_P2_MIN:-600}
@@ -1476,7 +1476,8 @@ U
 done_mark() { [ "${FORCE:-0}" != 1 ] && [ -e "$1" ]; }
 res_dir() { # PHASE SYS: the result directory of a system in phase 1 or 2
     case $1.$2 in 1.duck) echo "$OUT/p1/duckdb" ;; 2.qdb0) echo "$OUT/p2/qdb" ;; 2.qdb1) echo "$OUT/p2/qdb-parquet" ;;
-        2.qdb2) echo "$OUT/p2/qdb-parquet-zstd" ;; *) echo "$OUT/p$1/$2" ;; esac
+        2.qdb2) echo "$OUT/p2/qdb-parquet-zstd" ;; ?.iotz) echo "$OUT/p$1/iot-zstd" ;; ?.tdz) echo "$OUT/p$1/td-zstd" ;;
+        1.tdx) echo "$OUT/p1/td-xz" ;; *) echo "$OUT/p$1/$2" ;; esac
 }
 aside() { # PHASE SYS: a rerun starts empty: the last attempt's runs, REFUSED.txt, dash.txt and loose.txt go to
           # $OUT/old/ (outside what tables.py and runstats read), so they are neither averaged nor reported again

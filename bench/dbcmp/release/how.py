@@ -115,7 +115,7 @@ SYSTEMS = {
     ),
     "td": dict(
         system="TDengine (community)", image_env="TD_IMG",
-        settings=["CREATE DATABASE ... WAL_LEVEL 2 WAL_FSYNC_PERIOD 0 PRECISION 'ms'", "taosKeeper, taosExplorer, "
+        settings=["CREATE DATABASE ... WAL_LEVEL 2 WAL_FSYNC_PERIOD 0 PRECISION 'ms'; phase 2 with VGROUPS 16 (default 2; TDengine's planning docs: a core serves 1 to 2 vnodes)", "taosKeeper, taosExplorer, "
                   "taosX off", "REST on 6041 published on 127.0.0.1 only" + PASTA, "value FLOAT: ENCODE bss COMPRESS lz4 "
                   "LEVEL medium (default)", "container memory 24g"],
         durability="WAL fsynced before acknowledgement (WAL_LEVEL 2, WAL_FSYNC_PERIOD 0; default WAL_LEVEL 1)",
@@ -193,14 +193,18 @@ SYSTEMS["iot-zstd"] = dict(SYSTEMS["iot"], system="Apache IoTDB (table model, ZS
                            ["compressor=ZSTD, float encoding GORILLA"])
 SYSTEMS["td-zstd"] = dict(SYSTEMS["td"], system="TDengine (community, ZSTD)",
                           settings=[s for s in SYSTEMS["td"]["settings"] if not s.startswith("value")] +
-                          ["value FLOAT: COMPRESS 'zstd' LEVEL 'high' (never the lossy tsz)"])
+                          ["_ts TIMESTAMP and value FLOAT: COMPRESS 'zstd' LEVEL 'high' (never the lossy tsz)"])
+SYSTEMS["td-xz"] = dict(SYSTEMS["td"], system="TDengine (community, xz; sizes only)",
+                        settings=[s for s in SYSTEMS["td"]["settings"] if not s.startswith("value")] +
+                        ["_ts TIMESTAMP and value FLOAT: COMPRESS 'xz' LEVEL 'high', TDengine's smallest lossless "
+                         "setting"])
 SYSTEMS["chdb-lz4"] = dict(SYSTEMS["chdb"], system="chDB (embedded ClickHouse, default LZ4)",
                            settings=["default codecs (LZ4)"])
 SYSTEMS["duck"] = SYSTEMS["duckdb"]
 
 # run.sh's system names -> SYSTEMS key (phase 2's names are also its result directories)
 ALIAS = {"qdb0": "qdb", "qdb1": "qdb-parquet", "qdb2": "qdb-parquet-zstd", "qdbz": "qdb-parquet-zstd",
-         "iotz": "iot-zstd", "tdz": "td-zstd"}
+         "iotz": "iot-zstd", "tdz": "td-zstd", "tdx": "td-xz"}
 
 
 def image(env):

@@ -18,6 +18,7 @@
 TD_HDR=$'Authorization: Basic cm9vdDp0YW9zZGF0YQ==\r\n'   # root:taosdata, the default user
 TD_MEM=${TD_MEM:-24g}
 TD_STABLE=${TD_STABLE:-60}
+TD_P2_VGROUPS=${TD_P2_VGROUPS:-16}  # phase 2: 16 vgroups for 16 cores (planning docs: a core serves 1 to 2 vnodes; default 2)
 TD_SETTLE_MAX=${TD_SETTLE_MAX:-10800}
 TD_PROCS=${TD_PROCS:-8} TD_LINES=${TD_LINES:-100000}
 
@@ -42,10 +43,12 @@ td_sql() { # DATABASE|"" SQL: through REST; fails unless TDengine answers code 0
     case $out in *'"code":0,'*) return 0 ;; esac
     return 1
 }
-td_ddl() { # DATABASE: the database; TD_Z=1 also makes the supertable with zstd on the value column
-    td_sql "" "CREATE DATABASE $1 WAL_LEVEL 2 WAL_FSYNC_PERIOD 0 PRECISION 'ms'" > /dev/null || return 1
-    if [ "${TD_Z:-0}" = 1 ]; then  # the supertable schemaless would make (DESCRIBE after a schemaless load), with zstd
-        td_sql "$1" "CREATE STABLE sensors (_ts TIMESTAMP, value FLOAT COMPRESS 'zstd' LEVEL 'high') TAGS (\`series\` NCHAR(16))" > /dev/null || return 1
+td_ddl() { # DATABASE: the database (TD_VGROUPS: its vgroups, else TDengine's default 2); TD_Z=1 (zstd) or 2 (xz)
+           # also makes the supertable with that compressor at LEVEL 'high' on both columns
+    td_sql "" "CREATE DATABASE $1 WAL_LEVEL 2 WAL_FSYNC_PERIOD 0 PRECISION 'ms'${TD_VGROUPS:+ VGROUPS $TD_VGROUPS}" > /dev/null || return 1
+    local z=; case ${TD_Z:-0} in 1) z=zstd ;; 2) z=xz ;; esac
+    if [ -n "$z" ]; then  # the supertable schemaless would make (DESCRIBE after a schemaless load), with the compressor
+        td_sql "$1" "CREATE STABLE sensors (_ts TIMESTAMP COMPRESS '$z' LEVEL 'high', value FLOAT COMPRESS '$z' LEVEL 'high') TAGS (\`series\` NCHAR(16))" > /dev/null || return 1
     fi
 }
 td_load() { # FILE DATABASE: line protocol through taosAdapter
@@ -88,9 +91,10 @@ td_bytes() { # DU-FILE: data bytes: everything of the vnodes but the WAL (tsdb f
     awk -F'\t' '$2 != "wal" {s += $3} END {print s + 0}' "$1"
 }
 
-p1_tdz() { TD_Z=1 p1_td; }   # zstd high on the value column: sizes in p1/td-zstd.tsv
+p1_tdz() { TD_Z=1 p1_td; }   # zstd high on both columns: sizes in p1/td-zstd.tsv
+p1_tdx() { TD_Z=2 p1_td; }   # xz high on both columns (TDengine's smallest lossless setting): sizes in p1/td-xz.tsv
 p1_td() { # a database per data set (s_<ds>): its vnodes are its own, so du separates them
-    local v=td; [ "${TD_Z:-0}" = 1 ] && v=td-zstd
+    local v=td; [ "${TD_Z:-0}" = 1 ] && v=td-zstd; [ "${TD_Z:-0}" = 2 ] && v=td-xz
     local D=$OUT/p1/$v W=$DBCMP/s1/$v ds db f
     mkdir -p "$D"; rmdata "$W"
     TD_DDL_LOG=$D/ddl.txt td_start "$W" || return 1
@@ -108,9 +112,9 @@ p1_td() { # a database per data set (s_<ds>): its vnodes are its own, so du sepa
         td_du "$W" "$db" > "$D/du.$ds.txt"
         td_sql "$db" "SELECT count(value) FROM sensors" > "$D/count.$ds.json"
         td_sql "$db" "DESCRIBE sensors" > "$D/describe.$ds.json"
-        printf '%s\t%s\t%s\tvnode files but the WAL (du -sb) after FLUSH and COMPACT; value %s\n' "$ds" \
+        printf '%s\t%s\t%s\tvnode files but the WAL (du -sb) after FLUSH and COMPACT; %s\n' "$ds" \
             "$(jq -r '.data[0][0]' "$D/count.$ds.json" 2> /dev/null)" "$(td_bytes "$D/du.$ds.txt")" \
-            "$(jq -r '[.data[] | select(.[0] == "value") | .[4:7] | join(" ")][0]' "$D/describe.$ds.json" 2> /dev/null)" >> "$OUT/p1/$v.tsv"
+            "$(jq -r '[.data[] | select(.[0] == "value" or .[0] == "_ts") | .[0] + " " + (.[4:7] | join(" "))] | join("; ")' "$D/describe.$ds.json" 2> /dev/null)" >> "$OUT/p1/$v.tsv"
         [ "$(jq -r '.data[0][0]' "$D/count.$ds.json" 2> /dev/null)" = $(($(stat -c %s "$IN/$ds.rowbinary") / 16)) ] ||
             fail "p1 $v $ds: row count $(head -c 200 "$D/count.$ds.json") is not the file's $(($(stat -c %s "$IN/$ds.rowbinary") / 16))"
     done
@@ -130,7 +134,7 @@ p2_td() {
     for r in $(seq "$REPS"); do
         crm rb-td; rmdata "$W"
         TD_DDL_LOG=$D/ddl.$r.txt td_start "$W" || return 1
-        TD_DDL_LOG=$D/ddl.$r.txt td_ddl cmp || { fail "p2 $v ddl"; return 1; }
+        TD_VGROUPS=$TD_P2_VGROUPS TD_DDL_LOG=$D/ddl.$r.txt td_ddl cmp || { fail "p2 $v ddl"; return 1; }
         warm "$TD_LP"
         tstep "p2 $v load r$r" "$D/load.$r" -- td_timed
         untimed "$D/settle.$r.txt" td_settle "$W" cmp
