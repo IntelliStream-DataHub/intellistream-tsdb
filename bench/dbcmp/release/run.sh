@@ -368,13 +368,21 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
         REL has "$S" "$k" || { echo "$k: no query in rel.py for $S" >> "$D/dash.txt"; continue; }
         f=$D/q.$k.txt
         REL q "$S" "$k" > "$f"
+        # InfluxDB 2's timeWeightedAvg sees only its window's rows (no reading carried in across a bucket edge, none
+        # interpolated to it): a third of the hourly LINEAR buckets differ, so it does less work than tsdb's twal
+        case "$S:$k" in i2flux:twal)
+            echo "$k: InfluxDB 2's timeWeightedAvg interpolates only between the bucket's own rows, not across its edges (a third of the buckets differ from tsdb's LINEAR TWA); not timed" >> "$D/dash.txt"
+            continue ;;
+        esac
         # td: TDengine's TWA() (LINEAR) has tsdb's edges but accumulates with less precision: smoke 10 x 650 k,
-        # hourly, relative differences 1e-9 to 5e-8, and 1.7e-4 on an average near 0 (vibration, 8e-9 absolute)
-        case " ${TWA_LOOSE-i2flux td} " in
-        *" $S "*) # the built-in TWA with its own edges (InfluxDB 2's timeWeightedAvg sees only its window's rows):
-                  # timed whatever the check says; a difference goes to DIR/loose.txt for the tables, not a failure
-            REL check "$S" "$k" "ref/$k.jsonl" > "$D/check-$k.txt" 2>&1 9>&- ||
-                echo "$k: answers differ from tsdb's ($(grep -m1 "^$k:" "$D/check-$k.txt"))" >> "$D/loose.txt";;
+        # hourly, relative differences 1e-9 to 5e-8, and 1.7e-4 on an average near 0 (vibration, 8e-9 absolute).
+        # It is checked against a stated bound (TWA_TOL), timed only within it, and the bound and the largest
+        # difference go to DIR/loose.txt, which tables.py prints under the system's table
+        case " ${TWA_LOOSE-td} " in
+        *" $S "*)
+            REL_TOL=${TWA_TOL:-1e-6,1e-6} untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" ||
+                { log "  $S $k: not timed (answers differ beyond ${TWA_TOL:-1e-6,1e-6})"; continue; }
+            echo "$k: agrees with tsdb within ${TWA_TOL:-1e-6,1e-6} (relative, absolute) only, not 1e-9: $(grep -o 'largest difference.*' "$D/check-$k.txt" | head -1)" >> "$D/loose.txt";;
         *) untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { log "  $S $k: not timed (answers differ)"; continue; };;
         esac
         if [ "$1" = ch ]; then

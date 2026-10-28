@@ -380,6 +380,13 @@ def near(x, y, rel):
     """Within rel of each other; False for NaN on either side (abs(nan - y) > tol is False, so never test that way)."""
     return x == y or abs(x - y) <= rel * max(abs(x), abs(y), 1e-30)
 
+# REL_TOL "REL,ABS": the bound for the TWA average of a system whose built-in TWA has tsdb's edges but less precise
+# arithmetic (TDengine's TWA(): float accumulation), stated in the tables; default 1e-9 relative. Covered time stays exact.
+TOL_REL, TOL_ABS = (float(x) for x in os.environ.get("REL_TOL", "1e-9,0").split(","))
+
+def twa_near(x, y):
+    return near(x, y, TOL_REL) or (TOL_ABS > 0 and abs(x - y) <= TOL_ABS)
+
 def compare(kind, ref, rows, lenient_last=False):
     """rows: lists (series, t|b, v|area, [covered]); ref: relq dump. TWA rows with covered time compare it exactly;
     rows without it (series, b, twa: the TimescaleDB toolkit) compare the average only. A bucket missing on either
@@ -389,6 +396,7 @@ def compare(kind, ref, rows, lenient_last=False):
     for r in rows:
         got.setdefault(int(float(r[0])), []).append(r[1:])
     bad_series, bad_pts, bad_last, total = 0, 0, 0, 0
+    maxabs = maxrel = 0.0
     for s, e in sorted(ref.items()):
         g = got.get(s, [])
         if kind == "lttb":
@@ -416,7 +424,11 @@ def compare(kind, ref, rows, lenient_last=False):
             nb = nl = 0
             for b in set(eb) | set(gb):
                 x, y = eb.get(b), gb.get(b)
-                ok = x is not None and y is not None and near(x[0], y[0], 1e-9) and (y[1] is None or y[1] == x[1])
+                ok = x is not None and y is not None and twa_near(x[0], y[0]) and (y[1] is None or y[1] == x[1])
+                if x is not None and y is not None and x[0] == x[0] and y[0] == y[0]:
+                    d = abs(x[0] - y[0])
+                    maxabs = max(maxabs, d)
+                    maxrel = max(maxrel, d / max(abs(x[0]), abs(y[0]), 1e-30))
                 if not ok:
                     if lenient_last and (b == last or (x is None and b > (last or 0))): nl += 1
                     else:
@@ -428,7 +440,9 @@ def compare(kind, ref, rows, lenient_last=False):
     extra = sorted(set(got) - set(ref))
     print(f"{kind}: {len(ref)} {'windows' if kind in WKINDS else 'series'}, {total} reference {'points' if kind == 'lttb' else 'buckets'}; series with mismatches "
           f"{bad_series}, mismatched {bad_pts}, last-bucket differences {bad_last}{' (allowed: toolkit)' if lenient_last else ''}, "
-          f"unexpected series {len(extra)}")
+          f"unexpected series {len(extra)}" + ("" if kind == "lttb" else
+          f"; largest difference of an average {maxrel:.2g} relative, {maxabs:.2g} absolute (bound {TOL_REL:g} relative"
+          + (f" or {TOL_ABS:g} absolute)" if TOL_ABS > 0 else ")")))
     return bad_series == 0 and not extra
 
 def main():

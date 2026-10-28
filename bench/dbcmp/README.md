@@ -378,7 +378,9 @@ container (`rb-iot`, `rb-td`, `rb-vm`) with a 24 GB memory limit, ports publishe
 - Queries: SQL over REST (`/rest/sql/cmp`) through `qdrive`; a batch of K series is one statement.
 - Variants: `td` (the default for FLOAT: bss + LZ4) and `tdz` (ZSTD, level high). Never the lossy `tsz`.
 - `-`: LTTB. The hourly LINEAR TWA uses TDengine's `TWA()`; it agrees with tsdb's only to about 1e-8
-  relative (float precision), so that class is timed but marked as a loose match (`loose.txt`).
+  relative (float precision). It is checked against a stated bound instead of 1e-9 (`TWA_TOL`, default 1e-6
+  relative or 1e-6 absolute), timed only within it, and the bound and the largest difference are printed under
+  TDengine's table (`loose.txt`).
 - One core: TDengine is pinned to one CPU; its query thread setting (`numOfVnodeQueryThreads 1`)
   deadlocked a batch of 10, so it is left at its default.
 
