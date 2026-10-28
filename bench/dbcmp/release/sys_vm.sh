@@ -120,15 +120,17 @@ p2_vm() {
     python3 -I "$H/mkq.py" vm
     if untimed "$D/check.txt" python3 -I "$H/check.py" vm 200; then
         qsuite vm vm "$D" $Q ""
-        for n in ${FULLS-$FULLS_DEFAULT}; do   # 100 per-series queries on 16 connections, as tsdb and ClickHouse
-            reps "vm.full$n.per.c16" "$D" -- "$B/qdrive" $Q "" "$WORK/q/vm.full$n.per.txt" 16 100000 0
-        done
     fi
     echo "lttb: MetricsQL has no LTTB" >> "$D/dash.txt"
     local k; for k in twa $TWA_KINDS $TWA_WKINDS; do
         echo "$k: MetricsQL has no time-weighted average (integrate() is a STEP integral without the covered time)" >> "$D/dash.txt"
     done
-    bcheck vm "$D" && bsuite vm vm "$D" $Q ""
+    bcheck vm "$D" && {  # bcheck writes q/vm.full$n.per.txt (mkbatch.py), so the per-series runs come after it
+        for n in ${FULLS-$FULLS_DEFAULT}; do   # 100 per-series queries on 16 connections, as tsdb and ClickHouse
+            reps "vm.full$n.per.c16" "$D" -- "$B/qdrive" $Q "" "$WORK/q/vm.full$n.per.txt" 16 100000 0
+        done
+        bsuite vm vm "$D" $Q ""
+    }
     ctr_alive rb-vm "p2 vm after the query suites" && ctr_mem rb-vm "$D/mem.txt"
     # per core: a fresh start with one Go P (GOMAXPROCS=1, which VictoriaMetrics' cgroup code keeps) and one worker per
     # query, every thread pinned to PERCORE_CPU by taskset as the other containers

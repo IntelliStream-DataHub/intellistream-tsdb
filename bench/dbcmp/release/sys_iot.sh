@@ -138,12 +138,14 @@ p2_iot() {
     python3 -I "$H/mkq.py" iot
     if untimed "$D/check.txt" python3 -I "$H/check.py" iot 200; then
         qsuite iot "$v" "$D" $Q "$IOT_HDR"
+    fi
+    echo "lttb: IoTDB has no LTTB function" >> "$D/dash.txt"
+    bcheck iot "$D" && {  # bcheck writes q/iot.full$n.per.txt (mkbatch.py), so the per-series runs come after it
         for n in ${FULLS-$FULLS_DEFAULT}; do   # 100 per-series queries on 16 connections, as tsdb and ClickHouse
             reps "$v.full$n.per.c16" "$D" -- "$B/qdrive" $Q "$IOT_HDR" "$WORK/q/iot.full$n.per.txt" 16 100000 0
         done
-    fi
-    echo "lttb: IoTDB has no LTTB function" >> "$D/dash.txt"
-    bcheck iot "$D" && bsuite iot "$v" "$D" $Q "$IOT_HDR"
+        bsuite iot "$v" "$D" $Q "$IOT_HDR"
+    }
     REL q iot twa > "$D/q.twa.http"
     untimed "$D/check-twa.txt" REL check iot twa ref/twa.jsonl && qline twa "$D" "$D/q.twa.http" $Q "$IOT_HDR"
     twasuite iot "$D" $Q "$IOT_HDR"

@@ -193,6 +193,10 @@ int main(int argc, char **argv)
     const char *to = getenv("QDRIVE_TIMEOUT");
     if (to && *to) qtimeout = atof(to);
     FILE *f = fopen(argv[k], "r");
+    if (!f) { /* a missing query file is a failed run, never a crash in getline */
+        fprintf(stderr, "qdrive: cannot open %s: %s\n", argv[k], strerror(errno));
+        return 2;
+    }
     threads = atoi(argv[k + 1]);
     seconds = atof(argv[k + 2]);
     if (argc > k + 3) maxq = atol(argv[k + 3]);
