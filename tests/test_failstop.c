@@ -64,7 +64,7 @@ int tsdb_failed(tsdb *db, char *msg, size_t len)
 
 /* ------------------------------------------------------- fault injection */
 
-enum { F_WRITE = 1, F_PWRITE = 2, F_FSYNC = 4, F_FDATASYNC = 8, F_RENAME = 16 };
+enum { F_WRITE = 1, F_PWRITE = 2, F_FSYNC = 4, F_FDATASYNC = 8, F_RENAME = 16, F_UNLINK = 32 };
 
 static pthread_mutex_t f_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t f_cv = PTHREAD_COND_INITIALIZER;
@@ -200,6 +200,15 @@ int renameat(int olddirfd, const char *oldpath, int newdirfd, const char *newpat
     return (int)syscall(SYS_renameat, olddirfd, oldpath, newdirfd, newpath);
 }
 
+int unlinkat(int dirfd, const char *path, int flags)
+{
+    if (inject(F_UNLINK, -1, path)) {
+        errno = EIO;
+        return -1;
+    }
+    return (int)syscall(SYS_unlinkat, dirfd, path, flags);
+}
+
 static void arm(int op, const char *match, bool partial, bool drop)
 {
     pthread_mutex_lock(&f_lock);
@@ -277,6 +286,15 @@ static tsdb_options opts(void)
     o.buffer_rows = 1u << 20;
     o.merge_threads = 0;
     o.wal_max_batch_rows = 64;
+    return o;
+}
+
+/* Base partitions only: a test that counts partitions or names their parts (p1_) must not see a slow series
+ * move to a longer class, nor the CLASSES file that move creates */
+static tsdb_options opts_days(void)
+{
+    tsdb_options o = opts();
+    o.partition_classes = 0;
     return o;
 }
 
@@ -808,7 +826,7 @@ static bool find_file(const char *prefix, const char *suffix, char *out, size_t 
 /* A failed insert over two partitions whose intent is left on disk, the database closed. */
 static void intent_left(const char *name)
 {
-    tsdb *db = open_fresh(name, opts());
+    tsdb *db = open_fresh(name, opts_days());
     uint32_t id;
     OK(tsdb_series(db, "s", &id));
     arm(F_FSYNC, "/", false, false);
@@ -838,7 +856,7 @@ static void test_intent(const char *base)
     snprintf(name, sizeof name, "%s/failstop-intent", base);
 
     /* the directory fsync that makes the intent durable fails: committed or not, never half */
-    tsdb *db = open_fresh(name, opts());
+    tsdb *db = open_fresh(name, opts_days());
     uint32_t id;
     OK(tsdb_series(db, "s", &id));
     arm(F_FSYNC, "/", false, false);
@@ -853,7 +871,7 @@ static void test_intent(const char *base)
 
     /* the rename of the second partition's part fails after the intent is durable: the open rolls it forward,
      * so its tmp file must still be there */
-    db = open_fresh(name, opts());
+    db = open_fresh(name, opts_days());
     OK(tsdb_series(db, "s", &id));
     arm(F_RENAME, "p1_", false, false); /* renameat gets the bare name */
     CHECK(insert_n(db, id, 0, 100, true) == TSDB_ERR_IO);
@@ -920,6 +938,46 @@ static void test_intent(const char *base)
     CHECK(rows_after_open() == 100);
     printf("  failed commit of an insert over two partitions: all or nothing\n");
     printf("  a torn intent, or one whose parts are not all there, rolls the insert back\n");
+}
+
+/* CLASSES maps a series' rows to partitions, the WAL's on replay included: a failed write or sync of a record
+ * (or of the directory after the file was made) fails the engine, and the open cuts a torn record. A slow fresh
+ * series' first large insert writes its record (from the beginning of time) before any part. */
+static void test_classes_file(const char *base)
+{
+    static const struct {
+        int op;
+        const char *match, *msg;
+    } cases[] = {
+        {F_FSYNC, "/", "creating CLASSES"},
+        {F_PWRITE, "/CLASSES", "CLASSES"},
+        {F_FDATASYNC, "/CLASSES", "CLASSES"},
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        char name[600];
+        snprintf(name, sizeof name, "%s/failstop-classes-%zu", base, k);
+        tsdb *db = open_fresh(name, opts());
+        uint32_t id, slow;
+        OK(tsdb_series(db, "s", &id));
+        OK(tsdb_series(db, "slow", &slow));
+        OK(insert_n(db, id, 0, 100, false)); /* fast: class 0, no record */
+        int64_t ts[100];
+        float v[100];
+        for (int i = 0; i < 100; i++)
+            ts[i] = (int64_t)i * 600000, v[i] = (float)i; /* a row in 10 minutes */
+        arm(cases[k].op, cases[k].match, false, false);
+        CHECK(tsdb_insert_series(db, slow, ts, v, 100) == TSDB_ERR_IO);
+        CHECK(fired() == 1);
+        CHECK(is_failed(db, cases[k].msg));
+        CHECK(insert_n(db, id, 1000, 10, false) == TSDB_ERR_IO);
+        db = reopen(db);
+        CHECK(count_rows(db, "s") == 100);
+        CHECK(count_rows(db, "slow") == 0); /* failed before any part was written */
+        OK(insert_n(db, slow, 0, 100, false)); /* the series gets its class now */
+        CHECK(count_rows(db, "slow") == 100);
+        tsdb_close(db);
+    }
+    printf("  failed write or sync of CLASSES\n");
 }
 
 static int64_t stat_parts(tsdb *db)
@@ -1049,6 +1107,54 @@ static void test_wal_segment(const char *base)
     printf("  failed directory fsync after creating a WAL segment\n");
 }
 
+void tsdb_test_wal_state(tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced);
+
+static int wal_files(const char *dir)
+{
+    DIR *d = opendir(dir);
+    int n = 0;
+    for (struct dirent *e; d && (e = readdir(d));)
+        n += strncmp(e->d_name, "wal_", 4) == 0;
+    if (d)
+        closedir(d);
+    return n;
+}
+
+/* A flushed segment whose unlink fails stays, and wal_removed must not pass it: empty merge outputs (and the
+ * bound of a class switch) are dropped once every segment up to theirs is unlinked, and this one would replay at
+ * the next open. Before the fix the result of unlinkat was ignored and wal_removed moved on. The next flush
+ * removes it. */
+static void test_wal_unlink(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-unlink", base);
+    tsdb *db = open_fresh(name, opts());
+    uint32_t id;
+    OK(tsdb_series(db, "s", &id));
+    size_t nt;
+    uint64_t r0, r1, r2, sy;
+    tsdb_test_wal_state(db, &nt, &r0, &sy);
+    OK(tsdb_append(db, id, 1, 1));
+    arm(F_UNLINK, "wal_", false, false);
+    printf("  (a log line about removing a WAL segment is expected next)\n");
+    OK(tsdb_flush(db)); /* not fail-stop: nothing relies on the unlink */
+    CHECK(fired() == 1);
+    tsdb_test_wal_state(db, &nt, &r1, &sy);
+    CHECK(r1 == r0);
+    int stuck = wal_files(name);
+    CHECK(stuck == 2); /* the flushed segment and the new one */
+    OK(tsdb_append(db, id, 2, 2));
+    OK(tsdb_flush(db));
+    tsdb_test_wal_state(db, &nt, &r2, &sy);
+    CHECK(r2 >= r0 + 2);
+    CHECK(wal_files(name) == 1);
+    db = reopen(db);
+    int64_t want[] = {1, 2};
+    expect_rows(db, "s", want, 2);
+    tsdb_close(db);
+    printf("  failed unlink of a flushed WAL segment\n");
+}
+
 /* A large insert's part is renamed while another thread's directory fsync
  * fails. Its own fsync after that returns 0, but proves nothing: the kernel
  * reports a writeback error once per open file, the database shares one
@@ -1134,9 +1240,11 @@ int main(int argc, char **argv)
     test_background_sync(root);
     test_state_race(root);
     test_intent(root);
+    test_classes_file(root);
     test_merge(root);
     test_merge_backoff(root);
     test_wal_segment(root);
+    test_wal_unlink(root);
     test_drop_before(root);
     test_dir_fsync_race(root);
     if (!failures) {

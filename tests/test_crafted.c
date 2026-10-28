@@ -685,6 +685,56 @@ static void test_codecs(void)
     CHECK(in_child(patas_ring, NULL));
 }
 
+/* The part writer refuses rows out of (series, ts) order and writes nothing: a series run going back in time
+ * (what a placement that read two class histories once wrote), a repeated timestamp, a series before the last,
+ * within a granule and across granules. Before, it wrote them: queries binary-search the runs. */
+static void test_writer_order(const char *base)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/order", base);
+    tsdb_options o = opts();
+    o.granule_rows = 4;
+    eng *db;
+    OK(eng_open(dir, &o, &db));
+    static const struct {
+        uint32_t s1;
+        int64_t a[3];
+        uint32_t s2;
+        int64_t b[3];
+    } cases[] = {
+        {1, {10, 20, 30}, 1, {5, 6, 7}},     /* back in time across calls */
+        {1, {10, 20, 30}, 1, {30, 31, 32}},  /* a repeated ts */
+        {2, {10, 20, 30}, 1, {40, 50, 60}},  /* a series before the last */
+        {1, {10, 30, 20}, 2, {1, 2, 3}},     /* within a granule */
+    };
+    float v[3] = {1, 2, 3};
+    for (size_t c = 0; c < sizeof cases / sizeof *cases; c++) {
+        part_writer w;
+        OK(pw_begin(&w, db, 0, 0));
+        int rc = pw_add(&w, cases[c].s1, TSDB_FLOAT32, cases[c].a, v, 3);
+        if (rc == 0) {
+            rc = pw_add(&w, cases[c].s2, TSDB_FLOAT32, cases[c].b, v, 3);
+            part *p = NULL;
+            if (rc == 0)
+                rc = pw_finish(&w, 1, 1, 0, &p);
+            else
+                pw_abort(&w);
+            if (p)
+                part_unref(p);
+        } else {
+            pw_abort(&w);
+        }
+        CHECK(rc == TSDB_ERR_CORRUPT);
+    }
+    part_writer w; /* and a good one still goes through */
+    OK(pw_begin(&w, db, 0, 0));
+    int64_t t1[3] = {10, 20, 30}, t2[3] = {40, 50, 60};
+    OK(pw_add(&w, 1, TSDB_FLOAT32, t1, v, 3));
+    OK(pw_add(&w, 1, TSDB_FLOAT32, t2, v, 3));
+    pw_abort(&w);
+    CHECK(eng_close(db) == 0);
+}
+
 int main(int argc, char **argv)
 {
     /* a directory of this run's own: the fixed names below collided between worktrees testing at once */
@@ -701,6 +751,7 @@ int main(int argc, char **argv)
     test_dict(base);
     test_extremes(base);
     test_wal_unreachable(base);
+    test_writer_order(base);
     test_codecs();
     if (failures) {
         fprintf(stderr, "test_crafted: %d failures\n", failures);

@@ -3,7 +3,7 @@
  * while a nemesis crashes the server, and a checker verifies the history.
  *
  *   jepsen --dir DIR [--nemesis kill|power|pause|eio|none] [--seconds 20]
- *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so]
+ *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]
  *
  * Model. Each series is a set of keys (timestamps) holding the id of the write
  * that set them, last write wins. Every write has a unique id, stored as the
@@ -25,6 +25,18 @@
  * may stop or carry on, and then loses power (or, if idle, is stopped with
  * SIGTERM).
  * After each fault the server is restarted.
+ *
+ * Workloads. kv: 4 series, keys every 2 s. classes: partition classes at work. 8 series whose rate changes every
+ * few seconds of their timestamps (a row every 1, 3, 8 or 50 ms), written mostly near a frontier that moves
+ * through time as the run goes (some series also write anywhere into the past), on a server with small
+ * granules and partitions, flushes every 500 ms and idle merges after 1 s: fresh series get their class from
+ * their first rows, a series that speeds up moves to a shorter class at a flush, one that slows down to a
+ * longer one at the idle merge of its partition, while large inserts, replaces and deletes race those switches
+ * and the nemesis interrupts them. Checks 1-4 as below, and at the end, on the database opened in-process:
+ * classes did switch (at least one switch, parts in two classes), and after tsdb_optimize (one part per
+ * partition) the parts hold exactly as many rows as the final state has keys: no (series, time) in two
+ * partitions, whose copies a query would otherwise rank by block numbers that no merge keeps in order across
+ * partitions.
  *
  * Power runs also start a follower: a second tsdbd with --follow over the same
  * directory, outside the shim, as a query server on another host would be. It
@@ -76,11 +88,21 @@
 
 #include "../harness.h"
 
-#define NSERIES 4
+#define NSERIES 4        /* kv */
 #define NKEYS 6000
 #define T0 1700000000000LL
 #define KEY_MS 2000      /* keys every 2 s: 6000 keys span 3.3 hours */
 #define PARTITION_MS 3600000LL
+#define MAX_SERIES 8
+/* classes: base partitions of 2 s and granules of 512 rows, so a partition wants 4096 rows of a series: a row
+ * every 3.4 ms or faster gives class 1 (14 s), up to 13.7 ms class 2 (56 s), slower class 3 (728 s); a
+ * series speeding up from class 3 moves at a flush at a row every 6.8 ms or faster. */
+#define CL_SERIES 8
+#define CL_PARTITION_MS 2000
+#define CL_GRANULE_ROWS 512
+#define CL_SEG_MS 6000   /* a series keeps its rate for 6 s of timestamps */
+#define CL_SPEED 2       /* ms of timestamps the frontier moves per ms of the run */
+#define CL_NEAR 200      /* keys behind the frontier most writes go to */
 #define MAX_OPS 2000000
 #define MAX_FREADS 200000
 #define FOLLOW_FAIL_S 10 /* longest run of failed follower reads */
@@ -104,6 +126,7 @@ typedef struct rop {
     int series;
     uint32_t lo, hi;   /* key range [lo, hi) */
     uint32_t *seen;    /* write id per key in range, 0 = absent */
+    bool stray;        /* a row at a timestamp of no key (kept apart: seen[] holds write ids only) */
     int64_t invoke, complete;
     status st;
 } rop;
@@ -113,7 +136,13 @@ static int nclients = 8;
 static atomic_int port; /* where the current server listens, 0 while none runs: tsdbd picks it, see start_server */
 static double seconds = 20;
 static uint64_t seed = 1;
-static uint32_t ids[NSERIES];
+static uint32_t ids[MAX_SERIES];
+static bool classes;                /* --workload classes */
+static int nseries = NSERIES;
+static uint32_t nkeys[MAX_SERIES];  /* keys of a series */
+static size_t koff[MAX_SERIES + 1]; /* where its keys start in the checker's flat arrays */
+static int64_t *kts[MAX_SERIES];    /* the timestamp of each key, increasing */
+static int64_t run_start;           /* ns, when the clients start: the frontier moves from there */
 
 static wop *writes; /* indexed by write id; id 0 unused */
 static atomic_uint nwrites = 1;
@@ -124,6 +153,23 @@ static atomic_int server_pid;
 static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
 static int restarts;
 static char markpath[PATH_MAX]; /* eio: crashfs writes the path of the file it failed here */
+static char slogpath[PATH_MAX]; /* the stderr of the server's latest start */
+
+/* The last lines a file holds (a server's log), to stderr: why it did not come up. */
+static void print_tail(const char *path)
+{
+    char b[4096];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return;
+    off_t end = lseek(fd, 0, SEEK_END), at = end > (off_t)sizeof b ? end - (off_t)sizeof b : 0;
+    ssize_t n = pread(fd, b, sizeof b, at);
+    close(fd);
+    if (n > 0) {
+        fprintf(stderr, "jepsen: its log (%s) ends:\n", path);
+        fwrite(b, 1, (size_t)n, stderr);
+    }
+}
 static int failstops, eio_problems;
 static int lives_faulty, lives_clean, lives_died_starting; /* servers started under the nemesis, by kind */
 static int death_problems;       /* power: a server that ended any way but a power loss (exit 99) or our kill */
@@ -134,6 +180,9 @@ static char flogpath[PATH_MAX];     /* its stderr */
 static rop *freads;
 static atomic_uint nfreads;
 static int64_t ffail_longest;       /* ns, the longest run of failed follower reads */
+
+#define CL_STR_(x) #x
+#define CL_STR(x) CL_STR_(x)
 
 static int64_t now_ns(void)
 {
@@ -151,6 +200,84 @@ static uint64_t mix(uint64_t x)
     return x ^ (x >> 33);
 }
 
+/* -------------------------------------------------------------- keys */
+
+/* Keys of a series are its timestamps in order. kv: every 2 s. classes: in segments of CL_SEG_MS, each with its
+ * own spacing, in an order that differs per series, so each changes its rate several times in a run. */
+static void make_keys(void)
+{
+    static const int spacing[] = {1, 50, 8, 1, 3, 50};
+    int64_t span = (int64_t)(seconds * 1000) * CL_SPEED + 2 * CL_SEG_MS;
+    for (int s = 0; s < nseries; s++) {
+        size_t n = 0, cap = classes ? 1024 : NKEYS;
+        kts[s] = malloc(cap * sizeof *kts[s]);
+        for (int64_t t = T0; classes ? t < T0 + span : n < NKEYS;) {
+            if (n == cap)
+                kts[s] = realloc(kts[s], (cap *= 2) * sizeof *kts[s]);
+            kts[s][n++] = t;
+            t += classes ? spacing[((t - T0) / CL_SEG_MS + (uint64_t)s * 5 / 2) % 6] : KEY_MS;
+        }
+        nkeys[s] = (uint32_t)n;
+        koff[s + 1] = koff[s] + n;
+    }
+}
+
+/* [key_ts(lo), key_end(hi)) holds keys lo..hi-1 */
+static int64_t key_ts(int s, uint32_t k) { return kts[s][k]; }
+static int64_t key_end(int s, uint32_t k) { return k < nkeys[s] ? kts[s][k] : kts[s][nkeys[s] - 1] + 1; }
+
+/* The key at ts, or -1 if no key has it. */
+static int64_t ts_key(int s, int64_t ts)
+{
+    uint32_t lo = 0, hi = nkeys[s];
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (kts[s][mid] < ts)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < nkeys[s] && kts[s][lo] == ts ? (int64_t)lo : -1;
+}
+
+/* classes: keys below the frontier, which moves CL_SPEED ms of timestamps per ms of the run; kv: every key. */
+static uint32_t front(int s)
+{
+    if (!classes)
+        return nkeys[s];
+    int64_t ft = T0 + (now_ns() - run_start) / 1000000 * CL_SPEED;
+    uint32_t lo = 0, hi = nkeys[s];
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (kts[s][mid] < ft)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < 300 ? (nkeys[s] < 300 ? nkeys[s] : 300) : lo;
+}
+
+/* Where a key range starts. classes: mostly just behind the frontier (`near` of 100), else anywhere before it;
+ * kv: anywhere, as x % NKEYS always did. */
+static uint32_t pick_key(int s, uint64_t x, uint64_t y, int near)
+{
+    uint32_t f = front(s);
+    if (!classes || (int)(y % 100) >= near)
+        return (uint32_t)(x % f);
+    uint32_t w = f < CL_NEAR ? f : CL_NEAR;
+    return f - w + (uint32_t)(x % w);
+}
+
+/* The end of keys a write may use: a little past the frontier. */
+static uint32_t key_limit(int s)
+{
+    uint32_t f = front(s);
+    return !classes || f + 50 > nkeys[s] ? nkeys[s] : f + 50;
+}
+
+/* Series that write into the past as well (classes: the odd ones; their memtables then hold old rows too). */
+static int near_pct(int s) { return s % 2 ? 70 : 97; }
+
 /* ----------------------------------------------------------- the server */
 
 static void stop_server(int sig);
@@ -167,7 +294,7 @@ static void note_death(int st, bool we_killed, pid_t pid);
 static void start_server(bool faulty)
 {
     char pms[32], pf[PATH_MAX];
-    snprintf(pms, sizeof pms, "%lld", PARTITION_MS);
+    snprintf(pms, sizeof pms, "%lld", classes ? (long long)CL_PARTITION_MS : PARTITION_MS);
     atomic_store(&port, 0); /* until this server says where it listens, the clients have nowhere to go */
     for (int attempt = 0;; attempt++) {
         unlink(markpath); /* an EIO while opening: the clean server of the second attempt has no fault */
@@ -191,12 +318,25 @@ static void start_server(bool faulty)
                         setenv("CRASHFS_EIO_ONLY", "wal_", 1);
                 }
             }
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0 && !getenv("JEPSEN_VERBOSE"))
-                dup2(devnull, 2);
-            execl(tsdbd_path(), "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
-                  "--wal-max-batch-rows", "500", "--partition-ms", pms, getenv("TSDBD_IO") ? "--io" : NULL,
-                  getenv("TSDBD_IO"), (char *)NULL);
+            if (!getenv("JEPSEN_VERBOSE")) { /* kept for a server that does not come up */
+                int lfd = open(slogpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (lfd < 0)
+                    lfd = open("/dev/null", O_WRONLY);
+                if (lfd >= 0)
+                    dup2(lfd, 2);
+            }
+            const char *av[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
+                                  "--wal-max-batch-rows", "500", "--partition-ms", pms};
+            int ac = 13;
+            if (classes) {
+                av[ac++] = "--granule-rows", av[ac++] = CL_STR(CL_GRANULE_ROWS);
+                av[ac++] = "--merge-idle-s", av[ac++] = "1";
+                av[ac++] = "--flush-interval-ms", av[ac++] = "500";
+            }
+            if (getenv("TSDBD_IO"))
+                av[ac++] = "--io", av[ac++] = getenv("TSDBD_IO");
+            av[ac] = NULL;
+            execv(tsdbd_path(), (char **)av);
             _exit(127);
         }
         atomic_store(&server_pid, pid);
@@ -225,6 +365,7 @@ static void start_server(bool faulty)
             }
         }
         fprintf(stderr, "jepsen: the server does not come up: %s", th_why);
+        print_tail(slogpath);
         stop_server(SIGKILL);
         exit(2);
     }
@@ -318,26 +459,25 @@ static void *follower_reader(void *arg)
                 break;
             rop *q = &freads[idx];
             r = mix(r);
-            q->series = (int)(r % NSERIES);
-            q->lo = (uint32_t)((r >> 12) % NKEYS);
+            q->series = (int)(r % (uint64_t)nseries);
+            q->lo = pick_key(q->series, r >> 12, r >> 50, 50);
             q->hi = q->lo + 1 + (uint32_t)((r >> 30) % 400);
-            if (q->hi > NKEYS)
-                q->hi = NKEYS;
+            if (q->hi > nkeys[q->series])
+                q->hi = nkeys[q->series];
             q->seen = calloc(q->hi - q->lo, sizeof *q->seen);
             tsdb_points p;
             q->invoke = now_ns();
-            int rc = tsdbc_query_points(c, ids[q->series], T0 + (int64_t)q->lo * KEY_MS, T0 + (int64_t)q->hi * KEY_MS,
-                                        &p);
+            int rc = tsdbc_query_points(c, ids[q->series], key_ts(q->series, q->lo), key_end(q->series, q->hi), &p);
             q->complete = now_ns();
             if (rc == 0) {
                 ok = true;
                 q->st = ST_OK;
                 for (size_t i = 0; i < p.n; i++) {
-                    int64_t k = (p.ts[i] - T0) / KEY_MS;
-                    if (k >= q->lo && k < q->hi && (p.ts[i] - T0) % KEY_MS == 0)
+                    int64_t k = ts_key(q->series, p.ts[i]);
+                    if (k >= q->lo && k < q->hi)
                         q->seen[k - q->lo] = (uint32_t)p.values[i];
                     else
-                        q->seen[0] = UINT32_MAX;
+                        q->stray = true;
                 }
                 free(p.ts);
                 free(p.values);
@@ -388,7 +528,7 @@ static void *client(void *arg)
     tsdbc *c = connect_retry();
     while (c && !atomic_load(&stop)) {
         r = mix(r);
-        int s = (int)(r % NSERIES);
+        int s = (int)(r % (uint64_t)nseries);
         if ((r >> 8) % 100 < 6) { /* a delete or a replace of a key range */
             uint32_t id = atomic_fetch_add(&nwrites, 1);
             if (id >= MAX_OPS)
@@ -396,22 +536,22 @@ static void *client(void *arg)
             wop *w = &writes[id];
             w->series = s;
             w->kind = (r >> 16) % 2 ? W_REPLACE : W_DELETE;
-            w->lo = (uint32_t)(mix(r + 3) % NKEYS);
+            w->lo = pick_key(s, mix(r + 3), mix(r + 6), 50);
             w->hi = w->lo + 1 + (uint32_t)(mix(r + 4) % 200);
-            if (w->hi > NKEYS)
-                w->hi = NKEYS;
+            if (w->hi > key_limit(s))
+                w->hi = key_limit(s) > w->lo ? key_limit(s) : w->lo + 1;
             uint32_t n = w->kind == W_REPLACE ? (w->hi - w->lo) : 0, stride = 1 + (uint32_t)(mix(r + 5) % 4), m = 0;
             w->keys = malloc((n ? n : 1) * sizeof *w->keys);
             int64_t *ts = malloc((n ? n : 1) * sizeof *ts);
             float *v = malloc((n ? n : 1) * sizeof *v);
             for (uint32_t k = w->lo; k < w->lo + n; k += stride) {
                 w->keys[m] = k;
-                ts[m] = T0 + (int64_t)k * KEY_MS;
+                ts[m] = key_ts(s, k);
                 v[m++] = (float)id;
             }
             w->nkeys = m;
             tsdb_values col = {TSDB_FLOAT32, v, NULL};
-            int64_t a = T0 + (int64_t)w->lo * KEY_MS, b = T0 + (int64_t)w->hi * KEY_MS;
+            int64_t a = key_ts(s, w->lo), b = key_end(s, w->hi);
             w->invoke = now_ns();
             int rc = w->kind == W_REPLACE ? tsdbc_replace_range(c, ids[s], a, b, ts, &col, m)
                                           : tsdbc_delete_range(c, ids[s], a, b);
@@ -434,17 +574,22 @@ static void *client(void *arg)
             int64_t *ts = malloc(n * sizeof *ts);
             float *v = malloc(n * sizeof *v);
             /* distinct keys: a random start and stride */
-            uint32_t start = (uint32_t)(mix(r + 1) % NKEYS), stride = 1 + (uint32_t)(mix(r + 2) % 7);
-            uint32_t m = 0;
+            uint32_t lim = key_limit(s), stride = 1 + (uint32_t)(mix(r + 2) % 7);
+            uint32_t start = pick_key(s, mix(r + 1), mix(r + 7), near_pct(s)), m = 0;
+            if (classes && n > 20 && (mix(r + 7) % 100) < (uint64_t)near_pct(s)) /* large: ending at the frontier */
+            {
+                uint32_t span = n * stride, jitter = (uint32_t)(mix(r + 1) % CL_NEAR);
+                start = span + jitter < lim ? lim - span - jitter : 0;
+            }
             for (uint32_t i = 0; i < n; i++) {
-                uint32_t k = (start + i * stride) % NKEYS;
+                uint32_t k = (start + i * stride) % lim;
                 bool dup = false;
                 for (uint32_t j = 0; j < m && n <= 20; j++)
                     dup |= w->keys[j] == k;
-                if (dup || (n > 20 && i * stride >= NKEYS))
+                if (dup || (n > 20 && i * stride >= lim))
                     continue;
                 w->keys[m] = k;
-                ts[m] = T0 + (int64_t)k * KEY_MS;
+                ts[m] = key_ts(s, k);
                 v[m] = (float)id;
                 m++;
             }
@@ -465,23 +610,23 @@ static void *client(void *arg)
                 break;
             rop *q = &reads[idx];
             q->series = s;
-            q->lo = (uint32_t)((r >> 12) % NKEYS);
+            q->lo = pick_key(s, r >> 12, r >> 50, 50);
             q->hi = q->lo + 1 + (uint32_t)((r >> 30) % 400);
-            if (q->hi > NKEYS)
-                q->hi = NKEYS;
+            if (q->hi > nkeys[s])
+                q->hi = nkeys[s];
             q->seen = calloc(q->hi - q->lo, sizeof *q->seen);
             tsdb_points p;
             q->invoke = now_ns();
-            int rc = tsdbc_query_points(c, ids[s], T0 + (int64_t)q->lo * KEY_MS, T0 + (int64_t)q->hi * KEY_MS, &p);
+            int rc = tsdbc_query_points(c, ids[s], key_ts(s, q->lo), key_end(s, q->hi), &p);
             q->complete = now_ns();
             if (rc == 0) {
                 q->st = ST_OK;
                 for (size_t i = 0; i < p.n; i++) {
-                    int64_t k = (p.ts[i] - T0) / KEY_MS;
-                    if (k >= q->lo && k < q->hi && (p.ts[i] - T0) % KEY_MS == 0)
+                    int64_t k = ts_key(s, p.ts[i]);
+                    if (k >= q->lo && k < q->hi)
                         q->seen[k - q->lo] = (uint32_t)p.values[i];
                     else
-                        q->seen[0] = UINT32_MAX; /* a row at no key: invalid */
+                        q->stray = true; /* a row at no key: invalid */
                 }
                 free(p.ts);
                 free(p.values);
@@ -646,7 +791,7 @@ static bool wrote_key(uint32_t w, uint32_t k)
     return false;
 }
 
-/* deletes covering each key (series * NKEYS + key), as offsets into dlist */
+/* deletes covering each key (koff[series] + key), as offsets into dlist */
 static uint32_t *dcnt, *dlist;
 
 /* Whether a delete covering the key, that did not definitely fail, could be
@@ -654,7 +799,7 @@ static uint32_t *dcnt, *dlist;
  * completed at `before`: then the key may be absent. */
 static bool absent_ok(int series, uint32_t k, int64_t after, int64_t before)
 {
-    size_t slot = (size_t)series * NKEYS + k;
+    size_t slot = koff[series] + k;
     for (uint32_t i = dcnt[slot]; i < dcnt[slot + 1]; i++) {
         const wop *d = &writes[dlist[i]];
         if (d->st != ST_FAIL && d->complete >= after && d->invoke <= before)
@@ -663,7 +808,7 @@ static bool absent_ok(int series, uint32_t k, int64_t after, int64_t before)
     return false;
 }
 
-static int check(uint32_t final[NSERIES][NKEYS])
+static int check(const uint32_t *final)
 {
     uint32_t nw = atomic_load(&nwrites), nr = atomic_load(&nreads);
     if (nw > MAX_OPS)
@@ -671,27 +816,27 @@ static int check(uint32_t final[NSERIES][NKEYS])
     if (nr > MAX_OPS)
         nr = MAX_OPS;
     bool *applied = calloc(nw, sizeof *applied);
-    dcnt = calloc((size_t)NSERIES * NKEYS + 1, sizeof *dcnt);
+    dcnt = calloc(koff[nseries] + 1, sizeof *dcnt);
     size_t ndel = 0;
     for (uint32_t w = 1; w < nw; w++)
         for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++, ndel++)
-            dcnt[(size_t)writes[w].series * NKEYS + k + 1]++;
-    for (size_t x = 1; x <= (size_t)NSERIES * NKEYS; x++)
+            dcnt[koff[writes[w].series] + k + 1]++;
+    for (size_t x = 1; x <= koff[nseries]; x++)
         dcnt[x] += dcnt[x - 1];
     dlist = malloc((ndel + 1) * sizeof *dlist);
-    uint32_t *dfill = calloc((size_t)NSERIES * NKEYS, sizeof *dfill);
+    uint32_t *dfill = calloc(koff[nseries], sizeof *dfill);
     for (uint32_t w = 1; w < nw; w++)
         for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
-            size_t slot = (size_t)writes[w].series * NKEYS + k;
+            size_t slot = koff[writes[w].series] + k;
             dlist[dcnt[slot] + dfill[slot]++] = w;
         }
     free(dfill);
     /* applied: acknowledged, in the final state, or seen by a read */
     for (uint32_t w = 1; w < nw; w++)
         applied[w] = writes[w].st == ST_OK;
-    for (int s = 0; s < NSERIES; s++)
-        for (uint32_t k = 0; k < NKEYS; k++) {
-            uint32_t w = final[s][k];
+    for (int s = 0; s < nseries; s++)
+        for (uint32_t k = 0; k < nkeys[s]; k++) {
+            uint32_t w = final[koff[s] + k];
             if (!w)
                 continue;
             if (w >= nw || writes[w].series != s || !wrote_key(w, k)) {
@@ -704,7 +849,7 @@ static int check(uint32_t final[NSERIES][NKEYS])
         rop *q = &reads[i];
         if (q->st != ST_OK)
             continue;
-        if (q->hi > q->lo && q->seen[0] == UINT32_MAX) {
+        if (q->stray) {
             VIOLATION("read %u: a row at a timestamp no write used\n", i);
             continue;
         }
@@ -729,7 +874,7 @@ static int check(uint32_t final[NSERIES][NKEYS])
         if (!applied[w])
             continue;
         for (uint32_t i = 0; i < writes[w].nkeys; i++) {
-            uint32_t k = writes[w].keys[i], f = final[writes[w].series][k];
+            uint32_t k = writes[w].keys[i], f = final[koff[writes[w].series] + k];
             if (f ? older(f, w) : !absent_ok(writes[w].series, k, writes[w].invoke, INT64_MAX)) {
                 if (lost++ < 10)
                     VIOLATION("write %u (%s) to series %d key %u lost: final holds %u\n", w,
@@ -744,7 +889,7 @@ static int check(uint32_t final[NSERIES][NKEYS])
         if (!applied[w] || writes[w].kind == W_INSERT)
             continue;
         for (uint32_t k = writes[w].lo; k < writes[w].hi; k++) {
-            uint32_t f = final[writes[w].series][k];
+            uint32_t f = final[koff[writes[w].series] + k];
             if (f && f < nw && older(f, w)) {
                 if (lost++ < 10)
                     VIOLATION("%s %u of series %d keys %u..%u: final holds %u at key %u, which completed before\n",
@@ -779,6 +924,8 @@ static int check(uint32_t final[NSERIES][NKEYS])
                 if (k2 < q->lo || k2 >= q->hi)
                     continue;
                 uint32_t other = q->seen[k2 - q->lo];
+                if (other >= nw)
+                    continue; /* a value no write wrote: reported by check 1 */
                 if (other ? other != w && older(other, w) : !absent_ok(q->series, k2, writes[w].invoke, q->complete)) {
                     VIOLATION("read %u [%lld..%lld] saw write %u (%u keys, %lld..%lld) but %u (%u keys, %lld..%lld) at "
                               "its key %u: torn\n",
@@ -808,34 +955,34 @@ static int check(uint32_t final[NSERIES][NKEYS])
         int64_t complete, max_invoke;
     } ack;
     size_t total = 0;
-    uint32_t *cnt = calloc((size_t)NSERIES * NKEYS + 1, sizeof *cnt);
+    uint32_t *cnt = calloc(koff[nseries] + 1, sizeof *cnt);
     for (uint32_t w = 1; w < nw; w++)
         if (writes[w].st == ST_OK) {
             for (uint32_t j = 0; j < writes[w].nkeys; j++) {
-                cnt[(size_t)writes[w].series * NKEYS + writes[w].keys[j] + 1]++;
+                cnt[koff[writes[w].series] + writes[w].keys[j] + 1]++;
                 total++;
             }
             for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
-                cnt[(size_t)writes[w].series * NKEYS + k + 1]++;
+                cnt[koff[writes[w].series] + k + 1]++;
                 total++;
             }
         }
-    for (size_t x = 1; x <= (size_t)NSERIES * NKEYS; x++)
+    for (size_t x = 1; x <= koff[nseries]; x++)
         cnt[x] += cnt[x - 1];
     ack *acks = malloc((total + 1) * sizeof *acks);
-    uint32_t *fill = calloc((size_t)NSERIES * NKEYS, sizeof *fill);
+    uint32_t *fill = calloc(koff[nseries], sizeof *fill);
     for (uint32_t w = 1; w < nw; w++)
         if (writes[w].st == ST_OK) {
             for (uint32_t j = 0; j < writes[w].nkeys; j++) {
-                size_t slot = (size_t)writes[w].series * NKEYS + writes[w].keys[j];
+                size_t slot = koff[writes[w].series] + writes[w].keys[j];
                 acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke};
             }
             for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
-                size_t slot = (size_t)writes[w].series * NKEYS + k;
+                size_t slot = koff[writes[w].series] + k;
                 acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke};
             }
         }
-    for (size_t slot = 0; slot < (size_t)NSERIES * NKEYS; slot++) {
+    for (size_t slot = 0; slot < koff[nseries]; slot++) {
         ack *a = acks + cnt[slot];
         size_t n = cnt[slot + 1] - cnt[slot];
         for (size_t x = 1; x < n; x++) /* insertion sort: few writes per key */
@@ -853,7 +1000,7 @@ static int check(uint32_t final[NSERIES][NKEYS])
         if (q->st != ST_OK)
             continue;
         for (uint32_t k = q->lo; k < q->hi; k++) {
-            size_t slot = (size_t)q->series * NKEYS + k;
+            size_t slot = koff[q->series] + k;
             ack *a = acks + cnt[slot];
             size_t n = cnt[slot + 1] - cnt[slot], lo = 0, hi = n;
             while (lo < hi) { /* acknowledged before the read began */
@@ -882,21 +1029,23 @@ static int check(uint32_t final[NSERIES][NKEYS])
 }
 
 /* The follower's view of every series; nonzero if a read fails. */
-static int follower_state(uint32_t out[NSERIES][NKEYS])
+static int follower_state(uint32_t *out)
 {
     tsdbc *c;
     if (connect_own(fport, atomic_load(&follower_pid), &c) != 0)
         return -1;
     int rc = 0;
-    for (int s = 0; s < NSERIES && !rc; s++) {
-        memset(out[s], 0, sizeof out[s]);
+    memset(out, 0, koff[nseries] * sizeof *out);
+    for (int s = 0; s < nseries && !rc; s++) {
         tsdb_points p;
         if ((rc = tsdbc_query_points(c, ids[s], INT64_MIN, INT64_MAX, &p)) != 0)
             break;
         for (size_t i = 0; i < p.n; i++) {
-            int64_t k = (p.ts[i] - T0) / KEY_MS;
-            if (k >= 0 && k < NKEYS)
-                out[s][k] = (uint32_t)p.values[i];
+            int64_t k = ts_key(s, p.ts[i]);
+            if (k >= 0)
+                out[koff[s] + k] = (uint32_t)p.values[i];
+            else
+                out[koff[s]] = UINT32_MAX; /* a row at no key: never the writer's state */
         }
         free(p.ts);
         free(p.values);
@@ -907,7 +1056,7 @@ static int follower_state(uint32_t out[NSERIES][NKEYS])
 
 /* With the clean writer still up: the follower is alive, its reads were valid and did not keep failing, and it
  * catches up with `final`. Stops the follower. */
-static int check_follower(uint32_t final[NSERIES][NKEYS])
+static int check_follower(const uint32_t *final)
 {
     int before = violations;
     pid_t pid = atomic_load(&follower_pid);
@@ -931,7 +1080,7 @@ static int check_follower(uint32_t final[NSERIES][NKEYS])
         ok++;
         for (uint32_t k = q->lo; k < q->hi; k++)
             values += q->seen[k - q->lo] != 0;
-        if (q->hi > q->lo && q->seen[0] == UINT32_MAX) {
+        if (q->stray) {
             VIOLATION("follower read %u: a row at a timestamp no write used\n", i);
             continue;
         }
@@ -951,23 +1100,24 @@ static int check_follower(uint32_t final[NSERIES][NKEYS])
            (unsigned long long)values, ffail_longest / 1e9);
     if (ffail_longest > FOLLOW_FAIL_S * 1000000000LL)
         VIOLATION("follower reads kept failing for %.1f s\n", ffail_longest / 1e9);
-    static uint32_t view[NSERIES][NKEYS];
+    uint32_t *view = calloc(koff[nseries], sizeof *view);
     int64_t deadline = now_ns() + FOLLOW_CATCHUP_S * 1000000000LL;
     int rc;
     bool same = false;
-    while (!(same = (rc = follower_state(view)) == 0 && !memcmp(view, final, sizeof view)) && now_ns() < deadline)
+    while (!(same = (rc = follower_state(view)) == 0 && !memcmp(view, final, koff[nseries] * sizeof *view)) && now_ns() < deadline)
         usleep(100000);
     if (!same) {
         if (rc)
             VIOLATION("the follower cannot be read at the end: %s\n", rc < 0 ? "no connection" : tsdbc_strerror(rc));
-        for (int s = 0; s < NSERIES && !rc; s++)
-            for (uint32_t k = 0; k < NKEYS; k++)
-                if (view[s][k] != final[s][k]) {
+        for (int s = 0; s < nseries && !rc; s++)
+            for (uint32_t k = 0; k < nkeys[s]; k++)
+                if (view[koff[s] + k] != final[koff[s] + k]) {
                     VIOLATION("the follower does not catch up in %d s: series %d key %u holds %u, the writer %u\n",
-                              FOLLOW_CATCHUP_S, s, k, view[s][k], final[s][k]);
+                              FOLLOW_CATCHUP_S, s, k, view[koff[s] + k], final[koff[s] + k]);
                     break;
                 }
     }
+    free(view);
     signal_pid(pid, SIGTERM);
     waitpid(pid, &st, 0);
     atomic_store(&follower_pid, 0);
@@ -976,7 +1126,9 @@ static int check_follower(uint32_t final[NSERIES][NKEYS])
     return violations - before;
 }
 
-static void final_state(uint32_t final[NSERIES][NKEYS])
+static int stray_rows; /* rows at no key in a final read */
+
+static void final_state(uint32_t *final)
 {
     /* not connect_retry(): that gives up once `stop` is set, which it is by now */
     tsdbc *c = NULL;
@@ -987,8 +1139,8 @@ static void final_state(uint32_t final[NSERIES][NKEYS])
         stop_server(SIGTERM);
         exit(2);
     }
-    for (int s = 0; s < NSERIES; s++) {
-        memset(final[s], 0, sizeof final[s]);
+    memset(final, 0, koff[nseries] * sizeof *final);
+    for (int s = 0; s < nseries; s++) {
         tsdb_points p;
         int rc = tsdbc_query_points(c, ids[s], INT64_MIN, INT64_MAX, &p);
         if (rc != 0) {
@@ -1009,9 +1161,11 @@ static void final_state(uint32_t final[NSERIES][NKEYS])
             exit(2);
         }
         for (size_t i = 0; i < p.n; i++) {
-            int64_t k = (p.ts[i] - T0) / KEY_MS;
-            if (k >= 0 && k < NKEYS)
-                final[s][k] = (uint32_t)p.values[i];
+            int64_t k = ts_key(s, p.ts[i]);
+            if (k >= 0)
+                final[koff[s] + k] = (uint32_t)p.values[i];
+            else if (stray_rows++ < 5)
+                fprintf(stderr, "  final: series %d has a row at %lld, which no write used\n", s, (long long)p.ts[i]);
         }
         free(p.ts);
         free(p.values);
@@ -1019,12 +1173,104 @@ static void final_state(uint32_t final[NSERIES][NKEYS])
     tsdbc_close(c);
 }
 
+/* classes: on the database in-process, once no server runs. Classes switched (else the run tested nothing of them),
+ * and after tsdb_optimize, one part per partition with the newest of each (series, time) in it, the parts hold
+ * as many rows as the final state has keys and answer the final state: a (series, time) with rows in two
+ * partitions would count twice. */
+struct cls_tally {
+    uint64_t rows, parts[4], crows[4];
+};
+static void tally_part(void *ctx, const tsdb_part_info *in)
+{
+    struct cls_tally *t = ctx;
+    t->rows += in->rows;
+    if (in->cls >= 0 && in->cls < 4)
+        t->parts[in->cls]++, t->crows[in->cls] += in->rows;
+}
+
+static int check_classes(const uint32_t *final)
+{
+    int before = violations;
+    /* CLASSES: 24-byte records [check][series][from][class][0]; from = INT64_MIN is a fresh series' decision */
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/CLASSES", dir);
+    unsigned switches = 0, fresh = 0;
+    FILE *f = fopen(path, "rb");
+    unsigned char rec[24];
+    while (f && fread(rec, 1, sizeof rec, f) == sizeof rec) {
+        int64_t from;
+        memcpy(&from, rec + 8, 8);
+        if (from == INT64_MIN)
+            fresh++;
+        else
+            switches++;
+    }
+    if (f)
+        fclose(f);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    tsdb *db;
+    int rc = tsdb_open(dir, &o, &db);
+    if (rc) {
+        VIOLATION("classes: cannot open the database in-process: %s\n", tsdb_strerror(rc));
+        return violations - before;
+    }
+    int now[MAX_SERIES] = {0};
+    for (int s = 0; s < nseries; s++)
+        tsdb_series_class(db, ids[s], &now[s]);
+    struct cls_tally t = {0};
+    if ((rc = tsdb_optimize(db)) != 0)
+        VIOLATION("classes: tsdb_optimize: %s\n", tsdb_strerror(rc));
+    tsdb_foreach_part(db, tally_part, &t);
+    uint64_t keys = 0;
+    for (size_t x = 0; x < koff[nseries]; x++)
+        keys += final[x] != 0;
+    for (int s = 0; s < nseries; s++) {
+        tsdb_points p = {0};
+        if ((rc = tsdb_query_points(db, ids[s], INT64_MIN, INT64_MAX, &p)) != 0) {
+            VIOLATION("classes: in-process read of series %d: %s\n", s, tsdb_strerror(rc));
+            continue;
+        }
+        size_t same = 0;
+        for (size_t i = 0; i < p.n; i++) {
+            int64_t k = ts_key(s, p.ts[i]);
+            same += k >= 0 && final[koff[s] + k] == (uint32_t)p.values[i];
+        }
+        size_t want = 0;
+        for (uint32_t k = 0; k < nkeys[s]; k++)
+            want += final[koff[s] + k] != 0;
+        if (same != p.n || p.n != want)
+            VIOLATION("classes: after tsdb_optimize series %d has %zu rows, %zu of them as in the final state of "
+                      "%zu\n", s, p.n, same, want);
+        tsdb_points_free(&p);
+    }
+    tsdb_close(db);
+    unsigned used = 0;
+    for (int c = 0; c < 4; c++)
+        used += t.parts[c] > 0;
+    printf("classes: %u switches, %u fresh decisions; series now in classes", switches, fresh);
+    for (int s = 0; s < nseries; s++)
+        printf(" %d", now[s]);
+    printf("; after tsdb_optimize parts (rows) per class:");
+    for (int c = 0; c < 4; c++)
+        printf(" %llu (%llu)", (unsigned long long)t.parts[c], (unsigned long long)t.crows[c]);
+    printf("\n");
+    if (t.rows != keys)
+        VIOLATION("classes: after tsdb_optimize the parts hold %llu rows, the final state %llu: rows of one (series, "
+                  "time) in two partitions\n", (unsigned long long)t.rows, (unsigned long long)keys);
+    if (switches == 0 || used < 2)
+        VIOLATION("classes: %u switches, parts in %u classes: the workload tested no change of class\n", switches,
+                  used);
+    return violations - before;
+}
+
 int main(int argc, char **argv)
 {
     static struct option opts[] = {{"dir", required_argument, 0, 'd'},     {"nemesis", required_argument, 0, 'n'},
                                    {"seconds", required_argument, 0, 't'}, {"clients", required_argument, 0, 'c'},
                                    {"seed", required_argument, 0, 's'},    {"crashfs", required_argument, 0, 'f'},
-                                   {0, 0, 0, 0}};
+                                   {"workload", required_argument, 0, 'w'}, {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -1034,13 +1280,18 @@ int main(int argc, char **argv)
         case 'c': nclients = atoi(optarg); break;
         case 's': seed = strtoull(optarg, NULL, 10); break;
         case 'f': crashfs = optarg; break;
+        case 'w':
+            if (strcmp(optarg, "kv") && strcmp(optarg, "classes"))
+                return 2;
+            classes = !strcmp(optarg, "classes");
+            break;
         default: return 2;
         }
     }
     bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio");
     if (!dir || (shim && !crashfs)) {
         fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|none] [--seconds S] [--clients N]\n"
-                        "              [--seed N] [--crashfs build/libcrashfs.so]\n");
+                        "              [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]\n");
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
@@ -1059,12 +1310,15 @@ int main(int argc, char **argv)
     if (system(cmd) != 0)
         return 2;
     snprintf(markpath, sizeof markpath, "%s.eio", dir);
+    snprintf(slogpath, sizeof slogpath, "%s.server.log", dir);
     writes = calloc(MAX_OPS, sizeof *writes);
     reads = calloc(MAX_OPS, sizeof *reads);
+    nseries = classes ? CL_SERIES : NSERIES;
+    make_keys();
 
     start_server(false); /* the series exist before any fault */
     tsdbc *c = connect_retry();
-    for (int s = 0; s < NSERIES; s++) {
+    for (int s = 0; s < nseries; s++) {
         char name[32];
         snprintf(name, sizeof name, "jepsen.%d", s);
         if (tsdbc_series(c, name, 1, &ids[s])) {
@@ -1088,6 +1342,7 @@ int main(int argc, char **argv)
         start_follower();
         pthread_create(&fr, NULL, follower_reader, NULL);
     }
+    run_start = now_ns();
     for (int i = 0; i < nclients; i++)
         pthread_create(&th[i], NULL, client, (void *)(intptr_t)i);
     if (strcmp(nemesis, "none"))
@@ -1109,7 +1364,7 @@ int main(int argc, char **argv)
         server_gone();
     stop_server(strcmp(nemesis, "eio") ? SIGKILL : SIGTERM); /* eio: the shim rolls back at a normal exit */
     start_server(false);
-    static uint32_t final[NSERIES][NKEYS], again[NSERIES][NKEYS];
+    uint32_t *final = calloc(koff[nseries], sizeof *final), *again = calloc(koff[nseries], sizeof *again);
     final_state(final);
     stop_server(SIGTERM);
     start_server(false);
@@ -1133,9 +1388,13 @@ int main(int argc, char **argv)
     if (crashfs)
         printf("servers under the shim: %d faulty, %d clean (fallback after a failed start), %d died while starting\n",
                lives_faulty, lives_clean, lives_died_starting);
-    if (memcmp(final, again, sizeof final) != 0)
+    if (memcmp(final, again, koff[nseries] * sizeof *final) != 0)
         VIOLATION("the state changed across a clean restart\n");
+    if (stray_rows)
+        VIOLATION("%d rows at timestamps no write used in the final reads\n", stray_rows);
     int v = check(final); /* counts the follower's violations too */
+    if (classes)
+        v += check_classes(final);
     if (!strcmp(nemesis, "eio")) {
         printf("eio: %d fail-stops\n", failstops);
         v += eio_problems;
@@ -1151,6 +1410,8 @@ int main(int argc, char **argv)
         }
     }
     unlink(markpath);
+    if (!v)
+        unlink(slogpath);
     if (fport && !fv)
         unlink(flogpath);
     if (system(cmd) != 0)

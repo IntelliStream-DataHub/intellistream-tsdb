@@ -114,7 +114,7 @@ $(B)/test_threads: tests/test_threads.c src/internal.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_crafted $(B)/test_tzfiles $(B)/test_export $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_tzfiles $(B)/test_export $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
@@ -137,6 +137,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	B=$(B) tests/test_cli_input.sh
 	./$(B)/test_limits
 	./$(B)/test_small_parts
+	./$(B)/test_classes
 	./$(B)/test_follow
 	./$(B)/test_volumes
 	./$(B)/test_export
@@ -505,27 +506,35 @@ $(B)/test_limits: tests/test_limits.c $(LIB)
 $(B)/test_small_parts: tests/test_small_parts.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
+# partition classes: bulk loads, idle-merge switches, overlap, WAL replay, CLASSES damage, retention (switch hook: internal)
+$(B)/test_classes: tests/test_classes.c tools/datasets.h $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
+
 # with ARCH: in `make dist` it carries the glibc-compat header, since the tarball's test_server preloads it
 $(B)/libcrashfs.so: tests/jepsen/crashfs.c | $(B)
 	$(CC) -O2 -g -std=gnu11 -Wall $(ARCH) -fPIC -shared -o $@ $< -ldl -lpthread
 
-$(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB)
-	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+$(B)/jepsen: tests/jepsen/jepsen.c tests/harness.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
 # Jepsen-style fault injection: crashes, simulated power loss, I/O errors and pauses while
 # clients write and read; a checker verifies durability, atomicity and reads.
 # One directory per tree: worktrees run make jepsen at the same time, and a shared directory turns the other run's
 # activity into reported "lost writes". jepsen also refuses a directory another run holds.
 JEPSEN_DIR ?= /tmp/tsdb-jepsen-$(shell printf %s "$(CURDIR)" | cksum | cut -d' ' -f1)
+# Workloads: kv (keys every 2 s) and classes (rates that change, so series switch partition classes while
+# large inserts, replaces and deletes race the switches; see tests/jepsen/jepsen.c).
 JEPSEN_SEEDS ?= 1 2 3
+JEPSEN_WORKLOADS ?= kv classes
 jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so jepsen-selftest
-	for io in $(IO); do echo "== tsdbd --io $$io"; \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis kill  --seconds 20 && \
+	for io in $(IO); do for wl in $(JEPSEN_WORKLOADS); do echo "== tsdbd --io $$io, workload $$wl"; \
+	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis kill  --seconds 20 && \
 	    for seed in $(JEPSEN_SEEDS); do \
-	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis power --seconds 20 --seed $$seed \
+	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis power --seconds 20 --seed $$seed \
 	            --crashfs $(B)/libcrashfs.so || exit 1; done && \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis eio   --seconds 20 --crashfs $(B)/libcrashfs.so && \
-	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis pause --seconds 10 || exit 1; done
+	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis eio   --seconds 20 \
+	        --crashfs $(B)/libcrashfs.so && \
+	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis pause --seconds 10 || exit 1; done; done
 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
 # power run, and a power run that restarts too rarely fails too.

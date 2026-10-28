@@ -56,6 +56,8 @@ static void rmrf(const char *d)
         fprintf(stderr, "rm failed\n");
 }
 
+static int p_classes = 1; /* tsdb_options.partition_classes of the next open_db_p */
+
 static tsdb *open_db_p(const char *name, uint32_t granule_rows, int64_t partition_ms, char *dir)
 {
     snprintf(dir, 600, "%s/%s", base, name);
@@ -69,6 +71,7 @@ static tsdb *open_db_p(const char *name, uint32_t granule_rows, int64_t partitio
     o.buffer_rows = 1 << 22;
     o.wal_max_batch_rows = 64;
     o.partition_ms = partition_ms;
+    o.partition_classes = p_classes;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
     return db;
@@ -616,14 +619,17 @@ static tsdb_query_stats check_one(tsdb *db, uint32_t id, const ref_series *rs, i
 
 /* Without a staleness limit the snapshot spans the whole history, and every part used to add its last
  * granule before the range or its first after it, decoded: a query cost grew with the series' age. In daily
- * partitions (the default) only the parts next to the range may be read, and only the cut granules decoded. */
-static void test_history(void)
+ * partitions only the parts next to the range may be read, and only the cut granules decoded. With partition
+ * classes (the default) this slow series lives in one 364-day partition: one part, its granules full. */
+static void test_history(int classes)
 {
     char dir[600];
     tsdb_options d;
     tsdb_options_init(&d);
-    CHECK(d.partition_ms == 86400000);
+    CHECK(d.partition_ms == 86400000 && d.partition_classes == 1);
+    p_classes = classes;
     tsdb *db = open_db_p("history", 8192, d.partition_ms, dir);
+    p_classes = 1;
     uint32_t s;
     OK(tsdb_series_create(db, "x", TSDB_FLOAT64, NULL, &s));
     enum { DAYS = 60, PER = 144, N = DAYS * PER }; /* a reading every 10 minutes: a part of one granule a day */
@@ -647,9 +653,11 @@ static void test_history(void)
         for (int gi = 0; gi < 3; gi++) {
             int64_t gap = gi == 0 ? 0 : gi == 1 ? step : step / 2;
             tsdb_query_stats st = check_one(db, s, &rs, a0, a1, m, gap, "history: an hour");
-            CHECK(st.rows_decoded <= PER && st.granules <= 3 && st.parts <= 3);
+            CHECK(classes ? st.rows_decoded <= 8192 && st.granules <= 2 && st.parts == 1
+                          : st.rows_decoded <= PER && st.granules <= 3 && st.parts <= 3);
             st = check_one(db, s, &rs, b0, b1, m, gap, "history: a day across partitions");
-            CHECK(st.rows_decoded <= 2 * PER && st.granules <= 4 && st.parts <= 4);
+            CHECK(classes ? st.rows_decoded <= 8192 && st.granules <= 2 && st.parts == 1
+                          : st.rows_decoded <= 2 * PER && st.granules <= 4 && st.parts <= 4);
         }
     /* Corrections in a newer part at the last reading before b0 and the first after b1 (both in other
      * partitions): the sources tie on those times, and the newer value wins. */
@@ -1068,7 +1076,8 @@ int main(int argc, char **argv)
         return 1;
     test_rules();
     test_stats_only();
-    test_history();
+    test_history(0);
+    test_history(1);
     test_long_gap();
     test_local();
     test_random();

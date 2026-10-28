@@ -1103,6 +1103,7 @@ static void test_publish_then_merge(const char *dir)
 {
     rm_rf(dir);
     tsdb_options o = test_opts(1);
+    o.partition_classes = 0; /* counts parts by base partition */
     o.fsync = 1; /* so the merge thread can be held in its fdatasync */
     o.wal_max_batch_rows = 100;
     o.obsolete_part_lifetime_s = 0; /* a replaced part goes with its last reference */

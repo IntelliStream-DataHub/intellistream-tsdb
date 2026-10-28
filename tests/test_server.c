@@ -1081,8 +1081,9 @@ static void test_hello_keeps_errors(uint32_t f64)
 /* Version 4: the server knows UTC only; clients send the bounds of local periods. */
 /* QUERY_TWA: the interval, calendar, local and bounds forms, against hand-computed values */
 /* QUERY_BUCKETS with a limit stops early in the server as well, for the interval form (unit 0, which
- * tsdbc_query_agg_ex sends) as for calendar groups: 60 days at one row a minute, a granule a day, and the last (or
- * first) 3 hours touch one or two granules, not 60. */
+ * tsdbc_query_agg_ex sends) as for calendar groups: 60 days at one row a minute (a 364-day partition class: 11
+ * granules of 8192 rows; a granule a day in day partitions), and the last (or first) 3 hours touch one or two
+ * granules, not all. */
 static void test_limits_remote(tsdbc *c)
 {
     enum { DAYS = 60, N = DAYS * 1440 };
@@ -1103,7 +1104,7 @@ static void test_limits_remote(tsdbc *c)
     tsdb_query_stats st;
     OK(tsdbc_query_agg(c, s, t0, t1, 3600000, &all, &nall));
     OK(tsdbc_last_query_stats(c, &st));
-    CHECK(nall == DAYS * 24 && st.granules >= DAYS);
+    CHECK(nall == DAYS * 24 && st.granules >= N / 8192);
     for (int k = 0; k < 4; k++) {
         tsdb_query_opts q = {k & 1 ? TSDB_DESC : TSDB_ASC, 3};
         if (k < 2)
@@ -1111,11 +1112,11 @@ static void test_limits_remote(tsdbc *c)
         else
             OK(tsdbc_query_group(c, s, t0, t1, &(tsdb_group){TSDB_HOUR, 1, NULL}, &q, &b, &n));
         OK(tsdbc_last_query_stats(c, &st));
-        if (st.granules > 2 || st.rows_decoded > 2 * 1440)
+        if (st.granules > 2 || st.rows_decoded > 2 * 8192)
             fprintf(stderr, "  limits %s %s: %llu granules, %llu rows decoded for 3 buckets\n",
                     k < 2 ? "agg_ex" : "group", k & 1 ? "desc" : "asc", (unsigned long long)st.granules,
                     (unsigned long long)st.rows_decoded);
-        CHECK(st.granules <= 2 && st.rows_decoded <= 2 * 1440);
+        CHECK(st.granules <= 2 && st.rows_decoded <= 2 * 8192);
         CHECK(n == 3);
         for (size_t i = 0; i < n && n == 3; i++)
             CHECK(!memcmp(&b[i], &all[k & 1 ? nall - 1 - i : i], sizeof *b));

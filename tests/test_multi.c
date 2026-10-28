@@ -1,5 +1,6 @@
 /* tsdb_query_multi: every kind, mode, order and limit equals the single-series call, byte for byte, on data with
- * all five types, nulls, memtable rows, unmerged overlaps, deletes, replaces, retention and two volumes; for 1, 2,
+ * all five types, nulls, memtable rows, unmerged overlaps, deletes, replaces, retention, series in partitions of
+ * several classes and two volumes; for 1, 2,
  * 7 and 32 threads and with forced deferral; stop, cancel, max_rows, statistics, TRIM against *_group_local
  * across DST, and one cut per request (no insert seen by some series of a request and not by others), also over 12 volumes. */
 #include "internal.h"
@@ -70,6 +71,8 @@ static void put(tsdb *db, uint32_t id, tsdb_type t, const int64_t *ts, size_t n,
     free(valid);
 }
 
+static void rows_per_cls(void *ctx, const tsdb_part_info *p) { ((uint64_t *)ctx)[p->cls & 3] += p->rows; }
+
 static void fill(tsdb *db)
 {
     int64_t *ts = malloc(40000 * sizeof *ts);
@@ -121,6 +124,24 @@ static void fill(tsdb *db)
         tsdb_values vals = {t, v, NULL};
         OK(tsdb_replace_range(db, ids[2], T0 + 3600000, T0 + 3800000, rts, &vals, 100));
     }
+    /* three series switch partition classes (one in the second volume); batch D lies after the switch, in the new
+     * class's partitions, and batch C below goes into the past: into the class-0 partitions of batch A */
+    const size_t sw[3] = {3, 6, 9};
+    for (int j = 0; j < 3; j++) {
+        OK(tsdb_test_class_switch(db, ids[sw[j]], 3 - j, NULL));
+        int c;
+        OK(tsdb_series_class(db, ids[sw[j]], &c));
+        CHECK(c == 3 - j);
+        tsdb_type t;
+        OK(tsdb_series_type(db, ids[sw[j]], &t));
+        for (size_t i = 0; i < 3000; i++)
+            ts[i] = T0 + 23 * 3600000LL + (int64_t)i * 1000 + 500;
+        put(db, ids[sw[j]], t, ts, 3000, (int)sw[j] + 70, 1);
+    }
+    OK(tsdb_flush(db));
+    uint64_t per_cls[4] = {0};
+    OK(tsdb_foreach_part(db, rows_per_cls, per_cls));
+    CHECK(per_cls[1] == 3000 && per_cls[2] == 3000 && per_cls[3] == 3000);
     /* batch C: in the memtable */
     for (size_t k = 0; k < nids; k++) {
         tsdb_type t;

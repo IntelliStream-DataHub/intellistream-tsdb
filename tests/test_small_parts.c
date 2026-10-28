@@ -2,7 +2,9 @@
  * random order with replaces, deletes, retention, memtable rows and a reopen, and every query kind over random
  * windows checked against a model of what each series holds. Raw queries step through hundreds of parts and partial
  * granules: the decode buffers are sized by the largest granule a source reads and freed when it drains (run it under
- * make asan). Found the mutants of that sizing and freeing that the other suites let through.
+ * make asan). Found the mutants of that sizing and freeing that the other suites let through. Series switch
+ * partition classes at random times (the test hook), so their rows lie in partitions of several lengths, and
+ * writes into the past land in the partitions of the class they had then.
  *
  *   test_small_parts [scratch dir] [seeds]   (default /tmp, 4 seeds) */
 #define _GNU_SOURCE
@@ -14,7 +16,9 @@
 #include <string.h>
 #include <unistd.h>
 
-extern size_t desc_window_rows; /* internal: a small window makes DESC queries step back through many windows */
+extern size_t desc_window_rows;
+/* internal test hook: switch a series to class cls at the next boundary after its rows (or *at when later) */
+int tsdb_test_class_switch(tsdb *t, uint32_t series, int cls, const int64_t *at); /* internal: a small window makes DESC queries step back through many windows */
 
 #define K 3000 /* row slots per series, one per second */
 #define T0 1699920000000LL
@@ -277,6 +281,12 @@ static void query_all(tsdb *db, int rounds)
         }
 }
 
+static void count_cls(void *ctx, const tsdb_part_info *p)
+{
+    ((size_t *)ctx)[p->cls & 3]++;
+    ((size_t *)ctx)[4]++;
+}
+
 static void run(const char *dir, unsigned seed)
 {
     rs = seed * 2654435761u + 1;
@@ -298,7 +308,7 @@ static void run(const char *dir, unsigned seed)
     const char *names[NS] = {"f32disjoint", "f32mixed", "f64", "i64", "bool"};
     for (int s = 0; s < NS; s++)
         OK(tsdb_series_create(db, names[s], types[s], NULL, &ids[s]));
-    int next_a = 0, ks[64];
+    int next_a = 0, ks[64], switches = 0;
     for (int it = 0; it < 900; it++) {
         int s = (int)(rnd() % NS);
         if (s == 0) { /* disjoint and increasing: parts of 1 to 3 granules, the last one short */
@@ -309,8 +319,10 @@ static void run(const char *dir, unsigned seed)
                 ks[i] = next_a + i;
             next_a += n + (int)(rnd() % 3);
             write_rows(db, s, ks, n, 0, 0, 0);
-        } else { /* scattered over a window, overlapping earlier parts; one in 25 a replace */
-            int w0 = (int)(rnd() % K), n = 1 + (int)(rnd() % 40), span = n + (int)(rnd() % 200), m = 0;
+        } else { /* scattered over a window, overlapping earlier parts; one in 25 a replace. The windows reach
+                  * further as the run goes on, so that rows come after the boundary of a class switch. */
+            int front = 300 + it * 3 < K ? 300 + it * 3 : K;
+            int w0 = (int)(rnd() % (unsigned)front), n = 1 + (int)(rnd() % 40), span = n + (int)(rnd() % 200), m = 0;
             for (int k = w0; k < w0 + span && k < K && m < n; k++)
                 if (rnd() % (unsigned)(span / n + 1) == 0)
                     ks[m++] = k;
@@ -333,8 +345,16 @@ static void run(const char *dir, unsigned seed)
         }
         if (it % 97 == 0)
             OK(tsdb_flush(db));
+        if (it % 41 == 40) { /* a class switch, at the computed boundary or later */
+            int s2 = (int)(rnd() % NS), c = (int)(rnd() % 4);
+            int64_t at = TS(rnd() % K);
+            OK(tsdb_test_class_switch(db, ids[s2], c, rnd() & 1 ? &at : NULL));
+            switches++;
+        }
         if (it % 150 == 149)
             query_all(db, 2);
+        if (it == 600) /* merged parts in every key: a row in two keys shows (a merge outranks the other key) */
+            OK(tsdb_optimize(db));
     }
     OK(tsdb_set_retention(db, ids[2], clk(NULL) - TS(700))); /* float64: slots below 700 expire */
     cutk[2] = 700;
@@ -351,6 +371,12 @@ static void run(const char *dir, unsigned seed)
     OK(tsdb_close(db));
     OK(tsdb_open(dir, &o, &db));
     query_all(db, 20);
+    size_t ncls[5] = {0}; /* per class, then all */
+    OK(tsdb_foreach_part(db, count_cls, ncls));
+    if (switches && ncls[4] == ncls[0]) {
+        printf("seed %u: %d class switches, but every part is in class 0\n", seed, switches);
+        fails++;
+    }
     OK(tsdb_close(db));
     rm_rf(dir);
 }

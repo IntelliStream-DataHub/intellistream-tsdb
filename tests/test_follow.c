@@ -25,6 +25,8 @@
 
 #define NS 4
 #define T0 1700000000000LL
+/* internal test hook: switch a series to class cls at the next boundary after its rows (or *at when later) */
+int tsdb_test_class_switch(tsdb *t, uint32_t series, int cls, const int64_t *at);
 
 typedef struct shared {
     atomic_int phase;          /* 1 appends, 2 batches, 3 done */
@@ -242,6 +244,93 @@ static void test_typed_follow(const char *base)
     CHECK(system(cmd) == 0);
 }
 
+static void count_part_cls(void *ctx, const tsdb_part_info *p)
+{
+    ((uint64_t *)ctx)[p->cls & 3] += p->rows;
+}
+
+/* A follower across a partition class switch: it reads the switch from CLASSES with the MANIFEST that lists the
+ * parts of the new class, and answers exactly what the writer answers, rows written into the past after the switch
+ * (they go to the old class's partitions) included; so does a follower opened after it. */
+static void test_class_follow(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-follow-cls-%d", base, (int)getpid());
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    tsdb *w, *r = NULL, *r2 = NULL;
+    uint32_t id;
+    if (tsdb_open(dir, &o, &w) != 0) {
+        CHECK(!"open writer");
+        return;
+    }
+    enum { N = 4 * 1440 }; /* four days at a minute, then four more after the switch */
+    static int64_t ts[2 * N];
+    static float v[2 * N];
+    for (int i = 0; i < 2 * N; i++) {
+        ts[i] = T0 + (int64_t)i * 60000;
+        v[i] = (float)i;
+    }
+    CHECK(tsdb_series(w, "s", &id) == 0 && tsdb_test_class_switch(w, id, 0, NULL) == 0);
+    CHECK(tsdb_insert_series(w, id, ts, v, N) == 0 && tsdb_flush(w) == 0);
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1;
+    CHECK(tsdb_open(dir, &ro, &r) == 0);
+    if (!r) {
+        tsdb_close(w);
+        return;
+    }
+    int c = -1;
+    CHECK(tsdb_series_class(r, id, &c) == 0 && c == 0);
+    CHECK(tsdb_test_class_switch(w, id, 3, NULL) == 0);
+    /* rows from the next day (the default partition) after the newest row on are class 3 */
+    int64_t T = (ts[N - 1] / 86400000 + 1) * 86400000;
+    int n0 = 0;
+    while (ts[n0] < T)
+        n0++;
+    CHECK(tsdb_insert_series(w, id, ts + N, v + N, N) == 0); /* after the switch: class 3 */
+    float old[100];
+    for (int i = 0; i < 100; i++)
+        old[i] = v[1000 + i] = -1.0f - (float)i; /* into the past: class 0, newer than the first rows */
+    CHECK(tsdb_insert_series(w, id, ts + 1000, old, 100) == 0 && tsdb_flush(w) == 0);
+    CHECK(tsdb_refresh(r) == 0);
+    CHECK(tsdb_series_class(r, id, &c) == 0 && c == 3);
+    CHECK(tsdb_optimize(w) == 0); /* the follower still maps the parts it replaced */
+    CHECK(tsdb_open(dir, &ro, &r2) == 0);
+    for (int round = 0; round < 2; round++) {
+        tsdb *rd[3] = {w, r, r2};
+        uint64_t rows[3][4];
+        for (int k = 0; k < 3; k++) {
+            if (!rd[k])
+                continue;
+            if (k)
+                CHECK(tsdb_refresh(rd[k]) == 0);
+            tsdb_points p;
+            CHECK(tsdb_query_points(rd[k], id, INT64_MIN, INT64_MAX, &p) == 0);
+            bool same = p.n == 2 * N;
+            for (size_t i = 0; same && i < p.n; i++)
+                same = p.ts[i] == ts[i] && p.values[i] == v[i];
+            CHECK(same);
+            tsdb_points_free(&p);
+            memset(rows[k], 0, sizeof rows[k]);
+            CHECK(tsdb_foreach_part(rd[k], count_part_cls, rows[k]) == 0);
+            CHECK(rows[k][0] == (uint64_t)n0 && rows[k][3] == (uint64_t)(2 * N - n0) && !rows[k][1] && !rows[k][2]);
+            CHECK(tsdb_series_class(rd[k], id, &c) == 0 && c == 3);
+        }
+    }
+    if (r2)
+        tsdb_close(r2);
+    tsdb_close(r);
+    tsdb_close(w);
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    printf("  a follower reads a class switch with the parts that use it\n");
+}
+
 /* The library's fstat calls land here (the test binary's definition wins over
  * libc's): the next one can report a file larger than it is, which is what a
  * reader sees when a MANIFEST shrinks while it is rewritten in place. */
@@ -392,6 +481,7 @@ int main(int argc, char **argv)
         return 1;
     test_typed_follow(argc > 1 ? argv[1] : "/tmp");
     test_torn_manifest(argc > 1 ? argv[1] : "/tmp");
+    test_class_follow(argc > 1 ? argv[1] : "/tmp");
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;
