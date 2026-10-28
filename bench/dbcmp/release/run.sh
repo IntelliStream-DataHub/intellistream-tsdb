@@ -1156,8 +1156,19 @@ p3() {
         untimed "$D/dump-$e.log" sh -c "'$B/chq' dump '$E/$e' spec.tsv > dump/$e-windows.jsonl"
         untimed "$D/dump-$e-full.log" "$B/chq" full "$E/$e" 1 "dump/$e-full.jsonl"
     done
+    # embq answers the whole range of series 0-99 whatever the data holds (its file belongs to the multi-series
+    # track); with fewer series (the smoke run's NSERIES=10) the rest are empty answers, not in tsdbd's or chDB's dumps
+    local f
+    [ "${NSERIES:-100}" -lt 100 ] && for f in dump/tsdb-full.jsonl dump/duckdb-full.jsonl; do
+        jq -c --argjson n "$NSERIES" 'select(.s < $n)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    done
+    # tsdbd's reference holds the first 200 windows per class (check.py SYS 200), embedded tsdb answers all of spec.tsv:
+    # the comparison takes the windows both answered (check.py counts any other answer as a failure)
+    python3 -I -c 'import json, sys
+ids = {json.loads(l)["i"] for l in open(sys.argv[1])}
+sys.stdout.writelines(l for l in open(sys.argv[2]) if json.loads(l)["i"] in ids)' "$RW" dump/tsdb-windows.jsonl > dump/tsdb-windows.inref.jsonl
     {
-        python3 -I "$H/check.py" --dumps "$RW" "$RF" dump/tsdb-windows.jsonl dump/tsdb-full.jsonl
+        python3 -I "$H/check.py" --dumps "$RW" "$RF" dump/tsdb-windows.inref.jsonl dump/tsdb-full.jsonl
         # as README: the other engines against embedded tsdb's answers to every query (tsdbd's ref has 200 per class)
         for e in duckdb chdb chdb-lz4; do python3 -I "$H/check.py" --dumps dump/tsdb-windows.jsonl dump/tsdb-full.jsonl "dump/$e-windows.jsonl" "dump/$e-full.jsonl"; done
         REL jsonl lttb "$RL" dump/tsdb-lttb.jsonl
