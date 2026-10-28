@@ -232,7 +232,19 @@ crm() { # stop and remove containers by name; only the rb-* names this script cr
     done
 }
 cleanup_all() { tsdbd_stop; crm $CONTAINERS; }
-rmdata() { local d; for d in "$@"; do case $d in "$DBCMP"/s[0-9]*|/var/tmp/big|/var/tmp/ch-big) podman unshare rm -rf "$d" ;; esac; done; }
+# p5's directories follow P5_DIR (the smoke's is $DBCMP/p5): a pattern of /var/tmp/big alone left the smoke's tsdb and
+# ClickHouse data in place, so the next smoke loaded on top of it and stopped at "Database scale already exists"
+rmdata() {
+    local d p5=
+    case $P5_DIR in /var/tmp | /var/tmp/?*) p5=$P5_DIR ;; esac
+    for d in "$@"; do
+        case $d in
+            "$DBCMP"/s[0-9]* | /var/tmp/big | /var/tmp/ch-big) podman unshare rm -rf "$d" ;;
+            *) [ -n "$p5" ] && { [ "$d" = "$p5/big" ] || [ "$d" = "$p5/ch-big" ]; } && podman unshare rm -rf "$d" ;;
+        esac
+    done
+    return 0
+}
 ports_check() { # FILE: listeners on the benchmark ports; anything not on 127.0.0.1 is a failure
     ss -ltnp 2> /dev/null | grep -E "$PORTS_RE" > "$1"
     if grep -E "$PORTS_RE" "$1" | awk '{print $4}' | grep -vqE '^127\.0\.0\.1:'; then fail "a port is not bound to 127.0.0.1: $(tr '\n' ' ' < "$1")"; fi
@@ -1533,7 +1545,9 @@ phase_checktest() {
 phase_smoke() {
     local S=${SMOKE_DIR:-/var/tmp/dbcmp-smoke/small} t0=$SECONDS rc=0
     case $S in /var/tmp/?*) ;; *) log "smoke: SMOKE_DIR must be under /var/tmp, not $S"; return 1 ;; esac
-    # SMOKE_PHASES and SMOKE_OUT rerun a part (P2_SYSTEMS etc. pass through) on the inputs of an earlier smoke run
+    # SMOKE_PHASES and SMOKE_OUT rerun a part (SMOKE_P2_SYSTEMS picks p2's systems; the smoke leaves out qdb1, iotz and tdz,
+    # whose queries are qdb2's, iot's and td's; P1_SYSTEMS etc. pass through) on the inputs of an earlier smoke run;
+    # the smoke also drops the 1-client batch runs (BTHREADS=2; per core still runs) and converts at ZSTD level 3
     local ph=${SMOKE_PHASES:-prep p1 p2 p3 p4 p5} so=${SMOKE_OUT:-$S/results}
     case $so in "$S"/?*) ;; *) log "smoke: SMOKE_OUT must be under $S, not $so"; return 1 ;; esac
     rm -rf "$so"; mkdir -p "$so"
@@ -1545,6 +1559,8 @@ phase_smoke() {
         PREP_SERIES=10 PREP_POINTS=20000 POINTS=20000 SPEC_DIV=60 PREP_SIZE_POINTS=50000 PREP_SPEC=200 \
         DSLIST="${SMOKE_DS:-hdd_temp hyd_PS1}" \
         IOT_STABLE=15 TD_STABLE=10 VM_STABLE=10 I2_STABLE=15 QDB_WAIT_MAX=300 CH_SETTLE_MAX=300 WARM_SECS=1 PC_KS=1 \
+        BTHREADS="${BTHREADS:-2}" QDB_ZSTD_LEVEL="${SMOKE_QDB_ZSTD_LEVEL:-3}" \
+        P2_SYSTEMS="${SMOKE_P2_SYSTEMS:-tsdb ch qdb0 qdb2 ts i2 i3 iot td vm}" \
         I3_P2_FLAGS="--force-snapshot-max-age 30s" I3_P2_MIN=45 I3_P1_AGE=30s I3_P1_MIN=45 \
         I3_P2_STABLE=20 I3_P2_MAX=300 I3_P1_STABLE=20 I3_P1_MAX=300 \
         I2_EXTRA="-e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s" PROM_SETTLE_TIMEOUT=900 \
