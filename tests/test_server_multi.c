@@ -626,6 +626,29 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
     free(o.v);
 }
 
+/* The same with only small replies (a few KiB per series, gathered into batches): the batches go out as they fill,
+ * so the server holds at most its output cap and the results ahead, not the 300 MiB of the whole answer. */
+static void test_stall_small(pid_t pid)
+{
+    uint32_t n = TSDB_MULTI_MAX_SERIES;
+    uint32_t *list = malloc((size_t)n * 4);
+    uint8_t t[29], *req = malloc(24 + (size_t)n * 4 + 8 + 29);
+    for (uint32_t i = 0; i < n; i++)
+        list[i] = ids[i % 5];
+    values_tmpl(t, TSDB_MANY_SERIES, T0, T0 + 400000); /* about 400 rows of each */
+    size_t len = multi_frame(req, TSDB_OP_QUERY_VALUES, 0, n, list, t, 29);
+    long before = rss_anon_kb(pid);
+    int fd = raw_connect();
+    raw_send(fd, 9, TSDB_OP_QUERY_MULTI, req, len);
+    usleep(2000000);
+    long grown = rss_anon_kb(pid) - before;
+    fprintf(stderr, "stalled reader, small replies: server anonymous memory grew %ld KiB\n", grown);
+    CHECK(SANITIZED || grown <= (64 + 8 + 48) * 1024L);
+    close(fd);
+    free(list);
+    free(req);
+}
+
 /* On one connection, sent before anything is read: A (large), B, a single query C, then CANCEL B (queued) and
  * CANCEL of an id nobody uses. A is answered whole, B ends STOPPED with nothing answered, C comes after, in order.
  * Then D is cancelled while it runs, and the connection goes on. */
@@ -935,6 +958,7 @@ int main(int argc, char **argv)
     test_cancel_flood();
     test_disconnect(c, pid);
     test_stall(c, pid, 3);
+    test_stall_small(pid);
 
     /* more than one request's worth of series: split, indexes running on */
     size_t big = TSDB_MULTI_MAX_SERIES + 3;
