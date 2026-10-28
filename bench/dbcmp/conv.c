@@ -2,6 +2,7 @@
  * RowBinary (u32 series, i64 ts ms, f32 value, as written by tsdb-bench --export) -> bulk formats.
  *   conv lp    IN OUT   line protocol for InfluxDB 2 and 3 (measurement sensors, tag series, ms)
  *   conv ilp32 IN OUT   the same for QuestDB's FLOAT column
+ *   conv tdlp  IN OUT   ilp32 with the suffix f32, which makes TDengine's schemaless writer create a FLOAT column
  *   conv csv   IN OUT   series,timestamptz,value for TimescaleDB's COPY
  *   conv om    IN OUT   OpenMetrics text for Prometheus' promtool tsdb create-blocks-from openmetrics:
  *                       gauge sensors{series="N"}, timestamps in seconds with milliseconds
@@ -29,13 +30,20 @@ int main(int argc, char **argv)
     if (argc != 4) return 2;
     int fd = open(argv[2], O_RDONLY);
     struct stat st;
-    fstat(fd, &st);
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0) {
+        fprintf(stderr, "%s: missing, empty or unreadable\n", argv[2]);
+        return 1;
+    }
     const row *r = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
+    if (r == MAP_FAILED) {
+        perror(argv[2]);
+        return 1;
+    }
     size_t n = st.st_size / sizeof(row);
     FILE *o = fopen(argv[3], "w");
     static char obuf[1 << 22];
     setvbuf(o, obuf, _IOFBF, sizeof obuf);
-    int mode = !strcmp(argv[1], "lp") ? 0 : !strcmp(argv[1], "ilp32") ? 1 : !strcmp(argv[1], "om") ? 3 : 2;
+    int mode = !strcmp(argv[1], "lp") ? 0 : !strcmp(argv[1], "ilp32") ? 1 : !strcmp(argv[1], "om") ? 3 : !strcmp(argv[1], "tdlp") ? 4 : 2;
     if (mode == 3) fputs("# TYPE sensors gauge\n", o);
     char vb[40];
     int64_t last_sec = INT64_MIN;
@@ -54,8 +62,8 @@ int main(int argc, char **argv)
                 if (strtof(vb, NULL) == r[i].v) break;
             }
         }
-        if (mode < 2)
-            fprintf(o, "sensors,series=%u value=%s %lld\n", r[i].s, vb, (long long)r[i].t);
+        if (mode < 2 || mode == 4)
+            fprintf(o, "sensors,series=%u value=%s%s %lld\n", r[i].s, vb, mode == 4 ? "f32" : "", (long long)r[i].t);
         else if (mode == 3)
             fprintf(o, "sensors{series=\"%u\"} %s %lld.%03lld\n", r[i].s, vb, (long long)(r[i].t / 1000),
                     (long long)(r[i].t % 1000));

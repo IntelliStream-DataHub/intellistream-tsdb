@@ -1,0 +1,13 @@
+# The IoTDB Python client (loader iotload.py), exact versions each at least two weeks old on 2026-10-27
+# (PyPI upload dates: apache-iotdb 2026-09-14, pandas 2026-09-17, SQLAlchemy 2026-10-07).
+apache-iotdb==2.0.11
+numpy==2.3.5
+pandas==3.0.6
+python-dateutil==2.9.0.post0
+six==1.17.0
+SQLAlchemy==2.1.4
+SQLAlchemy-Utils==0.43.0
+thrift==0.25.0
+typing_extensions==4.16.0
+tzdata==2026.5
+tzlocal==5.4.4

@@ -1,14 +1,19 @@
-# tsdb against seven other databases, 100 M rows
+# tsdb against ten other databases, 100 M rows
 
 The harness behind the README's "100 million rows" tables: tsdb (through tsdbd and embedded),
 ClickHouse, TimescaleDB, QuestDB, InfluxDB 2, InfluxDB 3 Core and Prometheus, each loaded with the
-same 100 M rows and asked the same queries, with every answer checked against tsdb's; and DuckDB,
-embedded like tsdb, compared with tsdb's library in the same process.
+same 100 M rows and asked the same queries, with every answer checked against tsdb's; and DuckDB and
+chDB (ClickHouse as a library), embedded like tsdb, compared with tsdb's library in the same process.
+The release driver in [`release/`](release) runs all of it unattended and adds Apache IoTDB, TDengine
+and VictoriaMetrics, batches of 1, 10 and 100 series per request, and one-core runs (see "Release run").
 For compression on real measurements rather than generated data, see [`../hydraulic`](../hydraulic):
 a public data set from a hydraulic test rig, with the steps to reproduce its table.
 
 Every server runs in **Podman** (never Docker), with `--network host` and its own listen setting
-bound to 127.0.0.1. Run one system at a time: stop each container before starting the next, and
+bound to 127.0.0.1, except IoTDB and TDengine: they bind every address, so they run in their own network
+namespace with their ports published on 127.0.0.1 (`-p 127.0.0.1:PORT:PORT`, rootless Podman's pasta
+forwarder). The release run measures what that forwarder costs per request on VictoriaMetrics (the same
+server and point queries both ways, `p2/vm/vm.pasta.point.*`). Run one system at a time: stop each container before starting the next, and
 run nothing else heavy meanwhile.
 
 ## What is here
@@ -31,6 +36,7 @@ run nothing else heavy meanwhile.
 | `ts_compress.sh` | `compress_chunk` on every TimescaleDB chunk |
 | `qdb_wait.sh`, `i2_settle.sh`, `i3_watch.sh` | wait for QuestDB's WAL apply, InfluxDB 2's compaction, InfluxDB 3's snapshot |
 | `prom_settle.sh` | wait for Prometheus' head and block compactions |
+| `release/` | the release driver `run.sh` (phases, smoke run, checker test), `env.sh` (pinned images), `sys_iot.sh`, `sys_td.sh`, `sys_vm.sh`, `how.py` and `tables.py` (how each result ran) |
 
 ## Requirements
 
@@ -349,6 +355,67 @@ podman stop dbcmp-prom-bf && podman start dbcmp-prom && until curl -sf 127.0.0.1
 python3 -I $H/check.py prom 200 && $H/qbench.sh prom http 127.0.0.1 9090 ""                   # remote write
 ```
 
+## Apache IoTDB 2.0.11, TDengine 3.4.2.8, VictoriaMetrics 1.154.0 (release driver only)
+
+These three are run only by the release driver (`release/run.sh`, "Release run" below); there are no
+hand steps for them. Each has its own file in `release/`, whose header lists every setting that is not
+the default and why. The images are pinned by digest in `release/env.sh`. Each runs in its own
+container (`rb-iot`, `rb-td`, `rb-vm`) with a 24 GB memory limit, ports published on 127.0.0.1 only.
+
+**Apache IoTDB** (`apache/iotdb:2.0.11-standalone`, table model, `sys_iot.sh`)
+
+- Start: `wal_mode=SYNC` (the write-ahead log is synced before IoTDB says yes, as tsdb does; the default
+  syncs once a second), no cap on compaction writes (default 16 MB/s, which would make settling measure
+  the cap), a 1 h query timeout, the REST service on 18080. Heap 16 GB, direct memory 4 GB.
+- Load: `iotload.py`, IoTDB's own Python client (tablets over its RPC port 6667, the bulk path its docs
+  recommend), 100,000 rows per tablet, 8 processes. Needs a Python venv with `iotdb-requirements.txt`
+  (`IOT_VENV`).
+- Settle: FLUSH, then wait until the data files stay the same for 180 s and no compaction runs.
+- Size: `du -sb` of the database's sequence and unsequence directories; the WAL apart.
+- Queries: SQL over REST (`/rest/table/v1/query`) through `qdrive`; a batch of K series is one statement.
+- Variants: `iot` (Gorilla + LZ4, the default) and `iotz` (Gorilla + ZSTD). Floats are never stored with
+  RLE or TS_2DIFF: those round to two decimals.
+- `-`: LTTB (no such function). With its default memory settings IoTDB refuses some of the 32-client
+  TWA window runs ("not enough memory to execute current fragment instance", code 719; a larger heap or
+  operator share did not help, because its estimate grows with the pool). Refused runs are listed in
+  `REFUSED.txt` and not timed.
+
+**TDengine** (`tdengine/tsdb:3.4.2.8`, community edition, `sys_td.sh`)
+
+- Start: the database is made with `WAL_LEVEL 2 WAL_FSYNC_PERIOD 0` (synced before it says yes; the
+  default only writes the log), `PRECISION 'ms'`. The image's extra services (taosKeeper, taosExplorer,
+  taosX) are switched off. REST through taosAdapter on 6041.
+- Load: line protocol through taosAdapter (`/influxdb/v1/write`, schemaless), 100,000 lines per request,
+  8 connections, the way QuestDB and the InfluxDBs are loaded. TDengine also has a faster bulk path (stmt
+  over WebSocket) that is not used here, so its load time may look worse than it could be.
+- Settle: the community edition does not compact by itself, so the driver runs FLUSH DATABASE and COMPACT
+  DATABASE and waits until no compaction runs and the files stay the same.
+- Size: the vnode directories of the database, without the WAL.
+- Queries: SQL over REST (`/rest/sql/cmp`) through `qdrive`; a batch of K series is one statement.
+- Variants: `td` (the default for FLOAT: bss + LZ4) and `tdz` (ZSTD, level high). Never the lossy `tsz`.
+- `-`: LTTB. The hourly LINEAR TWA uses TDengine's `TWA()`; it agrees with tsdb's only to about 1e-8
+  relative (float precision). It is checked against a stated bound instead of 1e-9 (`TWA_TOL`, default 1e-6
+  relative or 1e-6 absolute), timed only within it, and the bound and the largest difference are printed under
+  TDengine's table (`loose.txt`).
+- One core: TDengine is pinned to one CPU; its query thread setting (`numOfVnodeQueryThreads 1`)
+  deadlocked a batch of 10, so it is left at its default.
+
+**VictoriaMetrics** (`victoriametrics/victoria-metrics:v1.154.0`, single node, `sys_vm.sh`)
+
+- Start: `-retentionPeriod=100y` (the default of one month would delete the 2024 data),
+  `-search.disableCache` (no cached answers between runs), query and queue limits raised to 1 h.
+- Load: Prometheus remote write (`loadprw`, as in phase 4), 10,000 samples per request, 8 shards.
+  VictoriaMetrics says yes from memory and writes to disk within 5 s: `force_flush` and `sync -f` after
+  the load are timed apart, as for the other systems that do not sync before saying yes.
+- Settle: `force_flush`, `force_merge` of every month, then wait until no merge runs and the files stay
+  the same.
+- Size: `du -sb` of `data/small`, `data/big` and `data/indexdb`.
+- Values: stored as decimal digits (about 12 significant digits); a float32 reads back exactly.
+- Queries: PromQL (MetricsQL) over the Prometheus HTTP API, the same queries as Prometheus. A batch of K
+  series is K requests, because PromQL cannot give each series its own window in one query.
+- `-`: LTTB and every time-weighted average (`integrate()` is a step integral that does not know which
+  part of the bucket had data).
+
 ## DuckDB 1.5.6, embedded, against tsdb embedded
 
 Both run in the driver's process: tsdb through `build/libtsdb.a`, DuckDB through its C API, with the
@@ -414,7 +481,11 @@ each other here); `DUCK_THREADS=1` runs DuckDB with one thread per query instead
 `DUCK_MEMORY` sets its memory limit (24GB). `embq duckdb sql DB "EXPLAIN ..."` shows a plan: the
 time bounds are cast to `TIMESTAMP_MS` so that both reach the scan as plain table filters.
 
-## To add at the release run: LTTB and time-weighted averages
+## LTTB and time-weighted averages
+
+Done in the release driver (`release/`): the plan below is what it runs, with the TWA fixes of the
+release study (QuestDB's own `twap()`, TWA per day, LINEAR per hour and over random 1-day and 7-day windows).
+Each result's `how.json` and `dash.txt` say which route a system took and why it has `-`.
 
 The README's comparison table gets two more columns, measured like the others and checked against tsdb's
 answers: LTTB downsampling (the same 1000 points per series over the whole range) and time-weighted
@@ -432,7 +503,9 @@ otherwise report "-" (not supported), and footnote which route each took:
 LTTB answers must be the same points (first maximum wins on ties); time-weighted averages within a stated
 tolerance. The twa track's REPORT.md has the ClickHouse query.
 
-## To add at the release run: embedded ClickHouse (chDB)
+## Embedded ClickHouse (chDB)
+
+Done in the release driver's phase 3 (`chdb` and `chdb-lz4`).
 
 DuckDB runs in-process (embq.c), so its whole-range bucket query avoids the network and the serialisation of
 1.67 M result rows that the ClickHouse server pays, and ClickHouse's size-optimised codecs (DoubleDelta,
@@ -445,7 +518,9 @@ results through its C API (it may serialise to Arrow or another format in memory
 vectors). `clickhouse local` is the other serverless form, but it is a separate process writing its output, so
 chDB is the fair embedded counterpart.
 
-## To add at the release run: compression per kind of sensor, one column per database
+## Compression per kind of sensor, one column per database
+
+Done in the release driver's phase 1, for every system including IoTDB, TDengine and VictoriaMetrics.
 
 The README's per-sensor table today compares compression methods (codec-bench). At the release run replace it
 with real on-disk sizes: load each sensor data set of tools/datasets.h (1 M readings each, plus random) on its
@@ -458,6 +533,47 @@ to psi) goes through the same steps, one sensor at a time, with tsdb's backgroun
 work: tsdb's dictionary codec runs in merges, and DuckDB, Parquet (QuestDB's Parquet partitions, InfluxDB 3) and
 ClickHouse's `LowCardinality` have dictionaries too, so data with few distinct values must be in the comparison
 before any claim about compression. Remove the containers and data afterwards.
+
+## Release run
+
+`release/run.sh` runs the whole comparison unattended, one phase per command. `release/env.sh` holds the
+paths and the pinned images; pull the images first. Every image is pinned by digest, and every release and
+image build was at least two weeks old when the run was planned. So the release run uses TimescaleDB 2.30.1,
+QuestDB 10.0.1 and InfluxDB 3 Core 3.12.0, not the newer versions in the sections above. Their tags are
+rebuilt in place, so a tag alone does not name the image.
+
+```sh
+BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh prep p1 p2 p3 p4   # or: all
+bench/dbcmp/release/run.sh smoke       # every system on tiny data; every answer check must pass
+bench/dbcmp/release/run.sh checktest   # the answer checker must catch planted mistakes
+```
+
+| phase | what it does | output in `$OUT` (`$DBCMP/results`) |
+|---|---|---|
+| `prep` | the inputs (not timed): the mixed table, the query list, the batch lists, one file per kind of sensor | `$DBCMP/input`, `$WORK` |
+| `p1` | size on disk per kind of sensor, every system and variant, each settled | `p1/<system>.tsv`, `p1/how-<system>.json` |
+| `p2` | the 100 M-row table on every server: load, settle, size, answer checks, queries | `p2/<system>/` |
+| `p3` | embedded: tsdb, DuckDB, chDB | `p3/` |
+| `p4` | Prometheus: backfill and remote write | `p4/` |
+| `p5` | 100 billion rows, tsdb and ClickHouse (only when named; not in `all`) | `p5/` |
+
+Every phase writes `PHASE n DONE` or `PHASE n FAILED: why` to `driver.log`, and `steps.log` has one line per
+step (rc, seconds, how busy the machine was). A phase or system that is done is skipped on the next call;
+`FORCE=1` runs it again, `P1_SYSTEMS` / `P2_SYSTEMS` pick systems. Each `<name>.<run>` file is summed up in
+`<name>.mean.txt` (mean, sd %, min-max over the runs), and `tables.md` collects every result with a
+"How it was run" table built from the `how.json` files (system, version, image digest, settings that are
+not the default, durability, loader, query client, connections, what one query is, the one-core method,
+warm-ups, runs, and why a cell is `-`). Queries a server refused (out of memory, its own limits) are listed
+in `REFUSED.txt` and not timed; a server the kernel killed for memory is started again.
+
+Timed steps wait for the CPU governor to be `performance` and for the machine to be idle, and take
+`BENCH_LOCK` exclusively; other steps take it shared. Every step has a time limit.
+
+Durations: the smoke run (10 series x 650,000 rows, one run of everything) took about 2 h 15 min on the
+Ryzen 9 7950X, most of it waiting for compactions (Prometheus about 30 min, QuestDB's ZSTD conversion,
+InfluxDB 3's snapshots) and for other benchmarks holding the lock: phase 1 22 min, phase 2 about 1 h 40 min,
+phase 3 2 min, phase 4 33 min. The full run on 100 M rows takes many hours (Prometheus' remote write
+alone several); run it under `tmux` or `nohup`.
 
 ## Fairness notes
 
@@ -479,19 +595,48 @@ before any claim about compression. Remove the containers and data afterwards.
   i, then i+1), not sorted by time. InfluxDB 2 has a 24 GB and InfluxDB 3 a 28 GB container limit;
   InfluxDB 3's memory pools are set for that. Prometheus' remote write gets each series in that
   order too (each series on one shard); its backfill reads the OpenMetrics file in that order.
+- **TimescaleDB's `work_mem`.** The server of the aggregate, raw and point queries keeps
+  timescaledb-tune's `work_mem`; the timescaledb-ha server of TWA and LTTB gets 256 MB, without which
+  TWA's window sorts spill to disk. `work_mem` holds per sort or hash node, and a batch of 100 series
+  is 100 `UNION ALL` branches: at 256 MB, 32 clients of 7-day batches took the 64 GB host's memory.
 - **DuckDB.** It has no last-write-wins: without a primary key, a second write of a timestamp adds a
   row (tsdb replaces it); with one, every append would pay a key check. Its input is sorted by
   (series, ts) before the load (timed apart) while tsdb takes the file unsorted. It runs with
   threads = 32 and memory_limit = 24GB; tsdb queries use every core too (`query_threads`), so
   "1 thread" means one calling thread for both. Its fsync behaviour on commit was not examined.
-- **Clients.** ClickHouse uses its own native client (`clickhouse-benchmark`), tsdbd the C client,
-  the others `qdrive` over HTTP or libpq. InfluxDB 3's Flight SQL was not tried. PromQL cannot clip a
+- **Batches.** Every system is asked for a single series, a batch of 10 and a batch of 100 (the same
+  series for every system, from `batches.tsv`). For tsdbd a batch is one request (protocol 10); for the SQL
+  systems one statement of K `UNION ALL` branches, sent as one request; for Prometheus and VictoriaMetrics K
+  requests, since PromQL cannot give each series its own window. The time is for the whole batch.
+- **One core.** Next to the parallel numbers each system also runs on one core: the server pinned to one CPU
+  with `taskset` (rootless Podman cannot use `--cpuset-cpus` here) and its own thread setting where it has
+  one (tsdbd `--query-threads 1`, ClickHouse `max_threads=1`, TimescaleDB without parallel workers, IoTDB
+  one query thread, VictoriaMetrics `GOMAXPROCS=1`), the client on another CPU. Servers that size their thread
+  pools at start are started again for this with those pools at one thread: QuestDB (every worker pool, and a
+  JVM that sees one CPU), InfluxDB 2 (`GOMAXPROCS=1`), InfluxDB 3 (`--num-datafusion-threads 1`), IoTDB and
+  VictoriaMetrics. TDengine is only pinned (its query-thread setting deadlocked). `how.json` says which.
+- **Timing.** ClickHouse is timed over HTTP by `qdrive`, like the others, with its own server latency from
+  `system.query_log` beside it ("server only"), not by 1/QPS. tsdb is
+  measured both as loaded and after its merges settled. Every number is the mean of at least 5 runs, with
+  sd and min-max.
+- **The three added systems.** IoTDB and TDengine sync their WAL before they say yes (set that way; it is
+  not their default), as tsdb does; VictoriaMetrics says yes from memory, like ClickHouse and QuestDB, and
+  its flush after the load is timed apart. TDengine is loaded through line protocol, not its faster
+  WebSocket path. IoTDB refuses some heavy 32-client queries with its default memory settings; those are
+  reported as refused.
+- **Clients.** tsdbd uses the C client, the others `qdrive` over HTTP or libpq (in the release run
+  ClickHouse too; the older tables above used `clickhouse-benchmark`). InfluxDB 3's Flight SQL was not tried. PromQL cannot clip a
   bucket to a window that starts or ends inside it, so Prometheus answers an aggregate window with
   two requests (whole buckets, then the clipped ends), timed together as one query; its whole-range
   bucket queries are 4 or 8 `query_range` requests (11,000 points per series at most), each
   limited to its step group's data span (± 1 s), because `query_range` evaluates every step, empty
   or not, where the others take fixed bounds or none. Its JSON answers are larger than the others'
-  (buckets of 60 samples: about 11 MB per series).
+  (buckets of 60 samples: about 11 MB per series). VictoriaMetrics gets MetricsQL's `aggr_over_time`, which
+  computes count, sum, min and max in one pass, and up to 30,000 points per request (its default limit).
+- **Data shape.** Every answer is checked against tsdb's, but only on this data, which has no duplicate
+  timestamps, no nulls and no gap longer than the narrowest bucket (`prep.sh` checks it with `shape` and stops
+  otherwise). Some TWA recipes (QuestDB's `twap()` with `SAMPLE BY`, the segment recipes of `rel.py`) would
+  be wrong on gaps that span buckets, and last-write-wins is not exercised for any system.
 
 ## Cleaning up
 

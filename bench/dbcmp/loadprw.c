@@ -199,11 +199,15 @@ int main(int argc, char **argv)
     }
     int fd = open(argv[1], O_RDONLY);
     struct stat st;
-    if (fd < 0 || fstat(fd, &st) != 0) {
-        perror(argv[1]);
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0) {
+        fprintf(stderr, "%s: missing, empty or unreadable\n", argv[1]);
         return 1;
     }
     rows = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
+    if (rows == MAP_FAILED) {
+        perror(argv[1]);
+        return 1;
+    }
     nrows = (size_t)st.st_size / sizeof(row);
     if (nrows > UINT32_MAX) {
         fprintf(stderr, "at most %u rows\n", UINT32_MAX);
