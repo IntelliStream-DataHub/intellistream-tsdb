@@ -41,7 +41,7 @@ vm_start() { # DATADIR [PODMAN ARGS...] [-- VM ARGS...]: rb-vm on 127.0.0.1:8428
     # (pasta), the path IoTDB and TDengine take (their servers bind every address), to measure what it costs
     local net=(--network host) la=(-httpListenAddr=127.0.0.1:8428)
     [ "${VM_PASTA:-0}" = 1 ] && { net=(-p 127.0.0.1:8428:8428); la=(); }
-    podman run -d --name rb-vm --memory "$VM_MEM" --memory-swap "$VM_MEM" "${net[@]}" "${pa[@]}" \
+    podman run -d --name rb-vm $(memlim "$VM_MEM") "${net[@]}" "${pa[@]}" \
         -v "$W:/storage" "$VM_IMG" -storageDataPath=/storage "${la[@]}" $VM_ARGS "${va[@]}" > /dev/null 9>&- || { fail "victoriametrics start"; return 1; }
     for i in $(seq 600); do
         curl -sf -m 10 127.0.0.1:8428/health 2> /dev/null | grep -q OK && return 0

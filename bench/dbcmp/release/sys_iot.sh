@@ -30,7 +30,7 @@ iot_start() { # DATADIR [PODMAN ARGS...]: rb-iot; IOT_Z=1 for compressor=ZSTD, e
     shift
     [ -n "$IOT_QMEM" ] && z="$z -e chunk_timeseriesmeta_free_memory_proportion=$IOT_QMEM"
     mkdir -p "$W/data" "$W/logs"
-    podman run -d --name rb-iot --memory "$IOT_MEM" --memory-swap "$IOT_MEM" \
+    podman run -d --name rb-iot $(memlim "$IOT_MEM") \
         -p 127.0.0.1:18080:18080 -p 127.0.0.1:6667:6667 \
         -e enable_rest_service=true -e rest_query_default_row_size_limit=2000000 -e wal_mode=SYNC \
         -e query_timeout_threshold=3600000 -e compaction_write_throughput_mb_per_sec=0 -e dn_rpc_address=0.0.0.0 \

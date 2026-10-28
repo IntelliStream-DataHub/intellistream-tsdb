@@ -578,6 +578,10 @@ alone several); run it under `tmux` or `nohup`.
   i, then i+1), not sorted by time. InfluxDB 2 has a 24 GB and InfluxDB 3 a 28 GB container limit;
   InfluxDB 3's memory pools are set for that. Prometheus' remote write gets each series in that
   order too (each series on one shard); its backfill reads the OpenMetrics file in that order.
+- **TimescaleDB's `work_mem`.** The server of the aggregate, raw and point queries keeps
+  timescaledb-tune's `work_mem`; the timescaledb-ha server of TWA and LTTB gets 256 MB, without which
+  TWA's window sorts spill to disk. `work_mem` holds per sort or hash node, and a batch of 100 series
+  is 100 `UNION ALL` branches: at 256 MB, 32 clients of 7-day batches took the 64 GB host's memory.
 - **DuckDB.** It has no last-write-wins: without a primary key, a second write of a timestamp adds a
   row (tsdb replaces it); with one, every append would pay a key check. Its input is sorted by
   (series, ts) before the load (timed apart) while tsdb takes the file unsorted. It runs with

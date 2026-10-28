@@ -26,7 +26,7 @@ td_start() { # DATADIR [PODMAN ARGS...]: rb-td
     local W=$1 i
     shift
     mkdir -p "$W/data" "$W/log"
-    podman run -d --name rb-td --memory "$TD_MEM" --memory-swap "$TD_MEM" -p 127.0.0.1:6041:6041 \
+    podman run -d --name rb-td $(memlim "$TD_MEM") -p 127.0.0.1:6041:6041 \
         -e TAOS_DISABLE_KEEPER=1 -e TAOS_DISABLE_EXPLORER=1 -e TAOS_DISABLE_TAOSX=1 "$@" \
         -v "$W/data:/var/lib/taos" -v "$W/log:/var/log/taos" "$TD_IMG" > /dev/null 9>&- || { fail "tdengine start"; return 1; }
     for i in $(seq 600); do

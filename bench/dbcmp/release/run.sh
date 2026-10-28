@@ -41,9 +41,14 @@ if ! systemctl --user show-environment > /dev/null 2>&1; then
         exit 1
     fi
     printf '[engine]\ncgroup_manager = "cgroupfs"\n' >> "$OUT/containers.conf"
+    NO_CGROUPS=1  # rootless cgroupfs cannot apply --memory either ("rootless needs no limits"): memlim drops it
     echo "$(date '+%F %T') no systemd user manager: smoke run with cgroup_manager cgroupfs (no memory/OOM records)" \
         >> "$OUT/driver.log"
 fi
+
+# A container's memory limit (and its swap, none). A smoke run on cgroupfs has no cgroup to put it in and starts the
+# container without one; a release run always has it.
+memlim() { [ "${NO_CGROUPS:-0}" = 1 ] || printf -- '--memory %s --memory-swap %s' "$1" "$1"; }
 
 # ------------------------------------------------------------------ logging, quiet gate, timed steps
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/driver.log"; }
@@ -283,7 +288,12 @@ qdb_wait_table() { # TABLE: until every WAL transaction is applied; fails after 
     echo "WAL of $1 not applied after ${QDB_WAIT_MAX:-3600} s ($r)"
     return 1
 }
-TS_WORK_MEM=${TS_WORK_MEM:-256MB}  # REPORT §5.11: the default (timescaledb-tune: 6 MB) spills TWA's window sorts to disk
+# REPORT §5.11: timescaledb-tune's work_mem (6 MB) spills TWA's window sorts to disk, so the timescaledb-ha server,
+# which runs TWA and LTTB, gets 256 MB. The plain server keeps tune's value: work_mem is per sort or hash node, and a
+# batch of 100 series is 100 UNION ALL branches; at 256 MB, 32 clients of 7-day batches grew to ~1.7 GB per backend
+# (most likely through it), and the kernel's OOM killer ended the 2026-10-28 smoke (64 GB host, no memory limit
+# under cgroupfs).
+TS_WORK_MEM=${TS_WORK_MEM:-256MB}
 # Podman gives a container 64 MB of /dev/shm; PostgreSQL's parallel workers share their hash tables there, and a
 # batch of 100 series failed with "could not resize shared memory segment ... No space left on device". A server on a
 # host has the host's /dev/shm (half the RAM); 8 GB is plenty here.
@@ -297,7 +307,7 @@ ts_start() { # NAME IMAGE DATADIR MOUNTPOINT: TimescaleDB on 127.0.0.1:5434 with
             -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 -c work_mem=$TS_WORK_MEM > /dev/null 9>&- || { fail "$name start"; return 1; }
     else
         podman run -d --name "$name" --network host --shm-size=$TS_SHM -v "$W:/var/lib/postgresql/data" -v "$mnt:/data:ro" -e POSTGRES_PASSWORD=bench \
-            -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 -c work_mem=$TS_WORK_MEM > /dev/null 9>&- || { fail "$name start"; return 1; }
+            -e TS_TUNE_MEMORY=24GB -e TS_TUNE_NUM_CPUS=32 "$img" postgres -c listen_addresses=127.0.0.1 -c port=5434 > /dev/null 9>&- || { fail "$name start"; return 1; }
     fi
     # the image runs initdb and its init scripts on a temporary server first: wait for the extension, then again
     for i in $(seq 300); do
@@ -312,7 +322,7 @@ PSQL() { psql -h 127.0.0.1 -p 5434 -U postgres "$@"; }
 i2_start() { # DATADIR
     local W=$1 i
     mkdir -p "$W/data" "$W/config"
-    podman run -d --name rb-i2 --network host --memory 24g --memory-swap 24g \
+    podman run -d --name rb-i2 --network host $(memlim 24g) \
         -v "$W/data:/var/lib/influxdb2" -v "$W/config:/etc/influxdb2" \
         -e DOCKER_INFLUXDB_INIT_MODE=setup -e DOCKER_INFLUXDB_INIT_USERNAME=bench \
         -e DOCKER_INFLUXDB_INIT_PASSWORD=benchbench -e DOCKER_INFLUXDB_INIT_ORG=bench \
@@ -335,7 +345,7 @@ i3_start() { # DATADIR [EXTRA FLAGS]
     local W=$1 i
     shift
     mkdir -p "$W" && podman unshare chown -R 1500:1500 "$W"
-    podman run -d --name rb-i3 --network host --memory 28g --memory-swap 28g -v "$W:/var/lib/influxdb3" "$I3_IMG" \
+    podman run -d --name rb-i3 --network host $(memlim 28g) -v "$W:/var/lib/influxdb3" "$I3_IMG" \
         influxdb3 serve --node-id node0 --object-store file --data-dir /var/lib/influxdb3/data \
         --http-bind 127.0.0.1:8181 --without-auth --query-file-limit 1000000 \
         --exec-mem-pool-size 8GB --file-cache-size 4GB --force-snapshot-mem-size 10GB --disable-telemetry-upload "$@" > /dev/null 9>&- || { fail "influxdb3 start"; return 1; }
@@ -1111,7 +1121,7 @@ p2_ts() {
     done
     load_ok "p2 ts" || return 1
     ports_check "$D/ports.txt"
-    PSQL -Atc "select version()" -c "select extversion from pg_extension where extname='timescaledb'" > "$D/version.txt"
+    PSQL -Atc "select version()" -c "select extversion from pg_extension where extname='timescaledb'" -c "show work_mem" > "$D/version.txt"
     cd "$WORK" || return 1
     python3 -I "$H/mkq.py" ts
     untimed "$D/check.txt" python3 -I "$H/check.py" ts 200
