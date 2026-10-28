@@ -91,7 +91,10 @@ def phase1(out, p):
     have = {h["key"] for h in hows}
     for f in tsvs:
         k = os.path.basename(f)[:-4]
-        k = {"duckdb": "duck", "qdb-parquet": "qdb"}.get(k, k)  # p1_duck writes duckdb.tsv, p1_qdb both qdb tsvs
+        # p1_duck writes duckdb.tsv, p1_qdb both qdb tsvs, p1_ch the LZ4 and OPTIMIZE FINAL variants, p1_tsdb the
+        # settled sizes; each row's note says which variant it is
+        k = {"duckdb": "duck", "qdb-parquet": "qdb", "ch-lz4": "ch", "ch-optimized": "ch",
+             "tsdb-settled": "tsdb"}.get(k, k)
         if k not in have:
             errors.append("%s: results without how-%s.json" % (f, k))
     out += ["## Phase 1: size per kind of sensor", ""]
