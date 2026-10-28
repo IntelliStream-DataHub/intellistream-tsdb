@@ -121,7 +121,8 @@ SYSTEMS = {
                   "LEVEL medium (default)", "container memory 24g"],
         durability="WAL fsynced before acknowledgement (WAL_LEVEL 2, WAL_FSYNC_PERIOD 0; default WAL_LEVEL 1)",
         loader="loadlp: line protocol through taosAdapter /influxdb/v1/write (schemaless), 100000 lines per "
-               "request, 8 connections (TDengine's faster stmt/WebSocket path is not used)",
+               "request, 8 connections. TDengine's documented fastest path (stmt over WebSocket) is not used, so "
+               "its load time is NOT comparable: leave TDengine out of any load-speed ranking",
         query_client=QDRIVE + "; REST /rest/sql (taosAdapter)",
         connections="random-window classes 1 and 32; whole range 1",
         one_query="one SQL statement per series; " + BATCH_SQL,
@@ -137,7 +138,9 @@ SYSTEMS = {
         query_client=QDRIVE + "; Prometheus HTTP API (MetricsQL)",
         connections="random-window classes 1 and 32; whole range 1",
         one_query="one HTTP query per series; a batch of K is K requests joined in one qdrive line (no multi-series "
-                  "query with per-series windows in PromQL)",
+                  "query with per-series windows in PromQL): those K requests run one after another on one "
+                  "connection, so a batch's time is their sum; tsdb's batch runs its K series in parallel. Compare "
+                  "throughput by the per-series time at 32 clients, not by the batch time",
         per_core="GOMAXPROCS=1 and -search.maxWorkersPerQuery=1; " + PIN,
     ),
     "prom": dict(

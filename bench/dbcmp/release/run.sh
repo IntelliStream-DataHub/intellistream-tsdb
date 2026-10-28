@@ -572,7 +572,9 @@ tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI
                # classes one window per request) and the log says the rest is pending.
     local P=$1 D=$2 k c t sfx= ths=${BTHREADS:-1 32} n
     [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
-    tsdb_has_batch || log "  $P: tsdbq in $TB has no --batch: tsdb batches K > 1 pending (K = 1 only)"
+    # a release run must time tsdb's batches: without protocol 10's --batch the phase fails (smoke only logs it)
+    tsdb_has_batch || { [ "${SMOKE:-0}" = 1 ] && log "  $P: tsdbq in $TB has no --batch: K > 1 not timed" \
+        || fail "$P: tsdbq in $TB has no --batch (TSDB_TREE must be the multi-series build): K > 1 not timed"; }
     for k in $KS; do
         if [ "$k" = 1 ]; then
             reps "$P.full.b1$sfx" "$D" -- pc_client env NSERIES="$(python3 -I "$H/batches.py" --count-full1)" "$TB/tsdbq" full 1 1
@@ -617,6 +619,8 @@ tsdb_self() { # TAG: tsdbd's answers now against its references (cwd WORK): the 
 tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (where tsdbd has --query-threads)
     local qt=()
     "$T/tsdbd" --help 2>&1 | grep -q -- '--query-threads' && qt=(--query-threads 1)
+    [ ${#qt[@]} = 0 ] && { [ "${SMOKE:-0}" = 1 ] && log "  tsdbd has no --query-threads: per core with all threads" \
+        || { fail "tsdbd in $T has no --query-threads: per core not measured"; return 1; }; }
     tsdbd_stop
     TSDBD_WRAP="taskset -c $PERCORE_CPU" tsdbd_start "$1" "${qt[@]}"
 }
@@ -1008,8 +1012,8 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
         REPS=1 qsuite qdbh "$P-http" "$D" http 127.0.0.1 9100 ""
         # variant: an index on the symbol (README), classes only
         QX "ALTER TABLE sensors ALTER COLUMN series ADD INDEX" > "$D/index.txt"
-        qdb_wait_table sensors >> "$D/index.txt"
-        FULLS="" qsuite qdb "$P-index" "$D" pg "$PG"
+        if qdb_wait_table sensors >> "$D/index.txt"; then FULLS="" qsuite qdb "$P-index" "$D" pg "$PG"
+        else fail "p2 $P: the index's WAL was not applied (see $D/index.txt); index classes not timed"; fi
     fi
     cd "$OUT" || true
     crm rb-qdb; rmdata "$W"
@@ -1523,7 +1527,8 @@ log "run.sh $* start: REPS=$REPS, SECS=$SECS, results in $OUT"
 RC=0
 for a in "$@"; do
     case $a in
-        all) set -- prep p1 p2 p3 p4 ;;
+        all) local_rest=(); for b in "$@"; do [ "$b" = all ] || local_rest+=("$b"); done
+             set -- prep p1 p2 p3 p4 "${local_rest[@]}"; break ;;
     esac
 done
 for a in "$@"; do
