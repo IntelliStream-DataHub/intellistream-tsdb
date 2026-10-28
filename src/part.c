@@ -269,8 +269,25 @@ static int pw_flush(part_writer *w)
     return rc;
 }
 
+/* A part's rows are sorted by (series, ts), one row per (series, ts): queries binary-search them and merges trust
+ * it. Rows out of that order come from a bug upstream (a placement that read two class histories wrote a series
+ * run going back in time, once); they fail the call and are never written. */
+static int pw_disorder(part_writer *w, uint32_t series, int64_t a, int64_t b)
+{
+    fprintf(stderr, "tsdb: writing a part of partition %" PRId64 ": rows of series %u out of order (%" PRId64
+                    " then %" PRId64 "): refused\n", w->partition, series, a, b);
+    return TSDB_ERR_CORRUPT;
+}
+
 static int pw_push_index(part_writer *w, const granule *g)
 {
+    if (g->ts_min > g->ts_max)
+        return pw_disorder(w, g->series, g->ts_min, g->ts_max);
+    if (w->ng) {
+        const granule *p = &w->idx[w->ng - 1];
+        if (g->series < p->series || (g->series == p->series && g->ts_min <= p->ts_max))
+            return pw_disorder(w, g->series, p->ts_max, g->ts_min);
+    }
     if (w->ng == w->idx_cap) {
         size_t cap = w->idx_cap ? w->idx_cap * 2 : 64;
         granule *idx = realloc(w->idx, cap * sizeof *idx);
@@ -290,6 +307,9 @@ static int pw_push_index(part_writer *w, const granule *g)
 
 static int pw_emit(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n)
 {
+    for (size_t i = 1; i < n; i++)
+        if (UNLIKELY(ts[i] <= ts[i - 1]))
+            return pw_disorder(w, series, ts[i - 1], ts[i]);
     granule g;
     memset(&g, 0, sizeof g);
     uint8_t *start = w->buf + w->len;
@@ -460,7 +480,14 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         goto fail;
     }
     free(trailer);
-    if (db->opt.fsync && fdatasync(w->fd) != 0) {
+    /* a deferred sync starts the writeback now: the caller syncs all its parts after the last one is written,
+     * by then mostly one journal commit for all of them instead of one each */
+    if (db->opt.fsync && pending && w->defer_fd) {
+        if (sync_file_range(w->fd, 0, 0, SYNC_FILE_RANGE_WRITE) != 0 && errno != ESPIPE && errno != EINVAL) {
+            rc = TSDB_ERR_IO;
+            goto fail;
+        }
+    } else if (db->opt.fsync && fdatasync(w->fd) != 0) {
         rc = TSDB_ERR_IO;
         goto fail;
     }
@@ -468,7 +495,10 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
     snprintf(name, sizeof name, "p%" PRId64 "_%" PRIu64 "_%" PRIu64 "_%u.part", w->partition, min_block,
              max_block, level);
     if (pending) {
-        close(w->fd);
+        if (db->opt.fsync && w->defer_fd)
+            *w->defer_fd = w->fd; /* the caller syncs and closes it */
+        else
+            close(w->fd);
         w->fd = -1; /* the tmp file stays */
         rc = part_open_as(db->dirfd, w->tmp_name, name, out);
         if (rc == 0)

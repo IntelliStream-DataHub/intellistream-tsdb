@@ -38,10 +38,7 @@ static bool part_has(const part *p, uint32_t s, int64_t start, int64_t end)
 static int tomb_part(eng *db, uint32_t series, int64_t partition, int64_t start, int64_t end, part **out)
 {
     int64_t lo, hi;
-    if (__builtin_mul_overflow(partition, db->partition_ms, &lo))
-        lo = partition < 0 ? INT64_MIN : INT64_MAX;
-    if (__builtin_add_overflow(lo, db->partition_ms, &hi))
-        hi = INT64_MAX;
+    partition_range(db, partition, &lo, &hi);
     tomb t = {.series = series, .start = MAX(start, lo), .end = MIN(end, hi)};
     part_writer w;
     int rc = pw_begin(&w, db, partition, 0);
@@ -113,9 +110,18 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
     pthread_mutex_unlock(&db->lock);
     if (pending && (rc = mt_flush(db)) != 0)
         return rc;
+    /* A fresh series gets its class from these rows, as from a large insert's: placed undecided in class 0, they
+     * would stay there when a later insert classifies the series from the beginning of time (two copies of one
+     * row in two partitions, classes.c) */
+    if (n && (rc = cls_classify_insert(db, NULL, series, ts, n)) != 0)
+        return rc;
 
+    /* one frozen class history from placing the rows until they are listed (classes.c) */
+    cls_freeze(db);
     part_list rows = {0}, all = {0};
-    if (n && (rc = insert_rows(db, st, NULL, series, ts, v, n, 0, &rows, true)) != 0) {
+    if (n && (rc = insert_rows(db, st, NULL, series, ts, v, n, 0, &rows, true, cls_uniform(db, NULL, series, 0),
+                               NULL)) != 0) {
+        cls_thaw(db);
         parts_discard(db, rows.p, rows.n);
         free(rows.p);
         return rc;
@@ -133,6 +139,8 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
     }
     for (size_t i = 0; rc == 0 && i < nb; i++)
         rc = add_tomb_part(db, series, before[i], start, end, &all);
+    if (rc == 0 && n && db->test_precommit)
+        db->test_precommit(db->test_precommit_arg);
     pthread_mutex_lock(&db->publish_lock);
     if (rc == 0)
         rc = range_partitions(db, series, start, end, &now, &nn);
@@ -165,6 +173,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         pthread_mutex_unlock(&db->lock);
     }
     pthread_mutex_unlock(&db->publish_lock);
+    cls_thaw(db);
     free(before);
     free(now);
     if (rc == 0 && all.n) {

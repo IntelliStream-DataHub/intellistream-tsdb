@@ -15,6 +15,7 @@
 #include "internal.h"
 
 #include <stdlib.h>
+#include <unistd.h>
 
 #define SORT_CHUNK_ROWS (8u << 20) /* bounds sort memory to ~256 MiB */
 
@@ -64,23 +65,85 @@ typedef struct rec {
     uint32_t v; /* 4-byte types: the value's bits; 8-byte types: the row (chunks have < 2^32 rows) */
 } rec;
 
+/* How the rows of one batch map to partitions (classes.c): with `ucls` >= 0 every series has that class at
+ * every time (series_check saw it), and a row's partition is today's arithmetic with that class's length;
+ * else each series' class is looked up where its range runs out. */
+typedef struct pctx {
+    eng *db;
+    int ucls;
+} pctx;
+
 typedef struct prange {
-    int64_t p, lo, hi; /* partition and its time range [lo, hi) */
+    int64_t p, lo, hi; /* partition key, and the time range [lo, hi) where a series' rows have that key */
+    int64_t q;         /* number of the partition within its class */
+    int c;             /* class */
 } prange;
 
-static inline void prange_of(const eng *db, int64_t ts, prange *r)
+static inline void prange_of(const pctx *x, uint32_t s, int64_t ts, prange *r)
 {
-    r->p = floor_div(ts, db->partition_ms);
-    r->lo = sat_mul(r->p, db->partition_ms);
-    r->hi = sat_add(r->lo, db->partition_ms);
+    const eng *db = x->db;
+    int64_t slo = INT64_MIN, shi = INT64_MAX;
+    int c = LIKELY(x->ucls >= 0) ? x->ucls : cls_at(x->db, s, ts, &slo, &shi);
+    int64_t len = db->cls_len[c];
+    r->c = c;
+    r->q = floor_div(ts, len);
+    r->p = r->q * db->cls_km[c] + c;
+    r->lo = sat_mul(r->q, len);
+    r->hi = sat_add(r->lo, len);
+    if (UNLIKELY(slo > r->lo))
+        r->lo = slo;
+    if (UNLIKELY(shi < r->hi))
+        r->hi = shi;
+}
+
+/* Dense numbers for the partitions a batch's rows can fall in: per class, those its time range spans. */
+typedef struct dmap {
+    int64_t qmin[PART_CLASSES];
+    uint64_t base[PART_CLASSES], np;
+} dmap;
+
+/* false when the batch spans too many partitions for a dense table */
+static bool dmap_init(const pctx *x, int64_t tmin, int64_t tmax, dmap *m)
+{
+    m->np = 0;
+    for (int c = 0; c < PART_CLASSES; c++) {
+        m->base[c] = m->np;
+        if (x->ucls >= 0 ? c != x->ucls : (c > 0 && !x->db->cls_on))
+            continue;
+        m->qmin[c] = floor_div(tmin, x->db->cls_len[c]);
+        uint64_t span = (uint64_t)floor_div(tmax, x->db->cls_len[c]) - (uint64_t)m->qmin[c] + 1;
+        if (span > (1u << 20))
+            return false;
+        m->np += span;
+    }
+    return m->np <= (1u << 20);
+}
+
+static inline size_t dmap_idx(const dmap *m, const prange *r) { return (size_t)(m->base[r->c] + (r->q - m->qmin[r->c])); }
+
+/* bucket_write's per-series cursor: the time range of its current partition and that partition's counter */
+typedef struct bcur {
+    int64_t lo, hi;
+    size_t slot; /* dense partition number x series in the batch + this series */
+} bcur;
+
+static inline void bcur_set(const pctx *x, const dmap *m, uint32_t s, int64_t ts, size_t k, size_t ns, bcur *b)
+{
+    prange r;
+    prange_of(x, s, ts, &r);
+    b->lo = r.lo;
+    b->hi = r.hi;
+    b->slot = dmap_idx(m, &r) * ns + k;
 }
 
 /* hi saturates at INT64_MAX for the last partition, which then includes INT64_MAX itself */
 
-static inline bool in_prange(const prange *r, int64_t ts)
+static inline bool in_lohi(int64_t lo, int64_t hi, int64_t ts)
 {
-    return ts >= r->lo && (ts < r->hi || (r->hi == INT64_MAX && ts == INT64_MAX));
+    return ts >= lo && (ts < hi || (hi == INT64_MAX && ts == INT64_MAX));
 }
+
+static inline bool in_prange(const prange *r, int64_t ts) { return in_lohi(r->lo, r->hi, ts); }
 
 int part_list_push(part_list *l, part *p)
 {
@@ -123,23 +186,63 @@ static int add_run_unique(part_writer *w, uint32_t s, int type, const int64_t *t
     return rc;
 }
 
-/* Writes rows already in (partition, series, ts) order, equal keys in
- * insertion order, as pending parts appended to `collect`. */
-static int write_sorted(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v,
-                        size_t n, uint64_t wal_seq, part_list *collect)
+/* fdatasyncs and closes the parts' files whose sync write_sorted deferred; the first error wins */
+static int sync_deferred(int *fds, size_t n, int rc)
 {
+    for (size_t i = 0; i < n; i++) {
+        if (rc == 0 && fdatasync(fds[i]) != 0)
+            rc = TSDB_ERR_IO;
+        close(fds[i]);
+    }
+    return rc;
+}
+
+/* Writes rows already in (partition, series, ts) order, equal keys in
+ * insertion order, as pending parts appended to `collect`. Their files are
+ * synced together at the end: a batch spanning several partitions (or classes)
+ * then pays about one journal commit, not one per part. */
+static int write_sorted(const pctx *x, int type, const uint32_t *series, uint32_t cs, const int64_t *ts,
+                        const void *v, size_t n, uint64_t wal_seq, part_list *collect)
+{
+    if (x->db->test_midplace)
+        x->db->test_midplace(x->db->test_midplace_arg);
+    eng *db = x->db;
     size_t wd = type_width(type);
     size_t i = 0;
+    int fds_local[8], *fds = fds_local;
+    size_t nfd = 0, cap = 8;
+    int rc = 0;
     while (i < n) {
         prange r;
-        prange_of(db, ts[i], &r);
+        prange_of(x, series ? series[i] : cs, ts[i], &r);
+        int64_t key = r.p;
         size_t j = i + 1;
-        while (j < n && in_prange(&r, ts[j]))
-            j++;
+        /* rows of one key are contiguous; in uniform batches every series shares the ranges */
+        for (; j < n; j++) {
+            uint32_t s = series ? series[j] : cs;
+            if (in_prange(&r, ts[j]) && (x->ucls >= 0 || !series || s == series[j - 1]))
+                continue;
+            prange_of(x, s, ts[j], &r);
+            if (r.p != key)
+                break;
+        }
+        if (nfd == cap) {
+            int *nf = malloc(2 * cap * sizeof *nf);
+            if (!nf) {
+                rc = TSDB_ERR_NOMEM;
+                break;
+            }
+            memcpy(nf, fds, nfd * sizeof *nf);
+            if (fds != fds_local)
+                free(fds);
+            fds = nf;
+            cap *= 2;
+        }
         part_writer w;
-        int rc = pw_begin(&w, db, r.p, wal_seq);
-        if (rc)
-            return rc;
+        if ((rc = pw_begin(&w, db, key, wal_seq)) != 0)
+            break;
+        int dfd = -1;
+        w.defer_fd = &dfd;
         for (size_t k = i; k < j && rc == 0;) {
             uint32_t s = series ? series[k] : cs;
             size_t m = k + 1;
@@ -153,18 +256,24 @@ static int write_sorted(eng *db, int type, const uint32_t *series, uint32_t cs, 
         }
         if (rc) {
             pw_abort(&w);
-            return rc;
+            break;
         }
         part *p; /* numbered when committed */
-        if ((rc = pw_finish_pending(&w, 0, 0, 0, &p)) != 0)
-            return rc;
+        rc = pw_finish_pending(&w, 0, 0, 0, &p);
+        if (dfd >= 0)
+            fds[nfd++] = dfd;
+        if (rc)
+            break;
         if (p && (rc = part_list_push(collect, p)) != 0) {
             parts_discard(db, &p, 1);
-            return rc;
+            break;
         }
         i = j;
     }
-    return 0;
+    rc = sync_deferred(fds, nfd, rc);
+    if (fds != fds_local)
+        free(fds);
+    return rc;
 }
 
 static void insertion_sort(rec *a, size_t n)
@@ -230,9 +339,12 @@ static rec *lsd_sort(rec *a, rec *tmp, size_t n, bool ts_sorted)
     return a;
 }
 
-static inline bool rec_less(const eng *db, const rec *a, const rec *b)
+static inline bool rec_less(const pctx *x, const rec *a, const rec *b)
 {
-    int64_t pa = floor_div(a->ts, db->partition_ms), pb = floor_div(b->ts, db->partition_ms);
+    prange ra, rb;
+    prange_of(x, a->series, a->ts, &ra);
+    prange_of(x, b->series, b->ts, &rb);
+    int64_t pa = ra.p, pb = rb.p;
     if (pa != pb)
         return pa < pb;
     if (a->series != b->series)
@@ -242,13 +354,13 @@ static inline bool rec_less(const eng *db, const rec *a, const rec *b)
 
 /* Stable bottom-up merge sort, for batches spanning very many partitions.
  * Returns the buffer holding the result. */
-static rec *merge_sort_recs(const eng *db, rec *a, rec *tmp, size_t n)
+static rec *merge_sort_recs(const pctx *x, rec *a, rec *tmp, size_t n)
 {
     for (size_t width = 1; width < n; width *= 2) {
         for (size_t lo = 0; lo < n; lo += 2 * width) {
             size_t mid = MIN(lo + width, n), hi = MIN(lo + 2 * width, n), i = lo, j = mid, k = lo;
             while (i < mid && j < hi)
-                tmp[k++] = rec_less(db, &a[j], &a[i]) ? a[j++] : a[i++];
+                tmp[k++] = rec_less(x, &a[j], &a[i]) ? a[j++] : a[i++];
             while (i < mid)
                 tmp[k++] = a[i++];
             while (j < hi)
@@ -267,7 +379,7 @@ static rec *merge_sort_recs(const eng *db, rec *a, rec *tmp, size_t n)
  * pass straight into the output arrays sort the batch. Returns 1 when a series
  * goes back in time or the key space is too sparse, and the caller falls back
  * to the radix sort. */
-static int bucket_write(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n,
+static int bucket_write(const pctx *x, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n,
                         uint64_t wal_seq, part_list *collect, bool refuse)
 {
     size_t wd = type_width(type);
@@ -281,13 +393,16 @@ static int bucket_write(eng *db, int type, const uint32_t *series, const int64_t
     }
     if (refuse && tmax == TS_UNREACHABLE)
         return TSDB_ERR_INVALID;
-    int64_t pmin = floor_div(tmin, db->partition_ms), pmax = floor_div(tmax, db->partition_ms);
-    uint64_t ns = (uint64_t)smax - smin + 1, np = (uint64_t)pmax - (uint64_t)pmin + 1;
-    if (np > (1u << 20) || ns * np > MAX(n / 2, (size_t)65536))
+    dmap dm;
+    uint64_t ns = (uint64_t)smax - smin + 1;
+    if (!dmap_init(x, tmin, tmax, &dm))
+        return 1;
+    uint64_t np = dm.np;
+    if (ns * np > MAX(n / 2, (size_t)65536))
         return 1;
     size_t nb = (size_t)(ns * np);
     size_t *cnt = scratch_get(SCR_CNT, (nb + 1) * sizeof *cnt);
-    prange *pr = scratch_get(SCR_A, ns * sizeof *pr); /* each series' current partition */
+    bcur *pr = scratch_get(SCR_A, ns * sizeof *pr); /* each series' current partition */
     int64_t *last = scratch_get(SCR_B, ns * sizeof *last);
     uint32_t *os = scratch_get(SCR_S, n * sizeof *os);
     int64_t *ot = scratch_get(SCR_T, n * sizeof *ot);
@@ -306,9 +421,9 @@ static int bucket_write(eng *db, int type, const uint32_t *series, const int64_t
         if (UNLIKELY(ts[i] < last[k]))
             return 1;
         last[k] = ts[i];
-        if (UNLIKELY(!in_prange(&pr[k], ts[i])))
-            prange_of(db, ts[i], &pr[k]);
-        cnt[(size_t)(pr[k].p - pmin) * ns + k + 1]++;
+        if (UNLIKELY(!in_lohi(pr[k].lo, pr[k].hi, ts[i])))
+            bcur_set(x, &dm, series[i], ts[i], k, ns, &pr[k]);
+        cnt[pr[k].slot + 1]++;
     }
     for (size_t k = 1; k <= nb; k++)
         cnt[k] += cnt[k - 1];
@@ -318,9 +433,9 @@ static int bucket_write(eng *db, int type, const uint32_t *series, const int64_t
     }
     for (size_t i = 0; i < n; i++) {
         size_t k = series[i] - smin;
-        if (UNLIKELY(!in_prange(&pr[k], ts[i])))
-            prange_of(db, ts[i], &pr[k]);
-        size_t o = cnt[(size_t)(pr[k].p - pmin) * ns + k]++;
+        if (UNLIKELY(!in_lohi(pr[k].lo, pr[k].hi, ts[i])))
+            bcur_set(x, &dm, series[i], ts[i], k, ns, &pr[k]);
+        size_t o = cnt[pr[k].slot]++;
         os[o] = series[i];
         ot[o] = ts[i];
         if (wd == 4)
@@ -328,7 +443,7 @@ static int bucket_write(eng *db, int type, const uint32_t *series, const int64_t
         else
             memcpy(ov + 8 * o, (const uint8_t *)v + 8 * i, 8);
     }
-    return write_sorted(db, type, os, 0, ot, ov, n, wal_seq, collect);
+    return write_sorted(x, type, os, 0, ot, ov, n, wal_seq, collect);
 }
 
 /* The sorted records' values into ov: in the record, or gathered by row. */
@@ -343,11 +458,11 @@ static inline void gather(const rec *r, size_t n, const void *v, size_t wd, uint
     }
 }
 
-static int sort_and_write(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v,
-                          size_t n, bool ts_sorted, uint64_t wal_seq, part_list *collect, bool refuse)
+static int sort_and_write(const pctx *x, int type, const uint32_t *series, uint32_t cs, const int64_t *ts,
+                          const void *v, size_t n, bool ts_sorted, uint64_t wal_seq, part_list *collect, bool refuse)
 {
     if (series) {
-        int rc = bucket_write(db, type, series, ts, v, n, wal_seq, collect, refuse);
+        int rc = bucket_write(x, type, series, ts, v, n, wal_seq, collect, refuse);
         if (rc != 1)
             return rc;
     }
@@ -376,8 +491,9 @@ static int sort_and_write(eng *db, int type, const uint32_t *series, uint32_t cs
         rc = TSDB_ERR_INVALID;
         goto out;
     }
-    int64_t pmin = floor_div(tmin, db->partition_ms), pmax = floor_div(tmax, db->partition_ms);
-    uint64_t np = (uint64_t)pmax - (uint64_t)pmin + 1;
+    dmap dm;
+    bool dense = dmap_init(x, tmin, tmax, &dm);
+    uint64_t np = dense ? dm.np : UINT64_MAX;
 
     /* each partition group ends up in either a or b; the result is gathered into os/ot/ov */
     rec *res;
@@ -392,8 +508,12 @@ static int sort_and_write(eng *db, int type, const uint32_t *series, uint32_t cs
         size_t *cnt = calloc(np + 1, sizeof *cnt);
         if (!cnt)
             goto out;
+        prange r = {.lo = INT64_MAX, .hi = INT64_MIN};
+        uint32_t rs = 0;
         for (size_t i = 0; i < n; i++) {
-            pk[i] = (uint32_t)(floor_div(a[i].ts, db->partition_ms) - pmin);
+            if (!in_prange(&r, a[i].ts) || (x->ucls < 0 && a[i].series != rs))
+                prange_of(x, rs = a[i].series, a[i].ts, &r);
+            pk[i] = (uint32_t)dmap_idx(&dm, &r);
             cnt[pk[i] + 1]++;
         }
         for (uint64_t k = 1; k <= np; k++)
@@ -420,14 +540,14 @@ static int sort_and_write(eng *db, int type, const uint32_t *series, uint32_t cs
         }
         free(cnt);
     } else {
-        res = merge_sort_recs(db, a, b, n);
+        res = merge_sort_recs(x, a, b, n);
         for (size_t i = 0; i < n; i++) {
             os[i] = res[i].series;
             ot[i] = res[i].ts;
         }
         gather(res, n, v, wd, ov);
     }
-    rc = write_sorted(db, type, os, 0, ot, ov, n, wal_seq, collect);
+    rc = write_sorted(x, type, os, 0, ot, ov, n, wal_seq, collect);
 out:
     free(pk);
     return rc;
@@ -437,23 +557,23 @@ out:
  * WAL holds, as it was acknowledged (an older build accepted such rows), so it does not refuse. The checks ride on
  * passes made anyway: the sort's minimum and maximum per chunk, and here a partition change, since only the last
  * partition can hold TS_UNREACHABLE; a batch that reaches it (292 million years from now) is scanned once more. */
-static int insert_rows_into(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts,
+static int insert_rows_into(const pctx *x, int type, const uint32_t *series, uint32_t cs, const int64_t *ts,
                             const void *v, size_t n, uint64_t wal_seq, part_list *collect, bool refuse)
 {
     size_t wd = type_width(type);
-    int64_t ptop = floor_div(TS_UNREACHABLE, db->partition_ms);
     bool sorted = true;
     prange r;
-    prange_of(db, ts[0], &r);
-    bool top = r.p == ptop;
+    prange_of(x, series ? series[0] : cs, ts[0], &r);
+    bool top = r.hi == INT64_MAX; /* only a range reaching the end of time can hold TS_UNREACHABLE */
     for (size_t i = 1; i < n && sorted; i++) {
-        if (!in_prange(&r, ts[i])) {
+        bool snew = series && series[i] != series[i - 1];
+        if (!in_prange(&r, ts[i]) || (snew && x->ucls < 0)) {
             int64_t prev = r.p;
-            prange_of(db, ts[i], &r);
-            top |= r.p == ptop;
-            if (r.p < prev)
+            prange_of(x, series ? series[i] : cs, ts[i], &r);
+            top |= r.hi == INT64_MAX;
+            if (r.p < prev || (r.p == prev && (snew ? series[i] < series[i - 1] : ts[i] < ts[i - 1])))
                 sorted = false;
-        } else if (series && series[i] != series[i - 1]) {
+        } else if (snew) {
             if (series[i] < series[i - 1])
                 sorted = false;
         } else if (ts[i] < ts[i - 1]) {
@@ -464,7 +584,7 @@ static int insert_rows_into(eng *db, int type, const uint32_t *series, uint32_t 
         for (size_t i = 0; refuse && top && i < n; i++)
             if (ts[i] == TS_UNREACHABLE)
                 return TSDB_ERR_INVALID;
-        return write_sorted(db, type, series, cs, ts, v, n, wal_seq, collect);
+        return write_sorted(x, type, series, cs, ts, v, n, wal_seq, collect);
     }
     /* chunks are written in order, so a later chunk's part is newer: last write still wins */
     for (size_t off = 0; off < n; off += SORT_CHUNK_ROWS) {
@@ -472,8 +592,8 @@ static int insert_rows_into(eng *db, int type, const uint32_t *series, uint32_t 
         bool ts_sorted = true; /* lets the radix sort skip the timestamp digits */
         for (size_t i = off + 1; i < off + m && ts_sorted; i++)
             ts_sorted = ts[i] >= ts[i - 1];
-        int rc = sort_and_write(db, type, series ? series + off : NULL, cs, ts + off, (const uint8_t *)v + off * wd, m,
-                                ts_sorted, wal_seq, collect, refuse);
+        int rc = sort_and_write(x, type, series ? series + off : NULL, cs, ts + off, (const uint8_t *)v + off * wd,
+                                m, ts_sorted, wal_seq, collect, refuse);
         if (rc)
             return rc;
     }
@@ -495,16 +615,26 @@ int parts_publish(eng *db, part **ps, size_t n)
 
 /* All parts of one insert are committed together (all or nothing) and
  * published together. With `collect`, they are handed back pending instead,
- * for the caller to publish with parts_commit under publish_lock. */
+ * for the caller to publish with parts_commit under publish_lock, the caller
+ * holding the class history frozen (cls_freeze) throughout. `gen`: the class
+ * generation read before the caller read the class bytes behind ucls. */
 int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t n,
-                uint64_t wal_seq, part_list *collect, bool refuse)
+                uint64_t wal_seq, part_list *collect, bool refuse, int ucls, const uint64_t *gen)
 {
     if (n == 0)
         return 0;
+    pctx x = {db, db->cls_on ? ucls : 0};
     if (collect)
-        return insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, collect, refuse);
+        return insert_rows_into(&x, type, series, cs, ts, v, n, wal_seq, collect, refuse);
     part_list mine = {0};
-    int rc = insert_rows_into(db, type, series, cs, ts, v, n, wal_seq, &mine, refuse);
+    /* one frozen class history from here until the parts are listed (classes.c); a switch since the caller read
+     * the class bytes (gen) makes every class be looked up again */
+    cls_freeze(db);
+    if (db->cls_on && (!gen || *gen != cls_gen_now(db)))
+        x.ucls = -1;
+    int rc = insert_rows_into(&x, type, series, cs, ts, v, n, wal_seq, &mine, refuse);
+    if (rc == 0 && db->test_precommit)
+        db->test_precommit(db->test_precommit_arg);
     /* their partitions, for the wait below, are read now: once published, a
      * part can be merged away and freed at any moment */
     int64_t *partitions = rc == 0 ? malloc((mine.n ? mine.n : 1) * sizeof *partitions) : NULL;
@@ -514,6 +644,7 @@ int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const in
         partitions[i] = mine.p[i]->partition;
     if (rc == 0)
         rc = parts_publish(db, mine.p, mine.n);
+    cls_thaw(db); /* before waiting for merges: the merge thread may be switching */
     if (rc) {
         parts_discard(db, mine.p, mine.n);
     } else {

@@ -316,17 +316,32 @@ int series_type(series_dict *d, uint32_t id)
 }
 
 /* Whether every series of a batch exists and has `type` (series NULL: cs alone). */
-bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n, int type)
+bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n, int type, struct cls_table *ct,
+                  int *ucls)
 {
+#define CLS_OF(id) (ct && (id) < ct->cap ? atomic_load_explicit(&ct->b[id], memory_order_relaxed) : 0)
     pthread_mutex_lock(&d->lock);
     uint32_t count = atomic_load(&d->count);
-    bool ok = true;
-    if (!series)
+    bool ok = true, same = true;
+    uint8_t b0 = 0;
+    if (!series) {
         ok = cs < count && d->types[cs] == type;
+        b0 = CLS_OF(cs);
+    }
     /* rows come grouped by series: checking where the series changes is enough */
     for (size_t i = 0; series && ok && i < n; i++)
-        if (i == 0 || series[i] != series[i - 1])
+        if (i == 0 || series[i] != series[i - 1]) {
             ok = series[i] < count && d->types[series[i]] == type;
+            uint8_t b = CLS_OF(series[i]);
+            if (i == 0)
+                b0 = b;
+            if (!(b & CLS_DECIDED))
+                b0 = 0; /* fresh: reported below whatever follows */
+            same &= b == b0;
+        }
     pthread_mutex_unlock(&d->lock);
+#undef CLS_OF
+    if (ucls)
+        *ucls = !(b0 & CLS_DECIDED) ? -2 : same && !(b0 & CLS_HIST) ? (int)(b0 & CLS_MASK) : -1;
     return ok;
 }

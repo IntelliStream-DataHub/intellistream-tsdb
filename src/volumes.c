@@ -1086,6 +1086,46 @@ int tsdb_series_type(tsdb *t, uint32_t id, tsdb_type *type)
     return 0;
 }
 
+int tsdb_series_class(tsdb *t, uint32_t id, int *cls)
+{
+    eng *e;
+    uint32_t local;
+    return route(t, id, &e, &local) ? eng_series_class(e, local, cls) : TSDB_ERR_NOTFOUND;
+}
+
+int tsdb_test_class_switch(tsdb *t, uint32_t id, int cls, const int64_t *at)
+{
+    eng *e;
+    uint32_t local;
+    return route(t, id, &e, &local) ? eng_class_switch(e, local, cls, at) : TSDB_ERR_NOTFOUND;
+}
+
+void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg)
+{
+    for (size_t i = 0; i < t->nvols; i++) {
+        t->vols[i]->test_precommit_arg = arg;
+        t->vols[i]->test_precommit = fn;
+    }
+}
+
+void tsdb_test_midplace(tsdb *t, void (*fn)(void *), void *arg)
+{
+    for (size_t i = 0; i < t->nvols; i++) {
+        t->vols[i]->test_midplace_arg = arg;
+        t->vols[i]->test_midplace = fn;
+    }
+}
+
+void tsdb_test_wal_state(tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced)
+{
+    eng *e = t->vols[0];
+    pthread_mutex_lock(&e->lock);
+    *nwtail = e->nwtail + (e->wtail_all_seq != 0);
+    *removed = atomic_load(&e->wal_removed);
+    *removed_synced = atomic_load(&e->wal_removed_synced);
+    pthread_mutex_unlock(&e->lock);
+}
+
 /* ---------------------------------------------------------------- states */
 
 static int state_get(tsdb *t, uint32_t series, const char *name, bool create, uint32_t *code)

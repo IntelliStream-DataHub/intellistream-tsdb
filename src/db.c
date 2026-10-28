@@ -35,6 +35,7 @@ void tsdb_options_init(tsdb_options *o)
 {
     memset(o, 0, sizeof *o);
     o->partition_ms = 86400000;
+    o->partition_classes = 1;
     o->granule_rows = 8192;
     o->zstd_level = 1;
     o->fsync = 1;
@@ -79,7 +80,6 @@ void cc_put(eng *db, codec_ctx *c)
 
 /* ------------------------------------------------------------ parts list */
 
-int64_t partition_of(const eng *db, int64_t ts) { return floor_div(ts, db->partition_ms); }
 
 static int part_cmp(const part *a, const part *b)
 {
@@ -128,7 +128,7 @@ void db_parts_remove_locked(eng *db, part *p)
     }
 }
 
-static size_t partition_part_count_locked(eng *db, int64_t partition)
+size_t partition_part_count_locked(eng *db, int64_t partition)
 {
     size_t n = 0;
     for (size_t i = 0; i < db->nparts; i++)
@@ -196,8 +196,8 @@ void db_release(part **parts, size_t n)
 static int meta_write(eng *db)
 {
     char buf[256];
-    int len = snprintf(buf, sizeof buf, "version=%d\npartition_ms=%" PRId64 "\ngranule_rows=%u\n", FORMAT_VERSION,
-                       db->partition_ms, db->granule_rows);
+    int len = snprintf(buf, sizeof buf, "version=%d\npartition_ms=%" PRId64 "\ngranule_rows=%u\npartition_classes=%d\n",
+                       FORMAT_VERSION, db->partition_ms, db->granule_rows, db->cls_on ? 1 : 0);
     int fd = openat(db->dirfd, META_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0)
         return TSDB_ERR_IO;
@@ -228,6 +228,9 @@ static int meta_load_or_create(eng *db, bool read_only)
             pms = strtoll(line + 13, NULL, 10);
         if ((line = strstr(buf, "granule_rows=")))
             grows = (unsigned)strtoul(line + 13, NULL, 10);
+        int classes = -1;
+        if ((line = strstr(buf, "partition_classes=")))
+            classes = atoi(line + 18);
         if (version != FORMAT_VERSION) {
             /* the format may change in a 0.9.x release (docs/compatibility.md): another version is refused, never
              * read as if it were ours */
@@ -237,10 +240,11 @@ static int meta_load_or_create(eng *db, bool read_only)
                     version, TSDB_VERSION, FORMAT_VERSION);
             return TSDB_ERR_CORRUPT;
         }
-        if (pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS)
+        if (pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS || classes < 0 || classes > 1)
             return TSDB_ERR_CORRUPT;
         db->partition_ms = pms;
         db->granule_rows = grows;
+        cls_setup(db, classes);
         return 0;
     }
     if (errno != ENOENT || read_only)
@@ -249,6 +253,7 @@ static int meta_load_or_create(eng *db, bool read_only)
     db->granule_rows = db->opt.granule_rows ? db->opt.granule_rows : 8192;
     if (db->granule_rows > MAX_GRANULE_ROWS)
         return TSDB_ERR_INVALID;
+    cls_setup(db, db->opt.partition_classes);
     return meta_write(db);
 }
 
@@ -372,6 +377,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     if (!db)
         return TSDB_ERR_NOMEM;
     db->ret_fd = -2; /* retention not opened yet */
+    db->cls_fd = -2;
     if (opts)
         db->opt = *opts;
     else
@@ -436,7 +442,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         goto fail;
     if ((rc = series_open(&db->series, db->dirfd, "SERIES", ro, db->opt.fsync)) != 0 ||
         (rc = series_open(&db->states, db->dirfd, "STATES", ro, db->opt.fsync)) != 0 ||
-        (rc = ret_open(db, ro)) != 0)
+        (rc = ret_open(db, ro)) != 0 || (rc = cls_open(db, ro)) != 0) /* classes before the WAL replay */
         goto fail;
     bool has_manifest = faccessat(db->dirfd, "MANIFEST", F_OK, 0) == 0;
     if (ro && has_manifest) {
@@ -444,12 +450,14 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         /* a MANIFEST caught mid-rewrite is read again, but a damaged one is not an empty database */
         while ((rc = follow_refresh(db)) == 0 && !db->follow_version && db->manifest_bad_since)
             usleep(10000);
+        if (rc == 0) /* CLASSES was read again after MANIFEST: its records come before the parts that use them */
+            rc = cls_check_parts(db);
         if (rc)
             goto fail;
     } else {
         if (!ro && (rc = intents_recover(db)) != 0) /* before tmp files are cleaned up */
             goto fail;
-        if ((rc = load_parts(db, ro)) != 0)
+        if ((rc = load_parts(db, ro)) != 0 || (rc = cls_check_parts(db)) != 0)
             goto fail;
         /* a follower takes WAL rows from the writer's manifest once there is one */
         if (!db->opt.follow && (rc = wal_open(db)) != 0)
@@ -540,6 +548,8 @@ int eng_close(eng *db)
         series_close(&db->states);
     if (db->ret_fd != -2)
         ret_close(db);
+    if (db->cls_fd != -2)
+        cls_close(db);
     while (db->cc_free) {
         codec_ctx *c = db->cc_free;
         db->cc_free = c->next;
@@ -583,10 +593,24 @@ void eng_fail(eng *db, const char *what, int err)
     pthread_mutex_unlock(&db->fail_lock);
 }
 
+/* Every WAL segment unlinked before a directory fsync stays unlinked after a power loss: wal_removed_synced
+ * follows each one (the WAL tail kept for class switches, and empty merge outputs, shrink with it). */
+static void removed_synced_to(eng *db, uint64_t removed)
+{
+    uint64_t cur = atomic_load(&db->wal_removed_synced);
+    while (cur < removed && !atomic_compare_exchange_weak(&db->wal_removed_synced, &cur, removed)) {
+    }
+}
+
 int eng_sync_dir(eng *db, const char *what)
 {
-    if (!db->opt.fsync)
-        return eng_check(db);
+    uint64_t removed = atomic_load(&db->wal_removed); /* unlinked before the fsync below */
+    if (!db->opt.fsync) {
+        int rc = eng_check(db);
+        if (rc == 0)
+            removed_synced_to(db, removed);
+        return rc;
+    }
     pthread_mutex_lock(&db->dir_sync_lock);
     int rc = eng_check(db);
     if (rc == 0 && fsync(db->dirfd) != 0) {
@@ -594,6 +618,8 @@ int eng_sync_dir(eng *db, const char *what)
         rc = TSDB_ERR_IO;
     }
     pthread_mutex_unlock(&db->dir_sync_lock);
+    if (rc == 0)
+        removed_synced_to(db, removed);
     return rc;
 }
 
@@ -667,7 +693,7 @@ const char *eng_state_name(eng *db, uint32_t code)
  * parts directly. A non-empty memtable is flushed first, so its rows get
  * older block numbers than the new part and "last write wins" holds. */
 static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v,
-                      size_t n)
+                      size_t n, int ucls, uint64_t gen)
 {
     int rc = eng_check(db);
     if (rc || n == 0)
@@ -688,7 +714,11 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
     pthread_mutex_unlock(&db->buf_lock);
     pthread_mutex_unlock(&db->lock);
     rc = pending ? mt_flush(db) : 0;
-    return rc ? rc : insert_rows(db, type, series, cs, ts, v, n, 0, NULL, true);
+    if (rc == 0 && ucls == -2) { /* fresh series: their class comes from these rows */
+        rc = cls_classify_insert(db, series, cs, ts, n);
+        ucls = -1;
+    }
+    return rc ? rc : insert_rows(db, type, series, cs, ts, v, n, 0, NULL, true, ucls, &gen);
 }
 
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *values, size_t n)
@@ -697,18 +727,25 @@ int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, con
         return TSDB_ERR_READONLY;
     if (n && (!series || !ts || !values))
         return TSDB_ERR_INVALID;
-    if (n && !series_check(&db->series, series, 0, n, type))
+    int ucls = -1;
+    uint64_t gen = cls_gen_now(db); /* before any class is looked up */
+    if (n && !series_check(&db->series, series, 0, n, type, atomic_load_explicit(&db->cls_tab, memory_order_acquire),
+                           &ucls))
         return TSDB_ERR_INVALID;
-    return write_rows(db, type, series, 0, ts, values, n);
+    return write_rows(db, type, series, 0, ts, values, n, ucls, gen);
 }
 
 int eng_insert_series(eng *db, int type, uint32_t series, const int64_t *ts, const void *values, size_t n)
 {
     if (db->opt.read_only)
         return TSDB_ERR_READONLY;
-    if (!series_check(&db->series, NULL, series, 0, type) || (n && (!ts || !values)))
+    int ucls = -1;
+    uint64_t gen = cls_gen_now(db);
+    if (!series_check(&db->series, NULL, series, 0, type, atomic_load_explicit(&db->cls_tab, memory_order_acquire),
+                      &ucls) ||
+        (n && (!ts || !values)))
         return TSDB_ERR_INVALID;
-    return write_rows(db, type, NULL, series, ts, values, n);
+    return write_rows(db, type, NULL, series, ts, values, n, ucls, gen);
 }
 
 int eng_commit(eng *db)
@@ -747,7 +784,8 @@ int eng_drop_before(eng *db, int64_t ts)
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < db->nparts;) {
         part *p = db->parts[i];
-        int64_t end = sat_add(sat_mul(p->partition, db->partition_ms), db->partition_ms);
+        int64_t lo, end;
+        partition_range(db, p->partition, &lo, &end);
         if (eng_check(db)) /* a rename below failed: retire nothing more */
             break;
         if (end <= ts) {
@@ -835,8 +873,12 @@ int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info),
         return TSDB_ERR_NOMEM;
     for (size_t i = 0; i < n; i++) {
         part *p = ps[i];
-        tsdb_part_info info = {p->name, p->partition, p->min_ts,  p->max_ts,  p->rows,
-                               p->map_len, p->ng,     p->level, p->created, p->written};
+        tsdb_part_info info = {.name = p->name, .partition = p->partition, .min_ts = p->min_ts, .max_ts = p->max_ts,
+                               .rows = p->rows, .bytes = p->map_len, .granules = p->ng, .level = p->level,
+                               .created_s = p->created, .written_s = p->written,
+                               .cls = partition_class(db, p->partition)};
+        partition_range(db, p->partition, &info.start_ms, &info.end_ms);
+        info.partition = floor_div(p->partition, db->cls_kmul); /* the base partition it starts in, as before */
         fn(ctx, &info);
     }
     db_release(ps, n);

@@ -42,7 +42,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -290,6 +292,10 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
 {
     if (m->rows == 0)
         return 0;
+    int rc0 = cls_classify_memtable(db, m); /* fresh series get their class before their rows are placed */
+    if (rc0)
+        return rc0;
+    int ucls = cls_uniform(db, m->ids, 0, m->nids);
     uint32_t *s = malloc(m->rows * sizeof *s);
     int64_t *t = malloc(m->rows * sizeof *t);
     uint64_t *v = malloc(m->rows * sizeof *v);
@@ -321,7 +327,7 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
                 memcpy((uint8_t *)v + 4 * i, &x, 4);
             }
         /* in (series, ts) order; insert_rows re-sorts only when partitions interleave */
-        rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false);
+        rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false, ucls, NULL);
     }
     free(s);
     free(t);
@@ -560,6 +566,31 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     return rc;
 }
 
+/* Unlinks the WAL segments up to seq, now in parts, and moves wal_removed on over those that are gone. One whose
+ * unlink fails (an I/O error, say) stays, and so does every later one, to be tried again at the next flush:
+ * wal_removed must not pass a segment that a reopen would replay (its empty parts and the switches' bound in
+ * classes.c rely on it). Called with flush_lock held. */
+static void wal_unlink_upto(eng *db, uint64_t seq)
+{
+    if (db->wal_enabled) {
+        for (uint64_t s = db->wal_unlink_next ? db->wal_unlink_next : seq; s <= seq; s++) {
+            char name[64];
+            wal_name(name, sizeof name, s);
+            if (unlinkat(db->dirfd, name, 0) != 0 && errno != ENOENT) {
+                if (db->wal_unlink_next != s)
+                    fprintf(stderr, "tsdb: removing %s failed (%s): it stays until a later flush removes it\n", name,
+                            strerror(errno));
+                db->wal_unlink_next = s;
+                return;
+            }
+        }
+        db->wal_unlink_next = 0;
+    }
+    pthread_mutex_lock(&db->lock);
+    db->wal_removed = MAX(db->wal_removed, seq);
+    pthread_mutex_unlock(&db->lock);
+}
+
 /* Writes every memtable waiting to be flushed, oldest first; one whose write
  * failed stays in the list to be retried. Called with flush_lock held. */
 static int flush_waiting(eng *db)
@@ -570,7 +601,9 @@ static int flush_waiting(eng *db)
         part_list pl = {0};
         if ((rc = eng_check(db)) != 0) /* e.g. the MANIFEST rewrite in mt_flush failed */
             break;
+        cls_freeze(db); /* one history from placing its rows until they are listed (classes.c) */
         rc = mt_write(db, m, &pl);
+        struct cls_wtail *wt = rc == 0 && db->cls_on ? cls_wal_tail_new(m) : NULL;
         if (rc == 0) {
             pthread_mutex_lock(&db->publish_lock); /* numbered, named and listed in one step */
             rc = parts_commit(db, pl.p, pl.n);
@@ -578,6 +611,8 @@ static int flush_waiting(eng *db)
                 pthread_mutex_unlock(&db->publish_lock);
         }
         if (rc) {
+            cls_thaw(db);
+            free(wt);
             parts_discard(db, pl.p, pl.n);
             free(pl.p);
             break;
@@ -588,21 +623,18 @@ static int flush_waiting(eng *db)
         memmove(db->flushing + i, db->flushing + i + 1, (db->nflushing - i - 1) * sizeof *db->flushing);
         db->nflushing--;
         db->wal_flushed = MAX(db->wal_flushed, m->wal_seq); /* flushes go in segment order */
+        if (db->cls_on)
+            cls_wal_tail_locked(db, wt, m->wal_seq, m->max_ts);
         pthread_cond_signal(&db->merge_cv);
         pthread_mutex_unlock(&db->lock);
         pthread_mutex_unlock(&db->publish_lock);
+        cls_thaw(db);
         int mrc = manifest_publish(db); /* fails the engine on error */
         free(pl.p);
-        if (db->wal_enabled && mrc == 0) { /* else MANIFEST may still name it: a follower would tail it */
-            char name[64];
-            wal_name(name, sizeof name, m->wal_seq);
-            unlinkat(db->dirfd, name, 0);
-        }
-        if (mrc == 0) {
-            pthread_mutex_lock(&db->lock);
-            db->wal_removed = MAX(db->wal_removed, m->wal_seq);
-            pthread_mutex_unlock(&db->lock);
-        }
+        if (mrc == 0)
+            wal_unlink_upto(db, m->wal_seq); /* else MANIFEST may still name it: a follower would tail it */
+        if (mrc == 0)
+            mrc = cls_flush_guard(db, m); /* a series of a long class that got fast moves on now */
         mt_unref(m);
         rc = mrc;
     }
@@ -853,7 +885,7 @@ int wal_open(eng *db)
                 int64_t ts;
                 uint64_t slot;
                 wal_row(r, &id, &ts, &slot);
-                int64_t p = partition_of(db, ts);
+                int64_t p = partition_of(db, id, ts);
                 if (!have_cache || p != cached_p) {
                     cached_p = p;
                     cached_seq = partition_wal_seq(db, p);

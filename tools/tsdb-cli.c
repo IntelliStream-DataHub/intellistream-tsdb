@@ -58,12 +58,12 @@ static void usage(void)
             "  create <series> [path] [--type T]  create a series of type T (float32, float64, int64,\n"
             "                                     bool, state), in volume <path> if given\n"
             "                                     (an existing volume: see volume add)\n"
-            "  series                             list series (type and volume)\n"
+            "  series                             list series (type, volume, partition class)\n"
             "  volume add <path>                  add a volume: a directory for series of their own\n"
             "                                     (e.g. one per disk or NFS mount); also while tsdbd runs\n"
             "  volume list                        list the volumes, the database directory first\n"
             "  stats                              rows, parts, size, compression ratio\n"
-            "  parts                              list active parts\n"
+            "  parts                              list active parts (partition class and range)\n"
             "  optimize                           merge every partition into one part\n"
             "  drop-before <time>                 drop whole partitions ending before <time>\n"
             "  delete <series> <start> <end>      delete the series' values in [start, end)\n"
@@ -619,11 +619,14 @@ static int cmd_query(tsdb *db, int argc, char **argv)
 static void print_part(void *ctx, const tsdb_part_info *p)
 {
     (void)ctx;
-    char a[40], b[40];
+    char a[40], b[40], s[40];
     format_time(p->min_ts, a, sizeof a);
     format_time(p->max_ts, b, sizeof b);
-    printf("%-40s level %-3u %12" PRIu64 " rows %12" PRIu64 " bytes %8" PRIu64 " granules  %s .. %s\n", p->name,
-           p->level, p->rows, p->bytes, p->granules, a, b);
+    format_time(p->start_ms, s, sizeof s);
+    /* the class: partitions of 1, 7, 28 or 364 base partitions (tsdb_options.partition_classes) */
+    printf("%-40s class %d from %s level %-3u %12" PRIu64 " rows %12" PRIu64 " bytes %8" PRIu64
+           " granules  %s .. %s\n",
+           p->name, p->cls, s, p->level, p->rows, p->bytes, p->granules, a, b);
 }
 
 static void human(double bytes, char *buf, size_t len)
@@ -731,7 +734,9 @@ int main(int argc, char **argv)
             put_name(stdout, tsdb_series_name(db, i));
             printf("\t%s\t", type_names[t]);
             put_name(stdout, tsdb_series_path(db, i));
-            putchar('\n');
+            int c = 0;
+            tsdb_series_class(db, i, &c);
+            printf("\tclass %d\n", c);
         }
     } else if (strcmp(cmd, "volume") == 0) {
         for (uint32_t i = 0; i < tsdb_volume_count(db); i++)

@@ -67,7 +67,10 @@ enum {
 enum { TSDB_VALUES_AUTO = 0, TSDB_VALUES_GORILLA = 1, TSDB_VALUES_CHIMP = 2 };
 
 typedef struct tsdb_options {
-    int64_t partition_ms;    /* fixed at creation; default 1 day */
+    int64_t partition_ms;    /* the base partition, fixed at creation; default 1 day. With partition_classes,
+                              * a series slower than about one row per 1.3 s (at the defaults: under 8
+                              * granules per day) gets partitions of 7, 28 or 364 base partitions, chosen
+                              * from its rate (and at most an eighth of its retention) */
     uint32_t granule_rows;   /* fixed at creation; default 8192 */
     int zstd_level;          /* default 1; 0 disables zstd */
     int value_codec;         /* TSDB_VALUES_AUTO (default), _GORILLA or _CHIMP; tsdb_open refuses others */
@@ -112,6 +115,9 @@ typedef struct tsdb_options {
                               * tsdb-cli set 0: a client must not choose where the server writes */
     int request_threads;     /* threads one query (or one tsdb_query_multi call) uses at most, its caller
                               * included; 0 (default): query_threads */
+    int partition_classes;   /* fixed at creation; 1 (default): a partition length per series from its rate
+                              * (see partition_ms), so slow series pay little per partition; 0: every series
+                              * in base partitions. Off by itself when partition_ms is below 4 ms */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -624,7 +630,10 @@ void tsdb_last_query_stats(tsdb_query_stats *out);
 
 /* ---- maintenance ---- */
 int tsdb_optimize(tsdb *db);                /* merge every partition down to one part */
-int tsdb_drop_before(tsdb *db, int64_t ts); /* drop whole partitions that end at or before ts */
+/* Drops whole partitions that end at or before ts. A slow series' partitions are 7, 28 or 364 base partitions
+ * long (tsdb_options.partition_classes): its rows go in those steps. Use retention or tsdb_delete_range to cut
+ * at an exact time. */
+int tsdb_drop_before(tsdb *db, int64_t ts);
 
 typedef struct tsdb_stats {
     uint64_t parts, partitions, rows, bytes;
@@ -674,12 +683,18 @@ int tsdb_failed(tsdb *db, char *msg, size_t len);
 
 typedef struct tsdb_part_info {
     const char *name;
-    int64_t partition, min_ts, max_ts;
+    int64_t partition, min_ts, max_ts; /* partition: the number of the base partition (partition_ms) its
+                                        * partition starts in, start_ms / partition_ms; with partition_classes
+                                        * a partition is (partition, cls) */
     uint64_t rows, bytes, granules;
     uint32_t level;
     int64_t created_s; /* when the file was written (Unix seconds) */
     int64_t written_s; /* when its newest rows were inserted; idle merges go by this */
+    int cls;           /* partition class: 0, 1, 2 or 3 for 1, 7, 28 or 364 base partitions */
+    int64_t start_ms, end_ms; /* the partition's time range [start_ms, end_ms) */
 } tsdb_part_info;
+/* The partition class of a series' newest rows (0..3, see tsdb_part_info.cls). */
+int tsdb_series_class(tsdb *db, uint32_t series, int *cls);
 int tsdb_foreach_part(tsdb *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 
 /* Read-only databases: pick up what the writer published since the last

@@ -378,6 +378,8 @@ int follow_refresh(eng *db)
             rc = series_reload(&db->states, db->dirfd);
         if (rc == 0)
             rc = ret_reload(db); /* the writer publishes MANIFEST after it changes a retention */
+        if (rc == 0)
+            rc = cls_reload(db); /* records come before the parts that use them are listed */
         /* the new part set: parts we have stay, new ones are opened */
         size_t ncur;
         part **cur = db_snapshot(db, INT64_MIN, INT64_MAX, &ncur);

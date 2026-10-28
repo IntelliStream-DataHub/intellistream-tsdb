@@ -416,9 +416,7 @@ static void ttl_compute_locked(eng *db, part *p, uint32_t gen)
 {
     int64_t any = INT64_MAX, all = INT64_MIN;
     int64_t lo, pend;
-    if (__builtin_mul_overflow(p->partition, db->partition_ms, &lo))
-        lo = p->partition < 0 ? INT64_MIN : INT64_MAX;
-    pend = sat_add64(lo, db->partition_ms);
+    partition_range(db, p->partition, &lo, &pend);
     for (uint32_t i = 0; i < p->ng; i++) {
         int64_t lim = eng_retention(db, p->g[i].series);
         if (lim <= 0) {
@@ -516,14 +514,11 @@ void *merge_thread_main(void *arg)
         if (!k && !dropped && !sync_wal && !eng_check(db))
             k = select_merge_locked(db, sel, true);
         if (dropped || sync_wal) {
-            uint64_t removed = db->wal_removed;
             pthread_mutex_unlock(&db->lock);
             int src = eng_sync_dir(db, "fsync of the directory after retiring expired partitions");
             if (src == 0 && dropped)
                 manifest_publish(db);
-            pthread_mutex_lock(&db->lock);
-            if (src == 0)
-                db->wal_removed_synced = MAX(db->wal_removed_synced, removed);
+            pthread_mutex_lock(&db->lock); /* eng_sync_dir moved wal_removed_synced on */
             dropped |= sync_wal && src == 0; /* look again at once */
         }
         if (!k) {
@@ -543,11 +538,23 @@ void *merge_thread_main(void *arg)
                     tsdb_strerror(rc));
         pthread_mutex_lock(&db->lock);
         merge_commit_locked(db, sel, k, out);
+        part *watch = NULL; /* an idle partition merged down to one part: its series' rates are measured */
+        if (out && !atomic_load(&out->obsolete) && db->opt.merge_idle_s >= 0 &&
+            time(NULL) - out->written >= db->opt.merge_idle_s && partition_part_count_locked(db, out->partition) == 1) {
+            watch = out;
+            part_ref(watch);
+        }
         pthread_mutex_unlock(&db->lock);
         if (out)
             manifest_publish(db);
         for (size_t i = 0; i < k; i++)
             part_unref(sel[i]);
+        if (watch) {
+            int crc = cls_observe(db, watch);
+            if (crc && crc != TSDB_ERR_IO)
+                fprintf(stderr, "tsdb: measuring the series of %s failed: %s\n", watch->name, tsdb_strerror(crc));
+            part_unref(watch);
+        }
         pthread_mutex_lock(&db->lock);
         if (rc != 0 && rc != TSDB_ERR_STOPPED) {
             /* back off instead of retrying a failing merge in a tight loop, but on the condition variable:

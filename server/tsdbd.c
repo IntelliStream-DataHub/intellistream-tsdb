@@ -2448,6 +2448,10 @@ int main(int argc, char **argv)
                                    {"refresh-ms", required_argument, 0, 'R'}, {"max-connections", required_argument, 0, 'm'},
                                    {"wal-max-batch-rows", required_argument, 0, 'B'},
                                    {"partition-ms", required_argument, 0, 'P'},
+                                   {"partition-classes", required_argument, 0, 'K'},
+                                   {"granule-rows", required_argument, 0, 'g'},
+                                   {"merge-idle-s", required_argument, 0, 'G'},
+                                   {"flush-interval-ms", required_argument, 0, 'H'},
                                    {"send-timeout", required_argument, 0, 'T'},
                                    {"io", required_argument, 0, 'I'},
                                    {"verify-checksums", no_argument, 0, 'V'},
@@ -2496,6 +2500,14 @@ int main(int argc, char **argv)
         case 'P': /* only when the database is created */
             o.partition_ms = num_arg("partition-ms", optarg, 1, (long long)1 << 50);
             break;
+        case 'K': /* only when the database is created: 0 keeps every series in base partitions */
+            o.partition_classes = (int)num_arg("partition-classes", optarg, 0, 1);
+            break;
+        case 'g': /* only when the database is created */
+            o.granule_rows = (uint32_t)num_arg("granule-rows", optarg, 1, 1 << 20);
+            break;
+        case 'G': o.merge_idle_s = (int)num_arg("merge-idle-s", optarg, -1, 86400 * 365); break;
+        case 'H': o.flush_interval_ms = (int)num_arg("flush-interval-ms", optarg, 1, 86400000); break;
         case 'T': send_timeout_s = (int)num_arg("send-timeout", optarg, 1, 86400); break;
         case 'q': o.query_threads = (int)num_arg("query-threads", optarg, 1, 4096); break;
         case 'L': o.request_threads = (int)num_arg("request-threads", optarg, 1, 4096); break;
@@ -2520,12 +2532,14 @@ int main(int argc, char **argv)
     usage:
         fprintf(stderr, "usage: tsdbd --version\n"
                         "       tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
-                        "             [--wal-sync-ms MS]\n"
+                        "             [--wal-sync-ms MS] [--partition-ms MS] [--partition-classes 1|0]\n"
+                        "             [--granule-rows 8192] (at creation)\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
                         "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"
                         "             [--metrics-port N|auto [--metrics-bind ADDR]]\n"
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
-                        "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n",
+                        "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"
+                        "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }

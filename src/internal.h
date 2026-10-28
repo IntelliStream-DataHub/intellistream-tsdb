@@ -30,8 +30,9 @@ typedef struct eng eng;
 /* 3: checksummed part header and footer, WAL records and dictionary records;
  * 4: time-weighted statistics in granule entries (136 bytes), range tombstones
  * between the index and the footer; 5: the spread (m2 or the sum of squares) in
- * granule entries (160 bytes), tombstones as in 4; 6: a 7-bit codec kind in block headers; 7: zstd frames
- * without magic number or content size. Databases of older versions
+ * granule entries (160 bytes), tombstones as in 4; 6: a 7-bit codec kind in block headers; 7: partition
+ * classes (a partition key is 4 x its first base partition + its class, CLASSES holds each series' class
+ * history) and zstd frames without magic number or content size. Databases of older versions
  * are refused (no release had them). */
 #define FORMAT_VERSION 7
 #define MAX_GRANULE_ROWS 65536
@@ -672,6 +673,7 @@ typedef struct part_writer {
     tomb *tombs; /* written after the index; sorted, disjoint per series */
     size_t nt;
     bool keep_empty;  /* write a part even with no rows and no tombstones (a merge's wal_seq anchor) */
+    int *defer_fd;    /* pending parts: hand the fd over here, its writeback started, for the caller's fdatasync */
     int effort;       /* CODEC_FAST (pw_begin) or CODEC_MERGE */
     int64_t empty_ts; /* its min_ts = max_ts then */
 } part_writer;
@@ -705,6 +707,7 @@ void pw_abort(part_writer *w);
 #define TS_UNREACHABLE INT64_MAX
 
 /* ---- series dictionary ---- */
+struct cls_table;
 typedef struct series_dict {
     pthread_mutex_t lock;
     const char *file;
@@ -729,7 +732,9 @@ void series_close(series_dict *d);
 int series_get(series_dict *d, const char *name, bool create, int type, uint32_t *id);
 const char *series_name(series_dict *d, uint32_t id);
 int series_type(series_dict *d, uint32_t id); /* -1 for an unknown id */
-bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n, int type);
+/* Also the batch's class (cls_uniform's answer, -2 when a series is fresh), from the class bytes of ct. */
+bool series_check(series_dict *d, const uint32_t *series, uint32_t cs, size_t n, int type, struct cls_table *ct,
+                  int *ucls);
 
 /* ---- working memory of multi-series tasks (multi.c) ----
  * A series that is not at the head of a multi-series request runs with a budget: where it would allocate more
@@ -842,6 +847,16 @@ typedef struct mt_series {
     bool sorted; /* non-decreasing ts, in insertion order */
 } mt_series;
 
+/* A flushed memtable's series and their newest timestamps, while its WAL segment may still be replayed (classes.c) */
+struct cls_wtail {
+    struct cls_wtail *next;
+    uint64_t seq;
+    size_t n;
+    bool sorted; /* ids sorted (with max), done by the first switch that looks */
+    uint32_t *ids;
+    int64_t *max;
+};
+
 typedef struct memtable {
     atomic_int refs;
     mt_series *s; /* indexed by series id */
@@ -922,6 +937,28 @@ void *follower_main(void *arg);
 void db_retire_locked(struct eng *db, part *p);
 void graveyard_purge(struct eng *db, bool all);
 
+/* ---- partition classes (classes.c) ----
+ * A series' rows go to partitions of 1, 7, 28 or 364 base partitions (partition_ms) by its class; a class-c
+ * partition holds series of class c only. Its key is kmul x (its first base partition) + c (kmul = 4; 1 with
+ * classes off, where keys are today's base partition numbers), so keys of every class sort by time and are
+ * compared for equality as before. A series' class may change at a time T (a switch, appended to CLASSES and
+ * synced before anything uses it); rows never move: earlier rows stay where they are. */
+#define PART_CLASSES 4
+#define CLS_MASK 3u     /* class byte: the class at the series' newest switch */
+#define CLS_HIST 4u     /* it has a switch after INT64_MIN: the history is in the map (cls_mu) */
+#define CLS_DECIDED 8u  /* not fresh: its class was decided (or it existed at open) */
+typedef struct cls_table {
+    uint64_t cap;
+    struct cls_table *older;
+    _Atomic uint8_t b[];
+} cls_table;
+typedef struct cls_hist {
+    uint32_t series, n, cap;
+    bool used;
+    int64_t *from; /* increasing */
+    uint8_t *cls;
+} cls_hist;
+
 /* ---- database ---- */
 typedef struct ret_table {
     uint64_t cap;
@@ -936,6 +973,9 @@ struct eng {
     tsdb_options opt;
     int64_t partition_ms;
     uint32_t granule_rows;
+    /* partition classes (classes.c): on, key multiplier, length and key step per class */
+    bool cls_on;
+    int64_t cls_kmul, cls_len[PART_CLASSES], cls_km[PART_CLASSES];
 
     pthread_mutex_t lock; /* parts list and part flags */
     /* New parts get their block numbers, names and place in the list in one
@@ -969,6 +1009,35 @@ struct eng {
     int ret_fd;
     uint64_t ret_off;
     bool ret_broken;
+
+    /* partition classes (classes.c). Lock order: flush_lock > cls_rw > class_lock > the WAL writer role; cls_mu is a
+     * leaf (the history map and the growth of cls_tab). */
+    pthread_mutex_t class_lock; /* decisions, switches and appends to CLASSES */
+    pthread_mutex_t cls_mu;
+    _Atomic(struct cls_table *) cls_tab; /* class byte per series, read without a lock */
+    cls_hist *hmap;                      /* open addressing by series (cls_mu) */
+    size_t hcap, hn;
+    int cls_fd;
+    uint64_t cls_off; /* bytes of CLASSES applied (a writer appends here) */
+    bool cls_broken;
+    atomic_uint_fast64_t st_class_switches;
+    /* One frozen history per placement: a large insert, a replace or a flush holds cls_rw for reading from the
+     * moment it looks up its rows' classes until their parts are listed; a switch takes it for writing (classes.c).
+     * cls_gen counts the switches (changed under cls_rw held for writing). */
+    pthread_rwlock_t cls_rw;
+    _Atomic uint64_t cls_gen;
+    void (*test_precommit)(void *); /* test hook: runs after a large insert placed its rows, before it commits */
+    void *test_precommit_arg;
+    void (*test_midplace)(void *); /* test hook: runs inside a placement, before rows are grouped into parts */
+    void *test_midplace_arg;
+    /* flushed memtables whose WAL segment may still be replayed (seq > wal_removed_synced): the newest timestamp
+     * of each series in them bounds the T of its switch (db->lock). wtail_all: the bound for every series when an
+     * entry could not be allocated, up to segment wtail_all_seq. */
+    struct cls_wtail *wtail;
+    size_t nwtail;
+    uint64_t wtail_all_seq;
+    int64_t wtail_all_max;
+    uint64_t wal_unlink_next; /* the first flushed segment whose unlink failed, to try again (flush_lock); 0: none */
     atomic_int_fast64_t clock_floor; /* now never goes below this */
     atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
     int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
@@ -1010,7 +1079,7 @@ struct eng {
     uint64_t wal_flushed; /* segments up to this are entirely in parts (db->lock) */
     /* segments up to wal_removed are unlinked, up to wal_removed_synced durably (db->lock): an empty part (a
      * merge's wal_seq anchor) is needed only while a segment up to its wal_seq may come back at open */
-    uint64_t wal_removed, wal_removed_synced;
+    _Atomic uint64_t wal_removed, wal_removed_synced; /* written under db->lock; the second also by eng_sync_dir */
     graveyard_entry *graveyard;
     size_t ngraveyard, graveyard_cap;
 
@@ -1067,12 +1136,17 @@ int eng_failed_msg(struct eng *db, char *msg, size_t len);
 codec_ctx *cc_get(struct eng *db);
 void cc_put(struct eng *db, codec_ctx *c);
 
-int64_t partition_of(const struct eng *db, int64_t ts);
+/* classes.c: the partition key of a row, and a key's class and time range [lo, hi) (hi saturates at INT64_MAX
+ * for the last partition, which then holds INT64_MAX itself) */
+int64_t partition_of(struct eng *db, uint32_t series, int64_t ts);
+void partition_range(const struct eng *db, int64_t key, int64_t *lo, int64_t *hi);
+int partition_class(const struct eng *db, int64_t key);
 /* Lists committed parts, taking over the caller's references, and rewrites
  * MANIFEST. Cannot fail: once listed, the parts are published and must not
  * be discarded; a MANIFEST failure fails the engine by itself (eng_fail). */
 void db_add_parts(struct eng *db, part **ps, size_t n);
 void db_wait_merges(struct eng *db, int64_t partition);
+size_t partition_part_count_locked(struct eng *db, int64_t partition);
 void db_parts_insert_locked(struct eng *db, part *p);
 void db_parts_remove_locked(struct eng *db, part *p);
 part **db_snapshot(struct eng *db, int64_t start, int64_t end, size_t *n);
@@ -1086,8 +1160,10 @@ void merge_commit_locked(struct eng *db, part **src, size_t k, part *out);
 /* insert.c: sorts (stably), keeps the last row per (series, ts), writes one
  * part per partition. Parts are published, or handed back in `collect`. With `refuse` (rows from a caller, not
  * a flush of the WAL), a row at TS_UNREACHABLE fails the insert with TSDB_ERR_INVALID. */
+/* ucls >= 0: every series of the batch has that class at every time (cls_uniform); -1: looked up per series. */
 int insert_rows(struct eng *db, int type, const uint32_t *series, uint32_t const_series, const int64_t *ts,
-                const void *v, size_t n, uint64_t wal_seq, part_list *collect, bool refuse);
+                const void *v, size_t n, uint64_t wal_seq, part_list *collect, bool refuse, int ucls,
+                const uint64_t *gen);
 int part_list_push(part_list *l, part *p);
 int parts_publish(struct eng *db, part **ps, size_t n);
 
@@ -1228,6 +1304,53 @@ static inline int64_t eng_mono_ms(void)
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
 /* retention.c */
+static inline uint8_t cls_byte(eng *db, uint32_t s)
+{
+    cls_table *t = atomic_load_explicit(&db->cls_tab, memory_order_acquire);
+    return t && s < t->cap ? atomic_load_explicit(&t->b[s], memory_order_relaxed) : 0;
+}
+/* The class of series s at ts and the time range [*lo, *hi) around ts where it holds. */
+int cls_at(eng *db, uint32_t s, int64_t ts, int64_t *lo, int64_t *hi);
+/* The class of every series of a batch when they share one with no switch (and none is fresh), else -1. */
+int cls_uniform(eng *db, const uint32_t *ids, uint32_t cs, size_t n);
+void cls_setup(eng *db, int classes);
+int cls_open(eng *db, bool read_only);
+int cls_reload(eng *db);
+void cls_close(eng *db);
+/* Fresh series of a large insert get their class from its rows (once, from the beginning of time). */
+int cls_classify_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, size_t n);
+/* The same for the fresh series of a memtable about to be flushed (caller holds flush_lock). */
+int cls_classify_memtable(eng *db, const memtable *m);
+/* After a flush (flush_lock held): a series of a long class that got much faster moves to a shorter one. */
+int cls_flush_guard(eng *db, const memtable *m);
+/* After an idle merge left one part in its partition: series whose rate left their class's band move. */
+int cls_observe(eng *db, part *p);
+/* A flushed memtable whose segment may still be replayed: its series' newest timestamps, built before the flush
+ * takes its locks (NULL on ENOMEM), then added under db->lock (which also drops entries no longer replayable). */
+struct cls_wtail *cls_wal_tail_new(const memtable *m);
+void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, int64_t max_ts);
+/* Placements (large inserts, replaces, flushes) hold the class history frozen from their first class lookup until
+ * their parts are listed; a switch waits for them. Never nested, and never held while waiting for a flush or a
+ * merge (a switch holds flush_lock and the merge thread switches). */
+void cls_freeze(eng *db);
+void cls_thaw(eng *db);
+/* At open: every part's rows lie in its partition's range, sorted, and in the class the history gives their
+ * series there (TSDB_ERR_CORRUPT with a log line otherwise). */
+int cls_check_parts(eng *db);
+int eng_series_class(eng *db, uint32_t series, int *cls);
+/* The switch generation, read (acquire) before series_check reads the class bytes: a large insert that finds it
+ * changed once it holds cls_rw looks every class up again. */
+uint64_t cls_gen_now(eng *db);
+/* test hook: switch series to cls at the computed T, or at *at when that is later */
+int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at);
+int tsdb_test_class_switch(struct tsdb *t, uint32_t series, int cls, const int64_t *at); /* through the volumes */
+/* test hook: fn(arg) runs in every large insert and replace after its rows were placed, before it commits */
+void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
+/* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */
+void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
+/* test hook: the WAL tail kept for switches, and how far segments are unlinked (durably) */
+void tsdb_test_wal_state(struct tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced);
+
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);
 void ret_close(eng *db);
