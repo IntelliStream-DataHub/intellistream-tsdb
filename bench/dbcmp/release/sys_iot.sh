@@ -24,10 +24,10 @@ IOT_STABLE=${IOT_STABLE:-180}                       # settle: TsFiles unchanged 
 IOT_SETTLE_MAX=${IOT_SETTLE_MAX:-10800}
 IOT_PROCS=${IOT_PROCS:-8} IOT_TABLET=${IOT_TABLET:-100000}
 
-iot_start() { # DATADIR [PODMAN ARGS...]: rb-iot; IOT_Z=1 for compressor=ZSTD
-    local W=$1 i z=
+iot_comp() { [ "${IOT_Z:-0}" = 1 ] && echo ZSTD || echo "${IOT_COMP:-LZ4}"; }
+iot_start() { # DATADIR [PODMAN ARGS...]: rb-iot; IOT_Z=1 for compressor=ZSTD, else IOT_COMP; IOT_ENC: float encoding
+    local W=$1 i z="-e compressor=$(iot_comp) -e default_float_encoding=${IOT_ENC:-GORILLA}"
     shift
-    [ "${IOT_Z:-0}" = 1 ] && z="-e compressor=ZSTD"
     [ -n "$IOT_QMEM" ] && z="$z -e chunk_timeseriesmeta_free_memory_proportion=$IOT_QMEM"
     mkdir -p "$W/data" "$W/logs"
     podman run -d --name rb-iot --memory "$IOT_MEM" --memory-swap "$IOT_MEM" \
@@ -75,8 +75,13 @@ iot_du() { # DATADIR: du -sb of every database directory under sequence/ and uns
 }
 
 p1_iotz() { IOT_Z=1 p1_iot; }   # compressor=ZSTD: sizes in p1/iot-zstd.tsv
+# sizes only: the other lossless float encoding (CHIMP) and the strongest compressor (LZMA2), for IoTDB's smallest
+p1_iotc() { IOT_ENC=CHIMP IOT_COMP=ZSTD p1_iot; }      # p1/iot-chimp-zstd.tsv
+p1_iotx() { IOT_COMP=LZMA2 p1_iot; }                   # p1/iot-gorilla-lzma2.tsv
+p1_iotcx() { IOT_ENC=CHIMP IOT_COMP=LZMA2 p1_iot; }    # p1/iot-chimp-lzma2.tsv
 p1_iot() { # a database per data set (s_<ds>, table sensors): IoTDB's files are per database, so du separates them
     local v=iot; [ "${IOT_Z:-0}" = 1 ] && v=iot-zstd
+    [ -n "${IOT_ENC:-}${IOT_COMP:-}" ] && v=iot-$(echo "${IOT_ENC:-GORILLA}-$(iot_comp)" | tr A-Z a-z)
     local D=$OUT/p1/$v W=$DBCMP/s1/$v ds db
     mkdir -p "$D"; rmdata "$W"
     IOT_DDL_LOG=$D/ddl.txt iot_start "$W" || return 1
@@ -93,9 +98,9 @@ p1_iot() { # a database per data set (s_<ds>, table sensors): IoTDB's files are 
         curl -s -H "${IOT_HDR%$'\r\n'}" -H 'Content-Type: application/json' http://127.0.0.1:18080/rest/table/v1/query \
             -d "{\"database\":\"s_${ds,,}\",\"sql\":\"SELECT count(value) FROM sensors\"}" > "$D/count.$ds.json"
         awk -v ds="$ds" -v db="s_${ds,,}" -v rows="$(jq -r '.values[0][0]' "$D/count.$ds.json" 2> /dev/null)" \
-            -v z="$([ "${IOT_Z:-0}" = 1 ] && echo ZSTD || echo LZ4)" '
+            -v z="${IOT_ENC:-GORILLA} + $(iot_comp)" '
             $2 == "data/sequence/" db {s = $1} $2 == "data/unsequence/" db {u = $1}
-            END {printf "%s\t%s\t%d\tTsFiles (sequence %d + unsequence %d, du -sb) after FLUSH and compaction; GORILLA + %s; WAL apart\n", ds, rows, s + u, s, u, z}' \
+            END {printf "%s\t%s\t%d\tTsFiles (sequence %d + unsequence %d, du -sb) after FLUSH and compaction; %s; WAL apart\n", ds, rows, s + u, s, u, z}' \
             "$D/du.txt" >> "$OUT/p1/$v.tsv"
         [ "$(jq -r '.values[0][0]' "$D/count.$ds.json" 2> /dev/null)" = $(($(stat -c %s "$IN/$ds.rowbinary") / 16)) ] ||
             fail "p1 $v $ds: row count $(head -c 200 "$D/count.$ds.json") is not the file's $(($(stat -c %s "$IN/$ds.rowbinary") / 16))"

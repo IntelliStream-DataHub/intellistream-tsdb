@@ -192,6 +192,12 @@ SYSTEMS["qdb-parquet-zstd"] = dict(SYSTEMS["qdb"], system="QuestDB (Parquet part
 SYSTEMS["iot-zstd"] = dict(SYSTEMS["iot"], system="Apache IoTDB (table model, ZSTD)",
                            settings=[s for s in SYSTEMS["iot"]["settings"] if not s.startswith("float")] +
                            ["compressor=ZSTD, float encoding GORILLA"])
+for _k, _e, _c in (("iot-chimp-zstd", "CHIMP", "ZSTD"), ("iot-gorilla-lzma2", "GORILLA", "LZMA2"),
+                   ("iot-chimp-lzma2", "CHIMP", "LZMA2")):
+    SYSTEMS[_k] = dict(SYSTEMS["iot"], system="Apache IoTDB (table model, %s + %s; sizes only)" % (_e, _c),
+                       settings=[s for s in SYSTEMS["iot"]["settings"] if not s.startswith("float")] +
+                       ["default_float_encoding=%s, compressor=%s (lossless; never TS_2DIFF/RLE on floats, which "
+                        "round to float_precision)" % (_e, _c)])
 SYSTEMS["td-zstd"] = dict(SYSTEMS["td"], system="TDengine (community, ZSTD)",
                           settings=[s for s in SYSTEMS["td"]["settings"] if not s.startswith("value")] +
                           ["_ts TIMESTAMP and value FLOAT: COMPRESS 'zstd' LEVEL 'high' (never the lossy tsz)"])
@@ -205,7 +211,8 @@ SYSTEMS["duck"] = SYSTEMS["duckdb"]
 
 # run.sh's system names -> SYSTEMS key (phase 2's names are also its result directories)
 ALIAS = {"qdb0": "qdb", "qdb1": "qdb-parquet", "qdb2": "qdb-parquet-zstd", "qdbz": "qdb-parquet-zstd",
-         "iotz": "iot-zstd", "tdz": "td-zstd", "tdx": "td-xz"}
+         "iotz": "iot-zstd", "tdz": "td-zstd", "tdx": "td-xz",
+         "iotc": "iot-chimp-zstd", "iotx": "iot-gorilla-lzma2", "iotcx": "iot-chimp-lzma2"}
 
 
 def image(env):

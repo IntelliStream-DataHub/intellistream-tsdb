@@ -6,12 +6,13 @@ import csv, os, sys
 
 d = sys.argv[1]
 order = ["tsdb", "tsdb-settled", "ch", "ch-optimized", "ch-zstd22", "ch-lz4", "duckdb", "qdb", "qdb-parquet",
-         "qdb-parquet-zstd", "ts", "i2", "i3", "prom", "iot", "iot-zstd", "td", "td-zstd", "td-xz", "vm"]
+         "qdb-parquet-zstd", "ts", "i2", "i3", "prom", "iot", "iot-zstd", "iot-chimp-zstd", "iot-gorilla-lzma2", "iot-chimp-lzma2", "td", "td-zstd", "td-xz", "vm"]
 names = {"tsdb": "tsdb", "tsdb-settled": "tsdb (merges idle, before optimize)", "ch": "ClickHouse (codecs)",
          "ch-optimized": "ClickHouse OPTIMIZE FINAL", "ch-zstd22": "ClickHouse ZSTD(22), OPTIMIZE FINAL",
          "ch-lz4": "ClickHouse (default LZ4)", "duckdb": "DuckDB", "qdb": "QuestDB", "qdb-parquet": "QuestDB, Parquet",
          "qdb-parquet-zstd": "QuestDB, Parquet ZSTD", "ts": "TimescaleDB", "i2": "InfluxDB 2",
          "i3": "InfluxDB 3 (Parquet)", "prom": "Prometheus (backfill)", "iot": "IoTDB", "iot-zstd": "IoTDB ZSTD",
+         "iot-chimp-zstd": "IoTDB CHIMP+ZSTD", "iot-gorilla-lzma2": "IoTDB LZMA2", "iot-chimp-lzma2": "IoTDB CHIMP+LZMA2",
          "td": "TDengine", "td-zstd": "TDengine zstd", "td-xz": "TDengine xz", "vm": "VictoriaMetrics"}
 # a system's .tsv this list does not know yet still gets its column (under its file name), never dropped
 order += sorted(f[:-4] for f in os.listdir(d) if f.endswith(".tsv") and f[:-4] not in order)
