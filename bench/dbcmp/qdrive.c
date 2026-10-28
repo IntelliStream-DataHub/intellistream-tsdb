@@ -68,6 +68,8 @@ typedef struct job {
     int done;
     double *lat;
     size_t n, cap;
+    char *seg; /* one request of a line, split in place */
+    size_t segcap;
     double secs;
     unsigned long long rows, bytes;
 } job;
@@ -113,21 +115,36 @@ static void *run(void *arg)
             for (const char *seg = q; seg;) {
                 const char *nx = strstr(seg, " && ");
                 size_t sl = nx ? (size_t)(nx - seg) : strlen(seg);
-                char one[16384];
-                snprintf(one, sizeof one, "%.*s", (int)sl, seg);
+                /* the segment is copied whole into a buffer of its size (a batch of 100 series is 20-270 KB) and
+                   split in place: METHOD PATH[\tCTYPE\tBODY] */
+                if (sl + 1 > j->segcap && !(j->seg = realloc(j->seg, j->segcap = sl + 1))) {
+                    fprintf(stderr, "out of memory\n");
+                    exit(1);
+                }
+                char *one = j->seg;
+                memcpy(one, seg, sl);
+                one[sl] = 0;
                 seg = nx ? nx + 4 : NULL;
-                char method[8], path[16384], ctype[128] = "";
-                const char *body = "";
-                const char *sp = strchr(one, ' ');
-                snprintf(method, sizeof method, "%.*s", (int)(sp - one), one);
-                const char *t1 = strchr(sp + 1, '\t');
+                char ctype[128] = "";
+                const char *method = one, *path, *body = "";
+                char *sp = strchr(one, ' ');
+                if (!sp) {
+                    fprintf(stderr, "query line without a method: %.300s\n", one);
+                    exit(1);
+                }
+                *sp = 0;
+                path = sp + 1;
+                char *t1 = strchr(sp + 1, '\t');
                 if (t1) {
-                    snprintf(path, sizeof path, "%.*s", (int)(t1 - sp - 1), sp + 1);
-                    const char *t2 = strchr(t1 + 1, '\t');
+                    *t1 = 0;
+                    char *t2 = strchr(t1 + 1, '\t');
+                    if (!t2) {
+                        fprintf(stderr, "query line with a content type but no body: %.300s\n", path);
+                        exit(1);
+                    }
                     snprintf(ctype, sizeof ctype, "Content-Type: %.*s\r\n", (int)(t2 - t1 - 1), t1 + 1);
                     body = t2 + 1;
-                } else
-                    snprintf(path, sizeof path, "%s", sp + 1);
+                }
                 char hdrs[4096];
                 snprintf(hdrs, sizeof hdrs, "%s%s", headers, ctype);
                 size_t rb = 0;
@@ -144,7 +161,7 @@ static void *run(void *arg)
                 }
                 if (bad) {
                     fprintf(stderr, "query failed: status %d: %.*s\n%.300s\n", st, (int)(resp.n < 500 ? resp.n : 500),
-                            resp.p ? resp.p : "", one);
+                            resp.p ? resp.p : "", path);
                     exit(1);
                 }
                 j->bytes += rb;

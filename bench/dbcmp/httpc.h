@@ -132,10 +132,19 @@ static int h_request(hconn *c, const char *method, const char *path, const char 
 {
     for (int attempt = 0; attempt < 2; attempt++) {
         if (c->fd < 0 && h_open(c) != 0) return -1;
-        char hdr[8192];
-        int hl = snprintf(hdr, sizeof hdr, "%s %s HTTP/1.1\r\nHost: %s:%d\r\n%sContent-Length: %zu\r\n\r\n", method,
-                          path, c->host, c->port, headers ? headers : "", blen);
-        if (h_writeall(c->fd, hdr, (size_t)hl) != 0 || (blen && h_writeall(c->fd, body, blen) != 0)) {
+        /* a GET of a batch of 100 series carries its query in the path (InfluxQL: 30 KB and more): the head is
+           sized to fit, never cut (a cut request could be a valid, smaller query and be timed as one) */
+        char small[8192], *hdr = small;
+        const char *fmt = "%s %s HTTP/1.1\r\nHost: %s:%d\r\n%sContent-Length: %zu\r\n\r\n";
+        int hl = snprintf(hdr, sizeof small, fmt, method, path, c->host, c->port, headers ? headers : "", blen);
+        if (hl < 0) return -1;
+        if ((size_t)hl >= sizeof small) {
+            if (!(hdr = malloc((size_t)hl + 1))) return -1;
+            snprintf(hdr, (size_t)hl + 1, fmt, method, path, c->host, c->port, headers ? headers : "", blen);
+        }
+        int werr = h_writeall(c->fd, hdr, (size_t)hl) != 0 || (blen && h_writeall(c->fd, body, blen) != 0);
+        if (hdr != small) free(hdr);
+        if (werr) {
             close(c->fd);
             c->fd = -1;
             continue; /* the server closed an idle keep-alive connection: retry once */
