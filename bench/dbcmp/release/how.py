@@ -24,6 +24,8 @@ PIN = ("the server's process tree pinned to CPU {cpu} by taskset (rootless Podma
 WARM_SRV = ("whole range: one warm-up run, then REPS runs of the one query; random-window classes: 3 s warm-up "
             "on 1 connection, then REPS runs of SECS s per connection count; LTTB/TWA: one warm-up, then REPS runs")
 
+PASTA = (" (pasta, rootless Podman's port forwarding: the server binds every address; its per-request cost is "
+         "measured on VictoriaMetrics: p2/vm vm.pasta.point.* against vm.point.*)")
 SYSTEMS = {
     "tsdb": dict(
         system="tsdb (tsdbd)", image_env=None,
@@ -101,7 +103,7 @@ SYSTEMS = {
     "iot": dict(
         system="Apache IoTDB (table model)", image_env="IOT_IMG",
         settings=["wal_mode=SYNC", "compaction_write_throughput_mb_per_sec=0", "query_timeout_threshold=3600000",
-                  "REST on 18080 published on 127.0.0.1 only (pasta)", "heap -Xmx16G, direct 4G, container 24g",
+                  "REST on 18080 published on 127.0.0.1 only" + PASTA, "heap -Xmx16G, direct 4G, container 24g",
                   "float encoding GORILLA, compressor LZ4 (default)"],
         durability="WAL fsynced before acknowledgement (wal_mode SYNC; default ASYNC)",
         loader="iotload.py: Python TableSession tablets over the native RPC (6667), 100000 rows per tablet, 8 "
@@ -114,7 +116,7 @@ SYSTEMS = {
     "td": dict(
         system="TDengine (community)", image_env="TD_IMG",
         settings=["CREATE DATABASE ... WAL_LEVEL 2 WAL_FSYNC_PERIOD 0 PRECISION 'ms'", "taosKeeper, taosExplorer, "
-                  "taosX off", "REST on 6041 published on 127.0.0.1 only", "value FLOAT: ENCODE bss COMPRESS lz4 "
+                  "taosX off", "REST on 6041 published on 127.0.0.1 only" + PASTA, "value FLOAT: ENCODE bss COMPRESS lz4 "
                   "LEVEL medium (default)", "container memory 24g"],
         durability="WAL fsynced before acknowledgement (WAL_LEVEL 2, WAL_FSYNC_PERIOD 0; default WAL_LEVEL 1)",
         loader="loadlp: line protocol through taosAdapter /influxdb/v1/write (schemaless), 100000 lines per "
@@ -128,7 +130,7 @@ SYSTEMS = {
         system="VictoriaMetrics (single node)", image_env="VM_IMG",
         settings=["-retentionPeriod=100y", "-search.disableCache", "-search.maxQueryDuration=3600s "
                   "-search.maxQueueDuration=3600s", "-precisionBits 64 (default; ~12 significant digits)",
-                  "port 8428 on 127.0.0.1"],
+                  "--network host, -httpListenAddr=127.0.0.1:8428"],
         durability="acknowledged from memory (flushed within 5 s); force_flush and sync after the load, timed",
         loader="loadprw: Prometheus remote write, 10000 samples per request, 8 shards",
         query_client=QDRIVE + "; Prometheus HTTP API (MetricsQL)",

@@ -17,6 +17,8 @@
 # write); the release data has no duplicate timestamps.
 # Load: Prometheus remote write (loadprw, as phase 4; each value is the float32's exact double) to /api/v1/write.
 # InfluxDB line protocol would turn decimal text into the nearest double, not the float32's.
+# Network: --network host, -httpListenAddr=127.0.0.1:8428; once more through pasta (vm.pasta.point.*: what IoTDB's
+# and TDengine's -p forwarding costs per request).
 # Queries: the Prometheus HTTP API on 127.0.0.1:8428 with mkq.py's PromQL (dialect vm = prom). No LTTB and no
 # time-weighted average in MetricsQL (integrate() is a STEP integral without the covered time): '-'.
 # Settle: force_flush, force_merge of every month partition, then until no merge runs and the files are unchanged
@@ -35,8 +37,12 @@ vm_start() { # DATADIR [PODMAN ARGS...] [-- VM ARGS...]: rb-vm on 127.0.0.1:8428
     [ "${1:-}" = -- ] && { shift; va=("$@"); }
     mkdir -p "$W"
     # shellcheck disable=SC2086
-    podman run -d --name rb-vm --memory "$VM_MEM" --memory-swap "$VM_MEM" -p 127.0.0.1:8428:8428 "${pa[@]}" \
-        -v "$W:/storage" "$VM_IMG" -storageDataPath=/storage $VM_ARGS "${va[@]}" > /dev/null 9>&- || { fail "victoriametrics start"; return 1; }
+    # host network, listening on loopback only, as every other server; VM_PASTA=1: rootless Podman's port forwarding
+    # (pasta), the path IoTDB and TDengine take (their servers bind every address), to measure what it costs
+    local net=(--network host) la=(-httpListenAddr=127.0.0.1:8428)
+    [ "${VM_PASTA:-0}" = 1 ] && { net=(-p 127.0.0.1:8428:8428); la=(); }
+    podman run -d --name rb-vm --memory "$VM_MEM" --memory-swap "$VM_MEM" "${net[@]}" "${pa[@]}" \
+        -v "$W:/storage" "$VM_IMG" -storageDataPath=/storage "${la[@]}" $VM_ARGS "${va[@]}" > /dev/null 9>&- || { fail "victoriametrics start"; return 1; }
     for i in $(seq 600); do
         curl -sf -m 10 127.0.0.1:8428/health 2> /dev/null | grep -q OK && return 0
         sleep 0.5
@@ -132,6 +138,17 @@ p2_vm() {
         bsuite vm vm "$D" $Q ""
     }
     ctr_alive rb-vm "p2 vm after the query suites" && ctr_mem rb-vm "$D/mem.txt"
+    # the cost of pasta's forwarding, which IoTDB's and TDengine's numbers include: the same server, data and point
+    # queries (the class where a per-request cost shows most) through -p 127.0.0.1:8428:8428 instead of host network
+    if [ -s "$D/check.txt" ] && ! grep -qE 'mismatches [1-9]' "$D/check.txt"; then
+        crm rb-vm
+        if VM_PASTA=1 vm_start "$W"; then
+            local t; for t in 1 32; do reps "vm.pasta.point.c$t" "$D" -- "$B/qdrive" $Q "" "$WORK/q/vm.point.txt" "$t" "$SECS"; done
+            ctr_alive rb-vm "p2 vm through pasta" && ctr_mem rb-vm "$D/mem.txt"
+        fi
+        crm rb-vm
+        vm_start "$W" || return 1
+    fi
     # per core: a fresh start with one Go P (GOMAXPROCS=1, which VictoriaMetrics' cgroup code keeps) and one worker per
     # query, every thread pinned to PERCORE_CPU by taskset as the other containers
     if [ -s "$D/check-batch-vm.txt" ] && ! grep -qE 'mismatches [1-9]' "$D/check-batch-vm.txt"; then

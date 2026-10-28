@@ -10,7 +10,10 @@ For compression on real measurements rather than generated data, see [`../hydrau
 a public data set from a hydraulic test rig, with the steps to reproduce its table.
 
 Every server runs in **Podman** (never Docker), with `--network host` and its own listen setting
-bound to 127.0.0.1. Run one system at a time: stop each container before starting the next, and
+bound to 127.0.0.1, except IoTDB and TDengine: they bind every address, so they run in their own network
+namespace with their ports published on 127.0.0.1 (`-p 127.0.0.1:PORT:PORT`, rootless Podman's pasta
+forwarder). The release run measures what that forwarder costs per request on VictoriaMetrics (the same
+server and point queries both ways, `p2/vm/vm.pasta.point.*`). Run one system at a time: stop each container before starting the next, and
 run nothing else heavy meanwhile.
 
 ## What is here
