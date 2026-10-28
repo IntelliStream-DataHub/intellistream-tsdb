@@ -227,6 +227,35 @@ static int raw_connect(void)
     return fd;
 }
 
+/* tsdb_request_errors_total{code="invalid"} from the metrics port, -1 if the scrape fails */
+static long invalid_errors(void)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)th_mport)};
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (fd < 0 || th_mport <= 0 || connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    struct timeval tv = {5, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static const char req[] = "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
+    if (send(fd, req, sizeof req - 1, MSG_NOSIGNAL) != (ssize_t)(sizeof req - 1)) {
+        close(fd);
+        return -1;
+    }
+    static char buf[1 << 20];
+    size_t got = 0;
+    ssize_t r;
+    while (got < sizeof buf - 1 && (r = recv(fd, buf + got, sizeof buf - 1 - got, 0)) > 0)
+        got += (size_t)r;
+    buf[got] = '\0';
+    close(fd);
+    const char *key = "tsdb_request_errors_total{code=\"invalid\"} ", *at = strstr(buf, key);
+    return at ? atol(at + strlen(key)) : -1;
+}
+
 static void raw_send(int fd, uint32_t id, uint8_t op, const void *p, size_t len)
 {
     uint8_t h[9];
@@ -379,10 +408,28 @@ static void test_malformed(uint32_t a)
             frames++;
         CHECK(ix == TSDB_MULTI_END && st == 0 && frames == 2);
     }
+    /* one series: 4 bytes of padding after its id, which must be zero */
+    {
+        uint8_t r1[128];
+        size_t l1 = multi_frame(r1, TSDB_OP_QUERY_VALUES, 0, 1, ids, t, 29);
+        CHECK(l1 == 32 + 29);
+        r1[29] = 1;
+        expect_end_invalid(fd, r1, l1, "nonzero padding");
+    }
     /* CANCEL of an unknown id: no reply, and the connection goes on */
     uint32_t nobody = 12345;
     raw_send(fd, nobody, TSDB_OP_CANCEL, &nobody, 4);
     expect_end_invalid(fd, req, 10, "after CANCEL of an unknown id");
+    /* a CANCEL of the wrong length has no reply either, but counts as an INVALID request */
+    long e0 = invalid_errors();
+    uint8_t five[5] = {0};
+    raw_send(fd, nobody, TSDB_OP_CANCEL, five, 5);
+    expect_end_invalid(fd, req, 10, "after a CANCEL of 5 bytes");
+    long e1 = invalid_errors();
+    if (!(e0 >= 0 && e1 == e0 + 2)) {
+        fprintf(stderr, "a malformed CANCEL is not counted: invalid errors %ld, then %ld\n", e0, e1);
+        failures++;
+    }
     close(fd);
 }
 
@@ -870,7 +917,8 @@ int main(int argc, char **argv)
     if (system(cmd) != 0)
         return 1;
     mkdir(dir, 0755);
-    static const char *const first[] = {"--send-timeout", "3", NULL};
+    static const char *const first[] = {"--send-timeout", "3", "--metrics-port", "auto", "--metrics-bind", "127.0.0.1",
+                                        NULL};
     pid_t pid = start_server(dir, first);
     tsdbc *c;
     OK(tsdbc_connect("127.0.0.1", port, &c));
@@ -910,6 +958,26 @@ int main(int argc, char **argv)
     OK(tsdbc_connect("127.0.0.1", port, &c));
     run_cases(c);
     test_full_frame(c);
+    tsdbc_close(c);
+    stop_server(pid);
+
+    /* --multi-max-rows caps what a request may ask for: max_rows above it, or none, ends at the server's cap */
+    static const char *const capped[] = {"--multi-max-rows", "10", NULL};
+    pid = start_server(dir, capped);
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    tsdb_multi_query vq = {.kind = TSDB_MULTI_VALUES, .start = lo, .end = hi, .opts = asc};
+    for (int k = 0; k < 2; k++) {
+        tsdb_multi_opts mo = {.max_rows = k ? 1000000 : 0};
+        r = NULL;
+        int rc = tsdbc_query_multi_collect(c, &vq, ids, 6, &mo, &r);
+        if (rc != TSDB_ERR_TOO_MANY_BUCKETS) {
+            fprintf(stderr, "--multi-max-rows 10, max_rows %llu: %d, not TOO_MANY_BUCKETS\n",
+                    (unsigned long long)mo.max_rows, rc);
+            failures++;
+        }
+        if (r)
+            tsdbc_series_results_free(r, 6);
+    }
     tsdbc_close(c);
     stop_server(pid);
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
