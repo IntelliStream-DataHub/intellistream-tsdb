@@ -923,7 +923,9 @@ codec_ctx *codec_new(void)
         return NULL;
     c->cctx = ZSTD_createCCtx();
     c->dctx = ZSTD_createDCtx();
-    if (!c->cctx || !c->dctx) {
+    if (!c->cctx || !c->dctx || ZSTD_isError(ZSTD_CCtx_setParameter(c->cctx, ZSTD_c_format, ZSTD_f_zstd1_magicless)) ||
+        ZSTD_isError(ZSTD_CCtx_setParameter(c->cctx, ZSTD_c_contentSizeFlag, 0)) ||
+        ZSTD_isError(ZSTD_DCtx_setParameter(c->dctx, ZSTD_d_format, ZSTD_f_zstd1_magicless))) {
         codec_free(c);
         return NULL;
     }
@@ -1023,7 +1025,7 @@ size_t block_wrap(codec_ctx *c, int level, int kind, size_t inner, uint8_t *out)
 size_t block_wrap_src(codec_ctx *c, int level, int kind, const uint8_t *src, size_t inner, uint8_t *out)
 {
     if (level > 0 && inner >= 64) {
-        size_t z = ZSTD_compressCCtx(c->cctx, out + 5, ZSTD_compressBound(inner), src, inner, level);
+        size_t z = zstd_pack(c->cctx, out + 5, ZSTD_compressBound(inner), src, inner, level);
         /* keep zstd only when it saves a few percent: decoding costs too */
         if (!ZSTD_isError(z) && z + 4 < inner - inner / 32) {
             out[0] = (uint8_t)(kind | BLK_ZSTD);

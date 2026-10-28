@@ -867,7 +867,7 @@ enum { AUTO_RUN = 128, AUTO_SAMPLE_BYTES = 8192, AUTO_SAMPLE_MAX = AUTO_SAMPLE_B
 #define AUTO_PROBE_GAIN 128
 static bool zstd_may_gain(codec_ctx *c, const uint8_t *src, size_t len, uint8_t *tmp)
 {
-    size_t z = ZSTD_compressCCtx(c->cctx, tmp, ZSTD_compressBound(len), src, len, AUTO_PROBE_LEVEL);
+    size_t z = zstd_pack(c->cctx, tmp, ZSTD_compressBound(len), src, len, AUTO_PROBE_LEVEL);
     return !ZSTD_isError(z) && z + 4 < len - len / AUTO_PROBE_GAIN;
 }
 
@@ -876,7 +876,7 @@ static size_t sample_block_size(codec_ctx *c, int level, size_t len, uint8_t *tm
 {
     if (level <= 0 || len < 64 || !zstd_may_gain(c, c->alt, len, tmp))
         return 1 + len;
-    size_t z = ZSTD_compressCCtx(c->cctx, tmp, ZSTD_compressBound(len), c->alt, len, level);
+    size_t z = zstd_pack(c->cctx, tmp, ZSTD_compressBound(len), c->alt, len, level);
     if (ZSTD_isError(z))
         return 1 + len;
     return z + 4 < len - len / 32 ? 5 + z : 1 + len;

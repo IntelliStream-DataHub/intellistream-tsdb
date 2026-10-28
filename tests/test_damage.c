@@ -525,11 +525,12 @@ static void test_parts(const char *scratch)
     query_part(dir, 0, &rc, &checks);
     CHECK(rc == 0 && checks == 0);
 
-    /* a flipped byte in a granule's values: caught by verify_checksums, and
-     * not paid for without it (whatever the decoder then makes of it) */
+    /* a flipped byte in a granule: caught by verify_checksums, and not paid for without it (whatever the
+     * decoder then makes of it). In the middle of the data: the last bytes before the index may be the padding
+     * to 8 (format 7's smaller zstd frames left 3 of them here) */
     make_part(dir, part, sizeof part);
     part_footer ft = read_footer(dir, part);
-    flip(dir, part, (off_t)ft.index_off - 3);
+    flip(dir, part, (off_t)(sizeof(part_header) + ft.index_off) / 2);
     query_part(dir, 1, &rc, &checks);
     RC(rc, TSDB_ERR_CORRUPT);
     CHECK(checks > 0);

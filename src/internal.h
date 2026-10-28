@@ -17,6 +17,7 @@ typedef struct eng eng;
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#define ZSTD_STATIC_LINKING_ONLY /* ZSTD_f_zstd1_magicless: stable since zstd 1.3, still in the experimental API */
 #include <zstd.h>
 
 #include "levels.h" /* before the declarations: renames them in a per-CPU-level compile */
@@ -29,13 +30,21 @@ typedef struct eng eng;
 /* 3: checksummed part header and footer, WAL records and dictionary records;
  * 4: time-weighted statistics in granule entries (136 bytes), range tombstones
  * between the index and the footer; 5: the spread (m2 or the sum of squares) in
- * granule entries (160 bytes), tombstones as in 4. Databases of older versions
+ * granule entries (160 bytes), tombstones as in 4; 6: a 7-bit codec kind in block headers; 7: zstd frames
+ * without magic number or content size. Databases of older versions
  * are refused (no release had them). */
-#define FORMAT_VERSION 6
+#define FORMAT_VERSION 7
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
 
+/* A block's zstd frame has neither the magic number nor the content size (format 7): the block header holds the
+ * inner length already. -7 bytes per block. Inline, so each CPU level of the codecs has its own copy. */
+static inline size_t zstd_pack(ZSTD_CCtx *z, void *dst, size_t cap, const void *src, size_t len, int level)
+{
+    ZSTD_CCtx_setParameter(z, ZSTD_c_compressionLevel, level);
+    return ZSTD_compress2(z, dst, cap, src, len);
+}
 static inline uint32_t load32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline void store32(void *p, uint32_t v) { memcpy(p, &v, 4); }
 

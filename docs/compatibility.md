@@ -7,7 +7,7 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 | | where | now |
 |---|---|---|
 | release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.9.0 |
-| disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 6 |
+| disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 7 |
 | wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 10 |
 
 ## What 0.9.x promises
@@ -26,7 +26,7 @@ volume path, for example, changes both). So:
   `tsdb_open` returns `TSDB_ERR_CORRUPT` and writes one line to stderr:
 
   ```
-  tsdb: the database has disk format version 5; tsdb 0.9.0 reads version 6 only. Export the data with the
+  tsdb: the database has disk format version 6; tsdb 0.9.0 reads version 7 only. Export the data with the
   release that wrote it and import it here (docs/compatibility.md)
   ```
 
