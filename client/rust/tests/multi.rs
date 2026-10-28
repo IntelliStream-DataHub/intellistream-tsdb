@@ -259,6 +259,9 @@ fn tsdbd_multi_answers_what_the_engine_answered() {
     // local periods) with no buckets; each side's multi call matches its single call (multi_equals_single)
     let ids = setup(&mut db);
     db.flush().unwrap(); // tsdbd finds the memtable rows in a part, so the engine reads them from one too
+    // and the same parts: a float spread over two overlapping parts differs in the last bit from one over their
+    // merge (docs/design.md), and a background merge may finish before the engine's queries or only after them
+    db.optimize().unwrap();
     let embedded = answers(&mut db, &ids);
     db.close().unwrap();
     let srv = Server::start_in(dir);
