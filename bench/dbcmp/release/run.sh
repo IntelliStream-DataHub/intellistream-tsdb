@@ -825,6 +825,7 @@ phase1() {
     for s in $P1_SYSTEMS; do
         done_mark "$OUT/p1/$s.done" && { log "p1 $s already done"; continue; }
         log "p1 $s start"
+        aside 1 "$s"
         local nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
         "p1_$s" || fail "p1 $s returned an error"
         cleanup_all
@@ -1129,6 +1130,7 @@ phase2() {
         reset_quiet
         done_mark "$OUT/p2/$s.done" && { log "p2 $s already done"; continue; }
         log "p2 $s start"
+        aside 2 "$s"
         LOAD_FAILED=0
         local nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
         case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; qdb2) p2_qdb 2 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
@@ -1443,6 +1445,16 @@ A phase or system with a done marker ($OUT/p<n>/<system>.done, $OUT/p<n>.done) i
 U
 }
 done_mark() { [ "${FORCE:-0}" != 1 ] && [ -e "$1" ]; }
+res_dir() { # PHASE SYS: the result directory of a system in phase 1 or 2
+    case $1.$2 in 1.duck) echo "$OUT/p1/duckdb" ;; 2.qdb0) echo "$OUT/p2/qdb" ;; 2.qdb1) echo "$OUT/p2/qdb-parquet" ;;
+        2.qdb2) echo "$OUT/p2/qdb-parquet-zstd" ;; *) echo "$OUT/p$1/$2" ;; esac
+}
+aside() { # PHASE SYS: a rerun starts empty: the last attempt's runs, REFUSED.txt, dash.txt and loose.txt go to
+          # $OUT/old/ (outside what tables.py and runstats read), so they are neither averaged nor reported again
+    local d; d=$(res_dir "$1" "$2")
+    [ -d "$d" ] || return 0
+    mkdir -p "$OUT/old" && mv "$d" "$OUT/old/p$1-$2.$(date +%m%d-%H%M%S)" && log "p$1 $2: earlier results moved to $OUT/old/"
+}
 runphase() { # N: one phase in a subshell, FAILS per phase, done marker when it had no failures
     local n=$1 rc
     PH_DIR=$OUT/p$n
