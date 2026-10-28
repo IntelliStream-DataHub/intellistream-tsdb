@@ -19,6 +19,8 @@ I3_P2_STABLE=${I3_P2_STABLE:-300} I3_P2_MAX=${I3_P2_MAX:-9000}     # Parquet unc
 I3_P1_STABLE=${I3_P1_STABLE:-180} I3_P1_MAX=${I3_P1_MAX:-5400}
 I3_P1_AGE=${I3_P1_AGE:-5m} I3_P1_MIN=${I3_P1_MIN:-420}
 I2_EXTRA=${I2_EXTRA:-}                  # smoke runs only: e.g. -e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s
+I2_STABLE=${I2_STABLE:-300}                # i2_settle.sh: nothing changed this long (s) before the load counts as settled
+WARM_SECS=${WARM_SECS:-3}                  # every window class is warmed up this long (s) on one client before it is timed
 PROM_SETTLE_TIMEOUT=${PROM_SETTLE_TIMEOUT:-36000}
 P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320} P5_DIR=${P5_DIR:-/var/tmp}
 # the many-client counts: 32 clients (window classes, TWA windows) and 16 connections (per-series whole range); the
@@ -393,7 +395,7 @@ qsuite() { # SYS PREFIX DIR DRIVER-ARGS...: whole range (warm-up, REPS runs of o
         reps "$P.full$n" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.full$n.txt" 1 100000 1
     done
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
-        "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" 1 3 > "$D/warm.$P.$c" 2>&1 9>&- || { fail "$P $c warm-up failed (see $D/warm.$P.$c)"; continue; }
+        "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" 1 "$WARM_SECS" > "$D/warm.$P.$c" 2>&1 9>&- || { fail "$P $c warm-up failed (see $D/warm.$P.$c)"; continue; }
         for t in 1 $NHI; do reps "$P.$c.c$t" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" "$t" "$SECS"; done
     done
 }
@@ -490,7 +492,7 @@ chsuite() { # PREFIX DIR TABLE-SYS(ch): chbench1 (qdrive over HTTP) with REPS ru
         done
     done
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
-        chbench1 1 0 3 "$WORK/q/$S.$c.txt" > /dev/null 2> "$D/warm.$P.$c" 9>&-
+        chbench1 1 0 "$WARM_SECS" "$WORK/q/$S.$c.txt" > /dev/null 2> "$D/warm.$P.$c" 9>&-
         for t in 1 $NHI; do for r in $(seq "$REPS"); do
             tstep "$P.$c.c$t r$r" "$D/$P.$c.c$t.$r" -- chbench_tag "$P.$c.c$t.$r.$$" "$t" 0 "$SECS" "$WORK/q/$S.$c.txt"
         done; done
@@ -499,7 +501,7 @@ chsuite() { # PREFIX DIR TABLE-SYS(ch): chbench1 (qdrive over HTTP) with REPS ru
 tsdbsuite() { # PREFIX DIR CLASS-THREADS("1 32"): tsdbq qps classes against $TSDB_PORT
     local P=$1 D=$2 ths=$3 c t
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
-        "$TB/tsdbq" qps "$WORK/spec.tsv" "$c" 1 2 > "$D/warm.$P.$c" 2>&1 9>&-
+        "$TB/tsdbq" qps "$WORK/spec.tsv" "$c" 1 "$WARM_SECS" > "$D/warm.$P.$c" 2>&1 9>&-
         for t in $ths; do reps "$P.$c.c$t" "$D" -- "$TB/tsdbq" qps "$WORK/spec.tsv" "$c" "$t" "$SECS"; done
     done
 }
@@ -512,6 +514,7 @@ REL() { python3 -I "$TOOLS/rel.py" "$@"; }
 # PERCORE_CPU (containers by ctr_taskset, tsdbd by taskset plus --query-threads 1), the engine's
 # own thread knob where it has one, one client pinned to PERCORE_CLIENT_CPU; names get ".pc".
 KS=${KS:-"1 10 100"}
+PC_KS=${PC_KS:-$KS}                        # the batch sizes of the per-core passes (smoke: 1 only)
 BCLASSES=${BCLASSES-$CLASSES_DEFAULT}
 PERCORE_CPU=${PERCORE_CPU:-2} PERCORE_CLIENT_CPU=${PERCORE_CLIENT_CPU:-3}
 pc_client() { # CMD...: on PERCORE_CLIENT_CPU in a per-core run (shell functions too: those used are exported)
@@ -586,7 +589,7 @@ pc_pin() { # CONTAINER...: to PERCORE_CPU
 how_write() { # PHASE SYS: how.json of the system's results (how.py: settings, durability, clients, per core, '-')
     env CH_IMG="$CH_IMG" TS_IMG="$TS_IMG" QDB_IMG="$QDB_IMG" I2_IMG="$I2_IMG" I3_IMG="$I3_IMG" IOT_IMG="$IOT_IMG" \
         TD_IMG="$TD_IMG" VM_IMG="$VM_IMG" PROM_IMG="$PROM_IMG" T="$T" TSDB_TREE="$TSDB_TREE" DUCKDB_DIR="$DUCKDB_DIR" \
-        DUCKDB_SHA="$DUCKDB_SHA" CHDB_DIR="$CHDB_DIR" CHDB_SHA="$CHDB_SHA" REPS="$REPS" SECS="$SECS" KS="$KS" \
+        DUCKDB_SHA="$DUCKDB_SHA" CHDB_DIR="$CHDB_DIR" CHDB_SHA="$CHDB_SHA" REPS="$REPS" SECS="$SECS" KS="$KS" PC_KS="$PC_KS" WARM_SECS="$WARM_SECS" \
         SMOKE="${SMOKE:-0}" PERCORE_CPU="$PERCORE_CPU" PERCORE_CLIENT_CPU="$PERCORE_CLIENT_CPU" \
         python3 -I "$RDIR/how.py" write "$1" "$2" "$OUT" >> "$OUT/driver.log" 2>&1 || fail "how.json of $2 (phase $1)"
 }
@@ -606,7 +609,7 @@ bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
     local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI}
     shift 3
     [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
-    for k in $KS; do
+    for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
         for n in ${FULLS-$FULLS_DEFAULT}; do
             f=$WORK/q/$S.full$n.b$k.txt; nl=$(wc -l < "$f")
             pc_client "$B/qdrive" "$@" "$f" 1 100000 "$nl" > "$D/warm.$P.full$n.b$k$sfx" 2>&1 9>&- || { fail "$P full$n.b$k warm-up failed (see $D/warm.$P.full$n.b$k$sfx)"; continue; }
@@ -614,7 +617,7 @@ bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
         done
         for c in $BCLASSES; do
             f=$WORK/q/$S.$c.b$k.txt
-            pc_client "$B/qdrive" "$@" "$f" 1 3 > "$D/warm.$P.$c.b$k$sfx" 2>&1 9>&- || { fail "$P $c.b$k warm-up failed (see $D/warm.$P.$c.b$k$sfx)"; continue; }
+            pc_client "$B/qdrive" "$@" "$f" 1 "$WARM_SECS" > "$D/warm.$P.$c.b$k$sfx" 2>&1 9>&- || { fail "$P $c.b$k warm-up failed (see $D/warm.$P.$c.b$k$sfx)"; continue; }
             for t in $ths; do reps "$P.$c.b$k.c$t$sfx" "$D" -- pc_client "$B/qdrive" "$@" "$f" "$t" "$SECS"; done
         done
     done
@@ -657,7 +660,7 @@ tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI
     # a release run must time tsdb's batches: without protocol 10's --batch the phase fails (smoke only logs it)
     tsdb_has_batch || { [ "${SMOKE:-0}" = 1 ] && log "  $P: tsdbq in $TB has no --batch: K > 1 not timed" \
         || fail "$P: tsdbq in $TB has no --batch (TSDB_TREE must be the multi-series build): K > 1 not timed"; }
-    for k in $KS; do
+    for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
         if [ "$k" = 1 ]; then
             reps "$P.full.b1$sfx" "$D" -- pc_client env NSERIES="$(python3 -I "$H/batches.py" --count-full1)" "$TB/tsdbq" full 1 1
         elif tsdb_has_batch; then
@@ -665,7 +668,7 @@ tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI
         else continue; fi
         for c in $BCLASSES; do
             n=$c; [ "$k" = 1 ] || n=$c.b$k
-            pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" 1 2 > "$D/warm.$P.$n$sfx" 2>&1 9>&-
+            pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" 1 "$WARM_SECS" > "$D/warm.$P.$n$sfx" 2>&1 9>&-
             for t in $ths; do reps "$P.$n.c$t$sfx" "$D" -- pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" "$t" "$SECS"; done
         done
     done
@@ -709,7 +712,7 @@ tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (whe
 chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through chbench1 (PC=1: max_threads=1, pinned)
     local P=$1 D=$2 S=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} set=() r
     [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; set=(--max_threads=1); }
-    for k in $KS; do
+    for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
         for n in ${FULLS-$FULLS_DEFAULT}; do
             f=$WORK/q/$S.full$n.b$k.txt; nl=$(wc -l < "$f")
             pc_client chbench1 1 "$nl" 0 "$f" > /dev/null 2> "$D/warm.$P.full$n.b$k$sfx" 9>&-
@@ -719,7 +722,7 @@ chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through chbench1 (PC=1: max
         done
         for c in $BCLASSES; do
             f=$WORK/q/$S.$c.b$k.txt
-            pc_client chbench1 1 0 3 "$f" > /dev/null 2> "$D/warm.$P.$c.b$k$sfx" 9>&-
+            pc_client chbench1 1 0 "$WARM_SECS" "$f" > /dev/null 2> "$D/warm.$P.$c.b$k$sfx" 9>&-
             for t in $ths; do for r in $(seq "$REPS"); do
                 tstep "$P.$c.b$k.c$t$sfx r$r" "$D/$P.$c.b$k.c$t$sfx.$r" -- pc_client chbench_tag "$P.$c.b$k.c$t$sfx.$r.$$" "$t" 0 "$SECS" "$f" "${set[@]}"
             done; done
@@ -887,7 +890,7 @@ p1_i2() {
         I2 bucket create --name "$ds" --hide-headers >> "$D/buckets.txt" 2>&1 9>&-
         "$B/loadlp" "$IN/$ds.lp" 127.0.0.1 8086 "/api/v2/write?org=bench&bucket=$ds&precision=ms" $'Authorization: Token benchtoken\r\n' 5000 8 >> "$D/load.txt" 2>&1 9>&- || fail "p1 i2 load $ds"
     done
-    I2_PORT=8086 "$H/i2_settle.sh" "$(date +%s)" > "$D/settle.txt" 2>&1 9>&- || fail "p1 i2 compaction did not settle (see $D/settle.txt); sizes taken anyway"
+    I2_PORT=8086 STABLE="$I2_STABLE" "$H/i2_settle.sh" "$(date +%s)" > "$D/settle.txt" 2>&1 9>&- || fail "p1 i2 compaction did not settle (see $D/settle.txt); sizes taken anyway"
     I2 bucket list --hide-headers > "$D/bucket-list.txt" 2>&1 9>&-
     podman unshare sh -c "cd $W/data/engine && du -sb data/* wal/* 2>/dev/null" > "$D/du.txt"
     podman unshare sh -c "cd $W/data/engine && du -sB1 data/* 2>/dev/null" > "$D/du-allocated.txt"
@@ -1179,7 +1182,7 @@ p2_ts() {
 i2_timed() {
     local s=$(date +%s)
     "$B/loadlp" "$DBCMP/input/mixed.lp" 127.0.0.1 8086 "/api/v2/write?org=bench&bucket=cmp&precision=ms" $'Authorization: Token benchtoken\r\n' 5000 8 || return 1
-    I2_PORT=8086 "$H/i2_settle.sh" "$(date +%s)" || return 1
+    I2_PORT=8086 STABLE="$I2_STABLE" "$H/i2_settle.sh" "$(date +%s)" || return 1
     echo "size: $(podman unshare du -sb "$1/data" | cut -f1) bytes (du -sb of the data directory)"
 }
 p2_i2() {
@@ -1339,12 +1342,12 @@ sys.stdout.writelines(l for l in open(sys.argv[2]) if json.loads(l)["i"] in ids)
     # random windows and points
     local c t
     for c in raw agg1d agg7d point; do
-        "$TB/embq" tsdb qps "$E/tsdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
+        "$TB/embq" tsdb qps "$E/tsdb" spec.tsv "$c" 1 "$WARM_SECS" > /dev/null 2>&1 9>&-
         for t in 1 $NHI; do reps "tsdb.$c.t$t" "$D" -- "$TB/embq" tsdb qps "$E/tsdb" spec.tsv "$c" "$t" "$SECS"; done
-        "$TB/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
+        "$TB/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" 1 "$WARM_SECS" > /dev/null 2>&1 9>&-
         for t in 1 $NHI; do reps "duckdb.$c.t$t" "$D" -- "$TB/embq" duckdb qps "$E/t.duckdb" spec.tsv "$c" "$t" "$SECS"; done
         for e in chdb chdb-lz4; do
-            "$B/chq" qps "$E/$e" spec.tsv "$c" 1 3 > /dev/null 2>&1 9>&-
+            "$B/chq" qps "$E/$e" spec.tsv "$c" 1 "$WARM_SECS" > /dev/null 2>&1 9>&-
             for t in 1 $NHI; do reps "$e.$c.t$t" "$D" -- "$B/chq" qps "$E/$e" spec.tsv "$c" "$t" "$SECS"; done
         done
     done
@@ -1541,7 +1544,7 @@ phase_smoke() {
         SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10 100" NHI=2 NPER=2 \
         PREP_SERIES=10 PREP_POINTS=20000 POINTS=20000 SPEC_DIV=60 PREP_SIZE_POINTS=50000 PREP_SPEC=200 \
         DSLIST="${SMOKE_DS:-hdd_temp hyd_PS1}" \
-        IOT_STABLE=15 TD_STABLE=10 VM_STABLE=10 QDB_WAIT_MAX=300 CH_SETTLE_MAX=300 \
+        IOT_STABLE=15 TD_STABLE=10 VM_STABLE=10 I2_STABLE=15 QDB_WAIT_MAX=300 CH_SETTLE_MAX=300 WARM_SECS=1 PC_KS=1 \
         I3_P2_FLAGS="--force-snapshot-max-age 30s" I3_P2_MIN=45 I3_P1_AGE=30s I3_P1_MIN=45 \
         I3_P2_STABLE=20 I3_P2_MAX=300 I3_P1_STABLE=20 I3_P1_MAX=300 \
         I2_EXTRA="-e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s" PROM_SETTLE_TIMEOUT=900 \

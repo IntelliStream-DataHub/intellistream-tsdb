@@ -21,7 +21,7 @@ BATCH_SQL = ("a batch of K series is one SQL statement: K UNION ALL branches tag
              "(mkbatch.py), sent as one request")
 PIN = ("the server's process tree pinned to CPU {cpu} by taskset (rootless Podman has no cpuset controller), "
        "the client on CPU {ccpu}")
-WARM_SRV = ("whole range: one warm-up run, then REPS runs of the one query; random-window classes: 3 s warm-up "
+WARM_SRV = ("whole range: one warm-up run, then REPS runs of the one query; random-window classes: " + os.environ.get("WARM_SECS", "3") + " s warm-up "
             "on 1 connection, then REPS runs of SECS s per connection count; LTTB/TWA: one warm-up, then REPS runs")
 
 PASTA = (" (pasta, rootless Podman's port forwarding: the server binds every address; its per-request cost is "
@@ -295,6 +295,8 @@ def write(phase, sysname, out):
     s["runs"] = "REPS=%s runs per measurement (mean, sd, min-max in *.mean.txt); SECS=%s s per random-window run; " \
                 "batches of %s series" % (os.environ.get("REPS", "?"), os.environ.get("SECS", "?"),
                                           os.environ.get("KS", "1 10 100"))
+    if os.environ.get("PC_KS", os.environ.get("KS", "1 10 100")) != os.environ.get("KS", "1 10 100"):
+        s["runs"] += "; per core only batches of %s series" % os.environ.get("PC_KS")
     s["smoke"] = os.environ.get("SMOKE", "0") == "1"
     dash = {}
     for l in lines(os.path.join(d, "dash.txt")) if phase == "2" else []:
