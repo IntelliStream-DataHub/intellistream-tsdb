@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -60,8 +61,13 @@ static pid_t start_server(const char *dir, const char *const *extra)
     char pf[PATH_MAX + 64];
     th_portfile(pf, sizeof pf, dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+    pid_t parent = getpid();
     pid_t pid = fork();
     if (pid == 0) {
+        /* A test that stops early (OK() exits) must not leave its server behind: an orphan keeps the descriptors
+         * it inherited, a caller's `flock -s` lock among them, and held one shared for hours. */
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent)
+            _exit(127);
         const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-fsync"};
         int n = 10;
         if (getenv("TSDBD_IO")) {
