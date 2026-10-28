@@ -859,6 +859,20 @@ static void bounds(const char *base)
     }
     multi_max_bounds = sm;
     OK(tsdb_close(db));
+
+    /* threads past request_threads are clamped to it: with 2, at most W = 4 results (384 KiB each) wait ahead */
+    o.request_threads = 2;
+    OK(tsdb_open(r, &o, &db));
+    for (int i = 0; i < 16; i++)
+        list[i] = good[i % 8];
+    memset(&b, 0, sizeof b);
+    memset(&sc, 0, sizeof sc);
+    mo.threads = 32;
+    OK(tsdb_query_multi(db, &qv, list, 16, &mo, slow_head, &sc));
+    CHECK(sc.rows == 16 * (uint64_t)ROWS);
+    fprintf(stderr, "  threads 32 of 2: peak %ld KiB ahead\n", atomic_load(&b.peak) >> 10);
+    CHECK(atomic_load(&b.peak) > 0 && atomic_load(&b.peak) <= 4 * (400 << 10));
+    OK(tsdb_close(db));
     free(ts);
     free(v);
     if (system(cmd)) {
