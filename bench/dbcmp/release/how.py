@@ -50,7 +50,8 @@ SYSTEMS = {
     ),
     "qdb": dict(
         system="QuestDB (native partitions)", image_env="QDB_IMG",
-        settings=["every port bound to 127.0.0.1", "PARTITION BY DAY WAL, series SYMBOL", "telemetry off"],
+        settings=["every port bound to 127.0.0.1", "PARTITION BY DAY WAL, series SYMBOL", "telemetry off",
+                  "http.request.header.buffer.size 1 MB (64 KB refuses the answer check's batch-of-100 URLs)"],
         durability="not fsynced at acknowledgement (cairo.commit.mode nosync, the default); WAL applied and sync "
                    "after the load, timed",
         loader="loadlp: InfluxDB line protocol over HTTP /write, 100000 lines per request, 8 connections",

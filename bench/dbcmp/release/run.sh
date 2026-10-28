@@ -210,16 +210,21 @@ CHC() { "$CLICKHOUSE" client --host 127.0.0.1 "$@"; }
 # QuestDB converts partitions to Parquet with LZ4_RAW unless told otherwise; the ZSTD variant (qdbz in p1, qdb2 in p2)
 # sets the codec and level (QuestDB 10.1.0 PropServerConfiguration: codec default LZ4_RAW, ZSTD level default 9,
 # levels 1-22; a partition compressing by less than min.compression.ratio 1.2 stays native)
+# Level 22 converts about one partition per second whatever its size (smoke: 450 small partitions took > 300 s);
+# qdb_wait_table's QDB_WAIT_MAX covers that.
 QDB_ZSTD_LEVEL=${QDB_ZSTD_LEVEL:-22}
 qdb_zstd_env() { echo "-e QDB_CAIRO_PARTITION_ENCODER_PARQUET_COMPRESSION_CODEC=ZSTD -e QDB_CAIRO_PARTITION_ENCODER_PARQUET_COMPRESSION_LEVEL=$QDB_ZSTD_LEVEL"; }
 qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD
     local W=$1 i
     mkdir -p "$W"
     # shellcheck disable=SC2046
+    # the HTTP header buffer (default 64 KB) holds the URL: check.py sends a batch of 100 series as one GET /exec,
+    # which QuestDB otherwise drops ("URL query string is too long"); the timed queries go over PostgreSQL wire
     podman run -d --name rb-qdb --network host -v "$W:/var/lib/questdb" $([ "${QDB_ZSTD:-0}" = 1 ] && qdb_zstd_env) \
         -e QDB_HTTP_NET_BIND_TO=127.0.0.1:9100 -e QDB_HTTP_MIN_NET_BIND_TO=127.0.0.1:9103 \
         -e QDB_PG_NET_BIND_TO=127.0.0.1:8812 -e QDB_LINE_TCP_NET_BIND_TO=127.0.0.1:9109 \
-        -e QDB_LINE_UDP_ENABLED=false -e QDB_TELEMETRY_ENABLED=false "$QDB_IMG" > /dev/null 9>&- || { fail "questdb start"; return 1; }
+        -e QDB_LINE_UDP_ENABLED=false -e QDB_TELEMETRY_ENABLED=false -e QDB_HTTP_REQUEST_HEADER_BUFFER_SIZE=1048576 \
+        "$QDB_IMG" > /dev/null 9>&- || { fail "questdb start"; return 1; }
     for i in $(seq 120); do curl -sf 'http://127.0.0.1:9100/exec?query=select%201' > /dev/null && return 0; sleep 0.5; done
     fail "questdb not ready"; return 1
 }
@@ -1330,7 +1335,7 @@ phase_smoke() {
         SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10" \
         PREP_SERIES=10 PREP_POINTS=650000 PREP_SIZE_POINTS=200000 PREP_SPEC=400 \
         DSLIST="${SMOKE_DS:-hdd_temp vibration hyd_CE hyd_PS1}" \
-        IOT_STABLE=40 TD_STABLE=20 VM_STABLE=10 QDB_WAIT_MAX=300 CH_SETTLE_MAX=600 \
+        IOT_STABLE=40 TD_STABLE=20 VM_STABLE=10 QDB_WAIT_MAX=900 CH_SETTLE_MAX=600 \
         I3_P2_FLAGS="--force-snapshot-max-age 2m" I3_P2_MIN=150 I3_P1_AGE=2m I3_P1_MIN=150 \
         I3_P2_STABLE=60 I3_P2_MAX=600 I3_P1_STABLE=60 I3_P1_MAX=600 \
         I2_EXTRA="-e INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=10s" PROM_SETTLE_TIMEOUT=1800 \
