@@ -21,9 +21,13 @@ ticks=$(getconf CLK_TCK)
 grp_ticks() { local s=0 p; for p in $(ps -o pid= -g "$1" 2>/dev/null); do
     s=$((s + $(awk '{print $14+$15+$16+$17}' /proc/$p/stat 2>/dev/null || echo 0))); done; echo $s; }
 
-# which job (run dir) a pid belongs to: its process group is the job's pid file
-job_of() { local g; g=$(ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '); [ -n "$g" ] || return
-    grep -lx "$g" "$RUNS"/*/pid 2>/dev/null | head -1 | xargs -r dirname | xargs -r basename; }
+# which job (run dir) a pid belongs to: walk up its parents (timeout(1) and setsid give steps their own process
+# groups) until a process group or pid named in a job's pid file
+job_of() { local p=$1 g f i; for i in $(seq 1 30); do [ -n "$p" ] && [ "$p" -gt 1 ] || return
+        g=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$g" ] || return
+        f=$(grep -lx -e "$g" -e "$p" "$RUNS"/*/pid 2>/dev/null | head -1)
+        [ -n "$f" ] && { basename "$(dirname "$f")"; return; }
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); done; }
 
 ino=$(stat -c %i "$L" 2>/dev/null)
 holders=$(grep -E ":$ino " /proc/locks 2>/dev/null | grep -v -- '->' | awk '{print $(NF-3)}' | sort -u)
