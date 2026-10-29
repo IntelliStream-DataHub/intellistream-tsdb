@@ -65,7 +65,8 @@ cgroup, so `nice` does not keep your work out of its way.
 - `src/volumes.c`: the public `tsdb`, which routes each series to a volume.
   Everything else in `src/` is the engine for one directory (`eng`, declared
   in `src/internal.h`).
-- `src/part.c`: part files, the writer, atomic commits (intent files).
+- `src/part.c`: part files, the writer, atomic commits (intent files). `src/gindex.c`: the packed granule
+  index (`gix_encode`, `gix_parse`; the readers `gx_*` and `gx_load` are inline in `internal.h`).
 - `src/insert.c`: sorting and writing batches. `src/memtable.c`: WAL and memtable.
 - `src/merge.c`: merge selection and execution. `src/query.c`: snapshots, raw
   queries, aggregation, bucketing. `src/manifest.c`: MANIFEST, retired parts, followers.
@@ -177,6 +178,11 @@ cgroup, so `nice` does not keep your work out of its way.
   renamed. Replaced parts are renamed to `retired_*` and deleted after
   `obsolete_part_lifetime_s`, never unlinked at once: a follower on another
   host may still have them mapped.
+- **The granule index** is read in place from the part's mapping: readers use `gx_count`, `gx_ts`,
+  `gx_series`, `gx_load(p, i, GW_*, &g)` (only the groups they need) or `granule_read_at`, never a
+  `struct granule` array on disk (that 160-byte struct is the decoded form; there is no `p->g`). A new
+  statistic needs a `GF_` field, its `field_value` in gindex.c and a `GW_` group in `gx_load`, and cases in
+  `tests/test_gindex.c`. The encoding is integer and compiled once: every CPU decodes the same bits.
 - **Granules** never span series, and in class 1-3 partitions never a base partition (day) edge either
   (`GRANULE_CUT`, `pw_add`; a merge copies a granule verbatim only inside one day): day and coarser buckets then
   answer from statistics as in day partitions, bit for bit. Their count/nulls/sum/min/max, and m2 (floats) or the
@@ -221,8 +227,9 @@ cgroup, so `nice` does not keep your work out of its way.
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
 - The on-disk format is version 7 (`FORMAT_VERSION`; 6: a 7-bit codec kind in block headers; 7: partition keys with
-  a class, CLASSES, zstd frames without magic and content size): 160-byte granule entries
-  with typed, time-weighted and spread statistics, a checksum over each part's header, index and footer,
+  a class, CLASSES, zstd frames without magic and content size, the packed granule index and a 64-byte footer
+  with `index_len`): granule entries with typed, time-weighted and spread statistics, bit-packed per part
+  (about 32 bytes each), a checksum over each part's header, index and footer,
   checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Until
   1.0 (the format freezes there; the user decided this on 2026-10-25) older formats need not stay readable: a
   layout change bumps `FORMAT_VERSION` and goes in the changelog with a way to carry data over, and a database

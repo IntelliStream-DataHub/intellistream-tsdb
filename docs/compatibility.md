@@ -10,6 +10,16 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 | disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 7 |
 | wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 10 |
 
+## Disk format versions
+
+| version | what changed |
+|---|---|
+| 7 | part keys `4 x first base partition + class` and the `CLASSES` file (partition classes); zstd frames without magic number and content size; the granule index bit-packed per part (about 32 bytes an entry instead of 160) behind a 64-byte footer that gives the index's length (`index_len`) |
+| 6 | block headers name their codec in 7 bits; the dictionary codec |
+| 5 | the spread in every granule entry (160 bytes) |
+
+Each version is refused by every release that reads another one; carry data over with export and import.
+
 ## What 0.9.x promises
 
 0.9.x is the road to 1.0, and the format and the protocol are still being shaped (series addressed by
