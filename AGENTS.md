@@ -101,7 +101,7 @@ cgroup, so `nice` does not keep your work out of its way.
   with subagents; `skills/subagent-economy/` keeps those subagents cheap (detached runs, a waiter, checkpoints;
   copy it to `~/.claude/skills/` to use it in other projects); `skills/jepsen-review/` is the adversarial
   review of durability, recovery and failover code in the Jepsen style (claims, faults, histories, a checker,
-  evidence); `agents/iso-waiter.md` waits on detached runs. Personal settings go in the ignored
+  evidence); `skills/job-watchdog/` (with `agents/job-watchdog.md` and `subagent-economy/scripts/watchdog.sh`) checks the detached jobs hourly for ones that died or hang, stops a hung one by its own process group, fixes harness causes and reruns it; `agents/iso-waiter.md` waits on detached runs. Personal settings go in the ignored
   `.claude/settings.local.json`. `.githooks/commit-msg`: the commit rules for everyone (`make hooks`).
 - `tools/dump.c`: `tsdb export` / `import` (public API only), the stream of `docs/export-format.md`, which every
   later version must keep reading (`tests/data/export-v1.tsdbdump`, `tests/test_export.c`).
