@@ -191,6 +191,10 @@ typedef struct twa_cur {
     bool have;
     twa_pt p;
     int64_t k, kb, ke; /* bucket k is [kb, ke) */
+    /* the newest bucket's sums, not yet in v: per row they stay in registers rather than going through memory
+     * (cur_seal moves them; the same additions in the same order, so the same bits) */
+    bool pend;
+    twa_part e;
     twa_part *v;
     size_t n, cap;
     int err;
@@ -217,15 +221,8 @@ static inline void cur_bucket(const twa_q *q, twa_cur *c, int64_t t)
     }
 }
 
-static inline void cur_add(twa_cur *c, double area, uint64_t ms, uint64_t count)
+static void cur_push(twa_cur *c, twa_part e)
 {
-    if (c->n && c->v[c->n - 1].k == c->k) {
-        twa_part *e = &c->v[c->n - 1];
-        e->area += area;
-        e->ms += ms;
-        e->count += count;
-        return;
-    }
     if (c->n == c->cap) {
         size_t cap = c->cap ? c->cap * 2 : 16;
         twa_part *v = realloc(c->v, cap * sizeof *v);
@@ -236,7 +233,30 @@ static inline void cur_add(twa_cur *c, double area, uint64_t ms, uint64_t count)
         c->v = v;
         c->cap = cap;
     }
-    c->v[c->n++] = (twa_part){c->k, area, ms, count};
+    c->v[c->n++] = e;
+}
+
+/* moves the pending sums into v: before anything reads v, n or err */
+static inline void cur_seal(twa_cur *c)
+{
+    if (c->pend) {
+        cur_push(c, c->e);
+        c->pend = false;
+    }
+}
+
+static inline void cur_add(twa_cur *c, double area, uint64_t ms, uint64_t count)
+{
+    if (c->pend && c->e.k == c->k) {
+        c->e.area += area;
+        c->e.ms += ms;
+        c->e.count += count;
+        return;
+    }
+    if (c->pend)
+        cur_push(c, c->e);
+    c->e = (twa_part){c->k, area, ms, count};
+    c->pend = true;
 }
 
 static inline double interp(twa_pt a, twa_pt b, int64_t x)
@@ -280,16 +300,47 @@ static inline void feed(const twa_q *q, twa_cur *c, twa_pt p)
         cur_bucket(q, c, p.t);
         cur_add(c, 0, 0, 1);
     }
-    c->p = p;
+    /* field by field: a struct copy goes through a 16-byte load of what was just stored in pieces, a store
+     * forwarding stall on every row */
+    c->p.t = p.t;
+    c->p.v = p.v;
+    c->p.ok = p.ok;
     c->have = true;
 }
 
-static void feed_rows(const twa_q *q, twa_cur *c, const int64_t *ts, const uint8_t *v, size_t n)
+static inline __attribute__((always_inline)) void feed_rows_as(const twa_q *q, twa_cur *c, const int64_t *ts,
+                                                               const uint8_t *v, size_t n)
 {
+    twa_cur l = *c; /* a local the compiler can keep in registers, whatever it inlines */
     for (size_t i = 0; i < n; i++) {
         const uint8_t *s = v + i * q->w;
         bool ok = slot_ok(q->type, s);
-        feed(q, c, (twa_pt){ts[i], ok ? slot_val(q->type, s) : 0, ok});
+        feed(q, &l, (twa_pt){ts[i], ok ? slot_val(q->type, s) : 0, ok});
+    }
+    *c = l;
+}
+
+/* The per-row loop, once per method and for float32 on its own: with those known, the compiler keeps the loop's
+ * state in registers instead of leaving it to its inlining budget for the whole file. */
+static void feed_rows(const twa_q *q, twa_cur *c, const int64_t *ts, const uint8_t *v, size_t n)
+{
+    twa_q l = *q;
+    if (q->type == TSDB_FLOAT32) {
+        l.type = TSDB_FLOAT32;
+        l.w = 4;
+        if (q->linear) {
+            l.linear = true;
+            feed_rows_as(&l, c, ts, v, n);
+        } else {
+            l.linear = false;
+            feed_rows_as(&l, c, ts, v, n);
+        }
+    } else if (q->linear) {
+        l.linear = true;
+        feed_rows_as(&l, c, ts, v, n);
+    } else {
+        l.linear = false;
+        feed_rows_as(&l, c, ts, v, n);
     }
 }
 
@@ -308,6 +359,7 @@ typedef struct twa_out {
 /* Moves a walk's partial sums into the result. */
 static void flush(twa_out *o, twa_cur *c)
 {
+    cur_seal(c);
     for (size_t i = 0; i < c->n; i++) {
         uint64_t k = (uint64_t)c->v[i].k - (uint64_t)o->b0;
         if (k >= o->nb) /* cannot happen: contributions lie within [dmin, dmax] */
@@ -331,7 +383,7 @@ enum { PC_STATS, PC_POINT, PC_DECODE, PC_MEM, PC_MERGE };
 typedef struct twa_piece {
     int kind;
     uint32_t src;
-    const granule *g;  /* PC_STATS, PC_POINT, PC_DECODE */
+    uint32_t k;        /* PC_STATS, PC_POINT, PC_DECODE: the granule's entry in parts[src]; else TW_NONE */
     size_t a, b;       /* PC_MERGE: items [a, b) */
     /* PC_DECODE, filled by the workers */
     twa_pt first, last;
@@ -342,8 +394,9 @@ typedef struct twa_piece {
 typedef struct twa_item {
     int64_t lo, hi;
     uint32_t src;
-    const granule *g;
+    uint32_t k; /* the granule's entry in parts[src]; TW_NONE for a memtable run */
 } twa_item;
+#define TW_NONE UINT32_MAX
 
 static int cmp_twa_item(const void *a, const void *b)
 {
@@ -383,15 +436,17 @@ static void twa_worker(void *arg, int idx)
             break;
         twa_piece *pc = &j->pc[j->work[w]];
         const part *p = j->sn->parts[pc->src];
-        int rc = granule_read(cc, p, pc->g, j->q->type, ts, v, p->verify);
+        granule gb;
+        int rc = granule_read_at(cc, p, pc->k, j->q->type, ts, v, p->verify, &gb);
         if (rc) {
             atomic_store(&j->err, rc);
             break;
         }
-        size_t n = pc->g->count;
+        size_t n = gb.count;
         twa_cur c;
         cur_init(&c);
         feed_rows(j->q, &c, ts, v, n);
+        cur_seal(&c);
         if (c.err) {
             free(c.v);
             atomic_store(&j->err, c.err);
@@ -478,10 +533,10 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
             const part *p = sn.parts[i];
             snap_find(&sn, i, series, start, end, &gi, &gj);
             /* the last granule before the range, unless one in it already starts before it */
-            if (gi > sn.gi[i] && p->g[gi - 1].series == series && (gi == gj || p->g[gi].ts_min >= start))
+            if (gi > sn.gi[i] && gx_series(p, gi - 1) == series && (gi == gj || gx_ts_min(p, gi) >= start))
                 gi--;
             /* and the first after it */
-            if (gj < sn.gj[i] && p->g[gj].series == series && (gj == gi || p->g[gj - 1].ts_max < end))
+            if (gj < sn.gj[i] && gx_series(p, gj) == series && (gj == gi || gx_ts_max(p, gj - 1) < end))
                 gj++;
         } else if (mem_from_memtable(&sn, i - sn.np)) {
             QS_ADD(memtable_rows, sn.mem[i - sn.np].n);
@@ -499,12 +554,12 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
             twa_item *it = &items[nitem++];
             it->src = (uint32_t)i;
             if (i < sn.np) {
-                it->g = &sn.parts[i]->g[k];
-                it->lo = it->g->ts_min;
-                it->hi = it->g->ts_max;
+                it->k = k;
+                it->lo = gx_ts_min(sn.parts[i], k);
+                it->hi = gx_ts_max(sn.parts[i], k);
             } else {
                 const mem_run *r = &sn.mem[i - sn.np];
-                it->g = NULL;
+                it->k = TW_NONE;
                 it->lo = r->ts[0];
                 it->hi = r->ts[r->n - 1];
             }
@@ -526,7 +581,7 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
         const twa_item *it = &items[k];
         if (it->hi < mb || it->lo > ma)
             continue;
-        if (it->g) {
+        if (it->k != TW_NONE) {
             QS_ADD(granules, 1);
             if (it->src != last_src) /* items come grouped by source */
                 QS_ADD(parts, 1);
@@ -567,7 +622,11 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
     o.acc = acc;
 
     /* pieces in time order: clusters of overlapping items */
-    qsort(items, nitem, sizeof *items, cmp_twa_item);
+    for (size_t k = 1; k < nitem; k++) /* usually in order already (see sort_items in query.c) */
+        if (items[k].lo < items[k - 1].lo) {
+            qsort(items, nitem, sizeof *items, cmp_twa_item);
+            break;
+        }
     for (size_t a = 0; a < nitem;) {
         size_t b = a + 1;
         int64_t h = items[a].hi;
@@ -583,17 +642,17 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
             for (size_t k = a; k < b; k++) {
                 const twa_item *it = &items[k];
                 twa_piece *x = &pc[npc++];
-                *x = (twa_piece){.kind = PC_MEM, .src = it->src, .g = it->g};
-                if (!it->g)
+                *x = (twa_piece){.kind = PC_MEM, .src = it->src, .k = it->k};
+                if (it->k == TW_NONE)
                     continue;
-                const granule *g = it->g;
-                if (!force_decode && (g->ts_max < start || g->ts_min >= end)) {
+                if (!force_decode && (it->hi < start || it->lo >= end)) {
                     x->kind = PC_POINT;
                     continue;
                 }
-                bool usable = !force_decode && g->ts_min >= start && g->ts_max < end &&
-                              bucketer_key(bk, g->ts_min) == bucketer_key(bk, g->ts_max) &&
-                              (!max_gap || (g->tw_gap < UINT32_MAX && g->tw_gap <= (uint64_t)max_gap));
+                uint32_t gap = (uint32_t)gix_get(&sn.parts[it->src]->ix, it->k, GF_GAP);
+                bool usable = !force_decode && it->lo >= start && it->hi < end &&
+                              bucketer_key(bk, it->lo) == bucketer_key(bk, it->hi) &&
+                              (!max_gap || (gap < UINT32_MAX && gap <= (uint64_t)max_gap));
                 x->kind = usable ? PC_STATS : PC_DECODE;
                 if (!usable)
                     work[nwork++] = npc - 1;
@@ -608,7 +667,7 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
         atomic_init(&j.err, 0);
         uint64_t rows = 0;
         for (size_t w = 0; w < nwork; w++)
-            rows += (uint64_t)pc[work[w]].g->count * TWA_ROW_WEIGHT;
+            rows += (uint64_t)gx_count(sn.parts[pc[work[w]].src], pc[work[w]].k) * TWA_ROW_WEIGHT;
         sched_run(db->sched, query_threads_for(db, rows, nwork), twa_worker, &j);
         rc = atomic_load(&j.err);
         if (rc)
@@ -624,7 +683,11 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
         twa_piece *x = &pc[i];
         switch (x->kind) {
         case PC_STATS: {
-            const granule *g = x->g;
+            granule gb;
+            gb.tw_step = gb.tw_lin = 0; /* the one not asked for stays unread */
+            gb.tw_step_ms = gb.tw_lin_ms = 0;
+            gx_load(sn.parts[x->src], x->k, GW_TWEND | (q.linear ? GW_TWLIN : GW_TWSTEP), &gb);
+            const granule *g = &gb;
             QS_ADD(granules_from_stats, 1);
             QS_ADD(rows_from_stats, g->count);
             twa_pt first = {g->ts_min, g->tw_first, !(g->tw_flags & GT_FIRST_NULL)};
@@ -639,7 +702,9 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
         }
         case PC_POINT: {
             /* before or after the range: the segments inside it do not reach into the range */
-            const granule *g = x->g;
+            granule gb;
+            gx_load(sn.parts[x->src], x->k, GW_TWEND, &gb);
+            const granule *g = &gb;
             twa_pt first = {g->ts_min, g->tw_first, !(g->tw_flags & GT_FIRST_NULL)};
             if (c.have)
                 seg(&q, &c, c.p, first);
@@ -673,7 +738,7 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
                         continue;
                     any = true;
                     if (s < sn.np) {
-                        uint32_t idx = (uint32_t)(items[k].g - sn.parts[s]->g);
+                        uint32_t idx = items[k].k;
                         gi = MIN(gi, idx);
                         gj = MAX(gj, idx + 1);
                     }
@@ -691,6 +756,7 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
                 src_free(&srcs[k]);
         }
         }
+        cur_seal(&c);
         if (c.err)
             rc = c.err;
         flush(&o, &c);
@@ -763,8 +829,8 @@ int eng_query_twa(eng *db, uint32_t series, int64_t start, int64_t end, const bu
         return rc;
     for (size_t i = 0; i < R.sn.np; i++)
         if (R.sn.gi[i] < R.sn.gj[i]) {
-            R.first = MIN(R.first, R.sn.parts[i]->g[R.sn.gi[i]].ts_min);
-            R.last = MAX(R.last, R.sn.parts[i]->g[R.sn.gj[i] - 1].ts_max);
+            R.first = MIN(R.first, gx_ts_min(R.sn.parts[i], R.sn.gi[i]));
+            R.last = MAX(R.last, gx_ts_max(R.sn.parts[i], R.sn.gj[i] - 1));
         }
     for (size_t i = 0; i < R.sn.nmem; i++)
         if (R.sn.mem[i].n) {

@@ -114,7 +114,7 @@ $(B)/test_threads: tests/test_threads.c src/internal.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_tzfiles $(B)/test_export $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
@@ -123,6 +123,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	./$(B)/test_failstop
 	./$(B)/test_damage
 	./$(B)/test_crafted
+	./$(B)/test_gindex
 	./$(B)/test_tzfiles
 	for h in $(FUZZ_HARNESSES); do ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 	./$(B)/test_types
@@ -469,6 +470,10 @@ $(B)/test_damage: tests/test_damage.c src/internal.h $(LIB)
 # Crafted files in the data directory and extreme inputs (internals: -Isrc)
 $(B)/test_crafted: tests/test_crafted.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
+
+# The packed granule index: round trips of every type and edge case, and through the engine (internals: -Isrc)
+$(B)/test_gindex: tests/test_gindex.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
 
 # Crafted TZif files, rules and zone names; includes the calendar's source to see its cache
 $(B)/test_tzfiles: tests/test_tzfiles.c client/tsdb_calendar.c include/tsdb_calendar.h

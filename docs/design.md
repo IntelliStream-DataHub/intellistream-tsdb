@@ -453,19 +453,23 @@ one insert (or produced by one merge), sorted by `(series, ts)`:
 header | ts block, value block, ts block, value block, ... | granule index | footer
 ```
 
-A granule is up to 8192 rows of one series. Its 136-byte index entry holds
-the series, min/max timestamp, row count, null count, the sum, min and max of
-the known values (doubles for floats; exact for integers: int64 min/max and a
-128-bit sum), block offsets and a checksum of the granule's blocks, and the
-time-weighted statistics (first and last value, STEP and LINEAR areas, the
-time they cover and the longest gap between rows: see "Time-weighted
-averages"). The
-header, the index and the footer (WAL segment, row count, time range) are
-covered by one more checksum, checked when the part is opened. The on-disk
+A granule is up to 8192 rows of one series. Its index entry holds the series,
+min/max timestamp, row count, null count, the sum, min and max of the known
+values (doubles for floats; exact for integers: int64 min/max and a 128-bit
+sum), the spread (m2, or the 192-bit sum of squares), block offsets and a
+checksum of the granule's blocks, and the time-weighted statistics (first and
+last value, STEP and LINEAR areas, the time they cover and the longest gap
+between rows: see "Time-weighted averages"). Decoded, an entry is the 160-byte
+`struct granule`; on disk the entries are bit-packed at a fixed width per part,
+about 32 bytes each (see "The granule index" below). The 64-byte footer holds
+the index's offset and length, the WAL segment, row count, time range and
+granule count, and one more checksum, over the header, the index, the
+tombstones and the footer, checked when the part is opened. The on-disk
 format is version 7; a database of another version is refused at open
-(until 1.0 an older format is carried over by export and import). The index is the sparse primary index of MergeTree: finding a series'
-rows in a time range is a binary search, and aggregates over whole granules
-are answered from the stored statistics without decompressing anything.
+(until 1.0 an older format is carried over by export and import). The index is
+the sparse primary index of MergeTree: finding a series' rows in a time range is
+a binary search, and aggregates over whole granules are answered from the
+stored statistics without decompressing anything.
 
 Parts are grouped by time partition (one day by default, or longer for slow
 series: see "Partition classes") and merged in the
@@ -473,10 +477,72 @@ background with ClickHouse's `SimpleMergeSelector` heuristics: only adjacent
 block ranges are merged, so "newest part wins" stays well defined. A merge
 copies granules that need no re-encoding as compressed bytes.
 
+### The granule index (src/gindex.c)
+
+The index stays in the part's mapping and is read in place: nothing is copied
+to the heap at open, so its pages are shared page cache, and a database opens
+in the time it takes to map its parts and check their hashes. Up to format 6
+an entry was the 160-byte struct itself; most of its bytes repeated what the
+entries around it said (offsets that grow by a block at a time, timestamps a
+day apart, float32 statistics stored as doubles, a time-weighted step area
+that follows from the sum on a regular grid). Format 7 stores each entry as
+`GF_N` fields at fixed bit offsets, with a frame of reference per field and
+part:
+
+```
+varint nruns
+per field: u8 width, u8 (shift | kind << 6 | has_slope << 7), varint base, [varint zigzag slope]
+zeros to a multiple of 4
+u32 series[nruns], u32 start[nruns]       run r: series[r] from entry start[r]
+n entries of `stride` bytes
+zeros to a multiple of 8
+```
+
+Field f of entry i is `base + i x slope + (bits << shift)` in wrapping u64
+arithmetic, `bits` being the field's `width` bits of the entry. Fields wider
+than 57 bits take 8 bytes of their own at the start of the entry; the others
+follow packed in field order, so every field is one unaligned 8-byte load, a
+shift and a mask (the 8 bytes after the index, the footer's first, are always
+there to load). The writer picks per field the frame with the fewest bits: the
+smallest value as base, in unsigned or signed order, or a straight line
+through the first and last entry (block offsets and granule starts grow with
+i), and the trailing zero bits all deltas share. A float statistic that every
+entry of the part holds as an exact float32 is stored as the float32's bits
+(kind 1): widening it back gives the same double, bit for bit. The span is
+`ts_max - ts_min`, the step and linear times are stored as span minus the time
+(usually 0, so no bits), and STEP and LINEAR areas that `gix_dstep` /
+`gix_dlin` give exactly from the sum, the ends and the gap (a regular grid
+without nulls) are a flag instead of a field. The series are a table of runs,
+not a field.
+
+Nothing is rounded: every field decodes to the bits the writer was given,
+which `gix_encode` checks by decoding its output before the part is named (an
+encoder bug fails the write; it never stores a wrong statistic). The
+arithmetic is integer apart from the float32 widening and the two derived
+areas (two or three IEEE operations under `-ffp-contract=off`), so every CPU
+reads the same values, and gindex.c is compiled once, not per CPU level.
+`gix_parse` trusts nothing: widths, shifts, kinds, run order, the lengths
+adding up exactly and zero padding are checked, so a damaged index that the
+hash missed fails the open with `TSDB_ERR_CORRUPT` and never makes a reader
+load outside it.
+
+Readers decode only what they use: `gx_count`, `gx_ts`, `gx_series` for one
+field, `gx_load(p, i, want, &g)` for the groups in `want` (`GW_TIME`, `GW_LOC`,
+`GW_STAT`, `GW_SPREAD`, the time-weighted groups, `GW_INT` for the upper words
+of integer sums), and `granule_read_at` to decode a granule's rows. A query
+over whole granules costs a few shifts per field per granule; on the
+10,000-series year of minute readings the index is 118 instead of 564 MB, the
+part files 939 instead of 1,407 MB (0.179 instead of 0.268 bytes a reading), a
+warm open takes 24 instead of 58 ms and a cold one 77 instead of 341 ms, and
+whole-range aggregates answered from the statistics run 1.5 to 1.8 times as
+fast (fewer cache lines, and the items of disjoint parts are no longer sorted:
+they come in order). The 100 M-row mixed set goes from 1.17 to 1.14 bytes a
+row; it has full 8192-row granules, where the index was a small part already.
+
 ### Partition classes (src/classes.c)
 
-Every series pays per partition at least one granule: a 160-byte index entry
-and two framed blocks. A series with a reading a minute writes 1440 rows a day,
+Every series pays per partition at least one granule: an index entry (about
+32 bytes packed, 160 before format 7) and two framed blocks. A series with a reading a minute writes 1440 rows a day,
 so in day partitions it pays that for 1440 rows, in short blocks that compress
 worse than 8192-row ones. So each series has a class c, and its rows go to
 partitions of `partition_ms` x {1, 7, 28, 364} (a day, a week, four weeks, 52
@@ -616,7 +682,9 @@ than every part), so a delete needs no ordering of its own:
 
 **On disk.** A part with tombstones has an optional trailer between the index
 and the footer: `n x {u32 series, u32 0, i64 start, i64 end}`, then `u32 n,
-u32 'TOMB'`; `index_hash` covers it. Parts without tombstones are byte for byte
+u32 'TOMB'`; `index_hash` covers it. The index starts at a multiple of 8 and is
+padded to one, so the trailer is 8-byte aligned and read in place; a part whose
+footer says otherwise is refused at open. Parts without tombstones are byte for byte
 what they were, so `FORMAT_VERSION` stays; an older binary rejects a part with
 a trailer at open (its size does not match) and never misreads one. **No
 downgrade while tombstone parts exist**: the older binary calls such a part

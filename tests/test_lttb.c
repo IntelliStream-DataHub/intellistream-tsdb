@@ -423,21 +423,40 @@ static void test_count_mismatch(const char *base)
         uint8_t *buf = malloc((size_t)size);
         rewind(f);
         if (fread(buf, 1, (size_t)size, f) == (size_t)size) {
+            /* the index decoded, every null count cleared, encoded again as the writer does; the file rebuilt
+             * around it (its length may change) and rehashed */
             part_footer ft;
             memcpy(&ft, buf + size - sizeof ft, sizeof ft);
+            part pp;
+            memset(&pp, 0, sizeof pp);
+            granule *gr = calloc(ft.ngranules + 1, sizeof *gr);
+            CHECK(gr && gix_parse(buf + ft.index_off, (size_t)ft.index_len, ft.ngranules, &pp.ix) == 0);
             for (uint32_t g = 0; g < ft.ngranules; g++) {
-                granule gr;
-                memcpy(&gr, buf + ft.index_off + g * sizeof gr, sizeof gr);
-                forged += gr.nulls != 0;
-                gr.nulls = 0;
-                memcpy(buf + ft.index_off + g * sizeof gr, &gr, sizeof gr);
+                gx_load(&pp, g, GW_ALL, &gr[g]);
+                forged += gr[g].nulls != 0;
+                gr[g].nulls = 0;
             }
-            uint64_t x = xxh64(buf, sizeof(part_header), 0);
-            x = xxh64(buf + ft.index_off, ft.ngranules * sizeof(granule), x);
+            uint8_t *ix;
+            size_t ilen;
+            CHECK(gix_encode(gr, ft.ngranules, &ix, &ilen) == 0);
+            size_t tail = (size_t)size - (size_t)(ft.index_off + ft.index_len), nlen = (size_t)ft.index_off + ilen + tail;
+            uint8_t *out = malloc(nlen);
+            memcpy(out, buf, (size_t)ft.index_off);
+            memcpy(out + ft.index_off, ix, ilen);
+            memcpy(out + ft.index_off + ilen, buf + ft.index_off + ft.index_len, tail);
+            ft.index_len = ilen;
+            uint64_t x = xxh64(out, sizeof(part_header), 0);
+            x = xxh64(out + ft.index_off, ilen, x);
+            if (tail > sizeof ft) /* tombstones */
+                x = xxh64(out + ft.index_off + ilen, tail - sizeof ft, x);
             ft.index_hash = xxh64(&ft, offsetof(part_footer, index_hash), x);
-            memcpy(buf + size - sizeof ft, &ft, sizeof ft);
+            memcpy(out + nlen - sizeof ft, &ft, sizeof ft);
+            CHECK(ftruncate(fileno(f), 0) == 0);
             rewind(f);
-            CHECK(fwrite(buf, 1, (size_t)size, f) == (size_t)size);
+            CHECK(fwrite(out, 1, nlen, f) == nlen);
+            free(out);
+            free(ix);
+            free(gr);
         }
         free(buf);
         fclose(f);

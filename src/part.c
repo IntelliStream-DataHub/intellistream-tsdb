@@ -2,7 +2,7 @@
  * Part files: immutable, sorted by (series, ts), written once and mmap'd.
  *
  *   header (24 bytes) | ts block, value block, ... per granule | pad to 8 |
- *   granule index (80 bytes per granule) | [tombstones] | footer (56 bytes)
+ *   granule index (bit-packed, gindex.c; index_len bytes, a multiple of 8) | [tombstones] | footer (64 bytes)
  *
  * The tombstone trailer (24 bytes per range tombstone, then u32 count and u32
  * TOMB_MAGIC) is there only in parts that hold deletes, so every other part is
@@ -15,7 +15,8 @@
  * values. The header also records the newest WAL segment whose rows the part
  * holds. One hash in the footer covers the header, the index and the footer,
  * so a damaged wal_seq, row count or time range is caught at open like a
- * damaged index; each granule's blocks have a checksum of their own.
+ * damaged index; each granule's blocks have a checksum of their own. The index
+ * is read where it lies in the mapping, never copied (gindex.c).
  * A part is written to tmp_*.part, fsync'd, and renamed to its final name
  * p<partition>_<min_block>_<max_block>_<level>.part, which makes it visible.
  */
@@ -74,7 +75,7 @@ static bool trailer_parse(const uint8_t *buf, size_t tlen, const tomb **t, uint3
     if (tlen == 0)
         return true;
     uint32_t cnt, magic;
-    if (tlen < 8)
+    if (tlen < 8 || (uintptr_t)buf % _Alignof(tomb) != 0) /* read in place as tombs; part_open checks it too */
         return false;
     memcpy(&cnt, buf + tlen - 8, 4);
     memcpy(&magic, buf + tlen - 4, 4);
@@ -155,17 +156,18 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     p->grows = h.granule_rows;
     p->wal_seq = h.wal_seq;
     /* checked without wrapping: the hash is no authentication, and a crafted index_off near 2^64 would otherwise
-       make part_hash read before the mapping */
-    if (f.index_off % 8 != 0 || f.index_off < sizeof h || f.index_off > (uint64_t)size - sizeof f ||
-        (uint64_t)f.ngranules * sizeof(granule) > (uint64_t)size - sizeof f - f.index_off)
+       make part_hash read before the mapping. The writer pads the index to a multiple of 8, so the tombstone
+       trailer, read in place as tomb structs, starts 8-byte aligned; a length that is not is refused here,
+       before trailer_parse touches it (gix_parse refuses it too, but runs later). */
+    if (f.index_off % 8 != 0 || f.index_len % 8 != 0 || f.index_off < sizeof h || f.index_off > (uint64_t)size - sizeof f ||
+        f.index_len > (uint64_t)size - sizeof f - f.index_off)
         goto fail;
-    uint64_t index_end = f.index_off + (uint64_t)f.ngranules * sizeof(granule);
+    uint64_t index_end = f.index_off + f.index_len;
     size_t tlen = (size_t)((uint64_t)size - sizeof f - index_end);
-    if (part_hash(&h, p->map + f.index_off, (size_t)f.ngranules * sizeof(granule), p->map + index_end, tlen, &f) !=
-            f.index_hash ||
-        f.min_ts > f.max_ts || !trailer_parse(p->map + index_end, tlen, &p->t, &p->nt))
+    if (part_hash(&h, p->map + f.index_off, (size_t)f.index_len, p->map + index_end, tlen, &f) != f.index_hash ||
+        f.min_ts > f.max_ts || !trailer_parse(p->map + index_end, tlen, &p->t, &p->nt) ||
+        gix_parse(p->map + f.index_off, (size_t)f.index_len, f.ngranules, &p->ix) != 0)
         goto fail;
-    p->g = (const granule *)(p->map + f.index_off);
     p->ng = f.ngranules;
     p->index_off = f.index_off;
     p->rows = f.rows;
@@ -194,6 +196,12 @@ void part_unref(part *p)
 }
 
 atomic_uint_fast64_t granule_checks;
+
+int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, bool verify, granule *g)
+{
+    gx_load(p, i, GW_LOC, g);
+    return granule_read(c, p, g, type, ts, v, verify);
+}
 
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, bool verify)
 {
@@ -388,11 +396,15 @@ int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const v
 
 /* Copies an already encoded granule verbatim. Any pending rows are emitted
  * first, so callers only do this when the pending rows belong to an earlier series. */
-int pw_copy_granule(part_writer *w, const part *src, const granule *g)
+int pw_copy_granule(part_writer *w, const part *src, uint32_t i)
 {
     int rc = pw_emit_pending(w);
     if (rc)
         return rc;
+    granule gb;
+    memset(&gb, 0, sizeof gb);
+    gx_load(src, i, GW_ALL, &gb);
+    const granule *g = &gb;
     size_t len = (size_t)g->ts_len + g->val_len;
     if (g->off < sizeof(part_header) || g->off > src->index_off || len > src->index_off - g->off)
         return TSDB_ERR_CORRUPT;
@@ -471,11 +483,17 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         f.min_ts = f.max_ts = w->empty_ts;
     f.ngranules = (uint32_t)w->ng;
     f.version = FORMAT_VERSION;
+    uint8_t *index = NULL;
+    size_t ilen = 0;
+    if ((rc = gix_encode(w->idx, w->ng, &index, &ilen)) != 0)
+        goto fail;
+    f.index_len = ilen;
     part_header h;
     pw_header(w, &h);
     size_t tlen = w->nt ? w->nt * sizeof(tomb) + 8 : 0;
     uint8_t *trailer = tlen ? malloc(tlen) : NULL;
     if (tlen && !trailer) {
+        free(index);
         rc = TSDB_ERR_NOMEM;
         goto fail;
     }
@@ -485,14 +503,16 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         memcpy(trailer + tlen - 8, &cnt, 4);
         memcpy(trailer + tlen - 4, &magic, 4);
     }
-    f.index_hash = part_hash(&h, w->idx, w->ng * sizeof(granule), trailer, tlen, &f);
+    f.index_hash = part_hash(&h, index, ilen, trailer, tlen, &f);
     memcpy(f.magic, PART_END_MAGIC, 8);
-    if ((rc = pw_flush(w)) != 0 || (rc = write_all(w->fd, w->idx, w->ng * sizeof(granule))) != 0 ||
+    if ((rc = pw_flush(w)) != 0 || (rc = write_all(w->fd, index, ilen)) != 0 ||
         (tlen && (rc = write_all(w->fd, trailer, tlen)) != 0) || (rc = write_all(w->fd, &f, sizeof f)) != 0) {
         free(trailer);
+        free(index);
         goto fail;
     }
     free(trailer);
+    free(index);
     /* a deferred sync starts the writeback now: the caller syncs all its parts after the last one is written,
      * by then mostly one journal commit for all of them instead of one each */
     if (db->opt.fsync && pending && w->defer_fd) {

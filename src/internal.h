@@ -32,7 +32,8 @@ typedef struct eng eng;
  * between the index and the footer; 5: the spread (m2 or the sum of squares) in
  * granule entries (160 bytes), tombstones as in 4; 6: a 7-bit codec kind in block headers; 7: partition
  * classes (a partition key is 4 x its first base partition + its class, CLASSES holds each series' class
- * history) and zstd frames without magic number or content size. Databases of older versions
+ * history) and zstd frames without magic number or content size, and the granule index bit-packed (gindex.c),
+ * its length in the footer (64 bytes). Databases of older versions
  * are refused (no release had them). */
 #define FORMAT_VERSION 7
 #define MAX_GRANULE_ROWS 65536
@@ -512,8 +513,8 @@ enum { BK_ONE, BK_FIXED, BK_CALENDAR, BK_BOUNDS };
 
 /* ---- parts ---- */
 
-/* One entry of a part's sparse index; stored on disk exactly like this (little
- * endian). The statistics cover the known values; their type is the series'. */
+/* One entry of a part's sparse index, decoded (gx_load) or about to be encoded (pw_push_index); on disk the
+ * entries are bit-packed (gindex.c). The statistics cover the known values; their type is the series'. */
 typedef struct granule {
     uint32_t series;
     uint32_t count;  /* rows, nulls included */
@@ -570,6 +571,7 @@ typedef struct part_header {
 
 typedef struct part_footer {
     uint64_t index_off;
+    uint64_t index_len; /* bytes of the packed index (gindex.c), a multiple of 8 */
     uint64_t rows;
     int64_t min_ts;
     int64_t max_ts;
@@ -578,7 +580,7 @@ typedef struct part_footer {
     uint64_t index_hash; /* xxh64 of the header, the index and the footer up to here */
     char magic[8];
 } part_footer;
-_Static_assert(sizeof(part_footer) == 56, "footer must be 56 bytes");
+_Static_assert(sizeof(part_footer) == 64, "footer must be 64 bytes");
 _Static_assert(sizeof(part_footer) >= BLK_SLACK, "footer must cover decoder overread");
 
 /* A range tombstone: rows of `series` with start <= ts < end are deleted from
@@ -609,6 +611,98 @@ bool tomb_set_hits(const tomb_set *s, uint32_t series, int64_t lo, int64_t hi);
 size_t tomb_set_filter(const tomb_set *s, uint32_t series, int64_t cutoff, int64_t *ts, uint8_t *v, size_t w,
                        size_t n);
 
+/* ---- the granule index (gindex.c) ----
+ * A part's index stays in its mapping: every entry is GF_N fields at fixed bit offsets, each field with its own
+ * frame of reference (base + i x slope + (bits << shift)) and width, chosen when the part is written; float
+ * statistics that a float32 holds exactly take 32 bits or fewer (GK_F32). The series are a table of runs. Readers
+ * decode the fields they need of entry i in place (gx_*), a few shifts and masks each; nothing is copied to the
+ * heap, so the index pages stay shared page cache as before. */
+enum { GF_COUNT, GF_TSMIN, GF_SPAN, GF_OFF, GF_TSLEN, GF_VALLEN, GF_NULLS, GF_CRC, GF_MIN, GF_MAX, GF_SUM,
+       GF_ISUMHI, GF_M2, GF_ISQ1, GF_ISQ2, GF_FIRST, GF_LAST, GF_STEP, GF_LIN, GF_STEPMS, GF_LINMS, GF_GAP,
+       GF_FLAGS, GF_N };
+enum { GK_U64, GK_F32 };
+/* GF_FLAGS: tw_flags in the low 32 bits; these say tw_step / tw_lin are not stored but derived (gix_dstep) */
+#define GIX_STEP_DERIVED (1ull << 32)
+#define GIX_LIN_DERIVED (1ull << 33)
+typedef struct gix_field {
+    uint64_t base, mask, slope;
+    uint32_t byte;            /* of the 8 bytes loaded at entry + byte, bits [bit, bit + width) */
+    uint8_t bit, shift, width, kind;
+} gix_field;
+typedef struct gix {
+    const uint8_t *e;              /* entry i at e + i x stride */
+    const uint32_t *rser, *rstart; /* run r: series rser[r] from entry rstart[r] */
+    uint32_t n, nruns, stride;
+    gix_field f[GF_N];
+} gix;
+/* Checks and lays out the index [b, b + len) of n entries; 8 readable bytes must follow it (the footer does).
+ * TSDB_ERR_CORRUPT for anything but exactly what gix_encode writes the layout of. */
+int gix_parse(const uint8_t *b, size_t len, uint32_t n, gix *x);
+/* The packed index of g[0..n) (sorted by series), malloc'd, *len a multiple of 8; decoded again and compared
+ * with g before it is returned: an encoder bug fails the write, it never stores a wrong statistic. */
+int gix_encode(const struct granule *g, size_t n, uint8_t **out, size_t *len);
+/* tw_step and tw_lin of a granule on a regular grid of gap ms without nulls, from its sum, first and last value:
+ * stored as a flag when these give exactly the bits granule_twa computed (the writer checks each entry). */
+static inline double gix_dstep(double sum, double last, uint32_t gap) { return (sum - last) * (double)gap; }
+static inline double gix_dlin(double sum, double first, double last, uint32_t gap)
+{
+    return (sum - (first + last) * 0.5) * (double)gap;
+}
+static inline uint64_t gix_get(const gix *x, uint32_t i, int f)
+{
+    const gix_field *d = &x->f[f];
+    uint64_t w;
+    memcpy(&w, x->e + (size_t)i * x->stride + d->byte, 8);
+    return d->base + (uint64_t)i * d->slope + (((w >> d->bit) & d->mask) << d->shift);
+}
+/* a 64-bit statistic's bits: a float32 field widened to the double it stands for */
+static inline uint64_t gix_bits(const gix *x, uint32_t i, int f)
+{
+    uint64_t u = gix_get(x, i, f);
+    if (x->f[f].kind == GK_F32) {
+        uint32_t b = (uint32_t)u;
+        float v;
+        memcpy(&v, &b, 4);
+        double d = v;
+        memcpy(&u, &d, 8);
+    }
+    return u;
+}
+static inline double gix_f64(const gix *x, uint32_t i, int f)
+{
+    uint64_t u = gix_bits(x, i, f);
+    double d;
+    memcpy(&d, &u, 8);
+    return d;
+}
+/* the run of series s: entries [*a, *b), empty at where it would be when the part has none of s */
+static inline void gix_run(const gix *x, uint32_t s, uint32_t *a, uint32_t *b)
+{
+    uint32_t lo = 0, hi = x->nruns;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (x->rser[mid] < s)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    *a = lo < x->nruns ? x->rstart[lo] : x->n;
+    *b = lo < x->nruns && x->rser[lo] == s ? (lo + 1 < x->nruns ? x->rstart[lo + 1] : x->n) : *a;
+}
+/* the run holding entry i (i < n) */
+static inline uint32_t gix_run_of(const gix *x, uint32_t i)
+{
+    uint32_t lo = 0, hi = x->nruns; /* the first run starting after i */
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (x->rstart[mid] <= i)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo - 1;
+}
+
 typedef struct part {
     char name[96];
     int dirfd;
@@ -619,7 +713,7 @@ typedef struct part {
     uint64_t wal_seq;
     const uint8_t *map;
     size_t map_len;
-    const granule *g;
+    gix ix; /* the granule index, in the map */
     uint32_t ng;
     const tomb *t; /* the part's tombstones (in the map); NULL when none */
     uint32_t nt;
@@ -639,6 +733,101 @@ typedef struct part {
     char pending[64];     /* tmp file name while the part awaits parts_commit, else "" */
 } part;
 
+
+/* What gx_load decodes besides the count: the fields a reader uses, so a hot loop pays only for those (each field
+ * is a few dependent loads, shifts and masks; the statistics path over many small parts is bound by them). */
+enum {
+    GW_TIME = 1,     /* ts_min, ts_max */
+    GW_LOC = 2,      /* off, ts_len, val_len, crc, nulls */
+    GW_STAT = 4,     /* nulls, min, max, sum (isum_hi only with GW_INT) */
+    GW_SPREAD = 8,   /* m2 or isq0 (isq1, isq2 only with GW_INT) */
+    GW_TWEND = 16,   /* ts_min, ts_max, tw_first, tw_last, tw_flags */
+    GW_TWSTEP = 32,  /* nulls, tw_step, tw_step_ms (and sum, tw_gap when derived) */
+    GW_TWLIN = 64,   /* nulls, tw_lin, tw_lin_ms (and sum, tw_gap when derived) */
+    GW_SERIES = 128,
+    GW_INT = 256,    /* the series is an integer type: the upper words of its sums matter */
+    GW_TW = GW_TWEND | GW_TWSTEP | GW_TWLIN,
+    GW_ALL = 511,
+};
+static inline uint32_t gx_count(const part *p, uint32_t i) { return (uint32_t)gix_get(&p->ix, i, GF_COUNT); }
+static inline int64_t gx_ts_min(const part *p, uint32_t i) { return (int64_t)gix_get(&p->ix, i, GF_TSMIN); }
+static inline int64_t gx_ts_max(const part *p, uint32_t i)
+{
+    return (int64_t)(gix_get(&p->ix, i, GF_TSMIN) + gix_get(&p->ix, i, GF_SPAN));
+}
+/* both ends of entry i: ts_min decoded once */
+static inline void gx_ts(const part *p, uint32_t i, int64_t *lo, int64_t *hi)
+{
+    uint64_t t = gix_get(&p->ix, i, GF_TSMIN);
+    *lo = (int64_t)t;
+    *hi = (int64_t)(t + gix_get(&p->ix, i, GF_SPAN));
+}
+static inline uint32_t gx_series(const part *p, uint32_t i) { return p->ix.rser[gix_run_of(&p->ix, i)]; }
+/* Entry i of p into *g: the count, and the groups in `want` (GW_*). Other fields are left as they were. */
+static inline void gx_load(const part *p, uint32_t i, unsigned want, granule *g)
+{
+    const gix *x = &p->ix;
+    g->count = (uint32_t)gix_get(x, i, GF_COUNT);
+    uint64_t span = 0;
+    if (want & (GW_TIME | GW_TWEND | GW_TWSTEP | GW_TWLIN)) {
+        span = gix_get(x, i, GF_SPAN);
+        g->ts_min = (int64_t)gix_get(x, i, GF_TSMIN);
+        g->ts_max = (int64_t)((uint64_t)g->ts_min + span);
+    }
+    if (want & (GW_LOC | GW_STAT | GW_TWSTEP | GW_TWLIN))
+        g->nulls = (uint32_t)gix_get(x, i, GF_NULLS);
+    if (want & GW_LOC) {
+        g->off = gix_get(x, i, GF_OFF);
+        g->ts_len = (uint32_t)gix_get(x, i, GF_TSLEN);
+        g->val_len = (uint32_t)gix_get(x, i, GF_VALLEN);
+        g->crc = (uint32_t)gix_get(x, i, GF_CRC);
+    }
+    if (want & GW_STAT) {
+        g->isum_lo = gix_bits(x, i, GF_SUM);
+        g->imin = (int64_t)gix_bits(x, i, GF_MIN);
+        g->imax = (int64_t)gix_bits(x, i, GF_MAX);
+        g->isum_hi = want & GW_INT ? (int64_t)gix_get(x, i, GF_ISUMHI) : 0;
+    }
+    if (want & GW_SPREAD) {
+        g->isq0 = gix_bits(x, i, GF_M2);
+        g->isq1 = want & GW_INT ? gix_get(x, i, GF_ISQ1) : 0;
+        g->isq2 = want & GW_INT ? gix_get(x, i, GF_ISQ2) : 0;
+    }
+    if (want & GW_TW) {
+        uint64_t fl = gix_get(x, i, GF_FLAGS);
+        g->tw_flags = (uint32_t)fl;
+        if (want & GW_TWEND) {
+            g->tw_first = gix_f64(x, i, GF_FIRST);
+            g->tw_last = gix_f64(x, i, GF_LAST);
+        }
+        if (want & (GW_TWSTEP | GW_TWLIN)) {
+            bool ds = want & GW_TWSTEP && fl & GIX_STEP_DERIVED, dl = want & GW_TWLIN && fl & GIX_LIN_DERIVED;
+            if (ds || dl) {
+                if (!(want & GW_STAT))
+                    g->isum_lo = gix_bits(x, i, GF_SUM);
+                g->tw_gap = (uint32_t)gix_get(x, i, GF_GAP);
+                if (!(want & GW_TWEND)) {
+                    g->tw_last = gix_f64(x, i, GF_LAST);
+                    if (dl)
+                        g->tw_first = gix_f64(x, i, GF_FIRST);
+                }
+            }
+            if (want & GW_TWSTEP) {
+                g->tw_step = ds ? gix_dstep(g->fsum, g->tw_last, g->tw_gap) : gix_f64(x, i, GF_STEP);
+                g->tw_step_ms = span - gix_get(x, i, GF_STEPMS);
+            }
+            if (want & GW_TWLIN) {
+                g->tw_lin = dl ? gix_dlin(g->fsum, g->tw_first, g->tw_last, g->tw_gap) : gix_f64(x, i, GF_LIN);
+                g->tw_lin_ms = span - gix_get(x, i, GF_LINMS);
+            }
+        }
+        if ((want & GW_TW) == GW_TW)
+            g->tw_gap = (uint32_t)gix_get(x, i, GF_GAP);
+    }
+    if (want & GW_SERIES)
+        g->series = gx_series(p, i);
+}
+
 int part_open(int dirfd, const char *name, part **out);
 int part_open_as(int dirfd, const char *file, const char *name, part **out);
 void part_ref(part *p);
@@ -646,6 +835,9 @@ void part_unref(part *p);
 /* Decodes a granule: timestamps, and values (if v) as slots of `type`; checks
  * the granule's checksum first if verify. */
 int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, bool verify);
+/* the same for entry i: decodes its GW_LOC fields into *g first. Out of line on purpose: inlined, the entry's
+ * decoding changes how the compiler lays out a caller's per-row loop (TWA lost 12% that way). */
+int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, bool verify, granule *g);
 extern atomic_uint_fast64_t granule_checks; /* granule checksums computed, for tests */
 
 typedef struct part_writer {
@@ -682,7 +874,8 @@ typedef struct part_writer {
 int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq);
 /* Rows of one series of `type` (v in its slots); (series, ts) order across calls. */
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n);
-int pw_copy_granule(part_writer *w, const part *src, const granule *g);
+/* entry i of src, copied as it is */
+int pw_copy_granule(part_writer *w, const part *src, uint32_t i);
 /* Tombstones for the trailer, sorted by (series, start) and disjoint per series; copied. */
 int pw_set_tombs(part_writer *w, const tomb *t, size_t n);
 int pw_finish(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);

@@ -62,8 +62,19 @@ disk format and the wire protocol.
   synced once at the end and then renamed to its name, so an interrupted one leaves no database under that name.
 
 ### Changed
-- Disk format 7: part keys are `4 x first base partition + class`, the new `CLASSES` file, and zstd frames
-  without magic number and content size. A version-6 database is refused at open; carry it over with
+- Disk format 7: part keys are `4 x first base partition + class`, the new `CLASSES` file, zstd frames
+  without magic number and content size, and a packed granule index: each part's entries are bit-packed at a
+  fixed width per field (a frame of reference per field and part: a base, a slope for offsets and starts that
+  grow, shared trailing zeros, float32 bits for float statistics a float32 holds exactly, derived TWA areas as a
+  flag) and read in place from the mapping, about 32 bytes an entry instead of 160, behind a 64-byte footer that
+  gives the index's length. Every field decodes to the exact bits written (the writer checks by decoding before
+  the part is named; a damaged index is `TSDB_ERR_CORRUPT` at open). A year of minute readings of 10,000 disks:
+  939 instead of 1,407 MB (0.179 instead of 0.268 bytes a reading), the index 118 instead of 564 MB of page
+  cache, an open in 24 instead of 58 ms warm and 77 instead of 341 ms cold; the 100 M-row mixed set 1.14 instead
+  of 1.17 bytes a row. Queries answered from granule statistics run faster: whole-range aggregates 1.5 to 1.8
+  times, day buckets over a year 1.4 to 1.7 times (one thread), TWA through tsdbd 1.48 times (1 connection) and
+  1.63 times (32); queries that decode rows and inserts are unchanged (within noise). Answers are identical.
+  A version-6 database is refused at open; carry it over with
   `tsdb export` (old release) and `tsdb import` (this one), which gives every series its class on its first
   batch. `tsdb_drop_before` drops whole partitions as before, so a slow series' rows go in steps of its
   partition length (7, 28 or 364 days); retention still clamps queries to the exact cutoff.

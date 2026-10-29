@@ -776,7 +776,7 @@ static int mixed_parts(const char *dir)
         part_footer f;
         if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= (off_t)sizeof f &&
             pread(fd, &f, sizeof f, st.st_size - (off_t)sizeof f) == (ssize_t)sizeof f && f.ngranules > 0 &&
-            f.index_off + (uint64_t)f.ngranules * sizeof(granule) + sizeof f < (uint64_t)st.st_size)
+            f.index_off + f.index_len + sizeof f < (uint64_t)st.st_size) /* a trailer: tombstones */
             n++;
         if (fd >= 0)
             close(fd);
