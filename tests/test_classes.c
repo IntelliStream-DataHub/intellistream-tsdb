@@ -24,6 +24,8 @@
  *      off (where partitions are days) the granules are as many, every query kind (raw both ways, aggregates at
  *      several intervals, calendar groups, bounds, spread, TWA both methods, LTTB) answers bit for bit the same,
  *      and day buckets over whole days are answered from granule statistics alone.
+ *  14. a switch waiting for a large insert in flight does not hold flushes back: a flush finishes while the insert
+ *      is held inside its placement and the switch is pending; the switch goes through after the insert.
  *
  *   test_classes [scratch dir] */
 #define _GNU_SOURCE
@@ -1489,11 +1491,112 @@ static void test_daycut(void)
     rm_rf(doff);
 }
 
+/* 14. The switch holds flush_lock while it waits for the write lock on the class history; waiting out a large
+ * insert there (seconds for 1 G rows) stopped every flush. Here the insert is held inside its placement (the
+ * precommit hook) until the flush is done or 3 s have passed. */
+typedef struct hold {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int in, go;
+    tsdb *db;
+    uint32_t id;
+} hold;
+
+static void hold_pre(void *arg)
+{
+    hold *h = arg;
+    pthread_mutex_lock(&h->mu);
+    h->in = 1;
+    pthread_cond_broadcast(&h->cv);
+    while (!h->go)
+        pthread_cond_wait(&h->cv, &h->mu);
+    pthread_mutex_unlock(&h->mu);
+}
+
+static void *hold_insert(void *arg)
+{
+    hold *h = arg;
+    int64_t ts[100];
+    float v[100];
+    for (int i = 0; i < 100; i++)
+        ts[i] = T0 + i * 1000LL, v[i] = (float)i;
+    OK(tsdb_insert_series(h->db, h->id, ts, v, 100));
+    return NULL;
+}
+
+typedef struct stall_sw {
+    tsdb *db;
+    uint32_t id;
+    int done;
+} stall_sw;
+
+static void *stall_switch(void *arg)
+{
+    stall_sw *w = arg;
+    OK(tsdb_test_class_switch(w->db, w->id, 1, NULL));
+    __atomic_store_n(&w->done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+static void *stall_flush(void *arg)
+{
+    stall_sw *w = arg;
+    OK(tsdb_append(w->db, w->id, T0 + 5 * DAY, 1.0f));
+    OK(tsdb_flush(w->db));
+    __atomic_store_n(&w->done, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+static void test_stall(void)
+{
+    char dir[600];
+    dir_of(dir, sizeof dir, "stall");
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.wal_max_batch_rows = 16; /* the 100-row insert goes straight to parts */
+    o.merge_idle_s = -1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    uint32_t a, b, c;
+    OK(tsdb_series(db, "a", &a));
+    OK(tsdb_series(db, "b", &b));
+    OK(tsdb_series(db, "c", &c));
+    OK(tsdb_append(db, b, T0, 1.0f));
+    OK(tsdb_flush(db));
+    hold h = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, db, a};
+    tsdb_test_precommit(db, hold_pre, &h);
+    pthread_t ti, ts, tf;
+    stall_sw sw = {db, b, 0}, fl = {db, c, 0};
+    CK(pthread_create(&ti, NULL, hold_insert, &h) == 0, "pthread_create");
+    pthread_mutex_lock(&h.mu);
+    while (!h.in)
+        pthread_cond_wait(&h.cv, &h.mu);
+    pthread_mutex_unlock(&h.mu);
+    CK(pthread_create(&ts, NULL, stall_switch, &sw) == 0, "pthread_create");
+    usleep(50000); /* the switch is pending */
+    CK(!__atomic_load_n(&sw.done, __ATOMIC_SEQ_CST), "the switch went through while a placement held the history");
+    CK(pthread_create(&tf, NULL, stall_flush, &fl) == 0, "pthread_create");
+    for (int i = 0; i < 300 && !__atomic_load_n(&fl.done, __ATOMIC_SEQ_CST); i++)
+        usleep(10000);
+    CK(__atomic_load_n(&fl.done, __ATOMIC_SEQ_CST), "a flush waited for a large insert behind a pending switch");
+    CK(!__atomic_load_n(&sw.done, __ATOMIC_SEQ_CST), "the switch went through while a placement held the history");
+    pthread_mutex_lock(&h.mu);
+    h.go = 1;
+    pthread_cond_broadcast(&h.cv);
+    pthread_mutex_unlock(&h.mu);
+    pthread_join(ti, NULL);
+    pthread_join(ts, NULL);
+    pthread_join(tf, NULL);
+    tsdb_test_precommit(db, NULL, NULL);
+    CK(cls_of(db, b) == 1, "class %d after the switch", cls_of(db, b));
+    OK(tsdb_close(db));
+}
+
 int main(int argc, char **argv)
 {
     snprintf(base, sizeof base, "%s", argc > 1 ? argv[1] : "/tmp");
     setvbuf(stdout, NULL, _IOLBF, 0);
-    const char *only = argc > 2 ? argv[2] : NULL; /* one section: bulk, live, overlap, fresh, wal, damage, retention, format, midplace, far, wtail, opencheck, comeback, daycut */
+    const char *only = argc > 2 ? argv[2] : NULL; /* one section: bulk, live, overlap, fresh, wal, damage, retention, format, midplace, far, wtail, opencheck, comeback, daycut, stall */
 #define SECTION(name, title, call)                                                                                 \
     if (!only || !strcmp(only, name)) {                                                                            \
         printf("%s\n", title);                                                                                     \
@@ -1513,6 +1616,7 @@ int main(int argc, char **argv)
     SECTION("opencheck", "parts against CLASSES at open", test_open_check());
     SECTION("comeback", "a series back in a class it left", test_comeback());
     SECTION("daycut", "granules end at day edges in class partitions", test_daycut());
+    SECTION("stall", "a pending switch does not hold flushes back", test_stall());
 #undef SECTION
     if (fails) {
         printf("test_classes: %d FAILED\n", fails);

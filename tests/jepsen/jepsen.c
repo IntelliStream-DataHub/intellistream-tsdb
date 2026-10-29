@@ -1265,6 +1265,22 @@ static int check_classes(const uint32_t *final)
     return violations - before;
 }
 
+static int create_series(int from, int to)
+{
+    tsdbc *c = connect_retry();
+    for (int s = from; s < to; s++) {
+        char name[32];
+        snprintf(name, sizeof name, "jepsen.%d", s);
+        if (tsdbc_series(c, name, 1, &ids[s])) {
+            fprintf(stderr, "jepsen: cannot create series\n");
+            tsdbc_close(c);
+            return 1;
+        }
+    }
+    tsdbc_close(c);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     static struct option opts[] = {{"dir", required_argument, 0, 'd'},     {"nemesis", required_argument, 0, 'n'},
@@ -1317,21 +1333,20 @@ int main(int argc, char **argv)
     make_keys();
 
     start_server(false); /* the series exist before any fault */
-    tsdbc *c = connect_retry();
-    for (int s = 0; s < nseries; s++) {
-        char name[32];
-        snprintf(name, sizeof name, "jepsen.%d", s);
-        if (tsdbc_series(c, name, 1, &ids[s])) {
-            fprintf(stderr, "jepsen: cannot create series\n");
-            return 2;
-        }
-    }
-    tsdbc_close(c);
+    /* classes under a shim: the series are created by the server under it (before the nemesis starts), so their
+     * first rows get a fresh class there; the restart below decides every series that exists (class 0, with no
+     * record), which left power and eio runs with no fresh decision at all. A series whose first flush brings
+     * fewer than 64 rows is decided class 0 without a record: the summary counts the decisions recorded. */
+    int early = classes && shim ? 0 : nseries;
+    if (create_series(0, early))
+        return 2;
     if (shim) { /* from here on, file operations may lose power or fail */
         pthread_mutex_lock(&server_lock);
         stop_server(SIGTERM);
         start_server(true);
         pthread_mutex_unlock(&server_lock);
+        if (create_series(early, nseries)) /* before the nemesis starts: no fault yet */
+            return 2;
     }
 
     pthread_t th[256], nem, fr;

@@ -735,6 +735,163 @@ static void test_writer_order(const char *base)
     CHECK(eng_close(db) == 0);
 }
 
+/* Day cuts in a merge: a full granule of a class-1 partition that spans a day edge (written by a build with
+ * another GRANULE_CUT, or before the cut) must be re-cut by the merge, never copied as it is. */
+static void test_daycut_merge(const char *base)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/daycut", base);
+    tsdb_options o = opts();
+    o.granule_rows = 4;
+    eng *db;
+    OK(eng_open(dir, &o, &db));
+    uint32_t s;
+    OK(eng_series(db, "a", TSDB_FLOAT32, &s));
+    int64_t from = INT64_MIN;
+    OK(eng_class_switch(db, s, 1, &from));
+    const int64_t D = db->partition_ms;
+    float v[4] = {1, 2, 3, 4};
+    part *src[2];
+    int64_t ta[4] = {D - 2, D - 1, D + 1, D + 2}, tb[4] = {3 * D, 3 * D + 1, 3 * D + 2, 3 * D + 3};
+    for (int k = 0; k < 2; k++) {
+        part_writer w;
+        OK(pw_begin(&w, db, 1 /* class 1, base partition 0 */, 0));
+        CHECK(w.cut_ms == D);
+        w.cut_ms = 0; /* as an older build wrote it */
+        OK(pw_add(&w, s, TSDB_FLOAT32, k ? tb : ta, v, 4));
+        OK(pw_finish_pending(&w, 0, 0, 1, &src[k]));
+        OK(parts_publish(db, &src[k], 1));
+        src[k]->level = 1; /* as if a merge wrote it: only merged granules are copied as they are */
+    }
+    CHECK(src[0]->ng == 1 && floor_div(src[0]->g[0].ts_min, D) != floor_div(src[0]->g[0].ts_max, D));
+    part *out = NULL;
+    OK(merge_parts(db, src, 2, &out));
+    CHECK(out != NULL);
+    int spans = 0;
+    for (uint32_t i = 0; out && i < out->ng; i++)
+        spans += floor_div(out->g[i].ts_min, D) != floor_div(out->g[i].ts_max, D);
+    if (spans)
+        fprintf(stderr, "daycut merge: %d granule(s) of the merge output span a day edge\n", spans);
+    CHECK(spans == 0);
+    if (out)
+        parts_discard(db, &out, 1);
+    CHECK(eng_close(db) == 0);
+}
+
+/* A switch while tsdb_drop_before's renames are not yet durable: the switch sees no rows of the series (their part
+ * is no longer listed) and writes its class from the beginning of time, synced. A power loss before the drop's
+ * directory fsync brings the part back under its old name. Emulated: the state such a power loss leaves. */
+static void test_drop_switch(const char *base)
+{
+    char dir[600], a[900], b[900];
+    snprintf(dir, sizeof dir, "%s/dropsw", base);
+    tsdb_options o = opts();
+    eng *db;
+    OK(eng_open(dir, &o, &db));
+    uint32_t s;
+    OK(eng_series(db, "a", TSDB_FLOAT32, &s));
+    size_t n = 70000;
+    int64_t *ts = malloc(n * sizeof *ts);
+    float *v = malloc(n * sizeof *v);
+    for (size_t i = 0; i < n; i++)
+        ts[i] = (int64_t)i, v[i] = (float)i; /* 1 kHz: class 0, all in base partition 0 */
+    OK(eng_insert_series(db, TSDB_FLOAT32, s, ts, v, n));
+    int c = -1;
+    OK(eng_series_class(db, s, &c));
+    CHECK(c == 0);
+    CHECK(db->nparts == 1);
+    char name[256];
+    snprintf(name, sizeof name, "%s", db->parts[0]->name);
+    snprintf(a, sizeof a, "%s/%s", dir, name);
+    snprintf(b, sizeof b, "%s/keep_%s", dir, name);
+    char cmd[2000];
+    snprintf(cmd, sizeof cmd, "cp '%s' '%s'", a, b);
+    CHECK(system(cmd) == 0);
+    OK(eng_drop_before(db, db->partition_ms));
+    /* in the window between the drop's renames and its directory fsync: what cls_observe would do */
+    OK(eng_class_switch(db, s, 3, NULL));
+    OK(eng_series_class(db, s, &c));
+    CHECK(c == 3);
+    CHECK(eng_close(db) == 0);
+    /* the power loss: the rename to retired_ never reached the disk, CLASSES (synced) did */
+    CHECK(rename(b, a) == 0);
+    snprintf(cmd, sizeof cmd, "rm -f '%s/retired_%s'", dir, name);
+    CHECK(system(cmd) == 0);
+    int rc = eng_open(dir, &o, &db);
+    if (rc)
+        fprintf(stderr, "dropsw: the reopen after the emulated power loss failed: %d\n", rc);
+    CHECK(rc == 0);
+    if (rc == 0)
+        CHECK(eng_close(db) == 0);
+    free(ts);
+    free(v);
+}
+
+/* The open check decodes a granule that spans a stay in another class and skips rows up to where the history
+ * changes next: that relies on ascending rows. A damaged granule whose rows stay within its bounds but go back in
+ * time (here 2D + 123457, then D + 5, a row of class 0 in a class-1 partition) must fail the open, not hide that row. */
+static void test_check_order(const char *base)
+{
+    char dir[600], path[900], name[256];
+    snprintf(dir, sizeof dir, "%s/chkorder", base);
+    tsdb_options o = opts();
+    o.granule_rows = 4;
+    eng *db;
+    OK(eng_open(dir, &o, &db));
+    uint32_t s;
+    OK(eng_series(db, "a", TSDB_FLOAT32, &s));
+    const int64_t D = db->partition_ms;
+    int64_t t0 = INT64_MIN, t1 = D, t2 = 2 * D;
+    OK(eng_class_switch(db, s, 1, &t0)); /* class 1, class 0 for the second day, then class 1 again */
+    OK(eng_class_switch(db, s, 0, &t1));
+    OK(eng_class_switch(db, s, 1, &t2));
+    float v[4] = {1, 2, 3, 4};
+    int64_t ts[4] = {D - 2, 2 * D + 123457, 2 * D + 45678901, 6 * D + 1234567}; /* irregular: room for the damage */
+    part_writer w;
+    part *pp;
+    OK(pw_begin(&w, db, 1 /* class 1, base partition 0 */, 0));
+    w.cut_ms = 0; /* one granule across the stay in class 0, as a build without day cuts wrote it */
+    OK(pw_add(&w, s, TSDB_FLOAT32, ts, v, 4));
+    OK(pw_finish_pending(&w, 0, 0, 1, &pp));
+    OK(parts_publish(db, &pp, 1));
+    CHECK(eng_close(db) == 0);
+    OK(eng_open(dir, &o, &db)); /* intact: the check decodes the granule and passes */
+    CHECK(eng_close(db) == 0);
+    /* the damage: the third row goes back into the second day */
+    CHECK(find_part(dir, name, sizeof name));
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    size_t len;
+    uint8_t *buf = (uint8_t *)slurp(path, &len);
+    part_footer f;
+    memcpy(&f, buf + len - sizeof f, sizeof f);
+    CHECK(f.ngranules == 1);
+    granule g;
+    memcpy(&g, buf + f.index_off, sizeof g);
+    int64_t bad[4] = {D - 2, 2 * D + 123457, D + 5, 6 * D + 1234567};
+    uint8_t enc[4096];
+    codec_ctx *cc = codec_new();
+    size_t tl = block_encode_ts(cc, 1, bad, 4, enc);
+    codec_free(cc);
+    if (!(tl > 0 && tl <= g.ts_len))
+        fprintf(stderr, "chkorder: the damaged block takes %zu bytes, the intact one %u\n", tl, g.ts_len);
+    CHECK(tl > 0 && tl <= g.ts_len);
+    if (tl > 0 && tl <= g.ts_len) {
+        memmove(buf + g.off + tl, buf + g.off + g.ts_len, g.val_len);
+        memcpy(buf + g.off, enc, tl);
+        g.ts_len = (uint32_t)tl;
+        memcpy(buf + f.index_off, &g, sizeof g);
+        spit(path, buf, len);
+        rehash_part(path);
+        int rc = eng_open(dir, &o, &db);
+        if (rc == 0) {
+            fprintf(stderr, "chkorder: the open took a granule with rows out of order\n");
+            eng_close(db);
+        }
+        CHECK(rc == TSDB_ERR_CORRUPT);
+    }
+    free(buf);
+}
+
 int main(int argc, char **argv)
 {
     /* a directory of this run's own: the fixed names below collided between worktrees testing at once */
@@ -752,6 +909,9 @@ int main(int argc, char **argv)
     test_extremes(base);
     test_wal_unreachable(base);
     test_writer_order(base);
+    test_daycut_merge(base);
+    test_drop_switch(base);
+    test_check_order(base);
     test_codecs();
     if (failures) {
         fprintf(stderr, "test_crafted: %d failures\n", failures);

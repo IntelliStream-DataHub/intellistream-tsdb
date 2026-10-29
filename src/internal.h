@@ -1038,6 +1038,9 @@ struct eng {
      * cls_gen counts the switches (changed under cls_rw held for writing). */
     pthread_rwlock_t cls_rw;
     _Atomic uint64_t cls_gen;
+    /* the end of the newest partition tsdb_drop_before or retention dropped in this process (db->lock): until the
+     * directory fsync its parts can come back after a power loss, so a switch never writes a T before it */
+    int64_t cls_dropped_end;
     void (*test_precommit)(void *); /* test hook: runs after a large insert placed its rows, before it commits */
     void *test_precommit_arg;
     void (*test_midplace)(void *); /* test hook: runs inside a placement, before rows are grouped into parts */
@@ -1342,7 +1345,7 @@ int cls_observe(eng *db, part *p);
 struct cls_wtail *cls_wal_tail_new(const memtable *m);
 void cls_wal_tail_locked(eng *db, struct cls_wtail *e, uint64_t seq, int64_t max_ts);
 /* Placements (large inserts, replaces, flushes) hold the class history frozen from their first class lookup until
- * their parts are listed; a switch waits for them. Never nested, and never held while waiting for a flush or a
+ * their parts are listed; a switch waits a few ms for them, then tries later. Never nested, and never held while waiting for a flush or a
  * merge (a switch holds flush_lock and the merge thread switches). */
 void cls_freeze(eng *db);
 void cls_thaw(eng *db);

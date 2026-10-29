@@ -35,7 +35,8 @@
  * listed part or a memtable when it computes T, and no placement sees two histories (rereading the live one while
  * grouping rows once wrote a part whose series run went back in time). Switches are rare (a flush's guard, an idle
  * merge), placements never wait for a flush or a merge while they hold it, and the read lock costs nothing
- * measurable beside writing a part. As backstops, the part writer refuses rows out of (series, ts) order, and the
+ * measurable beside writing a part. A switch holds flush_lock, so it waits only CLS_SWITCH_WAIT_MS for the
+ * placements in flight (a large insert can take seconds) and is asked again later rather than stall the flushes. As backstops, the part writer refuses rows out of (series, ts) order, and the
  * open checks that every part's rows lie where the history puts them (cls_check_parts).
  *
  * CLASSES is append-only like RETENTION: 24-byte records [u32 check][u32 series][i64 from][u32 class][u32 0];
@@ -324,6 +325,7 @@ int cls_open(eng *db, bool read_only)
     pthread_rwlock_init(&db->cls_rw, &ra);
     pthread_rwlockattr_destroy(&ra);
     db->cls_fd = -1;
+    db->cls_dropped_end = INT64_MIN;
     /* every series that exists now was decided (by a record, or class 0 without one) */
     uint32_t n = eng_series_count(db);
     pthread_mutex_lock(&db->cls_mu);
@@ -828,6 +830,23 @@ void cls_thaw(eng *db)
         pthread_rwlock_unlock(&db->cls_rw);
 }
 
+#define CLS_LATER 1          /* switch_locked: placements in flight held the history; ask again later */
+#define CLS_SWITCH_WAIT_MS 5 /* how long a switch waits for them, holding flush_lock and new placements back */
+#define CLS_RETRY_US 20000   /* between two tries of a switch that must happen (an observation, the test hook) */
+
+/* cls_rw for writing, or CLS_LATER after CLS_SWITCH_WAIT_MS. The caller holds flush_lock, and the lock prefers
+ * writers: waiting out a large insert (23.7 s for 1 G rows) would stop every flush, large insert and replace that
+ * long. A switch only moves future rows to better partitions, so it can wait instead. */
+static int switch_wrlock(eng *db)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    t.tv_nsec += CLS_SWITCH_WAIT_MS * 1000000L;
+    if (t.tv_nsec >= 1000000000L)
+        t.tv_sec++, t.tv_nsec -= 1000000000L;
+    return pthread_rwlock_timedwrlock(&db->cls_rw, &t) == 0 ? 0 : CLS_LATER;
+}
+
 typedef struct sw {
     uint32_t s;
     int cls;
@@ -846,7 +865,10 @@ static int switch_locked(eng *db, const sw *w, size_t n)
     cls_rec *r = malloc(n * sizeof *r);
     if (!r)
         return TSDB_ERR_NOMEM;
-    pthread_rwlock_wrlock(&db->cls_rw);
+    if (switch_wrlock(db)) {
+        free(r);
+        return CLS_LATER;
+    }
     pthread_mutex_lock(&db->class_lock);
     size_t k = 0;
     int64_t far = sat_add(eng_now_ms(db), CLS_FAR_MS);
@@ -865,6 +887,9 @@ static int switch_locked(eng *db, const sw *w, size_t n)
         newest = MAX(newest, mt_newest(db->active, s));
         pthread_mutex_unlock(&db->buf_lock);
         int64_t T = newest == INT64_MIN ? INT64_MIN : sat_mul(floor_div(newest, db->partition_ms) + 1, db->partition_ms);
+        /* rows of dropped partitions are no longer listed, but their removal may not be durable yet: a power loss
+         * brings them back, and they must still lie before T */
+        T = MAX(T, db->cls_dropped_end);
         if (T == INT64_MAX)
             continue; /* rows at the end of time: nothing can come after them */
         if (b & CLS_HIST) {
@@ -894,6 +919,21 @@ static int switch_locked(eng *db, const sw *w, size_t n)
     return rc;
 }
 
+/* A switch that must happen: tried until placements let it in, without holding flush_lock between tries. */
+static int switch_retry(eng *db, const sw *w, size_t n)
+{
+    for (;;) {
+        pthread_mutex_lock(&db->flush_lock);
+        int rc = switch_locked(db, w, n);
+        pthread_mutex_unlock(&db->flush_lock);
+        if (rc != CLS_LATER)
+            return rc;
+        if (atomic_load(&db->stop))
+            return 0; /* closing: the series is measured again after the next open */
+        usleep(CLS_RETRY_US);
+    }
+}
+
 uint64_t cls_gen_now(eng *db) { return atomic_load_explicit(&db->cls_gen, memory_order_acquire); }
 
 int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at)
@@ -902,11 +942,8 @@ int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at)
         return TSDB_ERR_READONLY;
     if (!db->cls_on || cls < 0 || cls >= PART_CLASSES || series >= eng_series_count(db))
         return TSDB_ERR_INVALID;
-    pthread_mutex_lock(&db->flush_lock);
     sw w = {series, cls, at};
-    int rc = switch_locked(db, &w, 1);
-    pthread_mutex_unlock(&db->flush_lock);
-    return rc;
+    return switch_retry(db, &w, 1);
 }
 
 int cls_flush_guard(eng *db, const memtable *m)
@@ -935,7 +972,7 @@ int cls_flush_guard(eng *db, const memtable *m)
     }
     int rc = switch_locked(db, w, k);
     free(w);
-    return rc;
+    return rc == CLS_LATER ? 0 : rc; /* placements in flight: the guard asks again at the next flush */
 }
 
 /* Where the series' newest class begins (INT64_MIN when it never switched). */
@@ -982,11 +1019,8 @@ int cls_observe(eng *db, part *p)
         w[k++] = (sw){s, to, NULL};
     }
     int rc = 0;
-    if (k) {
-        pthread_mutex_lock(&db->flush_lock);
-        rc = switch_locked(db, w, k);
-        pthread_mutex_unlock(&db->flush_lock);
-    }
+    if (k)
+        rc = switch_retry(db, w, k);
     free(w);
     return rc;
 }
@@ -1020,6 +1054,8 @@ static int check_granule(eng *db, codec_ctx *cc, int64_t *ts, const part *p, con
     for (uint32_t r = 0; r < g->count; r++) {
         if (ts[r] < g->ts_min || ts[r] > g->ts_max)
             return check_fail(p, s, "a row outside its granule's bounds", g->ts_min, ts[r]);
+        if (r && ts[r] <= ts[r - 1]) /* the skip below relies on ascending rows: damage must not hide one */
+            return check_fail(p, s, "rows out of time order", ts[r - 1], ts[r]);
         if (ts[r] < fhi || fhi == INT64_MAX)
             continue;
         if ((c = cls_at(db, s, ts[r], &flo, &fhi)) != pc)

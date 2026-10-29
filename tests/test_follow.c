@@ -12,6 +12,7 @@
 
 #include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -331,6 +332,84 @@ static void test_class_follow(const char *base)
     printf("  a follower reads a class switch with the parts that use it\n");
 }
 
+static void *republish(void *arg)
+{
+    usleep(100000);
+    uint32_t other;
+    CHECK(tsdb_series(arg, "other", &other) == 0 && tsdb_append(arg, other, T0, 1.0f) == 0 && tsdb_flush(arg) == 0);
+    return NULL;
+}
+
+/* A reader opening on a MANIFEST older than CLASSES: after that MANIFEST, a delete merged a series' newest rows
+ * away, and a switch then gave its class from a T below rows the old MANIFEST still lists (in parts of the old
+ * class). The open check of rows against classes failed the reader's open; it reads MANIFEST again now, and a
+ * reader that opens on a damaged database (test_classes: opencheck) still fails, once MANIFEST stays the same. */
+static void test_stale_manifest_classes(const char *base)
+{
+    char dir[512], mpath[600];
+    snprintf(dir, sizeof dir, "%s/tsdb-follow-stale-%d", base, (int)getpid());
+    snprintf(mpath, sizeof mpath, "%s/MANIFEST", dir);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    o.wal_max_batch_rows = 16; /* the rows go straight to parts */
+    tsdb *w, *r = NULL;
+    uint32_t id;
+    if (tsdb_open(dir, &o, &w) != 0) {
+        CHECK(!"open writer");
+        return;
+    }
+    enum { N = 3 * 1440 }; /* three days at a minute */
+    static int64_t ts[N];
+    static float v[N];
+    for (int i = 0; i < N; i++)
+        ts[i] = T0 + (int64_t)i * 60000, v[i] = (float)i;
+    CHECK(tsdb_series(w, "s", &id) == 0 && tsdb_test_class_switch(w, id, 0, NULL) == 0);
+    CHECK(tsdb_insert_series(w, id, ts, v, N) == 0 && tsdb_flush(w) == 0);
+    /* the MANIFEST a lagging reader sees */
+    char *old = NULL;
+    size_t olen = 0;
+    FILE *f = fopen(mpath, "rb");
+    CHECK(f != NULL);
+    if (f) {
+        old = malloc(1 << 20);
+        olen = fread(old, 1, 1 << 20, f);
+        fclose(f);
+    }
+    int64_t d1 = (T0 / 86400000 + 1) * 86400000;
+    CHECK(tsdb_delete_range(w, id, d1, INT64_MAX) == 0 && tsdb_optimize(w) == 0);
+    CHECK(tsdb_test_class_switch(w, id, 3, NULL) == 0); /* from d1: the newest row left is before it */
+    f = fopen(mpath, "r+b");
+    CHECK(f != NULL && olen > 0);
+    if (f) {
+        CHECK(fwrite(old, 1, olen, f) == olen && ftruncate(fileno(f), (off_t)olen) == 0);
+        fclose(f);
+    }
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1;
+    pthread_t th; /* the writer's next MANIFEST, a moment after the reader read the old one */
+    CHECK(pthread_create(&th, NULL, republish, w) == 0);
+    int rc = tsdb_open(dir, &ro, &r);
+    pthread_join(th, NULL);
+    if (rc)
+        fprintf(stderr, "a reader on a MANIFEST older than CLASSES: open failed (%d)\n", rc);
+    CHECK(rc == 0);
+    if (r) {
+        tsdb_points p;
+        CHECK(tsdb_query_points(r, id, INT64_MIN, INT64_MAX, &p) == 0 && p.n == (size_t)(d1 - T0) / 60000 + 1);
+        tsdb_points_free(&p);
+        tsdb_close(r);
+    }
+    free(old);
+    tsdb_close(w);
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    printf("  a reader opens on a MANIFEST older than a class switch\n");
+}
+
 /* The library's fstat calls land here (the test binary's definition wins over
  * libc's): the next one can report a file larger than it is, which is what a
  * reader sees when a MANIFEST shrinks while it is rewritten in place. */
@@ -482,6 +561,7 @@ int main(int argc, char **argv)
     test_typed_follow(argc > 1 ? argv[1] : "/tmp");
     test_torn_manifest(argc > 1 ? argv[1] : "/tmp");
     test_class_follow(argc > 1 ? argv[1] : "/tmp");
+    test_stale_manifest_classes(argc > 1 ? argv[1] : "/tmp");
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

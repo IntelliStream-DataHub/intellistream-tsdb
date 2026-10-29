@@ -452,6 +452,15 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
             usleep(10000);
         if (rc == 0) /* CLASSES was read again after MANIFEST: its records come before the parts that use them */
             rc = cls_check_parts(db);
+        /* CLASSES can also be newer than this MANIFEST: a merge after it may have deleted a series' newest rows,
+         * and a switch then put its class change below rows this MANIFEST still lists. The writer published the
+         * merge's MANIFEST before that switch, so a MANIFEST read again passes; on damage it stays the same. */
+        for (int i = 0; rc == TSDB_ERR_CORRUPT && i < 100; i++) {
+            uint64_t seen = db->follow_version;
+            usleep(10000);
+            if ((rc = follow_refresh(db)) == 0)
+                rc = db->follow_version != seen ? cls_check_parts(db) : TSDB_ERR_CORRUPT;
+        }
         if (rc)
             goto fail;
     } else {

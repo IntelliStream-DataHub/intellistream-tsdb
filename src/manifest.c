@@ -97,6 +97,11 @@ void db_retire_locked(eng *db, part *p)
 {
     char retired[sizeof p->name + sizeof RETIRED_PREFIX];
     snprintf(retired, sizeof retired, RETIRED_PREFIX "%s", p->name);
+    if (p->dropped) { /* no merged part covers its rows: see cls_dropped_end */
+        int64_t lo, end;
+        partition_range(db, p->partition, &lo, &end);
+        db->cls_dropped_end = MAX(db->cls_dropped_end, end);
+    }
     if (db->opt.obsolete_part_lifetime_s <= 0) {
         atomic_store(&p->obsolete, true); /* deleted when the last reference goes */
     } else if (renameat(db->dirfd, p->name, db->dirfd, retired) != 0) {
