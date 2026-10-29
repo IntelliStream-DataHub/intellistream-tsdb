@@ -1440,9 +1440,36 @@ static void test_value_codec_option(const char *base)
     }
 }
 
+/* The generated sensor streams (tools/datasets.h): timestamps strictly increase for every kind, so the
+ * jitter stays below half the interval, and the kinds documented as regular have none. */
+static void test_dataset_clock(void)
+{
+    for (int k = 0; k < DS_KINDS; k++) {
+        CHECK(2 * (int64_t)ds_info[k].jitter_ms < ds_info[k].step_ms);
+        ds_state st;
+        ds_init(&st, (ds_kind)k, 3, 1704067200000);
+        int64_t prev = INT64_MIN, ts, lo = INT64_MAX, hi = INT64_MIN;
+        double v;
+        for (int i = 0; i < 20000; i++) {
+            ds_next_f64(&st, &ts, &v);
+            CHECK(ts > prev);
+            prev = ts;
+            int64_t off = ts - (1704067200000 + (int64_t)i * ds_info[k].step_ms);
+            lo = off < lo ? off : lo, hi = off > hi ? off : hi;
+        }
+        int j = ds_info[k].jitter_ms;
+        CHECK(lo >= -j && hi <= j);
+        if (j)
+            CHECK(lo < 0 && hi > 0); /* the jitter is really there */
+        else
+            CHECK(lo == 0 && hi == 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
+    test_dataset_clock();
     for (effort = CODEC_FAST; effort <= CODEC_MERGE; effort++) {
         test_codecs();
         test_f64_sample();

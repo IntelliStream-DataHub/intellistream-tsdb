@@ -149,8 +149,11 @@ of the whole table takes 0.17 seconds instead of 59.
 
 The test data behaves like real industrial sensors, not random numbers: disk
 temperatures that creep by 0.1 °C, CPU temperatures with spikes, tanks that
-fill and drain, a fast vibration sensor, pipeline flows with shutdowns. Every
-answer was checked against tsdb's. All the numbers and how to run the
+fill and drain, a fast vibration sensor, pipeline flows with shutdowns. The
+clocks are not perfect either: most sensors report up to 5 to 50 ms off their
+schedule. Two are exactly regular on purpose: the disk temperature (to measure a
+constant interval) and the vibration sensor (1 ms apart, which leaves no room
+for jitter). Every answer was checked against tsdb's. All the numbers and how to run the
 benchmarks yourself are in [AGENTS.md](AGENTS.md#benchmarks).
 
 ## How the compression works

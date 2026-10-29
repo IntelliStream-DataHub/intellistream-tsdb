@@ -121,7 +121,7 @@ def w_ts(s, a, b, bk):
             "GROUP BY bb ORDER BY bb")
 
 # ---- QuestDB: no ARRAY JOIN / unnest, so a segment is split at most once (true for this data: the longest step
-# is 60 s + jitter, buckets are an hour or longer, window buckets 300 samples or more)
+# is 60 s (hdd_temp has no jitter; the largest jitter is 50 ms), buckets are an hour or longer, window buckets 300 samples or more)
 def split_once(I, area1, area2, key="series, ", group=False):
     """Rows (key, b, a, c) of the segments in seg (columns lo, hi, ...): the piece in lo's bucket and the piece in hi's.
     group: an explicit GROUP BY (QuestDB groups by the non-aggregate columns by itself), and no "WHERE c > 0" (IoTDB

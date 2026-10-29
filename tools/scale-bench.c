@@ -21,7 +21,7 @@
  * or against tsdbd (--port, one connection per thread), and with --sql DIR
  * writes the same queries, one per line, to DIR/<class>.sql for
  * clickhouse-benchmark. Windows are [T0 + i s - 0.5 s, T0 + (i + n) s - 0.5 s),
- * which holds exactly n samples despite the clock jitter of some kinds.
+ * which holds exactly n samples despite the clock jitter of some kinds (at most 50 ms, datasets.h).
  * Queries over many series run one query per series on --threads threads.
  */
 #include "../client/tsdb_client.h"

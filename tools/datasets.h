@@ -1,6 +1,14 @@
 /*
  * Synthetic but physically plausible sensor streams, shared by the benchmarks.
  * Each kind has its own sample interval, clock jitter and value resolution.
+ *
+ * Jitter is uniform in [-jitter_ms, +jitter_ms] around the grid t0 + i step, like a collector whose polls
+ * wait for a busy device; |jitter| < step/2 keeps timestamps strictly increasing (no duplicates, no
+ * reordering; tests/test_types.c checks it). Two kinds are regular on purpose: hdd_temp, so that one series
+ * measures the constant-interval case (DoubleDelta, about 0.03 bits a row), and vibration, whose 1 ms
+ * interval at millisecond resolution leaves no room for jitter without collisions.
+ *   hdd_temp 60 s +-0    cpu_temp 1 s +-20 ms   tank_bar, tank_psi 10 s +-50 ms   vibration 1 ms +-0
+ *   flow_rate, flow_total 1 s +-5 ms             random 1 s +-5 ms
  */
 #ifndef TSDB_TOOLS_DATASETS_H
 #define TSDB_TOOLS_DATASETS_H
@@ -26,8 +34,8 @@ static const struct {
     int64_t step_ms;
     int jitter_ms;
 } ds_info[DS_KINDS] = {
-    {"hdd_temp", 60000, 0},  {"cpu_temp", 1000, 20}, {"tank_bar", 10000, 0}, {"tank_psi", 10000, 0},
-    {"vibration", 1, 0},     {"flow_rate", 1000, 5}, {"flow_total", 1000, 5}, {"random", 1000, 0},
+    {"hdd_temp", 60000, 0},  {"cpu_temp", 1000, 20}, {"tank_bar", 10000, 50}, {"tank_psi", 10000, 50},
+    {"vibration", 1, 0},     {"flow_rate", 1000, 5},  {"flow_total", 1000, 5}, {"random", 1000, 5},
 };
 
 typedef struct ds_state {

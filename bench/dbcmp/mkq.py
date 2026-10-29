@@ -245,7 +245,7 @@ def influxql_full(n):
     if n == 0:
         w = "" if SET is None else " WHERE (" + " OR ".join(f'"series" = {chr(39)}{x}{chr(39)}' for x in SET) + ")"
         return f'SELECT count(value), sum(value), min(value), max(value) FROM sensors{w} GROUP BY "series"'
-    # GROUP BY time() needs a time range (the first jittered sample is 5 ms before 2024) and a
+    # GROUP BY time() needs a time range (the first jittered sample is up to 50 ms before 2024) and a
     # constant interval: one statement per step, all in one request
     return "; ".join(
         f"SELECT count(value), sum(value), min(value), max(value) FROM sensors WHERE ({' OR '.join(f'{chr(34)}series{chr(34)} = {chr(39)}{x}{chr(39)}' for x in sset() if x % 7 in k)}) "
@@ -299,7 +299,7 @@ def prom_full(n, vm=False):
         sel = "sensors" if SET is None else 'sensors{series=~"' + "|".join(str(x) for x in SET) + '"}'
         return prom_get("/api/v1/query", query=prom_aggs(sel, PROM_HI - PROM_LO, vm=vm), time=psec(PROM_HI - 1))
     # query_range evaluates every step, empty or not, so each step group spans only its own data
-    # (spec.py's samples, with a margin for the jitter) instead of the two years
+    # (spec.py's samples, with a margin of 1 s for the jitter, which is at most 50 ms) instead of the two years
     reqs = []
     for st, k in groups().items():
         w = st * n

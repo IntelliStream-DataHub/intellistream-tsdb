@@ -633,7 +633,9 @@ alone several); run it under `tmux` or `nohup`.
   or not, where the others take fixed bounds or none. Its JSON answers are larger than the others'
   (buckets of 60 samples: about 11 MB per series). VictoriaMetrics gets MetricsQL's `aggr_over_time`, which
   computes count, sum, min and max in one pass, and up to 30,000 points per request (its default limit).
-- **Data shape.** Every answer is checked against tsdb's, but only on this data, which has no duplicate
+- **Data shape.** The timestamps come from `tools/datasets.h`: every kind has its own interval and clock jitter
+  (hdd_temp 60 s and vibration 1 ms exactly regular, cpu_temp 1 s +-20 ms, tank_bar and tank_psi 10 s +-50 ms,
+  flow_rate, flow_total and random 1 s +-5 ms), so no two timestamps of a series collide. Every answer is checked against tsdb's, but only on this data, which has no duplicate
   timestamps, no nulls and no gap longer than the narrowest bucket (`prep.sh` checks it with `shape` and stops
   otherwise). Some TWA recipes (QuestDB's `twap()` with `SAMPLE BY`, the segment recipes of `rel.py`) would
   be wrong on gaps that span buckets, and last-write-wins is not exercised for any system.

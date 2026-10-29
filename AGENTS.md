@@ -283,6 +283,24 @@ cgroup, so `nice` does not keep your work out of its way.
 The README keeps one comparison table; the full results live here. Rerun what
 a change could move, on a quiet machine, and update the numbers.
 
+The generated data (`tools/datasets.h`) has seven sensor kinds, each with its own sample interval and clock jitter
+(uniform, plus or minus the value, so timestamps stay strictly increasing: the jitter is below half the interval,
+which `tests/test_types.c` checks):
+
+| kind | interval | jitter |
+|---|---:|---:|
+| `hdd_temp` | 60 s | none: regular on purpose, the one constant-interval series (DoubleDelta, about 0.03 bits per row) |
+| `cpu_temp` | 1 s | 20 ms |
+| `tank_bar`, `tank_psi` | 10 s | 50 ms |
+| `vibration` | 1 ms | none: at millisecond resolution a 1 ms clock has no room for jitter without duplicate or reordered timestamps |
+| `flow_rate`, `flow_total` | 1 s | 5 ms |
+| `random` | 1 s | 5 ms |
+
+The real hydraulic rig data (`bench/hydraulic`) has no timestamps; it gets regular generated ones. Before the jitter
+change of 2026-10-29 (user's decision) `tank_bar`, `tank_psi` and `random` were regular as well, so the size and
+timing numbers below that include timestamps (bytes per row, the mixed data sets) predate it; the value-only codec
+tables do not depend on it. The next full run measures the jittered data.
+
 | tool | measures |
 |---|---|
 | `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed; `--file F` for raw float32 values from a file |
