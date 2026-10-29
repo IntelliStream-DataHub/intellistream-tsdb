@@ -467,6 +467,232 @@ static void one_intent(const char *dir, const char *tmp, const char *fin)
     CHECK(existed || access(path, F_OK) != 0);
 }
 
+/* --------------------------------------------------------------- the packed granule index */
+
+/* the offset of field f's descriptor (its width byte) in index b; GF_N: the end of the descriptors */
+static size_t desc_at(const uint8_t *b, int f)
+{
+    size_t pos = 0;
+    while (b[pos++] & 0x80)
+        ;
+    for (int k = 0; k < f; k++) {
+        uint8_t sk = b[pos + 1];
+        pos += 2;
+        while (b[pos++] & 0x80)
+            ;
+        if (sk & 128)
+            while (b[pos++] & 0x80)
+                ;
+    }
+    return pos;
+}
+
+static int ix_loads; /* indexes accepted and read entry by entry */
+
+/* gix_parse of ix[0..len) for n entries, from a buffer of exactly len + 8 bytes (ASan sees anything beyond);
+   when it is accepted, every entry is read through every accessor */
+static int parse_copy(const uint8_t *ix, size_t len, uint32_t n)
+{
+    uint8_t *b = malloc(len + 8);
+    memcpy(b, ix, len);
+    memset(b + len, 0x5a, 8);
+    part pp;
+    memset(&pp, 0, sizeof pp);
+    int rc = gix_parse(b, len, n, &pp.ix);
+    if (rc == 0) {
+        ix_loads++;
+        pp.ng = n;
+        for (uint32_t i = 0; i < n; i++) {
+            granule g;
+            gx_load(&pp, i, GW_ALL, &g);
+            uint32_t a, e;
+            gix_run(&pp.ix, gx_series(&pp, i), &a, &e);
+            CHECK(a <= i && i < e && e <= n);
+        }
+    } else {
+        CHECK(rc == TSDB_ERR_CORRUPT);
+    }
+    free(b);
+    return rc;
+}
+
+/* the index of n entries over 3 series of float32 rows, as a part writer would make it */
+static uint8_t *ix_build(uint32_t n, size_t *len)
+{
+    granule *g = calloc(n, sizeof *g);
+    float v[64];
+    int64_t ts[64];
+    uint64_t off = sizeof(part_header);
+    for (uint32_t k = 0; k < n; k++) {
+        for (int i = 0; i < 64; i++) {
+            ts[i] = 1700000000000LL + (int64_t)(k * 64 + (uint32_t)i) * 1000 + (i * 7919 % 13);
+            v[i] = (float)((k * 31 + (uint32_t)i * 17) % 101) / 4;
+        }
+        granule_stats(TSDB_FLOAT32, v, 64, &g[k]);
+        granule_twa(TSDB_FLOAT32, ts, v, 64, &g[k]);
+        g[k].series = 3 + 5 * (k * 3 / n);
+        g[k].count = 64;
+        g[k].ts_min = ts[0];
+        g[k].ts_max = ts[63];
+        g[k].off = off;
+        g[k].ts_len = 40 + k % 7;
+        g[k].val_len = 90 + k * 13 % 29;
+        g[k].crc = 0x9e3779b9u * (k + 1);
+        off += g[k].ts_len + g[k].val_len;
+    }
+    uint8_t *ix = NULL;
+    OK(gix_encode(g, n, &ix, len));
+    free(g);
+    return ix;
+}
+
+/* A damaged index whose hash was recomputed: every inconsistency is TSDB_ERR_CORRUPT, and an index that parses
+   (mutated entry bits are just other values) never makes a reader load outside it plus the 8 bytes after it. */
+static void test_index_damage(const char *base)
+{
+    static const uint32_t ns[] = {1, 2, 3, 5, 15, 40};
+    int padded = 0;
+    for (size_t t = 0; t < sizeof ns / sizeof *ns; t++) {
+        uint32_t n = ns[t];
+        size_t len;
+        uint8_t *ix = ix_build(n, &len);
+        uint8_t *m = malloc(len + 16);
+        CHECK(parse_copy(ix, len, n) == 0);
+        /* lengths: not a multiple of 8, cut short at every 8 bytes, 8 bytes of zeros more, another count */
+        CHECK(parse_copy(ix, len - 4, n) == TSDB_ERR_CORRUPT);
+        for (size_t k = 0; k < len; k += 8)
+            CHECK(parse_copy(ix, k, n) == TSDB_ERR_CORRUPT);
+        memcpy(m, ix, len);
+        memset(m + len, 0, 8);
+        CHECK(parse_copy(m, len + 8, n) == TSDB_ERR_CORRUPT);
+        CHECK(parse_copy(ix, len, n - 1) == TSDB_ERR_CORRUPT);
+        (void)parse_copy(ix, len, n + 1); /* fits only where the zero padding holds a whole entry */
+        CHECK(parse_copy(ix, len, 0) == TSDB_ERR_CORRUPT);
+        /* nruns: more than n, 0 */
+        memcpy(m, ix, len);
+        uint8_t nr = m[0];
+        m[0] = (uint8_t)(n + 1);
+        if (nr < 0x80 && n + 1 < 0x80)
+            CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        m[0] = 0;
+        CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        /* field descriptors */
+        size_t dc = desc_at(ix, GF_COUNT), dm = desc_at(ix, GF_MIN), dh = desc_at(ix, GF_ISUMHI);
+        memcpy(m, ix, len);
+        m[dc] = 65; /* wider than 64 bits */
+        CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        memcpy(m, ix, len);
+        m[dc] = 64, m[dc + 1] = (uint8_t)((m[dc + 1] & ~63) | 1); /* shift + width beyond 64 */
+        CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        memcpy(m, ix, len);
+        m[dc + 1] |= 64; /* a float32 kind on an integer field */
+        CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        memcpy(m, ix, len);
+        m[dm + 1] |= 64 | 128; /* a float32 field with a slope */
+        CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        memcpy(m, ix, len);
+        m[dm + 1] = (uint8_t)((m[dm + 1] & ~63) | 64 | 20), m[dm] = 13; /* a float32 field beyond 32 bits */
+        CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        CHECK(ix[dh] == 0); /* float32 rows: the upper word of the sums takes no bits */
+        memcpy(m, ix, len);
+        m[dh + 1] = (uint8_t)((m[dh + 1] & ~63) | 3); /* a shift without bits */
+        CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        for (int f = 0; f < GF_N; f++) { /* every width one more and one less: refused or read in bounds */
+            size_t d = desc_at(ix, f);
+            for (int delta = -1; delta <= 1; delta += 2) {
+                memcpy(m, ix, len);
+                m[d] = (uint8_t)(m[d] + delta);
+                (void)parse_copy(m, len, n);
+            }
+        }
+        /* the runs: out of order, repeated, not starting at entry 0, a start beyond the entries */
+        size_t r = (desc_at(ix, GF_N) + 3) & ~(size_t)3;
+        uint32_t ser[3], st[3];
+        memcpy(ser, ix + r, 4 * MIN(n, 3));
+        if (n >= 3) {
+            CHECK(ix[0] == 3);
+            memcpy(st, ix + r + 12, 12);
+            memcpy(m, ix, len);
+            memcpy(m + r, &ser[1], 4), memcpy(m + r + 4, &ser[0], 4);
+            CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+            memcpy(m, ix, len);
+            memcpy(m + r + 4, &ser[0], 4);
+            CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+            memcpy(m, ix, len);
+            uint32_t one = 1;
+            memcpy(m + r + 12, &one, 4);
+            CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+            memcpy(m, ix, len);
+            memcpy(m + r + 20, &n, 4);
+            CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+            memcpy(m, ix, len);
+            memcpy(m + r + 16, &st[2], 4); /* two runs starting at the same entry */
+            CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+        }
+        /* padding: between the descriptors and the runs, and after the entries */
+        for (size_t p = desc_at(ix, GF_N); p < r; p++) {
+            memcpy(m, ix, len);
+            m[p] = 1;
+            CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+            padded++;
+        }
+        part pp;
+        memset(&pp, 0, sizeof pp);
+        memcpy(m, ix, len);
+        OK(gix_parse(m, len, n, &pp.ix));
+        size_t end = (size_t)(pp.ix.e - m) + (size_t)n * pp.ix.stride;
+        for (size_t p = end; p < len; p++) {
+            memcpy(m, ix, len);
+            m[p] = 0x80;
+            CHECK(parse_copy(m, len, n) == TSDB_ERR_CORRUPT);
+            padded++;
+        }
+        /* every byte before the entries, flipped in a few ways: refused, or read in bounds */
+        static const uint8_t x[] = {0x01, 0x02, 0x10, 0x40, 0x80, 0xff};
+        for (size_t p = 0; p < (size_t)(pp.ix.e - m); p++)
+            for (size_t k = 0; k < sizeof x; k++) {
+                memcpy(m, ix, len);
+                m[p] ^= x[k];
+                (void)parse_copy(m, len, n);
+            }
+        free(m);
+        free(ix);
+    }
+    CHECK(padded > 0);
+    CHECK(ix_loads > 0);
+
+    /* the same in a part on disk, its hash recomputed: the open refuses it */
+    snprintf(part_dir, sizeof part_dir, "%s/crafted_index", base);
+    char name[256], path[1024];
+    for (int k = 0; k < 6; k++) {
+        make_db(part_dir);
+        CHECK(find_part(part_dir, name, sizeof name));
+        snprintf(path, sizeof path, "%s/%s", part_dir, name);
+        size_t len;
+        uint8_t *buf = (uint8_t *)slurp(path, &len);
+        part_footer f;
+        memcpy(&f, buf + len - sizeof f, sizeof f);
+        uint8_t *ix = buf + f.index_off;
+        switch (k) {
+        case 0: f.index_len -= 8; break;                      /* the index's last 8 bytes taken as a trailer */
+        case 1: f.index_off -= 8, f.index_len += 8; break;    /* starting 8 bytes early, in the last block */
+        case 2: f.index_off += 4, f.index_len -= 8; break;    /* not 8-byte aligned */
+        case 3: f.ngranules += 1; break;                      /* an entry more than the index holds */
+        case 4: ix[desc_at(ix, GF_OFF)] = 65; break;          /* a field wider than 64 bits */
+        default: f.index_len = 0, f.ngranules = 0; break;     /* no index at all, the bytes as a trailer */
+        }
+        memcpy(buf + len - sizeof f, &f, sizeof f);
+        spit(path, buf, len);
+        free(buf);
+        rehash_part(path);
+        if (!in_child(open_refused, part_dir)) {
+            fprintf(stderr, "crafted index case %d was not refused cleanly\n", k);
+            failures++;
+        }
+    }
+    rm_rf(part_dir);
+}
+
 static void test_intents(const char *base)
 {
     char dir[512], path[1024];
@@ -948,6 +1174,7 @@ int main(int argc, char **argv)
     }
     test_manifest(base);
     test_parts(base);
+    test_index_damage(base);
     test_intents(base);
     test_dict(base);
     test_extremes(base);

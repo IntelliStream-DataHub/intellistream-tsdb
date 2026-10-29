@@ -8,7 +8,7 @@
  * kernel up to it, this encodes the sensor datasets, the type-bench streams and
  * edge cases (NaN payloads, infinities, -0, denormals, nulls, int64 extremes,
  * odd lengths) with each codec and the block layer, decodes them, folds them
- * into aggregates and granule statistics, and compares everything, byte for
+ * into aggregates, granule statistics and the packed granule index, and compares everything, byte for
  * byte, with the baseline. Decoded values must also equal the input.
  *
  * In a build without CPU levels (the default -march=native `make`) the codecs
@@ -803,6 +803,35 @@ static void run(rec *r, codec_ctx *c)
                 snprintf(what, sizeof what, "agg_fold_hint %zu%s", m, sp ? " spread" : "");
                 put(r, what, x->name, &a, sizeof a);
             }
+        }
+        /* the packed granule index of the input's granules (of 64, 1000 and all rows), as a part writer makes
+         * it from granule_stats and granule_twa: the bytes a part stores, identical at every level */
+        for (int gk = 0; gk < 3 && x->n; gk++) {
+            static const size_t grs[] = {64, 1000, GR};
+            size_t gr = grs[gk], ng = (x->n + gr - 1) / gr;
+            granule *gi = calloc(ng, sizeof *gi);
+            uint64_t off = sizeof(part_header);
+            for (size_t k = 0; k < ng; k++) {
+                size_t a = k * gr, m = MIN(gr, x->n - a);
+                granule_stats(x->type, (const uint8_t *)x->v + a * w, m, &gi[k]);
+                granule_twa(x->type, x->ts + a, (const uint8_t *)x->v + a * w, m, &gi[k]);
+                gi[k].series = (uint32_t)(k / 3);
+                gi[k].count = (uint32_t)m;
+                gi[k].ts_min = x->ts[a];
+                gi[k].ts_max = x->ts[a + m - 1];
+                gi[k].off = off;
+                gi[k].ts_len = (uint32_t)(m / 2 + 9);
+                gi[k].val_len = (uint32_t)(m + 17);
+                gi[k].crc = (uint32_t)xxh64((const uint8_t *)x->v + a * w, m * w, 3);
+                off += gi[k].ts_len + gi[k].val_len;
+            }
+            uint8_t *ix = NULL;
+            size_t ilen = 0;
+            CHECK(gix_encode(gi, ng, &ix, &ilen) == 0);
+            snprintf(what, sizeof what, "granule index %zu", gr);
+            put(r, what, x->name, ix, ilen);
+            free(ix);
+            free(gi);
         }
         /* TWA areas and LTTB picks (simd.c): gaps beyond 2^55 (dt rounds when converted), large time
          * offsets, every short prefix (the lanes' tails), equal areas (cy == ay: the area follows y alone) */
