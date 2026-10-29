@@ -32,6 +32,8 @@ job_of() { local p=$1 g f i; for i in $(seq 1 30); do [ -n "$p" ] && [ "$p" -gt 
 ino=$(stat -c %i "$L" 2>/dev/null)
 holders=$(grep -E ":$ino " /proc/locks 2>/dev/null | grep -v -- '->' | awk '{print $(NF-3)}' | sort -u)
 for h in $holders; do
+    # a step that took the lock for a moment may be gone by now: not an orphan
+    if ! kill -0 "$h" 2>/dev/null; then echo "LOCK     holder pid $h exited since (a short step)"; continue; fi
     echo "LOCK     holder pid $h ($(job_of $h)) $(ps -o etime=,args= -p $h 2>/dev/null | cut -c1-100)"
 done
 
