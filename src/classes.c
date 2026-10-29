@@ -698,15 +698,9 @@ int cls_classify_memtable(eng *db, const memtable *m)
 /* Newest timestamp of series s in part p, or INT64_MIN. */
 static int64_t part_newest(const part *p, uint32_t s)
 {
-    uint32_t a = 0, z = p->ng; /* first granule of a later series */
-    while (a < z) {
-        uint32_t mid = a + (z - a) / 2;
-        if (p->g[mid].series <= s)
-            a = mid + 1;
-        else
-            z = mid;
-    }
-    return a > 0 && p->g[a - 1].series == s ? p->g[a - 1].ts_max : INT64_MIN;
+    uint32_t a, z;
+    gix_run(&p->ix, s, &a, &z);
+    return a < z ? gx_ts_max(p, z - 1) : INT64_MIN;
 }
 
 static int64_t mt_newest(const memtable *m, uint32_t s)
@@ -996,12 +990,12 @@ int cls_observe(eng *db, part *p)
     double len = (double)hi - (double)lo;
     sw *w = NULL;
     size_t k = 0;
-    for (uint32_t i = 0, j; i < p->ng; i = j) {
-        uint32_t s = p->g[i].series;
+    for (uint32_t r = 0; r < p->ix.nruns; r++) {
+        uint32_t s = p->ix.rser[r], i = p->ix.rstart[r], j = r + 1 < p->ix.nruns ? p->ix.rstart[r + 1] : p->ng;
         size_t n = 0;
-        for (j = i; j < p->ng && p->g[j].series == s; j++)
-            n += p->g[j].count;
-        int64_t tmin = p->g[i].ts_min, tmax = p->g[j - 1].ts_max;
+        for (uint32_t x = i; x < j; x++)
+            n += gx_count(p, x);
+        int64_t tmin = gx_ts_min(p, i), tmax = gx_ts_max(p, j - 1);
         double rate = (double)tmax - (double)tmin >= len / 2 ? (double)n / len : rate_of(n, tmin, tmax);
         if (rate < 0)
             continue; /* no opinion */
@@ -1075,20 +1069,17 @@ int cls_check_parts(eng *db)
         int pc = partition_class(db, p->partition);
         int64_t lo, hi;
         partition_range(db, p->partition, &lo, &hi);
-        for (uint32_t i = 0, j; i < p->ng && rc == 0; i = j) {
-            uint32_t s = p->g[i].series;
-            if (i && s < p->g[i - 1].series) {
-                rc = check_fail(p, s, "series out of order", p->g[i - 1].series, s);
-                break;
-            }
-            for (j = i; j < p->ng && p->g[j].series == s; j++)
-                if (p->g[j].ts_min > p->g[j].ts_max || (j > i && p->g[j].ts_min <= p->g[j - 1].ts_max)) {
-                    rc = check_fail(p, s, "rows out of time order", p->g[j].ts_min, p->g[j].ts_max);
+        /* the runs are in series order (gix_parse checks it) */
+        for (uint32_t r = 0; r < p->ix.nruns && rc == 0; r++) {
+            uint32_t s = p->ix.rser[r], i = p->ix.rstart[r], j = r + 1 < p->ix.nruns ? p->ix.rstart[r + 1] : p->ng;
+            for (uint32_t x = i; x < j; x++)
+                if (gx_ts_min(p, x) > gx_ts_max(p, x) || (x > i && gx_ts_min(p, x) <= gx_ts_max(p, x - 1))) {
+                    rc = check_fail(p, s, "rows out of time order", gx_ts_min(p, x), gx_ts_max(p, x));
                     break;
                 }
             if (rc)
                 break;
-            int64_t tmin = p->g[i].ts_min, tmax = p->g[j - 1].ts_max;
+            int64_t tmin = gx_ts_min(p, i), tmax = gx_ts_max(p, j - 1);
             if (tmin < lo || (hi != INT64_MAX && tmax >= hi)) {
                 rc = check_fail(p, s, "rows outside the partition", tmin, tmax);
                 break;
@@ -1106,8 +1097,12 @@ int cls_check_parts(eng *db)
                 if (!(ts = malloc(tscap * sizeof *ts)))
                     rc = TSDB_ERR_NOMEM, tscap = 0;
             }
-            for (uint32_t g = i; g < j && rc == 0; g++) /* granule_read refuses a count above p->grows */
-                rc = check_granule(db, cc, ts, p, &p->g[g], pc);
+            for (uint32_t g = i; g < j && rc == 0; g++) { /* granule_read refuses a count above p->grows */
+                granule gb;
+                gx_load(p, g, GW_LOC | GW_TIME, &gb);
+                gb.series = s;
+                rc = check_granule(db, cc, ts, p, &gb, pc);
+            }
         }
     }
     if (cc)

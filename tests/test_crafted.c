@@ -255,6 +255,51 @@ static void query_refused(const char *dir)
     CHECK(rc == TSDB_ERR_CORRUPT);
 }
 
+/* The entries of the part's index (in buf, len bytes), decoded into a malloc'd array of f->ngranules. */
+static granule *index_load(const uint8_t *buf, size_t len, part_footer *f)
+{
+    memcpy(f, buf + len - sizeof *f, sizeof *f);
+    part pp;
+    memset(&pp, 0, sizeof pp);
+    granule *g = calloc(f->ngranules + 1, sizeof *g);
+    if (!g || gix_parse(buf + f->index_off, (size_t)f->index_len, f->ngranules, &pp.ix) != 0) {
+        free(g);
+        return NULL;
+    }
+    pp.ng = f->ngranules;
+    for (uint32_t i = 0; i < f->ngranules; i++)
+        gx_load(&pp, i, GW_ALL, &g[i]);
+    return g;
+}
+
+static void rehash_part(const char *path);
+
+/* The part at path with its index replaced by g[0..n) (encoded as the writer does), the hash recomputed. */
+static void index_store(const char *path, const granule *g, size_t n)
+{
+    size_t len;
+    uint8_t *buf = (uint8_t *)slurp(path, &len);
+    part_footer f;
+    memcpy(&f, buf + len - sizeof f, sizeof f);
+    uint8_t *ix;
+    size_t ilen;
+    CHECK(gix_encode(g, n, &ix, &ilen) == 0);
+    size_t tail = len - (size_t)(f.index_off + f.index_len); /* trailer and footer */
+    size_t nlen = (size_t)f.index_off + ilen + tail;
+    uint8_t *out = malloc(nlen);
+    memcpy(out, buf, (size_t)f.index_off);
+    memcpy(out + f.index_off, ix, ilen);
+    memcpy(out + f.index_off + ilen, buf + f.index_off + f.index_len, tail);
+    f.index_len = ilen;
+    f.ngranules = (uint32_t)n;
+    memcpy(out + nlen - sizeof f, &f, sizeof f);
+    spit(path, out, nlen);
+    free(out);
+    free(ix);
+    free(buf);
+    rehash_part(path);
+}
+
 /* The footer and index of the part, read and written back with a recomputed hash. */
 static void rehash_part(const char *path)
 {
@@ -262,9 +307,9 @@ static void rehash_part(const char *path)
     char *buf = slurp(path, &len);
     part_footer f;
     memcpy(&f, buf + len - sizeof f, sizeof f);
-    uint64_t index_end = f.index_off + (uint64_t)f.ngranules * sizeof(granule);
+    uint64_t index_end = f.index_off + f.index_len;
     uint64_t x = xxh64(buf, sizeof(part_header), 0);
-    x = xxh64(buf + f.index_off, (size_t)f.ngranules * sizeof(granule), x);
+    x = xxh64(buf + f.index_off, (size_t)f.index_len, x);
     size_t tlen = len - sizeof f - (size_t)index_end;
     if (tlen)
         x = xxh64(buf + index_end, tlen, x);
@@ -338,8 +383,8 @@ static void test_parts(const char *base)
     char *buf = slurp(path, &len);
     part_footer f;
     memcpy(&f, buf + len - sizeof f, sizeof f);
-    f.ngranules = 1u << 24;
-    f.index_off = (uint64_t)0 - (uint64_t)sizeof(granule) * f.ngranules;
+    f.index_len = 1ull << 32;
+    f.index_off = (uint64_t)0 - f.index_len;
     memcpy(buf + len - sizeof f, &f, sizeof f);
     spit(path, buf, len);
     free(buf);
@@ -351,15 +396,15 @@ static void test_parts(const char *base)
     CHECK(find_part(part_dir, name, sizeof name));
     snprintf(path, sizeof path, "%s/%s", part_dir, name);
     buf = slurp(path, &len);
-    memcpy(&f, buf + len - sizeof f, sizeof f);
-    granule g;
-    memcpy(&g, buf + f.index_off, sizeof g);
-    g.ts_len = g.val_len = 0xffffffffu;
-    g.off = (uint64_t)0 - ((1ull << 33) - 2) + 40;
-    memcpy(buf + f.index_off, &g, sizeof g);
-    spit(path, buf, len);
+    granule *gi = index_load((const uint8_t *)buf, len, &f);
+    CHECK(gi != NULL);
     free(buf);
-    rehash_part(path);
+    if (gi) {
+        gi[0].ts_len = gi[0].val_len = 0xffffffffu;
+        gi[0].off = (uint64_t)0 - ((1ull << 33) - 2) + 40;
+        index_store(path, gi, f.ngranules);
+        free(gi);
+    }
     CHECK(in_child(query_refused, part_dir));
     /* the same granule in a merge, which copies whole granules without decoding them: it copied from 8 GB before
        the mapping (a shorter one goes through memcpy) */
@@ -371,18 +416,17 @@ static void test_parts(const char *base)
     CHECK(find_part(part_dir, name, sizeof name));
     snprintf(path, sizeof path, "%s/%s", part_dir, name);
     buf = slurp(path, &len);
-    memcpy(&f, buf + len - sizeof f, sizeof f);
-    granule gs[3];
-    CHECK(f.ngranules == 3);
-    if (f.ngranules == 3) {
-        memcpy(gs, buf + f.index_off, sizeof gs);
-        CHECK(gs[0].count == 16 && gs[1].count == 16 && gs[2].count == 8);
-        memcpy(buf + f.index_off, &gs[2], sizeof(granule));
-        memcpy(buf + f.index_off + 2 * sizeof(granule), &gs[0], sizeof(granule));
-    }
-    spit(path, buf, len);
+    granule *gs = index_load((const uint8_t *)buf, len, &f);
     free(buf);
-    rehash_part(path);
+    CHECK(gs && f.ngranules == 3);
+    if (gs && f.ngranules == 3) {
+        CHECK(gs[0].count == 16 && gs[1].count == 16 && gs[2].count == 8);
+        granule t = gs[0];
+        gs[0] = gs[2];
+        gs[2] = t;
+        index_store(path, gs, 3);
+    }
+    free(gs);
     CHECK(in_child(query_safe, part_dir));
     rm_rf(part_dir);
 }
@@ -763,13 +807,13 @@ static void test_daycut_merge(const char *base)
         OK(parts_publish(db, &src[k], 1));
         src[k]->level = 1; /* as if a merge wrote it: only merged granules are copied as they are */
     }
-    CHECK(src[0]->ng == 1 && floor_div(src[0]->g[0].ts_min, D) != floor_div(src[0]->g[0].ts_max, D));
+    CHECK(src[0]->ng == 1 && floor_div(gx_ts_min(src[0], 0), D) != floor_div(gx_ts_max(src[0], 0), D));
     part *out = NULL;
     OK(merge_parts(db, src, 2, &out));
     CHECK(out != NULL);
     int spans = 0;
     for (uint32_t i = 0; out && i < out->ng; i++)
-        spans += floor_div(out->g[i].ts_min, D) != floor_div(out->g[i].ts_max, D);
+        spans += floor_div(gx_ts_min(out, i), D) != floor_div(gx_ts_max(out, i), D);
     if (spans)
         fprintf(stderr, "daycut merge: %d granule(s) of the merge output span a day edge\n", spans);
     CHECK(spans == 0);
@@ -864,9 +908,10 @@ static void test_check_order(const char *base)
     uint8_t *buf = (uint8_t *)slurp(path, &len);
     part_footer f;
     memcpy(&f, buf + len - sizeof f, sizeof f);
-    CHECK(f.ngranules == 1);
-    granule g;
-    memcpy(&g, buf + f.index_off, sizeof g);
+    granule *gp = index_load(buf, len, &f);
+    CHECK(gp && f.ngranules == 1);
+    granule g = gp ? gp[0] : (granule){0};
+    free(gp);
     int64_t bad[4] = {D - 2, 2 * D + 123457, D + 5, 6 * D + 1234567};
     uint8_t enc[4096];
     codec_ctx *cc = codec_new();
@@ -879,9 +924,8 @@ static void test_check_order(const char *base)
         memmove(buf + g.off + tl, buf + g.off + g.ts_len, g.val_len);
         memcpy(buf + g.off, enc, tl);
         g.ts_len = (uint32_t)tl;
-        memcpy(buf + f.index_off, &g, sizeof g);
         spit(path, buf, len);
-        rehash_part(path);
+        index_store(path, &g, 1);
         int rc = eng_open(dir, &o, &db);
         if (rc == 0) {
             fprintf(stderr, "chkorder: the open took a granule with rows out of order\n");

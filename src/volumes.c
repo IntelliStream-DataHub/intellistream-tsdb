@@ -1134,8 +1134,9 @@ void tsdb_test_granules(tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, cons
     part **ps = db_snapshot(e, INT64_MIN, INT64_MAX, &n);
     for (size_t k = 0; ps && k < n; k++)
         for (uint32_t i = 0; i < ps[k]->ng; i++) {
-            const granule *g = &ps[k]->g[i];
-            tsdb_test_granule tg = {g->series, g->count, g->ts_min, g->ts_max, ps[k]->grows};
+            granule g;
+            gx_load(ps[k], i, GW_TIME | GW_SERIES, &g);
+            tsdb_test_granule tg = {g.series, g.count, g.ts_min, g.ts_max, ps[k]->grows};
             fn(ctx, partition_class(e, ps[k]->partition), i, &tg);
         }
     if (ps)

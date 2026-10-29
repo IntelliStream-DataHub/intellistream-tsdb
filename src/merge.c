@@ -128,16 +128,28 @@ typedef struct cursor {
     uint8_t *v; /* slots of type */
     int type;   /* of the loaded granule's series */
     tomb_set hide; /* tombstones of newer sources */
+    uint32_t series, run_end; /* the series of the run holding gi, which ends before entry run_end (0: unknown) */
 } cursor;
 
 static inline bool cur_done(const cursor *c) { return c->gi >= c->p->ng; }
 
-/* Smallest remaining key; for an undecoded granule its first row is (series, ts_min). */
-static inline void cur_key(const cursor *c, uint32_t *s, int64_t *t)
+/* The series of granule gi: cursors only move forward, so the run is looked up once per run. */
+static inline uint32_t cur_series(cursor *c)
 {
-    const granule *g = &c->p->g[c->gi];
-    *s = g->series;
-    *t = c->loaded ? c->ts[c->pos] : g->ts_min;
+    if (c->gi >= c->run_end) {
+        const gix *x = &c->p->ix;
+        uint32_t r = gix_run_of(x, c->gi);
+        c->series = x->rser[r];
+        c->run_end = r + 1 < x->nruns ? x->rstart[r + 1] : x->n;
+    }
+    return c->series;
+}
+
+/* Smallest remaining key; for an undecoded granule its first row is (series, ts_min). */
+static inline void cur_key(cursor *c, uint32_t *s, int64_t *t)
+{
+    *s = cur_series(c);
+    *t = c->loaded ? c->ts[c->pos] : gx_ts_min(c->p, c->gi);
 }
 
 static inline bool key_lt(uint32_t s1, int64_t t1, uint32_t s2, int64_t t2)
@@ -153,8 +165,10 @@ static int cur_load(eng *db, codec_ctx *cc, cursor *c)
         if (!c->ts || !c->v)
             return TSDB_ERR_NOMEM;
     }
-    const granule *g = &c->p->g[c->gi];
-    c->type = series_type(&db->series, g->series);
+    granule gb;
+    gx_load(c->p, c->gi, GW_LOC, &gb);
+    const granule *g = &gb;
+    c->type = series_type(&db->series, cur_series(c));
     if (c->type < 0)
         return TSDB_ERR_CORRUPT; /* a granule of a series the dictionary does not have */
     int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, true);
@@ -287,7 +301,10 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         }
         if (!c)
             break;
-        const granule *g = &c->p->g[c->gi];
+        granule gb;
+        gx_load(c->p, c->gi, GW_TIME, &gb);
+        gb.series = cur_series(c);
+        const granule *g = &gb;
         if (ttl && g->series != cut_series) {
             cut_series = g->series;
             cut = eng_cutoff_at(db, g->series, now);
@@ -302,7 +319,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
             /* a part no merge has written was encoded at insert speed (CODEC_FAST): re-encoded once here */
             bool merged = c->p->level > 0;
             if (!filter && before_rest && full && merged && (w.pend_n == 0 || w.pend_series != g->series)) {
-                rc = pw_copy_granule(&w, c->p, g);
+                rc = pw_copy_granule(&w, c->p, c->gi);
                 rows += g->count;
                 copied++;
                 c->gi++;
@@ -419,13 +436,13 @@ static void ttl_compute_locked(eng *db, part *p, uint32_t gen)
     int64_t any = INT64_MAX, all = INT64_MIN;
     int64_t lo, pend;
     partition_range(db, p->partition, &lo, &pend);
-    for (uint32_t i = 0; i < p->ng; i++) {
-        int64_t lim = eng_retention(db, p->g[i].series);
+    for (uint32_t r = 0; r < p->ix.nruns; r++) { /* a run's earliest row is its first granule's */
+        int64_t lim = eng_retention(db, p->ix.rser[r]);
         if (lim <= 0) {
             all = INT64_MAX;
             continue;
         }
-        any = MIN(any, sat_add64(p->g[i].ts_min, lim));
+        any = MIN(any, sat_add64(gx_ts_min(p, p->ix.rstart[r]), lim));
         all = MAX(all, sat_add64(pend, lim));
     }
     for (uint32_t i = 0; i < p->nt; i++) {

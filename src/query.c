@@ -285,20 +285,21 @@ int snapshot_take(eng *db, uint32_t series, size_t w, int64_t start, int64_t end
 /* Granules [*gi, *gj) of series s that may hold rows in [start, end). */
 void part_find(const part *p, uint32_t s, int64_t start, int64_t end, uint32_t *gi, uint32_t *gj)
 {
-    const granule *g = p->g;
-    uint32_t lo = 0, hi = p->ng;
+    uint32_t a, b;
+    gix_run(&p->ix, s, &a, &b);
+    uint32_t lo = a, hi = b;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (g[mid].series < s || (g[mid].series == s && g[mid].ts_max < start))
+        if (gx_ts_max(p, mid) < start)
             lo = mid + 1;
         else
             hi = mid;
     }
     *gi = lo;
-    hi = p->ng;
+    hi = b;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (g[mid].series < s || (g[mid].series == s && g[mid].ts_min < end))
+        if (gx_ts_min(p, mid) < end)
             lo = mid + 1;
         else
             hi = mid;
@@ -382,14 +383,16 @@ static int decode_visible(codec_ctx *cc, const part *p, uint32_t k, uint32_t e, 
 {
     size_t w = type_width(type), total = 0;
     for (uint32_t x = k; x < e; x++)
-        total += p->g[x].count;
+        total += gx_count(p, x);
     memset(out, 0, sizeof *out);
     out->ts = malloc(total * sizeof *out->ts + 1);
     out->v = malloc(total * w + 1);
     if (!out->ts || !out->v)
         return TSDB_ERR_NOMEM;
     for (uint32_t x = k; x < e; x++) {
-        const granule *g = &p->g[x];
+        granule gb;
+        gx_load(p, x, GW_LOC, &gb);
+        const granule *g = &gb;
         int64_t *ts = out->ts + out->n;
         uint8_t *v = out->v + out->n * w;
         int rc = granule_read(cc, p, g, type, ts, v, p->verify);
@@ -451,8 +454,8 @@ static int snapshot_prepare(eng *db, snapshot *s, uint32_t series, int64_t start
             rc = sb_part(&b, p, s->gi[i], s->gj[i]);
         } else {
             for (uint32_t k = s->gi[i], e; rc == 0 && k < s->gj[i]; k = e) {
-                bool dirty = tomb_set_hits(&h, series, p->g[k].ts_min, p->g[k].ts_max);
-                for (e = k + 1; e < s->gj[i] && tomb_set_hits(&h, series, p->g[e].ts_min, p->g[e].ts_max) == dirty;)
+                bool dirty = tomb_set_hits(&h, series, gx_ts_min(p, k), gx_ts_max(p, k));
+                for (e = k + 1; e < s->gj[i] && tomb_set_hits(&h, series, gx_ts_min(p, e), gx_ts_max(p, e)) == dirty;)
                     e++;
                 if (!dirty) {
                     rc = sb_part(&b, p, k, e);
@@ -545,8 +548,8 @@ void src_free(src *c)
     }
 }
 
-static int64_t src_first_ts(const src *c) { return c->p ? c->p->g[c->gi].ts_min : c->ts[0]; }
-static int64_t src_last_ts(const src *c) { return c->p ? c->p->g[c->gj - 1].ts_max : c->ts[c->n - 1]; }
+static int64_t src_first_ts(const src *c) { return c->p ? gx_ts_min(c->p, c->gi) : c->ts[0]; }
+static int64_t src_last_ts(const src *c) { return c->p ? gx_ts_max(c->p, c->gj - 1) : c->ts[c->n - 1]; }
 
 /* Decodes granules until one has rows in [start, end), or the source ends. */
 static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
@@ -561,7 +564,7 @@ static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
            granule_read before it decodes. */
         uint32_t rows = 1;
         for (uint32_t k = c->gi; k < c->gj; k++)
-            rows = MAX(rows, c->p->g[k].count);
+            rows = MAX(rows, gx_count(c->p, k));
         rows = MIN(rows, c->p->grows);
         c->ts = malloc(rows * sizeof *c->ts);
         c->v = malloc(rows * c->w);
@@ -570,7 +573,9 @@ static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
             return TSDB_ERR_NOMEM;
     }
     while (c->gi < c->gj) {
-        const granule *g = &c->p->g[c->gi++];
+        granule gb;
+        gx_load(c->p, c->gi++, GW_LOC | GW_TIME, &gb);
+        const granule *g = &gb;
         int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, c->p->verify);
         if (rc)
             return rc;
@@ -956,7 +961,7 @@ static int fold_emit(void *ctx, const int64_t *ts, const void *v, size_t n)
 
 typedef struct gref {
     const part *p;
-    const granule *g;
+    uint32_t k; /* the entry */
 } gref;
 
 typedef struct agg_job {
@@ -1010,15 +1015,16 @@ static void agg_worker(void *arg, int idx)
         if (w >= j->nwork || atomic_load_explicit(&j->err, memory_order_relaxed))
             break;
         const gref *r = &j->work[w];
-        int rc = granule_read(cc, r->p, r->g, j->t.type, ts, v, r->p->verify);
+        granule gb;
+        int rc = granule_read_at(cc, r->p, r->k, j->t.type, ts, v, r->p->verify, &gb);
         if (rc) {
             atomic_store(&j->err, rc);
             break;
         }
-        size_t n = r->g->count;
+        size_t n = gb.count;
         size_t lo = lower_bound_i64(ts, n, j->t.start);
         size_t hi = lower_bound_i64(ts, n, j->t.end);
-        size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, r->g->nulls > 0, local,
+        size_t nl = fold_rows(&j->t, ts + lo, v + lo * j->t.w, hi > lo ? hi - lo : 0, gb.nulls > 0, local,
                               localx);
         j->nedge[w] = nl > 1 ? 2 : (uint8_t)nl;
         if (nl) {
@@ -1064,13 +1070,26 @@ out:
 typedef struct item {
     int64_t lo, hi;
     uint32_t src; /* index into the snapshot's sources: parts, then memtable runs */
-    const granule *g;
+    uint32_t k;   /* the granule's entry in parts[src]; GNONE for a memtable run */
 } item;
+#define GNONE UINT32_MAX
 
 static int cmp_item(const void *a, const void *b)
 {
     const item *x = a, *y = b;
     return (x->lo > y->lo) - (x->lo < y->lo);
+}
+
+/* Sorts items by lo. Parts of disjoint time (the usual case: one per partition, in partition order) list them in
+ * order already, and a check is far cheaper than qsort, which costs a statistics query over many small parts
+ * more than everything else together. A stable sort leaves sorted input as it is, so the answer is the same. */
+static void sort_items(item *it, size_t n)
+{
+    for (size_t k = 1; k < n; k++)
+        if (it[k].lo < it[k - 1].lo) {
+            qsort(it, n, sizeof *it, cmp_item);
+            return;
+        }
 }
 
 uint64_t mem_prio(const snapshot *sn, size_t i) { return sn->mprio[i]; }
@@ -1222,12 +1241,11 @@ static int bq_items(bq *q, int64_t start, int64_t end)
             item *it = &q->items[q->nitem++];
             it->src = (uint32_t)i;
             if (i < sn->np) {
-                it->g = &sn->parts[i]->g[k];
-                it->lo = it->g->ts_min;
-                it->hi = it->g->ts_max;
+                it->k = k;
+                gx_ts(sn->parts[i], k, &it->lo, &it->hi);
             } else {
                 const mem_run *r = &sn->mem[i - sn->np];
-                it->g = NULL;
+                it->k = GNONE;
                 it->lo = r->ts[0];
                 it->hi = r->ts[r->n - 1];
             }
@@ -1235,7 +1253,7 @@ static int bq_items(bq *q, int64_t start, int64_t end)
     }
     if (!q->nitem)
         return 0;
-    qsort(q->items, q->nitem, sizeof *q->items, cmp_item);
+    sort_items(q->items, q->nitem);
     if (!(q->cl = malloc(q->nitem * sizeof *q->cl)))
         return TSDB_ERR_NOMEM;
     const item *items = q->items;
@@ -1274,8 +1292,8 @@ static bool bq_bound(void *ctx, int64_t lo, int64_t hi, bool newest, int64_t *at
         snap_find(sn, i, q->series, lo, hi, &gi, &gj);
         if (gi < gj) {
             any = true;
-            best = newest ? MAX(best, MIN(sn->parts[i]->g[gj - 1].ts_max, hi - 1))
-                          : MIN(best, MAX(sn->parts[i]->g[gi].ts_min, lo));
+            best = newest ? MAX(best, MIN(gx_ts_max(sn->parts[i], gj - 1), hi - 1))
+                          : MIN(best, MAX(gx_ts_min(sn->parts[i], gi), lo));
         }
     }
     for (size_t i = 0; i < sn->nmem; i++) {
@@ -1356,6 +1374,7 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
     t.acc = acc;
     t.accx = accx;
     fc.t = &t;
+    const unsigned want = GW_STAT | (accx ? GW_SPREAD : 0) | (type_is_int(type) ? GW_INT : 0);
 
     size_t nwork = 0;
     for (size_t ci = c0; ci < c1 && rc == 0; ci++) {
@@ -1365,26 +1384,27 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
                 const item *it = &items[k];
                 if (it->hi < start || it->lo >= end)
                     continue;
-                if (!it->g) {
+                if (it->k == GNONE) {
                     mem_run r = run_cut(&sn->mem[it->src - sn->np], start, end, wd);
                     if (r.n && fold_emit(&fc, r.ts, r.v, r.n))
                         rc = TSDB_ERR_NOMEM;
                     continue;
                 }
-                const granule *g = it->g;
-                bool inside = g->ts_min >= start && g->ts_max < end;
-                int64_t bmin = bk_key(bk, g->ts_min);
-                int64_t bmax = bk_key(bk, g->ts_max);
+                bool inside = it->lo >= start && it->hi < end; /* the item's lo and hi: the granule's ts_min, ts_max */
+                int64_t bmin = bk_key(bk, it->lo);
+                int64_t bmax = bk_key(bk, it->hi);
                 bool one = bmin == bmax; /* keys only grow with time: one key, one bucket */
                 if (inside && one) {
                     agg_state ga;
                     agg_dev gx;
+                    granule g;
+                    gx_load(sn->parts[it->src], it->k, want, &g);
                     QS_ADD(granules_from_stats, 1);
-                    QS_ADD(rows_from_stats, g->count);
-                    agg_from_granule(type, g, &ga, accx ? &gx : NULL);
+                    QS_ADD(rows_from_stats, g.count);
+                    agg_from_granule(type, &g, &ga, accx ? &gx : NULL);
                     agg_combine(&acc[bmin - t.b0], accx ? &accx[bmin - t.b0] : NULL, &ga, &gx, type);
                 } else
-                    work[nwork++] = (gref){sn->parts[it->src], g};
+                    work[nwork++] = (gref){sn->parts[it->src], it->k};
             }
             continue;
         }
@@ -1399,7 +1419,7 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
                     continue;
                 any = true;
                 if (s < sn->np) {
-                    uint32_t idx = (uint32_t)(it->g - sn->parts[s]->g);
+                    uint32_t idx = it->k;
                     gi = MIN(gi, idx);
                     gj = MAX(gj, idx + 1);
                 }
@@ -1440,7 +1460,7 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
             pthread_mutex_init(&j->locks[k], NULL);
         uint64_t rows = 0;
         for (size_t w = 0; w < nwork; w++)
-            rows += work[w].g->count;
+            rows += gx_count(work[w].p, work[w].k);
         sched_run(db->sched, query_threads_for(db, rows, nwork), agg_worker, j);
         for (int k = 0; k < AGG_STRIPES; k++)
             pthread_mutex_destroy(&j->locks[k]);
@@ -1531,7 +1551,7 @@ static int bq_window(void *ctx, int64_t start, int64_t end, void **out, size_t *
         nin++;
         dmin = MIN(dmin, MAX(it->lo, start));
         dmax = MAX(dmax, MIN(it->hi, end - 1));
-        if (it->g) {
+        if (it->k != GNONE) {
             QS_ADD(granules, 1);
             if (!seen[it->src])
                 QS_ADD(parts, 1);
@@ -1808,7 +1828,7 @@ static int raw_desc(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t series,
                 sp = s2;
             }
             if (i < sn->np)
-                sp[ns++] = (span){sn->parts[i]->g[k].ts_min, sn->parts[i]->g[k].count};
+                sp[ns++] = (span){gx_ts_min(sn->parts[i], k), gx_count(sn->parts[i], k)};
             else if (sn->mem[i - sn->np].n)
                 sp[ns++] = (span){sn->mem[i - sn->np].ts[0], sn->mem[i - sn->np].n};
         }
@@ -2184,8 +2204,7 @@ static int lttb_count(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t serie
                 }
                 items = i2;
             }
-            const granule *g = &sn->parts[s]->g[k];
-            items[nitem++] = (item){g->ts_min, g->ts_max, s, g};
+            items[nitem++] = (item){gx_ts_min(sn->parts[s], k), gx_ts_max(sn->parts[s], k), s, k};
         }
     }
     for (size_t m = 0; rc == 0 && m < sn->nmem; m++) {
@@ -2201,10 +2220,10 @@ static int lttb_count(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t serie
             }
             items = i2;
         }
-        items[nitem++] = (item){mr->ts[lo], mr->ts[hi - 1], (uint32_t)(sn->np + m), NULL};
+        items[nitem++] = (item){mr->ts[lo], mr->ts[hi - 1], (uint32_t)(sn->np + m), GNONE};
     }
     if (rc == 0)
-        qsort(items, nitem, sizeof *items, cmp_item);
+        sort_items(items, nitem);
     for (size_t a = 0; a < nitem && rc == 0;) {
         size_t b = a + 1;
         int64_t hi = items[a].hi;
@@ -2215,9 +2234,13 @@ static int lttb_count(eng *db, codec_ctx *cc, const snapshot *sn, uint32_t serie
             b++;
         }
         for (size_t k = a; k < b && rc == 0; k++) {
-            const granule *g = items[k].g;
-            if (!multi && g && g->ts_min >= start && g->ts_max < end &&
-                (type_is_int(r->type) || isfinite(g->fsum))) {
+            granule gb;
+            const granule *g = NULL;
+            if (!multi && items[k].k != GNONE && items[k].lo >= start && items[k].hi < end) {
+                gx_load(sn->parts[items[k].src], items[k].k, GW_STAT | (type_is_int(r->type) ? GW_INT : 0), &gb);
+                g = &gb;
+            }
+            if (g && (type_is_int(r->type) || isfinite(g->fsum))) {
                 r->n += g->count - g->nulls; /* a NaN or an infinity makes the sum NaN or infinite */
                 continue;
             }

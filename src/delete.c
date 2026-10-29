@@ -23,15 +23,9 @@
 /* whether part p holds rows of series s in [start, end) */
 static bool part_has(const part *p, uint32_t s, int64_t start, int64_t end)
 {
-    uint32_t lo = 0, hi = p->ng;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (p->g[mid].series < s || (p->g[mid].series == s && p->g[mid].ts_max < start))
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo < p->ng && p->g[lo].series == s && p->g[lo].ts_min < end;
+    uint32_t gi, gj;
+    part_find(p, s, start, end, &gi, &gj);
+    return gi < gj;
 }
 
 /* Writes a pending tombstone-only part for [start, end) of series in one partition. */

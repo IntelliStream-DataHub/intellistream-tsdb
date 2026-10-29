@@ -775,7 +775,9 @@ static void bounds(const char *base)
         CHECK(dfd >= 0);
         OK(part_open(dfd, strrchr(pfile, '/') + 1, &pt));
         CHECK(pt->ng >= 10);
-        const granule *g = &pt->g[pt->ng - 1];
+        granule gb;
+        gx_load(pt, pt->ng - 1, GW_LOC, &gb);
+        const granule *g = &gb;
         off_t at = (off_t)(g->off + g->ts_len + g->val_len / 2);
         part_unref(pt);
         int fd = openat(dfd, strrchr(pfile, '/') + 1, O_RDWR);
