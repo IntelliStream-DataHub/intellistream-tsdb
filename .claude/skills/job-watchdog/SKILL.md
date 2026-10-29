@@ -14,13 +14,13 @@ test servers that inherited the lock's descriptor and kept it shared for hours. 
 
 ```sh
 S=/home/olav/projects/git/tsdb/.claude/skills/subagent-economy/scripts
-$S/watchdog.sh 45 tsdb        # one line per running job of this project; STALL_MIN 45
+$S/watchdog.sh 45 'tsdb\|dbcmp'   # one line per running job of this project (the release run's cmd names dbcmp, not tsdb)
 ```
 
 For every line that is not plainly `RUNNING`, gather evidence before deciding anything:
 
 - `tail -5 $SE_HOME/runs/NAME/out`, and for the release benchmark (`bench/dbcmp/release/run.sh`) its own logs:
-  `$DBCMP/results/driver.log` and `steps.log` (default `DBCMP=/var/tmp/dbcmp`), the newest file under
+  `$DBCMP/results/driver.log` (and `steps.log` where a run writes one; default `DBCMP=/var/tmp/dbcmp`), the newest file under
   `$DBCMP/results/p*/`. The release driver writes progress there, not to `out`.
 - The process tree of the job (`ps -o pid,etime,stat,wchan:20,args -g PGID`), which child is waiting and on what.
 - Containers (`podman ps`): a step waiting on a database shows 0% CPU in the job's own group, because the database's
