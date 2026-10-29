@@ -325,6 +325,57 @@ static void make_inputs(void)
                 ((uint64_t *)x->v)[i] = NULL_F64;
         }
     }
+    /* float64 decimals at every scale, rebuilt either way (k / 10^e, k * 10^-e), with exceptions at random places:
+     * the AVX2 encoder takes four values at a time and hands a group with an exception, or a value at or beyond
+     * 2^51 scaled, to the one-at-a-time code; lengths around the group of four */
+    {
+        static const size_t flens[] = {4, 5, 6, 7, 8, 9, 13, 33, 1001};
+        static const double odd[] = {-0.0, 0.5, -0.5, 1.5, 2.5, -2.5, 0.1 + 0.2, 1e300, -1e-300, 4.9e-324};
+        for (int c = 0; c < 92; c++) {
+            int e = c < 64 ? c / 4 : 1 + (c - 64) % 30; /* 10^0 .. 10^15, then 2^1 .. 2^30 */
+            bool mul = c & 1;
+            size_t n = flens[(size_t)c % (sizeof flens / sizeof *flens)];
+            double sc, inv;
+            if (c < 64) {
+                sc = 1.0;
+                for (int j = 0; j < e; j++)
+                    sc *= 10;
+                static const double invs[] = {1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7,
+                                              1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15};
+                inv = invs[e];
+            } else {
+                sc = (double)(1L << e);
+                inv = 1.0 / sc;
+            }
+            snprintf(name, sizeof name, "f64 decimal scale %s%d %s, %zu", c < 64 ? "1e" : "2^", e, mul ? "mul" : "div", n);
+            x = add(name, TSDB_FLOAT64, n);
+            int64_t k = (int64_t)(next() % 100000) - 50000;
+            for (size_t i = 0; i < n; i++) {
+                k += (int64_t)(next() % 41) - 20;
+                double d = mul ? (double)k * inv : (double)k / sc;
+                switch (next() % (c % 3 == 0 ? 9 : 40)) { /* every third input is rich in exceptions */
+                case 0: d = odd[next() % (sizeof odd / sizeof *odd)]; break;
+                case 1: d = (double)((int64_t)(next() % 1000) - 500) / 7; break;
+                case 2: memcpy(&d, &(uint64_t){NULL_F64}, 8); break;
+                default: break;
+                }
+                memcpy((double *)x->v + i, &d, 8);
+            }
+        }
+        /* counters near 2^51 and 2^52 as doubles (scale 1): the fast path ends at 2^51, the scalar one at 2^52 */
+        static const double bases[] = {2251799813685248.0 - 6, 2251799813685248.0 - 2, 2251799813685248.0 - 1,
+                                       2251799813685248.0,     4503599627370496.0 - 10, 4503599627370496.0 - 2,
+                                       4503599627370496.0,     -2251799813685248.0 + 6, -2251799813685248.0,
+                                       -4503599627370496.0 + 10};
+        for (size_t b = 0; b < sizeof bases / sizeof *bases; b++)
+            for (size_t n = 5; n <= 9; n += 4) {
+                snprintf(name, sizeof name, "f64 integers near 2^51 and 2^52, %zu from %.0f", n, bases[b]);
+                x = add(name, TSDB_FLOAT64, n);
+                for (size_t i = 0; i < n; i++)
+                    ((double *)x->v)[i] = bases[b] + (double)i * (b & 1 ? -1 : 1);
+            }
+    }
+
     struct { const char *name; double a, step; } ramps64[] = {
         {"f64 2^53 counter", 9007199254740000.0, 1}, {"f64 1e15 decimals", 1e15, 0.01},
         {"f64 1e300 ramp", 1e300, -1e296},            {"f64 0.1 steps", 0, 0.1},
@@ -651,6 +702,70 @@ static void crafted_sums(rec *r)
     free(blk);
 }
 
+/* BLK_F64_DECIMAL blocks (nothing but the integers: no exceptions) whose integers lie anywhere in the int64 range, as
+ * a damaged part's would, or as a counter at 2^51 and beyond does: the AVX2 conversion takes a block only when every
+ * integer is below 2^51 in magnitude, and the rest must come out as the scalar conversion gives it. The reference
+ * builds each double from the integers of ref_ibp_decode. */
+static void crafted_f64_decimal(rec *r)
+{
+    static const size_t lens[] = {2, 3, 4, 5, 7, 8, 9, 33, 1025, 8192};
+    const int64_t P51 = INT64_C(1) << 51;
+    const int64_t firsts[] = {0, 1, -1, P51 - 1, P51, -P51, -P51 - 1, P51 + 1, P51 - 5000, -P51 + 5000, P51 - 2,
+                              2 * P51, -2 * P51, 4 * P51 + 1, INT64_MAX, INT64_MIN, INT64_C(1) << 62};
+    enum { NF = sizeof firsts / sizeof *firsts };
+    static const double dec_inv[] = {1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7,
+                                     1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15};
+    uint64_t s = 4242;
+    uint32_t *z = malloc(1024 * sizeof *z);
+    uint8_t *blk = malloc(5 + 8 + 9 * (1024 * 4 + 8) + BLK_SLACK);
+    for (int c = 0; c < 400; c++) {
+        size_t n = lens[c % (sizeof lens / sizeof *lens)];
+        int e = (c * 7) % 46;
+        bool mul = (c >> 2) & 1;
+        int64_t first = c % 5 == 4 ? (int64_t)(s = ds_mix(s + c)) : firsts[(c / 10) % NF];
+        blk[0] = (uint8_t)(e | (mul ? 0x80 : 0));
+        memset(blk + 1, 0, 4); /* nexc 0 */
+        memcpy(blk + 5, &first, 8);
+        uint8_t *o = blk + 13;
+        for (size_t v0 = 1; v0 < n; v0 += 1024) {
+            size_t nv = MIN((size_t)1024, n - v0);
+            s = ds_mix(s + v0);
+            int w = c % 3 == 0 ? (int)(s % 33) : (int)(s % 12); /* small steps keep a block near the edge */
+            uint32_t mask = w == 32 ? UINT32_MAX : (uint32_t)((1ull << w) - 1);
+            for (size_t i = 0; i < nv; i++)
+                z[i] = (uint32_t)(s = ds_mix(s + i)) & mask;
+            *o++ = (uint8_t)w;
+            pack(z, nv, w, o);
+            o += packed_bytes(nv, w);
+        }
+        size_t len = (size_t)(o - blk);
+        memset(o, 0x5a, BLK_SLACK);
+        memset(dec, 0xa5, n * 16);
+        double *got = (double *)(void *)dec, *want = (double *)(void *)(dec + n * 8);
+        int rc = f64_decimal_decode(blk, len, n, got);
+        int rc2 = ref_ibp_decode(blk + 5, len - 5, n, (int64_t *)(void *)want);
+        double sc = e < 16 ? 1 : (double)(1L << (e - 15));
+        for (int j = 0; j < e && e < 16; j++)
+            sc *= 10;
+        double inv = e < 16 ? dec_inv[e] : 1.0 / (double)(1L << (e - 15));
+        for (size_t i = 0; i < n; i++) {
+            int64_t k;
+            memcpy(&k, &want[i], 8);
+            want[i] = mul ? (double)k * inv : (double)k / sc;
+        }
+        char what[64];
+        snprintf(what, sizeof what, "crafted f64_decimal %d", c);
+        put(r, what, "integers", got, n * 8);
+        if (rc != 0 || rc2 != 0 || memcmp(got, want, n * 8) != 0) {
+            fprintf(stderr, "%s (n %zu, first %lld, e %d%s): differs from the scalar conversion\n", what, n,
+                    (long long)first, e, mul ? " mul" : "");
+            failures++;
+        }
+    }
+    free(z);
+    free(blk);
+}
+
 /* The lengths of the prefixes folded and searched: every one up to SHORT_LENS (the short runs, the kernels' tails,
  * most of the sets' thresholds), the longer thresholds on both sides (check_thresholds), then all of it. */
 #define SHORT_LENS 66
@@ -708,6 +823,7 @@ static void twa_ref(int type, const int64_t *ts, const void *v, size_t n, twa_su
 static void run(rec *r, codec_ctx *c)
 {
     crafted_sums(r);
+    crafted_f64_decimal(r);
     for (int k = 0; k < nin; k++) {
         const input *x = &in[k];
         size_t w = type_width(x->type);

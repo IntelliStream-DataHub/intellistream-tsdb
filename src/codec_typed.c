@@ -33,6 +33,14 @@
 #include <math.h>
 #include <stdlib.h>
 
+/* AVX2 (the v3 level, and -march=native on CPUs without AVX-512DQ): there is no int64 <-> double conversion
+ * below AVX-512DQ, so the scalar loops of the decimal codec convert one value at a time and divide one at a
+ * time. With AVX-512DQ the compiler vectorizes them itself. */
+#if defined(__AVX2__) && !defined(__AVX512DQ__)
+#define F64_AVX2 1
+#include <immintrin.h>
+#endif
+
 #define IBP_VEC 1024
 _Static_assert(IBP_VEC <= 1024, "zz_prefix32 sums at most 1024 deltas");
 
@@ -178,6 +186,96 @@ static inline bool f64_int(double v, int e, bool mul, int64_t *k)
     return a == b; /* bitwise: -0.0 and NaN (nulls too) become exceptions */
 }
 
+#ifdef F64_AVX2
+/* Integers of magnitude below 2^51 convert exactly through the mantissa: 1.5 * 2^52 plus k is the double
+ * 0x4338000000000000 + k, and adding a double d to 1.5 * 2^52 rounds it to the nearest integer (ties to even,
+ * as llrint does in the default rounding mode) for |d| < 2^51. Both give what the scalar code gives. */
+#define F64_MAGIC_BITS INT64_C(0x4338000000000000)
+#define F64_FAST_LIMIT 2251799813685248.0 /* 2^51 */
+
+/* Four values at once: true, with their integers in k, if every lane is in range and rebuilds its value bit for
+ * bit (-0.0, NaN and the rest are left to f64_int, one at a time, as exceptions). */
+static inline bool f64_int4(const double *in, int e, bool mul, int64_t *k)
+{
+    const __m256d magic = _mm256_castsi256_pd(_mm256_set1_epi64x(F64_MAGIC_BITS));
+    __m256d v = _mm256_loadu_pd(in);
+    __m256d d = _mm256_mul_pd(v, _mm256_set1_pd(f64_scale[e])); /* a separate multiply: no FMA */
+    __m256d inr = _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), d), _mm256_set1_pd(F64_FAST_LIMIT), _CMP_LT_OQ);
+    if (_mm256_movemask_pd(inr) != 15)
+        return false;
+    __m256d t = _mm256_add_pd(d, magic);
+    __m256d kd = _mm256_sub_pd(t, magic); /* the rounded integer, exact */
+    __m256d back = mul ? _mm256_mul_pd(kd, _mm256_set1_pd(f64_inv[e])) : _mm256_div_pd(kd, _mm256_set1_pd(f64_scale[e]));
+    __m256i same = _mm256_cmpeq_epi64(_mm256_castpd_si256(back), _mm256_castpd_si256(v));
+    if (_mm256_movemask_pd(_mm256_castsi256_pd(same)) != 15)
+        return false;
+    _mm256_storeu_si256((__m256i *)(void *)k,
+                        _mm256_sub_epi64(_mm256_castpd_si256(t), _mm256_set1_epi64x(F64_MAGIC_BITS)));
+    return true;
+}
+#endif
+
+/* One value: its integer into k[i], or an exception record at *xp. False when there are too many exceptions. */
+static inline bool f64_enc_one(const double *in, size_t i, int e, bool mul, int64_t *k, uint8_t **xp, size_t *nexc,
+                               size_t max_exc)
+{
+    if (f64_int(in[i], e, mul, &k[i]))
+        return true;
+    if (*nexc == max_exc)
+        return false;
+    store32(*xp, (uint32_t)i);
+    memcpy(*xp + 4, &in[i], 8);
+    *xp += 12;
+    (*nexc)++;
+    k[i] = i ? k[i - 1] : 0; /* a zero delta keeps the stream smooth */
+    return true;
+}
+
+/* In place: the n integers in out (read as int64) become the doubles they stand for. */
+static void f64_back_all(double *out, size_t n, int e, bool mul)
+{
+    size_t i = 0;
+#ifdef F64_AVX2
+    /* Whole block in [-2^51, 2^51) (damaged streams can hold any integer): (k + 2^51) < 2^52 as unsigned */
+    const __m256i bias = _mm256_set1_epi64x(INT64_C(1) << 51);
+    __m256i acc = _mm256_setzero_si256();
+    size_t n4 = n & ~(size_t)3;
+    for (; i < n4; i += 4)
+        acc = _mm256_or_si256(acc, _mm256_add_epi64(_mm256_loadu_si256((const __m256i *)(const void *)&out[i]), bias));
+    uint64_t tail = 0;
+    for (size_t j = n4; j < n; j++) {
+        int64_t kj;
+        memcpy(&kj, &out[j], 8);
+        tail |= (uint64_t)kj + (UINT64_C(1) << 51);
+    }
+    if (_mm256_testz_si256(_mm256_srli_epi64(acc, 52), _mm256_set1_epi64x(-1)) && !(tail >> 52)) {
+        const __m256d magic = _mm256_castsi256_pd(_mm256_set1_epi64x(F64_MAGIC_BITS));
+        const __m256i mbits = _mm256_set1_epi64x(F64_MAGIC_BITS);
+        if (mul) {
+            const __m256d f = _mm256_set1_pd(f64_inv[e]);
+            for (i = 0; i < n4; i += 4) {
+                __m256i ki = _mm256_loadu_si256((const __m256i *)(const void *)&out[i]);
+                __m256d kd = _mm256_sub_pd(_mm256_castsi256_pd(_mm256_add_epi64(ki, mbits)), magic);
+                _mm256_storeu_pd(&out[i], _mm256_mul_pd(kd, f));
+            }
+        } else {
+            const __m256d f = _mm256_set1_pd(f64_scale[e]);
+            for (i = 0; i < n4; i += 4) {
+                __m256i ki = _mm256_loadu_si256((const __m256i *)(const void *)&out[i]);
+                __m256d kd = _mm256_sub_pd(_mm256_castsi256_pd(_mm256_add_epi64(ki, mbits)), magic);
+                _mm256_storeu_pd(&out[i], _mm256_div_pd(kd, f));
+            }
+        }
+    } else
+        i = 0;
+#endif
+    for (; i < n; i++) {
+        int64_t ki;
+        memcpy(&ki, &out[i], 8); /* the slot is read as an integer, then written as a double */
+        out[i] = f64_back(ki, e, mul);
+    }
+}
+
 size_t f64_decimal_bound(size_t n) { return 5 + (n / 16 + 1) * 12 + int_bp_bound(n); }
 
 /* Cost in bits a value of scale e (and way of rebuilding), on a few runs of
@@ -263,19 +361,24 @@ size_t f64_decimal_encode_keep(const double *in, size_t n, uint8_t *out, int64_t
         return 0;
     size_t max_exc = n / 16, nexc = 0;
     uint8_t *x = out + 5;
-    for (size_t i = 0; i < n; i++) {
-        if (f64_int(in[i], e, mul, &k[i]))
+    size_t i = 0;
+    while (i < n) {
+#ifdef F64_AVX2
+        if (i + 4 <= n && f64_int4(&in[i], e, mul, &k[i])) {
+            i += 4;
             continue;
-        if (nexc == max_exc) {
-            if (!keep)
-                free(k);
-            return 0;
         }
-        store32(x, (uint32_t)i);
-        memcpy(x + 4, &in[i], 8);
-        x += 12;
-        nexc++;
-        k[i] = i ? k[i - 1] : 0; /* a zero delta keeps the stream smooth */
+        /* a lane that is not a clean integer: these four one at a time, the exceptions in order */
+        size_t stop = MIN(i + 4, n);
+#else
+        size_t stop = n;
+#endif
+        for (; i < stop; i++)
+            if (!f64_enc_one(in, i, e, mul, k, &x, &nexc, max_exc)) {
+                if (!keep)
+                    free(k);
+                return 0;
+            }
     }
     out[0] = (uint8_t)(e | (mul ? F64_MUL : 0));
     store32(out + 1, (uint32_t)nexc);
@@ -301,11 +404,7 @@ int f64_decimal_decode(const uint8_t *in, size_t len, size_t n, double *out)
     /* same size: the integers are decoded into out, then turned into doubles in place */
     if (int_bp_decode(ints, len - (size_t)(ints - in), n, (int64_t *)(void *)out) != 0)
         return TSDB_ERR_CORRUPT;
-    for (size_t i = 0; i < n; i++) {
-        int64_t ki;
-        memcpy(&ki, &out[i], 8); /* the slot is read as an integer, then written as a double */
-        out[i] = f64_back(ki, e, mul);
-    }
+    f64_back_all(out, n, e, mul);
     for (uint32_t j = 0; j < nexc; j++, x += 12) {
         uint32_t pos = load32(x);
         if (pos >= n)
