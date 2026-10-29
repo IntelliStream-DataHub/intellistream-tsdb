@@ -2,7 +2,7 @@
  * Part files: immutable, sorted by (series, ts), written once and mmap'd.
  *
  *   header (24 bytes) | ts block, value block, ... per granule | pad to 8 |
- *   granule index (bit-packed, gindex.c; index_len bytes) | [tombstones] | footer (64 bytes)
+ *   granule index (bit-packed, gindex.c; index_len bytes, a multiple of 8) | [tombstones] | footer (64 bytes)
  *
  * The tombstone trailer (24 bytes per range tombstone, then u32 count and u32
  * TOMB_MAGIC) is there only in parts that hold deletes, so every other part is
@@ -75,7 +75,7 @@ static bool trailer_parse(const uint8_t *buf, size_t tlen, const tomb **t, uint3
     if (tlen == 0)
         return true;
     uint32_t cnt, magic;
-    if (tlen < 8)
+    if (tlen < 8 || (uintptr_t)buf % _Alignof(tomb) != 0) /* read in place as tombs; part_open checks it too */
         return false;
     memcpy(&cnt, buf + tlen - 8, 4);
     memcpy(&magic, buf + tlen - 4, 4);
@@ -156,8 +156,10 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     p->grows = h.granule_rows;
     p->wal_seq = h.wal_seq;
     /* checked without wrapping: the hash is no authentication, and a crafted index_off near 2^64 would otherwise
-       make part_hash read before the mapping */
-    if (f.index_off % 8 != 0 || f.index_off < sizeof h || f.index_off > (uint64_t)size - sizeof f ||
+       make part_hash read before the mapping. The writer pads the index to a multiple of 8, so the tombstone
+       trailer, read in place as tomb structs, starts 8-byte aligned; a length that is not is refused here,
+       before trailer_parse touches it (gix_parse refuses it too, but runs later). */
+    if (f.index_off % 8 != 0 || f.index_len % 8 != 0 || f.index_off < sizeof h || f.index_off > (uint64_t)size - sizeof f ||
         f.index_len > (uint64_t)size - sizeof f - f.index_off)
         goto fail;
     uint64_t index_end = f.index_off + f.index_len;

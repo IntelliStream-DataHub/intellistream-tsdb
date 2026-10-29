@@ -690,6 +690,35 @@ static void test_index_damage(const char *base)
             failures++;
         }
     }
+
+    /* index_len 4 bytes longer, then a well-formed tombstone trailer: the trailer starts at 4 mod 8. The open used
+       to read it in place as tomb structs before gix_parse refused the length (UBSan: misaligned member access,
+       found by the part fuzzer); it is refused before the trailer is touched. */
+    make_db(part_dir);
+    CHECK(find_part(part_dir, name, sizeof name));
+    snprintf(path, sizeof path, "%s/%s", part_dir, name);
+    size_t len;
+    uint8_t *buf = (uint8_t *)slurp(path, &len);
+    part_footer f;
+    memcpy(&f, buf + len - sizeof f, sizeof f);
+    CHECK(len == f.index_off + f.index_len + sizeof f); /* no trailer yet */
+    tomb t = {.series = 1, .start = 1700000000000LL, .end = 1700000001000LL};
+    uint32_t tail[2] = {1, 0x424d4f54u /* TOMB_MAGIC */};
+    size_t at = (size_t)(f.index_off + f.index_len), nlen = len + 4 + sizeof t + sizeof tail;
+    uint8_t *out = calloc(1, nlen);
+    memcpy(out, buf, at);
+    memcpy(out + at + 4, &t, sizeof t);
+    memcpy(out + at + 4 + sizeof t, tail, sizeof tail);
+    f.index_len += 4;
+    memcpy(out + nlen - sizeof f, &f, sizeof f);
+    spit(path, out, nlen);
+    free(out);
+    free(buf);
+    rehash_part(path);
+    if (!in_child(open_refused, part_dir)) {
+        fprintf(stderr, "a misaligned tombstone trailer was not refused cleanly\n");
+        failures++;
+    }
     rm_rf(part_dir);
 }
 

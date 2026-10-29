@@ -682,7 +682,9 @@ than every part), so a delete needs no ordering of its own:
 
 **On disk.** A part with tombstones has an optional trailer between the index
 and the footer: `n x {u32 series, u32 0, i64 start, i64 end}`, then `u32 n,
-u32 'TOMB'`; `index_hash` covers it. Parts without tombstones are byte for byte
+u32 'TOMB'`; `index_hash` covers it. The index starts at a multiple of 8 and is
+padded to one, so the trailer is 8-byte aligned and read in place; a part whose
+footer says otherwise is refused at open. Parts without tombstones are byte for byte
 what they were, so `FORMAT_VERSION` stays; an older binary rejects a part with
 a trailer at open (its size does not match) and never misreads one. **No
 downgrade while tombstone parts exist**: the older binary calls such a part
