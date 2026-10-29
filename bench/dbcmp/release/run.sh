@@ -518,6 +518,12 @@ tsdbsuite() { # PREFIX DIR CLASS-THREADS("1 32"): tsdbq qps classes against $TSD
     done
 }
 REL() { python3 -I "$TOOLS/rel.py" "$@"; }
+lttb_loose() { # CHECKFILE DIR: LTTB answers that rel.py accepted as equal-area alternatives go to DIR/loose.txt
+    awk -v f="$(basename "$1")" '/series answered with equal-area alternatives [1-9]/ {n = $NF; next}
+        n && / lttb (OK|MISMATCH)$/ {printf "%s: LTTB of %d series differs from tsdb'"'"'s through ties of the triangle area " \
+            "(the pick of a tie decided by rounding, the picks after it by that anchor; verified on the rows in exact " \
+            "arithmetic within 1e-12, see %s)\n", $1, n, f; n = 0}' "$1" >> "$2/loose.txt"
+}
 
 # ------------------------------------------------------------------ batches (batches.tsv, mkbatch.py) and one core
 # A batch is one request of K series (K = 1, 10, 100; mkbatch.py says how each language does it). Whole-range
@@ -1044,7 +1050,7 @@ p2_ch() {
     chsuite ch "$D" ch
     bcheck ch "$D" && { chbsuite ch "$D" ch; pc_pin rb-ch && PC=1 chbsuite ch "$D" ch; pc_unpin rb-ch; }
     REL q ch lttb > "$D/q.lttb.sql"; REL q ch twa > "$D/q.twa.sql"
-    untimed "$D/check-lttb.txt" REL check ch lttb ref/lttb.jsonl
+    untimed "$D/check-lttb.txt" REL check ch lttb ref/lttb.jsonl && lttb_loose "$D/check-lttb.txt" "$D"
     untimed "$D/check-twa.txt" REL check ch twa ref/twa.jsonl
     for k in lttb twa; do  # timed by the server (query_log), not the client (REPORT §3)
         chbench1 1 1 0 "$D/q.$k.sql" > /dev/null 2> "$D/warm.$k" 9>&-
@@ -1179,7 +1185,7 @@ p2_ts() {
     PSQL -Atc "select version()" -c "select extname, extversion from pg_extension" -c "show shared_buffers" -c "show work_mem" > "$D/ha-version.txt"
     cd "$WORK" || return 1
     REL q ts lttb > "$D/q.lttb.sql"; REL q ts twa > "$D/q.twa.sql"
-    untimed "$D/check-lttb.txt" REL check ts lttb ref/lttb.jsonl
+    untimed "$D/check-lttb.txt" REL check ts lttb ref/lttb.jsonl && lttb_loose "$D/check-lttb.txt" "$D"
     untimed "$D/check-twa.txt" REL check ts twa ref/twa.jsonl
     untimed "$D/explain-twa.txt" PSQL -c "EXPLAIN (ANALYZE, BUFFERS) $(cat "$D/q.twa.sql")"
     grep -q 'Disk' "$D/explain-twa.txt" && log "  ts: the TWA plan still spills to disk with work_mem=$TS_WORK_MEM (see $D/explain-twa.txt)"
@@ -1378,6 +1384,7 @@ sys.stdout.writelines(l for l in open(sys.argv[2]) if json.loads(l)["i"] in ids)
         for e in chdb chdb-lz4; do REL tsv lttb "$RL" "dump/$e-lttb.tsv"; REL tsv twa "$RT" "dump/$e-twa.tsv"; done
     } > "$D/check-rel.txt" 2>&1
     grep -qE 'MISMATCH|Traceback|Error' "$D/check-rel.txt" && fail "p3 LTTB/TWA check found mismatches (see $D/check-rel.txt)"
+    lttb_loose "$D/check-rel.txt" "$D"
     cd "$OUT" || true
     runstats "$D"
     rmdata "$E"
@@ -1400,6 +1407,14 @@ prom_rw_timed() { # DIR SAMPLES SHARDS
     local s=$(date +%s.%N)
     sync -f "$1"
     echo "sync after the load $(echo "$(date +%s.%N) - $s" | bc) s"
+}
+prom_rw_check() { # check.py exits 0 on mismatches; 1 here, so that untimed's UNTIMED_SOFT path sees them
+    env PROM_PORT=9090 python3 -I "$H/check.py" prom 200 > "$OUT/.check-rw.out" 2>&1
+    local rc=$?
+    cat "$OUT/.check-rw.out"
+    [ $rc = 0 ] && grep -qE 'mismatches [1-9]|MISMATCH' "$OUT/.check-rw.out" && rc=1
+    rm -f "$OUT/.check-rw.out"
+    return $rc
 }
 p4() {
     local D=$OUT/p4 P=$DBCMP/s4 r c S
@@ -1435,7 +1450,11 @@ p4() {
     podman unshare sh -c "cd $P/data && du -scb 01* | tail -1 && du -sb wal wbl chunks_head" > "$D/rw-size.txt" 2>&1
     S=$(curl -s -m 3600 -XPOST 127.0.0.1:9090/api/v1/admin/tsdb/snapshot | jq -r .data.name)
     [ -n "$S" ] && [ "$S" != null ] && podman unshare du -sb "$P/data/snapshots/$S" >> "$D/rw-size.txt" && podman unshare rm -rf "$P/data/snapshots/$S"
-    untimed "$D/check-rw.txt" env PROM_PORT=9090 python3 -I "$H/check.py" prom 200
+    # short answers: acknowledged samples Prometheus lost in its compactions are a result to report (loose.txt), if
+    # promlost.py finds them and they explain every difference; anything else fails as an answer check
+    UNTIMED_SOFT=1 untimed "$D/check-rw.txt" prom_rw_check
+    [ $? = 2 ] && untimed "$D/check-rw-lost.txt" env PROM_PORT=9090 python3 -I "$TOOLS/promlost.py" "$D/check-rw.txt" &&
+        echo "remote write: $(tail -1 "$D/check-rw-lost.txt" | sed 's/^promlost: //') after its compactions (the load was acknowledged and every sample answered right after it; check-rw.txt, check-rw-lost.txt)" >> "$D/loose.txt"
     qsuite prom rw "$D" http 127.0.0.1 9090 ""
     crm rb-prom; podman unshare rm -rf "$P/data"
     # (a') more shards and larger requests: load time only, fresh directories

@@ -36,7 +36,7 @@ run nothing else heavy meanwhile.
 | `ts_compress.sh` | `compress_chunk` on every TimescaleDB chunk |
 | `qdb_wait.sh`, `i2_settle.sh`, `i3_watch.sh` | wait for QuestDB's WAL apply, InfluxDB 2's compaction, InfluxDB 3's snapshot |
 | `prom_settle.sh` | wait for Prometheus' head and block compactions |
-| `release/` | the release driver `run.sh` (phases, smoke run, checker test), `env.sh` (pinned images), `sys_iot.sh`, `sys_td.sh`, `sys_vm.sh`, `how.py` and `tables.py` (how each result ran) |
+| `release/` | the release driver `run.sh` (phases, smoke run, checker test), `env.sh` (pinned images), `sys_iot.sh`, `sys_td.sh`, `sys_vm.sh`, `how.py` and `tables.py` (how each result ran), `rel.py` (LTTB and TWA queries and checks), `promlost.py` (acknowledged samples Prometheus lost) |
 
 ## Requirements
 
@@ -287,6 +287,13 @@ Two loads, each into its own fresh data directory and container:
   minutes, down to 40 blocks; `prom_settle.sh` waits for that. The out-of-order path also cuts
   chunks at 32 samples (`out_of_order_cap_max`), and compaction keeps them: 3.7 times the chunks of
   the backfill (120 samples) and 22% more bytes.
+  In some runs it loses acknowledged samples: the first sample of series whose clock jitter puts it just
+  before 2024-01-01 00:00 (the 2023 block, before the head's first full block) is answered right after the
+  load and gone after its compactions (smoke of 2026-10-29: series 2 and 3, one sample each, still gone
+  minutes after the compactions settled; of five more loads of the same file, one lost them, four did
+  not). The answer check then runs `release/promlost.py`, which finds the lost samples by bisection and
+  checks every series' whole-range count, sum, min and max against the rows without them; if they explain
+  every difference, the loss is a result (`loose.txt`, in the tables), not a harness failure.
 - **Backfill** (the docs' route for historical data): `promtool tsdb create-blocks-from openmetrics`
   writes blocks from an OpenMetrics file (`conv om`, not part of the load), then a server starts on
   them. `--max-block-duration=744h` follows the docs' advice for long ranges: promtool picks the
@@ -500,8 +507,15 @@ otherwise report "-" (not supported), and footnote which route each took:
 | DuckDB, InfluxDB 3 (SQL), QuestDB | window-function SQL, if the dialect supports it | window-function SQL |
 | InfluxDB 2, Prometheus | - unless built in by then | - unless built in by then |
 
-LTTB answers must be the same points (first maximum wins on ties); time-weighted averages within a stated
-tolerance. The twa track's REPORT.md has the ClickHouse query.
+LTTB answers must be the same points (first maximum wins on ties), with one exception: where two points of a
+bucket have the same triangle area, a system may pick the other one. That happens with quantized values and
+jittered timestamps (tank_bar: the next bucket's mean equals the anchor's value exactly, so every point one
+0.001 step above or below it has the same area, whatever its time); the double rounding of the mean then decides
+the pick, and ClickHouse and chDB sum in another order than tsdb (smoke, series 9: one exact tie and five picks
+after it). A series that differs is replayed on the raw rows in exact integer arithmetic along the system's own
+picks (`rel.py`, `DATA`): it passes when every pick has the largest area given its anchor, within 1e-12 of the size
+of the products the area is computed from, and the check line says how many picks were such alternatives.
+Time-weighted averages within a stated tolerance. The twa track's REPORT.md has the ClickHouse query.
 
 ## Embedded ClickHouse (chDB)
 

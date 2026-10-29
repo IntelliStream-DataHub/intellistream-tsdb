@@ -22,7 +22,14 @@
 # LTTB is sequential (each bucket's pick depends on the previous pick), so it has no window-function recipe;
 # InfluxDB 2 (Flux timeWeightedAvg interpolates linearly only) and Prometheus have no STEP TWA.
 #
-# Check: LTTB the same timestamps per series and values within 1e-7 relative; TWA per bucket with covered
+# Check: LTTB the same timestamps per series and values within 1e-7 relative, except where the series has an exact or
+# near tie: when the triangle areas of two points of a bucket are equal (quantized values: the next bucket's mean
+# equals the anchor's value, so every point one step above or below has the same area), double rounding of the mean
+# decides which one a system picks, and the picks after it follow from that anchor. A series that differs is
+# therefore replayed on the raw rows (DATA, the RowBinary input) in exact integer arithmetic along the system's own
+# picks: it passes when every pick is in its bucket with its value and has the largest area given its anchor, within
+# LTTB_TIE (1e-12) of the size of the two products the area is the difference of; the line says how many picks were
+# such alternatives (ties) and how many followed from them. TWA per bucket with covered
 # time > 0 the same bucket starts, the covered time exactly (where the system returns it) and twa within 1e-9
 # relative. NaN, a missing or an extra bucket or series is a mismatch. Only the TimescaleDB toolkit may differ in
 # the last bucket of a series (its interpolated_average holds the last value to the bucket end): counted apart.
@@ -387,6 +394,82 @@ TOL_REL, TOL_ABS = (float(x) for x in os.environ.get("REL_TOL", "1e-9,0").split(
 def twa_near(x, y):
     return near(x, y, TOL_REL) or (TOL_ABS > 0 and abs(x - y) <= TOL_ABS)
 
+LTTB_TIE = float(os.environ.get("LTTB_TIE", "1e-12"))
+_raw = {}  # DATA path -> memmap
+
+def raw_series(s):
+    """Series s from DATA (u32 series, i64 ms, f32 value), finite values only, ordered by time, the last of equal
+    timestamps (last write wins); None without DATA."""
+    path = os.environ.get("DATA")
+    if not path or not os.path.exists(path): return None
+    try:
+        import numpy as np
+        if path not in _raw: _raw[path] = np.memmap(path, dtype=np.dtype([("s", "<u4"), ("t", "<i8"), ("v", "<f4")]), mode="r")
+        r = _raw[path][_raw[path]["s"] == s]
+        r = r[np.isfinite(r["v"])]
+        o = np.argsort(r["t"], kind="stable")
+        t, v = r["t"][o], r["v"][o]
+        keep = np.append(t[1:] != t[:-1], True)
+        return [int(x) for x in t[keep]], [float(x) for x in v[keep]]
+    except ImportError:
+        import math, struct
+        d = {}
+        with open(path, "rb") as f:
+            while b := f.read(16 << 20):
+                for ss, t, v in struct.iter_unpack("<Iqf", b):
+                    if ss == s and math.isfinite(v): d[t] = v
+        t = sorted(d)
+        return t, [d[x] for x in t]
+
+def lttb_alternative(s, gt, gv, et):
+    """(True, why) when the system's picks gt/gv for series s are an LTTB answer of the raw rows that differs from
+    tsdb's (et) only through ties (see the header); (False, why) otherwise."""
+    import math
+    raw = raw_series(s)
+    if raw is None: return False, "no DATA to replay the series on"
+    T, V = raw
+    n, th = len(T), len(et)
+    if len(gt) != th or n <= th or th < 3: return False, f"{len(gt)} points of {n} rows, threshold {th}"
+    at = {t: k for k, t in enumerate(T)}
+    idx = [at.get(t) for t in gt]
+    if None in idx: return False, "a timestamp that is not a row"
+    if any(not near(V[k], y, 1e-7) for k, y in zip(idx, gv)): return False, "a value that is not the row's"
+    if idx[0] != 0 or idx[-1] != n - 1: return False, "first or last point is not the series' first or last row"
+    # exact: x in ms, y scaled by 2^149 (every float32 is an integer multiple of 2^-149); prefix sums for the means
+    X = T
+    Y = [int(math.ldexp(v, 149)) for v in V]
+    PX, PY = [0], [0]
+    for x, y in zip(X, Y):
+        PX.append(PX[-1] + x); PY.append(PY[-1] + y)
+    every = (n - 2) / (th - 2)  # the buckets as tsdb, ClickHouse and the paper's code cut them (doubles)
+    start = lambda b: math.floor(b * every) + 1
+    nb = th - 2
+    ties = exact = 0
+    for b in range(nb):
+        lo, hi = start(b), start(b + 1)
+        nlo, nhi = (start(b + 1), start(b + 2)) if b + 1 < nb else (n - 1, n)
+        p, a = idx[b + 1], idx[b]
+        if not lo <= p < hi: return False, f"point {b + 1} is outside its bucket"
+        c = nhi - nlo
+        cx, cy = PX[nhi] - PX[nlo], PY[nhi] - PY[nlo]  # the next bucket's mean times c
+        ax, ay = X[a] * c, Y[a] * c
+        def terms(j):  # the area times 2c is |t1 - t2|
+            return (ax - cx) * (Y[j] - Y[a]), (X[a] - X[j]) * (cy - ay)
+        best, bj = -1, lo
+        for j in range(lo, hi):
+            t1, t2 = terms(j)
+            if abs(t1 - t2) > best: best, bj = abs(t1 - t2), j
+        if p == bj: continue
+        t1, t2 = terms(p)
+        u1, u2 = terms(bj)
+        short = best - abs(t1 - t2)
+        if short > LTTB_TIE * max(abs(t1) + abs(t2), abs(u1) + abs(u2)):
+            return False, f"point {b + 1} (t {T[p]}) has a smaller area than t {T[bj]} by {short / best:.3g} of it"
+        ties += 1; exact += short == 0
+    nd = sum(x != y for x, y in zip(gt, et))
+    return True, (f"{nd} points differ from tsdb's, all an LTTB answer of the rows: {ties} equal-area alternatives "
+                  f"({exact} exact ties, the rest within {LTTB_TIE:g}), {nd - ties} the largest area after an anchor that differs")
+
 def compare(kind, ref, rows, lenient_last=False):
     """rows: lists (series, t|b, v|area, [covered]); ref: relq dump. TWA rows with covered time compare it exactly;
     rows without it (series, b, twa: the TimescaleDB toolkit) compare the average only. A bucket missing on either
@@ -395,7 +478,7 @@ def compare(kind, ref, rows, lenient_last=False):
     got = {}
     for r in rows:
         got.setdefault(int(float(r[0])), []).append(r[1:])
-    bad_series, bad_pts, bad_last, total = 0, 0, 0, 0
+    bad_series, bad_pts, bad_last, total, alt_series = 0, 0, 0, 0, 0
     maxabs = maxrel = 0.0
     for s, e in sorted(ref.items()):
         g = got.get(s, [])
@@ -407,6 +490,11 @@ def compare(kind, ref, rows, lenient_last=False):
             for a, b, x, y in zip(et, gt, ev, gv):
                 if a != b or not near(x, y, 1e-7): nb += 1
             if nb:
+                ok, why = lttb_alternative(s, gt, gv, et)
+                print(f"lttb series {s}: {why}" if ok else f"lttb series {s}: not an equal-area alternative: {why}")
+                if ok:
+                    alt_series += 1
+                    continue
                 bad_series += 1; bad_pts += nb
                 if bad_series <= 5: print(f"MISMATCH lttb series {s}: {nb} points differ (ref {len(et)}, got {len(gt)})")
         else:
@@ -440,7 +528,7 @@ def compare(kind, ref, rows, lenient_last=False):
     extra = sorted(set(got) - set(ref))
     print(f"{kind}: {len(ref)} {'windows' if kind in WKINDS else 'series'}, {total} reference {'points' if kind == 'lttb' else 'buckets'}; series with mismatches "
           f"{bad_series}, mismatched {bad_pts}, last-bucket differences {bad_last}{' (allowed: toolkit)' if lenient_last else ''}, "
-          f"unexpected series {len(extra)}" + ("" if kind == "lttb" else
+          f"unexpected series {len(extra)}" + (f"; series answered with equal-area alternatives {alt_series}" if kind == "lttb" else
           f"; largest difference of an average {maxrel:.2g} relative, {maxabs:.2g} absolute (bound {TOL_REL:g} relative"
           + (f" or {TOL_ABS:g} absolute)" if TOL_ABS > 0 else ")")))
     return bad_series == 0 and not extra

@@ -4,7 +4,8 @@
 # small built-in reference with a gap, a single-reading series and a bucket with a carried-in piece), writes the
 # true answers back in each system's row form and checks they pass, then one mutation at a time that must fail:
 # NaN, covered time off by one ms, a missing bucket, an extra bucket, a value off by 1.5e-9 relative (just over the
-# 1e-9 tolerance), a missing and an extra series, a count off by one. Prints one line per case and "checktest OK"
+# 1e-9 tolerance), a missing and an extra series, a count off by one; LTTB: an exact tie of the triangle area may be
+# answered with the other point (and the picks after it), a smaller area may not. Prints one line per case and "checktest OK"
 # or "checktest FAILED".
 import copy, io, json, os, shutil, subprocess, sys, tempfile
 
@@ -124,6 +125,55 @@ def decimal_cases():
     case("decimal: vm sum off by 1e-9 relative", False, sum_close(["check.py", "vm"], 100.0 * (1 + 1e-9), 100.0, 100, 0.5, 1.5))
     case("decimal: vm NaN sum", False, sum_close(["check.py", "vm"], float("nan"), 1e-4, 300, -1.24, 1.17))
 
+def exact_lttb(T, Y, th, force=None):
+    """LTTB in fractions, the first of equal areas wins, bucket b forced to point force[b]: an independent replay."""
+    from fractions import Fraction as F
+    import math
+    n, nb = len(T), th - 2
+    every = (n - 2) / nb
+    st = lambda b: math.floor(b * every) + 1
+    out = [0]
+    for b in range(nb):
+        nlo, nhi = (st(b + 1), st(b + 2)) if b + 1 < nb else (n - 1, n)
+        cx, cy = F(sum(T[nlo:nhi]), nhi - nlo), sum(map(F, Y[nlo:nhi])) / (nhi - nlo)
+        a = out[-1]
+        area = lambda j: abs((T[a] - cx) * (F(Y[j]) - F(Y[a])) - (T[a] - T[j]) * (cy - F(Y[a])))
+        out.append((force or {}).get(b, max(range(st(b), st(b + 1)), key=lambda j: (area(j), -j))))
+    return out + [n - 1]
+
+def lttb_cases():
+    """rel.py accepts an LTTB answer that differs from tsdb's only through an exact tie of the triangle area (replayed on
+    the rows of DATA) and the picks that follow from it, and nothing else. Bucket 0: the next bucket's mean equals the
+    anchor's value, so points 1 (+1) and 2 (-1) have the same area."""
+    import struct
+    T = [k * 1000 for k in range(11)]
+    Y = [0.0, 1.0, -1.0, 0.5, 2.0, -2.0, 0.0, 3.0, 0.0, 0.0, 0.25]
+    th = 5
+    first, other = exact_lttb(T, Y, th), exact_lttb(T, Y, th, {0: 2})
+    assert first[1] == 1 and other[1] == 2 and first[2:-1] != other[2:-1], (first, other)
+    ref = {0: {"s": 0, "t": [T[k] for k in first], "v": [Y[k] for k in first]}}
+    rows = lambda idx: [[0, T[k], Y[k]] for k in idx]
+    d = tempfile.mkdtemp(prefix="checktest-")
+    old = os.environ.get("DATA")
+    try:
+        os.environ["DATA"] = os.path.join(d, "rows.rowbinary")
+        with open(os.environ["DATA"], "wb") as f:
+            for t, y in zip(T, Y): f.write(struct.pack("<Iqf", 0, t, y))
+        case("lttb: tsdb's answer", True, quiet(rel.compare, "lttb", ref, rows(first)))
+        case("lttb: the other point of a tie and the picks after it", True, quiet(rel.compare, "lttb", ref, rows(other)))
+        m = list(other); m[2] = next(j for j in range(4, 7) if j != other[2])
+        case("lttb: a pick with a smaller area after the tie", False, quiet(rel.compare, "lttb", ref, rows(m)))
+        m = list(first); m[1] = 3
+        case("lttb: a pick with a smaller area (no tie)", False, quiet(rel.compare, "lttb", ref, rows(m)))
+        m = rows(other); m[1][2] = 1.0
+        case("lttb: the tie's time with another row's value", False, quiet(rel.compare, "lttb", ref, m))
+        os.environ["DATA"] = os.path.join(d, "missing")
+        case("lttb: the other point of a tie without DATA", False, quiet(rel.compare, "lttb", ref, rows(other)))
+    finally:
+        if old is None: os.environ.pop("DATA", None)
+        else: os.environ["DATA"] = old
+        shutil.rmtree(d)
+
 def main():
     a = sys.argv[1:]
     if not a or a[0] != "mutate": raise SystemExit("usage: checktest.py mutate [TWA_REF WINDOWS_REF FULL_REF]")
@@ -134,6 +184,7 @@ def main():
         ref = builtin_twa(); print("TWA reference: built in")
     twa_cases(ref)
     decimal_cases()
+    lttb_cases()
     if len(a) >= 4:
         windows_cases(a[2], a[3])
     print("checktest", "OK" if failures == 0 else f"FAILED ({failures} cases)")

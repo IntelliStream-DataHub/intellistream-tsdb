@@ -121,7 +121,8 @@ def results_table(d, prefix=""):
 
 
 def loose_notes(d):
-    """loose.txt: TWA kinds timed although their answers differ from tsdb's within the stated bound."""
+    """loose.txt: TWA kinds timed although their answers differ from tsdb's within the stated bound, and LTTB answers
+    that differ through ties of the triangle area (rel.py)."""
     f = os.path.join(d, "loose.txt")
     if not os.path.exists(f):
         return []
@@ -175,7 +176,7 @@ def phase_flat(out, p, title):
         errors.append("%s: results without how-*.json" % p)
     if not t:
         return
-    out += ["## %s" % title, ""] + t + [""]
+    out += ["## %s" % title, ""] + t + loose_notes(p) + [""]
     out += how_table(hows, COLS)
 
 
