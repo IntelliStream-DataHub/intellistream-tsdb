@@ -766,6 +766,78 @@ static void crafted_f64_decimal(rec *r)
     free(blk);
 }
 
+/* ---- unpack, at every width ----
+ * bitpack.h's AVX2 unpack takes eight values per step for widths 1 to 25 (v3, and a native build without AVX-512BW)
+ * and leaves the last n % 8 values, the wider widths and short runs to the scalar loops. Blocks of int_bp with one
+ * vector of every width and of lengths around the group of eight and the vector of 1024, whose unused bits and
+ * bytes past the end are ones, decode at every level to what ref_ibp_decode (the test's own unpack) gives; and
+ * unpack itself, on a heap buffer with no more bytes past the packed ones than its contract allows (16 - ceil(w / 2),
+ * at least 7, where the vector loop runs; 7 otherwise): ASan sees a read beyond. */
+static void crafted_unpack(rec *r)
+{
+    static const size_t lens[] = {2,  3,  4,  5,  6,  7,   8,   9,   10,  11,   12,   13,   14,   15,   16,  17,
+                                  18, 19, 23, 24, 25, 31,  32,  33,  34,  39,   40,   41,   1023, 1024,  1025, 8192};
+    uint64_t s = 777;
+    uint32_t *z = malloc(1024 * sizeof *z);
+    uint8_t *blk = malloc(8 + 9 * (1024 * 4 + 8) + BLK_SLACK);
+    for (int w = 0; w <= 32; w++)
+        for (size_t l = 0; l < sizeof lens / sizeof *lens; l++) {
+            size_t n = lens[l];
+            int64_t first = (int64_t)(s = ds_mix(s + 1));
+            memcpy(blk, &first, 8);
+            uint8_t *o = blk + 8;
+            uint32_t top = w == 32 ? UINT32_MAX : (uint32_t)((1ull << w) - 1);
+            for (size_t v0 = 1; v0 < n; v0 += 1024) {
+                size_t nv = MIN((size_t)1024, n - v0);
+                for (size_t i = 0; i < nv; i++) {
+                    s = ds_mix(s + i);
+                    z[i] = (uint32_t)s & top;
+                    if (i % 5 == 0) /* extremes: all ones, all zeros */
+                        z[i] = (i / 5) & 1 ? top : 0;
+                }
+                *o++ = (uint8_t)w;
+                pack(z, nv, w, o);
+                o += packed_bytes(nv, w);
+            }
+            size_t len = (size_t)(o - blk);
+            memset(o, 0xff, BLK_SLACK); /* what the loads past the end see */
+            memset(dec, 0xa5, n * 16);
+            int rc = int_bp_decode(blk, len, n, (int64_t *)(void *)dec);
+            int rc2 = ref_ibp_decode(blk, len, n, (int64_t *)(void *)(dec + n * 8));
+            char what[64];
+            snprintf(what, sizeof what, "crafted unpack w %d n %zu", w, n);
+            put(r, what, "int_bp", dec, n * 8);
+            if (rc != 0 || rc2 != 0 || memcmp(dec, dec + n * 8, n * 8) != 0) {
+                fprintf(stderr, "%s: differs from the reference unpack\n", what);
+                failures++;
+            }
+        }
+    free(z);
+    free(blk);
+
+    /* unpack alone, against bits read one value at a time from a stream pack wrote */
+    for (int w = 1; w <= 32; w++)
+        for (size_t n = 1; n <= 70; n++) {
+            uint32_t top = w == 32 ? UINT32_MAX : (uint32_t)((1ull << w) - 1), in[70], got[70];
+            for (size_t i = 0; i < n; i++)
+                in[i] = (uint32_t)(s = ds_mix(s + i)) & top;
+            size_t pb = packed_bytes(n, w);
+            size_t spare = n >= 8 && w <= 25 ? MAX((size_t)(16 - (w + 1) / 2), (size_t)7) : 7;
+            uint8_t *buf = malloc(pb + 4 + spare), *exact = malloc(pb + spare);
+            memset(buf, 0xff, pb + 4 + spare);
+            pack(in, n, w, buf); /* pack may write up to 3 bytes of padding */
+            memcpy(exact, buf, pb);
+            memset(exact + pb, 0xff, spare);
+            unpack(exact, n, w, got);
+            if (memcmp(got, in, n * 4) != 0) {
+                fprintf(stderr, "unpack w %d n %zu: wrong values\n", w, n);
+                failures++;
+            }
+            free(buf);
+            free(exact);
+        }
+}
+
 /* The lengths of the prefixes folded and searched: every one up to SHORT_LENS (the short runs, the kernels' tails,
  * most of the sets' thresholds), the longer thresholds on both sides (check_thresholds), then all of it. */
 #define SHORT_LENS 66
@@ -824,6 +896,7 @@ static void run(rec *r, codec_ctx *c)
 {
     crafted_sums(r);
     crafted_f64_decimal(r);
+    crafted_unpack(r);
     for (int k = 0; k < nin; k++) {
         const input *x = &in[k];
         size_t w = type_width(x->type);

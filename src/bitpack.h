@@ -7,6 +7,12 @@
 #if defined(__SSE2__)
 #include <emmintrin.h> /* x86-64 baseline: every CPU level has it */
 #endif
+/* AVX2 unpack (below): the v3 level, and -march=native on CPUs without AVX-512BW. The v4 level keeps the
+ * portable loops: it has not been measured against them (no AVX-512 machine at the time of writing). */
+#if defined(__AVX2__) && !defined(__AVX512BW__)
+#define BITPACK_AVX2 1
+#include <immintrin.h>
+#endif
 
 
 static inline int bits_for(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
@@ -60,10 +66,57 @@ static void (*const unpack_fn[33])(const uint8_t *, size_t, uint32_t *) = {
     unpack_18,  unpack_19, unpack_20, unpack_21, unpack_22, unpack_23, unpack_24, unpack_25, unpack_26,
     unpack_27,  unpack_28, unpack_29, unpack_30, unpack_31, unpack_32};
 
+#ifdef BITPACK_AVX2
+/* Eight values per step, w bytes of the stream, for w = 1..25: a 128-bit load for each half (the second at byte
+ * w / 2, the bit offset w odd leaves in the second half is in its shifts), PSHUFB moves the four bytes each value
+ * starts in into its 32-bit lane, a variable shift drops the bits below it and a mask the bits above (w + 7 <= 32,
+ * so a lane holds the whole value). Neither PDEP nor any CPU-specific choice: on a Comet Lake core it decodes
+ * 13-15 G values/s against 1.7-2.4 for the loops above, and PDEP (one 64-bit result per 8 values at best, w <= 8)
+ * is no faster beyond w = 8 and slow before Zen 3. The tables are constants (no startup code, see levels.h):
+ * lane k starts at bit k * w, or (k - 4) * w + 4 * (w & 1) from the second load. Reads up to 16 - ceil(w / 2)
+ * bytes (at most 15) past the packed bytes, the loops above up to 7 (BLK_SLACK covers both), and writes exactly
+ * n values. */
+#define BP_R(W, K) ((K) < 4 ? (K) * (W) : ((K) - 4) * (W) + 4 * ((W) & 1))
+#define BP_B(W, K, J) ((uint8_t)((BP_R(W, K) >> 3) + (J)))
+#define BP_C(W, K) BP_B(W, K, 0), BP_B(W, K, 1), BP_B(W, K, 2), BP_B(W, K, 3)
+#define BP_CTL(W) {BP_C(W, 0), BP_C(W, 1), BP_C(W, 2), BP_C(W, 3), BP_C(W, 4), BP_C(W, 5), BP_C(W, 6), BP_C(W, 7)}
+#define BP_S(W, K) ((uint32_t)(BP_R(W, K) & 7))
+#define BP_SHR(W) {BP_S(W, 0), BP_S(W, 1), BP_S(W, 2), BP_S(W, 3), BP_S(W, 4), BP_S(W, 5), BP_S(W, 6), BP_S(W, 7)}
+#define BP_ROWS(M) {{0}, M(1), M(2), M(3), M(4), M(5), M(6), M(7), M(8), M(9), M(10), M(11), M(12), M(13), \
+                    M(14), M(15), M(16), M(17), M(18), M(19), M(20), M(21), M(22), M(23), M(24), M(25)}
+#define BITPACK_AVX2_MAX_W 25
+static const uint8_t bp_ctl[BITPACK_AVX2_MAX_W + 1][32] = BP_ROWS(BP_CTL);
+static const uint32_t bp_shr[BITPACK_AVX2_MAX_W + 1][8] = BP_ROWS(BP_SHR);
+
+static inline void unpack_avx2(const uint8_t *in, size_t n, int w, uint32_t *out)
+{
+    const __m256i ctl = _mm256_loadu_si256((const __m256i *)(const void *)bp_ctl[w]);
+    const __m256i shr = _mm256_loadu_si256((const __m256i *)(const void *)bp_shr[w]);
+    const __m256i mask = _mm256_set1_epi32((int)((1u << w) - 1));
+    const size_t hi = (size_t)w >> 1;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8, in += w) {
+        __m256i x = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(const void *)in)),
+                                            _mm_loadu_si128((const __m128i *)(const void *)(in + hi)), 1);
+        x = _mm256_and_si256(_mm256_srlv_epi32(_mm256_shuffle_epi8(x, ctl), shr), mask);
+        _mm256_storeu_si256((__m256i *)(void *)(out + i), x);
+    }
+    for (; i < n; i++) { /* fewer than eight left: i & 7 values into the group that `in` points at */
+        uint64_t bit = (uint64_t)(i & 7) * (uint64_t)w, x;
+        memcpy(&x, in + (bit >> 3), 8);
+        out[i] = (uint32_t)((x >> (bit & 7)) & ((1ull << w) - 1));
+    }
+}
+#endif
+
 static inline void unpack(const uint8_t *in, size_t n, int w, uint32_t *out)
 {
     if (w == 0)
         memset(out, 0, n * sizeof *out);
+#ifdef BITPACK_AVX2
+    else if (w <= BITPACK_AVX2_MAX_W && n >= 8)
+        unpack_avx2(in, n, w, out);
+#endif
     else
         unpack_fn[w](in, n, out);
 }

@@ -4,7 +4,7 @@ Measured 2026-10-29 on the 10850K (10 cores / 20 threads, AVX2, no AVX-512), Ubu
 governor `powersave` under `intel_pstate` (HWP, EPP `balance_performance`; no sudo to change it), the desktop idle
 at about 1.5 CPUs. Binaries: a portable-style build (`-march=x86-64-v2`, codecs also at v3 and v4, `NO_URING=1`: liburing
 headers are missing, so no `tsdbd`, clients or `make dist`). Raw output was kept in `/var/tmp/i10850k/`.
-Not done yet: steps 2 (thresholds), 3 (PDEP/PEXT), the hydraulic data, the server and clients,
+Not done yet: step 2 (thresholds), the hydraulic data, the server and clients,
 and the same runs on the 7950X.
 
 ## Step 1: v2 against v3 (`tools/fold-bench.sh build-lv 5`, `codec-bench`, `type-bench`; medians, one run each for the codecs)
@@ -54,6 +54,59 @@ range against a plain reference: identical at every level, and three deliberate 
 before this change. `test_levels` and `test_types` pass under ASan + UBSan on the native AVX2 build and at v2 and v3
 in `build-lv`; `tools/check-isa.sh` is clean. No byte of a block changes, so no jepsen run. Not run: `make dist-test`,
 `dist-check-sandybridge` (they need static liburing), `make tsan` (no concurrency touched), the 7950X.
+
+## Step 3: PDEP/PEXT bit unpacking: not used; an AVX2 shuffle kernel instead (`src/bitpack.h`)
+
+`unpack()` (the bit-packed integers of int_bp, decimal_bp, delta_bp, ALP, and the float64 decimal codec) ran at 1.6-2.4 G
+values/s at v3, the cost of one 8-byte load, shift and mask per value that GCC does not vectorize well. Two prototypes
+on 1024 values (one vector of the codecs), mean of 7 runs, M values/s:
+
+| w | today | PDEP | AVX2 shuffle |
+|---:|---:|---:|---:|
+| 1-7 | 1,750-1,960 | 16,300-17,700 | 14,100-14,800 |
+| 8 | 2,424 | 17,384 | 14,601 |
+| 9-15 | 1,640-1,790 | 9,460-9,650 | 13,770-14,140 |
+| 16 | 2,427 | 9,626 | 14,039 |
+| 17-23 | 1,635-1,785 | (not tried) | 13,390-14,010 |
+| 25 | 1,778 | (not tried) | 13,160 |
+
+PDEP (w <= 8: one `pdep` into bytes, widened by `vpmovzxbd`; w 9-16: two into 16-bit lanes) wins only up to w = 8, by about
+1.2x, loses 1.5x to the shuffle kernel from 9 to 16, covers no width above 16, and is microcoded on Zen 1 and 2: it would
+need a CPU-model dispatch for a gain on the narrowest widths only. The shuffle kernel needs no dispatch: for w = 1..25 it
+handles eight values (w bytes) a step, two 128-bit loads (the second at byte w / 2), one `vpshufb` with a per-width constant
+control that moves the four bytes each value starts in into its 32-bit lane, `vpsrlvd` and a mask (w + 7 <= 32); the tables are
+constants built with macros (no startup code). It is in `unpack()` for 1 <= w <= 25, n >= 8; the last n % 8 values, w = 0,
+w >= 26 and short runs take the old loops. Only `__AVX2__` without `__AVX512BW__` uses it: the v3 level and `-march=native` on
+CPUs without AVX-512; v2 and v4 are unchanged (v4 for want of an AVX-512 machine to measure on; AVX2 code would run there).
+The loads read up to 16 - ceil(w / 2) (at most 15) bytes past the packed bytes, inside BLK_SLACK (32) as the old loops'
+7 were (audited: part.c decodes from mapped parts followed by the footer, the zstd scratch is reserved with BLK_SLACK,
+the fuzz harness and the tests pad); output is exactly n values. Bytes are the same: nothing about the format changes.
+
+Effect (v3, 7 interleaved runs of old and new, mean (sd); M values/s):
+
+| | before | after | |
+|---|---:|---:|---:|
+| `int_bp_decode`, one granule | 1,080-1,096 | 2,462-2,491 | 2.3x |
+| float64 decimal decode (k * 10^-e), `mb` | 856-868 | 1,545-1,565 | 1.8x |
+| float64 decimal decode (k / 10^e) | 694-697 | 1,066-1,075 | 1.5x |
+| float64 decimal encode | 548-645 | the same | (pack is scalar, untouched) |
+
+`type-bench` float64 and integer decode, with ZSTD and everything else (7 runs): cpu_temp 509 to 689, flow_rate 688 to 1,068,
+hdd_temp 503 to 659, tank_bar 490 to 670, vibration 575 to 817, flow_total 317 to 348; int64 sequence 881 to 1,646, rate
+1,040 to 1,639, totalizer 381 to 421; bool door 1,073 to 1,527, coin flips 692 to 1,047; state machine mode 780 to 1,260. The
+bytesplit datasets (random, tank_psi: no bit packing) are unchanged. `codec-bench` float32 decode, codec alone: ALP 1,477 to
+5,281, ALP_rd 640 to 1,698, decimal_bp 1,013 to 2,093, bit-delta 1,154 to 2,649, AUTO 1,070 to 2,103; with ZSTD(1): ALP 769 to
+1,275, AUTO 695 to 1,669. Others unchanged.
+
+Checks: `tests/test_levels.c` decodes int_bp blocks of every width 0-32 at 32 lengths around 8, 1024 and 8192 at every level
+against `ref_ibp_decode`, and runs `unpack` alone on a heap buffer with exactly the bytes its contract allows past the
+packed ones (ASan: a read beyond is an error; this runs in a `-march=native` build, where the AVX2 path is compiled in).
+Four mutations of the kernel (the second load's bit offset, its byte offset, the shift mask, the loop bound) each fail it.
+`test_levels`, `test_types`, `test_damage`, `test_crafted` and `test_tsdb` pass under ASan + UBSan on the native build;
+`make test IO=epoll` passes except `test_gindex` (two failures that exist without this change); `tools/check-isa.sh` is clean.
+The Makefile object rules did not list `src/bitpack.h`, so an edit of it rebuilt nothing (my first measurement ran stale
+objects and showed no change): it is a dependency of the four rules now. No jepsen (no byte on disk changes). Not run: the
+7950X (v4 is unchanged there by construction), `make dist-test`.
 
 ## Step 5: Hyper-Threading (10 cores, 20 threads; siblings are cpu N and N+10)
 
