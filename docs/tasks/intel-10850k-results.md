@@ -28,13 +28,24 @@ every CPU that runs v3 gets (measured here only), with byte-identical output at 
 
 End to end through `bench/clients/run.sh` (the C client, embedded and `tsdbd`, 5 repeats, main against this branch,
 same machine and script): **queries +9% to +27%** (embedded raw 3600-row windows 37.8k to 46.6k q/s on one thread; 86,400-row
-aggregates over TCP 8.8k to 9.7k and, on 32 connections, 35.7k to 41.1k), **loads unchanged** (bound by fsync and the
-disk). The hydraulic compression table is identical to main's.
+aggregates over TCP 8.8k to 9.7k and, on 32 connections, 35.7k to 41.1k), **loads unchanged within noise** (bound by fsync and
+the disk; the TCP zstd cells vary 8-27%). The hydraulic compression table is identical to main's.
 
 What was measured and **not changed**: the AVX2 thresholds (step 2: crossovers on this CPU differ by 8 to 16 rows, and 96
 for float32 without nulls, from Zen 4's, but no query is faster with other values), PDEP/PEXT (step 3: a plain AVX2
 kernel is faster beyond 8 bits and works on every CPU), the default of one query thread per logical CPU (step 5: the second
 thread of a core is worth 11 to 23%, and nothing is slower with it).
+
+**On the 7950X and 9950X neither change runs by default**: they pick the v4 level, where the shuffle kernel is compiled out
+(`__AVX512BW__`) and the AVX2 decimal path is compiled out (`__AVX512DQ__`; the v4 object vectorizes the decimal *decode*
+conversions itself, with packed `vcvtqq2pd`, but the *encode* loop stays scalar, so the AVX2 encoder may pay at v4 too:
+untested). To measure the same
+code the 10850K runs, use `TSDB_CPU=v3` (a `make dist` or CPU_LEVELS build) or an `-march=x86-64-v3` build, and measure
+native v4 next to it.
+
+Found, not fixed: **`test_gindex` fails on `main` too, and the cause is now known** (a NaN-payload mismatch between the index
+encoder and decoder, see Verification). Real inserts with NaN readings did not reproduce it (0 of 108 refused); a
+three-line guard fixes the test in a scratch copy. `make test` is therefore not clean on this machine.
 
 Still open, for the 7950X and the 9950X: whether the unpack kernel should also run at **v4** (it is enabled only where there
 is no AVX-512BW, because it could not be measured on AVX-512 hardware; `-DTSDB_UNPACK_AVX2` and `build/decode-bench`
@@ -268,8 +279,8 @@ not depend on the CPU.
 ## Clients and the server (`bench/clients/run.sh --clients c --repeat 5`)
 
 Embedded C and the C client over TCP to `tsdbd` (epoll: no liburing), the 100 M-row set, 5 repeats, medians. Run on the
-branch (2694f60) and on `main` (eb58c21) in turn, the same binaries' flags (`-march=native`, which here is AVX2), the
-machine quiet before every measurement (0.27 to 0.92 CPUs busy), 62 loads per run checked against the file (row count,
+branch (2694f60) and then on `main` (eb58c21) (two sequential runs of about 12 minutes, not interleaved), both built with
+`-march=native` (here AVX2), the machine quiet before every measurement (0.27 to 0.92 CPUs busy), 62 loads per run checked against the file (row count,
 sum, every timestamp and value): 0 mismatches in both runs. Queries, q/s, main -> branch:
 
 | query | embedded, 1 thread | embedded, 32 threads | TCP, 1 connection | TCP, 32 connections |
@@ -280,15 +291,15 @@ sum, every timestamp and value): 0 mismatches in both runs. Queries, q/s, main -
 
 Loads, M rows/s with 1 / 4 / 16 threads or connections, main -> branch: embedded fsync on 30.1 -> 30.3, 93.1 -> 89.7, 146.9
 -> 141.9; fsync off 33.7 -> 33.8, 117.5 -> 118.0, 197.0 -> 195.9; TCP zstd 19.4 -> 19.6, 59.1 -> 59.8, 91.0 -> 87.9; TCP plain 27.0 ->
-27.3, 79.5 -> 76.0, 87.2 -> 86.6. Within the noise (the spread of the TCP zstd cells is 8-27% of the median): loading is
-bound by fsync and the disk, not by decode. The Rust, Python and Java clients were not run (the task asks for `--clients c`;
+27.3, 79.5 -> 76.0, 87.2 -> 86.6. Within the noise: the spread of the TCP zstd cells is 8-27% of the median, so only the query gains are
+clearly beyond it. Loading is bound by fsync and the disk, not by decode. The Rust, Python and Java clients were not run (the task asks for `--clients c`;
 cargo, Maven and a Python environment were not set up).
 
 ## Verification
 
 | check | build | result |
 |---|---|---|
-| `make test IO=epoll` (`NO_URING=1`) | native, gcc 13.3 | all pass except `test_gindex`: 2 failures that also fail on `main` (below) |
+| `make test IO=epoll` (`NO_URING=1`) | native, gcc 13.3 | **not clean**: every test passes except `test_gindex` (2 failures), which also fails on `main` (below); run as `make -i` to get past it |
 | `tests/test_levels` | v2 scalar/SSE/AVX, v3 scalar/SSE/AVX/AVX2, and native | identical output at every level, 405 inputs; 92 float64 decimal inputs, 400 crafted decimal blocks, widths 0-32 at 32 lengths for unpack, `unpack` on an exactly sized buffer |
 | mutations of the new code (7: 3 in the decimal path, 4 in the unpack kernel) | test_levels | each one fails the suite |
 | `make asan` (full) | generic x86-64 (`ARCH=` in the target), copy of the tree | pass, no report; `test_gindex` passes there too |
@@ -304,21 +315,43 @@ or lowered here without root).
 `setarch x86_64 -R make tsan` (no randomization, no root) runs it. `make asan` and `make tsan` build with `ARCH=` (generic
 x86-64), so neither compiles the AVX2 kernels: the native ASan + UBSan run above covers those.
 
-**`test_gindex` (found, not fixed).** Two cases ("random fields" #113 and #293) fail with "the granule index encoder lost
-bits" on `main` as on this branch, in any build with `-O1` or higher (gcc 13.3: `-O1`, `-O2`, `-O3`, with or without
-`-march=native`, `-fno-tree-vectorize`), and pass at `-O0`, with `-fsanitize=undefined` at `-O2`, and under the TSan and ASan
-builds. `struct granule` has no padding (160 bytes, all fields) and UBSan reports nothing. clang (`-O1`, MemorySanitizer
-build) fails many more cases, among them the "float32 special" ones. So the encoder's own round-trip check (`gix_encode`
-decodes what it wrote and compares it with `memcmp`) refuses indexes when the compiler optimizes: a refused part is a
-failed insert or merge, so this may matter outside the test. The cause is not known. It is worth a look before the
-7950X and 9950X runs (gcc 14 or 15 may behave differently).
+**`test_gindex` (cause found, not fixed).** Two cases ("random fields" #113 and #293) fail with "the granule index encoder
+lost bits" on `main` as on this branch, in any build with `-O1` or higher (gcc 13.3: `-O1`, `-O2`, `-O3`, with or without
+`-march=native`, `-fno-tree-vectorize`), and pass at `-O0`, with `-fsanitize=undefined` at `-O2`, and under the TSan and
+ASan builds; clang (`-O1`, MemorySanitizer build) fails many more cases, among them the "float32 special" ones.
+`struct granule` has no padding and UBSan reports nothing. Printing the differing bytes in a scratch copy: always bytes 128-129,
+the low payload bytes of `tw_lin`; the entries have `tw_first` and `tw_last` both NaN with different payloads
+(`fffffffffffffa26` and `fffffffffffffc42`) and a finite `fsum`. `gix_dlin(sum, first, last, gap)` is
+`(sum - (first + last) * 0.5) * gap`; which operand's payload `first + last` returns when both are NaN is the compiler's
+choice (the result of an IEEE operation on two NaNs has an unspecified payload; x86 returns the first source operand's), and
+the encoder's evaluation (`gindex.c`, deciding that `tw_lin` is derivable) and the decoder's (`gx_load`, inlined elsewhere)
+are compiled with different operand orders at `-O1` and up. So the encoder flags the field as derived, the decoder derives
+other bits, and the encoder's own round-trip `memcmp` refuses the index. At `-O0` the two agree by accident.
+
+Is real data exposed? It needs first and last both NaN with different payloads and a **finite** sum, which a series with
+NaN readings does not give (the sum is NaN then); nulls share one payload. Inserts of a regular float32 series with NaN
+first, last and middle readings (6 x 6 payload pairs, 3 shapes, 108 inserts, native `-O3`) were all accepted. So the test
+builds an input real data probably cannot, but the encoder's choice is compiler-dependent and the test is red. A fix that
+makes the test pass in a scratch copy, at native and generic `-O3`, is to never derive from a NaN (in `gix_encode`, the loop that
+fills `skip[]`):
+
+```c
+bool nan_ = e->fsum != e->fsum || e->tw_first != e->tw_first || e->tw_last != e->tw_last;
+skip[2 * i] = !nan_ && same_bits(gix_dstep(e->fsum, e->tw_last, e->tw_gap), e->tw_step);
+skip[2 * i + 1] = !nan_ && same_bits(gix_dlin(e->fsum, e->tw_first, e->tw_last, e->tw_gap), e->tw_lin);
+```
+
+NaN-valued grid granules then keep `tw_step` and `tw_lin` explicit (a few bytes more; the decoder already reads explicit
+fields, so the format is unchanged). Not applied: it is outside this task, and it changes the index encoder.
 
 ## Repeating this on the 7950X and the 9950X
 
 [bench/cpu-compare/README.md](../../bench/cpu-compare/README.md) has the order and the commands. In short: build `main` and
 this branch, run `build/decode-bench` (also with `-DTSDB_UNPACK_AVX2`), `thresholds.sh --cpu v3` (and `v4`),
 `ht-sweep.sh --server`, `bench/hydraulic/run.sh` and `bench/clients/run.sh --clients c --repeat 5` on both. Questions the
-other CPUs answer:
+other CPUs answer. First, **both changes are compiled out at v4**, the level these CPUs pick: run with `TSDB_CPU=v3` (and
+`TSDB_CPU=v4` next to it) to see them, and run `test_levels` with `-DTSDB_UNPACK_AVX2`, which will be the first time the
+shuffle kernel runs on AVX-512 hardware (here it was only compiled for it).
 
 1. **Unpack kernel at v4.** `decode-bench` shows the loops, the kernel and PDEP side by side per width; on a 7950X
    (Zen 4 runs 512-bit operations in 256-bit halves) and a 9950X (Zen 5 has full-width units) it shows whether the kernel, which runs there too, beats the
@@ -328,9 +361,11 @@ other CPUs answer:
    crossovers (table in step 2) hold on AMD? A per-vendor table is only worth it if a crossover moves by a factor
    and a query follows.
 3. **Hyper-Threading** (`ht-sweep.sh`): the second thread is worth 11 to 23% here; the same on 16 cores / 32 threads?
-4. **The AVX2 decimal path against v4.** At v4 the compiler vectorizes the decimal conversions itself
-   (`vcvtqq2pd`), and `src/codec_typed.c` leaves them to it (`!defined(__AVX512DQ__)`). Compare `decode-bench`'s float64
-   decimal rows at `TSDB_CPU=v3` and `TSDB_CPU=v4` on the same machine.
+4. **The AVX2 decimal path against v4.** At v4 `src/codec_typed.c` leaves the conversions to the compiler
+   (`!defined(__AVX512DQ__)`). Checked in the objects (`objdump` of `f64_decimal_decode_v4` and `f64_decimal_encode_keep_v4`):
+   the v4 *decode* has packed `vcvtqq2pd` conversions, the v4 *encode* none. Compare `decode-bench`'s float64 decimal
+   rows at `TSDB_CPU=v3` and `TSDB_CPU=v4` on the same machine: if v3's encode is faster, the encoder's guard should drop
+   `__AVX512DQ__` (the decoder's probably not).
 5. **Before and after the same way** (`bench/clients/run.sh` on `main` and on the branch): on this CPU queries gained
    9-27%; is it the same on AMD?
 

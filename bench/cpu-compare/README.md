@@ -11,6 +11,13 @@ threshold sweep works on a scratch copy.
 | `thresholds.sh` + `thresholds-env.patch` | `bench/cpu-compare/thresholds.sh --cpu v3` (and `--cpu v4`) | Where the short-run kernels hand over to the wide ones on this CPU, against the constants in `src/simd.c`. |
 | `bench/hydraulic/run.sh`, `bench/clients/run.sh` | see their READMEs | Compression on real data (it must not move: no byte on disk changes), and loads and queries through `tsdbd`. |
 
+## Which code runs where
+
+The 10850K runs the **v3** level. A 7950X or 9950X picks **v4**, where the AVX2 shuffle unpack kernel is compiled out
+(`__AVX512BW__`) and the AVX2 float64 decimal path is compiled out (`__AVX512DQ__`; at v4 the compiler vectorizes the
+decimal decode itself but not the encode), so the changes of this branch do not run there by default. To compare the same code across CPUs run `TSDB_CPU=v3` (a `make dist` or
+CPU_LEVELS build), or build with `ARCH=-march=x86-64-v3`; measure native v4 next to it.
+
 ## Order for a new machine
 
 Quiet machine (no builds, no desktop load), governor `performance`, gcc 14 or newer, liburing installed.
@@ -20,12 +27,18 @@ Quiet machine (no builds, no desktop load), governor `performance`, gcc 14 or ne
 2. `build/decode-bench`, then again with the shuffle kernel forced at v4:
    `make B=build-u CFLAGS="-O3 -g -DTSDB_UNPACK_AVX2" build-u/decode-bench build-u/test_levels && build-u/decode-bench && build-u/test_levels`
    (`test_levels` must still pass: it compares every level byte for byte). On an AVX-512 CPU the default build
-   keeps the loops (`__AVX512BW__`), and the second run shows whether the kernel would be ahead of them.
+   keeps the loops (`__AVX512BW__`), and the second run shows whether the kernel would be ahead of them. The knob is
+   experimental and **unverified on AVX-512 hardware** (it was only compiled for it), off in every default build, and the
+   objects depend on the headers listed in the Makefile rules but not on `CFLAGS`: use a separate build directory, as above.
 3. `tools/fold-bench.sh build-dist 11` (every level this CPU has), and
    `bench/cpu-compare/thresholds.sh --cpu v3 --vary` (and `--cpu v4` on AVX-512 CPUs).
 4. `bench/cpu-compare/ht-sweep.sh --server` (about 20 minutes at 5 rounds of 3 s).
-5. `bench/hydraulic/get.sh`, `convert.py`, `run.sh` on both trees: the tables must be identical.
-6. `bench/clients/run.sh --clients c --repeat 5` on both trees (about 12 minutes each).
+5. `make tsan` may abort every test with `FATAL: ThreadSanitizer: unexpected memory mapping` (and finish in under a
+   minute) on a kernel with high address randomization: run it as `setarch x86_64 -R make tsan`. `make test` is red
+   until `test_gindex` is fixed (see the report); `make -i test` runs the rest.
+6. `bench/hydraulic/get.sh`, `convert.py`, `run.sh` on both trees: the tables must be identical.
+7. `bench/clients/run.sh --clients c --repeat 5` on both trees (about 12 minutes each; run them one after the other, the
+   load average must be below 2 at the start).
 
 For the same code path on every CPU use `TSDB_CPU=v3` (a CPU_LEVELS build, `make dist`): the 7950X and 9950X then run
 the AVX2 kernels the 10850K runs, and the comparison is the CPU, not the code. Without it they run v4.
