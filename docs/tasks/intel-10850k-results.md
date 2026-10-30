@@ -308,6 +308,7 @@ cargo, Maven and a Python environment were not set up).
 | ASan + UBSan on `test_levels`, `test_types`, `test_damage`, `test_crafted`, `test_tsdb` | native (AVX2 paths compiled in) | pass, no report |
 | `make tsan` | generic x86-64, `IO=epoll` | pass, no report, **under `setarch -R`** (below) |
 | `tools/check-isa.sh` | v2/v3/v4 build | clean: nothing above v2 outside the dispatch |
+| rounding modes (`rounding_modes` in `test_levels`) | every level and kernel | float32 and float64 inputs bit-identical under all four modes; fails on the old codec files |
 | jepsen | - | not run: no byte on disk changes, no write or recovery path touched |
 | `make dist`, `dist-test`, `dist-check-sandybridge`, `dist-check-almalinux10` | - | **not run**: `make dist` needs a static liburing, which is not installed here (Podman is) |
 
@@ -349,6 +350,43 @@ explicit fields, so no format changes and every index written before still reads
 `tests/test_gindex.c` (NaN ends with four different payloads, a finite sum, `tw_lin` and `tw_step` set to each payload and
 to what `gix_dlin`/`gix_dstep` give; every entry round-trips alone and together) fails on the old encoder at native `-O3`
 (27 failures: the 2 random cases of before and 25 of these) and passes with the fix at native `-O3`, generic `-O3` and `-O0`; `make test IO=epoll` is clean.
+
+## Rounding mode (found in review, fixed in the last commit)
+
+The float codecs keep an integer k only when `k / 10^e` (or `k * 10^-e`) gives the value back bit for bit, so their
+output depends on the CPU's rounding mode, which a host application may set (the engine never does) and which is per
+thread. Measured on 60,000 random blocks per mode with exceptions in random lanes: at round-to-nearest the scalar and the
+AVX2 encoders gave the same bytes in every case; under `FE_DOWNWARD` 790 blocks encoded differently between the two
+levels, under `FE_TOWARDZERO` 6, and under the three directed modes 11, 8 and 28 blocks (scalar too, so before this
+branch) decoded at round-to-nearest to other values than were written, silently. The fix: the four block entry points
+(`block_encode_f32`, `block_encode_vals`, `block_decode_f32`, `block_decode_vals`) run with round-to-nearest and put the
+caller's mode back (`src/fpmode.h`: `fp_nearest` / `fp_restore` on the SSE control register, rounding bits only,
+around a noinline body; `fenv.h` where there is no SSE2).
+
+- **Accuracy.** `tests/test_levels.c` `rounding_modes`, at every CPU level and kernel: each float32 and float64 input
+  encodes (AUTO, as inserts and as merges write) under `FE_UPWARD`, `FE_DOWNWARD` and `FE_TOWARDZERO` to the same
+  bytes as at `FE_TONEAREST`; the nearest block decodes to the input under each mode; the caller's mode is there after
+  the call (also where only MXCSR was set, which glibc's `fegetround` does not see); `block_encode_f32` and
+  `block_decode_f32` on their own as well. On the old codec files the first version of the test failed with 2,078 failures; six
+  mutations of the guard (a missing restore, a missing force, in each of the entries) each fail it. Writing a 40,000-row
+  series (regular grid, three decimals) under each mode and comparing the part files with the nearest write: **before,
+  the data blocks differ from byte 48 on, in every mode, float32 and float64; after, the data blocks are
+  byte-identical** and only the granule index and footer (the last 280 to 424 bytes) differ.
+- **Cost.** One `STMXCSR` per entry when the mode is already nearest (and per nested entry), an `LDMXCSR` in and out
+  otherwise. `block_encode_vals` / `block_decode_vals`, v3, old against new, 9 interleaved runs on a quiet machine
+  (0.4 to 1.4 CPUs busy before each pair), minimum of the runs: float64 granule of 8192 values encode 14,555 -> 14,610
+  ns (+0.4%), decode 7,367 -> 7,349 ns (-0.2%); float32 encode 25,965 -> 25,982 ns, decode 3,497 -> 3,480 ns; a block
+  of 64 values (the worst case): float64 decode 75.9 -> 76.6 ns, float32 decode 48.6 -> 50.2 ns (+1.6 ns, 3%),
+  encode within 1%. The means carry one disturbed run each (the machine was shared with a ClickHouse server for a
+  while), the minima and medians agree.
+- **Gates.** `make test IO=epoll` clean, `make jepsen` (12 runs, all valid), full `make asan` clean, `check-isa` clean;
+  `test_levels` and `test_types` also pass at v2 and v3 and native. At the default mode no byte changes.
+- **Not covered, found while measuring.** The granule statistics (sums, the spread, TWA areas) and the index's
+  derived areas (`gix_dlin`, `gix_dstep`) are computed in the calling thread's mode; a part written under another
+  mode has other bits in its index (and a float64 index a few bytes larger, fewer areas being derivable), the values
+  of the data stay exact. These are sums rounded in another direction, not wrong data, so they stay as they are: forcing
+  the mode in `granule_stats` costs once per granule on the write path, but the derived areas are also recomputed on
+  every read of the index (`gx_load`, the hot path of aggregate queries), where a guard would cost on every granule.
 
 ## Repeating this on the 7950X and the 9950X
 

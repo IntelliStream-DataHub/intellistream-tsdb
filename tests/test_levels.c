@@ -18,9 +18,11 @@
  */
 #include "internal.h"
 #include "bitpack.h"
+#include "fpmode.h"
 #include "../tools/datasets.h"
 #include "hydraulic_psi.h"
 
+#include <fenv.h>
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -892,11 +894,115 @@ static void twa_ref(int type, const int64_t *ts, const void *v, size_t n, twa_su
     *o = (twa_sums){.step = canon_nan(step), .lin = canon_nan(lin), .sms = sms, .lms = lms, .gap = gap};
 }
 
+/* ---- the CPU's rounding mode ----
+ * The decimal codecs keep an integer only when it rebuilds the value bit for bit, so their blocks and their decoded
+ * values depend on how the CPU rounds (fpmode.h). A host application may have set FE_UPWARD, FE_DOWNWARD or
+ * FE_TOWARDZERO: every float32 and float64 input must then encode to the very bytes it gives at FE_TONEAREST (AUTO,
+ * as inserts and as merges write it), the block of the nearest encode must decode to the input under each mode, and
+ * the caller's mode must be there again after the call, also where only the SSE control register was set (glibc's
+ * fegetround reads the x87 word, which a program that sets MXCSR itself does not touch). */
+static unsigned rc_bits(void)
+{
+#if defined(__SSE2__)
+    return _mm_getcsr() & FP_RC_MASK;
+#else
+    return (unsigned)fegetround();
+#endif
+}
+
+static void rounding_modes(codec_ctx *c)
+{
+    static const int modes[] = {FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO};
+    static const char *const names[] = {"FE_UPWARD", "FE_DOWNWARD", "FE_TOWARDZERO"};
+    size_t mx = 0;
+    for (int k = 0; k < nin; k++)
+        mx = MAX(mx, in[k].n);
+    uint8_t *ref = malloc(BUF(mx) + BLK_SLACK);
+    int shown = 0;
+    for (int k = 0; k < nin; k++) {
+        const input *x = &in[k];
+        if (x->type != TSDB_FLOAT32 && x->type != TSDB_FLOAT64)
+            continue;
+        size_t w = type_width(x->type);
+        for (int effort = 0; effort < 2; effort++) {
+            c->effort = effort ? CODEC_MERGE : CODEC_FAST;
+            fesetround(FE_TONEAREST);
+            memset(ref, 0, BUF(x->n));
+            size_t lenr = block_encode_vals(c, 0, 0, x->type, x->v, x->n, ref);
+            CHECK(lenr > 0);
+            for (int mi = 0; mi < 3; mi++) {
+                const char *bad = NULL;
+                fesetround(modes[mi]);
+                unsigned want = rc_bits();
+                memset(buf, 0, BUF(x->n));
+                size_t len = block_encode_vals(c, 0, 0, x->type, x->v, x->n, buf);
+                if (rc_bits() != want || fegetround() != modes[mi])
+                    bad = "encode left another mode";
+                if (!bad && x->type == TSDB_FLOAT32) { /* the float32 entry on its own, as codec-bench calls it */
+                    memset(dec, 0, BUF(x->n) > x->n * 16 ? x->n * 16 : BUF(x->n));
+                    size_t l32 = block_encode_f32(c, 0, TSDB_VALUES_AUTO, x->v, x->n, dec);
+                    if (rc_bits() != want || fegetround() != modes[mi])
+                        bad = "block_encode_f32 left another mode";
+                    else if (l32 != len || memcmp(dec, buf, len) != 0)
+                        bad = "block_encode_f32 differs from block_encode_vals";
+                }
+                fesetround(FE_TONEAREST);
+                if (!bad && (len != lenr || memcmp(buf, ref, lenr) != 0))
+                    bad = "encodes to other bytes than at FE_TONEAREST";
+                fesetround(modes[mi]);
+                memset(dec, 0xa5, x->n * w);
+                int rc = block_decode_vals(c, x->type, ref, lenr, x->n, dec);
+                if (!bad && (rc_bits() != want || fegetround() != modes[mi]))
+                    bad = "decode left another mode";
+                fesetround(FE_TONEAREST);
+                if (!bad && (rc != 0 || memcmp(dec, x->v, x->n * w) != 0))
+                    bad = "decodes to other values than were written";
+                if (!bad && x->type == TSDB_FLOAT32) {
+                    fesetround(modes[mi]);
+                    memset(dec, 0xa5, x->n * w);
+                    int r32 = block_decode_f32(c, ref, lenr, x->n, (float *)(void *)dec);
+                    unsigned after = rc_bits();
+                    fesetround(FE_TONEAREST);
+                    if (after != want)
+                        bad = "block_decode_f32 left another mode";
+                    else if (r32 != 0 || memcmp(dec, x->v, x->n * w) != 0)
+                        bad = "block_decode_f32 decodes to other values than were written";
+                }
+                if (bad) {
+                    failures++;
+                    if (shown++ < 8)
+                        fprintf(stderr, "rounding mode %s, %s (effort %d): %s\n", names[mi], x->name, effort, bad);
+                }
+            }
+        }
+    }
+#if defined(__SSE2__)
+    /* the mode set in MXCSR alone, not through fesetround: left as it was, flags raised by the arithmetic kept */
+    for (int mi = 1; mi < 4; mi++) {
+        unsigned csr = (_mm_getcsr() & ~FP_RC_MASK) | ((unsigned)mi << 13);
+        _mm_setcsr(csr);
+        for (int k = 0; k < nin; k += 7) {
+            const input *x = &in[k];
+            if (x->type != TSDB_FLOAT32 && x->type != TSDB_FLOAT64)
+                continue;
+            c->effort = CODEC_FAST;
+            size_t len = block_encode_vals(c, 0, 0, x->type, x->v, x->n, buf);
+            int rc = block_decode_vals(c, x->type, buf, len, x->n, dec);
+            CHECK(rc == 0 && (_mm_getcsr() & FP_RC_MASK) == ((unsigned)mi << 13));
+            CHECK(memcmp(dec, x->v, x->n * type_width(x->type)) == 0);
+        }
+        _mm_setcsr(_mm_getcsr() & ~FP_RC_MASK);
+    }
+#endif
+    free(ref);
+}
+
 static void run(rec *r, codec_ctx *c)
 {
     crafted_sums(r);
     crafted_f64_decimal(r);
     crafted_unpack(r);
+    rounding_modes(c);
     for (int k = 0; k < nin; k++) {
         const input *x = &in[k];
         size_t w = type_width(x->type);

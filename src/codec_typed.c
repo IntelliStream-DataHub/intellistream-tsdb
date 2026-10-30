@@ -28,6 +28,7 @@
 #include "internal.h"
 
 #include "bitpack.h"
+#include "fpmode.h"
 
 #include <float.h>
 #include <math.h>
@@ -1339,7 +1340,9 @@ static size_t encode_int(codec_ctx *c, int level, const int64_t *v, size_t n, ui
     return block_wrap(c, level, BLK_INT, int_bp_encode(v, n, c->scratch), out);
 }
 
-size_t block_encode_vals(codec_ctx *c, int level, int value_codec, int type, const void *v, size_t n, uint8_t *out)
+static __attribute__((noinline)) size_t block_encode_vals_nearest(codec_ctx *c, int level, int value_codec,
+                                                                   int type, const void *v, size_t n,
+                                                                   uint8_t *out)
 {
     switch (type) {
     case TSDB_FLOAT32: return block_encode_f32(c, level, value_codec, v, n, out);
@@ -1360,7 +1363,17 @@ size_t block_encode_vals(codec_ctx *c, int level, int value_codec, int type, con
     }
 }
 
-int block_decode_vals(codec_ctx *c, int type, const uint8_t *blk, size_t len, size_t n, void *out)
+/* run with round-to-nearest, the caller's mode put back (fpmode.h) */
+size_t block_encode_vals(codec_ctx *c, int level, int value_codec, int type, const void *v, size_t n, uint8_t *out)
+{
+    fp_mode m_ = fp_nearest();
+    size_t r_ = block_encode_vals_nearest(c, level, value_codec, type, v, n, out);
+    fp_restore(m_);
+    return r_;
+}
+
+static __attribute__((noinline)) int block_decode_vals_nearest(codec_ctx *c, int type, const uint8_t *blk,
+                                                                 size_t len, size_t n, void *out)
 {
     if (type == TSDB_FLOAT32)
         return block_decode_f32(c, blk, len, n, out);
@@ -1401,4 +1414,13 @@ int block_decode_vals(codec_ctx *c, int type, const uint8_t *blk, size_t len, si
         u[i] = (uint32_t)w[i];
     free(w);
     return rc;
+}
+
+/* run with round-to-nearest, the caller's mode put back (fpmode.h) */
+int block_decode_vals(codec_ctx *c, int type, const uint8_t *blk, size_t len, size_t n, void *out)
+{
+    fp_mode m_ = fp_nearest();
+    int r_ = block_decode_vals_nearest(c, type, blk, len, n, out);
+    fp_restore(m_);
+    return r_;
 }

@@ -9,6 +9,7 @@
  */
 #include "internal.h"
 #include "bitpack.h"
+#include "fpmode.h"
 #include "bits.h"
 
 #include <math.h>
@@ -1176,7 +1177,8 @@ static double entropy_words(const uint8_t *p, size_t len, size_t width)
  */
 #define F32_ALL_BITS 0
 #define F32_SURPRISE 0
-size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out)
+static __attribute__((noinline)) size_t block_encode_f32_nearest(codec_ctx *c, int level, int value_codec,
+                                                                  const float *v, size_t n, uint8_t *out)
 {
     size_t need = MAX(MAX(chimp_bound(n), gorilla_bound(n)), MAX(alprd_bound(n), decimal_bp_bound(n)));
     need = MAX(need, MAX(delta_bp32_bound(n), dict_bound(n)));
@@ -1198,6 +1200,15 @@ size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v
     static const int kinds[] = {BLK_DECIMAL_BP, BLK_CHIMP, BLK_DELTA32, BLK_BYTESPLIT, BLK_ALPRD, BLK_DELTA_BP};
     return auto_pick(c, level, kinds, sizeof kinds / sizeof *kinds, encode_f32_kind, v, n, 4, BLK_DECIMAL_BP, inner,
                      merge ? dict_block(c, level, v, n, 4, out) : 0, F32_ALL_BITS, F32_SURPRISE, out);
+}
+
+/* run with round-to-nearest, the caller's mode put back (fpmode.h) */
+size_t block_encode_f32(codec_ctx *c, int level, int value_codec, const float *v, size_t n, uint8_t *out)
+{
+    fp_mode m_ = fp_nearest();
+    size_t r_ = block_encode_f32_nearest(c, level, value_codec, v, n, out);
+    fp_restore(m_);
+    return r_;
 }
 
 /* Resolves a block to its transform kind and (decompressed) transform bytes. */
@@ -1242,7 +1253,8 @@ int block_decode_ts(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, int6
     }
 }
 
-int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, float *out)
+static __attribute__((noinline)) int block_decode_f32_nearest(codec_ctx *c, const uint8_t *blk, size_t len,
+                                                                size_t n, float *out)
 {
     int kind, rc;
     const uint8_t *p;
@@ -1261,4 +1273,13 @@ int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, flo
     case BLK_DICT: return dict_decode(p, plen, n, 4, out);
     default: return TSDB_ERR_CORRUPT;
     }
+}
+
+/* run with round-to-nearest, the caller's mode put back (fpmode.h) */
+int block_decode_f32(codec_ctx *c, const uint8_t *blk, size_t len, size_t n, float *out)
+{
+    fp_mode m_ = fp_nearest();
+    int r_ = block_decode_f32_nearest(c, blk, len, n, out);
+    fp_restore(m_);
+    return r_;
 }
