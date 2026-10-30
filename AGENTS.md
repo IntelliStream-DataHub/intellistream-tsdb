@@ -312,6 +312,7 @@ tables do not depend on it. The next full run measures the jittered data.
 |---|---|
 | `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed; `--file F` for raw float32 values from a file |
 | `build/type-bench` | the float64, int64, bool and state codecs; `--file F float32\|float64` for raw values from a file |
+| `build/decode-bench` | bit unpacking per width (loops, the AVX2 kernel, PDEP) and the int_bp and float64 decimal codecs, for comparing CPUs; [`bench/cpu-compare`](bench/cpu-compare) has the Hyper-Threading and threshold sweeps |
 | [`bench/hydraulic`](bench/hydraulic) | the codecs on real sensor data (UCI hydraulic test rig, 17 sensors): `get.sh`, `convert.py`, `run.sh` |
 | `build/tsdb-bench` | load, compression and queries on 100 M rows; `--type float64` or `int64` stores another value type; `--export` writes the rows for ClickHouse |
 | `build/insert-bench` | durable inserts on a real disk, 1 row to 1 billion rows per call |

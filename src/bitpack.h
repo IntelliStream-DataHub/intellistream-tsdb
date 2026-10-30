@@ -8,8 +8,9 @@
 #include <emmintrin.h> /* x86-64 baseline: every CPU level has it */
 #endif
 /* AVX2 unpack (below): the v3 level, and -march=native on CPUs without AVX-512BW. The v4 level keeps the
- * portable loops: it has not been measured against them (no AVX-512 machine at the time of writing). */
-#if defined(__AVX2__) && !defined(__AVX512BW__)
+ * portable loops: it has not been measured against them (no AVX-512 machine at the time of writing).
+ * -DTSDB_UNPACK_AVX2 takes the kernel at v4 too, to measure it there (tools/decode-bench.c, tests/test_levels.c). */
+#if defined(__AVX2__) && (!defined(__AVX512BW__) || defined(TSDB_UNPACK_AVX2))
 #define BITPACK_AVX2 1
 #include <immintrin.h>
 #endif
