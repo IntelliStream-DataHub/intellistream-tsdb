@@ -13,7 +13,8 @@
 # Embedded engines answer through embq, which writes the same reduced answers as tsdbq; those
 # files are compared directly, every query of the dump:
 #   python3 -I check.py --dumps REF_WINDOWS REF_FULL GOT_WINDOWS GOT_FULL
-import datetime, json, os, struct, sys, urllib.request, urllib.parse
+import datetime, json, os, struct, sys, urllib.error, urllib.request, urllib.parse
+import http.client as httpclient
 
 CH_HTTP = os.environ.get("CH_HTTP_PORT", "8123")
 TS_PORT = os.environ.get("TS_PORT", "5434")
@@ -456,10 +457,27 @@ def batch_main(sysname, ngroups):
             checked[f"{st}.b{k}"] = checked.get(f"{st}.b{k}", 0) + 1
     print(sysname, "batches checked", checked, "mismatches", bad)
 
+def server_down(e):
+    """True when e says the server could not be reached or went away: reported as SERVER DOWN (exit 3), not as a
+    mismatch of answers (the harness then restarts the server and tries once more)."""
+    t = (str(e) + " " + str(getattr(e, "stderr", "") or "")).lower()
+    return isinstance(e, (ConnectionError, urllib.error.URLError, httpclient.RemoteDisconnected)) or any(
+        m in t for m in ("connection refused", "server closed the connection", "could not connect", "connection reset",
+                         "remote end closed", "broken pipe", "no route to host"))
+
+def guarded(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as e:
+        if server_down(e):
+            print("SERVER DOWN: " + repr(e)[:300])
+            raise SystemExit(3)
+        raise
+
 if __name__ == "__main__":
     if sysname == "--dumps":
         dumps(*sys.argv[2:6])
     elif sysname == "--batch":
-        batch_main(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 5)
+        guarded(batch_main, sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 5)
     else:
-        main()
+        guarded(main)

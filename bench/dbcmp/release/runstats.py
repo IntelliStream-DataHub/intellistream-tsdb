@@ -18,7 +18,12 @@ from collections import defaultdict
 NUM = re.compile(r"(?<![A-Za-z_\d.])-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
 
 
+# a temporary copy of a query file ("/path/.chq.AbC123 c=32: ...", old ClickHouse runs) is a different name every run
+TMPNAME = re.compile(r"\S*/\.chq\.\w+")
+
+
 def split(line):
+    line = TMPNAME.sub("<query file>", line)
     nums = [m.group(0) for m in NUM.finditer(line)]
     return NUM.sub("\x00", line), nums
 

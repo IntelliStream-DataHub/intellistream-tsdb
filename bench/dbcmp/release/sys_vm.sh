@@ -24,7 +24,7 @@
 # Settle: force_flush, force_merge of every month partition, then until no merge runs and the files are unchanged
 # for VM_STABLE s. Size: du -sb of data/small, data/big (samples) and data/indexdb (the index), summed.
 
-VM_MEM=${VM_MEM:-24g}
+VM_MEM=${VM_MEM:-$SERVER_MEM}
 VM_STABLE=${VM_STABLE:-30}
 VM_SETTLE_MAX=${VM_SETTLE_MAX:-10800}
 VM_SAMPLES=${VM_SAMPLES:-10000} VM_SHARDS=${VM_SHARDS:-8}

@@ -52,9 +52,18 @@ if ! systemctl --user show-environment > /dev/null 2>&1; then
         >> "$OUT/driver.log"
 fi
 
+# One memory limit for every server, tsdbd included (SERVER_MEM, default 48g of the 64 GB machine, which leaves the rest
+# to the system, the clients and the page cache of the files being read). relbench3 (2026-10-29) gave containers 24-28 GB
+# (QuestDB and ClickHouse none) and tsdbd none: QuestDB took 57-59 GB twice and the kernel's global OOM killer ended it
+# (and nearly the desktop), TimescaleDB hit its 24 GB cgroup limit under 32 clients of 100-series batches. Now a server
+# that outgrows 48 GB is killed by its own cgroup, whatever it is, and that is a result (REFUSED.txt, tables).
+export SERVER_MEM=${SERVER_MEM:-48g}
 # A container's memory limit (and its swap, none). A smoke run on cgroupfs has no cgroup to put it in and starts the
 # container without one; a release run always has it.
-memlim() { [ "${NO_CGROUPS:-0}" = 1 ] || printf -- '--memory %s --memory-swap %s' "$1" "$1"; }
+memlim() { [ "${NO_CGROUPS:-0}" = 1 ] || printf -- '--memory %s --memory-swap %s' "${1:-$SERVER_MEM}" "${1:-$SERVER_MEM}"; }
+# tsdbd runs natively: the same limit as a transient systemd scope of the user manager (no swap). systemd-run --scope
+# execs the command in the scope, so the pid stays the one tsdbd_start records.
+tsdbd_memwrap() { [ "${NO_CGROUPS:-0}" = 1 ] || printf 'systemd-run --user --scope --quiet -p MemoryMax=%s -p MemorySwapMax=0' "${SERVER_MEM^^}"; }
 
 # ------------------------------------------------------------------ logging, quiet gate, timed steps
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/driver.log"; }
@@ -134,9 +143,23 @@ steplock() { # MODE(-s|-x): BENCH.lock on fd 9 unless inside a step
     flock "$1" 9
 }
 stepunlock() { [ "${IN_STEP:-0}" = 1 ] && return 0; flock -u 9; exec 9>&-; }
+declare -A DEAD_CLASS   # step label without its run (" r3"): the server died in it twice, so its other runs are skipped
 tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout+stderr to OUTFILE (fd 9 closed)
-    local label=$1 out=$2 s e rc
+    local label=$1 out=$2 s e rc key=${1% r[0-9]*}
     shift 3
+    # RESUME=1 (a rerun after a death or a harness fix): a step that already ended with rc 0 in steps.log is not run again;
+    # loads always run (the data of the earlier run is gone). A rerun clears the earlier run's death marks of the step.
+    if [ "${RESUME:-0}" = 1 ] && [ "${label#* load r}" = "$label" ] \
+        && grep -qF "$(printf '\t%s\trc=0\t' "$label")" "$OUT/steps.log" 2> /dev/null && [ -s "$out" ]; then
+        log "  RESUME: $label already measured, skipped"
+        return 0
+    fi
+    rm -f "$out.oom" "$out.died" "$out.refused"
+    if [ -n "${DEAD_CLASS[$key]-}" ]; then
+        echo "$label: not run, the server died twice in this class (${DEAD_CLASS[$key]})" >> "$(dirname "$out")/REFUSED.txt"
+        log "  DIED: $label skipped (the server died twice in $key)"
+        return 1
+    fi
     if [ "${SMOKE:-0}" = 1 ]; then steplock -s; else steplock -x; fi
     quiet "$label"
     s=$(date +%s.%N)
@@ -155,13 +178,26 @@ tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout
         log "  REFUSED: $label (see $out.refused)"
         return "$rc"
     fi
-    if [ "$rc" != 0 ] && [ -n "${QCTR-}" ] && [ "${label#* load r}" = "$label" ] && oom_killed "$QCTR"; then
-        # the kernel killed the server out of memory (its container limit) on this load: a result like a refusal, the
-        # server started again on the same data for the steps after it (QREADY: a command that succeeds once it serves)
-        mv "$out" "$out.oom"
-        echo "$label: the server was killed out of memory (container limit $(podman inspect -f '{{.HostConfig.Memory}}' "$QCTR" | awk '{printf "%.0f GB", $1 / 2^30}'))" >> "$(dirname "$out")/REFUSED.txt"
-        log "  OOM: $label killed $QCTR (see $out.oom); restarting it"
-        ctr_restart "$QCTR" || fail "$label: $QCTR did not serve again after its OOM kill"
+    if [ "$rc" != 0 ] && [ "$rc" != 124 ] && [ -n "${QCTR-}" ] && [ "${label#* load r}" = "$label" ] && ctr_died "$QCTR"; then
+        # the server died in this step (the kernel killed it out of memory at its limit, or it stopped by itself): a
+        # result like a refusal, recorded in REFUSED.txt (the death) and kept as OUT.oom / OUT.died. The server is started
+        # again on the same data (QREADY: a command that succeeds once it serves) and the step run once more; if it dies
+        # again, the class is over (its remaining runs are skipped: DEAD_CLASS)
+        local ext=died why=$CTR_WHY
+        [ "$CTR_OOM" = 1 ] && ext=oom
+        mv "$out" "$out.$ext"
+        echo "$label: the server died: $why$([ -n "${TSTEP_RETRY-}" ] && echo " (again, on the retry)")" >> "$(dirname "$out")/REFUSED.txt"
+        log "  DIED: $label: $QCTR $why (see $out.$ext); restarting it"
+        ctr_restart "$QCTR" || { fail "$label: $QCTR did not serve again after its death"; return "$rc"; }
+        if [ -z "${TSTEP_RETRY-}" ]; then
+            log "  retrying $label once"
+            TSTEP_RETRY=1
+            tstep "$label" "$out" -- "$@"
+            rc=$?
+            TSTEP_RETRY=
+        else
+            DEAD_CLASS[$key]=$why
+        fi
         return "$rc"
     fi
     [ "$rc" = 0 ] || fail "$label: rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${STEP_TIMEOUT}s)") (see $out)"
@@ -199,6 +235,25 @@ untimed() { # OUTFILE CMD...: a step that is not a timing (checks, dumps, sizes)
     limited "$lim" "$out" "$@"
     rc=$?
     stepunlock
+    if [ "$rc" != 0 ] && [ "$rc" != 124 ] && [ -z "${TSTEP_RETRY-}" ] && [ -n "${QCTR-}" ] && ctr_died "$QCTR"; then
+        # the server died (or was found dead) before or during this check: recorded, started again, the check once more
+        echo "$(basename "$out"): the server died: $CTR_WHY" >> "$(dirname "$out")/REFUSED.txt"
+        log "  DIED: $(basename "$out"): $QCTR $CTR_WHY; restarting it and trying once more"
+        cp "$out" "$out.died" 2> /dev/null
+        if ctr_restart "$QCTR"; then
+            TSTEP_RETRY=1
+            untimed "$out" "$@"
+            rc=$?
+            TSTEP_RETRY=
+            return "$rc"
+        fi
+        fail "$(basename "$out"): $QCTR did not serve again after its death"
+        return 1
+    fi
+    if [ "$rc" = 3 ]; then  # rel.py / check.py: SERVER DOWN, not a difference of answers
+        fail "$(basename "$out"): server down, nothing was checked ($(grep -m1 'SERVER DOWN' "$out" | cut -c1-150)) (see $out)"
+        return 3
+    fi
     # UNTIMED_SOFT: an answer check whose mismatch is a result to report (a stated bound missed), not a harness failure
     [ "$rc" = 1 ] && [ -n "${UNTIMED_SOFT-}" ] && grep -q MISMATCH "$out" && ! grep -q Traceback "$out" && return 2
     [ "$rc" = 0 ] || { fail "$(basename "$out"): rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${lim}s)") (see $out)"; return 1; }
@@ -213,7 +268,8 @@ tsdbd_start() { # DIR [ARGS]: tsdbd on --port 0 --port-file; sets TPID and TSDB_
     local d=$1 p pid i
     shift
     rm -f "$d.pf"
-    ${TSDBD_WRAP:-} "$T/tsdbd" --dir "$d" --listen 127.0.0.1 --port 0 --port-file "$d.pf" "$@" > "$d.log" 2>&1 9>&- &
+    # shellcheck disable=SC2046
+    $(tsdbd_memwrap) ${TSDBD_WRAP:-} "$T/tsdbd" --dir "$d" --listen 127.0.0.1 --port 0 --port-file "$d.pf" "$@" > "$d.log" 2>&1 9>&- &
     TPID=$!
     echo "$TPID tsdbd $d" >> "$OUT/pids"
     for i in $(seq 600); do [ -s "$d.pf" ] && break; kill -0 "$TPID" 2>/dev/null || break; sleep 0.1; done
@@ -221,7 +277,14 @@ tsdbd_start() { # DIR [ARGS]: tsdbd on --port 0 --port-file; sets TPID and TSDB_
     if [ "$pid" != "$TPID" ]; then fail "port file of $d names pid $pid, not our $TPID"; tsdbd_stop; return 1; fi
     export TSDB_PORT=$p TSDB_HOST=127.0.0.1
 }
+tsdbd_mem() { # PID FILE: the memory cgroup of tsdbd's scope: peak (page cache included), limit, OOM kills
+    local p
+    p=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/"$1"/cgroup 2> /dev/null)
+    [ -r "$p/memory.peak" ] && echo "$(date '+%F %T') tsdbd pid $1 peak $(cat "$p/memory.peak") limit $(cat "$p/memory.max")" \
+        "$(grep '^oom_kill ' "$p/memory.events")" >> "$2"
+}
 tsdbd_stop() {
+    [ -n "$TPID" ] && [ "$TPID" -gt 1 ] 2>/dev/null && tsdbd_mem "$TPID" "$OUT/tsdbd-mem.txt"
     if [ -n "$TPID" ] && [ "$TPID" -gt 1 ] 2>/dev/null; then kill -INT "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null; fi
     TPID=
 }
@@ -256,7 +319,7 @@ ch_start() { # DATADIR
     local W=$1 i
     mkdir -p "$W/data"
     printf '<clickhouse>\n    <listen_host replace="replace">127.0.0.1</listen_host>\n</clickhouse>\n' > "$W/listen.xml"
-    podman run -d --name rb-ch --network host --ulimit nofile=262144:262144 -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+    podman run -d --name rb-ch --network host $(memlim) --ulimit nofile=262144:262144 -e CLICKHOUSE_SKIP_USER_SETUP=1 \
         -v "$W/data:/var/lib/clickhouse" -v "$W/listen.xml:/etc/clickhouse-server/config.d/zz-listen.xml" "$CH_IMG" > /dev/null 9>&- || { fail "clickhouse start"; return 1; }
     for i in $(seq 120); do curl -sf http://127.0.0.1:8123/ping > /dev/null && break; sleep 0.5; done
     curl -sf http://127.0.0.1:8123/ping > /dev/null || { fail "clickhouse not ready"; return 1; }
@@ -284,7 +347,7 @@ qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD; QDB_PC=1: ev
     # Every SELECT of a batch's UNION ALL holds a table reader: 32 connections x 100 series need 3200, and the
     # default pool (cairo.reader.pool.max.segments 10 x 32 readers) refused them ("table busy [reason=pool size
     # exceeded]", 2026-10-28 smoke). 128 segments (4096 readers) is a limit, not a cache: readers open on demand.
-    podman run -d --name rb-qdb --network host -v "$W:/var/lib/questdb" $([ "${QDB_ZSTD:-0}" = 1 ] && qdb_zstd_env) \
+    podman run -d --name rb-qdb --network host $(memlim) -v "$W:/var/lib/questdb" $([ "${QDB_ZSTD:-0}" = 1 ] && qdb_zstd_env) \
         -e QDB_HTTP_NET_BIND_TO=127.0.0.1:9100 -e QDB_HTTP_MIN_NET_BIND_TO=127.0.0.1:9103 \
         -e QDB_PG_NET_BIND_TO=127.0.0.1:8812 -e QDB_LINE_TCP_NET_BIND_TO=127.0.0.1:9109 \
         -e QDB_LINE_UDP_ENABLED=false -e QDB_TELEMETRY_ENABLED=false -e QDB_HTTP_REQUEST_HEADER_BUFFER_SIZE=1048576 \
@@ -294,6 +357,7 @@ qdb_start() { # DATADIR; QDB_ZSTD=1: Parquet conversions with ZSTD; QDB_PC=1: ev
     fail "questdb not ready"; return 1
 }
 QX() { curl -sG http://127.0.0.1:9100/exec --data-urlencode "query=$1"; echo; }
+qdb_ready() { curl -sf 'http://127.0.0.1:9100/exec?query=select%201' > /dev/null; }
 qdb_wait_table() { # TABLE: until every WAL transaction is applied; fails after QDB_WAIT_MAX s (a missing table never applies)
     local r w q s t0=$SECONDS
     while [ $((SECONDS - t0)) -lt "${QDB_WAIT_MAX:-3600}" ]; do
@@ -312,7 +376,7 @@ qdb_wait_table() { # TABLE: until every WAL transaction is applied; fails after 
 # again at tune's 6 MB (2026-10-28 smokes, no memory limit under cgroupfs; the host's OOM killer ended both). So both
 # servers get a memory limit (TS_MEM) like the other containers: an OOM kill is then a result in REFUSED.txt, and the
 # steps after it wait until PostgreSQL serves again (QCTR rb-ts).
-TS_WORK_MEM=${TS_WORK_MEM:-256MB} TS_MEM=${TS_MEM:-24g}
+TS_WORK_MEM=${TS_WORK_MEM:-256MB} TS_MEM=${TS_MEM:-$SERVER_MEM}
 # Podman gives a container 64 MB of /dev/shm; PostgreSQL's parallel workers share their hash tables there, and a
 # batch of 100 series failed with "could not resize shared memory segment ... No space left on device". A server on a
 # host has the host's /dev/shm (half the RAM); 8 GB is plenty here.
@@ -341,7 +405,7 @@ PSQL() { psql -h 127.0.0.1 -p 5434 -U postgres "$@"; }
 i2_start() { # DATADIR
     local W=$1 i
     mkdir -p "$W/data" "$W/config"
-    podman run -d --name rb-i2 --network host $(memlim 24g) \
+    podman run -d --name rb-i2 --network host $(memlim) \
         -v "$W/data:/var/lib/influxdb2" -v "$W/config:/etc/influxdb2" \
         -e DOCKER_INFLUXDB_INIT_MODE=setup -e DOCKER_INFLUXDB_INIT_USERNAME=bench \
         -e DOCKER_INFLUXDB_INIT_PASSWORD=benchbench -e DOCKER_INFLUXDB_INIT_ORG=bench \
@@ -364,7 +428,7 @@ i3_start() { # DATADIR [EXTRA FLAGS]
     local W=$1 i
     shift
     mkdir -p "$W" && podman unshare chown -R 1500:1500 "$W"
-    podman run -d --name rb-i3 --network host $(memlim 28g) -v "$W:/var/lib/influxdb3" "$I3_IMG" \
+    podman run -d --name rb-i3 --network host $(memlim) -v "$W:/var/lib/influxdb3" "$I3_IMG" \
         influxdb3 serve --node-id node0 --object-store file --data-dir /var/lib/influxdb3/data \
         --http-bind 127.0.0.1:8181 --without-auth --query-file-limit 1000000 \
         --exec-mem-pool-size 8GB --file-cache-size 4GB --force-snapshot-mem-size 10GB --disable-telemetry-upload "$@" > /dev/null 9>&- || { fail "influxdb3 start"; return 1; }
@@ -389,7 +453,7 @@ i3_wait_snapshot() { # DATADIR MIN_S STABLE_S MAX_S: Parquet present and unchang
     done
 }
 prom_run() { # NAME PORT DATADIR
-    podman run -d --name "$1" --network host -v "$3:/prometheus" -v "$DBCMP/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+    podman run -d --name "$1" --network host $(memlim) -v "$3:/prometheus" -v "$DBCMP/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
         "$PROM_IMG" --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --web.listen-address=127.0.0.1:$2 \
         --web.enable-remote-write-receiver --web.enable-admin-api --query.max-concurrency=32 > /dev/null 9>&-
 }
@@ -419,6 +483,14 @@ qline() { # NAME DIR FILE DRIVER-ARGS...: one query (LTTB, TWA): a warm-up, then
 }
 TWA_KINDS=${TWA_KINDS-twad twal}       # whole-range TWA kinds besides the hourly STEP twa (rel.py, relq)
 TWA_WKINDS=${TWA_WKINDS-twa1d twa7d}   # TWA over random windows: the first TWA_N (1000) agg1d / agg7d windows
+nocheck() { # SYSTEM KIND DIR RC: a check that did not pass: rc 3 is a server that cannot be reached, not different answers
+    if [ "$4" = 3 ]; then
+        echo "$2: not timed, the server was down when it was checked (see check-$2.txt)" >> "$3/dash.txt"
+        log "  $1 $2: not timed (server down)"
+    else
+        log "  $1 $2: not timed (answers differ)"
+    fi
+}
 twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (rel.py has), checked against tsdb's
              # answers in $WORK/ref first and timed only when they agree; a kind without a query is noted in DIR/dash.txt
     local S=$1 D=$2 k f r
@@ -447,10 +519,10 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
             0) ;;
             2) echo "$k: answers differ from tsdb's beyond ${TWA_TOL:-1e-6,1e-6} (relative, absolute), not timed: $(grep -m1 -E "^$k: [0-9]+ series" "$D/check-$k.txt" | cut -d: -f2- | tr -s ' ' | sed 's/^ //; s/ (bound.*//')" >> "$D/dash.txt"
                log "  $S $k: not timed (answers differ beyond ${TWA_TOL:-1e-6,1e-6}; dash.txt)"; continue ;;
-            *) continue ;;
+            *) nocheck "$S" "$k" "$D" $?; continue ;;
             esac
             echo "$k: agrees with tsdb within ${TWA_TOL:-1e-6,1e-6} (relative, absolute) only, not 1e-9: $(grep -o 'largest difference.*' "$D/check-$k.txt" | head -1)" >> "$D/loose.txt";;
-        *) untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { log "  $S $k: not timed (answers differ)"; continue; };;
+        *) untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { nocheck "$S" "$k" "$D" $?; continue; };;
         esac
         if [ "$1" = ch ]; then
             chbench1 1 1 0 "$f" > /dev/null 2> "$D/warm.$k" 9>&-
@@ -462,7 +534,7 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
     for k in $TWA_WKINDS; do
         REL has "$S" "$k" || { echo "$k: no query in rel.py for $S" >> "$D/dash.txt"; continue; }
         REL q "$S" "$k" > "q/$S.$k.txt"
-        untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { log "  $S $k: not timed (answers differ)"; continue; }
+        untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { nocheck "$S" "$k" "$D" $?; continue; }
         if [ "$1" = ch ]; then FULLS="" CLASSES="$k" chsuite "$S" "$D" "$S"
         else FULLS="" CLASSES="$k" qsuite "$S" "$S" "$D" "$@"; fi
     done
@@ -486,9 +558,11 @@ chbench1() { # CONC ITER|0 SECONDS|0 FILE [SETTING=V...]: FILE's SQL lines as HT
     h=$(mktemp "$WORK/.chq.XXXXXX") || return 1
     awk -v p="POST /?$q" '{ print p "\ttext/plain\t" $0 }' "$f" > "$h"
     # an exception after the first rows comes with status 200: a reply with an exception text in it is a failure
-    if [ "$i" != 0 ]; then QDRIVE_ERR_SUB='DB::Exception' "$BIN/qdrive" http 127.0.0.1 8123 '' "$h" 1 100000 "$i"
-    else QDRIVE_ERR_SUB='DB::Exception' "$BIN/qdrive" http 127.0.0.1 8123 '' "$h" "$c" "$s"; fi
-    rc=$?
+    # qdrive starts its summary line with the file name: print the query file's, not the temporary copy's, or every
+    # run's line differs and runstats.py cannot average the runs (relbench3 reported run 1 as the mean)
+    { if [ "$i" != 0 ]; then QDRIVE_ERR_SUB='DB::Exception' "$BIN/qdrive" http 127.0.0.1 8123 '' "$h" 1 100000 "$i"
+    else QDRIVE_ERR_SUB='DB::Exception' "$BIN/qdrive" http 127.0.0.1 8123 '' "$h" "$c" "$s"; fi; } | sed "s|^$h |$f |"
+    rc=${PIPESTATUS[0]}
     rm -f "$h"
     return $rc
 }
@@ -560,6 +634,22 @@ oom_killed() { # CONTAINER: 0 when the kernel OOM-killed a process in its cgroup
     esac
     id=$(podman inspect -f '{{.Id}}' "$1" 2> /dev/null)
     [ -n "$id" ] && journalctl -k --since "-6h" 2> /dev/null | grep -qE "oom-kill:.*libpod-$id\.scope"
+}
+ctr_died() { # CONTAINER: 0 when the server died: the kernel OOM-killed a process in it, or the container no longer runs.
+    # Sets CTR_WHY (what to record) and CTR_OOM (1 when out of memory). An empty name (never started) is not a death.
+    local st lim why
+    CTR_WHY= CTR_OOM=0
+    lim=$(podman inspect -f '{{.HostConfig.Memory}}' "$1" 2> /dev/null | awk '$1 > 0 { printf "%.0f GB", $1 / 2^30 } $1 <= 0 { print "none" }')
+    st=$(podman inspect -f '{{.State.Status}} exit code {{.State.ExitCode}}' "$1" 2> /dev/null)
+    [ -n "$st" ] || return 1
+    if oom_killed "$1"; then
+        CTR_OOM=1
+        CTR_WHY="killed out of memory by the kernel (container limit $lim; $st)"
+        return 0
+    fi
+    case $st in running*) return 1 ;; esac
+    CTR_WHY="stopped by itself ($st; container limit $lim)"
+    return 0
 }
 ctr_restart() { # CONTAINER: start it again (same settings and data), then wait up to 300 s for QREADY
     local i
@@ -1030,10 +1120,32 @@ ch_load_rep() { # one load: fresh server and table, ch_load.sh (insert, syncfs, 
     ch_start "$W" || return 1
     CHC -n -q "CREATE DATABASE cmp; CREATE TABLE cmp.t100m (series UInt32, ts DateTime64(3, 'UTC') CODEC(DoubleDelta, ZSTD(1)), value Float32 CODEC(Gorilla, ZSTD(1))) ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (series, ts)" || return 1
 }
+chparts() { # FILE: the merges running and the active parts per partition now (ClickHouse's state under a query suite)
+    { echo "$(date '+%F %T') merges running: $(CHC -q "SELECT count() FROM system.merges WHERE database = 'cmp' AND table = 't100m'")"
+      echo "partition, parts, rows, bytes_on_disk:"
+      CHC -q "SELECT partition, count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'cmp' AND table = 't100m' AND active GROUP BY partition ORDER BY partition FORMAT TSV"; } > "$1" 2>&1
+}
+ch_ready() { curl -sf http://127.0.0.1:8123/ping > /dev/null; }
+ch_merged() { # DIR BATCHES-OK: the table after OPTIMIZE FINAL ("parts merged", like tsdb's merged.* rows): the same answers
+    # checked, the classes, the whole range, the batches, LTTB and TWA once more under the prefix merged
+    local D=$1 bok=$2 k r
+    cd "$WORK" || return 1
+    untimed "$D/optimize.txt" bash -c "'$CLICKHOUSE' client --host 127.0.0.1 -q 'OPTIMIZE TABLE cmp.t100m FINAL' && CH_STABLE=${CH_MERGED_STABLE:-60} '$H/ch_settle.sh' t100m" || return 1
+    chparts "$D/parts-merged-before-suite.txt"
+    untimed "$D/check.merged.txt" python3 -I "$H/check.py" ch 200
+    chsuite merged "$D" ch
+    [ "$bok" = 1 ] && chbsuite merged "$D" ch
+    for k in lttb twa; do
+        chbench1 1 1 0 "$D/q.$k.sql" > /dev/null 2> "$D/warm.merged.$k" 9>&-
+        for r in $(seq "$REPS"); do tstep "merged.$k r$r" "$D/merged.$k.$r" -- chbench_tag "merged.$k.$r.$$" 1 1 0 "$D/q.$k.sql"; done
+    done
+    chparts "$D/parts-merged-after-suite.txt"
+}
 p2_ch() {
-    local D=$OUT/p2/ch W=$DBCMP/s2/ch r
+    local D=$OUT/p2/ch W=$DBCMP/s2/ch r bok=0
+    local QCTR=rb-ch QREADY=ch_ready  # a server that dies in a class is started again and the class run once more
     mkdir -p "$D"
-    for r in $(seq "$REPS"); do
+    for r in $(seq "${LOADS_FROM:-1}" "$REPS"); do  # LOADS_FROM=$REPS: a rerun of later steps loads once (RESUME)
         crm rb-ch
         ch_load_rep "$W" || { fail "p2 ch start r$r"; return 1; }
         warm "$DATA"
@@ -1043,12 +1155,13 @@ p2_ch() {
     load_ok "p2 ch" || return 1
     ports_check "$D/ports.txt"
     CHC -q "SELECT version()" > "$D/version.txt"
+    chparts "$D/parts-before-suite.txt"
     cd "$WORK" || return 1
     python3 -I "$H/mkq.py" ch
     untimed "$D/check.txt" python3 -I "$H/check.py" ch 200
     (cd "$WORK" && python3 -I "$H/mkbatch.py" ch) || fail "mkbatch ch"
     chsuite ch "$D" ch
-    bcheck ch "$D" && { chbsuite ch "$D" ch; pc_pin rb-ch && PC=1 chbsuite ch "$D" ch; pc_unpin rb-ch; }
+    bcheck ch "$D" && { bok=1; chbsuite ch "$D" ch; pc_pin rb-ch && PC=1 chbsuite ch "$D" ch; pc_unpin rb-ch; }
     REL q ch lttb > "$D/q.lttb.sql"; REL q ch twa > "$D/q.twa.sql"
     untimed "$D/check-lttb.txt" REL check ch lttb ref/lttb.jsonl && lttb_loose "$D/check-lttb.txt" "$D"
     untimed "$D/check-twa.txt" REL check ch twa ref/twa.jsonl
@@ -1058,7 +1171,10 @@ p2_ch() {
     done
     twasuite ch "$D" ch
     CHC -q "SELECT count(), sum(bytes_on_disk) FROM system.parts WHERE database = 'cmp' AND table = 't100m' AND active" > "$D/size-end.txt"
+    chparts "$D/parts-after-suite.txt"
+    ch_merged "$D" "$bok"
     cd "$OUT" || true
+    ctr_mem rb-ch "$D/mem.txt"
     crm rb-ch; rmdata "$W"
     runstats "$D"
 }
@@ -1080,12 +1196,13 @@ qdb_load_rep() { # W PARQUET(0|1|2): fresh server, table, load, WAL applied, [co
 }
 p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), Parquet ZSTD (QDB_ZSTD_LEVEL)
     local pq=$1 P=qdb D W r
+    local QCTR=rb-qdb QREADY=qdb_ready  # a server that dies in a class is started again and the class run once more
     [ "$pq" = 1 ] && P=qdb-parquet
     [ "$pq" = 2 ] && P=qdb-parquet-zstd
     local QDB_ZSTD=0; [ "$pq" = 2 ] && QDB_ZSTD=1
     D=$OUT/p2/$P W=$DBCMP/s2/$P
     mkdir -p "$D"
-    for r in $(seq "$REPS"); do
+    for r in $(seq "${LOADS_FROM:-1}" "$REPS"); do  # LOADS_FROM=$REPS: a rerun of later steps loads once (RESUME)
         crm rb-qdb; rmdata "$W"
         qdb_start "$W" || return 1
         QX "CREATE TABLE sensors (series SYMBOL CAPACITY 128 CACHE, value FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL" > "$D/ddl.$r.txt"
@@ -1125,6 +1242,7 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
         else fail "p2 $P: the index's WAL was not applied (see $D/index.txt); index classes not timed"; fi
     fi
     cd "$OUT" || true
+    ctr_mem rb-qdb "$D/mem.txt"
     crm rb-qdb; rmdata "$W"
     runstats "$D"
 }
@@ -1149,7 +1267,7 @@ p2_ts() {
     local QCTR=rb-ts QREADY=ts_ready
     local D=$OUT/p2/ts W=$DBCMP/s2/ts r
     mkdir -p "$D"
-    for r in $(seq "$REPS"); do
+    for r in $(seq "${LOADS_FROM:-1}" "$REPS"); do  # LOADS_FROM=$REPS: a rerun of later steps loads once (RESUME)
         crm rb-ts; rmdata "$W"
         ts_start rb-ts "$TS_IMG" "$W" "$DBCMP/input" || return 1
         ts_load_rep > "$D/setup.$r.txt" 2>&1 || { fail "p2 ts setup r$r"; return 1; }
@@ -1172,6 +1290,7 @@ p2_ts() {
         pc_pin rb-ts && PC=1 bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC -c max_parallel_workers_per_gather=0'"
         pc_unpin rb-ts; }
     cd "$OUT" || true
+    ctr_mem rb-ts "$D/mem.txt"
     crm rb-ts; rmdata "$W"
     # LTTB and TWA need the toolkit, which is in the -ha image (same TimescaleDB 2.30.1, PostgreSQL 17.11, toolkit 1.26.0) only:
     # one more load there (timed once, for the record), then the two queries
@@ -1612,7 +1731,9 @@ machine() {
 }
 usage() {
     cat <<'U'
-usage: run.sh PHASE...      (env.sh has the paths; REPS, SECS, FORCE=1, P1_SYSTEMS, P2_SYSTEMS override)
+usage: run.sh PHASE...      (env.sh has the paths; REPS, SECS, FORCE=1, P1_SYSTEMS, P2_SYSTEMS override;
+                            RESUME=1 skips timed steps that already ended with rc 0 in steps.log, LOADS_FROM=N
+                            starts the loads of ch, qdb* and ts at run N: RESUME=1 LOADS_FROM=5 loads once)
   prep       inputs (not timed): mixed.*, spec.tsv, batches.tsv, per-sensor sets; under flock -s
   p1         sizes per kind of sensor           p2   the 100 M-row table, every server system
   p3         embedded (tsdb, DuckDB, chDB)      p4   Prometheus (backfill, remote write)

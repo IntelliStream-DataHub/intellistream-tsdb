@@ -62,7 +62,7 @@ def how_table(hows, cols):
             for why, ks in byreason.items():
                 notes.append("  '-' for %s: %s." % (", ".join(ks), why))
         for r in h.get("refused", []):
-            notes.append("  Refused by the server (not timed): %s" % r)
+            notes.append("  Refused or died (server killed or stopped; see the flags of the measurement): %s" % r)
         if h.get("smoke"):
             notes.append("  SMOKE RUN: tiny data, one run; these numbers are not results.")
     return out + ["", "Notes:", ""] + notes + [""]
@@ -95,7 +95,7 @@ def picked(f):
     if nq:
         flags.append("measured on a busy machine in %d run(s): %s" % (len(nq), "; ".join(
             "%s %s" % (os.path.basename(x).split(".")[-2], open(x).read().strip()) for x in nq)))
-    for ext, what in (("refused", "refused by the server"), ("oom", "killed out of memory")):
+    for ext, what in (("refused", "refused by the server"), ("oom", "killed out of memory"), ("died", "server died")):
         n = len(glob.glob(base + ".*." + ext))
         if n:
             flags.append("%d run(s) %s, not averaged" % (n, what))

@@ -16,7 +16,7 @@
 # The REST service binds every address and has no bind setting, so IoTDB runs in its own network namespace
 # (podman's default, pasta) with its two ports published on 127.0.0.1 only; every request crosses that forwarding.
 IOT_HDR=$'Authorization: Basic cm9vdDpyb290\r\n'   # root:root, the default user
-IOT_MEM=${IOT_MEM:-24g}                             # container limit, as InfluxDB 2's 24g; heap below
+IOT_MEM=${IOT_MEM:-$SERVER_MEM}                    # container limit, the same for every server; heap below
 IOT_JMX=${IOT_JMX:--Xms16G -Xmx16G -XX:MaxDirectMemorySize=4G}
 IOT_QMEM=${IOT_QMEM-}   # empty: IoTDB's default; else BloomFilter:ChunkCache:TSMetaCache:Coordinator:Operators:
                         # DataExchange:timeIndex:..:Subscription (default 1:100:200:50:200:200:200:50:250)

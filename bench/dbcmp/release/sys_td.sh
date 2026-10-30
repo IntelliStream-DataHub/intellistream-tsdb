@@ -16,7 +16,7 @@
 # Settle: TDengine has no automatic compaction in the community edition (COMPACT_INTERVAL is Enterprise), so the
 # settle is FLUSH DATABASE, COMPACT DATABASE, and SHOW COMPACTS empty with the vnode files unchanged for TD_STABLE s.
 TD_HDR=$'Authorization: Basic cm9vdDp0YW9zZGF0YQ==\r\n'   # root:taosdata, the default user
-TD_MEM=${TD_MEM:-24g}
+TD_MEM=${TD_MEM:-$SERVER_MEM}
 TD_STABLE=${TD_STABLE:-60}
 TD_P2_VGROUPS=${TD_P2_VGROUPS:-16}  # phase 2: 16 vgroups for 16 cores (planning docs: a core serves 1 to 2 vnodes; default 2)
 TD_SETTLE_MAX=${TD_SETTLE_MAX:-10800}

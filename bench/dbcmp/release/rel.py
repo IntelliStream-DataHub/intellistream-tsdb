@@ -5,7 +5,8 @@
 #                                         line); window kinds: one line per window
 #   python3 -I rel.py sql SYS KIND        the SQL (or Flux) itself
 #   python3 -I rel.py has SYS KIND        exit 0 when SYS has a query for KIND ('-' in the tables otherwise)
-#   python3 -I rel.py check SYS KIND REF  run it on the server (ports of bench/dbcmp/README.md), compare; exit 1 on a mismatch
+#   python3 -I rel.py check SYS KIND REF  run it on the server (ports of bench/dbcmp/README.md), compare; exit 1 on a
+#                                         mismatch, 3 when the server cannot be reached ("SERVER DOWN")
 #   python3 -I rel.py tsv KIND REF FILE   compare a TSV answer file (embq/chq OUT) with REF
 #   python3 -I rel.py jsonl KIND REF FILE compare another relq/relemb dump with REF
 # KIND: lttb (1000 points per series; rows series, t_ms, value); twa, twad, twal: every series over the whole range,
@@ -34,7 +35,8 @@
 # relative. NaN, a missing or an extra bucket or series is a mismatch. Only the TimescaleDB toolkit may differ in
 # the last bucket of a series (its interpolated_average holds the last value to the bucket end): counted apart.
 # Checked with clickhouse local and DuckDB on 7 series x 650,000 rows: twa, twad, twal, twa1d, twa7d all exact.
-import datetime, json, os, subprocess, sys, time, urllib.parse, urllib.request
+import datetime, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import http.client as httpclient
 
 H = 3600000
 IV = {"twa": H, "twad": 86400000, "twal": H}  # bucket width of the whole-range TWA kinds (twal: LINEAR)
@@ -561,5 +563,22 @@ def main():
         ok = compare(kind, load_ref(ref), rows)
         print(f, kind, "OK" if ok else "MISMATCH")
 
+def server_down(e):
+    """True when e says the server could not be reached or went away: reported as SERVER DOWN (exit 3), not as a
+    mismatch of answers (the harness then restarts the server and tries once more)."""
+    t = (str(e) + " " + str(getattr(e, "stderr", "") or "")).lower()
+    return isinstance(e, (ConnectionError, urllib.error.URLError, httpclient.RemoteDisconnected)) or any(
+        m in t for m in ("connection refused", "server closed the connection", "could not connect", "connection reset",
+                         "remote end closed", "broken pipe", "no route to host"))
+
+def guarded(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as e:
+        if server_down(e):
+            print("SERVER DOWN: " + repr(e)[:300])
+            raise SystemExit(3)
+        raise
+
 if __name__ == "__main__":
-    main()
+    guarded(main)
