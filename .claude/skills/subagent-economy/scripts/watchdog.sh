@@ -4,7 +4,7 @@
 #   WAITING  NAME  on BENCH.lock held by PID (JOB) for Nm   a flock waiter: fine unless the holder is STALLED
 #   STALLED  NAME  out Nm ago, cpu 0%, child: CMD             no output and no CPU for STALL_MIN minutes
 #   DIED     NAME  no process left and no rc                  killed (session end, OOM, reboot)
-# plus the holders of BENCH.lock. A job someone stopped on purpose gets a file `stopped` (one line: why) in its run
+# plus the holders of BENCH.lock. "out" means the newest of the job's out file and the files its run dir's `watch` lists. A job someone stopped on purpose gets a file `stopped` (one line: why) in its run
 # dir and is skipped; DIED jobs older than a day are skipped too (old runs of this and other projects share $RUNS).
 # PATTERN limits the report to jobs whose cmd matches it (e.g. tsdb), so a watchdog never acts on another project's
 # jobs. CPU is counted for the job's own process group only: a job waiting on a container (its CPU is in the
@@ -43,7 +43,12 @@ for d in "$RUNS"/*/; do
     pg=$(cat "$d/pid")
     np=$(ps -o pid= -g "$pg" 2>/dev/null | wc -l)
     if [ "$np" -eq 0 ]; then [ $((now - $(cat $d/start))) -gt 86400 ] && continue; echo "DIED     $n  no process left and no rc (started $(date -d @$(cat $d/start) +%F_%H:%M))"; continue; fi
-    age=$(( (now - $(stat -c %Y "$d/out" 2>/dev/null || cat "$d/start")) / 60 ))
+    # a job that logs its progress elsewhere names those files, one per line, in $d/watch (the release driver:
+    # $DBCMP/results/steps.log); the newest of them and out counts
+    newest=$(stat -c %Y "$d/out" 2>/dev/null || cat "$d/start")
+    [ -e "$d/watch" ] && while read -r w; do t=$(stat -c %Y "$w" 2>/dev/null) && [ "$t" -gt "$newest" ] && newest=$t
+        done < "$d/watch"
+    age=$(( (now - newest) / 60 ))
     t0=$(grp_ticks "$pg"); sleep 2; t1=$(grp_ticks "$pg")
     cpu=$(( (t1 - t0) * 100 / (2 * ticks) ))
     waiter=$(for p in $(ps -o pid= -g "$pg"); do ps -o args= -p $p | grep -q '^flock' && grep -E ":$ino " /proc/locks | grep -q -- "-> .* $p " && echo $p; done | head -1)
