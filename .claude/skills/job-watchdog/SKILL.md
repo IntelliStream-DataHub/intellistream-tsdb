@@ -33,6 +33,9 @@ For every line that is not plainly `RUNNING`, gather evidence before deciding an
 - `WAITING` on BENCH.lock is normal while another job holds it. It is a problem only when the holder is itself
   stalled, or the holder is not a job at all (an orphaned process: `LOCK holder pid ... ()` with no job name).
 
+A job that logs its progress outside its `out` file should get a `watch` file in its run dir listing those files
+(one path per line); watchdog.sh then counts the newest of them. Add one when you start such a job.
+
 ## 2. Decide
 
 | state | evidence | action |
