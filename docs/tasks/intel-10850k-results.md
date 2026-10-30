@@ -4,7 +4,7 @@ Measured 2026-10-29 on the 10850K (10 cores / 20 threads, AVX2, no AVX-512), Ubu
 governor `powersave` under `intel_pstate` (HWP, EPP `balance_performance`; no sudo to change it), the desktop idle
 at about 1.5 CPUs. Binaries: a portable-style build (`-march=x86-64-v2`, codecs also at v3 and v4, `NO_URING=1`: liburing
 headers are missing, so no `tsdbd`, clients or `make dist`). Raw output was kept in `/var/tmp/i10850k/`.
-Not done yet: step 2 (thresholds), the hydraulic data, the server and clients,
+Not done yet: the hydraulic data, the server and clients,
 and the same runs on the 7950X.
 
 ## Step 1: v2 against v3 (`tools/fold-bench.sh build-lv 5`, `codec-bench`, `type-bench`; medians, one run each for the codecs)
@@ -54,6 +54,48 @@ range against a plain reference: identical at every level, and three deliberate 
 before this change. `test_levels` and `test_types` pass under ASan + UBSan on the native AVX2 build and at v2 and v3
 in `build-lv`; `tools/check-isa.sh` is clean. No byte of a block changes, so no jepsen run. Not run: `make dist-test`,
 `dist-check-sandybridge` (they need static liburing), `make tsan` (no concurrency touched), the 7950X.
+
+## Step 2: thresholds (measured, not changed)
+
+Method: a scratch copy of the tree whose `simd_select` reads every AVX2 threshold from the environment, so one
+`fold-bench` binary runs the wide kernels at every row count ("W": `simd_short` and the integer and LTTB limits at 0) and
+the small kernels or `values.c` loops at every row count ("S": all at SIZE_MAX), at v3, `--ms 50`, 11 interleaved rounds per
+row count, 21 row counts from 4 to 1024 (and again with `--vary`, 15 row counts from 12 to 160, so the predictor cannot
+learn one granule). W/S is the ratio of the means; a cell counts only beyond 2% or two sd. Raw output: `/var/tmp/i10850k/thr/`.
+
+| threshold | now (AVX2) | W / S on the 10850K, `--vary` | crossover here |
+|---|---:|---|---:|
+| `AVX2_SHORT`, float32 | 128 | no nulls: 0.88 at 24, 1.23 at 32, 1.2-1.3 from 32 to 160; with nulls: 1.16-1.23 at multiples of 32 (32, 64, 96, 128, 160), 0.68-0.89 between them up to 112 | 32 without nulls; 128 with nulls |
+| `AVX2_SHORT`, float64 | 128 | no nulls: 0.65 at 24-28, 0.94 at 48, 0.98 at 64, 1.07 at 80, 1.09 at 96, 1.12 at 112; with nulls: 0.94 at 64, 1.02 at 96, 1.06 at 128 | 80-96 without nulls; 128 with nulls |
+| `i64` (agg, int64) | 16 | 0.82 at 16-20, 0.95 at 24, 1.23 at 32 (with nulls 1.04 at 24) | 24 |
+| `i64_dev` (spread, int64) | 24 | 0.81-0.96 up to 40, 1.02 at 48; with nulls 0.91 at 24, 1.08 at 32 | 40 |
+| `u32` (bool, state: agg and spread) | 32 | 0.90 at 28, 1.42 at 32 | 32 (unchanged) |
+| LTTB small | 8 | 0.77-0.89 at 8 and 12 (all types), 1.2-1.4 at 16 (no nulls) | 16 |
+
+(The wide float kernels fold a last partial group of 32 values one at a time, so with nulls their speed rises and falls
+with n mod 32; that, not the CPU, is why 128 is a sound limit there.) TWA has no speed threshold in this sense
+(`TWA_SEQ_MAX` fixes the summation order): W/S is 1.00 everywhere.
+
+The crossovers differ a little from the Zen 4 values (16, 24, 32, 8 and 128, set on a 7950X), the integer and LTTB ones
+by 8 to 16 rows, the float32 one by 96 rows without nulls. But **no query changes**. `tsdb-bench` on the 100 M-row
+database, 7 interleaved runs per setting, M rows/s (default thresholds, wide always, small always):
+
+| query | default | wide always | small always |
+|---|---:|---:|---:|
+| agg, buckets of 60 samples (60-row folds, decodes all) | 2,204 | 2,135 | 2,185 |
+| agg, buckets of 10 samples | 647 | 601 | 656 |
+| agg, buckets of 3600 samples | 5,071 | 4,872 | 4,860 |
+| group by 15 minutes | 2,610 | 2,457 | 2,530 |
+| random windows, 86,400 samples, 20 clients (q/s) | 53,950 | 54,209 | 51,328 |
+
+The default is as fast as, or faster than, either extreme on every line (the sd of "wide always" is 4 to 11% where
+the default's is 1 to 2%). A fold of a few dozen rows is some tens of nanoseconds in a query whose granule decode costs
+microseconds, and a run that short only comes from the edge of a range or from buckets of a few dozen rows. So a per-vendor table
+(`GenuineIntel` getting 24, 40, 32, 16 and a float limit that depends on whether the run has nulls) would buy up to
+1.3x on a fold that is not on the critical path, for a vendor check at startup, two more sets of constants to keep right
+at both sides in `tests/test_levels.c`, and values measured on one Intel core (not Haswell, Skylake or Ice Lake). Not
+worth it; the numbers above are the values to use if a workload of 20-60-row granules ever appears. Not measured: the
+same sweep on the 7950X, to see whether Zen 4's own values still hold.
 
 ## Step 3: PDEP/PEXT bit unpacking: not used; an AVX2 shuffle kernel instead (`src/bitpack.h`)
 
