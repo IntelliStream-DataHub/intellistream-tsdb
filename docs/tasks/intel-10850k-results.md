@@ -43,9 +43,10 @@ untested). To measure the same
 code the 10850K runs, use `TSDB_CPU=v3` (a `make dist` or CPU_LEVELS build) or an `-march=x86-64-v3` build, and measure
 native v4 next to it.
 
-Found, not fixed: **`test_gindex` fails on `main` too, and the cause is now known** (a NaN-payload mismatch between the index
-encoder and decoder, see Verification). Real inserts with NaN readings did not reproduce it (0 of 108 refused); a
-three-line guard fixes the test in a scratch copy. `make test` is therefore not clean on this machine.
+Also fixed, last: **`test_gindex` failed on `main` too** (a NaN-payload mismatch between the index encoder and decoder at
+`-O1` and above, see Verification). `gix_encode` no longer derives `tw_step` and `tw_lin` from a NaN; a new test fails
+without the fix; `make test` is clean now (it was not before the fix). Real inserts with NaN readings never reproduced it
+(0 of 108 refused).
 
 Still open, for the 7950X and the 9950X: whether the unpack kernel should also run at **v4** (it is enabled only where there
 is no AVX-512BW, because it could not be measured on AVX-512 hardware; `-DTSDB_UNPACK_AVX2` and `build/decode-bench`
@@ -159,7 +160,8 @@ against `ref_ibp_decode`, and runs `unpack` alone on a heap buffer with exactly 
 packed ones (ASan: a read beyond is an error; this runs in a `-march=native` build, where the AVX2 path is compiled in).
 Four mutations of the kernel (the second load's bit offset, its byte offset, the shift mask, the loop bound) each fail it.
 `test_levels`, `test_types`, `test_damage`, `test_crafted` and `test_tsdb` pass under ASan + UBSan on the native build;
-`make test IO=epoll` passes except `test_gindex` (two failures that exist without this change); `tools/check-isa.sh` is clean.
+`make test IO=epoll` passes except `test_gindex` (two failures that exist without this change, fixed in the last commit);
+`tools/check-isa.sh` is clean.
 The Makefile object rules did not list `src/bitpack.h`, so an edit of it rebuilt nothing (my first measurement ran stale
 objects and showed no change): it is a dependency of the four rules now. No jepsen (no byte on disk changes). Not run: the
 7950X (v4 is unchanged there by construction), `make dist-test`.
@@ -189,8 +191,8 @@ included), 7 runs: cpu_temp 515 to 532, flow_rate 670 to 717, flow_total 310 to 
 Checks: `tests/test_levels.c` has 92 float64 decimal inputs (every decimal and binary scale, both ways of rebuilding,
 exceptions, lengths around four, integers at 2^51 and 2^52) and 400 crafted blocks with integers anywhere in the int64
 range against a plain reference: identical at every level, and three deliberate mutations of the AVX2 code are caught.
-`make test IO=epoll` (native build) passes except `test_gindex` (2 failures), which fails the same way on the commit
-before this change. `test_levels` and `test_types` pass under ASan + UBSan on the native AVX2 build and at v2 and v3
+`make test IO=epoll` (native build) passed except `test_gindex` (2 failures), which failed the same way on the commit
+before this change (fixed in the last commit). `test_levels` and `test_types` pass under ASan + UBSan on the native AVX2 build and at v2 and v3
 in `build-lv`; `tools/check-isa.sh` is clean. No byte of a block changes, so no jepsen run. Not run: `make dist-test`,
 `dist-check-sandybridge` (they need static liburing), `make tsan` (no concurrency touched), the 7950X.
 
@@ -299,7 +301,7 @@ cargo, Maven and a Python environment were not set up).
 
 | check | build | result |
 |---|---|---|
-| `make test IO=epoll` (`NO_URING=1`) | native, gcc 13.3 | **not clean**: every test passes except `test_gindex` (2 failures), which also fails on `main` (below); run as `make -i` to get past it |
+| `make test IO=epoll` (`NO_URING=1`) | native, gcc 13.3 | **clean after the `test_gindex` fix** (exit 0, no `-i`); before it every test passed except `test_gindex` (2 failures, also on `main`) |
 | `tests/test_levels` | v2 scalar/SSE/AVX, v3 scalar/SSE/AVX/AVX2, and native | identical output at every level, 405 inputs; 92 float64 decimal inputs, 400 crafted decimal blocks, widths 0-32 at 32 lengths for unpack, `unpack` on an exactly sized buffer |
 | mutations of the new code (7: 3 in the decimal path, 4 in the unpack kernel) | test_levels | each one fails the suite |
 | `make asan` (full) | generic x86-64 (`ARCH=` in the target), copy of the tree | pass, no report; `test_gindex` passes there too |
@@ -315,7 +317,7 @@ or lowered here without root).
 `setarch x86_64 -R make tsan` (no randomization, no root) runs it. `make asan` and `make tsan` build with `ARCH=` (generic
 x86-64), so neither compiles the AVX2 kernels: the native ASan + UBSan run above covers those.
 
-**`test_gindex` (cause found, not fixed).** Two cases ("random fields" #113 and #293) fail with "the granule index encoder
+**`test_gindex` (cause found, fixed in the last commit).** Two cases ("random fields" #113 and #293) fail with "the granule index encoder
 lost bits" on `main` as on this branch, in any build with `-O1` or higher (gcc 13.3: `-O1`, `-O2`, `-O3`, with or without
 `-march=native`, `-fno-tree-vectorize`), and pass at `-O0`, with `-fsanitize=undefined` at `-O2`, and under the TSan and
 ASan builds; clang (`-O1`, MemorySanitizer build) fails many more cases, among them the "float32 special" ones.
@@ -331,18 +333,22 @@ other bits, and the encoder's own round-trip `memcmp` refuses the index. At `-O0
 Is real data exposed? It needs first and last both NaN with different payloads and a **finite** sum, which a series with
 NaN readings does not give (the sum is NaN then); nulls share one payload. Inserts of a regular float32 series with NaN
 first, last and middle readings (6 x 6 payload pairs, 3 shapes, 108 inserts, native `-O3`) were all accepted. So the test
-builds an input real data probably cannot, but the encoder's choice is compiler-dependent and the test is red. A fix that
-makes the test pass in a scratch copy, at native and generic `-O3`, is to never derive from a NaN (in `gix_encode`, the loop that
-fills `skip[]`):
+built an input real data probably cannot, but the encoder's choice depended on the compiler (and on the CPU: x86 and Arm pick
+different payloads), which is reason enough.
+
+**The fix** (`src/gindex.c`, in `gix_encode`, the loop that fills `skip[]`): never derive from a NaN.
 
 ```c
-bool nan_ = e->fsum != e->fsum || e->tw_first != e->tw_first || e->tw_last != e->tw_last;
-skip[2 * i] = !nan_ && same_bits(gix_dstep(e->fsum, e->tw_last, e->tw_gap), e->tw_step);
-skip[2 * i + 1] = !nan_ && same_bits(gix_dlin(e->fsum, e->tw_first, e->tw_last, e->tw_gap), e->tw_lin);
+bool nan = e->fsum != e->fsum || e->tw_first != e->tw_first || e->tw_last != e->tw_last;
+skip[2 * i] = !nan && same_bits(gix_dstep(...), e->tw_step);
+skip[2 * i + 1] = !nan && same_bits(gix_dlin(...), e->tw_lin);
 ```
 
-NaN-valued grid granules then keep `tw_step` and `tw_lin` explicit (a few bytes more; the decoder already reads explicit
-fields, so the format is unchanged). Not applied: it is outside this task, and it changes the index encoder.
+A NaN entry keeps `tw_step` and `tw_lin` as explicit fields (a few bytes more for such a granule); the decoder already reads
+explicit fields, so no format changes and every index written before still reads the same. A new `test_nan_ends` in
+`tests/test_gindex.c` (NaN ends with four different payloads, a finite sum, `tw_lin` and `tw_step` set to each payload and
+to what `gix_dlin`/`gix_dstep` give; every entry round-trips alone and together) fails on the old encoder at native `-O3`
+(27 failures: the 2 random cases of before and 25 of these) and passes with the fix at native `-O3`, generic `-O3` and `-O0`; `make test IO=epoll` is clean.
 
 ## Repeating this on the 7950X and the 9950X
 

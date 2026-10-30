@@ -34,8 +34,8 @@ Quiet machine (no builds, no desktop load), governor `performance`, gcc 14 or ne
    `bench/cpu-compare/thresholds.sh --cpu v3 --vary` (and `--cpu v4` on AVX-512 CPUs).
 4. `bench/cpu-compare/ht-sweep.sh --server` (about 20 minutes at 5 rounds of 3 s).
 5. `make tsan` may abort every test with `FATAL: ThreadSanitizer: unexpected memory mapping` (and finish in under a
-   minute) on a kernel with high address randomization: run it as `setarch x86_64 -R make tsan`. `make test` is red
-   until `test_gindex` is fixed (see the report); `make -i test` runs the rest.
+   minute) on a kernel with high address randomization: run it as `setarch x86_64 -R make tsan`. `make test` was red
+   on every machine until the `test_gindex` fix (the last commit of the branch); on `main` it still is.
 6. `bench/hydraulic/get.sh`, `convert.py`, `run.sh` on both trees: the tables must be identical.
 7. `bench/clients/run.sh --clients c --repeat 5` on both trees (about 12 minutes each; run them one after the other, the
    load average must be below 2 at the start).
