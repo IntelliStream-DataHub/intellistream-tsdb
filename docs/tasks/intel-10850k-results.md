@@ -1,11 +1,44 @@
-# Results: tsdb on an Intel Core i9-10850K (partial)
+# Results: tsdb on an Intel Core i9-10850K (Comet Lake, AVX2)
 
-Measured 2026-10-29 on the 10850K (10 cores / 20 threads, AVX2, no AVX-512), Ubuntu, gcc 13.3 (the task asks for 14+),
-governor `powersave` under `intel_pstate` (HWP, EPP `balance_performance`; no sudo to change it), the desktop idle
-at about 1.5 CPUs. Binaries: a portable-style build (`-march=x86-64-v2`, codecs also at v3 and v4, `NO_URING=1`: liburing
-headers are missing, so no `tsdbd`, clients or `make dist`). Raw output was kept in `/var/tmp/i10850k/`.
-Not done yet: the hydraulic data, the server and clients,
-and the same runs on the 7950X.
+Task: [intel-10850k.md](intel-10850k.md). Measured 2026-10-29 and 30 on the machine below. Branch
+`intel-10850k-avx2-f64-decimal`, on top of `main` (eb58c21).
+
+| | |
+|---|---|
+| CPU | i9-10850K, 10 cores / 20 threads (siblings are cpu N and N+10), AVX2, BMI2, no AVX-512; the engine runs its **v3** level |
+| memory, disk | 31 GiB; ext4 on an SSD (`/var/tmp`, the root disk) |
+| governor | `powersave` under `intel_pstate` (HWP, EPP `balance_performance`); there is no sudo to change it, so frequency scales with load and the numbers carry that |
+| compiler | gcc 13.3 (the task asks for 14 or newer: not available), `-O3` |
+| load | a desktop session (browser, IDE, music) ran throughout: 0.3 to 0.9 CPUs busy in the second before each client measurement, about 1.5 over a day |
+| not possible here | `make dist` and what builds on it (`dist-test`, `dist-check-sandybridge`, `dist-check-almalinux10`: no static liburing, no sudo), the 7950X and 9950X |
+
+Raw output of the main runs is in [intel-10850k-raw/](intel-10850k-raw/). Everything the numbers need to be repeated on
+another CPU is in [bench/cpu-compare/](../../bench/cpu-compare/README.md); the last section lists the order.
+
+## Summary
+
+**Does the code need its own path for this CPU? No vendor or model path. Two improvements in the v3 (AVX2) level**, which
+every CPU that runs v3 gets (measured here only), with byte-identical output at every CPU level, and one build fix:
+
+| change | commit | effect on the 10850K (v3) |
+|---|---|---|
+| AVX2 float64 decimal encode and decode (step 4) | 480b0ef | encode +45 to +50%, decode +15 to +23% on a granule |
+| AVX2 shuffle kernel for bit unpacking, widths 1-25 (step 3) | f6964cd | unpack 5.5-8.5x (1.6-2.4 to 13-15 G values/s); `int_bp` decode 2.3x; float64 decimal decode 1.5-1.8x more; float32 ALP decode 3.6x; AUTO decode with ZSTD 2.4x |
+| Makefile: `src/bitpack.h` is a dependency of the object rules | f6964cd | an edit of it used to rebuild nothing |
+
+End to end through `bench/clients/run.sh` (the C client, embedded and `tsdbd`, 5 repeats, main against this branch,
+same machine and script): **queries +9% to +27%** (embedded raw 3600-row windows 37.8k to 46.6k q/s on one thread; 86,400-row
+aggregates over TCP 8.8k to 9.7k and, on 32 connections, 35.7k to 41.1k), **loads unchanged** (bound by fsync and the
+disk). The hydraulic compression table is identical to main's.
+
+What was measured and **not changed**: the AVX2 thresholds (step 2: crossovers on this CPU differ by 8 to 16 rows, and 96
+for float32 without nulls, from Zen 4's, but no query is faster with other values), PDEP/PEXT (step 3: a plain AVX2
+kernel is faster beyond 8 bits and works on every CPU), the default of one query thread per logical CPU (step 5: the second
+thread of a core is worth 11 to 23%, and nothing is slower with it).
+
+Still open, for the 7950X and the 9950X: whether the unpack kernel should also run at **v4** (it is enabled only where there
+is no AVX-512BW, because it could not be measured on AVX-512 hardware; `-DTSDB_UNPACK_AVX2` and `build/decode-bench`
+test it), the thresholds and the thread-scaling there, and the same before/after of the client runs.
 
 ## Step 1: v2 against v3 (`tools/fold-bench.sh build-lv 5`, `codec-bench`, `type-bench`; medians, one run each for the codecs)
 
@@ -24,36 +57,6 @@ Spread over 5 rounds under 2% (fold-bench prints median and min-max, not mean an
 (An earlier note here read the `tsdb-bench` "1 thr" and "20 thr" rows as one thread against 20 and called the scaling
 poor, 1.4x to 3.3x. That was wrong: its "1 thr" row is one client that already runs every query thread inside the
 query, and "20 thr" is 20 clients. Step 5 below has the real scaling.)
-
-## Step 4: AVX2 float64 decimal (`src/codec_typed.c`, v3 level and `-march=native` without AVX-512DQ)
-
-The float64 decimal codec converts int64 and double one value at a time below AVX-512DQ and divides one at a time.
-Now four values at a time: the integer by the 1.5 * 2^52 mantissa trick (exact for |k| < 2^51), the rounding by adding
-the same constant (ties to even, as `llrint`), the same IEEE multiply or divide as the scalar code. A group of four
-with an exception, or a value at or beyond 2^51 scaled, takes the one-at-a-time code, so the bytes are identical; a
-decoded block with any integer at or beyond 2^51 in magnitude (damage) is converted scalar as a whole. v2 and v4 are untouched.
-
-One 8192-value granule, 7 runs of 3 rounds, interleaved old and new, v3, mean (sd of the run means):
-
-| case | encode before | encode after | decode before | decode after |
-|---|---:|---:|---:|---:|
-| 10^-2, k / 100 | 381 (3) | 557 (7) | 580 (7) | 714 (4) |
-| 10^-2, k * 0.01 | 406 (4) | 584 (8) | 776 (14) | 891 (3) |
-| 10^-5, divide | 392 (2) | 575 (8) | 581 (4) | 713 (7) |
-| 10^-9, multiply | 439 (4) | 656 (9) | 775 (21) | 888 (11) |
-| 10^-12, divide | 412 (3) | 616 (11) | 578 (8) | 711 (11) |
-
-Encode +45 to +50%, decode +15 to +23% (M values/s). `type-bench` float64 decode (zstd and the integer unpacking
-included), 7 runs: cpu_temp 515 to 532, flow_rate 670 to 717, flow_total 310 to 331, hdd_temp 500 to 523, tank_bar 491 to
-505, vibration 502 to 610: +3 to +6%, vibration +21%. The integer unpacking (about 0.9 ns a value) is what is left of decode.
-
-Checks: `tests/test_levels.c` has 92 float64 decimal inputs (every decimal and binary scale, both ways of rebuilding,
-exceptions, lengths around four, integers at 2^51 and 2^52) and 400 crafted blocks with integers anywhere in the int64
-range against a plain reference: identical at every level, and three deliberate mutations of the AVX2 code are caught.
-`make test IO=epoll` (native build) passes except `test_gindex` (2 failures), which fails the same way on the commit
-before this change. `test_levels` and `test_types` pass under ASan + UBSan on the native AVX2 build and at v2 and v3
-in `build-lv`; `tools/check-isa.sh` is clean. No byte of a block changes, so no jepsen run. Not run: `make dist-test`,
-`dist-check-sandybridge` (they need static liburing), `make tsan` (no concurrency touched), the 7950X.
 
 ## Step 2: thresholds (measured, not changed)
 
@@ -150,77 +153,184 @@ The Makefile object rules did not list `src/bitpack.h`, so an edit of it rebuilt
 objects and showed no change): it is a dependency of the four rules now. No jepsen (no byte on disk changes). Not run: the
 7950X (v4 is unchanged there by construction), `make dist-test`.
 
+## Step 4: AVX2 float64 decimal (`src/codec_typed.c`, v3 level and `-march=native` without AVX-512DQ)
+
+The float64 decimal codec converts int64 and double one value at a time below AVX-512DQ and divides one at a time.
+Now four values at a time: the integer by the 1.5 * 2^52 mantissa trick (exact for |k| < 2^51), the rounding by adding
+the same constant (ties to even, as `llrint`), the same IEEE multiply or divide as the scalar code. A group of four
+with an exception, or a value at or beyond 2^51 scaled, takes the one-at-a-time code, so the bytes are identical; a
+decoded block with any integer at or beyond 2^51 in magnitude (damage) is converted scalar as a whole. v2 and v4 are untouched.
+
+One 8192-value granule, 7 runs of 3 rounds, interleaved old and new, v3, mean (sd of the run means):
+
+| case | encode before | encode after | decode before | decode after |
+|---|---:|---:|---:|---:|
+| 10^-2, k / 100 | 381 (3) | 557 (7) | 580 (7) | 714 (4) |
+| 10^-2, k * 0.01 | 406 (4) | 584 (8) | 776 (14) | 891 (3) |
+| 10^-5, divide | 392 (2) | 575 (8) | 581 (4) | 713 (7) |
+| 10^-9, multiply | 439 (4) | 656 (9) | 775 (21) | 888 (11) |
+| 10^-12, divide | 412 (3) | 616 (11) | 578 (8) | 711 (11) |
+
+Encode +45 to +50%, decode +15 to +23% (M values/s). `type-bench` float64 decode (zstd and the integer unpacking
+included), 7 runs: cpu_temp 515 to 532, flow_rate 670 to 717, flow_total 310 to 331, hdd_temp 500 to 523, tank_bar 491 to
+505, vibration 502 to 610: +3 to +6%, vibration +21%. The integer unpacking (about 0.9 ns a value) is what is left of decode.
+
+Checks: `tests/test_levels.c` has 92 float64 decimal inputs (every decimal and binary scale, both ways of rebuilding,
+exceptions, lengths around four, integers at 2^51 and 2^52) and 400 crafted blocks with integers anywhere in the int64
+range against a plain reference: identical at every level, and three deliberate mutations of the AVX2 code are caught.
+`make test IO=epoll` (native build) passes except `test_gindex` (2 failures), which fails the same way on the commit
+before this change. `test_levels` and `test_types` pass under ASan + UBSan on the native AVX2 build and at v2 and v3
+in `build-lv`; `tools/check-isa.sh` is clean. No byte of a block changes, so no jepsen run. Not run: `make dist-test`,
+`dist-check-sandybridge` (they need static liburing), `make tsan` (no concurrency touched), the 7950X.
+
 ## Step 5: Hyper-Threading (10 cores, 20 threads; siblings are cpu N and N+10)
 
-Setup: v3, the 100-series x 1 M-row float32 database (133 MiB, in the page cache), five interleaved rounds of 3 s per
-cell (means; sd is under 1.5% unless a cell says more), governor `powersave`, the desktop at about 1.5 CPUs.
-Raw output: `/var/tmp/i10850k/ht/`.
+Measured with the final code by `bench/cpu-compare/ht-sweep.sh --server`: v3, the 100-series x 1 M-row float32
+database (133 MiB, in the page cache, an untimed pass first), five interleaved rounds of 3 s per cell, means with sd, the
+desktop running (the 20-thread cells carry 2 to 5% sd for that reason; the others under 1.5%). Raw output:
+`intel-10850k-raw/ht-sweep.final.txt`.
 
 **A. What the second thread of a core is worth.** `taskset` sets, as many client threads as CPUs, each with
 `query_threads` = CPUs (tsdb-bench `--qps`), random windows. q/s, and the factor over one CPU:
 
 | CPUs | set | raw 3600 | x | agg 86400 | x | agg 604800 | x |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1 | cpu 0 | 38,246 | 1.0 | 3,900 | 1.0 | 768 | 1.0 |
-| 2 | two cores | 75,339 | 1.97 | 7,694 | 1.97 | 1,522 | 1.98 |
-| 2 | one core, both threads | 44,990 | 1.18 | 4,595 | 1.18 | 898 | 1.17 |
-| 4 | four cores | 148,265 | 3.88 | 15,162 | 3.89 | 2,967 | 3.86 |
-| 4 | two cores, both threads | 89,196 | 2.33 | 9,087 | 2.33 | 1,753 | 2.28 |
-| 5 | five cores | 186,288 | 4.87 | 18,896 | 4.84 | 3,718 | 4.84 |
-| 10 | ten cores, one thread each | 369,035 | 9.65 | 37,477 | 9.61 | 7,221 | 9.40 |
-| 10 | five cores, both threads | 220,039 | 5.75 | 22,459 | 5.76 | 4,330 | 5.64 |
-| 20 | everything | 414,271 | 10.83 | 43,085 | 11.05 | 8,091 | 10.54 |
+| 1 | cpu 0 | 46,451 | 1.00 | 4,597 | 1.00 | 925 | 1.00 |
+| 2 | two cores | 91,337 | 1.97 | 9,112 | 1.98 | 1,846 | 2.00 |
+| 2 | one core, both threads | 56,387 | 1.21 | 5,619 | 1.22 | 1,122 | 1.21 |
+| 4 | four cores | 180,972 | 3.90 | 18,072 | 3.93 | 3,638 | 3.93 |
+| 4 | two cores, both threads | 112,574 | 2.42 | 11,196 | 2.44 | 2,209 | 2.39 |
+| 5 | five cores | 225,885 | 4.86 | 22,525 | 4.90 | 4,561 | 4.93 |
+| 10 | ten cores, one thread each | 443,971 | 9.56 | 44,887 | 9.76 | 8,938 | 9.66 |
+| 10 | five cores, both threads | 277,331 | 5.97 | 27,691 | 6.02 | 5,497 | 5.94 |
+| 20 | everything | 525,254 | 11.31 | 52,359 | 11.39 | 9,926 | 10.73 |
 
-Physical cores scale linearly (97-98% per core up to 10). The second thread of a loaded core adds 15-19% (18% on one
-core, 18% on 2 to 5 cores) and 12-15% on the whole chip (10 cores to 20 threads): the decode is integer and AVX2 work,
-and the two threads share the core's units, but the gain is real and it is never a loss.
+Physical cores scale linearly (97-98% per core up to 10). The second thread of a loaded core adds **21-23%** (one core,
+two cores, five cores), and **11-18% on the whole chip** (10 cores to 20 threads: raw +18%, agg 86400 +17%, agg 604800 +11%):
+decode is integer and AVX2 work and the two threads share the core's units, but the gain is real and never a loss. (An
+earlier sweep, before the unpack kernel was in, gave 15-19% and 12-15%.)
 
 **B. One large query, unpinned** (one client, `--query-threads` Q; q/s):
 
 | Q | raw 3600 | agg 86400 | agg 604800 |
 |---:|---:|---:|---:|
-| 1 | 38,207 | 3,888 | 765 |
-| 2 | 38,382 | 6,986 | 1,463 |
-| 4 | 38,212 | 11,889 | 2,741 |
-| 5 | 38,452 | 13,251 | 3,341 |
-| 10 | 38,204 | 13,261 | 5,312 |
-| 20 | 38,417 | 13,204 | 6,194 |
+| 1 | 46,333 | 4,585 | 926 |
+| 2 | 46,318 | 8,186 | 1,765 |
+| 4 | 46,397 | 13,709 | 3,278 |
+| 10 | 45,940 | 15,324 | 6,202 |
+| 20 | 46,281 | 15,384 | 7,371 |
 
-Raw windows (3600 rows) and the 86,400-row aggregates (about 5 threads of `QUERY_ROWS_PER_THREAD` = 16384 rows) are
-capped by the rows they decode, not by Hyper-Threading: nothing above 5 threads helps them, and nothing hurts. The
-604,800-row window uses every thread: 10 threads give 6.9x, 20 give 8.1x (+17% over 10).
-`threads-bench` (one query over 1024 granules, 7 runs of 150 ms; mean us per query, one thread against all): agg 13,018
-to 2,967 us at 5 threads (4.4x), 1,810 at 10 (7.1x), 1,514 at 20 (8.4x); STEP TWA 52,501 to 11,069 (4.7x), 5,900
-(8.9x), 5,534 (9.5x): TWA gains only 7% from the second thread, agg 20%. Queries of 1 to 8 granules are as fast at
-20 threads as at 5 (13.5, 36.0 and 34.6 us for 1 and 8 granules at 5, 20 threads).
+Raw windows (3600 rows) and the 86,400-row aggregates (about 5 threads of `QUERY_ROWS_PER_THREAD` = 16384 rows) are capped
+by the rows they decode, not by Hyper-Threading: nothing above 5 threads helps them, and nothing hurts. The 604,800-row
+window uses every thread: 10 threads give 6.7x, 20 give 8.0x (+19% over 10). `threads-bench` (an earlier run, before the
+unpack kernel; one query over 1024 granules, 7 runs of 150 ms; mean us per query, one thread against all): agg 13,018
+to 2,967 us at 5 threads (4.4x), 1,810 at 10 (7.1x), 1,514 at 20 (8.4x); STEP TWA 52,501 to 11,069 (4.7x), 5,900 (8.9x),
+5,534 (9.5x): TWA gains only 7% from the second thread, agg 20%. Queries of 1 to 8 granules are as fast at 20 threads as
+at 5 (13.5, 36.0 and 34.6 us for 1 and 8 granules at 5, 20 threads).
 
-**C. Many clients** (20 clients, Q query threads): throughput is flat in Q within the noise, 1 to 20 threads: raw
-402,600 to 426,900, agg 86400 41,100 to 42,900, agg 604800 7,930 to 8,230. The machine is saturated by the clients,
-so more helper threads add nothing, and cost 2-6% on raw windows at Q = 20 against Q = 1 (about three sd; small
-windows run on their caller and the helpers only add wake-ups).
+**C. Many clients** (an earlier run, before the unpack kernel; 20 clients, Q query threads): throughput is flat in Q
+within the noise, 1 to 20 threads: raw 402,600 to 426,900, agg 86400 41,100 to 42,900, agg 604800 7,930 to 8,230. The
+machine is saturated by the clients, so more helper threads add nothing, and cost 2-6% on raw windows at Q = 20 against
+Q = 1 (about three sd; small windows run on their caller and the helpers only add wake-ups).
 
 **D. tsdbd**, one connection (`tsdbc-bench query --multi 100`: 100 windows per QUERY_MULTI, the series spread over the
 server's threads), q/s by `--query-threads`:
 
 | Q | raw | agg 86400 | agg 604800 | twa 604800 |
 |---:|---:|---:|---:|---:|
-| 1 | 21,321 | 3,693 | 758 | 268 |
-| 2 | 36,464 | 6,949 | 1,415 | 517 |
-| 4 | 61,342 | 13,270 | 2,789 | 992 |
-| 5 | 61,567 | 16,512 | 3,426 | 1,240 |
-| 10 | 59,144 | 28,068 | 6,032 | 2,211 |
-| 20 | 58,762 | 37,504 | 7,949 | 2,585 |
+| 1 | 24,485 | 4,391 | 904 | 281 |
+| 2 | 41,440 | 8,320 | 1,697 | 545 |
+| 4 | 64,221 | 15,853 | 3,320 | 1,052 |
+| 10 | 61,824 | 33,040 | 7,088 | 2,364 |
+| 20 | 61,506 | 42,762 | 9,840 | 2,733 |
 
-Multi-series requests scale to 10.2x at 20 threads for the aggregates (+34% over 10 threads, +32% for 604,800-row
-windows, +17% for TWA). The raw class stops at about 4 threads: one connection and the reply path are the limit. This
-is more than the 12-15% of A; the client runs on the same machine and takes CPU from a 10-thread server, so part of
-the gain is the client and the server not competing. With one request per window (`--multi 0`) the aggregates stop at
-the per-query cap again (agg 86400: 8,756 at 10, 8,734 at 20; agg 604800: 4,274 and 5,056, +18%).
+Multi-series requests scale to 9.7-10.9x at 20 threads for the aggregates: +29% over 10 threads for 86,400-row windows,
++39% for 604,800-row windows, +16% for TWA. The raw class stops at about 4 threads (24k to 64k, then flat): one connection
+and the reply path are the limit, not the decode. The gain from 10 to 20 threads is more than the 11-18% of A because the
+client runs on the same machine and competes for the cores with a 10-thread server; a pinned client and server were not
+run.
 
 **What follows.** Do not change the default of one query thread per logical CPU. Limiting it to one per physical core
-would lose 12-19% on large and multi-series queries (up to a third in the loopback case) and gain nothing: no
-configuration is slower with 20 threads than with 10, except a 2-6% throughput cost for tiny windows under a
-saturating client load, which a fixed 10 would pay too. The second thread of a core is worth about 15% here, so
-capacity planning for such CPUs should count a core as about 1.15 threads of tsdb work. Not measured: the 7950X
-(16 against 32 threads; Zen 4's SMT may differ), and a pinned run of B/D with the client on other cores, which would
-separate the client's share in D.
+would lose 11-39% on large and multi-series queries and gain nothing: no configuration is slower with 20 threads than with
+10, except a 2-6% throughput cost for tiny windows under a saturating client load, which a fixed 10 would pay too.
+Capacity planning for such CPUs should count a core as about 1.2 threads of tsdb work. Not measured: the 7950X and 9950X
+(16 against 32 threads; Zen's SMT may differ).
+
+## Hydraulic data (real sensors, `bench/hydraulic/run.sh`)
+
+The 17 UCI hydraulic-rig sensors, float32 and float64 (and the pressures converted to psi): bits per value of tsdb and
+of the other codecs, every granule decoded again and checked bit for bit. **The table of this branch and the table of
+`main` are identical** (`diff` of the two outputs: no difference; `intel-10850k-raw/hydraulic-table.md`): the AVX2 paths
+change no byte. 24 of the 46 rows differ by 0.01 bit (smaller) from the table in `bench/hydraulic/README.md`, which
+predates other commits on `main` (2026-10-26); this work did not move them. The table is about size, not speed, and does
+not depend on the CPU.
+
+## Clients and the server (`bench/clients/run.sh --clients c --repeat 5`)
+
+Embedded C and the C client over TCP to `tsdbd` (epoll: no liburing), the 100 M-row set, 5 repeats, medians. Run on the
+branch (2694f60) and on `main` (eb58c21) in turn, the same binaries' flags (`-march=native`, which here is AVX2), the
+machine quiet before every measurement (0.27 to 0.92 CPUs busy), 62 loads per run checked against the file (row count,
+sum, every timestamp and value): 0 mismatches in both runs. Queries, q/s, main -> branch:
+
+| query | embedded, 1 thread | embedded, 32 threads | TCP, 1 connection | TCP, 32 connections |
+|---|---:|---:|---:|---:|
+| raw, 3600 samples | 37,788 -> 46,590 (+23%) | 429,527 -> 522,650 (+22%) | 15,491 -> 16,849 (+9%) | 86,517 -> 88,876 (+3%) |
+| agg, 86,400 samples in buckets of 300 | 13,137 -> 15,383 (+17%) | 41,905 -> 53,307 (+27%) | 8,750 -> 9,694 (+11%) | 35,654 -> 41,071 (+15%) |
+| agg, 604,800 samples in buckets of 3600 | 6,138 -> 7,366 (+20%) | 8,049 -> 10,147 (+26%) | 5,010 -> 5,809 (+16%) | 7,968 -> 9,847 (+24%) |
+
+Loads, M rows/s with 1 / 4 / 16 threads or connections, main -> branch: embedded fsync on 30.1 -> 30.3, 93.1 -> 89.7, 146.9
+-> 141.9; fsync off 33.7 -> 33.8, 117.5 -> 118.0, 197.0 -> 195.9; TCP zstd 19.4 -> 19.6, 59.1 -> 59.8, 91.0 -> 87.9; TCP plain 27.0 ->
+27.3, 79.5 -> 76.0, 87.2 -> 86.6. Within the noise (the spread of the TCP zstd cells is 8-27% of the median): loading is
+bound by fsync and the disk, not by decode. The Rust, Python and Java clients were not run (the task asks for `--clients c`;
+cargo, Maven and a Python environment were not set up).
+
+## Verification
+
+| check | build | result |
+|---|---|---|
+| `make test IO=epoll` (`NO_URING=1`) | native, gcc 13.3 | all pass except `test_gindex`: 2 failures that also fail on `main` (below) |
+| `tests/test_levels` | v2 scalar/SSE/AVX, v3 scalar/SSE/AVX/AVX2, and native | identical output at every level, 405 inputs; 92 float64 decimal inputs, 400 crafted decimal blocks, widths 0-32 at 32 lengths for unpack, `unpack` on an exactly sized buffer |
+| mutations of the new code (7: 3 in the decimal path, 4 in the unpack kernel) | test_levels | each one fails the suite |
+| `make asan` (full) | generic x86-64 (`ARCH=` in the target), copy of the tree | pass, no report; `test_gindex` passes there too |
+| ASan + UBSan on `test_levels`, `test_types`, `test_damage`, `test_crafted`, `test_tsdb` | native (AVX2 paths compiled in) | pass, no report |
+| `make tsan` | generic x86-64, `IO=epoll` | pass, no report, **under `setarch -R`** (below) |
+| `tools/check-isa.sh` | v2/v3/v4 build | clean: nothing above v2 outside the dispatch |
+| jepsen | - | not run: no byte on disk changes, no write or recovery path touched |
+| `make dist`, `dist-test`, `dist-check-sandybridge`, `dist-check-almalinux10` | - | **not run**: `make dist` needs a static liburing, which is not installed here (Podman is) |
+
+`make tsan` aborts every test with `FATAL: ThreadSanitizer: unexpected memory mapping` on this kernel (6.17) with gcc
+13.3's TSan runtime: a known incompatibility with the kernel's address randomization (`vm.mmap_rnd_bits`; it cannot be read
+or lowered here without root).
+`setarch x86_64 -R make tsan` (no randomization, no root) runs it. `make asan` and `make tsan` build with `ARCH=` (generic
+x86-64), so neither compiles the AVX2 kernels: the native ASan + UBSan run above covers those.
+
+**`test_gindex` (found, not fixed).** Two cases ("random fields" #113 and #293) fail with "the granule index encoder lost
+bits" on `main` as on this branch, in any build with `-O1` or higher (gcc 13.3: `-O1`, `-O2`, `-O3`, with or without
+`-march=native`, `-fno-tree-vectorize`), and pass at `-O0`, with `-fsanitize=undefined` at `-O2`, and under the TSan and ASan
+builds. `struct granule` has no padding (160 bytes, all fields) and UBSan reports nothing. clang (`-O1`, MemorySanitizer
+build) fails many more cases, among them the "float32 special" ones. So the encoder's own round-trip check (`gix_encode`
+decodes what it wrote and compares it with `memcmp`) refuses indexes when the compiler optimizes: a refused part is a
+failed insert or merge, so this may matter outside the test. The cause is not known. It is worth a look before the
+7950X and 9950X runs (gcc 14 or 15 may behave differently).
+
+## Repeating this on the 7950X and the 9950X
+
+[bench/cpu-compare/README.md](../../bench/cpu-compare/README.md) has the order and the commands. In short: build `main` and
+this branch, run `build/decode-bench` (also with `-DTSDB_UNPACK_AVX2`), `thresholds.sh --cpu v3` (and `v4`),
+`ht-sweep.sh --server`, `bench/hydraulic/run.sh` and `bench/clients/run.sh --clients c --repeat 5` on both. Questions the
+other CPUs answer:
+
+1. **Unpack kernel at v4.** `decode-bench` shows the loops, the kernel and PDEP side by side per width; on a 7950X
+   (Zen 4 runs 512-bit operations in 256-bit halves) and a 9950X (Zen 5 has full-width units) it shows whether the kernel, which runs there too, beats the
+   loops that v4 uses now, and whether PDEP (fast on Zen 3 and later) ever wins on AMD. If it wins, remove
+   `!defined(__AVX512BW__)` in `src/bitpack.h` and run `make dist-test` at every level.
+2. **Thresholds** (`thresholds.sh`): are Zen 4's constants in `src/simd.c` right on the 9950X, and do the 10850K's
+   crossovers (table in step 2) hold on AMD? A per-vendor table is only worth it if a crossover moves by a factor
+   and a query follows.
+3. **Hyper-Threading** (`ht-sweep.sh`): the second thread is worth 11 to 23% here; the same on 16 cores / 32 threads?
+4. **The AVX2 decimal path against v4.** At v4 the compiler vectorizes the decimal conversions itself
+   (`vcvtqq2pd`), and `src/codec_typed.c` leaves them to it (`!defined(__AVX512DQ__)`). Compare `decode-bench`'s float64
+   decimal rows at `TSDB_CPU=v3` and `TSDB_CPU=v4` on the same machine.
+5. **Before and after the same way** (`bench/clients/run.sh` on `main` and on the branch): on this CPU queries gained
+   9-27%; is it the same on AMD?
+

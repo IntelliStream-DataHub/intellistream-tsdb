@@ -1,0 +1,15 @@
+--- a/src/simd.c
++++ b/src/simd.c
+@@ -1767,6 +1767,12 @@
+     default: break;
+     }
+ #endif
++    { /* scratch build for the threshold sweep: any threshold from the environment ("max": never) */
++        const char *e;
++#define OVR(var, name) if ((e = getenv(name))) var = !strcmp(e, "max") ? SIZE_MAX : (size_t)strtoull(e, NULL, 0)
++        OVR(shortn, "TSDB_T_SHORT"); OVR(shortn64, "TSDB_T_SHORT64");
++        OVR(thr.i64, "TSDB_T_I64"); OVR(thr.i64_dev, "TSDB_T_I64DEV"); OVR(thr.u32, "TSDB_T_U32"); OVR(thr.lttb, "TSDB_T_LTTB");
++    }
+     simd_agg_f32 = f;
+     simd_fold_f32 = f32;
+     simd_fold_f64 = f64;
