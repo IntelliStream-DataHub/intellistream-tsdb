@@ -143,6 +143,42 @@ steplock() { # MODE(-s|-x): BENCH.lock on fd 9 unless inside a step
     flock "$1" 9
 }
 stepunlock() { [ "${IN_STEP:-0}" = 1 ] && return 0; flock -u 9; exec 9>&-; }
+# The memory of the servers during a timed step (OUT.mem, one line per server): the highest memory.current of its cgroup
+# (page cache included: what the limit counts) and the highest anon + shmem + kernel of memory.stat (without the page
+# cache, which the kernel takes back under pressure: what the server itself holds), sampled every 0.5 s. The servers
+# are the running rb-* containers and tsdbd (TPID): a step does not say which one it drives, tables.py picks by system.
+mem_cgroups() { # NAME CGDIR per line: every running rb-* container and tsdbd's scope
+    local c p
+    for c in $(podman ps --format '{{.Names}}' 2> /dev/null | grep '^rb-'); do
+        p=$(podman inspect -f '{{.State.CgroupPath}}' "$c" 2> /dev/null)
+        [ -n "$p" ] && [ -r "${CGROOT:-/sys/fs/cgroup}$p/memory.stat" ] && echo "$c ${CGROOT:-/sys/fs/cgroup}$p"
+    done
+    if [ -n "${TPID-}" ] && [ "$TPID" -gt 1 ] 2> /dev/null; then
+        p=$(sed -n 's/^0:://p' /proc/"$TPID"/cgroup 2> /dev/null)
+        [ -n "$p" ] && [ -r "${CGROOT:-/sys/fs/cgroup}$p/memory.stat" ] && echo "tsdbd ${CGROOT:-/sys/fs/cgroup}$p"
+    fi
+}
+mem_sample() { # OUTFILE NAME CGDIR [NAME CGDIR...]: until killed, the peaks of each into OUTFILE (rewritten when one grows)
+    local f=$1 i n cur res grew
+    shift
+    local -a name dir pc pr
+    while [ $# -ge 2 ]; do name+=("$1"); dir+=("$2"); pc+=(0); pr+=(0); shift 2; done
+    n=${#name[@]}
+    [ "$n" -gt 0 ] || return 0
+    while :; do
+        grew=0
+        for ((i = 0; i < n; i++)); do
+            cur=$(cat "${dir[i]}/memory.current" 2> /dev/null) || continue
+            res=$(awk '$1 == "anon" || $1 == "shmem" || $1 == "kernel" { s += $2 } END { print s + 0 }' "${dir[i]}/memory.stat" 2> /dev/null)
+            [ "$cur" -gt "${pc[i]}" ] 2> /dev/null && { pc[i]=$cur; grew=1; }
+            [ "${res:-0}" -gt "${pr[i]}" ] 2> /dev/null && { pr[i]=$res; grew=1; }
+        done
+        if [ "$grew" = 1 ]; then
+            for ((i = 0; i < n; i++)); do echo "${name[i]} peak ${pc[i]} nocache ${pr[i]}"; done > "$f.tmp" && mv "$f.tmp" "$f"
+        fi
+        sleep 0.5
+    done
+}
 declare -A DEAD_CLASS   # step label without its run (" r3"): the server died in it twice, so its other runs are skipped
 tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout+stderr to OUTFILE (fd 9 closed)
     local label=$1 out=$2 s e rc key=${1% r[0-9]*}
@@ -162,10 +198,15 @@ tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout
     fi
     if [ "${SMOKE:-0}" = 1 ]; then steplock -s; else steplock -x; fi
     quiet "$label"
+    local mp
+    rm -f "$out.mem"
+    mem_sample "$out.mem" $(mem_cgroups) 9>&- &
+    mp=$!
     s=$(date +%s.%N)
     limited "$STEP_TIMEOUT" "$out" "$@"
     rc=$?
     e=$(date +%s.%N)
+    [ "$mp" -gt 1 ] 2> /dev/null && { kill "$mp" 2> /dev/null; wait "$mp" 2> /dev/null; }
     stepunlock
     printf '%s\t%s\trc=%d\t%.1fs\tbusy=%s\n' "$(date '+%F %T')" "$label" "$rc" "$(echo "$e - $s" | bc)" "$BUSY" >> "$OUT/steps.log"
     # a run measured on a busy machine says so beside its output (OUT.notquiet), which tables.py prints with the mean

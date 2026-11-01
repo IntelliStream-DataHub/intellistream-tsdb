@@ -1,12 +1,12 @@
 #!/bin/bash
 # harnesstest.sh: run.sh's death detection (oom_killed, ctr_died) against a stub podman and a fake cgroup tree, so
-# no container is needed; and ts_many_probe against a stub qdrive. Prints one line per case and "harnesstest OK" or "harnesstest FAILED".
+# no container is needed; ts_many_probe against a stub qdrive; mem_sample against fake memory files. Prints one line per case and "harnesstest OK" or "harnesstest FAILED".
 #   bash bench/dbcmp/release/harnesstest.sh
 HERE=$(dirname "$(readlink -f "$0")")
 T=$(mktemp -d) || exit 2
 trap 'rm -rf "$T"' EXIT
 # the functions under test, taken from run.sh as they are (sourcing run.sh would run it)
-eval "$(sed -n -e '/^oom_killed() {/,/^}/p' -e '/^ctr_died() {/,/^}/p' -e '/^ts_many_probe() {/,/^}/p' "$HERE/run.sh")"
+eval "$(sed -n -e '/^oom_killed() {/,/^}/p' -e '/^ctr_died() {/,/^}/p' -e '/^ts_many_probe() {/,/^}/p' -e '/^mem_sample() {/,/^}/p' "$HERE/run.sh")"
 OUT=$T/out CGROOT=$T/cg
 mkdir -p "$OUT"
 ID=id1 OOMS=0
@@ -58,4 +58,16 @@ probe() { # PAR_OK TRY WANT-MANY_CONN-SUFFIX
 probe 1 "2 1 0" "'-c TimeZone=UTC -c max_parallel_workers_per_gather=1'"
 probe 2 "2 1 0" "'-c TimeZone=UTC -c max_parallel_workers_per_gather=2'"
 probe -1 "2 1 0" ""
+
+# mem_sample: the peaks of two servers, page cache included (memory.current) and without (anon + shmem + kernel)
+M=$T/mem; mkdir -p "$M/a" "$M/b"
+setmem() { echo "$2" > "$M/$1/memory.current"; printf 'anon %s\nfile 999999\nkernel %s\nshmem %s\n' "$3" "$4" "$5" > "$M/$1/memory.stat"; }
+setmem a 1000 100 10 1; setmem b 5000 50 5 0
+mem_sample "$M/out" rb-a "$M/a" tsdbd "$M/b" &
+mp=$!
+sleep 1.2; setmem a 9000 700 70 7; sleep 1.2; setmem a 2000 200 20 2; sleep 1.2
+kill "$mp"; wait "$mp" 2> /dev/null
+want=$'rb-a peak 9000 nocache 777\ntsdbd peak 5000 nocache 55'
+if [ "$(cat "$M/out")" = "$want" ]; then echo "ok   mem_sample keeps each server's peaks"
+else echo "FAIL mem_sample wrote: $(cat "$M/out" | tr '\n' ';') want: ${want//$'\n'/;}"; fails=$((fails + 1)); fi
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }

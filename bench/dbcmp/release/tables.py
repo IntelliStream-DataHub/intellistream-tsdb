@@ -6,7 +6,9 @@
 For every phase directory OUT/p<n> that has results: the results (phase 1: sizes.md of sizes_summary.py; phases 2
 to 4: one table per system of its measurements: every timing line of every *.mean.txt (the mean over the runs) with
 its sd and min-max, the run count, and flags for runs on a busy machine, refused or OOM-killed runs and text that
-differs between runs; a mean file without a timing line fails the script; then loose.txt, answers that differ from
+differs between runs, and the servers' peak memory over its runs (the OUT.mem files of run.sh's mem_sample: without
+the page cache, and with it, which is what a memory limit counts); a mean file without a timing line fails the script;
+then a line with each server's peak over all its timed steps, then loose.txt, answers that differ from
 tsdb's within a stated bound), and under them a "How it was run" table built from the how.json
 files (how.py) plus footnotes: the '-' reasons, refusals and the per-core method. A system directory with results
 but no how.json, or a how.json without one of how.py's REQUIRED fields, fails the script (exit 1): no number goes
@@ -102,22 +104,50 @@ def picked(f):
     return lines, nruns, flags
 
 
+def mem_peaks(files):
+    """{server: (peak without page cache, peak with it)} over mem_sample files ("NAME peak N nocache M" lines)."""
+    peaks = {}
+    for f in files:
+        for l in open(f):
+            m = re.fullmatch(r"(\S+) peak (\d+) nocache (\d+)", l.strip())
+            if m:
+                a, b = peaks.get(m.group(1), (0, 0))
+                peaks[m.group(1)] = (max(a, int(m.group(3))), max(b, int(m.group(2))))
+    return peaks
+
+
+def mem_cell(peaks):
+    return "<br>".join("%s %.2f / %.2f GB" % (k, v[0] / 2**30, v[1] / 2**30) for k, v in sorted(peaks.items()))
+
+
+def mem_line(d, prefix=""):
+    """The peak of each server over every timed step in d (loads included), or nothing without mem files."""
+    peaks = mem_peaks(sorted(glob.glob(os.path.join(d, prefix + "*.mem"))))
+    if not peaks:
+        return []
+    return ["", "Peak memory of the server over all timed steps (loads included), without / with the page cache "
+            "(sampled every 0.5 s): " + "; ".join(mem_cell({k: v}) for k, v in sorted(peaks.items())), ""]
+
+
 def results_table(d, prefix=""):
     rows = []
     for f in sorted(glob.glob(os.path.join(d, prefix + "*.mean.txt"))):
         name = os.path.basename(f)[:-len(".mean.txt")]
+        mem = mem_cell(mem_peaks(g for g in glob.glob(os.path.join(d, name + ".*.mem"))
+                                 if re.fullmatch(re.escape(name) + r"\.\d+\.mem", os.path.basename(g))))
         lines, nruns, flags = picked(f)
         if not lines:
             errors.append("%s: no timing in it (a failed or empty run?)" % f)
             flags.append("NO TIMING")
         res = "<br>".join(cell(t)[:240] for t, _ in lines) or "-"
         spread = "<br>".join(cell(st)[:240] or "(one run or no spread)" for _, st in lines) or "-"
-        rows.append("| %s | %s | %s | %s | %s |" % (cell(name), res, spread, nruns if nruns is not None else "?",
-                                                   cell("; ".join(flags)) or ""))
+        rows.append("| %s | %s | %s | %s | %s | %s |" % (cell(name), res, spread, nruns if nruns is not None else "?",
+                                                        mem or "-", cell("; ".join(flags)) or ""))
     if not rows:
         return []
-    return ["| measurement | mean over the runs | sd %, [min-max] per number | runs | flags |",
-            "|---|---|---|---|---|"] + rows
+    return ["| measurement | mean over the runs | sd %, [min-max] per number | runs | "
+            "peak memory, without / with page cache | flags |",
+            "|---|---|---|---|---|---|"] + rows
 
 
 def loose_notes(d):
@@ -165,7 +195,7 @@ def phase2(out, p):
         if not h:
             continue
         hows.append(h)
-        out += ["### %s" % h["system"], ""] + (t or ["(no timed measurements)"]) + loose_notes(d) + [""]
+        out += ["### %s" % h["system"], ""] + (t or ["(no timed measurements)"]) + mem_line(d) + loose_notes(d) + [""]
     out += how_table(hows, COLS)
 
 
@@ -176,7 +206,7 @@ def phase_flat(out, p, title):
         errors.append("%s: results without how-*.json" % p)
     if not t:
         return
-    out += ["## %s" % title, ""] + t + loose_notes(p) + [""]
+    out += ["## %s" % title, ""] + t + mem_line(p) + loose_notes(p) + [""]
     out += how_table(hows, COLS)
 
 
