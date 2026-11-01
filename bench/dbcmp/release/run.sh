@@ -601,6 +601,8 @@ twabsuite() { # SYS DIR DRIVER-ARGS...|ch
     shift 2
     cd "$WORK" || return 1
     for k in $TWA_WKINDS; do for K in $TWA_KS; do
+        # a batch is whole groups of K windows: none with fewer windows (the smoke's TWA_N=60 and K = 100)
+        [ "$K" -le "${TWA_N:-1000}" ] || { log "  $S $k.b$K: only TWA_N=$TWA_N windows, no batch of $K"; continue; }
         REL has "$S" "$k" || { dashnote "$D" "$k.b$K: no query in rel.py for $S"; continue; }
         f=$WORK/q/$S.$k.b$K.txt
         REL qb "$S" "$k" "$K" > "$f" && [ -s "$f" ] || { fail "rel.py qb $S $k $K (see $f)"; continue; }
@@ -641,6 +643,7 @@ tsdbtwab() { # DIR PREFIX
         reps "$P$k.b100.c1" "$D" -- "$B/relq" "$k" 1 1 --batch 100
     done
     for k in $TWA_WKINDS; do for K in $TWA_KS; do
+        [ "$K" -le "${TWA_N:-1000}" ] || { log "  tsdb $P$k.b$K: only TWA_N=$TWA_N windows, no batch of $K"; continue; }
         untimed "$D/check-$P$k.b$K.txt" bash -c "TWA_SPEC='$WORK/spec.tsv' '$B/relq' $k 1 1 '$w/$P$k.b$K.jsonl' --batch $K && python3 -I '$TOOLS/rel.py' jsonl $k '$WORK/ref/$k.jsonl' '$w/$P$k.b$K.jsonl'" || continue
         TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" 1 "$WARM_SECS" > "$D/warm.$P$k.b$K" 2>&1 9>&- || { fail "tsdb $P$k.b$K warm-up failed (see $D/warm.$P$k.b$K)"; continue; }
         for t in 1 $NHI; do reps "$P$k.b$K.c$t" "$D" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" "$t" "$SECS"; done
@@ -1831,6 +1834,7 @@ phase6() {
         nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
         SWEEP_SUB=/memsweep XREPS=$reps REPS=1 LOADS_FROM=1 NO_PC=1 LABEL_PFX="p6 " p2_sys "$s" || fail "p6 $s returned an error"
         cleanup_all
+        [ -e "$d/how.json" ] || how_write 2 "$s"   # a system phase 2 has not run: tables.py needs how it ran
         runstats "$d"   # the new classes' means beside phase 2's (runstats rewrites every mean of the directory alike)
         [ "$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)" = "$nf" ] && date > "$OUT/p6/$s.done"
         log "p6 $s end"
@@ -1854,7 +1858,7 @@ phase_checktest() {
 }
 
 # ================================================================== smoke: every phase and system on tiny data
-# run.sh again in its own DBCMP (SMOKE_DIR, under /var/tmp): prep p1 p2 p3 p4 p5 with every system and variant, 10
+# run.sh again in its own DBCMP (SMOKE_DIR, under /var/tmp): prep p1 p2 p3 p4 p5 p6 with every system and variant, 10
 # series x 20,000 rows with every window and bucket 60 times shorter (SPEC_DIV), 2 data sets for p1, p5 at 100 series
 # x 100,000 rows, REPS=1, SECS=1, batches of 1, 10 and 100, 2 clients where the release run has 32 or 16 (NHI, NPER),
 # short settles and a 120 s step timeout, SMOKE=1 (no quiet gate; BENCH.lock shared, per step). It is the builder's
@@ -1868,7 +1872,7 @@ phase_smoke() {
     # SMOKE_PHASES and SMOKE_OUT rerun a part (SMOKE_P2_SYSTEMS picks p2's systems; the smoke leaves out qdb1, iotz and tdz,
     # whose queries are qdb2's, iot's and td's; P1_SYSTEMS etc. pass through) on the inputs of an earlier smoke run;
     # the smoke also drops the 1-client batch runs (BTHREADS=2; per core still runs) and converts at ZSTD level 3
-    local ph=${SMOKE_PHASES:-prep p1 p2 p3 p4 p5} so=${SMOKE_OUT:-$S/results}
+    local ph=${SMOKE_PHASES:-prep p1 p2 p3 p4 p5 p6} so=${SMOKE_OUT:-$S/results}
     case $so in "$S"/?*) ;; *) log "smoke: SMOKE_OUT must be under $S, not $so"; return 1 ;; esac
     rm -rf "$so"; mkdir -p "$so"
     log "SMOKE START: run.sh $ph in $S (log $so/driver.log)"

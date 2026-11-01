@@ -83,7 +83,7 @@ expect() { # NAME CONDITION...: one case
     if eval "${*:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
 }
 declare -A DEAD_CLASS
-quiet() { BUSY=0.1; }; mem_cgroups() { :; }; reset_quiet() { :; }; cleanup_all() { :; }; rmdata() { :; }
+quiet() { BUSY=0.1; }; mem_cgroups() { :; }; reset_quiet() { :; }; cleanup_all() { :; }; rmdata() { :; }; pc_client() { "$@"; }
 X6=$T/p6; OUT=$X6/out WORK=$X6/work B=$X6/b TOOLS=$X6/tools WARM_SECS=1 NHI=32 SECS=1 REPS=5 STEP_TIMEOUT=60
 mkdir -p "$OUT/p2/ch" "$WORK/q" "$B" "$TOOLS"
 # tstep: the label prefix goes into steps.log; RESUME skips a step logged rc=0 whose output is there, and only then
@@ -112,7 +112,10 @@ expect "twabsuite: checked into the system's directory" "grep -q 'ts twa1d.b10 O
 REPS=5 twabsuite none "$OUT/p2/i2" http x; REPS=5 twabsuite none "$OUT/p2/i2" http x
 expect "twabsuite: no query: one dash line per class, not repeated by a rerun" \
     "[ \$(grep -c '^twa1d.b10: no query in rel.py for none\$' '$OUT/p2/i2/dash.txt') = 1 ] && [ \$(wc -l < '$OUT/p2/i2/dash.txt') = 4 ]"
-fails0=$fails; fail() { echo "fail: $*" >> "$X6/fails"; }
+TWA_N=60 REPS=5 twabsuite ts2 "$OUT/p2/ts2" pg conn
+expect "twabsuite: K above TWA_N windows (the smoke's 60) skipped, the others timed" \
+    "! grep -q '^ts2.twa[17]d.b100' '$X6/reps.log' && [ \$(grep -c '^ts2.twa[17]d.b10.c' '$X6/reps.log') = 4 ]"
+fail() { echo "fail: $*" >> "$X6/fails"; }
 REPS=5 twabsuite bad "$OUT/p2/bad" http x
 expect "twabsuite: rel.py qb failing is a FAIL, nothing timed" "[ \$(grep -c 'qb bad' '$X6/fails') = 4 ] && ! grep -q '^bad\.' '$X6/reps.log'"
 # tsdbtwab: the one-request whole range (twa, twad, twal .b100.c1) and the windows at 1 and NHI connections
@@ -127,10 +130,11 @@ expect "tsdbtwab: twa twad twal as merged.KIND.b100.c1, 5 runs, in p2/tsdb" \
     "[ \$(grep -c '^merged.twa[dl]\?.b100.c1 $OUT/p2/tsdb REPS=5\$' '$X6/reps.log') = 3 ]"
 expect "tsdbtwab: the windows K at a time at 1 and 32 connections" \
     "[ \$(grep -c '^merged.twa[17]d.b1\(0\|00\).c\(1\|32\) $OUT/p2/tsdb REPS=5\$' '$X6/reps.log') = 8 ]"
-expect "tsdbtwab: every form checked first (relq --batch dumps)" "[ \$(grep -c -- '--batch' '$P6LOG') = 7 ]"
+expect "tsdbtwab: every form checked first (relq --batch dumps, then rel.py jsonl)" \
+    "[ \$(grep -c -- '--batch' '$P6LOG') = 7 ] && [ \$(cat '$OUT'/p2/tsdb/check-merged.twa*.b*.txt | grep -c 'twa OK') = 7 ]"
 # NO_PC: per-core batch suites return before running anything, pinning refuses
 : > "$P6LOG"
-NO_PC=1 PC=1 bsuite ch ch "$OUT/p2/ch" http x; rc=$?
+NO_PC=1 PC=1 KS=1 PC_KS=1 FULLS=0 BCLASSES=raw bsuite ch ch "$OUT/p2/ch" http x; rc=$?
 expect "NO_PC: bsuite with PC=1 runs nothing" "[ $rc = 0 ] && [ ! -s '$P6LOG' ]"
 expect "NO_PC: pc_pin refuses" "! NO_PC=1 pc_pin rb-x"
 # phase6: per system once, REPS=1 into memsweep with XREPS for the batches, no per core, labels "p6 "; done markers;
@@ -140,12 +144,14 @@ PH_DIR=$OUT/p6; mkdir -p "$PH_DIR"
 res_dir() { case $2 in qdb0) echo "$OUT/p2/qdb" ;; *) echo "$OUT/p2/$2" ;; esac; }
 done_mark() { [ "${FORCE:-0}" != 1 ] && [ -e "$1" ]; }
 runstats() { echo "runstats $1" >> "$X6/p6.log"; }
+how_write() { echo "how_write $*" >> "$X6/p6.log"; }
 p2_sys() { echo "p2_sys $1 sub=$SWEEP_SUB REPS=$REPS XREPS=$XREPS LOADS_FROM=$LOADS_FROM NO_PC=$NO_PC pfx=$LABEL_PFX" >> "$X6/p6.log"
     mkdir -p "$(res_dir 2 "$1")$SWEEP_SUB"; echo x > "$(res_dir 2 "$1")$SWEEP_SUB/load.1"; [ "$1" != broken ] || fail "broken"; }
 P6_SYSTEMS="tsdb qdb0 broken" REPS=5 LOADS_FROM=5 phase6
 expect "phase6: each system once with the sweep's settings" \
     "[ \$(grep -c 'sub=/memsweep REPS=1 XREPS=5 LOADS_FROM=1 NO_PC=1 pfx=p6 \$' '$X6/p6.log') = 3 ]"
 expect "phase6: runstats on the system's own directory" "grep -qx 'runstats $OUT/p2/qdb' '$X6/p6.log'"
+expect "phase6: how.json for a system without one (phase 2 not run)" "grep -qx 'how_write 2 qdb0' '$X6/p6.log'"
 expect "phase6: done markers only for systems without failures" "[ -e '$OUT/p6/tsdb.done' ] && [ -e '$OUT/p6/qdb0.done' ] && [ ! -e '$OUT/p6/broken.done' ]"
 : > "$X6/p6.log"
 P6_SYSTEMS="tsdb qdb0 broken" RESUME=1 phase6
