@@ -431,6 +431,8 @@ def run_sql(sysname, sql):
             if out.get("code") != 719: break
             print(f"iot: 719 (query memory), retry {attempt + 1} in 5 s", file=sys.stderr)
             time.sleep(5)
+        if out.get("code") == 719:  # still refused after the waits: IoTDB's own answer, a result, not a broken check
+            raise Refused(f"iot code 719: {out.get('message', '')}"[:400])
         if "values" not in out: raise RuntimeError(f"iot: {out}")
         return out["values"]
     if sysname == "td":

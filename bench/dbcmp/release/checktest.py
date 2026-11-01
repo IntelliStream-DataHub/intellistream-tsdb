@@ -284,6 +284,17 @@ def refused_cases():
     finally:
         sys.stdout = old
     case("http 400: guarded exits 4 with a REFUSED line", True, rc == 4 and out.getvalue().startswith("REFUSED: HTTP 400: no"))
+    # IoTDB's 719 (its query memory estimate) that outlasts the waits is a refusal with its message, not a crash
+    old_http, old_sleep = rel.http, rel.time.sleep
+    rel.http = lambda *a, **k: json.dumps({"code": 719, "message": "There is not enough memory to execute current fragment instance"})
+    rel.time.sleep = lambda s: None
+    try:
+        rel.run_sql("iot", "SELECT 1"); e = None
+    except Exception as x:
+        e = x
+    finally:
+        rel.http, rel.time.sleep = old_http, old_sleep
+    case("iot 719 after the waits: Refused with IoTDB's message", True, isinstance(e, rel.Refused) and "not enough memory" in str(e))
     # InfluxDB 3 refused a 100-window batch sent in a GET URL (HTTP 414): a long query goes as a POST body instead
     short, long_ = rel.wire("i3", "SELECT 1"), rel.wire("i3", "SELECT " + "x" * 9000)
     case("i3: a short query stays a GET line", True, short.startswith("GET /api/v3/query_sql?"))
