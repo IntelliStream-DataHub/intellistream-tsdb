@@ -4,6 +4,9 @@
   python3 -I how.py write PHASE SYS OUT    OUT/p<PHASE>/<dir>/how.json (phase 2) or OUT/p<PHASE>/how-<SYS>.json
                                            (phases 1, 3, 4: one directory holds every system's files)
   python3 -I how.py check FILE...          every required field present and non-empty (exit 1 otherwise)
+  python3 -I how.py p6 DIR                 the "p6" block of DIR/how.json (run.sh p6, the extra pass): when it ran, its
+                                           runs (XREPS), the tsdb tree and the harness commit, its '-' reasons
+                                           (DIR/p6/dash.txt) and refusals (DIR/p6/REFUSED.txt, DIR/memsweep/REFUSED.txt)
 
 The static part (settings, durability, loader, query client, what one query is, per-core method) is SYSTEMS below:
 the facts behind each line are in run.sh, sys_*.sh and bench/dbcmp/README.md, and a change to how a system runs
@@ -11,7 +14,7 @@ changes its line here in the same commit. Written at run time: the image with it
 the tsdb tree and commit, REPS, SECS, batch sizes, smoke or not, and the '-' reasons (dash.txt) and refusals
 (REFUSED.txt) of that run. tables.py reads these files and fails on a missing field.
 """
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
 
 REQUIRED = ["system", "version", "image", "settings", "durability", "loader", "query_client", "connections",
             "one_query", "per_core", "warmups", "runs", "dash"]
@@ -323,6 +326,40 @@ def write(phase, sysname, out):
     print(f)
 
 
+def p6(d):
+    """The extra pass's own facts, beside phase 2's in the same how.json: its timings come from another load."""
+    f = os.path.join(d, "how.json")
+    h = json.load(open(f))
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        harness = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                                 timeout=10).stdout.strip()
+    except OSError:
+        harness = ""
+    dash = {}
+    for l in lines(os.path.join(d, "p6", "dash.txt")):
+        k, _, why = l.partition(":")
+        dash[k.strip()] = why.strip()
+    v, tree = tsdb_version()
+    h["p6"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"),
+        "runs": "REPS=%s runs per TWA batch class (p6/*.mean.txt); every other class once into memsweep/ (peak memory "
+                "only, never averaged)" % os.environ.get("XREPS", "?"),
+        "tsdb": "%s, %s" % (v, tree),
+        "harness": "%s at %s" % (os.path.abspath(os.path.join(here, "..", "..", "..")), harness or "?"),
+        "dash": dash,
+        "refused": lines(os.path.join(d, "p6", "REFUSED.txt")) +
+                   ["memory sweep: " + l for l in lines(os.path.join(d, "memsweep", "REFUSED.txt"))],
+        "note": "the extra pass loads the data once more: its TWA batch timings come from that load, not from the "
+                "load of phase 2's rows",
+    }
+    with open(f, "w") as o:
+        json.dump(h, o, indent=1, sort_keys=True)
+        o.write("\n")
+    check([f])
+    print(f, "p6")
+
+
 def check(files):
     bad = 0
     for f in files:
@@ -338,6 +375,8 @@ def check(files):
 if __name__ == "__main__":
     if len(sys.argv) == 5 and sys.argv[1] == "write":
         write(*sys.argv[2:5])
+    elif len(sys.argv) == 3 and sys.argv[1] == "p6":
+        p6(sys.argv[2])
     elif len(sys.argv) > 2 and sys.argv[1] == "check":
         check(sys.argv[2:])
     else:

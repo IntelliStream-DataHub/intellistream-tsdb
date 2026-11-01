@@ -302,9 +302,13 @@ int main(int argc, char **argv)
     /* windows: their count, so a reader (tables.py) can turn a run's seconds into windows per second */
     char wstr[32] = "";
     if (wcls) snprintf(wstr, sizeof wstr, "; %zu windows", njobs);
-    printf("%s %d conns%s: mean %.4f s sd %.4f (%.1f%%) min %.4f max %.4f, %d runs after a warm-up; %zu %s%s\n", argv[1],
-           conns, bstr, mean, reps > 1 ? sqrt(ss / (reps - 1)) : 0.0, reps > 1 ? 100 * sqrt(ss / (reps - 1)) / mean : 0.0, mn,
-           mx, reps, tot, mode_twa ? "buckets" : "points", wstr);
+    if (reps == 1) /* no spread to give: runstats averages such runs across files */
+        printf("%s %d conns%s: %.4f s, one run after a warm-up; %zu %s%s\n", argv[1], conns, bstr, mean, tot,
+               mode_twa ? "buckets" : "points", wstr);
+    else
+        printf("%s %d conns%s: mean %.4f s sd %.4f (%.1f%%) min %.4f max %.4f, %d runs after a warm-up; %zu %s%s\n",
+               argv[1], conns, bstr, mean, sqrt(ss / (reps - 1)), 100 * sqrt(ss / (reps - 1)) / mean, mn, mx, reps, tot,
+               mode_twa ? "buckets" : "points", wstr);
     if (argc > 4) {
         FILE *f = fopen(argv[4], "w");
         if (!f) { perror(argv[4]); return 1; }

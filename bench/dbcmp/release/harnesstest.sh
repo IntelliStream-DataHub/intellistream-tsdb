@@ -68,8 +68,8 @@ mem_sample "$M/out" rb-a "$M/a" tsdbd "$M/b" &
 mp=$!
 sleep 1.2; setmem a 9000 700 70 7; sleep 1.2; setmem a 2000 200 20 2; sleep 1.2
 kill "$mp"; wait "$mp" 2> /dev/null
-want=$'rb-a peak 9000 nocache 777\ntsdbd peak 5000 nocache 55'
-if [ "$(cat "$M/out")" = "$want" ]; then echo "ok   mem_sample keeps each server's peaks"
+want=$'rb-a peak 9000 nocache 777 start 1000 startnocache 111\ntsdbd peak 5000 nocache 55 start 5000 startnocache 55'
+if [ "$(cat "$M/out")" = "$want" ]; then echo "ok   mem_sample keeps each server's peaks and its memory at the start"
 else echo "FAIL mem_sample wrote: $(cat "$M/out" | tr '\n' ';') want: ${want//$'\n'/;}"; fails=$((fails + 1)); fi
 # no server running (a step before any container starts): nothing to sample, no error under run.sh's set -u
 if (set -u; mem_sample "$M/none") 2> "$M/none.err" && [ ! -s "$M/none.err" ] && [ ! -e "$M/none" ]; then
@@ -78,13 +78,15 @@ else echo "FAIL mem_sample with no server: $(cat "$M/none.err")"; fails=$((fails
 
 # the extra pass (p6) and the TWA batch suites, against stubs: where results go, how many runs, what is skipped
 eval "$(sed -n -e '/^tstep() {/,/^}/p' -e '/^phase6() {/,/^}/p' -e '/^twabsuite() {/,/^}/p' -e '/^tsdbtwab() {/,/^}/p' \
-    -e '/^dashnote() {/,/^}/p' -e '/^want_pc() {/p' -e '/^pc_pin() {/,/^}/p' -e '/^bsuite() {/,/^}/p' "$HERE/run.sh")"
+    -e '/^dashnote() {/,/^}/p' -e '/^want_pc() {/p' -e '/^pc_pin() {/,/^}/p' -e '/^bsuite() {/,/^}/p' \
+    -e '/^twab_dir() {/,/^}/p' -e '/^twa_single_failed() {/,/^}/p' -e '/^nocheck() {/,/^}/p' -e '/^aside() {/,/^}/p' \
+    -e '/^tsdbsuite() {/,/^}/p' "$HERE/run.sh")"
 expect() { # NAME CONDITION...: one case
     if eval "${*:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
 }
 declare -A DEAD_CLASS
 quiet() { BUSY=0.1; }; mem_cgroups() { :; }; reset_quiet() { :; }; cleanup_all() { :; }; rmdata() { :; }; pc_client() { "$@"; }
-X6=$T/p6; OUT=$X6/out WORK=$X6/work B=$X6/b TOOLS=$X6/tools WARM_SECS=1 NHI=32 SECS=1 REPS=5 STEP_TIMEOUT=60
+X6=$T/p6; OUT=$X6/out WORK=$X6/work B=$X6/b TOOLS=$X6/tools WARM_SECS=1 NHI=32 SECS=1 REPS=5 STEP_TIMEOUT=60 CHECK_TIMEOUT=300
 mkdir -p "$OUT/p2/ch" "$WORK/q" "$B" "$TOOLS"
 # tstep: the label prefix goes into steps.log; RESUME skips a step logged rc=0 whose output is there, and only then
 LABEL_PFX="p6 " tstep "ch.x.c1 r1" "$OUT/a.1" -- echo hello
@@ -93,7 +95,8 @@ RESUME=1 LABEL_PFX="p6 " tstep "ch.x.c1 r1" "$OUT/a.1" -- false
 expect "tstep: RESUME skips a p6 step that is done" "[ \$(grep -c 'ch.x.c1 r1' '$OUT/steps.log') = 1 ]"
 RESUME=1 LABEL_PFX="p6 " tstep "ch.x.c1 r1" "$OUT/memsweep.a.1" -- echo again
 expect "tstep: RESUME runs it when its output (another directory) is missing" "[ -s '$OUT/memsweep.a.1' ]"
-# twabsuite: the batches go to the system's own directory with XREPS runs, also when called with DIR/memsweep
+# twabsuite: in p6 (DIR/memsweep) the batches go to the system's p6/ with XREPS runs, named by the variant (the result
+# directory); a kind is batched only when its single windows passed their check in this load
 REL() { case $1 in has) [ "$2" != none ] ;; qb) [ "$2" = bad ] || echo "SELECT $3 $4" ;; checkb) echo "$2 $3.b$4 OK" ;; esac; }
 reps() { echo "$1 $2 REPS=$REPS" >> "$X6/reps.log"; }
 cat > "$B/qdrive" << 'EOS'
@@ -102,20 +105,43 @@ echo "warm $*" >> "$P6LOG"
 EOS
 chmod +x "$B/qdrive"; export P6LOG=$X6/qdrive.log
 untimed() { local o=$1; shift; "$@" > "$o" 2>&1; }
-nocheck() { echo "nocheck $*" >> "$X6/reps.log"; }
+single_ok() { local s=$1 d=$2 k; mkdir -p "$d"; for k in twa1d twa7d; do echo "$s $k OK" > "$d/check-$k.txt"; done; }
 TWA_WKINDS="twa1d twa7d" TWA_KS="10 100"
+single_ok ts "$OUT/p2/ts/memsweep"
 XREPS=5 REPS=1 twabsuite ts "$OUT/p2/ts/memsweep" pg conn
-expect "twabsuite: 8 timings, into p2/ts, 5 runs each" \
-    "[ \$(grep -c '^ts.twa[17]d.b1\(0\|00\).c\(1\|32\) $OUT/p2/ts REPS=5\$' '$X6/reps.log') = 8 ]"
+expect "twabsuite: 8 timings, into p2/ts/p6, 5 runs each" \
+    "[ \$(grep -c '^ts.twa[17]d.b1\(0\|00\).c\(1\|32\) $OUT/p2/ts/p6 REPS=5\$' '$X6/reps.log') = 8 ]"
 expect "twabsuite: request files from rel.py qb" "[ \"\$(cat '$WORK/q/ts.twa7d.b100.txt')\" = 'SELECT twa7d 100' ]"
-expect "twabsuite: checked into the system's directory" "grep -q 'ts twa1d.b10 OK' '$OUT/p2/ts/check-twa1d.b10.txt'"
+expect "twabsuite: checked into p6/" "grep -q 'ts twa1d.b10 OK' '$OUT/p2/ts/p6/check-twa1d.b10.txt'"
+single_ok qdb "$OUT/p2/qdb-parquet"
+REPS=5 twabsuite qdb "$OUT/p2/qdb-parquet" pg conn
+expect "twabsuite: a variant's steps and files are named by its directory, rel.py's system for the queries" \
+    "[ \$(grep -c '^qdb-parquet.twa1d.b10.c1 $OUT/p2/qdb-parquet REPS=5\$' '$X6/reps.log') = 1 ] && ! grep -q '^qdb\.' '$X6/reps.log' && [ -s '$WORK/q/qdb.twa1d.b10.txt' ]"
 REPS=5 twabsuite none "$OUT/p2/i2" http x; REPS=5 twabsuite none "$OUT/p2/i2" http x
 expect "twabsuite: no query: one dash line per class, not repeated by a rerun" \
     "[ \$(grep -c '^twa1d.b10: no query in rel.py for none\$' '$OUT/p2/i2/dash.txt') = 1 ] && [ \$(wc -l < '$OUT/p2/i2/dash.txt') = 4 ]"
+single_ok ts2 "$OUT/p2/ts2"
 TWA_N=60 REPS=5 twabsuite ts2 "$OUT/p2/ts2" pg conn
-expect "twabsuite: K above TWA_N windows (the smoke's 60) skipped, the others timed" \
+expect "twabsuite: K above TWA_N windows skipped, the others timed" \
     "! grep -q '^ts2.twa[17]d.b100' '$X6/reps.log' && [ \$(grep -c '^ts2.twa[17]d.b10.c' '$X6/reps.log') = 4 ]"
+(set -u; unset TWA_N; TWA_KS=2000 REPS=5 twabsuite ts2 "$OUT/p2/ts2" pg conn) 2> "$X6/setu.err"
+expect "twabsuite: K above the default 1000 windows under set -u without TWA_N" "[ ! -s '$X6/setu.err' ]"
+mkdir -p "$OUT/p2/i3"; echo "i3 twa1d OK" > "$OUT/p2/i3/check-twa1d.txt"
+printf 'partial\nSTEP TIMEOUT after 3600 s\n' > "$OUT/p2/i3/check-twa7d.txt"
+REPS=5 twabsuite i3 "$OUT/p2/i3" http x
+expect "twabsuite: a kind whose single-window check timed out is not batched; dash says it timed out" \
+    "! grep -q '^i3.twa7d' '$X6/reps.log' && grep -qx 'twa7d.b10: not run: the single-window check of twa7d timed out after 300s' '$OUT/p2/i3/dash.txt' && [ \$(grep -c '^i3.twa1d.b10.c' '$X6/reps.log') = 2 ]"
+mkdir -p "$OUT/p2/td"; echo "MISMATCH td twa1d" > "$OUT/p2/td/check-twa1d.txt"
+REPS=5 twabsuite td "$OUT/p2/td" http x
+expect "twabsuite: a kind whose single windows disagreed (or never ran) is not batched" \
+    "! grep -q '^td\.' '$X6/reps.log' && grep -q '^twa1d.b100: not run: the single-window check of twa1d did not pass' '$OUT/p2/td/dash.txt' && grep -q '^twa7d.b10: not run: the single-window check of twa7d did not run' '$OUT/p2/td/dash.txt'"
+log() { :; }
+mkdir -p "$OUT/p2/nc"; echo 'STEP TIMEOUT after 300 s' > "$OUT/p2/nc/check-twa1d.b10.txt"
+nocheck nc twa1d.b10 "$OUT/p2/nc" 1
+expect "nocheck: a timed-out check is said to have timed out, not to differ" \
+    "grep -qx 'twa1d.b10: not timed, its answer check timed out after 300s (see check-twa1d.b10.txt)' '$OUT/p2/nc/dash.txt'"
 fail() { echo "fail: $*" >> "$X6/fails"; }
+single_ok bad "$OUT/p2/bad"
 REPS=5 twabsuite bad "$OUT/p2/bad" http x
 expect "twabsuite: rel.py qb failing is a FAIL, nothing timed" "[ \$(grep -c 'qb bad' '$X6/fails') = 4 ] && ! grep -q '^bad\.' '$X6/reps.log'"
 # tsdbtwab: the one-request whole range (twa, twad, twal .b100.c1) and the windows at 1 and NHI connections
@@ -126,38 +152,58 @@ echo "relq $*" >> "$P6LOG"
 EOS
 chmod +x "$B/relq"; echo 'print("x twa OK")' > "$TOOLS/rel.py"
 TWA_KINDS="twad twal" XREPS=5 REPS=1 tsdbtwab "$OUT/p2/tsdb/memsweep" merged.
-expect "tsdbtwab: twa twad twal as merged.KIND.b100.c1, 5 runs, in p2/tsdb" \
-    "[ \$(grep -c '^merged.twa[dl]\?.b100.c1 $OUT/p2/tsdb REPS=5\$' '$X6/reps.log') = 3 ]"
+expect "tsdbtwab: twa twad twal as merged.KIND.b100.c1, 5 runs, in p2/tsdb/p6" \
+    "[ \$(grep -c '^merged.twa[dl]\?.b100.c1 $OUT/p2/tsdb/p6 REPS=5\$' '$X6/reps.log') = 3 ]"
 expect "tsdbtwab: the windows K at a time at 1 and 32 connections" \
-    "[ \$(grep -c '^merged.twa[17]d.b1\(0\|00\).c\(1\|32\) $OUT/p2/tsdb REPS=5\$' '$X6/reps.log') = 8 ]"
+    "[ \$(grep -c '^merged.twa[17]d.b1\(0\|00\).c\(1\|32\) $OUT/p2/tsdb/p6 REPS=5\$' '$X6/reps.log') = 8 ]"
 expect "tsdbtwab: every form checked first (relq --batch dumps, then rel.py jsonl)" \
-    "[ \$(grep -c -- '--batch' '$P6LOG') = 7 ] && [ \$(cat '$OUT'/p2/tsdb/check-merged.twa*.b*.txt | grep -c 'twa OK') = 7 ]"
+    "[ \$(grep -c -- '--batch' '$P6LOG') = 7 ] && [ \$(cat '$OUT'/p2/tsdb/p6/check-merged.twa*.b*.txt | grep -c 'twa OK') = 7 ]"
+# warm-ups have the step time limit: one past it is a FAIL and its class is not timed
+: > "$X6/reps.log"; : > "$X6/fails"
+limited() { local s=$1 o=$2; shift 2; echo "STEP TIMEOUT" > "$o"; return 124; }
+CLASSES="raw agg1d" tsdbsuite tsdbq "$OUT/p2/tsdb" "1 32"
+expect "tsdbsuite: a warm-up past the time limit fails its class, nothing timed" \
+    "[ \$(grep -c 'warm-up: STEP TIMEOUT' '$X6/fails') = 2 ] && [ ! -s '$X6/reps.log' ]"
+TWA_KINDS="" TWA_KS=10 tsdbtwab "$OUT/p2/tsdb" ""
+expect "tsdbtwab: a relq warm-up past the time limit fails, nothing timed" \
+    "grep -q 'twa1d.b10 warm-up failed' '$X6/fails' && ! grep -q 'twa1d.b10.c' '$X6/reps.log'"
+limited() { local s=$1 o=$2; shift 2; "$@" > "$o" 2>&1; }
 # NO_PC: per-core batch suites return before running anything, pinning refuses
 : > "$P6LOG"
 NO_PC=1 PC=1 KS=1 PC_KS=1 FULLS=0 BCLASSES=raw bsuite ch ch "$OUT/p2/ch" http x; rc=$?
 expect "NO_PC: bsuite with PC=1 runs nothing" "[ $rc = 0 ] && [ ! -s '$P6LOG' ]"
 expect "NO_PC: pc_pin refuses" "! NO_PC=1 pc_pin rb-x"
-# phase6: per system once, REPS=1 into memsweep with XREPS for the batches, no per core, labels "p6 "; done markers;
-# a rerun moves an old sweep aside unless RESUME=1
+# phase6: per system once, REPS=1 into memsweep with XREPS for the batches, no per core, labels "p6 "; a done marker
+# when the system's pass reached its end (failed classes are results); a rerun moves p6/ and memsweep/ aside unless
+# RESUME=1
 fail() { echo "fail: $*" >> "$PH_DIR/FAILS"; }
 PH_DIR=$OUT/p6; mkdir -p "$PH_DIR"
 res_dir() { case $2 in qdb0) echo "$OUT/p2/qdb" ;; *) echo "$OUT/p2/$2" ;; esac; }
 done_mark() { [ "${FORCE:-0}" != 1 ] && [ -e "$1" ]; }
 runstats() { echo "runstats $1" >> "$X6/p6.log"; }
 how_write() { echo "how_write $*" >> "$X6/p6.log"; }
+how_p6() { echo "how_p6 $*" >> "$X6/p6.log"; }
 p2_sys() { echo "p2_sys $1 sub=$SWEEP_SUB REPS=$REPS XREPS=$XREPS LOADS_FROM=$LOADS_FROM NO_PC=$NO_PC pfx=$LABEL_PFX" >> "$X6/p6.log"
-    mkdir -p "$(res_dir 2 "$1")$SWEEP_SUB"; echo x > "$(res_dir 2 "$1")$SWEEP_SUB/load.1"; [ "$1" != broken ] || fail "broken"; }
-P6_SYSTEMS="tsdb qdb0 broken" REPS=5 LOADS_FROM=5 phase6
+    local d; d=$(res_dir 2 "$1"); mkdir -p "$d$SWEEP_SUB" "$d/p6"; echo x > "$d$SWEEP_SUB/load.1"; echo x > "$d/p6/c.1"
+    [ "$1" != refusing ] || fail "a class refused"; [ "$1" != broken ]; }
+P6_SYSTEMS="tsdb qdb0 refusing broken" REPS=5 LOADS_FROM=5 phase6
 expect "phase6: each system once with the sweep's settings" \
-    "[ \$(grep -c 'sub=/memsweep REPS=1 XREPS=5 LOADS_FROM=1 NO_PC=1 pfx=p6 \$' '$X6/p6.log') = 3 ]"
-expect "phase6: runstats on the system's own directory" "grep -qx 'runstats $OUT/p2/qdb' '$X6/p6.log'"
-expect "phase6: how.json for a system without one (phase 2 not run)" "grep -qx 'how_write 2 qdb0' '$X6/p6.log'"
-expect "phase6: done markers only for systems without failures" "[ -e '$OUT/p6/tsdb.done' ] && [ -e '$OUT/p6/qdb0.done' ] && [ ! -e '$OUT/p6/broken.done' ]"
-: > "$X6/p6.log"
-P6_SYSTEMS="tsdb qdb0 broken" RESUME=1 phase6
-expect "phase6: RESUME=1 skips done systems and keeps the sweep" "[ \$(grep -c p2_sys '$X6/p6.log') = 1 ] && [ -e '$OUT/p2/broken/memsweep/load.1' ] && [ ! -d '$OUT/old' ]"
+    "[ \$(grep -c 'sub=/memsweep REPS=1 XREPS=5 LOADS_FROM=1 NO_PC=1 pfx=p6 \$' '$X6/p6.log') = 4 ]"
+expect "phase6: runstats on the system's p6/" "grep -qx 'runstats $OUT/p2/qdb/p6' '$X6/p6.log'"
+expect "phase6: how.json for a system without one (phase 2 not run), and its p6 block" \
+    "grep -qx 'how_write 2 qdb0' '$X6/p6.log' && grep -qx 'how_p6 $OUT/p2/qdb 5' '$X6/p6.log'"
+expect "phase6: done when the pass reached the system's end (a refused class too), not after a failed load" \
+    "[ -e '$OUT/p6/tsdb.done' ] && [ -e '$OUT/p6/qdb0.done' ] && [ -e '$OUT/p6/refusing.done' ] && [ ! -e '$OUT/p6/broken.done' ]"
+: > "$X6/p6.log"; rm -rf "$OUT/old"   # the first pass moved the suites' earlier test output aside
+P6_SYSTEMS="tsdb qdb0 refusing broken" RESUME=1 phase6
+expect "phase6: RESUME=1 skips done systems and keeps the sweep and p6/" \
+    "[ \$(grep -c p2_sys '$X6/p6.log') = 1 ] && [ -e '$OUT/p2/broken/memsweep/load.1' ] && [ ! -d '$OUT/old' ]"
 P6_SYSTEMS="broken" phase6
-expect "phase6: a rerun without RESUME moves the old sweep to OUT/old" "ls -d '$OUT'/old/p6-broken-memsweep.* > /dev/null 2>&1"
+expect "phase6: a rerun without RESUME moves the old p6/ and memsweep/ to OUT/old" \
+    "ls -d '$OUT'/old/p6-broken-memsweep.* '$OUT'/old/p6-broken-p6.* > /dev/null 2>&1"
+mkdir -p "$OUT/p2/tsdb"
+aside 2 tsdb
+expect "aside: a phase-2 rerun of a system makes its extra pass due again" "[ ! -e '$OUT/p6/tsdb.done' ] && [ -e '$OUT/p6/qdb0.done' ]"
 # untimed: a check that exits 1 on a mismatch (rel.py jsonl) is named by its MISMATCH line in FAILS, as when it exited 0
 eval "$(sed -n -e '/^untimed() {/,/^}/p' "$HERE/run.sh")"
 fail() { echo "fail: $*" >> "$X6/ufails"; }

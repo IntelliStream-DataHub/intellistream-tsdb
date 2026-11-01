@@ -158,11 +158,12 @@ mem_cgroups() { # NAME CGDIR per line: every running rb-* container and tsdbd's 
         [ -n "$p" ] && [ -r "${CGROOT:-/sys/fs/cgroup}$p/memory.stat" ] && echo "tsdbd ${CGROOT:-/sys/fs/cgroup}$p"
     fi
 }
-mem_sample() { # OUTFILE NAME CGDIR [NAME CGDIR...]: until killed, the peaks of each into OUTFILE (rewritten when one grows)
+mem_sample() { # OUTFILE NAME CGDIR [NAME CGDIR...]: until killed, the peaks of each into OUTFILE (rewritten when one grows),
+               # with the first sample as "start": a peak includes what earlier steps left; the rise is this step's
     local f=$1 i n cur res grew
     shift
-    local -a name=() dir=() pc=() pr=()
-    while [ $# -ge 2 ]; do name+=("$1"); dir+=("$2"); pc+=(0); pr+=(0); shift 2; done
+    local -a name=() dir=() pc=() pr=() sc=() sr=()
+    while [ $# -ge 2 ]; do name+=("$1"); dir+=("$2"); pc+=(0); pr+=(0); sc+=(""); sr+=(""); shift 2; done
     n=${#name[@]}
     [ "$n" -gt 0 ] || return 0
     while :; do
@@ -170,11 +171,14 @@ mem_sample() { # OUTFILE NAME CGDIR [NAME CGDIR...]: until killed, the peaks of 
         for ((i = 0; i < n; i++)); do
             cur=$(cat "${dir[i]}/memory.current" 2> /dev/null) || continue
             res=$(awk '$1 == "anon" || $1 == "shmem" || $1 == "kernel" { s += $2 } END { print s + 0 }' "${dir[i]}/memory.stat" 2> /dev/null)
+            [ -z "${sc[i]}" ] && { sc[i]=$cur; sr[i]=${res:-0}; }
             [ "$cur" -gt "${pc[i]}" ] 2> /dev/null && { pc[i]=$cur; grew=1; }
             [ "${res:-0}" -gt "${pr[i]}" ] 2> /dev/null && { pr[i]=$res; grew=1; }
         done
         if [ "$grew" = 1 ]; then
-            for ((i = 0; i < n; i++)); do echo "${name[i]} peak ${pc[i]} nocache ${pr[i]}"; done > "$f.tmp" && mv "$f.tmp" "$f"
+            for ((i = 0; i < n; i++)); do
+                echo "${name[i]} peak ${pc[i]} nocache ${pr[i]} start ${sc[i]:-0} startnocache ${sr[i]:-0}"
+            done > "$f.tmp" && mv "$f.tmp" "$f"
         fi
         sleep 0.5
     done
@@ -534,17 +538,22 @@ TWA_KS=${TWA_KS-10 100}                # those windows K at a time, one request 
 dashnote() { # DIR LINE: LINE into DIR/dash.txt unless it is there (the extra pass p6 may run a system again)
     grep -qxF -- "$2" "$1/dash.txt" 2> /dev/null || echo "$2" >> "$1/dash.txt"
 }
-nocheck() { # SYSTEM KIND DIR RC: a check that did not pass: rc 3 is a server that cannot be reached, not different answers
+nocheck() { # SYSTEM KIND DIR RC: a check that did not pass: rc 3 is a server that cannot be reached, a check past its
+           # time limit (limited's "STEP TIMEOUT" in DIR/check-KIND.txt) a timeout; neither is "answers differ"
     if [ "$4" = 3 ]; then
         echo "$2: not timed, the server was down when it was checked (see check-$2.txt)" >> "$3/dash.txt"
         log "  $1 $2: not timed (server down)"
+    elif grep -q 'STEP TIMEOUT' "$3/check-$2.txt" 2> /dev/null; then
+        dashnote "$3" "$2: not timed, its answer check timed out after ${CHECK_TIMEOUT}s (see check-$2.txt)"
+        log "  $1 $2: not timed (the check timed out)"
     else
         log "  $1 $2: not timed (answers differ)"
     fi
 }
 twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (rel.py has), checked against tsdb's
              # answers in $WORK/ref first and timed only when they agree; a kind without a query is noted in DIR/dash.txt
-    local S=$1 D=$2 k f r
+    local S=$1 D=$2 k f r V
+    V=$(basename "${D%/memsweep}")  # the variant (qdb-parquet, iot-zstd, ...): names and step labels; S is rel.py's
     shift 2
     cd "$WORK" || return 1
     for k in $TWA_KINDS; do
@@ -586,38 +595,53 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
         REL has "$S" "$k" || { echo "$k: no query in rel.py for $S" >> "$D/dash.txt"; continue; }
         REL q "$S" "$k" > "q/$S.$k.txt"
         untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { nocheck "$S" "$k" "$D" $?; continue; }
-        if [ "$1" = ch ]; then FULLS="" CLASSES="$k" chsuite "$S" "$D" "$S"
-        else FULLS="" CLASSES="$k" qsuite "$S" "$S" "$D" "$@"; fi
+        if [ "$1" = ch ]; then FULLS="" CLASSES="$k" chsuite "$V" "$D" "$S"
+        else FULLS="" CLASSES="$k" qsuite "$S" "$V" "$D" "$@"; fi
     done
     twabsuite "$S" "$D" "$@"
+}
+twab_dir() { # DIR: where the TWA batch classes go: DIR, or in the extra pass (DIR .../memsweep) the system's p6/
+    case $1 in */memsweep) echo "${1%/memsweep}/p6" ;; *) echo "$1" ;; esac
+}
+twa_single_failed() { # CHECKFILE SYS KIND: prints why, and succeeds, when KIND's one-window-per-request check of this
+                      # load did not pass (a batch of windows that one at a time disagree, or took an hour, is not sent)
+    if [ ! -s "$1" ]; then echo "the single-window check of $3 did not run in this load"
+    elif grep -q 'STEP TIMEOUT' "$1"; then echo "the single-window check of $3 timed out after ${CHECK_TIMEOUT}s"
+    elif grep -qx "$2 $3 OK" "$1"; then return 1
+    else echo "the single-window check of $3 did not pass (see $(basename "$1"))"; fi
+    return 0
 }
 # The TWA windows in batches, as the aggregate classes have them (bsuite): one request of K windows (rel.py qb: the
 # window queries as UNION ALL branches with a member column, each with its own WITH tables), checked member by member
 # against tsdb's answers (rel.py checkb, 1e-9 relative) and timed only when they agree, at 1 and NHI clients for SECS.
-# In the extra pass (p6, DIR .../memsweep) they go to the system's own directory with XREPS runs: they are new
-# results there, not a memory sweep's single runs.
+# In the extra pass (p6, DIR .../memsweep) they go to the system's p6/ directory with XREPS runs: new results of
+# another load, kept apart from phase 2's files (a rerun of p6 moves p6/ aside, so no stale run is averaged in).
+# Names and labels carry the variant (the result directory's name), so qdb0/1/2, iot/iotz and td/tdz never share a
+# step label (RESUME, DEAD_CLASS); a kind is sent in batches only when its single windows agreed in this load.
 twabsuite() { # SYS DIR DRIVER-ARGS...|ch
-    local S=$1 D=${2%/memsweep} k K f t a r REPS=${XREPS:-$REPS}
+    local S=$1 C=$2 D V k K f t a r why REPS=${XREPS:-$REPS}
+    D=$(twab_dir "$C"); V=$(basename "${C%/memsweep}")
     mkdir -p "$D"
     shift 2
     cd "$WORK" || return 1
     for k in $TWA_WKINDS; do for K in $TWA_KS; do
-        # a batch is whole groups of K windows: none with fewer windows (the smoke's TWA_N=60 and K = 100)
-        [ "$K" -le "${TWA_N:-1000}" ] || { log "  $S $k.b$K: only TWA_N=$TWA_N windows, no batch of $K"; continue; }
+        # a batch is whole groups of K windows: none with fewer windows (TWA_N below K)
+        [ "$K" -le "${TWA_N:-1000}" ] || { log "  $V $k.b$K: only TWA_N=${TWA_N:-1000} windows, no batch of $K"; continue; }
         REL has "$S" "$k" || { dashnote "$D" "$k.b$K: no query in rel.py for $S"; continue; }
+        why=$(twa_single_failed "$C/check-$k.txt" "$S" "$k") && { dashnote "$D" "$k.b$K: not run: $why"; continue; }
         f=$WORK/q/$S.$k.b$K.txt
         REL qb "$S" "$k" "$K" > "$f" && [ -s "$f" ] || { fail "rel.py qb $S $k $K (see $f)"; continue; }
-        untimed "$D/check-$k.b$K.txt" REL checkb "$S" "$k" "$K" "ref/$k.jsonl" || { nocheck "$S" "$k.b$K" "$D" $?; continue; }
+        untimed "$D/check-$k.b$K.txt" REL checkb "$S" "$k" "$K" "ref/$k.jsonl" || { nocheck "$V" "$k.b$K" "$D" $?; continue; }
         if [ "$1" = ch ]; then
-            chbench1 1 0 "$WARM_SECS" "$f" > /dev/null 2> "$D/warm.$S.$k.b$K" 9>&-
+            chbench1 1 0 "$WARM_SECS" "$f" > /dev/null 2> "$D/warm.$V.$k.b$K" 9>&-
             for t in 1 $NHI; do for r in $(seq "$REPS"); do
-                tstep "$S.$k.b$K.c$t r$r" "$D/$S.$k.b$K.c$t.$r" -- chbench_tag "$S.$k.b$K.c$t.$r.$$" "$t" 0 "$SECS" "$f"
+                tstep "$V.$k.b$K.c$t r$r" "$D/$V.$k.b$K.c$t.$r" -- chbench_tag "$V.$k.b$K.c$t.$r.$$" "$t" 0 "$SECS" "$f"
             done; done
         else
-            "$B/qdrive" "$@" "$f" 1 "$WARM_SECS" > "$D/warm.$S.$k.b$K" 2>&1 9>&- || { fail "$S $k.b$K warm-up failed (see $D/warm.$S.$k.b$K)"; continue; }
+            "$B/qdrive" "$@" "$f" 1 "$WARM_SECS" > "$D/warm.$V.$k.b$K" 2>&1 9>&- || { fail "$V $k.b$K warm-up failed (see $D/warm.$V.$k.b$K)"; continue; }
             for t in 1 $NHI; do
                 a=("$@"); [ "$t" != 1 ] && [ -n "${MANY_CONN-}" ] && a=("$1" "$MANY_CONN")
-                reps "$S.$k.b$K.c$t" "$D" -- "$B/qdrive" "${a[@]}" "$f" "$t" "$SECS"
+                reps "$V.$k.b$K.c$t" "$D" -- "$B/qdrive" "${a[@]}" "$f" "$t" "$SECS"
             done
         fi
     done; done
@@ -635,18 +659,20 @@ tsdbtwa() { # DIR PREFIX CONNS...: relq for every TWA kind (windows at 1 and 32 
 # request on one connection (KIND.b100.c1: what one SQL query is in ClickHouse and the others; relq --batch 100), and
 # the windows K at a time (KIND.bK.cT: relq qps, requests counted as qdrive counts them, at 1 and NHI connections).
 # Each form's answers are checked against ref/ (relq --batch dump, rel.py jsonl) before it is timed; REPS runs of one
-# timing each (runstats: KIND.b100.c1.mean.txt). In p6 (DIR .../memsweep) into tsdb's own directory, XREPS runs.
+# timing each (runstats: KIND.b100.c1.mean.txt). In p6 (DIR .../memsweep) into tsdb's p6/ directory, XREPS runs.
 tsdbtwab() { # DIR PREFIX
-    local D=${1%/memsweep} P=$2 k K t w=$WORK/self REPS=${XREPS:-$REPS}
+    local D P=$2 k K t w=$WORK/self REPS=${XREPS:-$REPS}
+    D=$(twab_dir "$1")
     mkdir -p "$w" "$D"
     for k in twa $TWA_KINDS; do
         untimed "$D/check-$P$k.b100.txt" bash -c "'$B/relq' $k 1 1 '$w/$P$k.b100.jsonl' --batch 100 && python3 -I '$TOOLS/rel.py' jsonl $k '$WORK/ref/$k.jsonl' '$w/$P$k.b100.jsonl'" || continue
         reps "$P$k.b100.c1" "$D" -- "$B/relq" "$k" 1 1 --batch 100
     done
     for k in $TWA_WKINDS; do for K in $TWA_KS; do
-        [ "$K" -le "${TWA_N:-1000}" ] || { log "  tsdb $P$k.b$K: only TWA_N=$TWA_N windows, no batch of $K"; continue; }
+        [ "$K" -le "${TWA_N:-1000}" ] || { log "  tsdb $P$k.b$K: only TWA_N=${TWA_N:-1000} windows, no batch of $K"; continue; }
         untimed "$D/check-$P$k.b$K.txt" bash -c "TWA_SPEC='$WORK/spec.tsv' '$B/relq' $k 1 1 '$w/$P$k.b$K.jsonl' --batch $K && python3 -I '$TOOLS/rel.py' jsonl $k '$WORK/ref/$k.jsonl' '$w/$P$k.b$K.jsonl'" || continue
-        TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" 1 "$WARM_SECS" > "$D/warm.$P$k.b$K" 2>&1 9>&- || { fail "tsdb $P$k.b$K warm-up failed (see $D/warm.$P$k.b$K)"; continue; }
+        limited "$STEP_TIMEOUT" "$D/warm.$P$k.b$K" env TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" 1 "$WARM_SECS" 9>&- \
+            || { fail "tsdb $P$k.b$K warm-up failed (see $D/warm.$P$k.b$K)"; continue; }
         for t in 1 $NHI; do reps "$P$k.b$K.c$t" "$D" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" "$t" "$SECS"; done
     done; done
 }
@@ -690,7 +716,9 @@ chsuite() { # PREFIX DIR TABLE-SYS(ch): chbench1 (qdrive over HTTP) with REPS ru
 tsdbsuite() { # PREFIX DIR CLASS-THREADS("1 32"): tsdbq qps classes against $TSDB_PORT
     local P=$1 D=$2 ths=$3 c t
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
-        "$TB/tsdbq" qps "$WORK/spec.tsv" "$c" 1 "$WARM_SECS" > "$D/warm.$P.$c" 2>&1 9>&-
+        # a warm-up has the step time limit too (a tsdbd that never answers must not hold the run)
+        limited "$STEP_TIMEOUT" "$D/warm.$P.$c" "$TB/tsdbq" qps "$WORK/spec.tsv" "$c" 1 "$WARM_SECS" 9>&-
+        [ $? = 124 ] && { fail "$P $c warm-up: STEP TIMEOUT ${STEP_TIMEOUT}s (see $D/warm.$P.$c)"; continue; }
         for t in $ths; do reps "$P.$c.c$t" "$D" -- "$TB/tsdbq" qps "$WORK/spec.tsv" "$c" "$t" "$SECS"; done
     done
 }
@@ -891,7 +919,8 @@ tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI
         else continue; fi
         for c in $BCLASSES; do
             n=$c; [ "$k" = 1 ] || n=$c.b$k
-            pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" 1 "$WARM_SECS" > "$D/warm.$P.$n$sfx" 2>&1 9>&-
+            limited "$STEP_TIMEOUT" "$D/warm.$P.$n$sfx" pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" 1 "$WARM_SECS" 9>&-
+            [ $? = 124 ] && { fail "$P $n$sfx warm-up: STEP TIMEOUT ${STEP_TIMEOUT}s (see $D/warm.$P.$n$sfx)"; continue; }
             for t in $ths; do reps "$P.$n.c$t$sfx" "$D" -- pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" "$t" "$SECS"; done
         done
     done
@@ -1197,13 +1226,17 @@ p2_tsdb() {
     load_ok "p2 tsdb" || return 1
     ports_check "$D/ports.txt"
     cd "$WORK" || return 1
-    # p6 (the sweep) writes ref/ again: the same input loaded the same way gives the same answers, and every later
-    # check compares with these
-    untimed "$D/ref-windows.log" sh -c "'$TB/tsdbq' dump spec.tsv 200 > ref/windows.jsonl"
-    untimed "$D/ref-full.log" sh -c "'$TB/tsdbq' full 1 1 dump 2> ref/full.jsonl"
-    untimed "$D/ref-lttb.log" "$B/relq" lttb 1 1 ref/lttb.jsonl
-    untimed "$D/ref-twa.log" "$B/relq" twa 1 1 ref/twa.jsonl
-    for k in $TWA_KINDS $TWA_WKINDS; do untimed "$D/ref-$k.log" env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" 1 1 "ref/$k.jsonl"; done
+    # ref/ is phase 2's reference and stays so: the extra pass (p6) dumps its own load's answers to ref-p6/ and checks
+    # them against ref/ (the same input loaded the same way must answer the same; a difference fails loudly)
+    local R=ref; [ -n "${SWEEP_SUB-}" ] && R=ref-p6
+    mkdir -p "$WORK/$R"
+    untimed "$D/ref-windows.log" sh -c "'$TB/tsdbq' dump spec.tsv 200 > $R/windows.jsonl"
+    untimed "$D/ref-full.log" sh -c "'$TB/tsdbq' full 1 1 dump 2> $R/full.jsonl"
+    untimed "$D/ref-lttb.log" "$B/relq" lttb 1 1 "$R/lttb.jsonl"
+    untimed "$D/ref-twa.log" "$B/relq" twa 1 1 "$R/twa.jsonl"
+    for k in $TWA_KINDS $TWA_WKINDS; do untimed "$D/ref-$k.log" env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" 1 1 "$R/$k.jsonl"; done
+    [ "$R" = ref ] || untimed "$D/check-ref-p6.txt" ref_same ref "$R" \
+        || log "  p6 tsdb: this load's answers differ from phase 2's reference (see $D/check-ref-p6.txt)"
     tstep "p2 tsdb full c1" "$D/full.c1.txt" -- "$TB/tsdbq" full 1 "$REPS"
     tstep "p2 tsdb full c$NPER" "$D/full.c$NPER.txt" -- "$TB/tsdbq" full $NPER "$REPS"
     tstep "p2 tsdb lttb c1" "$D/lttb.c1.txt" -- "$B/relq" lttb 1 "$REPS"
@@ -1232,6 +1265,12 @@ p2_tsdb() {
     cd "$OUT" || true
     runstats "$D"
     rmdata "$W"
+}
+ref_same() { # A B (cwd WORK): the reference dumps in B against those in A, with the checkers every system gets
+    local k rc=0
+    python3 -I "$H/check.py" --dumps "$1/windows.jsonl" "$1/full.jsonl" "$2/windows.jsonl" "$2/full.jsonl" || rc=1
+    for k in lttb twa $TWA_KINDS $TWA_WKINDS; do REL jsonl "$k" "$1/$k.jsonl" "$2/$k.jsonl" || rc=1; done
+    return "$rc"
 }
 ch_load_rep() { # one load: fresh server and table, ch_load.sh (insert, syncfs, merges), size
     local W=$1
@@ -1316,6 +1355,9 @@ qdb_load_rep() { # W PARQUET(0|1|2): fresh server, table, load, WAL applied, [co
 p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), Parquet ZSTD (QDB_ZSTD_LEVEL)
     local pq=$1 P=qdb D W r
     local QCTR=rb-qdb QREADY=qdb_ready  # a server that dies in a class is started again and the class run once more
+    # QuestDB refusing by its own limits is a result (REFUSED.txt), not a harness failure: its RSS limit, and "table busy
+    # [reason=pool size exceeded]" when more readers want a table than its reader pool holds
+    local QREFUSE='global RSS memory limit exceeded|table busy'; export QREFUSE
     [ "$pq" = 1 ] && P=qdb-parquet
     [ "$pq" = 2 ] && P=qdb-parquet-zstd
     local QDB_ZSTD=0; [ "$pq" = 2 ] && QDB_ZSTD=1
@@ -1812,35 +1854,50 @@ phase5() { reset_quiet; p5 || fail "p5 returned an error"; }
 # ================================================================== phase 6: the extra pass over phase 2's systems
 # For results phase 2 did not have when it ran: per system, ONE load (its own p2 function, with REPS=1), then
 #  (1) the TWA batch classes (tsdbtwab: every series in one QUERY_MULTI, KIND.b100.c1, and the windows K at a time;
-#      twabsuite: the other systems' TWA windows K at a time), timed REPS (XREPS) times into the system's phase-2
-#      directory, beside its other results, where tables.py shows them; they run where phase 2 runs them, after the
-#      single-request TWA kinds of the same load;
+#      twabsuite: the other systems' TWA windows K at a time), timed REPS (XREPS) times into <dir>/p6, which tables.py
+#      shows in the system's table marked "p6:" (another load than phase 2's rows); they run where phase 2 runs
+#      them, after the single-window TWA kinds of the same load, and only for a kind whose single windows agreed;
 #  (2) a memory sweep: every other class of phase 2 once, per core left out (NO_PC), each with mem_sample, into
 #      <dir>/memsweep, which runstats and tables.py keep apart from the timings (one run is not a result to average;
 #      tables.py reports the peak memory per class and the system's overall peak from it).
 # The p2 function's own safeguards stay as they are (step timeouts, QCTR deaths and restarts, REFUSED, the quiet gate
-# and BENCH.lock in every tstep, ts_many_probe, SERVER_MEM). steps.log labels start with "p6 ". RESUME=1 continues
-# after a stop: systems with $OUT/p6/<sys>.done are skipped, the interrupted one loads again (as every RESUME does) and
-# skips the steps whose output is there (memsweep is kept for it; without RESUME a rerun moves it to $OUT/old/).
+# and BENCH.lock in every tstep, ts_many_probe, SERVER_MEM). steps.log labels start with "p6 ". tsdb's references of
+# this load go to $WORK/ref-p6 and are checked against phase 2's ref/, which stays the reference. how.json gets a p6
+# block (how.py p6). $OUT/p6/<sys>.done means the pass reached the end of the system (failed or refused classes are
+# results); RESUME=1 continues after a stop: done systems are skipped, the interrupted one loads again (as every
+# RESUME does) and skips the steps whose output is there (p6/ and memsweep/ are kept for it; without RESUME a rerun
+# moves both to $OUT/old/, and a phase-2 rerun of the system (aside) makes its p6 due again).
 P6_SYSTEMS=${P6_SYSTEMS:-$P2_SYSTEMS}
+how_p6() { # DIR REPS: the p6 block of DIR/how.json (how.py p6: when, runs, trees, the pass's dash and refusals)
+    env T="$T" TSDB_TREE="$TSDB_TREE" XREPS="$2" python3 -I "$RDIR/how.py" p6 "$1" >> "$OUT/driver.log" 2>&1 \
+        || fail "how.json p6 block of $1"
+}
 phase6() {
-    local s d nf reps=$REPS
+    local s d x ok reps=$REPS
     for s in $P6_SYSTEMS; do
         reset_quiet
         done_mark "$OUT/p6/$s.done" && { log "p6 $s already done"; continue; }
         d=$(res_dir 2 "$s")
         mkdir -p "$d"
-        if [ -d "$d/memsweep" ] && [ "${RESUME:-0}" != 1 ]; then
-            mkdir -p "$OUT/old" && mv "$d/memsweep" "$OUT/old/p6-$s-memsweep.$(date +%m%d-%H%M%S)" && log "p6 $s: earlier sweep moved to $OUT/old/"
+        # a rerun starts empty, as aside does for phase 2: the last attempt's p6/ and memsweep/ go to $OUT/old/, so a
+        # stale run is never averaged with new ones (RESUME=1 keeps them: it goes on where the last attempt stopped)
+        if [ "${RESUME:-0}" != 1 ]; then
+            for x in p6 memsweep; do
+                [ -d "$d/$x" ] || continue
+                mkdir -p "$OUT/old" && mv "$d/$x" "$OUT/old/p6-$s-$x.$(date +%m%d-%H%M%S)" && log "p6 $s: earlier $x/ moved to $OUT/old/"
+            done
         fi
-        log "p6 $s start: one load; the TWA batch classes ($reps runs) into $d; every other class once into $d/memsweep"
+        log "p6 $s start: one load; the TWA batch classes ($reps runs) into $d/p6; every other class once into $d/memsweep"
         LOAD_FAILED=0
-        nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
-        SWEEP_SUB=/memsweep XREPS=$reps REPS=1 LOADS_FROM=1 NO_PC=1 LABEL_PFX="p6 " p2_sys "$s" || fail "p6 $s returned an error"
+        # the done marker says the pass reached the end of the system: classes that failed or were refused are results
+        # it recorded (FAILS, REFUSED.txt, dash.txt), so RESUME does not load the system again for them
+        if SWEEP_SUB=/memsweep XREPS=$reps REPS=1 LOADS_FROM=1 NO_PC=1 LABEL_PFX="p6 " p2_sys "$s"; then ok=1
+        else ok=0; fail "p6 $s returned an error (a start or load failed; RESUME=1 loads it again)"; fi
         cleanup_all
         [ -e "$d/how.json" ] || how_write 2 "$s"   # a system phase 2 has not run: tables.py needs how it ran
-        runstats "$d"   # the new classes' means beside phase 2's (runstats rewrites every mean of the directory alike)
-        [ "$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)" = "$nf" ] && date > "$OUT/p6/$s.done"
+        how_p6 "$d" "$reps"
+        runstats "$d/p6"
+        [ "$ok" = 1 ] && date > "$OUT/p6/$s.done"
         log "p6 $s end"
     done
     rmdata "$DBCMP/s2"
@@ -1883,7 +1940,7 @@ phase_smoke() {
     env DBCMP="$S" WORK="$S/work" DATA="$S/input/mixed.rowbinary" IN="$S/sizes/in" OUT="$so" \
         CLICKHOUSE="$CLICKHOUSE" DUCKDB_DIR="$DUCKDB_DIR" CHDB_DIR="$CHDB_DIR" IOT_VENV="$IOT_VENV" HYD_RAW="$HYD_RAW" \
         BENCH_LOCK="$LOCK" TSDB_TREE="$TSDB_TREE" TB="$TB" BIN="$BIN" \
-        SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=60 KS="1 10 100" NHI=2 NPER=2 \
+        SMOKE=1 FORCE=1 REPS=1 SECS=1 NSERIES=10 TWA_N=100 KS="1 10 100" NHI=2 NPER=2 \
         PREP_SERIES=10 PREP_POINTS=20000 POINTS=20000 SPEC_DIV=60 PREP_SIZE_POINTS=50000 PREP_SPEC=200 \
         DSLIST="${SMOKE_DS:-hdd_temp hyd_PS1}" \
         IOT_STABLE=15 TD_STABLE=10 VM_STABLE=10 I2_STABLE=15 QDB_WAIT_MAX=300 CH_SETTLE_MAX=300 WARM_SECS=1 PC_KS=1 \
@@ -1929,7 +1986,7 @@ usage: run.sh PHASE...      (env.sh has the paths; REPS, SECS, FORCE=1, P1_SYSTE
   p3         embedded (tsdb, DuckDB, chDB)      p4   Prometheus (backfill, remote write)
   p5         100 billion rows (only when named; not in "all")
   p6         the extra pass over p2's systems (only when named): one load each, the TWA batch classes (REPS runs, into
-             p2/<sys>/), every other class once with its peak memory (p2/<sys>/memsweep/); P6_SYSTEMS picks
+             p2/<sys>/p6/), every other class once with its peak memory (p2/<sys>/memsweep/); P6_SYSTEMS picks
   all        prep p1 p2 p3 p4
   smoke      every system end to end on tiny data, every check must pass (DBCMP=/var/tmp/dbcmp-smoke)
   checktest  the answer checker against a crafted data set and mutated answers
@@ -1946,6 +2003,7 @@ res_dir() { # PHASE SYS: the result directory of a system in phase 1 or 2
 aside() { # PHASE SYS: a rerun starts empty: the last attempt's runs, REFUSED.txt, dash.txt and loose.txt go to
           # $OUT/old/ (outside what tables.py and runstats read), so they are neither averaged nor reported again
     local d; d=$(res_dir "$1" "$2")
+    [ "$1" = 2 ] && rm -f "$OUT/p6/$2.done"   # its p6/ and memsweep/ go with the directory: the extra pass is due again
     [ -d "$d" ] || return 0
     mkdir -p "$OUT/old" && mv "$d" "$OUT/old/p$1-$2.$(date +%m%d-%H%M%S)" && log "p$1 $2: earlier results moved to $OUT/old/"
 }
