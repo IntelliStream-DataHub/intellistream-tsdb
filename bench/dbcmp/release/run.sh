@@ -621,13 +621,15 @@ ctr_mem() { # CONTAINER FILE: the container's cgroup memory (peak, limit, OOM ki
 }
 oom_killed() { # CONTAINER: 0 when the kernel OOM-killed a process in its cgroup: it no longer runs, or it still runs
     # and its cgroup's oom_kill count grew since the last call (PostgreSQL's postmaster outlives a killed backend and
-    # restarts the others itself, in recovery for a moment)
+    # restarts the others itself, in recovery for a moment). The count seen is kept per container id: a container made
+    # again under the same name has a new cgroup counting from 0, and an old count of 15 hid its first OOM kills
+    # (2026-11-01: TimescaleDB's later steps then ran against a server in recovery and all failed at once)
     local st id p n f
     st=$(podman inspect -f '{{.State.Status}}' "$1" 2> /dev/null)
     case $st in '') return 1 ;; running)
-        p=/sys/fs/cgroup$(podman inspect -f '{{.State.CgroupPath}}' "$1" 2> /dev/null)
+        p=${CGROOT:-/sys/fs/cgroup}$(podman inspect -f '{{.State.CgroupPath}}' "$1" 2> /dev/null)
         n=$(awk '$1 == "oom_kill" { print $2 }' "$p/memory.events" 2> /dev/null)
-        f=$OUT/.oomseen.$1
+        f=$OUT/.oomseen.$1.$(podman inspect -f '{{.Id}}' "$1" 2> /dev/null)
         [ -n "$n" ] && [ "$n" -gt "$(cat "$f" 2> /dev/null || echo 0)" ] || return 1
         echo "$n" > "$f"
         return 0 ;;
@@ -655,7 +657,7 @@ ctr_restart() { # CONTAINER: start it again (same settings and data), then wait 
     local i
     steplock -s
     # a container that still runs (oom_killed) only waits; a new start makes a new cgroup, whose count starts at 0
-    [ "$(podman inspect -f '{{.State.Status}}' "$1" 2> /dev/null)" = running ] || { rm -f "$OUT/.oomseen.$1"; podman start "$1" > /dev/null 2>&1 9>&-; }
+    [ "$(podman inspect -f '{{.State.Status}}' "$1" 2> /dev/null)" = running ] || { rm -f "$OUT/.oomseen.$1".*; podman start "$1" > /dev/null 2>&1 9>&-; }
     for i in $(seq 600); do
         ${QREADY:-true} > /dev/null 2>&1 || { sleep 0.5; continue; }
         stepunlock
