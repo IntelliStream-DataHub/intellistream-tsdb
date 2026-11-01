@@ -14,6 +14,8 @@ and the sweep's), and under them a "How it was run" table built from the how.jso
 files (how.py) plus footnotes: the '-' reasons, refusals and the per-core method. A system directory with results
 but no how.json, or a how.json without one of how.py's REQUIRED fields, fails the script (exit 1): no number goes
 out without the way it was measured.
+tsdb's relq and tsdbq full files (NAME.cN.txt: the runs and their mean in one file) are read as they are, with their
+unit: seconds per whole-table pass, or for the TWA windows (twa1d, twa7d) windows per second and ms per window.
 In batch classes (NAME.bK.cN: K windows per request) q/s counts requests for every system: qdrive's lines and relq's
 count requests; tsdbq's count windows, so their requests per second (q/s / K) are added beside them.
 """
@@ -154,6 +156,59 @@ def batch_unit(name, lines):
     return out
 
 
+RELQ_FILE = re.compile(r"^((?:merged\.)?(?:twa|twad|twal|twa1d|twa7d|lttb|full)\.c\d+)\.txt$")
+RELQ = re.compile(r"^(\S+) (\d+) conns(?:, [^:]*)?: mean ([\d.]+) s sd ([\d.]+) \(([\d.]+)%\) min ([\d.]+) max ([\d.]+), "
+                  r"(\d+) runs after a warm-up; (\d+) (buckets|points)(?:; (\d+) windows)?")
+FULLQ = re.compile(r"^full (.+?)\s+(\d+) conns batch \d+: mean ([\d.]+) s sd ([\d.]+), median ([\d.]+) \(min ([\d.]+), "
+                   r"max ([\d.]+), (\d+) runs\)")
+TWA_N = 1000  # windows of twa1d / twa7d when the line does not count them (relq before it did; run.sh's TWA_N)
+
+
+def relq_rows(d, prefix=""):
+    """tsdb's relq (TWA, LTTB) and tsdbq full files, NAME.cN.txt: one tstep with all REPS runs and their mean, sd, min
+    and max inside (not runstats' NAME.<run> files), read as they are. Whole-table kinds are seconds per pass over every
+    series; the window kinds (twa1d, twa7d) are a set of TWA_N windows per run, given as windows per second and ms of
+    wall time per window (at N connections the windows overlap: wall time over windows, not a latency)."""
+    rows = []
+    for f in sorted(glob.glob(os.path.join(d, prefix + "*.txt"))):
+        m = RELQ_FILE.match(os.path.basename(f))
+        if not m:
+            continue
+        name, res, spread, nruns = m.group(1), [], [], None
+        for l in open(f, errors="replace"):
+            r = RELQ.match(l.strip())
+            if r:
+                kind, conns, mean, sd, pct, mn, mx, runs, nb, what, nw = r.groups()
+                mean, mn, mx, nruns = float(mean), float(mn), float(mx), int(runs)
+                if kind in ("twa1d", "twa7d"):
+                    w = int(nw or TWA_N)
+                    res.append("%d windows on %s conns: mean %.4f s per set = %.0f windows/s, %.4f ms of wall time per "
+                               "window (%s buckets)%s" % (w, conns, mean, w / mean, mean / w * 1e3, nb,
+                                                          "" if nw else " [%d windows: the run's TWA_N]" % w))
+                    spread.append("sd %s%% [%.0f-%.0f windows/s]" % (pct, w / mx, w / mn))
+                else:
+                    res.append("%s on %s conns: mean %.4f s per whole-table pass (every series, one request each; %s %s)" % (
+                        kind, conns, mean, nb, what))
+                    spread.append("sd %s%% [%.4f-%.4f s]" % (pct, mn, mx))
+            q = FULLQ.match(l.strip())
+            if q:
+                what, conns, mean, sd, med, mn, mx, runs = q.groups()
+                nruns = int(runs)
+                res.append("full, %s, on %s conns: mean %s s per whole-table pass (median %s s)" % (what, conns, mean, med))
+                spread.append("sd %.1f%% [%s-%s s]" % (100 * float(sd) / float(mean) if float(mean) else 0.0, mn, mx))
+        flags = []
+        if os.path.exists(f + ".notquiet"):
+            flags.append("measured on a busy machine: " + open(f + ".notquiet").read().strip())
+        if not res:
+            errors.append("%s: no timing in it (a failed or empty run?)" % f)
+            flags.append("NO TIMING")
+        mem = mem_cell(mem_peaks([f + ".mem"])) if os.path.exists(f + ".mem") else ""
+        rows.append((name, "| %s | %s | %s | %s | %s | %s |" % (
+            cell(name), "<br>".join(cell(x) for x in res) or "-", "<br>".join(cell(x) for x in spread) or "-",
+            nruns if nruns is not None else "?", mem or "-", cell("; ".join(flags)))))
+    return rows
+
+
 def results_table(d, prefix=""):
     rows = []
     for f in sorted(glob.glob(os.path.join(d, prefix + "*.mean.txt"))):
@@ -167,8 +222,9 @@ def results_table(d, prefix=""):
             flags.append("NO TIMING")
         res = "<br>".join(cell(t)[:240] for t, _ in lines) or "-"
         spread = "<br>".join(cell(st)[:240] or "(one run or no spread)" for _, st in lines) or "-"
-        rows.append("| %s | %s | %s | %s | %s | %s |" % (cell(name), res, spread, nruns if nruns is not None else "?",
-                                                        mem or "-", cell("; ".join(flags)) or ""))
+        rows.append((name, "| %s | %s | %s | %s | %s | %s |" % (cell(name), res, spread, nruns if nruns is not None else "?",
+                                                               mem or "-", cell("; ".join(flags)) or "")))
+    rows = [r for _, r in sorted(rows + relq_rows(d, prefix))]
     if not rows:
         return []
     return ["| measurement | mean over the runs | sd %, [min-max] per number | runs | "

@@ -299,9 +299,12 @@ int main(int argc, char **argv)
     }
     size_t tot = 0;
     for (size_t k = 0; k < njobs; k++) tot += mode_twa ? res[k].nb : res[k].p.n;
-    printf("%s %d conns%s: mean %.4f s sd %.4f (%.1f%%) min %.4f max %.4f, %d runs after a warm-up; %zu %s\n", argv[1],
+    /* windows: their count, so a reader (tables.py) can turn a run's seconds into windows per second */
+    char wstr[32] = "";
+    if (wcls) snprintf(wstr, sizeof wstr, "; %zu windows", njobs);
+    printf("%s %d conns%s: mean %.4f s sd %.4f (%.1f%%) min %.4f max %.4f, %d runs after a warm-up; %zu %s%s\n", argv[1],
            conns, bstr, mean, reps > 1 ? sqrt(ss / (reps - 1)) : 0.0, reps > 1 ? 100 * sqrt(ss / (reps - 1)) / mean : 0.0, mn,
-           mx, reps, tot, mode_twa ? "buckets" : "points");
+           mx, reps, tot, mode_twa ? "buckets" : "points", wstr);
     if (argc > 4) {
         FILE *f = fopen(argv[4], "w");
         if (!f) { perror(argv[4]); return 1; }
