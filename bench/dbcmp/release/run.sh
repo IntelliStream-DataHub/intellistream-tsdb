@@ -22,7 +22,7 @@ I2_EXTRA=${I2_EXTRA:-}                  # smoke runs only: e.g. -e INFLUXD_STORA
 I2_STABLE=${I2_STABLE:-300}                # i2_settle.sh: nothing changed this long (s) before the load counts as settled
 WARM_SECS=${WARM_SECS:-3}                  # every window class is warmed up this long (s) on one client before it is timed
 PROM_SETTLE_TIMEOUT=${PROM_SETTLE_TIMEOUT:-36000}
-P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320} P5_DIR=${P5_DIR:-/var/tmp}
+P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_MINFREE:-320} P5_DIR=${P5_DIR:-/var/tmp} P5_LOAD_TIMEOUT=${P5_LOAD_TIMEOUT:-10800}
 # the many-client counts: 32 clients (window classes, TWA windows) and 16 connections (per-series whole range); the
 # smoke test runs 2 and 2 (NHI, NPER): it checks that every step works, and 32 clients of 100-series batches on its
 # data only made it slow (and ran unlimited containers out of host memory)
@@ -1814,40 +1814,61 @@ ch_big_load() { # 8 streams of 1250 series, RowBinary from scale-bench export; s
     CHC -q "SELECT count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'scale' AND table = 'big' AND active"
     return $bad
 }
+# P5_SYSTEMS ("tsdb ch") reruns one side: the other side's results stay, the rerun side's earlier results move to
+# $OUT/old/ first; ClickHouse needs the SQL tsdb's warm-up wrote ($D/sql). The loads (insert, then merges settled) get
+# P5_LOAD_TIMEOUT: on 2026-11-01 tsdb's took 3379 s and ClickHouse's insert alone 1443 s, so STEP_TIMEOUT (3600 s)
+# cut ClickHouse's settle short and its queries ran beside its merges.
 p5() {
-    local D=$OUT/p5 W=$P5_DIR/big C=$P5_DIR/ch-big r avail
+    local D=$OUT/p5 W=$P5_DIR/big C=$P5_DIR/ch-big r avail sys=" ${P5_SYSTEMS:-tsdb ch} " f old
     mkdir -p "$D"
     case $P5_DIR in /var/tmp | /var/tmp/?*) ;; *) fail "p5: P5_DIR must be under /var/tmp, not $P5_DIR"; return 1 ;; esac
     mkdir -p "$P5_DIR"
     avail=$(df -B1G --output=avail "$P5_DIR" | tail -1 | tr -d ' ')
     echo "free on $P5_DIR: $avail GB" > "$D/disk.txt"
     [ "$avail" -ge "$P5_MINFREE" ] || { fail "p5: only $avail GB free on $P5_DIR, need about $P5_MINFREE (tsdb 116 GB + ClickHouse 170 GB + margin)"; return 1; }
-    rmdata "$W" "$C"
-    tstep "p5 tsdb load" "$D/tsdb.load.txt" -- "$T/scale-bench" load --dir "$W" --series "$P5_SERIES" --points "$P5_POINTS" --threads 8
-    du -sb --exclude='retired_*' "$W" > "$D/tsdb.du.txt"
-    mkdir -p "$D/sql"
-    "$T/scale-bench" query --dir "$W" --series "$P5_SERIES" --threads 32 --sql "$D/sql" > "$D/warm.tsdb-emb" 2>&1 9>&-  # warm-up, writes the SQL
-    reps tsdb-emb "$D" -- "$T/scale-bench" query --dir "$W" --series "$P5_SERIES" --threads 32
-    tsdbd_start "$W" || return 1
-    "$T/scale-bench" query --port "$TSDB_PORT" --series "$P5_SERIES" --threads 32 > "$D/warm.tsdbd" 2>&1 9>&-
-    reps tsdbd "$D" -- "$T/scale-bench" query --port "$TSDB_PORT" --series "$P5_SERIES" --threads 32
-    tsdbd_stop
-    # ClickHouse on the same file system
-    crm rb-ch
-    mkdir -p "$C/data"
-    ch_start "$C" || return 1
-    ports_check "$D/ports.txt"
-    CHC -n -q "CREATE DATABASE scale; CREATE TABLE scale.big (series UInt32, ts DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)), value Float32 CODEC(Delta, ZSTD(1))) ENGINE = MergeTree PARTITION BY toDate(ts) ORDER BY (series, ts)" || { fail "p5 ch create"; return 1; }
-    tstep "p5 ch load" "$D/ch.load.txt" -- ch_big_load
-    "$ROOT/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE" > "$D/warm.ch" 2>&1 9>&-
-    reps ch "$D" -- "$ROOT/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE"
-    CHC -q "SELECT count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'scale' AND active" > "$D/ch.size-end.txt"
-    CHC -q "SELECT name, data_compressed_bytes, data_uncompressed_bytes FROM system.columns WHERE database = 'scale' AND table = 'big'" > "$D/ch.columns.txt"
-    crm rb-ch
+    if [ "$sys" != " tsdb ch " ]; then  # a rerun of one side: its earlier results aside
+        old=$OUT/old/p5.$(date +%m%d-%H%M%S); mkdir -p "$old"
+        case $sys in *" tsdb "*) for f in "$D"/tsdb* "$D"/warm.tsdb*; do [ -e "$f" ] && mv "$f" "$old/"; done ;; esac
+        case $sys in *" ch "*) for f in "$D"/ch.* "$D"/ch "$D"/warm.ch; do [ -e "$f" ] && mv "$f" "$old/"; done ;; esac
+        log "  p5: rerun of${sys% }; its earlier results moved to $old"
+    fi
+    case $sys in *" tsdb "*)
+        rmdata "$W"
+        STEP_TIMEOUT=$P5_LOAD_TIMEOUT tstep "p5 tsdb load" "$D/tsdb.load.txt" -- "$T/scale-bench" load --dir "$W" --series "$P5_SERIES" --points "$P5_POINTS" --threads 8 ||
+            { fail "p5 tsdb load (see $D/tsdb.load.txt): no tsdb queries"; return 1; }
+        du -sb --exclude='retired_*' "$W" > "$D/tsdb.du.txt"
+        mkdir -p "$D/sql"
+        "$T/scale-bench" query --dir "$W" --series "$P5_SERIES" --threads 32 --sql "$D/sql" > "$D/warm.tsdb-emb" 2>&1 9>&-  # warm-up, writes the SQL
+        reps tsdb-emb "$D" -- "$T/scale-bench" query --dir "$W" --series "$P5_SERIES" --threads 32
+        tsdbd_start "$W" || return 1
+        "$T/scale-bench" query --port "$TSDB_PORT" --series "$P5_SERIES" --threads 32 > "$D/warm.tsdbd" 2>&1 9>&-
+        reps tsdbd "$D" -- "$T/scale-bench" query --port "$TSDB_PORT" --series "$P5_SERIES" --threads 32
+        tsdbd_stop
+        rmdata "$W"
+        cp "$W.log" "$D/tsdbd.log" 2> /dev/null
+        rm -f "$W.log" "$W.pf" ;;
+    esac
+    case $sys in *" ch "*)
+        [ -n "$(ls -A "$D/sql" 2> /dev/null)" ] || { fail "p5 ch: no SQL in $D/sql (tsdb's warm-up writes it)"; return 1; }
+        # ClickHouse on the same file system
+        crm rb-ch
+        rmdata "$C"
+        mkdir -p "$C/data"
+        ch_start "$C" || return 1
+        ports_check "$D/ports.txt"
+        CHC -n -q "CREATE DATABASE scale; CREATE TABLE scale.big (series UInt32, ts DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)), value Float32 CODEC(Delta, ZSTD(1))) ENGINE = MergeTree PARTITION BY toDate(ts) ORDER BY (series, ts)" || { fail "p5 ch create"; return 1; }
+        if STEP_TIMEOUT=$P5_LOAD_TIMEOUT tstep "p5 ch load" "$D/ch.load.txt" -- ch_big_load; then
+            "$ROOT/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE" > "$D/warm.ch" 2>&1 9>&-
+            reps ch "$D" -- "$ROOT/tools/scale-bench-ch.sh" "$D/sql" scale.big "$CLICKHOUSE"
+        else
+            fail "p5 ch load (see $D/ch.load.txt): not settled, so no ClickHouse queries (they would run beside its merges)"
+        fi
+        CHC -q "SELECT count(), sum(rows), sum(bytes_on_disk) FROM system.parts WHERE database = 'scale' AND active" > "$D/ch.size-end.txt"
+        CHC -q "SELECT name, data_compressed_bytes, data_uncompressed_bytes FROM system.columns WHERE database = 'scale' AND table = 'big'" > "$D/ch.columns.txt"
+        crm rb-ch
+        rmdata "$C" ;;
+    esac
     runstats "$D"
-    rmdata "$W" "$C"
-    cp "$W.log" "$D/tsdbd.log" 2> /dev/null
-    rm -f "$W.log" "$W.pf"
 }
 phase5() { reset_quiet; p5 || fail "p5 returned an error"; }
 
