@@ -301,6 +301,12 @@ untimed() { # OUTFILE CMD...: a step that is not a timing (checks, dumps, sizes)
         fail "$(basename "$out"): server down, nothing was checked ($(grep -m1 'SERVER DOWN' "$out" | cut -c1-150)) (see $out)"
         return 3
     fi
+    # rel.py REFUSED (4): the server answered the query with an error of its own (QuestDB's RSS limit as an HTTP 400):
+    # a result the caller records (nocheck: dash.txt, REFUSED.txt), not a harness failure
+    if [ "$rc" = 4 ] && grep -q '^REFUSED: ' "$out"; then
+        log "  $(basename "$out"): refused by the server: $(grep -m1 '^REFUSED: ' "$out" | cut -c10-160)"
+        return 4
+    fi
     # UNTIMED_SOFT: an answer check whose mismatch is a result to report (a stated bound missed), not a harness failure
     [ "$rc" = 1 ] && [ -n "${UNTIMED_SOFT-}" ] && grep -q MISMATCH "$out" && ! grep -q Traceback "$out" && return 2
     # before the exit code: a checker that exits 1 on a mismatch (rel.py) is named by its mismatch in FAILS
@@ -538,11 +544,16 @@ TWA_KS=${TWA_KS-10 100}                # those windows K at a time, one request 
 dashnote() { # DIR LINE: LINE into DIR/dash.txt unless it is there (the extra pass p6 may run a system again)
     grep -qxF -- "$2" "$1/dash.txt" 2> /dev/null || echo "$2" >> "$1/dash.txt"
 }
-nocheck() { # SYSTEM KIND DIR RC: a check that did not pass: rc 3 is a server that cannot be reached, a check past its
+nocheck() { # SYSTEM KIND DIR RC: a check that did not pass: rc 3 is a server that cannot be reached, rc 4 one that
+           # refused the query (rel.py REFUSED: the server's own message, a result in REFUSED.txt), a check past its
            # time limit (limited's "STEP TIMEOUT" in DIR/check-KIND.txt) a timeout; neither is "answers differ"
     if [ "$4" = 3 ]; then
         echo "$2: not timed, the server was down when it was checked (see check-$2.txt)" >> "$3/dash.txt"
         log "  $1 $2: not timed (server down)"
+    elif [ "$4" = 4 ]; then
+        dashnote "$3" "$2: not timed, the server refused the query: $(grep -m1 '^REFUSED: ' "$3/check-$2.txt" | cut -c10-300) (see check-$2.txt)"
+        echo "check-$2: refused by the server: $(grep -m1 '^REFUSED: ' "$3/check-$2.txt" | cut -c10-300)" >> "$3/REFUSED.txt"
+        log "  $1 $2: not timed (refused by the server)"
     elif grep -q 'STEP TIMEOUT' "$3/check-$2.txt" 2> /dev/null; then
         dashnote "$3" "$2: not timed, its answer check timed out after ${CHECK_TIMEOUT}s (see check-$2.txt)"
         log "  $1 $2: not timed (the check timed out)"

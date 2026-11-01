@@ -211,4 +211,11 @@ UNTIMED_TIMEOUT=60 CHECK_TIMEOUT=60 QCTR= untimed "$X6/check-u.txt" sh -c 'echo 
 expect "untimed: a mismatch exiting 1 fails with its MISMATCH line" "[ $rc = 1 ] && grep -q 'answer check: x twa MISMATCH' '$X6/ufails'"
 UNTIMED_TIMEOUT=60 CHECK_TIMEOUT=60 QCTR= untimed "$X6/check-v.txt" sh -c 'echo "x twa OK"'; rc=$?
 expect "untimed: a passing check passes" "[ $rc = 0 ] && [ \$(wc -l < '$X6/ufails') = 1 ]"
+# rel.py REFUSED (exit 4): a result, passed on as 4 (not a FAIL, not "answers differ"); nocheck records the message
+UNTIMED_TIMEOUT=60 CHECK_TIMEOUT=60 QCTR= untimed "$X6/check-r.txt" sh -c 'echo "REFUSED: HTTP 400: global RSS memory limit exceeded"; exit 4'; rc=$?
+expect "untimed: a refused check returns 4 and is no FAIL" "[ $rc = 4 ] && [ \$(wc -l < '$X6/ufails') = 1 ]"
+mkdir -p "$X6/nr"; cp "$X6/check-r.txt" "$X6/nr/check-r.txt"
+nocheck x r "$X6/nr" 4
+expect "nocheck: a refusal goes to dash.txt and REFUSED.txt with the server's message" \
+    "grep -q 'refused the query: HTTP 400: global RSS' '$X6/nr/dash.txt' && grep -q 'check-r: refused by the server: HTTP 400' '$X6/nr/REFUSED.txt'"
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }

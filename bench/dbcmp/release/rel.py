@@ -6,7 +6,8 @@
 #   python3 -I rel.py sql SYS KIND        the SQL (or Flux) itself
 #   python3 -I rel.py has SYS KIND        exit 0 when SYS has a query for KIND ('-' in the tables otherwise)
 #   python3 -I rel.py check SYS KIND REF  run it on the server (ports of bench/dbcmp/README.md), compare; exit 1 on a
-#                                         mismatch, 3 when the server cannot be reached ("SERVER DOWN")
+#                                         mismatch, 3 when the server cannot be reached ("SERVER DOWN"), 4 when it
+#                                         answered the query with an HTTP error ("REFUSED: HTTP 400: its message")
 #   python3 -I rel.py tsv KIND REF FILE   compare a TSV answer file (embq/chq OUT) with REF; exit 1 on a mismatch
 #   python3 -I rel.py jsonl KIND REF FILE compare another relq/relemb dump with REF; exit 1 on a mismatch
 #   python3 -I rel.py qb SYS KIND K       window kinds in batches: K consecutive windows per request (the groups of
@@ -377,10 +378,22 @@ def wire(sysname, q):
         return "POST /api/v2/query?org=bench\tapplication/json\t" + json.dumps({"query": q, "type": "flux", "dialect": {"annotations": []}})
     return q
 
+class Refused(RuntimeError):
+    """The server answered the query with an HTTP error: it is up and said no (QuestDB's "global RSS memory limit
+    exceeded" comes as a 400 with a JSON error). Not SERVER DOWN: HTTPError is a URLError, which server_down counts."""
+
 def http(url, data=None, headers=None):
     req = urllib.request.Request(url, data=data.encode() if data else None, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=3600) as r:
-        return r.read().decode()
+    try:
+        with urllib.request.urlopen(req, timeout=3600) as r:
+            return r.read().decode()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            body = json.loads(body).get("error", body)
+        except ValueError:
+            pass
+        raise Refused(f"HTTP {e.code}: {' '.join(str(body).split())[:400]}") from None
 
 def run_sql(sysname, sql):
     if sysname == "ch":
@@ -642,6 +655,8 @@ def main():
 def server_down(e):
     """True when e says the server could not be reached or went away: reported as SERVER DOWN (exit 3), not as a
     mismatch of answers (the harness then restarts the server and tries once more)."""
+    if isinstance(e, Refused):
+        return False
     t = (str(e) + " " + str(getattr(e, "stderr", "") or "")).lower()
     return isinstance(e, (ConnectionError, urllib.error.URLError, httpclient.RemoteDisconnected)) or any(
         m in t for m in ("connection refused", "server closed the connection", "could not connect", "connection reset",
@@ -654,6 +669,9 @@ def guarded(fn, *a):
         if server_down(e):
             print("SERVER DOWN: " + repr(e)[:300])
             raise SystemExit(3)
+        if isinstance(e, Refused):
+            print("REFUSED: " + str(e))
+            raise SystemExit(4)
         raise
 
 if __name__ == "__main__":

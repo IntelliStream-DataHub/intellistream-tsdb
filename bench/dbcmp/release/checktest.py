@@ -254,6 +254,37 @@ def batch_cases():
         else: os.environ["TWA_SPEC"] = old_spec
         shutil.rmtree(d)
 
+def refused_cases():
+    """An HTTP error answer (QuestDB's RSS limit comes as a 400 with a JSON error) is the server refusing, with its
+    message: never SERVER DOWN (HTTPError is a URLError, which server_down once counted as down)."""
+    import http.server, threading
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            b = json.dumps({"query": "x", "error": "global RSS memory limit exceeded", "position": 0}).encode()
+            self.send_response(400); self.end_headers(); self.wfile.write(b)
+        def log_message(self, *a): pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        rel.http(f"http://127.0.0.1:{srv.server_address[1]}/exec?query=1")
+        e = None
+    except Exception as x:
+        e = x
+    finally:
+        srv.shutdown()
+    case("http 400: raised as Refused with the server's message", True,
+         isinstance(e, rel.Refused) and "global RSS memory limit exceeded" in str(e))
+    case("http 400: not SERVER DOWN", True, e is not None and not rel.server_down(e))
+    out = io.StringIO(); old = sys.stdout; sys.stdout = out
+    try:
+        rel.guarded(lambda: (_ for _ in ()).throw(rel.Refused("HTTP 400: no")))
+        rc = 0
+    except SystemExit as x:
+        rc = x.code
+    finally:
+        sys.stdout = old
+    case("http 400: guarded exits 4 with a REFUSED line", True, rc == 4 and out.getvalue().startswith("REFUSED: HTTP 400: no"))
+
 def main():
     a = sys.argv[1:]
     if not a or a[0] != "mutate": raise SystemExit("usage: checktest.py mutate [TWA_REF WINDOWS_REF FULL_REF]")
@@ -267,6 +298,7 @@ def main():
     lttb_cases()
     batch_cases()
     exit_cases(ref)
+    refused_cases()
     if len(a) >= 4:
         windows_cases(a[2], a[3])
     print("checktest", "OK" if failures == 0 else f"FAILED ({failures} cases)")
