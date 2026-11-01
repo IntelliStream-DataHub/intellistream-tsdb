@@ -284,6 +284,12 @@ def refused_cases():
     finally:
         sys.stdout = old
     case("http 400: guarded exits 4 with a REFUSED line", True, rc == 4 and out.getvalue().startswith("REFUSED: HTTP 400: no"))
+    # InfluxDB 3 refused a 100-window batch sent in a GET URL (HTTP 414): a long query goes as a POST body instead
+    short, long_ = rel.wire("i3", "SELECT 1"), rel.wire("i3", "SELECT " + "x" * 9000)
+    case("i3: a short query stays a GET line", True, short.startswith("GET /api/v3/query_sql?"))
+    b = long_.split("\t")
+    case("i3: a long query is a POST with the query in its JSON body", True,
+         len(b) == 3 and b[0] == "POST /api/v3/query_sql" and json.loads(b[2])["q"] == "SELECT " + "x" * 9000)
 
 def main():
     a = sys.argv[1:]

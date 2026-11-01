@@ -366,10 +366,17 @@ def query(sysname, kind):
         return [(i, W[sysname](s, a, b, bk)) for i, s, a, b, bk in windows(kind)]
     return Q[sysname](kind)
 
+I3_GET_MAX = 8192  # bytes of a GET request line to InfluxDB 3; longer queries go as a POST body
+
 def wire(sysname, q):
     """A query as one line of a qdrive / clickhouse-benchmark input file."""
     if sysname in ("i3",):
-        return "GET /api/v3/query_sql?db=cmp&format=csv&q=" + urllib.parse.quote(q, safe="")
+        # GET as phase 2 timed it; a batch of 100 windows is a URL past what InfluxDB 3 takes (HTTP 414 in the
+        # 2026-11-01 smoke), so a long query goes as the JSON body of a POST, which the same endpoint takes
+        g = "GET /api/v3/query_sql?db=cmp&format=csv&q=" + urllib.parse.quote(q, safe="")
+        if len(g) <= I3_GET_MAX:
+            return g
+        return "POST /api/v3/query_sql\tapplication/json\t" + json.dumps({"db": "cmp", "q": q, "format": "csv"}, separators=(",", ":"))
     if sysname == "iot":
         return "POST /rest/table/v1/query\tapplication/json\t" + json.dumps({"database": "cmp", "sql": q}, separators=(",", ":"))
     if sysname == "td":
@@ -410,8 +417,9 @@ def run_sql(sysname, sql):
         if "error" in out: raise RuntimeError(out["error"])
         return out["dataset"]
     if sysname == "i3":
-        url = f"http://127.0.0.1:{os.environ.get('I3_PORT', '8181')}/api/v3/query_sql?db=cmp&format=json&q=" + urllib.parse.quote(sql, safe="")
-        return [list(r.values()) for r in json.loads(http(url))]
+        url = f"http://127.0.0.1:{os.environ.get('I3_PORT', '8181')}/api/v3/query_sql"  # POST: no URL length limit
+        body = json.dumps({"db": "cmp", "q": sql, "format": "json"})
+        return [list(r.values()) for r in json.loads(http(url, body, {"Content-Type": "application/json"}))]
     if sysname == "iot":
         # 719 is IoTDB refusing a query whose memory estimate exceeds what the query operators have free at that
         # moment (enable_query_memory_estimation, the default); right after a 32-client run the queries the clients
