@@ -570,7 +570,7 @@ bench/dbcmp/release/run.sh checktest   # the answer checker must catch planted m
 | `p3` | embedded: tsdb, DuckDB, chDB | `p3/` |
 | `p4` | Prometheus: backfill and remote write | `p4/` |
 | `p5` | 100 billion rows, tsdb and ClickHouse (only when named; not in `all`) | `p5/` |
-| `p6` | an extra pass over p2's systems: the TWA batches, and each class's peak memory (only when named) | `p2/<system>/`, `p2/<system>/memsweep/` |
+| `p6` | an extra pass over p2's systems: the TWA batches, and each class's peak memory (only when named) | `p2/<system>/p6/`, `p2/<system>/memsweep/` |
 
 Every phase writes `PHASE n DONE` or `PHASE n FAILED: why` to `driver.log`, and `steps.log` has one line per
 step (rc, seconds, how busy the machine was). A phase or system that is done is skipped on the next call;
@@ -616,17 +616,26 @@ The TWA windows (`twa1d`, `twa7d`: 1000 random 1-day and 7-day windows) also com
 aggregate classes: 10 or 100 windows per request, at 1 and 32 clients. tsdb sends one QUERY_MULTI per batch
 (`relq qps twa1d.b10 ...`). The SQL systems send one query per batch: the windows' queries joined with UNION ALL,
 each with its member number as the first column (`rel.py qb`). Every batch is checked window by window against
-tsdb's answers (`rel.py checkb`, 1e-9) before it is timed. A system without a TWA query gets a line in `dash.txt`.
-In the tables, q/s of a batch class counts requests for every system (tsdbq's own lines count windows; their
-requests per second are added beside them).
+tsdb's answers (`rel.py checkb`, 1e-9) before it is timed, and a kind is sent in batches only when its windows
+one at a time agreed in the same load (a check that took too long counts as not agreeing, and `dash.txt` says it
+timed out). A system without a TWA query gets a line in `dash.txt`. In the tables, every batch line says what its
+q/s counts: requests for qdrive and relq (every system's batches, tsdb's TWA batches too), windows for tsdbq's
+aggregate batches, which get their requests per second added beside them.
 
 Phase 2 ran before these classes existed, and before the servers' memory was sampled. `p6` fills both in without
 redoing phase 2. For each system it loads the data once, then:
 
-1. runs the new TWA batch classes `REPS` times, into the system's phase-2 directory, so they appear in its table;
+1. runs the new TWA batch classes `REPS` times, into `p2/<system>/p6/`; they appear in the system's table marked
+   `p6:`, since they come from another load than the phase-2 rows;
 2. runs every other class of phase 2 once (not the per-core runs), with the server's memory sampled, into
-   `p2/<system>/memsweep/`. These single runs are not averaged; `tables.md` shows the peak memory per class and
-   the peak over the whole sweep under each system's table.
+   `p2/<system>/memsweep/`. These single runs are not averaged. Under each system's table, `tables.md` shows per class
+   the peak memory during the step (which includes what earlier classes left behind) and how much it grew over the
+   step's start, and the peak over the whole sweep.
+
+tsdb's answers of this load are checked against phase 2's reference (`ref-p6/` against `ref/`); `ref/` is not
+rewritten. The system's `how.json` gets a `p6` block (when, runs, the tsdb and harness commits, its `-` reasons and
+refusals), printed under its table. QuestDB's own refusals ("global RSS memory limit exceeded", "table busy") are
+recorded as refusals, not failures.
 
 Every safeguard of phase 2 still applies (time limits, deaths and restarts, refusals, the idle check, the lock).
 
@@ -636,8 +645,10 @@ P6_SYSTEMS="ch ts" BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p6
 RESUME=1 BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p6      # go on after a stop
 ```
 
-A system that finished has `p6/<system>.done` and is skipped. After a stop, `RESUME=1` loads the interrupted
-system again and skips the steps it already measured; without it, a rerun moves the old `memsweep/` to `old/`.
+A system the pass got through has `p6/<system>.done` and is skipped, also when some of its classes failed or were
+refused (those are recorded results). After a stop, `RESUME=1` loads the interrupted system again and skips the
+steps it already measured; without it, a rerun moves the old `p6/` and `memsweep/` to `old/`. Running a system's
+phase 2 again makes its p6 due again.
 In `steps.log` the pass's steps start with `p6 `.
 
 How long it takes, from the release run's logs (an upper bound): about 1 h for tsdb, ClickHouse, QuestDB (native),

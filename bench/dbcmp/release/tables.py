@@ -16,8 +16,10 @@ but no how.json, or a how.json without one of how.py's REQUIRED fields, fails th
 out without the way it was measured.
 tsdb's relq and tsdbq full files (NAME.cN.txt: the runs and their mean in one file) are read as they are, with their
 unit: seconds per whole-table pass, or for the TWA windows (twa1d, twa7d) windows per second and ms per window.
-In batch classes (NAME.bK.cN: K windows per request) q/s counts requests for every system: qdrive's lines and relq's
-count requests; tsdbq's count windows, so their requests per second (q/s / K) are added beside them.
+In batch classes (NAME.bK.cN: K windows per request) the q/s of qdrive's and relq's lines counts requests, and that of
+tsdbq's lines counts windows; each line says which, and tsdbq's get their requests per second (q/s / K) beside them.
+The extra pass's timings (p2/<sys>/p6/, run.sh p6: another load) join the system's table marked "p6:", and the
+system's how.json p6 block (when, runs, trees, its '-' reasons and refusals) is printed under it.
 """
 import glob, json, os, re, sys
 
@@ -109,16 +111,33 @@ def picked(f):
     return lines, nruns, flags
 
 
+MEM = re.compile(r"(\S+) peak (\d+) nocache (\d+)(?: start (\d+) startnocache (\d+))?")
+
+
 def mem_peaks(files):
-    """{server: (peak without page cache, peak with it)} over mem_sample files ("NAME peak N nocache M" lines)."""
+    """{server: (peak without page cache, peak with it)} over mem_sample files ("NAME peak N nocache M [start S
+    startnocache T]" lines)."""
     peaks = {}
     for f in files:
         for l in open(f):
-            m = re.fullmatch(r"(\S+) peak (\d+) nocache (\d+)", l.strip())
+            m = MEM.fullmatch(l.strip())
             if m:
                 a, b = peaks.get(m.group(1), (0, 0))
                 peaks[m.group(1)] = (max(a, int(m.group(3))), max(b, int(m.group(2))))
     return peaks
+
+
+def mem_rise(files):
+    """{server: (rise without page cache, rise with it)}: the most a step's peak exceeded the memory the server held when
+    the step started (its first sample), over files with a start; what earlier steps left is not in it."""
+    rise = {}
+    for f in files:
+        for l in open(f):
+            m = MEM.fullmatch(l.strip())
+            if m and m.group(4) is not None:
+                a, b = rise.get(m.group(1), (0, 0))
+                rise[m.group(1)] = (max(a, int(m.group(3)) - int(m.group(5))), max(b, int(m.group(2)) - int(m.group(4))))
+    return rise
 
 
 def mem_cell(peaks):
@@ -157,6 +176,8 @@ def batch_unit(name, lines):
 
 
 RELQ_FILE = re.compile(r"^((?:merged\.)?(?:twa|twad|twal|twa1d|twa7d|lttb|full)\.c\d+)\.txt$")
+RELQ1 = re.compile(r"^(\S+) (\d+) conns(?:, [^:]*)?: ([\d.]+) s, one run after a warm-up; (\d+) (buckets|points)"
+                   r"(?:; (\d+) windows)?")
 RELQ = re.compile(r"^(\S+) (\d+) conns(?:, [^:]*)?: mean ([\d.]+) s sd ([\d.]+) \(([\d.]+)%\) min ([\d.]+) max ([\d.]+), "
                   r"(\d+) runs after a warm-up; (\d+) (buckets|points)(?:; (\d+) windows)?")
 FULLQ = re.compile(r"^full (.+?)\s+(\d+) conns batch \d+: mean ([\d.]+) s sd ([\d.]+), median ([\d.]+) \(min ([\d.]+), "
@@ -177,19 +198,24 @@ def relq_rows(d, prefix=""):
         name, res, spread, nruns = m.group(1), [], [], None
         for l in open(f, errors="replace"):
             r = RELQ.match(l.strip())
+            r1 = RELQ1.match(l.strip())
+            if r1:  # REPS=1 (the smoke): one time, no spread
+                kind, conns, mean, nb, what, nw = r1.groups()
+                r, (sd, pct, mn, mx, runs) = r1, ("0", "0", mean, mean, "1")
             if r:
-                kind, conns, mean, sd, pct, mn, mx, runs, nb, what, nw = r.groups()
+                if not r1:
+                    kind, conns, mean, sd, pct, mn, mx, runs, nb, what, nw = r.groups()
                 mean, mn, mx, nruns = float(mean), float(mn), float(mx), int(runs)
                 if kind in ("twa1d", "twa7d"):
                     w = int(nw or TWA_N)
                     res.append("%d windows on %s conns: mean %.4f s per set = %.0f windows/s, %.4f ms of wall time per "
                                "window (%s buckets)%s" % (w, conns, mean, w / mean, mean / w * 1e3, nb,
                                                           "" if nw else " [%d windows: the run's TWA_N]" % w))
-                    spread.append("sd %s%% [%.0f-%.0f windows/s]" % (pct, w / mx, w / mn))
+                    spread.append("one run" if nruns == 1 else "sd %s%% [%.0f-%.0f windows/s]" % (pct, w / mx, w / mn))
                 else:
                     res.append("%s on %s conns: mean %.4f s per whole-table pass (every series, one request each; %s %s)" % (
                         kind, conns, mean, nb, what))
-                    spread.append("sd %s%% [%.4f-%.4f s]" % (pct, mn, mx))
+                    spread.append("one run" if nruns == 1 else "sd %s%% [%.4f-%.4f s]" % (pct, mn, mx))
             q = FULLQ.match(l.strip())
             if q:
                 what, conns, mean, sd, med, mn, mx, runs = q.groups()
@@ -209,7 +235,8 @@ def relq_rows(d, prefix=""):
     return rows
 
 
-def results_table(d, prefix=""):
+def results_table(d, prefix="", mark=""):
+    """The timing rows of d; with mark (the extra pass's d/p6), names start with it and the header is left out."""
     rows = []
     for f in sorted(glob.glob(os.path.join(d, prefix + "*.mean.txt"))):
         name = os.path.basename(f)[:-len(".mean.txt")]
@@ -222,9 +249,15 @@ def results_table(d, prefix=""):
             flags.append("NO TIMING")
         res = "<br>".join(cell(t)[:240] for t, _ in lines) or "-"
         spread = "<br>".join(cell(st)[:240] or "(one run or no spread)" for _, st in lines) or "-"
-        rows.append((name, "| %s | %s | %s | %s | %s | %s |" % (cell(name), res, spread, nruns if nruns is not None else "?",
+        rows.append((name, "| %s | %s | %s | %s | %s | %s |" % (cell(mark + name), res, spread,
+                                                               nruns if nruns is not None else "?",
                                                                mem or "-", cell("; ".join(flags)) or "")))
     rows = [r for _, r in sorted(rows + relq_rows(d, prefix))]
+    if mark:
+        return rows
+    p6 = os.path.join(d, "p6")
+    if os.path.isdir(p6):
+        rows += results_table(p6, prefix, "p6: ")
     if not rows:
         return []
     return ["| measurement | mean over the runs | sd %, [min-max] per number | runs | "
@@ -242,21 +275,48 @@ def sweep_table(d):
     by = {}
     for f in files:  # NAME.<run>.mem (reps), NAME.txt.mem (one tstep), load.<run>.mem
         by.setdefault(re.sub(r"\.(?:\d+|txt)$", "", os.path.basename(f)[:-len(".mem")]), []).append(f)
-    rows = ["| class (one run) | peak memory, without / with page cache | flags |", "|---|---|---|"]
+    rows = ["| class (one run) | peak during the step (includes what earlier classes left), without / with page cache "
+            "| rise over the step's start, without / with page cache | flags |", "|---|---|---|---|"]
     for n, fs in sorted(by.items()):
-        flags = ["%s %s" % (len(glob.glob(os.path.join(s, n + "*." + ext))), what) for ext, what in
+        # n + ".*." + ext: twa's files only, not twad's or twal's
+        flags = ["%s %s" % (len(glob.glob(os.path.join(s, n + ".*." + ext))), what) for ext, what in
                  (("refused", "refused"), ("oom", "killed out of memory"), ("died", "server died"))
-                 if glob.glob(os.path.join(s, n + "*." + ext))]
-        rows.append("| %s | %s | %s |" % (cell(n), mem_cell(mem_peaks(fs)) or "-", cell("; ".join(flags))))
+                 if glob.glob(os.path.join(s, n + ".*." + ext))]
+        rows.append("| %s | %s | %s | %s |" % (cell(n), mem_cell(mem_peaks(fs)) or "-", mem_cell(mem_rise(fs)) or "-",
+                                               cell("; ".join(flags))))
     peaks = mem_peaks(files)
     out = ["", "Memory sweep (run.sh p6: one load, then every class above once, per core left out; one run each, not "
-           "averaged): the server's peak memory per class, without / with the page cache (sampled every 0.5 s)", ""]
+           "averaged): the server's memory per class, without / with the page cache (sampled every 0.5 s). The peak "
+           "is what the server held at most during the step, memory earlier classes left behind included (caches, "
+           "pools); the rise is how far it grew above what it held when the step started.", ""]
     out += rows + ["", "Peak over the whole sweep (load included): " +
                    ("; ".join(mem_cell({k: v}) for k, v in sorted(peaks.items())) or "-")]
     r = os.path.join(s, "REFUSED.txt")
     if os.path.exists(r):
         out += ["", "Refused or died in the sweep:", ""] + ["- " + cell(l.strip()) for l in open(r) if l.strip()]
     return out + [""]
+
+
+def relq_note(d):
+    """Under tsdb's table: its relq window rows are not the steady-state q/s of the other systems' window classes."""
+    if not any(RELQ_FILE.match(os.path.basename(f)) and re.search(r"twa[17]d\.c", f)
+               for f in glob.glob(os.path.join(d, "*.txt"))):
+        return []
+    return ["", "The twa1d / twa7d.cN rows (relq) time a fixed set of 1000 windows from start to end, connects "
+            "included, and give windows/s from that wall time; the other systems' twa1d / twa7d rows (and tsdb's "
+            "KIND.bK.cN) are q/s over a 15 s steady-state run, so the two are not the same measure."]
+
+
+def p6_notes(h):
+    """The extra pass's how.json block (how.py p6), under the system's tables."""
+    p = h.get("p6")
+    if not p:
+        return []
+    out = ["", "Extra pass (p6) on %s: %s; tsdb %s; harness %s. %s." % (
+        p.get("date", "?"), p.get("runs", "?"), p.get("tsdb", "?"), p.get("harness", "?"), p.get("note", ""))]
+    out += ["- p6 '-': %s: %s" % (cell(k), cell(v)) for k, v in sorted(p.get("dash", {}).items())]
+    out += ["- p6 refused or died: " + cell(l) for l in p.get("refused", [])]
+    return out
 
 
 def loose_notes(d):
@@ -291,9 +351,11 @@ def phase1(out, p):
 
 def phase2(out, p):
     out += ["## Phase 2: the mixed table, server systems", "",
-            "In batch classes (NAME.bK.cN, K windows per request) q/s counts requests for every system; tsdbq counts "
-            "windows, so its requests per second are added in brackets. KIND.b100.c1 of tsdb is its whole-range TWA "
-            "of every series in one request (QUERY_MULTI), the form one SQL query has in the other systems.", ""]
+            "In batch classes (NAME.bK.cN, K windows per request) each line says what its q/s counts: requests in "
+            "qdrive's and relq's lines (every system but tsdbq), windows in tsdbq's, whose requests per second are "
+            "added in brackets. KIND.b100.c1 of tsdb is its whole-range TWA of every series in one request "
+            "(QUERY_MULTI), the form one SQL query has in the other systems. Rows marked p6: are from the extra pass "
+            "(run.sh p6), on a load of their own.", ""]
     hows = []
     for d in sorted(glob.glob(os.path.join(p, "*/"))):
         d = d.rstrip("/")
@@ -307,8 +369,8 @@ def phase2(out, p):
         if not h:
             continue
         hows.append(h)
-        out += ["### %s" % h["system"], ""] + (t or ["(no timed measurements)"]) + mem_line(d) + loose_notes(d) + \
-            sweep_table(d) + [""]
+        out += ["### %s" % h["system"], ""] + (t or ["(no timed measurements)"]) + relq_note(d) + mem_line(d) + \
+            loose_notes(d) + sweep_table(d) + p6_notes(h) + [""]
     out += how_table(hows, COLS)
 
 
