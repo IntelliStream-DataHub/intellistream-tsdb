@@ -570,6 +570,7 @@ bench/dbcmp/release/run.sh checktest   # the answer checker must catch planted m
 | `p3` | embedded: tsdb, DuckDB, chDB | `p3/` |
 | `p4` | Prometheus: backfill and remote write | `p4/` |
 | `p5` | 100 billion rows, tsdb and ClickHouse (only when named; not in `all`) | `p5/` |
+| `p6` | an extra pass over p2's systems: the TWA batches, and each class's peak memory (only when named) | `p2/<system>/`, `p2/<system>/memsweep/` |
 
 Every phase writes `PHASE n DONE` or `PHASE n FAILED: why` to `driver.log`, and `steps.log` has one line per
 step (rc, seconds, how busy the machine was). A phase or system that is done is skipped on the next call;
@@ -603,6 +604,46 @@ Ryzen 9 7950X, most of it waiting for compactions (Prometheus about 30 min, Ques
 InfluxDB 3's snapshots) and for other benchmarks holding the lock: phase 1 22 min, phase 2 about 1 h 40 min,
 phase 3 2 min, phase 4 33 min. The full run on 100 M rows takes many hours (Prometheus' remote write
 alone several); run it under `tmux` or `nohup`.
+
+### TWA in batches, and the extra pass (p6)
+
+The other systems answer a whole-table TWA for all 100 series in one SQL query. tsdb can do the same with one
+QUERY_MULTI request (protocol 10), so it is measured that way too: `twa.b100.c1`, `twad.b100.c1` and
+`twal.b100.c1` are every series in one request on one connection (`relq KIND 1 1 --batch 100`). The older
+`twa.c1` and `twa.c16` rows are one request per series.
+
+The TWA windows (`twa1d`, `twa7d`: 1000 random 1-day and 7-day windows) also come in batches now, like the
+aggregate classes: 10 or 100 windows per request, at 1 and 32 clients. tsdb sends one QUERY_MULTI per batch
+(`relq qps twa1d.b10 ...`). The SQL systems send one query per batch: the windows' queries joined with UNION ALL,
+each with its member number as the first column (`rel.py qb`). Every batch is checked window by window against
+tsdb's answers (`rel.py checkb`, 1e-9) before it is timed. A system without a TWA query gets a line in `dash.txt`.
+In the tables, q/s of a batch class counts requests for every system (tsdbq's own lines count windows; their
+requests per second are added beside them).
+
+Phase 2 ran before these classes existed, and before the servers' memory was sampled. `p6` fills both in without
+redoing phase 2. For each system it loads the data once, then:
+
+1. runs the new TWA batch classes `REPS` times, into the system's phase-2 directory, so they appear in its table;
+2. runs every other class of phase 2 once (not the per-core runs), with the server's memory sampled, into
+   `p2/<system>/memsweep/`. These single runs are not averaged; `tables.md` shows the peak memory per class and
+   the peak over the whole sweep under each system's table.
+
+Every safeguard of phase 2 still applies (time limits, deaths and restarts, refusals, the idle check, the lock).
+
+```sh
+BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p6               # every system of P2_SYSTEMS
+P6_SYSTEMS="ch ts" BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p6
+RESUME=1 BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p6      # go on after a stop
+```
+
+A system that finished has `p6/<system>.done` and is skipped. After a stop, `RESUME=1` loads the interrupted
+system again and skips the steps it already measured; without it, a rerun moves the old `memsweep/` to `old/`.
+In `steps.log` the pass's steps start with `p6 `.
+
+How long it takes, from the release run's logs (an upper bound): about 1 h for tsdb, ClickHouse, QuestDB (native),
+TimescaleDB and each TDengine variant; 1.3 to 1.6 h for QuestDB's Parquet variants and InfluxDB 2; about 2.2 h for
+each IoTDB variant; half an hour for VictoriaMetrics; and up to 7 h for InfluxDB 3 (it waits at least an hour for
+its Parquet snapshot). All of them: about 15 to 23 hours.
 
 ## Fairness notes
 
