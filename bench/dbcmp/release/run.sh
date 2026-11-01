@@ -181,7 +181,9 @@ mem_sample() { # OUTFILE NAME CGDIR [NAME CGDIR...]: until killed, the peaks of 
 }
 declare -A DEAD_CLASS   # step label without its run (" r3"): the server died in it twice, so its other runs are skipped
 tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout+stderr to OUTFILE (fd 9 closed)
-    local label=$1 out=$2 s e rc key=${1% r[0-9]*}
+    # LABEL_PFX (the extra pass p6: "p6 "): in front of every label, so steps.log tells its steps from phase 2's
+    local label=${LABEL_PFX-}$1 out=$2 s e rc key
+    key=${label% r[0-9]*}
     shift 3
     # RESUME=1 (a rerun after a death or a harness fix): a step that already ended with rc 0 in steps.log is not run again;
     # loads always run (the data of the earlier run is gone). A rerun clears the earlier run's death marks of the step.
@@ -233,7 +235,7 @@ tstep() { # LABEL OUTFILE -- CMD...: exclusive lock, quiet gate, CMD with stdout
         if [ -z "${TSTEP_RETRY-}" ]; then
             log "  retrying $label once"
             TSTEP_RETRY=1
-            tstep "$label" "$out" -- "$@"
+            LABEL_PFX= tstep "$label" "$out" -- "$@"
             rc=$?
             TSTEP_RETRY=
         else
@@ -256,7 +258,7 @@ inputs_ok() { # N: the inputs prep makes for phase N; a phase without them fails
     local f miss=""
     case $1 in
         1) for f in $DSLIST; do [ -s "$DBCMP/sizes/in/$f.rowbinary" ] || miss="$miss sizes/in/$f.rowbinary"; done ;;
-        2|3|4) for f in "$DBCMP"/input/mixed.{rowbinary,lp,ilp32,csv,om} "$WORK/spec.tsv" "$WORK/batches.tsv"; do
+        2|3|4|6) for f in "$DBCMP"/input/mixed.{rowbinary,lp,ilp32,csv,om} "$WORK/spec.tsv" "$WORK/batches.tsv"; do
                    [ -s "$f" ] || miss="$miss $f"; done ;;
     esac
     [ -z "$miss" ] && return 0
@@ -527,6 +529,10 @@ qline() { # NAME DIR FILE DRIVER-ARGS...: one query (LTTB, TWA): a warm-up, then
 }
 TWA_KINDS=${TWA_KINDS-twad twal}       # whole-range TWA kinds besides the hourly STEP twa (rel.py, relq)
 TWA_WKINDS=${TWA_WKINDS-twa1d twa7d}   # TWA over random windows: the first TWA_N (1000) agg1d / agg7d windows
+TWA_KS=${TWA_KS-10 100}                # those windows K at a time, one request per batch (twabsuite, tsdbtwab)
+dashnote() { # DIR LINE: LINE into DIR/dash.txt unless it is there (the extra pass p6 may run a system again)
+    grep -qxF -- "$2" "$1/dash.txt" 2> /dev/null || echo "$2" >> "$1/dash.txt"
+}
 nocheck() { # SYSTEM KIND DIR RC: a check that did not pass: rc 3 is a server that cannot be reached, not different answers
     if [ "$4" = 3 ]; then
         echo "$2: not timed, the server was down when it was checked (see check-$2.txt)" >> "$3/dash.txt"
@@ -582,6 +588,36 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
         if [ "$1" = ch ]; then FULLS="" CLASSES="$k" chsuite "$S" "$D" "$S"
         else FULLS="" CLASSES="$k" qsuite "$S" "$S" "$D" "$@"; fi
     done
+    twabsuite "$S" "$D" "$@"
+}
+# The TWA windows in batches, as the aggregate classes have them (bsuite): one request of K windows (rel.py qb: the
+# window queries as UNION ALL branches with a member column, each with its own WITH tables), checked member by member
+# against tsdb's answers (rel.py checkb, 1e-9 relative) and timed only when they agree, at 1 and NHI clients for SECS.
+# In the extra pass (p6, DIR .../memsweep) they go to the system's own directory with XREPS runs: they are new
+# results there, not a memory sweep's single runs.
+twabsuite() { # SYS DIR DRIVER-ARGS...|ch
+    local S=$1 D=${2%/memsweep} k K f t a r REPS=${XREPS:-$REPS}
+    mkdir -p "$D"
+    shift 2
+    cd "$WORK" || return 1
+    for k in $TWA_WKINDS; do for K in $TWA_KS; do
+        REL has "$S" "$k" || { dashnote "$D" "$k.b$K: no query in rel.py for $S"; continue; }
+        f=$WORK/q/$S.$k.b$K.txt
+        REL qb "$S" "$k" "$K" > "$f" && [ -s "$f" ] || { fail "rel.py qb $S $k $K (see $f)"; continue; }
+        untimed "$D/check-$k.b$K.txt" REL checkb "$S" "$k" "$K" "ref/$k.jsonl" || { nocheck "$S" "$k.b$K" "$D" $?; continue; }
+        if [ "$1" = ch ]; then
+            chbench1 1 0 "$WARM_SECS" "$f" > /dev/null 2> "$D/warm.$S.$k.b$K" 9>&-
+            for t in 1 $NHI; do for r in $(seq "$REPS"); do
+                tstep "$S.$k.b$K.c$t r$r" "$D/$S.$k.b$K.c$t.$r" -- chbench_tag "$S.$k.b$K.c$t.$r.$$" "$t" 0 "$SECS" "$f"
+            done; done
+        else
+            "$B/qdrive" "$@" "$f" 1 "$WARM_SECS" > "$D/warm.$S.$k.b$K" 2>&1 9>&- || { fail "$S $k.b$K warm-up failed (see $D/warm.$S.$k.b$K)"; continue; }
+            for t in 1 $NHI; do
+                a=("$@"); [ "$t" != 1 ] && [ -n "${MANY_CONN-}" ] && a=("$1" "$MANY_CONN")
+                reps "$S.$k.b$K.c$t" "$D" -- "$B/qdrive" "${a[@]}" "$f" "$t" "$SECS"
+            done
+        fi
+    done; done
 }
 tsdbtwa() { # DIR PREFIX CONNS...: relq for every TWA kind (windows at 1 and 32 connections), timed
     local D=$1 P=$2 k c
@@ -589,6 +625,25 @@ tsdbtwa() { # DIR PREFIX CONNS...: relq for every TWA kind (windows at 1 and 32 
     for k in $TWA_KINDS; do for c in "$@"; do tstep "p2 tsdb $P$k c$c" "$D/$P$k.c$c.txt" -- "$B/relq" "$k" "$c" "$REPS"; done; done
     for k in $TWA_WKINDS; do for c in 1 $NHI; do
         tstep "p2 tsdb $P$k c$c" "$D/$P$k.c$c.txt" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" "$k" "$c" "$REPS"
+    done; done
+    tsdbtwab "$D" "$P"
+}
+# tsdb's TWA through QUERY_MULTI (protocol 10), as the other systems answer it: the whole range of every series in ONE
+# request on one connection (KIND.b100.c1: what one SQL query is in ClickHouse and the others; relq --batch 100), and
+# the windows K at a time (KIND.bK.cT: relq qps, requests counted as qdrive counts them, at 1 and NHI connections).
+# Each form's answers are checked against ref/ (relq --batch dump, rel.py jsonl) before it is timed; REPS runs of one
+# timing each (runstats: KIND.b100.c1.mean.txt). In p6 (DIR .../memsweep) into tsdb's own directory, XREPS runs.
+tsdbtwab() { # DIR PREFIX
+    local D=${1%/memsweep} P=$2 k K t w=$WORK/self REPS=${XREPS:-$REPS}
+    mkdir -p "$w" "$D"
+    for k in twa $TWA_KINDS; do
+        untimed "$D/check-$P$k.b100.txt" bash -c "'$B/relq' $k 1 1 '$w/$P$k.b100.jsonl' --batch 100 && python3 -I '$TOOLS/rel.py' jsonl $k '$WORK/ref/$k.jsonl' '$w/$P$k.b100.jsonl'" || continue
+        reps "$P$k.b100.c1" "$D" -- "$B/relq" "$k" 1 1 --batch 100
+    done
+    for k in $TWA_WKINDS; do for K in $TWA_KS; do
+        untimed "$D/check-$P$k.b$K.txt" bash -c "TWA_SPEC='$WORK/spec.tsv' '$B/relq' $k 1 1 '$w/$P$k.b$K.jsonl' --batch $K && python3 -I '$TOOLS/rel.py' jsonl $k '$WORK/ref/$k.jsonl' '$w/$P$k.b$K.jsonl'" || continue
+        TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" 1 "$WARM_SECS" > "$D/warm.$P$k.b$K" 2>&1 9>&- || { fail "tsdb $P$k.b$K warm-up failed (see $D/warm.$P$k.b$K)"; continue; }
+        for t in 1 $NHI; do reps "$P$k.b$K.c$t" "$D" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" "$t" "$SECS"; done
     done; done
 }
 chbench1() { # CONC ITER|0 SECONDS|0 FILE [SETTING=V...]: FILE's SQL lines as HTTP POSTs through qdrive, its summary
@@ -736,8 +791,12 @@ ctr_taskset() { # CPUS CONTAINER: pin the container's process tree; fails if the
     done
     [ "$n" -gt 0 ] && [ "$(taskset -cp "$root" 2> /dev/null | sed 's/.*: //')" = "$cpus" ]
 }
+# NO_PC=1 (the extra pass p6): no per-core runs; every per-core start and pinning fails quietly, so the "... &&
+# PC=1 ..." chains skip them, and the batch suites return at once for PC=1
+want_pc() { [ "${NO_PC:-0}" != 1 ]; }
 pc_pin() { # CONTAINER...: to PERCORE_CPU
     local c
+    want_pc || return 1
     for c; do ctr_taskset "$PERCORE_CPU" "$c" || { fail "per-core: taskset $c"; return 1; }; done
 }
 how_write() { # PHASE SYS: how.json of the system's results (how.py: settings, durability, clients, per core, '-')
@@ -747,11 +806,12 @@ how_write() { # PHASE SYS: how.json of the system's results (how.py: settings, d
         SMOKE="${SMOKE:-0}" PERCORE_CPU="$PERCORE_CPU" PERCORE_CLIENT_CPU="$PERCORE_CLIENT_CPU" \
         python3 -I "$RDIR/how.py" write "$1" "$2" "$OUT" >> "$OUT/driver.log" 2>&1 || fail "how.json of $2 (phase $1)"
 }
-pc_unpin() { local c; for c; do ctr_taskset "0-$(( $(nproc) - 1 ))" "$c"; done; }
+pc_unpin() { local c; want_pc || return 0; for c; do ctr_taskset "0-$(( $(nproc) - 1 ))" "$c"; done; }
 pc_restart() { # CONTAINER CONFIG_FILE START_CMD...: the per-core start: runtimes size their thread pools at start, so
     # pinning a running server leaves it 32-wide pools on one CPU (REVIEW-fairness M7). START_CMD starts the container
     # with its thread knobs at 1; the container's configuration and pinning go to CONFIG_FILE.
     local c=$1 f=$2
+    want_pc || return 1
     shift 2
     crm "$c"
     "$@" && pc_pin "$c" || { fail "per-core start of $c"; return 1; }
@@ -764,7 +824,7 @@ pc_restart() { # CONTAINER CONFIG_FILE START_CMD...: the per-core start: runtime
 bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
     local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} a
     shift 3
-    [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
+    [ "${PC:-0}" = 1 ] && { want_pc || return 0; sfx=.pc; ths=1; }
     for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
         for n in ${FULLS-$FULLS_DEFAULT}; do
             f=$WORK/q/$S.full$n.b$k.txt; nl=$(wc -l < "$f")
@@ -815,7 +875,7 @@ tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI
                # A tsdbq without --batch answers K = 1 only (the 10 single series, one request each; the window
                # classes one window per request) and the log says the rest is pending.
     local P=$1 D=$2 k c t sfx= ths=${BTHREADS:-1 $NHI} n
-    [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
+    [ "${PC:-0}" = 1 ] && { want_pc || return 0; sfx=.pc; ths=1; }
     # a release run must time tsdb's batches: without protocol 10's --batch the phase fails (smoke only logs it)
     tsdb_has_batch || { [ "${SMOKE:-0}" = 1 ] && log "  $P: tsdbq in $TB has no --batch: K > 1 not timed" \
         || fail "$P: tsdbq in $TB has no --batch (TSDB_TREE must be the multi-series build): K > 1 not timed"; }
@@ -862,6 +922,7 @@ tsdb_self() { # TAG: tsdbd's answers now against its references (cwd WORK): the 
 }
 tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (where tsdbd has --query-threads)
     local qt=()
+    want_pc || return 1
     "$T/tsdbd" --help 2>&1 | grep -q -- '--query-threads' && qt=(--query-threads 1)
     [ ${#qt[@]} = 0 ] && { [ "${SMOKE:-0}" = 1 ] && log "  tsdbd has no --query-threads: per core with all threads" \
         || { fail "tsdbd in $T has no --query-threads: per core not measured"; return 1; }; }
@@ -870,7 +931,7 @@ tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (whe
 }
 chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through chbench1 (PC=1: max_threads=1, pinned)
     local P=$1 D=$2 S=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} set=() r
-    [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; set=(--max_threads=1); }
+    [ "${PC:-0}" = 1 ] && { want_pc || return 0; sfx=.pc; ths=1; set=(--max_threads=1); }
     for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
         for n in ${FULLS-$FULLS_DEFAULT}; do
             f=$WORK/q/$S.full$n.b$k.txt; nl=$(wc -l < "$f")
@@ -1119,7 +1180,7 @@ phase1() {
 
 # ================================================================== phase 2: the 100 M-row table
 p2_tsdb() {
-    local D=$OUT/p2/tsdb W=$DBCMP/s2/tsdb r
+    local D=$OUT/p2/tsdb${SWEEP_SUB-} W=$DBCMP/s2/tsdb r
     mkdir -p "$D" "$WORK/ref"
     for r in $(seq "$REPS"); do
         rmdata "$W"; mkdir -p "$W"
@@ -1193,7 +1254,7 @@ ch_merged() { # DIR BATCHES-OK: the table after OPTIMIZE FINAL ("parts merged", 
     chparts "$D/parts-merged-after-suite.txt"
 }
 p2_ch() {
-    local D=$OUT/p2/ch W=$DBCMP/s2/ch r bok=0
+    local D=$OUT/p2/ch${SWEEP_SUB-} W=$DBCMP/s2/ch r bok=0
     local QCTR=rb-ch QREADY=ch_ready  # a server that dies in a class is started again and the class run once more
     mkdir -p "$D"
     for r in $(seq "${LOADS_FROM:-1}" "$REPS"); do  # LOADS_FROM=$REPS: a rerun of later steps loads once (RESUME)
@@ -1251,7 +1312,7 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
     [ "$pq" = 1 ] && P=qdb-parquet
     [ "$pq" = 2 ] && P=qdb-parquet-zstd
     local QDB_ZSTD=0; [ "$pq" = 2 ] && QDB_ZSTD=1
-    D=$OUT/p2/$P W=$DBCMP/s2/$P
+    D=$OUT/p2/$P${SWEEP_SUB-} W=$DBCMP/s2/$P
     mkdir -p "$D"
     for r in $(seq "${LOADS_FROM:-1}" "$REPS"); do  # LOADS_FROM=$REPS: a rerun of later steps loads once (RESUME)
         crm rb-qdb; rmdata "$W"
@@ -1280,7 +1341,7 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
     untimed "$D/check-twaseg.txt" REL check qdbseg twa ref/twa.jsonl && qline twaseg "$D" "$D/q.twaseg.sql" pg "$PG"
     twasuite qdb "$D" pg "$PG"
     # per core: a restart with every worker pool at one thread (the data stays), then a normal start for what follows
-    if [ $bok = 1 ]; then
+    if [ $bok = 1 ] && want_pc; then
         QDB_PC=1 pc_restart rb-qdb "$D/config.pc.txt" qdb_start "$W" && PC=1 bsuite qdb "$P" "$D" pg "$PG"
         crm rb-qdb; [ "$pq" = 0 ] && { qdb_start "$W" || return 1; }
     fi
@@ -1345,7 +1406,7 @@ ts_many_probe() { # DIR CONN-PREFIX: sets MANY_CONN (the caller's local) unless 
 }
 p2_ts() {
     local QCTR=rb-ts QREADY=ts_ready
-    local D=$OUT/p2/ts W=$DBCMP/s2/ts r
+    local D=$OUT/p2/ts${SWEEP_SUB-} W=$DBCMP/s2/ts r
     mkdir -p "$D"
     for r in $(seq "${LOADS_FROM:-1}" "$REPS"); do  # LOADS_FROM=$REPS: a rerun of later steps loads once (RESUME)
         crm rb-ts; rmdata "$W"
@@ -1405,7 +1466,7 @@ i2_timed() {
     echo "size: $(podman unshare du -sb "$1/data" | cut -f1) bytes (du -sb of the data directory)"
 }
 p2_i2() {
-    local D=$OUT/p2/i2 W=$DBCMP/s2/i2 r bid
+    local D=$OUT/p2/i2${SWEEP_SUB-} W=$DBCMP/s2/i2 r bid
     mkdir -p "$D"
     for r in $(seq "$REPS"); do
         crm rb-i2; rmdata "$W"
@@ -1433,9 +1494,9 @@ p2_i2() {
         bcheck i2ql "$D" && { [ $x = 1 ] || perc16 i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'; } && PC=$x bsuite i2ql i2ql "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\n'
         bcheck i2flux "$D" && { [ $x = 1 ] || perc16 i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'; } && PC=$x bsuite i2flux i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
         # per core: a restart with one Go P (GOMAXPROCS=1; influxd has no query-thread knob), pinned
-        [ $x = 0 ] && { I2_EXTRA="$I2_EXTRA -e GOMAXPROCS=1" pc_restart rb-i2 "$D/config.pc.txt" i2_start "$W" || break; }
+        [ $x = 0 ] && { want_pc || break; I2_EXTRA="$I2_EXTRA -e GOMAXPROCS=1" pc_restart rb-i2 "$D/config.pc.txt" i2_start "$W" || break; }
     done
-    crm rb-i2; i2_start "$W" || return 1
+    want_pc && { crm rb-i2; i2_start "$W" || return 1; }  # without per core (NO_PC) the normal server still runs
     TWA_WKINDS="" twasuite i2flux "$D" http 127.0.0.1 8086 $'Authorization: Token benchtoken\r\nAccept: application/csv\r\n'
     cd "$OUT" || true
     crm rb-i2; rmdata "$W"
@@ -1445,7 +1506,7 @@ p2_i3() {
     # InfluxDB 3 Core was OOM-killed at its 28 GB limit by 32 concurrent batch queries over 65,000 Parquet files
     # (smoke): recorded as such and restarted (tstep), not a harness failure
     local QCTR=rb-i3 QREADY="curl -sf http://127.0.0.1:8181/health"
-    local D=$OUT/p2/i3 W=$DBCMP/s2/i3 r
+    local D=$OUT/p2/i3${SWEEP_SUB-} W=$DBCMP/s2/i3 r
     mkdir -p "$D"
     for r in $(seq "$REPS"); do
         crm rb-i3; rmdata "$W"
@@ -1469,9 +1530,11 @@ p2_i3() {
     if bcheck i3 "$D"; then
         perc16 i3 i3 "$D" http 127.0.0.1 8181 ""; bsuite i3 i3 "$D" http 127.0.0.1 8181 ""
         # per core: a restart with one DataFusion thread (its runtime sizes itself at start), pinned; then a normal start
-        pc_restart rb-i3 "$D/config.pc.txt" i3_start "$W" $I3_P2_FLAGS --num-datafusion-threads 1 &&
-            PC=1 bsuite i3 i3 "$D" http 127.0.0.1 8181 ""
-        crm rb-i3; i3_start "$W" $I3_P2_FLAGS || return 1
+        if want_pc; then
+            pc_restart rb-i3 "$D/config.pc.txt" i3_start "$W" $I3_P2_FLAGS --num-datafusion-threads 1 &&
+                PC=1 bsuite i3 i3 "$D" http 127.0.0.1 8181 ""
+            crm rb-i3; i3_start "$W" $I3_P2_FLAGS || return 1
+        fi
     fi
     REL q i3 twa > "$D/q.twa.http"
     untimed "$D/check-twa.txt" REL check i3 twa ref/twa.jsonl
@@ -1481,6 +1544,7 @@ p2_i3() {
     crm rb-i3; rmdata "$W"
     runstats "$D"
 }
+p2_sys() { case $1 in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; qdb2) p2_qdb 2 ;; *) "p2_$1" ;; esac; }
 phase2() {
     local s
     for s in $P2_SYSTEMS; do
@@ -1490,7 +1554,7 @@ phase2() {
         aside 2 "$s"
         LOAD_FAILED=0
         local nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
-        case $s in qdb0) p2_qdb 0 ;; qdb1) p2_qdb 1 ;; qdb2) p2_qdb 2 ;; *) "p2_$s" ;; esac || fail "p2 $s returned an error"
+        p2_sys "$s" || fail "p2 $s returned an error"
         cleanup_all
         how_write 2 "$s"
         [ "$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)" = "$nf" ] && date > "$OUT/p2/$s.done"
@@ -1738,6 +1802,42 @@ p5() {
 }
 phase5() { reset_quiet; p5 || fail "p5 returned an error"; }
 
+# ================================================================== phase 6: the extra pass over phase 2's systems
+# For results phase 2 did not have when it ran: per system, ONE load (its own p2 function, with REPS=1), then
+#  (1) the TWA batch classes (tsdbtwab: every series in one QUERY_MULTI, KIND.b100.c1, and the windows K at a time;
+#      twabsuite: the other systems' TWA windows K at a time), timed REPS (XREPS) times into the system's phase-2
+#      directory, beside its other results, where tables.py shows them; they run where phase 2 runs them, after the
+#      single-request TWA kinds of the same load;
+#  (2) a memory sweep: every other class of phase 2 once, per core left out (NO_PC), each with mem_sample, into
+#      <dir>/memsweep, which runstats and tables.py keep apart from the timings (one run is not a result to average;
+#      tables.py reports the peak memory per class and the system's overall peak from it).
+# The p2 function's own safeguards stay as they are (step timeouts, QCTR deaths and restarts, REFUSED, the quiet gate
+# and BENCH.lock in every tstep, ts_many_probe, SERVER_MEM). steps.log labels start with "p6 ". RESUME=1 continues
+# after a stop: systems with $OUT/p6/<sys>.done are skipped, the interrupted one loads again (as every RESUME does) and
+# skips the steps whose output is there (memsweep is kept for it; without RESUME a rerun moves it to $OUT/old/).
+P6_SYSTEMS=${P6_SYSTEMS:-$P2_SYSTEMS}
+phase6() {
+    local s d nf reps=$REPS
+    for s in $P6_SYSTEMS; do
+        reset_quiet
+        done_mark "$OUT/p6/$s.done" && { log "p6 $s already done"; continue; }
+        d=$(res_dir 2 "$s")
+        mkdir -p "$d"
+        if [ -d "$d/memsweep" ] && [ "${RESUME:-0}" != 1 ]; then
+            mkdir -p "$OUT/old" && mv "$d/memsweep" "$OUT/old/p6-$s-memsweep.$(date +%m%d-%H%M%S)" && log "p6 $s: earlier sweep moved to $OUT/old/"
+        fi
+        log "p6 $s start: one load; the TWA batch classes ($reps runs) into $d; every other class once into $d/memsweep"
+        LOAD_FAILED=0
+        nf=$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)
+        SWEEP_SUB=/memsweep XREPS=$reps REPS=1 LOADS_FROM=1 NO_PC=1 LABEL_PFX="p6 " p2_sys "$s" || fail "p6 $s returned an error"
+        cleanup_all
+        runstats "$d"   # the new classes' means beside phase 2's (runstats rewrites every mean of the directory alike)
+        [ "$(cat "$PH_DIR/FAILS" 2> /dev/null | wc -l)" = "$nf" ] && date > "$OUT/p6/$s.done"
+        log "p6 $s end"
+    done
+    rmdata "$DBCMP/s2"
+}
+
 # ================================================================== checktest: the answer checkers have teeth
 phase_checktest() {
     local D=$OUT/checktest rc=0
@@ -1820,6 +1920,8 @@ usage: run.sh PHASE...      (env.sh has the paths; REPS, SECS, FORCE=1, P1_SYSTE
   p1         sizes per kind of sensor           p2   the 100 M-row table, every server system
   p3         embedded (tsdb, DuckDB, chDB)      p4   Prometheus (backfill, remote write)
   p5         100 billion rows (only when named; not in "all")
+  p6         the extra pass over p2's systems (only when named): one load each, the TWA batch classes (REPS runs, into
+             p2/<sys>/), every other class once with its peak memory (p2/<sys>/memsweep/); P6_SYSTEMS picks
   all        prep p1 p2 p3 p4
   smoke      every system end to end on tiny data, every check must pass (DBCMP=/var/tmp/dbcmp-smoke)
   checktest  the answer checker against a crafted data set and mutated answers
@@ -1879,7 +1981,7 @@ for a in "$@"; do
     case $a in
         # bash, not the file's mode: a checkout without the executable bit once ran every phase with no inputs
         prep) flock -s "$LOCK" bash "$RDIR/prep.sh" > "$OUT/prep.log" 2>&1 || { log "prep failed (see $OUT/prep.log); later phases stop"; RC=1; PREP_FAILED=1; } ;;
-        p[1-5]) [ "${PREP_FAILED:-0}" = 1 ] && { log "PHASE ${a#p} not run: prep failed"; RC=1; continue; }
+        p[1-6]) [ "${PREP_FAILED:-0}" = 1 ] && { log "PHASE ${a#p} not run: prep failed"; RC=1; continue; }
                 runphase "${a#p}" || RC=1; TABLES=1 ;;
         smoke) phase_smoke || RC=1 ;;
         checktest) phase_checktest || RC=1 ;;

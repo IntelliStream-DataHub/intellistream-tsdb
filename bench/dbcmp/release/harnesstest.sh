@@ -1,6 +1,7 @@
 #!/bin/bash
 # harnesstest.sh: run.sh's death detection (oom_killed, ctr_died) against a stub podman and a fake cgroup tree, so
-# no container is needed; ts_many_probe against a stub qdrive; mem_sample against fake memory files. Prints one line per case and "harnesstest OK" or "harnesstest FAILED".
+# no container is needed; ts_many_probe against a stub qdrive; mem_sample against fake memory files; the
+# extra pass (phase6, tstep's labels and RESUME, NO_PC) and the TWA batch suites (twabsuite, tsdbtwab) against stubs. Prints one line per case and "harnesstest OK" or "harnesstest FAILED".
 #   bash bench/dbcmp/release/harnesstest.sh
 HERE=$(dirname "$(readlink -f "$0")")
 T=$(mktemp -d) || exit 2
@@ -74,4 +75,81 @@ else echo "FAIL mem_sample wrote: $(cat "$M/out" | tr '\n' ';') want: ${want//$'
 if (set -u; mem_sample "$M/none") 2> "$M/none.err" && [ ! -s "$M/none.err" ] && [ ! -e "$M/none" ]; then
     echo "ok   mem_sample with no server returns quietly"
 else echo "FAIL mem_sample with no server: $(cat "$M/none.err")"; fails=$((fails + 1)); fi
+
+# the extra pass (p6) and the TWA batch suites, against stubs: where results go, how many runs, what is skipped
+eval "$(sed -n -e '/^tstep() {/,/^}/p' -e '/^phase6() {/,/^}/p' -e '/^twabsuite() {/,/^}/p' -e '/^tsdbtwab() {/,/^}/p' \
+    -e '/^dashnote() {/,/^}/p' -e '/^want_pc() {/p' -e '/^pc_pin() {/,/^}/p' -e '/^bsuite() {/,/^}/p' "$HERE/run.sh")"
+expect() { # NAME CONDITION...: one case
+    if eval "${*:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
+}
+declare -A DEAD_CLASS
+quiet() { BUSY=0.1; }; mem_cgroups() { :; }; reset_quiet() { :; }; cleanup_all() { :; }; rmdata() { :; }
+X6=$T/p6; OUT=$X6/out WORK=$X6/work B=$X6/b TOOLS=$X6/tools WARM_SECS=1 NHI=32 SECS=1 REPS=5 STEP_TIMEOUT=60
+mkdir -p "$OUT/p2/ch" "$WORK/q" "$B" "$TOOLS"
+# tstep: the label prefix goes into steps.log; RESUME skips a step logged rc=0 whose output is there, and only then
+LABEL_PFX="p6 " tstep "ch.x.c1 r1" "$OUT/a.1" -- echo hello
+expect "tstep: p6's label in steps.log" "grep -qP '\tp6 ch.x.c1 r1\trc=0\t' '$OUT/steps.log'"
+RESUME=1 LABEL_PFX="p6 " tstep "ch.x.c1 r1" "$OUT/a.1" -- false
+expect "tstep: RESUME skips a p6 step that is done" "[ \$(grep -c 'ch.x.c1 r1' '$OUT/steps.log') = 1 ]"
+RESUME=1 LABEL_PFX="p6 " tstep "ch.x.c1 r1" "$OUT/memsweep.a.1" -- echo again
+expect "tstep: RESUME runs it when its output (another directory) is missing" "[ -s '$OUT/memsweep.a.1' ]"
+# twabsuite: the batches go to the system's own directory with XREPS runs, also when called with DIR/memsweep
+REL() { case $1 in has) [ "$2" != none ] ;; qb) [ "$2" = bad ] || echo "SELECT $3 $4" ;; checkb) echo "$2 $3.b$4 OK" ;; esac; }
+reps() { echo "$1 $2 REPS=$REPS" >> "$X6/reps.log"; }
+cat > "$B/qdrive" << 'EOS'
+#!/bin/bash
+echo "warm $*" >> "$P6LOG"
+EOS
+chmod +x "$B/qdrive"; export P6LOG=$X6/qdrive.log
+untimed() { local o=$1; shift; "$@" > "$o" 2>&1; }
+nocheck() { echo "nocheck $*" >> "$X6/reps.log"; }
+TWA_WKINDS="twa1d twa7d" TWA_KS="10 100"
+XREPS=5 REPS=1 twabsuite ts "$OUT/p2/ts/memsweep" pg conn
+expect "twabsuite: 8 timings, into p2/ts, 5 runs each" \
+    "[ \$(grep -c '^ts.twa[17]d.b1\(0\|00\).c\(1\|32\) $OUT/p2/ts REPS=5\$' '$X6/reps.log') = 8 ]"
+expect "twabsuite: request files from rel.py qb" "[ \"\$(cat '$WORK/q/ts.twa7d.b100.txt')\" = 'SELECT twa7d 100' ]"
+expect "twabsuite: checked into the system's directory" "grep -q 'ts twa1d.b10 OK' '$OUT/p2/ts/check-twa1d.b10.txt'"
+REPS=5 twabsuite none "$OUT/p2/i2" http x; REPS=5 twabsuite none "$OUT/p2/i2" http x
+expect "twabsuite: no query: one dash line per class, not repeated by a rerun" \
+    "[ \$(grep -c '^twa1d.b10: no query in rel.py for none\$' '$OUT/p2/i2/dash.txt') = 1 ] && [ \$(wc -l < '$OUT/p2/i2/dash.txt') = 4 ]"
+fails0=$fails; fail() { echo "fail: $*" >> "$X6/fails"; }
+REPS=5 twabsuite bad "$OUT/p2/bad" http x
+expect "twabsuite: rel.py qb failing is a FAIL, nothing timed" "[ \$(grep -c 'qb bad' '$X6/fails') = 4 ] && ! grep -q '^bad\.' '$X6/reps.log'"
+# tsdbtwab: the one-request whole range (twa, twad, twal .b100.c1) and the windows at 1 and NHI connections
+: > "$X6/reps.log"
+cat > "$B/relq" << 'EOS'
+#!/bin/bash
+echo "relq $*" >> "$P6LOG"
+EOS
+chmod +x "$B/relq"; echo 'print("x twa OK")' > "$TOOLS/rel.py"
+TWA_KINDS="twad twal" XREPS=5 REPS=1 tsdbtwab "$OUT/p2/tsdb/memsweep" merged.
+expect "tsdbtwab: twa twad twal as merged.KIND.b100.c1, 5 runs, in p2/tsdb" \
+    "[ \$(grep -c '^merged.twa[dl]\?.b100.c1 $OUT/p2/tsdb REPS=5\$' '$X6/reps.log') = 3 ]"
+expect "tsdbtwab: the windows K at a time at 1 and 32 connections" \
+    "[ \$(grep -c '^merged.twa[17]d.b1\(0\|00\).c\(1\|32\) $OUT/p2/tsdb REPS=5\$' '$X6/reps.log') = 8 ]"
+expect "tsdbtwab: every form checked first (relq --batch dumps)" "[ \$(grep -c -- '--batch' '$P6LOG') = 7 ]"
+# NO_PC: per-core batch suites return before running anything, pinning refuses
+: > "$P6LOG"
+NO_PC=1 PC=1 bsuite ch ch "$OUT/p2/ch" http x; rc=$?
+expect "NO_PC: bsuite with PC=1 runs nothing" "[ $rc = 0 ] && [ ! -s '$P6LOG' ]"
+expect "NO_PC: pc_pin refuses" "! NO_PC=1 pc_pin rb-x"
+# phase6: per system once, REPS=1 into memsweep with XREPS for the batches, no per core, labels "p6 "; done markers;
+# a rerun moves an old sweep aside unless RESUME=1
+fail() { echo "fail: $*" >> "$PH_DIR/FAILS"; }
+PH_DIR=$OUT/p6; mkdir -p "$PH_DIR"
+res_dir() { case $2 in qdb0) echo "$OUT/p2/qdb" ;; *) echo "$OUT/p2/$2" ;; esac; }
+done_mark() { [ "${FORCE:-0}" != 1 ] && [ -e "$1" ]; }
+runstats() { echo "runstats $1" >> "$X6/p6.log"; }
+p2_sys() { echo "p2_sys $1 sub=$SWEEP_SUB REPS=$REPS XREPS=$XREPS LOADS_FROM=$LOADS_FROM NO_PC=$NO_PC pfx=$LABEL_PFX" >> "$X6/p6.log"
+    mkdir -p "$(res_dir 2 "$1")$SWEEP_SUB"; echo x > "$(res_dir 2 "$1")$SWEEP_SUB/load.1"; [ "$1" != broken ] || fail "broken"; }
+P6_SYSTEMS="tsdb qdb0 broken" REPS=5 LOADS_FROM=5 phase6
+expect "phase6: each system once with the sweep's settings" \
+    "[ \$(grep -c 'sub=/memsweep REPS=1 XREPS=5 LOADS_FROM=1 NO_PC=1 pfx=p6 \$' '$X6/p6.log') = 3 ]"
+expect "phase6: runstats on the system's own directory" "grep -qx 'runstats $OUT/p2/qdb' '$X6/p6.log'"
+expect "phase6: done markers only for systems without failures" "[ -e '$OUT/p6/tsdb.done' ] && [ -e '$OUT/p6/qdb0.done' ] && [ ! -e '$OUT/p6/broken.done' ]"
+: > "$X6/p6.log"
+P6_SYSTEMS="tsdb qdb0 broken" RESUME=1 phase6
+expect "phase6: RESUME=1 skips done systems and keeps the sweep" "[ \$(grep -c p2_sys '$X6/p6.log') = 1 ] && [ -e '$OUT/p2/broken/memsweep/load.1' ] && [ ! -d '$OUT/old' ]"
+P6_SYSTEMS="broken" phase6
+expect "phase6: a rerun without RESUME moves the old sweep to OUT/old" "ls -d '$OUT'/old/p6-broken-memsweep.* > /dev/null 2>&1"
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }

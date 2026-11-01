@@ -174,6 +174,68 @@ def lttb_cases():
         else: os.environ["DATA"] = old
         shutil.rmtree(d)
 
+def batch_cases():
+    """rel.py qb / checkb, the TWA window batches: each member's WITH tables renamed apart, its rows mapped back to its
+    window by the member column; a member answered with another's rows, a missing or an extra member, a wrong value
+    and a request file that is not rel.py's batch must fail."""
+    import re
+    cs, body = rel.ctes("WITH seg AS (SELECT (1) AS x), parts AS (SELECT x FROM seg) SELECT x FROM parts")
+    case("batch: WITH tables parsed", True, cs == [("seg", "SELECT (1) AS x"), ("parts", "SELECT x FROM seg")]
+         and body == "SELECT x FROM parts")
+    ws = [(3, 1704067200000, 1704153600000, 18000000), (4, 1704070800000, 1704157200000, 18000000)]
+    bcs, bbody = rel.ctes(rel.wbatch("i3", ws))
+    own = all(set(re.findall(r"\b(?:seg|parts)(\d+)\b", b)) <= {n[-1]} for n, b in bcs)
+    case("batch: i3 members use their own WITH tables only", True, own
+         and [n for n, _ in bcs] == ["seg0", "parts0", "seg1", "parts1"]
+         and re.findall(r"\(SELECT (\d) AS mb, bb,.*?FROM parts(\d) ", bbody) == [("0", "0"), ("1", "1")])
+    case("batch: ch is mkbatch.py's UNION ALL form", True,
+         rel.wbatch("ch", ws).startswith("SELECT * FROM ((SELECT 0 AS mb, bb, "))
+    d = tempfile.mkdtemp()
+    try:
+        old_spec, old_run, cwd = os.environ.get("TWA_SPEC"), rel.run_sql, os.getcwd()
+        os.chdir(d)
+        os.makedirs("q")
+        t0 = 1704067200000
+        with open("spec.tsv", "w") as f:
+            for i in range(6):
+                f.write(f"agg1d\t{i % 4}\t{t0 + i * H}\t{t0 + i * H + 86400000}\t18000000\n")
+                f.write(f"raw\t0\t{t0}\t{t0 + H}\t0\n")
+        os.environ["TWA_SPEC"] = "spec.tsv"
+        ref = {}
+        for i, s_, a_, b_, bk in rel.windows("twa1d"):
+            ref[i] = {"s": s_, "i": i, "b": [[a_ // bk * bk, 2.0 * (i + 1) * 1000, 1000, 1], [a_ // bk * bk + bk, 7.5 * 1000, 1000, 2]]}
+        groups = rel.wgroups("twa1d", 3)
+        with open("q/ch.twa1d.b3.txt", "w") as f:
+            f.write("".join(rel.wire("ch", rel.wbatch("ch", [x[1:] for x in g])) + "\n" for g in groups))
+        sqls = [rel.wbatch("ch", [x[1:] for x in g]) for g in groups]
+        def server(mutate=None):
+            def run_sql(sysname, sql):
+                g = groups[sqls.index(sql)]
+                rows = [[m, b[0], b[1], b[2]] for m, x in enumerate(g) for b in ref[x[0]]["b"]]
+                return mutate(rows) if mutate else rows
+            return run_sql
+        def checkb(mutate=None):
+            rel.run_sql = server(mutate)
+            rows, keys = rel.fetch_batches("ch", "twa1d", 3, "q/ch.twa1d.b3.txt")
+            return quiet(rel.compare, "twa1d", {i: ref[i] for i in keys}, rows) and sorted(keys) == sorted(ref)
+        case("batch: true answers", True, checkb())
+        case("batch: two members' rows swapped", False, checkb(lambda r: [[{0: 1, 1: 0}.get(x[0], x[0]), *x[1:]] for x in r]))
+        case("batch: a member missing", False, checkb(lambda r: [x for x in r if x[0] != 2]))
+        case("batch: an extra member", False, checkb(lambda r: r + [[3, *r[0][1:]]]))
+        case("batch: a value off by 1.5e-9 relative", False,
+             checkb(lambda r: [r[0][:2] + [r[0][2] * (1 + 1.5e-9)] + r[0][3:]] + r[1:]))
+        lines = open("q/ch.twa1d.b3.txt").read().splitlines()
+        with open("q/ch.twa1d.b3.txt", "w") as f: f.write("\n".join([lines[0].replace("18000000", "18000001", 1)] + lines[1:]) + "\n")
+        try: checkb(); ok = True
+        except SystemExit: ok = False
+        case("batch: a request file with a line that is not rel.py's", False, ok)
+    finally:
+        rel.run_sql = old_run
+        os.chdir(cwd)
+        if old_spec is None: os.environ.pop("TWA_SPEC", None)
+        else: os.environ["TWA_SPEC"] = old_spec
+        shutil.rmtree(d)
+
 def main():
     a = sys.argv[1:]
     if not a or a[0] != "mutate": raise SystemExit("usage: checktest.py mutate [TWA_REF WINDOWS_REF FULL_REF]")
@@ -185,6 +247,7 @@ def main():
     twa_cases(ref)
     decimal_cases()
     lttb_cases()
+    batch_cases()
     if len(a) >= 4:
         windows_cases(a[2], a[3])
     print("checktest", "OK" if failures == 0 else f"FAILED ({failures} cases)")

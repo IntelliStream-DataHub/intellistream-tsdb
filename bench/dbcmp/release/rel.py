@@ -9,6 +9,13 @@
 #                                         mismatch, 3 when the server cannot be reached ("SERVER DOWN")
 #   python3 -I rel.py tsv KIND REF FILE   compare a TSV answer file (embq/chq OUT) with REF
 #   python3 -I rel.py jsonl KIND REF FILE compare another relq/relemb dump with REF
+#   python3 -I rel.py qb SYS KIND K       window kinds in batches: K consecutive windows per request (the groups of
+#                                         batches.py: whole groups only), one request line each (q/SYS.KIND.bK.txt)
+#   python3 -I rel.py checkb SYS KIND K REF   run every batch of FILE q/SYS.KIND.bK.txt (which must be qb's lines)
+#                                         and compare each member with REF (exit codes as check)
+# A batch is one SQL request in mkbatch.py's form: the members' window queries as UNION ALL branches, each with its
+# member number as the first column (mb); a member's WITH tables are renamed apart (seg -> seg0, seg1, ...) and
+# gathered in one WITH in front, so every member is the query it is alone.
 # KIND: lttb (1000 points per series; rows series, t_ms, value); twa, twad, twal: every series over the whole range,
 # STEP by hour, STEP by day, LINEAR by hour, buckets aligned to the epoch (rows series, bucket_ms, area, covered_ms,
 # or series, bucket_ms, twa for the TimescaleDB toolkit and Flux); twa1d, twa7d: STEP over the windows relq takes
@@ -296,6 +303,61 @@ Q = {"ch": q_ch, "ts": q_ts, "qdb": q_qdb, "qdbseg": q_qdbseg, "i3": q_i3, "i2fl
      "chdb": lambda k: q_ch(k, "t"), "iot": q_iot, "td": q_td}
 W = {"ch": w_ch, "ts": w_ts, "qdb": w_qdb, "i3": w_i3, "iot": w_iot, "td": w_td}
 
+def ctes(q):
+    """'WITH a AS (...), b AS (...) SELECT ...' -> ([(a, ...), (b, ...)], 'SELECT ...'); ([], q) without WITH."""
+    if not q.startswith("WITH "): return [], q
+    out, i = [], len("WITH ")
+    while True:
+        j = q.index(" AS (", i)
+        p = k = j + len(" AS (")
+        depth = 1
+        while depth:
+            depth += (q[p] == "(") - (q[p] == ")")
+            p += 1
+        out.append((q[i:j].strip(), q[k:p - 1]))
+        rest = q[p:].lstrip()
+        if not rest.startswith(","): return out, rest
+        i = q.index(",", p) + 1
+
+def wbatch(sysname, members):
+    """One request of the windows members [(series, start, end, bucket)]: mkbatch.py's UNION ALL with a member
+    column, each member's WITH tables renamed apart."""
+    import re
+    with_, parts = [], []
+    for m, x in enumerate(members):
+        cs, body = ctes(W[sysname](*x))
+        if cs:
+            pat = re.compile(r"\b(" + "|".join(re.escape(n) for n, _ in cs) + r")\b")
+            ren = lambda t, m=m: pat.sub(lambda g: f"{g.group(1)}{m}", t)
+            with_ += [(f"{n}{m}", ren(b)) for n, b in cs]
+            body = ren(body)
+        assert body.startswith("SELECT ")
+        parts.append(f"SELECT {m} AS mb, " + body[len("SELECT "):])
+    q = parts[0] if len(parts) == 1 else "SELECT * FROM (" + " UNION ALL ".join(f"({p})" for p in parts) + ") x"
+    return ("WITH " + ", ".join(f"{n} AS ({b})" for n, b in with_) + " " + q) if with_ else q
+
+def wgroups(kind, k):
+    """The windows of kind (windows()) K at a time, whole groups only, as batches.py groups a class's lines."""
+    w = windows(kind)
+    return [w[g * k:(g + 1) * k] for g in range(len(w) // k)]
+
+def fetch_batches(sysname, kind, k, path):
+    """Every batch of path (checked to be the requests wbatch makes) run once; rows keyed by the window's line."""
+    lines = open(path).read().splitlines()
+    groups = wgroups(kind, k)
+    if len(lines) != len(groups):
+        raise SystemExit(f"{path}: {len(lines)} lines, {len(groups)} groups of {k} windows")
+    rows, keys = [], []
+    for line, g in zip(lines, groups):
+        sql = wbatch(sysname, [x[1:] for x in g])
+        if line != wire(sysname, sql): raise SystemExit(f"{path}: a line that is not rel.py's batch (rel.py qb)")
+        keys += [x[0] for x in g]
+        for r in run_sql(sysname, sql):
+            m = int(float(r[0]))
+            # a member number out of range becomes a key no window has: an unexpected series in compare
+            rows.append([g[m][0] if 0 <= m < len(g) else -1 - m, *r[1:]])
+    return rows, keys
+
 def query(sysname, kind):
     """The whole-range query, or for window kinds the list of (line, query), one per window."""
     if kind in WKINDS:
@@ -543,6 +605,18 @@ def main():
         if not s: raise SystemExit(1)  # no such query: the caller writes '-'
         for x in (s if kind in WKINDS else [(None, s)]):
             print(wire(sysname, x[1]) if cmd == "q" else x[1])
+    elif cmd == "qb":
+        sysname, kind, k = sys.argv[2], sys.argv[3], int(sys.argv[4])
+        if kind not in WKINDS or sysname not in W: raise SystemExit(1)
+        for g in wgroups(kind, k):
+            print(wire(sysname, wbatch(sysname, [x[1:] for x in g])))
+    elif cmd == "checkb":
+        sysname, kind, k, ref = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+        rows, keys = fetch_batches(sysname, kind, k, f"q/{sysname}.{kind}.b{k}.txt")
+        full = load_ref(ref)
+        ok = compare(kind, {i: full[i] for i in keys if i in full}, rows) and all(i in full for i in keys)
+        print(sysname, f"{kind}.b{k}", "OK" if ok else "MISMATCH")
+        if not ok: raise SystemExit(1)
     elif cmd == "has":  # exit 0 when SYS has a query for KIND
         raise SystemExit(0 if sys.argv[2] in Q and query(sys.argv[2], sys.argv[3]) else 1)
     elif cmd == "check":

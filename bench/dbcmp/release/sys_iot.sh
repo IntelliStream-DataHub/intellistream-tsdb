@@ -115,7 +115,7 @@ iot_timed() { # one timed load into a fresh rb-iot: the loader, then (untimed by
 p2_iotz() { IOT_Z=1 p2_iot; }
 p2_iot() {
     local v=iot; [ "${IOT_Z:-0}" = 1 ] && v=iot-zstd
-    local D=$OUT/p2/$v W=$DBCMP/s2/$v r n Q="http 127.0.0.1 18080"
+    local D=$OUT/p2/$v${SWEEP_SUB-} W=$DBCMP/s2/$v r n Q="http 127.0.0.1 18080"
     # IoTDB's REST service answers a failed query with status 200 and {"code":...}: qdrive fails on that prefix
     local QDRIVE_ERR='{"code":'; export QDRIVE_ERR
     # code 719: IoTDB refuses a fragment whose estimated operator memory exceeds what is left of its pool. 32
@@ -158,7 +158,7 @@ p2_iot() {
     # its pools for one CPU, and pinned to PERCORE_CPU (taskset in front of a rootless podman run does not reach the
     # container: the processes are made by the pause process, so pc_pin pins them once it runs)
     crm rb-iot
-    if IOT_JMX="$IOT_JMX -XX:ActiveProcessorCount=1" iot_start "$W" -e query_thread_count=1 \
+    if want_pc && IOT_JMX="$IOT_JMX -XX:ActiveProcessorCount=1" iot_start "$W" -e query_thread_count=1 \
         -e degree_of_query_parallelism=1 && pc_pin rb-iot; then
         [ -s "$D/check-batch-iot.txt" ] && ! grep -qE 'mismatches [1-9]' "$D/check-batch-iot.txt" && PC=1 bsuite iot "$v" "$D" $Q "$IOT_HDR"
     fi
