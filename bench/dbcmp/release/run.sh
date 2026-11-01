@@ -464,7 +464,7 @@ FULLS_DEFAULT="0 3600 60"
 CLASSES_DEFAULT="raw agg1d agg7d point"
 qsuite() { # SYS PREFIX DIR DRIVER-ARGS...: whole range (warm-up, REPS runs of one query) and classes (3 s warm-up,
            # REPS x SECS at 1 and 32 clients); FULLS / CLASSES select ("" skips)
-    local S=$1 P=$2 D=$3 n c t
+    local S=$1 P=$2 D=$3 n c t a
     shift 3
     for n in ${FULLS-$FULLS_DEFAULT}; do
         "$B/qdrive" "$@" "$WORK/q/$S.full$n.txt" 1 100000 1 > "$D/warm.$P.full$n" 2>&1 9>&- || { fail "$P full$n warm-up failed (see $D/warm.$P.full$n)"; continue; }
@@ -472,7 +472,10 @@ qsuite() { # SYS PREFIX DIR DRIVER-ARGS...: whole range (warm-up, REPS runs of o
     done
     for c in ${CLASSES-$CLASSES_DEFAULT}; do
         "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" 1 "$WARM_SECS" > "$D/warm.$P.$c" 2>&1 9>&- || { fail "$P $c warm-up failed (see $D/warm.$P.$c)"; continue; }
-        for t in 1 $NHI; do reps "$P.$c.c$t" "$D" -- "$B/qdrive" "$@" "$WORK/q/$S.$c.txt" "$t" "$SECS"; done
+        for t in 1 $NHI; do
+            a=("$@"); [ "$t" != 1 ] && [ -n "${MANY_CONN-}" ] && a=("$1" "$MANY_CONN")
+            reps "$P.$c.c$t" "$D" -- "$B/qdrive" "${a[@]}" "$WORK/q/$S.$c.txt" "$t" "$SECS"
+        done
     done
 }
 qline() { # NAME DIR FILE DRIVER-ARGS...: one query (LTTB, TWA): a warm-up, then REPS runs
@@ -715,8 +718,10 @@ pc_restart() { # CONTAINER CONFIG_FILE START_CMD...: the per-core start: runtime
       echo "pinned to CPU $PERCORE_CPU (taskset, whole container tree): $(taskset -cp "$(podman inspect -f '{{.State.Pid}}' "$c")" 2>&1)"
       echo "threads: $(podman exec "$c" sh -c 'ls /proc/[0-9]*/task 2> /dev/null | grep -c "^[0-9]"' 2>&1)"; } > "$f" 2>&1
 }
+# MANY_CONN, when set, replaces the connection string (the second driver arg, "DRIVER CONN") in the classes with more
+# than one client: TimescaleDB's 32-client classes run with fewer parallel workers per query (ts_many_probe)
 bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
-    local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI}
+    local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} a
     shift 3
     [ "${PC:-0}" = 1 ] && { sfx=.pc; ths=1; }
     for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
@@ -728,7 +733,10 @@ bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
         for c in $BCLASSES; do
             f=$WORK/q/$S.$c.b$k.txt
             pc_client "$B/qdrive" "$@" "$f" 1 "$WARM_SECS" > "$D/warm.$P.$c.b$k$sfx" 2>&1 9>&- || { fail "$P $c.b$k warm-up failed (see $D/warm.$P.$c.b$k$sfx)"; continue; }
-            for t in $ths; do reps "$P.$c.b$k.c$t$sfx" "$D" -- pc_client "$B/qdrive" "$@" "$f" "$t" "$SECS"; done
+            for t in $ths; do
+                a=("$@"); [ "$t" != 1 ] && [ -n "${MANY_CONN-}" ] && a=("$1" "$MANY_CONN")
+                reps "$P.$c.b$k.c$t$sfx" "$D" -- pc_client "$B/qdrive" "${a[@]}" "$f" "$t" "$SECS"
+            done
         done
     done
 }
@@ -1265,6 +1273,35 @@ ts_timed() { # CONTAINER: the timed part of a load
     PSQL -c "VACUUM t100m" && echo "after VACUUM: $(PSQL -Atc "SELECT hypertable_size('t100m')")"
 }
 ts_ready() { [ "$(psql -h 127.0.0.1 -p 5434 -U postgres -Atc 'select 1' 2> /dev/null)" = 1 ]; }  # QREADY of rb-ts
+# 32 clients of 7-day batches of 100 series ran TimescaleDB out of memory at 48 GB with its defaults (2026-11-01): each
+# query is 100 UNION ALL branches that decompress their chunks, in up to 16 parallel workers per query (tune's
+# max_parallel_workers_per_gather), each worker with its own memory; work_mem (6 MB) bounds none of it. On a machine that
+# 32 clients already keep busy, fewer workers per query cost little, so the 32-client classes take the most workers of
+# TS_MANY_TRY that this class survives, and say so (many-parallel.txt, driver.log); 1-client classes keep the default.
+ts_many_probe() { # DIR CONN-PREFIX: sets MANY_CONN (the caller's local) unless every setting runs out of memory
+    local D=$1 base=$2 w rc f
+    (cd "$WORK" && python3 -I "$H/mkbatch.py" ts) || { fail "mkbatch ts"; return 1; }
+    for w in ${TS_MANY_TRY:-2 1 0}; do
+        f=$D/probe.par$w.txt
+        steplock -s
+        limited "$STEP_TIMEOUT" "$f" "$B/qdrive" pg "$base -c max_parallel_workers_per_gather=$w'" "$WORK/q/ts.agg7d.b100.txt" "$NHI" "$SECS"
+        rc=$?
+        stepunlock
+        ctr_mem rb-ts "$f"
+        if ctr_died rb-ts; then
+            log "  ts probe: max_parallel_workers_per_gather=$w at $NHI clients of agg7d.b100: $CTR_WHY"
+            ctr_restart rb-ts || { fail "ts probe: rb-ts did not serve again"; return 1; }
+            continue
+        fi
+        [ "$rc" = 0 ] || { log "  ts probe: max_parallel_workers_per_gather=$w: rc $rc (see $f)"; continue; }
+        MANY_CONN="$base -c max_parallel_workers_per_gather=$w'"
+        echo "max_parallel_workers_per_gather=$w in the $NHI-client classes (tried: ${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel.txt"
+        log "  ts: the $NHI-client classes run with max_parallel_workers_per_gather=$w (1-client classes: the default)"
+        return 0
+    done
+    echo "default in every class: out of memory at every setting tried (${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel.txt"
+    log "  ts: out of memory at every max_parallel_workers_per_gather tried; the $NHI-client classes keep the default"
+}
 p2_ts() {
     local QCTR=rb-ts QREADY=ts_ready
     local D=$OUT/p2/ts W=$DBCMP/s2/ts r
@@ -1283,6 +1320,8 @@ p2_ts() {
     cd "$WORK" || return 1
     python3 -I "$H/mkq.py" ts
     untimed "$D/check.txt" python3 -I "$H/check.py" ts 200
+    local MANY_CONN=
+    [ -n "${TS_MANY_TRY-x}" ] && ts_many_probe "$D" "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC"
     qsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
     bcheck ts "$D" && {
         for n in ${FULLS-$FULLS_DEFAULT}; do  # like with like (REPORT §3, §5.11): one query per series, 16 connections
