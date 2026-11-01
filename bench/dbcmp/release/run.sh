@@ -161,7 +161,7 @@ mem_cgroups() { # NAME CGDIR per line: every running rb-* container and tsdbd's 
 mem_sample() { # OUTFILE NAME CGDIR [NAME CGDIR...]: until killed, the peaks of each into OUTFILE (rewritten when one grows)
     local f=$1 i n cur res grew
     shift
-    local -a name dir pc pr
+    local -a name=() dir=() pc=() pr=()
     while [ $# -ge 2 ]; do name+=("$1"); dir+=("$2"); pc+=(0); pr+=(0); shift 2; done
     n=${#name[@]}
     [ "$n" -gt 0 ] || return 0

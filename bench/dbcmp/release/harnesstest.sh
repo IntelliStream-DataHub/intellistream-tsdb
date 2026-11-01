@@ -70,4 +70,8 @@ kill "$mp"; wait "$mp" 2> /dev/null
 want=$'rb-a peak 9000 nocache 777\ntsdbd peak 5000 nocache 55'
 if [ "$(cat "$M/out")" = "$want" ]; then echo "ok   mem_sample keeps each server's peaks"
 else echo "FAIL mem_sample wrote: $(cat "$M/out" | tr '\n' ';') want: ${want//$'\n'/;}"; fails=$((fails + 1)); fi
+# no server running (a step before any container starts): nothing to sample, no error under run.sh's set -u
+if (set -u; mem_sample "$M/none") 2> "$M/none.err" && [ ! -s "$M/none.err" ] && [ ! -e "$M/none" ]; then
+    echo "ok   mem_sample with no server returns quietly"
+else echo "FAIL mem_sample with no server: $(cat "$M/none.err")"; fails=$((fails + 1)); fi
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }
