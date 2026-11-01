@@ -9,10 +9,13 @@ its sd and min-max, the run count, and flags for runs on a busy machine, refused
 differs between runs, and the servers' peak memory over its runs (the OUT.mem files of run.sh's mem_sample: without
 the page cache, and with it, which is what a memory limit counts); a mean file without a timing line fails the script;
 then a line with each server's peak over all its timed steps, then loose.txt, answers that differ from
-tsdb's within a stated bound), and under them a "How it was run" table built from the how.json
+tsdb's within a stated bound, then the memory sweep of run.sh p6 (<dir>/memsweep: every class once, its peak memory
+and the sweep's), and under them a "How it was run" table built from the how.json
 files (how.py) plus footnotes: the '-' reasons, refusals and the per-core method. A system directory with results
 but no how.json, or a how.json without one of how.py's REQUIRED fields, fails the script (exit 1): no number goes
 out without the way it was measured.
+In batch classes (NAME.bK.cN: K windows per request) q/s counts requests for every system: qdrive's lines and relq's
+count requests; tsdbq's count windows, so their requests per second (q/s / K) are added beside them.
 """
 import glob, json, os, re, sys
 
@@ -129,6 +132,28 @@ def mem_line(d, prefix=""):
             "(sampled every 0.5 s): " + "; ".join(mem_cell({k: v}) for k, v in sorted(peaks.items())), ""]
 
 
+BATCH = re.compile(r"(?:^|\.)(?:raw|agg1d|agg7d|point|twa1d|twa7d)\.b(\d+)\.c\d+(?:\.pc)?$")
+QPS = re.compile(r"= (\d+(?:\.\d+)?) q/s")
+
+
+def batch_unit(name, lines):
+    """The unit of q/s in a batch class, so that nobody compares tsdbq's windows per second with another system's
+    requests per second: tsdbq's NAME.bK lines ("... q/s ... per request") count windows and get their requests per
+    second added; every other q/s line (qdrive, relq qps) counts requests and says so."""
+    m = BATCH.search(name)
+    if not m:
+        return lines
+    k, out = int(m.group(1)), []
+    for t, st in lines:
+        q = QPS.search(t)
+        if q and "per request" in t and "requests of" not in t:
+            t += " [q/s counts windows: %.1f requests/s of %d windows]" % (float(q.group(1)) / k, k)
+        elif q:
+            t += " [q/s counts requests of %d windows]" % k
+        out.append([t, st])
+    return out
+
+
 def results_table(d, prefix=""):
     rows = []
     for f in sorted(glob.glob(os.path.join(d, prefix + "*.mean.txt"))):
@@ -136,6 +161,7 @@ def results_table(d, prefix=""):
         mem = mem_cell(mem_peaks(g for g in glob.glob(os.path.join(d, name + ".*.mem"))
                                  if re.fullmatch(re.escape(name) + r"\.\d+\.mem", os.path.basename(g))))
         lines, nruns, flags = picked(f)
+        lines = batch_unit(name, lines)
         if not lines:
             errors.append("%s: no timing in it (a failed or empty run?)" % f)
             flags.append("NO TIMING")
@@ -148,6 +174,33 @@ def results_table(d, prefix=""):
     return ["| measurement | mean over the runs | sd %, [min-max] per number | runs | "
             "peak memory, without / with page cache | flags |",
             "|---|---|---|---|---|---|"] + rows
+
+
+def sweep_table(d):
+    """d/memsweep (run.sh p6): one load and every class once, each with mem_sample: the server's peak memory per class
+    and over the whole sweep. One run per class: never averaged, never in the timing table."""
+    s = os.path.join(d, "memsweep")
+    files = sorted(glob.glob(os.path.join(s, "*.mem")))
+    if not files:
+        return []
+    by = {}
+    for f in files:  # NAME.<run>.mem (reps), NAME.txt.mem (one tstep), load.<run>.mem
+        by.setdefault(re.sub(r"\.(?:\d+|txt)$", "", os.path.basename(f)[:-len(".mem")]), []).append(f)
+    rows = ["| class (one run) | peak memory, without / with page cache | flags |", "|---|---|---|"]
+    for n, fs in sorted(by.items()):
+        flags = ["%s %s" % (len(glob.glob(os.path.join(s, n + "*." + ext))), what) for ext, what in
+                 (("refused", "refused"), ("oom", "killed out of memory"), ("died", "server died"))
+                 if glob.glob(os.path.join(s, n + "*." + ext))]
+        rows.append("| %s | %s | %s |" % (cell(n), mem_cell(mem_peaks(fs)) or "-", cell("; ".join(flags))))
+    peaks = mem_peaks(files)
+    out = ["", "Memory sweep (run.sh p6: one load, then every class above once, per core left out; one run each, not "
+           "averaged): the server's peak memory per class, without / with the page cache (sampled every 0.5 s)", ""]
+    out += rows + ["", "Peak over the whole sweep (load included): " +
+                   ("; ".join(mem_cell({k: v}) for k, v in sorted(peaks.items())) or "-")]
+    r = os.path.join(s, "REFUSED.txt")
+    if os.path.exists(r):
+        out += ["", "Refused or died in the sweep:", ""] + ["- " + cell(l.strip()) for l in open(r) if l.strip()]
+    return out + [""]
 
 
 def loose_notes(d):
@@ -181,7 +234,10 @@ def phase1(out, p):
 
 
 def phase2(out, p):
-    out += ["## Phase 2: the mixed table, server systems", ""]
+    out += ["## Phase 2: the mixed table, server systems", "",
+            "In batch classes (NAME.bK.cN, K windows per request) q/s counts requests for every system; tsdbq counts "
+            "windows, so its requests per second are added in brackets. KIND.b100.c1 of tsdb is its whole-range TWA "
+            "of every series in one request (QUERY_MULTI), the form one SQL query has in the other systems.", ""]
     hows = []
     for d in sorted(glob.glob(os.path.join(p, "*/"))):
         d = d.rstrip("/")
@@ -195,7 +251,8 @@ def phase2(out, p):
         if not h:
             continue
         hows.append(h)
-        out += ["### %s" % h["system"], ""] + (t or ["(no timed measurements)"]) + mem_line(d) + loose_notes(d) + [""]
+        out += ["### %s" % h["system"], ""] + (t or ["(no timed measurements)"]) + mem_line(d) + loose_notes(d) + \
+            sweep_table(d) + [""]
     out += how_table(hows, COLS)
 
 
