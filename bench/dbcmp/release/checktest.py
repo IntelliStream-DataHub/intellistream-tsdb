@@ -174,6 +174,24 @@ def lttb_cases():
         else: os.environ["DATA"] = old
         shutil.rmtree(d)
 
+def exit_cases(ref):
+    """rel.py jsonl and tsv exit 1 on a mismatch (run.sh's callers rely on it, besides grepping MISMATCH), 0 when the
+    answers agree."""
+    d = tempfile.mkdtemp()
+    try:
+        r, good, bad, tsv = (os.path.join(d, x) for x in ("ref.jsonl", "good.jsonl", "bad.jsonl", "bad.tsv"))
+        with open(r, "w") as f: f.writelines(json.dumps(e) + "\n" for e in ref.values())
+        shutil.copy(r, good)
+        m = copy.deepcopy(ref); s0 = next(s for s in m if m[s]["b"]); m[s0]["b"][0][1] *= 1.01
+        with open(bad, "w") as f: f.writelines(json.dumps(e) + "\n" for e in m.values())
+        with open(tsv, "w") as f: f.writelines("\t".join(map(str, x)) + "\n" for x in twa_rows(m))
+        run = lambda *a: subprocess.run([sys.executable, "-I", os.path.join(HERE, "rel.py"), *a], capture_output=True).returncode
+        case("rel.py jsonl: the same answers exit 0", True, run("jsonl", "twa", r, good) == 0)
+        case("rel.py jsonl: a mismatch exits 1", False, run("jsonl", "twa", r, bad) != 1)
+        case("rel.py tsv: a mismatch exits 1", False, run("tsv", "twa", r, tsv) != 1)
+    finally:
+        shutil.rmtree(d)
+
 def batch_cases():
     """rel.py qb / checkb, the TWA window batches: each member's WITH tables renamed apart, its rows mapped back to its
     window by the member column; a member answered with another's rows, a missing or an extra member, a wrong value
@@ -248,6 +266,7 @@ def main():
     decimal_cases()
     lttb_cases()
     batch_cases()
+    exit_cases(ref)
     if len(a) >= 4:
         windows_cases(a[2], a[3])
     print("checktest", "OK" if failures == 0 else f"FAILED ({failures} cases)")

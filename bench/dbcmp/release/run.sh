@@ -299,8 +299,9 @@ untimed() { # OUTFILE CMD...: a step that is not a timing (checks, dumps, sizes)
     fi
     # UNTIMED_SOFT: an answer check whose mismatch is a result to report (a stated bound missed), not a harness failure
     [ "$rc" = 1 ] && [ -n "${UNTIMED_SOFT-}" ] && grep -q MISMATCH "$out" && ! grep -q Traceback "$out" && return 2
-    [ "$rc" = 0 ] || { fail "$(basename "$out"): rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${lim}s)") (see $out)"; return 1; }
+    # before the exit code: a checker that exits 1 on a mismatch (rel.py) is named by its mismatch in FAILS
     case $(basename "$out") in check*) grep -qE 'mismatches [1-9]|MISMATCH|Traceback' "$out" && { fail "answer check: $(grep -m1 -E 'mismatches [1-9]|MISMATCH|Traceback' "$out" | cut -c1-150) ($out)"; return 1; } ;; esac
+    [ "$rc" = 0 ] || { fail "$(basename "$out"): rc $rc$([ "$rc" = 124 ] && echo " (STEP TIMEOUT ${lim}s)") (see $out)"; return 1; }
     return 0
 }
 runstats() { python3 -I "$TOOLS/runstats.py" "$1" >> "$OUT/driver.log" 2>&1; }
@@ -901,6 +902,7 @@ tsdb_self() { # TAG: tsdbd's answers now against its references (cwd WORK): the 
     local G=$1 k w=self rc=0
     mkdir -p "$w"
     if [ "$G" = merged ]; then
+        # rel.py jsonl exits 1 on a mismatch: rc=1, and untimed (check-self*) names the MISMATCH line in FAILS
         { "$TB/tsdbq" dump spec.tsv 200 > "$w/$G-windows.jsonl" && "$TB/tsdbq" full 1 1 dump 2> "$w/$G-full.jsonl"; } \
             || { echo "MISMATCH: tsdbq dump failed"; rc=1; }
         python3 -I "$H/check.py" --dumps ref/windows.jsonl ref/full.jsonl "$w/$G-windows.jsonl" "$w/$G-full.jsonl" || rc=1
@@ -1195,6 +1197,8 @@ p2_tsdb() {
     load_ok "p2 tsdb" || return 1
     ports_check "$D/ports.txt"
     cd "$WORK" || return 1
+    # p6 (the sweep) writes ref/ again: the same input loaded the same way gives the same answers, and every later
+    # check compares with these
     untimed "$D/ref-windows.log" sh -c "'$TB/tsdbq' dump spec.tsv 200 > ref/windows.jsonl"
     untimed "$D/ref-full.log" sh -c "'$TB/tsdbq' full 1 1 dump 2> ref/full.jsonl"
     untimed "$D/ref-lttb.log" "$B/relq" lttb 1 1 ref/lttb.jsonl
@@ -1617,7 +1621,7 @@ sys.stdout.writelines(l for l in open(sys.argv[2]) if json.loads(l)["i"] in ids)
         for e in duckdb chdb chdb-lz4; do python3 -I "$H/check.py" --dumps dump/tsdb-windows.jsonl dump/tsdb-full.jsonl "dump/$e-windows.jsonl" "dump/$e-full.jsonl"; done
         REL jsonl lttb "$RL" dump/tsdb-lttb.jsonl
         REL jsonl twa "$RT" dump/tsdb-twa.jsonl
-    } > "$D/check.txt" 2>&1
+    } > "$D/check.txt" 2>&1  # every answer compared even after a mismatch (exit codes ignored): the grep judges
     grep -E 'mismatches [1-9]|MISMATCH|Traceback|Error' "$D/check.txt" > /dev/null && fail "p3 answer check found mismatches (see $D/check.txt)"
     # whole range
     tstep "p3 tsdb full t1" "$D/tsdb.full.t1.txt" -- "$TB/embq" tsdb full "$E/tsdb" "$REPS" 1

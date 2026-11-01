@@ -158,4 +158,11 @@ P6_SYSTEMS="tsdb qdb0 broken" RESUME=1 phase6
 expect "phase6: RESUME=1 skips done systems and keeps the sweep" "[ \$(grep -c p2_sys '$X6/p6.log') = 1 ] && [ -e '$OUT/p2/broken/memsweep/load.1' ] && [ ! -d '$OUT/old' ]"
 P6_SYSTEMS="broken" phase6
 expect "phase6: a rerun without RESUME moves the old sweep to OUT/old" "ls -d '$OUT'/old/p6-broken-memsweep.* > /dev/null 2>&1"
+# untimed: a check that exits 1 on a mismatch (rel.py jsonl) is named by its MISMATCH line in FAILS, as when it exited 0
+eval "$(sed -n -e '/^untimed() {/,/^}/p' "$HERE/run.sh")"
+fail() { echo "fail: $*" >> "$X6/ufails"; }
+UNTIMED_TIMEOUT=60 CHECK_TIMEOUT=60 QCTR= untimed "$X6/check-u.txt" sh -c 'echo "x twa MISMATCH"; exit 1'; rc=$?
+expect "untimed: a mismatch exiting 1 fails with its MISMATCH line" "[ $rc = 1 ] && grep -q 'answer check: x twa MISMATCH' '$X6/ufails'"
+UNTIMED_TIMEOUT=60 CHECK_TIMEOUT=60 QCTR= untimed "$X6/check-v.txt" sh -c 'echo "x twa OK"'; rc=$?
+expect "untimed: a passing check passes" "[ $rc = 0 ] && [ \$(wc -l < '$X6/ufails') = 1 ]"
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }

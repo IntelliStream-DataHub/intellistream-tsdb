@@ -7,8 +7,8 @@
 #   python3 -I rel.py has SYS KIND        exit 0 when SYS has a query for KIND ('-' in the tables otherwise)
 #   python3 -I rel.py check SYS KIND REF  run it on the server (ports of bench/dbcmp/README.md), compare; exit 1 on a
 #                                         mismatch, 3 when the server cannot be reached ("SERVER DOWN")
-#   python3 -I rel.py tsv KIND REF FILE   compare a TSV answer file (embq/chq OUT) with REF
-#   python3 -I rel.py jsonl KIND REF FILE compare another relq/relemb dump with REF
+#   python3 -I rel.py tsv KIND REF FILE   compare a TSV answer file (embq/chq OUT) with REF; exit 1 on a mismatch
+#   python3 -I rel.py jsonl KIND REF FILE compare another relq/relemb dump with REF; exit 1 on a mismatch
 #   python3 -I rel.py qb SYS KIND K       window kinds in batches: K consecutive windows per request (the groups of
 #                                         batches.py: whole groups only), one request line each (q/SYS.KIND.bK.txt)
 #   python3 -I rel.py checkb SYS KIND K REF   run every batch of FILE q/SYS.KIND.bK.txt (which must be qb's lines)
@@ -628,6 +628,7 @@ def main():
         kind, ref, f = sys.argv[2:5]
         ok = compare(kind, load_ref(ref), [l.rstrip("\n").split("\t") for l in open(f) if l.strip()])
         print(f, kind, "OK" if ok else "MISMATCH")
+        if not ok: raise SystemExit(1)
     elif cmd == "jsonl":
         kind, ref, f = sys.argv[2:5]
         rows = []
@@ -636,6 +637,7 @@ def main():
             else: rows += [[x.get("i", x["s"]), b[0], b[1], b[2]] for b in x["b"]]
         ok = compare(kind, load_ref(ref), rows)
         print(f, kind, "OK" if ok else "MISMATCH")
+        if not ok: raise SystemExit(1)
 
 def server_down(e):
     """True when e says the server could not be reached or went away: reported as SERVER DOWN (exit 3), not as a
