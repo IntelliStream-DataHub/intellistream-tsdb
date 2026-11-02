@@ -839,7 +839,9 @@ static void test_hung_volume(const char *base)
     CHECK(!__atomic_load_n(&c.done, __ATOMIC_ACQUIRE)); /* the same name waits for the first creation */
     int r = open(fifo, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     CHECK(r >= 0);
-    for (int i = 0; i < 1000 && r >= 0 && !(a.done && c.done); i++) {
+    for (int i = 0; i < 1000 && r >= 0 &&
+                    !(__atomic_load_n(&a.done, __ATOMIC_ACQUIRE) && __atomic_load_n(&c.done, __ATOMIC_ACQUIRE));
+         i++) {
         while (read(r, buf, sizeof buf) > 0)
             ;
         usleep(10000);
