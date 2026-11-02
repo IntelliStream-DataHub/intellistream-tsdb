@@ -218,4 +218,19 @@ mkdir -p "$X6/nr"; cp "$X6/check-r.txt" "$X6/nr/check-r.txt"
 nocheck x r "$X6/nr" 4
 expect "nocheck: a refusal goes to dash.txt and REFUSED.txt with the server's message" \
     "grep -q 'refused the query: HTTP 400: global RSS' '$X6/nr/dash.txt' && grep -q 'check-r: refused by the server: HTTP 400' '$X6/nr/REFUSED.txt'"
+# tools/scale-bench-ch.sh: the mean is wall time over the queries, not 1000 / clickhouse-benchmark's rounded QPS
+# (0.009 q/s printed as 111111.111 ms); the server's query_log mean and median follow
+SB=$T/sbch; mkdir -p "$SB/sql"; printf 'SELECT 1 FROM big\nSELECT 2 FROM big\n' > "$SB/sql/agg_all.sql"
+cat > "$SB/ch" << 'EOS'
+#!/bin/sh
+case $1 in
+benchmark) cat > /dev/null; sleep 0.3; printf 'Loaded 2 queries.\n127.0.0.1:9000, queries 2, QPS: 0.009, RPS: 1.0\n50%%\t0.150 sec.\n' ;;
+client) printf '2\t149.500\t149.250\n' ;;
+esac
+EOS
+chmod +x "$SB/ch"
+l=$(sh "$HERE/../../../tools/scale-bench-ch.sh" "$SB/sql" big "$SB/ch")
+m=$(echo "$l" | awk '{ print $5 }')
+expect "scale-bench-ch: mean from wall time (about 150 ms), not 1000 / rounded QPS" \
+    "awk -v m='$m' 'BEGIN { exit !(m > 140 && m < 400) }' && echo '$l' | grep -q 'p50    150.000 ms  server: 2 q, mean 149.500 ms, median 149.250 ms'"
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }
