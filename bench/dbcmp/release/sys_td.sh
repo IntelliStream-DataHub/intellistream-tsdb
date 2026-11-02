@@ -16,7 +16,7 @@
 # Settle: TDengine has no automatic compaction in the community edition (COMPACT_INTERVAL is Enterprise), so the
 # settle is FLUSH DATABASE, COMPACT DATABASE, and SHOW COMPACTS empty with the vnode files unchanged for TD_STABLE s.
 TD_HDR=$'Authorization: Basic cm9vdDp0YW9zZGF0YQ==\r\n'   # root:taosdata, the default user
-TD_MEM=${TD_MEM:-24g}
+TD_MEM=${TD_MEM:-$SERVER_MEM}
 TD_STABLE=${TD_STABLE:-60}
 TD_P2_VGROUPS=${TD_P2_VGROUPS:-16}  # phase 2: 16 vgroups for 16 cores (planning docs: a core serves 1 to 2 vnodes; default 2)
 TD_SETTLE_MAX=${TD_SETTLE_MAX:-10800}
@@ -126,7 +126,7 @@ td_timed() { td_load "$TD_LP" cmp; }   # one timed load into a fresh rb-td; sett
 p2_tdz() { TD_Z=1 p2_td; }
 p2_td() {
     local v=td; [ "${TD_Z:-0}" = 1 ] && v=td-zstd
-    local D=$OUT/p2/$v W=$DBCMP/s2/$v r n Q="http 127.0.0.1 6041"
+    local D=$OUT/p2/$v${SWEEP_SUB-} W=$DBCMP/s2/$v r n Q="http 127.0.0.1 6041"
     # taosAdapter answers an error with HTTP 4xx/5xx and {"code":N,"desc":...}; a success also has "code" (0)
     local QDRIVE_ERR_SUB='"desc":'; export QDRIVE_ERR_SUB
     mkdir -p "$D"
@@ -169,7 +169,9 @@ p2_td() {
     # PARTITION BY ... INTERVAL(60s) queries) stayed 85 minutes in SHOW QUERIES with its merge tasks in "retry" and its
     # scans "partial_succeed", answering nothing. TD_PC_THREADS=N sets it anyway (N >= 2 untested).
     local pc=1 i n
-    if [ -n "${TD_PC_THREADS:-}" ]; then
+    if ! want_pc; then
+        pc=0
+    elif [ -n "${TD_PC_THREADS:-}" ]; then
         pc=0
         if ctr_alive rb-td "p2 $v before per core" &&
             td_sql "" "ALTER DNODE 1 'numOfVnodeQueryThreads' '$TD_PC_THREADS'" > "$D/config.pc.txt" &&

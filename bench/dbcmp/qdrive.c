@@ -103,7 +103,10 @@ static void *run(void *arg)
             PGresult *r = PQexec(pg, q);
             int st = PQresultStatus(r);
             if (st != 1 && st != 2) {
-                fprintf(stderr, "query failed: %s\n%.300s\n", PQresultErrorMessage(r), q);
+                /* no result at all (the connection was gone before or while sending) has no result error: the
+                 * reason is the connection's (QuestDB under 32 clients of 100-window batches printed nothing) */
+                const char *e = r ? PQresultErrorMessage(r) : "";
+                fprintf(stderr, "query failed: status %d: %s\n%.300s\n", st, *e ? e : PQerrorMessage(pg), q);
                 exit(1);
             }
             j->rows += (unsigned long long)PQntuples(r);

@@ -4,6 +4,9 @@
   python3 -I how.py write PHASE SYS OUT    OUT/p<PHASE>/<dir>/how.json (phase 2) or OUT/p<PHASE>/how-<SYS>.json
                                            (phases 1, 3, 4: one directory holds every system's files)
   python3 -I how.py check FILE...          every required field present and non-empty (exit 1 otherwise)
+  python3 -I how.py p6 DIR                 the "p6" block of DIR/how.json (run.sh p6, the extra pass): when it ran, its
+                                           runs (XREPS), the tsdb tree and the harness commit, its '-' reasons
+                                           (DIR/p6/dash.txt) and refusals (DIR/p6/REFUSED.txt, DIR/memsweep/REFUSED.txt)
 
 The static part (settings, durability, loader, query client, what one query is, per-core method) is SYSTEMS below:
 the facts behind each line are in run.sh, sys_*.sh and bench/dbcmp/README.md, and a change to how a system runs
@@ -11,7 +14,7 @@ changes its line here in the same commit. Written at run time: the image with it
 the tsdb tree and commit, REPS, SECS, batch sizes, smoke or not, and the '-' reasons (dash.txt) and refusals
 (REFUSED.txt) of that run. tables.py reads these files and fails on a missing field.
 """
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
 
 REQUIRED = ["system", "version", "image", "settings", "durability", "loader", "query_client", "connections",
             "one_query", "per_core", "warmups", "runs", "dash"]
@@ -24,13 +27,18 @@ PIN = ("the server's process tree pinned to CPU {cpu} by taskset (rootless Podma
 WARM_SRV = ("whole range: one warm-up run, then REPS runs of the one query; random-window classes: " + os.environ.get("WARM_SECS", "3") + " s warm-up "
             "on 1 connection, then REPS runs of SECS s per connection count; LTTB/TWA: one warm-up, then REPS runs")
 
+MEM = os.environ.get("SERVER_MEM", "48g")
+LIMIT = ("memory limit %s for every server, tsdbd too (SERVER_MEM: a cgroup, no swap; a server that outgrows it is "
+         "killed by the kernel and that is a result: REFUSED.txt, flags in the tables)" % MEM)
+
 PASTA = (" (pasta, rootless Podman's port forwarding: the server binds every address; its per-request cost is "
          "measured on VictoriaMetrics: p2/vm vm.pasta.point.* against vm.point.*)")
 SYSTEMS = {
     "tsdb": dict(
         system="tsdb (tsdbd)", image_env=None,
         settings=["defaults (wal_sync_ms 0, 1-day partitions, 8192-row granules)", "--listen 127.0.0.1 --port 0 "
-                  "--port-file", "also measured after merges (tsdb_optimize: one part per partition)"],
+                  "--port-file", "also measured after merges (tsdb_optimize: one part per partition)",
+                  "tsdbd in a systemd scope with " + LIMIT.split(" (SERVER_MEM")[0] + " (peak in tsdbd-mem.txt)"],
         durability="WAL fsynced before every acknowledgement (group commit); large inserts as parts, fsynced",
         loader="tsdbc-bench load: RowBinary input, 4 connections, compressed packed inserts (protocol 10)",
         query_client="tsdbq (C client library, tsdb's binary protocol over TCP; protocol 10)",
@@ -42,7 +50,10 @@ SYSTEMS = {
         system="ClickHouse (server)", image_env="CH_IMG",
         settings=["listen_host 127.0.0.1; server defaults otherwise", "MergeTree PARTITION BY toYYYYMM(ts) ORDER BY "
                   "(series, ts); DoubleDelta / Gorilla + ZSTD(1)", "phase 1 also: default LZ4, OPTIMIZE FINAL, and "
-                  "ZSTD(22) after OPTIMIZE FINAL (ClickHouse's smallest lossless setting)"],
+                  "ZSTD(22) after OPTIMIZE FINAL (ClickHouse's smallest lossless setting)", "container " + LIMIT,
+                  "phase 2: settled when no merge runs and the part count is unchanged for 180 s (parts per partition "
+                  "before and after the suites in parts-*.txt); beside the main rows, 'merged.*' rows after OPTIMIZE FINAL "
+                  "(one part per partition, like tsdb's merged rows)"],
         durability="not fsynced at acknowledgement (fsync_after_insert 0, the default); syncfs after the load, timed",
         loader="ch_load.sh: one RowBinary INSERT through clickhouse client (native protocol); merges settled",
         query_client="qdrive over HTTP (port 8123, TabSeparated replies), the same driver and client wall time as "
@@ -57,7 +68,10 @@ SYSTEMS = {
         settings=["every port bound to 127.0.0.1", "PARTITION BY DAY WAL, series SYMBOL", "telemetry off",
                   "http.request.header.buffer.size 1 MB (64 KB refuses the answer check's batch-of-100 URLs)",
                   "cairo.reader.pool.max.segments 128 (the default 10 refuses 32 connections of 100-series batches: "
-                  "'table busy [reason=pool size exceeded]')"],
+                  "'table busy [reason=pool size exceeded]')", "container " + LIMIT + "; relbench3 ran it without a limit and "
+                  "the kernel's global OOM killer ended it twice at 57-59 GB resident",
+                  "a server that dies in a class is started again and the class run once more; deaths are listed in "
+                  "the notes"],
         durability="not fsynced at acknowledgement (cairo.commit.mode nosync, the default); WAL applied and sync "
                    "after the load, timed",
         loader="loadlp: InfluxDB line protocol over HTTP /write, 100000 lines per request, 8 connections",
@@ -71,7 +85,7 @@ SYSTEMS = {
         system="TimescaleDB", image_env="TS_IMG",
         settings=["listen_addresses 127.0.0.1", "timescaledb-tune 24GB / 32 CPUs", "work_mem: timescaledb-tune's for "
                   "the plain server; 256MB for the timescaledb-ha server of TWA and LTTB (tune's 6 MB spills TWA's window "
-                  "sorts)", "container memory limit 24 GB (TS_MEM): 32 clients of 100-series batches grew to ~1.7 GB per backend "
+                  "sorts)", "container " + LIMIT + " (TS_MEM; 24 GB in relbench3): 32 clients of 100-series batches grew to ~1.7 GB per backend "
                   "at either work_mem; an OOM kill is reported as such", "max_wal_size 16GB", "/dev/shm 8 GB (Podman's default 64 MB fails parallel queries)", "hypertable, 1-day chunks, compressed "
                   "(segmentby series, orderby ts)", "TWA and LTTB of the toolkit run in the timescaledb-ha image"],
         durability="fsync at commit (synchronous_commit on, the default)",
@@ -84,7 +98,7 @@ SYSTEMS = {
     "i2": dict(
         system="InfluxDB 2 (InfluxQL and Flux)", image_env="I2_IMG",
         settings=["http-bind-address 127.0.0.1:8086", "storage-compact-full-write-cold-duration 1m",
-                  "container memory 24g", "settle: bench/dbcmp/i2_settle.sh"],
+                  "container memory " + MEM + " (relbench3: 24g)", "settle: bench/dbcmp/i2_settle.sh"],
         durability="WAL fsynced before acknowledgement (the default)",
         loader="loadlp: line protocol over HTTP /api/v2/write, 5000 lines per request, 8 connections",
         query_client=QDRIVE + "; HTTP (InfluxQL /query and Flux /api/v2/query)",
@@ -97,7 +111,7 @@ SYSTEMS = {
         system="InfluxDB 3 Core", image_env="I3_IMG",
         settings=["--http-bind 127.0.0.1:8181 --without-auth", "--object-store file", "--exec-mem-pool-size 8GB "
                   "--file-cache-size 4GB --force-snapshot-mem-size 10GB --query-file-limit 1000000",
-                  "container memory 28g", "queried once Parquet is written (snapshot settled)"],
+                  "container memory " + MEM + " (28g before)", "queried once Parquet is written (snapshot settled)"],
         durability="acknowledged once the WAL file of the flush interval (1 s) is written to the object store "
                    "(local files); fsync not verified here",
         loader="loadlp: line protocol over HTTP /api/v3/write_lp, 100000 lines per request, 16 connections",
@@ -109,7 +123,7 @@ SYSTEMS = {
     "iot": dict(
         system="Apache IoTDB (table model)", image_env="IOT_IMG",
         settings=["wal_mode=SYNC", "compaction_write_throughput_mb_per_sec=0", "query_timeout_threshold=3600000",
-                  "REST on 18080 published on 127.0.0.1 only" + PASTA, "heap -Xmx16G, direct 4G, container 24g",
+                  "REST on 18080 published on 127.0.0.1 only" + PASTA, "heap -Xmx16G, direct 4G, container " + MEM,
                   "float encoding GORILLA, compressor LZ4 (default)"],
         durability="WAL fsynced before acknowledgement (wal_mode SYNC; default ASYNC)",
         loader="iotload.py: Python TableSession tablets over the native RPC (6667), 100000 rows per tablet, 8 "
@@ -123,7 +137,7 @@ SYSTEMS = {
         system="TDengine (community)", image_env="TD_IMG",
         settings=["CREATE DATABASE ... WAL_LEVEL 2 WAL_FSYNC_PERIOD 0 PRECISION 'ms'; phase 2 with VGROUPS 16 (default 2; TDengine's planning docs: a core serves 1 to 2 vnodes)", "taosKeeper, taosExplorer, "
                   "taosX off", "REST on 6041 published on 127.0.0.1 only" + PASTA, "value FLOAT: ENCODE bss COMPRESS lz4 "
-                  "LEVEL medium (default)", "container memory 24g"],
+                  "LEVEL medium (default)", "container memory " + MEM],
         durability="WAL fsynced before acknowledgement (WAL_LEVEL 2, WAL_FSYNC_PERIOD 0; default WAL_LEVEL 1)",
         loader="loadlp: line protocol through taosAdapter /influxdb/v1/write (schemaless), 100000 lines per "
                "request, 8 connections. TDengine's documented fastest path (stmt over WebSocket) is not used, so "
@@ -312,6 +326,40 @@ def write(phase, sysname, out):
     print(f)
 
 
+def p6(d):
+    """The extra pass's own facts, beside phase 2's in the same how.json: its timings come from another load."""
+    f = os.path.join(d, "how.json")
+    h = json.load(open(f))
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        harness = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                                 timeout=10).stdout.strip()
+    except OSError:
+        harness = ""
+    dash = {}
+    for l in lines(os.path.join(d, "p6", "dash.txt")):
+        k, _, why = l.partition(":")
+        dash[k.strip()] = why.strip()
+    v, tree = tsdb_version()
+    h["p6"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"),
+        "runs": "REPS=%s runs per TWA batch class (p6/*.mean.txt); every other class once into memsweep/ (peak memory "
+                "only, never averaged)" % os.environ.get("XREPS", "?"),
+        "tsdb": "%s, %s" % (v, tree),
+        "harness": "%s at %s" % (os.path.abspath(os.path.join(here, "..", "..", "..")), harness or "?"),
+        "dash": dash,
+        "refused": lines(os.path.join(d, "p6", "REFUSED.txt")) +
+                   ["memory sweep: " + l for l in lines(os.path.join(d, "memsweep", "REFUSED.txt"))],
+        "note": "the extra pass loads the data once more: its TWA batch timings come from that load, not from the "
+                "load of phase 2's rows",
+    }
+    with open(f, "w") as o:
+        json.dump(h, o, indent=1, sort_keys=True)
+        o.write("\n")
+    check([f])
+    print(f, "p6")
+
+
 def check(files):
     bad = 0
     for f in files:
@@ -327,6 +375,8 @@ def check(files):
 if __name__ == "__main__":
     if len(sys.argv) == 5 and sys.argv[1] == "write":
         write(*sys.argv[2:5])
+    elif len(sys.argv) == 3 and sys.argv[1] == "p6":
+        p6(sys.argv[2])
     elif len(sys.argv) > 2 and sys.argv[1] == "check":
         check(sys.argv[2:])
     else:

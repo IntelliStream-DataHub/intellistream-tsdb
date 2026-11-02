@@ -45,7 +45,8 @@ static inline void pack(const uint32_t *in, size_t n, int w, uint8_t *out)
     }
 }
 
-/* One 8-byte load per value; with w a constant the compiler unrolls and vectorizes. */
+/* One 8-byte load per value, w a constant. GCC does not vectorize this (the -O3 assembly is one value per
+ * iteration at every CPU level); SIMD unpacking is on the roadmap. */
 #define UNPACK_W(W)                                                                     \
     static inline void unpack_##W(const uint8_t *in, size_t n, uint32_t *out)                 \
     {                                                                                   \

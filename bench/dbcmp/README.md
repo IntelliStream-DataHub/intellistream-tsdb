@@ -367,7 +367,7 @@ python3 -I $H/check.py prom 200 && $H/qbench.sh prom http 127.0.0.1 9090 ""     
 These three are run only by the release driver (`release/run.sh`, "Release run" below); there are no
 hand steps for them. Each has its own file in `release/`, whose header lists every setting that is not
 the default and why. The images are pinned by digest in `release/env.sh`. Each runs in its own
-container (`rb-iot`, `rb-td`, `rb-vm`) with a 24 GB memory limit, ports published on 127.0.0.1 only.
+container (`rb-iot`, `rb-td`, `rb-vm`) with the memory limit of every server (`SERVER_MEM`, 48 GB), ports published on 127.0.0.1 only.
 
 **Apache IoTDB** (`apache/iotdb:2.0.11-standalone`, table model, `sys_iot.sh`)
 
@@ -570,6 +570,7 @@ bench/dbcmp/release/run.sh checktest   # the answer checker must catch planted m
 | `p3` | embedded: tsdb, DuckDB, chDB | `p3/` |
 | `p4` | Prometheus: backfill and remote write | `p4/` |
 | `p5` | 100 billion rows, tsdb and ClickHouse (only when named; not in `all`) | `p5/` |
+| `p6` | an extra pass over p2's systems: the TWA batches, and each class's peak memory (only when named) | `p2/<system>/p6/`, `p2/<system>/memsweep/` |
 
 Every phase writes `PHASE n DONE` or `PHASE n FAILED: why` to `driver.log`, and `steps.log` has one line per
 step (rc, seconds, how busy the machine was). A phase or system that is done is skipped on the next call;
@@ -578,7 +579,22 @@ step (rc, seconds, how busy the machine was). A phase or system that is done is 
 "How it was run" table built from the `how.json` files (system, version, image digest, settings that are
 not the default, durability, loader, query client, connections, what one query is, the one-core method,
 warm-ups, runs, and why a cell is `-`). Queries a server refused (out of memory, its own limits) are listed
-in `REFUSED.txt` and not timed; a server the kernel killed for memory is started again.
+in `REFUSED.txt` and not timed. A server that dies in a class (the kernel killed it at its memory limit, or it
+stopped) is recorded there, started again on the same data, and the class run once more; if it dies again the
+class ends (its other runs are skipped). A check that cannot reach the server says `SERVER DOWN` (exit 3), not
+"answers differ".
+
+A rerun after a death or a harness fix does not repeat what was measured: `RESUME=1` skips the timed steps that
+ended with rc 0 in `steps.log` (loads always run, since the data is gone) and `LOADS_FROM=5` loads once instead of
+five times, e.g. `FORCE=1 RESUME=1 LOADS_FROM=5 P2_SYSTEMS=qdb0 release/run.sh p2`.
+
+**One memory limit for every server (`SERVER_MEM`, default 48g).** The release run of 2026-10-29 gave
+the containers 24 to 28 GB (QuestDB and ClickHouse none) and tsdbd none, which was not the same test: QuestDB took
+57 to 59 GB twice and the kernel's global OOM killer ended it, one variant died of address space (`mmap`) at 564 GB
+of mapped files, and TimescaleDB was killed at its 24 GB limit by 32 clients of 100-series batches. Now every
+container (`--memory`, no swap) and tsdbd (a `systemd-run --user --scope -p MemoryMax=`) get the same limit, and
+a server that outgrows it is killed by its own cgroup, which is a result. `tsdbd-mem.txt` and each container's
+`mem.txt` record the peak (page cache included).
 
 Timed steps wait for the CPU governor to be `performance` and for the machine to be idle, and take
 `BENCH_LOCK` exclusively; other steps take it shared. Every step has a time limit.
@@ -589,6 +605,57 @@ InfluxDB 3's snapshots) and for other benchmarks holding the lock: phase 1 22 mi
 phase 3 2 min, phase 4 33 min. The full run on 100 M rows takes many hours (Prometheus' remote write
 alone several); run it under `tmux` or `nohup`.
 
+### TWA in batches, and the extra pass (p6)
+
+The other systems answer a whole-table TWA for all 100 series in one SQL query. tsdb can do the same with one
+QUERY_MULTI request (protocol 10), so it is measured that way too: `twa.b100.c1`, `twad.b100.c1` and
+`twal.b100.c1` are every series in one request on one connection (`relq KIND 1 1 --batch 100`). The older
+`twa.c1` and `twa.c16` rows are one request per series.
+
+The TWA windows (`twa1d`, `twa7d`: 1000 random 1-day and 7-day windows) also come in batches now, like the
+aggregate classes: 10 or 100 windows per request, at 1 and 32 clients. tsdb sends one QUERY_MULTI per batch
+(`relq qps twa1d.b10 ...`). The SQL systems send one query per batch: the windows' queries joined with UNION ALL,
+each with its member number as the first column (`rel.py qb`). Every batch is checked window by window against
+tsdb's answers (`rel.py checkb`, 1e-9) before it is timed, and a kind is sent in batches only when its windows
+one at a time agreed in the same load (a check that took too long counts as not agreeing, and `dash.txt` says it
+timed out). A system without a TWA query gets a line in `dash.txt`. In the tables, every batch line says what its
+q/s counts: requests for qdrive and relq (every system's batches, tsdb's TWA batches too), windows for tsdbq's
+aggregate batches, which get their requests per second added beside them.
+
+Phase 2 ran before these classes existed, and before the servers' memory was sampled. `p6` fills both in without
+redoing phase 2. For each system it loads the data once, then:
+
+1. runs the new TWA batch classes `REPS` times, into `p2/<system>/p6/`; they appear in the system's table marked
+   `p6:`, since they come from another load than the phase-2 rows;
+2. runs every other class of phase 2 once (not the per-core runs), with the server's memory sampled, into
+   `p2/<system>/memsweep/`. These single runs are not averaged. Under each system's table, `tables.md` shows per class
+   the peak memory during the step (which includes what earlier classes left behind) and how much it grew over the
+   step's start, and the peak over the whole sweep.
+
+tsdb's answers of this load are checked against phase 2's reference (`ref-p6/` against `ref/`); `ref/` is not
+rewritten. The system's `how.json` gets a `p6` block (when, runs, the tsdb and harness commits, its `-` reasons and
+refusals), printed under its table. QuestDB's own refusals ("global RSS memory limit exceeded", "table busy") are
+recorded as refusals, not failures.
+
+Every safeguard of phase 2 still applies (time limits, deaths and restarts, refusals, the idle check, the lock).
+
+```sh
+BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p6               # every system of P2_SYSTEMS
+P6_SYSTEMS="ch ts" BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p6
+RESUME=1 BENCH_LOCK=/path/BENCH.lock bench/dbcmp/release/run.sh p6      # go on after a stop
+```
+
+A system the pass got through has `p6/<system>.done` and is skipped, also when some of its classes failed or were
+refused (those are recorded results). After a stop, `RESUME=1` loads the interrupted system again and skips the
+steps it already measured; without it, a rerun moves the old `p6/` and `memsweep/` to `old/`. Running a system's
+phase 2 again makes its p6 due again.
+In `steps.log` the pass's steps start with `p6 `.
+
+How long it takes, from the release run's logs (an upper bound): about 1 h for tsdb, ClickHouse, QuestDB (native),
+TimescaleDB and each TDengine variant; 1.3 to 1.6 h for QuestDB's Parquet variants and InfluxDB 2; about 2.2 h for
+each IoTDB variant; half an hour for VictoriaMetrics; and up to 7 h for InfluxDB 3 (it waits at least an hour for
+its Parquet snapshot). All of them: about 15 to 23 hours.
+
 ## Fairness notes
 
 - **Durability at acknowledgement differs.** tsdb, PostgreSQL and both InfluxDBs flush to disk before
@@ -596,8 +663,9 @@ alone several); run it under `tmux` or `nohup`.
   when a 128 MB segment is full) do not. Time the `sync -f` after their loads separately.
 - **Background work.** InfluxDB 2's full-compaction wait was cut from 4 h to 1 min so it can be
   measured; its 10-minute cache snapshot wait is the default. TimescaleDB compresses from 16
-  sessions, where its policy would use one job. ClickHouse keeps merging lazily long after
-  `ch_load.sh` calls it settled. Prometheus' remote write is made for live data, not two years of
+  sessions, where its policy would use one job. ClickHouse backs off up to 60 s between merge selections, so `ch_settle.sh` calls the table settled only
+  when no merge runs and the part count has not changed for 180 s (three times that); the release run also
+  measures it again after `OPTIMIZE TABLE FINAL` (`merged.*` rows, like tsdb's). Prometheus' remote write is made for live data, not two years of
   history in one go: almost all of it takes the out-of-order path and leaves thousands of 2 h blocks
   to compact (78 minutes for 10 M rows, hours for 100 M); its backfill (promtool) is the route its
   docs give for history, and is reported next to it.
@@ -606,8 +674,8 @@ alone several); run it under `tmux` or `nohup`.
 - **Indexes.** TimescaleDB has only the default `ts` index on uncompressed chunks, which favours its
   load. QuestDB is measured without and with a symbol index.
 - **Input order and limits.** Every system gets the file in its original order (all series at sample
-  i, then i+1), not sorted by time. InfluxDB 2 has a 24 GB and InfluxDB 3 a 28 GB container limit;
-  InfluxDB 3's memory pools are set for that. Prometheus' remote write gets each series in that
+  i, then i+1), not sorted by time. Every server, tsdbd too, runs with one memory limit (`SERVER_MEM`, 48 GB of the 64 GB machine; see
+  "Release run"); InfluxDB 3's memory pools are set for 28 GB. Prometheus' remote write gets each series in that
   order too (each series on one shard); its backfill reads the OpenMetrics file in that order.
 - **TimescaleDB's `work_mem`.** The server of the aggregate, raw and point queries keeps
   timescaledb-tune's `work_mem`; the timescaledb-ha server of TWA and LTTB gets 256 MB, without which
