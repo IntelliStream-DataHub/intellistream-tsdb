@@ -7,7 +7,8 @@ name = "tsdb-client"
 description = "Client for tsdbd, the TCP server of the tsdb time series database"
 requires-python = ">=3.9"
 dynamic = ["version"]
-classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
+license = { text = "Apache-2.0" }
+classifiers = ["License :: OSI Approved :: Apache Software License", "Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
 numpy = ["numpy"]

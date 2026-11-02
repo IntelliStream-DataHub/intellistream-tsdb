@@ -2,6 +2,7 @@
 name = "tsdb-client"
 version = "0.9.0"
 edition = "2024"
+license = "Apache-2.0"
 rust-version = "1.88"
 description = "Blocking client for tsdbd, the TCP server of the tsdb time series database"
 publish = false

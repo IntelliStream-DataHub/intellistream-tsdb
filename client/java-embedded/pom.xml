@@ -15,6 +15,18 @@
 
   <name>tsdb-embedded</name>
   <description>The tsdb time series database in-process, through libtsdb.so and the Java FFM API (Java 22+)</description>
+  <url>https://intellistream.ai</url>
+  <organization>
+    <name>IntelliStream AS</name>
+    <url>https://intellistream.ai</url>
+  </organization>
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>

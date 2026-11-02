@@ -508,3 +508,7 @@ make jepsen        # crash tests: kill -9, power loss, pauses, disk errors
 make test-clients  # the Rust, Python and Java clients (needs cargo, python3, mvn)
 make integration-tests  # tsdbd, the CLI and all four clients end to end, both server backends (same tools)
 ```
+
+## License
+
+tsdb is open source under the [Apache License 2.0](LICENSE). Copyright 2026 IntelliStream AS; see [NOTICE](NOTICE).

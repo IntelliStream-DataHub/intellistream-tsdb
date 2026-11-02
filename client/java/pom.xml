@@ -11,6 +11,18 @@
 
   <name>tsdb-client</name>
   <description>Java client for tsdbd, the TCP server of the tsdb time series database</description>
+  <url>https://intellistream.ai</url>
+  <organization>
+    <name>IntelliStream AS</name>
+    <url>https://intellistream.ai</url>
+  </organization>
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
