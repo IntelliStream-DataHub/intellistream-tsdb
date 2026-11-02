@@ -1525,6 +1525,7 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
 extern size_t lttb_buffer_bytes; /* tests make it small to exercise the two-pass way */
 extern size_t local_piece_bounds; /* local periods per window of tsdb_query_group_local (0: default); tests */
 extern size_t agg_dense_buckets; /* the most buckets one dense array holds (0: the default); for tests */
+extern size_t dense_chunk;       /* buckets per item of the passes over a dense array (0: the default); for tests */
 extern size_t agg_dense_states;  /* bucket states of all dense arrays so far (src/query.c); for tests */
 extern size_t local_twa_listed;  /* bounds local TWAs have listed so far (src/calendar.c); for tests */
 /* Buckets newest first with desc; at most limit non-empty ones (0: all), computing only about as many. */
