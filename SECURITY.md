@@ -60,8 +60,8 @@ hardening ideas without a concrete way to go wrong. You are still welcome to ope
 
 **Please report it privately. Do not open a public issue or pull request for a vulnerability.**
 
-Send an email to **security@<TBD — IntelliStream AS>** *(placeholder: the address is not decided yet; until it
-is filled in, use GitHub's "Report a vulnerability" button on the repository's Security tab, if it is enabled)*.
+Send an email to **olav@intellistream.ai**. You can also use GitHub's "Report a vulnerability" button on the
+repository's Security tab, if it is enabled.
 
 Please include:
 
