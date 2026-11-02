@@ -158,6 +158,16 @@ uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 #define BLK_ZSTD 0x80 /* the transform output is additionally ZSTD compressed */
 #define BLK_SLACK 32  /* decoders may read up to this many bytes past a block */
 
+/* What ZSTD must save of `inner` transform bytes for a block to keep it, since decoding costs too: 1/8 for timestamp
+ * blocks, 1/32 for value blocks. Every query that reads rows decodes the timestamps, and the timestamp blocks ZSTD
+ * shrank by 1/32 to 1/8 (jittered clocks) were 0.65% of the bytes but 17-22% of a minute-bucket query on one thread
+ * (the user's decision, 2026-11-02). Integer arithmetic on the kind: every CPU level keeps the same blocks. */
+static inline size_t blk_zstd_min_saving(int kind, size_t inner)
+{
+    bool ts = kind == BLK_DD || kind == BLK_TS_DELTA || kind == BLK_TS_GRID;
+    return inner / (ts ? 8 : 32);
+}
+
 typedef struct codec_ctx {
     struct codec_ctx *next; /* free list in eng */
     ZSTD_CCtx *cctx;

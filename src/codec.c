@@ -1027,8 +1027,7 @@ size_t block_wrap_src(codec_ctx *c, int level, int kind, const uint8_t *src, siz
 {
     if (level > 0 && inner >= 64) {
         size_t z = zstd_pack(c->cctx, out + 5, ZSTD_compressBound(inner), src, inner, level);
-        /* keep zstd only when it saves a few percent: decoding costs too */
-        if (!ZSTD_isError(z) && z + 4 < inner - inner / 32) {
+        if (!ZSTD_isError(z) && z + 4 < inner - blk_zstd_min_saving(kind, inner)) {
             out[0] = (uint8_t)(kind | BLK_ZSTD);
             store32(out + 1, (uint32_t)inner);
             return 5 + z;
