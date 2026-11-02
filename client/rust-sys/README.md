@@ -1,4 +1,4 @@
-# tsdb-sys
+# intellistream-tsdb-sys
 
 Raw FFI declarations of tsdb's public C API (`include/tsdb.h` and
 `include/tsdb_calendar.h`), and the engine itself: by default `build.rs`
@@ -6,8 +6,10 @@ compiles the C sources of this repository with the `cc` crate, so a Rust
 program that uses it needs no `libtsdb.so`, no tsdbd and no C toolchain
 beyond the one `cc` finds.
 
-Use the safe API instead: `tsdb_client::Db` (crate `tsdb-client`, feature
+Use the safe API instead: `tsdb_client::Db` (crate `intellistream-tsdb-client`, feature
 `embedded`). This crate is for code that wants the C functions directly.
+The package is called `intellistream-tsdb-sys`; the library inside it is
+still `tsdb_sys`, so you write `use tsdb_sys::...`.
 
 ## Build
 

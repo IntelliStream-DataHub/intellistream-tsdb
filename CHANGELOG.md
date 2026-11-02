@@ -181,6 +181,9 @@ Server (`tsdbd`)
 Clients and bindings
 - Clients of tsdbd in C, Rust, Python and Java, all at protocol 9.
 - Embedded bindings (no server): Rust, Python and Java 22+, with the same operations as the clients.
+- Package names carry the company: Rust crates `intellistream-tsdb-client` and `intellistream-tsdb-sys`, Python
+  distribution `intellistream-tsdb-client`; the imports stay `tsdb_client` and `tsdb_sys`, and the Java artifacts
+  (`ai.intellistream:tsdb-client`) are unchanged.
 - Command-line tool `tsdb` (create, import, query, delete, retention, volumes, stats, optimize).
 - Apache Pulsar 5 sink (`connectors/pulsar`): Pulsar holds the points while tsdb is down, and a point is
   taken off Pulsar once it is on disk.

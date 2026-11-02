@@ -1,4 +1,4 @@
-# tsdb-client (Rust)
+# intellistream-tsdb-client (Rust)
 
 A Rust library for talking to `tsdbd`, the tsdb database server. You use it
 to store numbers with a timestamp (a "time series") and to read them back,
@@ -6,6 +6,10 @@ raw or summed up per hour, day or month.
 
 The client waits for each answer (it is blocking, not async). Its only
 dependency is `zstd`, for compressing inserts.
+
+The package is called `intellistream-tsdb-client`; the library inside it is
+still `tsdb_client`, so your code says `use tsdb_client::Client;` as in the
+examples below.
 
 ## Quick start
 
@@ -83,7 +87,7 @@ To use the library in your own project, add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tsdb-client = { path = "path/to/tsdb/client/rust" }
+intellistream-tsdb-client = { path = "path/to/tsdb/client/rust" }
 ```
 
 ## Connect
@@ -316,10 +320,10 @@ your process at C speed, with the same methods as `Client` (the
 on either).
 
 ```toml
-tsdb-client = { path = "../tsdb/client/rust", features = ["embedded"] }
+intellistream-tsdb-client = { path = "../tsdb/client/rust", features = ["embedded"] }
 ```
 
-The build compiles the C engine (the `tsdb-sys` crate in `../rust-sys`)
+The build compiles the C engine (the `intellistream-tsdb-sys` crate in `../rust-sys`)
 with your C compiler, and zstd with it: nothing to install. It runs on
 any x86-64 and picks AVX2 or AVX-512 code at run time; the feature
 `native` builds for this CPU only. `embedded-system` links a `libtsdb.so`

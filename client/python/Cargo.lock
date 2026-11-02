@@ -81,6 +81,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "intellistream-tsdb-client"
+version = "0.9.0"
+dependencies = [
+ "intellistream-tsdb-sys",
+ "libc",
+ "rayon",
+ "zstd",
+]
+
+[[package]]
+name = "intellistream-tsdb-sys"
+version = "0.9.0"
+dependencies = [
+ "cc",
+ "zstd-sys",
+]
+
+[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -328,30 +346,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
-name = "tsdb-client"
-version = "0.9.0"
-dependencies = [
- "libc",
- "rayon",
- "tsdb-sys",
- "zstd",
-]
-
-[[package]]
 name = "tsdb-client-python"
 version = "0.9.0"
 dependencies = [
+ "intellistream-tsdb-client",
  "numpy",
  "pyo3",
- "tsdb-client",
-]
-
-[[package]]
-name = "tsdb-sys"
-version = "0.9.0"
-dependencies = [
- "cc",
- "zstd-sys",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "tsdb-client"
+name = "intellistream-tsdb-client"
 version = "0.9.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -9,6 +9,10 @@ publish = false
 readme = "README.md"
 keywords = ["timeseries", "database", "client"]
 categories = ["database"]
+
+# imports stay `use tsdb_client::...`
+[lib]
+name = "tsdb_client"
 
 [features]
 # Db: the database inside this process (crate tsdb-sys builds the C engine into it)
@@ -21,7 +25,7 @@ native = ["embedded", "tsdb-sys/native"]
 [dependencies]
 # packed inserts (protocol version 3); the bundled libzstd, no optional features
 zstd = { version = "0.13", default-features = false }
-tsdb-sys = { path = "../rust-sys", optional = true }
+tsdb-sys = { package = "intellistream-tsdb-sys", path = "../rust-sys", optional = true }
 # batch calls (Pool, Db::*_many) run their queries and inserts on a thread pool
 rayon = "1"
 

@@ -302,8 +302,9 @@ test-python: $(B)/tsdbd
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
 	    && $(abspath $(PYVENV))/bin/python -m pytest tests
 
-# The Python sdist carries tsdb-sys as a path dependency, so the engine's C sources travel in it as the copy
-# client/rust-sys/vendor.sh makes (csrc/). test-python-sdist builds a wheel from the sdist alone and imports it.
+# The Python sdist (distribution intellistream-tsdb-client, module tsdb_client) carries intellistream-tsdb-sys as a
+# path dependency, so the engine's C sources travel in it as the copy client/rust-sys/vendor.sh makes (csrc/).
+# test-python-sdist builds a wheel from the sdist alone and imports it; the file names follow the distribution name.
 python-sdist:
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	client/rust-sys/vendor.sh
@@ -312,8 +313,8 @@ python-sdist:
 
 test-python-sdist: python-sdist
 	rm -rf $(B)/sdist-check && mkdir -p $(B)/sdist-check/whl
-	PATH=$(abspath $(PYVENV))/bin:$$PATH $(PYVENV)/bin/pip wheel -q --no-build-isolation --no-deps -w $(B)/sdist-check/whl $(B)/sdist/tsdb_client-*.tar.gz
-	cd $(B)/sdist-check && unzip -q whl/tsdb_client-*.whl -d site \
+	PATH=$(abspath $(PYVENV))/bin:$$PATH $(PYVENV)/bin/pip wheel -q --no-build-isolation --no-deps -w $(B)/sdist-check/whl $(B)/sdist/intellistream_tsdb_client-*.tar.gz
+	cd $(B)/sdist-check && unzip -q whl/intellistream_tsdb_client-*.whl -d site \
 	    && $(abspath $(PYVENV))/bin/python -I -c "import os, sys; sys.path.insert(0, os.path.abspath('site')); import tsdb_client; \
 	    assert tsdb_client.__file__.startswith('$(abspath $(B))/sdist-check/site'), tsdb_client.__file__; tsdb_client.Db"
 

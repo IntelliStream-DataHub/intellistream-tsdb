@@ -6,6 +6,6 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-tsdb-client = { path = "../../../client/rust" }
+tsdb-client = { package = "intellistream-tsdb-client", path = "../../../client/rust" }
 
 [workspace]

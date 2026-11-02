@@ -19,7 +19,7 @@ Edit `VERSION`, then the other places that must say the same:
 
 - `include/tsdb.h`: `TSDB_VERSION_MAJOR`, `_MINOR`, `_PATCH` and `TSDB_VERSION`
 - `client/rust/Cargo.toml`, `client/rust-sys/Cargo.toml`, `client/python/Cargo.toml` (`version =`), and the
-  matching entries in the `Cargo.lock` files (`cargo update -p tsdb-client` or edit the three lines)
+  matching entries in the `Cargo.lock` files (`cargo update -p intellistream-tsdb-client` or edit the three lines)
 - `client/java/pom.xml`, `client/java-embedded/pom.xml` (its version and its dependency on `tsdb-client`),
   `connectors/pulsar/pom.xml` (its version and `tsdb-client.version`)
 - the version in the READMEs' jar names (`grep -rn "tsdb-client-0\." --include=*.md .`)

@@ -1,8 +1,12 @@
-# tsdb_client (Python)
+# intellistream-tsdb-client (Python)
 
 A Python library for talking to `tsdbd`, the tsdb database server. You use it
 to store numbers with a timestamp (a "time series") and to read them back,
 raw or summed up per hour, day or month.
+
+The package is called `intellistream-tsdb-client` (its name on PyPI); the
+module you import is still `tsdb_client`, so your code says
+`from tsdb_client import Client`.
 
 It is written in Rust (it uses the Rust client in `../rust`) and works with
 plain lists. If numpy is installed, queries return numpy arrays.

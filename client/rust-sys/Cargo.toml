@@ -1,5 +1,5 @@
 [package]
-name = "tsdb-sys"
+name = "intellistream-tsdb-sys"
 version = "0.9.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -13,6 +13,10 @@ build = "build.rs"
 include = ["Cargo.toml", "Cargo.lock", "README.md", "build.rs", "layout.c", "src/**", "tests/**", "csrc/**"]
 keywords = ["timeseries", "database", "ffi"]
 categories = ["database", "external-ffi-bindings"]
+
+# imports stay `use tsdb_sys::...`
+[lib]
+name = "tsdb_sys"
 
 [features]
 default = ["bundled-zstd"]

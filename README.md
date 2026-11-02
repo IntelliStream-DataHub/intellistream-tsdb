@@ -422,8 +422,8 @@ large one, or a request for many series, spreads over more.
 | client | quick start |
 |---|---|
 | C | [`client/tsdb_client.h`](client/tsdb_client.h), [`examples/client.c`](examples/client.c) |
-| Rust | [client/rust](client/rust/README.md) |
-| Python | [client/python](client/python/README.md) |
+| Rust (package `intellistream-tsdb-client`, `use tsdb_client::...`) | [client/rust](client/rust/README.md) |
+| Python (package `intellistream-tsdb-client`, `import tsdb_client`) | [client/python](client/python/README.md) |
 | Java 17+ | [client/java](client/java/README.md) |
 | Java 22+, embedded (no server) | [client/java-embedded](client/java-embedded/README.md) |
 

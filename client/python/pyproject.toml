@@ -3,7 +3,7 @@ requires = ["maturin>=1.5,<2"]
 build-backend = "maturin"
 
 [project]
-name = "tsdb-client"
+name = "intellistream-tsdb-client"
 description = "Client for tsdbd, the TCP server of the tsdb time series database"
 requires-python = ">=3.9"
 dynamic = ["version"]
