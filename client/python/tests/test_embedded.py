@@ -94,14 +94,17 @@ def test_series_types_and_volumes(tmp_path, client):
     assert client.failed() is None and Db.simd_level()
 
 
-def test_series_ids_are_64_bits(client):
+def test_series_ids_are_64_bits(client, tmp_path):
     import numpy as np
 
+    # ids are (volume + 1) << 32 | local: every real one is past 2**32, in the database directory and in a volume
     a, b = client.series("a"), client.series("b")
-    assert sorted(client.series_ids()) == sorted([a, b]) and client.series_count() == 2
-    # id columns: uint64 and uint32 arrays (widened), array.array and lists of ints
+    c = client.series_at("c", str(tmp_path / "volume"))
+    assert (a >> 32, a & 0xFFFFFFFF, b >> 32, b & 0xFFFFFFFF, c >> 32, c & 0xFFFFFFFF) == (1, 0, 1, 1, 2, 0)
+    assert sorted(client.series_ids()) == [a, b, c] and client.series_count() == 3
+    # id columns: uint64 and int64 arrays, array.array and lists of ints
     client.insert(np.array([a, b], dtype=np.uint64), [T0, T0], [1.0, 2.0])
-    client.insert(np.array([a, b], dtype=np.uint32), [T0 + 1, T0 + 1], [3.0, 4.0])
+    client.insert(np.array([a, b], dtype=np.int64), [T0 + 1, T0 + 1], [3.0, 4.0])
     client.insert(array.array("Q", [a, b]), [T0 + 2, T0 + 2], [5.0, 6.0])
     client.insert_values([a, b], [T0 + 3, T0 + 3], [7.0, 8.0])
     assert list(client.query_points(a, numpy=False)[1]) == [1.0, 3.0, 5.0, 7.0]
@@ -118,12 +121,17 @@ def test_series_ids_are_64_bits(client):
             client.insert_many([(bad, [T0], [1.0])])
     with pytest.raises(OverflowError):
         client.insert(np.array([a, -1], dtype=np.int64), [T0, T0], [1.0, 2.0])
-    # an id the database never handed out is unknown, also when its low 32 bits name a series
-    for big in (a + 2**32, 2**64 - 1):
-        assert code(client.insert_series, big, [T0 + 9], [9.0]) == tsdb_client.ERR_INVALID
-        assert code(client.insert, np.array([a, big], dtype=np.uint64), [T0 + 9] * 2, [9.0] * 2) == tsdb_client.ERR_INVALID
-        assert code(client.series_name, big) == tsdb_client.ERR_NOTFOUND
+    # a malformed id is unknown, never the series its low 32 bits name: a zero volume field (a truncated id, as a
+    # uint32 column makes), any of bits 48-63, a volume the database does not have, a local number past its series
+    truncated = np.array([a, b], dtype=np.uint64).astype(np.uint32)
+    assert code(client.insert, truncated, [T0 + 9] * 2, [9.0] * 2) == tsdb_client.ERR_INVALID
+    for bad in (a & 0xFFFFFFFF, b & 0xFFFFFFFF, a | 1 << 48, c | 1 << 63, 2**64 - 1, a + (2 << 32), c + 1, a + 1000):
+        assert code(client.insert_series, bad, [T0 + 9], [9.0]) == tsdb_client.ERR_INVALID
+        assert code(client.insert, np.array([a, bad], dtype=np.uint64), [T0 + 9] * 2, [9.0] * 2) == tsdb_client.ERR_INVALID
+        assert code(client.series_name, bad) == tsdb_client.ERR_NOTFOUND
     assert list(client.query_points(a, numpy=False)[1]) == [1.0, 3.0, 5.0, 7.0]
+    client.insert_series(c, [T0], [11.0])
+    assert client.series_name(c) == "c" and list(client.query_points(c, numpy=False)[1]) == [11.0]
 
 
 def test_options_and_errors(tmp_path):

@@ -43,8 +43,15 @@ int main(int argc, char **argv)
         printf("optimize: rc %d, %.2f s\n", rc, now() - t0);
         show(c, "optimized");
     }
+    /* a few of the series by the names tsdbc-bench load gave them, with their ids (the volume in the high bits) */
+    static const char *kind[7] = {"hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate", "flow_total"};
     char name[64];
-    for (uint32_t i = 0; i < 100; i += 33) { tsdbc_series_name(c, i, name, sizeof name); printf("id %u = %s\n", i, name); }
+    for (uint32_t i = 0; i < 100; i += 33) {
+        tsdb_sid id = 0;
+        snprintf(name, sizeof name, "%s.%u", kind[i % 7], i);
+        int rc = tsdbc_series(c, name, 0, &id);
+        printf("%s = id %#llx%s\n", name, (unsigned long long)id, rc ? " (not found)" : "");
+    }
     tsdbc_close(c);
     return 0;
 }

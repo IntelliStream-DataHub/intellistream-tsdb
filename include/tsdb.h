@@ -40,10 +40,23 @@ const char *tsdb_version(void);
 
 typedef struct tsdb tsdb;
 
-/* A series id: 64 bits, handed out by tsdb_series* and valid for the life of the database. Treat it as an opaque
- * number: ids are not dense (do not loop over 0 .. tsdb_series_count() - 1; use tsdb_series_foreach), and an id
- * the database never handed out is unknown to every call. */
+/* A series id: 64 bits, handed out by tsdb_series* and valid for the life of the database (ids are never reused;
+ * another database, an import included, gives the same name another id). Its layout:
+ *
+ *   bits 0-31   the series' index in its volume (0 .. 2^31 - 2)
+ *   bits 32-47  the volume's number plus one (1 .. 65535; the database directory is volume 0)
+ *   bits 48-63  zero
+ *
+ * so every id lies in [2^32, 2^48) and 0 is never one (TSDB_SID_NONE). Ids are not dense: do not loop over
+ * 0 .. tsdb_series_count() - 1; use tsdb_series_foreach, or TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v) - 1).
+ * An id the database never handed out (bits 48-63 set, a volume field of zero, as a 32-bit truncation has, or one
+ * beyond the volumes, a local index beyond the volume's series) is unknown to every call and touches no series:
+ * TSDB_ERR_NOTFOUND, or TSDB_ERR_INVALID where a call says so (writes). */
 typedef uint64_t tsdb_sid;
+#define TSDB_SID(volume, local) ((((tsdb_sid)(volume) + 1) << 32) | (uint32_t)(local))
+#define TSDB_SID_VOLUME(id) ((uint32_t)((id) >> 32) - 1) /* of a valid id */
+#define TSDB_SID_LOCAL(id) ((uint32_t)(id))
+#define TSDB_SID_NONE ((tsdb_sid)0) /* never a series */
 
 enum {
     TSDB_OK = 0,
@@ -164,7 +177,9 @@ typedef struct tsdb_values {
  * same path share that volume. The path only matters at creation: it must be
  * absolute, without control characters or "." and ".." components
  * (TSDB_ERR_INVALID), and name a volume (TSDB_ERR_NOTFOUND otherwise, unless
- * create_volumes adds it). A symlink to a volume names that volume. */
+ * create_volumes adds it). A symlink to a volume names that volume. Names
+ * are unique in the whole database: asking for an existing name with another
+ * path returns the existing series, in the volume it was created in. */
 int tsdb_series(tsdb *db, const char *name, tsdb_sid *id);        /* get or create in the database directory */
 int tsdb_series_at(tsdb *db, const char *name, const char *path, tsdb_sid *id); /* get or create in volume `path` */
 int tsdb_series_lookup(tsdb *db, const char *name, tsdb_sid *id); /* TSDB_ERR_NOTFOUND if missing */
@@ -173,7 +188,9 @@ int tsdb_series_lookup(tsdb *db, const char *name, tsdb_sid *id); /* TSDB_ERR_NO
  * TSDB_ERR_INVALID. tsdb_series and tsdb_series_at create float32 series. */
 int tsdb_series_create(tsdb *db, const char *name, tsdb_type type, const char *path, tsdb_sid *id);
 int tsdb_series_type(tsdb *db, tsdb_sid id, tsdb_type *type);
-uint64_t tsdb_series_count(tsdb *db);
+uint64_t tsdb_series_count(tsdb *db); /* in every volume */
+/* The series of volume `volume` (0 for a number beyond the volumes): their ids are TSDB_SID(volume, 0 .. n - 1). */
+uint32_t tsdb_volume_series_count(tsdb *db, uint32_t volume);
 /* Calls fn once for every series (those of one volume in creation order; no order across volumes is promised);
  * stops at the first non-zero return of fn and returns it, 0 when every call returned 0. */
 int tsdb_series_foreach(tsdb *db, int (*fn)(void *ctx, tsdb_sid id), void *ctx);
@@ -675,7 +692,7 @@ int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
 
 /* Fail-stop. A storage error after which it is unknown what reached the disk
  * (a failed WAL write or fsync, a failed fsync of the directory after new
- * parts were named, a failed MANIFEST, series or state dictionary or CATALOG
+ * parts were named, a failed MANIFEST, series or state dictionary or a volume's META
  * write; ENOSPC there counts too)
  * puts the database, or the volume it happened in, in a failed state for good:
  * after a failed fsync Linux may drop the unwritten pages and report success

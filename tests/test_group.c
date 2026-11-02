@@ -126,7 +126,7 @@ static long maxrss_mb(void)
 
 /* Local grouping a few periods at a time gives the buckets of one window over every bound, bit for bit,
  * in both orders and with limits, for the buckets and the spread. */
-static void same_in_windows(tsdb *db, uint32_t id, int64_t start, int64_t end, const tsdb_group *g)
+static void same_in_windows(tsdb *db, tsdb_sid id, int64_t start, int64_t end, const tsdb_group *g)
 {
     size_t lims[] = {0, 3}, wins[] = {2, 7};
     for (int desc = 0; desc < 2; desc++)

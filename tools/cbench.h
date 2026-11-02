@@ -188,12 +188,14 @@ static inline int cb_expect_check(const cb_expect *e, uint32_t s, uint64_t count
     return fabs(sum - e->sum[s]) > 1e-9 * e->abs[s] + 1e-9;
 }
 
-/* The two queries verification needs, of whatever is verified (the library or a client). */
+/* The two queries verification needs, of whatever is verified (the library or a client), and the id of each of the
+ * file's series numbers (ids are not those numbers: they carry the volume, and a database may hold other series). */
 typedef struct cb_source {
     void *ctx;
-    int (*agg)(void *ctx, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
+    int (*agg)(void *ctx, tsdb_sid series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
                size_t *nout);
-    int (*raw)(void *ctx, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *fnctx);
+    int (*raw)(void *ctx, tsdb_sid series, int64_t start, int64_t end, tsdb_raw_fn fn, void *fnctx);
+    const tsdb_sid *ids;
 } cb_source;
 
 typedef struct cb_rawsum {
@@ -218,7 +220,7 @@ static inline int cb_expect_verify(const cb_expect *e, uint32_t s, const cb_sour
 {
     tsdb_bucket *b;
     size_t nb;
-    int rc = src->agg(src->ctx, s, INT64_MIN, INT64_MAX, 0, &b, &nb);
+    int rc = src->agg(src->ctx, src->ids[s], INT64_MIN, INT64_MAX, 0, &b, &nb);
     if (rc)
         return rc;
     uint64_t c = nb ? b[0].count : 0;
@@ -231,7 +233,7 @@ static inline int cb_expect_verify(const cb_expect *e, uint32_t s, const cb_sour
         return 1;
     }
     cb_rawsum r = {0, 0};
-    rc = src->raw(src->ctx, s, INT64_MIN, INT64_MAX, cb_rawsum_fn, &r);
+    rc = src->raw(src->ctx, src->ids[s], INT64_MIN, INT64_MAX, cb_rawsum_fn, &r);
     if (rc)
         return rc;
     if (r.count != e->count[s] || r.hash != e->hash[s]) {

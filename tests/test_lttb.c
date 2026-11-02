@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -158,7 +159,7 @@ static int checks;
 
 /* tsdb_query_lttb against the reference over the model m, or else over tsdb_query_values on truth, and the
  * properties */
-static void check_one(tsdb *db, tsdb *truth, const model *md, uint32_t s, int64_t start, int64_t end, size_t t,
+static void check_one(tsdb *db, tsdb *truth, const model *md, tsdb_sid s, int64_t start, int64_t end, size_t t,
                       const char *what)
 {
     pts raw = {0}, got = {.all = true};
@@ -187,7 +188,7 @@ static void check_one(tsdb *db, tsdb *truth, const model *md, uint32_t s, int64_
     if (ok && db == truth && m) /* statistics: one read of the range (none when the count found no point) */
         ok = ls.result_rows == got.n && ls.rows == rs.rows && ls.parts == rs.parts;
     if (!ok) {
-        fprintf(stderr, "%s: series %u [%lld, %lld) threshold %zu: %zu points of %zu, expected %zu\n", what, s,
+        fprintf(stderr, "%s: series %" PRIu64 " [%lld, %lld) threshold %zu: %zu points of %zu, expected %zu\n", what, s,
                 (long long)start, (long long)end, t, got.n, raw.n, m);
         for (size_t i = 0; i < m && i < got.n; i++)
             if (got.p[i].ts != raw.p[idx[i]].ts || got.p[i].bits != raw.p[idx[i]].bits) {
@@ -204,7 +205,7 @@ static void check_one(tsdb *db, tsdb *truth, const model *md, uint32_t s, int64_
 
 #define T0 1700000000000LL
 
-static void check_series(tsdb *db, tsdb *truth, const model *md, uint32_t s, const char *what)
+static void check_series(tsdb *db, tsdb *truth, const model *md, tsdb_sid s, const char *what)
 {
     pts all = {.all = true};
     if (md)

@@ -22,6 +22,7 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -466,7 +467,7 @@ static void test_twa_memtable(void)
  * minimums and maximums must match exactly. `stride` steps over tsdb_bucket or tsdb_spread_bucket. */
 static int64_t fldiv(int64_t a, int64_t b) { return a / b - (a % b != 0 && (a < 0) != (b < 0)); }
 
-static void naive_agg(tsdb *db, uint32_t id, int64_t start, int64_t end, int64_t iv, const void *res, size_t n,
+static void naive_agg(tsdb *db, tsdb_sid id, int64_t start, int64_t end, int64_t iv, const void *res, size_t n,
                       size_t stride, const char *what)
 {
     tsdb_type type;
@@ -516,7 +517,7 @@ static void naive_agg(tsdb *db, uint32_t id, int64_t start, int64_t end, int64_t
 
 static int queries;
 
-static void check_series(tsdb *db, uint32_t id, const char *stage, int rounds)
+static void check_series(tsdb *db, tsdb_sid id, const char *stage, int rounds)
 {
     char what[256];
     int64_t bounds[64];
@@ -531,7 +532,7 @@ static void check_series(tsdb *db, uint32_t id, const char *stage, int rounds)
         size_t nbo = rand_bounds(start, end, bounds);
         size_t na, nl;
         int rc;
-        snprintf(what, sizeof what, "%s, series %u, kind %d, [%lld, %lld), interval %lld, group %d/%u, %zu bounds",
+        snprintf(what, sizeof what, "%s, series %" PRIu64 ", kind %d, [%lld, %lld), interval %lld, group %d/%u, %zu bounds",
                  stage, id, kind, (long long)start, (long long)end, (long long)iv, g ? (int)g->unit : 0,
                  g ? g->count : 0, nbo);
         queries++;
@@ -614,7 +615,7 @@ static void check_series(tsdb *db, uint32_t id, const char *stage, int rounds)
         bool desc = rnd() & 1;
         tsdb_query_opts o = {desc ? TSDB_DESC : TSDB_ASC, rnd() & 1 ? 0 : rand_limit(a.n)};
         OK(tsdb_query_lttb_ex(db, id, start, end, thr, &o, collect, &l));
-        snprintf(what, sizeof what, "%s, series %u, lttb [%lld, %lld) threshold %zu", stage, id, (long long)start,
+        snprintf(what, sizeof what, "%s, series %" PRIu64 ", lttb [%lld, %lld) threshold %zu", stage, id, (long long)start,
                  (long long)end, thr);
         same_cut(what, l.p, l.n, a.p, a.n, sizeof *a.p, desc, o.limit);
         queries++;
@@ -666,7 +667,7 @@ static void test_random(int threads, int rounds)
     for (int round = 0; round < 12; round++) {
         write_round(db, ids);
         if (round % 3 == 2) {
-            uint32_t id = ids[rnd() % NSERIES];
+            tsdb_sid id = ids[rnd() % NSERIES];
             int64_t a = T0 + rndr(SPAN), b = a + 1 + rndr(rnd() & 1 ? MIN_MS : 6 * HOUR_MS);
             OK(tsdb_delete_range(db, id, a, b));
         }

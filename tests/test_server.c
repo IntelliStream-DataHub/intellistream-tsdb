@@ -335,22 +335,22 @@ static uint32_t id_payload(uint8_t op, uint64_t x, uint32_t code, uint8_t *p)
     return 0;
 }
 
-/* Protocol 11: series ids are u64 on the wire. An id that differs from an existing one only above bit 31 is
- * another series, unknown to the server, never the existing one cut to 32 bits; UINT64_MAX (TSDB_MANY_SERIES)
- * names no series. Ops 6 and 11 (QUERY_AGG, QUERY_GROUP) were removed: unknown ops. Many-series inserts carry
+/* Protocol 11: series ids are u64 on the wire, (volume + 1) << 32 | local. An id that differs from an existing
+ * one only above bit 31 is another series (another volume, unknown here) or malformed (volume field 0, bits from
+ * 48 up), never the existing one cut to 32 bits; UINT64_MAX (TSDB_MANY_SERIES) names no series. Ops 6 and 11 (QUERY_AGG, QUERY_GROUP) were removed: unknown ops. Many-series inserts carry
  * their u64 ids after zero bytes to a multiple of 8. */
 static void test_wide_ids(tsdbc *c)
 {
     tsdb_sid k, kst;
     OK(tsdbc_series_create(c, "wide.f32", TSDB_FLOAT32, NULL, &k));
     OK(tsdbc_series_create(c, "wide.state", TSDB_STATE, NULL, &kst));
-    CHECK(k < (1ull << 32) && kst < (1ull << 32));
+    CHECK(k >> 32 == 1 && kst >> 32 == 1); /* the database directory is volume 0 */
     int64_t ts[3] = {T0, T0 + 1, T0 + 2};
     float v[3] = {1, 2, 3};
     OK(tsdbc_insert_series(c, k, ts, v, 3));
     uint32_t code;
     OK(tsdbc_state(c, kst, "on", &code));
-    const uint64_t unknown = 0xffffff00u; /* below 2^32 and never handed out here */
+    const uint64_t unknown = TSDB_SID(0, 0xffffff00u); /* well formed, never handed out here */
 
     /* reads: the alias and UINT64_MAX are answered as the unknown id is, not as the series */
     static const uint8_t reads[] = {TSDB_OP_SERIES_NAME, TSDB_OP_SERIES_TYPE, TSDB_OP_GET_RETENTION,
@@ -361,11 +361,11 @@ static void test_wide_ids(tsdbc *c)
         uint8_t op = reads[i], p[64];
         bool st_op = op == TSDB_OP_STATE || op == TSDB_OP_STATE_NAME;
         uint64_t base = st_op ? kst : k;
-        uint64_t xs[4] = {base, base + (1ull << 32), base | 0xffffffff00000000ull, UINT64_MAX};
+        uint64_t xs[] = {base, base + (1ull << 32), (uint32_t)base, base | 1ull << 48, base | 1ull << 63, UINT64_MAX};
         wire_ans known, none, a;
         uint32_t len = id_payload(op, unknown, code, p);
         none.st = raw_once(op, p, len, none.body, sizeof none.body, &none.n);
-        for (int x = 0; x < 4; x++) {
+        for (int x = 0; x < 6; x++) {
             id_payload(op, xs[x], code, p);
             wire_ans *w = x ? &a : &known;
             w->st = raw_once(op, p, len, w->body, sizeof w->body, &w->n);
@@ -384,9 +384,9 @@ static void test_wide_ids(tsdbc *c)
                                      TSDB_OP_REPLACE_RANGE, TSDB_OP_SET_RETENTION};
     for (size_t i = 0; i < sizeof writes; i++) {
         uint8_t op = writes[i];
-        uint64_t xs[4] = {unknown, k + (1ull << 32), k | 0xffffffff00000000ull, UINT64_MAX};
+        uint64_t xs[] = {unknown, k + (1ull << 32), (uint32_t)k, k | 1ull << 48, k | 1ull << 63, UINT64_MAX};
         int32_t want = 0;
-        for (int x = 0; x < 4; x++) {
+        for (int x = 0; x < 6; x++) {
             uint8_t p[64] = {0}, body[64];
             uint32_t one = 1, len = 0;
             int64_t t = T0 + 10, lo = INT64_MIN, hi = INT64_MAX, lim = 1;
@@ -417,7 +417,7 @@ static void test_wide_ids(tsdbc *c)
             int32_t st = raw_once(op, p, len, body, sizeof body, &n);
             if (x == 0)
                 want = st;
-            CHECK(st != 0 && (x == 3 || st == want));
+            CHECK(st != 0 && (x == 5 || st == want));
         }
         CHECK(count_of(c, k) == 3);
     }

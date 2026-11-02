@@ -7,7 +7,9 @@
  * - a damaged stream (truncated anywhere, any flipped byte) fails the import loudly: from a file nothing is
  *   written, from a pipe the series being read is removed again and the rest are whole; a newer stream version
  *   and an unknown record kind are refused with a clear message;
- * - a stream written by the first release (tests/data/export-v1.tsdbdump) still imports: the format is stable;
+ * - a stream written by the first release (tests/data/export-v1.tsdbdump) still imports: the format is stable,
+ *   and it names series and volumes, never ids (a volume that arrives as another volume number gets other ids);
+ * - a database of disk format 7 is refused by the CLI and tsdbd (exit 1, a line naming 7 and 8);
  * - an export taken while a writer keeps rewriting every series sees each series at one moment;
  * - export and import run in constant memory (anonymous RSS sampled from /proc; parts are mmap'd).
  *
@@ -588,6 +590,9 @@ static void test_round_trip(void)
         CHECK(same_series(s, d, all_series[i], TSDB_TS_MIN, TSDB_TS_MAX));
     CHECK(same_str(tsdb_series_path(d, lookup(d, "f64")), path("vol2")));
     CHECK(same_str(tsdb_series_path(d, lookup(d, "temp/a")), dst));
+    /* ids carry the volume: the stream names series and volumes, never ids */
+    CHECK(TSDB_SID_VOLUME(lookup(d, "f64")) == 1 && TSDB_SID_VOLUME(lookup(d, "temp/a")) == 0);
+    CHECK(lookup(d, "f64") == lookup(s, "f64"));
     /* deletes were applied and the memtable's rows won */
     CHECK(rows_of(d, "temp/a") == BIG - 1000 + 1);
     col c = read_series(d, lookup(d, "temp/a"), T0, T0 + 1);
@@ -607,6 +612,22 @@ static void test_round_trip(void)
     d = open_db(dst2, true);
     for (int i = 0; i < NALL; i++)
         CHECK(same_series(s, d, all_series[i], TSDB_TS_MIN, TSDB_TS_MAX));
+    tsdb_close(d);
+
+    /* a destination with a volume of its own first: the moved volume is its volume 2, so the volume's series get
+     * other ids than in the source, and every series still arrives whole under its name */
+    const char *dst5 = path("dst5");
+    tsdb_close(open_db(dst5, false));
+    CHECK(RUN(NULL, NULL, dst5, "volume", "add", path("vol5a")) == 0);
+    snprintf(map, sizeof map, "%s=%s", vol, path("vol5"));
+    CHECK(RUN(NULL, NULL, dst5, "import", file, "--volume", map, "--create-volumes") == 0);
+    d = open_db(dst5, true);
+    CHECK(tsdb_volume_count(d) == 3);
+    for (int i = 0; i < NALL; i++)
+        CHECK(same_series(s, d, all_series[i], TSDB_TS_MIN, TSDB_TS_MAX));
+    CHECK(TSDB_SID_VOLUME(lookup(d, "f64")) == 2 && lookup(d, "f64") != lookup(s, "f64"));
+    CHECK(same_str(tsdb_series_path(d, lookup(d, "f64")), path("vol5")));
+    CHECK(tsdb_volume_series_count(d, 1) == 0);
     tsdb_close(d);
 
     /* uncompressed streams too; --check reads a stream without a database */
@@ -1959,6 +1980,49 @@ static void test_nonempty_target(void)
     printf("non-empty targets refused: ok\n");
 }
 
+/* A database of disk format 7 (dense 32-bit ids and a CATALOG) is refused by the CLI and by tsdbd: both exit 1
+ * with a line that names the version found and the one they read, and tell how to carry the data over. */
+static void test_old_format(void)
+{
+    const char *dir = path("format7");
+    tsdb_close(open_db(dir, false));
+    char meta[PATH_MAX + 8];
+    snprintf(meta, sizeof meta, "%s/META", dir);
+    size_t n;
+    char *buf = slurp(meta, &n);
+    char *v = buf ? strstr(buf, "version=8") : NULL;
+    CHECK(v != NULL);
+    if (!v) {
+        free(buf);
+        return;
+    }
+    v[8] = '7';
+    spit(meta, buf, n);
+    free(buf);
+    const char *want[] = {"disk format version 7", "reads version 8 only", "Export the data"};
+    CHECK(RUN(NULL, NULL, dir, "stats") == 1);
+    for (int i = 0; i < 3; i++)
+        CHECK(err_has(want[i]));
+    CHECK(RUN(NULL, NULL, dir, "export", "-o", path("format7.dump")) == 1);
+    CHECK(err_has(want[0]));
+
+    char tsdbd[PATH_MAX];
+    snprintf(tsdbd, sizeof tsdbd, "%s", cli);
+    char *slash = strrchr(tsdbd, '/');
+    snprintf(slash ? slash + 1 : tsdbd, sizeof tsdbd - (size_t)(slash ? slash + 1 - tsdbd : 0), "tsdbd");
+    if (access(tsdbd, X_OK) != 0) {
+        printf("  no %s: the server's refusal not checked\n", tsdbd);
+    } else {
+        /* the timeout only matters if tsdbd wrongly serves: it must exit before it writes the port file */
+        CHECK(sh("timeout 30 '%s' --dir '%s' --port 0 --port-file '%s' >/dev/null 2>%s", tsdbd, dir,
+                 path("format7.port"), errfile) == 1);
+        for (int i = 0; i < 3; i++)
+            CHECK(err_has(want[i]));
+        CHECK(access(path("format7.port"), F_OK) != 0);
+    }
+    printf("format 7 refused: ok\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *cli_env = getenv("TSDB_CLI");
@@ -2012,6 +2076,7 @@ int main(int argc, char **argv)
     test_symlink_target();
     test_nonempty_target();
     test_golden(golden);
+    test_old_format();
     test_concurrent();
     test_memory();
     if (!failures)

@@ -216,7 +216,7 @@ static tsdb_options opts(void)
     return o;
 }
 
-static long count_rows(tsdb *db, uint32_t id, int *rc)
+static long count_rows(tsdb *db, tsdb_sid id, int *rc)
 {
     tsdb_points pts = {0};
     *rc = tsdb_query_points(db, id, 0, INT64_MAX, &pts);
@@ -263,7 +263,7 @@ static void make_series(const char *dir, const char *const *names, int n)
     for (int i = 0; i < n; i++) {
         tsdb_sid id;
         OK(tsdb_series(db, names[i], &id));
-        CHECK(id == (uint32_t)i);
+        CHECK(id == TSDB_SID(0, i));
     }
     OK(tsdb_close(db));
 }
@@ -277,7 +277,7 @@ static void check_names(const char *dir, const char *const *names, int n, int pr
         tsdb_sid id;
         int rc = tsdb_series_lookup(db, names[i], &id);
         if (i < present)
-            CHECK(rc == 0 && id == (uint32_t)i);
+            CHECK(rc == 0 && id == TSDB_SID(0, i));
         else
             CHECK(rc == TSDB_ERR_NOTFOUND);
     }
@@ -297,7 +297,6 @@ static void test_series(const char *scratch)
 
     /* a torn last record (a crash during the append): cut, the others stay */
     cut(dir, "SERIES", (off_t)off2 + 5);
-    cut(dir, "CATALOG", 2 * 16); /* appended after the volume's SERIES: not reached */
     check_names(dir, names, 3, 2);
     CHECK(file_size(dir, "SERIES") == (off_t)off2);
 
@@ -919,6 +918,73 @@ static void test_codecs(void)
     printf("  codecs: %ld damaged blocks decoded without UB (%ld rejected)\n", blocks, errors);
 }
 
+/* Counts the entries of dir (but . and ..), to see that a refused open made nothing. */
+static int entries(const char *dir)
+{
+    DIR *d = opendir(dir);
+    int n = 0;
+    for (struct dirent *e; d && (e = readdir(d));)
+        n += strcmp(e->d_name, ".") && strcmp(e->d_name, "..");
+    if (d)
+        closedir(d);
+    return n;
+}
+
+/* A database of another disk format (7: series ids from a CATALOG, no volume numbers in META) is refused at open,
+ * by writers and readers, with a message that names both versions, and nothing in it is touched. */
+static void test_format_version(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-format", scratch);
+    rm_rf(dir);
+    tsdb_options o = opts();
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    OK(tsdb_append(db, id, 1000, 1.0f));
+    OK(tsdb_close(db));
+    char meta[512], text[512];
+    off_t len = file_size(dir, "META");
+    CHECK(len > 0 && len < (off_t)sizeof meta);
+    file_pread(dir, "META", 0, meta, (size_t)len);
+    meta[len] = '\0';
+    char *v = strstr(meta, "version=");
+    CHECK(v && atoi(v + 8) == FORMAT_VERSION && FORMAT_VERSION == 8);
+    if (!v)
+        return;
+    v[8] = '7';
+    file_pwrite(dir, "META", 0, meta, (size_t)len);
+    int before = entries(dir);
+    for (int ro = 0; ro < 2; ro++) {
+        char log[700];
+        snprintf(log, sizeof log, "%s.stderr", dir);
+        fflush(stderr);
+        int saved = dup(2), lfd = open(log, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        dup2(lfd, 2);
+        o.read_only = ro;
+        db = NULL;
+        int rc = tsdb_open(dir, &o, &db);
+        fflush(stderr);
+        dup2(saved, 2);
+        close(saved);
+        char got[1024] = "";
+        ssize_t n = pread(lfd, got, sizeof got - 1, 0);
+        got[n > 0 ? n : 0] = '\0';
+        close(lfd);
+        unlink(log);
+        RC(rc, TSDB_ERR_CORRUPT);
+        if (db)
+            tsdb_close(db);
+        CHECK(strstr(got, "disk format version 7;") && strstr(got, "reads version 8 only"));
+    }
+    CHECK(entries(dir) == before);
+    file_pread(dir, "META", 0, text, (size_t)len);
+    CHECK(memcmp(text, meta, (size_t)len) == 0 && file_size(dir, "META") == len);
+    rm_rf(dir);
+    printf("  a format-7 database is refused at open, naming both versions, untouched\n");
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
@@ -935,6 +1001,7 @@ int main(int argc, char **argv)
     test_part_follower(base);
     test_manifest(base);
     test_codecs();
+    test_format_version(base);
     rm_rf(base);
     if (failures) {
         fprintf(stderr, "%d damage checks FAILED\n", failures);

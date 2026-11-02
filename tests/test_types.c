@@ -1026,7 +1026,7 @@ static uint64_t num_slot(int type, size_t k)
 
 /* Writes rows k0, k0 + stride, ... below k1 in batches of `batch`; with `nans` one row in that many is a NaN
  * (every row in the NaN-only range), one in 101 a null, the rest numbers. */
-static void nan_write(tsdb *db, uint32_t id, int type, uint64_t *ref, size_t k0, size_t k1, size_t stride,
+static void nan_write(tsdb *db, tsdb_sid id, int type, uint64_t *ref, size_t k0, size_t k1, size_t stride,
                       size_t batch, unsigned nans)
 {
     int64_t *ts = malloc(batch * sizeof *ts);

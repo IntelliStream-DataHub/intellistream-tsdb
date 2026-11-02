@@ -44,13 +44,13 @@ static int64_t test_clock(void *arg)
 }
 
 static char root[512], vol2[512];
-static uint32_t ids[16];
+static tsdb_sid ids[16];
 static size_t nids;
 static tsdb_sid big; /* two rows 5 M ms apart: interval 1 ms is TOO_MANY_BUCKETS */
 
 static size_t api_w(tsdb_type t) { return t == TSDB_BOOL ? 1 : t == TSDB_FLOAT64 || t == TSDB_INT64 ? 8 : 4; }
 
-static void put(tsdb *db, uint32_t id, tsdb_type t, const int64_t *ts, size_t n, int salt, int nulls)
+static void put(tsdb *db, tsdb_sid id, tsdb_type t, const int64_t *ts, size_t n, int salt, int nulls)
 {
     uint8_t *v = calloc(n, 8), *valid = calloc((n + 7) / 8, 1);
     for (size_t i = 0; i < n; i++) {
@@ -211,7 +211,7 @@ static size_t row_of(tsdb_multi_kind k)
 }
 
 /* group: a zone through *_group_local, the reference of TRIM */
-static void single(tsdb *db, const tsdb_multi_query *q, const tsdb_group *local, size_t i, uint32_t id, res *r)
+static void single(tsdb *db, const tsdb_multi_query *q, const tsdb_group *local, size_t i, tsdb_sid id, res *r)
 {
     memset(r, 0, sizeof *r);
     int64_t s = q->starts ? q->starts[i] : q->start, e = q->ends ? q->ends[i] : q->end;

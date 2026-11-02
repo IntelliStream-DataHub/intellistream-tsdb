@@ -44,6 +44,33 @@ typedef struct load_job {
     uint64_t sent;
 } load_job;
 
+/* Series are numbered 0 .. n - 1 here and in the row files, named "<kind>.<number>"; sids[] holds their ids, looked
+ * up by name (ids carry the volume, and the server may hold other series). */
+static tsdb_sid *sids;
+
+static void resolve_ids(tsdbc *c, uint32_t n, int create)
+{
+    sids = calloc(n ? n : 1, sizeof *sids);
+    for (uint32_t i = 0; i < n; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
+        int rc = tsdbc_series(c, name, create, &sids[i]);
+        if (rc)
+            die(name, rc);
+    }
+}
+
+/* the ids of the query benchmarks' series (--series), which a load made */
+static void resolve_query_ids(void)
+{
+    tsdbc *c;
+    int rc = tsdbc_connect(host, port, &c);
+    if (rc)
+        die("connect", rc);
+    resolve_ids(c, nseries, 0);
+    tsdbc_close(c);
+}
+
 static void *loader(void *arg)
 {
     load_job *j = arg;
@@ -65,7 +92,7 @@ static void *loader(void *arg)
             inflight = 0;
         }
         for (size_t k = 0; k < m; k++) {
-            s[k] = j->rows[off + k].s;
+            s[k] = sids[j->rows[off + k].s];
             t[k] = j->rows[off + k].t;
             v[k] = j->rows[off + k].v;
         }
@@ -98,13 +125,7 @@ static int load(const char *path)
     int rc = tsdbc_connect(host, port, &c);
     if (rc)
         die("connect", rc);
-    for (uint32_t i = 0; i <= maxs; i++) {
-        char name[64];
-        tsdb_sid id;
-        snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
-        if ((rc = tsdbc_series(c, name, 1, &id)) != 0)
-            die("series", rc);
-    }
+    resolve_ids(c, maxs + 1, 1);
     double t0 = now_s(), cpu0 = cb_cpu_s();
     pthread_t th[256];
     load_job jobs[256];
@@ -126,19 +147,19 @@ static int load(const char *path)
     return 0;
 }
 
-static int verify_agg(void *ctx, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
+static int verify_agg(void *ctx, tsdb_sid series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
                       size_t *nout)
 {
     return tsdbc_query_agg(ctx, series, start, end, interval, out, nout);
 }
 
-static int verify_raw(void *ctx, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *fnctx)
+static int verify_raw(void *ctx, tsdb_sid series, int64_t start, int64_t end, tsdb_raw_fn fn, void *fnctx)
 {
     return tsdbc_query_raw(ctx, series, start, end, fn, fnctx);
 }
 
-/* The server holds the rows of the file: the same rows in every series: count, sum, and every timestamp and value. Series ids
- * are the file's, which is what a fresh server gives to series created in order (all clients create them that way). */
+/* The server holds the rows of the file: the same rows in every series: count, sum, and every timestamp and value. The
+ * file's series numbers are names ("<kind>.<number>", as every client creates them), looked up for their ids. */
 static int verify(const char *path)
 {
     cb_file f;
@@ -150,7 +171,8 @@ static int verify(const char *path)
     int rc = tsdbc_connect(host, port, &c);
     if (rc)
         die("connect", rc);
-    cb_source src = {c, verify_agg, verify_raw};
+    resolve_ids(c, e.nseries, 0);
+    cb_source src = {c, verify_agg, verify_raw, sids};
     rc = cb_expect_verify_all(&e, f.n, &src, "on the server");
     tsdbc_close(c);
     cb_expect_free(&e);
@@ -202,18 +224,18 @@ static int count_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
     return 0;
 }
 
-static void next_window(uint64_t *r, const cb_class *k, tsdb_sid *s, int64_t *start, int64_t *end)
+/* a window of a random series: its number (for its rate) and its id */
+static void next_window(uint64_t *r, const cb_class *k, uint32_t *ix, tsdb_sid *s, int64_t *start, int64_t *end)
 {
     if (k->window == 0) { /* the whole range of a random series */
         *r = ds_mix(*r);
-        *s = (uint32_t)(*r % nseries);
+        *ix = (uint32_t)(*r % nseries);
         *start = INT64_MIN;
         *end = INT64_MAX;
-        return;
+    } else {
+        cb_window(r, nseries, points, k->window, ix, start, end);
     }
-    uint32_t s32;
-    cb_window(r, nseries, points, k->window, &s32, start, end);
-    *s = s32;
+    *s = sids[*ix];
 }
 
 typedef struct multi_ctx {
@@ -262,11 +284,13 @@ static void *querier(void *arg)
     while (now_s() - t0 < seconds) {
         for (int k = 0; k < 16; k++) {
             tsdb_sid s;
+            uint32_t ix;
             int64_t start, end;
             if (use_multi) {
                 for (int i = 0; i < kk; i++) {
-                    next_window(&r, q->k, &ss[i], &st[i], &en[i]);
-                    iv[i] = (int64_t)q->k->bucket * cb_step_ms(ss[i]);
+                    uint32_t ix;
+                    next_window(&r, q->k, &ix, &ss[i], &st[i], &en[i]);
+                    iv[i] = (int64_t)q->k->bucket * cb_step_ms(ix);
                 }
                 tsdb_multi_query mq = {.kind = !q->k->agg ? TSDB_MULTI_VALUES
                                                : q->k->agg == 2 ? TSDB_MULTI_TWA
@@ -279,7 +303,7 @@ static void *querier(void *arg)
                 q->queries += (uint64_t)kk;
                 continue;
             }
-            next_window(&r, q->k, &s, &start, &end);
+            next_window(&r, q->k, &ix, &s, &start, &end);
             if (!q->k->agg) {
                 uint64_t n = 0; /* --multi 1: QUERY_VALUES, the op QUERY_MULTI wraps; else QUERY_RAW as always */
                 if ((rc = multi_k == 1 ? tsdbc_query_values(c, s, start, end, NULL, values_cb, &n)
@@ -289,7 +313,7 @@ static void *querier(void *arg)
             } else if (q->k->agg == 2) {
                 tsdb_twa_bucket *b;
                 size_t nb;
-                if ((rc = tsdbc_query_twa(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(s), &twa, &b, &nb)) != 0)
+                if ((rc = tsdbc_query_twa(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(ix), &twa, &b, &nb)) != 0)
                     die("query", rc);
                 for (size_t i = 0; i < nb; i++)
                     q->rows += b[i].count;
@@ -297,7 +321,7 @@ static void *querier(void *arg)
             } else {
                 tsdb_bucket *b;
                 size_t nb;
-                if ((rc = tsdbc_query_agg(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(s), &b, &nb)) != 0)
+                if ((rc = tsdbc_query_agg(c, s, start, end, (int64_t)q->k->bucket * cb_step_ms(ix), &b, &nb)) != 0)
                     die("query", rc);
                 for (size_t i = 0; i < nb; i++)
                     q->rows += b[i].count;
@@ -381,7 +405,7 @@ static void *holder(void *arg)
             int64_t start = 1704067200000 + (int64_t)((r >> 20) % (points - 3600)) * step;
             tsdb_bucket *b;
             size_t nb;
-            if (tsdbc_query_agg(cs[i], s, start, start + 3600 * step, 0, &b, &nb) == 0) {
+            if (tsdbc_query_agg(cs[i], sids[s], start, start + 3600 * step, 0, &b, &nb) == 0) {
                 free(b);
                 j->queries++;
             } else {
@@ -447,8 +471,10 @@ int main(int argc, char **argv)
         default: return 2;
         }
     }
-    if (optind < argc && strcmp(argv[optind], "connections") == 0 && conns >= 1)
+    if (optind < argc && strcmp(argv[optind], "connections") == 0 && conns >= 1) {
+        resolve_query_ids();
         return connections();
+    }
     if (conns < 1 || conns > 256 || optind >= argc || multi_k < 0 || multi_k > 65536) {
         fprintf(stderr, "usage: tsdbc-bench load FILE [--conns N] [--batch ROWS] [--compression LEVEL]\n"
                         "       tsdbc-bench verify FILE | optimize\n"
@@ -464,6 +490,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[optind], "optimize") == 0)
         return optimize();
     if (strcmp(argv[optind], "query") == 0) {
+        resolve_query_ids();
         int bad = 0;
         for (int k = 0; k < CB_NCLASSES; k++)
             bad |= run_queries(&cb_classes[k]);

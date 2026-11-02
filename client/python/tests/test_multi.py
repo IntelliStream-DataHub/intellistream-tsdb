@@ -77,7 +77,7 @@ def test_values_and_lttb(target):
             with pytest.raises(TypeError):
                 r.values  # the series have different types
     # one type: one values column
-    r = c.query_values_multi(np.array(f32, dtype=np.uint32))
+    r = c.query_values_multi(np.array(f32, dtype=np.uint64))
     assert r.values.dtype == np.float32 and len(r.values) == len(r.ts) == r.offsets[-1]
     assert np.array_equal(r.values[r.offsets[1] : r.offsets[2]], one.query_values(f32[1])[1])
     # per-series ranges
@@ -181,7 +181,7 @@ def test_split_over_65536(server):
     """A list longer than one request carries goes as several, in order."""
     with Client("127.0.0.1", server.port, timeout=60) as c:
         f32, _ = fill(c)
-        series = np.array([f32[i % 3] for i in range(65_539)], dtype=np.uint32)
+        series = np.array([f32[i % 3] for i in range(65_539)], dtype=np.uint64)
         r = c.query_values_multi(series, T0 + 300 * 60_000, None, limit=1)
         assert len(r) == 65_539 and r.ok
         assert np.array_equal(np.diff(r.offsets), np.ones(65_539))

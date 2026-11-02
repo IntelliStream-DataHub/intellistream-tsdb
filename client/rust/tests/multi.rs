@@ -296,6 +296,7 @@ fn long_lists_are_split() {
     let mut c = srv.client();
     let ids = setup(&mut c);
     let n = 65_536 + 3;
+    // fillers: ids with a zero volume field, which no series has
     let mut series: Vec<u64> = (0..n as u64).map(|i| 5_000_000 + i).collect();
     for (k, at) in [0, 65_535, 65_536, n - 1].into_iter().enumerate() {
         series[at] = ids[k];
@@ -305,7 +306,7 @@ fn long_lists_are_split() {
     assert_eq!(b.len(), n);
     for (i, &id) in series.iter().enumerate() {
         let r = b[i].as_ref().unwrap();
-        if id < 5_000_000 {
+        if ids.contains(&id) {
             assert_eq!(key(r), key(&c.query_agg(id, .., 86_400_000).unwrap()), "series {i}");
         } else {
             assert!(r.is_empty());

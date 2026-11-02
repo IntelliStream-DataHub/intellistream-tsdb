@@ -429,7 +429,7 @@ static void check_raw(tsdb *db, ref *r, uint32_t s, int64_t start, int64_t end)
 {
     ref_final(r);
     tsdb_points p;
-    OK(tsdb_query_points(db, s, start, end, &p));
+    OK(tsdb_query_points(db, TSDB_SID(0, s), start, end, &p));
     size_t k = 0;
     bool ok = true;
     for (size_t i = 0; i < r->nfin; i++) {
@@ -458,7 +458,7 @@ static void check_agg(tsdb *db, ref *r, uint32_t s, int64_t start, int64_t end, 
 {
     tsdb_bucket *b;
     size_t nb;
-    int rc = tsdb_query_agg(db, s, start, end, interval, &b, &nb);
+    int rc = tsdb_query_agg(db, TSDB_SID(0, s), start, end, interval, &b, &nb);
     ref_final(r);
     if (rc == TSDB_ERR_TOO_MANY_BUCKETS && interval) {
         /* only when more than 4 Mi buckets lie between the first and the last reading in range */
@@ -527,7 +527,7 @@ static void check_order(tsdb *db, ref *r, uint32_t s, int64_t start, int64_t end
     ref_final(r);
     tsdb_query_opts q = {order, limit};
     tsdb_points p;
-    OK(tsdb_query_points_ex(db, s, start, end, &q, &p));
+    OK(tsdb_query_points_ex(db, TSDB_SID(0, s), start, end, &q, &p));
     /* the expected rows in ascending order */
     size_t ne = 0;
     for (size_t i = 0; i < r->nfin; i++)
@@ -620,11 +620,11 @@ static void test_db(const char *dir)
     for (int i = 0; i < NS; i++) {
         snprintf(name, sizeof name, "sensor.%d", i);
         OK(tsdb_series(db, name, &ids[i]));
-        CHECK(ids[i] == (uint32_t)i);
+        CHECK(ids[i] == TSDB_SID(0, i));
     }
     tsdb_sid again;
     OK(tsdb_series(db, "sensor.3", &again));
-    CHECK(again == 3);
+    CHECK(again == ids[3]);
     CHECK(tsdb_series_lookup(db, "nope", &again) == TSDB_ERR_NOTFOUND);
 
     ref r = {0};
@@ -640,15 +640,15 @@ static void test_db(const char *dir)
         int64_t base = t0 + (int64_t)(rnd() % (uint64_t)span);
         for (size_t i = 0; i < n; i++) {
             switch (shape) {
-            case 0: s[i] = (uint32_t)(batch % NS); t[i] = base + (int64_t)i * 1000; break;
-            case 1: s[i] = (uint32_t)(i % NS); t[i] = base + (int64_t)(i / NS) * 10000; break;
-            case 2: s[i] = (uint32_t)(rnd() % NS); t[i] = t0 + (int64_t)(rnd() % (uint64_t)span); break;
-            default: s[i] = (uint32_t)(rnd() % 2); t[i] = base + (int64_t)(rnd() % 50) * 1000; break;
+            case 0: s[i] = ids[batch % NS]; t[i] = base + (int64_t)i * 1000; break;
+            case 1: s[i] = ids[i % NS]; t[i] = base + (int64_t)(i / NS) * 10000; break;
+            case 2: s[i] = ids[rnd() % NS]; t[i] = t0 + (int64_t)(rnd() % (uint64_t)span); break;
+            default: s[i] = ids[rnd() % 2]; t[i] = base + (int64_t)(rnd() % 50) * 1000; break;
             }
             v[i] = (rnd() % 50 == 0) ? NAN : (float)((int64_t)(rnd() % 2000) - 1000) / 10.0f;
             if (shape == 2 && rnd() % 2)
                 v[i] = (float)(i % 10); /* repeated values */
-            ref_add(&r, s[i], t[i], v[i]);
+            ref_add(&r, TSDB_SID_LOCAL(s[i]), t[i], v[i]);
         }
         if (shape == 0)
             OK(tsdb_insert_series(db, s[0], t, v, n));
@@ -662,11 +662,11 @@ static void test_db(const char *dir)
     for (int i = 0; i < 500; i++) {
         int64_t t = -1800000 + i * 7919;
         float v = (float)i;
-        OK(tsdb_insert_series(db, 5, &t, &v, 1));
+        OK(tsdb_insert_series(db, ids[5], &t, &v, 1));
         ref_add(&r, 5, t, v);
     }
     /* bad input is rejected */
-    tsdb_sid bad = 99;
+    tsdb_sid bad = TSDB_SID(0, 99);
     int64_t bt = 0;
     float bv = 0;
     CHECK(tsdb_insert(db, &bad, &bt, &bv, 1) == TSDB_ERR_INVALID);
@@ -694,7 +694,7 @@ static void test_db(const char *dir)
     for (int i = 0; i < 1000; i++) {
         int64_t t = t0 + span + i * 500;
         float v = (float)(i % 13);
-        OK(tsdb_append(db, (uint32_t)(i % NS), t, v));
+        OK(tsdb_append(db, ids[i % NS], t, v));
         ref_add(&r, (uint32_t)(i % NS), t, v);
     }
     OK(tsdb_flush(db));
@@ -705,9 +705,9 @@ static void test_db(const char *dir)
     o.read_only = 1;
     OK(tsdb_open(dir, &o, &db));
     CHECK(tsdb_series_count(db) == NS);
-    CHECK(strcmp(tsdb_series_name(db, 4), "sensor.4") == 0);
+    CHECK(strcmp(tsdb_series_name(db, ids[4]), "sensor.4") == 0);
     check_all(db, &r, NS, t0, span);
-    CHECK(tsdb_insert_series(db, 0, &bt, &bv, 1) == TSDB_ERR_READONLY);
+    CHECK(tsdb_insert_series(db, ids[0], &bt, &bv, 1) == TSDB_ERR_READONLY);
     OK(tsdb_close(db));
     o.read_only = 0;
 
@@ -997,14 +997,14 @@ static void *flush_main(void *db)
 
 static void *append_two(void *db)
 {
-    OK(tsdb_append(db, 0, 1700000000000, 2.0f));
+    OK(tsdb_append(db, TSDB_SID(0, 0), 1700000000000, 2.0f));
     return NULL;
 }
 
 static float value_at(tsdb *db, int64_t t)
 {
     tsdb_points p;
-    OK(tsdb_query_points(db, 0, t, t + 1, &p));
+    OK(tsdb_query_points(db, TSDB_SID(0, 0), t, t + 1, &p));
     float v = p.n == 1 ? p.values[0] : NAN;
     tsdb_points_free(&p);
     return v;
@@ -1069,7 +1069,7 @@ static void *insert_parts(void *a)
         ts[i] = p->t + (p->two && i >= 100 ? 3600000 : 0) + i;
         v[i] = 2.0f;
     }
-    OK(tsdb_insert_series(p->db, 0, ts, v, 200));
+    OK(tsdb_insert_series(p->db, TSDB_SID(0, 0), ts, v, 200));
     return NULL;
 }
 
@@ -1159,7 +1159,7 @@ static void *writer(void *a)
             t[i] = 1700000000000 + ((int64_t)b * 500 + i) * 1000;
             v[i] = (float)c->id;
         }
-        OK(tsdb_insert_series(c->db, c->id, t, v, 500));
+        OK(tsdb_insert_series(c->db, TSDB_SID(0, c->id), t, v, 500));
     }
     return NULL;
 }
@@ -1171,12 +1171,12 @@ static void *reader(void *a)
         for (uint32_t s = 0; s < 4; s++) {
             tsdb_bucket *b;
             size_t nb;
-            OK(tsdb_query_agg(c->db, s, INT64_MIN, INT64_MAX, 60000, &b, &nb));
+            OK(tsdb_query_agg(c->db, TSDB_SID(0, s), INT64_MIN, INT64_MAX, 60000, &b, &nb));
             for (size_t i = 0; i < nb; i++)
                 CHECK(b[i].min == (float)s && b[i].max == (float)s);
             free(b);
             tsdb_points p;
-            OK(tsdb_query_points(c->db, s, INT64_MIN, INT64_MAX, &p));
+            OK(tsdb_query_points(c->db, TSDB_SID(0, s), INT64_MIN, INT64_MAX, &p));
             for (size_t i = 1; i < p.n; i++)
                 CHECK(p.ts[i - 1] < p.ts[i]);
             tsdb_points_free(&p);
@@ -1223,7 +1223,7 @@ static void test_concurrency(const char *dir)
     for (uint32_t s = 0; s < 4; s++) {
         tsdb_bucket *b;
         size_t nb;
-        OK(tsdb_query_agg(db, s, INT64_MIN, INT64_MAX, 0, &b, &nb));
+        OK(tsdb_query_agg(db, TSDB_SID(0, s), INT64_MIN, INT64_MAX, 0, &b, &nb));
         CHECK(nb == 1 && b[0].count == 100000 && b[0].sum == 100000.0 * s);
         free(b);
     }
@@ -2127,7 +2127,7 @@ static void test_raw_many_parts(const char *base)
     }
     free(ts);
     free(v);
-    const uint32_t ids[2] = {sd, si};
+    const tsdb_sid ids[2] = {sd, si};
     for (int s = 0; s < 2; s++) {
         heap_watch h = {.last = INT64_MIN, .ordered = 1};
         h.base = h.peak = heap_in_use();

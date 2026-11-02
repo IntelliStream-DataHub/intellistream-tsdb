@@ -121,17 +121,29 @@ class EmbeddedDbTest {
     }
 
     /**
-     * Ids are 64 bits: one past 2^32 is unknown to every call, never the series of its low 32 bits (here series a,
-     * which must not change).
+     * Ids are (volume + 1) << 32 | local: every real id is past 2^32 and taken whole, in the database directory and
+     * in another volume. A malformed id (a zero volume field, as a truncated id has; any of bits 48-63; a volume the
+     * database does not have; a local number past the volume's series) is unknown to every call, never the series of
+     * its low 32 bits (here series a, which must not change).
      */
     @Test
-    void idsBeyond32BitsAreUnknown() throws TsdbException {
+    void idsCarryTheVolumeAndMalformedOnesAreUnknown() throws TsdbException {
+        db.close();
+        db = EmbeddedDb.open(tmp.resolve("db").toString(),
+                new EmbeddedOptions().fsync(false).walSyncMs(-1).createVolumes(true));
         long a = db.series("a");
         long st = db.seriesCreate("st", ValueType.STATE);
+        long c = db.seriesAt("c", tmp.resolve("volume").toString());
+        assertEquals(1L << 32, a);
+        assertEquals((1L << 32) | 1, st);
+        assertEquals(2L << 32, c);
         db.insert(a, new long[] {T0}, new float[] {1});
+        db.insert(c, new long[] {T0}, new float[] {3});
+        assertEquals("c", db.seriesName(c));
         long[] ts = {T0, T0 + 1000};
         float[] v = {7, 8};
-        for (long big : new long[] {a | 1L << 32, st | 1L << 32, -1L, Long.MIN_VALUE | a}) {
+        for (long big : new long[] {a & 0xFFFF_FFFFL, st & 0xFFFF_FFFFL, a | 1L << 48, -1L, Long.MIN_VALUE | a,
+                a + (2L << 32), c + 1, a + 1000}) {
             String what = Long.toUnsignedString(big);
             assertEquals(Status.ERR_INVALID, status(() -> db.insert(big, ts, v)), what);
             assertEquals(Status.ERR_INVALID, status(() -> db.insert(new long[] {a, big}, ts, v)), what);
@@ -150,8 +162,9 @@ class EmbeddedDbTest {
             assertEquals(1, multi.get(1).get().size(), what);
         }
         assertArrayEquals(new float[] {1}, db.queryPoints(a, Long.MIN_VALUE, Long.MAX_VALUE).values());
+        assertArrayEquals(new float[] {3}, db.queryPoints(c, Long.MIN_VALUE, Long.MAX_VALUE).values());
         assertEquals("a", db.seriesName(a));
-        assertEquals(2, db.seriesCount());
+        assertEquals(3, db.seriesCount());
     }
 
     @Test

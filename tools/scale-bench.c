@@ -47,8 +47,14 @@ static uint64_t points = 10000000, window = 100000;
 
 static ds_kind kind_of(uint32_t s) { return (ds_kind)(s % (DS_KINDS - 1)); } /* mixed: no random */
 
-/* Rows of series [s0, s0 + ns) for samples [i0, i0 + n), series by series. */
-static size_t gen(ds_state *st, uint32_t s0, uint32_t ns, uint64_t n, tsdb_sid *sv, int64_t *tv, float *vv)
+/* Series are numbered 0 .. nseries - 1 here, in the row file and in the SQL; sids[] holds their ids, which carry
+ * the volume in their high bits and are not those numbers. Loads create the series by name, queries look them up. */
+static tsdb_sid *sids;
+
+static void series_name(uint32_t s, char *name, size_t len) { snprintf(name, len, "%s.%u", ds_info[kind_of(s)].name, s); }
+
+/* Rows of series [s0, s0 + ns) for samples [i0, i0 + n), series by series; sv[] gets the series numbers. */
+static size_t gen(ds_state *st, uint32_t s0, uint32_t ns, uint64_t n, uint32_t *sv, int64_t *tv, float *vv)
 {
     size_t k = 0;
     for (uint32_t s = 0; s < ns; s++)
@@ -76,7 +82,8 @@ static void *load_worker(void *arg)
 {
     tsdb *db = arg;
     size_t cap = (size_t)group_series * window;
-    tsdb_sid *sv = malloc(cap * sizeof *sv);
+    uint32_t *sv = malloc(cap * sizeof *sv);
+    tsdb_sid *idv = malloc(cap * sizeof *idv);
     int64_t *tv = malloc(cap * sizeof *tv);
     float *vv = malloc(cap * sizeof *vv);
     ds_state *st = malloc(group_series * sizeof *st);
@@ -87,7 +94,9 @@ static void *load_worker(void *arg)
         for (uint64_t i0 = 0; i0 < points; i0 += window) {
             uint64_t n = points - i0 < window ? points - i0 : window;
             size_t rows = gen(st, s0, ns, n, sv, tv, vv);
-            int rc = tsdb_insert(db, sv, tv, vv, rows);
+            for (size_t k = 0; k < rows; k++)
+                idv[k] = sids[sv[k]];
+            int rc = tsdb_insert(db, idv, tv, vv, rows);
             if (rc) {
                 fprintf(stderr, "insert: %s\n", tsdb_strerror(rc));
                 exit(1);
@@ -96,6 +105,7 @@ static void *load_worker(void *arg)
         }
     }
     free(sv);
+    free(idv);
     free(tv);
     free(vv);
     free(st);
@@ -112,12 +122,12 @@ static int cmd_load(void)
         fprintf(stderr, "open %s: %s\n", dir, tsdb_strerror(rc));
         return 1;
     }
-    for (uint32_t s = 0; s < nseries; s++) { /* ids are assigned in order, so series s gets id s */
+    sids = calloc(nseries ? nseries : 1, sizeof *sids);
+    for (uint32_t s = 0; s < nseries; s++) {
         char name[64];
-        tsdb_sid id;
-        snprintf(name, sizeof name, "%s.%u", ds_info[kind_of(s)].name, s);
-        if ((rc = tsdb_series(db, name, &id)) != 0 || id != s) {
-            fprintf(stderr, "series %s: %s\n", name, rc ? tsdb_strerror(rc) : "unexpected id");
+        series_name(s, name, sizeof name);
+        if ((rc = tsdb_series(db, name, &sids[s])) != 0) {
+            fprintf(stderr, "series %s: %s\n", name, tsdb_strerror(rc));
             return 1;
         }
     }
@@ -172,7 +182,7 @@ static int cmd_export(void)
     if (!s_to)
         s_to = nseries;
     size_t cap = (size_t)group_series * window;
-    tsdb_sid *sv = malloc(cap * sizeof *sv);
+    uint32_t *sv = malloc(cap * sizeof *sv);
     int64_t *tv = malloc(cap * sizeof *tv);
     float *vv = malloc(cap * sizeof *vv);
     char *buf = malloc(cap * 16);
@@ -184,8 +194,7 @@ static int cmd_export(void)
             uint64_t n = points - i0 < window ? points - i0 : window;
             size_t rows = gen(st, s0, ns, n, sv, tv, vv);
             for (size_t k = 0; k < rows; k++) {
-                uint32_t id32 = (uint32_t)sv[k]; /* the row file keeps its 4-byte id */
-                memcpy(buf + k * 16, &id32, 4);
+                memcpy(buf + k * 16, &sv[k], 4); /* the series number, as in the SQL; not the id */
                 memcpy(buf + k * 16 + 4, &tv[k], 8);
                 memcpy(buf + k * 16 + 12, &vv[k], 4);
             }
@@ -257,13 +266,15 @@ static int count_raw(void *ctx, const int64_t *ts, const float *v, size_t n)
 static int run_one(const target *tg, int slot, const qclass *qc, uint32_t s, int64_t start, int64_t end, tally *t)
 {
     tsdbc *c = tg->conns ? tg->conns[slot] : NULL;
+    tsdb_sid id = sids[s];
     if (qc->kind == Q_RAW)
-        return c ? tsdbc_query_raw(c, s, start, end, count_raw, t) : tsdb_query_raw(tg->db, s, start, end, count_raw, t);
+        return c ? tsdbc_query_raw(c, id, start, end, count_raw, t)
+                 : tsdb_query_raw(tg->db, id, start, end, count_raw, t);
     const tsdb_group *g = qc->group == G_NONE ? NULL : &groups[qc->group];
     tsdb_bucket *b = NULL;
     size_t nb = 0;
-    int rc = c ? tsdbc_query_group(c, s, start, end, g, NULL, &b, &nb)
-               : tsdb_query_group_local(tg->db, s, start, end, g, NULL, &b, &nb);
+    int rc = c ? tsdbc_query_group(c, id, start, end, g, NULL, &b, &nb)
+               : tsdb_query_group_local(tg->db, id, start, end, g, NULL, &b, &nb);
     for (size_t i = 0; i < nb; i++) {
         t->rows += b[i].count;
         t->sum += b[i].sum;
@@ -412,6 +423,16 @@ static int cmd_query(void)
         int rc = tsdb_open(dir, &o, &tg.db);
         if (rc) {
             fprintf(stderr, "open %s: %s\n", dir, tsdb_strerror(rc));
+            return 1;
+        }
+    }
+    sids = calloc(nseries ? nseries : 1, sizeof *sids);
+    for (uint32_t s = 0; s < nseries; s++) {
+        char name[64];
+        series_name(s, name, sizeof name);
+        int rc = tg.conns ? tsdbc_series(tg.conns[0], name, 0, &sids[s]) : tsdb_series_lookup(tg.db, name, &sids[s]);
+        if (rc) {
+            fprintf(stderr, "series %s: %s\n", name, tg.conns ? tsdbc_strerror(rc) : tsdb_strerror(rc));
             return 1;
         }
     }

@@ -371,8 +371,8 @@ with tsdb_client.Db("/tmp/tsdb-many") as db:
     db.insert_many([(s, ts, np.full(1440, i + 1.0, dtype=np.float32)) for i, s in enumerate(pumps)])
 
     # the first hour of every pump: one (timestamps, values) pair per query
-    for s, (t, v) in zip(pumps, db.query_raw_many(pumps, t0, t0 + 3_600_000)):
-        print("raw  ", s, len(t), v.sum())
+    for i, (t, v) in enumerate(db.query_raw_many(pumps, t0, t0 + 3_600_000)):
+        print("raw  ", f"pump{i}", len(t), v.sum())
 
     # hourly buckets of every pump, then numpy over all of them at once
     hours = db.query_agg_many(pumps, t0, t0 + 86_400_000, 3_600_000)

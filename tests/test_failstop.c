@@ -671,31 +671,39 @@ static void test_series_dict(const char *base)
     printf("  failed series dictionary append\n");
 }
 
-/* CATALOG maps series to volumes; a torn record shifts every later one. */
-static void test_catalog(const char *base)
+/* A volume add writes the volume's META (its number, which ids carry) before the VOLUMES line names the
+ * directory. A failed write leaves no line and stops the writer; the add retried after the reopen completes the
+ * directory, under the number it gets then. */
+static void test_volume_meta(const char *base)
 {
-    char name[600];
-    snprintf(name, sizeof name, "%s/failstop-catalog", base);
+    char name[600], vol[700], cmd[800];
+    snprintf(name, sizeof name, "%s/failstop-volmeta", base);
+    snprintf(vol, sizeof vol, "%s/failstop-volmeta-v1", base);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", vol);
+    if (system(cmd) != 0)
+        failures++;
     tsdb *db = open_fresh(name, opts());
-    tsdb_sid a, b, c;
+    tsdb_sid a, b;
     OK(tsdb_series(db, "a", &a));
-    arm(F_WRITE, "/CATALOG", true, false);
-    CHECK(tsdb_series(db, "b", &b) == TSDB_ERR_IO);
+    OK(tsdb_append(db, a, 1, 1));
+    arm(F_WRITE, "-v1/META.tmp", true, false);
+    CHECK(tsdb_series_at(db, "b", vol, &b) == TSDB_ERR_IO);
     CHECK(fired() == 1);
-    int rc = tsdb_series(db, "c", &c);
-    CHECK(rc == TSDB_ERR_IO);
-    CHECK(is_failed(db, "CATALOG"));
-    if (rc == 0)
-        OK(tsdb_append(db, c, 7, 7));
+    CHECK(tsdb_volume_count(db) == 1);
+    CHECK(is_failed(db, "META"));
     db = reopen(db);
-    tsdb_sid got;
-    OK(tsdb_series_lookup(db, "a", &got));
-    if (rc == 0) {
-        int64_t seven[] = {7};
-        expect_rows(db, "c", seven, 1);
-    }
+    CHECK(tsdb_volume_count(db) == 1);
+    OK(tsdb_series_at(db, "b", vol, &b));
+    CHECK(b == TSDB_SID(1, 0) && tsdb_volume_count(db) == 2);
+    OK(tsdb_append(db, b, 7, 7));
+    db = reopen(db);
+    int64_t one[] = {1}, seven[] = {7};
+    expect_rows(db, "a", one, 1);
+    expect_rows(db, "b", seven, 1);
     tsdb_close(db);
-    printf("  failed CATALOG append\n");
+    if (system(cmd) != 0)
+        failures++;
+    printf("  failed volume META write\n");
 }
 
 /* wal_sync_ms > 0: the flusher's sync fails with no writer waiting; the next
@@ -754,7 +762,7 @@ static int insert_n(tsdb *db, tsdb_sid id, int64_t ts0, int n, bool split)
 
 typedef struct {
     tsdb *db;
-    uint32_t series;
+    tsdb_sid series;
     const char *name;
     uint32_t code;
     int rc;
@@ -1165,7 +1173,7 @@ static void test_wal_unlink(const char *base)
  * fsync failed in a flush). */
 typedef struct {
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     int rc;
 } inserter;
 
@@ -1237,7 +1245,7 @@ int main(int argc, char **argv)
     test_flush_retry(root);
     test_manifest(root);
     test_series_dict(root);
-    test_catalog(root);
+    test_volume_meta(root);
     test_background_sync(root);
     test_state_race(root);
     test_intent(root);

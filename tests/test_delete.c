@@ -68,6 +68,7 @@ static void rmrf(const char *dir)
 /* ------------------------------------------------------------------ model */
 
 #define NS 3
+#define SID(s) TSDB_SID(0, TSDB_SID_LOCAL(s)) /* every series here is in the database directory: an index or an id */
 #define D 16000 /* timestamps 0..D-1: eight partitions of 2000 ms */
 #define ABSENT INT64_MAX
 #define NULLV INT64_MIN
@@ -146,13 +147,13 @@ static void db_apply(tsdb **db, const char *dir, const op *o)
     switch (o->kind) {
     case OP_SMALL:
     case OP_LARGE:
-        OK(tsdb_insert_series_values(*db, o->s, o->ts, &v, o->n));
+        OK(tsdb_insert_series_values(*db, SID(o->s), o->ts, &v, o->n));
         break;
     case OP_DELETE:
-        OK(tsdb_delete_range(*db, o->s, o->a, o->b));
+        OK(tsdb_delete_range(*db, SID(o->s), o->a, o->b));
         break;
     case OP_REPLACE:
-        OK(tsdb_replace_range(*db, o->s, o->a, o->b, o->ts, &v, o->n));
+        OK(tsdb_replace_range(*db, SID(o->s), o->a, o->b, o->ts, &v, o->n));
         break;
     case OP_FLUSH:
         OK(tsdb_flush(*db));
@@ -176,7 +177,7 @@ static void create_series(tsdb *db)
         tsdb_sid id;
         snprintf(name, sizeof name, "s%u", s);
         OK(tsdb_series_create(db, name, TSDB_INT64, NULL, &id));
-        CHECK(id == s);
+        CHECK(id == SID(s));
     }
 }
 
@@ -201,7 +202,7 @@ static bool series_matches(tsdb *db, const model *m, uint32_t s, bool quiet)
 {
     static rows r;
     r.n = 0;
-    if (tsdb_query_values(db, s, INT64_MIN, INT64_MAX, NULL, collect, &r) != 0)
+    if (tsdb_query_values(db, SID(s), INT64_MIN, INT64_MAX, NULL, collect, &r) != 0)
         return false;
     size_t k = 0;
     for (int64_t t = 0; t < D; t++) {
@@ -230,7 +231,7 @@ static void check_queries(tsdb *db, const model *m, uint64_t *r)
         int64_t interval = q % 2 ? 0 : 500;
         tsdb_bucket *bk = NULL;
         size_t nb = 0;
-        OK(tsdb_query_agg(db, s, a, b, interval, &bk, &nb));
+        OK(tsdb_query_agg(db, SID(s), a, b, interval, &bk, &nb));
         size_t j = 0;
         for (int64_t lo = interval ? a - a % interval : a; lo < MIN(b, D); lo = interval ? lo + interval : D) {
             uint64_t cnt = 0, rowsin = 0;
@@ -264,7 +265,7 @@ static void check_queries(tsdb *db, const model *m, uint64_t *r)
         static rows rr;
         rr.n = 0;
         tsdb_query_opts qo = {TSDB_DESC, 1 + rnd(r) % 100};
-        OK(tsdb_query_values(db, s, a, b, &qo, collect, &rr));
+        OK(tsdb_query_values(db, SID(s), a, b, &qo, collect, &rr));
         size_t k = 0;
         for (int64_t t = MIN(b, D) - 1; t >= a && k < qo.limit; t--) {
             if (m->v[s][t] == ABSENT)
@@ -433,7 +434,7 @@ static void wr_put(tsdb *db, uint32_t s, int64_t a, int64_t b, int64_t add)
         v[n] = add + t;
     }
     tsdb_values col = {TSDB_INT64, v, NULL};
-    OK(tsdb_insert_series_values(db, s, ts, &col, n));
+    OK(tsdb_insert_series_values(db, SID(s), ts, &col, n));
 }
 
 static void wr_check(tsdb *db, const int64_t *exp0, const char *when)
@@ -441,7 +442,7 @@ static void wr_check(tsdb *db, const int64_t *exp0, const char *when)
     static rows r;
     for (uint32_t s = 0; s < 2; s++) {
         r.n = 0;
-        OK(tsdb_query_values(db, s, INT64_MIN, INT64_MAX, NULL, collect, &r));
+        OK(tsdb_query_values(db, SID(s), INT64_MIN, INT64_MAX, NULL, collect, &r));
         size_t k = 0;
         bool ok = true;
         for (int64_t t = 0; t < 10000; t += 100) {
@@ -476,12 +477,12 @@ static void test_wal_replay(void)
         create_series(db);
         wr_put(db, 0, 0, 10000, 0); /* five partitions, all in the memtable */
         wr_put(db, 1, 0, 10000, 0);
-        OK(tsdb_delete_range(db, 0, 2000, 6000));
+        OK(tsdb_delete_range(db, SID(0), 2000, 6000));
         wr_put(db, 0, 3000, 4000, 1000000);   /* after the delete: visible */
         wr_put(db, 0, 7000, 8000, 2000000);   /* overwrites outside the range */
         int64_t ts = 8500, v = 3000000;
         tsdb_values col = {TSDB_INT64, &v, NULL};
-        OK(tsdb_replace_range(db, 0, 8000, 9000, &ts, &col, 1));
+        OK(tsdb_replace_range(db, SID(0), 8000, 9000, &ts, &col, 1));
         wr_put(db, 0, 8800, 8900, 4000000);   /* after the replace */
         raise(SIGKILL);
         _exit(1);
@@ -516,7 +517,7 @@ static int64_t agg_count(tsdb *db, uint32_t s, int64_t a, int64_t b, int64_t *su
 {
     tsdb_bucket *bk = NULL;
     size_t nb = 0;
-    OK(tsdb_query_agg(db, s, a, b, 0, &bk, &nb));
+    OK(tsdb_query_agg(db, SID(s), a, b, 0, &bk, &nb));
     tsdb_last_query_stats(st);
     int64_t c = nb ? (int64_t)bk[0].count : 0;
     *sum = nb ? bk[0].isum : 0;
@@ -541,7 +542,7 @@ static void test_stats(void)
     for (int i = 0; i < N; i++)
         ts[i] = i, v[i] = i;
     tsdb_values tv = {TSDB_INT64, v, NULL};
-    OK(tsdb_insert_series_values(db, 1, ts, &tv, N));
+    OK(tsdb_insert_series_values(db, SID(1), ts, &tv, N));
     OK(tsdb_optimize(db));
     tsdb_query_stats st;
     int64_t sum;
@@ -549,12 +550,12 @@ static void test_stats(void)
     CHECK(st.granules > 0 && st.granules_from_stats == st.granules);
 
     /* deleting another series' range, or this series' range outside its rows, costs no decoding */
-    OK(tsdb_delete_range(db, 0, 0, N));
-    OK(tsdb_delete_range(db, 1, N + 10, N + 1000));
+    OK(tsdb_delete_range(db, SID(0), 0, N));
+    OK(tsdb_delete_range(db, SID(1), N + 10, N + 1000));
     CHECK(agg_count(db, 1, 0, N, &sum, &st) == N);
     CHECK(st.granules_from_stats == st.granules);
 
-    OK(tsdb_delete_range(db, 1, 1000, 2000));
+    OK(tsdb_delete_range(db, SID(1), 1000, 2000));
     int64_t want = (int64_t)N * (N - 1) / 2 - (1000 + 1999) * 1000 / 2;
     CHECK(agg_count(db, 1, 0, N, &sum, &st) == N - 1000 && sum == want);
     CHECK(st.granules - st.granules_from_stats <= 1000 / 64 + 2 && st.granules_from_stats > 0);
@@ -563,13 +564,13 @@ static void test_stats(void)
     {
         static rows rr;
         rr.n = 0;
-        OK(tsdb_query_values(db, 1, 0, 3000, NULL, collect, &rr));
+        OK(tsdb_query_values(db, SID(1), 0, 3000, NULL, collect, &rr));
         tsdb_last_query_stats(&st);
         CHECK(rr.n == 2000 && st.memtable_rows == 0 && st.rows_decoded > 0);
         tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
         tsdb_twa_bucket *tb = NULL;
         size_t ntb = 0;
-        OK(tsdb_query_twa(db, 1, 0, N, 0, &to, &tb, &ntb));
+        OK(tsdb_query_twa(db, SID(1), 0, N, 0, &to, &tb, &ntb));
         tsdb_last_query_stats(&st);
         CHECK(ntb == 1 && st.memtable_rows == 0 && st.rows_decoded > 0);
         free(tb);
@@ -577,7 +578,7 @@ static void test_stats(void)
     /* a later insert into the deleted range is visible; the delete hides only what came before it */
     int64_t t1 = 1500, v1 = 7;
     tsdb_values one = {TSDB_INT64, &v1, NULL};
-    OK(tsdb_insert_series_values(db, 1, &t1, &one, 1));
+    OK(tsdb_insert_series_values(db, SID(1), &t1, &one, 1));
     CHECK(agg_count(db, 1, 0, N, &sum, &st) == N - 999 && sum == want + 7);
     OK(tsdb_flush(db));
     CHECK(agg_count(db, 1, 0, N, &sum, &st) == N - 999 && sum == want + 7);
@@ -592,8 +593,8 @@ static void test_stats(void)
     /* replace: the old range goes, the new rows stay, outside rows are refused */
     int64_t rts[3] = {50000, 50001, 50500}, rv[3] = {1, 2, 3};
     tsdb_values rtv = {TSDB_INT64, rv, NULL};
-    CHECK(tsdb_replace_range(db, 1, 50000, 50500, rts, &rtv, 3) == TSDB_ERR_INVALID);
-    OK(tsdb_replace_range(db, 1, 50000, 51000, rts, &rtv, 3));
+    CHECK(tsdb_replace_range(db, SID(1), 50000, 50500, rts, &rtv, 3) == TSDB_ERR_INVALID);
+    OK(tsdb_replace_range(db, SID(1), 50000, 51000, rts, &rtv, 3));
     CHECK(agg_count(db, 1, 50000, 51000, &sum, &st) == 3 && sum == 6);
     CHECK(agg_count(db, 1, 0, N, &sum, &st) == N - 999 - 997);
     OK(tsdb_close(db));
@@ -619,7 +620,7 @@ static void test_follower(void)
     for (int i = 0; i < 100; i++)
         ts[i] = i * 100, v[i] = i;
     tsdb_values tv = {TSDB_INT64, v, NULL};
-    OK(tsdb_insert_series_values(db, 2, ts, &tv, 100));
+    OK(tsdb_insert_series_values(db, SID(2), ts, &tv, 100));
     OK(tsdb_flush(db));
     tsdb_options fopt = test_opts();
     fopt.follow = 1;
@@ -628,7 +629,7 @@ static void test_follower(void)
     int64_t sum;
     tsdb_query_stats st;
     CHECK(agg_count(fo, 2, 0, D, &sum, &st) == 100);
-    OK(tsdb_delete_range(db, 2, 0, 5000));
+    OK(tsdb_delete_range(db, SID(2), 0, 5000));
     int64_t n = -1;
     for (int i = 0; i < 300 && n != 50; i++) {
         struct timespec d = {0, 10000000};
@@ -661,7 +662,7 @@ static size_t values_span(tsdb *db, uint32_t s, int64_t a, int64_t b, tsdb_order
     static rows rr;
     rr.n = 0;
     tsdb_query_opts qo = {order, 0};
-    OK(tsdb_query_values(db, s, a, b, &qo, collect, &rr));
+    OK(tsdb_query_values(db, SID(s), a, b, &qo, collect, &rr));
     *first = rr.n ? rr.ts[0] : -1;
     *last = rr.n ? rr.ts[rr.n - 1] : -1;
     return rr.n;
@@ -695,15 +696,15 @@ static void test_retention(void)
         ts[i] = i, v[i] = 1;
     tsdb_values tv = {TSDB_INT64, v, NULL};
     for (tsdb_sid s = 0; s < NS; s++)
-        OK(tsdb_insert_series_values(db, s, ts, &tv, D));
+        OK(tsdb_insert_series_values(db, SID(s), ts, &tv, D));
     int64_t lim = -1, sum;
     tsdb_query_stats st;
-    OK(tsdb_get_retention(db, 0, &lim));
+    OK(tsdb_get_retention(db, SID(0), &lim));
     CHECK(lim == 0);
-    CHECK(tsdb_set_retention(db, 0, -5) == TSDB_ERR_INVALID);
-    CHECK(tsdb_set_retention(db, 99, 5) != 0);
-    OK(tsdb_set_retention(db, 0, 10000)); /* cutoff 10000 */
-    OK(tsdb_set_retention(db, 1, 30000)); /* cutoff -10000: keeps everything */
+    CHECK(tsdb_set_retention(db, SID(0), -5) == TSDB_ERR_INVALID);
+    CHECK(tsdb_set_retention(db, SID(99), 5) != 0);
+    OK(tsdb_set_retention(db, SID(0), 10000)); /* cutoff 10000 */
+    OK(tsdb_set_retention(db, SID(1), 30000)); /* cutoff -10000: keeps everything */
     CHECK(agg_count(db, 0, 0, D, &sum, &st) == D - 10000);
     CHECK(agg_count(db, 1, 0, D, &sum, &st) == D);
     CHECK(values_from(db, 0, 10000) && values_from(db, 1, 0));
@@ -716,13 +717,13 @@ static void test_retention(void)
     OK(tsdb_close(db));
     fake_now = 21000;
     OK(tsdb_open(dir, &opt, &db));
-    OK(tsdb_get_retention(db, 0, &lim));
+    OK(tsdb_get_retention(db, SID(0), &lim));
     CHECK(lim == 10000);
     CHECK(agg_count(db, 0, 0, D, &sum, &st) == D - 11000);
     CHECK(values_from(db, 0, 11000));
     OK(tsdb_optimize(db)); /* merges drop the expired rows for good */
     CHECK(values_from(db, 0, 11000));
-    OK(tsdb_set_retention(db, 0, 0));
+    OK(tsdb_set_retention(db, SID(0), 0));
     CHECK(agg_count(db, 0, 0, D, &sum, &st) == D - 11000);
     CHECK(values_from(db, 0, 11000));
     CHECK(agg_count(db, 1, 0, D, &sum, &st) == D);
@@ -740,8 +741,8 @@ static void test_retention(void)
     fake_now = 26000;
     /* series 0 keeps its rows from 11000 on (no limit now, the rest merged away), cutoffs: series 1 6000,
      * series 2 3000: partition 0 goes whole, the rows before the cutoffs in the others are rewritten away */
-    OK(tsdb_set_retention(db, 1, 20000));
-    OK(tsdb_set_retention(db, 2, 23000));
+    OK(tsdb_set_retention(db, SID(1), 20000));
+    OK(tsdb_set_retention(db, SID(2), 23000));
     const uint64_t want = (D - 11000) + (D - 6000) + (D - 3000);
     for (int i = 0; i < 100; i++) {
         OK(tsdb_get_stats(db, &ds));

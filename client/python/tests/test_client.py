@@ -96,7 +96,7 @@ def test_numpy(client):
     t[0] = 0  # writable
     t, v = client.query_raw(a, order="desc", limit=2, numpy=True)
     assert list(t) == [ts[-1], ts[-2]]
-    client.insert(np.array([a, a], dtype=np.uint32), np.array([T0, T0 + 1000]), np.array([5, 6], dtype=np.float32))
+    client.insert(np.array([a, a], dtype=np.uint64), np.array([T0, T0 + 1000]), np.array([5, 6], dtype=np.float32))
     assert list(client.query_raw(a, limit=2)[1]) == [5.0, 6.0]
 
 
@@ -178,8 +178,8 @@ def test_errors(server, client):
     assert e.value.code == tsdb_client.ERR_INVALID
     assert str(e.value) == "server error -4: invalid argument"
     assert tsdb_client.strerror(tsdb_client.ERR_NOTFOUND) == "not found"
-    # ids are 64 bits on the wire (protocol 11): an id above 2**32 goes out whole and tsdbd, which hands out none yet,
-    # does not know it. It is never taken for `a`, whose low 32 bits it shares.
+    # ids are 64 bits on the wire (protocol 11) and carry the volume above bit 32: a + 2**32 goes out whole and names
+    # a volume tsdbd does not have. It is never taken for `a`, whose low 32 bits it shares.
     for call in (
         lambda: client.insert_series(a + 2**32, [T0], [1.0]),
         lambda: client.insert([a, a + 2**32], [T0, T0], [1.0, 2.0]),
@@ -232,7 +232,7 @@ def test_threads_share_or_own_clients(server, client):
     def work(c, sid):
         try:
             for r in range(20):
-                c.insert_series_async(sid, [T0 + (r * 500 + i) * 1000 for i in range(500)], [float(sid)] * 500)
+                c.insert_series_async(sid, [T0 + (r * 500 + i) * 1000 for i in range(500)], [float(sid & 0xFFFFFFFF)] * 500)
             c.wait()
         except Exception as e:  # noqa: BLE001 - reported below
             errors.append(e)
@@ -249,7 +249,7 @@ def test_threads_share_or_own_clients(server, client):
     assert errors == []
     for sid in ids:
         (b,) = client.query_agg(sid)
-        assert (b.count, b.min, b.max) == (10_000, sid, sid)
+        assert (b.count, b.min, b.max) == (10_000, sid & 0xFFFFFFFF, sid & 0xFFFFFFFF)
 
 
 def test_last_query_stats(client):

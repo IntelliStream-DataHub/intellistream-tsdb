@@ -19,7 +19,7 @@
  * (SIGSTOP/SIGCONT), eio (the crashfs shim fails one write or sync with EIO
  * and from then on lies about that file's syncs, as Linux may after a failed
  * writeback; at exit it rolls back what was not made durable). After an EIO
- * on anything already relied upon (the WAL, MANIFEST, a dictionary, CATALOG,
+ * on anything already relied upon (the WAL, MANIFEST, a dictionary, a volume's META,
  * the directory) the server must stop by itself with exit status 1
  * (fail-stop); after one on an unpublished part (tmp_*) or intent (txn_*) it
  * may stop or carry on, and then loses power (or, if idle, is stopped with
@@ -735,7 +735,7 @@ static void *nemesis_thread(void *arg)
                     }
                 } else {
                     /* only an unpublished part (tmp_) or an intent whose name was never synced (txn_) fails
-                     * just the call; the WAL, MANIFEST, the dictionaries, CATALOG and the directory are
+                     * just the call; the WAL, MANIFEST, the dictionaries, a volume's META and the directory are
                      * relied upon (class b in docs/design.md): fail-stop */
                     if (strncmp(base, "tmp_", 4) && strncmp(base, "txn_", 4)) {
                         eio_problems++;

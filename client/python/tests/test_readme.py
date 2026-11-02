@@ -49,7 +49,12 @@ def test_many(tmp_path):
     code = code.replace('"/tmp/tsdb-many"', repr(str(tmp_path / "db")))
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.splitlines() == ["raw   0 60 60.0", "raw   1 60 120.0", "raw   2 60 180.0", "hours 3 25 8640.0"]
+    assert out.stdout.splitlines() == [
+        "raw   pump0 60 60.0",
+        "raw   pump1 60 120.0",
+        "raw   pump2 60 180.0",
+        "hours 3 25 8640.0",
+    ]
 
 
 def test_analytics(tmp_path):

@@ -363,6 +363,16 @@ global id), which 1000 volumes of 10^6 series do not reach but 3000 volumes of 2
     question 9.
   - No global name index is kept: it would cost what `by_name` costs today (8-16 bytes a series), and the per-volume
     tables already exist.
+  - **Tenants are name prefixes** (decided with question 2): a name is unique in the whole database, and a tenant
+    is the series whose names start with its prefix (`tenantA/...`). There is no tenant id and no id space per
+    tenant: an id says where a series is stored (its volume), never whom it belongs to, and a tenant's series may
+    sit in any volumes. What tenants need later builds on the names, not on this change: listing a tenant is a scan
+    of the volume dictionaries for the prefix (`tsdb_series_foreach`, in memory, no prefix index until a
+    measurement asks for one); deleting or setting retention for a tenant applies the per-series call to that
+    listing; giving a tenant its own volumes is a mapping from prefix to path in whoever creates the series (the
+    Pulsar sink's config, question 9). A later auth layer binds a connection to a prefix: tsdbd checks the name in
+    SERIES, and an id in any other request through its name (an array index in the volume's dictionary), since a
+    client can send ids it never looked up.
 - `insert_slots`: validate every id, then counting-sort rows by `TSDB_SID_VOLUME` into a `uint32_t` local array
   per volume, as today's multi-volume path does. The `identity` shortcut (the root alone: the caller's array goes to
   the engine as is, volumes.c:1235-1242) cannot survive, since the caller's array is now 64-bit; the root-only case
@@ -625,7 +635,7 @@ and for the connector `mvn test` in connectors/pulsar. The benchmarks of §4 las
    `tsdb_series_at` returns the existing series wherever it is. ha.md D9 makes names unique per volume (the path
    is part of the address). Keeping today's rule costs a probe of every volume when a name is created and of every
    volume when a lookup names no path (§2.3), and no memory. Recommended: keep today's rule now, decide again with
-   failover.
+   failover. Decided (2026-11-02): names stay unique in the whole database, and tenants are name prefixes (§2.3).
 3. **Format 8 with a refusal, or open format 7 in place?** The data is the same; an upgrade would only write
    `volume=N` into each META and delete CATALOG. With no release in format 7, the refusal (and export/import for
    anyone running main) is simpler and follows the rules. Recommended: refuse.

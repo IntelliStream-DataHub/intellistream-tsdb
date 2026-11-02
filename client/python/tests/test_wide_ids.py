@@ -1,6 +1,6 @@
 """64-bit series ids on the wire (protocol version 11): the frames carry every bit of an id (checked on a fake server
-that records what it receives), a server of an older protocol is refused when the client connects, and tsdbd, which
-hands out no id above 2**32 yet, answers an id such as a + 2**32 as an unknown series, never as series a."""
+that records what it receives), a server of an older protocol is refused when the client connects, and tsdbd, whose ids
+carry the volume in bits 32-47, answers an id such as a + 2**32 (another volume) as an unknown series, never as a."""
 
 import array
 import socket

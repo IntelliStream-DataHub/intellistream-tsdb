@@ -55,7 +55,7 @@ def check_inserts(c, form):
     def at(off, sel=slice(None)):
         return ([int(t) + off for t in ts][sel], v[sel])
 
-    ids = np.array([s1, s2] * 3, dtype=np.uint32)
+    ids = np.array([s1, s2] * 3, dtype=np.uint64)
     c.insert_series(s1, f(ts), f(vals))
     assert rows(c, s1, T0, T0 + 6) == at(0)
     c.insert(f(ids), f(ts + 10), f(vals))
@@ -70,7 +70,7 @@ def check_inserts(c, form):
     c.insert_many([(i64, f(ts), f(np.arange(6, dtype=np.int64) * 2**40))])
     assert c.query_values(i64, numpy=False)[1] == [k * 2**40 for k in range(6)]
     # batch arguments
-    q = np.array([s1, s2, s1], dtype=np.uint32)
+    q = np.array([s1, s2, s1], dtype=np.uint64)
     start = np.array([T0, T0 + 40, T0 + 30], dtype=np.int64)
     end = start + 6
     for got, s, a, b in zip(c.query_raw_many(f(q), f(start), f(end)), q, start, end):
@@ -104,7 +104,7 @@ import sys, threading, numpy as np, tsdb_client as t
 T0, n, big = 1_700_000_000_000, 200_000, 2_000_000_000
 with t.Db(sys.argv[1], fsync=False, merge_threads=1) as db:
     ids = [db.series(f"s{k}") for k in range(10)]
-    ser = np.repeat(np.array(ids, dtype=np.uint32), n // 10)
+    ser = np.repeat(np.array(ids, dtype=np.uint64), n // 10)
     ts = np.tile(np.arange(n // 10, dtype=np.int64) + T0, 10)
     vals = np.ones(n, dtype=np.float32)
     stop, j = [False], n // 2

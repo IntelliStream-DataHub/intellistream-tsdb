@@ -131,6 +131,21 @@ static void add_bucket(ans *r, int64_t start, uint64_t count, double sum, double
 
 static tsdb *tdb;
 
+/* The files number the series 0 .. 99; tsids[] holds their ids, which carry the volume in their high bits and are
+ * not those numbers. The load creates the series by name, the queries look them up. */
+static tsdb_sid tsids[100];
+
+static void tsdb_resolve(int create)
+{
+    for (uint32_t i = 0; i < 100; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s.%u", KIND[i % 7], i);
+        int rc = create ? tsdb_series(tdb, name, &tsids[i]) : tsdb_series_lookup(tdb, name, &tsids[i]);
+        if (rc)
+            die(name, tsdb_strerror(rc));
+    }
+}
+
 static tsdb *tsdb_open_or_die(const char *dir)
 {
     tsdb_options o;
@@ -161,11 +176,11 @@ static void tsdb_run(const q *x, ans *r)
 {
     int rc;
     if (x->bucket == 0)
-        rc = tsdb_query_raw(tdb, x->s, x->a, x->b, raw_cb, r);
+        rc = tsdb_query_raw(tdb, tsids[x->s], x->a, x->b, raw_cb, r);
     else {
         tsdb_bucket *b;
         size_t nb;
-        rc = tsdb_query_agg(tdb, x->s, x->a, x->b, x->bucket, &b, &nb);
+        rc = tsdb_query_agg(tdb, tsids[x->s], x->a, x->b, x->bucket, &b, &nb);
         if (!rc) {
             free(r->b);
             r->b = b;
@@ -198,7 +213,7 @@ static uint64_t tsdb_batch(size_t at, size_t k)
     int64_t *st = malloc(k * sizeof *st), *en = malloc(k * sizeof *en), *iv = malloc(k * sizeof *iv);
     for (size_t i = 0; i < k; i++) {
         const q *x = &qs[(at + i) % nq];
-        ss[i] = x->s;
+        ss[i] = tsids[x->s];
         st[i] = x->a;
         en[i] = x->b;
         iv[i] = x->bucket;
@@ -233,7 +248,7 @@ static void *tsdb_loader(void *arg)
     for (size_t off = 0; off < j->n; off += batch) {
         size_t m = j->n - off < batch ? j->n - off : batch;
         for (size_t k = 0; k < m; k++) {
-            s[k] = j->rows[off + k].s;
+            s[k] = tsids[j->rows[off + k].s];
             t[k] = j->rows[off + k].t;
             v[k] = j->rows[off + k].v;
         }
@@ -253,13 +268,10 @@ static void tsdb_load(const rbrow *rows, size_t n, int threads)
     if (stat(dbpath, &st) == 0)
         die(dbpath, "exists; the load wants a fresh directory");
     tdb = tsdb_open_or_die(dbpath);
-    for (uint32_t i = 0; i < 100; i++) { /* ids in file order, as tsdbc-bench load creates them */
-        char name[64];
-        tsdb_sid id;
-        snprintf(name, sizeof name, "%s.%u", KIND[i % 7], i);
-        if (tsdb_series(tdb, name, &id) || id != i)
-            die(name, "series id does not match the file's series number");
-    }
+    tsdb_resolve(1);
+    for (size_t i = 0; i < n; i++)
+        if (rows[i].s >= 100)
+            die(dbpath, "a row names a series number past 99");
     pthread_t th[256];
     tload jobs[256];
     double t0 = now();
@@ -728,18 +740,20 @@ static void *tsdb_full_run(void *arg)
     fjob *j = arg;
     tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
     tsdb_sid ss[100];
+    uint32_t sn[100]; /* the series numbers of ss[] */
     int64_t iv[100];
     size_t k = 0;
     for (uint32_t s = (uint32_t)j->id; s < 100; s += (uint32_t)j->threads) {
         if (batch > 1) {
-            ss[k] = s;
+            ss[k] = tsids[s];
+            sn[k] = s;
             iv[k++] = full_interval(j, s);
             continue;
         }
         void *b;
         size_t nb;
-        int rc = j->twa ? tsdb_query_twa(tdb, s, INT64_MIN, INT64_MAX, 3600000, &to, (tsdb_twa_bucket **)&b, &nb)
-                        : tsdb_query_agg(tdb, s, INT64_MIN, INT64_MAX, full_interval(j, s), (tsdb_bucket **)&b, &nb);
+        int rc = j->twa ? tsdb_query_twa(tdb, tsids[s], INT64_MIN, INT64_MAX, 3600000, &to, (tsdb_twa_bucket **)&b, &nb)
+                        : tsdb_query_agg(tdb, tsids[s], INT64_MIN, INT64_MAX, full_interval(j, s), (tsdb_bucket **)&b, &nb);
         if (rc)
             die(j->twa ? "twa" : "agg", tsdb_strerror(rc));
         full_keep(j, s, b, nb);
@@ -757,7 +771,7 @@ static void *tsdb_full_run(void *arg)
         for (size_t i = 0; i < m; i++) {
             if (r[i].status)
                 die("query multi, series", tsdb_strerror(r[i].status));
-            full_keep(j, ss[at + i], r[i].buckets, r[i].n);
+            full_keep(j, sn[at + i], r[i].buckets, r[i].n);
         }
         tsdb_series_results_free(r, m);
     }
@@ -923,8 +937,10 @@ int main(int argc, char **argv)
     if (is_duck) {
         duck_open(dbpath);
         fprintf(stderr, "duckdb %s\n", duckdb_library_version());
-    } else
+    } else {
         tdb = tsdb_open_or_die(dbpath);
+        tsdb_resolve(0);
+    }
     if (!strcmp(cmd, "qps") && argc == 8) {
         char base[16];
         snprintf(base, sizeof base, "%s", argv[5]);

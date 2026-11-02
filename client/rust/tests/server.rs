@@ -243,7 +243,7 @@ fn errors() {
     // u64::MAX marks the many-series layout: it is never an id
     assert!(matches!(c.insert_series(u64::MAX, &[T0], &[1.0]), Err(Error::InvalidArgument(_))));
     // protocol 11 carries all 64 bits: an id above 2^32 goes out whole (it is never truncated onto a series
-    // whose low 32 bits match, here a) and tsdbd, which hands out no such id yet, does not know it
+    // whose low 32 bits match, here a) and names a volume tsdbd does not have
     let big = a + (1u64 << 32);
     let status = |e: Error| e.status();
     assert_eq!(status(c.insert_series(big, &[T0], &[1.0]).unwrap_err()), Some(Status::Invalid));
@@ -301,6 +301,11 @@ fn server_going_away_breaks_the_client() {
     assert!(matches!(c.stats(), Err(Error::Io(_))));
 }
 
+/// The series' number within its volume (its id holds the volume above bit 32): a value each series can carry exactly.
+fn local(id: u64) -> u32 {
+    id as u32
+}
+
 #[test]
 fn concurrent_clients() {
     let srv = Server::start();
@@ -313,11 +318,11 @@ fn concurrent_clients() {
                 let mut c = Client::connect(addr).unwrap();
                 for round in 0..50 {
                     let ts: Vec<i64> = (0..1000).map(|i| T0 + (round * 1000 + i) * 1000).collect();
-                    c.insert_series_async(id, &ts, &[id as f32; 1000]).unwrap();
+                    c.insert_series_async(id, &ts, &[local(id) as f32; 1000]).unwrap();
                 }
                 c.wait().unwrap();
                 let b = c.query_agg(id, .., 0).unwrap();
-                assert_eq!((b.len(), b[0].count, b[0].min, b[0].max), (1, 50_000, id as f64, id as f64));
+                assert_eq!((b.len(), b[0].count, b[0].min, b[0].max), (1, 50_000, local(id) as f64, local(id) as f64));
             });
         }
     });

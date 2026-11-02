@@ -3,30 +3,40 @@
  * storage directory of its own (its parts, WAL, MANIFEST and LOCK), for
  * example one per NFS mount. A series lives in one volume, chosen when it is
  * created (tsdb_series_at); everything about it is routed there. Writes to
- * different volumes share nothing but this routing table, so they scale with
- * the number of mounts.
+ * different volumes share nothing, so they scale with the number of mounts.
  *
  * The root directory is volume 0, so a database without extra volumes is
  * exactly what a single engine stores. The root also holds:
  *
  *   VOLUMES   one line per extra volume (volume i is line i): "<check> <path>", check
  *             the low 32 bits of xxh64(path, seed i) in hex
- *   CATALOG   one 16-byte record per series, in global id order: u32 volume,
- *             u32 local id, u64 xxh64 of {global id, volume, local id}
  *   ID        a random identifier; every volume holds a copy in ROOT_ID, so a
  *             volume cannot be attached to another database by mistake
  *
- * A series is created in its volume first and then appended to CATALOG; a
- * crash in between leaves a series the catalog does not know, which the next
- * open appends.
+ * A series id is TSDB_SID(volume, local): the volume's number plus one in bits
+ * 32-47 and the series' index in that volume's SERIES dictionary in bits 0-31.
+ * Routing is arithmetic, with no table to load or keep: an id whose volume
+ * field is 0 or beyond the volumes, whose bits 48-63 are set, or whose local
+ * index the volume has not handed out is unknown and touches nothing. Since
+ * ids carry the volume number, each volume's META says which number it is
+ * ("volume=N", written by the add before its VOLUMES line), and every open
+ * checks it against the line: a directory reached under another line's path
+ * (swapped, bind-mounted twice, a VOLUMES rebuilt by hand) would otherwise
+ * send the writes of ids clients hold to other series without a word.
  *
- * Both files only grow, by appends. At open the writer cuts a torn tail (a
- * partial or unchecked last record, with no valid one after it), so the next
- * append starts on a record boundary. A record that fails its check with a
- * valid one after it, or one naming a volume or series that does not exist,
- * is damage to durable data: the open fails with TSDB_ERR_CORRUPT rather than
- * renumber the series that follow. Followers stop at the first record they
- * cannot use (the writer may still be appending it) and read again later.
+ * Names are unique in the whole database. A lookup probes the volumes' own
+ * dictionaries (the named volume first when there is one); a creation probes
+ * every volume again under create_lock, which every creation holds, so no two
+ * volumes ever hold one name. Creating a series is one durable append to its
+ * volume's SERIES and touches no other directory.
+ *
+ * VOLUMES only grows, by appends. At open the writer cuts a torn tail (a
+ * partial or unchecked last line, with no valid one after it), so the next
+ * append starts on a line boundary. A line that fails its check with a valid
+ * one after it is damage to durable data: the open fails with
+ * TSDB_ERR_CORRUPT rather than renumber the volumes that follow. Followers stop
+ * at the first line they cannot use (the writer may still be appending it) and
+ * read again later.
  */
 #include "internal.h"
 
@@ -40,7 +50,6 @@
 #include <unistd.h>
 
 #define VOLUMES_FILE "VOLUMES"
-#define CATALOG_FILE "CATALOG"
 #define ID_FILE "ID"
 #define ROOT_ID_FILE "ROOT_ID"
 
@@ -49,14 +58,10 @@ struct tsdb {
     char *dir;
     int dirfd;
     uint64_t id;
-    pthread_rwlock_t lock; /* the arrays below; written when series or volumes are added */
+    pthread_rwlock_t lock; /* the arrays below; written when volumes are added */
     eng **vols;
     char **paths; /* canonical, [0] is the root */
     size_t nvols, vols_cap;
-    uint32_t *cat_vol, *cat_local; /* by global series id */
-    size_t ncat, cat_cap;
-    uint32_t *by_name; /* open addressing over global ids + 1 */
-    size_t name_cap;
     pthread_mutex_t create_lock; /* one series or volume creation at a time */
     off_t vols_seen;             /* the size of VOLUMES when a writer last read it (create_lock) */
     int vols_rc;                 /* and what that read gave: damage is reported once per change, not per request */
@@ -64,69 +69,6 @@ struct tsdb {
 };
 
 /* ---------------------------------------------------------------- helpers */
-
-static uint64_t name_hash(const char *s) { return xxh64(s, strlen(s), 0x76a1); }
-
-static const char *gid_name(tsdb *t, uint32_t g) { return eng_series_name(t->vols[t->cat_vol[g]], t->cat_local[g]); }
-
-static int names_grow(tsdb *t)
-{
-    size_t cap = t->name_cap ? t->name_cap * 2 : 1024;
-    uint32_t *m = calloc(cap, sizeof *m);
-    if (!m)
-        return TSDB_ERR_NOMEM;
-    for (size_t g = 0; g < t->ncat; g++) {
-        size_t h = name_hash(gid_name(t, (uint32_t)g)) & (cap - 1);
-        while (m[h])
-            h = (h + 1) & (cap - 1);
-        m[h] = (uint32_t)g + 1;
-    }
-    free(t->by_name);
-    t->by_name = m;
-    t->name_cap = cap;
-    return 0;
-}
-
-static int64_t names_find(tsdb *t, const char *name)
-{
-    if (!t->name_cap)
-        return -1;
-    size_t h = name_hash(name) & (t->name_cap - 1);
-    while (t->by_name[h]) {
-        uint32_t g = t->by_name[h] - 1;
-        if (strcmp(gid_name(t, g), name) == 0)
-            return g;
-        h = (h + 1) & (t->name_cap - 1);
-    }
-    return -1;
-}
-
-/* Adds a catalog entry in memory; caller holds the write lock. */
-static int cat_add(tsdb *t, uint32_t vol, uint32_t local)
-{
-    if (t->ncat == t->cat_cap) {
-        size_t cap = t->cat_cap ? t->cat_cap * 2 : 256;
-        uint32_t *v = realloc(t->cat_vol, cap * sizeof *v);
-        if (!v)
-            return TSDB_ERR_NOMEM;
-        t->cat_vol = v;
-        uint32_t *l = realloc(t->cat_local, cap * sizeof *l);
-        if (!l)
-            return TSDB_ERR_NOMEM;
-        t->cat_local = l;
-        t->cat_cap = cap;
-    }
-    t->cat_vol[t->ncat] = vol;
-    t->cat_local[t->ncat] = local;
-    t->ncat++;
-    if ((t->ncat + 1) * 2 > t->name_cap)
-        return names_grow(t);
-    size_t h = name_hash(gid_name(t, (uint32_t)(t->ncat - 1))) & (t->name_cap - 1);
-    while (t->by_name[h])
-        h = (h + 1) & (t->name_cap - 1);
-    t->by_name[h] = (uint32_t)t->ncat;
-    return 0;
-}
 
 /* errno tells why on failure */
 static int append_file(int dirfd, const char *name, const void *data, size_t len, bool sync)
@@ -140,47 +82,6 @@ static int append_file(int dirfd, const char *name, const void *data, size_t len
     close(fd);
     errno = err;
     return ok ? 0 : TSDB_ERR_IO;
-}
-
-/* A failed append to CATALOG or VOLUMES may leave a torn record, after which
- * the next open reads nothing: no record may follow it. The root volume's
- * engine holds the failure (eng_fail), so tsdb_failed reports it and writes
- * to the root volume stop too. */
-static int append_root(tsdb *t, const char *name, const void *data, size_t len)
-{
-    int rc = eng_check(t->vols[0]);
-    if (rc == 0 && (rc = append_file(t->dirfd, name, data, len, t->opt.fsync)) != 0) {
-        char what[64];
-        snprintf(what, sizeof what, "append to %s", name);
-        eng_fail(t->vols[0], what, errno);
-    }
-    return rc;
-}
-
-#define CAT_REC 16
-
-static uint64_t cat_check(uint64_t gid, uint32_t vol, uint32_t local)
-{
-    uint8_t b[16];
-    memcpy(b, &gid, 8);
-    memcpy(b + 8, &vol, 4);
-    memcpy(b + 12, &local, 4);
-    return xxh64(b, sizeof b, 0x434154414c4f47ull);
-}
-
-static void cat_record(uint8_t rec[CAT_REC], uint64_t gid, uint32_t vol, uint32_t local)
-{
-    uint64_t check = cat_check(gid, vol, local);
-    memcpy(rec, &vol, 4);
-    memcpy(rec + 4, &local, 4);
-    memcpy(rec + 8, &check, 8);
-}
-
-static bool cat_valid(const char *rec, uint64_t gid)
-{
-    uint64_t check;
-    memcpy(&check, rec + 8, 8);
-    return check == cat_check(gid, load32(rec), load32(rec + 4));
 }
 
 /* The check of VOLUMES line i (counting from 1) for this path. */
@@ -372,17 +273,16 @@ static void paths_free(char **p, size_t n)
     free(p);
 }
 
-/* What a new volume's directory may hold: nothing of another database (its ID,
- * CATALOG or VOLUMES as a root, its ROOT_ID as a volume) and no engine files
- * without our ROOT_ID; our ROOT_ID and META alone are a crashed add. Writes the
- * root's META (the database's partitioning, so readers can open the volume
- * before a writer has) and ROOT_ID. */
-static int volume_dir_prepare(int rootfd, const char *canon, uint64_t id, bool sync)
+/* What a new volume's directory may hold: nothing of another database (its ID
+ * or VOLUMES as a root, its ROOT_ID as a volume) and no engine files without
+ * our ROOT_ID; our ROOT_ID and META alone are a crashed add. Writes ROOT_ID;
+ * META follows once the add knows the volume's number (volume_meta_write). */
+static int volume_dir_prepare(const char *canon, uint64_t id, bool sync)
 {
     int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0)
         return TSDB_ERR_IO;
-    static const char *const root_files[] = {ID_FILE, CATALOG_FILE, VOLUMES_FILE};
+    static const char *const root_files[] = {ID_FILE, VOLUMES_FILE};
     static const char *const eng_files[] = {"MANIFEST", "SERIES", "LOCK"};
     const char *why = NULL;
     for (size_t i = 0; !why && i < sizeof root_files / sizeof *root_files; i++)
@@ -407,12 +307,6 @@ static int volume_dir_prepare(int rootfd, const char *canon, uint64_t id, bool s
         if (engine || meta)
             why = "holds tsdb files of no database";
     }
-    if (!why && rc == 0 && !meta) {
-        rc = read_file_all(rootfd, "META", &txt, &len);
-        if (rc == 0)
-            rc = append_file(fd, "META", txt, len, sync);
-        free(txt);
-    }
     if (!why && rc == 0 && !ours) {
         char buf[32];
         int n = snprintf(buf, sizeof buf, "%016" PRIx64 "\n", id);
@@ -426,6 +320,103 @@ static int volume_dir_prepare(int rootfd, const char *canon, uint64_t id, bool s
         return TSDB_ERR_INVALID;
     }
     return rc;
+}
+
+/* The volume number META records ("volume=N" on a line of its own), -1 without one. */
+static long meta_volume(const char *txt)
+{
+    const char *l = strstr(txt, "volume=");
+    if (!l || (l != txt && l[-1] != '\n'))
+        return -1;
+    char *end;
+    long v = strtol(l + 7, &end, 10);
+    return end == l + 7 || *end != '\n' || v < 0 || v >= MAX_VOLUMES ? -1 : v;
+}
+
+/* Whether META at fd is of our format: another one is refused by the engine's open, with a message naming both
+ * versions, which a complaint about a missing volume number must not preempt. */
+static bool meta_version_ok(int fd)
+{
+    char *txt;
+    size_t len;
+    if (read_file_all(fd, "META", &txt, &len) != 0)
+        return true; /* the check that follows reports it */
+    const char *l = strstr(txt, "version=");
+    bool ok = l && atoi(l + 8) == FORMAT_VERSION;
+    free(txt);
+    return ok;
+}
+
+/* Checks that the META of the directory open at fd says it is volume `index`
+ * (the VOLUMES line that named it; 0: the database directory). */
+static int meta_check(int fd, const char *path, uint32_t index)
+{
+    char *txt;
+    size_t len;
+    int rc = read_file_all(fd, "META", &txt, &len);
+    if (rc == TSDB_ERR_NOTFOUND)
+        fprintf(stderr, "tsdb: %s has no META, but it is volume %u: the open fails\n", path, index);
+    if (rc)
+        return rc == TSDB_ERR_NOTFOUND ? TSDB_ERR_CORRUPT : rc;
+    long v = meta_volume(txt);
+    free(txt);
+    if (v == (long)index)
+        return 0;
+    if (v < 0)
+        fprintf(stderr, "tsdb: %s/META records no volume number, but it is volume %u: the open fails\n", path, index);
+    else
+        fprintf(stderr, "tsdb: %s/META says it is volume %ld, but %s names it as volume %u: the open fails\n", path,
+                v, index ? VOLUMES_FILE : "the database", index);
+    return TSDB_ERR_CORRUPT;
+}
+
+/* Writes the META of volume `index` at canon: the root's (the database's
+ * partitioning, so readers can open the volume before any writer has) with its
+ * own "volume=" line, atomically (tmp, fsync, rename, directory fsync), before
+ * the VOLUMES line names the directory: ids carry the number. */
+static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool sync)
+{
+    char *txt;
+    size_t len;
+    int rc = read_file_all(rootfd, "META", &txt, &len);
+    if (rc)
+        return rc;
+    char *buf = malloc(len + 32);
+    if (!buf) {
+        free(txt);
+        return TSDB_ERR_NOMEM;
+    }
+    size_t n = 0;
+    for (char *l = txt, *next; *l; l = next) { /* every line but the root's volume number */
+        next = strchr(l, '\n');
+        next = next ? next + 1 : l + strlen(l);
+        if (strncmp(l, "volume=", 7) != 0) {
+            memcpy(buf + n, l, (size_t)(next - l));
+            n += (size_t)(next - l);
+        }
+    }
+    free(txt);
+    n += (size_t)snprintf(buf + n, 32, "volume=%u\n", index);
+    int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int mfd = fd < 0 ? -1 : openat(fd, "META.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    ssize_t wr = mfd < 0 ? -1 : write(mfd, buf, n);
+    bool ok = wr == (ssize_t)n && (!sync || fsync(mfd) == 0);
+    int err = ok ? 0 : wr >= 0 && wr != (ssize_t)n ? ENOSPC : errno;
+    if (mfd >= 0)
+        close(mfd);
+    if (ok && renameat(fd, "META.tmp", fd, "META") != 0) {
+        ok = false;
+        err = errno;
+    }
+    if (ok && sync && fsync(fd) != 0) {
+        ok = false;
+        err = errno;
+    }
+    if (fd >= 0)
+        close(fd);
+    free(buf);
+    errno = err;
+    return ok ? 0 : TSDB_ERR_IO;
 }
 
 /* Under the write lock on fd: VOLUMES (a torn tail cut) and where canon
@@ -510,9 +501,11 @@ static int volume_add(int dirfd, const char *root, uint64_t id, const char *path
     if (rc == 0 && !found && made && sync)
         rc = sync_parent(canon);
     if (rc == 0 && !found)
-        rc = volume_dir_prepare(dirfd, canon, id, sync);
+        rc = volume_dir_prepare(canon, id, sync);
     if (rc == 0 && !found && (rc = volumes_lock(fd, F_WRLCK)) == 0) /* again: another add may have come between */
         rc = volumes_place(fd, root, canon, sync, &paths, &n, &size, &found, index);
+    if (rc == 0 && !found && (rc = volume_meta_write(dirfd, canon, (uint32_t)(n + 1), sync)) != 0 && fail)
+        eng_fail(fail, "write the META of a new volume", errno); /* a retried fsync would prove nothing */
     if (rc == 0 && !found) {
         char line[PATH_MAX + 16];
         size_t len = strlen(canon);
@@ -558,11 +551,13 @@ static int volume_open(tsdb *t, const char *path, uint32_t *index)
     char *txt;
     size_t len;
     int rc = read_file_all(fd, ROOT_ID_FILE, &txt, &len);
-    close(fd);
     if (rc == 0) {
         rc = strtoull(txt, NULL, 16) == t->id ? 0 : TSDB_ERR_INVALID; /* a volume of another database */
         free(txt);
     }
+    if (rc == 0)
+        rc = meta_check(fd, path, (uint32_t)t->nvols); /* before the engine reads or writes anything there */
+    close(fd);
     if (rc)
         return rc;
     eng *e;
@@ -574,7 +569,7 @@ static int volume_open(tsdb *t, const char *path, uint32_t *index)
     return 0;
 }
 
-/* Reads VOLUMES and CATALOG entries beyond what we have (followers call this
+/* Reads the VOLUMES lines beyond what we have (followers call this
  * again to catch up with the writer). Caller holds the write lock. */
 static int load_layout(tsdb *t)
 {
@@ -604,7 +599,7 @@ static int load_layout(tsdb *t)
         uint32_t idx;
         rc = volume_open(t, line + 9, &idx);
     }
-    size_t vols_cut = SIZE_MAX, vols_len = len; /* cut after CATALOG checks out: it may need those lines */
+    size_t vols_cut = SIZE_MAX, vols_len = len;
     if (rc == 0 && writer && good_end < len) {
         /* damage when the line after the bad one passes its check (as the next volume's) */
         bool later = false;
@@ -628,78 +623,7 @@ static int load_layout(tsdb *t)
     free(txt);
     if (rc)
         return rc;
-    rc = read_file_all(t->dirfd, CATALOG_FILE, &txt, &len);
-    if (rc == TSDB_ERR_NOTFOUND)
-        return vols_cut == SIZE_MAX ? 0 : cut_tail(t, VOLUMES_FILE, vols_cut, vols_len);
-    if (rc)
-        return rc;
-    size_t off = t->ncat * CAT_REC;
-    for (; rc == 0 && off + CAT_REC <= len; off += CAT_REC) {
-        uint64_t gid = off / CAT_REC;
-        if (!cat_valid(txt + off, gid))
-            break;
-        uint32_t vol = load32(txt + off), local = load32(txt + off + 4);
-        if (vol >= t->nvols || local >= eng_series_count(t->vols[vol])) {
-            if (!writer && vol < t->nvols)
-                eng_refresh(t->vols[vol]); /* the writer created it a moment ago */
-            if (!writer && (vol >= t->nvols || local >= eng_series_count(t->vols[vol])))
-                break; /* not visible to us yet: next time */
-            if (writer) {
-                fprintf(stderr, "tsdb: %s: series %" PRIu64 " names volume %u series %u, which does not exist: the open "
-                        "fails\n", CATALOG_FILE, gid, vol, local);
-                rc = TSDB_ERR_CORRUPT;
-                break;
-            }
-        }
-        rc = cat_add(t, vol, local);
-    }
-    if (rc == 0 && writer && off < len) {
-        /* the record at off is partial or fails its check: a torn tail unless a valid record follows */
-        bool later = false;
-        for (size_t o = off + CAT_REC, g = off / CAT_REC + 1; !later && o + CAT_REC <= len; o += CAT_REC, g++)
-            later = cat_valid(txt + o, g);
-        if (later) {
-            fprintf(stderr, "tsdb: %s: record %zu is damaged and later records are not: the open fails\n",
-                    CATALOG_FILE, off / CAT_REC);
-            rc = TSDB_ERR_CORRUPT;
-        } else {
-            rc = cut_tail(t, CATALOG_FILE, off, len);
-        }
-    }
-    free(txt);
-    if (rc == 0 && vols_cut != SIZE_MAX)
-        rc = cut_tail(t, VOLUMES_FILE, vols_cut, vols_len);
-    return rc;
-}
-
-/* Writer: series that exist in a volume but not in CATALOG (a crash between
- * creating one and recording it, or a database from before volumes). */
-static int adopt_orphans(tsdb *t)
-{
-    for (uint32_t v = 0; v < t->nvols; v++) {
-        uint32_t n = eng_series_count(t->vols[v]);
-        uint8_t *known = calloc(n ? n : 1, 1);
-        if (!known)
-            return TSDB_ERR_NOMEM;
-        for (size_t g = 0; g < t->ncat; g++)
-            if (t->cat_vol[g] == v && t->cat_local[g] < n)
-                known[t->cat_local[g]] = 1;
-        for (uint32_t l = 0; l < n; l++) {
-            if (known[l])
-                continue;
-            uint8_t rec[CAT_REC];
-            cat_record(rec, t->ncat, v, l);
-            int rc = append_file(t->dirfd, CATALOG_FILE, rec, CAT_REC, t->opt.fsync);
-            if (rc == 0)
-                rc = cat_add(t, v, l);
-            if (rc) {
-                free(known);
-                return rc;
-            }
-        }
-        free(known);
-    }
-    return 0;
+    return vols_cut == SIZE_MAX ? 0 : cut_tail(t, VOLUMES_FILE, vols_cut, vols_len);
 }
 
 /* ------------------------------------------------------------- open/close */
@@ -724,8 +648,19 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         tsdb_close(t);
         return TSDB_ERR_NOMEM;
     }
+    /* an existing database directory must be one (META says volume 0), not a volume of one: checked before its
+     * engine replays or writes anything there */
+    int rc = 0, mfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (mfd >= 0 && faccessat(mfd, "META", F_OK, AT_SYMLINK_NOFOLLOW) == 0 && meta_version_ok(mfd))
+        rc = meta_check(mfd, dir, 0);
+    if (mfd >= 0)
+        close(mfd);
+    if (rc) {
+        tsdb_close(t);
+        return rc;
+    }
     eng *root;
-    int rc = eng_open_sched(dir, &t->opt, t->sched, &root); /* creates the directory for a writer */
+    rc = eng_open_sched(dir, &t->opt, t->sched, &root); /* creates the directory for a writer */
     if (rc) {
         tsdb_close(t);
         return rc;
@@ -761,8 +696,6 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         rc = 0; /* read only, written by an older version: no volumes */
     }
     pthread_rwlock_wrlock(&t->lock);
-    if (rc == 0)
-        rc = names_grow(t);
     /* a writer may cut a torn tail of VOLUMES: not while tsdb-cli appends a volume */
     int vfd = t->opt.read_only ? -1 : openat(t->dirfd, VOLUMES_FILE, O_RDWR | O_CLOEXEC);
     if (rc == 0 && vfd < 0 && !t->opt.read_only && errno != ENOENT)
@@ -776,13 +709,6 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         t->vols_seen = vst.st_size; /* after a cut: what load_layout read */
     if (vfd >= 0)
         close(vfd);
-    if (rc == 0 && !t->opt.read_only)
-        rc = adopt_orphans(t);
-    if (rc == 0 && t->opt.read_only && t->ncat == 0) {
-        /* no CATALOG (an older database): the root's series are the global ones */
-        for (uint32_t l = 0; rc == 0 && l < eng_series_count(root); l++)
-            rc = cat_add(t, 0, l);
-    }
     pthread_rwlock_unlock(&t->lock);
     if (rc) {
         tsdb_close(t);
@@ -805,9 +731,6 @@ int tsdb_close(tsdb *t)
     sched_free(t->sched); /* after the volumes: none of them runs a query now */
     free(t->vols);
     free(t->paths);
-    free(t->cat_vol);
-    free(t->cat_local);
-    free(t->by_name);
     free(t->dir);
     if (t->dirfd >= 0)
         close(t->dirfd);
@@ -819,55 +742,84 @@ int tsdb_close(tsdb *t)
 
 /* ---------------------------------------------------------------- series */
 
-/* A follower may be asked about series its writer created a moment ago. */
+/* The volume field of an id: -1 when no volume can have it (bits 48-63 set, or a zero field: a truncated id). */
+static int64_t sid_volume(tsdb_sid id) { return id >> 48 || !(id >> 32) ? -1 : (int64_t)(id >> 32) - 1; }
+
+static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
+{
+    int64_t v = sid_volume(id);
+    if (v < 0)
+        return false;
+    pthread_rwlock_rdlock(&t->lock);
+    bool ok = (size_t)v < t->nvols && TSDB_SID_LOCAL(id) < eng_series_count(t->vols[v]);
+    if (ok) {
+        *e = t->vols[v];
+        *local = TSDB_SID_LOCAL(id);
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return ok;
+}
+
+/* Routes an id: its volume and local id, by its bits. A follower may be asked about a series or a volume its
+ * writer created a moment ago: it reads VOLUMES or that volume's SERIES again, once. */
+static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
+{
+    if (route_now(t, id, e, local))
+        return true;
+    int64_t v = sid_volume(id);
+    if (!t->opt.read_only || v < 0)
+        return false;
+    pthread_rwlock_wrlock(&t->lock);
+    if ((size_t)v >= t->nvols)
+        load_layout(t);
+    if ((size_t)v < t->nvols)
+        eng_refresh(t->vols[v]);
+    pthread_rwlock_unlock(&t->lock);
+    return route_now(t, id, e, local);
+}
+
+/* A follower asked for a name its writer may have created a moment ago. */
 static void catch_up(tsdb *t)
 {
     if (!t->opt.read_only)
         return;
     pthread_rwlock_wrlock(&t->lock);
-    eng_refresh(t->vols[0]);
     load_layout(t);
+    for (size_t v = 0; v < t->nvols; v++)
+        eng_refresh(t->vols[v]);
     pthread_rwlock_unlock(&t->lock);
 }
 
-/* Routes a global id: the volume and its local id. */
-static bool route(tsdb *t, tsdb_sid g, eng **e, uint32_t *local)
+/* Finds name in the volumes' own dictionaries, volume `first` before the others (names are unique in the whole
+ * database, so the order decides only how soon the probe ends). */
+static int lookup_from(tsdb *t, const char *name, size_t first, tsdb_sid *id)
 {
     pthread_rwlock_rdlock(&t->lock);
-    bool ok = g < t->ncat;
-    if (ok) {
-        *e = t->vols[t->cat_vol[g]];
-        *local = t->cat_local[g];
+    int rc = TSDB_ERR_NOTFOUND;
+    size_t n = t->nvols;
+    if (first >= n)
+        first = 0;
+    for (size_t i = 0; i < n && rc == TSDB_ERR_NOTFOUND; i++) {
+        size_t v = i == 0 ? first : i <= first ? i - 1 : i;
+        uint32_t local;
+        rc = eng_series_lookup(t->vols[v], name, &local);
+        if (rc == 0)
+            *id = TSDB_SID(v, local);
     }
     pthread_rwlock_unlock(&t->lock);
-    if (!ok && t->opt.read_only) {
-        catch_up(t);
-        pthread_rwlock_rdlock(&t->lock);
-        ok = g < t->ncat;
-        if (ok) {
-            *e = t->vols[t->cat_vol[g]];
-            *local = t->cat_local[g];
-        }
-        pthread_rwlock_unlock(&t->lock);
-    }
-    return ok;
+    return rc;
 }
 
 int tsdb_series_lookup(tsdb *t, const char *name, tsdb_sid *id)
 {
-    pthread_rwlock_rdlock(&t->lock);
-    int64_t g = names_find(t, name);
-    pthread_rwlock_unlock(&t->lock);
-    if (g < 0 && t->opt.read_only) {
-        catch_up(t);
-        pthread_rwlock_rdlock(&t->lock);
-        g = names_find(t, name);
-        pthread_rwlock_unlock(&t->lock);
-    }
-    if (g < 0)
+    if (!name || !*name)
         return TSDB_ERR_NOTFOUND;
-    *id = (tsdb_sid)g;
-    return 0;
+    int rc = lookup_from(t, name, 0, id);
+    if (rc == TSDB_ERR_NOTFOUND && t->opt.read_only) {
+        catch_up(t);
+        rc = lookup_from(t, name, 0, id);
+    }
+    return rc == TSDB_ERR_INVALID ? TSDB_ERR_NOTFOUND : rc; /* a name too long to be one */
 }
 
 /* A writer opens the volumes added since it read VOLUMES (tsdb_volume_add_dir,
@@ -1001,49 +953,60 @@ int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index)
     return rc;
 }
 
+/* An existing series of the right type (type < 0: any) */
+static int series_found(tsdb *t, int type, tsdb_sid id)
+{
+    tsdb_type have;
+    return type < 0 || (tsdb_series_type(t, id, &have) == 0 && (int)have == type) ? 0 : TSDB_ERR_INVALID;
+}
+
 /* Gets or creates a series. type < 0: any existing type, else created as
- * float32; otherwise an existing series must have this type. */
+ * float32; otherwise an existing series must have this type. An existing name
+ * stays in the volume it was created in, whatever path is asked for: the named
+ * volume is probed first only because that is where it usually is. */
 static int series_make(tsdb *t, const char *name, int type, const char *path, tsdb_sid *id)
 {
     if (!name || !*name || (type >= 0 && !type_valid(type)))
         return TSDB_ERR_INVALID;
-    tsdb_type have;
-    if (tsdb_series_lookup(t, name, id) == 0) /* exists: it stays in the volume it was created in */
-        return type < 0 || (tsdb_series_type(t, *id, &have) == 0 && (int)have == type) ? 0 : TSDB_ERR_INVALID;
-    if (t->opt.read_only)
-        return TSDB_ERR_READONLY;
-    if (eng_check(t->vols[0]))
-        return TSDB_ERR_IO; /* CATALOG takes no more records */
     char norm[PATH_MAX], canon[PATH_MAX];
     uint32_t vol = 0;
-    int rc = 0;
+    if (path && path_valid(path) == 0) { /* a path we know as given: no file system call */
+        path_norm(path, norm);
+        if (!volume_find(t, norm, &vol))
+            vol = 0;
+    }
+    int rc = lookup_from(t, name, vol, id);
+    if (rc == TSDB_ERR_NOTFOUND && t->opt.read_only)
+        rc = tsdb_series_lookup(t, name, id); /* with a catch-up */
+    if (rc == 0)
+        return series_found(t, type, *id);
+    if (rc != TSDB_ERR_NOTFOUND && rc != TSDB_ERR_INVALID) /* INVALID: a name too long, refused below */
+        return rc;
+    if (t->opt.read_only)
+        return TSDB_ERR_READONLY;
+    rc = 0;
     if (path && (rc = volume_lookup(t, path, norm, canon, &vol)) == 0)
         path = NULL; /* found: volumes are never removed */
     else if (rc == TSDB_ERR_NOTFOUND)
         rc = 0; /* maybe added since, or to be created: under the lock */
     if (rc)
         return rc;
+    /* Every creation holds create_lock from this probe of every volume to the append, so no two volumes ever hold
+     * one name. Only this writer creates series in its volumes, and a volume it has not opened has none yet. */
     pthread_mutex_lock(&t->create_lock);
-    if (tsdb_series_lookup(t, name, id) == 0) {
+    rc = lookup_from(t, name, path ? 0 : vol, id);
+    if (rc == 0) {
         pthread_mutex_unlock(&t->create_lock);
-        return type < 0 || (tsdb_series_type(t, *id, &have) == 0 && (int)have == type) ? 0 : TSDB_ERR_INVALID;
+        return series_found(t, type, *id);
     }
-    if (path)
+    rc = rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_INVALID ? 0 : rc; /* INVALID: the engine says why below */
+    if (rc == 0 && path)
         rc = volume_resolve(t, path, norm, canon, &vol);
     uint32_t local = 0;
     if (rc == 0)
-        rc = eng_series(t->vols[vol], name, type < 0 ? TSDB_FLOAT32 : type, &local); /* the volume, then the catalog */
-    if (rc == 0) {
-        uint8_t rec[CAT_REC];
-        cat_record(rec, t->ncat, vol, local);
-        rc = append_root(t, CATALOG_FILE, rec, CAT_REC);
-    }
-    if (rc == 0) {
-        pthread_rwlock_wrlock(&t->lock);
-        *id = (tsdb_sid)t->ncat;
-        rc = cat_add(t, vol, local);
-        pthread_rwlock_unlock(&t->lock);
-    }
+        rc = eng_series(t->vols[vol], name, type < 0 ? TSDB_FLOAT32 : type, &local); /* one append, in the volume */
+    if (rc == 0)
+        *id = TSDB_SID(vol, local);
     pthread_mutex_unlock(&t->create_lock);
     return rc;
 }
@@ -1060,10 +1023,20 @@ int tsdb_series_create(tsdb *t, const char *name, tsdb_type type, const char *pa
     return series_make(t, name, (int)type, path, id);
 }
 
+uint32_t tsdb_volume_series_count(tsdb *t, uint32_t volume)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    uint32_t n = volume < t->nvols ? eng_series_count(t->vols[volume]) : 0;
+    pthread_rwlock_unlock(&t->lock);
+    return n;
+}
+
 uint64_t tsdb_series_count(tsdb *t)
 {
     pthread_rwlock_rdlock(&t->lock);
-    uint64_t n = t->ncat;
+    uint64_t n = 0;
+    for (size_t v = 0; v < t->nvols; v++)
+        n += eng_series_count(t->vols[v]);
     pthread_rwlock_unlock(&t->lock);
     return n;
 }
@@ -1072,11 +1045,14 @@ int tsdb_series_foreach(tsdb *t, int (*fn)(void *ctx, tsdb_sid id), void *ctx)
 {
     if (!fn)
         return TSDB_ERR_INVALID;
-    size_t n = (size_t)tsdb_series_count(t); /* series created during the walk may be left out */
-    for (size_t g = 0; g < n; g++) {
-        int rc = fn(ctx, (tsdb_sid)g);
-        if (rc)
-            return rc;
+    /* the counts as the walk reaches each volume: series created meanwhile may be left out */
+    for (uint32_t v = 0; v < tsdb_volume_count(t); v++) {
+        uint32_t n = tsdb_volume_series_count(t, v);
+        for (uint32_t l = 0; l < n; l++) {
+            int rc = fn(ctx, TSDB_SID(v, l));
+            if (rc)
+                return rc;
+        }
     }
     return 0;
 }
@@ -1192,8 +1168,12 @@ const char *tsdb_state_name(tsdb *t, tsdb_sid series, uint32_t code)
 
 const char *tsdb_series_path(tsdb *t, tsdb_sid id)
 {
+    eng *e;
+    uint32_t local;
+    if (!route(t, id, &e, &local))
+        return NULL;
     pthread_rwlock_rdlock(&t->lock);
-    const char *p = id < t->ncat ? t->paths[t->cat_vol[id]] : NULL;
+    const char *p = t->paths[TSDB_SID_VOLUME(id)];
     pthread_rwlock_unlock(&t->lock);
     return p;
 }
@@ -1246,22 +1226,26 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
         return TSDB_ERR_INVALID;
     size_t w = type_width(type);
     pthread_rwlock_rdlock(&t->lock);
-    size_t nv = t->nvols, ncat = t->ncat;
-    bool identity = nv == 1; /* the root alone: global ids are its local ids */
-    for (size_t i = 0; i < n; i++)
-        if (series[i] >= ncat) {
+    size_t nv = t->nvols;
+    /* every id first: an unknown one fails the whole batch before any volume writes a row */
+    bool one = true; /* every row in one volume: the engine takes it as it is, with the ids narrowed */
+    for (size_t i = 0; i < n; i++) {
+        int64_t v = sid_volume(series[i]);
+        if (v < 0 || (size_t)v >= nv || TSDB_SID_LOCAL(series[i]) >= eng_series_count(t->vols[v])) {
             pthread_rwlock_unlock(&t->lock);
             return TSDB_ERR_INVALID;
         }
-    if (identity) { /* the engine takes 32-bit local ids: one pass narrows them */
-        eng *root = t->vols[0];
+        one &= (series[i] >> 32) == (series[0] >> 32);
+    }
+    if (one) {
+        eng *e = t->vols[n ? TSDB_SID_VOLUME(series[0]) : 0];
         pthread_rwlock_unlock(&t->lock);
         uint32_t *ls = malloc((n ? n : 1) * sizeof *ls);
         if (!ls)
             return TSDB_ERR_NOMEM;
         for (size_t i = 0; i < n; i++)
-            ls[i] = (uint32_t)series[i];
-        int rc = eng_insert(root, type, ls, ts, values, n);
+            ls[i] = TSDB_SID_LOCAL(series[i]);
+        int rc = eng_insert(e, type, ls, ts, values, n);
         free(ls);
         return rc;
     }
@@ -1272,7 +1256,7 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
     int rc = (!cnt || !ls || !lt || !lv) ? TSDB_ERR_NOMEM : 0;
     if (rc == 0) {
         for (size_t i = 0; i < n; i++)
-            cnt[t->cat_vol[series[i]] + 1]++;
+            cnt[TSDB_SID_VOLUME(series[i]) + 1]++;
         for (size_t v = 1; v <= nv; v++)
             cnt[v] += cnt[v - 1];
         size_t *pos = malloc(nv * sizeof *pos);
@@ -1281,8 +1265,8 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
         } else {
             memcpy(pos, cnt, nv * sizeof *pos);
             for (size_t i = 0; i < n; i++) { /* stable: later rows stay later */
-                size_t o = pos[t->cat_vol[series[i]]]++;
-                ls[o] = t->cat_local[series[i]];
+                size_t o = pos[TSDB_SID_VOLUME(series[i])]++;
+                ls[o] = TSDB_SID_LOCAL(series[i]);
                 lt[o] = ts[i];
                 memcpy(lv + o * w, (const uint8_t *)values + i * w, w);
             }

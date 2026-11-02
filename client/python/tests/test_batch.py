@@ -54,7 +54,7 @@ def check_raw(c, ids):
         assert ts.dtype == np.int64 and v.dtype == np.float32
         assert np.array_equal(ts, one[0]) and np.array_equal(v, one[1])
     # numpy columns in, a scalar start for every query, None for an open end, desc with a limit
-    arr = c.query_raw_many(np.array(series, dtype=np.uint32), T0 + 5000, None, order="desc", limit=3)
+    arr = c.query_raw_many(np.array(series, dtype=np.uint64), T0 + 5000, None, order="desc", limit=3)
     for (ts, v), s in zip(arr, series):
         one = c.query_raw(s, T0 + 5000, None, order="desc", limit=3, numpy=True)
         assert np.array_equal(ts, one[0]) and np.array_equal(v, one[1])
@@ -79,7 +79,7 @@ def check_agg(c, ids):
     with pytest.raises(IndexError):
         many[len(series)]
     # one interval for every query, the default (0) and numpy arrays
-    hourly = c.query_agg_many(np.array(series, dtype=np.uint32), np.array(start), np.array(end), 3_600_000)
+    hourly = c.query_agg_many(np.array(series, dtype=np.uint64), np.array(start), np.array(end), 3_600_000)
     assert [list(b) for b in hourly] == [list(c.query_agg(s, a, b, 3_600_000)) for s, a, b in zip(series, start, end)]
     assert int(c.query_agg_many(series).buckets.counts.sum()) == N * len(series)
 
@@ -118,7 +118,7 @@ def check_insert_many(c, ids, f64, i64):
     c.insert_many(
         [
             (ids[0], ts, np.full(5, 7.0, dtype=np.float32)),
-            (np.array([ids[1], ids[2]] * 2 + [ids[1]], dtype=np.uint32), ts, [1.0, 2.0, 3.0, 4.0, 5.0]),
+            (np.array([ids[1], ids[2]] * 2 + [ids[1]], dtype=np.uint64), ts, [1.0, 2.0, 3.0, 4.0, 5.0]),
             (f64, ts, vals),  # float64 from the dtype, a null where masked
             (i64, list(ts), np.arange(5, dtype=np.int64) - 2),
         ]
@@ -338,7 +338,7 @@ def check_list_order(c):
             [
                 (s, ts, np.array([1.0], dtype=np.float32)),
                 (t, ts, np.array([5.0], dtype=np.float32)),
-                (np.array([t, s], dtype=np.uint32), np.array([T0 + k] * 2), np.array([6.0, 3.0], dtype=np.float32)),
+                (np.array([t, s], dtype=np.uint64), np.array([T0 + k] * 2), np.array([6.0, 3.0], dtype=np.float32)),
                 (s, ts, np.array([2.0], dtype=np.float32)),
             ]
         )

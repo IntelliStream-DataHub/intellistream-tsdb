@@ -1,13 +1,14 @@
 /*
- * VOLUMES and CATALOG (volumes.c): the template with a second volume, one of
- * the two files replaced by the input, then a read-only open, every series
- * named and looked up, a query on each, and a close. Byte 0: bit 0 picks
- * CATALOG, else VOLUMES; with bit 1 a VOLUMES input is a list of paths, each
- * taken below the template's root and written with a valid checksum (they are
- * no authentication, and a path with the scratch directory's pid in it would
- * not survive into the corpus); without it the bytes are the file. Paths in
- * VOLUMES are absolute, so the template is restored in the same place before
- * each input.
+ * VOLUMES (volumes.c): the template with a second volume, VOLUMES replaced by
+ * the input, then a read-only open, every series of every volume (by its id,
+ * TSDB_SID(volume, local)) named and looked up, a query on each, and a close.
+ * Byte 0: with bits 0-1 equal to 2 the input is a list of paths, each taken
+ * below the template's root and written with a valid checksum (they are no
+ * authentication, and a path with the scratch directory's pid in it would not
+ * survive into the corpus); otherwise the bytes are the file. Paths in VOLUMES
+ * are absolute, so the template is restored in the same place before each
+ * input. (Format 8 has no CATALOG: a volume's number is in its META, which the
+ * open checks against its line in VOLUMES.)
  */
 #include "template.h"
 
@@ -20,8 +21,8 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
     D = fuzz_dir("volumes");
     template_build(D, true, true, NULL);
     snap_take(&tpl, D);
-    if (!tpl_find(&tpl, "VOLUMES", "") || !tpl_find(&tpl, "CATALOG", "")) {
-        fprintf(stderr, "fuzz: the template has no VOLUMES or CATALOG\n");
+    if (!tpl_find(&tpl, "VOLUMES", "")) {
+        fprintf(stderr, "fuzz: the template has no VOLUMES\n");
         exit(1);
     }
     atexit(fuzz_rm_at_exit);
@@ -34,7 +35,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         LLVMFuzzerInitialize(NULL, NULL);
     if (size < 1)
         return 0;
-    const char *file = data[0] & 1 ? "CATALOG" : "VOLUMES";
+    const char *file = "VOLUMES";
     snap_put(&tpl, D, file);
     if ((data[0] & 3) == 2) {
         size_t n = 0, line = 0; /* each line grows by at most 11 bytes and the root */
@@ -56,8 +57,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     o.read_only = 1;
     tsdb *db;
     if (tsdb_open(D, &o, &db) == 0) {
-        uint32_t n = tsdb_series_count(db);
-        for (uint32_t id = 0; id < n && id < 64; id++) {
+        uint32_t done = 0;
+        for (uint32_t v = 0; v < tsdb_volume_count(db); v++)
+        for (uint32_t l = 0; l < tsdb_volume_series_count(db, v) && done < 64; l++, done++) {
+            tsdb_sid id = TSDB_SID(v, l);
             const char *name = tsdb_series_name(db, id);
             tsdb_sid got;
             if (name)
@@ -74,16 +77,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
 void fuzz_seeds(const char *dir)
 {
+    /* only paths: the template's own VOLUMES names the scratch directory, which differs on every run */
     fuzz_put(dir, "seed-VOLUMES-paths", "\002vol2\n", 6);
-    const char *names[2] = {"VOLUMES", "CATALOG"};
-    for (int i = 1; i < 2; i++) {
-        const snap_file *f = tpl_find(&tpl, names[i], "");
-        uint8_t *b = malloc(f->n + 1);
-        b[0] = (uint8_t)i;
-        memcpy(b + 1, f->d, f->n);
-        char seed[64];
-        snprintf(seed, sizeof seed, "seed-%s", names[i]);
-        fuzz_put(dir, seed, b, f->n + 1);
-        free(b);
-    }
 }

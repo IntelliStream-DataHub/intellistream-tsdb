@@ -13,8 +13,8 @@
  * one plain request per series, as without it), so --batch 100 on 1 connection is one request. A qps
  * CLASS of the form NAME.bK (raw.b10) runs NAME's windows K at a time as one QUERY_MULTI with
  * per-series starts and ends; q/s then counts windows, and the latencies are of whole requests.
- * tsdbd is at TSDB_HOST:TSDB_PORT (127.0.0.1:7070). Series ids are taken to equal the series
- * numbers of the RowBinary file, which holds when tsdbc-bench load created them in a fresh database.
+ * tsdbd is at TSDB_HOST:TSDB_PORT (127.0.0.1:7070). The spec and the RowBinary file number the series;
+ * their ids (which carry the volume in their high bits) are looked up by the names tsdbc-bench load gave them.
  * NSERIES (100) is the number of series for the whole-range queries, as for spec.py.
  */
 #include "tsdb_client.h"
@@ -34,6 +34,8 @@ static double seconds;
 static uint32_t nseries = 100;
 static size_t batch = 1; /* --batch K, or K of a qps class NAME.bK */
 #define MAXSERIES 1024
+static const char *KIND[7] = {"hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate", "flow_total"};
+static tsdb_sid sids[MAXSERIES]; /* series number -> id */
 
 static double now(void)
 {
@@ -56,10 +58,32 @@ static void load(const char *path, const char *cls)
     size_t cap = 0;
     while (fscanf(f, "%7s %u %ld %ld %ld", x.cls, &x.s, &x.a, &x.b, &x.bucket) == 5) {
         if (cls && strcmp(cls, x.cls)) continue;
+        if (x.s >= MAXSERIES) { fprintf(stderr, "%s: series %u, past %d\n", path, x.s, MAXSERIES); exit(2); }
         if (nq == cap) qs = realloc(qs, (cap = cap ? cap * 2 : 1024) * sizeof *qs);
         qs[nq++] = x;
     }
     fclose(f);
+}
+
+/* sids[0 .. n) by name */
+static void resolve(uint32_t n)
+{
+    tsdbc *c = conn();
+    for (uint32_t s = 0; s < n; s++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s.%u", KIND[s % 7], s);
+        int rc = tsdbc_series(c, name, 0, &sids[s]);
+        if (rc) { fprintf(stderr, "series %s: %s\n", name, tsdbc_strerror(rc)); exit(1); }
+    }
+    tsdbc_close(c);
+}
+
+static void resolve_queries(void)
+{
+    uint32_t n = 0;
+    for (size_t i = 0; i < nq; i++)
+        if (qs[i].s >= n) n = qs[i].s + 1;
+    resolve(n);
 }
 
 typedef struct rawacc { uint64_t n; double sum; int64_t first, last; float v; } rawacc;
@@ -77,8 +101,8 @@ static int run_one(tsdbc *c, const q *x, rawacc *r, tsdb_bucket **b, size_t *nb)
     memset(r, 0, sizeof *r);
     *b = NULL;
     *nb = 0;
-    if (x->bucket == 0) return tsdbc_query_raw(c, x->s, x->a, x->b, raw_cb, r);
-    return tsdbc_query_agg(c, x->s, x->a, x->b, x->bucket, b, nb);
+    if (x->bucket == 0) return tsdbc_query_raw(c, sids[x->s], x->a, x->b, raw_cb, r);
+    return tsdbc_query_agg(c, sids[x->s], x->a, x->b, x->bucket, b, nb);
 }
 
 static void die_rc(const char *what, int rc)
@@ -99,7 +123,7 @@ static void run_batch(tsdbc *c, size_t at, size_t k)
     int64_t st[k], en[k], iv[k];
     for (size_t i = 0; i < k; i++) {
         const q *x = &qs[(at + i) % nq];
-        ss[i] = x->s; st[i] = x->a; en[i] = x->b; iv[i] = x->bucket;
+        ss[i] = sids[x->s]; st[i] = x->a; en[i] = x->b; iv[i] = x->bucket;
     }
     int agg = qs[at % nq].bucket != 0;
     tsdb_multi_query m = {.kind = agg ? TSDB_MULTI_BUCKETS : TSDB_MULTI_VALUES, .starts = st, .ends = en,
@@ -172,18 +196,20 @@ static void *full_run(void *arg)
     tsdbc *c = conn();
     tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
     tsdb_sid ss[MAXSERIES];
+    uint32_t sn[MAXSERIES]; /* the series numbers of ss[] */
     int64_t iv[MAXSERIES];
     size_t k = 0;
     for (uint32_t s = (uint32_t)j->id; s < nseries; s += (uint32_t)j->conns) {
         if (batch > 1) {
-            ss[k] = s;
+            ss[k] = sids[s];
+            sn[k] = s;
             iv[k++] = full_interval(j, s);
             continue;
         }
         void *b;
         size_t nb;
-        int rc = j->twa ? tsdbc_query_twa(c, s, INT64_MIN, INT64_MAX, 3600000, &to, (tsdb_twa_bucket **)&b, &nb)
-                        : tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, full_interval(j, s), (tsdb_bucket **)&b, &nb);
+        int rc = j->twa ? tsdbc_query_twa(c, sids[s], INT64_MIN, INT64_MAX, 3600000, &to, (tsdb_twa_bucket **)&b, &nb)
+                        : tsdbc_query_agg(c, sids[s], INT64_MIN, INT64_MAX, full_interval(j, s), (tsdb_bucket **)&b, &nb);
         if (rc) die_rc(j->twa ? "twa" : "agg", rc);
         full_keep(j, s, b, nb);
     }
@@ -200,7 +226,7 @@ static void *full_run(void *arg)
             void *b = malloc(r[i].n * row + 1);
             if (!b) die_rc("multi", TSDB_ERR_NOMEM);
             if (r[i].n) memcpy(b, r[i].buckets, r[i].n * row);
-            full_keep(j, ss[at + i], b, r[i].n);
+            full_keep(j, sn[at + i], b, r[i].n);
         }
         tsdbc_series_results_free(r, m);
     }
@@ -252,6 +278,7 @@ int main(int argc, char **argv)
         if (batch < 1 || batch > 65536) { fprintf(stderr, "class NAME.bK: K from 1 to 65536\n"); return 2; }
         load(argv[2], base);
         if (!nq) { fprintf(stderr, "no queries of class %s\n", base); return 2; }
+        resolve_queries();
         threads = atoi(argv[4]);
         seconds = atof(argv[5]);
         job *jobs = calloc((size_t)threads, sizeof *jobs);
@@ -275,6 +302,7 @@ int main(int argc, char **argv)
     }
     if (argc == 4 && !strcmp(argv[1], "dump")) {
         load(argv[2], NULL);
+        resolve_queries();
         size_t per = strtoull(argv[3], NULL, 10);
         tsdbc *c = conn();
         const char *seen = "";
@@ -306,6 +334,7 @@ int main(int argc, char **argv)
         int dump = argc > 4;
         if (getenv("NSERIES")) nseries = (uint32_t)atoi(getenv("NSERIES"));
         if (nseries < 1 || nseries > MAXSERIES) { fprintf(stderr, "NSERIES: 1 to %d\n", MAXSERIES); return 2; }
+        resolve(nseries);
         int64_t sizes[3] = {0, 3600, 60};
         const char *names[3] = {"count/sum/min/max per series", "buckets of 3600 samples", "buckets of 60 samples"};
         for (int k = 0; k < 3; k++) {
@@ -325,6 +354,7 @@ int main(int argc, char **argv)
         int conns = atoi(argv[2]), reps = atoi(argv[3]);
         if (getenv("NSERIES")) nseries = (uint32_t)atoi(getenv("NSERIES"));
         if (nseries < 1 || nseries > MAXSERIES || conns < 1 || conns > 256 || reps < 1 || reps > 100) return 2;
+        resolve(nseries);
         fjob *jobs = calloc((size_t)conns, sizeof *jobs);
         full_time("STEP by hour", conns, reps, 1, 0, jobs);
         size_t tot = 0;

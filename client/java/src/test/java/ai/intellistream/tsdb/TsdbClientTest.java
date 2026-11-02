@@ -216,8 +216,8 @@ class TsdbClientTest {
     }
 
     /**
-     * Protocol 11 carries 64-bit ids: an id of 2^32 or more is sent whole and answered as an unknown series, never
-     * cut to the series of its low bits (here a real one, which must not change). All ones is the many-series marker
+     * Protocol 11 carries 64-bit ids, which hold the volume above bit 32: a malformed one is sent whole and answered
+     * as an unknown series, never cut to the series of its low bits (here a real one, which must not change). All ones is the many-series marker
      * and refused before anything is sent.
      */
     @Test
@@ -226,7 +226,9 @@ class TsdbClientTest {
         c.insert(id, new long[] {T0}, new float[] {1});
         long[] ts = {T0, T0 + 1000};
         float[] v = {7, 8};
-        for (long big : new long[] {id | 1L << 32, 0xFFFF_FFFF_0000_0000L | id, Long.MIN_VALUE | id, 1L << 63}) {
+        /* another volume, a zero volume field (a truncated id), bits 48-63 */
+        for (long big : new long[] {id + (1L << 32), id & 0xFFFF_FFFFL, 0xFFFF_FFFF_0000_0000L | id, Long.MIN_VALUE | id,
+                1L << 63}) {
             String what = Long.toUnsignedString(big);
             long sent = c.bytesSent();
             List<Executable> writes = List.of(() -> c.insert(big, ts, v),

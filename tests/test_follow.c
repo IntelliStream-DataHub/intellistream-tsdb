@@ -27,7 +27,7 @@
 #define NS 4
 #define T0 1700000000000LL
 /* internal test hook: switch a series to class cls at the next boundary after its rows (or *at when later) */
-int tsdb_test_class_switch(tsdb *t, uint32_t series, int cls, const int64_t *at);
+int tsdb_test_class_switch(tsdb *t, tsdb_sid series, int cls, const int64_t *at);
 
 typedef struct shared {
     atomic_int phase;          /* 1 appends, 2 batches, 3 done */
@@ -82,7 +82,7 @@ static void writer(const char *dir, shared *sh)
     while (now() - t0 < 1.5) {
         for (int s = 0; s < NS; s++) {
             long long ts = T0 + i * 1000;
-            if (tsdb_append(db, (uint32_t)s, ts, (float)(i % 1000) / 10.0f)) {
+            if (tsdb_append(db, TSDB_SID(0, s), ts, (float)(i % 1000) / 10.0f)) {
                 sh->writer_failed = 1;
                 return;
             }
@@ -101,7 +101,7 @@ static void writer(const char *dir, shared *sh)
                 ts[k] = T0 + ((long long)round * 7000 + k) * 1000; /* overlaps the appends and earlier rounds */
                 v[k] = (float)(round * 100 + s);
             }
-            if (tsdb_insert_series(db, (uint32_t)s, ts, v, B)) {
+            if (tsdb_insert_series(db, TSDB_SID(0, s), ts, v, B)) {
                 sh->writer_failed = 1;
                 return;
             }
@@ -123,7 +123,7 @@ static void writer(const char *dir, shared *sh)
         size_t nb;
         sh->final_count[s] = 0;
         sh->final_sum[s] = 0;
-        if (tsdb_query_agg(db, s, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0 && nb == 1) {
+        if (tsdb_query_agg(db, TSDB_SID(0, s), INT64_MIN, INT64_MAX, 0, &b, &nb) == 0 && nb == 1) {
             sh->final_count[s] = (long long)b[0].count;
             sh->final_sum[s] = b[0].sum;
         }
@@ -140,7 +140,7 @@ static void writer(const char *dir, shared *sh)
 static bool query_ok(tsdb *db, uint32_t s, size_t *rows, double *sum)
 {
     tsdb_points p;
-    if (tsdb_query_points(db, s, INT64_MIN, INT64_MAX, &p))
+    if (tsdb_query_points(db, TSDB_SID(0, s), INT64_MIN, INT64_MAX, &p))
         return false;
     bool ok = true;
     double total = 0;
@@ -501,7 +501,7 @@ int main(int argc, char **argv)
         long long want = sh->acked[0];
         usleep(100000); /* five refresh intervals */
         tsdb_points p;
-        if (tsdb_query_points(db, 0, want, want + 1, &p) == 0) {
+        if (tsdb_query_points(db, TSDB_SID(0, 0), want, want + 1, &p) == 0) {
             fresh_checks++;
             fresh_ok += p.n == 1;
             tsdb_points_free(&p);
@@ -517,7 +517,7 @@ int main(int argc, char **argv)
         }
         tsdb_bucket *b;
         size_t nb;
-        if (tsdb_query_agg(db, 1, INT64_MIN, INT64_MAX, 60000, &b, &nb) == 0)
+        if (tsdb_query_agg(db, TSDB_SID(0, 1), INT64_MIN, INT64_MAX, 60000, &b, &nb) == 0)
             free(b);
     }
     CHECK(ordered);
@@ -533,7 +533,7 @@ int main(int argc, char **argv)
             double sum = 0;
             if (s == NS) {
                 tsdb_sid id;
-                if (tsdb_series_lookup(db, "sensor.late", &id) != 0 || id != NS) {
+                if (tsdb_series_lookup(db, "sensor.late", &id) != 0 || id != TSDB_SID(0, NS)) {
                     converged = false;
                     break;
                 }

@@ -46,7 +46,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-int tsdb_test_class_switch(tsdb *t, uint32_t series, int cls, const int64_t *at); /* internal test hooks */
+int tsdb_test_class_switch(tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* internal test hooks */
 void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg);
 void tsdb_test_midplace(tsdb *t, void (*fn)(void *), void *arg);
 void tsdb_test_wal_state(tsdb *t, size_t *nwtail, uint64_t *removed, uint64_t *removed_synced);
@@ -106,14 +106,14 @@ static uint64_t rnd(void)
 /* ---------------------------------------------------------------- model: a grid of slots per series */
 
 typedef struct grid {
-    uint32_t id;
+    tsdb_sid id;
     int64_t t0, step;
     size_t k;
     signed char *has;
     float *v;
 } grid;
 
-static void grid_init(grid *g, uint32_t id, int64_t t0, int64_t step, size_t k)
+static void grid_init(grid *g, tsdb_sid id, int64_t t0, int64_t step, size_t k)
 {
     g->id = id, g->t0 = t0, g->step = step, g->k = k;
     g->has = calloc(k, 1);
@@ -158,7 +158,7 @@ static void check(tsdb *db, const grid *g, const char *what)
             continue;
         if (j >= p.n || p.ts[j] != gts(g, i) || p.values[j] != g->v[i]) {
             if (bad++ < 3)
-                CK(0, "%s: series %u slot %zu (ts %" PRId64 "): got %s ts %" PRId64 " %g, want %g", what, g->id, i,
+                CK(0, "%s: series %" PRIu64 " slot %zu (ts %" PRId64 "): got %s ts %" PRId64 " %g, want %g", what, g->id, i,
                    gts(g, i), j < p.n ? "row" : "nothing", j < p.n ? p.ts[j] : 0, j < p.n ? p.values[j] : 0.0,
                    g->v[i]);
             while (j < p.n && p.ts[j] < gts(g, i))
@@ -169,7 +169,7 @@ static void check(tsdb *db, const grid *g, const char *what)
         }
         j++;
     }
-    CK(j == p.n && !bad, "%s: series %u: %zu rows read, %zu matched, %zu bad", what, g->id, p.n, j, bad);
+    CK(j == p.n && !bad, "%s: series %" PRIu64 ": %zu rows read, %zu matched, %zu bad", what, g->id, p.n, j, bad);
     tsdb_points_free(&p);
     for (int w = 0; w < 6; w++) {
         size_t a = w ? rnd() % g->k : 0, b = w ? a + rnd() % (g->k - a) + 1 : g->k;
@@ -183,7 +183,7 @@ static void check(tsdb *db, const grid *g, const char *what)
         OK(tsdb_query_agg(db, g->id, gts(g, a), gts(g, b), 0, &bk, &nb));
         uint64_t got = nb ? bk[0].count : 0;
         double gs = nb ? bk[0].sum : 0;
-        CK(got == cnt && fabs(gs - sum) <= 1e-9 * fabs(sum) + 1e-6, "%s: series %u agg [%zu, %zu): %" PRIu64
+        CK(got == cnt && fabs(gs - sum) <= 1e-9 * fabs(sum) + 1e-6, "%s: series %" PRIu64 " agg [%zu, %zu): %" PRIu64
            " rows sum %f, want %" PRIu64 " sum %f", what, g->id, a, b, got, gs, cnt, sum);
         free(bk);
     }
@@ -229,7 +229,7 @@ static pstat parts_of(tsdb *db)
     return ps;
 }
 
-static int cls_of(tsdb *db, uint32_t id)
+static int cls_of(tsdb *db, tsdb_sid id)
 {
     int c = -1;
     OK(tsdb_series_class(db, id, &c));
@@ -310,7 +310,7 @@ static void test_bulk(void)
 
 /* ---------------------------------------------------------------- 2 and 3. live series */
 
-static int wait_class(tsdb *db, uint32_t id, int want, int seconds)
+static int wait_class(tsdb *db, tsdb_sid id, int want, int seconds)
 {
     for (int i = 0; i < seconds * 20; i++) {
         if (cls_of(db, id) == want)
@@ -443,7 +443,7 @@ static void repl(tsdb *db, grid *g, size_t a, size_t b, int gen)
  * the switch, which then only finishes before it returns when nothing holds it back (the bug). */
 typedef struct race {
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     int armed, to, fired, where; /* where: 0 midplace, 1 precommit */
     const int64_t *at;
     pthread_t th;
@@ -784,7 +784,7 @@ static void test_retention(void)
     rm_rf(dir);
 }
 
-/* ---------------------------------------------------------------- 8. format 6 */
+/* ---------------------------------------------------------------- 8. format 7 */
 
 static void test_format(void)
 {
@@ -799,16 +799,16 @@ static void test_format(void)
     char buf[512] = {0};
     int fd = open(path, O_RDWR);
     ssize_t n = read(fd, buf, sizeof buf - 1);
-    char *v = strstr(buf, "version=7");
+    char *v = strstr(buf, "version=8");
     CK(n > 0 && v, "META: %s", buf);
     if (v) {
-        v[8] = '6';
+        v[8] = '7';
         CK(pwrite(fd, buf, (size_t)n, 0) == n, "pwrite");
     }
     close(fd);
-    printf("  (a log line about format version 6 is expected next)\n");
+    printf("  (a log line about format version 7 is expected next)\n");
     int rc = tsdb_open(dir, &o, &db);
-    CK(rc == TSDB_ERR_CORRUPT, "a format-6 database: open returned %d", rc);
+    CK(rc == TSDB_ERR_CORRUPT, "a format-7 database: open returned %d", rc);
     if (rc == 0)
         tsdb_close(db);
     rm_rf(dir);
@@ -891,7 +891,7 @@ static void test_fresh(void)
  * 1 from 12000; the switch to 2 at 24000 races the insert (or the replace) in the middle. */
 #define MP_T0 1700000000000LL
 
-static void mid_check(tsdb *db, uint32_t s, size_t n, float want, const char *what)
+static void mid_check(tsdb *db, tsdb_sid s, size_t n, float want, const char *what)
 {
     tsdb_points p = {0};
     OK(tsdb_query_points(db, s, MP_T0, MP_T0 + 30000, &p));
@@ -1158,11 +1158,11 @@ static void test_comeback(void)
         uint32_t s;
         int64_t from;
         memcpy(&s, rec + 4, 4), memcpy(&from, rec + 8, 8);
-        if (s != id || from != at[2])
+        if (s != TSDB_SID_LOCAL(id) || from != at[2])
             continue;
         from = gts(&g, 720 + 24);
         memcpy(rec + 8, &from, 8);
-        tsdb_sid c = (uint32_t)xxh64(rec + 4, 20, (uint64_t)off);
+        uint32_t c = (uint32_t)xxh64(rec + 4, 20, (uint64_t)off);
         memcpy(rec, &c, 4);
         moved = pwrite(fd, rec, 24, off) == 24;
     }
@@ -1328,7 +1328,7 @@ static int on_dc_values(void *ctx, const int64_t *ts, const tsdb_values *v, size
         free(arr);                                                                                                 \
     } while (0)
 
-static void dc_answers(tsdb *db, uint32_t id, int64_t lo, int64_t hi, const int64_t *bounds, size_t nbounds,
+static void dc_answers(tsdb *db, tsdb_sid id, int64_t lo, int64_t hi, const int64_t *bounds, size_t nbounds,
                        dc_ans *a)
 {
     a->nq = 0;
@@ -1499,7 +1499,7 @@ typedef struct hold {
     pthread_cond_t cv;
     int in, go;
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
 } hold;
 
 static void hold_pre(void *arg)
@@ -1526,7 +1526,7 @@ static void *hold_insert(void *arg)
 
 typedef struct stall_sw {
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     int done;
 } stall_sw;
 

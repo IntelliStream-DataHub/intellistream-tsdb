@@ -445,24 +445,25 @@ static void test_malformed(tsdb_sid a)
 
 static tsdb_sid ids[6];
 
-/* Ids are u64 on the wire (protocol 11): one that differs from a stored series only above bit 31 is another,
- * unknown series (status 0, no rows), not that one cut to 32 bits; UINT64_MAX (the template's "many") the same. */
+/* Ids are u64 on the wire (protocol 11), (volume + 1) << 32 | local: one that differs from a stored series only
+ * above bit 31 is another volume's series (unknown here) or malformed (volume field 0, bits from 48 up), answered as
+ * an unknown series (status 0, no rows), never that one cut to 32 bits; UINT64_MAX (the template's "many") the same. */
 static void test_wide_ids(tsdbc *c)
 {
-    tsdb_sid list[4] = {ids[0], ids[0] | (1ull << 32), 0xffffffff00000000ull | ids[0], UINT64_MAX};
+    tsdb_sid list[5] = {ids[0], ids[0] + (1ull << 32), (uint32_t)ids[0], ids[0] | 1ull << 48, UINT64_MAX};
     tsdb_multi_query vq = {.kind = TSDB_MULTI_VALUES, .start = T0 - 7200000, .end = T0 + 3600000,
                            .opts = {TSDB_ASC, 0}};
     tsdb_series_result *r = NULL;
-    CHECK(tsdbc_query_multi_collect(c, &vq, list, 4, NULL, &r) == 0);
+    CHECK(tsdbc_query_multi_collect(c, &vq, list, 5, NULL, &r) == 0);
     CHECK(r && r[0].status == 0 && r[0].n > 0);
-    for (int i = 1; r && i < 4; i++)
+    for (int i = 1; r && i < 5; i++)
         CHECK(r[i].index == (size_t)i && r[i].series == list[i] && r[i].status == 0 && r[i].n == 0);
     if (r)
-        tsdbc_series_results_free(r, 4);
+        tsdbc_series_results_free(r, 5);
     tsdb_multi_query bq = {.kind = TSDB_MULTI_BUCKETS, .start = T0 - 7200000, .end = T0 + 3600000,
                            .interval_ms = 600000, .opts = {TSDB_ASC, 0}};
-    compare(c, &bq, list, 4, "buckets of ids above 2^32");
-    compare(c, &vq, list, 4, "values of ids above 2^32");
+    compare(c, &bq, list, 5, "buckets of unknown and malformed ids");
+    compare(c, &vq, list, 5, "values of unknown and malformed ids");
 }
 
 static void load(tsdbc *c)

@@ -245,7 +245,7 @@ static int compare(const char *what, const rbucket *r, size_t nr, const tsdb_twa
 
 /* ------------------------------------------------------- hand cases */
 
-static void query1(tsdb *db, uint32_t s, int64_t start, int64_t end, int64_t interval, int method, int64_t gap,
+static void query1(tsdb *db, tsdb_sid s, int64_t start, int64_t end, int64_t interval, int method, int64_t gap,
                    tsdb_twa_bucket **b, size_t *n)
 {
     tsdb_twa_opts o = {.method = method, .max_gap_ms = gap};
@@ -384,7 +384,7 @@ static long double gen_value(int type, int64_t i, int shape)
 }
 
 /* writes rows [0, n) of s into the db in shuffled batches, with wrong values first for some rows */
-static void write_series(tsdb *db, uint32_t id, const ref_series *s)
+static void write_series(tsdb *db, tsdb_sid id, const ref_series *s)
 {
     size_t n = s->n;
     size_t w = s->type == TSDB_FLOAT32 ? 4 : s->type == TSDB_BOOL ? 1 : 8;
@@ -597,7 +597,7 @@ static void test_random(void)
 }
 
 /* One TWA query of [start, end) in one bucket against the reference; returns the query's statistics. */
-static tsdb_query_stats check_one(tsdb *db, uint32_t id, const ref_series *rs, int64_t start, int64_t end,
+static tsdb_query_stats check_one(tsdb *db, tsdb_sid id, const ref_series *rs, int64_t start, int64_t end,
                                   int method, int64_t gap, const char *what)
 {
     tsdb_twa_bucket *b;
@@ -864,7 +864,7 @@ static void ref_splice(ref_series *s, int64_t a, int64_t b, const int64_t *ts, c
 }
 
 /* Writes m rows of the series' type: a replace of [a, b) when `replace`, else an insert. */
-static void put_rows(tsdb *db, uint32_t id, int type, const int64_t *ts, const long double *v, const bool *ok, size_t m,
+static void put_rows(tsdb *db, tsdb_sid id, int type, const int64_t *ts, const long double *v, const bool *ok, size_t m,
                      bool replace, int64_t a, int64_t b)
 {
     uint8_t *vals = malloc(m * 8 + 8), *valid = calloc(m / 8 + 2, 1);
@@ -889,7 +889,7 @@ static void put_rows(tsdb *db, uint32_t id, int type, const int64_t *ts, const l
 
 /* One random change to series s: a delete, a replace or plain inserts over a random slice of its history,
  * applied to the database and the model alike. */
-static void random_change(tsdb *db, uint32_t id, ref_series *s, int shape)
+static void random_change(tsdb *db, tsdb_sid id, ref_series *s, int shape)
 {
     int64_t t0 = s->ts[0], t1 = s->ts[s->n - 1], span = t1 - t0 + 1;
     int op = (int)rndr(3);

@@ -727,7 +727,7 @@ static void test_intents(const char *base)
     char dir[512], path[1024];
     snprintf(dir, sizeof dir, "%s/crafted_intent", base);
 
-    /* an intent naming SERIES: garbage was renamed over it (CATALOG still knows the names, so only the bytes
+    /* an intent naming SERIES: garbage was renamed over it (nothing else holds the names, so only the bytes
        show it) */
     make_db(dir);
     snprintf(path, sizeof path, "%s/SERIES", dir);
@@ -883,7 +883,7 @@ static void test_extremes(const char *base)
     OK(tsdb_insert_series(db, b, ok5, v, 5));
     tsdb_group g = {TSDB_DAY, 1, "+01:00"};
     for (int s = 0; s < 2; s++) {
-        uint32_t id = s ? b : a;
+        tsdb_sid id = s ? b : a;
         uint64_t want = s ? 5 : 3, total = 0;
         int rc = tsdb_query_group_local(db, id, INT64_MIN, INT64_MAX, &g, NULL, &bk, &nb);
         CHECK(rc == 0);

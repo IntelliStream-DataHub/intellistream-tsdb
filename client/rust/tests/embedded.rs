@@ -612,37 +612,63 @@ fn a_locked_directory_fails_cleanly() {
     done(again);
 }
 
-/// Ids are 64 bits: one the database never handed out is unknown to every call, and an id whose low 32 bits
-/// name a series (2^32 + id) never reaches that series.
+/// Ids are `(volume + 1) << 32 | local`: every real id is past 2^32 and is taken whole, in the database directory
+/// and in another volume. An id that is malformed (a zero volume field, as a truncated id has; any of bits 48-63)
+/// or names an unknown volume or a local number past the volume's series is unknown to every call, and never
+/// reaches the series its low 32 bits name.
 #[test]
-fn an_id_beyond_32_bits_is_unknown() {
-    let db = open();
+fn ids_carry_the_volume_and_malformed_ones_are_unknown() {
+    let dir = test_dir("tsdb-embedded");
+    let vol = test_dir("tsdb-embedded-vol");
+    let db = Db::open(&dir, &Options { create_volumes: true, ..opts() }).unwrap();
     let a = db.series("a").unwrap();
     let b = db.series_create("b", ValueType::State, None).unwrap();
+    let c = db.series_at("c", vol.to_str().unwrap()).unwrap();
+    assert_eq!((a >> 32, a & 0xFFFF_FFFF), (1, 0), "{a:#x}");
+    assert_eq!((b >> 32, b & 0xFFFF_FFFF), (1, 1), "{b:#x}");
+    assert_eq!((c >> 32, c & 0xFFFF_FFFF), (2, 0), "{c:#x}");
     db.insert_series(a, &[T0], &[1.0]).unwrap();
-    for big in [a + (1 << 32), b + (1 << 32), u64::MAX, u32::MAX as u64 + 1] {
-        assert_eq!(status(db.insert_series(big, &[T0 + 1], &[2.0])), Some(Status::Invalid), "{big}");
-        assert_eq!(status(db.insert(&[a, big], &[T0 + 2, T0 + 3], &[3.0, 4.0])), Some(Status::Invalid));
-        assert_eq!(status(db.append(big, T0 + 4, 5.0)), Some(Status::Invalid));
-        assert_eq!(status(db.series_name(big)), Some(Status::NotFound));
-        assert_eq!(status(db.series_type(big)), Some(Status::NotFound));
-        assert!(db.state(big, "on").is_err());
-        assert!(db.delete_range(big, ..).is_err());
-        assert!(db.query_points(big, .., QueryOpts::asc()).map_or(true, |p| p.is_empty()));
-        let multi = db.query_rows_multi(&[big, a], .., QueryOpts::asc(), Default::default()).unwrap();
+    db.insert(&[c, a], &[T0, T0 + 1], &[7.0, 1.5]).unwrap();
+    db.append(c, T0 + 1, 8.0).unwrap();
+    assert_eq!(db.series_name(c).unwrap(), "c");
+    assert_eq!(db.series_lookup("c").unwrap(), c);
+    for bad in [
+        a & 0xFFFF_FFFF, // volume field 0: a truncated id
+        b & 0xFFFF_FFFF,
+        c & 0xFFFF_FFFF,
+        a | 1 << 48, // bits 48-63 must be zero
+        c | 1 << 63,
+        u64::MAX,
+        a + (2 << 32),          // a volume the database does not have
+        (c & !0xFFFF_FFFF) | 1, // past the volume's series
+        a + 1000,
+    ] {
+        assert_eq!(status(db.insert_series(bad, &[T0 + 1], &[2.0])), Some(Status::Invalid), "{bad:#x}");
+        assert_eq!(status(db.insert(&[a, bad], &[T0 + 2, T0 + 3], &[3.0, 4.0])), Some(Status::Invalid));
+        assert_eq!(status(db.append(bad, T0 + 4, 5.0)), Some(Status::Invalid));
+        assert_eq!(status(db.series_name(bad)), Some(Status::NotFound), "{bad:#x}");
+        assert_eq!(status(db.series_type(bad)), Some(Status::NotFound));
+        assert!(db.state(bad, "on").is_err());
+        assert!(db.delete_range(bad, ..).is_err());
+        assert!(db.query_points(bad, .., QueryOpts::asc()).map_or(true, |p| p.is_empty()));
+        let multi = db.query_rows_multi(&[bad, a, c], .., QueryOpts::asc(), Default::default()).unwrap();
         assert!(multi[0].as_ref().map_or(true, |r| r.ts.is_empty()));
-        assert_eq!(multi[1].as_ref().unwrap().ts, vec![T0]);
+        assert_eq!(multi[1].as_ref().unwrap().ts, vec![T0, T0 + 1]);
+        assert_eq!(multi[2].as_ref().unwrap().ts, vec![T0, T0 + 1]);
     }
     db.flush().unwrap();
-    assert_eq!(db.query_points(a, .., QueryOpts::asc()).unwrap().values, vec![1.0]);
+    assert_eq!(db.query_points(a, .., QueryOpts::asc()).unwrap().values, vec![1.0, 1.5]);
+    assert_eq!(db.query_points(c, .., QueryOpts::asc()).unwrap().values, vec![7.0, 8.0]);
     assert_eq!(db.series_name(a).unwrap(), "a");
-    assert_eq!(db.series_count(), 2);
+    assert_eq!(db.series_count(), 3);
     let mut ids = db.series_ids().unwrap();
     ids.sort_unstable();
-    let mut want = vec![a, b];
-    want.sort_unstable();
-    assert_eq!(ids, want);
+    assert_eq!(ids, vec![a, b, c]);
+    db.close().unwrap();
+    let db = Db::open(&dir, &opts()).unwrap();
+    assert_eq!((db.series_lookup("a").unwrap(), db.series_lookup("c").unwrap()), (a, c));
     done(db);
+    let _ = std::fs::remove_dir_all(vol);
 }
 
 #[test]

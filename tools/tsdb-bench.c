@@ -54,6 +54,10 @@ typedef struct cfg {
 
 static const int64_t T0 = 1704067200000; /* 2024-01-01 */
 
+/* Series are numbered 0 .. series - 1 here (and in the row files); sids[] holds their ids, which are not those
+ * numbers ((volume + 1) << 32 | local, and a database may hold other series). */
+static tsdb_sid *sids;
+
 static ds_kind kind_of(const cfg *c, uint32_t s)
 {
     return c->dataset >= 0 ? (ds_kind)c->dataset : (ds_kind)(s % (DS_KINDS - 1)); /* mixed: no random */
@@ -89,13 +93,14 @@ static void *writer(void *arg)
         uint64_t i1 = i0 + window < c->points ? i0 + window : c->points;
         for (uint64_t i = i0; i < i1; i++)
             for (uint32_t s = 0; s < ns; s++) {
-                sv[n] = j->s0 + s;
+                sv[n] = sids[j->s0 + s];
                 ds_next(&st[s], &tv[n], &vv[n]);
                 n++;
             }
         if (j->out) {
-            for (size_t k = 0; k < n; k++) { /* RowBinary: UInt32, DateTime64(3), Float32 */
-                fwrite(&sv[k], 4, 1, j->out);
+            for (size_t k = 0; k < n; k++) { /* RowBinary: UInt32 (the series number), DateTime64(3), Float32 */
+                uint32_t ix = j->s0 + (uint32_t)(k % ns);
+                fwrite(&ix, 4, 1, j->out);
                 fwrite(&tv[k], 8, 1, j->out);
                 fwrite(&vv[k], 4, 1, j->out);
             }
@@ -151,8 +156,8 @@ static int count_values(void *ctx, const int64_t *ts, const tsdb_values *v, size
 static int scan_raw(tsdb *db, const cfg *c, uint32_t s, int64_t start, int64_t end, double *acc)
 {
     if (c->vtype < 0)
-        return tsdb_query_raw(db, s, start, end, count_rows, acc);
-    return tsdb_query_values(db, s, start, end, NULL, count_values, acc);
+        return tsdb_query_raw(db, sids[s], start, end, count_rows, acc);
+    return tsdb_query_values(db, sids[s], start, end, NULL, count_values, acc);
 }
 
 typedef struct qjob {
@@ -185,7 +190,7 @@ static void *query_loop(void *arg)
             } else {
                 tsdb_bucket *b;
                 size_t nb;
-                tsdb_query_agg(q->db, s, start, end, (int64_t)q->bucket * step, &b, &nb);
+                tsdb_query_agg(q->db, sids[s], start, end, (int64_t)q->bucket * step, &b, &nb);
                 for (size_t i = 0; i < nb; i++)
                     q->rows += b[i].count;
                 free(b);
@@ -238,7 +243,7 @@ static void *file_loader(void *arg)
     for (size_t off = 0; off < j->n && j->rc == 0; off += j->batch) {
         size_t m = j->n - off < j->batch ? j->n - off : j->batch;
         for (size_t k = 0; k < m; k++) {
-            s[k] = j->rows[off + k].s;
+            s[k] = sids[j->rows[off + k].s];
             t[k] = j->rows[off + k].t;
             v[k] = j->rows[off + k].v;
         }
@@ -250,13 +255,13 @@ static void *file_loader(void *arg)
     return NULL;
 }
 
-static int verify_agg(void *ctx, uint32_t series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
+static int verify_agg(void *ctx, tsdb_sid series, int64_t start, int64_t end, int64_t interval, tsdb_bucket **out,
                       size_t *nout)
 {
     return tsdb_query_agg(ctx, series, start, end, interval, out, nout);
 }
 
-static int verify_raw(void *ctx, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *fnctx)
+static int verify_raw(void *ctx, tsdb_sid series, int64_t start, int64_t end, tsdb_raw_fn fn, void *fnctx)
 {
     return tsdb_query_raw(ctx, series, start, end, fn, fnctx);
 }
@@ -282,7 +287,7 @@ static int mode_verify(const cfg *c)
     }
     cb_expect e;
     cb_expect_make(&f, &e);
-    cb_source src = {db, verify_agg, verify_raw};
+    cb_source src = {db, verify_agg, verify_raw, sids};
     rc = cb_expect_verify_all(&e, f.n, &src, "in the database");
     tsdb_close(db);
     cb_expect_free(&e);
@@ -326,14 +331,13 @@ static int mode_load(const cfg *c)
     }
     cb_expect e;
     cb_expect_make(&f, &e);
-    for (uint32_t i = 0; i < e.nseries; i++) { /* named as tsdbc-bench names them; ids 0.. in order */
+    sids = calloc(e.nseries ? e.nseries : 1, sizeof *sids);
+    for (uint32_t i = 0; i < e.nseries; i++) { /* named as tsdbc-bench names them */
         char name[64];
-        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
-        rc = tsdb_series(db, name, &id);
-        if (rc || id != i) { /* verification and the query benchmarks rely on ids equal to the file's indexes */
-            fprintf(stderr, "series %s: %s (id %" PRIu64 ", expected %u)\n", name, rc ? tsdb_strerror(rc) : "wrong id", id,
-                    i);
+        rc = tsdb_series(db, name, &sids[i]);
+        if (rc) {
+            fprintf(stderr, "series %s: %s\n", name, tsdb_strerror(rc));
             return 1;
         }
     }
@@ -366,7 +370,7 @@ static int mode_load(const cfg *c)
             return 1;
         }
     }
-    cb_source vsrc = {db, verify_agg, verify_raw};
+    cb_source vsrc = {db, verify_agg, verify_raw, sids};
     int vrc = cb_expect_verify_all(&e, f.n, &vsrc, "in the database");
     tsdb_stats st;
     tsdb_get_stats(db, &st);
@@ -399,7 +403,7 @@ static void *qw_loop(void *arg)
             cb_window(&r, q->c->series, q->c->points, q->k->window, &s, &start, &end);
             if (!q->k->agg) {
                 double acc[2] = {0, 0};
-                int rc = tsdb_query_raw(q->db, s, start, end, count_rows, acc);
+                int rc = tsdb_query_raw(q->db, sids[s], start, end, count_rows, acc);
                 if (rc != 0) {
                     fprintf(stderr, "query: series %u: %s\n", s, tsdb_strerror(rc));
                     exit(1);
@@ -408,7 +412,7 @@ static void *qw_loop(void *arg)
             } else {
                 tsdb_bucket *b;
                 size_t nb;
-                int rc = tsdb_query_agg(q->db, s, start, end, (int64_t)q->k->bucket * cb_step_ms(s), &b, &nb);
+                int rc = tsdb_query_agg(q->db, sids[s], start, end, (int64_t)q->k->bucket * cb_step_ms(s), &b, &nb);
                 if (rc != 0) {
                     fprintf(stderr, "query: series %u: %s\n", s, tsdb_strerror(rc));
                     exit(1);
@@ -580,11 +584,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "open: %s\n", tsdb_strerror(rc));
         return 1;
     }
-    for (uint32_t s = 0; s < c.series && !c.query_only; s++) {
+    sids = calloc(c.series ? c.series : 1, sizeof *sids);
+    for (uint32_t s = 0; s < c.series; s++) {
         char name[64];
-        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", ds_info[kind_of(&c, s)].name, s);
-        rc = c.vtype < 0 ? tsdb_series(db, name, &id) : tsdb_series_create(db, name, (tsdb_type)c.vtype, NULL, &id);
+        rc = c.query_only ? tsdb_series_lookup(db, name, &sids[s])
+             : c.vtype < 0 ? tsdb_series(db, name, &sids[s])
+                           : tsdb_series_create(db, name, (tsdb_type)c.vtype, NULL, &sids[s]);
         if (rc) {
             fprintf(stderr, "series %s: %s\n", name, tsdb_strerror(rc));
             return 1;
@@ -644,7 +650,7 @@ int main(int argc, char **argv)
         for (uint32_t s = 0; s < c.series; s++) {
             tsdb_bucket *b;
             size_t nb;
-            rc = tsdb_query_agg(db, s, INT64_MIN, INT64_MAX, (int64_t)aggs[k].bucket * step_of(&c, s), &b, &nb);
+            rc = tsdb_query_agg(db, sids[s], INT64_MIN, INT64_MAX, (int64_t)aggs[k].bucket * step_of(&c, s), &b, &nb);
             if (rc) {
                 fprintf(stderr, "agg: %s\n", tsdb_strerror(rc));
                 return 1;
@@ -680,7 +686,7 @@ int main(int argc, char **argv)
             for (uint32_t s = 0; s < c.series; s++) {
                 tsdb_bucket *b;
                 size_t nb;
-                if ((rc = tsdb_query_group_local(db, s, INT64_MIN, INT64_MAX, &groups[k].g, NULL, &b, &nb)) != 0) {
+                if ((rc = tsdb_query_group_local(db, sids[s], INT64_MIN, INT64_MAX, &groups[k].g, NULL, &b, &nb)) != 0) {
                     fprintf(stderr, "group: %s\n", tsdb_strerror(rc));
                     return 1;
                 }

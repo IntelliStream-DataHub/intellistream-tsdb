@@ -18,7 +18,7 @@
 
 extern size_t desc_window_rows;
 /* internal test hook: switch a series to class cls at the next boundary after its rows (or *at when later) */
-int tsdb_test_class_switch(tsdb *t, uint32_t series, int cls, const int64_t *at); /* internal: a small window makes DESC queries step back through many windows */
+int tsdb_test_class_switch(tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* internal: a small window makes DESC queries step back through many windows */
 
 #define K 3000 /* row slots per series, one per second */
 #define T0 1699920000000LL

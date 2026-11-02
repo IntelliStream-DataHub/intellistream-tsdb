@@ -192,11 +192,13 @@ void db_release(part **parts, size_t n)
 
 /* ------------------------------------------------------------------ meta */
 
-/* Writes META for the current format, atomically. */
+/* Writes META for the current format, atomically. An engine writes its own META only in a new database directory,
+ * which is volume 0; a volume's META, with its number, is written by the add that makes it (volumes.c). */
 static int meta_write(eng *db)
 {
     char buf[256];
-    int len = snprintf(buf, sizeof buf, "version=%d\npartition_ms=%" PRId64 "\ngranule_rows=%u\npartition_classes=%d\n",
+    int len = snprintf(buf, sizeof buf,
+                       "version=%d\npartition_ms=%" PRId64 "\ngranule_rows=%u\npartition_classes=%d\nvolume=0\n",
                        FORMAT_VERSION, db->partition_ms, db->granule_rows, db->cls_on ? 1 : 0);
     int fd = openat(db->dirfd, META_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0)

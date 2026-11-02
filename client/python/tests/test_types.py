@@ -215,5 +215,5 @@ def test_numpy_masked_arrays_and_chunk_boundaries(client):
     client.insert_series_values(st, ts[:2], np.ma.MaskedArray(np.array([on, on], dtype=np.uint32), mask=[False, True]))
     assert client.state_names(st, client.query_values(st)[1]) == ["on", None]
     # many series from numpy arrays
-    client.insert_values(np.array([d, d], dtype=np.uint32), ts[3:5], np.array([3.5, 4.5]))
+    client.insert_values(np.array([d, d], dtype=np.uint64), ts[3:5], np.array([3.5, 4.5]))
     assert client.query_values(d, numpy=False)[1] == [0.5, 1.5, 2.5, 3.5, 4.5]

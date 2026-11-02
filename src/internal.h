@@ -33,9 +33,10 @@ typedef struct eng eng;
  * granule entries (160 bytes), tombstones as in 4; 6: a 7-bit codec kind in block headers; 7: partition
  * classes (a partition key is 4 x its first base partition + its class, CLASSES holds each series' class
  * history) and zstd frames without magic number or content size, and the granule index bit-packed (gindex.c),
- * its length in the footer (64 bytes). Databases of older versions
+ * its length in the footer (64 bytes); 8: 64-bit series ids (volume + 1) << 32 | local, no CATALOG, each
+ * directory's META says which volume it is ("volume=N"; the files inside a volume are as in 7). Databases of older versions
  * are refused (no release had them). */
-#define FORMAT_VERSION 7
+#define FORMAT_VERSION 8
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */

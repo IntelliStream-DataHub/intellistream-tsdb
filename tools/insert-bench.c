@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 static uint32_t nseries = 1000;
+static tsdb_sid *sids; /* the id of series number i (ids carry the volume: they are not the numbers) */
 static const char *dir;
 static int nvolumes = 1; /* series spread round-robin over this many volumes (directories) */
 
@@ -38,9 +39,9 @@ static void stream_free(stream *s) { free(s->st); }
 static void stream_fill(stream *s, tsdb_sid *sv, int64_t *tv, float *vv, size_t n)
 {
     for (size_t k = 0; k < n; k++, s->pos++) {
-        uint32_t id = (uint32_t)(s->pos % nseries);
-        sv[k] = id;
-        ds_next(&s->st[id], &tv[k], &vv[k]);
+        uint32_t i = (uint32_t)(s->pos % nseries);
+        sv[k] = sids[i];
+        ds_next(&s->st[i], &tv[k], &vv[k]);
     }
 }
 
@@ -64,7 +65,7 @@ static void *fill_part(void *arg)
             first += nseries;
         for (uint64_t p = first; p < j->base + j->n; p += nseries) {
             size_t k = p - j->base;
-            j->sv[k] = id;
+            j->sv[k] = sids[id];
             ds_next(&j->s->st[id], &j->tv[k], &j->vv[k]);
         }
     }
@@ -109,12 +110,12 @@ static tsdb *open_fresh(int wal_sync_ms, size_t wal_max_batch)
         perror(dir);
         exit(1);
     }
+    sids = calloc(nseries, sizeof *sids);
     for (uint32_t i = 0; i < nseries; i++) {
         char name[64], vol[PATH_MAX + 32];
-        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
         snprintf(vol, sizeof vol, "%s.vol%u", abs, i % (uint32_t)nvolumes);
-        rc = tsdb_series_at(db, name, nvolumes > 1 ? vol : NULL, &id);
+        rc = tsdb_series_at(db, name, nvolumes > 1 ? vol : NULL, &sids[i]);
         if (rc) {
             fprintf(stderr, "series %s in %s: %s\n", name, nvolumes > 1 ? vol : dir, tsdb_strerror(rc));
             exit(1);
@@ -178,7 +179,7 @@ static void *appender(void *arg)
         float v;
         ds_next(&st[id], &ts, &v);
         double a = now_s();
-        int rc = tsdb_append(j->db, id, ts, v);
+        int rc = tsdb_append(j->db, sids[id], ts, v);
         double b = now_s();
         if (rc) {
             fprintf(stderr, "append: %s\n", tsdb_strerror(rc));

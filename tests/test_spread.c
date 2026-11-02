@@ -22,6 +22,7 @@
 #include <float.h>
 #include <math.h>
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,7 +97,7 @@ static bool same_bits(double result, double x) { return result == x || (x != x &
 
 /* ------------------------------------------------------------- hand cases */
 
-static void insert(tsdb *db, uint32_t s, int type, const double *v, const bool *ok, size_t n, int64_t t0)
+static void insert(tsdb *db, tsdb_sid s, int type, const double *v, const bool *ok, size_t n, int64_t t0)
 {
     int64_t ts[64];
     uint8_t vals[64 * 8], valid[8] = {0};
@@ -116,7 +117,7 @@ static void insert(tsdb *db, uint32_t s, int type, const double *v, const bool *
 }
 
 /* tsdb_query_spread; and tsdb_query_agg, which skips the spread, must give the same buckets bit for bit */
-static int spread_agg(tsdb *db, uint32_t s, int64_t start, int64_t end, int64_t interval, tsdb_spread_bucket **out,
+static int spread_agg(tsdb *db, tsdb_sid s, int64_t start, int64_t end, int64_t interval, tsdb_spread_bucket **out,
                       size_t *nout)
 {
     int rc = tsdb_query_spread(db, s, start, end, interval, NULL, out, nout);
@@ -127,14 +128,14 @@ static int spread_agg(tsdb *db, uint32_t s, int64_t start, int64_t end, int64_t 
     for (size_t i = 0; same && i < np; i++)
         same = memcmp(&p[i], &(*out)[i].b, sizeof *p) == 0;
     if (!same)
-        fprintf(stderr, "series %u interval %lld: tsdb_query_agg differs from tsdb_query_spread\n", s,
+        fprintf(stderr, "series %" PRIu64 " interval %lld: tsdb_query_agg differs from tsdb_query_spread\n", s,
                 (long long)interval);
     failures += !same;
     free(p);
     return rc;
 }
 
-static tsdb_spread_bucket one(tsdb *db, uint32_t s)
+static tsdb_spread_bucket one(tsdb *db, tsdb_sid s)
 {
     tsdb_spread_bucket *b;
     size_t n;
@@ -304,9 +305,9 @@ static void gen_series(ref_series *s, int type, int shape)
     }
 }
 
-static void put_rows1(tsdb *db, uint32_t id, const ref_series *s, size_t a, size_t e, bool wrong);
+static void put_rows1(tsdb *db, tsdb_sid id, const ref_series *s, size_t a, size_t e, bool wrong);
 /* batches of at most 64 rows go to the memtable (wal_max_batch_rows), bigger ones straight into parts */
-static void put_rows(tsdb *db, uint32_t id, const ref_series *s, size_t a, size_t e, bool wrong, bool small)
+static void put_rows(tsdb *db, tsdb_sid id, const ref_series *s, size_t a, size_t e, bool wrong, bool small)
 {
     if (!small) {
         put_rows1(db, id, s, a, e, wrong);
@@ -316,7 +317,7 @@ static void put_rows(tsdb *db, uint32_t id, const ref_series *s, size_t a, size_
         put_rows1(db, id, s, k, k + 50 < e ? k + 50 : e, wrong);
 }
 
-static void put_rows1(tsdb *db, uint32_t id, const ref_series *s, size_t a, size_t e, bool wrong)
+static void put_rows1(tsdb *db, tsdb_sid id, const ref_series *s, size_t a, size_t e, bool wrong)
 {
     int64_t ts[NROWS];
     static uint8_t vals[NROWS * 8], valid[NROWS / 8 + 1];
@@ -707,7 +708,7 @@ static void test_random(void)
 /* ------------------------------------------- deletes, replaces, retention */
 
 /* Writes the rows idx[0..m) of s (sorted): a replace of [a, b) when `replace`, else an insert. */
-static void write_rows(tsdb *db, uint32_t id, const ref_series *s, const size_t *idx, size_t m, bool replace,
+static void write_rows(tsdb *db, tsdb_sid id, const ref_series *s, const size_t *idx, size_t m, bool replace,
                        int64_t a, int64_t b)
 {
     int64_t *ts = malloc((m + 1) * sizeof *ts);
