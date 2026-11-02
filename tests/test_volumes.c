@@ -857,6 +857,193 @@ static void test_hung_volume(const char *base)
     printf("  a hung volume holds up only the name being created in it\n");
 }
 
+typedef struct {
+    tsdb *db;
+    const char *name;
+    tsdb_sid id;
+    int rc, done;
+} looker;
+
+static void *lookup_thread(void *arg)
+{
+    looker *l = arg;
+    l->rc = tsdb_series_lookup(l->db, l->name, &l->id);
+    __atomic_store_n(&l->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* A writer opening a volume an operator added while it runs (tsdb-cli), on a file system that hangs (here the
+ * volume's META is a FIFO nobody writes), holds up nothing in the volumes it has open: lookups and creations there
+ * go on. The open, once it fails, is tried again by the next request that names the volume. */
+static void test_hung_new_volume(const char *base)
+{
+    char top[600], root[700], v1[800], meta[900], saved[4096];
+    fresh(base, "volnew", top, sizeof top, root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    snprintf(meta, sizeof meta, "%s/META", v1);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.create_volumes = 0;
+    tsdb *db = NULL;
+    OK(tsdb_open(root, &o, &db));
+    tsdb_sid before, s;
+    OK(tsdb_series(db, "before", &before));
+    uint32_t idx = 0;
+    OK(tsdb_volume_add_dir(root, v1, &idx)); /* as tsdb-cli does, beside the running writer */
+    CHECK(idx == 1);
+    ssize_t n = -1;
+    int fd = open(meta, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        n = read(fd, saved, sizeof saved);
+        close(fd);
+    }
+    CHECK(n > 0);
+    CHECK(unlink(meta) == 0 && mkfifo(meta, 0644) == 0);
+    maker a = {.db = db, .name = "x", .path = v1, .rc = -1};
+    maker b = {.db = db, .name = "other", .path = NULL, .rc = -1};
+    pthread_t ta, tb;
+    CHECK(pthread_create(&ta, NULL, make_thread, &a) == 0);
+    usleep(300000);
+    CHECK(!__atomic_load_n(&a.done, __ATOMIC_ACQUIRE)); /* opening the new volume: its META does not answer */
+    looker l = {.db = db, .name = "before", .rc = 1};
+    pthread_t tl;
+    CHECK(pthread_create(&tl, NULL, lookup_thread, &l) == 0);
+    CHECK(pthread_create(&tb, NULL, make_thread, &b) == 0);
+    bool b_done = wait_done(&b, 3000);
+    bool l_done = __atomic_load_n(&l.done, __ATOMIC_ACQUIRE);
+    if (!b_done || !l_done)
+        fprintf(stderr, "  opening a new volume on a hung file system holds up the volumes already open\n");
+    CHECK(b_done && l_done);
+    int w = -1;
+    for (int i = 0; i < 500 && w < 0; i++) /* the open of the FIFO for reading is waiting for us */
+        if ((w = open(meta, O_WRONLY | O_NONBLOCK | O_CLOEXEC)) < 0)
+            usleep(10000);
+    CHECK(w >= 0);
+    if (w >= 0)
+        close(w); /* nothing written: META reads as broken, the request fails */
+    pthread_join(ta, NULL);
+    pthread_join(tb, NULL);
+    pthread_join(tl, NULL);
+    CHECK(a.rc != 0);
+    CHECK(b.rc == 0 && TSDB_SID_VOLUME(b.id) == 0);
+    CHECK(l.rc == 0 && l.id == before);
+    CHECK(tsdb_volume_count(db) == 1);
+    CHECK(unlink(meta) == 0);
+    fd = open(meta, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    CHECK(fd >= 0 && n > 0 && write(fd, saved, (size_t)n) == n);
+    if (fd >= 0)
+        close(fd);
+    OK(tsdb_series_at(db, "x", v1, &s)); /* tried again */
+    CHECK(s == TSDB_SID(1, 0) && tsdb_volume_count(db) == 2);
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  a new volume on a hung file system holds up only the requests that name it\n");
+}
+
+/* The dictionaries' test hook (src/internal.h): here it holds a follower's read of SERIES, as a hung NFS server
+ * would. */
+void tsdb_test_dict_fault(tsdb *t, int (*fn)(void *arg, int point, const char *name), void *arg);
+static pthread_mutex_t rl_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rl_cv = PTHREAD_COND_INITIALIZER;
+static int rl_held, rl_go;
+
+static int reload_hold(void *arg, int point, const char *name)
+{
+    (void)arg;
+    if (point != 3 || strcmp(name, "SERIES") != 0) /* DICT_AT_RELOAD */
+        return 0;
+    pthread_mutex_lock(&rl_mu);
+    rl_held++;
+    pthread_cond_broadcast(&rl_cv);
+    while (!rl_go)
+        pthread_cond_wait(&rl_cv, &rl_mu);
+    pthread_mutex_unlock(&rl_mu);
+    return 0;
+}
+
+/* A follower reading a SERIES that grew (on a hung file system, the read may take forever) holds no lock that a
+ * lookup of a name it already knows needs. */
+static void test_hung_reload(const char *base)
+{
+    char top[600], root[700];
+    fresh(base, "volreload", top, sizeof top, root, sizeof root);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *w = NULL, *f = NULL;
+    OK(tsdb_open(root, &o, &w));
+    tsdb_sid a, b, fa;
+    OK(tsdb_series(w, "a", &a));
+    tsdb_options ro = o;
+    ro.read_only = 1;
+    OK(tsdb_open(root, &ro, &f));
+    OK(tsdb_series_lookup(f, "a", &fa));
+    CHECK(fa == a);
+    OK(tsdb_series(w, "b", &b)); /* SERIES grows */
+    rl_held = rl_go = 0;
+    tsdb_test_dict_fault(f, reload_hold, NULL);
+    looker lb = {.db = f, .name = "b", .rc = 1}, la = {.db = f, .name = "a", .rc = 1};
+    pthread_t tb, ta;
+    CHECK(pthread_create(&tb, NULL, lookup_thread, &lb) == 0); /* a miss: reads SERIES again, and hangs there */
+    pthread_mutex_lock(&rl_mu);
+    while (!rl_held)
+        pthread_cond_wait(&rl_cv, &rl_mu);
+    pthread_mutex_unlock(&rl_mu);
+    CHECK(pthread_create(&ta, NULL, lookup_thread, &la) == 0);
+    bool done = false;
+    for (int i = 0; i < 300 && !(done = __atomic_load_n(&la.done, __ATOMIC_ACQUIRE)); i++)
+        usleep(10000);
+    if (!done)
+        fprintf(stderr, "  a lookup of a known name waits for a follower's read of SERIES\n");
+    CHECK(done);
+    pthread_mutex_lock(&rl_mu);
+    rl_go = 1;
+    pthread_cond_broadcast(&rl_cv);
+    pthread_mutex_unlock(&rl_mu);
+    pthread_join(ta, NULL);
+    pthread_join(tb, NULL);
+    CHECK(la.rc == 0 && la.id == a);
+    CHECK(lb.rc == 0 && lb.id == b);
+    tsdb_test_dict_fault(f, NULL, NULL);
+    OK(tsdb_close(f));
+    OK(tsdb_close(w));
+    remove_tree(top);
+    printf("  a follower's read of SERIES holds up no lookup of a known name\n");
+}
+
+/* A follower asked about a series its writer created a moment ago reads SERIES again. STATES (state names) has
+ * nothing to do with it: a STATES that cannot be read (here a directory took its name) must not hide the series. */
+static void test_reload_states_fails(const char *base)
+{
+    char top[600], root[700], states[800], aside[800];
+    fresh(base, "volstates", top, sizeof top, root, sizeof root);
+    snprintf(states, sizeof states, "%s/STATES", root);
+    snprintf(aside, sizeof aside, "%s/STATES.aside", root);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *w = NULL, *f = NULL;
+    OK(tsdb_open(root, &o, &w));
+    tsdb_sid a, n;
+    OK(tsdb_series(w, "a", &a));
+    tsdb_options ro = o;
+    ro.read_only = 1;
+    OK(tsdb_open(root, &ro, &f));
+    CHECK(rename(states, aside) == 0 && mkdir(states, 0755) == 0);
+    OK(tsdb_series_create(w, "n", TSDB_INT64, NULL, &n));
+    tsdb_type ty = TSDB_FLOAT32;
+    int rc = tsdb_series_type(f, n, &ty);
+    if (rc != 0)
+        fprintf(stderr, "  a follower misses a new series when STATES cannot be read\n");
+    CHECK(rc == 0 && ty == TSDB_INT64);
+    CHECK(tsdb_series_name(f, n) && strcmp(tsdb_series_name(f, n), "n") == 0);
+    OK(tsdb_close(f));
+    OK(tsdb_close(w));
+    remove_tree(top);
+    printf("  a follower finds a new series when STATES cannot be read\n");
+}
+
 /* A reader that saw VOLUMES end in a torn line (here the zeros a power loss leaves) must notice when an add cuts it
  * and appends a line of the very same length: the size alone does not change. */
 static void test_volumes_same_size(const char *base)
@@ -1621,6 +1808,9 @@ int main(int argc, char **argv)
     test_new_meta_write(base);
     test_hung_volume(base);
     test_volumes_same_size(base);
+    test_hung_reload(base);
+    test_hung_new_volume(base);
+    test_reload_states_fails(base);
     test_add_power_loss(base, argv[0]);
     test_series_ids(base);
     test_unique_names(base);

@@ -907,7 +907,7 @@ void pw_abort(part_writer *w);
 struct cls_table;
 typedef struct series_dict {
     pthread_mutex_t lock;        /* the table and the names; never held across I/O */
-    pthread_mutex_t append_lock; /* one append at a time, across its write and fdatasync; taken before lock */
+    pthread_mutex_t append_lock; /* one append (or follower's reload) at a time, across its I/O; before lock */
     const char *file;
     int fd;
     bool fsync;
@@ -1520,7 +1520,7 @@ static inline int64_t eng_mono_ms(void)
 }
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
-int eng_series_reload(eng *db); /* followers: SERIES and STATES appended since, when they grew */
+int eng_series_reload(eng *db); /* followers: SERIES appended since, when it grew */
 /* retention.c */
 static inline uint8_t cls_byte(eng *db, uint32_t s)
 {

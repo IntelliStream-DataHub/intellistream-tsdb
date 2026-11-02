@@ -645,21 +645,35 @@ static int volume_add(int dirfd, const char *root, uint64_t id, const char *path
     return rc;
 }
 
-/* Opens volume `path` (canonical, with our ROOT_ID). Caller holds the write lock. */
-static int volume_open(tsdb *t, const char *path, uint32_t *index)
+static int vols_grow(tsdb *t)
 {
-    if (t->nvols == t->vols_cap) {
-        size_t cap = t->vols_cap ? t->vols_cap * 2 : 8;
-        eng **v = realloc(t->vols, cap * sizeof *v);
-        if (!v)
-            return TSDB_ERR_NOMEM;
-        t->vols = v;
-        char **p = realloc(t->paths, cap * sizeof *p);
-        if (!p)
-            return TSDB_ERR_NOMEM;
-        t->paths = p;
-        t->vols_cap = cap;
-    }
+    if (t->nvols < t->vols_cap)
+        return 0;
+    size_t cap = t->vols_cap ? t->vols_cap * 2 : 8;
+    eng **v = realloc(t->vols, cap * sizeof *v);
+    if (!v)
+        return TSDB_ERR_NOMEM;
+    t->vols = v;
+    char **p = realloc(t->paths, cap * sizeof *p);
+    if (!p)
+        return TSDB_ERR_NOMEM;
+    t->paths = p;
+    t->vols_cap = cap;
+    return 0;
+}
+
+/* Opens volume `index` (line `index` of VOLUMES) at `path` (canonical, with our ROOT_ID) and lists it. Called
+ * without t->lock: the open reads the volume's files, and a volume on a file system that hangs must not hold up
+ * the lookups and creations in the volumes already open, which take the lock for reading. Callers open in line
+ * order. Two that open one volume at once (a follower's threads) both open it; the first to list it wins, and the
+ * other closes its copy. */
+static int volume_open(tsdb *t, const char *path, uint32_t index)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    bool listed = index < t->nvols;
+    pthread_rwlock_unlock(&t->lock);
+    if (listed)
+        return 0;
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0)
         return TSDB_ERR_IO;
@@ -671,21 +685,35 @@ static int volume_open(tsdb *t, const char *path, uint32_t *index)
         free(txt);
     }
     if (rc == 0)
-        rc = meta_check(fd, path, (uint32_t)t->nvols); /* before the engine reads or writes anything there */
+        rc = meta_check(fd, path, index); /* before the engine reads or writes anything there */
     close(fd);
     if (rc)
         return rc;
     eng *e;
     if ((rc = eng_open_sched(path, &t->opt, t->sched, &e)) != 0)
         return rc;
-    t->vols[t->nvols] = e;
-    t->paths[t->nvols] = strdup(path);
-    *index = (uint32_t)t->nvols++;
-    return 0;
+    char *p = strdup(path);
+    rc = p ? 0 : TSDB_ERR_NOMEM;
+    listed = false;
+    pthread_rwlock_wrlock(&t->lock);
+    if (rc == 0 && t->nvols == index && (rc = vols_grow(t)) == 0) {
+        t->vols[t->nvols] = e;
+        t->paths[t->nvols] = p;
+        t->nvols++;
+        listed = true;
+    } else if (rc == 0 && t->nvols < index) {
+        rc = TSDB_ERR_INVALID; /* callers open in line order: never */
+    }
+    pthread_rwlock_unlock(&t->lock);
+    if (!listed) { /* another thread listed it first, or we failed */
+        eng_close(e);
+        free(p);
+    }
+    return rc;
 }
 
 /* Reads the VOLUMES lines beyond what we have (followers call this
- * again to catch up with the writer). Caller holds the write lock. */
+ * again to catch up with the writer). Caller holds no t->lock: volume_open lists each volume under it. */
 static int load_layout(tsdb *t)
 {
     bool writer = !t->opt.read_only;
@@ -709,10 +737,7 @@ static int load_layout(tsdb *t)
             break;
         }
         good_end = (size_t)(next - txt);
-        if (++line_no < t->nvols)
-            continue; /* already open */
-        uint32_t idx;
-        rc = volume_open(t, line + 9, &idx);
+        rc = volume_open(t, line + 9, (uint32_t)++line_no); /* nothing to do when already open */
     }
     size_t vols_cut = SIZE_MAX, vols_len = len;
     if (rc == 0 && writer && good_end < len) {
@@ -812,7 +837,6 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     } else if (rc == TSDB_ERR_NOTFOUND) {
         rc = 0; /* read only, written by an older version: no volumes */
     }
-    pthread_rwlock_wrlock(&t->lock);
     /* a writer may cut a torn tail of VOLUMES: not while tsdb-cli appends a volume */
     int vfd = t->opt.read_only ? -1 : openat(t->dirfd, VOLUMES_FILE, O_RDWR | O_CLOEXEC);
     if (rc == 0 && vfd < 0 && !t->opt.read_only && errno != ENOENT)
@@ -826,7 +850,6 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         t->vols_seen = stamp_of(&vst); /* after a cut: what load_layout read */
     if (vfd >= 0)
         close(vfd);
-    pthread_rwlock_unlock(&t->lock);
     if (rc) {
         tsdb_close(t);
         return rc;
@@ -890,8 +913,9 @@ static eng *volume_at(tsdb *t, size_t v, bool reload)
     grown = grown && !stamp_same(&t->vols_seen, &st);
     pthread_rwlock_unlock(&t->lock);
     if (!e && grown) {
+        int rc = load_layout(t); /* opens new volumes outside the lock: one may be on a hung file system */
         pthread_rwlock_wrlock(&t->lock);
-        if (load_layout(t) == 0)
+        if (rc == 0)
             t->vols_seen = stamp_of(&st);
         e = v < t->nvols ? t->vols[v] : NULL;
         pthread_rwlock_unlock(&t->lock);
@@ -983,18 +1007,18 @@ static int reload_volumes(tsdb *t)
         size = -1;
     }
     close(fd);
-    pthread_rwlock_wrlock(&t->lock);
-    for (size_t i = 0; rc == 0 && i + 1 < t->nvols && i < n; i++)
+    pthread_rwlock_rdlock(&t->lock);
+    size_t open_vols = t->nvols; /* only we (create_lock) add volumes to a writer */
+    for (size_t i = 0; rc == 0 && i + 1 < open_vols && i < n; i++)
         if (strcmp(paths[i], t->paths[i + 1]) != 0) {
             fprintf(stderr, "tsdb: %s: line %zu names %s, but volume %zu is %s\n", VOLUMES_FILE, i + 1, paths[i],
                     i + 1, t->paths[i + 1]);
             rc = TSDB_ERR_CORRUPT;
         }
-    for (size_t i = t->nvols - 1; rc == 0 && i < n; i++) {
-        uint32_t idx;
-        rc = volume_open(t, paths[i], &idx);
-    }
     pthread_rwlock_unlock(&t->lock);
+    /* without the lock: a volume on a hung file system holds up only the requests that name it (create_lock) */
+    for (size_t i = open_vols - 1; rc == 0 && i < n; i++)
+        rc = volume_open(t, paths[i], (uint32_t)(i + 1));
     if (size >= 0 && (rc == 0 || rc == TSDB_ERR_CORRUPT)) { /* an I/O error is tried again */
         t->vols_seen = stamp_of(&st);
         t->vols_rc = rc;

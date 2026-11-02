@@ -99,7 +99,9 @@ disk format and the wire protocol.
   less). A format-7 database, which has one, is refused at open (below).
 - Series creation no longer takes one lock for the whole database across the append and its fsync: a volume on a
   slow or hung file system holds up only the names being created in it, while other names, in any volume, and
-  lookups go on. Two creators of one name still take turns and get one series.
+  lookups go on. Two creators of one name still take turns and get one series. Opening a volume that was added
+  while the database is open, and a follower's read of a volume's `SERIES`, hold no lock that lookups and
+  creations in the other volumes need either.
 - Disk format 8: no `CATALOG`, and each volume's `META` holds its number (`volume=N`, 0 in the database
   directory), which the open checks against the line of `VOLUMES` the directory is on (`TSDB_ERR_CORRUPT`, with a
   line that names both), so a cached id never reaches another volume's series. Nothing inside a volume changed

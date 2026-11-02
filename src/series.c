@@ -203,7 +203,9 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
 }
 
 /* Loads names a writer appended since. The file is reopened every time: on
- * NFS that is what revalidates its size (close-to-open consistency). */
+ * NFS that is what revalidates its size (close-to-open consistency). The read holds append_lock (one reload at a
+ * time; a reader appends nothing), not lock: lookups of the names already known never wait for a file system that
+ * hangs. */
 int series_reload(series_dict *d, int dirfd)
 {
     int fd = openat(dirfd, d->file, O_RDONLY | O_CLOEXEC);
@@ -215,13 +217,14 @@ int series_reload(series_dict *d, int dirfd)
         close(fd);
         return TSDB_ERR_IO;
     }
-    pthread_mutex_lock(&d->lock);
-    uint64_t off = d->file_off, size = (uint64_t)st.st_size;
+    pthread_mutex_lock(&d->append_lock);
+    uint64_t off = d->file_off, size = (uint64_t)st.st_size; /* moved only under append_lock */
     if (size > off) {
         size_t len = (size_t)(size - off);
         uint8_t *buf = malloc(len);
         dict_hook(d, DICT_AT_RELOAD, d->file);
         rc = !buf ? TSDB_ERR_NOMEM : read_all(fd, buf, len, off);
+        pthread_mutex_lock(&d->lock);
         size_t pos = 0, n, rec;
         const char *name;
         int type;
@@ -235,9 +238,10 @@ int series_reload(series_dict *d, int dirfd)
         if (rc == 0 && pos != len && valid_after(buf, pos, len, off))
             rc = TSDB_ERR_CORRUPT; /* reported by the refresh; read again from here next time */
         d->file_off = off + pos;
+        pthread_mutex_unlock(&d->lock);
         free(buf);
     }
-    pthread_mutex_unlock(&d->lock);
+    pthread_mutex_unlock(&d->append_lock);
     close(fd);
     return rc;
 }
