@@ -24,6 +24,9 @@ cp "$b/libcrashfs.so" "$stage/tests/" # the power-loss and EIO shim test_server 
 cp dist/run-tests.sh "$stage/tests/"
 cp dist/tsdbd.service "$stage/systemd/"
 cp dist/README.dist "$stage/README.dist"
+# The binaries contain zstd and liburing (linked statically): their licenses require that their notices
+# travel with them (dist/THIRD-PARTY-NOTICES). Apache-2.0 wants LICENSE and NOTICE with every copy.
+cp LICENSE NOTICE dist/THIRD-PARTY-NOTICES "$stage/"
 {
     echo "version  $version"
     echo "build    $build_id"

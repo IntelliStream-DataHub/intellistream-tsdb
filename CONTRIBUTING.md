@@ -92,6 +92,9 @@ servers. [AGENTS.md](AGENTS.md) explains why.
    short sentences, no jargon (or a few words of explanation when a term is needed). Details go in `docs/` or
    [AGENTS.md](AGENTS.md).
 8. **Update the [CHANGELOG](CHANGELOG.md)** under "Unreleased" for anything a user can notice.
+9. **A new dependency needs a compatible license** (MIT, BSD, Apache-2.0 and the like; no GPL or LGPL code linked
+   in). Add it to [docs/licenses.md](docs/licenses.md), and to `dist/THIRD-PARTY-NOTICES` if `make dist` links it
+   into the tarball.
 
 Do not commit `build*/` directories or benchmark data.
 

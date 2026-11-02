@@ -38,6 +38,9 @@ mkdir -p /tmp/dist /tmp/scratch && tar -C /tmp/dist -xzf /dist.tar.gz && cd /tmp
 for b in bin/* bench/* tests/test_*; do
     if ldd "$b" | grep -q "not found"; then echo "$b: missing libraries"; ldd "$b"; exit 1; fi
 done
+for f in LICENSE NOTICE THIRD-PARTY-NOTICES; do
+    [ -s "$f" ] || { echo "$f missing from the tarball"; exit 1; }
+done
 cat BUILDINFO
 bin/tsdb 2>&1 | head -n 1
 tests/run-tests.sh /tmp/scratch

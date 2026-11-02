@@ -512,3 +512,10 @@ make integration-tests  # tsdbd, the CLI and all four clients end to end, both s
 ## License
 
 tsdb is open source under the [Apache License 2.0](LICENSE). Copyright 2026 IntelliStream AS; see [NOTICE](NOTICE).
+The libraries tsdb builds on, and their licenses, are listed in [docs/licenses.md](docs/licenses.md).
+
+## Contributing and security
+
+Want to help? [CONTRIBUTING.md](CONTRIBUTING.md) tells you how to build, test and send a change.
+tsdb is made for a trusted network (no login or encryption yet): please read [SECURITY.md](SECURITY.md) before you
+run it anywhere else, and to report a vulnerability.

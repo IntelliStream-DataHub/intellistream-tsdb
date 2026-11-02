@@ -9,6 +9,8 @@ disk format and the wire protocol.
 ## [Unreleased]
 
 ### Added
+- `CONTRIBUTING.md`, `SECURITY.md` and `docs/licenses.md` (the licenses of everything tsdb builds on). The `make dist`
+  tarball now carries `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd and liburing are linked into its binaries).
 - Partition classes: each series gets partitions of 1, 7, 28 or 364 base partitions (`partition_ms`), the
   shortest that holds at least eight granules of it, chosen from its rate (a fresh series from its first batch,
   others when an idle merge measures them; a band widened 2x either way keeps them from flapping, and a class is
