@@ -904,7 +904,8 @@ void pw_abort(part_writer *w);
 /* ---- series dictionary ---- */
 struct cls_table;
 typedef struct series_dict {
-    pthread_mutex_t lock;
+    pthread_mutex_t lock;        /* the table and the names; never held across I/O */
+    pthread_mutex_t append_lock; /* one append at a time, across its write and fdatasync; taken before lock */
     const char *file;
     int fd;
     bool fsync;

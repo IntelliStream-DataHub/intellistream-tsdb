@@ -26,9 +26,13 @@
  *
  * Names are unique in the whole database. A lookup probes the volumes' own
  * dictionaries (the named volume first when there is one); a creation probes
- * every volume again under create_lock, which every creation holds, so no two
- * volumes ever hold one name. Creating a series is one durable append to its
- * volume's SERIES and touches no other directory.
+ * every volume again while it holds its name (name_reserve), which a creation
+ * of the same name waits for, so no two volumes ever hold one name. Creating a
+ * series is one durable append to its volume's SERIES and touches no other
+ * directory; creations of other names, in that volume or another, and lookups
+ * do not wait for it, so a volume on a hung file system holds up only the
+ * names being created in it. create_lock is held only to find or add the
+ * volume a creation names.
  *
  * VOLUMES only grows, by appends. At open the writer cuts a torn tail (a
  * partial or unchecked last line, with no valid one after it), so the next
@@ -62,10 +66,17 @@ struct tsdb {
     eng **vols;
     char **paths; /* canonical, [0] is the root */
     size_t nvols, vols_cap;
-    pthread_mutex_t create_lock; /* one series or volume creation at a time */
+    pthread_mutex_t create_lock; /* one volume add or resolve at a time */
     off_t vols_seen;             /* the size of VOLUMES when last read (a writer: create_lock; a follower: lock) */
     int vols_rc;                 /* and what that read gave: damage is reported once per change, not per request */
     sched *sched;                /* the query helpers of every volume */
+    /* The names being created now: a creation holds its name from the probe of every volume to its append, so
+     * two creators of one name take turns and those of different names do not wait for each other's disks. */
+    pthread_mutex_t name_mu;
+    pthread_cond_t name_cv;
+    const char **names_held;
+    size_t nheld, held_cap;
+    atomic_bool dup_logged; /* a name found in two volumes (damage, or a hand-made copy) is reported once */
 };
 
 /* ---------------------------------------------------------------- helpers */
@@ -723,6 +734,8 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         t->opt.read_only = 1;
     pthread_rwlock_init(&t->lock, NULL);
     pthread_mutex_init(&t->create_lock, NULL);
+    pthread_mutex_init(&t->name_mu, NULL);
+    pthread_cond_init(&t->name_cv, NULL);
     t->dirfd = -1;
     t->sched = sched_new(t->opt.query_threads, t->opt.request_threads);
     if (!t->sched) {
@@ -817,6 +830,9 @@ int tsdb_close(tsdb *t)
         close(t->dirfd);
     pthread_rwlock_destroy(&t->lock);
     pthread_mutex_destroy(&t->create_lock);
+    pthread_mutex_destroy(&t->name_mu);
+    pthread_cond_destroy(&t->name_cv);
+    free(t->names_held);
     free(t);
     return rc;
 }
@@ -1052,6 +1068,45 @@ int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index)
     return rc;
 }
 
+/* Holds name for one creation; waits while another creation holds it. Only creations in flight are held, a few
+ * at a time, so a scan is enough. name_mu is a leaf: nothing else is taken under it, and nothing waits for I/O. */
+static int name_reserve(tsdb *t, const char *name)
+{
+    pthread_mutex_lock(&t->name_mu);
+    for (size_t i = 0; i < t->nheld;)
+        if (strcmp(t->names_held[i], name) == 0) {
+            pthread_cond_wait(&t->name_cv, &t->name_mu);
+            i = 0; /* the list changed */
+        } else {
+            i++;
+        }
+    if (t->nheld == t->held_cap) {
+        size_t cap = t->held_cap ? 2 * t->held_cap : 16;
+        const char **a = realloc(t->names_held, cap * sizeof *a);
+        if (!a) {
+            pthread_mutex_unlock(&t->name_mu);
+            return TSDB_ERR_NOMEM;
+        }
+        t->names_held = a;
+        t->held_cap = cap;
+    }
+    t->names_held[t->nheld++] = name;
+    pthread_mutex_unlock(&t->name_mu);
+    return 0;
+}
+
+static void name_release(tsdb *t, const char *name)
+{
+    pthread_mutex_lock(&t->name_mu);
+    for (size_t i = 0; i < t->nheld; i++)
+        if (t->names_held[i] == name) {
+            t->names_held[i] = t->names_held[--t->nheld];
+            break;
+        }
+    pthread_cond_broadcast(&t->name_cv);
+    pthread_mutex_unlock(&t->name_mu);
+}
+
 /* An existing series of the right type (type < 0: any) */
 static int series_found(tsdb *t, int type, tsdb_sid id)
 {
@@ -1090,23 +1145,31 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ts
         rc = 0; /* maybe added since, or to be created: under the lock */
     if (rc)
         return rc;
-    /* Every creation holds create_lock from this probe of every volume to the append, so no two volumes ever hold
+    /* Every creation holds its name from this probe of every volume to the append, so no two volumes ever hold
      * one name. Only this writer creates series in its volumes, and a volume it has not opened has none yet. */
-    pthread_mutex_lock(&t->create_lock);
+    if ((rc = name_reserve(t, name)) != 0)
+        return rc;
     rc = lookup_from(t, name, path ? 0 : vol, id);
     if (rc == 0) {
-        pthread_mutex_unlock(&t->create_lock);
+        name_release(t, name);
         return series_found(t, type, *id);
     }
     rc = rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_INVALID ? 0 : rc; /* INVALID: the engine says why below */
-    if (rc == 0 && path)
+    if (rc == 0 && path) {
+        pthread_mutex_lock(&t->create_lock);
         rc = volume_resolve(t, path, norm, canon, &vol);
+        pthread_mutex_unlock(&t->create_lock);
+    }
     uint32_t local = 0;
-    if (rc == 0)
-        rc = eng_series(t->vols[vol], name, type < 0 ? TSDB_FLOAT32 : type, &local); /* one append, in the volume */
+    if (rc == 0) {
+        pthread_rwlock_rdlock(&t->lock); /* an add may move the array; the engine stays until the close */
+        eng *e = t->vols[vol];
+        pthread_rwlock_unlock(&t->lock);
+        rc = eng_series(e, name, type < 0 ? TSDB_FLOAT32 : type, &local); /* one append, in the volume */
+    }
     if (rc == 0)
         *id = TSDB_SID(vol, local);
-    pthread_mutex_unlock(&t->create_lock);
+    name_release(t, name);
     return rc;
 }
 

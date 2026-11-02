@@ -240,7 +240,10 @@ cgroup, so `nice` does not keep your work out of its way.
   `partition_classes = 0`.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
-  is a leaf. The `crashfs` lock in tests is innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
+  is a leaf. Series creation (`volumes.c`): a reserved name (`name_reserve`; its `name_mu` is a leaf) >
+  `create_lock` (only around `volume_resolve` and volume adds) > the `tsdb` rwlock; a dictionary's `append_lock`
+  (held across its write and fdatasync) > its `lock` (never held across I/O), and `broken` is set under `lock`
+  before `append_lock` is released. The `crashfs` lock in tests is innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
   `fn`, a query or the callback runs, nor while an engine lock is taken. A job's `fn` waits only for the items of its
   own nested jobs (a fork/join tree), never for a lock another job's worker may hold while waiting for helpers.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the

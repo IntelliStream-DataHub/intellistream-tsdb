@@ -748,6 +748,95 @@ static void test_new_meta_write(const char *base)
     printf("  a new volume's META is written outside the VOLUMES lock, and its failure fails just the add\n");
 }
 
+typedef struct {
+    tsdb *db;
+    const char *name, *path;
+    tsdb_sid id;
+    int rc, done;
+} maker;
+
+static void *make_thread(void *arg)
+{
+    maker *m = arg;
+    m->rc = tsdb_series_at(m->db, m->name, m->path, &m->id);
+    __atomic_store_n(&m->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static bool wait_done(maker *m, int ms)
+{
+    for (int i = 0; i < ms / 10 && !__atomic_load_n(&m->done, __ATOMIC_ACQUIRE); i++)
+        usleep(10000);
+    return __atomic_load_n(&m->done, __ATOMIC_ACQUIRE);
+}
+
+/* A volume whose file system hangs (here its SERIES is a FIFO with a full pipe) holds up only the creation of the
+ * name being appended there: a creation of another name in another volume and lookups go on, and a second creator
+ * of the hung name waits for it and gets the same series. */
+static void test_hung_volume(const char *base)
+{
+    char top[600], root[700], v1[800], fifo[900];
+    fresh(base, "volhung", top, sizeof top, root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    snprintf(fifo, sizeof fifo, "%s/SERIES", v1);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0; /* no fdatasync of the FIFO */
+    tsdb *db = NULL;
+    OK(tsdb_open(root, &o, &db));
+    tsdb_sid before, s;
+    OK(tsdb_series(db, "before", &before));
+    uint32_t idx = 0;
+    OK(tsdb_volume_add(db, v1, &idx));
+    CHECK(idx == 1);
+    OK(tsdb_close(db));
+    CHECK(unlink(fifo) == 0 && mkfifo(fifo, 0644) == 0); /* an empty SERIES before */
+    OK(tsdb_open(root, &o, &db));
+    int w = open(fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC); /* the engine holds it open for reading and writing */
+    CHECK(w >= 0);
+    char buf[4096] = {0};
+    while (w >= 0 && write(w, buf, sizeof buf) > 0)
+        ;
+    while (w >= 0 && write(w, buf, 1) > 0)
+        ;
+    maker a = {.db = db, .name = "hung", .path = v1, .rc = -1};
+    maker b = {.db = db, .name = "other", .path = NULL, .rc = -1};
+    maker c = {.db = db, .name = "hung", .path = NULL, .rc = -1};
+    pthread_t ta, tb, tc;
+    CHECK(pthread_create(&ta, NULL, make_thread, &a) == 0);
+    usleep(300000);
+    CHECK(!__atomic_load_n(&a.done, __ATOMIC_ACQUIRE)); /* its append waits for room in the pipe */
+    CHECK(pthread_create(&tb, NULL, make_thread, &b) == 0);
+    CHECK(pthread_create(&tc, NULL, make_thread, &c) == 0);
+    bool b_done = wait_done(&b, 3000);
+    if (!b_done)
+        fprintf(stderr, "  creating a series in volume 0 waits for an append to volume 1\n");
+    CHECK(b_done);
+    CHECK(tsdb_series_lookup(db, "before", &s) == 0 && s == before);
+    CHECK(!__atomic_load_n(&c.done, __ATOMIC_ACQUIRE)); /* the same name waits for the first creation */
+    int r = open(fifo, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    CHECK(r >= 0);
+    for (int i = 0; i < 1000 && r >= 0 && !(a.done && c.done); i++) {
+        while (read(r, buf, sizeof buf) > 0)
+            ;
+        usleep(10000);
+    }
+    pthread_join(ta, NULL);
+    pthread_join(tb, NULL);
+    pthread_join(tc, NULL);
+    if (r >= 0)
+        close(r);
+    if (w >= 0)
+        close(w);
+    CHECK(a.rc == 0 && b.rc == 0 && c.rc == 0);
+    CHECK(TSDB_SID_VOLUME(a.id) == 1 && TSDB_SID_VOLUME(b.id) == 0);
+    CHECK(c.id == a.id); /* one series, not a second one in volume 0 */
+    CHECK(tsdb_volume_series_count(db, 1) == 1 && tsdb_series_count(db) == 3);
+    OK(tsdb_close(db)); /* not opened again: the FIFO kept no names */
+    remove_tree(top);
+    printf("  a hung volume holds up only the name being created in it\n");
+}
+
 /* Power lost at every step of "tsdb <dir> volume add" (the crashfs shim), and
  * just after it reported success: the database opens again each time, and
  * the volume it reported is there. A VOLUMES line whose directory entry was
@@ -1417,6 +1506,7 @@ int main(int argc, char **argv)
     test_open_waits_for_add(base);
     test_readd_other_path(base);
     test_new_meta_write(base);
+    test_hung_volume(base);
     test_add_power_loss(base, argv[0]);
     test_series_ids(base);
     test_unique_names(base);

@@ -152,6 +152,7 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
 {
     memset(d, 0, sizeof *d);
     pthread_mutex_init(&d->lock, NULL);
+    pthread_mutex_init(&d->append_lock, NULL);
     if (getrandom(&d->seed, sizeof d->seed, GRND_NONBLOCK) != sizeof d->seed)
         d->seed = xxh64(&d, sizeof d, (uint64_t)time(NULL) ^ (uint64_t)getpid()); /* no entropy yet: still not public */
     d->file = file;
@@ -240,6 +241,68 @@ void series_close(series_dict *d)
     if (d->fd >= 0)
         close(d->fd);
     pthread_mutex_destroy(&d->lock);
+    pthread_mutex_destroy(&d->append_lock);
+}
+
+/* Appends a new name. The write and its fdatasync hold only append_lock, so lookups and the other names of this
+ * dictionary (d->lock) never wait for a slow or hung disk; appends take turns, and each re-checks the name under
+ * append_lock, so two creators of one name get one record. */
+static int dict_append(series_dict *d, const char *name, size_t len, int type, uint32_t *id)
+{
+    pthread_mutex_lock(&d->append_lock);
+    pthread_mutex_lock(&d->lock);
+    size_t slot;
+    int64_t found = table_find(d, name, len, &slot);
+    int rc = 0;
+    if (found >= 0) {
+        *id = (uint32_t)found;
+        if (d->types[found] != type)
+            rc = TSDB_ERR_INVALID; /* exists with another type */
+    } else if (d->fd < 0) {
+        rc = TSDB_ERR_READONLY;
+    } else if (d->broken) {
+        rc = TSDB_ERR_IO; /* a record after a torn one would be lost at the next open, yet acknowledged */
+    } else if (atomic_load(&d->count) >= DICT_MAX_NAMES) {
+        rc = TSDB_ERR_INVALID; /* full: checked before the record is written, or every open would fail on it */
+    }
+    uint64_t off = d->file_off; /* only appends move it, and they hold append_lock */
+    pthread_mutex_unlock(&d->lock);
+    if (found >= 0 || rc != 0) {
+        pthread_mutex_unlock(&d->append_lock);
+        return rc;
+    }
+    size_t size = rec_size(len);
+    uint8_t *rec = calloc(1, size);
+    if (!rec) {
+        pthread_mutex_unlock(&d->append_lock);
+        return TSDB_ERR_NOMEM;
+    }
+    rec[4] = (uint8_t)(len & 0xff);
+    rec[5] = (uint8_t)(len >> 8);
+    rec[6] = (uint8_t)type;
+    memcpy(rec + REC_HDR, name, len);
+    store32(rec, rec_check(rec, len, off));
+    int err = 0;
+    ssize_t wr = write(d->fd, rec, size);
+    if (wr != (ssize_t)size || (d->fsync && fdatasync(d->fd) != 0)) {
+        rc = TSDB_ERR_IO; /* the caller fails the engine (dict_get): see eng_fail */
+        err = wr >= 0 && wr != (ssize_t)size ? ENOSPC : errno;
+    }
+    free(rec);
+    pthread_mutex_lock(&d->lock);
+    if (rc == 0) {
+        d->file_off = off + size;
+        rc = dict_add(d, name, len, type, id);
+    } else {
+        /* Set before append_lock is released: the caller fails the engine only after it, and another creator
+         * waiting for append_lock must not append behind the torn record meanwhile. */
+        d->broken = true;
+    }
+    pthread_mutex_unlock(&d->lock);
+    pthread_mutex_unlock(&d->append_lock);
+    if (rc == TSDB_ERR_IO)
+        errno = err;
+    return rc;
 }
 
 int series_get(series_dict *d, const char *name, bool create, int type, uint32_t *id)
@@ -257,45 +320,10 @@ int series_get(series_dict *d, const char *name, bool create, int type, uint32_t
             rc = TSDB_ERR_INVALID; /* exists with another type */
     } else if (!create) {
         rc = TSDB_ERR_NOTFOUND;
-    } else if (d->fd < 0) {
-        rc = TSDB_ERR_READONLY;
-    } else if (d->broken) {
-        rc = TSDB_ERR_IO; /* a record after a torn one would be lost at the next open, yet acknowledged */
-    } else if (atomic_load(&d->count) >= DICT_MAX_NAMES) {
-        rc = TSDB_ERR_INVALID; /* full: checked before the record is written, or every open would fail on it */
-    } else {
-        size_t size = rec_size(len);
-        uint8_t *rec = calloc(1, size);
-        if (!rec) {
-            rc = TSDB_ERR_NOMEM;
-        } else {
-            rec[4] = (uint8_t)(len & 0xff);
-            rec[5] = (uint8_t)(len >> 8);
-            rec[6] = (uint8_t)type;
-            memcpy(rec + REC_HDR, name, len);
-            store32(rec, rec_check(rec, len, d->file_off));
-            int err = 0;
-            ssize_t wr = write(d->fd, rec, size);
-            if (wr != (ssize_t)size || (d->fsync && fdatasync(d->fd) != 0)) {
-                rc = TSDB_ERR_IO; /* the caller fails the engine (dict_get): see eng_fail */
-                err = wr >= 0 && wr != (ssize_t)size ? ENOSPC : errno;
-            }
-            free(rec);
-            if (rc == TSDB_ERR_IO) {
-                /* Set before the unlock: the caller fails the engine only after it, and another creator
-                 * waiting for the lock must not append behind the torn record meanwhile. */
-                d->broken = true;
-                pthread_mutex_unlock(&d->lock);
-                errno = err;
-                return rc;
-            }
-            if (rc == 0) {
-                d->file_off += size;
-                rc = dict_add(d, name, len, type, id);
-            }
-        }
     }
     pthread_mutex_unlock(&d->lock);
+    if (found < 0 && create)
+        rc = dict_append(d, name, len, type, id);
     return rc;
 }
 
