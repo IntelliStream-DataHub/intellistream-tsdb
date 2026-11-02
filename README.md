@@ -82,7 +82,9 @@ ClickHouse and VictoriaMetrics, 100 billion rows against ClickHouse,
 time-weighted averages, memory use, and size on disk against 13 systems) are in
 [bench/dbcmp/results/0.9.0-interim.md](bench/dbcmp/results/0.9.0-interim.md).
 The tables below are from the earlier measurement; they will be replaced when
-the rest is in.
+the rest is in. InfluxDB 2's new load and query times are in
+[bench/dbcmp/results/0.9.0-interim-tables.md](bench/dbcmp/results/0.9.0-interim-tables.md)
+and in the section about InfluxDB 2 below.
 
 **Where tsdb is more than 100 times faster than ClickHouse** (100 billion rows:
 10,000 sensors x 10 million readings, the same rows in both, ClickHouse queried
@@ -104,6 +106,93 @@ there tsdb is 2 to 3 times faster: one sensor by hour 17 ms against 42 ms, every
 sensor by hour 53 s against 113 s. Interim numbers from
 [bench/dbcmp/results/0.9.0-interim.md](bench/dbcmp/results/0.9.0-interim.md);
 ClickHouse's times are whole milliseconds, as its benchmark tool reports them.
+
+**tsdb against InfluxDB 2.** The same machine and the same data: 100 sensors,
+1 million readings each. InfluxDB 2.7.12 ran in Podman with its default
+settings, except that it was told to compact old data after one minute without
+writes, so that its background work ends sooner. Like tsdb, it syncs a write to
+disk before it answers. InfluxDB 2
+has two query languages, InfluxQL and Flux. For every question below, the
+InfluxDB 2 time is the faster of the two (neither is faster on all questions).
+Every answer was checked against tsdb's before it was timed. These are interim
+numbers: more is coming, for example time-weighted averages for InfluxDB 2.
+
+*Size on disk.* Bytes per reading over 31 data sets (8 made-up sensor kinds and
+23 real sensors from a hydraulic test rig). Each size compared to tsdb's
+(tsdb = 1x):
+
+| | smallest | largest | median |
+|---|---:|---:|---:|
+| **tsdb** | **1x** | **1x** | **1x** |
+| InfluxDB 2 | 5.2x | 400x | 20.4x |
+
+tsdb is smaller on all 31 data sets. At its best, InfluxDB 2 needs 4.8 bytes
+per reading where tsdb needs 0.93. At its worst it needs 256 bytes where tsdb
+needs 0.64.
+
+*Speed.* The 100 million readings, median time of one request, tsdb through its
+server over TCP. "Clients" is how many connections ask at the same time. A
+request for 100 sensors names all of them. A day is 86,400 readings, a week is
+604,800. tsdb loaded with 4 connections, InfluxDB 2 with 8.
+
+| question | clients | tsdb | InfluxDB 2 | InfluxDB 2 takes |
+|---|---:|---:|---:|---:|
+| load 100 million readings | | **1.08 s** | 27.9 s | 26x longer |
+| wait after the load until background work is done | | **0.02 s** | 664 s | |
+| summary of 100 sensors, whole history | 1 | **1.2 ms** | 2.38 s | 2,000x longer |
+| the same in buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s | 280x longer |
+| the same in buckets of 60 readings (1.67 million buckets) | 1 | **67 ms** | 6.85 s | 103x longer |
+| one day of one sensor, in 288 buckets | 1 | **0.089 ms** | 5.0 ms | 57x longer |
+| | 32 | **0.45 ms** | 33.6 ms | 75x longer |
+| one day of 100 sensors | 1 | **1.3 ms** | 293 ms | 230x longer |
+| | 32 | **28.5 ms** | 3.34 s | 120x longer |
+| one week of one sensor, in 168 buckets | 1 | **0.12 ms** | 8.4 ms | 70x longer |
+| | 32 | **1.4 ms** | 79.7 ms | 55x longer |
+| one week of 100 sensors | 1 | **4.9 ms** | 348 ms | 71x longer |
+| | 32 | **137 ms** | 9.04 s | 66x longer |
+| 3,600 raw readings of one sensor | 1 | **0.043 ms** | 2.2 ms | 52x longer |
+| | 32 | **0.35 ms** | 6.7 ms | 20x longer |
+| 3,600 raw readings of each of 100 sensors | 1 | **1.2 ms** | 207 ms | 170x longer |
+| | 32 | **25.9 ms** | 648 ms | 25x longer |
+| one reading | 1 | **0.031 ms** | 0.29 ms | 9.4x longer |
+| | 32 | **0.23 ms** | 0.83 ms | 3.6x longer |
+
+- A summary is count, sum, minimum and maximum. "Summary of 100 sensors" is one
+  request that asks about all 100 sensors, the whole table.
+- **Memory:** in these queries tsdb used at most 1.8 GB (1.7 GB without the
+  file cache). InfluxDB 2's memory is not measured yet: more is coming.
+- You can also ask InfluxDB 2 one question per sensor, on 16 connections at
+  once. It then does the whole table in 0.40 s for the summary (tsdb: 2.8 ms,
+  140x faster), 0.41 s for buckets of 3,600 (tsdb: 9.0 ms, 46x) and 0.92 s for
+  buckets of 60 (tsdb: 33.5 ms, 27x). Those are the times of the whole pass over
+  all 100 sensors, not of one request.
+
+**Where tsdb is more than 100 times faster than InfluxDB 2** (100 million
+readings: 100 sensors x 1 million readings, the same rows in both; median time
+of one request, tsdb through its server over TCP, InfluxDB 2 the faster of
+InfluxQL and Flux):
+
+| question | clients | tsdb | InfluxDB 2 | InfluxDB 2 takes |
+|---|---:|---:|---:|---:|
+| summary of 100 sensors, whole history | 1 | **1.2 ms** | 2.38 s | 2,000x longer |
+| summary of 10 sensors, whole history | 1 | **1.7 ms** | 230 ms | 140x longer |
+| the same for 100 sensors in buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s | 280x longer |
+| the same for 100 sensors in buckets of 60 readings | 1 | **67 ms** | 6.85 s | 103x longer |
+| one day of 100 sensors | 1 | **1.3 ms** | 293 ms | 230x longer |
+| one day of 100 sensors | 32 | **28.5 ms** | 3.34 s | 120x longer |
+| one day of 10 sensors | 1 | **0.25 ms** | 30.6 ms | 120x longer |
+| one day of 10 sensors | 32 | **3.0 ms** | 338 ms | 110x longer |
+| 3,600 raw readings of each of 100 sensors | 1 | **1.2 ms** | 207 ms | 170x longer |
+
+The big gaps are on requests that name many sensors at once. tsdb keeps a
+summary for every block of 8192 readings (see above), so a summary of the whole
+history is answered from the summaries, and so are most blocks of a day-long
+window. Raw readings have to be read in both systems; tsdb still answers a
+request for 100 sensors in one go. For one sensor the gap is smaller: 20 to
+75 times for a window, 4 to 9 times for one reading. Numbers from
+[bench/dbcmp/results/0.9.0-interim-tables.md](bench/dbcmp/results/0.9.0-interim-tables.md).
+tsdb's whole-table times are printed in tenths of a millisecond there, so
+those ratios are rounded.
 
 100 million sensor readings (100 sensors, 1 million readings each), loaded and
 queried on the same machine (AMD Ryzen 9 7950X, NVMe disk). Two tables: tsdb as
