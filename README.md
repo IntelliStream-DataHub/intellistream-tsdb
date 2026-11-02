@@ -1,5 +1,7 @@
 # tsdb
 
+[![CI](https://github.com/IntelliStream-DataHub/intellistream-tsdb/actions/workflows/ci.yml/badge.svg)](https://github.com/IntelliStream-DataHub/intellistream-tsdb/actions/workflows/ci.yml)
+
 A small, fast time series database written in C.
 
 At [IntelliStream](https://intellistream.ai) we work a lot with industrial

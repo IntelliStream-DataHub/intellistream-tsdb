@@ -1,0 +1,342 @@
+# Continuous integration for tsdb. What runs where is described in CONTRIBUTING.md ("CI").
+#
+#   every push to main and every pull request: build-test, asan, tsan, clients, portable, integration, dco (pull requests)
+#   once a week and by hand (workflow_dispatch):  jepsen (about 10 minutes of fault injection)
+#
+# Rules this file follows:
+#   - Jobs run directly on ubuntu-24.04 runners (4 CPUs, 16 GB), never in container jobs. Packages come from apt.
+#   - Containers are Podman only. No job needs one: `make dist-check-almalinux10` (the tarball in an
+#     AlmaLinux 10 container, run with Podman) is left out of CI on purpose; run it by hand before a release.
+#   - Third-party actions are pinned to a full commit SHA with the version in a comment, and are at least two weeks
+#     old when pinned.
+#   - The test harnesses start tsdbd with `--port 0 --port-file`, so no job picks a TCP port.
+#   - make is run with -j only for plain builds; the test recipes themselves run one test after the other.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 1" # Mondays, 03:23 UTC: the weekly jepsen run
+
+permissions:
+  contents: read
+
+# A new push to the same branch or pull request replaces the run in progress. The event is part of the key so that
+# the weekly run and a manual run are not cancelled by a push.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash # bash -eo pipefail: a failing make is not hidden by `| tee`
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ------------------------------------------------------------------------------------------------ build and test
+  build-test:
+    name: build and test
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packages
+        run: .github/scripts/install-deps.sh
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: Which event loops can the server tests use?
+        id: io
+        # `make test` runs the server tests on io_uring and on epoll. Where io_uring is disabled (a kernel or a policy
+        # that refuses it, as on AlmaLinux 10) that would fail on setup, so the job falls back to
+        # `make test IO=epoll` and says so in a warning.
+        run: echo "list=$(.github/scripts/pick-io.sh)" >> "$GITHUB_OUTPUT"
+      - name: make test (unit, crash-recovery, fuzz corpus replay, quick start, server on ${{ steps.io.outputs.list }})
+        env:
+          IO_LIST: ${{ steps.io.outputs.list }}
+        run: |
+          ulimit -n 65536 || true
+          mkdir -p ci-logs
+          make -j"$(nproc)" test IO="$IO_LIST" 2>&1 | tee ci-logs/make-test.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-build-test
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # -------------------------------------------------------------------------------------------------------- asan
+  asan:
+    name: AddressSanitizer and UBSan
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packages
+        run: .github/scripts/install-deps.sh
+      - name: Let the sanitizer map its shadow memory
+        # Ubuntu 24.04's kernel randomizes mappings over 32 bits, which the sanitizer runtimes cannot place their
+        # shadow memory around ("unexpected memory mapping"). 28 bits is the value they were tested with.
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Which event loops can the server tests use?
+        id: io
+        run: echo "list=$(.github/scripts/pick-io.sh)" >> "$GITHUB_OUTPUT"
+      - name: make asan (starts with make clean, which is fine in its own job)
+        env:
+          IO_LIST: ${{ steps.io.outputs.list }}
+        run: |
+          ulimit -n 65536 || true
+          mkdir -p ci-logs
+          make asan IO="$IO_LIST" 2>&1 | tee ci-logs/make-asan.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-asan
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # -------------------------------------------------------------------------------------------------------- tsan
+  tsan:
+    name: ThreadSanitizer
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packages
+        run: .github/scripts/install-deps.sh
+      - name: Let the sanitizer map its shadow memory
+        run: sudo sysctl -w vm.mmap_rnd_bits=28 # see the asan job
+      - name: Which event loops can the server tests use?
+        id: io
+        run: echo "list=$(.github/scripts/pick-io.sh)" >> "$GITHUB_OUTPUT"
+      - name: make tsan (builds into build-tsan/, the server under test included)
+        env:
+          IO_LIST: ${{ steps.io.outputs.list }}
+        run: |
+          ulimit -n 65536 || true
+          mkdir -p ci-logs
+          make tsan IO="$IO_LIST" 2>&1 | tee ci-logs/make-tsan.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-tsan
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------------------------------- clients
+  clients:
+    name: Rust, Python and Java clients
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packages
+        run: .github/scripts/install-deps.sh clients
+      - name: Rust
+        # The crates need Rust 1.88 or newer (edition 2024); the stable toolchain is newer.
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: stable
+      - name: Java (the embedded binding needs 22 or newer; the TCP client targets 17)
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - name: Cache cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('client/*/Cargo.lock', 'tests/integration/rust/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Cache pip downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'Makefile') }}
+          restore-keys: pip-${{ runner.os }}-
+      - name: make test-clients (Rust, Python, the Python sdist, Java, embedded Java; against build/tsdbd)
+        run: |
+          mkdir -p ci-logs
+          make -j"$(nproc)" test-clients 2>&1 | tee ci-logs/make-test-clients.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-clients
+          path: |
+            ci-logs
+            client/java/target/surefire-reports
+            client/java-embedded/target/surefire-reports
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------------------------------- portable
+  portable:
+    name: portable build and tarball
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packages
+        run: .github/scripts/install-deps.sh
+      - name: make PORTABLE=1 (no -march=native)
+        run: make -j"$(nproc)" PORTABLE=1
+      - name: make dist (x86-64-v2 plus v3 and v4 codecs; checks the glibc ceiling and the instruction sets)
+        run: |
+          mkdir -p ci-logs
+          make -j"$(nproc)" dist 2>&1 | tee ci-logs/make-dist.log
+      - name: make dist-test (the tarball's own tests, at every CPU level this runner has)
+        # A level the CPU lacks (v4 without AVX-512) is skipped by the suite itself. The AlmaLinux 10 container check
+        # (make dist-check-almalinux10) needs Podman and is not part of CI.
+        run: |
+          ulimit -n 65536 || true
+          make dist-test 2>&1 | tee ci-logs/make-dist-test.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-portable
+          path: ci-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # -------------------------------------------------------------------------------------------------- integration
+  integration:
+    name: integration tests and version check
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packages
+        run: .github/scripts/install-deps.sh clients
+      - name: Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
+        with:
+          toolchain: stable
+      - name: Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - name: Cache cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('client/*/Cargo.lock', 'tests/integration/rust/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Cache pip downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('client/python/pyproject.toml', 'Makefile') }}
+          restore-keys: pip-${{ runner.os }}-
+      - name: Build, then check that VERSION, tsdb.h, the binaries and the client manifests agree
+        run: |
+          make -j"$(nproc)"
+          make check-version
+      - name: The harness's own tests
+        run: make integration-selftest
+      - name: make integration-tests (tsdbd, the CLI and the C, Rust, Python and Java clients, uring and epoll)
+        # tests/integration/run.py probes io_uring itself and skips the uring runs, with a line in its summary, on a
+        # runner that does not offer it.
+        run: |
+          ulimit -n 65536 || true
+          mkdir -p ci-logs
+          make integration-tests 2>&1 | tee ci-logs/make-integration-tests.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-integration
+          path: |
+            ci-logs
+            build/integ/logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ------------------------------------------------------------------------------------------------------ jepsen
+  jepsen:
+    name: jepsen fault injection (weekly)
+    # Not on every push: about 10 minutes of kill -9, simulated power loss (the crashfs LD_PRELOAD shim, built by
+    # make), I/O errors and pauses, on both event loops and the workloads kv and classes.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.repository == 'IntelliStream-DataHub/intellistream-tsdb')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      JEPSEN_DIR: /tmp/tsdb-jepsen-ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packages
+        run: .github/scripts/install-deps.sh
+      - name: Which event loops can the server use?
+        id: io
+        run: echo "list=$(.github/scripts/pick-io.sh)" >> "$GITHUB_OUTPUT"
+      - name: make jepsen
+        env:
+          IO_LIST: ${{ steps.io.outputs.list }}
+        run: |
+          ulimit -n 65536 || true
+          mkdir -p ci-logs
+          make jepsen IO="$IO_LIST" JEPSEN_DIR="$JEPSEN_DIR" 2>&1 | tee ci-logs/make-jepsen.log
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-jepsen
+          path: |
+            ci-logs
+            /tmp/tsdb-jepsen-ci*.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------------------------------------- dco
+  dco:
+    name: DCO sign-off and commit rules
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the whole history, so that base..head can be listed
+      - name: Check every commit of the pull request
+        # .githooks/commit-msg (no session link, a Signed-off-by as the last trailer) plus: that Signed-off-by is the
+        # commit author's. The pull request's title and text are checked for a session link too. They are passed in
+        # the environment, never put into the script text.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          PR_TEXT="$PR_TITLE
+          $PR_BODY"
+          export PR_TEXT
+          .github/scripts/check-commits.sh "$BASE_SHA" "$HEAD_SHA"

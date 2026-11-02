@@ -68,6 +68,32 @@ Tests and tools never pick a TCP port by themselves: start `tsdbd` with `--port 
 port from the file, as the test harnesses do. Two runs on one machine would otherwise talk to each other's
 servers. [AGENTS.md](AGENTS.md) explains why.
 
+## CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and every push to `main`, on plain
+Ubuntu 24.04 runners with 4 CPUs and 16 GB. These checks should be green before a change is merged:
+
+- **build and test:** `make`, then `make test`. If the runner does not allow io_uring, the server tests run on
+  epoll only (`make test IO=epoll`) and the log says so.
+- **AddressSanitizer and UBSan:** `make asan`.
+- **ThreadSanitizer:** `make tsan`.
+- **clients:** `make test-clients` (Rust, Python and Java).
+- **portable build and tarball:** `make PORTABLE=1`, `make dist` and `make dist-test`.
+- **integration tests:** `make check-version`, then `make integration-tests`.
+- **DCO** (pull requests only): every commit has a `Signed-off-by` that matches its author, as the last trailer, and
+  no commit message or pull request text links to an AI session. It is the same check as the `commit-msg` hook,
+  run by `.github/scripts/check-commits.sh BASE HEAD`, so you can try it on your branch.
+
+Once a week (Mondays) and by hand from the Actions tab ("Run workflow"), CI also runs `make jepsen`, the fault
+injection with kill -9, simulated power loss, disk errors and pauses (about 10 minutes). It does not run on every
+push; run it yourself for a change to how data reaches the disk. When a job fails, its logs are attached to the run
+as an artifact for two weeks.
+
+CI does not run the AlmaLinux 10 container check (`make dist-check-almalinux10`, it needs Podman), the long fuzz
+runs, the benchmarks or the Podman-based Pulsar connector test. A test that passes here on a 32-thread machine can
+still be slow or timing-sensitive on a 4-CPU runner: if a CI run fails once and passes when you run it again,
+tell us in the pull request, so that we can fix the test.
+
 ## The rules
 
 1. **Every bug fix comes with a regression test that fails without the fix.** Check it: build the old code
