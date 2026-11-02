@@ -672,8 +672,8 @@ static void test_series_dict(const char *base)
 }
 
 /* A volume add writes the volume's META (its number, which ids carry) before the VOLUMES line names the
- * directory. A failed write leaves no line and stops the writer; the add retried after the reopen completes the
- * directory, under the number it gets then. */
+ * directory. A failed write leaves no line and fails just the add: nothing relies on that META yet, so the writer
+ * goes on, and the add tried again completes the directory, under the number it gets then. */
 static void test_volume_meta(const char *base)
 {
     char name[600], vol[700], cmd[800];
@@ -690,20 +690,19 @@ static void test_volume_meta(const char *base)
     CHECK(tsdb_series_at(db, "b", vol, &b) == TSDB_ERR_IO);
     CHECK(fired() == 1);
     CHECK(tsdb_volume_count(db) == 1);
-    CHECK(is_failed(db, "META"));
-    db = reopen(db);
-    CHECK(tsdb_volume_count(db) == 1);
+    CHECK(tsdb_failed(db, NULL, 0) == 0);
+    OK(tsdb_append(db, a, 2, 2));
     OK(tsdb_series_at(db, "b", vol, &b));
     CHECK(b == TSDB_SID(1, 0) && tsdb_volume_count(db) == 2);
     OK(tsdb_append(db, b, 7, 7));
     db = reopen(db);
-    int64_t one[] = {1}, seven[] = {7};
-    expect_rows(db, "a", one, 1);
+    int64_t one_two[] = {1, 2}, seven[] = {7};
+    expect_rows(db, "a", one_two, 2);
     expect_rows(db, "b", seven, 1);
     tsdb_close(db);
     if (system(cmd) != 0)
         failures++;
-    printf("  failed volume META write\n");
+    printf("  failed volume META write fails just the add\n");
 }
 
 /* wal_sync_ms > 0: the flusher's sync fails with no writer waiting; the next
