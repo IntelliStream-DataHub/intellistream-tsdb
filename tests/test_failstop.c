@@ -671,6 +671,124 @@ static void test_series_dict(const char *base)
     printf("  failed series dictionary append\n");
 }
 
+/* The dictionaries' test hook (src/internal.h, DICT_AT_*): fails the add of one name in memory, as if memory ran
+ * out after its record was written, and holds the creator whose append failed before it fails the engine. */
+void tsdb_test_dict_fault(tsdb *t, int (*fn)(void *arg, int point, const char *name), void *arg);
+enum { AT_ADD = 1, AT_FAILED = 2 };
+static char df_name[32];     /* the name the hook acts on */
+static int df_fail_add;      /* the next add of it fails */
+static int df_hold, df_held, df_go; /* hold its creator after the failed append */
+
+static int dict_fault(void *arg, int point, const char *name)
+{
+    (void)arg;
+    int fail = 0;
+    pthread_mutex_lock(&f_lock);
+    if (strcmp(name, df_name) == 0) {
+        if (point == AT_ADD && df_fail_add) {
+            df_fail_add = 0;
+            fail = 1;
+        } else if (point == AT_FAILED && df_hold) {
+            df_hold = 0;
+            df_held = 1;
+            pthread_cond_broadcast(&f_cv);
+            while (!df_go)
+                pthread_cond_wait(&f_cv, &f_lock);
+        }
+    }
+    pthread_mutex_unlock(&f_lock);
+    return fail;
+}
+
+static void dict_fault_arm(const char *name, bool fail_add, bool hold_failed)
+{
+    pthread_mutex_lock(&f_lock);
+    snprintf(df_name, sizeof df_name, "%s", name);
+    df_fail_add = fail_add;
+    df_hold = hold_failed;
+    df_held = df_go = 0;
+    pthread_mutex_unlock(&f_lock);
+}
+
+/* The record of a new name is durable, but adding it to the table in memory fails (no memory). The next name
+ * would get its id in memory and the one after it in the file: after a reopen, its rows would be another
+ * series'. Such a dictionary takes no more names, and the engine fails, as after a torn record. */
+static void test_series_dict_add(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-series-add", base);
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid a, b, c;
+    OK(tsdb_series(db, "a", &a));
+    OK(tsdb_append(db, a, 1, 1));
+    tsdb_test_dict_fault(db, dict_fault, NULL);
+    dict_fault_arm("b", true, false);
+    int rb = tsdb_series(db, "b", &b);
+    CHECK(rb == TSDB_ERR_IO);
+    CHECK(is_failed(db, "series dictionary"));
+    int rc = tsdb_series(db, "c", &c);
+    CHECK(rc == TSDB_ERR_IO);
+    if (rc == 0)
+        OK(tsdb_append(db, c, 7, 7));
+    tsdb_test_dict_fault(db, NULL, NULL);
+    db = reopen(db);
+    int64_t want[] = {1};
+    expect_rows(db, "a", want, 1);
+    if (rc == 0) { /* acknowledged: must be there, under its own name */
+        int64_t seven[] = {7};
+        expect_rows(db, "c", seven, 1);
+    }
+    tsdb_close(db);
+    printf("  a name whose record is durable but not in memory fails the engine\n");
+}
+
+struct creator {
+    tsdb *db;
+    const char *name;
+    tsdb_sid id;
+    int rc;
+};
+
+static void *create_main(void *arg)
+{
+    struct creator *c = arg;
+    c->rc = tsdb_series(c->db, c->name, &c->id);
+    return NULL;
+}
+
+/* A creator refused because an earlier append failed (the dictionary is broken) must not fail the engine itself:
+ * it knows no cause, and the first failure wins the message. The creator whose append failed reports its own. */
+static void test_series_dict_cause(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-series-cause", base);
+    tsdb *db = open_fresh(name, opts());
+    tsdb_sid a;
+    OK(tsdb_series(db, "a", &a));
+    tsdb_test_dict_fault(db, dict_fault, NULL);
+    dict_fault_arm("b", true, true);
+    struct creator cb = {.db = db, .name = "b", .rc = 1}, cc = {.db = db, .name = "c", .rc = 1};
+    pthread_t tb, tc;
+    CHECK(pthread_create(&tb, NULL, create_main, &cb) == 0);
+    pthread_mutex_lock(&f_lock);
+    while (!df_held)
+        pthread_cond_wait(&f_cv, &f_lock);
+    pthread_mutex_unlock(&f_lock);
+    CHECK(pthread_create(&tc, NULL, create_main, &cc) == 0); /* refused: the dictionary is broken */
+    pthread_join(tc, NULL);
+    CHECK(cc.rc == TSDB_ERR_IO);
+    pthread_mutex_lock(&f_lock);
+    df_go = 1;
+    pthread_cond_broadcast(&f_cv);
+    pthread_mutex_unlock(&f_lock);
+    pthread_join(tb, NULL);
+    CHECK(cb.rc == TSDB_ERR_IO);
+    CHECK(is_failed(db, strerror(ENOMEM)));
+    tsdb_test_dict_fault(db, NULL, NULL);
+    tsdb_close(db);
+    printf("  the creator whose append failed names the cause of the failure\n");
+}
+
 /* A volume add writes the volume's META (its number, which ids carry) before the VOLUMES line names the
  * directory. A failed write leaves no line and fails just the add: nothing relies on that META yet, so the writer
  * goes on, and the add tried again completes the directory, under the number it gets then. */
@@ -1306,6 +1424,8 @@ int main(int argc, char **argv)
     test_flush_retry(root);
     test_manifest(root);
     test_series_dict(root);
+    test_series_dict_add(root);
+    test_series_dict_cause(root);
     test_volume_meta(root);
     test_volume_meta_race(root);
     test_background_sync(root);

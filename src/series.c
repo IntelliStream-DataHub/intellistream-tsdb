@@ -63,6 +63,12 @@ static int64_t table_find(const series_dict *d, const char *name, size_t len, si
     return -1;
 }
 
+static int dict_hook(series_dict *d, int point, const char *name)
+{
+    int (*fn)(void *, int, const char *) = __atomic_load_n(&d->test_fault, __ATOMIC_ACQUIRE);
+    return fn ? fn(__atomic_load_n(&d->test_fault_arg, __ATOMIC_ACQUIRE), point, name) : 0;
+}
+
 /* Adds a name in memory; caller holds the lock (or is single threaded). */
 static int dict_add(series_dict *d, const char *name, size_t len, int type, uint32_t *id)
 {
@@ -88,6 +94,10 @@ static int dict_add(series_dict *d, const char *name, size_t len, int type, uint
         return TSDB_ERR_NOMEM;
     memcpy(copy, name, len);
     copy[len] = '\0';
+    if (dict_hook(d, DICT_AT_ADD, copy)) {
+        free(copy);
+        return TSDB_ERR_NOMEM;
+    }
     size_t slot = 0;
     table_find(d, copy, len, &slot);
     d->names[n] = copy;
@@ -210,6 +220,7 @@ int series_reload(series_dict *d, int dirfd)
     if (size > off) {
         size_t len = (size_t)(size - off);
         uint8_t *buf = malloc(len);
+        dict_hook(d, DICT_AT_RELOAD, d->file);
         rc = !buf ? TSDB_ERR_NOMEM : read_all(fd, buf, len, off);
         size_t pos = 0, n, rec;
         const char *name;
@@ -218,7 +229,8 @@ int series_reload(series_dict *d, int dirfd)
         while (rc == 0 && parse_record(buf, pos, len, off, &name, &n, &type, &rec)) {
             uint32_t id;
             rc = type_valid(type) ? dict_add(d, name, n, type, &id) : TSDB_ERR_CORRUPT;
-            pos += rec;
+            if (rc == 0)
+                pos += rec; /* a record not added is read again next time: ids stay the record numbers */
         }
         if (rc == 0 && pos != len && valid_after(buf, pos, len, off))
             rc = TSDB_ERR_CORRUPT; /* reported by the refresh; read again from here next time */
@@ -269,6 +281,8 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
     pthread_mutex_unlock(&d->lock);
     if (found >= 0 || rc != 0) {
         pthread_mutex_unlock(&d->append_lock);
+        if (rc == TSDB_ERR_IO)
+            errno = 0; /* broken: the creator whose append failed fails the engine, with its cause (dict_get) */
         return rc;
     }
     size_t size = rec_size(len);
@@ -293,6 +307,14 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
     if (rc == 0) {
         d->file_off = off + size;
         rc = dict_add(d, name, len, type, id);
+        if (rc != 0) {
+            /* The record is durable but not in the table: the next name would get its id here and the one after
+             * it in the file, and after a reopen its rows would be another series'. Only a reopen, which reads the
+             * file, puts the two in step again, so this is a failed append like a torn one. */
+            d->broken = true;
+            err = rc == TSDB_ERR_NOMEM ? ENOMEM : EIO;
+            rc = TSDB_ERR_IO;
+        }
     } else {
         /* Set before append_lock is released: the caller fails the engine only after it, and another creator
          * waiting for append_lock must not append behind the torn record meanwhile. */
@@ -300,6 +322,8 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
     }
     pthread_mutex_unlock(&d->lock);
     pthread_mutex_unlock(&d->append_lock);
+    if (rc != 0)
+        dict_hook(d, DICT_AT_FAILED, name);
     if (rc == TSDB_ERR_IO)
         errno = err;
     return rc;

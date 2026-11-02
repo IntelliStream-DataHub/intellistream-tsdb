@@ -1292,6 +1292,20 @@ void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg)
     }
 }
 
+/* Test hook on the series and state dictionaries of every open volume (series_dict.test_fault). */
+void tsdb_test_dict_fault(tsdb *t, int (*fn)(void *arg, int point, const char *name), void *arg)
+{
+    pthread_rwlock_rdlock(&t->lock);
+    for (size_t i = 0; i < t->nvols; i++) {
+        series_dict *ds[2] = {&t->vols[i]->series, &t->vols[i]->states};
+        for (int k = 0; k < 2; k++) {
+            __atomic_store_n(&ds[k]->test_fault_arg, arg, __ATOMIC_RELEASE);
+            __atomic_store_n(&ds[k]->test_fault, fn, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_rwlock_unlock(&t->lock);
+}
+
 void tsdb_test_midplace(tsdb *t, void (*fn)(void *), void *arg)
 {
     for (size_t i = 0; i < t->nvols; i++) {

@@ -701,7 +701,9 @@ static int dict_get(eng *db, series_dict *d, const char *what, const char *name,
     }
     errno = 0;
     int rc = series_get(d, name, create, type, id);
-    if (rc == TSDB_ERR_IO && create && !db->opt.read_only)
+    /* errno 0: refused because an earlier append failed. That creator fails the engine with the real cause; this
+     * one knows none, and the first eng_fail names the failure. */
+    if (rc == TSDB_ERR_IO && create && !db->opt.read_only && errno != 0)
         eng_fail(db, what, errno);
     return rc;
 }

@@ -920,7 +920,12 @@ typedef struct series_dict {
     uint64_t seed;   /* random per open: names chosen to collide cannot be planted (nothing persists the hash) */
     uint64_t file_off; /* bytes of SERIES already loaded */
     bool broken;       /* an append failed (under lock): the file may end in a torn record, append no more */
+    /* test hook (tsdb_test_dict_fault), read atomically: called at the DICT_AT_* points; nonzero at DICT_AT_ADD
+     * fails that add as if memory ran out */
+    int (*test_fault)(void *arg, int point, const char *name);
+    void *test_fault_arg;
 } series_dict;
+enum { DICT_AT_ADD = 1, DICT_AT_FAILED = 2, DICT_AT_RELOAD = 3 };
 
 /* The series dictionary (file SERIES) and the state names (file STATES) are both these. */
 int series_open(series_dict *d, int dirfd, const char *file, bool read_only, bool fsync);
