@@ -8,6 +8,18 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Changed
+- Hour cuts: a granule of a series that writes at least 3000 rows an hour (a row every 1.2 s or faster, measured
+  from its last 64 rows before each edge) ends at every UTC hour edge, so hourly buckets and the days of zones a
+  whole number of hours from UTC (Europe/Oslo, but not Asia/Kolkata) are answered from granule statistics instead
+  of decoding the granules around each edge. A slower series keeps its granules as before, whatever its class.
+  Cost: more, smaller granules: 1-6% more bytes on the 1 Hz data sets measured (15%, or 0.018 bytes a row, on a
+  nearly constant one), up to 10% just above the threshold (1.1-1.2 s), under 1% for faster series and none for
+  slower ones. The
+  layout changes, not the format (no `FORMAT_VERSION` bump): readers take any granule boundaries, and a database
+  written before keeps its granules until merges rewrite them. Answers stay the same; only float64 sums, variances
+  and TWA areas, which are summed per granule, can differ in the last bits.
+
 ## [0.9.0] - 2026-11-04
 
 The first release. **Disk format version 8, wire protocol version 11** (the server and the clients refuse a peer

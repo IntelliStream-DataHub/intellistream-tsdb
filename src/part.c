@@ -254,6 +254,7 @@ void part_unref(part *p)
 }
 
 atomic_uint_fast64_t granule_checks;
+atomic_uint hour_cut_min = HOUR_CUT_MIN;
 
 int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, bool verify, granule *g)
 {
@@ -302,7 +303,7 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     w->grows = db->granule_rows;
     int64_t cut = db->partition_ms * GRANULE_CUT; /* cls_len is partition_ms for every class without classes */
     w->cut_ms = db->cls_len[partition_class(db, partition)] > cut ? cut : 0;
-    w->hc_min = HOUR_CUT_MIN;
+    w->hc_min = atomic_load_explicit(&hour_cut_min, memory_order_relaxed);
     w->zstd_level = db->opt.zstd_level;
     w->value_codec = db->opt.value_codec;
     w->min_ts = INT64_MAX;

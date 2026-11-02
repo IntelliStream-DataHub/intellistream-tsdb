@@ -865,10 +865,11 @@ extern atomic_uint_fast64_t granule_checks; /* granule checksums computed, for t
  * series' start make no hour cut. Part of the layout the writer makes, not of the format: readers take any granule
  * boundaries, and a merge re-cuts a granule across an edge of a dense series instead of copying it. 0: off. */
 #ifndef HOUR_CUT_MIN
-#define HOUR_CUT_MIN 2048
+#define HOUR_CUT_MIN 3000
 #endif
 #define HOUR_CUT_MS 3600000
 #define HOUR_CUT_K 64
+extern atomic_uint hour_cut_min; /* HOUR_CUT_MIN; tests set 0 to compare against the layout without hour cuts */
 typedef struct part_writer {
     struct eng *db;
     int64_t partition;

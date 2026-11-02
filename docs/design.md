@@ -636,6 +636,23 @@ key is the base partition number.
   but day and 2.5-day buckets decoded nearly every granule. The cut is layout,
   not format: readers take any granule boundaries, a merge copies only granules
   inside one day and re-encodes (and so re-cuts) the rest.
+- **Granules of dense series end at hour edges** (hour cuts). In every class a
+  granule also ends at a UTC hour edge where its series writes at least 3000
+  rows an hour (`HOUR_CUT_MIN`, a compile-time constant): the writer looks at
+  the series' last 64 rows before the edge, so the rate is the one at that edge,
+  whatever the class (a short retention keeps slow series in class 0, and a
+  class-0 partition holds fresh series too; a class rule would give a series
+  read every minute 60-row granules). Hourly buckets and the days of zones a
+  whole number of hours from UTC then come from granule statistics: on the
+  100-billion-row benchmark, a whole table by hour took 53 s and by Oslo day
+  41 s without them, against 0.2 s for UTC days. Cost: granules of a 1 Hz series
+  hold 3600 rows instead of 8192, 1-6% more bytes (an index entry, the frame of
+  a timestamp block and of a value block per extra granule, about 115 bytes),
+  up to 10% just above the threshold (3000 rows a granule); faster series fill
+  8192 rows before the edge anyway (under 1%), and slower ones are not cut. A merge copies a
+  short granule that is a whole hour of a dense series when nothing else of that
+  series and hour is left to merge, and re-cuts a full granule across an edge
+  of a dense series (one written before hour cuts). Layout again, not format.
 
 Writes are published atomically (`tmp_*.part`, fsync, rename, fsync dir).
 An insert that makes several parts (one per partition) commits through an
