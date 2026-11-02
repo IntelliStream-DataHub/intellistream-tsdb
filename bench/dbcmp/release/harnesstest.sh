@@ -233,4 +233,18 @@ l=$(sh "$HERE/../../../tools/scale-bench-ch.sh" "$SB/sql" big "$SB/ch")
 m=$(echo "$l" | awk '{ print $5 }')
 expect "scale-bench-ch: mean from wall time (about 150 ms), not 1000 / rounded QPS" \
     "awk -v m='$m' 'BEGIN { exit !(m > 140 && m < 400) }' && echo '$l' | grep -q 'p50    150.000 ms  server: 2 q, mean 149.500 ms, median 149.250 ms'"
+# qdrive pg: a query on a connection the server dropped prints why (no PGresult: the connection's message), not ""
+QD=${QDRIVE:-$HERE/../../../build/dbcmp/qdrive}
+if [ -x "$QD" ]; then
+    PF=$T/pgport; rm -f "$PF"
+    python3 -I "$HERE/pgdrop.py" "$PF" & pd=$!
+    for i in $(seq 50); do [ -s "$PF" ] && break; sleep 0.1; done
+    echo "SELECT 1" > "$T/pg.q"
+    "$QD" pg "host=127.0.0.1 port=$(cat "$PF") user=x dbname=x sslmode=disable connect_timeout=5" "$T/pg.q" 1 1 > "$T/pg.out" 2>&1
+    rc=$?; [ "$pd" -gt 1 ] && wait "$pd" 2> /dev/null
+    expect "qdrive pg: a dropped connection is a failure that names its reason" \
+        "[ $rc != 0 ] && grep -q 'query failed: status [0-9]*: [^ ]' '$T/pg.out'"
+else
+    echo "skip qdrive pg case (no $QD)"
+fi
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }
