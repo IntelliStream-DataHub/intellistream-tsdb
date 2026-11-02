@@ -106,7 +106,7 @@ p1_vm() { # a fresh server per data set, so each has its own directory to measur
 }
 
 p2_vm() {
-    local D=$OUT/p2/vm W=$DBCMP/s2/vm r n Q="http 127.0.0.1 8428" PROM_PORT=8428
+    local D=$OUT/p2/vm${SWEEP_SUB-} W=$DBCMP/s2/vm r n Q="http 127.0.0.1 8428" PROM_PORT=8428
     export PROM_PORT
     mkdir -p "$D"
     for r in $(seq "$REPS"); do
@@ -131,6 +131,9 @@ p2_vm() {
     local k; for k in twa $TWA_KINDS $TWA_WKINDS; do
         echo "$k: MetricsQL has no time-weighted average (integrate() is a STEP integral without the covered time)" >> "$D/dash.txt"
     done
+    for k in $TWA_WKINDS; do for n in $TWA_KS; do  # the batches of TWA windows (twabsuite); in p6 beside p2's results
+        dashnote "${D%/memsweep}" "$k.b$n: MetricsQL has no time-weighted average"
+    done; done
     bcheck vm "$D" && {  # bcheck writes q/vm.full$n.per.txt (mkbatch.py), so the per-series runs come after it
         for n in ${FULLS-$FULLS_DEFAULT}; do   # 100 per-series queries on 16 connections, as tsdb and ClickHouse
             reps "vm.full$n.per.c$NPER" "$D" -- "$B/qdrive" $Q "" "$WORK/q/vm.full$n.per.txt" "$NPER" 100000 0
@@ -151,7 +154,7 @@ p2_vm() {
     fi
     # per core: a fresh start with one Go P (GOMAXPROCS=1, which VictoriaMetrics' cgroup code keeps) and one worker per
     # query, every thread pinned to PERCORE_CPU by taskset as the other containers
-    if [ -s "$D/check-batch-vm.txt" ] && ! grep -qE 'mismatches [1-9]' "$D/check-batch-vm.txt"; then
+    if want_pc && [ -s "$D/check-batch-vm.txt" ] && ! grep -qE 'mismatches [1-9]' "$D/check-batch-vm.txt"; then
         crm rb-vm
         if vm_start "$W" -e GOMAXPROCS=1 -- -search.maxWorkersPerQuery=1 && pc_pin rb-vm; then
             { podman inspect rb-vm --format '{{json .Config.Cmd}} env {{json .Config.Env}}'

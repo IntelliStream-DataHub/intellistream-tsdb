@@ -174,6 +174,134 @@ def lttb_cases():
         else: os.environ["DATA"] = old
         shutil.rmtree(d)
 
+def exit_cases(ref):
+    """rel.py jsonl and tsv exit 1 on a mismatch (run.sh's callers rely on it, besides grepping MISMATCH), 0 when the
+    answers agree."""
+    d = tempfile.mkdtemp()
+    try:
+        r, good, bad, tsv = (os.path.join(d, x) for x in ("ref.jsonl", "good.jsonl", "bad.jsonl", "bad.tsv"))
+        with open(r, "w") as f: f.writelines(json.dumps(e) + "\n" for e in ref.values())
+        shutil.copy(r, good)
+        m = copy.deepcopy(ref); s0 = next(s for s in m if m[s]["b"]); m[s0]["b"][0][1] *= 1.01
+        with open(bad, "w") as f: f.writelines(json.dumps(e) + "\n" for e in m.values())
+        with open(tsv, "w") as f: f.writelines("\t".join(map(str, x)) + "\n" for x in twa_rows(m))
+        run = lambda *a: subprocess.run([sys.executable, "-I", os.path.join(HERE, "rel.py"), *a], capture_output=True).returncode
+        case("rel.py jsonl: the same answers exit 0", True, run("jsonl", "twa", r, good) == 0)
+        case("rel.py jsonl: a mismatch exits 1", False, run("jsonl", "twa", r, bad) != 1)
+        case("rel.py tsv: a mismatch exits 1", False, run("tsv", "twa", r, tsv) != 1)
+    finally:
+        shutil.rmtree(d)
+
+def batch_cases():
+    """rel.py qb / checkb, the TWA window batches: each member's WITH tables renamed apart, its rows mapped back to its
+    window by the member column; a member answered with another's rows, a missing or an extra member, a wrong value
+    and a request file that is not rel.py's batch must fail."""
+    import re
+    cs, body = rel.ctes("WITH seg AS (SELECT (1) AS x), parts AS (SELECT x FROM seg) SELECT x FROM parts")
+    case("batch: WITH tables parsed", True, cs == [("seg", "SELECT (1) AS x"), ("parts", "SELECT x FROM seg")]
+         and body == "SELECT x FROM parts")
+    ws = [(3, 1704067200000, 1704153600000, 18000000), (4, 1704070800000, 1704157200000, 18000000)]
+    bcs, bbody = rel.ctes(rel.wbatch("i3", ws))
+    own = all(set(re.findall(r"\b(?:seg|parts)(\d+)\b", b)) <= {n[-1]} for n, b in bcs)
+    case("batch: i3 members use their own WITH tables only", True, own
+         and [n for n, _ in bcs] == ["seg0", "parts0", "seg1", "parts1"]
+         and re.findall(r"\(SELECT (\d) AS mb, bb,.*?FROM parts(\d) ", bbody) == [("0", "0"), ("1", "1")])
+    case("batch: ch is mkbatch.py's UNION ALL form", True,
+         rel.wbatch("ch", ws).startswith("SELECT * FROM ((SELECT 0 AS mb, bb, "))
+    d = tempfile.mkdtemp()
+    try:
+        old_spec, old_run, cwd = os.environ.get("TWA_SPEC"), rel.run_sql, os.getcwd()
+        os.chdir(d)
+        os.makedirs("q")
+        t0 = 1704067200000
+        with open("spec.tsv", "w") as f:
+            for i in range(6):
+                f.write(f"agg1d\t{i % 4}\t{t0 + i * H}\t{t0 + i * H + 86400000}\t18000000\n")
+                f.write(f"raw\t0\t{t0}\t{t0 + H}\t0\n")
+        os.environ["TWA_SPEC"] = "spec.tsv"
+        ref = {}
+        for i, s_, a_, b_, bk in rel.windows("twa1d"):
+            ref[i] = {"s": s_, "i": i, "b": [[a_ // bk * bk, 2.0 * (i + 1) * 1000, 1000, 1], [a_ // bk * bk + bk, 7.5 * 1000, 1000, 2]]}
+        groups = rel.wgroups("twa1d", 3)
+        with open("q/ch.twa1d.b3.txt", "w") as f:
+            f.write("".join(rel.wire("ch", rel.wbatch("ch", [x[1:] for x in g])) + "\n" for g in groups))
+        sqls = [rel.wbatch("ch", [x[1:] for x in g]) for g in groups]
+        def server(mutate=None):
+            def run_sql(sysname, sql):
+                g = groups[sqls.index(sql)]
+                rows = [[m, b[0], b[1], b[2]] for m, x in enumerate(g) for b in ref[x[0]]["b"]]
+                return mutate(rows) if mutate else rows
+            return run_sql
+        def checkb(mutate=None):
+            rel.run_sql = server(mutate)
+            rows, keys = rel.fetch_batches("ch", "twa1d", 3, "q/ch.twa1d.b3.txt")
+            return quiet(rel.compare, "twa1d", {i: ref[i] for i in keys}, rows) and sorted(keys) == sorted(ref)
+        case("batch: true answers", True, checkb())
+        case("batch: two members' rows swapped", False, checkb(lambda r: [[{0: 1, 1: 0}.get(x[0], x[0]), *x[1:]] for x in r]))
+        case("batch: a member missing", False, checkb(lambda r: [x for x in r if x[0] != 2]))
+        case("batch: an extra member", False, checkb(lambda r: r + [[3, *r[0][1:]]]))
+        case("batch: a value off by 1.5e-9 relative", False,
+             checkb(lambda r: [r[0][:2] + [r[0][2] * (1 + 1.5e-9)] + r[0][3:]] + r[1:]))
+        lines = open("q/ch.twa1d.b3.txt").read().splitlines()
+        with open("q/ch.twa1d.b3.txt", "w") as f: f.write("\n".join([lines[0].replace("18000000", "18000001", 1)] + lines[1:]) + "\n")
+        try: checkb(); ok = True
+        except SystemExit: ok = False
+        case("batch: a request file with a line that is not rel.py's", False, ok)
+    finally:
+        rel.run_sql = old_run
+        os.chdir(cwd)
+        if old_spec is None: os.environ.pop("TWA_SPEC", None)
+        else: os.environ["TWA_SPEC"] = old_spec
+        shutil.rmtree(d)
+
+def refused_cases():
+    """An HTTP error answer (QuestDB's RSS limit comes as a 400 with a JSON error) is the server refusing, with its
+    message: never SERVER DOWN (HTTPError is a URLError, which server_down once counted as down)."""
+    import http.server, threading
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            b = json.dumps({"query": "x", "error": "global RSS memory limit exceeded", "position": 0}).encode()
+            self.send_response(400); self.end_headers(); self.wfile.write(b)
+        def log_message(self, *a): pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        rel.http(f"http://127.0.0.1:{srv.server_address[1]}/exec?query=1")
+        e = None
+    except Exception as x:
+        e = x
+    finally:
+        srv.shutdown()
+    case("http 400: raised as Refused with the server's message", True,
+         isinstance(e, rel.Refused) and "global RSS memory limit exceeded" in str(e))
+    case("http 400: not SERVER DOWN", True, e is not None and not rel.server_down(e))
+    out = io.StringIO(); old = sys.stdout; sys.stdout = out
+    try:
+        rel.guarded(lambda: (_ for _ in ()).throw(rel.Refused("HTTP 400: no")))
+        rc = 0
+    except SystemExit as x:
+        rc = x.code
+    finally:
+        sys.stdout = old
+    case("http 400: guarded exits 4 with a REFUSED line", True, rc == 4 and out.getvalue().startswith("REFUSED: HTTP 400: no"))
+    # IoTDB's 719 (its query memory estimate) that outlasts the waits is a refusal with its message, not a crash
+    old_http, old_sleep = rel.http, rel.time.sleep
+    rel.http = lambda *a, **k: json.dumps({"code": 719, "message": "There is not enough memory to execute current fragment instance"})
+    rel.time.sleep = lambda s: None
+    try:
+        rel.run_sql("iot", "SELECT 1"); e = None
+    except Exception as x:
+        e = x
+    finally:
+        rel.http, rel.time.sleep = old_http, old_sleep
+    case("iot 719 after the waits: Refused with IoTDB's message", True, isinstance(e, rel.Refused) and "not enough memory" in str(e))
+    # InfluxDB 3 refused a 100-window batch sent in a GET URL (HTTP 414): a long query goes as a POST body instead
+    short, long_ = rel.wire("i3", "SELECT 1"), rel.wire("i3", "SELECT " + "x" * 9000)
+    case("i3: a short query stays a GET line", True, short.startswith("GET /api/v3/query_sql?"))
+    b = long_.split("\t")
+    case("i3: a long query is a POST with the query in its JSON body", True,
+         len(b) == 3 and b[0] == "POST /api/v3/query_sql" and json.loads(b[2])["q"] == "SELECT " + "x" * 9000)
+
 def main():
     a = sys.argv[1:]
     if not a or a[0] != "mutate": raise SystemExit("usage: checktest.py mutate [TWA_REF WINDOWS_REF FULL_REF]")
@@ -185,6 +313,9 @@ def main():
     twa_cases(ref)
     decimal_cases()
     lttb_cases()
+    batch_cases()
+    exit_cases(ref)
+    refused_cases()
     if len(a) >= 4:
         windows_cases(a[2], a[3])
     print("checktest", "OK" if failures == 0 else f"FAILED ({failures} cases)")
