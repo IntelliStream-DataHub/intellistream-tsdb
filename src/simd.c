@@ -1642,7 +1642,15 @@ static pthread_once_t simd_once = PTHREAD_ONCE_INIT;
 /* Skylake-SP/X, Cascade Lake and Cooper Lake (family 6, model 0x55) drop the
  * clock of the whole core for a while after 512-bit instructions, which slows
  * everything else running there. Ice Lake and later Intel cores, and AMD
- * Zen 4/5, have no meaningful penalty. */
+ * Zen 4/5, have no meaningful penalty.
+ *
+ * Measured on 2026-11-02 on a dual Xeon Platinum 6162 (model 0x55): the
+ * kernels alone, in cache (tools/fold-bench.sh), run 1.1-2.7x faster with
+ * AVX-512, yet tsdb-bench with TSDB_SIMD=avx512 is 7-22% slower than with the
+ * AVX2 kernels this rule picks (whole range -16%, hour buckets -16%, a 1-thread
+ * raw scan -9%, 96 threads of day queries in 300 s buckets -22%): the lower
+ * clock slows the decoding and the rest of a query more than the kernels gain.
+ * Judge any change here by whole queries, not by kernel benchmarks. */
 static bool avx512_downclocks(void)
 {
     unsigned eax, ebx, ecx, edx;
