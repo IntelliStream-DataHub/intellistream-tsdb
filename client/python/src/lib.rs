@@ -951,6 +951,9 @@ impl Client {
 
     /// Returns the id of a series, creating it (as float32) if needed.
     ///
+    /// The id is a 64-bit int that names the series' volume: keep it as it is (do not store it in 32 bits)
+    /// and do not count on ids being 0, 1, 2 and so on.
+    ///
     /// Args:
     ///     name: The series name, such as "pump7.flow".
     ///     create: If False, do not create the series.
@@ -1209,8 +1212,7 @@ impl Client {
     ///
     /// Args:
     ///     level: 0 turns compression off; 1 (the default) is fast, higher
-    ///         levels compress more, negative levels are faster still. Servers
-    ///         older than protocol version 3 always get uncompressed inserts.
+    ///         levels compress more, negative levels are faster still.
     ///
     /// Raises:
     ///     TsdbError: ERR_INVALID for a level zstd does not have.
@@ -1347,8 +1349,7 @@ impl Client {
     /// calendar: a day across a daylight saving change lasts 23 or 25 hours.
     /// Seconds, minutes and hours have a fixed length. For a zone other than
     /// UTC the client computes where the local periods begin and sends those
-    /// times (query_bounds()); a server older than protocol version 4 gets
-    /// the zone itself.
+    /// times (query_bounds()).
     ///
     /// Args:
     ///     series: The series id.
@@ -1396,8 +1397,7 @@ impl Client {
     /// Bucket i holds the rows from bounds[i] up to bounds[i + 1]; the last
     /// one holds the rows up to end. Rows before bounds[0] are left out.
     /// calendar_bounds() computes such bounds for local days, weeks, months,
-    /// quarters or years; query_group() does both steps. Needs a server of
-    /// protocol version 4.
+    /// quarters or years; query_group() does both steps.
     ///
     /// Args:
     ///     series: The series id.
@@ -1413,8 +1413,7 @@ impl Client {
     ///     are left out.
     ///
     /// Raises:
-    ///     TsdbError: ERR_INVALID if bounds is empty or does not increase, or
-    ///         from a server older than version 4.
+    ///     TsdbError: ERR_INVALID if bounds is empty or does not increase.
     #[pyo3(signature = (series, bounds, start = None, end = None, *, order = "asc", limit = None))]
     #[allow(clippy::too_many_arguments)]
     fn query_bounds(
@@ -1434,7 +1433,7 @@ impl Client {
 
     /// Count, sum, min and max like query_agg(), and the spread of the values
     /// in each bucket: range (max - min), population and sample variance and
-    /// standard deviation (protocol version 8).
+    /// standard deviation.
     ///
     /// Takes the arguments of query_agg(). The variance is computed from the
     /// granule statistics where whole granules fall in a bucket, so it costs
@@ -1447,8 +1446,7 @@ impl Client {
     ///     ones also for a single value.
     ///
     /// Raises:
-    ///     TsdbError: ERR_INVALID for a negative interval or from a server
-    ///         older than version 8 (the client does not send the request).
+    ///     TsdbError: ERR_INVALID for a negative interval.
     #[pyo3(signature = (series, start = None, end = None, interval_ms = 0, *, order = "asc", limit = None))]
     #[allow(clippy::too_many_arguments)]
     fn query_spread(
@@ -1507,7 +1505,7 @@ impl Client {
     }
 
     /// Time-weighted averages: each reading weighted by how long it held
-    /// (protocol version 6; order and limit need no newer server).
+    /// (order and limit as in query_agg()).
     ///
     /// A reading made once an hour counts as much as an hour of readings made
     /// every second. Use it for values sampled irregularly or on change.
@@ -1529,8 +1527,7 @@ impl Client {
     ///     twa, area, covered_ms and counts.
     ///
     /// Raises:
-    ///     TsdbError: ERR_INVALID for a negative interval or a server older
-    ///         than version 6.
+    ///     TsdbError: ERR_INVALID for a negative interval.
     ///     ValueError: Unknown method or order.
     #[pyo3(signature = (series, start = None, end = None, interval_ms = 0, *, method = "step", max_gap_ms = 0,
                         order = "asc", limit = None))]
@@ -1598,7 +1595,7 @@ impl Client {
     }
 
     /// Downsamples a series for a chart: at most threshold rows that keep the
-    /// shape of the line (Largest-Triangle-Three-Buckets; protocol version 5).
+    /// shape of the line (Largest-Triangle-Three-Buckets).
     ///
     /// The first and last rows are always kept; a range of threshold rows or
     /// fewer comes back whole.
@@ -1617,8 +1614,7 @@ impl Client {
     ///     (timestamps, values), as query_values() returns them.
     ///
     /// Raises:
-    ///     TsdbError: ERR_INVALID from a server older than version 5, or
-    ///         older than 9 with order="desc" or a limit.
+    ///     TsdbError: ERR_INVALID for a threshold below 3 or a state series.
     #[pyo3(signature = (series, threshold, start = None, end = None, *, order = "asc", limit = None, numpy = None))]
     #[allow(clippy::too_many_arguments)]
     fn query_lttb<'py>(
@@ -1637,23 +1633,18 @@ impl Client {
         rows_to_py(py, rows, numpy)
     }
 
-    /// Deletes the rows of a series with start <= ts < end (protocol version 7).
+    /// Deletes the rows of a series with start <= ts < end.
     ///
     /// A delete is a write like any other: a row inserted after it returned
     /// is kept. start and end are required; None is unbounded, so
     /// delete_range(id, None, None) deletes every row of the series.
-    ///
-    /// Raises:
-    ///     TsdbError: ERR_INVALID from a server older than version 7 (the
-    ///         client asks HELLO first and does not send the request).
     #[pyo3(signature = (series, start, end))]
     fn delete_range(&self, py: Python<'_>, series: u64, start: Option<i64>, end: Option<i64>) -> PyResult<()> {
         self.with(py, |c| c.delete_range(series, range(start, end)))
     }
 
     /// Replaces the rows of a series with start <= ts < end by ts and values,
-    /// atomically: a reader sees the old rows or the new ones, never a mix
-    /// (protocol version 7).
+    /// atomically: a reader sees the old rows or the new ones, never a mix.
     ///
     /// Args:
     ///     series: The series id.
@@ -1666,7 +1657,7 @@ impl Client {
     /// Raises:
     ///     TsdbError: ERR_INVALID for a timestamp outside the range, a
     ///         value_type other than the series', rows that do not fit in
-    ///         one request (256 MiB), or a server older than version 7.
+    ///         one request (256 MiB).
     #[pyo3(signature = (series, start, end, ts, values, *, value_type = None))]
     #[allow(clippy::too_many_arguments)]
     fn replace_range(
@@ -1682,18 +1673,17 @@ impl Client {
         self.replace_typed(py, series, start, end, ts, values, value_type)
     }
 
-    /// Sets how long a series keeps its rows, in ms (protocol version 7):
+    /// Sets how long a series keeps its rows, in ms:
     /// rows older than the server's clock minus limit_ms disappear from
     /// queries at once and from disk as merges get to them. 0 keeps them.
     ///
     /// Raises:
-    ///     TsdbError: ERR_INVALID for a negative limit or a server older
-    ///         than version 7.
+    ///     TsdbError: ERR_INVALID for a negative limit.
     fn set_retention(&self, py: Python<'_>, series: u64, limit_ms: i64) -> PyResult<()> {
         self.with(py, |c| c.set_retention(series, limit_ms))
     }
 
-    /// Returns the retention limit of a series in ms, 0 for none (protocol version 7).
+    /// Returns the retention limit of a series in ms, 0 for none.
     fn retention(&self, py: Python<'_>, series: u64) -> PyResult<i64> {
         self.with(py, |c| c.retention(series))
     }
@@ -1726,7 +1716,7 @@ impl Client {
         self.with(py, |c| c.last_query_stats()).map(QueryStats::from)
     }
 
-    /// Reads the rows of many series in one request (protocol version 10).
+    /// Reads the rows of many series in one request.
     ///
     /// The server reads the series in parallel, from one consistent point in
     /// time, and answers them in the order asked. Lists of more than 65,536
@@ -1754,7 +1744,7 @@ impl Client {
     ///
     /// Raises:
     ///     TsdbError: A series failed (errors="raise"), the whole request
-    ///         failed, or the server is older than version 10.
+    ///         failed.
     #[pyo3(signature = (series, start = None, end = None, *, order = "asc", limit = None, threads = 0, max_rows = 0, errors = "raise", numpy = None))]
     #[allow(clippy::too_many_arguments)]
     fn query_values_multi(
@@ -1805,7 +1795,7 @@ impl Client {
         )
     }
 
-    /// Aggregates many series in one request (protocol version 10).
+    /// Aggregates many series in one request.
     ///
     /// Each series is bucketed as query_agg() (interval_ms), query_group()
     /// (unit, count, timezone) or query_bounds() (bounds) would; with none of

@@ -934,7 +934,7 @@ static void test_lttb_remote(tsdbc *c)
             free(got.p);
         }
     lpts none = {0};
-    CHECK(tsdbc_server_version(c) == TSDB_PROTOCOL_VERSION); /* QUERY_LTTB needs 5 */
+    CHECK(tsdbc_server_version(c) == TSDB_PROTOCOL_VERSION);
     CHECK(tsdbc_query_lttb(c, f, INT64_MIN, INT64_MAX, 2, lttb_collect, &none) == TSDB_ERR_INVALID);
     CHECK(tsdbc_query_lttb(c, st, INT64_MIN, INT64_MAX, 10, lttb_collect, &none) == TSDB_ERR_INVALID);
     CHECK(tsdbc_query_lttb(c, f, INT64_MIN, INT64_MAX, 40000, lttb_stop, NULL) == TSDB_ERR_STOPPED);

@@ -20,7 +20,6 @@ fn rows(c: &mut Client, id: u64) -> (Vec<i64>, Vec<Option<i64>>) {
 fn delete_and_replace() {
     let srv = Server::start();
     let mut c = srv.client();
-    assert!(c.protocol_version().unwrap() >= 7);
     let id = c.series_create("d", ValueType::Int64, None).unwrap();
     let ts: Vec<i64> = (0..10).map(|k| T0 + k * 1000).collect();
     let vals: Vec<i64> = (0..10).collect();
@@ -72,7 +71,7 @@ fn delete_and_replace() {
 }
 
 #[test]
-fn a_pending_insert_error_is_not_taken_for_an_old_server() {
+fn a_pending_insert_error_is_reported_by_the_next_call() {
     let srv = Server::start();
     let mut c = srv.client();
     let id = c.series_create("p", ValueType::Int64, None).unwrap();

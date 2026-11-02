@@ -46,9 +46,8 @@ import jdk.net.ExtendedSocketOptions;
  * request. At most {@value #MAX_IN_FLIGHT} insert frames are outstanding: past that, {@code insertAsync} reads the
  * oldest acknowledgement before sending, which bounds the memory the server spends on queued requests.
  *
- * <p><b>Compression.</b> Inserts travel packed and zstd compressed (level 1 by default) when the server speaks
- * protocol version 3, as with the C client; see {@link #setCompression(int)}. {@link #bytesSent()} counts what
- * goes on the wire.
+ * <p><b>Compression.</b> Inserts travel packed and zstd compressed (level 1 by default), as with the C client;
+ * see {@link #setCompression(int)}. {@link #bytesSent()} counts what goes on the wire.
  *
  * <p><b>Errors.</b> Every request either succeeds or throws {@link TsdbException}. A status from the server (such
  * as {@link Status#ERR_NOTFOUND}) leaves the connection usable. A connection failure, a malformed reply, or an
@@ -60,10 +59,10 @@ import jdk.net.ExtendedSocketOptions;
  * {@link #series(String)}), float64, int64, bool or state, and any value may be null. The float32 methods
  * ({@link #insert(long, long[], float[])}, {@link #queryPoints(long, long, long)}, {@link #queryRaw}) take and return
  * {@code float[]} and work on float32 series only; {@link #insertSeriesValues}, {@link #insertValues} and
- * {@link #queryValues} carry a {@link Column} of any type with its nulls (protocol version 2).
- * {@link #queryAgg} and {@link #queryGroup} work on every type and need a version 2 server.
+ * {@link #queryValues} carry a {@link Column} of any type with its nulls.
+ * {@link #queryAgg} and {@link #queryGroup} work on every type.
  *
- * <p><b>Time zones.</b> The server groups by UTC only (protocol version 4). For local days, weeks, months, quarters
+ * <p><b>Time zones.</b> The server groups by UTC only. For local days, weeks, months, quarters
  * and years, {@link #queryGroup} computes the UTC instant each local period begins, with the JDK's time zone data,
  * and asks for buckets that begin there ({@link #queryBounds}).
  *
@@ -969,7 +968,7 @@ public final class TsdbClient implements AutoCloseable {
      * Aggregates a series over {@code [start, end)} in buckets that begin at the given UTC instants, oldest first:
      * bucket {@code i} holds the rows in {@code [bounds[i], bounds[i + 1])}, the last one every row from
      * {@code bounds[n - 1]} on. Rows before {@code bounds[0]} belong to no bucket. Only buckets with rows are
-     * returned, each with its bound as start. Needs a server of protocol version 4.
+     * returned, each with its bound as start.
      *
      * <p>This is how calendar periods in a time zone reach the server: {@link Group#bounds} computes them.
      *
@@ -983,8 +982,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param end the first timestamp excluded
      * @param bounds the bucket starts in ms since the epoch, strictly increasing; at least one
      * @return the buckets with rows
-     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not strictly increase, or the server is
-     *     older than version 4
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not strictly increase
      * @throws IllegalArgumentException if there are no bounds, or more than one request can carry (about 33 million)
      */
     public List<Bucket> queryBounds(long series, long start, long end, long[] bounds) throws TsdbException {
@@ -1101,15 +1099,14 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * Aggregates a series over {@code [start, end)} in fixed intervals, oldest first, with the spread of each bucket:
-     * range, population and sample variance and standard deviation (protocol version 8).
+     * range, population and sample variance and standard deviation.
      *
      * @param series the series id
      * @param start the first timestamp included
      * @param end the first timestamp excluded
      * @param intervalMs the bucket length in ms; 0 for a single bucket starting at {@code start}
      * @return the buckets with rows
-     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval or from a server older than
-     *     version 8 (asked with HELLO; the request is not sent)
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval
      */
     public List<SpreadBucket> querySpread(long series, long start, long end, long intervalMs) throws TsdbException {
         return querySpread(series, start, end, intervalMs, Order.ASC, 0);
@@ -1133,14 +1130,14 @@ public final class TsdbClient implements AutoCloseable {
         checkOpts(order, limit);
         if (intervalMs < 0) /* as the C and Rust clients: the server's status, without asking it */
             throw new TsdbException(Status.ERR_INVALID, "negative interval", null);
-        needVersion(8, "the spread");
+        request();
         bucketsSend(series, start, end, intervalMs, null, new byte[0], order, limit, Protocol.SPREAD);
         return spreadReply("QUERY_BUCKETS");
     }
 
     /**
      * The spread in calendar buckets, as {@link #queryGroup(long, long, long, Group, Order, long)} groups (local
-     * periods become bounds here) (protocol version 8).
+     * periods become bounds here).
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1149,13 +1146,12 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest bucket first
      * @param limit the most buckets to return; 0 for all
      * @return the buckets with rows
-     * @throws TsdbException with {@link Status#ERR_INVALID} from a server older than version 8
      * @throws IllegalArgumentException for a negative limit
      */
     public List<SpreadBucket> querySpreadGroup(long series, long start, long end, Group group, Order order,
                                                long limit) throws TsdbException {
         checkOpts(order, limit);
-        needVersion(8, "the spread");
+        request();
         if (group == null || group.utc()) {
             bucketsSend(series, start, end, 0, group, new byte[0], order, limit, Protocol.SPREAD);
             return spreadReply("QUERY_BUCKETS");
@@ -1166,7 +1162,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * The spread in buckets that begin at the given UTC instants, as {@link #queryBounds(long, long, long, long[],
-     * Order, long)} (protocol version 8).
+     * Order, long)}.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1175,15 +1171,14 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest bucket first
      * @param limit the most buckets to return; 0 for all
      * @return the buckets with rows
-     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not increase or the server is older
-     *     than version 8
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not increase
      * @throws IllegalArgumentException if there are no bounds or too many, or for a negative limit
      */
     public List<SpreadBucket> querySpreadBounds(long series, long start, long end, long[] bounds, Order order,
                                                 long limit) throws TsdbException {
         checkBounds(bounds);
         checkOpts(order, limit);
-        needVersion(8, "the spread");
+        request();
         boundsSend(series, start, end, bounds, order, limit, Protocol.SPREAD);
         return spreadReply("QUERY_BOUNDS");
     }
@@ -1191,7 +1186,7 @@ public final class TsdbClient implements AutoCloseable {
     // ------------------------------------------------- time-weighted averages
 
     /**
-     * Time-weighted averages of a series over {@code [start, end)} in fixed intervals (protocol version 6): each
+     * Time-weighted averages of a series over {@code [start, end)} in fixed intervals: each
      * reading weighted by how long it held, so a reading made once an hour counts as much as an hour of readings
      * made every second. A reading before the range carries into it.
      *
@@ -1201,8 +1196,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param intervalMs the bucket length in ms; 0 for a single bucket starting at {@code start}
      * @param opts method, gap limit, order and limit
      * @return the buckets with readings or coverage
-     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval, a state series or a server
-     *     older than version 6 (asked with HELLO; the request is not sent)
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval or a state series
      */
     public List<TwaBucket> queryTwa(long series, long start, long end, long intervalMs, TwaOptions opts)
             throws TsdbException {
@@ -1213,7 +1207,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * Time-weighted averages in calendar buckets (protocol version 6). For a time zone other than UTC the client
+     * Time-weighted averages in calendar buckets. For a time zone other than UTC the client
      * computes the local periods' bounds: over a bounded range to its ends, over an open side to the first or last
      * row there is.
      *
@@ -1223,7 +1217,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param group the calendar grouping, or {@code null} for one bucket over the whole range
      * @param opts method, gap limit, order and limit
      * @return the buckets with readings or coverage
-     * @throws TsdbException with {@link Status#ERR_INVALID} for a state series or a server older than version 6
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a state series
      */
     public List<TwaBucket> queryTwaGroup(long series, long start, long end, Group group, TwaOptions opts)
             throws TsdbException {
@@ -1232,13 +1226,13 @@ public final class TsdbClient implements AutoCloseable {
             return twa(series, start, end, 0, 0, 0, new long[0], opts);
         if (group.utc())
             return twa(series, start, end, 0, group.unit().code, group.count(), new long[0], opts);
-        needVersion(6, "time-weighted averages");
+        request();
         long[] bounds = localBounds(series, start, end, group, true);
         return bounds == null ? Collections.emptyList() : twa(series, start, end, 0, 0, 0, bounds, opts);
     }
 
     /**
-     * Time-weighted averages in buckets that begin at the given UTC instants (protocol version 6).
+     * Time-weighted averages in buckets that begin at the given UTC instants.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1246,8 +1240,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param bounds the bucket starts in ms since the epoch, strictly increasing; at least one
      * @param opts method, gap limit, order and limit
      * @return the buckets with readings or coverage
-     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not increase, for a state series or a
-     *     server older than version 6
+     * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not increase or for a state series
      * @throws IllegalArgumentException if there are no bounds or too many
      */
     public List<TwaBucket> queryTwaBounds(long series, long start, long end, long[] bounds, TwaOptions opts)
@@ -1261,7 +1254,7 @@ public final class TsdbClient implements AutoCloseable {
     private List<TwaBucket> twa(long series, long start, long end, long interval, int unit, int count, long[] bounds,
                                 TwaOptions o) throws TsdbException {
         checkId(series);
-        needVersion(6, "time-weighted averages");
+        request();
         begin(Protocol.OP_QUERY_TWA, Protocol.TWA_HEADER + (long) bounds.length * Long.BYTES);
         out.putLong(series).putLong(start).putLong(end);
         out.put((byte) (o.method() == TwaMethod.LINEAR ? 1 : 0)).put((byte) (o.order() == Order.DESC ? 1 : 0));
@@ -1303,7 +1296,7 @@ public final class TsdbClient implements AutoCloseable {
     // -------------------------------------------------------------------- LTTB
 
     /**
-     * Downsamples a series for a chart (protocol version 5): at most {@code threshold} points of {@code [start,
+     * Downsamples a series for a chart: at most {@code threshold} points of {@code [start,
      * end)} that keep the shape of the line (Largest-Triangle-Three-Buckets), oldest first, with their stored
      * values. The first and last points are always kept; a range of {@code threshold} points or fewer comes back
      * whole.
@@ -1313,8 +1306,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param end the first timestamp excluded
      * @param threshold the most points to keep, at least 3
      * @return the chosen points
-     * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold below 3, a state series or a server
-     *     older than version 5
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold below 3 or a state series
      */
     public ValuePoints queryLttb(long series, long start, long end, long threshold) throws TsdbException {
         return queryLttb(series, start, end, threshold, Order.ASC, 0);
@@ -1322,8 +1314,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * As {@link #queryLttb(long, long, long, long)}, newest first with {@link Order#DESC} and only the first
-     * {@code limit} of the chosen points in that order; the choice does not change. Needs protocol version 9 with
-     * {@link Order#DESC} or a limit.
+     * {@code limit} of the chosen points in that order; the choice does not change.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1332,15 +1323,12 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest first
      * @param limit the most points to return; 0 for all
      * @return the chosen points
-     * @throws TsdbException as {@link #queryLttb(long, long, long, long)}, and from a server older than version 9
-     *     with an order or a limit
+     * @throws TsdbException as {@link #queryLttb(long, long, long, long)}
      */
     public ValuePoints queryLttb(long series, long start, long end, long threshold, Order order, long limit)
             throws TsdbException {
         checkOpts(order, limit);
-        needVersion(5, "LTTB");
-        if (order == Order.DESC || limit != 0)
-            needVersion(9, "LTTB with an order or a limit");
+        request();
         ValueCollector c = new ValueCollector();
         valuesStream(Protocol.OP_QUERY_LTTB, series, start, end, order, limit, threshold, c);
         if (c.overflow || c.mixed)
@@ -1672,13 +1660,6 @@ public final class TsdbClient implements AutoCloseable {
         return true;
     }
 
-    /**
-     * The server's protocol version, asked when the client connected (HELLO).
-     */
-    private int serverVersion() {
-        return serverVersion;
-    }
-
     /** One packed frame of rows {@code [off, off + m)}: reshape, compress, send. */
     private void sendPacked(long one, long[] many, long[] ts, Column col, int off, int m) throws TsdbException {
         byte[] valid = Values.validity(col, off, m);
@@ -1896,7 +1877,7 @@ public final class TsdbClient implements AutoCloseable {
     // ------------------------------------------------------------ many series
 
     /*
-     * Many series in one request (protocol version 10), as tsdbc_query_multi in client/tsdb_client.c sends them.
+     * Many series in one request, as tsdbc_query_multi in client/tsdb_client.c sends them.
      * QUERY_MULTI carries the single op's payload once, as a template with series 0xffffffffffffffff, and the series (with
      * per-series starts, ends and intervals) as arrays; a list longer than MULTI_MAX_SERIES goes in successive
      * requests, and the indexes run on. The reply is the single op's frames for every series in index order, each
@@ -2002,8 +1983,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * The rows of every series in {@code series} over {@code [start, end)} (or each series' own range from
-     * {@code m}), as {@link #queryValues(long, long, long, Order, long)} gives them for one, in one request
-     * (protocol version 10).
+     * {@code m}), as {@link #queryValues(long, long, long, Order, long)} gives them for one, in one request.
      *
      * <p>Each series has its rows or the error the single call would give for it. Every series of one request reads
      * the same instant of each volume, so an insert is seen in all of them or in none. Lists longer than 65,536
@@ -2016,8 +1996,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param limit rows per series at most (0: all)
      * @param m threads, a cap on all rows, per-series ranges
      * @return one result per series, in the order of {@code series}
-     * @throws TsdbException {@link Status#ERR_INVALID} from a server older than version 10 (nothing is sent),
-     *     {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} rows in all, or a connection error
+     * @throws TsdbException {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} rows in all, or a connection error
      */
     public List<SeriesResult<ValuePoints>> queryValuesMulti(long[] series, long start, long end, Order order,
                                                             long limit, MultiOptions m) throws TsdbException {
@@ -2077,7 +2056,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * LTTB of every series in {@code series}, as {@link #queryLttb(long, long, long, long, Order, long)} gives it for
-     * one, in one request (protocol version 10).
+     * one, in one request.
      *
      * @param series the series ids
      * @param start the first timestamp included, ms
@@ -2101,7 +2080,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * Buckets of every series in {@code series}, as {@link #queryAgg}, {@link #queryGroup} or {@link #queryBounds}
-     * give them for one, in one request (protocol version 10).
+     * give them for one, in one request.
      *
      * @param series the series ids; an id may come more than once, an unknown id has no buckets
      * @param start the first timestamp included, ms
@@ -2111,7 +2090,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param limit buckets per series at most (0: all)
      * @param m threads, a cap on all buckets, per-series ranges
      * @return one result per series, in the order of {@code series}
-     * @throws TsdbException {@link Status#ERR_INVALID} from a server older than version 10 or for a negative
+     * @throws TsdbException {@link Status#ERR_INVALID} for a negative
      *     {@link Buckets#every} interval, {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} buckets in
      *     all, or a connection error
      */
@@ -2127,7 +2106,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * Buckets with the spread of every series in {@code series}, as {@link #querySpread} gives them for one, in one
-     * request (protocol version 10).
+     * request.
      *
      * @param series the series ids
      * @param start the first timestamp included, ms
@@ -2151,7 +2130,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * Time-weighted averages of every series in {@code series}, as {@link #queryTwa}, {@link #queryTwaGroup} or
-     * {@link #queryTwaBounds} give them for one, in one request (protocol version 10).
+     * {@link #queryTwaBounds} give them for one, in one request.
      *
      * @param series the series ids
      * @param start the first timestamp included, ms
@@ -2179,7 +2158,7 @@ public final class TsdbClient implements AutoCloseable {
         if (m.ends() != null && m.ends().length != series.length)
             throw new IllegalArgumentException(m.ends().length + " ends for " + series.length + " series");
         checkIds(0, series, 0, series.length);
-        needVersion(10, "many series in one request");
+        request();
     }
 
     private List<SeriesResult<ValuePoints>> rowsMulti(MultiQ q, long[] series, MultiOptions m) throws TsdbException {
@@ -2578,7 +2557,7 @@ public final class TsdbClient implements AutoCloseable {
     // ---------------------------------------------------- deletes and retention
 
     /**
-     * Deletes every row of a series with {@code start <= ts < end} (protocol version 7); {@code start >= end}
+     * Deletes every row of a series with {@code start <= ts < end}; {@code start >= end}
      * deletes nothing. It returns once the delete is durable and visible: queries stop seeing the rows at once,
      * merges remove them from disk later. {@link Long#MIN_VALUE} and {@link Long#MAX_VALUE} leave a side unbounded.
      * Pending inserts are collected first.
@@ -2586,12 +2565,11 @@ public final class TsdbClient implements AutoCloseable {
      * @param series the series id
      * @param start the first timestamp deleted, ms since the epoch
      * @param end the first timestamp kept after the range
-     * @throws TsdbException with {@link Status#ERR_INVALID} from a server older than version 7 (asked with HELLO;
-     *     the request is not sent); the first error of earlier pipelined inserts
+     * @throws TsdbException the first error of earlier pipelined inserts
      */
     public void deleteRange(long series, long start, long end) throws TsdbException {
         checkId(series);
-        needDeletes();
+        request();
         begin(Protocol.OP_DELETE_RANGE, 24);
         out.putLong(series).putLong(start).putLong(end);
         send();
@@ -2601,8 +2579,8 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * Replaces the rows of a series in {@code [start, end)} by {@code timestamps} and {@code values}, atomically
-     * (protocol version 7): a reader sees either the old rows or the new ones. Every timestamp must lie in the
+     * Replaces the rows of a series in {@code [start, end)} by {@code timestamps} and {@code values}, atomically:
+     * a reader sees either the old rows or the new ones. Every timestamp must lie in the
      * range; no rows make it a delete. The column's type must be the series' type; its nulls are written as nulls.
      * The rows travel in one plain frame of at most 256 MiB.
      *
@@ -2613,7 +2591,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param values the values; as long as {@code timestamps}
      * @throws IllegalArgumentException if the lengths differ or the rows do not fit in one frame
      * @throws TsdbException with {@link Status#ERR_INVALID} for a timestamp outside the range, a column of another
-     *     type than the series or a server older than version 7; the first error of earlier pipelined inserts
+     *     type than the series; the first error of earlier pipelined inserts
      */
     public void replaceRange(long series, long start, long end, long[] timestamps, Column values)
             throws TsdbException {
@@ -2625,7 +2603,7 @@ public final class TsdbClient implements AutoCloseable {
         if (payload > Protocol.MAX_FRAME - 5)
             throw new IllegalArgumentException(n + " rows do not fit in one request");
         checkId(series);
-        needDeletes();
+        request();
         begin(Protocol.OP_REPLACE_RANGE, payload);
         out.putInt(n).put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0);
         out.putLong(series);
@@ -2641,18 +2619,18 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * Sets how long a series keeps its rows, in ms (protocol version 7): rows older than the server's clock minus
+     * Sets how long a series keeps its rows, in ms: rows older than the server's clock minus
      * {@code limitMs} disappear from queries at once and from disk as merges get to them; 0 keeps them forever.
      * Set it right after creating a series to never show older rows. The limit is durable when this returns.
      *
      * @param series the series id
      * @param limitMs the age limit in ms, 0 for none
-     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative limit or a server older than version 7,
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a negative limit,
      *     {@link Status#ERR_NOTFOUND} for an unknown series
      */
     public void setRetention(long series, long limitMs) throws TsdbException {
         checkId(series);
-        needDeletes();
+        request();
         begin(Protocol.OP_SET_RETENTION, 16);
         out.putLong(series).putLong(limitMs);
         send();
@@ -2662,7 +2640,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * Returns the retention limit of a series (protocol version 7).
+     * Returns the retention limit of a series.
      *
      * @param series the series id
      * @return the age limit in ms, 0 for none
@@ -2670,7 +2648,7 @@ public final class TsdbClient implements AutoCloseable {
      */
     public long retention(long series) throws TsdbException {
         checkId(series);
-        needDeletes();
+        request();
         begin(Protocol.OP_GET_RETENTION, 8);
         out.putLong(series);
         send();
@@ -2681,24 +2659,6 @@ public final class TsdbClient implements AutoCloseable {
         endReply();
         check(st);
         return v;
-    }
-
-    /**
-     * Deletes and retention need a server of protocol version 7. An older one answers {@link Status#ERR_INVALID}
-     * for an op it does not know; asking HELLO first gives the same answer without sending it. Pending inserts are
-     * collected first, so that their errors are not taken for an old server.
-     */
-    private void needDeletes() throws TsdbException {
-        needVersion(7, "deletes");
-    }
-
-    /** As {@link #needDeletes}, for any op newer than version 1: a server older than {@code v} is not asked. */
-    private void needVersion(int v, String what) throws TsdbException {
-        request();
-        int have = serverVersion();
-        if (have < v)
-            throw new TsdbException(Status.ERR_INVALID,
-                    "the server speaks protocol " + have + "; " + what + ": protocol " + v, null);
     }
 
     // ------------------------------------------------------------- maintenance

@@ -682,8 +682,7 @@ class Client:
 
         Args:
             level: 0 turns compression off; 1 (the default) is fast, higher
-                levels compress more, negative levels are faster still. Servers
-                older than protocol version 3 always get uncompressed inserts.
+                levels compress more, negative levels are faster still.
 
         Raises:
             TsdbError: ERR_INVALID for a level zstd does not have.
@@ -800,8 +799,7 @@ class Client:
         calendar: a day across a daylight saving change lasts 23 or 25 hours.
         Seconds, minutes and hours have a fixed length. For a zone other than
         UTC the client computes where the local periods begin and sends those
-        times (query_bounds()); a server older than protocol version 4 gets
-        the zone itself.
+        times (query_bounds()).
 
         Args:
             series: The series id.
@@ -840,8 +838,7 @@ class Client:
         Bucket i holds the rows from bounds[i] up to bounds[i + 1]; the last
         one holds the rows up to end. Rows before bounds[0] are left out.
         calendar_bounds() computes such bounds for local days, weeks, months,
-        quarters or years; query_group() does both steps. Needs a server of
-        protocol version 4.
+        quarters or years; query_group() does both steps.
 
         Args:
             series: The series id.
@@ -857,8 +854,7 @@ class Client:
             are left out.
 
         Raises:
-            TsdbError: ERR_INVALID if bounds is empty or does not increase, or
-                from a server older than version 4.
+            TsdbError: ERR_INVALID if bounds is empty or does not increase.
         """
     def query_spread(
         self,
@@ -872,7 +868,7 @@ class Client:
     ) -> Buckets:
         """Count, sum, min and max like query_agg(), and the spread of the values
         in each bucket: range (max - min), population and sample variance and
-        standard deviation (protocol version 8).
+        standard deviation.
 
         Takes the arguments of query_agg(). The variance is computed from the
         granule statistics where whole granules fall in a bucket, so it costs
@@ -885,8 +881,7 @@ class Client:
             ones also for a single value.
 
         Raises:
-            TsdbError: ERR_INVALID for a negative interval or from a server
-                older than version 8 (the client does not send the request).
+            TsdbError: ERR_INVALID for a negative interval.
         """
     def query_spread_group(
         self,
@@ -929,7 +924,7 @@ class Client:
         limit: int | None = None,
     ) -> TwaBuckets:
         """Time-weighted averages: each reading weighted by how long it held
-        (protocol version 6; order and limit need no newer server).
+        (order and limit as in query_agg()).
 
         A reading made once an hour counts as much as an hour of readings made
         every second. Use it for values sampled irregularly or on change.
@@ -951,8 +946,7 @@ class Client:
             twa, area, covered_ms and counts.
 
         Raises:
-            TsdbError: ERR_INVALID for a negative interval or a server older
-                than version 6.
+            TsdbError: ERR_INVALID for a negative interval.
             ValueError: Unknown method or order.
         """
     def query_twa_group(
@@ -999,7 +993,7 @@ class Client:
         numpy: bool | None = None,
     ) -> tuple[Any, Any]:
         """Downsamples a series for a chart: at most threshold rows that keep the
-        shape of the line (Largest-Triangle-Three-Buckets; protocol version 5).
+        shape of the line (Largest-Triangle-Three-Buckets).
 
         The first and last rows are always kept; a range of threshold rows or
         fewer comes back whole.
@@ -1018,19 +1012,14 @@ class Client:
             (timestamps, values), as query_values() returns them.
 
         Raises:
-            TsdbError: ERR_INVALID from a server older than version 5, or
-                older than 9 with order="desc" or a limit.
+            TsdbError: ERR_INVALID for a threshold below 3 or a state series.
         """
     def delete_range(self, series: int, start: int | None, end: int | None) -> None:
-        """Deletes the rows of a series with start <= ts < end (protocol version 7).
+        """Deletes the rows of a series with start <= ts < end.
 
         A delete is a write like any other: a row inserted after it returned
         is kept. start and end are required; None is unbounded, so
         delete_range(id, None, None) deletes every row of the series.
-
-        Raises:
-            TsdbError: ERR_INVALID from a server older than version 7 (the
-                client asks HELLO first and does not send the request).
         """
     def replace_range(
         self,
@@ -1043,8 +1032,7 @@ class Client:
         value_type: _ValueType | None = None,
     ) -> None:
         """Replaces the rows of a series with start <= ts < end by ts and values,
-        atomically: a reader sees the old rows or the new ones, never a mix
-        (protocol version 7).
+        atomically: a reader sees the old rows or the new ones, never a mix.
 
         Args:
             series: The series id.
@@ -1057,19 +1045,18 @@ class Client:
         Raises:
             TsdbError: ERR_INVALID for a timestamp outside the range, a
                 value_type other than the series', rows that do not fit in
-                one request (256 MiB), or a server older than version 7.
+                one request (256 MiB).
         """
     def set_retention(self, series: int, limit_ms: int) -> None:
-        """Sets how long a series keeps its rows, in ms (protocol version 7):
+        """Sets how long a series keeps its rows, in ms:
         rows older than the server's clock minus limit_ms disappear from
         queries at once and from disk as merges get to them. 0 keeps them.
 
         Raises:
-            TsdbError: ERR_INVALID for a negative limit or a server older
-                than version 7.
+            TsdbError: ERR_INVALID for a negative limit.
         """
     def retention(self, series: int) -> int:
-        """Returns the retention limit of a series in ms, 0 for none (protocol version 7)."""
+        """Returns the retention limit of a series in ms, 0 for none."""
     def commit(self) -> None:
         """Makes everything written so far durable on the server's disk."""
     def flush(self) -> None:
@@ -1091,7 +1078,7 @@ class Client:
         errors: Literal["raise", "status"] = "raise",
         numpy: bool | None = None,
     ) -> Many:
-        """Reads the rows of many series in one request (protocol version 10).
+        """Reads the rows of many series in one request.
 
         The server reads the series in parallel, from one consistent point in
         time, and answers them in the order asked. Lists of more than 65,536
@@ -1119,7 +1106,7 @@ class Client:
 
         Raises:
             TsdbError: A series failed (errors="raise"), the whole request
-                failed, or the server is older than version 10.
+                failed.
         """
     def query_buckets_multi(
         self,
@@ -1138,7 +1125,7 @@ class Client:
         max_rows: int = 0,
         errors: Literal["raise", "status"] = "raise",
     ) -> Many:
-        """Aggregates many series in one request (protocol version 10).
+        """Aggregates many series in one request.
 
         Each series is bucketed as query_agg() (interval_ms), query_group()
         (unit, count, timezone) or query_bounds() (bounds) would; with none of

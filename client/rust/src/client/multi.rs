@@ -103,8 +103,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Status::Invalid`] from a server older than version 10 (asked through HELLO, nothing is
-    /// sent); [`Error::InvalidArgument`] if a per-series array of `m` is not as long as `series`;
+    /// [`Error::InvalidArgument`] if a per-series array of `m` is not as long as `series`;
     /// [`Status::TooManyBuckets`] past `m.max_rows` rows in all; [`Error::Io`] or
     /// [`Error::Protocol`] as for the single calls.
     ///
@@ -166,7 +165,7 @@ impl Client {
         let q = MultiQ::new(Kind::Values, &range, opts);
         let drop_rows = opts.wire_limit().is_none();
         self.run(|c| {
-            c.need_version(10)?;
+            c.wait_inner()?;
             check_multi(series, &m)?;
             let (mut ts, mut col) = (Vec::new(), Column::empty(ValueType::Float32));
             c.multi_send_all(&q, series, m, &[], 0, &mut |ix, it| match it {
@@ -244,7 +243,7 @@ impl Client {
     }
 
     fn rows_multi(&mut self, q: &MultiQ<'_>, series: &[SeriesId], m: MultiOpts<'_>) -> Result<Vec<Result<Rows>>> {
-        self.need_version(10)?;
+        self.wait_inner()?;
         check_multi(series, &m)?;
         // a limit of 0 asks for one row and keeps none, so that the type still arrives (as query_rows)
         let drop_rows = q.opts.wire_limit().is_none();
@@ -279,7 +278,7 @@ impl Client {
         series: &[SeriesId],
         m: MultiOpts<'_>,
     ) -> Result<Vec<Result<Vec<T>>>> {
-        self.need_version(10)?;
+        self.wait_inner()?;
         check_multi(series, &m)?;
         let mut zone = None;
         match q.buckets {

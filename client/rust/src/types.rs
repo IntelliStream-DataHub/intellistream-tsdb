@@ -102,8 +102,7 @@ pub struct Group {
     /// `None` or `"UTC"`, a fixed offset (`"+02:00"`, `"-0530"`) or an IANA
     /// name such as `"Europe/Oslo"`. The client reads the zone from the
     /// system's zoneinfo and computes the bounds of the local periods (see
-    /// [`calendar_bounds`](crate::calendar_bounds)); a server older than
-    /// protocol version 4 gets the name and resolves it itself.
+    /// [`calendar_bounds`](crate::calendar_bounds)).
     pub timezone: Option<String>,
 }
 

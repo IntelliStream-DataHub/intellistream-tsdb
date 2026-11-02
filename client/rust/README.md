@@ -182,8 +182,7 @@ offset such as `"+02:00"`, or `"UTC"`.
 
 The server only knows UTC. The client works out when each local day begins
 and sends those times (`calendar_bounds` and `query_bounds` let you do the
-two steps yourself). With a server older than protocol version 4, the client
-sends the zone name instead.
+two steps yourself).
 
 ## Value types and nulls
 
@@ -216,8 +215,7 @@ assert_eq!(client.retention(starts)?, 30 * 86_400_000);
 A delete returns once it is durable; queries stop seeing the rows at once.
 A replace is atomic: readers see the old rows or the new ones, never a mix.
 Rows older than a series' retention limit disappear from queries at once and
-from disk as merges get to them. These need a server of protocol version 7; an
-older one gets no request and the call fails with `Status::Invalid`.
+from disk as merges get to them.
 
 ## Time-weighted averages, spread and charts
 
@@ -277,9 +275,7 @@ chart 100 of 10000 points
 `.max_gap(ms)` treats a longer silence as unknown, and `.desc()` and
 `.limit(n)` order and cut the buckets. The `_group` and `_bounds` forms take
 calendar groups and bucket starts as `query_group` and `query_bounds` do, and
-`query_agg_ex` is `query_agg` with an order and a limit. These need a server of
-protocol version 6 (TWA), 8 (spread) or 5 (LTTB; 9 with an order or a limit);
-an older one gets no request and the call fails with `Status::Invalid`. The
+`query_agg_ex` is `query_agg` with an order and a limit. The
 embedded `Db` has all of them, with the same answers.
 
 ## Compression
@@ -291,8 +287,6 @@ them smaller on the network and usually faster. To change it:
 client.set_compression(0)?;   // off: send plain arrays
 client.set_compression(3)?;   // smaller, but uses more CPU
 ```
-
-Servers older than protocol version 3 always get uncompressed inserts.
 
 ## Insert benchmark
 

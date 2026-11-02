@@ -27,7 +27,7 @@ import org.junit.jupiter.api.Test;
 /**
  * Grouping by local periods (protocol version 4): the client computes the UTC bounds and sends QUERY_BOUNDS.
  * Against tsdbd, compared with what the C code gives for the same rows ({@code build/tsdb}, the embedded CLI, which
- * groups with {@code tsdb_calendar_bounds} as the C client does); and against fake servers of versions 3 and 4.
+ * groups with {@code tsdb_calendar_bounds} as the C client does); and against a fake server.
  */
 class TimeZoneGroupTest {
     static final long MIN = 60_000L, HOUR = 3_600_000L, DAY = 86_400_000L;

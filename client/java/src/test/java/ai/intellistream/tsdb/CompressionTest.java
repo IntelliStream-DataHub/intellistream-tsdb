@@ -338,7 +338,7 @@ class CompressionTest {
     }
 
     @Test
-    void version3ServersGetPackedFrames() throws Exception {
+    void packedFramesByDefault() throws Exception {
         FakeServer v3 = run(Protocol.VERSION, 1);
         assertEquals(List.of(HELLO, VALUES, VALUES, VALUES, INSERT), v3.ops());
         for (int i = 1; i <= 3; i++)

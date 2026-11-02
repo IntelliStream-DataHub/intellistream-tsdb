@@ -167,9 +167,7 @@ each 64-byte bucket row is followed by the five doubles. A request without
 the byte gets the old rows and the server runs the plain, one-pass query, so
 clients that do not know the spread read replies unchanged and pay nothing.
 The C client's `tsdbc_query_agg`, `_group` and `_bounds` never send the byte;
-`tsdbc_query_spread`, `_spread_group` and `_spread_bounds` send it, and
-against a server older than version 8 fail with `TSDB_ERR_INVALID` without a
-request.
+`tsdbc_query_spread`, `_spread_group` and `_spread_bounds` send it.
 
 ## Query statistics
 

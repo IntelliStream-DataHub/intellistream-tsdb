@@ -15,7 +15,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
-/** Protocol version 7 against a live build/tsdbd: range deletes, replaces, retention; and an older server. */
+/** Protocol version 7 against a live build/tsdbd: range deletes, replaces, retention. */
 class DeletesTest {
     static final long T0 = TsdbClientTest.T0;
     static final long HOUR = 3_600_000;

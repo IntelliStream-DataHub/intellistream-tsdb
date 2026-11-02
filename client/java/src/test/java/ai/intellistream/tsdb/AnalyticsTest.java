@@ -14,7 +14,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
-/** Protocol 9 against a live build/tsdbd: the spread, time-weighted averages, LTTB; and older servers. */
+/** Protocol 9 against a live build/tsdbd: the spread, time-weighted averages, LTTB. */
 class AnalyticsTest {
     static final long T0 = TsdbClientTest.T0;
     static final long MIN = Long.MIN_VALUE, MAX = Long.MAX_VALUE;
@@ -108,7 +108,7 @@ class AnalyticsTest {
                 invalid(() -> o.querySpread(1, MIN, MAX, -5, Order.DESC, 3));
                 o.commit();
             }
-            /* HELLO may go out or not (the client asks for the version when it needs it); no query does */
+            /* HELLO went out at connect; no query did */
             assertEquals(List.of((int) Protocol.OP_COMMIT),
                     f.ops().stream().filter(op -> op != Protocol.OP_HELLO).toList());
         }

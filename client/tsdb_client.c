@@ -637,8 +637,6 @@ static int buckets_req(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, in
     size_t zl = strlen(zone);
     if (zl > 65535)
         return TSDB_ERR_INVALID;
-    if (fields && server_version(c) < 8) /* an older server has no spread (and refuses the byte) */
-        return TSDB_ERR_INVALID;
     uint8_t q[48];
     memcpy(q, &series, 8);
     memcpy(q + 8, &start, 8);
@@ -671,8 +669,6 @@ static int bounds_req(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, con
     *out = NULL;
     *nout = 0;
     if (!bounds || n == 0 || n > (TSDB_MAX_FRAME - 64) / 8)
-        return TSDB_ERR_INVALID;
-    if (fields && server_version(c) < 8)
         return TSDB_ERR_INVALID;
     uint8_t q[37];
     uint32_t n32 = (uint32_t)n;
@@ -732,7 +728,7 @@ static int group_req(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, cons
                      const tsdb_query_opts *opts, uint8_t fields, void **out, size_t *nout)
 {
     bool local = group && group->timezone && strcmp(group->timezone, "UTC") != 0;
-    if (!local || server_version(c) < 4) /* an older server still takes the zone itself */
+    if (!local)
         return buckets_req(c, series, start, end, 0, group, opts, fields, out, nout);
     *out = NULL;
     *nout = 0;
@@ -796,8 +792,6 @@ static int twa_req(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, int64_
     *out = NULL;
     *nout = 0;
     if (n > (TSDB_MAX_FRAME - 64 - TSDB_TWA_HEADER) / 8)
-        return TSDB_ERR_INVALID;
-    if (server_version(c) < 6) /* an older server does not know QUERY_TWA */
         return TSDB_ERR_INVALID;
     tsdb_twa_opts def = {0};
     if (!opts)
@@ -997,8 +991,8 @@ uint32_t tsdbc_server_version(tsdbc *c) { return tsdbc_wait(c) ? 0 : server_vers
 
 uint64_t tsdbc_bytes_sent(const tsdbc *c) { return c->sent; }
 
-/* Whether inserts go packed: compression on, and a server that reads them. */
-static bool packing(tsdbc *c) { return c->zlevel && server_version(c) >= 3; }
+/* Whether inserts go packed: compression on. */
+static bool packing(tsdbc *c) { return c->zlevel != 0; }
 
 /* One packed frame: reshape, zstd, send (the buffers are free again on return). */
 static int send_packed(tsdbc *c, const tsdb_sid *series, tsdb_sid s, const int64_t *ts, const tsdb_values *v,
@@ -1136,12 +1130,8 @@ int tsdbc_query_lttb_ex(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, s
     int rc = tsdbc_wait(c);
     if (rc)
         return rc;
-    if (server_version(c) < 5)
-        return TSDB_ERR_INVALID; /* the server does not know QUERY_LTTB */
     /* order and limit only when they change something: the 32-byte form is the plain one */
     bool ex = opts && (opts->order == TSDB_DESC || opts->limit);
-    if (ex && server_version(c) < 9)
-        return TSDB_ERR_INVALID;
     uint8_t q[41];
     uint64_t t = threshold, lim = opts ? opts->limit : 0;
     memcpy(q, &series, 8);
@@ -1293,19 +1283,9 @@ int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st)
 int tsdbc_commit(tsdbc *c) { return call(c, TSDB_OP_COMMIT, NULL, 0, NULL, 0, NULL, NULL); }
 int tsdbc_flush(tsdbc *c) { return call(c, TSDB_OP_FLUSH, NULL, 0, NULL, 0, NULL, NULL); }
 
-/* Deletes and retention need protocol version 7: an older server would answer TSDB_ERR_INVALID too, but
- * only after the request went out; asking first keeps a pipelined connection's replies in order. */
-static int need_deletes(tsdbc *c)
-{
-    int rc = tsdbc_wait(c);
-    if (rc)
-        return rc;
-    return server_version(c) < 7 ? TSDB_ERR_INVALID : 0;
-}
-
 int tsdbc_delete_range(tsdbc *c, tsdb_sid series, int64_t start, int64_t end)
 {
-    int rc = need_deletes(c);
+    int rc = tsdbc_wait(c);
     if (rc)
         return rc;
     uint8_t b[24];
@@ -1332,7 +1312,7 @@ int tsdbc_replace_range(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, c
     memcpy(h + 8, &series, 8);
     memcpy(h + 16, &start, 8);
     memcpy(h + 24, &end, 8);
-    int rc = need_deletes(c);
+    int rc = tsdbc_wait(c);
     if (rc)
         return rc;
     struct iovec parts[5] = {{0}, {h, sizeof h}, {(void *)ts, n * 8}, {(void *)v->values, vb},
@@ -1349,7 +1329,7 @@ int tsdbc_replace_range(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, c
 
 int tsdbc_set_retention(tsdbc *c, tsdb_sid series, int64_t limit_ms)
 {
-    int rc = need_deletes(c);
+    int rc = tsdbc_wait(c);
     if (rc)
         return rc;
     uint8_t b[16];
@@ -1360,7 +1340,7 @@ int tsdbc_set_retention(tsdbc *c, tsdb_sid series, int64_t limit_ms)
 
 int tsdbc_get_retention(tsdbc *c, tsdb_sid series, int64_t *limit_ms)
 {
-    int rc = need_deletes(c);
+    int rc = tsdbc_wait(c);
     if (rc)
         return rc;
     const uint8_t *b;
@@ -1813,8 +1793,6 @@ int tsdbc_query_multi(tsdbc *c, const tsdb_multi_query *q, const tsdb_sid *serie
     if (!q || !fn || (n && !series) || (q->nbounds && !q->bounds) ||
         (q->trim & ~(TSDB_MULTI_TRIM_LO | TSDB_MULTI_TRIM_HI)))
         return TSDB_ERR_INVALID;
-    if (server_version(c) < 10)
-        return c->broken ? TSDB_ERR_IO : TSDB_ERR_INVALID;
     if (n == 0)
         return 0;
     mrun m = {.c = c, .mo = mo, .fn = fn, .ctx = ctx, .max_rows = mo ? mo->max_rows : 0};

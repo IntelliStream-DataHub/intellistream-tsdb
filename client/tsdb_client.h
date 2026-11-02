@@ -54,9 +54,9 @@ int tsdbc_series_at(tsdbc *c, const char *name, const char *path, tsdb_sid *id);
 /* TSDB_ERR_INVALID if the name and its NUL do not fit in len bytes (65536 always do). */
 int tsdbc_series_name(tsdbc *c, tsdb_sid id, char *buf, size_t len);
 
-/* Inserts travel packed and zstd compressed (level 1 by default) when the
- * server speaks protocol version 3; 0 sends plain arrays, which costs 16 bytes
- * a row on the wire instead of a few, but no CPU. Negative levels are faster. */
+/* Inserts travel packed and zstd compressed (level 1 by default); 0 sends plain
+ * arrays, which costs 16 bytes a row on the wire instead of a few, but no CPU.
+ * Negative levels are faster. */
 int tsdbc_set_compression(tsdbc *c, int level);
 /* Bytes written to the server so far, frame headers included. */
 uint64_t tsdbc_bytes_sent(const tsdbc *c);
@@ -94,8 +94,7 @@ int tsdbc_query_bounds(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, co
                        const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 /* The spread (range, variances, standard deviations), as tsdb_query_spread,
  * _spread_group and _spread_bounds (tsdb.h); a group in a time zone other than
- * UTC is turned into bounds here. Needs a server of protocol version 8
- * (TSDB_ERR_INVALID from an older one, without asking it). */
+ * UTC is turned into bounds here. */
 int tsdbc_query_spread(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                        const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
 int tsdbc_query_spread_group(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
@@ -103,8 +102,7 @@ int tsdbc_query_spread_group(tsdbc *c, tsdb_sid series, int64_t start, int64_t e
 int tsdbc_query_spread_bounds(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds,
                               size_t n, const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
 /* Time-weighted averages, as tsdb_query_twa, _twa_group and _twa_bounds (tsdb.h);
- * a group in a time zone other than UTC is turned into bounds here. Needs a
- * server of protocol version 5 (TSDB_ERR_INVALID from an older one). */
+ * a group in a time zone other than UTC is turned into bounds here. */
 int tsdbc_query_twa(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                     const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 int tsdbc_query_twa_group(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
@@ -112,7 +110,7 @@ int tsdbc_query_twa_group(tsdbc *c, tsdb_sid series, int64_t start, int64_t end,
 int tsdbc_query_twa_bounds(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                            const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 
-/* Value types and nulls (protocol version 2), as tsdb_series_create,
+/* Value types and nulls, as tsdb_series_create,
  * tsdb_insert_values, tsdb_query_values and the state dictionary. */
 int tsdbc_series_create(tsdbc *c, const char *name, tsdb_type type, const char *path, tsdb_sid *id);
 int tsdbc_series_type(tsdbc *c, tsdb_sid id, tsdb_type *type);
@@ -128,14 +126,10 @@ int tsdbc_query_values(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, co
  * server that predates HELLO), after waiting for pipelined inserts; 0 if the
  * connection failed. */
 uint32_t tsdbc_server_version(tsdbc *c);
-/* LTTB downsampling, as tsdb_query_lttb (protocol version 5: against an older
- * server it returns TSDB_ERR_INVALID without asking, as such a server would
- * for the unknown op; the same code as a bad threshold, so a caller that must
- * tell them apart checks tsdbc_server_version first). */
+/* LTTB downsampling, as tsdb_query_lttb. */
 int tsdbc_query_lttb(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
                      void *ctx);
-/* Newest first or cut to a limit, as tsdb_query_lttb_ex. Needs a server of protocol version 9 when opts asks
- * for either (TSDB_ERR_INVALID from an older one, without asking it). */
+/* Newest first or cut to a limit, as tsdb_query_lttb_ex. */
 int tsdbc_query_lttb_ex(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, size_t threshold,
                         const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx);
 int tsdbc_state(tsdbc *c, tsdb_sid series, const char *name, uint32_t *code);
@@ -146,7 +140,7 @@ int tsdbc_state_name(tsdbc *c, tsdb_sid series, uint32_t code, char *buf, size_t
 int tsdbc_last_query_stats(tsdbc *c, tsdb_query_stats *st);
 
 /* Deletes, replaces and retention, as tsdb_delete_range, tsdb_replace_range, tsdb_set_retention and
- * tsdb_get_retention (protocol version 7; with an older server: TSDB_ERR_INVALID). A replace travels as
+ * tsdb_get_retention. A replace travels as
  * one frame, so n is limited by the frame size (about 256 MiB). */
 int tsdbc_delete_range(tsdbc *c, tsdb_sid series, int64_t start, int64_t end);
 int tsdbc_replace_range(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, const int64_t *ts,
@@ -154,7 +148,7 @@ int tsdbc_replace_range(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, c
 int tsdbc_set_retention(tsdbc *c, tsdb_sid series, int64_t limit_ms);
 int tsdbc_get_retention(tsdbc *c, tsdb_sid series, int64_t *limit_ms);
 
-/* Many series in one request (protocol version 10; with an older server TSDB_ERR_INVALID, without asking), with
+/* Many series in one request, with
  * the types, calls and statuses of tsdb_query_multi (tsdb.h). mo->threads and mo->max_rows go to the server
  * (0: its --request-threads and --multi-max-rows; larger values are clamped there); mo->cancelled is polled after
  * each delivery; the other hooks are the server's own. A list over 65,536 series goes in several requests, with

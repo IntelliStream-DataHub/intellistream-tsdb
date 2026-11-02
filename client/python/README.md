@@ -161,8 +161,7 @@ for b in client.query_group(series, unit="day", timezone="Europe/Oslo"):
 
 The server only knows UTC. The client works out when each local day begins
 and sends those times (`tsdb_client.calendar_bounds` and `query_bounds` let
-you do the two steps yourself). With a server older than protocol version 4,
-the client sends the zone name instead.
+you do the two steps yourself).
 
 ## Spread, time-weighted averages and charts
 
@@ -206,10 +205,7 @@ Every query of one series takes `order="desc"` (newest first) and `limit`:
 `query_bounds`, the `query_spread*` and `query_twa*` calls and `query_lttb`.
 Of the batch calls, `query_raw_many` takes them too; `query_agg_many` does
 not. There is no batch call for the spread or time-weighted averages in
-0.9.0: run `query_spread` or `query_twa` per series. Over TCP the
-spread needs a server of protocol version 8, time-weighted averages 6, LTTB 5
-(9 with `order` or `limit`); an older server gets no request and the call
-fails with an invalid-argument error.
+0.9.0: run `query_spread` or `query_twa` per series.
 
 ## Value types and nulls
 
@@ -247,8 +243,7 @@ assert client.retention(starts) == 30 * 86_400_000
 A delete returns once it is durable; queries stop seeing the rows at once.
 A replace is atomic: readers see the old rows or the new ones, never a mix.
 Rows older than a series' retention limit disappear from queries at once and
-from disk as merges get to them. These need a server of protocol version 7; an
-older one gets no request and the call fails with an invalid-argument error.
+from disk as merges get to them.
 
 ## Compression
 
@@ -259,8 +254,6 @@ them smaller on the network and usually faster. To change it:
 client.set_compression(0)  # off: send plain arrays
 client.set_compression(3)  # smaller, but uses more CPU
 ```
-
-Servers older than protocol version 3 always get uncompressed inserts.
 
 ## Insert benchmark
 

@@ -8,9 +8,8 @@
 //! I/O or protocol error the stream may be out of step, so the client refuses
 //! further calls rather than misread replies.
 //!
-//! Inserts go packed and zstd compressed (protocol version 3) when compression
-//! is on (level 1 by default) and the server's HELLO, asked before the first
-//! non-empty insert, says 3 or more; otherwise as plain arrays. float32
+//! Inserts go packed and zstd compressed when compression
+//! is on (level 1 by default); otherwise as plain arrays. float32
 //! inserts too: the packed form is the smaller one.
 
 use std::fmt;
@@ -244,9 +243,9 @@ impl Client {
     /// Sets how much inserts are compressed (the zstd level).
     ///
     /// `level` 0 sends plain arrays. Any other level zstd accepts packs and
-    /// compresses inserts for servers of protocol version 3 or later: 1 (the
+    /// compresses inserts: 1 (the
     /// default, [`DEFAULT_COMPRESSION`]) is fast, higher levels compress more and
-    /// negative ones are faster still. Older servers always get plain arrays.
+    /// negative ones are faster still.
     ///
     /// # Errors
     ///
@@ -352,19 +351,9 @@ impl Client {
         Ok(v)
     }
 
-    /// Whether an insert goes packed: compression on and a server that reads
-    /// it. The first time, this asks the server (after collecting pending
-    /// inserts, whose errors it returns rather than taking them for an old server).
-    fn packing(&mut self) -> Result<bool> {
-        Ok(self.level != 0 && self.server_version()? >= 3)
-    }
-
-    /// The server's protocol version, asked once per connection.
-    fn server_version(&mut self) -> Result<u32> {
-        match self.server_version {
-            Some(v) => Ok(v),
-            None => self.hello(),
-        }
+    /// Whether an insert goes packed: compression is on.
+    fn packing(&self) -> bool {
+        self.level != 0
     }
 
     /// Waits for pending inserts, then closes the connection.
@@ -740,7 +729,7 @@ impl Client {
     ) -> Result<()> {
         check_lengths(series, one, ts, values.len())?;
         let n = ts.len();
-        if n > 0 && self.packing()? {
+        if n > 0 && self.packing() {
             return self.insert_values_frames(series, one, ts, ColumnRef::from(values));
         }
         let mut off = 0;
@@ -783,7 +772,7 @@ impl Client {
             )));
         }
         let n = ts.len();
-        let packed = n > 0 && self.packing()?;
+        let packed = n > 0 && self.packing();
         let flags = if col.valid.is_some() { VALID } else { 0 } | if packed { PACKED } else { 0 };
         let mut off = 0;
         loop {
@@ -992,16 +981,14 @@ impl Client {
         self.run(|c| c.rows_stream(series, start, end, opts, None))
     }
 
-    /// LTTB downsampling (protocol version 5): at most `threshold` points of `series` in
+    /// LTTB downsampling: at most `threshold` points of `series` in
     /// `range` that keep the shape of its line (the first and last always), with their
     /// stored values. `opts` returns them newest first or only the first `limit` of them in
-    /// that order (version 9); the choice of points does not change.
+    /// that order; the choice of points does not change.
     ///
     /// # Errors
     ///
-    /// [`Status::Invalid`] for a threshold below 3, for a state series, from a server older than
-    /// version 5, and from one older than 9 when `opts` asks for an order or a limit (the client
-    /// asks HELLO first and does not send the request).
+    /// [`Status::Invalid`] for a threshold below 3 and for a state series.
     ///
     /// ```no_run
     /// # use tsdb_client::{Client, QueryOpts};
@@ -1019,10 +1006,6 @@ impl Client {
     ) -> Result<Rows> {
         let (start, end) = bounds(&range);
         self.run(|c| {
-            c.need_version(5)?;
-            if opts.order == Order::Desc || opts.limit.is_some() {
-                c.need_version(9)?;
-            }
             c.rows_stream(series, start, end, opts, Some(threshold))
         })
     }
@@ -1259,8 +1242,7 @@ impl Client {
     /// In UTC the server does the grouping. For another zone the client computes
     /// where the local periods begin ([`calendar_bounds`](crate::calendar_bounds),
     /// over the first to the last row in the range) and sends those instants
-    /// ([`query_bounds`](Client::query_bounds)); a server older than protocol
-    /// version 4 gets the zone itself. Either way a bucket's `start` is the UTC
+    /// ([`query_bounds`](Client::query_bounds)). A bucket's `start` is the UTC
     /// instant its period begins.
     ///
     /// # Errors
@@ -1290,18 +1272,18 @@ impl Client {
     ) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
         self.run(|c| match group {
-            Some(g) if g.timezone.as_deref().is_some_and(|z| z != "UTC") && c.server_version()? >= 4 => {
+            Some(g) if g.timezone.as_deref().is_some_and(|z| z != "UTC") => {
                 if !c.group_local(series, start, end, g, opts, 0)? {
                     return Ok(Vec::new());
                 }
                 c.read_buckets()
             }
-            // UTC, or an older server, which still takes the zone itself
+            // UTC, or no group: the server does the grouping
             _ => c.buckets(series, start, end, 0, group, opts),
         })
     }
 
-    /// Calendar groups in a time zone for a version 4 server: their UTC
+    /// Calendar groups in a time zone: their UTC
     /// bounds, computed over the rows there are (an open range would be
     /// millennia of periods), go out in QUERY_BOUNDS.
     /// The reply is left in `self.body`; `false`: there is none (no rows, or a limit of 0).
@@ -1316,9 +1298,6 @@ impl Client {
     ) -> Result<bool> {
         let zone = g.timezone.as_deref().unwrap_or("");
         calendar::zone(zone)?; // an unknown zone is an error even for a series without rows
-        if fields != 0 {
-            self.need_version(8)?;
-        }
         let Some(_) = opts.wire_limit() else {
             self.wait_inner()?;
             return Ok(false);
@@ -1355,13 +1334,11 @@ impl Client {
     /// This is how calendar periods in a time zone reach a server, which
     /// knows UTC only: [`calendar_bounds`](crate::calendar_bounds) computes
     /// them, and [`query_group`](Client::query_group) does both steps.
-    /// Needs a server of protocol version 4.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidArgument`] if `bounds` is empty, does not strictly
-    /// increase, or has more than 32 Mi entries (the largest request);
-    /// [`Status::Invalid`] from a server older than version 4.
+    /// increase, or has more than 32 Mi entries (the largest request).
     ///
     /// ```no_run
     /// use tsdb_client::{Client, QueryOpts, Unit, calendar_bounds};
@@ -1401,9 +1378,6 @@ impl Client {
         fields: u8,
     ) -> Result<bool> {
         check_bounds(b)?;
-        if fields != 0 {
-            self.need_version(8)?;
-        }
         let Some(limit) = opts.wire_limit() else {
             self.wait_inner()?;
             return Ok(false);
@@ -1455,9 +1429,6 @@ impl Client {
         fields: u8,
     ) -> Result<bool> {
         let tz = wire_str("time zone", group.and_then(|g| g.timezone.as_deref()).unwrap_or(""), true)?;
-        if fields != 0 {
-            self.need_version(8)?;
-        }
         let Some(limit) = opts.wire_limit() else {
             self.wait_inner()?;
             return Ok(false);
@@ -1494,13 +1465,11 @@ impl Client {
 
     /// The spread of `series` over `range` in buckets of `interval_ms` (0: one
     /// bucket): count, sum, min and max as [`query_agg_ex`](Client::query_agg_ex),
-    /// and the range, variances and standard deviations of the known values
-    /// (protocol version 8).
+    /// and the range, variances and standard deviations of the known values.
     ///
     /// # Errors
     ///
-    /// [`Status::Invalid`] from a server older than version 8 (asked through HELLO, the
-    /// request is not sent) and for a negative interval; otherwise as `query_agg`.
+    /// [`Status::Invalid`] for a negative interval; otherwise as `query_agg`.
     ///
     /// ```no_run
     /// # use tsdb_client::{Client, QueryOpts};
@@ -1570,12 +1539,11 @@ impl Client {
 
     /// Time-weighted averages of `series` over `range` in buckets of `interval_ms`
     /// (0: one bucket), with the method, staleness limit, order and limit of
-    /// `opts` (protocol version 6; tsdb.h, `tsdb_query_twa`, has the rules).
+    /// `opts` (tsdb.h, `tsdb_query_twa`, has the rules).
     ///
     /// # Errors
     ///
-    /// [`Status::Invalid`] from a server older than version 6 (the request is not sent), for a
-    /// negative interval and for a state series.
+    /// [`Status::Invalid`] for a negative interval and for a state series.
     ///
     /// ```no_run
     /// # use tsdb_client::{Client, TwaOpts};
@@ -1620,7 +1588,6 @@ impl Client {
                 Some(z) => z,
             };
             calendar::zone(zone)?;
-            c.need_version(6)?;
             let (mut lo, mut hi) = (start, if end == i64::MAX { i64::MIN } else { end - 1 });
             if start == i64::MIN {
                 match c.edge_ts(series, start, end, Order::Asc)? {
@@ -1674,7 +1641,7 @@ impl Client {
         if b.len() > (MAX_FRAME - 64 - TWA_HEADER) / 8 {
             return Err(Error::InvalidArgument(format!("{} bucket bounds", b.len())));
         }
-        self.need_version(6)?;
+        self.wait_inner()?;
         let Some(limit) = opts.query_opts().wire_limit() else {
             return Ok(Vec::new());
         };
@@ -1699,7 +1666,7 @@ impl Client {
 
     // ------------------------------------------------ deletes and retention
 
-    /// Deletes the rows of a series in `range` (protocol version 7).
+    /// Deletes the rows of a series in `range`.
     ///
     /// A delete is a write like any other: a row of the range inserted after it returned is
     /// kept, one acknowledged before it started is gone. Queries stop returning the rows at once,
@@ -1707,8 +1674,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Status::Invalid`] from a server older than version 7 (the client asks HELLO first and
-    /// does not send the request); [`Error::Io`] if the connection fails, [`Error::Protocol`] if
+    /// [`Error::Io`] if the connection fails, [`Error::Protocol`] if
     /// the reply makes no sense; after either the client refuses further calls.
     ///
     /// ```no_run
@@ -1721,15 +1687,14 @@ impl Client {
     pub fn delete_range(&mut self, series: SeriesId, range: impl RangeBounds<i64>) -> Result<()> {
         let (start, end) = self::bounds(&range);
         self.run(|c| {
-            c.need_deletes()?;
             c.request(Op::DeleteRange, |f| {
                 f.u64(series).i64(start).i64(end);
             })
         })
     }
 
-    /// Replaces the rows of a series in `range` by `ts` and `values`, atomically (protocol
-    /// version 7): a reader sees either the old rows or the new ones. Every timestamp must lie in
+    /// Replaces the rows of a series in `range` by `ts` and `values`, atomically:
+    /// a reader sees either the old rows or the new ones. Every timestamp must lie in
     /// `range`; no rows make it a delete. The values are a column of the series' type, with nulls
     /// where its validity bitmap says so. It travels as one plain frame of at most 256 MiB.
     ///
@@ -1737,7 +1702,7 @@ impl Client {
     ///
     /// [`Error::InvalidArgument`] if the lengths differ or the rows do not fit in one frame;
     /// [`Status::Invalid`] for a timestamp outside `range`, a column of another type than the
-    /// series, or a server older than version 7; otherwise as [`delete_range`](Client::delete_range).
+    /// series; otherwise as [`delete_range`](Client::delete_range).
     ///
     /// ```no_run
     /// # use tsdb_client::{Client, Column};
@@ -1772,7 +1737,6 @@ impl Client {
         if REPLACE_HEADER + n * (8 + ty.wire_width()) + valid > MAX_FRAME - 16 {
             return Err(Error::InvalidArgument(format!("{n} rows do not fit in one request")));
         }
-        self.need_deletes()?;
         self.request(Op::ReplaceRange, |f| {
             f.u32(n as u32)
                 .u8(ty.code())
@@ -1789,31 +1753,29 @@ impl Client {
         })
     }
 
-    /// Sets how long a series keeps its rows, in ms (protocol version 7): rows older than the
+    /// Sets how long a series keeps its rows, in ms: rows older than the
     /// server's clock minus `limit_ms` disappear from queries at once and from disk as merges get
     /// to them. 0 keeps them forever. Set it right after creating a series to never show older rows.
     ///
     /// # Errors
     ///
-    /// [`Status::Invalid`] for a negative limit or a server older than version 7; otherwise as
+    /// [`Status::Invalid`] for a negative limit; otherwise as
     /// [`delete_range`](Client::delete_range).
     pub fn set_retention(&mut self, series: SeriesId, limit_ms: i64) -> Result<()> {
         self.run(|c| {
-            c.need_deletes()?;
             c.request(Op::SetRetention, |f| {
                 f.u64(series).i64(limit_ms);
             })
         })
     }
 
-    /// The retention limit of a series in ms, 0 for none (protocol version 7).
+    /// The retention limit of a series in ms, 0 for none.
     ///
     /// # Errors
     ///
     /// As [`set_retention`](Client::set_retention).
     pub fn retention(&mut self, series: SeriesId) -> Result<i64> {
         self.run(|c| {
-            c.need_deletes()?;
             c.request(Op::GetRetention, |f| {
                 f.u64(series);
             })?;
@@ -1822,24 +1784,6 @@ impl Client {
             end(&r)?;
             Ok(v)
         })
-    }
-
-    /// Deletes and retention need a server of protocol version 7. An older one answers
-    /// [`Status::Invalid`] for an op it does not know; asking HELLO first gives the same answer
-    /// without sending it. Pending inserts are collected first, so that their errors are not
-    /// taken for an old server.
-    fn need_deletes(&mut self) -> Result<()> {
-        self.need_version(7)
-    }
-
-    /// [`Status::Invalid`], as an older server would answer the unknown op or the longer
-    /// request, without sending it to a server whose HELLO says less than `v`.
-    fn need_version(&mut self, v: u32) -> Result<()> {
-        self.wait_inner()?;
-        if self.server_version()? < v {
-            return Err(Error::Server(Status::Invalid));
-        }
-        Ok(())
     }
 
     // -------------------------------------------------------- maintenance
