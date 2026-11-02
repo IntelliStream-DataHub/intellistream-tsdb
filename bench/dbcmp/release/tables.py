@@ -94,7 +94,7 @@ def picked(f):
         if m:
             nruns = int(m.group(1))
             continue
-        if "TEXT DIFFERS" in l:
+        if "TEXT DIFFERS" in l and "TEXT DIFFERS between runs (see the raw files)" not in flags:
             flags.append("TEXT DIFFERS between runs (see the raw files)")
         if l.startswith("#") or not l.strip() or CH_PCT.match(l) or not TIME.search(l):
             continue
@@ -109,6 +109,26 @@ def picked(f):
         if n:
             flags.append("%d run(s) %s, not averaged" % (n, what))
     return lines, nruns, flags
+
+
+FAILURE = re.compile(r"Code: 241[^.]*\.[^.]*memory limit exceeded|memory limit exceeded|global RSS memory limit exceeded|"
+                     r"table busy[^\n]*|server closed the connection unexpectedly|query timed out after \d+ s|"
+                     r"STEP TIMEOUT[^\n]*|status -1|code.? ?719[^\n]*")
+
+
+def run_failures(f):
+    """What the runs of a mean file that has no timing died of, from the run files: the server's own error where
+    it gave one (ClickHouse's Code 241, QuestDB's RSS limit, IoTDB's 719), else the client's (a cut-off reply, a
+    timeout), counted per kind; '' when no run file names a failure."""
+    base, seen = f[:-len(".mean.txt")], {}
+    for g in sorted(glob.glob(base + ".*")):
+        if not re.fullmatch(re.escape(base) + r"\.\d+", g):
+            continue
+        m = FAILURE.search(open(g, errors="replace").read(20000))
+        if m:
+            k = " ".join(m.group(0).split())[:90]
+            seen[k] = seen.get(k, 0) + 1
+    return "; ".join("%d x %s" % (n, k) for k, n in seen.items())
 
 
 MEM = re.compile(r"(\S+) peak (\d+) nocache (\d+)(?: start (\d+) startnocache (\d+))?")
@@ -245,8 +265,13 @@ def results_table(d, prefix="", mark=""):
         lines, nruns, flags = picked(f)
         lines = batch_unit(name, lines)
         if not lines:
-            errors.append("%s: no timing in it (a failed or empty run?)" % f)
-            flags.append("NO TIMING")
+            why = run_failures(f)
+            if why or any("not averaged" in x for x in flags):
+                # every run refused, killed or failed with the server's own error: a result, shown as '-' with why
+                flags.append("no run timed: " + why if why else "no run timed")
+            else:
+                errors.append("%s: no timing in it (a failed or empty run?)" % f)
+                flags.append("NO TIMING")
         res = "<br>".join(cell(t)[:240] for t, _ in lines) or "-"
         spread = "<br>".join(cell(st)[:240] or "(one run or no spread)" for _, st in lines) or "-"
         rows.append((name, "| %s | %s | %s | %s | %s | %s |" % (cell(mark + name), res, spread,

@@ -302,6 +302,28 @@ def refused_cases():
     case("i3: a long query is a POST with the query in its JSON body", True,
          len(b) == 3 and b[0] == "POST /api/v3/query_sql" and json.loads(b[2])["q"] == "SELECT " + "x" * 9000)
 
+def tables_cases():
+    """tables.py: a class whose every run the server refused is a result ('-' and why), not "no timing" (exit 1);
+    a mean file with no timing and no failure named stays an error."""
+    import tables
+    d = tempfile.mkdtemp()
+    try:
+        open(os.path.join(d, "ch.twa7d.b100.c32.mean.txt"), "w").write("query failed   # TEXT DIFFERS between runs\n")
+        for i, t in ((1, "query failed: status -1: 44\t17"), (2, "query failed: status 500: Code: 241. DB::Exception: (total) memory limit exceeded: would use 43 GiB")):
+            open(os.path.join(d, "ch.twa7d.b100.c32.%d" % i), "w").write(t)
+        open(os.path.join(d, "x.raw.c1.mean.txt"), "w").write("nothing here\n")
+        tables.errors.clear()
+        rows = tables.results_table(d)
+        text = "\n".join(r if isinstance(r, str) else r[1] for r in rows)
+        case("tables: refused class shown with the server's error", True,
+             "no run timed: 1 x status -1; 1 x Code: 241. DB::Exception: (total) memory limit exceeded" in text)
+        case("tables: refused class is no error", True, not any("ch.twa7d" in e for e in tables.errors))
+        case("tables: a mean file with no timing and no failure named is still an error", True,
+             any("x.raw.c1" in e for e in tables.errors))
+    finally:
+        shutil.rmtree(d)
+        tables.errors.clear()
+
 def main():
     a = sys.argv[1:]
     if not a or a[0] != "mutate": raise SystemExit("usage: checktest.py mutate [TWA_REF WINDOWS_REF FULL_REF]")
@@ -316,6 +338,7 @@ def main():
     batch_cases()
     exit_cases(ref)
     refused_cases()
+    tables_cases()
     if len(a) >= 4:
         windows_cases(a[2], a[3])
     print("checktest", "OK" if failures == 0 else f"FAILED ({failures} cases)")
