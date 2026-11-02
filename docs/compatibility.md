@@ -7,13 +7,14 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 | | where | now |
 |---|---|---|
 | release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.9.0 |
-| disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 7 |
-| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 10 |
+| disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 8 |
+| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 11 |
 
 ## Disk format versions
 
 | version | what changed |
 |---|---|
+| 8 | `CATALOG` is gone: a series id is `(volume + 1) << 32 \| local`, so it names its volume, and each volume's `META` holds its number (`volume=N`, checked at open) |
 | 7 | part keys `4 x first base partition + class` and the `CLASSES` file (partition classes); zstd frames without magic number and content size; the granule index bit-packed per part (about 32 bytes an entry instead of 160) behind a 64-byte footer that gives the index's length (`index_len`) |
 | 6 | block headers name their codec in 7 bits; the dictionary codec |
 | 5 | the spread in every granule entry (160 bytes) |
@@ -36,20 +37,22 @@ volume path, for example, changes both). So:
   `tsdb_open` returns `TSDB_ERR_CORRUPT` and writes one line to stderr:
 
   ```
-  tsdb: the database has disk format version 6; tsdb 0.9.0 reads version 7 only. Export the data with the
+  tsdb: the database has disk format version 7; tsdb 0.9.0 reads version 8 only. Export the data with the
   release that wrote it and import it here (docs/compatibility.md)
   ```
 
   `tsdbd` and `tsdb` then exit with an error and have touched nothing. A downgrade is refused the same
   way: a newer release's database is not read by an older release.
 - **Use the same release for the server and its clients.** On connect a client sends `HELLO` with the
-  protocol version it speaks, and the server answers with the lower of its own and the client's. A client
-  never sends what that version does not know. If a client asks for something that needs a newer server
-  (the spread needs 8, a limit with an order needs 9, many series in one request 10), the call fails with `TSDB_ERR_INVALID` without
-  sending it. A server of an older protocol than the client's, and a client of an older protocol than the
-  server's, thus work for the operations both know; operations that came later fail. Across a 0.9.x
-  release that changed the protocol we do not promise more than that: upgrade the server and its clients
-  together, the server last.
+  protocol version it speaks, and the server answers with the lower of its own and the client's. Each 0.9.x
+  release names the oldest protocol it speaks (the floor, 11 now): the server refuses a client below it,
+  and a client refuses a server below it, with `TSDB_ERR_INVALID` at connect. The release that moved the
+  floor to 11 did so because every series id on the wire became 64 bits: a version-10 peer would read a
+  `u32` where a `u64` is sent, so there is no operation both could do safely. Above the floor, a client
+  never sends what the server's version does not know: if it asks for something that needs a newer server,
+  the call fails with `TSDB_ERR_INVALID` without sending it. Across a 0.9.x release that changed the
+  protocol we do not promise more than that: upgrade the server and its clients together, the server last.
+  From 1.0 on the floor is 1.0's version and stays.
 - **The programming interfaces** (`tsdb.h`, `tsdb_client.h`, `tsdb_calendar.h`, the Rust, Python and Java
   clients and bindings) may change in a 0.9.x release too; the changelog lists it. Names and meanings
   that do not need to change stay.

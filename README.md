@@ -65,14 +65,14 @@ performance optimizations for different CPU architectures.
 - Delete the values of one series in a time range, or replace them with new
   ones in one step (readers see the old values or the new ones, never a mix).
   Give a series a retention period, and values older than that disappear on
-  their own. Over the wire these need protocol version 7 (tsdbd and the C,
-  Rust, Python and Java clients of this release; the CLI has `delete` and
+  their own. They work over the wire in tsdbd and the C,
+  Rust, Python and Java clients of this release (the CLI has `delete` and
   `retention`).
 - Ask about many series in one request: the last hour of 200 sensors, or a
   day of every pump by hour. The server works on the series in parallel and
   sends the answers back in your order, all read at the same instant, so a
   write to several series shows up in all of them or in none. Over the wire
-  this needs protocol version 10 (tsdbd and the clients of this release).
+  this works in tsdbd and the clients of this release.
 - Safe writes: data is on disk when a write returns. We test this by killing
   the server and by simulating power loss.
 - One writer and any number of read-only followers can share a directory,
@@ -536,7 +536,7 @@ The key lines of the C client (link with `build/libtsdbclient.a -lzstd -lpthread
 ```c
 tsdbc *c;
 tsdbc_connect("127.0.0.1", 7070, &c);
-uint32_t id;
+tsdb_sid id;                                         /* 64-bit; look it up by name, never count ids */
 tsdbc_series(c, "pump7.flow", 1, &id);
 tsdbc_insert_series(c, id, times, values, n);
 tsdbc_query_agg(c, id, start, end, 60000, &b, &nb);    /* one summary per minute */

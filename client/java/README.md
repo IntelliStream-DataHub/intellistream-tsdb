@@ -134,7 +134,9 @@ after 3 unanswered probes (`setKeepAlive` changes or turns it off).
 
 ## Create a series
 
-Series ids are unsigned 64-bit numbers in a `long`; `-1L` is reserved. The client speaks protocol 11 and
+Series ids are 64-bit numbers in a `long`, handed out by the database: the volume in the high half, so every id is
+at least 2^32 and positive. Look them up by name and keep them in a `long`, never an `int`; do not count on them
+being 0, 1, 2 and so on. The client speaks protocol 11 and
 `TsdbClient.connect` fails with `Status.ERR_INVALID` ("upgrade the server") when the server answers an older version.
 
 A series has a name and a value type. `series` gets a series of 32-bit floats, and creates it if it is missing.

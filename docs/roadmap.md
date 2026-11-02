@@ -11,6 +11,10 @@ series store underneath; tsdb does not duplicate it.
 
 ## Done
 
+- 64-bit series ids, from the failover design (docs/ha.md §5): `(volume + 1) << 32 | local`, so an id names its
+  volume and routing needs no table; `CATALOG` is gone (disk format 8, protocol 11, all four clients, the
+  embedded bindings and the Pulsar sink). It changed the protocol and the on-disk layout before the formats
+  freeze, so failover can follow in 1.1 without a break. The design is docs/design-series64.md.
 - Many series in one request (protocol 10, QUERY_MULTI and CANCEL): values, buckets (fixed, calendar in any
   zone, bounds), spread, TWA and LTTB for up to 65,536 series, answered in order from one snapshot, the series
   spread over the server's threads; in the library (`tsdb_query_multi`), tsdbd, the C, Rust, Python and Java
@@ -48,9 +52,6 @@ and 1.0 still need (the format and protocol changes may land in a 0.9.x, but bef
   client and CLI parsing; fuzzing of decoders, file loaders and frames (in progress).
 - SIMD kernels for float64, int64 and bool, the spread, time-weighted averages and LTTB, at every CPU level
   (AVX-512, AVX2, x86-64-v2), with identical results on every CPU (in progress).
-- Series addressed by volume path and name with 64-bit ids, from the failover design (docs/ha.md §5): it changes
-  the protocol, the on-disk layout and every client, so it lands before the formats are frozen, and failover
-  can follow in 1.1 without a break.
 - Release mechanics: version and tag, release notes, the compatibility promise (which formats and protocol
   versions 1.x reads), the portable tarball checked on AlmaLinux 10; export and import for 0.9.x format changes.
 - The release benchmarks: the full comparison (bench/dbcmp) and the internal numbers on a quiet machine.

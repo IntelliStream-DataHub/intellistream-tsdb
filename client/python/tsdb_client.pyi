@@ -50,8 +50,10 @@ _TwaMethod = Literal["step", "linear"]
 # without iterating), or any sequence of numbers.
 _Timestamps = Buffer | Sequence[int]
 _Values = Buffer | Sequence[float]
-# Series ids are ints of 64 bits (0 to 2**64 - 1), handed out by the database and not dense; an id
-# column is a uint64 array, a uint32 array (widened), or a sequence of ints.
+# Series ids are ints of 64 bits, handed out by the database: the volume in the high half, the series' index
+# in the volume in the low half, so every id is at least 2**32 (an id cut to 32 bits is refused). They are not
+# dense: look them up by name or list them with Db.series_ids(). An id column is a uint64 array, a uint32 array
+# (widened), or a sequence of ints.
 _SeriesIds = Buffer | Sequence[int]
 _ValueType = Literal["float32", "float64", "int64", "bool", "state"]
 # Typed values: a numpy array or masked array (masked = null), a buffer, or a
@@ -525,6 +527,9 @@ class Client:
         """
     def series(self, name: str, create: bool = True) -> int:
         """Returns the id of a series, creating it (as float32) if needed.
+
+        The id is a 64-bit int that names the series' volume: keep it as it is (do not store it in 32 bits)
+        and do not count on ids being 0, 1, 2 and so on.
 
         Args:
             name: The series name, such as "pump7.flow".

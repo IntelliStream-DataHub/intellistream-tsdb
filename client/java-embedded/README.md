@@ -20,7 +20,7 @@ import ai.intellistream.tsdb.*;
 import ai.intellistream.tsdb.embedded.*;
 
 try (EmbeddedDb db = EmbeddedDb.open("/var/lib/tsdb")) {
-    long id = db.series("boiler.temp");
+    long id = db.series("boiler.temp");                       // a 64-bit id, not 0, 1, 2 ...: keep it in a long
     db.insert(id, new long[] {t0, t0 + 60_000}, new float[] {61.5f, 61.8f});
 
     Points raw = db.queryPoints(id, t0, t1);

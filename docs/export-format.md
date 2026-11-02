@@ -20,6 +20,9 @@ What queries see at the moment each series is read, nothing else:
 - for state series, the names of the state codes the rows use (codes are per volume, so they differ in the target
   and are mapped through their names).
 
+The stream carries no series ids: a series travels by its name and volume path, and the id it gets in the target
+database is the target's own. That is why the stream is the same in every disk format and protocol version.
+
 **Deletes and replaces are already applied**, rows past their series' retention are not there, and of several
 writes of one key only the last is. Merges, parts, partitions and granules are not in the stream: the importing
 tsdb lays the data out its own way. The stream does not hold the database options (partition length, granule

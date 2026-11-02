@@ -409,8 +409,8 @@ They made the on-disk format version 4.
 A database is a directory:
 
 ```
-META                       format version, partition size, granule size, partition classes on or off
-SERIES                     append-only series dictionary (name -> dense id, value type)
+META                       format version, partition size, granule size, partition classes on or off, volume number
+SERIES                     append-only series dictionary (name -> local id, value type)
 STATES                     append-only dictionary of state names (name -> code)
 RETENTION                  append-only retention limits per series
 CLASSES                    append-only partition class switches per series (series, from, class)
@@ -420,9 +420,25 @@ wal_<seq>.log              write-ahead log of the current memtable
 p<key>_<minblock>_<maxblock>_<level>.part   key: 4 x first base partition + class
 ```
 
-A database with volumes (`tsdb_series_at`) also has `VOLUMES` (their paths)
-and `CATALOG` (global series id -> volume and local id) in the root; each
-volume is a directory of the layout above, with `ROOT_ID` (the root's `ID`).
+A database with volumes (`tsdb_series_at`) also has `VOLUMES` (their paths) in
+the root; each volume is a directory of the layout above, with `ROOT_ID` (the
+root's `ID`) and its own number in `META` (`volume=N`; 0 in the root), which
+the open checks against the line of `VOLUMES` the directory is on.
+
+**A series id is 64 bits: `(volume + 1) << 32 | local`.** `volume` is the
+volume's number (0 for the database directory, line i of `VOLUMES` for volume
+i) and `local` the series' index in that volume's `SERIES`. Every file inside
+a volume (WAL, parts, granule index, `CLASSES`, `RETENTION`) holds only local
+ids, so the engine of one directory numbers its series densely, as it always
+did, and nothing per row or per granule costs more. The volume half is the
+directory a file is in. Routing a request is a shift and a bounds check; there
+is no global table to read at an open or to keep in memory, and creating a
+series is one append, to its own volume. The `+ 1` keeps 0 from being an id
+and puts every id above 2^32, so an id cut to 32 bits anywhere is refused
+instead of being taken for another series. Ids are not dense: list them with
+`tsdb_series_foreach`, look them up by name. They are never reused (`SERIES`
+is append-only and volumes are never removed), but they are not the same in
+another database: an export names series, not ids.
 
 Volumes are added on purpose: `tsdb <dir> volume add <path>` (`tsdb_volume_add_dir`,
 also while tsdbd has the database open) or `tsdb_volume_add`. tsdbd and the CLI
@@ -435,7 +451,7 @@ refuses (INVALID) a path that is not absolute, holds a control character (a
 newline would split its line) or a `.` or `..` component, lies inside the root
 or another volume or contains one, or is the directory of another database or
 holds tsdb files. It makes the directory and syncs its parent, writes the
-root's `META` and `ROOT_ID` into it and then appends the line, so a line never
+root's `META` (with the new volume's number) and `ROOT_ID` into it and then appends the line, so a line never
 names a directory a power loss can take back; the engine files come with the
 first writer that opens it. The lock is held only to read the list and to
 append, not while the new directory (perhaps on a slow NFS server) is made. A
@@ -465,7 +481,7 @@ about 32 bytes each (see "The granule index" below). The 64-byte footer holds
 the index's offset and length, the WAL segment, row count, time range and
 granule count, and one more checksum, over the header, the index, the
 tombstones and the footer, checked when the part is opened. The on-disk
-format is version 7; a database of another version is refused at open
+format is version 8; a database of another version is refused at open
 (until 1.0 an older format is carried over by export and import). The index is
 the sparse primary index of MergeTree: finding a series' rows in a time range is
 a binary search, and aggregates over whole granules are answered from the
@@ -758,7 +774,7 @@ pages and marked them clean, so the next `fsync` succeeds while the data is
 gone (PostgreSQL's "fsyncgate", 2018). tsdb therefore stops. When a write or
 sync fails on a file that an acknowledgement may rely on (a WAL segment, the
 directory after new names became visible, MANIFEST, the series and state
-dictionaries, CATALOG), the engine is marked failed: the writers whose rows
+dictionaries), the engine is marked failed: the writers whose rows
 went through the failed call get `TSDB_ERR_IO`, no later write is acknowledged,
 no new file is named (a merge that finishes afterwards deletes its output),
 and `tsdb_failed` says what failed. tsdbd exits with status 1, and a restart
@@ -777,7 +793,7 @@ dictionary is fail-stop as well, as in PostgreSQL: under systemd a full disk
 means restarts that serve reads in between, until space is freed. The failure
 message goes to stderr once, possibly while the caller holds engine locks;
 it is one short line per engine lifetime. With several volumes,
-a failure stops only the volume it happened in (the root volume for CATALOG).
+a failure stops only the volume it happened in.
 
 ### Damage on disk
 
@@ -794,9 +810,10 @@ damage into silently missing or shifted data:
 - **SERIES and STATES** records carry a checksum seeded with their offset, so
   a run of zeros or a shifted record is never read as a name. A torn tail is
   cut; damage before a valid record fails the open.
-- **CATALOG** records (16 bytes) and **VOLUMES** lines carry a checksum that
-  includes their position. A torn tail is cut; damage before a valid record,
-  or a record naming a series its volume does not have, fails the open.
+- **VOLUMES** lines carry a checksum that includes their position. A torn tail
+  is cut; damage before a valid line fails the open. A volume whose `META`
+  names another number than its line fails it too (`TSDB_ERR_CORRUPT`, with a
+  log line that names both), so an id never reaches another volume's series.
 - **Parts**: a part whose header, index or footer fails its checksum fails
   the open with `TSDB_ERR_CORRUPT` and a log line naming it; renaming it to
   `*.broken` accepts the loss of its rows. Dropping it silently would answer
@@ -1459,7 +1476,7 @@ mirrors the embedded API and does not link the storage engine:
 ```c
 tsdbc *c;
 tsdbc_connect("127.0.0.1", 7070, &c);
-uint32_t id;
+tsdb_sid id;                                       /* 64-bit; look it up by name, never count ids */
 tsdbc_series(c, "pump7.flow", 1, &id);
 tsdbc_insert_series_async(c, id, ts, values, n);   /* pipelined */
 tsdbc_wait(c);                                     /* acknowledgements */

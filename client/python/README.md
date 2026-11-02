@@ -94,7 +94,8 @@ example `tsdb_client.ERR_NOTFOUND`.
 
 ## Create a series
 
-A series has a name and a number (its id). You use the id in every other call.
+A series has a name and a number (its id, a 64-bit int). You use the id in every other call. Ids are handed out
+by the database and name the series' volume: look them up by name, and do not count on them being 0, 1, 2 and so on.
 
 ```python
 series = client.series("pump7.flow")                # creates it if it does not exist

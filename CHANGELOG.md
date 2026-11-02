@@ -80,7 +80,35 @@ disk format and the wire protocol.
   `tsdb export` (old release) and `tsdb import` (this one), which gives every series its class on its first
   batch. `tsdb_drop_before` drops whole partitions as before, so a slow series' rows go in steps of its
   partition length (7, 28 or 364 days); retention still clamps queries to the exact cutoff.
-- The wire protocol is version 10. Clients of this release speak it and gate the new calls on the server's HELLO.
+- Series ids are 64-bit. A series' id is `(volume + 1) << 32 | local`: the volume's number plus one in the high
+  half, the series' index in that volume's `SERIES` file in the low half (`tsdb_sid`, `TSDB_SID`,
+  `TSDB_SID_VOLUME`, `TSDB_SID_LOCAL`, `TSDB_SID_NONE`). Every id is at least 2^32 and 0 is never one, so
+  an id cut to 32 bits in a cast, a Java `int`, a Rust `as u32` or a Python `"I"` is refused instead of being
+  taken for another series. Ids are not dense any more: list series with `tsdb_series_foreach` (C), `series_ids`
+  (Rust and Python `Db`) or `seriesIds` (Java `EmbeddedDb`), or `TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v)
+  - 1)`, never `0 .. tsdb_series_count() - 1` (which now returns `uint64_t`); look ids up by name. `tsdb_abi_version`
+  names the layout of the C ABI the bindings check. C `tsdb_sid`, Rust `SeriesId` (`u64`), Python `int` (numpy
+  `uint64` columns; `uint32` input is widened), Java `long` and `long[]` (the methods that took `int` ids are
+  gone, not overloaded). `tsdb series` prints the id. The Pulsar sink keeps its ids as `long`. The
+  benchmarks find their ids by name and keep the series number of their row files as an index into that table.
+- The root file `CATALOG` is gone. It only routed a dense 32-bit id to its volume; with the volume inside the id,
+  routing is a shift. A series is created with one append to its volume's `SERIES` file instead of two, and
+  nothing is read from or kept for the root at an open (at a billion series, a 16 GB file and 16-32 GB of memory
+  less). A format-7 database, which has one, is refused at open (below).
+- Disk format 8: no `CATALOG`, and each volume's `META` holds its number (`volume=N`, 0 in the database
+  directory), which the open checks against the line of `VOLUMES` the directory is on (`TSDB_ERR_CORRUPT`, with a
+  line that names both), so a cached id never reaches another volume's series. Nothing inside a volume changed
+  (WAL, parts, granule index, `CLASSES`, `RETENTION`, `SERIES`), and nothing costs a bit more per row. A version-7
+  database is refused at open, with the message that names both versions; carry it over with `tsdb export` (the
+  release that wrote it) and `tsdb import` (this one). The export stream is unchanged, version 1 still: it
+  names series, never ids, so every stream written so far imports as before
+  ([docs/export-format.md](docs/export-format.md)).
+- The wire protocol is version 11: every series id in a request or reply is a `u64`, and `tsdbd` and the
+  clients refuse a peer below 11 at HELLO (`TSDB_ERR_INVALID`; there is no operation that a version-10 peer and
+  this one could both do safely). The two version-1 aggregate operations QUERY_AGG and QUERY_GROUP are removed:
+  QUERY_BUCKETS and QUERY_BOUNDS answer the same queries. Ids cost 4 bytes more per request
+  (nothing more where a reserved word took it, about nothing in packed inserts). The gates on protocol versions
+  3 to 10 in the clients are gone, since they always pass. Upgrade the server and its clients together.
 - One query scheduler per database instead of a thread pool per volume: concurrent queries share the CPUs by
   groups capped at `request_threads`, the calling thread always works, and decoding of series already started
   comes before new series.

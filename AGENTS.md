@@ -148,7 +148,7 @@ cgroup, so `nice` does not keep your work out of its way.
   synced up to it (`mt_collect` with `visible`).
 - **Fail-stop** ("fsyncgate"). A failed write or sync whose data an
   acknowledgement may already rely on (the WAL, a directory fsync after names
-  became visible, MANIFEST, SERIES, STATES, CATALOG) calls `eng_fail`: after it
+  became visible, MANIFEST, SERIES, STATES) calls `eng_fail`: after it
   the engine acknowledges nothing, names no new file (a merge in flight drops
   its output), and `tsdb_failed` reports it;
   tsdbd exits with status 1. A retried fsync can return 0 after the kernel
@@ -171,7 +171,22 @@ cgroup, so `nice` does not keep your work out of its way.
   control bytes, no `.`/`..`; not in or around the root or another volume; not another database's directory) and
   appends to VOLUMES under an OFD write lock, which a writer's open also takes (not held while the directory is
   made; its parent is synced before the line is appended); a running writer picks new lines up when a request names
-  a path it does not know (`volume_resolve`), having resolved the client's path before `create_lock`.
+  a path it does not know (`volume_resolve`), having resolved the client's path before `create_lock`. A volume's
+  `META` holds its number (`volume=N`, 0 in the root), written by the add before its VOLUMES line (tmp, rename,
+  directory fsync) and checked at every open against the line the directory is on (`TSDB_ERR_CORRUPT` naming both):
+  the number is inside ids that clients keep, so one directory reached by two paths must not pass.
+- **Series ids** are `tsdb_sid`, a `uint64_t`: `(volume + 1) << 32 | local` (`TSDB_SID`, `TSDB_SID_VOLUME`,
+  `TSDB_SID_LOCAL`, `TSDB_SID_NONE`), so every id is in [2^32, 2^48) and 0 is never one. `local` is the index in the
+  volume's `SERIES` (below 2^31). Inside a volume only local ids exist: every file (WAL, parts, granule index,
+  `CLASSES`, `RETENTION`, `SERIES`) and the engine's per-series arrays hold the 32-bit local id, and `src/volumes.c`
+  turns an id into (volume, local) by shifting; there is no CATALOG and no table to route with. Ids are not dense:
+  never loop `0 .. tsdb_series_count() - 1` or build an id from an index; list with `tsdb_series_foreach` (or
+  `TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v) - 1)`) and find ids by name. An id with a zero volume field, bits
+  48-63 set or a volume or local number that does not exist is an unknown id (`TSDB_ERR_INVALID` for writes,
+  `TSDB_ERR_NOTFOUND` for lookups). A 32-bit variable, `%u`, Java `int`, Rust `as u32` or Python `"I"` that holds an
+  id is a bug that tests with ids above 2^32 find; row files of the benchmarks keep a u32 series NUMBER that indexes
+  the bench's table of ids, never an id. Ids are never reused and mean nothing in another database (export and
+  import name series, not ids). `tsdb_abi_version` changes when the C structs or signatures the bindings use change.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
@@ -234,11 +249,11 @@ cgroup, so `nice` does not keep your work out of its way.
   `include/tsdb.h`, the binaries and the manifests of the clients and the connector. A release is cut by
   `docs/release.md`; what 0.9.x and 1.0 promise is `docs/compatibility.md`; the notes are `CHANGELOG.md`.
   `make dist` names the tarball `tsdb-VERSION-x86_64-linux.tar.gz`.
-- The on-disk format is version 7 (`FORMAT_VERSION`; 6: a 7-bit codec kind in block headers; 7: partition keys with
+- The on-disk format is version 8 (`FORMAT_VERSION`; 6: a 7-bit codec kind in block headers; 7: partition keys with
   a class, CLASSES, zstd frames without magic and content size, the packed granule index and a 64-byte footer
-  with `index_len`): granule entries with typed, time-weighted and spread statistics, bit-packed per part
-  (about 32 bytes each), a checksum over each part's header, index and footer,
-  checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Until
+  with `index_len`; 8: no CATALOG, the volume number in each volume's META, 64-bit series ids): granule entries
+  with typed, time-weighted and spread statistics, bit-packed per part (about 32 bytes each), a checksum over each
+  part's header, index and footer, checksummed WAL, SERIES/STATES, VOLUMES and intent records. Until
   1.0 (the format freezes there; decided on 2026-10-25) older formats need not stay readable: a
   layout change bumps `FORMAT_VERSION` and goes in the changelog with a way to carry data over, and a database
   of another version is refused at open with a message that names both versions. Value blocks name their codec, so new
@@ -259,8 +274,10 @@ cgroup, so `nice` does not keep your work out of its way.
   packed inserts, 4 QUERY_BOUNDS (the server knows UTC only), 5 LTTB, 6 TWA,
   7 range delete, replace and retention, 8 the spread in bucket replies, 9
   order and limit for LTTB (and early-stopping limits on bucketed queries), 10
-  QUERY_MULTI (many series in one request, one snapshot) and CANCEL.
-  All four clients speak 10 and gate each call on the version HELLO answered;
+  QUERY_MULTI (many series in one request, one snapshot) and CANCEL, 11 u64 series
+  ids (`tsdb_sid`; QUERY_AGG and QUERY_GROUP removed; HELLO floor 11: tsdbd refuses a
+  client below 11 and a client a server below 11, `TSDB_ERR_INVALID`).
+  All four clients speak 11 and no call is gated on a version below the floor;
   the embedded bindings (Rust `Db`, Python `Db`, Java `EmbeddedDb`) have the
   same operations, and their tests compare them with tsdbd's answers.
 
