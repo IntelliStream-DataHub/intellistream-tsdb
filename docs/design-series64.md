@@ -2,8 +2,8 @@
 
 Status: design, not implemented. Branch `series64-design`, written on 2026-11-02 from main at 58456ee.
 
-The user decided on 2026-11-02 to widen series ids from 32 to 64 bits before the first release (0.9.0, not tagged
-yet), for the production target of 1 billion series over about 1000 volumes on dual-socket servers. The roadmap
+It was decided on 2026-11-02 to widen series ids from 32 to 64 bits before the first release (0.9.0, not tagged
+yet), for a target of 1 billion series over about 1000 volumes. The roadmap
 row "Series addressed by volume path and name with 64-bit ids" (docs/roadmap.md:51) and the failover design
 (docs/ha.md §5, decision D9) already sketch the id; this document turns that into a change to today's code, site by
 site, and keeps the failover parts (LOST entries, `STALE_ID`, `volumes.cache`, forwarding) out of it.
@@ -318,7 +318,7 @@ series for the life of the database, as today's global id does. (A storage rollb
 failover design's concern: LOST entries, docs/ha.md D36.)
 
 **Limits.** 2^31 - 1 series per volume, 65,535 volumes (the database directory and 65,534 more): about 1.4 x
-10^14 series. The production target, 10^9 series over 1000 volumes, is 10^6 per volume. At exhaustion:
+10^14 series. The target, 10^9 series over 1000 volumes, is 10^6 per volume. At exhaustion:
 
 - a volume whose `SERIES` holds 2^31 - 1 names refuses a new series with `TSDB_ERR_INVALID` before anything is
   written (series.c:28-30, unchanged); existing series and other volumes go on; the operator adds a volume;
@@ -653,6 +653,6 @@ and for the connector `mvn test` in connectors/pulsar. The benchmarks of §4 las
 8. **`tsdb_abi_version()`**: add it (recommended: the size check alone misses this very change), or rely on
    using the same release for the library and its bindings?
 9. **Volumes for the Pulsar sink.** The sink creates every series in the database directory (no path in its
-   SERIES requests), so the production layout of 1000 volumes needs a way for it to pick a volume per series (a
+   SERIES requests), so a layout of 1000 volumes needs a way for it to pick a volume per series (a
    mapping from topic or name prefix to a volume path in its config). Not part of this change, but it decides
-   whether lookups without a path (the slow case of §2.3) matter in production. In scope here, or a follow-up?
+   whether lookups without a path (the slow case of §2.3) matter at that size. In scope here, or a follow-up?
