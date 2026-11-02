@@ -77,7 +77,8 @@ def expect(rows):
 
 
 def series_name(i):
-    """The name of the file's series i: its sensor kind, then its index."""
+    """The name of the file's series i: its sensor kind, then its index. The file's u32 is this number, an index into
+    the table of ids; the ids themselves are 64-bit and carry the volume."""
     return f"{NAMES[i % 7]}.{i}"
 
 

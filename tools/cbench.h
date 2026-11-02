@@ -94,6 +94,10 @@ static inline void cb_report_load(const char *client, int conns, int compression
 
 /* ----------------------------------------------------- expected contents */
 
+/* One row of a bench row file (the RowBinary ClickHouse loads). s is the series NUMBER, an index into the bench's id
+ * table (sids[s] holds the tsdb_sid that tsdb_series / tsdbc_series returned for the series' name), never a tsdb id:
+ * ids are 64-bit and carry the volume. It stays 32 bits so files already generated and ClickHouse's tables do not
+ * change. */
 typedef struct rbrow {
     uint32_t s;
     int64_t t;

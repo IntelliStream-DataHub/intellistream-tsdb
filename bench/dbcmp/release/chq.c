@@ -25,6 +25,8 @@
 #include <string.h>
 #include <time.h>
 
+/* s: the series number of spec.tsv and of the RowBinary file's u32 column, an index into the bench's id table (it
+ * decides the kind: s % 7, and indexes the digests); tsdb's own ids are not used here */
 typedef struct q { char cls[8]; uint32_t s; int64_t a, b, bucket; } q;
 typedef struct bk { int64_t start; uint64_t count; double sum; float mn, mx; } bk;
 typedef struct ans { uint64_t n; double sum; int64_t first, last; float v; bk *b; size_t nb, cap; } ans;

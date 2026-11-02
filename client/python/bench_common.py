@@ -34,6 +34,16 @@ def step_ms(series):
     return STEPS[series % 7]
 
 
+NAMES = ("hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate", "flow_total")
+
+
+def series_name(s):
+    """The name tsdb-bench and tsdbc-bench give series number s. A window's series, and the u32 of a row file, are
+    such numbers: indexes into the bench's table of ids. The ids that series() returns are 64-bit and carry the
+    volume, so a benchmark looks them up by this name and indexes that table."""
+    return f"{NAMES[s % 7]}.{s}"
+
+
 def window(r, nseries, points, window_samples):
     """The next random window of a thread: (new state, series, start, end)."""
     r = mix(r)

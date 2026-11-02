@@ -10,8 +10,10 @@
 //! slices, one per connection; each connection sends batches with the
 //! many-series layout, keeping up to `--inflight` of them unacknowledged.
 //! `--compression 0` sends plain arrays; any other zstd level packs them
-//! (protocol version 3). Series `bench.<n>` are created first, outside the
-//! timing. Reports rows/s, the bytes written to the sockets per row and the CPU time of the process, in the
+//! (protocol version 3). Series `<kind>.<n>` (tsdb-bench's names, so that `tsdbc-bench verify` finds them) are
+//! created first, outside the timing. The u32 of a row is the series number, an index into the table of ids (`ids[n]`, the u64 `series`
+//! returned for series `n`); it is not a series id, which is 64-bit and carries the volume. Reports rows/s, the
+//! bytes written to the sockets per row and the CPU time of the process, in the
 //! format of tsdbc-bench (see examples/common/mod.rs).
 
 mod common;
@@ -107,7 +109,9 @@ fn main() {
     let n = rows.len() / 16;
     let max = (0..n).map(|i| row(&rows, i).0).max().unwrap_or(0);
     let mut c = Client::connect(args.addr.as_str()).expect("connect");
-    let ids: Vec<u64> = (0..=max).map(|i| c.series(&format!("bench.{i}")).expect("series")).collect();
+    let ids: Vec<u64> = (0..=max)
+        .map(|i| c.series(&format!("{}.{i}", common::NAMES[i as usize % 7])).expect("series"))
+        .collect();
 
     let (t0, cpu0) = (Instant::now(), common::cpu_s());
     let sent: u64 = std::thread::scope(|sc| {

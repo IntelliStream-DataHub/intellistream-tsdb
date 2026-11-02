@@ -22,7 +22,10 @@
  * runs, each printed, then mean, sd, min and max. OUT gets the answers of the last run, one JSON line per series:
  *   lttb: {"s":S,"t":[...],"v":[...]}      twa*: {"s":S,"b":[[start,area,covered_ms,count],...]}
  * (windows also carry "i", the window's 0-based line in TWA_SPEC, the key of the reference answers)
- * NSERIES (100) series, ids 0..NSERIES-1 as tsdbc-bench load / embq load create them.
+ * NSERIES (100) series, numbered 0..NSERIES-1 (the numbers of spec.tsv and of the RowBinary input) and named
+ * KIND.NUMBER as tsdbq / embq load create them. A series' id carries its volume in the high bits and is not its
+ * number, so the program looks the ids up by name once, into sids[], and indexes that table; the "s" of the OUT
+ * lines is the number.
  */
 #define _GNU_SOURCE
 #ifdef EMBEDDED
@@ -39,11 +42,13 @@
 
 #define MAXSERIES 1024
 static uint32_t nseries = 100;
+static const char *KIND[7] = {"hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate", "flow_total"};
+static tsdb_sid sids[MAXSERIES]; /* series number -> id */
 static int conns, mode_twa;
 static tsdb_twa_method method = TSDB_TWA_STEP;
 typedef struct pts { int64_t *t; double *v; size_t n, cap; } pts;
 typedef struct ans { pts p; tsdb_twa_bucket *b; size_t nb; } ans;
-typedef struct job { uint32_t s; int64_t a, b, interval; long line; } job; /* one request */
+typedef struct job { uint32_t s; /* series number: the index into sids[] */ int64_t a, b, interval; long line; } job; /* one request */
 static job *jobs;
 static size_t njobs;
 static ans *res;
@@ -97,11 +102,11 @@ static tsdb *db;
 /* jobs[at], ..., jobs[at + n - 1] as one QUERY_MULTI of TWA; the buckets into out[0..n) (NULL: not kept) */
 static int twa_multi(HT h, size_t at, size_t n, ans *out)
 {
-    uint32_t ss[n];
+    tsdb_sid ss[n];
     int64_t st[n], en[n], iv[n];
     for (size_t i = 0; i < n; i++) {
         const job *j = &jobs[at + i];
-        ss[i] = j->s; st[i] = j->a; en[i] = j->b; iv[i] = j->interval;
+        ss[i] = sids[j->s]; st[i] = j->a; en[i] = j->b; iv[i] = j->interval;
     }
     tsdb_multi_query m = {.kind = TSDB_MULTI_TWA, .twa = {.method = method}};
     if (jobs[at].line < 0) { /* whole range: one start, end and interval for all (the series differ only) */
@@ -154,7 +159,7 @@ static void *run(void *arg)
                 tsdb_twa_bucket *b = NULL;
                 size_t nb;
                 const job *j = &jobs[g % ng];
-                e = TWA(H, j->s, j->a, j->b, j->interval, &o, &b, &nb);
+                e = TWA(H, sids[j->s], j->a, j->b, j->interval, &o, &b, &nb);
                 free(b);
             }
             if (e) { fprintf(stderr, "request %zu: %s\n", g % ng, ERR(e)); exit(1); }
@@ -184,10 +189,10 @@ static void *run(void *arg)
         if (mode_twa) {
             free(a->b);
             a->b = NULL;
-            e = TWA(H, j->s, j->a, j->b, j->interval, &o, &a->b, &a->nb);
+            e = TWA(H, sids[j->s], j->a, j->b, j->interval, &o, &a->b, &a->nb);
         } else {
             a->p.n = 0;
-            e = LTTB(H, j->s, j->a, j->b, 1000, pts_cb, &a->p);
+            e = LTTB(H, sids[j->s], j->a, j->b, 1000, pts_cb, &a->p);
         }
         if (e) { fprintf(stderr, "series %u: %s\n", j->s, ERR(e)); exit(1); }
     }
@@ -247,6 +252,10 @@ int main(int argc, char **argv)
         jobs = calloc(nseries, sizeof *jobs);
         for (uint32_t s = 0; s < nseries; s++) jobs[njobs++] = (job){s, INT64_MIN, INT64_MAX, interval, -1};
     }
+    uint32_t nids = 0; /* the ids of the series the jobs name, by name */
+    for (size_t k = 0; k < njobs; k++)
+        if (jobs[k].s >= nids) nids = jobs[k].s + 1;
+    if (nids > MAXSERIES) { fprintf(stderr, "series %u, past %d\n", nids - 1, MAXSERIES); return 2; }
     res = calloc(njobs, sizeof *res);
     if (qps && njobs < batch) { fprintf(stderr, "%zu windows: no group of %zu\n", njobs, batch); return 1; }
 #ifdef EMBEDDED
@@ -255,6 +264,26 @@ int main(int argc, char **argv)
     tsdb_options_init(&opt);
     int rc = dir ? tsdb_open(dir, &opt, &db) : -1;
     if (rc) { fprintf(stderr, "open %s: %s\n", dir ? dir : "(TSDB_DIR unset)", dir ? tsdb_strerror(rc) : ""); return 1; }
+#endif
+#ifdef EMBEDDED
+    for (uint32_t s = 0; s < nids; s++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s.%u", KIND[s % 7], s);
+        rc = tsdb_series_lookup(db, name, &sids[s]);
+        if (rc) { fprintf(stderr, "series %s: %s\n", name, tsdb_strerror(rc)); return 1; }
+    }
+#else
+    tsdbc *c0;
+    const char *h0 = getenv("TSDB_HOST"), *p0 = getenv("TSDB_PORT");
+    int rc = tsdbc_connect(h0 ? h0 : "127.0.0.1", p0 ? atoi(p0) : 7070, &c0);
+    if (rc) { fprintf(stderr, "connect: %s\n", tsdbc_strerror(rc)); return 1; }
+    for (uint32_t s = 0; s < nids; s++) {
+        char name[64];
+        snprintf(name, sizeof name, "%s.%u", KIND[s % 7], s);
+        rc = tsdbc_series(c0, name, 0, &sids[s]);
+        if (rc) { fprintf(stderr, "series %s: %s\n", name, tsdbc_strerror(rc)); return 1; }
+    }
+    tsdbc_close(c0);
 #endif
     if (qps) {
         pthread_t th[256];

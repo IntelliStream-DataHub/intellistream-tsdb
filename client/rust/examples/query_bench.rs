@@ -50,6 +50,10 @@ fn parse() -> Result<Args, String> {
 /// One connection's queries for `seconds`; returns (queries, rows, seconds).
 fn querier(args: &Args, k: &Class, thread: usize) -> (u64, u64, f64) {
     let mut c = Client::connect(args.addr.as_str()).expect("connect");
+    // a window's series is a number, an index into this table of ids (64-bit, with the volume), found by name
+    let ids: Vec<u64> = (0..args.series)
+        .map(|i| c.series_lookup(&format!("{}.{i}", common::NAMES[i as usize % 7])).expect("series"))
+        .collect();
     let mut r = common::seed(thread);
     let (mut queries, mut rows) = (0u64, 0u64);
     let t0 = Instant::now();
@@ -57,14 +61,14 @@ fn querier(args: &Args, k: &Class, thread: usize) -> (u64, u64, f64) {
         for _ in 0..16 {
             let (s, start, end) = common::window(&mut r, args.series, args.points, k.window);
             if !k.agg {
-                c.query_raw(u64::from(s), start..end, QueryOpts::default(), |ts, _| {
+                c.query_raw(ids[s as usize], start..end, QueryOpts::default(), |ts, _| {
                     rows += ts.len() as u64;
                     ControlFlow::Continue(())
                 })
                 .expect("query");
             } else {
                 let buckets =
-                    c.query_agg(u64::from(s), start..end, k.bucket as i64 * common::step_ms(s)).expect("query");
+                    c.query_agg(ids[s as usize], start..end, k.bucket as i64 * common::step_ms(s)).expect("query");
                 rows += buckets.iter().map(|b| b.count).sum::<u64>();
             }
             queries += 1;

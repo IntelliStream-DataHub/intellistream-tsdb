@@ -116,18 +116,21 @@ public final class QueryBench {
         long queries = 0;
         BenchCommon.Window w = new BenchCommon.Window(thread);
         try (TsdbClient c = TsdbClient.connect(host, port)) {
+            long[] ids = new long[nseries]; /* series number -> id, found by name */
+            for (int s = 0; s < nseries; s++)
+                ids[s] = c.series(BenchCommon.seriesName(s), false);
             long t0 = System.nanoTime();
             long limit = (long) (seconds * 1e9);
             while (System.nanoTime() - t0 < limit) {
                 for (int i = 0; i < 16; i++) {
                     w.next(nseries, points, k.window());
                     if (!k.agg()) {
-                        c.queryRaw(w.series, w.start, w.end, (ts, v, n) -> {
+                        c.queryRaw(ids[w.series], w.start, w.end, (ts, v, n) -> {
                             rows[0] += n;
                             return true;
                         });
                     } else {
-                        for (Bucket b : c.queryAgg(w.series, w.start, w.end, k.bucket() * BenchCommon.stepMs(w.series)))
+                        for (Bucket b : c.queryAgg(ids[w.series], w.start, w.end, k.bucket() * BenchCommon.stepMs(w.series)))
                             rows[0] += b.count();
                     }
                     queries++;

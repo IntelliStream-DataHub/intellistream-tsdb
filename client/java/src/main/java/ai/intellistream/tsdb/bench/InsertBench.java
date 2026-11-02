@@ -30,8 +30,6 @@ import java.util.concurrent.atomic.AtomicReference;
  * process, in the format of tsdbc-bench ({@code BenchCommon}).
  */
 public final class InsertBench {
-    private static final String[] KINDS = {"hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate",
-        "flow_total"}; /* tools/datasets.h, as tsdbc-bench names its series */
     private static final int ROW = BenchCommon.ROW;
     private static final int INFLIGHT = 4;
 
@@ -121,7 +119,7 @@ public final class InsertBench {
         System.exit(2);
     }
 
-    /** Creates series 0 .. the largest id in the first 10M rows, as tsdbc-bench does; returns file id to id. */
+    /** Creates series 0 .. the largest number in the first 10M rows, as tsdbc-bench does; returns number to id. */
     private static long[] createSeries(ByteBuffer[] rows, long n, String host, int port) throws IOException {
         int max = 0;
         long scan = Math.min(n, 10_000_000);
@@ -130,7 +128,7 @@ public final class InsertBench {
         long[] ids = new long[max + 1];
         try (TsdbClient c = TsdbClient.connect(host, port)) {
             for (int i = 0; i <= max; i++)
-                ids[i] = c.series(KINDS[i % KINDS.length] + "." + i);
+                ids[i] = c.series(BenchCommon.seriesName(i));
         }
         return ids;
     }

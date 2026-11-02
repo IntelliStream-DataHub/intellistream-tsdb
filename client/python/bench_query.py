@@ -40,6 +40,7 @@ def querier(args, klass, thread, out, errors, pool=None):
         host, port = args.addr.rsplit(":", 1)
         _, _, agg, window, bucket = klass
         c = tsdb_client.Client(host, int(port))
+        ids = [c.series(bc.series_name(i), create=False) for i in range(args.series)]  # number -> id
         r = bc.seed(thread)
         queries = rows = 0
         t0 = time.perf_counter()
@@ -47,10 +48,10 @@ def querier(args, klass, thread, out, errors, pool=None):
             for _ in range(16):
                 r, s, start, end = bc.window(r, args.series, args.points, window)
                 if not agg:
-                    ts, _v = c.query_raw(s, start, end)
+                    ts, _v = c.query_raw(ids[s], start, end)
                     rows += len(ts)
                 else:
-                    b = c.query_agg(s, start, end, bucket * bc.step_ms(s))
+                    b = c.query_agg(ids[s], start, end, bucket * bc.step_ms(s))
                     rows += int(b.counts.sum()) if np is not None else sum(b.count)
                 queries += 1
         secs = time.perf_counter() - t0
@@ -69,6 +70,7 @@ def batch_querier(args, klass, thread, out, errors, pool):
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < args.seconds:
             r, s, start, end, interval = bc.batch(r, args.many, args.series, args.points, window, bucket)
+            s = [args.ids[i] for i in s]  # series numbers -> ids
             if not agg:
                 rows += sum(len(ts) for ts, _v in pool.query_raw_many(s, start, end))
             else:
@@ -95,6 +97,8 @@ def main():
             raise SystemExit("--many needs numpy")
         host, port = args.addr.rsplit(":", 1)
         pool = tsdb_client.Pool(host, int(port), args.pool or None)
+        with tsdb_client.Client(host, int(port)) as c0:
+            args.ids = [c0.series(bc.series_name(i), create=False) for i in range(args.series)]
 
     for klass in bc.CLASSES:
         out, errors = [], []

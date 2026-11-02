@@ -9,7 +9,9 @@ slices, one per connection (a thread each: the client releases the GIL while
 it sends); each connection sends batches with the many-series layout,
 keeping up to --inflight of them unacknowledged. --compression 0 sends plain
 arrays; any other zstd level packs them (protocol version 3). Series
-`bench.<n>` are created first, outside the timing. Reports rows/s and the
+`<kind>.<n>` (tsdb-bench's names, so that `tsdbc-bench verify` finds them) are created first, outside the
+timing. The u32 is the series number n, an index into the table of ids that series() returned (`ids[n]`); it is
+not a series id, which is 64-bit and carries the volume. Reports rows/s and the
 bytes written to the sockets per row and the CPU time of the process, in the
 format of tsdbc-bench (see bench_common.py). Uses numpy if it is installed (much
 faster to slice the file); without it, rows are unpacked in Python.
@@ -89,7 +91,7 @@ def main():
         top = max((s for s, _, _ in ROW.iter_unpack(rows)), default=0)
     host, port = args.addr.rsplit(":", 1)
     with tsdb_client.Client(host, int(port)) as c:
-        ids = [c.series(f"bench.{i}") for i in range(top + 1)]
+        ids = [c.series(bc.series_name(i)) for i in range(top + 1)]
     if np is not None:
         ids = np.array(ids, dtype=np.uint64)
 

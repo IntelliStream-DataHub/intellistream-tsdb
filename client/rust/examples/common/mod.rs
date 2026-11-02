@@ -7,6 +7,10 @@
 pub const T0: i64 = 1_704_067_200_000; // 2024-01-01
 /// Step in ms of series s: tools/datasets.h ds_info[s % 7].step_ms.
 const STEPS: [i64; 7] = [60_000, 1_000, 10_000, 10_000, 1, 1_000, 1_000];
+/// tools/datasets.h ds_info[s % 7].name: series number `s` is named `<kind>.<s>`. The number (a window's series, the
+/// u32 of a row file) is an index into the bench's table of ids; the ids themselves are 64-bit and carry the volume.
+pub const NAMES: [&str; 7] =
+    ["hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate", "flow_total"];
 
 pub struct Class {
     pub id: &'static str,

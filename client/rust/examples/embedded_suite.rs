@@ -8,7 +8,8 @@
 //! cargo run --release --features embedded --example embedded_suite -- --dir /data/emb   # queries only
 //! ```
 //!
-//! `--load FILE` reads rows of u32 series, i64 ts (ms), f32 value (16 bytes each, as
+//! `--load FILE` reads rows of u32 series (the series number, an index into the table of ids that `db.series`
+//! returns by name; not an id, which is 64-bit), i64 ts (ms), f32 value (16 bytes each, as
 //! `tsdb-bench --export` writes them) into memory first, so the timing covers the inserts but
 //! not the data generation that tsdb-bench's own "insert+generate" line includes. Like
 //! tsdb-bench, each of `--threads` writers owns a range of series and sends them time-major in

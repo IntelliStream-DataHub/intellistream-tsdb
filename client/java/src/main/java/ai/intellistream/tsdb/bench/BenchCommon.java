@@ -48,6 +48,18 @@ final class BenchCommon {
         return STEPS[series % 7];
     }
 
+    private static final String[] KINDS = {"hdd_temp", "cpu_temp", "tank_bar", "tank_psi", "vibration", "flow_rate",
+        "flow_total"}; /* tools/datasets.h */
+
+    /**
+     * The name tsdbc-bench and tsdb-bench give series number {@code s}. The u32 of a bench row file and the
+     * {@code series} of a window are such numbers, indexes into the bench's table of ids; the ids that
+     * {@code series(name)} returns are 64-bit and carry the volume.
+     */
+    static String seriesName(int s) {
+        return KINDS[s % KINDS.length] + "." + s;
+    }
+
     /** One random window of a thread: the generator state is advanced by {@link #next}. */
     static final class Window {
         long state;
@@ -93,7 +105,8 @@ final class BenchCommon {
     }
 
     /*
-     * The RowBinary file of the loads (u32 series, i64 ts, f32 value; 16 bytes a row), as tools/cbench.h's
+     * The RowBinary file of the loads (u32 series, i64 ts, f32 value; 16 bytes a row; the u32 is a series number, an
+     * index into the bench's table of ids, not a series id), as tools/cbench.h's
      * cb_file_open reads it: mapped whole and read in before the clock starts (MAP_POPULATE there, load() here), so
      * a load measures inserting, not page faults on the file. A ByteBuffer holds at most 2 GiB: 1 GiB pieces.
      */

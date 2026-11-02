@@ -7,6 +7,8 @@
  *
  * The database is opened as embq opens it (threads = DUCK_THREADS or 32, memory_limit = DUCK_MEMORY or 24GB), so
  * these timings and embq's random-window timings run under the same settings. Opening is not timed.
+ * The SQL names series by their number (the u32 `series` column, an index into the bench's id table), never by a
+ * tsdb id; duckq calls no tsdb function.
  */
 #include <duckdb.h>
 #include <math.h>

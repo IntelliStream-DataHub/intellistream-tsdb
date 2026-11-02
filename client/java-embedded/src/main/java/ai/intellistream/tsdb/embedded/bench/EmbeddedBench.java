@@ -38,7 +38,7 @@ import java.util.stream.Stream;
  *
  * <p>{@code --load} and {@code --qps} are what bench/clients/run.sh runs, as {@code tsdb-bench --load} and
  * {@code tsdb-bench --qps} (tools/cbench.h): {@code --load} removes DIR, names the series as tsdb-bench does (ids
- * equal to the file's indexes), gives each of --threads threads a contiguous slice of the file in batches of --batch
+ * found by name, the file's indexes are indexes into the table of ids), gives each of --threads threads a contiguous slice of the file in batches of --batch
  * rows, and prints a {@code RESULT kind=load client=embedded-java-fsync} (or {@code -nofsync}) line; check the
  * database with {@code tsdb-bench --dir DIR --verify FILE} afterwards. {@code --qps N} runs the three window classes
  * with N threads and cb_window's generator and seeds for --seconds each, after an untimed JIT warm-up of --warmup
@@ -60,6 +60,22 @@ public final class EmbeddedBench {
     private static int series = 100;
     private static long points = 1_000_000;
     private static int dataset = -1;
+
+    /** Series number -> series id. Ids carry the volume in their high bits and are not the numbers. */
+    private static long[] sids;
+
+    /** Fills {@link #sids} from the names the loads give: {@code s<n>} here, tsdb-bench's {@code <kind>.<n>}. */
+    private static void resolveIds(EmbeddedDb db) throws TsdbException {
+        long[] t = new long[series];
+        for (int s = 0; s < series; s++) {
+            try {
+                t[s] = db.series("s" + s, false);
+            } catch (TsdbException e) {
+                t[s] = db.series(BenchCommon.seriesName(s), false);
+            }
+        }
+        sids = t;
+    }
 
     static long stepOf(int s) {
         return STEP_MS[dataset >= 0 ? dataset : s % (KINDS.length - 1)];
@@ -138,6 +154,8 @@ public final class EmbeddedBench {
                     dataset < 0 ? "mixed" : KINDS[dataset], EmbeddedDb.simdLevel(), EmbeddedDb.librarySource());
             if (file != null)
                 load(db, file, threads, batch);
+            else
+                resolveIds(db);
             queries(db);
         }
     }
@@ -160,12 +178,11 @@ public final class EmbeddedBench {
             int nseries = 0; /* the file's highest series index + 1, as cb_expect_make */
             for (long r = 0; r < rows; r++)
                 nseries = Math.max(nseries, BenchCommon.seriesAt(m, r) + 1);
-            for (int s = 0; s < nseries; s++) {
-                long id = db.series(BenchCommon.seriesName(s));
-                if (id != s)
-                    throw new IllegalStateException("series " + BenchCommon.seriesName(s) + " got id " + id);
-            }
-            BenchCommon.warmFill(m, null, batch);
+            /* the file's u32 is the series number, an index into this table; the ids carry the volume */
+            long[] ids = new long[nseries];
+            for (int s = 0; s < nseries; s++)
+                ids[s] = db.series(BenchCommon.seriesName(s));
+            BenchCommon.warmFill(m, ids, batch);
             Thread[] th = new Thread[threads];
             Exception[] err = new Exception[1];
             double cpu0 = BenchCommon.cpuSeconds();
@@ -180,7 +197,7 @@ public final class EmbeddedBench {
                     try {
                         for (long r0 = a; r0 < b; r0 += batch) {
                             int n = (int) Math.min(batch, b - r0);
-                            BenchCommon.fill(m, r0, n, null, sv, tv, vv);
+                            BenchCommon.fill(m, r0, n, ids, sv, tv, vv);
                             db.insert(sv, tv, vv, 0, n);
                         }
                     } catch (IOException e) { /* TsdbException included */
@@ -214,6 +231,7 @@ public final class EmbeddedBench {
 
     /** tsdb-bench --qps (mode_qps, qw_loop), with QueryBench's JIT warm-up first. */
     private static void harnessQueries(EmbeddedDb db, int nt, double seconds, double warmup) throws Exception {
+        resolveIds(db);
         if (warmup > 0) {
             for (BenchCommon.Klass k : BenchCommon.CLASSES)
                 qwLoop(db, k, 0, warmup, new long[3]);
@@ -268,12 +286,12 @@ public final class EmbeddedBench {
             for (int i = 0; i < 16; i++) {
                 w.next(series, points, k.window());
                 if (!k.agg()) {
-                    db.queryRaw(w.series, w.start, w.end, (ts, v, n) -> {
+                    db.queryRaw(sids[w.series], w.start, w.end, (ts, v, n) -> {
                         rows[0] += n;
                         return true;
                     });
                 } else {
-                    for (Bucket b : db.queryAgg(w.series, w.start, w.end, k.bucket() * BenchCommon.stepMs(w.series)))
+                    for (Bucket b : db.queryAgg(sids[w.series], w.start, w.end, k.bucket() * BenchCommon.stepMs(w.series)))
                         rows[0] += b.count();
                 }
                 queries++;
@@ -285,8 +303,10 @@ public final class EmbeddedBench {
     }
 
     private static void load(EmbeddedDb db, String file, int threads, int batch) throws Exception {
+        long[] ids = new long[series]; /* the file's u32 is the series number, an index into this table */
         for (int s = 0; s < series; s++)
-            db.series("s" + s); /* ids 0 .. series-1, as tsdb-bench's */
+            ids[s] = db.series("s" + s);
+        sids = ids;
         try (FileChannel ch = FileChannel.open(Paths.get(file), StandardOpenOption.READ)) {
             long rows = ch.size() / 16;
             long batches = (rows + batch - 1) / batch;
@@ -309,7 +329,7 @@ public final class EmbeddedBench {
                             ByteBuffer m = ch.map(FileChannel.MapMode.READ_ONLY, r0 * 16, n * 16L)
                                     .order(ByteOrder.LITTLE_ENDIAN);
                             for (int i = 0, off = 0; i < n; i++, off += 16) {
-                                sv[i] = Integer.toUnsignedLong(m.getInt(off));
+                                sv[i] = ids[m.getInt(off)];
                                 tv[i] = m.getLong(off + 4);
                                 vv[i] = m.getFloat(off + 12);
                             }
@@ -345,7 +365,7 @@ public final class EmbeddedBench {
         double t0 = now();
         double[] acc = {0, 0};
         for (int s = 0; s < series; s++)
-            db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (ts, v, n) -> {
+            db.queryRaw(sids[s], Long.MIN_VALUE, Long.MAX_VALUE, (ts, v, n) -> {
                 acc[0] += n;
                 acc[1] += v[n - 1]; /* touch the data */
                 return true;
@@ -362,7 +382,7 @@ public final class EmbeddedBench {
             long rows = 0;
             long buckets = 0;
             for (int s = 0; s < series; s++) {
-                List<Bucket> b = db.queryAgg(s, Long.MIN_VALUE, Long.MAX_VALUE, aggBuckets[k] * stepOf(s));
+                List<Bucket> b = db.queryAgg(sids[s], Long.MIN_VALUE, Long.MAX_VALUE, aggBuckets[k] * stepOf(s));
                 for (Bucket x : b)
                     rows += x.count();
                 buckets += b.size();
@@ -387,7 +407,7 @@ public final class EmbeddedBench {
                 rows = 0;
                 buckets = 0;
                 for (int s = 0; s < series; s++) {
-                    List<Bucket> b = db.queryGroup(s, Long.MIN_VALUE, Long.MAX_VALUE, groups[k]);
+                    List<Bucket> b = db.queryGroup(sids[s], Long.MIN_VALUE, Long.MAX_VALUE, groups[k]);
                     for (Bucket x : b)
                         rows += x.count();
                     buckets += b.size();
@@ -433,12 +453,12 @@ public final class EmbeddedBench {
                             long start = T0 + Long.remainderUnsigned(r >>> 20, span) * step;
                             long end = start + window * step;
                             if (!agg) {
-                                db.queryRaw(s, start, end, (ts, v, n) -> {
+                                db.queryRaw(sids[s], start, end, (ts, v, n) -> {
                                     got[0] += n;
                                     return true;
                                 });
                             } else {
-                                for (Bucket b : db.queryAgg(s, start, end, bucket * step))
+                                for (Bucket b : db.queryAgg(sids[s], start, end, bucket * step))
                                     got[0] += b.count();
                             }
                             queries[seed]++;

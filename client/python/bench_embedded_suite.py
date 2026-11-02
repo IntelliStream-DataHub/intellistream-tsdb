@@ -6,7 +6,8 @@ through tsdb_client.Db (the engine in this process, no tsdbd).
         [--batch 1000000] [--threads 4] [--zstd 1] [--no-fsync]
     python bench_embedded_suite.py --dir /data/emb      # queries only
 
---load FILE reads rows of u32 series, i64 ts (ms), f32 value (16 bytes each,
+--load FILE reads rows of u32 series (the series number, an index into the table of ids that db.series
+returns by name; not an id, which is 64-bit), i64 ts (ms), f32 value (16 bytes each,
 as `tsdb-bench --export` writes them) into numpy arrays first, so the timing
 covers the inserts but not the data generation that tsdb-bench's own
 "insert+generate" line includes. Like tsdb-bench, each of --threads writers

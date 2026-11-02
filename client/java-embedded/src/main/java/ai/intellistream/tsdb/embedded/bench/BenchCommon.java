@@ -55,7 +55,7 @@ final class BenchCommon {
         return STEPS[series % (KINDS.length - 1)];
     }
 
-    /** The name tsdb-bench --load and tsdbc-bench give series s, so that ids follow the file's indexes. */
+    /** The name tsdb-bench --load and tsdbc-bench give series number s; the ids are looked up by it. */
     static String seriesName(int s) {
         return KINDS[s % (KINDS.length - 1)] + "." + Integer.toUnsignedString(s);
     }
@@ -106,7 +106,8 @@ final class BenchCommon {
     }
 
     /*
-     * The RowBinary file of the loads (u32 series, i64 ts, f32 value; 16 bytes a row), as tools/cbench.h's
+     * The RowBinary file of the loads (u32 series, i64 ts, f32 value; 16 bytes a row; the u32 is a series number, an
+     * index into the bench's table of ids, not a series id), as tools/cbench.h's
      * cb_file_open reads it: mapped whole and populated before the clock starts (MAP_POPULATE there, load() here),
      * so a load measures inserting, not page faults on the file.
      */

@@ -114,7 +114,7 @@ $(B)/test_threads: tests/test_threads.c src/internal.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
@@ -136,6 +136,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	./$(B)/test_spread
 	B=$(B) tests/test_cli_spread.sh
 	B=$(B) tests/test_cli_input.sh
+	B=$(B) tests/test_bench_export.sh
 	./$(B)/test_limits
 	./$(B)/test_small_parts
 	./$(B)/test_classes

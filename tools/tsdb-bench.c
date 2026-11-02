@@ -93,7 +93,7 @@ static void *writer(void *arg)
         uint64_t i1 = i0 + window < c->points ? i0 + window : c->points;
         for (uint64_t i = i0; i < i1; i++)
             for (uint32_t s = 0; s < ns; s++) {
-                sv[n] = sids[j->s0 + s];
+                sv[n] = j->out ? 0 : sids[j->s0 + s]; /* --export has no database, so no ids (the file keeps numbers) */
                 ds_next(&st[s], &tv[n], &vv[n]);
                 n++;
             }

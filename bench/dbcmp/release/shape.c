@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The u32 is not a tsdb series id (those are 64-bit and carry the volume): it is the series number, an index into the
+ * bench's id table, and the table below is indexed by it. */
 typedef struct { int64_t rows, dups, unordered, nans, max_gap, first, last; } shape;
 
 int main(int argc, char **argv) {
