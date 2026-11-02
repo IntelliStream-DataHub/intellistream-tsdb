@@ -351,9 +351,10 @@ global id), which 1000 volumes of 10^6 series do not reach but 3000 volumes of 2
   `names_grow`, `names_find`, `cat_add`, `cat_check`, `cat_record`, `cat_valid`, `adopt_orphans`, the CATALOG half
   of `load_layout`, and the CATALOG append in `series_make` go.
 - **Name lookups.** Names stay unique in the whole database (today's rule; see open question 2):
-  - `tsdb_series_at(name, path)` / `tsdb_series_create(.., path)`: look the name up in the named volume first (one
-    probe of that volume's own hash table, `series_get(.., create=false)`); found: done, as fast as today. Not
-    found: under `create_lock`, probe every other volume (a series found there is returned, as today: "it stays in
+  - `tsdb_series_at(name, path)` / `tsdb_series_create(.., path)`: look the name up in every volume, always in
+    volume order (one probe of each volume's own hash table, `series_get(.., create=false)`), so every call gives
+    one id even for a name that damage or a hand-made copy put in two volumes (reported once). Not found: holding
+    the name (`name_reserve`), probe every volume again (a series found there is returned, as today: "it stays in
     the volume it was created in"), else create it in the named volume with `eng_series`. A probe is one hash
     lookup in memory, so 1000 volumes cost on the order of 100 µs, next to the fsync a creation does anyway.
   - `tsdb_series(name)`, `tsdb_series_lookup(name)` without a path: the database directory first, then every volume

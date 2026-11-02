@@ -25,7 +25,7 @@
  * send the writes of ids clients hold to other series without a word.
  *
  * Names are unique in the whole database. A lookup probes the volumes' own
- * dictionaries (the named volume first when there is one); a creation probes
+ * dictionaries, always in volume order (lookup_from); a creation probes
  * every volume again while it holds its name (name_reserve), which a creation
  * of the same name waits for, so no two volumes ever hold one name. Creating a
  * series is one durable append to its volume's SERIES and touches no other
@@ -905,22 +905,26 @@ static void catch_up(tsdb *t)
         eng_series_reload(e);
 }
 
-/* Finds name in the volumes' own dictionaries, volume `first` before the others (names are unique in the whole
- * database, so the order decides only how soon the probe ends). */
-static int lookup_from(tsdb *t, const char *name, size_t first, tsdb_sid *id)
+/* Finds name in the volumes' own dictionaries, always in volume order, so every call (tsdb_series,
+ * tsdb_series_at with any path, tsdb_series_lookup) gives the same id. Names are unique in the whole database, but
+ * a name in two volumes (a SERIES copied or edited by hand, damage) would otherwise get a different id from each
+ * path asked for. When `hint` (the volume a creation names) comes after the volume the name was found in, it is
+ * probed too, and a duplicate found there is reported, once per open. */
+static int lookup_from(tsdb *t, const char *name, size_t hint, tsdb_sid *id)
 {
     pthread_rwlock_rdlock(&t->lock);
     int rc = TSDB_ERR_NOTFOUND;
-    size_t n = t->nvols;
-    if (first >= n)
-        first = 0;
-    for (size_t i = 0; i < n && rc == TSDB_ERR_NOTFOUND; i++) {
-        size_t v = i == 0 ? first : i <= first ? i - 1 : i;
-        uint32_t local;
+    size_t n = t->nvols, v;
+    uint32_t local, other;
+    for (v = 0; v < n && rc == TSDB_ERR_NOTFOUND; v++) {
         rc = eng_series_lookup(t->vols[v], name, &local);
         if (rc == 0)
             *id = TSDB_SID(v, local);
     }
+    if (rc == 0 && hint >= v && hint < n && eng_series_lookup(t->vols[hint], name, &other) == 0 &&
+        !atomic_exchange(&t->dup_logged, true))
+        fprintf(stderr, "tsdb: series \"%.200s\" is in volume %zu and in volume %zu; volume %zu's is used\n", name,
+                v - 1, hint, v - 1);
     pthread_rwlock_unlock(&t->lock);
     return rc;
 }
@@ -1116,8 +1120,7 @@ static int series_found(tsdb *t, int type, tsdb_sid id)
 
 /* Gets or creates a series. type < 0: any existing type, else created as
  * float32; otherwise an existing series must have this type. An existing name
- * stays in the volume it was created in, whatever path is asked for: the named
- * volume is probed first only because that is where it usually is. */
+ * stays in the volume it was created in, whatever path is asked for. */
 static int series_make(tsdb *t, const char *name, int type, const char *path, tsdb_sid *id)
 {
     if (!name || !*name || (type >= 0 && !type_valid(type)))

@@ -1177,6 +1177,54 @@ static void test_unique_names(const char *base)
     printf("  one name, created at once in different volumes: one series\n");
 }
 
+/* A name in two volumes cannot be created, but a SERIES copied by hand (or damage) can hold one: every call then
+ * gives the same id, whatever volume it names, and the duplicate is reported once. */
+static void test_duplicate_name(const char *base)
+{
+    char top[600], root[700], v1[800], cmd[2000], log[800], text[4096];
+    fresh(base, "voldup", top, sizeof top, root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    snprintf(log, sizeof log, "%s/stderr.txt", top);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *db = NULL;
+    OK(tsdb_open(root, &o, &db));
+    tsdb_sid id, want = TSDB_SID(0, 0);
+    uint32_t idx = 0;
+    OK(tsdb_volume_add(db, v1, &idx));
+    CHECK(idx == 1);
+    OK(tsdb_series_at(db, "dup", v1, &id));
+    CHECK(id == TSDB_SID(1, 0));
+    OK(tsdb_close(db));
+    /* the record is the first in both files, so it checks out at the same offset in the root's SERIES */
+    snprintf(cmd, sizeof cmd, "cp '%s/SERIES' '%s/SERIES'", v1, root);
+    CHECK(system(cmd) == 0);
+    OK(tsdb_open(root, &o, &db));
+    fflush(stderr);
+    int saved = dup(2), fd = open(log, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    CHECK(saved >= 0 && fd >= 0 && dup2(fd, 2) == 2);
+    CHECK(tsdb_series_lookup(db, "dup", &id) == 0 && id == want);
+    CHECK(tsdb_series_at(db, "dup", v1, &id) == 0 && id == want);
+    CHECK(tsdb_series(db, "dup", &id) == 0 && id == want);
+    CHECK(tsdb_series_create(db, "dup", TSDB_FLOAT32, v1, &id) == 0 && id == want);
+    CHECK(tsdb_series_at(db, "dup", v1, &id) == 0 && id == want);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    close(fd);
+    read_text(log, text, sizeof text);
+    int reports = 0;
+    for (const char *p = text; (p = strstr(p, "is in volume 0 and in volume 1")) != NULL; p++)
+        reports++;
+    if (reports != 1)
+        fprintf(stderr, "  duplicate reported %d times: %s\n", reports, text);
+    CHECK(reports == 1);
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  a name in two volumes (a copied SERIES) gets one id from every call, reported once\n");
+}
+
 /* A writer killed after acknowledged appends to series in several volumes: the reopen replays each volume's WAL,
  * and every id names the same series with the same rows. */
 static void test_wal_replay(const char *base)
@@ -1510,6 +1558,7 @@ int main(int argc, char **argv)
     test_add_power_loss(base, argv[0]);
     test_series_ids(base);
     test_unique_names(base);
+    test_duplicate_name(base);
     test_wal_replay(base);
 
     if (system(cmd) != 0)
