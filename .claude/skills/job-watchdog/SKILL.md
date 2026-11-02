@@ -13,7 +13,7 @@ test servers that inherited the lock's descriptor and kept it shared for hours. 
 ## 1. Look
 
 ```sh
-S=/home/olav/projects/git/tsdb/.claude/skills/subagent-economy/scripts
+S=$(git rev-parse --show-toplevel)/.claude/skills/subagent-economy/scripts   # run from inside the tsdb clone
 $S/watchdog.sh 45 'tsdb\|dbcmp'   # one line per running job of this project (the release run's cmd names dbcmp, not tsdb)
 ```
 
