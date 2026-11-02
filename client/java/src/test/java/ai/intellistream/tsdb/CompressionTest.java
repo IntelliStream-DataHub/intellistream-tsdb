@@ -24,7 +24,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
-/** Packed, zstd-compressed inserts (protocol version 3): against tsdbd, and against a fake server of any version. */
+/** Packed, zstd-compressed inserts: against tsdbd, and the frames they make, read by a fake server. */
 class CompressionTest {
     static final long T0 = TsdbClientTest.T0;
 
@@ -164,7 +164,7 @@ class CompressionTest {
     /** One received request frame. */
     record Frame(int op, ByteBuffer payload) {
         int flags() {
-            return payload.get(9) & 0xff;
+            return payload.get(5) & 0xff;
         }
     }
 
@@ -275,16 +275,71 @@ class CompressionTest {
     }
 
     @Test
-    void oldServersGetPlainArrays() throws Exception {
-        FakeServer v2 = run(2, 1);
-        assertEquals(List.of(HELLO, INSERT, INSERT, VALUES, INSERT), v2.ops(), "HELLO once, then version 1/2 ops");
-        assertEquals(Protocol.VALID, v2.frames.get(3).flags());
-        assertEquals(16 + 10 * 16 + 2, v2.frames.get(3).payload().limit(), "plain int64 layout");
+    void plainFramesCarryU64Ids() throws Exception {
+        FakeServer f = run(Protocol.VERSION, 0);
+        assertEquals(List.of(HELLO, INSERT, INSERT, VALUES, INSERT), f.ops(), "HELLO once, at connect");
+        ByteBuffer one = f.frames.get(1).payload();
+        assertEquals(16 + 100 * 12, one.limit());
+        assertEquals(100, one.getInt(0));
+        assertEquals(0, one.getInt(4));
+        assertEquals(5, one.getLong(8));
+        /* three rows, series per row: 16 + 3 * 12 = 52, padded to 56, then 3 x u64 */
+        ByteBuffer many = f.frames.get(2).payload();
+        assertEquals(56 + 24, many.limit());
+        assertEquals(3, many.getInt(0));
+        assertEquals(0, many.getInt(4));
+        assertEquals(Protocol.MANY_SERIES, many.getLong(8));
+        assertEquals(0, many.getInt(52), "padding");
+        assertEquals(List.of(5L, 6L, 5L), List.of(many.getLong(56), many.getLong(64), many.getLong(72)));
+        /* int64 with a null: the INSERT_VALUES header is n, type, flags, 0, series */
+        ByteBuffer v = f.frames.get(3).payload();
+        assertEquals(10, v.getInt(0));
+        assertEquals(ValueType.INT64.code, v.get(4));
+        assertEquals(Protocol.VALID, v.get(5));
+        assertEquals(0, v.getShort(6));
+        assertEquals(6, v.getLong(8));
+        assertEquals(16 + 10 * 16 + 2, v.limit(), "plain int64 layout");
+    }
+
+    @Test
+    void idsAboveU32GoOutWhole() throws Exception {
+        long big = 0x1_0000_0005L, wide = 0xFFFF_FFFF_0000_0001L;
+        for (int level : new int[] {0, 1}) {
+            FakeServer f = new FakeServer(Protocol.VERSION);
+            try (TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
+                c.setCompression(level);
+                c.insert(big, clock(4), readings(4));
+                c.insert(new long[] {big, wide, 7, wide}, clock(4), readings(4));
+                c.insertSeriesValues(wide, clock(4), Column.ofLongs(1, 2, 3, 4));
+                c.insertValues(new long[] {wide, 0, big, 1L << 63}, clock(4), Column.ofLongs(1, 2, 3, 4));
+            }
+            f.close();
+            ByteBuffer single = f.frames.get(1).payload(), many = f.frames.get(2).payload();
+            ByteBuffer values = f.frames.get(3).payload(), valuesMany = f.frames.get(4).payload();
+            assertEquals(big, single.getLong(8), "level " + level);
+            assertEquals(Protocol.MANY_SERIES, many.getLong(8), "level " + level);
+            assertEquals(wide, values.getLong(8), "level " + level);
+            assertEquals(Protocol.MANY_SERIES, valuesMany.getLong(8), "level " + level);
+            if (level == 0) { /* the ids follow the padded values, in full */
+                int at = 16 + 4 * 12;
+                assertEquals(List.of(big, wide, 7L, wide), List.of(many.getLong(at), many.getLong(at + 8),
+                        many.getLong(at + 16), many.getLong(at + 24)));
+                int vat = 16 + 4 * 16;
+                assertEquals(List.of(wide, 0L, big, 1L << 63), List.of(valuesMany.getLong(vat),
+                        valuesMany.getLong(vat + 8), valuesMany.getLong(vat + 16), valuesMany.getLong(vat + 24)));
+            } else { /* the packed series column is wrapping zigzag deltas, whatever the ids are */
+                ByteBuffer m = valuesMany;
+                byte[] z = new byte[m.limit() - 20];
+                m.get(20, z);
+                assertArrayEquals(PackTest.reshape(clock(4), Column.ofLongs(1, 2, 3, 4),
+                        new long[] {wide, 0, big, 1L << 63}, 0, 4), Zstd.decompress(z, m.getInt(16)));
+            }
+        }
     }
 
     @Test
     void version3ServersGetPackedFrames() throws Exception {
-        FakeServer v3 = run(3, 1);
+        FakeServer v3 = run(Protocol.VERSION, 1);
         assertEquals(List.of(HELLO, VALUES, VALUES, VALUES, INSERT), v3.ops());
         for (int i = 1; i <= 3; i++)
             assertEquals(Protocol.PACKED, v3.frames.get(i).flags() & Protocol.PACKED, "frame " + i);
@@ -293,9 +348,10 @@ class CompressionTest {
         /* the first frame decodes to exactly what was inserted */
         ByteBuffer p = v3.frames.get(1).payload();
         assertEquals(100, p.getInt(0));
-        assertEquals(5, p.getInt(4));
-        assertEquals(ValueType.FLOAT32.code, p.get(8));
-        assertEquals(0, p.getShort(10) | p.getInt(12), "reserved bytes are zero");
+        assertEquals(ValueType.FLOAT32.code, p.get(4));
+        assertEquals(Protocol.PACKED, p.get(5));
+        assertEquals(0, p.getShort(6), "reserved bytes are zero");
+        assertEquals(5, p.getLong(8));
         int rawLen = p.getInt(16);
         byte[] z = new byte[p.limit() - 20];
         p.get(20, z);
@@ -305,7 +361,7 @@ class CompressionTest {
 
         /* the many-series frame carries the series ids */
         ByteBuffer m = v3.frames.get(2).payload();
-        assertEquals(Protocol.MANY_SERIES, m.getInt(4));
+        assertEquals(Protocol.MANY_SERIES, m.getLong(8));
         byte[] mz = new byte[m.limit() - 20];
         m.get(20, mz);
         assertArrayEquals(PackTest.reshape(clock(3), Column.ofFloats(1, 2, 3), new long[] {5, 6, 5}, 0, 3),
@@ -313,20 +369,20 @@ class CompressionTest {
     }
 
     @Test
-    void levelZeroNeverAsks() throws Exception {
-        FakeServer f = run(3, 0);
-        assertEquals(List.of(INSERT, INSERT, VALUES, INSERT), f.ops(), "no HELLO, plain frames");
-        assertEquals(Protocol.VALID, f.frames.get(2).flags());
+    void levelZeroSendsPlainFrames() throws Exception {
+        FakeServer f = run(Protocol.VERSION, 0);
+        assertEquals(List.of(HELLO, INSERT, INSERT, VALUES, INSERT), f.ops(), "HELLO at connect, plain frames");
+        assertEquals(Protocol.VALID, f.frames.get(3).flags());
     }
 
     @Test
-    void helloDecidesToo() throws Exception {
-        FakeServer f = new FakeServer(2);
+    void helloAsksAgain() throws Exception {
+        FakeServer f = new FakeServer(Protocol.VERSION);
         try (TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
-            assertEquals(2, c.hello());
+            assertEquals(Protocol.VERSION, c.hello());
             c.insert(1, clock(5), readings(5));
         }
         f.close();
-        assertEquals(List.of(HELLO, INSERT), f.ops(), "the version from hello() is kept");
+        assertEquals(List.of(HELLO, HELLO, VALUES), f.ops(), "connect asks once, hello() once more");
     }
 }

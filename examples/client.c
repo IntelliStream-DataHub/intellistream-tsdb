@@ -54,7 +54,7 @@ int main(int argc, char **argv)
     tsdb_bucket *hours = NULL, *days = NULL;
     CHECK(tsdbc_connect(host, port, &c)); /* on an error, CHECK prints it and jumps to done: below */
 
-    uint32_t flow;
+    tsdb_sid flow;
     CHECK(tsdbc_series(c, "pump7.flow", 1, &flow)); /* 1: create the series if it is missing */
 
     static int64_t times[N];

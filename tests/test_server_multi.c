@@ -144,7 +144,7 @@ static size_t stride_of(tsdb_multi_kind k)
                                      : 0;
 }
 
-static void single(tsdbc *c, const tsdb_multi_query *q, size_t i, uint32_t s, one *o)
+static void single(tsdbc *c, const tsdb_multi_query *q, size_t i, tsdb_sid s, one *o)
 {
     memset(o, 0, sizeof *o);
     int64_t st = q->starts ? q->starts[i] : q->start, en = q->ends ? q->ends[i] : q->end;
@@ -196,7 +196,7 @@ static bool same(const tsdb_multi_query *q, const tsdb_series_result *r, const o
     return ok;
 }
 
-static void compare(tsdbc *c, const tsdb_multi_query *q, const uint32_t *ids, size_t n, const char *what)
+static void compare(tsdbc *c, const tsdb_multi_query *q, const tsdb_sid *ids, size_t n, const char *what)
 {
     tsdb_series_result *r = NULL;
     int rc = tsdbc_query_multi_collect(c, q, ids, n, NULL, &r);
@@ -303,7 +303,7 @@ static bool raw_frame(int fd, uint32_t *id, int32_t *st, uint32_t *ix, uint8_t *
     return read_full(fd, buf, *blen);
 }
 
-static size_t multi_frame(uint8_t *out, uint8_t op, uint8_t flags, uint32_t n, const uint32_t *ids,
+static size_t multi_frame(uint8_t *out, uint8_t op, uint8_t flags, uint32_t n, const tsdb_sid *ids,
                           const void *tmpl, size_t tlen)
 {
     memset(out, 0, 24);
@@ -313,20 +313,18 @@ static size_t multi_frame(uint8_t *out, uint8_t op, uint8_t flags, uint32_t n, c
     uint32_t tl = (uint32_t)tlen;
     memcpy(out + 16, &tl, 4);
     size_t at = 24;
-    memcpy(out + at, ids, (size_t)n * 4);
-    at += (size_t)n * 4;
-    while (at % 8)
-        out[at++] = 0;
+    memcpy(out + at, ids, (size_t)n * 8);
+    at += (size_t)n * 8;
     memcpy(out + at, tmpl, tlen);
     return at + tlen;
 }
 
-static void values_tmpl(uint8_t *t, uint32_t series, int64_t start, int64_t end)
+static void values_tmpl(uint8_t *t, tsdb_sid series, int64_t start, int64_t end)
 {
-    memset(t, 0, 29);
-    memcpy(t, &series, 4);
-    memcpy(t + 4, &start, 8);
-    memcpy(t + 12, &end, 8);
+    memset(t, 0, 33);
+    memcpy(t, &series, 8);
+    memcpy(t + 8, &start, 8);
+    memcpy(t + 16, &end, 8);
 }
 
 /* a malformed request gets the END frame alone, with INVALID and 0 answered; the connection goes on */
@@ -347,13 +345,13 @@ static void expect_end_invalid(int fd, const uint8_t *req, size_t len, const cha
     }
 }
 
-static void test_malformed(uint32_t a)
+static void test_malformed(tsdb_sid a)
 {
     int fd = raw_connect();
     uint8_t t[64], req[256];
-    uint32_t ids[2] = {a, a};
+    tsdb_sid ids[2] = {a, a};
     values_tmpl(t, TSDB_MANY_SERIES, T0, T0 + 3600000);
-    size_t len = multi_frame(req, TSDB_OP_QUERY_VALUES, 0, 2, ids, t, 29);
+    size_t len = multi_frame(req, TSDB_OP_QUERY_VALUES, 0, 2, ids, t, 33);
     uint8_t bad[256];
     memcpy(bad, req, len);
     bad[0] = TSDB_OP_QUERY_RAW;
@@ -381,12 +379,11 @@ static void test_malformed(uint32_t a)
     bad[20] = 1;
     expect_end_invalid(fd, bad, len, "the reserved u32");
     memcpy(bad, req, len);
-    bad[16] = 28;
+    bad[16] = 32;
     expect_end_invalid(fd, bad, len, "tlen short");
     expect_end_invalid(fd, req, len - 1, "length short");
     memcpy(bad, req, len);
-    bad[24 + 8] = 0; /* a padding byte would be at 32 with n = 2: none, so poke the template's series */
-    memcpy(bad + 32, &a, 4);
+    memcpy(bad + 24 + 16, &a, 8); /* the template's series, after the two ids */
     expect_end_invalid(fd, bad, len, "template names a series");
     expect_end_invalid(fd, req, 10, "header short");
     /* PER_START with a start in the template */
@@ -395,16 +392,16 @@ static void test_malformed(uint32_t a)
         memset(r2, 0, sizeof r2);
         r2[0] = TSDB_OP_QUERY_VALUES;
         r2[1] = TSDB_MULTI_PER_START;
-        uint32_t n = 2, tl = 29;
+        uint32_t n = 2, tl = 33;
         memcpy(r2 + 4, &n, 4);
         memcpy(r2 + 16, &tl, 4);
         int64_t starts[2] = {T0, T0};
         memcpy(r2 + 24, starts, 16);
-        memcpy(r2 + 40, ids, 8);
-        values_tmpl(r2 + 48, TSDB_MANY_SERIES, T0, T0 + 1000);
-        expect_end_invalid(fd, r2, 48 + 29, "PER_START with a start in the template");
-        values_tmpl(r2 + 48, TSDB_MANY_SERIES, 0, T0 + 1000);
-        raw_send(fd, 7, TSDB_OP_QUERY_MULTI, r2, 48 + 29);
+        memcpy(r2 + 40, ids, 16);
+        values_tmpl(r2 + 56, TSDB_MANY_SERIES, T0, T0 + 1000);
+        expect_end_invalid(fd, r2, 56 + 33, "PER_START with a start in the template");
+        values_tmpl(r2 + 56, TSDB_MANY_SERIES, 0, T0 + 1000);
+        raw_send(fd, 7, TSDB_OP_QUERY_MULTI, r2, 56 + 33);
         uint8_t buf[1 << 16];
         uint32_t rid, ix;
         int32_t st;
@@ -414,13 +411,18 @@ static void test_malformed(uint32_t a)
             frames++;
         CHECK(ix == TSDB_MULTI_END && st == 0 && frames == 2);
     }
-    /* one series: 4 bytes of padding after its id, which must be zero */
+    /* one series: its u64 id, then the template at once (no padding since protocol 11); a version-10 frame (u32
+     * id, 4 bytes of padding, a 29-byte template with a u32 series) is refused by its lengths */
     {
         uint8_t r1[128];
-        size_t l1 = multi_frame(r1, TSDB_OP_QUERY_VALUES, 0, 1, ids, t, 29);
-        CHECK(l1 == 32 + 29);
-        r1[29] = 1;
-        expect_end_invalid(fd, r1, l1, "nonzero padding");
+        size_t l1 = multi_frame(r1, TSDB_OP_QUERY_VALUES, 0, 1, ids, t, 33);
+        CHECK(l1 == 32 + 33);
+        uint32_t tl10 = 29, all = 0xffffffffu;
+        memcpy(r1 + 16, &tl10, 4);
+        memset(r1 + 28, 0, 4);
+        memset(r1 + 32, 0, 29);
+        memcpy(r1 + 32, &all, 4);
+        expect_end_invalid(fd, r1, 32 + 29, "a version-10 frame");
     }
     /* CANCEL of an unknown id: no reply, and the connection goes on */
     uint32_t nobody = 12345;
@@ -441,7 +443,27 @@ static void test_malformed(uint32_t a)
 
 /* ---- data ---- */
 
-static uint32_t ids[6];
+static tsdb_sid ids[6];
+
+/* Ids are u64 on the wire (protocol 11): one that differs from a stored series only above bit 31 is another,
+ * unknown series (status 0, no rows), not that one cut to 32 bits; UINT64_MAX (the template's "many") the same. */
+static void test_wide_ids(tsdbc *c)
+{
+    tsdb_sid list[4] = {ids[0], ids[0] | (1ull << 32), 0xffffffff00000000ull | ids[0], UINT64_MAX};
+    tsdb_multi_query vq = {.kind = TSDB_MULTI_VALUES, .start = T0 - 7200000, .end = T0 + 3600000,
+                           .opts = {TSDB_ASC, 0}};
+    tsdb_series_result *r = NULL;
+    CHECK(tsdbc_query_multi_collect(c, &vq, list, 4, NULL, &r) == 0);
+    CHECK(r && r[0].status == 0 && r[0].n > 0);
+    for (int i = 1; r && i < 4; i++)
+        CHECK(r[i].index == (size_t)i && r[i].series == list[i] && r[i].status == 0 && r[i].n == 0);
+    if (r)
+        tsdbc_series_results_free(r, 4);
+    tsdb_multi_query bq = {.kind = TSDB_MULTI_BUCKETS, .start = T0 - 7200000, .end = T0 + 3600000,
+                           .interval_ms = 600000, .opts = {TSDB_ASC, 0}};
+    compare(c, &bq, list, 4, "buckets of ids above 2^32");
+    compare(c, &vq, list, 4, "values of ids above 2^32");
+}
 
 static void load(tsdbc *c)
 {
@@ -481,7 +503,7 @@ static void load(tsdbc *c)
 
 static const int64_t TB = T0 + 30LL * 86400000; /* the big series: one row a millisecond from here */
 enum { BIG_ROWS = 4194304 };
-static uint32_t big_id;
+static tsdb_sid big_id;
 
 static void load_big(tsdbc *c)
 {
@@ -556,7 +578,7 @@ static bool reset_hwm(pid_t pid)
 static void test_full_frame(tsdbc *c)
 {
     const size_t full = (TSDB_MAX_FRAME - 13) / TSDB_BUCKET_ROW;
-    uint32_t two[2] = {big_id, ids[0]};
+    tsdb_sid two[2] = {big_id, ids[0]};
     tsdb_multi_query q = {.kind = TSDB_MULTI_BUCKETS, .start = TB, .end = TB + (int64_t)full, .interval_ms = 1};
     tsdb_series_result *r = NULL;
     CHECK(tsdbc_query_multi_collect(c, &q, two, 2, NULL, &r) == 0);
@@ -569,18 +591,18 @@ static void test_full_frame(tsdbc *c)
     CHECK(r && r[0].status == TSDB_ERR_TOO_MANY_BUCKETS && r[0].n == 0 && r[1].status == 0);
     tsdbc_series_results_free(r, 2);
     compare(c, &q, two, 2, "one bucket over a frame");
-    uint32_t bb[3] = {big_id, ids[1], big_id};
+    tsdb_sid bb[3] = {big_id, ids[1], big_id};
     for (int64_t rows = 16383; rows <= 32769; rows += rows == 16385 ? 32766 - 16385 : 1) {
         tsdb_multi_query v = {.kind = TSDB_MULTI_VALUES, .start = TB, .end = TB + rows, .opts = {TSDB_ASC, 0}};
         compare(c, &v, bb, 3, "values around a full chunk");
     }
 }
 
-static void raw_values_multi(int fd, uint32_t id, const uint32_t *list, uint32_t n)
+static void raw_values_multi(int fd, uint32_t id, const tsdb_sid *list, uint32_t n)
 {
-    uint8_t t[29], *req = malloc(24 + (size_t)n * 4 + 8 + 29);
+    uint8_t t[33], *req = malloc(24 + (size_t)n * 8 + 33);
     values_tmpl(t, TSDB_MANY_SERIES, INT64_MIN, INT64_MAX);
-    size_t len = multi_frame(req, TSDB_OP_QUERY_VALUES, 0, n, list, t, 29);
+    size_t len = multi_frame(req, TSDB_OP_QUERY_VALUES, 0, n, list, t, 33);
     raw_send(fd, id, TSDB_OP_QUERY_MULTI, req, len);
     free(req);
 }
@@ -621,7 +643,7 @@ static int read_to_end(int fd, uint32_t id, uint32_t *answered, uint32_t *seen)
  * and its output cap, other connections are answered at once, and --send-timeout ends the connection. */
 static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
 {
-    uint32_t list[64];
+    tsdb_sid list[64];
     for (int i = 0; i < 64; i++)
         list[i] = i % 2 ? big_id : ids[i / 2 % 5];
     long before = rss_anon_kb(pid);
@@ -667,12 +689,12 @@ static void test_stall(tsdbc *c, pid_t pid, int send_timeout_s)
 static void test_stall_small(pid_t pid)
 {
     uint32_t n = TSDB_MULTI_MAX_SERIES;
-    uint32_t *list = malloc((size_t)n * 4);
-    uint8_t t[29], *req = malloc(24 + (size_t)n * 4 + 8 + 29);
+    tsdb_sid *list = malloc((size_t)n * sizeof *list);
+    uint8_t t[33], *req = malloc(24 + (size_t)n * 8 + 33);
     for (uint32_t i = 0; i < n; i++)
         list[i] = ids[i % 5];
     values_tmpl(t, TSDB_MANY_SERIES, T0, T0 + 400000); /* about 400 rows of each */
-    size_t len = multi_frame(req, TSDB_OP_QUERY_VALUES, 0, n, list, t, 29);
+    size_t len = multi_frame(req, TSDB_OP_QUERY_VALUES, 0, n, list, t, 33);
     long before = rss_anon_kb(pid);
     int fd = raw_connect();
     raw_send(fd, 9, TSDB_OP_QUERY_MULTI, req, len);
@@ -693,22 +715,22 @@ static void test_stall_buckets(pid_t pid)
     const size_t full = (TSDB_MAX_FRAME - 13) / TSDB_BUCKET_ROW;
     const long result_kb = (long)(full * TSDB_BUCKET_ROW >> 10);
     for (int multi = 0; multi < 2; multi++) {
-        uint8_t t[44] = {0}, req[24 + 8 + 44];
-        uint32_t s = multi ? TSDB_MANY_SERIES : big_id;
+        uint8_t t[48] = {0}, req[24 + 8 + 48];
+        tsdb_sid s = multi ? TSDB_MANY_SERIES : big_id;
         int64_t start = TB, end = TB + (int64_t)full, iv = 1;
-        memcpy(t, &s, 4);
-        memcpy(t + 4, &start, 8);
-        memcpy(t + 12, &end, 8);
-        memcpy(t + 20, &iv, 8);
+        memcpy(t, &s, 8);
+        memcpy(t + 8, &start, 8);
+        memcpy(t + 16, &end, 8);
+        memcpy(t + 24, &iv, 8);
         usleep(300000); /* what the previous step freed is gone */
         long before = status_kb(pid, "RssAnon");
         bool hwm = reset_hwm(pid);
         long hwm0 = status_kb(pid, "VmHWM");
         int fd = raw_connect();
         if (multi)
-            raw_send(fd, 11, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_BUCKETS, 0, 1, &big_id, t, 44));
+            raw_send(fd, 11, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_BUCKETS, 0, 1, &big_id, t, 48));
         else
-            raw_send(fd, 11, TSDB_OP_QUERY_BUCKETS, t, 44);
+            raw_send(fd, 11, TSDB_OP_QUERY_BUCKETS, t, 48);
         usleep(2000000);
         long grown = status_kb(pid, "RssAnon") - before, peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
         fprintf(stderr, "stalled reader, a full frame of buckets (%s): server anonymous memory grew %ld KiB, "
@@ -726,12 +748,12 @@ static void test_stall_buckets(pid_t pid)
 static void test_cancel_pipeline(void)
 {
     int fd = raw_connect();
-    uint32_t a[4] = {big_id, big_id, ids[0], big_id}, b[2] = {ids[1], ids[2]};
+    tsdb_sid a[4] = {big_id, big_id, ids[0], big_id}, b[2] = {ids[1], ids[2]};
     raw_values_multi(fd, 1, a, 4);
     raw_values_multi(fd, 2, b, 2);
-    uint8_t t[29];
+    uint8_t t[33];
     values_tmpl(t, ids[0], T0, T0 + 1);
-    raw_send(fd, 3, TSDB_OP_QUERY_VALUES, t, 29);
+    raw_send(fd, 3, TSDB_OP_QUERY_VALUES, t, 33);
     uint32_t cid = 2, nobody = 77;
     raw_send(fd, 2, TSDB_OP_CANCEL, &cid, 4);
     raw_send(fd, 77, TSDB_OP_CANCEL, &nobody, 4);
@@ -743,7 +765,7 @@ static void test_cancel_pipeline(void)
     int32_t st;
     size_t bl;
     CHECK(raw_frame(fd, &rid, &st, &ix, buf, sizeof buf, &bl) && rid == 3 && st == 0 && (ix & 0xff) == 1);
-    uint32_t d[32];
+    tsdb_sid d[32];
     for (int i = 0; i < 32; i++)
         d[i] = big_id;
     raw_values_multi(fd, 4, d, 32);
@@ -756,7 +778,7 @@ static void test_cancel_pipeline(void)
     uint32_t did = 4;
     raw_send(fd, 4, TSDB_OP_CANCEL, &did, 4);
     CHECK(read_to_end(fd, 4, &answered, &seen) == TSDB_ERR_STOPPED && answered < 32);
-    raw_send(fd, 5, TSDB_OP_QUERY_VALUES, t, 29);
+    raw_send(fd, 5, TSDB_OP_QUERY_VALUES, t, 33);
     CHECK(raw_frame(fd, &rid, &st, &ix, buf, sizeof buf, &bl) && rid == 5 && st == 0);
     close(fd);
 }
@@ -803,15 +825,15 @@ static void *flood_fn(void *arg)
  * connection with 30,000 LAST_STATS queued). Queued with 30,000 LAST_STATS, then with 20,000 small multis. */
 static void test_cancel_flood(void)
 {
-    uint32_t d[32];
+    tsdb_sid d[32];
     for (int i = 0; i < 32; i++)
         d[i] = big_id;
     for (int kind = 0; kind < 2; kind++) {
         size_t nreq = kind ? 20000 : 30000, per = 0;
-        uint8_t m[128], t[29];
+        uint8_t m[128], t[33];
         if (kind) {
             values_tmpl(t, TSDB_MANY_SERIES, T0, T0 + 1);
-            per = multi_frame(m + 9, TSDB_OP_QUERY_VALUES, 0, 1, ids, t, 29);
+            per = multi_frame(m + 9, TSDB_OP_QUERY_VALUES, 0, 1, ids, t, 33);
         }
         uint8_t *fill = malloc(nreq * (9 + per));
         CHECK(fill != NULL);
@@ -860,7 +882,7 @@ static void test_cancel_flood(void)
 static void test_disconnect(tsdbc *c, pid_t pid)
 {
     long before = rss_anon_kb(pid);
-    uint32_t d[32];
+    tsdb_sid d[32];
     for (int i = 0; i < 32; i++)
         d[i] = big_id;
     for (int k = 0; k < 8; k++) {
@@ -883,7 +905,7 @@ static void test_disconnect(tsdbc *c, pid_t pid)
 }
 
 /* LAST_STATS after a QUERY_MULTI on one thread: the sums of the single requests' */
-static void test_stats(tsdbc *c, const tsdb_multi_query *q, const uint32_t *list, size_t n)
+static void test_stats(tsdbc *c, const tsdb_multi_query *q, const tsdb_sid *list, size_t n)
 {
     tsdb_query_stats sum = {0}, st;
     for (size_t i = 0; i < n; i++) {
@@ -924,7 +946,7 @@ static int stop_fn(void *ctx, const tsdb_series_result *r)
 /* every op and mode, multi against single; stopping; max_rows; LAST_STATS */
 static void run_cases(tsdbc *c)
 {
-    uint32_t list[13];
+    tsdb_sid list[13];
     size_t n = 0;
     for (int k = 0; k < 6; k++)
         list[n++] = ids[k];
@@ -1016,7 +1038,7 @@ int main(int argc, char **argv)
     pid_t pid = start_server(dir, first);
     tsdbc *c;
     OK(tsdbc_connect("127.0.0.1", port, &c));
-    CHECK(tsdbc_server_version(c) == 10);
+    CHECK(tsdbc_server_version(c) == TSDB_PROTOCOL_VERSION);
     load(c);
 
     int64_t lo = T0 - 7200000, hi = T0 + 4 * 3600000;
@@ -1034,7 +1056,7 @@ int main(int argc, char **argv)
 
     /* more than one request's worth of series: split, indexes running on */
     size_t big = TSDB_MULTI_MAX_SERIES + 3;
-    uint32_t *many = malloc(big * 4);
+    tsdb_sid *many = malloc(big * sizeof *many);
     for (size_t i = 0; i < big; i++)
         many[i] = ids[i % 6];
     tsdb_multi_query one_q = {.kind = TSDB_MULTI_BUCKETS, .start = lo, .end = hi, .opts = asc};
@@ -1045,6 +1067,7 @@ int main(int argc, char **argv)
     free(many);
 
     test_malformed(ids[0]);
+    test_wide_ids(c);
     tsdbc_close(c);
     stop_server(pid);
 

@@ -71,4 +71,48 @@ class PackTest {
         assertEquals(-1L, Pack.zigzag(Long.MIN_VALUE));
         assertEquals(1L, Pack.zigzag(-1));
     }
+
+    /** Ids in the packed series column: reshape with ids only and read the varints back (wrapping 64-bit sums). */
+    static long[] ids(long[] series) {
+        int n = series.length;
+        long[] ts = new long[n]; /* all zero: one byte each */
+        Column col = Column.ofBools(new boolean[n]); /* one plane: n bytes */
+        byte[] b = reshape(ts, col, series, 0, n);
+        int o = n + n; /* the timestamp varints, then the bool plane */
+        long[] got = new long[n];
+        long prev = 0;
+        for (int i = 0; i < n; i++) {
+            long z = 0;
+            int shift = 0;
+            for (;;) {
+                int x = b[o++] & 0xff;
+                z |= (long) (x & 0x7f) << shift;
+                if (x < 0x80)
+                    break;
+                shift += 7;
+            }
+            prev += (z >>> 1) ^ -(z & 1);
+            got[i] = prev;
+        }
+        assertEquals(b.length, o, "the series column ends the body");
+        return got;
+    }
+
+    @Test
+    void idsAcrossTwoToTheThirtyTwoBothWays() {
+        long wide = 0xFFFF_FFFF_0000_0001L;
+        long[][] cases = {
+            {0, 0x1_0000_0005L, 0, wide, -2L, 0, Long.MIN_VALUE, Long.MAX_VALUE, -2L, 5, 0xFFFF_FFFFL, 0x1_0000_0000L},
+            {-2L}, {0xFFFF_FFFFL, 0x1_0000_0000L, 0xFFFF_FFFFL}, {Long.MAX_VALUE, Long.MIN_VALUE, Long.MAX_VALUE},
+        };
+        for (long[] c : cases)
+            assertArrayEquals(c, ids(c), Arrays.toString(c));
+        /* 0 -> UINT64_MAX - 1 is the delta -2: one zigzag byte; and back, +2 */
+        byte[] b = reshape(new long[2], Column.ofBools(false, false), new long[] {-2L, 0}, 0, 2);
+        assertArrayEquals(bytes(0, 0, 0, 0, 3, 4), b);
+        /* a delta of 2^63 needs the full ten bytes: the bound has room for ten a row */
+        assertEquals(10, reshape(new long[1], Column.ofBools(false), new long[] {Long.MIN_VALUE}, 0, 1).length - 2);
+        assertEquals(1 * (10 + 1) + 10, Pack.rawBound(1, ValueType.BOOL, false, true));
+        assertEquals(1 * (10 + 4) + (1 + 7) / 8 + 10, Pack.rawBound(1, ValueType.FLOAT32, true, true));
+    }
 }

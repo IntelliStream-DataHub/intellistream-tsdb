@@ -69,8 +69,10 @@ class RequestTimeoutTest {
                 synchronized (open) {
                     open.add(in);
                 }
-                if (accepted.getAndIncrement() == 0)
-                    continue; /* stalls: read by nobody, answered by nobody */
+                if (accepted.getAndIncrement() == 0) {
+                    answerHello(in); /* the client asks at connect; every request after it stalls */
+                    continue;
+                }
                 Socket out = new Socket(InetAddress.getLoopbackAddress(), server.port);
                 synchronized (open) {
                     open.add(out);
@@ -81,6 +83,17 @@ class RequestTimeoutTest {
         } catch (IOException e) {
             /* closed */
         }
+    }
+
+    /** Reads the HELLO a client sends at connect and answers protocol 11 (u32 len, u32 id, u8 op, u32 version). */
+    private static void answerHello(Socket s) throws IOException {
+        java.io.DataInputStream in = new java.io.DataInputStream(s.getInputStream());
+        java.nio.ByteBuffer h = java.nio.ByteBuffer.allocate(9).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        in.readFully(h.array());
+        int len = h.getInt(0), id = h.getInt(4);
+        in.readFully(new byte[len - 5]);
+        s.getOutputStream().write(java.nio.ByteBuffer.allocate(17).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .putInt(13).putInt(id).put((byte) 0).putInt(0).putInt(11).array());
     }
 
     private static void pipe(Socket from, Socket to) {

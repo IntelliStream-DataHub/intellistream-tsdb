@@ -1,6 +1,5 @@
 /* Tests: codec round trips, and every query checked against a brute-force reference. */
 #include "internal.h"
-#define SK_SID tsdb_sid
 #include "samekeys.h"
 
 #include <dirent.h>

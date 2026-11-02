@@ -50,7 +50,21 @@ struct Fake {
 }
 
 impl Fake {
+    /// Answers the HELLO every connect sends (protocol 11), then behaves as `behave` says.
     fn start(behave: impl FnOnce(TcpStream, mpsc::Receiver<()>) + Send + 'static) -> Fake {
+        Fake::start_raw(|mut s, rx| {
+            let Ok((id, op)) = read_request(&mut s) else { return };
+            assert_eq!(op, 1, "the first request of a connection is HELLO");
+            let mut r = ack(id).to_vec();
+            r[0..4].copy_from_slice(&13u32.to_le_bytes());
+            r.extend_from_slice(&tsdb_client::PROTOCOL_VERSION.to_le_bytes());
+            let _ = s.write_all(&r);
+            behave(s, rx);
+        })
+    }
+
+    /// Leaves the HELLO to `behave`.
+    fn start_raw(behave: impl FnOnce(TcpStream, mpsc::Receiver<()>) + Send + 'static) -> Fake {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -96,7 +110,7 @@ fn hold(rx: mpsc::Receiver<()>) {
 
 fn connect(f: &Fake) -> Client {
     let mut c = Client::connect_with(f.addr, Some(TIMEOUT)).unwrap();
-    c.set_compression(0).unwrap(); // no HELLO before the first insert
+    c.set_compression(0).unwrap(); // plain INSERT frames
     c
 }
 
@@ -132,6 +146,16 @@ fn server_that_never_answers() {
     let t = Instant::now();
     let r = c.series("a").map(|_| ());
     assert_timed_out(&mut c, t, r);
+}
+
+#[test]
+fn server_that_never_answers_hello() {
+    let _w = watchdog();
+    let f = Fake::start_raw(|_s, rx| hold(rx));
+    let t = Instant::now();
+    let Err(e) = Client::connect_with(f.addr, Some(TIMEOUT)) else { panic!("the connect must fail") };
+    assert!(is_timeout(&e), "{e:?}");
+    assert!(t.elapsed() >= TIMEOUT - Duration::from_millis(50) && t.elapsed() < BOUND, "{:?}", t.elapsed());
 }
 
 #[test]
@@ -335,8 +359,8 @@ mod keepalive {
 
     #[test]
     fn on_by_default_with_short_probes_and_adjustable() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let s = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let f = Fake::start(|_s, rx| hold(rx)); // answers the HELLO of from_stream
+        let s = TcpStream::connect(f.addr).unwrap();
         let probe = s.try_clone().unwrap(); // shares the socket: reads its options
         let c = Client::from_stream(s).unwrap();
         let get = |n| opt(&probe, libc::IPPROTO_TCP, n);

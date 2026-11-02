@@ -228,10 +228,10 @@ compute-all-then-cut over random ranges, orders and limits, with deletes,
 retention, the memtable, a follower and merges.
 
 `tsdb_query_agg` has no options; `tsdb_query_agg_ex` adds order and limit.
-On the wire, QUERY_AGG (version 1) keeps its 32-byte rows without order or
-limit: QUERY_BUCKETS with unit 0 is the same query with both and with the
-exact int64 fields, so clients use it (`tsdbc_query_agg` already did) and no
-second form of QUERY_AGG is needed. LTTB needs every point of the range to
+On the wire, QUERY_BUCKETS with unit 0 is this query, with both and with the
+exact int64 fields; QUERY_AGG, its version-1 form with 32-byte rows and
+neither order nor limit, was removed in protocol 11 (`tsdbc_query_agg` had
+long sent QUERY_BUCKETS). LTTB needs every point of the range to
 choose, so its order and limit (`tsdb_query_lttb_ex`, QUERY_LTTB's optional
 order and limit in version 9) only reverse and cut the chosen points:
 ascending stops the callback at the limit. Descending, when the threshold

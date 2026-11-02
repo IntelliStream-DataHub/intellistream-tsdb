@@ -228,22 +228,26 @@ class TypedValuesTest {
 
     @Test
     void manySeriesFramesArePadded() throws Exception {
-        /* bools are one byte wide: the series ids after them need padding to 4 bytes */
+        /* bools are one byte wide: the u64 series ids after them need padding to 8 bytes, packed or plain */
         long a = c.seriesCreate("many.bool.a", ValueType.BOOL), b = c.seriesCreate("many.bool.b", ValueType.BOOL);
+        int keep = c.compression();
+        for (int level : new int[] {1, 0})
         for (int n = 1; n <= 9; n++) {
+            c.setCompression(level);
+            long base = T0 + (level == 0 ? 50_000_000L : 0) + n * 100_000L;
             long[] series = new long[n];
             long[] ts = new long[n];
             boolean[] v = new boolean[n];
             BitSet nulls = new BitSet();
             for (int i = 0; i < n; i++) {
                 series[i] = i % 2 == 0 ? a : b;
-                ts[i] = T0 + n * 100_000L + i;
+                ts[i] = base + i;
                 v[i] = i % 3 != 1;
             }
             nulls.set(n / 2);
             c.insertValues(series, ts, Column.ofBools(v).withNulls(nulls));
             for (long s : new long[] {a, b}) {
-                ValuePoints p = c.queryValues(s, T0 + n * 100_000L, T0 + n * 100_000L + n);
+                ValuePoints p = c.queryValues(s, base, base + n);
                 for (int j = 0, i = s == a ? 0 : 1; i < n; i += 2, j++) {
                     assertEquals(ts[i], p.timestamps()[j]);
                     assertEquals(i == n / 2, p.values().isNull(j), "n=" + n + " row " + i);
@@ -252,6 +256,7 @@ class TypedValuesTest {
                 }
             }
         }
+        c.setCompression(keep);
     }
 
     @Test

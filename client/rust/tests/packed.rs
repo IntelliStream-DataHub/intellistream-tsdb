@@ -1,6 +1,5 @@
 //! Packed, zstd-compressed inserts (protocol version 3): the server stores
-//! what it unpacks exactly as the plain arrays, the client falls back to plain
-//! arrays for older servers, and compression can be turned off.
+//! what it unpacks exactly as the plain arrays, and compression can be turned off.
 
 mod common;
 
@@ -98,7 +97,7 @@ fn packed_and_plain_store_the_same() {
     let packed_bytes = packed.bytes_sent() - before;
     let before = plain.bytes_sent();
     plain.insert_series(b, &ts, &v).unwrap();
-    assert_eq!(plain.bytes_sent() - before, (9 + 8 + n * 12) as u64); // the version 1 INSERT frame
+    assert_eq!(plain.bytes_sent() - before, (9 + 16 + n * 12) as u64); // the version 1 INSERT frame
     assert!(packed_bytes < (n * 12 / 2) as u64, "{packed_bytes} bytes packed");
     assert_eq!(
         packed.query_points(a, .., QueryOpts::asc()).unwrap(),
@@ -123,7 +122,7 @@ fn set_compression() {
     let before = c.bytes_sent();
     c.insert_values(&vec![id; n], &ts, ColumnRef::from(&v).with_validity(&valid)).unwrap();
     let body = 16 + n * 8 + n * 8 + 2; // header, ts, values, bitmap
-    assert_eq!(c.bytes_sent() - before, (9 + body.next_multiple_of(4) + n * 4) as u64);
+    assert_eq!(c.bytes_sent() - before, (9 + body.next_multiple_of(8) + n * 8) as u64);
 
     // higher and negative levels compress too, and store the same
     for (k, level) in [3, 19, -5].into_iter().enumerate() {
@@ -138,18 +137,17 @@ fn set_compression() {
 }
 
 #[test]
-fn hello_does_not_swallow_a_pending_error() {
+fn a_pipelined_failure_is_reported_by_the_next_waiting_call() {
     let srv = Server::start();
     let mut c = srv.client();
     let id = c.series("a").unwrap();
     c.set_compression(0).unwrap();
     c.insert_series_async(999_999, &[T0], &[1.0]).unwrap(); // fails on the server
     c.set_compression(1).unwrap();
-    // the first packed insert asks HELLO, which first collects that failure
+    // the connect has asked HELLO already: the packed insert is sent, and its call collects that failure
     assert_eq!(c.insert_series(id, &[T0], &[1.0]).unwrap_err().status(), Some(tsdb_client::Status::Invalid));
-    // ...and has learned the server's version anyway: later inserts go packed
     c.insert_series(id, &[T0 + 1], &[2.0]).unwrap();
-    assert_eq!(c.query_points(id, .., QueryOpts::asc()).unwrap().values, vec![2.0]);
+    assert_eq!(c.query_points(id, .., QueryOpts::asc()).unwrap().values, vec![1.0, 2.0]);
     assert_eq!(c.protocol_version().unwrap(), tsdb_client::PROTOCOL_VERSION);
 }
 
@@ -200,29 +198,23 @@ fn talk(version: u32, level: i32) -> Vec<Seen> {
 }
 
 #[test]
-fn old_servers_get_plain_arrays() {
-    let seen = talk(2, 1);
+fn level_zero_sends_plain_arrays() {
+    let seen = talk(11, 0);
     let ops: Vec<u8> = seen.iter().map(|s| s.op).collect();
-    assert_eq!(ops, vec![1, 4, 14, 4]); // HELLO once, then version 1 INSERT, plain INSERT_VALUES
-    assert_eq!(seen[2].payload[9], 0);
+    assert_eq!(ops, vec![1, 4, 14, 4]); // HELLO at connect, then version 1 INSERT, plain INSERT_VALUES
+    assert_eq!(seen[2].payload[5], 0); // flags
     assert_eq!(seen[2].payload.len(), 16 + 2 * 16);
 }
 
 #[test]
-fn level_zero_does_not_ask() {
-    let ops: Vec<u8> = talk(3, 0).iter().map(|s| s.op).collect();
-    assert_eq!(ops, vec![4, 14, 4]);
-}
-
-#[test]
 fn new_servers_get_packed_frames() {
-    let seen = talk(3, 1);
+    let seen = talk(11, 1);
     let ops: Vec<u8> = seen.iter().map(|s| s.op).collect();
     assert_eq!(ops, vec![1, 14, 14, 4]); // the float32 insert goes as packed INSERT_VALUES
     for (s, ty) in [(&seen[1], 0u8), (&seen[2], 2)] {
         let p = &s.payload;
-        assert_eq!(&p[..10], &[2, 0, 0, 0, 1, 0, 0, 0, ty, 2]); // n, series, type, PACKED
-        assert_eq!(&p[10..16], &[0; 6]);
+        assert_eq!(&p[..8], &[2, 0, 0, 0, ty, 2, 0, 0]); // n, type, PACKED, 0
+        assert_eq!(&p[8..16], &[1, 0, 0, 0, 0, 0, 0, 0]); // series
         let raw_len = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
         let raw = zstd::bulk::decompress(&p[20..], raw_len).unwrap();
         assert_eq!(raw.len(), raw_len);

@@ -1,19 +1,14 @@
 """Protocol 9 queries against a real tsdbd: the spread, time-weighted averages, LTTB, and
 aggregates with order and limit. test_embedded.py runs the same tests on a Db, and compares
-its answers with tsdbd's; the last test checks that a server older than a call's protocol
-version is not asked."""
+its answers with tsdbd's."""
 
 import math
-import socket
-import struct
-import threading
 
 import pytest
 
 import tsdb_client
 from tsdb_client import Client, TsdbError
 
-from test_zones import fake_server
 
 T0 = 1_699_999_980_000
 
@@ -149,74 +144,6 @@ def test_lttb(client):
     assert code(client.query_lttb, wave, 2) == tsdb_client.ERR_INVALID
     st = client.series_create("wave.state", "state")
     assert code(client.query_lttb, st, 10) == tsdb_client.ERR_INVALID
-
-
-@pytest.mark.parametrize("version", range(4, 9))
-def test_an_older_server_is_not_asked(version):
-    port, seen, th = fake_server(version)
-    with Client(port=port) as c:
-        calls = [
-            (5, lambda: c.query_lttb(1, 100)),
-            (6, lambda: c.query_twa(1)),
-            (6, lambda: c.query_twa_group(1, unit="hour", method="linear")),
-            (6, lambda: c.query_twa_group(1, 0, 1000, unit="day", timezone="Europe/Oslo")),
-            (6, lambda: c.query_twa_bounds(1, [0, 10])),
-            (8, lambda: c.query_spread(1)),
-            (8, lambda: c.query_spread(1, limit=0)),
-            (8, lambda: c.query_spread_group(1, unit="hour", order="desc")),
-            (8, lambda: c.query_spread_group(1, unit="day", timezone="Europe/Oslo")),
-            (8, lambda: c.query_spread_bounds(1, [0, 10])),
-            (9, lambda: c.query_lttb(1, 100, order="desc")),
-            (9, lambda: c.query_lttb(1, 100, limit=10)),
-        ]
-        for need, call in calls:
-            if version < need:
-                assert code(call) == tsdb_client.ERR_INVALID
-        assert c.protocol_version() == version  # the client is still usable
-    th.join(5)
-    assert {op for op, _ in seen} == {1}, f"version {version}: HELLO only"
-
-
-def lttb_server(version):
-    """A server of `version` that knows only the 28-byte QUERY_LTTB of versions 5 to 8: it answers that with the last
-    chunk of no points, the 37-byte form of version 9 with INVALID. Returns (port, LTTB payload lengths, thread)."""
-    lst = socket.socket()
-    lst.bind(("127.0.0.1", 0))
-    lst.listen(1)
-    lens = []
-
-    def serve():
-        s, _ = lst.accept()
-        f = s.makefile("rb")
-        while hdr := f.read(9):
-            length, rid, op = struct.unpack("<IIB", hdr)
-            payload = f.read(length - 5)
-            status, body = 0, b""
-            if op == 1:
-                body = struct.pack("<I", version)
-            elif op == 21:
-                lens.append(len(payload))
-                if len(payload) == 28:
-                    body = bytes([1, 0, 0, 0]) + struct.pack("<I", 0)  # last, FLOAT32; no points
-                else:
-                    status = tsdb_client.ERR_INVALID
-            s.sendall(struct.pack("<IIBi", 9 + len(body), rid, 0, status) + body)
-        s.close()
-        lst.close()
-
-    th = threading.Thread(target=serve, daemon=True)
-    th.start()
-    return lst.getsockname()[1], lens, th
-
-
-@pytest.mark.parametrize("version", range(5, 10))
-def test_plain_lttb_is_the_short_request(version):
-    port, lens, th = lttb_server(version)
-    with Client(port=port) as c:
-        assert c.query_lttb(1, 100, numpy=False) == ([], [])
-        assert c.query_lttb(1, 3, T0, T0 + 1000, order="asc", numpy=False) == ([], [])
-    th.join(5)
-    assert lens == [28, 28]
 
 
 def test_over_wide_local_ranges_are_too_many_buckets(client):

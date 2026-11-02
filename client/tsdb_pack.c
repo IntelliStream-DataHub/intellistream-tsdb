@@ -35,11 +35,11 @@ static inline int get_varint(const uint8_t **p, const uint8_t *end, uint64_t *x)
 
 size_t tsdb_pack_raw_bound(size_t n, unsigned type, int valid, int many)
 {
-    return n * (10 + tsdb_wire_width(type)) + (valid ? (n + 7) / 8 : 0) + (many ? n * 5 : 0);
+    return n * (10 + tsdb_wire_width(type)) + (valid ? (n + 7) / 8 : 0) + (many ? n * 10 : 0);
 }
 
 size_t tsdb_pack_reshape(size_t n, unsigned type, const int64_t *ts, const void *values, const uint8_t *valid,
-                         const uint32_t *series, uint8_t *out)
+                         const uint64_t *series, uint8_t *out)
 {
     uint8_t *o = out;
     int64_t prev = 0;
@@ -57,9 +57,9 @@ size_t tsdb_pack_reshape(size_t n, unsigned type, const int64_t *ts, const void 
         o += (n + 7) / 8;
     }
     if (series) {
-        uint32_t ps = 0;
+        uint64_t ps = 0;
         for (size_t i = 0; i < n; i++) {
-            o = put_varint(o, zigzag((int64_t)series[i] - (int64_t)ps));
+            o = put_varint(o, zigzag((int64_t)(series[i] - ps))); /* wrapping: 0 -> UINT64_MAX is -1 */
             ps = series[i];
         }
     }
@@ -67,7 +67,7 @@ size_t tsdb_pack_reshape(size_t n, unsigned type, const int64_t *ts, const void 
 }
 
 int tsdb_pack_unshape(const uint8_t *in, size_t len, size_t n, unsigned type, int valid, int many, int64_t *ts,
-                      uint8_t *values, uint8_t *valid_out, uint32_t *series)
+                      uint8_t *values, uint8_t *valid_out, uint64_t *series)
 {
     const uint8_t *p = in, *end = in + len;
     uint64_t z;
@@ -92,14 +92,12 @@ int tsdb_pack_unshape(const uint8_t *in, size_t len, size_t n, unsigned type, in
         p += vb;
     }
     if (many) {
-        int64_t ps = 0;
+        uint64_t ps = 0;
         for (size_t i = 0; i < n; i++) {
             if (!get_varint(&p, end, &z))
                 return -1;
-            ps += unzigzag(z);
-            if (ps < 0 || ps > UINT32_MAX)
-                return -1;
-            series[i] = (uint32_t)ps;
+            ps += (uint64_t)unzigzag(z); /* every u64 is an id on the wire; tsdbd refuses ones it does not know */
+            series[i] = ps;
         }
     }
     return p == end ? 0 : -1;

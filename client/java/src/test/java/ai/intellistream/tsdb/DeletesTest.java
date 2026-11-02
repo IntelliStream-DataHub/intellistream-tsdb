@@ -147,21 +147,4 @@ class DeletesTest {
         c.setRetention(id, 0);
         assertEquals(0, c.retention(id));
     }
-
-    @Test
-    void anOlderServerIsNotAsked() throws Exception {
-        for (int version : new int[] {5, 6}) {
-            try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(version)) {
-                try (TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
-                    invalid(() -> o.deleteRange(1, Long.MIN_VALUE, Long.MAX_VALUE));
-                    invalid(() -> o.replaceRange(1, T0, T0 + 1, new long[] {T0}, Column.ofLongs(1)));
-                    invalid(() -> o.setRetention(1, 1000));
-                    invalid(() -> o.retention(1));
-                    o.commit(); /* the connection is still good */
-                }
-                assertArrayEquals(new Object[] {(int) Protocol.OP_HELLO, (int) Protocol.OP_COMMIT},
-                        f.ops().toArray(), "version " + version + ": HELLO and COMMIT only");
-            }
-        }
-    }
 }

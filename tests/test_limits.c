@@ -758,8 +758,9 @@ static void test_ends(void)
 }
 
 /* At most 4 Mi buckets a query, counted between the first and the last reading in range: with 64 Mi, one
- * QUERY_AGG over two readings far apart made tsdbd allocate 1.3 GB (found by fuzz-frames, whose input is
- * tests/fuzz/frames/crash-agg-span). */
+ * QUERY_AGG over two readings far apart made tsdbd allocate 1.3 GB (found by fuzz-frames). QUERY_AGG is gone since
+ * protocol 11; tests/fuzz/frames/crash-agg-span keeps the case as two such readings and a QUERY_BUCKETS (unit 0)
+ * of some 40 million buckets between them. */
 static void test_max_buckets(void)
 {
     char dir[600];

@@ -463,8 +463,7 @@ impl Client {
                 max => max - rows,
             };
             let narrays = [m.starts.is_some(), m.ends.is_some(), per_interval.is_some()].iter().filter(|&&b| b).count();
-            let pad = (8 - (k * 4) % 8) % 8;
-            let body = 5 + MULTI_HEADER + narrays * k * 8 + k * 4 + pad + t.len();
+            let body = 5 + MULTI_HEADER + narrays * k * 8 + k * 8 + t.len();
             if body > MAX_FRAME {
                 return Err(Error::Server(Status::TooManyBuckets)); // bounds that no frame carries
             }
@@ -479,7 +478,7 @@ impl Client {
             if let Some(iv) = per_interval {
                 f.i64s(&iv[at..at + k]);
             }
-            f.sids(&series[at..at + k]).bytes(&[0u8; 8][..pad]).bytes(&t);
+            f.sids(&series[at..at + k]).bytes(&t);
             self.send()?;
             self.req.shrink();
             let stopped = self.multi_read(values, row, k, &mut rows, &mut |ix, it| sink(at + ix, it))?;
@@ -593,7 +592,7 @@ impl<'a> MultiQ<'a> {
     }
 }
 
-/// The single op's payload for series 0xffffffff, with 0 in every field a per-series array replaces.
+/// The single op's payload for series UINT64_MAX, with 0 in every field a per-series array replaces.
 /// `bounds` (non-empty) replace the bucket form of `q`.
 fn template(q: &MultiQ<'_>, m: &MultiOpts<'_>, bounds: &[i64]) -> Result<(Op, u8, Vec<u8>)> {
     let start = if m.starts.is_some() { 0 } else { q.start };
@@ -668,10 +667,8 @@ fn template(q: &MultiQ<'_>, m: &MultiOpts<'_>, bounds: &[i64]) -> Result<(Op, u8
     Ok((op, fields, t))
 }
 
-/// The per-series arrays of `m` must be as long as the series list, and every id must fit protocol 10
-/// ([`FrameBuf::sids`](crate::protocol::FrameBuf::sids) relies on it).
+/// The per-series arrays of `m` must be as long as the series list.
 fn check_multi(series: &[SeriesId], m: &MultiOpts<'_>) -> Result<()> {
-    wire_ids(series)?;
     for (what, a) in [("starts", m.starts), ("ends", m.ends)] {
         if let Some(a) = a
             && a.len() != series.len()

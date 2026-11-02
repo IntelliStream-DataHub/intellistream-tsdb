@@ -211,45 +211,80 @@ class TsdbClientTest {
         assertArrayEquals(new float[] {0, 1, 10, 11, 12, 13, 14}, p.values());
         assertThrows(IllegalArgumentException.class, () -> c.insert(id, ts, new float[3]));
         assertThrows(IndexOutOfBoundsException.class, () -> c.insert(id, ts, v, 18, 5));
-        assertThrows(IllegalArgumentException.class, () -> c.insert(0xffffffffL, ts, v)); /* the many-series marker */
+        assertThrows(IllegalArgumentException.class, () -> c.insert(-1L, ts, v)); /* the many-series marker */
         assertEquals(0, c.pending());
     }
 
     /**
-     * Protocol 10 carries 32-bit ids: a larger one is refused before anything is sent, never cut to the series of
-     * its low bits (here a real one, which must not change).
+     * Protocol 11 carries 64-bit ids: an id of 2^32 or more is sent whole and answered as an unknown series, never
+     * cut to the series of its low bits (here a real one, which must not change). All ones is the many-series marker
+     * and refused before anything is sent.
      */
     @Test
-    void idsBeyond32BitsAreRefusedNotTruncated() throws Exception {
+    void idsBeyond32BitsAreSentWholeAndUnknown() throws Exception {
         long id = c.series("wide.id");
         c.insert(id, new long[] {T0}, new float[] {1});
         long[] ts = {T0, T0 + 1000};
         float[] v = {7, 8};
-        c.queryTwa(id, T0, T0 + 1, 0, TwaOptions.step()); /* HELLO asked here, not by a refused call below */
-        for (long big : new long[] {id | 1L << 32, -1L, Long.MIN_VALUE | id}) {
+        for (long big : new long[] {id | 1L << 32, 0xFFFF_FFFF_0000_0000L | id, Long.MIN_VALUE | id, 1L << 63}) {
+            String what = Long.toUnsignedString(big);
             long sent = c.bytesSent();
-            List<Executable> calls = List.of(() -> c.insert(big, ts, v), () -> c.insertAsync(big, ts, v),
+            List<Executable> writes = List.of(() -> c.insert(big, ts, v),
                     () -> c.insert(new long[] {id, big}, ts, v),
                     () -> c.insertSeriesValues(big, ts, Column.ofFloats(v)),
-                    () -> c.insertValues(new long[] {big, id}, ts, Column.ofFloats(v)),
-                    () -> c.replaceRange(big, T0, T0 + 2000, ts, Column.ofFloats(v)),
-                    () -> c.deleteRange(big, Long.MIN_VALUE, Long.MAX_VALUE), () -> c.setRetention(big, 1),
-                    () -> c.retention(big), () -> c.seriesName(big), () -> c.seriesType(big),
-                    () -> c.state(big, "on"), () -> c.stateName(big, 1),
-                    () -> c.queryPoints(big, Long.MIN_VALUE, Long.MAX_VALUE),
-                    () -> c.queryValues(big, Long.MIN_VALUE, Long.MAX_VALUE),
-                    () -> c.queryAgg(big, Long.MIN_VALUE, Long.MAX_VALUE, 0),
-                    () -> c.queryGroup(big, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY)),
-                    () -> c.queryBounds(big, Long.MIN_VALUE, Long.MAX_VALUE, new long[] {T0}),
-                    () -> c.queryLttb(big, Long.MIN_VALUE, Long.MAX_VALUE, 10),
-                    () -> c.queryTwa(big, Long.MIN_VALUE, Long.MAX_VALUE, 0, TwaOptions.step()),
-                    () -> c.queryValuesMulti(new long[] {id, big}, Long.MIN_VALUE, Long.MAX_VALUE));
-            for (Executable call : calls)
-                assertEquals(Status.ERR_INVALID, assertThrows(TsdbException.class, call).status(),
-                        Long.toUnsignedString(big));
-            assertEquals(sent, c.bytesSent(), "nothing was sent");
-            assertEquals(0, c.pending());
+                    () -> c.insertValues(new long[] {big, id}, ts, Column.ofFloats(v)));
+            for (Executable call : writes) {
+                TsdbException e = assertThrows(TsdbException.class, call, what);
+                assertEquals(Status.ERR_INVALID, e.status(), what);
+            }
+            c.setCompression(0);
+            for (Executable call : writes) {
+                TsdbException e = assertThrows(TsdbException.class, call, what);
+                assertEquals(Status.ERR_INVALID, e.status(), what);
+            }
+            c.setCompression(1);
+            assertTrue(c.bytesSent() > sent, "the frames went out");
+            List<Executable> lookups = List.of(() -> c.seriesName(big), () -> c.seriesType(big),
+                    () -> c.state(big, "on"), () -> c.stateName(big, 1), () -> c.retention(big),
+                    () -> c.setRetention(big, 1), () -> c.deleteRange(big, Long.MIN_VALUE, Long.MAX_VALUE),
+                    () -> c.replaceRange(big, T0, T0 + 2000, ts, Column.ofFloats(v)));
+            for (Executable call : lookups) {
+                TsdbException e = assertThrows(TsdbException.class, call, what);
+                assertTrue(e.status() == Status.ERR_NOTFOUND || e.status() == Status.ERR_INVALID, what + " " + e);
+            }
+            /* reads of an unknown series have no rows (or its NOTFOUND), and never the rows of series `id` */
+            assertEquals(0, c.queryPoints(big, Long.MIN_VALUE, Long.MAX_VALUE).size(), what);
+            assertEquals(0, c.queryValues(big, Long.MIN_VALUE, Long.MAX_VALUE).size(), what);
+            assertTrue(c.queryBounds(big, Long.MIN_VALUE, Long.MAX_VALUE, new long[] {T0}).stream()
+                    .allMatch(b -> b.count() == 0), what);
+            assertEquals(0, c.queryLttb(big, Long.MIN_VALUE, Long.MAX_VALUE, 10).size(), what);
+            List<SeriesResult<ValuePoints>> multi = c.queryValuesMulti(new long[] {id, big},
+                    Long.MIN_VALUE, Long.MAX_VALUE);
+            assertEquals(1, multi.get(0).get().size(), what);
+            assertTrue(!multi.get(1).ok() || multi.get(1).get().size() == 0, what);
         }
+        long marker = Protocol.MANY_SERIES;
+        long sent = c.bytesSent();
+        List<Executable> calls = List.of(() -> c.insert(marker, ts, v), () -> c.insertAsync(marker, ts, v),
+                () -> c.insert(new long[] {id, marker}, ts, v),
+                () -> c.insertSeriesValues(marker, ts, Column.ofFloats(v)),
+                () -> c.insertValues(new long[] {marker, id}, ts, Column.ofFloats(v)),
+                () -> c.replaceRange(marker, T0, T0 + 2000, ts, Column.ofFloats(v)),
+                () -> c.deleteRange(marker, Long.MIN_VALUE, Long.MAX_VALUE), () -> c.setRetention(marker, 1),
+                () -> c.retention(marker), () -> c.seriesName(marker), () -> c.seriesType(marker),
+                () -> c.state(marker, "on"), () -> c.stateName(marker, 1),
+                () -> c.queryPoints(marker, Long.MIN_VALUE, Long.MAX_VALUE),
+                () -> c.queryValues(marker, Long.MIN_VALUE, Long.MAX_VALUE),
+                () -> c.queryAgg(marker, Long.MIN_VALUE, Long.MAX_VALUE, 0),
+                () -> c.queryGroup(marker, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY)),
+                () -> c.queryBounds(marker, Long.MIN_VALUE, Long.MAX_VALUE, new long[] {T0}),
+                () -> c.queryLttb(marker, Long.MIN_VALUE, Long.MAX_VALUE, 10),
+                () -> c.queryTwa(marker, Long.MIN_VALUE, Long.MAX_VALUE, 0, TwaOptions.step()),
+                () -> c.queryValuesMulti(new long[] {id, marker}, Long.MIN_VALUE, Long.MAX_VALUE));
+        for (Executable call : calls)
+            assertThrows(IllegalArgumentException.class, call);
+        assertEquals(sent, c.bytesSent(), "nothing was sent");
+        assertEquals(0, c.pending());
         assertArrayEquals(new float[] {1}, c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE).values());
         assertEquals("wide.id", c.seriesName(id));
     }

@@ -1,10 +1,7 @@
 """Grouping by local periods (protocol version 4): the client turns a time zone
-into bucket bounds; a server older than version 4 still gets the zone."""
+into bucket bounds."""
 
 import pathlib
-import socket
-import struct
-import threading
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -84,39 +81,3 @@ def test_query_bounds(client):
         with pytest.raises(TsdbError) as e:
             client.query_bounds(s, bad)
         assert e.value.code == tsdb_client.ERR_INVALID
-
-
-def fake_server(version):
-    """Answers HELLO with `version`, QUERY_BUCKETS with no buckets, anything
-    else with OK; returns (port, seen ops and payloads, thread)."""
-    lst = socket.socket()
-    lst.bind(("127.0.0.1", 0))
-    lst.listen(1)
-    seen = []
-
-    def serve():
-        s, _ = lst.accept()
-        f = s.makefile("rb")
-        while hdr := f.read(9):
-            length, rid, op = struct.unpack("<IIB", hdr)
-            payload = f.read(length - 5)
-            body = struct.pack("<I", version) if op == 1 else b"\0\0\0\0" if op == 18 else b""
-            s.sendall(struct.pack("<IIBi", 9 + len(body), rid, 0, 0) + body)
-            seen.append((op, payload))
-        s.close()
-        lst.close()
-
-    th = threading.Thread(target=serve, daemon=True)
-    th.start()
-    return lst.getsockname()[1], seen, th
-
-
-def test_an_older_server_gets_the_zone():
-    port, seen, th = fake_server(3)
-    with Client(port=port) as c:
-        assert c.query_group(7, 1000, 2000, unit="day", count=2, timezone=ZoneInfo("Europe/Oslo")) == []
-    th.join(5)
-    assert [op for op, _ in seen] == [1, 18]  # HELLO, QUERY_BUCKETS
-    p = seen[1][1]
-    assert struct.unpack("<IqqqBIBQH", p[:44]) == (7, 1000, 2000, 0, 4, 2, 0, 0, 11)
-    assert p[44:] == b"Europe/Oslo"

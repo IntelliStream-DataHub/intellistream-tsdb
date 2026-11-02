@@ -192,7 +192,7 @@ static bool hello(int port)
     if (tsdbc_connect("127.0.0.1", port, &c) != 0)
         return false;
     tsdbc_set_timeout(c, 2000);
-    uint32_t id;
+    tsdb_sid id;
     int rc = tsdbc_series(c, "probe", 0, &id); /* any request: NOTFOUND is an answer */
     tsdbc_close(c);
     return rc == 0 || rc == TSDB_ERR_NOTFOUND;
@@ -281,7 +281,7 @@ static uint64_t count_rows(int port, const char *name)
     if (tsdbc_connect("127.0.0.1", port, &c) != 0)
         return n;
     tsdbc_set_timeout(c, 5000);
-    uint32_t id;
+    tsdb_sid id;
     tsdb_bucket *b;
     size_t nb;
     if (tsdbc_series(c, name, 0, &id) == 0 && tsdbc_query_agg(c, id, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0) {
@@ -299,7 +299,7 @@ static int insert(int port, const char *name, int64_t k0, size_t n)
     if (tsdbc_connect("127.0.0.1", port, &c) != 0)
         return -1;
     tsdbc_set_timeout(c, 10000);
-    uint32_t id;
+    tsdb_sid id;
     int64_t *ts = malloc(n * sizeof *ts);
     float *v = malloc(n * sizeof *v);
     for (size_t i = 0; i < n; i++) {
@@ -383,16 +383,16 @@ static void test_hup_and_pipe(void)
     /* a large result, abandoned with a reset after the first bytes */
     CHECK(insert(port, "p", 0, 2000000) == 0);
     tsdbc *c;
-    uint32_t id;
+    tsdb_sid id;
     CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "p", 0, &id) == 0);
     tsdbc_close(c);
     for (int round = 0; round < 5; round++) {
         int fd = raw_connect(port);
-        uint8_t q[29] = {0};
+        uint8_t q[33] = {0};
         int64_t lo = INT64_MIN, hi = INT64_MAX;
-        memcpy(q, &id, 4);
-        memcpy(q + 4, &lo, 8);
-        memcpy(q + 12, &hi, 8);
+        memcpy(q, &id, 8);
+        memcpy(q + 8, &lo, 8);
+        memcpy(q + 16, &hi, 8);
         uint8_t h[9];
         uint32_t flen = 5 + sizeof q, rid = 1;
         memcpy(h, &flen, 4);
@@ -452,21 +452,21 @@ static void test_shutdown_with_clients(void)
     pid_t pid = start(dir, &port, NULL, NULL);
     CHECK(insert(port, "big", 0, 3000000) == 0);
     tsdbc *c;
-    uint32_t id;
+    tsdb_sid id;
     CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
     tsdbc_close(c);
     int fds[100], nfd = 0;
     for (int i = 0; i < 4; i++) { /* raw queries never read: output fills, workers block */
         int fd = raw_connect(port);
-        uint8_t f[9 + 20];
-        uint32_t flen = 25, rid = 1;
+        uint8_t f[9 + 24];
+        uint32_t flen = 29, rid = 1;
         int64_t lo = INT64_MIN, hi = INT64_MAX;
         memcpy(f, &flen, 4);
         memcpy(f + 4, &rid, 4);
         f[8] = TSDB_OP_QUERY_RAW;
-        memcpy(f + 9, &id, 4);
-        memcpy(f + 13, &lo, 8);
-        memcpy(f + 21, &hi, 8);
+        memcpy(f + 9, &id, 8);
+        memcpy(f + 17, &lo, 8);
+        memcpy(f + 25, &hi, 8);
         CHECK(write(fd, f, sizeof f) == (ssize_t)sizeof f);
         fds[nfd++] = fd;
     }
@@ -614,17 +614,17 @@ static void test_storm(void)
 }
 
 /* Asks for every row of series id in one QUERY_RAW; the reply streams in chunks. */
-static void send_query_raw(int fd, uint32_t id)
+static void send_query_raw(int fd, tsdb_sid id)
 {
-    uint8_t f[9 + 20];
-    uint32_t flen = 25, rid = 7;
+    uint8_t f[9 + 24];
+    uint32_t flen = 29, rid = 7;
     int64_t lo = INT64_MIN, hi = INT64_MAX;
     memcpy(f, &flen, 4);
     memcpy(f + 4, &rid, 4);
     f[8] = TSDB_OP_QUERY_RAW;
-    memcpy(f + 9, &id, 4);
-    memcpy(f + 13, &lo, 8);
-    memcpy(f + 21, &hi, 8);
+    memcpy(f + 9, &id, 8);
+    memcpy(f + 17, &lo, 8);
+    memcpy(f + 25, &hi, 8);
     CHECK(write(fd, f, sizeof f) == (ssize_t)sizeof f);
 }
 
@@ -692,7 +692,7 @@ static void test_slow_readers(void)
     enum { N = 3000000 };
     CHECK(insert(port, "big", 0, N) == 0);
     tsdbc *c;
-    uint32_t id = 0;
+    tsdb_sid id = 0;
     CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
     tsdbc_close(c);
 
@@ -759,7 +759,7 @@ static void test_stuck_reader_idle(void)
     enum { N = 1000000 }; /* 12 MB of reply: far beyond both socket buffers */
     CHECK(insert(port, "big", 0, N) == 0);
     tsdbc *c;
-    uint32_t id = 0;
+    tsdb_sid id = 0;
     CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
     tsdbc_close(c);
     int fd = raw_connect(port);

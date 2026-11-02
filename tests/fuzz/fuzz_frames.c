@@ -259,7 +259,7 @@ static void run_one(const uint8_t *in, size_t len)
     size_t first = len > 7 ? 7 : len, at = 0;
     uint32_t seq = 0;
     bool ok = true;
-    while (at < len && ok) {
+    while (at < len && ok && !c->eof) { /* eof: a refused HELLO, after which tsdbd reads nothing more */
         size_t take = at == 0 ? first : len - at;
         if (buf_reserve(&c->in, take) != 0)
             abort();
@@ -322,6 +322,7 @@ static void p8(fb *b, uint8_t v) { put(b, &v, 1); }
 static void p16(fb *b, uint16_t v) { put(b, &v, 2); }
 static void p32(fb *b, uint32_t v) { put(b, &v, 4); }
 static void p64(fb *b, int64_t v) { put(b, &v, 8); }
+static void psid(fb *b, uint64_t v) { put(b, &v, 8); } /* a series id (u64 since protocol 11) */
 static void pstr16(fb *b, const char *s)
 {
     p16(b, (uint16_t)strlen(s));
@@ -376,25 +377,24 @@ static void values_body(fb *b, unsigned type, uint32_t n, bool valid, bool many)
     if (valid)
         for (uint32_t i = 0; i < (n + 7) / 8; i++)
             p8(b, 0xb5);
-    if (many) { /* b holds the payload from its start: pad to 4, then a series of this type per row */
-        while (b->len % 4)
+    if (many) { /* b holds the payload from its start: pad to 8, then a series of this type per row */
+        while (b->len % 8)
             p8(b, 0);
         for (uint32_t i = 0; i < n; i++)
-            p32(b, type);
+            psid(b, type);
     }
 }
 
-static void values_header(fb *b, uint32_t n, uint32_t s, unsigned type, uint8_t flags)
+static void values_header(fb *b, uint32_t n, uint64_t s, unsigned type, uint8_t flags)
 {
     p32(b, n);
-    p32(b, s);
     p8(b, (uint8_t)type);
     p8(b, flags);
     p16(b, 0);
-    p32(b, 0);
+    psid(b, s);
 }
 
-/* A QUERY_MULTI payload (version 10): header, the arrays its flags ask for, the series, padding, the template t
+/* A QUERY_MULTI payload (version 11): header, the arrays its flags ask for, the series, the template t
  * (an inner op's payload with series TSDB_MANY_SERIES). */
 static void multi_payload(fb *p, uint8_t op, uint8_t flags, uint16_t threads, uint32_t n, uint64_t max_rows,
                           const fb *t)
@@ -410,10 +410,8 @@ static void multi_payload(fb *p, uint8_t op, uint8_t flags, uint16_t threads, ui
         if (flags & (1 << a))
             for (uint32_t i = 0; i < n; i++)
                 p64(p, a == 0 ? (int64_t)i * 1000 : a == 1 ? 900000 - (int64_t)i * 1000 : 10000 * (int64_t)(i + 1));
-    for (uint32_t i = 0; i < n; i++)
-        p32(p, i == 2 ? 77 : i % 5); /* 77: unknown */
-    while (p->len % 8)
-        p8(p, 0);
+    for (uint32_t i = 0; i < n; i++) /* 77 and 2^32 + 1: unknown (not series 1) */
+        psid(p, i == 2 ? 77 : i == 4 ? 0x100000001ull : i % 5);
     put(p, t->p, t->len);
 }
 
@@ -433,10 +431,13 @@ static int cmd_seeds(const char *dir)
     SEED("series-lookup", TSDB_OP_SERIES, (p8(&p, 0), pstr16(&p, "f32")));
     SEED("series-create", TSDB_OP_SERIES, (p8(&p, 1), pstr16(&p, "new")));
     SEED("series-path", TSDB_OP_SERIES, (p8(&p, 1), pstr16(&p, "vol"), pstr16(&p, "vol1")));
-    SEED("series-name", TSDB_OP_SERIES_NAME, p32(&p, 2));
+    SEED("hello-10", TSDB_OP_HELLO, p32(&p, 10)); /* refused: the connection reads nothing more */
+    SEED("series-name", TSDB_OP_SERIES_NAME, psid(&p, 2));
+    SEED("series-name-id64", TSDB_OP_SERIES_NAME, psid(&p, 0x100000002ull)); /* unknown, not series 2 */
     SEED("insert", TSDB_OP_INSERT, ({
              p32(&p, 3);
              p32(&p, 0);
+             psid(&p, 0);
              for (int i = 0; i < 3; i++)
                  p64(&p, 300000 + i);
              for (int i = 0; i < 3; i++) {
@@ -445,35 +446,29 @@ static int cmd_seeds(const char *dir)
              }
          }));
     SEED("insert-many", TSDB_OP_INSERT, ({
-             p32(&p, 2);
-             p32(&p, TSDB_MANY_SERIES);
+             p32(&p, 3);
+             p32(&p, 0);
+             psid(&p, TSDB_MANY_SERIES);
              p64(&p, 7);
              p64(&p, 8);
-             float v[2] = {1, 2};
-             put(&p, v, 8);
-             p32(&p, 0);
-             p32(&p, 0);
+             p64(&p, 9);
+             float v[3] = {1, 2, 3};
+             put(&p, v, 12);
+             p32(&p, 0); /* to a multiple of 8 */
+             psid(&p, 0);
+             psid(&p, 0);
+             psid(&p, 0);
          }));
-    SEED("query-raw", TSDB_OP_QUERY_RAW, (p32(&p, 0), p64(&p, 0), p64(&p, 1000000)));
-    SEED("query-raw-ex", TSDB_OP_QUERY_RAW, (p32(&p, 0), p64(&p, 0), p64(&p, 1000000), p8(&p, 1), p64(&p, 10)));
-    SEED("query-agg", TSDB_OP_QUERY_AGG, (p32(&p, 0), p64(&p, 0), p64(&p, 1000000), p64(&p, 10000)));
-    SEED("query-group", TSDB_OP_QUERY_GROUP, ({
-             p32(&p, 0);
-             p64(&p, 0);
-             p64(&p, 100000000);
-             p8(&p, 1); /* a calendar unit */
-             p32(&p, 1);
-             p8(&p, 0);
-             p64(&p, 0);
-             pstr16(&p, "UTC");
-         }));
+    SEED("query-raw", TSDB_OP_QUERY_RAW, (psid(&p, 0), p64(&p, 0), p64(&p, 1000000)));
+    SEED("query-raw-ex", TSDB_OP_QUERY_RAW, (psid(&p, 0), p64(&p, 0), p64(&p, 1000000), p8(&p, 1), p64(&p, 10)));
+    SEED("query-raw-id64", TSDB_OP_QUERY_RAW, (psid(&p, 0x100000000ull), p64(&p, 0), p64(&p, 1000000)));
     SEED("commit", TSDB_OP_COMMIT, (void)0);
     SEED("flush", TSDB_OP_FLUSH, (void)0);
     SEED("optimize", TSDB_OP_OPTIMIZE, (void)0);
     SEED("stats", TSDB_OP_STATS, (void)0);
     SEED("series-create-typed", TSDB_OP_SERIES_CREATE, (p8(&p, 2), pstr16(&p, "i"), p16(&p, 0)));
     SEED("series-create-path", TSDB_OP_SERIES_CREATE, (p8(&p, 1), pstr16(&p, "d"), pstr16(&p, "vol2")));
-    SEED("series-type", TSDB_OP_SERIES_TYPE, p32(&p, 1));
+    SEED("series-type", TSDB_OP_SERIES_TYPE, psid(&p, 1));
     for (unsigned t = 0; t <= TSDB_STATE; t++) {
         char name[64];
         snprintf(name, sizeof name, "insert-values-%u", t);
@@ -493,9 +488,10 @@ static int cmd_seeds(const char *dir)
             uint32_t n = 20;
             int64_t ts[20];
             uint8_t vals[20 * 8] = {0}, valid[3] = {0xff, 0x7f, 0x0f};
-            uint32_t series[20];
-            for (uint32_t i = 0; i < n; i++)
-                ts[i] = 50000 + 10 * i, series[i] = t, vals[i * tsdb_wire_width(t)] = (uint8_t)(t == 4 ? 0 : i);
+            uint64_t series[20];
+            for (uint32_t i = 0; i < n; i++) /* float32: ids across 2^32 and back, and to UINT64_MAX - 1 (unknown) */
+                ts[i] = 50000 + 10 * i, series[i] = t || i < 7 || i > 9 ? t : i == 7 ? 0x100000005ull : UINT64_MAX - 1,
+                vals[i * tsdb_wire_width(t)] = (uint8_t)(t == 4 ? 0 : i);
             size_t bound = tsdb_pack_raw_bound(n, t, 1, many);
             uint8_t *raw = malloc(bound), *z = malloc(ZSTD_compressBound(bound));
             size_t rl = tsdb_pack_reshape(n, t, ts, vals, valid, many ? series : NULL, raw);
@@ -510,13 +506,13 @@ static int cmd_seeds(const char *dir)
             free(z);
         }
     }
-    SEED("query-values", TSDB_OP_QUERY_VALUES, (p32(&p, 1), p64(&p, 0), p64(&p, 1000000)));
-    SEED("query-values-ex", TSDB_OP_QUERY_VALUES, (p32(&p, 2), p64(&p, 0), p64(&p, 1000000), p8(&p, 1), p64(&p, 3)));
-    SEED("state", TSDB_OP_STATE, (p32(&p, 4), p8(&p, 1), pstr16(&p, "off")));
-    SEED("state-lookup", TSDB_OP_STATE, (p32(&p, 4), p8(&p, 0), pstr16(&p, "on")));
-    SEED("state-name", TSDB_OP_STATE_NAME, (p32(&p, 4), p32(&p, 1)));
+    SEED("query-values", TSDB_OP_QUERY_VALUES, (psid(&p, 1), p64(&p, 0), p64(&p, 1000000)));
+    SEED("query-values-ex", TSDB_OP_QUERY_VALUES, (psid(&p, 2), p64(&p, 0), p64(&p, 1000000), p8(&p, 1), p64(&p, 3)));
+    SEED("state", TSDB_OP_STATE, (psid(&p, 4), p8(&p, 1), pstr16(&p, "off")));
+    SEED("state-lookup", TSDB_OP_STATE, (psid(&p, 4), p8(&p, 0), pstr16(&p, "on")));
+    SEED("state-name", TSDB_OP_STATE_NAME, (psid(&p, 4), p32(&p, 1)));
     SEED("query-buckets", TSDB_OP_QUERY_BUCKETS, ({
-             p32(&p, 0);
+             psid(&p, 0);
              p64(&p, 0);
              p64(&p, 1000000);
              p64(&p, 20000);
@@ -527,7 +523,7 @@ static int cmd_seeds(const char *dir)
              p16(&p, 0);
          }));
     SEED("query-buckets-spread", TSDB_OP_QUERY_BUCKETS, ({
-             p32(&p, 0);
+             psid(&p, 0);
              p64(&p, 0);
              p64(&p, 1000000);
              p64(&p, 0);
@@ -540,7 +536,7 @@ static int cmd_seeds(const char *dir)
          }));
     SEED("last-stats", TSDB_OP_LAST_STATS, (void)0);
     SEED("query-bounds", TSDB_OP_QUERY_BOUNDS, ({
-             p32(&p, 0);
+             psid(&p, 0);
              p64(&p, 0);
              p64(&p, 1000000);
              p8(&p, 0);
@@ -551,7 +547,7 @@ static int cmd_seeds(const char *dir)
              p64(&p, 100000);
          }));
     SEED("query-bounds-spread", TSDB_OP_QUERY_BOUNDS, ({
-             p32(&p, 1);
+             psid(&p, 1);
              p64(&p, 0);
              p64(&p, 1000000);
              p8(&p, 1);
@@ -561,14 +557,14 @@ static int cmd_seeds(const char *dir)
              p64(&p, 50000);
              p8(&p, TSDB_SPREAD);
          }));
-    SEED("query-lttb", TSDB_OP_QUERY_LTTB, (p32(&p, 0), p64(&p, 0), p64(&p, 1000000), p64(&p, 10)));
+    SEED("query-lttb", TSDB_OP_QUERY_LTTB, (psid(&p, 0), p64(&p, 0), p64(&p, 1000000), p64(&p, 10)));
     SEED("query-lttb-ex", TSDB_OP_QUERY_LTTB,
-         (p32(&p, 0), p64(&p, 0), p64(&p, 1000000), p64(&p, 10), p8(&p, 1), p64(&p, 4)));
+         (psid(&p, 0), p64(&p, 0), p64(&p, 1000000), p64(&p, 10), p8(&p, 1), p64(&p, 4)));
     for (int form = 0; form < 3; form++) {
         char name[64];
         snprintf(name, sizeof name, "query-twa-%d", form);
         SEED(name, TSDB_OP_QUERY_TWA, ({
-                 p32(&p, 0);
+                 psid(&p, 0);
                  p64(&p, 0);
                  p64(&p, 1000000);
                  p8(&p, (uint8_t)(form & 1)); /* method */
@@ -590,7 +586,7 @@ static int cmd_seeds(const char *dir)
      * pieces (OUT_PIECE) with the output drained between them (OUT_CAP); alone and as one series of a QUERY_MULTI */
     for (int multi = 0; multi < 2; multi++) {
         fb t = {0};
-        p32(&t, multi ? TSDB_MANY_SERIES : 0);
+        psid(&t, multi ? TSDB_MANY_SERIES : 0);
         p64(&t, 0);
         p64(&t, 200000);
         p8(&t, 0), p8(&t, 0), p8(&t, 0), p8(&t, 0);
@@ -634,7 +630,7 @@ static int cmd_seeds(const char *dir)
                  pi = mq[k].flags & TSDB_MULTI_PER_INTERVAL;
             int form = mq[k].form;
             t.len = 0;
-            p32(&t, TSDB_MANY_SERIES);
+            psid(&t, TSDB_MANY_SERIES);
             p64(&t, ps ? 0 : 0);
             p64(&t, pe ? 0 : 1000000);
             switch (mq[k].op) {
@@ -675,7 +671,7 @@ static int cmd_seeds(const char *dir)
         /* a QUERY_MULTI, a second one cancelled while queued, a CANCEL of nobody, then a query */
         f.len = p.len = 0;
         t.len = 0;
-        p32(&t, TSDB_MANY_SERIES), p64(&t, 0), p64(&t, 1000000), p8(&t, 0), p64(&t, 0);
+        psid(&t, TSDB_MANY_SERIES), p64(&t, 0), p64(&t, 1000000), p8(&t, 0), p64(&t, 0);
         multi_payload(&p, TSDB_OP_QUERY_VALUES, 0, 0, 3, 0, &t);
         frame(&f, TSDB_OP_QUERY_MULTI, &p);
         frame(&f, TSDB_OP_QUERY_MULTI, &p);
@@ -689,9 +685,10 @@ static int cmd_seeds(const char *dir)
         seed_write(dir, "multi-cancel", &f);
         free(t.p);
     }
-    SEED("delete-range", TSDB_OP_DELETE_RANGE, (p32(&p, 0), p32(&p, 0), p64(&p, 10000), p64(&p, 20000)));
-    SEED("set-retention", TSDB_OP_SET_RETENTION, (p32(&p, 1), p32(&p, 0), p64(&p, 86400000)));
-    SEED("get-retention", TSDB_OP_GET_RETENTION, p32(&p, 1));
+    SEED("delete-range", TSDB_OP_DELETE_RANGE, (psid(&p, 0), p64(&p, 10000), p64(&p, 20000)));
+    SEED("delete-range-id64", TSDB_OP_DELETE_RANGE, (psid(&p, 0x100000000ull), p64(&p, 10000), p64(&p, 20000)));
+    SEED("set-retention", TSDB_OP_SET_RETENTION, (psid(&p, 1), p64(&p, 86400000)));
+    SEED("get-retention", TSDB_OP_GET_RETENTION, psid(&p, 1));
     /* a pipeline: several requests in one input */
     f.len = 0;
     p.len = 0;
@@ -702,7 +699,7 @@ static int cmd_seeds(const char *dir)
     values_body(&p, 1, 4, false, false);
     frame(&f, TSDB_OP_INSERT_VALUES, &p);
     p.len = 0;
-    p32(&p, 1), p64(&p, 0), p64(&p, 1000000);
+    psid(&p, 1), p64(&p, 0), p64(&p, 1000000);
     frame(&f, TSDB_OP_QUERY_VALUES, &p);
     frame(&f, TSDB_OP_LAST_STATS, &(fb){0});
     seed_write(dir, "pipeline", &f);

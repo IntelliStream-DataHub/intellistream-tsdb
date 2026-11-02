@@ -51,9 +51,9 @@ mut("M3", "server loses the acknowledgement of every 61st values insert (a dropp
     ["c"], "matrix", hang=True)
 mut("M4", "Java client sends limit + 1 for raw queries (off by one in limits)",
     "client/java/src/main/java/ai/intellistream/tsdb/TsdbClient.java",
-    "begin(Protocol.OP_QUERY_RAW, opts ? 29 : 20);\n        out.putInt(wire).putLong(start).putLong(end);\n"
+    "begin(Protocol.OP_QUERY_RAW, opts ? 33 : 24);\n        out.putLong(series).putLong(start).putLong(end);\n"
     "        if (opts)\n            out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);",
-    "begin(Protocol.OP_QUERY_RAW, opts ? 29 : 20);\n        out.putInt(wire).putLong(start).putLong(end);\n"
+    "begin(Protocol.OP_QUERY_RAW, opts ? 33 : 24);\n        out.putLong(series).putLong(start).putLong(end);\n"
     "        if (opts)\n            out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit > 0 ? limit + 1 : 0);",
     ["java"], "matrix")
 mut("M5", "server mixes up two fields of a bucket reply (min and max swapped): all clients agree, the engine does not",

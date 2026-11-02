@@ -53,7 +53,7 @@ static void *loader(void *arg)
         die("connect", rc);
     if ((rc = tsdbc_set_compression(c, compression)) != 0)
         die("compression", rc);
-    uint32_t *s = malloc(batch * 4);
+    tsdb_sid *s = malloc(batch * sizeof *s);
     int64_t *t = malloc(batch * 8);
     float *v = malloc(batch * 4);
     int inflight = 0;
@@ -100,7 +100,7 @@ static int load(const char *path)
         die("connect", rc);
     for (uint32_t i = 0; i <= maxs; i++) {
         char name[64];
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
         if ((rc = tsdbc_series(c, name, 1, &id)) != 0)
             die("series", rc);
@@ -202,7 +202,7 @@ static int count_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
     return 0;
 }
 
-static void next_window(uint64_t *r, const cb_class *k, uint32_t *s, int64_t *start, int64_t *end)
+static void next_window(uint64_t *r, const cb_class *k, tsdb_sid *s, int64_t *start, int64_t *end)
 {
     if (k->window == 0) { /* the whole range of a random series */
         *r = ds_mix(*r);
@@ -211,7 +211,9 @@ static void next_window(uint64_t *r, const cb_class *k, uint32_t *s, int64_t *st
         *end = INT64_MAX;
         return;
     }
-    cb_window(r, nseries, points, k->window, s, start, end);
+    uint32_t s32;
+    cb_window(r, nseries, points, k->window, &s32, start, end);
+    *s = s32;
 }
 
 typedef struct multi_ctx {
@@ -254,12 +256,12 @@ static void *querier(void *arg)
     tsdb_twa_opts twa = {.method = TSDB_TWA_STEP};
     int use_multi = multi_k >= 2 || (multi_k == 1 && multi_one);
     int kk = use_multi ? multi_k : 1;
-    uint32_t *ss = malloc((size_t)kk * sizeof *ss);
+    tsdb_sid *ss = malloc((size_t)kk * sizeof *ss);
     int64_t *st = malloc((size_t)kk * 3 * sizeof *st), *en = st + kk, *iv = en + kk;
     double t0 = now_s();
     while (now_s() - t0 < seconds) {
         for (int k = 0; k < 16; k++) {
-            uint32_t s;
+            tsdb_sid s;
             int64_t start, end;
             if (use_multi) {
                 for (int i = 0; i < kk; i++) {

@@ -178,18 +178,23 @@ def test_errors(server, client):
     assert e.value.code == tsdb_client.ERR_INVALID
     assert str(e.value) == "server error -4: invalid argument"
     assert tsdb_client.strerror(tsdb_client.ERR_NOTFOUND) == "not found"
-    # ids are 64 bits; protocol 10 carries 32, so a larger id is refused before sending, never truncated onto
-    # another series (a + 2**32 would land on a)
+    # ids are 64 bits on the wire (protocol 11): an id above 2**32 goes out whole and tsdbd, which hands out none yet,
+    # does not know it. It is never taken for `a`, whose low 32 bits it shares.
     for call in (
         lambda: client.insert_series(a + 2**32, [T0], [1.0]),
         lambda: client.insert([a, a + 2**32], [T0, T0], [1.0, 2.0]),
         lambda: client.insert(array.array("Q", [a, a + 2**32]), [T0, T0], [1.0, 2.0]),
-        lambda: client.query_raw(a + 2**32),
-        lambda: client.series_name(a + 2**32),
     ):
         with pytest.raises(TsdbError) as e:
             call()
-        assert e.value.code == tsdb_client.ERR_INVALID and "32-bit" in str(e.value)
+        assert e.value.code == tsdb_client.ERR_INVALID and "32-bit" not in str(e.value)
+    with pytest.raises(TsdbError) as e:
+        client.series_name(a + 2**32)
+    assert e.value.code == tsdb_client.ERR_NOTFOUND
+    try:  # an unknown series: an error, or no rows
+        assert client.query_raw(a + 2**32, numpy=False) == ([], [])
+    except TsdbError as e:
+        assert e.code in (tsdb_client.ERR_NOTFOUND, tsdb_client.ERR_INVALID)
     with pytest.raises(OverflowError):
         client.insert([a, -1], [T0, T0], [1.0, 2.0])
     assert client.query_raw(a, numpy=False) == ([], [])

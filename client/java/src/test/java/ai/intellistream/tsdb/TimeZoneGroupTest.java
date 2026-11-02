@@ -196,37 +196,17 @@ class TimeZoneGroupTest {
     }
 
     static String zoneOf(ByteBuffer p) {
-        int len = p.getShort(42) & 0xffff;
+        int len = p.getShort(46) & 0xffff;
         byte[] z = new byte[len];
-        p.get(44, z);
+        p.get(48, z);
         return new String(z, StandardCharsets.UTF_8);
     }
 
-    /** A server older than version 4 still groups by the zone itself: the client sends its name. */
+    /** A local group: first and last row, then the bounds between them. */
     @Test
-    void version3ServerGetsTheZone() throws Exception {
-        FakeServer f = new FakeServer(3, fr -> reply(fr, -1));
-        try (TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
-            assertTrue(c.queryGroup(7, 10, 20, Group.of(Unit.MONTH, 3).in("Europe/Oslo"), Order.DESC, 4).isEmpty());
-        }
-        f.close();
-        assertEquals(List.of(HELLO, BUCKETS), f.ops());
-        ByteBuffer p = f.frames.get(1).payload();
-        assertEquals(7, p.getInt(0));
-        assertEquals(10, p.getLong(4));
-        assertEquals(20, p.getLong(12));
-        assertEquals(Unit.MONTH.code, p.get(28));
-        assertEquals(3, p.getInt(29));
-        assertEquals(1, p.get(33), "descending");
-        assertEquals(4, p.getLong(34));
-        assertEquals("Europe/Oslo", zoneOf(p));
-    }
-
-    /** A version 4 server: first and last row, then the bounds between them. */
-    @Test
-    void version4ServerGetsBounds() throws Exception {
+    void localGroupsGetBounds() throws Exception {
         long row = utc(2024, 3, 31, 12);
-        FakeServer f = new FakeServer(4, fr -> reply(fr, row));
+        FakeServer f = new FakeServer(Protocol.VERSION, fr -> reply(fr, row));
         Group days = Group.of(Unit.DAY, 2).in("America/St_Johns");
         try (TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
             assertTrue(c.queryGroup(9, Long.MIN_VALUE, Long.MAX_VALUE, days, Order.DESC, 3).isEmpty());
@@ -234,32 +214,32 @@ class TimeZoneGroupTest {
         f.close();
         assertEquals(List.of(HELLO, VALUES, VALUES, BOUNDS), f.ops());
         ByteBuffer asc = f.frames.get(1).payload(), desc = f.frames.get(2).payload();
-        assertEquals(29, asc.limit());
-        assertEquals(0, asc.get(20), "oldest first");
-        assertEquals(1, asc.getLong(21), "limit 1");
-        assertEquals(1, desc.get(20), "newest first");
-        assertEquals(1, desc.getLong(21), "limit 1");
+        assertEquals(33, asc.limit());
+        assertEquals(0, asc.get(24), "oldest first");
+        assertEquals(1, asc.getLong(25), "limit 1");
+        assertEquals(1, desc.get(24), "newest first");
+        assertEquals(1, desc.getLong(25), "limit 1");
 
         ByteBuffer p = f.frames.get(3).payload();
-        assertEquals(9, p.getInt(0));
-        assertEquals(Long.MIN_VALUE, p.getLong(4), "the query's own range");
-        assertEquals(Long.MAX_VALUE, p.getLong(12));
-        assertEquals(1, p.get(20), "descending");
-        assertEquals(3, p.getLong(21));
+        assertEquals(9, p.getLong(0));
+        assertEquals(Long.MIN_VALUE, p.getLong(8), "the query's own range");
+        assertEquals(Long.MAX_VALUE, p.getLong(16));
+        assertEquals(1, p.get(24), "descending");
+        assertEquals(3, p.getLong(25));
         long[] want = days.bounds(row, row + 1);
-        assertEquals(want.length, p.getInt(29));
-        assertEquals(33 + 8 * want.length, p.limit());
+        assertEquals(want.length, p.getInt(33));
+        assertEquals(37 + 8 * want.length, p.limit());
         long[] sent = new long[want.length];
         for (int i = 0; i < sent.length; i++)
-            sent[i] = p.getLong(33 + 8 * i);
+            sent[i] = p.getLong(37 + 8 * i);
         assertArrayEquals(want, sent);
         assertArrayEquals(new long[] {utc(2024, 3, 30, 2) + 30 * MIN}, sent, "2-day periods from 1970, local");
     }
 
-    /** UTC needs no bounds and no HELLO, whatever the zone is called; an empty series needs no QUERY_BOUNDS. */
+    /** UTC needs no bounds, whatever the zone is called; an empty series needs no QUERY_BOUNDS. */
     @Test
     void utcAndEmptySeries() throws Exception {
-        FakeServer f = new FakeServer(4, fr -> reply(fr, -1));
+        FakeServer f = new FakeServer(Protocol.VERSION, fr -> reply(fr, -1));
         try (TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
             c.queryGroup(1, 0, 10, Group.of(Unit.DAY).in("Etc/UTC"));
             c.queryGroup(1, 0, 10, Group.of(Unit.DAY).in(ZoneOffset.UTC));
@@ -268,16 +248,16 @@ class TimeZoneGroupTest {
             assertTrue(c.queryGroup(1, 0, 10, Group.of(Unit.DAY).in("Asia/Kathmandu")).isEmpty());
         }
         f.close();
-        assertEquals(List.of(BUCKETS, BUCKETS, BUCKETS, BUCKETS, HELLO, VALUES, VALUES), f.ops());
-        for (int i = 0; i < 4; i++)
+        assertEquals(List.of(HELLO, BUCKETS, BUCKETS, BUCKETS, BUCKETS, VALUES, VALUES), f.ops());
+        for (int i = 1; i <= 4; i++)
             assertEquals("", zoneOf(f.frames.get(i).payload()));
-        assertEquals(0, f.frames.get(3).payload().get(28), "no unit: one bucket");
+        assertEquals(0, f.frames.get(4).payload().get(32), "no unit: one bucket");
     }
 
     /** Arguments QUERY_BOUNDS cannot carry are refused before anything is sent. */
     @Test
     void boundsArguments() throws Exception {
-        FakeServer f = new FakeServer(4, fr -> reply(fr, -1));
+        FakeServer f = new FakeServer(Protocol.VERSION, fr -> reply(fr, -1));
         try (TsdbClient c = TsdbClient.connect("127.0.0.1", f.port())) {
             assertThrows(IllegalArgumentException.class,
                     () -> c.queryBounds(1, 0, 10, new long[0]));
@@ -292,10 +272,10 @@ class TimeZoneGroupTest {
             assertTrue(c.queryBounds(1, 0, 10, many).isEmpty());
         }
         f.close();
-        assertEquals(List.of(BOUNDS), f.ops());
-        ByteBuffer p = f.frames.get(0).payload();
-        assertEquals(300_000, p.getInt(29));
-        assertEquals(299_999_000L, p.getLong(33 + 8 * 299_999));
+        assertEquals(List.of(HELLO, BOUNDS), f.ops());
+        ByteBuffer p = f.frames.get(1).payload();
+        assertEquals(300_000, p.getInt(33));
+        assertEquals(299_999_000L, p.getLong(37 + 8 * 299_999));
     }
 
 }

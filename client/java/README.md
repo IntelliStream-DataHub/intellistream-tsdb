@@ -134,6 +134,9 @@ after 3 unanswered probes (`setKeepAlive` changes or turns it off).
 
 ## Create a series
 
+Series ids are unsigned 64-bit numbers in a `long`; `-1L` is reserved. The client speaks protocol 11 and
+`TsdbClient.connect` fails with `Status.ERR_INVALID` ("upgrade the server") when the server answers an older version.
+
 A series has a name and a value type. `series` gets a series of 32-bit floats, and creates it if it is missing.
 `seriesCreate` lets you choose another type (see [Value types and nulls](#value-types-and-nulls)).
 
@@ -223,8 +226,7 @@ ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);
 ```
 
 `querySpreadGroup`, `querySpreadBounds`, `queryTwaGroup` and `queryTwaBounds` take calendar groups and bucket
-starts as `queryGroup` and `queryBounds` do. These need a server of protocol version 8 (the spread), 6 (TWA) or 5
-(LTTB; 9 with an order or a limit); an older one gets no request and the call fails with `Status.ERR_INVALID`.
+starts as `queryGroup` and `queryBounds` do.
 
 ## Value types and nulls
 
@@ -265,13 +267,12 @@ long limit = client.retention(energy);
 A delete returns once it is durable; queries stop seeing the rows at once.
 A replace is atomic: readers see the old rows or the new ones, never a mix.
 Rows older than a series' retention limit disappear from queries at once and
-from disk as merges get to them. These need a server of protocol version 7; an
-older one gets no request and the call fails with `Status.ERR_INVALID`.
+from disk as merges get to them.
 
 ## Compression
 
 Inserts are compressed with zstd, level 1, by default. A row then takes a few bytes on the network instead of
-16 or more. The client only compresses when the server supports it (version 3 or newer) and zstd-jni is on the
+16 or more. The client only compresses when zstd-jni is on the
 class path; otherwise it sends rows uncompressed.
 
 ```java
@@ -285,7 +286,7 @@ warning.
 
 ## Many series in one request
 
-The `...Multi` methods ask one question of a whole list of series in a single request (protocol version 10):
+The `...Multi` methods ask one question of a whole list of series in a single request:
 `queryValuesMulti`, `queryLttbMulti`, `queryBucketsMulti`, `querySpreadMulti` and `queryTwaMulti`. The server
 works on the series in parallel, sends the answers back in the order of the list, and reads every series at the
 same instant. Each series has its own result, so an unknown or bad series does not spoil the others:

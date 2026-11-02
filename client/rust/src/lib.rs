@@ -40,8 +40,8 @@
 //!   series also have a fast path with plain `f32` slices
 //!   ([`Client::insert_series`], [`Client::query_points`]).
 //! - **Series ids** are [`SeriesId`] (`u64`), handed out by the database: opaque numbers, not dense (list
-//!   them with `Db::series_ids`, not `0..series_count`). Protocol 10 carries them in 32 bits, so the
-//!   network client refuses a larger id before sending ([`Error::InvalidArgument`]).
+//!   them with `Db::series_ids`, not `0..series_count`). Protocol 11 carries all 64 bits; `u64::MAX` is
+//!   reserved (the marker of a request with a series per row) and refused as the id of an insert.
 //! - **Last write wins.** Writing a timestamp again replaces its value.
 //! - **Aggregates** ([`Client::query_agg`], [`Client::query_group`],
 //!   [`Client::query_bounds`]) return [`Bucket`]s with count, sum, min and

@@ -95,7 +95,7 @@ static int count_fn(void *ctx, const tsdb_series_result *r)
 /* qs[at], qs[at + 1], ... (k of them, wrapping) as one QUERY_MULTI */
 static void run_batch(tsdbc *c, size_t at, size_t k)
 {
-    uint32_t ss[k];
+    tsdb_sid ss[k];
     int64_t st[k], en[k], iv[k];
     for (size_t i = 0; i < k; i++) {
         const q *x = &qs[(at + i) % nq];
@@ -171,7 +171,7 @@ static void *full_run(void *arg)
     fjob *j = arg;
     tsdbc *c = conn();
     tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
-    uint32_t ss[MAXSERIES];
+    tsdb_sid ss[MAXSERIES];
     int64_t iv[MAXSERIES];
     size_t k = 0;
     for (uint32_t s = (uint32_t)j->id; s < nseries; s += (uint32_t)j->conns) {

@@ -313,7 +313,7 @@ The `_multi` calls ask for many series at once: one request, one answer,
 in the order of your list. The server (or, for `Db`, the database in this
 process) reads the series in parallel and from one moment in time, so an
 insert that wrote several series at once is seen whole or not at all.
-They need tsdbd 0.9 with protocol version 10.
+They need tsdbd 0.9 with protocol version 11.
 
 ```python
 import numpy as np

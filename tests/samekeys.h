@@ -41,12 +41,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The type of a series id in the batches: tsdb_sid for the embedded library (test_tsdb defines SK_SID before the
- * include), the network client's uint32_t for test_server. */
-#ifndef SK_SID
-#define SK_SID uint32_t
-#endif
-
 #define SK_MAX_WRITERS 16
 #define SK_MAX_SERIES 8
 
@@ -139,7 +133,7 @@ static inline bool sk_decode(const sk_cfg *c, int64_t code, uint32_t key, int *w
 /* ------------------------------------------------------------- batches */
 
 typedef struct sk_batch {
-    SK_SID *series;
+    tsdb_sid *series;
     int64_t *ts;
     uint8_t *v;     /* float, double or int64_t per the type */
     uint8_t *valid; /* bitmap; every bit set where there is no null */
@@ -155,7 +149,7 @@ static void sk_batch_free(sk_batch *b)
     memset(b, 0, sizeof *b);
 }
 
-static void sk_put(const sk_cfg *c, sk_batch *b, SK_SID sid, int64_t ts, int64_t code, bool null)
+static void sk_put(const sk_cfg *c, sk_batch *b, tsdb_sid sid, int64_t ts, int64_t code, bool null)
 {
     size_t i = b->n++;
     b->series[i] = sid;
@@ -181,7 +175,7 @@ static void sk_put(const sk_cfg *c, sk_batch *b, SK_SID sid, int64_t ts, int64_t
  * large: every key twice, poison first. order 0: by (series, ts); 1: by
  * (ts, series), what collectors send; 2: shuffled. Poison rows always come
  * before the real ones. */
-static void sk_build(const sk_cfg *c, const SK_SID *ids, int w, int r, bool large, int order, uint64_t seed,
+static void sk_build(const sk_cfg *c, const tsdb_sid *ids, int w, int r, bool large, int order, uint64_t seed,
                      uint32_t only, sk_batch *b)
 {
     uint32_t ns = only < c->nseries ? 1 : c->nseries, s0 = only < c->nseries ? only : 0;

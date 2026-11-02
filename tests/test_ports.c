@@ -60,7 +60,7 @@ static bool serves(int port)
     tsdbc *c;
     if (tsdbc_connect("127.0.0.1", port, &c) != 0)
         return false;
-    uint32_t id;
+    tsdb_sid id;
     int rc = tsdbc_series(c, "probe", 0, &id);
     tsdbc_close(c);
     return rc == 0 || rc == TSDB_ERR_NOTFOUND;
@@ -71,7 +71,7 @@ static bool series_exists(int port, const char *name)
     tsdbc *c;
     if (tsdbc_connect("127.0.0.1", port, &c) != 0)
         return false;
-    uint32_t id;
+    tsdb_sid id;
     int rc = tsdbc_series(c, name, 0, &id);
     tsdbc_close(c);
     return rc == 0;
@@ -168,7 +168,7 @@ int main(int argc, char **argv)
     CHECK(serves(p1) && serves(p2));
     {
         tsdbc *c;
-        uint32_t id;
+        tsdb_sid id;
         CHECK(tsdbc_connect("127.0.0.1", p1, &c) == 0 && tsdbc_series(c, "only.on.one", 1, &id) == 0);
         tsdbc_close(c);
         CHECK(series_exists(p1, "only.on.one") && !series_exists(p2, "only.on.one"));

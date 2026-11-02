@@ -8,7 +8,7 @@
 //! timestamps   zigzag deltas from the previous row (the first from 0), LEB128 varints
 //! values       byte planes: byte 0 of every value, then byte 1, ... (bool: one plane)
 //! valid        the bitmap, unchanged (with a validity bitmap)
-//! series       zigzag deltas, LEB128 varints (many-series layout)
+//! series       zigzag deltas of the wrapping 64-bit ids (the first from 0), LEB128 varints (many-series layout)
 //! ```
 //!
 //! The whole is one zstd frame (with its content size, which the server
@@ -19,7 +19,7 @@ use crate::value::{ValueType, ValuesRef};
 /// The largest reshaped body of `n` rows (`tsdb_pack_raw_bound`): the server
 /// refuses a larger `raw_len`.
 pub(crate) fn raw_bound(n: usize, ty: ValueType, valid: bool, many: bool) -> usize {
-    n * (10 + ty.wire_width()) + if valid { n.div_ceil(8) } else { 0 } + if many { n * 5 } else { 0 }
+    n * (10 + ty.wire_width()) + if valid { n.div_ceil(8) } else { 0 } + if many { n * 10 } else { 0 }
 }
 
 fn zigzag(x: i64) -> u64 {
@@ -66,11 +66,12 @@ pub(crate) fn reshape(
         out.extend_from_slice(&v[start / 8..start / 8 + n.div_ceil(8)]);
     }
     if let Some(s) = series {
-        let mut prev = 0i64;
-        // protocol 10: deltas of the u32 ids (the caller checked that every id fits)
+        // protocol 11: the wrapping 64-bit difference, so a jump across 2^32 or from 0 to u64::MAX - 1 stays
+        // a delta of at most 10 varint bytes
+        let mut prev = 0u64;
         for &x in &s[start..end] {
-            put_varint(out, zigzag(x as u32 as i64 - prev));
-            prev = x as u32 as i64;
+            put_varint(out, zigzag(x.wrapping_sub(prev) as i64));
+            prev = x;
         }
     }
 }
@@ -128,10 +129,10 @@ mod tests {
         };
         let series = if many {
             let mut s = Vec::new();
-            let mut prev = 0i64;
+            let mut prev = 0u64;
             for _ in 0..n {
-                prev += unzigzag(get_varint(&mut p)?);
-                s.push(u32::try_from(prev).ok()? as u64);
+                prev = prev.wrapping_add(unzigzag(get_varint(&mut p)?) as u64);
+                s.push(prev);
             }
             Some(s)
         } else {
@@ -156,6 +157,49 @@ mod tests {
         assert!(out.len() <= raw_bound(2, ValueType::Int64, true, true));
     }
 
+    /// The series column alone: `reshape` of `ids` with one-byte (bool) values, minus the timestamps and values.
+    fn series_column(ids: &[u64]) -> Vec<u8> {
+        let n = ids.len();
+        let (ts, v) = (vec![0i64; n], vec![false; n]);
+        let mut out = Vec::new();
+        reshape(&ts, ValuesRef::Bool(&v), None, Some(ids), 0, n, &mut Vec::new(), &mut out);
+        out.split_off(n + n) // n one-byte timestamp deltas (0), n value bytes
+    }
+
+    #[test]
+    fn wide_ids_are_wrapping_64_bit_deltas() {
+        // across 2^32 up and down, and between 0 and u64::MAX - 1 (a wrapping difference of -2 and 2)
+        let ids = [5u64, 0x1_0000_0005, 0xFFFF_FFFF_0000_0001, 5, 0, u64::MAX - 1, 0, 1 << 63, 0];
+        let col = series_column(&ids);
+        let mut want = Vec::new();
+        for (i, &x) in ids.iter().enumerate() {
+            let prev = if i == 0 { 0 } else { ids[i - 1] };
+            put_varint(&mut want, zigzag(x.wrapping_sub(prev) as i64));
+        }
+        assert_eq!(col, want);
+        // hand-checked bytes: 0 -> u64::MAX - 1 is -2, zigzag 3; back is +2, zigzag 4
+        let two = series_column(&[u64::MAX - 1, 0]);
+        assert_eq!(two, vec![0x03, 0x04]);
+        // 0 -> 0x1_0000_0005: +2^32 + 5 = zigzag 2^33 + 10, a 5 byte varint
+        assert_eq!(series_column(&[0x1_0000_0005]), vec![0x8a, 0x80, 0x80, 0x80, 0x20]);
+        // the worst case, a jump of 2^63, takes the 10 bytes the bound reserves per id
+        assert_eq!(series_column(&[1 << 63]).len(), 10);
+        let mut round = Vec::new();
+        reshape(
+            &vec![0i64; ids.len()],
+            ValuesRef::Bool(&vec![false; ids.len()]),
+            None,
+            Some(&ids),
+            0,
+            ids.len(),
+            &mut Vec::new(),
+            &mut round,
+        );
+        assert!(round.len() <= raw_bound(ids.len(), ValueType::Bool, false, true));
+        let (_, _, _, s2) = unshape(&round, ids.len(), 1, false, true).expect("well formed");
+        assert_eq!(s2.as_deref(), Some(&ids[..]));
+    }
+
     #[test]
     fn round_trips() {
         let n: usize = 1000;
@@ -163,6 +207,7 @@ mod tests {
         let f: Vec<f64> = (0..n).map(|i| i as f64 * 0.37 - 5.0).collect();
         let b: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
         let s: Vec<u64> = (0..n as u64).map(|i| if i % 2 == 0 { u32::MAX as u64 - i } else { i }).collect();
+        let s: Vec<u64> = s.iter().enumerate().map(|(i, &x)| if i % 5 == 0 { x << 33 | 1 } else { x }).collect();
         let bits: Vec<u8> = (0..n.div_ceil(8)).map(|i| i as u8 ^ 0x5a).collect();
         for (values, w) in [(ValuesRef::Float64(&f), 8), (ValuesRef::Bool(&b), 1)] {
             for (valid, many) in [(false, false), (true, false), (false, true), (true, true)] {

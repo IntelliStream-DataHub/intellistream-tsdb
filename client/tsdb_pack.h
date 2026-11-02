@@ -9,7 +9,9 @@
  *   timestamps   zigzag deltas from the previous row (the first from 0), LEB128 varints
  *   values       byte planes: byte 0 of every value, then byte 1, ... (bool: one plane)
  *   valid        the bitmap, unchanged (with TSDB_VALID)
- *   series       zigzag deltas, LEB128 varints (with TSDB_MANY_SERIES)
+ *   series       zigzag varints of the wrapping 64-bit difference from the previous id (the first from 0), with
+ *                TSDB_MANY_SERIES: ids are u64 (protocol 11), and any two differ by some wrapping delta that
+ *                fits 10 varint bytes
  *
  * and the whole is one zstd frame. On the wire, after the 16-byte header:
  *
@@ -27,11 +29,11 @@ size_t tsdb_pack_raw_bound(size_t n, unsigned type, int valid, int many);
 /* Reshapes rows into out (tsdb_pack_raw_bound bytes); returns its length.
  * values in the wire layout of `type` (bool: one byte each). */
 size_t tsdb_pack_reshape(size_t n, unsigned type, const int64_t *ts, const void *values, const uint8_t *valid,
-                         const uint32_t *series, uint8_t *out);
+                         const uint64_t *series, uint8_t *out);
 
 /* Undoes tsdb_pack_reshape into the plain wire arrays (ts 8-aligned).
  * Returns 0, or -1 when the body does not hold n rows exactly. */
 int tsdb_pack_unshape(const uint8_t *in, size_t len, size_t n, unsigned type, int valid, int many, int64_t *ts,
-                      uint8_t *values, uint8_t *valid_out, uint32_t *series);
+                      uint8_t *values, uint8_t *valid_out, uint64_t *series);
 
 #endif

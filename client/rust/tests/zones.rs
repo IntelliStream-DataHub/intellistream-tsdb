@@ -1,8 +1,8 @@
 //! Grouping by local periods (protocol version 4): the server knows UTC only,
 //! so the client turns a time zone into bucket bounds (QUERY_BOUNDS). Against
 //! a real tsdbd the buckets are those of the C client
-//! (`fixtures/group_by_zone.txt`); an older server still gets the zone in
-//! QUERY_BUCKETS.
+//! (`fixtures/group_by_zone.txt`); the frames sent are checked against a fake
+//! server.
 
 mod common;
 
@@ -160,7 +160,7 @@ fn fake_server(version: u32) -> (String, thread::JoinHandle<Seen>) {
             let body: Vec<u8> = match h[8] {
                 1 => version.to_le_bytes().to_vec(),
                 15 => {
-                    let ts = if payload[20] == 1 { LAST } else { FIRST };
+                    let ts = if payload[24] == 1 { LAST } else { FIRST };
                     let mut chunk = vec![1, 0, 0, 0, 1, 0, 0, 0];
                     chunk.extend_from_slice(&ts.to_le_bytes());
                     chunk.extend_from_slice(&1.0f32.to_le_bytes());
@@ -181,36 +181,12 @@ fn fake_server(version: u32) -> (String, thread::JoinHandle<Seen>) {
     (addr, h)
 }
 
-#[test]
-fn an_older_server_gets_the_zone() {
-    let (addr, h) = fake_server(3);
-    let mut c = Client::connect(addr).unwrap();
-    let oslo = Group::new(Unit::Day).count(2).timezone("Europe/Oslo");
-    assert!(c.query_group(7, 1000..2000, Some(&oslo), QueryOpts::desc().limit(5)).unwrap().is_empty());
-    // even a zone this client does not know: the old server decides
-    let mars = Group::new(Unit::Day).timezone("Mars/Olympus_Mons");
-    assert!(c.query_group(7, .., Some(&mars), QueryOpts::asc()).unwrap().is_empty());
-    c.close().unwrap();
-    let seen = h.join().unwrap();
-    assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [1, 18, 18]); // HELLO once, QUERY_BUCKETS
-    let p = &seen[1].1;
-    assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 7);
-    assert_eq!(i64::from_le_bytes(p[4..12].try_into().unwrap()), 1000);
-    assert_eq!(i64::from_le_bytes(p[12..20].try_into().unwrap()), 2000);
-    assert_eq!(i64::from_le_bytes(p[20..28].try_into().unwrap()), 0); // no interval
-    assert_eq!((p[28], u32::from_le_bytes(p[29..33].try_into().unwrap()), p[33]), (4, 2, 1)); // day, 2, desc
-    assert_eq!(u64::from_le_bytes(p[34..42].try_into().unwrap()), 5);
-    assert_eq!(u16::from_le_bytes(p[42..44].try_into().unwrap()), 11);
-    assert_eq!(&p[44..], b"Europe/Oslo");
-    assert_eq!(&seen[2].1[44..], b"Mars/Olympus_Mons");
-}
-
 const FIRST: i64 = 1_711_670_400_000; // 2024-03-29 00:00 UTC
 const LAST: i64 = 1_712_016_000_000;
 
 #[test]
-fn a_version_4_server_gets_bounds() {
-    let (addr, h) = fake_server(4);
+fn local_groups_go_as_bounds() {
+    let (addr, h) = fake_server(tsdb_client::PROTOCOL_VERSION);
     let mut c = Client::connect(addr).unwrap();
     let oslo = Group::new(Unit::Day).timezone("Europe/Oslo");
     assert!(c.query_group(7, 1000.., Some(&oslo), QueryOpts::desc().limit(3)).unwrap().is_empty());
@@ -221,19 +197,19 @@ fn a_version_4_server_gets_bounds() {
     // HELLO, the first and the last row, QUERY_BOUNDS; then QUERY_BUCKETS
     assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [1, 15, 15, 20, 18]);
     for (s, order) in [(&seen[1].1, 0), (&seen[2].1, 1)] {
-        assert_eq!(i64::from_le_bytes(s[4..12].try_into().unwrap()), 1000);
-        assert_eq!((s[20], u64::from_le_bytes(s[21..29].try_into().unwrap())), (order, 1));
+        assert_eq!(i64::from_le_bytes(s[8..16].try_into().unwrap()), 1000);
+        assert_eq!((s[24], u64::from_le_bytes(s[25..33].try_into().unwrap())), (order, 1));
     }
     let p = &seen[3].1;
     let expected = calendar_bounds("Europe/Oslo", Unit::Day, 1, FIRST..=LAST).unwrap();
     assert_eq!(expected.len(), 5);
-    assert_eq!(p.len(), 33 + 8 * expected.len());
-    assert_eq!(u32::from_le_bytes(p[0..4].try_into().unwrap()), 7);
-    assert_eq!(i64::from_le_bytes(p[4..12].try_into().unwrap()), 1000); // the query's range, not the rows'
-    assert_eq!(i64::from_le_bytes(p[12..20].try_into().unwrap()), i64::MAX);
-    assert_eq!((p[20], u64::from_le_bytes(p[21..29].try_into().unwrap())), (1, 3)); // desc, limit
-    assert_eq!(u32::from_le_bytes(p[29..33].try_into().unwrap()) as usize, expected.len());
-    let sent: Vec<i64> = p[33..].chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect();
+    assert_eq!(p.len(), 37 + 8 * expected.len());
+    assert_eq!(u64::from_le_bytes(p[0..8].try_into().unwrap()), 7);
+    assert_eq!(i64::from_le_bytes(p[8..16].try_into().unwrap()), 1000); // the query's range, not the rows'
+    assert_eq!(i64::from_le_bytes(p[16..24].try_into().unwrap()), i64::MAX);
+    assert_eq!((p[24], u64::from_le_bytes(p[25..33].try_into().unwrap())), (1, 3)); // desc, limit
+    assert_eq!(u32::from_le_bytes(p[33..37].try_into().unwrap()) as usize, expected.len());
+    let sent: Vec<i64> = p[37..].chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect();
     assert_eq!(sent, expected);
-    assert_eq!(&seen[4].1[44..], b"UTC");
+    assert_eq!(&seen[4].1[48..], b"UTC");
 }

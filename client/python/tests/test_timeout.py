@@ -50,9 +50,12 @@ def watchdog():
 
 
 class Fake:
-    """Runs behave(conn, stop) on the first connection; closing it releases the connection."""
+    """Runs behave(conn, stop) on the first connection; closing it releases the connection.
 
-    def __init__(self, behave):
+    Answers the HELLO every connect sends (protocol 11) first, unless raw: then behave sees it."""
+
+    def __init__(self, behave, raw=False):
+        self.raw = raw
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(1)
@@ -69,6 +72,10 @@ class Fake:
             return
         with conn:
             try:
+                if not self.raw:
+                    req_id, op = read_request(conn)
+                    assert op == 1, "the first request of a connection is HELLO"
+                    conn.sendall(ack(req_id, struct.pack("<I", tsdb_client.PROTOCOL_VERSION)))
                 self.behave(conn, self.stop)
             except (EOFError, OSError):
                 pass
@@ -83,8 +90,8 @@ class Fake:
 def fake():
     made = []
 
-    def make(behave):
-        f = Fake(behave)
+    def make(behave, raw=False):
+        f = Fake(behave, raw)
         made.append(f)
         return f
 
@@ -118,6 +125,16 @@ def test_server_that_never_answers(fake):
     assert_timed_out(c, t, lambda: c.series("a"))
 
 
+def test_server_that_never_answers_hello(fake):
+    f = fake(lambda s, stop: stop.wait(), raw=True)
+    t = time.monotonic()
+    with pytest.raises(TsdbError) as e:
+        Client(port=f.port, timeout=TIMEOUT)
+    took = time.monotonic() - t
+    assert e.value.code == tsdb_client.ERR_IO
+    assert TIMEOUT - 0.05 <= took < BOUND, f"{took:.2f} s"
+
+
 def test_server_that_accepts_and_never_reads(fake):
     c = Client(port=fake(lambda s, stop: stop.wait()).port, timeout=TIMEOUT)
     t = time.monotonic()
@@ -138,9 +155,8 @@ def test_server_that_answers_half_a_frame(fake):
 def test_server_that_stops_answering_among_pipelined_inserts(fake):
     def behave(s, stop):
         for _ in range(5):
-            req_id, op = read_request(s)
-            # HELLO is answered with protocol version 2: plain arrays follow
-            s.sendall(ack(req_id, struct.pack("<I", 2)) if op == 1 else ack(req_id))
+            req_id, _ = read_request(s)
+            s.sendall(ack(req_id))
         stop.wait()
 
     c = Client(port=fake(behave).port, timeout=TIMEOUT)
@@ -155,11 +171,12 @@ def test_server_that_stops_answering_among_pipelined_inserts(fake):
 def test_server_that_stops_reading_among_pipelined_inserts(fake):
     def behave(s, stop):
         for _ in range(10):
-            req_id, op = read_request(s)
-            s.sendall(ack(req_id, struct.pack("<I", 2)) if op == 1 else ack(req_id))
+            req_id, _ = read_request(s)
+            s.sendall(ack(req_id))
         stop.wait()  # the socket buffers fill up and a send blocks
 
     c = Client(port=fake(behave).port, timeout=TIMEOUT)
+    c.set_compression(0)  # plain arrays: packed ones are too small to fill the buffers
     n = 200_000
     ts = array.array("q", range(n))
     values = array.array("f", range(n))

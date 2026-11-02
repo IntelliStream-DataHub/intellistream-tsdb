@@ -1,11 +1,7 @@
-//! Range deletes, replaces and retention (protocol version 7) against a real tsdbd, and what the
-//! client does with an older server, for these and the queries of versions 5 to 9.
+//! Range deletes, replaces and retention (protocol version 7) against a real tsdbd.
 
 mod common;
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{Server, T0};
@@ -100,127 +96,6 @@ fn retention() {
     assert!(invalid(c.set_retention(id, -1)));
     c.set_retention(id, 0).unwrap();
     assert_eq!(c.retention(id).unwrap(), 0);
-}
-
-/// A server that answers HELLO with `version` and counts every other request it gets.
-fn old_server(version: u32) -> (String, thread::JoinHandle<Vec<u8>>) {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap().to_string();
-    let h = thread::spawn(move || {
-        let (mut s, _) = l.accept().unwrap();
-        let mut ops = Vec::new();
-        let mut h = [0u8; 9];
-        while s.read_exact(&mut h).is_ok() {
-            let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
-            let mut payload = vec![0; len - 5];
-            s.read_exact(&mut payload).unwrap();
-            let body: &[u8] = if h[8] == 1 { &version.to_le_bytes() } else { &[] };
-            let mut reply = ((9 + body.len()) as u32).to_le_bytes().to_vec();
-            reply.extend_from_slice(&h[4..8]);
-            reply.extend_from_slice(&[0, 0, 0, 0, 0]);
-            reply.extend_from_slice(body);
-            s.write_all(&reply).unwrap();
-            ops.push(h[8]);
-        }
-        ops
-    });
-    (addr, h)
-}
-
-#[test]
-fn an_older_server_is_not_asked() {
-    for version in [5, 6] {
-        let (addr, h) = old_server(version);
-        let mut c = Client::connect(addr).unwrap();
-        assert!(invalid(c.delete_range(1, ..)));
-        assert!(invalid(c.replace_range(1, .., &[T0], &[1i64])));
-        assert!(invalid(c.set_retention(1, 1000)));
-        assert!(invalid(c.retention(1)));
-        assert!(!c.is_broken());
-        c.close().unwrap();
-        assert_eq!(h.join().unwrap(), vec![1], "version {version}: HELLO only");
-    }
-}
-
-#[test]
-fn newer_queries_are_not_sent_to_an_older_server() {
-    for version in 4..=8u32 {
-        let (addr, h) = old_server(version);
-        let mut c = Client::connect(addr).unwrap();
-        let day = Group::new(Unit::Day).timezone("Europe/Oslo");
-        if version < 5 {
-            assert!(invalid(c.query_lttb(1, .., 100, QueryOpts::asc())));
-        }
-        if version < 6 {
-            assert!(invalid(c.query_twa(1, .., 0, TwaOpts::step())));
-            assert!(invalid(c.query_twa_group(1, .., Some(&Group::new(Unit::Hour)), TwaOpts::linear())));
-            assert!(invalid(c.query_twa_group(1, 0..1000, Some(&day), TwaOpts::step())));
-            assert!(invalid(c.query_twa_bounds(1, .., &[0, 10], TwaOpts::step())));
-        }
-        // the spread needs 8, LTTB with order or limit 9, whatever the limit
-        if version < 8 {
-            assert!(invalid(c.query_spread(1, .., 0, QueryOpts::asc())));
-            assert!(invalid(c.query_spread(1, .., 0, QueryOpts::asc().limit(0))));
-            assert!(invalid(c.query_spread_group(1, .., Some(&Group::new(Unit::Hour)), QueryOpts::desc())));
-            assert!(invalid(c.query_spread_group(1, .., Some(&day), QueryOpts::asc())));
-            assert!(invalid(c.query_spread_bounds(1, .., &[0, 10], QueryOpts::asc())));
-        }
-        assert!(invalid(c.query_lttb(1, .., 100, QueryOpts::desc())));
-        assert!(invalid(c.query_lttb(1, .., 100, QueryOpts::asc().limit(10))));
-        assert!(!c.is_broken());
-        c.close().unwrap();
-        assert_eq!(h.join().unwrap(), vec![1], "version {version}: HELLO only");
-    }
-}
-
-/// A server of `version` that knows only the 28-byte QUERY_LTTB of versions 5 to 8: it answers that with the last
-/// chunk of no points and the 37-byte form of version 9 with INVALID. Returns the payload lengths of the LTTB requests.
-fn lttb_server(version: u32) -> (String, thread::JoinHandle<Vec<usize>>) {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap().to_string();
-    let h = thread::spawn(move || {
-        let (mut s, _) = l.accept().unwrap();
-        let mut lens = Vec::new();
-        let mut h = [0u8; 9];
-        while s.read_exact(&mut h).is_ok() {
-            let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
-            let mut payload = vec![0; len - 5];
-            s.read_exact(&mut payload).unwrap();
-            let (status, body): (i32, Vec<u8>) = match h[8] {
-                1 => (0, version.to_le_bytes().to_vec()),
-                21 => {
-                    lens.push(payload.len());
-                    // last, FLOAT32, no flags, 0; no points
-                    if payload.len() == 28 {
-                        (0, vec![1, 0, 0, 0, 0, 0, 0, 0])
-                    } else {
-                        (Status::Invalid.code(), vec![])
-                    }
-                }
-                _ => (0, vec![]),
-            };
-            let mut reply = ((9 + body.len()) as u32).to_le_bytes().to_vec();
-            reply.extend_from_slice(&h[4..8]);
-            reply.push(0);
-            reply.extend_from_slice(&status.to_le_bytes());
-            reply.extend_from_slice(&body);
-            s.write_all(&reply).unwrap();
-        }
-        lens
-    });
-    (addr, h)
-}
-
-#[test]
-fn plain_lttb_is_the_short_request() {
-    for version in 5..=9u32 {
-        let (addr, h) = lttb_server(version);
-        let mut c = Client::connect(addr).unwrap();
-        assert_eq!(c.query_lttb(1, .., 100, QueryOpts::asc()).unwrap().ts.len(), 0, "version {version}");
-        assert_eq!(c.query_lttb(1, T0..T0 + 1000, 3, QueryOpts::asc()).unwrap().ts.len(), 0, "version {version}");
-        c.close().unwrap();
-        assert_eq!(h.join().unwrap(), vec![28, 28], "version {version}");
-    }
 }
 
 /// More local periods than one request carries (QUERY_BOUNDS takes 32 Mi bounds, QUERY_TWA 56 bytes' worth fewer; the

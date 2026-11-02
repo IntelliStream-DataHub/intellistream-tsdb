@@ -8,7 +8,8 @@ package ai.intellistream.tsdb;
  *   timestamps   zigzag deltas from the previous row (the first from 0), LEB128 varints
  *   values       byte planes: byte 0 of every value, then byte 1, ... (bool: one plane)
  *   valid        the validity bitmap, unchanged (with TSDB_VALID)
- *   series       zigzag deltas, LEB128 varints (with TSDB_MANY_SERIES)
+ *   series       zigzag varints of the wrapping 64-bit difference from the previous id (the first from 0), with
+ *                TSDB_MANY_SERIES: ids are u64 (protocol 11), a delta takes up to 10 bytes
  * </pre>
  *
  * The client compresses the result as one zstd frame. Regular clocks become one-byte deltas and the high bytes
@@ -20,7 +21,7 @@ final class Pack {
 
     /** The largest reshaped body of n rows, as {@code tsdb_pack_raw_bound}. */
     static long rawBound(int n, ValueType type, boolean valid, boolean many) {
-        return (long) n * (10 + type.width) + (valid ? (n + 7) / 8 : 0) + (many ? (long) n * 5 : 0);
+        return (long) n * (10 + type.width) + (valid ? (n + 7) / 8 : 0) + (many ? (long) n * 10 : 0);
     }
 
     /**
@@ -28,7 +29,7 @@ final class Pack {
      * length written.
      *
      * @param valid the frame's validity bitmap (bit i for row off + i), or null
-     * @param series the series id of every row (indexed like ts, each below 2^32: protocol 10), or null
+     * @param series the series id of every row (indexed like ts; any u64, the differences wrap), or null
      */
     static int reshape(long[] ts, Column col, long[] series, int off, int n, byte[] valid, byte[] out) {
         int o = 0;
@@ -47,7 +48,7 @@ final class Pack {
             long ps = 0;
             for (int i = off, end = off + n; i < end; i++) {
                 long s = series[i];
-                o = putVarint(out, o, zigzag(s - ps));
+                o = putVarint(out, o, zigzag(s - ps)); /* wraps like the C code's unsigned subtraction */
                 ps = s;
             }
         }

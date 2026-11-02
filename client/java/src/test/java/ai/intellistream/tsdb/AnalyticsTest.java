@@ -102,7 +102,7 @@ class AnalyticsTest {
 
     @Test
     void aNegativeSpreadIntervalIsRefusedWithoutAskingTheServer() throws Exception {
-        try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(9)) {
+        try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(Protocol.VERSION)) {
             try (TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
                 invalid(() -> o.querySpread(1, MIN, MAX, -1));
                 invalid(() -> o.querySpread(1, MIN, MAX, -5, Order.DESC, 3));
@@ -129,9 +129,9 @@ class AnalyticsTest {
             tooMany(() -> c.queryTwaGroup(s, MIN, MAX, secs, TwaOptions.step()));
         }
         c.commit(); /* the connection is still good */
-        /* bounded on both sides, TWA covers the range: 33,554,418 seconds is one past QUERY_TWA's (MAX_FRAME - 120) / 8
+        /* bounded on both sides, TWA covers the range: 33,554,418 seconds is past QUERY_TWA's (MAX_FRAME - 64 - 60) / 8 = 33,554,416
          * (and below QUERY_BOUNDS' cap). The client refuses it without sending it: tsdbd would refuse it too. */
-        try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(9)) {
+        try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(Protocol.VERSION)) {
             try (TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
                 tooMany(() -> o.queryTwaGroup(wide, T0, T0 + 33_554_418_000L, secs, TwaOptions.step()));
             }
@@ -144,10 +144,10 @@ class AnalyticsTest {
         assertEquals(Status.ERR_TOO_MANY_BUCKETS, x.status(), x.getMessage());
     }
 
-    /* QUERY_TWA carries 56 bytes more than QUERY_BOUNDS before its bounds, so it takes fewer: as the C client. */
+    /* QUERY_TWA carries 60 bytes more than QUERY_BOUNDS before its bounds, so it takes fewer: as the C client. */
     @Test
     void twaBoundsCapIsTheCClients() throws Exception {
-        long[] b = new long[(Protocol.MAX_FRAME - 120) / 8 + 1];
+        long[] b = new long[(Protocol.MAX_FRAME - 64 - Protocol.TWA_HEADER) / 8 + 1];
         assertThrows(IllegalArgumentException.class, () -> c.queryTwaBounds(calc, MIN, MAX, b, TwaOptions.step()));
         c.commit();
     }
@@ -207,56 +207,26 @@ class AnalyticsTest {
         invalid(() -> c.queryLttb(state, MIN, MAX, 10));
     }
 
-    @Test
-    void anOlderServerIsNotAsked() throws Exception {
-        Group oslo = Group.of(Unit.DAY).in("Europe/Oslo");
-        for (int version = 4; version <= 8; version++) {
-            try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(version)) {
-                try (TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
-                    if (version < 5)
-                        invalid(() -> o.queryLttb(1, MIN, MAX, 100));
-                    if (version < 6) {
-                        invalid(() -> o.queryTwa(1, MIN, MAX, 0, TwaOptions.step()));
-                        invalid(() -> o.queryTwaGroup(1, MIN, MAX, Group.of(Unit.HOUR), TwaOptions.linear()));
-                        invalid(() -> o.queryTwaGroup(1, 0, 1000, oslo, TwaOptions.step()));
-                        invalid(() -> o.queryTwaBounds(1, MIN, MAX, new long[] {0, 10}, TwaOptions.step()));
-                    }
-                    if (version < 8) {
-                        invalid(() -> o.querySpread(1, MIN, MAX, 0));
-                        invalid(() -> o.querySpreadGroup(1, MIN, MAX, Group.of(Unit.HOUR), Order.DESC, 0));
-                        invalid(() -> o.querySpreadGroup(1, MIN, MAX, oslo, Order.ASC, 0));
-                        invalid(() -> o.querySpreadBounds(1, MIN, MAX, new long[] {0, 10}, Order.ASC, 0));
-                    }
-                    invalid(() -> o.queryLttb(1, MIN, MAX, 100, Order.DESC, 0));
-                    invalid(() -> o.queryLttb(1, MIN, MAX, 100, Order.ASC, 10));
-                    o.commit(); /* the connection is still good */
-                }
-                assertArrayEquals(new Object[] {(int) Protocol.OP_HELLO, (int) Protocol.OP_COMMIT},
-                        f.ops().toArray(), "version " + version + ": HELLO and COMMIT only");
-            }
-        }
-    }
-
-    /* A server of version 5 to 8 knows only the 28-byte QUERY_LTTB: this one answers it with no points and the
-     * 37-byte form of version 9 with INVALID. A plain queryLttb must still work there. */
+    /* A plain queryLttb (ascending, no limit) is the short request: 32 bytes with the u64 series; an order or a
+     * limit make it 41. */
     @Test
     void plainLttbIsTheShortRequest() throws Exception {
-        for (int version = 5; version <= 9; version++) {
-            List<Integer> lengths = new java.util.ArrayList<>();
-            try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(version,
-                    fr -> new byte[] {1, 0, 0, 0, 0, 0, 0, 0}, /* the last chunk: FLOAT32, no points */
-                    fr -> fr.op() == Protocol.OP_QUERY_LTTB && fr.payload().remaining() != 28 ? Status.ERR_INVALID : 0);
-                 TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
-                ValuePoints p = o.queryLttb(1, MIN, MAX, 100);
-                assertEquals(0, p.size(), "version " + version);
-                assertEquals(0, o.queryLttb(1, MIN, MAX, 100, Order.ASC, 0).size(), "version " + version);
-                synchronized (f.frames) {
-                    for (CompressionTest.Frame fr : f.frames)
-                        if (fr.op() == Protocol.OP_QUERY_LTTB)
-                            lengths.add(fr.payload().remaining());
-                }
+        List<Integer> lengths = new java.util.ArrayList<>();
+        try (CompressionTest.FakeServer f = new CompressionTest.FakeServer(Protocol.VERSION,
+                fr -> new byte[] {1, 0, 0, 0, 0, 0, 0, 0}, /* the last chunk: FLOAT32, no points */
+                fr -> 0);
+             TsdbClient o = TsdbClient.connect("127.0.0.1", f.port())) {
+            assertEquals(0, o.queryLttb(0x1_0000_0001L, MIN, MAX, 100).size());
+            assertEquals(0, o.queryLttb(1, MIN, MAX, 100, Order.ASC, 0).size());
+            assertEquals(0, o.queryLttb(1, MIN, MAX, 100, Order.DESC, 3).size());
+            synchronized (f.frames) {
+                for (CompressionTest.Frame fr : f.frames)
+                    if (fr.op() == Protocol.OP_QUERY_LTTB)
+                        lengths.add(fr.payload().remaining());
+                assertEquals(0x1_0000_0001L, f.frames.get(1).payload().getLong(0), "the id goes out whole");
+                assertEquals(100, f.frames.get(1).payload().getLong(24));
             }
-            assertEquals(List.of(28, 28), lengths, "version " + version);
         }
+        assertEquals(List.of(32, 32, 41), lengths);
     }
 }

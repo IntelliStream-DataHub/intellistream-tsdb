@@ -6,6 +6,7 @@
  * they got. */
 #define _GNU_SOURCE
 #include "tsdb_client.h"
+#include "tsdb_pack.h"
 #include "tsdb_protocol.h"
 
 #include <arpa/inet.h>
@@ -49,12 +50,22 @@ struct fake {
     pthread_t th;
 };
 
+static bool read_req(int fd, uint32_t *id, uint8_t *op, uint8_t *body, size_t cap, size_t *blen);
+static void reply(int fd, uint32_t id, int32_t status, const void *body, size_t n);
+
+/* The client says HELLO at connect (protocol 11): the fake answers it with its own version, then runs the script. */
 static void *fake_main(void *arg)
 {
     struct fake *f = arg;
     int fd = accept(f->lfd, NULL, NULL);
     if (fd >= 0) {
-        f->script(fd);
+        uint8_t body[16], op;
+        uint32_t id, v = TSDB_PROTOCOL_VERSION;
+        size_t n;
+        if (read_req(fd, &id, &op, body, sizeof body, &n) && op == TSDB_OP_HELLO) {
+            reply(fd, id, 0, &v, 4);
+            f->script(fd);
+        }
         close(fd);
     }
     return NULL;
@@ -145,12 +156,13 @@ static void slow_series(int fd)
 {
     uint8_t body[256];
     size_t n;
-    uint32_t id, next = 100;
+    uint32_t id;
+    uint64_t next = 100;
     uint8_t op;
     for (int i = 0; read_req(fd, &id, &op, body, sizeof body, &n); i++) {
         if (i == 0)
             usleep(500 * 1000);
-        reply(fd, id, 0, &next, 4);
+        reply(fd, id, 0, &next, 8);
         next++;
     }
 }
@@ -165,7 +177,7 @@ static void test_timeout_breaks_connection(void)
     tsdbc *c;
     CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
     CHECK(tsdbc_set_timeout(c, 200) == 0);
-    uint32_t id = 0;
+    tsdb_sid id = 0;
     CHECK(tsdbc_series(c, "pump1.flow", 1, &id) == TSDB_ERR_IO);
     usleep(600 * 1000); /* the late reply has arrived by now */
     id = 0;
@@ -182,10 +194,11 @@ static void wrong_id(int fd)
 {
     uint8_t body[256];
     size_t n;
-    uint32_t id, sid = 7;
+    uint32_t id;
+    uint64_t sid = 7;
     uint8_t op;
     while (read_req(fd, &id, &op, body, sizeof body, &n))
-        reply(fd, id + 5, 0, &sid, 4);
+        reply(fd, id + 5, 0, &sid, 8);
 }
 
 static void test_reply_id_checked(void)
@@ -194,7 +207,7 @@ static void test_reply_id_checked(void)
     fake_start(&f, wrong_id);
     tsdbc *c;
     CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
-    uint32_t id = 0;
+    tsdb_sid id = 0;
     CHECK(tsdbc_series(c, "a", 1, &id) == TSDB_ERR_CORRUPT);
     CHECK(id == 0);
     CHECK(tsdbc_series(c, "b", 1, &id) == TSDB_ERR_IO);
@@ -256,8 +269,8 @@ static void bad_stream(int fd)
     uint8_t f3[5] = {1, 0, 0, 0, 0};
     reply(fd, id, 0, f3, sizeof f3);
     while (read_req(fd, &id, &op, body, sizeof body, &n)) {
-        uint32_t sid = 3;
-        reply(fd, id, 0, &sid, 4);
+        uint64_t sid = 3;
+        reply(fd, id, 0, &sid, 8);
     }
 }
 
@@ -278,7 +291,7 @@ static void test_stream_cut(void)
     size_t rows = 0;
     CHECK(tsdbc_query_raw(c, 1, 0, 100, count_rows, &rows) == TSDB_ERR_CORRUPT);
     CHECK(rows == 1);
-    uint32_t id = 0;
+    tsdb_sid id = 0;
     CHECK(tsdbc_series(c, "x", 1, &id) == TSDB_ERR_IO);
     tsdbc_close(c);
     fake_stop(&f);
@@ -300,8 +313,8 @@ static void good_stream(int fd)
             fr[0] = 1;
             reply(fd, id, 0, fr, sizeof fr);
         } else {
-            uint32_t sid = 42;
-            reply(fd, id, 0, &sid, 4);
+            uint64_t sid = 42;
+            reply(fd, id, 0, &sid, 8);
         }
     }
 }
@@ -316,7 +329,7 @@ static void test_stream_in_step(void)
         size_t rows = 0;
         CHECK(tsdbc_query_raw(c, 1, 0, 100, count_rows, &rows) == 0);
         CHECK(rows == 3);
-        uint32_t id = 0;
+        tsdb_sid id = 0;
         CHECK(tsdbc_series(c, "x", 1, &id) == 0 && id == 42);
     }
     tsdbc_close(c);
@@ -385,8 +398,8 @@ static void big_slow_frame(int fd)
     send_all(fd, f + half, 13 + blen - half);
     free(f);
     while (read_req(fd, &id, &op, body, sizeof body, &n)) {
-        uint32_t sid = 7;
-        reply(fd, id, 0, &sid, 4);
+        uint64_t sid = 7;
+        reply(fd, id, 0, &sid, 8);
     }
 }
 
@@ -402,7 +415,7 @@ static void test_timeout_in_large_body(void)
     size_t rows = 0;
     CHECK(tsdbc_query_raw(c, 1, 0, 100, count_rows, &rows) == TSDB_ERR_IO);
     usleep(600 * 1000);
-    uint32_t id = 0;
+    tsdb_sid id = 0;
     CHECK(tsdbc_series(c, "x", 1, &id) == TSDB_ERR_IO);
     CHECK(id == 0);
     tsdbc_close(c);
@@ -427,8 +440,8 @@ static void good_values(int fd)
                 reply(fd, id, 0, fr, sizeof fr);
             }
         } else {
-            uint32_t sid = 42;
-            reply(fd, id, 0, &sid, 4);
+            uint64_t sid = 42;
+            reply(fd, id, 0, &sid, 8);
         }
     }
 }
@@ -451,7 +464,7 @@ static void test_values_stream_in_step(void)
         size_t rows = 0;
         CHECK(tsdbc_query_values(c, 1, 0, 100, NULL, count_values, &rows) == 0);
         CHECK(rows == 3);
-        uint32_t id = 0;
+        tsdb_sid id = 0;
         CHECK(tsdbc_series(c, "x", 1, &id) == 0 && id == 42);
     }
     tsdbc_close(c);
@@ -498,7 +511,7 @@ static void test_peer_closed(void)
     fake_stop(&f);
     usleep(100 * 1000);
     enum { N = 1000 };
-    static uint32_t series[N];
+    static tsdb_sid series[N];
     static int64_t ts[N];
     static float v[N];
     int rc = 0;
@@ -545,8 +558,82 @@ static void test_keepalive_args(void)
     fake_stop(&f);
 }
 
+/* Ids are u64 on the wire (protocol 11): an id above 2^32 goes out whole, and one comes back whole. */
+static uint8_t wide_body[16];
+static size_t wide_len;
+
+static void wide_ids(int fd)
+{
+    uint8_t body[256];
+    size_t n;
+    uint32_t id;
+    uint8_t op;
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        if (op == TSDB_OP_SERIES_TYPE) {
+            wide_len = n;
+            memcpy(wide_body, body, n < sizeof wide_body ? n : sizeof wide_body);
+            uint8_t t = TSDB_INT64;
+            reply(fd, id, 0, &t, 1);
+        } else {
+            uint64_t sid = 0xffffffff00000001ull;
+            reply(fd, id, 0, &sid, 8);
+        }
+    }
+}
+
+static void test_wide_ids(void)
+{
+    struct fake f;
+    fake_start(&f, wide_ids);
+    tsdbc *c;
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    tsdb_type t = TSDB_FLOAT32;
+    CHECK(tsdbc_series_type(c, 0x100000005ull, &t) == 0 && t == TSDB_INT64);
+    uint64_t sent = 0;
+    memcpy(&sent, wide_body, 8);
+    CHECK(wide_len == 8 && sent == 0x100000005ull);
+    tsdb_sid id = 0;
+    CHECK(tsdbc_series(c, "x", 1, &id) == 0 && id == 0xffffffff00000001ull);
+    tsdbc_close(c);
+    fake_stop(&f);
+}
+
+/* The packed series column: zigzag varints of the wrapping 64-bit difference, so ids that jump across 2^32 either
+ * way, or from 0 to UINT64_MAX - 1 and back, round trip, and the decoder takes every u64. */
+static void test_pack_wide_ids(void)
+{
+    static const tsdb_sid cases[][6] = {
+        {5, 0x100000005ull, 3, 0xffffffffull, 0x100000000ull, 0},
+        {0, UINT64_MAX - 1, 0, UINT64_MAX - 1, 1, UINT64_MAX},
+        {0xffffffff00000001ull, 1, 0x8000000000000000ull, 0x7fffffffffffffffull, UINT64_MAX, 0},
+    };
+    enum { N = 6 };
+    for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+        int64_t ts[N], ts2[N];
+        float v[N], v2[N];
+        tsdb_sid ids2[N];
+        for (int i = 0; i < N; i++) {
+            ts[i] = 1700000000000 + i * 1000;
+            v[i] = (float)i;
+        }
+        size_t bound = tsdb_pack_raw_bound(N, TSDB_FLOAT32, 0, 1);
+        uint8_t raw[512];
+        CHECK(bound <= sizeof raw);
+        size_t len = tsdb_pack_reshape(N, TSDB_FLOAT32, ts, v, NULL, cases[k], raw);
+        CHECK(len <= bound);
+        memset(ids2, 0, sizeof ids2);
+        CHECK(tsdb_pack_unshape(raw, len, N, TSDB_FLOAT32, 0, 1, ts2, (uint8_t *)v2, NULL, ids2) == 0);
+        CHECK(memcmp(ids2, cases[k], sizeof ids2) == 0 && memcmp(ts2, ts, sizeof ts) == 0 &&
+              memcmp(v2, v, sizeof v) == 0);
+        /* a body one byte short is refused, not read past */
+        CHECK(tsdb_pack_unshape(raw, len - 1, N, TSDB_FLOAT32, 0, 1, ts2, (uint8_t *)v2, NULL, ids2) != 0);
+    }
+}
+
 int main(void)
 {
+    test_pack_wide_ids();
+    test_wide_ids();
     test_timeout_breaks_connection();
     test_reply_id_checked();
     test_name_replies();

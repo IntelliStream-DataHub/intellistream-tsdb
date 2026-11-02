@@ -26,7 +26,6 @@
  * nulls, and a bucket whose rows are all null is reported with count 0.
  */
 #include "internal.h"
-#include "tsdb_protocol.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -36,7 +35,9 @@
  * 37-byte request make tsdbd allocate gigabytes before it found that the reply would not fit a frame; the working
  * memory now follows the buckets with rows (bq_window), and 4 Mi, as for TWA, keep the result within a frame. */
 #define MAX_BUCKETS (4u << 20)
-_Static_assert((uint64_t)MAX_BUCKETS * TSDB_AGG_ROW + 64 <= TSDB_MAX_FRAME, "an aggregate reply must fit a frame");
+/* No assert that MAX_BUCKETS rows fit a reply frame: it held for QUERY_AGG's 32-byte rows (removed in protocol 11),
+ * but 4 Mi rows of TSDB_BUCKET_ROW (64 bytes) are the whole 256 MiB frame. tsdbd sizes replies itself: it runs a
+ * query with a limit at most one row past a frame (frame_limit) and refuses a larger reply (TOO_MANY_BUCKETS). */
 #define AGG_DENSE_BYTES (32u << 20) /* one dense array of bucket states (bq_window) */
 #define AGG_STRIPES 64
 #define AGG_STRIPE_SHIFT 10 /* 1024 consecutive buckets share a lock */

@@ -44,7 +44,7 @@ def test_packed_and_plain_store_the_same(server, client):
     g = plain.series("g")
     plain.insert_series(g, ts, v)
     sent = (client.bytes_sent - before[0], plain.bytes_sent - before[1])
-    assert sent[1] == 9 + 8 + n * 12 + (9 + 3 + 1)  # the version 1 INSERT frame, and SERIES "g"
+    assert sent[1] == 9 + 16 + n * 12 + (9 + 3 + 1)  # the version 1 INSERT frame, and SERIES "g"
     assert sent[0] < n * 6
     assert client.query_raw(f, numpy=False) == plain.query_raw(g, numpy=False)
     plain.close()
@@ -97,21 +97,18 @@ def talk(version, level):
     return seen
 
 
-def test_old_servers_get_plain_arrays():
-    seen = talk(2, 1)
-    assert [op for op, _ in seen] == [1, 4, 14]
-    assert seen[2][1][9] == 0  # flags: plain
-
-
-def test_level_zero_does_not_ask():
-    assert [op for op, _ in talk(3, 0)] == [4, 14]
+def test_level_zero_sends_plain_arrays():
+    seen = talk(11, 0)
+    assert [op for op, _ in seen] == [1, 4, 14]  # HELLO at connect, version 1 INSERT, INSERT_VALUES
+    assert seen[2][1][5] == 0  # flags: plain
+    assert len(seen[2][1]) == 16 + 2 * 16
 
 
 def test_new_servers_get_packed_frames():
-    seen = talk(3, 1)
+    seen = talk(11, 1)
     assert [op for op, _ in seen] == [1, 14, 14]
     p = seen[2][1]
-    assert p[:10] == bytes([2, 0, 0, 0, 1, 0, 0, 0, 2, 2])  # n, series, int64, PACKED
+    assert p[:16] == bytes([2, 0, 0, 0, 2, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0])  # n, int64, PACKED, 0, series
     zstd = pytest.importorskip("compression.zstd")  # Python 3.14+
     raw_len = struct.unpack("<I", p[16:20])[0]
     raw = zstd.decompress(p[20:])

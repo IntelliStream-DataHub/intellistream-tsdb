@@ -51,10 +51,12 @@ class TimeoutTest {
             thread.join(5_000);
     }
 
-    TsdbClient connect(Behaviour b) throws Exception {
+    /** Accepts one connection, answers its HELLO (the client asks at connect) and then runs {@code b}. */
+    void serve(Behaviour b) throws Exception {
         listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
         thread = new Thread(() -> {
             try (Socket s = listener.accept()) {
+                answerHello(s);
                 b.run(s, release);
             } catch (IOException e) {
                 /* the test is over */
@@ -62,9 +64,26 @@ class TimeoutTest {
         });
         thread.setDaemon(true);
         thread.start();
+    }
+
+    TsdbClient connect(Behaviour b) throws Exception {
+        serve(b);
         TsdbClient c = TsdbClient.connect("127.0.0.1", listener.getLocalPort(), Duration.ofSeconds(5), TIMEOUT);
-        c.setCompression(0); /* no HELLO before the first insert */
+        c.setCompression(0);
         return c;
+    }
+
+    /** Reads the HELLO a client sends at connect and answers it with the version the client speaks. */
+    static void answerHello(Socket s) throws IOException {
+        int[] r = readRequest(s);
+        if (r[1] != Protocol.OP_HELLO)
+            throw new IOException("first request " + r[1] + ", not HELLO");
+        s.getOutputStream().write(helloReply(r[0], Protocol.VERSION));
+    }
+
+    static byte[] helloReply(int id, int version) {
+        return ByteBuffer.allocate(17).order(ByteOrder.LITTLE_ENDIAN).putInt(13).putInt(id).put((byte) 0).putInt(0)
+                .putInt(version).array();
     }
 
     /** Reads one request frame and returns its id and op. */
@@ -240,7 +259,7 @@ class TimeoutTest {
 
     @Test
     void noTimeoutByDefaultAndItCanBeChanged() throws Exception {
-        listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+        serve((s, r) -> hold(r));
         try (TsdbClient c = TsdbClient.connect("127.0.0.1", listener.getLocalPort())) {
             assertEquals(Duration.ZERO, c.requestTimeout());
             c.setRequestTimeout(Duration.ofSeconds(7));
@@ -334,7 +353,7 @@ class TimeoutTest {
 
     @Test
     void keepAliveIsOnByDefaultAndCanBeChanged() throws Exception {
-        listener = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+        serve((s, r) -> hold(r));
         try (TsdbClient c = TsdbClient.connect("127.0.0.1", listener.getLocalPort())) {
             assertEquals(Boolean.TRUE, c.socketOption(StandardSocketOptions.SO_KEEPALIVE));
             assertProbes(c, 30, 10, 3);

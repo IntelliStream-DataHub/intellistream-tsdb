@@ -35,7 +35,7 @@ static int parse_type(const char *s)
 /* ---- series by name, with their types ---- */
 typedef struct sinfo {
     char name[128];
-    uint32_t id;
+    tsdb_sid id;
     tsdb_type type;
 } sinfo;
 static sinfo infos[256];
@@ -70,18 +70,18 @@ typedef struct column {
     tsdb_type type;
     size_t n, cap;
     int64_t *ts;
-    uint32_t *sid;
+    tsdb_sid *sid;
     uint8_t *v;
     uint8_t *valid;
     int nulls;
 } column;
 
-static void col_push(column *c, int64_t ts, uint32_t sid, const void *v, int known)
+static void col_push(column *c, int64_t ts, tsdb_sid sid, const void *v, int known)
 {
     if (c->n == c->cap) {
         c->cap = c->cap ? c->cap * 2 : 1024;
         c->ts = realloc(c->ts, c->cap * 8);
-        c->sid = realloc(c->sid, c->cap * 4);
+        c->sid = realloc(c->sid, c->cap * sizeof *c->sid);
         c->v = realloc(c->v, c->cap * 8);
         c->valid = realloc(c->valid, c->cap / 8 + 8);
     }
@@ -388,7 +388,7 @@ static void do_read(tsdbc *c, const char *path)
 #define LOAD_FLIGHT 8
 static void do_load(tsdbc *c, const char *name, int level, int seed)
 {
-    uint32_t id;
+    tsdb_sid id;
     int rc = tsdbc_series_create(c, name, TSDB_INT64, NULL, &id);
     if (rc)
         die("series", rc);

@@ -26,8 +26,8 @@ use crate::keepalive::{self, KeepAlive};
 use crate::pack;
 use crate::protocol::extend_i64s;
 use crate::protocol::{
-    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, MULTI_PREFIX, Op, PACKED, PROTOCOL_VERSION, REPLACE_HEADER,
-    REPLY_HEADER, SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW, VALID, VALUES_CHUNK_HEADER, wire_id, wire_ids,
+    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, MULTI_PREFIX, Op, PACKED, PROTOCOL_MIN, PROTOCOL_VERSION,
+    REPLACE_HEADER, REPLY_HEADER, SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW, VALID, VALUES_CHUNK_HEADER,
 };
 use crate::types::{
     Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts,
@@ -188,8 +188,9 @@ impl Client {
         let Some(t) = timeout else {
             return Client::connect(addr);
         };
-        let c = Client::from_stream(connect_each(addr, t)?)?;
+        let mut c = Client::new(connect_each(addr, t)?)?;
         c.set_timeout(Some(t))?;
+        c.handshake()?;
         Ok(c)
     }
 
@@ -202,8 +203,26 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] if `TCP_NODELAY` cannot be set on the stream.
+    /// Then asks the server for its protocol version (HELLO) and refuses a server older than this client
+    /// needs (version 11, the 64-bit series ids).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if `TCP_NODELAY` cannot be set on the stream or the HELLO fails;
+    /// [`Error::Protocol`] if the server speaks a protocol older than 11
+    /// ("tsdbd speaks protocol N; this client needs 11: upgrade the server").
     pub fn from_stream(stream: TcpStream) -> Result<Client> {
+        let mut c = Client::new(stream)?;
+        c.handshake()?;
+        Ok(c)
+    }
+
+    /// The first HELLO of a connection: the server's version must be at least [`PROTOCOL_MIN`].
+    fn handshake(&mut self) -> Result<()> {
+        self.protocol_version().map(|_| ())
+    }
+
+    fn new(stream: TcpStream) -> Result<Client> {
         stream.set_nodelay(true)?;
         let _ = keepalive::apply(&stream, Some(KeepAlive::default()));
         Ok(Client {
@@ -324,6 +343,11 @@ impl Client {
         let mut r = Cursor::new(&self.body);
         let v = r.u32()?;
         end(&r)?;
+        if v < PROTOCOL_MIN {
+            return Err(Error::Protocol(format!(
+                "tsdbd speaks protocol {v}; this client needs {PROTOCOL_MIN}: upgrade the server"
+            )));
+        }
         self.server_version = Some(v);
         Ok(v)
     }
@@ -408,9 +432,8 @@ impl Client {
     /// after either the client refuses further calls.
     pub fn series_name(&mut self, id: SeriesId) -> Result<String> {
         self.run(|c| {
-            let id = wire_id(id)?;
             c.request(Op::SeriesName, |f| {
-                f.u32(id);
+                f.u64(id);
             })?;
             let mut r = Cursor::new(&c.body);
             let n = r.u16()? as usize;
@@ -430,9 +453,9 @@ impl Client {
             }
         })?;
         let mut r = Cursor::new(&self.body);
-        let id = r.u32()?;
+        let id = r.u64()?;
         end(&r)?;
-        Ok(id.into())
+        Ok(id)
     }
 
     /// Returns the id of series `name` of value type `ty`, creating it if needed
@@ -461,9 +484,9 @@ impl Client {
                 f.u8(ty.code()).u16(name.len() as u16).bytes(name).u16(path.len() as u16).bytes(path);
             })?;
             let mut r = Cursor::new(&c.body);
-            let id = r.u32()?;
+            let id = r.u64()?;
             end(&r)?;
-            Ok(id.into())
+            Ok(id)
         })
     }
 
@@ -475,9 +498,8 @@ impl Client {
     /// after either the client refuses further calls.
     pub fn series_type(&mut self, id: SeriesId) -> Result<ValueType> {
         self.run(|c| {
-            let id = wire_id(id)?;
             c.request(Op::SeriesType, |f| {
-                f.u32(id);
+                f.u64(id);
             })?;
             let mut r = Cursor::new(&c.body);
             let code = r.u8()?;
@@ -518,9 +540,8 @@ impl Client {
     /// after either the client refuses further calls.
     pub fn state_name(&mut self, series: SeriesId, code: u32) -> Result<String> {
         self.run(|c| {
-            let series = wire_id(series)?;
             c.request(Op::StateName, |f| {
-                f.u32(series).u32(code);
+                f.u64(series).u32(code);
             })?;
             let mut r = Cursor::new(&c.body);
             let n = r.u16()? as usize;
@@ -532,9 +553,8 @@ impl Client {
 
     fn state_req(&mut self, series: SeriesId, name: &str, create: bool) -> Result<u32> {
         let name = wire_str("state name", name, false)?;
-        let series = wire_id(series)?;
         self.request(Op::State, |f| {
-            f.u32(series).u8(create as u8).u16(name.len() as u16).bytes(name);
+            f.u64(series).u8(create as u8).u16(name.len() as u16).bytes(name);
         })?;
         let mut r = Cursor::new(&self.body);
         let code = r.u32()?;
@@ -730,10 +750,10 @@ impl Client {
                 self.collect_ack()?;
             }
             let f = self.req.begin(self.next_id, Op::Insert);
-            f.u32(m as u32).u32(series.map_or(one as u32, |_| MANY_SERIES)).i64s(&ts[off..off + m]);
+            f.u32(m as u32).u32(0).u64(series.map_or(one, |_| MANY_SERIES)).i64s(&ts[off..off + m]);
             Native::put(&values[off..off + m], f.raw());
             if let Some(s) = series {
-                f.sids(&s[off..off + m]);
+                f.align8().sids(&s[off..off + m]);
             }
             self.send_insert()?;
             off += m;
@@ -744,7 +764,7 @@ impl Client {
     }
 
     /// INSERT_VALUES frames: header, timestamps, values, the validity bitmap
-    /// if any, then (aligned to 4) the series of each row.
+    /// if any, then (aligned to 8) the series of each row.
     fn insert_values_frames(
         &mut self,
         series: Option<&[SeriesId]>,
@@ -773,12 +793,7 @@ impl Client {
                 self.collect_ack()?;
             }
             let f = self.req.begin(self.next_id, Op::InsertValues);
-            f.u32(m as u32)
-                .u32(series.map_or(one as u32, |_| MANY_SERIES))
-                .u8(col.value_type().code())
-                .u8(flags)
-                .u16(0)
-                .u32(0);
+            f.u32(m as u32).u8(col.value_type().code()).u8(flags).u16(0).u64(series.map_or(one, |_| MANY_SERIES));
             if packed {
                 let p = match &mut self.packer {
                     Some(p) => p,
@@ -810,7 +825,7 @@ impl Client {
                     f.bytes(&v.as_bytes()[off / 8..(off + m).div_ceil(8)]);
                 }
                 if let Some(s) = series {
-                    f.align4().sids(&s[off..off + m]);
+                    f.align8().sids(&s[off..off + m]);
                 }
             }
             self.send_insert()?;
@@ -1119,7 +1134,6 @@ impl Client {
     where
         F: FnMut(Chunk<'_>) -> Result<ControlFlow<()>>,
     {
-        let wire = wire_id(series)?;
         self.wait_inner()?;
         let (limit, mut stopped) = match opts.wire_limit() {
             Some(l) => (l, false),
@@ -1128,8 +1142,8 @@ impl Client {
         match lttb {
             None => self.send_range_query(Op::QueryValues, series, start, end, opts.order, limit)?,
             Some(t) => {
-                // order and limit only when they change something: the 28-byte form is what every server takes
-                let f = self.req.begin(self.next_id, Op::QueryLttb).u32(wire).i64(start).i64(end).u64(t);
+                // order and limit only when they change something: the 32-byte form is the shortest
+                let f = self.req.begin(self.next_id, Op::QueryLttb).u64(series).i64(start).i64(end).u64(t);
                 if opts.order == Order::Desc || opts.limit.is_some() {
                     f.u8((opts.order == Order::Desc) as u8).u64(limit);
                 }
@@ -1182,8 +1196,7 @@ impl Client {
         order: Order,
         limit: u64,
     ) -> Result<()> {
-        let series = wire_id(series)?;
-        self.req.begin(self.next_id, op).u32(series).i64(start).i64(end).u8((order == Order::Desc) as u8).u64(limit);
+        self.req.begin(self.next_id, op).u64(series).i64(start).i64(end).u8((order == Order::Desc) as u8).u64(limit);
         self.send()
     }
 
@@ -1387,7 +1400,6 @@ impl Client {
         opts: QueryOpts,
         fields: u8,
     ) -> Result<bool> {
-        let series = wire_id(series)?;
         check_bounds(b)?;
         if fields != 0 {
             self.need_version(8)?;
@@ -1397,7 +1409,7 @@ impl Client {
             return Ok(false);
         };
         self.request(Op::QueryBounds, |f| {
-            f.u32(series)
+            f.u64(series)
                 .i64(start)
                 .i64(end)
                 .u8((opts.order == Order::Desc) as u8)
@@ -1442,7 +1454,6 @@ impl Client {
         opts: QueryOpts,
         fields: u8,
     ) -> Result<bool> {
-        let series = wire_id(series)?;
         let tz = wire_str("time zone", group.and_then(|g| g.timezone.as_deref()).unwrap_or(""), true)?;
         if fields != 0 {
             self.need_version(8)?;
@@ -1452,7 +1463,7 @@ impl Client {
             return Ok(false);
         };
         self.request(Op::QueryBuckets, |f| {
-            f.u32(series)
+            f.u64(series)
                 .i64(start)
                 .i64(end)
                 .i64(interval)
@@ -1660,7 +1671,6 @@ impl Client {
         b: &[i64],
         opts: TwaOpts,
     ) -> Result<Vec<TwaBucket>> {
-        let series = wire_id(series)?;
         if b.len() > (MAX_FRAME - 64 - TWA_HEADER) / 8 {
             return Err(Error::InvalidArgument(format!("{} bucket bounds", b.len())));
         }
@@ -1669,7 +1679,7 @@ impl Client {
             return Ok(Vec::new());
         };
         self.request(Op::QueryTwa, |f| {
-            f.u32(series)
+            f.u64(series)
                 .i64(start)
                 .i64(end)
                 .u8(opts.method as u8)
@@ -1711,10 +1721,9 @@ impl Client {
     pub fn delete_range(&mut self, series: SeriesId, range: impl RangeBounds<i64>) -> Result<()> {
         let (start, end) = self::bounds(&range);
         self.run(|c| {
-            let series = wire_id(series)?;
             c.need_deletes()?;
             c.request(Op::DeleteRange, |f| {
-                f.u32(series).u32(0).i64(start).i64(end);
+                f.u64(series).i64(start).i64(end);
             })
         })
     }
@@ -1753,7 +1762,6 @@ impl Client {
     fn replace_req(&mut self, series: SeriesId, start: i64, end: i64, ts: &[i64], col: ColumnRef<'_>) -> Result<()> {
         let n = ts.len();
         check_lengths(None, series, ts, col.len())?;
-        let series = series as u32; // check_lengths: it fits
         if let Some(v) = col.valid
             && v.len() != n
         {
@@ -1767,11 +1775,10 @@ impl Client {
         self.need_deletes()?;
         self.request(Op::ReplaceRange, |f| {
             f.u32(n as u32)
-                .u32(series)
                 .u8(ty.code())
                 .u8(if col.valid.is_some() { VALID } else { 0 })
                 .u16(0)
-                .u32(0)
+                .u64(series)
                 .i64(start)
                 .i64(end)
                 .i64s(ts);
@@ -1792,10 +1799,9 @@ impl Client {
     /// [`delete_range`](Client::delete_range).
     pub fn set_retention(&mut self, series: SeriesId, limit_ms: i64) -> Result<()> {
         self.run(|c| {
-            let series = wire_id(series)?;
             c.need_deletes()?;
             c.request(Op::SetRetention, |f| {
-                f.u32(series).u32(0).i64(limit_ms);
+                f.u64(series).i64(limit_ms);
             })
         })
     }
@@ -1807,10 +1813,9 @@ impl Client {
     /// As [`set_retention`](Client::set_retention).
     pub fn retention(&mut self, series: SeriesId) -> Result<i64> {
         self.run(|c| {
-            let series = wire_id(series)?;
             c.need_deletes()?;
             c.request(Op::GetRetention, |f| {
-                f.u32(series);
+                f.u64(series);
             })?;
             let mut r = Cursor::new(&c.body);
             let v = r.i64()?;
@@ -2118,7 +2123,7 @@ struct Chunk<'a> {
     valid: Option<&'a [u8]>,
 }
 
-/// Also checks that the ids fit protocol 10 (`one as u32` and [`FrameBuf::sids`] rely on it).
+/// Also refuses `MANY_SERIES` as a single id: it is the marker of the many-series layout, never an id.
 fn check_lengths(series: Option<&[SeriesId]>, one: SeriesId, ts: &[i64], values: usize) -> Result<()> {
     if ts.len() != values || series.is_some_and(|s| s.len() != ts.len()) {
         return Err(Error::InvalidArgument(format!(
@@ -2127,14 +2132,9 @@ fn check_lengths(series: Option<&[SeriesId]>, one: SeriesId, ts: &[i64], values:
             series.map_or(String::new(), |s| format!(", {} series", s.len()))
         )));
     }
-    match series {
-        Some(s) => wire_ids(s)?,
-        None => {
-            if one == MANY_SERIES as u64 {
-                return Err(Error::InvalidArgument(format!("series id {one} is reserved")));
-            }
-            wire_id(one)?;
-        }
+    // a MANY_SERIES in the array itself is refused by tsdbd (unknown series); only the single id is the marker
+    if series.is_none() && one == MANY_SERIES {
+        return Err(Error::InvalidArgument(format!("series id {one} is reserved")));
     }
     Ok(())
 }

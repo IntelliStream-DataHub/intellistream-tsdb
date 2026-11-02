@@ -186,18 +186,18 @@ static int32_t raw_reply(int fd, uint32_t *id, uint8_t *rest, size_t cap, size_t
     return status;
 }
 
-static void raw_insert(int fd, uint32_t id, uint32_t series, int64_t ts, float v)
+static void raw_insert(int fd, uint32_t id, tsdb_sid series, int64_t ts, float v)
 {
-    uint8_t b[20];
+    uint8_t b[28] = {0};
     uint32_t one = 1;
     memcpy(b, &one, 4);
-    memcpy(b + 4, &series, 4);
-    memcpy(b + 8, &ts, 8);
-    memcpy(b + 16, &v, 4);
+    memcpy(b + 8, &series, 8);
+    memcpy(b + 16, &ts, 8);
+    memcpy(b + 24, &v, 4);
     raw_send(fd, id, TSDB_OP_INSERT, b, sizeof b);
 }
 
-static uint64_t count_of(tsdbc *c, uint32_t series)
+static uint64_t count_of(tsdbc *c, tsdb_sid series)
 {
     tsdb_bucket *b;
     size_t nb;
@@ -213,7 +213,7 @@ static uint64_t count_of(tsdbc *c, uint32_t series)
  * server saw the close, so pipelined inserts without a wait got lost. */
 static void test_close(tsdbc *c)
 {
-    uint32_t d, e;
+    tsdb_sid d, e;
     OK(tsdbc_series(c, "close.async", 1, &d));
     OK(tsdbc_series(c, "close.halfclose", 1, &e));
     tsdbc *c2;
@@ -247,27 +247,227 @@ static void test_close(tsdbc *c)
 }
 
 /* Regressions in request and reply framing. */
-/* HELLO answers the version both sides speak: an older client (whose tests compare it with
- * its own constant) hears its own version, a newer one the server's. */
+/* HELLO answers the version both sides speak: a newer client hears the server's. One below
+ * TSDB_PROTOCOL_MIN (protocol 11 widened every series id) is refused, and its connection closed. */
 static void test_hello(void)
 {
     int fd = raw_connect();
-    const uint32_t asks[] = {4, 5, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION + 7, 0};
-    const uint32_t want[] = {4, 5, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION};
-    for (uint32_t i = 0; i < 6; i++) {
-        raw_send(fd, 70 + i, TSDB_OP_HELLO, i < 5 ? &asks[i] : NULL, i < 5 ? 4 : 0); /* the last: no version */
+    const uint32_t asks[] = {TSDB_PROTOCOL_VERSION, TSDB_PROTOCOL_VERSION + 7};
+    for (uint32_t i = 0; i < 3; i++) {
+        raw_send(fd, 70 + i, TSDB_OP_HELLO, i < 2 ? &asks[i] : NULL, i < 2 ? 4 : 0); /* the last: no version */
         uint32_t rid, v = 0;
         uint8_t rest[16];
         size_t nrest = 0;
         CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 70 + i && nrest == 4);
         memcpy(&v, rest, 4);
-        CHECK(v == (i < 5 ? want[i] : TSDB_PROTOCOL_VERSION));
+        CHECK(v == TSDB_PROTOCOL_VERSION);
     }
     close(fd);
+    const uint32_t old[] = {TSDB_PROTOCOL_MIN - 1, 1, 0};
+    for (int k = 0; k < 3; k++) {
+        fd = raw_connect();
+        /* a request behind the refused HELLO, in the same segment: never answered */
+        raw_send(fd, 80, TSDB_OP_HELLO, &old[k], 4);
+        raw_send(fd, 81, TSDB_OP_STATS, NULL, 0);
+        uint32_t rid;
+        uint8_t rest[16];
+        size_t nrest = 0;
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID && rid == 80 && nrest == 0);
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == INT32_MIN); /* closed: end of stream */
+        close(fd);
+    }
+}
+
+/* One request on its own connection: the status and the first reply frame's body (up to cap bytes). */
+static int32_t raw_once(uint8_t op, const void *p, uint32_t len, uint8_t *body, size_t cap, size_t *n)
+{
+    int fd = raw_connect();
+    raw_send(fd, 5, op, p, len);
+    uint32_t rid = 0;
+    *n = 0;
+    int32_t st = raw_reply(fd, &rid, body, cap, n);
+    CHECK(rid == 5);
+    close(fd);
+    return st;
+}
+
+typedef struct wire_ans {
+    int32_t st;
+    size_t n;
+    uint8_t body[256];
+} wire_ans;
+
+static bool ans_same(const wire_ans *a, const wire_ans *b)
+{
+    return a->st == b->st && a->n == b->n && memcmp(a->body, b->body, a->n < 256 ? a->n : 256) == 0;
+}
+
+/* The payload of an id-taking op for series x (code: of STATE_NAME). Returns its length. */
+static uint32_t id_payload(uint8_t op, uint64_t x, uint32_t code, uint8_t *p)
+{
+    int64_t lo = INT64_MIN, hi = INT64_MAX, t0 = T0;
+    uint64_t th = 10;
+    memset(p, 0, 64);
+    memcpy(p, &x, 8);
+    switch (op) {
+    case TSDB_OP_SERIES_NAME:
+    case TSDB_OP_SERIES_TYPE:
+    case TSDB_OP_GET_RETENTION: return 8;
+    case TSDB_OP_STATE_NAME: memcpy(p + 8, &code, 4); return 12;
+    case TSDB_OP_STATE: p[9] = 2, p[11] = 'o', p[12] = 'n'; return 13; /* lookup "on" */
+    case TSDB_OP_QUERY_RAW:
+    case TSDB_OP_QUERY_VALUES:
+        memcpy(p + 8, &lo, 8), memcpy(p + 16, &hi, 8);
+        return 24;
+    case TSDB_OP_QUERY_LTTB:
+        memcpy(p + 8, &lo, 8), memcpy(p + 16, &hi, 8), memcpy(p + 24, &th, 8);
+        return 32;
+    case TSDB_OP_QUERY_BUCKETS:
+        memcpy(p + 8, &lo, 8), memcpy(p + 16, &hi, 8);
+        return 48;
+    case TSDB_OP_QUERY_BOUNDS: {
+        uint32_t one = 1;
+        memcpy(p + 8, &lo, 8), memcpy(p + 16, &hi, 8), memcpy(p + 33, &one, 4), memcpy(p + 37, &t0, 8);
+        return 45;
+    }
+    case TSDB_OP_QUERY_TWA: memcpy(p + 8, &lo, 8), memcpy(p + 16, &hi, 8); return TSDB_TWA_HEADER;
+    }
+    return 0;
+}
+
+/* Protocol 11: series ids are u64 on the wire. An id that differs from an existing one only above bit 31 is
+ * another series, unknown to the server, never the existing one cut to 32 bits; UINT64_MAX (TSDB_MANY_SERIES)
+ * names no series. Ops 6 and 11 (QUERY_AGG, QUERY_GROUP) were removed: unknown ops. Many-series inserts carry
+ * their u64 ids after zero bytes to a multiple of 8. */
+static void test_wide_ids(tsdbc *c)
+{
+    tsdb_sid k, kst;
+    OK(tsdbc_series_create(c, "wide.f32", TSDB_FLOAT32, NULL, &k));
+    OK(tsdbc_series_create(c, "wide.state", TSDB_STATE, NULL, &kst));
+    CHECK(k < (1ull << 32) && kst < (1ull << 32));
+    int64_t ts[3] = {T0, T0 + 1, T0 + 2};
+    float v[3] = {1, 2, 3};
+    OK(tsdbc_insert_series(c, k, ts, v, 3));
+    uint32_t code;
+    OK(tsdbc_state(c, kst, "on", &code));
+    const uint64_t unknown = 0xffffff00u; /* below 2^32 and never handed out here */
+
+    /* reads: the alias and UINT64_MAX are answered as the unknown id is, not as the series */
+    static const uint8_t reads[] = {TSDB_OP_SERIES_NAME, TSDB_OP_SERIES_TYPE, TSDB_OP_GET_RETENTION,
+                                    TSDB_OP_STATE_NAME,  TSDB_OP_STATE,       TSDB_OP_QUERY_RAW,
+                                    TSDB_OP_QUERY_VALUES, TSDB_OP_QUERY_LTTB, TSDB_OP_QUERY_BUCKETS,
+                                    TSDB_OP_QUERY_BOUNDS, TSDB_OP_QUERY_TWA};
+    for (size_t i = 0; i < sizeof reads; i++) {
+        uint8_t op = reads[i], p[64];
+        bool st_op = op == TSDB_OP_STATE || op == TSDB_OP_STATE_NAME;
+        uint64_t base = st_op ? kst : k;
+        uint64_t xs[4] = {base, base + (1ull << 32), base | 0xffffffff00000000ull, UINT64_MAX};
+        wire_ans known, none, a;
+        uint32_t len = id_payload(op, unknown, code, p);
+        none.st = raw_once(op, p, len, none.body, sizeof none.body, &none.n);
+        for (int x = 0; x < 4; x++) {
+            id_payload(op, xs[x], code, p);
+            wire_ans *w = x ? &a : &known;
+            w->st = raw_once(op, p, len, w->body, sizeof w->body, &w->n);
+            if (x == 0)
+                CHECK(known.st == 0 && !ans_same(&known, &none));
+            else if (!ans_same(&a, &none))
+                fprintf(stderr, "  op %u, id %#llx: status %d, %zu bytes; unknown id: %d, %zu bytes\n", op,
+                        (unsigned long long)xs[x], a.st, a.n, none.st, none.n);
+            CHECK(x == 0 || ans_same(&a, &none));
+        }
+    }
+
+    /* writes: refused like the unknown id (UINT64_MAX in a single-series INSERT means a series per row, and the
+     * frame is then the wrong length), and the series keeps its rows */
+    static const uint8_t writes[] = {TSDB_OP_INSERT,       TSDB_OP_INSERT_VALUES, TSDB_OP_DELETE_RANGE,
+                                     TSDB_OP_REPLACE_RANGE, TSDB_OP_SET_RETENTION};
+    for (size_t i = 0; i < sizeof writes; i++) {
+        uint8_t op = writes[i];
+        uint64_t xs[4] = {unknown, k + (1ull << 32), k | 0xffffffff00000000ull, UINT64_MAX};
+        int32_t want = 0;
+        for (int x = 0; x < 4; x++) {
+            uint8_t p[64] = {0}, body[64];
+            uint32_t one = 1, len = 0;
+            int64_t t = T0 + 10, lo = INT64_MIN, hi = INT64_MAX, lim = 1;
+            float fv = 9;
+            switch (op) {
+            case TSDB_OP_INSERT:
+                memcpy(p, &one, 4), memcpy(p + 8, &xs[x], 8), memcpy(p + 16, &t, 8), memcpy(p + 24, &fv, 4);
+                len = 28;
+                break;
+            case TSDB_OP_INSERT_VALUES:
+                memcpy(p, &one, 4), memcpy(p + 8, &xs[x], 8), memcpy(p + 16, &t, 8), memcpy(p + 24, &fv, 4);
+                len = 28;
+                break;
+            case TSDB_OP_DELETE_RANGE:
+                memcpy(p, &xs[x], 8), memcpy(p + 8, &lo, 8), memcpy(p + 16, &hi, 8);
+                len = 24;
+                break;
+            case TSDB_OP_REPLACE_RANGE: /* no rows: would empty the series */
+                memcpy(p + 8, &xs[x], 8), memcpy(p + 16, &lo, 8), memcpy(p + 24, &hi, 8);
+                len = TSDB_REPLACE_HEADER;
+                break;
+            case TSDB_OP_SET_RETENTION: /* 1 ms: would expire every row */
+                memcpy(p, &xs[x], 8), memcpy(p + 8, &lim, 8);
+                len = 16;
+                break;
+            }
+            size_t n;
+            int32_t st = raw_once(op, p, len, body, sizeof body, &n);
+            if (x == 0)
+                want = st;
+            CHECK(st != 0 && (x == 3 || st == want));
+        }
+        CHECK(count_of(c, k) == 3);
+    }
+
+    /* the removed ops are unknown; the connection carries on */
+    int fd = raw_connect();
+    uint8_t q[36] = {0};
+    memcpy(q, &k, 8);
+    for (int i = 0; i < 2; i++) {
+        uint32_t rid;
+        uint8_t rest[64];
+        size_t nrest;
+        raw_send(fd, 20 + (uint32_t)i, i ? 11 : 6, q, i ? 36 : 28);
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID && rid == 20u + (uint32_t)i);
+    }
+    close(fd);
+    CHECK(count_of(c, k) == 3);
+
+    /* many-series INSERT and INSERT_VALUES (with a validity bitmap): zero bytes to a multiple of 8, then the ids */
+    for (int vals = 0; vals < 2; vals++)
+        for (int bad = 0; bad < 4; bad++) { /* 1: a pad byte set; 2: an alias of k; 3: UINT64_MAX among them */
+            uint8_t p[128] = {0}, body[64];
+            uint32_t three = 3;
+            uint64_t many = TSDB_MANY_SERIES;
+            int64_t t3[3] = {T0 + 100 + vals * 10, T0 + 101 + vals * 10, T0 + 102 + vals * 10};
+            float f3[3] = {4, 5, 6};
+            uint64_t ids[3] = {k, k, bad == 2 ? k + (1ull << 32) : bad == 3 ? UINT64_MAX : k};
+            memcpy(p, &three, 4);
+            memcpy(p + 8, &many, 8);
+            memcpy(p + 16, t3, 24);
+            memcpy(p + 40, f3, 12); /* 52 bytes */
+            size_t end = 52;
+            if (vals) {
+                p[5] = TSDB_VALID; /* type 0: float32 */
+                p[52] = 0x7;
+                end = 53;
+            }
+            if (bad == 1)
+                p[end] = 1;
+            memcpy(p + 56, ids, 24);
+            uint64_t before = count_of(c, k);
+            size_t n;
+            int32_t st = raw_once(vals ? TSDB_OP_INSERT_VALUES : TSDB_OP_INSERT, p, 80, body, sizeof body, &n);
+            CHECK(bad ? st == TSDB_ERR_INVALID : st == 0);
+            CHECK(count_of(c, k) == before + (bad ? 0 : 3));
+        }
 }
 
 /* A server older than the client: it answers HELLO with fake_version and refuses everything else, counting it.
- * The client must refuse what that version does not know without sending it. */
+ * The client must refuse it at connect (below TSDB_PROTOCOL_MIN) without sending anything else. */
 static uint32_t fake_version;
 static int fake_others; /* read after the join */
 
@@ -310,31 +510,9 @@ static void test_old_server(uint32_t version)
     fake_others = 0;
     pthread_t th;
     CHECK(pthread_create(&th, NULL, fake_server, &lfd) == 0);
-    tsdbc *c;
-    OK(tsdbc_connect("127.0.0.1", ntohs(sa.sin_port), &c));
-    OK(tsdbc_set_compression(c, 0));
-    CHECK(tsdbc_server_version(c) == version);
-    int64_t lim = 7, t = T0;
-    double one = 1;
-    tsdb_values col = {TSDB_FLOAT64, &one, NULL};
-    if (version < 7) {
-        CHECK(tsdbc_delete_range(c, 1, T0, T0 + 10) == TSDB_ERR_INVALID);
-        CHECK(tsdbc_replace_range(c, 1, T0, T0 + 10, &t, &col, 1) == TSDB_ERR_INVALID);
-        CHECK(tsdbc_set_retention(c, 1, 1000) == TSDB_ERR_INVALID);
-        CHECK(tsdbc_get_retention(c, 1, &lim) == TSDB_ERR_INVALID);
-    }
-    if (version < 9) { /* LTTB's order and limit are version 9; the plain form still goes out */
-        tsdb_query_opts desc = {TSDB_DESC, 0}, lim = {TSDB_ASC, 5};
-        CHECK(tsdbc_query_lttb_ex(c, 1, T0, T0 + 10, 100, &desc, NULL, NULL) == TSDB_ERR_INVALID);
-        CHECK(tsdbc_query_lttb_ex(c, 1, T0, T0 + 10, 100, &lim, NULL, NULL) == TSDB_ERR_INVALID);
-    }
-    if (version < 6) {
-        tsdb_twa_bucket *b = NULL;
-        size_t nb = 0;
-        CHECK(tsdbc_query_twa(c, 1, T0, T0 + 10, 0, NULL, &b, &nb) == TSDB_ERR_INVALID && nb == 0);
-        free(b);
-    }
-    tsdbc_close(c);
+    tsdbc *c = (tsdbc *)&lfd;
+    fprintf(stderr, "(a refusal message follows)\n");
+    CHECK(tsdbc_connect("127.0.0.1", ntohs(sa.sin_port), &c) == TSDB_ERR_INVALID && c == NULL);
     pthread_join(th, NULL);
     close(lfd);
     CHECK(fake_others == 0); /* only HELLO went out */
@@ -390,7 +568,7 @@ static int collect_values(void *ctx, const int64_t *ts, const tsdb_values *col, 
 
 static void test_types(tsdbc *c)
 {
-    uint32_t d, i, b, st, again;
+    tsdb_sid d, i, b, st, again;
     OK(tsdbc_series_create(c, "t.f64", TSDB_FLOAT64, NULL, &d));
     OK(tsdbc_series_create(c, "t.i64", TSDB_INT64, NULL, &i));
     OK(tsdbc_series_create(c, "t.bool", TSDB_BOOL, NULL, &b));
@@ -440,7 +618,7 @@ static void test_types(tsdbc *c)
     free(bk);
 
     /* many series in one frame: float64 rows for d, then bools, states */
-    uint32_t sv[4] = {d, d, d, d};
+    tsdb_sid sv[4] = {d, d, d, d};
     double dv[4] = {1.5, 2.25, -3.0, 1e300};
     OK(tsdbc_insert_values(c, sv, ts, &(tsdb_values){TSDB_FLOAT64, dv, NULL}, 4));
     OK(tsdbc_query_agg(c, d, INT64_MIN, INT64_MAX, 0, &bk, &nb));
@@ -466,7 +644,7 @@ static void test_types(tsdbc *c)
     CHECK(strcmp(name, "on") == 0);
     CHECK(tsdbc_state_name(c, st, 999, name, sizeof name) == TSDB_ERR_NOTFOUND);
     uint32_t codes[3] = {on, off, on};
-    uint32_t stv[3] = {st, st, st};
+    tsdb_sid stv[3] = {st, st, st};
     OK(tsdbc_insert_values(c, stv, ts, &(tsdb_values){TSDB_STATE, codes, NULL}, 3));
     r.n = 0;
     OK(tsdbc_query_values(c, st, INT64_MIN, INT64_MAX, NULL, collect_values, &r));
@@ -486,12 +664,12 @@ static void test_types(tsdbc *c)
         uint8_t f[TSDB_VALUES_HEADER + 8 + 8] = {0};
         uint32_t one = 1;
         memcpy(f, &one, 4);
-        memcpy(f + 4, &i, 4);
-        f[8] = TSDB_INT64;
+        f[4] = TSDB_INT64;
+        memcpy(f + 8, &i, 8);
         if (bad)
-            f[12] = 1; /* a reserved byte */
+            f[6] = 1; /* a reserved byte */
         else
-            f[9] = 0x80; /* an unknown flag */
+            f[5] = 0x80; /* an unknown flag */
         memcpy(f + 16, &ts[0], 8);
         memcpy(f + 24, &iv[0], 8);
         raw_send(fd, 40 + (uint32_t)bad, TSDB_OP_INSERT_VALUES, f, sizeof f);
@@ -501,29 +679,10 @@ static void test_types(tsdbc *c)
         CHECK(raw_reply(fd, &rid0, rest0, sizeof rest0, &nrest0) == TSDB_ERR_INVALID && rid0 == 40 + (uint32_t)bad);
     }
     close(fd);
-
-    /* QUERY_AGG still answers with version 1 rows (f32 min and max) */
-    fd = raw_connect();
-    uint8_t q[28];
-    int64_t lo = INT64_MIN, hi = INT64_MAX, every = 0;
-    memcpy(q, &d, 4);
-    memcpy(q + 4, &lo, 8);
-    memcpy(q + 12, &hi, 8);
-    memcpy(q + 20, &every, 8);
-    raw_send(fd, 5, TSDB_OP_QUERY_AGG, q, sizeof q);
-    uint32_t rid;
-    uint8_t rest[64];
-    size_t nrest = 0;
-    CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0);
-    float mn, mx;
-    memcpy(&mn, rest + 4 + 24, 4);
-    memcpy(&mx, rest + 4 + 28, 4);
-    CHECK(nrest == 4 + TSDB_AGG_ROW && mn == -3.0f && isinf(mx));
-    close(fd);
 }
 
-/* NaN results through the server: one quiet NaN 0x7ff8000000000000 (0x7fc00000 in the float32 min and max of
- * version 1 rows), whatever payloads the data had; raw values keep theirs. */
+/* NaN results through the server: one quiet NaN 0x7ff8000000000000, whatever payloads the data had; raw values
+ * keep theirs. */
 static bool canon64(double d)
 {
     uint64_t b;
@@ -561,7 +720,7 @@ static void test_nan(tsdbc *c)
     static const uint32_t p32[] = {0x7fc00001u, 0xffc00000u, 0x7f800001u, 0x7f801001u,
                                    0x7fc01000u, 0x7fc01002u, 0xffffffffu, 0x7fc0deadu};
     uint64_t x = 0x2545f4914f6cdd1dull;
-    uint32_t ids[2];
+    tsdb_sid ids[2];
     OK(tsdbc_series_create(c, "nan.f32", TSDB_FLOAT32, NULL, &ids[0]));
     OK(tsdbc_series_create(c, "nan.f64", TSDB_FLOAT64, NULL, &ids[1]));
     static uint64_t ref[2][NN];
@@ -642,27 +801,6 @@ static void test_nan(tsdbc *c)
             fprintf(stderr, "  %s: %zu NaN results are not 0x7ff8000000000000\n", t ? "float64" : "float32", bad);
         CHECK(bad == 0 && nan_sums > 10 && nan_mins >= 2);
 
-        /* version 1 rows (QUERY_AGG): double sum, float32 min and max */
-        int fd = raw_connect();
-        uint8_t q[28];
-        int64_t a = lo + 1000 * 1000, z = lo + 1100 * 1000, every = 0;
-        memcpy(q, &ids[t], 4);
-        memcpy(q + 4, &a, 8);
-        memcpy(q + 12, &z, 8);
-        memcpy(q + 20, &every, 8);
-        raw_send(fd, 7, TSDB_OP_QUERY_AGG, q, sizeof q);
-        uint32_t rid;
-        uint8_t rest[64];
-        size_t nrest = 0;
-        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && nrest == 4 + TSDB_AGG_ROW);
-        uint64_t sb;
-        uint32_t mnb, mxb;
-        memcpy(&sb, rest + 4 + 16, 8);
-        memcpy(&mnb, rest + 4 + 24, 4);
-        memcpy(&mxb, rest + 4 + 28, 4);
-        CHECK(sb == 0x7ff8000000000000ull && mnb == 0x7fc00000u && mxb == 0x7fc00000u);
-        close(fd);
-
         /* raw: the payloads as written */
         nan_rows r = {malloc(NN * 8), 0, NN, t};
         OK(tsdbc_query_values(c, ids[t], lo, hi, NULL, collect_bits, &r));
@@ -694,7 +832,7 @@ static int count_rows(void *ctx, const int64_t *ts, const float *v, size_t n)
 }
 
 typedef struct cjob {
-    uint32_t id;
+    tsdb_sid id;
     int errors;
 } cjob;
 
@@ -758,7 +896,7 @@ static int lttb_stop(void *ctx, const int64_t *ts, const tsdb_values *col, size_
 
 static void test_lttb_remote(tsdbc *c)
 {
-    uint32_t f, bo, st;
+    tsdb_sid f, bo, st;
     OK(tsdbc_series_create(c, "lttb.f64", TSDB_FLOAT64, NULL, &f));
     OK(tsdbc_series_create(c, "lttb.bool", TSDB_BOOL, NULL, &bo));
     OK(tsdbc_series_create(c, "lttb.state", TSDB_STATE, NULL, &st));
@@ -777,7 +915,7 @@ static void test_lttb_remote(tsdbc *c)
     OK(tsdbc_insert_series_values(c, f, ts, &(tsdb_values){TSDB_FLOAT64, dv, valid}, N));
     OK(tsdbc_insert_series_values(c, bo, ts, &(tsdb_values){TSDB_BOOL, bv, valid}, N));
     size_t ths[] = {3, 500, 40000, N + 10};
-    uint32_t ser[] = {f, bo};
+    tsdb_sid ser[] = {f, bo};
     for (size_t s = 0; s < 2; s++)
         for (size_t k = 0; k < sizeof ths / sizeof *ths; k++) {
             lpts raw = {0}, got = {0};
@@ -821,16 +959,16 @@ static void test_lttb_remote(tsdbc *c)
         free(asc.p), free(d.p), free(dl.p), free(al.p);
     }
 
-    /* the request is exactly 28 bytes, or 37 with order and limit: other lengths are refused */
+    /* the request is exactly 32 bytes, or 41 with order and limit: other lengths are refused */
     int fd = raw_connect();
-    uint8_t q[38] = {0};
+    uint8_t q[42] = {0};
     int64_t lo = INT64_MIN, hi = INT64_MAX;
     uint64_t t = 10;
-    memcpy(q, &f, 4);
-    memcpy(q + 4, &lo, 8);
-    memcpy(q + 12, &hi, 8);
-    memcpy(q + 20, &t, 8);
-    for (uint32_t len = 27; len <= 38; len += len == 29 ? 7 : 2) {
+    memcpy(q, &f, 8);
+    memcpy(q + 8, &lo, 8);
+    memcpy(q + 16, &hi, 8);
+    memcpy(q + 24, &t, 8);
+    for (uint32_t len = 31; len <= 42; len += len == 33 ? 7 : 2) {
         raw_send(fd, 40 + len, TSDB_OP_QUERY_LTTB, q, len);
         uint32_t rid;
         uint8_t rest[256];
@@ -848,48 +986,16 @@ static void test_lttb_remote(tsdbc *c)
 /* A bucketed reply that does not fit a frame is refused with TSDB_ERR_TOO_MANY_BUCKETS, and the server computes
  * no more buckets than a frame carries (plus one) to find out: it used to build the whole reply, over 256 MB,
  * which the client then refused as a broken frame. A limit within a frame still answers. */
-/* QUERY_AGG over a raw connection: its status, and the buckets of an answer in *nb (the reply is read and dropped) */
-static int32_t raw_query_agg(uint32_t s, int64_t start, int64_t end, int64_t interval, size_t *nb)
-{
-    int fd = raw_connect();
-    uint8_t q[28], h[13];
-    memcpy(q, &s, 4);
-    memcpy(q + 4, &start, 8);
-    memcpy(q + 12, &end, 8);
-    memcpy(q + 20, &interval, 8);
-    raw_send(fd, 9, TSDB_OP_QUERY_AGG, q, sizeof q);
-    int32_t status = INT32_MIN;
-    uint32_t flen, n = 0;
-    *nb = 0;
-    if (read_full(fd, h, 13)) {
-        memcpy(&flen, h, 4);
-        memcpy(&status, h + 9, 4);
-        size_t left = flen - 9; /* after the status */
-        if (status == 0 && left >= 4 && read_full(fd, &n, 4)) {
-            left -= 4;
-            *nb = n;
-            CHECK(left == (size_t)n * TSDB_AGG_ROW);
-        }
-        static uint8_t sink[1 << 16];
-        while (left && read_full(fd, sink, left < sizeof sink ? left : sizeof sink))
-            left -= left < sizeof sink ? left : sizeof sink;
-    }
-    close(fd);
-    return status;
-}
-
 /* A reply is at most one frame: exactly a frame's worth of buckets answers, one more is TOO_MANY_BUCKETS (not a
- * frame the client refuses), for aggregates (64-byte rows) and the spread (104); QUERY_AGG's 32-byte rows meet the
- * engine's limit first (4 Mi buckets a query, a frame's worth at most). A request without
+ * frame the client refuses), for aggregates (64-byte rows) and the spread (104). A request without
  * a limit is the embedded query: a span over the engine's limit is refused at once, however few rows it has. One
  * with a larger limit computes about a frame's worth (it runs with one bucket more than a frame as its limit). */
 static void test_frame_cap(tsdbc *c)
 {
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdbc_series_create(c, "cap.f32", TSDB_FLOAT32, NULL, &s));
-    size_t acap = (TSDB_MAX_FRAME - 13) / TSDB_AGG_ROW, bcap = (TSDB_MAX_FRAME - 13) / TSDB_BUCKET_ROW,
-           scap = (TSDB_MAX_FRAME - 13) / TSDB_SPREAD_ROW;
-    size_t n = acap + 1, chunk = 500000;
+    size_t bcap = (TSDB_MAX_FRAME - 13) / TSDB_BUCKET_ROW, scap = (TSDB_MAX_FRAME - 13) / TSDB_SPREAD_ROW;
+    size_t n = 2 * bcap + 2, chunk = 500000; /* a frame and a bucket stay under half of the granules */
     int64_t *ts = malloc(chunk * sizeof *ts);
     float *v = malloc(chunk * sizeof *v);
     for (size_t a = 0; a < n; a += chunk) {
@@ -911,9 +1017,7 @@ static void test_frame_cap(tsdbc *c)
     CHECK(nb == bcap && b[bcap - 1].start == T0 + (int64_t)bcap - 1);
     free(b);
     CHECK(tsdbc_query_agg(c, s, T0, T0 + (int64_t)bcap + 1, 1, &b, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
-    CHECK(raw_query_agg(s, T0, T0 + (4 << 20), 1, &nb) == 0 && nb == (4u << 20));
-    CHECK(raw_query_agg(s, T0, T0 + (4 << 20) + 1, 1, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
-    CHECK(raw_query_agg(s, INT64_MIN, INT64_MAX, 1, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
+    CHECK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 1, &b, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
 
     /* a limit over a frame computes a frame and one bucket, not the 8 M rows' buckets */
     tsdb_query_opts all = {TSDB_ASC, SIZE_MAX};
@@ -945,7 +1049,6 @@ static void test_frame_cap(tsdbc *c)
     OK(tsdbc_flush(c));
     CHECK(tsdbc_query_agg(c, s, INT64_MIN, INT64_MAX, 1, &b, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
     CHECK(tsdbc_query_spread(c, s, INT64_MIN, INT64_MAX, 1, NULL, &sb, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
-    CHECK(raw_query_agg(s, INT64_MIN, INT64_MAX, 1, &nb) == TSDB_ERR_TOO_MANY_BUCKETS);
     tsdb_query_opts last = {TSDB_DESC, 3};
     OK(tsdbc_query_agg_ex(c, s, INT64_MIN, INT64_MAX, 1, &last, &b, &nb));
     CHECK(nb == 3 && b[0].start == st2[199] && b[2].start == st2[197]);
@@ -955,7 +1058,7 @@ static void test_frame_cap(tsdbc *c)
 /* Deletes, replaces and retention over the wire (protocol version 7). */
 static void test_delete(tsdbc *c)
 {
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdbc_series_create(c, "del.i64", TSDB_INT64, NULL, &s));
     int64_t ts[100], v[100];
     for (int k = 0; k < 100; k++)
@@ -1011,7 +1114,7 @@ static void test_pack_roundtrip(void)
                 int64_t *ts = malloc((n + 1) * 8), *ts2 = malloc((n + 1) * 8);
                 uint8_t *v = malloc(n * w + 1), *v2 = malloc(n * w + 1);
                 uint8_t *bits = calloc(n / 8 + 1, 1), *bits2 = calloc(n / 8 + 1, 1);
-                uint32_t *sv = malloc((n + 1) * 4), *sv2 = malloc((n + 1) * 4);
+                uint64_t *sv = malloc((n + 1) * 8), *sv2 = malloc((n + 1) * 8);
                 for (size_t i = 0; i < n; i++) {
                     r = r * 6364136223846793005ull + 1442695040888963407ull;
                     /* regular clocks, jumps, and the extremes (deltas wrap) */
@@ -1020,7 +1123,12 @@ static void test_pack_roundtrip(void)
                         v[i * w + b] = (uint8_t)(r >> (8 * b));
                     if (type == TSDB_BOOL)
                         v[i] &= 1;
-                    sv[i] = i % 5 == 0 ? UINT32_MAX - (uint32_t)i : (uint32_t)(r >> 40);
+                    /* ids of 64 bits (protocol 11): small, around 2^32 and the extremes, whose deltas wrap */
+                    sv[i] = i % 5 == 0   ? UINT64_MAX - i
+                            : i % 5 == 1 ? (1ull << 32) + (r >> 62) - 2
+                            : i % 5 == 2 ? (r >> 40)
+                            : i % 5 == 3 ? 0
+                                         : r;
                     if (valid && (r >> 13) & 1)
                         bits[i / 8] |= (uint8_t)(1u << (i % 8));
                 }
@@ -1029,7 +1137,7 @@ static void test_pack_roundtrip(void)
                 CHECK(len <= tsdb_pack_raw_bound(n, type, valid, many));
                 int rc = tsdb_pack_unshape(raw, len, n, type, valid, many, ts2, v2, bits2, sv2);
                 bool same = rc == 0 && (!n || (memcmp(ts, ts2, n * 8) == 0 && memcmp(v, v2, n * w) == 0)) &&
-                            (!valid || memcmp(bits, bits2, (n + 7) / 8) == 0) && (!many || !n || memcmp(sv, sv2, n * 4) == 0);
+                            (!valid || memcmp(bits, bits2, (n + 7) / 8) == 0) && (!many || !n || memcmp(sv, sv2, n * 8) == 0);
                 if (!same)
                     fprintf(stderr, "  pack round trip failed: type %u, n %zu, valid %d, many %d\n", type, n, valid, many);
                 CHECK(same);
@@ -1047,7 +1155,7 @@ static void test_pack_roundtrip(void)
 /* Regression: the first packed insert asked the server's version through a
  * call that first collected the pipelined acknowledgements; an error among
  * them was taken for HELLO's, lost, and the connection never packed again. */
-static void test_hello_keeps_errors(uint32_t f64)
+static void test_hello_keeps_errors(tsdb_sid f64)
 {
     tsdbc *c;
     OK(tsdbc_connect("127.0.0.1", port, &c));
@@ -1064,14 +1172,14 @@ static void test_hello_keeps_errors(uint32_t f64)
         v[i] = 20 + (i % 10) / 10.0;
     }
     tsdb_values col = {TSDB_FLOAT64, v, NULL};
-    uint32_t *ids = malloc(N * 4);
+    tsdb_sid *ids = malloc(N * sizeof *ids);
     for (int i = 0; i < N; i++)
         ids[i] = f64;
     OK(tsdbc_insert_values_async(c, ids, ts, &col, N));
     CHECK(tsdbc_wait(c) != 0); /* the float32 insert's error, not lost */
     uint64_t before = tsdbc_bytes_sent(c);
     OK(tsdbc_insert_values(c, ids, ts, &col, N));
-    CHECK(tsdbc_bytes_sent(c) - before < N * 4); /* packed: plain would be 20 bytes a row */
+    CHECK(tsdbc_bytes_sent(c) - before < N * 4); /* packed: plain would be 24 bytes a row */
     free(ids);
     free(ts);
     free(v);
@@ -1087,7 +1195,7 @@ static void test_hello_keeps_errors(uint32_t f64)
 static void test_limits_remote(tsdbc *c)
 {
     enum { DAYS = 60, N = DAYS * 1440 };
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdbc_series_create(c, "limits.year", TSDB_FLOAT64, NULL, &s));
     const int64_t t0 = 1700000000000LL / 86400000 * 86400000, t1 = t0 + (int64_t)N * 60000;
     int64_t *ts = malloc(N * sizeof *ts);
@@ -1127,7 +1235,7 @@ static void test_limits_remote(tsdbc *c)
 
 static void test_twa(tsdbc *c)
 {
-    uint32_t s, st;
+    tsdb_sid s, st;
     OK(tsdbc_series_create(c, "twa.level", TSDB_FLOAT64, NULL, &s));
     int64_t t0 = 1700000000000LL / 86400000 * 86400000; /* a UTC midnight */
     int64_t ts[] = {t0, t0 + 1000, t0 + 2000, t0 + 3000, t0 + 10000};
@@ -1177,7 +1285,7 @@ static void test_twa(tsdbc *c)
     free(b);
 }
 
-static void test_bounds(tsdbc *c, uint32_t a, size_t n)
+static void test_bounds(tsdbc *c, tsdb_sid a, size_t n)
 {
     tsdb_bucket *bk, *bb;
     size_t nb, nbb;
@@ -1219,14 +1327,14 @@ static void test_bounds(tsdbc *c, uint32_t a, size_t n)
         int64_t lo = INT64_MIN, hi = INT64_MAX;
         uint32_t count = 1;
         uint16_t zl = (uint16_t)strlen(zone);
-        memcpy(q, &a, 4);
-        memcpy(q + 4, &lo, 8);
-        memcpy(q + 12, &hi, 8);
-        q[20] = TSDB_DAY;
-        memcpy(q + 21, &count, 4);
-        memcpy(q + 34, &zl, 2);
-        memcpy(q + 36, zone, zl);
-        raw_send(fd, 30 + (uint32_t)utc, TSDB_OP_QUERY_GROUP, q, 36u + zl);
+        memcpy(q, &a, 8);
+        memcpy(q + 8, &lo, 8);
+        memcpy(q + 16, &hi, 8);
+        q[32] = TSDB_DAY;
+        memcpy(q + 33, &count, 4);
+        memcpy(q + 46, &zl, 2);
+        memcpy(q + 48, zone, zl);
+        raw_send(fd, 30 + (uint32_t)utc, TSDB_OP_QUERY_BUCKETS, q, 48u + zl);
         uint32_t rid;
         uint8_t rest[1 << 16];
         size_t nrest;
@@ -1240,7 +1348,7 @@ static void test_bounds(tsdbc *c, uint32_t a, size_t n)
  * its 64-byte rows (what older clients read), with TSDB_SPREAD the rows carry it, other bits are refused. */
 static void test_spread_remote(tsdbc *c)
 {
-    uint32_t d;
+    tsdb_sid d;
     OK(tsdbc_series_create(c, "spread.f64", TSDB_FLOAT64, NULL, &d));
     int64_t ts[5];
     double v[5] = {101326, 101324, 101327, 101323, 0};
@@ -1280,13 +1388,13 @@ static void test_spread_remote(tsdbc *c)
 
     int fd = raw_connect();
     for (int fields = -1; fields <= 2; fields++) {
-        uint8_t q[45] = {0};
+        uint8_t q[49] = {0};
         int64_t lo = INT64_MIN, hi = INT64_MAX;
-        memcpy(q, &d, 4);
-        memcpy(q + 4, &lo, 8);
-        memcpy(q + 12, &hi, 8);
-        q[44] = (uint8_t)fields;
-        raw_send(fd, 40 + (uint32_t)(fields + 1), TSDB_OP_QUERY_BUCKETS, q, fields < 0 ? 44 : 45);
+        memcpy(q, &d, 8);
+        memcpy(q + 8, &lo, 8);
+        memcpy(q + 16, &hi, 8);
+        q[48] = (uint8_t)fields;
+        raw_send(fd, 40 + (uint32_t)(fields + 1), TSDB_OP_QUERY_BUCKETS, q, fields < 0 ? 48 : 49);
         uint32_t rid, n = 0;
         uint8_t rest[256];
         size_t nrest = 0;
@@ -1308,15 +1416,15 @@ static void test_spread_remote(tsdbc *c)
     }
     /* QUERY_BOUNDS with the byte after the bounds; a reserved bit is refused */
     for (int fields = 1; fields <= 3; fields++) {
-        uint8_t q[33 + 16 + 1] = {0};
+        uint8_t q[37 + 16 + 1] = {0};
         int64_t lo = INT64_MIN, hi = INT64_MAX;
         uint32_t n2 = 2;
-        memcpy(q, &d, 4);
-        memcpy(q + 4, &lo, 8);
-        memcpy(q + 12, &hi, 8);
-        memcpy(q + 29, &n2, 4);
-        memcpy(q + 33, bounds, 16);
-        q[49] = (uint8_t)fields;
+        memcpy(q, &d, 8);
+        memcpy(q + 8, &lo, 8);
+        memcpy(q + 16, &hi, 8);
+        memcpy(q + 33, &n2, 4);
+        memcpy(q + 37, bounds, 16);
+        q[53] = (uint8_t)fields;
         raw_send(fd, 50 + (uint32_t)fields, TSDB_OP_QUERY_BOUNDS, q, sizeof q);
         uint32_t rid, n = 0;
         uint8_t rest[512];
@@ -1338,7 +1446,7 @@ static void test_spread_remote(tsdbc *c)
  * calendar itself stops at 64 Mi): every grouped call fails with TOO_MANY_BUCKETS, as in the Rust and Java clients. */
 static void test_wide_local_ranges(tsdbc *c)
 {
-    uint32_t wide, wider;
+    tsdb_sid wide, wider;
     OK(tsdbc_series_create(c, "wide.local", TSDB_FLOAT64, NULL, &wide));
     OK(tsdbc_series_create(c, "wider.local", TSDB_FLOAT64, NULL, &wider));
     int64_t ts[2] = {T0, T0 + 450 * 86400000LL}; /* 38.9 M seconds */
@@ -1347,7 +1455,7 @@ static void test_wide_local_ranges(tsdbc *c)
     ts[1] = T0 + 800 * 86400000LL; /* 69.1 M seconds */
     OK(tsdbc_insert_series_values(c, wider, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, 2));
     tsdb_group secs = {TSDB_SECOND, 1, "Europe/Oslo"};
-    uint32_t ids[2] = {wide, wider};
+    tsdb_sid ids[2] = {wide, wider};
     for (int k = 0; k < 2; k++) {
         tsdb_bucket *b;
         tsdb_spread_bucket *sb;
@@ -1366,123 +1474,9 @@ static void test_wide_local_ranges(tsdbc *c)
     OK(tsdbc_commit(c)); /* the connection is still good */
 }
 
-/* A server of protocol version 6 (before the spread), as far as bucket queries go: HELLO answers 6, a
- * QUERY_BUCKETS or QUERY_BOUNDS with a byte after the zone or bounds is refused as such a server does, one
- * without it gets a bucket of 64 bytes. Counts the bucket requests it sees. */
-static const int64_t t0_old = 1700000000000;
-
-typedef struct old_server {
-    int lfd, port;
-    int bucket_reqs, refused;
-} old_server;
-
-static void old_reply(int fd, uint32_t id, int32_t st, const void *body, uint32_t n)
-{
-    uint8_t h[13];
-    uint32_t flen = 9 + n;
-    memcpy(h, &flen, 4);
-    memcpy(h + 4, &id, 4);
-    h[8] = TSDB_OP_REPLY;
-    memcpy(h + 9, &st, 4);
-    CHECK(write(fd, h, 13) == 13);
-    CHECK(n == 0 || write(fd, body, n) == (ssize_t)n);
-}
-
-static void *old_server_run(void *arg)
-{
-    old_server *o = arg;
-    int fd = accept(o->lfd, NULL, NULL);
-    uint8_t h[9], p[4096];
-    while (fd >= 0 && read_full(fd, h, 9)) {
-        uint32_t flen, id;
-        memcpy(&flen, h, 4);
-        memcpy(&id, h + 4, 4);
-        uint32_t len = flen - 5;
-        if (len > sizeof p || !read_full(fd, p, len))
-            break;
-        if (h[8] == TSDB_OP_HELLO) {
-            uint32_t six = 6;
-            old_reply(fd, id, 0, &six, 4);
-            continue;
-        }
-        bool exact = false;
-        if (h[8] == TSDB_OP_QUERY_BUCKETS && len >= 44) {
-            uint16_t zl;
-            memcpy(&zl, p + 42, 2);
-            exact = len == 44u + zl;
-        } else if (h[8] == TSDB_OP_QUERY_BOUNDS && len >= 33) {
-            uint32_t n;
-            memcpy(&n, p + 29, 4);
-            exact = len == 33 + (size_t)n * 8;
-        } else {
-            old_reply(fd, id, TSDB_ERR_INVALID, NULL, 0);
-            continue;
-        }
-        o->bucket_reqs++;
-        if (!exact) {
-            o->refused++;
-            old_reply(fd, id, TSDB_ERR_INVALID, NULL, 0);
-            continue;
-        }
-        uint8_t body[4 + TSDB_BUCKET_ROW] = {0};
-        uint32_t one = 1;
-        uint64_t count = 3;
-        memcpy(body, &one, 4);
-        memcpy(body + 4, &t0_old, 8);
-        memcpy(body + 12, &count, 8);
-        old_reply(fd, id, 0, body, sizeof body);
-    }
-    if (fd >= 0)
-        close(fd);
-    return NULL;
-}
-
-/* The client against a version 6 server: plain bucket queries send exactly what such a server takes and read
- * its 64-byte rows; the spread is refused by the client without a request (the server would refuse it). */
-static void test_spread_old_server(void)
-{
-    old_server o = {0};
-    o.lfd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in sa = {.sin_family = AF_INET};
-    socklen_t sl = sizeof sa;
-    inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
-    CHECK(bind(o.lfd, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(o.lfd, 1) == 0);
-    CHECK(getsockname(o.lfd, (struct sockaddr *)&sa, &sl) == 0);
-    o.port = ntohs(sa.sin_port);
-    pthread_t th;
-    pthread_create(&th, NULL, old_server_run, &o);
-    tsdbc *c;
-    OK(tsdbc_connect("127.0.0.1", o.port, &c));
-    CHECK(tsdbc_server_version(c) == 6);
-    tsdb_bucket *b;
-    size_t n;
-    int64_t bounds[1] = {0};
-    tsdb_group g = {TSDB_SECOND, 1, NULL};
-    OK(tsdbc_query_agg(c, 1, 0, INT64_MAX, 1000, &b, &n));
-    CHECK(n == 1 && b[0].start == t0_old && b[0].count == 3);
-    free(b);
-    OK(tsdbc_query_group(c, 1, 0, INT64_MAX, &g, NULL, &b, &n));
-    CHECK(n == 1 && b[0].count == 3);
-    free(b);
-    OK(tsdbc_query_bounds(c, 1, 0, INT64_MAX, bounds, 1, NULL, &b, &n));
-    CHECK(n == 1 && b[0].count == 3);
-    free(b);
-    tsdb_spread_bucket *sb = (tsdb_spread_bucket *)1;
-    n = 7;
-    CHECK(tsdbc_query_spread(c, 1, 0, INT64_MAX, 1000, NULL, &sb, &n) == TSDB_ERR_INVALID && !sb && !n);
-    CHECK(tsdbc_query_spread_group(c, 1, 0, INT64_MAX, &g, NULL, &sb, &n) == TSDB_ERR_INVALID);
-    CHECK(tsdbc_query_spread_bounds(c, 1, 0, INT64_MAX, bounds, 1, NULL, &sb, &n) == TSDB_ERR_INVALID);
-    tsdbc_close(c);
-    pthread_join(th, NULL);
-    close(o.lfd);
-    CHECK(o.bucket_reqs == 3 && o.refused == 0);
-    if (o.bucket_reqs != 3 || o.refused)
-        fprintf(stderr, "old server: %d bucket requests, %d refused\n", o.bucket_reqs, o.refused);
-}
-
 static void test_packed_inserts(tsdbc *c)
 {
-    uint32_t a, b;
+    tsdb_sid a, b;
     OK(tsdbc_series_create(c, "pk.on", TSDB_FLOAT64, NULL, &a));
     OK(tsdbc_series_create(c, "pk.off", TSDB_FLOAT64, NULL, &b));
     enum { N = 100000 };
@@ -1516,9 +1510,9 @@ static void test_packed_inserts(tsdbc *c)
         size_t zl = ZSTD_compress(z, sizeof z, raw, rl, 1);
         uint32_t n = bad ? 2 : 1, rl32 = (uint32_t)rl;
         memcpy(f, &n, 4);
-        memcpy(f + 4, &a, 4);
-        f[8] = TSDB_FLOAT64;
-        f[9] = TSDB_PACKED;
+        f[4] = TSDB_FLOAT64;
+        f[5] = TSDB_PACKED;
+        memcpy(f + 8, &a, 8);
         memcpy(f + TSDB_VALUES_HEADER, &rl32, 4);
         memcpy(f + TSDB_VALUES_HEADER + 4, z, zl);
         if (!bad)
@@ -1547,7 +1541,7 @@ static void test_packed_inserts(tsdbc *c)
  * are applied in order, so a writer's last round still wins over its others. */
 typedef struct skn {
     const sk_cfg *c;
-    uint32_t ids[SK_MAX_SERIES];
+    tsdb_sid ids[SK_MAX_SERIES];
     atomic_int started[SK_MAX_WRITERS]; /* rounds sent */
     atomic_int acked[SK_MAX_WRITERS];   /* rounds acknowledged */
     int last_kind[SK_MAX_WRITERS];
@@ -1675,7 +1669,7 @@ static void *skn_maintenance(void *a)
     return NULL;
 }
 
-static void skn_read_all(const sk_cfg *c, const uint32_t *ids, sk_val *st)
+static void skn_read_all(const sk_cfg *c, const tsdb_sid *ids, sk_val *st)
 {
     tsdbc *cn = sk_connect();
     for (uint32_t s = 0; s < c->nseries; s++) {
@@ -1687,7 +1681,7 @@ static void skn_read_all(const sk_cfg *c, const uint32_t *ids, sk_val *st)
     tsdbc_close(cn);
 }
 
-static void skn_same(const sk_cfg *c, const uint32_t *ids, const sk_val *want, const char *after)
+static void skn_same(const sk_cfg *c, const tsdb_sid *ids, const sk_val *want, const char *after)
 {
     size_t nk = sk_nkeys(c);
     sk_val *st = calloc(nk, sizeof *st);
@@ -1820,7 +1814,7 @@ static void test_wal_failstop(const char *dir)
     eio_mark = NULL;
     tsdbc *c;
     OK(tsdbc_connect("127.0.0.1", port, &c));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdbc_series(c, "failstop", 1, &id));
     enum { ROWS = 10 };
     int64_t ts[ROWS];
@@ -2186,7 +2180,7 @@ static void check_monotone(const mset *a, const mset *b)
 }
 
 typedef struct {
-    uint32_t id;
+    tsdb_sid id;
     int errors;
 } mjob;
 
@@ -2413,7 +2407,7 @@ static void test_metrics(const char *dir)
         uint8_t rest[64];
         size_t nrest;
         uint32_t rid;
-        raw_send(rfd, 7, TSDB_OP_QUERY_AGG, short_payload, sizeof short_payload);
+        raw_send(rfd, 7, TSDB_OP_QUERY_BUCKETS, short_payload, sizeof short_payload);
         CHECK(raw_reply(rfd, &rid, rest, sizeof rest, &nrest) == TSDB_ERR_INVALID);
         close(rfd);
     }
@@ -2436,8 +2430,7 @@ static void test_metrics(const char *dir)
     CHECK(msum(&after, "tsdb_query_duration_seconds_sum") > msum(&before, "tsdb_query_duration_seconds_sum"));
     {   /* a query of a few thousand rows takes far less than 30 s: it must not sit in the +Inf bucket,
          * and a fast one is in a bucket at or below 1 s. The workers' tsdbc_query_agg calls arrive as
-         * QUERY_BUCKETS (protocol 9); the only QUERY_AGG is the refused raw frame above, which the server
-         * counts after its reply is sent, so a scrape for op="query_agg" races it. */
+         * QUERY_BUCKETS (QUERY_AGG was removed in protocol 11), as does the refused raw frame above. */
         double agg_inf = mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_buckets\",le=\"+Inf\"");
         CHECK(agg_inf > 0);
         CHECK(mval(&after, "tsdb_query_duration_seconds_bucket", "op=\"query_buckets\",le=\"30\"") == agg_inf);
@@ -2482,7 +2475,7 @@ static void test_metrics(const char *dir)
      * every 100 ms, and a crowd of silent ones. The main port is as fast as without them and a
      * real scrape still works, even with every slot taken. */
     OK(tsdbc_connect("127.0.0.1", port, &c));
-    uint32_t sid;
+    tsdb_sid sid;
     OK(tsdbc_series(c, "metrics.0", 0, &sid));
     int64_t base_worst = main_port_worst_us(c, sid, 300);
     enum { SLOW = 30, SILENT = 100 };
@@ -2596,9 +2589,10 @@ static void test_metrics_more(const char *dir)
     /* a volume whose directory name has a double quote and a backslash: the label must be escaped
      * (Prometheus drops a whole scrape with a malformed line) */
     snprintf(vol, sizeof vol, "%s.vol\"q\\z", dir);
-    uint32_t vid, sid;
+    uint32_t vid;
+    tsdb_sid sid;
     OK(tsdb_volume_add_dir(dir, vol, &vid)); /* tsdb-cli volume add, while the server runs */
-    OK(tsdbc_series_at(c, "weird", vol, &vid));
+    OK(tsdbc_series_at(c, "weird", vol, &sid));
     OK(tsdbc_series(c, "plain", 1, &sid));
     {
         mset m;
@@ -2638,7 +2632,7 @@ static void test_metrics_more(const char *dir)
         scrape(&b4);
         tsdb_bucket *bk;
         size_t nb;
-        uint32_t nid;
+        tsdb_sid nid;
         int rc1 = tsdbc_series(c, "no such series", 0, &nid);
         CHECK(rc1 == TSDB_ERR_NOTFOUND);
         /* data 200 000 s apart, 1 ms buckets: over the limit of 4 Mi buckets */
@@ -2802,16 +2796,16 @@ static size_t send_until_stalled(int fd, const uint8_t *fr, size_t total, size_t
 }
 
 /* An INSERT frame of n rows (1 MB for 87000) into series s, all at time 0. */
-static uint8_t *insert_frame(uint32_t s, uint32_t n, uint32_t id, size_t *total)
+static uint8_t *insert_frame(tsdb_sid s, uint32_t n, uint32_t id, size_t *total)
 {
-    size_t len = 8 + (size_t)n * 12;
+    size_t len = 16 + (size_t)n * 12;
     uint8_t *fr = calloc(9 + len, 1);
     uint32_t flen = (uint32_t)len + 5;
     memcpy(fr, &flen, 4);
     memcpy(fr + 4, &id, 4);
     fr[8] = TSDB_OP_INSERT;
     memcpy(fr + 9, &n, 4);
-    memcpy(fr + 13, &s, 4);
+    memcpy(fr + 17, &s, 8);
     *total = 9 + len;
     return fr;
 }
@@ -2886,22 +2880,22 @@ static void test_hostile(const char *dir)
     CHECK(mport > 0);
     tsdbc *c;
     OK(tsdbc_connect("127.0.0.1", port, &c));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdbc_series(c, "hostile", 1, &s));
 
     {
         int64_t ts[2] = {0, 5000000};
         float v[2] = {1, 2};
-        uint32_t ss[2] = {s, s};
+        tsdb_sid ss[2] = {s, s};
         OK(tsdbc_insert(c, ss, ts, v, 2));
     }
-    uint32_t big;
+    tsdb_sid big;
     size_t nbig = 4500000;
     OK(tsdbc_series(c, "hostile.big", 1, &big));
     {
         int64_t *ts = malloc(nbig * 8);
         float *v = malloc(nbig * 4);
-        uint32_t *ss = malloc(nbig * 4);
+        tsdb_sid *ss = malloc(nbig * sizeof *ss);
         for (size_t i = 0; i < nbig; i++) {
             ts[i] = (int64_t)i;
             v[i] = (float)i;
@@ -2924,34 +2918,6 @@ static void test_hostile(const char *dir)
         CHECK(count_of(c, big) == nbig); /* the connection still works */
     }
 
-    /* the same for QUERY_AGG (32 bytes a bucket): 9 million buckets would make a 288 MB frame */
-    {
-        int64_t *ts = malloc(nbig * 8);
-        float *v = calloc(nbig, 4);
-        uint32_t *ss = malloc(nbig * 4);
-        for (size_t i = 0; i < nbig; i++) {
-            ts[i] = (int64_t)(nbig + i);
-            ss[i] = big;
-        }
-        OK(tsdbc_insert(c, ss, ts, v, nbig));
-        free(ts);
-        free(v);
-        free(ss);
-        uint8_t q[28];
-        int64_t start = 0, end = 2 * (int64_t)nbig, iv = 1;
-        memcpy(q, &big, 4);
-        memcpy(q + 4, &start, 8);
-        memcpy(q + 12, &end, 8);
-        memcpy(q + 20, &iv, 8);
-        int fd = raw_connect();
-        raw_send(fd, 3, TSDB_OP_QUERY_AGG, q, sizeof q);
-        uint32_t id = 0;
-        uint8_t rest[64];
-        size_t nrest;
-        CHECK(raw_reply(fd, &id, rest, sizeof rest, &nrest) == TSDB_ERR_TOO_MANY_BUCKETS && id == 3);
-        close(fd);
-    }
-
     /* a packed insert whose rows would not fit a frame unpacked: refused before anything is allocated
      * (23 million float32 rows, 276 MB unpacked, from 115 MB of zeros, a few kilobytes compressed) */
     {
@@ -2962,9 +2928,9 @@ static void test_hostile(const char *dir)
         CHECK(zeros && pl);
         memset(pl, 0, TSDB_VALUES_HEADER);
         memcpy(pl, &n, 4);
-        memcpy(pl + 4, &s, 4);
-        pl[8] = TSDB_FLOAT32;
-        pl[9] = TSDB_PACKED;
+        pl[4] = TSDB_FLOAT32;
+        pl[5] = TSDB_PACKED;
+        memcpy(pl + 8, &s, 8);
         memcpy(pl + TSDB_VALUES_HEADER, &raw_len, 4);
         size_t z = ZSTD_compress(pl + TSDB_VALUES_HEADER + 4, zcap, zeros, raw_len, 1);
         CHECK(!ZSTD_isError(z) && z < 100000);
@@ -3031,13 +2997,13 @@ static void test_hostile(const char *dir)
         free(h);
         usleep(100000);
         uint32_t n = 170000; /* 2 MB */
-        size_t len = 8 + (size_t)n * 12;
+        size_t len = 16 + (size_t)n * 12;
         uint8_t *pl = calloc(len, 1);
         memcpy(pl, &n, 4);
-        memcpy(pl + 4, &s, 4);
+        memcpy(pl + 8, &s, 8);
         for (uint32_t i = 0; i < n; i++) {
             int64_t t = 10000000 + round * 1000000 + i;
-            memcpy(pl + 8 + (size_t)i * 8, &t, 8);
+            memcpy(pl + 16 + (size_t)i * 8, &t, 8);
         }
         raw_send(b, 9, TSDB_OP_INSERT, pl, (uint32_t)len);
         free(pl);
@@ -3071,7 +3037,7 @@ static void test_hostile(const char *dir)
         uint8_t *fr = insert_frame(s, n, 11, &total);
         for (uint32_t i = 0; i < n; i++) {
             int64_t t = 20000000 + i;
-            memcpy(fr + 17 + (size_t)i * 8, &t, 8);
+            memcpy(fr + 25 + (size_t)i * 8, &t, 8); /* the timestamps after the 16-byte header */
         }
         CHECK(write(b, fr, total / 2) == (ssize_t)(total / 2));
         struct timeval tv = {8, 0};
@@ -3098,10 +3064,10 @@ static void test_hostile(const char *dir)
      * also when its frames are small enough to need no buffer of their own */
     {
         int fd = raw_connect();
-        uint8_t q[20] = {0};
+        uint8_t q[24] = {0};
         int64_t end = (int64_t)nbig;
-        memcpy(q, &big, 4);
-        memcpy(q + 12, &end, 8);
+        memcpy(q, &big, 8);
+        memcpy(q + 16, &end, 8);
         raw_send(fd, 1, TSDB_OP_QUERY_RAW, q, sizeof q); /* about 54 MB of reply, not read */
         size_t total;
         uint8_t *fr = insert_frame(s, 4000, 2, &total); /* 48 KB: frames over 64 KB wait for the limit anyway */
@@ -3146,10 +3112,10 @@ static void test_hostile(const char *dir)
      * answers all of them */
     {
         int fd = raw_connect();
-        uint8_t q[20] = {0};
+        uint8_t q[24] = {0};
         int64_t end = (int64_t)nbig;
-        memcpy(q, &big, 4);
-        memcpy(q + 12, &end, 8);
+        memcpy(q, &big, 8);
+        memcpy(q + 16, &end, 8);
         /* the empty frames of the connection before, up to 4 MB, may still be held: they would count here */
         double before = request_memory_below(256 << 10);
         CHECK(before >= 0 && before < (256 << 10));
@@ -3214,7 +3180,7 @@ int main(int argc, char **argv)
 
     tsdbc *c;
     OK(tsdbc_connect("127.0.0.1", port, &c));
-    uint32_t a, b, again;
+    tsdb_sid a, b, again;
     OK(tsdbc_series(c, "tank.level_bar", 1, &a));
     OK(tsdbc_series(c, "pump.flow_m3h", 1, &b));
     OK(tsdbc_series(c, "tank.level_bar", 0, &again));
@@ -3225,7 +3191,7 @@ int main(int argc, char **argv)
     CHECK(strcmp(name, "pump.flow_m3h") == 0);
     char vol[600];
     snprintf(vol, sizeof vol, "%s.volume", dir);
-    uint32_t onvol;
+    tsdb_sid onvol;
     /* a client cannot choose where the server writes: a path that is no volume is NOTFOUND and creates
      * nothing, a newline (which split the VOLUMES line, so the database never opened again) is INVALID */
     struct stat vst;
@@ -3261,7 +3227,7 @@ int main(int argc, char **argv)
     OK(tsdbc_insert_series(c, a, ts, v, N));
 
     /* rows of several series in one batch, and a pipelined rewrite of the same keys */
-    uint32_t s2[3] = {b, b, a};
+    tsdb_sid s2[3] = {b, b, a};
     int64_t t2[3] = {T0, T0 + 1000, T0};
     float v2[3] = {1.5f, 2.5f, -7.0f};
     OK(tsdbc_insert_async(c, s2, t2, v2, 3));
@@ -3362,10 +3328,10 @@ int main(int argc, char **argv)
     test_close(c);
     test_framing();
     test_hello();
-    test_old_server(8);
-    test_old_server(6);
+    test_old_server(TSDB_PROTOCOL_MIN - 1);
     test_old_server(5);
     test_types(c);
+    test_wide_ids(c);
     test_nan(c);
     test_lttb_remote(c);
     test_pack_roundtrip();
@@ -3375,7 +3341,6 @@ int main(int argc, char **argv)
     test_limits_remote(c);
     test_spread_remote(c);
     test_wide_local_ranges(c);
-    test_spread_old_server();
     test_delete(c);
     test_frame_cap(c);
 

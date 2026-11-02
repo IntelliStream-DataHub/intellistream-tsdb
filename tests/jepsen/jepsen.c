@@ -136,7 +136,7 @@ static int nclients = 8;
 static atomic_int port; /* where the current server listens, 0 while none runs: tsdbd picks it, see start_server */
 static double seconds = 20;
 static uint64_t seed = 1;
-static uint32_t ids[MAX_SERIES];
+static tsdb_sid ids[MAX_SERIES];
 static bool classes;                /* --workload classes */
 static int nseries = NSERIES;
 static uint32_t nkeys[MAX_SERIES];  /* keys of a series */

@@ -41,7 +41,7 @@ directory) and `path`.
 | `tsdb_broken_parts` | gauge | parts a follower found damaged and left out |
 | `tsdb_failed` | gauge | 1 once the volume is fail-stopped: writes return IO errors and tsdbd exits; alert on it |
 | `tsdb_follow_errors_total`, `tsdb_follow_refresh_age_seconds` | counter, gauge | followers only: failed refreshes, and time since the last good one (the age of the follower's refresh, not of the writer's data: a stopped writer leaves it near 0) |
-| `tsdb_requests_total{op}` | counter | requests handled, by operation (`insert`, `query_raw`, `query_agg`, ...) |
+| `tsdb_requests_total{op}` | counter | requests handled, by operation (`insert`, `query_raw`, `query_buckets`, ...) |
 | `tsdb_inserted_rows_total` | counter | rows in successful insert requests |
 | `tsdb_multi_series_total` | counter | series answered by many-series requests (QUERY_MULTI, `op="query_multi"` in the request counters) |
 | `tsdb_multi_deferred_total` | counter | series of such requests too large to hold ahead of their turn, run again at it (streaming); a high rate next to `tsdb_multi_series_total` means the requests are mostly large series |

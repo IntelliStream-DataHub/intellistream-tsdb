@@ -65,10 +65,14 @@ import jdk.net.ExtendedSocketOptions;
  *
  * <p><b>Time zones.</b> The server groups by UTC only (protocol version 4). For local days, weeks, months, quarters
  * and years, {@link #queryGroup} computes the UTC instant each local period begins, with the JDK's time zone data,
- * and asks for buckets that begin there ({@link #queryBounds}); a server older than version 4 gets the zone's name
- * instead and groups by itself.
+ * and asks for buckets that begin there ({@link #queryBounds}).
  *
- * <p><b>Numbers.</b> Series ids and state codes are unsigned 32-bit integers carried in an {@code int}.
+ * <p><b>Versions.</b> The client speaks protocol 11 (64-bit series ids) and refuses to connect to a server that
+ * answers HELLO with a lower version: {@link TsdbException} with {@link Status#ERR_INVALID}.
+ *
+ * <p><b>Numbers.</b> Series ids are unsigned 64-bit integers carried in a {@code long} (compare them with
+ * {@link Long#compareUnsigned}); {@code -1L}, all ones, is reserved and refused with
+ * {@link IllegalArgumentException}. State codes are unsigned 32-bit integers carried in an {@code int}.
  * Timestamps are milliseconds since the Unix epoch. Time ranges are half open, {@code [start, end)}; use
  * {@link Long#MIN_VALUE} and {@link Long#MAX_VALUE} for "everything".
  */
@@ -84,7 +88,7 @@ public final class TsdbClient implements AutoCloseable {
     private static final int MAX_STRING = 0xffff;         /* u16 length prefix */
     private static final int MAX_BOUNDS = (Protocol.MAX_FRAME - 64) / Long.BYTES; /* QUERY_BOUNDS, as the C client */
     /* QUERY_TWA carries 56 bytes before its bounds, as the C client */
-    private static final int MAX_TWA_BOUNDS = (Protocol.MAX_FRAME - 64 - 56) / Long.BYTES;
+    private static final int MAX_TWA_BOUNDS = (Protocol.MAX_FRAME - 64 - Protocol.TWA_HEADER) / Long.BYTES;
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
     /** TCP keepalive of a new connection: first probe after 30 s of silence, then every 10 s, 3 probes. */
     private static final Duration KEEPALIVE_IDLE = Duration.ofSeconds(30);
@@ -108,7 +112,7 @@ public final class TsdbClient implements AutoCloseable {
     private Column chunkColumn;                  /* reused for ValuesConsumer */
     private final BitSet chunkNulls = new BitSet();
     private int zlevel = 1;                      /* zstd level of packed inserts; 0: plain arrays */
-    private int serverVersion;                   /* from HELLO; 0 until asked */
+    private int serverVersion;                   /* from HELLO at connect */
     private Compressor zstd;                     /* created at the first packed insert */
     private boolean noZstd;                      /* zstd-jni could not be loaded: send plain arrays */
     private byte[] raw = new byte[0];            /* the reshaped body of a packed frame */
@@ -222,7 +226,20 @@ public final class TsdbClient implements AutoCloseable {
                 ch.socket().connect(new InetSocketAddress(a, port), ms);
                 /* before the client exists: its selector is opened last, and only a built client owns it */
                 setKeepAlive(ch, KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_COUNT);
-                return new TsdbClient(ch, requestTimeout);
+                TsdbClient c = new TsdbClient(ch, requestTimeout);
+                try {
+                    c.hello(); /* before any request: a server older than protocol 11 reads the new frames wrongly */
+                } catch (TsdbException | RuntimeException e) {
+                    closeQuietly(c.ch);
+                    closeQuietly(c.selector);
+                    throw e;
+                }
+                return c;
+            } catch (TsdbException e) {
+                closeQuietly(ch);
+                if (e.status() == Status.ERR_INVALID) /* a server of another protocol: no other address helps */
+                    throw e;
+                last = e;
             } catch (IOException | RuntimeException e) {
                 closeQuietly(ch);
                 if (e instanceof RuntimeException re)
@@ -354,8 +371,9 @@ public final class TsdbClient implements AutoCloseable {
     /**
      * Exchanges protocol versions with the server.
      *
-     * @return the server's protocol version (4 for the server this client is written for)
-     * @throws TsdbException on a connection failure
+     * @return the server's protocol version (11 for the server this client is written for)
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a server older than protocol 11, which cannot read
+     *     64-bit series ids; with {@link Status#ERR_IO} on a connection failure
      */
     public int hello() throws TsdbException {
         request();
@@ -369,15 +387,17 @@ public final class TsdbClient implements AutoCloseable {
         endReply();
         check(st);
         serverVersion = v;
+        if (v < Protocol.MIN_VERSION)
+            throw new TsdbException(Status.ERR_INVALID, "tsdbd speaks protocol " + v + "; this client needs "
+                    + Protocol.MIN_VERSION + ": upgrade the server", null);
         return v;
     }
 
     /**
      * Sets how inserts travel. With a level other than 0 (the default is 1), inserts of every type, float32
      * included, are packed (delta varints and byte planes) and compressed as one zstd frame each, which takes a few
-     * bytes a row on the wire instead of 16 or more. The client asks the server's version (HELLO) before the first
-     * insert and packs only for a server that speaks protocol version 3; older servers get plain arrays. Level 0
-     * sends plain arrays, which costs no CPU; negative levels are faster than 1 and compress less.
+     * bytes a row on the wire instead of 16 or more. Level 0 sends plain arrays, which costs no CPU; negative levels
+     * are faster than 1 and compress less.
      *
      * <p>Packing needs zstd-jni at run time; without it the client sends plain arrays.
      *
@@ -461,9 +481,9 @@ public final class TsdbClient implements AutoCloseable {
             out.putShort((short) p.length).put(p);
         send();
         int st = frame();
-        if (st == 0 && bodyLen != 4)
+        if (st == 0 && bodyLen != 8)
             throw lost(Status.ERR_CORRUPT, "SERIES reply of " + bodyLen + " bytes");
-        long id = st == 0 ? Integer.toUnsignedLong(in.getInt()) : 0;
+        long id = st == 0 ? in.getLong() : 0;
         endReply();
         check(st);
         return id;
@@ -477,10 +497,10 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
      */
     public String seriesName(long id) throws TsdbException {
-        int wire = wireId(id);
+        checkId(id);
         request();
-        begin(Protocol.OP_SERIES_NAME, 4);
-        out.putInt(wire);
+        begin(Protocol.OP_SERIES_NAME, 8);
+        out.putLong(id);
         send();
         return stringReply("SERIES_NAME");
     }
@@ -635,24 +655,27 @@ public final class TsdbClient implements AutoCloseable {
         Objects.requireNonNull(values, "values");
         Objects.checkFromIndexSize(off, n, ts.length);
         Objects.checkFromIndexSize(off, n, values.length);
-        int one = wireIds(series, many, off, n);
+        long one = checkIds(series, many, off, n);
         ready();
         if (n > 0 && packing()) { /* float32 too: the packed form is the smaller one */
             insertValuesFrames(series, many, ts, Column.ofFloats(values), off, n);
             return;
         }
-        int rowBytes = Long.BYTES + Values.BYTES + (many != null ? Integer.BYTES : 0);
         int sent = 0;
         do { /* one frame even for zero rows, as the C client */
             int m = Math.min(n - sent, INSERT_FRAME_ROWS);
             while (pending >= MAX_IN_FLIGHT)
                 collectOne();
-            begin(Protocol.OP_INSERT, 8 + (long) m * rowBytes);
-            out.putInt(m).putInt(one);
+            long end = 16 + (long) m * (Long.BYTES + Values.BYTES);
+            int pad = many != null ? (int) (-end & 7) : 0;
+            begin(Protocol.OP_INSERT, end + pad + (many != null ? (long) m * Long.BYTES : 0));
+            out.putInt(m).putInt(0).putLong(one);
             putLongs(ts, off + sent, m);
             putValues(values, off + sent, m);
-            if (many != null)
-                putIds(many, off + sent, m);
+            if (many != null) {
+                putZeros(pad);
+                putLongs(many, off + sent, m);
+            }
             send();
             pending++;
             sent += m;
@@ -786,11 +809,11 @@ public final class TsdbClient implements AutoCloseable {
         Objects.requireNonNull(order, "order");
         if (limit < 0)
             throw new IllegalArgumentException("negative limit");
-        int wire = wireId(series);
+        checkId(series);
         request();
         boolean opts = order != Order.ASC || limit != 0;
-        begin(Protocol.OP_QUERY_RAW, opts ? 29 : 20);
-        out.putInt(wire).putLong(start).putLong(end);
+        begin(Protocol.OP_QUERY_RAW, opts ? 33 : 24);
+        out.putLong(series).putLong(start).putLong(end);
         if (opts)
             out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
         send();
@@ -885,8 +908,7 @@ public final class TsdbClient implements AutoCloseable {
      *
      * <p>The server groups in UTC only. For another time zone the client asks the series' first and last row in the
      * range, computes the UTC instants at which the local periods between them begin ({@link Group#bounds}), and
-     * asks for buckets that begin there ({@link #queryBounds}): three requests instead of one. A server older than
-     * protocol version 4 still groups by the zone itself, given by its name.
+     * asks for buckets that begin there ({@link #queryBounds}): three requests instead of one.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -906,8 +928,6 @@ public final class TsdbClient implements AutoCloseable {
         request();
         if (group == null || group.utc())
             return buckets(series, start, end, 0, group, "", order, limit);
-        if (serverVersion() < 4) /* an older server still takes the zone itself */
-            return buckets(series, start, end, 0, group, group.zone().normalized().getId(), order, limit);
         long[] bounds = localBounds(series, start, end, group, false);
         return bounds == null ? Collections.emptyList() : queryBounds(series, start, end, bounds, order, limit);
     }
@@ -1001,9 +1021,9 @@ public final class TsdbClient implements AutoCloseable {
     /** Sends QUERY_BOUNDS, with the {@code fields} byte when it is not 0. */
     private void boundsSend(long series, long start, long end, long[] bounds, Order order, long limit, int fields)
             throws TsdbException {
-        int wire = wireId(series);
-        begin(Protocol.OP_QUERY_BOUNDS, 33 + (long) bounds.length * Long.BYTES + (fields != 0 ? 1 : 0));
-        out.putInt(wire).putLong(start).putLong(end);
+        checkId(series);
+        begin(Protocol.OP_QUERY_BOUNDS, 37 + (long) bounds.length * Long.BYTES + (fields != 0 ? 1 : 0));
+        out.putLong(series).putLong(start).putLong(end);
         out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit).putInt(bounds.length);
         putLongs(bounds, 0, bounds.length);
         if (fields != 0)
@@ -1026,9 +1046,9 @@ public final class TsdbClient implements AutoCloseable {
     /** Sends QUERY_BUCKETS, with the {@code fields} byte when it is not 0. */
     private void bucketsSend(long series, long start, long end, long interval, Group group, byte[] z, Order order,
                              long limit, int fields) throws TsdbException {
-        int wire = wireId(series);
-        begin(Protocol.OP_QUERY_BUCKETS, 44 + z.length + (fields != 0 ? 1 : 0));
-        out.putInt(wire).putLong(start).putLong(end).putLong(interval);
+        checkId(series);
+        begin(Protocol.OP_QUERY_BUCKETS, 48 + z.length + (fields != 0 ? 1 : 0));
+        out.putLong(series).putLong(start).putLong(end).putLong(interval);
         out.put((byte) (group != null ? group.unit().code : 0)).putInt(group != null ? group.count() : 0);
         out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
         out.putShort((short) z.length).put(z);
@@ -1240,10 +1260,10 @@ public final class TsdbClient implements AutoCloseable {
     /** QUERY_TWA and its reply: u32 n, n buckets of 40 bytes. */
     private List<TwaBucket> twa(long series, long start, long end, long interval, int unit, int count, long[] bounds,
                                 TwaOptions o) throws TsdbException {
-        int wire = wireId(series);
+        checkId(series);
         needVersion(6, "time-weighted averages");
         begin(Protocol.OP_QUERY_TWA, Protocol.TWA_HEADER + (long) bounds.length * Long.BYTES);
-        out.putInt(wire).putLong(start).putLong(end);
+        out.putLong(series).putLong(start).putLong(end);
         out.put((byte) (o.method() == TwaMethod.LINEAR ? 1 : 0)).put((byte) (o.order() == Order.DESC ? 1 : 0));
         out.put((byte) unit).put((byte) 0).putLong(o.maxGapMs()).putLong(o.limit()).putLong(interval);
         out.putInt(count).putInt(bounds.length);
@@ -1362,7 +1382,13 @@ public final class TsdbClient implements AutoCloseable {
         begin(Protocol.OP_SERIES_CREATE, 5 + n.length + p.length);
         out.put((byte) type.code).putShort((short) n.length).put(n).putShort((short) p.length).put(p);
         send();
-        return Integer.toUnsignedLong(u32Reply("SERIES_CREATE"));
+        int st = frame();
+        if (st == 0 && bodyLen != 8)
+            throw lost(Status.ERR_CORRUPT, "SERIES_CREATE reply of " + bodyLen + " bytes");
+        long id = st == 0 ? in.getLong() : 0;
+        endReply();
+        check(st);
+        return id;
     }
 
     /**
@@ -1373,10 +1399,10 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
      */
     public ValueType seriesType(long id) throws TsdbException {
-        int wire = wireId(id);
+        checkId(id);
         request();
-        begin(Protocol.OP_SERIES_TYPE, 4);
-        out.putInt(wire);
+        begin(Protocol.OP_SERIES_TYPE, 8);
+        out.putLong(id);
         send();
         int st = frame();
         ValueType t = null;
@@ -1424,10 +1450,10 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown code
      */
     public String stateName(long series, int code) throws TsdbException {
-        int wire = wireId(series);
+        checkId(series);
         request();
-        begin(Protocol.OP_STATE_NAME, 8);
-        out.putInt(wire).putInt(code);
+        begin(Protocol.OP_STATE_NAME, 12);
+        out.putLong(series).putInt(code);
         send();
         return stringReply("STATE_NAME");
     }
@@ -1436,10 +1462,10 @@ public final class TsdbClient implements AutoCloseable {
         byte[] n = utf8(Objects.requireNonNull(name, "name"), "name");
         if (n.length == 0)
             throw new IllegalArgumentException("empty state name");
-        int wire = wireId(series);
+        checkId(series);
         request();
-        begin(Protocol.OP_STATE, 7 + n.length);
-        out.putInt(wire).put((byte) (create ? 1 : 0)).putShort((short) n.length).put(n);
+        begin(Protocol.OP_STATE, 11 + n.length);
+        out.putLong(series).put((byte) (create ? 1 : 0)).putShort((short) n.length).put(n);
         send();
         return u32Reply("STATE");
     }
@@ -1592,7 +1618,7 @@ public final class TsdbClient implements AutoCloseable {
         Objects.requireNonNull(col, "values");
         Objects.checkFromIndexSize(off, n, ts.length);
         Objects.checkFromIndexSize(off, n, col.size());
-        int one = wireIds(series, many, off, n);
+        long one = checkIds(series, many, off, n);
         ready();
         if (n > 0 && packing()) {
             for (int sent = 0; sent < n;) {
@@ -1612,22 +1638,19 @@ public final class TsdbClient implements AutoCloseable {
             byte[] valid = Values.validity(col, off + sent, m);
             long end = Protocol.VALUES_HEADER + (long) m * (Long.BYTES + type.width)
                     + (valid != null ? valid.length : 0);
-            int pad = many != null ? (int) (((end + 3) & ~3L) - end) : 0;
+            int pad = many != null ? (int) (-end & 7) : 0;
             while (pending >= MAX_IN_FLIGHT)
                 collectOne();
-            begin(Protocol.OP_INSERT_VALUES, end + pad + (many != null ? (long) m * Integer.BYTES : 0));
-            out.putInt(m).putInt(one);
-            out.put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0).putInt(0);
+            begin(Protocol.OP_INSERT_VALUES, end + pad + (many != null ? (long) m * Long.BYTES : 0));
+            out.putInt(m).put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0)
+                    .putLong(one);
             putLongs(ts, off + sent, m);
             putColumn(col, off + sent, m);
             if (valid != null)
                 putBytes(valid);
             if (many != null) {
-                if (out.remaining() < pad)
-                    send();
-                for (int i = 0; i < pad; i++)
-                    out.put((byte) 0);
-                putIds(many, off + sent, m);
+                putZeros(pad);
+                putLongs(many, off + sent, m);
             }
             send();
             pending++;
@@ -1636,13 +1659,11 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * Whether inserts go packed: compression on, zstd available, and a server that reads them (HELLO, asked once).
-     * Outstanding acknowledgements are collected first; their errors stay for {@link #await()}.
+     * Whether inserts go packed: compression on, zstd available, and a server that reads them (every server the
+     * client connects to does).
      */
     private boolean packing() throws TsdbException {
         if (zlevel == 0 || noZstd)
-            return false;
-        if (serverVersion() < 3)
             return false;
         if (zstd == null && (zstd = Compressor.create()) == null) {
             noZstd = true;
@@ -1652,26 +1673,14 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * The server's protocol version, asked once (HELLO). Outstanding acknowledgements are collected first; their
-     * errors stay for {@link #await()}.
+     * The server's protocol version, asked when the client connected (HELLO).
      */
-    private int serverVersion() throws TsdbException {
-        if (serverVersion == 0) {
-            while (pending > 0)
-                collectOne();
-            begin(Protocol.OP_HELLO, 4);
-            out.putInt(Protocol.VERSION);
-            send();
-            int st = frame();
-            int v = st == 0 && bodyLen == 4 ? in.getInt() : 1; /* as the C client: anything else is version 1 */
-            endReply();
-            serverVersion = v;
-        }
+    private int serverVersion() {
         return serverVersion;
     }
 
     /** One packed frame of rows {@code [off, off + m)}: reshape, compress, send. */
-    private void sendPacked(int one, long[] many, long[] ts, Column col, int off, int m) throws TsdbException {
+    private void sendPacked(long one, long[] many, long[] ts, Column col, int off, int m) throws TsdbException {
         byte[] valid = Values.validity(col, off, m);
         long bound = Pack.rawBound(m, col.type(), valid != null, many != null);
         if (raw.length < bound)
@@ -1684,9 +1693,8 @@ public final class TsdbClient implements AutoCloseable {
             throw new TsdbException(Status.ERR_NOMEM, "zstd", e);
         }
         begin(Protocol.OP_INSERT_VALUES, Protocol.VALUES_HEADER + 4 + (long) z);
-        out.putInt(m).putInt(one);
-        out.put((byte) col.type().code).put((byte) (Protocol.PACKED | (valid != null ? Protocol.VALID : 0)));
-        out.putShort((short) 0).putInt(0).putInt(len);
+        out.putInt(m).put((byte) col.type().code).put((byte) (Protocol.PACKED | (valid != null ? Protocol.VALID : 0)));
+        out.putShort((short) 0).putLong(one).putInt(len);
         putBytes(zstd.out(), z);
         send();
     }
@@ -1837,9 +1845,9 @@ public final class TsdbClient implements AutoCloseable {
                                  ValueSink sink) throws TsdbException {
         boolean opts = order != Order.ASC || limit != 0;
         boolean lttb = op == Protocol.OP_QUERY_LTTB;
-        int wire = wireId(series);
-        begin(op, (opts ? 29 : 20) + (lttb ? 8 : 0));
-        out.putInt(wire).putLong(start).putLong(end);
+        checkId(series);
+        begin(op, (opts ? 33 : 24) + (lttb ? 8 : 0));
+        out.putLong(series).putLong(start).putLong(end);
         if (lttb)
             out.putLong(threshold);
         if (opts)
@@ -1889,7 +1897,7 @@ public final class TsdbClient implements AutoCloseable {
 
     /*
      * Many series in one request (protocol version 10), as tsdbc_query_multi in client/tsdb_client.c sends them.
-     * QUERY_MULTI carries the single op's payload once, as a template with series 0xffffffff, and the series (with
+     * QUERY_MULTI carries the single op's payload once, as a template with series 0xffffffffffffffff, and the series (with
      * per-series starts, ends and intervals) as arrays; a list longer than MULTI_MAX_SERIES goes in successive
      * requests, and the indexes run on. The reply is the single op's frames for every series in index order, each
      * with the series' index before the body, then an END frame. A caller that stops early sends CANCEL (with the
@@ -2170,8 +2178,7 @@ public final class TsdbClient implements AutoCloseable {
             throw new IllegalArgumentException(m.starts().length + " starts for " + series.length + " series");
         if (m.ends() != null && m.ends().length != series.length)
             throw new IllegalArgumentException(m.ends().length + " ends for " + series.length + " series");
-        for (long id : series)
-            wireId(id);
+        checkIds(0, series, 0, series.length);
         needVersion(10, "many series in one request");
     }
 
@@ -2369,7 +2376,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * The single op's payload for series 0xffffffff, with 0 in every field a per-series array replaces.
+     * The single op's payload for series 0xffffffffffffffff, with 0 in every field a per-series array replaces.
      * {@code bounds} (non-empty) replace the bucket form of {@code q}.
      */
     private static byte[] multiTemplate(MultiQ q, MultiOptions m, long[] bounds) {
@@ -2384,7 +2391,7 @@ public final class TsdbClient implements AutoCloseable {
         long limit = q.kind == K_TWA ? q.twa.limit() : q.limit;
         int nb = bounds.length;
         ByteBuffer t = ByteBuffer.allocate(Protocol.TWA_HEADER + 16 + nb * Long.BYTES).order(ByteOrder.LITTLE_ENDIAN);
-        t.putInt(Protocol.MANY_SERIES).putLong(start).putLong(end);
+        t.putLong(Protocol.MANY_SERIES).putLong(start).putLong(end);
         switch (q.kind) {
         case K_VALUES:
             t.put(desc).putLong(limit);
@@ -2448,9 +2455,7 @@ public final class TsdbClient implements AutoCloseable {
                     throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS);
                 left = m.maxRows() - rows[0];
             }
-            int pad = (8 - (k * 4) % 8) % 8;
-            long payload = Protocol.MULTI_HEADER + (long) narrays * k * Long.BYTES + (long) k * Integer.BYTES + pad
-                    + t.length;
+            long payload = Protocol.MULTI_HEADER + (long) narrays * k * Long.BYTES + (long) k * Long.BYTES + t.length;
             if (payload > Protocol.MAX_FRAME - 5) /* bounds that no frame carries */
                 throw new TsdbException(Status.ERR_TOO_MANY_BUCKETS, "a request of " + payload + " bytes", null);
             begin(Protocol.OP_QUERY_MULTI, payload);
@@ -2462,8 +2467,7 @@ public final class TsdbClient implements AutoCloseable {
                 putLongs(m.ends(), at, k);
             if (iv != null)
                 putLongs(iv, at, k);
-            putIds(series, at, k);
-            putBytes(new byte[pad]);
+            putLongs(series, at, k);
             putBytes(t);
             send();
             if (multiRead(values, row, k, at, rows, sink))
@@ -2586,10 +2590,10 @@ public final class TsdbClient implements AutoCloseable {
      *     the request is not sent); the first error of earlier pipelined inserts
      */
     public void deleteRange(long series, long start, long end) throws TsdbException {
-        int wire = wireId(series);
+        checkId(series);
         needDeletes();
         begin(Protocol.OP_DELETE_RANGE, 24);
-        out.putInt(wire).putInt(0).putLong(start).putLong(end);
+        out.putLong(series).putLong(start).putLong(end);
         send();
         int st = frame();
         endReply();
@@ -2620,11 +2624,11 @@ public final class TsdbClient implements AutoCloseable {
                 + (valid != null ? valid.length : 0);
         if (payload > Protocol.MAX_FRAME - 5)
             throw new IllegalArgumentException(n + " rows do not fit in one request");
-        int wire = wireId(series);
+        checkId(series);
         needDeletes();
         begin(Protocol.OP_REPLACE_RANGE, payload);
-        out.putInt(n).putInt(wire);
-        out.put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0).putInt(0);
+        out.putInt(n).put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0);
+        out.putLong(series);
         out.putLong(start).putLong(end);
         putLongs(timestamps, 0, n);
         putColumn(values, 0, n);
@@ -2647,10 +2651,10 @@ public final class TsdbClient implements AutoCloseable {
      *     {@link Status#ERR_NOTFOUND} for an unknown series
      */
     public void setRetention(long series, long limitMs) throws TsdbException {
-        int wire = wireId(series);
+        checkId(series);
         needDeletes();
         begin(Protocol.OP_SET_RETENTION, 16);
-        out.putInt(wire).putInt(0).putLong(limitMs);
+        out.putLong(series).putLong(limitMs);
         send();
         int st = frame();
         endReply();
@@ -2665,10 +2669,10 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException as {@link #setRetention(long, long)}
      */
     public long retention(long series) throws TsdbException {
-        int wire = wireId(series);
+        checkId(series);
         needDeletes();
-        begin(Protocol.OP_GET_RETENTION, 4);
-        out.putInt(wire);
+        begin(Protocol.OP_GET_RETENTION, 8);
+        out.putLong(series);
         send();
         int st = frame();
         if (st == 0 && bodyLen != 8)
@@ -2893,42 +2897,31 @@ public final class TsdbClient implements AutoCloseable {
         }
     }
 
-    /**
-     * A series id as protocol 10 carries it: 32 bits. A larger id is no series that server can have (it would be
-     * truncated into another one), so it is refused before anything is written, as the server refuses an unknown id
-     * in a write.
-     */
-    static int wireId(long id) throws TsdbException {
-        if ((id >>> 32) != 0)
-            throw new TsdbException(Status.ERR_INVALID, "series id " + Long.toUnsignedString(id)
-                    + " does not fit in protocol " + Protocol.VERSION, null);
-        return (int) id;
+    /** The marker of a request with a series per row; a series never has this id. */
+    private static void checkId(long id) {
+        if (id == Protocol.MANY_SERIES)
+            throw new IllegalArgumentException("series id 0xffffffffffffffff is reserved");
     }
 
     /**
-     * Checks the ids of an insert: {@code many[off .. off + n)}, or {@code one} (which must not be the many-series
-     * marker). Returns the id field of the frame header.
+     * Checks the ids of a request: {@code many[off .. off + n)}, or {@code one} when there is no array. Returns the
+     * id field of the frame header (the many-series marker for an array).
      */
-    private static int wireIds(long one, long[] many, int off, int n) throws TsdbException {
+    private static long checkIds(long one, long[] many, int off, int n) {
         if (many == null) {
-            int w = wireId(one);
-            if (w == Protocol.MANY_SERIES)
-                throw new IllegalArgumentException("series id 0xffffffff is reserved");
-            return w;
+            checkId(one);
+            return one;
         }
         Objects.checkFromIndexSize(off, n, many.length);
         for (int i = off; i < off + n; i++)
-            wireId(many[i]);
+            checkId(many[i]);
         return Protocol.MANY_SERIES;
     }
 
-    /** Ids checked by {@link #wireId}, as u32. */
-    private void putIds(long[] a, int off, int n) throws TsdbException {
-        for (int end = off + n; off < end; off++) {
-            if (out.remaining() < Integer.BYTES)
-                send();
-            out.putInt((int) a[off]);
-        }
+    /** Zero bytes: the padding that brings an id array to a multiple of 8. */
+    private void putZeros(int n) throws TsdbException {
+        if (n > 0)
+            putBytes(new byte[n]);
     }
 
     private void putInts(int[] a, int off, int n) throws TsdbException {

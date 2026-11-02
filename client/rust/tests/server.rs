@@ -240,22 +240,25 @@ fn errors() {
     assert!(matches!(e, Error::InvalidArgument(_)));
     assert_eq!(e.code(), -4);
     assert!(matches!(c.insert(&[a], &[T0, T0 + 1], &[1.0, 2.0]), Err(Error::InvalidArgument(_))));
-    assert!(matches!(c.insert_series(u32::MAX.into(), &[T0], &[1.0]), Err(Error::InvalidArgument(_))));
-    // protocol 10 carries 32-bit ids: a larger one is refused, never truncated onto another series (a + 2^32
-    // would land on a)
+    // u64::MAX marks the many-series layout: it is never an id
+    assert!(matches!(c.insert_series(u64::MAX, &[T0], &[1.0]), Err(Error::InvalidArgument(_))));
+    // protocol 11 carries all 64 bits: an id above 2^32 goes out whole (it is never truncated onto a series
+    // whose low 32 bits match, here a) and tsdbd, which hands out no such id yet, does not know it
     let big = a + (1u64 << 32);
-    let refused = |r: Result<(), Error>| matches!(r, Err(Error::InvalidArgument(ref m)) if m.contains("32-bit"));
-    assert!(refused(c.insert_series(big, &[T0], &[1.0])));
-    assert!(refused(c.insert(&[a, big], &[T0, T0], &[1.0, 2.0])));
-    assert!(refused(c.insert_series_values(big, &[T0], &[1.0f32])));
-    assert!(refused(c.query_points(big, .., QueryOpts::asc()).map(|_| ())));
-    assert!(refused(c.query_agg(big, .., 0).map(|_| ())));
-    assert!(refused(c.series_name(big).map(|_| ())));
-    assert!(refused(c.series_type(big).map(|_| ())));
-    assert!(refused(c.delete_range(big, ..)));
-    assert!(refused(c.retention(big).map(|_| ())));
-    let multi = c.query_rows_multi(&[a, big], .., QueryOpts::asc(), Default::default());
-    assert!(refused(multi.map(|_| ())));
+    let status = |e: Error| e.status();
+    assert_eq!(status(c.insert_series(big, &[T0], &[1.0]).unwrap_err()), Some(Status::Invalid));
+    assert_eq!(status(c.insert(&[a, big], &[T0, T0], &[1.0, 2.0]).unwrap_err()), Some(Status::Invalid));
+    assert_eq!(status(c.insert_series_values(big, &[T0], &[1.0f32]).unwrap_err()), Some(Status::Invalid));
+    // (the status of a query on an unknown series is the server's business; what matters is that no row of a comes back)
+    assert!(c.query_points(big, .., QueryOpts::asc()).map_or(true, |p| p.is_empty()));
+    assert_eq!(status(c.series_name(big).unwrap_err()), Some(Status::NotFound));
+    assert_eq!(status(c.series_type(big).unwrap_err()), Some(Status::NotFound));
+    assert_eq!(status(c.retention(big).unwrap_err()), Some(Status::NotFound));
+    assert!(c.delete_range(big, ..).is_err());
+    let multi = c.query_rows_multi(&[a, big], .., QueryOpts::asc(), Default::default()).unwrap();
+    assert_eq!(multi.len(), 2);
+    assert_eq!(multi[1].as_ref().unwrap().len(), 0);
+    // nothing of the above reached series a
     assert_eq!(c.query_points(a, .., QueryOpts::asc()).unwrap().len(), 0);
     assert!(matches!(c.series(""), Err(Error::InvalidArgument(_))));
     assert!(matches!(c.series("a\0b"), Err(Error::InvalidArgument(_))));

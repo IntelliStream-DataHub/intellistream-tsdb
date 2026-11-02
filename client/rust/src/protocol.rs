@@ -5,41 +5,29 @@
 //! Version 2 adds value types and nulls (SERIES_CREATE, SERIES_TYPE,
 //! INSERT_VALUES, QUERY_VALUES, STATE, STATE_NAME, QUERY_BUCKETS). This client
 //! sends QUERY_BUCKETS for every aggregate: its 64-byte rows carry f64 min/max
-//! and the exact integer fields, which the version 1 QUERY_AGG/GROUP rows lack.
+//! and the exact integer fields. (The version 1 QUERY_AGG and QUERY_GROUP were removed in version 11.)
 //! Version 3 adds packed, zstd-compressed INSERT_VALUES bodies (`pack.rs`).
 //! Version 4: the server knows UTC only. QUERY_BUCKETS refuses a time zone
 //! other than UTC; local periods arrive as their UTC bounds in QUERY_BOUNDS
 //! (`calendar.rs` computes them).
-//! Version 5 and 6 add LTTB and time-weighted averages, which this client does
-//! not offer (it still says 7: the server answers the lower of both versions).
-//! Version 7 adds DELETE_RANGE, REPLACE_RANGE, SET_RETENTION, GET_RETENTION.
+//! Version 5 and 6 add LTTB and time-weighted averages, version 7 DELETE_RANGE,
+//! REPLACE_RANGE, SET_RETENTION, GET_RETENTION.
+//! Version 11: every series id is a u64 on the wire. A server that answers HELLO with less is refused
+//! when the client connects ([`Error::Protocol`]).
 
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
+/// The oldest server version this client talks to (`TSDB_PROTOCOL_MIN`): version 11 widened every series id.
+pub(crate) const PROTOCOL_MIN: u32 = 11;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 
 /// Largest frame either side accepts (`TSDB_MAX_FRAME`), counted like `len`.
 pub(crate) const MAX_FRAME: usize = 256 << 20;
 /// The series field of an INSERT whose rows carry their own series.
-pub(crate) const MANY_SERIES: u32 = u32::MAX;
-/// Narrows a series id to the 32 bits protocol 10 carries. The database hands out no larger id yet;
-/// a larger one is refused before anything is sent, as invalid input.
-pub(crate) fn wire_id(id: u64) -> Result<u32> {
-    u32::try_from(id).map_err(|_| {
-        Error::InvalidArgument(format!("series id {id} does not fit protocol {PROTOCOL_VERSION} (32-bit ids)"))
-    })
-}
-
-/// [`wire_id`] for every id of an array (checked once, then written by [`FrameBuf::sids`]).
-pub(crate) fn wire_ids(ids: &[u64]) -> Result<()> {
-    match ids.iter().find(|&&i| i > u32::MAX as u64) {
-        Some(&i) => wire_id(i).map(|_| ()),
-        None => Ok(()),
-    }
-}
+pub(crate) const MANY_SERIES: u64 = u64::MAX;
 
 /// Bytes per bucket in a QUERY_BUCKETS reply (`TSDB_BUCKET_ROW`).
 pub(crate) const BUCKET_ROW: usize = 64;
@@ -48,7 +36,7 @@ pub(crate) const SPREAD: u8 = 1;
 /// Bytes per bucket in a reply with [`SPREAD`].
 pub(crate) const SPREAD_ROW: usize = 104;
 /// Bytes of a QUERY_TWA request before the bounds.
-pub(crate) const TWA_HEADER: usize = 56;
+pub(crate) const TWA_HEADER: usize = 60;
 /// Bytes per bucket in a QUERY_TWA reply.
 pub(crate) const TWA_ROW: usize = 40;
 /// Header of a QUERY_VALUES chunk: last, type, flags, 0, n.
@@ -57,7 +45,7 @@ pub(crate) const VALUES_CHUNK_HEADER: usize = 8;
 pub(crate) const VALID: u8 = 1;
 /// Flag: the arrays are packed and zstd compressed (`TSDB_PACKED`, version 3).
 pub(crate) const PACKED: u8 = 2;
-/// Header of a REPLACE_RANGE request: n, series, type, flags, 0, 0, start, end
+/// Header of a REPLACE_RANGE request: n, type, flags, 0, series, start, end
 /// (`TSDB_REPLACE_HEADER`, version 7).
 pub(crate) const REPLACE_HEADER: usize = 32;
 /// Reply header: len, id, op, status.
@@ -154,12 +142,11 @@ impl FrameBuf {
         self
     }
 
-    /// Series ids as protocol 10's u32 array; the caller checked them with [`wire_ids`].
+    /// Series ids as an array of u64 (protocol 11).
     pub(crate) fn sids(&mut self, v: &[u64]) -> &mut Self {
-        self.buf.reserve(v.len() * 4);
+        self.buf.reserve(v.len() * 8);
         for &x in v {
-            debug_assert!(x <= u32::MAX as u64);
-            self.buf.extend_from_slice(&(x as u32).to_le_bytes());
+            self.buf.extend_from_slice(&x.to_le_bytes());
         }
         self
     }
@@ -176,10 +163,10 @@ impl FrameBuf {
         &mut self.buf
     }
 
-    /// Pads the payload (which starts after the 9-byte header) to a multiple of 4 bytes.
-    pub(crate) fn align4(&mut self) -> &mut Self {
-        let pad = (4 - (self.buf.len() - 9) % 4) % 4;
-        self.buf.extend_from_slice(&[0; 3][..pad]);
+    /// Pads the payload (which starts after the 9-byte header) to a multiple of 8 bytes.
+    pub(crate) fn align8(&mut self) -> &mut Self {
+        let pad = (8 - (self.buf.len() - 9) % 8) % 8;
+        self.buf.extend_from_slice(&[0; 7][..pad]);
         self
     }
 
