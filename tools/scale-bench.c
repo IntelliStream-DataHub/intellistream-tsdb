@@ -5,6 +5,9 @@
  *   scale-bench load   --dir D [--series 10000] [--points 10000000] [--threads 8]
  *   scale-bench export [--series ...] [--from S0] [--to S1] > rows.rowbinary
  *   scale-bench query  --dir D | --port P  [--series ...] [--threads 32] [--sql DIR] [--only NAME]
+ *                      [--query-threads N] (embedded: tsdb_options.query_threads) [--repeat K] (K x the queries)
+ *                      [--one-series S] (single-series classes query series S only)
+ *                      [--digest] (a hash of every answer's bytes: compare builds; slows the timed loop)
  *
  * The data are the seven sensor kinds of datasets.h, mixed over the series,
  * with their usual value streams but all stamped at 1 Hz, so every series
@@ -41,7 +44,7 @@ static const int64_t T0 = 1704067200000; /* 2024-01-01 */
 static const int64_t STEP = 1000;
 
 static const char *dir, *host = "127.0.0.1", *sql_dir, *only;
-static int port, threads = 8;
+static int port, threads = 8, query_threads, repeat = 1, one_series = -1, digest;
 static uint32_t nseries = 10000, s_from, s_to, group_series = 100;
 static uint64_t points = 10000000, window = 100000;
 
@@ -254,6 +257,7 @@ typedef struct target {
 typedef struct tally {
     uint64_t rows, buckets;
     double sum;
+    uint64_t digest; /* of every bucket's bytes, a sum over the queries: the same in any order of threads */
 } tally;
 
 static int count_raw(void *ctx, const int64_t *ts, const float *v, size_t n)
@@ -283,6 +287,12 @@ static int run_one(const target *tg, int slot, const qclass *qc, uint32_t s, int
         t->sum += b[i].sum;
     }
     t->buckets += nb;
+    if (digest) { /* in the timed loop: compare answers with it, not times */
+        uint64_t h = 0xcbf29ce484222325ull ^ ((uint64_t)s << 32);
+        for (size_t i = 0; i < nb * sizeof *b; i++)
+            h = (h ^ ((const uint8_t *)b)[i]) * 0x100000001b3ull;
+        t->digest += ds_mix(h);
+    }
     free(b);
     return rc;
 }
@@ -316,7 +326,7 @@ static void run_span(const target *tg, const qclass *qc, uint32_t s0, uint32_t s
     span_job *j = calloc((size_t)threads, sizeof *j);
     pthread_t *th = calloc((size_t)threads, sizeof *th);
     for (int i = 0; i < threads; i++) {
-        j[i] = (span_job){tg, qc, i, &next, s1, start, end, {0, 0, 0}};
+        j[i] = (span_job){tg, qc, i, &next, s1, start, end, {0, 0, 0, 0}};
         pthread_create(&th[i], NULL, span_worker, &j[i]);
     }
     for (int i = 0; i < threads; i++) {
@@ -324,6 +334,7 @@ static void run_span(const target *tg, const qclass *qc, uint32_t s0, uint32_t s
         t->rows += j[i].t.rows;
         t->buckets += j[i].t.buckets;
         t->sum += j[i].t.sum;
+        t->digest += j[i].t.digest;
     }
     free(j);
     free(th);
@@ -360,8 +371,11 @@ static void write_sql(FILE *f, const qclass *qc, uint32_t s0, uint32_t s1, int64
 static void run_class(const target *tg, const qclass *qc)
 {
     uint64_t r = ds_mix(0x5eed ^ (uint64_t)(qc - classes));
+    qclass rep = *qc; /* --repeat K: K times the queries of the class, for profiles and steadier means */
+    rep.queries *= repeat > 0 ? repeat : 1;
+    qc = &rep;
     double *lat = malloc((size_t)qc->queries * sizeof *lat);
-    tally t = {0, 0, 0};
+    tally t = {0, 0, 0, 0};
     FILE *f = NULL;
     if (sql_dir) {
         char path[4096];
@@ -376,6 +390,8 @@ static void run_class(const target *tg, const qclass *qc)
         r = ds_mix(r);
         uint32_t span = qc->series ? qc->series : nseries;
         uint32_t s0 = (uint32_t)(r % (nseries - span + 1)), s1 = s0 + span;
+        if (span == 1 && one_series >= 0) /* --one-series: the same series (codec) in every class */
+            s0 = (uint32_t)one_series, s1 = s0 + 1;
         uint64_t n = qc->samples ? qc->samples : points;
         uint64_t i = (r >> 24) % (points - n + 1);
         int64_t start = T0 + (int64_t)i * STEP - STEP / 2, end = start + (int64_t)n * STEP;
@@ -400,9 +416,9 @@ static void run_class(const target *tg, const qclass *qc)
     qsort(lat, (size_t)qc->queries, sizeof *lat, cmp_double);
     double mean = total / qc->queries;
     printf("%-14s %-44s %5d q  mean %10.3f ms  p50 %10.3f ms  min %10.3f ms  %12.0f rows/q  %8.1f M rows/s"
-           "  %" PRIu64 " buckets  sum %.6g\n",
+           "  %" PRIu64 " buckets  sum %.6g  digest %016" PRIx64 "\n",
            qc->name, qc->label, qc->queries, mean * 1e3, lat[qc->queries / 2] * 1e3, lat[0] * 1e3,
-           (double)t.rows / qc->queries, t.rows / total / 1e6, t.buckets, t.sum);
+           (double)t.rows / qc->queries, t.rows / total / 1e6, t.buckets, t.sum, t.digest);
     fflush(stdout);
     free(lat);
 }
@@ -423,6 +439,7 @@ static int cmd_query(void)
         tsdb_options o;
         tsdb_options_init(&o);
         o.read_only = true;
+        o.query_threads = query_threads;
         int rc = tsdb_open(dir, &o, &tg.db);
         if (rc) {
             fprintf(stderr, "open %s: %s\n", dir, tsdb_strerror(rc));
@@ -469,6 +486,8 @@ int main(int argc, char **argv)
         {"from", required_argument, 0, 'f'},   {"to", required_argument, 0, 'T'},
         {"host", required_argument, 0, 'h'},   {"port", required_argument, 0, 'P'},
         {"sql", required_argument, 0, 'S'},    {"only", required_argument, 0, 'o'},
+        {"query-threads", required_argument, 0, 'Q'}, {"repeat", required_argument, 0, 'R'},
+        {"one-series", required_argument, 0, 'O'}, {"digest", no_argument, 0, 'D'},
         {0, 0, 0, 0}};
     int ch;
     optind = 2;
@@ -486,6 +505,10 @@ int main(int argc, char **argv)
         case 'P': port = atoi(optarg); break;
         case 'S': sql_dir = optarg; break;
         case 'o': only = optarg; break;
+        case 'Q': query_threads = atoi(optarg); break;
+        case 'R': repeat = atoi(optarg); break;
+        case 'O': one_series = atoi(optarg); break;
+        case 'D': digest = 1; break;
         default: return 2;
         }
     }
