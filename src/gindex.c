@@ -338,11 +338,15 @@ int gix_encode(const granule *g, size_t n, uint8_t **out, size_t *len)
     gix x = {0}, y;
     if (!v || !r || !delta || !skip)
         goto out;
-    /* derivable step and linear areas */
+    /* derivable step and linear areas. Never from a NaN: which payload an operation on two NaNs returns (first + last
+     * with both NaN) is not defined by IEEE 754, differs between compilers, optimization levels and CPUs, and the
+     * decoder (gix_dlin inlined in gx_load) need not evaluate it as this loop does, so the stored flag would decode
+     * to other bits and gix_encode's check would refuse the part. A NaN entry keeps its areas as explicit fields. */
     for (size_t i = 0; i < n; i++) {
         const granule *e = &g[i];
-        skip[2 * i] = same_bits(gix_dstep(e->fsum, e->tw_last, e->tw_gap), e->tw_step);
-        skip[2 * i + 1] = same_bits(gix_dlin(e->fsum, e->tw_first, e->tw_last, e->tw_gap), e->tw_lin);
+        bool nan = e->fsum != e->fsum || e->tw_first != e->tw_first || e->tw_last != e->tw_last;
+        skip[2 * i] = !nan && same_bits(gix_dstep(e->fsum, e->tw_last, e->tw_gap), e->tw_step);
+        skip[2 * i + 1] = !nan && same_bits(gix_dlin(e->fsum, e->tw_first, e->tw_last, e->tw_gap), e->tw_lin);
     }
     for (int f = 0; f < GF_N; f++)
         if ((rc = pack_field(g, n, skip, f, v, r, &x.f[f], delta + (size_t)f * n)) != 0)

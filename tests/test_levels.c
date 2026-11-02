@@ -18,9 +18,11 @@
  */
 #include "internal.h"
 #include "bitpack.h"
+#include "fpmode.h"
 #include "../tools/datasets.h"
 #include "hydraulic_psi.h"
 
+#include <fenv.h>
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -325,6 +327,57 @@ static void make_inputs(void)
                 ((uint64_t *)x->v)[i] = NULL_F64;
         }
     }
+    /* float64 decimals at every scale, rebuilt either way (k / 10^e, k * 10^-e), with exceptions at random places:
+     * the AVX2 encoder takes four values at a time and hands a group with an exception, or a value at or beyond
+     * 2^51 scaled, to the one-at-a-time code; lengths around the group of four */
+    {
+        static const size_t flens[] = {4, 5, 6, 7, 8, 9, 13, 33, 1001};
+        static const double odd[] = {-0.0, 0.5, -0.5, 1.5, 2.5, -2.5, 0.1 + 0.2, 1e300, -1e-300, 4.9e-324};
+        for (int c = 0; c < 92; c++) {
+            int e = c < 64 ? c / 4 : 1 + (c - 64) % 30; /* 10^0 .. 10^15, then 2^1 .. 2^30 */
+            bool mul = c & 1;
+            size_t n = flens[(size_t)c % (sizeof flens / sizeof *flens)];
+            double sc, inv;
+            if (c < 64) {
+                sc = 1.0;
+                for (int j = 0; j < e; j++)
+                    sc *= 10;
+                static const double invs[] = {1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7,
+                                              1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15};
+                inv = invs[e];
+            } else {
+                sc = (double)(1L << e);
+                inv = 1.0 / sc;
+            }
+            snprintf(name, sizeof name, "f64 decimal scale %s%d %s, %zu", c < 64 ? "1e" : "2^", e, mul ? "mul" : "div", n);
+            x = add(name, TSDB_FLOAT64, n);
+            int64_t k = (int64_t)(next() % 100000) - 50000;
+            for (size_t i = 0; i < n; i++) {
+                k += (int64_t)(next() % 41) - 20;
+                double d = mul ? (double)k * inv : (double)k / sc;
+                switch (next() % (c % 3 == 0 ? 9 : 40)) { /* every third input is rich in exceptions */
+                case 0: d = odd[next() % (sizeof odd / sizeof *odd)]; break;
+                case 1: d = (double)((int64_t)(next() % 1000) - 500) / 7; break;
+                case 2: memcpy(&d, &(uint64_t){NULL_F64}, 8); break;
+                default: break;
+                }
+                memcpy((double *)x->v + i, &d, 8);
+            }
+        }
+        /* counters near 2^51 and 2^52 as doubles (scale 1): the fast path ends at 2^51, the scalar one at 2^52 */
+        static const double bases[] = {2251799813685248.0 - 6, 2251799813685248.0 - 2, 2251799813685248.0 - 1,
+                                       2251799813685248.0,     4503599627370496.0 - 10, 4503599627370496.0 - 2,
+                                       4503599627370496.0,     -2251799813685248.0 + 6, -2251799813685248.0,
+                                       -4503599627370496.0 + 10};
+        for (size_t b = 0; b < sizeof bases / sizeof *bases; b++)
+            for (size_t n = 5; n <= 9; n += 4) {
+                snprintf(name, sizeof name, "f64 integers near 2^51 and 2^52, %zu from %.0f", n, bases[b]);
+                x = add(name, TSDB_FLOAT64, n);
+                for (size_t i = 0; i < n; i++)
+                    ((double *)x->v)[i] = bases[b] + (double)i * (b & 1 ? -1 : 1);
+            }
+    }
+
     struct { const char *name; double a, step; } ramps64[] = {
         {"f64 2^53 counter", 9007199254740000.0, 1}, {"f64 1e15 decimals", 1e15, 0.01},
         {"f64 1e300 ramp", 1e300, -1e296},            {"f64 0.1 steps", 0, 0.1},
@@ -651,6 +704,142 @@ static void crafted_sums(rec *r)
     free(blk);
 }
 
+/* BLK_F64_DECIMAL blocks (nothing but the integers: no exceptions) whose integers lie anywhere in the int64 range, as
+ * a damaged part's would, or as a counter at 2^51 and beyond does: the AVX2 conversion takes a block only when every
+ * integer is below 2^51 in magnitude, and the rest must come out as the scalar conversion gives it. The reference
+ * builds each double from the integers of ref_ibp_decode. */
+static void crafted_f64_decimal(rec *r)
+{
+    static const size_t lens[] = {2, 3, 4, 5, 7, 8, 9, 33, 1025, 8192};
+    const int64_t P51 = INT64_C(1) << 51;
+    const int64_t firsts[] = {0, 1, -1, P51 - 1, P51, -P51, -P51 - 1, P51 + 1, P51 - 5000, -P51 + 5000, P51 - 2,
+                              2 * P51, -2 * P51, 4 * P51 + 1, INT64_MAX, INT64_MIN, INT64_C(1) << 62};
+    enum { NF = sizeof firsts / sizeof *firsts };
+    static const double dec_inv[] = {1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7,
+                                     1e-8, 1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15};
+    uint64_t s = 4242;
+    uint32_t *z = malloc(1024 * sizeof *z);
+    uint8_t *blk = malloc(5 + 8 + 9 * (1024 * 4 + 8) + BLK_SLACK);
+    for (int c = 0; c < 400; c++) {
+        size_t n = lens[c % (sizeof lens / sizeof *lens)];
+        int e = (c * 7) % 46;
+        bool mul = (c >> 2) & 1;
+        int64_t first = c % 5 == 4 ? (int64_t)(s = ds_mix(s + c)) : firsts[(c / 10) % NF];
+        blk[0] = (uint8_t)(e | (mul ? 0x80 : 0));
+        memset(blk + 1, 0, 4); /* nexc 0 */
+        memcpy(blk + 5, &first, 8);
+        uint8_t *o = blk + 13;
+        for (size_t v0 = 1; v0 < n; v0 += 1024) {
+            size_t nv = MIN((size_t)1024, n - v0);
+            s = ds_mix(s + v0);
+            int w = c % 3 == 0 ? (int)(s % 33) : (int)(s % 12); /* small steps keep a block near the edge */
+            uint32_t mask = w == 32 ? UINT32_MAX : (uint32_t)((1ull << w) - 1);
+            for (size_t i = 0; i < nv; i++)
+                z[i] = (uint32_t)(s = ds_mix(s + i)) & mask;
+            *o++ = (uint8_t)w;
+            pack(z, nv, w, o);
+            o += packed_bytes(nv, w);
+        }
+        size_t len = (size_t)(o - blk);
+        memset(o, 0x5a, BLK_SLACK);
+        memset(dec, 0xa5, n * 16);
+        double *got = (double *)(void *)dec, *want = (double *)(void *)(dec + n * 8);
+        int rc = f64_decimal_decode(blk, len, n, got);
+        int rc2 = ref_ibp_decode(blk + 5, len - 5, n, (int64_t *)(void *)want);
+        double sc = e < 16 ? 1 : (double)(1L << (e - 15));
+        for (int j = 0; j < e && e < 16; j++)
+            sc *= 10;
+        double inv = e < 16 ? dec_inv[e] : 1.0 / (double)(1L << (e - 15));
+        for (size_t i = 0; i < n; i++) {
+            int64_t k;
+            memcpy(&k, &want[i], 8);
+            want[i] = mul ? (double)k * inv : (double)k / sc;
+        }
+        char what[64];
+        snprintf(what, sizeof what, "crafted f64_decimal %d", c);
+        put(r, what, "integers", got, n * 8);
+        if (rc != 0 || rc2 != 0 || memcmp(got, want, n * 8) != 0) {
+            fprintf(stderr, "%s (n %zu, first %lld, e %d%s): differs from the scalar conversion\n", what, n,
+                    (long long)first, e, mul ? " mul" : "");
+            failures++;
+        }
+    }
+    free(z);
+    free(blk);
+}
+
+/* ---- unpack, at every width ----
+ * bitpack.h's AVX2 unpack takes eight values per step for widths 1 to 25 (v3, and a native build without AVX-512BW)
+ * and leaves the last n % 8 values, the wider widths and short runs to the scalar loops. Blocks of int_bp with one
+ * vector of every width and of lengths around the group of eight and the vector of 1024, whose unused bits and
+ * bytes past the end are ones, decode at every level to what ref_ibp_decode (the test's own unpack) gives; and
+ * unpack itself, on a heap buffer with no more bytes past the packed ones than its contract allows (16 - ceil(w / 2),
+ * at least 7, where the vector loop runs; 7 otherwise): ASan sees a read beyond. */
+static void crafted_unpack(rec *r)
+{
+    static const size_t lens[] = {2,  3,  4,  5,  6,  7,   8,   9,   10,  11,   12,   13,   14,   15,   16,  17,
+                                  18, 19, 23, 24, 25, 31,  32,  33,  34,  39,   40,   41,   1023, 1024,  1025, 8192};
+    uint64_t s = 777;
+    uint32_t *z = malloc(1024 * sizeof *z);
+    uint8_t *blk = malloc(8 + 9 * (1024 * 4 + 8) + BLK_SLACK);
+    for (int w = 0; w <= 32; w++)
+        for (size_t l = 0; l < sizeof lens / sizeof *lens; l++) {
+            size_t n = lens[l];
+            int64_t first = (int64_t)(s = ds_mix(s + 1));
+            memcpy(blk, &first, 8);
+            uint8_t *o = blk + 8;
+            uint32_t top = w == 32 ? UINT32_MAX : (uint32_t)((1ull << w) - 1);
+            for (size_t v0 = 1; v0 < n; v0 += 1024) {
+                size_t nv = MIN((size_t)1024, n - v0);
+                for (size_t i = 0; i < nv; i++) {
+                    s = ds_mix(s + i);
+                    z[i] = (uint32_t)s & top;
+                    if (i % 5 == 0) /* extremes: all ones, all zeros */
+                        z[i] = (i / 5) & 1 ? top : 0;
+                }
+                *o++ = (uint8_t)w;
+                pack(z, nv, w, o);
+                o += packed_bytes(nv, w);
+            }
+            size_t len = (size_t)(o - blk);
+            memset(o, 0xff, BLK_SLACK); /* what the loads past the end see */
+            memset(dec, 0xa5, n * 16);
+            int rc = int_bp_decode(blk, len, n, (int64_t *)(void *)dec);
+            int rc2 = ref_ibp_decode(blk, len, n, (int64_t *)(void *)(dec + n * 8));
+            char what[64];
+            snprintf(what, sizeof what, "crafted unpack w %d n %zu", w, n);
+            put(r, what, "int_bp", dec, n * 8);
+            if (rc != 0 || rc2 != 0 || memcmp(dec, dec + n * 8, n * 8) != 0) {
+                fprintf(stderr, "%s: differs from the reference unpack\n", what);
+                failures++;
+            }
+        }
+    free(z);
+    free(blk);
+
+    /* unpack alone, against bits read one value at a time from a stream pack wrote */
+    for (int w = 1; w <= 32; w++)
+        for (size_t n = 1; n <= 70; n++) {
+            uint32_t top = w == 32 ? UINT32_MAX : (uint32_t)((1ull << w) - 1), in[70], got[70];
+            for (size_t i = 0; i < n; i++)
+                in[i] = (uint32_t)(s = ds_mix(s + i)) & top;
+            size_t pb = packed_bytes(n, w);
+            size_t spare = n >= 8 && w <= 25 ? MAX((size_t)(16 - (w + 1) / 2), (size_t)7) : 7;
+            uint8_t *buf = malloc(pb + 4 + spare), *exact = malloc(pb + spare);
+            memset(buf, 0xff, pb + 4 + spare);
+            pack(in, n, w, buf); /* pack may write up to 3 bytes of padding */
+            memcpy(exact, buf, pb);
+            memset(exact + pb, 0xff, spare);
+            unpack(exact, n, w, got);
+            if (memcmp(got, in, n * 4) != 0) {
+                fprintf(stderr, "unpack w %d n %zu: wrong values\n", w, n);
+                failures++;
+            }
+            free(buf);
+            free(exact);
+        }
+}
+
 /* The lengths of the prefixes folded and searched: every one up to SHORT_LENS (the short runs, the kernels' tails,
  * most of the sets' thresholds), the longer thresholds on both sides (check_thresholds), then all of it. */
 #define SHORT_LENS 66
@@ -705,9 +894,115 @@ static void twa_ref(int type, const int64_t *ts, const void *v, size_t n, twa_su
     *o = (twa_sums){.step = canon_nan(step), .lin = canon_nan(lin), .sms = sms, .lms = lms, .gap = gap};
 }
 
+/* ---- the CPU's rounding mode ----
+ * The decimal codecs keep an integer only when it rebuilds the value bit for bit, so their blocks and their decoded
+ * values depend on how the CPU rounds (fpmode.h). A host application may have set FE_UPWARD, FE_DOWNWARD or
+ * FE_TOWARDZERO: every float32 and float64 input must then encode to the very bytes it gives at FE_TONEAREST (AUTO,
+ * as inserts and as merges write it), the block of the nearest encode must decode to the input under each mode, and
+ * the caller's mode must be there again after the call, also where only the SSE control register was set (glibc's
+ * fegetround reads the x87 word, which a program that sets MXCSR itself does not touch). */
+static unsigned rc_bits(void)
+{
+#if defined(__SSE2__)
+    return _mm_getcsr() & FP_RC_MASK;
+#else
+    return (unsigned)fegetround();
+#endif
+}
+
+static void rounding_modes(codec_ctx *c)
+{
+    static const int modes[] = {FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO};
+    static const char *const names[] = {"FE_UPWARD", "FE_DOWNWARD", "FE_TOWARDZERO"};
+    size_t mx = 0;
+    for (int k = 0; k < nin; k++)
+        mx = MAX(mx, in[k].n);
+    uint8_t *ref = malloc(BUF(mx) + BLK_SLACK);
+    int shown = 0;
+    for (int k = 0; k < nin; k++) {
+        const input *x = &in[k];
+        if (x->type != TSDB_FLOAT32 && x->type != TSDB_FLOAT64)
+            continue;
+        size_t w = type_width(x->type);
+        for (int effort = 0; effort < 2; effort++) {
+            c->effort = effort ? CODEC_MERGE : CODEC_FAST;
+            fesetround(FE_TONEAREST);
+            memset(ref, 0, BUF(x->n));
+            size_t lenr = block_encode_vals(c, 0, 0, x->type, x->v, x->n, ref);
+            CHECK(lenr > 0);
+            for (int mi = 0; mi < 3; mi++) {
+                const char *bad = NULL;
+                fesetround(modes[mi]);
+                unsigned want = rc_bits();
+                memset(buf, 0, BUF(x->n));
+                size_t len = block_encode_vals(c, 0, 0, x->type, x->v, x->n, buf);
+                if (rc_bits() != want || fegetround() != modes[mi])
+                    bad = "encode left another mode";
+                if (!bad && x->type == TSDB_FLOAT32) { /* the float32 entry on its own, as codec-bench calls it */
+                    memset(dec, 0, BUF(x->n) > x->n * 16 ? x->n * 16 : BUF(x->n));
+                    size_t l32 = block_encode_f32(c, 0, TSDB_VALUES_AUTO, x->v, x->n, dec);
+                    if (rc_bits() != want || fegetround() != modes[mi])
+                        bad = "block_encode_f32 left another mode";
+                    else if (l32 != len || memcmp(dec, buf, len) != 0)
+                        bad = "block_encode_f32 differs from block_encode_vals";
+                }
+                fesetround(FE_TONEAREST);
+                if (!bad && (len != lenr || memcmp(buf, ref, lenr) != 0))
+                    bad = "encodes to other bytes than at FE_TONEAREST";
+                fesetround(modes[mi]);
+                memset(dec, 0xa5, x->n * w);
+                int rc = block_decode_vals(c, x->type, ref, lenr, x->n, dec);
+                if (!bad && (rc_bits() != want || fegetround() != modes[mi]))
+                    bad = "decode left another mode";
+                fesetround(FE_TONEAREST);
+                if (!bad && (rc != 0 || memcmp(dec, x->v, x->n * w) != 0))
+                    bad = "decodes to other values than were written";
+                if (!bad && x->type == TSDB_FLOAT32) {
+                    fesetround(modes[mi]);
+                    memset(dec, 0xa5, x->n * w);
+                    int r32 = block_decode_f32(c, ref, lenr, x->n, (float *)(void *)dec);
+                    unsigned after = rc_bits();
+                    fesetround(FE_TONEAREST);
+                    if (after != want)
+                        bad = "block_decode_f32 left another mode";
+                    else if (r32 != 0 || memcmp(dec, x->v, x->n * w) != 0)
+                        bad = "block_decode_f32 decodes to other values than were written";
+                }
+                if (bad) {
+                    failures++;
+                    if (shown++ < 8)
+                        fprintf(stderr, "rounding mode %s, %s (effort %d): %s\n", names[mi], x->name, effort, bad);
+                }
+            }
+        }
+    }
+#if defined(__SSE2__)
+    /* the mode set in MXCSR alone, not through fesetround: left as it was, flags raised by the arithmetic kept */
+    for (int mi = 1; mi < 4; mi++) {
+        unsigned csr = (_mm_getcsr() & ~FP_RC_MASK) | ((unsigned)mi << 13);
+        _mm_setcsr(csr);
+        for (int k = 0; k < nin; k += 7) {
+            const input *x = &in[k];
+            if (x->type != TSDB_FLOAT32 && x->type != TSDB_FLOAT64)
+                continue;
+            c->effort = CODEC_FAST;
+            size_t len = block_encode_vals(c, 0, 0, x->type, x->v, x->n, buf);
+            int rc = block_decode_vals(c, x->type, buf, len, x->n, dec);
+            CHECK(rc == 0 && (_mm_getcsr() & FP_RC_MASK) == ((unsigned)mi << 13));
+            CHECK(memcmp(dec, x->v, x->n * type_width(x->type)) == 0);
+        }
+        _mm_setcsr(_mm_getcsr() & ~FP_RC_MASK);
+    }
+#endif
+    free(ref);
+}
+
 static void run(rec *r, codec_ctx *c)
 {
     crafted_sums(r);
+    crafted_f64_decimal(r);
+    crafted_unpack(r);
+    rounding_modes(c);
     for (int k = 0; k < nin; k++) {
         const input *x = &in[k];
         size_t w = type_width(x->type);

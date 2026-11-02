@@ -193,6 +193,14 @@ cgroup, so `nice` does not keep your work out of its way.
   hold 8-byte slots for every type. Null is a reserved value per type
   (`type_null`), so a null written later replaces an older value like any
   other write. Aggregates skip nulls; integer sums are exact (128 bits).
+- **Rounding mode.** The float codecs keep an integer only when it rebuilds the value bit for bit, so their blocks and
+  decoded values depend on the CPU's rounding mode, which is per thread (a host application may set it; the engine
+  never does). The four block entry points that do such arithmetic (`block_encode_f32`, `block_encode_vals`,
+  `block_decode_f32`, `block_decode_vals`) run with round-to-nearest and put the caller's mode back (`src/fpmode.h`,
+  `fp_nearest` / `fp_restore`, around a noinline body: GCC does not model MXCSR). A new entry that reaches the codecs
+  another way needs the same; `tests/test_levels.c` (`rounding_modes`) encodes and decodes under every mode. Not
+  covered: granule statistics (sums, TWA areas) and the index's derived areas are computed in the calling thread's
+  mode, so a part written under another mode has other bits there (data blocks are identical).
 - **Partition classes** (`src/classes.c`). A series' rows go to partitions of 1, 7, 28 or 364 base partitions by
   its class; the key is `4 x first base partition + class` (`partition_classes = 0`: the base number). A switch
   (series, T, class) never rewrites rows: T is past every row of the series in parts and memtables and every row
@@ -312,6 +320,7 @@ tables do not depend on it. The next full run measures the jittered data.
 |---|---|
 | `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed; `--file F` for raw float32 values from a file |
 | `build/type-bench` | the float64, int64, bool and state codecs; `--file F float32\|float64` for raw values from a file |
+| `build/decode-bench` | bit unpacking per width (loops, the AVX2 kernel, PDEP) and the int_bp and float64 decimal codecs, for comparing CPUs; [`bench/cpu-compare`](bench/cpu-compare) has the Hyper-Threading and threshold sweeps |
 | [`bench/hydraulic`](bench/hydraulic) | the codecs on real sensor data (UCI hydraulic test rig, 17 sensors): `get.sh`, `convert.py`, `run.sh` |
 | `build/tsdb-bench` | load, compression and queries on 100 M rows; `--type float64` or `int64` stores another value type; `--export` writes the rows for ClickHouse |
 | `build/insert-bench` | durable inserts on a real disk, 1 row to 1 billion rows per call |

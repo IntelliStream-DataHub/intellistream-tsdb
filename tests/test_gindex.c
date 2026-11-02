@@ -353,6 +353,54 @@ static uint64_t field_rand(int regime, uint64_t base, size_t i)
     }
 }
 
+/* tw_step and tw_lin of a granule on a regular grid are derived from its sum and its first and last value, but never
+ * from a NaN: the payload of first + last with both NaN is the compiler's to pick (not defined by IEEE 754), and the
+ * encoder and the decoder evaluate it separately. Entries with NaN ends of different payloads, with a finite sum, and
+ * with tw_lin and tw_step equal to each payload and to what gix_dlin / gix_dstep give here (whichever it is at this
+ * optimization level), must round-trip: gix_encode refused them at -O1 and above before the encoder skipped NaNs. */
+static double dbl_from(uint64_t u)
+{
+    double d;
+    memcpy(&d, &u, 8);
+    return d;
+}
+
+static void test_nan_ends(void)
+{
+    const double nans[] = {dbl_from(0x7ff8000000000001ull), dbl_from(0xfff8000000000abcull),
+                           dbl_from(0x7ff8123456789abcull), dbl_from(0xffffffffffffffffull)};
+    granule g[64];
+    memset(g, 0, sizeof g);
+    size_t n = 0;
+    for (int a = 0; a < 4; a++)
+        for (int b = 0; b < 4; b++)
+            for (int how = 0; how < 3 && n + 3 <= 64; how++) {
+                granule *e = &g[n++];
+                e->series = (uint32_t)(n / 8); /* ascending */
+                e->count = 100;
+                e->ts_min = 1000;
+                e->ts_max = 1000 + 99 * 60000;
+                e->fsum = 123.5; /* finite: the areas are derivable but for the NaN ends */
+                e->tw_first = nans[a];
+                e->tw_last = nans[b];
+                e->tw_gap = 60000;
+                e->tw_step_ms = e->tw_lin_ms = (uint64_t)(e->ts_max - e->ts_min);
+                volatile double fs = e->fsum, f1 = e->tw_first, f2 = e->tw_last; /* not folded at compile time */
+                double lin = gix_dlin(fs, f1, f2, e->tw_gap), stp = gix_dstep(fs, f2, e->tw_gap);
+                e->tw_lin = how == 0 ? nans[a] : how == 1 ? nans[b] : lin;
+                e->tw_step = how == 2 ? stp : nans[b];
+            }
+    for (size_t i = 1; i < n; i++)
+        if (g[i].series < g[i - 1].series)
+            g[i].series = g[i - 1].series;
+    roundtrip(g, n, "NaN ends on a grid", NULL);
+    for (size_t i = 0; i < n; i++) { /* one entry at a time as well: the flags are per entry */
+        char label[64];
+        snprintf(label, sizeof label, "NaN ends on a grid, entry %zu alone", i);
+        roundtrip(&g[i], 1, label, NULL);
+    }
+}
+
 static void test_random_fields(void)
 {
     static const size_t ns[] = {1, 2, 3, 7, 100, 1000};
@@ -578,6 +626,7 @@ int main(int argc, char **argv)
     }
     test_rows();
     test_random_fields();
+    test_nan_ends();
     test_engine(base);
     printf("%zu indexes round-tripped: %zu entries in %zu runs, %.1f bytes per entry\n", total_idx, total_entries,
            total_runs, total_entries ? (double)total_bytes / (double)total_entries : 0);

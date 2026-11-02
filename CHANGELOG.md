@@ -109,6 +109,13 @@ disk format and the wire protocol.
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
+- The float32 and float64 codecs no longer depend on the CPU's rounding mode. A host application that had set
+  `FE_UPWARD`, `FE_DOWNWARD` or `FE_TOWARDZERO` (the engine never does) stored other bytes than at round-to-nearest,
+  and in some blocks values that decoded one unit in the last place off at round-to-nearest, silently; a block read in
+  another mode (the mode is per thread, and the scheduler's helper threads keep the one their creator had when the
+  database was opened) gave other values. The block entry points now run with round-to-nearest and restore the caller's mode (a few register accesses
+  per block: no measurable cost). Granule statistics (sums, time-weighted areas) are still computed in the calling
+  thread's mode.
 - tsdbd no longer copies a large reply whole into a connection's output buffer: a bucket, aggregate or TWA reply of up
   to a frame (256 MB) went in at once, in a buffer rounded up to 512 MB, while the engine's result was still held,
   so one request peaked at about 500 MB of server memory. Replies now reach the output in pieces of 1 MB, the
