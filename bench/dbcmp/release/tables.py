@@ -273,8 +273,11 @@ def relq_rows(d, prefix=""):
 
 
 def results_table(d, prefix="", mark=""):
-    """The timing rows of d; with mark (the extra pass's d/p6), names start with it and the header is left out."""
+    """The timing rows of d; with mark (the extra pass's d/p6), names start with it and the header is left out. A
+    class the extra pass timed again (TWA_RETIME: QuestDB's TWA after its query changed) is flagged in the phase-2 row."""
     rows = []
+    again = set() if mark else {os.path.basename(g)[:-len(".mean.txt")]
+                                for g in glob.glob(os.path.join(d, "p6", prefix + "*.mean.txt"))}
     for f in sorted(glob.glob(os.path.join(d, prefix + "*.mean.txt"))):
         name = os.path.basename(f)[:-len(".mean.txt")]
         mem = mem_cell(mem_peaks(g for g in glob.glob(os.path.join(d, name + ".*.mem"))
@@ -289,6 +292,8 @@ def results_table(d, prefix="", mark=""):
             else:
                 errors.append("%s: no timing in it (a failed or empty run?)" % f)
                 flags.append("NO TIMING")
+        if name in again:
+            flags.append("SUPERSEDED: timed again in the extra pass (the p6: row of the same name)")
         res = "<br>".join(cell(t)[:240] for t, _ in lines) or "-"
         spread = "<br>".join(cell(st)[:240] or "(one run or no spread)" for _, st in lines) or "-"
         rows.append((name, "| %s | %s | %s | %s | %s | %s |" % (cell(mark + name), res, spread,

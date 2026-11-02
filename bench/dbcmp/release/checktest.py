@@ -325,6 +325,14 @@ def tables_cases():
         case("tables: p3 DuckDB/chDB one-query TWA read (mean, spread from the runs)", True,
              "| duckdb.twa | TWA (hourly STEP buckets) of the whole table in one query: mean 1.8200 s | sd 1.1% [1.8000-1.8400 s] | 2 |" in text)
         case("tables: p3 embedded tsdb counts threads, not connections", True, "twa on 1 threads" in text)
+        os.makedirs(os.path.join(d, "p6"))
+        for x in (d, os.path.join(d, "p6")):
+            open(os.path.join(x, "qdb.twa1d.c1.mean.txt"), "w").write(
+                "q c=1: 10 queries in 15.00 s = 0.7 q/s, mean 89.1 ms, median 89.2 ms, p99 99.0 ms\n")
+        text = "\n".join(r if isinstance(r, str) else r[1] for r in tables.results_table(d))
+        case("tables: a class timed again in p6 is flagged superseded in its phase-2 row", True,
+             any(l.startswith("| qdb.twa1d.c1 ") and "SUPERSEDED" in l for l in text.splitlines()) and
+             any(l.startswith("| p6: qdb.twa1d.c1 ") and "SUPERSEDED" not in l for l in text.splitlines()))
         case("tables: a mean file with no timing and no failure named is still an error", True,
              any("x.raw.c1" in e for e in tables.errors))
     finally:
