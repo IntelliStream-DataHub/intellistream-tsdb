@@ -325,12 +325,14 @@ static int volume_dir_prepare(const char *canon, uint64_t id, bool sync)
 /* The volume number META records ("volume=N" on a line of its own), -1 without one. */
 static long meta_volume(const char *txt)
 {
-    const char *l = strstr(txt, "volume=");
-    if (!l || (l != txt && l[-1] != '\n'))
-        return -1;
-    char *end;
-    long v = strtol(l + 7, &end, 10);
-    return end == l + 7 || *end != '\n' || v < 0 || v >= MAX_VOLUMES ? -1 : v;
+    for (const char *l = txt; *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : l + strlen(l)) {
+        if (strncmp(l, "volume=", 7) != 0)
+            continue; /* another key, even one that ends in "volume=" */
+        char *end;
+        long v = strtol(l + 7, &end, 10);
+        return end == l + 7 || *end != '\n' || v < 0 || v >= MAX_VOLUMES ? -1 : v;
+    }
+    return -1;
 }
 
 /* Whether META at fd is of our format: another one is refused by the engine's open, with a message naming both
@@ -461,16 +463,63 @@ static int sync_parent(const char *canon)
     return rc;
 }
 
+/* The volume number the META of the directory at canon records, -1 without one (no META yet, or no number). */
+static long dir_meta_volume(const char *canon)
+{
+    int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    char *txt;
+    size_t len;
+    long v = -1;
+    if (read_file_all(fd, "META", &txt, &len) == 0) {
+        v = meta_volume(txt);
+        free(txt);
+    }
+    close(fd);
+    return v;
+}
+
+/* 1: a and b are one directory (an NFS export mounted twice, a bind mount, a rename), 0: not, -1: cannot tell. */
+static int same_dir(const char *a, const char *b)
+{
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0)
+        return -1;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* Refuses to add canon when it is volume k already under another path (line k, `as`): the add would write its own
+ * number into META, and every later open would fail on the mismatch. A line k that is another directory means a
+ * crashed add whose number was taken since, which may go on. */
+static int volume_taken(const char *canon, long k, const char *as)
+{
+    int same = same_dir(as, canon);
+    if (same == 0)
+        return 0;
+    if (same > 0)
+        fprintf(stderr, "tsdb: volume %s is volume %ld already, as %s: not added\n", canon, k, as);
+    else
+        fprintf(stderr, "tsdb: volume %s: its META says it is volume %ld, which is %s, and that cannot be checked: "
+                        "not added\n", canon, k, as);
+    return TSDB_ERR_INVALID;
+}
+
 /* Adds volume `path` to the database whose root directory (canonical `root`,
  * identifier `id`) is open at dirfd. *index is its number; a path that already
  * is a volume gives that one's number and changes nothing. A failed append may
  * leave a torn line: with `fail` (a writer's root engine) that is fail-stop.
  *
  * The write lock on VOLUMES is held only to read the list and to append: the
- * new directory (mkdir, realpath, META and ROOT_ID with their fsyncs) is made
+ * new directory (mkdir, realpath, ROOT_ID and META with their fsyncs) is made
  * between, on a file system that may be slow or hung, while a running writer
- * waits for that lock under its create_lock. A directory prepared for an add
- * that then fails is the same as a crashed add, which a later add takes over. */
+ * waits for that lock under its create_lock. So META carries the number the
+ * list had room for when it was read; when another add appended a line since,
+ * META is written again with the next number. META, ROOT_ID and the parent's
+ * entry are durable before the line names the directory. A directory prepared
+ * for an add that then fails is the same as a crashed add, which a later add
+ * takes over, unless its META names a line that is this very directory under
+ * another path: then it is that volume already, and the add is refused. */
 static int volume_add(int dirfd, const char *root, uint64_t id, const char *path, bool sync, eng *fail,
                       uint32_t *index)
 {
@@ -483,29 +532,61 @@ static int volume_add(int dirfd, const char *root, uint64_t id, const char *path
     char **paths = NULL, canon[PATH_MAX];
     size_t n = 0;
     off_t size = 0;
-    bool made = false, found = false;
+    bool made = false, found = false, prepared = false;
     if (!(made = mkdir(path, 0755) == 0) && errno != EEXIST)
         rc = TSDB_ERR_IO;
     else if (!realpath(path, canon))
         rc = TSDB_ERR_IO;
     else if (path_valid(canon) != 0) /* a symlink to a name with a newline */
         rc = TSDB_ERR_INVALID;
-    if (rc == 0 && (rc = volumes_lock(fd, F_WRLCK)) == 0) { /* refuse before writing into the directory */
+    while (rc == 0) {
+        long k = dir_meta_volume(canon); /* before the lock: the new directory's file system */
+        if ((rc = volumes_lock(fd, F_WRLCK)) != 0)
+            break;
         rc = volumes_place(fd, root, canon, sync, &paths, &n, &size, &found, index);
+        size_t n0 = n;
+        if (volumes_lock(fd, F_UNLCK) != 0 && rc == 0)
+            rc = TSDB_ERR_IO;
+        if (rc == 0 && !found && k >= 1 && (size_t)k <= n0)
+            rc = volume_taken(canon, k, paths[k - 1]); /* lines never change: checked without the lock */
         paths_free(paths, n);
         paths = NULL;
         n = 0;
-        if (volumes_lock(fd, F_UNLCK) != 0 && rc == 0)
+        if (rc || found)
+            break;
+        if (!prepared) { /* refused or not, nothing was written into the directory before this */
+            if (made && sync)
+                rc = sync_parent(canon);
+            if (rc == 0)
+                rc = volume_dir_prepare(canon, id, sync);
+            if (rc)
+                break;
+            prepared = true;
+        }
+        /* Nothing relies on this META until the line names the directory: an error fails just the call. */
+        if ((rc = volume_meta_write(dirfd, canon, (uint32_t)(n0 + 1), sync)) != 0)
+            break;
+        if ((rc = volumes_lock(fd, F_WRLCK)) != 0) /* held until close */
+            break;
+        rc = volumes_place(fd, root, canon, sync, &paths, &n, &size, &found, index);
+        if (rc == 0 && found && dir_meta_volume(canon) != (long)*index)
+            rc = volume_meta_write(dirfd, canon, *index, sync); /* an add of this path came between: its number */
+        if (rc || found)
+            break;
+        bool again = n != n0;
+        for (size_t i = n0; i < n && rc == 0; i++) /* lines added meanwhile: one may be this directory */
+            if (same_dir(paths[i], canon) != 0) {
+                volume_meta_write(dirfd, canon, (uint32_t)(i + 1), sync); /* put back what that add wrote */
+                rc = volume_taken(canon, (long)(i + 1), paths[i]);
+            }
+        if (rc || !again)
+            break;
+        paths_free(paths, n); /* write META again, with the number after the new lines */
+        paths = NULL;
+        n = 0;
+        if (volumes_lock(fd, F_UNLCK) != 0)
             rc = TSDB_ERR_IO;
     }
-    if (rc == 0 && !found && made && sync)
-        rc = sync_parent(canon);
-    if (rc == 0 && !found)
-        rc = volume_dir_prepare(canon, id, sync);
-    if (rc == 0 && !found && (rc = volumes_lock(fd, F_WRLCK)) == 0) /* again: another add may have come between */
-        rc = volumes_place(fd, root, canon, sync, &paths, &n, &size, &found, index);
-    if (rc == 0 && !found && (rc = volume_meta_write(dirfd, canon, (uint32_t)(n + 1), sync)) != 0 && fail)
-        eng_fail(fail, "write the META of a new volume", errno); /* a retried fsync would prove nothing */
     if (rc == 0 && !found) {
         char line[PATH_MAX + 16];
         size_t len = strlen(canon);

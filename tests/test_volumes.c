@@ -638,6 +638,115 @@ static void test_open_waits_for_add(const char *base)
     printf("  a writer's open waits for an add in progress\n");
 }
 
+/* A volume added a second time under another path (an NFS export mounted twice, a bind mount; here a rename and a
+ * symlink to the new name): its META names line 1, which is this very directory, so the add is refused and META
+ * keeps its number. It used to be rewritten to volume 2, and every later open failed. When line 1 cannot be
+ * checked (its path is gone), the add is refused too. */
+static void test_readd_other_path(const char *base)
+{
+    char top[600], root[700], a[800], b[800], meta[900], mtext[2048];
+    fresh(base, "volre", top, sizeof top, root, sizeof root);
+    snprintf(a, sizeof a, "%s/a", top);
+    snprintf(b, sizeof b, "%s/b", top);
+    snprintf(meta, sizeof meta, "%s/META", b);
+    uint32_t v = 0;
+    OK(tsdb_volume_add_dir(root, a, &v));
+    CHECK(v == 1);
+    CHECK(rename(a, b) == 0 && symlink(b, a) == 0); /* two paths to one directory */
+    v = 0;
+    CHECK(tsdb_volume_add_dir(root, b, &v) == TSDB_ERR_INVALID && v == 0);
+    read_text(meta, mtext, sizeof mtext);
+    CHECK(strstr(mtext, "\nvolume=1\n") != NULL);
+    CHECK(unlink(a) == 0); /* line 1's path is gone: it cannot be told apart */
+    CHECK(tsdb_volume_add_dir(root, b, &v) == TSDB_ERR_INVALID && v == 0);
+    read_text(meta, mtext, sizeof mtext);
+    CHECK(strstr(mtext, "\nvolume=1\n") != NULL);
+    CHECK(rename(b, a) == 0);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    tsdb *db = NULL;
+    CHECK(tsdb_open(root, &o, &db) == 0); /* the old add made every open fail */
+    if (db) {
+        CHECK(tsdb_volume_count(db) == 2);
+        OK(tsdb_close(db));
+    }
+    remove_tree(top);
+    printf("  a volume added again under a second path is refused, and its META keeps its number\n");
+}
+
+struct adder {
+    tsdb *db;
+    const char *path;
+    int rc, done;
+    uint32_t index;
+};
+
+static void *add_thread(void *arg)
+{
+    struct adder *x = arg;
+    x->rc = tsdb_volume_add(x->db, x->path, &x->index);
+    __atomic_store_n(&x->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* A new volume's META is written while the VOLUMES lock is free: its file system may hang (here META.tmp is a FIFO
+ * nobody reads yet). And when that write fails (an fsync of a FIFO does), the add fails alone: nothing relies on
+ * that META, so the engine is not failed and the add can be tried again. */
+static void test_new_meta_write(const char *base)
+{
+    char top[600], root[700], v1[800], fifo[900], rid[900], vols[800], msg[256];
+    fresh(base, "volmeta", top, sizeof top, root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    snprintf(fifo, sizeof fifo, "%s/META.tmp", v1);
+    snprintf(rid, sizeof rid, "%s/ROOT_ID", v1);
+    snprintf(vols, sizeof vols, "%s/VOLUMES", root);
+    CHECK(mkdir(v1, 0755) == 0 && mkfifo(fifo, 0644) == 0);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 1;
+    tsdb *db = NULL;
+    OK(tsdb_open(root, &o, &db));
+    tsdb_sid s;
+    OK(tsdb_series(db, "before", &s));
+    struct adder x = {.db = db, .path = v1};
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, add_thread, &x) == 0);
+    for (int i = 0; i < 1000 && !exists(rid); i++)
+        usleep(10000);
+    usleep(300000); /* ROOT_ID is written right before META: the add is waiting for the FIFO now */
+    CHECK(!__atomic_load_n(&x.done, __ATOMIC_ACQUIRE));
+    int fd = open(vols, O_RDWR | O_CLOEXEC);
+    struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    bool free_lock = fd >= 0 && fcntl(fd, F_OFD_SETLK, &fl) == 0;
+    if (!free_lock)
+        fprintf(stderr, "  the VOLUMES lock is held while a new volume's META is written\n");
+    CHECK(free_lock);
+    if (fd >= 0)
+        close(fd);
+    int r = open(fifo, O_RDONLY | O_CLOEXEC);
+    char buf[4096];
+    while (r >= 0 && read(r, buf, sizeof buf) > 0)
+        ;
+    if (r >= 0)
+        close(r);
+    pthread_join(th, NULL);
+    CHECK(x.rc == TSDB_ERR_IO);
+    CHECK(tsdb_failed(db, msg, sizeof msg) == 0);
+    OK(tsdb_append(db, s, T0, 1));
+    CHECK(unlink(fifo) == 0);
+    x.index = 0;
+    OK(tsdb_volume_add(db, v1, &x.index));
+    CHECK(x.index == 1);
+    OK(tsdb_close(db));
+    OK(tsdb_open(root, &o, &db));
+    if (db) {
+        CHECK(tsdb_volume_count(db) == 2);
+        OK(tsdb_close(db));
+    }
+    remove_tree(top);
+    printf("  a new volume's META is written outside the VOLUMES lock, and its failure fails just the add\n");
+}
+
 /* Power lost at every step of "tsdb <dir> volume add" (the crashfs shim), and
  * just after it reported success: the database opens again each time, and
  * the volume it reported is there. A VOLUMES line whose directory entry was
@@ -1265,6 +1374,8 @@ int main(int argc, char **argv)
     test_volumes_under_writer(base);
     test_concurrent_adds(base);
     test_open_waits_for_add(base);
+    test_readd_other_path(base);
+    test_new_meta_write(base);
     test_add_power_loss(base, argv[0]);
     test_series_ids(base);
     test_unique_names(base);
