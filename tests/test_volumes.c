@@ -436,7 +436,7 @@ static void test_user_files_in_volume(const char *base)
     snprintf(vol, sizeof vol, "%s/data", top);
     CHECK(mkdir(vol, 0755) == 0);
     static const char *const users[] = {"tmp_notes.txt",  "tmp_x",       "tmp_1_2.part.bak", "tmp_1_x.part",
-                                        "META.tmpfile",   "txn_list",    "txn_notes.intent", "retired_old.csv",
+                                        "META.tmpfile",   "META.tmp.notes", "META.tmp.a.b.1", "txn_list",   "txn_notes.intent", "retired_old.csv",
                                         "retired_p1.part", "wal_cafe.log", "wal_0000000000000001.log.bak",
                                         "plan.part",      "p1_2.part"};
     size_t nu = sizeof users / sizeof *users;
@@ -462,13 +462,16 @@ static void test_user_files_in_volume(const char *base)
     write_file(leftover, "junk");
     snprintf(meta_tmp, sizeof meta_tmp, "%s/META.tmp", vol);
     write_file(meta_tmp, "junk");
+    char add_tmp[1000]; /* and a volume add's own (meta_tmp_make) */
+    snprintf(add_tmp, sizeof add_tmp, "%s/META.tmp.host-1.%d.%d", vol, 4242, 4243);
+    write_file(add_tmp, "junk");
     OK(tsdb_open(root, &o, &db));
     tsdb_points pts;
     OK(tsdb_query_points(db, id, INT64_MIN, INT64_MAX, &pts));
     CHECK(pts.n == 100);
     tsdb_points_free(&pts);
     OK(tsdb_close(db));
-    CHECK(!exists(leftover) && !exists(meta_tmp));
+    CHECK(!exists(leftover) && !exists(meta_tmp) && !exists(add_tmp));
     for (size_t i = 0; i < nu; i++) {
         snprintf(p, sizeof p, "%s/%s", vol, users[i]);
         CHECK(exists(p) && file_size(p) == 11);
@@ -680,28 +683,42 @@ struct adder {
     const char *path;
     int rc, done;
     uint32_t index;
+    bool fifo_meta;  /* first make the add's own META temporary a FIFO (its name has this thread's id) */
+    int planted;
+    char fifo[1200];
 };
 
 static void *add_thread(void *arg)
 {
     struct adder *x = arg;
+    if (x->fifo_meta) { /* META.tmp.HOST.PID.TID, as meta_tmp_make (db.c) names it */
+        char host[65] = "";
+        if (gethostname(host, sizeof host - 1) != 0 || !host[0])
+            snprintf(host, sizeof host, "localhost");
+        for (char *c = host; *c; c++)
+            if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '-' ||
+                  *c == '_'))
+                *c = '_';
+        snprintf(x->fifo, sizeof x->fifo, "%s/META.tmp.%s.%ld.%ld", x->path, host, (long)getpid(), (long)gettid());
+        CHECK(mkfifo(x->fifo, 0644) == 0);
+        __atomic_store_n(&x->planted, 1, __ATOMIC_RELEASE);
+    }
     x->rc = tsdb_volume_add(x->db, x->path, &x->index);
     __atomic_store_n(&x->done, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
-/* A new volume's META is written while the VOLUMES lock is free: its file system may hang (here META.tmp is a FIFO
- * nobody reads yet). And when that write fails (an fsync of a FIFO does), the add fails alone: nothing relies on
- * that META, so the engine is not failed and the add can be tried again. */
+/* A new volume's META is written while the VOLUMES lock is free: its file system may hang (here the add's META
+ * temporary is a FIFO nobody reads yet). And when that write fails (an fsync of a FIFO does), the add fails alone:
+ * nothing relies on that META, so the engine is not failed and the add can be tried again. */
 static void test_new_meta_write(const char *base)
 {
-    char top[600], root[700], v1[800], fifo[900], rid[900], vols[800], msg[256];
+    char top[600], root[700], v1[800], rid[900], vols[800], msg[256];
     fresh(base, "volmeta", top, sizeof top, root, sizeof root);
     snprintf(v1, sizeof v1, "%s/v1", top);
-    snprintf(fifo, sizeof fifo, "%s/META.tmp", v1);
     snprintf(rid, sizeof rid, "%s/ROOT_ID", v1);
     snprintf(vols, sizeof vols, "%s/VOLUMES", root);
-    CHECK(mkdir(v1, 0755) == 0 && mkfifo(fifo, 0644) == 0);
+    CHECK(mkdir(v1, 0755) == 0);
     tsdb_options o;
     tsdb_options_init(&o);
     o.fsync = 1;
@@ -709,9 +726,12 @@ static void test_new_meta_write(const char *base)
     OK(tsdb_open(root, &o, &db));
     tsdb_sid s;
     OK(tsdb_series(db, "before", &s));
-    struct adder x = {.db = db, .path = v1};
+    struct adder x = {.db = db, .path = v1, .fifo_meta = true};
+    const char *fifo = x.fifo;
     pthread_t th;
     CHECK(pthread_create(&th, NULL, add_thread, &x) == 0);
+    for (int i = 0; i < 1000 && !__atomic_load_n(&x.planted, __ATOMIC_ACQUIRE); i++)
+        usleep(10000);
     for (int i = 0; i < 1000 && !exists(rid); i++)
         usleep(10000);
     usleep(300000); /* ROOT_ID is written right before META: the add is waiting for the FIFO now */
@@ -734,7 +754,7 @@ static void test_new_meta_write(const char *base)
     CHECK(x.rc == TSDB_ERR_IO);
     CHECK(tsdb_failed(db, msg, sizeof msg) == 0);
     OK(tsdb_append(db, s, T0, 1));
-    CHECK(unlink(fifo) == 0);
+    CHECK(!exists(fifo)); /* the failed add removed its temporary */
     x.index = 0;
     OK(tsdb_volume_add(db, v1, &x.index));
     CHECK(x.index == 1);

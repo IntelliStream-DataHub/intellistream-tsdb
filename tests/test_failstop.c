@@ -705,6 +705,68 @@ static void test_volume_meta(const char *base)
     printf("  failed volume META write fails just the add\n");
 }
 
+struct dir_adder {
+    const char *root, *vol;
+    uint32_t index;
+    int rc;
+};
+
+static void *dir_add_main(void *arg)
+{
+    struct dir_adder *a = arg;
+    a->rc = tsdb_volume_add_dir(a->root, a->vol, &a->index);
+    return NULL;
+}
+
+/* Two adds of one directory at once (two CLIs; or one directory reached by two paths, from two hosts) each write
+ * its META outside the VOLUMES lock. With one shared META.tmp, the second add's rename took the file the first was
+ * still writing, and the first one's rename then failed (or, had it died, left META empty). Each writes a temporary
+ * of its own now: both adds succeed with the same number, and META says it. */
+static void test_volume_meta_race(const char *base)
+{
+    char name[600], vol[700], cmd[800], meta[800];
+    snprintf(name, sizeof name, "%s/failstop-volrace", base);
+    snprintf(vol, sizeof vol, "%s/failstop-volrace-v1", base);
+    snprintf(meta, sizeof meta, "%s/META", vol);
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", vol);
+    if (system(cmd) != 0)
+        failures++;
+    tsdb *db = open_fresh(name, opts());
+    OK(tsdb_close(db));
+    struct dir_adder a = {.root = name, .vol = vol, .rc = 1}, b = {.root = name, .vol = vol, .rc = 1};
+    hold(F_WRITE, "-v1/META.tmp");
+    pthread_t ta, tb;
+    CHECK(pthread_create(&ta, NULL, dir_add_main, &a) == 0);
+    wait_held(); /* a has created its temporary and is about to write it */
+    CHECK(pthread_create(&tb, NULL, dir_add_main, &b) == 0);
+    pthread_join(tb, NULL);
+    release();
+    pthread_join(ta, NULL);
+    CHECK(a.rc == 0 && b.rc == 0);
+    CHECK(a.index == 1 && b.index == 1);
+    char txt[256] = {0};
+    FILE *f = fopen(meta, "r");
+    if (f) {
+        if (fread(txt, 1, sizeof txt - 1, f) == 0)
+            txt[0] = '\0';
+        fclose(f);
+    }
+    CHECK(strstr(txt, "volume=1\n") != NULL);
+    tsdb_options o = opts();
+    db = NULL;
+    OK(tsdb_open(name, &o, &db));
+    if (db) {
+        CHECK(tsdb_volume_count(db) == 2);
+        tsdb_sid s;
+        OK(tsdb_series_at(db, "s", vol, &s));
+        CHECK(s == TSDB_SID(1, 0));
+        OK(tsdb_close(db));
+    }
+    if (system(cmd) != 0)
+        failures++;
+    printf("  two adds of one volume at once each write their own META temporary\n");
+}
+
 /* wal_sync_ms > 0: the flusher's sync fails with no writer waiting; the next
  * write learns of it. */
 static void test_background_sync(const char *base)
@@ -1245,6 +1307,7 @@ int main(int argc, char **argv)
     test_manifest(root);
     test_series_dict(root);
     test_volume_meta(root);
+    test_volume_meta_race(root);
     test_background_sync(root);
     test_state_race(root);
     test_intent(root);

@@ -894,6 +894,8 @@ int intents_recover(struct eng *db);
 /* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
 bool part_tmp_name(const char *name);
 bool part_file_name(const char *name);
+void meta_tmp_make(char *buf, size_t cap); /* a volume add's own META temporary (db.c) */
+bool meta_tmp_name(const char *name);      /* the engine's or an add's META temporary */
 void pw_abort(part_writer *w);
 
 /* Every range is half-open with an int64 end, so a row at INT64_MAX could never be read, counted or deleted:

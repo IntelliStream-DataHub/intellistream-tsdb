@@ -410,17 +410,21 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     }
     free(txt);
     n += (size_t)snprintf(buf + n, 32, "volume=%u\n", index);
+    char tmp[128];
+    meta_tmp_make(tmp, sizeof tmp); /* our own: another add of this directory may be writing META right now */
     int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    int mfd = fd < 0 ? -1 : openat(fd, "META.tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int mfd = fd < 0 ? -1 : openat(fd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     ssize_t wr = mfd < 0 ? -1 : write(mfd, buf, n);
     bool ok = wr == (ssize_t)n && (!sync || fsync(mfd) == 0);
     int err = ok ? 0 : wr >= 0 && wr != (ssize_t)n ? ENOSPC : errno;
     if (mfd >= 0)
         close(mfd);
-    if (ok && renameat(fd, "META.tmp", fd, "META") != 0) {
+    if (ok && renameat(fd, tmp, fd, "META") != 0) {
         ok = false;
         err = errno;
     }
+    if (!ok && mfd >= 0)
+        unlinkat(fd, tmp, 0); /* or the volume's next open removes it */
     if (ok && sync && fsync(fd) != 0) {
         ok = false;
         err = errno;

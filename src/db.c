@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #define META_FILE "META"
@@ -210,6 +211,48 @@ static int meta_write(eng *db)
     return fsync(db->dirfd) == 0 ? 0 : TSDB_ERR_IO; /* at creation: the open fails */
 }
 
+/* A volume add writes the volume's META outside any lock it shares with other adds of the same directory (two
+ * CLIs, or two hosts that reach it by different paths), so each writes a temporary of its own and renames that:
+ * META.tmp.HOST.PID.TID. A shared name let one add rename the file another was still writing. */
+void meta_tmp_make(char *buf, size_t cap)
+{
+    char host[65] = "";
+    if (gethostname(host, sizeof host - 1) != 0 || !host[0])
+        snprintf(host, sizeof host, "localhost");
+    for (char *c = host; *c; c++)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '-' ||
+              *c == '_'))
+            *c = '_'; /* dots too: the last two separate the numbers */
+    snprintf(buf, cap, "%s.tmp.%s.%ld.%ld", META_FILE, host, (long)getpid(), (long)syscall(SYS_gettid));
+}
+
+/* The engine's own META.tmp, or an add's (above): what the cleanup at open removes, and nothing else of a user's. */
+bool meta_tmp_name(const char *name)
+{
+    if (strcmp(name, META_FILE ".tmp") == 0)
+        return true;
+    if (strncmp(name, META_FILE ".tmp.", sizeof META_FILE + 4) != 0)
+        return false;
+    const char *host = name + sizeof META_FILE + 4, *tid = strrchr(host, '.');
+    if (!tid || tid == host)
+        return false;
+    const char *pid = tid - 1;
+    while (pid > host && *pid != '.')
+        pid--;
+    if (pid == host || *pid != '.')
+        return false;
+    for (const char *c = host; c < pid; c++)
+        if (*c == '.')
+            return false;
+    for (const char *c = pid + 1; c < tid; c++)
+        if (*c < '0' || *c > '9')
+            return false;
+    for (const char *c = tid + 1; *c; c++)
+        if (*c < '0' || *c > '9')
+            return false;
+    return tid > pid + 1 && tid[1];
+}
+
 static int meta_load_or_create(eng *db, bool read_only)
 {
     char buf[512];
@@ -274,7 +317,7 @@ static int load_parts(eng *db, bool read_only)
         const char *name = e->d_name;
         /* Only names the engine writes: a volume may be a directory with the user's own files in it
          * (tsdb_volume_add_dir), and their tmp_notes.txt or retired_old.csv is not ours to delete. */
-        if (part_tmp_name(name) || strcmp(name, META_FILE ".tmp") == 0) {
+        if (part_tmp_name(name) || meta_tmp_name(name)) {
             if (!read_only)
                 unlinkat(db->dirfd, name, 0);
             continue;
