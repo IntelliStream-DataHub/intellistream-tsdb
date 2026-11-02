@@ -107,7 +107,8 @@ sensor by hour 53 s against 113 s. Interim numbers from
 [bench/dbcmp/results/0.9.0-interim.md](bench/dbcmp/results/0.9.0-interim.md);
 ClickHouse's times are whole milliseconds, as its benchmark tool reports them.
 
-**tsdb against InfluxDB 2.** The same machine and the same data: 100 sensors,
+**tsdb against InfluxDB 2.** InfluxDB 2 remains one of the most widely deployed
+versions of the InfluxDB time series database. The same machine and the same data: 100 sensors,
 1 million readings each. InfluxDB 2.7.12 ran in Podman with its default
 settings, except that it was told to compact old data after one minute without
 writes, so that its background work ends sooner. Like tsdb, it syncs a write to
