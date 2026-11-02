@@ -564,7 +564,7 @@ nocheck() { # SYSTEM KIND DIR RC: a check that did not pass: rc 3 is a server th
 twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (rel.py has), checked against tsdb's
              # answers in $WORK/ref first and timed only when they agree; a kind without a query is noted in DIR/dash.txt
     local S=$1 D=$2 k f r V
-    V=$(basename "${D%/memsweep}")  # the variant (qdb-parquet, iot-zstd, ...): names and step labels; S is rel.py's
+    V=${D%/memsweep}; V=$(basename "${V%/p6}")  # the variant (qdb-parquet, iot-zstd, ...): names and step labels; S is rel.py's
     shift 2
     cd "$WORK" || return 1
     for k in $TWA_KINDS; do
@@ -631,7 +631,7 @@ twa_single_failed() { # CHECKFILE SYS KIND: prints why, and succeeds, when KIND'
 # step label (RESUME, DEAD_CLASS); a kind is sent in batches only when its single windows agreed in this load.
 twabsuite() { # SYS DIR DRIVER-ARGS...|ch
     local S=$1 C=$2 D V k K f t a r why REPS=${XREPS:-$REPS}
-    D=$(twab_dir "$C"); V=$(basename "${C%/memsweep}")
+    D=$(twab_dir "$C"); V=${C%/memsweep}; V=$(basename "${V%/p6}")  # C may already be p6/ (TWA_RETIME)
     mkdir -p "$D"
     shift 2
     cd "$WORK" || return 1
@@ -1398,11 +1398,15 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
     qsuite qdb "$P" "$D" pg "$PG"
     local bok=0
     bcheck qdb "$D" && { bok=1; perc16 qdb "$P" "$D" pg "$PG"; bsuite qdb "$P" "$D" pg "$PG"; }
-    REL q qdb twa > "$D/q.twa.sql"  # native twap() + SAMPLE BY 1h (REPORT §5.10), timed only when it agrees
-    untimed "$D/check-twa.txt" REL check qdb twa ref/twa.jsonl && qline twa "$D" "$D/q.twa.sql" pg "$PG"
-    REL q qdbseg twa > "$D/q.twaseg.sql"  # the 0.9.0 run's lead() CTE, for comparison
-    untimed "$D/check-twaseg.txt" REL check qdbseg twa ref/twa.jsonl && qline twaseg "$D" "$D/q.twaseg.sql" pg "$PG"
-    twasuite qdb "$D" pg "$PG"
+    # TWA_RETIME=qdb (the extra pass of 2026-11-02): QuestDB's TWA kinds are timed again with the full REPS into p6/,
+    # because rel.py's QuestDB TWA now reads its segments once (split_once once=True) instead of twice
+    local TD=$D TR=$REPS
+    case "$D: ${TWA_RETIME-} " in */memsweep:*" qdb "*) TD=$(twab_dir "$D"); TR=${XREPS:-$REPS}; mkdir -p "$TD" ;; esac
+    REL q qdb twa > "$TD/q.twa.sql"  # native twap() + SAMPLE BY 1h (REPORT §5.10), timed only when it agrees
+    untimed "$TD/check-twa.txt" REL check qdb twa ref/twa.jsonl && REPS=$TR qline twa "$TD" "$TD/q.twa.sql" pg "$PG"
+    REL q qdbseg twa > "$TD/q.twaseg.sql"  # the 0.9.0 run's lead() CTE, for comparison
+    untimed "$TD/check-twaseg.txt" REL check qdbseg twa ref/twa.jsonl && REPS=$TR qline twaseg "$TD" "$TD/q.twaseg.sql" pg "$PG"
+    REPS=$TR twasuite qdb "$TD" pg "$PG"
     # per core: a restart with every worker pool at one thread (the data stays), then a normal start for what follows
     if [ $bok = 1 ] && want_pc; then
         QDB_PC=1 pc_restart rb-qdb "$D/config.pc.txt" qdb_start "$W" && PC=1 bsuite qdb "$P" "$D" pg "$PG"

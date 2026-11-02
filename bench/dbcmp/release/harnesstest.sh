@@ -247,4 +247,11 @@ if [ -x "$QD" ]; then
 else
     echo "skip qdrive pg case (no $QD)"
 fi
+# the variant name from a result dir: the system's dir, its memsweep/ or (TWA_RETIME) its p6/ all name the variant
+for dd in /x/p2/qdb-parquet /x/p2/qdb-parquet/memsweep /x/p2/qdb-parquet/p6; do
+    V=${dd%/memsweep}; V=$(basename "${V%/p6}")
+    expect "variant of $dd is qdb-parquet" "[ '$V' = qdb-parquet ]"
+done
+expect "run.sh derives every variant name the same way (no basename of only %/memsweep left)" \
+    "! grep -n 'basename \"\\\${[A-Z]*%/memsweep}\"' '$HERE/run.sh'"
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }

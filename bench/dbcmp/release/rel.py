@@ -139,12 +139,22 @@ def w_ts(s, a, b, bk):
 
 # ---- QuestDB: no ARRAY JOIN / unnest, so a segment is split at most once (true for this data: the longest step
 # is 60 s (hdd_temp has no jitter; the largest jitter is 50 ms), buckets are an hour or longer, window buckets 300 samples or more)
-def split_once(I, area1, area2, key="series, ", group=False):
+def split_once(I, area1, area2, key="series, ", group=False, once=False):
     """Rows (key, b, a, c) of the segments in seg (columns lo, hi, ...): the piece in lo's bucket and the piece in hi's.
     group: an explicit GROUP BY (QuestDB groups by the non-aggregate columns by itself), and no "WHERE c > 0" (IoTDB
     2.0.11 answers a filter over a UNION ALL subquery with extra groups whose b is null; a piece with c = 0 adds 0, and
-    a bucket covering 0 ms is left out by the check as by tsdb)."""
+    a bucket covering 0 ms is left out by the check as by tsdb).
+    once: seg is read once, crossed with a two-row table (k 0: lo's piece, k 1: hi's), instead of twice in a UNION ALL.
+    QuestDB inlines a WITH where it is used, so the UNION ALL ran seg's scans (and its lead() window) twice; the
+    other servers keep the UNION ALL they were checked and timed with."""
     b0, b1 = f"lo / {I} * {I}", f"hi / {I} * {I}"
+    if once:
+        return (f"SELECT {key}b, sum(a) area, sum(c) covered FROM ("
+                f"SELECT {key}CASE WHEN k = 0 THEN {b0} ELSE {b1} END b, "
+                f"CASE WHEN k = 0 THEN {area1} ELSE {area2} END a, "
+                f"CASE WHEN k = 0 THEN least(hi, {b0} + {I}) - lo ELSE hi - {b1} END c "
+                f"FROM seg CROSS JOIN (SELECT x - 1 k FROM long_sequence(2)) ks WHERE hi > lo AND (k = 0 OR hi / {I} > lo / {I})"
+                + (f") u GROUP BY {key}b" if group else ") WHERE c > 0") + f" ORDER BY {key}b")
     return (f"SELECT {key}b, sum(a) area, sum(c) covered FROM ("
             f"SELECT {key}{b0} b, {area1} a, least(hi, {b0} + {I}) - lo c FROM seg WHERE hi > lo "
             f"UNION ALL SELECT {key}{b1} b, {area2} a, hi - {b1} c FROM seg WHERE hi > lo AND hi / {I} > lo / {I}"
@@ -160,7 +170,7 @@ def q_qdb(kind):
         b0, b1 = f"lo / {I} * {I}", f"hi / {I} * {I}"
         L = lambda p, q: lin(p, q).replace("t0", "lo").replace("t1", "hi").replace("DOUBLE", "double")
         return (f"WITH seg AS (SELECT * FROM ({seg}) WHERE hi IS NOT NULL) "
-                + split_once(I, L("lo", f"least(hi, {b0} + {I})"), L(b1, "hi")))
+                + split_once(I, L("lo", f"least(hi, {b0} + {I})"), L(b1, "hi"), once=True))
     # native twap() per bucket: the area between the bucket's first and last reading is twap * (last - first);
     # lag/lead over the bucket rows add the pieces before the first reading (the previous bucket's last value from
     # the edge) and after the last one (its value up to the edge). Buckets without a reading are missing, so a gap
@@ -181,7 +191,7 @@ def q_qdbseg(kind):  # the 0.9.0 run's TWA: lead() in a CTE (kept to compare wit
     I = IV[kind]
     seg = ("SELECT series, cast(value AS double) v, cast(ts AS long) / 1000 lo, "
            "cast(lead(ts) OVER (PARTITION BY series ORDER BY ts) AS long) / 1000 hi FROM sensors")
-    return f"WITH seg AS (SELECT * FROM ({seg}) WHERE hi IS NOT NULL) " + split_once(I, f"v * (least(hi, lo / {I} * {I} + {I}) - lo)", f"v * (hi - hi / {I} * {I})")
+    return f"WITH seg AS (SELECT * FROM ({seg}) WHERE hi IS NOT NULL) " + split_once(I, f"v * (least(hi, lo / {I} * {I} + {I}) - lo)", f"v * (hi - hi / {I} * {I})", once=True)
 
 def w_qdb(s, a, b, bk):
     src = f"SELECT ts, cast(value AS double) v FROM sensors WHERE series = '{s}' AND "
@@ -189,7 +199,7 @@ def w_qdb(s, a, b, bk):
            f"ts < '{iso(b)}') UNION ALL SELECT * FROM ({src}ts >= '{iso(b)}' ORDER BY ts LIMIT 1)")
     seg = (f"SELECT greatest(t0, {a}) lo, least(t1, {b}) hi, v FROM (SELECT cast(ts AS long) / 1000 t0, "
            f"cast(lead(ts) OVER (ORDER BY ts) AS long) / 1000 t1, v FROM ({pts} ORDER BY ts)) WHERE t1 IS NOT NULL AND t0 < t1")
-    return f"WITH seg AS ({seg}) " + split_once(bk, f"v * (least(hi, lo / {bk} * {bk} + {bk}) - lo)", f"v * (hi - hi / {bk} * {bk})", key="")
+    return f"WITH seg AS ({seg}) " + split_once(bk, f"v * (least(hi, lo / {bk} * {bk} + {bk}) - lo)", f"v * (hi - hi / {bk} * {bk})", key="", once=True)
 
 # ---- InfluxDB 3 (DataFusion) and DuckDB: unnest(range()) splits a segment at every edge
 def unnest_q(kind, seg, div):
