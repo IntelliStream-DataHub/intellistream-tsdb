@@ -357,7 +357,10 @@ static void test_live(void)
     OK(tsdb_flush(db));
     CK(cls_of(db, d) == 3, "1,440 rows a day in one flush: class %d", cls_of(db, d));
     long before = classes_bytes(dir);
-    CK(before == 2 * 24, "CLASSES holds %ld bytes after two decisions", before);
+    /* with merge_idle_s = 1 a slow build (TSan) can let the idle merge move "slow" to class 3 already: a third
+     * record, and the only one allowed here */
+    CK(before == 2 * 24 || (before == 3 * 24 && cls_of(db, a) == 3), "CLASSES holds %ld bytes after two decisions",
+       before);
 
     CK(wait_class(db, a, 3, 30), "the slow series did not move to class 3 after idle merges (class %d)", cls_of(db, a));
     sleep(3); /* let the other idle merges observe their partitions too */
