@@ -93,26 +93,30 @@ the rest is in. InfluxDB 2's new load and query times are in
 [bench/dbcmp/results/0.9.0-interim-tables.md](bench/dbcmp/results/0.9.0-interim-tables.md)
 and in the section about InfluxDB 2 below.
 
-**Where tsdb is more than 100 times faster than ClickHouse** (100 billion rows:
-10,000 sensors x 10 million readings, the same rows in both, ClickHouse queried
-only after its background merges had settled; median time of one query, tsdb
-through its server over TCP):
+Queries that tsdb answers from its stored statistics alone (such as a count
+over all the data) are left out, because they measure a lookup, not reading
+data.
+
+**Where tsdb is furthest ahead of ClickHouse** (100 billion rows: 10,000
+sensors x 10 million readings, the same rows in both, ClickHouse queried only
+after its background merges had settled; median time of one query, tsdb through
+its server over TCP):
 
 | question | rows it covers | tsdb | ClickHouse | ClickHouse takes |
 |---|---:|---:|---:|---:|
-| summary of one sensor's whole history | 10 million | **0.11 ms** | 35 ms | 330x longer |
-| summary of 100 sensors | 1 billion | **1.3 ms** | 723 ms | 570x longer |
-| summary of the whole table | 100 billion | **91 ms** | 70.5 s | 780x longer |
-| every sensor by day (UTC) | 100 billion | **0.27 s** | 109 s | 400x longer |
+| count, sum, minimum and maximum of a window of one sensor | 1 million | **0.60 ms** | 8 ms | 13x longer |
+| 100 sensors, a summary per sensor and local day (Europe/Oslo) | 1 billion | **156 ms** | 1,071 ms | 6.9x longer |
+| one reading | 1 | **0.32 ms** | 2 ms | 6.3x longer |
 
-A summary here is count, sum, minimum and maximum. tsdb keeps those for every
-block of 8192 readings, so when a question covers whole blocks (a whole series,
-the whole table, whole UTC days) it reads the summaries instead of the readings.
-Questions that cut through blocks have to read the data in both systems, and
-there tsdb is 2 to 3 times faster: one sensor by hour 17 ms against 42 ms, every
-sensor by hour 53 s against 113 s. Interim numbers from
+tsdb keeps count, sum, minimum and maximum for every block of 8192 readings.
+In the window and the local days, the blocks inside the window or the day are
+answered from those, and tsdb reads the readings of the blocks at the edges.
+Questions that cut through most blocks have to read the data in both systems,
+and there tsdb is 2 to 3 times faster: one sensor by hour 17 ms against 42 ms,
+every sensor by hour 53 s against 113 s. Interim numbers from
 [bench/dbcmp/results/0.9.0-interim.md](bench/dbcmp/results/0.9.0-interim.md);
-ClickHouse's times are whole milliseconds, as its benchmark tool reports them.
+ClickHouse's times are whole milliseconds, as its benchmark tool reports them,
+so the ratios of the small queries are approximate.
 
 **tsdb against InfluxDB 2.** InfluxDB is the most popular time series database: number 1 in the
 [DB-Engines ranking](https://db-engines.com/en/ranking/time+series+dbms) (November 2026, with about twice the score of
@@ -148,8 +152,7 @@ request for 100 sensors names all of them. A day is 86,400 readings, a week is
 |---|---:|---:|---:|---:|
 | load 100 million readings | | **1.08 s** | 27.9 s | 26x longer |
 | wait after the load until background work is done | | **0.02 s** | 664 s | |
-| summary of 100 sensors, whole history | 1 | **1.2 ms** | 2.38 s | 2,000x longer |
-| the same in buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s | 280x longer |
+| whole history of 100 sensors, in buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s | 280x longer |
 | the same in buckets of 60 readings (1.67 million buckets) | 1 | **67 ms** | 6.85 s | 103x longer |
 | one day of one sensor, in 288 buckets | 1 | **0.089 ms** | 5.0 ms | 57x longer |
 | | 32 | **0.45 ms** | 33.6 ms | 75x longer |
@@ -166,22 +169,18 @@ request for 100 sensors names all of them. A day is 86,400 readings, a week is
 | one reading | 1 | **0.031 ms** | 0.29 ms | 9.4x longer |
 | | 32 | **0.23 ms** | 0.83 ms | 3.6x longer |
 
-- A summary is count, sum, minimum and maximum. "Summary of 100 sensors" is one
-  request that asks about all 100 sensors, the whole table.
 - **Memory:** in these queries tsdb used at most 1.8 GB (1.7 GB without the
   file cache). InfluxDB 2's memory is not measured yet: more is coming.
 - You can also ask InfluxDB 2 one question per sensor, on 16 connections at
-  once. It then does the whole table in 0.40 s for the summary (tsdb: 2.8 ms,
-  140x faster), 0.41 s for buckets of 3,600 (tsdb: 9.0 ms, 46x) and 0.92 s for
-  buckets of 60 (tsdb: 33.5 ms, 27x). Those are the times of the whole pass over
-  all 100 sensors, not of one request.
+  once. It then does the whole table in 0.41 s for buckets of 3,600 (tsdb:
+  9.0 ms, 46x faster) and 0.92 s for buckets of 60 (tsdb: 33.5 ms, 27x). Those
+  are the times of the whole pass over all 100 sensors, not of one request.
 
-The gaps of more than 100 times are on requests that name many sensors at once. tsdb keeps a
-summary for every block of 8192 readings (see above), so a summary of the whole
-history is answered from the summaries, and so are most blocks of a day-long
-window. Raw readings have to be read in both systems; tsdb still answers a
-request for 100 sensors in one go. For one sensor the gap is smaller: 20 to
-75 times for a window, 4 to 9 times for one reading. Numbers from
+The gaps of more than 100 times are on requests that name many sensors at once:
+tsdb answers a request for 100 sensors in one go. Every query above reads
+the data in both systems (the buckets of 60, 300 and 3,600 readings are smaller
+than tsdb's blocks of 8192 readings, so tsdb mostly unpacks them). For one sensor the gap is
+smaller: 20 to 75 times for a window, 4 to 9 times for one reading. Numbers from
 [bench/dbcmp/results/0.9.0-interim-tables.md](bench/dbcmp/results/0.9.0-interim-tables.md).
 tsdb's whole-table times are printed in tenths of a millisecond there, so
 those ratios are rounded.
@@ -212,9 +211,7 @@ over TCP. Each is compared only with systems used the same way.
 - **Query (rows per second):** all 100 sensors over the whole range in buckets
   of 60 readings, a query that has to read every row: 100 million rows divided
   by the time it took. tsdb used one thread (embedded) or one connection
-  (server); DuckDB and ClickHouse ran the query on 32 threads. Summaries over
-  whole blocks are much faster still, because tsdb answers them from each
-  block's summary without reading the rows.
+  (server); DuckDB and ClickHouse ran the query on 32 threads.
 - **Query time:** one day of one sensor as 5-minute averages (86,400 readings
   into 288 buckets), one client, average over thousands of random days.
 - **Size compared to tsdb:** each system's size on disk divided by tsdb's: 2.6x
@@ -260,8 +257,8 @@ over TCP. Each is compared only with systems used the same way.
 - The more regular the sensor, the bigger the gain: slow, rounded sensors
   shrink 10 to 36 times; noisy or unrounded data has less pattern to remove.
 
-At 100 billion rows, tsdb needs 116 GB where ClickHouse needs 170 GB. A summary
-of the whole table takes 0.17 seconds instead of 59.
+At 100 billion rows, tsdb needs 116 GB where ClickHouse needs 170 GB. Reading
+the whole table in buckets of one hour takes 47 seconds instead of 101.
 
 The test data behaves like real industrial sensors, not random numbers: disk
 temperatures that creep by 0.1 °C, CPU temperatures with spikes, tanks that
