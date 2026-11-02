@@ -15,9 +15,9 @@ database that does nothing but time series, from scratch, keeping the best ideas
 of ClickHouse's storage design and adding ALP-style compression for the sensor
 values? tsdb is the result. We built it to:
 
-- **store that data for less money**: ClickHouse needs 2.6 to 2.9 times as
-  much disk for the same data (the median over 31 data sets), and tsdb needs a
-  tenth of the raw size;
+- **store that data for less money**: tsdb shrinks it to about a tenth of its
+  raw size, and needs less than half the disk ClickHouse needs for the same
+  data;
 - **cost less to run** than a ClickHouse cluster: one small program that works
   well with its defaults, and no cluster to look after;
 - **answer time series questions faster**: "the 5-minute averages of this
