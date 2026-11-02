@@ -116,6 +116,16 @@ static void *load_worker(void *arg)
     return NULL;
 }
 
+static void count_inserted(void *ctx, const tsdb_part_info *p) { *(uint64_t *)ctx += p->level == 0 && p->granules; }
+
+/* Parts with rows no merge has written yet. */
+static uint64_t inserted_parts(tsdb *db)
+{
+    uint64_t n = 0;
+    tsdb_foreach_part(db, count_inserted, &n);
+    return n;
+}
+
 static int insert_zstd = INT_MIN; /* load --insert-zstd: tsdb_options.insert_zstd_level; INT_MIN the default */
 
 static int cmd_load(void)
@@ -167,14 +177,19 @@ static int cmd_load(void)
     printf("inserted %.2f G rows in %.0f s: %.1f M rows/s; %" PRIu64 " parts, %.2f GB\n", total / 1e9, t_ins,
            total / t_ins / 1e6, s.parts, s.bytes / 1e9);
     fflush(stdout);
-    /* settled: no merge finished and the part count did not move for a minute */
-    for (int quiet = 0; quiet < 6;) {
+    /* settled: no merge finished and the part count did not move for a minute, and no part is left as an insert
+     * wrote it (CODEC_FAST, without zstd by default): those are rewritten only once their partition has been idle
+     * for merge_idle_s, which can come after a quiet minute */
+    double t_last = now_s();
+    for (int quiet = 0; quiet < 6 || inserted_parts(db) > 0;) {
         tsdb_stats p = s;
         sleep(10);
         tsdb_get_stats(db, &s);
         quiet = s.parts == p.parts && s.merges == p.merges ? quiet + 1 : 0;
+        if (!quiet)
+            t_last = now_s();
     }
-    double t_all = now_s() - t0 - 60;
+    double t_all = t_last - t0;
     printf("merges settled after %.0f s: %" PRIu64 " parts in %" PRIu64 " partitions, %" PRIu64
            " merges, %.2f GB = %.0f MB, %.3f bytes/row\n",
            t_all, s.parts, s.partitions, s.merges, s.bytes / 1e9, s.bytes / 1e6, (double)s.bytes / s.rows);
