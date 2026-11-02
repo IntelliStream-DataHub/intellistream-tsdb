@@ -255,17 +255,36 @@ def image(env):
     return ref, tag
 
 
+def commit_of(path):
+    """The short commit of the tree at path (or below it): its repository's HEAD, or for a tree made by `git archive`
+    (no repository: the release run's rb6-src) the first word of the file COMMIT at the top of the tree, found by
+    walking up from path (a COMMIT file in a directory that is not the top of a tree is not looked for beyond 5 levels)."""
+    try:
+        c = subprocess.run(["git", "-C", path, "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                           timeout=10).stdout.strip()
+    except OSError:
+        c = ""
+    p = os.path.abspath(path)
+    for _ in range(5):
+        if c:
+            break
+        try:
+            c = open(os.path.join(p, "COMMIT")).read().split()[0][:7]
+        except (OSError, IndexError):
+            pass
+        p = os.path.dirname(p)
+    return c
+
+
 def tsdb_version():
     t = os.environ.get("T", "")
     tree = os.environ.get("TSDB_TREE", "")
     try:
         v = subprocess.run([os.path.join(t, "tsdbd"), "--version"], capture_output=True, text=True,
                            timeout=10).stdout.strip()
-        c = subprocess.run(["git", "-C", tree, "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
-                           timeout=10).stdout.strip()
     except OSError:
         return "unknown", "unknown"
-    return v or "unknown", "%s at %s" % (tree, c or "?")
+    return v or "unknown", "%s at %s" % (tree, commit_of(tree) or "?")
 
 
 def lines(path):
@@ -331,16 +350,29 @@ def p6(d):
     f = os.path.join(d, "how.json")
     h = json.load(open(f))
     here = os.path.dirname(os.path.abspath(__file__))
-    try:
-        harness = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
-                                 timeout=10).stdout.strip()
-    except OSError:
-        harness = ""
+    harness = commit_of(here)
     dash = {}
     for l in lines(os.path.join(d, "p6", "dash.txt")):
         k, _, why = l.partition(":")
         dash[k.strip()] = why.strip()
     v, tree = tsdb_version()
+    many = os.environ.get("MANY_CLIENTS", "")
+    refused = lines(os.path.join(d, "p6", "REFUSED.txt")) + \
+        ["memory sweep: " + l for l in lines(os.path.join(d, "memsweep", "REFUSED.txt"))]
+    if many and "p6" in h:
+        # the extra-clients pass (run.sh phase6many) adds to the block of the pass before it: its date, trees and
+        # TWA runs stay; p6/REFUSED.txt now holds this pass's refusals too
+        h["p6"]["refused"] = refused
+        h["p6"]["many"] = ("%s-client pass (MANY_CLIENTS) of the classes '%s' at %s: REPS=%s runs each into p6/ (names "
+                           "NAME.c%s), on a load of its own, %s; tsdb %s, %s" % (
+                               many, os.environ.get("CLASS_FILTER", "") or "all", many, os.environ.get("XREPS", "?"), many,
+                               time.strftime("%Y-%m-%d %H:%M"), v, tree))
+        with open(f, "w") as o:
+            json.dump(h, o, indent=1, sort_keys=True)
+            o.write("\n")
+        check([f])
+        print(f, "p6 many")
+        return
     h["p6"] = {
         "date": time.strftime("%Y-%m-%d %H:%M"),
         "runs": "REPS=%s runs per TWA batch class (p6/*.mean.txt); every other class once into memsweep/ (peak memory "
@@ -348,8 +380,7 @@ def p6(d):
         "tsdb": "%s, %s" % (v, tree),
         "harness": "%s at %s" % (os.path.abspath(os.path.join(here, "..", "..", "..")), harness or "?"),
         "dash": dash,
-        "refused": lines(os.path.join(d, "p6", "REFUSED.txt")) +
-                   ["memory sweep: " + l for l in lines(os.path.join(d, "memsweep", "REFUSED.txt"))],
+        "refused": refused,
         "note": "the extra pass loads the data once more: its TWA batch timings come from that load, not from the "
                 "load of phase 2's rows",
     }

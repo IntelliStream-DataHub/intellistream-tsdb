@@ -27,6 +27,14 @@ P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_M
 # smoke test runs 2 and 2 (NHI, NPER): it checks that every step works, and 32 clients of 100-series batches on its
 # data only made it slow (and ran unlimited containers out of host memory)
 NHI=${NHI:-32} NPER=${NPER:-16}
+# MANY_CLIENTS=N (with CLASS_FILTER=b100): the extra-clients pass of `run.sh p6` (phase6many) for tsdb and QuestDB: the
+# batch classes whose name contains CLASS_FILTER are timed at N clients, REPS runs each, into p2/<sys>/p6/ as
+# NAME.cN. Written for the 100-series batches (.b100) that QuestDB's memory could not carry at 32 clients: both
+# systems are then compared at 16, and the 32-client rows stay what they were, failures with their reason (tables.py)
+MANY_CLIENTS=${MANY_CLIENTS-} CLASS_FILTER=${CLASS_FILTER-}
+class_wanted() { # CLASS: CLASS_FILTER (a substring such as b100) picks the classes whose name contains it; empty: all
+    [ -z "${CLASS_FILTER-}" ] || case $1 in *"$CLASS_FILTER"*) true ;; *) false ;; esac
+}
 CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot rb-td rb-vm"
 PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080|6041|8428)\b'
 mkdir -p "$OUT"
@@ -865,16 +873,22 @@ pc_restart() { # CONTAINER CONFIG_FILE START_CMD...: the per-core start: runtime
 # MANY_CONN, when set, replaces the connection string (the second driver arg, "DRIVER CONN") in the classes with more
 # than one client: TimescaleDB's 32-client classes run with fewer parallel workers per query (ts_many_probe)
 bsuite() { # SYS PREFIX DIR DRIVER-ARGS...: the batches of SYS through qdrive
-    local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} a
+    local S=$1 P=$2 D=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} a fulls=${FULLS-$FULLS_DEFAULT}
     shift 3
     [ "${PC:-0}" = 1 ] && { want_pc || return 0; sfx=.pc; ths=1; }
+    # MANY_CLIENTS: only the classes CLASS_FILTER names, at that many clients (the whole-range runs have one client:
+    # none), XREPS runs each; the class name carries .cN like any other count, so nothing here is a new kind of file
+    local REPS=$REPS
+    [ -n "${MANY_CLIENTS-}" ] && { ths=$MANY_CLIENTS; fulls=; REPS=${XREPS:-$REPS}; }
     for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
-        for n in ${FULLS-$FULLS_DEFAULT}; do
+        for n in $fulls; do
+            class_wanted "full$n.b$k" || continue
             f=$WORK/q/$S.full$n.b$k.txt; nl=$(wc -l < "$f")
             pc_client "$B/qdrive" "$@" "$f" 1 100000 "$nl" > "$D/warm.$P.full$n.b$k$sfx" 2>&1 9>&- || { fail "$P full$n.b$k warm-up failed (see $D/warm.$P.full$n.b$k$sfx)"; continue; }
             reps "$P.full$n.b$k$sfx" "$D" -- pc_client "$B/qdrive" "$@" "$f" 1 100000 "$nl"
         done
         for c in $BCLASSES; do
+            class_wanted "$c.b$k" || continue
             f=$WORK/q/$S.$c.b$k.txt
             pc_client "$B/qdrive" "$@" "$f" 1 "$WARM_SECS" > "$D/warm.$P.$c.b$k$sfx" 2>&1 9>&- || { fail "$P $c.b$k warm-up failed (see $D/warm.$P.$c.b$k$sfx)"; continue; }
             for t in $ths; do
@@ -919,17 +933,24 @@ tsdbbsuite() { # PREFIX DIR: the batches through tsdbq (protocol 10, QUERY_MULTI
                # classes one window per request) and the log says the rest is pending.
     local P=$1 D=$2 k c t sfx= ths=${BTHREADS:-1 $NHI} n
     [ "${PC:-0}" = 1 ] && { want_pc || return 0; sfx=.pc; ths=1; }
+    # MANY_CLIENTS (as in bsuite): the CLASS_FILTER classes at that many clients, XREPS runs, no whole-range runs
+    local REPS=$REPS
+    [ -n "${MANY_CLIENTS-}" ] && { ths=$MANY_CLIENTS; REPS=${XREPS:-$REPS}; }
     # a release run must time tsdb's batches: without protocol 10's --batch the phase fails (smoke only logs it)
     tsdb_has_batch || { [ "${SMOKE:-0}" = 1 ] && log "  $P: tsdbq in $TB has no --batch: K > 1 not timed" \
         || fail "$P: tsdbq in $TB has no --batch (TSDB_TREE must be the multi-series build): K > 1 not timed"; }
     for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
-        if [ "$k" = 1 ]; then
-            reps "$P.full.b1$sfx" "$D" -- pc_client env NSERIES="$(python3 -I "$H/batches.py" --count-full1)" "$TB/tsdbq" full 1 1
-        elif tsdb_has_batch; then
-            reps "$P.full.b$k$sfx" "$D" -- pc_client "$TB/tsdbq" full 1 1 --batch "$k"
-        else continue; fi
+        [ "$k" = 1 ] || tsdb_has_batch || continue
+        if [ -z "${MANY_CLIENTS-}" ] && class_wanted "full.b$k"; then
+            if [ "$k" = 1 ]; then
+                reps "$P.full.b1$sfx" "$D" -- pc_client env NSERIES="$(python3 -I "$H/batches.py" --count-full1)" "$TB/tsdbq" full 1 1
+            else
+                reps "$P.full.b$k$sfx" "$D" -- pc_client "$TB/tsdbq" full 1 1 --batch "$k"
+            fi
+        fi
         for c in $BCLASSES; do
             n=$c; [ "$k" = 1 ] || n=$c.b$k
+            class_wanted "$n" || continue
             limited "$STEP_TIMEOUT" "$D/warm.$P.$n$sfx" pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" 1 "$WARM_SECS" 9>&-
             [ $? = 124 ] && { fail "$P $n$sfx warm-up: STEP TIMEOUT ${STEP_TIMEOUT}s (see $D/warm.$P.$n$sfx)"; continue; }
             for t in $ths; do reps "$P.$n.c$t$sfx" "$D" -- pc_client "$TB/tsdbq" qps "$WORK/spec.tsv" "$n" "$t" "$SECS"; done
@@ -1237,6 +1258,14 @@ p2_tsdb() {
     load_ok "p2 tsdb" || return 1
     ports_check "$D/ports.txt"
     cd "$WORK" || return 1
+    if [ -n "${MANY_CLIENTS-}" ]; then  # the extra-clients pass (phase6many): this load, the batches' answer check, the CLASS_FILTER classes
+        untimed "$D/check-self.txt" tsdb_self "" && tsdbbsuite tsdbq "$D"
+        tsdbd_stop
+        cd "$OUT" || true
+        runstats "$D"
+        rmdata "$W"
+        return 0
+    fi
     # ref/ is phase 2's reference and stays so: the extra pass (p6) dumps its own load's answers to ref-p6/ and checks
     # them against ref/ (the same input loaded the same way must answer the same; a difference fails loudly)
     local R=ref; [ -n "${SWEEP_SUB-}" ] && R=ref-p6
@@ -1409,6 +1438,14 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
     python3 -I "$H/mkq.py" qdb && python3 -I "$H/mkq.py" qdbh
     untimed "$D/check.txt" python3 -I "$H/check.py" qdb 200
     local PG="host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb"
+    if [ -n "${MANY_CLIENTS-}" ]; then  # the extra-clients pass (phase6many): this load, the batches' answer check, the CLASS_FILTER classes
+        bcheck qdb "$D" && bsuite qdb "$P" "$D" pg "$PG"
+        cd "$OUT" || true
+        ctr_mem rb-qdb "$D/mem.txt"
+        crm rb-qdb; rmdata "$W"
+        runstats "$D"
+        return 0
+    fi
     qsuite qdb "$P" "$D" pg "$PG"
     local bok=0
     bcheck qdb "$D" && { bok=1; perc16 qdb "$P" "$D" pg "$PG"; bsuite qdb "$P" "$D" pg "$PG"; }
@@ -1922,11 +1959,39 @@ phase5() { reset_quiet; p5 || fail "p5 returned an error"; }
 # moves both to $OUT/old/, and a phase-2 rerun of the system (aside) makes its p6 due again).
 P6_SYSTEMS=${P6_SYSTEMS:-$P2_SYSTEMS}
 how_p6() { # DIR REPS: the p6 block of DIR/how.json (how.py p6: when, runs, trees, the pass's dash and refusals)
-    env T="$T" TSDB_TREE="$TSDB_TREE" XREPS="$2" python3 -I "$RDIR/how.py" p6 "$1" >> "$OUT/driver.log" 2>&1 \
+    env T="$T" TSDB_TREE="$TSDB_TREE" XREPS="$2" MANY_CLIENTS="${MANY_CLIENTS-}" CLASS_FILTER="${CLASS_FILTER-}" python3 -I "$RDIR/how.py" p6 "$1" >> "$OUT/driver.log" 2>&1 \
         || fail "how.json p6 block of $1"
+}
+# The extra-clients pass (MANY_CLIENTS=16 CLASS_FILTER=b100 run.sh p6, systems tsdb and qdb0-2): QuestDB's 100-series
+# batches ran out of memory at 32 clients (its own RSS limit, the 48 GB container limit), so tsdb and QuestDB are timed
+# at 16 as well. Per system ONE load, the batches' answer check, then the CLASS_FILTER classes at MANY_CLIENTS clients,
+# REPS runs each, into <dir>/p6/NAME.cN (labels "p6 NAME.cN rK"; the load, checks and memory files of the load beside
+# them). Nothing is moved aside: the 32-client rows, p6/ and memsweep/ stay as they were, whatever RESUME says.
+# $OUT/p6/<sys>.cN.done marks a system's pass.
+phase6many() {
+    local s d ok reps=$REPS
+    for s in $P6_SYSTEMS; do
+        case $s in tsdb|qdb0|qdb1|qdb2) ;; *) fail "p6 $s: MANY_CLIENTS is implemented for tsdb and qdb0-qdb2 only"; continue ;; esac
+        reset_quiet
+        done_mark "$OUT/p6/$s.c$MANY_CLIENTS.done" && { log "p6 $s c$MANY_CLIENTS already done"; continue; }
+        d=$(res_dir 2 "$s")
+        mkdir -p "$d/p6"
+        log "p6 $s start: one load; the classes '${CLASS_FILTER:-all}' at $MANY_CLIENTS clients, $reps runs, into $d/p6"
+        LOAD_FAILED=0
+        if SWEEP_SUB=/p6 XREPS=$reps REPS=1 LOADS_FROM=1 NO_PC=1 LABEL_PFX="p6 " p2_sys "$s"; then ok=1
+        else ok=0; fail "p6 $s c$MANY_CLIENTS returned an error (a start or load failed; RESUME=1 loads it again)"; fi
+        cleanup_all
+        [ -e "$d/how.json" ] || how_write 2 "$s"
+        how_p6 "$d" "$reps"   # adds the pass to the p6 block (how.py: MANY_CLIENTS), keeps the TWA pass's facts
+        runstats "$d/p6"
+        [ "$ok" = 1 ] && date > "$OUT/p6/$s.c$MANY_CLIENTS.done"
+        log "p6 $s c$MANY_CLIENTS end"
+    done
+    rmdata "$DBCMP/s2"
 }
 phase6() {
     local s d x ok reps=$REPS
+    [ -n "${MANY_CLIENTS-}" ] && { phase6many; return; }
     for s in $P6_SYSTEMS; do
         reset_quiet
         done_mark "$OUT/p6/$s.done" && { log "p6 $s already done"; continue; }
@@ -2016,12 +2081,18 @@ phase_smoke() {
 . "$RDIR/sys_vm.sh"
 
 # ================================================================== main
+tree_commit() { # DIR: the commit of a tree: its repository's HEAD, or for a tree made by `git archive` (no .git, the
+                # release run's source copy) the file COMMIT at its top, which whoever made the copy writes
+    local c
+    c=$(git -C "$1" rev-parse HEAD 2> /dev/null) || c=$(head -c 40 "$1/COMMIT" 2> /dev/null | tr -d '\n')
+    echo "${c:-unknown (no repository and no COMMIT file)}"
+}
 machine() {
     {
         date; uname -a; lscpu | grep -E 'Model name|^CPU\(s\)|Thread|MHz'; free -g | head -2; df -h /var/tmp
         echo "governor: $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort | uniq -c | tr '\n' ' ')"
-        echo "tsdb tree: $TSDB_TREE $(git -C "$TSDB_TREE" rev-parse HEAD) ($(git -C "$TSDB_TREE" diff --stat | tail -1))"
-        echo "harness: $ROOT $(git -C "$ROOT" rev-parse HEAD)"
+        echo "tsdb tree: $TSDB_TREE $(tree_commit "$TSDB_TREE") ($(git -C "$TSDB_TREE" diff --stat 2> /dev/null | tail -1))"
+        echo "harness: $ROOT $(tree_commit "$ROOT")"
         podman --version
         for i in $CH_IMG $TS_IMG $TSHA_IMG $QDB_IMG $I2_IMG $I3_IMG "$PROM_IMG" $IOT_IMG $TD_IMG $VM_IMG; do echo "$i $(podman image inspect --format '{{.Digest}} {{.Created}}' "$i" 2> /dev/null)"; done
         echo "duckdb: $DUCKDB_DIR (libduckdb-linux-amd64.zip sha256 $DUCKDB_SHA)"
@@ -2040,6 +2111,9 @@ usage: run.sh PHASE...      (env.sh has the paths; REPS, SECS, FORCE=1, P1_SYSTE
   p5         100 billion rows (only when named; not in "all")
   p6         the extra pass over p2's systems (only when named): one load each, the TWA batch classes (REPS runs, into
              p2/<sys>/p6/), every other class once with its peak memory (p2/<sys>/memsweep/); P6_SYSTEMS picks
+             MANY_CLIENTS=16 CLASS_FILTER=b100 P6_SYSTEMS="tsdb qdb0 qdb1 qdb2" run.sh p6: only the extra-clients
+             pass instead: one load each, the classes whose name contains CLASS_FILTER at that many clients, REPS
+             runs, into p2/<sys>/p6/NAME.c16 (the 32-client rows and the sweep stay; marker p6/<sys>.c16.done)
   all        prep p1 p2 p3 p4
   smoke      every system end to end on tiny data, every check must pass (DBCMP=/var/tmp/dbcmp-smoke)
   checktest  the answer checker against a crafted data set and mutated answers

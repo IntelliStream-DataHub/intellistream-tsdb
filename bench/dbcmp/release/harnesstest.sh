@@ -80,7 +80,8 @@ else echo "FAIL mem_sample with no server: $(cat "$M/none.err")"; fails=$((fails
 eval "$(sed -n -e '/^tstep() {/,/^}/p' -e '/^phase6() {/,/^}/p' -e '/^twabsuite() {/,/^}/p' -e '/^tsdbtwab() {/,/^}/p' \
     -e '/^dashnote() {/,/^}/p' -e '/^want_pc() {/p' -e '/^pc_pin() {/,/^}/p' -e '/^bsuite() {/,/^}/p' \
     -e '/^twab_dir() {/,/^}/p' -e '/^twa_single_failed() {/,/^}/p' -e '/^nocheck() {/,/^}/p' -e '/^aside() {/,/^}/p' \
-    -e '/^tsdbsuite() {/,/^}/p' "$HERE/run.sh")"
+    -e '/^tsdbsuite() {/,/^}/p' -e '/^class_wanted() {/,/^}/p' -e '/^tsdbbsuite() {/,/^}/p' \
+    -e '/^phase6many() {/,/^}/p' -e '/^tree_commit() {/,/^}/p' "$HERE/run.sh")"
 expect() { # NAME CONDITION...: one case
     if eval "${*:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
 }
@@ -173,6 +174,37 @@ limited() { local s=$1 o=$2; shift 2; "$@" > "$o" 2>&1; }
 NO_PC=1 PC=1 KS=1 PC_KS=1 FULLS=0 BCLASSES=raw bsuite ch ch "$OUT/p2/ch" http x; rc=$?
 expect "NO_PC: bsuite with PC=1 runs nothing" "[ $rc = 0 ] && [ ! -s '$P6LOG' ]"
 expect "NO_PC: pc_pin refuses" "! NO_PC=1 pc_pin rb-x"
+# MANY_CLIENTS (the extra-clients pass): bsuite and tsdbbsuite time only the CLASS_FILTER classes, at that many clients,
+# XREPS runs each, and not the whole-range runs; the file names carry .c16; without the option nothing changes
+: > "$X6/reps.log"; mkdir -p "$OUT/p2/qdb/p6"
+MANY_CLIENTS=16 CLASS_FILTER=b100 XREPS=5 REPS=1 KS="1 10 100" FULLS="0 3600" BCLASSES="raw agg1d" bsuite qdb qdb "$OUT/p2/qdb/p6" pg conn
+got=$(cat "$X6/reps.log")
+want=$(printf '%s\n' "qdb.raw.b100.c16 $OUT/p2/qdb/p6 REPS=5" "qdb.agg1d.b100.c16 $OUT/p2/qdb/p6 REPS=5")
+expect "MANY_CLIENTS: bsuite times the b100 classes at 16 clients, 5 runs each, no whole-range runs" '[ "$got" = "$want" ]'
+: > "$X6/reps.log"
+FULLS="" BCLASSES=raw KS=10 REPS=2 bsuite qdb qdb "$OUT/p2/qdb" pg conn
+got=$(cat "$X6/reps.log")
+want=$(printf '%s\n' "qdb.raw.b10.c1 $OUT/p2/qdb REPS=2" "qdb.raw.b10.c32 $OUT/p2/qdb REPS=2")
+expect "MANY_CLIENTS: bsuite without the option still times 1 and NHI clients" '[ "$got" = "$want" ]'
+mkdir -p "$X6/tb"; printf '#!/bin/bash\necho "tsdbq $*" >> "$P6LOG"\n' > "$X6/tb/tsdbq"; chmod +x "$X6/tb/tsdbq"
+tsdb_has_batch() { true; }; mkdir -p "$OUT/p2/tsdb/p6"
+: > "$X6/reps.log"
+TB=$X6/tb MANY_CLIENTS=16 CLASS_FILTER=b100 XREPS=5 REPS=1 KS="1 10 100" BCLASSES="agg1d point" tsdbbsuite tsdbq "$OUT/p2/tsdb/p6"
+got=$(cat "$X6/reps.log")
+want=$(printf '%s\n' "tsdbq.agg1d.b100.c16 $OUT/p2/tsdb/p6 REPS=5" "tsdbq.point.b100.c16 $OUT/p2/tsdb/p6 REPS=5")
+expect "MANY_CLIENTS: tsdbbsuite times the b100 classes at 16 clients, 5 runs each, no full.bK runs" '[ "$got" = "$want" ]'
+: > "$X6/reps.log"
+mkdir -p "$X6/h"; echo "print(10)" > "$X6/h/batches.py"
+H=$X6/h TB=$X6/tb KS="1 10" BCLASSES=point REPS=2 tsdbbsuite tsdbq "$OUT/p2/tsdb"
+got=$(cat "$X6/reps.log")
+want=$(printf '%s\n' "tsdbq.full.b1 $OUT/p2/tsdb REPS=2" "tsdbq.point.c1 $OUT/p2/tsdb REPS=2" "tsdbq.point.c32 $OUT/p2/tsdb REPS=2" \
+    "tsdbq.full.b10 $OUT/p2/tsdb REPS=2" "tsdbq.point.b10.c1 $OUT/p2/tsdb REPS=2" "tsdbq.point.b10.c32 $OUT/p2/tsdb REPS=2")
+expect "MANY_CLIENTS: tsdbbsuite without the option still times the whole range, 1 and NHI clients" '[ "$got" = "$want" ]'
+# a tree made by git archive has no repository: its commit is the file COMMIT
+mkdir -p "$X6/arch" "$X6/bare"; echo "0123456789abcdef0123456789abcdef01234567 main" > "$X6/arch/COMMIT"
+expect "tree_commit: a tree without a repository gives the commit in its COMMIT file" \
+    '[ "$(tree_commit "$X6/arch")" = 0123456789abcdef0123456789abcdef01234567 ]'
+expect "tree_commit: no repository and no COMMIT file says so" 'tree_commit "$X6/bare" | grep -q "^unknown"'
 # phase6: per system once, REPS=1 into memsweep with XREPS for the batches, no per core, labels "p6 "; a done marker
 # when the system's pass reached its end (failed classes are results); a rerun moves p6/ and memsweep/ aside unless
 # RESUME=1
@@ -204,6 +236,22 @@ expect "phase6: a rerun without RESUME moves the old p6/ and memsweep/ to OUT/ol
 mkdir -p "$OUT/p2/tsdb"
 aside 2 tsdb
 expect "aside: a phase-2 rerun of a system makes its extra pass due again" "[ ! -e '$OUT/p6/tsdb.done' ] && [ -e '$OUT/p6/qdb0.done' ]"
+# phase6 with MANY_CLIENTS: the extra-clients pass; per system one load into its p6/ (SWEEP_SUB=/p6, XREPS runs), nothing
+# moved aside (the sweep and the 32-client rows stay), a done marker of its own (.c16.done), a system it does not
+# implement is a FAIL; how.json gets the pass added
+: > "$X6/p6.log"; rm -rf "$OUT/old" "$PH_DIR/FAILS"
+mkdir -p "$OUT/p2/qdb/memsweep"; echo keep > "$OUT/p2/qdb/memsweep/load.1"
+MANY_CLIENTS=16 CLASS_FILTER=b100 P6_SYSTEMS="tsdb qdb0 ch" REPS=5 phase6
+expect "phase6 MANY_CLIENTS: each implemented system once, into its p6/, XREPS runs, one load" \
+    "[ \$(grep -c 'sub=/p6 REPS=1 XREPS=5 LOADS_FROM=1 NO_PC=1 pfx=p6 \$' '$X6/p6.log') = 2 ] && grep -q '^p2_sys tsdb ' '$X6/p6.log' && grep -q '^p2_sys qdb0 ' '$X6/p6.log'"
+expect "phase6 MANY_CLIENTS: its own done markers, not the sweep's" \
+    "[ -e '$OUT/p6/tsdb.c16.done' ] && [ -e '$OUT/p6/qdb0.c16.done' ] && [ ! -e '$OUT/p6/ch.c16.done' ] && [ ! -e '$OUT/p6/tsdb.done' ]"
+expect "phase6 MANY_CLIENTS: a system without the pass fails" "grep -q 'p6 ch: MANY_CLIENTS is implemented for' '$PH_DIR/FAILS' && ! grep -q 'p2_sys ch' '$X6/p6.log'"
+expect "phase6 MANY_CLIENTS: nothing moved aside, the sweep stays" "[ ! -d '$OUT/old' ] && [ \"\$(cat '$OUT/p2/qdb/memsweep/load.1')\" = keep ]"
+expect "phase6 MANY_CLIENTS: how.json block and runstats on p6/" \
+    "grep -qx 'how_p6 $OUT/p2/tsdb 5' '$X6/p6.log' && grep -qx 'runstats $OUT/p2/qdb/p6' '$X6/p6.log'"
+P6_SYSTEMS="tsdb qdb0" MANY_CLIENTS=16 CLASS_FILTER=b100 RESUME=1 phase6; n=$(grep -c '^p2_sys' "$X6/p6.log")
+expect "phase6 MANY_CLIENTS: a system with its done marker is skipped (the marker is per client count)" "[ $n = 2 ]"
 # untimed: a check that exits 1 on a mismatch (rel.py jsonl) is named by its MISMATCH line in FAILS, as when it exited 0
 eval "$(sed -n -e '/^untimed() {/,/^}/p' "$HERE/run.sh")"
 fail() { echo "fail: $*" >> "$X6/ufails"; }

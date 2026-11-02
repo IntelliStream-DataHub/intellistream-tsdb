@@ -20,6 +20,10 @@ In batch classes (NAME.bK.cN: K windows per request) the q/s of qdrive's and rel
 tsdbq's lines counts windows; each line says which, and tsdbq's get their requests per second (q/s / K) beside them.
 The extra pass's timings (p2/<sys>/p6/, run.sh p6: another load) join the system's table marked "p6:", and the
 system's how.json p6 block (when, runs, trees, its '-' reasons and refusals) is printed under it.
+The extra-clients pass (run.sh phase6many: MANY_CLIENTS=16 CLASS_FILTER=b100 for tsdb and QuestDB) puts NAME.c16 files
+there too. A 32-client class that failed (no run timed, or runs killed or refused) and has a NAME.c16 result gets a
+note in its flags: it ran out of memory, with the peak, the limit and the memory held before the class (from its
+.mem files), and the 16-client row is the comparison; the 32-client row itself stays a failure.
 """
 import glob, json, os, re, sys
 
@@ -272,6 +276,58 @@ def relq_rows(d, prefix=""):
     return rows
 
 
+LIMIT = re.compile(r"container limit (\d+(?:\.\d+)? ?[A-Za-z]+)")
+
+
+def gb(x):
+    return "%.1f GB" % (x / 2**30)
+
+
+def many_note(d, name, lines, flags):
+    """The note under a failed 32-client class that has a 16-client result (run.sh phase6many: MANY_CLIENTS=16 for tsdb
+    and QuestDB): QuestDB ran out of memory in its 32-client 100-series batches, so the 16-client run is the
+    comparison and the 32-client row stays a failure. The numbers come from the mem files of the class (the run with the
+    highest peak: the one that ran out; peak with the page cache is what a container limit counts, then without it, and
+    the server's memory at the step's start: what the earlier classes left), the limit from the REFUSED lines naming the
+    class ('container limit 48 GB'), or any REFUSED line of the system. '' when the class did not fail or has no
+    16-client result."""
+    if not name.endswith(".c32") or not (flags_failed(flags) or not lines):
+        return ""
+    c16 = name[:-len("c32")] + "c16"
+    f16 = next((f for f in (os.path.join(d, "p6", c16 + ".mean.txt"), os.path.join(d, c16 + ".mean.txt"))
+                if os.path.exists(f) and picked(f)[0]), None)
+    if not f16:
+        return ""
+    best = {}  # server: (peak with cache, peak without, start with cache, start without): the file with the highest peak
+    for sub in ("", "memsweep"):
+        for g in glob.glob(os.path.join(d, sub, name + ".*.mem")):
+            if not re.fullmatch(re.escape(name) + r"\.\d+\.mem", os.path.basename(g)):
+                continue
+            for l in open(g):
+                m = MEM.fullmatch(l.strip())
+                if m:
+                    cur = (int(m.group(2)), int(m.group(3)), int(m.group(4) or 0), int(m.group(5) or 0))
+                    if m.group(1) not in best or cur[0] > best[m.group(1)][0]:
+                        best[m.group(1)] = cur
+    limit, anylimit = None, None
+    for r in glob.glob(os.path.join(d, "REFUSED*.txt")) + [os.path.join(d, s, "REFUSED.txt") for s in ("memsweep", "p6")]:
+        for l in open(r, errors="replace") if os.path.exists(r) else []:
+            m = LIMIT.search(l)
+            if m:
+                anylimit = anylimit or m.group(1)
+                if name in l:
+                    limit = limit or m.group(1)
+    why = run_failures(os.path.join(d, name + ".mean.txt")) if os.path.exists(os.path.join(d, name + ".mean.txt")) else ""
+    mem = "; ".join("%s peak %s with the page cache (%s without), %s held when the class started" % (
+        k, gb(v[0]), gb(v[1]), gb(v[2])) for k, v in sorted(best.items())) or "memory not recorded"
+    return ("the 32-client run ran out of memory%s: %s; limit %s. The 16-client run (%s) is the comparison" % (
+        " (" + why + ")" if why else "", mem, limit or anylimit or "not recorded", os.path.basename(f16)[:-len(".mean.txt")]))
+
+
+def flags_failed(flags):
+    return any("not averaged" in x or x.startswith("no run timed") for x in flags)
+
+
 def results_table(d, prefix="", mark=""):
     """The timing rows of d; with mark (the extra pass's d/p6), names start with it and the header is left out. A
     class the extra pass timed again (TWA_RETIME: QuestDB's TWA after its query changed) is flagged in the phase-2 row."""
@@ -292,6 +348,9 @@ def results_table(d, prefix="", mark=""):
             else:
                 errors.append("%s: no timing in it (a failed or empty run?)" % f)
                 flags.append("NO TIMING")
+        note = "" if mark else many_note(d, name, lines, flags)
+        if note:
+            flags.append(note)
         if name in again:
             flags.append("SUPERSEDED: timed again in the extra pass (the p6: row of the same name)")
         res = "<br>".join(cell(t)[:240] for t, _ in lines) or "-"
@@ -361,6 +420,8 @@ def p6_notes(h):
         return []
     out = ["", "Extra pass (p6) on %s: %s; tsdb %s; harness %s. %s." % (
         p.get("date", "?"), p.get("runs", "?"), p.get("tsdb", "?"), p.get("harness", "?"), p.get("note", ""))]
+    if p.get("many"):
+        out.append("- extra-clients pass: " + cell(p["many"]))
     out += ["- p6 '-': %s: %s" % (cell(k), cell(v)) for k, v in sorted(p.get("dash", {}).items())]
     out += ["- p6 refused or died: " + cell(l) for l in p.get("refused", [])]
     return out

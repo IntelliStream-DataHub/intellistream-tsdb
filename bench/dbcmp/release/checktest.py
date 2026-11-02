@@ -339,6 +339,62 @@ def tables_cases():
         shutil.rmtree(d)
         tables.errors.clear()
 
+def many_cases():
+    """tables.py: a failed 32-client class with a 16-client result (the extra-clients pass, run.sh MANY_CLIENTS=16) gets
+    the note that it ran out of memory (peak, limit, memory held before it) and that the 16-client run is the comparison;
+    a 32-client class that worked, or one without a 16-client result, gets none. how.py: the commit of a tree without a
+    repository (git archive) is the file COMMIT."""
+    import tables, how
+    d = tempfile.mkdtemp()
+    T16 = "q c=16: 160 queries in 15.00 s = 10.7 q/s, mean 1400.1 ms, median 1390.0 ms, p99 2100.0 ms\n"
+    try:
+        os.makedirs(os.path.join(d, "p6"))
+        os.makedirs(os.path.join(d, "memsweep"))
+        v = "qdb-parquet"
+        # agg7d.b100.c32: killed at the container limit (the run file says only the connection dropped), nothing timed
+        open(os.path.join(d, v + ".agg7d.b100.c32.mean.txt"), "w").write("query failed   # TEXT DIFFERS between runs\n")
+        open(os.path.join(d, v + ".agg7d.b100.c32.1"), "w").write("query failed: server closed the connection unexpectedly\n")
+        open(os.path.join(d, v + ".agg7d.b100.c32.1.oom"), "w").write("query failed: server closed the connection unexpectedly\n")
+        open(os.path.join(d, "memsweep", v + ".agg7d.b100.c32.1.mem"), "w").write(
+            "rb-qdb peak 51539607552 nocache 51536883712 start 41239035904 startnocache 40796782592\n")
+        open(os.path.join(d, "memsweep", "REFUSED.txt"), "w").write(
+            "p6 %s.agg7d.b100.c32 r1: the server died: killed out of memory by the kernel (container limit 48 GB; exited exit code 137)\n" % v)
+        open(os.path.join(d, "p6", v + ".agg7d.b100.c16.mean.txt"), "w").write(T16)
+        # point.b100.c32 worked, and has a 16-client result: no note; raw.b100.c32 failed and has none: no note
+        open(os.path.join(d, v + ".point.b100.c32.mean.txt"), "w").write(T16.replace("c=16", "c=32"))
+        open(os.path.join(d, "p6", v + ".point.b100.c16.mean.txt"), "w").write(T16)
+        open(os.path.join(d, v + ".raw.b100.c32.mean.txt"), "w").write("query failed   # TEXT DIFFERS between runs\n")
+        open(os.path.join(d, v + ".raw.b100.c32.1"), "w").write("query failed: server closed the connection unexpectedly\n")
+        tables.errors.clear()
+        rows = tables.results_table(d)
+        text = "\n".join(r if isinstance(r, str) else r[1] for r in rows).splitlines()
+        row = next((l for l in text if l.startswith("| %s.agg7d.b100.c32 " % v)), "")
+        case("many: the failed 32-client class says it ran out of memory", True, "the 32-client run ran out of memory" in row)
+        case("many: with the peak (with and without the page cache), the limit and what was held before", True,
+             "rb-qdb peak 48.0 GB with the page cache (48.0 GB without)" in row and "limit 48 GB" in row
+             and "38.4 GB held when the class started" in row)
+        case("many: and names the 16-client row as the comparison", True,
+             "The 16-client run (%s.agg7d.b100.c16) is the comparison" % v in row)
+        case("many: the 32-client row stays a failure", True, "no run timed" in row)
+        case("many: the 16-client row is in the table (p6:)", True,
+             any(l.startswith("| p6: %s.agg7d.b100.c16 " % v) and "10.7 q/s" in l for l in text))
+        case("many: a 32-client class that worked gets no note", True,
+             not any("comparison" in l for l in text if l.startswith("| %s.point.b100.c32 " % v)))
+        case("many: a failed 32-client class without a 16-client result gets no note", True,
+             not any("comparison" in l for l in text if l.startswith("| %s.raw.b100.c32 " % v)))
+        os.remove(os.path.join(d, "memsweep", "REFUSED.txt"))
+        text = "\n".join(r if isinstance(r, str) else r[1] for r in tables.results_table(d))
+        case("many: a limit that no REFUSED line names is said not to be recorded", True, "limit not recorded" in text)
+        case("many: tables.py has no error for any of these", True, not tables.errors)
+        t = os.path.join(d, "arch", "bench", "dbcmp", "release")
+        os.makedirs(t)
+        open(os.path.join(d, "arch", "COMMIT"), "w").write("0123456789abcdef0123456789abcdef01234567 main\n")
+        case("many: how.py reads the commit of a git archive tree from COMMIT", True, how.commit_of(t) == "0123456")
+        case("many: no repository and no COMMIT file gives no commit", True, how.commit_of(d) == "")
+    finally:
+        shutil.rmtree(d)
+        tables.errors.clear()
+
 def main():
     a = sys.argv[1:]
     if not a or a[0] != "mutate": raise SystemExit("usage: checktest.py mutate [TWA_REF WINDOWS_REF FULL_REF]")
@@ -354,6 +410,7 @@ def main():
     exit_cases(ref)
     refused_cases()
     tables_cases()
+    many_cases()
     if len(a) >= 4:
         windows_cases(a[2], a[3])
     print("checktest", "OK" if failures == 0 else f"FAILED ({failures} cases)")
