@@ -1644,7 +1644,7 @@ static pthread_once_t simd_once = PTHREAD_ONCE_INIT;
  * everything else running there. Ice Lake and later Intel cores, and AMD
  * Zen 4/5, have no meaningful penalty.
  *
- * Measured on 2026-11-02 on a dual Xeon Platinum 6162 (model 0x55): the
+ * Confirmed on 2026-11-02 on a test machine, a dual Xeon Platinum 6162 (model 0x55): the
  * kernels alone, in cache (tools/fold-bench.sh), run 1.1-2.7x faster with
  * AVX-512, yet tsdb-bench with TSDB_SIMD=avx512 is 7-22% slower than with the
  * AVX2 kernels this rule picks (whole range -16%, hour buckets -16%, a 1-thread

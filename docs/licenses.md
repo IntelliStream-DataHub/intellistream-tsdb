@@ -121,9 +121,14 @@ The Pulsar NAR packs Jackson and zstd-jni, so it should carry `LICENSE`, `NOTICE
 
 The databases that `bench/dbcmp` compares tsdb with (ClickHouse, QuestDB, TimescaleDB, InfluxDB, DuckDB and the
 others) run in their own containers or are downloaded by the benchmark scripts. Nothing of them is part of tsdb or
-its tarball, so their licenses do not touch tsdb's. (Publishing *measurements* of a product can have its own
-conditions; read the product's license before you do that.) The Podman containers the scripts start use their
-own images.
+its tarball, so their licenses do not touch tsdb's. The Podman containers the scripts start use their own images.
+
+Publishing measurements of them is allowed: the open-source editions benchmarked are under Apache-2.0 (ClickHouse,
+chDB, QuestDB, IoTDB, VictoriaMetrics, Prometheus, TimescaleDB's core), MIT (DuckDB, InfluxDB 2), MIT/Apache-2.0
+(InfluxDB 3 Core) or AGPL-3.0 (TDengine), and an open-source license cannot forbid benchmarks. TimescaleDB's
+compression is under the Timescale License (tsl/LICENSE-TIMESCALE, posted 2020-09-24), which was read on 2026-11-02:
+it restricts offering the software as a database service, derivative works and resale, and says nothing about
+benchmarks or publishing test results. Enterprise editions, which can carry other terms, were not benchmarked.
 
 ## Conclusion
 

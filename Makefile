@@ -554,7 +554,7 @@ jepsen-selftest: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so
 	        echo "jepsen-selftest: a SIGSEGV in the server went unnoticed (rc $$rc)"; echo "$$out" | tail -n 20; exit 1; fi; \
 	    echo "jepsen-selftest: ok"
 
-# Build and test on AlmaLinux 10 (the production OS) in Podman; takes minutes, logs in $LOGDIR.
+# Build and test on AlmaLinux 10 (the main target OS) in Podman; takes minutes, logs in $LOGDIR.
 # URING=0 keeps Podman's stock seccomp profile, which blocks io_uring as production does: tsdbd then runs on epoll.
 test-almalinux10:
 	tests/distro/almalinux10.sh
