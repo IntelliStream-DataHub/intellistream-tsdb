@@ -13,12 +13,16 @@ database that does nothing but time series, from scratch, keeping the best ideas
 of ClickHouse's storage design and adding ALP-style compression for the sensor
 values? tsdb is the result. We built it to:
 
-- **store that data for less money**: it needs a third to a half less disk
-  than ClickHouse, and a tenth of the raw size;
+- **store that data for less money**: ClickHouse needs 2.6 to 2.9 times as
+  much disk for the same data (the median over 31 data sets), and tsdb needs a
+  tenth of the raw size;
 - **cost less to run** than a ClickHouse cluster: one small program that works
   well with its defaults, and no cluster to look after;
 - **answer time series questions faster**: "the 5-minute averages of this
-  sensor yesterday" takes 0.15 ms, 20 times faster than ClickHouse.
+  sensor yesterday" takes 0.09 ms, 35 times faster than ClickHouse.
+
+We compared it with ClickHouse, InfluxDB, VictoriaMetrics, QuestDB, TimescaleDB
+and others on the same machine and the same data; the numbers are below.
 
 tsdb uses the same storage design as ClickHouse (MergeTree), but keeps only
 what time series need. There is no SQL and there are no tables: you store
