@@ -1306,6 +1306,7 @@ struct eng {
     pthread_t follower;
     pthread_mutex_t refresh_lock;
     uint64_t follow_version;
+    uint64_t follow_check; /* the checksum of the MANIFEST taken: versions start again at every writer's open */
     int64_t manifest_bad_since; /* follower: MANIFEST failed its checks since (monotonic ms), else 0 */
     bool manifest_reported;     /* follower: and that was logged */
     char broken_reported[96];   /* follower: the last broken part logged */

@@ -146,6 +146,11 @@ disk format and the wire protocol.
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
+- A follower could stop seeing new rows after the writer restarted. Every writer numbers its MANIFEST versions from 1
+  again, and a follower took a MANIFEST only when its version changed: after writers that died before they flushed
+  (kill -9, power loss), the new writer could publish the version the follower already had, and the follower kept
+  the old parts and the old WAL segment until the writer published again, which an idle writer may never do. A
+  follower now also compares the MANIFEST's checksum (`make jepsen`, power nemesis: "the follower does not catch up").
 - The float32 and float64 codecs no longer depend on the CPU's rounding mode. A host application that had set
   `FE_UPWARD`, `FE_DOWNWARD` or `FE_TOWARDZERO` (the engine never does) stored other bytes than at round-to-nearest,
   and in some blocks values that decoded one unit in the last place off at round-to-nearest, silently; a block read in

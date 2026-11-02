@@ -149,6 +149,7 @@ void graveyard_purge(eng *db, bool all)
 
 typedef struct manifest {
     uint64_t version, wal_flushed, wal_active;
+    uint64_t check; /* over the whole text: a new writer counts its versions from 1 again */
     uint32_t series;
     char **parts;
     size_t nparts;
@@ -193,6 +194,7 @@ static int manifest_read(eng *db, manifest *m)
         manifest_free(m);
         return TSDB_ERR_CORRUPT;
     }
+    m->check = want;
     *body_end = '\0';
     int format = 0;
     size_t nparts = 0;
@@ -377,7 +379,10 @@ int follow_refresh(eng *db)
         pthread_mutex_unlock(&db->refresh_lock);
         return rc;
     }
-    if (m.version != db->follow_version) {
+    /* Not the version alone: every writer counts from 1 again at its open, so a writer restarted after a crash
+     * publishes the versions its predecessor did, with other parts and another active WAL segment. Taken for the
+     * same MANIFEST, it would keep the follower on the old segment until the new writer published once more. */
+    if (m.version != db->follow_version || m.check != db->follow_check) {
         rc = series_reload(&db->series, db->dirfd);
         if (rc == 0)
             rc = series_reload(&db->states, db->dirfd);
@@ -448,6 +453,7 @@ int follow_refresh(eng *db)
             }
             db->ntails = kept;
             db->follow_version = m.version;
+            db->follow_check = m.check;
             db->follow_flushed = m.wal_flushed;
             db->follow_active = m.wal_active;
             pthread_mutex_unlock(&db->buf_lock);

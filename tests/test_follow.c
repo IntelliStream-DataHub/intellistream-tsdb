@@ -464,6 +464,75 @@ static void test_torn_manifest(const char *base)
     printf("  a MANIFEST torn by a rewrite is read again at the next refresh\n");
 }
 
+static uint64_t manifest_version(const char *dir)
+{
+    char path[600], text[256];
+    snprintf(path, sizeof path, "%s/MANIFEST", dir);
+    FILE *f = fopen(path, "r");
+    unsigned long long v = 0;
+    if (f) {
+        size_t n = fread(text, 1, sizeof text - 1, f);
+        text[n] = '\0';
+        char *line = strstr(text, "\nversion ");
+        if (line)
+            v = strtoull(line + 9, NULL, 10);
+        fclose(f);
+    }
+    return v;
+}
+
+/* Every writer counts its MANIFEST versions from 1 again. Writers that die before they flush (kill -9, power loss)
+ * each publish the same versions at their open: one for the replay of the segment the last one left, one for the
+ * open. A follower that saw the second of two such writers holds its version and a WAL tail of its segment; the next
+ * writer publishes that version too, with other parts and a new active segment. The follower must take that
+ * MANIFEST, or it shows nothing the new writer appends until the writer happens to publish again (jepsen power:
+ * "the follower does not catch up"). */
+static void test_writer_restart(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-follow-restart-%d", base, (int)getpid());
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0; /* no merge publishes a version of its own */
+    tsdb *w = NULL, *r = NULL;
+    tsdb_sid id = 0;
+    for (int i = 0; i < 2; i++) { /* writers with one row in their WAL each, dead without a flush or a close */
+        pid_t pid = fork();
+        if (pid == 0)
+            _exit(tsdb_open(dir, &o, &w) != 0 || tsdb_series(w, "s", &id) != 0 ||
+                  tsdb_append(w, id, T0 + i, 1.0f) != 0);
+        int st;
+        CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1; /* no polling thread: refreshes happen here */
+    CHECK(tsdb_open(dir, &ro, &r) == 0);
+    if (r) {
+        uint64_t seen = manifest_version(dir);
+        tsdb_points p;
+        CHECK(tsdb_series_lookup(r, "s", &id) == 0);
+        CHECK(tsdb_query_points(r, id, T0, T0 + 3, &p) == 0 && p.n == 2); /* a part, and the last one's WAL */
+        tsdb_points_free(&p);
+        CHECK(tsdb_open(dir, &o, &w) == 0);
+        if (w) {
+            CHECK(manifest_version(dir) == seen); /* the case under test: the same version, another MANIFEST */
+            CHECK(tsdb_append(w, id, T0 + 2, 2.0f) == 0);
+            CHECK(tsdb_refresh(r) == 0);
+            CHECK(tsdb_query_points(r, id, T0, T0 + 3, &p) == 0);
+            CHECK(p.n == 3); /* the new writer's row, from its new segment */
+            tsdb_points_free(&p);
+            tsdb_close(w);
+        }
+        tsdb_close(r);
+    }
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    printf("  a restarted writer's MANIFEST with the version the follower has is still read\n");
+}
+
 /* A series the writer creates after the follower opened, with no rows yet (no MANIFEST change, no WAL row):
  * the follower finds it by name and by id, from SERIES alone. */
 static void test_rowless_series(const char *base)
@@ -597,6 +666,7 @@ int main(int argc, char **argv)
     test_typed_follow(argc > 1 ? argv[1] : "/tmp");
     test_torn_manifest(argc > 1 ? argv[1] : "/tmp");
     test_rowless_series(argc > 1 ? argv[1] : "/tmp");
+    test_writer_restart(argc > 1 ? argv[1] : "/tmp");
     test_class_follow(argc > 1 ? argv[1] : "/tmp");
     test_stale_manifest_classes(argc > 1 ? argv[1] : "/tmp");
     if (failures) {
