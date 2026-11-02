@@ -1,7 +1,7 @@
 # Continuous integration for tsdb. What runs where is described in CONTRIBUTING.md ("CI").
 #
 #   every push to main and every pull request: build-test, asan, tsan, clients, portable, integration, dco (pull requests)
-#   once a week and by hand (workflow_dispatch):  jepsen (about 10 minutes of fault injection)
+#   jepsen (about 10 minutes of fault injection) on every push and pull request too, and once a week
 #
 # Rules this file follows:
 #   - Jobs run directly on ubuntu-24.04 runners (4 CPUs, 16 GB), never in container jobs. Packages come from apt.
@@ -281,12 +281,12 @@ jobs:
 
   # ------------------------------------------------------------------------------------------------------ jepsen
   jepsen:
-    name: jepsen fault injection (weekly)
-    # Not on every push: about 10 minutes of kill -9, simulated power loss (the crashfs LD_PRELOAD shim, built by
-    # make), I/O errors and pauses, on both event loops and the workloads kv and classes.
+    name: jepsen fault injection
+    # On every push and pull request, and once a week: about 10 minutes of kill -9, simulated power loss (the crashfs
+    # LD_PRELOAD shim, built by make), I/O errors and pauses, on both event loops and the workloads kv and classes.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'schedule' && github.repository == 'IntelliStream-DataHub/intellistream-tsdb')
+      github.event_name != 'schedule' ||
+      github.repository == 'IntelliStream-DataHub/intellistream-tsdb'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:

@@ -84,10 +84,10 @@ Ubuntu 24.04 runners with 4 CPUs and 16 GB. These checks should be green before 
   no commit message or pull request text links to an AI session. It is the same check as the `commit-msg` hook,
   run by `.github/scripts/check-commits.sh BASE HEAD`, so you can try it on your branch.
 
-Once a week (Mondays) and by hand from the Actions tab ("Run workflow"), CI also runs `make jepsen`, the fault
-injection with kill -9, simulated power loss, disk errors and pauses (about 10 minutes). It does not run on every
-push; run it yourself for a change to how data reaches the disk. When a job fails, its logs are attached to the run
-as an artifact for two weeks.
+- **jepsen:** `make jepsen`, the fault injection with kill -9, simulated power loss, disk errors and pauses (about
+  10 minutes). It also runs once a week (Mondays), and by hand from the Actions tab ("Run workflow").
+
+When a job fails, its logs are attached to the run as an artifact for two weeks.
 
 CI does not run the AlmaLinux 10 container check (`make dist-check-almalinux10`, it needs Podman), the long fuzz
 runs, the benchmarks or the Podman-based Pulsar connector test. A test that passes here on a 32-thread machine can
