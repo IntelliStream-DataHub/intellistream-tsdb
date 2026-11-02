@@ -1313,6 +1313,9 @@ ch_merged() { # DIR BATCHES-OK: the table after OPTIMIZE FINAL ("parts merged", 
 p2_ch() {
     local D=$OUT/p2/ch${SWEEP_SUB-} W=$DBCMP/s2/ch r bok=0
     local QCTR=rb-ch QREADY=ch_ready  # a server that dies in a class is started again and the class run once more
+    # ClickHouse refusing a query by its own memory limit (max_server_memory_usage, 90% of the container's): "Code: 241
+    # ... memory limit exceeded" (32 clients of 100-window weekly TWA batches, 2026-11-02): a result, not a FAIL
+    local QREFUSE='Code: 241|memory limit exceeded'; export QREFUSE
     mkdir -p "$D"
     for r in $(seq "${LOADS_FROM:-1}" "$REPS"); do  # LOADS_FROM=$REPS: a rerun of later steps loads once (RESUME)
         crm rb-ch
