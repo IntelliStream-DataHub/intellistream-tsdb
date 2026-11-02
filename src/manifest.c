@@ -502,6 +502,13 @@ int follow_refresh(eng *db)
 
 int eng_refresh(eng *db) { return follow_refresh(db); }
 
+/* A follower's names: the series (and state names) the writer appended since, read only when the file grew. */
+int eng_series_reload(eng *db)
+{
+    int rc = series_reload(&db->series, db->dirfd);
+    return rc ? rc : series_reload(&db->states, db->dirfd);
+}
+
 void *follower_main(void *arg)
 {
     eng *db = arg;

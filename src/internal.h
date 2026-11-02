@@ -1512,6 +1512,7 @@ static inline int64_t eng_mono_ms(void)
 }
 int eng_foreach_part(eng *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 int eng_refresh(eng *db);
+int eng_series_reload(eng *db); /* followers: SERIES and STATES appended since, when they grew */
 /* retention.c */
 static inline uint8_t cls_byte(eng *db, uint32_t s)
 {

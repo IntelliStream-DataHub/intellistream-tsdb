@@ -464,6 +464,41 @@ static void test_torn_manifest(const char *base)
     printf("  a MANIFEST torn by a rewrite is read again at the next refresh\n");
 }
 
+/* A series the writer creates after the follower opened, with no rows yet (no MANIFEST change, no WAL row):
+ * the follower finds it by name and by id, from SERIES alone. */
+static void test_rowless_series(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-follow-rowless-%d", base, (int)getpid());
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *w, *r = NULL;
+    tsdb_sid first, late, late2, got = 0;
+    if (tsdb_open(dir, &o, &w) != 0) {
+        CHECK(!"open writer");
+        return;
+    }
+    CHECK(tsdb_series(w, "first", &first) == 0 && tsdb_append(w, first, T0, 1.0f) == 0 && tsdb_flush(w) == 0);
+    tsdb_options ro;
+    tsdb_options_init(&ro);
+    ro.read_only = 1; /* no polling thread */
+    CHECK(tsdb_open(dir, &ro, &r) == 0);
+    if (r) {
+        CHECK(tsdb_series(w, "late", &late) == 0 && tsdb_series(w, "late2", &late2) == 0);
+        CHECK(tsdb_series_lookup(r, "late", &got) == 0 && got == late); /* by name */
+        const char *name = tsdb_series_name(r, late2);                   /* by id */
+        CHECK(name && strcmp(name, "late2") == 0);
+        CHECK(tsdb_series_lookup(r, "never", &got) == TSDB_ERR_NOTFOUND);
+        tsdb_close(r);
+    }
+    tsdb_close(w);
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    printf("  a series created after the follower opened, with no rows, is found by name and by id\n");
+}
+
 int main(int argc, char **argv)
 {
     char dir[512];
@@ -561,6 +596,7 @@ int main(int argc, char **argv)
         return 1;
     test_typed_follow(argc > 1 ? argv[1] : "/tmp");
     test_torn_manifest(argc > 1 ? argv[1] : "/tmp");
+    test_rowless_series(argc > 1 ? argv[1] : "/tmp");
     test_class_follow(argc > 1 ? argv[1] : "/tmp");
     test_stale_manifest_classes(argc > 1 ? argv[1] : "/tmp");
     if (failures) {

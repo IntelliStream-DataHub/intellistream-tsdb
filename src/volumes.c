@@ -63,7 +63,7 @@ struct tsdb {
     char **paths; /* canonical, [0] is the root */
     size_t nvols, vols_cap;
     pthread_mutex_t create_lock; /* one series or volume creation at a time */
-    off_t vols_seen;             /* the size of VOLUMES when a writer last read it (create_lock) */
+    off_t vols_seen;             /* the size of VOLUMES when last read (a writer: create_lock; a follower: lock) */
     int vols_rc;                 /* and what that read gave: damage is reported once per change, not per request */
     sched *sched;                /* the query helpers of every volume */
 };
@@ -841,8 +841,28 @@ static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
     return ok;
 }
 
+/* The engine of volume v, NULL beyond the volumes (followers: after reading VOLUMES again when it changed). */
+static eng *volume_at(tsdb *t, size_t v, bool reload)
+{
+    struct stat st;
+    bool grown = reload && fstatat(t->dirfd, VOLUMES_FILE, &st, 0) == 0;
+    pthread_rwlock_rdlock(&t->lock);
+    eng *e = v < t->nvols ? t->vols[v] : NULL;
+    grown = grown && st.st_size != t->vols_seen;
+    pthread_rwlock_unlock(&t->lock);
+    if (!e && grown) {
+        pthread_rwlock_wrlock(&t->lock);
+        if (load_layout(t) == 0)
+            t->vols_seen = st.st_size;
+        e = v < t->nvols ? t->vols[v] : NULL;
+        pthread_rwlock_unlock(&t->lock);
+    }
+    return e;
+}
+
 /* Routes an id: its volume and local id, by its bits. A follower may be asked about a series or a volume its
- * writer created a moment ago: it reads VOLUMES or that volume's SERIES again, once. */
+ * writer created a moment ago, with no rows yet (nothing in MANIFEST or the WAL names it): it reads VOLUMES or
+ * that volume's SERIES again when the file grew, and then the volume's parts, which may hold the series' rows. */
 static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
 {
     if (route_now(t, id, e, local))
@@ -850,25 +870,23 @@ static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
     int64_t v = sid_volume(id);
     if (!t->opt.read_only || v < 0)
         return false;
-    pthread_rwlock_wrlock(&t->lock);
-    if ((size_t)v >= t->nvols)
-        load_layout(t);
-    if ((size_t)v < t->nvols)
-        eng_refresh(t->vols[v]);
-    pthread_rwlock_unlock(&t->lock);
-    return route_now(t, id, e, local);
+    eng *ve = volume_at(t, (size_t)v, true);
+    if (!ve || eng_series_reload(ve) != 0 || !route_now(t, id, e, local))
+        return false;
+    eng_refresh(ve);
+    return true;
 }
 
-/* A follower asked for a name its writer may have created a moment ago. */
+/* A follower asked for a name its writer may have created a moment ago: SERIES of every volume, each read only
+ * when it grew, without the write lock on the volume list. */
 static void catch_up(tsdb *t)
 {
     if (!t->opt.read_only)
         return;
-    pthread_rwlock_wrlock(&t->lock);
-    load_layout(t);
-    for (size_t v = 0; v < t->nvols; v++)
-        eng_refresh(t->vols[v]);
-    pthread_rwlock_unlock(&t->lock);
+    volume_at(t, SIZE_MAX, true);
+    eng *e;
+    for (size_t v = 0; (e = volume_at(t, v, false)) != NULL; v++)
+        eng_series_reload(e);
 }
 
 /* Finds name in the volumes' own dictionaries, volume `first` before the others (names are unique in the whole
