@@ -8,6 +8,16 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Added
+- Inserts and memtable flushes write their parts without zstd (`tsdb_options.insert_zstd_level`, default 0;
+  tsdbd `--insert-zstd-level`): background merges re-encode every such part at `zstd_level` anyway, with others
+  or alone once its partition is idle, so the parts at rest are the same bytes, and only parts not merged yet
+  are larger (1.68 instead of 1.12 bytes per row for a CPU temperature). Where nothing merges
+  (`merge_idle_s = -1`, `merge_threads = 0`) parts stay as inserted. `-1` writes inserts at `zstd_level` as
+  before. In the Rust, Python and Java embedded bindings (`insert_zstd_level`, `insertZstdLevel`);
+  `tsdb-bench --insert-zstd N --merge-threads N --fresh`, `insert-bench` and `scale-bench load --insert-zstd N`.
+  `TSDB_ABI_VERSION` is 3: `insert_zstd_level` follows `pin_index` and grows `tsdb_options` by 8 bytes.
+
 ## [0.9.0] - 2026-11-04
 
 The first release. **Disk format version 8, wire protocol version 11** (the server and the clients refuse a peer

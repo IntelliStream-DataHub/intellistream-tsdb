@@ -302,7 +302,8 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     w->grows = db->granule_rows;
     int64_t cut = db->partition_ms * GRANULE_CUT; /* cls_len is partition_ms for every class without classes */
     w->cut_ms = db->cls_len[partition_class(db, partition)] > cut ? cut : 0;
-    w->zstd_level = db->opt.zstd_level;
+    /* inserts and flushes (CODEC_FAST) may skip zstd: a merge re-encodes every part no merge wrote (merge.c) */
+    w->zstd_level = db->opt.insert_zstd_level < 0 ? db->opt.zstd_level : db->opt.insert_zstd_level;
     w->value_codec = db->opt.value_codec;
     w->min_ts = INT64_MAX;
     w->max_ts = INT64_MIN;

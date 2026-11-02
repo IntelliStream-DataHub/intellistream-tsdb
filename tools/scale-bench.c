@@ -2,7 +2,7 @@
  * Benchmark at scale: load a large data set, then run a fixed query suite, in
  * tsdb and, through the SQL it writes, in ClickHouse.
  *
- *   scale-bench load   --dir D [--series 10000] [--points 10000000] [--threads 8]
+ *   scale-bench load   --dir D [--series 10000] [--points 10000000] [--threads 8] [--insert-zstd LEVEL]
  *   scale-bench export [--series ...] [--from S0] [--to S1] > rows.rowbinary
  *   scale-bench query  --dir D | --port P  [--series ...] [--threads 32] [--sql DIR] [--only NAME]
  *
@@ -31,6 +31,7 @@
 #include "tsdb_calendar.h"
 
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -115,10 +116,14 @@ static void *load_worker(void *arg)
     return NULL;
 }
 
+static int insert_zstd = INT_MIN; /* load --insert-zstd: tsdb_options.insert_zstd_level; INT_MIN the default */
+
 static int cmd_load(void)
 {
     tsdb_options o;
     tsdb_options_init(&o);
+    if (insert_zstd != INT_MIN)
+        o.insert_zstd_level = insert_zstd;
     tsdb *db;
     int rc = tsdb_open(dir, &o, &db);
     if (rc) {
@@ -469,7 +474,7 @@ int main(int argc, char **argv)
         {"from", required_argument, 0, 'f'},   {"to", required_argument, 0, 'T'},
         {"host", required_argument, 0, 'h'},   {"port", required_argument, 0, 'P'},
         {"sql", required_argument, 0, 'S'},    {"only", required_argument, 0, 'o'},
-        {0, 0, 0, 0}};
+        {"insert-zstd", required_argument, 0, 'z'}, {0, 0, 0, 0}};
     int ch;
     optind = 2;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -486,6 +491,7 @@ int main(int argc, char **argv)
         case 'P': port = atoi(optarg); break;
         case 'S': sql_dir = optarg; break;
         case 'o': only = optarg; break;
+        case 'z': insert_zstd = atoi(optarg); break;
         default: return 2;
         }
     }

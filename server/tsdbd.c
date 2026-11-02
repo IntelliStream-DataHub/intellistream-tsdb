@@ -2449,6 +2449,7 @@ int main(int argc, char **argv)
                                    {"partition-classes", required_argument, 0, 'K'},
                                    {"granule-rows", required_argument, 0, 'g'},
                                    {"merge-idle-s", required_argument, 0, 'G'},
+                                   {"insert-zstd-level", required_argument, 0, 'Z'},
                                    {"flush-interval-ms", required_argument, 0, 'H'},
                                    {"send-timeout", required_argument, 0, 'T'},
                                    {"io", required_argument, 0, 'I'},
@@ -2507,6 +2508,7 @@ int main(int argc, char **argv)
             o.granule_rows = (uint32_t)num_arg("granule-rows", optarg, 1, 1 << 20);
             break;
         case 'G': o.merge_idle_s = (int)num_arg("merge-idle-s", optarg, -1, 86400 * 365); break;
+        case 'Z': o.insert_zstd_level = (int)num_arg("insert-zstd-level", optarg, -1, 22); break;
         case 'H': o.flush_interval_ms = (int)num_arg("flush-interval-ms", optarg, 1, 86400000); break;
         case 'T': send_timeout_s = (int)num_arg("send-timeout", optarg, 1, 86400); break;
         case 'q': o.query_threads = (int)num_arg("query-threads", optarg, 1, 4096); break;
@@ -2539,7 +2541,7 @@ int main(int argc, char **argv)
                         "             [--metrics-port N|auto [--metrics-bind ADDR]]\n"
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
                         "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"
-                        "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000]\n",
+                        "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }

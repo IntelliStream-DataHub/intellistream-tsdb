@@ -24,6 +24,7 @@ public final class EmbeddedOptions {
     private boolean partitionClasses;
     private int granuleRows;
     private int zstdLevel;
+    private int insertZstdLevel;
     private int valueCodec;
     private boolean fsync;
     private int mergeThreads;
@@ -61,6 +62,7 @@ public final class EmbeddedOptions {
             partitionClasses = o.get(JAVA_INT, offset(OPTIONS, "partition_classes")) != 0;
             granuleRows = o.get(JAVA_INT, offset(OPTIONS, "granule_rows"));
             zstdLevel = o.get(JAVA_INT, offset(OPTIONS, "zstd_level"));
+            insertZstdLevel = o.get(JAVA_INT, offset(OPTIONS, "insert_zstd_level"));
             valueCodec = o.get(JAVA_INT, offset(OPTIONS, "value_codec"));
             fsync = o.get(JAVA_INT, offset(OPTIONS, "fsync")) != 0;
             mergeThreads = o.get(JAVA_INT, offset(OPTIONS, "merge_threads"));
@@ -90,6 +92,7 @@ public final class EmbeddedOptions {
         o.set(JAVA_INT, offset(OPTIONS, "partition_classes"), partitionClasses ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "granule_rows"), granuleRows);
         o.set(JAVA_INT, offset(OPTIONS, "zstd_level"), zstdLevel);
+        o.set(JAVA_INT, offset(OPTIONS, "insert_zstd_level"), insertZstdLevel);
         o.set(JAVA_INT, offset(OPTIONS, "value_codec"), valueCodec);
         o.set(JAVA_INT, offset(OPTIONS, "fsync"), fsync ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "merge_threads"), mergeThreads);
@@ -148,13 +151,25 @@ public final class EmbeddedOptions {
     }
 
     /**
-     * zstd level for parts.
+     * zstd level for the parts merges write.
      *
      * @param level default 1; 0 disables zstd
      * @return this
      */
     public EmbeddedOptions zstdLevel(int level) {
         zstdLevel = level;
+        return this;
+    }
+
+    /**
+     * zstd level for the parts inserts and memtable flushes write; background merges re-encode them at
+     * {@link #zstdLevel(int)}.
+     *
+     * @param level default 0: none (faster to write, larger until merged); -1: the merges' level
+     * @return this
+     */
+    public EmbeddedOptions insertZstdLevel(int level) {
+        insertZstdLevel = level;
         return this;
     }
 
@@ -397,7 +412,7 @@ public final class EmbeddedOptions {
     @Override
     public String toString() {
         return "EmbeddedOptions[partitionMs=" + partitionMs + ", granuleRows=" + granuleRows + ", zstdLevel="
-                + zstdLevel + ", valueCodec=" + valueCodec + ", fsync=" + fsync + ", mergeThreads=" + mergeThreads
+                + zstdLevel + ", insertZstdLevel=" + insertZstdLevel + ", valueCodec=" + valueCodec + ", fsync=" + fsync + ", mergeThreads=" + mergeThreads
                 + ", queryThreads=" + queryThreads + ", requestThreads=" + requestThreads + ", bufferRows=" + bufferRows + ", flushIntervalMs="
                 + flushIntervalMs + ", walSyncMs=" + walSyncMs + ", walMaxBatchRows=" + walMaxBatchRows
                 + ", maxPartBytes=" + maxPartBytes + ", readOnly=" + readOnly + ", follow=" + follow + ", refreshMs="
