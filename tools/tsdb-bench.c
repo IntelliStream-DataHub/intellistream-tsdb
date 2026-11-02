@@ -559,13 +559,17 @@ int main(int argc, char **argv)
     if (c.export_path) {
         /* one thread, so the file is time-major across all series */
         FILE *f = fopen(c.export_path, "wb");
-        if (!f)
-            return 1;
-        jobs[0] = (wjob){&c, NULL, f, 0, c.series, 0};
-        writer(&jobs[0]);
-        fclose(f);
-        printf("exported %" PRIu64 " rows to %s\n", jobs[0].rows, c.export_path);
-        return 0;
+        int rc = 1;
+        if (f) {
+            jobs[0] = (wjob){&c, NULL, f, 0, c.series, 0};
+            writer(&jobs[0]);
+            fclose(f);
+            printf("exported %" PRIu64 " rows to %s\n", jobs[0].rows, c.export_path);
+            rc = 0;
+        }
+        free(jobs);
+        free(th);
+        return rc;
     }
 
     char cmd[1024];
