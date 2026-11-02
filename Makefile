@@ -365,7 +365,8 @@ integration-tests: $(B)/tsdbd $(B)/tsdb $(INTEG)/itc integ-rust integ-python int
 	python3 tests/integration/run.py --bin-dir $(B) $(INTEG_ARGS)
 
 # The harness's own tests (seconds): a broken io_uring backend fails the run, signals, mutate.py's verdicts.
-integration-selftest: $(B)/tsdbd $(B)/tsdb
+# run.py refuses to start without every client program (rc 2), so the selftest builds them as integration-tests does.
+integration-selftest: $(B)/tsdbd $(B)/tsdb $(INTEG)/itc integ-rust integ-python integ-java
 	python3 tests/integration/selftest.py
 
 # The same against the binaries of `make dist`: its tsdbd and tsdb, and the C client linked with its libtsdbclient.a.
