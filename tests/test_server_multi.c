@@ -233,8 +233,8 @@ static int raw_connect(void)
     return fd;
 }
 
-/* tsdb_request_errors_total{code="invalid"} from the metrics port, -1 if the scrape fails */
-static long invalid_errors(void)
+/* The metrics page, NULL if the scrape fails */
+static const char *scrape(void)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)th_mport)};
@@ -242,14 +242,14 @@ static long invalid_errors(void)
     if (fd < 0 || th_mport <= 0 || connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
         if (fd >= 0)
             close(fd);
-        return -1;
+        return NULL;
     }
     struct timeval tv = {5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     static const char req[] = "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n";
     if (send(fd, req, sizeof req - 1, MSG_NOSIGNAL) != (ssize_t)(sizeof req - 1)) {
         close(fd);
-        return -1;
+        return NULL;
     }
     static char buf[1 << 20];
     size_t got = 0;
@@ -258,8 +258,46 @@ static long invalid_errors(void)
         got += (size_t)r;
     buf[got] = '\0';
     close(fd);
-    const char *key = "tsdb_request_errors_total{code=\"invalid\"} ", *at = strstr(buf, key);
+    return buf;
+}
+
+/* tsdb_request_errors_total{code="invalid"} from the metrics port, -1 if the scrape fails */
+static long invalid_errors(void)
+{
+    const char *buf = scrape(), *key = "tsdb_request_errors_total{code=\"invalid\"} ";
+    const char *at = buf ? strstr(buf, key) : NULL;
     return at ? atol(at + strlen(key)) : -1;
+}
+
+/* The sum of a per-volume gauge over its samples, -1 if the scrape fails */
+static long gauge_sum(const char *name)
+{
+    const char *buf = scrape();
+    if (!buf)
+        return -1;
+    long sum = 0;
+    size_t len = strlen(name);
+    for (const char *l = buf; l && *l; l = strchr(l, '\n'), l = l ? l + 1 : NULL)
+        if (strncmp(l, name, len) == 0 && (l[len] == '{' || l[len] == ' ')) {
+            const char *v = strchr(l, ' ');
+            sum += v ? atol(v + 1) : 0;
+        }
+    return sum;
+}
+
+/* Waits (up to 30 s) until the server is idle: no merge running and the memtables neither filling nor being
+ * flushed, over three scrapes 200 ms apart. A merge or flush still going from earlier steps would otherwise
+ * count its buffers in the peak of the next measurement (VmHWM is process wide). */
+static void wait_idle(void)
+{
+    long last = -2;
+    int calm = 0;
+    for (int i = 0; i < 150 && calm < 3; i++) {
+        long merging = gauge_sum("tsdb_merging_parts"), mem = gauge_sum("tsdb_memtable_rows");
+        calm = merging == 0 && mem == last ? calm + 1 : 0;
+        last = mem;
+        usleep(200000);
+    }
 }
 
 static void raw_send(int fd, uint32_t id, uint8_t op, const void *p, size_t len)
@@ -725,6 +763,7 @@ static void test_stall_buckets(pid_t pid)
         memcpy(t + 8, &start, 8);
         memcpy(t + 16, &end, 8);
         memcpy(t + 24, &iv, 8);
+        wait_idle();
         usleep(300000); /* what the previous step freed is gone */
         long before = status_kb(pid, "RssAnon");
         bool hwm = reset_hwm(pid);
@@ -736,9 +775,9 @@ static void test_stall_buckets(pid_t pid)
             raw_send(fd, 11, TSDB_OP_QUERY_BUCKETS, t, 48);
         usleep(2000000);
         long grown = status_kb(pid, "RssAnon") - before, peak = hwm ? status_kb(pid, "VmHWM") - hwm0 : -1;
-        fprintf(stderr, "stalled reader, a full frame of buckets (%s): server anonymous memory grew %ld KiB, "
-                        "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS", grown,
-                peak, result_kb);
+        fprintf(stderr, "stalled reader, a full frame of buckets (%s, io %s): server anonymous memory grew %ld KiB, "
+                        "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS",
+                getenv("TSDBD_IO") ? getenv("TSDBD_IO") : "default", grown, peak, result_kb);
         CHECK(SANITIZED || grown <= result_kb + 48 * 1024L);
         CHECK(SANITIZED || !hwm || peak <= result_kb + 64 * 1024L);
         close(fd);
