@@ -1928,7 +1928,7 @@ phase6() {
         cleanup_all
         [ -e "$d/how.json" ] || how_write 2 "$s"   # a system phase 2 has not run: tables.py needs how it ran
         how_p6 "$d" "$reps"
-        runstats "$d/p6"
+        [ -d "$d/p6" ] && runstats "$d/p6"   # none for a system with no TWA query (VictoriaMetrics: dash.txt says why)
         [ "$ok" = 1 ] && date > "$OUT/p6/$s.done"
         log "p6 $s end"
     done
