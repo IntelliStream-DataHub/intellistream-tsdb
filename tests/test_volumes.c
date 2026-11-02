@@ -3,13 +3,16 @@
 #include "tsdb.h"
 #include "tsdb_calendar.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <limits.h>
 #include <unistd.h>
@@ -1012,6 +1015,330 @@ static void test_hung_reload(const char *base)
     printf("  a follower's read of SERIES holds up no lookup of a known name\n");
 }
 
+/* Threads of this process in an open system call now (here: waiting for a FIFO's writer); -1: /proc does not say. */
+static int threads_in_open(void)
+{
+    DIR *d = opendir("/proc/self/task");
+    if (!d)
+        return -1;
+    int n = 0, seen = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.')
+            continue;
+        char p[300], buf[64];
+        snprintf(p, sizeof p, "/proc/self/task/%s/syscall", de->d_name);
+        int fd = open(p, O_RDONLY | O_CLOEXEC);
+        ssize_t r = fd < 0 ? -1 : read(fd, buf, sizeof buf - 1);
+        if (fd >= 0)
+            close(fd);
+        if (r <= 0)
+            continue;
+        buf[r] = '\0';
+        seen++;
+        long nr = strtol(buf, NULL, 10);
+        bool in_open = buf[0] >= '0' && buf[0] <= '9' && nr == SYS_openat;
+#ifdef SYS_open
+        in_open = in_open || (buf[0] >= '0' && buf[0] <= '9' && nr == SYS_open);
+#endif
+        n += in_open;
+    }
+    closedir(d);
+    return seen ? n : -1;
+}
+
+/* The fewest over a few looks: another thread may pass through an open. */
+static int threads_in_open_min(void)
+{
+    int m = -1;
+    for (int i = 0; i < 5; i++) {
+        int c = threads_in_open();
+        if (c >= 0 && (m < 0 || c < m))
+            m = c;
+        usleep(20000);
+    }
+    return m;
+}
+
+#define HERD 8
+
+/* A follower's threads that want a volume its writer just added, on a file system that hangs (here the volume's
+ * META is a FIFO nobody writes): one opens it, and the others wait for that open rather than each run an open of
+ * their own. A lookup of a name the writer just created in a volume the follower has open completes meanwhile. */
+static void test_follower_hung_new_volume(const char *base)
+{
+    char top[600], root[700], v1[800], meta[900], fifo[900], good[900], saved[4096];
+    fresh(base, "volfnew", top, sizeof top, root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    snprintf(meta, sizeof meta, "%s/META", v1);
+    snprintf(fifo, sizeof fifo, "%s/fifo", top); /* a second name: the FIFO is answered after META is fixed */
+    snprintf(good, sizeof good, "%s/META.good", v1);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *w = NULL, *f = NULL;
+    OK(tsdb_open(root, &o, &w));
+    tsdb_sid before, x, fr, fb = 0;
+    OK(tsdb_series(w, "before", &before));
+    tsdb_options ro = o;
+    ro.read_only = 1;
+    OK(tsdb_open(root, &ro, &f));
+    OK(tsdb_series_lookup(f, "before", &fb));
+    CHECK(fb == before);
+    uint32_t idx = 0;
+    OK(tsdb_volume_add(w, v1, &idx));
+    CHECK(idx == 1);
+    OK(tsdb_series_at(w, "x", v1, &x));
+    ssize_t n = -1;
+    int fd = open(meta, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        n = read(fd, saved, sizeof saved);
+        close(fd);
+    }
+    CHECK(n > 0);
+    CHECK(unlink(meta) == 0 && mkfifo(meta, 0644) == 0 && link(meta, fifo) == 0);
+    looker herd[HERD];
+    pthread_t th[HERD];
+    for (int i = 0; i < HERD; i++)
+        herd[i] = (looker){.db = f, .name = "x", .rc = 1};
+    CHECK(pthread_create(&th[0], NULL, lookup_thread, &herd[0]) == 0);
+    int in_open = -1;
+    for (int i = 0; i < 300 && in_open != 1; i++) /* the first opener reaches the FIFO */
+        if ((in_open = threads_in_open()) != 1)
+            usleep(10000);
+    CHECK(!__atomic_load_n(&herd[0].done, __ATOMIC_ACQUIRE)); /* opening v1: its META does not answer */
+    OK(tsdb_series(w, "fresh", &fr)); /* in volume 0, after the follower read its SERIES */
+    looker lf = {.db = f, .name = "fresh", .rc = 1};
+    pthread_t tf;
+    CHECK(pthread_create(&tf, NULL, lookup_thread, &lf) == 0);
+    for (int i = 1; i < HERD; i++)
+        CHECK(pthread_create(&th[i], NULL, lookup_thread, &herd[i]) == 0);
+    bool f_done = false;
+    for (int i = 0; i < 300 && !(f_done = __atomic_load_n(&lf.done, __ATOMIC_ACQUIRE)); i++)
+        usleep(10000);
+    if (!f_done)
+        fprintf(stderr, "  a follower's open of a hung new volume hides a name new in a volume it has open\n");
+    CHECK(f_done);
+    usleep(200000); /* the others: waiting for the opener, or each in an open of its own */
+    if (in_open == 1) {
+        int opening = threads_in_open_min();
+        if (opening != 1)
+            fprintf(stderr, "  %d threads of a follower open one new volume at once\n", opening);
+        CHECK(opening == 1);
+    } else {
+        printf("  (/proc/self/task/*/syscall says nothing here: the opens are not counted)\n");
+    }
+    fd = open(good, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    CHECK(fd >= 0 && n > 0 && write(fd, saved, (size_t)n) == n);
+    if (fd >= 0)
+        close(fd);
+    CHECK(rename(good, meta) == 0); /* what the next opener reads */
+    int wfd = -1;
+    for (int i = 0; i < 500 && wfd < 0; i++)
+        if ((wfd = open(fifo, O_WRONLY | O_NONBLOCK | O_CLOEXEC)) < 0)
+            usleep(10000);
+    CHECK(wfd >= 0);
+    if (wfd >= 0)
+        close(wfd); /* nothing written: that open fails, and one of those waiting opens v1 */
+    for (int i = 0; i < HERD; i++)
+        pthread_join(th[i], NULL);
+    pthread_join(tf, NULL);
+    CHECK(lf.rc == 0 && lf.id == fr);
+    int found = 0;
+    for (int i = 1; i < HERD; i++)
+        found += herd[i].rc == 0 && herd[i].id == x;
+    if (found != HERD - 1)
+        fprintf(stderr, "  %d of the %d lookups that waited for a new volume found the name\n", found, HERD - 1);
+    CHECK(found == HERD - 1);
+    tsdb_sid sx = 0;
+    OK(tsdb_series_lookup(f, "x", &sx));
+    CHECK(sx == x);
+    CHECK(tsdb_volume_count(f) == 2 && tsdb_volume_count(w) == 2);
+    CHECK(tsdb_volume_count(f) == 2 && strcmp(tsdb_volume_path(f, 1), tsdb_volume_path(w, 1)) == 0);
+    unlink(fifo);
+    OK(tsdb_close(f));
+    OK(tsdb_close(w));
+    remove_tree(top);
+    printf("  a follower opens a new volume on a hung file system once, and it hides no name in the others\n");
+}
+
+/* A follower's threads racing for volumes its writer adds one at a time: half look the new name up, half query the
+ * id (route). Every one gets the right series, and the follower lists each volume once, in the writer's order. */
+#define RACERS 16
+#define RACE_ROUNDS 6
+static tsdb *race_f;
+static char race_names[RACE_ROUNDS][64];
+static tsdb_sid race_want[RACE_ROUNDS];
+static atomic_int race_round, race_failures, race_done;
+
+static void *racer(void *arg)
+{
+    long me = (long)arg;
+    for (int r = 0; r < RACE_ROUNDS; r++) {
+        while (atomic_load(&race_round) < r)
+            usleep(100);
+        int rc = TSDB_ERR_NOTFOUND;
+        if (me & 1) {
+            tsdb_points p = {0};
+            for (int k = 0; k < 500 && (rc || p.n == 0); k++) {
+                tsdb_points_free(&p);
+                if ((rc = tsdb_query_points(race_f, race_want[r], INT64_MIN, INT64_MAX, &p)) != 0 || !p.n)
+                    usleep(2000);
+            }
+            if (rc || p.n != 1 || p.values[0] != (float)r) {
+                fprintf(stderr, "  racer %ld, volume %d: query rc %d, %zu rows\n", me, r + 1, rc, p.n);
+                atomic_fetch_add(&race_failures, 1);
+            }
+            tsdb_points_free(&p);
+        } else {
+            tsdb_sid id = 0;
+            for (int k = 0; k < 500 && rc; k++)
+                if ((rc = tsdb_series_lookup(race_f, race_names[r], &id)) != 0)
+                    usleep(2000);
+            if (rc || id != race_want[r]) {
+                fprintf(stderr, "  racer %ld, volume %d: lookup rc %d, id %llx, want %llx\n", me, r + 1, rc,
+                        (unsigned long long)id, (unsigned long long)race_want[r]);
+                atomic_fetch_add(&race_failures, 1);
+            }
+        }
+        atomic_fetch_add(&race_done, 1);
+    }
+    return NULL;
+}
+
+static void test_follower_open_race(const char *base)
+{
+    char top[600], root[700];
+    fresh(base, "volrace", top, sizeof top, root, sizeof root);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *w = NULL;
+    OK(tsdb_open(root, &o, &w));
+    tsdb_options fo = o;
+    fo.follow = 1;
+    fo.refresh_ms = 5;
+    race_f = NULL;
+    OK(tsdb_open(root, &fo, &race_f));
+    if (!w || !race_f) {
+        tsdb_close(race_f);
+        tsdb_close(w);
+        return;
+    }
+    atomic_store(&race_round, -1);
+    atomic_store(&race_failures, 0);
+    atomic_store(&race_done, 0);
+    pthread_t th[RACERS];
+    int started = 0;
+    for (long i = 0; i < RACERS; i++)
+        if (pthread_create(&th[started], NULL, racer, (void *)i) == 0)
+            started++;
+    CHECK(started == RACERS);
+    for (int r = 0; r < RACE_ROUNDS; r++) {
+        char v[800];
+        snprintf(v, sizeof v, "%s/vol%d", top, r);
+        uint32_t idx = 0;
+        OK(tsdb_volume_add(w, v, &idx));
+        CHECK(idx == (uint32_t)r + 1);
+        snprintf(race_names[r], sizeof race_names[r], "race.%d", r);
+        OK(tsdb_series_at(w, race_names[r], v, &race_want[r]));
+        CHECK(TSDB_SID_VOLUME(race_want[r]) == (uint32_t)r + 1);
+        int64_t ts = 1000;
+        float val = (float)r;
+        OK(tsdb_insert_series(w, race_want[r], &ts, &val, 1));
+        OK(tsdb_flush(w));
+        atomic_store(&race_round, r); /* every racer takes this volume on at once */
+        while (atomic_load(&race_done) < started * (r + 1))
+            usleep(1000);
+    }
+    for (int i = 0; i < started; i++)
+        pthread_join(th[i], NULL);
+    CHECK(atomic_load(&race_failures) == 0);
+    uint32_t nf = tsdb_volume_count(race_f), nw = tsdb_volume_count(w);
+    if (nf != nw)
+        fprintf(stderr, "  the follower lists %u volumes, the writer %u\n", nf, nw);
+    CHECK(nf == nw && nw == RACE_ROUNDS + 1);
+    for (uint32_t i = 0; i < nf && i < nw; i++)
+        CHECK(strcmp(tsdb_volume_path(race_f, i), tsdb_volume_path(w, i)) == 0);
+    for (int r = 0; r < RACE_ROUNDS; r++) {
+        const char *name = tsdb_series_name(race_f, race_want[r]);
+        CHECK(name && strcmp(name, race_names[r]) == 0);
+    }
+    OK(tsdb_close(race_f));
+    OK(tsdb_close(w));
+    remove_tree(top);
+    printf("  a follower's threads racing for new volumes open each once, in order, with the right series\n");
+}
+
+/* A volume's META that names another number for a moment (an add of the same directory under another path writes
+ * its number there and puts it back, volume_add) fails the requests that come meanwhile, not every later one until
+ * VOLUMES changes: the writer reads that META again before it answers with the damage it found. */
+static void test_meta_passing_mismatch(const char *base)
+{
+    char top[600], root[700], v1[800];
+    fresh(base, "volmeta", top, sizeof top, root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.create_volumes = 0;
+    tsdb *db = NULL;
+    OK(tsdb_open(root, &o, &db));
+    uint32_t idx = 0;
+    OK(tsdb_volume_add_dir(root, v1, &idx)); /* as tsdb-cli does, beside the running writer */
+    CHECK(idx == 1);
+    meta_with_volume(v1, v1, 5); /* what the other add writes */
+    tsdb_sid s = 0;
+    CHECK(tsdb_series_at(db, "x", v1, &s) == TSDB_ERR_CORRUPT);
+    CHECK(tsdb_series_at(db, "x", v1, &s) == TSDB_ERR_CORRUPT); /* still another number: still damage */
+    meta_with_volume(v1, v1, 1);                                  /* put back */
+    int rc = tsdb_series_at(db, "x", v1, &s);
+    if (rc)
+        fprintf(stderr, "  a META that named another number for a moment refuses its volume until VOLUMES changes\n");
+    CHECK(rc == 0 && s == TSDB_SID(1, 0) && tsdb_volume_count(db) == 2);
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  a META that names another number for a moment does not refuse its volume for good\n");
+}
+
+static int fail_add_of_b(void *arg, int point, const char *name)
+{
+    (void)arg;
+    return point == 1 && strcmp(name, "b") == 0; /* DICT_AT_ADD: as if memory ran out */
+}
+
+/* A follower routing an id it does not know reads SERIES again. A record after the id's that cannot be added (here
+ * no memory) is for the refresh to report: it does not hide the id, which was loaded before it. */
+static void test_route_past_failed_record(const char *base)
+{
+    char top[600], root[700];
+    fresh(base, "volroute", top, sizeof top, root, sizeof root);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *w = NULL, *f = NULL;
+    OK(tsdb_open(root, &o, &w));
+    tsdb_options ro = o;
+    ro.read_only = 1;
+    OK(tsdb_open(root, &ro, &f));
+    tsdb_sid a = 0, b = 0;
+    OK(tsdb_series(w, "a", &a));
+    OK(tsdb_series(w, "b", &b));
+    tsdb_test_dict_fault(f, fail_add_of_b, NULL);
+    tsdb_type ty;
+    int rc = tsdb_series_type(f, a, &ty);
+    if (rc)
+        fprintf(stderr, "  a record that failed after an id's hides the id from a follower\n");
+    CHECK(rc == 0);
+    CHECK(tsdb_series_type(f, b, &ty) != 0); /* not loaded */
+    tsdb_test_dict_fault(f, NULL, NULL);
+    OK(tsdb_series_type(f, b, &ty));
+    OK(tsdb_close(f));
+    OK(tsdb_close(w));
+    remove_tree(top);
+    printf("  a follower routes an id loaded before a record that failed\n");
+}
+
 /* A follower asked about a series its writer created a moment ago reads SERIES again. STATES (state names) has
  * nothing to do with it: a STATES that cannot be read (here a directory took its name) must not hide the series. */
 static void test_reload_states_fails(const char *base)
@@ -1810,6 +2137,10 @@ int main(int argc, char **argv)
     test_volumes_same_size(base);
     test_hung_reload(base);
     test_hung_new_volume(base);
+    test_follower_hung_new_volume(base);
+    test_follower_open_race(base);
+    test_meta_passing_mismatch(base);
+    test_route_past_failed_record(base);
     test_reload_states_fails(base);
     test_add_power_loss(base, argv[0]);
     test_series_ids(base);

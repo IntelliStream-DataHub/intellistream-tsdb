@@ -86,8 +86,16 @@ struct tsdb {
     char **paths; /* canonical, [0] is the root */
     size_t nvols, vols_cap;
     pthread_mutex_t create_lock; /* one volume add or resolve at a time */
-    vols_stamp vols_seen;        /* VOLUMES when last read (a writer: create_lock; a follower: lock) */
+    /* A follower's opens of new volumes, one thread at a time (volume_at): the others wait for it and find the
+     * volume listed, rather than each run a full open of it. Lookups and routes to open volumes never take it. */
+    pthread_mutex_t layout_lock;
+    vols_stamp vols_seen;        /* VOLUMES when last read (a writer: create_lock; a follower: layout_lock + lock) */
     int vols_rc;                 /* and what that read gave: damage is reported once per change, not per request */
+    /* When vols_rc is a volume's META naming another number (a writer; create_lock): that line, read again before
+     * vols_rc is given out. An add of the same directory under another path writes its number there for a moment
+     * (volume_add puts it back), and such a passing CORRUPT must not refuse the volume until VOLUMES changes. */
+    char *meta_bad_path;
+    uint32_t meta_bad_index;
     sched *sched;                /* the query helpers of every volume */
     /* The names being created now: a creation holds its name from the probe of every volume to its append, so
      * two creators of one name take turns and those of different names do not wait for each other's disks. */
@@ -665,10 +673,13 @@ static int vols_grow(tsdb *t)
 /* Opens volume `index` (line `index` of VOLUMES) at `path` (canonical, with our ROOT_ID) and lists it. Called
  * without t->lock: the open reads the volume's files, and a volume on a file system that hangs must not hold up
  * the lookups and creations in the volumes already open, which take the lock for reading. Callers open in line
- * order. Two that open one volume at once (a follower's threads) both open it; the first to list it wins, and the
- * other closes its copy. */
-static int volume_open(tsdb *t, const char *path, uint32_t index)
+ * order, one at a time (a writer under create_lock, a follower under layout_lock). Should two ever open one volume
+ * at once, the first to list it wins and the other closes its copy. *meta_bad (when given): the open failed because
+ * the volume's META names another number. */
+static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad)
 {
+    if (meta_bad)
+        *meta_bad = false;
     pthread_rwlock_rdlock(&t->lock);
     bool listed = index < t->nvols;
     pthread_rwlock_unlock(&t->lock);
@@ -684,8 +695,8 @@ static int volume_open(tsdb *t, const char *path, uint32_t index)
         rc = strtoull(txt, NULL, 16) == t->id ? 0 : TSDB_ERR_INVALID; /* a volume of another database */
         free(txt);
     }
-    if (rc == 0)
-        rc = meta_check(fd, path, index); /* before the engine reads or writes anything there */
+    if (rc == 0 && (rc = meta_check(fd, path, index)) == TSDB_ERR_CORRUPT && meta_bad) /* before the engine */
+        *meta_bad = true;
     close(fd);
     if (rc)
         return rc;
@@ -713,7 +724,8 @@ static int volume_open(tsdb *t, const char *path, uint32_t index)
 }
 
 /* Reads the VOLUMES lines beyond what we have (followers call this
- * again to catch up with the writer). Caller holds no t->lock: volume_open lists each volume under it. */
+ * again to catch up with the writer, under layout_lock). Caller holds no t->lock: volume_open lists each volume
+ * under it. */
 static int load_layout(tsdb *t)
 {
     bool writer = !t->opt.read_only;
@@ -737,7 +749,7 @@ static int load_layout(tsdb *t)
             break;
         }
         good_end = (size_t)(next - txt);
-        rc = volume_open(t, line + 9, (uint32_t)++line_no); /* nothing to do when already open */
+        rc = volume_open(t, line + 9, (uint32_t)++line_no, NULL); /* nothing to do when already open */
     }
     size_t vols_cut = SIZE_MAX, vols_len = len;
     if (rc == 0 && writer && good_end < len) {
@@ -782,6 +794,7 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         t->opt.read_only = 1;
     pthread_rwlock_init(&t->lock, NULL);
     pthread_mutex_init(&t->create_lock, NULL);
+    pthread_mutex_init(&t->layout_lock, NULL);
     pthread_mutex_init(&t->name_mu, NULL);
     pthread_cond_init(&t->name_cv, NULL);
     t->dirfd = -1;
@@ -871,11 +884,13 @@ int tsdb_close(tsdb *t)
     sched_free(t->sched); /* after the volumes: none of them runs a query now */
     free(t->vols);
     free(t->paths);
+    free(t->meta_bad_path);
     free(t->dir);
     if (t->dirfd >= 0)
         close(t->dirfd);
     pthread_rwlock_destroy(&t->lock);
     pthread_mutex_destroy(&t->create_lock);
+    pthread_mutex_destroy(&t->layout_lock);
     pthread_mutex_destroy(&t->name_mu);
     pthread_cond_destroy(&t->name_cv);
     free(t->names_held);
@@ -903,23 +918,33 @@ static bool route_now(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
     return ok;
 }
 
-/* The engine of volume v, NULL beyond the volumes (followers: after reading VOLUMES again when it changed). */
+/* The engine of volume v, NULL beyond the volumes (followers: after reading VOLUMES again when it changed). The
+ * opens of new volumes take layout_lock, so of the threads that want one (tsdbd's workers) one opens it and the
+ * others wait for it and find it listed; the volumes already open are found without it. */
 static eng *volume_at(tsdb *t, size_t v, bool reload)
 {
-    struct stat st;
-    bool grown = reload && fstatat(t->dirfd, VOLUMES_FILE, &st, 0) == 0;
     pthread_rwlock_rdlock(&t->lock);
     eng *e = v < t->nvols ? t->vols[v] : NULL;
-    grown = grown && !stamp_same(&t->vols_seen, &st);
     pthread_rwlock_unlock(&t->lock);
-    if (!e && grown) {
-        int rc = load_layout(t); /* opens new volumes outside the lock: one may be on a hung file system */
-        pthread_rwlock_wrlock(&t->lock);
-        if (rc == 0)
-            t->vols_seen = stamp_of(&st);
-        e = v < t->nvols ? t->vols[v] : NULL;
+    if (e || !reload)
+        return e;
+    pthread_mutex_lock(&t->layout_lock);
+    struct stat st;
+    if (fstatat(t->dirfd, VOLUMES_FILE, &st, 0) == 0) { /* stamped before the read: a later change is seen */
+        pthread_rwlock_rdlock(&t->lock);
+        e = v < t->nvols ? t->vols[v] : NULL; /* opened while we waited */
+        bool changed = !stamp_same(&t->vols_seen, &st);
         pthread_rwlock_unlock(&t->lock);
+        if (!e && changed) {
+            int rc = load_layout(t); /* opens new volumes outside t->lock: one may be on a hung file system */
+            pthread_rwlock_wrlock(&t->lock);
+            if (rc == 0)
+                t->vols_seen = stamp_of(&st);
+            e = v < t->nvols ? t->vols[v] : NULL;
+            pthread_rwlock_unlock(&t->lock);
+        }
     }
+    pthread_mutex_unlock(&t->layout_lock);
     return e;
 }
 
@@ -934,22 +959,26 @@ static bool route(tsdb *t, tsdb_sid id, eng **e, uint32_t *local)
     if (!t->opt.read_only || v < 0)
         return false;
     eng *ve = volume_at(t, (size_t)v, true);
-    if (!ve || eng_series_reload(ve) != 0 || !route_now(t, id, e, local))
+    if (!ve)
+        return false;
+    /* An error is for the refresh to report (follow_refresh): the records before the one that failed are loaded,
+     * and the id may be among them. */
+    (void)eng_series_reload(ve);
+    if (!route_now(t, id, e, local))
         return false;
     eng_refresh(ve);
     return true;
 }
 
-/* A follower asked for a name its writer may have created a moment ago: SERIES of every volume, each read only
- * when it grew, without the write lock on the volume list. */
-static void catch_up(tsdb *t)
+/* A follower asked for a name its writer may have created a moment ago: SERIES of the volumes from `from` on,
+ * each read only when it grew, without the write lock on the volume list. Returns how many volumes it read. */
+static size_t reload_series(tsdb *t, size_t from)
 {
-    if (!t->opt.read_only)
-        return;
-    volume_at(t, SIZE_MAX, true);
     eng *e;
-    for (size_t v = 0; (e = volume_at(t, v, false)) != NULL; v++)
+    size_t v = from;
+    for (; (e = volume_at(t, v, false)) != NULL; v++)
         eng_series_reload(e);
+    return v;
 }
 
 /* Finds name in the volumes' own dictionaries, always in volume order, so every call (tsdb_series,
@@ -982,8 +1011,15 @@ int tsdb_series_lookup(tsdb *t, const char *name, tsdb_sid *id)
         return TSDB_ERR_NOTFOUND;
     int rc = lookup_from(t, name, 0, id);
     if (rc == TSDB_ERR_NOTFOUND && t->opt.read_only) {
-        catch_up(t);
+        /* The volumes open first: opening one added since may hang (its file system), and must not hide a name the
+         * writer just created in one of these. */
+        size_t n = reload_series(t, 0);
         rc = lookup_from(t, name, 0, id);
+        if (rc == TSDB_ERR_NOTFOUND) {
+            volume_at(t, SIZE_MAX, true); /* the volumes added since */
+            reload_series(t, n);
+            rc = lookup_from(t, name, 0, id);
+        }
     }
     return rc == TSDB_ERR_INVALID ? TSDB_ERR_NOTFOUND : rc; /* a name too long to be one */
 }
@@ -1017,11 +1053,17 @@ static int reload_volumes(tsdb *t)
         }
     pthread_rwlock_unlock(&t->lock);
     /* without the lock: a volume on a hung file system holds up only the requests that name it (create_lock) */
-    for (size_t i = open_vols - 1; rc == 0 && i < n; i++)
-        rc = volume_open(t, paths[i], (uint32_t)(i + 1));
+    bool meta_bad = false;
+    size_t i = open_vols - 1;
+    for (; rc == 0 && i < n; i++)
+        if ((rc = volume_open(t, paths[i], (uint32_t)(i + 1), &meta_bad)) != 0)
+            break;
     if (size >= 0 && (rc == 0 || rc == TSDB_ERR_CORRUPT)) { /* an I/O error is tried again */
         t->vols_seen = stamp_of(&st);
         t->vols_rc = rc;
+        free(t->meta_bad_path);
+        t->meta_bad_path = rc && meta_bad && i < n ? strdup(paths[i]) : NULL; /* NULL (no memory): kept as damage */
+        t->meta_bad_index = (uint32_t)(i + 1);
     }
     paths_free(paths, n);
     return rc;
@@ -1080,14 +1122,20 @@ static int volume_resolve(tsdb *t, const char *path, const char *norm, const cha
     if (volume_find(t, norm, vol) || (canon[0] && volume_find(t, canon, vol)))
         return 0;
     struct stat st;
-    if (fstatat(t->dirfd, VOLUMES_FILE, &st, 0) == 0 && !stamp_same(&t->vols_seen, &st)) {
+    bool changed = fstatat(t->dirfd, VOLUMES_FILE, &st, 0) == 0 && !stamp_same(&t->vols_seen, &st);
+    if (!changed && t->vols_rc) {
+        /* A META that named another number may have been in the middle of an add of its directory under another
+         * path, which puts the number back: read again once it does, without a word until then. */
+        if (!t->meta_bad_path || dir_meta_volume(t->meta_bad_path) != (long)t->meta_bad_index)
+            return t->vols_rc; /* damaged, and said so once */
+        changed = true;
+    }
+    if (changed) {
         int rc = reload_volumes(t);
         if (rc)
             return rc;
         if (volume_find(t, norm, vol) || (canon[0] && volume_find(t, canon, vol)))
             return 0;
-    } else if (t->vols_rc) {
-        return t->vols_rc; /* damaged, and said so once */
     }
     return t->opt.create_volumes ? volume_add_open(t, path, vol) : TSDB_ERR_NOTFOUND;
 }
@@ -1647,7 +1695,11 @@ int tsdb_optimize(tsdb *t) { return each(t, eng_optimize); }
 int tsdb_refresh(tsdb *t)
 {
     int rc = each(t, eng_refresh);
-    catch_up(t);
+    if (t->opt.read_only) { /* the volumes open first, as in tsdb_series_lookup */
+        size_t n = reload_series(t, 0);
+        volume_at(t, SIZE_MAX, true);
+        reload_series(t, n);
+    }
     return rc;
 }
 

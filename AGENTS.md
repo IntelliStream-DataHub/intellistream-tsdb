@@ -241,9 +241,13 @@ cgroup, so `nice` does not keep your work out of its way.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf. Series creation (`volumes.c`): a reserved name (`name_reserve`; its `name_mu` is a leaf) >
-  `create_lock` (only around `volume_resolve` and volume adds) > the `tsdb` rwlock (never held across I/O: a new
-  volume is opened first and listed under it, by `volume_open`; two threads that open one volume both open it and
-  the first to list it wins); a dictionary's `append_lock` (held across its write and fdatasync, or a follower's
+  `create_lock` (only around `volume_resolve` and volume adds) or, in a follower, `layout_lock` (only around the
+  opens of new volumes in `volume_at`; a lookup or a route to a volume already open never takes it, and a lookup
+  reads SERIES of the open volumes before it opens new ones) > the `tsdb` rwlock (never held across I/O: a new
+  volume is opened first and listed under it, by `volume_open`, one at a time under `create_lock` or
+  `layout_lock`; should two ever open one, the first to list it wins). `create_lock` and `layout_lock` are held
+  across a new volume's whole open, so they come before every engine lock. An engine's `refresh_lock` > a
+  dictionary's `append_lock` (held across its write and fdatasync, or a follower's
   read of it in `series_reload`) > its `lock` (never held across I/O), and `broken` is set under `lock` before
   `append_lock` is released (also when a durable record could not be added in memory). The `crashfs` lock in tests is innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
   `fn`, a query or the callback runs, nor while an engine lock is taken. A job's `fn` waits only for the items of its
