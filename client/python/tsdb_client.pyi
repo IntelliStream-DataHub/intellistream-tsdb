@@ -52,8 +52,9 @@ _Timestamps = Buffer | Sequence[int]
 _Values = Buffer | Sequence[float]
 # Series ids are ints of 64 bits, handed out by the database: the volume in the high half, the series' index
 # in the volume in the low half, so every id is at least 2**32 (an id cut to 32 bits is refused). They are not
-# dense: look them up by name or list them with Db.series_ids(). An id column is a uint64 array, a uint32 array
-# (widened), or a sequence of ints.
+# dense: look them up by name or list them with Db.series_ids(). An id column is a uint64 or int64 array (a
+# negative id raises ValueError) or a sequence of ints; a 32-bit array (uint32, int32) raises TypeError, since it
+# cannot hold an id.
 _SeriesIds = Buffer | Sequence[int]
 _ValueType = Literal["float32", "float64", "int64", "bool", "state"]
 # Typed values: a numpy array or masked array (masked = null), a buffer, or a
@@ -625,7 +626,7 @@ class Client:
         """Inserts float32 rows into many series and waits.
 
         Args:
-            series: The series id of each row: a list of ints, or a uint64 or uint32 array.
+            series: The series id of each row: a list of ints, or a uint64 or int64 array.
             ts: The timestamp of each row, ms since the epoch.
             values: The value of each row.
         """
@@ -1085,7 +1086,7 @@ class Client:
         series go as several requests.
 
         Args:
-            series: Series ids: a list of ints, or a uint64 or uint32 array.
+            series: Series ids: a list of ints, or a uint64 or int64 array.
             start: First timestamp to include (ms): one for every series, or a
                 list or int64 array with one per series; None for no limit.
             end: Timestamp to stop before, like start.
@@ -1665,7 +1666,7 @@ class Db:
         interpreter is crossed once per call rather than once per query.
 
         Args:
-            series: Series ids: a list or a numpy array (uint64 or uint32), one per query.
+            series: Series ids: a list or a numpy array (uint64 or int64), one per query.
             start, end: None (unbounded), one timestamp for every query, or a
                 list or int64 array with one per query; [start, end) in ms.
             order: "asc" or "desc".
@@ -1693,7 +1694,7 @@ class Db:
         """Runs many aggregate queries at once, in parallel on every CPU.
 
         Args:
-            series: Series ids, one per query (a list, or a uint64 or uint32 array).
+            series: Series ids, one per query (a list, or a uint64 or int64 array).
             start, end: As in query_raw_many().
             interval_ms: Bucket length in ms: one for every query, or a list or
                 int64 array of one per query; 0 (the default) is one bucket for

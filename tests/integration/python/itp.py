@@ -101,7 +101,7 @@ def write(cx, path):
         if "legacy" in flags:
             fl = array.array("f", struct.pack("<%dI" % n, *[bits32(v) for v in vals]))
             if multi:
-                (cx.c.insert_async if asyn else cx.c.insert)(array.array("I", ids), tsa, fl)
+                (cx.c.insert_async if asyn else cx.c.insert)(array.array("Q", ids), tsa, fl)
             else:
                 (cx.c.insert_series_async if asyn else cx.c.insert_series)(one, tsa, fl)
             continue
@@ -117,7 +117,7 @@ def write(cx, path):
         else:
             data = vals
         if multi:
-            (cx.c.insert_values_async if asyn else cx.c.insert_values)(array.array("I", ids), tsa, data, value_type=ty)
+            (cx.c.insert_values_async if asyn else cx.c.insert_values)(array.array("Q", ids), tsa, data, value_type=ty)
         else:
             (cx.c.insert_series_values_async if asyn else cx.c.insert_series_values)(one, tsa, data, value_type=ty)
     cx.c.wait()

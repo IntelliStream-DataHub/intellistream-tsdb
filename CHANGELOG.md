@@ -90,7 +90,7 @@ disk format and the wire protocol.
   `EmbeddedDb`), or `TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v) - 1)`, never `0 .. tsdb_series_count() - 1`
   (which now returns `uint64_t`); look ids up by name. `tsdb_abi_version` names the layout of the C ABI the
   bindings check. C `tsdb_sid`, Rust `SeriesId` (`u64`), Python `int` (numpy
-  `uint64` columns; `uint32` input is widened), Java `long` and `long[]` (the methods that took `int` ids are
+  `uint64` or `int64` columns; a 32-bit column raises `TypeError`), Java `long` and `long[]` (the methods that took `int` ids are
   gone, not overloaded). `tsdb series` prints the id. The Pulsar sink keeps its ids as `long`. The
   benchmarks find their ids by name and keep the series number of their row files as an index into that table.
 - The root file `CATALOG` is gone. It only routed a dense 32-bit id to its volume; with the volume inside the id,

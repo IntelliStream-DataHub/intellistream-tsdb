@@ -838,7 +838,7 @@ impl Db {
     /// interpreter is crossed once per call rather than once per query.
     ///
     /// Args:
-    ///     series: Series ids: a list or a numpy array (uint64 or uint32), one per query.
+    ///     series: Series ids: a list or a numpy array (uint64 or int64), one per query.
     ///     start, end: None (unbounded), one timestamp for every query, or a
     ///         list or int64 array with one per query; [start, end) in ms.
     ///     order: "asc" or "desc".
@@ -873,7 +873,7 @@ impl Db {
     /// Runs many aggregate queries at once, in parallel on every CPU.
     ///
     /// Args:
-    ///     series: Series ids, one per query (a list, or a uint64 or uint32 array).
+    ///     series: Series ids, one per query (a list, or a uint64 or int64 array).
     ///     start, end: As in query_raw_many().
     ///     interval_ms: Bucket length in ms: one for every query, or a list or
     ///         int64 array of one per query; 0 (the default) is one bucket for

@@ -78,16 +78,28 @@ fn ts_column(obj: &Bound<'_, PyAny>) -> PyResult<Col<i64>> {
     })
 }
 
-/// Series ids: a uint64 buffer, a uint32 buffer (widened where it is read, so existing uint32 arrays keep
-/// working), or a sequence of ints (a negative one, or one of 2**64 or more, raises OverflowError).
+/// Series ids: a uint64 buffer, an int64 buffer (numpy's default integer; a negative id raises ValueError), or a
+/// sequence of ints (a negative one, or one of 2**64 or more, raises OverflowError). A 32-bit integer buffer
+/// raises TypeError: every id is at least 2**32, so such a column holds truncated ids, and taking them would only
+/// turn a type mistake into INVALID answers.
 fn series_column(obj: &Bound<'_, PyAny>) -> PyResult<SidCol> {
     if let Some(c) = Col::<u64>::buffer(obj)? {
-        return Ok(SidCol::Wide(c));
+        return Ok(c);
     }
-    if let Some(c) = Col::<u32>::buffer(obj)? {
-        return Ok(SidCol::Narrow(c));
+    if arrays::native::<u32>(obj).is_some() || arrays::native::<i32>(obj).is_some() {
+        return Err(PyTypeError::new_err(
+            "series ids are 64-bit (every id is at least 2**32): use a uint64 or int64 array, not a 32-bit one",
+        ));
     }
-    Ok(SidCol::Wide(Col::Owned(obj.extract()?)))
+    if let Some(c) = Col::<i64>::buffer(obj)? {
+        // copied now, with the GIL held, so the check holds for the values the call uses (see arrays.rs)
+        let v = c.snap();
+        if let Some(&bad) = v.iter().find(|&&x| x < 0) {
+            return Err(PyValueError::new_err(format!("a series id is never negative: {bad}")));
+        }
+        return Ok(Col::Owned(v.iter().map(|&x| x as u64).collect()));
+    }
+    Ok(Col::Owned(obj.extract()?))
 }
 
 /// float32 values of the version 1 calls: float32 or float64 buffers, or a sequence.
@@ -1088,7 +1100,7 @@ impl Client {
     /// Inserts float32 rows into many series and waits.
     ///
     /// Args:
-    ///     series: The series id of each row: a list of ints, or a uint64 or uint32 array.
+    ///     series: The series id of each row: a list of ints, or a uint64 or int64 array.
     ///     ts: The timestamp of each row, ms since the epoch.
     ///     values: The value of each row.
     fn insert(
@@ -1723,7 +1735,7 @@ impl Client {
     /// series go as several requests.
     ///
     /// Args:
-    ///     series: Series ids: a list of ints, or a uint64 or uint32 array.
+    ///     series: Series ids: a list of ints, or a uint64 or int64 array.
     ///     start: First timestamp to include (ms): one for every series, or a
     ///         list or int64 array with one per series; None for no limit.
     ///     end: Timestamp to stop before, like start.

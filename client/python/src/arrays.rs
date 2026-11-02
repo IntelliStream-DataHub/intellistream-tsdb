@@ -99,29 +99,8 @@ impl<T: Element + Copy> Col<T> {
     }
 }
 
-/// A column of series ids: a uint64 buffer or vector, or a uint32 buffer, widened when it is read.
-pub(crate) enum SidCol {
-    Wide(Col<u64>),
-    Narrow(Col<u32>),
-}
-
-impl SidCol {
-    /// The ids, read once; see `Col::snap`.
-    pub(crate) fn snap(&self) -> Cow<'_, [u64]> {
-        match self {
-            SidCol::Wide(c) => c.snap(),
-            SidCol::Narrow(c) => Cow::Owned(c.snap().iter().map(|&x| u64::from(x)).collect()),
-        }
-    }
-
-    /// The first id, read once.
-    pub(crate) fn first(&self) -> Option<u64> {
-        match self {
-            SidCol::Wide(c) => c.first(),
-            SidCol::Narrow(c) => c.first().map(u64::from),
-        }
-    }
-}
+/// A column of series ids (`series_column` in lib.rs).
+pub(crate) type SidCol = Col<u64>;
 
 /// Typed insert values: read in place when the buffer has the series' type, else a `Column`.
 pub(crate) enum ValCol {

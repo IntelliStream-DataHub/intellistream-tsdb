@@ -332,7 +332,8 @@ with tsdb_client.Db("/tmp/tsdb-multi") as db:
 
 There are five: `query_values_multi`, `query_buckets_multi`,
 `query_spread_multi`, `query_twa_multi` and `query_lttb_multi`, on
-`Client`, `Pool` and `Db`. `series` is a list of ints or a numpy `uint64` (or `uint32`) array.
+`Client`, `Pool` and `Db`. `series` is a list of ints or a numpy `uint64` (or `int64`) array; a
+32-bit array cannot hold an id and raises `TypeError`.
 `start`, `end` and `interval_ms` are one number for every series or one
 per series. The bucket calls take `interval_ms`, or `unit`, `count` and
 `timezone` (as `query_group`), or `bounds` (as `query_bounds`).
