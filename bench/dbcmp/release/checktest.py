@@ -312,12 +312,19 @@ def tables_cases():
         for i, t in ((1, "query failed: status -1: 44\t17"), (2, "query failed: status 500: Code: 241. DB::Exception: (total) memory limit exceeded: would use 43 GiB")):
             open(os.path.join(d, "ch.twa7d.b100.c32.%d" % i), "w").write(t)
         open(os.path.join(d, "x.raw.c1.mean.txt"), "w").write("nothing here\n")
+        open(os.path.join(d, "duckdb.twa.txt"), "w").write("sqlt run 1: 1.80 s (3 rows)\nsqlt run 2: 1.84 s (3 rows)\n"
+                                                           "sqlt: mean 1.8200 s sd 0.0200, 2 runs after a warm-up\n")
+        open(os.path.join(d, "tsdb.twa.t1.txt"), "w").write("twa 1 conns: mean 0.0390 s sd 0.0015 (3.8%) min 0.0380 "
+                                                            "max 0.0416, 5 runs after a warm-up; 339774 buckets\n")
         tables.errors.clear()
         rows = tables.results_table(d)
         text = "\n".join(r if isinstance(r, str) else r[1] for r in rows)
         case("tables: refused class shown with the server's error", True,
              "no run timed: 1 x status -1; 1 x Code: 241. DB::Exception: (total) memory limit exceeded" in text)
         case("tables: refused class is no error", True, not any("ch.twa7d" in e for e in tables.errors))
+        case("tables: p3 DuckDB/chDB one-query TWA read (mean, spread from the runs)", True,
+             "| duckdb.twa | TWA (hourly STEP buckets) of the whole table in one query: mean 1.8200 s | sd 1.1% [1.8000-1.8400 s] | 2 |" in text)
+        case("tables: p3 embedded tsdb counts threads, not connections", True, "twa on 1 threads" in text)
         case("tables: a mean file with no timing and no failure named is still an error", True,
              any("x.raw.c1" in e for e in tables.errors))
     finally:

@@ -195,7 +195,10 @@ def batch_unit(name, lines):
     return out
 
 
-RELQ_FILE = re.compile(r"^((?:merged\.)?(?:twa|twad|twal|twa1d|twa7d|lttb|full)\.c\d+)\.txt$")
+RELQ_FILE = re.compile(r"^((?:merged\.)?(?:twa|twad|twal|twa1d|twa7d|lttb|full)\.c\d+"
+                       r"|(?:tsdb|chdb|chdb-lz4|duckdb)\.(?:twa|lttb)(?:\.t\d+)?)\.txt$")  # p2's relq; p3's embedded
+SQLT = re.compile(r"^sqlt: mean ([\d.]+) s sd ([\d.]+), (\d+) runs after a warm-up")  # p3: DuckDB, chDB (one query)
+SQLT_RUN = re.compile(r"^sqlt run \d+: ([\d.]+) s")
 RELQ1 = re.compile(r"^(\S+) (\d+) conns(?:, [^:]*)?: ([\d.]+) s, one run after a warm-up; (\d+) (buckets|points)"
                    r"(?:; (\d+) windows)?")
 RELQ = re.compile(r"^(\S+) (\d+) conns(?:, [^:]*)?: mean ([\d.]+) s sd ([\d.]+) \(([\d.]+)%\) min ([\d.]+) max ([\d.]+), "
@@ -216,7 +219,19 @@ def relq_rows(d, prefix=""):
         if not m:
             continue
         name, res, spread, nruns = m.group(1), [], [], None
+        sq_runs = []
         for l in open(f, errors="replace"):
+            r = SQLT_RUN.match(l.strip())
+            if r:
+                sq_runs.append(float(r.group(1)))
+            r = SQLT.match(l.strip())
+            if r:
+                mean, sd, nruns = float(r.group(1)), float(r.group(2)), int(r.group(3))
+                kind = "LTTB" if ".lttb" in name else "TWA (hourly STEP buckets)"
+                res.append("%s of the whole table in one query: mean %.4f s" % (kind, mean))
+                spread.append("one run" if nruns == 1 else "sd %.1f%% [%.4f-%.4f s]" % (
+                    100 * sd / mean if mean else 0.0, min(sq_runs or [mean]), max(sq_runs or [mean])))
+                continue
             r = RELQ.match(l.strip())
             r1 = RELQ1.match(l.strip())
             if r1:  # REPS=1 (the smoke): one time, no spread
@@ -242,6 +257,8 @@ def relq_rows(d, prefix=""):
                 nruns = int(runs)
                 res.append("full, %s, on %s conns: mean %s s per whole-table pass (median %s s)" % (what, conns, mean, med))
                 spread.append("sd %.1f%% [%s-%s s]" % (100 * float(sd) / float(mean) if float(mean) else 0.0, mn, mx))
+        if name.startswith("tsdb."):  # p3: embedded tsdb, threads and calls in one process, not connections
+            res = [x.replace(" conns", " threads").replace("one request each", "one call each") for x in res]
         flags = []
         if os.path.exists(f + ".notquiet"):
             flags.append("measured on a busy machine: " + open(f + ".notquiet").read().strip())
