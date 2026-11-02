@@ -110,7 +110,8 @@ static void answers(tsdb *db, blob *out)
 {
     static const int ng[] = {1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 33, 40};
     static const int64_t iv[] = {420000, 60000, 3600000, 0};
-    for (uint32_t s = 0; s < 2; s++)
+    size_t buckets = 0;
+    for (tsdb_sid s = TSDB_SID(0, 0); s <= TSDB_SID(0, 1); s++) /* "a" and "b", the first two series */
         for (size_t gi = 0; gi < sizeof ng / sizeof *ng; gi++)
             for (size_t k = 0; k < sizeof iv / sizeof *iv; k++) {
                 int64_t start = 6 * GR * 1000LL + 12345, end = start + (int64_t)ng[gi] * GR * 1000;
@@ -119,6 +120,7 @@ static void answers(tsdb *db, blob *out)
                 void *r;
                 size_t n;
                 must(tsdb_query_agg(db, s, start, end, iv[k], (tsdb_bucket **)&r, &n), "agg");
+                buckets += n;
                 put(out, r, n * sizeof(tsdb_bucket));
                 free(r);
                 must(tsdb_query_spread(db, s, start, end, iv[k], NULL, (tsdb_spread_bucket **)&r, &n), "spread");
@@ -131,6 +133,10 @@ static void answers(tsdb *db, blob *out)
                     free(r);
                 }
             }
+    if (buckets == 0) { /* ids that name no series answer nothing, alike at every thread count */
+        fprintf(stderr, "FAIL: the queries found no rows\n");
+        exit(1);
+    }
 }
 
 int main(int argc, char **argv)
