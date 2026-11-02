@@ -88,9 +88,19 @@ class CalendarBoundsTest {
         throw new IllegalArgumentException("unit " + code);
     }
 
-    /** The fixtures: the header's tzdata version, then the cases. */
-    static String read(BufferedReader r, List<Case> cases) throws IOException {
+    /** What sameBoundsAsTheCClient does with each case, given the fixtures' tzdata version. */
+    interface CaseCheck {
+        void check(String version, Case c);
+    }
+
+    /**
+     * The fixtures: the header's tzdata version, then the cases, each handed to {@code each} as it is read and then
+     * dropped: some cases hold 31 million bounds (252 MB), and keeping them all needs more heap than a 16 GB CI runner's
+     * default JVM has. Returns the number of cases.
+     */
+    static int read(BufferedReader r, CaseCheck each) throws IOException {
         String version = null;
+        int n = 0;
         for (String line; (line = r.readLine()) != null;) {
             if (line.startsWith("#")) {
                 int v = line.indexOf("zoneinfo version ");
@@ -98,10 +108,12 @@ class CalendarBoundsTest {
                     version = line.substring(v + "zoneinfo version ".length()).trim();
                 continue;
             }
-            if (!line.isBlank())
-                cases.add(Case.parse(line));
+            if (!line.isBlank()) {
+                each.check(version, Case.parse(line));
+                n++;
+            }
         }
-        return version;
+        return n;
     }
 
     /**
@@ -163,35 +175,34 @@ class CalendarBoundsTest {
 
     @Test
     void sameBoundsAsTheCClient() throws IOException {
-        List<Case> cases = new ArrayList<>();
-        String version;
+        String[] version = {null};
+        Map<String, List<String>> wrong = new LinkedHashMap<>();
+        int[] skipped = {0};
+        int cases;
         try (InputStream in = CalendarBoundsTest.class.getResourceAsStream(FIXTURES)) {
             assertTrue(in != null, FIXTURES + " is missing");
-            version = read(new BufferedReader(new InputStreamReader(new GZIPInputStream(in), StandardCharsets.UTF_8)),
-                    cases);
+            cases = read(new BufferedReader(new InputStreamReader(new GZIPInputStream(in), StandardCharsets.UTF_8)),
+                    (v, c) -> {
+                        version[0] = v;
+                        if (!jdkTzdb().equals(v) && TZDB_CHANGES.containsKey(c.zone())) {
+                            skipped[0]++;
+                            return;
+                        }
+                        String d = check(c, HISTORY_BEFORE_1970.contains(c.zone()) ? 0 : Long.MIN_VALUE);
+                        if (d != null)
+                            wrong.computeIfAbsent(c.zone(), z -> new ArrayList<>()).add(d + "\n      "
+                                    + c.line().substring(0, Math.min(c.line().length(), 160)));
+                    });
         }
-        assertTrue(cases.size() > 4000, "fixtures: " + cases.size() + " cases");
-        boolean sameTzdb = jdkTzdb().equals(version);
-        Map<String, List<String>> wrong = new LinkedHashMap<>();
-        int skipped = 0;
-        for (Case c : cases) {
-            if (!sameTzdb && TZDB_CHANGES.containsKey(c.zone())) {
-                skipped++;
-                continue;
-            }
-            String d = check(c, HISTORY_BEFORE_1970.contains(c.zone()) ? 0 : Long.MIN_VALUE);
-            if (d != null)
-                wrong.computeIfAbsent(c.zone(), z -> new ArrayList<>()).add(d + "\n      " + c.line().substring(0,
-                        Math.min(c.line().length(), 160)));
-        }
+        assertTrue(cases > 4000, "fixtures: " + cases + " cases");
         if (!wrong.isEmpty()) {
-            StringBuilder s = new StringBuilder("bounds differ from C (fixtures: tzdata " + version + ", JDK tzdb "
+            StringBuilder s = new StringBuilder("bounds differ from C (fixtures: tzdata " + version[0] + ", JDK tzdb "
                     + jdkTzdb() + ") in " + wrong.size() + " zones:\n");
             wrong.forEach((z, l) -> s.append("  ").append(z).append(": ").append(l.size()).append(" cases, e.g. ")
                     .append(l.get(0)).append('\n'));
             fail(s.toString());
         }
-        assertTrue(skipped < cases.size() / 4, skipped + " cases skipped");
+        assertTrue(skipped[0] < cases / 4, skipped[0] + " cases skipped");
     }
 
     static long utc(int y, int m, int d, int h, int min) {
