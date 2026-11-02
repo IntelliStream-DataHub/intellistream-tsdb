@@ -2,7 +2,8 @@
  * tsdbd: serves a tsdb directory over TCP (protocol in tsdb_protocol.h).
  *
  * One thread runs the event loop: one recv and at most one send in flight per
- * connection, and an eventfd through which workers report. The loop runs on
+ * connection, and an eventfd through which workers report (a lock-free stack of
+ * notes, see notify). The loop runs on
  * io_uring, or on epoll where io_uring is not allowed (RHEL and AlmaLinux 10
  * disable it by default); --io auto (the default) tries io_uring and falls
  * back to epoll when the kernel refuses it. Only how bytes move differs: see
@@ -17,7 +18,13 @@
  * write wins" for clients that pipeline. Workers append replies to the
  * connection's output buffer; a worker streaming a large result waits while
  * that buffer is over OUT_CAP, so a slow client cannot make the server buffer
- * without bound.
+ * without bound. Who sends a connection's output is decided under its lock:
+ * while the event loop has nothing of it in flight, the worker sends what it
+ * appended itself, without blocking (out_send: one loop thread cannot do the
+ * kernel's TCP transmit of every small reply); what such a send leaves, on a
+ * full socket buffer or an error, goes to the event loop, which then sends
+ * everything until it has drained the output (tx_loop), the worker meanwhile
+ * only appending.
  *
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--port-file FILE] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
@@ -226,9 +233,10 @@ typedef struct conn {
     pthread_cond_t cv;
     buf out;
     atomic_bool closing;
-    bool notified;      /* an output event is queued for the main thread */
-    bool tx_loop;       /* the main thread sends: a send in flight or bytes left in `sending` */
-    bool tx_worker;     /* the worker sends from the front of `out` itself (out_send) */
+    bool notified;      /* `out` has bytes the main thread was told of (n_out pushed): it sends them */
+    bool tx_loop;       /* the main thread sends: a send in flight, bytes left in `sending`, or bytes a worker's
+                           send left in `out`; the worker only appends until the main thread drained it all */
+    bool tx_worker;     /* the worker sends from the front of `out` itself (out_send): nobody else touches `out` */
     note n_out, n_done; /* in note_top while queued for the main thread */
     atomic_bool out_queued; /* n_out is in note_top or not yet handled */
     tsdb_query_stats last_stats; /* of the previous query (LAST_STATS) */
@@ -395,7 +403,10 @@ static void out_wait(conn *c)
  * main thread must be told of output. */
 static bool out_send(conn *c)
 {
-    size_t done = 0, len = c->out.len; /* nobody else changes `out` while tx_worker is set */
+    /* While tx_worker is set nobody else reads or changes `out`: the main thread leaves it alone (submit_send), and
+     * only this worker appends to it. So the send, and moving what it left to the front (up to OUT_CAP + OUT_PIECE),
+     * need no lock; the main thread, which takes the lock for every note it handles, never waits for them. */
+    size_t done = 0, len = c->out.len;
     while (done < len) {
         ssize_t n = send(c->fd, c->out.p + done, len - done, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (n > 0)
@@ -405,12 +416,15 @@ static bool out_send(conn *c)
         else
             break;
     }
+    if (done && done < len)
+        memmove(c->out.p, c->out.p + done, len - done);
+    c->out.len = len - done;
     pthread_mutex_lock(&c->lock);
     c->tx_worker = false;
-    if (done) {
-        memmove(c->out.p, c->out.p + done, c->out.len - done);
-        c->out.len -= done;
-    }
+    /* What the socket did not take now waits for it to drain: the main thread sends it, and everything appended
+     * until it has drained the output, rather than this worker trying again (an EAGAIN and a move per piece). */
+    if (c->out.len)
+        c->tx_loop = true;
     bool wake = c->out.len && !c->notified;
     if (wake)
         c->notified = true;
@@ -2161,11 +2175,8 @@ static void on_accept(int fd)
     submit_recv(c);
 }
 
-static void on_wake(void)
+static void take_notes(void)
 {
-    uint64_t v;
-    if (read(wake_fd, &v, 8) < 0 && errno != EAGAIN)
-        perror("tsdbd: eventfd");
     note *top = atomic_exchange_explicit(&note_top, NULL, memory_order_acquire), *batch = NULL;
     while (top) { /* into the order of the pushes */
         note *next = top->next;
@@ -2203,6 +2214,24 @@ static void on_wake(void)
     }
     if (park_head)
         unpark_some();
+}
+
+static void on_wake(void)
+{
+    uint64_t v;
+    if (read(wake_fd, &v, 8) < 0 && errno != EAGAIN)
+        perror("tsdbd: eventfd");
+    take_notes();
+}
+
+/* Only the push onto an empty stack writes the eventfd (notify), so a worker preempted between its push and that
+ * write would hold up every note pushed after it. The main thread therefore also takes the notes after each round
+ * of events when the stack is not empty (one load per round), so the notes that came during a round wait for no
+ * such write. The eventfd is left alone here: a count it holds only makes a later on_wake find less to do. */
+static void notes_pending(void)
+{
+    if (atomic_load_explicit(&note_top, memory_order_relaxed))
+        take_notes();
 }
 
 #ifndef TSDBD_NO_URING
@@ -2244,6 +2273,7 @@ static void uring_loop(void)
             }
         }
         io_uring_cq_advance(&ring, seen);
+        notes_pending();
     }
 }
 #endif
@@ -2322,6 +2352,7 @@ static void ep_loop(void)
             ep_want(c);
         }
         ep_round();
+        notes_pending();
     }
 }
 
