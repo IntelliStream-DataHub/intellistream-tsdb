@@ -58,7 +58,7 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  *
  * <pre>{@code
  * try (EmbeddedDb db = EmbeddedDb.open("/var/lib/tsdb")) {
- *     int id = db.series("cpu.temp");
+ *     long id = db.series("cpu.temp");
  *     db.insert(id, new long[] {t0, t0 + 1000}, new float[] {21.5f, 21.7f});
  *     List<Bucket> perHour = db.queryGroup(id, t0, t1, Group.of(Unit.HOUR).in("Europe/Oslo"));
  * }
@@ -270,7 +270,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the series id
      * @throws TsdbException e.g. {@link Status#ERR_READONLY}
      */
-    public int series(String name) throws TsdbException {
+    public long series(String name) throws TsdbException {
         return series(name, true);
     }
 
@@ -282,16 +282,16 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the series id
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} if the series is missing and {@code create} is false
      */
-    public int series(String name, boolean create) throws TsdbException {
+    public long series(String name, boolean create) throws TsdbException {
         checkName(name, "series");
         MemorySegment d = enter();
         int rc;
         try (Arena a = Arena.ofConfined()) {
-            MemorySegment id = a.allocate(JAVA_INT);
+            MemorySegment id = a.allocate(JAVA_LONG);
             rc = create ? (int) Native.SERIES.invokeExact(d, a.allocateFrom(name), id)
                     : (int) Native.SERIES_LOOKUP.invokeExact(d, a.allocateFrom(name), id);
             if (rc == 0)
-                return id.get(JAVA_INT, 0);
+                return id.get(JAVA_LONG, 0);
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
@@ -309,7 +309,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the series id
      * @throws TsdbException if the series or its volume cannot be created
      */
-    public int seriesAt(String name, String path) throws TsdbException {
+    public long seriesAt(String name, String path) throws TsdbException {
         return seriesCreate(name, ValueType.FLOAT32, Objects.requireNonNull(path, "path"));
     }
 
@@ -321,7 +321,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the series id
      * @throws TsdbException with {@link Status#ERR_INVALID} if the series exists with another type
      */
-    public int seriesCreate(String name, ValueType type) throws TsdbException {
+    public long seriesCreate(String name, ValueType type) throws TsdbException {
         return seriesCreate(name, type, null);
     }
 
@@ -334,18 +334,18 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the series id
      * @throws TsdbException with {@link Status#ERR_INVALID} if the series exists with another type
      */
-    public int seriesCreate(String name, ValueType type, String path) throws TsdbException {
+    public long seriesCreate(String name, ValueType type, String path) throws TsdbException {
         checkName(name, "series");
         Objects.requireNonNull(type, "type");
         checkCString(path, "volume path");
         MemorySegment d = enter();
         int rc;
         try (Arena a = Arena.ofConfined()) {
-            MemorySegment id = a.allocate(JAVA_INT);
+            MemorySegment id = a.allocate(JAVA_LONG);
             MemorySegment p = path == null ? MemorySegment.NULL : a.allocateFrom(path);
             rc = (int) Native.SERIES_CREATE.invokeExact(d, a.allocateFrom(name), type.code(), p, id);
             if (rc == 0)
-                return id.get(JAVA_INT, 0);
+                return id.get(JAVA_LONG, 0);
             checkWrite(d, rc, name);
         } catch (TsdbException e) {
             throw e;
@@ -364,7 +364,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return its type
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
      */
-    public ValueType seriesType(int id) throws TsdbException {
+    public ValueType seriesType(long id) throws TsdbException {
         MemorySegment d = enter();
         int rc;
         try (Arena a = Arena.ofConfined()) {
@@ -377,7 +377,7 @@ public final class EmbeddedDb implements AutoCloseable {
         } finally {
             exit();
         }
-        throw new TsdbException(rc, "series " + Integer.toUnsignedString(id), null);
+        throw new TsdbException(rc, "series " + Long.toUnsignedString(id), null);
     }
 
     /**
@@ -388,7 +388,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return its class
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
      */
-    public int seriesClass(int id) throws TsdbException {
+    public int seriesClass(long id) throws TsdbException {
         MemorySegment d = enter();
         int rc;
         try (Arena a = Arena.ofConfined()) {
@@ -401,7 +401,7 @@ public final class EmbeddedDb implements AutoCloseable {
         } finally {
             exit();
         }
-        throw new TsdbException(rc, "series " + Integer.toUnsignedString(id), null);
+        throw new TsdbException(rc, "series " + Long.toUnsignedString(id), null);
     }
 
     /**
@@ -411,10 +411,10 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return its name
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
      */
-    public String seriesName(int id) throws TsdbException {
-        String s = stringOf(Native.SERIES_NAME, id);
+    public String seriesName(long id) throws TsdbException {
+        String s = idString(Native.SERIES_NAME, id);
         if (s == null)
-            throw new TsdbException(Status.ERR_NOTFOUND, "series " + Integer.toUnsignedString(id), null);
+            throw new TsdbException(Status.ERR_NOTFOUND, "series " + Long.toUnsignedString(id), null);
         return s;
     }
 
@@ -425,21 +425,76 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the directory
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
      */
-    public String seriesPath(int id) throws TsdbException {
-        String s = stringOf(Native.SERIES_PATH, id);
+    public String seriesPath(long id) throws TsdbException {
+        String s = idString(Native.SERIES_PATH, id);
         if (s == null)
-            throw new TsdbException(Status.ERR_NOTFOUND, "series " + Integer.toUnsignedString(id), null);
+            throw new TsdbException(Status.ERR_NOTFOUND, "series " + Long.toUnsignedString(id), null);
         return s;
     }
 
     /**
-     * The number of series; ids are {@code 0 .. seriesCount() - 1}.
+     * The number of series. Ids are not dense: list them with {@link #seriesIds()}, never as a range.
      *
      * @return the count
      * @throws TsdbException if the database is closed
      */
-    public int seriesCount() throws TsdbException {
-        return intOf(Native.SERIES_COUNT);
+    public long seriesCount() throws TsdbException {
+        MemorySegment d = enter();
+        try {
+            return (long) Native.SERIES_COUNT.invokeExact(d);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        } finally {
+            exit();
+        }
+    }
+
+    /**
+     * The id of every series (those of one volume in creation order; no order across volumes is promised).
+     *
+     * @return the ids
+     * @throws TsdbException if the database is closed
+     */
+    public long[] seriesIds() throws TsdbException {
+        MemorySegment d = enter();
+        IdList out = new IdList();
+        long ctx = IDS.getAndIncrement();
+        int rc;
+        try {
+            SINKS.put(ctx, out);
+            rc = (int) Native.SERIES_FOREACH.invokeExact(d, SERIES_STUB, MemorySegment.ofAddress(ctx));
+        } catch (Throwable t) {
+            throw rethrow(t);
+        } finally {
+            SINKS.remove(ctx);
+            exit();
+        }
+        if (out.error != null)
+            throw rethrow(out.error);
+        check(rc, "series ids");
+        return Arrays.copyOf(out.ids, out.n);
+    }
+
+    /** The ids tsdb_series_foreach hands {@link #seriesId}. */
+    private static final class IdList {
+        long[] ids = new long[64];
+        int n;
+        Throwable error;
+    }
+
+    private static int seriesId(MemorySegment ctx, long id) {
+        IdList l = null;
+        try {
+            l = (IdList) SINKS.get(ctx.address());
+            if (l.n == l.ids.length)
+                l.ids = Arrays.copyOf(l.ids, Math.addExact(l.n, l.n >> 1));
+            l.ids[l.n++] = id;
+            return 0;
+        } catch (Throwable t) {
+            if (l != null)
+                l.error = t;
+            return 1;
+        }
     }
 
     /**
@@ -470,6 +525,17 @@ public final class EmbeddedDb implements AutoCloseable {
         MemorySegment d = enter();
         try {
             return Native.string((MemorySegment) h.invokeExact(d, arg));
+        } catch (Throwable t) {
+            throw rethrow(t);
+        } finally {
+            exit();
+        }
+    }
+
+    private String idString(java.lang.invoke.MethodHandle h, long id) throws TsdbException {
+        MemorySegment d = enter();
+        try {
+            return Native.string((MemorySegment) h.invokeExact(d, id));
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
@@ -522,7 +588,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return its code
      * @throws TsdbException e.g. {@link Status#ERR_INVALID} if the series is not a state series
      */
-    public int state(int series, String name) throws TsdbException {
+    public int state(long series, String name) throws TsdbException {
         return stateCode(series, name, true);
     }
 
@@ -534,11 +600,11 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return its code
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} if the name has no code
      */
-    public int stateLookup(int series, String name) throws TsdbException {
+    public int stateLookup(long series, String name) throws TsdbException {
         return stateCode(series, name, false);
     }
 
-    private int stateCode(int series, String name, boolean create) throws TsdbException {
+    private int stateCode(long series, String name, boolean create) throws TsdbException {
         checkName(name, "state");
         MemorySegment d = enter();
         int rc;
@@ -567,7 +633,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return its name
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown code
      */
-    public String stateName(int series, int code) throws TsdbException {
+    public String stateName(long series, int code) throws TsdbException {
         MemorySegment d = enter();
         String s;
         try {
@@ -593,7 +659,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param values the values, as many as timestamps
      * @throws TsdbException e.g. {@link Status#ERR_INVALID} if the series is not float32
      */
-    public void insert(int series, long[] timestamps, float[] values) throws TsdbException {
+    public void insert(long series, long[] timestamps, float[] values) throws TsdbException {
         insert(series, timestamps, values, 0, timestamps.length);
     }
 
@@ -607,7 +673,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param length the number of points
      * @throws TsdbException e.g. {@link Status#ERR_INVALID} if the series is not float32
      */
-    public void insert(int series, long[] timestamps, float[] values, int offset, int length) throws TsdbException {
+    public void insert(long series, long[] timestamps, float[] values, int offset, int length) throws TsdbException {
         Objects.checkFromIndexSize(offset, length, timestamps.length);
         Objects.checkFromIndexSize(offset, length, values.length);
         MemorySegment d = enter();
@@ -643,7 +709,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param values the values
      * @throws TsdbException e.g. {@link Status#ERR_INVALID} if a series is not float32
      */
-    public void insert(int[] series, long[] timestamps, float[] values) throws TsdbException {
+    public void insert(long[] series, long[] timestamps, float[] values) throws TsdbException {
         insert(series, timestamps, values, 0, timestamps.length);
     }
 
@@ -657,7 +723,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param length the number of points
      * @throws TsdbException e.g. {@link Status#ERR_INVALID} if a series is not float32
      */
-    public void insert(int[] series, long[] timestamps, float[] values, int offset, int length)
+    public void insert(long[] series, long[] timestamps, float[] values, int offset, int length)
             throws TsdbException {
         Objects.checkFromIndexSize(offset, length, series.length);
         Objects.checkFromIndexSize(offset, length, timestamps.length);
@@ -669,7 +735,7 @@ public final class EmbeddedDb implements AutoCloseable {
             a = scratch.take();
             if (length == 0)
                 return;
-            MemorySegment s = a.allocateFrom(JAVA_INT, MemorySegment.ofArray(series), JAVA_INT, offset * 4L, length);
+            MemorySegment s = a.allocateFrom(JAVA_LONG, MemorySegment.ofArray(series), JAVA_LONG, offset * 8L, length);
             MemorySegment ts = a.allocateFrom(JAVA_LONG, MemorySegment.ofArray(timestamps), JAVA_LONG, offset * 8L, length);
             MemorySegment v = a.allocateFrom(JAVA_FLOAT, MemorySegment.ofArray(values), JAVA_FLOAT, offset * 4L, length);
             rc = (int) Native.INSERT.invokeExact(d, s, ts, v, (long) length);
@@ -689,26 +755,26 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /**
-     * The same as {@link #insert(int, long[], float[])}: an embedded insert has no round trip to overlap.
+     * The same as {@link #insert(long, long[], float[])}: an embedded insert has no round trip to overlap.
      *
      * @param series the series id
      * @param timestamps ms since the epoch
      * @param values the values
      * @throws TsdbException as {@code insert}
      */
-    public void insertAsync(int series, long[] timestamps, float[] values) throws TsdbException {
+    public void insertAsync(long series, long[] timestamps, float[] values) throws TsdbException {
         insert(series, timestamps, values);
     }
 
     /**
-     * The same as {@link #insert(int[], long[], float[])}.
+     * The same as {@link #insert(long[], long[], float[])}.
      *
      * @param series the series id of each point
      * @param timestamps ms since the epoch
      * @param values the values
      * @throws TsdbException as {@code insert}
      */
-    public void insertAsync(int[] series, long[] timestamps, float[] values) throws TsdbException {
+    public void insertAsync(long[] series, long[] timestamps, float[] values) throws TsdbException {
         insert(series, timestamps, values);
     }
 
@@ -740,7 +806,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param values the values: a column of the series' type
      * @throws TsdbException with {@link Status#ERR_INVALID} if the column's type is not the series'
      */
-    public void insertSeriesValues(int series, long[] timestamps, Column values) throws TsdbException {
+    public void insertSeriesValues(long series, long[] timestamps, Column values) throws TsdbException {
         insertSeriesValues(series, timestamps, values, 0, timestamps.length);
     }
 
@@ -754,7 +820,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param length the number of points
      * @throws TsdbException with {@link Status#ERR_INVALID} if the column's type is not the series'
      */
-    public void insertSeriesValues(int series, long[] timestamps, Column values, int offset, int length)
+    public void insertSeriesValues(long series, long[] timestamps, Column values, int offset, int length)
             throws TsdbException {
         insertValues(null, series, timestamps, values, offset, length);
     }
@@ -767,7 +833,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param values the values
      * @throws TsdbException with {@link Status#ERR_INVALID} if a series has another type
      */
-    public void insertValues(int[] series, long[] timestamps, Column values) throws TsdbException {
+    public void insertValues(long[] series, long[] timestamps, Column values) throws TsdbException {
         insertValues(series, timestamps, values, 0, timestamps.length);
     }
 
@@ -781,36 +847,36 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param length the number of points
      * @throws TsdbException with {@link Status#ERR_INVALID} if a series has another type
      */
-    public void insertValues(int[] series, long[] timestamps, Column values, int offset, int length)
+    public void insertValues(long[] series, long[] timestamps, Column values, int offset, int length)
             throws TsdbException {
         insertValues(Objects.requireNonNull(series, "series"), 0, timestamps, values, offset, length);
     }
 
     /**
-     * The same as {@link #insertSeriesValues(int, long[], Column)}.
+     * The same as {@link #insertSeriesValues(long, long[], Column)}.
      *
      * @param series the series id
      * @param timestamps ms since the epoch
      * @param values the values
      * @throws TsdbException as {@code insertSeriesValues}
      */
-    public void insertSeriesValuesAsync(int series, long[] timestamps, Column values) throws TsdbException {
+    public void insertSeriesValuesAsync(long series, long[] timestamps, Column values) throws TsdbException {
         insertSeriesValues(series, timestamps, values);
     }
 
     /**
-     * The same as {@link #insertValues(int[], long[], Column)}.
+     * The same as {@link #insertValues(long[], long[], Column)}.
      *
      * @param series the series id of each point
      * @param timestamps ms since the epoch
      * @param values the values
      * @throws TsdbException as {@code insertValues}
      */
-    public void insertValuesAsync(int[] series, long[] timestamps, Column values) throws TsdbException {
+    public void insertValuesAsync(long[] series, long[] timestamps, Column values) throws TsdbException {
         insertValues(series, timestamps, values);
     }
 
-    private void insertValues(int[] many, int one, long[] timestamps, Column c, int off, int n)
+    private void insertValues(long[] many, long one, long[] timestamps, Column c, int off, int n)
             throws TsdbException {
         Objects.requireNonNull(c, "values");
         Objects.checkFromIndexSize(off, n, timestamps.length);
@@ -830,7 +896,7 @@ public final class EmbeddedDb implements AutoCloseable {
             col.set(PTR, 8, columnValues(a, c, off, n));
             col.set(PTR, 16, validity(a, c, off, n));
             if (many != null) {
-                MemorySegment s = a.allocateFrom(JAVA_INT, MemorySegment.ofArray(many), JAVA_INT, off * 4L, n);
+                MemorySegment s = a.allocateFrom(JAVA_LONG, MemorySegment.ofArray(many), JAVA_LONG, off * 8L, n);
                 rc = (int) Native.INSERT_VALUES.invokeExact(d, s, ts, col, (long) n);
             } else {
                 rc = (int) Native.INSERT_SERIES_VALUES.invokeExact(d, one, ts, col, (long) n);
@@ -888,7 +954,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param value the value
      * @throws TsdbException e.g. {@link Status#ERR_INVALID} if the series is not float32
      */
-    public void append(int series, long timestamp, float value) throws TsdbException {
+    public void append(long series, long timestamp, float value) throws TsdbException {
         MemorySegment d = enter();
         try {
             int rc;
@@ -916,6 +982,8 @@ public final class EmbeddedDb implements AutoCloseable {
     private static final MemorySegment VALUES_STUB = Native.upcall(MethodHandles.lookup(), "valuesChunk",
             Native.VALUES_FN);
     private static final MemorySegment PART_STUB = Native.upcall(MethodHandles.lookup(), "partInfo", Native.PART_FN);
+    private static final MemorySegment SERIES_STUB = Native.upcall(MethodHandles.lookup(), "seriesId",
+            Native.SERIES_FN);
 
     /* the calling thread's last query statistics, copied right after each query: a virtual thread may run on
      * another carrier (with other C thread-locals) by the time it asks */
@@ -1160,7 +1228,7 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /** Runs a streaming query and returns true unless the consumer stopped it. */
-    private boolean stream(Sink s, int series, long start, long end, Order order, long limit, boolean typed)
+    private boolean stream(Sink s, long series, long start, long end, Order order, long limit, boolean typed)
             throws TsdbException {
         return stream(s, series, start, end, order, limit, typed ? VALUES : RAW, 0);
     }
@@ -1168,7 +1236,7 @@ public final class EmbeddedDb implements AutoCloseable {
     private static final int RAW = 0, VALUES = 1, LTTB = 2;
 
     /** Runs a streaming query of {@code kind} ({@code threshold} for LTTB only). */
-    private boolean stream(Sink s, int series, long start, long end, Order order, long limit, int kind,
+    private boolean stream(Sink s, long series, long start, long end, Order order, long limit, int kind,
                            long threshold) throws TsdbException {
         MemorySegment d = enter();
         long id = IDS.getAndIncrement();
@@ -1216,9 +1284,9 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param end the first timestamp excluded
      * @return the points
      * @throws TsdbException with {@link Status#ERR_INVALID} for a series of another type (use
-     *     {@link #queryValues(int, long, long)})
+     *     {@link #queryValues(long, long, long)})
      */
-    public Points queryPoints(int series, long start, long end) throws TsdbException {
+    public Points queryPoints(long series, long start, long end) throws TsdbException {
         return queryPoints(series, start, end, Order.ASC, 0);
     }
 
@@ -1234,7 +1302,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a series of another type
      * @throws IllegalArgumentException for a negative limit
      */
-    public Points queryPoints(int series, long start, long end, Order order, long limit) throws TsdbException {
+    public Points queryPoints(long series, long start, long end, Order order, long limit) throws TsdbException {
         MemorySegment d = enter();
         int rc;
         try (Arena a = Arena.ofConfined()) {
@@ -1286,7 +1354,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return true if every point was delivered, false if the consumer stopped
      * @throws TsdbException with {@link Status#ERR_INVALID} for a series of another type
      */
-    public boolean queryRaw(int series, long start, long end, RawConsumer consumer) throws TsdbException {
+    public boolean queryRaw(long series, long start, long end, RawConsumer consumer) throws TsdbException {
         return queryRaw(series, start, end, Order.ASC, 0, consumer);
     }
 
@@ -1307,7 +1375,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a series of another type
      * @throws IllegalArgumentException for a negative limit
      */
-    public boolean queryRaw(int series, long start, long end, Order order, long limit, RawConsumer consumer)
+    public boolean queryRaw(long series, long start, long end, Order order, long limit, RawConsumer consumer)
             throws TsdbException {
         Objects.requireNonNull(consumer, "consumer");
         Sink s = Sink.take();
@@ -1328,7 +1396,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the points
      * @throws TsdbException e.g. {@link Status#ERR_NOTFOUND} for an unknown series
      */
-    public ValuePoints queryValues(int series, long start, long end) throws TsdbException {
+    public ValuePoints queryValues(long series, long start, long end) throws TsdbException {
         return queryValues(series, start, end, Order.ASC, 0);
     }
 
@@ -1344,7 +1412,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException e.g. {@link Status#ERR_NOTFOUND} for an unknown series
      * @throws IllegalArgumentException for a negative limit
      */
-    public ValuePoints queryValues(int series, long start, long end, Order order, long limit) throws TsdbException {
+    public ValuePoints queryValues(long series, long start, long end, Order order, long limit) throws TsdbException {
         ValueType type = seriesType(series);
         Sink s = new Sink();
         s.collect = true;
@@ -1365,14 +1433,14 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return true if every point was delivered, false if the consumer stopped
      * @throws TsdbException e.g. {@link Status#ERR_NOTFOUND} for an unknown series
      */
-    public boolean queryValues(int series, long start, long end, ValuesConsumer consumer) throws TsdbException {
+    public boolean queryValues(long series, long start, long end, ValuesConsumer consumer) throws TsdbException {
         return queryValues(series, start, end, Order.ASC, 0, consumer);
     }
 
     /**
      * Streams the points of a series of any type in {@code [start, end)} in the given order, at most {@code limit}
      * of them, in chunks of up to {@link #CHUNK} points; as
-     * {@link #queryRaw(int, long, long, Order, long, RawConsumer)} otherwise.
+     * {@link #queryRaw(long, long, long, Order, long, RawConsumer)} otherwise.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1384,7 +1452,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException e.g. {@link Status#ERR_NOTFOUND} for an unknown series
      * @throws IllegalArgumentException for a negative limit
      */
-    public boolean queryValues(int series, long start, long end, Order order, long limit, ValuesConsumer consumer)
+    public boolean queryValues(long series, long start, long end, Order order, long limit, ValuesConsumer consumer)
             throws TsdbException {
         Objects.requireNonNull(consumer, "consumer");
         Sink s = Sink.take();
@@ -1441,7 +1509,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the buckets
      * @throws TsdbException e.g. {@link Status#ERR_TOO_MANY_BUCKETS}
      */
-    public List<Bucket> queryAgg(int series, long start, long end, long intervalMs) throws TsdbException {
+    public List<Bucket> queryAgg(long series, long start, long end, long intervalMs) throws TsdbException {
         return queryAgg(series, start, end, intervalMs, Order.ASC, 0);
     }
 
@@ -1458,7 +1526,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException e.g. {@link Status#ERR_TOO_MANY_BUCKETS}
      * @throws IllegalArgumentException for a negative limit
      */
-    public List<Bucket> queryAgg(int series, long start, long end, long intervalMs, Order order, long limit)
+    public List<Bucket> queryAgg(long series, long start, long end, long intervalMs, Order order, long limit)
             throws TsdbException {
         checkOpts(order, limit);
         return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_AGG_EX.invokeExact(d, series, start, end,
@@ -1476,7 +1544,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the buckets with rows, oldest first
      * @throws TsdbException e.g. {@link Status#ERR_TOO_MANY_BUCKETS}
      */
-    public List<Bucket> queryGroup(int series, long start, long end, Group group) throws TsdbException {
+    public List<Bucket> queryGroup(long series, long start, long end, Group group) throws TsdbException {
         return queryGroup(series, start, end, group, Order.ASC, 0);
     }
 
@@ -1494,7 +1562,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException e.g. {@link Status#ERR_TOO_MANY_BUCKETS}
      * @throws IllegalArgumentException for a negative limit
      */
-    public List<Bucket> queryGroup(int series, long start, long end, Group group, Order order, long limit)
+    public List<Bucket> queryGroup(long series, long start, long end, Group group, Order order, long limit)
             throws TsdbException {
         if (group != null && group.zone() != null && !group.zone().normalized().equals(ZoneOffset.UTC)) {
             Objects.requireNonNull(order, "order");
@@ -1532,7 +1600,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * The same grouping done by the engine's own calendar code ({@code tsdb_query_group_local}): for checking that
      * it and {@link Group#bounds} agree.
      */
-    List<Bucket> queryGroupNative(int series, long start, long end, Group group, Order order, long limit)
+    List<Bucket> queryGroupNative(long series, long start, long end, Group group, Order order, long limit)
             throws TsdbException {
         MemorySegment d = enter();
         int rc;
@@ -1596,7 +1664,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not strictly increase
      * @throws IllegalArgumentException if there are no bounds
      */
-    public List<Bucket> queryBounds(int series, long start, long end, long[] bounds) throws TsdbException {
+    public List<Bucket> queryBounds(long series, long start, long end, long[] bounds) throws TsdbException {
         return queryBounds(series, start, end, bounds, Order.ASC, 0);
     }
 
@@ -1614,7 +1682,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not strictly increase
      * @throws IllegalArgumentException if there are no bounds, or for a negative limit
      */
-    public List<Bucket> queryBounds(int series, long start, long end, long[] bounds, Order order, long limit)
+    public List<Bucket> queryBounds(long series, long start, long end, long[] bounds, Order order, long limit)
             throws TsdbException {
         if (bounds.length == 0)
             throw new IllegalArgumentException("no bounds");
@@ -1699,7 +1767,7 @@ public final class EmbeddedDb implements AutoCloseable {
 
     /**
      * True for a group in a zone other than UTC. Its periods become bounds here, with {@link Group#bounds}
-     * (java.time), as in {@link #queryGroup(int, long, long, Group, Order, long)} and {@link TsdbClient}: the
+     * (java.time), as in {@link #queryGroup(long, long, long, Group, Order, long)} and {@link TsdbClient}: the
      * engine's calendar reads the system's tzdata and knows other zone ids than the JDK ("UTC+2", "GMT-05:30"), so
      * handing it the zone would group differently from those.
      */
@@ -1724,7 +1792,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * to the first and last row there is; the time-weighted averages ({@code bounded}) cover a bounded side to its
      * end, since a reading before the range carries into it, and cut only an open side.
      */
-    private long[] localBounds(int series, long start, long end, Group group, boolean bounded) throws TsdbException {
+    private long[] localBounds(long series, long start, long end, Group group, boolean bounded) throws TsdbException {
         long lo = start, hi = end == Long.MAX_VALUE ? Long.MIN_VALUE : end - 1;
         if (!bounded || start == Long.MIN_VALUE) {
             ValuePoints first = queryValues(series, start, end, Order.ASC, 1);
@@ -1752,7 +1820,7 @@ public final class EmbeddedDb implements AutoCloseable {
 
     /**
      * Aggregates a series over {@code [start, end)} in fixed intervals, oldest first, with the spread of each bucket:
-     * range, population and sample variance and standard deviation. As {@link TsdbClient#querySpread(int, long,
+     * range, population and sample variance and standard deviation. As {@link TsdbClient#querySpread(long, long,
      * long, long)}.
      *
      * @param series the series id
@@ -1762,12 +1830,12 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the buckets with rows
      * @throws TsdbException e.g. {@link Status#ERR_INVALID} for a negative interval
      */
-    public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs) throws TsdbException {
+    public List<SpreadBucket> querySpread(long series, long start, long end, long intervalMs) throws TsdbException {
         return querySpread(series, start, end, intervalMs, Order.ASC, 0);
     }
 
     /**
-     * As {@link #querySpread(int, long, long, long)}, in the given order, at most {@code limit} buckets.
+     * As {@link #querySpread(long, long, long, long)}, in the given order, at most {@code limit} buckets.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1779,7 +1847,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException e.g. {@link Status#ERR_INVALID} for a negative interval
      * @throws IllegalArgumentException for a negative limit
      */
-    public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs, Order order, long limit)
+    public List<SpreadBucket> querySpread(long series, long start, long end, long intervalMs, Order order, long limit)
             throws TsdbException {
         checkOpts(order, limit);
         return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_SPREAD.invokeExact(d, series, start, end,
@@ -1788,7 +1856,7 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /**
-     * The spread in calendar buckets, as {@link #queryGroup(int, long, long, Group, Order, long)} groups; the
+     * The spread in calendar buckets, as {@link #queryGroup(long, long, long, Group, Order, long)} groups; the
      * periods of a zone other than UTC become bounds here ({@link Group#bounds}) over the rows there are.
      *
      * @param series the series id
@@ -1801,7 +1869,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException e.g. {@link Status#ERR_TOO_MANY_BUCKETS}
      * @throws IllegalArgumentException for a negative limit
      */
-    public List<SpreadBucket> querySpreadGroup(int series, long start, long end, Group group, Order order,
+    public List<SpreadBucket> querySpreadGroup(long series, long start, long end, Group group, Order order,
                                                long limit) throws TsdbException {
         checkOpts(order, limit);
         if (local(group)) {
@@ -1815,7 +1883,7 @@ public final class EmbeddedDb implements AutoCloseable {
 
     /**
      * The spread in buckets that begin at the given UTC instants, as
-     * {@link #queryBounds(int, long, long, long[], Order, long)}.
+     * {@link #queryBounds(long, long, long, long[], Order, long)}.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1827,7 +1895,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not strictly increase
      * @throws IllegalArgumentException if there are no bounds, or for a negative limit
      */
-    public List<SpreadBucket> querySpreadBounds(int series, long start, long end, long[] bounds, Order order,
+    public List<SpreadBucket> querySpreadBounds(long series, long start, long end, long[] bounds, Order order,
                                                 long limit) throws TsdbException {
         checkBounds(bounds);
         checkOpts(order, limit);
@@ -1849,7 +1917,7 @@ public final class EmbeddedDb implements AutoCloseable {
 
     /**
      * Time-weighted averages of a series over {@code [start, end)} in fixed intervals: each reading weighted by how
-     * long it held. As {@link TsdbClient#queryTwa(int, long, long, long, TwaOptions)}.
+     * long it held. As {@link TsdbClient#queryTwa(long, long, long, long, TwaOptions)}.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1859,7 +1927,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the buckets with readings or coverage
      * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval or a state series
      */
-    public List<TwaBucket> queryTwa(int series, long start, long end, long intervalMs, TwaOptions opts)
+    public List<TwaBucket> queryTwa(long series, long start, long end, long intervalMs, TwaOptions opts)
             throws TsdbException {
         Objects.requireNonNull(opts, "opts");
         return arrayQuery((d, a, out, nout) -> (int) Native.QUERY_TWA.invokeExact(d, series, start, end, intervalMs,
@@ -1878,7 +1946,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the buckets with readings or coverage
      * @throws TsdbException with {@link Status#ERR_INVALID} for a state series
      */
-    public List<TwaBucket> queryTwaGroup(int series, long start, long end, Group group, TwaOptions opts)
+    public List<TwaBucket> queryTwaGroup(long series, long start, long end, Group group, TwaOptions opts)
             throws TsdbException {
         Objects.requireNonNull(opts, "opts");
         if (local(group)) {
@@ -1902,7 +1970,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} if the bounds do not increase or for a state series
      * @throws IllegalArgumentException if there are no bounds
      */
-    public List<TwaBucket> queryTwaBounds(int series, long start, long end, long[] bounds, TwaOptions opts)
+    public List<TwaBucket> queryTwaBounds(long series, long start, long end, long[] bounds, TwaOptions opts)
             throws TsdbException {
         Objects.requireNonNull(opts, "opts");
         checkBounds(bounds);
@@ -1916,7 +1984,7 @@ public final class EmbeddedDb implements AutoCloseable {
     /**
      * Downsamples a series for a chart: at most {@code threshold} points of {@code [start, end)} that keep the shape
      * of the line (Largest-Triangle-Three-Buckets), oldest first, with their stored values. As
-     * {@link TsdbClient#queryLttb(int, long, long, long)}.
+     * {@link TsdbClient#queryLttb(long, long, long, long)}.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1926,12 +1994,12 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold below 3 or a state series; an unknown
      *     series has no points, as over TCP
      */
-    public ValuePoints queryLttb(int series, long start, long end, long threshold) throws TsdbException {
+    public ValuePoints queryLttb(long series, long start, long end, long threshold) throws TsdbException {
         return queryLttb(series, start, end, threshold, Order.ASC, 0);
     }
 
     /**
-     * As {@link #queryLttb(int, long, long, long)}, newest first with {@link Order#DESC} and only the first
+     * As {@link #queryLttb(long, long, long, long)}, newest first with {@link Order#DESC} and only the first
      * {@code limit} of the chosen points in that order; the choice does not change.
      *
      * @param series the series id
@@ -1941,10 +2009,10 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param order oldest or newest first
      * @param limit the most points to return; 0 for all
      * @return the chosen points
-     * @throws TsdbException as {@link #queryLttb(int, long, long, long)}
+     * @throws TsdbException as {@link #queryLttb(long, long, long, long)}
      * @throws IllegalArgumentException for a negative limit
      */
-    public ValuePoints queryLttb(int series, long start, long end, long threshold, Order order, long limit)
+    public ValuePoints queryLttb(long series, long start, long end, long threshold, Order order, long limit)
             throws TsdbException {
         checkOpts(order, limit);
         /* as tsdbd and the Rust Db: the threshold is checked first, and an unknown series has no points */
@@ -2009,7 +2077,7 @@ public final class EmbeddedDb implements AutoCloseable {
         return v == null ? MemorySegment.NULL : a.allocateFrom(JAVA_LONG, v);
     }
 
-    private <T> List<SeriesResult<T>> multiCollect(MultiCall q, int[] series, MultiOptions m, SeriesReader<T> reader)
+    private <T> List<SeriesResult<T>> multiCollect(MultiCall q, long[] series, MultiOptions m, SeriesReader<T> reader)
             throws TsdbException {
         int n = series.length;
         MemorySegment d = enter();
@@ -2032,7 +2100,7 @@ public final class EmbeddedDb implements AutoCloseable {
             if (q.twa != null)
                 MemorySegment.copy(twaOpts(a, q.twa), 0, qs, Native.offset(Native.MULTI_QUERY, "twa"),
                         Native.TWA_OPTS.byteSize());
-            MemorySegment ids = n == 0 ? MemorySegment.NULL : a.allocateFrom(JAVA_INT, series);
+            MemorySegment ids = n == 0 ? MemorySegment.NULL : a.allocateFrom(JAVA_LONG, series);
             MemorySegment mo = a.allocate(Native.MULTI_OPTS).fill((byte) 0);
             mo.set(JAVA_INT, Native.offset(Native.MULTI_OPTS, "threads"), m.threads());
             mo.set(JAVA_LONG, Native.offset(Native.MULTI_OPTS, "max_rows"), m.maxRows());
@@ -2150,7 +2218,7 @@ public final class EmbeddedDb implements AutoCloseable {
         };
     }
 
-    private static void checkMulti(int[] series, MultiOptions m) {
+    private static void checkMulti(long[] series, MultiOptions m) {
         Objects.requireNonNull(series, "series");
         Objects.requireNonNull(m, "options");
         if (m.starts() != null && m.starts().length != series.length)
@@ -2159,12 +2227,12 @@ public final class EmbeddedDb implements AutoCloseable {
             throw new IllegalArgumentException(m.ends().length + " ends for " + series.length + " series");
     }
 
-    private List<SeriesResult<ValuePoints>> rowsMulti(MultiCall q, int[] series, MultiOptions m)
+    private List<SeriesResult<ValuePoints>> rowsMulti(MultiCall q, long[] series, MultiOptions m)
             throws TsdbException {
         checkOpts(q.order, q.limit);
         checkMulti(series, m);
         List<SeriesResult<ValuePoints>> r = multiCollect(q, series, m, EmbeddedDb::readValues);
-        Map<Integer, ValueType> types = new HashMap<>();
+        Map<Long, ValueType> types = new HashMap<>();
         for (int i = 0; i < r.size(); i++) {
             if (!r.get(i).ok() || r.get(i).get() != null)
                 continue;
@@ -2186,9 +2254,9 @@ public final class EmbeddedDb implements AutoCloseable {
 
     /**
      * The rows of every series in {@code series} over {@code [start, end)} (or each series' own range from
-     * {@code m}), as {@link #queryValues(int, long, long, Order, long)} gives them for one, in one call, on up to
+     * {@code m}), as {@link #queryValues(long, long, long, Order, long)} gives them for one, in one call, on up to
      * {@code m.threads()} threads ({@link EmbeddedOptions#requestThreads}). As
-     * {@link TsdbClient#queryValuesMulti(int[], long, long, Order, long, MultiOptions)}: every series reads the
+     * {@link TsdbClient#queryValuesMulti(long[], long, long, Order, long, MultiOptions)}: every series reads the
      * same instant of each volume, an unknown id has no rows.
      *
      * @param series the series ids; an id may come more than once
@@ -2200,7 +2268,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return one result per series, in the order of {@code series}
      * @throws TsdbException {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} rows in all
      */
-    public List<SeriesResult<ValuePoints>> queryValuesMulti(int[] series, long start, long end, Order order,
+    public List<SeriesResult<ValuePoints>> queryValuesMulti(long[] series, long start, long end, Order order,
                                                             long limit, MultiOptions m) throws TsdbException {
         MultiCall q = new MultiCall(Native.MULTI_VALUES, start, end);
         q.order = order;
@@ -2209,7 +2277,7 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /**
-     * LTTB of every series in {@code series}, as {@link #queryLttb(int, long, long, long, Order, long)} gives it for
+     * LTTB of every series in {@code series}, as {@link #queryLttb(long, long, long, long, Order, long)} gives it for
      * one, in one call. As {@link TsdbClient#queryLttbMulti}.
      *
      * @param series the series ids
@@ -2222,7 +2290,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return one result per series, in the order of {@code series}
      * @throws TsdbException {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} rows in all
      */
-    public List<SeriesResult<ValuePoints>> queryLttbMulti(int[] series, long start, long end, long threshold,
+    public List<SeriesResult<ValuePoints>> queryLttbMulti(long[] series, long start, long end, long threshold,
                                                           Order order, long limit, MultiOptions m)
             throws TsdbException {
         MultiCall q = new MultiCall(Native.MULTI_LTTB, start, end);
@@ -2247,7 +2315,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException {@link Status#ERR_INVALID} for a negative {@link Buckets#every} interval,
      *     {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} buckets in all
      */
-    public List<SeriesResult<List<Bucket>>> queryBucketsMulti(int[] series, long start, long end, Buckets b,
+    public List<SeriesResult<List<Bucket>>> queryBucketsMulti(long[] series, long start, long end, Buckets b,
                                                               Order order, long limit, MultiOptions m)
             throws TsdbException {
         MultiCall q = new MultiCall(Native.MULTI_BUCKETS, start, end);
@@ -2271,7 +2339,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return one result per series, in the order of {@code series}
      * @throws TsdbException as {@link #queryBucketsMulti}
      */
-    public List<SeriesResult<List<SpreadBucket>>> querySpreadMulti(int[] series, long start, long end, Buckets b,
+    public List<SeriesResult<List<SpreadBucket>>> querySpreadMulti(long[] series, long start, long end, Buckets b,
                                                                    Order order, long limit, MultiOptions m)
             throws TsdbException {
         MultiCall q = new MultiCall(Native.MULTI_SPREAD, start, end);
@@ -2294,7 +2362,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return one result per series, in the order of {@code series}
      * @throws TsdbException as {@link #queryBucketsMulti}
      */
-    public List<SeriesResult<List<TwaBucket>>> queryTwaMulti(int[] series, long start, long end, Buckets b,
+    public List<SeriesResult<List<TwaBucket>>> queryTwaMulti(long[] series, long start, long end, Buckets b,
                                                              TwaOptions opts, MultiOptions m) throws TsdbException {
         Objects.requireNonNull(opts, "opts");
         MultiCall q = new MultiCall(Native.MULTI_TWA, start, end);
@@ -2305,10 +2373,10 @@ public final class EmbeddedDb implements AutoCloseable {
 
     /** The single call of a bucket kind for one series and a local group. */
     private interface SingleGroup<T> {
-        List<T> call(int series, long start, long end, Group g) throws TsdbException;
+        List<T> call(long series, long start, long end, Group g) throws TsdbException;
     }
 
-    private <T> List<SeriesResult<List<T>>> bucketMulti(MultiCall q, Buckets b, int[] series, MultiOptions m,
+    private <T> List<SeriesResult<List<T>>> bucketMulti(MultiCall q, Buckets b, long[] series, MultiOptions m,
                                                         SeriesReader<List<T>> reader, SingleGroup<T> single)
             throws TsdbException {
         Objects.requireNonNull(b, "buckets");
@@ -2348,7 +2416,7 @@ public final class EmbeddedDb implements AutoCloseable {
     }
 
     /** Calendar periods in a zone: one union of bounds, trimmed per series by the engine. */
-    private <T> List<SeriesResult<List<T>>> multiLocal(MultiCall q, Group g, int[] series, MultiOptions m,
+    private <T> List<SeriesResult<List<T>>> multiLocal(MultiCall q, Group g, long[] series, MultiOptions m,
                                                        SeriesReader<List<T>> reader, SingleGroup<T> single)
             throws TsdbException {
         int n = series.length;
@@ -2439,7 +2507,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param end the first timestamp kept after the range
      * @throws TsdbException e.g. {@link Status#ERR_READONLY}
      */
-    public void deleteRange(int series, long start, long end) throws TsdbException {
+    public void deleteRange(long series, long start, long end) throws TsdbException {
         MemorySegment d = enter();
         try {
             int rc;
@@ -2468,7 +2536,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a timestamp outside the range or a column of another
      *     type than the series
      */
-    public void replaceRange(int series, long start, long end, long[] timestamps, Column values)
+    public void replaceRange(long series, long start, long end, long[] timestamps, Column values)
             throws TsdbException {
         Objects.requireNonNull(timestamps, "timestamps");
         Objects.requireNonNull(values, "values");
@@ -2503,7 +2571,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a negative limit, {@link Status#ERR_NOTFOUND} for an
      *     unknown series
      */
-    public void setRetention(int series, long limitMs) throws TsdbException {
+    public void setRetention(long series, long limitMs) throws TsdbException {
         MemorySegment d = enter();
         try {
             int rc;
@@ -2525,7 +2593,7 @@ public final class EmbeddedDb implements AutoCloseable {
      * @return the age limit in ms, 0 for none
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown series
      */
-    public long retention(int series) throws TsdbException {
+    public long retention(long series) throws TsdbException {
         MemorySegment d = enter();
         try (Arena a = Arena.ofConfined()) {
             MemorySegment v = a.allocate(JAVA_LONG);

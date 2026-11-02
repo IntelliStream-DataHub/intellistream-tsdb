@@ -108,9 +108,10 @@ fn kind_of(dataset: Option<usize>, s: u32) -> usize {
     dataset.unwrap_or(s as usize % (KINDS.len() - 1)) // mixed: no random
 }
 
-/// One writer's batches: its series' rows in file order (time-major), cut like tsdb-bench's.
+/// One writer's batches: its series' rows in file order (time-major), cut like tsdb-bench's. `series` holds
+/// the file's indexes until `load` turns them into the database's ids.
 struct Batches {
-    series: Vec<u32>,
+    series: Vec<u64>,
     ts: Vec<i64>,
     values: Vec<f32>,
     rows_per_batch: usize,
@@ -138,7 +139,7 @@ fn read_rows(path: &str, threads: usize, batch: usize) -> (u32, u64, Vec<Batches
     for r in data.chunks_exact(16) {
         let (s, t, v) = rec(r);
         let w = (0..threads).find(|&i| s < lo(i + 1)).unwrap();
-        out[w].series.push(s);
+        out[w].series.push(s.into());
         out[w].ts.push(t);
         out[w].values.push(v);
     }
@@ -146,9 +147,11 @@ fn read_rows(path: &str, threads: usize, batch: usize) -> (u32, u64, Vec<Batches
 }
 
 fn load(db: &Db, a: &Args, path: &str) {
-    let (nseries, total, writers) = read_rows(path, a.threads, a.batch);
-    for s in 0..nseries {
-        db.series(&format!("{}.{s}", KINDS[kind_of(a.dataset, s)].0)).expect("series");
+    let (nseries, total, mut writers) = read_rows(path, a.threads, a.batch);
+    let ids: Vec<u64> =
+        (0..nseries).map(|s| db.series(&format!("{}.{s}", KINDS[kind_of(a.dataset, s)].0)).expect("series")).collect();
+    for w in &mut writers {
+        w.series.iter_mut().for_each(|s| *s = ids[*s as usize]);
     }
     println!(
         "embedded_suite: {nseries} series, {:.1} M rows from {path}, batch {} rows, {} writer threads, zstd {}, \
@@ -189,14 +192,15 @@ fn load(db: &Db, a: &Args, path: &str) {
     );
 }
 
-/// What the queries need to know about the data: series count, points per series, steps.
+/// What the queries need to know about the data: series count, their ids, points per series, steps.
 struct Shape {
     series: u32,
+    ids: Vec<u64>,
     points: u64,
     step: Vec<i64>,
 }
 
-fn raw_rows(db: &Db, s: u32, range: std::ops::Range<i64>) -> (u64, f64) {
+fn raw_rows(db: &Db, s: u64, range: std::ops::Range<i64>) -> (u64, f64) {
     let (mut n, mut last) = (0u64, 0f64);
     db.query_raw(s, range, QueryOpts::asc(), |_ts, v| {
         n += v.len() as u64;
@@ -227,8 +231,8 @@ fn qps(db: &Db, sh: &Shape, seconds: f64, c: &Class, threads: usize) {
                     while t0.elapsed().as_secs_f64() < seconds {
                         for _ in 0..64 {
                             r = ds_mix(r);
-                            let s = (r % sh.series as u64) as u32;
-                            let step = sh.step[s as usize];
+                            let i = (r % sh.series as u64) as usize;
+                            let (s, step) = (sh.ids[i], sh.step[i]);
                             let span = if sh.points > window { sh.points - window } else { 1 };
                             let start = T0 + ((r >> 20) % span) as i64 * step;
                             let end = start + window as i64 * step;
@@ -270,7 +274,7 @@ fn queries(db: &Db, sh: &Shape, seconds: f64) {
 
     let t0 = Instant::now();
     let mut rows = 0u64;
-    for s in 0..sh.series {
+    for &s in &sh.ids {
         rows += raw_rows(db, s, i64::MIN..i64::MAX).0;
     }
     let tr = t0.elapsed().as_secs_f64();
@@ -289,8 +293,8 @@ fn queries(db: &Db, sh: &Shape, seconds: f64) {
     for (label, bucket) in aggs {
         let t0 = Instant::now();
         let (mut rows, mut buckets) = (0u64, 0usize);
-        for s in 0..sh.series {
-            let b = db.query_agg(s, i64::MIN..i64::MAX, bucket * sh.step[s as usize]).expect("agg");
+        for (&s, &step) in sh.ids.iter().zip(&sh.step) {
+            let b = db.query_agg(s, i64::MIN..i64::MAX, bucket * step).expect("agg");
             rows += b.iter().map(|b| b.count).sum::<u64>();
             buckets += b.len();
         }
@@ -318,7 +322,7 @@ fn queries(db: &Db, sh: &Shape, seconds: f64) {
         for _ in 0..3 {
             let t0 = Instant::now();
             (rows, buckets) = (0, 0);
-            for s in 0..sh.series {
+            for &s in &sh.ids {
                 let b = db.query_group(s, i64::MIN..i64::MAX, Some(g), QueryOpts::asc()).expect("group");
                 rows += b.iter().map(|b| b.count).sum::<u64>();
                 buckets += b.len();
@@ -357,16 +361,18 @@ fn main() {
     if let Some(path) = &a.load {
         load(&db, &a, path);
     }
-    let series = db.series_count();
-    let step: Vec<i64> = (0..series)
-        .map(|s| {
+    let ids = db.series_ids().expect("series ids");
+    let series = ids.len() as u32;
+    let step: Vec<i64> = ids
+        .iter()
+        .map(|&s| {
             let name = db.series_name(s).expect("series name");
             let kind = name.split('.').next().unwrap_or("");
             KINDS.iter().find(|k| k.0 == kind).map_or_else(|| panic!("series {name}: not tsdb-bench's"), |k| k.1)
         })
         .collect();
     let rows = db.stats().expect("stats").rows;
-    let sh = Shape { series, points: if series > 0 { rows / series as u64 } else { 0 }, step };
+    let sh = Shape { series, ids, points: if series > 0 { rows / series as u64 } else { 0 }, step };
     queries(&db, &sh, a.seconds);
     db.close().expect("close");
 }

@@ -40,6 +40,11 @@ const char *tsdb_version(void);
 
 typedef struct tsdb tsdb;
 
+/* A series id: 64 bits, handed out by tsdb_series* and valid for the life of the database. Treat it as an opaque
+ * number: ids are not dense (do not loop over 0 .. tsdb_series_count() - 1; use tsdb_series_foreach), and an id
+ * the database never handed out is unknown to every call. */
+typedef uint64_t tsdb_sid;
+
 enum {
     TSDB_OK = 0,
     TSDB_ERR_IO = -1,
@@ -160,17 +165,20 @@ typedef struct tsdb_values {
  * absolute, without control characters or "." and ".." components
  * (TSDB_ERR_INVALID), and name a volume (TSDB_ERR_NOTFOUND otherwise, unless
  * create_volumes adds it). A symlink to a volume names that volume. */
-int tsdb_series(tsdb *db, const char *name, uint32_t *id);        /* get or create in the database directory */
-int tsdb_series_at(tsdb *db, const char *name, const char *path, uint32_t *id); /* get or create in volume `path` */
-int tsdb_series_lookup(tsdb *db, const char *name, uint32_t *id); /* TSDB_ERR_NOTFOUND if missing */
+int tsdb_series(tsdb *db, const char *name, tsdb_sid *id);        /* get or create in the database directory */
+int tsdb_series_at(tsdb *db, const char *name, const char *path, tsdb_sid *id); /* get or create in volume `path` */
+int tsdb_series_lookup(tsdb *db, const char *name, tsdb_sid *id); /* TSDB_ERR_NOTFOUND if missing */
 /* Get or create a series of `type` in volume `path` (NULL: the database
  * directory). An existing series keeps its type: asking for another one is
  * TSDB_ERR_INVALID. tsdb_series and tsdb_series_at create float32 series. */
-int tsdb_series_create(tsdb *db, const char *name, tsdb_type type, const char *path, uint32_t *id);
-int tsdb_series_type(tsdb *db, uint32_t id, tsdb_type *type);
-uint32_t tsdb_series_count(tsdb *db);
-const char *tsdb_series_name(tsdb *db, uint32_t id); /* valid until tsdb_close */
-const char *tsdb_series_path(tsdb *db, uint32_t id); /* its volume's directory */
+int tsdb_series_create(tsdb *db, const char *name, tsdb_type type, const char *path, tsdb_sid *id);
+int tsdb_series_type(tsdb *db, tsdb_sid id, tsdb_type *type);
+uint64_t tsdb_series_count(tsdb *db);
+/* Calls fn once for every series (those of one volume in creation order; no order across volumes is promised);
+ * stops at the first non-zero return of fn and returns it, 0 when every call returned 0. */
+int tsdb_series_foreach(tsdb *db, int (*fn)(void *ctx, tsdb_sid id), void *ctx);
+const char *tsdb_series_name(tsdb *db, tsdb_sid id); /* valid until tsdb_close */
+const char *tsdb_series_path(tsdb *db, tsdb_sid id); /* its volume's directory */
 uint32_t tsdb_volume_count(tsdb *db);                /* 1 + the extra volumes */
 const char *tsdb_volume_path(tsdb *db, uint32_t index);
 /* Adds volume `path` (made if missing, one level; its parent must exist) and
@@ -196,14 +204,14 @@ int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index);
  * fails the whole call with TSDB_ERR_INVALID (and so does tsdb_append, and
  * a replace): no query range could reach it.
  */
-int tsdb_insert(tsdb *db, const uint32_t *series, const int64_t *ts, const float *values, size_t n);
-int tsdb_insert_series(tsdb *db, uint32_t series, const int64_t *ts, const float *values, size_t n);
+int tsdb_insert(tsdb *db, const tsdb_sid *series, const int64_t *ts, const float *values, size_t n);
+int tsdb_insert_series(tsdb *db, tsdb_sid series, const int64_t *ts, const float *values, size_t n);
 
 /* The same for any value type, and with nulls. Every series of one call
  * must have the column's type (TSDB_ERR_INVALID otherwise); the float32
  * calls above are these with a float32 column and no nulls. */
-int tsdb_insert_values(tsdb *db, const uint32_t *series, const int64_t *ts, const tsdb_values *values, size_t n);
-int tsdb_insert_series_values(tsdb *db, uint32_t series, const int64_t *ts, const tsdb_values *values, size_t n);
+int tsdb_insert_values(tsdb *db, const tsdb_sid *series, const int64_t *ts, const tsdb_values *values, size_t n);
+int tsdb_insert_series_values(tsdb *db, tsdb_sid series, const int64_t *ts, const tsdb_values *values, size_t n);
 
 /* ---- deleting ----
  * tsdb_delete_range deletes every value of one series with start <= ts < end.
@@ -222,8 +230,8 @@ int tsdb_insert_series_values(tsdb *db, uint32_t series, const int64_t *ts, cons
  * old values or the new ones, never a mix. Every ts must lie in [start, end)
  * (TSDB_ERR_INVALID otherwise); values as in tsdb_insert_series_values. n = 0
  * is a delete. */
-int tsdb_delete_range(tsdb *db, uint32_t series, int64_t start, int64_t end);
-int tsdb_replace_range(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+int tsdb_delete_range(tsdb *db, tsdb_sid series, int64_t start, int64_t end);
+int tsdb_replace_range(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const int64_t *ts,
                        const tsdb_values *values, size_t n);
 
 /* ---- retention ----
@@ -235,18 +243,18 @@ int tsdb_replace_range(tsdb *db, uint32_t series, int64_t start, int64_t end, co
  * them in the background, whole partitions go when every series in them has
  * expired. Raising a limit brings back only values merges have not removed yet.
  * The limit is durable when tsdb_set_retention returns. */
-int tsdb_set_retention(tsdb *db, uint32_t series, int64_t limit_ms);
-int tsdb_get_retention(tsdb *db, uint32_t series, int64_t *limit_ms);
+int tsdb_set_retention(tsdb *db, tsdb_sid series, int64_t limit_ms);
+int tsdb_get_retention(tsdb *db, tsdb_sid series, int64_t *limit_ms);
 
 /* State dictionary: names <-> codes (1, 2, ...), shared by the state series
  * of one volume. tsdb_state creates a name's code if needed; codes never
  * change. tsdb_state_name returns NULL for an unknown code. */
-int tsdb_state(tsdb *db, uint32_t series, const char *name, uint32_t *code);
-int tsdb_state_lookup(tsdb *db, uint32_t series, const char *name, uint32_t *code); /* TSDB_ERR_NOTFOUND */
-const char *tsdb_state_name(tsdb *db, uint32_t series, uint32_t code);              /* valid until tsdb_close */
+int tsdb_state(tsdb *db, tsdb_sid series, const char *name, uint32_t *code);
+int tsdb_state_lookup(tsdb *db, tsdb_sid series, const char *name, uint32_t *code); /* TSDB_ERR_NOTFOUND */
+const char *tsdb_state_name(tsdb *db, tsdb_sid series, uint32_t code);              /* valid until tsdb_close */
 
 /* A single point: WAL + memtable, visible at once, durable per wal_sync_ms. */
-int tsdb_append(tsdb *db, uint32_t series, int64_t ts, float value);
+int tsdb_append(tsdb *db, tsdb_sid series, int64_t ts, float value);
 /* Makes everything written so far durable without creating parts. */
 int tsdb_commit(tsdb *db);
 /* Commits, then turns the memtable into parts. */
@@ -258,14 +266,14 @@ int tsdb_flush(tsdb *db);
  * read as NaN; other types: TSDB_ERR_INVALID, use tsdb_query_values). The
  * arrays are only valid during the call. Return non-zero from fn to stop early. */
 typedef int (*tsdb_raw_fn)(void *ctx, const int64_t *ts, const float *values, size_t n);
-int tsdb_query_raw(tsdb *db, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx);
+int tsdb_query_raw(tsdb *db, tsdb_sid series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx);
 
 typedef struct tsdb_points {
     int64_t *ts;
     float *values;
     size_t n, cap;
 } tsdb_points;
-int tsdb_query_points(tsdb *db, uint32_t series, int64_t start, int64_t end, tsdb_points *out);
+int tsdb_query_points(tsdb *db, tsdb_sid series, int64_t start, int64_t end, tsdb_points *out);
 void tsdb_points_free(tsdb_points *p);
 /* Frees an array the library returned (buckets, bounds, ...). Callers in other
  * languages (embedded bindings) use it so the engine's allocator frees its own
@@ -309,7 +317,7 @@ static inline double tsdb_bucket_avg(const tsdb_bucket *b)
  * At most 4M buckets lie between the first and the last reading in range
  * (TSDB_ERR_TOO_MANY_BUCKETS beyond; the same for groups, bounds, the spread
  * and TWA), which bounds a query's memory to some 400 MB. */
-int tsdb_query_agg(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+int tsdb_query_agg(tsdb *db, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                    tsdb_bucket **out, size_t *nout);
 
 /* Order (by timestamp) and limit, for raw rows and for buckets. Descending
@@ -329,17 +337,17 @@ typedef struct tsdb_query_opts {
 } tsdb_query_opts;
 
 /* tsdb_query_agg with order and limit (opts NULL: as tsdb_query_agg). */
-int tsdb_query_agg_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+int tsdb_query_agg_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
-int tsdb_query_raw_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+int tsdb_query_raw_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_raw_fn fn, void *ctx);
-int tsdb_query_points_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+int tsdb_query_points_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                          tsdb_points *out);
 
 /* Raw points of a series of any type, with nulls. */
 typedef int (*tsdb_values_fn)(void *ctx, const int64_t *ts, const tsdb_values *values, size_t n);
-int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+int tsdb_query_values(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_values_fn fn, void *ctx);
 
 /* Downsampling for charts: Largest-Triangle-Three-Buckets (Steinarsson 2013)
@@ -366,13 +374,13 @@ int tsdb_query_values(tsdb *db, uint32_t series, int64_t start, int64_t end, con
  * It reads one snapshot, so concurrent writes and merges do not tear the
  * result. Query statistics describe one read of the range (the counting pass,
  * and for very large buckets a second pass for the means, are not counted). */
-int tsdb_query_lttb(tsdb *db, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+int tsdb_query_lttb(tsdb *db, tsdb_sid series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
                     void *ctx);
 /* The same points newest first (TSDB_DESC), or only the first `limit` of them in that order: the choice
  * does not change, since it needs every point of the range anyway (opts NULL: as tsdb_query_lttb). Newest first
  * holds at most min(limit, threshold) chosen points in memory, and none where the threshold keeps every point
  * (a backwards read that stops at the limit). */
-int tsdb_query_lttb_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, size_t threshold,
+int tsdb_query_lttb_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, size_t threshold,
                        const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx);
 
 /* Calendar grouping, in UTC: `count` units per bucket.
@@ -401,16 +409,16 @@ typedef struct tsdb_group {
     const char *timezone; /* NULL or "UTC"; clients turn other zones into bounds */
 } tsdb_group;
 
-int tsdb_query_group(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_group(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                      tsdb_bucket **out, size_t *nout);
 /* Buckets that begin at given UTC instants: bucket i covers [bounds[i],
  * bounds[i + 1]), the last one everything from bounds[n - 1] on; only rows in
  * [start, end) count. bounds must strictly increase. Reported starts are the
  * bounds; order and limit as in tsdb_query_group_ex. */
-int tsdb_query_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+int tsdb_query_bounds(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 /* group NULL: one bucket for the whole range. */
-int tsdb_query_group_ex(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_group_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout);
 
 /* ---- the spread: range, variance, standard deviation ----
@@ -445,11 +453,11 @@ typedef struct tsdb_spread_bucket {
     double stddev_pop, stddev_samp;
 } tsdb_spread_bucket;
 
-int tsdb_query_spread(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+int tsdb_query_spread(tsdb *db, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                       const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
-int tsdb_query_spread_group(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_spread_group(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                             const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
-int tsdb_query_spread_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *bounds,
+int tsdb_query_spread_bounds(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds,
                              size_t n, const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout);
 
 /* ---- time-weighted averages ----
@@ -511,13 +519,13 @@ typedef struct tsdb_twa_bucket {
 } tsdb_twa_bucket;
 
 /* interval_ms as in tsdb_query_agg (0: one bucket); opts NULL: STEP, no limit. Free with free(). */
-int tsdb_query_twa(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+int tsdb_query_twa(tsdb *db, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                    const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 /* UTC calendar groups as in tsdb_query_group (group NULL: one bucket). */
-int tsdb_query_twa_group(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_twa_group(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                          const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 /* Client bounds as in tsdb_query_bounds: segments before bounds[0] do not count. */
-int tsdb_query_twa_bounds(tsdb *db, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+int tsdb_query_twa_bounds(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                           const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout);
 
 /* ---- many series in one call ----
@@ -578,7 +586,7 @@ typedef struct tsdb_multi_query {
 
 typedef struct tsdb_series_result {
     size_t index; /* into series[] */
-    uint32_t series;
+    tsdb_sid series;
     int status;
     int last; /* the series' last call */
     size_t n;
@@ -601,11 +609,11 @@ typedef struct tsdb_multi_opts {
     void *hook_ctx;
 } tsdb_multi_opts;
 
-int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series, size_t n,
                      const tsdb_multi_opts *mo, tsdb_multi_fn fn, void *ctx);
 /* The same into out[n] (index order, one result per series, rows of VALUES joined); free with
  * tsdb_series_results_free. A per-series status is in out[i].status; the return value is the call's. */
-int tsdb_query_multi_collect(tsdb *db, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+int tsdb_query_multi_collect(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series, size_t n,
                              const tsdb_multi_opts *mo, tsdb_series_result **out);
 void tsdb_series_results_free(tsdb_series_result *r, size_t n);
 
@@ -694,7 +702,7 @@ typedef struct tsdb_part_info {
     int64_t start_ms, end_ms; /* the partition's time range [start_ms, end_ms) */
 } tsdb_part_info;
 /* The partition class of a series' newest rows (0..3, see tsdb_part_info.cls). */
-int tsdb_series_class(tsdb *db, uint32_t series, int *cls);
+int tsdb_series_class(tsdb *db, tsdb_sid series, int *cls);
 int tsdb_foreach_part(tsdb *db, void (*fn)(void *ctx, const tsdb_part_info *info), void *ctx);
 
 /* Read-only databases: pick up what the writer published since the last
@@ -726,6 +734,12 @@ typedef enum tsdb_struct_kind {
     TSDB_STRUCT_MULTI_OPTS = 14,
 } tsdb_struct_kind;
 size_t tsdb_struct_size(int kind);
+
+/* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
+ * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
+ * number they were written for when they load the library and refuse another. */
+#define TSDB_ABI_VERSION 1
+int tsdb_abi_version(void);
 
 #ifdef __cplusplus
 }

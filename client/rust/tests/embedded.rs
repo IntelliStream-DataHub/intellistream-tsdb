@@ -547,7 +547,7 @@ fn a_panicking_callback_does_not_cross_into_c() {
 #[test]
 fn threads_share_one_db() {
     let db = Arc::new(open());
-    let ids: Vec<u32> = (0..4).map(|t| db.series(&format!("thread.{t}")).unwrap()).collect();
+    let ids: Vec<u64> = (0..4).map(|t| db.series(&format!("thread.{t}")).unwrap()).collect();
     let mut handles = Vec::new();
     for (t, &id) in ids.iter().enumerate() {
         let db = Arc::clone(&db);
@@ -610,6 +610,39 @@ fn a_locked_directory_fails_cleanly() {
     assert_eq!(again.volumes()[0], dir.to_str().unwrap());
     assert!(!Db::simd_level().is_empty());
     done(again);
+}
+
+/// Ids are 64 bits: one the database never handed out is unknown to every call, and an id whose low 32 bits
+/// name a series (2^32 + id) never reaches that series.
+#[test]
+fn an_id_beyond_32_bits_is_unknown() {
+    let db = open();
+    let a = db.series("a").unwrap();
+    let b = db.series_create("b", ValueType::State, None).unwrap();
+    db.insert_series(a, &[T0], &[1.0]).unwrap();
+    for big in [a + (1 << 32), b + (1 << 32), u64::MAX, u32::MAX as u64 + 1] {
+        assert_eq!(status(db.insert_series(big, &[T0 + 1], &[2.0])), Some(Status::Invalid), "{big}");
+        assert_eq!(status(db.insert(&[a, big], &[T0 + 2, T0 + 3], &[3.0, 4.0])), Some(Status::Invalid));
+        assert_eq!(status(db.append(big, T0 + 4, 5.0)), Some(Status::Invalid));
+        assert_eq!(status(db.series_name(big)), Some(Status::NotFound));
+        assert_eq!(status(db.series_type(big)), Some(Status::NotFound));
+        assert!(db.state(big, "on").is_err());
+        assert!(db.delete_range(big, ..).is_err());
+        assert!(db.query_points(big, .., QueryOpts::asc()).map_or(true, |p| p.is_empty()));
+        let multi = db.query_rows_multi(&[big, a], .., QueryOpts::asc(), Default::default()).unwrap();
+        assert!(multi[0].as_ref().map_or(true, |r| r.ts.is_empty()));
+        assert_eq!(multi[1].as_ref().unwrap().ts, vec![T0]);
+    }
+    db.flush().unwrap();
+    assert_eq!(db.query_points(a, .., QueryOpts::asc()).unwrap().values, vec![1.0]);
+    assert_eq!(db.series_name(a).unwrap(), "a");
+    assert_eq!(db.series_count(), 2);
+    let mut ids = db.series_ids().unwrap();
+    ids.sort_unstable();
+    let mut want = vec![a, b];
+    want.sort_unstable();
+    assert_eq!(ids, want);
+    done(db);
 }
 
 #[test]

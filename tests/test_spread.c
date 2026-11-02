@@ -152,7 +152,7 @@ static void test_hand(void)
 {
     char dir[600];
     tsdb *db = open_db("hand", dir);
-    uint32_t s[12];
+    tsdb_sid s[12];
     for (int pass = 0; pass < 2; pass++) { /* memtable, then parts */
         char name[32];
         int k = 0;
@@ -491,7 +491,7 @@ enum { NI = sizeof intervals / sizeof intervals[0] };
 
 /* every query of every series; results appended to *all (for bit comparisons), their types to btype */
 static int *btype;
-static void check_all(tsdb *db, const uint32_t *ids, ref_series *const *ss, const char *stage, tsdb_spread_bucket **all,
+static void check_all(tsdb *db, const tsdb_sid *ids, ref_series *const *ss, const char *stage, tsdb_spread_bucket **all,
                       size_t *nall)
 {
     static ref_bucket r[NROWS];
@@ -537,7 +537,7 @@ static void same_order(const char *what, const char *form, const tsdb_spread_buc
 
 /* The interval, group and bounds forms over a part of the range, ascending, descending and limited, against
  * the reference. bounds[0] lies after the first rows: those belong to no bucket even though start is 0. */
-static void check_forms(tsdb *db, const uint32_t *ids, ref_series *const *ss, const char *stage)
+static void check_forms(tsdb *db, const tsdb_sid *ids, ref_series *const *ss, const char *stage)
 {
     static ref_bucket r[NROWS];
     static int64_t bounds[NROWS];
@@ -605,7 +605,7 @@ static void same_ints(const tsdb_spread_bucket *a, size_t na, const tsdb_spread_
 }
 
 /* every CPU level and kernel (TSDB_CPU, TSDB_SIMD): the same bits as the first one */
-static void check_levels(tsdb *db, const uint32_t *ids, ref_series *const *ss, const char *stage)
+static void check_levels(tsdb *db, const tsdb_sid *ids, ref_series *const *ss, const char *stage)
 {
     tsdb_spread_bucket *b;
     size_t nb;
@@ -650,7 +650,7 @@ static void test_random(void)
     tsdb *db = open_db("random", dir);
     static ref_series store[NS];
     ref_series *ss[NS];
-    uint32_t ids[NS];
+    tsdb_sid ids[NS];
     for (int k = 0; k < NS; k++) {
         char name[32];
         snprintf(name, sizeof name, "s%d", k);
@@ -737,7 +737,7 @@ static void write_rows(tsdb *db, uint32_t id, const ref_series *s, const size_t 
 /* One random change to a slice of s's history, in the database and the model alike: a delete, a replace
  * (some rows of the slice come back with new values) or inserts over the old values. The range's ends fall
  * between rows or on them; small writes land in the memtable, big ones in parts. */
-static void spread_change(tsdb *db, uint32_t id, ref_series *s)
+static void spread_change(tsdb *db, tsdb_sid id, ref_series *s)
 {
     size_t i = (size_t)rndr(NROWS);
     size_t j = i + 1 + (size_t)rndr(rndr(4) ? 200 : 1500);
@@ -809,7 +809,7 @@ static void test_deletes(bool merges)
     tsdb *db = open_del(dir, merges, false);
     static ref_series store[NS];
     ref_series *ss[NS];
-    uint32_t ids[NS];
+    tsdb_sid ids[NS];
     for (int k = 0; k < NS; k++) {
         char name[32];
         snprintf(name, sizeof name, "d%d", k);
@@ -903,7 +903,7 @@ static void test_fast_path(void)
         for (int shape = 0; shape < NSHAPE; shape++) {
             char name[32];
             snprintf(name, sizeof name, "f%d_%d", t, shape);
-            uint32_t id;
+            tsdb_sid id;
             OK(tsdb_series_create(db, name, (tsdb_type)types[t], NULL, &id));
             gen_series(&s, types[t], shape);
             put_rows(db, id, &s, 0, NROWS, false, true);
@@ -1085,7 +1085,7 @@ static long maxrss_mb(void)
 
 /* The buckets of a series bit for bit the same with one dense array and in chunks of `dense` buckets: aggregates
  * and the spread, by interval, bounds and with a limit either way. */
-static void same_in_chunks(tsdb *db, uint32_t id, int64_t iv, size_t dense, const char *what)
+static void same_in_chunks(tsdb *db, tsdb_sid id, int64_t iv, size_t dense, const char *what)
 {
     static int64_t bounds[NROWS];
     size_t nbd = 0;
@@ -1126,7 +1126,7 @@ static void test_sparse_span(void)
 {
     char dir[600];
     tsdb *db = open_db("sparse", dir);
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_create(db, "two", TSDB_FLOAT32, NULL, &id));
     int64_t ts[2] = {0, (4 << 20) - 1};
     float v[2] = {1.5f, 2.5f};

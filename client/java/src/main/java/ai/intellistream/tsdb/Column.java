@@ -86,7 +86,7 @@ public final class Column {
     /**
      * A state column.
      *
-     * @param codes state codes from {@link TsdbClient#state(int, String)}, unsigned; 0 reads back as null
+     * @param codes state codes from {@link TsdbClient#state(long, String)}, unsigned; 0 reads back as null
      * @return a column over {@code codes}
      */
     public static Column ofStates(int... codes) {
@@ -208,7 +208,7 @@ public final class Column {
     }
 
     /**
-     * The codes of a state column; {@link TsdbClient#stateName(int, int)} turns them into names.
+     * The codes of a state column; {@link TsdbClient#stateName(long, int)} turns them into names.
      *
      * @return the array, not copied
      * @throws IllegalStateException for another type

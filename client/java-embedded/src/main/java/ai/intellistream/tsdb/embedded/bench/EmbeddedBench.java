@@ -161,7 +161,7 @@ public final class EmbeddedBench {
             for (long r = 0; r < rows; r++)
                 nseries = Math.max(nseries, BenchCommon.seriesAt(m, r) + 1);
             for (int s = 0; s < nseries; s++) {
-                int id = db.series(BenchCommon.seriesName(s));
+                long id = db.series(BenchCommon.seriesName(s));
                 if (id != s)
                     throw new IllegalStateException("series " + BenchCommon.seriesName(s) + " got id " + id);
             }
@@ -174,7 +174,7 @@ public final class EmbeddedBench {
                 long a = rows * t / threads;
                 long b = rows * (t + 1) / threads;
                 th[t] = new Thread(() -> {
-                    int[] sv = new int[batch];
+                    long[] sv = new long[batch];
                     long[] tv = new long[batch];
                     float[] vv = new float[batch];
                     try {
@@ -296,7 +296,7 @@ public final class EmbeddedBench {
             for (int t = 0; t < threads; t++) {
                 int first = t;
                 th[t] = new Thread(() -> {
-                    int[] sv = new int[batch];
+                    long[] sv = new long[batch];
                     long[] tv = new long[batch];
                     float[] vv = new float[batch];
                     try {
@@ -309,7 +309,7 @@ public final class EmbeddedBench {
                             ByteBuffer m = ch.map(FileChannel.MapMode.READ_ONLY, r0 * 16, n * 16L)
                                     .order(ByteOrder.LITTLE_ENDIAN);
                             for (int i = 0, off = 0; i < n; i++, off += 16) {
-                                sv[i] = m.getInt(off);
+                                sv[i] = Integer.toUnsignedLong(m.getInt(off));
                                 tv[i] = m.getLong(off + 4);
                                 vv[i] = m.getFloat(off + 12);
                             }

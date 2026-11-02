@@ -50,7 +50,7 @@ pub(crate) struct Pool {
     pool: RwLock<Option<tc::Pool>>,
     addr: String,
     /// Series types, which never change: insert_many() converts values to them.
-    types: Mutex<HashMap<u32, ValueType>>,
+    types: Mutex<HashMap<u64, ValueType>>,
 }
 
 impl Pool {
@@ -71,9 +71,9 @@ impl Pool {
 
     /// The type of each series in `ids`, looked up once (a lookup that failed is an error of its
     /// own, not of the call: insert_many() reports it for the insert that needed it).
-    fn types(&self, py: Python<'_>, ids: &[u32]) -> PyResult<Vec<tc::Result<ValueType>>> {
+    fn types(&self, py: Python<'_>, ids: &[u64]) -> PyResult<Vec<tc::Result<ValueType>>> {
         let known = self.types.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let missing: Vec<u32> = ids.iter().copied().filter(|id| !known.contains_key(id)).collect();
+        let missing: Vec<u64> = ids.iter().copied().filter(|id| !known.contains_key(id)).collect();
         let mut found = HashMap::new();
         if !missing.is_empty() {
             let got = self.with(py, |p| {

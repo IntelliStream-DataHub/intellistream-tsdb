@@ -131,7 +131,7 @@ class TsdbdSinkTest {
             ValuePoints m = values(c, "mode");
             assertEquals(ValueType.STATE, m.type());
             assertEquals(3, m.size());
-            int id = c.series("mode", false);
+            long id = c.series("mode", false);
             Column mc = m.values();
             assertEquals("run", c.stateName(id, mc.states()[0]));
             assertTrue(mc.isNull(1));

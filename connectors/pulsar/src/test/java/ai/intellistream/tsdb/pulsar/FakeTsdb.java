@@ -36,7 +36,7 @@ final class FakeTsdb implements TsdbConnection.Factory {
     }
 
     final Map<String, SeriesCache.Entry> series = new HashMap<>();
-    final Map<Integer, String> names = new HashMap<>();
+    final Map<Long, String> names = new HashMap<>();
     /** STATE_NAME requests, to tell cache hits from lookups. */
     final java.util.concurrent.atomic.AtomicInteger stateCalls = new java.util.concurrent.atomic.AtomicInteger();
     final List<Row> rows = new ArrayList<>();
@@ -113,14 +113,14 @@ final class FakeTsdb implements TsdbConnection.Factory {
         }
 
         @Override
-        public int state(int s, String name) throws TsdbException {
+        public int state(long s, String name) throws TsdbException {
             check();
             stateCalls.incrementAndGet();
             return Math.abs(name.hashCode() % 1000) + 1;
         }
 
         @Override
-        public void insertAsync(int[] ids, long[] ts, Column values, int n) throws TsdbException {
+        public void insertAsync(long[] ids, long[] ts, Column values, int n) throws TsdbException {
             check();
             synchronized (FakeTsdb.this) {
                 for (int i = 0; i < n; i++) {

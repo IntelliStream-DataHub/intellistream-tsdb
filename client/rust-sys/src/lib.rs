@@ -41,6 +41,13 @@ pub const TSDB_ERR_TOO_MANY_BUCKETS: c_int = -7;
 pub const TSDB_ERR_STOPPED: c_int = -8;
 pub const TSDB_ERR_READONLY: c_int = -9;
 
+/// A series id (`tsdb_sid`): 64 bits, opaque, not dense.
+pub type tsdb_sid = u64;
+
+/// Raised with every incompatible change of a public struct's layout or of a function's signature;
+/// bindings refuse a library whose [`tsdb_abi_version`] differs.
+pub const TSDB_ABI_VERSION: c_int = 1;
+
 pub const TSDB_TS_MIN: i64 = i64::MIN;
 pub const TSDB_TS_MAX: i64 = i64::MAX;
 
@@ -265,57 +272,70 @@ unsafe extern "C" {
     pub fn tsdb_close(db: *mut tsdb) -> c_int;
     pub fn tsdb_strerror(err: c_int) -> *const c_char;
 
-    pub fn tsdb_series(db: *mut tsdb, name: *const c_char, id: *mut u32) -> c_int;
-    pub fn tsdb_series_at(db: *mut tsdb, name: *const c_char, path: *const c_char, id: *mut u32) -> c_int;
-    pub fn tsdb_series_lookup(db: *mut tsdb, name: *const c_char, id: *mut u32) -> c_int;
+    pub fn tsdb_series(db: *mut tsdb, name: *const c_char, id: *mut tsdb_sid) -> c_int;
+    pub fn tsdb_series_at(db: *mut tsdb, name: *const c_char, path: *const c_char, id: *mut tsdb_sid) -> c_int;
+    pub fn tsdb_series_lookup(db: *mut tsdb, name: *const c_char, id: *mut tsdb_sid) -> c_int;
     pub fn tsdb_series_create(
         db: *mut tsdb,
         name: *const c_char,
         type_: tsdb_type,
         path: *const c_char,
-        id: *mut u32,
+        id: *mut tsdb_sid,
     ) -> c_int;
-    pub fn tsdb_series_type(db: *mut tsdb, id: u32, type_: *mut tsdb_type) -> c_int;
-    pub fn tsdb_series_class(db: *mut tsdb, series: u32, cls: *mut c_int) -> c_int;
-    pub fn tsdb_series_count(db: *mut tsdb) -> u32;
-    pub fn tsdb_series_name(db: *mut tsdb, id: u32) -> *const c_char;
-    pub fn tsdb_series_path(db: *mut tsdb, id: u32) -> *const c_char;
+    pub fn tsdb_series_type(db: *mut tsdb, id: tsdb_sid, type_: *mut tsdb_type) -> c_int;
+    pub fn tsdb_series_class(db: *mut tsdb, series: tsdb_sid, cls: *mut c_int) -> c_int;
+    pub fn tsdb_series_count(db: *mut tsdb) -> u64;
+    /// Calls `fn_` once for every series; stops at the first non-zero return and returns it.
+    pub fn tsdb_series_foreach(
+        db: *mut tsdb,
+        fn_: Option<unsafe extern "C" fn(ctx: *mut c_void, id: tsdb_sid) -> c_int>,
+        ctx: *mut c_void,
+    ) -> c_int;
+    pub fn tsdb_series_name(db: *mut tsdb, id: tsdb_sid) -> *const c_char;
+    pub fn tsdb_series_path(db: *mut tsdb, id: tsdb_sid) -> *const c_char;
     pub fn tsdb_volume_count(db: *mut tsdb) -> u32;
     pub fn tsdb_volume_path(db: *mut tsdb, index: u32) -> *const c_char;
 
-    pub fn tsdb_insert(db: *mut tsdb, series: *const u32, ts: *const i64, values: *const f32, n: usize) -> c_int;
-    pub fn tsdb_insert_series(db: *mut tsdb, series: u32, ts: *const i64, values: *const f32, n: usize) -> c_int;
+    pub fn tsdb_insert(db: *mut tsdb, series: *const tsdb_sid, ts: *const i64, values: *const f32, n: usize) -> c_int;
+    pub fn tsdb_insert_series(db: *mut tsdb, series: tsdb_sid, ts: *const i64, values: *const f32, n: usize) -> c_int;
     pub fn tsdb_insert_values(
         db: *mut tsdb,
-        series: *const u32,
+        series: *const tsdb_sid,
         ts: *const i64,
         values: *const tsdb_values,
         n: usize,
     ) -> c_int;
     pub fn tsdb_insert_series_values(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         ts: *const i64,
         values: *const tsdb_values,
         n: usize,
     ) -> c_int;
 
-    pub fn tsdb_state(db: *mut tsdb, series: u32, name: *const c_char, code: *mut u32) -> c_int;
-    pub fn tsdb_state_lookup(db: *mut tsdb, series: u32, name: *const c_char, code: *mut u32) -> c_int;
-    pub fn tsdb_state_name(db: *mut tsdb, series: u32, code: u32) -> *const c_char;
+    pub fn tsdb_state(db: *mut tsdb, series: tsdb_sid, name: *const c_char, code: *mut u32) -> c_int;
+    pub fn tsdb_state_lookup(db: *mut tsdb, series: tsdb_sid, name: *const c_char, code: *mut u32) -> c_int;
+    pub fn tsdb_state_name(db: *mut tsdb, series: tsdb_sid, code: u32) -> *const c_char;
 
-    pub fn tsdb_append(db: *mut tsdb, series: u32, ts: i64, value: f32) -> c_int;
+    pub fn tsdb_append(db: *mut tsdb, series: tsdb_sid, ts: i64, value: f32) -> c_int;
     pub fn tsdb_commit(db: *mut tsdb) -> c_int;
     pub fn tsdb_flush(db: *mut tsdb) -> c_int;
 
-    pub fn tsdb_query_raw(db: *mut tsdb, series: u32, start: i64, end: i64, f: tsdb_raw_fn, ctx: *mut c_void) -> c_int;
-    pub fn tsdb_query_points(db: *mut tsdb, series: u32, start: i64, end: i64, out: *mut tsdb_points) -> c_int;
+    pub fn tsdb_query_raw(
+        db: *mut tsdb,
+        series: tsdb_sid,
+        start: i64,
+        end: i64,
+        f: tsdb_raw_fn,
+        ctx: *mut c_void,
+    ) -> c_int;
+    pub fn tsdb_query_points(db: *mut tsdb, series: tsdb_sid, start: i64, end: i64, out: *mut tsdb_points) -> c_int;
     pub fn tsdb_points_free(p: *mut tsdb_points);
     pub fn tsdb_free(p: *mut c_void);
 
     pub fn tsdb_query_agg(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         interval_ms: i64,
@@ -324,7 +344,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_raw_ex(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         opts: *const tsdb_query_opts,
@@ -333,7 +353,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_points_ex(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         opts: *const tsdb_query_opts,
@@ -341,7 +361,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_values(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         opts: *const tsdb_query_opts,
@@ -350,7 +370,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_group(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         group: *const tsdb_group,
@@ -359,7 +379,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_bounds(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         bounds: *const i64,
@@ -370,7 +390,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_group_ex(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         group: *const tsdb_group,
@@ -381,7 +401,7 @@ unsafe extern "C" {
 
     pub fn tsdb_query_agg_ex(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         interval_ms: i64,
@@ -391,7 +411,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_lttb(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         threshold: usize,
@@ -400,7 +420,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_lttb_ex(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         threshold: usize,
@@ -410,7 +430,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_spread(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         interval_ms: i64,
@@ -420,7 +440,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_spread_group(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         group: *const tsdb_group,
@@ -430,7 +450,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_spread_bounds(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         bounds: *const i64,
@@ -441,7 +461,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_twa(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         interval_ms: i64,
@@ -451,7 +471,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_twa_group(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         group: *const tsdb_group,
@@ -461,7 +481,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_twa_bounds(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         bounds: *const i64,
@@ -471,18 +491,18 @@ unsafe extern "C" {
         nout: *mut usize,
     ) -> c_int;
 
-    pub fn tsdb_delete_range(db: *mut tsdb, series: u32, start: i64, end: i64) -> c_int;
+    pub fn tsdb_delete_range(db: *mut tsdb, series: tsdb_sid, start: i64, end: i64) -> c_int;
     pub fn tsdb_replace_range(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         ts: *const i64,
         values: *const tsdb_values,
         n: usize,
     ) -> c_int;
-    pub fn tsdb_set_retention(db: *mut tsdb, series: u32, limit_ms: i64) -> c_int;
-    pub fn tsdb_get_retention(db: *mut tsdb, series: u32, limit_ms: *mut i64) -> c_int;
+    pub fn tsdb_set_retention(db: *mut tsdb, series: tsdb_sid, limit_ms: i64) -> c_int;
+    pub fn tsdb_get_retention(db: *mut tsdb, series: tsdb_sid, limit_ms: *mut i64) -> c_int;
 
     /// What the calling thread's last query did.
     pub fn tsdb_last_query_stats(out: *mut tsdb_query_stats);
@@ -494,6 +514,8 @@ unsafe extern "C" {
     pub fn tsdb_foreach_part(db: *mut tsdb, f: tsdb_part_fn, ctx: *mut c_void) -> c_int;
     pub fn tsdb_refresh(db: *mut tsdb) -> c_int;
     pub fn tsdb_simd_level() -> *const c_char;
+    /// [`TSDB_ABI_VERSION`] of the library actually linked.
+    pub fn tsdb_abi_version() -> c_int;
 
     // tsdb_calendar.h
     /// `*bounds` is allocated by the library: free it with [`tsdb_free`].
@@ -508,7 +530,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_group_local(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         group: *const tsdb_group,
@@ -518,7 +540,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_spread_group_local(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         group: *const tsdb_group,
@@ -528,7 +550,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn tsdb_query_twa_group_local(
         db: *mut tsdb,
-        series: u32,
+        series: tsdb_sid,
         start: i64,
         end: i64,
         group: *const tsdb_group,
@@ -595,7 +617,7 @@ impl Default for tsdb_multi_query {
 #[derive(Debug, Clone, Copy)]
 pub struct tsdb_series_result {
     pub index: usize,
-    pub series: u32,
+    pub series: tsdb_sid,
     pub status: c_int,
     /// The series' last call.
     pub last: c_int,
@@ -644,7 +666,7 @@ unsafe extern "C" {
     pub fn tsdb_query_multi(
         db: *mut tsdb,
         q: *const tsdb_multi_query,
-        series: *const u32,
+        series: *const tsdb_sid,
         n: usize,
         mo: *const tsdb_multi_opts,
         fn_: tsdb_multi_fn,
@@ -653,7 +675,7 @@ unsafe extern "C" {
     pub fn tsdb_query_multi_collect(
         db: *mut tsdb,
         q: *const tsdb_multi_query,
-        series: *const u32,
+        series: *const tsdb_sid,
         n: usize,
         mo: *const tsdb_multi_opts,
         out: *mut *mut tsdb_series_result,

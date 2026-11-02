@@ -178,6 +178,21 @@ def test_errors(server, client):
     assert e.value.code == tsdb_client.ERR_INVALID
     assert str(e.value) == "server error -4: invalid argument"
     assert tsdb_client.strerror(tsdb_client.ERR_NOTFOUND) == "not found"
+    # ids are 64 bits; protocol 10 carries 32, so a larger id is refused before sending, never truncated onto
+    # another series (a + 2**32 would land on a)
+    for call in (
+        lambda: client.insert_series(a + 2**32, [T0], [1.0]),
+        lambda: client.insert([a, a + 2**32], [T0, T0], [1.0, 2.0]),
+        lambda: client.insert(array.array("Q", [a, a + 2**32]), [T0, T0], [1.0, 2.0]),
+        lambda: client.query_raw(a + 2**32),
+        lambda: client.series_name(a + 2**32),
+    ):
+        with pytest.raises(TsdbError) as e:
+            call()
+        assert e.value.code == tsdb_client.ERR_INVALID and "32-bit" in str(e.value)
+    with pytest.raises(OverflowError):
+        client.insert([a, -1], [T0, T0], [1.0, 2.0])
+    assert client.query_raw(a, numpy=False) == ([], [])
 
     client.insert_series_async(999_999, [T0], [1.0])
     client.insert_series_async(a, [T0], [1.0])

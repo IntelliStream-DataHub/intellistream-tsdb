@@ -1551,7 +1551,7 @@ int eng_series_class(eng *db, uint32_t series, int *cls);
 uint64_t cls_gen_now(eng *db);
 /* test hook: switch series to cls at the computed T, or at *at when that is later */
 int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at);
-int tsdb_test_class_switch(struct tsdb *t, uint32_t series, int cls, const int64_t *at); /* through the volumes */
+int tsdb_test_class_switch(struct tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* through the volumes */
 /* test hook: fn(arg) runs in every large insert and replace after its rows were placed, before it commits */
 void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */

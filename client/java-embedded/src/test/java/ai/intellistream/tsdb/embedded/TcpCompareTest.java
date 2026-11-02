@@ -62,7 +62,7 @@ class TcpCompareTest {
         f[7] = Float.NaN;
         f[8] = Float.NEGATIVE_INFINITY;
         String[] names = {"f32", "f64", "i64", "bool", "state"};
-        int[] ids = new int[names.length];
+        long[] ids = new long[names.length];
         try (EmbeddedDb db = EmbeddedDb.open(dir.toString(), new EmbeddedOptions().fsync(false))) {
             ids[0] = db.series(names[0]);
             db.insert(ids[0], ts, f);
@@ -114,7 +114,7 @@ class TcpCompareTest {
             try (EmbeddedDb db = EmbeddedDb.open(dir.toString(), new EmbeddedOptions().readOnly(true));
                  TsdbClient tcp = TsdbClient.connect("127.0.0.1", port)) {
                 for (int k = 0; k < names.length; k++) {
-                    int id = ids[k];
+                    long id = ids[k];
                     assertEquals(tcp.series(names[k], false), id);
                     assertEquals(tcp.seriesName(id), db.seriesName(id));
                     assertEquals(tcp.seriesType(id), db.seriesType(id));

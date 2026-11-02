@@ -91,5 +91,6 @@ int main(void)
     E("multi", VALUES, TSDB_MULTI_VALUES); E("multi", BUCKETS, TSDB_MULTI_BUCKETS); E("multi", SPREAD, TSDB_MULTI_SPREAD);
     E("multi", TWA, TSDB_MULTI_TWA); E("multi", LTTB, TSDB_MULTI_LTTB);
     E("multi", TRIM_LO, TSDB_MULTI_TRIM_LO); E("multi", TRIM_HI, TSDB_MULTI_TRIM_HI);
+    E("abi", VERSION, TSDB_ABI_VERSION);
     return 0;
 }

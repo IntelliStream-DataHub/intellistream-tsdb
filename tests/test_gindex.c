@@ -578,7 +578,7 @@ static void test_engine(const char *base)
                     continue;
                 char sn[32];
                 snprintf(sn, sizeof sn, "s-%s", sname[s]);
-                uint32_t id;
+                tsdb_sid id;
                 OK(tsdb_series_create(db, sn, (tsdb_type)types[t], NULL, &id));
                 size_t rows = cfgs[c].grows == 1 ? 300 : n;
                 gen_rows(types[t], s, rows, ts, v);

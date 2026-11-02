@@ -28,7 +28,7 @@ static void fail(const char *what, int rc)
 
 static void load(tsdb *db, uint64_t rows)
 {
-    uint32_t s;
+    tsdb_sid s;
     int rc = tsdb_series_create(db, "twa", TSDB_FLOAT32, NULL, &s);
     if (rc)
         fail("create", rc);
@@ -64,7 +64,7 @@ static void load(tsdb *db, uint64_t rows)
     free(v);
 }
 
-static double best_twa(tsdb *db, uint32_t s, int64_t interval, int method, bool decode, int repeat, double *sum,
+static double best_twa(tsdb *db, tsdb_sid s, int64_t interval, int method, bool decode, int repeat, double *sum,
                        tsdb_query_stats *st)
 {
     double best = 1e30;
@@ -119,7 +119,7 @@ int main(int argc, char **argv)
     int rc = tsdb_open(dir, &opts, &db);
     if (rc)
         fail(dir, rc);
-    uint32_t s;
+    tsdb_sid s;
     if (do_load) {
         if (tsdb_series_lookup(db, "twa", &s) == 0) {
             fprintf(stderr, "twa-bench: %s already holds the series; load into an empty directory\n", dir);

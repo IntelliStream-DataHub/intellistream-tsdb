@@ -69,7 +69,7 @@ fn per_series(obj: Option<&Bound<'_, PyAny>>, n: usize, what: &str) -> PyResult<
 /// One multi-series call, converted while the GIL is held.
 pub(crate) struct Req {
     kind: Kind,
-    series: Vec<u32>,
+    series: Vec<u64>,
     start: Option<i64>,
     end: Option<i64>,
     starts: Option<Vec<i64>>,
@@ -370,7 +370,7 @@ enum PyData {
 #[pyclass(frozen, sequence, module = "tsdb_client")]
 pub(crate) struct Many {
     kind: Kind,
-    series: Vec<u32>,
+    series: Vec<u64>,
     status: Vec<i32>,
     status_py: Py<PyAny>,
     messages: Vec<Option<String>>,
@@ -468,7 +468,7 @@ impl Many {
 
     /// The series ids, in the order asked.
     #[getter]
-    fn series(&self) -> Vec<u32> {
+    fn series(&self) -> Vec<u64> {
         self.series.clone()
     }
 

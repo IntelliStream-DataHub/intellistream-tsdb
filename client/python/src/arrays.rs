@@ -25,7 +25,7 @@ use pyo3::buffer::{Element, PyBuffer};
 use pyo3::exceptions::{PyAttributeError, PyImportError, PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyList, PySlice, PyTuple};
+use pyo3::types::{PyInt, PyList, PySlice, PyTuple};
 
 use ::tsdb_client as tc;
 use tc::{Column, ColumnRef, ValueType, ValuesRef};
@@ -95,6 +95,30 @@ impl<T: Element + Copy> Col<T> {
             Col::Borrowed(b) if b.item_count() == 0 => None,
             // SAFETY: as in snap(), for one element
             Col::Borrowed(b) => Some(unsafe { std::ptr::read(b.buf_ptr() as *const T) }),
+        }
+    }
+}
+
+/// A column of series ids: a uint64 buffer or vector, or a uint32 buffer, widened when it is read.
+pub(crate) enum SidCol {
+    Wide(Col<u64>),
+    Narrow(Col<u32>),
+}
+
+impl SidCol {
+    /// The ids, read once; see `Col::snap`.
+    pub(crate) fn snap(&self) -> Cow<'_, [u64]> {
+        match self {
+            SidCol::Wide(c) => c.snap(),
+            SidCol::Narrow(c) => Cow::Owned(c.snap().iter().map(|&x| u64::from(x)).collect()),
+        }
+    }
+
+    /// The first id, read once.
+    pub(crate) fn first(&self) -> Option<u64> {
+        match self {
+            SidCol::Wide(c) => c.first(),
+            SidCol::Narrow(c) => c.first().map(u64::from),
         }
     }
 }
@@ -201,13 +225,13 @@ pub(crate) fn agg_queries(
 
 /// What the rows of one insert of a batch go to.
 pub(crate) enum Dest {
-    One(u32),
-    Each(Col<u32>),
+    One(u64),
+    Each(SidCol),
 }
 
 impl Dest {
     /// The series whose type the values take: the only one, or the first row's.
-    fn first(&self) -> Option<u32> {
+    fn first(&self) -> Option<u64> {
         match self {
             Dest::One(s) => Some(*s),
             Dest::Each(c) => c.first(),
@@ -224,8 +248,8 @@ pub(crate) struct Insert {
 
 /// An insert's columns read once (`Insert::snap`).
 pub(crate) struct InsertSnap<'a> {
-    one: u32,
-    each: Option<Cow<'a, [u32]>>,
+    one: u64,
+    each: Option<Cow<'a, [u64]>>,
     ts: Cow<'a, [i64]>,
     values: ValSnap<'a>,
 }
@@ -278,7 +302,7 @@ pub(crate) fn entry_err(py: Python<'_>, index: usize, e: PyErr) -> PyErr {
 pub(crate) fn inserts(
     batches: &Bound<'_, PyAny>,
     value_type: Option<ValueType>,
-    types: impl FnOnce(&[u32]) -> PyResult<Vec<tc::Result<ValueType>>>,
+    types: impl FnOnce(&[u64]) -> PyResult<Vec<tc::Result<ValueType>>>,
 ) -> PyResult<Vec<Insert>> {
     let py = batches.py();
     let mut parsed = Vec::with_capacity(batches.len().unwrap_or(0));
@@ -291,17 +315,19 @@ pub(crate) fn inserts(
                 return Err(PyTypeError::new_err("each batch is a tuple (series, ts, values)"));
             }
             let (s, ts, v) = (t.get_item(0)?, t.get_item(1)?, t.get_item(2)?);
-            let dest = match s.extract::<u32>() {
+            let dest = match s.extract::<u64>() {
                 Ok(id) => Dest::One(id),
+                // a negative int, or one of 2**64 or more, is no id: raise its OverflowError
+                Err(e) if s.is_instance_of::<PyInt>() => return Err(e),
                 Err(_) => Dest::Each(crate::series_column(&s)?),
             };
             Ok((dest, crate::ts_column(&ts)?, v))
         };
         parsed.push(parse().map_err(|e| entry_err(py, i, e))?);
     }
-    let mut known: HashMap<u32, tc::Result<ValueType>> = HashMap::new();
+    let mut known: HashMap<u64, tc::Result<ValueType>> = HashMap::new();
     if value_type.is_none() {
-        let mut ids: Vec<u32> = parsed.iter().filter_map(|p| p.0.first()).collect();
+        let mut ids: Vec<u64> = parsed.iter().filter_map(|p| p.0.first()).collect();
         ids.sort_unstable();
         ids.dedup();
         if !ids.is_empty() {

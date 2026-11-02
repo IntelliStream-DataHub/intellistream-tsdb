@@ -102,6 +102,7 @@ class LayoutTest {
         assertEquals((long) Native.MULTI_LTTB, c.get("multi.LTTB"));
         assertEquals((long) Native.MULTI_TRIM_LO, c.get("multi.TRIM_LO"));
         assertEquals((long) Native.MULTI_TRIM_HI, c.get("multi.TRIM_HI"));
+        assertEquals((long) Native.ABI_VERSION, c.get("abi.VERSION"), "TSDB_ABI_VERSION: the binding is out of date");
         assertEquals(0L, c.get("order.ASC"));
         assertEquals(1L, c.get("order.DESC"));
         assertEquals(5, c.keySet().stream().filter(k -> k.startsWith("type.")).count(), "a C type Java lacks");
@@ -244,6 +245,14 @@ class LayoutTest {
         e = Pattern.compile("typedef [^;()]*\\( ?\\* ?(\\w+) ?\\) ?\\(").matcher(h);
         while (e.find())
             enums.put(e.group(1), MemorySegment.class);
+        e = Pattern.compile("typedef ((?:u?int(?:8|16|32|64)_t|size_t|int|float|double)) (\\w+);").matcher(h);
+        while (e.find()) /* scalar typedefs: tsdb_sid */
+            enums.put(e.group(2), carrier(e.group(1), enums));
+        assertEquals(long.class, enums.get("tsdb_sid"), "series ids are 64 bits");
+        /* callbacks declared inline in a prototype, the second parameter of each */
+        Map<String, FunctionDescriptor> inline = Map.of("tsdb_foreach_part", Native.PART_FN, "tsdb_series_foreach",
+                Native.SERIES_FN);
+        assertTrue(Native.BOUND.keySet().containsAll(inline.keySet()), "bound " + Native.BOUND.keySet());
         assertTrue(Native.BOUND.size() >= 40, "bound " + Native.BOUND.keySet());
         for (Map.Entry<String, FunctionDescriptor> b : Native.BOUND.entrySet()) {
             String name = b.getKey();
@@ -251,12 +260,12 @@ class LayoutTest {
             assertTrue(m.find(), name + ": no prototype in tsdb.h or tsdb_calendar.h");
             String args = inside(h, m.end() - 1);
             assertEquals(methodType(m.group(1), args, enums), b.getValue().toMethodType(), name + "(" + args + ")");
-            if (name.equals("tsdb_foreach_part")) { /* its callback is declared inline */
+            if (inline.containsKey(name)) {
                 String fn = params(args).get(1);
                 Matcher r = Pattern.compile("^\\s*(.*?)\\(\\s*\\*\\s*\\w+\\s*\\)\\s*\\(").matcher(fn);
                 assertTrue(r.find(), fn);
-                assertEquals(methodType(r.group(1), inside(fn, r.end() - 1), enums), Native.PART_FN.toMethodType(),
-                        "the callback of tsdb_foreach_part");
+                assertEquals(methodType(r.group(1), inside(fn, r.end() - 1), enums), inline.get(name).toMethodType(),
+                        "the callback of " + name);
             }
         }
         for (Map.Entry<String, FunctionDescriptor> cb : Map.of("tsdb_raw_fn", Native.RAW_FN, "tsdb_values_fn",
@@ -270,12 +279,28 @@ class LayoutTest {
 
     @Test
     void aLibraryWithOtherStructSizesIsRefused() {
-        Native.checkAbi("test", k -> Native.ALL_STRUCTS[k].byteSize()); /* the loaded library passed this too */
+        Native.checkAbi("test", Native.ABI_VERSION, k -> Native.ALL_STRUCTS[k].byteSize()); /* as the loaded one */
         for (int bad = 0; bad < Native.ALL_STRUCTS.length; bad++) {
             int which = bad;
             UnsatisfiedLinkError e = assertThrows(UnsatisfiedLinkError.class, () -> Native.checkAbi("old.so",
-                    k -> Native.ALL_STRUCTS[k].byteSize() + (k == which ? 8 : 0)));
+                    Native.ABI_VERSION, k -> Native.ALL_STRUCTS[k].byteSize() + (k == which ? 8 : 0)));
             assertTrue(e.getMessage().contains(Native.ALL_STRUCTS[which].name().orElseThrow()), e.getMessage());
+        }
+    }
+
+    /**
+     * A library of another ABI version is refused even where every struct has the size this binding expects:
+     * tsdb_series_result kept its 72 bytes when its series id became 64 bits and status and last moved.
+     */
+    @Test
+    void aLibraryOfAnotherAbiVersionIsRefused() {
+        assertEquals(1, Native.ABI_VERSION);
+        assertEquals(Native.ABI_VERSION, Native.LIBRARY_ABI_VERSION, "the loaded library's tsdb_abi_version()");
+        for (int other : new int[] {Native.ABI_VERSION - 1, Native.ABI_VERSION + 1}) {
+            UnsatisfiedLinkError e = assertThrows(UnsatisfiedLinkError.class,
+                    () -> Native.checkAbi("other.so", other, k -> Native.ALL_STRUCTS[k].byteSize()));
+            assertTrue(e.getMessage().contains("other.so") && e.getMessage().contains("ABI version " + other)
+                    && e.getMessage().contains("written for ABI version " + Native.ABI_VERSION), e.getMessage());
         }
     }
 }

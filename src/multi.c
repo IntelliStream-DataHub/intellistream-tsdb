@@ -55,7 +55,7 @@ typedef struct mslot {
 typedef struct mcall {
     tsdb *db;
     const tsdb_multi_query *q;
-    const uint32_t *series;
+    const tsdb_sid *series;
     size_t n;
     const tsdb_multi_opts *mo;
     tsdb_multi_fn fn;
@@ -199,7 +199,7 @@ static int first_ts(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n
 }
 
 /* the bounds of q that serve series id over [s, e) (TSDB_MULTI_TRIM_*) */
-static int trim_bounds(mcall *c, uint32_t id, int64_t s, int64_t e, const int64_t **b, size_t *nb)
+static int trim_bounds(mcall *c, tsdb_sid id, int64_t s, int64_t e, const int64_t **b, size_t *nb)
 {
     const tsdb_multi_query *q = c->q;
     int64_t lo = s, hi = e == INT64_MIN ? INT64_MIN : e - 1;
@@ -247,7 +247,7 @@ static int trim_bounds(mcall *c, uint32_t id, int64_t s, int64_t e, const int64_
 static int run_one(mcall *c, size_t i, msink *k)
 {
     const tsdb_multi_query *q = c->q;
-    uint32_t id = c->series[i];
+    tsdb_sid id = c->series[i];
     int64_t s = q->starts ? q->starts[i] : q->start, e = q->ends ? q->ends[i] : q->end;
     int64_t iv = q->intervals ? q->intervals[i] : q->interval_ms;
     mres *r = k->r;
@@ -510,7 +510,7 @@ static int clamp_threads(tsdb *db, const tsdb_multi_opts *mo)
     return MAX(1, MIN(t, rt));
 }
 
-int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series, size_t n,
                      const tsdb_multi_opts *mo, tsdb_multi_fn fn, void *ctx)
 {
     if (!db || !q || !fn || (n && !series) || q->kind < TSDB_MULTI_VALUES || q->kind > TSDB_MULTI_LTTB ||
@@ -623,7 +623,7 @@ static int collect_fn(void *ctx, const tsdb_series_result *r)
     return 0;
 }
 
-int tsdb_query_multi_collect(tsdb *db, const tsdb_multi_query *q, const uint32_t *series, size_t n,
+int tsdb_query_multi_collect(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series, size_t n,
                              const tsdb_multi_opts *mo, tsdb_series_result **out)
 {
     *out = NULL;

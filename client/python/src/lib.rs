@@ -36,7 +36,7 @@ mod embedded;
 mod multi;
 mod pool;
 
-use arrays::{Buckets, Col, TwaBuckets, values_column, vec_to_py};
+use arrays::{Buckets, Col, SidCol, TwaBuckets, values_column, vec_to_py};
 
 create_exception!(
     tsdb_client,
@@ -78,11 +78,16 @@ fn ts_column(obj: &Bound<'_, PyAny>) -> PyResult<Col<i64>> {
     })
 }
 
-fn series_column(obj: &Bound<'_, PyAny>) -> PyResult<Col<u32>> {
-    Ok(match Col::buffer(obj)? {
-        Some(c) => c,
-        None => Col::Owned(obj.extract()?),
-    })
+/// Series ids: a uint64 buffer, a uint32 buffer (widened where it is read, so existing uint32 arrays keep
+/// working), or a sequence of ints (a negative one, or one of 2**64 or more, raises OverflowError).
+fn series_column(obj: &Bound<'_, PyAny>) -> PyResult<SidCol> {
+    if let Some(c) = Col::<u64>::buffer(obj)? {
+        return Ok(SidCol::Wide(c));
+    }
+    if let Some(c) = Col::<u32>::buffer(obj)? {
+        return Ok(SidCol::Narrow(c));
+    }
+    Ok(SidCol::Wide(Col::Owned(obj.extract()?)))
 }
 
 /// float32 values of the version 1 calls: float32 or float64 buffers, or a sequence.
@@ -688,8 +693,8 @@ impl From<tc::QueryStats> for QueryStats {
 #[derive(Default)]
 struct Inner {
     conn: Option<tc::Client>,
-    types: HashMap<u32, ValueType>,
-    states: HashMap<(u32, u32), String>,
+    types: HashMap<u64, ValueType>,
+    states: HashMap<(u64, u32), String>,
 }
 
 impl Inner {
@@ -697,7 +702,7 @@ impl Inner {
         self.conn.as_mut().ok_or_else(closed)
     }
 
-    fn series_type(&mut self, id: u32) -> tc::Result<ValueType> {
+    fn series_type(&mut self, id: u64) -> tc::Result<ValueType> {
         if let Some(&t) = self.types.get(&id) {
             return Ok(t);
         }
@@ -706,7 +711,7 @@ impl Inner {
         Ok(t)
     }
 
-    fn state_name(&mut self, series: u32, code: u32) -> tc::Result<String> {
+    fn state_name(&mut self, series: u64, code: u32) -> tc::Result<String> {
         if let Some(n) = self.states.get(&(series, code)) {
             return Ok(n.clone());
         }
@@ -787,7 +792,7 @@ impl Client {
     fn insert_typed(
         &self,
         py: Python<'_>,
-        one: Option<u32>,
+        one: Option<u64>,
         many: Option<&Bound<'_, PyAny>>,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
@@ -796,14 +801,14 @@ impl Client {
     ) -> PyResult<()> {
         let ts = ts_column(ts)?;
         let many = many.map(series_column).transpose()?;
-        let ty = match (value_type, one.or_else(|| many.as_ref().and_then(Col::first))) {
+        let ty = match (value_type, one.or_else(|| many.as_ref().and_then(SidCol::first))) {
             (Some(t), _) => self::value_type(t)?,
             (None, Some(id)) => self.with_inner(py, |i| i.series_type(id))?,
             (None, None) => ValueType::Float32,
         };
         let col = values_column(values, ty)?;
         self.with(py, |c| {
-            let (ts, col, many) = (ts.snap(), col.snap(), many.as_ref().map(Col::snap));
+            let (ts, col, many) = (ts.snap(), col.snap(), many.as_ref().map(SidCol::snap));
             let col = ColumnRef::from(&col);
             match (&many, one) {
                 (Some(s), _) if wait => c.insert_values(s, &ts, col),
@@ -819,7 +824,7 @@ impl Client {
     fn replace_typed(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         ts: &Bound<'_, PyAny>,
@@ -953,7 +958,7 @@ impl Client {
     /// Raises:
     ///     TsdbError: ERR_NOTFOUND if create is False and there is no such series.
     #[pyo3(signature = (name, create = true))]
-    fn series(&self, py: Python<'_>, name: &str, create: bool) -> PyResult<u32> {
+    fn series(&self, py: Python<'_>, name: &str, create: bool) -> PyResult<u64> {
         self.with(py, |c| if create { c.series(name) } else { c.series_lookup(name) })
     }
 
@@ -964,7 +969,7 @@ impl Client {
     ///     path: A volume on the server for the new series, one the operator
     ///         added (`tsdb <dir> volume add`; else ERR_NOTFOUND); it only
     ///         matters when the series is created.
-    fn series_at(&self, py: Python<'_>, name: &str, path: &str) -> PyResult<u32> {
+    fn series_at(&self, py: Python<'_>, name: &str, path: &str) -> PyResult<u64> {
         self.with(py, |c| c.series_at(name, path))
     }
 
@@ -981,7 +986,7 @@ impl Client {
     ///     TsdbError: ERR_INVALID if the series exists with another type.
     ///     ValueError: Unknown value_type.
     #[pyo3(signature = (name, value_type = "float32", path = None))]
-    fn series_create(&self, py: Python<'_>, name: &str, value_type: &str, path: Option<&str>) -> PyResult<u32> {
+    fn series_create(&self, py: Python<'_>, name: &str, value_type: &str, path: Option<&str>) -> PyResult<u64> {
         let ty = self::value_type(value_type)?;
         self.with_inner(py, |i| {
             let id = i.conn()?.series_create(name, ty, path)?;
@@ -994,7 +999,7 @@ impl Client {
     ///
     /// Raises:
     ///     TsdbError: ERR_NOTFOUND if there is no such series.
-    fn series_type(&self, py: Python<'_>, id: u32) -> PyResult<&'static str> {
+    fn series_type(&self, py: Python<'_>, id: u64) -> PyResult<&'static str> {
         self.with_inner(py, |i| i.series_type(id)).map(ValueType::name)
     }
 
@@ -1002,7 +1007,7 @@ impl Client {
     ///
     /// Raises:
     ///     TsdbError: ERR_NOTFOUND if there is no such series.
-    fn series_name(&self, py: Python<'_>, id: u32) -> PyResult<String> {
+    fn series_name(&self, py: Python<'_>, id: u64) -> PyResult<String> {
         self.with(py, |c| c.series_name(id))
     }
 
@@ -1014,7 +1019,7 @@ impl Client {
     /// Args:
     ///     series: A series id; its volume holds the names.
     ///     name: The state name, such as "running".
-    fn state(&self, py: Python<'_>, series: u32, name: &str) -> PyResult<u32> {
+    fn state(&self, py: Python<'_>, series: u64, name: &str) -> PyResult<u32> {
         self.with(py, |c| c.state(series, name))
     }
 
@@ -1022,7 +1027,7 @@ impl Client {
     ///
     /// Raises:
     ///     TsdbError: ERR_NOTFOUND if the name has no code.
-    fn state_lookup(&self, py: Python<'_>, series: u32, name: &str) -> PyResult<u32> {
+    fn state_lookup(&self, py: Python<'_>, series: u64, name: &str) -> PyResult<u32> {
         self.with(py, |c| c.state_lookup(series, name))
     }
 
@@ -1030,7 +1035,7 @@ impl Client {
     ///
     /// Raises:
     ///     TsdbError: ERR_NOTFOUND for an unknown code.
-    fn state_name(&self, py: Python<'_>, series: u32, code: u32) -> PyResult<String> {
+    fn state_name(&self, py: Python<'_>, series: u64, code: u32) -> PyResult<String> {
         self.with_inner(py, |i| i.state_name(series, code))
     }
 
@@ -1043,7 +1048,7 @@ impl Client {
     ///
     /// Returns:
     ///     A list of names. Names are cached in the client.
-    fn state_names(&self, py: Python<'_>, series: u32, codes: &Bound<'_, PyAny>) -> PyResult<Vec<Option<String>>> {
+    fn state_names(&self, py: Python<'_>, series: u64, codes: &Bound<'_, PyAny>) -> PyResult<Vec<Option<String>>> {
         let col = py_column(codes, ValueType::State)?;
         self.with_inner(py, |i| {
             col.iter::<u32>()
@@ -1069,7 +1074,7 @@ impl Client {
     fn insert_series(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
@@ -1080,7 +1085,7 @@ impl Client {
     /// Inserts float32 rows into many series and waits.
     ///
     /// Args:
-    ///     series: The series id of each row: a list of ints or a uint32 array.
+    ///     series: The series id of each row: a list of ints, or a uint64 or uint32 array.
     ///     ts: The timestamp of each row, ms since the epoch.
     ///     values: The value of each row.
     fn insert(
@@ -1101,7 +1106,7 @@ impl Client {
     fn insert_series_async(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
@@ -1137,7 +1142,7 @@ impl Client {
     fn insert_series_values(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
         value_type: Option<&str>,
@@ -1165,7 +1170,7 @@ impl Client {
     fn insert_series_values_async(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
         value_type: Option<&str>,
@@ -1248,7 +1253,7 @@ impl Client {
     fn query_raw<'py>(
         &self,
         py: Python<'py>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         order: &str,
@@ -1266,7 +1271,7 @@ impl Client {
     fn query_points<'py>(
         &self,
         py: Python<'py>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         order: &str,
@@ -1289,7 +1294,7 @@ impl Client {
     fn query_values<'py>(
         &self,
         py: Python<'py>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         order: &str,
@@ -1325,7 +1330,7 @@ impl Client {
     fn query_agg(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         interval_ms: i64,
@@ -1372,7 +1377,7 @@ impl Client {
     fn query_group(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         unit: Option<&str>,
@@ -1415,7 +1420,7 @@ impl Client {
     fn query_bounds(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         bounds: &Bound<'_, PyAny>,
         start: Option<i64>,
         end: Option<i64>,
@@ -1449,7 +1454,7 @@ impl Client {
     fn query_spread(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         interval_ms: i64,
@@ -1468,7 +1473,7 @@ impl Client {
     fn query_spread_group(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         unit: Option<&str>,
@@ -1489,7 +1494,7 @@ impl Client {
     fn query_spread_bounds(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         bounds: &Bound<'_, PyAny>,
         start: Option<i64>,
         end: Option<i64>,
@@ -1533,7 +1538,7 @@ impl Client {
     fn query_twa(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         interval_ms: i64,
@@ -1554,7 +1559,7 @@ impl Client {
     fn query_twa_group(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         unit: Option<&str>,
@@ -1578,7 +1583,7 @@ impl Client {
     fn query_twa_bounds(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         bounds: &Bound<'_, PyAny>,
         start: Option<i64>,
         end: Option<i64>,
@@ -1619,7 +1624,7 @@ impl Client {
     fn query_lttb<'py>(
         &self,
         py: Python<'py>,
-        series: u32,
+        series: u64,
         threshold: u64,
         start: Option<i64>,
         end: Option<i64>,
@@ -1642,7 +1647,7 @@ impl Client {
     ///     TsdbError: ERR_INVALID from a server older than version 7 (the
     ///         client asks HELLO first and does not send the request).
     #[pyo3(signature = (series, start, end))]
-    fn delete_range(&self, py: Python<'_>, series: u32, start: Option<i64>, end: Option<i64>) -> PyResult<()> {
+    fn delete_range(&self, py: Python<'_>, series: u64, start: Option<i64>, end: Option<i64>) -> PyResult<()> {
         self.with(py, |c| c.delete_range(series, range(start, end)))
     }
 
@@ -1667,7 +1672,7 @@ impl Client {
     fn replace_range(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         ts: &Bound<'_, PyAny>,
@@ -1684,12 +1689,12 @@ impl Client {
     /// Raises:
     ///     TsdbError: ERR_INVALID for a negative limit or a server older
     ///         than version 7.
-    fn set_retention(&self, py: Python<'_>, series: u32, limit_ms: i64) -> PyResult<()> {
+    fn set_retention(&self, py: Python<'_>, series: u64, limit_ms: i64) -> PyResult<()> {
         self.with(py, |c| c.set_retention(series, limit_ms))
     }
 
     /// Returns the retention limit of a series in ms, 0 for none (protocol version 7).
-    fn retention(&self, py: Python<'_>, series: u32) -> PyResult<i64> {
+    fn retention(&self, py: Python<'_>, series: u64) -> PyResult<i64> {
         self.with(py, |c| c.retention(series))
     }
 
@@ -1728,7 +1733,7 @@ impl Client {
     /// series go as several requests.
     ///
     /// Args:
-    ///     series: Series ids: a list of ints or a uint32 array.
+    ///     series: Series ids: a list of ints, or a uint64 or uint32 array.
     ///     start: First timestamp to include (ms): one for every series, or a
     ///         list or int64 array with one per series; None for no limit.
     ///     end: Timestamp to stop before, like start.

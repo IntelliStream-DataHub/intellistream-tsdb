@@ -240,7 +240,23 @@ fn errors() {
     assert!(matches!(e, Error::InvalidArgument(_)));
     assert_eq!(e.code(), -4);
     assert!(matches!(c.insert(&[a], &[T0, T0 + 1], &[1.0, 2.0]), Err(Error::InvalidArgument(_))));
-    assert!(matches!(c.insert_series(u32::MAX, &[T0], &[1.0]), Err(Error::InvalidArgument(_))));
+    assert!(matches!(c.insert_series(u32::MAX.into(), &[T0], &[1.0]), Err(Error::InvalidArgument(_))));
+    // protocol 10 carries 32-bit ids: a larger one is refused, never truncated onto another series (a + 2^32
+    // would land on a)
+    let big = a + (1u64 << 32);
+    let refused = |r: Result<(), Error>| matches!(r, Err(Error::InvalidArgument(ref m)) if m.contains("32-bit"));
+    assert!(refused(c.insert_series(big, &[T0], &[1.0])));
+    assert!(refused(c.insert(&[a, big], &[T0, T0], &[1.0, 2.0])));
+    assert!(refused(c.insert_series_values(big, &[T0], &[1.0f32])));
+    assert!(refused(c.query_points(big, .., QueryOpts::asc()).map(|_| ())));
+    assert!(refused(c.query_agg(big, .., 0).map(|_| ())));
+    assert!(refused(c.series_name(big).map(|_| ())));
+    assert!(refused(c.series_type(big).map(|_| ())));
+    assert!(refused(c.delete_range(big, ..)));
+    assert!(refused(c.retention(big).map(|_| ())));
+    let multi = c.query_rows_multi(&[a, big], .., QueryOpts::asc(), Default::default());
+    assert!(refused(multi.map(|_| ())));
+    assert_eq!(c.query_points(a, .., QueryOpts::asc()).unwrap().len(), 0);
     assert!(matches!(c.series(""), Err(Error::InvalidArgument(_))));
     assert!(matches!(c.series("a\0b"), Err(Error::InvalidArgument(_))));
     assert!(matches!(c.series(&"x".repeat(70_000)), Err(Error::InvalidArgument(_))));
@@ -286,7 +302,7 @@ fn server_going_away_breaks_the_client() {
 fn concurrent_clients() {
     let srv = Server::start();
     let mut c = srv.client();
-    let ids: Vec<u32> = (0..8).map(|i| c.series(&format!("vib.{i}")).unwrap()).collect();
+    let ids: Vec<u64> = (0..8).map(|i| c.series(&format!("vib.{i}")).unwrap()).collect();
     std::thread::scope(|s| {
         for &id in &ids {
             let addr = srv.addr();

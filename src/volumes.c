@@ -831,7 +831,7 @@ static void catch_up(tsdb *t)
 }
 
 /* Routes a global id: the volume and its local id. */
-static bool route(tsdb *t, uint32_t g, eng **e, uint32_t *local)
+static bool route(tsdb *t, tsdb_sid g, eng **e, uint32_t *local)
 {
     pthread_rwlock_rdlock(&t->lock);
     bool ok = g < t->ncat;
@@ -853,7 +853,7 @@ static bool route(tsdb *t, uint32_t g, eng **e, uint32_t *local)
     return ok;
 }
 
-int tsdb_series_lookup(tsdb *t, const char *name, uint32_t *id)
+int tsdb_series_lookup(tsdb *t, const char *name, tsdb_sid *id)
 {
     pthread_rwlock_rdlock(&t->lock);
     int64_t g = names_find(t, name);
@@ -866,7 +866,7 @@ int tsdb_series_lookup(tsdb *t, const char *name, uint32_t *id)
     }
     if (g < 0)
         return TSDB_ERR_NOTFOUND;
-    *id = (uint32_t)g;
+    *id = (tsdb_sid)g;
     return 0;
 }
 
@@ -1003,7 +1003,7 @@ int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index)
 
 /* Gets or creates a series. type < 0: any existing type, else created as
  * float32; otherwise an existing series must have this type. */
-static int series_make(tsdb *t, const char *name, int type, const char *path, uint32_t *id)
+static int series_make(tsdb *t, const char *name, int type, const char *path, tsdb_sid *id)
 {
     if (!name || !*name || (type >= 0 && !type_valid(type)))
         return TSDB_ERR_INVALID;
@@ -1040,7 +1040,7 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ui
     }
     if (rc == 0) {
         pthread_rwlock_wrlock(&t->lock);
-        *id = (uint32_t)t->ncat;
+        *id = (tsdb_sid)t->ncat;
         rc = cat_add(t, vol, local);
         pthread_rwlock_unlock(&t->lock);
     }
@@ -1048,34 +1048,49 @@ static int series_make(tsdb *t, const char *name, int type, const char *path, ui
     return rc;
 }
 
-int tsdb_series_at(tsdb *t, const char *name, const char *path, uint32_t *id)
+int tsdb_series_at(tsdb *t, const char *name, const char *path, tsdb_sid *id)
 {
     return series_make(t, name, -1, path, id);
 }
 
-int tsdb_series(tsdb *t, const char *name, uint32_t *id) { return series_make(t, name, -1, NULL, id); }
+int tsdb_series(tsdb *t, const char *name, tsdb_sid *id) { return series_make(t, name, -1, NULL, id); }
 
-int tsdb_series_create(tsdb *t, const char *name, tsdb_type type, const char *path, uint32_t *id)
+int tsdb_series_create(tsdb *t, const char *name, tsdb_type type, const char *path, tsdb_sid *id)
 {
     return series_make(t, name, (int)type, path, id);
 }
 
-uint32_t tsdb_series_count(tsdb *t)
+uint64_t tsdb_series_count(tsdb *t)
 {
     pthread_rwlock_rdlock(&t->lock);
-    uint32_t n = (uint32_t)t->ncat;
+    uint64_t n = t->ncat;
     pthread_rwlock_unlock(&t->lock);
     return n;
 }
 
-const char *tsdb_series_name(tsdb *t, uint32_t id)
+int tsdb_series_foreach(tsdb *t, int (*fn)(void *ctx, tsdb_sid id), void *ctx)
+{
+    if (!fn)
+        return TSDB_ERR_INVALID;
+    size_t n = (size_t)tsdb_series_count(t); /* series created during the walk may be left out */
+    for (size_t g = 0; g < n; g++) {
+        int rc = fn(ctx, (tsdb_sid)g);
+        if (rc)
+            return rc;
+    }
+    return 0;
+}
+
+int tsdb_abi_version(void) { return TSDB_ABI_VERSION; }
+
+const char *tsdb_series_name(tsdb *t, tsdb_sid id)
 {
     eng *e;
     uint32_t local;
     return route(t, id, &e, &local) ? eng_series_name(e, local) : NULL;
 }
 
-int tsdb_series_type(tsdb *t, uint32_t id, tsdb_type *type)
+int tsdb_series_type(tsdb *t, tsdb_sid id, tsdb_type *type)
 {
     eng *e;
     uint32_t local;
@@ -1086,14 +1101,14 @@ int tsdb_series_type(tsdb *t, uint32_t id, tsdb_type *type)
     return 0;
 }
 
-int tsdb_series_class(tsdb *t, uint32_t id, int *cls)
+int tsdb_series_class(tsdb *t, tsdb_sid id, int *cls)
 {
     eng *e;
     uint32_t local;
     return route(t, id, &e, &local) ? eng_series_class(e, local, cls) : TSDB_ERR_NOTFOUND;
 }
 
-int tsdb_test_class_switch(tsdb *t, uint32_t id, int cls, const int64_t *at)
+int tsdb_test_class_switch(tsdb *t, tsdb_sid id, int cls, const int64_t *at)
 {
     eng *e;
     uint32_t local;
@@ -1145,7 +1160,7 @@ void tsdb_test_granules(tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, cons
 
 /* ---------------------------------------------------------------- states */
 
-static int state_get(tsdb *t, uint32_t series, const char *name, bool create, uint32_t *code)
+static int state_get(tsdb *t, tsdb_sid series, const char *name, bool create, uint32_t *code)
 {
     eng *e;
     uint32_t local;
@@ -1158,24 +1173,24 @@ static int state_get(tsdb *t, uint32_t series, const char *name, bool create, ui
     return eng_state(e, name, create, code);
 }
 
-int tsdb_state(tsdb *t, uint32_t series, const char *name, uint32_t *code)
+int tsdb_state(tsdb *t, tsdb_sid series, const char *name, uint32_t *code)
 {
     return state_get(t, series, name, true, code);
 }
 
-int tsdb_state_lookup(tsdb *t, uint32_t series, const char *name, uint32_t *code)
+int tsdb_state_lookup(tsdb *t, tsdb_sid series, const char *name, uint32_t *code)
 {
     return state_get(t, series, name, false, code);
 }
 
-const char *tsdb_state_name(tsdb *t, uint32_t series, uint32_t code)
+const char *tsdb_state_name(tsdb *t, tsdb_sid series, uint32_t code)
 {
     eng *e;
     uint32_t local;
     return route(t, series, &e, &local) ? eng_state_name(e, code) : NULL;
 }
 
-const char *tsdb_series_path(tsdb *t, uint32_t id)
+const char *tsdb_series_path(tsdb *t, tsdb_sid id)
 {
     pthread_rwlock_rdlock(&t->lock);
     const char *p = id < t->ncat ? t->paths[t->cat_vol[id]] : NULL;
@@ -1212,7 +1227,7 @@ static int vals_import(const tsdb_values *in, size_t n, const void **slots, void
     return 0;
 }
 
-static int insert_series_slots(tsdb *t, int type, uint32_t series, const int64_t *ts, const void *v, size_t n)
+static int insert_series_slots(tsdb *t, int type, tsdb_sid series, const int64_t *ts, const void *v, size_t n)
 {
     eng *e;
     uint32_t local;
@@ -1223,7 +1238,7 @@ static int insert_series_slots(tsdb *t, int type, uint32_t series, const int64_t
 
 /* Rows of several series: split by volume, local ids, each volume written on
  * its own (a batch that spans volumes is durable per volume). */
-static int insert_slots(tsdb *t, int type, const uint32_t *series, const int64_t *ts, const void *values, size_t n)
+static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t *ts, const void *values, size_t n)
 {
     if (t->opt.read_only)
         return TSDB_ERR_READONLY;
@@ -1238,10 +1253,17 @@ static int insert_slots(tsdb *t, int type, const uint32_t *series, const int64_t
             pthread_rwlock_unlock(&t->lock);
             return TSDB_ERR_INVALID;
         }
-    if (identity) {
+    if (identity) { /* the engine takes 32-bit local ids: one pass narrows them */
         eng *root = t->vols[0];
         pthread_rwlock_unlock(&t->lock);
-        return eng_insert(root, type, series, ts, values, n);
+        uint32_t *ls = malloc((n ? n : 1) * sizeof *ls);
+        if (!ls)
+            return TSDB_ERR_NOMEM;
+        for (size_t i = 0; i < n; i++)
+            ls[i] = (uint32_t)series[i];
+        int rc = eng_insert(root, type, ls, ts, values, n);
+        free(ls);
+        return rc;
     }
     size_t *cnt = calloc(nv + 1, sizeof *cnt);
     uint32_t *ls = malloc(n * sizeof *ls);
@@ -1284,22 +1306,22 @@ static int insert_slots(tsdb *t, int type, const uint32_t *series, const int64_t
     return rc;
 }
 
-int tsdb_insert_series(tsdb *t, uint32_t series, const int64_t *ts, const float *values, size_t n)
+int tsdb_insert_series(tsdb *t, tsdb_sid series, const int64_t *ts, const float *values, size_t n)
 {
     return insert_series_slots(t, TSDB_FLOAT32, series, ts, values, n);
 }
 
-int tsdb_append(tsdb *t, uint32_t series, int64_t ts, float value)
+int tsdb_append(tsdb *t, tsdb_sid series, int64_t ts, float value)
 {
     return insert_series_slots(t, TSDB_FLOAT32, series, &ts, &value, 1);
 }
 
-int tsdb_insert(tsdb *t, const uint32_t *series, const int64_t *ts, const float *values, size_t n)
+int tsdb_insert(tsdb *t, const tsdb_sid *series, const int64_t *ts, const float *values, size_t n)
 {
     return insert_slots(t, TSDB_FLOAT32, series, ts, values, n);
 }
 
-int tsdb_insert_values(tsdb *t, const uint32_t *series, const int64_t *ts, const tsdb_values *values, size_t n)
+int tsdb_insert_values(tsdb *t, const tsdb_sid *series, const int64_t *ts, const tsdb_values *values, size_t n)
 {
     const void *slots;
     void *owned;
@@ -1310,7 +1332,7 @@ int tsdb_insert_values(tsdb *t, const uint32_t *series, const int64_t *ts, const
     return rc;
 }
 
-int tsdb_insert_series_values(tsdb *t, uint32_t series, const int64_t *ts, const tsdb_values *values, size_t n)
+int tsdb_insert_series_values(tsdb *t, tsdb_sid series, const int64_t *ts, const tsdb_values *values, size_t n)
 {
     const void *slots;
     void *owned;
@@ -1323,7 +1345,7 @@ int tsdb_insert_series_values(tsdb *t, uint32_t series, const int64_t *ts, const
 
 /* ---------------------------------------------------- deletes, retention */
 
-int tsdb_delete_range(tsdb *t, uint32_t series, int64_t start, int64_t end)
+int tsdb_delete_range(tsdb *t, tsdb_sid series, int64_t start, int64_t end)
 {
     eng *e;
     uint32_t local;
@@ -1332,7 +1354,7 @@ int tsdb_delete_range(tsdb *t, uint32_t series, int64_t start, int64_t end)
     return route(t, series, &e, &local) ? eng_delete_range(e, local, start, end) : TSDB_ERR_INVALID;
 }
 
-int tsdb_replace_range(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *ts,
+int tsdb_replace_range(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const int64_t *ts,
                        const tsdb_values *values, size_t n)
 {
     eng *e;
@@ -1352,7 +1374,7 @@ int tsdb_replace_range(tsdb *t, uint32_t series, int64_t start, int64_t end, con
     return rc;
 }
 
-int tsdb_set_retention(tsdb *t, uint32_t series, int64_t limit_ms)
+int tsdb_set_retention(tsdb *t, tsdb_sid series, int64_t limit_ms)
 {
     eng *e;
     uint32_t local;
@@ -1361,7 +1383,7 @@ int tsdb_set_retention(tsdb *t, uint32_t series, int64_t limit_ms)
     return route(t, series, &e, &local) ? eng_set_retention(e, local, limit_ms) : TSDB_ERR_NOTFOUND;
 }
 
-int tsdb_get_retention(tsdb *t, uint32_t series, int64_t *limit_ms)
+int tsdb_get_retention(tsdb *t, tsdb_sid series, int64_t *limit_ms)
 {
     eng *e;
     uint32_t local;
@@ -1496,7 +1518,7 @@ static int f32_cb(void *arg, const int64_t *ts, const void *v, size_t n)
     return o->fn(o->ctx, ts, v, n);
 }
 
-int tsdb_query_raw_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+int tsdb_query_raw_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_raw_fn fn, void *ctx)
 {
     eng *e;
@@ -1516,7 +1538,7 @@ int tsdb_query_raw_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
     return rc;
 }
 
-int tsdb_query_raw(tsdb *t, uint32_t series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx)
+int tsdb_query_raw(tsdb *t, tsdb_sid series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx)
 {
     return tsdb_query_raw_ex(t, series, start, end, NULL, fn, ctx);
 }
@@ -1542,7 +1564,7 @@ static int collect_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
     return 0;
 }
 
-int tsdb_query_points_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+int tsdb_query_points_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                          tsdb_points *out)
 {
     memset(out, 0, sizeof *out);
@@ -1554,7 +1576,7 @@ int tsdb_query_points_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, c
     return rc;
 }
 
-int tsdb_query_points(tsdb *t, uint32_t series, int64_t start, int64_t end, tsdb_points *out)
+int tsdb_query_points(tsdb *t, tsdb_sid series, int64_t start, int64_t end, tsdb_points *out)
 {
     return tsdb_query_points_ex(t, series, start, end, NULL, out);
 }
@@ -1602,7 +1624,7 @@ static int vals_cb(void *arg, const int64_t *ts, const void *v, size_t n)
     return o->fn(o->ctx, ts, &col, n);
 }
 
-int tsdb_query_values(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_query_opts *opts,
+int tsdb_query_values(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_query_opts *opts,
                       tsdb_values_fn fn, void *ctx)
 {
     eng *e;
@@ -1641,7 +1663,7 @@ static int lttb_limit_cb(void *arg, const int64_t *ts, const void *v, size_t n)
     return l->limit && l->sent >= l->limit;
 }
 
-int tsdb_query_lttb_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, size_t threshold,
+int tsdb_query_lttb_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, size_t threshold,
                        const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx)
 {
     if (threshold < 3)
@@ -1666,7 +1688,7 @@ int tsdb_query_lttb_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, siz
     return rc;
 }
 
-int tsdb_query_lttb(tsdb *t, uint32_t series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
+int tsdb_query_lttb(tsdb *t, tsdb_sid series, int64_t start, int64_t end, size_t threshold, tsdb_values_fn fn,
                     void *ctx)
 {
     return tsdb_query_lttb_ex(t, series, start, end, threshold, NULL, fn, ctx);
@@ -1674,7 +1696,7 @@ int tsdb_query_lttb(tsdb *t, uint32_t series, int64_t start, int64_t end, size_t
 
 /* Aggregates, calendar groups and bounds: one router. The engine applies order and limit, computing only
  * about the buckets it returns (bucket_windows in src/query.c). */
-static int query_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+static int query_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                        const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
     eng *e;
@@ -1691,7 +1713,7 @@ static int query_group(tsdb *t, uint32_t series, int64_t start, int64_t end, con
     return rc;
 }
 
-int tsdb_query_agg_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+int tsdb_query_agg_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -1702,13 +1724,13 @@ int tsdb_query_agg_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, int6
     return query_group(t, series, start, end, &bk, opts, out, nout);
 }
 
-int tsdb_query_agg(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
+int tsdb_query_agg(tsdb *t, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms, tsdb_bucket **out,
                    size_t *nout)
 {
     return tsdb_query_agg_ex(t, series, start, end, interval_ms, NULL, out, nout);
 }
 
-int tsdb_query_group_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_group_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                         const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -1718,14 +1740,14 @@ int tsdb_query_group_ex(tsdb *t, uint32_t series, int64_t start, int64_t end, co
     return rc ? rc : query_group(t, series, start, end, &bk, opts, out, nout);
 }
 
-int tsdb_query_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                      tsdb_bucket **out, size_t *nout)
 {
     return tsdb_query_group_ex(t, series, start, end, group, NULL, out, nout);
 }
 
 /* Time-weighted averages: one router for the interval, group and bounds forms. */
-static int query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+static int query_twa(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                      const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
     eng *e;
@@ -1744,7 +1766,7 @@ static int query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, const
     return rc;
 }
 
-int tsdb_query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+int tsdb_query_twa(tsdb *t, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                    const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -1755,7 +1777,7 @@ int tsdb_query_twa(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t
     return query_twa(t, series, start, end, &bk, opts, out, nout);
 }
 
-int tsdb_query_twa_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_twa_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                          const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -1765,7 +1787,7 @@ int tsdb_query_twa_group(tsdb *t, uint32_t series, int64_t start, int64_t end, c
     return rc ? rc : query_twa(t, series, start, end, &bk, opts, out, nout);
 }
 
-int tsdb_query_twa_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+int tsdb_query_twa_bounds(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                           const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -1779,7 +1801,7 @@ int tsdb_query_twa_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, 
     return query_twa(t, series, start, end, &bk, opts, out, nout);
 }
 
-int tsdb_query_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+int tsdb_query_bounds(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -1794,7 +1816,7 @@ int tsdb_query_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, cons
 }
 
 /* The spread: one router for the interval, group and bounds forms, like query_twa. */
-static int query_spread(tsdb *t, uint32_t series, int64_t start, int64_t end, const bucketer *bk,
+static int query_spread(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const bucketer *bk,
                         const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
 {
     eng *e;
@@ -1811,7 +1833,7 @@ static int query_spread(tsdb *t, uint32_t series, int64_t start, int64_t end, co
     return rc;
 }
 
-int tsdb_query_spread(tsdb *t, uint32_t series, int64_t start, int64_t end, int64_t interval_ms,
+int tsdb_query_spread(tsdb *t, tsdb_sid series, int64_t start, int64_t end, int64_t interval_ms,
                       const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -1822,7 +1844,7 @@ int tsdb_query_spread(tsdb *t, uint32_t series, int64_t start, int64_t end, int6
     return query_spread(t, series, start, end, &bk, opts, out, nout);
 }
 
-int tsdb_query_spread_group(tsdb *t, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_spread_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                             const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -1832,7 +1854,7 @@ int tsdb_query_spread_group(tsdb *t, uint32_t series, int64_t start, int64_t end
     return rc ? rc : query_spread(t, series, start, end, &bk, opts, out, nout);
 }
 
-int tsdb_query_spread_bounds(tsdb *t, uint32_t series, int64_t start, int64_t end, const int64_t *bounds,
+int tsdb_query_spread_bounds(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds,
                              size_t n, const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
 {
     *out = NULL;

@@ -27,10 +27,10 @@ interface TsdbConnection extends AutoCloseable {
     SeriesCache.Entry create(String name, ValueType type) throws TsdbException;
 
     /** The code of a state name of a state series, created if new. */
-    int state(int series, String name) throws TsdbException;
+    int state(long series, String name) throws TsdbException;
 
     /** Sends an insert of rows of one type without waiting. */
-    void insertAsync(int[] series, long[] ts, Column values, int n) throws TsdbException;
+    void insertAsync(long[] series, long[] ts, Column values, int n) throws TsdbException;
 
     /** Waits for every insert sent; throws the first error among them. Returns once they are durable. */
     void await() throws TsdbException;
@@ -94,7 +94,7 @@ interface TsdbConnection extends AutoCloseable {
 
         @Override
         public SeriesCache.Entry lookup(String name) throws TsdbException {
-            int id;
+            long id;
             try {
                 id = c.series(name, false);
             } catch (TsdbException e) {
@@ -111,12 +111,12 @@ interface TsdbConnection extends AutoCloseable {
         }
 
         @Override
-        public int state(int series, String name) throws TsdbException {
+        public int state(long series, String name) throws TsdbException {
             return c.state(series, name);
         }
 
         @Override
-        public void insertAsync(int[] series, long[] ts, Column values, int n) throws TsdbException {
+        public void insertAsync(long[] series, long[] ts, Column values, int n) throws TsdbException {
             c.insertValuesAsync(series, ts, values, 0, n);
         }
 

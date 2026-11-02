@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use rayon::prelude::*;
 
+use crate::SeriesId;
 use crate::client::Client;
 use crate::error::{Error, Result};
 use std::ops::{ControlFlow, RangeBounds};
@@ -44,7 +45,7 @@ use crate::value::{Column, ColumnRef};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RangeQuery {
     /// The series id.
-    pub series: u32,
+    pub series: SeriesId,
     /// First timestamp included.
     pub start: i64,
     /// Timestamp to stop before.
@@ -53,7 +54,7 @@ pub struct RangeQuery {
 
 impl RangeQuery {
     /// `series` over `[start, end)`.
-    pub fn new(series: u32, start: i64, end: i64) -> Self {
+    pub fn new(series: SeriesId, start: i64, end: i64) -> Self {
         RangeQuery { series, start, end }
     }
 }
@@ -62,7 +63,7 @@ impl RangeQuery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AggQuery {
     /// The series id.
-    pub series: u32,
+    pub series: SeriesId,
     /// First timestamp included.
     pub start: i64,
     /// Timestamp to stop before.
@@ -73,7 +74,7 @@ pub struct AggQuery {
 
 impl AggQuery {
     /// `series` over `[start, end)` in buckets of `interval_ms`.
-    pub fn new(series: u32, start: i64, end: i64, interval_ms: i64) -> Self {
+    pub fn new(series: SeriesId, start: i64, end: i64, interval_ms: i64) -> Self {
         AggQuery { series, start, end, interval_ms }
     }
 }
@@ -82,9 +83,9 @@ impl AggQuery {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Target<'a> {
     /// Every row into this series.
-    Series(u32),
+    Series(SeriesId),
     /// Row i into `series[i]`.
-    Each(&'a [u32]),
+    Each(&'a [SeriesId]),
 }
 
 /// One insert of a batch: all or nothing on its own.
@@ -100,12 +101,12 @@ pub struct InsertBatch<'a> {
 
 impl<'a> InsertBatch<'a> {
     /// Rows of one series.
-    pub fn series(series: u32, ts: &'a [i64], values: impl Into<ColumnRef<'a>>) -> Self {
+    pub fn series(series: SeriesId, ts: &'a [i64], values: impl Into<ColumnRef<'a>>) -> Self {
         InsertBatch { target: Target::Series(series), ts, values: values.into() }
     }
 
     /// Row i into `series[i]`.
-    pub fn each(series: &'a [u32], ts: &'a [i64], values: impl Into<ColumnRef<'a>>) -> Self {
+    pub fn each(series: &'a [SeriesId], ts: &'a [i64], values: impl Into<ColumnRef<'a>>) -> Self {
         InsertBatch { target: Target::Each(series), ts, values: values.into() }
     }
 }
@@ -202,12 +203,12 @@ fn chains(batches: &[InsertBatch<'_>]) -> Vec<Vec<usize>> {
         x
     }
     let mut parent: Vec<usize> = (0..batches.len()).collect();
-    let mut owner: HashMap<u32, usize> = HashMap::new();
+    let mut owner: HashMap<SeriesId, usize> = HashMap::new();
     for (i, b) in batches.iter().enumerate() {
         let ids = match b.target {
             Target::Series(s) => std::slice::from_ref(&s).to_vec(),
             Target::Each(s) => {
-                let mut v: Vec<u32> = s.to_vec();
+                let mut v: Vec<SeriesId> = s.to_vec();
                 v.dedup(); // rows of one series usually come together
                 v
             }
@@ -244,7 +245,7 @@ impl crate::Db {
     /// batch's queries; so does it after [`query_agg_many`](crate::Db::query_agg_many).
     pub fn query_points_many(&self, queries: &[RangeQuery], opts: QueryOpts) -> Result<Vec<Points>> {
         // one tsdb_query_multi: the database's query scheduler runs the series, all from one cut
-        let series: Vec<u32> = queries.iter().map(|q| q.series).collect();
+        let series: Vec<SeriesId> = queries.iter().map(|q| q.series).collect();
         let starts: Vec<i64> = queries.iter().map(|q| q.start).collect();
         let ends: Vec<i64> = queries.iter().map(|q| q.end).collect();
         let m = MultiOpts { starts: Some(&starts), ends: Some(&ends), ..MultiOpts::default() };
@@ -278,7 +279,7 @@ impl crate::Db {
     /// [`Error::Batch`] with the lowest failing query's index and error (as
     /// [`query_agg`](crate::Db::query_agg)); every query below it succeeded.
     pub fn query_agg_many(&self, queries: &[AggQuery]) -> Result<Vec<Vec<Bucket>>> {
-        let series: Vec<u32> = queries.iter().map(|q| q.series).collect();
+        let series: Vec<SeriesId> = queries.iter().map(|q| q.series).collect();
         let starts: Vec<i64> = queries.iter().map(|q| q.start).collect();
         let ends: Vec<i64> = queries.iter().map(|q| q.end).collect();
         let intervals: Vec<i64> = queries.iter().map(|q| q.interval_ms).collect();
@@ -422,7 +423,7 @@ impl Pool {
     /// [`Client::query_rows_multi`] on one of the pool's connections (retried once on a new one if it breaks).
     pub fn query_rows_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         opts: QueryOpts,
         m: MultiOpts<'_>,
@@ -434,7 +435,7 @@ impl Pool {
     /// [`Client::query_lttb_multi`] on one of the pool's connections.
     pub fn query_lttb_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         threshold: u64,
         opts: QueryOpts,
@@ -448,7 +449,7 @@ impl Pool {
     /// seen chunks).
     pub fn query_chunks_multi<F>(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         opts: QueryOpts,
         m: MultiOpts<'_>,
@@ -470,7 +471,7 @@ impl Pool {
     /// [`Client::query_buckets_multi`] on one of the pool's connections.
     pub fn query_buckets_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: QueryOpts,
@@ -483,7 +484,7 @@ impl Pool {
     /// [`Client::query_spread_multi`] on one of the pool's connections.
     pub fn query_spread_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: QueryOpts,
@@ -496,7 +497,7 @@ impl Pool {
     /// [`Client::query_twa_multi`] on one of the pool's connections.
     pub fn query_twa_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: TwaOpts,

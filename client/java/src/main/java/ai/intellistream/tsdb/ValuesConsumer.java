@@ -3,7 +3,7 @@ package ai.intellistream.tsdb;
 /**
  * Receives the points of a streamed typed query, chunk by chunk, in the requested order.
  *
- * @see TsdbClient#queryValues(int, long, long, Order, long, ValuesConsumer)
+ * @see TsdbClient#queryValues(long, long, long, Order, long, ValuesConsumer)
  */
 @FunctionalInterface
 public interface ValuesConsumer {

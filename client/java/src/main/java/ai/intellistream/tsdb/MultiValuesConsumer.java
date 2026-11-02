@@ -1,7 +1,7 @@
 package ai.intellistream.tsdb;
 
 /**
- * Receives the rows of a query over many series as they arrive ({@link TsdbClient#queryValuesMulti(int[], long, long,
+ * Receives the rows of a query over many series as they arrive ({@link TsdbClient#queryValuesMulti(long[], long, long,
  * Order, long, MultiOptions, MultiValuesConsumer)}), series by series in the order of the list.
  */
 @FunctionalInterface

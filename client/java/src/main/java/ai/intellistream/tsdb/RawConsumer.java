@@ -3,7 +3,7 @@ package ai.intellistream.tsdb;
 /**
  * Receives the points of a streamed raw query, chunk by chunk, in the requested order.
  *
- * @see TsdbClient#queryRaw(int, long, long, Order, long, RawConsumer)
+ * @see TsdbClient#queryRaw(long, long, long, Order, long, RawConsumer)
  */
 @FunctionalInterface
 public interface RawConsumer {

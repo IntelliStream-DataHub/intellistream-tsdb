@@ -303,7 +303,7 @@ static const char *type_name[] = {"float32", "float64", "int64", "bool"};
 static model models[NSER];
 
 /* ms: the models of the series (NULL: read the reference from truth) */
-static void check_all(tsdb *db, tsdb *truth, const model *ms, const uint32_t *ids, const char *what)
+static void check_all(tsdb *db, tsdb *truth, const model *ms, const tsdb_sid *ids, const char *what)
 {
     for (int k = 0; k < NSER; k++) {
         char w[128];
@@ -315,7 +315,7 @@ static void check_all(tsdb *db, tsdb *truth, const model *ms, const uint32_t *id
 /* hand-checked: the largest triangle, and the first of equal ones */
 static void test_by_hand(tsdb *db)
 {
-    uint32_t s, b;
+    tsdb_sid s, b;
     OK(tsdb_series_create(db, "hand", TSDB_FLOAT64, NULL, &s));
     int64_t ts[5] = {T0, T0 + 1, T0 + 2, T0 + 3, T0 + 4};
     double v[5] = {0, 1, 10, 2, 0};
@@ -333,7 +333,7 @@ static void test_by_hand(tsdb *db)
     /* the paper's bucket bounds: with n = 17 and threshold 13, every = 15/11 and 11 * every rounds
      * below 15, so the last bucket is point 14 alone and point 15 only enters the last mean: the
      * spike there is not chosen (exact integer bounds would choose it) */
-    uint32_t pp;
+    tsdb_sid pp;
     OK(tsdb_series_create(db, "paper", TSDB_FLOAT64, NULL, &pp));
     int64_t pts17[32];
     double pv[32];
@@ -357,7 +357,7 @@ static void test_by_hand(tsdb *db)
     free(got.p);
 
     /* the contract's errors */
-    uint32_t st;
+    tsdb_sid st;
     OK(tsdb_series_create(db, "state", TSDB_STATE, NULL, &st));
     pts none = {0};
     for (size_t t = 0; t < 3; t++)
@@ -389,7 +389,7 @@ static void test_count_mismatch(const char *base)
     o.wal_max_batch_rows = 100; /* the insert becomes a part */
     o.merge_threads = 0;
     tsdb *db;
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_series_create(db, "nulls", TSDB_FLOAT64, NULL, &s));
     enum { N = 2000 };
@@ -483,7 +483,7 @@ static void test_count_mismatch(const char *base)
  * timestamps (n stays the same) while queries check the count, the order and the fixed ends. */
 enum { CN = 60000 };
 static tsdb *cdb;
-static uint32_t cs;
+static tsdb_sid cs;
 static atomic_int cstop;
 static int64_t cts[CN];
 
@@ -608,7 +608,7 @@ int main(int argc, char **argv)
     OK(tsdb_open(dir, &o, &db));
     test_by_hand(db);
 
-    uint32_t ids[NSER];
+    tsdb_sid ids[NSER];
     int64_t clock[NSER];
     double walk[NSER];
     size_t base[NSER];

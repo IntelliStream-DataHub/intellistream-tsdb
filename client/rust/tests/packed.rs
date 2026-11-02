@@ -46,7 +46,7 @@ fn columns(n: usize) -> Vec<(ValueType, Column)> {
 }
 
 /// The stored rows, floats compared by their bits.
-fn stored(c: &mut Client, id: u32) -> (Vec<i64>, Vec<Option<u64>>) {
+fn stored(c: &mut Client, id: u64) -> (Vec<i64>, Vec<Option<u64>>) {
     let r = c.query_rows(id, .., QueryOpts::asc()).unwrap();
     let v = &r.values;
     let bits: Vec<Option<u64>> = match &v.values {
@@ -70,7 +70,7 @@ fn packed_and_plain_store_the_same() {
     let n = 3001; // not a multiple of 8: a partial last bitmap byte
     let ts = awkward_ts(n);
     for (ty, col) in columns(n) {
-        let ids: Vec<u32> = ["p", "q", "mp0", "mp1", "mp2", "mq0", "mq1", "mq2"]
+        let ids: Vec<u64> = ["p", "q", "mp0", "mp1", "mp2", "mq0", "mq1", "mq2"]
             .iter()
             .map(|s| packed.series_create(&format!("{s}.{ty}"), ty, None).unwrap())
             .collect();
@@ -80,7 +80,7 @@ fn packed_and_plain_store_the_same() {
         assert_eq!(stored(&mut packed, ids[0]).1.iter().filter(|v| v.is_none()).count(), col.null_count(), "{ty}");
 
         // many series, ids going up and down
-        let pick = |base: usize| -> Vec<u32> { (0..n).map(|i| ids[base + [2, 0, 1][i % 3]]).collect() };
+        let pick = |base: usize| -> Vec<u64> { (0..n).map(|i| ids[base + [2, 0, 1][i % 3]]).collect() };
         packed.insert_values(&pick(2), &ts, &col).unwrap();
         plain.insert_values(&pick(5), &ts, &col).unwrap();
         for k in 0..3 {

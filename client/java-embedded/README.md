@@ -20,7 +20,7 @@ import ai.intellistream.tsdb.*;
 import ai.intellistream.tsdb.embedded.*;
 
 try (EmbeddedDb db = EmbeddedDb.open("/var/lib/tsdb")) {
-    int id = db.series("boiler.temp");
+    long id = db.series("boiler.temp");
     db.insert(id, new long[] {t0, t0 + 60_000}, new float[] {61.5f, 61.8f});
 
     Points raw = db.queryPoints(id, t0, t1);
@@ -57,8 +57,9 @@ The library is looked up in this order. The first match wins:
    includes /usr/lib and /lib, where an older installed libtsdb.so would otherwise win unnoticed.
 4. The dynamic linker's own search (`LD_LIBRARY_PATH`, the ld.so cache).
 
-Whichever it is, the binding asks the library for the size of every public struct (`tsdb_struct_size`) when it
-loads it and refuses one built from other headers with an `UnsatisfiedLinkError`, instead of corrupting memory.
+Whichever it is, the binding asks the library for its ABI version (`tsdb_abi_version`, raised with every
+incompatible change of a struct or a function) and for the size of every public struct (`tsdb_struct_size`) when it
+loads it, and refuses one built from other headers with an `UnsatisfiedLinkError`, instead of corrupting memory.
 (The spread and TWA structs have no such size yet; the tests check them against the headers, and a library
 without their functions fails to load.)
 The library needs `libzstd.so.1` at run time (`apt install libzstd1`, `dnf install libzstd`).

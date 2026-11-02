@@ -182,7 +182,7 @@ static void test_sparse_local(tsdb *db)
     for (int k = 0; k < 4; k++) {
         char name[32];
         snprintf(name, sizeof name, "sparse%d", k);
-        uint32_t id;
+        tsdb_sid id;
         OK(tsdb_series(db, name, &id));
         int64_t tt[2] = {t0, t0 + gaps[k]};
         float vv[2] = {1, 2};
@@ -244,7 +244,7 @@ int main(int argc, char **argv)
     o.partition_ms = 30LL * 86400000;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     test_sparse_local(db);
 

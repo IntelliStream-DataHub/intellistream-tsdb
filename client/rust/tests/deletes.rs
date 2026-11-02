@@ -15,7 +15,7 @@ fn invalid<T: std::fmt::Debug>(r: Result<T, Error>) -> bool {
     r.unwrap_err().status() == Some(Status::Invalid)
 }
 
-fn rows(c: &mut Client, id: u32) -> (Vec<i64>, Vec<Option<i64>>) {
+fn rows(c: &mut Client, id: u64) -> (Vec<i64>, Vec<Option<i64>>) {
     let r = c.query_rows(id, .., QueryOpts::asc()).unwrap();
     (r.ts, r.values.to_options::<i64>().unwrap())
 }

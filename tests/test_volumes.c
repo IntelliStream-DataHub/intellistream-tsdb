@@ -48,7 +48,7 @@ static uint64_t rnd(void)
     return rng;
 }
 
-static void check_all(tsdb *db, const uint32_t *ids)
+static void check_all(tsdb *db, const tsdb_sid *ids)
 {
     for (int s = 0; s < NS; s++) {
         tsdb_points p;
@@ -74,7 +74,7 @@ static void check_all(tsdb *db, const uint32_t *ids)
 
 typedef struct wjob {
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     int s;
 } wjob;
 
@@ -137,7 +137,8 @@ static void test_paths(const char *base)
     o.fsync = 0;
     CHECK(o.create_volumes == 1); /* embedded default */
     tsdb *db;
-    uint32_t id, v;
+    tsdb_sid id;
+    uint32_t v;
     OK(tsdb_open(root, &o, &db));
     OK(tsdb_series(db, "plain", &id));
 
@@ -222,7 +223,7 @@ static void test_paths(const char *base)
     snprintf(p, sizeof p, "%s/vol\ny", top);
     CHECK(tsdb_series_at(db, "evil", p, &id) == TSDB_ERR_INVALID);
     /* an existing volume is matched as before: spelled with extra slashes, or through a symlink */
-    uint32_t on_a;
+    tsdb_sid on_a;
     snprintf(p, sizeof p, "%s//va/", top);
     OK(tsdb_series_at(db, "on.a", p, &on_a));
     CHECK(strcmp(tsdb_series_path(db, on_a), va) == 0);
@@ -236,7 +237,7 @@ static void test_paths(const char *base)
     snprintf(vc, sizeof vc, "%s/vc", top);
     OK(tsdb_volume_add_dir(root, vb, &v));
     CHECK(v == 2 && tsdb_volume_count(db) == 2);
-    uint32_t on_b;
+    tsdb_sid on_b;
     OK(tsdb_series_at(db, "on.b", vb, &on_b));
     CHECK(tsdb_volume_count(db) == 3 && strcmp(tsdb_series_path(db, on_b), vb) == 0);
     OK(tsdb_append(db, on_b, T0, 2.0));
@@ -330,7 +331,8 @@ static void test_refused_dirs(const char *base)
     o.fsync = 0;
     o.create_volumes = 0;
     tsdb *db;
-    uint32_t v, id;
+    tsdb_sid id;
+    uint32_t v;
     OK(tsdb_open(root, &o, &db));
 
     /* contains a volume, but not the root */
@@ -412,7 +414,8 @@ static void test_user_files_in_volume(const char *base)
     tsdb_options o;
     tsdb_options_init(&o);
     o.fsync = 0;
-    uint32_t v, id;
+    tsdb_sid id;
+    uint32_t v;
     OK(tsdb_volume_add_dir(root, vol, &v));
     tsdb *db;
     OK(tsdb_open(root, &o, &db));
@@ -460,7 +463,8 @@ static void test_volumes_under_writer(const char *base)
     o.fsync = 0;
     o.create_volumes = 0;
     tsdb *db;
-    uint32_t v, id;
+    tsdb_sid id;
+    uint32_t v;
     OK(tsdb_open(root, &o, &db));
     OK(tsdb_volume_add_dir(root, v1, &v));
     off_t good = file_size(vols);
@@ -511,7 +515,8 @@ static void test_concurrent_adds(const char *base)
     o.fsync = 0;
     o.create_volumes = 0;
     tsdb *db;
-    uint32_t v, id;
+    tsdb_sid id;
+    uint32_t v;
     OK(tsdb_open(root, &o, &db));
     pid_t kids[PROCS];
     for (int k = 0; k < PROCS; k++) {
@@ -664,7 +669,7 @@ static void test_add_power_loss(const char *base, const char *argv0)
             for (uint32_t i = 0; i < tsdb_volume_count(db); i++)
                 listed |= strcmp(tsdb_volume_path(db, i), p) == 0;
             CHECK(listed); /* it said so: it is on disk */
-            uint32_t id;
+            tsdb_sid id;
             CHECK(tsdb_series_at(db, "after", p, &id) == 0);
         }
         if (rc == 0)
@@ -673,6 +678,100 @@ static void test_add_power_loss(const char *base, const char *argv0)
     CHECK(finished && crashes > 3);
     remove_tree(top);
     printf("  power lost at each of %d steps of volume add and after it: the database opens\n", crashes);
+}
+
+/* tsdb_series_foreach hands out every series once; an id is 64 bits and an id with bits above the 32nd is unknown,
+ * never truncated to the series whose low bits it carries. */
+typedef struct visit {
+    tsdb_sid seen[16];
+    int calls;
+    int stop_at; /* the call that returns stop_rc; 0: none */
+    int stop_rc;
+} visit;
+
+static int visit_fn(void *ctx, tsdb_sid id)
+{
+    visit *v = ctx;
+    if (v->calls < 16)
+        v->seen[v->calls] = id;
+    v->calls++;
+    return v->stop_at && v->calls == v->stop_at ? v->stop_rc : 0;
+}
+
+typedef struct first_row {
+    size_t n;
+    float first;
+} first_row;
+
+static int first_row_fn(void *ctx, const int64_t *ts, const float *values, size_t n)
+{
+    first_row *r = ctx;
+    if (!r->n && n)
+        r->first = values[0];
+    r->n += n;
+    return 0;
+}
+
+static void test_series_ids(const char *base)
+{
+    char top[600], root[700], v1[800];
+    fresh(base, "sid", top, sizeof top, root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *db;
+    OK(tsdb_open(root, &o, &db));
+    CHECK(tsdb_abi_version() == TSDB_ABI_VERSION);
+
+    enum { N = 6 };
+    tsdb_sid ids[N];
+    for (int i = 0; i < N; i++) { /* three in the root, three in a second volume */
+        char name[32];
+        snprintf(name, sizeof name, "%s.%d", i < 3 ? "root" : "vol", i);
+        OK(tsdb_series_at(db, name, i < 3 ? NULL : v1, &ids[i]));
+        int64_t t = T0;
+        float x = (float)(i + 1);
+        OK(tsdb_insert_series(db, ids[i], &t, &x, 1));
+    }
+    CHECK(tsdb_volume_count(db) == 2 && tsdb_series_count(db) == N);
+
+    visit v = {0};
+    CHECK(tsdb_series_foreach(db, visit_fn, &v) == 0 && v.calls == N);
+    for (int i = 0; i < N; i++) {
+        int times = 0;
+        for (int k = 0; k < v.calls; k++)
+            times += v.seen[k] == ids[i];
+        CHECK(times == 1); /* every series exactly once */
+    }
+
+    visit stop = {.stop_at = 3, .stop_rc = 7};
+    CHECK(tsdb_series_foreach(db, visit_fn, &stop) == 7 && stop.calls == 3); /* the first non-zero return ends it */
+
+    /* the ids of series 0 and 5 with a bit above 32 set name no series */
+    for (int i = 0; i < N; i += 5) {
+        tsdb_sid bad = ((tsdb_sid)1 << 32) | ids[i];
+        int64_t t = T0 + 1000;
+        float x = 99;
+        tsdb_type type;
+        CHECK(tsdb_series_name(db, bad) == NULL);
+        CHECK(tsdb_series_type(db, bad, &type) == TSDB_ERR_NOTFOUND);
+        CHECK(tsdb_insert(db, &bad, &t, &x, 1) == TSDB_ERR_INVALID);
+        CHECK(tsdb_insert_series(db, bad, &t, &x, 1) == TSDB_ERR_INVALID);
+        CHECK(tsdb_append(db, bad, t, x) == TSDB_ERR_INVALID);
+        tsdb_sid mixed[2] = {ids[i], bad}; /* one unknown id fails the whole call */
+        int64_t mt[2] = {T0 + 2000, T0 + 3000};
+        float mv[2] = {98, 97};
+        CHECK(tsdb_insert(db, mixed, mt, mv, 2) == TSDB_ERR_INVALID);
+    }
+    for (int i = 0; i < N; i++) { /* nothing was written into the series whose low bits the bad ids carry */
+        first_row r = {0};
+        OK(tsdb_query_raw(db, ids[i], INT64_MIN, INT64_MAX, first_row_fn, &r));
+        CHECK(r.n == 1 && r.first == (float)(i + 1));
+    }
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  the abi version, tsdb_series_foreach, and 64-bit ids that are not truncated\n");
 }
 
 int main(int argc, char **argv)
@@ -701,7 +800,7 @@ int main(int argc, char **argv)
     tsdb *db;
     OK(tsdb_open(root, &o, &db));
     const char *where[NS] = {NULL, va, vb, va, NULL, vb};
-    uint32_t ids[NS];
+    tsdb_sid ids[NS];
     char name[32];
     for (int s = 0; s < NS; s++) {
         snprintf(name, sizeof name, "sensor.%d", s);
@@ -709,7 +808,7 @@ int main(int argc, char **argv)
         CHECK(ids[s] == (uint32_t)s);
     }
     CHECK(tsdb_volume_count(db) == 3);
-    uint32_t again;
+    tsdb_sid again;
     OK(tsdb_series_at(db, "sensor.1", vb, &again)); /* exists: stays where it is */
     CHECK(again == ids[1] && strstr(tsdb_series_path(db, again), "mount_a") != NULL);
     CHECK(strcmp(tsdb_series_name(db, ids[5]), "sensor.5") == 0);
@@ -717,7 +816,7 @@ int main(int argc, char **argv)
     /* batches mixing volumes, unsorted, with duplicates: last write wins */
     for (int round = 0; round < 30; round++) {
         size_t n = 1 + rnd() % 2000;
-        uint32_t *s = malloc(n * sizeof *s);
+        tsdb_sid *s = malloc(n * sizeof *s);
         int64_t *t = malloc(n * sizeof *t);
         float *v = malloc(n * sizeof *v);
         for (size_t i = 0; i < n; i++) {
@@ -751,8 +850,8 @@ int main(int argc, char **argv)
     check_all(db, ids);
     tsdb_stats st;
     tsdb_get_stats(db, &st);
-    printf("  %u series in %u volumes, %llu parts\n", tsdb_series_count(db), tsdb_volume_count(db),
-           (unsigned long long)st.parts);
+    printf("  %llu series in %u volumes, %llu parts\n", (unsigned long long)tsdb_series_count(db),
+           tsdb_volume_count(db), (unsigned long long)st.parts);
 
     /* a follower of the root sees all volumes, and a volume created after it opened */
     tsdb_options fo = o;
@@ -763,12 +862,12 @@ int main(int argc, char **argv)
     check_all(f, ids);
     char vc[600];
     snprintf(vc, sizeof vc, "%s/tsdb-vol-%d/mount_c", base, (int)getpid());
-    uint32_t late;
+    tsdb_sid late;
     OK(tsdb_series_at(db, "late.on_c", vc, &late));
     int64_t lt = T0;
     float lv = 7;
     OK(tsdb_insert_series(db, late, &lt, &lv, 1));
-    uint32_t seen = 0;
+    tsdb_sid seen = 0;
     int rc = TSDB_ERR_NOTFOUND;
     for (int k = 0; k < 100 && rc; k++) {
         rc = tsdb_series_lookup(f, "late.on_c", &seen);
@@ -792,7 +891,7 @@ int main(int argc, char **argv)
     OK(tsdb_open(root, &o, &db));
     CHECK(tsdb_series_count(db) == NS + 1 && tsdb_volume_count(db) == 4);
     for (int s = 0; s < NS; s++) {
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "sensor.%d", s);
         OK(tsdb_series_lookup(db, name, &id));
         CHECK(id == ids[s]);
@@ -807,7 +906,7 @@ int main(int argc, char **argv)
     CHECK(stat(cat, &cs) == 0 && cs.st_size == (NS + 1) * 16);
     CHECK(truncate(cat, cs.st_size - 16) == 0); /* "late.on_c" is no longer recorded */
     OK(tsdb_open(root, &o, &db));
-    uint32_t back;
+    tsdb_sid back;
     OK(tsdb_series_lookup(db, "late.on_c", &back));
     CHECK(back == late);
     OK(tsdb_query_points(db, back, INT64_MIN, INT64_MAX, &p));
@@ -817,7 +916,7 @@ int main(int argc, char **argv)
     /* a volume belongs to one database */
     tsdb *db2;
     OK(tsdb_open(other, &o, &db2));
-    uint32_t x;
+    tsdb_sid x;
     CHECK(tsdb_series_at(db2, "steal", va, &x) == TSDB_ERR_INVALID);
     OK(tsdb_close(db2));
     OK(tsdb_close(db));
@@ -828,7 +927,7 @@ int main(int argc, char **argv)
     append_bytes(cat, "abc", 3);
     OK(tsdb_open(root, &o, &db));
     CHECK(stat(cat, &cs) == 0 && cs.st_size == full);
-    uint32_t after_torn = 0;
+    tsdb_sid after_torn = 0;
     OK(tsdb_series(db, "after.torn", &after_torn));
     CHECK(after_torn == NS + 1);
     OK(tsdb_close(db));
@@ -879,7 +978,7 @@ int main(int argc, char **argv)
     snprintf(vd, sizeof vd, "%s/tsdb-vol-%d/vol_d", base, (int)getpid());
     append_bytes(vols, "0123abcd /half/a/pa", 19);
     OK(tsdb_open(root, &o, &db));
-    uint32_t on_d;
+    tsdb_sid on_d;
     OK(tsdb_series_at(db, "on.d", vd, &on_d));
     OK(tsdb_append(db, on_d, T0, 1.0));
     OK(tsdb_close(db));
@@ -907,6 +1006,7 @@ int main(int argc, char **argv)
     test_concurrent_adds(base);
     test_open_waits_for_add(base);
     test_add_power_loss(base, argv[0]);
+    test_series_ids(base);
 
     if (system(cmd) != 0)
         return 1;

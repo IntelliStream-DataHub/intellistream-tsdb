@@ -11,7 +11,7 @@
 
 #include <stdlib.h>
 
-static int local_range(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t *lo, int64_t *hi, bool *cut);
+static int local_range(tsdb *db, tsdb_sid series, int64_t start, int64_t end, int64_t *lo, int64_t *hi, bool *cut);
 
 static int first_ts(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
 {
@@ -75,7 +75,7 @@ static int window_bounds(const tsdb_group *g, bool desc, int64_t t, int64_t lim,
 }
 
 /* Buckets (spread false: tsdb_bucket) or the spread (tsdb_spread_bucket) of local periods. */
-static int group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+static int group_local(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                        const tsdb_query_opts *opts, bool spread, void **out, size_t *nout)
 {
     *out = NULL;
@@ -173,20 +173,20 @@ static int group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, co
     return 0;
 }
 
-int tsdb_query_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_group_local(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                            const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
     return group_local(db, series, start, end, group, opts, false, (void **)out, nout);
 }
 
-int tsdb_query_spread_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_spread_group_local(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                                   const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
 {
     return group_local(db, series, start, end, group, opts, true, (void **)out, nout);
 }
 
 /* The time of the newest (desc) or oldest reading in [start, end), if any. */
-static int edge_ts(tsdb *db, uint32_t series, int64_t start, int64_t end, tsdb_order order, int64_t *ts, bool *found)
+static int edge_ts(tsdb *db, tsdb_sid series, int64_t start, int64_t end, tsdb_order order, int64_t *ts, bool *found)
 {
     int64_t t = INT64_MIN;
     tsdb_query_opts o = {order, 1};
@@ -202,7 +202,7 @@ static int edge_ts(tsdb *db, uint32_t series, int64_t start, int64_t end, tsdb_o
     return 0;
 }
 
-int tsdb_query_twa_group_local(tsdb *db, uint32_t series, int64_t start, int64_t end, const tsdb_group *group,
+int tsdb_query_twa_group_local(tsdb *db, tsdb_sid series, int64_t start, int64_t end, const tsdb_group *group,
                                const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
     *out = NULL;
@@ -286,7 +286,7 @@ int tsdb_query_twa_group_local(tsdb *db, uint32_t series, int64_t start, int64_t
  * the first (last) row within the limits, rows before them join the first period, which then begins at INT64_MIN
  * (*cut), and rows after them the last, which runs to the end anyway. One such row used to make every grouping over
  * an open range fail. */
-static int local_range(tsdb *db, uint32_t series, int64_t start, int64_t end, int64_t *lo, int64_t *hi, bool *cut)
+static int local_range(tsdb *db, tsdb_sid series, int64_t start, int64_t end, int64_t *lo, int64_t *hi, bool *cut)
 {
     const int64_t lim = TSDB_CALENDAR_LIMIT_MS;
     *cut = *lo < -lim;

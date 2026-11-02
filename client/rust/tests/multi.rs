@@ -17,7 +17,7 @@ const N: i64 = 30_000;
 const STEP: i64 = 7_000;
 
 /// One series of each type (nulls, a part and memtable rows) and an empty one; their ids.
-fn setup(db: &mut impl Database) -> Vec<u32> {
+fn setup(db: &mut impl Database) -> Vec<u64> {
     let ts: Vec<i64> = (0..N).map(|i| T0 + i * STEP).collect();
     let valid: Bitmap = (0..N).map(|i| i % 89 != 5).collect();
     let mut ids = Vec::new();
@@ -74,7 +74,7 @@ fn key<T: std::fmt::Debug>(r: &T) -> String {
 fn single(
     db: &mut impl Database,
     kind: &str,
-    id: u32,
+    id: u64,
     (s, e): (i64, i64),
     b: &B,
     i: usize,
@@ -105,7 +105,7 @@ fn single(
 fn multi(
     db: &mut impl Database,
     kind: &str,
-    series: &[u32],
+    series: &[u64],
     r: (i64, i64),
     b: &B,
     o: QueryOpts,
@@ -273,7 +273,7 @@ fn tsdbd_multi_answers_what_the_engine_answered() {
 }
 
 #[cfg(feature = "embedded")]
-fn answers(db: &mut impl Database, ids: &[u32]) -> Vec<String> {
+fn answers(db: &mut impl Database, ids: &[u64]) -> Vec<String> {
     let full = (i64::MIN, i64::MAX);
     let oslo = Group::new(Unit::Day).timezone("Europe/Oslo");
     let starts: Vec<i64> = (0..ids.len() as i64).map(|i| T0 + i * 1_000_000).collect();
@@ -296,7 +296,7 @@ fn long_lists_are_split() {
     let mut c = srv.client();
     let ids = setup(&mut c);
     let n = 65_536 + 3;
-    let mut series: Vec<u32> = (0..n as u32).map(|i| 5_000_000 + i).collect();
+    let mut series: Vec<u64> = (0..n as u64).map(|i| 5_000_000 + i).collect();
     for (k, at) in [0, 65_535, 65_536, n - 1].into_iter().enumerate() {
         series[at] = ids[k];
     }

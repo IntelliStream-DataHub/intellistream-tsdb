@@ -25,6 +25,22 @@ pub const DEFAULT_PORT: u16 = 7070;
 pub(crate) const MAX_FRAME: usize = 256 << 20;
 /// The series field of an INSERT whose rows carry their own series.
 pub(crate) const MANY_SERIES: u32 = u32::MAX;
+/// Narrows a series id to the 32 bits protocol 10 carries. The database hands out no larger id yet;
+/// a larger one is refused before anything is sent, as invalid input.
+pub(crate) fn wire_id(id: u64) -> Result<u32> {
+    u32::try_from(id).map_err(|_| {
+        Error::InvalidArgument(format!("series id {id} does not fit protocol {PROTOCOL_VERSION} (32-bit ids)"))
+    })
+}
+
+/// [`wire_id`] for every id of an array (checked once, then written by [`FrameBuf::sids`]).
+pub(crate) fn wire_ids(ids: &[u64]) -> Result<()> {
+    match ids.iter().find(|&&i| i > u32::MAX as u64) {
+        Some(&i) => wire_id(i).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
 /// Bytes per bucket in a QUERY_BUCKETS reply (`TSDB_BUCKET_ROW`).
 pub(crate) const BUCKET_ROW: usize = 64;
 /// QUERY_BUCKETS/QUERY_BOUNDS fields: the spread follows each bucket (version 8).
@@ -138,10 +154,12 @@ impl FrameBuf {
         self
     }
 
-    pub(crate) fn u32s(&mut self, v: &[u32]) -> &mut Self {
+    /// Series ids as protocol 10's u32 array; the caller checked them with [`wire_ids`].
+    pub(crate) fn sids(&mut self, v: &[u64]) -> &mut Self {
         self.buf.reserve(v.len() * 4);
-        for x in v {
-            self.buf.extend_from_slice(&x.to_le_bytes());
+        for &x in v {
+            debug_assert!(x <= u32::MAX as u64);
+            self.buf.extend_from_slice(&(x as u32).to_le_bytes());
         }
         self
     }

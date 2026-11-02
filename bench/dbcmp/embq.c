@@ -194,7 +194,7 @@ static int multi_count(void *ctx, const tsdb_series_result *r)
 /* qs[at], qs[at + 1], ... (k of them, wrapping) as one tsdb_query_multi; returns the rows */
 static uint64_t tsdb_batch(size_t at, size_t k)
 {
-    uint32_t *ss = malloc(k * sizeof *ss);
+    tsdb_sid *ss = malloc(k * sizeof *ss);
     int64_t *st = malloc(k * sizeof *st), *en = malloc(k * sizeof *en), *iv = malloc(k * sizeof *iv);
     for (size_t i = 0; i < k; i++) {
         const q *x = &qs[(at + i) % nq];
@@ -227,7 +227,7 @@ static void *tsdb_loader(void *arg)
 {
     tload *j = arg;
     const size_t batch = 1000000;
-    uint32_t *s = malloc(batch * 4);
+    tsdb_sid *s = malloc(batch * sizeof *s);
     int64_t *t = malloc(batch * 8);
     float *v = malloc(batch * 4);
     for (size_t off = 0; off < j->n; off += batch) {
@@ -255,7 +255,7 @@ static void tsdb_load(const rbrow *rows, size_t n, int threads)
     tdb = tsdb_open_or_die(dbpath);
     for (uint32_t i = 0; i < 100; i++) { /* ids in file order, as tsdbc-bench load creates them */
         char name[64];
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", KIND[i % 7], i);
         if (tsdb_series(tdb, name, &id) || id != i)
             die(name, "series id does not match the file's series number");
@@ -727,7 +727,7 @@ static void *tsdb_full_run(void *arg)
 {
     fjob *j = arg;
     tsdb_twa_opts to = {.method = TSDB_TWA_STEP};
-    uint32_t ss[100];
+    tsdb_sid ss[100];
     int64_t iv[100];
     size_t k = 0;
     for (uint32_t s = (uint32_t)j->id; s < 100; s += (uint32_t)j->threads) {

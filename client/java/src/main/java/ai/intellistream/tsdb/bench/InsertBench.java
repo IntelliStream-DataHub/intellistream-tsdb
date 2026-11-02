@@ -75,7 +75,7 @@ public final class InsertBench {
                 usage(file + ": " + size + " bytes is not a whole number of 16-byte rows");
             long n = size / ROW;
             ByteBuffer[] rows = BenchCommon.mapRows(fc);
-            int[] ids = createSeries(rows, n, host, port);
+            long[] ids = createSeries(rows, n, host, port);
             BenchCommon.warmFill(rows, ids, batch);
 
             long[] bytes = new long[conns];
@@ -122,12 +122,12 @@ public final class InsertBench {
     }
 
     /** Creates series 0 .. the largest id in the first 10M rows, as tsdbc-bench does; returns file id to id. */
-    private static int[] createSeries(ByteBuffer[] rows, long n, String host, int port) throws IOException {
+    private static long[] createSeries(ByteBuffer[] rows, long n, String host, int port) throws IOException {
         int max = 0;
         long scan = Math.min(n, 10_000_000);
         for (long r = 0; r < scan; r++)
             max = Math.max(max, BenchCommon.seriesAt(rows, r));
-        int[] ids = new int[max + 1];
+        long[] ids = new long[max + 1];
         try (TsdbClient c = TsdbClient.connect(host, port)) {
             for (int i = 0; i <= max; i++)
                 ids[i] = c.series(KINDS[i % KINDS.length] + "." + i);
@@ -136,9 +136,9 @@ public final class InsertBench {
     }
 
     /** Sends rows [from, to) over one connection; returns the bytes written to it. */
-    private static long load(ByteBuffer[] rows, long from, long to, int[] ids, String host, int port, int batch,
+    private static long load(ByteBuffer[] rows, long from, long to, long[] ids, String host, int port, int batch,
                              int level) throws IOException {
-        int[] s = new int[batch];
+        long[] s = new long[batch];
         long[] t = new long[batch];
         float[] v = new float[batch];
         try (TsdbClient c = TsdbClient.connect(host, port)) {

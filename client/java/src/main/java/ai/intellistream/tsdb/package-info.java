@@ -7,7 +7,7 @@
  *
  * <pre>{@code
  * try (TsdbClient client = TsdbClient.connect("127.0.0.1", TsdbClient.DEFAULT_PORT)) {
- *     int pump = client.series("pump7.flow");                      // get or create a float32 series
+ *     long pump = client.series("pump7.flow");                     // get or create a float32 series
  *     client.insert(pump, new long[] {t0, t0 + 60_000}, new float[] {41.5f, 42.0f});
  *
  *     Points raw = client.queryPoints(pump, t0, t0 + 3_600_000);   // the points of one hour

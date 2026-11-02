@@ -25,7 +25,7 @@ public final class Example {
         int port = args.length > 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
 
         try (TsdbClient client = TsdbClient.connect(host, port)) {
-            int pump = client.series("pump7.flow_m3h"); // get or create
+            long pump = client.series("pump7.flow_m3h"); // get or create
 
             // One reading per minute for a day, from 2024-03-01T00:00Z, as a single batch.
             long t0 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();

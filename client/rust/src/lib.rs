@@ -39,6 +39,9 @@
 //!   ([`Client::insert_series_values`], [`Client::query_rows`]). Float32
 //!   series also have a fast path with plain `f32` slices
 //!   ([`Client::insert_series`], [`Client::query_points`]).
+//! - **Series ids** are [`SeriesId`] (`u64`), handed out by the database: opaque numbers, not dense (list
+//!   them with `Db::series_ids`, not `0..series_count`). Protocol 10 carries them in 32 bits, so the
+//!   network client refuses a larger id before sending ([`Error::InvalidArgument`]).
 //! - **Last write wins.** Writing a timestamp again replaces its value.
 //! - **Aggregates** ([`Client::query_agg`], [`Client::query_group`],
 //!   [`Client::query_bounds`]) return [`Bucket`]s with count, sum, min and
@@ -90,4 +93,7 @@ pub use types::{
     Bucket, Buckets, Group, MultiOpts, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket,
     TwaMethod, TwaOpts, Unit,
 };
+/// A series id: 64 bits, handed out by the database, valid for its life. Ids are not dense.
+pub type SeriesId = u64;
+
 pub use value::{Bitmap, Column, ColumnRef, NULL_F32_BITS, NULL_F64_BITS, Native, Value, ValueType, Values, ValuesRef};

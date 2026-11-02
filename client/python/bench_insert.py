@@ -91,7 +91,7 @@ def main():
     with tsdb_client.Client(host, int(port)) as c:
         ids = [c.series(f"bench.{i}") for i in range(top + 1)]
     if np is not None:
-        ids = np.array(ids, dtype=np.uint32)
+        ids = np.array(ids, dtype=np.uint64)
 
     sent, errors = [], []
     t0, cpu0 = time.perf_counter(), bc.cpu_s()

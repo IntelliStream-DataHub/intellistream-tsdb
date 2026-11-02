@@ -27,7 +27,7 @@ import jdk.net.ExtendedSocketOptions;
  *
  * <pre>{@code
  * try (TsdbClient c = TsdbClient.connect("127.0.0.1", 7070)) {
- *     int id = c.series("pump7.flow");                              // get or create
+ *     long id = c.series("pump7.flow");                             // get or create
  *     c.insert(id, timestamps, values);                             // long[] ms, float[] values
  *     Points newest = c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE, Order.DESC, 10);
  *     List<Bucket> perMinute = c.queryAgg(id, start, end, 60_000);
@@ -39,7 +39,7 @@ import jdk.net.ExtendedSocketOptions;
  * time, and open one client per thread for concurrency. The server runs the requests of different connections in
  * parallel, and those of one connection in order.
  *
- * <p><b>Pipelining.</b> {@link #insertAsync(int, long[], float[])} sends an insert without waiting for its
+ * <p><b>Pipelining.</b> {@link #insertAsync(long, long[], float[])} sends an insert without waiting for its
  * acknowledgement; {@link #await()} collects the acknowledgements and throws the first error among them. Because
  * the server applies a connection's requests in order, pipelined inserts keep "last write wins". Every other call
  * first collects outstanding acknowledgements, and throws the first error among them instead of sending its own
@@ -58,7 +58,7 @@ import jdk.net.ExtendedSocketOptions;
  *
  * <p><b>Value types.</b> A series has one {@link ValueType}, chosen when it is created: float32 (the type of
  * {@link #series(String)}), float64, int64, bool or state, and any value may be null. The float32 methods
- * ({@link #insert(int, long[], float[])}, {@link #queryPoints(int, long, long)}, {@link #queryRaw}) take and return
+ * ({@link #insert(long, long[], float[])}, {@link #queryPoints(long, long, long)}, {@link #queryRaw}) take and return
  * {@code float[]} and work on float32 series only; {@link #insertSeriesValues}, {@link #insertValues} and
  * {@link #queryValues} carry a {@link Column} of any type with its nulls (protocol version 2).
  * {@link #queryAgg} and {@link #queryGroup} work on every type and need a version 2 server.
@@ -418,7 +418,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the series id
      * @throws TsdbException if the server fails, e.g. {@link Status#ERR_READONLY}
      */
-    public int series(String name) throws TsdbException {
+    public long series(String name) throws TsdbException {
         return seriesRequest(name, true, null);
     }
 
@@ -430,7 +430,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the series id
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} if the series is missing and {@code create} is false
      */
-    public int series(String name, boolean create) throws TsdbException {
+    public long series(String name, boolean create) throws TsdbException {
         return seriesRequest(name, create, null);
     }
 
@@ -445,11 +445,11 @@ public final class TsdbClient implements AutoCloseable {
      * @return the series id
      * @throws TsdbException if the server cannot create the series or its volume
      */
-    public int seriesAt(String name, String path) throws TsdbException {
+    public long seriesAt(String name, String path) throws TsdbException {
         return seriesRequest(name, true, path);
     }
 
-    private int seriesRequest(String name, boolean create, String path) throws TsdbException {
+    private long seriesRequest(String name, boolean create, String path) throws TsdbException {
         byte[] n = utf8(Objects.requireNonNull(name, "name"), "name");
         if (n.length == 0)
             throw new IllegalArgumentException("empty series name");
@@ -463,7 +463,7 @@ public final class TsdbClient implements AutoCloseable {
         int st = frame();
         if (st == 0 && bodyLen != 4)
             throw lost(Status.ERR_CORRUPT, "SERIES reply of " + bodyLen + " bytes");
-        int id = st == 0 ? in.getInt() : 0;
+        long id = st == 0 ? Integer.toUnsignedLong(in.getInt()) : 0;
         endReply();
         check(st);
         return id;
@@ -476,10 +476,11 @@ public final class TsdbClient implements AutoCloseable {
      * @return its name
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
      */
-    public String seriesName(int id) throws TsdbException {
+    public String seriesName(long id) throws TsdbException {
+        int wire = wireId(id);
         request();
         begin(Protocol.OP_SERIES_NAME, 4);
-        out.putInt(id);
+        out.putInt(wire);
         send();
         return stringReply("SERIES_NAME");
     }
@@ -498,7 +499,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param values the values; as long as {@code timestamps}
      * @throws TsdbException the first error among this insert and earlier pipelined ones
      */
-    public void insert(int series, long[] timestamps, float[] values) throws TsdbException {
+    public void insert(long series, long[] timestamps, float[] values) throws TsdbException {
         insert(series, timestamps, values, 0, sameLength(timestamps, values));
     }
 
@@ -511,9 +512,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param offset the first row to send
      * @param length the number of rows
      * @throws TsdbException the first error among this insert and earlier pipelined ones
-     * @see #insert(int, long[], float[])
+     * @see #insert(long, long[], float[])
      */
-    public void insert(int series, long[] timestamps, float[] values, int offset, int length) throws TsdbException {
+    public void insert(long series, long[] timestamps, float[] values, int offset, int length) throws TsdbException {
         insertFrames(series, null, timestamps, values, offset, length);
         await();
     }
@@ -525,9 +526,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param timestamps ms since the epoch
      * @param values the values
      * @throws TsdbException the first error among this insert and earlier pipelined ones
-     * @see #insert(int, long[], float[])
+     * @see #insert(long, long[], float[])
      */
-    public void insert(int[] series, long[] timestamps, float[] values) throws TsdbException {
+    public void insert(long[] series, long[] timestamps, float[] values) throws TsdbException {
         insert(series, timestamps, values, 0, sameLength(series, timestamps, values));
     }
 
@@ -541,7 +542,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param length the number of rows
      * @throws TsdbException the first error among this insert and earlier pipelined ones
      */
-    public void insert(int[] series, long[] timestamps, float[] values, int offset, int length)
+    public void insert(long[] series, long[] timestamps, float[] values, int offset, int length)
             throws TsdbException {
         insertFrames(0, Objects.requireNonNull(series, "series"), timestamps, values, offset, length);
         await();
@@ -556,7 +557,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param values the values
      * @throws TsdbException on a connection failure
      */
-    public void insertAsync(int series, long[] timestamps, float[] values) throws TsdbException {
+    public void insertAsync(long series, long[] timestamps, float[] values) throws TsdbException {
         insertAsync(series, timestamps, values, 0, sameLength(timestamps, values));
     }
 
@@ -569,9 +570,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param offset the first row to send
      * @param length the number of rows
      * @throws TsdbException on a connection failure
-     * @see #insertAsync(int, long[], float[])
+     * @see #insertAsync(long, long[], float[])
      */
-    public void insertAsync(int series, long[] timestamps, float[] values, int offset, int length)
+    public void insertAsync(long series, long[] timestamps, float[] values, int offset, int length)
             throws TsdbException {
         insertFrames(series, null, timestamps, values, offset, length);
     }
@@ -583,9 +584,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param timestamps ms since the epoch
      * @param values the values
      * @throws TsdbException on a connection failure
-     * @see #insertAsync(int, long[], float[])
+     * @see #insertAsync(long, long[], float[])
      */
-    public void insertAsync(int[] series, long[] timestamps, float[] values) throws TsdbException {
+    public void insertAsync(long[] series, long[] timestamps, float[] values) throws TsdbException {
         insertAsync(series, timestamps, values, 0, sameLength(series, timestamps, values));
     }
 
@@ -598,9 +599,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param offset the first row to send
      * @param length the number of rows
      * @throws TsdbException on a connection failure
-     * @see #insertAsync(int, long[], float[])
+     * @see #insertAsync(long, long[], float[])
      */
-    public void insertAsync(int[] series, long[] timestamps, float[] values, int offset, int length)
+    public void insertAsync(long[] series, long[] timestamps, float[] values, int offset, int length)
             throws TsdbException {
         insertFrames(0, Objects.requireNonNull(series, "series"), timestamps, values, offset, length);
     }
@@ -628,16 +629,13 @@ public final class TsdbClient implements AutoCloseable {
         return pending;
     }
 
-    private void insertFrames(int series, int[] many, long[] ts, float[] values, int off, int n)
+    private void insertFrames(long series, long[] many, long[] ts, float[] values, int off, int n)
             throws TsdbException {
         Objects.requireNonNull(ts, "timestamps");
         Objects.requireNonNull(values, "values");
         Objects.checkFromIndexSize(off, n, ts.length);
         Objects.checkFromIndexSize(off, n, values.length);
-        if (many != null)
-            Objects.checkFromIndexSize(off, n, many.length);
-        else if (series == Protocol.MANY_SERIES)
-            throw new IllegalArgumentException("series id 0xffffffff is reserved");
+        int one = wireIds(series, many, off, n);
         ready();
         if (n > 0 && packing()) { /* float32 too: the packed form is the smaller one */
             insertValuesFrames(series, many, ts, Column.ofFloats(values), off, n);
@@ -650,11 +648,11 @@ public final class TsdbClient implements AutoCloseable {
             while (pending >= MAX_IN_FLIGHT)
                 collectOne();
             begin(Protocol.OP_INSERT, 8 + (long) m * rowBytes);
-            out.putInt(m).putInt(many != null ? Protocol.MANY_SERIES : series);
+            out.putInt(m).putInt(one);
             putLongs(ts, off + sent, m);
             putValues(values, off + sent, m);
             if (many != null)
-                putInts(many, off + sent, m);
+                putIds(many, off + sent, m);
             send();
             pending++;
             sent += m;
@@ -680,7 +678,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the points
      * @throws TsdbException if the query fails, or {@link Status#ERR_NOMEM} if the result does not fit in one array
      */
-    public Points queryPoints(int series, long start, long end) throws TsdbException {
+    public Points queryPoints(long series, long start, long end) throws TsdbException {
         return queryPoints(series, start, end, Order.ASC, 0);
     }
 
@@ -696,7 +694,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the points
      * @throws TsdbException if the query fails, or {@link Status#ERR_NOMEM} if the result does not fit in one array
      */
-    public Points queryPoints(int series, long start, long end, Order order, long limit) throws TsdbException {
+    public Points queryPoints(long series, long start, long end, Order order, long limit) throws TsdbException {
         Collector c = new Collector();
         raw(series, start, end, order, limit, c);
         if (c.overflow)
@@ -715,7 +713,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return {@code true} if every point was delivered, {@code false} if the consumer stopped early
      * @throws TsdbException if the query fails
      */
-    public boolean queryRaw(int series, long start, long end, RawConsumer consumer) throws TsdbException {
+    public boolean queryRaw(long series, long start, long end, RawConsumer consumer) throws TsdbException {
         return queryRaw(series, start, end, Order.ASC, 0, consumer);
     }
 
@@ -735,7 +733,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return {@code true} if every point was delivered, {@code false} if the consumer stopped early
      * @throws TsdbException if the query fails
      */
-    public boolean queryRaw(int series, long start, long end, Order order, long limit, RawConsumer consumer)
+    public boolean queryRaw(long series, long start, long end, Order order, long limit, RawConsumer consumer)
             throws TsdbException {
         Objects.requireNonNull(consumer, "consumer");
         return raw(series, start, end, order, limit, (b, n) -> {
@@ -784,14 +782,15 @@ public final class TsdbClient implements AutoCloseable {
         }
     }
 
-    private boolean raw(int series, long start, long end, Order order, long limit, Sink sink) throws TsdbException {
+    private boolean raw(long series, long start, long end, Order order, long limit, Sink sink) throws TsdbException {
         Objects.requireNonNull(order, "order");
         if (limit < 0)
             throw new IllegalArgumentException("negative limit");
+        int wire = wireId(series);
         request();
         boolean opts = order != Order.ASC || limit != 0;
         begin(Protocol.OP_QUERY_RAW, opts ? 29 : 20);
-        out.putInt(series).putLong(start).putLong(end);
+        out.putInt(wire).putLong(start).putLong(end);
         if (opts)
             out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
         send();
@@ -843,7 +842,7 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval,
      *     {@link Status#ERR_TOO_MANY_BUCKETS} if the range holds too many, and so on
      */
-    public List<Bucket> queryAgg(int series, long start, long end, long intervalMs) throws TsdbException {
+    public List<Bucket> queryAgg(long series, long start, long end, long intervalMs) throws TsdbException {
         return buckets(series, start, end, intervalMs, null, "", Order.ASC, 0);
     }
 
@@ -858,9 +857,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest bucket first
      * @param limit the most buckets to return; 0 for all
      * @return the buckets
-     * @throws TsdbException as {@link #queryAgg(int, long, long, long)}
+     * @throws TsdbException as {@link #queryAgg(long, long, long, long)}
      */
-    public List<Bucket> queryAgg(int series, long start, long end, long intervalMs, Order order, long limit)
+    public List<Bucket> queryAgg(long series, long start, long end, long intervalMs, Order order, long limit)
             throws TsdbException {
         return buckets(series, start, end, intervalMs, null, "", order, limit);
     }
@@ -874,9 +873,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param group the calendar grouping, or {@code null} for one bucket over the whole range
      * @return the buckets with rows
      * @throws TsdbException with {@link Status#ERR_TOO_MANY_BUCKETS} if the range holds too many buckets, and so on
-     * @see #queryGroup(int, long, long, Group, Order, long)
+     * @see #queryGroup(long, long, long, Group, Order, long)
      */
-    public List<Bucket> queryGroup(int series, long start, long end, Group group) throws TsdbException {
+    public List<Bucket> queryGroup(long series, long start, long end, Group group) throws TsdbException {
         return queryGroup(series, start, end, group, Order.ASC, 0);
     }
 
@@ -899,7 +898,7 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_TOO_MANY_BUCKETS} if the range holds too many buckets, and so on
      * @throws IllegalArgumentException for a negative limit
      */
-    public List<Bucket> queryGroup(int series, long start, long end, Group group, Order order, long limit)
+    public List<Bucket> queryGroup(long series, long start, long end, Group group, Order order, long limit)
             throws TsdbException {
         Objects.requireNonNull(order, "order");
         if (limit < 0)
@@ -919,7 +918,7 @@ public final class TsdbClient implements AutoCloseable {
      * is; the time-weighted averages ({@code bounded}) cover a bounded side to its end, since a reading before the
      * range carries into it, and cut only an open side.
      */
-    private long[] localBounds(int series, long start, long end, Group group, boolean bounded)
+    private long[] localBounds(long series, long start, long end, Group group, boolean bounded)
             throws TsdbException {
         long[] edge = {start, end == Long.MAX_VALUE ? Long.MIN_VALUE : end - 1};
         boolean[] found = {true, true};
@@ -968,7 +967,7 @@ public final class TsdbClient implements AutoCloseable {
      *     older than version 4
      * @throws IllegalArgumentException if there are no bounds, or more than one request can carry (about 33 million)
      */
-    public List<Bucket> queryBounds(int series, long start, long end, long[] bounds) throws TsdbException {
+    public List<Bucket> queryBounds(long series, long start, long end, long[] bounds) throws TsdbException {
         return queryBounds(series, start, end, bounds, Order.ASC, 0);
     }
 
@@ -983,10 +982,10 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest bucket first
      * @param limit the most buckets to return; 0 for all
      * @return the buckets with rows
-     * @throws TsdbException as {@link #queryBounds(int, long, long, long[])}
+     * @throws TsdbException as {@link #queryBounds(long, long, long, long[])}
      * @throws IllegalArgumentException if there are no bounds or too many, or for a negative limit
      */
-    public List<Bucket> queryBounds(int series, long start, long end, long[] bounds, Order order, long limit)
+    public List<Bucket> queryBounds(long series, long start, long end, long[] bounds, Order order, long limit)
             throws TsdbException {
         Objects.requireNonNull(bounds, "bounds");
         Objects.requireNonNull(order, "order");
@@ -1000,10 +999,11 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** Sends QUERY_BOUNDS, with the {@code fields} byte when it is not 0. */
-    private void boundsSend(int series, long start, long end, long[] bounds, Order order, long limit, int fields)
+    private void boundsSend(long series, long start, long end, long[] bounds, Order order, long limit, int fields)
             throws TsdbException {
+        int wire = wireId(series);
         begin(Protocol.OP_QUERY_BOUNDS, 33 + (long) bounds.length * Long.BYTES + (fields != 0 ? 1 : 0));
-        out.putInt(series).putLong(start).putLong(end);
+        out.putInt(wire).putLong(start).putLong(end);
         out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit).putInt(bounds.length);
         putLongs(bounds, 0, bounds.length);
         if (fields != 0)
@@ -1012,7 +1012,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** QUERY_BUCKETS: fixed intervals (group null) or calendar groups, with f64 min/max and exact integers. */
-    private List<Bucket> buckets(int series, long start, long end, long interval, Group group, String zone,
+    private List<Bucket> buckets(long series, long start, long end, long interval, Group group, String zone,
                                  Order order, long limit) throws TsdbException {
         Objects.requireNonNull(order, "order");
         if (limit < 0)
@@ -1024,10 +1024,11 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** Sends QUERY_BUCKETS, with the {@code fields} byte when it is not 0. */
-    private void bucketsSend(int series, long start, long end, long interval, Group group, byte[] z, Order order,
+    private void bucketsSend(long series, long start, long end, long interval, Group group, byte[] z, Order order,
                              long limit, int fields) throws TsdbException {
+        int wire = wireId(series);
         begin(Protocol.OP_QUERY_BUCKETS, 44 + z.length + (fields != 0 ? 1 : 0));
-        out.putInt(series).putLong(start).putLong(end).putLong(interval);
+        out.putInt(wire).putLong(start).putLong(end).putLong(interval);
         out.put((byte) (group != null ? group.unit().code : 0)).putInt(group != null ? group.count() : 0);
         out.put((byte) (order == Order.DESC ? 1 : 0)).putLong(limit);
         out.putShort((short) z.length).put(z);
@@ -1090,12 +1091,12 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval or from a server older than
      *     version 8 (asked with HELLO; the request is not sent)
      */
-    public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs) throws TsdbException {
+    public List<SpreadBucket> querySpread(long series, long start, long end, long intervalMs) throws TsdbException {
         return querySpread(series, start, end, intervalMs, Order.ASC, 0);
     }
 
     /**
-     * As {@link #querySpread(int, long, long, long)}, in the given order, at most {@code limit} buckets.
+     * As {@link #querySpread(long, long, long, long)}, in the given order, at most {@code limit} buckets.
      *
      * @param series the series id
      * @param start the first timestamp included
@@ -1104,10 +1105,10 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest bucket first
      * @param limit the most buckets to return; 0 for all
      * @return the buckets with rows
-     * @throws TsdbException as {@link #querySpread(int, long, long, long)}
+     * @throws TsdbException as {@link #querySpread(long, long, long, long)}
      * @throws IllegalArgumentException for a negative limit
      */
-    public List<SpreadBucket> querySpread(int series, long start, long end, long intervalMs, Order order, long limit)
+    public List<SpreadBucket> querySpread(long series, long start, long end, long intervalMs, Order order, long limit)
             throws TsdbException {
         checkOpts(order, limit);
         if (intervalMs < 0) /* as the C and Rust clients: the server's status, without asking it */
@@ -1118,7 +1119,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * The spread in calendar buckets, as {@link #queryGroup(int, long, long, Group, Order, long)} groups (local
+     * The spread in calendar buckets, as {@link #queryGroup(long, long, long, Group, Order, long)} groups (local
      * periods become bounds here) (protocol version 8).
      *
      * @param series the series id
@@ -1131,7 +1132,7 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} from a server older than version 8
      * @throws IllegalArgumentException for a negative limit
      */
-    public List<SpreadBucket> querySpreadGroup(int series, long start, long end, Group group, Order order,
+    public List<SpreadBucket> querySpreadGroup(long series, long start, long end, Group group, Order order,
                                                long limit) throws TsdbException {
         checkOpts(order, limit);
         needVersion(8, "the spread");
@@ -1144,7 +1145,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * The spread in buckets that begin at the given UTC instants, as {@link #queryBounds(int, long, long, long[],
+     * The spread in buckets that begin at the given UTC instants, as {@link #queryBounds(long, long, long, long[],
      * Order, long)} (protocol version 8).
      *
      * @param series the series id
@@ -1158,7 +1159,7 @@ public final class TsdbClient implements AutoCloseable {
      *     than version 8
      * @throws IllegalArgumentException if there are no bounds or too many, or for a negative limit
      */
-    public List<SpreadBucket> querySpreadBounds(int series, long start, long end, long[] bounds, Order order,
+    public List<SpreadBucket> querySpreadBounds(long series, long start, long end, long[] bounds, Order order,
                                                 long limit) throws TsdbException {
         checkBounds(bounds);
         checkOpts(order, limit);
@@ -1183,7 +1184,7 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a negative interval, a state series or a server
      *     older than version 6 (asked with HELLO; the request is not sent)
      */
-    public List<TwaBucket> queryTwa(int series, long start, long end, long intervalMs, TwaOptions opts)
+    public List<TwaBucket> queryTwa(long series, long start, long end, long intervalMs, TwaOptions opts)
             throws TsdbException {
         Objects.requireNonNull(opts, "opts");
         if (intervalMs < 0)
@@ -1204,7 +1205,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the buckets with readings or coverage
      * @throws TsdbException with {@link Status#ERR_INVALID} for a state series or a server older than version 6
      */
-    public List<TwaBucket> queryTwaGroup(int series, long start, long end, Group group, TwaOptions opts)
+    public List<TwaBucket> queryTwaGroup(long series, long start, long end, Group group, TwaOptions opts)
             throws TsdbException {
         Objects.requireNonNull(opts, "opts");
         if (group == null)
@@ -1229,7 +1230,7 @@ public final class TsdbClient implements AutoCloseable {
      *     server older than version 6
      * @throws IllegalArgumentException if there are no bounds or too many
      */
-    public List<TwaBucket> queryTwaBounds(int series, long start, long end, long[] bounds, TwaOptions opts)
+    public List<TwaBucket> queryTwaBounds(long series, long start, long end, long[] bounds, TwaOptions opts)
             throws TsdbException {
         Objects.requireNonNull(opts, "opts");
         checkBounds(bounds, MAX_TWA_BOUNDS);
@@ -1237,11 +1238,12 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** QUERY_TWA and its reply: u32 n, n buckets of 40 bytes. */
-    private List<TwaBucket> twa(int series, long start, long end, long interval, int unit, int count, long[] bounds,
+    private List<TwaBucket> twa(long series, long start, long end, long interval, int unit, int count, long[] bounds,
                                 TwaOptions o) throws TsdbException {
+        int wire = wireId(series);
         needVersion(6, "time-weighted averages");
         begin(Protocol.OP_QUERY_TWA, Protocol.TWA_HEADER + (long) bounds.length * Long.BYTES);
-        out.putInt(series).putLong(start).putLong(end);
+        out.putInt(wire).putLong(start).putLong(end);
         out.put((byte) (o.method() == TwaMethod.LINEAR ? 1 : 0)).put((byte) (o.order() == Order.DESC ? 1 : 0));
         out.put((byte) unit).put((byte) 0).putLong(o.maxGapMs()).putLong(o.limit()).putLong(interval);
         out.putInt(count).putInt(bounds.length);
@@ -1294,12 +1296,12 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a threshold below 3, a state series or a server
      *     older than version 5
      */
-    public ValuePoints queryLttb(int series, long start, long end, long threshold) throws TsdbException {
+    public ValuePoints queryLttb(long series, long start, long end, long threshold) throws TsdbException {
         return queryLttb(series, start, end, threshold, Order.ASC, 0);
     }
 
     /**
-     * As {@link #queryLttb(int, long, long, long)}, newest first with {@link Order#DESC} and only the first
+     * As {@link #queryLttb(long, long, long, long)}, newest first with {@link Order#DESC} and only the first
      * {@code limit} of the chosen points in that order; the choice does not change. Needs protocol version 9 with
      * {@link Order#DESC} or a limit.
      *
@@ -1310,10 +1312,10 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest first
      * @param limit the most points to return; 0 for all
      * @return the chosen points
-     * @throws TsdbException as {@link #queryLttb(int, long, long, long)}, and from a server older than version 9
+     * @throws TsdbException as {@link #queryLttb(long, long, long, long)}, and from a server older than version 9
      *     with an order or a limit
      */
-    public ValuePoints queryLttb(int series, long start, long end, long threshold, Order order, long limit)
+    public ValuePoints queryLttb(long series, long start, long end, long threshold, Order order, long limit)
             throws TsdbException {
         checkOpts(order, limit);
         needVersion(5, "LTTB");
@@ -1336,7 +1338,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the series id
      * @throws TsdbException with {@link Status#ERR_INVALID} if the series exists with another type
      */
-    public int seriesCreate(String name, ValueType type) throws TsdbException {
+    public long seriesCreate(String name, ValueType type) throws TsdbException {
         return seriesCreate(name, type, null);
     }
 
@@ -1350,7 +1352,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the series id
      * @throws TsdbException with {@link Status#ERR_INVALID} if the series exists with another type
      */
-    public int seriesCreate(String name, ValueType type, String path) throws TsdbException {
+    public long seriesCreate(String name, ValueType type, String path) throws TsdbException {
         byte[] n = utf8(Objects.requireNonNull(name, "name"), "name");
         if (n.length == 0)
             throw new IllegalArgumentException("empty series name");
@@ -1360,7 +1362,7 @@ public final class TsdbClient implements AutoCloseable {
         begin(Protocol.OP_SERIES_CREATE, 5 + n.length + p.length);
         out.put((byte) type.code).putShort((short) n.length).put(n).putShort((short) p.length).put(p);
         send();
-        return u32Reply("SERIES_CREATE");
+        return Integer.toUnsignedLong(u32Reply("SERIES_CREATE"));
     }
 
     /**
@@ -1370,10 +1372,11 @@ public final class TsdbClient implements AutoCloseable {
      * @return its type
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown id
      */
-    public ValueType seriesType(int id) throws TsdbException {
+    public ValueType seriesType(long id) throws TsdbException {
+        int wire = wireId(id);
         request();
         begin(Protocol.OP_SERIES_TYPE, 4);
-        out.putInt(id);
+        out.putInt(wire);
         send();
         int st = frame();
         ValueType t = null;
@@ -1396,7 +1399,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return its code
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown series
      */
-    public int state(int series, String name) throws TsdbException {
+    public int state(long series, String name) throws TsdbException {
         return stateRequest(series, name, true);
     }
 
@@ -1408,7 +1411,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return its code
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} if the name has no code
      */
-    public int stateLookup(int series, String name) throws TsdbException {
+    public int stateLookup(long series, String name) throws TsdbException {
         return stateRequest(series, name, false);
     }
 
@@ -1420,21 +1423,23 @@ public final class TsdbClient implements AutoCloseable {
      * @return its name
      * @throws TsdbException with {@link Status#ERR_NOTFOUND} for an unknown code
      */
-    public String stateName(int series, int code) throws TsdbException {
+    public String stateName(long series, int code) throws TsdbException {
+        int wire = wireId(series);
         request();
         begin(Protocol.OP_STATE_NAME, 8);
-        out.putInt(series).putInt(code);
+        out.putInt(wire).putInt(code);
         send();
         return stringReply("STATE_NAME");
     }
 
-    private int stateRequest(int series, String name, boolean create) throws TsdbException {
+    private int stateRequest(long series, String name, boolean create) throws TsdbException {
         byte[] n = utf8(Objects.requireNonNull(name, "name"), "name");
         if (n.length == 0)
             throw new IllegalArgumentException("empty state name");
+        int wire = wireId(series);
         request();
         begin(Protocol.OP_STATE, 7 + n.length);
-        out.putInt(series).put((byte) (create ? 1 : 0)).putShort((short) n.length).put(n);
+        out.putInt(wire).put((byte) (create ? 1 : 0)).putShort((short) n.length).put(n);
         send();
         return u32Reply("STATE");
     }
@@ -1474,9 +1479,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param values the values; as long as {@code timestamps}
      * @throws TsdbException with {@link Status#ERR_INVALID} for a type mismatch; the first error among this insert
      *     and earlier pipelined ones
-     * @see #insert(int, long[], float[])
+     * @see #insert(long, long[], float[])
      */
-    public void insertSeriesValues(int series, long[] timestamps, Column values) throws TsdbException {
+    public void insertSeriesValues(long series, long[] timestamps, Column values) throws TsdbException {
         insertSeriesValues(series, timestamps, values, 0, sameLength(timestamps, values));
     }
 
@@ -1490,7 +1495,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param length the number of rows
      * @throws TsdbException the first error among this insert and earlier pipelined ones
      */
-    public void insertSeriesValues(int series, long[] timestamps, Column values, int offset, int length)
+    public void insertSeriesValues(long series, long[] timestamps, Column values, int offset, int length)
             throws TsdbException {
         insertValuesFrames(series, null, timestamps, values, offset, length);
         await();
@@ -1506,7 +1511,7 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a type mismatch; the first error among this insert
      *     and earlier pipelined ones
      */
-    public void insertValues(int[] series, long[] timestamps, Column values) throws TsdbException {
+    public void insertValues(long[] series, long[] timestamps, Column values) throws TsdbException {
         insertValues(series, timestamps, values, 0, sameLength(series, timestamps, values));
     }
 
@@ -1520,7 +1525,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param length the number of rows
      * @throws TsdbException the first error among this insert and earlier pipelined ones
      */
-    public void insertValues(int[] series, long[] timestamps, Column values, int offset, int length)
+    public void insertValues(long[] series, long[] timestamps, Column values, int offset, int length)
             throws TsdbException {
         insertValuesFrames(0, Objects.requireNonNull(series, "series"), timestamps, values, offset, length);
         await();
@@ -1528,14 +1533,14 @@ public final class TsdbClient implements AutoCloseable {
 
     /**
      * Sends an insert of typed values into one series without waiting; see
-     * {@link #insertAsync(int, long[], float[])}. The arrays may be reused as soon as this returns.
+     * {@link #insertAsync(long, long[], float[])}. The arrays may be reused as soon as this returns.
      *
      * @param series the series id
      * @param timestamps ms since the epoch
      * @param values the values
      * @throws TsdbException on a connection failure
      */
-    public void insertSeriesValuesAsync(int series, long[] timestamps, Column values) throws TsdbException {
+    public void insertSeriesValuesAsync(long series, long[] timestamps, Column values) throws TsdbException {
         insertSeriesValuesAsync(series, timestamps, values, 0, sameLength(timestamps, values));
     }
 
@@ -1549,7 +1554,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param length the number of rows
      * @throws TsdbException on a connection failure
      */
-    public void insertSeriesValuesAsync(int series, long[] timestamps, Column values, int offset, int length)
+    public void insertSeriesValuesAsync(long series, long[] timestamps, Column values, int offset, int length)
             throws TsdbException {
         insertValuesFrames(series, null, timestamps, values, offset, length);
     }
@@ -1562,7 +1567,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param values the values
      * @throws TsdbException on a connection failure
      */
-    public void insertValuesAsync(int[] series, long[] timestamps, Column values) throws TsdbException {
+    public void insertValuesAsync(long[] series, long[] timestamps, Column values) throws TsdbException {
         insertValuesAsync(series, timestamps, values, 0, sameLength(series, timestamps, values));
     }
 
@@ -1576,28 +1581,25 @@ public final class TsdbClient implements AutoCloseable {
      * @param length the number of rows
      * @throws TsdbException on a connection failure
      */
-    public void insertValuesAsync(int[] series, long[] timestamps, Column values, int offset, int length)
+    public void insertValuesAsync(long[] series, long[] timestamps, Column values, int offset, int length)
             throws TsdbException {
         insertValuesFrames(0, Objects.requireNonNull(series, "series"), timestamps, values, offset, length);
     }
 
-    private void insertValuesFrames(int series, int[] many, long[] ts, Column col, int off, int n)
+    private void insertValuesFrames(long series, long[] many, long[] ts, Column col, int off, int n)
             throws TsdbException {
         Objects.requireNonNull(ts, "timestamps");
         Objects.requireNonNull(col, "values");
         Objects.checkFromIndexSize(off, n, ts.length);
         Objects.checkFromIndexSize(off, n, col.size());
-        if (many != null)
-            Objects.checkFromIndexSize(off, n, many.length);
-        else if (series == Protocol.MANY_SERIES)
-            throw new IllegalArgumentException("series id 0xffffffff is reserved");
+        int one = wireIds(series, many, off, n);
         ready();
         if (n > 0 && packing()) {
             for (int sent = 0; sent < n;) {
                 int m = Math.min(n - sent, INSERT_FRAME_ROWS);
                 while (pending >= MAX_IN_FLIGHT)
                     collectOne();
-                sendPacked(series, many, ts, col, off + sent, m);
+                sendPacked(one, many, ts, col, off + sent, m);
                 pending++;
                 sent += m;
             }
@@ -1614,7 +1616,7 @@ public final class TsdbClient implements AutoCloseable {
             while (pending >= MAX_IN_FLIGHT)
                 collectOne();
             begin(Protocol.OP_INSERT_VALUES, end + pad + (many != null ? (long) m * Integer.BYTES : 0));
-            out.putInt(m).putInt(many != null ? Protocol.MANY_SERIES : series);
+            out.putInt(m).putInt(one);
             out.put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0).putInt(0);
             putLongs(ts, off + sent, m);
             putColumn(col, off + sent, m);
@@ -1625,7 +1627,7 @@ public final class TsdbClient implements AutoCloseable {
                     send();
                 for (int i = 0; i < pad; i++)
                     out.put((byte) 0);
-                putInts(many, off + sent, m);
+                putIds(many, off + sent, m);
             }
             send();
             pending++;
@@ -1669,7 +1671,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** One packed frame of rows {@code [off, off + m)}: reshape, compress, send. */
-    private void sendPacked(int series, int[] many, long[] ts, Column col, int off, int m) throws TsdbException {
+    private void sendPacked(int one, long[] many, long[] ts, Column col, int off, int m) throws TsdbException {
         byte[] valid = Values.validity(col, off, m);
         long bound = Pack.rawBound(m, col.type(), valid != null, many != null);
         if (raw.length < bound)
@@ -1682,7 +1684,7 @@ public final class TsdbClient implements AutoCloseable {
             throw new TsdbException(Status.ERR_NOMEM, "zstd", e);
         }
         begin(Protocol.OP_INSERT_VALUES, Protocol.VALUES_HEADER + 4 + (long) z);
-        out.putInt(m).putInt(many != null ? Protocol.MANY_SERIES : series);
+        out.putInt(m).putInt(one);
         out.put((byte) col.type().code).put((byte) (Protocol.PACKED | (valid != null ? Protocol.VALID : 0)));
         out.putShort((short) 0).putInt(0).putInt(len);
         putBytes(zstd.out(), z);
@@ -1698,7 +1700,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the points
      * @throws TsdbException if the query fails, or {@link Status#ERR_NOMEM} if the result does not fit in one array
      */
-    public ValuePoints queryValues(int series, long start, long end) throws TsdbException {
+    public ValuePoints queryValues(long series, long start, long end) throws TsdbException {
         return queryValues(series, start, end, Order.ASC, 0);
     }
 
@@ -1714,7 +1716,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return the points
      * @throws TsdbException if the query fails, or {@link Status#ERR_NOMEM} if the result does not fit in one array
      */
-    public ValuePoints queryValues(int series, long start, long end, Order order, long limit) throws TsdbException {
+    public ValuePoints queryValues(long series, long start, long end, Order order, long limit) throws TsdbException {
         ValueCollector c = new ValueCollector();
         values(series, start, end, order, limit, c);
         if (c.overflow)
@@ -1735,13 +1737,13 @@ public final class TsdbClient implements AutoCloseable {
      * @return {@code true} if every point was delivered, {@code false} if the consumer stopped early
      * @throws TsdbException if the query fails
      */
-    public boolean queryValues(int series, long start, long end, ValuesConsumer consumer) throws TsdbException {
+    public boolean queryValues(long series, long start, long end, ValuesConsumer consumer) throws TsdbException {
         return queryValues(series, start, end, Order.ASC, 0, consumer);
     }
 
     /**
      * Streams the points of a series of any type in {@code [start, end)}, in the given order, at most {@code limit}
-     * of them, in chunks of up to 16384 points. As with {@link #queryRaw(int, long, long, Order, long, RawConsumer)},
+     * of them, in chunks of up to 16384 points. As with {@link #queryRaw(long, long, long, Order, long, RawConsumer)},
      * stopping early still reads the rest of the stream.
      *
      * @param series the series id
@@ -1753,7 +1755,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return {@code true} if every point was delivered, {@code false} if the consumer stopped early
      * @throws TsdbException if the query fails
      */
-    public boolean queryValues(int series, long start, long end, Order order, long limit, ValuesConsumer consumer)
+    public boolean queryValues(long series, long start, long end, Order order, long limit, ValuesConsumer consumer)
             throws TsdbException {
         Objects.requireNonNull(consumer, "consumer");
         return values(series, start, end, order, limit, (b, type, n, valid) -> {
@@ -1823,7 +1825,7 @@ public final class TsdbClient implements AutoCloseable {
         }
     }
 
-    private boolean values(int series, long start, long end, Order order, long limit, ValueSink sink)
+    private boolean values(long series, long start, long end, Order order, long limit, ValueSink sink)
             throws TsdbException {
         checkOpts(order, limit);
         request();
@@ -1831,12 +1833,13 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** QUERY_VALUES, or QUERY_LTTB with {@code threshold}, and its chunks. */
-    private boolean valuesStream(byte op, int series, long start, long end, Order order, long limit, long threshold,
+    private boolean valuesStream(byte op, long series, long start, long end, Order order, long limit, long threshold,
                                  ValueSink sink) throws TsdbException {
         boolean opts = order != Order.ASC || limit != 0;
         boolean lttb = op == Protocol.OP_QUERY_LTTB;
+        int wire = wireId(series);
         begin(op, (opts ? 29 : 20) + (lttb ? 8 : 0));
-        out.putInt(series).putLong(start).putLong(end);
+        out.putInt(wire).putLong(start).putLong(end);
         if (lttb)
             out.putLong(threshold);
         if (opts)
@@ -1940,7 +1943,7 @@ public final class TsdbClient implements AutoCloseable {
     private interface BucketKind<T> {
         T read();
 
-        List<T> single(int series, long start, long end, Group g, MultiQ q) throws TsdbException;
+        List<T> single(long series, long start, long end, Group g, MultiQ q) throws TsdbException;
     }
 
     private final BucketKind<Bucket> bucketKind = new BucketKind<>() {
@@ -1948,7 +1951,7 @@ public final class TsdbClient implements AutoCloseable {
             return readBucket();
         }
 
-        public List<Bucket> single(int s, long start, long end, Group g, MultiQ q) throws TsdbException {
+        public List<Bucket> single(long s, long start, long end, Group g, MultiQ q) throws TsdbException {
             return queryGroup(s, start, end, g, q.order, q.limit);
         }
     };
@@ -1959,7 +1962,7 @@ public final class TsdbClient implements AutoCloseable {
                     in.getDouble());
         }
 
-        public List<SpreadBucket> single(int s, long start, long end, Group g, MultiQ q) throws TsdbException {
+        public List<SpreadBucket> single(long s, long start, long end, Group g, MultiQ q) throws TsdbException {
             return querySpreadGroup(s, start, end, g, q.order, q.limit);
         }
     };
@@ -1969,29 +1972,29 @@ public final class TsdbClient implements AutoCloseable {
             return new TwaBucket(in.getLong(), in.getDouble(), in.getDouble(), in.getLong(), in.getLong());
         }
 
-        public List<TwaBucket> single(int s, long start, long end, Group g, MultiQ q) throws TsdbException {
+        public List<TwaBucket> single(long s, long start, long end, Group g, MultiQ q) throws TsdbException {
             return queryTwaGroup(s, start, end, g, q.twa);
         }
     };
 
     /**
-     * The rows of every series in {@code series} over {@code [start, end)}, as {@link #queryValues(int, long, long)}
+     * The rows of every series in {@code series} over {@code [start, end)}, as {@link #queryValues(long, long, long)}
      * gives them for one, in one request.
      *
      * @param series the series ids; an id may come more than once, an unknown id has no rows
      * @param start the first timestamp included, ms
      * @param end the first timestamp excluded, ms
      * @return one result per series, in the order of {@code series}
-     * @throws TsdbException as {@link #queryValuesMulti(int[], long, long, Order, long, MultiOptions)}
+     * @throws TsdbException as {@link #queryValuesMulti(long[], long, long, Order, long, MultiOptions)}
      */
-    public List<SeriesResult<ValuePoints>> queryValuesMulti(int[] series, long start, long end)
+    public List<SeriesResult<ValuePoints>> queryValuesMulti(long[] series, long start, long end)
             throws TsdbException {
         return queryValuesMulti(series, start, end, Order.ASC, 0, MultiOptions.defaults());
     }
 
     /**
      * The rows of every series in {@code series} over {@code [start, end)} (or each series' own range from
-     * {@code m}), as {@link #queryValues(int, long, long, Order, long)} gives them for one, in one request
+     * {@code m}), as {@link #queryValues(long, long, long, Order, long)} gives them for one, in one request
      * (protocol version 10).
      *
      * <p>Each series has its rows or the error the single call would give for it. Every series of one request reads
@@ -2008,7 +2011,7 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException {@link Status#ERR_INVALID} from a server older than version 10 (nothing is sent),
      *     {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} rows in all, or a connection error
      */
-    public List<SeriesResult<ValuePoints>> queryValuesMulti(int[] series, long start, long end, Order order,
+    public List<SeriesResult<ValuePoints>> queryValuesMulti(long[] series, long start, long end, Order order,
                                                             long limit, MultiOptions m) throws TsdbException {
         MultiQ q = new MultiQ(K_VALUES, start, end);
         q.order = order;
@@ -2017,7 +2020,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * As {@link #queryValuesMulti(int[], long, long, Order, long, MultiOptions)}, handing the rows to
+     * As {@link #queryValuesMulti(long[], long, long, Order, long, MultiOptions)}, handing the rows to
      * {@code consumer} as they arrive. A consumer that returns false cancels the rest of the query.
      *
      * @param series the series ids
@@ -2028,9 +2031,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param m threads, a cap on all rows, per-series ranges
      * @param consumer receives the rows and the end of each series
      * @return true if every series was read, false if the consumer stopped
-     * @throws TsdbException as {@link #queryValuesMulti(int[], long, long, Order, long, MultiOptions)}
+     * @throws TsdbException as {@link #queryValuesMulti(long[], long, long, Order, long, MultiOptions)}
      */
-    public boolean queryValuesMulti(int[] series, long start, long end, Order order, long limit, MultiOptions m,
+    public boolean queryValuesMulti(long[] series, long start, long end, Order order, long limit, MultiOptions m,
                                     MultiValuesConsumer consumer) throws TsdbException {
         Objects.requireNonNull(consumer, "consumer");
         MultiQ q = new MultiQ(K_VALUES, start, end);
@@ -2065,7 +2068,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /**
-     * LTTB of every series in {@code series}, as {@link #queryLttb(int, long, long, long, Order, long)} gives it for
+     * LTTB of every series in {@code series}, as {@link #queryLttb(long, long, long, long, Order, long)} gives it for
      * one, in one request (protocol version 10).
      *
      * @param series the series ids
@@ -2076,9 +2079,9 @@ public final class TsdbClient implements AutoCloseable {
      * @param limit points per series at most (0: all)
      * @param m threads, a cap on all rows, per-series ranges
      * @return one result per series, in the order of {@code series}
-     * @throws TsdbException as {@link #queryValuesMulti(int[], long, long, Order, long, MultiOptions)}
+     * @throws TsdbException as {@link #queryValuesMulti(long[], long, long, Order, long, MultiOptions)}
      */
-    public List<SeriesResult<ValuePoints>> queryLttbMulti(int[] series, long start, long end, long threshold,
+    public List<SeriesResult<ValuePoints>> queryLttbMulti(long[] series, long start, long end, long threshold,
                                                           Order order, long limit, MultiOptions m)
             throws TsdbException {
         MultiQ q = new MultiQ(K_LTTB, start, end);
@@ -2104,7 +2107,7 @@ public final class TsdbClient implements AutoCloseable {
      *     {@link Buckets#every} interval, {@link Status#ERR_TOO_MANY_BUCKETS} past {@code m.maxRows()} buckets in
      *     all, or a connection error
      */
-    public List<SeriesResult<List<Bucket>>> queryBucketsMulti(int[] series, long start, long end, Buckets b,
+    public List<SeriesResult<List<Bucket>>> queryBucketsMulti(long[] series, long start, long end, Buckets b,
                                                               Order order, long limit, MultiOptions m)
             throws TsdbException {
         MultiQ q = new MultiQ(K_BUCKETS, start, end);
@@ -2128,7 +2131,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return one result per series, in the order of {@code series}
      * @throws TsdbException as {@link #queryBucketsMulti}
      */
-    public List<SeriesResult<List<SpreadBucket>>> querySpreadMulti(int[] series, long start, long end, Buckets b,
+    public List<SeriesResult<List<SpreadBucket>>> querySpreadMulti(long[] series, long start, long end, Buckets b,
                                                                    Order order, long limit, MultiOptions m)
             throws TsdbException {
         MultiQ q = new MultiQ(K_SPREAD, start, end);
@@ -2151,7 +2154,7 @@ public final class TsdbClient implements AutoCloseable {
      * @return one result per series, in the order of {@code series}
      * @throws TsdbException as {@link #queryBucketsMulti}
      */
-    public List<SeriesResult<List<TwaBucket>>> queryTwaMulti(int[] series, long start, long end, Buckets b,
+    public List<SeriesResult<List<TwaBucket>>> queryTwaMulti(long[] series, long start, long end, Buckets b,
                                                              TwaOptions opts, MultiOptions m) throws TsdbException {
         MultiQ q = new MultiQ(K_TWA, start, end);
         q.twa = Objects.requireNonNull(opts, "opts");
@@ -2160,17 +2163,19 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** Checks the arguments and the server's version. */
-    private void startMulti(int[] series, MultiOptions m) throws TsdbException {
+    private void startMulti(long[] series, MultiOptions m) throws TsdbException {
         Objects.requireNonNull(series, "series");
         Objects.requireNonNull(m, "options");
         if (m.starts() != null && m.starts().length != series.length)
             throw new IllegalArgumentException(m.starts().length + " starts for " + series.length + " series");
         if (m.ends() != null && m.ends().length != series.length)
             throw new IllegalArgumentException(m.ends().length + " ends for " + series.length + " series");
+        for (long id : series)
+            wireId(id);
         needVersion(10, "many series in one request");
     }
 
-    private List<SeriesResult<ValuePoints>> rowsMulti(MultiQ q, int[] series, MultiOptions m) throws TsdbException {
+    private List<SeriesResult<ValuePoints>> rowsMulti(MultiQ q, long[] series, MultiOptions m) throws TsdbException {
         checkOpts(q.order, q.limit);
         startMulti(series, m);
         List<SeriesResult<ValuePoints>> out = new ArrayList<>(series.length);
@@ -2204,7 +2209,7 @@ public final class TsdbClient implements AutoCloseable {
         return complete(out, series.length);
     }
 
-    private <T> List<SeriesResult<List<T>>> bucketMulti(MultiQ q, int[] series, MultiOptions m, BucketKind<T> k)
+    private <T> List<SeriesResult<List<T>>> bucketMulti(MultiQ q, long[] series, MultiOptions m, BucketKind<T> k)
             throws TsdbException {
         if (q.kind == K_TWA)
             checkOpts(q.twa.order(), q.twa.limit());
@@ -2229,7 +2234,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** Bucket replies of {@code q} for {@code series} into {@code out}. */
-    private <T> void collectBuckets(MultiQ q, int[] series, MultiOptions m, long[] bounds, int trim, BucketKind<T> k,
+    private <T> void collectBuckets(MultiQ q, long[] series, MultiOptions m, long[] bounds, int trim, BucketKind<T> k,
                                     List<SeriesResult<List<T>>> out) throws TsdbException {
         @SuppressWarnings("unchecked")
         List<T>[] cur = new List[1];
@@ -2255,7 +2260,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** Calendar periods in a time zone: one union of bounds, trimmed per series by the server. */
-    private <T> void multiLocal(MultiQ q, int[] series, MultiOptions m, BucketKind<T> k,
+    private <T> void multiLocal(MultiQ q, long[] series, MultiOptions m, BucketKind<T> k,
                                 List<SeriesResult<List<T>>> out) throws TsdbException {
         boolean twa = q.kind == K_TWA;
         long[] starts = m.starts(), ends = m.ends();
@@ -2328,7 +2333,7 @@ public final class TsdbClient implements AutoCloseable {
     }
 
     /** The series one by one through the single calls. */
-    private <T> void multiSingle(MultiQ q, int[] series, MultiOptions m, BucketKind<T> k,
+    private <T> void multiSingle(MultiQ q, long[] series, MultiOptions m, BucketKind<T> k,
                                  List<SeriesResult<List<T>>> out) throws TsdbException {
         long rows = 0;
         for (int i = 0; i < series.length; i++) {
@@ -2414,7 +2419,7 @@ public final class TsdbClient implements AutoCloseable {
      * item to {@code sink} with the index into {@code series}. {@code bounds} (with {@code trim}) replace the bucket
      * form. Returns whether the sink stopped.
      */
-    private boolean multiSendAll(MultiQ q, int[] series, MultiOptions m, long[] bounds, int trim, MultiSink sink)
+    private boolean multiSendAll(MultiQ q, long[] series, MultiOptions m, long[] bounds, int trim, MultiSink sink)
             throws TsdbException {
         byte op;
         if (q.kind == K_VALUES)
@@ -2457,7 +2462,7 @@ public final class TsdbClient implements AutoCloseable {
                 putLongs(m.ends(), at, k);
             if (iv != null)
                 putLongs(iv, at, k);
-            putInts(series, at, k);
+            putIds(series, at, k);
             putBytes(new byte[pad]);
             putBytes(t);
             send();
@@ -2580,10 +2585,11 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} from a server older than version 7 (asked with HELLO;
      *     the request is not sent); the first error of earlier pipelined inserts
      */
-    public void deleteRange(int series, long start, long end) throws TsdbException {
+    public void deleteRange(long series, long start, long end) throws TsdbException {
+        int wire = wireId(series);
         needDeletes();
         begin(Protocol.OP_DELETE_RANGE, 24);
-        out.putInt(series).putInt(0).putLong(start).putLong(end);
+        out.putInt(wire).putInt(0).putLong(start).putLong(end);
         send();
         int st = frame();
         endReply();
@@ -2605,7 +2611,7 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a timestamp outside the range, a column of another
      *     type than the series or a server older than version 7; the first error of earlier pipelined inserts
      */
-    public void replaceRange(int series, long start, long end, long[] timestamps, Column values)
+    public void replaceRange(long series, long start, long end, long[] timestamps, Column values)
             throws TsdbException {
         int n = sameLength(Objects.requireNonNull(timestamps, "timestamps"), Objects.requireNonNull(values, "values"));
         ValueType type = values.type();
@@ -2614,9 +2620,10 @@ public final class TsdbClient implements AutoCloseable {
                 + (valid != null ? valid.length : 0);
         if (payload > Protocol.MAX_FRAME - 5)
             throw new IllegalArgumentException(n + " rows do not fit in one request");
+        int wire = wireId(series);
         needDeletes();
         begin(Protocol.OP_REPLACE_RANGE, payload);
-        out.putInt(n).putInt(series);
+        out.putInt(n).putInt(wire);
         out.put((byte) type.code).put((byte) (valid != null ? Protocol.VALID : 0)).putShort((short) 0).putInt(0);
         out.putLong(start).putLong(end);
         putLongs(timestamps, 0, n);
@@ -2639,10 +2646,11 @@ public final class TsdbClient implements AutoCloseable {
      * @throws TsdbException with {@link Status#ERR_INVALID} for a negative limit or a server older than version 7,
      *     {@link Status#ERR_NOTFOUND} for an unknown series
      */
-    public void setRetention(int series, long limitMs) throws TsdbException {
+    public void setRetention(long series, long limitMs) throws TsdbException {
+        int wire = wireId(series);
         needDeletes();
         begin(Protocol.OP_SET_RETENTION, 16);
-        out.putInt(series).putInt(0).putLong(limitMs);
+        out.putInt(wire).putInt(0).putLong(limitMs);
         send();
         int st = frame();
         endReply();
@@ -2654,12 +2662,13 @@ public final class TsdbClient implements AutoCloseable {
      *
      * @param series the series id
      * @return the age limit in ms, 0 for none
-     * @throws TsdbException as {@link #setRetention(int, long)}
+     * @throws TsdbException as {@link #setRetention(long, long)}
      */
-    public long retention(int series) throws TsdbException {
+    public long retention(long series) throws TsdbException {
+        int wire = wireId(series);
         needDeletes();
         begin(Protocol.OP_GET_RETENTION, 4);
-        out.putInt(series);
+        out.putInt(wire);
         send();
         int st = frame();
         if (st == 0 && bodyLen != 8)
@@ -2884,6 +2893,44 @@ public final class TsdbClient implements AutoCloseable {
         }
     }
 
+    /**
+     * A series id as protocol 10 carries it: 32 bits. A larger id is no series that server can have (it would be
+     * truncated into another one), so it is refused before anything is written, as the server refuses an unknown id
+     * in a write.
+     */
+    static int wireId(long id) throws TsdbException {
+        if ((id >>> 32) != 0)
+            throw new TsdbException(Status.ERR_INVALID, "series id " + Long.toUnsignedString(id)
+                    + " does not fit in protocol " + Protocol.VERSION, null);
+        return (int) id;
+    }
+
+    /**
+     * Checks the ids of an insert: {@code many[off .. off + n)}, or {@code one} (which must not be the many-series
+     * marker). Returns the id field of the frame header.
+     */
+    private static int wireIds(long one, long[] many, int off, int n) throws TsdbException {
+        if (many == null) {
+            int w = wireId(one);
+            if (w == Protocol.MANY_SERIES)
+                throw new IllegalArgumentException("series id 0xffffffff is reserved");
+            return w;
+        }
+        Objects.checkFromIndexSize(off, n, many.length);
+        for (int i = off; i < off + n; i++)
+            wireId(many[i]);
+        return Protocol.MANY_SERIES;
+    }
+
+    /** Ids checked by {@link #wireId}, as u32. */
+    private void putIds(long[] a, int off, int n) throws TsdbException {
+        for (int end = off + n; off < end; off++) {
+            if (out.remaining() < Integer.BYTES)
+                send();
+            out.putInt((int) a[off]);
+        }
+    }
+
     private void putInts(int[] a, int off, int n) throws TsdbException {
         while (n > 0) {
             if (out.remaining() < Integer.BYTES)
@@ -3037,13 +3084,13 @@ public final class TsdbClient implements AutoCloseable {
         return ts.length;
     }
 
-    private static int sameLength(int[] series, long[] ts, Column values) {
+    private static int sameLength(long[] series, long[] ts, Column values) {
         if (series.length != ts.length)
             throw new IllegalArgumentException("series and timestamps differ in length");
         return sameLength(ts, values);
     }
 
-    private static int sameLength(int[] series, long[] ts, float[] values) {
+    private static int sameLength(long[] series, long[] ts, float[] values) {
         if (series.length != ts.length)
             throw new IllegalArgumentException("series and timestamps differ in length");
         return sameLength(ts, values);

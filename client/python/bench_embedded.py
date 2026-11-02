@@ -7,7 +7,7 @@ tsdb_client.Db (the engine in this process, no tsdbd).
     python bench_embedded.py --dir /data/emb --qps THREADS [--series 100] [--points 1000000] [--seconds 3]
         [--query-threads N] [--many N]
 
---load wipes --dir, creates the series under tsdb-bench's names (ids in file order), and has each of --threads
+--load wipes --dir, creates the series under tsdb-bench's names (in file order), and has each of --threads
 writers (Python threads: Db releases the GIL while the engine works) insert one contiguous slice of the file's rows
 in batches of --batch, copying them from the file's packed rows into numpy columns inside the timing, as tsdb-bench
 does. Then (after --optimize) it checks that the database holds exactly the file's rows: count and sum per series
@@ -76,20 +76,25 @@ def expect(rows):
     return count, total, mag, h
 
 
-def verify(db, rows):
+def series_name(i):
+    """The name of the file's series i: its sensor kind, then its index."""
+    return f"{NAMES[i % 7]}.{i}"
+
+
+def verify(db, rows, ids):
     """cb_expect_verify_all: prints the reasons (up to 5) and the verdict line; True if the database holds exactly
     the file's rows."""
     count, total, mag, h = expect(rows)
     found = bad = 0
     for s in range(len(count)):
-        b = db.query_agg(s)
+        b = db.query_agg(ids[s])
         c, sm = (b[0].count, b[0].sum) if b else (0, 0.0)
         found += c
         why = None
         if c != count[s] or abs(sm - total[s]) > 1e-9 * mag[s] + 1e-9:
             why = f"holds {c} rows, sum {sm:.17g}; the file has {count[s]}, sum {total[s]:.17g}"
         else:
-            ts, v = db.query_raw(s, numpy=True)
+            ts, v = db.query_raw(ids[s], numpy=True)
             got = int(np.sum(row_hash(ts, v), dtype=U64)) if len(ts) else 0
             if len(ts) != count[s] or got != h[s]:
                 why = f"reads back {len(ts)} rows with timestamps or values other than the file's ({count[s]} rows)"
@@ -109,17 +114,15 @@ def load(a):
         sys.exit(f"{a.load}: not a RowBinary file of 16-byte rows (series u32, ts i64, value f32)")
     shutil.rmtree(a.dir, ignore_errors=True)
     db = tsdb_client.Db(a.dir, zstd_level=a.zstd, fsync=a.fsync)
-    for i in range(int(rows["s"].max()) + 1):
-        sid = db.series(f"{NAMES[i % 7]}.{i}")
-        if sid != i:  # verification and the query benchmarks rely on ids equal to the file's indexes
-            sys.exit(f"series {NAMES[i % 7]}.{i}: id {sid}, expected {i}")
+    # the file's series are indexes; the database hands out its own ids (not dense in general)
+    ids = np.array([db.series(series_name(i)) for i in range(int(rows["s"].max()) + 1)], dtype=U64)
     n, nt, errors = len(rows), a.threads, []
 
     def writer(lo, hi):
         try:
             for off in range(lo, hi, a.batch):
                 part = rows[off : min(hi, off + a.batch)]
-                db.insert(*(np.ascontiguousarray(part[f]) for f in ("s", "t", "v")))
+                db.insert(ids[part["s"]], *(np.ascontiguousarray(part[f]) for f in ("t", "v")))
         except Exception as e:  # noqa: BLE001 - reported by the main thread
             errors.append(e)
 
@@ -139,17 +142,17 @@ def load(a):
         t0 = time.perf_counter()
         db.optimize()
         print(f"optimize {time.perf_counter() - t0:.2f} s")
-    ok = verify(db, rows)
+    ok = verify(db, rows, [int(x) for x in ids])
     st = db.stats()
     print(f"storage {st.bytes / 1048576.0:.2f} MiB, {st.bytes / max(st.rows, 1):.3f} bytes/row")  # rows: in parts, not the memtable
     db.close()
     return ok
 
 
-def querier(db, a, klass, thread, out, errors):
+def querier(db, ids, a, klass, thread, out, errors):
     """One thread's queries of one class for --seconds (tools/tsdb-bench.c qw_loop)."""
     if a.many:
-        return batch_querier(db, a, klass, thread, out, errors)
+        return batch_querier(db, ids, a, klass, thread, out, errors)
     try:
         _, _, agg, window, bucket = klass
         r = bc.seed(thread)
@@ -159,19 +162,19 @@ def querier(db, a, klass, thread, out, errors):
             for _ in range(16):
                 r, s, start, end = bc.window(r, a.series, a.points, window)
                 if not agg:
-                    ts, v = db.query_raw(s, start, end, numpy=True)
+                    ts, v = db.query_raw(ids[s], start, end, numpy=True)
                     rows += len(ts)
                     if len(v):
                         float(v[-1])  # touch the data, as tsdb-bench does
                 else:
-                    rows += int(db.query_agg(s, start, end, bucket * bc.step_ms(s)).counts.sum())
+                    rows += int(db.query_agg(ids[s], start, end, bucket * bc.step_ms(s)).counts.sum())
                 queries += 1
         out.append((queries, rows, time.perf_counter() - t0))
     except Exception as e:  # noqa: BLE001 - reported by the main thread
         errors.append(e)
 
 
-def batch_querier(db, a, klass, thread, out, errors):
+def batch_querier(db, ids, a, klass, thread, out, errors):
     """As querier(), --many windows per call."""
     try:
         _, _, agg, window, bucket = klass
@@ -180,6 +183,7 @@ def batch_querier(db, a, klass, thread, out, errors):
         t0 = time.perf_counter()
         while time.perf_counter() - t0 < a.seconds:
             r, s, start, end, interval = bc.batch(r, a.many, a.series, a.points, window, bucket)
+            s = [ids[x] for x in s]
             if not agg:
                 for ts, v in db.query_raw_many(s, start, end):
                     rows += len(ts)
@@ -198,10 +202,15 @@ def qps(a):
         print(f"qps: {a.dir} is not a database directory", file=sys.stderr)
         return False
     db = tsdb_client.Db(a.dir, query_threads=a.query_threads if a.query_threads > 0 else None)
+    try:
+        ids = [db.series(series_name(i), create=False) for i in range(a.series)]
+    except tsdb_client.TsdbError as e:
+        print(f"qps: {a.dir} does not hold the data set's {a.series} series: {e}", file=sys.stderr)
+        return False
     for klass in bc.CLASSES:
         out, errors = [], []
         cpu0 = bc.cpu_s()
-        threads = [threading.Thread(target=querier, args=(db, a, klass, i, out, errors)) for i in range(a.qps)]
+        threads = [threading.Thread(target=querier, args=(db, ids, a, klass, i, out, errors)) for i in range(a.qps)]
         for t in threads:
             t.start()
         for t in threads:

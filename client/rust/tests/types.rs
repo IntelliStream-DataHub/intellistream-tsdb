@@ -253,7 +253,7 @@ fn many_series_layout_and_pipelining() {
     assert_eq!(ry.values.to_options::<bool>().unwrap(), vec![None, Some(true)]);
     for n in 0..9 {
         // every padding length, without a bitmap
-        let s: Vec<u32> = vec![x; n];
+        let s: Vec<u64> = vec![x; n];
         let t: Vec<i64> = (0..n as i64).map(|i| T0 + 100 + i).collect();
         c.insert_values(&s, &t, &vec![true; n]).unwrap();
     }

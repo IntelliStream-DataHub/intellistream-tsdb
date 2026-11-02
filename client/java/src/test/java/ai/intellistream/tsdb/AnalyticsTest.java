@@ -22,7 +22,7 @@ class AnalyticsTest {
     static Path scratch;
     static TsdbServer server;
     static TsdbClient c;
-    static int calc, wave, state;
+    static long calc, wave, state;
 
     @BeforeAll
     static void start() throws Exception {
@@ -118,12 +118,12 @@ class AnalyticsTest {
      * call fails with TOO_MANY_BUCKETS, as in the C and Rust clients, before it sends the bounds. */
     @Test
     void overWideLocalRangesAreTooManyBuckets() throws Exception {
-        int wide = c.seriesCreate("wide", ValueType.FLOAT64);
+        long wide = c.seriesCreate("wide", ValueType.FLOAT64);
         c.insertSeriesValues(wide, new long[] {T0, T0 + 450 * 86_400_000L}, Column.ofDoubles(1, 2)); /* 38.9 M s */
-        int wider = c.seriesCreate("wider", ValueType.FLOAT64);
+        long wider = c.seriesCreate("wider", ValueType.FLOAT64);
         c.insertSeriesValues(wider, new long[] {T0, T0 + 800 * 86_400_000L}, Column.ofDoubles(1, 2)); /* 69.1 M s */
         Group secs = Group.of(Unit.SECOND).in("Europe/Oslo");
-        for (int s : new int[] {wide, wider}) {
+        for (long s : new long[] {wide, wider}) {
             tooMany(() -> c.queryGroup(s, MIN, MAX, secs, Order.ASC, 0));
             tooMany(() -> c.querySpreadGroup(s, MIN, MAX, secs, Order.ASC, 0));
             tooMany(() -> c.queryTwaGroup(s, MIN, MAX, secs, TwaOptions.step()));

@@ -19,6 +19,7 @@ use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::ops::{Bound, ControlFlow, RangeBounds};
 use std::time::Duration;
 
+use crate::SeriesId;
 use crate::calendar;
 use crate::error::{Error, Result, Status};
 use crate::keepalive::{self, KeepAlive};
@@ -26,7 +27,7 @@ use crate::pack;
 use crate::protocol::extend_i64s;
 use crate::protocol::{
     BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, MULTI_PREFIX, Op, PACKED, PROTOCOL_VERSION, REPLACE_HEADER,
-    REPLY_HEADER, SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW, VALID, VALUES_CHUNK_HEADER,
+    REPLY_HEADER, SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW, VALID, VALUES_CHUNK_HEADER, wire_id, wire_ids,
 };
 use crate::types::{
     Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts,
@@ -367,7 +368,7 @@ impl Client {
     /// [`Error::InvalidArgument`] for an empty name, one longer than 65535 bytes
     /// or with a NUL byte; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
     /// after either the client refuses further calls.
-    pub fn series(&mut self, name: &str) -> Result<u32> {
+    pub fn series(&mut self, name: &str) -> Result<SeriesId> {
         self.run(|c| c.series_req(name, true, None))
     }
 
@@ -377,7 +378,7 @@ impl Client {
     ///
     /// [`Status::NotFound`] if there is no series `name`; otherwise as
     /// [`series`](Client::series).
-    pub fn series_lookup(&mut self, name: &str) -> Result<u32> {
+    pub fn series_lookup(&mut self, name: &str) -> Result<SeriesId> {
         self.run(|c| c.series_req(name, false, None))
     }
 
@@ -394,7 +395,7 @@ impl Client {
     ///
     /// As [`series`](Client::series); [`Status::Invalid`] if the server cannot
     /// use `path`.
-    pub fn series_at(&mut self, name: &str, path: &str) -> Result<u32> {
+    pub fn series_at(&mut self, name: &str, path: &str) -> Result<SeriesId> {
         self.run(|c| c.series_req(name, true, Some(path)))
     }
 
@@ -405,8 +406,9 @@ impl Client {
     ///
     /// [`Status::NotFound`] if there is no such series; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
     /// after either the client refuses further calls.
-    pub fn series_name(&mut self, id: u32) -> Result<String> {
+    pub fn series_name(&mut self, id: SeriesId) -> Result<String> {
         self.run(|c| {
+            let id = wire_id(id)?;
             c.request(Op::SeriesName, |f| {
                 f.u32(id);
             })?;
@@ -418,7 +420,7 @@ impl Client {
         })
     }
 
-    fn series_req(&mut self, name: &str, create: bool, path: Option<&str>) -> Result<u32> {
+    fn series_req(&mut self, name: &str, create: bool, path: Option<&str>) -> Result<SeriesId> {
         let name = wire_str("series name", name, false)?;
         let path = path.map(|p| wire_str("path", p, true)).transpose()?;
         self.request(Op::Series, |f| {
@@ -430,7 +432,7 @@ impl Client {
         let mut r = Cursor::new(&self.body);
         let id = r.u32()?;
         end(&r)?;
-        Ok(id)
+        Ok(id.into())
     }
 
     /// Returns the id of series `name` of value type `ty`, creating it if needed
@@ -451,7 +453,7 @@ impl Client {
     /// # let _ = starts;
     /// # Ok::<(), tsdb_client::Error>(())
     /// ```
-    pub fn series_create(&mut self, name: &str, ty: ValueType, path: Option<&str>) -> Result<u32> {
+    pub fn series_create(&mut self, name: &str, ty: ValueType, path: Option<&str>) -> Result<SeriesId> {
         self.run(|c| {
             let name = wire_str("series name", name, false)?;
             let path = wire_str("path", path.unwrap_or(""), true)?;
@@ -461,7 +463,7 @@ impl Client {
             let mut r = Cursor::new(&c.body);
             let id = r.u32()?;
             end(&r)?;
-            Ok(id)
+            Ok(id.into())
         })
     }
 
@@ -471,8 +473,9 @@ impl Client {
     ///
     /// [`Status::NotFound`] if there is no such series; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
     /// after either the client refuses further calls.
-    pub fn series_type(&mut self, id: u32) -> Result<ValueType> {
+    pub fn series_type(&mut self, id: SeriesId) -> Result<ValueType> {
         self.run(|c| {
+            let id = wire_id(id)?;
             c.request(Op::SeriesType, |f| {
                 f.u32(id);
             })?;
@@ -493,7 +496,7 @@ impl Client {
     ///
     /// [`Error::InvalidArgument`] for an empty name; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
     /// after either the client refuses further calls.
-    pub fn state(&mut self, series: u32, name: &str) -> Result<u32> {
+    pub fn state(&mut self, series: SeriesId, name: &str) -> Result<u32> {
         self.run(|c| c.state_req(series, name, true))
     }
 
@@ -503,7 +506,7 @@ impl Client {
     ///
     /// [`Status::NotFound`] if `name` has no code; as [`state`](Client::state)
     /// otherwise.
-    pub fn state_lookup(&mut self, series: u32, name: &str) -> Result<u32> {
+    pub fn state_lookup(&mut self, series: SeriesId, name: &str) -> Result<u32> {
         self.run(|c| c.state_req(series, name, false))
     }
 
@@ -513,8 +516,9 @@ impl Client {
     ///
     /// [`Status::NotFound`] for an unknown code; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
     /// after either the client refuses further calls.
-    pub fn state_name(&mut self, series: u32, code: u32) -> Result<String> {
+    pub fn state_name(&mut self, series: SeriesId, code: u32) -> Result<String> {
         self.run(|c| {
+            let series = wire_id(series)?;
             c.request(Op::StateName, |f| {
                 f.u32(series).u32(code);
             })?;
@@ -526,8 +530,9 @@ impl Client {
         })
     }
 
-    fn state_req(&mut self, series: u32, name: &str, create: bool) -> Result<u32> {
+    fn state_req(&mut self, series: SeriesId, name: &str, create: bool) -> Result<u32> {
         let name = wire_str("state name", name, false)?;
+        let series = wire_id(series)?;
         self.request(Op::State, |f| {
             f.u32(series).u8(create as u8).u16(name.len() as u16).bytes(name);
         })?;
@@ -560,7 +565,7 @@ impl Client {
     /// c.insert_series(id, &[1_700_000_000_000, 1_700_000_001_000], &[4.2, 4.3])?;
     /// # Ok::<(), tsdb_client::Error>(())
     /// ```
-    pub fn insert_series(&mut self, series: u32, ts: &[i64], values: &[Value]) -> Result<()> {
+    pub fn insert_series(&mut self, series: SeriesId, ts: &[i64], values: &[Value]) -> Result<()> {
         self.run(|c| {
             c.insert_frames(None, series, ts, values)?;
             c.wait_inner()
@@ -574,7 +579,7 @@ impl Client {
     ///
     /// As [`insert_series`](Client::insert_series), and
     /// [`Error::InvalidArgument`] if `series` has another length.
-    pub fn insert(&mut self, series: &[u32], ts: &[i64], values: &[Value]) -> Result<()> {
+    pub fn insert(&mut self, series: &[SeriesId], ts: &[i64], values: &[Value]) -> Result<()> {
         self.run(|c| {
             c.insert_frames(Some(series), 0, ts, values)?;
             c.wait_inner()
@@ -592,7 +597,7 @@ impl Client {
     ///
     /// [`Error::InvalidArgument`] if the slices differ in length; [`Error::Io`] if the connection fails, [`Error::Protocol`] if the reply makes no sense;
     /// after either the client refuses further calls.
-    pub fn insert_series_async(&mut self, series: u32, ts: &[i64], values: &[Value]) -> Result<()> {
+    pub fn insert_series_async(&mut self, series: SeriesId, ts: &[i64], values: &[Value]) -> Result<()> {
         self.run(|c| c.insert_frames(None, series, ts, values))
     }
 
@@ -602,7 +607,7 @@ impl Client {
     /// # Errors
     ///
     /// As [`insert_series_async`](Client::insert_series_async).
-    pub fn insert_async(&mut self, series: &[u32], ts: &[i64], values: &[Value]) -> Result<()> {
+    pub fn insert_async(&mut self, series: &[SeriesId], ts: &[i64], values: &[Value]) -> Result<()> {
         self.run(|c| c.insert_frames(Some(series), 0, ts, values))
     }
 
@@ -628,7 +633,7 @@ impl Client {
     /// ```
     pub fn insert_series_values<'a>(
         &mut self,
-        series: u32,
+        series: SeriesId,
         ts: &[i64],
         values: impl Into<ColumnRef<'a>>,
     ) -> Result<()> {
@@ -645,7 +650,12 @@ impl Client {
     /// # Errors
     ///
     /// As [`insert_series_values`](Client::insert_series_values).
-    pub fn insert_values<'a>(&mut self, series: &[u32], ts: &[i64], values: impl Into<ColumnRef<'a>>) -> Result<()> {
+    pub fn insert_values<'a>(
+        &mut self,
+        series: &[SeriesId],
+        ts: &[i64],
+        values: impl Into<ColumnRef<'a>>,
+    ) -> Result<()> {
         let col = values.into();
         self.run(|c| {
             c.insert_values_frames(Some(series), 0, ts, col)?;
@@ -662,7 +672,7 @@ impl Client {
     /// after either the client refuses further calls.
     pub fn insert_series_values_async<'a>(
         &mut self,
-        series: u32,
+        series: SeriesId,
         ts: &[i64],
         values: impl Into<ColumnRef<'a>>,
     ) -> Result<()> {
@@ -678,7 +688,7 @@ impl Client {
     /// As [`insert_series_values_async`](Client::insert_series_values_async).
     pub fn insert_values_async<'a>(
         &mut self,
-        series: &[u32],
+        series: &[SeriesId],
         ts: &[i64],
         values: impl Into<ColumnRef<'a>>,
     ) -> Result<()> {
@@ -701,7 +711,13 @@ impl Client {
         self.pending
     }
 
-    fn insert_frames(&mut self, series: Option<&[u32]>, one: u32, ts: &[i64], values: &[Value]) -> Result<()> {
+    fn insert_frames(
+        &mut self,
+        series: Option<&[SeriesId]>,
+        one: SeriesId,
+        ts: &[i64],
+        values: &[Value],
+    ) -> Result<()> {
         check_lengths(series, one, ts, values.len())?;
         let n = ts.len();
         if n > 0 && self.packing()? {
@@ -714,10 +730,10 @@ impl Client {
                 self.collect_ack()?;
             }
             let f = self.req.begin(self.next_id, Op::Insert);
-            f.u32(m as u32).u32(series.map_or(one, |_| MANY_SERIES)).i64s(&ts[off..off + m]);
+            f.u32(m as u32).u32(series.map_or(one as u32, |_| MANY_SERIES)).i64s(&ts[off..off + m]);
             Native::put(&values[off..off + m], f.raw());
             if let Some(s) = series {
-                f.u32s(&s[off..off + m]);
+                f.sids(&s[off..off + m]);
             }
             self.send_insert()?;
             off += m;
@@ -729,7 +745,13 @@ impl Client {
 
     /// INSERT_VALUES frames: header, timestamps, values, the validity bitmap
     /// if any, then (aligned to 4) the series of each row.
-    fn insert_values_frames(&mut self, series: Option<&[u32]>, one: u32, ts: &[i64], col: ColumnRef<'_>) -> Result<()> {
+    fn insert_values_frames(
+        &mut self,
+        series: Option<&[SeriesId]>,
+        one: SeriesId,
+        ts: &[i64],
+        col: ColumnRef<'_>,
+    ) -> Result<()> {
         check_lengths(series, one, ts, col.len())?;
         if let Some(v) = col.valid
             && v.len() != col.len()
@@ -752,7 +774,7 @@ impl Client {
             }
             let f = self.req.begin(self.next_id, Op::InsertValues);
             f.u32(m as u32)
-                .u32(series.map_or(one, |_| MANY_SERIES))
+                .u32(series.map_or(one as u32, |_| MANY_SERIES))
                 .u8(col.value_type().code())
                 .u8(flags)
                 .u16(0)
@@ -788,7 +810,7 @@ impl Client {
                     f.bytes(&v.as_bytes()[off / 8..(off + m).div_ceil(8)]);
                 }
                 if let Some(s) = series {
-                    f.align4().u32s(&s[off..off + m]);
+                    f.align4().sids(&s[off..off + m]);
                 }
             }
             self.send_insert()?;
@@ -849,7 +871,7 @@ impl Client {
     /// }
     /// # Ok::<(), tsdb_client::Error>(())
     /// ```
-    pub fn query_points(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Points> {
+    pub fn query_points(&mut self, series: SeriesId, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Points> {
         let (start, end) = bounds(&range);
         self.run(|c| {
             let mut p = Points::default();
@@ -871,7 +893,13 @@ impl Client {
     /// # Errors
     ///
     /// As [`query_points`](Client::query_points).
-    pub fn query_raw<F>(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts, mut f: F) -> Result<()>
+    pub fn query_raw<F>(
+        &mut self,
+        series: SeriesId,
+        range: impl RangeBounds<i64>,
+        opts: QueryOpts,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(&[i64], &[Value]) -> ControlFlow<()>,
     {
@@ -889,7 +917,7 @@ impl Client {
     }
 
     /// Sends a QUERY_RAW and passes the timestamp and value bytes of each chunk to `sink`.
-    fn raw_stream<F>(&mut self, series: u32, start: i64, end: i64, opts: QueryOpts, mut sink: F) -> Result<()>
+    fn raw_stream<F>(&mut self, series: SeriesId, start: i64, end: i64, opts: QueryOpts, mut sink: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> ControlFlow<()>,
     {
@@ -944,7 +972,7 @@ impl Client {
     /// }
     /// # Ok::<(), tsdb_client::Error>(())
     /// ```
-    pub fn query_rows(&mut self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Rows> {
+    pub fn query_rows(&mut self, series: SeriesId, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Rows> {
         let (start, end) = bounds(&range);
         self.run(|c| c.rows_stream(series, start, end, opts, None))
     }
@@ -969,7 +997,7 @@ impl Client {
     /// ```
     pub fn query_lttb(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         threshold: u64,
         opts: QueryOpts,
@@ -985,7 +1013,14 @@ impl Client {
     }
 
     /// The rows of QUERY_VALUES, or of QUERY_LTTB with `lttb` as the threshold.
-    fn rows_stream(&mut self, series: u32, start: i64, end: i64, opts: QueryOpts, lttb: Option<u64>) -> Result<Rows> {
+    fn rows_stream(
+        &mut self,
+        series: SeriesId,
+        start: i64,
+        end: i64,
+        opts: QueryOpts,
+        lttb: Option<u64>,
+    ) -> Result<Rows> {
         {
             let c = self;
             let mut rows = Rows { ts: Vec::new(), values: Column::empty(ValueType::Float32) };
@@ -1027,7 +1062,7 @@ impl Client {
     /// after either the client refuses further calls.
     pub fn query_values<F>(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         opts: QueryOpts,
         mut f: F,
@@ -1063,7 +1098,7 @@ impl Client {
     /// Sends a QUERY_VALUES and passes every chunk, empty ones included (they
     /// still carry the type), to `sink` until it breaks. A limit of `Some(0)`
     /// asks for one row and passes none, so the type still arrives.
-    fn values_stream<F>(&mut self, series: u32, start: i64, end: i64, opts: QueryOpts, sink: F) -> Result<()>
+    fn values_stream<F>(&mut self, series: SeriesId, start: i64, end: i64, opts: QueryOpts, sink: F) -> Result<()>
     where
         F: FnMut(Chunk<'_>) -> Result<ControlFlow<()>>,
     {
@@ -1074,7 +1109,7 @@ impl Client {
     /// checked the server's version), to `sink` as [`values_stream`](Client::values_stream).
     fn chunk_stream<F>(
         &mut self,
-        series: u32,
+        series: SeriesId,
         start: i64,
         end: i64,
         opts: QueryOpts,
@@ -1084,6 +1119,7 @@ impl Client {
     where
         F: FnMut(Chunk<'_>) -> Result<ControlFlow<()>>,
     {
+        let wire = wire_id(series)?;
         self.wait_inner()?;
         let (limit, mut stopped) = match opts.wire_limit() {
             Some(l) => (l, false),
@@ -1093,7 +1129,7 @@ impl Client {
             None => self.send_range_query(Op::QueryValues, series, start, end, opts.order, limit)?,
             Some(t) => {
                 // order and limit only when they change something: the 28-byte form is what every server takes
-                let f = self.req.begin(self.next_id, Op::QueryLttb).u32(series).i64(start).i64(end).u64(t);
+                let f = self.req.begin(self.next_id, Op::QueryLttb).u32(wire).i64(start).i64(end).u64(t);
                 if opts.order == Order::Desc || opts.limit.is_some() {
                     f.u8((opts.order == Order::Desc) as u8).u64(limit);
                 }
@@ -1137,7 +1173,16 @@ impl Client {
         status_result(status)
     }
 
-    fn send_range_query(&mut self, op: Op, series: u32, start: i64, end: i64, order: Order, limit: u64) -> Result<()> {
+    fn send_range_query(
+        &mut self,
+        op: Op,
+        series: SeriesId,
+        start: i64,
+        end: i64,
+        order: Order,
+        limit: u64,
+    ) -> Result<()> {
+        let series = wire_id(series)?;
         self.req.begin(self.next_id, op).u32(series).i64(start).i64(end).u8((order == Order::Desc) as u8).u64(limit);
         self.send()
     }
@@ -1161,7 +1206,12 @@ impl Client {
     /// }
     /// # Ok::<(), tsdb_client::Error>(())
     /// ```
-    pub fn query_agg(&mut self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64) -> Result<Vec<Bucket>> {
+    pub fn query_agg(
+        &mut self,
+        series: SeriesId,
+        range: impl RangeBounds<i64>,
+        interval_ms: i64,
+    ) -> Result<Vec<Bucket>> {
         self.query_agg_ex(series, range, interval_ms, QueryOpts::asc())
     }
 
@@ -1177,7 +1227,7 @@ impl Client {
     /// ```
     pub fn query_agg_ex(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         interval_ms: i64,
         opts: QueryOpts,
@@ -1220,7 +1270,7 @@ impl Client {
     /// ```
     pub fn query_group(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         group: Option<&Group>,
         opts: QueryOpts,
@@ -1244,7 +1294,7 @@ impl Client {
     /// The reply is left in `self.body`; `false`: there is none (no rows, or a limit of 0).
     fn group_local(
         &mut self,
-        series: u32,
+        series: SeriesId,
         start: i64,
         end: i64,
         g: &Group,
@@ -1271,7 +1321,7 @@ impl Client {
     }
 
     /// The timestamp of the first (`Asc`) or last (`Desc`) row of `series` in `[start, end)`.
-    fn edge_ts(&mut self, series: u32, start: i64, end: i64, order: Order) -> Result<Option<i64>> {
+    fn edge_ts(&mut self, series: SeriesId, start: i64, end: i64, order: Order) -> Result<Option<i64>> {
         let mut ts = None;
         self.values_stream(series, start, end, QueryOpts { order, limit: Some(1) }, |chunk| {
             if chunk.n > 0 {
@@ -1314,7 +1364,7 @@ impl Client {
     /// ```
     pub fn query_bounds(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         bounds: &[i64],
         opts: QueryOpts,
@@ -1330,13 +1380,14 @@ impl Client {
     /// every server version takes.
     fn bounds_send(
         &mut self,
-        series: u32,
+        series: SeriesId,
         start: i64,
         end: i64,
         b: &[i64],
         opts: QueryOpts,
         fields: u8,
     ) -> Result<bool> {
+        let series = wire_id(series)?;
         check_bounds(b)?;
         if fields != 0 {
             self.need_version(8)?;
@@ -1364,7 +1415,7 @@ impl Client {
     /// QUERY_BUCKETS: fixed intervals (no group) or calendar groups.
     fn buckets(
         &mut self,
-        series: u32,
+        series: SeriesId,
         start: i64,
         end: i64,
         interval: i64,
@@ -1383,7 +1434,7 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     fn buckets_send(
         &mut self,
-        series: u32,
+        series: SeriesId,
         start: i64,
         end: i64,
         interval: i64,
@@ -1391,6 +1442,7 @@ impl Client {
         opts: QueryOpts,
         fields: u8,
     ) -> Result<bool> {
+        let series = wire_id(series)?;
         let tz = wire_str("time zone", group.and_then(|g| g.timezone.as_deref()).unwrap_or(""), true)?;
         if fields != 0 {
             self.need_version(8)?;
@@ -1450,7 +1502,7 @@ impl Client {
     /// ```
     pub fn query_spread(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         interval_ms: i64,
         opts: QueryOpts,
@@ -1472,7 +1524,7 @@ impl Client {
     /// turns periods in a time zone other than UTC into bounds.
     pub fn query_spread_group(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         group: Option<&Group>,
         opts: QueryOpts,
@@ -1492,7 +1544,7 @@ impl Client {
     /// The spread in buckets with the given bounds, as [`query_bounds`](Client::query_bounds).
     pub fn query_spread_bounds(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         bounds: &[i64],
         opts: QueryOpts,
@@ -1525,7 +1577,7 @@ impl Client {
     /// ```
     pub fn query_twa(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         interval_ms: i64,
         opts: TwaOpts,
@@ -1542,7 +1594,7 @@ impl Client {
     /// where the range is open.
     pub fn query_twa_group(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         group: Option<&Group>,
         opts: TwaOpts,
@@ -1585,7 +1637,7 @@ impl Client {
     /// do not count, the last bucket ends at the end of the range.
     pub fn query_twa_bounds(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         bounds: &[i64],
         opts: TwaOpts,
@@ -1599,7 +1651,7 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     fn twa_req(
         &mut self,
-        series: u32,
+        series: SeriesId,
         start: i64,
         end: i64,
         interval: i64,
@@ -1608,6 +1660,7 @@ impl Client {
         b: &[i64],
         opts: TwaOpts,
     ) -> Result<Vec<TwaBucket>> {
+        let series = wire_id(series)?;
         if b.len() > (MAX_FRAME - 64 - TWA_HEADER) / 8 {
             return Err(Error::InvalidArgument(format!("{} bucket bounds", b.len())));
         }
@@ -1655,9 +1708,10 @@ impl Client {
     /// c.delete_range(id, t0..t0 + 3_600_000)?; // one hour, its end excluded
     /// # Ok::<(), tsdb_client::Error>(())
     /// ```
-    pub fn delete_range(&mut self, series: u32, range: impl RangeBounds<i64>) -> Result<()> {
+    pub fn delete_range(&mut self, series: SeriesId, range: impl RangeBounds<i64>) -> Result<()> {
         let (start, end) = self::bounds(&range);
         self.run(|c| {
+            let series = wire_id(series)?;
             c.need_deletes()?;
             c.request(Op::DeleteRange, |f| {
                 f.u32(series).u32(0).i64(start).i64(end);
@@ -1685,7 +1739,7 @@ impl Client {
     /// ```
     pub fn replace_range<'a>(
         &mut self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         ts: &[i64],
         values: impl Into<ColumnRef<'a>>,
@@ -1696,9 +1750,10 @@ impl Client {
     }
 
     /// REPLACE_RANGE.
-    fn replace_req(&mut self, series: u32, start: i64, end: i64, ts: &[i64], col: ColumnRef<'_>) -> Result<()> {
+    fn replace_req(&mut self, series: SeriesId, start: i64, end: i64, ts: &[i64], col: ColumnRef<'_>) -> Result<()> {
         let n = ts.len();
         check_lengths(None, series, ts, col.len())?;
+        let series = series as u32; // check_lengths: it fits
         if let Some(v) = col.valid
             && v.len() != n
         {
@@ -1735,8 +1790,9 @@ impl Client {
     ///
     /// [`Status::Invalid`] for a negative limit or a server older than version 7; otherwise as
     /// [`delete_range`](Client::delete_range).
-    pub fn set_retention(&mut self, series: u32, limit_ms: i64) -> Result<()> {
+    pub fn set_retention(&mut self, series: SeriesId, limit_ms: i64) -> Result<()> {
         self.run(|c| {
+            let series = wire_id(series)?;
             c.need_deletes()?;
             c.request(Op::SetRetention, |f| {
                 f.u32(series).u32(0).i64(limit_ms);
@@ -1749,8 +1805,9 @@ impl Client {
     /// # Errors
     ///
     /// As [`set_retention`](Client::set_retention).
-    pub fn retention(&mut self, series: u32) -> Result<i64> {
+    pub fn retention(&mut self, series: SeriesId) -> Result<i64> {
         self.run(|c| {
+            let series = wire_id(series)?;
             c.need_deletes()?;
             c.request(Op::GetRetention, |f| {
                 f.u32(series);
@@ -2061,7 +2118,8 @@ struct Chunk<'a> {
     valid: Option<&'a [u8]>,
 }
 
-fn check_lengths(series: Option<&[u32]>, one: u32, ts: &[i64], values: usize) -> Result<()> {
+/// Also checks that the ids fit protocol 10 (`one as u32` and [`FrameBuf::sids`] rely on it).
+fn check_lengths(series: Option<&[SeriesId]>, one: SeriesId, ts: &[i64], values: usize) -> Result<()> {
     if ts.len() != values || series.is_some_and(|s| s.len() != ts.len()) {
         return Err(Error::InvalidArgument(format!(
             "column lengths differ: {} timestamps, {values} values{}",
@@ -2069,8 +2127,14 @@ fn check_lengths(series: Option<&[u32]>, one: u32, ts: &[i64], values: usize) ->
             series.map_or(String::new(), |s| format!(", {} series", s.len()))
         )));
     }
-    if series.is_none() && one == MANY_SERIES {
-        return Err(Error::InvalidArgument(format!("series id {one} is reserved")));
+    match series {
+        Some(s) => wire_ids(s)?,
+        None => {
+            if one == MANY_SERIES as u64 {
+                return Err(Error::InvalidArgument(format!("series id {one} is reserved")));
+            }
+            wire_id(one)?;
+        }
     }
     Ok(())
 }

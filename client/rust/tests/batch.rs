@@ -14,19 +14,19 @@ use tsdb_client::{
     AggQuery, Bucket, Client, Db, Error, InsertBatch, Options, Pool, QueryOpts, RangeQuery, Status, Target, ValueType,
 };
 
-const SERIES: u32 = 24;
+const SERIES: u64 = 24;
 const ROWS: i64 = 5000;
 
-fn rows(s: u32) -> (Vec<i64>, Vec<f32>) {
-    let ts = (0..ROWS).map(|i| T0 + i * 1000 + i64::from(s)).collect();
-    let v = (0..ROWS).map(|i| (i * i64::from(s + 1) % 977) as f32 * 0.5).collect();
+fn rows(s: u64) -> (Vec<i64>, Vec<f32>) {
+    let ts = (0..ROWS).map(|i| T0 + i * 1000 + s as i64).collect();
+    let v = (0..ROWS).map(|i| (i * (s as i64 + 1) % 977) as f32 * 0.5).collect();
     (ts, v)
 }
 
 /// A query per series, some over part of the range, one empty, one twice.
 fn queries() -> Vec<RangeQuery> {
     let mut q: Vec<RangeQuery> =
-        (0..SERIES).map(|s| RangeQuery::new(s, T0 + i64::from(s) * 77_000, T0 + 4_000_000)).collect();
+        (0..SERIES).map(|s| RangeQuery::new(s, T0 + s as i64 * 77_000, T0 + 4_000_000)).collect();
     q.push(RangeQuery::new(3, i64::MIN, i64::MAX));
     q.push(RangeQuery::new(5, T0 - 10, T0 - 5));
     q.push(RangeQuery::new(3, i64::MIN, i64::MAX));
@@ -38,14 +38,14 @@ fn data() -> Vec<(Vec<i64>, Vec<f32>)> {
 }
 
 /// Half the series one insert each, the other half in one insert of a series column.
-fn batches<'a>(d: &'a [(Vec<i64>, Vec<f32>)], each: &'a (Vec<u32>, Vec<i64>, Vec<f32>)) -> Vec<InsertBatch<'a>> {
+fn batches<'a>(d: &'a [(Vec<i64>, Vec<f32>)], each: &'a (Vec<u64>, Vec<i64>, Vec<f32>)) -> Vec<InsertBatch<'a>> {
     let mut b: Vec<InsertBatch> =
         (0..SERIES / 2).map(|s| InsertBatch::series(s, &d[s as usize].0, &d[s as usize].1)).collect();
     b.push(InsertBatch::each(&each.0, &each.1, &each.2));
     b
 }
 
-fn each_column(d: &[(Vec<i64>, Vec<f32>)]) -> (Vec<u32>, Vec<i64>, Vec<f32>) {
+fn each_column(d: &[(Vec<i64>, Vec<f32>)]) -> (Vec<u64>, Vec<i64>, Vec<f32>) {
     let mut c = (Vec::new(), Vec::new(), Vec::new());
     for s in SERIES / 2..SERIES {
         let (ts, v) = &d[s as usize];
@@ -243,19 +243,19 @@ fn inserts_into_one_series_keep_their_list_order() {
     }
     let ts = [T0];
     let vals: Vec<[f32; 1]> = (0..64).map(|k| [k as f32]).collect();
-    let both = [0u32, 1];
+    let both = [0u64, 1];
     let each_ts = [T0, T0];
     let each_v = [100f32, 101.0];
     for round in 0..50 {
         // 64 batches writing one row of series 0, 1 or 2 in turn; one more writes series 0 and 1
         // through a column of ids, which ties their chains together
         let mut b: Vec<InsertBatch<'_>> =
-            (0..64).map(|k| InsertBatch::series(k as u32 % 3, &ts, &vals[k][..])).collect();
+            (0..64).map(|k| InsertBatch::series(k as u64 % 3, &ts, &vals[k][..])).collect();
         if round % 2 == 1 {
             b.insert(40, InsertBatch::each(&both, &each_ts, &each_v[..]));
         }
         db.insert_many(&b).unwrap();
-        let last = |s: u32| db.query_points(s, T0..T0 + 1, QueryOpts::asc()).unwrap().values[0];
+        let last = |s: u64| db.query_points(s, T0..T0 + 1, QueryOpts::asc()).unwrap().values[0];
         // the last batch of each series in the list wins (63, 61, 62: k % 3)
         assert_eq!((last(0), last(1), last(2)), (63.0, 61.0, 62.0), "round {round}");
     }

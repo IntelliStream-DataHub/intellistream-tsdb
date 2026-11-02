@@ -257,7 +257,7 @@ static uint64_t load_kind(int kind, int classes, int *cls_out, size_t nrows)
     classes_off = !classes;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     ds_state s;
     ds_init(&s, (ds_kind)kind, 0, T0);
@@ -331,7 +331,7 @@ static void test_live(void)
     o.merge_threads = 1;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t a, b, c, d;
+    tsdb_sid a, b, c, d;
     OK(tsdb_series(db, "slow", &a));       /* 1/min by appends: moves to class 3 after an idle merge */
     OK(tsdb_series(db, "near0", &b));      /* 60,000 rows a day: below class 0's target, inside its band */
     OK(tsdb_series(db, "near1", &c));      /* class 2 from a bulk insert, then 10,800 a day: inside its band */
@@ -497,7 +497,7 @@ static void test_overlap(int seed)
     o.merge_threads = 1;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id, other;
+    tsdb_sid id, other;
     OK(tsdb_series(db, "e", &id));
     OK(tsdb_series(db, "f", &other));
     grid g, h;
@@ -608,7 +608,7 @@ static void test_wal_guard(void)
     if (pid == 0) {
         tsdb *db;
         OK(tsdb_open(dir, &o, &db));
-        uint32_t id, x;
+        tsdb_sid id, x;
         OK(tsdb_series(db, "w", &id));
         OK(tsdb_series(db, "x", &x));
         for (int i = 0; i < 10; i++)
@@ -666,7 +666,7 @@ static void test_wal_guard(void)
     CK(revived == 1, "%d WAL segments brought back", revived);
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_lookup(db, "w", &id));
     tsdb_points p = {0};
     OK(tsdb_query_points(db, id, D - 3 * DAY, D + 3 * DAY, &p));
@@ -690,7 +690,7 @@ static void test_damage(void)
     tsdb_options_init(&o);
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "g", &id));
     int64_t t1 = T0 + DAY, t2 = T0 + 2 * DAY;
     OK(tsdb_test_class_switch(db, id, 2, &t1));
@@ -741,7 +741,7 @@ static void test_retention(void)
     o.merge_idle_s = -1;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t h, y;
+    tsdb_sid h, y;
     OK(tsdb_series(db, "month", &h));
     OK(tsdb_series(db, "years", &y));
     OK(tsdb_set_retention(db, h, 30 * DAY));
@@ -819,7 +819,7 @@ static void test_format(void)
     o.partition_classes = 0;
     o.merge_threads = 0;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "x", &id));
     grid g;
     grid_init(&g, id, T0, 60000, 3 * 1440);
@@ -861,7 +861,7 @@ static void test_fresh(void)
     o.fsync = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "fresh", &id));
     grid g;
     grid_init(&g, id, 1700000000000 / DAY * DAY, 600000, 2000); /* one row in 10 minutes, 14 days */
@@ -912,14 +912,14 @@ static void test_midplace(int how) /* 0: tsdb_insert_series, 1: tsdb_insert, 2: 
     o.partition_ms = 2000, o.granule_rows = 512, o.merge_threads = 0, o.wal_max_batch_rows = 500;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series(db, "s", &s));
     int64_t a8 = MP_T0 + 8000, a12 = MP_T0 + 12000, a24 = MP_T0 + 24000;
     OK(tsdb_test_class_switch(db, s, 2, &a8));
     OK(tsdb_test_class_switch(db, s, 1, &a12));
     static int64_t ts[6000];
     static float v[6000];
-    static uint32_t ids[6000];
+    static tsdb_sid ids[6000];
     size_t n = 0;
     for (int64_t t = 0; t <= 24010; t += 5)
         ts[n] = MP_T0 + t, v[n] = 1, ids[n] = s, n++;
@@ -961,7 +961,7 @@ static void on_day_part(void *c, const tsdb_part_info *in)
         day_rows[in->cls] += (int)in->rows;
 }
 
-static void fast_day(tsdb *db, uint32_t c, int day)
+static void fast_day(tsdb *db, tsdb_sid c, int day)
 {
     for (int i = 0; i < 5000; i++)
         OK(tsdb_append(db, c, T0 + day * DAY + 3600000 + i * 10LL, (float)i));
@@ -992,7 +992,7 @@ static void test_far(int own)
     o.merge_threads = 0, o.flush_interval_ms = 3600000, o.wal_max_batch_rows = 1000; /* the load: parts */
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t a, c;
+    tsdb_sid a, c;
     OK(tsdb_series(db, "a", &a));
     OK(tsdb_series(db, "c", &c));
     size_t n = 30 * 1440;
@@ -1047,7 +1047,7 @@ static void test_wtail(int fsync_on)
     o.merge_threads = 0, o.flush_interval_ms = 3600000, o.fsync = fsync_on;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "w", &id));
     size_t nt = 0, most = 0;
     uint64_t removed = 0, synced = 0;
@@ -1079,7 +1079,7 @@ static void test_open_check(void)
     o.merge_threads = 0, o.wal_max_batch_rows = 16; /* straight to parts: the load decides the class */
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "g", &id));
     grid g;
     grid_init(&g, id, T0, 60000, 10 * 1440);
@@ -1123,7 +1123,7 @@ static void test_comeback(void)
     o.merge_threads = 0, o.wal_max_batch_rows = 16;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "back", &id));
     grid g;
     grid_init(&g, id, T0, 600000, 8 * 144); /* every 10 minutes: the longest class */
@@ -1162,7 +1162,7 @@ static void test_comeback(void)
             continue;
         from = gts(&g, 720 + 24);
         memcpy(rec + 8, &from, 8);
-        uint32_t c = (uint32_t)xxh64(rec + 4, 20, (uint64_t)off);
+        tsdb_sid c = (uint32_t)xxh64(rec + 4, 20, (uint64_t)off);
         memcpy(rec, &c, 4);
         moved = pwrite(fd, rec, 24, off) == 24;
     }
@@ -1244,7 +1244,7 @@ static void dc_make(dc_data *d, int k)
     }
 }
 
-static void dc_put(tsdb *db, uint32_t id, int k, const dc_data *d, size_t a, size_t b, size_t batch)
+static void dc_put(tsdb *db, tsdb_sid id, int k, const dc_data *d, size_t a, size_t b, size_t batch)
 {
     for (size_t i = a; i < b; i += batch) { /* a and batch are multiples of 8: the bitmap starts at a byte */
         size_t m = b - i < batch ? b - i : batch;
@@ -1371,7 +1371,7 @@ static void dc_answers(tsdb *db, uint32_t id, int64_t lo, int64_t hi, const int6
 }
 
 /* the answers of on and off agree for whole ranges, whole days and random windows of every series */
-static void dc_compare(tsdb *on, tsdb *off, const uint32_t *ids_on, const uint32_t *ids_off, int round,
+static void dc_compare(tsdb *on, tsdb *off, const tsdb_sid *ids_on, const tsdb_sid *ids_off, int round,
                        const dc_data *d, const char *what)
 {
     for (size_t k = 0; k < DC_N; k++) {
@@ -1400,7 +1400,7 @@ static void dc_compare(tsdb *on, tsdb *off, const uint32_t *ids_on, const uint32
 }
 
 /* day buckets over whole days come from granule statistics alone */
-static void dc_stats(tsdb *db, const uint32_t *ids, const dc_data *d, int round, const char *what)
+static void dc_stats(tsdb *db, const tsdb_sid *ids, const dc_data *d, int round, const char *what)
 {
     for (size_t k = 0; k < DC_N; k++) {
         size_t n = dc_loaded(k, round);
@@ -1435,7 +1435,7 @@ static void test_daycut(void)
     dir_of(don, sizeof don, "daycut-on");
     dir_of(doff, sizeof doff, "daycut-off");
     dc_data d[DC_N];
-    uint32_t ion[DC_N], ioff[DC_N];
+    tsdb_sid ion[DC_N], ioff[DC_N];
     for (size_t k = 0; k < DC_N; k++)
         dc_make(&d[k], (int)k);
     tsdb *on = dc_open(don, 1), *off = dc_open(doff, 0);
@@ -1448,7 +1448,7 @@ static void test_daycut(void)
     for (int round = 1; round <= 2; round++) {
         for (int x = 0; x < 2; x++) {
             tsdb *db = x ? off : on;
-            const uint32_t *ids = x ? ioff : ion;
+            const tsdb_sid *ids = x ? ioff : ion;
             for (size_t k = 0; k < DC_N; k++) {
                 size_t n = dc_specs[k].n, a = n * 3 / 5 & ~(size_t)7, b = dc_loaded(k, 1);
                 if (round == 1) {
@@ -1557,7 +1557,7 @@ static void test_stall(void)
     o.merge_idle_s = -1;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t a, b, c;
+    tsdb_sid a, b, c;
     OK(tsdb_series(db, "a", &a));
     OK(tsdb_series(db, "b", &b));
     OK(tsdb_series(db, "c", &c));

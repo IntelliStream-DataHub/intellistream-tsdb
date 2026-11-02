@@ -272,7 +272,7 @@ typedef struct exporter {
     uint32_t seq;      /* records written */
     buf rec, raw;      /* a record payload, a chunk before compression */
     /* the chunk being filled */
-    uint32_t series;
+    tsdb_sid series;
     tsdb_type type;
     size_t n;
     int64_t *ts;
@@ -285,6 +285,12 @@ typedef struct exporter {
     uint64_t s_rows, s_nulls, t_rows, t_series, bytes;
     uint32_t s_chunks;
     bool failed;
+    /* what ex_series needs, called by tsdb_series_foreach */
+    char **pat;
+    int npat;
+    const char *root;
+    int64_t from, to;
+    int rc;
 } exporter;
 
 static void ex_write(exporter *x, const void *p, size_t n)
@@ -353,11 +359,11 @@ static int ex_states(exporter *x)
         }
         const char *name = tsdb_state_name(x->db, x->series, code);
         if (!name) {
-            fprintf(stderr, "tsdb: export: series %u: state code %u has no name\n", x->series, code);
+            fprintf(stderr, "tsdb: export: series %" PRIu64 ": state code %u has no name\n", x->series, code);
             return TSDB_ERR_CORRUPT;
         }
         if (strlen(name) > DUMP_NAME_MAX) {
-            fprintf(stderr, "tsdb: export: series %u: state code %u has a name longer than the format allows\n",
+            fprintf(stderr, "tsdb: export: series %" PRIu64 ": state code %u has a name longer than the format allows\n",
                     x->series, code);
             return TSDB_ERR_INVALID;
         }
@@ -473,6 +479,55 @@ static void export_usage(void)
     fprintf(stderr, "usage: tsdb <dir> export [-o FILE] [--series PATTERN]... [--from TIME] [--to TIME] "
                     "[--zstd-level N] [--force]\n");
     exit(2);
+}
+
+/* One series of the export: its record, then its rows in chunks, then its end record. Returns non-zero to stop
+ * tsdb_series_foreach, with the error in x->rc (0 when the export stopped for x->failed). */
+static int ex_series(void *ctx, tsdb_sid id)
+{
+    exporter *x = ctx;
+    tsdb *db = x->db;
+    if (x->failed)
+        return 1;
+    int rc = 0;
+    const char *name = tsdb_series_name(db, id), *path = tsdb_series_path(db, id);
+    if (!name || !matches(name, x->pat, x->npat))
+        return 0;
+    if (strlen(name) > DUMP_NAME_MAX || (path && strlen(path) > DUMP_NAME_MAX)) {
+        fprintf(stderr, "tsdb: export: series %" PRIu64 ": its name or volume path is longer than the format allows\n",
+                id);
+        return x->rc = TSDB_ERR_INVALID;
+    }
+    int64_t keep = 0;
+    if ((rc = tsdb_series_type(db, id, &x->type)) != 0 || (rc = tsdb_get_retention(db, id, &keep)) != 0)
+        return x->rc = rc;
+    buf *p = &x->rec;
+    p->n = 0;
+    put_str32(p, name);
+    put_str32(p, path && x->root && strcmp(path, x->root) != 0 ? path : ""); /* "": the database directory */
+    put_u8(p, (uint8_t)x->type);
+    put_u64(p, (uint64_t)keep);
+    ex_record(x, REC_SERIES, p);
+    x->series = id;
+    x->n = 0;
+    x->nulls = false;
+    x->s_rows = x->s_nulls = 0;
+    x->s_chunks = 0;
+    if (x->named)
+        memset(x->named, 0, x->named_cap / 8);
+    rc = tsdb_query_values(db, id, x->from, x->to, NULL, ex_rows, x);
+    if (!rc)
+        rc = ex_chunk(x);
+    if (rc)
+        return x->rc = rc;
+    p->n = 0;
+    put_u64(p, x->s_rows);
+    put_u64(p, x->s_nulls);
+    put_u32(p, x->s_chunks);
+    ex_record(x, REC_END, p);
+    x->t_rows += x->s_rows;
+    x->t_series++;
+    return x->failed;
 }
 
 int dump_export_main(const char *dir, int argc, char **argv)
@@ -601,47 +656,13 @@ int dump_export_main(const char *dir, int argc, char **argv)
     put_u32(&h, crc32c(0, h.p, h.n));
     ex_write(&x, h.p, h.n);
 
-    uint32_t count = tsdb_series_count(db);
-    const char *root = tsdb_volume_path(db, 0);
-    for (uint32_t id = 0; id < count && !rc && !x.failed; id++) {
-        const char *name = tsdb_series_name(db, id), *path = tsdb_series_path(db, id);
-        if (!name || !matches(name, pat, npat))
-            continue;
-        if (strlen(name) > DUMP_NAME_MAX || (path && strlen(path) > DUMP_NAME_MAX)) {
-            fprintf(stderr, "tsdb: export: series %u: its name or volume path is longer than the format allows\n", id);
-            rc = TSDB_ERR_INVALID;
-            break;
-        }
-        int64_t keep = 0;
-        if ((rc = tsdb_series_type(db, id, &x.type)) != 0 || (rc = tsdb_get_retention(db, id, &keep)) != 0)
-            break;
-        buf *p = &x.rec;
-        p->n = 0;
-        put_str32(p, name);
-        put_str32(p, path && root && strcmp(path, root) != 0 ? path : ""); /* "": the database directory */
-        put_u8(p, (uint8_t)x.type);
-        put_u64(p, (uint64_t)keep);
-        ex_record(&x, REC_SERIES, p);
-        x.series = id;
-        x.n = 0;
-        x.nulls = false;
-        x.s_rows = x.s_nulls = 0;
-        x.s_chunks = 0;
-        if (x.named)
-            memset(x.named, 0, x.named_cap / 8);
-        rc = tsdb_query_values(db, id, from, to, NULL, ex_rows, &x);
-        if (!rc)
-            rc = ex_chunk(&x);
-        if (rc)
-            break;
-        p->n = 0;
-        put_u64(p, x.s_rows);
-        put_u64(p, x.s_nulls);
-        put_u32(p, x.s_chunks);
-        ex_record(&x, REC_END, p);
-        x.t_rows += x.s_rows;
-        x.t_series++;
-    }
+    x.pat = pat;
+    x.npat = npat;
+    x.root = tsdb_volume_path(db, 0);
+    x.from = from;
+    x.to = to;
+    tsdb_series_foreach(db, ex_series, &x); /* stops at the first series that fails or when the output did */
+    rc = x.rc;
     if (!rc && !x.failed) {
         buf *p = &x.rec;
         p->n = 0;
@@ -774,7 +795,7 @@ typedef struct importer {
     char vpath[PATH_MAX]; /* its volume in the target */
     tsdb_type type;
     int64_t retention, keep; /* the stream's; the one that will apply in the target (0: none) */
-    uint32_t id;             /* in the target, when apply */
+    tsdb_sid id;             /* in the target, when apply */
     bool skip;               /* existing, --skip-existing */
     bool created;            /* by this import */
     bool replacing, deleted; /* existing, --replace; its range deleted already (it did not fit one batch) */
@@ -792,7 +813,7 @@ typedef struct importer {
     /* the batch: rows of whole series of one type, then from cur0 those of the series being read */
     size_t n, cur0;
     tsdb_type btype;
-    uint32_t *sid;
+    tsdb_sid *sid;
     int64_t *ts;
     uint8_t *val;
     uint8_t *valid;
@@ -1325,7 +1346,7 @@ static int im_series(importer *im, cur *c)
     if (!im->db)
         return im_volume(im, name);
 
-    uint32_t id;
+    tsdb_sid id;
     int rc = tsdb_series_lookup(im->db, im->name, &id);
     if (rc == 0) {
         tsdb_type t;
@@ -2229,7 +2250,7 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
     size_t cap = im->batch_rows + DUMP_CHUNK_MAX;
     im->ts = malloc(cap * 8);
     im->val = malloc(cap * 8);
-    im->sid = malloc(cap * 4);
+    im->sid = malloc(cap * sizeof *im->sid);
     im->valid = malloc(cap / 8 + 1);
     if (!im->ts || !im->val || !im->sid || !im->valid || !im->zd) {
         fprintf(stderr, "tsdb: out of memory\n");

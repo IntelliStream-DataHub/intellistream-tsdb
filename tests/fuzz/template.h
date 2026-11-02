@@ -107,7 +107,7 @@ static inline void template_build(const char *root, bool parts, bool volume, sna
         fprintf(stderr, "fuzz: cannot create the template in %s\n", root);
         exit(1);
     }
-    uint32_t id[4];
+    tsdb_sid id[4];
     tsdb_series_create(db, "a", TSDB_FLOAT32, NULL, &id[0]);
     tsdb_series_create(db, "b", TSDB_FLOAT64, volume ? vol : NULL, &id[1]);
     tsdb_series_create(db, "c", TSDB_INT64, NULL, &id[2]);

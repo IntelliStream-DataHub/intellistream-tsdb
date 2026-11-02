@@ -48,7 +48,7 @@ static uint64_t points = 10000000, window = 100000;
 static ds_kind kind_of(uint32_t s) { return (ds_kind)(s % (DS_KINDS - 1)); } /* mixed: no random */
 
 /* Rows of series [s0, s0 + ns) for samples [i0, i0 + n), series by series. */
-static size_t gen(ds_state *st, uint32_t s0, uint32_t ns, uint64_t n, uint32_t *sv, int64_t *tv, float *vv)
+static size_t gen(ds_state *st, uint32_t s0, uint32_t ns, uint64_t n, tsdb_sid *sv, int64_t *tv, float *vv)
 {
     size_t k = 0;
     for (uint32_t s = 0; s < ns; s++)
@@ -76,7 +76,7 @@ static void *load_worker(void *arg)
 {
     tsdb *db = arg;
     size_t cap = (size_t)group_series * window;
-    uint32_t *sv = malloc(cap * sizeof *sv);
+    tsdb_sid *sv = malloc(cap * sizeof *sv);
     int64_t *tv = malloc(cap * sizeof *tv);
     float *vv = malloc(cap * sizeof *vv);
     ds_state *st = malloc(group_series * sizeof *st);
@@ -114,7 +114,7 @@ static int cmd_load(void)
     }
     for (uint32_t s = 0; s < nseries; s++) { /* ids are assigned in order, so series s gets id s */
         char name[64];
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", ds_info[kind_of(s)].name, s);
         if ((rc = tsdb_series(db, name, &id)) != 0 || id != s) {
             fprintf(stderr, "series %s: %s\n", name, rc ? tsdb_strerror(rc) : "unexpected id");
@@ -172,7 +172,7 @@ static int cmd_export(void)
     if (!s_to)
         s_to = nseries;
     size_t cap = (size_t)group_series * window;
-    uint32_t *sv = malloc(cap * sizeof *sv);
+    tsdb_sid *sv = malloc(cap * sizeof *sv);
     int64_t *tv = malloc(cap * sizeof *tv);
     float *vv = malloc(cap * sizeof *vv);
     char *buf = malloc(cap * 16);
@@ -184,7 +184,8 @@ static int cmd_export(void)
             uint64_t n = points - i0 < window ? points - i0 : window;
             size_t rows = gen(st, s0, ns, n, sv, tv, vv);
             for (size_t k = 0; k < rows; k++) {
-                memcpy(buf + k * 16, &sv[k], 4);
+                uint32_t id32 = (uint32_t)sv[k]; /* the row file keeps its 4-byte id */
+                memcpy(buf + k * 16, &id32, 4);
                 memcpy(buf + k * 16 + 4, &tv[k], 8);
                 memcpy(buf + k * 16 + 12, &vv[k], 4);
             }

@@ -66,15 +66,15 @@ def load(db, a, path):
     rows = np.fromfile(path, dtype=ROW)
     nseries = int(rows["s"].max()) + 1 if len(rows) else 0
     threads = max(1, min(a.threads, nseries))
+    # the file's series are indexes; the database hands out its own ids (not dense in general)
+    ids = np.array([db.series(f"{KINDS[kind_of(a.dataset, s)][0]}.{s}") for s in range(nseries)], dtype=np.uint64)
     batches = []
     for i in range(threads):
         lo, hi = nseries * i // threads, nseries * (i + 1) // threads
         mine = rows[(rows["s"] >= lo) & (rows["s"] < hi)]  # keeps the file's time-major order
         n = max(1, a.batch // (hi - lo)) * (hi - lo)
-        s, t, v = (np.ascontiguousarray(mine[f]) for f in ("s", "t", "v"))
+        s, t, v = np.ascontiguousarray(ids[mine["s"]]), np.ascontiguousarray(mine["t"]), np.ascontiguousarray(mine["v"])
         batches.append([(s[k : k + n], t[k : k + n], v[k : k + n]) for k in range(0, len(mine), n)])
-    for s in range(nseries):
-        db.series(f"{KINDS[kind_of(a.dataset, s)][0]}.{s}")
     print(
         f"bench_embedded_suite: {nseries} series, {len(rows) / 1e6:.1f} M rows from {path}, batch {a.batch} rows, "
         f"{threads} writer threads, zstd {a.zstd}, fsync {int(a.fsync)}, simd {tsdb_client.Db.simd_level()}\n"
@@ -113,7 +113,7 @@ def raw_rows(db, s, start, end):
     return len(v)
 
 
-def qps(db, series, points, step, seconds, label, agg, window, bucket, threads):
+def qps(db, ids, points, step, seconds, label, agg, window, bucket, threads):
     res = [None] * threads
 
     def loop(i):
@@ -123,8 +123,8 @@ def qps(db, series, points, step, seconds, label, agg, window, bucket, threads):
         while time.perf_counter() - t0 < seconds:
             for _ in range(64):
                 r = ds_mix(r)
-                s = r % series
-                st = step[s]
+                k = r % len(ids)
+                s, st = ids[k], step[k]
                 span = points - window if points > window else 1
                 start = T0 + ((r >> 20) % span) * st
                 end = start + window * st
@@ -150,8 +150,9 @@ def qps(db, series, points, step, seconds, label, agg, window, bucket, threads):
 
 
 def queries(db, seconds):
-    series = db.series_count()
-    step = [STEP[db.series_name(s).split(".")[0]] for s in range(series)]
+    ids = db.series_ids()
+    series = len(ids)
+    step = [STEP[db.series_name(s).split(".")[0]] for s in ids]
     st = db.stats()
     points = st.rows // series if series else 0
     total = series * points
@@ -161,7 +162,7 @@ def queries(db, seconds):
     )
 
     t0 = time.perf_counter()
-    rows = sum(raw_rows(db, s, None, None) for s in range(series))
+    rows = sum(raw_rows(db, s, None, None) for s in ids)
     tr = time.perf_counter() - t0
     print(f"raw scan, all series, 1 thread            {tr:8.3f} s  {rows / tr / 1e6:7.1f} M rows/s  ({rows} rows)")
 
@@ -174,8 +175,8 @@ def queries(db, seconds):
     ]:
         t0 = time.perf_counter()
         rows = buckets = 0
-        for s in range(series):
-            b = db.query_agg(s, None, None, bucket * step[s])
+        for s, st in zip(ids, step):
+            b = db.query_agg(s, None, None, bucket * st)
             rows += sum(x.count for x in b)
             buckets += len(b)
         ta = time.perf_counter() - t0
@@ -198,7 +199,7 @@ def queries(db, seconds):
         for _ in range(3):
             t0 = time.perf_counter()
             rows = buckets = 0
-            for s in range(series):
+            for s in ids:
                 b = db.query_group(s, unit=unit, count=count, timezone=zone)
                 rows += sum(x.count for x in b)
                 buckets += len(b)
@@ -215,7 +216,7 @@ def queries(db, seconds):
         if window == 604800 and points <= 7 * 86400:
             continue
         for threads in (1, n):
-            qps(db, series, points, step, seconds, label, agg, window, bucket, threads)
+            qps(db, ids, points, step, seconds, label, agg, window, bucket, threads)
 
 
 def main():

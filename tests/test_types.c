@@ -492,7 +492,7 @@ typedef struct row {
 } row;
 
 typedef struct series_ref {
-    uint32_t id;
+    tsdb_sid id;
     int type;
     row *rows;
     size_t n, cap;
@@ -783,7 +783,7 @@ static void test_engine(const char *base)
     check_all(db, refs, NTYPES, t0, "after optimize");
 
     /* type errors */
-    uint32_t id;
+    tsdb_sid id;
     CHECK(tsdb_series_create(db, "s.float64", TSDB_INT64, NULL, &id) == TSDB_ERR_INVALID);
     OK(tsdb_series_create(db, "s.float64", TSDB_FLOAT64, NULL, &id));
     CHECK(id == refs[TSDB_FLOAT64].id);
@@ -796,7 +796,7 @@ static void test_engine(const char *base)
     double d1 = 1;
     tsdb_values col = {TSDB_FLOAT64, &d1, NULL};
     CHECK(tsdb_insert_series_values(db, refs[TSDB_INT64].id, &ts1, &col, 1) == TSDB_ERR_INVALID);
-    uint32_t mixed[2] = {refs[TSDB_FLOAT64].id, refs[TSDB_INT64].id};
+    tsdb_sid mixed[2] = {refs[TSDB_FLOAT64].id, refs[TSDB_INT64].id};
     int64_t ts2[2] = {t0, t0};
     double d2[2] = {1, 2};
     col.values = d2;
@@ -815,7 +815,7 @@ static void test_engine(const char *base)
     CHECK(tsdb_state_name(db, refs[TSDB_STATE].id, 0) == NULL);
 
     /* exact integer sums, saturating, and a bucket of nulls only */
-    uint32_t big;
+    tsdb_sid big;
     OK(tsdb_series_create(db, "big", TSDB_INT64, NULL, &big));
     enum { NB = 2000 };
     int64_t bt[NB], bv[NB];
@@ -923,7 +923,7 @@ static void test_query_stats(const char *base)
     char dir[512];
     snprintf(dir, sizeof dir, "%s/types-stats-%d", base, (int)getpid());
     tsdb *db = open_db(dir); /* 256-row granules; batches of 1000+ rows become parts */
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_create(db, "s", TSDB_FLOAT64, NULL, &id));
     enum { N = 100000 };
     const int64_t t0 = 1700000000000;
@@ -1085,7 +1085,7 @@ static size_t nan_check_buckets(const tsdb_bucket *b, size_t nb, size_t *nan_min
     return nan_sum;
 }
 
-static void nan_check(tsdb *db, const uint32_t *ids, uint64_t *const *refs, const char *when)
+static void nan_check(tsdb *db, const tsdb_sid *ids, uint64_t *const *refs, const char *when)
 {
     const int64_t t0 = 1700000000000, t1 = t0 + (int64_t)NAN_ROWS * NAN_STEP;
     for (int t = 0; t < 2; t++) {
@@ -1147,7 +1147,7 @@ static void test_nan_canonical(const char *base)
     o.query_threads = 8;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t ids[2];
+    tsdb_sid ids[2];
     uint64_t *refs[2];
     OK(tsdb_series_create(db, "nan.f32", TSDB_FLOAT32, NULL, &ids[0]));
     OK(tsdb_series_create(db, "nan.f64", TSDB_FLOAT64, NULL, &ids[1]));
@@ -1418,7 +1418,7 @@ static void test_value_codec_option(const char *base)
         o.wal_max_batch_rows = 100; /* straight to a part */
         tsdb *db;
         OK(tsdb_open(dir, &o, &db));
-        uint32_t id;
+        tsdb_sid id;
         OK(tsdb_series(db, "random", &id));
         enum { N = 10000 };
         int64_t ts[N];

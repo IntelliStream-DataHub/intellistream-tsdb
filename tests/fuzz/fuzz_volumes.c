@@ -59,7 +59,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         uint32_t n = tsdb_series_count(db);
         for (uint32_t id = 0; id < n && id < 64; id++) {
             const char *name = tsdb_series_name(db, id);
-            uint32_t got;
+            tsdb_sid got;
             if (name)
                 tsdb_series_lookup(db, name, &got);
             tsdb_bucket *b = NULL;

@@ -34,11 +34,11 @@
 /* Volume paths come from the client: keep them inside the scratch directory (the server's own checks of
  * them belong to the volume code and its tests). */
 static int fz_path_ok(const char *path) { return !path || (path[0] != '/' && !strstr(path, "..")); }
-static int fz_series_at(tsdb *d, const char *name, const char *path, uint32_t *id)
+static int fz_series_at(tsdb *d, const char *name, const char *path, tsdb_sid *id)
 {
     return fz_path_ok(path) ? tsdb_series_at(d, name, path, id) : TSDB_ERR_INVALID;
 }
-static int fz_series_create(tsdb *d, const char *name, tsdb_type t, const char *path, uint32_t *id)
+static int fz_series_create(tsdb *d, const char *name, tsdb_type t, const char *path, tsdb_sid *id)
 {
     return fz_path_ok(path) ? tsdb_series_create(d, name, t, path, id) : TSDB_ERR_INVALID;
 }
@@ -166,7 +166,7 @@ static void db_start(void)
     }
     static const char *names[] = {"f32", "f64", "i64", "bool", "state"};
     for (unsigned t = 0; t < 5; t++) {
-        uint32_t id;
+        tsdb_sid id;
         tsdb_series_create(db, names[t], (tsdb_type)t, NULL, &id);
     }
     uint32_t code;

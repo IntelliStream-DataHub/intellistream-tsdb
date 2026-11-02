@@ -69,7 +69,7 @@ static void writer(const char *dir, shared *sh)
         sh->writer_failed = 1;
         return;
     }
-    uint32_t id;
+    tsdb_sid id;
     char name[32];
     for (int s = 0; s < NS; s++) {
         snprintf(name, sizeof name, "sensor.%d", s);
@@ -189,7 +189,7 @@ static void test_typed_follow(const char *base)
         CHECK(!"open writer");
         return;
     }
-    uint32_t cnt, mode;
+    tsdb_sid cnt, mode;
     CHECK(tsdb_series_create(w, "typed.count", TSDB_INT64, NULL, &cnt) == 0);
     tsdb_options fo;
     tsdb_options_init(&fo);
@@ -230,7 +230,8 @@ static void test_typed_follow(const char *base)
         CHECK(tsdb_query_agg(f, cnt, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0);
         CHECK(nb == 1 && b[0].count == 90 && b[0].imax == iv[99]);
         free(b);
-        uint32_t fmode, fidle;
+        tsdb_sid fmode;
+        uint32_t fidle;
         CHECK(tsdb_series_lookup(f, "typed.mode", &fmode) == 0 && fmode == mode);
         CHECK(tsdb_state_lookup(f, fmode, "idle", &fidle) == 0 && fidle == idle);
         const char *name = tsdb_state_name(f, fmode, idle);
@@ -262,7 +263,7 @@ static void test_class_follow(const char *base)
     o.fsync = 0;
     o.merge_threads = 0;
     tsdb *w, *r = NULL, *r2 = NULL;
-    uint32_t id;
+    tsdb_sid id;
     if (tsdb_open(dir, &o, &w) != 0) {
         CHECK(!"open writer");
         return;
@@ -335,7 +336,7 @@ static void test_class_follow(const char *base)
 static void *republish(void *arg)
 {
     usleep(100000);
-    uint32_t other;
+    tsdb_sid other;
     CHECK(tsdb_series(arg, "other", &other) == 0 && tsdb_append(arg, other, T0, 1.0f) == 0 && tsdb_flush(arg) == 0);
     return NULL;
 }
@@ -355,7 +356,7 @@ static void test_stale_manifest_classes(const char *base)
     o.merge_threads = 0;
     o.wal_max_batch_rows = 16; /* the rows go straight to parts */
     tsdb *w, *r = NULL;
-    uint32_t id;
+    tsdb_sid id;
     if (tsdb_open(dir, &o, &w) != 0) {
         CHECK(!"open writer");
         return;
@@ -435,7 +436,7 @@ static void test_torn_manifest(const char *base)
     tsdb_options_init(&o);
     o.fsync = 0;
     tsdb *w, *r = NULL;
-    uint32_t id;
+    tsdb_sid id;
     if (tsdb_open(dir, &o, &w) != 0) {
         CHECK(!"open writer");
         return;
@@ -531,7 +532,7 @@ int main(int argc, char **argv)
             size_t rows = 0;
             double sum = 0;
             if (s == NS) {
-                uint32_t id;
+                tsdb_sid id;
                 if (tsdb_series_lookup(db, "sensor.late", &id) != 0 || id != NS) {
                     converged = false;
                     break;

@@ -27,6 +27,7 @@ use std::sync::Mutex;
 
 use tsdb_sys as sys;
 
+use crate::SeriesId;
 use crate::client::bounds;
 use crate::error::{Error, Result, Status};
 use crate::types::{
@@ -366,6 +367,20 @@ impl Drop for Db {
     }
 }
 
+/// The `TSDB_ABI_VERSION` this crate was written for. A struct can keep its size while its fields move
+/// (`tsdb_series_result` did when ids became 64 bits), so the engine's number is compared, not sizes.
+const ABI_VERSION: c_int = 1;
+
+fn check_abi(found: c_int) -> Result<()> {
+    if found != ABI_VERSION {
+        return Err(Error::Protocol(format!(
+            "the tsdb engine linked in has ABI version {found}; this tsdb_client was written for {ABI_VERSION} \
+             (use the tsdb-sys of the same release)"
+        )));
+    }
+    Ok(())
+}
+
 fn check(rc: c_int) -> Result<()> {
     if rc < 0 { Err(Error::Server(Status::from_code(rc))) } else { Ok(()) }
 }
@@ -393,7 +408,7 @@ fn c_str(p: *const c_char) -> Result<String> {
     Ok(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
 }
 
-fn check_lengths(series: Option<&[u32]>, ts: &[i64], values: usize) -> Result<()> {
+fn check_lengths(series: Option<&[SeriesId]>, ts: &[i64], values: usize) -> Result<()> {
     if ts.len() != values || series.is_some_and(|s| s.len() != ts.len()) {
         return Err(Error::InvalidArgument(format!(
             "column lengths differ: {} timestamps, {values} values{}",
@@ -620,9 +635,11 @@ impl Db {
     /// # Errors
     ///
     /// [`Status::Locked`] if another process or `Db` has it open for writing,
-    /// [`Status::Io`] or [`Status::Corrupt`] if it cannot be read.
+    /// [`Status::Io`] or [`Status::Corrupt`] if it cannot be read; [`Error::Protocol`] if the engine
+    /// linked in has another ABI version than this crate was written for (`tsdb_abi_version`).
     pub fn open(path: impl AsRef<Path>, opts: &Options) -> Result<Db> {
         use std::os::unix::ffi::OsStrExt;
+        check_abi(unsafe { sys::tsdb_abi_version() })?;
         let path = path.as_ref().to_path_buf();
         let c = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| Error::InvalidArgument("path contains a NUL byte".into()))?;
@@ -671,7 +688,7 @@ impl Db {
     /// # Errors
     ///
     /// [`Error::InvalidArgument`] for an empty name or one with a NUL byte.
-    pub fn series(&self, name: &str) -> Result<u32> {
+    pub fn series(&self, name: &str) -> Result<SeriesId> {
         let name = c_string("series name", name)?;
         let mut id = 0;
         check(unsafe { sys::tsdb_series(self.p(), name.as_ptr(), &mut id) })?;
@@ -679,7 +696,7 @@ impl Db {
     }
 
     /// The id of an existing series; [`Status::NotFound`] if there is none.
-    pub fn series_lookup(&self, name: &str) -> Result<u32> {
+    pub fn series_lookup(&self, name: &str) -> Result<SeriesId> {
         let name = c_string("series name", name)?;
         let mut id = 0;
         check(unsafe { sys::tsdb_series_lookup(self.p(), name.as_ptr(), &mut id) })?;
@@ -687,14 +704,14 @@ impl Db {
     }
 
     /// Like [`series`](Db::series), creating the series in volume `path` (a directory).
-    pub fn series_at(&self, name: &str, path: &str) -> Result<u32> {
+    pub fn series_at(&self, name: &str, path: &str) -> Result<SeriesId> {
         self.series_create(name, ValueType::Float32, Some(path))
     }
 
     /// The id of series `name` of type `ty`, created (in volume `path`, or the database
     /// directory) if it does not exist. An existing series keeps its type: asking for another
     /// is [`Status::Invalid`].
-    pub fn series_create(&self, name: &str, ty: ValueType, path: Option<&str>) -> Result<u32> {
+    pub fn series_create(&self, name: &str, ty: ValueType, path: Option<&str>) -> Result<SeriesId> {
         let name = c_string("series name", name)?;
         let path = path.map(|p| c_string("volume path", p)).transpose()?;
         let mut id = 0;
@@ -711,32 +728,45 @@ impl Db {
     }
 
     /// The value type of series `id`; [`Status::NotFound`] if there is none.
-    pub fn series_type(&self, id: u32) -> Result<ValueType> {
+    pub fn series_type(&self, id: SeriesId) -> Result<ValueType> {
         let mut ty = 0;
         check(unsafe { sys::tsdb_series_type(self.p(), id, &mut ty) })?;
         u8::try_from(ty).ok().and_then(ValueType::from_code).ok_or(Error::Server(Status::Corrupt))
     }
 
     /// The partition class of the newest rows of series `id`, 0 to 3 (see [`PartInfo::cls`]).
-    pub fn series_class(&self, id: u32) -> Result<i32> {
+    pub fn series_class(&self, id: SeriesId) -> Result<i32> {
         let mut c = 0;
         check(unsafe { sys::tsdb_series_class(self.p(), id, &mut c) })?;
         Ok(c)
     }
 
     /// The name of series `id`; [`Status::NotFound`] if there is none.
-    pub fn series_name(&self, id: u32) -> Result<String> {
+    pub fn series_name(&self, id: SeriesId) -> Result<String> {
         c_str(unsafe { sys::tsdb_series_name(self.p(), id) })
     }
 
     /// The volume (directory) series `id` is stored in; [`Status::NotFound`] if there is none.
-    pub fn series_path(&self, id: u32) -> Result<String> {
+    pub fn series_path(&self, id: SeriesId) -> Result<String> {
         c_str(unsafe { sys::tsdb_series_path(self.p(), id) })
     }
 
-    /// Number of series.
-    pub fn series_count(&self) -> u32 {
+    /// Number of series. Ids are not dense: list them with [`series_ids`](Db::series_ids), not
+    /// `0..series_count()`.
+    pub fn series_count(&self) -> u64 {
         unsafe { sys::tsdb_series_count(self.p()) }
+    }
+
+    /// The ids of every series: those of one volume in creation order, the volumes one after another
+    /// (`tsdb_series_foreach`).
+    pub fn series_ids(&self) -> Result<Vec<SeriesId>> {
+        unsafe extern "C" fn push(ctx: *mut c_void, id: sys::tsdb_sid) -> c_int {
+            unsafe { (*ctx.cast::<Vec<SeriesId>>()).push(id) };
+            0
+        }
+        let mut ids: Vec<SeriesId> = Vec::with_capacity(self.series_count().try_into().unwrap_or(0));
+        check(unsafe { sys::tsdb_series_foreach(self.p(), Some(push), (&raw mut ids).cast()) })?;
+        Ok(ids)
     }
 
     /// The directories of the volumes: the database directory first.
@@ -746,7 +776,7 @@ impl Db {
     }
 
     /// The code of state `name` for state series `series`, created if needed.
-    pub fn state(&self, series: u32, name: &str) -> Result<u32> {
+    pub fn state(&self, series: SeriesId, name: &str) -> Result<u32> {
         let name = c_string("state name", name)?;
         let mut code = 0;
         check(unsafe { sys::tsdb_state(self.p(), series, name.as_ptr(), &mut code) })?;
@@ -754,7 +784,7 @@ impl Db {
     }
 
     /// The code of an existing state; [`Status::NotFound`] if there is none.
-    pub fn state_lookup(&self, series: u32, name: &str) -> Result<u32> {
+    pub fn state_lookup(&self, series: SeriesId, name: &str) -> Result<u32> {
         let name = c_string("state name", name)?;
         let mut code = 0;
         check(unsafe { sys::tsdb_state_lookup(self.p(), series, name.as_ptr(), &mut code) })?;
@@ -762,7 +792,7 @@ impl Db {
     }
 
     /// The name of state `code`; [`Status::NotFound`] for an unknown code.
-    pub fn state_name(&self, series: u32, code: u32) -> Result<String> {
+    pub fn state_name(&self, series: SeriesId, code: u32) -> Result<String> {
         c_str(unsafe { sys::tsdb_state_name(self.p(), series, code) })
     }
 
@@ -775,13 +805,13 @@ impl Db {
     ///
     /// [`Error::InvalidArgument`] if the slices differ in length; [`Status::Invalid`] if the
     /// series is not float32.
-    pub fn insert_series(&self, series: u32, ts: &[i64], values: &[Value]) -> Result<()> {
+    pub fn insert_series(&self, series: SeriesId, ts: &[i64], values: &[Value]) -> Result<()> {
         check_lengths(None, ts, values.len())?;
         check(unsafe { sys::tsdb_insert_series(self.p(), series, ts.as_ptr(), values.as_ptr(), ts.len()) })
     }
 
     /// Inserts rows of several float32 series: row i goes to `series[i]`.
-    pub fn insert(&self, series: &[u32], ts: &[i64], values: &[Value]) -> Result<()> {
+    pub fn insert(&self, series: &[SeriesId], ts: &[i64], values: &[Value]) -> Result<()> {
         check_lengths(Some(series), ts, values.len())?;
         check(unsafe { sys::tsdb_insert(self.p(), series.as_ptr(), ts.as_ptr(), values.as_ptr(), ts.len()) })
     }
@@ -793,14 +823,19 @@ impl Db {
     ///
     /// [`Error::InvalidArgument`] if the lengths differ; [`Status::Invalid`] if the series has
     /// another type.
-    pub fn insert_series_values<'a>(&self, series: u32, ts: &[i64], values: impl Into<ColumnRef<'a>>) -> Result<()> {
+    pub fn insert_series_values<'a>(
+        &self,
+        series: SeriesId,
+        ts: &[i64],
+        values: impl Into<ColumnRef<'a>>,
+    ) -> Result<()> {
         let col = values.into();
         let c = c_values(&col, ts)?;
         check(unsafe { sys::tsdb_insert_series_values(self.p(), series, ts.as_ptr(), &c, ts.len()) })
     }
 
     /// Inserts typed values into several series of the column's type: row i goes to `series[i]`.
-    pub fn insert_values<'a>(&self, series: &[u32], ts: &[i64], values: impl Into<ColumnRef<'a>>) -> Result<()> {
+    pub fn insert_values<'a>(&self, series: &[SeriesId], ts: &[i64], values: impl Into<ColumnRef<'a>>) -> Result<()> {
         let col = values.into();
         check_lengths(Some(series), ts, col.len())?;
         let c = c_values(&col, ts)?;
@@ -809,7 +844,7 @@ impl Db {
 
     /// One float32 point through the WAL and memtable: visible at once, durable per
     /// [`Options::wal_sync_ms`].
-    pub fn append(&self, series: u32, ts: i64, value: Value) -> Result<()> {
+    pub fn append(&self, series: SeriesId, ts: i64, value: Value) -> Result<()> {
         check(unsafe { sys::tsdb_append(self.p(), series, ts, value) })
     }
 
@@ -820,7 +855,7 @@ impl Db {
     /// # Errors
     ///
     /// [`Status::Invalid`] if the series is not float32 (use [`query_rows`](Db::query_rows)).
-    pub fn query_points(&self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Points> {
+    pub fn query_points(&self, series: SeriesId, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Points> {
         let mut p = Points::default();
         self.query_raw(series, range, opts, |ts, v| {
             p.ts.extend_from_slice(ts);
@@ -833,7 +868,7 @@ impl Db {
     /// Streams the rows of float32 `series` in `range` to `f`, a chunk at a time, straight from
     /// the engine's buffers. Return [`ControlFlow::Break`] to stop early. A panic in `f` stops
     /// the query and continues once the engine has returned.
-    pub fn query_raw<F>(&self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts, f: F) -> Result<()>
+    pub fn query_raw<F>(&self, series: SeriesId, range: impl RangeBounds<i64>, opts: QueryOpts, f: F) -> Result<()>
     where
         F: FnMut(&[i64], &[Value]) -> ControlFlow<()>,
     {
@@ -848,7 +883,7 @@ impl Db {
     }
 
     /// The rows of `series` (any type, with nulls) in `range`.
-    pub fn query_rows(&self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Rows> {
+    pub fn query_rows(&self, series: SeriesId, range: impl RangeBounds<i64>, opts: QueryOpts) -> Result<Rows> {
         let mut rows: Option<Rows> = None;
         self.query_chunks(series, range, opts, |ts, chunk| {
             let r = rows.get_or_insert_with(|| Rows { ts: Vec::new(), values: Column::empty(chunk.value_type()) });
@@ -872,7 +907,13 @@ impl Db {
     /// [`Client::query_values`](crate::Client::query_values); the column is reused between
     /// chunks and has a validity bitmap only if the chunk has nulls. [`query_chunks`](Db::query_chunks)
     /// avoids the copy into the column.
-    pub fn query_values<F>(&self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts, mut f: F) -> Result<()>
+    pub fn query_values<F>(
+        &self,
+        series: SeriesId,
+        range: impl RangeBounds<i64>,
+        opts: QueryOpts,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(&[i64], &Column) -> ControlFlow<()>,
     {
@@ -893,7 +934,7 @@ impl Db {
 
     /// Streams the rows of `series` (any type, with nulls) to `f` as they lie in the engine's
     /// buffers: no copy. The fastest way to read; the borrowed chunk cannot outlive the call.
-    pub fn query_chunks<F>(&self, series: u32, range: impl RangeBounds<i64>, opts: QueryOpts, f: F) -> Result<()>
+    pub fn query_chunks<F>(&self, series: SeriesId, range: impl RangeBounds<i64>, opts: QueryOpts, f: F) -> Result<()>
     where
         F: FnMut(&[i64], ChunkRef<'_>) -> ControlFlow<()>,
     {
@@ -909,7 +950,7 @@ impl Db {
 
     /// Aggregates `series` over `range` into buckets of `interval_ms`, aligned to the epoch;
     /// 0 gives one bucket. Only non-empty buckets, oldest first.
-    pub fn query_agg(&self, series: u32, range: impl RangeBounds<i64>, interval_ms: i64) -> Result<Vec<Bucket>> {
+    pub fn query_agg(&self, series: SeriesId, range: impl RangeBounds<i64>, interval_ms: i64) -> Result<Vec<Bucket>> {
         let (start, end) = bounds(&range);
         let r = buckets(|out, n| unsafe { sys::tsdb_query_agg(self.p(), series, start, end, interval_ms, out, n) });
         self.record();
@@ -926,7 +967,7 @@ impl Db {
     /// holds too many buckets.
     pub fn query_group(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         group: Option<&Group>,
         opts: QueryOpts,
@@ -957,7 +998,7 @@ impl Db {
     /// [`Error::InvalidArgument`] if `bounds` is empty or does not strictly increase.
     pub fn query_bounds(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         bounds: &[i64],
         opts: QueryOpts,
@@ -975,7 +1016,7 @@ impl Db {
     /// As [`query_agg`](Db::query_agg), in `opts.order` and at most `opts.limit` buckets.
     pub fn query_agg_ex(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         interval_ms: i64,
         opts: QueryOpts,
@@ -995,7 +1036,7 @@ impl Db {
     /// [`Client::query_spread`](crate::Client::query_spread).
     pub fn query_spread(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         interval_ms: i64,
         opts: QueryOpts,
@@ -1016,7 +1057,7 @@ impl Db {
     /// The spread by calendar periods, as [`query_group`](Db::query_group).
     pub fn query_spread_group(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         group: Option<&Group>,
         opts: QueryOpts,
@@ -1041,7 +1082,7 @@ impl Db {
     /// The spread in buckets with the given bounds, as [`query_bounds`](Db::query_bounds).
     pub fn query_spread_bounds(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         bounds: &[i64],
         opts: QueryOpts,
@@ -1063,7 +1104,7 @@ impl Db {
     /// [`Client::query_twa`](crate::Client::query_twa).
     pub fn query_twa(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         interval_ms: i64,
         opts: TwaOpts,
@@ -1084,7 +1125,7 @@ impl Db {
     /// Time-weighted averages by calendar periods (`None`: one bucket), in any time zone.
     pub fn query_twa_group(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         group: Option<&Group>,
         opts: TwaOpts,
@@ -1109,7 +1150,7 @@ impl Db {
     /// Time-weighted averages in buckets with the given bounds.
     pub fn query_twa_bounds(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         bounds: &[i64],
         opts: TwaOpts,
@@ -1131,7 +1172,7 @@ impl Db {
     /// first or cut to a limit with `opts`, as [`Client::query_lttb`](crate::Client::query_lttb).
     pub fn query_lttb(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         threshold: u64,
         opts: QueryOpts,
@@ -1163,7 +1204,7 @@ impl Db {
 
     fn lttb_chunks<F>(
         &self,
-        series: u32,
+        series: SeriesId,
         start: i64,
         end: i64,
         threshold: usize,
@@ -1193,7 +1234,7 @@ impl Db {
     // ------------------------------------------------ deletes and retention
 
     /// Deletes the rows of a series in `range`, as [`Client::delete_range`](crate::Client::delete_range).
-    pub fn delete_range(&self, series: u32, range: impl RangeBounds<i64>) -> Result<()> {
+    pub fn delete_range(&self, series: SeriesId, range: impl RangeBounds<i64>) -> Result<()> {
         let (start, end) = bounds(&range);
         check(unsafe { sys::tsdb_delete_range(self.p(), series, start, end) })
     }
@@ -1202,7 +1243,7 @@ impl Db {
     /// in the range. As [`Client::replace_range`](crate::Client::replace_range).
     pub fn replace_range<'a>(
         &self,
-        series: u32,
+        series: SeriesId,
         range: impl RangeBounds<i64>,
         ts: &[i64],
         values: impl Into<ColumnRef<'a>>,
@@ -1214,12 +1255,12 @@ impl Db {
     }
 
     /// Sets how long a series keeps its values (0: for ever), durably.
-    pub fn set_retention(&self, series: u32, limit_ms: i64) -> Result<()> {
+    pub fn set_retention(&self, series: SeriesId, limit_ms: i64) -> Result<()> {
         check(unsafe { sys::tsdb_set_retention(self.p(), series, limit_ms) })
     }
 
     /// A series' retention limit in ms (0: none).
-    pub fn retention(&self, series: u32) -> Result<i64> {
+    pub fn retention(&self, series: SeriesId) -> Result<i64> {
         let mut v = 0i64;
         check(unsafe { sys::tsdb_get_retention(self.p(), series, &mut v) })?;
         Ok(v)
@@ -1335,4 +1376,18 @@ fn c_values(col: &ColumnRef<'_>, ts: &[i64]) -> Result<sys::tsdb_values> {
         ValuesRef::State(v) => (sys::TSDB_STATE, v.as_ptr().cast()),
     };
     Ok(sys::tsdb_values { type_, values, valid })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn another_abi_is_refused() {
+        assert!(check_abi(unsafe { sys::tsdb_abi_version() }).is_ok());
+        for v in [0, ABI_VERSION + 1] {
+            let e = check_abi(v).unwrap_err();
+            assert!(matches!(e, Error::Protocol(ref m) if m.contains("ABI version")), "{e}");
+        }
+    }
 }

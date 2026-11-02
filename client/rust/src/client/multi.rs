@@ -57,7 +57,7 @@ pub(super) trait BucketRow: Sized {
     const KIND: Kind;
     fn parse(b: &[u8]) -> Result<Vec<Self>>;
     /// The single call for one series (calendar periods only).
-    fn single(c: &mut Client, series: u32, start: i64, end: i64, g: &Group, q: &MultiQ<'_>) -> Result<Vec<Self>>;
+    fn single(c: &mut Client, series: SeriesId, start: i64, end: i64, g: &Group, q: &MultiQ<'_>) -> Result<Vec<Self>>;
 }
 
 impl BucketRow for Bucket {
@@ -65,7 +65,7 @@ impl BucketRow for Bucket {
     fn parse(b: &[u8]) -> Result<Vec<Self>> {
         parse_buckets(b)
     }
-    fn single(c: &mut Client, series: u32, start: i64, end: i64, g: &Group, q: &MultiQ<'_>) -> Result<Vec<Self>> {
+    fn single(c: &mut Client, series: SeriesId, start: i64, end: i64, g: &Group, q: &MultiQ<'_>) -> Result<Vec<Self>> {
         c.query_group(series, start..end, Some(g), q.opts)
     }
 }
@@ -75,7 +75,7 @@ impl BucketRow for SpreadBucket {
     fn parse(b: &[u8]) -> Result<Vec<Self>> {
         parse_spread(b)
     }
-    fn single(c: &mut Client, series: u32, start: i64, end: i64, g: &Group, q: &MultiQ<'_>) -> Result<Vec<Self>> {
+    fn single(c: &mut Client, series: SeriesId, start: i64, end: i64, g: &Group, q: &MultiQ<'_>) -> Result<Vec<Self>> {
         c.query_spread_group(series, start..end, Some(g), q.opts)
     }
 }
@@ -85,7 +85,7 @@ impl BucketRow for TwaBucket {
     fn parse(b: &[u8]) -> Result<Vec<Self>> {
         parse_twa(b)
     }
-    fn single(c: &mut Client, series: u32, start: i64, end: i64, g: &Group, q: &MultiQ<'_>) -> Result<Vec<Self>> {
+    fn single(c: &mut Client, series: SeriesId, start: i64, end: i64, g: &Group, q: &MultiQ<'_>) -> Result<Vec<Self>> {
         c.query_twa_group(series, start..end, Some(g), q.twa)
     }
 }
@@ -119,7 +119,7 @@ impl Client {
     /// ```
     pub fn query_rows_multi(
         &mut self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         opts: QueryOpts,
         m: MultiOpts<'_>,
@@ -132,7 +132,7 @@ impl Client {
     /// one, in one request; the result as [`query_rows_multi`](Client::query_rows_multi).
     pub fn query_lttb_multi(
         &mut self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         threshold: u64,
         opts: QueryOpts,
@@ -154,7 +154,7 @@ impl Client {
     /// As [`query_rows_multi`](Client::query_rows_multi).
     pub fn query_chunks_multi<F>(
         &mut self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         opts: QueryOpts,
         m: MultiOpts<'_>,
@@ -201,7 +201,7 @@ impl Client {
     /// ```
     pub fn query_buckets_multi(
         &mut self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: QueryOpts,
@@ -216,7 +216,7 @@ impl Client {
     /// group and bounds forms for one; otherwise as [`query_buckets_multi`](Client::query_buckets_multi).
     pub fn query_spread_multi(
         &mut self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: QueryOpts,
@@ -231,7 +231,7 @@ impl Client {
     /// its group and bounds forms for one; otherwise as [`query_buckets_multi`](Client::query_buckets_multi).
     pub fn query_twa_multi(
         &mut self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: TwaOpts,
@@ -243,7 +243,7 @@ impl Client {
         self.run(|c| c.bucket_multi(&q, series, m))
     }
 
-    fn rows_multi(&mut self, q: &MultiQ<'_>, series: &[u32], m: MultiOpts<'_>) -> Result<Vec<Result<Rows>>> {
+    fn rows_multi(&mut self, q: &MultiQ<'_>, series: &[SeriesId], m: MultiOpts<'_>) -> Result<Vec<Result<Rows>>> {
         self.need_version(10)?;
         check_multi(series, &m)?;
         // a limit of 0 asks for one row and keeps none, so that the type still arrives (as query_rows)
@@ -276,7 +276,7 @@ impl Client {
     fn bucket_multi<T: BucketRow>(
         &mut self,
         q: &MultiQ<'_>,
-        series: &[u32],
+        series: &[SeriesId],
         m: MultiOpts<'_>,
     ) -> Result<Vec<Result<Vec<T>>>> {
         self.need_version(10)?;
@@ -314,7 +314,7 @@ impl Client {
     fn collect_buckets<T: BucketRow>(
         &mut self,
         q: &MultiQ<'_>,
-        series: &[u32],
+        series: &[SeriesId],
         m: MultiOpts<'_>,
         bounds: &[i64],
         trim: u8,
@@ -343,7 +343,7 @@ impl Client {
         q: &MultiQ<'_>,
         zone: &str,
         g: &Group,
-        series: &[u32],
+        series: &[SeriesId],
         m: MultiOpts<'_>,
         out: &mut Vec<Result<Vec<T>>>,
     ) -> Result<()> {
@@ -403,7 +403,7 @@ impl Client {
         &mut self,
         q: &MultiQ<'_>,
         g: &Group,
-        series: &[u32],
+        series: &[SeriesId],
         m: MultiOpts<'_>,
         out: &mut Vec<Result<Vec<T>>>,
     ) -> Result<()> {
@@ -431,7 +431,7 @@ impl Client {
     fn multi_send_all(
         &mut self,
         q: &MultiQ<'_>,
-        series: &[u32],
+        series: &[SeriesId],
         m: MultiOpts<'_>,
         bounds: &[i64],
         trim: u8,
@@ -479,7 +479,7 @@ impl Client {
             if let Some(iv) = per_interval {
                 f.i64s(&iv[at..at + k]);
             }
-            f.u32s(&series[at..at + k]).bytes(&[0u8; 8][..pad]).bytes(&t);
+            f.sids(&series[at..at + k]).bytes(&[0u8; 8][..pad]).bytes(&t);
             self.send()?;
             self.req.shrink();
             let stopped = self.multi_read(values, row, k, &mut rows, &mut |ix, it| sink(at + ix, it))?;
@@ -668,8 +668,10 @@ fn template(q: &MultiQ<'_>, m: &MultiOpts<'_>, bounds: &[i64]) -> Result<(Op, u8
     Ok((op, fields, t))
 }
 
-/// The per-series arrays of `m` must be as long as the series list.
-fn check_multi(series: &[u32], m: &MultiOpts<'_>) -> Result<()> {
+/// The per-series arrays of `m` must be as long as the series list, and every id must fit protocol 10
+/// ([`FrameBuf::sids`](crate::protocol::FrameBuf::sids) relies on it).
+fn check_multi(series: &[SeriesId], m: &MultiOpts<'_>) -> Result<()> {
+    wire_ids(series)?;
     for (what, a) in [("starts", m.starts), ("ends", m.ends)] {
         if let Some(a) = a
             && a.len() != series.len()

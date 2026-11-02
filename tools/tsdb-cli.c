@@ -99,7 +99,7 @@ static int parse_type(const char *s)
 /* One batch per value type: a batch is written with one tsdb_insert_values. */
 typedef struct batch {
     tsdb_type type;
-    uint32_t *s;
+    tsdb_sid *s;
     int64_t *t;
     uint8_t *v;     /* values of the type (bool: bytes) */
     uint8_t *valid; /* bitmap */
@@ -122,7 +122,7 @@ static void batch_flush(tsdb *db, batch *b, size_t *total)
     b->nulls = false;
 }
 
-static void batch_push(batch *b, uint32_t s, int64_t t, const void *v, bool known)
+static void batch_push(batch *b, tsdb_sid s, int64_t t, const void *v, bool known)
 {
     if (b->n == b->cap) {
         b->cap = b->cap ? b->cap * 2 : 65536;
@@ -172,7 +172,7 @@ static void die_name(const char *name, int rc)
 }
 
 /* Parses a value of `type` into out (its API layout); false if it does not parse. */
-static bool parse_value(tsdb *db, uint32_t series, tsdb_type type, const char *vs, uint8_t out[8], bool *known)
+static bool parse_value(tsdb *db, tsdb_sid series, tsdb_type type, const char *vs, uint8_t out[8], bool *known)
 {
     *known = !(vs[0] == '\0' || strcmp(vs, "null") == 0 || strcmp(vs, "NULL") == 0 || strcmp(vs, "\\N") == 0);
     memset(out, 0, 8);
@@ -220,7 +220,7 @@ static bool parse_value(tsdb *db, uint32_t series, tsdb_type type, const char *v
 
 static int cmd_import(tsdb *db, const char *fixed_series, FILE *in)
 {
-    uint32_t fixed = 0;
+    tsdb_sid fixed = 0;
     tsdb_type fixed_type = TSDB_FLOAT32;
     int rc;
     if (fixed_series && ((rc = tsdb_series(db, fixed_series, &fixed)) != 0 ||
@@ -234,7 +234,7 @@ static int cmd_import(tsdb *db, const char *fixed_series, FILE *in)
      * name is never mistaken for a longer one that shares its first bytes */
     char *last_name = NULL;
     size_t last_cap = 0;
-    uint32_t last_id = 0;
+    tsdb_sid last_id = 0;
     tsdb_type last_type = TSDB_FLOAT32;
     double t0 = now_s();
     while ((len = getline(&line, &cap, in)) > 0) {
@@ -259,7 +259,7 @@ static int cmd_import(tsdb *db, const char *fixed_series, FILE *in)
             fprintf(stderr, "tsdb: line %zu: expected %d fields\n", lineno, need);
             return 1;
         }
-        uint32_t id = fixed;
+        tsdb_sid id = fixed;
         tsdb_type type = fixed_type;
         if (!fixed_series) {
             if (!last_name || strcmp(fields[0], last_name) != 0) {
@@ -313,7 +313,7 @@ typedef struct raw_out {
     FILE *f;
     size_t n;
     tsdb *db;
-    uint32_t series;
+    tsdb_sid series;
 } raw_out;
 
 static int print_raw(void *ctx, const int64_t *ts, const tsdb_values *col, size_t n)
@@ -411,7 +411,7 @@ static bool parse_group(const char *s, tsdb_group *g, int64_t *interval_ms)
     return parse_interval(s, interval_ms) && *interval_ms > 0;
 }
 
-static int query_twa(tsdb *db, uint32_t id, int64_t start, int64_t end, const tsdb_group *g, int64_t interval,
+static int query_twa(tsdb *db, tsdb_sid id, int64_t start, int64_t end, const tsdb_group *g, int64_t interval,
                      tsdb_twa_opts *tw, const tsdb_query_opts *q)
 {
     tw->order = q->order;
@@ -475,7 +475,7 @@ static int cmd_query(tsdb *db, int argc, char **argv)
     }
     if (npos < 3)
         usage();
-    uint32_t id;
+    tsdb_sid id;
     int rc = tsdb_series_lookup(db, pos[0], &id);
     if (rc == TSDB_ERR_NOTFOUND)
         return 0; /* unknown series: empty result */
@@ -640,6 +640,21 @@ static void human(double bytes, char *buf, size_t len)
     snprintf(buf, len, "%.2f %s", bytes, u[i]);
 }
 
+/* One line of `tsdb DIR series`; the ids come from tsdb_series_foreach, which does not assume they are dense. */
+static int print_series(void *ctx, tsdb_sid id)
+{
+    tsdb *db = ctx;
+    tsdb_type t = TSDB_FLOAT32;
+    tsdb_series_type(db, id, &t);
+    put_name(stdout, tsdb_series_name(db, id));
+    printf("\t%s\t", type_names[t]);
+    put_name(stdout, tsdb_series_path(db, id));
+    int c = 0;
+    tsdb_series_class(db, id, &c);
+    printf("\tclass %d\n", c);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -719,25 +734,18 @@ int main(int argc, char **argv)
         }
         if (!name)
             usage();
-        uint32_t id;
+        tsdb_sid id;
         if ((rc = tsdb_series_create(db, name, (tsdb_type)type, path, &id)) != 0)
             die(name, rc);
-        printf("%u\t", id);
+        printf("%" PRIu64 "\t", id);
         put_name(stdout, name);
         printf("\t%s\t", type_names[type]);
         put_name(stdout, tsdb_series_path(db, id));
         putchar('\n');
     } else if (strcmp(cmd, "series") == 0) {
-        for (uint32_t i = 0; i < tsdb_series_count(db); i++) {
-            tsdb_type t = TSDB_FLOAT32;
-            tsdb_series_type(db, i, &t);
-            put_name(stdout, tsdb_series_name(db, i));
-            printf("\t%s\t", type_names[t]);
-            put_name(stdout, tsdb_series_path(db, i));
-            int c = 0;
-            tsdb_series_class(db, i, &c);
-            printf("\tclass %d\n", c);
-        }
+        rc = tsdb_series_foreach(db, print_series, db);
+        if (rc)
+            die("series", rc);
     } else if (strcmp(cmd, "volume") == 0) {
         for (uint32_t i = 0; i < tsdb_volume_count(db); i++)
             printf("%u\t%s\n", i, tsdb_volume_path(db, i));
@@ -747,7 +755,7 @@ int main(int argc, char **argv)
         char sz[32], raw[32];
         human((double)st.bytes, sz, sizeof sz);
         human((double)st.rows * 12, raw, sizeof raw);
-        printf("series      %u\nrows        %" PRIu64 "\nparts       %" PRIu64 "\npartitions  %" PRIu64
+        printf("series      %" PRIu64 "\nrows        %" PRIu64 "\nparts       %" PRIu64 "\npartitions  %" PRIu64
                "\non disk     %s (%.3f bytes/row)\nuncompressed %s (DateTime64(3) + Float32)\nratio       %.1fx\n"
                "simd        %s\n",
                tsdb_series_count(db), st.rows, st.parts, st.partitions, sz,
@@ -768,13 +776,13 @@ int main(int argc, char **argv)
             die("drop-before", rc);
     } else if (strcmp(cmd, "delete") == 0) {
         int64_t a, b;
-        uint32_t id;
+        tsdb_sid id;
         if (argc != 6 || !parse_time(argv[4], &a) || !parse_time(argv[5], &b))
             usage();
         if ((rc = tsdb_series_lookup(db, argv[3], &id)) != 0 || (rc = tsdb_delete_range(db, id, a, b)) != 0)
             die(argv[3], rc);
     } else if (strcmp(cmd, "retention") == 0) {
-        uint32_t id;
+        tsdb_sid id;
         int64_t limit = 0;
         if (argc < 4 || argc > 5 || (argc == 5 && strcmp(argv[4], "off") != 0 &&
                                      (!parse_interval(argv[4], &limit) || limit <= 0)))

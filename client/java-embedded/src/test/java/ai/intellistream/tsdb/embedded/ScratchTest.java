@@ -182,13 +182,13 @@ class ScratchTest {
     void failedGrowthNeitherFailsTheInsertNorWedgesClose() throws Exception {
         int n = 1_000_000;
         long[] ts = new long[n];
-        int[] many = new int[n];
+        long[] many = new long[n];
         for (int i = 0; i < n; i++)
             ts[i] = T0 + i;
         EmbeddedDb db = EmbeddedDb.open(tmp.resolve("o").toString(), opts());
         try {
-            int s = db.series("s");
-            int d = db.seriesCreate("d", ValueType.FLOAT64);
+            long s = db.series("s");
+            long d = db.seriesCreate("d", ValueType.FLOAT64);
             java.util.Arrays.fill(many, s);
             Scratch.Pool p = pool(db);
             Scratch.growHook = () -> {
@@ -236,17 +236,17 @@ class ScratchTest {
     }
 
     private static void insertsOfChangingSizes(EmbeddedDb db) throws TsdbException {
-        int f = db.series("f");
-        int g = db.series("g");
-        int d = db.seriesCreate("d", ValueType.FLOAT64);
-        int b = db.seriesCreate("b", ValueType.BOOL);
+        long f = db.series("f");
+        long g = db.series("g");
+        long d = db.seriesCreate("d", ValueType.FLOAT64);
+        long b = db.seriesCreate("b", ValueType.BOOL);
         int[] sizes = {1000, 1000, 10, 300_000, 5, 2_200_000, 1000};
         long t = T0;
         for (int round = 0; round < sizes.length; round++) {
             int n = sizes[round];
             long[] ts = new long[n];
             float[] fv = new float[n];
-            int[] many = new int[n];
+            long[] many = new long[n];
             double[] dv = new double[n];
             boolean[] bv = new boolean[n];
             BitSet nulls = new BitSet();
@@ -286,14 +286,15 @@ class ScratchTest {
         int nt = 8, calls = 20, n = 50_000;
         EmbeddedDb db = EmbeddedDb.open(tmp.resolve("c").toString(), opts());
         try {
-            int[] ids = new int[nt];
+            long[] ids = new long[nt];
             for (int k = 0; k < nt; k++)
                 ids[k] = db.series("s" + k);
             ExecutorService ex = Executors.newFixedThreadPool(nt);
             try {
                 List<Future<?>> fs = new ArrayList<>();
                 for (int k = 0; k < nt; k++) {
-                    int id = ids[k], kk = k;
+                    long id = ids[k];
+                    int kk = k;
                     fs.add(ex.submit(() -> {
                         for (int c = 0; c < calls; c++) {
                             int m = n - c * 100; /* sizes vary: some calls fit, some spill */
@@ -334,7 +335,7 @@ class ScratchTest {
         int nt = 80, n = 300_000; /* 3.6 MB per call: 4 MiB blocks, two fit the limit */
         EmbeddedDb db = EmbeddedDb.open(tmp.resolve("m").toString(), opts().scratchBytes(8 * MIB));
         try {
-            int[] ids = new int[nt];
+            long[] ids = new long[nt];
             for (int k = 0; k < nt; k++)
                 ids[k] = db.series("s" + k);
             AtomicReference<Throwable> bad = new AtomicReference<>();
@@ -386,7 +387,7 @@ class ScratchTest {
         for (int round = 0; round < 12; round++) {
             EmbeddedDb db = EmbeddedDb.open(tmp.resolve("r" + round).toString(), opts());
             int nt = 24;
-            int[] ids = new int[nt];
+            long[] ids = new long[nt];
             for (int k = 0; k < nt; k++)
                 ids[k] = k % 2 == 0 ? db.series("s" + k) : db.seriesCreate("d" + k, ValueType.FLOAT64);
             AtomicReference<Throwable> bad = new AtomicReference<>();
@@ -440,7 +441,7 @@ class ScratchTest {
     void failedInsertsReturnTheirScratch() throws Exception {
         EmbeddedDb db = EmbeddedDb.open(tmp.resolve("f").toString(), opts());
         try {
-            int d = db.seriesCreate("d", ValueType.FLOAT64);
+            long d = db.seriesCreate("d", ValueType.FLOAT64);
             int n = 100_000;
             long[] ts = new long[n];
             for (int i = 0; i < n; i++)

@@ -30,7 +30,7 @@ public final class TypedExample {
             long[] ts = {t0, t0 + 60_000, t0 + 120_000, t0 + 180_000};
 
             // An int64 meter reading per minute; the third one is missing (null).
-            int energy = client.seriesCreate("pump7.energy_wh", ValueType.INT64);
+            long energy = client.seriesCreate("pump7.energy_wh", ValueType.INT64);
             BitSet missing = new BitSet();
             missing.set(2);
             client.insertSeriesValues(energy, ts, Column.ofLongs(1_000, 1_250, 0, 1_900).withNulls(missing));
@@ -47,7 +47,7 @@ public final class TypedExample {
             System.out.println("known " + all.count() + ", sum " + all.isum() + ", max " + all.imax());
 
             // A state series stores each name once, as a code.
-            int mode = client.seriesCreate("pump7.mode", ValueType.STATE);
+            long mode = client.seriesCreate("pump7.mode", ValueType.STATE);
             int running = client.state(mode, "running");
             int stopped = client.state(mode, "stopped");
             client.insertSeriesValues(mode, ts, Column.ofStates(running, running, stopped, running));

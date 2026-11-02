@@ -129,7 +129,7 @@ static void make_db(const char *dir)
     rm_rf(dir);
     tsdb_options o = opts();
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_series(db, "s1", &id));
     int64_t ts[1000];
@@ -226,7 +226,7 @@ static void query_rows(const char *dir, int *rc, long *rows)
 {
     tsdb_options o = opts();
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     *rc = tsdb_open(dir, &o, &db);
     *rows = -1;
     if (*rc)
@@ -324,7 +324,7 @@ static void merge_refused(const char *dir)
 {
     tsdb_options o = opts();
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_series_lookup(db, "s1", &id));
     int64_t ts[100];
@@ -347,7 +347,7 @@ static void make_db_3_granules(const char *dir)
     o.granule_rows = 16;
     o.wal_max_batch_rows = 4; /* straight to a part */
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_series(db, "s1", &id));
     int64_t ts[40];
@@ -847,7 +847,7 @@ static void test_extremes(const char *base)
     tsdb_options o = opts();
     o.wal_max_batch_rows = 4; /* 3 rows: WAL and memtable; 5: straight to parts */
     tsdb *db;
-    uint32_t a, b;
+    tsdb_sid a, b;
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_series(db, "a", &a));
     OK(tsdb_series(db, "b", &b));
@@ -860,13 +860,13 @@ static void test_extremes(const char *base)
     CHECK(tsdb_insert_series(db, a, sorted, v, 5) == TSDB_ERR_INVALID);
     int64_t unsorted[5] = {3000, INT64_MAX, 1000, INT64_MIN, 2000};
     CHECK(tsdb_insert_series(db, a, unsorted, v, 5) == TSDB_ERR_INVALID);
-    uint32_t ser[5] = {b, a, b, a, a};
+    tsdb_sid ser[5] = {b, a, b, a, a};
     CHECK(tsdb_insert(db, ser, unsorted, v, 5) == TSDB_ERR_INVALID);
-    uint32_t ser_sorted[5] = {a, a, a, b, b};
+    tsdb_sid ser_sorted[5] = {a, a, a, b, b};
     int64_t ts_sorted[5] = {1, 2, INT64_MAX, 1, 2};
     CHECK(tsdb_insert(db, ser_sorted, ts_sorted, v, 5) == TSDB_ERR_INVALID);
     /* each series in time order, all in the last partition: the counting sort (bucket_write) takes it */
-    uint32_t ser_bucket[5] = {b, a, b, a, a};
+    tsdb_sid ser_bucket[5] = {b, a, b, a, a};
     int64_t ts_bucket[5] = {INT64_MAX - 4, INT64_MAX - 3, INT64_MAX - 2, INT64_MAX - 1, INT64_MAX};
     CHECK(tsdb_insert(db, ser_bucket, ts_bucket, v, 5) == TSDB_ERR_INVALID);
     tsdb_bucket *bk;
@@ -905,7 +905,7 @@ static void test_extremes(const char *base)
     CHECK(nb >= 2 && bk[nb - 1].start == 86400000LL * 3 - 3600000 && bk[nb - 1].count == 2);
     free(bk);
     /* only rows beyond the limit, on one side */
-    uint32_t c;
+    tsdb_sid c;
     OK(tsdb_series(db, "c", &c));
     int64_t far[2] = {INT64_MAX - 10, INT64_MAX - 5};
     OK(tsdb_insert_series(db, c, far, v, 2));

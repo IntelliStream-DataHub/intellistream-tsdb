@@ -173,7 +173,7 @@ static void create_series(tsdb *db)
 {
     for (uint32_t s = 0; s < NS; s++) {
         char name[16];
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "s%u", s);
         OK(tsdb_series_create(db, name, TSDB_INT64, NULL, &id));
         CHECK(id == s);
@@ -694,7 +694,7 @@ static void test_retention(void)
     for (int i = 0; i < D; i++)
         ts[i] = i, v[i] = 1;
     tsdb_values tv = {TSDB_INT64, v, NULL};
-    for (uint32_t s = 0; s < NS; s++)
+    for (tsdb_sid s = 0; s < NS; s++)
         OK(tsdb_insert_series_values(db, s, ts, &tv, D));
     int64_t lim = -1, sum;
     tsdb_query_stats st;
@@ -807,7 +807,7 @@ static void test_partial_merge(void)
     opt.max_part_bytes = 200000;
     tsdb *db;
     OK(tsdb_open(dir, &opt, &db));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &s));
     enum { N = 100000 };
     static int64_t ts[N], v[N];
@@ -870,7 +870,7 @@ static void test_edges(void)
         opt.merge_threads = 0;
         tsdb *db;
         OK(tsdb_open(dir, &opt, &db));
-        uint32_t s;
+        tsdb_sid s;
         OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &s));
         static int64_t ts[6000], v[6000];
         for (int i = 0; i < 6000; i++)
@@ -905,7 +905,7 @@ static void test_anchors(void)
     opt.merge_threads = 0; /* nothing may retire the anchor before the segment comes back */
     tsdb *db;
     OK(tsdb_open(dir, &opt, &db));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &s));
     int64_t ts[100], v[100];
     for (int i = 0; i < 100; i++)

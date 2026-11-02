@@ -249,7 +249,7 @@ static int col_add(void *arg, const int64_t *ts, const tsdb_values *v, size_t n)
     return 0;
 }
 
-static col read_series(tsdb *db, uint32_t id, int64_t a, int64_t b)
+static col read_series(tsdb *db, tsdb_sid id, int64_t a, int64_t b)
 {
     col c = {0};
     OK(tsdb_series_type(db, id, &c.type));
@@ -264,11 +264,11 @@ static void col_free(col *c)
     free(c->ok);
 }
 
-static uint32_t lookup(tsdb *db, const char *name)
+static tsdb_sid lookup(tsdb *db, const char *name)
 {
-    uint32_t id = UINT32_MAX;
+    tsdb_sid id = UINT64_MAX;
     if (tsdb_series_lookup(db, name, &id) != 0)
-        return UINT32_MAX;
+        return UINT64_MAX;
     return id;
 }
 
@@ -279,9 +279,10 @@ static bool same_str(const char *a, const char *b) { return a && b && strcmp(a, 
  * codes by name. */
 static bool same_series(tsdb *s, tsdb *d, const char *name, int64_t a, int64_t b)
 {
-    uint32_t is = lookup(s, name), id = lookup(d, name);
-    if (is == UINT32_MAX || id == UINT32_MAX) {
-        fprintf(stderr, "  series %s missing (%u %u)\n", name, is, id);
+    tsdb_sid is = lookup(s, name), id = lookup(d, name);
+    if (is == UINT64_MAX || id == UINT64_MAX) {
+        fprintf(stderr, "  series %s missing (%llu %llu)\n", name, (unsigned long long)is,
+                (unsigned long long)id);
         return false;
     }
     int64_t rs = -1, rd = -2;
@@ -292,7 +293,7 @@ static bool same_series(tsdb *s, tsdb *d, const char *name, int64_t a, int64_t b
     for (size_t i = 0; same && i < x.n; i++) {
         same = x.ts[i] == y.ts[i] && x.ok[i] == y.ok[i];
         if (same && x.ok[i] && x.type == TSDB_STATE) {
-            const char *nx = tsdb_state_name(s, is, (uint32_t)x.v[i]), *ny = tsdb_state_name(d, id, (uint32_t)y.v[i]);
+            const char *nx = tsdb_state_name(s, is, (tsdb_sid)x.v[i]), *ny = tsdb_state_name(d, id, (uint32_t)y.v[i]);
             same = nx && ny && strcmp(nx, ny) == 0;
         } else if (same && x.ok[i]) {
             same = x.v[i] == y.v[i];
@@ -311,8 +312,8 @@ static bool same_series(tsdb *s, tsdb *d, const char *name, int64_t a, int64_t b
 
 static size_t rows_of(tsdb *db, const char *name)
 {
-    uint32_t id = lookup(db, name);
-    if (id == UINT32_MAX)
+    tsdb_sid id = lookup(db, name);
+    if (id == UINT64_MAX)
         return 0;
     col c = read_series(db, id, TSDB_TS_MIN, TSDB_TS_MAX);
     size_t n = c.n;
@@ -331,7 +332,7 @@ static uint64_t next(void)
     return rng;
 }
 
-static void insert(tsdb *db, uint32_t id, tsdb_type type, const int64_t *ts, const void *v, const uint8_t *valid,
+static void insert(tsdb *db, tsdb_sid id, tsdb_type type, const int64_t *ts, const void *v, const uint8_t *valid,
                    size_t n)
 {
     tsdb_values col = {type, v, valid};
@@ -350,7 +351,7 @@ static void build_source(const char *dir, const char *vol, bool golden)
     o.merge_threads = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     size_t n = golden ? 300 : BIG;
     int64_t *ts = malloc(n * 8);
     float *f = malloc(n * 4);
@@ -438,7 +439,8 @@ static void build_source(const char *dir, const char *vol, bool golden)
         st[i] = code[(i / 3) % 6];
     insert(db, id, TSDB_STATE, ts, st, valid, n);
     if (vol) {
-        uint32_t id2, c2;
+        tsdb_sid id2;
+        uint32_t c2;
         OK(tsdb_series_create(db, "mode2", TSDB_STATE, vol, &id2));
         OK(tsdb_state(db, id2, "far", &c2));
         for (size_t i = 0; i < n; i++)
@@ -451,7 +453,7 @@ static void build_source(const char *dir, const char *vol, bool golden)
     OK(tsdb_set_retention(db, id, 3600000));
 
     /* a few rows through the WAL into the memtable, overwriting part rows (the last write wins) */
-    uint32_t a;
+    tsdb_sid a;
     OK(tsdb_series_lookup(db, "temp/a", &a));
     float last[3] = {-1.0f, -2.0f, -3.0f};
     int64_t lts[3] = {T0, T0 + 1000, T0 + (int64_t)n * 1000};
@@ -484,9 +486,9 @@ static int lttb_add(void *arg, const int64_t *ts, const tsdb_values *v, size_t n
 
 static void same_queries(tsdb *s, tsdb *d, const char *name)
 {
-    uint32_t is = lookup(s, name), id = lookup(d, name);
-    CHECK(is != UINT32_MAX && id != UINT32_MAX);
-    if (is == UINT32_MAX || id == UINT32_MAX)
+    tsdb_sid is = lookup(s, name), id = lookup(d, name);
+    CHECK(is != UINT64_MAX && id != UINT64_MAX);
+    if (is == UINT64_MAX || id == UINT64_MAX)
         return;
     int64_t a = TSDB_TS_MIN, b = TSDB_TS_MAX, a2 = T0 - 3600000, b2 = T0 + (int64_t)BIG * 1000 + 3600000;
     /* agg: one bucket over everything, and by minute */
@@ -647,7 +649,7 @@ static void test_filters_and_existing(void)
     CHECK(RUN(NULL, NULL, dst, "import", f, "--volume", map) == 0);
     tsdb *s = open_db(src, true), *d = open_db(dst, true);
     CHECK(tsdb_series_count(d) == 3);
-    CHECK(lookup(d, "temp/a") == UINT32_MAX);
+    CHECK(lookup(d, "temp/a") == UINT64_MAX);
     int64_t a = T0 + 50000 * 1000LL, b = T0 + 60000 * 1000LL;
     CHECK(same_series(s, d, "mode", a, b) && same_series(s, d, "mode2", a, b) && same_series(s, d, "i64", a, b));
     CHECK(rows_of(d, "mode") == 10000);
@@ -656,7 +658,7 @@ static void test_filters_and_existing(void)
 
     /* existing series: refused by default (nothing written), skipped, merged, or the range replaced */
     d = open_db(dst, false);
-    uint32_t id = lookup(d, "i64");
+    tsdb_sid id = lookup(d, "i64");
     int64_t extra_ts[2] = {T0 + 50000 * 1000LL + 1, T0 + 70000 * 1000LL}; /* inside and outside the range */
     int64_t extra_v[2] = {-5, -6};
     insert(d, id, TSDB_INT64, extra_ts, extra_v, NULL, 2);
@@ -730,7 +732,7 @@ static void refused(const char *file, const char *why, bool pipe)
         return;
     tsdb *d = open_db(dst, true), *s = open_db(path("src"), true);
     if (!pipe && tsdb_series_count(d) != 0) {
-        fprintf(stderr, "  %s: %u series written\n", why, tsdb_series_count(d));
+        fprintf(stderr, "  %s: %llu series written\n", why, (unsigned long long)tsdb_series_count(d));
         failures++;
     }
     for (uint32_t i = 0; i < tsdb_series_count(d); i++) {
@@ -858,7 +860,7 @@ static void test_concurrent(void)
         o.flush_interval_ms = 50;
         tsdb *db;
         OK(tsdb_open(dir, &o, &db));
-        uint32_t id[CS];
+        tsdb_sid id[CS];
         char name[16];
         size_t rows[CS];
         for (int s = 0; s < CS; s++) {
@@ -924,7 +926,7 @@ static void big_db(const char *dir, size_t rows)
     o.merge_threads = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id[4];
+    tsdb_sid id[4];
     for (int s = 0; s < 4; s++) {
         char name[16];
         snprintf(name, sizeof name, "big%d", s);
@@ -1221,7 +1223,8 @@ static void craft_refused(const knobs *k, const char *what, const char *why)
     if (stat(dst, &st) == 0) {
         tsdb *d = open_db(dst, true);
         if (tsdb_series_count(d) != 0) {
-            fprintf(stderr, "  crafted (%s): %u series written\n", why, tsdb_series_count(d));
+            fprintf(stderr, "  crafted (%s): %llu series written\n", why,
+                (unsigned long long)tsdb_series_count(d));
             failures++;
         }
         tsdb_close(d);
@@ -1318,7 +1321,7 @@ static void test_crafted(void)
     craft(f, &(knobs){.retention = 365LL * 24 * 3600 * 1000 * 100});
     const char *rp = path("replace");
     d = open_db(rp, false);
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_create(d, "f", TSDB_FLOAT32, NULL, &id));
     int64_t old_ts[2] = {T0 + 500, CR_TO + 5};
     float old_v[2] = {9, 9};
@@ -1386,7 +1389,7 @@ static void test_crafted(void)
         CHECK(err_has("series big, which this import created, is left empty") && err_has("--merge"));
         CHECK(err_has("1 series before it"));
         d = open_db(pd, true);
-        CHECK(rows_of(d, "first") == 3 && lookup(d, "big") != UINT32_MAX && rows_of(d, "big") == 0);
+        CHECK(rows_of(d, "first") == 3 && lookup(d, "big") != UINT64_MAX && rows_of(d, "big") == 0);
         tsdb_close(d);
         CHECK(sh("cat '%s' | '%s' '%s' import --merge --batch-rows 1000 2>%s", path("pipe-good.dump"), cli, pd,
                  errfile) == 0);
@@ -1463,7 +1466,8 @@ static void test_volumes(void)
     /* two state series of one volume share its dictionary: each stream names its own codes */
     const char *src = path("shared-src");
     d = open_db(src, false);
-    uint32_t a, b, on, off;
+    tsdb_sid a, b;
+    uint32_t on, off;
     OK(tsdb_series_create(d, "s1", TSDB_STATE, NULL, &a));
     OK(tsdb_series_create(d, "s2", TSDB_STATE, NULL, &b));
     OK(tsdb_state(d, a, "on", &on));
@@ -1473,7 +1477,7 @@ static void test_volumes(void)
     insert(d, a, TSDB_STATE, ts, v, NULL, 2);
     insert(d, b, TSDB_STATE, ts, v, NULL, 2);
     /* names long enough that one chunk's names exceed a STATES record of this exporter: split */
-    uint32_t lg;
+    tsdb_sid lg;
     OK(tsdb_series_create(d, "long", TSDB_STATE, NULL, &lg));
     enum { NLONG = 60, LLEN = 20000 };
     int64_t lts[NLONG];

@@ -27,7 +27,7 @@ fn engine_keeps_its_internal_names_to_itself() {
         let mut db = ptr::null_mut();
         assert_eq!(tsdb_sys::tsdb_open(path.as_ptr(), ptr::null(), &mut db), 0);
         let name = CString::new("s").unwrap();
-        let mut id = 0u32;
+        let mut id: tsdb_sys::tsdb_sid = 0;
         assert_eq!(tsdb_sys::tsdb_series(db, name.as_ptr(), &mut id), 0);
         let ts: Vec<i64> = (0..1000).map(|i| i * 1000).collect();
         let vals: Vec<f32> = (0..1000).map(|i| i as f32).collect();

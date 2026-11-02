@@ -202,10 +202,9 @@ final class Native {
 
     static final StructLayout SERIES_RESULT = MemoryLayout.structLayout(
             SIZE_T.withName("index"),
-            JAVA_INT.withName("series"),
+            JAVA_LONG.withName("series"),
             JAVA_INT.withName("status"),
             JAVA_INT.withName("last"),
-            MemoryLayout.paddingLayout(4),
             SIZE_T.withName("n"),
             PTR.withName("ts"),
             VALUES.withName("values"),
@@ -237,8 +236,17 @@ final class Native {
 
     // ------------------------------------------------------------------------------------------------ the library
 
+    /**
+     * The {@code TSDB_ABI_VERSION} of the tsdb.h this binding was written for. The library raises it with every
+     * incompatible change of a struct's layout or a function's signature, which the size check misses
+     * (tsdb_series_result kept its size when its series id became 64 bits and its fields moved).
+     */
+    static final int ABI_VERSION = 1;
+
     /** Where the library was loaded from, for {@link EmbeddedDb#librarySource()}. */
     static final String SOURCE;
+    /** What the loaded library's {@code tsdb_abi_version()} answered (equal to {@link #ABI_VERSION}, or it failed). */
+    static final int LIBRARY_ABI_VERSION;
     private static final SymbolLookup LIB;
 
     static {
@@ -247,10 +255,18 @@ final class Native {
         String[] source = new String[1];
         LIB = load(source);
         SOURCE = source[0];
-        MemorySegment sym = LIB.find("tsdb_struct_size").orElseThrow(() -> new UnsatisfiedLinkError(
+        MemorySegment sym = LIB.find("tsdb_abi_version").orElseThrow(() -> new UnsatisfiedLinkError(
+                "libtsdb.so (" + SOURCE + ") has no tsdb_abi_version: it is older than this binding (ABI version "
+                        + ABI_VERSION + "); use the library this jar was built with"));
+        try {
+            LIBRARY_ABI_VERSION = (int) LINKER.downcallHandle(sym, FunctionDescriptor.of(JAVA_INT)).invokeExact();
+        } catch (Throwable t) {
+            throw new AssertionError(t);
+        }
+        sym = LIB.find("tsdb_struct_size").orElseThrow(() -> new UnsatisfiedLinkError(
                 "libtsdb.so (" + SOURCE + ") has no tsdb_struct_size: it is older than this binding"));
         MethodHandle size = LINKER.downcallHandle(sym, FunctionDescriptor.of(JAVA_LONG, JAVA_INT));
-        checkAbi(SOURCE, k -> {
+        checkAbi(SOURCE, LIBRARY_ABI_VERSION, k -> {
             try {
                 return (long) size.invokeExact(k);
             } catch (Throwable t) {
@@ -260,11 +276,17 @@ final class Native {
     }
 
     /**
-     * Refuses a library whose structs differ in size from this binding's layouts: one built from other headers
-     * would read or write past the end of the memory this side allocates (tsdb_options_init, tsdb_get_stats, ...),
-     * which corrupts the heap instead of failing.
+     * Refuses a library of another ABI version, whose structs or signatures differ from this binding's even where
+     * the sizes agree (an id passed at the wrong width, a field read at the wrong offset), and a library whose
+     * structs differ in size from this binding's layouts: one built from other headers would read or write past the
+     * end of the memory this side allocates (tsdb_options_init, tsdb_get_stats, ...), which corrupts the heap
+     * instead of failing.
      */
-    static void checkAbi(String source, IntToLongFunction size) {
+    static void checkAbi(String source, int abi, IntToLongFunction size) {
+        if (abi != ABI_VERSION)
+            throw new UnsatisfiedLinkError("libtsdb.so (" + source + ") has ABI version " + abi
+                    + " and this binding was written for ABI version " + ABI_VERSION
+                    + "; use the library this jar was built with");
         for (int k = 0; k < ALL_STRUCTS.length; k++) {
             long theirs = size.applyAsLong(k);
             if (theirs != ALL_STRUCTS[k].byteSize())
@@ -370,44 +392,45 @@ final class Native {
     static final MethodHandle SERIES_AT = fn("tsdb_series_at", i(PTR, PTR, PTR, PTR));
     static final MethodHandle SERIES_LOOKUP = fn("tsdb_series_lookup", i(PTR, PTR, PTR));
     static final MethodHandle SERIES_CREATE = fn("tsdb_series_create", i(PTR, PTR, JAVA_INT, PTR, PTR));
-    static final MethodHandle SERIES_TYPE = fn("tsdb_series_type", i(PTR, JAVA_INT, PTR));
-    static final MethodHandle SERIES_CLASS = fn("tsdb_series_class", i(PTR, JAVA_INT, PTR));
-    static final MethodHandle SERIES_COUNT = fn("tsdb_series_count", i(PTR));
-    static final MethodHandle SERIES_NAME = fn("tsdb_series_name", FunctionDescriptor.of(PTR, PTR, JAVA_INT));
-    static final MethodHandle SERIES_PATH = fn("tsdb_series_path", FunctionDescriptor.of(PTR, PTR, JAVA_INT));
+    static final MethodHandle SERIES_TYPE = fn("tsdb_series_type", i(PTR, JAVA_LONG, PTR));
+    static final MethodHandle SERIES_CLASS = fn("tsdb_series_class", i(PTR, JAVA_LONG, PTR));
+    static final MethodHandle SERIES_COUNT = fn("tsdb_series_count", FunctionDescriptor.of(JAVA_LONG, PTR));
+    static final MethodHandle SERIES_FOREACH = fn("tsdb_series_foreach", i(PTR, PTR, PTR));
+    static final MethodHandle SERIES_NAME = fn("tsdb_series_name", FunctionDescriptor.of(PTR, PTR, JAVA_LONG));
+    static final MethodHandle SERIES_PATH = fn("tsdb_series_path", FunctionDescriptor.of(PTR, PTR, JAVA_LONG));
     static final MethodHandle VOLUME_COUNT = fn("tsdb_volume_count", i(PTR));
     static final MethodHandle VOLUME_PATH = fn("tsdb_volume_path", FunctionDescriptor.of(PTR, PTR, JAVA_INT));
 
     static final MethodHandle INSERT = fn("tsdb_insert", i(PTR, PTR, PTR, PTR, SIZE_T));
-    static final MethodHandle INSERT_SERIES = fn("tsdb_insert_series", i(PTR, JAVA_INT, PTR, PTR, SIZE_T));
+    static final MethodHandle INSERT_SERIES = fn("tsdb_insert_series", i(PTR, JAVA_LONG, PTR, PTR, SIZE_T));
     static final MethodHandle INSERT_VALUES = fn("tsdb_insert_values", i(PTR, PTR, PTR, PTR, SIZE_T));
     static final MethodHandle INSERT_SERIES_VALUES = fn("tsdb_insert_series_values",
-            i(PTR, JAVA_INT, PTR, PTR, SIZE_T));
-    static final MethodHandle STATE = fn("tsdb_state", i(PTR, JAVA_INT, PTR, PTR));
-    static final MethodHandle STATE_LOOKUP = fn("tsdb_state_lookup", i(PTR, JAVA_INT, PTR, PTR));
-    static final MethodHandle STATE_NAME = fn("tsdb_state_name", FunctionDescriptor.of(PTR, PTR, JAVA_INT, JAVA_INT));
-    static final MethodHandle APPEND = fn("tsdb_append", i(PTR, JAVA_INT, JAVA_LONG, JAVA_FLOAT));
+            i(PTR, JAVA_LONG, PTR, PTR, SIZE_T));
+    static final MethodHandle STATE = fn("tsdb_state", i(PTR, JAVA_LONG, PTR, PTR));
+    static final MethodHandle STATE_LOOKUP = fn("tsdb_state_lookup", i(PTR, JAVA_LONG, PTR, PTR));
+    static final MethodHandle STATE_NAME = fn("tsdb_state_name", FunctionDescriptor.of(PTR, PTR, JAVA_LONG, JAVA_INT));
+    static final MethodHandle APPEND = fn("tsdb_append", i(PTR, JAVA_LONG, JAVA_LONG, JAVA_FLOAT));
     static final MethodHandle COMMIT = fn("tsdb_commit", i(PTR));
     static final MethodHandle FLUSH = fn("tsdb_flush", i(PTR));
 
-    static final MethodHandle QUERY_RAW = fn("tsdb_query_raw", i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR));
-    static final MethodHandle QUERY_POINTS = fn("tsdb_query_points", i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR));
+    static final MethodHandle QUERY_RAW = fn("tsdb_query_raw", i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR));
+    static final MethodHandle QUERY_POINTS = fn("tsdb_query_points", i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR));
     static final MethodHandle POINTS_FREE = fn("tsdb_points_free", FunctionDescriptor.ofVoid(PTR));
     static final MethodHandle FREE = fn("tsdb_free", FunctionDescriptor.ofVoid(PTR));
     static final MethodHandle QUERY_AGG = fn("tsdb_query_agg",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR));
     static final MethodHandle QUERY_RAW_EX = fn("tsdb_query_raw_ex",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
     static final MethodHandle QUERY_POINTS_EX = fn("tsdb_query_points_ex",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR));
     static final MethodHandle QUERY_VALUES = fn("tsdb_query_values",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
     static final MethodHandle QUERY_GROUP = fn("tsdb_query_group",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
     static final MethodHandle QUERY_BOUNDS = fn("tsdb_query_bounds",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
     static final MethodHandle QUERY_GROUP_EX = fn("tsdb_query_group_ex",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
     static final MethodHandle LAST_QUERY_STATS = fn("tsdb_last_query_stats", FunctionDescriptor.ofVoid(PTR),
             CRITICAL);
 
@@ -422,43 +445,44 @@ final class Native {
     static final MethodHandle CALENDAR_BOUNDS = fn("tsdb_calendar_bounds",
             i(PTR, JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR));
     static final MethodHandle QUERY_GROUP_LOCAL = fn("tsdb_query_group_local",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
 
     static final MethodHandle QUERY_AGG_EX = fn("tsdb_query_agg_ex",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
     static final MethodHandle QUERY_SPREAD = fn("tsdb_query_spread",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
     static final MethodHandle QUERY_SPREAD_GROUP = fn("tsdb_query_spread_group",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
     static final MethodHandle QUERY_SPREAD_GROUP_LOCAL = fn("tsdb_query_spread_group_local",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
     static final MethodHandle QUERY_SPREAD_BOUNDS = fn("tsdb_query_spread_bounds",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
     static final MethodHandle QUERY_TWA = fn("tsdb_query_twa",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR));
     static final MethodHandle QUERY_TWA_GROUP = fn("tsdb_query_twa_group",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
     static final MethodHandle QUERY_TWA_GROUP_LOCAL = fn("tsdb_query_twa_group_local",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, PTR, PTR));
     static final MethodHandle QUERY_TWA_BOUNDS = fn("tsdb_query_twa_bounds",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, SIZE_T, PTR, PTR, PTR));
     static final MethodHandle QUERY_MULTI_COLLECT = fn("tsdb_query_multi_collect", i(PTR, PTR, PTR, SIZE_T, PTR, PTR));
     static final MethodHandle SERIES_RESULTS_FREE = fn("tsdb_series_results_free",
             FunctionDescriptor.ofVoid(PTR, SIZE_T));
     static final MethodHandle QUERY_LTTB_EX = fn("tsdb_query_lttb_ex",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, SIZE_T, PTR, PTR, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, SIZE_T, PTR, PTR, PTR));
 
-    static final MethodHandle DELETE_RANGE = fn("tsdb_delete_range", i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG));
+    static final MethodHandle DELETE_RANGE = fn("tsdb_delete_range", i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG));
     static final MethodHandle REPLACE_RANGE = fn("tsdb_replace_range",
-            i(PTR, JAVA_INT, JAVA_LONG, JAVA_LONG, PTR, PTR, SIZE_T));
-    static final MethodHandle SET_RETENTION = fn("tsdb_set_retention", i(PTR, JAVA_INT, JAVA_LONG));
-    static final MethodHandle GET_RETENTION = fn("tsdb_get_retention", i(PTR, JAVA_INT, PTR));
+            i(PTR, JAVA_LONG, JAVA_LONG, JAVA_LONG, PTR, PTR, SIZE_T));
+    static final MethodHandle SET_RETENTION = fn("tsdb_set_retention", i(PTR, JAVA_LONG, JAVA_LONG));
+    static final MethodHandle GET_RETENTION = fn("tsdb_get_retention", i(PTR, JAVA_LONG, PTR));
 
     // ------------------------------------------------------------------------------------------------ callbacks
 
     static final FunctionDescriptor RAW_FN = i(PTR, PTR, PTR, SIZE_T);
     static final FunctionDescriptor VALUES_FN = i(PTR, PTR, PTR, SIZE_T);
     static final FunctionDescriptor PART_FN = FunctionDescriptor.ofVoid(PTR, PTR);
+    static final FunctionDescriptor SERIES_FN = i(PTR, JAVA_LONG);
 
     /** One upcall stub per callback type for the life of the JVM; the query it serves is named by {@code ctx}. */
     static MemorySegment upcall(MethodHandles.Lookup lookup, String method, FunctionDescriptor d) {

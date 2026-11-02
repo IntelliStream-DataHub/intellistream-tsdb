@@ -98,7 +98,7 @@ static void test_stats(void)
     o.wal_max_batch_rows = 64;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "year", TSDB_FLOAT64, NULL, &s));
     int64_t ts[1440];
     double v[1440];
@@ -261,7 +261,7 @@ static void make_times(void)
 
 /* a round of writes: every k-th row of a random stretch, with fresh values (replacing older ones), nulls,
  * and for floats NaN and infinities now and then */
-static void write_round(tsdb *db, const uint32_t *ids)
+static void write_round(tsdb *db, const tsdb_sid *ids)
 {
     size_t a = (size_t)rndr((int64_t)ntimes), b = a + 1 + (size_t)rndr((int64_t)(ntimes - a));
     size_t k = 1 + (size_t)rndr(3);
@@ -386,7 +386,7 @@ static void test_lttb_stats(void)
     o.merge_threads = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "year", TSDB_FLOAT64, NULL, &s));
     int64_t ts[1440];
     double v[1440];
@@ -432,7 +432,7 @@ static void test_twa_memtable(void)
     o.merge_threads = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "twamem", TSDB_FLOAT64, NULL, &s));
     int64_t ts[8];
     double v[8];
@@ -622,7 +622,7 @@ static void check_series(tsdb *db, uint32_t id, const char *stage, int rounds)
     }
 }
 
-static void check_all(tsdb *db, const uint32_t *ids, const char *stage, int rounds)
+static void check_all(tsdb *db, const tsdb_sid *ids, const char *stage, int rounds)
 {
     for (int s = 0; s < NSERIES; s++)
         check_series(db, ids[s], stage, rounds);
@@ -630,7 +630,7 @@ static void check_all(tsdb *db, const uint32_t *ids, const char *stage, int roun
 
 /* Float sums do not depend on how a query is split over threads: the writer (`threads` query threads) and
  * the follower (one) give the same bits for the same parts. */
-static void same_threads(tsdb *db, tsdb *f, const uint32_t *ids, int threads)
+static void same_threads(tsdb *db, tsdb *f, const tsdb_sid *ids, int threads)
 {
     char what[128];
     for (int s = 0; s < NSERIES; s++)
@@ -640,8 +640,8 @@ static void same_threads(tsdb *db, tsdb *f, const uint32_t *ids, int threads)
             size_t na, nb;
             OK(tsdb_query_spread(db, ids[s], TSDB_TS_MIN, TSDB_TS_MAX, iv, NULL, &a, &na));
             OK(tsdb_query_spread(f, ids[s], TSDB_TS_MIN, TSDB_TS_MAX, iv, NULL, &b, &nb));
-            snprintf(what, sizeof what, "%d threads against 1, series %u, interval %lld", threads, ids[s],
-                     (long long)iv);
+            snprintf(what, sizeof what, "%d threads against 1, series %llu, interval %lld", threads,
+                     (unsigned long long)ids[s], (long long)iv);
             same_cut(what, a, na, b, nb, sizeof *a, false, 0);
             free(a), free(b);
         }
@@ -654,7 +654,7 @@ static void test_random(int threads, int rounds)
     rmrf(dir);
     __atomic_store_n(&clock_now, T0 + SPAN + DAY_MS, __ATOMIC_SEQ_CST);
     tsdb *db = open_rand(dir, threads, false);
-    uint32_t ids[NSERIES];
+    tsdb_sid ids[NSERIES];
     for (int s = 0; s < NSERIES; s++) {
         char name[32];
         snprintf(name, sizeof name, "s%d", s);
@@ -720,7 +720,7 @@ static void test_ends(void)
     o.merge_threads = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "ends", TSDB_FLOAT64, NULL, &s));
     enum { N = 10 };
     int64_t ts[N];
@@ -771,7 +771,7 @@ static void test_max_buckets(void)
     o.merge_threads = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "maxb", TSDB_FLOAT32, NULL, &s));
     const int64_t lim = 4 << 20, t0 = 1700000000000;
     int64_t ts[3] = {t0, t0 + lim - 1, t0 + lim};

@@ -57,13 +57,14 @@ fn querier(args: &Args, k: &Class, thread: usize) -> (u64, u64, f64) {
         for _ in 0..16 {
             let (s, start, end) = common::window(&mut r, args.series, args.points, k.window);
             if !k.agg {
-                c.query_raw(s, start..end, QueryOpts::default(), |ts, _| {
+                c.query_raw(u64::from(s), start..end, QueryOpts::default(), |ts, _| {
                     rows += ts.len() as u64;
                     ControlFlow::Continue(())
                 })
                 .expect("query");
             } else {
-                let buckets = c.query_agg(s, start..end, k.bucket as i64 * common::step_ms(s)).expect("query");
+                let buckets =
+                    c.query_agg(u64::from(s), start..end, k.bucket as i64 * common::step_ms(s)).expect("query");
                 rows += buckets.iter().map(|b| b.count).sum::<u64>();
             }
             queries += 1;

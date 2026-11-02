@@ -86,7 +86,7 @@ class EmbeddedDbTest {
 
     @Test
     void series() throws TsdbException {
-        int a = db.series("a");
+        long a = db.series("a");
         assertEquals(a, db.series("a"));
         assertEquals(a, db.series("a", false));
         assertEquals(Status.ERR_NOTFOUND, status(() -> db.series("missing", false)));
@@ -96,15 +96,67 @@ class EmbeddedDbTest {
         assertEquals(1, db.seriesCount());
         assertEquals(1, db.volumeCount());
         assertEquals(db.volumePath(0), db.seriesPath(a));
-        int b = db.seriesAt("b", tmp.resolve("vol2").toString());
+        long b = db.seriesAt("b", tmp.resolve("vol2").toString());
         assertEquals(2, db.volumeCount());
         assertTrue(db.seriesPath(b).endsWith("vol2"));
         assertEquals(ValueType.FLOAT32, db.seriesType(b));
+        long[] ids = db.seriesIds(); /* no order across volumes */
+        java.util.Arrays.sort(ids);
+        long[] want = {a, b};
+        java.util.Arrays.sort(want);
+        assertArrayEquals(want, ids);
+        assertEquals(2, db.seriesCount());
+    }
+
+    /** Enough ids that tsdb_series_foreach's upcall grows its array several times. */
+    @Test
+    void seriesIdsListsEverySeries() throws TsdbException {
+        java.util.Set<Long> want = new java.util.HashSet<>();
+        for (int i = 0; i < 1000; i++)
+            want.add(db.series("s" + i));
+        long[] ids = db.seriesIds();
+        assertEquals(1000, ids.length);
+        assertEquals(want, java.util.Arrays.stream(ids).boxed().collect(java.util.stream.Collectors.toSet()));
+        assertEquals(1000, db.seriesCount());
+    }
+
+    /**
+     * Ids are 64 bits: one past 2^32 is unknown to every call, never the series of its low 32 bits (here series a,
+     * which must not change).
+     */
+    @Test
+    void idsBeyond32BitsAreUnknown() throws TsdbException {
+        long a = db.series("a");
+        long st = db.seriesCreate("st", ValueType.STATE);
+        db.insert(a, new long[] {T0}, new float[] {1});
+        long[] ts = {T0, T0 + 1000};
+        float[] v = {7, 8};
+        for (long big : new long[] {a | 1L << 32, st | 1L << 32, -1L, Long.MIN_VALUE | a}) {
+            String what = Long.toUnsignedString(big);
+            assertEquals(Status.ERR_INVALID, status(() -> db.insert(big, ts, v)), what);
+            assertEquals(Status.ERR_INVALID, status(() -> db.insert(new long[] {a, big}, ts, v)), what);
+            assertEquals(Status.ERR_INVALID, status(() -> db.insertSeriesValues(big, ts, Column.ofFloats(v))), what);
+            assertEquals(Status.ERR_INVALID, status(() -> db.append(big, T0 + 5000, 9)), what);
+            assertEquals(Status.ERR_INVALID, status(() -> db.deleteRange(big, Long.MIN_VALUE, Long.MAX_VALUE)), what);
+            assertEquals(Status.ERR_NOTFOUND, status(() -> db.seriesName(big)), what);
+            assertEquals(Status.ERR_NOTFOUND, status(() -> db.seriesPath(big)), what);
+            assertEquals(Status.ERR_NOTFOUND, status(() -> db.seriesType(big)), what);
+            assertEquals(Status.ERR_NOTFOUND, status(() -> db.retention(big)), what);
+            assertEquals(Status.ERR_NOTFOUND, status(() -> db.state(big, "on")), what);
+            assertEquals(Status.ERR_NOTFOUND, status(() -> db.queryValues(big, Long.MIN_VALUE, Long.MAX_VALUE)), what);
+            var multi = db.queryValuesMulti(new long[] {big, a}, Long.MIN_VALUE, Long.MAX_VALUE, Order.ASC, 0,
+                    ai.intellistream.tsdb.MultiOptions.defaults());
+            assertEquals(0, multi.get(0).get().size(), what);
+            assertEquals(1, multi.get(1).get().size(), what);
+        }
+        assertArrayEquals(new float[] {1}, db.queryPoints(a, Long.MIN_VALUE, Long.MAX_VALUE).values());
+        assertEquals("a", db.seriesName(a));
+        assertEquals(2, db.seriesCount());
     }
 
     @Test
     void insertAndStream() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         int n = 100_000; /* more than CHUNK: several chunks */
         long[] ts = new long[n];
         float[] v = new float[n];
@@ -147,12 +199,12 @@ class EmbeddedDbTest {
 
     @Test
     void offsetsManySeriesAndEmptyInserts() throws TsdbException {
-        int a = db.series("a");
-        int b = db.series("b");
+        long a = db.series("a");
+        long b = db.series("b");
         long[] ts = {T0, T0 + 1, T0 + 2, T0 + 3};
         float[] v = {1, 2, 3, 4};
         db.insert(a, ts, v, 1, 2);
-        db.insert(new int[] {a, b, a, b}, ts, v, 0, 4);
+        db.insert(new long[] {a, b, a, b}, ts, v, 0, 4);
         db.insert(a, new long[0], new float[0]);
         db.insertAsync(a, new long[] {T0 + 9}, new float[] {9});
         db.await();
@@ -165,7 +217,7 @@ class EmbeddedDbTest {
 
     @Test
     void lastWriteWinsAndCorrections() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         db.insert(s, new long[] {T0, T0 + 1, T0}, new float[] {1, 2, 3}); /* later row of a batch wins */
         db.append(s, T0 + 1, 20);
         db.flush();
@@ -178,7 +230,7 @@ class EmbeddedDbTest {
 
     @Test
     void descendingWithLimit() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         long[] ts = new long[50];
         float[] v = new float[50];
         for (int i = 0; i < 50; i++) {
@@ -215,7 +267,7 @@ class EmbeddedDbTest {
             Column.ofBools(true, false, false, true, true).withNulls(nulls),
             null,
         };
-        int st = db.seriesCreate("state", ValueType.STATE);
+        long st = db.seriesCreate("state", ValueType.STATE);
         int on = db.state(st, "on");
         int off = db.state(st, "off");
         assertEquals(on, db.state(st, "on"));
@@ -225,7 +277,7 @@ class EmbeddedDbTest {
         assertEquals(Status.ERR_NOTFOUND, status(() -> db.stateName(st, 999)));
         cols[4] = Column.ofStates(on, off, off, on, off).withNulls(nulls);
         for (Column c : cols) {
-            int s = c.type() == ValueType.STATE ? st : db.seriesCreate("t" + c.type(), c.type());
+            long s = c.type() == ValueType.STATE ? st : db.seriesCreate("t" + c.type(), c.type());
             assertEquals(c.type(), db.seriesType(s));
             db.insertSeriesValues(s, ts, c);
             ValuePoints p = db.queryValues(s, T0, T0 + 10);
@@ -250,22 +302,22 @@ class EmbeddedDbTest {
             }));
             assertEquals(List.of(T0 + 4, T0 + 3, T0 + 2), seen);
         }
-        int f = db.series("f32");
+        long f = db.series("f32");
         assertEquals(Status.ERR_INVALID, status(() -> db.insertSeriesValues(f, ts, cols[1])), "type mismatch");
         assertEquals(Status.ERR_INVALID, status(() -> db.seriesCreate("f32", ValueType.INT64)));
-        int i64 = db.seriesCreate("tINT64", ValueType.INT64);
+        long i64 = db.seriesCreate("tINT64", ValueType.INT64);
         assertEquals(Status.ERR_INVALID, status(() -> db.queryPoints(i64, T0, T0 + 10)));
     }
 
     @Test
     void manySeriesTypedInsertAndOffsets() throws TsdbException {
-        int a = db.seriesCreate("a", ValueType.FLOAT64);
-        int b = db.seriesCreate("b", ValueType.FLOAT64);
+        long a = db.seriesCreate("a", ValueType.FLOAT64);
+        long b = db.seriesCreate("b", ValueType.FLOAT64);
         BitSet nulls = new BitSet();
         nulls.set(2);
         Column c = Column.ofDoubles(0, 1, 2, 3, 4, 5).withNulls(nulls);
         long[] ts = {T0, T0, T0 + 1, T0 + 1, T0 + 2, T0 + 2};
-        db.insertValues(new int[] {a, b, a, b, a, b}, ts, c, 1, 5); /* the bitmap shifts with the offset */
+        db.insertValues(new long[] {a, b, a, b, a, b}, ts, c, 1, 5); /* the bitmap shifts with the offset */
         ValuePoints pa = db.queryValues(a, T0, T0 + 10);
         assertArrayEquals(new long[] {T0 + 1, T0 + 2}, pa.timestamps());
         assertTrue(pa.values().isNull(0));
@@ -277,8 +329,8 @@ class EmbeddedDbTest {
 
     @Test
     void reservedValuesReadBackAsNull() throws TsdbException {
-        int f = db.seriesCreate("f", ValueType.FLOAT32);
-        int i = db.seriesCreate("i", ValueType.INT64);
+        long f = db.seriesCreate("f", ValueType.FLOAT32);
+        long i = db.seriesCreate("i", ValueType.INT64);
         db.insertSeriesValues(f, new long[] {T0, T0 + 1}, Column.ofFloats(Float.intBitsToFloat(0x7fc01001), 1));
         db.insertSeriesValues(i, new long[] {T0}, Column.ofLongs(Long.MIN_VALUE));
         assertTrue(db.queryValues(f, T0, T0 + 2).values().isNull(0));
@@ -288,7 +340,7 @@ class EmbeddedDbTest {
 
     @Test
     void aggregates() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         long[] ts = new long[100];
         float[] v = new float[100];
         for (int i = 0; i < 100; i++) {
@@ -307,7 +359,7 @@ class EmbeddedDbTest {
         assertEquals(10, tens.size());
         assertEquals(45, tens.get(0).sum());
         assertEquals(4.5, tens.get(0).avg());
-        int n = db.seriesCreate("n", ValueType.INT64);
+        long n = db.seriesCreate("n", ValueType.INT64);
         db.insertSeriesValues(n, new long[] {T0, T0 + 1, T0 + 2}, Column.ofLongs(Long.MAX_VALUE, Long.MAX_VALUE, -1));
         Bucket b = db.queryAgg(n, T0, T0 + 3, 0).get(0);
         assertEquals(Long.MAX_VALUE, b.isum(), "clamped exact sum");
@@ -323,7 +375,7 @@ class EmbeddedDbTest {
 
     @Test
     void spreadTwaAndLttb() throws TsdbException {
-        int s = db.seriesCreate("sp", ValueType.FLOAT64);
+        long s = db.seriesCreate("sp", ValueType.FLOAT64);
         db.insertSeriesValues(s, new long[] {T0, T0 + 1000, T0 + 2000, T0 + 3000}, Column.ofDoubles(1, 2, 3, 4));
         SpreadBucket all = db.querySpread(s, T0, T0 + 4000, 0).get(0);
         assertEquals(4, all.bucket().count());
@@ -346,7 +398,7 @@ class EmbeddedDbTest {
                 Order.ASC, 0));
         assertThrows(IllegalArgumentException.class, () -> db.querySpread(s, T0, T0 + 1, 0, Order.ASC, -1));
 
-        int t = db.seriesCreate("tw", ValueType.FLOAT64);
+        long t = db.seriesCreate("tw", ValueType.FLOAT64);
         db.insertSeriesValues(t, new long[] {T0, T0 + 1000, T0 + 3000}, Column.ofDoubles(0, 10, 10));
         TwaBucket step = db.queryTwa(t, T0, T0 + 3000, 0, TwaOptions.step()).get(0);
         assertEquals(20_000, step.area(), 1e-9);
@@ -364,11 +416,11 @@ class EmbeddedDbTest {
                 db.queryTwaGroup(t, T0, T0 + 3000, null, TwaOptions.linear()));
         assertEquals(1, db.queryTwaGroup(t, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY).in("Asia/Tokyo"),
                 TwaOptions.step()).size());
-        int st = db.seriesCreate("st", ValueType.STATE);
+        long st = db.seriesCreate("st", ValueType.STATE);
         assertEquals(Status.ERR_INVALID, status(() -> db.queryTwa(st, T0, T0 + 1, 0, TwaOptions.step())));
         assertEquals(Status.ERR_INVALID, status(() -> db.queryTwa(t, T0, T0 + 1, -1, TwaOptions.step())));
 
-        int l = db.series("lt");
+        long l = db.series("lt");
         long[] ts = new long[1000];
         float[] v = new float[1000];
         for (int i = 0; i < ts.length; i++) {
@@ -405,7 +457,7 @@ class EmbeddedDbTest {
 
     @Test
     void deleteReplaceAndRetention() throws TsdbException {
-        int s = db.seriesCreate("d", ValueType.INT64);
+        long s = db.seriesCreate("d", ValueType.INT64);
         long[] ts = new long[10];
         long[] v = new long[10];
         for (int i = 0; i < 10; i++) {
@@ -454,7 +506,7 @@ class EmbeddedDbTest {
 
     @Test
     void groupInUtcAndInZones() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         int n = 24 * 400; /* hourly for 400 days: DST changes both ways, month and year ends */
         long[] ts = new long[n];
         float[] v = new float[n];
@@ -492,7 +544,7 @@ class EmbeddedDbTest {
         }
         /* more local periods than the calendar computes (64 Mi seconds is 777 days): TOO_MANY_BUCKETS from every
          * grouped call, as from the TCP clients */
-        int wide = db.series("wide");
+        long wide = db.series("wide");
         db.insert(wide, new long[] {T0, T0 + 800 * 86_400_000L}, new float[] {1, 2});
         Group secs = Group.of(Unit.SECOND).in("Europe/Oslo");
         assertEquals(Status.ERR_TOO_MANY_BUCKETS, status(() -> db.queryGroup(wide, Long.MIN_VALUE, Long.MAX_VALUE,
@@ -501,7 +553,7 @@ class EmbeddedDbTest {
                 Long.MAX_VALUE, secs, Order.ASC, 0)));
         assertEquals(Status.ERR_TOO_MANY_BUCKETS, status(() -> db.queryTwaGroup(wide, Long.MIN_VALUE, Long.MAX_VALUE,
                 secs, TwaOptions.step())));
-        int empty = db.series("empty");
+        long empty = db.series("empty");
         assertEquals(0, db.queryGroup(empty, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY).in("Europe/Oslo"))
                 .size());
     }
@@ -528,7 +580,7 @@ class EmbeddedDbTest {
 
     @Test
     void exceptionInAConsumerStopsTheQuery() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         int n = 3 * EmbeddedDb.CHUNK;
         long[] ts = new long[n];
         float[] v = new float[n];
@@ -584,7 +636,7 @@ class EmbeddedDbTest {
 
     @Test
     void maintenanceStatsAndParts() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         for (int k = 0; k < 3; k++)
             db.insert(s, new long[] {T0 + k * 86_400_000L}, new float[] {k});
         db.flush();
@@ -618,7 +670,7 @@ class EmbeddedDbTest {
 
     @Test
     void lastQueryStatsBelongToTheVirtualThread() throws Exception {
-        int s = db.series("x");
+        long s = db.series("x");
         long[] ts = new long[1000];
         float[] v = new float[1000];
         for (int i = 0; i < 1000; i++)
@@ -642,15 +694,15 @@ class EmbeddedDbTest {
     @Test
     void manyThreadsOnOneDatabase() throws Exception {
         int threads = 16;
-        int[] ids = new int[threads];
+        long[] ids = new long[threads];
         for (int t = 0; t < threads; t++)
             ids[t] = db.series("s" + t);
         ExecutorService ex = Executors.newFixedThreadPool(threads);
         try {
             List<Future<Long>> fs = new ArrayList<>();
             for (int t = 0; t < threads; t++) {
-                int id = ids[t];
-                int other = ids[(t + 1) % threads];
+                long id = ids[t];
+                long other = ids[(t + 1) % threads];
                 fs.add(ex.submit(() -> {
                     long checked = 0;
                     for (int round = 0; round < 50; round++) {
@@ -675,7 +727,7 @@ class EmbeddedDbTest {
             for (Future<Long> f : fs)
                 total += f.get();
             assertEquals(threads * 50L * 200, total);
-            for (int id : ids)
+            for (long id : ids)
                 assertEquals(10_000, db.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE).size());
         } finally {
             ex.shutdown();
@@ -684,7 +736,7 @@ class EmbeddedDbTest {
 
     @Test
     void closeWaitsForRunningCalls() throws Exception {
-        int s = db.series("x");
+        long s = db.series("x");
         long[] ts = new long[50_000];
         float[] v = new float[50_000];
         for (int i = 0; i < ts.length; i++)
@@ -718,7 +770,7 @@ class EmbeddedDbTest {
 
     @Test
     void arraysTheLibraryReturnsAreFreed() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         db.insert(s, new long[] {T0, T0 + 1000}, new float[] {1, 2});
         long before = Native.OUTSTANDING.get();
         for (int i = 0; i < 10_000; i++) {
@@ -753,10 +805,10 @@ class EmbeddedDbTest {
     @Test
     void aNulInsideAStringIsRefused() throws Exception {
         /* C would read "a" and use that series instead; tsdbd refuses the same names */
-        int a = db.series("a");
-        int st = db.seriesCreate("st", ValueType.STATE);
+        long a = db.series("a");
+        long st = db.seriesCreate("st", ValueType.STATE);
         db.state(st, "run");
-        int count = db.seriesCount();
+        long count = db.seriesCount();
         String vol = tmp.resolve("vol").toString();
         assertEquals(Status.ERR_INVALID, status(() -> db.series("a\0b")));
         assertEquals(Status.ERR_INVALID, status(() -> db.series("a\0b", false)));
@@ -774,7 +826,7 @@ class EmbeddedDbTest {
 
     @Test
     void aCollectingQueryOverTheArrayLimitFails() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         long[] ts = new long[1000];
         for (int i = 0; i < ts.length; i++)
             ts[i] = T0 + i;
@@ -793,8 +845,8 @@ class EmbeddedDbTest {
     }
 
     /* rows in a part and in the memtable reach the stub in several engine callbacks */
-    private int rowsInSeveralCallbacks(ValueType type) throws TsdbException {
-        int s = type == ValueType.FLOAT32 ? db.series("x") : db.seriesCreate("x", type);
+    private long rowsInSeveralCallbacks(ValueType type) throws TsdbException {
+        long s = type == ValueType.FLOAT32 ? db.series("x") : db.seriesCreate("x", type);
         int n = EmbeddedDb.CHUNK + 100;
         long[] ts = new long[n];
         for (int i = 0; i < n; i++)
@@ -811,7 +863,7 @@ class EmbeddedDbTest {
 
     @Test
     void anExceptionStopsAQueryThatSpansSeveralEngineCallbacks() throws TsdbException {
-        int s = rowsInSeveralCallbacks(ValueType.FLOAT32);
+        long s = rowsInSeveralCallbacks(ValueType.FLOAT32);
         AtomicInteger calls = new AtomicInteger();
         assertThrows(IllegalStateException.class, () -> db.queryRaw(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, k) -> {
             calls.incrementAndGet();
@@ -825,7 +877,7 @@ class EmbeddedDbTest {
 
     @Test
     void anExceptionStopsATypedQueryThatSpansSeveralEngineCallbacks() throws TsdbException {
-        int s = rowsInSeveralCallbacks(ValueType.INT64);
+        long s = rowsInSeveralCallbacks(ValueType.INT64);
         AtomicInteger calls = new AtomicInteger();
         assertThrows(IllegalStateException.class,
                 () -> db.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE, (t, c, k) -> {
@@ -837,7 +889,7 @@ class EmbeddedDbTest {
 
     @Test
     void closeWaitsForACallInsideAConsumer() throws Exception {
-        int s = db.series("x");
+        long s = db.series("x");
         db.insert(s, new long[] {T0, T0 + 1}, new float[] {1, 2});
         CountDownLatch inside = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
@@ -874,18 +926,18 @@ class EmbeddedDbTest {
 
     @Test
     void insertOffsetsApplyToTheSeriesArrayAndToBools() throws TsdbException {
-        int a = db.series("a");
-        int b = db.series("b");
+        long a = db.series("a");
+        long b = db.series("b");
         long[] ts = {T0, T0 + 1, T0 + 2, T0 + 3};
-        db.insert(new int[] {b, a, b, a}, ts, new float[] {1, 2, 3, 4}, 1, 2);
+        db.insert(new long[] {b, a, b, a}, ts, new float[] {1, 2, 3, 4}, 1, 2);
         assertArrayEquals(new long[] {T0 + 1}, db.queryPoints(a, T0, T0 + 10).timestamps());
         assertArrayEquals(new float[] {2}, db.queryPoints(a, T0, T0 + 10).values());
         assertArrayEquals(new long[] {T0 + 2}, db.queryPoints(b, T0, T0 + 10).timestamps());
-        int c = db.seriesCreate("c", ValueType.BOOL);
-        int d = db.seriesCreate("d", ValueType.BOOL);
+        long c = db.seriesCreate("c", ValueType.BOOL);
+        long d = db.seriesCreate("d", ValueType.BOOL);
         db.insertSeriesValues(c, ts, Column.ofBools(true, false, true, true), 1, 2);
         assertArrayEquals(new boolean[] {false, true}, db.queryValues(c, T0, T0 + 10).values().bools());
-        db.insertValues(new int[] {c, d, d, c}, ts, Column.ofBools(true, true, false, true), 1, 2);
+        db.insertValues(new long[] {c, d, d, c}, ts, Column.ofBools(true, true, false, true), 1, 2);
         ValuePoints vd = db.queryValues(d, T0, T0 + 10);
         assertArrayEquals(new long[] {T0 + 1, T0 + 2}, vd.timestamps());
         assertArrayEquals(new boolean[] {true, false}, vd.values().bools());
@@ -893,7 +945,7 @@ class EmbeddedDbTest {
 
     @Test
     void lastQueryStatsFollowStreamingAndCollectingQueries() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         long[] ts = new long[100];
         for (int i = 0; i < ts.length; i++)
             ts[i] = T0 + i;
@@ -910,7 +962,7 @@ class EmbeddedDbTest {
 
     @Test
     void optimizeRaisesThePartLevel() throws TsdbException {
-        int s = db.series("x");
+        long s = db.series("x");
         for (int k = 0; k < 3; k++) {
             db.insert(s, new long[] {T0 + k}, new float[] {k});
             db.flush();

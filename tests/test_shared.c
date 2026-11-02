@@ -60,7 +60,7 @@ int main(int argc, char **argv)
 
     tsdb *db;
     OK(tsdb_open(dir, NULL, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_create(db, "pump7.flow", TSDB_FLOAT64, NULL, &id));
     enum { N = 1000 };
     int64_t ts[N];

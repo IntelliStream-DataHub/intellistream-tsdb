@@ -28,7 +28,7 @@ enum { NS = 5 };
 static uint64_t rs;
 static int fails;
 static const tsdb_type types[NS] = {TSDB_FLOAT32, TSDB_FLOAT32, TSDB_FLOAT64, TSDB_INT64, TSDB_BOOL};
-static uint32_t ids[NS];
+static tsdb_sid ids[NS];
 static signed char present[NS][K]; /* the model: 0 absent, 1 a value, 2 null */
 static int64_t val[NS][K];
 static int64_t cutk[NS]; /* rows below this slot are expired */

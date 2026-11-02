@@ -231,7 +231,7 @@ static long rows_of(const char *dir, const char *series)
     tsdb *db;
     if (tsdb_open(dir, &o, &db) != 0)
         return -2;
-    uint32_t id;
+    tsdb_sid id;
     long n = -3;
     int rc;
     if (tsdb_series_lookup(db, series, &id) == 0)
@@ -261,7 +261,7 @@ static void make_series(const char *dir, const char *const *names, int n)
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
     for (int i = 0; i < n; i++) {
-        uint32_t id;
+        tsdb_sid id;
         OK(tsdb_series(db, names[i], &id));
         CHECK(id == (uint32_t)i);
     }
@@ -274,7 +274,7 @@ static void check_names(const char *dir, const char *const *names, int n, int pr
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
     for (int i = 0; i < n; i++) {
-        uint32_t id;
+        tsdb_sid id;
         int rc = tsdb_series_lookup(db, names[i], &id);
         if (i < present)
             CHECK(rc == 0 && id == (uint32_t)i);
@@ -341,7 +341,7 @@ static void crash_with_wal(const char *dir, char *wal, size_t len)
     if (pid == 0) {
         tsdb_options o = opts();
         tsdb *db;
-        uint32_t id;
+        tsdb_sid id;
         if (tsdb_open(dir, &o, &db) || tsdb_series(db, "wal.series", &id))
             _exit(1);
         for (int r = 0; r < WAL_RECS; r++) {
@@ -416,7 +416,7 @@ static void test_wal_follower(const char *scratch)
     rm_rf(dir);
     tsdb_options o = opts();
     tsdb *w, *f;
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_open(dir, &o, &w));
     OK(tsdb_series(w, "follow.series", &id));
     int64_t ts[WAL_RECROWS];
@@ -476,7 +476,7 @@ static void make_part(const char *dir, char *part, size_t len)
     rm_rf(dir);
     tsdb_options o = opts();
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_series(db, "part.series", &id));
     int64_t ts[PART_ROWS];
@@ -502,7 +502,7 @@ static void query_part(const char *dir, int verify, int *rc, uint64_t *checks)
     tsdb_options o = opts();
     o.verify_checksums = verify;
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_series_lookup(db, "part.series", &id));
     uint64_t before = atomic_load(&granule_checks);
@@ -574,7 +574,7 @@ static void test_part_follower(const char *scratch)
     make_part(dir, first, sizeof first);
     tsdb_options o = opts();
     tsdb *w, *f = NULL;
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_open(dir, &o, &w));
     OK(tsdb_series_lookup(w, "part.series", &id));
     tsdb_options ro = opts();
@@ -651,7 +651,7 @@ static void test_manifest(const char *scratch)
     fo.read_only = 1;
     fo.refresh_ms = 20;
     tsdb *f;
-    uint32_t id;
+    tsdb_sid id;
     int rc;
 
     /* torn for 300 ms, then the rewrite completes: the follower sees the rows */
@@ -788,7 +788,7 @@ static void test_read_errors(const char *scratch)
     rm_rf(dir);
     tsdb_options o = opts();
     tsdb *w, *f = NULL;
-    uint32_t a, b;
+    tsdb_sid a, b;
     OK(tsdb_open(dir, &o, &w));
     OK(tsdb_series(w, "eio.a", &a));
     OK(tsdb_append(w, a, T0, 1.0f));
@@ -804,7 +804,7 @@ static void test_read_errors(const char *scratch)
         atomic_store(&fault_mode, FAULT_NONE);
         CHECK(atomic_load(&fault_fired) > 0);
         OK(tsdb_refresh(f));
-        uint32_t fb;
+        tsdb_sid fb;
         int rc;
         OK(tsdb_series_lookup(f, "eio.b", &fb));
         CHECK(fb == b && count_rows(f, b, &rc) == 1);

@@ -74,7 +74,7 @@ class EmbeddedMultiTest {
         return o;
     }
 
-    static <T> void check(int[] ids, List<SeriesResult<T>> got, Single<T> single, String what) throws Exception {
+    static <T> void check(long[] ids, List<SeriesResult<T>> got, Single<T> single, String what) throws Exception {
         assertEquals(ids.length, got.size(), what);
         for (int i = 0; i < ids.length; i++) {
             Object want;
@@ -103,26 +103,26 @@ class EmbeddedMultiTest {
             if (i % 97 == 5)
                 nulls.set(i);
         }
-        int[] ids;
+        long[] ids;
         Map<String, Multi<EmbeddedDb>> embedded = new LinkedHashMap<>();
         Map<String, Multi<TsdbClient>> tcp = new LinkedHashMap<>();
         try (EmbeddedDb db = EmbeddedDb.open(dir.toString(), new EmbeddedOptions().fsync(false).requestThreads(4))) {
-            int a = db.series("f32");
+            long a = db.series("f32");
             db.insert(a, ts, f);
-            int b = db.seriesCreate("f64", ValueType.FLOAT64);
+            long b = db.seriesCreate("f64", ValueType.FLOAT64);
             db.insertSeriesValues(b, ts, Column.ofDoubles(d).withNulls(nulls));
-            int c = db.seriesCreate("i64", ValueType.INT64);
+            long c = db.seriesCreate("i64", ValueType.INT64);
             db.insertSeriesValues(c, java.util.Arrays.copyOf(ts, ROWS / 3),
                     Column.ofLongs(java.util.Arrays.copyOf(l, ROWS / 3)));
-            int s = db.seriesCreate("state", ValueType.STATE);
+            long s = db.seriesCreate("state", ValueType.STATE);
             int[] st = new int[ROWS];
             int[] codes = {db.state(s, "idle"), db.state(s, "run")};
             for (int i = 0; i < ROWS; i++)
                 st[i] = codes[i % 7 < 3 ? 0 : 1];
             db.insertSeriesValues(s, ts, Column.ofStates(st));
-            int e = db.seriesCreate("empty", ValueType.BOOL);
-            ids = new int[] {a, b, c, s, e, a};
-            int[] known = ids;
+            long e = db.seriesCreate("empty", ValueType.BOOL);
+            ids = new long[] {a, b, c, s, e, a};
+            long[] known = ids;
 
             long[] iv = {3_600_000, 600_000, 86_400_000, 7_200_000, 60_000, 0};
             long[] bounds = {T0, T0 + 3_600_000, T0 + 86_400_000, T0 + 3 * 86_400_000L};
@@ -169,17 +169,17 @@ class EmbeddedMultiTest {
                             i -> db.queryTwaBounds(known[i], MIN, MAX, bounds, t), "twa bounds " + w);
                 }
             /* an unknown id has no rows (status 0), as over TCP; the cap on all rows fails the call */
-            List<SeriesResult<ValuePoints>> u = db.queryValuesMulti(new int[] {999_999, a}, MIN, MAX, Order.ASC, 0,
+            List<SeriesResult<ValuePoints>> u = db.queryValuesMulti(new long[] {999_999, a}, MIN, MAX, Order.ASC, 0,
                     dflt);
             assertTrue(u.get(0).ok() && u.get(0).get().size() == 0 && u.get(1).get().size() == ROWS);
             TsdbException x = assertThrows(TsdbException.class,
                     () -> db.queryValuesMulti(known, MIN, MAX, Order.ASC, 0, dflt.maxRows(100)));
             assertEquals(Status.ERR_TOO_MANY_BUCKETS, x.status());
             assertFalse(db.queryTwaMulti(known, MIN, MAX, Buckets.one(), TwaOptions.step(), dflt).get(3).ok());
-            assertEquals(0, db.queryBucketsMulti(new int[0], MIN, MAX, Buckets.one(), Order.ASC, 0, dflt).size());
+            assertEquals(0, db.queryBucketsMulti(new long[0], MIN, MAX, Buckets.one(), Order.ASC, 0, dflt).size());
 
             /* the same calls through tsdbd */
-            int[] all = {a, b, c, s, e, 999_999, a};
+            long[] all = {a, b, c, s, e, 999_999, a};
             long[] iv2 = {3_600_000, 600_000, 86_400_000, 7_200_000, 60_000, 0, -5};
             embedded.put("values", x2 -> ((EmbeddedDb) x2).queryValuesMulti(all, MIN, MAX, Order.DESC, 3, dflt));
             tcp.put("values", x2 -> x2.queryValuesMulti(all, MIN, MAX, Order.DESC, 3, dflt));

@@ -19,6 +19,7 @@ import java.util.concurrent.Future;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 /** Integration tests: every operation against a live build/tsdbd. */
 class TsdbClientTest {
@@ -84,8 +85,8 @@ class TsdbClientTest {
 
     @Test
     void series() throws Exception {
-        int a = c.series("tank.level_bar");
-        int b = c.series("pump.flow_m3h", true);
+        long a = c.series("tank.level_bar");
+        long b = c.series("pump.flow_m3h", true);
         assertNotEquals(a, b);
         assertEquals(a, c.series("tank.level_bar", false));
         assertEquals(Status.ERR_NOTFOUND, assertThrows(TsdbException.class, () -> c.series("missing", false)).status());
@@ -106,7 +107,7 @@ class TsdbClientTest {
                 assertThrows(TsdbException.class, () -> c.seriesAt("remote.on_volume", vol)).status());
         assertFalse(java.nio.file.Files.exists(scratch.resolve("volume")));
         server.addVolume(scratch.resolve("volume"));
-        int id = c.seriesAt("remote.on_volume", vol);
+        long id = c.seriesAt("remote.on_volume", vol);
         assertEquals(id, c.seriesAt("remote.on_volume", null)); /* the path only matters at creation */
         c.insert(id, new long[] {T0}, new float[] {3.5f});
         Points p = c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE);
@@ -116,7 +117,7 @@ class TsdbClientTest {
 
     @Test
     void largeInsertStreamsBack() throws Exception {
-        int id = c.series("big.stream");
+        long id = c.series("big.stream");
         long[] ts = seq(T0, 1000, N);
         float[] v = bigValues();
         c.insert(id, ts, v);
@@ -148,7 +149,7 @@ class TsdbClientTest {
 
     @Test
     void stoppingAStreamKeepsTheConnection() throws Exception {
-        int id = c.series("stop.early");
+        long id = c.series("stop.early");
         c.insert(id, seq(T0, 1000, 100_000), new float[100_000]);
         int[] calls = {0};
         assertFalse(c.queryRaw(id, Long.MIN_VALUE, Long.MAX_VALUE, (t, x, n) -> ++calls[0] < 1));
@@ -165,7 +166,7 @@ class TsdbClientTest {
 
     @Test
     void lastWriteWins() throws Exception {
-        int a = c.series("lww.a"), b = c.series("lww.b");
+        long a = c.series("lww.a"), b = c.series("lww.b");
 
         /* within one batch, the later row */
         c.insert(a, new long[] {T0, T0, T0 + 1000}, new float[] {1, 2, 3});
@@ -174,7 +175,7 @@ class TsdbClientTest {
         assertArrayEquals(new float[] {2, 3}, p.values());
 
         /* rows of several series in one batch, then a pipelined rewrite of the same keys */
-        int[] s = {b, b, a};
+        long[] s = {b, b, a};
         long[] t = {T0, T0 + 1000, T0};
         float[] v = {1.5f, 2.5f, -7.0f};
         c.insertAsync(s, t, v);
@@ -198,25 +199,64 @@ class TsdbClientTest {
 
     @Test
     void offsetsAndEmptyInserts() throws Exception {
-        int id = c.series("offsets");
+        long id = c.series("offsets");
         long[] ts = seq(T0, 1000, 20);
         float[] v = new float[20];
         for (int i = 0; i < 20; i++)
             v[i] = i;
         c.insert(id, ts, v, 10, 5);
-        c.insert(new int[] {id, id, id}, ts, v, 0, 2);
+        c.insert(new long[] {id, id, id}, ts, v, 0, 2);
         c.insert(id, new long[0], new float[0]);
         Points p = c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE);
         assertArrayEquals(new float[] {0, 1, 10, 11, 12, 13, 14}, p.values());
         assertThrows(IllegalArgumentException.class, () -> c.insert(id, ts, new float[3]));
         assertThrows(IndexOutOfBoundsException.class, () -> c.insert(id, ts, v, 18, 5));
-        assertThrows(IllegalArgumentException.class, () -> c.insert(-1, ts, v)); /* the many-series marker */
+        assertThrows(IllegalArgumentException.class, () -> c.insert(0xffffffffL, ts, v)); /* the many-series marker */
         assertEquals(0, c.pending());
+    }
+
+    /**
+     * Protocol 10 carries 32-bit ids: a larger one is refused before anything is sent, never cut to the series of
+     * its low bits (here a real one, which must not change).
+     */
+    @Test
+    void idsBeyond32BitsAreRefusedNotTruncated() throws Exception {
+        long id = c.series("wide.id");
+        c.insert(id, new long[] {T0}, new float[] {1});
+        long[] ts = {T0, T0 + 1000};
+        float[] v = {7, 8};
+        c.queryTwa(id, T0, T0 + 1, 0, TwaOptions.step()); /* HELLO asked here, not by a refused call below */
+        for (long big : new long[] {id | 1L << 32, -1L, Long.MIN_VALUE | id}) {
+            long sent = c.bytesSent();
+            List<Executable> calls = List.of(() -> c.insert(big, ts, v), () -> c.insertAsync(big, ts, v),
+                    () -> c.insert(new long[] {id, big}, ts, v),
+                    () -> c.insertSeriesValues(big, ts, Column.ofFloats(v)),
+                    () -> c.insertValues(new long[] {big, id}, ts, Column.ofFloats(v)),
+                    () -> c.replaceRange(big, T0, T0 + 2000, ts, Column.ofFloats(v)),
+                    () -> c.deleteRange(big, Long.MIN_VALUE, Long.MAX_VALUE), () -> c.setRetention(big, 1),
+                    () -> c.retention(big), () -> c.seriesName(big), () -> c.seriesType(big),
+                    () -> c.state(big, "on"), () -> c.stateName(big, 1),
+                    () -> c.queryPoints(big, Long.MIN_VALUE, Long.MAX_VALUE),
+                    () -> c.queryValues(big, Long.MIN_VALUE, Long.MAX_VALUE),
+                    () -> c.queryAgg(big, Long.MIN_VALUE, Long.MAX_VALUE, 0),
+                    () -> c.queryGroup(big, Long.MIN_VALUE, Long.MAX_VALUE, Group.of(Unit.DAY)),
+                    () -> c.queryBounds(big, Long.MIN_VALUE, Long.MAX_VALUE, new long[] {T0}),
+                    () -> c.queryLttb(big, Long.MIN_VALUE, Long.MAX_VALUE, 10),
+                    () -> c.queryTwa(big, Long.MIN_VALUE, Long.MAX_VALUE, 0, TwaOptions.step()),
+                    () -> c.queryValuesMulti(new long[] {id, big}, Long.MIN_VALUE, Long.MAX_VALUE));
+            for (Executable call : calls)
+                assertEquals(Status.ERR_INVALID, assertThrows(TsdbException.class, call).status(),
+                        Long.toUnsignedString(big));
+            assertEquals(sent, c.bytesSent(), "nothing was sent");
+            assertEquals(0, c.pending());
+        }
+        assertArrayEquals(new float[] {1}, c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE).values());
+        assertEquals("wide.id", c.seriesName(id));
     }
 
     @Test
     void descendingWithLimit() throws Exception {
-        int id = c.series("desc.limit");
+        long id = c.series("desc.limit");
         long[] ts = seq(T0, 1000, N);
         c.insert(id, ts, bigValues());
         Points p = c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE, Order.DESC, 5);
@@ -238,7 +278,7 @@ class TsdbClientTest {
 
     @Test
     void aggregates() throws Exception {
-        int id = c.series("agg.minutes");
+        long id = c.series("agg.minutes");
         long[] ts = seq(T0, 1000, N);
         float[] v = bigValues();
         v[0] = -7.0f;
@@ -276,7 +316,7 @@ class TsdbClientTest {
 
     @Test
     void groupByTimezone() throws Exception {
-        int id = c.series("group.days");
+        long id = c.series("group.days");
         long[] ts = seq(T0, 1000, N); /* 2023-11-14 to 2023-11-17, no DST change in Oslo */
         c.insert(id, ts, bigValues());
 
@@ -308,7 +348,7 @@ class TsdbClientTest {
 
     @Test
     void errors() throws Exception {
-        int id = c.series("errors");
+        long id = c.series("errors");
         c.insert(id, new long[] {T0}, new float[] {1});
         assertEquals(Status.ERR_INVALID,
                 assertThrows(TsdbException.class, () -> c.queryAgg(id, T0, T0 + 1, -5)).status());
@@ -349,7 +389,7 @@ class TsdbClientTest {
 
     @Test
     void maintenanceAndStats() throws Exception {
-        int id = c.series("maint");
+        long id = c.series("maint");
         c.insert(id, seq(T0, 1000, 1000), new float[1000]);
         Stats before = c.stats();
         assertTrue(before.rows() + before.memtableRows() >= 1000, before.toString());
@@ -366,7 +406,7 @@ class TsdbClientTest {
     void lastQueryStats() throws Exception {
         try (TsdbClient own = server.client()) {
             assertEquals(new QueryStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), own.lastQueryStats(), "before any query");
-            int id = own.series("query.stats");
+            long id = own.series("query.stats");
             own.insert(id, seq(T0, 1000, N), bigValues());
             own.flush();
 
@@ -412,7 +452,7 @@ class TsdbClientTest {
         try {
             List<Future<Bucket>> results = new ArrayList<>();
             for (int i = 0; i < threads; i++) {
-                int id = c.series("vib." + i);
+                long id = c.series("vib." + i);
                 float value = i;
                 results.add(pool.submit(() -> {
                     try (TsdbClient own = server.client()) { /* one client per thread */
@@ -438,7 +478,7 @@ class TsdbClientTest {
 
     @Test
     void closeWaitsForPipelinedInserts() throws Exception {
-        int id = c.series("close.pipelined");
+        long id = c.series("close.pipelined");
         TsdbClient own = server.client();
         for (int round = 0; round < 100; round++)
             own.insertAsync(id, seq(T0 + round * 100_000L, 1000, 100), new float[100]);
@@ -451,7 +491,7 @@ class TsdbClientTest {
 
     @Test
     void manyPipelinedInsertsStayBounded() throws Exception {
-        int id = c.series("bounded");
+        long id = c.series("bounded");
         try (TsdbClient own = server.client()) {
             long[] t = new long[1];
             float[] v = new float[1];

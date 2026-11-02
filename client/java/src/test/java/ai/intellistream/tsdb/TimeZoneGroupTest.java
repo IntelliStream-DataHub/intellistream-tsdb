@@ -54,7 +54,7 @@ class TimeZoneGroupTest {
             try (TsdbServer s = TsdbServer.start(db); TsdbClient c = s.client()) {
                 assertEquals(Protocol.VERSION, c.hello());
                 /* every 10 minutes through 2024 and a bit, and random rows over 50 years; int64 sums are exact */
-                int tenMin = c.seriesCreate("ten.min", ValueType.INT64);
+                long tenMin = c.seriesCreate("ten.min", ValueType.INT64);
                 long t0 = utc(2023, 12, 25, 0);
                 int n = (int) ((utc(2025, 1, 10, 0) - t0) / (10 * MIN));
                 long[] ts = new long[n], v = new long[n];
@@ -63,7 +63,7 @@ class TimeZoneGroupTest {
                     v[i] = i % 97;
                 }
                 c.insertSeriesValues(tenMin, ts, Column.ofLongs(v));
-                int sparse = c.seriesCreate("sparse", ValueType.INT64);
+                long sparse = c.seriesCreate("sparse", ValueType.INT64);
                 Random r = new Random(42);
                 long lo = utc(1990, 1, 1, 0), hi = utc(2040, 1, 1, 0);
                 long[] st = new long[2_000], sv = new long[st.length]; /* a partition a row: few */
@@ -124,7 +124,7 @@ class TimeZoneGroupTest {
                             if (series.equals("ten.min") || g[0] != Unit.MINUTE) /* 584,000 bounds: slow, not new */
                                 specs.add(new Spec(series, z, (Unit) g[0], (Integer) g[1], (String) g[2]));
                 for (Spec sp : specs) {
-                    int id = sp.series().equals("sparse") ? sparse : tenMin;
+                    long id = sp.series().equals("sparse") ? sparse : tenMin;
                     java.put(sp, c.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE,
                             new Group(sp.unit(), sp.count(), ZoneId.of(sp.zone()))));
                 }

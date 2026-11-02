@@ -79,7 +79,7 @@ static void *writer(void *arg)
     ds_state *st = calloc(ns, sizeof *st);
     for (uint32_t s = 0; s < ns; s++)
         ds_init(&st[s], kind_of(c, j->s0 + s), j->s0 + s, T0);
-    uint32_t *sv = malloc(c->batch * sizeof *sv);
+    tsdb_sid *sv = malloc(c->batch * sizeof *sv);
     int64_t *tv = malloc(c->batch * sizeof *tv);
     float *vv = malloc(c->batch * sizeof *vv);
     void *tv64 = c->vtype == TSDB_FLOAT64 || c->vtype == TSDB_INT64 ? malloc(c->batch * 8) : NULL;
@@ -232,7 +232,7 @@ typedef struct lload {
 static void *file_loader(void *arg)
 {
     lload *j = arg;
-    uint32_t *s = malloc(j->batch * sizeof *s);
+    tsdb_sid *s = malloc(j->batch * sizeof *s);
     int64_t *t = malloc(j->batch * sizeof *t);
     float *v = malloc(j->batch * sizeof *v);
     for (size_t off = 0; off < j->n && j->rc == 0; off += j->batch) {
@@ -328,11 +328,12 @@ static int mode_load(const cfg *c)
     cb_expect_make(&f, &e);
     for (uint32_t i = 0; i < e.nseries; i++) { /* named as tsdbc-bench names them; ids 0.. in order */
         char name[64];
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
         rc = tsdb_series(db, name, &id);
         if (rc || id != i) { /* verification and the query benchmarks rely on ids equal to the file's indexes */
-            fprintf(stderr, "series %s: %s (id %u, expected %u)\n", name, rc ? tsdb_strerror(rc) : "wrong id", id, i);
+            fprintf(stderr, "series %s: %s (id %" PRIu64 ", expected %u)\n", name, rc ? tsdb_strerror(rc) : "wrong id", id,
+                    i);
             return 1;
         }
     }
@@ -581,7 +582,7 @@ int main(int argc, char **argv)
     }
     for (uint32_t s = 0; s < c.series && !c.query_only; s++) {
         char name[64];
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", ds_info[kind_of(&c, s)].name, s);
         rc = c.vtype < 0 ? tsdb_series(db, name, &id) : tsdb_series_create(db, name, (tsdb_type)c.vtype, NULL, &id);
         if (rc) {

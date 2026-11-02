@@ -21,7 +21,7 @@ import java.util.Map;
 /** The Java client of the integration tests: same command line and output as c/itc.c, rust/ and python/itp.py
  * (see run.py). */
 public final class Itj {
-    record Series(int id, ValueType type) {}
+    record Series(long id, ValueType type) {}
 
     static TsdbClient c;
     static final Map<String, Series> series = new HashMap<>();
@@ -44,7 +44,7 @@ public final class Itj {
         if (s != null)
             return s;
         try {
-            int id = create != null ? c.seriesCreate(name, create) : c.series(name, false);
+            long id = create != null ? c.seriesCreate(name, create) : c.series(name, false);
             s = new Series(id, create != null ? create : c.seriesType(id));
         } catch (TsdbException e) {
             if (create != null)
@@ -70,7 +70,7 @@ public final class Itj {
             String flags = p[3];
             int n = Integer.parseInt(p[4]);
             ValueType ty;
-            int one = 0;
+            long one = 0;
             if (multi)
                 ty = parseType(p[1]);
             else {
@@ -79,7 +79,7 @@ public final class Itj {
                 one = s.id();
             }
             long[] ts = new long[n];
-            int[] ids = new int[n];
+            long[] ids = new long[n];
             float[] f = new float[n];
             double[] d = new double[n];
             long[] l = new long[n];
@@ -89,7 +89,7 @@ public final class Itj {
             for (int k = 0; k < n; k++) {
                 String[] r = lines.get(i++).trim().split("\\s+");
                 int o = 0;
-                int sid = one;
+                long sid = one;
                 if (multi)
                     sid = find(r[o++], null).id();
                 ids[k] = sid;
@@ -147,7 +147,7 @@ public final class Itj {
                     + "\t" + b.isum() + "\t" + b.imin() + "\t" + b.imax());
     }
 
-    static String stateName(int series, int code) throws TsdbException {
+    static String stateName(long series, int code) throws TsdbException {
         String k = series + ":" + code;
         String v = names.get(k);
         if (v == null) {
@@ -243,7 +243,7 @@ public final class Itj {
     static final int LOAD_ROWS = 1000000, LOAD_BATCH = 200, LOAD_FLIGHT = 8;
 
     static void load(String name, long seed, int level) throws Exception {
-        int id = c.seriesCreate(name, ValueType.INT64);
+        long id = c.seriesCreate(name, ValueType.INT64);
         c.setCompression(level);
         out.println("READY");
         out.flush();

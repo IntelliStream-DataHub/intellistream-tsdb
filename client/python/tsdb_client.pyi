@@ -50,6 +50,8 @@ _TwaMethod = Literal["step", "linear"]
 # without iterating), or any sequence of numbers.
 _Timestamps = Buffer | Sequence[int]
 _Values = Buffer | Sequence[float]
+# Series ids are ints of 64 bits (0 to 2**64 - 1), handed out by the database and not dense; an id
+# column is a uint64 array, a uint32 array (widened), or a sequence of ints.
 _SeriesIds = Buffer | Sequence[int]
 _ValueType = Literal["float32", "float64", "int64", "bool", "state"]
 # Typed values: a numpy array or masked array (masked = null), a buffer, or a
@@ -618,7 +620,7 @@ class Client:
         """Inserts float32 rows into many series and waits.
 
         Args:
-            series: The series id of each row: a list of ints or a uint32 array.
+            series: The series id of each row: a list of ints, or a uint64 or uint32 array.
             ts: The timestamp of each row, ms since the epoch.
             values: The value of each row.
         """
@@ -1091,7 +1093,7 @@ class Client:
         series go as several requests.
 
         Args:
-            series: Series ids: a list of ints or a uint32 array.
+            series: Series ids: a list of ints, or a uint64 or uint32 array.
             start: First timestamp to include (ms): one for every series, or a
                 list or int64 array with one per series; None for no limit.
             end: Timestamp to stop before, like start.
@@ -1329,7 +1331,9 @@ class Db:
     def series_path(self, id: int) -> str:
         """Returns the volume (directory) a series is stored in."""
     def series_count(self) -> int:
-        """Returns the number of series."""
+        """Returns the number of series. Ids are not 0 .. series_count() - 1: list them with series_ids()."""
+    def series_ids(self) -> list[int]:
+        """Returns the ids of every series: those of one volume in creation order, the volumes one after another."""
     def volumes(self) -> list[str]:
         """Returns the directories of the volumes, the database directory first."""
     def state(self, series: int, name: str) -> int:
@@ -1669,7 +1673,7 @@ class Db:
         interpreter is crossed once per call rather than once per query.
 
         Args:
-            series: Series ids: a list or a numpy array (uint32), one per query.
+            series: Series ids: a list or a numpy array (uint64 or uint32), one per query.
             start, end: None (unbounded), one timestamp for every query, or a
                 list or int64 array with one per query; [start, end) in ms.
             order: "asc" or "desc".
@@ -1697,7 +1701,7 @@ class Db:
         """Runs many aggregate queries at once, in parallel on every CPU.
 
         Args:
-            series: Series ids, one per query (a list or a uint32 array).
+            series: Series ids, one per query (a list, or a uint64 or uint32 array).
             start, end: As in query_raw_many().
             interval_ms: Bucket length in ms: one for every query, or a list or
                 int64 array of one per query; 0 (the default) is one bucket for

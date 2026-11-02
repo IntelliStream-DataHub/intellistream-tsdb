@@ -287,7 +287,7 @@ class TsdbSinkTest {
         TsdbSinkConfig c = config();
         c.autoCreate = false;
         tsdb.series.put("known", new SeriesCache.Entry(1, ValueType.FLOAT64));
-        tsdb.names.put(1, "known");
+        tsdb.names.put(1L, "known");
         open(c);
         FakeRecord a = FakeRecord.point(0, "known", 1, 1.0);
         FakeRecord b = FakeRecord.point(1, "unknown", 1, 1.0);
@@ -412,7 +412,7 @@ class TsdbSinkTest {
         /* the series changes type behind the sink's cache, as with another server behind the same endpoint */
         synchronized (tsdb) {
             tsdb.series.put("s", new SeriesCache.Entry(1000, ValueType.INT64));
-            tsdb.names.put(1000, "s");
+            tsdb.names.put(1000L, "s");
         }
         FakeRecord second = FakeRecord.point(1, "s", 2, 7);
         sink.write(second);

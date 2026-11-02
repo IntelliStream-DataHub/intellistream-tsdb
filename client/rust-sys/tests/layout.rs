@@ -113,3 +113,26 @@ fn strip_comments(s: &str) -> String {
     out.push_str(rest);
     out.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n")
 }
+
+/// tsdb_series_result kept its size when its id became 64 bits while status and last moved, so a size check
+/// alone passes with the old declaration: the offsets are pinned here as well (LP64).
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn series_result_has_a_64_bit_id() {
+    assert_eq!(size_of::<tsdb_sid>(), 8);
+    assert_eq!(offset_of!(tsdb_series_result, series), 8);
+    assert_eq!(offset_of!(tsdb_series_result, status), 16);
+    assert_eq!(offset_of!(tsdb_series_result, last), 20);
+    assert_eq!(size_of::<tsdb_series_result>(), 72);
+}
+
+/// The crate is written for one ABI: its constant must match the header and the library it links.
+#[test]
+fn abi_version_matches_the_header_and_the_library() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let header = std::fs::read_to_string(root.join("../../include/tsdb.h")).unwrap();
+    let line = header.lines().find(|l| l.starts_with("#define TSDB_ABI_VERSION ")).expect("TSDB_ABI_VERSION");
+    let v: std::ffi::c_int = line.split_whitespace().nth(2).unwrap().parse().unwrap();
+    assert_eq!(v, TSDB_ABI_VERSION);
+    assert_eq!(unsafe { tsdb_abi_version() }, TSDB_ABI_VERSION);
+}

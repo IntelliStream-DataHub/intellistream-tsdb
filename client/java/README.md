@@ -14,7 +14,7 @@ so the same code works with either one: only the line that opens the database ch
 
 ```java
 try (EmbeddedDb db = EmbeddedDb.open("/var/lib/tsdb")) {   // instead of TsdbClient.connect("host", 7070)
-    int id = db.series("pump7.flow");
+    long id = db.series("pump7.flow");
     db.insert(id, times, values);
 }
 ```
@@ -80,7 +80,7 @@ public final class Example {
         int port = args.length > 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
 
         try (TsdbClient client = TsdbClient.connect(host, port)) {
-            int pump = client.series("pump7.flow_m3h"); // get or create
+            long pump = client.series("pump7.flow_m3h"); // get or create
 
             // One reading per minute for a day, from 2024-03-01T00:00Z, as a single batch.
             long t0 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
@@ -138,11 +138,11 @@ A series has a name and a value type. `series` gets a series of 32-bit floats, a
 `seriesCreate` lets you choose another type (see [Value types and nulls](#value-types-and-nulls)).
 
 ```java
-int flow = client.series("pump7.flow");
-int energy = client.seriesCreate("pump7.energy_wh", ValueType.INT64);
+long flow = client.series("pump7.flow");
+long energy = client.seriesCreate("pump7.energy_wh", ValueType.INT64);
 ```
 
-Both return a number, the series id. The other calls take this id.
+Both return a number, the series id (a `long`). The other calls take this id.
 
 ## Insert
 
@@ -291,8 +291,8 @@ works on the series in parallel, sends the answers back in the order of the list
 same instant. Each series has its own result, so an unknown or bad series does not spoil the others:
 
 ```java
-int[] pumps = new int[200];
-for (int i = 0; i < pumps.length; i++) pumps[i] = i;
+long[] pumps = new long[200];
+for (int i = 0; i < pumps.length; i++) pumps[i] = client.series("pump" + i + ".flow");
 long day = 86_400_000L;
 // every pump by hour over one day
 List<SeriesResult<List<Bucket>>> hourly =

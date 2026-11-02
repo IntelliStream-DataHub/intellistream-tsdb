@@ -123,7 +123,7 @@ final class BenchCommon {
      * Rows {@code [r, r + n)} into the arrays from index 0, the series through {@code ids}. Returns the first
      * series index that ids does not cover, or -1.
      */
-    static long fill(ByteBuffer[] m, long r, int n, int[] ids, int[] s, long[] t, float[] v) {
+    static long fill(ByteBuffer[] m, long r, int n, long[] ids, long[] s, long[] t, float[] v) {
         for (int i = 0; i < n;) {
             ByteBuffer b = m[(int) (r >>> PIECE_SHIFT)];
             int first = (int) (r & ((1 << PIECE_SHIFT) - 1));
@@ -137,7 +137,7 @@ final class BenchCommon {
         return -1;
     }
 
-    private static long fill(ByteBuffer b, int o, int k, int[] ids, int[] s, long[] t, float[] v, int i0) {
+    private static long fill(ByteBuffer b, int o, int k, long[] ids, long[] s, long[] t, float[] v, int i0) {
         for (int i = i0, end = i0 + k; i < end; i++, o += ROW) {
             int id = b.getInt(o);
             if (id < 0 || id >= ids.length)
@@ -154,9 +154,9 @@ final class BenchCommon {
      * before the clock starts. The C benchmarks' copy loop is compiled ahead of time; without this the load's
      * threads would start it in the interpreter and in profiled code at once, and count that as loading.
      */
-    static void warmFill(ByteBuffer[] m, int[] ids, int batch) {
+    static void warmFill(ByteBuffer[] m, long[] ids, int batch) {
         int n = (int) Math.min(Math.min(batch, 1 << 16), m.length == 0 ? 0 : m[0].capacity() / ROW);
-        int[] s = new int[n];
+        long[] s = new long[n];
         long[] t = new long[n];
         float[] v = new float[n];
         long best = Long.MAX_VALUE;

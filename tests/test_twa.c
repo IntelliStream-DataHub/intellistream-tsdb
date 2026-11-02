@@ -258,7 +258,7 @@ static void test_rules(void)
 {
     char dir[600];
     tsdb *db = open_db("rules", 4, dir);
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "x", TSDB_FLOAT64, NULL, &s));
     /* 10 at 0, 20 at 1000, null at 2000, 30 at 3000, 40 at 10000 */
     int64_t ts[] = {0, 1000, 2000, 3000, 10000};
@@ -335,7 +335,7 @@ static void test_rules(void)
     CHECK(tsdb_query_twa_group(db, s, 0, 20000, &(tsdb_group){TSDB_DAY, 1, "Europe/Oslo"}, NULL, &b, &n) ==
           TSDB_ERR_INVALID);
     /* invalid: state series, a method that does not exist, a negative limit */
-    uint32_t st;
+    tsdb_sid st;
     OK(tsdb_series_create(db, "st", TSDB_STATE, NULL, &st));
     CHECK(tsdb_query_twa(db, st, 0, 1, 0, NULL, &b, &n) == TSDB_ERR_INVALID);
     CHECK(tsdb_query_twa(db, s, 0, 1, 0, &(tsdb_twa_opts){.method = 7}, &b, &n) == TSDB_ERR_INVALID);
@@ -343,7 +343,7 @@ static void test_rules(void)
     CHECK(tsdb_query_twa(db, s, 0, 1, -5, NULL, &b, &n) == TSDB_ERR_INVALID);
 
     /* bool: the fraction of time true */
-    uint32_t on;
+    tsdb_sid on;
     OK(tsdb_series_create(db, "on", TSDB_BOOL, NULL, &on));
     int64_t bt[] = {0, 3000, 4000};
     uint8_t bv[] = {1, 0, 1};
@@ -352,7 +352,7 @@ static void test_rules(void)
     CHECK(n == 1 && near(b[0].twa, 0.75) && b[0].count == 2);
     free(b);
     /* NaN held for a while makes the result NaN; held for nothing it does not matter */
-    uint32_t f;
+    tsdb_sid f;
     OK(tsdb_series_create(db, "f", TSDB_FLOAT32, NULL, &f));
     int64_t ft[] = {0, 1000, 2000};
     float fv[] = {1, NAN, 3};
@@ -463,7 +463,7 @@ static void gen_series(ref_series *s, int type, int shape, size_t n)
     }
 }
 
-static int check_all(tsdb *db, const uint32_t *ids, const ref_series *ss, size_t nser, const char *stage)
+static int check_all(tsdb *db, const tsdb_sid *ids, const ref_series *ss, size_t nser, const char *stage)
 {
     int bad = 0;
     for (size_t k = 0; k < nser && bad < 5; k++) {
@@ -542,7 +542,7 @@ static void test_random(void)
     tsdb *db = open_db("random", 64, dir);
     enum { NS = NSER * 3 };
     ref_series ss[NS];
-    uint32_t ids[NS];
+    tsdb_sid ids[NS];
     for (int k = 0; k < NS; k++) {
         char name[32];
         snprintf(name, sizeof name, "s%d", k);
@@ -630,7 +630,7 @@ static void test_history(int classes)
     p_classes = classes;
     tsdb *db = open_db_p("history", 8192, d.partition_ms, dir);
     p_classes = 1;
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "x", TSDB_FLOAT64, NULL, &s));
     enum { DAYS = 60, PER = 144, N = DAYS * PER }; /* a reading every 10 minutes: a part of one granule a day */
     const int64_t day = 86400000, step = 600000;
@@ -687,7 +687,7 @@ static void test_long_gap(void)
 {
     char dir[600];
     tsdb *db = open_db("longgap", 8192, dir);
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "x", TSDB_FLOAT64, NULL, &s));
     const int64_t g = 60 * 86400000LL; /* 5.18e9 ms; mod 2^32 about 10 days */
     int64_t ts[] = {0, 1000, 1000 + g, 2000 + g};
@@ -725,7 +725,7 @@ static void test_stats_only(void)
 {
     char dir[600];
     tsdb *db = open_db("stats", 64, dir);
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "x", TSDB_FLOAT32, NULL, &s));
     enum { N = 64 * 100 };
     int64_t *ts = malloc(N * sizeof *ts);
@@ -789,7 +789,7 @@ static void test_local(void)
 {
     char dir[600];
     tsdb *db = open_db("local", 4, dir);
-    uint32_t s;
+    tsdb_sid s;
     OK(tsdb_series_create(db, "x", TSDB_FLOAT64, NULL, &s));
     const int64_t h = 3600000, t0 = 1711836000000LL; /* 2024-03-30T22:00Z */
     int64_t ts[] = {t0, t0 + 2 * h + h / 2, t0 + 14 * h, t0 + 32 * h};
@@ -977,7 +977,7 @@ static void test_deletes(bool merges)
     __atomic_store_n(&twa_now, 1700000000000LL, __ATOMIC_SEQ_CST);
     tsdb *db = open_del(dir, merges, false);
     enum { NS = NSER * 3 };
-    uint32_t ids[NS];
+    tsdb_sid ids[NS];
     ref_series ss[NS];
     for (int k = 0; k < NS; k++) {
         char name[32];
@@ -1045,7 +1045,7 @@ static void test_retention_carry(void)
     rmrf(dir);
     __atomic_store_n(&twa_now, 100000, __ATOMIC_SEQ_CST);
     tsdb *db = open_del(dir, false, false);
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_create(db, "r", TSDB_FLOAT64, NULL, &id));
     int64_t ts[3] = {0, 10000, 20000};
     double v[3] = {10, 20, 30};

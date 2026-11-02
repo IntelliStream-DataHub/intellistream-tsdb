@@ -597,6 +597,15 @@ static int values_cb(void *ctx, const int64_t *ts, const tsdb_values *col, size_
     return 0;
 }
 
+/* Protocol 10 carries 32-bit series ids; the library takes tsdb_sid (64 bits). NULL: out of memory. */
+static tsdb_sid *widen_ids(const uint32_t *ids, size_t n)
+{
+    tsdb_sid *w = malloc((n ? n : 1) * sizeof *w);
+    for (size_t i = 0; w && i < n; i++)
+        w[i] = ids[i];
+    return w;
+}
+
 /* A packed INSERT_VALUES: unzstd, unshape into plain arrays, insert. */
 static int insert_packed(const uint8_t *p, size_t len, uint32_t n, uint32_t s)
 {
@@ -631,7 +640,11 @@ static int insert_packed(const uint8_t *p, size_t len, uint32_t n, uint32_t s)
             rc = TSDB_ERR_INVALID;
         } else {
             tsdb_values col = {(tsdb_type)type, vals, valid ? bits : NULL};
-            rc = many ? tsdb_insert_values(db, series, ts, &col, n) : tsdb_insert_series_values(db, s, ts, &col, n);
+            tsdb_sid *ids = many ? widen_ids(series, n) : NULL;
+            rc = many && !ids ? TSDB_ERR_NOMEM
+                 : many       ? tsdb_insert_values(db, ids, ts, &col, n)
+                              : tsdb_insert_series_values(db, s, ts, &col, n);
+            free(ids);
         }
     }
     free(raw);
@@ -1047,7 +1060,9 @@ static void handle_multi(conn *c, req *r)
                               .budget_give = multi_budget_give,
                               .on_deferred = multi_on_deferred,
                               .hook_ctx = &m};
-        rc = tsdb_query_multi(db, &q, series, n, &mo, multi_fn, &m);
+        tsdb_sid *ids = widen_ids(series, n);
+        rc = ids ? tsdb_query_multi(db, &q, ids, n, &mo, multi_fn, &m) : TSDB_ERR_NOMEM;
+        free(ids);
     }
     qreq_free(&qr);
     free(m.vo.ts);
@@ -1094,7 +1109,7 @@ static void handle(req *r)
         }
         char *name = strndup((const char *)p + 3, n);
         char *path = len > 3u + n ? strndup((const char *)p + 5 + n, pn) : NULL;
-        uint32_t id = 0;
+        tsdb_sid id = 0;
         if (!name || (len > 3u + n && !path))
             rc = TSDB_ERR_NOMEM;
         else if (!p[0])
@@ -1104,7 +1119,8 @@ static void handle(req *r)
         free(name);
         free(path);
         if (rc == 0) {
-            reply(c, r->id, 0, &id, 4, NULL, 0, NULL, 0);
+            uint32_t w = (uint32_t)id; /* protocol 10: every id is below 2^32 */
+            reply(c, r->id, 0, &w, 4, NULL, 0, NULL, 0);
             return;
         }
         break;
@@ -1140,8 +1156,9 @@ static void handle(req *r)
         }
         const int64_t *ts = (const int64_t *)(p + 8);
         const float *v = (const float *)(p + 8 + (size_t)n * 8);
-        rc = many ? tsdb_insert(db, (const uint32_t *)(p + 8 + (size_t)n * 12), ts, v, n)
-                  : tsdb_insert_series(db, s, ts, v, n);
+        tsdb_sid *ids = many ? widen_ids((const uint32_t *)(p + 8 + (size_t)n * 12), n) : NULL;
+        rc = many && !ids ? TSDB_ERR_NOMEM : many ? tsdb_insert(db, ids, ts, v, n) : tsdb_insert_series(db, s, ts, v, n);
+        free(ids);
         break;
     }
     case TSDB_OP_QUERY_RAW: {
@@ -1257,12 +1274,13 @@ static void handle(req *r)
         }
         char *name = strndup((const char *)p + 3, n);
         char *path = pn ? strndup((const char *)p + 5 + n, pn) : NULL;
-        uint32_t id = 0;
+        tsdb_sid id = 0;
         rc = !name || (pn && !path) ? TSDB_ERR_NOMEM : tsdb_series_create(db, name, (tsdb_type)p[0], path, &id);
         free(name);
         free(path);
         if (rc == 0) {
-            reply(c, r->id, 0, &id, 4, NULL, 0, NULL, 0);
+            uint32_t w = (uint32_t)id; /* protocol 10: every id is below 2^32 */
+            reply(c, r->id, 0, &w, 4, NULL, 0, NULL, 0);
             return;
         }
         break;
@@ -1307,8 +1325,10 @@ static void handle(req *r)
         const int64_t *ts = (const int64_t *)(p + TSDB_VALUES_HEADER); /* the payload is 8-aligned */
         const uint8_t *vals = p + TSDB_VALUES_HEADER + (size_t)n * 8;
         tsdb_values col = {(tsdb_type)p[8], vals, valid ? vals + vb : NULL};
-        rc = many ? tsdb_insert_values(db, (const uint32_t *)(p + sofs), ts, &col, n)
-                  : tsdb_insert_series_values(db, s, ts, &col, n);
+        tsdb_sid *ids = many ? widen_ids((const uint32_t *)(p + sofs), n) : NULL;
+        rc = many && !ids ? TSDB_ERR_NOMEM : many ? tsdb_insert_values(db, ids, ts, &col, n)
+                                                  : tsdb_insert_series_values(db, s, ts, &col, n);
+        free(ids);
         break;
     }
     case TSDB_OP_QUERY_VALUES:

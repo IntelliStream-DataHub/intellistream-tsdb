@@ -42,7 +42,7 @@ pub(crate) fn reshape(
     ts: &[i64],
     values: ValuesRef<'_>,
     valid: Option<&[u8]>,
-    series: Option<&[u32]>,
+    series: Option<&[u64]>,
     start: usize,
     end: usize,
     scratch: &mut Vec<u8>,
@@ -67,9 +67,10 @@ pub(crate) fn reshape(
     }
     if let Some(s) = series {
         let mut prev = 0i64;
+        // protocol 10: deltas of the u32 ids (the caller checked that every id fits)
         for &x in &s[start..end] {
-            put_varint(out, zigzag(x as i64 - prev));
-            prev = x as i64;
+            put_varint(out, zigzag(x as u32 as i64 - prev));
+            prev = x as u32 as i64;
         }
     }
 }
@@ -103,7 +104,7 @@ mod tests {
         w: usize,
         valid: bool,
         many: bool,
-    ) -> Option<(Vec<i64>, Vec<u8>, Option<Vec<u8>>, Option<Vec<u32>>)> {
+    ) -> Option<(Vec<i64>, Vec<u8>, Option<Vec<u8>>, Option<Vec<u64>>)> {
         let mut ts = Vec::new();
         let mut prev = 0i64;
         for _ in 0..n {
@@ -130,7 +131,7 @@ mod tests {
             let mut prev = 0i64;
             for _ in 0..n {
                 prev += unzigzag(get_varint(&mut p)?);
-                s.push(u32::try_from(prev).ok()?);
+                s.push(u32::try_from(prev).ok()? as u64);
             }
             Some(s)
         } else {
@@ -161,7 +162,7 @@ mod tests {
         let ts: Vec<i64> = (0..n as i64).map(|i| if i % 7 == 0 { i64::MIN + i } else { i * 1000 - 3 }).collect();
         let f: Vec<f64> = (0..n).map(|i| i as f64 * 0.37 - 5.0).collect();
         let b: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
-        let s: Vec<u32> = (0..n as u32).map(|i| if i % 2 == 0 { u32::MAX - i } else { i }).collect();
+        let s: Vec<u64> = (0..n as u64).map(|i| if i % 2 == 0 { u32::MAX as u64 - i } else { i }).collect();
         let bits: Vec<u8> = (0..n.div_ceil(8)).map(|i| i as u8 ^ 0x5a).collect();
         for (values, w) in [(ValuesRef::Float64(&f), 8), (ValuesRef::Bool(&b), 1)] {
             for (valid, many) in [(false, false), (true, false), (false, true), (true, true)] {

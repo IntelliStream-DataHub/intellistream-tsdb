@@ -26,7 +26,7 @@
 #define MAXS 32
 
 static tsdb *db;
-static uint32_t sid;
+static tsdb_sid sid;
 static int kind; /* 0 agg, 1 twa */
 
 static void die(const char *what, int rc)

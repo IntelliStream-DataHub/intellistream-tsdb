@@ -52,7 +52,7 @@ int main(int argc, char **argv)
     tsdb_bucket *hours = NULL, *days = NULL;
     CHECK(tsdb_open(dir, NULL, &db)); /* on an error, CHECK prints it and jumps to done: below */
 
-    uint32_t flow;
+    tsdb_sid flow;
     CHECK(tsdb_series(db, "pump7.flow", &flow)); /* finds the series, or creates it */
 
     static int64_t times[N];

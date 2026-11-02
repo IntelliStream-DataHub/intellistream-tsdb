@@ -22,7 +22,7 @@ fn rows() -> Vec<i64> {
     spans.iter().flat_map(|&(a, b)| (a..b).step_by(1_800_000)).collect()
 }
 
-fn load(c: &mut Client) -> u32 {
+fn load(c: &mut Client) -> u64 {
     let id = c.series("oslo").unwrap();
     let ts = rows();
     c.insert_series(id, &ts, &vec![1.0; ts.len()]).unwrap();

@@ -46,7 +46,7 @@ static int64_t test_clock(void *arg)
 static char root[512], vol2[512];
 static uint32_t ids[16];
 static size_t nids;
-static uint32_t big; /* two rows 5 M ms apart: interval 1 ms is TOO_MANY_BUCKETS */
+static tsdb_sid big; /* two rows 5 M ms apart: interval 1 ms is TOO_MANY_BUCKETS */
 
 static size_t api_w(tsdb_type t) { return t == TSDB_BOOL ? 1 : t == TSDB_FLOAT64 || t == TSDB_INT64 ? 8 : 4; }
 
@@ -79,7 +79,7 @@ static void fill(tsdb *db)
     char name[64];
     for (int vol = 0; vol < 2; vol++)
         for (int t = 0; t < 5; t++) {
-            uint32_t id;
+            tsdb_sid id;
             snprintf(name, sizeof name, "s%d_%d", vol, t);
             OK(tsdb_series_create(db, name, (tsdb_type)t, vol ? vol2 : NULL, &id));
             if (t == TSDB_STATE)
@@ -302,7 +302,7 @@ static bool bucket_same(tsdb_multi_kind kind, const char *x, const char *y)
 static void same(const tsdb_multi_query *q, const res *a, const tsdb_series_result *b, const char *what, size_t i)
 {
     if (a->status != b->status || a->n != b->n) {
-        fprintf(stderr, "%s: series #%zu (%u): single status %d n %zu, multi status %d n %zu\n", what, i, b->series,
+        fprintf(stderr, "%s: series #%zu (%llu): single status %d n %zu, multi status %d n %zu\n", what, i, (unsigned long long)b->series,
                 a->status, a->n, b->status, b->n);
         exit(1);
     }
@@ -336,7 +336,7 @@ static void same(const tsdb_multi_query *q, const res *a, const tsdb_series_resu
     }
 }
 
-static uint32_t list[64];
+static tsdb_sid list[64];
 static size_t nlist;
 
 static void compare(tsdb *db, const tsdb_multi_query *q, const tsdb_group *local, const char *what)
@@ -545,7 +545,7 @@ static void control(tsdb *db)
 
 typedef struct cutrun {
     tsdb *db;
-    uint32_t *s;
+    tsdb_sid *s;
     size_t n;
     atomic_int stop;
     atomic_long checked, torn;
@@ -639,16 +639,16 @@ static void many_volumes(const char *base)
     o.granule_rows = 1024;
     tsdb *db;
     OK(tsdb_open(r, &o, &db));
-    uint32_t vids[NV * PER], order[NV * PER];
+    tsdb_sid vids[NV * PER], order[NV * PER];
     int64_t *ts = malloc(ROWS * sizeof *ts);
     float *v = malloc(ROWS * sizeof *v);
-    uint32_t *sid = malloc(ROWS * sizeof *sid);
+    tsdb_sid *sid = malloc(ROWS * sizeof *sid);
     CHECK(ts && v && sid);
     for (int k = 0; k < NV; k++) {
         snprintf(vol, sizeof vol, "%s-vol%d", r, k);
         for (int j = 0; j < PER; j++) {
             snprintf(name, sizeof name, "nv%d_%d", k, j);
-            uint32_t id;
+            tsdb_sid id;
             OK(tsdb_series_create(db, name, TSDB_FLOAT32, k ? vol : NULL, &id));
             for (int i = 0; i < ROWS; i++)
                 ts[i] = T0 + (int64_t)i * 1000, v[i] = (float)(i % 97 + k + j), sid[i] = id;
@@ -748,7 +748,7 @@ static void bounds(const char *base)
     o.granule_rows = 1024;
     tsdb *db;
     OK(tsdb_open(r, &o, &db));
-    uint32_t good[8], wide, bad;
+    tsdb_sid good[8], wide, bad;
     int64_t *ts = malloc(ROWS * sizeof *ts);
     float *v = malloc(ROWS * sizeof *v);
     CHECK(ts && v);
@@ -790,7 +790,7 @@ static void bounds(const char *base)
     }
     o.verify_checksums = 1;
     OK(tsdb_open(r, &o, &db));
-    uint32_t list[17];
+    tsdb_sid list[17];
     tsdb_multi_query qv = {.kind = TSDB_MULTI_VALUES, .start = INT64_MIN, .end = INT64_MAX};
 
     /* a series that fails ahead holds nothing, and is never charged for the rows it had before the error */

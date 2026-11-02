@@ -49,7 +49,7 @@ fn opt_ptr(a: Option<&[i64]>) -> *const i64 {
 }
 
 /// The per-series arrays of `m` must be as long as the series list (as the TCP client checks).
-fn check_multi(series: &[u32], m: &MultiOpts<'_>) -> Result<()> {
+fn check_multi(series: &[SeriesId], m: &MultiOpts<'_>) -> Result<()> {
     for (what, a) in [("starts", m.starts), ("ends", m.ends)] {
         if let Some(a) = a
             && a.len() != series.len()
@@ -66,7 +66,7 @@ impl Db {
     /// scheduler, every series as of the same instant of each volume.
     pub fn query_rows_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         opts: QueryOpts,
         m: MultiOpts<'_>,
@@ -78,7 +78,7 @@ impl Db {
     /// LTTB of many series, as [`Client::query_lttb_multi`](crate::Client::query_lttb_multi).
     pub fn query_lttb_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         threshold: u64,
         opts: QueryOpts,
@@ -92,7 +92,7 @@ impl Db {
     /// Streams the rows of many series, as [`Client::query_chunks_multi`](crate::Client::query_chunks_multi).
     pub fn query_chunks_multi<F>(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         opts: QueryOpts,
         m: MultiOpts<'_>,
@@ -142,7 +142,7 @@ impl Db {
     /// Aggregates of many series, as [`Client::query_buckets_multi`](crate::Client::query_buckets_multi).
     pub fn query_buckets_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: QueryOpts,
@@ -155,7 +155,7 @@ impl Db {
     /// The spread of many series, as [`Client::query_spread_multi`](crate::Client::query_spread_multi).
     pub fn query_spread_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: QueryOpts,
@@ -168,7 +168,7 @@ impl Db {
     /// Time-weighted averages of many series, as [`Client::query_twa_multi`](crate::Client::query_twa_multi).
     pub fn query_twa_multi(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         range: impl RangeBounds<i64>,
         b: Buckets<'_>,
         opts: TwaOpts,
@@ -179,7 +179,13 @@ impl Db {
     }
 
     /// Runs `q` over `series` with `f` called for every result, then keeps the call's statistics.
-    pub(crate) fn multi_call<F>(&self, q: &sys::tsdb_multi_query, series: &[u32], m: &MultiOpts<'_>, f: F) -> Result<()>
+    pub(crate) fn multi_call<F>(
+        &self,
+        q: &sys::tsdb_multi_query,
+        series: &[SeriesId],
+        m: &MultiOpts<'_>,
+        f: F,
+    ) -> Result<()>
     where
         F: FnMut(&sys::tsdb_series_result) -> ControlFlow<()>,
     {
@@ -204,7 +210,7 @@ impl Db {
     pub(crate) fn rows_multi(
         &self,
         kind: sys::tsdb_multi_kind,
-        series: &[u32],
+        series: &[SeriesId],
         start: i64,
         end: i64,
         threshold: usize,
@@ -265,7 +271,7 @@ impl Db {
     #[allow(clippy::too_many_arguments)]
     fn bucket_multi<T: EngineRow>(
         &self,
-        series: &[u32],
+        series: &[SeriesId],
         start: i64,
         end: i64,
         b: Buckets<'_>,

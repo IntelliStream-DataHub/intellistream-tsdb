@@ -61,7 +61,7 @@ class PartsTest {
         c.put("c", new SeriesCache.Entry(3, ValueType.FLOAT64));
         assertEquals(2, c.size());
         assertNull(c.get("b"));
-        assertEquals(1, c.get("a").id);
+        assertEquals(1L, c.get("a").id);
     }
 
     @Test

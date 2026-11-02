@@ -24,8 +24,8 @@ class MultiTest {
     static Path scratch;
     static TsdbServer server;
     static TsdbClient c;
-    static int f32, f64, i64, bool, state, empty;
-    static int[] ids;
+    static long f32, f64, i64, bool, state, empty;
+    static long[] ids;
 
     @BeforeAll
     static void start() throws Exception {
@@ -63,7 +63,7 @@ class MultiTest {
             sv[i] = i % 17 < 9 ? a : b;
         c.insertSeriesValues(state, ts, Column.ofStates(sv));
         empty = c.seriesCreate("m.empty", ValueType.FLOAT64);
-        ids = new int[] {f32, f64, i64, bool, state, empty, 999_999, f32};
+        ids = new long[] {f32, f64, i64, bool, state, empty, 999_999, f32};
     }
 
     @AfterAll
@@ -208,7 +208,7 @@ class MultiTest {
     @Test
     void splitCapAndCancel() throws Exception {
         int n = Protocol.MULTI_MAX_SERIES + 3;
-        int[] many = new int[n];
+        long[] many = new long[n];
         for (int i = 0; i < n; i++)
             many[i] = ids[i % 4];
         List<SeriesResult<ValuePoints>> r = c.queryValuesMulti(many, MIN, MAX, Order.DESC, 1, MultiOptions.defaults());
@@ -246,7 +246,7 @@ class MultiTest {
                     throw new IllegalStateException("stop");
                 }));
         assertEquals(ROWS, c.queryValues(f32, MIN, MAX).size());
-        assertTrue(c.queryValuesMulti(new int[0], MIN, MAX).isEmpty());
+        assertTrue(c.queryValuesMulti(new long[0], MIN, MAX).isEmpty());
         assertThrows(IllegalArgumentException.class,
                 () -> c.queryValuesMulti(ids, MIN, MAX, Order.ASC, 0, MultiOptions.defaults().starts(new long[1])));
     }

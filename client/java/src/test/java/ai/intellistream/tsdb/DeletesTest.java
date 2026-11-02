@@ -44,7 +44,7 @@ class DeletesTest {
     }
 
     /** The rows of an int64 series as "ts=value" strings, "ts=null" for a null. */
-    static List<String> rows(int id) throws TsdbException {
+    static List<String> rows(long id) throws TsdbException {
         ValuePoints p = c.queryValues(id, Long.MIN_VALUE, Long.MAX_VALUE);
         List<String> r = new ArrayList<>();
         Column v = p.values();
@@ -67,7 +67,7 @@ class DeletesTest {
 
     @Test
     void deletesAndReplaces() throws Exception {
-        int id = c.seriesCreate("d", ValueType.INT64);
+        long id = c.seriesCreate("d", ValueType.INT64);
         long[] ts = new long[10];
         long[] vals = new long[10];
         for (int i = 0; i < 10; i++) {
@@ -127,7 +127,7 @@ class DeletesTest {
 
     @Test
     void aPendingInsertErrorIsNotTakenForAnOldServer() throws Exception {
-        int id = c.seriesCreate("p", ValueType.INT64);
+        long id = c.seriesCreate("p", ValueType.INT64);
         c.insertSeriesValuesAsync(id, new long[] {T0}, Column.ofDoubles(1.0));
         invalid(() -> c.deleteRange(id, Long.MIN_VALUE, Long.MAX_VALUE));
         c.deleteRange(id, Long.MIN_VALUE, Long.MAX_VALUE);
@@ -135,7 +135,7 @@ class DeletesTest {
 
     @Test
     void retention() throws Exception {
-        int id = c.seriesCreate("r", ValueType.INT64);
+        long id = c.seriesCreate("r", ValueType.INT64);
         assertEquals(0, c.retention(id));
         long now = System.currentTimeMillis();
         long[] ts = {now - 2 * HOUR, now - HOUR / 6};

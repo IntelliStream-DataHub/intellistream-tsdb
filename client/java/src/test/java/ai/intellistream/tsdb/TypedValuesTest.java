@@ -132,20 +132,20 @@ class TypedValuesTest {
     void seriesCreateAndType() throws Exception {
         assertEquals(level, c.compression(), "the client of this invocation");
         for (ValueType t : ValueType.values()) {
-            int id = c.seriesCreate("create." + t, t);
+            long id = c.seriesCreate("create." + t, t);
             assertEquals(t, c.seriesType(id));
             assertEquals(id, c.seriesCreate("create." + t, t));
             assertEquals(id, c.series("create." + t, false));
         }
         assertEquals(ValueType.FLOAT32, c.seriesType(c.series("create.default")));
-        int d = c.seriesCreate("create.FLOAT64", ValueType.FLOAT64);
+        long d = c.seriesCreate("create.FLOAT64", ValueType.FLOAT64);
         assertEquals(Status.ERR_INVALID, status(() -> c.seriesCreate("create.FLOAT64", ValueType.INT64)));
         assertEquals(Status.ERR_INVALID, status(() -> c.seriesCreate("create.default", ValueType.BOOL)));
         assertEquals(Status.ERR_NOTFOUND, status(() -> c.seriesType(0x7ffffff0)));
         String none = scratch.resolve("not_a_volume").toString();
         assertEquals(Status.ERR_NOTFOUND, status(() -> c.seriesCreate("create.off_volume", ValueType.INT64, none)));
         assertFalse(java.nio.file.Files.exists(scratch.resolve("not_a_volume")));
-        int onVolume = c.seriesCreate("create.on_volume", ValueType.INT64, scratch.resolve("volume").toString());
+        long onVolume = c.seriesCreate("create.on_volume", ValueType.INT64, scratch.resolve("volume").toString());
         assertEquals(ValueType.INT64, c.seriesType(onVolume));
         assertNotEquals(d, onVolume);
         assertTrue(c.isOpen());
@@ -155,7 +155,7 @@ class TypedValuesTest {
     void everyTypeRoundTripsWithNulls() throws Exception {
         long[] ts = TsdbClientTest.seq(T0, 1000, N);
         for (ValueType t : ValueType.values()) {
-            int id = c.seriesCreate("rt." + t, t);
+            long id = c.seriesCreate("rt." + t, t);
             int[] codes = t == ValueType.STATE
                     ? new int[] {c.state(id, "idle"), c.state(id, "run"), c.state(id, "fault")}
                     : null;
@@ -197,7 +197,7 @@ class TypedValuesTest {
 
     @Test
     void offsetsShiftTheBitmap() throws Exception {
-        int id = c.seriesCreate("offsets.typed", ValueType.FLOAT64);
+        long id = c.seriesCreate("offsets.typed", ValueType.FLOAT64);
         long[] ts = TsdbClientTest.seq(T0, 1000, 40);
         double[] v = new double[40];
         for (int i = 0; i < 40; i++)
@@ -221,7 +221,7 @@ class TypedValuesTest {
             if (!want.get(i))
                 assertEquals(i + 5, p.values().doubles()[i]);
         /* a slice without nulls goes without a bitmap */
-        int id2 = c.seriesCreate("offsets.typed2", ValueType.FLOAT64);
+        long id2 = c.seriesCreate("offsets.typed2", ValueType.FLOAT64);
         c.insertSeriesValues(id2, ts, col, 14, 10);
         assertFalse(c.queryValues(id2, Long.MIN_VALUE, Long.MAX_VALUE).values().hasNulls());
     }
@@ -229,9 +229,9 @@ class TypedValuesTest {
     @Test
     void manySeriesFramesArePadded() throws Exception {
         /* bools are one byte wide: the series ids after them need padding to 4 bytes */
-        int a = c.seriesCreate("many.bool.a", ValueType.BOOL), b = c.seriesCreate("many.bool.b", ValueType.BOOL);
+        long a = c.seriesCreate("many.bool.a", ValueType.BOOL), b = c.seriesCreate("many.bool.b", ValueType.BOOL);
         for (int n = 1; n <= 9; n++) {
-            int[] series = new int[n];
+            long[] series = new long[n];
             long[] ts = new long[n];
             boolean[] v = new boolean[n];
             BitSet nulls = new BitSet();
@@ -242,7 +242,7 @@ class TypedValuesTest {
             }
             nulls.set(n / 2);
             c.insertValues(series, ts, Column.ofBools(v).withNulls(nulls));
-            for (int s : new int[] {a, b}) {
+            for (long s : new long[] {a, b}) {
                 ValuePoints p = c.queryValues(s, T0 + n * 100_000L, T0 + n * 100_000L + n);
                 for (int j = 0, i = s == a ? 0 : 1; i < n; i += 2, j++) {
                     assertEquals(ts[i], p.timestamps()[j]);
@@ -256,7 +256,7 @@ class TypedValuesTest {
 
     @Test
     void exactIntegerAggregates() throws Exception {
-        int id = c.seriesCreate("agg.int64", ValueType.INT64);
+        long id = c.seriesCreate("agg.int64", ValueType.INT64);
         long big = Long.MAX_VALUE - 10, neg = -(Long.MAX_VALUE - 20);
         long[] v = {big, neg, 7, Long.MAX_VALUE / 2, 0};
         BitSet nulls = new BitSet();
@@ -271,10 +271,10 @@ class TypedValuesTest {
         assertEquals((double) neg, all.min());
 
         /* sums saturate */
-        int up = c.seriesCreate("agg.int64.up", ValueType.INT64);
+        long up = c.seriesCreate("agg.int64.up", ValueType.INT64);
         c.insertSeriesValues(up, TsdbClientTest.seq(T0, 1000, 2), Column.ofLongs(Long.MAX_VALUE - 1, 5));
         assertEquals(Long.MAX_VALUE, c.queryAgg(up, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0).isum());
-        int down = c.seriesCreate("agg.int64.down", ValueType.INT64);
+        long down = c.seriesCreate("agg.int64.down", ValueType.INT64);
         c.insertSeriesValues(down, TsdbClientTest.seq(T0, 1000, 2), Column.ofLongs(Long.MIN_VALUE + 1, -5));
         assertEquals(Long.MIN_VALUE, c.queryAgg(down, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0).isum());
 
@@ -294,7 +294,7 @@ class TypedValuesTest {
 
     @Test
     void boolAndFloatAggregates() throws Exception {
-        int b = c.seriesCreate("agg.bool", ValueType.BOOL);
+        long b = c.seriesCreate("agg.bool", ValueType.BOOL);
         BitSet nulls = new BitSet();
         nulls.set(2);
         c.insertSeriesValues(b, TsdbClientTest.seq(T0, 1000, 5),
@@ -308,20 +308,20 @@ class TypedValuesTest {
         assertEquals(0.5, bk.avg());
 
         /* float64 min and max arrive unrounded (version 1 rows would make 1e300 infinite) */
-        int d = c.seriesCreate("agg.f64", ValueType.FLOAT64);
-        c.insertValues(new int[] {d, d, d, d}, TsdbClientTest.seq(T0, 1000, 4),
+        long d = c.seriesCreate("agg.f64", ValueType.FLOAT64);
+        c.insertValues(new long[] {d, d, d, d}, TsdbClientTest.seq(T0, 1000, 4),
                 Column.ofDoubles(1.5, 2.25, -3.0, 1e300));
         Bucket f = c.queryAgg(d, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0);
         assertEquals(4, f.count());
         assertEquals(-3.0, f.min());
         assertEquals(1e300, f.max());
         double precise = 0.1;
-        int p = c.seriesCreate("agg.f64.precise", ValueType.FLOAT64);
+        long p = c.seriesCreate("agg.f64.precise", ValueType.FLOAT64);
         c.insertSeriesValues(p, new long[] {T0}, Column.ofDoubles(precise));
         assertEquals(precise, c.queryAgg(p, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0).min());
 
         /* float32 series keep working, now through QUERY_BUCKETS */
-        int f32 = c.series("agg.f32");
+        long f32 = c.series("agg.f32");
         c.insert(f32, TsdbClientTest.seq(T0, 1000, 3), new float[] {1.25f, -2.5f, 4});
         Bucket x = c.queryAgg(f32, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0);
         assertEquals(3, x.count());
@@ -332,8 +332,8 @@ class TypedValuesTest {
 
     @Test
     void stateDictionary() throws Exception {
-        int s = c.seriesCreate("state.a", ValueType.STATE);
-        int s2 = c.seriesCreate("state.b", ValueType.STATE);
+        long s = c.seriesCreate("state.a", ValueType.STATE);
+        long s2 = c.seriesCreate("state.b", ValueType.STATE);
         int on = c.state(s, "on"), off = c.state(s, "off");
         assertNotEquals(on, off);
         assertTrue(on != 0 && off != 0, "code 0 is null");
@@ -347,7 +347,7 @@ class TypedValuesTest {
         assertEquals(Status.ERR_NOTFOUND, status(() -> c.stateName(s, 999)));
         assertThrows(IllegalArgumentException.class, () -> c.state(s, ""));
 
-        c.insertValues(new int[] {s, s2, s}, TsdbClientTest.seq(T0, 1000, 3), Column.ofStates(on, off, off));
+        c.insertValues(new long[] {s, s2, s}, TsdbClientTest.seq(T0, 1000, 3), Column.ofStates(on, off, off));
         assertArrayEquals(new int[] {on, off}, c.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).values().states());
         assertArrayEquals(new int[] {off}, c.queryValues(s2, Long.MIN_VALUE, Long.MAX_VALUE).values().states());
         Bucket b = c.queryAgg(s, Long.MIN_VALUE, Long.MAX_VALUE, 0).get(0);
@@ -356,11 +356,11 @@ class TypedValuesTest {
 
     @Test
     void reservedValuesReadBackAsNull() throws Exception {
-        int i = c.seriesCreate("reserved.i64", ValueType.INT64);
+        long i = c.seriesCreate("reserved.i64", ValueType.INT64);
         c.insertSeriesValues(i, TsdbClientTest.seq(T0, 1000, 2), Column.ofLongs(Long.MIN_VALUE, 1));
         assertTrue(c.queryValues(i, Long.MIN_VALUE, Long.MAX_VALUE).values().isNull(0));
 
-        int f = c.seriesCreate("reserved.f32", ValueType.FLOAT32);
+        long f = c.seriesCreate("reserved.f32", ValueType.FLOAT32);
         c.insertSeriesValues(f, TsdbClientTest.seq(T0, 1000, 2),
                 Column.ofFloats(Float.intBitsToFloat(0x7fc01001), Float.NaN));
         Column got = c.queryValues(f, Long.MIN_VALUE, Long.MAX_VALUE).values();
@@ -368,14 +368,14 @@ class TypedValuesTest {
         assertFalse(got.isNull(1), "other NaNs are values");
         assertTrue(Float.isNaN(got.floats()[1]));
 
-        int s = c.seriesCreate("reserved.state", ValueType.STATE);
+        long s = c.seriesCreate("reserved.state", ValueType.STATE);
         c.insertSeriesValues(s, new long[] {T0}, Column.ofStates(0));
         assertTrue(c.queryValues(s, Long.MIN_VALUE, Long.MAX_VALUE).values().isNull(0));
     }
 
     @Test
     void lastWriteWinsWithNullsAndPipelining() throws Exception {
-        int id = c.seriesCreate("lww.typed", ValueType.INT64);
+        long id = c.seriesCreate("lww.typed", ValueType.INT64);
         long[] ts = {T0, T0 + 1000};
         BitSet first = new BitSet();
         first.set(1);
@@ -383,7 +383,7 @@ class TypedValuesTest {
         c.insertSeriesValuesAsync(id, ts, Column.ofLongs(3, 4)); /* replaces the null */
         BitSet second = new BitSet();
         second.set(0);
-        c.insertValuesAsync(new int[] {id}, new long[] {T0}, Column.ofLongs(5).withNulls(second)); /* a null wins */
+        c.insertValuesAsync(new long[] {id}, new long[] {T0}, Column.ofLongs(5).withNulls(second)); /* a null wins */
         assertEquals(3, c.pending());
         c.await();
         Column v = c.queryValues(id, Long.MIN_VALUE, Long.MAX_VALUE).values();
@@ -397,14 +397,14 @@ class TypedValuesTest {
 
     @Test
     void typeMismatches() throws Exception {
-        int d = c.seriesCreate("mismatch.f64", ValueType.FLOAT64);
-        int f = c.series("mismatch.f32");
+        long d = c.seriesCreate("mismatch.f64", ValueType.FLOAT64);
+        long f = c.series("mismatch.f32");
         long[] ts = {T0};
         assertEquals(Status.ERR_INVALID, status(() -> c.insertSeriesValues(d, ts, Column.ofLongs(1))));
         assertEquals(Status.ERR_INVALID, status(() -> c.insert(d, ts, new float[] {1})));
         assertEquals(Status.ERR_INVALID, status(() -> c.queryPoints(d, Long.MIN_VALUE, Long.MAX_VALUE)));
         assertEquals(Status.ERR_INVALID,
-                status(() -> c.insertValues(new int[] {d, f}, new long[] {T0, T0}, Column.ofDoubles(1, 2))));
+                status(() -> c.insertValues(new long[] {d, f}, new long[] {T0, T0}, Column.ofDoubles(1, 2))));
         assertEquals(0, c.queryValues(d, Long.MIN_VALUE, Long.MAX_VALUE).size(), "nothing of the batch applied");
         assertEquals(0, c.queryValues(f, Long.MIN_VALUE, Long.MAX_VALUE).size());
         /* a pipelined mismatch is reported by await */
@@ -427,7 +427,7 @@ class TypedValuesTest {
         assertEquals(0, none.size());
         assertEquals(ValueType.FLOAT32, none.type());
 
-        int id = c.seriesCreate("stop.typed", ValueType.INT64);
+        long id = c.seriesCreate("stop.typed", ValueType.INT64);
         c.insertSeriesValues(id, TsdbClientTest.seq(T0, 1000, N), Column.ofLongs(new long[N]));
         int[] calls = {0};
         assertFalse(c.queryValues(id, Long.MIN_VALUE, Long.MAX_VALUE, (t, v, n) -> ++calls[0] < 1));

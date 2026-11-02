@@ -1,5 +1,6 @@
 /* Tests: codec round trips, and every query checked against a brute-force reference. */
 #include "internal.h"
+#define SK_SID tsdb_sid
 #include "samekeys.h"
 
 #include <dirent.h>
@@ -615,14 +616,14 @@ static void test_db(const char *dir)
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
     enum { NS = 7 };
-    uint32_t ids[NS];
+    tsdb_sid ids[NS];
     char name[32];
     for (int i = 0; i < NS; i++) {
         snprintf(name, sizeof name, "sensor.%d", i);
         OK(tsdb_series(db, name, &ids[i]));
         CHECK(ids[i] == (uint32_t)i);
     }
-    uint32_t again;
+    tsdb_sid again;
     OK(tsdb_series(db, "sensor.3", &again));
     CHECK(again == 3);
     CHECK(tsdb_series_lookup(db, "nope", &again) == TSDB_ERR_NOTFOUND);
@@ -633,7 +634,7 @@ static void test_db(const char *dir)
     /* batches of every shape: sorted per series, time-major, random, duplicates, negative ts */
     for (int batch = 0; batch < 40; batch++) {
         size_t n = 1 + rnd() % 3000;
-        uint32_t *s = malloc(n * sizeof *s);
+        tsdb_sid *s = malloc(n * sizeof *s);
         int64_t *t = malloc(n * sizeof *t);
         float *v = malloc(n * sizeof *v);
         int shape = batch % 4;
@@ -666,7 +667,7 @@ static void test_db(const char *dir)
         ref_add(&r, 5, t, v);
     }
     /* bad input is rejected */
-    uint32_t bad = 99;
+    tsdb_sid bad = 99;
     int64_t bt = 0;
     float bv = 0;
     CHECK(tsdb_insert(db, &bad, &bt, &bv, 1) == TSDB_ERR_INVALID);
@@ -781,7 +782,7 @@ static void test_replace(const char *dir)
     tsdb_options o = test_opts(2);
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "tank.level", &id));
     ref r = {0};
     const int64_t t0 = 1700000000000;
@@ -853,7 +854,7 @@ static void test_wal(const char *dir)
         pid_t pid = fork();
         if (pid == 0) {
             tsdb *db;
-            uint32_t id;
+            tsdb_sid id;
             if (tsdb_open(dir, &o, &db) || tsdb_series(db, "pipe.flow", &id))
                 _exit(1);
             for (int i = 0; i < 2000; i++)
@@ -896,7 +897,7 @@ static void test_wal(const char *dir)
     tsdb_options o = test_opts(0);
     o.wal_max_batch_rows = 100;
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_open(dir, &o, &db));
     OK(tsdb_series(db, "pipe.pressure", &id));
     int64_t t = t0;
@@ -1024,7 +1025,7 @@ static void test_flush_visibility(const char *dir)
     o.flush_interval_ms = 1000000;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     const int64_t t = 1700000000000;
     OK(tsdb_append(db, id, t, 1.0f));
@@ -1109,7 +1110,7 @@ static void test_publish_then_merge(const char *dir)
     o.obsolete_part_lifetime_s = 0; /* a replaced part goes with its last reference */
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     const int64_t t = 1700002800000; /* partitions of an hour: p0 and p1 = p0 + 1 */
     const int64_t p0 = t / 3600000;
@@ -1159,7 +1160,7 @@ static void *writer(void *a)
             t[i] = 1700000000000 + ((int64_t)b * 500 + i) * 1000;
             v[i] = (float)c->id;
         }
-        OK(tsdb_insert_series(c->db, (uint32_t)c->id, t, v, 500));
+        OK(tsdb_insert_series(c->db, c->id, t, v, 500));
     }
     return NULL;
 }
@@ -1194,7 +1195,7 @@ static void test_concurrency(const char *dir)
     OK(tsdb_open(dir, &o, &db));
     for (int i = 0; i < 4; i++) {
         char name[16];
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "s%d", i);
         OK(tsdb_series(db, name, &id));
     }
@@ -1238,7 +1239,7 @@ static void test_concurrency(const char *dir)
 typedef struct skx {
     const sk_cfg *c;
     tsdb *db;
-    uint32_t ids[SK_MAX_SERIES];
+    tsdb_sid ids[SK_MAX_SERIES];
     atomic_int started[SK_MAX_WRITERS]; /* rounds begun */
     atomic_int acked[SK_MAX_WRITERS];   /* rounds acknowledged */
     int last_kind[SK_MAX_WRITERS];
@@ -1399,7 +1400,7 @@ static void *sk_maintenance(void *a)
     return NULL;
 }
 
-static void sk_read_all(const sk_cfg *c, tsdb *db, const uint32_t *ids, sk_val *st)
+static void sk_read_all(const sk_cfg *c, tsdb *db, const tsdb_sid *ids, sk_val *st)
 {
     for (uint32_t s = 0; s < c->nseries; s++) {
         sk_collect k;
@@ -1465,7 +1466,7 @@ static void sk_phase(skx *x, sk_val *st)
     CHECK(sk_check_final(c, st, x->last_kind) == 0);
 }
 
-static void sk_same(const sk_cfg *c, const sk_val *want, tsdb *db, const uint32_t *ids, const char *after)
+static void sk_same(const sk_cfg *c, const sk_val *want, tsdb *db, const tsdb_sid *ids, const char *after)
 {
     size_t nk = sk_nkeys(c);
     sk_val *st = calloc(nk, sizeof *st);
@@ -1711,7 +1712,7 @@ static void test_idle_merge(const char *base)
     o.merge_idle_s = 1;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     /* two parts of the same size whose rows interleave in time: the merge
      * heuristics leave a pair like this for about an hour */
@@ -1798,7 +1799,7 @@ static void test_solo_rewrite(const char *base)
         o.merge_idle_s = optimize ? -1 : 1;
         tsdb *db;
         OK(tsdb_open(dir, &o, &db));
-        uint32_t id;
+        tsdb_sid id;
         OK(tsdb_series(db, "psi", &id));
         OK(tsdb_insert_series(db, id, ts, v, N));
         solo_info a = {0, 0, 0}, b = {0, 0, 0};
@@ -1854,7 +1855,7 @@ static void test_solo_after_retention(const char *base)
     o.merge_threads = 0;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     enum { N = 1000 };
     int64_t ts[N];
@@ -1920,7 +1921,7 @@ static void test_optimize_waits_for_solo(const char *base)
     o.merge_idle_s = 1;
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "psi", &id));
     OK(tsdb_insert_series(db, id, ts, v, N));
     /* the merge thread's output is a tmp_ file until it is named: optimize is called while it exists */
@@ -1965,7 +1966,7 @@ static void test_volume_stats(const char *base)
     CHECK(tsdb_get_volume_stats(db, 1, &vs) == TSDB_ERR_INVALID);
     OK(tsdb_get_volume_stats(db, 0, &vs));
     CHECK(vs.rows == 0 && vs.parts == 0 && vs.wal_bytes == 0 && vs.failed == 0 && vs.follow_refresh_age_ms == 0);
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     enum { N = 2000 };
     int64_t ts[N];
@@ -2024,7 +2025,7 @@ static void test_merging_parts(const char *base)
     o.merge_threads = 0; /* only tsdb_optimize merges: the part count stays what the test made */
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     enum { PARTS = 8, N = 100000 };
     int64_t *ts = malloc(N * sizeof *ts);
@@ -2105,7 +2106,7 @@ static void test_raw_many_parts(const char *base)
     o.merge_threads = 0; /* the parts stay as written */
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
-    uint32_t sd, si;
+    tsdb_sid sd, si;
     OK(tsdb_series(db, "disjoint", &sd));
     OK(tsdb_series(db, "interleaved", &si));
     /* disjoint parts of 2,048 rows (without the freeing: 24 MB of buffers even at the right size), interleaved

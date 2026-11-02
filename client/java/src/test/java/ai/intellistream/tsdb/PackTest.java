@@ -12,7 +12,7 @@ import org.junit.jupiter.api.Test;
 class PackTest {
     static final long[] TS = {1000, 2000, 1999, -5, Long.MAX_VALUE};
 
-    static byte[] reshape(long[] ts, Column col, int[] series, int off, int n) {
+    static byte[] reshape(long[] ts, Column col, long[] series, int off, int n) {
         byte[] valid = Values.validity(col, off, n);
         byte[] out = new byte[(int) Pack.rawBound(n, col.type(), valid != null, series != null)];
         return Arrays.copyOf(out, Pack.reshape(ts, col, series, off, n, valid, out));
@@ -30,7 +30,7 @@ class PackTest {
         BitSet nulls = new BitSet();
         nulls.set(1);
         Column col = Column.ofFloats(1.5f, Float.intBitsToFloat(0x7fc01001), -2.0f, 0.0f, 3.25f).withNulls(nulls);
-        int[] series = {3, 3, 1, 0x80000000, 0};
+        long[] series = {3, 3, 1, 0x80000000L, 0};
         assertArrayEquals(bytes(-48, 15, -48, 15, 1, -89, 31, -9, -1, -1, -1, -1, -1, -1, -1, -1, 1, 0, 1, 0, 0, 0,
                 0, 16, 0, 0, 0, -64, -64, 0, 0, 80, 63, 127, -64, 0, 64, 29, 6, 0, 3, -2, -1, -1, -1, 15, -1, -1, -1,
                 -1, 15), reshape(TS, col, series, 0, 5));
@@ -54,9 +54,9 @@ class PackTest {
         BitSet nulls = new BitSet();
         nulls.set(3);
         Column col = Column.ofFloats(9, 9, -2.0f, 0.0f, 9).withNulls(nulls);
-        byte[] got = reshape(TS, col, new int[] {9, 9, 1, 0x80000000, 9}, 2, 2);
+        byte[] got = reshape(TS, col, new long[] {9, 9, 1, 0x80000000L, 9}, 2, 2);
         byte[] want = reshape(new long[] {1999, -5}, Column.ofFloats(-2.0f, 0.0f).withNulls(BitSet.valueOf(
-                new long[] {2})), new int[] {1, 0x80000000}, 0, 2);
+                new long[] {2})), new long[] {1, 0x80000000L}, 0, 2);
         assertArrayEquals(want, got);
         assertEquals(1999 * 2, Pack.zigzag(1999));
     }

@@ -15,7 +15,7 @@ class RestartTest {
         Path scratch = TsdbServer.scratch("tsdbd-java-restart-");
         Path dir = scratch.resolve("db");
         try {
-            int id;
+            long id;
             long[] ts = TsdbClientTest.seq(TsdbClientTest.T0, 1000, 5000);
             float[] v = new float[ts.length];
             for (int i = 0; i < v.length; i++)

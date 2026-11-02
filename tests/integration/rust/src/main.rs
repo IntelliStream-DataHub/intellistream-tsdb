@@ -18,18 +18,18 @@ fn parse_type(s: &str) -> ValueType {
 }
 
 struct Series {
-    id: u32,
+    id: u64,
     ty: ValueType,
 }
 
 struct Ctx {
     c: Client,
     series: std::collections::HashMap<String, Series>,
-    names: std::collections::HashMap<(u32, u32), String>,
+    names: std::collections::HashMap<(u64, u32), String>,
 }
 
 impl Ctx {
-    fn find(&mut self, name: &str, create: Option<ValueType>) -> Option<(u32, ValueType)> {
+    fn find(&mut self, name: &str, create: Option<ValueType>) -> Option<(u64, ValueType)> {
         if let Some(s) = self.series.get(name) {
             return Some((s.id, s.ty));
         }
@@ -68,7 +68,7 @@ fn token(ty: ValueType, t: &str) -> Tok {
     }
 }
 
-fn build(cx: &mut Ctx, series: u32, ty: ValueType, toks: &[Tok]) -> Column {
+fn build(cx: &mut Ctx, series: u64, ty: ValueType, toks: &[Tok]) -> Column {
     macro_rules! col {
         ($t:ty, $variant:ident, $conv:expr) => {
             Column::from_options::<$t>(toks.iter().map(|t| match t {
@@ -115,7 +115,7 @@ fn write(cx: &mut Ctx, path: &str) -> R<()> {
         let flags = p[3];
         let n: usize = p[4].parse()?;
         let (ty, one) = if multi {
-            (parse_type(p[1]), 0u32)
+            (parse_type(p[1]), 0u64)
         } else {
             let (id, t) = cx.find(p[1], None).expect("series");
             (t, id)
@@ -188,7 +188,7 @@ fn write(cx: &mut Ctx, path: &str) -> R<()> {
     Ok(())
 }
 
-fn state_name(cx: &mut Ctx, series: u32, code: u32) -> String {
+fn state_name(cx: &mut Ctx, series: u64, code: u32) -> String {
     if let Some(n) = cx.names.get(&(series, code)) {
         return n.clone();
     }

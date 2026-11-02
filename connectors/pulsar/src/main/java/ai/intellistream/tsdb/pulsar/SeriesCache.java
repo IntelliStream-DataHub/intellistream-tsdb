@@ -20,7 +20,7 @@ final class SeriesCache {
 
     /** A resolved series. */
     static final class Entry {
-        final int id;
+        final long id;
         final ValueType type;
         /** State names to codes (LRU), for state series; filled on first use through {@link SeriesCache#putState}. */
         LinkedHashMap<String, Integer> states;
@@ -29,7 +29,7 @@ final class SeriesCache {
         /** Whether the entry is counted in a cache (an evicted one may still be in use by a batch). */
         boolean cached;
 
-        Entry(int id, ValueType type) {
+        Entry(long id, ValueType type) {
             this.id = id;
             this.type = type;
         }

@@ -16,7 +16,7 @@ public enum ValueType {
     /** Booleans; aggregates count {@code true} as 1 and {@code false} as 0. */
     BOOL(3, 1),
     /**
-     * Codes of a state dictionary ({@link TsdbClient#state(int, String)}), one per name, shared by the state series
+     * Codes of a state dictionary ({@link TsdbClient#state(long, String)}), one per name, shared by the state series
      * of a volume. Code 0 is reserved for null. Aggregates only count.
      */
     STATE(4, 4);

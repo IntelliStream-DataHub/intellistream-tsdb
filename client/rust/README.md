@@ -113,7 +113,8 @@ after 3 unanswered probes, which `set_keepalive` changes or turns off.
 
 ## Create a series
 
-A series has a name and a number (its id). You use the id in every other call.
+A series has a name and a number (its id, a `u64`, also called `SeriesId`). You use the id in every
+other call. Ids are handed out by the database: do not count on them being 0, 1, 2 and so on.
 
 ```rust
 let id = client.series("pump7.flow")?;           // creates it if it does not exist
@@ -402,7 +403,7 @@ use tsdb_client::{Buckets, Client, MultiOpts, QueryOpts};
 
 fn main() -> tsdb_client::Result<()> {
     let mut c = Client::connect("127.0.0.1:7070")?;
-    let pumps: Vec<u32> = (0..200).collect();
+    let pumps: Vec<u64> = (0..200).map(|i| c.series(&format!("pump{i}.flow"))).collect::<Result<_, _>>()?;
     let day = 86_400_000;
     // every pump by hour over one day: hourly[i] is pumps[i]'s answer
     let hourly = c.query_buckets_multi(&pumps, 0..day, Buckets::Every(3_600_000), QueryOpts::default(),

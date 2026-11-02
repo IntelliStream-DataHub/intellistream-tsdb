@@ -131,16 +131,13 @@ final class BenchCommon {
      * Rows {@code [r, r + n)} into the arrays from index 0, the series through {@code ids} when it is not null.
      * Returns the first series index that ids does not cover, or -1.
      */
-    static long fill(MemorySegment m, long r, int n, int[] ids, int[] s, long[] t, float[] v) {
+    static long fill(MemorySegment m, long r, int n, long[] ids, long[] s, long[] t, float[] v) {
         long o = r * ROW;
         for (int i = 0; i < n; i++, o += ROW) {
-            int id = m.get(U32, o);
-            if (ids != null) {
-                if (id < 0 || id >= ids.length)
-                    return Integer.toUnsignedLong(id);
-                id = ids[id];
-            }
-            s[i] = id;
+            int ix = m.get(U32, o);
+            if (ids != null && (ix < 0 || ix >= ids.length))
+                return Integer.toUnsignedLong(ix);
+            s[i] = ids != null ? ids[ix] : Integer.toUnsignedLong(ix);
             t[i] = m.get(I64, o + 4);
             v[i] = m.get(F32, o + 12);
         }
@@ -152,9 +149,9 @@ final class BenchCommon {
      * before the clock starts. The C benchmarks' copy loop is compiled ahead of time; without this the load's
      * threads would start it in the interpreter and in profiled code at once, and count that as loading.
      */
-    static void warmFill(MemorySegment m, int[] ids, int batch) {
+    static void warmFill(MemorySegment m, long[] ids, int batch) {
         int n = (int) Math.min(Math.min(batch, 1 << 16), m.byteSize() / ROW);
-        int[] s = new int[n];
+        long[] s = new long[n];
         long[] t = new long[n];
         float[] v = new float[n];
         long best = Long.MAX_VALUE;

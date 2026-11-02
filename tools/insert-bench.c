@@ -35,7 +35,7 @@ static void stream_init(stream *s)
 
 static void stream_free(stream *s) { free(s->st); }
 
-static void stream_fill(stream *s, uint32_t *sv, int64_t *tv, float *vv, size_t n)
+static void stream_fill(stream *s, tsdb_sid *sv, int64_t *tv, float *vv, size_t n)
 {
     for (size_t k = 0; k < n; k++, s->pos++) {
         uint32_t id = (uint32_t)(s->pos % nseries);
@@ -46,7 +46,7 @@ static void stream_fill(stream *s, uint32_t *sv, int64_t *tv, float *vv, size_t 
 
 typedef struct fill_job {
     stream *s;
-    uint32_t *sv;
+    tsdb_sid *sv;
     int64_t *tv;
     float *vv;
     size_t n;
@@ -71,7 +71,7 @@ static void *fill_part(void *arg)
     return NULL;
 }
 
-static void stream_fill_parallel(stream *s, uint32_t *sv, int64_t *tv, float *vv, size_t n)
+static void stream_fill_parallel(stream *s, tsdb_sid *sv, int64_t *tv, float *vv, size_t n)
 {
     int nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
     pthread_t th[256];
@@ -111,7 +111,7 @@ static tsdb *open_fresh(int wal_sync_ms, size_t wal_max_batch)
     }
     for (uint32_t i = 0; i < nseries; i++) {
         char name[64], vol[PATH_MAX + 32];
-        uint32_t id;
+        tsdb_sid id;
         snprintf(name, sizeof name, "%s.%u", ds_info[i % (DS_KINDS - 1)].name, i);
         snprintf(vol, sizeof vol, "%s.vol%u", abs, i % (uint32_t)nvolumes);
         rc = tsdb_series_at(db, name, nvolumes > 1 ? vol : NULL, &id);
@@ -232,7 +232,7 @@ static void run_batches(const char *label, size_t batch, size_t wal_max_batch, d
     tsdb *db = open_fresh(0, wal_max_batch);
     stream s;
     stream_init(&s);
-    uint32_t *sv = malloc(batch * sizeof *sv);
+    tsdb_sid *sv = malloc(batch * sizeof *sv);
     int64_t *tv = malloc(batch * sizeof *tv);
     float *vv = malloc(batch * sizeof *vv);
     if (!sv || !tv || !vv) {

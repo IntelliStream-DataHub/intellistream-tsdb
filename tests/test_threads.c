@@ -50,7 +50,7 @@ static tsdb *open_db(const char *dir, int threads)
 
 static void load(tsdb *db)
 {
-    uint32_t a, b;
+    tsdb_sid a, b;
     must(tsdb_series_create(db, "a", TSDB_FLOAT32, NULL, &a), "create a");
     must(tsdb_series_create(db, "b", TSDB_FLOAT64, NULL, &b), "create b");
     size_t n = (size_t)NG * GR;

@@ -19,7 +19,7 @@ use pyo3::types::{PyList, PyTuple};
 
 use ::tsdb_client as tc;
 
-use crate::arrays::{BucketsMany, Col, agg_queries, inserts, many_cols, points_list, range_queries, with_batches};
+use crate::arrays::{BucketsMany, SidCol, agg_queries, inserts, many_cols, points_list, range_queries, with_batches};
 use tc::ValueType;
 
 use crate::{
@@ -123,7 +123,7 @@ impl Db {
     fn insert_typed(
         &self,
         py: Python<'_>,
-        one: Option<u32>,
+        one: Option<u64>,
         many: Option<&Bound<'_, PyAny>>,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
@@ -131,14 +131,14 @@ impl Db {
     ) -> PyResult<()> {
         let ts = ts_column(ts)?;
         let many = many.map(series_column).transpose()?;
-        let ty = match (value_type, one.or_else(|| many.as_ref().and_then(Col::first))) {
+        let ty = match (value_type, one.or_else(|| many.as_ref().and_then(SidCol::first))) {
             (Some(t), _) => self::value_type(t)?,
             (None, Some(id)) => self.with(py, |d| d.series_type(id))?,
             (None, None) => ValueType::Float32,
         };
         let col = values_column(values, ty)?;
         self.with(py, |d| {
-            let (ts, col, many) = (ts.snap(), col.snap(), many.as_ref().map(Col::snap));
+            let (ts, col, many) = (ts.snap(), col.snap(), many.as_ref().map(SidCol::snap));
             match (&many, one) {
                 (Some(s), _) => d.insert_values(s, &ts, &col),
                 (None, Some(id)) => d.insert_series_values(id, &ts, &col),
@@ -261,12 +261,12 @@ impl Db {
     /// Raises:
     ///     TsdbError: ERR_NOTFOUND if create is False and there is no such series.
     #[pyo3(signature = (name, create = true))]
-    fn series(&self, py: Python<'_>, name: &str, create: bool) -> PyResult<u32> {
+    fn series(&self, py: Python<'_>, name: &str, create: bool) -> PyResult<u64> {
         self.with(py, |d| if create { d.series(name) } else { d.series_lookup(name) })
     }
 
     /// Returns the id of a series, creating it (as float32) in a volume if needed.
-    fn series_at(&self, py: Python<'_>, name: &str, path: &str) -> PyResult<u32> {
+    fn series_at(&self, py: Python<'_>, name: &str, path: &str) -> PyResult<u64> {
         self.with(py, |d| d.series_at(name, path))
     }
 
@@ -276,29 +276,34 @@ impl Db {
     ///     TsdbError: ERR_INVALID if the series exists with another type.
     ///     ValueError: Unknown value_type.
     #[pyo3(signature = (name, value_type = "float32", path = None))]
-    fn series_create(&self, py: Python<'_>, name: &str, value_type: &str, path: Option<&str>) -> PyResult<u32> {
+    fn series_create(&self, py: Python<'_>, name: &str, value_type: &str, path: Option<&str>) -> PyResult<u64> {
         let ty = self::value_type(value_type)?;
         self.with(py, |d| d.series_create(name, ty, path))
     }
 
     /// Returns the value type of a series: "float32", "float64", "int64", "bool" or "state".
-    fn series_type(&self, py: Python<'_>, id: u32) -> PyResult<&'static str> {
+    fn series_type(&self, py: Python<'_>, id: u64) -> PyResult<&'static str> {
         self.with(py, |d| d.series_type(id)).map(ValueType::name)
     }
 
     /// Returns the name of a series.
-    fn series_name(&self, py: Python<'_>, id: u32) -> PyResult<String> {
+    fn series_name(&self, py: Python<'_>, id: u64) -> PyResult<String> {
         self.with(py, |d| d.series_name(id))
     }
 
     /// Returns the volume (directory) a series is stored in.
-    fn series_path(&self, py: Python<'_>, id: u32) -> PyResult<String> {
+    fn series_path(&self, py: Python<'_>, id: u64) -> PyResult<String> {
         self.with(py, |d| d.series_path(id))
     }
 
-    /// Returns the number of series.
-    fn series_count(&self, py: Python<'_>) -> PyResult<u32> {
+    /// Returns the number of series. Ids are not 0 .. series_count() - 1: list them with series_ids().
+    fn series_count(&self, py: Python<'_>) -> PyResult<u64> {
         self.with(py, |d| Ok(d.series_count()))
+    }
+
+    /// Returns the ids of every series: those of one volume in creation order, the volumes one after another.
+    fn series_ids(&self, py: Python<'_>) -> PyResult<Vec<u64>> {
+        self.with(py, |d| d.series_ids())
     }
 
     /// Returns the directories of the volumes, the database directory first.
@@ -307,22 +312,22 @@ impl Db {
     }
 
     /// Returns the code of a state name, creating it if needed.
-    fn state(&self, py: Python<'_>, series: u32, name: &str) -> PyResult<u32> {
+    fn state(&self, py: Python<'_>, series: u64, name: &str) -> PyResult<u32> {
         self.with(py, |d| d.state(series, name))
     }
 
     /// Returns the code of an existing state name (ERR_NOTFOUND if it has none).
-    fn state_lookup(&self, py: Python<'_>, series: u32, name: &str) -> PyResult<u32> {
+    fn state_lookup(&self, py: Python<'_>, series: u64, name: &str) -> PyResult<u32> {
         self.with(py, |d| d.state_lookup(series, name))
     }
 
     /// Returns the name of a state code (ERR_NOTFOUND for an unknown code).
-    fn state_name(&self, py: Python<'_>, series: u32, code: u32) -> PyResult<String> {
+    fn state_name(&self, py: Python<'_>, series: u64, code: u32) -> PyResult<String> {
         self.with(py, |d| d.state_name(series, code))
     }
 
     /// Returns the names of many state codes; None and masked entries give None.
-    fn state_names(&self, py: Python<'_>, series: u32, codes: &Bound<'_, PyAny>) -> PyResult<Vec<Option<String>>> {
+    fn state_names(&self, py: Python<'_>, series: u64, codes: &Bound<'_, PyAny>) -> PyResult<Vec<Option<String>>> {
         let col = py_column(codes, ValueType::State)?;
         self.with(py, |d| {
             col.iter::<u32>()
@@ -341,7 +346,7 @@ impl Db {
     fn insert_series(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
@@ -365,7 +370,7 @@ impl Db {
     fn insert_series_async(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
@@ -395,7 +400,7 @@ impl Db {
     fn insert_series_values(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
         value_type: Option<&str>,
@@ -421,7 +426,7 @@ impl Db {
     fn insert_series_values_async(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         ts: &Bound<'_, PyAny>,
         values: &Bound<'_, PyAny>,
         value_type: Option<&str>,
@@ -466,7 +471,7 @@ impl Db {
     fn query_raw<'py>(
         &self,
         py: Python<'py>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         order: &str,
@@ -484,7 +489,7 @@ impl Db {
     fn query_points<'py>(
         &self,
         py: Python<'py>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         order: &str,
@@ -503,7 +508,7 @@ impl Db {
     fn query_values<'py>(
         &self,
         py: Python<'py>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         order: &str,
@@ -525,7 +530,7 @@ impl Db {
     fn query_agg(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         interval_ms: i64,
@@ -549,7 +554,7 @@ impl Db {
     fn query_group(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         unit: Option<&str>,
@@ -569,7 +574,7 @@ impl Db {
     fn query_bounds(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         bounds: &Bound<'_, PyAny>,
         start: Option<i64>,
         end: Option<i64>,
@@ -602,7 +607,7 @@ impl Db {
     fn query_spread(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         interval_ms: i64,
@@ -621,7 +626,7 @@ impl Db {
     fn query_spread_group(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         unit: Option<&str>,
@@ -642,7 +647,7 @@ impl Db {
     fn query_spread_bounds(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         bounds: &Bound<'_, PyAny>,
         start: Option<i64>,
         end: Option<i64>,
@@ -684,7 +689,7 @@ impl Db {
     fn query_twa(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         interval_ms: i64,
@@ -705,7 +710,7 @@ impl Db {
     fn query_twa_group(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         unit: Option<&str>,
@@ -729,7 +734,7 @@ impl Db {
     fn query_twa_bounds(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         bounds: &Bound<'_, PyAny>,
         start: Option<i64>,
         end: Option<i64>,
@@ -767,7 +772,7 @@ impl Db {
     fn query_lttb<'py>(
         &self,
         py: Python<'py>,
-        series: u32,
+        series: u64,
         threshold: u64,
         start: Option<i64>,
         end: Option<i64>,
@@ -783,7 +788,7 @@ impl Db {
     /// Deletes the rows of a series with start <= ts < end; None is unbounded.
     /// A row inserted after the call returned is kept.
     #[pyo3(signature = (series, start, end))]
-    fn delete_range(&self, py: Python<'_>, series: u32, start: Option<i64>, end: Option<i64>) -> PyResult<()> {
+    fn delete_range(&self, py: Python<'_>, series: u64, start: Option<i64>, end: Option<i64>) -> PyResult<()> {
         self.with(py, |d| d.delete_range(series, range(start, end)))
     }
 
@@ -798,7 +803,7 @@ impl Db {
     fn replace_range(
         &self,
         py: Python<'_>,
-        series: u32,
+        series: u64,
         start: Option<i64>,
         end: Option<i64>,
         ts: &Bound<'_, PyAny>,
@@ -817,12 +822,12 @@ impl Db {
     /// Sets how long a series keeps its rows, in ms; 0 keeps them for ever.
     /// Rows older than the clock minus limit_ms disappear from queries at
     /// once and from disk as merges get to them.
-    fn set_retention(&self, py: Python<'_>, series: u32, limit_ms: i64) -> PyResult<()> {
+    fn set_retention(&self, py: Python<'_>, series: u64, limit_ms: i64) -> PyResult<()> {
         self.with(py, |d| d.set_retention(series, limit_ms))
     }
 
     /// Returns the retention limit of a series in ms, 0 for none.
-    fn retention(&self, py: Python<'_>, series: u32) -> PyResult<i64> {
+    fn retention(&self, py: Python<'_>, series: u64) -> PyResult<i64> {
         self.with(py, |d| d.retention(series))
     }
 
@@ -833,7 +838,7 @@ impl Db {
     /// interpreter is crossed once per call rather than once per query.
     ///
     /// Args:
-    ///     series: Series ids: a list or a numpy array (uint32), one per query.
+    ///     series: Series ids: a list or a numpy array (uint64 or uint32), one per query.
     ///     start, end: None (unbounded), one timestamp for every query, or a
     ///         list or int64 array with one per query; [start, end) in ms.
     ///     order: "asc" or "desc".
@@ -868,7 +873,7 @@ impl Db {
     /// Runs many aggregate queries at once, in parallel on every CPU.
     ///
     /// Args:
-    ///     series: Series ids, one per query (a list or a uint32 array).
+    ///     series: Series ids, one per query (a list, or a uint64 or uint32 array).
     ///     start, end: As in query_raw_many().
     ///     interval_ms: Bucket length in ms: one for every query, or a list or
     ///         int64 array of one per query; 0 (the default) is one bucket for

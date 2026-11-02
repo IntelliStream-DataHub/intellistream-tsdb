@@ -28,9 +28,9 @@ final class Pack {
      * length written.
      *
      * @param valid the frame's validity bitmap (bit i for row off + i), or null
-     * @param series the series id of every row (indexed like ts), or null
+     * @param series the series id of every row (indexed like ts, each below 2^32: protocol 10), or null
      */
-    static int reshape(long[] ts, Column col, int[] series, int off, int n, byte[] valid, byte[] out) {
+    static int reshape(long[] ts, Column col, long[] series, int off, int n, byte[] valid, byte[] out) {
         int o = 0;
         long prev = 0;
         for (int i = off, end = off + n; i < end; i++) {
@@ -46,7 +46,7 @@ final class Pack {
         if (series != null) {
             long ps = 0;
             for (int i = off, end = off + n; i < end; i++) {
-                long s = Integer.toUnsignedLong(series[i]);
+                long s = series[i];
                 o = putVarint(out, o, zigzag(s - ps));
                 ps = s;
             }

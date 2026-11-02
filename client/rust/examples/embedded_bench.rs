@@ -94,6 +94,11 @@ fn parse() -> Result<Args, String> {
     Ok(a)
 }
 
+/// The name of the file's series `i`: its sensor kind, then its index.
+fn series_name(i: usize) -> String {
+    format!("{}.{i}", NAMES[i % 7])
+}
+
 /// Row i of a RowBinary file of 16-byte rows (u32 series, i64 ts, f32 value, little endian).
 fn row(data: &[u8], i: usize) -> (u32, i64, f32) {
     let r = &data[i * 16..i * 16 + 16];
@@ -136,17 +141,17 @@ impl Expect {
 
     /// cb_expect_verify_all: prints the reasons (up to 5) and the verdict line; true if the database holds
     /// exactly the file's rows.
-    fn verify(&self, db: &Db, file_rows: usize) -> bool {
+    fn verify(&self, db: &Db, ids: &[u64], file_rows: usize) -> bool {
         let (mut total, mut bad) = (0u64, 0u32);
-        for s in 0..self.count.len() {
-            let b = db.query_agg(s as u32, .., 0).expect("verify: aggregate");
+        for (s, &id) in ids.iter().enumerate().take(self.count.len()) {
+            let b = db.query_agg(id, .., 0).expect("verify: aggregate");
             let (c, sum) = b.first().map_or((0, 0.0), |b| (b.count, b.sum));
             total += c;
             let why = if c != self.count[s] || (sum - self.sum[s]).abs() > 1e-9 * self.abs[s] + 1e-9 {
                 Some(format!("holds {c} rows, sum {sum:.17}; the file has {}, sum {:.17}", self.count[s], self.sum[s]))
             } else {
                 let (mut n, mut h) = (0u64, 0u64);
-                db.query_raw(s as u32, .., QueryOpts::default(), |ts, v| {
+                db.query_raw(id, .., QueryOpts::default(), |ts, v| {
                     for (&t, &v) in ts.iter().zip(v) {
                         h = h.wrapping_add(row_hash(t, v));
                     }
@@ -188,15 +193,13 @@ fn load(a: &Args, path: &str) -> bool {
     }
     let db = Db::open(&a.dir, &Options { zstd_level: a.zstd, fsync: a.fsync, ..Options::default() }).expect("open");
     let e = Expect::of(&data);
-    for i in 0..e.count.len() as u32 {
-        let id = db.series(&format!("{}.{i}", NAMES[i as usize % 7])).expect("series");
-        assert_eq!(id, i, "verification and the query benchmarks rely on ids equal to the file's indexes");
-    }
+    // the file's series are indexes; the database hands out its own ids (not dense in general)
+    let ids: Vec<u64> = (0..e.count.len()).map(|i| db.series(&series_name(i)).expect("series")).collect();
     let nt = a.threads;
     let (t0, cpu0) = (Instant::now(), common::cpu_s());
     std::thread::scope(|sc| {
         for i in 0..nt {
-            let (db, data) = (&db, &data);
+            let (db, data, ids) = (&db, &data, &ids);
             let (lo, hi) = (n * i / nt, n * (i + 1) / nt);
             sc.spawn(move || {
                 let mut s = Vec::with_capacity(a.batch);
@@ -208,7 +211,7 @@ fn load(a: &Args, path: &str) -> bool {
                     v.clear();
                     for k in off..hi.min(off + a.batch) {
                         let r = row(data, k);
-                        s.push(r.0);
+                        s.push(ids[r.0 as usize]);
                         t.push(r.1);
                         v.push(r.2);
                     }
@@ -226,7 +229,7 @@ fn load(a: &Args, path: &str) -> bool {
         db.optimize().expect("optimize");
         println!("optimize {:.2} s", t0.elapsed().as_secs_f64());
     }
-    let ok = e.verify(&db, n);
+    let ok = e.verify(&db, &ids, n);
     let st = db.stats().expect("stats");
     println!(
         "storage {:.2} MiB, {:.3} bytes/row",
@@ -238,7 +241,7 @@ fn load(a: &Args, path: &str) -> bool {
 }
 
 /// One thread's queries of class `k` for `seconds`: (queries, rows, seconds). tools/tsdb-bench.c qw_loop.
-fn querier(db: &Db, a: &Args, k: &Class, thread: usize) -> (u64, u64, f64) {
+fn querier(db: &Db, ids: &[u64], a: &Args, k: &Class, thread: usize) -> (u64, u64, f64) {
     let mut r = common::seed(thread);
     let (mut queries, mut rows) = (0u64, 0u64);
     let mut touch = 0.0f64;
@@ -247,14 +250,14 @@ fn querier(db: &Db, a: &Args, k: &Class, thread: usize) -> (u64, u64, f64) {
         for _ in 0..16 {
             let (s, start, end) = common::window(&mut r, a.series, a.points, k.window);
             if !k.agg {
-                db.query_raw(s, start..end, QueryOpts::default(), |ts, v| {
+                db.query_raw(ids[s as usize], start..end, QueryOpts::default(), |ts, v| {
                     rows += ts.len() as u64;
                     touch += v.last().map_or(0.0, |&x| f64::from(x)); // touch the data, as tsdb-bench does
                     ControlFlow::Continue(())
                 })
                 .expect("query");
             } else {
-                let b = db.query_agg(s, start..end, k.bucket as i64 * common::step_ms(s)).expect("query");
+                let b = db.query_agg(ids[s as usize], start..end, k.bucket as i64 * common::step_ms(s)).expect("query");
                 rows += b.iter().map(|b| b.count).sum::<u64>();
             }
             queries += 1;
@@ -274,14 +277,21 @@ fn qps(a: &Args) -> bool {
         o.query_threads = a.query_threads;
     }
     let db = Db::open(&a.dir, &o).expect("open");
+    let ids: Vec<u64> = match (0..a.series as usize).map(|i| db.series_lookup(&series_name(i))).collect() {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("qps: {} does not hold the data set's {} series: {e}", a.dir, a.series);
+            return false;
+        }
+    };
     for k in &CLASSES {
         let cpu0 = common::cpu_s();
         let res: Vec<(u64, u64, f64)> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..a.qps)
                 .map(|i| {
                     sc.spawn({
-                        let db = &db;
-                        move || querier(db, a, k, i)
+                        let (db, ids) = (&db, &ids);
+                        move || querier(db, ids, a, k, i)
                     })
                 })
                 .collect();

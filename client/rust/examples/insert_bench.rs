@@ -70,7 +70,7 @@ fn row(rows: &[u8], i: usize) -> (u32, i64, f32) {
 }
 
 /// Sends rows `[a, b)` over one connection; returns the bytes written.
-fn load(args: &Args, rows: &[u8], ids: &[u32], a: usize, b: usize) -> Result<u64, tsdb_client::Error> {
+fn load(args: &Args, rows: &[u8], ids: &[u64], a: usize, b: usize) -> Result<u64, tsdb_client::Error> {
     let mut c = Client::connect(args.addr.as_str())?;
     c.set_compression(args.compression)?;
     let (mut s, mut t, mut v) = (Vec::new(), Vec::new(), Vec::new());
@@ -107,7 +107,7 @@ fn main() {
     let n = rows.len() / 16;
     let max = (0..n).map(|i| row(&rows, i).0).max().unwrap_or(0);
     let mut c = Client::connect(args.addr.as_str()).expect("connect");
-    let ids: Vec<u32> = (0..=max).map(|i| c.series(&format!("bench.{i}")).expect("series")).collect();
+    let ids: Vec<u64> = (0..=max).map(|i| c.series(&format!("bench.{i}")).expect("series")).collect();
 
     let (t0, cpu0) = (Instant::now(), common::cpu_s());
     let sent: u64 = std::thread::scope(|sc| {

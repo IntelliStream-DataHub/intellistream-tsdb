@@ -401,7 +401,7 @@ final class Shard implements Runnable {
 
         void send(TsdbConnection conn) throws TsdbException {
             int n = rows.size();
-            int[] ids = new int[n];
+            long[] ids = new long[n];
             long[] ts = new long[n];
             BitSet nulls = new BitSet();
             for (int i = 0; i < n; i++) {

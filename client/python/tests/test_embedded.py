@@ -94,6 +94,38 @@ def test_series_types_and_volumes(tmp_path, client):
     assert client.failed() is None and Db.simd_level()
 
 
+def test_series_ids_are_64_bits(client):
+    import numpy as np
+
+    a, b = client.series("a"), client.series("b")
+    assert sorted(client.series_ids()) == sorted([a, b]) and client.series_count() == 2
+    # id columns: uint64 and uint32 arrays (widened), array.array and lists of ints
+    client.insert(np.array([a, b], dtype=np.uint64), [T0, T0], [1.0, 2.0])
+    client.insert(np.array([a, b], dtype=np.uint32), [T0 + 1, T0 + 1], [3.0, 4.0])
+    client.insert(array.array("Q", [a, b]), [T0 + 2, T0 + 2], [5.0, 6.0])
+    client.insert_values([a, b], [T0 + 3, T0 + 3], [7.0, 8.0])
+    assert list(client.query_points(a, numpy=False)[1]) == [1.0, 3.0, 5.0, 7.0]
+    assert [float(r[1][0]) for r in client.query_raw_many(np.array([b, a], dtype=np.uint64))] == [2.0, 1.0]
+    # a negative id, or one of 2**64 or more, is no id
+    for bad in (-1, 2**64):
+        with pytest.raises(OverflowError):
+            client.insert([a, bad], [T0, T0], [1.0, 2.0])
+        with pytest.raises(OverflowError):
+            client.insert_series(bad, [T0], [1.0])
+        with pytest.raises(OverflowError):
+            client.series_name(bad)
+        with pytest.raises(OverflowError):
+            client.insert_many([(bad, [T0], [1.0])])
+    with pytest.raises(OverflowError):
+        client.insert(np.array([a, -1], dtype=np.int64), [T0, T0], [1.0, 2.0])
+    # an id the database never handed out is unknown, also when its low 32 bits name a series
+    for big in (a + 2**32, 2**64 - 1):
+        assert code(client.insert_series, big, [T0 + 9], [9.0]) == tsdb_client.ERR_INVALID
+        assert code(client.insert, np.array([a, big], dtype=np.uint64), [T0 + 9] * 2, [9.0] * 2) == tsdb_client.ERR_INVALID
+        assert code(client.series_name, big) == tsdb_client.ERR_NOTFOUND
+    assert list(client.query_points(a, numpy=False)[1]) == [1.0, 3.0, 5.0, 7.0]
+
+
 def test_options_and_errors(tmp_path):
     with pytest.raises(ValueError):
         Db(tmp_path / "x", value_codec="lz4")

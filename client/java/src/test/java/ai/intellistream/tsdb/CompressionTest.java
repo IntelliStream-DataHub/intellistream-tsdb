@@ -85,8 +85,8 @@ class CompressionTest {
                 c.insertSeriesValues(c.seriesCreate(p + "i64", ValueType.INT64), ts,
                         Column.ofLongs(longs).withNulls(nulls));
                 c.insertSeriesValuesAsync(c.seriesCreate(p + "f64", ValueType.FLOAT64), ts, Column.ofDoubles(doubles));
-                int b = c.seriesCreate(p + "bool", ValueType.BOOL);
-                int[] many = new int[n];
+                long b = c.seriesCreate(p + "bool", ValueType.BOOL);
+                long[] many = new long[n];
                 java.util.Arrays.fill(many, b);
                 c.insertValues(many, ts, Column.ofBools(bools).withNulls(nulls));
                 wire[level] = c.bytesSent() - before;
@@ -114,7 +114,7 @@ class CompressionTest {
         long[] ts = clock(n);
         float[] v = readings(n);
         try (TsdbClient c = server.client()) {
-            int id = c.series("large.packed");
+            long id = c.series("large.packed");
             for (int off = 0; off < n; off += 500_000)
                 c.insertAsync(id, ts, v, off, 500_000);
             c.await();
@@ -135,7 +135,7 @@ class CompressionTest {
             assertEquals(1, c.compression(), "level 1 by default, as the C client");
             assertThrows(IllegalArgumentException.class, () -> c.setCompression(23));
             assertThrows(IllegalArgumentException.class, () -> c.setCompression(-(1 << 17) - 1));
-            int id = c.series("levels");
+            long id = c.series("levels");
             int k = 0;
             for (int level : new int[] {-5, 0, 3, 19, 1}) {
                 c.setCompression(level);
@@ -146,7 +146,7 @@ class CompressionTest {
                     c.queryPoints(id, Long.MIN_VALUE, Long.MAX_VALUE).values());
 
             /* the level reaches zstd: fast levels send more bytes than strong ones */
-            int big = c.series("levels.big");
+            long big = c.series("levels.big");
             long[] sent = new long[2];
             int[] levels = {-50, 19};
             for (int i = 0; i < 2; i++) {
@@ -266,7 +266,7 @@ class CompressionTest {
             c.insert(5, clock(100), readings(100));
             BitSet nulls = new BitSet();
             nulls.set(3);
-            c.insertAsync(new int[] {5, 6, 5}, clock(3), new float[] {1, 2, 3});
+            c.insertAsync(new long[] {5, 6, 5}, clock(3), new float[] {1, 2, 3});
             c.insertSeriesValues(6, clock(10), Column.ofLongs(new long[10]).withNulls(nulls));
             c.insert(5, new long[0], new float[0]); /* empty: plain, as the C client */
         }
@@ -308,7 +308,7 @@ class CompressionTest {
         assertEquals(Protocol.MANY_SERIES, m.getInt(4));
         byte[] mz = new byte[m.limit() - 20];
         m.get(20, mz);
-        assertArrayEquals(PackTest.reshape(clock(3), Column.ofFloats(1, 2, 3), new int[] {5, 6, 5}, 0, 3),
+        assertArrayEquals(PackTest.reshape(clock(3), Column.ofFloats(1, 2, 3), new long[] {5, 6, 5}, 0, 3),
                 Zstd.decompress(mz, m.getInt(16)));
     }
 

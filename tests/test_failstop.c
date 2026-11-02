@@ -351,7 +351,7 @@ static bool is_failed(tsdb *db, const char *expect)
 /* Exactly the timestamps want[0..n) are in the series, in order. */
 static void expect_rows(tsdb *db, const char *series, const int64_t *want, size_t n)
 {
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_lookup(db, series, &id));
     tsdb_points p = {0};
     OK(tsdb_query_points(db, id, INT64_MIN, INT64_MAX, &p));
@@ -392,7 +392,7 @@ static void sleep_ms(int ms)
 
 typedef struct {
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     int64_t ts;
     int rc;
 } appender;
@@ -411,7 +411,7 @@ static void test_group_commit(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-group", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
 
     /* X syncs and is held in its fdatasync; A and D append meanwhile, so the
@@ -450,7 +450,7 @@ static void test_group_commit(const char *base)
     CHECK(tsdb_append(db, id, 4, 4) == TSDB_ERR_IO);
     CHECK(tsdb_commit(db) == TSDB_ERR_IO);
     CHECK(tsdb_flush(db) == TSDB_ERR_IO);
-    uint32_t other;
+    tsdb_sid other;
     CHECK(tsdb_series(db, "new", &other) == TSDB_ERR_IO);
     OK(tsdb_series(db, "s", &other)); /* existing series are still found */
     int64_t one[] = {1};
@@ -477,7 +477,7 @@ static void test_torn_write(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-torn", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     OK(tsdb_append(db, id, 1, 1));
     arm(F_WRITE, "/wal_", true, false);
@@ -500,7 +500,7 @@ static void test_dir_fsync(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-dir", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     int64_t ts[100];
     float v[100];
@@ -519,7 +519,7 @@ static void test_dir_fsync(const char *base)
     CHECK(tsdb_append(db, id, 5000, 1) == TSDB_ERR_IO);
     CHECK(tsdb_optimize(db) == TSDB_ERR_IO);
     db = reopen(db); /* the unacknowledged part may or may not be there; the first one is */
-    uint32_t sid;
+    tsdb_sid sid;
     OK(tsdb_series_lookup(db, "s", &sid));
     tsdb_points p = {0};
     OK(tsdb_query_points(db, sid, 0, 100, &p));
@@ -539,7 +539,7 @@ static void test_flush_retry(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-flush", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     int64_t ts[100];
     float v[100];
@@ -560,7 +560,7 @@ static void test_flush_retry(const char *base)
     OK(tsdb_insert_series(db, id, ts, v, 100)); /* a part, newer than both */
     for (int round = 0; round < 2; round++) {
         tsdb_points p = {0};
-        uint32_t sid;
+        tsdb_sid sid;
         OK(tsdb_series_lookup(db, "s", &sid));
         OK(tsdb_query_points(db, sid, 0, 100, &p));
         CHECK(p.n == 100);
@@ -584,7 +584,7 @@ static void test_manifest(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-manifest", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     OK(tsdb_append(db, id, 1, 1));
     arm(F_PWRITE, "/MANIFEST", false, false);
@@ -649,7 +649,7 @@ static void test_series_dict(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-series", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t a, b, c;
+    tsdb_sid a, b, c;
     OK(tsdb_series(db, "a", &a));
     OK(tsdb_append(db, a, 1, 1));
     arm(F_WRITE, "/SERIES", true, false);
@@ -677,7 +677,7 @@ static void test_catalog(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-catalog", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t a, b, c;
+    tsdb_sid a, b, c;
     OK(tsdb_series(db, "a", &a));
     arm(F_WRITE, "/CATALOG", true, false);
     CHECK(tsdb_series(db, "b", &b) == TSDB_ERR_IO);
@@ -688,7 +688,7 @@ static void test_catalog(const char *base)
     if (rc == 0)
         OK(tsdb_append(db, c, 7, 7));
     db = reopen(db);
-    uint32_t got;
+    tsdb_sid got;
     OK(tsdb_series_lookup(db, "a", &got));
     if (rc == 0) {
         int64_t seven[] = {7};
@@ -707,7 +707,7 @@ static void test_background_sync(const char *base)
     tsdb_options o = opts();
     o.wal_sync_ms = 20;
     tsdb *db = open_fresh(name, o);
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     OK(tsdb_append(db, id, 1, 1));
     OK(tsdb_commit(db));
@@ -730,7 +730,7 @@ static void test_background_sync(const char *base)
 
 static int64_t count_rows(tsdb *db, const char *series)
 {
-    uint32_t id;
+    tsdb_sid id;
     if (tsdb_series_lookup(db, series, &id) != 0)
         return 0;
     tsdb_points p = {0};
@@ -741,7 +741,7 @@ static int64_t count_rows(tsdb *db, const char *series)
 }
 
 /* n rows from ts0 on; with split, the second half one day later (another partition) */
-static int insert_n(tsdb *db, uint32_t id, int64_t ts0, int n, bool split)
+static int insert_n(tsdb *db, tsdb_sid id, int64_t ts0, int n, bool split)
 {
     int64_t ts[200];
     float v[200];
@@ -776,7 +776,8 @@ static void test_state_race(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-states", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t mode, idle;
+    tsdb_sid mode;
+    uint32_t idle;
     OK(tsdb_series_create(db, "mode", TSDB_STATE, NULL, &mode));
     OK(tsdb_state(db, mode, "idle", &idle));
     arm(F_WRITE, "/STATES", true, false);
@@ -827,7 +828,7 @@ static bool find_file(const char *prefix, const char *suffix, char *out, size_t 
 static void intent_left(const char *name)
 {
     tsdb *db = open_fresh(name, opts_days());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     arm(F_FSYNC, "/", false, false);
     CHECK(insert_n(db, id, 0, 100, true) == TSDB_ERR_IO);
@@ -857,7 +858,7 @@ static void test_intent(const char *base)
 
     /* the directory fsync that makes the intent durable fails: committed or not, never half */
     tsdb *db = open_fresh(name, opts_days());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     arm(F_FSYNC, "/", false, false);
     CHECK(insert_n(db, id, 0, 100, true) == TSDB_ERR_IO);
@@ -957,7 +958,7 @@ static void test_classes_file(const char *base)
         char name[600];
         snprintf(name, sizeof name, "%s/failstop-classes-%zu", base, k);
         tsdb *db = open_fresh(name, opts());
-        uint32_t id, slow;
+        tsdb_sid id, slow;
         OK(tsdb_series(db, "s", &id));
         OK(tsdb_series(db, "slow", &slow));
         OK(insert_n(db, id, 0, 100, false)); /* fast: class 0, no record */
@@ -990,7 +991,7 @@ static int64_t stat_parts(tsdb *db)
 static tsdb *two_parts(const char *name)
 {
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     OK(insert_n(db, id, 0, 100, false));
     OK(insert_n(db, id, 100, 100, false));
@@ -1037,7 +1038,7 @@ static void test_merge(const char *base)
 
     /* the engine fails while a merge is in flight: its output is neither named nor listed */
     db = two_parts(name);
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_lookup(db, "s", &id));
     hold(F_FDATASYNC, "/tmp_");
     optimizer o = {db, 0};
@@ -1092,7 +1093,7 @@ static void test_wal_segment(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-segment", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     OK(tsdb_append(db, id, 1, 1));
     arm(F_FSYNC, "/", false, false);
@@ -1129,7 +1130,7 @@ static void test_wal_unlink(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-unlink", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     size_t nt;
     uint64_t r0, r1, r2, sy;
@@ -1180,7 +1181,7 @@ static void test_dir_fsync_race(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-dirrace", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     hold(F_RENAME, "_0.part"); /* the large insert, before it names its part */
     inserter a = {db, id, -1};
@@ -1208,7 +1209,7 @@ static void test_drop_before(const char *base)
     char name[600];
     snprintf(name, sizeof name, "%s/failstop-drop", base);
     tsdb *db = open_fresh(name, opts());
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series(db, "s", &id));
     OK(insert_n(db, id, 0, 100, false));
     OK(insert_n(db, id, 86400000, 100, false));
