@@ -169,24 +169,7 @@ request for 100 sensors names all of them. A day is 86,400 readings, a week is
   buckets of 60 (tsdb: 33.5 ms, 27x). Those are the times of the whole pass over
   all 100 sensors, not of one request.
 
-**Where tsdb is more than 100 times faster than InfluxDB 2** (100 million
-readings: 100 sensors x 1 million readings, the same rows in both; median time
-of one request, tsdb through its server over TCP, InfluxDB 2 the faster of
-InfluxQL and Flux):
-
-| question | clients | tsdb | InfluxDB 2 | InfluxDB 2 takes |
-|---|---:|---:|---:|---:|
-| summary of 100 sensors, whole history | 1 | **1.2 ms** | 2.38 s | 2,000x longer |
-| summary of 10 sensors, whole history | 1 | **1.7 ms** | 230 ms | 140x longer |
-| the same for 100 sensors in buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s | 280x longer |
-| the same for 100 sensors in buckets of 60 readings | 1 | **67 ms** | 6.85 s | 103x longer |
-| one day of 100 sensors | 1 | **1.3 ms** | 293 ms | 230x longer |
-| one day of 100 sensors | 32 | **28.5 ms** | 3.34 s | 120x longer |
-| one day of 10 sensors | 1 | **0.25 ms** | 30.6 ms | 120x longer |
-| one day of 10 sensors | 32 | **3.0 ms** | 338 ms | 110x longer |
-| 3,600 raw readings of each of 100 sensors | 1 | **1.2 ms** | 207 ms | 170x longer |
-
-The big gaps are on requests that name many sensors at once. tsdb keeps a
+The gaps of more than 100 times are on requests that name many sensors at once. tsdb keeps a
 summary for every block of 8192 readings (see above), so a summary of the whole
 history is answered from the summaries, and so are most blocks of a day-long
 window. Raw readings have to be read in both systems; tsdb still answers a
