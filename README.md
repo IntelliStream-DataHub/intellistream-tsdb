@@ -77,6 +77,27 @@ time-weighted averages, memory use, and size on disk against 13 systems) are in
 The tables below are from the earlier measurement; they will be replaced when
 the rest is in.
 
+**Where tsdb is more than 100 times faster than ClickHouse** (100 billion rows:
+10,000 sensors x 10 million readings, the same rows in both, ClickHouse queried
+only after its background merges had settled; median time of one query, tsdb
+through its server over TCP):
+
+| question | rows it covers | tsdb | ClickHouse | ClickHouse takes |
+|---|---:|---:|---:|---:|
+| summary of one sensor's whole history | 10 million | **0.11 ms** | 35 ms | 330x longer |
+| summary of 100 sensors | 1 billion | **1.3 ms** | 723 ms | 570x longer |
+| summary of the whole table | 100 billion | **91 ms** | 70.5 s | 780x longer |
+| every sensor by day (UTC) | 100 billion | **0.27 s** | 109 s | 400x longer |
+
+A summary here is count, sum, minimum and maximum. tsdb keeps those for every
+block of 8192 readings, so when a question covers whole blocks (a whole series,
+the whole table, whole UTC days) it reads the summaries instead of the readings.
+Questions that cut through blocks have to read the data in both systems, and
+there tsdb is 2 to 3 times faster: one sensor by hour 17 ms against 42 ms, every
+sensor by hour 53 s against 113 s. Interim numbers from
+[bench/dbcmp/results/0.9.0-interim.md](bench/dbcmp/results/0.9.0-interim.md);
+ClickHouse's times are whole milliseconds, as its benchmark tool reports them.
+
 100 million sensor readings (100 sensors, 1 million readings each), loaded and
 queried on the same machine (AMD Ryzen 9 7950X, NVMe disk). Two tables: tsdb as
 a library inside your program, and tsdb as a server used through its clients
