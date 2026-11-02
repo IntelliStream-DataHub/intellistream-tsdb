@@ -101,6 +101,29 @@ def q_ch(kind, table="cmp.t100m"):
             f"ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS t1n FROM {table}) WHERE t1n IS NOT NULL AND t0 < t1n) "
             f"ARRAY JOIN range(intDiv(t0, {I}) * {I}, t1, {I}) AS b GROUP BY series, b ORDER BY series, b")
 
+def q_ch2(kind, table="cmp.t100m"):
+    """STEP TWA in two levels (twa, twad): per (series, bucket) the area of the segments inside it from one sorted
+    array of the bucket's readings, then per series over its buckets only the two edge pieces: the last reading up to
+    the next bucket's first reading or the edge, and the previous bucket's last value from the edge to the first
+    reading. A window over buckets, not over 100 M rows (twa-research/fairness.md: the release table quotes whichever
+    of q_ch and q_ch2 is faster). Buckets without a reading are not made up: none occur in this data at an hour or a
+    day (the slowest sensor reads every 60 s), and the check against tsdb's answers would show one."""
+    if kind not in ("twa", "twad"):
+        return None
+    I = IV[kind]
+    per = (f"SELECT series, intDiv(toUnixTimestamp64Milli(ts), {I}) * {I} AS b, "
+           "arraySort(groupArray((toUnixTimestamp64Milli(ts), toFloat64(value)))) AS a, "
+           "arraySum(arrayMap((d, x) -> d * x.2, arrayPopFront(arrayDifference(arrayMap(x -> x.1, a))), arrayPopBack(a))) AS inner, "
+           f"a[1].1 AS ft, a[-1].1 AS lt, a[-1].2 AS lv FROM {table} GROUP BY series, b")
+    edges = ("SELECT series, b, inner, ft, lt, lv, leadInFrame(toNullable(ft)) OVER w AS nf, "
+             f"lagInFrame(toNullable(lv)) OVER w AS plv FROM ({per}) "
+             "WINDOW w AS (PARTITION BY series ORDER BY b ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)")
+    tail = f"if(nf IS NULL, 0, least(assumeNotNull(nf), b + {I}) - lt)"
+    head = "if(plv IS NULL, 0, ft - b)"
+    return (f"SELECT series, b, area, covered FROM (SELECT series, b, "
+            f"inner + if(nf IS NULL, 0.0, lv * toFloat64({tail})) + if(plv IS NULL, 0.0, assumeNotNull(plv) * toFloat64({head})) AS area, "
+            f"(lt - ft) + {tail} + {head} AS covered FROM ({edges})) WHERE covered > 0 ORDER BY series, b")
+
 def w_ch(s, a, b, bk, table="cmp.t100m"):
     """One window, STEP: the reading before it carried in, the first reading at or after its end closing the last
     segment (tsdb.h, time-weighted averages), buckets aligned to the epoch, cut at the window's ends."""
@@ -310,7 +333,7 @@ def q_i2flux(kind):
             '|> aggregateWindow(every: 1h, fn: (tables=<-, column) => tables |> timeWeightedAvg(unit: 1ms), '
             'createEmpty: false, timeSrc: "_start") |> keep(columns: ["series", "_time", "_value"])')
 
-Q = {"ch": q_ch, "ts": q_ts, "qdb": q_qdb, "qdbseg": q_qdbseg, "i3": q_i3, "i2flux": q_i2flux, "duck": q_duck,
+Q = {"ch": q_ch, "ch2": q_ch2, "ts": q_ts, "qdb": q_qdb, "qdbseg": q_qdbseg, "i3": q_i3, "i2flux": q_i2flux, "duck": q_duck,
      "chdb": lambda k: q_ch(k, "t"), "iot": q_iot, "td": q_td}
 W = {"ch": w_ch, "ts": w_ts, "qdb": w_qdb, "i3": w_i3, "iot": w_iot, "td": w_td}
 
@@ -413,7 +436,7 @@ def http(url, data=None, headers=None):
         raise Refused(f"HTTP {e.code}: {' '.join(str(body).split())[:400]}") from None
 
 def run_sql(sysname, sql):
-    if sysname == "ch":
+    if sysname in ("ch", "ch2"):
         out = http(f"http://127.0.0.1:{os.environ.get('CH_HTTP_PORT', '8123')}/", sql + " FORMAT TSV")
         return [l.split("\t") for l in out.splitlines() if l]
     if sysname == "ts":

@@ -1337,11 +1337,25 @@ p2_ch() {
     REL q ch lttb > "$D/q.lttb.sql"; REL q ch twa > "$D/q.twa.sql"
     untimed "$D/check-lttb.txt" REL check ch lttb ref/lttb.jsonl && lttb_loose "$D/check-lttb.txt" "$D"
     untimed "$D/check-twa.txt" REL check ch twa ref/twa.jsonl
+    # TWA_RETIME=ch (the extra pass of 2026-11-02): ClickHouse's TWA is timed again with the full REPS into p6/,
+    # next to the two-level form below, in one load
+    local TD=$D TR=$REPS k r
+    case "$D: ${TWA_RETIME-} " in */memsweep:*" ch "*) TD=$(twab_dir "$D"); TR=${XREPS:-$REPS}; mkdir -p "$TD" ;; esac
     for k in lttb twa; do  # timed by the server (query_log), not the client (REPORT §3)
-        chbench1 1 1 0 "$D/q.$k.sql" > /dev/null 2> "$D/warm.$k" 9>&-
-        for r in $(seq "$REPS"); do tstep "$k r$r" "$D/$k.$r" -- chbench_tag "$k.$r.$$" 1 1 0 "$D/q.$k.sql"; done
+        [ "$k" = twa ] || [ "$TD" = "$D" ] || continue
+        [ "$TD" = "$D" ] || cp "$D/q.$k.sql" "$TD/q.$k.sql"
+        chbench1 1 1 0 "$TD/q.$k.sql" > /dev/null 2> "$TD/warm.$k" 9>&-
+        for r in $(seq "$TR"); do tstep "$k r$r" "$TD/$k.$r" -- chbench_tag "$k.$r.$$" 1 1 0 "$TD/q.$k.sql"; done
     done
-    twasuite ch "$D" ch
+    REPS=$TR twasuite ch "$TD" ch
+    # the two-level STEP form (rel.py q_ch2: per-bucket arrays, then only the edges over buckets); the release table
+    # quotes whichever form is faster (twa-research/fairness.md)
+    for k in twa twad; do
+        REL q ch2 "$k" > "$TD/q.${k}2.sql"
+        untimed "$TD/check-${k}2.txt" REL check ch2 "$k" "ref/$k.jsonl" || { nocheck ch2 "${k}2" "$TD" $?; continue; }
+        chbench1 1 1 0 "$TD/q.${k}2.sql" > /dev/null 2> "$TD/warm.${k}2" 9>&-
+        for r in $(seq "$TR"); do tstep "${k}2 r$r" "$TD/${k}2.$r" -- chbench_tag "${k}2.$r.$$" 1 1 0 "$TD/q.${k}2.sql"; done
+    done
     CHC -q "SELECT count(), sum(bytes_on_disk) FROM system.parts WHERE database = 'cmp' AND table = 't100m' AND active" > "$D/size-end.txt"
     chparts "$D/parts-after-suite.txt"
     ch_merged "$D" "$bok"
