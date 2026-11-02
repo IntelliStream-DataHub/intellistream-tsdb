@@ -326,7 +326,26 @@ may still change in a 0.9.x release and freeze at 1.0; what that means for your 
 
 ## Getting started
 
-You need a C compiler (C11), libzstd, and liburing for the server (not with `make NO_URING=1`).
+You need a C compiler (C11), `make`, libzstd, and liburing for the server (not with `make NO_URING=1`).
+Python 3 is used by some of the tests.
+
+On Debian or Ubuntu:
+
+```sh
+sudo apt install build-essential libzstd-dev liburing-dev python3
+```
+
+On Fedora, RHEL or AlmaLinux:
+
+```sh
+sudo dnf install gcc make libzstd-devel liburing-devel python3
+```
+
+On RHEL or AlmaLinux, if `liburing-devel` is not found, enable the CRB repository
+(`sudo dnf config-manager --set-enabled crb`), or leave liburing out and build with `make NO_URING=1`: io_uring is
+disabled by default there anyway, and tsdbd then uses epoll.
+
+The Rust, Python and Java clients need their own tools on top (`cargo`, `python3`, `mvn`); their READMEs say which.
 
 ### Quick start (5 minutes, one machine)
 
@@ -484,7 +503,7 @@ See [`include/tsdb.h`](include/tsdb.h) and the complete program
 tsdb *db;
 tsdb_open("/data/sensors", NULL, &db);
 
-uint32_t flow;
+tsdb_sid flow;                                        /* 64-bit; look it up by name, never count ids */
 tsdb_series(db, "pump7.flow", &flow);                 /* find or create a series */
 tsdb_insert_series(db, flow, times, values, n);       /* on disk when it returns */
 
