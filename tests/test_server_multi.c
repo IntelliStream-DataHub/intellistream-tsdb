@@ -779,7 +779,10 @@ static void test_stall_buckets(pid_t pid)
                         "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS",
                 getenv("TSDBD_IO") ? getenv("TSDBD_IO") : "default", grown, peak, result_kb);
         CHECK(SANITIZED || grown <= result_kb + 48 * 1024L);
-        CHECK(SANITIZED || !hwm || peak <= result_kb + 64 * 1024L);
+        /* The peak also counts the engine's working memory before the result is final (64-75 MiB above the result
+         * measured on 4-CPU CI runners, 40-70 here); a second copy of the frame would add 256 MiB, rounding the
+         * buffer up to 512 MiB more still, so 128 MiB above the result tells the two apart with room for both. */
+        CHECK(SANITIZED || !hwm || peak <= result_kb + 128 * 1024L);
         close(fd);
     }
 }
