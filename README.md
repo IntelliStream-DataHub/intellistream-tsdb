@@ -2,9 +2,16 @@
 
 A small, fast time series database written in C.
 
-At [intellistream.ai](https://intellistream.ai) we work a lot with industrial
+At [IntelliStream](https://intellistream.ai) we work a lot with industrial
 data: sensors on pumps, tanks, pipelines and machines that report a value every
-second or every minute, for years. We built tsdb to:
+second or every minute, for years. Our DataHub platform first stored this data in
+ClickHouse, because of everything we tried it had the best balance between
+compression and speed. But ClickHouse is a general analytics database, and time
+series are only one of the many things it has to be good at. With a coding model
+as capable as Claude Opus 5.5, we asked a simple question: what if we wrote a
+database that does nothing but time series, from scratch, keeping the best ideas
+of ClickHouse's storage design and adding ALP-style compression for the sensor
+values? tsdb is the result. We built it to:
 
 - **store that data for less money**: it needs a third to a half less disk
   than ClickHouse, and a tenth of the raw size;
