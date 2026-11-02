@@ -428,7 +428,7 @@ class TypedValuesTest {
 
     @Test
     void unknownSeriesAndEarlyStop() throws Exception {
-        ValuePoints none = c.queryValues(0x7ffffff0, Long.MIN_VALUE, Long.MAX_VALUE);
+        ValuePoints none = c.queryValues((1L << 32) | 0x7ffffff0, Long.MIN_VALUE, Long.MAX_VALUE);
         assertEquals(0, none.size());
         assertEquals(ValueType.FLOAT32, none.type());
 

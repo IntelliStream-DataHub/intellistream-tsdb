@@ -169,7 +169,7 @@ def test_type_mismatches(client):
         client.insert_series_values(i, [T0, T0 + 1], [1])
     assert e.value.code == tsdb_client.ERR_INVALID
     assert client.query_values(i, numpy=False) == ([], [])
-    assert client.query_values(999_999, numpy=False) == ([], [])
+    assert client.query_values(1 << 32 | 999_999, numpy=False) == ([], [])
 
 
 def test_buffers_without_numpy(client):

@@ -9,11 +9,13 @@ import numpy as np
 import pytest
 
 from conftest import Server
+import tsdb_client
 from tsdb_client import Buckets, Client, Db, Many, Pool, TsdbError, TwaBuckets
 
 T0 = 1_700_000_000_000 - 1_700_000_000_000 % 86_400_000  # a UTC midnight
 N = 3000  # rows per series, 1 min apart: a little over two days
-UNKNOWN = 999_999
+UNKNOWN = 1 << 32 | 999_999  # well formed, of a volume the server does not have
+TRUNCATED = 999_999  # no volume field: INVALID
 
 
 def fill(c):
@@ -157,6 +159,12 @@ def test_errors(target):
     # an unknown series reads as empty, as the single call does
     r = c.query_values_multi([UNKNOWN, f32[0]])
     assert r.ok and r.offsets[1] == 0 and same_rows(r[0], one.query_values(UNKNOWN))
+    # a truncated id is INVALID in a multi query, as in the single one
+    r = c.query_values_multi([f32[0], TRUNCATED], errors="status")
+    assert r.status[0] == 0 and r.status[1] == tsdb_client.ERR_INVALID
+    with pytest.raises(TsdbError) as e:
+        one.query_values(TRUNCATED)
+    assert e.value.code == tsdb_client.ERR_INVALID
     with pytest.raises(ValueError):
         c.query_values_multi(series, errors="ignore")
     with pytest.raises(ValueError):

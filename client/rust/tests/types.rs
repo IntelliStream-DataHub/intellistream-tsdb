@@ -55,7 +55,7 @@ fn int64_nulls_order_and_limit() {
     let none = c.query_rows(id, .., QueryOpts::desc().limit(0)).unwrap();
     assert!(none.is_empty());
     assert_eq!(none.value_type(), ValueType::Int64);
-    assert!(c.query_rows(999_999, .., QueryOpts::asc()).unwrap().is_empty());
+    assert!(c.query_rows(1 << 32 | 999_999, .., QueryOpts::asc()).unwrap().is_empty());
 
     // one bucket, and calendar seconds newest first
     let b = c.query_agg(id, .., 0).unwrap();

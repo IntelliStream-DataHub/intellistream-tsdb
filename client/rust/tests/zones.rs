@@ -122,7 +122,7 @@ fn query_bounds_buckets_by_any_bounds() {
     for bad in [&[][..], &[3000, 3000], &[3000, 2000]] {
         assert!(matches!(c.query_bounds(id, .., bad, QueryOpts::asc()), Err(Error::InvalidArgument(_))));
     }
-    assert!(c.query_bounds(12345, .., &[0], QueryOpts::asc()).unwrap().is_empty());
+    assert!(c.query_bounds(1 << 32 | 12345, .., &[0], QueryOpts::asc()).unwrap().is_empty());
 }
 
 #[test]

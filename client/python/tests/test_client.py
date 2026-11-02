@@ -79,7 +79,7 @@ def test_order_limit_and_columns(client):
     assert client.query_points(a, T0 + 5000, order="asc", limit=3, numpy=False)[0] == [T0 + 5000, T0 + 6000, T0 + 7000]
     assert client.query_raw(a, limit=0, numpy=False) == ([], [])
     assert len(client.query_raw(a, T0 + 5000, T0 + 15000, numpy=False)[0]) == 10
-    assert client.query_raw(999_999, numpy=False) == ([], [])
+    assert client.query_raw(1 << 32 | 999_999, numpy=False) == ([], [])
     with pytest.raises(ValueError):
         client.query_raw(a, order="sideways")
 

@@ -63,7 +63,7 @@ class MultiTest {
             sv[i] = i % 17 < 9 ? a : b;
         c.insertSeriesValues(state, ts, Column.ofStates(sv));
         empty = c.seriesCreate("m.empty", ValueType.FLOAT64);
-        ids = new long[] {f32, f64, i64, bool, state, empty, 999_999, f32};
+        ids = new long[] {f32, f64, i64, bool, state, empty, (1L << 32) | 999_999, f32}; /* an unknown id */
     }
 
     @AfterAll

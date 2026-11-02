@@ -123,7 +123,8 @@ fn multi(
 fn multi_equals_single(db: &mut impl Database) {
     let ids = setup(db);
     let mut series = ids.clone();
-    series.extend([999_999, ids[0], ids[3]]); // an unknown id, and duplicates
+    // an unknown id, a truncated one (no volume field: INVALID, never an empty answer), and duplicates
+    series.extend([1 << 32 | 999_999, 999_999, ids[0], ids[3]]);
     let n = series.len();
     let full = (i64::MIN, i64::MAX);
     let range = (T0 + 1_000, T0 + 150_000_000);
@@ -190,6 +191,11 @@ fn multi_equals_single(db: &mut impl Database) {
         db.query_buckets_multi(&series, .., Buckets::Intervals(&ivs), QueryOpts::asc(), MultiOpts::default()).unwrap();
     assert_eq!(r[2].as_ref().unwrap_err().status(), Some(Status::Invalid));
     assert!(r[0].is_ok() && r[3].is_ok());
+    // the unknown id has no rows, the truncated one is INVALID
+    let r = db.query_rows_multi(&series, .., QueryOpts::asc(), MultiOpts::default()).unwrap();
+    assert!(r[ids.len()].as_ref().unwrap().ts.is_empty());
+    assert_eq!(r[ids.len() + 1].as_ref().unwrap_err().status(), Some(Status::Invalid));
+    assert_eq!(db.query_rows(999_999, .., QueryOpts::asc()).unwrap_err().status(), Some(Status::Invalid));
     // LTTB of a state series is INVALID for that series only
     let r = db.query_lttb_multi(&ids, .., 10, QueryOpts::asc(), MultiOpts::default()).unwrap();
     assert_eq!(r[4].as_ref().unwrap_err().status(), Some(Status::Invalid));
@@ -227,8 +233,8 @@ fn multi_equals_single(db: &mut impl Database) {
         ControlFlow::Continue(())
     })
     .unwrap();
-    assert!(errs.is_empty());
-    for (i, &id) in series.iter().enumerate() {
+    assert_eq!(errs, [(ids.len() + 1, Some(Status::Invalid))]); // the truncated id
+    for (i, &id) in series.iter().enumerate().filter(|&(i, _)| i != ids.len() + 1) {
         assert_eq!(got[i], db.query_rows(id, .., QueryOpts::asc()).unwrap().ts, "chunks of {i}");
     }
 }
@@ -296,8 +302,8 @@ fn long_lists_are_split() {
     let mut c = srv.client();
     let ids = setup(&mut c);
     let n = 65_536 + 3;
-    // fillers: ids with a zero volume field, which no series has
-    let mut series: Vec<u64> = (0..n as u64).map(|i| 5_000_000 + i).collect();
+    // fillers: well formed ids past the volume's series, which no series has
+    let mut series: Vec<u64> = (0..n as u64).map(|i| 1 << 32 | (5_000_000 + i)).collect();
     for (k, at) in [0, 65_535, 65_536, n - 1].into_iter().enumerate() {
         series[at] = ids[k];
     }

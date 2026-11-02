@@ -139,7 +139,8 @@
  *               Other flag bits are reserved. Duplicate series are answered each time.
  *               -> for each series in index order, exactly the frames the inner op sends for it, each with
  *                  u32 index after the status (TSDB_MULTI_PREFIX; frames up to TSDB_MAX_FRAME + 4); a series'
- *                  status is its own (INVALID for a bad per-series value; an unknown id: 0 and no rows); then
+ *                  status is its own (INVALID for a bad per-series value or a malformed id; an unknown id: 0
+ *                  and no rows); then
  *                  the END frame, last: index 0xffffffff, the request's status (0, INVALID, STOPPED,
  *                  TOO_MANY_BUCKETS past max_rows, NOMEM) and u32 answered (series sent). A bad header or
  *                  template gets the END frame alone, with INVALID.

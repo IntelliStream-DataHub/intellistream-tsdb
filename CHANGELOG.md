@@ -84,10 +84,12 @@ disk format and the wire protocol.
   half, the series' index in that volume's `SERIES` file in the low half (`tsdb_sid`, `TSDB_SID`,
   `TSDB_SID_VOLUME`, `TSDB_SID_LOCAL`, `TSDB_SID_NONE`). Every id is at least 2^32 and 0 is never one, so
   an id cut to 32 bits in a cast, a Java `int`, a Rust `as u32` or a Python `"I"` is refused instead of being
-  taken for another series. Ids are not dense any more: list series with `tsdb_series_foreach` (C), `series_ids`
-  (Rust and Python `Db`) or `seriesIds` (Java `EmbeddedDb`), or `TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v)
-  - 1)`, never `0 .. tsdb_series_count() - 1` (which now returns `uint64_t`); look ids up by name. `tsdb_abi_version`
-  names the layout of the C ABI the bindings check. C `tsdb_sid`, Rust `SeriesId` (`u64`), Python `int` (numpy
+  taken for another series; a query of such an id (or of one with any of bits 48-63 set) answers `TSDB_ERR_INVALID`
+  rather than an empty range, while a well formed id that is unknown still has no rows. Ids are not dense any
+  more: list series with `tsdb_series_foreach` (C), `series_ids` (Rust and Python `Db`) or `seriesIds` (Java
+  `EmbeddedDb`), or `TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v) - 1)`, never `0 .. tsdb_series_count() - 1`
+  (which now returns `uint64_t`); look ids up by name. `tsdb_abi_version` names the layout of the C ABI the
+  bindings check. C `tsdb_sid`, Rust `SeriesId` (`u64`), Python `int` (numpy
   `uint64` columns; `uint32` input is widened), Java `long` and `long[]` (the methods that took `int` ids are
   gone, not overloaded). `tsdb series` prints the id. The Pulsar sink keeps its ids as `long`. The
   benchmarks find their ids by name and keep the series number of their row files as an index into that table.

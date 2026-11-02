@@ -185,10 +185,13 @@ def test_tsdbd_answers_a_wide_id_as_unknown(client):
             assert code(client.state, w, "up") in (tsdb_client.ERR_NOTFOUND, tsdb_client.ERR_INVALID)
             assert code(client.delete_range, w, None, None) in (tsdb_client.ERR_NOTFOUND, tsdb_client.ERR_INVALID)
             assert code(client.set_retention, w, 1000) in (tsdb_client.ERR_NOTFOUND, tsdb_client.ERR_INVALID)
-            try:
+            if w >> 48 or not w >> 32:
+                # no volume can have it: queries say so rather than answer an empty range
+                assert code(client.query_values, w, numpy=False) == tsdb_client.ERR_INVALID
+                assert code(client.query_agg, w, None, None, 0) == tsdb_client.ERR_INVALID
+            else:
+                # a well formed id of a volume this server does not have: no rows
                 assert len(client.query_values(w, numpy=False)[0]) == 0
-            except TsdbError as e:
-                assert e.code in (tsdb_client.ERR_NOTFOUND, tsdb_client.ERR_INVALID)
             # nothing above touched series a, whose low 32 bits the wide ids share
             assert client.query_values(a, numpy=False) == (ts, [1, 2, 3])
             assert client.retention(a) == 0

@@ -419,6 +419,11 @@ fn check_lengths(series: Option<&[SeriesId]>, ts: &[i64], values: usize) -> Resu
     Ok(())
 }
 
+/// An id no volume can have: a zero volume field (an id cut to 32 bits) or any of bits 48-63.
+fn malformed(id: SeriesId) -> bool {
+    id >> 48 != 0 || id >> 32 == 0
+}
+
 /// The C options of a query, or `None` for a limit of 0, which asks for nothing (in C, 0 means
 /// no limit; the Rust API follows the TCP client).
 fn c_opts(o: QueryOpts) -> Option<sys::tsdb_query_opts> {
@@ -894,6 +899,8 @@ impl Db {
         match rows {
             Some(r) => Ok(r),
             // an unknown series has no rows, typed float32 as tsdbd answers it
+            // an id no volume can have is INVALID, as tsdbd answers it (a limit of 0 asks the engine nothing)
+            None if malformed(series) => Err(Error::Server(Status::Invalid)),
             None => match self.series_type(series) {
                 Err(e) if e.status() == Some(Status::NotFound) => {
                     Ok(Rows { ts: Vec::new(), values: Column::empty(ValueType::Float32) })
@@ -1193,6 +1200,8 @@ impl Db {
         })?;
         match rows {
             Some(r) => Ok(r),
+            // an id no volume can have is INVALID, as tsdbd answers it (a limit of 0 asks the engine nothing)
+            None if malformed(series) => Err(Error::Server(Status::Invalid)),
             None => match self.series_type(series) {
                 Err(e) if e.status() == Some(Status::NotFound) => {
                     Ok(Rows { ts: Vec::new(), values: Column::empty(ValueType::Float32) })

@@ -347,7 +347,7 @@ static void compare(tsdb *db, const tsdb_multi_query *q, const tsdb_group *local
         single(db, q, local, i, list[i], &ref[i]);
         /* tsdb_query_twa_group_local looks the type up first; TRIM answers an unknown id as the clients' local
          * groups and every single request do: no rows */
-        if (local && ref[i].status == TSDB_ERR_NOTFOUND && list[i] == 999999)
+        if (local && ref[i].status == TSDB_ERR_NOTFOUND && list[i] == TSDB_SID(0, 999999))
             ref[i].status = 0;
     }
     for (int defer = 0; defer < 3; defer++) {
@@ -926,7 +926,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < nids; i++)
         list[nlist++] = ids[i];
     list[nlist++] = ids[3];
-    list[nlist++] = 999999;
+    list[nlist++] = TSDB_SID(0, 999999); /* well formed: a truncated id is INVALID */
     list[nlist++] = big;
     list[nlist++] = ids[0];
     {

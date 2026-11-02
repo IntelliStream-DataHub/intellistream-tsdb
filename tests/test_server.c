@@ -337,8 +337,9 @@ static uint32_t id_payload(uint8_t op, uint64_t x, uint32_t code, uint8_t *p)
 
 /* Protocol 11: series ids are u64 on the wire, (volume + 1) << 32 | local. An id that differs from an existing
  * one only above bit 31 is another series (another volume, unknown here) or malformed (volume field 0, bits from
- * 48 up), never the existing one cut to 32 bits; UINT64_MAX (TSDB_MANY_SERIES) names no series. Ops 6 and 11 (QUERY_AGG, QUERY_GROUP) were removed: unknown ops. Many-series inserts carry
- * their u64 ids after zero bytes to a multiple of 8. */
+ * 48 up), never the existing one cut to 32 bits; queries refuse a malformed one (INVALID) and answer no rows for an
+ * unknown one; UINT64_MAX (TSDB_MANY_SERIES) names no series. Ops 6 and 11 (QUERY_AGG, QUERY_GROUP) were removed:
+ * unknown ops. Many-series inserts carry their u64 ids after zero bytes to a multiple of 8. */
 static void test_wide_ids(tsdbc *c)
 {
     tsdb_sid k, kst;
@@ -369,12 +370,19 @@ static void test_wide_ids(tsdbc *c)
             id_payload(op, xs[x], code, p);
             wire_ans *w = x ? &a : &known;
             w->st = raw_once(op, p, len, w->body, sizeof w->body, &w->n);
+            /* a query of an id no volume can have by its bits (x >= 2: a truncated one) is refused, so it does not
+             * look like an empty range; the well formed alias answers no rows */
+            bool query = op == TSDB_OP_QUERY_RAW || op == TSDB_OP_QUERY_VALUES || op == TSDB_OP_QUERY_LTTB ||
+                         op == TSDB_OP_QUERY_BUCKETS || op == TSDB_OP_QUERY_BOUNDS || op == TSDB_OP_QUERY_TWA;
             if (x == 0)
                 CHECK(known.st == 0 && !ans_same(&known, &none));
-            else if (!ans_same(&a, &none))
+            else if (query && x >= 2 && a.st != TSDB_ERR_INVALID)
+                fprintf(stderr, "  op %u, malformed id %#llx: status %d, want INVALID\n", op,
+                        (unsigned long long)xs[x], a.st);
+            else if (!(query && x >= 2) && !ans_same(&a, &none))
                 fprintf(stderr, "  op %u, id %#llx: status %d, %zu bytes; unknown id: %d, %zu bytes\n", op,
                         (unsigned long long)xs[x], a.st, a.n, none.st, none.n);
-            CHECK(x == 0 || ans_same(&a, &none));
+            CHECK(x == 0 || (query && x >= 2 ? a.st == TSDB_ERR_INVALID : ans_same(&a, &none)));
         }
     }
 
@@ -2270,7 +2278,7 @@ static int64_t mono_us(void)
 }
 
 /* Slowest of n small queries on the main port, microseconds. */
-static int64_t main_port_worst_us(tsdbc *c, uint32_t id, int n)
+static int64_t main_port_worst_us(tsdbc *c, tsdb_sid id, int n)
 {
     int64_t worst = 0;
     for (int i = 0; i < n; i++) {

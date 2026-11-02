@@ -169,8 +169,8 @@ class EmbeddedMultiTest {
                             i -> db.queryTwaBounds(known[i], MIN, MAX, bounds, t), "twa bounds " + w);
                 }
             /* an unknown id has no rows (status 0), as over TCP; the cap on all rows fails the call */
-            List<SeriesResult<ValuePoints>> u = db.queryValuesMulti(new long[] {999_999, a}, MIN, MAX, Order.ASC, 0,
-                    dflt);
+            List<SeriesResult<ValuePoints>> u = db.queryValuesMulti(new long[] {(1L << 32) | 999_999, a}, MIN, MAX,
+                    Order.ASC, 0, dflt);
             assertTrue(u.get(0).ok() && u.get(0).get().size() == 0 && u.get(1).get().size() == ROWS);
             TsdbException x = assertThrows(TsdbException.class,
                     () -> db.queryValuesMulti(known, MIN, MAX, Order.ASC, 0, dflt.maxRows(100)));

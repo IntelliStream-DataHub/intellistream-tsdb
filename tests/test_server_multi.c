@@ -446,8 +446,9 @@ static void test_malformed(tsdb_sid a)
 static tsdb_sid ids[6];
 
 /* Ids are u64 on the wire (protocol 11), (volume + 1) << 32 | local: one that differs from a stored series only
- * above bit 31 is another volume's series (unknown here) or malformed (volume field 0, bits from 48 up), answered as
- * an unknown series (status 0, no rows), never that one cut to 32 bits; UINT64_MAX (the template's "many") the same. */
+ * above bit 31 is another volume's series (unknown here: status 0, no rows) or malformed (volume field 0, bits from
+ * 48 up; UINT64_MAX, the template's "many", too: status INVALID, as the single query answers), never that one cut to
+ * 32 bits. */
 static void test_wide_ids(tsdbc *c)
 {
     tsdb_sid list[5] = {ids[0], ids[0] + (1ull << 32), (uint32_t)ids[0], ids[0] | 1ull << 48, UINT64_MAX};
@@ -456,8 +457,9 @@ static void test_wide_ids(tsdbc *c)
     tsdb_series_result *r = NULL;
     CHECK(tsdbc_query_multi_collect(c, &vq, list, 5, NULL, &r) == 0);
     CHECK(r && r[0].status == 0 && r[0].n > 0);
-    for (int i = 1; r && i < 5; i++)
-        CHECK(r[i].index == (size_t)i && r[i].series == list[i] && r[i].status == 0 && r[i].n == 0);
+    for (int i = 1; r && i < 5; i++) /* 1: well formed but unknown; 2-4: no volume can have them (INVALID) */
+        CHECK(r[i].index == (size_t)i && r[i].series == list[i] && r[i].status == (i == 1 ? 0 : TSDB_ERR_INVALID) &&
+              r[i].n == 0);
     if (r)
         tsdbc_series_results_free(r, 5);
     tsdb_multi_query bq = {.kind = TSDB_MULTI_BUCKETS, .start = T0 - 7200000, .end = T0 + 3600000,
@@ -495,7 +497,7 @@ static void load(tsdbc *c)
         tsdb_values col2 = {types[k], v + (N / 2) * tsdb_wire_width(types[k]), NULL};
         OK(tsdbc_insert_series_values(c, ids[k], ts + N / 2, &col2, N / 2));
     }
-    ids[5] = 999999; /* unknown */
+    ids[5] = TSDB_SID(0, 999999); /* unknown, well formed (a truncated id is INVALID) */
     free(ts);
     free(v);
 }

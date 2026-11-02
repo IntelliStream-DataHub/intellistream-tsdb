@@ -1,6 +1,7 @@
 /* Volumes: series stored in directories of their own, routed by the root. */
 #define _GNU_SOURCE
 #include "tsdb.h"
+#include "tsdb_calendar.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -853,6 +854,13 @@ static int first_row_fn(void *ctx, const int64_t *ts, const float *values, size_
     return 0;
 }
 
+static int count_values_fn(void *ctx, const int64_t *ts, const tsdb_values *values, size_t n)
+{
+    (void)ts, (void)values;
+    ((first_row *)ctx)->n += n;
+    return 0;
+}
+
 static void test_series_ids(const char *base)
 {
     char top[600], root[700], v1[800];
@@ -936,19 +944,52 @@ static void test_series_ids(const char *base)
         CHECK(tsdb_insert(db, mixed, mt, mv, 2) == TSDB_ERR_INVALID);
         tsdb_values mvv = {TSDB_FLOAT32, mv, NULL};
         CHECK(tsdb_insert_values(db, mixed, mt, &mvv, 2) == TSDB_ERR_INVALID);
-        first_row r = {0}; /* queries of an unknown id answer nothing */
-        CHECK(tsdb_query_raw(db, bad, INT64_MIN, INT64_MAX, first_row_fn, &r) == 0 && r.n == 0);
+        /* queries: a well formed id that is unknown answers nothing (a follower may not have seen it yet); one that no
+         * volume can have by its bits (a truncated id) answers INVALID, so it does not look like an empty range */
+        bool mal = b < 4;
+        int want = mal ? TSDB_ERR_INVALID : 0;
+        first_row r = {0};
+        CHECK(tsdb_query_raw(db, bad, INT64_MIN, INT64_MAX, first_row_fn, &r) == want && r.n == 0);
         tsdb_points p = {0};
-        CHECK(tsdb_query_points(db, bad, INT64_MIN, INT64_MAX, &p) == 0 && p.n == 0);
+        CHECK(tsdb_query_points(db, bad, INT64_MIN, INT64_MAX, &p) == want && p.n == 0);
         tsdb_points_free(&p);
+        CHECK(tsdb_query_values(db, bad, INT64_MIN, INT64_MAX, NULL, count_values_fn, &r) == want && r.n == 0);
+        CHECK(tsdb_query_lttb(db, bad, INT64_MIN, INT64_MAX, 10, count_values_fn, &r) == want && r.n == 0);
         tsdb_bucket *bk = NULL;
         size_t nb = 1;
-        CHECK(tsdb_query_agg(db, bad, INT64_MIN, INT64_MAX, 0, &bk, &nb) == 0 && nb == 0);
+        CHECK(tsdb_query_agg(db, bad, INT64_MIN, INT64_MAX, 0, &bk, &nb) == want && nb == 0);
         free(bk);
+        int64_t bounds[2] = {T0, T0 + 86400000};
+        bk = NULL, nb = 1;
+        CHECK(tsdb_query_bounds(db, bad, INT64_MIN, INT64_MAX, bounds, 2, NULL, &bk, &nb) == want && nb == 0);
+        free(bk);
+        tsdb_group zone = {.unit = TSDB_DAY, .count = 1, .timezone = "Europe/Oslo"};
+        bk = NULL, nb = 1;
+        CHECK(tsdb_query_group_local(db, bad, T0 - 86400000, T0 + 86400000, &zone, NULL, &bk, &nb) == want &&
+              nb == 0);
+        free(bk);
+        tsdb_spread_bucket *sb = NULL;
+        nb = 1;
+        CHECK(tsdb_query_spread(db, bad, INT64_MIN, INT64_MAX, 0, NULL, &sb, &nb) == want && nb == 0);
+        free(sb);
+        tsdb_twa_bucket *tb = NULL;
+        nb = 1;
+        CHECK(tsdb_query_twa(db, bad, T0, T0 + 86400000, 3600000, NULL, &tb, &nb) == want && nb == 0);
+        free(tb);
+        tb = NULL, nb = 1;
+        int twa_rc = tsdb_query_twa_group_local(db, bad, T0 - 86400000, T0 + 86400000, &zone, NULL, &tb, &nb);
+        CHECK((mal ? twa_rc == TSDB_ERR_INVALID : twa_rc != TSDB_ERR_INVALID) && nb == 0);
+        free(tb);
         tsdb_series_result *res = NULL;
         tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = INT64_MIN, .end = INT64_MAX};
         CHECK(tsdb_query_multi_collect(db, &q, mixed, 2, NULL, &res) == 0);
-        CHECK(res && res[0].n == 1 && res[1].n == 0);
+        CHECK(res && res[0].n == 1 && res[0].status == 0 && res[1].n == 0 && res[1].status == want);
+        if (res)
+            tsdb_series_results_free(res, 2);
+        tsdb_multi_query bq = {.kind = TSDB_MULTI_BUCKETS, .start = INT64_MIN, .end = INT64_MAX};
+        res = NULL;
+        CHECK(tsdb_query_multi_collect(db, &bq, mixed, 2, NULL, &res) == 0);
+        CHECK(res && res[0].status == 0 && res[1].n == 0 && res[1].status == want);
         if (res)
             tsdb_series_results_free(res, 2);
     }

@@ -129,6 +129,11 @@ def test_series_ids_are_64_bits(client, tmp_path):
         assert code(client.insert_series, bad, [T0 + 9], [9.0]) == tsdb_client.ERR_INVALID
         assert code(client.insert, np.array([a, bad], dtype=np.uint64), [T0 + 9] * 2, [9.0] * 2) == tsdb_client.ERR_INVALID
         assert code(client.series_name, bad) == tsdb_client.ERR_NOTFOUND
+        if bad >> 48 or not bad >> 32:  # no volume can have it: queries say so rather than answer an empty range
+            assert code(client.query_points, bad, numpy=False) == tsdb_client.ERR_INVALID
+            assert code(client.query_agg, bad, None, None, 0) == tsdb_client.ERR_INVALID
+        else:
+            assert len(client.query_points(bad, numpy=False)[0]) == 0
     assert list(client.query_points(a, numpy=False)[1]) == [1.0, 3.0, 5.0, 7.0]
     client.insert_series(c, [T0], [11.0])
     assert client.series_name(c) == "c" and list(client.query_points(c, numpy=False)[1]) == [11.0]

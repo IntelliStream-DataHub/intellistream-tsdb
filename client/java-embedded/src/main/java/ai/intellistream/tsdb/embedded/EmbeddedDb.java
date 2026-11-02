@@ -1409,10 +1409,12 @@ public final class EmbeddedDb implements AutoCloseable {
      * @param order by timestamp
      * @param limit at most this many points; 0 for all
      * @return the points
-     * @throws TsdbException e.g. {@link Status#ERR_NOTFOUND} for an unknown series
+     * @throws TsdbException e.g. {@link Status#ERR_NOTFOUND} for an unknown series, {@link Status#ERR_INVALID} for an
+     *     id no volume can have
      * @throws IllegalArgumentException for a negative limit
      */
     public ValuePoints queryValues(long series, long start, long end, Order order, long limit) throws TsdbException {
+        checkWellFormed(series);
         ValueType type = seriesType(series);
         Sink s = new Sink();
         s.collect = true;
@@ -2018,6 +2020,7 @@ public final class EmbeddedDb implements AutoCloseable {
         /* as tsdbd and the Rust Db: the threshold is checked first, and an unknown series has no points */
         if (Long.compareUnsigned(threshold, 3) < 0) /* a size_t: -1 is a huge threshold, as over TCP */
             throw new TsdbException(Status.ERR_INVALID, "an LTTB threshold below 3", null);
+        checkWellFormed(series);
         ValueType type;
         try {
             type = seriesType(series);
@@ -2484,6 +2487,16 @@ public final class EmbeddedDb implements AutoCloseable {
         q.bounds = bounds;
         q.trim = (openLo ? Native.MULTI_TRIM_LO : 0) | (openHi ? Native.MULTI_TRIM_HI : 0);
         return multiCollect(q, series, m, reader);
+    }
+
+    /**
+     * The engine's queries answer INVALID for an id no volume can have (a zero volume field, as an id cut to 32 bits
+     * has, or any of bits 48-63); the calls that look the type up first must say so too, not NOTFOUND or no rows.
+     */
+    private static void checkWellFormed(long id) throws TsdbException {
+        if ((id >>> 48) != 0 || (id >>> 32) == 0)
+            throw new TsdbException(Status.ERR_INVALID, "series id " + Long.toUnsignedString(id) + " is malformed",
+                    null);
     }
 
     private static boolean uniform(long[] a) {

@@ -129,7 +129,7 @@ fn large_stream_order_and_limit() {
     assert_eq!(c.query_points(a, ..T0 + 2000, QueryOpts::asc()).unwrap().len(), 2);
 
     // a series without data, or that does not exist, has no points
-    assert!(c.query_points(999_999, .., QueryOpts::asc()).unwrap().is_empty());
+    assert!(c.query_points(1 << 32 | 999_999, .., QueryOpts::asc()).unwrap().is_empty());
 }
 
 #[test]

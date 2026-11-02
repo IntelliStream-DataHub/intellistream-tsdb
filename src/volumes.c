@@ -1609,8 +1609,8 @@ int tsdb_query_raw_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, cons
     qrun qr;
     qs_begin(t, &qr);
     f32_out o = {fn, ctx, 0};
-    int rc = 0;
-    if (route(t, series, &e, &local)) {
+    int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
+    if (rc == 0 && route(t, series, &e, &local)) {
         if (eng_series_type(e, local) != TSDB_FLOAT32)
             rc = TSDB_ERR_INVALID; /* tsdb_query_values reads every type */
         else
@@ -1715,8 +1715,8 @@ int tsdb_query_values(tsdb *t, tsdb_sid series, int64_t start, int64_t end, cons
     qrun qr;
     qs_begin(t, &qr);
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
-    int rc = 0;
-    if (route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0)
+    int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
+    if (rc == 0 && route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0)
         rc = eng_query_raw_ex(e, local, start, end, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0, vals_cb,
                               &o);
     qs_end(&qr, o.type, o.rows);
@@ -1758,8 +1758,8 @@ int tsdb_query_lttb_ex(tsdb *t, tsdb_sid series, int64_t start, int64_t end, siz
     vals_out o = {fn, ctx, -1, NULL, NULL, 0, 0};
     lttb_limit l = {.o = &o, .limit = opts ? opts->limit : 0};
     bool desc = opts && opts->order == TSDB_DESC;
-    int rc = 0;
-    if (route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0) {
+    int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0;
+    if (rc == 0 && route(t, series, &e, &local) && (o.type = eng_series_type(e, local)) >= 0) {
         rc = eng_query_lttb(e, local, start, end, threshold, desc, l.limit, l.limit ? lttb_limit_cb : vals_cb,
                             l.limit ? (void *)&l : &o);
         if (rc == TSDB_ERR_STOPPED && l.limit && l.sent >= l.limit && !l.stopped)
@@ -1786,8 +1786,8 @@ static int query_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, con
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
-    int rc = 0, type = -1;
-    if (route(t, series, &e, &local)) {
+    int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
+    if (rc == 0 && route(t, series, &e, &local)) {
         type = eng_series_type(e, local);
         rc = eng_query_group(e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
                              out, nout);
@@ -1840,8 +1840,8 @@ static int query_twa(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const
         opts = &def;
     qrun qr;
     qs_begin(t, &qr);
-    int rc = 0, type = -1;
-    if (route(t, series, &e, &local)) {
+    int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
+    if (rc == 0 && route(t, series, &e, &local)) {
         type = eng_series_type(e, local);
         rc = eng_query_twa(e, local, start, end, bk, opts, out, nout);
     }
@@ -1906,8 +1906,8 @@ static int query_spread(tsdb *t, tsdb_sid series, int64_t start, int64_t end, co
     uint32_t local;
     qrun qr;
     qs_begin(t, &qr);
-    int rc = 0, type = -1;
-    if (route(t, series, &e, &local)) {
+    int rc = sid_malformed(series) ? TSDB_ERR_INVALID : 0, type = -1;
+    if (rc == 0 && route(t, series, &e, &local)) {
         type = eng_series_type(e, local);
         rc = eng_query_spread(e, local, start, end, bk, opts && opts->order == TSDB_DESC, opts ? opts->limit : 0,
                               out, nout);

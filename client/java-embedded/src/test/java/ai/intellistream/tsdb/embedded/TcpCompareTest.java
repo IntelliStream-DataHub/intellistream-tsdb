@@ -176,10 +176,12 @@ class TcpCompareTest {
                         }
                     }
                 }
-                for (long th : new long[] {2, 10}) /* an unknown series: no points, after the threshold check */
-                    same("lttb of an unknown series " + th, () -> points(tcp.queryLttb(987_654, Long.MIN_VALUE,
-                            Long.MAX_VALUE, th)), () -> points(db.queryLttb(987_654, Long.MIN_VALUE, Long.MAX_VALUE,
-                            th)));
+                /* an unknown series: no points, after the threshold check; a truncated id (no volume field): INVALID */
+                for (long th : new long[] {2, 10})
+                    for (long u : new long[] {(1L << 32) | 987_654, 987_654})
+                        same("lttb of an unknown series " + u + " " + th, () -> points(tcp.queryLttb(u,
+                                Long.MIN_VALUE, Long.MAX_VALUE, th)), () -> points(db.queryLttb(u, Long.MIN_VALUE,
+                                Long.MAX_VALUE, th)));
                 var p = db.queryPoints(ids[0], Long.MIN_VALUE, Long.MAX_VALUE);
                 var q = tcp.queryPoints(ids[0], Long.MIN_VALUE, Long.MAX_VALUE);
                 assertArrayEquals(q.timestamps(), p.timestamps());

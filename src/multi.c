@@ -252,6 +252,8 @@ static int run_one(mcall *c, size_t i, msink *k)
     int64_t iv = q->intervals ? q->intervals[i] : q->interval_ms;
     mres *r = k->r;
     int rc;
+    if (sid_malformed(id))
+        return TSDB_ERR_INVALID; /* a truncated id: its status says so, not an empty answer */
     if (q->kind == TSDB_MULTI_VALUES || q->kind == TSDB_MULTI_LTTB) {
         if (q->kind == TSDB_MULTI_VALUES)
             rc = tsdb_query_values(c->db, id, s, e, &q->opts, sink_values, k);

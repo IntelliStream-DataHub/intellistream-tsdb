@@ -1554,6 +1554,10 @@ uint64_t cls_gen_now(eng *db);
 /* test hook: switch series to cls at the computed T, or at *at when that is later */
 int eng_class_switch(eng *db, uint32_t series, int cls, const int64_t *at);
 int tsdb_test_class_switch(struct tsdb *t, tsdb_sid series, int cls, const int64_t *at); /* through the volumes */
+/* An id no volume can have by its bits: a zero volume field (an id cut to 32 bits) or bits 48-63 set. Queries answer
+ * TSDB_ERR_INVALID for it, so a truncated id does not look like an empty range; a well formed id that is unknown
+ * (a series a follower has not seen yet) answers no rows. */
+static inline bool sid_malformed(tsdb_sid id) { return (id >> 48) != 0 || (id >> 32) == 0; }
 /* test hook: fn(arg) runs in every large insert and replace after its rows were placed, before it commits */
 void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */

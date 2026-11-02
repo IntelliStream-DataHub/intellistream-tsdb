@@ -105,7 +105,8 @@ machine's CPU (`-march=native`). For a jar that runs on other machines, build th
   the same answers. Spread and TWA groups in a time zone get their bounds from `Group.bounds` too, as the TCP
   client does: the engine's calendar reads the system's tzdata and does not know every zone id java.time takes
   (`UTC+2`, `GMT-05:30`). `queryLttb` checks the threshold before the series, and an unknown series gives no
-  points, as tsdbd does. A range with more local periods than the calendar computes fails with
+  points, as tsdbd does; a malformed id (bits 48-63 set, or a zero volume field as a truncated id has) is
+  `ERR_INVALID` in every query. A range with more local periods than the calendar computes fails with
   `ERR_TOO_MANY_BUCKETS`, as in every client.
 - **Embedded only.** `append`, `dropBefore`, `refresh`, `failed()`, `parts()`, `seriesPath`, `volumeCount`,
   `volumePath`, `simdLevel()` and every field of `EmbeddedOptions` (`tsdb_options`).

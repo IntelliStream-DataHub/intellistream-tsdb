@@ -217,7 +217,8 @@ class TsdbClientTest {
 
     /**
      * Protocol 11 carries 64-bit ids, which hold the volume above bit 32: a malformed one is sent whole and answered
-     * as an unknown series, never cut to the series of its low bits (here a real one, which must not change). All ones is the many-series marker
+     * as an unknown series (a query of an id no volume can have: INVALID), never cut to the series of its low bits
+     * (here a real one, which must not change). All ones is the many-series marker
      * and refused before anything is sent.
      */
     @Test
@@ -254,16 +255,28 @@ class TsdbClientTest {
                 TsdbException e = assertThrows(TsdbException.class, call, what);
                 assertTrue(e.status() == Status.ERR_NOTFOUND || e.status() == Status.ERR_INVALID, what + " " + e);
             }
-            /* reads of an unknown series have no rows (or its NOTFOUND), and never the rows of series `id` */
-            assertEquals(0, c.queryPoints(big, Long.MIN_VALUE, Long.MAX_VALUE).size(), what);
-            assertEquals(0, c.queryValues(big, Long.MIN_VALUE, Long.MAX_VALUE).size(), what);
-            assertTrue(c.queryBounds(big, Long.MIN_VALUE, Long.MAX_VALUE, new long[] {T0}).stream()
-                    .allMatch(b -> b.count() == 0), what);
-            assertEquals(0, c.queryLttb(big, Long.MIN_VALUE, Long.MAX_VALUE, 10).size(), what);
+            /* reads never answer the rows of series `id`: a well formed id of an unknown volume has no rows, and one
+             * no volume can have (a zero volume field, bits 48-63) is INVALID rather than an empty range */
             List<SeriesResult<ValuePoints>> multi = c.queryValuesMulti(new long[] {id, big},
                     Long.MIN_VALUE, Long.MAX_VALUE);
             assertEquals(1, multi.get(0).get().size(), what);
-            assertTrue(!multi.get(1).ok() || multi.get(1).get().size() == 0, what);
+            if ((big >>> 48) != 0 || (big >>> 32) == 0) {
+                List<Executable> reads = List.of(() -> c.queryPoints(big, Long.MIN_VALUE, Long.MAX_VALUE),
+                        () -> c.queryValues(big, Long.MIN_VALUE, Long.MAX_VALUE),
+                        () -> c.queryBounds(big, Long.MIN_VALUE, Long.MAX_VALUE, new long[] {T0}),
+                        () -> c.queryLttb(big, Long.MIN_VALUE, Long.MAX_VALUE, 10),
+                        () -> c.queryAgg(big, Long.MIN_VALUE, Long.MAX_VALUE, 0));
+                for (Executable call : reads)
+                    assertEquals(Status.ERR_INVALID, assertThrows(TsdbException.class, call, what).status(), what);
+                assertEquals(Status.ERR_INVALID, multi.get(1).status(), what);
+            } else {
+                assertEquals(0, c.queryPoints(big, Long.MIN_VALUE, Long.MAX_VALUE).size(), what);
+                assertEquals(0, c.queryValues(big, Long.MIN_VALUE, Long.MAX_VALUE).size(), what);
+                assertTrue(c.queryBounds(big, Long.MIN_VALUE, Long.MAX_VALUE, new long[] {T0}).stream()
+                        .allMatch(b -> b.count() == 0), what);
+                assertEquals(0, c.queryLttb(big, Long.MIN_VALUE, Long.MAX_VALUE, 10).size(), what);
+                assertEquals(0, multi.get(1).get().size(), what);
+            }
         }
         long marker = Protocol.MANY_SERIES;
         long sent = c.bytesSent();

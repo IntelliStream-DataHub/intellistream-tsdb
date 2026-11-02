@@ -105,7 +105,7 @@ class TimeZoneGroupTest {
                 assertEquals(utc(2024, 6, 30, 22), june.get(1).start());
                 assertEquals(12, june.get(1).count());
                 assertTrue(c.queryGroup(tenMin, 0, 1000, Group.of(Unit.DAY).in("Europe/Oslo")).isEmpty());
-                assertTrue(c.queryGroup(0x7fff0000, Long.MIN_VALUE, Long.MAX_VALUE,
+                assertTrue(c.queryGroup((1L << 32) | 0x7fff0000, Long.MIN_VALUE, Long.MAX_VALUE,
                         Group.of(Unit.DAY).in("Europe/Oslo")).isEmpty(), "unknown series");
 
                 /* bounds the server refuses */

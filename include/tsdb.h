@@ -51,7 +51,9 @@ typedef struct tsdb tsdb;
  * 0 .. tsdb_series_count() - 1; use tsdb_series_foreach, or TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v) - 1).
  * An id the database never handed out (bits 48-63 set, a volume field of zero, as a 32-bit truncation has, or one
  * beyond the volumes, a local index beyond the volume's series) is unknown to every call and touches no series:
- * TSDB_ERR_NOTFOUND, or TSDB_ERR_INVALID where a call says so (writes). */
+ * TSDB_ERR_NOTFOUND, or TSDB_ERR_INVALID where a call says so (writes). Queries answer no rows for an unknown id
+ * that is well formed (a follower may not know the series yet) and TSDB_ERR_INVALID for one no volume can have
+ * (bits 48-63 set or a zero volume field), so a truncated id never reads as an empty range. */
 typedef uint64_t tsdb_sid;
 #define TSDB_SID(volume, local) ((((tsdb_sid)(volume) + 1) << 32) | (uint32_t)(local))
 #define TSDB_SID_VOLUME(id) ((uint32_t)((id) >> 32) - 1) /* of a valid id */
@@ -562,8 +564,8 @@ int tsdb_query_twa_bounds(tsdb *db, tsdb_sid series, int64_t start, int64_t end,
  * kinds send one call with `buckets` pointing at n tsdb_bucket, tsdb_spread_bucket or tsdb_twa_bucket. status is
  * the series' error (n = 0, last = 1): one series failing does not end the call. Rows sent for a series before
  * its error status are not an answer: drop them (whether any come first depends on timing). An unknown id has
- * status 0 and no rows. The pointers are valid during the call only. fn returning nonzero ends the call
- * (TSDB_ERR_STOPPED).
+ * status 0 and no rows; a malformed one (bits 48-63 set, a zero volume field) TSDB_ERR_INVALID. The pointers are
+ * valid during the call only. fn returning nonzero ends the call (TSDB_ERR_STOPPED).
  * Every series of one call reads the same instant of each volume: an insert is seen by all of them or by none
  * (volumes are written independently, so this holds per volume).
  * Returns 0, TSDB_ERR_STOPPED (fn or mo->cancelled), TSDB_ERR_TOO_MANY_BUCKETS (more than max_rows rows or buckets

@@ -80,6 +80,8 @@ static int group_local(tsdb *db, tsdb_sid series, int64_t start, int64_t end, co
 {
     *out = NULL;
     *nout = 0;
+    if (sid_malformed(series))
+        return TSDB_ERR_INVALID;
     if (!group || !group->timezone || strcmp(group->timezone, "UTC") == 0)
         return spread ? tsdb_query_spread_group(db, series, start, end, group, opts, (tsdb_spread_bucket **)out, nout)
                       : tsdb_query_group_ex(db, series, start, end, group, opts, (tsdb_bucket **)out, nout);
@@ -207,6 +209,8 @@ int tsdb_query_twa_group_local(tsdb *db, tsdb_sid series, int64_t start, int64_t
 {
     *out = NULL;
     *nout = 0;
+    if (sid_malformed(series))
+        return TSDB_ERR_INVALID;
     if (!group || !group->timezone || strcmp(group->timezone, "UTC") == 0)
         return tsdb_query_twa_group(db, series, start, end, group, opts, out, nout);
     tsdb_type type;

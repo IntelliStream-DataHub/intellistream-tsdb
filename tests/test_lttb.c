@@ -365,7 +365,7 @@ static void test_by_hand(tsdb *db)
         CHECK(tsdb_query_lttb(db, s, T0, T0 + 5, t, collect, &none) == TSDB_ERR_INVALID);
     CHECK(tsdb_query_lttb(db, st, T0, T0 + 5, 10, collect, &none) == TSDB_ERR_INVALID);
     CHECK(tsdb_query_lttb(db, s, T0 + 5, T0, 10, collect, &none) == 0 && none.n == 0);
-    CHECK(tsdb_query_lttb(db, 999999, T0, T0 + 5, 10, collect, &none) == 0 && none.n == 0);
+    CHECK(tsdb_query_lttb(db, TSDB_SID(0, 999999), T0, T0 + 5, 10, collect, &none) == 0 && none.n == 0);
     free(none.p);
 }
 

@@ -1588,6 +1588,11 @@ impl Client {
                 Some(z) => z,
             };
             calendar::zone(zone)?;
+            if opts.query_opts().wire_limit().is_none() {
+                // a limit of 0 asks for nothing: no reads for the edges either (as query_group and the multi form)
+                c.wait_inner()?;
+                return Ok(Vec::new());
+            }
             let (mut lo, mut hi) = (start, if end == i64::MAX { i64::MIN } else { end - 1 });
             if start == i64::MIN {
                 match c.edge_ts(series, start, end, Order::Asc)? {

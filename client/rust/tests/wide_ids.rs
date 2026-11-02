@@ -315,6 +315,11 @@ fn many_series_marker_is_not_an_id() {
     assert_eq!(c.insert(&[a, u64::MAX], &[T0, T0], &[1.0f32, 2.0]).unwrap_err().status(), Some(Status::Invalid));
 }
 
+/// No volume can have this id: a zero volume field (an id cut to 32 bits) or any of bits 48-63.
+fn malformed(id: u64) -> bool {
+    id >> 48 != 0 || id >> 32 == 0
+}
+
 #[test]
 fn tsdbd_answers_a_wide_id_as_unknown_not_as_its_low_32_bits() {
     let srv = Server::start();
@@ -343,19 +348,28 @@ fn tsdbd_answers_a_wide_id_as_unknown_not_as_its_low_32_bits() {
             assert!(c.delete_range(w, ..).is_err(), "{w:#x}");
             assert!(c.set_retention(w, 1000).is_err(), "{w:#x}");
             assert!(c.replace_range(w, .., &[T0], &[5i64]).is_err(), "{w:#x}");
-            assert!(c.query_rows(w, .., QueryOpts::asc()).map_or(true, |r| r.len() == 0), "{w:#x}");
-            assert!(c.query_agg(w, .., 0).map_or(true, |b| b.iter().all(|x| x.count == 0)), "{w:#x}");
-            assert!(c.query_lttb(w, .., 3, QueryOpts::asc()).map_or(true, |r| r.ts.is_empty()), "{w:#x}");
-            assert!(c.query_twa(w, .., 0, TwaOpts::step()).map_or(true, |b| b.is_empty()), "{w:#x}");
+            if malformed(w) {
+                // no volume can have it: queries say so rather than answer an empty range
+                assert_eq!(c.query_rows(w, .., QueryOpts::asc()).unwrap_err().status(), invalid, "{w:#x}");
+                assert_eq!(c.query_agg(w, .., 0).unwrap_err().status(), invalid, "{w:#x}");
+                assert_eq!(c.query_lttb(w, .., 3, QueryOpts::asc()).unwrap_err().status(), invalid, "{w:#x}");
+                assert_eq!(c.query_twa(w, .., 0, TwaOpts::step()).unwrap_err().status(), invalid, "{w:#x}");
+            } else {
+                // a well formed id of a volume this server does not have: no rows
+                assert_eq!(c.query_rows(w, .., QueryOpts::asc()).unwrap().len(), 0, "{w:#x}");
+                assert!(c.query_agg(w, .., 0).unwrap().iter().all(|x| x.count == 0), "{w:#x}");
+                assert!(c.query_lttb(w, .., 3, QueryOpts::asc()).unwrap().ts.is_empty(), "{w:#x}");
+                assert!(c.query_twa(w, .., 0, TwaOpts::step()).unwrap().is_empty(), "{w:#x}");
+            }
             assert!(!c.is_broken());
         }
-        // a multi query: series a answers, the wide ids give nothing
+        // a multi query: series a answers, the unknown volume gives nothing, the malformed id INVALID
         let q = [wide[0], a, wide[1]];
         let multi = c.query_rows_multi(&q, .., QueryOpts::asc(), MultiOpts::default()).unwrap();
         assert_eq!(multi.len(), 3);
-        assert_eq!(multi[0].as_ref().map_or(0, |r| r.len()), 0);
+        assert_eq!(multi[0].as_ref().unwrap().len(), 0);
         assert_eq!(multi[1].as_ref().unwrap().len(), 3);
-        assert_eq!(multi[2].as_ref().map_or(0, |r| r.len()), 0);
+        assert_eq!(multi[2].as_ref().unwrap_err().status(), Some(Status::Invalid));
         // nothing above touched series a, whose low 32 bits the wide ids share
         let after = c.query_rows(a, .., QueryOpts::asc()).unwrap();
         assert_eq!(

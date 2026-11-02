@@ -124,7 +124,7 @@ class EmbeddedDbTest {
      * Ids are (volume + 1) << 32 | local: every real id is past 2^32 and taken whole, in the database directory and
      * in another volume. A malformed id (a zero volume field, as a truncated id has; any of bits 48-63; a volume the
      * database does not have; a local number past the volume's series) is unknown to every call, never the series of
-     * its low 32 bits (here series a, which must not change).
+     * its low 32 bits (here series a, which must not change). Queries answer INVALID for an id no volume can have.
      */
     @Test
     void idsCarryTheVolumeAndMalformedOnesAreUnknown() throws TsdbException {
@@ -155,11 +155,19 @@ class EmbeddedDbTest {
             assertEquals(Status.ERR_NOTFOUND, status(() -> db.seriesType(big)), what);
             assertEquals(Status.ERR_NOTFOUND, status(() -> db.retention(big)), what);
             assertEquals(Status.ERR_NOTFOUND, status(() -> db.state(big, "on")), what);
-            assertEquals(Status.ERR_NOTFOUND, status(() -> db.queryValues(big, Long.MIN_VALUE, Long.MAX_VALUE)), what);
             var multi = db.queryValuesMulti(new long[] {big, a}, Long.MIN_VALUE, Long.MAX_VALUE, Order.ASC, 0,
                     ai.intellistream.tsdb.MultiOptions.defaults());
-            assertEquals(0, multi.get(0).get().size(), what);
             assertEquals(1, multi.get(1).get().size(), what);
+            long lo = Long.MIN_VALUE, hi = Long.MAX_VALUE;
+            if ((big >>> 48) != 0 || (big >>> 32) == 0) { /* no volume can have it: INVALID, not an empty range */
+                assertEquals(Status.ERR_INVALID, status(() -> db.queryValues(big, lo, hi)), what);
+                assertEquals(Status.ERR_INVALID, status(() -> db.queryPoints(big, lo, hi)), what);
+                assertEquals(Status.ERR_INVALID, status(() -> db.queryAgg(big, lo, hi, 0)), what);
+                assertEquals(Status.ERR_INVALID, multi.get(0).status(), what);
+            } else {
+                assertEquals(Status.ERR_NOTFOUND, status(() -> db.queryValues(big, lo, hi)), what);
+                assertEquals(0, multi.get(0).get().size(), what);
+            }
         }
         assertArrayEquals(new float[] {1}, db.queryPoints(a, Long.MIN_VALUE, Long.MAX_VALUE).values());
         assertArrayEquals(new float[] {3}, db.queryPoints(c, Long.MIN_VALUE, Long.MAX_VALUE).values());
@@ -458,7 +466,7 @@ class EmbeddedDbTest {
         assertEquals(0, db.queryLttb(l, 0, 1, 10).size());
         /* as tsdbd and the Rust Db: the threshold first, then an unknown series has no points */
         assertEquals(Status.ERR_INVALID, status(() -> db.queryLttb(987_654, T0, T0 + 1, 2)));
-        ValuePoints none = db.queryLttb(987_654, Long.MIN_VALUE, Long.MAX_VALUE, 10, Order.DESC, 3);
+        ValuePoints none = db.queryLttb((1L << 32) | 987_654, Long.MIN_VALUE, Long.MAX_VALUE, 10, Order.DESC, 3);
         assertEquals(0, none.size());
         assertEquals(ValueType.FLOAT32, none.values().type());
 
@@ -573,7 +581,8 @@ class EmbeddedDbTest {
 
     @Test
     void errorsAndClosedDatabase() throws Exception {
-        assertEquals(Status.ERR_NOTFOUND, status(() -> db.queryValues(4242, 0, 1)));
+        assertEquals(Status.ERR_NOTFOUND, status(() -> db.queryValues((1L << 32) | 4242, 0, 1)));
+        assertEquals(Status.ERR_INVALID, status(() -> db.queryValues(4242, 0, 1))); /* no volume field: malformed */
         assertEquals(Status.ERR_NOTFOUND, status(() -> db.seriesType(4242)));
         /* a second open of a directory being written fails cleanly */
         TsdbException locked = assertThrows(TsdbException.class, () -> EmbeddedDb.open(db.directory()));

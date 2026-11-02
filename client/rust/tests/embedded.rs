@@ -79,7 +79,8 @@ fn series_and_states(db: &mut impl Database) {
     assert_eq!(db.series_lookup("plain").unwrap(), plain);
     assert_eq!(status(db.series_lookup("missing")), Some(Status::NotFound));
     assert_eq!(status(db.series_type(999_999)), Some(Status::NotFound));
-    let none = db.query_rows(999_999, .., QueryOpts::asc()).unwrap(); // no rows, typed float32 as tsdbd answers
+    // no rows, typed float32 as tsdbd answers
+    let none = db.query_rows(1 << 32 | 999_999, .., QueryOpts::asc()).unwrap();
     assert!(none.ts.is_empty() && none.values.value_type() == ValueType::Float32);
     assert!(matches!(db.series(""), Err(Error::InvalidArgument(_))));
 
@@ -615,7 +616,7 @@ fn a_locked_directory_fails_cleanly() {
 /// Ids are `(volume + 1) << 32 | local`: every real id is past 2^32 and is taken whole, in the database directory
 /// and in another volume. An id that is malformed (a zero volume field, as a truncated id has; any of bits 48-63)
 /// or names an unknown volume or a local number past the volume's series is unknown to every call, and never
-/// reaches the series its low 32 bits name.
+/// reaches the series its low 32 bits name. Queries answer INVALID for a malformed id and no rows for the others.
 #[test]
 fn ids_carry_the_volume_and_malformed_ones_are_unknown() {
     let dir = test_dir("tsdb-embedded");
@@ -650,9 +651,17 @@ fn ids_carry_the_volume_and_malformed_ones_are_unknown() {
         assert_eq!(status(db.series_type(bad)), Some(Status::NotFound));
         assert!(db.state(bad, "on").is_err());
         assert!(db.delete_range(bad, ..).is_err());
-        assert!(db.query_points(bad, .., QueryOpts::asc()).map_or(true, |p| p.is_empty()));
         let multi = db.query_rows_multi(&[bad, a, c], .., QueryOpts::asc(), Default::default()).unwrap();
-        assert!(multi[0].as_ref().map_or(true, |r| r.ts.is_empty()));
+        if bad >> 48 != 0 || bad >> 32 == 0 {
+            // no volume can have it: queries say so rather than answer an empty range
+            assert_eq!(status(db.query_points(bad, .., QueryOpts::asc())), Some(Status::Invalid), "{bad:#x}");
+            assert_eq!(status(db.query_agg(bad, .., 0)), Some(Status::Invalid), "{bad:#x}");
+            assert_eq!(multi[0].as_ref().unwrap_err().status(), Some(Status::Invalid), "{bad:#x}");
+        } else {
+            assert!(db.query_points(bad, .., QueryOpts::asc()).unwrap().is_empty(), "{bad:#x}");
+            assert!(db.query_agg(bad, .., 0).unwrap().iter().all(|x| x.count == 0), "{bad:#x}");
+            assert!(multi[0].as_ref().unwrap().ts.is_empty(), "{bad:#x}");
+        }
         assert_eq!(multi[1].as_ref().unwrap().ts, vec![T0, T0 + 1]);
         assert_eq!(multi[2].as_ref().unwrap().ts, vec![T0, T0 + 1]);
     }
