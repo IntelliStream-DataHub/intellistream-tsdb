@@ -31,6 +31,9 @@ by time range, either as raw points or as summaries (count, sum, min, max,
 average). You can link tsdb into your program as a library, or run its server,
 `tsdbd`, and talk to it from C, Rust, Python or Java.
 
+tsdb is still at an early stage. We are adding more functionality, and more
+performance optimizations for different CPU architectures.
+
 ## Features
 
 - Values can be float32, float64, int64, bool or a state (a text label from a
