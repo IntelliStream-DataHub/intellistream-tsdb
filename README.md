@@ -70,6 +70,13 @@ average). You can link tsdb into your program as a library, or run its server,
 
 ## How it compares
 
+**New measurements for 0.9.0 are coming.** The first results (tsdb against
+ClickHouse and VictoriaMetrics, 100 billion rows against ClickHouse,
+time-weighted averages, memory use, and size on disk against 13 systems) are in
+[bench/dbcmp/results/0.9.0-interim.md](bench/dbcmp/results/0.9.0-interim.md).
+The tables below are from the earlier measurement; they will be replaced when
+the rest is in.
+
 100 million sensor readings (100 sensors, 1 million readings each), loaded and
 queried on the same machine (AMD Ryzen 9 7950X, NVMe disk). Two tables: tsdb as
 a library inside your program, and tsdb as a server used through its clients
