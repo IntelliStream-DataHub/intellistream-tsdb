@@ -11,6 +11,7 @@ import ai.intellistream.tsdb.ValuePoints;
 import ai.intellistream.tsdb.ValueType;
 
 import java.io.IOException;
+import java.lang.reflect.Array;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -27,6 +28,7 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * The same data answers the same through both doors: written embedded, then served by build/tsdbd from the same
@@ -128,15 +130,16 @@ class TcpCompareTest {
                                 if (!a.values().isNull(i))
                                     assertEquals(Double.doubleToRawLongBits(c.values().getDouble(i)),
                                             Double.doubleToRawLongBits(a.values().getDouble(i)), names[k] + " " + i);
-                            assertEquals(tcp.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, o, limit),
+                            alike("agg " + names[k], tcp.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, o, limit),
                                     db.queryAgg(id, T0, T0 + n * 60_000L, 3_600_000L, o, limit));
                             for (Group g : new Group[] {null, Group.of(Unit.DAY), Group.of(Unit.WEEK).in("Europe/Oslo"),
                                 Group.of(Unit.HOUR, 5).in("America/St_Johns"), Group.of(Unit.MONTH).in("Asia/Kolkata"),
                                 /* zone ids of java.time that the engine's calendar does not know: the embedded
                                  * calls must compute the bounds in Java, as TsdbClient does */
                                 Group.of(Unit.DAY).in("UTC+2"), Group.of(Unit.HOUR, 7).in("GMT-05:30")}) {
-                                assertEquals(tcp.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, g, o, limit),
-                                        db.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, g, o, limit), "" + g);
+                                alike(names[k] + " group " + g,
+                                        tcp.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, g, o, limit),
+                                        db.queryGroup(id, Long.MIN_VALUE, Long.MAX_VALUE, g, o, limit));
                                 long gl = limit;
                                 for (long[] r : new long[][] {{Long.MIN_VALUE, Long.MAX_VALUE},
                                     {T0 + 12_345_678L, T0 + 2_000_000_000L}}) {
@@ -148,7 +151,7 @@ class TcpCompareTest {
                                 }
                             }
                             long[] bounds = {T0 - 1, T0 + 1_000_000, T0 + 9_999_999};
-                            assertEquals(tcp.queryBounds(id, T0, T0 + 20_000_000L, bounds, o, limit),
+                            alike(names[k] + " bounds", tcp.queryBounds(id, T0, T0 + 20_000_000L, bounds, o, limit),
                                     db.queryBounds(id, T0, T0 + 20_000_000L, bounds, o, limit));
                             long ol = limit;
                             long lo = T0 + 999 * 60_000L, hi = T0 + 30_000 * 60_000L;
@@ -170,7 +173,7 @@ class TcpCompareTest {
                                         () -> db.queryTwaBounds(id, T0, hi, bounds, to));
                             }
                             for (long th : new long[] {0, 2, 3, 100, 49_000, 1_000_000, -1})
-                                same(names[k] + " lttb " + th, () -> points(tcp.queryLttb(id, Long.MIN_VALUE,
+                                sameExact(names[k] + " lttb " + th, () -> points(tcp.queryLttb(id, Long.MIN_VALUE,
                                         Long.MAX_VALUE, th, o, ol)), () -> points(db.queryLttb(id, Long.MIN_VALUE,
                                         Long.MAX_VALUE, th, o, ol)));
                         }
@@ -179,7 +182,7 @@ class TcpCompareTest {
                 /* an unknown series: no points, after the threshold check; a truncated id (no volume field): INVALID */
                 for (long th : new long[] {2, 10})
                     for (long u : new long[] {(1L << 32) | 987_654, 987_654})
-                        same("lttb of an unknown series " + u + " " + th, () -> points(tcp.queryLttb(u,
+                        sameExact("lttb of an unknown series " + u + " " + th, () -> points(tcp.queryLttb(u,
                                 Long.MIN_VALUE, Long.MAX_VALUE, th)), () -> points(db.queryLttb(u, Long.MIN_VALUE,
                                 Long.MAX_VALUE, th)));
                 var p = db.queryPoints(ids[0], Long.MIN_VALUE, Long.MAX_VALUE);
@@ -203,8 +206,19 @@ class TcpCompareTest {
         T run() throws TsdbException;
     }
 
-    /** Both answer alike, or both fail with the same status. */
+    /** Both answer alike (see {@link #alike}), or both fail with the same status. */
     private static <T> void same(String what, Query<T> tcp, Query<T> embedded) {
+        Object[] r = run(tcp, embedded);
+        alike(what, r[0], r[1]);
+    }
+
+    /** Both answer equal, or both fail with the same status: for answers that are picks, not sums (LTTB). */
+    private static <T> void sameExact(String what, Query<T> tcp, Query<T> embedded) {
+        Object[] r = run(tcp, embedded);
+        assertEquals(r[0], r[1], what);
+    }
+
+    private static <T> Object[] run(Query<T> tcp, Query<T> embedded) {
         Object a, b;
         try {
             a = tcp.run();
@@ -216,7 +230,83 @@ class TcpCompareTest {
         } catch (TsdbException e) {
             b = "status " + e.status();
         }
-        assertEquals(a, b, what);
+        return new Object[] {a, b};
+    }
+
+    /*
+     * tsdbd runs background merges while this test queries (and the embedded reader sees whatever layout the merge
+     * has reached), so the two doors can read the same rows grouped into granules differently. tsdb's rule: answers
+     * are bit-identical on one layout; across layouts the float sums, the spread (variance and deviation, combined
+     * granule by granule with Chan's formula) and the TWA areas agree to a relative 1e-12, not in the last bits.
+     * Hence alike(): double and float fields match bit for bit or within 1e-12 relative (NaN equals NaN), except
+     * min and max, which are picks and stay exact; longs, timestamps, counts, strings and everything else must be
+     * equal. A mismatch names the path to the field and both values.
+     */
+    private static void alike(String what, Object a, Object b) {
+        String diff = diff(what, a, b);
+        if (diff != null)
+            fail(diff);
+    }
+
+    private static boolean close(double a, double b) {
+        if (Double.doubleToRawLongBits(a) == Double.doubleToRawLongBits(b) || (Double.isNaN(a) && Double.isNaN(b)))
+            return true;
+        if (Double.isNaN(a) || Double.isNaN(b) || Double.isInfinite(a) || Double.isInfinite(b))
+            return false;
+        return Math.abs(a - b) <= 1e-12 * Math.max(Math.abs(a), Math.abs(b));
+    }
+
+    private static String diff(String path, Object a, Object b) {
+        return diff(path, a, b, false);
+    }
+
+    private static String diff(String path, Object a, Object b, boolean exact) {
+        if (a == null || b == null)
+            return a == b ? null : path + ": " + a + " != " + b;
+        if (a instanceof Double x && b instanceof Double y)
+            return (exact ? x.equals(y) : close(x, y)) ? null : path + ": " + a + " != " + b;
+        if (a instanceof Float x && b instanceof Float y)
+            return (exact ? x.equals(y) : close(x, y)) ? null : path + ": " + a + " != " + b;
+        if (a instanceof Record ra && b instanceof Record rb) {
+            if (ra.getClass() != rb.getClass())
+                return path + ": " + ra.getClass() + " != " + rb.getClass();
+            for (var c : ra.getClass().getRecordComponents()) {
+                try {
+                    var m = c.getAccessor();
+                    m.setAccessible(true);
+                    String d = diff(path + "." + c.getName(), m.invoke(ra), m.invoke(rb),
+                            exact || c.getName().equals("min") || c.getName().equals("max"));
+                    if (d != null)
+                        return d;
+                } catch (ReflectiveOperationException e) {
+                    throw new AssertionError(path + "." + c.getName(), e);
+                }
+            }
+            return null;
+        }
+        if (a.getClass().isArray() && b.getClass().isArray()) {
+            int n = Array.getLength(a);
+            if (n != Array.getLength(b) || a.getClass() != b.getClass())
+                return path + ": length " + n + " (" + a.getClass().getSimpleName() + ") != " + Array.getLength(b)
+                        + " (" + b.getClass().getSimpleName() + ")";
+            for (int i = 0; i < n; i++) {
+                String d = diff(path + "[" + i + "]", Array.get(a, i), Array.get(b, i), exact);
+                if (d != null)
+                    return d;
+            }
+            return null;
+        }
+        if (a instanceof List<?> la && b instanceof List<?> lb) {
+            if (la.size() != lb.size())
+                return path + ": size " + la.size() + " != " + lb.size();
+            for (int i = 0; i < la.size(); i++) {
+                String d = diff(path + "[" + i + "]", la.get(i), lb.get(i), exact);
+                if (d != null)
+                    return d;
+            }
+            return null;
+        }
+        return a.equals(b) ? null : path + ": " + a + " != " + b;
     }
 
     /** A comparable form of points: timestamps, then each value's bits or null. */
