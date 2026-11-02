@@ -38,7 +38,11 @@ baseline (VBMI, VBMI2, GFNI, BITALG, VPOPCNTDQ, BF16), plus AVX512-VP2INTERSECT 
 
 ## Steps
 
-1. **Baseline, every level.** On a `make dist` build:
+1. **Baseline, every level.** First `tools/bench-tsdb.sh --standard --portable --cpu-compare` (about an hour and a quarter; it builds the
+   release build from scratch, records the machine, runs the folds, the codecs (with `decode-bench`), `tsdb-bench`, `tsdbd` with
+   `tsdbc-bench` and `insert-bench` five times each, then `ht-sweep.sh` and `thresholds.sh` of `bench/cpu-compare` once, and writes `bench-results/*/summary.md` and `summary.json`; add
+   `--reps 11` for the short fold cases, `--full` for float64 and int64). That covers the bullets below except the
+   codecs forced to each `TSDB_CPU` level and the real sensor data. By hand, on a `make dist` build:
    - `tools/fold-bench.sh build-dist 11` (the folds: every type, aggregate, spread, TWA, LTTB, at v2 scalar,
      SSE, AVX, v3 and v4);
    - `build-dist/codec-bench` and `build-dist/type-bench` (the portable build; `build/` has the `make` ones), with

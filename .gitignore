@@ -18,3 +18,8 @@ perf.data*
 __pycache__/
 /build-fuzz-frames/
 .corbienest/
+
+# tools/bench-tsdb.sh results and scratch data
+/bench-results/
+/build-bench/
+/build-bench-portable/

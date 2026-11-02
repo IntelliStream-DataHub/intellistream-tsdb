@@ -161,7 +161,9 @@ clocks are not perfect either: most sensors report up to 5 to 50 ms off their
 schedule. Two are exactly regular on purpose: the disk temperature (to measure a
 constant interval) and the vibration sensor (1 ms apart, which leaves no room
 for jitter). Every answer was checked against tsdb's. All the numbers and how to run the
-benchmarks yourself are in [AGENTS.md](AGENTS.md#benchmarks).
+benchmarks yourself are in [AGENTS.md](AGENTS.md#benchmarks). To measure tsdb on your own machine, clone it and run
+`tools/bench-tsdb.sh` (`--quick` first to see that it works): it builds an optimized copy, runs the benchmarks several
+times and writes a summary with the mean and spread of every number.
 
 ## How the compression works
 

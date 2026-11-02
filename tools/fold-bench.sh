@@ -7,19 +7,32 @@
 #
 # Configurations: TSDB_CPU=v2 with TSDB_SIMD=scalar, sse (SSE4.2) and avx (AVX without AVX2, as on Sandy
 # Bridge), v3 (AVX2), v4 (AVX-512).
+#
+# Environment (used by tools/bench-tsdb.sh):
+#   FOLD_CONFIGS   the configurations instead of the list above: "CPU:SIMD" sets TSDB_CPU and TSDB_SIMD, "CPU" only
+#                  TSDB_CPU, ":SIMD" only TSDB_SIMD (a -march=native build has no CPU levels), "-" neither
+#   FOLD_RAW_DIR   keep every run's output as FOLD_RAW_DIR/CONFIG.ROUND, instead of in a temporary directory
+#                  that is removed
 set -eu
 dir=${1:-build-dist}
 rounds=${2:-5}
 [ $# -ge 2 ] && shift 2 || shift $#
 bench=$dir/fold-bench
 [ -x "$bench" ] || { echo "fold-bench.sh: no $bench (make dist)" >&2; exit 1; }
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-configs="v2:scalar v2:sse v2:avx v3 v4"
+if [ -n "${FOLD_RAW_DIR:-}" ]; then
+    tmp=$FOLD_RAW_DIR
+    mkdir -p "$tmp"
+else
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+fi
+configs=${FOLD_CONFIGS:-"v2:scalar v2:sse v2:avx v3 v4"}
 r=1
 while [ "$r" -le "$rounds" ]; do
     for c in $configs; do
         case $c in
+        -) "$bench" "$@" >"$tmp/$c.$r" ;;
+        :*) TSDB_SIMD=${c#:} "$bench" "$@" >"$tmp/$c.$r" ;;
         *:*) TSDB_CPU=${c%%:*} TSDB_SIMD=${c#*:} "$bench" "$@" >"$tmp/$c.$r" ;;
         *) TSDB_CPU=$c "$bench" "$@" >"$tmp/$c.$r" ;;
         esac

@@ -392,7 +392,10 @@ around a noinline body; `fenv.h` where there is no SSE2).
 
 [bench/cpu-compare/README.md](../../bench/cpu-compare/README.md) has the order and the commands. In short: build `main` and
 this branch, run `build/decode-bench` (also with `-DTSDB_UNPACK_AVX2`), `thresholds.sh --cpu v3` (and `v4`),
-`ht-sweep.sh --server`, `bench/hydraulic/run.sh` and `bench/clients/run.sh --clients c --repeat 5` on both. Questions the
+`ht-sweep.sh --server`, `bench/hydraulic/run.sh` and `bench/clients/run.sh --clients c --repeat 5` on both
+(`tools/bench-tsdb.sh --full --portable --cpu-compare` does `decode-bench`, the folds, `thresholds.sh`, `ht-sweep.sh --server`
+and the tsdb-only benchmarks in one go and writes a summary; the forced `-DTSDB_UNPACK_AVX2` run, hydraulic and
+`bench/clients` stay by hand). Questions the
 other CPUs answer. First, **both changes are compiled out at v4**, the level these CPUs pick: run with `TSDB_CPU=v3` (and
 `TSDB_CPU=v4` next to it) to see them, and run `test_levels` with `-DTSDB_UNPACK_AVX2`, which will be the first time the
 shuffle kernel runs on AVX-512 hardware (here it was only compiled for it).

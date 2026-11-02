@@ -316,8 +316,21 @@ change of 2026-10-29 (user's decision) `tank_bar`, `tank_psi` and `random` were 
 timing numbers below that include timestamps (bytes per row, the mixed data sets) predate it; the value-only codec
 tables do not depend on it. The next full run measures the jittered data.
 
+**One command for all of tsdb's own benchmarks** (for a fresh clone on another machine): `tools/bench-tsdb.sh`
+(`--quick` to see that it works, `--standard` the default, `--full`; `--reps N`, `--dir SCRATCH`, `--out DIR`,
+`--portable` for the `make dist` build, `--cpu-compare` to add `bench/cpu-compare`). It checks the prerequisites,
+builds an optimized copy from scratch in `build-bench/` (never a debug or sanitizer build; `CFLAGS`/`ARCH` from the
+environment are dropped), records the machine (CPU, memory, disk, governor, git commit, compiler and flags) and
+warns when it is not quiet. It then runs codec-bench, type-bench and decode-bench, `tools/fold-bench.sh`,
+tsdb-bench, tsdbd (started with `--port 0 --port-file`) with tsdbc-bench, insert-bench and, in `--full`, scale-bench
+(the size picked from the free disk and memory), each `--reps` times (5), and writes `summary.md` and
+`summary.json` (mean, sd and lowest-highest run of every number) and the raw logs to `bench-results/HOST-DATE/`
+(`tools/bench-summary.py` parses them). Rough time: `--quick` 3 to 5 minutes, `--standard` about 40 minutes (plus the build),
+`--full` about 1.5 hours. The dbcmp comparisons and the 100 B run are separate (see below).
+
 | tool | measures |
 |---|---|
+| `tools/bench-tsdb.sh` | all of the below except dbcmp and hydraulic, repeated, with a summary; see above |
 | `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed; `--file F` for raw float32 values from a file |
 | `build/type-bench` | the float64, int64, bool and state codecs; `--file F float32\|float64` for raw values from a file |
 | `build/decode-bench` | bit unpacking per width (loops, the AVX2 kernel, PDEP) and the int_bp and float64 decimal codecs, for comparing CPUs; [`bench/cpu-compare`](bench/cpu-compare) has the Hyper-Threading and threshold sweeps |

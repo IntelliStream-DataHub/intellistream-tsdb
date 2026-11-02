@@ -11,6 +11,15 @@ threshold sweep works on a scratch copy.
 | `thresholds.sh` + `thresholds-env.patch` | `bench/cpu-compare/thresholds.sh --cpu v3` (and `--cpu v4`) | Where the short-run kernels hand over to the wide ones on this CPU, against the constants in `src/simd.c`. |
 | `bench/hydraulic/run.sh`, `bench/clients/run.sh` | see their READMEs | Compression on real data (it must not move: no byte on disk changes), and loads and queries through `tsdbd`. |
 
+## The one-command version
+
+`tools/bench-tsdb.sh --standard --portable --cpu-compare` builds the release build from scratch, records the machine,
+runs `decode-bench`, the folds, the codecs, `tsdb-bench`, `tsdbd` and `insert-bench` five times each, then
+`ht-sweep.sh` and `thresholds.sh` (v3, and v4 on an AVX-512 CPU) below, and writes `bench-results/*/summary.md` and
+`summary.json` (about an hour and a quarter). It covers steps 1 and 3 to 5 of the order below; what it does not do (the
+forced `-DTSDB_UNPACK_AVX2` build of step 2, the sanitizers, the hydraulic data, `bench/clients`) stays manual. The two
+scripts here run on their own just as before; the one-command run keeps their output as it prints it, one run of each.
+
 ## Which code runs where
 
 The 10850K runs the **v3** level. A 7950X or 9950X picks **v4**, where the AVX2 shuffle unpack kernel is compiled out

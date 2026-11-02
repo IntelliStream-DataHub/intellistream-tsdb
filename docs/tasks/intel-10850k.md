@@ -46,7 +46,12 @@ and of many cloud VMs. Questions:
 
 ## Steps
 
-1. **Baseline at v2 and v3.** On a `make dist` build:
+1. **Baseline at v2 and v3.** First `tools/bench-tsdb.sh --standard --portable --cpu-compare` (about an hour and a quarter; it builds the
+   release build from scratch, records the machine, runs the folds, the codecs (with `decode-bench`), `tsdb-bench`, `tsdbd` with
+   `tsdbc-bench` and `insert-bench` five times each, then `ht-sweep.sh` and `thresholds.sh` of `bench/cpu-compare` once, and writes `bench-results/*/summary.md` and `summary.json`; add
+   `--reps 11` for the short fold cases, `--full` for float64 and int64). That covers the first three bullets
+   below except the forced `TSDB_CPU` levels; the real sensor data and `bench/clients` stay manual. On a
+   `make dist` build, by hand:
    - `tools/fold-bench.sh build-dist 11` (it runs every level the CPU has: here v2 scalar, SSE, AVX and v3);
    - `build-dist/codec-bench` and `build-dist/type-bench` with `TSDB_CPU=v2` and `TSDB_CPU=v3`;
    - `build/tsdb-bench --dir /var/tmp/b --series 100 --points 1000000`, also with `--type float64` and
