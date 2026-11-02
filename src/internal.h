@@ -856,6 +856,19 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_
 int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, bool verify, granule *g);
 extern atomic_uint_fast64_t granule_checks; /* granule checksums computed, for tests */
 
+/* Hour cuts. A granule of a series that writes at least HOUR_CUT_MIN rows an hour also ends at every UTC hour edge
+ * (a multiple of HOUR_CUT_MS), so hourly buckets and local days (whole hours in nearly every zone) are answered from
+ * granule statistics instead of decoding the granule that holds the edge. The rate is measured where the edge falls:
+ * the HOUR_CUT_K rows of the series up to the edge (given to this writer: emitted, pending or arriving) span at most
+ * (HOUR_CUT_K - 1) x HOUR_CUT_MS / HOUR_CUT_MIN. So it depends on the rows only, not on the class (a short retention
+ * keeps slow series in class 0); a slow series keeps its 8192-row granules; the first K rows after a gap or at a
+ * series' start make no hour cut. Part of the layout the writer makes, not of the format: readers take any granule
+ * boundaries, and a merge re-cuts a granule across an edge of a dense series instead of copying it. 0: off. */
+#ifndef HOUR_CUT_MIN
+#define HOUR_CUT_MIN 2048
+#endif
+#define HOUR_CUT_MS 3600000
+#define HOUR_CUT_K 64
 typedef struct part_writer {
     struct eng *db;
     int64_t partition;
@@ -874,6 +887,9 @@ typedef struct part_writer {
     uint8_t *pend_v; /* slots of pend_type */
     uint32_t grows;
     int64_t cut_ms; /* > 0: granules end at multiples of it (GRANULE_CUT); 0 in a base partition */
+    uint32_t hc_min;          /* > 0: hour cuts for series of at least this many rows an hour (HOUR_CUT_MIN) */
+    uint32_t hk_series, hk_n; /* the last hk_n (<= HOUR_CUT_K) timestamps of series hk_series given to the writer */
+    int64_t hk_ts[HOUR_CUT_K];
     int zstd_level;
     int value_codec;
     codec_ctx *cc;
@@ -892,6 +908,8 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n);
 /* entry i of src, copied as it is */
 int pw_copy_granule(part_writer *w, const part *src, uint32_t i);
+/* g (count, ts_min, ts_max) holds a series at least as dense as w's hour cuts ask for */
+bool pw_granule_dense(const part_writer *w, const granule *g);
 /* Tombstones for the trailer, sorted by (series, start) and disjoint per series; copied. */
 int pw_set_tombs(part_writer *w, const tomb *t, size_t n);
 int pw_finish(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);

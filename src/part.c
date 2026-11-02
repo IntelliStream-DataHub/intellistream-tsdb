@@ -302,6 +302,7 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     w->grows = db->granule_rows;
     int64_t cut = db->partition_ms * GRANULE_CUT; /* cls_len is partition_ms for every class without classes */
     w->cut_ms = db->cls_len[partition_class(db, partition)] > cut ? cut : 0;
+    w->hc_min = HOUR_CUT_MIN;
     w->zstd_level = db->opt.zstd_level;
     w->value_codec = db->opt.value_codec;
     w->min_ts = INT64_MAX;
@@ -409,7 +410,72 @@ static int pw_emit_pending(part_writer *w)
     return rc;
 }
 
-/* Rows must be in (series, ts) order across calls. Granules never span series, nor a multiple of cut_ms. */
+/* Remembers the last HOUR_CUT_K timestamps given for `series`: the rate at its next hour edge. */
+static void hk_push(part_writer *w, uint32_t series, const int64_t *ts, size_t n)
+{
+    if (!w->hc_min || !n)
+        return;
+    if (w->hk_series != series) {
+        w->hk_series = series;
+        w->hk_n = 0;
+    }
+    if (n >= HOUR_CUT_K) {
+        memcpy(w->hk_ts, ts + n - HOUR_CUT_K, sizeof w->hk_ts);
+        w->hk_n = HOUR_CUT_K;
+        return;
+    }
+    size_t keep = MIN((size_t)w->hk_n, HOUR_CUT_K - n);
+    memmove(w->hk_ts, w->hk_ts + w->hk_n - keep, keep * sizeof *w->hk_ts);
+    memcpy(w->hk_ts + keep, ts, n * sizeof *ts);
+    w->hk_n = (uint32_t)(keep + n);
+}
+
+/* Whether `series` is dense at an hour edge that the rows ts[0..m) (not given yet) come last before: its last
+ * HOUR_CUT_K rows there span at most (HOUR_CUT_K - 1) x HOUR_CUT_MS / hc_min. */
+static bool hk_dense(const part_writer *w, uint32_t series, const int64_t *ts, size_t m)
+{
+    int64_t last, kth;
+    if (m >= HOUR_CUT_K) {
+        last = ts[m - 1];
+        kth = ts[m - HOUR_CUT_K];
+    } else {
+        size_t h = w->hk_series == series ? w->hk_n : 0;
+        if (h + m < HOUR_CUT_K)
+            return false;
+        last = m ? ts[m - 1] : w->hk_ts[h - 1];
+        kth = w->hk_ts[h - (HOUR_CUT_K - m)];
+    }
+    return (uint64_t)last - (uint64_t)kth <= (uint64_t)(HOUR_CUT_K - 1) * HOUR_CUT_MS / w->hc_min;
+}
+
+bool pw_granule_dense(const part_writer *w, const granule *g)
+{
+    return w->hc_min && g->count >= HOUR_CUT_K &&
+           (uint64_t)g->ts_max - (uint64_t)g->ts_min <= (uint64_t)(g->count - 1) * HOUR_CUT_MS / w->hc_min;
+}
+
+/* Rows that may join the current granule out of ts[0..lim): up to the first hour edge after the pending rows at
+ * which the series is dense, unless the granule fills up first. */
+static size_t hour_lim(const part_writer *w, uint32_t series, const int64_t *ts, size_t lim)
+{
+    int64_t from = w->pend_n ? w->pend_ts[w->pend_n - 1] : ts[0];
+    size_t room = w->grows - w->pend_n;
+    int64_t q = floor_div(from, HOUR_CUT_MS) + 1; /* the next edge is q x HOUR_CUT_MS, if representable */
+    size_t m = 0;
+    while (q <= INT64_MAX / HOUR_CUT_MS) {
+        size_t e = m + lower_bound_i64(ts + m, lim - m, q * HOUR_CUT_MS); /* rows before the edge */
+        if (e >= lim || e >= room)
+            break; /* no row past it here, or the granule is full before it */
+        if (hk_dense(w, series, ts, e))
+            return e;
+        m = e; /* ts[e] is past the edge: the next one that can cut is the one after it */
+        q = floor_div(ts[e], HOUR_CUT_MS) + 1;
+    }
+    return lim;
+}
+
+/* Rows must be in (series, ts) order across calls. Granules never span series, nor a multiple of cut_ms, nor an
+ * hour edge where the series is dense (hc_min). */
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n)
 {
     int rc;
@@ -423,15 +489,18 @@ int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const v
             int64_t first = w->pend_n ? w->pend_ts[0] : ts[0];
             int64_t q = floor_div(first, w->cut_ms) + 1; /* the next edge is q x cut_ms, if representable */
             lim = q > INT64_MAX / w->cut_ms ? n : lower_bound_i64(ts, n, q * w->cut_ms);
-            if (lim == 0) { /* only with pending rows: they end at the edge */
-                if ((rc = pw_emit_pending(w)) != 0)
-                    return rc;
-                continue;
-            }
+        }
+        if (w->hc_min && lim)
+            lim = hour_lim(w, series, ts, lim);
+        if (lim == 0) { /* only with pending rows: they end at the edge */
+            if ((rc = pw_emit_pending(w)) != 0)
+                return rc;
+            continue;
         }
         if (!w->pend_n && lim >= w->grows) {
             if ((rc = pw_emit(w, series, type, ts, vb, w->grows)) != 0)
                 return rc;
+            hk_push(w, series, ts, w->grows);
             ts += w->grows;
             vb += w->grows * wd;
             n -= w->grows;
@@ -443,6 +512,7 @@ int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const v
         w->pend_series = series;
         w->pend_type = type;
         w->pend_n += take;
+        hk_push(w, series, ts, take);
         ts += take;
         vb += take * wd;
         n -= take;
@@ -478,6 +548,17 @@ int pw_copy_granule(part_writer *w, const part *src, uint32_t i)
     } else {
         memcpy(w->buf + w->len, src->map + g->off, len);
         w->len += len;
+    }
+    if (w->hc_min && g->count) {
+        /* its timestamps are not decoded: the rate at the next hour edge takes them as evenly spaced */
+        int64_t t[HOUR_CUT_K];
+        uint32_t k = MIN(g->count, (uint32_t)HOUR_CUT_K);
+        uint64_t span = (uint64_t)g->ts_max - (uint64_t)g->ts_min;
+        for (uint32_t j = 0; j < k; j++)
+            t[k - 1 - j] = g->count > 1 ? (int64_t)((uint64_t)g->ts_max -
+                                                    (uint64_t)((unsigned __int128)span * j / (g->count - 1)))
+                                        : g->ts_max;
+        hk_push(w, g->series, t, k);
     }
     return pw_push_index(w, &ng);
 }
