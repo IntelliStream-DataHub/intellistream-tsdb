@@ -1,6 +1,6 @@
 #!/bin/bash
 # PreToolUse hook for Bash: refuses a git push while any local commit that is on no
-# remote yet carries a link to a Claude session (the user's rule: no session links
+# remote yet carries a link to a Claude session (project rule: no session links
 # in anything that lands in a repository). Checks every local branch, so pushes
 # from worktrees (git -C ../tsdb-x push) are covered too.
 set -u

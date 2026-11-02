@@ -1,9 +1,9 @@
 # Task: what a Ryzen 9 9950X (Zen 5) can do for tsdb
 
-A task to work on the 9950X machine on its own, from a fresh checkout. Read [AGENTS.md](../../AGENTS.md)
+An open measurement and tuning task for anyone with this CPU (a Ryzen 9 9950X or another Zen 5 part). Work from a fresh checkout. Read [AGENTS.md](../../AGENTS.md)
 first: its rules ("CPU levels" above all) hold here too.
 
-## Why this machine
+## Why this CPU
 
 tsdb is developed on a Ryzen 9 7950X (Zen 4). Zen 4 runs each 512-bit AVX-512 instruction as two 256-bit
 halves; the 9950X (Zen 5) runs them at full width. It also has every extension Zen 4 has beyond the x86-64-v4
@@ -64,7 +64,7 @@ baseline (VBMI, VBMI2, GFNI, BITALG, VPOPCNTDQ, BF16), plus AVX512-VP2INTERSECT 
    v4 path, on the 9950X and the 7950X.
 4. **The v4 code layout at 7-16 rows.** After the short-run work of October 2026, float32 aggregates of 7-16
    values on the v4 copy are 1-2.5% below the code before it (medians 0.975-0.992, on the 7950X), from how the
-   compiler lays out the v4 copy of `src/values.c` (the user accepted this for 0.9.0). Check it on Zen 5 and,
+   compiler lays out the v4 copy of `src/values.c` (accepted for 0.9.0). Check it on Zen 5 and,
    with steps 2 and 3 changing the same code, try to remove it.
 5. **Look for uses of VP2INTERSECT** (finding equal elements of two vectors): merging sorted timestamps or
    series ids are candidates. Only if a measurement shows a gain.

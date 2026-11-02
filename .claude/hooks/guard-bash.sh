@@ -5,7 +5,7 @@
 #                       killed the whole session this way (AGENTS.md).
 #   kill ... -1 / 0     a pid of -1 signals every process of the user (the terminal
 #                       included), 0 the whole process group.
-#   docker              this project uses Podman only (the user's rule).
+#   docker              this project uses Podman only (project rule).
 #
 # Only command positions count (line start, after ; & | ( or sudo/exec), so text that
 # merely mentions these words, in an echo or a commit message, passes.

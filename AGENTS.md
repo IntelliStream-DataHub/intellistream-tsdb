@@ -239,7 +239,7 @@ cgroup, so `nice` does not keep your work out of its way.
   with `index_len`): granule entries with typed, time-weighted and spread statistics, bit-packed per part
   (about 32 bytes each), a checksum over each part's header, index and footer,
   checksummed WAL, SERIES/STATES, CATALOG, VOLUMES and intent records. Until
-  1.0 (the format freezes there; the user decided this on 2026-10-25) older formats need not stay readable: a
+  1.0 (the format freezes there; decided on 2026-10-25) older formats need not stay readable: a
   layout change bumps `FORMAT_VERSION` and goes in the changelog with a way to carry data over, and a database
   of another version is refused at open with a message that names both versions. Value blocks name their codec, so new
   codecs need no version bump.
@@ -252,7 +252,7 @@ cgroup, so `nice` does not keep your work out of its way.
   be safe (no UB, no overread) on any bytes. With `fsync = 0` a power loss looks
   like damage and fails the open.
 - **Protocol.** There has been no release yet, so the wire protocol may change
-  without keeping old clients working (the user decided this on 2026-10-24): no
+  without keeping old clients working (decided on 2026-10-24): no
   legacy paths for earlier protocol versions in new designs. Every change must
   reach the C, Rust, Python and Java clients in the same commit, with
   `make test-clients` green. History so far: version 2 typed operations, 3
@@ -312,7 +312,7 @@ which `tests/test_types.c` checks):
 | `random` | 1 s | 5 ms |
 
 The real hydraulic rig data (`bench/hydraulic`) has no timestamps; it gets regular generated ones. Before the jitter
-change of 2026-10-29 (user's decision) `tank_bar`, `tank_psi` and `random` were regular as well, so the size and
+change of 2026-10-29 (a deliberate change) `tank_bar`, `tank_psi` and `random` were regular as well, so the size and
 timing numbers below that include timestamps (bytes per row, the mixed data sets) predate it; the value-only codec
 tables do not depend on it. The next full run measures the jittered data.
 
@@ -363,8 +363,8 @@ build/scale-bench export --from 0 --to 1250 | clickhouse client -q "INSERT INTO 
 ## Benchmark results
 
 These comparisons were measured before the changes of 2026-10-24 (compressed
-client inserts, fail-stop, the epoll backend, the portable build). The user
-decided to rerun the full comparison against the other databases, and the 100 B
+client inserts, fail-stop, the epoll backend, the portable build). The plan
+is to rerun the full comparison against the other databases, and the 100 B
 run against ClickHouse, only when a release is near; `bench/dbcmp/README.md`
 has the steps, Prometheus included. Internal benchmarks (flags, float32 vs
 float64, io_uring vs epoll, clients) are rerun whenever the machine is quiet.

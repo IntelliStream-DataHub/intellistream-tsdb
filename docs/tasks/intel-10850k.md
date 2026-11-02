@@ -1,9 +1,9 @@
 # Task: tune tsdb for an Intel Core i9-10850K (Comet Lake, AVX2)
 
-A task to work on the 10850K machine on its own, from a fresh checkout. Read [AGENTS.md](../../AGENTS.md)
+An open measurement and tuning task for anyone with this CPU (an i9-10850K or a similar Comet Lake or Skylake-family Intel core). Work from a fresh checkout. Read [AGENTS.md](../../AGENTS.md)
 first: its rules ("CPU levels" above all) hold here too.
 
-## Why this machine
+## Why this CPU
 
 tsdb is developed and tuned on AMD Zen 4 (a Ryzen 9 7950X). The 10850K is an Intel Comet Lake: a
 Skylake-family core with AVX2 and BMI2 but no AVX-512, so tsdb runs its **v3** level there (`TSDB_CPU=v3`;
