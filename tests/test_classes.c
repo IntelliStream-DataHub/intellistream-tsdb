@@ -33,7 +33,10 @@
  *      and a reopen the layout still holds, every granule's statistics are its rows', and every bucketed query
  *      (minutes, hours, UTC days, Oslo and Kolkata days and hours, spread, TWA) answers as without hour cuts;
  *      hours and Oslo days come from statistics alone; a merge copies whole hours (short granules) and ends with
- *      one writer's layout; a database written without hour cuts gets them when merged.
+ *      one writer's layout; a database written without hour cuts gets them when merged; series in 1 Hz bursts
+ *      below 3000 rows an hour (class 1) keep the layout and bytes they have without hour cuts, and a series
+ *      dense three hours a day (class 1) is cut exactly at those hours, and a merge of merged parts copies every
+ *      granule it does not have to decode (a whole hour, a span of hours ended at an hour cut, a day's tail).
  *
  *   test_classes [scratch dir] */
 #define _GNU_SOURCE
@@ -1606,11 +1609,10 @@ static void test_stall(void)
     OK(tsdb_close(db));
 }
 
-/* 15. Hour cuts (HOUR_CUT_MIN): a granule of a series dense at an hour edge (its last 64 rows before the edge span
- * at most 63 x 3600 s / HOUR_CUT_MIN) ends there. The same rows go into databases with hour cuts on and off
+/* 15. Hour cuts (HOUR_CUT_MIN): a granule of a series dense at an hour edge (at least HOUR_CUT_MIN rows in the hour
+ * before it) ends there. The same rows go into databases with hour cuts on and off
  * (hour_cut_min, read when a writer begins: each database's writes run with its own value). */
 #define HOUR 3600000LL
-#define HC_K 64
 #define HT0 (T0 + 3 * DAY)
 
 typedef struct hc_ser {
@@ -1807,28 +1809,18 @@ static void hc_edit(tsdb *db, const uint32_t *ids, int on)
     }
 }
 
-/* 1 dense, 0 not, -1 unknown: whether the writer finds series s dense at hour edge e (not a day edge), from the live
- * rows before e within e's day (a day lies in one partition; a writer knows nothing before its partition). With
- * slack, rates within 5% of the threshold are unknown (a merge takes copied granules' rows as evenly spaced). */
+/* 1 dense, 0 not, -1 unknown: whether the writer cuts series s at hour edge e, that is whether at least
+ * HOUR_CUT_MIN live rows lie in the hour before e (one writer given every row of that hour). With slack, counts
+ * within 5% of the threshold are unknown (a merge takes copied granules' rows as evenly spaced). */
 static int hc_dense_at(const hc_ser *s, int64_t e, int slack)
 {
-    int64_t day = floor_div(e, DAY) * DAY, kth = 0, last = 0;
-    int got = 0;
-    for (size_t i = hc_lb(s, e); i-- > 0 && got < HC_K;) {
-        if (!s->alive[i])
-            continue;
-        if (s->ts[i] < day)
-            return -1;
-        if (!got++)
-            last = s->ts[i];
-        kth = s->ts[i];
-    }
-    if (got < HC_K)
-        return 0;
-    int64_t lim = (HC_K - 1) * HOUR / hc_on_min, span = last - kth;
+    int64_t got = 0;
+    for (size_t i = hc_lb(s, e - HOUR); i < hc_lb(s, e); i++)
+        got += s->alive[i];
+    int64_t lim = hc_on_min;
     if (!slack)
-        return span <= lim;
-    return span * 20 <= lim * 19 ? 1 : span * 20 > lim * 21 ? 0 : -1;
+        return got >= lim;
+    return got * 20 >= lim * 21 ? 1 : got * 20 < lim * 19 ? 0 : -1;
 }
 
 typedef struct hc_gran {
@@ -2195,15 +2187,145 @@ static void hc_touch(tsdb *db, const uint32_t *ids)
     OK(tsdb_optimize(db));
 }
 
+/* One series alone in a fresh database with hour cuts on or off: loaded in one insert, optimized, then merged twice
+ * more (hc_retouch), the second time from merged parts only, where granules are copied */
+typedef struct hc_db {
+    char dir[600];
+    tsdb *db;
+    uint32_t id;
+    int64_t *ts;
+    float *v;
+    size_t n;
+    uint64_t copied; /* granules the last merge copied */
+} hc_db;
+
+static void hc_retouch(hc_db *d, int64_t at)
+{
+    /* the row at or after `at` of each of the three days again: a merge in every partition, which re-encodes the
+     * granule of that row and may copy the others */
+    for (int day = 0; day < 3; day++) {
+        size_t i = 0;
+        while (i < d->n && d->ts[i] < HT0 + day * DAY + at)
+            i++;
+        if (i < d->n && d->ts[i] < HT0 + (day + 1) * DAY)
+            OK(tsdb_insert_series(d->db, d->id, d->ts + i, d->v + i, 1));
+    }
+    OK(tsdb_flush(d->db));
+    tsdb_stats s0, s1;
+    OK(tsdb_get_stats(d->db, &s0));
+    OK(tsdb_optimize(d->db));
+    OK(tsdb_get_stats(d->db, &s1));
+    d->copied = s1.passthrough_granules - s0.passthrough_granules;
+}
+
+static void hc_db_load(hc_db *d, const char *name, int on, int64_t *ts, size_t n, int64_t touch_at)
+{
+    snprintf(d->dir, sizeof d->dir, "%s/%s-%s", base, name, on ? "on" : "off");
+    rm_rf(d->dir);
+    hc_set(on);
+    d->db = hc_open(d->dir, 0, NULL);
+    OK(tsdb_series_create(d->db, name, TSDB_FLOAT32, NULL, &d->id));
+    d->ts = ts, d->n = n, d->v = malloc(n * sizeof *d->v);
+    for (size_t i = 0; i < n; i++)
+        d->v[i] = (float)(mix(i) % 4000) * 0.25f;
+    OK(tsdb_insert_series(d->db, d->id, ts, d->v, n));
+    OK(tsdb_flush(d->db));
+    OK(tsdb_optimize(d->db));
+    hc_retouch(d, touch_at); /* merged parts from here on */
+    hc_retouch(d, touch_at);
+}
+
+static void hc_db_close(hc_db *d)
+{
+    OK(tsdb_close(d->db));
+    rm_rf(d->dir);
+    free(d->v);
+}
+
+/* Bursts of `len` rows at 1 Hz every `every` seconds, the first at HT0 + first seconds, for three days: on average
+ * below HOUR_CUT_MIN rows an hour, though a burst across an hour edge is as dense as 1 Hz there. Hour cuts leave
+ * their granules alone: the layout, the bytes and what a merge copies are the same as without them. */
+static void hc_bursty(const char *name, int64_t len, int64_t every, int64_t first)
+{
+    size_t cap = (size_t)(3 * 86400 / every + 1) * (size_t)len, n = 0;
+    int64_t *ts = malloc(cap * sizeof *ts);
+    for (int64_t b = HT0 + first * 1000; b + len * 1000 <= HT0 + 3 * DAY; b += every * 1000)
+        for (int64_t j = 0; j < len; j++)
+            ts[n++] = b + j * 1000 + (j ? (int64_t)(mix((uint64_t)b + (uint64_t)j) % 200) : 0);
+    hc_db on, off;
+    hc_db_load(&on, name, 1, ts, n, 0);
+    hc_db_load(&off, name, 0, ts, n, 0);
+    hc_glist gon = hc_series_granules(on.db, on.id), goff = hc_series_granules(off.db, off.id);
+    tsdb_stats son, soff;
+    OK(tsdb_get_stats(on.db, &son));
+    OK(tsdb_get_stats(off.db, &soff));
+    printf("  %s: %zu rows (%.0f an hour) in class %d: %zu granules, %" PRIu64 " bytes; without hour cuts %zu, %" PRIu64
+           "; the last merge copied %" PRIu64 " and %" PRIu64 "\n", name, n, (double)n / 72, cls_of(on.db, on.id),
+           gon.n, son.bytes, goff.n, soff.bytes, on.copied, off.copied);
+    CK(cls_of(on.db, on.id) == 1, "%s: class %d, want 1", name, cls_of(on.db, on.id));
+    CK(hc_same_layout(&gon, &goff) && son.bytes == soff.bytes && gon.n <= n / 8192 + 3,
+       "%s: hour cuts change the layout of a bursty series: %zu granules, %" PRIu64 " bytes; without them %zu, %" PRIu64,
+       name, gon.n, son.bytes, goff.n, soff.bytes);
+    /* the second merge re-encodes the granule of each day's first row and copies the rest */
+    CK(on.copied == off.copied && on.copied + 3 == gon.n, "%s: the last merge copied %" PRIu64 " of %zu granules "
+       "(%" PRIu64 " without hour cuts), want all but 3", name, on.copied, gon.n, off.copied);
+    free(gon.a), free(goff.a);
+    hc_db_close(&on), hc_db_close(&off);
+    free(ts);
+}
+
+/* A series dense three hours a day (06:00 to 09:00 at 1 Hz, one row a minute otherwise; 12,060 rows a day, so
+ * class 1: week partitions, granules cut at day edges): a day is four granules, 00:00-07:00 (360 + 3600 rows: the
+ * hour before 06:00 has 60), 07:00-08:00, 08:00-09:00 and 09:00-24:00 (900 rows, ended by the day cut). A merge
+ * keeps that layout and copies each of them where nothing else of the series comes before its end: a whole hour,
+ * one that spans hours and ends at an hour cut (its stamps decide), one that ends at the day cut. */
+static void hc_class1(void)
+{
+    size_t n = 0;
+    int64_t *ts = malloc(3 * 12060 * sizeof *ts);
+    for (int day = 0; day < 3; day++)
+        for (int64_t t = 0; t < DAY; t += t >= 6 * HOUR && t < 9 * HOUR ? 1000 : 60000)
+            ts[n++] = HT0 + day * DAY + t;
+    hc_db on, off;
+    hc_db_load(&on, "dense3h", 1, ts, n, 3 * HOUR); /* the row at 03:00: the first granule of each day decodes */
+    hc_db_load(&off, "dense3h", 0, ts, n, 3 * HOUR);
+    CK(cls_of(on.db, on.id) == 1, "dense3h: class %d, want 1", cls_of(on.db, on.id));
+    hc_glist l = hc_series_granules(on.db, on.id), lo = hc_series_granules(off.db, off.id);
+    static const int64_t start[4] = {0, 7 * HOUR, 8 * HOUR, 9 * HOUR};
+    static const uint32_t count[4] = {3960, 3600, 3600, 900};
+    size_t bad = l.n != 12;
+    for (size_t j = 0; j < l.n && j < 12; j++)
+        if ((l.a[j].g.ts_min != HT0 + (int64_t)(j / 4) * DAY + start[j % 4] || l.a[j].g.count != count[j % 4]) &&
+            bad++ < 3)
+            printf("  dense3h: granule %zu of %u rows from %" PRId64 " (want %u from %" PRId64 ")\n", j,
+                   l.a[j].g.count, l.a[j].g.ts_min, count[j % 4], (int64_t)(HT0 + (int64_t)(j / 4) * DAY + start[j % 4]));
+    CK(!bad, "dense3h: %zu granules, %zu not as one writer cuts them", l.n, bad);
+    /* without hour cuts: 8192 rows and the 3868 left before the day cut, which the merge copies */
+    CK(lo.n == 6 && on.copied == 9 && off.copied == 3, "dense3h: the last merge copied %" PRIu64 " of %zu granules "
+       "(want 9 of 12), without hour cuts %" PRIu64 " of %zu (want 3 of 6)", on.copied, l.n, off.copied, lo.n);
+    tsdb_stats son, soff;
+    OK(tsdb_get_stats(on.db, &son));
+    OK(tsdb_get_stats(off.db, &soff));
+    printf("  dense3h: %zu granules, %" PRIu64 " bytes; without hour cuts %zu, %" PRIu64 "\n", l.n, son.bytes, lo.n,
+           soff.bytes);
+    free(l.a), free(lo.a);
+    hc_db_close(&on), hc_db_close(&off);
+    free(ts);
+}
+
 static void test_hourcut(void)
 {
     hc_on_min = atomic_load(&hour_cut_min);
-    CK(hc_on_min == 3000, "HOUR_CUT_MIN is %u, these cases are built around 3000", hc_on_min);
-    if (!hc_on_min)
+    if (hc_on_min != 3000) { /* the data sets sit on both sides of 3000 rows an hour */
+        printf("  skipped: HOUR_CUT_MIN is %u, these cases are built around 3000\n", hc_on_min);
         return;
+    }
     hc_make();
     hc_exact_edges(1800);
     hc_exact_edges(1000);
+    hc_bursty("burst15m", 200, 900, 3500); /* 800 rows an hour, 100 of a burst before each hour edge */
+    hc_bursty("burst5m", 100, 300, 3530);  /* 1200 rows an hour, 70 before each hour edge */
+    hc_class1();
 
     /* one writer per series and partition: the rule exactly, edges at granule ends, the threshold both ways */
     char d_one[600], d_on[600], d_off[600], d_old[600], d_il[600];
@@ -2221,8 +2343,9 @@ static void test_hourcut(void)
     size_t f32_hours = 0;
     for (size_t j = 0; j < ref.n; j++)
         f32_hours += ref.a[j].g.count < 3000 || ref.a[j].g.count > 3600 ? 0 : 1;
-    CK(ref.n == 71 && f32_hours == 69, "dense_f32: %zu granules, %zu of whole hours (want 71 and 69: 72 hours, "
-       "the two inside the gap gone, the two at its ends with 900 rows)", ref.n, f32_hours);
+    CK(ref.n == 69 && f32_hours == 68, "dense_f32: %zu granules, %zu of whole hours (want 69 and 68: 72 hours, "
+       "the two inside the gap gone; the 900 rows before it, the 900 after it and the hour after that in one, as "
+       "the hours before 06:00 and 08:00 hold 900 rows)", ref.n, f32_hours);
 
     /* dense_f32 in chunks of 20000 rows, even ones first: the second optimize copies the whole hours inside the
      * first round's chunks (short granules) and ends with the layout of one writer */

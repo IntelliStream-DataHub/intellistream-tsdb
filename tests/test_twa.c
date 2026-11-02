@@ -13,11 +13,14 @@
 #include "tsdb_calendar.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+extern atomic_uint hour_cut_min; /* HOUR_CUT_MIN (src/internal.h): granules of dense series end at hour edges */
 
 static int failures;
 #define CHECK(cond)                                                                  \
@@ -740,12 +743,14 @@ static void test_stats_only(void)
     tsdb_twa_bucket *b;
     size_t n;
     tsdb_query_stats st;
+    unsigned hc = atomic_load(&hour_cut_min);
+    int cut = hc && hc <= 3600; /* the hour before 3600 s holds 3600 rows: hour cuts end a granule there */
     for (int linear = 0; linear < 2; linear++) {
         tsdb_twa_opts o = {.method = linear};
         OK(tsdb_query_twa(db, s, 0, 1000LL * N, 0, &o, &b, &n));
         tsdb_last_query_stats(&st);
-        /* 100 granules of 64 rows, and one more: the hour edge at 3600 s cuts one (HOUR_CUT_MIN) */
-        CHECK(st.rows_decoded == 0 && st.granules_from_stats == 101 && st.rows_from_stats == N);
+        /* 100 granules of 64 rows, and with hour cuts one more: the edge at 3600 s cuts one */
+        CHECK(st.rows_decoded == 0 && st.granules_from_stats == (cut ? 101u : 100u) && st.rows_from_stats == N);
         long double area = 0;
         for (int i = 0; i + 1 < N; i++)
             area += linear ? ((long double)v[i] + v[i + 1]) / 2 * 1000 : (long double)v[i] * 1000;
@@ -772,13 +777,16 @@ static void test_stats_only(void)
         CHECK(st.rows_decoded == N && n == 1 && b[0].covered_ms == 0 && b[0].count == N);
         free(b);
     }
-    /* buckets of 640 s hold 10 granules each up to the hour edge at 3600 s; a range cut inside granules decodes
-     * only those: the two at the range's ends (64 and 48 rows) and, past the hour edge (granules from 3600 s on),
-     * the four the bucket edges at 3840, 4480, 5120 and 5760 s cut */
+    /* buckets of 640 s hold 10 granules each (up to the hour edge at 3600 s with hour cuts); a range cut inside
+     * granules decodes only those: the two at the range's ends, and with hour cuts (64 and 48 rows), past the edge
+     * (granules from 3600 s on), the four the bucket edges at 3840, 4480, 5120 and 5760 s cut */
     tsdb_twa_opts o = {0};
     OK(tsdb_query_twa(db, s, 32000, 1000LL * N - 32000, 640000, &o, &b, &n));
     tsdb_last_query_stats(&st);
-    CHECK(n == 10 && st.granules_from_stats == 95 && st.rows_decoded == 64 + 4 * 64 + 48);
+    if (cut)
+        CHECK(n == 10 && st.granules_from_stats == 95 && st.rows_decoded == 64 + 4 * 64 + 48);
+    else
+        CHECK(n == 10 && st.granules_from_stats == 98 && st.rows_decoded == 128);
     free(b);
     tsdb_close(db);
     free(ts);

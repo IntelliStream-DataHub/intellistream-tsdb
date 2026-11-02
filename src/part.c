@@ -304,6 +304,7 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     int64_t cut = db->partition_ms * GRANULE_CUT; /* cls_len is partition_ms for every class without classes */
     w->cut_ms = db->cls_len[partition_class(db, partition)] > cut ? cut : 0;
     w->hc_min = atomic_load_explicit(&hour_cut_min, memory_order_relaxed);
+    w->hk_end = INT64_MIN; /* no row given yet */
     w->zstd_level = db->opt.zstd_level;
     w->value_codec = db->opt.value_codec;
     w->min_ts = INT64_MAX;
@@ -411,54 +412,164 @@ static int pw_emit_pending(part_writer *w)
     return rc;
 }
 
-/* Remembers the last HOUR_CUT_K timestamps given for `series`: the rate at its next hour edge. */
+/* The start of hour q (q x HOUR_CUT_MS), clamped to the int64 range. */
+static int64_t hc_edge(int64_t q)
+{
+    return q > INT64_MAX / HOUR_CUT_MS ? INT64_MAX : q < INT64_MIN / HOUR_CUT_MS ? INT64_MIN : q * HOUR_CUT_MS;
+}
+
+/* The writer was given cnt rows of series in hour h, the hour of the last one. */
+static void hk_set(part_writer *w, uint32_t series, int64_t h, uint64_t cnt)
+{
+    w->hk_series = series;
+    w->hk_hour = h;
+    w->hk_end = hc_edge(h + 1);
+    w->hk_cnt = cnt;
+}
+
+/* Counts ts[0..n) (rows of `series`, after every row given before) into the rows given in the hour of the last. */
 static void hk_push(part_writer *w, uint32_t series, const int64_t *ts, size_t n)
 {
     if (!w->hc_min || !n)
         return;
-    if (w->hk_series != series) {
-        w->hk_series = series;
-        w->hk_n = 0;
-    }
-    if (n >= HOUR_CUT_K) {
-        memcpy(w->hk_ts, ts + n - HOUR_CUT_K, sizeof w->hk_ts);
-        w->hk_n = HOUR_CUT_K;
+    if (w->hk_series == series && ts[n - 1] < w->hk_end) { /* the rows before lie in that hour, and so do all of ts */
+        w->hk_cnt += n;
         return;
     }
-    size_t keep = MIN((size_t)w->hk_n, HOUR_CUT_K - n);
-    memmove(w->hk_ts, w->hk_ts + w->hk_n - keep, keep * sizeof *w->hk_ts);
-    memcpy(w->hk_ts + keep, ts, n * sizeof *ts);
-    w->hk_n = (uint32_t)(keep + n);
+    int64_t h = floor_div(ts[n - 1], HOUR_CUT_MS);
+    hk_set(w, series, h, n - lower_bound_i64(ts, n, hc_edge(h)));
 }
 
-/* Whether `series` is dense at an hour edge that the rows ts[0..m) (not given yet) come last before: its last
- * HOUR_CUT_K rows there span at most (HOUR_CUT_K - 1) x HOUR_CUT_MS / hc_min. */
-static bool hk_dense(const part_writer *w, uint32_t series, const int64_t *ts, size_t m)
+/* Whether the writer cuts `series` at the hour edge q x HOUR_CUT_MS when ts[0..m) (all before it) come next: at
+ * least hc_min rows of the series given or coming lie in the hour before it. */
+static bool hk_cut(const part_writer *w, uint32_t series, int64_t q, const int64_t *ts, size_t m)
 {
-    int64_t last, kth;
-    if (m >= HOUR_CUT_K) {
-        last = ts[m - 1];
-        kth = ts[m - HOUR_CUT_K];
-    } else {
-        size_t h = w->hk_series == series ? w->hk_n : 0;
-        if (h + m < HOUR_CUT_K)
-            return false;
-        last = m ? ts[m - 1] : w->hk_ts[h - 1];
-        kth = w->hk_ts[h - (HOUR_CUT_K - m)];
+    uint64_t c = m - lower_bound_i64(ts, m, hc_edge(q - 1));
+    if (w->hk_series == series && w->hk_hour == q - 1) /* given rows lie in that hour (then all of ts[0..m) do) */
+        c += w->hk_cnt;
+    return c >= w->hc_min;
+}
+
+/* Rows of g in [a, b), as far as its count, time window and longest gap between consecutive rows (gap; 0: unknown)
+ * tell: at least *lo, at most *hi. Rows at most gap apart put at least floor(w / gap) in a window of w ms inside the
+ * granule's span, and at least ceil(d / gap) in d ms of it outside the window. */
+static void hc_rows_in(const granule *g, uint64_t gap, int64_t a, int64_t b, uint64_t *lo, uint64_t *hi)
+{
+    if (b <= g->ts_min || a > g->ts_max) {
+        *lo = *hi = 0;
+        return;
     }
-    return (uint64_t)last - (uint64_t)kth <= (uint64_t)(HOUR_CUT_K - 1) * HOUR_CUT_MS / w->hc_min;
+    if (a <= g->ts_min && b > g->ts_max) {
+        *lo = *hi = g->count;
+        return;
+    }
+    /* the window cuts the span: ts_min < ts_max */
+    uint64_t a1 = a > g->ts_min ? (uint64_t)a : (uint64_t)g->ts_min;
+    uint64_t b1 = b > g->ts_max ? (uint64_t)g->ts_max + 1 : (uint64_t)b;
+    uint64_t wlen = b1 - a1;
+    uint64_t pre = a > g->ts_min ? (uint64_t)a - (uint64_t)g->ts_min : 0;   /* time of the span before a */
+    uint64_t post = b <= g->ts_max ? (uint64_t)g->ts_max - (uint64_t)b + 1 : 0; /* and from b on */
+    uint64_t out, in;
+    if (gap) {
+        out = pre / gap + (pre % gap != 0) + post / gap + (post % gap != 0);
+        in = wlen / gap;
+    } else { /* only the first and the last row are known */
+        out = (pre > 0) + (post > 0);
+        in = (pre == 0) + (post == 0);
+    }
+    uint64_t h = g->count > out ? g->count - out : 0;
+    *hi = h < wlen ? h : wlen; /* stamps are distinct integers */
+    *lo = in < *hi ? in : *hi;
 }
 
-bool pw_granule_dense(const part_writer *w, const granule *g)
+static uint64_t hc_gap(const part *src, uint32_t i, uint32_t count)
 {
-    return w->hc_min && g->count >= HOUR_CUT_K &&
-           (uint64_t)g->ts_max - (uint64_t)g->ts_min <= (uint64_t)(g->count - 1) * HOUR_CUT_MS / w->hc_min;
+    uint64_t gap = count > 1 ? gix_get(&src->ix, i, GF_GAP) : 0; /* 0 for state series, which keep no TWA */
+    return gap >= UINT32_MAX ? 0 : gap;                              /* saturated: not a bound */
+}
+
+int pw_copy_fits(part_writer *w, const part *src, uint32_t i, const granule *g, bool want_end, int64_t *end)
+{
+    *end = INT64_MAX;
+    w->hk_dsrc = NULL;
+    if (!w->hc_min)
+        return 1;
+    uint64_t gap = hc_gap(src, i, g->count), lo, hi, c = g->count;
+    int64_t h0 = floor_div(g->ts_min, HOUR_CUT_MS), h1 = floor_div(g->ts_max, HOUR_CUT_MS);
+    uint64_t hk0 = w->hk_series == g->series && w->hk_hour == h0 ? w->hk_cnt : 0; /* given rows in g's first hour */
+    bool need = false;                                                            /* the bounds do not decide */
+    if (h1 > h0) { /* edges inside at (h0 + 1) x 1 h .. h1 x 1 h */
+        hc_rows_in(g, gap, hc_edge(h0), hc_edge(h0 + 1), &lo, &hi);
+        if (lo + hk0 >= w->hc_min)
+            return 0;
+        need = hi + hk0 >= w->hc_min;
+        if (!need && h1 > h0 + 1) {
+            /* a later hour inside the span (span > 1 h) holds at most count - ceil((span - 1 h + 1) / gap) rows */
+            uint64_t d = (uint64_t)g->ts_max - (uint64_t)g->ts_min - HOUR_CUT_MS + 1;
+            uint64_t o = gap ? d / gap + (d % gap != 0) : 1, most = c > o ? c - o : 0;
+            if (most >= w->hc_min && (uint64_t)(h1 - h0) > 64)
+                need = true; /* decoding is cheaper than bounding many hours */
+            for (int64_t h = h0 + 1; most >= w->hc_min && h < h1 && !need; h++) {
+                hc_rows_in(g, gap, hc_edge(h), hc_edge(h + 1), &lo, &hi);
+                if (lo >= w->hc_min)
+                    return 0;
+                need = hi >= w->hc_min;
+            }
+        }
+    }
+    if (want_end && !need && h1 < INT64_MAX / HOUR_CUT_MS) {
+        uint64_t hk1 = h1 == h0 ? hk0 : 0;
+        hc_rows_in(g, gap, hc_edge(h1), hc_edge(h1 + 1), &lo, &hi);
+        if (lo + hk1 >= w->hc_min)
+            *end = (h1 + 1) * HOUR_CUT_MS;
+        else
+            need = hi + hk1 >= w->hc_min;
+    }
+    if (!need)
+        return 1;
+    /* the stamps decide: decoded (timestamps only), and kept for pw_copy_granule's count of the hour */
+    if (!w->hk_buf && !(w->hk_buf = malloc(MAX_GRANULE_ROWS * sizeof *w->hk_buf)))
+        return TSDB_ERR_NOMEM;
+    granule gl;
+    memset(&gl, 0, sizeof gl);
+    gx_load(src, i, GW_TIME | GW_LOC, &gl);
+    int rc = granule_read(w->cc, src, &gl, 0, w->hk_buf, NULL, true);
+    if (rc)
+        return rc;
+    const int64_t *ts = w->hk_buf;
+    *end = INT64_MAX;
+    for (size_t j = 0; j < c;) {
+        int64_t h = floor_div(ts[j], HOUR_CUT_MS);
+        if (h >= INT64_MAX / HOUR_CUT_MS)
+            break; /* no edge after this hour */
+        size_t k = j + lower_bound_i64(ts + j, c - j, (h + 1) * HOUR_CUT_MS);
+        uint64_t n = k - j + (j == 0 ? hk0 : 0); /* rows given and of g in hour h */
+        if (k < c && n >= w->hc_min)
+            return 0; /* the writer cuts at the edge inside */
+        if (k == c && want_end && n >= w->hc_min)
+            *end = (h + 1) * HOUR_CUT_MS;
+        j = k;
+    }
+    w->hk_dsrc = src;
+    w->hk_di = i;
+    return 1;
+}
+
+bool pw_hcut_before(const part_writer *w, int64_t t)
+{
+    if (!w->hc_min || !w->pend_n)
+        return false;
+    int64_t h = floor_div(w->pend_ts[w->pend_n - 1], HOUR_CUT_MS); /* hk_hour: pending rows were given last */
+    return h < floor_div(t, HOUR_CUT_MS) && h < INT64_MAX / HOUR_CUT_MS && w->hk_series == w->pend_series &&
+           w->hk_hour == h && w->hk_cnt >= w->hc_min;
 }
 
 /* Rows that may join the current granule out of ts[0..lim): up to the first hour edge after the pending rows at
- * which the series is dense, unless the granule fills up first. */
+ * which the writer cuts, unless the granule fills up first. */
 static size_t hour_lim(const part_writer *w, uint32_t series, const int64_t *ts, size_t lim)
 {
+    if (w->hk_series == series && ts[lim - 1] < w->hk_end)
+        return lim; /* all in the hour of the last row given: no edge (one-row calls of a merge take this) */
     int64_t from = w->pend_n ? w->pend_ts[w->pend_n - 1] : ts[0];
     size_t room = w->grows - w->pend_n;
     int64_t q = floor_div(from, HOUR_CUT_MS) + 1; /* the next edge is q x HOUR_CUT_MS, if representable */
@@ -467,7 +578,7 @@ static size_t hour_lim(const part_writer *w, uint32_t series, const int64_t *ts,
         size_t e = m + lower_bound_i64(ts + m, lim - m, q * HOUR_CUT_MS); /* rows before the edge */
         if (e >= lim || e >= room)
             break; /* no row past it here, or the granule is full before it */
-        if (hk_dense(w, series, ts, e))
+        if (hk_cut(w, series, q, ts, e))
             return e;
         m = e; /* ts[e] is past the edge: the next one that can cut is the one after it */
         q = floor_div(ts[e], HOUR_CUT_MS) + 1;
@@ -476,7 +587,7 @@ static size_t hour_lim(const part_writer *w, uint32_t series, const int64_t *ts,
 }
 
 /* Rows must be in (series, ts) order across calls. Granules never span series, nor a multiple of cut_ms, nor an
- * hour edge where the series is dense (hc_min). */
+ * hour edge where the writer cuts the series (hc_min). */
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n)
 {
     int rc;
@@ -551,16 +662,17 @@ int pw_copy_granule(part_writer *w, const part *src, uint32_t i)
         w->len += len;
     }
     if (w->hc_min && g->count) {
-        /* its timestamps are not decoded: the rate at the next hour edge takes them as evenly spaced */
-        int64_t t[HOUR_CUT_K];
-        uint32_t k = MIN(g->count, (uint32_t)HOUR_CUT_K);
-        uint64_t span = (uint64_t)g->ts_max - (uint64_t)g->ts_min;
-        for (uint32_t j = 0; j < k; j++)
-            t[k - 1 - j] = g->count > 1 ? (int64_t)((uint64_t)g->ts_max -
-                                                    (uint64_t)((unsigned __int128)span * j / (g->count - 1)))
-                                        : g->ts_max;
-        hk_push(w, g->series, t, k);
+        if (w->hk_dsrc == src && w->hk_di == i) { /* pw_copy_fits decoded its stamps */
+            hk_push(w, g->series, w->hk_buf, g->count);
+        } else { /* the rows of its last hour, or at least as many as its window and longest gap give */
+            int64_t h = floor_div(g->ts_max, HOUR_CUT_MS);
+            uint64_t in = g->count, hi;
+            if (floor_div(g->ts_min, HOUR_CUT_MS) != h)
+                hc_rows_in(g, hc_gap(src, i, g->count), hc_edge(h), hc_edge(h + 1), &in, &hi);
+            hk_set(w, g->series, h, w->hk_series == g->series && w->hk_hour == h ? w->hk_cnt + in : in);
+        }
     }
+    w->hk_dsrc = NULL;
     return pw_push_index(w, &ng);
 }
 
@@ -591,6 +703,7 @@ void pw_abort(part_writer *w)
     free(w->pend_ts);
     free(w->pend_v);
     free(w->tombs);
+    free(w->hk_buf);
     memset(w, 0, sizeof *w);
     w->fd = -1;
 }

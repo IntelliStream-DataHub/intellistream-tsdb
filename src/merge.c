@@ -13,9 +13,11 @@
  * Merging is a k-way merge on (series, ts). Equal keys collapse to the row of
  * the newest source part (highest block number), which is what makes the
  * table behave like a ReplacingMergeTree. When a whole source granule sorts
- * strictly before everything else that remains, it is copied as compressed bytes:
- * a full one (granule_rows) that crosses no cut, or a shorter one that is a whole
- * hour of a dense series (hour cuts, HOUR_CUT_MIN) with nothing of that hour left.
+ * strictly before everything else that remains, it is copied as compressed bytes
+ * where one writer would cut its rows the same way: a full one (granule_rows) that
+ * crosses no cut (day, or hour cut: HOUR_CUT_MIN), or a shorter one that ends where
+ * the writer ends it (an hour cut, a day cut, the series' last row) with nothing of
+ * the series before that edge left.
  *
  * Deletes and retention: a source's rows covered by the tombstones of a newer
  * source, or older than their series' retention cutoff, are dropped (a granule
@@ -332,27 +334,37 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
         bool filter = gcut > g->ts_min || (c->hide.n && tomb_set_hits(&c->hide, g->series, g->ts_min, g->ts_max));
         if (!c->loaded) {
             bool before_rest = !has_bound || g->series < bs || (g->series == bs && g->ts_max < bt);
-            /* a granule across a cut (written before the cut, or by another GRANULE_CUT) is re-cut, not copied */
+            /* Copied only where one writer given these rows would cut them the same way (pw_copy_fits): a granule
+             * across a cut (written before the cut, by another GRANULE_CUT, or by a writer that saw less of the
+             * hour) is re-cut. Pending rows of its series go first as a granule of their own: only where the
+             * writer would end them, at a day cut or an hour cut. */
             bool day = !w.cut_ms || floor_div(g->ts_min, w.cut_ms) == floor_div(g->ts_max, w.cut_ms);
-            int64_t hour = floor_div(g->ts_min, HOUR_CUT_MS);
-            bool in_hour = hour == floor_div(g->ts_max, HOUR_CUT_MS);
-            bool dense = pw_granule_dense(&w, g);
-            /* across an hour edge of a dense series (written before hour cuts, or by a merge that saw part of the
-             * hour) it is re-cut; a slow series' granule spans hours as it should */
-            bool full = g->count >= w.grows && day && (in_hour || !dense);
-            bool pend_ok = w.pend_n == 0 || w.pend_series != g->series;
-            if (!full && dense && day && in_hour) {
-                /* a short granule that is a whole hour of a dense series (hour cuts) is kept as it is when nothing
-                 * else of the series in that hour is left to merge: in another cursor, after it in its own part,
-                 * or pending */
-                int64_t end = hour < INT64_MAX / HOUR_CUT_MS ? (hour + 1) * HOUR_CUT_MS : INT64_MAX;
-                uint32_t nx = c->gi + 1; /* cur_series set run_end: entries before it are of g's series */
-                full = (!has_bound || bs != g->series || bt >= end) && (nx >= c->run_end || gx_ts_min(c->p, nx) >= end);
-                pend_ok = pend_ok || floor_div(w.pend_ts[w.pend_n - 1], HOUR_CUT_MS) < hour;
-            }
+            bool pend_ok = w.pend_n == 0 || w.pend_series != g->series ||
+                           (w.cut_ms && floor_div(w.pend_ts[w.pend_n - 1], w.cut_ms) < floor_div(g->ts_min, w.cut_ms)) ||
+                           pw_hcut_before(&w, g->ts_min);
             /* a part no merge has written was encoded at insert speed (CODEC_FAST): re-encoded once here */
             bool merged = c->p->level > 0;
-            if (!filter && before_rest && full && merged && pend_ok) {
+            int fit = 0;
+            if (!filter && before_rest && day && merged && pend_ok) {
+                bool shrt = g->count < w.grows;
+                int64_t end, d;
+                if ((fit = pw_copy_fits(&w, c->p, c->gi, g, shrt, &end)) < 0) {
+                    rc = fit;
+                    break;
+                }
+                if (fit && shrt) {
+                    /* a short one ends where the writer ends it: at an hour edge where it cuts, at a day cut, or at
+                     * the end of the series' rows; nothing else of the series may come before that, in another
+                     * cursor or after it in its own part */
+                    if (w.cut_ms && (d = floor_div(g->ts_min, w.cut_ms) + 1) <= INT64_MAX / w.cut_ms)
+                        end = MIN(end, d * w.cut_ms);
+                    bool open = end == INT64_MAX; /* no edge: only the end of the series' rows ends it */
+                    uint32_t nx = c->gi + 1;      /* cur_series set run_end: entries before it are of g's series */
+                    fit = !(has_bound && bs == g->series && (open || bt < end)) &&
+                          !(nx < c->run_end && (open || gx_ts_min(c->p, nx) < end));
+                }
+            }
+            if (fit) {
                 rc = pw_copy_granule(&w, c->p, c->gi);
                 rows += g->count;
                 copied++;
