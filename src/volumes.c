@@ -57,6 +57,25 @@
 #define ID_FILE "ID"
 #define ROOT_ID_FILE "ROOT_ID"
 
+/* VOLUMES as last read. Its size alone does not show every change: an add may cut a torn tail and append a line
+ * of the same length (a power loss leaves zeros as long as the line). The cut and the write both move ctime. */
+typedef struct {
+    off_t size;
+    ino_t ino;
+    struct timespec ctim;
+} vols_stamp;
+
+static vols_stamp stamp_of(const struct stat *st)
+{
+    return (vols_stamp){.size = st->st_size, .ino = st->st_ino, .ctim = st->st_ctim};
+}
+
+static bool stamp_same(const vols_stamp *s, const struct stat *st)
+{
+    return s->size == st->st_size && s->ino == st->st_ino && s->ctim.tv_sec == st->st_ctim.tv_sec &&
+           s->ctim.tv_nsec == st->st_ctim.tv_nsec;
+}
+
 struct tsdb {
     tsdb_options opt;
     char *dir;
@@ -67,7 +86,7 @@ struct tsdb {
     char **paths; /* canonical, [0] is the root */
     size_t nvols, vols_cap;
     pthread_mutex_t create_lock; /* one volume add or resolve at a time */
-    off_t vols_seen;             /* the size of VOLUMES when last read (a writer: create_lock; a follower: lock) */
+    vols_stamp vols_seen;        /* VOLUMES when last read (a writer: create_lock; a follower: lock) */
     int vols_rc;                 /* and what that read gave: damage is reported once per change, not per request */
     sched *sched;                /* the query helpers of every volume */
     /* The names being created now: a creation holds its name from the probe of every volume to its append, so
@@ -804,7 +823,7 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
         rc = load_layout(t);
     struct stat vst;
     if (rc == 0 && vfd >= 0 && fstat(vfd, &vst) == 0)
-        t->vols_seen = vst.st_size; /* after a cut: what load_layout read */
+        t->vols_seen = stamp_of(&vst); /* after a cut: what load_layout read */
     if (vfd >= 0)
         close(vfd);
     pthread_rwlock_unlock(&t->lock);
@@ -868,12 +887,12 @@ static eng *volume_at(tsdb *t, size_t v, bool reload)
     bool grown = reload && fstatat(t->dirfd, VOLUMES_FILE, &st, 0) == 0;
     pthread_rwlock_rdlock(&t->lock);
     eng *e = v < t->nvols ? t->vols[v] : NULL;
-    grown = grown && st.st_size != t->vols_seen;
+    grown = grown && !stamp_same(&t->vols_seen, &st);
     pthread_rwlock_unlock(&t->lock);
     if (!e && grown) {
         pthread_rwlock_wrlock(&t->lock);
         if (load_layout(t) == 0)
-            t->vols_seen = st.st_size;
+            t->vols_seen = stamp_of(&st);
         e = v < t->nvols ? t->vols[v] : NULL;
         pthread_rwlock_unlock(&t->lock);
     }
@@ -958,6 +977,11 @@ static int reload_volumes(tsdb *t)
     int rc = volumes_lock(fd, F_WRLCK); /* the writer cuts a torn tail, as at open */
     if (rc == 0)
         rc = volumes_parse(fd, true, t->opt.fsync, &paths, &n, &size);
+    struct stat st = {0};
+    if (size >= 0 && fstat(fd, &st) != 0) { /* after our cut, under the lock: what was parsed */
+        rc = rc ? rc : TSDB_ERR_IO;
+        size = -1;
+    }
     close(fd);
     pthread_rwlock_wrlock(&t->lock);
     for (size_t i = 0; rc == 0 && i + 1 < t->nvols && i < n; i++)
@@ -971,8 +995,8 @@ static int reload_volumes(tsdb *t)
         rc = volume_open(t, paths[i], &idx);
     }
     pthread_rwlock_unlock(&t->lock);
-    if (rc == 0 || (rc == TSDB_ERR_CORRUPT && size >= 0)) { /* an I/O error is tried again */
-        t->vols_seen = size;
+    if (size >= 0 && (rc == 0 || rc == TSDB_ERR_CORRUPT)) { /* an I/O error is tried again */
+        t->vols_seen = stamp_of(&st);
         t->vols_rc = rc;
     }
     paths_free(paths, n);
@@ -1032,7 +1056,7 @@ static int volume_resolve(tsdb *t, const char *path, const char *norm, const cha
     if (volume_find(t, norm, vol) || (canon[0] && volume_find(t, canon, vol)))
         return 0;
     struct stat st;
-    if (fstatat(t->dirfd, VOLUMES_FILE, &st, 0) == 0 && st.st_size != t->vols_seen) {
+    if (fstatat(t->dirfd, VOLUMES_FILE, &st, 0) == 0 && !stamp_same(&t->vols_seen, &st)) {
         int rc = reload_volumes(t);
         if (rc)
             return rc;

@@ -857,6 +857,51 @@ static void test_hung_volume(const char *base)
     printf("  a hung volume holds up only the name being created in it\n");
 }
 
+/* A reader that saw VOLUMES end in a torn line (here the zeros a power loss leaves) must notice when an add cuts it
+ * and appends a line of the very same length: the size alone does not change. */
+static void test_volumes_same_size(const char *base)
+{
+    char top[600], root[700], v1[800], vols[800];
+    fresh(base, "volsize", top, sizeof top, root, sizeof root);
+    snprintf(v1, sizeof v1, "%s/v1", top);
+    snprintf(vols, sizeof vols, "%s/VOLUMES", root);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.create_volumes = 0;
+    tsdb *w = NULL, *f = NULL;
+    OK(tsdb_open(root, &o, &w));
+    tsdb_sid a, x, fx;
+    OK(tsdb_series(w, "a", &a));
+    char zeros[1024] = {0};
+    size_t line_len = 9 + strlen(v1) + 1; /* "%08x " path "\n" */
+    int fd = open(vols, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    CHECK(fd >= 0 && write(fd, zeros, line_len) == (ssize_t)line_len);
+    if (fd >= 0)
+        close(fd);
+    tsdb_options ro = o;
+    ro.read_only = 1;
+    OK(tsdb_open(root, &ro, &f));
+    CHECK(tsdb_series_lookup(f, "x", &fx) == TSDB_ERR_NOTFOUND); /* reads VOLUMES: the torn line */
+    struct stat before, after;
+    CHECK(stat(vols, &before) == 0);
+    usleep(20000);
+    uint32_t idx = 0;
+    OK(tsdb_volume_add_dir(root, v1, &idx)); /* cuts the zeros, appends its line */
+    CHECK(idx == 1);
+    CHECK(stat(vols, &after) == 0 && after.st_size == before.st_size);
+    OK(tsdb_series_at(w, "x", v1, &x));
+    CHECK(x == TSDB_SID(1, 0));
+    int rc = tsdb_series_lookup(f, "x", &fx);
+    if (rc != 0)
+        fprintf(stderr, "  a reader misses a volume whose VOLUMES line replaced a torn one of the same size\n");
+    CHECK(rc == 0 && fx == x);
+    OK(tsdb_close(f));
+    OK(tsdb_close(w));
+    remove_tree(top);
+    printf("  a volume line that replaces a torn one of the same size is seen\n");
+}
+
 /* Power lost at every step of "tsdb <dir> volume add" (the crashfs shim), and
  * just after it reported success: the database opens again each time, and
  * the volume it reported is there. A VOLUMES line whose directory entry was
@@ -1575,6 +1620,7 @@ int main(int argc, char **argv)
     test_readd_other_path(base);
     test_new_meta_write(base);
     test_hung_volume(base);
+    test_volumes_same_size(base);
     test_add_power_loss(base, argv[0]);
     test_series_ids(base);
     test_unique_names(base);
