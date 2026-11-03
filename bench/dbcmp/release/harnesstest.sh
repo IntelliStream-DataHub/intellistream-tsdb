@@ -94,7 +94,8 @@ eval "$(sed -n -e '/^tstep() {/,/^}/p' -e '/^phase6() {/,/^}/p' -e '/^twabsuite(
     -e '/^twab_dir() {/,/^}/p' -e '/^twa_single_failed() {/,/^}/p' -e '/^nocheck() {/,/^}/p' -e '/^aside() {/,/^}/p' \
     -e '/^tsdbsuite() {/,/^}/p' -e '/^class_wanted() {/,/^}/p' -e '/^tsdbbsuite() {/,/^}/p' \
     -e '/^phase6many() {/,/^}/p' -e '/^tree_commit() {/,/^}/p' -e '/^chbsuite() {/,/^}/p' -e '/^twasuite() {/,/^}/p' \
-    -e '/^p2_ch() {/,/^}/p' -e '/^p2_ts() {/,/^}/p' "$HERE/run.sh")"
+    -e '/^p2_ch() {/,/^}/p' -e '/^p2_ts() {/,/^}/p' -e '/^agg_wanted() {/,/^}/p' -e '/^p2_tsdb() {/,/^}/p' \
+    -e '/^p2_qdb() {/,/^}/p' "$HERE/run.sh")"
 expect() { # NAME CONDITION...: one case
     if eval "${*:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
 }
@@ -213,6 +214,28 @@ got=$(cat "$X6/reps.log")
 want=$(printf '%s\n' "tsdbq.full.b1 $OUT/p2/tsdb REPS=2" "tsdbq.point.c1 $OUT/p2/tsdb REPS=2" "tsdbq.point.c32 $OUT/p2/tsdb REPS=2" \
     "tsdbq.full.b10 $OUT/p2/tsdb REPS=2" "tsdbq.point.b10.c1 $OUT/p2/tsdb REPS=2" "tsdbq.point.b10.c32 $OUT/p2/tsdb REPS=2")
 expect "MANY_CLIENTS: tsdbbsuite without the option still times the whole range, 1 and NHI clients" '[ "$got" = "$want" ]'
+# the TWA batch classes in the extra-clients pass (tsdb and QuestDB): CLASS_FILTER may list substrings, "twa1d.b100
+# twa7d.b100" picks exactly the two batches of 100 windows (the substring "twa" would take the batches of 10 as well)
+cw() { CLASS_FILTER="$1" class_wanted "$2" && echo yes || echo no; }
+expect "class_wanted: a list of substrings picks exactly the classes it names" \
+    '[ "$(cw "twa1d.b100 twa7d.b100" twa1d.b100)$(cw "twa1d.b100 twa7d.b100" twa7d.b100)$(cw "twa1d.b100 twa7d.b100" twa1d.b10)$(cw "twa1d.b100 twa7d.b100" raw.b100)" = yesyesnono ]'
+expect "class_wanted: one substring, and no filter at all, as before" \
+    '[ "$(cw b100 raw.b100)$(cw b100 raw.b10)$(cw "" anything)" = yesnoyes ]'
+expect "agg_wanted: no aggregate batch class under the TWA filter, some under b100 or no filter" \
+    '[ "$(KS="1 10 100" BCLASSES="raw agg1d" CLASS_FILTER="twa1d.b100 twa7d.b100" agg_wanted && echo y || echo n)$(KS="1 10 100" BCLASSES="raw agg1d" CLASS_FILTER=b100 agg_wanted && echo y || echo n)$(KS="1 10 100" BCLASSES="raw agg1d" CLASS_FILTER= agg_wanted && echo y || echo n)" = nyy ]'
+: > "$X6/reps.log"; : > "$P6LOG"
+TWA_KINDS="twad twal" TWA_WKINDS="twa1d twa7d" TWA_KS="10 100" MANY_CLIENTS=16 CLASS_FILTER="twa1d.b100 twa7d.b100" XREPS=3 REPS=1 \
+    tsdbtwab "$OUT/p2/tsdb/p6" ""
+got=$(cat "$X6/reps.log")
+want=$(printf '%s\n' "twa1d.b100.c16 $OUT/p2/tsdb/p6 REPS=3" "twa7d.b100.c16 $OUT/p2/tsdb/p6 REPS=3")
+expect "MANY_CLIENTS: tsdbtwab times the TWA window batches of 100 at 16 clients, 3 runs each; no whole-range request, no 1 or 32 clients" \
+    '[ "$got" = "$want" ]'
+expect "MANY_CLIENTS: tsdbtwab checks only those two forms first (relq --batch 100)" \
+    '[ "$(grep -c -- "--batch" "$P6LOG")" = 2 ] && [ "$(grep -c -- "--batch 100\$" "$P6LOG")" = 2 ]'
+: > "$X6/reps.log"
+TWA_KINDS="twad twal" TWA_WKINDS="twa1d" TWA_KS="10" XREPS=3 REPS=1 tsdbtwab "$OUT/p2/tsdb/p6" ""
+expect "MANY_CLIENTS: tsdbtwab without the option still times the whole range and 1 and 32 clients" \
+    '[ "$(wc -l < "$X6/reps.log")" = 5 ] && grep -q "^twa1d.b10.c32 " "$X6/reps.log" && grep -q "^twal.b100.c1 " "$X6/reps.log"'
 # a tree made by git archive has no repository: its commit is the file COMMIT
 mkdir -p "$X6/arch" "$X6/bare"; echo "0123456789abcdef0123456789abcdef01234567 main" > "$X6/arch/COMMIT"
 expect "tree_commit: a tree without a repository gives the commit in its COMMIT file" \
@@ -355,6 +378,12 @@ expect "MANY_CLIENTS: a kind with no wanted batch class is not even checked" \
 TWA_KINDS="" TWA_WKINDS=twa1d TWA_KS=10 REPS=1 twabsuite ch "$MD" ch
 expect "MANY_CLIENTS: twabsuite without the option still times 1 and NHI clients" \
     '[ "$(cat "$X6/tstep.log")" = "$(printf "%s\n" "ch.twa1d.b10.c1 r1" "ch.twa1d.b10.c32 r1")" ]'
+# a QuestDB variant: twasuite (rel.py's QuestDB form) checks the single windows of the wanted kinds and times their batches
+: > "$X6/reps.log"; : > "$X6/rel.log"; mkdir -p "$OUT/p2/qdb-parquet-zstd/p6"
+MANY_CLIENTS=16 CLASS_FILTER="twa1d.b100 twa7d.b100" XREPS=3 REPS=1 twasuite qdb "$OUT/p2/qdb-parquet-zstd/p6" pg conn
+want=$(printf '%s\n' "qdb-parquet-zstd.twa1d.b100.c16 $OUT/p2/qdb-parquet-zstd/p6 REPS=3" "qdb-parquet-zstd.twa7d.b100.c16 $OUT/p2/qdb-parquet-zstd/p6 REPS=3")
+expect "MANY_CLIENTS: twasuite on a QuestDB variant times the two TWA batches of 100 at 16 clients, named by the variant" \
+    '[ "$(cat "$X6/reps.log")" = "$want" ] && [ "$(cat "$X6/rel.log")" = "$(printf "%s\n" "check qdb twa1d" "check qdb twa7d")" ]'
 # p2_ch and p2_ts with the pass: stub loads, checks and suites that log; the branch must call the batch suites (and the
 # probe for ts) and none of the 1/32-client classes, the merged table, LTTB or the -ha image
 mkdir -p "$X6/h"
@@ -381,4 +410,32 @@ H=$X6/h DBCMP=$X6/db MANY_CLIENTS=16 CLASS_FILTER=b100 REPS=1 XREPS=5 LOADS_FROM
 want=$(printf '%s\n' "ts_start rb-ts" "probe $OUT/p2/ts/p6" "bcheck ts" "bsuite ts ts $OUT/p2/ts/p6 MANY_CONN=probed" "ctr_mem rb-ts" "runstats $OUT/p2/ts/p6")
 expect "p2_ts with MANY_CLIENTS: the probe's setting reaches the batch classes; no qsuite, no -ha image load" \
     '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ]'
+# p2_tsdb and p2_qdb with the pass: with CLASS_FILTER=b100 the aggregate classes' check and suites and the TWA batches; with
+# the two TWA classes of 100 named, the TWA batches only (no answer check or suite of the aggregate classes, which the
+# earlier pass timed)
+mkdir -p "$X6/qh"
+tsdbd_start() { echo "tsdbd_start" >> "$X6/p2.log"; }; tsdbd_stop() { echo "tsdbd_stop" >> "$X6/p2.log"; }
+tsdb_self() { echo "tsdb_self" >> "$X6/p2.log"; }
+tsdbbsuite() { echo "tsdbbsuite $1 $2" >> "$X6/p2.log"; }
+tsdbtwab() { echo "tsdbtwab $1 [$2]" >> "$X6/p2.log"; }
+qdb_start() { echo "qdb_start" >> "$X6/p2.log"; }; QX() { :; }
+twasuite() { echo "twasuite $1 $2 $3" >> "$X6/p2.log"; }
+for f in b100 "twa1d.b100 twa7d.b100"; do
+    : > "$X6/p2.log"
+    H=$X6/h DBCMP=$X6/db KS="1 10 100" BCLASSES="raw agg1d" MANY_CLIENTS=16 CLASS_FILTER="$f" REPS=1 XREPS=5 LOADS_FROM=1 SWEEP_SUB=/p6 p2_tsdb; rc=$?
+    if [ "$f" = b100 ]; then
+        want=$(printf '%s\n' "tsdbd_start" "tsdb_self" "tsdbbsuite tsdbq $OUT/p2/tsdb/p6" "tsdbtwab $OUT/p2/tsdb/p6 []" "tsdbd_stop" "runstats $OUT/p2/tsdb/p6")
+    else
+        want=$(printf '%s\n' "tsdbd_start" "tsdbtwab $OUT/p2/tsdb/p6 []" "tsdbd_stop" "runstats $OUT/p2/tsdb/p6")
+    fi
+    expect "p2_tsdb with MANY_CLIENTS and CLASS_FILTER '$f': [$(echo "$want" | tr '\n' ',')]" '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ]'
+    : > "$X6/p2.log"
+    H=$X6/h DBCMP=$X6/db KS="1 10 100" BCLASSES="raw agg1d" MANY_CLIENTS=16 CLASS_FILTER="$f" REPS=1 XREPS=5 LOADS_FROM=1 SWEEP_SUB=/p6 p2_qdb 0; rc=$?
+    if [ "$f" = b100 ]; then
+        want=$(printf '%s\n' "qdb_start" "bcheck qdb" "bsuite qdb qdb $OUT/p2/qdb/p6 MANY_CONN=" "twasuite qdb $OUT/p2/qdb/p6 pg" "ctr_mem rb-qdb" "runstats $OUT/p2/qdb/p6")
+    else
+        want=$(printf '%s\n' "qdb_start" "twasuite qdb $OUT/p2/qdb/p6 pg" "ctr_mem rb-qdb" "runstats $OUT/p2/qdb/p6")
+    fi
+    expect "p2_qdb with MANY_CLIENTS and CLASS_FILTER '$f': [$(echo "$want" | tr '\n' ',')]" '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ]'
+done
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }

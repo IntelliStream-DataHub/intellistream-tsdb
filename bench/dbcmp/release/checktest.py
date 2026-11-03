@@ -412,6 +412,43 @@ def many_cases():
         case("many: with the peak from p6/'s mem file and ClickHouse's own limit", True,
              "rb-ch peak 43.9 GB with the page cache (43.8 GB without)" in row and "20.0 GB held when the class started" in row
              and "limit 43.20 GiB" in row)
+        # QuestDB's TWA batch classes (p6/, 100 windows per request) failed at 32 clients too, in two ways: every run turned away
+        # with "table busy [reason=pool size exceeded]" (its pool of table readers; the runs left only .refused files), and
+        # Java's "GC overhead limit exceeded" in a run file. The first is not a memory failure and must not be called one;
+        # the second is. Both have a 16-client result of the pass (CLASS_FILTER="twa1d.b100 twa7d.b100") to compare with
+        v = "qdb-zstd"
+        q = os.path.join(d, "qdb", "p6")
+        os.makedirs(q)
+        busy = "query failed: status 7: ERROR:  table busy [reason=pool size exceeded]\nLINE 1: WITH seg0 AS (SELECT 1\n"
+        open(os.path.join(q, v + ".twa1d.b100.c32.mean.txt"), "w").write("query failed   # TEXT DIFFERS between runs\n")
+        for r in (1, 2, 3):
+            open(os.path.join(q, "%s.twa1d.b100.c32.%d.refused" % (v, r)), "w").write(busy)
+            open(os.path.join(q, "%s.twa1d.b100.c32.%d.mem" % (v, r)), "w").write(
+                "rb-qdb peak 20134887424 nocache 20131094528 start 11896238080 startnocache 11898015744\n")
+        open(os.path.join(q, "REFUSED.txt"), "w").write(
+            "p6 %s.twa1d.b100.c32 r1: refused by the server: table busy [reason=pool size exceeded]\n" % v)
+        open(os.path.join(q, v + ".twa1d.b100.c16.mean.txt"), "w").write(T16)
+        open(os.path.join(q, v + ".twa7d.b100.c32.mean.txt"), "w").write("query failed   # TEXT DIFFERS between runs\n")
+        open(os.path.join(q, v + ".twa7d.b100.c32.1"), "w").write("query failed: status 7: ERROR:  GC overhead limit exceeded\n")
+        open(os.path.join(q, v + ".twa7d.b100.c32.1.mem"), "w").write(
+            "rb-qdb peak 26307772416 nocache 26303283200 start 20124196864 startnocache 20144574464\n")
+        open(os.path.join(q, v + ".twa7d.b100.c16.mean.txt"), "w").write(T16)
+        tables.errors.clear()
+        text = [r if isinstance(r, str) else r[1] for r in tables.results_table(os.path.join(d, "qdb"))]
+        row = next((l for l in text if l.startswith("| p6: %s.twa1d.b100.c32 " % v)), "")
+        case("many: QuestDB's TWA batch refused by its reader pool says so, with the reason, and is not called out of memory", True,
+             "the 32-client run was refused (3 x table busy [reason=pool size exceeded])" in row
+             and "not its memory" in row and "ran out of memory" not in row)
+        case("many: and names the 16-client row of the TWA batch as the comparison", True,
+             "The 16-client run (%s.twa1d.b100.c16) is the comparison" % v in row and "no run timed: 3 x table busy" in row)
+        row = next((l for l in text if l.startswith("| p6: %s.twa7d.b100.c32 " % v)), "")
+        case("many: QuestDB's TWA batch that ran Java out of memory says so, with the peak", True,
+             "the 32-client run ran out of memory (1 x GC overhead limit exceeded)" in row
+             and "rb-qdb peak 24.5 GB with the page cache (24.5 GB without)" in row
+             and "The 16-client run (%s.twa7d.b100.c16) is the comparison" % v in row)
+        case("many: the 16-client TWA rows are in the table (p6:)", True,
+             all(any(l.startswith("| p6: %s.%s.b100.c16 " % (v, k)) and "10.7 q/s" in l for l in text) for k in ("twa1d", "twa7d")))
+        case("many: tables.py has no error for the QuestDB TWA classes", True, not tables.errors)
         # how.py p6 with MANY_CLIENTS adds the pass to the block and names TimescaleDB's parallel-worker setting
         h = os.path.join(d, "ts")
         os.makedirs(os.path.join(h, "p6"))
@@ -430,6 +467,27 @@ def many_cases():
         many = json.load(open(os.path.join(h, "how.json")))["p6"].get("many", "")
         case("many: how.py p6 names the parallel-worker setting the pass used", True,
              "16-client pass" in many and "setting: max_parallel_workers_per_gather=2 in the 16-client classes" in many)
+        # a second pass on the same system (the TWA batches after the aggregate classes) is added, not substituted
+        os.environ.update(MANY_CLIENTS="16", CLASS_FILTER="twa1d.b100 twa7d.b100", XREPS="3", T=d, TSDB_TREE=d)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                how.p6(h)
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
+        many = json.load(open(os.path.join(h, "how.json")))["p6"].get("many", "")
+        case("many: how.py p6 keeps the earlier pass's description when another pass is added", True,
+             "classes 'b100' at 16" in many and "classes 'twa1d.b100 twa7d.b100' at 16" in many)
+        os.environ.update(MANY_CLIENTS="16", CLASS_FILTER="twa1d.b100 twa7d.b100", XREPS="3", T=d, TSDB_TREE=d)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                how.p6(h)
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
+        many = json.load(open(os.path.join(h, "how.json")))["p6"].get("many", "")
+        case("many: and a rerun of a pass does not repeat it", True, many.count("classes 'twa1d.b100 twa7d.b100'") == 1
+             and many.count("classes 'b100'") == 1)
     finally:
         shutil.rmtree(d)
         tables.errors.clear()

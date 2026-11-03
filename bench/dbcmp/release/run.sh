@@ -32,10 +32,23 @@ NHI=${NHI:-32} NPER=${NPER:-16}
 # p2/<sys>/p6/ as NAME.cN. Written for the 100-series batches (.b100) that QuestDB's, ClickHouse's (twa7d.b100: its
 # memory limit) and TimescaleDB's memory could not carry at 32 clients: the systems are then compared at 16, and the
 # 32-client rows stay what they were, failures with their reason (tables.py). ClickHouse also times the TWA batch
-# classes (twa1d.b100, twa7d.b100); TimescaleDB's TWA needs the toolkit image and a load of its own: not in this pass
+# classes (twa1d.b100, twa7d.b100), and so do tsdb and QuestDB (qdb0-qdb2: their TWA batch classes failed at 32 clients
+# as well); TimescaleDB's TWA needs the toolkit image and a load of its own: not in this pass.
+# CLASS_FILTER is one substring or several separated by spaces ("twa1d.b100 twa7d.b100": exactly the two TWA batch
+# classes of 100 windows, where "twa" would also pick the batches of 10)
 MANY_CLIENTS=${MANY_CLIENTS-} CLASS_FILTER=${CLASS_FILTER-}
-class_wanted() { # CLASS: CLASS_FILTER (a substring such as b100) picks the classes whose name contains it; empty: all
-    [ -z "${CLASS_FILTER-}" ] || case $1 in *"$CLASS_FILTER"*) true ;; *) false ;; esac
+class_wanted() { # CLASS: CLASS_FILTER (substrings such as b100) picks the classes whose name contains one of them; empty: all
+    local f
+    [ -z "${CLASS_FILTER-}" ] && return 0
+    set -f   # a filter is text, never a glob
+    for f in $CLASS_FILTER; do case $1 in *"$f"*) set +f; return 0 ;; esac; done
+    set +f; return 1
+}
+agg_wanted() { # is one of the aggregate / raw / point batch classes (BCLASSES at KS) wanted? An extra-clients pass for the
+               # TWA batch classes only (CLASS_FILTER="twa1d.b100 twa7d.b100") then skips their answer check and suites
+    local c k
+    for k in $KS; do for c in $BCLASSES; do class_wanted "$c.b$k" && return 0; done; done
+    return 1
 }
 CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot rb-td rb-vm"
 PORTS_RE=':(7070|8123|9000|9004|9005|9009|5434|9100|9103|8812|9109|8086|9999|8181|9090|9091|6667|18080|6041|8428)\b'
@@ -693,19 +706,23 @@ tsdbtwa() { # DIR PREFIX CONNS...: relq for every TWA kind (windows at 1 and 32 
 # Each form's answers are checked against ref/ (relq --batch dump, rel.py jsonl) before it is timed; REPS runs of one
 # timing each (runstats: KIND.b100.c1.mean.txt). In p6 (DIR .../memsweep) into tsdb's p6/ directory, XREPS runs.
 tsdbtwab() { # DIR PREFIX
-    local D P=$2 k K t w=$WORK/self REPS=${XREPS:-$REPS}
+    local D P=$2 k K t w=$WORK/self REPS=${XREPS:-$REPS} ths="1 $NHI" kinds="twa $TWA_KINDS"
+    # MANY_CLIENTS (the extra-clients pass): only the window batches CLASS_FILTER names, at that many clients; no
+    # whole-range request (one connection, no client count to change)
+    [ -n "${MANY_CLIENTS-}" ] && { ths=$MANY_CLIENTS; kinds=; }
     D=$(twab_dir "$1")
     mkdir -p "$w" "$D"
-    for k in twa $TWA_KINDS; do
+    for k in $kinds; do
         untimed "$D/check-$P$k.b100.txt" bash -c "'$B/relq' $k 1 1 '$w/$P$k.b100.jsonl' --batch 100 && python3 -I '$TOOLS/rel.py' jsonl $k '$WORK/ref/$k.jsonl' '$w/$P$k.b100.jsonl'" || continue
         reps "$P$k.b100.c1" "$D" -- "$B/relq" "$k" 1 1 --batch 100
     done
     for k in $TWA_WKINDS; do for K in $TWA_KS; do
+        class_wanted "$k.b$K" || continue
         [ "$K" -le "${TWA_N:-1000}" ] || { log "  tsdb $P$k.b$K: only TWA_N=${TWA_N:-1000} windows, no batch of $K"; continue; }
         untimed "$D/check-$P$k.b$K.txt" bash -c "TWA_SPEC='$WORK/spec.tsv' '$B/relq' $k 1 1 '$w/$P$k.b$K.jsonl' --batch $K && python3 -I '$TOOLS/rel.py' jsonl $k '$WORK/ref/$k.jsonl' '$w/$P$k.b$K.jsonl'" || continue
         limited "$STEP_TIMEOUT" "$D/warm.$P$k.b$K" env TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" 1 "$WARM_SECS" 9>&- \
             || { fail "tsdb $P$k.b$K warm-up failed (see $D/warm.$P$k.b$K)"; continue; }
-        for t in 1 $NHI; do reps "$P$k.b$K.c$t" "$D" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" "$t" "$SECS"; done
+        for t in $ths; do reps "$P$k.b$K.c$t" "$D" -- env TWA_SPEC="$WORK/spec.tsv" "$B/relq" qps "$k.b$K" "$t" "$SECS"; done
     done; done
 }
 chbench1() { # CONC ITER|0 SECONDS|0 FILE [SETTING=V...]: FILE's SQL lines as HTTP POSTs through qdrive, its summary
@@ -1276,7 +1293,8 @@ p2_tsdb() {
     ports_check "$D/ports.txt"
     cd "$WORK" || return 1
     if [ -n "${MANY_CLIENTS-}" ]; then  # the extra-clients pass (phase6many): this load, the batches' answer check, the CLASS_FILTER classes
-        untimed "$D/check-self.txt" tsdb_self "" && tsdbbsuite tsdbq "$D"
+        agg_wanted && { untimed "$D/check-self.txt" tsdb_self "" && tsdbbsuite tsdbq "$D"; }
+        tsdbtwab "$D" ""   # the TWA window batches among them (each form's answers are checked first)
         tsdbd_stop
         cd "$OUT" || true
         runstats "$D"
@@ -1467,7 +1485,10 @@ p2_qdb() { # PARQUET(0|1|2): native, Parquet LZ4_RAW (QuestDB's default codec), 
     untimed "$D/check.txt" python3 -I "$H/check.py" qdb 200
     local PG="host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb"
     if [ -n "${MANY_CLIENTS-}" ]; then  # the extra-clients pass (phase6many): this load, the batches' answer check, the CLASS_FILTER classes
-        bcheck qdb "$D" && bsuite qdb "$P" "$D" pg "$PG"
+        agg_wanted && { bcheck qdb "$D" && bsuite qdb "$P" "$D" pg "$PG"; }
+        # the TWA window batches among them: twasuite checks the single windows of the wanted kinds, then twabsuite
+        # times the wanted classes with rel.py's QuestDB form (split_once once=True, as TWA_RETIME=qdb)
+        twasuite qdb "$D" pg "$PG"
         cd "$OUT" || true
         ctr_mem rb-qdb "$D/mem.txt"
         crm rb-qdb; rmdata "$W"
@@ -2153,7 +2174,9 @@ usage: run.sh PHASE...      (env.sh has the paths; REPS, SECS, FORCE=1, P1_SYSTE
              p2/<sys>/p6/), every other class once with its peak memory (p2/<sys>/memsweep/); P6_SYSTEMS picks
              MANY_CLIENTS=16 CLASS_FILTER=b100 P6_SYSTEMS="tsdb qdb0 qdb1 qdb2" run.sh p6: only the extra-clients
              pass instead: one load each, the classes whose name contains CLASS_FILTER at that many clients, REPS
-             runs, into p2/<sys>/p6/NAME.c16 (the 32-client rows and the sweep stay; marker p6/<sys>.c16.done)
+             runs, into p2/<sys>/p6/NAME.c16 (the 32-client rows and the sweep stay; marker p6/<sys>.c16.done).
+             CLASS_FILTER may list several substrings: CLASS_FILTER="twa1d.b100 twa7d.b100" times only the TWA
+             batches of 100 windows (tsdb, qdb0-qdb2, ch), without the aggregate classes' check or suites
   all        prep p1 p2 p3 p4
   smoke      every system end to end on tiny data, every check must pass (DBCMP=/var/tmp/dbcmp-smoke)
   checktest  the answer checker against a crafted data set and mutated answers

@@ -23,7 +23,10 @@ system's how.json p6 block (when, runs, trees, its '-' reasons and refusals) is 
 The extra-clients pass (run.sh phase6many: MANY_CLIENTS=16 CLASS_FILTER=b100 for tsdb, QuestDB, ClickHouse and TimescaleDB) puts NAME.c16 files
 there too. A 32-client class that failed (no run timed, or runs killed or refused) and has a NAME.c16 result gets a
 note in its flags: it ran out of memory, with the peak, the limit and the memory held before the class (from its
-.mem files), and the 16-client row is the comparison; the 32-client row itself stays a failure.
+.mem files), and the 16-client row is the comparison; the 32-client row itself stays a failure. That covers the TWA batch
+classes in p6/ (twa1d.b100, twa7d.b100) of every system that has a 16-client run of them; QuestDB's, turned away by its
+pool of table readers ("table busy"), are said to be refused, not out of memory. The run files' reasons include the
+.refused, .oom and .died files of a run that left nothing else.
 """
 import glob, json, os, re, sys
 
@@ -116,7 +119,7 @@ def picked(f):
 
 
 FAILURE = re.compile(r"Code: 241[^.]*\.[^.]*memory limit exceeded|memory limit exceeded|global RSS memory limit exceeded|"
-                     r"table busy[^\n]*|server closed the connection unexpectedly|query timed out after \d+ s|"
+                     r"GC overhead limit exceeded|Java heap space|table busy[^\n]*|server closed the connection unexpectedly|query timed out after \d+ s|"
                      r"STEP TIMEOUT[^\n]*|status -1|code.? ?719[^\n]*")
 
 
@@ -124,10 +127,13 @@ def run_failures(f):
     """What the runs of a mean file that has no timing died of, from the run files: the server's own error where
     it gave one (ClickHouse's Code 241, QuestDB's RSS limit, IoTDB's 719), else the client's (a cut-off reply, a
     timeout), counted per kind; '' when no run file names a failure."""
-    base, seen = f[:-len(".mean.txt")], {}
+    base, seen, runs = f[:-len(".mean.txt")], {}, {}
     for g in sorted(glob.glob(base + ".*")):
-        if not re.fullmatch(re.escape(base) + r"\.\d+", g):
-            continue
+        m = re.fullmatch(re.escape(base) + r"\.(\d+)(\.refused|\.oom|\.died)?", g)
+        if m:  # a run's own file first; a run that left only its .refused / .oom / .died file is read from that
+            runs.setdefault(m.group(1), []).append(g)
+    for n in sorted(runs, key=int):
+        g = sorted(runs[n], key=lambda x: x != base + "." + n)[0]
         m = FAILURE.search(open(g, errors="replace").read(20000))
         if m:
             k = " ".join(m.group(0).split())[:90]
@@ -323,6 +329,11 @@ def many_note(d, name, lines, flags):
     why = run_failures(os.path.join(d, name + ".mean.txt")) if os.path.exists(os.path.join(d, name + ".mean.txt")) else ""
     mem = "; ".join("%s peak %s with the page cache (%s without), %s held when the class started" % (
         k, gb(v[0]), gb(v[1]), gb(v[2])) for k, v in sorted(best.items())) or "memory not recorded"
+    if why and all("table busy" in k for k in why.split("; ")):
+        # QuestDB's TWA batches of 100 windows at 32 clients: every run was turned away because more queries wanted
+        # a table than its pool of readers holds. Not a memory failure, and the note must not say it was
+        return ("the 32-client run was refused (%s): QuestDB's pool of table readers was exhausted, not its memory (%s). "
+                "The 16-client run (%s) is the comparison" % (why, mem, os.path.basename(f16)[:-len(".mean.txt")]))
     return ("the 32-client run ran out of memory%s: %s; limit %s. The 16-client run (%s) is the comparison" % (
         " (" + why + ")" if why else "", mem, limit or anylimit or "not recorded", os.path.basename(f16)[:-len(".mean.txt")]))
 

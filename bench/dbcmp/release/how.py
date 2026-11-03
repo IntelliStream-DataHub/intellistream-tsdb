@@ -363,15 +363,23 @@ def p6(d):
         # the extra-clients pass (run.sh phase6many) adds to the block of the pass before it: its date, trees and
         # TWA runs stay; p6/REFUSED.txt now holds this pass's refusals too
         h["p6"]["refused"] = refused
-        h["p6"]["many"] = ("%s-client pass (MANY_CLIENTS) of the classes '%s' at %s: REPS=%s runs each into p6/ (names "
-                           "NAME.c%s), on a load of its own, %s; tsdb %s, %s" % (
-                               many, os.environ.get("CLASS_FILTER", "") or "all", many, os.environ.get("XREPS", "?"), many,
-                               time.strftime("%Y-%m-%d %H:%M"), v, tree))
+        text = ("%s-client pass (MANY_CLIENTS) of the classes '%s' at %s: REPS=%s runs each into p6/ (names "
+                "NAME.c%s), on a load of its own, %s; tsdb %s, %s" % (
+                    many, os.environ.get("CLASS_FILTER", "") or "all", many, os.environ.get("XREPS", "?"), many,
+                    time.strftime("%Y-%m-%d %H:%M"), v, tree))
         # TimescaleDB's multi-client classes run with fewer parallel workers per query when it ran out of memory with
         # the default (run.sh ts_many_probe): the setting this pass used is part of how its rows were made
         par = lines(os.path.join(d, "p6", "many-parallel.txt"))
         if par:
-            h["p6"]["many"] += "; setting: " + par[0]
+            text += "; setting: " + par[0]
+        # a system gets several passes (the aggregate classes b100, then the TWA batches): each stays, keyed by its
+        # client count and class filter, so a later pass does not replace the description of an earlier one
+        passes = h["p6"].get("many_passes", {})
+        if h["p6"].get("many") and not passes:
+            passes["earlier"] = h["p6"]["many"]
+        passes["%s|%s" % (many, os.environ.get("CLASS_FILTER", ""))] = text
+        h["p6"]["many_passes"] = passes
+        h["p6"]["many"] = " || ".join(passes[k] for k in sorted(passes))
         with open(f, "w") as o:
             json.dump(h, o, indent=1, sort_keys=True)
             o.write("\n")
