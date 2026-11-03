@@ -375,7 +375,7 @@ impl Drop for Db {
 
 /// The `TSDB_ABI_VERSION` this crate was written for. A struct can keep its size while its fields move
 /// (`tsdb_series_result` did when ids became 64 bits), so the engine's number is compared, not sizes.
-const ABI_VERSION: c_int = 1;
+const ABI_VERSION: c_int = 2;
 
 fn check_abi(found: c_int) -> Result<()> {
     if found != ABI_VERSION {
