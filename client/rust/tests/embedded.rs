@@ -608,7 +608,8 @@ fn a_locked_directory_fails_cleanly() {
     assert_eq!(again.series_lookup("x").unwrap(), id);
     assert!(again.failed().is_none());
     assert!(!again.parts().unwrap().is_empty());
-    assert_eq!(again.volumes()[0], dir.to_str().unwrap());
+    // volume paths are canonical (macOS: the temporary directory is a link, /var -> /private/var)
+    assert_eq!(again.volumes()[0], dir.canonicalize().unwrap().to_str().unwrap());
     assert!(!Db::simd_level().is_empty());
     done(again);
 }

@@ -240,7 +240,7 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
     if (db->ret_fd < 0) {
         bool existed = faccessat(db->dirfd, RET_FILE, F_OK, 0) == 0;
         db->ret_fd = openat(db->dirfd, RET_FILE, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
-        if (db->ret_fd < 0 || (!existed && db->opt.fsync && fsync(db->dirfd) != 0)) {
+        if (db->ret_fd < 0 || (!existed && db->opt.fsync && tsdb_fsync(db->dirfd) != 0)) {
             pthread_mutex_unlock(&db->ret_lock);
             return TSDB_ERR_IO;
         }
@@ -254,7 +254,7 @@ int eng_set_retention(eng *db, uint32_t series, int64_t limit_ms)
     do
         w = pwrite(db->ret_fd, rec, RET_REC, (off_t)db->ret_off);
     while (w < 0 && errno == EINTR);
-    if (w != RET_REC || (db->opt.fsync && fdatasync(db->ret_fd) != 0)) {
+    if (w != RET_REC || (db->opt.fsync && tsdb_fdatasync(db->ret_fd) != 0)) {
         db->ret_broken = true; /* the file may end in a torn record: append no more */
         pthread_mutex_unlock(&db->ret_lock);
         return TSDB_ERR_IO;

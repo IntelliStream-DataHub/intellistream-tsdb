@@ -211,7 +211,7 @@ static void *helper_main(void *a)
     sched *s = h->s;
     is_helper_thread = true;
     /* Named for top -H and for tests that count the helpers (test_sched's test_volumes). */
-    pthread_setname_np(pthread_self(), "tsdb-query");
+    tsdb_thread_name("tsdb-query");
     pthread_mutex_lock(&s->m);
     for (;;) {
         if (s->stop)
@@ -444,7 +444,7 @@ sched *sched_new(int query_threads, int request_threads)
         helper *h = &s->h[s->nh];
         h->s = s;
         pthread_cond_init(&h->cv, NULL);
-        if (pthread_create(&h->th, NULL, helper_main, h) != 0) {
+        if (tsdb_thread_create(&h->th, helper_main, h) != 0) {
             pthread_cond_destroy(&h->cv);
             break;
         }

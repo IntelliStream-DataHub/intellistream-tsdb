@@ -24,6 +24,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 #define NS 4
 #define T0 1700000000000LL
 /* internal test hook: switch a series to class cls at the next boundary after its rows (or *at when later) */
@@ -418,7 +420,11 @@ static atomic_int stat_grow;
 
 int fstat(int fd, struct stat *st)
 {
+#ifdef __APPLE__
+    int rc = REAL(fstat)(fd, st);
+#else
     int rc = fstatat(fd, "", st, AT_EMPTY_PATH);
+#endif
     int grow = atomic_exchange(&stat_grow, 0);
     if (rc == 0)
         st->st_size += grow;
@@ -543,7 +549,7 @@ static void test_rowless_series(const char *base)
     tsdb_options_init(&o);
     o.fsync = 0;
     tsdb *w, *r = NULL;
-    tsdb_sid first, late, late2, got = 0;
+    tsdb_sid first, late, late2 = 0, got = 0;
     if (tsdb_open(dir, &o, &w) != 0) {
         CHECK(!"open writer");
         return;

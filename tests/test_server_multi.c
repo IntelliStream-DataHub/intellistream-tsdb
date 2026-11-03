@@ -18,7 +18,10 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
+#ifdef __linux__
 #include <sys/prctl.h>
+#endif
+#include "portable.h"
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
@@ -68,8 +71,12 @@ static pid_t start_server(const char *dir, const char *const *extra)
     if (pid == 0) {
         /* A test that stops early (OK() exits) must not leave its server behind: an orphan keeps the descriptors
          * it inherited, a caller's `flock -s` lock among them, and held one shared for hours. */
+#ifdef __linux__ /* macOS has no parent-death signal: a stopped test may leave its server running */
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent)
             _exit(127);
+#else /* no parent-death signal there: --exit-with-parent below is the only line */
+        (void)parent;
+#endif
         const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-fsync",
                                 "--no-auth"};
         int n = 11;
@@ -574,6 +581,15 @@ static double now_ms(void)
 }
 
 /* anonymous memory of the server: its output buffers and results, not the part files it maps */
+#ifdef __APPLE__ /* no /proc: the physical footprint (dirty and compressed memory, not mapped files) */
+static long rss_anon_kb(pid_t pid) { return tp_footprint_kb(pid, false); }
+static long status_kb(pid_t pid, const char *key) { return tp_footprint_kb(pid, !strcmp(key, "VmHWM")); }
+static bool reset_hwm(pid_t pid)
+{
+    (void)pid;
+    return false; /* the lifetime peak cannot be restarted */
+}
+#else
 static long rss_anon_kb(pid_t pid)
 {
     char path[64], line[256];
@@ -617,6 +633,7 @@ static bool reset_hwm(pid_t pid)
     bool ok = fputs("5", f) >= 0;
     return fclose(f) == 0 && ok;
 }
+#endif
 
 /* The largest bucket reply a frame carries (with the index, TSDB_MAX_FRAME + 4 at most) goes out whole; one bucket
  * more is TOO_MANY_BUCKETS for that series alone. VALUES chunks that end exactly at a chunk's size. */
@@ -782,7 +799,11 @@ static void test_stall_buckets(pid_t pid)
         fprintf(stderr, "stalled reader, a full frame of buckets (%s, io %s): server anonymous memory grew %ld KiB, "
                         "peak %ld KiB, the result is %ld KiB\n", multi ? "QUERY_MULTI" : "QUERY_BUCKETS",
                 getenv("TSDBD_IO") ? getenv("TSDBD_IO") : "default", grown, peak, result_kb);
+#ifdef __APPLE__ /* the footprint keeps freed pages and compresses others: the slack still catches a second copy (256 MiB) */
+        CHECK(SANITIZED || grown <= result_kb + 192 * 1024L);
+#else
         CHECK(SANITIZED || grown <= result_kb + 48 * 1024L);
+#endif
         /* The peak also counts the engine's working memory before the result is final (64-75 MiB above the result
          * measured on 4-CPU CI runners, 40-70 here); a second copy of the frame would add 256 MiB, rounding the
          * buffer up to 512 MiB more still, so 128 MiB above the result tells the two apart with room for both. */

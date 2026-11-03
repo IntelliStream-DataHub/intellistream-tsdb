@@ -61,7 +61,7 @@ static void unpack_pdep(const uint8_t *in, size_t n, int w, uint32_t *out)
 }
 #endif
 
-static void stat(const double *r, int n, double *m, double *sd)
+static void mean_sd(const double *r, int n, double *m, double *sd)
 {
     double s = 0, q = 0;
     for (int i = 0; i < n; i++)
@@ -162,7 +162,7 @@ int main(int argc, char **argv)
         for (int k = 0; k < NVAR; k++) {
             double m, sd;
             if (have[k]) {
-                stat(r[k], rounds, &m, &sd);
+                mean_sd(r[k], rounds, &m, &sd);
                 printf(" %9.0f (%4.0f)", m, sd);
             } else {
                 printf(" %16s", "-");
@@ -202,7 +202,7 @@ int main(int argc, char **argv)
     double *rr[3] = {r0, r1, r2};
     for (int c = 0; c < 3; c++) {
         double m, sd;
-        stat(rr[c], rounds, &m, &sd);
+        mean_sd(rr[c], rounds, &m, &sd);
         printf("%-24s %9.0f (%4.0f)\n", names[c], m, sd);
     }
     return (int)(sink == 0xdeadbeef); /* keeps sink live */

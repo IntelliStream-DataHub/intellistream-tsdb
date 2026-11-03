@@ -71,7 +71,11 @@ _Static_assert(TINY_F64 <= SIMD_LANES_F64 && SIMD_LANES_F64 == 16, "one value pe
  * replacing the bound only when strictly less, returns the same lane: n operations instead of 2n. */
 /* MINSD/MAXSD (x < y ? x : y, x > y ? x : y) in asm: GCC turned the conditionals into branches, and the
  * intrinsics into extra register moves (zeroing the upper lane) */
-#ifdef __AVX__
+#if !defined(__x86_64__) && !defined(__i386__)
+/* the same as MINSD/MAXSD: (x < y ? x : y), so y when either is NaN or both are zeros (never fmin/fmax) */
+#define TMIN(x, y) ((x) < (y) ? (x) : (y))
+#define TMAX(x, y) ((x) > (y) ? (x) : (y))
+#elif defined(__AVX__)
 #define TMINMAX(op, x, y)                                                                                          \
     ({                                                                                                             \
         double r_;                                                                                                 \
@@ -86,8 +90,10 @@ _Static_assert(TINY_F64 <= SIMD_LANES_F64 && SIMD_LANES_F64 == 16, "one value pe
         r_;                                                                                                        \
     })
 #endif
+#if defined(__x86_64__) || defined(__i386__)
 #define TMIN(x, y) TMINMAX("minsd", x, y)
 #define TMAX(x, y) TMINMAX("maxsd", x, y)
+#endif
 #define TLEAF(j)                                                                                                   \
     double x##j = f32 ? (double)((const float *)v)[(j) < n ? (j) : 0] : ((const double *)v)[(j) < n ? (j) : 0];    \
     double s##j = x##j; /* lanes from n on: unused, optimised out */                                               \

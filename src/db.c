@@ -211,11 +211,11 @@ static int meta_write(eng *db)
     int fd = openat(db->dirfd, META_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0)
         return TSDB_ERR_IO;
-    bool ok = write(fd, buf, (size_t)len) == len && fsync(fd) == 0;
+    bool ok = write(fd, buf, (size_t)len) == len && tsdb_fsync(fd) == 0;
     close(fd);
     if (!ok || renameat(db->dirfd, META_FILE ".tmp", db->dirfd, META_FILE) != 0)
         return TSDB_ERR_IO;
-    return fsync(db->dirfd) == 0 ? 0 : TSDB_ERR_IO; /* at creation: the open fails */
+    return tsdb_fsync(db->dirfd) == 0 ? 0 : TSDB_ERR_IO; /* at creation: the open fails */
 }
 
 /* A volume add writes the volume's META outside any lock it shares with other adds of the same directory (two
@@ -230,7 +230,7 @@ void meta_tmp_make(char *buf, size_t cap)
         if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '-' ||
               *c == '_'))
             *c = '_'; /* dots too: the last two separate the numbers */
-    snprintf(buf, cap, "%s.tmp.%s.%ld.%ld", META_FILE, host, (long)getpid(), (long)syscall(SYS_gettid));
+    snprintf(buf, cap, "%s.tmp.%s.%ld.%ld", META_FILE, host, (long)getpid(), tsdb_gettid());
 }
 
 /* The engine's own META.tmp, or an add's (above): what the cleanup at open removes, and nothing else of a user's. */
@@ -675,13 +675,13 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     if (!ro && db->opt.merge_threads > 0) {
         db->mergers = calloc((size_t)db->opt.merge_threads, sizeof *db->mergers);
         for (int i = 0; db->mergers && i < db->opt.merge_threads; i++)
-            if (pthread_create(&db->mergers[db->nmergers], NULL, merge_thread_main, db) == 0)
+            if (tsdb_thread_create(&db->mergers[db->nmergers], merge_thread_main, db) == 0)
                 db->nmergers++;
     }
-    if (!ro && pthread_create(&db->flusher, NULL, flusher_main, db) == 0)
+    if (!ro && tsdb_thread_create(&db->flusher, flusher_main, db) == 0)
         db->has_flusher = true;
     atomic_store(&db->follow_ok_ms, eng_mono_ms());
-    if (db->opt.follow && pthread_create(&db->follower, NULL, follower_main, db) == 0)
+    if (db->opt.follow && tsdb_thread_create(&db->follower, follower_main, db) == 0)
         db->has_follower = true;
     *out = db;
     return 0;
@@ -804,7 +804,7 @@ int eng_sync_dir(eng *db, const char *what)
     }
     pthread_mutex_lock(&db->dir_sync_lock);
     int rc = eng_check(db);
-    if (rc == 0 && fsync(db->dirfd) != 0) {
+    if (rc == 0 && tsdb_fsync(db->dirfd) != 0) {
         eng_fail(db, what, errno);
         rc = TSDB_ERR_IO;
     }

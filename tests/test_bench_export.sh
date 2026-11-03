@@ -12,7 +12,7 @@ trap 'rm -rf "$dir"' EXIT
 fail() { echo "test_bench_export: FAIL: $*" >&2; exit 1; }
 
 "$B/tsdb-bench" --export "$dir/x.rb" --series 7 --points 300 >/dev/null 2>&1 || fail "export exited with $?"
-size=$(stat -c %s "$dir/x.rb")
+size=$(stat -c %s "$dir/x.rb" 2>/dev/null || stat -f %z "$dir/x.rb") # GNU, then BSD stat
 [ "$size" -eq $((7 * 300 * 16)) ] || fail "file is $size bytes, want $((7 * 300 * 16))"
 # every time step lists the series 0, then 1 ... 6: the numbers, not ids
 python3 - "$dir/x.rb" <<'PY' || fail "series numbers"

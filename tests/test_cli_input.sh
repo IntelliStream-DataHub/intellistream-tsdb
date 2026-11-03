@@ -67,7 +67,7 @@ refused "--limit 5x" "" query i64 min max raw --limit 5x
 refused "--limit 0" "" query i64 min max raw --limit 0
 refused "group 4294967297h" "" query i64 min max avg 4294967297h
 out=$(t query i64 min max raw --limit 1 2>/dev/null | wc -l)
-[ "$out" = 1 ] || fail "--limit 1 gave $out rows"
+[ "$out" -eq 1 ] || fail "--limit 1 gave $out rows" # numeric: BSD wc pads
 
 # the import's name cache: a name that is the start of a longer one is its own series
 long=$(printf 'a%.0s' $(seq 1500))

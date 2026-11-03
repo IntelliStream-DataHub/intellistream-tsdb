@@ -23,6 +23,12 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+
+#ifdef MAP_POPULATE
+#define TSDB_MAP_POPULATE MAP_POPULATE
+#else
+#define TSDB_MAP_POPULATE 0 /* macOS */
+#endif
 #include <unistd.h>
 
 #define CB_T0 INT64_C(1704067200000) /* 2024-01-01, where tsdb-bench starts every series */
@@ -129,7 +135,7 @@ static inline int cb_file_open(const char *path, cb_file *f)
         close(fd);
         return -1;
     }
-    void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
+    void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED | TSDB_MAP_POPULATE, fd, 0);
     close(fd);
     if (p == MAP_FAILED) {
         perror(path);

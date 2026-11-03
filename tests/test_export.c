@@ -34,6 +34,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 static int failures;
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -85,6 +87,9 @@ static char *path(const char *name)
 
 /* ------------------------------------------------------------------ running the tsdb binary */
 
+#ifdef __APPLE__
+static long rss_anon_kb(pid_t pid) { return tp_footprint_kb(pid, false); }
+#else
 static long rss_anon_kb(pid_t pid)
 {
     char f[64], line[256];
@@ -98,6 +103,7 @@ static long rss_anon_kb(pid_t pid)
         fclose(s);
     return kb;
 }
+#endif
 
 /* Runs the CLI with stdin from `in` and stdout to `out` (NULL: /dev/null), stderr to errfile; returns its exit
  * status and, with peak, the most anonymous memory it held. */
@@ -107,7 +113,11 @@ static int run(const char *in, const char *out, long *peak, const char *const *a
     /* Until execv the child is a copy of this process, whose anonymous memory (the rows it built) counts as the
      * child's: sample only once the close-on-exec pipe reports the exec (EOF). */
     int gate[2];
+#ifdef __APPLE__
+    if (pipe(gate) != 0 || fcntl(gate[0], F_SETFD, FD_CLOEXEC) != 0 || fcntl(gate[1], F_SETFD, FD_CLOEXEC) != 0) {
+#else
     if (pipe2(gate, O_CLOEXEC) != 0) {
+#endif
         perror("pipe2");
         exit(1);
     }
@@ -1554,7 +1564,7 @@ static int run_crashfs(const char *const *env, const char *const *args)
     char shim[PATH_MAX + 16], abs[PATH_MAX], self[PATH_MAX];
     const char *slash = strrchr(cli, '/');
     snprintf(shim, sizeof shim, "%.*s/libcrashfs.so", slash ? (int)(slash - cli) : 1, slash ? cli : ".");
-    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    ssize_t n = tp_self_exe(self, sizeof self);
     self[n > 0 ? n : 0] = 0;
     if (!realpath(shim, abs) && strrchr(self, '/')) { /* a TSDB_CLI elsewhere: the shim beside this test */
         snprintf(shim, sizeof shim, "%.*s/libcrashfs.so", (int)(strrchr(self, '/') - self), self);
@@ -2014,7 +2024,7 @@ static void test_old_format(void)
         printf("  no %s: the server's refusal not checked\n", tsdbd);
     } else {
         /* the timeout only matters if tsdbd wrongly serves: it must exit before it writes the port file */
-        CHECK(sh("timeout 30 '%s' --dir '%s' --no-auth --port 0 --port-file '%s' >/dev/null 2>%s", tsdbd, dir,
+        CHECK(sh(TIMEOUT_TERM_CMD(30) " '%s' --dir '%s' --no-auth --port 0 --port-file '%s' >/dev/null 2>%s", tsdbd, dir,
                  path("format7.port"), errfile) == 1);
         for (int i = 0; i < 3; i++)
             CHECK(err_has(want[i]));
@@ -2030,7 +2040,7 @@ int main(int argc, char **argv)
         snprintf(cli, sizeof cli, "%s", cli_env);
     else {
         char self[PATH_MAX - 16];
-        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        ssize_t n = tp_self_exe(self, sizeof self);
         self[n > 0 ? n : 0] = 0;
         char *slash = strrchr(self, '/');
         if (slash)
@@ -2052,7 +2062,8 @@ int main(int argc, char **argv)
         perror(tmpl);
         return 1;
     }
-    snprintf(base, sizeof base, "%s", tmpl);
+    if (!realpath(tmpl, base)) /* a dump holds canonical paths (/tmp is /private/tmp on macOS) */
+        snprintf(base, sizeof base, "%s", tmpl);
     snprintf(errfile, sizeof errfile, "%s/stderr", base);
     if (access(cli, X_OK) != 0) {
         fprintf(stderr, "test_export: no tsdb binary at %s (set TSDB_CLI)\n", cli);
@@ -2069,7 +2080,12 @@ int main(int argc, char **argv)
     test_damage();
     test_crafted();
     test_volumes();
+#ifdef __APPLE__
+    printf("  (power-loss and EIO runs of import: skipped on macOS, they need the crashfs LD_PRELOAD shim)\n");
+    (void)test_sync;
+#else
     test_sync();
+#endif
     test_kill();
     test_failed_volumes();
     test_intruder();

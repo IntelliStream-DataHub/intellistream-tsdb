@@ -349,7 +349,7 @@ final class Native {
         return SymbolLookup.libraryLookup(name, global);
     }
 
-    /** {@code linux-x86_64}, {@code linux-aarch64}, ...: the directory of the bundled library. */
+    /** {@code linux-x86_64}, {@code linux-aarch64}, {@code macos-aarch64}, ...: the directory of the bundled library. */
     static String platform() {
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
@@ -357,7 +357,7 @@ final class Native {
             arch = "x86_64";
         else if (arch.equals("arm64"))
             arch = "aarch64";
-        return (os.startsWith("linux") ? "linux" : os.replace(' ', '_')) + "-" + arch;
+        return (os.startsWith("linux") ? "linux" : os.startsWith("mac") ? "macos" : os.replace(' ', '_')) + "-" + arch;
     }
 
     private static final class UncheckedIOException extends RuntimeException {
