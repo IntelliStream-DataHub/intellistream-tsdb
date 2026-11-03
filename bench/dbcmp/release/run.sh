@@ -1321,8 +1321,8 @@ p2_tsdb() {
     tsdbtwa "$D" "" 1 16
     tsdbsuite tsdbq "$D" "1 $NHI"
     untimed "$D/check-self.txt" tsdb_self "" && tsdbbsuite tsdbq "$D"
-    tstep "p2 tsdbc-bench query c1" "$D/tsdbc-bench.c1.txt" -- "$T/tsdbc-bench" query --conns 1 --seconds 5 --port "$TSDB_PORT"
-    tstep "p2 tsdbc-bench query c$NHI" "$D/tsdbc-bench.c$NHI.txt" -- "$T/tsdbc-bench" query --conns $NHI --seconds 5 --port "$TSDB_PORT"
+    tstep "p2 tsdbc-bench query c1" "$D/tsdbc-bench.c1.txt" -- "$T/tsdbc-bench" query --conns 1 --seconds 5 --series "${NSERIES:-100}" --port "$TSDB_PORT"
+    tstep "p2 tsdbc-bench query c$NHI" "$D/tsdbc-bench.c$NHI.txt" -- "$T/tsdbc-bench" query --conns $NHI --seconds 5 --series "${NSERIES:-100}" --port "$TSDB_PORT"
     # partitions merged (README row "tsdbd, 1 connection, partitions merged")
     tstep "p2 tsdb optimize" "$D/optimize.txt" -- bash -c "'$TB/tsdbstat' optimize && du -sb --exclude='retired_*' '$W/db'"
     untimed "$D/check-self.merged.txt" tsdb_self merged || { cd "$OUT"; tsdbd_stop; runstats "$D"; return 1; }
