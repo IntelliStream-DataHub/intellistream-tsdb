@@ -831,13 +831,25 @@ damage into silently missing or shifted data:
   queries and merges read it in the part's mapping, where damage that reaches
   the file later (a misdirected write, a page misread after the kernel
   evicted it) shows. Every entry number taken from the index is kept inside
-  it, so such damage never makes a read leave the index. With
-  `verify_checksums` the index and tombstones are read from a copy made when
-  they were checked, so answers do not change at all; that copy costs about
-  32 bytes of memory per granule (about 4 MB per billion rows in full 8192-row
-  granules, more for many small series; 51 bytes per granule were measured on
-  a database of short runs). Without the option such damage gives wrong
-  answers, like damage to a granule.
+  it, so such damage never makes a read leave the index. With `pin_index`
+  (`tsdbd --pin-index`, off by default and independent of `verify_checksums`)
+  the index and tombstones are read from a copy made when they were checked,
+  so answers do not change at all. That copy is heap, not page cache: about
+  32 bytes per granule in full 8192-row granules (about 4 MB per billion rows),
+  and 51 bytes per granule measured on a database of short runs, in every
+  process that opens the part (the writer and each follower) and once more
+  for a merge's output while it is written. Granules never span series, so a
+  partition key holds at least one granule per series with rows in it: at the
+  target of 10^9 series that is at least 51 GB per partition generation per
+  process, which is why it is not tied to `verify_checksums`.
+  `tsdb_volume_stats.pinned_bytes` and the metric `tsdb_pinned_index_bytes`
+  report it. Without the option such damage gives wrong answers, like damage
+  to a granule; a merge hashes each source's index again before it uses it
+  (about 0.3% of the part) and fails on a mismatch rather than write damaged
+  statistics or series under the new part's fresh hash, so the damage stays
+  in the source part, which the next open refuses. Measuring a partition's
+  series rates (`cls_observe`) skips runs naming a series beyond SERIES or out
+  of order, so such damage writes no class record.
 - **Series in parts.** Every series a part holds is in SERIES: its record is
   synced (`dict_append`) before its id is handed out, and so before any row of
   it can reach a part. A part that names a series beyond the end of SERIES
@@ -852,7 +864,29 @@ damage into silently missing or shifted data:
   a series it does not know; if SERIES still lacks it, the follower shows
   nothing from that record on, and once that outlasts its patience for NFS
   (as for a damaged WAL record) its refreshes fail with `TSDB_ERR_CORRUPT`,
-  with a log line; the rows appear if SERIES is whole again.
+  with a log line; the rows appear if SERIES is whole again. A follower, and
+  any reader that opens through MANIFEST (volumes included, also those opened
+  later), checks the same for parts: after reading SERIES again it needs as
+  many records as MANIFEST counts, and each part it opens may name no series
+  beyond them. Otherwise it keeps its previous view like for a broken part
+  and, after the same patience, logs it, counts it in `broken_parts` and fails
+  its refresh (an open fails) with `TSDB_ERR_CORRUPT`. A writer without fsync
+  says so in MANIFEST (`fsync 0`): its files can reach another host in any
+  order (the NFS client's writeback, up to 30 s by default), so a missing
+  record is not called damage there; the patience is a minute and the log
+  line says the record may still be on its way or lost with a crash of the
+  writer's host.
+- **A refused open changes nothing.** The open of a writer finds torn tails
+  (SERIES, STATES, CLASSES, the WAL) before the checks above, which can prove
+  that a "torn" record was acknowledged. It cuts them only after every check
+  passed (the parts, CLASSES, and every WAL segment, checked before the replay
+  writes anything), so a refused open leaves each file byte for byte as it
+  was: a damaged last record can still be repaired (a single flipped bit can
+  be flipped back) or restored. The refusal names the way out: restore SERIES
+  from a backup or snapshot (a copy with at least as many records as the
+  message says), or move the named WAL segment or part aside to accept the
+  loss of its rows. `tsdb export` opens the database like a reader and is
+  refused the same way, so it is no way around the repair.
 - **A tail is read twice before it is cut.** A read that returns other bytes
   than the disk holds (a misdirected read) can make the last records of the
   WAL, SERIES, STATES, RETENTION or CLASSES look torn. Before cutting, the
@@ -864,9 +898,11 @@ damage into silently missing or shifted data:
   lost; the cut is logged (`cutting a torn tail`). A cut SERIES record is
   noticed only through its series' rows (above): a series without any is
   simply gone. On ext4 or XFS, which keep no checksums of the
-  data, run with `verify_checksums`; on ZFS the file system catches both.
+  data, run with `verify_checksums`, and with `pin_index` where the memory
+  above is affordable; on ZFS the file system catches both.
   `make jepsen` runs the nemeses `misdirect` (misdirected writes, reads and
-  page reads, with and without `verify_checksums`) and `rot` (bits flipped or
+  page reads, with and without `verify_checksums`; with it, also `pin_index`)
+  and `rot` (bits flipped or
   files truncated while the server is down) and counts these cases apart.
 - **Without fsync** (`fsync = 0`) nothing above is synced, so after a power
   loss (a process crash is fine) a named part, a WAL record or a dictionary

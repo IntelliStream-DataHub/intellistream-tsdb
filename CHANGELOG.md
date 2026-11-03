@@ -158,9 +158,29 @@ disk format and the wire protocol.
 ### Fixed
 - Found by the new jepsen nemesis `misdirect`: a misdirected write into the granule index of a part the server had
   open could crash a merge (SIGSEGV): the index is checked at the open and then read in the part's mapping, where
-  later damage shows. Every entry number taken from the index now stays inside it, and with `verify_checksums`
-  the index and tombstones are read from the copy that was checked, which costs about 32 bytes of memory per
-  granule (about 4 MB per billion rows). Without the option such damage gives wrong answers, like damage to data.
+  later damage shows. Every entry number taken from the index now stays inside it. With the new option
+  `pin_index` (`tsdbd --pin-index`, off by default) the index and tombstones are read from the copy that was
+  checked, so answers do not change at all; the copy costs about 32 to 51 bytes of RAM per granule in every process
+  that opens the part (at least one granule per series and partition: 51 GB per partition generation at 10^9
+  series), reported as `tsdb_volume_stats.pinned_bytes` and the metric `tsdb_pinned_index_bytes`. It was part of
+  `verify_checksums` at first; that option now means the granule checksums only. Without `pin_index` such damage
+  gives wrong answers, like damage to data, and a merge hashes each source's index again first and fails on a
+  mismatch rather than write damaged statistics under a fresh hash (before, it copied them, and the damage became
+  undetectable); measuring series rates skips runs naming a series beyond `SERIES`, so no class record is written
+  for it. `TSDB_ABI_VERSION` is 2 (`pin_index` sits in what was padding of `tsdb_options`); the Rust, Python and
+  Java embedded bindings have `pin_index` / `pinIndex`.
+- A refused open no longer changes any file: the torn tails of `SERIES`, `STATES` and `CLASSES` were cut before the
+  checks that then proved the cut record was acknowledged and refused the open, so a record with one flipped bit,
+  which could have been repaired, was gone for good. A writer now cuts torn tails only after the parts, `CLASSES`
+  and every WAL segment passed their checks (the WAL is checked whole before the replay writes anything), and the
+  refusal names the way out (restore `SERIES`, or move a segment aside; `tsdb export` is refused the same way).
+- Followers, and readers that open through MANIFEST (volumes included), served series whose `SERIES` record was
+  damaged as never created: open fine, lookups NOTFOUND, rows unreachable, no error and no log line. After reading
+  `SERIES` again they now need as many records as MANIFEST counts and each new part may name no series beyond
+  them; otherwise the previous view stays (like for a broken part) and, after the follower patience, the refresh or
+  the open fails with `TSDB_ERR_CORRUPT`, logged once and counted in `broken_parts`. A writer without fsync says so
+  in MANIFEST (`fsync 0`, a new optional line): a follower then waits a minute for a missing record, since NFS can
+  show the writer's files in any order, and says it may still be on its way instead of calling `SERIES` damaged.
 - Found the same way: a misdirected write over the last records of `SERIES` made the open cut them as a torn tail,
   and every series they named, with all its rows in parts, was gone without an error. The open now fails with
   `TSDB_ERR_CORRUPT` when a part holds a series `SERIES` does not have (one comparison per part).

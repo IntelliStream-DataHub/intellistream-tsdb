@@ -48,7 +48,8 @@ are in scope, and we want to hear about a way around any of them:
   nothing. `make jepsen` tests this with crashes, simulated power loss, disk errors, misdirected reads and
   writes, and files damaged at rest. Two limits are known: without `--verify-checksums` damaged or misdirected
   data blocks of a part are read as wrong values (tsdbd says so at startup on ext4 and XFS; ZFS checks its data
-  itself), and damage to the very last record of the WAL or of an append-only file looks like a write cut short
+  itself), as is a part's index damaged after the server opened it unless `--pin-index` keeps it in memory, and
+  damage to the very last record of the WAL or of an append-only file looks like a write cut short
   by a crash and is cut, with a log line. See "Damage on disk" in [docs/design.md](docs/design.md).
 - **Writes outside the database's directories:** volume paths are checked (absolute, no `.` or `..`, not in or
   around another database), and a client can never make the server add a volume or create a directory.

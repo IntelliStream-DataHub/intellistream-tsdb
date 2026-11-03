@@ -538,6 +538,15 @@ On ext4 or XFS, start tsdbd with `--verify-checksums`: those file systems keep n
 without it a damaged disk block can come back as wrong values instead of an error. tsdbd reminds you at startup.
 ZFS checks its data itself and needs no option.
 
+`--verify-checksums` checks the data each query reads. Each part's index (which rows are where, and the sums,
+minimums and maximums queries answer from) is checked when the part is opened and then read from the file as it
+is. If the disk damages it after that, answers can be wrong until the next restart refuses the part.
+`--pin-index` keeps a copy of every index in memory, as it was checked, so that cannot happen. The copy costs
+about 51 bytes of RAM per granule (a block of up to 8192 rows of one series), in the server and in every
+follower: about 4 MB per billion rows of busy series, but at least one granule per series and partition, so
+with many slow series it adds up (a billion series take about 51 GB per partition). The metric
+`tsdb_pinned_index_bytes` shows it. Turn it on where you use `--verify-checksums` and the RAM is there.
+
 `--metrics-port N` serves Prometheus metrics (`GET /metrics`) on a second port of its own: rows and
 bytes on disk, parts, merges, WAL, request and error counters, a query latency histogram, connections,
 fail-stop and follower refresh age. See [docs/metrics.md](docs/metrics.md).
