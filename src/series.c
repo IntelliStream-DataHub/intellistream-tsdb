@@ -158,6 +158,28 @@ static int read_all(int fd, uint8_t *buf, size_t len, uint64_t off)
     return 0;
 }
 
+/* A tail about to be cut as torn is read once more, from the disk: a read that returned bytes other than the file's
+ * (a misdirected read, a page misread) makes valid records look torn, and cutting them would lose acknowledged
+ * writes for a fault that a second read does not repeat. The cached pages are dropped first, since a misread page
+ * stays in the page cache. Reads that differ fail the open (TSDB_ERR_IO) and cut nothing; a later open reads again. */
+int tail_confirm(int dirfd, const char *file, const uint8_t *tail, uint64_t off, size_t len)
+{
+    int fd = openat(dirfd, file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    (void)posix_fadvise(fd, (off_t)off, (off_t)len, POSIX_FADV_DONTNEED);
+    uint8_t *b = malloc(len ? len : 1);
+    int rc = !b ? TSDB_ERR_NOMEM : read_all(fd, b, len, off);
+    if (rc == 0 && memcmp(b, tail, len) != 0) {
+        fprintf(stderr, "tsdb: %s: two reads of its tail at offset %llu differ: the open fails and nothing is cut\n",
+                file, (unsigned long long)off);
+        rc = TSDB_ERR_IO;
+    }
+    free(b);
+    close(fd);
+    return rc;
+}
+
 int series_open(series_dict *d, int dirfd, const char *file, bool read_only, bool fsync)
 {
     memset(d, 0, sizeof *d);
@@ -194,10 +216,16 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
         fprintf(stderr, "tsdb: %s is damaged at offset %zu, before valid records\n", file, pos);
         rc = TSDB_ERR_CORRUPT;
     }
+    /* a torn append at the end is cut: it was never acknowledged (or the last record was damaged at rest, which
+       looks the same: hence the log line) */
+    if (rc == 0 && pos != size && !read_only)
+        rc = tail_confirm(dirfd, file, buf + pos, pos, size - pos);
     free(buf);
-    /* a torn append at the end is cut: it was never acknowledged */
-    if (rc == 0 && pos != size && !read_only && ftruncate(d->fd, (off_t)pos) != 0)
-        rc = TSDB_ERR_IO;
+    if (rc == 0 && pos != size && !read_only) {
+        fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes at offset %zu\n", file, size - pos, pos);
+        if (ftruncate(d->fd, (off_t)pos) != 0)
+            rc = TSDB_ERR_IO;
+    }
     d->file_off = pos;
     return rc;
 }

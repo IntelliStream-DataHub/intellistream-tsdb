@@ -153,8 +153,9 @@ static void append_zeros(const char *dir, const char *name, size_t n)
 
 /* The library's pread calls land here (the test binary's definition wins over
  * libc's): while armed, reads of files whose name starts with fault_name fail
- * with EIO, or find the file ending after 8 bytes (a short read). */
-enum { FAULT_NONE, FAULT_EIO, FAULT_SHORT };
+ * with EIO, or find the file ending after 8 bytes (a short read); or the next one only returns its last 8 bytes
+ * garbled (a misdirected read, which a second read does not repeat). */
+enum { FAULT_NONE, FAULT_EIO, FAULT_SHORT, FAULT_GARBLE };
 static atomic_int fault_mode, fault_fired;
 static char fault_name[32];
 
@@ -178,6 +179,12 @@ ssize_t pread(int fd, void *buf, size_t n, off_t off)
             base = base ? base + 1 : target;
             if (strncmp(base, fault_name, strlen(fault_name)) == 0) {
                 atomic_fetch_add(&fault_fired, 1);
+                if (mode == FAULT_GARBLE && atomic_exchange(&fault_mode, FAULT_NONE) == FAULT_GARBLE) {
+                    ssize_t r = syscall(SYS_pread64, fd, buf, n, off);
+                    for (ssize_t i = r > 8 ? r - 8 : 0; i < r; i++)
+                        ((uint8_t *)buf)[i] ^= 0xa5;
+                    return r;
+                }
                 if (mode == FAULT_EIO) {
                     errno = EIO;
                     return -1;
@@ -808,6 +815,61 @@ static void test_series_cut_under_parts(const char *scratch)
     rm_rf(dir);
 }
 
+/* src/volumes.c: switch a series' class at *at (tests/test_classes.c) */
+int tsdb_test_class_switch(tsdb *t, tsdb_sid id, int cls, const int64_t *at);
+
+/* A read at the open that returns other bytes at the end of the file than the disk holds (a misdirected read, found
+ * by jepsen --nemesis misdirect) made the last records of the WAL, a dictionary, RETENTION or CLASSES look torn,
+ * and the open cut them: acknowledged writes lost to a fault a second read does not repeat. The tail is read again
+ * before it is cut; reads that differ fail the open, and the next open finds everything. */
+static void test_misread_tail(const char *scratch)
+{
+    char dir[600], wal[256];
+    snprintf(dir, sizeof dir, "%s/damage-misread", scratch);
+
+    crash_with_wal(dir, wal, sizeof wal);
+    arm_read_fault(FAULT_GARBLE, "wal_");
+    RC(try_open(dir), TSDB_ERR_IO);
+    CHECK(atomic_load(&fault_fired) == 1);
+    CHECK(rows_of(dir, "wal.series") == WAL_RECS * WAL_RECROWS);
+
+    static const char *const names[] = {"pump.inlet.pressure", "pump.outlet.pressure", "pump.speed"};
+    make_series(dir, names, 3);
+    off_t size = file_size(dir, "SERIES");
+    arm_read_fault(FAULT_GARBLE, "SERIES");
+    RC(try_open(dir), TSDB_ERR_IO);
+    CHECK(atomic_load(&fault_fired) == 1 && file_size(dir, "SERIES") == size);
+    check_names(dir, names, 3, 3);
+
+    rm_rf(dir);
+    tsdb_options o = opts();
+    tsdb *db;
+    tsdb_sid id;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "kept", &id));
+    OK(tsdb_set_retention(db, id, 7 * 86400000LL));
+    OK(tsdb_set_retention(db, id, 9 * 86400000LL));
+    int64_t t1 = T0 + 86400000LL, t2 = T0 + 2 * 86400000LL;
+    OK(tsdb_test_class_switch(db, id, 2, &t1));
+    OK(tsdb_test_class_switch(db, id, 3, &t2));
+    OK(tsdb_close(db));
+    off_t rsize = file_size(dir, "RETENTION"), csize = file_size(dir, "CLASSES");
+    arm_read_fault(FAULT_GARBLE, "RETENTION");
+    RC(try_open(dir), TSDB_ERR_IO);
+    CHECK(atomic_load(&fault_fired) == 1);
+    arm_read_fault(FAULT_GARBLE, "CLASSES");
+    RC(try_open(dir), TSDB_ERR_IO);
+    CHECK(atomic_load(&fault_fired) == 1);
+    int64_t limit = 0;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_get_retention(db, id, &limit));
+    CHECK(limit == 9 * 86400000LL);
+    OK(tsdb_close(db));
+    CHECK(file_size(dir, "RETENTION") == rsize && file_size(dir, "CLASSES") == csize);
+    printf("  a misread tail of the WAL, SERIES, RETENTION or CLASSES at the open: read again, nothing cut\n");
+    rm_rf(dir);
+}
+
 /* src/db.c: in an open that lists the parts itself, just before it does */
 void tsdb_test_before_parts(void (*fn)(void *), void *arg);
 
@@ -1169,6 +1231,7 @@ int main(int argc, char **argv)
     test_index_after_open(base);
     test_series_cut_under_parts(base);
     test_series_check_races(base);
+    test_misread_tail(base);
     test_read_errors(base);
     test_parts(base);
     test_part_follower(base);

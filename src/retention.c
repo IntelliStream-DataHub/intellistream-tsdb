@@ -107,6 +107,8 @@ static int ret_load(eng *db, bool writer)
             rc = TSDB_ERR_CORRUPT;
         }
     }
+    if (writer && rc == 0 && pos < size && (rc = tail_confirm(db->dirfd, RET_FILE, buf + pos, pos, size - pos)) == 0)
+        fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes at offset %zu\n", RET_FILE, size - pos, pos);
     if (writer)
         db->ret_off = pos; /* a torn tail is overwritten by the next append */
     pthread_mutex_unlock(&db->ret_lock);

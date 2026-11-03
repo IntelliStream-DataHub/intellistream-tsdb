@@ -258,8 +258,9 @@ static bool rec_ok(const uint8_t *rec, uint64_t off)
     return load32(rec) == rec_check(rec, off) && load32(rec + 16) < PART_CLASSES && load32(rec + 20) == 0;
 }
 
-/* Applies the records from cls_off on (all of them at open; a reader's refresh, those appended since). */
-static int cls_load(eng *db)
+/* Applies the records from cls_off on (all of them at open; a reader's refresh, those appended since). confirm: a
+ * writer's open, which cuts a torn tail, reads it again first (tail_confirm). */
+static int cls_load(eng *db, bool confirm)
 {
     int fd = openat(db->dirfd, CLS_FILE, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -309,6 +310,8 @@ static int cls_load(eng *db)
             fprintf(stderr, "tsdb: %s is damaged at offset %zu, before valid records\n", CLS_FILE, base + pos);
             rc = TSDB_ERR_CORRUPT;
         }
+    if (rc == 0 && confirm && pos < len)
+        rc = tail_confirm(db->dirfd, CLS_FILE, buf + pos, base + pos, len - pos);
     if (rc == 0)
         db->cls_off = base + pos; /* a torn tail is overwritten by the next append */
     free(buf);
@@ -335,10 +338,12 @@ int cls_open(eng *db, bool read_only)
         atomic_store_explicit(&t->b[i], CLS_DECIDED, memory_order_relaxed);
     pthread_mutex_unlock(&db->cls_mu);
     if (rc == 0)
-        rc = cls_load(db);
+        rc = cls_load(db, !read_only);
     struct stat st;
     if (rc == 0 && !read_only && fstatat(db->dirfd, CLS_FILE, &st, 0) == 0 && (uint64_t)st.st_size > db->cls_off) {
         /* cut a torn tail, as SERIES does: nothing relied on it, since a record is synced before it is used */
+        fprintf(stderr, "tsdb: %s: cutting a torn tail of %llu bytes at offset %llu\n", CLS_FILE,
+                (unsigned long long)st.st_size - (unsigned long long)db->cls_off, (unsigned long long)db->cls_off);
         int fd = openat(db->dirfd, CLS_FILE, O_WRONLY | O_CLOEXEC);
         if (fd < 0 || ftruncate(fd, (off_t)db->cls_off) != 0)
             rc = TSDB_ERR_IO;
@@ -359,7 +364,7 @@ int cls_reload(eng *db)
             rc = set_byte_locked(db, i, cls_byte(db, i) | CLS_DECIDED);
     pthread_mutex_unlock(&db->cls_mu);
     if (rc == 0)
-        rc = cls_load(db);
+        rc = cls_load(db, false);
     pthread_mutex_unlock(&db->class_lock);
     return rc;
 }

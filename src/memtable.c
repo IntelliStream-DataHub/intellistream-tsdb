@@ -903,6 +903,12 @@ int wal_open(eng *db)
                     "segment is kept (move it out of the directory to accept the loss of its rows)\n",
                     segs[k].name, pos);
             rc = TSDB_ERR_CORRUPT;
+        } else if (rc == 0 && pos < len && !ro) {
+            /* a torn append: never acknowledged, unless the last record was damaged at rest, which looks the same */
+            rc = tail_confirm(db->dirfd, segs[k].name, buf + pos, pos, len - pos);
+            if (rc == 0)
+                fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes at offset %zu\n", segs[k].name, len - pos,
+                        pos);
         }
         free(buf);
         if (rc == 0 && !ro) {

@@ -940,6 +940,9 @@ enum { DICT_AT_ADD = 1, DICT_AT_FAILED = 2, DICT_AT_RELOAD = 3 };
 /* The series dictionary (file SERIES) and the state names (file STATES) are both these. */
 int series_open(series_dict *d, int dirfd, const char *file, bool read_only, bool fsync);
 int series_reload(series_dict *d, int dirfd); /* readers: names appended by the writer since */
+/* before a torn tail is cut: the bytes [off, off + len) of the file read again from the disk equal `tail`, or
+ * TSDB_ERR_IO (series.c) */
+int tail_confirm(int dirfd, const char *file, const uint8_t *tail, uint64_t off, size_t len);
 void series_close(series_dict *d);
 /* create: make a missing name, of `type` (an existing name of another type is TSDB_ERR_INVALID) */
 int series_get(series_dict *d, const char *name, bool create, int type, uint32_t *id);
