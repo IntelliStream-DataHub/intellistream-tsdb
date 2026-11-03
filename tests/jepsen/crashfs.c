@@ -52,6 +52,29 @@
  *
  * With CRASHFS_AT_EXIT=1 the power also fails as the process exits normally:
  * what a command reported done must already be durable.
+ *
+ * With CRASHFS_MODE=misdirect there is no power loss; instead, with
+ * probability $CRASHFS_MD_RATE per write, pwrite, read or pread of a regular
+ * file inside $CRASHFS_ROOT, the I/O goes to the wrong place, as a disk or a
+ * controller with a firmware bug may send it (misdirected I/O):
+ *  - a write: one chunk of it (512 or 4096 bytes, or all of a smaller write,
+ *    at an aligned or unaligned offset) lands at another offset of the same
+ *    file, or in another file of the same directory (at a random offset or at
+ *    the one it was meant for), clamped to that file's size. The chunk's own
+ *    place keeps its old bytes (zeros where the write extended the file); the
+ *    call reports success;
+ *  - a read: one chunk of the buffer comes from another offset of the same
+ *    file (a transient fault: the next read is right);
+ *  - a part file (*.part), which tsdb reads through a read-only shared
+ *    mapping whose loads no shim can see: with probability
+ *    $CRASHFS_MD_MAP_RATE (default 0.05) its mmap returns a private copy of
+ *    the file with one chunk taken from another offset, as a page misread
+ *    into the page cache would be until it is evicted. The copy does not see
+ *    later writes to the file; parts are never written after they are named.
+ * $CRASHFS_MD_FILES=parts limits the faults to part files (as source and as
+ * destination), =noparts to every other file. Every fault is appended to
+ * $CRASHFS_MD_LOG (else stderr) as one line: pid, kind, file, offsets and
+ * length, so a checker can tie what it sees to a fault.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -69,6 +92,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -122,6 +146,10 @@ static bool tear; /* CRASHFS_TEAR=1 */
 static unsigned tear_prefix, tear_garbage, tear_old, tear_kept; /* what the power loss kept, for the message */
 static bool eio_mode, eio_done; /* CRASHFS_MODE=eio, and the error was injected */
 static bool loss_at_exit;       /* CRASHFS_AT_EXIT=1 */
+static bool md_mode;            /* CRASHFS_MODE=misdirect */
+static double md_rate, md_map_rate;
+static int md_files; /* 0: every file, 1: parts only, 2: all but parts */
+static char md_log[PATH_MAX];
 static char lying_dir[PATH_MAX]; /* a directory whose syncs lie after the error */
 static char mark[PATH_MAX], eio_only[64], eio_on[16];
 static char *fdpath[MAX_FDS];
@@ -133,6 +161,9 @@ static unsigned saved_counter;
 
 #define REAL(name) static __typeof__(name) *real_##name
 REAL(open);
+REAL(read);
+REAL(pread);
+REAL(mmap);
 REAL(openat);
 REAL(write);
 REAL(pwrite);
@@ -166,6 +197,9 @@ __attribute__((constructor)) static void init(void)
 {
 #define LOAD(name) real_##name = dlsym(RTLD_NEXT, #name)
     LOAD(open);
+    LOAD(read);
+    LOAD(pread);
+    LOAD(mmap);
     LOAD(openat);
     LOAD(write);
     LOAD(pwrite);
@@ -199,6 +233,15 @@ __attribute__((constructor)) static void init(void)
         snprintf(mark, sizeof mark, "%s", getenv("CRASHFS_MARK"));
     tear = getenv("CRASHFS_TEAR") && atoi(getenv("CRASHFS_TEAR")) != 0;
     loss_at_exit = getenv("CRASHFS_AT_EXIT") && atoi(getenv("CRASHFS_AT_EXIT")) != 0;
+    md_mode = getenv("CRASHFS_MODE") && !strcmp(getenv("CRASHFS_MODE"), "misdirect");
+    md_rate = getenv("CRASHFS_MD_RATE") ? atof(getenv("CRASHFS_MD_RATE")) : 0.001;
+    md_map_rate = getenv("CRASHFS_MD_MAP_RATE") ? atof(getenv("CRASHFS_MD_MAP_RATE")) : 0.05;
+    const char *mf = getenv("CRASHFS_MD_FILES");
+    md_files = !mf ? 0 : !strcmp(mf, "parts") ? 1 : !strcmp(mf, "noparts") ? 2 : 0;
+    if (getenv("CRASHFS_MD_LOG"))
+        snprintf(md_log, sizeof md_log, "%s", getenv("CRASHFS_MD_LOG"));
+    if (md_mode)
+        prob = 0;
     signal(SIGUSR2, on_usr2);
     active = files && dops;
 }
@@ -213,7 +256,8 @@ static double urand(void)
 
 /* ------------------------------------------------------------- tracking */
 
-static bool tracked(const char *p) { return active && strncmp(p, root, rootlen) == 0; }
+/* misdirect mode keeps none of the power-loss state: only which descriptors are its files (md_open) */
+static bool tracked(const char *p) { return active && !md_mode && strncmp(p, root, rootlen) == 0; }
 
 static void path_of_at(int dirfd, const char *name, char *out)
 {
@@ -592,12 +636,212 @@ __attribute__((destructor)) static void fini(void)
     }
 }
 
+/* ----------------------------------------------------------- misdirect */
+
+static unsigned long md_seq; /* faults injected by this process */
+
+static bool md_part(const char *p)
+{
+    size_t n = strlen(p);
+    return n > 5 && !strcmp(p + n - 5, ".part");
+}
+
+/* A file of the database: inside the root, not a lock or the shim's own leftovers, and of the kind
+ * CRASHFS_MD_FILES asks for. */
+static bool md_eligible(const char *p)
+{
+    if (!active || strncmp(p, root, rootlen) != 0 || p[rootlen] != '/')
+        return false;
+    const char *base = strrchr(p, '/') + 1;
+    if (base[0] == '.' || !strcmp(base, "LOCK"))
+        return false;
+    return md_files == 0 || (md_files == 1) == md_part(base);
+}
+
+static void md_note(const char *fmt, ...)
+{
+    char msg[3 * PATH_MAX];
+    int n = snprintf(msg, sizeof msg, "crashfs[%d] misdirect %lu: ", (int)getpid(), ++md_seq);
+    va_list ap;
+    va_start(ap, fmt);
+    n += vsnprintf(msg + n, sizeof msg - (size_t)n, fmt, ap);
+    va_end(ap);
+    if (n >= (int)sizeof msg - 1)
+        n = (int)sizeof msg - 2;
+    msg[n++] = '\n';
+    int fd = md_log[0] ? real_open(md_log, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644) : 2;
+    if (fd >= 0 && real_write(fd, msg, (size_t)n) < 0) {
+    }
+    if (fd > 2)
+        real_close(fd);
+}
+
+static uint64_t md_below(uint64_t n) { return n ? (uint64_t)(urand() * (double)n) % n : 0; }
+
+/* A chunk [*a, *a + *c) of [off, off + n): one 512 or 4096-byte block, aligned in the file or not, or all of a
+ * smaller request. */
+static void md_chunk(off_t off, size_t n, off_t *a, size_t *c)
+{
+    size_t want = urand() < 0.5 ? 512 : 4096;
+    *c = n < want ? n : want;
+    off_t at = off + (off_t)md_below(n - *c + 1);
+    if (urand() < 0.5) { /* aligned to its size in the file, where that stays inside the request */
+        off_t al = at / (off_t)want * (off_t)want;
+        if (al >= off && al + (off_t)*c <= off + (off_t)n)
+            at = al;
+    }
+    *a = at;
+}
+
+/* Where a misdirected chunk of `c` bytes meant for `a` in `path` lands: another offset of it (when it has data),
+ * or another file of its directory, at a random offset or at `a`. Writes the destination's path and returns its
+ * offset; -1 if there is nowhere (an empty directory and file). */
+static off_t md_dest(const char *path, ino_t self, off_t size, off_t a, size_t c, char *dest)
+{
+    double kind = urand();
+    if (kind < 0.5 || size == 0) { /* another file of the directory */
+        char dir[PATH_MAX];
+        dir_of(path, dir);
+        DIR *d = opendir(dir);
+        char pick[PATH_MAX] = "";
+        off_t psize = 0;
+        unsigned seen = 0;
+        struct dirent *e;
+        while (d && (e = readdir(d)) != NULL) {
+            char p[PATH_MAX + 256];
+            struct stat st;
+            snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+            if (!md_eligible(p) || stat(p, &st) != 0 || !S_ISREG(st.st_mode) || st.st_ino == self || st.st_size == 0)
+                continue;
+            if (md_below(++seen) == 0) { /* reservoir: each file equally likely */
+                snprintf(pick, sizeof pick, "%.*s", PATH_MAX - 1, p);
+                psize = st.st_size;
+            }
+        }
+        if (d)
+            closedir(d);
+        if (pick[0]) {
+            snprintf(dest, PATH_MAX, "%s", pick);
+            if (kind < 0.2 && a < psize) /* the offset it was meant for, in the wrong file */
+                return a;
+            off_t o = (off_t)md_below((uint64_t)psize);
+            return urand() < 0.5 ? o / (off_t)c * (off_t)c : o;
+        }
+        if (size == 0)
+            return -1;
+    }
+    snprintf(dest, PATH_MAX, "%s", path);
+    for (int i = 0; i < 8; i++) { /* another offset of the same file, not where it was meant to go */
+        off_t o = (off_t)md_below((uint64_t)size);
+        if (urand() < 0.5)
+            o = o / 512 * 512;
+        if (o != a)
+            return o;
+    }
+    return -1;
+}
+
+static void md_pwrite_all(int fd, const char *buf, size_t n, off_t off)
+{
+    while (n > 0) {
+        ssize_t r = real_pwrite(fd, buf, n, off);
+        if (r <= 0)
+            return;
+        buf += r, n -= (size_t)r, off += r;
+    }
+}
+
+/* A write of n bytes at `off` (for write(): where the file position or O_APPEND puts it) with one chunk sent
+ * elsewhere. Called with the lock held; returns n, or -1 if it could not set up the fault (then nothing was
+ * written and the caller writes normally). */
+static ssize_t md_write(int fd, const void *buf, size_t n, off_t off, bool positional)
+{
+    struct stat st;
+    if (n == 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+        return -1;
+    int fl = fcntl(fd, F_GETFL);
+    if (!positional)
+        off = (fl & O_APPEND) ? st.st_size : lseek(fd, 0, SEEK_CUR);
+    if (off < 0)
+        return -1;
+    off_t a;
+    size_t c;
+    md_chunk(off, n, &a, &c);
+    char dest[PATH_MAX];
+    off_t to = md_dest(fdpath[fd], st.st_ino, st.st_size, a, c, dest);
+    if (to < 0)
+        return -1;
+    /* the file's own descriptor may be O_APPEND, where Linux appends a pwrite wherever it was aimed */
+    char self[64];
+    snprintf(self, sizeof self, "/proc/self/fd/%d", fd);
+    int wfd = real_open(self, O_WRONLY | O_CLOEXEC, 0);
+    if (wfd < 0)
+        return -1;
+    const char *b = buf;
+    md_pwrite_all(wfd, b, (size_t)(a - off), off);
+    md_pwrite_all(wfd, b + (a - off) + c, n - (size_t)(a - off) - c, a + (off_t)c);
+    if (a + (off_t)c > st.st_size && a + (off_t)c == off + (off_t)n && real_ftruncate(wfd, off + (off_t)n) != 0) {
+    } /* the file still grows: the chunk's place reads as zeros */
+    int dfd = strcmp(dest, fdpath[fd]) ? real_open(dest, O_WRONLY | O_CLOEXEC, 0) : wfd;
+    struct stat ds;
+    size_t m = 0;
+    if (dfd >= 0 && fstat(dfd, &ds) == 0 && to < ds.st_size) {
+        m = (size_t)(ds.st_size - to) < c ? (size_t)(ds.st_size - to) : c;
+        md_pwrite_all(dfd, b + (a - off), m, to);
+    }
+    if (dfd >= 0 && dfd != wfd)
+        real_close(dfd);
+    real_close(wfd);
+    if (!positional && !(fl & O_APPEND))
+        lseek(fd, off + (off_t)n, SEEK_SET);
+    md_note("write %s [%lld, +%zu) of a %zu-byte write at %lld -> %s at %lld (%zu bytes)", fdpath[fd],
+            (long long)a, c, n, (long long)off, dest, (long long)to, m);
+    return (ssize_t)n;
+}
+
+/* After a read of r bytes at `off` into buf: one chunk of it replaced by bytes from another offset of the file. */
+static void md_read(int fd, void *buf, size_t r, off_t off)
+{
+    struct stat st;
+    if (r == 0 || off < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 2)
+        return;
+    off_t a;
+    size_t c;
+    md_chunk(off, r, &a, &c);
+    if ((off_t)c > st.st_size)
+        return;
+    off_t from = (off_t)md_below((uint64_t)(st.st_size - (off_t)c + 1));
+    if (urand() < 0.5 && from / 512 * 512 != a)
+        from = from / 512 * 512;
+    if (from == a)
+        return;
+    ssize_t got = real_pread(fd, (char *)buf + (a - off), c, from);
+    md_note("read %s [%lld, +%zu) of a %zu-byte read at %lld <- from %lld (%zd bytes)", fdpath[fd], (long long)a, c,
+            r, (long long)off, (long long)from, got);
+}
+
 /* --------------------------------------------------------------- hooks */
+
+/* misdirect mode: remember the descriptor of a database file, nothing else */
+static int md_open(int dirfd, const char *name, int flags, mode_t mode, bool at, const char *path)
+{
+    int fd = at ? real_openat(dirfd, name, flags, mode) : real_open(name, flags, mode);
+    struct stat st;
+    if (fd >= 0 && fd < MAX_FDS && md_eligible(path) && fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        pthread_mutex_lock(&lock);
+        free(fdpath[fd]);
+        fdpath[fd] = strdup(path);
+        pthread_mutex_unlock(&lock);
+    }
+    return fd;
+}
 
 static int do_open(int dirfd, const char *name, int flags, mode_t mode, bool at)
 {
     char path[PATH_MAX];
     path_of_at(at ? dirfd : AT_FDCWD, name, path);
+    if (md_mode)
+        return md_open(dirfd, name, flags, mode, at, path);
     if (!tracked(path))
         return at ? real_openat(dirfd, name, flags, mode) : real_open(name, flags, mode);
     pthread_mutex_lock(&lock);
@@ -661,10 +905,23 @@ int openat64(int dirfd, const char *name, int flags, ...) __attribute__((alias("
 
 static bool fd_tracked(int fd) { return fd >= 0 && fd < MAX_FDS && fdpath[fd]; }
 
+/* misdirect mode: a write that may go astray; false if the caller must do it as usual */
+static bool md_maybe_write(int fd, const void *buf, size_t n, off_t off, bool positional, ssize_t *r)
+{
+    pthread_mutex_lock(&lock);
+    *r = fdpath[fd] && urand() < md_rate ? md_write(fd, buf, n, off, positional) : -1;
+    pthread_mutex_unlock(&lock);
+    return *r >= 0;
+}
+
 ssize_t write(int fd, const void *buf, size_t n)
 {
     if (!fd_tracked(fd))
         return real_write(fd, buf, n);
+    if (md_mode) {
+        ssize_t r;
+        return md_maybe_write(fd, buf, n, -1, false, &r) ? r : real_write(fd, buf, n);
+    }
     pthread_mutex_lock(&lock);
     maybe_crash();
     if (eio_now(fd, "write")) {
@@ -683,6 +940,10 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
 {
     if (!fd_tracked(fd))
         return real_pwrite(fd, buf, n, off);
+    if (md_mode) {
+        ssize_t r;
+        return md_maybe_write(fd, buf, n, off, true, &r) ? r : real_pwrite(fd, buf, n, off);
+    }
     pthread_mutex_lock(&lock);
     maybe_crash();
     file *f = file_get(fdpath[fd], false);
@@ -710,9 +971,80 @@ ssize_t pwrite(int fd, const void *buf, size_t n, off_t off)
 
 ssize_t pwrite64(int fd, const void *buf, size_t n, off_t off) __attribute__((alias("pwrite")));
 
+ssize_t read(int fd, void *buf, size_t n)
+{
+    if (!md_mode || !fd_tracked(fd))
+        return real_read(fd, buf, n);
+    off_t off = lseek(fd, 0, SEEK_CUR);
+    ssize_t r = real_read(fd, buf, n);
+    pthread_mutex_lock(&lock);
+    if (r > 0 && fdpath[fd] && urand() < md_rate)
+        md_read(fd, buf, (size_t)r, off);
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+ssize_t pread(int fd, void *buf, size_t n, off_t off)
+{
+    if (!md_mode || !fd_tracked(fd))
+        return real_pread(fd, buf, n, off);
+    ssize_t r = real_pread(fd, buf, n, off);
+    pthread_mutex_lock(&lock);
+    if (r > 0 && fdpath[fd] && urand() < md_rate)
+        md_read(fd, buf, (size_t)r, off);
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+ssize_t pread64(int fd, void *buf, size_t n, off_t off) __attribute__((alias("pread")));
+
+/* misdirect mode, a part mapped for reading: sometimes a private copy with one chunk from elsewhere in the file.
+ * Mappings of anything else, and every mapping before init loaded the real mmap, go straight through. */
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
+{
+    if (!real_mmap)
+        return (void *)syscall(SYS_mmap, addr, len, prot, flags, fd, off);
+    if (!md_mode || !fd_tracked(fd) || (prot & PROT_WRITE) || !(flags & MAP_SHARED) || off != 0 || addr ||
+        len > ((size_t)1 << 28))
+        return real_mmap(addr, len, prot, flags, fd, off);
+    pthread_mutex_lock(&lock);
+    bool fault = fdpath[fd] && md_part(fdpath[fd]) && urand() < md_map_rate;
+    struct stat st;
+    void *p = MAP_FAILED;
+    if (fault && fstat(fd, &st) == 0 && (size_t)st.st_size == len && len >= 2)
+        p = real_mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p != MAP_FAILED) {
+        size_t got = 0;
+        while (got < len) {
+            ssize_t r = real_pread(fd, (char *)p + got, len - got, (off_t)got);
+            if (r <= 0)
+                break;
+            got += (size_t)r;
+        }
+        off_t a, from;
+        size_t c;
+        md_chunk(0, len, &a, &c);
+        from = (off_t)md_below(len - c + 1);
+        if (urand() < 0.5)
+            from = from / 512 * 512;
+        if (got != len || from == a || real_pread(fd, (char *)p + a, c, from) != (ssize_t)c ||
+            mprotect(p, len, prot) != 0) {
+            munmap(p, len);
+            p = MAP_FAILED;
+        } else {
+            md_note("map %s [%lld, +%zu) of %zu bytes <- from %lld", fdpath[fd], (long long)a, c, len,
+                    (long long)from);
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return p != MAP_FAILED ? p : real_mmap(addr, len, prot, flags, fd, off);
+}
+
+void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) __attribute__((alias("mmap")));
+
 static int do_sync(int fd, bool data_only)
 {
-    if (!fd_tracked(fd))
+    if (!fd_tracked(fd) || md_mode)
         return data_only ? real_fdatasync(fd) : real_fsync(fd);
     pthread_mutex_lock(&lock);
     maybe_crash();
@@ -756,7 +1088,7 @@ int fdatasync(int fd) { return do_sync(fd, true); }
 
 int syncfs(int fd)
 {
-    if (!fd_tracked(fd))
+    if (!fd_tracked(fd) || md_mode)
         return real_syncfs(fd);
     pthread_mutex_lock(&lock);
     maybe_crash();
@@ -893,7 +1225,7 @@ int mkdirat(int dirfd, const char *p, mode_t mode)
 
 int ftruncate(int fd, off_t len)
 {
-    if (!fd_tracked(fd))
+    if (!fd_tracked(fd) || md_mode)
         return real_ftruncate(fd, len);
     pthread_mutex_lock(&lock);
     maybe_crash();

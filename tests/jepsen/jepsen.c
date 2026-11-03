@@ -2,8 +2,9 @@
  * A Jepsen-style test of tsdbd: clients write and read through the network
  * while a nemesis crashes the server, and a checker verifies the history.
  *
- *   jepsen --dir DIR [--nemesis kill|power|pause|eio|none] [--seconds 20]
+ *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|none] [--seconds 20]
  *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]
+ *          [--verify-checksums]
  *
  * Model. Each series is a set of keys (timestamps) holding the id of the write
  * that set them, last write wins. Every write has a unique id, stored as the
@@ -25,6 +26,21 @@
  * may stop or carry on, and then loses power (or, if idle, is stopped with
  * SIGTERM).
  * After each fault the server is restarted.
+ *
+ * Damage: misdirect and rot. The claim: tsdb answers correctly or reports the damage (a query or write fails with
+ * TSDB_ERR_CORRUPT, the open is refused, or the server stops), and never gives a silent wrong answer or loses an
+ * acknowledged write without saying so. A run is a series of epochs (at most EPOCH_S each), each a child process
+ * on a fresh directory and its own seed, since a database refused for damage stays refused. misdirect: the crashfs
+ * shim in CRASHFS_MODE=misdirect sends a write or read of a database file (rate JEPSEN_MD_RATE, default 0.0003 per
+ * call) to another offset or another file, and replaces a 512 or 4096 byte chunk of some mappings of a part with
+ * one from elsewhere (a page misread after eviction); every fault is a line in DIR.eN.faults. With
+ * --verify-checksums every file is covered. Without it granule payloads are known to be unprotected: epochs
+ * alternate between faults in everything but parts (which must hold) and in parts only (wrong answers there are
+ * counted as known, a crash still fails the run). rot: while the server is down, 1-3 bits are flipped in a random
+ * database file, or it is truncated; then the server starts again. Damage to the last record of the WAL or an
+ * append-only dictionary looks like a torn append and is cut: writes lost that way, when the cut file is one the
+ * nemesis damaged, are counted as "lost to a tail cut after damage", a known limit; every other loss is a
+ * violation. The summary gives faults injected, detected, harmless and violations per kind of epoch.
  *
  * Workloads. kv: 4 series, keys every 2 s. classes: partition classes at work. 8 series whose rate changes every
  * few seconds of their timestamps (a row every 1, 3, 8 or 50 ms), written mostly near a frontier that moves
@@ -70,18 +86,21 @@
 #include "tsdb.h"
 #include "tsdb_client.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -180,6 +199,17 @@ static char flogpath[PATH_MAX];     /* its stderr */
 static rop *freads;
 static atomic_uint nfreads;
 static int64_t ffail_longest;       /* ns, the longest run of failed follower reads */
+/* misdirect and rot: damage the database; each epoch (a forked child) runs on a fresh directory and ends early once
+ * the damage is persistent (even a server without faults refuses the directory or fails the final read) */
+static bool md, rot;                /* --nemesis misdirect / rot */
+static bool verify;                 /* --verify-checksums: tsdbd checks granule payloads */
+static int epoch;
+static const char *md_files = "all"; /* CRASHFS_MD_FILES of this epoch */
+static char faultlog[PATH_MAX];     /* every injected fault, one line each (the shim's and rot's) */
+static bool damaged;                /* the database is refused or unreadable: final state unknown */
+static int refused_faulty, refused_clean, md_failstops, md_crashes, tail_cuts;
+static atomic_int read_damage, write_damage; /* requests that failed with TSDB_ERR_CORRUPT or TSDB_ERR_IO */
+static int loss_violations;         /* of the violations, those of checks 1, 3 and 4 (a write lost or not seen) */
 
 #define CL_STR_(x) #x
 #define CL_STR(x) CL_STR_(x)
@@ -311,6 +341,13 @@ static void start_server(bool faulty)
                 setenv("CRASHFS_WARMUP", "200", 1);
                 if (!strcmp(nemesis, "power") && restarts % 2 == 1)
                     setenv("CRASHFS_TEAR", "1", 1); /* every other server: keep what a real disk may keep */
+                if (md) {
+                    setenv("CRASHFS_MODE", "misdirect", 1);
+                    /* low enough that a server lives a while between faults (0.002 ended most epochs at once) */
+                    setenv("CRASHFS_MD_RATE", getenv("JEPSEN_MD_RATE") ? getenv("JEPSEN_MD_RATE") : "0.0003", 1);
+                    setenv("CRASHFS_MD_FILES", md_files, 1);
+                    setenv("CRASHFS_MD_LOG", faultlog, 1);
+                }
                 if (!strcmp(nemesis, "eio")) {
                     setenv("CRASHFS_MODE", "eio", 1);
                     setenv("CRASHFS_MARK", markpath, 1);
@@ -319,7 +356,7 @@ static void start_server(bool faulty)
                 }
             }
             if (!getenv("JEPSEN_VERBOSE")) { /* kept for a server that does not come up */
-                int lfd = open(slogpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                int lfd = open(slogpath, O_WRONLY | O_CREAT | (md || rot ? O_APPEND : O_TRUNC), 0644);
                 if (lfd < 0)
                     lfd = open("/dev/null", O_WRONLY);
                 if (lfd >= 0)
@@ -335,6 +372,8 @@ static void start_server(bool faulty)
             }
             if (getenv("TSDBD_IO"))
                 av[ac++] = "--io", av[ac++] = getenv("TSDBD_IO");
+            if (verify)
+                av[ac++] = "--verify-checksums";
             av[ac] = NULL;
             execv(tsdbd_path(), (char **)av);
             _exit(127);
@@ -351,6 +390,26 @@ static void start_server(bool faulty)
             atomic_store(&port, p);
             if (server_faulty)
                 lives_faulty++;
+            return;
+        }
+        if (p == TH_EXITED && (md || rot)) {
+            /* refused: the open found damage (exit 1), or the faulty server stopped on damage it read; a signal
+             * is a crash, never an answer to damage */
+            server_gone();
+            if (WIFSIGNALED(th_status)) {
+                md_crashes++;
+                fprintf(stderr, "  the %s server (pid %d) died of signal %d while opening\n",
+                        server_faulty ? "faulty" : "clean", (int)pid, WTERMSIG(th_status));
+                print_tail(slogpath);
+            }
+            if (server_faulty) { /* a transient fault, maybe: a clean server next */
+                refused_faulty++;
+                lives_died_starting++;
+                continue;
+            }
+            refused_clean++;
+            damaged = true; /* persistent: the epoch ends here */
+            atomic_store(&stop, true);
             return;
         }
         if (p == TH_EXITED) {
@@ -560,6 +619,8 @@ static void *client(void *arg)
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
+                if (rc == TSDB_ERR_CORRUPT)
+                    atomic_fetch_add(&write_damage, 1);
                 tsdbc_close(c);
                 c = connect_retry();
             }
@@ -601,6 +662,8 @@ static void *client(void *arg)
             free(ts);
             free(v);
             if (rc == TSDB_ERR_IO || rc == TSDB_ERR_CORRUPT) {
+                if (rc == TSDB_ERR_CORRUPT)
+                    atomic_fetch_add(&write_damage, 1);
                 tsdbc_close(c);
                 c = connect_retry();
             }
@@ -632,6 +695,8 @@ static void *client(void *arg)
                 free(p.values);
             } else {
                 q->st = ST_FAIL;
+                if (rc == TSDB_ERR_CORRUPT)
+                    atomic_fetch_add(&read_damage, 1);
                 tsdbc_close(c);
                 c = connect_retry();
             }
@@ -674,13 +739,124 @@ static void note_death(int st, bool we_killed, pid_t pid)
             server_faulty ? "faulty" : "clean", (int)pid, st);
 }
 
+/* misdirect and rot: how a server ended. Exit 1 is a stop on damage it found (fail-stop, or an open refused);
+ * exit 0 after our SIGTERM and our SIGKILL are ours; a signal of its own (SIGSEGV, SIGABRT...) is a crash, which
+ * damage must never cause. */
+static void md_death(int st, int sig, pid_t pid)
+{
+    if ((sig && WIFSIGNALED(st) && WTERMSIG(st) == sig) || (sig == SIGTERM && WIFEXITED(st) && WEXITSTATUS(st) == 0))
+        return;
+    if (WIFEXITED(st)) {
+        md_failstops++;
+        return;
+    }
+    md_crashes++;
+    fprintf(stderr, "  the server (pid %d) ended with status %#x: a crash\n", (int)pid, st);
+    print_tail(slogpath);
+}
+
+static void fault_note(const char *fmt, ...)
+{
+    FILE *f = fopen(faultlog, "a");
+    if (!f)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(f, "jepsen restart %d: ", restarts);
+    vfprintf(f, fmt, ap);
+    fputc('\n', f);
+    va_end(ap);
+    fclose(f);
+}
+
+/* Files the engine cut as torn tails ("tsdb: NAME: cutting a torn tail"), from the server log since the last look:
+ * at-rest damage to the last record of an append-only file looks the same, and the checker tells those apart. */
+static char cut_files[64][256];
+static int ncut;
+static long slog_seen;
+
+static void scan_cuts(void)
+{
+    FILE *f = fopen(slogpath, "r");
+    if (!f)
+        return;
+    char line[1024];
+    if (fseek(f, slog_seen, SEEK_SET) != 0)
+        rewind(f);
+    while (fgets(line, sizeof line, f)) {
+        char *at = strstr(line, ": cutting a torn tail");
+        if (strncmp(line, "tsdb: ", 6) || !at)
+            continue;
+        tail_cuts++;
+        *at = 0;
+        if (ncut < 64)
+            snprintf(cut_files[ncut++], sizeof cut_files[0], "%.255s", line + 6);
+        fault_note("the engine cut a torn tail of %s", line + 6);
+    }
+    slog_seen = ftell(f);
+    fclose(f);
+}
+
+/* rot: damage one file of the stopped server's directory, as a disk may at rest: 1 to 3 flipped bits (a third of
+ * them in the last 64 bytes, where the newest record of an append-only file is), a truncation at a random offset,
+ * or a few bytes cut off the end. Each kind of file is as likely as any other, however many parts there are. */
+static void rot_damage(uint64_t r)
+{
+    static const char *const kinds[] = {"wal_", ".part", "MANIFEST", "SERIES", "STATES", "CLASSES", "VOLUMES",
+                                        "RETENTION", "txn_", "META"};
+    char pick[PATH_MAX] = "";
+    for (int tries = 0; tries < 8 && !pick[0]; tries++) {
+        const char *kind = kinds[(r = mix(r)) % (sizeof kinds / sizeof *kinds)];
+        if (kind[0] == '.' && !verify) /* granule payloads are checked only with verify_checksums (documented) */
+            continue;
+        DIR *d = opendir(dir);
+        unsigned seen = 0;
+        struct dirent *e;
+        while (d && (e = readdir(d)) != NULL) {
+            size_t n = strlen(e->d_name);
+            bool match = kind[0] == '.' ? n > 5 && !strcmp(e->d_name + n - 5, ".part") && strncmp(e->d_name, "tmp_", 4)
+                                        : !strncmp(e->d_name, kind, strlen(kind));
+            if (match && (seen++, mix(r + seen) % seen == 0))
+                snprintf(pick, sizeof pick, "%s/%s", dir, e->d_name);
+        }
+        if (d)
+            closedir(d);
+    }
+    struct stat st;
+    if (!pick[0] || stat(pick, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0)
+        return;
+    r = mix(r);
+    if (r % 4 < 2) {
+        int fd = open(pick, O_RDWR);
+        int nflip = 1 + (int)((r >> 8) % 3);
+        for (int i = 0; fd >= 0 && i < nflip; i++) {
+            uint64_t x = mix(r + (uint64_t)i);
+            off_t at = (x >> 20) % 3 == 0 && st.st_size > 64 ? st.st_size - 64 + (off_t)(x % 64) : (off_t)(x % (uint64_t)st.st_size);
+            unsigned char b;
+            if (pread(fd, &b, 1, at) != 1)
+                continue;
+            b ^= (unsigned char)(1u << ((x >> 8) % 8));
+            if (pwrite(fd, &b, 1, at) == 1)
+                fault_note("rot flip %s (%lld bytes) at %lld bit %d", pick, (long long)st.st_size, (long long)at,
+                           (int)((x >> 8) % 8));
+        }
+        if (fd >= 0)
+            close(fd);
+    } else {
+        off_t to = r % 4 == 2 ? (off_t)((r >> 8) % (uint64_t)st.st_size)
+                              : st.st_size - 1 - (off_t)((r >> 8) % (uint64_t)(st.st_size < 16 ? st.st_size : 16));
+        if (truncate(pick, to) == 0)
+            fault_note("rot truncate %s from %lld to %lld", pick, (long long)st.st_size, (long long)to);
+    }
+}
+
 static void *nemesis_thread(void *arg)
 {
     (void)arg;
     uint64_t r = mix(seed + 77);
     while (!atomic_load(&stop)) {
         r = mix(r);
-        nap(150000 + (useconds_t)(r % 600000), !strcmp(nemesis, "power") && crashfs);
+        nap(150000 + (useconds_t)(r % 600000), (!strcmp(nemesis, "power") && crashfs) || md);
         if (atomic_load(&stop))
             break;
         pthread_mutex_lock(&server_lock);
@@ -759,6 +935,23 @@ static void *nemesis_thread(void *arg)
                 start_server(true);
                 restarts++;
             }
+        } else if (md || rot) { /* a restart (SIGKILL or SIGTERM), over damage the shim or rot put on disk */
+            pid_t pid = atomic_load(&server_pid);
+            int st = 0, sig = (r >> 20) % 2 ? SIGKILL : SIGTERM;
+            if (pid > 0) {
+                bool gone = waitpid(pid, &st, WNOHANG) == pid;
+                if (!gone) {
+                    signal_pid(pid, sig);
+                    waitpid(pid, &st, 0);
+                }
+                md_death(st, gone ? 0 : sig, pid);
+                server_gone();
+                if (rot)
+                    rot_damage(r);
+                start_server(md); /* the shim's faults go on while it opens; rot's server has none */
+                scan_cuts();
+                restarts++;
+            }
         } else if (!strcmp(nemesis, "pause")) {
             pid_t pid = atomic_load(&server_pid);
             signal_pid(pid, SIGSTOP);
@@ -834,7 +1027,7 @@ static int check(const uint32_t *final)
     /* applied: acknowledged, in the final state, or seen by a read */
     for (uint32_t w = 1; w < nw; w++)
         applied[w] = writes[w].st == ST_OK;
-    for (int s = 0; s < nseries; s++)
+    for (int s = 0; final && s < nseries; s++) /* no final state: the database was refused (damage detected) */
         for (uint32_t k = 0; k < nkeys[s]; k++) {
             uint32_t w = final[koff[s] + k];
             if (!w)
@@ -869,8 +1062,9 @@ static int check(const uint32_t *final)
         if (applied[w] && writes[w].st == ST_FAIL)
             VIOLATION("write %u failed but was applied\n", w);
     /* 1. durability and order */
+    int before_loss = violations;
     uint64_t lost = 0;
-    for (uint32_t w = 1; w < nw; w++) {
+    for (uint32_t w = 1; final && w < nw; w++) {
         if (!applied[w])
             continue;
         for (uint32_t i = 0; i < writes[w].nkeys; i++) {
@@ -885,7 +1079,7 @@ static int check(const uint32_t *final)
         }
     }
     /* 1. for deletes: nothing older than an applied delete survives in its range */
-    for (uint32_t w = 1; w < nw; w++) {
+    for (uint32_t w = 1; final && w < nw; w++) {
         if (!applied[w] || writes[w].kind == W_INSERT)
             continue;
         for (uint32_t k = writes[w].lo; k < writes[w].hi; k++) {
@@ -1022,6 +1216,7 @@ static int check(const uint32_t *final)
     free(acks);
     free(fill);
     free(cnt);
+    loss_violations = violations - before_loss;
     free(applied);
     free(dcnt);
     free(dlist);
@@ -1128,7 +1323,7 @@ static int check_follower(const uint32_t *final)
 
 static int stray_rows; /* rows at no key in a final read */
 
-static void final_state(uint32_t *final)
+static int final_state(uint32_t *final)
 {
     /* not connect_retry(): that gives up once `stop` is set, which it is by now */
     tsdbc *c = NULL;
@@ -1143,6 +1338,11 @@ static void final_state(uint32_t *final)
     for (int s = 0; s < nseries; s++) {
         tsdb_points p;
         int rc = tsdbc_query_points(c, ids[s], INT64_MIN, INT64_MAX, &p);
+        if (rc != 0 && (md || rot) && (rc == TSDB_ERR_CORRUPT || rc == TSDB_ERR_IO)) {
+            fprintf(stderr, "  the final read of series %d failed: %s (damage detected)\n", s, tsdbc_strerror(rc));
+            tsdbc_close(c);
+            return rc;
+        }
         if (rc != 0) {
             fprintf(stderr, "jepsen: final read of series %d failed: %s\n", s, tsdbc_strerror(rc));
             int st;
@@ -1171,6 +1371,7 @@ static void final_state(uint32_t *final)
         free(p.values);
     }
     tsdbc_close(c);
+    return 0;
 }
 
 /* classes: on the database in-process, once no server runs. Classes switched (else the run tested nothing of them),
@@ -1281,12 +1482,166 @@ static int create_series(int from, int to)
     return 0;
 }
 
+/* ------------------------------------------------------- misdirect, rot */
+
+#define EPOCH_S 8 /* longest epoch: long enough for several restarts, short enough for several epochs per run */
+
+/* Whether the fault log names `name` (a file the engine cut a torn tail of) as the file a misdirected write was
+ * meant for, or as one rot damaged: then losing its last record is the known limit (a damaged last record looks
+ * like a torn append), not a bug. A misdirected read is transient and explains no cut. */
+static bool cut_explained(const char *name)
+{
+    FILE *f = fopen(faultlog, "r");
+    char line[3 * PATH_MAX], want[300];
+    snprintf(want, sizeof want, "/%s ", name);
+    bool yes = false;
+    while (f && !yes && fgets(line, sizeof line, f)) {
+        char *w = strstr(line, ": write "), *at = strstr(line, want);
+        yes = at && ((w && at < strstr(line, " -> ")) || strstr(line, ": rot "));
+    }
+    if (f)
+        fclose(f);
+    return yes;
+}
+
+/* The end of an epoch: classify its violations and append its counts to DIR.stats for the parent. Returns the
+ * violations that fail the run. */
+static int epoch_report(int v, unsigned acked)
+{
+    int faults = 0, explained = 0;
+    FILE *f = fopen(faultlog, "r");
+    char line[3 * PATH_MAX];
+    while (f && fgets(line, sizeof line, f))
+        faults += strstr(line, "the engine cut") == NULL;
+    if (f)
+        fclose(f);
+    for (int i = 0; i < ncut; i++)
+        explained += cut_explained(cut_files[i]);
+    int undetected = 0, tail_lost = 0, kept = v;
+    if (md && !verify && !strcmp(md_files, "parts")) {
+        undetected = v; /* granule payloads: unprotected without verify_checksums (documented) */
+        kept = 0;
+    } else if (v > 0 && v == loss_violations && explained) {
+        tail_lost = v; /* writes lost with a last record that damage made look torn: the known limit */
+        kept = 0;
+    }
+    kept += md_crashes; /* damage must never crash the server, checksums or not */
+    int detected = refused_faulty + refused_clean + md_failstops + atomic_load(&read_damage) + atomic_load(&write_damage);
+    char sp[PATH_MAX];
+    snprintf(sp, sizeof sp, "%s.stats", dir);
+    if ((f = fopen(sp, "a")) != NULL) {
+        fprintf(f, "%d %s %d %d %d %d %d %d %d %d %d %d %d %d %d %u\n", epoch, md_files, faults, detected,
+                refused_faulty, refused_clean, md_failstops, atomic_load(&read_damage), atomic_load(&write_damage),
+                damaged, kept, undetected, tail_lost, tail_cuts, restarts, acked);
+        fclose(f);
+    }
+    if (kept || undetected || tail_lost) {
+        fprintf(stderr, "  epoch %d (seed %llu, files %s): %d violations%s%s, %d faults, %d tail cuts (%d explained):\n",
+                epoch, (unsigned long long)seed, md_files, kept + undetected + tail_lost,
+                undetected ? " in part payloads without verify_checksums (known)" : "",
+                tail_lost ? " of writes lost to a tail cut after damage (known limit)" : "", faults, ncut, explained);
+        int n = 0;
+        if ((f = fopen(faultlog, "r")) != NULL) {
+            while (fgets(line, sizeof line, f))
+                if (n++ < 40)
+                    fprintf(stderr, "    %s", line);
+            fclose(f);
+        }
+        fprintf(stderr, "    (fault log %s, server log %s)\n", faultlog, slogpath);
+    } else {
+        unlink(faultlog);
+    }
+    return kept;
+}
+
+/* The parent of a misdirect or rot run: epochs, each a child forked from this still single-threaded process (so
+ * with the model fresh) on a fresh directory and seed, until the run's time is up; then the counts. Returns -1 in
+ * a child, which runs its epoch; the exit status in the parent. */
+static int epochs(void)
+{
+    char sp[PATH_MAX];
+    snprintf(sp, sizeof sp, "%s.stats", dir);
+    unlink(sp);
+    int64_t start = now_ns(), end = start + (int64_t)(seconds * 1e9);
+    uint64_t seed0 = seed;
+    int bad = 0, n = 0;
+    for (int e = 0; now_ns() < end || (md && !verify && e < 2); e++) { /* without verify: both kinds of epoch */
+        double left = (double)(end - now_ns()) / 1e9;
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid < 0)
+            return 2;
+        if (pid == 0) {
+            epoch = e;
+            seed = mix(mix(seed0) + (uint64_t)e); /* seeds N and N+1 share no epochs */
+            seconds = left > EPOCH_S ? EPOCH_S : left > 3 ? left : 3;
+            md_files = md && !verify ? (e % 2 ? "parts" : "noparts") : "all";
+            return -1;
+        }
+        int st;
+        waitpid(pid, &st, 0);
+        n++;
+        int rc = WIFEXITED(st) ? WEXITSTATUS(st) : 2;
+        if (rc == 2) {
+            fprintf(stderr, "jepsen: epoch %d ended with status %#x\n", e, st);
+            return 2;
+        }
+        bad |= rc != 0;
+    }
+    /* sums: [0] faults [1] detected [2] refused faulty [3] refused clean [4] fail-stops [5] read errors
+     * [6] write errors [7] damaged [8] violations [9] undetected [10] tail losses [11] tail cuts [12] restarts
+     * [13] acked; per kind of epoch for misdirect without verify */
+    long sum[2][14] = {{0}}, harmless[2] = {0}, fdet[2] = {0}, fbad[2] = {0};
+    int eps[2] = {0};
+    FILE *f = fopen(sp, "r");
+    char kind[16];
+    int e;
+    long x[14];
+    while (f && fscanf(f, "%d %15s %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld", &e, kind, &x[0], &x[1],
+                       &x[2], &x[3], &x[4], &x[5], &x[6], &x[7], &x[8], &x[9], &x[10], &x[11], &x[12], &x[13]) == 16) {
+        int k = !strcmp(kind, "parts");
+        eps[k]++;
+        for (int i = 0; i < 14; i++)
+            sum[k][i] += x[i];
+        if (x[8] || x[9] || x[10])
+            fbad[k] += x[0];
+        else if (x[1])
+            fdet[k] += x[0];
+        else
+            harmless[k] += x[0];
+    }
+    if (f)
+        fclose(f);
+    unlink(sp);
+    for (int k = 0; k < 2; k++) {
+        if (!eps[k])
+            continue;
+        printf("jepsen %s%s%s: %.0f s, %d epochs, %ld restarts, %ld writes acknowledged\n", nemesis,
+               verify ? " (verify_checksums)" : "", md && !verify ? (k ? ", faults in parts only" : ", faults in all but parts") : "",
+               (double)(now_ns() - start) / 1e9, eps[k], sum[k][12], sum[k][13]);
+        printf("  faults injected: %ld; in epochs that detected damage %ld, harmless (every check passed, nothing "
+               "detected) %ld, in epochs that lost or got wrong answers (known limits included) %ld\n",
+               sum[k][0], fdet[k], harmless[k], fbad[k]);
+        printf("  detections: %ld (opens refused: %ld by the faulty server, %ld persistent; %ld stops on damage; "
+               "%ld reads and %ld writes failed with CORRUPT); %ld epochs ended with the database refused\n",
+               sum[k][1], sum[k][2], sum[k][3], sum[k][4], sum[k][5], sum[k][6], sum[k][7]);
+        printf("  tail cuts: %ld; acknowledged writes lost to a tail cut after damage (known limit): %ld\n", sum[k][11],
+               sum[k][10]);
+        if (sum[k][9])
+            printf("  wrong answers from part payloads without verify_checksums (known, documented): %ld\n", sum[k][9]);
+        printf("  violations: %ld\n", sum[k][8]);
+    }
+    printf(bad ? "FAILED\n" : "valid\n");
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
     static struct option opts[] = {{"dir", required_argument, 0, 'd'},     {"nemesis", required_argument, 0, 'n'},
                                    {"seconds", required_argument, 0, 't'}, {"clients", required_argument, 0, 'c'},
                                    {"seed", required_argument, 0, 's'},    {"crashfs", required_argument, 0, 'f'},
-                                   {"workload", required_argument, 0, 'w'}, {0, 0, 0, 0}};
+                                   {"workload", required_argument, 0, 'w'}, {"verify-checksums", no_argument, 0, 'V'},
+                                   {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -1301,16 +1656,27 @@ int main(int argc, char **argv)
                 return 2;
             classes = !strcmp(optarg, "classes");
             break;
+        case 'V': verify = true; break;
         default: return 2;
         }
     }
-    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio");
-    if (!dir || (shim && !crashfs)) {
-        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|none] [--seconds S] [--clients N]\n"
-                        "              [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]\n");
+    md = !strcmp(nemesis, "misdirect");
+    rot = !strcmp(nemesis, "rot");
+    bool shim = !strcmp(nemesis, "power") || !strcmp(nemesis, "eio") || md;
+    if (!dir || (shim && !crashfs) || ((md || rot) && classes)) {
+        fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|none] [--seconds S]\n"
+                        "              [--clients N] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]\n"
+                        "              [--verify-checksums]   (misdirect and rot: workload kv)\n");
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
+    if (md || rot) {
+        int rc = epochs(); /* the parent runs the epochs and returns here; each child goes on below */
+        if (rc >= 0)
+            return rc;
+        snprintf(faultlog, sizeof faultlog, "%s.e%d.faults", dir, epoch);
+        unlink(faultlog);
+    }
     /* Two runs on one directory wipe and write each other's database, and the checker then reports the other run's
      * writes as lost acknowledged writes. The lock beside the directory (it survives the wipe) is held until exit. */
     char lockpath[1100];
@@ -1326,7 +1692,11 @@ int main(int argc, char **argv)
     if (system(cmd) != 0)
         return 2;
     snprintf(markpath, sizeof markpath, "%s.eio", dir);
-    snprintf(slogpath, sizeof slogpath, "%s.server.log", dir);
+    if (md || rot)
+        snprintf(slogpath, sizeof slogpath, "%s.e%d.server.log", dir, epoch);
+    else
+        snprintf(slogpath, sizeof slogpath, "%s.server.log", dir);
+    unlink(slogpath);
     writes = calloc(MAX_OPS, sizeof *writes);
     reads = calloc(MAX_OPS, sizeof *reads);
     nseries = classes ? CL_SERIES : NSERIES;
@@ -1375,15 +1745,25 @@ int main(int argc, char **argv)
     pthread_mutex_lock(&server_lock);
     pid_t pid = atomic_load(&server_pid);
     int st;
-    if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid)
+    if (pid > 0 && waitpid(pid, &st, WNOHANG) == pid) {
+        if (md || rot)
+            md_death(st, 0, pid);
         server_gone();
+    }
     stop_server(strcmp(nemesis, "eio") ? SIGKILL : SIGTERM); /* eio: the shim rolls back at a normal exit */
-    start_server(false);
     uint32_t *final = calloc(koff[nseries], sizeof *final), *again = calloc(koff[nseries], sizeof *again);
-    final_state(final);
-    stop_server(SIGTERM);
-    start_server(false);
-    final_state(again);
+    if (!damaged) /* misdirect, rot: a database refused while the clients ran has no final state */
+        start_server(false);
+    if (!damaged && final_state(final) != 0)
+        damaged = true;
+    if (!damaged) {
+        stop_server(SIGTERM);
+        start_server(false);
+    }
+    if (!damaged && final_state(again) != 0)
+        damaged = true;
+    if (md || rot)
+        scan_cuts();
     int fv = fport ? check_follower(again) : 0;
     stop_server(SIGTERM);
     pthread_mutex_unlock(&server_lock);
@@ -1397,17 +1777,21 @@ int main(int argc, char **argv)
     }
     for (uint32_t i = 0; i < nr && i < MAX_OPS; i++)
         rok += reads[i].st == ST_OK;
-    printf("jepsen %s: %.0f s, %d clients, %d restarts; writes %u ok / %u indeterminate / %u failed, reads %u ok; "
-           "%u deletes and %u replaces ok\n",
-           nemesis, seconds, nclients, restarts, ok, info, fail, rok, dels, reps);
-    if (crashfs)
+    if (!(md || rot)) {
+        printf("jepsen %s: %.0f s, %d clients, %d restarts; writes %u ok / %u indeterminate / %u failed, reads %u ok; "
+               "%u deletes and %u replaces ok\n",
+               nemesis, seconds, nclients, restarts, ok, info, fail, rok, dels, reps);
+    }
+    if (crashfs && !md)
         printf("servers under the shim: %d faulty, %d clean (fallback after a failed start), %d died while starting\n",
                lives_faulty, lives_clean, lives_died_starting);
-    if (memcmp(final, again, koff[nseries] * sizeof *final) != 0)
+    if (!damaged && memcmp(final, again, koff[nseries] * sizeof *final) != 0)
         VIOLATION("the state changed across a clean restart\n");
     if (stray_rows)
         VIOLATION("%d rows at timestamps no write used in the final reads\n", stray_rows);
-    int v = check(final); /* counts the follower's violations too */
+    int v = check(damaged ? NULL : final); /* counts the follower's violations too */
+    if (md || rot)
+        v = epoch_report(v, ok);
     if (classes)
         v += check_classes(final);
     if (!strcmp(nemesis, "eio")) {
@@ -1435,6 +1819,7 @@ int main(int argc, char **argv)
         printf("FAILED: %d violations\n", v);
         return 1;
     }
-    printf("valid\n");
+    if (!(md || rot))
+        printf("valid\n");
     return 0;
 }
