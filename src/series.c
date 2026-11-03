@@ -211,6 +211,7 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
         uint32_t id;
         rc = type_valid(type) ? dict_add(d, name, len, type, &id) : TSDB_ERR_CORRUPT;
         d->last_off = pos;
+        d->last_check = load32(buf + pos);
         pos += rec;
     }
     if (rc == 0 && pos != size && valid_after(buf, pos, size, 0)) {
@@ -278,13 +279,10 @@ int series_reload(series_dict *d, int dirfd)
         size_t pos = (size_t)(off - from), n, rec;
         const char *name;
         int type;
-        uint32_t count = atomic_load(&d->count);
-        if (rc == 0 && pos) {
-            const char *had = count ? d->names[count - 1] : NULL;
-            if (!count || !parse_record(buf, 0, len, from, &name, &n, &type, &rec) || rec != pos ||
-                strlen(had) != n || memcmp(had, name, n) != 0 || type != d->types[count - 1])
-                rc = TSDB_ERR_CORRUPT;
-        }
+        /* the record's check covers its name and type, seeded with its offset */
+        if (rc == 0 && pos && (!parse_record(buf, 0, len, from, &name, &n, &type, &rec) || rec != pos ||
+                               load32(buf) != d->last_check))
+            rc = TSDB_ERR_CORRUPT;
         /* a record that does not check out is still being appended */
         size_t start = pos;
         while (rc == 0 && parse_record(buf, pos, len, from, &name, &n, &type, &rec)) {
@@ -292,6 +290,7 @@ int series_reload(series_dict *d, int dirfd)
             rc = type_valid(type) ? dict_add(d, name, n, type, &id) : TSDB_ERR_CORRUPT;
             if (rc == 0) {
                 d->last_off = from + pos;
+                d->last_check = load32(buf + pos);
                 pos += rec; /* a record not added is read again next time: ids stay the record numbers */
             }
         }
@@ -359,7 +358,8 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
     rec[5] = (uint8_t)(len >> 8);
     rec[6] = (uint8_t)type;
     memcpy(rec + REC_HDR, name, len);
-    store32(rec, rec_check(rec, len, off));
+    uint32_t check = rec_check(rec, len, off);
+    store32(rec, check);
     int err = 0;
     ssize_t wr = write(d->fd, rec, size);
     if (wr != (ssize_t)size || (d->fsync && fdatasync(d->fd) != 0)) {
@@ -370,6 +370,7 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
     pthread_mutex_lock(&d->lock);
     if (rc == 0) {
         d->last_off = off;
+        d->last_check = check;
         d->file_off = off + size;
         rc = dict_add(d, name, len, type, id);
         if (rc != 0) {

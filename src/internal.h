@@ -935,6 +935,7 @@ typedef struct series_dict {
     uint64_t seed;   /* random per open: names chosen to collide cannot be planted (nothing persists the hash) */
     uint64_t file_off; /* bytes of SERIES already loaded */
     uint64_t last_off; /* where the last record loaded starts (a reload checks it is still there) */
+    uint32_t last_check; /* and its check field */
     bool broken;       /* an append failed (under lock): the file may end in a torn record, append no more */
     bool tail_pending; /* a writer's open found a torn tail after file_off: cut by series_cut_tail, not before */
     /* test hook (tsdb_test_dict_fault), read atomically: called at the DICT_AT_* points; nonzero at DICT_AT_ADD
