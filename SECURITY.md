@@ -45,7 +45,11 @@ are in scope, and we want to hear about a way around any of them:
   a single file. Request size, query memory and the time to deliver a frame are bounded.
 - **Data loss or corruption:** a failed write or fsync stops the engine (fail-stop) instead of acknowledging
   data that may not be on disk; damaged files fail the open and are never skipped quietly; inserts are all or
-  nothing. `make jepsen` tests this with crashes, simulated power loss and disk errors.
+  nothing. `make jepsen` tests this with crashes, simulated power loss, disk errors, misdirected reads and
+  writes, and files damaged at rest. Two limits are known: without `--verify-checksums` damaged or misdirected
+  data blocks of a part are read as wrong values (tsdbd says so at startup on ext4 and XFS; ZFS checks its data
+  itself), and damage to the very last record of the WAL or of an append-only file looks like a write cut short
+  by a crash and is cut, with a log line. See "Damage on disk" in [docs/design.md](docs/design.md).
 - **Writes outside the database's directories:** volume paths are checked (absolute, no `.` or `..`, not in or
   around another database), and a client can never make the server add a volume or create a directory.
 

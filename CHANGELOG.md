@@ -12,6 +12,13 @@ disk format and the wire protocol.
 - tsdbd says at startup when a database or volume directory is on ext2/3/4 or XFS and `--verify-checksums` is
   off: those file systems keep no checksums of the data, so a damaged or misdirected data block would be read as
   wrong values. Turn the option on there, or use a file system that checks its data (ZFS).
+- `make jepsen` runs two more nemeses on the kv workload: `misdirect` (the crashfs shim sends writes and reads of
+  database files to other offsets or files and swaps pages of a mapped part, with `--verify-checksums` and without)
+  and `rot` (bits flipped in a file, or the file truncated, while the server is down). The claim they check: tsdb
+  answers correctly or reports the damage. Known limits, counted apart: without `--verify-checksums` damaged part
+  data reads as wrong values, and damage to the last record of the WAL or an append-only file is cut as a torn
+  tail ("Damage on disk" in docs/design.md). The weekly CI run makes every jepsen run 5 minutes long
+  (`JEPSEN_SECONDS`).
 - `CONTRIBUTING.md`, `SECURITY.md` and `docs/licenses.md` (the licenses of everything tsdb builds on). The `make dist`
   tarball now carries `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd and liburing are linked into its binaries).
 - Partition classes: each series gets partitions of 1, 7, 28 or 364 base partitions (`partition_ms`), the
@@ -149,6 +156,23 @@ disk format and the wire protocol.
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
+- Found by the new jepsen nemesis `misdirect`: a misdirected write into the granule index of a part the server had
+  open could crash a merge (SIGSEGV): the index is checked at the open and then read in the part's mapping, where
+  later damage shows. Every entry number taken from the index now stays inside it, and with `verify_checksums`
+  the index and tombstones are read from the copy that was checked, which costs about 32 bytes of memory per
+  granule (about 4 MB per billion rows). Without the option such damage gives wrong answers, like damage to data.
+- Found the same way: a misdirected write over the last records of `SERIES` made the open cut them as a torn tail,
+  and every series they named, with all its rows in parts, was gone without an error. The open now fails with
+  `TSDB_ERR_CORRUPT` when a part holds a series `SERIES` does not have (one comparison per part).
+- Likewise for rows still in the WAL: the replay skipped rows of a series `SERIES` lacked as those of a series
+  never created. It now fails the open with `TSDB_ERR_CORRUPT`, naming the segment, the offset and the series, and
+  keeps the segment. A reader that opens while a writer creates series reads `SERIES` again first (before, it
+  could miss the new series' rows); a follower that still lacks the series after reading `SERIES` again stops
+  before that WAL record and reports the damage once it outlasts its patience for NFS.
+- A read at the open that returned other bytes than the disk holds could make the last records of the WAL,
+  `SERIES`, `STATES`, `RETENTION` or `CLASSES` look torn, and the open cut them: acknowledged rows lost to a fault
+  that does not repeat. The tail is now read again from the disk before it is cut; if the reads differ, the open
+  fails with `TSDB_ERR_IO` and cuts nothing. Every cut is logged ("cutting a torn tail").
 - A follower could stop seeing new rows after the writer restarted. Every writer numbers its MANIFEST versions from 1
   again, and a follower took a MANIFEST only when its version changed: after writers that died before they flushed
   (kill -9, power loss), the new writer could publish the version the follower already had, and the follower kept

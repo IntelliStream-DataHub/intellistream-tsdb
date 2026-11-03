@@ -827,6 +827,47 @@ damage into silently missing or shifted data:
   check every granule they decode, so damage is never rewritten under a fresh
   checksum; a granule a merge passes through unchanged is copied with its
   checksum, so the damage stays detectable.
+- **The granule index after the open.** The open checks a part's index, but
+  queries and merges read it in the part's mapping, where damage that reaches
+  the file later (a misdirected write, a page misread after the kernel
+  evicted it) shows. Every entry number taken from the index is kept inside
+  it, so such damage never makes a read leave the index. With
+  `verify_checksums` the index and tombstones are read from a copy made when
+  they were checked, so answers do not change at all; that copy costs about
+  32 bytes of memory per granule (about 4 MB per billion rows in full 8192-row
+  granules, more for many small series; 51 bytes per granule were measured on
+  a database of short runs). Without the option such damage gives wrong
+  answers, like damage to a granule.
+- **Series in parts.** Every series a part holds is in SERIES: its record is
+  synced (`dict_append`) before its id is handed out, and so before any row of
+  it can reach a part. A part that names a series beyond the end of SERIES
+  means SERIES lost records (damage to its last records is cut as a torn tail,
+  see below), and the open fails with `TSDB_ERR_CORRUPT` instead of serving
+  those series as never created. The check costs one comparison per part. The
+  WAL replay checks every row the same way: a row of a series SERIES lacks
+  fails the open (with the segment, the offset and the id in the log) instead
+  of being skipped, and the segment stays. A reader that opens without
+  MANIFEST reads SERIES again before it judges either, since a writer may have
+  created the series since. A follower reads SERIES again when a WAL row names
+  a series it does not know; if SERIES still lacks it, the follower shows
+  nothing from that record on, and once that outlasts its patience for NFS
+  (as for a damaged WAL record) its refreshes fail with `TSDB_ERR_CORRUPT`,
+  with a log line; the rows appear if SERIES is whole again.
+- **A tail is read twice before it is cut.** A read that returns other bytes
+  than the disk holds (a misdirected read) can make the last records of the
+  WAL, SERIES, STATES, RETENTION or CLASSES look torn. Before cutting, the
+  open drops the cached pages of the tail and reads it again; if the two reads
+  differ, the open fails with `TSDB_ERR_IO` and cuts nothing.
+- **Known limits.** A torn append and damage at rest to the last record of the
+  WAL or an append-only file look the same, so such damage is cut, and
+  acknowledged rows in that WAL record (or a retention or class record) are
+  lost; the cut is logged (`cutting a torn tail`). A cut SERIES record is
+  noticed only through its series' rows (above): a series without any is
+  simply gone. On ext4 or XFS, which keep no checksums of the
+  data, run with `verify_checksums`; on ZFS the file system catches both.
+  `make jepsen` runs the nemeses `misdirect` (misdirected writes, reads and
+  page reads, with and without `verify_checksums`) and `rot` (bits flipped or
+  files truncated while the server is down) and counts these cases apart.
 - **Without fsync** (`fsync = 0`) nothing above is synced, so after a power
   loss (a process crash is fine) a named part, a WAL record or a dictionary
   record can hold pages that never reached the disk. That looks like damage,
