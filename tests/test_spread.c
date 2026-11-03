@@ -29,6 +29,8 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 static int failures;
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -1081,7 +1083,7 @@ static long maxrss_mb(void)
 {
     struct rusage u;
     getrusage(RUSAGE_SELF, &u);
-    return u.ru_maxrss / 1024;
+    return RU_MAXRSS_KB(u) / 1024;
 }
 
 /* The buckets of a series bit for bit the same with one dense array and in chunks of `dense` buckets: aggregates
@@ -1236,6 +1238,13 @@ static void test_sparse_span(void)
 
 int main(int argc, char **argv)
 {
+#if LDBL_MANT_DIG < 64
+    /* the reference below is computed in long double and needs the x87 one (64-bit mantissa); where it is a plain
+     * double (arm64: macOS) it cannot even hold an int64, and the comparison would test the reference */
+    (void)argc, (void)argv;
+    printf("test_spread: skipped, long double has %d mantissa bits here (the reference needs 64)\n", LDBL_MANT_DIG);
+    return 0;
+#endif
     snprintf(base, sizeof base, "%s/tsdb_spread_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     rmrf(base);
     char cmd[600];

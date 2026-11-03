@@ -4,7 +4,12 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#else
 #include <malloc.h>
+#endif
+#include "portable.h"
 #include <math.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -955,13 +960,21 @@ static void hold_point(int which)
 int fsync(int fd)
 {
     hold_point(HOLD_FSYNC);
+#ifdef __APPLE__
+    return REAL(fsync)(fd);
+#else
     return (int)syscall(SYS_fsync, fd);
+#endif
 }
 
 int fdatasync(int fd)
 {
     hold_point(HOLD_FDATASYNC);
+#ifdef __APPLE__
+    return REAL(fdatasync)(fd);
+#else
     return (int)syscall(SYS_fdatasync, fd);
+#endif
 }
 
 static void hold_arm(int which)
@@ -2069,8 +2082,14 @@ typedef struct {
 
 static size_t heap_in_use(void)
 {
+#ifdef __APPLE__
+    malloc_statistics_t st;
+    malloc_zone_statistics(NULL, &st);
+    return st.size_in_use;
+#else
     struct mallinfo2 mi = mallinfo2();
     return mi.uordblks + mi.hblkhd;
+#endif
 }
 
 static int heap_watch_cb(void *ctx, const int64_t *ts, const float *v, size_t n)

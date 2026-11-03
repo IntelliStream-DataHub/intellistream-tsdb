@@ -190,7 +190,7 @@ static int add_run_unique(part_writer *w, uint32_t s, int type, const int64_t *t
 static int sync_deferred(int *fds, size_t n, int rc)
 {
     for (size_t i = 0; i < n; i++) {
-        if (rc == 0 && fdatasync(fds[i]) != 0)
+        if (rc == 0 && tsdb_fdatasync(fds[i]) != 0)
             rc = TSDB_ERR_IO;
         close(fds[i]);
     }

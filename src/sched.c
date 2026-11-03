@@ -442,7 +442,7 @@ sched *sched_new(int query_threads, int request_threads)
         helper *h = &s->h[s->nh];
         h->s = s;
         pthread_cond_init(&h->cv, NULL);
-        if (pthread_create(&h->th, NULL, helper_main, h) != 0) {
+        if (tsdb_thread_create(&h->th, helper_main, h) != 0) {
             pthread_cond_destroy(&h->cv);
             break;
         }

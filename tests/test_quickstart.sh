@@ -86,7 +86,11 @@ sed -e "s#/tmp/tsdb-qs#$scratch/qs#g" -e "s#--port 17070#--port 0 --port-file $p
 ! grep -q 17070 "$scratch/block.sh" || fail "the README block still names port 17070 after the rewrite"
 
 # -e: the first command that fails ends the quick start, as it would for a reader who pastes it.
-if ! "${runenv[@]}" timeout 600 bash -e "$scratch/block.sh" > "$scratch/out" 2>&1; then
+# GNU timeout is not on macOS (bash 3.2 there also rejects an empty array under set -u)
+if command -v timeout >/dev/null 2>&1; then limit=(timeout 600)
+elif command -v gtimeout >/dev/null 2>&1; then limit=(gtimeout 600)
+else limit=(perl -e 'alarm 600; exec @ARGV' --); fi
+if ! ${runenv[@]+"${runenv[@]}"} "${limit[@]}" bash -e "$scratch/block.sh" > "$scratch/out" 2>&1; then
     fail "the quick start block stopped with an error"
 fi
 

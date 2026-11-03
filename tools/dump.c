@@ -28,6 +28,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zstd.h>
+
+#include "../src/compat.h" /* tsdb_fsync (macOS: with the drive cache flush) */
+
+#ifdef __APPLE__
+#define syncfs(fd) tsdb_fsync(fd) /* no syncfs; the fsync that follows is the same call, kept for the error text */
+#endif
 #if defined(__SSE4_2__)
 #include <nmmintrin.h>
 #endif
@@ -671,7 +677,7 @@ int dump_export_main(const char *dir, int argc, char **argv)
         put_u64(p, x.seq);
         ex_record(&x, REC_TRAILER, p);
     }
-    if (!rc && !x.failed && (fflush(out) != 0 || (tmp && fsync(fileno(out)) != 0))) {
+    if (!rc && !x.failed && (fflush(out) != 0 || (tmp && tsdb_fsync(fileno(out)) != 0))) {
         fprintf(stderr, "tsdb: export: writing %s: %s\n", out_name, strerror(errno));
         x.failed = true;
     }
@@ -693,7 +699,7 @@ int dump_export_main(const char *dir, int argc, char **argv)
             const char *slash = strrchr(out_name, '/');
             char *d = slash ? strndup(out_name, (size_t)(slash - out_name) + (slash == out_name)) : strdup(".");
             int fd = d ? open(d, O_RDONLY | O_DIRECTORY) : -1;
-            if (fd < 0 || fsync(fd) != 0) {
+            if (fd < 0 || tsdb_fsync(fd) != 0) {
                 fprintf(stderr, "tsdb: export: syncing the directory of %s: %s\n", out_name, strerror(errno));
                 ok = false;
             }
@@ -1691,6 +1697,16 @@ static int prefixed_close(void *arg)
     return rc;
 }
 
+#ifdef __APPLE__ /* no fopencookie: funopen, with int lengths */
+static int prefixed_read_bsd(void *arg, char *out, int len) { return (int)prefixed_read(arg, out, (size_t)len); }
+static FILE *prefixed_open(prefixed *p) { return funopen(p, prefixed_read_bsd, NULL, NULL, prefixed_close); }
+#else
+static FILE *prefixed_open(prefixed *p)
+{
+    return fopencookie(p, "r", (cookie_io_functions_t){.read = prefixed_read, .close = prefixed_close});
+}
+#endif
+
 /* The target does not exist yet or is an empty directory. */
 static bool dir_is_new(const char *dir)
 {
@@ -1765,7 +1781,7 @@ static bool fsync_dir(const char *p)
 {
     char e[256];
     int fd = open(p, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    bool ok = fd >= 0 && fsync(fd) == 0;
+    bool ok = fd >= 0 && tsdb_fsync(fd) == 0;
     int err = errno;
     if (!ok)
         fprintf(stderr, "tsdb: import: fsync %s: %s\n", esc(p, e, sizeof e), strerror(err));
@@ -1985,7 +2001,7 @@ static bool sync_all(const char *dir, char **vols, uint32_t nv)
     for (uint32_t i = 0; i <= nv; i++) {
         const char *p = i < nv ? vols[i] : dir;
         int fd = open(p, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        const char *what = fd < 0 ? "open" : syncfs(fd) != 0 ? "syncfs" : fsync(fd) != 0 ? "fsync" : NULL;
+        const char *what = fd < 0 ? "open" : syncfs(fd) != 0 ? "syncfs" : tsdb_fsync(fd) != 0 ? "fsync" : NULL;
         int err = errno;
         if (fd >= 0)
             close(fd);
@@ -2149,7 +2165,7 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
                 fclose(in);
             return 1;
         }
-        *csv = fopencookie(pre, "r", (cookie_io_functions_t){.read = prefixed_read, .close = prefixed_close});
+        *csv = prefixed_open(pre);
         return -1;
     }
     crc_init();
@@ -2176,7 +2192,7 @@ static int import_run(const char *dir, int argc, char **argv, FILE **csv, import
         }
     } else {
         pre->pos = 8;
-        in = fopencookie(pre, "r", (cookie_io_functions_t){.read = prefixed_read, .close = prefixed_close});
+        in = prefixed_open(pre);
         if (!in) {
             fprintf(stderr, "tsdb: import: %s\n", strerror(errno));
             if (pre->f != stdin)

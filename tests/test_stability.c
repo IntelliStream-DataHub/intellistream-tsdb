@@ -14,9 +14,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#ifdef __linux__
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
+#endif
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -25,7 +27,9 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#ifdef __linux__
 #include <sys/prctl.h>
+#endif
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -33,6 +37,7 @@
 #include <unistd.h>
 
 #include "harness.h"
+#include "portable.h"
 
 static int failures;
 #define CHECK(cond)                                                                  \
@@ -123,6 +128,7 @@ static const char *spawn_log;
  * seccomp filter rather than an LD_PRELOAD shim: liburing makes the system call
  * itself. Calls of another architecture's ABI (x32, ia32) are let through: the
  * number would mean something else there. */
+#ifdef __linux__ /* seccomp: Linux only; macOS has no io_uring to refuse */
 #if defined(__x86_64__)
 #define TEST_AUDIT_ARCH AUDIT_ARCH_X86_64
 #elif defined(__aarch64__)
@@ -146,6 +152,9 @@ static void refuse_io_uring(int err)
         _exit(126);
     }
 }
+#else
+static void refuse_io_uring(int err) { (void)err; }
+#endif
 
 /* A restart on the same explicit port (the kill -9 and follower tests) lies in the ephemeral range now. That is
  * safe in practice because the kernel gives bind(0) odd and connect() even ports, so a client socket does not take
@@ -548,6 +557,9 @@ static void *storm_main(void *arg)
     return NULL;
 }
 
+#ifdef __APPLE__
+static int count_fds(pid_t pid) { return tp_fd_count(pid); }
+#else
 static int count_fds(pid_t pid)
 {
     char path[64];
@@ -561,6 +573,7 @@ static int count_fds(pid_t pid)
     closedir(d);
     return n;
 }
+#endif
 
 static void test_storm(void)
 {
@@ -603,7 +616,11 @@ static void test_storm(void)
     if (after != before) {
         fprintf(stderr, "%s: %d descriptors before, %d after:\n", current, before, after);
         char cmd[128];
+#ifdef __APPLE__
+        snprintf(cmd, sizeof cmd, "lsof -p %d >&2", (int)pid);
+#else
         snprintf(cmd, sizeof cmd, "ls -l /proc/%d/fd >&2", (int)pid);
+#endif
         if (system(cmd) != 0)
             fprintf(stderr, "(no listing)\n");
     }
@@ -726,6 +743,13 @@ static void test_slow_readers(void)
 }
 
 /* CPU time (user + system) the thread tid of process pid has used, in seconds. */
+#ifdef __APPLE__ /* the whole process (the event loop is the one thread that could spin): no per-thread stats */
+static double thread_cpu(pid_t pid, pid_t tid)
+{
+    (void)tid;
+    return tp_cpu_s(pid);
+}
+#else
 static double thread_cpu(pid_t pid, pid_t tid)
 {
     char path[64], buf[1024];
@@ -743,6 +767,7 @@ static double thread_cpu(pid_t pid, pid_t tid)
         return -1;
     return (double)(ut + st) / (double)sysconf(_SC_CLK_TCK);
 }
+#endif
 
 /* Regression: a client that stops reading must cost the event loop nothing
  * while its send waits. An epoll loop that keeps such a socket marked writable
@@ -898,6 +923,10 @@ static bool file_has(const char *path, const char *text)
  * other pass has already run it. */
 static void test_io_fallback(void)
 {
+#ifdef __APPLE__
+    fprintf(stderr, "  (io_uring fallback: not applicable on macOS, which has no io_uring)\n");
+    return;
+#endif
     const char *io = getenv("TSDBD_IO");
     if (io && strcmp(io, "epoll") == 0)
         return;

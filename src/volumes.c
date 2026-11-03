@@ -115,7 +115,7 @@ static int append_file(int dirfd, const char *name, const void *data, size_t len
     if (fd < 0)
         return TSDB_ERR_IO;
     ssize_t wr = write(fd, data, len);
-    bool ok = wr == (ssize_t)len && (!sync || fdatasync(fd) == 0);
+    bool ok = wr == (ssize_t)len && (!sync || tsdb_fdatasync(fd) == 0);
     int err = ok ? 0 : wr >= 0 && wr != (ssize_t)len ? ENOSPC : errno;
     close(fd);
     errno = err;
@@ -133,7 +133,7 @@ static int cut_tail(tsdb *t, const char *name, size_t len, size_t size)
 {
     fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes\n", name, size - len);
     int fd = openat(t->dirfd, name, O_WRONLY | O_CLOEXEC);
-    int rc = fd < 0 || ftruncate(fd, (off_t)len) != 0 || (t->opt.fsync && fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
+    int rc = fd < 0 || ftruncate(fd, (off_t)len) != 0 || (t->opt.fsync && tsdb_fdatasync(fd) != 0) ? TSDB_ERR_IO : 0;
     if (fd >= 0)
         close(fd);
     return rc;
@@ -267,7 +267,7 @@ static int volumes_parse(int fd, bool cut, bool sync, char ***out, size_t *n, of
         if (!(next = strchr(line, '\n')) && cut) {
             fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes\n", VOLUMES_FILE, len - (size_t)(line - txt));
             *size = (off_t)(line - txt);
-            if (ftruncate(fd, *size) != 0 || (sync && fdatasync(fd) != 0))
+            if (ftruncate(fd, *size) != 0 || (sync && tsdb_fdatasync(fd) != 0))
                 rc = TSDB_ERR_IO;
             break;
         }
@@ -350,7 +350,7 @@ static int volume_dir_prepare(const char *canon, uint64_t id, bool sync)
         int n = snprintf(buf, sizeof buf, "%016" PRIx64 "\n", id);
         rc = append_file(fd, ROOT_ID_FILE, buf, (size_t)n, sync);
     }
-    if (!why && rc == 0 && sync && fsync(fd) != 0)
+    if (!why && rc == 0 && sync && tsdb_fsync(fd) != 0)
         rc = TSDB_ERR_IO;
     close(fd);
     if (why) {
@@ -442,7 +442,7 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     int mfd = fd < 0 ? -1 : openat(fd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     ssize_t wr = mfd < 0 ? -1 : write(mfd, buf, n);
-    bool ok = wr == (ssize_t)n && (!sync || fsync(mfd) == 0);
+    bool ok = wr == (ssize_t)n && (!sync || tsdb_fsync(mfd) == 0);
     int err = ok ? 0 : wr >= 0 && wr != (ssize_t)n ? ENOSPC : errno;
     if (mfd >= 0)
         close(mfd);
@@ -452,7 +452,7 @@ static int volume_meta_write(int rootfd, const char *canon, uint32_t index, bool
     }
     if (!ok && mfd >= 0)
         unlinkat(fd, tmp, 0); /* or the volume's next open removes it */
-    if (ok && sync && fsync(fd) != 0) {
+    if (ok && sync && tsdb_fsync(fd) != 0) {
         ok = false;
         err = errno;
     }
@@ -499,7 +499,7 @@ static int sync_parent(const char *canon)
     size_t n = (size_t)(strrchr(canon, '/') - canon);
     snprintf(parent, sizeof parent, "%.*s", (int)(n ? n : 1), canon);
     int fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    int rc = fd < 0 || fsync(fd) != 0 ? TSDB_ERR_IO : 0;
+    int rc = fd < 0 || tsdb_fsync(fd) != 0 ? TSDB_ERR_IO : 0;
     if (fd >= 0)
         close(fd);
     return rc;
@@ -634,14 +634,14 @@ static int volume_add(int dirfd, const char *root, uint64_t id, const char *path
         size_t len = strlen(canon);
         int w = snprintf(line, sizeof line, "%08x %s\n", vol_check(canon, len, n + 1), canon);
         ssize_t wr = write(fd, line, (size_t)w);
-        bool ok = wr == w && (!sync || fdatasync(fd) == 0);
+        bool ok = wr == w && (!sync || tsdb_fdatasync(fd) == 0);
         if (!ok) {
             int err = wr >= 0 && wr != w ? ENOSPC : errno;
             if (fail)
                 eng_fail(fail, "append to " VOLUMES_FILE, err);
             rc = TSDB_ERR_IO;
         } else if (size == 0 && sync) { /* the file may be new */
-            rc = fail ? eng_sync_dir(fail, VOLUMES_FILE) : fsync(dirfd) == 0 ? 0 : TSDB_ERR_IO;
+            rc = fail ? eng_sync_dir(fail, VOLUMES_FILE) : tsdb_fsync(dirfd) == 0 ? 0 : TSDB_ERR_IO;
         }
         if (rc == 0)
             *index = (uint32_t)(n + 1);

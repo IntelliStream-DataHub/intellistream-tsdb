@@ -20,6 +20,8 @@ typedef struct eng eng;
 #define ZSTD_STATIC_LINKING_ONLY /* ZSTD_f_zstd1_magicless: stable since zstd 1.3, still in the experimental API */
 #include <zstd.h>
 
+#include "compat.h" /* macOS shims; nothing on Linux */
+
 #include "levels.h" /* before the declarations: renames them in a per-CPU-level compile */
 
 #define LIKELY(x) __builtin_expect(!!(x), 1)

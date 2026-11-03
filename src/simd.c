@@ -47,6 +47,8 @@
 #include <immintrin.h>
 #define TSDB_X86 1
 #endif
+/* helpers of the x86 kernels only: unused where those are not compiled (arm64) */
+#define X86_ONLY __attribute__((unused))
 
 /*
  * All five sets give bit-identical results: stored granule statistics and
@@ -656,7 +658,7 @@ __attribute__((target("avx512f,avx512dq"))) static void fold_f64_avx512(const do
 #define I64_BLOCK ((size_t)1 << 26)
 
 /* the 192-bit sum of the squares of v's known values into dx, one at a time */
-static void i64_squares(const int64_t *v, size_t i, size_t n, agg_dev *dx)
+static X86_ONLY void i64_squares(const int64_t *v, size_t i, size_t n, agg_dev *dx)
 {
     unsigned __int128 q = 0;
     uint64_t qh = 0;
@@ -673,7 +675,7 @@ static void i64_squares(const int64_t *v, size_t i, size_t n, agg_dev *dx)
 }
 
 /* v[i, n) one at a time into the run's sum, known count, min and max */
-static void i64_tail(const int64_t *v, size_t i, size_t n, __int128 *s, uint64_t *c, int64_t *mn, int64_t *mx)
+static X86_ONLY void i64_tail(const int64_t *v, size_t i, size_t n, __int128 *s, uint64_t *c, int64_t *mn, int64_t *mx)
 {
     for (; i < n; i++) {
         int64_t x = v[i];
@@ -686,7 +688,7 @@ static void i64_tail(const int64_t *v, size_t i, size_t n, __int128 *s, uint64_t
     }
 }
 
-static void i64_finish(agg_state *a, __int128 s, uint64_t c, int64_t mn, int64_t mx)
+static X86_ONLY void i64_finish(agg_state *a, __int128 s, uint64_t c, int64_t mn, int64_t mx)
 {
     a->count += c;
     a->isum += s;
@@ -697,7 +699,7 @@ static void i64_finish(agg_state *a, __int128 s, uint64_t c, int64_t mn, int64_t
 /* The squares of values beyond int32: |x| = h 2^32 + l, so x^2 = l^2 + hl 2^33 + h^2 2^64, each product from
  * a 32x32 multiply and summed in its 32-bit halves: a0, a1 (l^2), b0, b1 (hl), c0, c1 (h^2), reduced over the
  * lanes, below 2^60 each, into the 192-bit sum */
-static void i64_sq_wide(agg_dev *dx, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1, uint64_t c0, uint64_t c1)
+static X86_ONLY void i64_sq_wide(agg_dev *dx, uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1, uint64_t c0, uint64_t c1)
 {
     unsigned __int128 t = (unsigned __int128)a0 + ((unsigned __int128)a1 << 32) + ((unsigned __int128)b0 << 33);
     unsigned __int128 h = (unsigned __int128)c0 + ((unsigned __int128)b1 << 1) + ((unsigned __int128)c1 << 32);
@@ -705,7 +707,7 @@ static void i64_sq_wide(agg_dev *dx, uint64_t a0, uint64_t a1, uint64_t b0, uint
     isq_add(dx, (unsigned __int128)(uint64_t)h << 64, (uint64_t)(h >> 64));
 }
 
-static inline __int128 i64_combine(const uint64_t *lo, const uint64_t *hi, const uint64_t *neg, int k)
+static X86_ONLY inline __int128 i64_combine(const uint64_t *lo, const uint64_t *hi, const uint64_t *neg, int k)
 {
     uint64_t l = 0, h = 0, g = 0;
     for (int j = 0; j < k; j++) {
@@ -926,7 +928,7 @@ __attribute__((target("avx512f,avx512dq"))) static void fold_i64_avx512(const in
  */
 #define U32_BLOCK ((size_t)1 << 26)
 
-static void u32_tail(const uint32_t *v, size_t i, size_t n, uint32_t null, unsigned __int128 *s, uint64_t *c,
+static X86_ONLY void u32_tail(const uint32_t *v, size_t i, size_t n, uint32_t null, unsigned __int128 *s, uint64_t *c,
                      unsigned __int128 *q, uint32_t *mn, uint32_t *mx)
 {
     for (; i < n; i++) {
@@ -941,7 +943,7 @@ static void u32_tail(const uint32_t *v, size_t i, size_t n, uint32_t null, unsig
     }
 }
 
-static void u32_finish(agg_state *a, agg_dev *dx, unsigned __int128 s, uint64_t c, unsigned __int128 q, uint32_t mn,
+static X86_ONLY void u32_finish(agg_state *a, agg_dev *dx, unsigned __int128 s, uint64_t c, unsigned __int128 q, uint32_t mn,
                        uint32_t mx)
 {
     if (!c)

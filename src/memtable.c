@@ -483,7 +483,7 @@ static int wal_write_sync(eng *db, int fd, uint64_t seq, uint64_t *off, uint8_t 
         return TSDB_ERR_IO;
     }
     if (db->opt.fsync) {
-        if (fdatasync(fd) != 0) {
+        if (tsdb_fdatasync(fd) != 0) {
             eng_fail(db, "WAL fdatasync", errno);
             return TSDB_ERR_IO;
         }
@@ -920,7 +920,7 @@ int wal_open(eng *db)
             unlinkat(db->dirfd, segs[k].name, 0);
     }
     free(segs);
-    if (rc == 0 && !ro && db->opt.fsync && fsync(db->dirfd) != 0)
+    if (rc == 0 && !ro && db->opt.fsync && tsdb_fsync(db->dirfd) != 0)
         rc = TSDB_ERR_IO; /* at open: the open fails */
     if (rc == 0 && db->wal_enabled)
         rc = wal_open_segment(db, db->wal_seq, &db->wal_fd);

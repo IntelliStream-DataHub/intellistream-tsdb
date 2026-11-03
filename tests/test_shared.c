@@ -21,6 +21,12 @@ static int failures;
     } while (0)
 #define OK(x) CHECK((x) == 0)
 
+#ifdef __APPLE__
+#define LIBTSDB "libtsdb.dylib"
+#else
+#define LIBTSDB "libtsdb.so"
+#endif
+
 int main(int argc, char **argv)
 {
     char dir[512], cmd[600];
@@ -30,7 +36,7 @@ int main(int argc, char **argv)
         return 1;
 
     /* engine internals stay hidden: a binding can only reach the public API */
-    void *self = dlopen("libtsdb.so", RTLD_NOW | RTLD_NOLOAD);
+    void *self = dlopen(LIBTSDB, RTLD_NOW | RTLD_NOLOAD);
     CHECK(self != NULL);
     if (self) {
         CHECK(dlsym(self, "tsdb_open") != NULL);

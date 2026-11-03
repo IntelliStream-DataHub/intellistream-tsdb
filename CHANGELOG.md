@@ -9,6 +9,10 @@ disk format and the wire protocol.
 ## [Unreleased]
 
 ### Added
+- macOS (arm64 and x86-64) as a developer platform: `make` and `make test IO=epoll` work with Homebrew's zstd, `tsdbd`
+  runs on kqueue (no io_uring), and the embedded library builds as a dylib. Every sync there is followed by
+  `fcntl(F_FULLFSYNC)`, because macOS `fsync` leaves the data in the drive's cache (slower: `TSDB_FAST_FSYNC=1` gives it
+  up). The Linux-only checks (`make jepsen`, `make dist`) do not run. See `docs/macos.md`.
 - `CONTRIBUTING.md`, `SECURITY.md` and `docs/licenses.md` (the licenses of everything tsdb builds on). The `make dist`
   tarball now carries `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd and liburing are linked into its binaries).
 - Partition classes: each series gets partitions of 1, 7, 28 or 364 base partitions (`partition_ms`), the

@@ -59,12 +59,22 @@ static void fz_out_wait(struct conn *c);
 /* ------------------------------------------------------------ coverage */
 
 #define MAP_SIZE (1u << 16)
+/* GCC and newer clang have the attribute; Apple's clang does not (and there the coverage build is not used) */
+#if defined(__has_attribute)
+#if __has_attribute(no_sanitize_coverage)
+#define NO_COV __attribute__((no_sanitize_coverage))
+#endif
+#endif
+#ifndef NO_COV
+#define NO_COV
+#endif
+
 static uint8_t cov_map[MAP_SIZE], virgin[MAP_SIZE];
 static __thread uintptr_t cov_prev;
 static int cov_on;
 
 void __sanitizer_cov_trace_pc(void);
-__attribute__((no_sanitize_coverage)) void __sanitizer_cov_trace_pc(void)
+NO_COV void __sanitizer_cov_trace_pc(void)
 {
     if (!cov_on)
         return;
@@ -80,7 +90,7 @@ static uint8_t bucket(uint8_t n)
 }
 
 /* Whether the last run reached an edge (or a hit-count bucket of one) no earlier run did. */
-__attribute__((no_sanitize_coverage)) static int cov_new(void)
+NO_COV static int cov_new(void)
 {
     int fresh = 0;
     for (size_t i = 0; i < MAP_SIZE; i++) {
@@ -95,7 +105,7 @@ __attribute__((no_sanitize_coverage)) static int cov_new(void)
     return fresh;
 }
 
-__attribute__((no_sanitize_coverage)) static size_t cov_edges(void)
+NO_COV static size_t cov_edges(void)
 {
     size_t n = 0;
     for (size_t i = 0; i < MAP_SIZE; i++)

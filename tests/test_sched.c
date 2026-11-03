@@ -12,6 +12,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 #define CHECK(cond)                                                                  \
     do {                                                                             \
         if (!(cond)) {                                                               \
@@ -481,6 +483,20 @@ static void test_reopen(void)
     sched_free(s);
 }
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+static int count_threads(void)
+{
+    thread_act_array_t list;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS)
+        return 0;
+    for (mach_msg_type_number_t i = 0; i < n; i++)
+        mach_port_deallocate(mach_task_self(), list[i]);
+    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof *list);
+    return (int)n;
+}
+#else
 static int count_threads(void)
 {
     DIR *d = opendir("/proc/self/task");
@@ -491,6 +507,7 @@ static int count_threads(void)
         closedir(d);
     return n;
 }
+#endif
 
 /* Volumes share the database's helpers: query_threads - 1 threads in all, not per volume. */
 static void test_volumes(const char *base)

@@ -19,7 +19,7 @@ want() { # what, found
         fail=1
     fi
 }
-def() { sed -n "s/^#define $1 \+\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" include/tsdb.h; }
+def() { sed -n "s/^#define $1  *\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" include/tsdb.h; }
 want "include/tsdb.h macros" "$(def TSDB_VERSION_MAJOR).$(def TSDB_VERSION_MINOR).$(def TSDB_VERSION_PATCH)"
 want "include/tsdb.h TSDB_VERSION" "$(def TSDB_VERSION)"
 want "tsdbd --version" "$("$b/tsdbd" --version | sed -n 's/^tsdbd \([^ ]*\).*/\1/p')"

@@ -31,6 +31,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "portable.h"
+
 static int failures;
 #define CHECK(cond)                                                                  \
     do {                                                                             \
@@ -67,7 +69,7 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
     if (eio_mark && !realpath(near, shim)) {
         /* the tarball keeps it among the tests, beside this program */
         char self[PATH_MAX], beside[PATH_MAX + 32];
-        ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+        ssize_t n = tp_self_exe(self, sizeof self);
         self[n > 0 ? n : 0] = '\0';
         snprintf(beside, sizeof beside, "%.*slibcrashfs.so", (int)(strrchr(self, '/') ? strrchr(self, '/') - self + 1 : 0),
                  self);
@@ -2744,9 +2746,12 @@ static void test_metrics_more(const char *dir)
         CHECK(body && cl);
         if (body && cl) {
             size_t blen = got - (size_t)(body + 4 - all);
+            (void)blen;
+#ifndef __APPLE__ /* macOS's loopback buffers hold the whole reply, so the dropped part cannot be seen */
             if (blen >= (size_t)atol(cl + 16))
                 fprintf(stderr, "metrics: a client that did not read for 1.5 s still got all %zu bytes\n", blen);
             CHECK(blen < (size_t)atol(cl + 16));
+#endif
         }
         free(all);
         for (int i = 0; i < 3; i++)
@@ -2839,7 +2844,7 @@ static void test_hostile(const char *dir)
                                           "--wal-sync-ms -5", "--frame-timeout 0", "--max-request-memory 0",
                                           "--send-timeout abc", "--partition-ms 99999999999999999999"};
         for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
-            snprintf(cmd, sizeof cmd, "timeout -s KILL 10 '%s' --dir '%s.bad' %s >/dev/null 2>&1", bin, dir, bad[i]);
+            snprintf(cmd, sizeof cmd, TIMEOUT_KILL_CMD(10) " '%s' --dir '%s.bad' %s >/dev/null 2>&1", bin, dir, bad[i]);
             int st = system(cmd);
             if (!(WIFEXITED(st) && WEXITSTATUS(st) == 2))
                 fprintf(stderr, "tsdbd %s: status %d, not 2\n", bad[i], WIFEXITED(st) ? WEXITSTATUS(st) : -1);
@@ -2998,6 +3003,11 @@ static void test_hostile(const char *dir)
         static const uint32_t a_flen[2] = {64u << 20, 250000}; /* the second fits the old 256 KB uncounted buffer */
         static const size_t a_sent[2] = {4096, 200000};
         int a = raw_connect(), b = raw_connect();
+#ifdef __APPLE__ /* loopback buffers there are small: without room for the 2 MB insert the write below waits for the
+                  * server, which is parked, until the frame timeout closes a */
+        int big = 4 << 20;
+        setsockopt(b, SOL_SOCKET, SO_SNDBUF, &big, sizeof big);
+#endif
         uint8_t *h = calloc(9 + a_sent[round], 1);
         memcpy(h, &a_flen[round], 4);
         h[8] = TSDB_OP_INSERT;
@@ -3394,7 +3404,12 @@ int main(int argc, char **argv)
     test_same_keys(dir);
     printf("fail-stop after a WAL write error\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-failstop-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+#ifdef __APPLE__
+    printf("  (fail-stop under the crashfs shim: skipped on macOS, it needs LD_PRELOAD)\n");
+    (void)test_wal_failstop;
+#else
     test_wal_failstop(dir);
+#endif
     printf("prometheus metrics\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-metrics-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_metrics(dir);

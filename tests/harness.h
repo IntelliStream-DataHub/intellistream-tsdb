@@ -50,6 +50,71 @@ static inline void th_cache_add(int port, unsigned long ino)
     atomic_store(&th_cache[atomic_fetch_add(&th_cache_next, 1) % TH_CACHE], v);
 }
 
+#ifdef __APPLE__
+/* macOS has no /proc: libproc lists the descriptors of a process of ours (its sockets, with their state and local
+ * port), and a socket is told apart by the address of its kernel object (soi_so), the counterpart of an inode. */
+#include <arpa/inet.h>
+#include <libproc.h>
+#include <sys/proc_info.h>
+
+/* Walks pid's sockets: with port > 0 the listening TCP socket on that port, else one of `want` (n objects).
+ * Returns the socket's object id, or 0. */
+static inline unsigned long th_scan_sockets(pid_t pid, int port, const unsigned long *want, int n)
+{
+    int bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0);
+    if (bytes <= 0)
+        return 0;
+    struct proc_fdinfo *fds = malloc((size_t)bytes);
+    if (!fds)
+        return 0;
+    bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, bytes);
+    unsigned long found = 0;
+    for (int i = 0; bytes > 0 && !found && i < bytes / (int)sizeof *fds; i++) {
+        struct socket_fdinfo si;
+        if (fds[i].proc_fdtype != PROX_FDTYPE_SOCKET ||
+            proc_pidfdinfo(pid, fds[i].proc_fd, PROC_PIDFDSOCKETINFO, &si, sizeof si) != (int)sizeof si)
+            continue;
+        unsigned long so = (unsigned long)si.psi.soi_so;
+        if (port > 0) {
+            so &= 0xffffffffffffULL; /* as th_cache_add keeps it */
+            if (si.psi.soi_kind == SOCKINFO_TCP && si.psi.soi_proto.pri_tcp.tcpsi_state == TSI_S_LISTEN &&
+                ntohs((uint16_t)si.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport) == port)
+                found = so;
+        } else {
+            so &= 0xffffffffffffULL;
+            for (int k = 0; k < n; k++)
+                if (want[k] == so)
+                    found = so;
+        }
+    }
+    free(fds);
+    return found;
+}
+
+static inline unsigned long th_fd_socket(pid_t pid, const unsigned long *want, int n)
+{
+    return th_scan_sockets(pid, 0, want, n);
+}
+
+static inline int th_owns_port(pid_t pid, int port)
+{
+    unsigned long known[TH_CACHE];
+    int nk = 0;
+    for (int i = 0; i < TH_CACHE; i++) { /* sockets proven to listen on this port before */
+        unsigned long long v = atomic_load(&th_cache[i]);
+        if ((int)(v >> 48) == port && v && nk < TH_CACHE)
+            known[nk++] = (unsigned long)(v & 0xffffffffffffULL);
+    }
+    if (nk > 0 && th_fd_socket(pid, known, nk))
+        return 1;
+    atomic_fetch_add(&th_scans, 1);
+    unsigned long so = th_scan_sockets(pid, port, NULL, 0);
+    if (so)
+        th_cache_add(port, so);
+    return so != 0;
+}
+#else /* Linux */
+
 /* Does `pid` hold a socket with one of these inodes (`want`, n of them)? Returns the inode, or 0. */
 static inline unsigned long th_fd_socket(pid_t pid, const unsigned long *want, int n)
 {
@@ -116,6 +181,7 @@ static inline int th_owns_port(pid_t pid, int port)
         th_cache_add(port, ino);
     return ino != 0;
 }
+#endif /* __APPLE__ */
 
 /* Why the last th_await() failed, ready to print. */
 static char th_why[4352];
