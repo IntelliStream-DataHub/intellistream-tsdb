@@ -34,7 +34,8 @@
  * shim in CRASHFS_MODE=misdirect sends a write or read of a database file (rate JEPSEN_MD_RATE, default 0.0003 per
  * call) to another offset or another file, and replaces a 512 or 4096 byte chunk of some mappings of a part with
  * one from elsewhere (a page misread after eviction); every fault is a line in DIR.eN.faults. With
- * --verify-checksums every file is covered. Without it granule payloads are known to be unprotected: epochs
+ * --verify-checksums (tsdbd also gets --pin-index, which keeps each part's index as the open checked it) every
+ * file is covered. Without it granule payloads and indexes damaged after the open are known to be unprotected: epochs
  * alternate between faults in everything but parts (which must hold) and in parts only (wrong answers there are
  * counted as known, a crash still fails the run). rot: while the server is down, 1-3 bits are flipped in a random
  * database file, or it is truncated; then the server starts again. Damage to the last record of the WAL or an
@@ -372,8 +373,8 @@ static void start_server(bool faulty)
             }
             if (getenv("TSDBD_IO"))
                 av[ac++] = "--io", av[ac++] = getenv("TSDBD_IO");
-            if (verify)
-                av[ac++] = "--verify-checksums";
+            if (verify) /* both: payloads checked, and each part's index used as the open checked it */
+                av[ac++] = "--verify-checksums", av[ac++] = "--pin-index";
             av[ac] = NULL;
             execv(tsdbd_path(), (char **)av);
             _exit(127);

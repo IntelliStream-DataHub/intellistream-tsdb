@@ -216,18 +216,33 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
         fprintf(stderr, "tsdb: %s is damaged at offset %zu, before valid records\n", file, pos);
         rc = TSDB_ERR_CORRUPT;
     }
-    /* a torn append at the end is cut: it was never acknowledged (or the last record was damaged at rest, which
-       looks the same: hence the log line) */
+    /* A torn append at the end is cut: it was never acknowledged, or the last record was damaged at rest, which
+       looks the same (hence the log line). Not here, though: series_cut_tail does it once the open's checks
+       passed, since a part or a WAL row naming a series of the cut record proves it was acknowledged, and a
+       refused open leaves the bytes for the operator to repair. */
     if (rc == 0 && pos != size && !read_only)
         rc = tail_confirm(dirfd, file, buf + pos, pos, size - pos);
     free(buf);
-    if (rc == 0 && pos != size && !read_only) {
-        fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes at offset %zu\n", file, size - pos, pos);
-        if (ftruncate(d->fd, (off_t)pos) != 0)
-            rc = TSDB_ERR_IO;
-    }
+    d->tail_pending = rc == 0 && pos != size && !read_only;
     d->file_off = pos;
     return rc;
+}
+
+int series_cut_tail(series_dict *d)
+{
+    if (!d->tail_pending)
+        return 0;
+    struct stat st;
+    if (fstat(d->fd, &st) != 0)
+        return TSDB_ERR_IO;
+    if ((uint64_t)st.st_size > d->file_off) {
+        fprintf(stderr, "tsdb: %s: cutting a torn tail of %llu bytes at offset %llu\n", d->file,
+                (unsigned long long)st.st_size - (unsigned long long)d->file_off, (unsigned long long)d->file_off);
+        if (ftruncate(d->fd, (off_t)d->file_off) != 0)
+            return TSDB_ERR_IO;
+    }
+    d->tail_pending = false;
+    return 0;
 }
 
 /* Loads names a writer appended since. The file is reopened every time: on
@@ -304,7 +319,7 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
             rc = TSDB_ERR_INVALID; /* exists with another type */
     } else if (d->fd < 0) {
         rc = TSDB_ERR_READONLY;
-    } else if (d->broken) {
+    } else if (d->broken || d->tail_pending) {
         rc = TSDB_ERR_IO; /* a record after a torn one would be lost at the next open, yet acknowledged */
     } else if (atomic_load(&d->count) >= DICT_MAX_NAMES) {
         rc = TSDB_ERR_INVALID; /* full: checked before the record is written, or every open would fail on it */

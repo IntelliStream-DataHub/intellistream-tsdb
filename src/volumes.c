@@ -1349,6 +1349,18 @@ int tsdb_series_class(tsdb *t, tsdb_sid id, int *cls)
     return route(t, id, &e, &local) ? eng_series_class(e, local, cls) : TSDB_ERR_NOTFOUND;
 }
 
+/* tests/test_damage.c: cls_observe on every part of the root volume, as the merge thread does on an idle partition */
+int tsdb_test_observe(tsdb *t)
+{
+    size_t n = 0;
+    part **ps = db_snapshot(t->vols[0], INT64_MIN, INT64_MAX, &n);
+    int rc = ps || !n ? 0 : TSDB_ERR_NOMEM;
+    for (size_t i = 0; rc == 0 && i < n; i++)
+        rc = cls_observe(t->vols[0], ps[i]);
+    db_release(ps, n);
+    return rc;
+}
+
 int tsdb_test_class_switch(tsdb *t, tsdb_sid id, int cls, const int64_t *at)
 {
     eng *e;

@@ -757,6 +757,7 @@ void *flusher_main(void *arg)
 
 typedef struct seg {
     uint64_t seq;
+    size_t end; /* a writer's open: where the valid records end, as wal_check_segment found */
     char name[256];
 } seg;
 
@@ -810,8 +811,56 @@ static int read_file(int dirfd, const char *name, uint8_t **out, size_t *len)
     return rc;
 }
 
-/* Replays WAL segments left by a previous run, then opens a fresh segment. */
-int wal_open(eng *db)
+/* A writer's open checks every segment before it replays any: the replay writes parts and unlinks each segment
+ * (with its torn tail), so a refusal found in a later segment would come after the earlier ones were changed. The
+ * checks are the replay's own: records out of order, a row of a series SERIES lacks, a tail that reads otherwise
+ * the second time. s->end is where the valid records end. */
+static int wal_check_segment(eng *db, seg *s)
+{
+    uint8_t *buf;
+    size_t len, pos = 0, n, rec;
+    int rc = read_file(db->dirfd, s->name, &buf, &len);
+    if (rc)
+        return rc;
+    uint32_t count = eng_series_count(db);
+    while (rc == 0 && (rec = wal_record(buf + pos, len - pos, s->seq, pos, &n)) != 0) {
+        const uint8_t *r = buf + pos + WAL_HDR;
+        for (size_t i = 0; i < n; i++, r += WAL_ROW) {
+            uint32_t id;
+            int64_t ts;
+            uint64_t slot;
+            wal_row(r, &id, &ts, &slot);
+            if (id >= count) {
+                fprintf(stderr,
+                        "tsdb: WAL segment %s names series %" PRIu32 " in the record at offset %zu, but SERIES has "
+                        "only %" PRIu32 ": SERIES is damaged. Nothing was changed: restore SERIES from a backup or "
+                        "snapshot, or move the segment out of the directory to accept the loss of its rows; tsdb "
+                        "export cannot read the database either until then\n",
+                        s->name, id, pos, count);
+                rc = TSDB_ERR_CORRUPT;
+                break;
+            }
+        }
+        pos += rec;
+    }
+    if (rc == 0 && pos < len && wal_valid_after(buf, len, pos, s->seq, 0)) {
+        fprintf(stderr,
+                "tsdb: WAL segment %s is damaged at offset %zu, before valid records: the open fails and the "
+                "segment is kept (move it out of the directory to accept the loss of its rows)\n",
+                s->name, pos);
+        rc = TSDB_ERR_CORRUPT;
+    } else if (rc == 0 && pos < len) {
+        /* a torn append: never acknowledged, unless the last record was damaged at rest, which looks the same */
+        rc = tail_confirm(db->dirfd, s->name, buf + pos, pos, len - pos);
+    }
+    s->end = pos;
+    free(buf);
+    return rc;
+}
+
+/* Replays WAL segments left by a previous run, then opens a fresh segment. A writer checks every segment first and
+ * then calls before_replay (the open's cuts of torn tails), so nothing is written or cut until all checks passed. */
+int wal_open(eng *db, int (*before_replay)(eng *))
 {
     bool ro = db->opt.read_only;
     seg *segs = NULL;
@@ -861,6 +910,10 @@ int wal_open(eng *db)
     }
 
     int rc = 0;
+    for (size_t k = 0; !ro && k < nseg && rc == 0; k++)
+        rc = wal_check_segment(db, &segs[k]);
+    if (rc == 0 && before_replay)
+        rc = before_replay(db);
     for (size_t k = 0; k < nseg && rc == 0; k++) {
         uint8_t *buf;
         size_t len;
@@ -896,7 +949,7 @@ int wal_open(eng *db)
                      * looks the same) or overwritten. Its rows are not dropped as those of a series never made. */
                     fprintf(stderr,
                             "tsdb: WAL segment %s names series %" PRIu32 " in the record at offset %zu, but SERIES "
-                            "has only %" PRIu32 ": SERIES is damaged\n",
+                            "has only %" PRIu32 ": SERIES is damaged (restore it from a backup or snapshot)\n",
                             segs[k].name, id, pos, eng_series_count(db));
                     rc = TSDB_ERR_CORRUPT;
                     break;
@@ -923,12 +976,14 @@ int wal_open(eng *db)
                     "segment is kept (move it out of the directory to accept the loss of its rows)\n",
                     segs[k].name, pos);
             rc = TSDB_ERR_CORRUPT;
+        } else if (rc == 0 && !ro && pos != segs[k].end) {
+            fprintf(stderr, "tsdb: %s: two reads at the open end its valid records at offsets %zu and %zu: the open "
+                            "fails\n", segs[k].name, segs[k].end, pos);
+            rc = TSDB_ERR_IO;
         } else if (rc == 0 && pos < len && !ro) {
-            /* a torn append: never acknowledged, unless the last record was damaged at rest, which looks the same */
-            rc = tail_confirm(db->dirfd, segs[k].name, buf + pos, pos, len - pos);
-            if (rc == 0)
-                fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes at offset %zu\n", segs[k].name, len - pos,
-                        pos);
+            /* the torn tail wal_check_segment confirmed: it goes with the segment, unlinked below */
+            fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes at offset %zu\n", segs[k].name, len - pos,
+                    pos);
         }
         free(buf);
         if (rc == 0 && !ro) {

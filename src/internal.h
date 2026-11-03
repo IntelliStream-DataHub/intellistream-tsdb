@@ -724,9 +724,10 @@ typedef struct part {
     gix ix; /* the granule index, in the map */
     uint32_t ng;
     const tomb *t; /* the part's tombstones (in the map, or in icopy); NULL when none */
-    uint8_t *icopy; /* verify: the index and tombstones, copied when checked; NULL: read in the map */
+    uint8_t *icopy; /* pin_index: the index and tombstones, copied when checked; NULL: read in the map */
+    size_t pinned;  /* bytes of icopy */
     uint32_t nt;
-    uint64_t index_off;
+    uint64_t index_off, index_len, index_hash; /* as the open checked them (part_index_intact) */
     uint64_t rows;
     int64_t min_ts, max_ts;
     bool verify; /* queries check each granule's checksum (tsdb_options.verify_checksums) */
@@ -837,10 +838,11 @@ static inline void gx_load(const part *p, uint32_t i, unsigned want, granule *g)
         g->series = gx_series(p, i);
 }
 
-/* verify: queries check granule checksums, and the index and tombstones are read from a copy made when they were
-   checked (tsdb_options.verify_checksums) */
-int part_open(int dirfd, const char *name, bool verify, part **out);
-int part_open_as(int dirfd, const char *file, const char *name, bool verify, part **out);
+/* pin: the index and tombstones are read from a copy made when they were checked (tsdb_options.pin_index), not
+   from the mapping; the caller sets p->verify (granule checksums, tsdb_options.verify_checksums) */
+int part_open(int dirfd, const char *name, bool pin, part **out);
+int part_open_as(int dirfd, const char *file, const char *name, bool pin, part **out);
+bool part_index_intact(const part *p);
 void part_ref(part *p);
 void part_unref(part *p);
 /* Decodes a granule: timestamps, and values (if v) as slots of `type`; checks
@@ -930,6 +932,7 @@ typedef struct series_dict {
     uint64_t seed;   /* random per open: names chosen to collide cannot be planted (nothing persists the hash) */
     uint64_t file_off; /* bytes of SERIES already loaded */
     bool broken;       /* an append failed (under lock): the file may end in a torn record, append no more */
+    bool tail_pending; /* a writer's open found a torn tail after file_off: cut by series_cut_tail, not before */
     /* test hook (tsdb_test_dict_fault), read atomically: called at the DICT_AT_* points; nonzero at DICT_AT_ADD
      * fails that add as if memory ran out */
     int (*test_fault)(void *arg, int point, const char *name);
@@ -940,6 +943,7 @@ enum { DICT_AT_ADD = 1, DICT_AT_FAILED = 2, DICT_AT_RELOAD = 3 };
 /* The series dictionary (file SERIES) and the state names (file STATES) are both these. */
 int series_open(series_dict *d, int dirfd, const char *file, bool read_only, bool fsync);
 int series_reload(series_dict *d, int dirfd); /* readers: names appended by the writer since */
+int series_cut_tail(series_dict *d); /* a writer's open, once its checks passed: cuts the torn tail it found */
 /* before a torn tail is cut: the bytes [off, off + len) of the file read again from the disk equal `tail`, or
  * TSDB_ERR_IO (series.c) */
 int tail_confirm(int dirfd, const char *file, const uint8_t *tail, uint64_t off, size_t len);
@@ -1123,7 +1127,7 @@ size_t wal_record(const uint8_t *p, size_t avail, uint64_t seq, uint64_t off, si
 bool wal_valid_after(const uint8_t *p, size_t len, size_t from, uint64_t seq, uint64_t base);
 void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot);
 int wal_commit(struct eng *db, uint64_t target);
-int wal_open(struct eng *db);
+int wal_open(struct eng *db, int (*before_replay)(struct eng *));
 void wal_close(struct eng *db);
 void *flusher_main(void *arg);
 
@@ -1323,6 +1327,8 @@ struct eng {
     int64_t manifest_bad_since; /* follower: MANIFEST failed its checks since (monotonic ms), else 0 */
     bool manifest_reported;     /* follower: and that was logged */
     char broken_reported[96];   /* follower: the last broken part logged */
+    int64_t series_gap_since;   /* follower: a new part names a series SERIES lacks since (monotonic ms), else 0 */
+    bool writer_nofsync;        /* follower: the writer's MANIFEST says it runs without fsync */
     uint64_t follow_flushed, follow_active;
     wal_tail tails[MAX_TAILS]; /* oldest first; the array is changed under db->lock + buf_lock */
     size_t ntails;
@@ -1406,6 +1412,8 @@ int eng_close(eng *db);
 int eng_series(eng *db, const char *name, int type, uint32_t *id);
 int eng_series_lookup(eng *db, const char *name, uint32_t *id);
 uint32_t eng_series_count(eng *db);
+/* whether part p holds rows or tombstones of a series id >= n (the first such id in *s); db.c */
+bool part_beyond_series(const part *p, uint32_t n, uint32_t *s);
 const char *eng_series_name(eng *db, uint32_t id);
 int eng_series_type(eng *db, uint32_t id);
 int eng_state(eng *db, const char *name, bool create, uint32_t *code);
@@ -1547,6 +1555,7 @@ int cls_at(eng *db, uint32_t s, int64_t ts, int64_t *lo, int64_t *hi);
 int cls_uniform(eng *db, const uint32_t *ids, uint32_t cs, size_t n);
 void cls_setup(eng *db, int classes);
 int cls_open(eng *db, bool read_only);
+int cls_cut_tail(eng *db); /* a writer's open, once its checks passed: cuts the torn tail cls_open found */
 int cls_reload(eng *db);
 void cls_close(eng *db);
 /* Fresh series of a large insert get their class from its rows (once, from the beginning of time). */

@@ -306,17 +306,24 @@ static int meta_load_or_create(eng *db, bool read_only)
  * A part naming one beyond is damage to SERIES: records cut as a torn tail at its open, where damage to the last
  * records looks the same (a misdirected write once overwrote all four of a test's), or lost. The open fails rather
  * than serve those series as never created and their rows as gone. */
+bool part_beyond_series(const part *p, uint32_t n, uint32_t *s)
+{
+    *s = p->ix.nruns ? p->ix.rser[p->ix.nruns - 1] : 0; /* runs are in series order: one per part */
+    bool bad = p->ix.nruns && *s >= n;
+    for (uint32_t t = 0; !bad && t < p->nt; t++)
+        if ((bad = p->t[t].series >= n))
+            *s = p->t[t].series;
+    return bad;
+}
+
 static int parts_check_series(eng *db, bool read_only)
 {
     uint32_t n = eng_series_count(db);
     bool reloaded = false;
     for (size_t i = 0; i < db->nparts; i++) {
         const part *p = db->parts[i];
-        uint32_t s = p->ix.nruns ? p->ix.rser[p->ix.nruns - 1] : 0; /* runs are in series order: one per part */
-        bool bad = p->ix.nruns && s >= n;
-        for (uint32_t t = 0; !bad && t < p->nt; t++)
-            if ((bad = p->t[t].series >= n))
-                s = p->t[t].series;
+        uint32_t s;
+        bool bad = part_beyond_series(p, n, &s);
         if (bad && read_only && !reloaded) {
             /* A reader without MANIFEST read SERIES before it listed the parts: a writer that opened in between
              * may have created the series since (its record is synced before any part can hold it), so the file
@@ -330,12 +337,28 @@ static int parts_check_series(eng *db, bool read_only)
             continue;
         }
         if (bad) {
-            fprintf(stderr, "tsdb: part %s holds series %u, but SERIES has only %u: SERIES is damaged\n", p->name,
-                    s, n);
+            fprintf(stderr,
+                    "tsdb: part %s holds series %u, but SERIES has only %u: SERIES is damaged. Nothing was changed: "
+                    "restore SERIES from a backup or snapshot (a copy with at least %u records), then open again; "
+                    "tsdb export cannot read the database either until then\n",
+                    p->name, s, n, s + 1);
             return TSDB_ERR_CORRUPT;
         }
     }
     return 0;
+}
+
+/* A writer's open cuts the torn tails it found (SERIES, STATES, CLASSES) only once every check that could refuse
+ * the open passed: a part or a WAL row can prove a "torn" record was acknowledged, and a refused open must leave
+ * the files as they were, for the operator to repair. RETENTION needs no cut: its next append overwrites. */
+static int open_cut_tails(eng *db)
+{
+    int rc = series_cut_tail(&db->series);
+    if (rc == 0)
+        rc = series_cut_tail(&db->states);
+    if (rc == 0)
+        rc = cls_cut_tail(db);
+    return rc;
 }
 
 /* test hook (tsdb_test_before_parts): runs in an open that lists the parts itself, just before it does */
@@ -390,7 +413,7 @@ static int load_parts(eng *db, bool read_only)
         if (!part_file_name(name))
             continue;
         part *p;
-        int r = part_open(db->dirfd, name, db->opt.verify_checksums, &p);
+        int r = part_open(db->dirfd, name, db->opt.pin_index, &p);
         if (r == TSDB_ERR_NOTFOUND)
             continue; /* removed while we listed the directory */
         if (r == 0 && p->grows != db->granule_rows) {
@@ -539,7 +562,10 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     if (ro && has_manifest) {
         /* a reader follows what the writer published, not the directory */
         /* a MANIFEST caught mid-rewrite is read again, but a damaged one is not an empty database */
-        while ((rc = follow_refresh(db)) == 0 && !db->follow_version && db->manifest_bad_since)
+        /* and parts naming series SERIES lacks are not an empty view either: the open waits as a follower would,
+           then fails (follow_refresh) */
+        while ((rc = follow_refresh(db)) == 0 && !db->follow_version &&
+               (db->manifest_bad_since || db->series_gap_since))
             usleep(10000);
         if (rc == 0) /* CLASSES was read again after MANIFEST: its records come before the parts that use them */
             rc = cls_check_parts(db);
@@ -562,8 +588,13 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         if ((rc = load_parts(db, ro)) != 0 || (rc = parts_check_series(db, ro)) != 0 ||
             (rc = cls_check_parts(db)) != 0)
             goto fail;
-        /* a follower takes WAL rows from the writer's manifest once there is one */
-        if (!db->opt.follow && (rc = wal_open(db)) != 0)
+        /* a follower takes WAL rows from the writer's manifest once there is one; a writer cuts torn tails only
+           after the WAL's checks too, just before the replay writes anything */
+        if (!db->opt.follow)
+            rc = wal_open(db, ro ? NULL : open_cut_tails);
+        else if (!ro)
+            rc = open_cut_tails(db);
+        if (rc != 0)
             goto fail;
     }
     if (!ro) {
@@ -908,12 +939,14 @@ int eng_drop_before(eng *db, int64_t ts)
 
 /* The numbers of tsdb_stats in one pass over the parts; the volume statistics ask for the granule
  * and merging counts in the same pass (granules and rows then come from one snapshot). */
-static void stats_walk(eng *db, tsdb_stats *st, uint64_t *granules, uint64_t *merging)
+static void stats_walk(eng *db, tsdb_stats *st, uint64_t *granules, uint64_t *merging, uint64_t *pinned)
 {
     memset(st, 0, sizeof *st);
     pthread_mutex_lock(&db->lock);
     for (size_t i = 0; i < db->nparts; i++) {
         part *p = db->parts[i];
+        if (pinned)
+            *pinned += p->pinned;
         if (granules)
             *granules += p->ng;
         if (merging)
@@ -942,7 +975,7 @@ static void stats_walk(eng *db, tsdb_stats *st, uint64_t *granules, uint64_t *me
 
 int eng_get_stats(eng *db, tsdb_stats *st)
 {
-    stats_walk(db, st, NULL, NULL);
+    stats_walk(db, st, NULL, NULL, NULL);
     return 0;
 }
 
@@ -950,7 +983,7 @@ int eng_get_volume_stats(eng *db, tsdb_volume_stats *vs)
 {
     memset(vs, 0, sizeof *vs);
     tsdb_stats st;
-    stats_walk(db, &st, &vs->granules, &vs->merging_parts);
+    stats_walk(db, &st, &vs->granules, &vs->merging_parts, &vs->pinned_bytes);
     vs->parts = st.parts;
     vs->partitions = st.partitions;
     vs->rows = st.rows;

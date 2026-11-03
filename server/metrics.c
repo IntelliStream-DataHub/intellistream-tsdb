@@ -317,6 +317,7 @@ static void render(sb *b)
     VOL_FAMILY("tsdb_wal_bytes_total", "counter", "Bytes written to the WAL since start.", wal_bytes);
     VOL_FAMILY("tsdb_wal_syncs_total", "counter", "WAL fdatasync calls since start.", wal_syncs);
     VOL_FAMILY("tsdb_broken_parts", "gauge", "Parts a follower found damaged and left out.", broken_parts);
+    VOL_FAMILY("tsdb_pinned_index_bytes", "gauge", "Heap bytes of the parts' index copies (--pin-index).", pinned_bytes);
     VOL_FAMILY("tsdb_failed", "gauge", "1 once the volume is in its fail-stop state (writes return IO errors).",
                failed);
     if (strcmp(cfg.role, "follower") == 0) {

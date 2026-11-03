@@ -21,7 +21,7 @@
  *
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--port-file FILE] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
- *         [--verify-checksums] [--metrics-port N|auto [--metrics-bind ADDR]]
+ *         [--verify-checksums] [--pin-index] [--metrics-port N|auto [--metrics-bind ADDR]]
  *
  * --metrics-port serves Prometheus metrics (GET /metrics) on a port of its own, from a
  * thread of its own: see metrics.c. Off by default; binds to --listen unless --metrics-bind.
@@ -29,6 +29,9 @@
  * --verify-checksums checks each granule's checksum before a query decodes it
  * (off by default: meant for storage without checksums of its own). Without it, a directory on ext2/3/4 or
  * XFS, which keep no checksums of the data, gets a line at startup that says so (fs_warn).
+ * --pin-index keeps each part's granule index and tombstones in memory as the open checked them (about 32 to 51
+ * bytes per granule; the tsdb_pinned_index_bytes metric), so damage that reaches a part file later cannot change
+ * which granules a query reads or the statistics it answers from. Off by default: then they are read in place.
  *
  * --port 0 binds a port the kernel chooses; --port-file FILE then holds "PORT PID" (written to a temporary file
  * and renamed once the listener is up; an old FILE is removed at start), and the banner names the real port.
@@ -2450,6 +2453,7 @@ int main(int argc, char **argv)
                                    {"send-timeout", required_argument, 0, 'T'},
                                    {"io", required_argument, 0, 'I'},
                                    {"verify-checksums", no_argument, 0, 'V'},
+                                   {"pin-index", no_argument, 0, 'J'},
                                    {"metrics-port", required_argument, 0, 'M'},
                                    {"metrics-bind", required_argument, 0, 'b'},
                                    {"port-file", required_argument, 0, 'Q'},
@@ -2476,6 +2480,7 @@ int main(int argc, char **argv)
         case 's': o.wal_sync_ms = (int)num_arg("wal-sync-ms", optarg, -1, 3600000); break; /* -1: no WAL */
         case 'F': o.fsync = 0; break;
         case 'V': o.verify_checksums = 1; break;
+        case 'J': o.pin_index = 1; break;
         case 'M': {
             if (!strcmp(optarg, "auto")) { /* a port the kernel chooses; the port file names it */
                 metrics_on = 1;
@@ -2530,7 +2535,7 @@ int main(int argc, char **argv)
                         "             [--wal-sync-ms MS] [--partition-ms MS] [--partition-classes 1|0]\n"
                         "             [--granule-rows 8192] (at creation)\n"
                         "             [--no-fsync] [--read-only | --follow [--refresh-ms 100]] [--max-connections 10000]\n"
-                        "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums]\n"
+                        "             [--send-timeout 60] [--io auto|uring|epoll] [--verify-checksums] [--pin-index]\n"
                         "             [--metrics-port N|auto [--metrics-bind ADDR]]\n"
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
                         "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"

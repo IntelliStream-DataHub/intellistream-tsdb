@@ -202,6 +202,18 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
     uint64_t min_block = UINT64_MAX, max_block = 0;
     uint32_t level = 0;
     for (size_t i = 0; i < k; i++) {
+        /* Without pin_index a source's index is read in the mapping, where damage after its open shows. The merge
+         * copies granule statistics from it verbatim and takes series and time ranges from it for the rows it
+         * decodes, and would write either under the new part's fresh hash: wrong answers for good, which no later
+         * check could see. So the index is hashed again first (it is about 0.3% of the part); on a mismatch the
+         * merge fails and the part stays, for the next open to refuse. Decoding instead would still trust its run
+         * table and offsets. */
+        if (!part_index_intact(src[i])) {
+            fprintf(stderr, "tsdb: merge: the index of part %s no longer matches the checksum its open checked "
+                            "(damaged since): not merged; the next open will refuse the part\n", src[i]->name);
+            free(cur);
+            return TSDB_ERR_CORRUPT;
+        }
         cur[i].p = src[i];
         min_block = MIN(min_block, src[i]->min_block);
         max_block = MAX(max_block, src[i]->max_block);

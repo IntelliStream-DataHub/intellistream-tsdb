@@ -138,6 +138,13 @@ typedef struct tsdb_options {
     int partition_classes;   /* fixed at creation; 1 (default): a partition length per series from its rate
                               * (see partition_ms), so slow series pay little per partition; 0: every series
                               * in base partitions. Off by itself when partition_ms is below 4 ms */
+    int pin_index;           /* 1: each part's granule index and tombstones are copied into memory when the open
+                              * checks them, and read from that copy: damage that reaches the file later (a
+                              * misdirected write, a misread page) cannot change what queries see. Costs about 32
+                              * to 51 bytes of RAM per granule, in every process that opens the part
+                              * (tsdb_volume_stats.pinned_bytes). Default 0: read in place from the mapping (page
+                              * cache); damage after the open can then give wrong answers, never a read outside the
+                              * part. Independent of verify_checksums */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -688,6 +695,7 @@ typedef struct tsdb_volume_stats {
     uint64_t wal_syncs;      /* WAL fdatasyncs since open (0 with fsync off) */
     uint64_t broken_parts, follow_errors;
     int64_t follow_refresh_age_ms;   /* follower: time since its last successful refresh; 0 for a writer */
+    uint64_t pinned_bytes;   /* heap the listed parts' index copies take (pin_index; 0 without it) */
     int failed;              /* fail-stop state of this volume (see tsdb_failed) */
 } tsdb_volume_stats;
 int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
@@ -757,7 +765,7 @@ size_t tsdb_struct_size(int kind);
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
  * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 1
+#define TSDB_ABI_VERSION 2 /* 2: tsdb_options.pin_index (in what was padding) */
 int tsdb_abi_version(void);
 
 #ifdef __cplusplus

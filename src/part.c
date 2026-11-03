@@ -93,14 +93,31 @@ static bool trailer_parse(const uint8_t *buf, size_t tlen, const tomb **t, uint3
     return true;
 }
 
-int part_open(int dirfd, const char *name, bool verify, part **out)
+int part_open(int dirfd, const char *name, bool pin, part **out)
 {
-    return part_open_as(dirfd, name, name, verify, out);
+    return part_open_as(dirfd, name, name, pin, out);
+}
+
+/* Whether the index, tombstones, header and footer in the mapping still hash to what the open checked. A part read
+ * in place (without pin_index) can be damaged after the open; a merge copies granule statistics from the index
+ * verbatim and would write them under a fresh hash, so it checks first (about 0.3% of the part's bytes). */
+bool part_index_intact(const part *p)
+{
+    if (p->icopy)
+        return true; /* the copy is what was checked */
+    part_header h;
+    part_footer f;
+    memcpy(&h, p->map, sizeof h);
+    memcpy(&f, p->map + p->map_len - sizeof f, sizeof f);
+    /* the geometry of the open, not the footer's now: damaged lengths must not move the read */
+    size_t ilen = (size_t)p->index_len, tlen = p->map_len - sizeof f - (size_t)p->index_off - ilen;
+    const uint8_t *ib = p->map + p->index_off;
+    return part_hash(&h, ib, ilen, ib + ilen, tlen, &f) == p->index_hash;
 }
 
 /* Opens the file `file` as the part called `name` (a follower may find a part
- * under its retired_ name). */
-int part_open_as(int dirfd, const char *file, const char *name, bool verify, part **out)
+ * under its retired_ name). pin: read the index and tombstones from a checked copy (pin_index). */
+int part_open_as(int dirfd, const char *file, const char *name, bool pin, part **out)
 {
     *out = NULL;
     part *p = calloc(1, sizeof *p);
@@ -167,26 +184,29 @@ int part_open_as(int dirfd, const char *file, const char *name, bool verify, par
         goto fail;
     size_t ilen = (size_t)f.index_len, tlen = (size_t)((uint64_t)size - sizeof f - f.index_off - f.index_len);
     const uint8_t *ib = p->map + f.index_off;
-    if (verify) {
+    if (pin) {
         /* The index and the tombstones are checked here, once, and then trusted by every query. In the mapping,
-           damage that reaches the file later (a misdirected write, a page misread after it was evicted) would
-           change them under the readers unchecked: a granule skipped, a statistic wrong. So verify_checksums reads
-           them from a copy, and the bytes checked are the bytes used (about 32 bytes of memory per granule).
-           8 zero bytes follow it, as the footer follows them in the file: gix_get loads 8 bytes at a time. */
+           damage that reaches the file later (a misdirected write, a page misread after it was evicted) changes
+           them under the readers unchecked: a granule skipped, a statistic wrong (never a read outside the mapping:
+           the gix_* readers clamp). pin_index reads them from a copy instead, so the bytes checked are the bytes
+           used, at about 32 to 51 bytes of memory per granule. 8 zero bytes follow it, as the footer follows them
+           in the file: gix_get loads 8 bytes at a time. */
         rc = TSDB_ERR_NOMEM;
         if (!(p->icopy = malloc(ilen + tlen + 8)))
             goto fail;
         memcpy(p->icopy, ib, ilen + tlen);
         memset(p->icopy + ilen + tlen, 0, 8);
         ib = p->icopy;
+        p->pinned = ilen + tlen + 8;
         rc = TSDB_ERR_CORRUPT;
     }
-    p->verify = verify;
     if (part_hash(&h, ib, ilen, ib + ilen, tlen, &f) != f.index_hash || f.min_ts > f.max_ts ||
         !trailer_parse(ib + ilen, tlen, &p->t, &p->nt) || gix_parse(ib, ilen, f.ngranules, &p->ix) != 0)
         goto fail;
     p->ng = f.ngranules;
     p->index_off = f.index_off;
+    p->index_len = f.index_len;
+    p->index_hash = f.index_hash;
     p->rows = f.rows;
     p->min_ts = f.min_ts;
     p->max_ts = f.max_ts;
@@ -552,7 +572,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         else
             close(w->fd);
         w->fd = -1; /* the tmp file stays */
-        rc = part_open_as(db->dirfd, w->tmp_name, name, db->opt.verify_checksums, out);
+        rc = part_open_as(db->dirfd, w->tmp_name, name, db->opt.pin_index, out);
         if (rc == 0)
             (*out)->verify = db->opt.verify_checksums;
         if (rc == 0)
@@ -575,7 +595,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         pw_abort(w);
         return TSDB_ERR_IO;
     }
-    rc = part_open(db->dirfd, name, db->opt.verify_checksums, out);
+    rc = part_open(db->dirfd, name, db->opt.pin_index, out);
     if (rc == 0)
         (*out)->verify = db->opt.verify_checksums;
     if (rc != 0)

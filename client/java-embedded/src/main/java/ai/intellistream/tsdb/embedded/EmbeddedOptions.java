@@ -40,6 +40,7 @@ public final class EmbeddedOptions {
     private int mergeIdleS;
     private int obsoletePartLifetimeS;
     private boolean verifyChecksums;
+    private boolean pinIndex;
     private int retentionMergeS;
     private boolean createVolumes;
     private long scratchBytes = DEFAULT_SCRATCH_BYTES;
@@ -76,6 +77,7 @@ public final class EmbeddedOptions {
             mergeIdleS = o.get(JAVA_INT, offset(OPTIONS, "merge_idle_s"));
             obsoletePartLifetimeS = o.get(JAVA_INT, offset(OPTIONS, "obsolete_part_lifetime_s"));
             verifyChecksums = o.get(JAVA_INT, offset(OPTIONS, "verify_checksums")) != 0;
+            pinIndex = o.get(JAVA_INT, offset(OPTIONS, "pin_index")) != 0;
             retentionMergeS = o.get(JAVA_INT, offset(OPTIONS, "retention_merge_s"));
             createVolumes = o.get(JAVA_INT, offset(OPTIONS, "create_volumes")) != 0;
         }
@@ -104,6 +106,7 @@ public final class EmbeddedOptions {
         o.set(JAVA_INT, offset(OPTIONS, "merge_idle_s"), mergeIdleS);
         o.set(JAVA_INT, offset(OPTIONS, "obsolete_part_lifetime_s"), obsoletePartLifetimeS);
         o.set(JAVA_INT, offset(OPTIONS, "verify_checksums"), verifyChecksums ? 1 : 0);
+        o.set(JAVA_INT, offset(OPTIONS, "pin_index"), pinIndex ? 1 : 0);
         o.set(JAVA_INT, offset(OPTIONS, "retention_merge_s"), retentionMergeS);
         o.set(JAVA_INT, offset(OPTIONS, "create_volumes"), createVolumes ? 1 : 0);
         /* clock_ms and clock_arg stay NULL (allocate zeroes): retention reads the wall clock */
@@ -335,6 +338,19 @@ public final class EmbeddedOptions {
     }
 
     /**
+     * Whether each part's granule index and tombstones are copied into memory when the open checks them, so damage
+     * that reaches the file later cannot change what queries see. Costs about 32 to 51 bytes of RAM per granule.
+     *
+     * @param on default false: read in place (damage after the open can give wrong answers, never a read outside
+     *     the part)
+     * @return this
+     */
+    public EmbeddedOptions pinIndex(boolean on) {
+        pinIndex = on;
+        return this;
+    }
+
+    /**
      * A part holding rows past their series' retention is rewritten without them once it is this old.
      *
      * @param seconds default 3600; -1 never (merges still drop them)
@@ -386,7 +402,7 @@ public final class EmbeddedOptions {
                 + flushIntervalMs + ", walSyncMs=" + walSyncMs + ", walMaxBatchRows=" + walMaxBatchRows
                 + ", maxPartBytes=" + maxPartBytes + ", readOnly=" + readOnly + ", follow=" + follow + ", refreshMs="
                 + refreshMs + ", mergeIdleS=" + mergeIdleS + ", obsoletePartLifetimeS=" + obsoletePartLifetimeS
-                + ", verifyChecksums=" + verifyChecksums + ", retentionMergeS=" + retentionMergeS
+                + ", verifyChecksums=" + verifyChecksums + ", pinIndex=" + pinIndex + ", retentionMergeS=" + retentionMergeS
                 + ", createVolumes=" + createVolumes + ", scratchBytes=" + scratchBytes + "]";
     }
 }

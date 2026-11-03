@@ -98,6 +98,10 @@ pub struct Options {
     /// Queries check each granule's checksum before decoding it (a mismatch is [`Error::Server`] with
     /// `TSDB_ERR_CORRUPT`). Default false: for storage that checks its data itself (ZFS, ECC memory).
     pub verify_checksums: bool,
+    /// Each part's granule index and tombstones are copied into memory when the open checks them, so damage that
+    /// reaches the file later cannot change what queries see; about 32 to 51 bytes of RAM per granule. Default
+    /// false: read in place (damage after the open can give wrong answers, never a read outside the part).
+    pub pin_index: bool,
     /// A part holding rows past their series' retention is rewritten without them once it is this many
     /// seconds old; -1 never (merges still drop them). Default 3600.
     pub retention_merge_s: i32,
@@ -136,6 +140,7 @@ impl Default for Options {
             merge_idle_s: o.merge_idle_s,
             obsolete_part_lifetime_s: o.obsolete_part_lifetime_s,
             verify_checksums: o.verify_checksums != 0,
+            pin_index: o.pin_index != 0,
             retention_merge_s: o.retention_merge_s,
             create_volumes: o.create_volumes != 0,
             request_threads: o.request_threads,
@@ -175,6 +180,7 @@ impl Options {
             create_volumes: self.create_volumes as c_int,
             request_threads: self.request_threads,
             partition_classes: self.partition_classes as c_int,
+            pin_index: self.pin_index as c_int,
         }
     }
 }

@@ -1283,6 +1283,7 @@ class Db:
         retention_merge_s: int | None = None,
         request_threads: int | None = None,
         partition_classes: bool | None = None,
+        pin_index: bool | None = None,
     ) -> Db: ...
     def close(self) -> None:
         """Flushes the memtable and closes the database.

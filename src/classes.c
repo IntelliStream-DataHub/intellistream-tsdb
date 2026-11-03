@@ -339,17 +339,22 @@ int cls_open(eng *db, bool read_only)
     pthread_mutex_unlock(&db->cls_mu);
     if (rc == 0)
         rc = cls_load(db, !read_only);
+    return rc;
+}
+
+/* A torn tail is cut as SERIES's is: nothing relied on it, since a record is synced before it is used. Called by a
+ * writer's open once its checks passed (as series_cut_tail), so a refused open leaves the file as it found it. */
+int cls_cut_tail(eng *db)
+{
     struct stat st;
-    if (rc == 0 && !read_only && fstatat(db->dirfd, CLS_FILE, &st, 0) == 0 && (uint64_t)st.st_size > db->cls_off) {
-        /* cut a torn tail, as SERIES does: nothing relied on it, since a record is synced before it is used */
-        fprintf(stderr, "tsdb: %s: cutting a torn tail of %llu bytes at offset %llu\n", CLS_FILE,
-                (unsigned long long)st.st_size - (unsigned long long)db->cls_off, (unsigned long long)db->cls_off);
-        int fd = openat(db->dirfd, CLS_FILE, O_WRONLY | O_CLOEXEC);
-        if (fd < 0 || ftruncate(fd, (off_t)db->cls_off) != 0)
-            rc = TSDB_ERR_IO;
-        if (fd >= 0)
-            close(fd);
-    }
+    if (fstatat(db->dirfd, CLS_FILE, &st, 0) != 0 || (uint64_t)st.st_size <= db->cls_off)
+        return 0;
+    fprintf(stderr, "tsdb: %s: cutting a torn tail of %llu bytes at offset %llu\n", CLS_FILE,
+            (unsigned long long)st.st_size - (unsigned long long)db->cls_off, (unsigned long long)db->cls_off);
+    int fd = openat(db->dirfd, CLS_FILE, O_WRONLY | O_CLOEXEC);
+    int rc = fd < 0 || ftruncate(fd, (off_t)db->cls_off) != 0 ? TSDB_ERR_IO : 0;
+    if (fd >= 0)
+        close(fd);
     return rc;
 }
 
@@ -995,11 +1000,15 @@ int cls_observe(eng *db, part *p)
     double len = (double)hi - (double)lo;
     sw *w = NULL;
     size_t k = 0;
+    uint32_t nser = eng_series_count(db);
     for (uint32_t r = 0; r < p->ix.nruns; r++) {
         uint32_t s = p->ix.rser[r], i = gix_rstart(&p->ix, r);
         uint32_t j = r + 1 < p->ix.nruns ? gix_rstart(&p->ix, r + 1) : p->ng;
-        if (j <= i)
-            continue; /* a run table damaged after the open (see gix_rstart) */
+        /* A run table damaged after the open (see gix_rstart; read in the mapping without pin_index) must not
+         * become a durable record: a series SERIES lacks (which a series made later would inherit), or runs out of
+         * order, which name some other series. */
+        if (j <= i || s >= nser || (r > 0 && s <= p->ix.rser[r - 1]))
+            continue;
         size_t n = 0;
         for (uint32_t x = i; x < j; x++)
             n += gx_count(p, x);

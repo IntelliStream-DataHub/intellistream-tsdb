@@ -734,6 +734,7 @@ static tsdb *open_two_parts(const char *dir, int verify, tsdb_sid *id, char *par
     rm_rf(dir);
     tsdb_options o = opts();
     o.verify_checksums = verify;
+    o.pin_index = verify;
     o.wal_max_batch_rows = 100; /* straight to parts */
     tsdb *db;
     OK(tsdb_open(dir, &o, &db));
@@ -754,17 +755,21 @@ static tsdb *open_two_parts(const char *dir, int verify, tsdb_sid *id, char *par
 /* A misdirected write into the index of a part the server has mapped (found by jepsen --nemesis misdirect): the
  * open checked the index, the readers trust it, and the mapping shows what reached the file since. A run table
  * entry made gix_run_of return UINT32_MAX and a merge read rser[UINT32_MAX] (SIGSEGV). Now every entry number
- * taken from the run table stays in the index, and with verify_checksums the index is read from the copy that was
- * checked, so the answers do not change at all. */
+ * taken from the run table stays in the index, and with pin_index the index is read from the copy that was
+ * checked, so the answers do not change at all. (That copy was verify_checksums' at first; it is its own option
+ * now, since it costs memory per granule and the clamps alone keep reads in bounds.) */
 static void test_index_after_open(const char *scratch)
 {
     char dir[600], part[256];
     snprintf(dir, sizeof dir, "%s/damage-index-live", scratch);
-    for (int verify = 0; verify <= 1; verify++) {
+    for (int verify = 0; verify <= 1; verify++) { /* verify: pin_index (and verify_checksums) */
         tsdb_sid id;
         tsdb *db = open_two_parts(dir, verify, &id, part, sizeof part);
         int rc;
         CHECK(count_rows(db, id, &rc) == 2 * PART_ROWS);
+        tsdb_volume_stats vs;
+        OK(tsdb_get_volume_stats(db, 0, &vs));
+        CHECK(verify ? vs.pinned_bytes >= 8 * vs.granules : vs.pinned_bytes == 0);
         part_footer ft = read_footer(dir, part);
         uint8_t junk[4096];
         memset(junk, 0xa5, sizeof junk);
@@ -780,7 +785,51 @@ static void test_index_after_open(const char *scratch)
         }
         tsdb_close(db);
     }
-    printf("  a part's index damaged after the open: no crash; with verify_checksums the answers stay right\n");
+    /* verify_checksums alone no longer pins the index: that costs memory per granule, and is pin_index's */
+    tsdb_options o = opts();
+    o.verify_checksums = 1;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_volume_stats vs;
+    OK(tsdb_get_volume_stats(db, 0, &vs));
+    CHECK(vs.pinned_bytes == 0 && vs.granules > 0);
+    tsdb_close(db);
+    printf("  a part's index damaged after the open: no crash; with pin_index the answers stay right\n");
+    rm_rf(dir);
+}
+
+/* A merge copies a merged source's granules verbatim, statistics included, from the index in the mapping. Damage
+ * that reached the index after the open (without pin_index) was written into the new part under a fresh hash: wrong
+ * aggregates for good, which no later check could see. The merge checks each source's index hash first now, and
+ * fails rather than copy; the damaged part stays, and the next open refuses it. */
+static void test_merge_index_damage(const char *scratch)
+{
+    char dir[600], part[256];
+    snprintf(dir, sizeof dir, "%s/damage-merge-index", scratch);
+    rm_rf(dir);
+    tsdb_options o = opts();
+    o.wal_max_batch_rows = 100; /* straight to parts */
+    tsdb *db;
+    tsdb_sid id;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "merge.a", &id));
+    static int64_t ts[PART_ROWS];
+    static float v[PART_ROWS];
+    for (int k = 0; k < 3; k++) {
+        for (int i = 0; i < PART_ROWS; i++)
+            ts[i] = T0 + (k * PART_ROWS + i) * 1000, v[i] = (float)(i % 37);
+        OK(tsdb_insert_series(db, id, ts, v, PART_ROWS));
+        if (k == 1)
+            OK(tsdb_optimize(db)); /* a merged part: its granules are copied verbatim by the next merge */
+    }
+    CHECK(find_file(dir, "p", "_1.part", part, sizeof part));
+    part_footer ft = read_footer(dir, part);
+    flip(dir, part, (off_t)(ft.index_off + ft.index_len - 8)); /* the last granule entry's statistics */
+    RC(tsdb_optimize(db), TSDB_ERR_CORRUPT);
+    char again[256];
+    CHECK(find_file(dir, part, "", again, sizeof again)); /* still there, not replaced by a laundered copy */
+    tsdb_close(db);
+    printf("  a merge does not copy statistics from an index damaged after the open\n");
     rm_rf(dir);
 }
 
@@ -812,6 +861,267 @@ static void test_series_cut_under_parts(const char *scratch)
         RC(try_open(dir), TSDB_ERR_CORRUPT);
     }
     printf("  SERIES cut below series that parts hold: the open fails\n");
+    rm_rf(dir);
+}
+
+static void crash_with_series(const char *dir, const char *vol);
+
+/* Every file of dir, by name and content (order-free): equal before and after means nothing was changed. */
+static uint64_t dir_digest(const char *dir)
+{
+    DIR *d = opendir(dir);
+    uint64_t sum = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        char p[1024];
+        struct stat st;
+        path(p, sizeof p, dir, e->d_name);
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode) || strcmp(e->d_name, "LOCK") == 0)
+            continue;
+        uint8_t *b = malloc((size_t)st.st_size + 1);
+        int fd = open(p, O_RDONLY);
+        CHECK(b && fd >= 0 && pread(fd, b, (size_t)st.st_size, 0) == (ssize_t)st.st_size);
+        sum += xxh64(e->d_name, strlen(e->d_name), 0) * 31 + xxh64(b, (size_t)st.st_size, (uint64_t)st.st_size);
+        if (fd >= 0)
+            close(fd);
+        free(b);
+    }
+    if (d)
+        closedir(d);
+    return sum;
+}
+
+static void append_junk(const char *dir, const char *name, size_t n)
+{
+    char p[1024];
+    path(p, sizeof p, dir, name);
+    int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    uint8_t z[64] = {0};
+    CHECK(fd >= 0 && n <= sizeof z && write(fd, z, n) == (ssize_t)n);
+    if (fd >= 0)
+        close(fd);
+}
+
+/* The open cut a "torn" SERIES tail (and those of STATES and CLASSES) before the checks that then found the cut
+ * record was acknowledged and refused the open: the only copy of the damaged record was gone, so one flipped bit,
+ * which the operator could have flipped back, became a database that never opens again. The cuts wait for every
+ * check now: a refused open leaves each file byte for byte as it was, and once SERIES is repaired the open works. */
+static void test_refused_open_keeps_files(const char *scratch)
+{
+    char dir[600], wal[256];
+    snprintf(dir, sizeof dir, "%s/damage-refused-keeps", scratch);
+    for (int in_wal = 0; in_wal <= 1; in_wal++) {
+        const char *last = in_wal ? "wal.b" : "sensor_3";
+        if (in_wal) {
+            crash_with_series(dir, NULL); /* wal.a and wal.b, with rows only in the WAL */
+            CHECK(find_file(dir, "wal_", ".log", wal, sizeof wal));
+            append_junk(dir, wal, 13); /* a torn append after the rows */
+        } else {
+            rm_rf(dir);
+            tsdb_options o = opts();
+            tsdb *db;
+            OK(tsdb_open(dir, &o, &db));
+            tsdb_sid sid;
+            uint32_t code;
+            OK(tsdb_series_create(db, "machine.mode", TSDB_STATE, NULL, &sid)); /* STATES gets a record */
+            OK(tsdb_state(db, sid, "running", &code));
+            for (int s = 0; s < 4; s++) {
+                char name[32];
+                tsdb_sid id;
+                snprintf(name, sizeof name, "sensor_%d", s);
+                OK(tsdb_series(db, name, &id));
+                int64_t ts[100];
+                float v[100];
+                for (int i = 0; i < 100; i++)
+                    ts[i] = T0 + i * 1000, v[i] = (float)i;
+                OK(tsdb_insert_series(db, id, ts, v, 100));
+            }
+            OK(tsdb_flush(db));
+            OK(tsdb_close(db));
+        }
+        append_junk(dir, "STATES", 5);
+        append_junk(dir, "CLASSES", 10);
+        off_t size = file_size(dir, "SERIES");
+        off_t at = size - (off_t)rec_size(strlen(last)) + 8; /* the last record's name */
+        flip(dir, "SERIES", at);
+        uint64_t before = dir_digest(dir);
+        RC(try_open(dir), TSDB_ERR_CORRUPT);
+        CHECK(file_size(dir, "SERIES") == size);
+        CHECK(dir_digest(dir) == before);
+        flip(dir, "SERIES", at); /* the repair: possible because the record is still there */
+        OK(try_open(dir));
+        CHECK(rows_of(dir, last) == (in_wal ? WAL_RECROWS : 100));
+    }
+    printf("  a refused open changes no file: SERIES repaired afterwards, the open works\n");
+    rm_rf(dir);
+}
+
+static int open_reader(const char *dir, int follow, tsdb **out)
+{
+    tsdb_options o = opts();
+    o.read_only = 1;
+    o.follow = follow;
+    return tsdb_open(dir, &o, out);
+}
+
+/* Four series with 100 rows each, straight into parts, in dir (or vol, a volume) by a writer left open. */
+static tsdb *writer_with_parts(const char *dir, const char *vol, int first, int n)
+{
+    tsdb_options o = opts();
+    o.wal_max_batch_rows = 10; /* inserts go straight to parts */
+    o.fsync = 1;               /* a missing record is damage only after a writer that synced it */
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    for (int s = first; db && s < first + n; s++) {
+        char name[32];
+        tsdb_sid id;
+        snprintf(name, sizeof name, "sensor_%d", s);
+        OK(vol ? tsdb_series_at(db, name, vol, &id) : tsdb_series(db, name, &id));
+        int64_t ts[100];
+        float v[100];
+        for (int i = 0; i < 100; i++)
+            ts[i] = T0 + i * 1000, v[i] = (float)i;
+        OK(tsdb_insert_series(db, id, ts, v, 100));
+    }
+    return db;
+}
+
+/* The follower gap: a reader or follower with MANIFEST listed parts naming a series its SERIES lacks (the last
+ * record damaged at rest while the writer ran) and served the series as never made: open fine, lookup NOTFOUND, no
+ * error and no log line, while the writer kept serving it. Now the part is "broken" like one that fails its
+ * checksum: the open waits out the patience and fails, a running follower keeps its previous view and its refresh
+ * fails, and both recover once SERIES is repaired. */
+static void test_series_gap_follower(const char *scratch)
+{
+    char dir[600], vol[700];
+    snprintf(dir, sizeof dir, "%s/damage-series-gap", scratch);
+    snprintf(vol, sizeof vol, "%s-vol", dir);
+    rm_rf(dir);
+    tsdb *w = writer_with_parts(dir, NULL, 0, 4), *f;
+    off_t at = file_size(dir, "SERIES") - (off_t)rec_size(strlen("sensor_3")) + 8;
+    flip(dir, "SERIES", at);
+    for (int follow = 0; follow <= 1; follow++) {
+        int rc = open_reader(dir, follow, &f);
+        RC(rc, TSDB_ERR_CORRUPT);
+        if (rc == 0)
+            tsdb_close(f);
+    }
+    flip(dir, "SERIES", at);
+    tsdb_sid id;
+    OK(open_reader(dir, 1, &f));
+    OK(tsdb_series_lookup(f, "sensor_3", &id));
+
+    /* a running follower: the damage reaches SERIES between the record's append and the part that uses it */
+    tsdb_sid id4;
+    OK(tsdb_series(w, "sensor_4", &id4));
+    at = file_size(dir, "SERIES") - (off_t)rec_size(strlen("sensor_4")) + 8;
+    flip(dir, "SERIES", at);
+    int64_t ts[100];
+    float v[100];
+    for (int i = 0; i < 100; i++)
+        ts[i] = T0 + i * 1000, v[i] = (float)i;
+    OK(tsdb_insert_series(w, id4, ts, v, 100));
+    int rc = 0;
+    for (int i = 0; i < 600 && rc == 0; i++) { /* the patience is 2 s */
+        rc = tsdb_refresh(f);
+        usleep(10000);
+    }
+    RC(rc, TSDB_ERR_CORRUPT);
+    tsdb_stats st;
+    OK(tsdb_get_stats(f, &st));
+    CHECK(st.broken_parts >= 1);
+    RC(tsdb_series_lookup(f, "sensor_4", &id), TSDB_ERR_NOTFOUND); /* the previous view */
+    flip(dir, "SERIES", at);
+    OK(tsdb_refresh(f));
+    OK(tsdb_series_lookup(f, "sensor_4", &id));
+    int qrc;
+    CHECK(count_rows(f, id, &qrc) == 100 && qrc == 0);
+    tsdb_close(f);
+    tsdb_close(w);
+
+    /* a volume is judged by its own SERIES */
+    rm_rf(dir);
+    rm_rf(vol);
+    w = writer_with_parts(dir, vol, 0, 4);
+    at = file_size(vol, "SERIES") - (off_t)rec_size(strlen("sensor_3")) + 8;
+    flip(vol, "SERIES", at);
+    rc = open_reader(dir, 1, &f);
+    if (rc == 0) { /* volumes open when first needed: the lookup must not say "no such series" */
+        CHECK(tsdb_series_lookup(f, "sensor_3", &id) != TSDB_ERR_NOTFOUND);
+        tsdb_close(f);
+    } else {
+        RC(rc, TSDB_ERR_CORRUPT);
+    }
+    tsdb_close(w);
+    printf("  a follower's new part naming a series SERIES lacks: the open fails, a running follower keeps its view\n");
+    rm_rf(dir);
+    rm_rf(vol);
+}
+
+/* src/volumes.c: cls_observe on every part of the root volume, as the merge thread does on an idle partition */
+int tsdb_test_observe(tsdb *t);
+
+/* Whether CLASSES has a record for local series id s. */
+static bool classes_has(const char *dir, uint32_t s)
+{
+    off_t size = file_size(dir, "CLASSES");
+    bool found = false;
+    for (off_t off = 0; size > 0 && off + 24 <= size; off += 24) {
+        uint8_t rec[24];
+        file_pread(dir, "CLASSES", off, rec, sizeof rec);
+        uint32_t id;
+        memcpy(&id, rec + 4, 4);
+        found |= id == s;
+    }
+    return found;
+}
+
+/* The measurement of an idle partition's series rates (cls_observe) reads the run table in the mapping, where damage
+ * after the open put a series id SERIES lacks: it wrote and synced a class record for that id, which a series made
+ * later would inherit. Runs naming a series beyond SERIES, or out of order, are skipped. */
+static void test_observe_damaged_runs(const char *scratch)
+{
+    char dir[600], pname[256];
+    snprintf(dir, sizeof dir, "%s/damage-observe", scratch);
+    for (int damage = 0; damage <= 1; damage++) {
+        rm_rf(dir);
+        tsdb_options o = opts();
+        o.wal_max_batch_rows = 10; /* straight to parts */
+        tsdb *db;
+        tsdb_sid id;
+        OK(tsdb_open(dir, &o, &db));
+        OK(tsdb_series(db, "observe.a", &id));
+        static int64_t ts[600];
+        static float v[600];
+        for (int i = 0; i < 600; i++) /* fast: class 0 */
+            ts[i] = T0 + i * 1000, v[i] = 1;
+        OK(tsdb_insert_series(db, id, ts, v, 600));
+        const int64_t day2 = 19677LL * 86400000; /* two days on: the base partition 19677, key 4 x 19677 */
+        for (int i = 0; i < 100; i++) /* then slow, in a class 0 partition: a switch is due */
+            ts[i] = day2 + i * 800000, v[i] = 2;
+        OK(tsdb_insert_series(db, id, ts, v, 100));
+        CHECK(find_file(dir, "p78708_", ".part", pname, sizeof pname));
+        if (damage) {
+            int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+            part *pt = NULL;
+            OK(part_open(dfd, pname, false, &pt));
+            if (pt && pt->ix.nruns == 1) {
+                uint32_t bogus = 1000;
+                file_pwrite(dir, pname, (off_t)((const uint8_t *)pt->ix.rser - pt->map), &bogus, 4);
+            }
+            CHECK(pt && pt->ix.nruns == 1);
+            if (pt)
+                part_unref(pt);
+            close(dfd);
+        }
+        OK(tsdb_test_observe(db));
+        if (damage)
+            CHECK(!classes_has(dir, 1000));
+        else
+            CHECK(classes_has(dir, (uint32_t)TSDB_SID_LOCAL(id))); /* the setup reaches a switch */
+        tsdb_close(db);
+    }
+    printf("  rates measured from a damaged run table write no class record for a series SERIES lacks\n");
     rm_rf(dir);
 }
 
@@ -1154,14 +1464,38 @@ static void test_series_wal_follower(const char *scratch)
     OK(tsdb_open(dir, &fo, &f));
     OK(tsdb_refresh(f));
     off_t size = file_size(dir, "SERIES");
-    OK(tsdb_series(sm.w, "follow.b", &b));
-    size_t rs = rec_size(strlen("follow.b"));
+    OK(tsdb_series(sm.w, "follow.n", &b));
+    size_t rs = rec_size(strlen("follow.n"));
     uint8_t good[64];
+    file_pread(dir, "SERIES", size, good, rs);
+    junk_last_series(dir, "follow.n");
+    OK(tsdb_insert_series(sm.w, b, ts, v, WAL_RECROWS));
+    /* A writer without fsync leaves the order its files reach a follower on NFS to the writeback, so a missing record
+     * is not damage within the usual patience: it was reported as "SERIES is damaged" after 2 s. It gets a minute. */
+    int rc = 0;
+    for (int i = 0; i < 30 && rc == 0; i++) {
+        rc = tsdb_refresh(f);
+        usleep(100000);
+    }
+    OK(rc);
+    file_pwrite(dir, "SERIES", size, good, rs);
+    OK(tsdb_refresh(f));
+    OK(tsdb_series_lookup(f, "follow.n", &b));
+
+    /* a writer with fsync: after the usual patience it is damage */
+    OK(tsdb_close(sm.w));
+    tsdb_options so = opts();
+    so.fsync = 1;
+    OK(tsdb_open(dir, &so, &sm.w));
+    OK(tsdb_refresh(f));
+    size = file_size(dir, "SERIES");
+    OK(tsdb_series(sm.w, "follow.b", &b));
+    rs = rec_size(strlen("follow.b"));
     file_pread(dir, "SERIES", size, good, rs);
     junk_last_series(dir, "follow.b");
     OK(tsdb_insert_series(sm.w, b, ts, v, WAL_RECROWS));
     OK(tsdb_insert_series(sm.w, a, (int64_t[]){T0 + 100000}, (float[]){6}, 1)); /* after it: not shown either */
-    int rc = tsdb_refresh(f);
+    rc = tsdb_refresh(f);
     CHECK(rc == 0); /* within the patience */
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1471,6 +1805,10 @@ int main(int argc, char **argv)
     test_series_cut_under_parts(base);
     test_series_check_races(base);
     test_series_cut_under_wal(base);
+    test_refused_open_keeps_files(base);
+    test_series_gap_follower(base);
+    test_observe_damaged_runs(base);
+    test_merge_index_damage(base);
     test_series_wal_follower(base);
     test_misread_tail(base);
     test_read_errors(base);

@@ -16,7 +16,7 @@ static const size_t layout[] = {
     O(tsdb_options, obsolete_part_lifetime_s), O(tsdb_options, verify_checksums),
     O(tsdb_options, retention_merge_s), O(tsdb_options, clock_ms), O(tsdb_options, clock_arg),
     O(tsdb_options, create_volumes),
-    O(tsdb_options, request_threads), O(tsdb_options, partition_classes),
+    O(tsdb_options, request_threads), O(tsdb_options, partition_classes), O(tsdb_options, pin_index),
     S(tsdb_values), O(tsdb_values, type), O(tsdb_values, values), O(tsdb_values, valid),
     S(tsdb_points), O(tsdb_points, ts), O(tsdb_points, values), O(tsdb_points, n), O(tsdb_points, cap),
     S(tsdb_bucket), O(tsdb_bucket, start), O(tsdb_bucket, count), O(tsdb_bucket, sum), O(tsdb_bucket, min),
