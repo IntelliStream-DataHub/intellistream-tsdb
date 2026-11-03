@@ -20,7 +20,7 @@ In batch classes (NAME.bK.cN: K windows per request) the q/s of qdrive's and rel
 tsdbq's lines counts windows; each line says which, and tsdbq's get their requests per second (q/s / K) beside them.
 The extra pass's timings (p2/<sys>/p6/, run.sh p6: another load) join the system's table marked "p6:", and the
 system's how.json p6 block (when, runs, trees, its '-' reasons and refusals) is printed under it.
-The extra-clients pass (run.sh phase6many: MANY_CLIENTS=16 CLASS_FILTER=b100 for tsdb and QuestDB) puts NAME.c16 files
+The extra-clients pass (run.sh phase6many: MANY_CLIENTS=16 CLASS_FILTER=b100 for tsdb, QuestDB, ClickHouse and TimescaleDB) puts NAME.c16 files
 there too. A 32-client class that failed (no run timed, or runs killed or refused) and has a NAME.c16 result gets a
 note in its flags: it ran out of memory, with the peak, the limit and the memory held before the class (from its
 .mem files), and the 16-client row is the comparison; the 32-client row itself stays a failure.
@@ -276,7 +276,8 @@ def relq_rows(d, prefix=""):
     return rows
 
 
-LIMIT = re.compile(r"container limit (\d+(?:\.\d+)? ?[A-Za-z]+)")
+# a container's limit (QuestDB: killed at 'container limit 48 GB') or ClickHouse's own ('Code: 241 ... maximum: 43.20 GiB')
+LIMIT = re.compile(r"container limit (\d+(?:\.\d+)? ?[A-Za-z]+)|maximum: (\d+(?:\.\d+)? ?[A-Za-z]+)")
 
 
 def gb(x):
@@ -284,8 +285,9 @@ def gb(x):
 
 
 def many_note(d, name, lines, flags):
-    """The note under a failed 32-client class that has a 16-client result (run.sh phase6many: MANY_CLIENTS=16 for tsdb
-    and QuestDB): QuestDB ran out of memory in its 32-client 100-series batches, so the 16-client run is the
+    """The note under a failed 32-client class that has a 16-client result (run.sh phase6many: MANY_CLIENTS=16 for tsdb,
+    QuestDB, ClickHouse and TimescaleDB): QuestDB ran out of memory in its 32-client 100-series batches, ClickHouse in
+    its weekly TWA batches of 100 windows (a class in p6/, where d is that directory), so the 16-client run is the
     comparison and the 32-client row stays a failure. The numbers come from the mem files of the class (the run with the
     highest peak: the one that ran out; peak with the page cache is what a container limit counts, then without it, and
     the server's memory at the step's start: what the earlier classes left), the limit from the REFUSED lines naming the
@@ -299,7 +301,7 @@ def many_note(d, name, lines, flags):
     if not f16:
         return ""
     best = {}  # server: (peak with cache, peak without, start with cache, start without): the file with the highest peak
-    for sub in ("", "memsweep"):
+    for sub in ("", "memsweep", "p6"):  # ClickHouse's TWA batch classes are timed in p6/ at 32 clients too
         for g in glob.glob(os.path.join(d, sub, name + ".*.mem")):
             if not re.fullmatch(re.escape(name) + r"\.\d+\.mem", os.path.basename(g)):
                 continue
@@ -314,9 +316,10 @@ def many_note(d, name, lines, flags):
         for l in open(r, errors="replace") if os.path.exists(r) else []:
             m = LIMIT.search(l)
             if m:
-                anylimit = anylimit or m.group(1)
+                lim = m.group(1) or m.group(2)
+                anylimit = anylimit or lim
                 if name in l:
-                    limit = limit or m.group(1)
+                    limit = limit or lim
     why = run_failures(os.path.join(d, name + ".mean.txt")) if os.path.exists(os.path.join(d, name + ".mean.txt")) else ""
     mem = "; ".join("%s peak %s with the page cache (%s without), %s held when the class started" % (
         k, gb(v[0]), gb(v[1]), gb(v[2])) for k, v in sorted(best.items())) or "memory not recorded"
@@ -348,7 +351,7 @@ def results_table(d, prefix="", mark=""):
             else:
                 errors.append("%s: no timing in it (a failed or empty run?)" % f)
                 flags.append("NO TIMING")
-        note = "" if mark else many_note(d, name, lines, flags)
+        note = many_note(d, name, lines, flags)  # also in the p6: rows: ClickHouse's TWA batches are timed there
         if note:
             flags.append(note)
         if name in again:

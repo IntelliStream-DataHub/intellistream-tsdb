@@ -42,6 +42,7 @@ WORK=$T/work H=$T/h B=$T/b D=$T/d NHI=32 SECS=1 STEP_TIMEOUT=60 ID=id3
 mkdir -p "$WORK" "$H" "$B" "$D"; echo 'pass' > "$H/mkbatch.py"; oom 0
 cat > "$B/qdrive" << 'EOS'
 #!/bin/bash
+echo "$4" >> "$CLIENTS"
 w=$(echo "$2" | sed -n 's/.*max_parallel_workers_per_gather=\([0-9]*\).*/\1/p')
 [ "$w" -le "$PAR_OK" ] && { echo "1000 queries"; exit 0; }
 n=$(awk '{print $2}' "$EVENTS"); echo "oom_kill $((n + 1))" > "$EVENTS"; echo "server closed the connection"; exit 1
@@ -59,6 +60,17 @@ probe() { # PAR_OK TRY WANT-MANY_CONN-SUFFIX
 probe 1 "2 1 0" "'-c TimeZone=UTC -c max_parallel_workers_per_gather=1'"
 probe 2 "2 1 0" "'-c TimeZone=UTC -c max_parallel_workers_per_gather=2'"
 probe -1 "2 1 0" ""
+# the extra-clients pass probes at its own client count (MANY_CLIENTS), and says so in many-parallel.txt
+export CLIENTS=$T/clients.log; : > "$CLIENTS"
+probe 2 "2 1 0" "'-c TimeZone=UTC -c max_parallel_workers_per_gather=2'"
+MANY_CLIENTS=16 probe 1 "2 1 0" "'-c TimeZone=UTC -c max_parallel_workers_per_gather=1'"
+expect() { # NAME CONDITION...: one case (run.sh's functions are defined below; this one is needed here)
+    if eval "${*:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
+}
+expect "probe: without MANY_CLIENTS it runs NHI (32) clients, with it MANY_CLIENTS (16)" \
+    "[ \"\$(sort -u '$CLIENTS' | tr '\\n' ' ')\" = '16 32 ' ] && [ \"\$(tail -1 '$CLIENTS')\" = 16 ]"
+expect "probe: many-parallel.txt names the client count of the pass" \
+    "grep -q 'max_parallel_workers_per_gather=1 in the 16-client classes' '$D/many-parallel.txt'"
 
 # mem_sample: the peaks of two servers, page cache included (memory.current) and without (anon + shmem + kernel)
 M=$T/mem; mkdir -p "$M/a" "$M/b"
@@ -81,7 +93,8 @@ eval "$(sed -n -e '/^tstep() {/,/^}/p' -e '/^phase6() {/,/^}/p' -e '/^twabsuite(
     -e '/^dashnote() {/,/^}/p' -e '/^want_pc() {/p' -e '/^pc_pin() {/,/^}/p' -e '/^bsuite() {/,/^}/p' \
     -e '/^twab_dir() {/,/^}/p' -e '/^twa_single_failed() {/,/^}/p' -e '/^nocheck() {/,/^}/p' -e '/^aside() {/,/^}/p' \
     -e '/^tsdbsuite() {/,/^}/p' -e '/^class_wanted() {/,/^}/p' -e '/^tsdbbsuite() {/,/^}/p' \
-    -e '/^phase6many() {/,/^}/p' -e '/^tree_commit() {/,/^}/p' "$HERE/run.sh")"
+    -e '/^phase6many() {/,/^}/p' -e '/^tree_commit() {/,/^}/p' -e '/^chbsuite() {/,/^}/p' -e '/^twasuite() {/,/^}/p' \
+    -e '/^p2_ch() {/,/^}/p' -e '/^p2_ts() {/,/^}/p' "$HERE/run.sh")"
 expect() { # NAME CONDITION...: one case
     if eval "${*:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
 }
@@ -241,17 +254,17 @@ expect "aside: a phase-2 rerun of a system makes its extra pass due again" "[ ! 
 # implement is a FAIL; how.json gets the pass added
 : > "$X6/p6.log"; rm -rf "$OUT/old" "$PH_DIR/FAILS"
 mkdir -p "$OUT/p2/qdb/memsweep"; echo keep > "$OUT/p2/qdb/memsweep/load.1"
-MANY_CLIENTS=16 CLASS_FILTER=b100 P6_SYSTEMS="tsdb qdb0 ch" REPS=5 phase6
-expect "phase6 MANY_CLIENTS: each implemented system once, into its p6/, XREPS runs, one load" \
-    "[ \$(grep -c 'sub=/p6 REPS=1 XREPS=5 LOADS_FROM=1 NO_PC=1 pfx=p6 \$' '$X6/p6.log') = 2 ] && grep -q '^p2_sys tsdb ' '$X6/p6.log' && grep -q '^p2_sys qdb0 ' '$X6/p6.log'"
+MANY_CLIENTS=16 CLASS_FILTER=b100 P6_SYSTEMS="tsdb qdb0 ch ts i2" REPS=5 phase6
+expect "phase6 MANY_CLIENTS: each implemented system once (tsdb, qdb0, ch, ts), into its p6/, XREPS runs, one load" \
+    "[ \$(grep -c 'sub=/p6 REPS=1 XREPS=5 LOADS_FROM=1 NO_PC=1 pfx=p6 \$' '$X6/p6.log') = 4 ] && grep -q '^p2_sys tsdb ' '$X6/p6.log' && grep -q '^p2_sys qdb0 ' '$X6/p6.log' && grep -q '^p2_sys ch ' '$X6/p6.log' && grep -q '^p2_sys ts ' '$X6/p6.log'"
 expect "phase6 MANY_CLIENTS: its own done markers, not the sweep's" \
-    "[ -e '$OUT/p6/tsdb.c16.done' ] && [ -e '$OUT/p6/qdb0.c16.done' ] && [ ! -e '$OUT/p6/ch.c16.done' ] && [ ! -e '$OUT/p6/tsdb.done' ]"
-expect "phase6 MANY_CLIENTS: a system without the pass fails" "grep -q 'p6 ch: MANY_CLIENTS is implemented for' '$PH_DIR/FAILS' && ! grep -q 'p2_sys ch' '$X6/p6.log'"
+    "[ -e '$OUT/p6/tsdb.c16.done' ] && [ -e '$OUT/p6/qdb0.c16.done' ] && [ -e '$OUT/p6/ch.c16.done' ] && [ -e '$OUT/p6/ts.c16.done' ] && [ ! -e '$OUT/p6/i2.c16.done' ] && [ ! -e '$OUT/p6/tsdb.done' ]"
+expect "phase6 MANY_CLIENTS: a system without the pass fails" "grep -q 'p6 i2: MANY_CLIENTS is implemented for' '$PH_DIR/FAILS' && ! grep -q 'p2_sys i2' '$X6/p6.log'"
 expect "phase6 MANY_CLIENTS: nothing moved aside, the sweep stays" "[ ! -d '$OUT/old' ] && [ \"\$(cat '$OUT/p2/qdb/memsweep/load.1')\" = keep ]"
 expect "phase6 MANY_CLIENTS: how.json block and runstats on p6/" \
     "grep -qx 'how_p6 $OUT/p2/tsdb 5' '$X6/p6.log' && grep -qx 'runstats $OUT/p2/qdb/p6' '$X6/p6.log'"
-P6_SYSTEMS="tsdb qdb0" MANY_CLIENTS=16 CLASS_FILTER=b100 RESUME=1 phase6; n=$(grep -c '^p2_sys' "$X6/p6.log")
-expect "phase6 MANY_CLIENTS: a system with its done marker is skipped (the marker is per client count)" "[ $n = 2 ]"
+P6_SYSTEMS="tsdb qdb0 ch ts" MANY_CLIENTS=16 CLASS_FILTER=b100 RESUME=1 phase6; n=$(grep -c '^p2_sys' "$X6/p6.log")
+expect "phase6 MANY_CLIENTS: a system with its done marker is skipped (the marker is per client count)" "[ $n = 4 ]"
 # untimed: a check that exits 1 on a mismatch (rel.py jsonl) is named by its MISMATCH line in FAILS, as when it exited 0
 eval "$(sed -n -e '/^untimed() {/,/^}/p' "$HERE/run.sh")"
 fail() { echo "fail: $*" >> "$X6/ufails"; }
@@ -302,4 +315,70 @@ for dd in /x/p2/qdb-parquet /x/p2/qdb-parquet/memsweep /x/p2/qdb-parquet/p6; do
 done
 expect "run.sh derives every variant name the same way (no basename of only %/memsweep left)" \
     "! grep -n 'basename \"\\\${[A-Z]*%/memsweep}\"' '$HERE/run.sh'"
+# MANY_CLIENTS for ClickHouse and TimescaleDB: chbsuite and the TWA batch classes (twasuite, twabsuite) time only the
+# CLASS_FILTER classes at that many clients, XREPS runs; the branches of p2_ch and p2_ts do the load, the probe (ts), the
+# answer checks and those suites, and leave out everything else (the 1- and 32-client classes, merged, LTTB, the -ha load)
+untimed() { local o=$1; shift; "$@" > "$o" 2>&1; }
+fail() { echo "fail: $*" >> "$X6/mfails"; }
+log() { :; }
+tstep() { echo "$1" >> "$X6/tstep.log"; }
+chbench1() { :; }
+REL() { case $1 in
+    has) [ "$2" != none ] ;;
+    q) echo "SELECT $3" ;;
+    qb) echo "SELECT $3 $4" ;;
+    check) echo "check $2 $3" >> "$X6/rel.log"; echo "$2 $3 OK" ;;
+    checkb) echo "$2 $3.b$4 OK" ;;
+esac; }
+MD=$OUT/p2/ch/p6; mkdir -p "$MD"
+: > "$X6/tstep.log"
+MANY_CLIENTS=16 CLASS_FILTER=b100 XREPS=2 REPS=1 KS="1 10 100" FULLS="0 3600" BCLASSES="raw agg7d" chbsuite ch "$MD" ch
+want=$(printf '%s\n' "ch.raw.b100.c16 r1" "ch.raw.b100.c16 r2" "ch.agg7d.b100.c16 r1" "ch.agg7d.b100.c16 r2")
+expect "MANY_CLIENTS: chbsuite times the b100 classes at 16 clients, XREPS runs each, no whole-range runs" '[ "$(cat "$X6/tstep.log")" = "$want" ]'
+: > "$X6/tstep.log"
+FULLS="" KS=10 BCLASSES=raw REPS=2 chbsuite ch "$MD" ch
+want=$(printf '%s\n' "ch.raw.b10.c1 r1" "ch.raw.b10.c1 r2" "ch.raw.b10.c32 r1" "ch.raw.b10.c32 r2")
+expect "MANY_CLIENTS: chbsuite without the option still times 1 and NHI clients" '[ "$(cat "$X6/tstep.log")" = "$want" ]'
+: > "$X6/tstep.log"; : > "$X6/rel.log"
+TWA_KINDS="twad twal" TWA_WKINDS="twa1d twa7d" TWA_KS="10 100"
+MANY_CLIENTS=16 CLASS_FILTER=b100 XREPS=3 REPS=1 twasuite ch "$MD" ch
+want=$(printf '%s\n' "ch.twa1d.b100.c16 r1" "ch.twa1d.b100.c16 r2" "ch.twa1d.b100.c16 r3" "ch.twa7d.b100.c16 r1" "ch.twa7d.b100.c16 r2" "ch.twa7d.b100.c16 r3")
+expect "MANY_CLIENTS: twasuite times only the TWA b100 classes at 16 clients (no whole-range kinds, no single windows, no b10)" \
+    '[ "$(cat "$X6/tstep.log")" = "$want" ]'
+expect "MANY_CLIENTS: twasuite checks the single windows of the kinds it batches (and nothing else)" \
+    '[ "$(cat "$X6/rel.log")" = "$(printf "%s\n" "check ch twa1d" "check ch twa7d")" ]'
+: > "$X6/tstep.log"; : > "$X6/rel.log"
+MANY_CLIENTS=16 CLASS_FILTER=twa7d.b100 XREPS=1 REPS=1 twasuite ch "$MD" ch
+expect "MANY_CLIENTS: a kind with no wanted batch class is not even checked" \
+    '[ "$(cat "$X6/tstep.log")" = "ch.twa7d.b100.c16 r1" ] && [ "$(cat "$X6/rel.log")" = "check ch twa7d" ]'
+: > "$X6/tstep.log"
+TWA_KINDS="" TWA_WKINDS=twa1d TWA_KS=10 REPS=1 twabsuite ch "$MD" ch
+expect "MANY_CLIENTS: twabsuite without the option still times 1 and NHI clients" \
+    '[ "$(cat "$X6/tstep.log")" = "$(printf "%s\n" "ch.twa1d.b10.c1 r1" "ch.twa1d.b10.c32 r1")" ]'
+# p2_ch and p2_ts with the pass: stub loads, checks and suites that log; the branch must call the batch suites (and the
+# probe for ts) and none of the 1/32-client classes, the merged table, LTTB or the -ha image
+mkdir -p "$X6/h"
+for py in mkq check mkbatch; do
+    printf 'import os, sys\nopen(os.environ["P6LOG"], "a").write("py %%s %%s\\n" %% (os.path.basename(sys.argv[0]), " ".join(sys.argv[1:])))\n' > "$X6/h/$py.py"
+done
+: > "$P6LOG"; : > "$X6/p2.log"
+crm() { :; }; ch_load_rep() { :; }; warm() { :; }; load_ok() { :; }; ports_check() { :; }; CHC() { :; }; chparts() { :; }
+ctr_mem() { echo "ctr_mem $1" >> "$X6/p2.log"; }; runstats() { echo "runstats $1" >> "$X6/p2.log"; }
+bcheck() { echo "bcheck $1" >> "$X6/p2.log"; }
+chbsuite() { echo "chbsuite $*" >> "$X6/p2.log"; }
+twasuite() { echo "twasuite $1" >> "$X6/p2.log"; }
+chsuite() { echo "chsuite" >> "$X6/p2.log"; }; ch_merged() { echo "ch_merged" >> "$X6/p2.log"; }
+H=$X6/h DBCMP=$X6/db MANY_CLIENTS=16 CLASS_FILTER=b100 REPS=1 XREPS=5 LOADS_FROM=1 SWEEP_SUB=/p6 p2_ch; rc=$?
+want=$(printf '%s\n' "bcheck ch" "chbsuite ch $OUT/p2/ch/p6 ch" "twasuite ch" "ctr_mem rb-ch" "runstats $OUT/p2/ch/p6")
+expect "p2_ch with MANY_CLIENTS: checks, the batch suites and the TWA batches, nothing of the 1/32-client suite or merged" \
+    '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ] && grep -qx "py mkq.py ch" "$P6LOG" && grep -qx "py check.py ch 200" "$P6LOG"'
+: > "$X6/p2.log"
+ts_start() { echo "ts_start $1" >> "$X6/p2.log"; }; ts_load_rep() { :; }; PSQL() { :; }
+ts_many_probe() { echo "probe $1" >> "$X6/p2.log"; MANY_CONN=probed; }
+bsuite() { echo "bsuite $1 $2 $3 MANY_CONN=$MANY_CONN" >> "$X6/p2.log"; }
+qsuite() { echo "qsuite" >> "$X6/p2.log"; }
+H=$X6/h DBCMP=$X6/db MANY_CLIENTS=16 CLASS_FILTER=b100 REPS=1 XREPS=5 LOADS_FROM=1 SWEEP_SUB=/p6 p2_ts; rc=$?
+want=$(printf '%s\n' "ts_start rb-ts" "probe $OUT/p2/ts/p6" "bcheck ts" "bsuite ts ts $OUT/p2/ts/p6 MANY_CONN=probed" "ctr_mem rb-ts" "runstats $OUT/p2/ts/p6")
+expect "p2_ts with MANY_CLIENTS: the probe's setting reaches the batch classes; no qsuite, no -ha image load" \
+    '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ]'
 [ "$fails" = 0 ] && echo "harnesstest OK" || { echo "harnesstest FAILED"; exit 1; }

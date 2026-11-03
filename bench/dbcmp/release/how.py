@@ -367,6 +367,11 @@ def p6(d):
                            "NAME.c%s), on a load of its own, %s; tsdb %s, %s" % (
                                many, os.environ.get("CLASS_FILTER", "") or "all", many, os.environ.get("XREPS", "?"), many,
                                time.strftime("%Y-%m-%d %H:%M"), v, tree))
+        # TimescaleDB's multi-client classes run with fewer parallel workers per query when it ran out of memory with
+        # the default (run.sh ts_many_probe): the setting this pass used is part of how its rows were made
+        par = lines(os.path.join(d, "p6", "many-parallel.txt"))
+        if par:
+            h["p6"]["many"] += "; setting: " + par[0]
         with open(f, "w") as o:
             json.dump(h, o, indent=1, sort_keys=True)
             o.write("\n")

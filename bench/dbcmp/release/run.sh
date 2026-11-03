@@ -27,10 +27,12 @@ P5_SERIES=${P5_SERIES:-10000} P5_POINTS=${P5_POINTS:-10000000} P5_MINFREE=${P5_M
 # smoke test runs 2 and 2 (NHI, NPER): it checks that every step works, and 32 clients of 100-series batches on its
 # data only made it slow (and ran unlimited containers out of host memory)
 NHI=${NHI:-32} NPER=${NPER:-16}
-# MANY_CLIENTS=N (with CLASS_FILTER=b100): the extra-clients pass of `run.sh p6` (phase6many) for tsdb and QuestDB: the
-# batch classes whose name contains CLASS_FILTER are timed at N clients, REPS runs each, into p2/<sys>/p6/ as
-# NAME.cN. Written for the 100-series batches (.b100) that QuestDB's memory could not carry at 32 clients: both
-# systems are then compared at 16, and the 32-client rows stay what they were, failures with their reason (tables.py)
+# MANY_CLIENTS=N (with CLASS_FILTER=b100): the extra-clients pass of `run.sh p6` (phase6many) for tsdb, QuestDB, ClickHouse
+# and TimescaleDB: the batch classes whose name contains CLASS_FILTER are timed at N clients, REPS runs each, into
+# p2/<sys>/p6/ as NAME.cN. Written for the 100-series batches (.b100) that QuestDB's, ClickHouse's (twa7d.b100: its
+# memory limit) and TimescaleDB's memory could not carry at 32 clients: the systems are then compared at 16, and the
+# 32-client rows stay what they were, failures with their reason (tables.py). ClickHouse also times the TWA batch
+# classes (twa1d.b100, twa7d.b100); TimescaleDB's TWA needs the toolkit image and a load of its own: not in this pass
 MANY_CLIENTS=${MANY_CLIENTS-} CLASS_FILTER=${CLASS_FILTER-}
 class_wanted() { # CLASS: CLASS_FILTER (a substring such as b100) picks the classes whose name contains it; empty: all
     [ -z "${CLASS_FILTER-}" ] || case $1 in *"$CLASS_FILTER"*) true ;; *) false ;; esac
@@ -575,7 +577,11 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
     V=${D%/memsweep}; V=$(basename "${V%/p6}")  # the variant (qdb-parquet, iot-zstd, ...): names and step labels; S is rel.py's
     shift 2
     cd "$WORK" || return 1
-    for k in $TWA_KINDS; do
+    # MANY_CLIENTS (the extra-clients pass): only the TWA batch classes CLASS_FILTER names, at that many clients (twabsuite),
+    # after the single-window check of the kinds they need: no whole-range kinds, no single-window timings
+    local kinds=$TWA_KINDS K any
+    [ -n "${MANY_CLIENTS-}" ] && kinds=
+    for k in $kinds; do
         REL has "$S" "$k" || { echo "$k: no query in rel.py for $S" >> "$D/dash.txt"; continue; }
         f=$D/q.$k.txt
         REL q "$S" "$k" > "$f"
@@ -611,9 +617,14 @@ twasuite() { # SYS DIR DRIVER-ARGS...|ch: every TWA kind SYS has a query for (re
         fi
     done
     for k in $TWA_WKINDS; do
+        if [ -n "${MANY_CLIENTS-}" ]; then   # no batch class of this kind wanted: its windows need no check
+            any=0; for K in $TWA_KS; do class_wanted "$k.b$K" && any=1; done
+            [ $any = 1 ] || continue
+        fi
         REL has "$S" "$k" || { echo "$k: no query in rel.py for $S" >> "$D/dash.txt"; continue; }
         REL q "$S" "$k" > "q/$S.$k.txt"
         untimed "$D/check-$k.txt" REL check "$S" "$k" "ref/$k.jsonl" || { nocheck "$S" "$k" "$D" $?; continue; }
+        [ -n "${MANY_CLIENTS-}" ] && continue
         if [ "$1" = ch ]; then FULLS="" CLASSES="$k" chsuite "$V" "$D" "$S"
         else FULLS="" CLASSES="$k" qsuite "$S" "$V" "$D" "$@"; fi
     done
@@ -638,12 +649,14 @@ twa_single_failed() { # CHECKFILE SYS KIND: prints why, and succeeds, when KIND'
 # Names and labels carry the variant (the result directory's name), so qdb0/1/2, iot/iotz and td/tdz never share a
 # step label (RESUME, DEAD_CLASS); a kind is sent in batches only when its single windows agreed in this load.
 twabsuite() { # SYS DIR DRIVER-ARGS...|ch
-    local S=$1 C=$2 D V k K f t a r why REPS=${XREPS:-$REPS}
+    local S=$1 C=$2 D V k K f t a r why REPS=${XREPS:-$REPS} ths="1 $NHI"
+    [ -n "${MANY_CLIENTS-}" ] && ths=$MANY_CLIENTS   # the extra-clients pass: that many clients, the CLASS_FILTER classes
     D=$(twab_dir "$C"); V=${C%/memsweep}; V=$(basename "${V%/p6}")  # C may already be p6/ (TWA_RETIME)
     mkdir -p "$D"
     shift 2
     cd "$WORK" || return 1
     for k in $TWA_WKINDS; do for K in $TWA_KS; do
+        class_wanted "$k.b$K" || continue
         # a batch is whole groups of K windows: none with fewer windows (TWA_N below K)
         [ "$K" -le "${TWA_N:-1000}" ] || { log "  $V $k.b$K: only TWA_N=${TWA_N:-1000} windows, no batch of $K"; continue; }
         REL has "$S" "$k" || { dashnote "$D" "$k.b$K: no query in rel.py for $S"; continue; }
@@ -653,12 +666,12 @@ twabsuite() { # SYS DIR DRIVER-ARGS...|ch
         untimed "$D/check-$k.b$K.txt" REL checkb "$S" "$k" "$K" "ref/$k.jsonl" || { nocheck "$V" "$k.b$K" "$D" $?; continue; }
         if [ "$1" = ch ]; then
             chbench1 1 0 "$WARM_SECS" "$f" > /dev/null 2> "$D/warm.$V.$k.b$K" 9>&-
-            for t in 1 $NHI; do for r in $(seq "$REPS"); do
+            for t in $ths; do for r in $(seq "$REPS"); do
                 tstep "$V.$k.b$K.c$t r$r" "$D/$V.$k.b$K.c$t.$r" -- chbench_tag "$V.$k.b$K.c$t.$r.$$" "$t" 0 "$SECS" "$f"
             done; done
         else
             "$B/qdrive" "$@" "$f" 1 "$WARM_SECS" > "$D/warm.$V.$k.b$K" 2>&1 9>&- || { fail "$V $k.b$K warm-up failed (see $D/warm.$V.$k.b$K)"; continue; }
-            for t in 1 $NHI; do
+            for t in $ths; do
                 a=("$@"); [ "$t" != 1 ] && [ -n "${MANY_CONN-}" ] && a=("$1" "$MANY_CONN")
                 reps "$V.$k.b$K.c$t" "$D" -- "$B/qdrive" "${a[@]}" "$f" "$t" "$SECS"
             done
@@ -996,10 +1009,13 @@ tsdbd_percore() { # DIR: restart tsdbd on PERCORE_CPU with one query thread (whe
     TSDBD_WRAP="taskset -c $PERCORE_CPU" tsdbd_start "$1" "${qt[@]}"
 }
 chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through chbench1 (PC=1: max_threads=1, pinned)
-    local P=$1 D=$2 S=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} set=() r
+    local P=$1 D=$2 S=$3 n k c t f nl sfx= ths=${BTHREADS:-1 $NHI} set=() r fulls=${FULLS-$FULLS_DEFAULT}
     [ "${PC:-0}" = 1 ] && { want_pc || return 0; sfx=.pc; ths=1; set=(--max_threads=1); }
+    # MANY_CLIENTS (as in bsuite): only the CLASS_FILTER classes, at that many clients, XREPS runs, no whole-range runs
+    local REPS=$REPS
+    [ -n "${MANY_CLIENTS-}" ] && { ths=$MANY_CLIENTS; fulls=; REPS=${XREPS:-$REPS}; }
     for k in $( [ "${PC:-0}" = 1 ] && echo "$PC_KS" || echo "$KS" ); do
-        for n in ${FULLS-$FULLS_DEFAULT}; do
+        for n in $fulls; do
             f=$WORK/q/$S.full$n.b$k.txt; nl=$(wc -l < "$f")
             pc_client chbench1 1 "$nl" 0 "$f" > /dev/null 2> "$D/warm.$P.full$n.b$k$sfx" 9>&-
             for r in $(seq "$REPS"); do
@@ -1007,6 +1023,7 @@ chbsuite() { # PREFIX DIR TABLE-SYS(ch): the batches through chbench1 (PC=1: max
             done
         done
         for c in $BCLASSES; do
+            class_wanted "$c.b$k" || continue
             f=$WORK/q/$S.$c.b$k.txt
             pc_client chbench1 1 0 "$WARM_SECS" "$f" > /dev/null 2> "$D/warm.$P.$c.b$k$sfx" 9>&-
             for t in $ths; do for r in $(seq "$REPS"); do
@@ -1360,6 +1377,17 @@ p2_ch() {
     cd "$WORK" || return 1
     python3 -I "$H/mkq.py" ch
     untimed "$D/check.txt" python3 -I "$H/check.py" ch 200
+    if [ -n "${MANY_CLIENTS-}" ]; then  # the extra-clients pass (phase6many): this load, the batches' answer check, the CLASS_FILTER classes
+        # the aggregate batches, then the TWA windows in batches (twasuite checks their single windows first and times
+        # nothing else here): twa7d.b100 is the class that ran ClickHouse out of memory at 32 clients
+        bcheck ch "$D" && chbsuite ch "$D" ch
+        twasuite ch "$D" ch
+        cd "$OUT" || true
+        ctr_mem rb-ch "$D/mem.txt"
+        crm rb-ch; rmdata "$W"
+        runstats "$D"
+        return 0
+    fi
     (cd "$WORK" && python3 -I "$H/mkbatch.py" ch) || fail "mkbatch ch"
     chsuite ch "$D" ch
     bcheck ch "$D" && { bok=1; chbsuite ch "$D" ch; pc_pin rb-ch && PC=1 chbsuite ch "$D" ch; pc_unpin rb-ch; }
@@ -1498,29 +1526,30 @@ ts_ready() { [ "$(psql -h 127.0.0.1 -p 5434 -U postgres -Atc 'select 1' 2> /dev/
 # max_parallel_workers_per_gather), each worker with its own memory; work_mem (6 MB) bounds none of it. On a machine that
 # 32 clients already keep busy, fewer workers per query cost little, so the 32-client classes take the most workers of
 # TS_MANY_TRY that this class survives, and say so (many-parallel.txt, driver.log); 1-client classes keep the default.
-ts_many_probe() { # DIR CONN-PREFIX: sets MANY_CONN (the caller's local) unless every setting runs out of memory
-    local D=$1 base=$2 w rc f
+ts_many_probe() { # DIR CONN-PREFIX: sets MANY_CONN (the caller's local) unless every setting runs out of memory.
+    # Probed at the client count of the classes it is for: NHI, or MANY_CLIENTS in the extra-clients pass
+    local D=$1 base=$2 w rc f n=${MANY_CLIENTS:-$NHI}
     (cd "$WORK" && python3 -I "$H/mkbatch.py" ts) || { fail "mkbatch ts"; return 1; }
     for w in ${TS_MANY_TRY:-2 1 0}; do
         f=$D/probe.par$w.txt
         steplock -s
-        limited "$STEP_TIMEOUT" "$f" "$B/qdrive" pg "$base -c max_parallel_workers_per_gather=$w'" "$WORK/q/ts.agg7d.b100.txt" "$NHI" "$SECS"
+        limited "$STEP_TIMEOUT" "$f" "$B/qdrive" pg "$base -c max_parallel_workers_per_gather=$w'" "$WORK/q/ts.agg7d.b100.txt" "$n" "$SECS"
         rc=$?
         stepunlock
         ctr_mem rb-ts "$f"
         if ctr_died rb-ts; then
-            log "  ts probe: max_parallel_workers_per_gather=$w at $NHI clients of agg7d.b100: $CTR_WHY"
+            log "  ts probe: max_parallel_workers_per_gather=$w at $n clients of agg7d.b100: $CTR_WHY"
             ctr_restart rb-ts || { fail "ts probe: rb-ts did not serve again"; return 1; }
             continue
         fi
         [ "$rc" = 0 ] || { log "  ts probe: max_parallel_workers_per_gather=$w: rc $rc (see $f)"; continue; }
         MANY_CONN="$base -c max_parallel_workers_per_gather=$w'"
-        echo "max_parallel_workers_per_gather=$w in the $NHI-client classes (tried: ${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel.txt"
-        log "  ts: the $NHI-client classes run with max_parallel_workers_per_gather=$w (1-client classes: the default)"
+        echo "max_parallel_workers_per_gather=$w in the $n-client classes (tried: ${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel.txt"
+        log "  ts: the $n-client classes run with max_parallel_workers_per_gather=$w (1-client classes: the default)"
         return 0
     done
     echo "default in every class: out of memory at every setting tried (${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel.txt"
-    log "  ts: out of memory at every max_parallel_workers_per_gather tried; the $NHI-client classes keep the default"
+    log "  ts: out of memory at every max_parallel_workers_per_gather tried; the $n-client classes keep the default"
 }
 p2_ts() {
     local QCTR=rb-ts QREADY=ts_ready
@@ -1542,6 +1571,16 @@ p2_ts() {
     untimed "$D/check.txt" python3 -I "$H/check.py" ts 200
     local MANY_CONN=
     [ -n "${TS_MANY_TRY-x}" ] && ts_many_probe "$D" "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC"
+    if [ -n "${MANY_CLIENTS-}" ]; then  # the extra-clients pass (phase6many): this load, the probe above (at MANY_CLIENTS
+        # clients; many-parallel.txt says which setting), the batches' answer check, the CLASS_FILTER classes. Not the
+        # -ha image's load for LTTB and TWA
+        bcheck ts "$D" && bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
+        cd "$OUT" || true
+        ctr_mem rb-ts "$D/mem.txt"
+        crm rb-ts; rmdata "$W"
+        runstats "$D"
+        return 0
+    fi
     qsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
     bcheck ts "$D" && {
         for n in ${FULLS-$FULLS_DEFAULT}; do  # like with like (REPORT §3, §5.11): one query per series, 16 connections
@@ -1962,16 +2001,17 @@ how_p6() { # DIR REPS: the p6 block of DIR/how.json (how.py p6: when, runs, tree
     env T="$T" TSDB_TREE="$TSDB_TREE" XREPS="$2" MANY_CLIENTS="${MANY_CLIENTS-}" CLASS_FILTER="${CLASS_FILTER-}" python3 -I "$RDIR/how.py" p6 "$1" >> "$OUT/driver.log" 2>&1 \
         || fail "how.json p6 block of $1"
 }
-# The extra-clients pass (MANY_CLIENTS=16 CLASS_FILTER=b100 run.sh p6, systems tsdb and qdb0-2): QuestDB's 100-series
-# batches ran out of memory at 32 clients (its own RSS limit, the 48 GB container limit), so tsdb and QuestDB are timed
-# at 16 as well. Per system ONE load, the batches' answer check, then the CLASS_FILTER classes at MANY_CLIENTS clients,
+# The extra-clients pass (MANY_CLIENTS=16 CLASS_FILTER=b100 run.sh p6, systems tsdb, qdb0-2, ch and ts): QuestDB's
+# 100-series batches ran out of memory at 32 clients (its own RSS limit, the 48 GB container limit), ClickHouse's weekly
+# TWA batches of 100 windows at its memory limit, and TimescaleDB's runs have had out-of-memory trouble there as well, so
+# these are timed at 16 as well. Per system ONE load, the batches' answer check, then the CLASS_FILTER classes at MANY_CLIENTS clients,
 # REPS runs each, into <dir>/p6/NAME.cN (labels "p6 NAME.cN rK"; the load, checks and memory files of the load beside
 # them). Nothing is moved aside: the 32-client rows, p6/ and memsweep/ stay as they were, whatever RESUME says.
 # $OUT/p6/<sys>.cN.done marks a system's pass.
 phase6many() {
     local s d ok reps=$REPS
     for s in $P6_SYSTEMS; do
-        case $s in tsdb|qdb0|qdb1|qdb2) ;; *) fail "p6 $s: MANY_CLIENTS is implemented for tsdb and qdb0-qdb2 only"; continue ;; esac
+        case $s in tsdb|qdb0|qdb1|qdb2|ch|ts) ;; *) fail "p6 $s: MANY_CLIENTS is implemented for tsdb, qdb0-qdb2, ch and ts only"; continue ;; esac
         reset_quiet
         done_mark "$OUT/p6/$s.c$MANY_CLIENTS.done" && { log "p6 $s c$MANY_CLIENTS already done"; continue; }
         d=$(res_dir 2 "$s")

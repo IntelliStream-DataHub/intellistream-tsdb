@@ -7,7 +7,7 @@
 # 1e-9 tolerance), a missing and an extra series, a count off by one; LTTB: an exact tie of the triangle area may be
 # answered with the other point (and the picks after it), a smaller area may not. Prints one line per case and "checktest OK"
 # or "checktest FAILED".
-import copy, io, json, os, shutil, subprocess, sys, tempfile
+import contextlib, copy, io, json, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -391,6 +391,45 @@ def many_cases():
         open(os.path.join(d, "arch", "COMMIT"), "w").write("0123456789abcdef0123456789abcdef01234567 main\n")
         case("many: how.py reads the commit of a git archive tree from COMMIT", True, how.commit_of(t) == "0123456")
         case("many: no repository and no COMMIT file gives no commit", True, how.commit_of(d) == "")
+        # ClickHouse: its TWA batch classes are timed in p6/ (the table's "p6:" rows), also at 32 clients; the server's
+        # own memory limit ('Code: 241 ... maximum: 43.20 GiB') is the limit, from a REFUSED line that does not name the class
+        c = os.path.join(d, "ch", "p6")
+        os.makedirs(c)
+        open(os.path.join(c, "ch.twa7d.b100.c32.mean.txt"), "w").write("query failed   # TEXT DIFFERS between runs\n")
+        open(os.path.join(c, "ch.twa7d.b100.c32.2"), "w").write("query failed: Code: 241\n")
+        open(os.path.join(c, "ch.twa7d.b100.c32.2.mem"), "w").write(
+            "rb-ch peak 47110422528 nocache 46995726336 start 21474836480 startnocache 21400000000\n")
+        open(os.path.join(c, "REFUSED.txt"), "w").write(
+            "p6 ch.twa7d.b100.c32 r2: refused by the server: Code: 241\nmemory limit exceeded: would use 43.24 GiB "
+            "(attempt to allocate chunk of 0.00 B), current RSS: 41.99 GiB, maximum: 43.20 GiB.\n")
+        open(os.path.join(c, "ch.twa7d.b100.c16.mean.txt"), "w").write(T16)
+        tables.errors.clear()
+        text = [r if isinstance(r, str) else r[1] for r in tables.results_table(os.path.join(d, "ch"))]
+        row = next((l for l in text if l.startswith("| p6: ch.twa7d.b100.c32 ")), "")
+        case("many: a failed 32-client class in p6/ (ClickHouse's TWA batches) gets the note too", True,
+             "the 32-client run ran out of memory" in row
+             and "The 16-client run (ch.twa7d.b100.c16) is the comparison" in row)
+        case("many: with the peak from p6/'s mem file and ClickHouse's own limit", True,
+             "rb-ch peak 43.9 GB with the page cache (43.8 GB without)" in row and "20.0 GB held when the class started" in row
+             and "limit 43.20 GiB" in row)
+        # how.py p6 with MANY_CLIENTS adds the pass to the block and names TimescaleDB's parallel-worker setting
+        h = os.path.join(d, "ts")
+        os.makedirs(os.path.join(h, "p6"))
+        json.dump({**{k: "x" for k in how.REQUIRED if k != "dash"}, "dash": {"a": "b"}, "p6": {"date": "x"}},
+                  open(os.path.join(h, "how.json"), "w"))
+        open(os.path.join(h, "p6", "many-parallel.txt"), "w").write(
+            "max_parallel_workers_per_gather=2 in the 16-client classes (tried: 2 1 0)\n")
+        env = dict(os.environ)
+        os.environ.update(MANY_CLIENTS="16", CLASS_FILTER="b100", XREPS="5", T=d, TSDB_TREE=d)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                how.p6(h)
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
+        many = json.load(open(os.path.join(h, "how.json")))["p6"].get("many", "")
+        case("many: how.py p6 names the parallel-worker setting the pass used", True,
+             "16-client pass" in many and "setting: max_parallel_workers_per_gather=2 in the 16-client classes" in many)
     finally:
         shutil.rmtree(d)
         tables.errors.clear()
