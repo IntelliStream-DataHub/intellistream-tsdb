@@ -773,7 +773,7 @@ static void bounds(const char *base)
         int dfd = open(vol, O_RDONLY | O_DIRECTORY);
         part *pt;
         CHECK(dfd >= 0);
-        OK(part_open(dfd, strrchr(pfile, '/') + 1, &pt));
+        OK(part_open(dfd, strrchr(pfile, '/') + 1, false, &pt));
         CHECK(pt->ng >= 10);
         granule gb;
         gx_load(pt, pt->ng - 1, GW_LOC, &gb);

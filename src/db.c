@@ -344,7 +344,7 @@ static int load_parts(eng *db, bool read_only)
         if (!part_file_name(name))
             continue;
         part *p;
-        int r = part_open(db->dirfd, name, &p);
+        int r = part_open(db->dirfd, name, db->opt.verify_checksums, &p);
         if (r == TSDB_ERR_NOTFOUND)
             continue; /* removed while we listed the directory */
         if (r == 0 && p->grows != db->granule_rows) {

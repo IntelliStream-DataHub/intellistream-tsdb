@@ -254,11 +254,11 @@ static int cmp_part_order(const void *x, const void *y)
 /* Opens a part by its active name or, if the writer has just retired it, by its retired name. */
 static int open_listed_part(eng *db, const char *name, part **out)
 {
-    int rc = part_open(db->dirfd, name, out);
+    int rc = part_open(db->dirfd, name, db->opt.verify_checksums, out);
     if (rc == TSDB_ERR_NOTFOUND) {
         char retired[256];
         snprintf(retired, sizeof retired, RETIRED_PREFIX "%s", name);
-        rc = part_open_as(db->dirfd, retired, name, out);
+        rc = part_open_as(db->dirfd, retired, name, db->opt.verify_checksums, out);
     }
     if (rc == 0)
         (*out)->verify = db->opt.verify_checksums;

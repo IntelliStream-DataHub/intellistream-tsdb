@@ -676,6 +676,11 @@ static inline double gix_f64(const gix *x, uint32_t i, int f)
     memcpy(&d, &u, 8);
     return d;
 }
+/* The first entry of run r. gix_parse checked the run table, but without verify_checksums the readers use it in
+ * the part's mapping, where damage that reaches the file after the open shows (a misdirected write, a page misread
+ * after eviction): every entry number taken from it is kept below n, so such damage gives wrong answers, as in a
+ * granule payload, and never a read outside the index. */
+static inline uint32_t gix_rstart(const gix *x, uint32_t r) { return x->rstart[r] < x->n ? x->rstart[r] : x->n; }
 /* the run of series s: entries [*a, *b), empty at where it would be when the part has none of s */
 static inline void gix_run(const gix *x, uint32_t s, uint32_t *a, uint32_t *b)
 {
@@ -687,8 +692,10 @@ static inline void gix_run(const gix *x, uint32_t s, uint32_t *a, uint32_t *b)
         else
             hi = mid;
     }
-    *a = lo < x->nruns ? x->rstart[lo] : x->n;
-    *b = lo < x->nruns && x->rser[lo] == s ? (lo + 1 < x->nruns ? x->rstart[lo + 1] : x->n) : *a;
+    *a = lo < x->nruns ? gix_rstart(x, lo) : x->n;
+    *b = lo < x->nruns && x->rser[lo] == s ? (lo + 1 < x->nruns ? gix_rstart(x, lo + 1) : x->n) : *a;
+    if (*b < *a)
+        *b = *a;
 }
 /* the run holding entry i (i < n) */
 static inline uint32_t gix_run_of(const gix *x, uint32_t i)
@@ -701,7 +708,7 @@ static inline uint32_t gix_run_of(const gix *x, uint32_t i)
         else
             hi = mid;
     }
-    return lo - 1;
+    return lo ? lo - 1 : 0; /* 0 when rstart[0] is damaged (see gix_rstart) */
 }
 
 typedef struct part {
@@ -716,7 +723,8 @@ typedef struct part {
     size_t map_len;
     gix ix; /* the granule index, in the map */
     uint32_t ng;
-    const tomb *t; /* the part's tombstones (in the map); NULL when none */
+    const tomb *t; /* the part's tombstones (in the map, or in icopy); NULL when none */
+    uint8_t *icopy; /* verify: the index and tombstones, copied when checked; NULL: read in the map */
     uint32_t nt;
     uint64_t index_off;
     uint64_t rows;
@@ -829,8 +837,10 @@ static inline void gx_load(const part *p, uint32_t i, unsigned want, granule *g)
         g->series = gx_series(p, i);
 }
 
-int part_open(int dirfd, const char *name, part **out);
-int part_open_as(int dirfd, const char *file, const char *name, part **out);
+/* verify: queries check granule checksums, and the index and tombstones are read from a copy made when they were
+   checked (tsdb_options.verify_checksums) */
+int part_open(int dirfd, const char *name, bool verify, part **out);
+int part_open_as(int dirfd, const char *file, const char *name, bool verify, part **out);
 void part_ref(part *p);
 void part_unref(part *p);
 /* Decodes a granule: timestamps, and values (if v) as slots of `type`; checks

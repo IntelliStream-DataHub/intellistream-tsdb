@@ -109,7 +109,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     free(b);
     int dfd = open(D, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     part *p;
-    if (dfd >= 0 && part_open(dfd, name, &p) == 0) {
+    /* Odd sizes open with verify_checksums, which reads the index from a checked heap copy (reseal made the
+     * checksums match); even sizes read it in place from the mapping. */
+    if (dfd >= 0 && part_open(dfd, name, (size & 1) != 0, &p) == 0) {
         for (uint32_t i = 0; i < p->ng && i < 512; i++) {
             granule g;
             memset(&g, 0, sizeof g);

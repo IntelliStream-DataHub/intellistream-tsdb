@@ -718,6 +718,65 @@ static void test_manifest(const char *scratch)
     rm_rf(dir);
 }
 
+/* ------------------------------------------------- misdirected writes */
+
+/* Two parts of one series (PART_ROWS rows each, inserted straight to parts), the database left open: the caller
+ * damages a part in place, as a misdirected write meant for another file would, after the open checked it. */
+static tsdb *open_two_parts(const char *dir, int verify, tsdb_sid *id, char *part, size_t len)
+{
+    rm_rf(dir);
+    tsdb_options o = opts();
+    o.verify_checksums = verify;
+    o.wal_max_batch_rows = 100; /* straight to parts */
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "md.series", id));
+    int64_t ts[PART_ROWS];
+    float v[PART_ROWS];
+    for (int k = 0; k < 2; k++) {
+        for (int i = 0; i < PART_ROWS; i++) {
+            ts[i] = T0 + (k * PART_ROWS + i) * 1000;
+            v[i] = (float)(i % 37) * 0.25f;
+        }
+        OK(tsdb_insert_series(db, *id, ts, v, PART_ROWS));
+    }
+    CHECK(find_file(dir, "p", ".part", part, len));
+    return db;
+}
+
+/* A misdirected write into the index of a part the server has mapped (found by jepsen --nemesis misdirect): the
+ * open checked the index, the readers trust it, and the mapping shows what reached the file since. A run table
+ * entry made gix_run_of return UINT32_MAX and a merge read rser[UINT32_MAX] (SIGSEGV). Now every entry number
+ * taken from the run table stays in the index, and with verify_checksums the index is read from the copy that was
+ * checked, so the answers do not change at all. */
+static void test_index_after_open(const char *scratch)
+{
+    char dir[600], part[256];
+    snprintf(dir, sizeof dir, "%s/damage-index-live", scratch);
+    for (int verify = 0; verify <= 1; verify++) {
+        tsdb_sid id;
+        tsdb *db = open_two_parts(dir, verify, &id, part, sizeof part);
+        int rc;
+        CHECK(count_rows(db, id, &rc) == 2 * PART_ROWS);
+        part_footer ft = read_footer(dir, part);
+        uint8_t junk[4096];
+        memset(junk, 0xa5, sizeof junk);
+        size_t n = ft.index_len < sizeof junk ? (size_t)ft.index_len : sizeof junk;
+        file_pwrite(dir, part, (off_t)ft.index_off, junk, n);
+        long rows = count_rows(db, id, &rc); /* without verify: anything but a crash */
+        if (verify)
+            CHECK(rc == 0 && rows == 2 * PART_ROWS);
+        rc = tsdb_optimize(db); /* a merge of both parts walks the run table */
+        if (verify) {
+            CHECK(rc == 0);
+            CHECK(count_rows(db, id, &rc) == 2 * PART_ROWS && rc == 0);
+        }
+        tsdb_close(db);
+    }
+    printf("  a part's index damaged after the open: no crash; with verify_checksums the answers stay right\n");
+    rm_rf(dir);
+}
+
 /* ------------------------------------------------------------- shifted records */
 
 /* A valid record at another offset (stale data, a misdirected write) is
@@ -996,6 +1055,7 @@ int main(int argc, char **argv)
     test_wal(base);
     test_wal_follower(base);
     test_shifted(base);
+    test_index_after_open(base);
     test_read_errors(base);
     test_parts(base);
     test_part_follower(base);

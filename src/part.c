@@ -93,11 +93,14 @@ static bool trailer_parse(const uint8_t *buf, size_t tlen, const tomb **t, uint3
     return true;
 }
 
-int part_open(int dirfd, const char *name, part **out) { return part_open_as(dirfd, name, name, out); }
+int part_open(int dirfd, const char *name, bool verify, part **out)
+{
+    return part_open_as(dirfd, name, name, verify, out);
+}
 
 /* Opens the file `file` as the part called `name` (a follower may find a part
  * under its retired_ name). */
-int part_open_as(int dirfd, const char *file, const char *name, part **out)
+int part_open_as(int dirfd, const char *file, const char *name, bool verify, part **out)
 {
     *out = NULL;
     part *p = calloc(1, sizeof *p);
@@ -162,11 +165,25 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     if (f.index_off % 8 != 0 || f.index_len % 8 != 0 || f.index_off < sizeof h || f.index_off > (uint64_t)size - sizeof f ||
         f.index_len > (uint64_t)size - sizeof f - f.index_off)
         goto fail;
-    uint64_t index_end = f.index_off + f.index_len;
-    size_t tlen = (size_t)((uint64_t)size - sizeof f - index_end);
-    if (part_hash(&h, p->map + f.index_off, (size_t)f.index_len, p->map + index_end, tlen, &f) != f.index_hash ||
-        f.min_ts > f.max_ts || !trailer_parse(p->map + index_end, tlen, &p->t, &p->nt) ||
-        gix_parse(p->map + f.index_off, (size_t)f.index_len, f.ngranules, &p->ix) != 0)
+    size_t ilen = (size_t)f.index_len, tlen = (size_t)((uint64_t)size - sizeof f - f.index_off - f.index_len);
+    const uint8_t *ib = p->map + f.index_off;
+    if (verify) {
+        /* The index and the tombstones are checked here, once, and then trusted by every query. In the mapping,
+           damage that reaches the file later (a misdirected write, a page misread after it was evicted) would
+           change them under the readers unchecked: a granule skipped, a statistic wrong. So verify_checksums reads
+           them from a copy, and the bytes checked are the bytes used (about 32 bytes of memory per granule).
+           8 zero bytes follow it, as the footer follows them in the file: gix_get loads 8 bytes at a time. */
+        rc = TSDB_ERR_NOMEM;
+        if (!(p->icopy = malloc(ilen + tlen + 8)))
+            goto fail;
+        memcpy(p->icopy, ib, ilen + tlen);
+        memset(p->icopy + ilen + tlen, 0, 8);
+        ib = p->icopy;
+        rc = TSDB_ERR_CORRUPT;
+    }
+    p->verify = verify;
+    if (part_hash(&h, ib, ilen, ib + ilen, tlen, &f) != f.index_hash || f.min_ts > f.max_ts ||
+        !trailer_parse(ib + ilen, tlen, &p->t, &p->nt) || gix_parse(ib, ilen, f.ngranules, &p->ix) != 0)
         goto fail;
     p->ng = f.ngranules;
     p->index_off = f.index_off;
@@ -179,6 +196,7 @@ int part_open_as(int dirfd, const char *file, const char *name, part **out)
     return 0;
 fail:
     munmap((void *)p->map, p->map_len);
+    free(p->icopy);
     free(p);
     return rc;
 }
@@ -190,6 +208,7 @@ void part_unref(part *p)
     if (!p || atomic_fetch_sub_explicit(&p->refs, 1, memory_order_acq_rel) != 1)
         return;
     munmap((void *)p->map, p->map_len);
+    free(p->icopy);
     if (atomic_load(&p->obsolete))
         unlinkat(p->dirfd, p->name, 0);
     free(p);
@@ -533,7 +552,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         else
             close(w->fd);
         w->fd = -1; /* the tmp file stays */
-        rc = part_open_as(db->dirfd, w->tmp_name, name, out);
+        rc = part_open_as(db->dirfd, w->tmp_name, name, db->opt.verify_checksums, out);
         if (rc == 0)
             (*out)->verify = db->opt.verify_checksums;
         if (rc == 0)
@@ -556,7 +575,7 @@ static int pw_finish_mode(part_writer *w, uint64_t min_block, uint64_t max_block
         pw_abort(w);
         return TSDB_ERR_IO;
     }
-    rc = part_open(db->dirfd, name, out);
+    rc = part_open(db->dirfd, name, db->opt.verify_checksums, out);
     if (rc == 0)
         (*out)->verify = db->opt.verify_checksums;
     if (rc != 0)

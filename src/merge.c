@@ -140,7 +140,7 @@ static inline uint32_t cur_series(cursor *c)
         const gix *x = &c->p->ix;
         uint32_t r = gix_run_of(x, c->gi);
         c->series = x->rser[r];
-        c->run_end = r + 1 < x->nruns ? x->rstart[r + 1] : x->n;
+        c->run_end = r + 1 < x->nruns ? gix_rstart(x, r + 1) : x->n;
     }
     return c->series;
 }
@@ -442,7 +442,8 @@ static void ttl_compute_locked(eng *db, part *p, uint32_t gen)
             all = INT64_MAX;
             continue;
         }
-        any = MIN(any, sat_add64(gx_ts_min(p, p->ix.rstart[r]), lim));
+        uint32_t g0 = gix_rstart(&p->ix, r);
+        any = MIN(any, sat_add64(gx_ts_min(p, g0 < p->ng ? g0 : 0), lim));
         all = MAX(all, sat_add64(pend, lim));
     }
     for (uint32_t i = 0; i < p->nt; i++) {

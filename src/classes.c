@@ -991,7 +991,10 @@ int cls_observe(eng *db, part *p)
     sw *w = NULL;
     size_t k = 0;
     for (uint32_t r = 0; r < p->ix.nruns; r++) {
-        uint32_t s = p->ix.rser[r], i = p->ix.rstart[r], j = r + 1 < p->ix.nruns ? p->ix.rstart[r + 1] : p->ng;
+        uint32_t s = p->ix.rser[r], i = gix_rstart(&p->ix, r);
+        uint32_t j = r + 1 < p->ix.nruns ? gix_rstart(&p->ix, r + 1) : p->ng;
+        if (j <= i)
+            continue; /* a run table damaged after the open (see gix_rstart) */
         size_t n = 0;
         for (uint32_t x = i; x < j; x++)
             n += gx_count(p, x);
@@ -1071,7 +1074,8 @@ int cls_check_parts(eng *db)
         partition_range(db, p->partition, &lo, &hi);
         /* the runs are in series order (gix_parse checks it) */
         for (uint32_t r = 0; r < p->ix.nruns && rc == 0; r++) {
-            uint32_t s = p->ix.rser[r], i = p->ix.rstart[r], j = r + 1 < p->ix.nruns ? p->ix.rstart[r + 1] : p->ng;
+            uint32_t s = p->ix.rser[r], i = gix_rstart(&p->ix, r);
+            uint32_t j = r + 1 < p->ix.nruns ? gix_rstart(&p->ix, r + 1) : p->ng;
             for (uint32_t x = i; x < j; x++)
                 if (gx_ts_min(p, x) > gx_ts_max(p, x) || (x > i && gx_ts_min(p, x) <= gx_ts_max(p, x - 1))) {
                     rc = check_fail(p, s, "rows out of time order", gx_ts_min(p, x), gx_ts_max(p, x));

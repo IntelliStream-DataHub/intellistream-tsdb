@@ -499,7 +499,7 @@ static size_t check_parts(const char *dir, int type, const char *label)
         if (de->d_name[0] != 'p' || !strstr(de->d_name, ".part"))
             continue;
         part *p;
-        if (part_open(dfd, de->d_name, &p) != 0) {
+        if (part_open(dfd, de->d_name, false, &p) != 0) {
             fprintf(stderr, "%s: part %s does not open\n", label, de->d_name);
             failures++;
             continue;
