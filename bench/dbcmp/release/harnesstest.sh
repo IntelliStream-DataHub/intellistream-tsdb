@@ -42,7 +42,7 @@ WORK=$T/work H=$T/h B=$T/b D=$T/d NHI=32 SECS=1 STEP_TIMEOUT=60 ID=id3
 mkdir -p "$WORK" "$H" "$B" "$D"; echo 'pass' > "$H/mkbatch.py"; oom 0
 cat > "$B/qdrive" << 'EOS'
 #!/bin/bash
-echo "$4" >> "$CLIENTS"
+echo "$4" >> "$CLIENTS"; echo "$3" >> "${QLOG:-/dev/null}"
 w=$(echo "$2" | sed -n 's/.*max_parallel_workers_per_gather=\([0-9]*\).*/\1/p')
 [ "$w" -le "$PAR_OK" ] && { echo "1000 queries"; exit 0; }
 n=$(awk '{print $2}' "$EVENTS"); echo "oom_kill $((n + 1))" > "$EVENTS"; echo "server closed the connection"; exit 1
@@ -71,6 +71,27 @@ expect "probe: without MANY_CLIENTS it runs NHI (32) clients, with it MANY_CLIEN
     "[ \"\$(sort -u '$CLIENTS' | tr '\\n' ' ')\" = '16 32 ' ] && [ \"\$(tail -1 '$CLIENTS')\" = 16 ]"
 expect "probe: many-parallel.txt names the client count of the pass" \
     "grep -q 'max_parallel_workers_per_gather=1 in the 16-client classes' '$D/many-parallel.txt'"
+# the TWA batch classes probe on the toolkit container with their own request file and their own record (tag .twa): the
+# container asked about is the one given, the file sent is the one given, and the aggregate probe's files stay as they are
+export QLOG=$T/q.log CTRLOG=$T/ctr.log; : > "$QLOG"; : > "$CTRLOG"
+ctr_mem() { echo "$1" >> "$CTRLOG"; }
+probe_twa() { # PAR_OK WANT-MANY_CONN-SUFFIX
+    local MANY_CONN=; export PAR_OK=$1; TS_MANY_TRY="2 1 0" MANY_CLIENTS=16 \
+        ts_many_probe "$D" "host=x options='-c TimeZone=UTC" rb-tsha "$T/twa.txt" .twa
+    [ "${MANY_CONN##*options=}" = "$2" ]
+}
+probe_twa 1 "'-c TimeZone=UTC -c max_parallel_workers_per_gather=1'"; rc=$?
+expect "probe with a tag: the TWA batch's setting is found on the container and the request file it is given" \
+    "[ $rc = 0 ] && [ \"\$(sort -u '$CTRLOG')\" = rb-tsha ] && [ \"\$(sort -u '$QLOG')\" = '$T/twa.txt' ]"
+expect "probe with a tag: its own record (many-parallel.twa.txt, probe.twa.parN.txt), the aggregate probe's files untouched" \
+    "grep -q 'max_parallel_workers_per_gather=1 in the 16-client TWA batch classes' '$D/many-parallel.twa.txt' \
+     && [ -s '$D/probe.twa.par2.txt' ] && [ -s '$D/probe.twa.par1.txt' ] \
+     && grep -q 'max_parallel_workers_per_gather=1 in the 16-client classes' '$D/many-parallel.txt'"
+probe_twa -1 ""; rc=$?
+expect "probe with a tag: no setting fits: the default is recorded as the TWA batches' own, MANY_CONN stays empty" \
+    "[ $rc = 0 ] && grep -q 'default in every TWA batch class: out of memory' '$D/many-parallel.twa.txt' \
+     && grep -q 'max_parallel_workers_per_gather=1 in the 16-client classes' '$D/many-parallel.txt'"
+ctr_mem() { :; }
 
 # mem_sample: the peaks of two servers, page cache included (memory.current) and without (anon + shmem + kernel)
 M=$T/mem; mkdir -p "$M/a" "$M/b"
@@ -95,7 +116,8 @@ eval "$(sed -n -e '/^tstep() {/,/^}/p' -e '/^phase6() {/,/^}/p' -e '/^twabsuite(
     -e '/^tsdbsuite() {/,/^}/p' -e '/^class_wanted() {/,/^}/p' -e '/^tsdbbsuite() {/,/^}/p' \
     -e '/^phase6many() {/,/^}/p' -e '/^tree_commit() {/,/^}/p' -e '/^chbsuite() {/,/^}/p' -e '/^twasuite() {/,/^}/p' \
     -e '/^p2_ch() {/,/^}/p' -e '/^p2_ts() {/,/^}/p' -e '/^agg_wanted() {/,/^}/p' -e '/^p2_tsdb() {/,/^}/p' \
-    -e '/^p2_qdb() {/,/^}/p' "$HERE/run.sh")"
+    -e '/^p2_qdb() {/,/^}/p' -e '/^twa_wanted() {/,/^}/p' -e '/^ts_plain_pass() {/,/^}/p' -e '/^ts_twa_probe() {/,/^}/p' \
+    "$HERE/run.sh")"
 expect() { # NAME CONDITION...: one case
     if eval "${*:2}"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
 }
@@ -223,6 +245,9 @@ expect "class_wanted: one substring, and no filter at all, as before" \
     '[ "$(cw b100 raw.b100)$(cw b100 raw.b10)$(cw "" anything)" = yesnoyes ]'
 expect "agg_wanted: no aggregate batch class under the TWA filter, some under b100 or no filter" \
     '[ "$(KS="1 10 100" BCLASSES="raw agg1d" CLASS_FILTER="twa1d.b100 twa7d.b100" agg_wanted && echo y || echo n)$(KS="1 10 100" BCLASSES="raw agg1d" CLASS_FILTER=b100 agg_wanted && echo y || echo n)$(KS="1 10 100" BCLASSES="raw agg1d" CLASS_FILTER= agg_wanted && echo y || echo n)" = nyy ]'
+tw() { CLASS_FILTER="$1" twa_wanted && echo y || echo n; }
+expect "twa_wanted: the TWA batch classes under the TWA filter and b100 or no filter, none under an aggregate filter" \
+    '[ "$(tw "twa1d.b100 twa7d.b100")$(tw b100)$(tw "")$(tw agg7d.b100)$(tw twa7d.b100)" = yyyny ]'
 : > "$X6/reps.log"; : > "$P6LOG"
 TWA_KINDS="twad twal" TWA_WKINDS="twa1d twa7d" TWA_KS="10 100" MANY_CLIENTS=16 CLASS_FILTER="twa1d.b100 twa7d.b100" XREPS=3 REPS=1 \
     tsdbtwab "$OUT/p2/tsdb/p6" ""
@@ -403,13 +428,48 @@ expect "p2_ch with MANY_CLIENTS: checks, the batch suites and the TWA batches, n
     '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ] && grep -qx "py mkq.py ch" "$P6LOG" && grep -qx "py check.py ch 200" "$P6LOG"'
 : > "$X6/p2.log"
 ts_start() { echo "ts_start $1" >> "$X6/p2.log"; }; ts_load_rep() { :; }; PSQL() { :; }
-ts_many_probe() { echo "probe $1" >> "$X6/p2.log"; MANY_CONN=probed; }
+ts_many_probe() { # the aggregate classes' probe: "probed"; the TWA batch classes' (tag .twa): "probed.twa", or nothing when
+    # PROBE_TWA_FAIL is set (every setting ran out of memory: MANY_CONN keeps what it was)
+    echo "probe $1 [${3-}] [${5-}]" >> "$X6/p2.log"
+    if [ -z "${5-}" ]; then MANY_CONN=probed; elif [ -z "${PROBE_TWA_FAIL-}" ]; then MANY_CONN=probed.twa; fi
+}
 bsuite() { echo "bsuite $1 $2 $3 MANY_CONN=$MANY_CONN" >> "$X6/p2.log"; }
 qsuite() { echo "qsuite" >> "$X6/p2.log"; }
-H=$X6/h DBCMP=$X6/db MANY_CLIENTS=16 CLASS_FILTER=b100 REPS=1 XREPS=5 LOADS_FROM=1 SWEEP_SUB=/p6 p2_ts; rc=$?
-want=$(printf '%s\n' "ts_start rb-ts" "probe $OUT/p2/ts/p6" "bcheck ts" "bsuite ts ts $OUT/p2/ts/p6 MANY_CONN=probed" "ctr_mem rb-ts" "runstats $OUT/p2/ts/p6")
-expect "p2_ts with MANY_CLIENTS: the probe's setting reaches the batch classes; no qsuite, no -ha image load" \
+# p2_ts in the extra-clients pass, per filter (a subshell with stubs for the steps that need a container): the plain image
+# only for the aggregate classes, the -ha image only for the TWA batch classes; there the container is rb-tsha (QCTR:
+# a death is seen, recorded and restarted), the probe is the TWA batch's own on rb-tsha with the request file of the
+# heaviest wanted batch, and its setting (not the aggregate probe's) reaches twasuite
+p2ts_run() { # FILTER: log in $X6/p2.log, rc in $rc
+    : > "$X6/p2.log"
+    ( tstep() { echo "tstep $1" >> "$X6/p2.log"; }; ts_timed() { :; }
+      REL() { echo "REL $*" >> "$X6/p2.log"; echo "SELECT 1"; }
+      twasuite() { echo "twasuite $1 QCTR=$QCTR MANY_CONN=$MANY_CONN" >> "$X6/p2.log"; }
+      H=$X6/h DBCMP=$X6/db KS="1 10 100" BCLASSES="raw agg1d" MANY_CLIENTS=16 CLASS_FILTER="$1" REPS=1 XREPS=5 LOADS_FROM=1 \
+        SWEEP_SUB=/p6 WORK=$X6/work2 p2_ts ) > /dev/null 2>&1
+    rc=$?
+}
+mkdir -p "$X6/work2"
+P=$OUT/p2/ts/p6
+p2ts_run b100
+want=$(printf '%s\n' "ts_start rb-ts" "tstep p2 ts load r1" "probe $P [] []" "bcheck ts" "bsuite ts ts $P MANY_CONN=probed" "ctr_mem rb-ts" \
+    "ts_start rb-tsha" "tstep p2 tsha load" "REL qb ts twa7d 100" "probe $P [rb-tsha] [.twa]" \
+    "twasuite ts QCTR=rb-tsha MANY_CONN=probed.twa" "ctr_mem rb-tsha" "runstats $P")
+expect "p2_ts with MANY_CLIENTS and b100: the plain image's classes, then the -ha image's TWA batches with a probe of their own" \
     '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ]'
+p2ts_run "twa1d.b100 twa7d.b100"
+want=$(printf '%s\n' "ts_start rb-tsha" "tstep p2 tsha load" "REL qb ts twa7d 100" "probe $P [rb-tsha] [.twa]" \
+    "twasuite ts QCTR=rb-tsha MANY_CONN=probed.twa" "ctr_mem rb-tsha" "runstats $P")
+expect "p2_ts with the TWA filter: only the -ha image is loaded; no plain image, aggregate probe, check or suite; QCTR is rb-tsha" \
+    '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ]'
+p2ts_run "twa1d.b100"
+expect "p2_ts: the probe sends the batch the filter names (twa1d.b100 only: twa1d's request file)" \
+    'grep -qx "REL qb ts twa1d 100" "$X6/p2.log" && ! grep -q "twa7d" "$X6/p2.log"'
+PROBE_TWA_FAIL=1 p2ts_run "twa1d.b100 twa7d.b100"
+expect "p2_ts: when no setting fits the TWA batches run with the default, not with the aggregate probe's setting" \
+    'grep -qx "twasuite ts QCTR=rb-tsha MANY_CONN=" "$X6/p2.log"'
+p2ts_run "agg1d.b100"
+want=$(printf '%s\n' "ts_start rb-ts" "tstep p2 ts load r1" "probe $P [] []" "bcheck ts" "bsuite ts ts $P MANY_CONN=probed" "ctr_mem rb-ts" "runstats $P")
+expect "p2_ts with an aggregate-only filter: no -ha image, as before" '[ $rc = 0 ] && [ "$(cat "$X6/p2.log")" = "$want" ]'
 # p2_tsdb and p2_qdb with the pass: with CLASS_FILTER=b100 the aggregate classes' check and suites and the TWA batches; with
 # the two TWA classes of 100 named, the TWA batches only (no answer check or suite of the aggregate classes, which the
 # earlier pass timed)

@@ -334,6 +334,22 @@ def many_note(d, name, lines, flags):
         # a table than its pool of readers holds. Not a memory failure, and the note must not say it was
         return ("the 32-client run was refused (%s): QuestDB's pool of table readers was exhausted, not its memory (%s). "
                 "The 16-client run (%s) is the comparison" % (why, mem, os.path.basename(f16)[:-len(".mean.txt")]))
+    seen_dying = glob.glob(os.path.join(d, name + ".*.oom")) + glob.glob(os.path.join(d, name + ".*.died"))  # the harness saw it
+    if why and all("server closed the connection" in k for k in why.split("; ")) and not limit and not seen_dying:
+        # TimescaleDB's TWA batch classes (they run in the -ha container, which the harness did not watch before
+        # 2026-11-03: no REFUSED line, no .oom file, no oom_kill count): libpq says only that the server closed the
+        # connection. What the files show is the container's memory: when it is at the limit, that is the kernel's OOM
+        # killer (a backend is killed, the postmaster restarts the others, every query in flight fails)
+        lim = re.fullmatch(r"(\d+(?:\.\d+)?) ?(?:GB|GiB)", (anylimit or "").strip())
+        full = [k for k, v in sorted(best.items()) if lim and v[1] >= 0.98 * float(lim.group(1)) * 2**30]
+        kern = sorted(glob.glob(os.path.join(d, "kernel-oom*.txt")))
+        cause = ("the container's memory without the page cache was at its limit of %s (%s), so it was the kernel's OOM "
+                 "killer that ended a backend; the harness did not watch this container then, so the run files hold no "
+                 "oom_kill count%s" % (anylimit, ", ".join(full), "; the kernel log lines of the kills are in " +
+                                       ", ".join(os.path.basename(x) for x in kern) if kern else "")
+                 if full else "the cause was not recorded (the container's memory did not reach its limit in the files)")
+        return ("the 32-client run lost its connection to the server (%s): %s; %s. The 16-client run (%s) is the comparison" % (
+            why, mem, cause, os.path.basename(f16)[:-len(".mean.txt")]))
     return ("the 32-client run ran out of memory%s: %s; limit %s. The 16-client run (%s) is the comparison" % (
         " (" + why + ")" if why else "", mem, limit or anylimit or "not recorded", os.path.basename(f16)[:-len(".mean.txt")]))
 

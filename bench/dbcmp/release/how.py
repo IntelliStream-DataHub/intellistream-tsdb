@@ -369,9 +369,15 @@ def p6(d):
                     time.strftime("%Y-%m-%d %H:%M"), v, tree))
         # TimescaleDB's multi-client classes run with fewer parallel workers per query when it ran out of memory with
         # the default (run.sh ts_many_probe): the setting this pass used is part of how its rows were made
-        par = lines(os.path.join(d, "p6", "many-parallel.txt"))
+        # (many-parallel.txt: the aggregate classes' probe; many-parallel.twa.txt: the TWA batch classes' own, on the toolkit
+        # container). A pass names the setting of the classes it timed: a TWA-only filter must not claim the aggregate one
+        flt = os.environ.get("CLASS_FILTER", "").split()
+        twa_only = bool(flt) and all("twa" in x for x in flt)
+        par = [] if twa_only else lines(os.path.join(d, "p6", "many-parallel.txt"))
+        if not flt or any(x in c for x in flt for c in ("twa1d.b10", "twa1d.b100", "twa7d.b10", "twa7d.b100")):
+            par += lines(os.path.join(d, "p6", "many-parallel.twa.txt"))
         if par:
-            text += "; setting: " + par[0]
+            text += "; setting: " + "; ".join(par[:2])
         # a system gets several passes (the aggregate classes b100, then the TWA batches): each stays, keyed by its
         # client count and class filter, so a later pass does not replace the description of an earlier one
         passes = h["p6"].get("many_passes", {})

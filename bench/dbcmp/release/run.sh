@@ -33,7 +33,9 @@ NHI=${NHI:-32} NPER=${NPER:-16}
 # memory limit) and TimescaleDB's memory could not carry at 32 clients: the systems are then compared at 16, and the
 # 32-client rows stay what they were, failures with their reason (tables.py). ClickHouse also times the TWA batch
 # classes (twa1d.b100, twa7d.b100), and so do tsdb and QuestDB (qdb0-qdb2: their TWA batch classes failed at 32 clients
-# as well); TimescaleDB's TWA needs the toolkit image and a load of its own: not in this pass.
+# as well). So does TimescaleDB (p2_ts): its TWA needs the toolkit, which only the -ha image has, so the pass loads that
+# image once more (the plain image only when an aggregate class is wanted too), probes the parallel workers on the TWA
+# batch there (many-parallel.twa.txt) and times the wanted TWA classes at N clients.
 # CLASS_FILTER is one substring or several separated by spaces ("twa1d.b100 twa7d.b100": exactly the two TWA batch
 # classes of 100 windows, where "twa" would also pick the batches of 10)
 MANY_CLIENTS=${MANY_CLIENTS-} CLASS_FILTER=${CLASS_FILTER-}
@@ -48,6 +50,12 @@ agg_wanted() { # is one of the aggregate / raw / point batch classes (BCLASSES a
                # TWA batch classes only (CLASS_FILTER="twa1d.b100 twa7d.b100") then skips their answer check and suites
     local c k
     for k in $KS; do for c in $BCLASSES; do class_wanted "$c.b$k" && return 0; done; done
+    return 1
+}
+twa_wanted() { # is one of the TWA window batch classes (TWA_WKINDS at TWA_KS) wanted? An extra-clients pass for the
+               # aggregate classes only (CLASS_FILTER=agg7d.b100) then needs no load of the toolkit image
+    local k K
+    for k in ${TWA_WKINDS-twa1d twa7d}; do for K in ${TWA_KS-10 100}; do class_wanted "$k.b$K" && return 0; done; done
     return 1
 }
 CONTAINERS="rb-ch rb-qdb rb-ts rb-tsha rb-i2 rb-i3 rb-prom rb-prom-bf rb-prom-sweep rb-promtool rb-chbig rb-iot rb-td rb-vm"
@@ -1547,35 +1555,40 @@ ts_ready() { [ "$(psql -h 127.0.0.1 -p 5434 -U postgres -Atc 'select 1' 2> /dev/
 # max_parallel_workers_per_gather), each worker with its own memory; work_mem (6 MB) bounds none of it. On a machine that
 # 32 clients already keep busy, fewer workers per query cost little, so the 32-client classes take the most workers of
 # TS_MANY_TRY that this class survives, and say so (many-parallel.txt, driver.log); 1-client classes keep the default.
-ts_many_probe() { # DIR CONN-PREFIX: sets MANY_CONN (the caller's local) unless every setting runs out of memory.
+ts_many_probe() { # DIR CONN-PREFIX [CONTAINER QUERY-FILE TAG]: sets MANY_CONN (the caller's local) unless every setting runs
+    # out of memory. Without the optional arguments it is the aggregate classes' probe (rb-ts, agg7d.b100 from mkbatch.py,
+    # files probe.parN.txt and many-parallel.txt). The TWA batch classes pass the toolkit container, their own query file
+    # and the tag ".twa" (probe.twa.parN.txt, many-parallel.twa.txt): neither probe overwrites the other's record.
     # Probed at the client count of the classes it is for: NHI, or MANY_CLIENTS in the extra-clients pass
-    local D=$1 base=$2 w rc f n=${MANY_CLIENTS:-$NHI}
-    (cd "$WORK" && python3 -I "$H/mkbatch.py" ts) || { fail "mkbatch ts"; return 1; }
+    local D=$1 base=$2 ctr=${3:-rb-ts} q=${4-} tag=${5-} w rc f n=${MANY_CLIENTS:-$NHI} kind=
+    [ -n "$tag" ] && kind=" TWA batch"
+    if [ -z "$q" ]; then
+        (cd "$WORK" && python3 -I "$H/mkbatch.py" ts) || { fail "mkbatch ts"; return 1; }
+        q=$WORK/q/ts.agg7d.b100.txt
+    fi
     for w in ${TS_MANY_TRY:-2 1 0}; do
-        f=$D/probe.par$w.txt
+        f=$D/probe$tag.par$w.txt
         steplock -s
-        limited "$STEP_TIMEOUT" "$f" "$B/qdrive" pg "$base -c max_parallel_workers_per_gather=$w'" "$WORK/q/ts.agg7d.b100.txt" "$n" "$SECS"
+        limited "$STEP_TIMEOUT" "$f" "$B/qdrive" pg "$base -c max_parallel_workers_per_gather=$w'" "$q" "$n" "$SECS"
         rc=$?
         stepunlock
-        ctr_mem rb-ts "$f"
-        if ctr_died rb-ts; then
-            log "  ts probe: max_parallel_workers_per_gather=$w at $n clients of agg7d.b100: $CTR_WHY"
-            ctr_restart rb-ts || { fail "ts probe: rb-ts did not serve again"; return 1; }
+        ctr_mem "$ctr" "$f"
+        if ctr_died "$ctr"; then
+            log "  ts probe: max_parallel_workers_per_gather=$w at $n clients of $(basename "$q" .txt): $CTR_WHY"
+            ctr_restart "$ctr" || { fail "ts probe: $ctr did not serve again"; return 1; }
             continue
         fi
         [ "$rc" = 0 ] || { log "  ts probe: max_parallel_workers_per_gather=$w: rc $rc (see $f)"; continue; }
         MANY_CONN="$base -c max_parallel_workers_per_gather=$w'"
-        echo "max_parallel_workers_per_gather=$w in the $n-client classes (tried: ${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel.txt"
-        log "  ts: the $n-client classes run with max_parallel_workers_per_gather=$w (1-client classes: the default)"
+        echo "max_parallel_workers_per_gather=$w in the $n-client$kind classes (tried: ${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel$tag.txt"
+        log "  ts: the $n-client$kind classes run with max_parallel_workers_per_gather=$w (1-client classes: the default)"
         return 0
     done
-    echo "default in every class: out of memory at every setting tried (${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel.txt"
-    log "  ts: out of memory at every max_parallel_workers_per_gather tried; the $n-client classes keep the default"
+    echo "default in every$kind class: out of memory at every setting tried (${TS_MANY_TRY:-2 1 0})" > "$D/many-parallel$tag.txt"
+    log "  ts: out of memory at every max_parallel_workers_per_gather tried; the $n-client$kind classes keep the default"
 }
-p2_ts() {
-    local QCTR=rb-ts QREADY=ts_ready
-    local D=$OUT/p2/ts${SWEEP_SUB-} W=$DBCMP/s2/ts r
-    mkdir -p "$D"
+ts_plain_pass() { # DIR: the plain image's load and classes (p2_ts: its locals QCTR, QREADY, PG and MANY_CONN are in scope)
+    local D=$1 W=$DBCMP/s2/ts r n
     for r in $(seq "${LOADS_FROM:-1}" "$REPS"); do  # LOADS_FROM=$REPS: a rerun of later steps loads once (RESUME)
         crm rb-ts; rmdata "$W"
         ts_start rb-ts "$TS_IMG" "$W" "$DBCMP/input" || return 1
@@ -1590,31 +1603,49 @@ p2_ts() {
     cd "$WORK" || return 1
     python3 -I "$H/mkq.py" ts
     untimed "$D/check.txt" python3 -I "$H/check.py" ts 200
-    local MANY_CONN=
     [ -n "${TS_MANY_TRY-x}" ] && ts_many_probe "$D" "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC"
     if [ -n "${MANY_CLIENTS-}" ]; then  # the extra-clients pass (phase6many): this load, the probe above (at MANY_CLIENTS
-        # clients; many-parallel.txt says which setting), the batches' answer check, the CLASS_FILTER classes. Not the
-        # -ha image's load for LTTB and TWA
-        bcheck ts "$D" && bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
-        cd "$OUT" || true
-        ctr_mem rb-ts "$D/mem.txt"
-        crm rb-ts; rmdata "$W"
-        runstats "$D"
-        return 0
+        # clients; many-parallel.txt says which setting), the batches' answer check, the CLASS_FILTER classes
+        bcheck ts "$D" && bsuite ts ts "$D" pg "$PG"
+    else
+        qsuite ts ts "$D" pg "$PG"
+        bcheck ts "$D" && {
+            for n in ${FULLS-$FULLS_DEFAULT}; do  # like with like (REPORT §3, §5.11): one query per series, 16 connections
+                reps "ts.full$n.per.c$NPER" "$D" -- "$B/qdrive" pg "$PG" "$WORK/q/ts.full$n.per.txt" "$NPER" 100000 0
+            done
+            bsuite ts ts "$D" pg "$PG"
+            pc_pin rb-ts && PC=1 bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC -c max_parallel_workers_per_gather=0'"
+            pc_unpin rb-ts; }
     fi
-    qsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
-    bcheck ts "$D" && {
-        for n in ${FULLS-$FULLS_DEFAULT}; do  # like with like (REPORT §3, §5.11): one query per series, 16 connections
-            reps "ts.full$n.per.c$NPER" "$D" -- "$B/qdrive" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'" "$WORK/q/ts.full$n.per.txt" "$NPER" 100000 0
-        done
-        bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
-        pc_pin rb-ts && PC=1 bsuite ts ts "$D" pg "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC -c max_parallel_workers_per_gather=0'"
-        pc_unpin rb-ts; }
     cd "$OUT" || true
     ctr_mem rb-ts "$D/mem.txt"
     crm rb-ts; rmdata "$W"
+}
+ts_twa_probe() { # DIR PG: the parallel-worker probe for the TWA batch classes of the extra-clients pass, on the toolkit
+    # container (QCTR rb-tsha) with the heaviest batch the filter names: its request file is the one twabsuite sends
+    # (rel.py qb), built here without waiting for the single-window check, which the probe does not need
+    local D=$1 k K pk= pK f
+    for k in ${TWA_WKINDS-twa1d twa7d}; do for K in ${TWA_KS-10 100}; do class_wanted "$k.b$K" && { pk=$k; pK=$K; }; done; done
+    [ -n "$pk" ] || return 0
+    f=$WORK/q/ts.$pk.b$pK.txt
+    REL qb ts "$pk" "$pK" > "$f" && [ -s "$f" ] || { fail "rel.py qb ts $pk $pK for the probe (see $f)"; return 1; }
+    ts_many_probe "$D" "$2" rb-tsha "$f" .twa
+}
+p2_ts() {
+    local QCTR=rb-ts QREADY=ts_ready
+    local D=$OUT/p2/ts${SWEEP_SUB-} W
+    local PG="host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
+    local MANY_CONN=
+    mkdir -p "$D"
+    # The extra-clients pass (phase6many) loads only what its CLASS_FILTER needs: the plain image for the aggregate
+    # classes (agg_wanted), the -ha image (the toolkit's TWA) for the TWA batch classes (twa_wanted). A TWA-only filter
+    # ("twa1d.b100 twa7d.b100") leaves the aggregate classes of the earlier pass as they are.
+    local plain=1 twa=1
+    if [ -n "${MANY_CLIENTS-}" ]; then agg_wanted || plain=0; twa_wanted || twa=0; fi
+    [ $plain = 1 ] && { ts_plain_pass "$D" || return 1; }
+    [ $twa = 1 ] || { runstats "$D"; return 0; }
     # LTTB and TWA need the toolkit, which is in the -ha image (same TimescaleDB 2.30.1, PostgreSQL 17.11, toolkit 1.26.0) only:
-    # one more load there (timed once, for the record), then the two queries
+    # one more load there (timed once, for the record), then the two queries (the extra-clients pass: the TWA batches)
     W=$DBCMP/s2/tsha
     rmdata "$W"
     ts_start rb-tsha "$TSHA_IMG" "$W" "$DBCMP/input" || return 1
@@ -1623,17 +1654,27 @@ p2_ts() {
     warm "$DBCMP/input/mixed.csv"
     tstep "p2 tsha load" "$D/ha-load.txt" -- ts_timed rb-tsha
     PSQL -Atc "select version()" -c "select extname, extversion from pg_extension" -c "show shared_buffers" -c "show work_mem" > "$D/ha-version.txt"
+    # From here on the server is rb-tsha: a death in a TWA class (the kernel's OOM killer, 2026-11-03) is seen, recorded
+    # (REFUSED.txt, .oom) and the server started again. With QCTR still rb-ts none of that happened: the five runs of a class
+    # failed in a row against a server in recovery, and the next answer check with them.
+    QCTR=rb-tsha
     cd "$WORK" || return 1
-    REL q ts lttb > "$D/q.lttb.sql"; REL q ts twa > "$D/q.twa.sql"
-    untimed "$D/check-lttb.txt" REL check ts lttb ref/lttb.jsonl && lttb_loose "$D/check-lttb.txt" "$D"
-    untimed "$D/check-twa.txt" REL check ts twa ref/twa.jsonl
-    untimed "$D/explain-twa.txt" PSQL -c "EXPLAIN (ANALYZE, BUFFERS) $(cat "$D/q.twa.sql")"
-    grep -q 'Disk' "$D/explain-twa.txt" && log "  ts: the TWA plan still spills to disk with work_mem=$TS_WORK_MEM (see $D/explain-twa.txt)"
-    local PG="host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC'"
-    qline lttb "$D" "$D/q.lttb.sql" pg "$PG"
-    qline twa "$D" "$D/q.twa.sql" pg "$PG"
+    if [ -z "${MANY_CLIENTS-}" ]; then
+        REL q ts lttb > "$D/q.lttb.sql"; REL q ts twa > "$D/q.twa.sql"
+        untimed "$D/check-lttb.txt" REL check ts lttb ref/lttb.jsonl && lttb_loose "$D/check-lttb.txt" "$D"
+        untimed "$D/check-twa.txt" REL check ts twa ref/twa.jsonl
+        untimed "$D/explain-twa.txt" PSQL -c "EXPLAIN (ANALYZE, BUFFERS) $(cat "$D/q.twa.sql")"
+        grep -q 'Disk' "$D/explain-twa.txt" && log "  ts: the TWA plan still spills to disk with work_mem=$TS_WORK_MEM (see $D/explain-twa.txt)"
+        qline lttb "$D" "$D/q.lttb.sql" pg "$PG"
+        qline twa "$D" "$D/q.twa.sql" pg "$PG"
+    else  # the extra-clients pass: the probe on this container (a setting of its own: many-parallel.twa.txt), then the batches
+        mkdir -p q
+        MANY_CONN=   # not the aggregate classes' setting: the TWA batches decide for themselves
+        [ -n "${TS_MANY_TRY-x}" ] && ts_twa_probe "$D" "host=127.0.0.1 port=5434 user=postgres password=bench dbname=postgres options='-c TimeZone=UTC"
+    fi
     twasuite ts "$D" pg "$PG"
     cd "$OUT" || true
+    ctr_mem rb-tsha "$D/ha-mem.txt"
     crm rb-tsha; rmdata "$W"
     runstats "$D"
 }

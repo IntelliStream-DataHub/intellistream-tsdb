@@ -449,6 +449,54 @@ def many_cases():
         case("many: the 16-client TWA rows are in the table (p6:)", True,
              all(any(l.startswith("| p6: %s.%s.b100.c16 " % (v, k)) and "10.7 q/s" in l for l in text) for k in ("twa1d", "twa7d")))
         case("many: tables.py has no error for the QuestDB TWA classes", True, not tables.errors)
+        # TimescaleDB's TWA batch classes (twa1d.b100, twa7d.b100 at 32 clients, 2026-11-03): in the -ha container, which the
+        # harness did not watch then, so no REFUSED line names the class, no .oom file, no oom_kill count; libpq says only
+        # that "the server closed the connection unexpectedly". The container's memory in the .mem files is the evidence:
+        # at its limit it was the kernel's OOM killer, and the note says so and what it rests on; below it, the cause was not
+        # recorded and the note does not claim one
+        t = os.path.join(d, "tsw")
+        os.makedirs(os.path.join(t, "p6"))
+        closed = ("query failed: status 7: server closed the connection unexpectedly\n\tThis probably means the server "
+                  "terminated abnormally\n\tbefore or while processing the request.\n\nSELECT * FROM ((SELECT 0 AS mb)\n")
+        open(os.path.join(t, "REFUSED.txt"), "w").write(  # the plain container's aggregate class, which was watched
+            "ts.agg7d.b100.c32 r1: the server died: killed out of memory by the kernel (container limit 48 GB; running exit code 0)\n")
+        for k, peak in (("twa1d", 51537842176), ("twa7d", 20000000000)):
+            open(os.path.join(t, "ts.%s.b100.c32.mean.txt" % k), "w").write("query failed   # TEXT DIFFERS between runs\n")
+            for r in (1, 2):
+                open(os.path.join(t, "ts.%s.b100.c32.%d" % (k, r)), "w").write(closed)
+            open(os.path.join(t, "ts.%s.b100.c32.1.mem" % k), "w").write(
+                "rb-tsha peak %d nocache %d start 18891190272 startnocache 7561584640\n" % (51539595264 if k == "twa1d" else peak, peak))
+            open(os.path.join(t, "p6", "ts.%s.b100.c16.mean.txt" % k), "w").write(T16)
+        tables.errors.clear()
+        text = [r if isinstance(r, str) else r[1] for r in tables.results_table(t)]
+        row = next((l for l in text if l.startswith("| ts.twa1d.b100.c32 ")), "")
+        case("many: TimescaleDB's TWA batch that lost its server at the container limit is said to be the OOM killer, with the evidence", True,
+             "the 32-client run lost its connection to the server (2 x server closed the connection unexpectedly)" in row
+             and "without the page cache was at its limit of 48 GB (rb-tsha)" in row and "kernel's OOM killer" in row
+             and "no oom_kill count" in row and "rb-tsha peak 48.0 GB with the page cache (48.0 GB without)" in row)
+        case("many: and names the 16-client TWA row as the comparison", True,
+             "The 16-client run (ts.twa1d.b100.c16) is the comparison" in row)
+        row = next((l for l in text if l.startswith("| ts.twa7d.b100.c32 ")), "")
+        case("many: the same failure with the memory far below the limit claims no cause", True,
+             "the cause was not recorded" in row and "OOM killer" not in row and "ran out of memory" not in row
+             and "The 16-client run (ts.twa7d.b100.c16) is the comparison" in row)
+        open(os.path.join(t, "kernel-oom-2026-11-03.txt"), "w").write("Nov 03 04:34:35 kernel: Memory cgroup out of memory: Killed\n")
+        text = [r if isinstance(r, str) else r[1] for r in tables.results_table(t)]
+        row = next((l for l in text if l.startswith("| ts.twa1d.b100.c32 ")), "")
+        case("many: a saved kernel log of the kills is named in the note", True,
+             "the kernel log lines of the kills are in kernel-oom-2026-11-03.txt" in row)
+        case("many: the 16-client TWA rows of TimescaleDB are in the table (p6:)", True,
+             all(any(l.startswith("| p6: ts.%s.b100.c16 " % k) and "10.7 q/s" in l for l in text) for k in ("twa1d", "twa7d")))
+        case("many: tables.py has no error for the TimescaleDB TWA classes", True, not tables.errors)
+        # a death the harness did watch (QCTR rb-tsha since 2026-11-03: REFUSED line naming the class, .oom file) is the
+        # ordinary note, with the limit the REFUSED line names
+        open(os.path.join(t, "ts.twa1d.b100.c32.1.oom"), "w").write(closed)
+        open(os.path.join(t, "REFUSED.txt"), "a").write(
+            "ts.twa1d.b100.c32 r1: the server died: killed out of memory by the kernel (container limit 48 GB; running exit code 0)\n")
+        text = [r if isinstance(r, str) else r[1] for r in tables.results_table(t)]
+        row = next((l for l in text if l.startswith("| ts.twa1d.b100.c32 ")), "")
+        case("many: a TWA class whose death the harness recorded gets the ordinary note", True,
+             "the 32-client run ran out of memory" in row and "limit 48 GB" in row and "lost its connection" not in row)
         # how.py p6 with MANY_CLIENTS adds the pass to the block and names TimescaleDB's parallel-worker setting
         h = os.path.join(d, "ts")
         os.makedirs(os.path.join(h, "p6"))
@@ -468,6 +516,10 @@ def many_cases():
         case("many: how.py p6 names the parallel-worker setting the pass used", True,
              "16-client pass" in many and "setting: max_parallel_workers_per_gather=2 in the 16-client classes" in many)
         # a second pass on the same system (the TWA batches after the aggregate classes) is added, not substituted
+        # TimescaleDB's TWA batches probe on their own (the toolkit container; run.sh ts_twa_probe): their pass names that
+        # setting, not the aggregate classes' one
+        open(os.path.join(h, "p6", "many-parallel.twa.txt"), "w").write(
+            "max_parallel_workers_per_gather=1 in the 16-client TWA batch classes (tried: 2 1 0)\n")
         os.environ.update(MANY_CLIENTS="16", CLASS_FILTER="twa1d.b100 twa7d.b100", XREPS="3", T=d, TSDB_TREE=d)
         try:
             with contextlib.redirect_stdout(io.StringIO()):
@@ -478,6 +530,10 @@ def many_cases():
         many = json.load(open(os.path.join(h, "how.json")))["p6"].get("many", "")
         case("many: how.py p6 keeps the earlier pass's description when another pass is added", True,
              "classes 'b100' at 16" in many and "classes 'twa1d.b100 twa7d.b100' at 16" in many)
+        twa_pass = next((x for x in many.split(" || ") if "classes 'twa1d.b100 twa7d.b100'" in x), "")
+        case("many: a TWA-only pass names the TWA probe's setting and not the aggregate classes' one", True,
+             "setting: max_parallel_workers_per_gather=1 in the 16-client TWA batch classes" in twa_pass
+             and "in the 16-client classes" not in twa_pass)
         os.environ.update(MANY_CLIENTS="16", CLASS_FILTER="twa1d.b100 twa7d.b100", XREPS="3", T=d, TSDB_TREE=d)
         try:
             with contextlib.redirect_stdout(io.StringIO()):
