@@ -115,6 +115,25 @@ bool part_index_intact(const part *p)
     return part_hash(&h, ib, ilen, ib + ilen, tlen, &f) == p->index_hash;
 }
 
+/* Before a decision that is made for good from a part's index (a merge, which writes what it read under a fresh
+ * checksum; a retention drop or a class record, which take its series ids): damage since the open must not decide
+ * it. A damaged part is marked once, logged once and counted in st_broken_parts; it is then left out of merges and
+ * drops (which would otherwise retry it every second, starving the rest), and stays for the next open to refuse. */
+bool part_checked(eng *db, part *p, const char *what)
+{
+    if (atomic_load(&p->damaged))
+        return false;
+    if (part_index_intact(p))
+        return true;
+    if (!atomic_exchange(&p->damaged, true)) {
+        fprintf(stderr, "tsdb: %s: the index of part %s no longer matches the checksum its open checked (damaged "
+                        "since): the part is left as it is, out of merges and retention drops; the next open will "
+                        "refuse it (restore it from a backup or snapshot)\n", what, p->name);
+        atomic_fetch_add(&db->st_broken_parts, 1);
+    }
+    return false;
+}
+
 /* Opens the file `file` as the part called `name` (a follower may find a part
  * under its retired_ name). pin: read the index and tombstones from a checked copy (pin_index). */
 int part_open_as(int dirfd, const char *file, const char *name, bool pin, part **out)

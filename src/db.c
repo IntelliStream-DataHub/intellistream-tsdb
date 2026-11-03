@@ -348,16 +348,66 @@ static int parts_check_series(eng *db, bool read_only)
     return 0;
 }
 
-/* A writer's open cuts the torn tails it found (SERIES, STATES, CLASSES) only once every check that could refuse
- * the open passed: a part or a WAL row can prove a "torn" record was acknowledged, and a refused open must leave
- * the files as they were, for the operator to repair. RETENTION needs no cut: its next append overwrites. */
+static int dict_short(const char *file, const char *by, uint64_t named, uint32_t n)
+{
+    fprintf(stderr,
+            "tsdb: %s, but %s has only %" PRIu32 " records: %s is damaged (its last records, cut as a torn tail, "
+            "would be handed out again to new names). Nothing was changed: restore %s from a backup or snapshot (a "
+            "copy with at least %" PRIu64 " records), then open again; tsdb export cannot read the database either "
+            "until then\n",
+            by, file, n, file, file, named);
+    return TSDB_ERR_CORRUPT;
+}
+
+/* Besides parts and WAL rows (parts_check_series, wal_check_segment), these durable records name series and states,
+ * and each was written after the record it names was synced: RETENTION (tsdb_set_retention takes ids SERIES has),
+ * CLASSES (a class is decided for a series that exists), and the counts of a MANIFEST whose writer synced
+ * (dict_append counts a record once it is synced). So one naming an id the dictionary lacks proves the dictionary
+ * lost acknowledged records, typically its last ones, damaged at rest and taken for a torn tail; cut, their ids
+ * would go to the next names, which would inherit a retention limit or a class, or (STATES) old rows' codes. State
+ * values in parts and the WAL prove nothing: inserts take any code, not only those tsdb_state handed out. */
+static int open_check_records(eng *db)
+{
+    uint32_t n = eng_series_count(db), ns = atomic_load(&db->states.count), ms, mst;
+    char by[64];
+    if (db->ret_ids > n) {
+        snprintf(by, sizeof by, "RETENTION names series %" PRIu64, db->ret_ids - 1);
+        return dict_short("SERIES", by, db->ret_ids, n);
+    }
+    if (db->cls_ids > n) {
+        snprintf(by, sizeof by, "CLASSES names series %" PRIu64, db->cls_ids - 1);
+        return dict_short("SERIES", by, db->cls_ids, n);
+    }
+    int rc = manifest_synced_counts(db, &ms, &mst);
+    if (rc == TSDB_ERR_NOTFOUND || rc == TSDB_ERR_CORRUPT)
+        return 0; /* none, a writer's without fsync, or damaged: the writer rewrites it, and the parts were checked */
+    if (rc)
+        return rc;
+    if (ms > n) {
+        snprintf(by, sizeof by, "MANIFEST counts %" PRIu32 " series", ms);
+        return dict_short("SERIES", by, ms, n);
+    }
+    if (mst > ns) {
+        snprintf(by, sizeof by, "MANIFEST counts %" PRIu32 " states", mst);
+        return dict_short("STATES", by, mst, ns);
+    }
+    return 0;
+}
+
+/* A writer's open cuts the torn tails it found (SERIES, STATES, CLASSES, RETENTION) only once every check that
+ * could refuse the open passed: a part, a WAL row or another record can prove a "torn" record was acknowledged, and
+ * a refused open must leave the files as they were, for the operator to repair. */
 static int open_cut_tails(eng *db)
 {
-    int rc = series_cut_tail(&db->series);
+    int rc = open_check_records(db);
+    if (rc == 0)
+        rc = series_cut_tail(&db->series);
     if (rc == 0)
         rc = series_cut_tail(&db->states);
     if (rc == 0)
         rc = cls_cut_tail(db);
+    if (rc == 0)
+        rc = ret_cut_tail(db);
     return rc;
 }
 
@@ -565,7 +615,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         /* and parts naming series SERIES lacks are not an empty view either: the open waits as a follower would,
            then fails (follow_refresh) */
         while ((rc = follow_refresh(db)) == 0 && !db->follow_version &&
-               (db->manifest_bad_since || db->series_gap_since))
+               (db->manifest_bad_since || db->series_gap_since || db->series_bad_since))
             usleep(10000);
         if (rc == 0) /* CLASSES was read again after MANIFEST: its records come before the parts that use them */
             rc = cls_check_parts(db);

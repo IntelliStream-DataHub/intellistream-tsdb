@@ -210,6 +210,7 @@ int series_open(series_dict *d, int dirfd, const char *file, bool read_only, boo
     while (rc == 0 && parse_record(buf, pos, size, 0, &name, &len, &type, &rec)) {
         uint32_t id;
         rc = type_valid(type) ? dict_add(d, name, len, type, &id) : TSDB_ERR_CORRUPT;
+        d->last_off = pos;
         pos += rec;
     }
     if (rc == 0 && pos != size && valid_after(buf, pos, size, 0)) {
@@ -262,25 +263,41 @@ int series_reload(series_dict *d, int dirfd)
     }
     pthread_mutex_lock(&d->append_lock);
     uint64_t off = d->file_off, size = (uint64_t)st.st_size; /* moved only under append_lock */
-    if (size > off) {
-        size_t len = (size_t)(size - off);
+    /* The last record read is read again with the new ones: a writer that cut it (damaged at rest, taken for a torn
+     * tail) hands its id to the next name, maybe in a record of the same size, and this reader would go on naming
+     * that id after the record it read. A file shorter than what was read says the same. */
+    uint64_t from = d->last_off < off ? d->last_off : off;
+    if (size < off) {
+        rc = TSDB_ERR_CORRUPT; /* reported by the refresh; read again from here next time */
+    } else if (size > from) {
+        size_t len = (size_t)(size - from);
         uint8_t *buf = malloc(len);
         dict_hook(d, DICT_AT_RELOAD, d->file);
-        rc = !buf ? TSDB_ERR_NOMEM : read_all(fd, buf, len, off);
+        rc = !buf ? TSDB_ERR_NOMEM : read_all(fd, buf, len, from);
         pthread_mutex_lock(&d->lock);
-        size_t pos = 0, n, rec;
+        size_t pos = (size_t)(off - from), n, rec;
         const char *name;
         int type;
+        uint32_t count = atomic_load(&d->count);
+        if (rc == 0 && pos) {
+            const char *had = count ? d->names[count - 1] : NULL;
+            if (!count || !parse_record(buf, 0, len, from, &name, &n, &type, &rec) || rec != pos ||
+                strlen(had) != n || memcmp(had, name, n) != 0 || type != d->types[count - 1])
+                rc = TSDB_ERR_CORRUPT;
+        }
         /* a record that does not check out is still being appended */
-        while (rc == 0 && parse_record(buf, pos, len, off, &name, &n, &type, &rec)) {
+        size_t start = pos;
+        while (rc == 0 && parse_record(buf, pos, len, from, &name, &n, &type, &rec)) {
             uint32_t id;
             rc = type_valid(type) ? dict_add(d, name, n, type, &id) : TSDB_ERR_CORRUPT;
-            if (rc == 0)
+            if (rc == 0) {
+                d->last_off = from + pos;
                 pos += rec; /* a record not added is read again next time: ids stay the record numbers */
+            }
         }
-        if (rc == 0 && pos != len && valid_after(buf, pos, len, off))
+        if (rc == 0 && pos != len && valid_after(buf, pos, len, from))
             rc = TSDB_ERR_CORRUPT; /* reported by the refresh; read again from here next time */
-        d->file_off = off + pos;
+        d->file_off = from + (pos > start ? pos : start);
         pthread_mutex_unlock(&d->lock);
         free(buf);
     }
@@ -352,6 +369,7 @@ static int dict_append(series_dict *d, const char *name, size_t len, int type, u
     free(rec);
     pthread_mutex_lock(&d->lock);
     if (rc == 0) {
+        d->last_off = off;
         d->file_off = off + size;
         rc = dict_add(d, name, len, type, id);
         if (rc != 0) {

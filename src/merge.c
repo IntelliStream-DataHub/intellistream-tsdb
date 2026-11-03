@@ -70,8 +70,15 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
             b++;
         size_t nparts = b - a;
         time_t newest = 0;
-        for (size_t i = a; i < b; i++)
+        bool damaged = false; /* a merge of it would fail again (part_checked): the other partitions go on */
+        for (size_t i = a; i < b; i++) {
             newest = MAX(newest, db->parts[i]->written);
+            damaged |= atomic_load(&db->parts[i]->damaged);
+        }
+        if (damaged) {
+            a = b;
+            continue;
+        }
         bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
         for (size_t i = a; i < b && solo_ok && idle && solo == SIZE_MAX; i++)
             if (insert_written(db->parts[i]) && !db->parts[i]->merging)
@@ -208,9 +215,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
          * check could see. So the index is hashed again first (it is about 0.3% of the part); on a mismatch the
          * merge fails and the part stays, for the next open to refuse. Decoding instead would still trust its run
          * table and offsets. */
-        if (!part_index_intact(src[i])) {
-            fprintf(stderr, "tsdb: merge: the index of part %s no longer matches the checksum its open checked "
-                            "(damaged since): not merged; the next open will refuse the part\n", src[i]->name);
+        if (!part_checked(db, src[i], "merge")) {
             free(cur);
             return TSDB_ERR_CORRUPT;
         }
@@ -467,6 +472,27 @@ static void ttl_compute_locked(eng *db, part *p, uint32_t gen)
     p->ttl_gen = gen;
 }
 
+/* Parts [a, b) of one partition looked expired. Without pin_index, ttl_all came from series ids read in the mapping,
+ * where damage since the open shows (a run of a series without retention renamed to one with a short limit), and a
+ * drop is for good: the files go after obsolete_part_lifetime_s, where no later open can see them. So each part's
+ * index is checked first and the decision made again from the checked bytes; a damaged part keeps its partition
+ * (part_checked). Hashing every part at every retention change would hold db->lock for a pass over all indexes;
+ * only a drop needs it, and a TTL rewrite is checked by merge_parts. Caller holds db->lock. */
+static bool partition_expired_checked_locked(eng *db, size_t a, size_t b, uint32_t gen, int64_t now)
+{
+    int64_t all = INT64_MIN;
+    for (size_t i = a; i < b; i++) {
+        part *p = db->parts[i];
+        if (!p->ng && !p->nt)
+            continue;
+        if (!part_checked(db, p, "retention"))
+            return false;
+        ttl_compute_locked(db, p, gen);
+        all = MAX(all, p->ttl_all);
+    }
+    return now >= all;
+}
+
 /* Expired partitions and partitions left with nothing but empty parts are retired (*dropped); one part with
  * expired rows is selected for a rewrite. An empty part (a merge's wal_seq anchor) holds its partition only while
  * a WAL segment up to its wal_seq may still be replayed: *sync_wal asks for a directory fsync that makes the
@@ -506,7 +532,7 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
                 ttl_compute_locked(db, p, gen);
             all = MAX(all, p->ttl_all);
         }
-        if (now >= all && !eng_check(db)) {
+        if (now >= all && !eng_check(db) && partition_expired_checked_locked(db, a, b, gen, now)) {
             /* every series in the partition has expired past its end, or nothing is left in it: drop it like
              * tsdb_drop_before. Memtable rows of it are hidden by the same cutoffs; flushed later, they go the
              * same way (or, for an empty partition, are newer than what was deleted). */
@@ -520,7 +546,8 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
         }
         for (size_t i = a; ret && i < b && !k; i++) {
             part *p = db->parts[i];
-            if (p->merging || (!p->ng && !p->nt) || now <= p->ttl_any || db->opt.retention_merge_s < 0 ||
+            if (p->merging || atomic_load(&p->damaged) || (!p->ng && !p->nt) || now <= p->ttl_any ||
+                db->opt.retention_merge_s < 0 ||
                 wall - p->created < db->opt.retention_merge_s)
                 continue;
             p->merging = true;
@@ -610,6 +637,7 @@ int eng_optimize(eng *db)
     if (rc)
         return rc;
     part *sel[MAX_MERGE_PARTS];
+    bool skipped = false; /* a partition with a damaged part was left as it is: TSDB_ERR_CORRUPT at the end */
     pthread_mutex_lock(&db->lock);
     for (;;) {
         /* first partition with several parts, or with one only inserts wrote, and no merge in flight; one a merge
@@ -617,11 +645,17 @@ int eng_optimize(eng *db)
         size_t a = SIZE_MAX, k = 0;
         bool waiting = false;
         for (size_t i = 0, j; i < db->nparts && a == SIZE_MAX; i = j) {
-            bool busy = db->parts[i]->merging;
-            for (j = i + 1; j < db->nparts && db->parts[j]->partition == db->parts[i]->partition; j++)
+            bool busy = db->parts[i]->merging, damaged = atomic_load(&db->parts[i]->damaged);
+            for (j = i + 1; j < db->nparts && db->parts[j]->partition == db->parts[i]->partition; j++) {
                 busy |= db->parts[j]->merging;
+                damaged |= atomic_load(&db->parts[j]->damaged);
+            }
             if (j - i < 2 && !insert_written(db->parts[i]))
                 continue;
+            if (damaged) { /* found by a merge before (part_checked): the rest is merged, and the call fails */
+                skipped = true;
+                continue;
+            }
             if (busy)
                 waiting = true;
             else
@@ -650,12 +684,19 @@ int eng_optimize(eng *db)
             int mrc = manifest_publish(db);
             rc = rc ? rc : mrc;
         }
-        for (size_t i = 0; i < k; i++)
+        bool marked = false;
+        for (size_t i = 0; i < k; i++) {
+            marked |= rc == TSDB_ERR_CORRUPT && atomic_load(&sel[i]->damaged);
             part_unref(sel[i]);
+        }
+        if (marked) { /* the loop leaves its partition out from now on */
+            skipped = true;
+            rc = 0;
+        }
         pthread_mutex_lock(&db->lock);
         if (rc || (rc = eng_check(db)) != 0) /* failed meanwhile: the output was dropped, do not select again */
             break;
     }
     pthread_mutex_unlock(&db->lock);
-    return rc;
+    return rc == 0 && skipped ? TSDB_ERR_CORRUPT : rc;
 }

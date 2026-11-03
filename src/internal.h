@@ -676,7 +676,7 @@ static inline double gix_f64(const gix *x, uint32_t i, int f)
     memcpy(&d, &u, 8);
     return d;
 }
-/* The first entry of run r. gix_parse checked the run table, but without verify_checksums the readers use it in
+/* The first entry of run r. gix_parse checked the run table, but without pin_index the readers use it in
  * the part's mapping, where damage that reaches the file after the open shows (a misdirected write, a page misread
  * after eviction): every entry number taken from it is kept below n, so such damage gives wrong answers, as in a
  * granule payload, and never a read outside the index. */
@@ -737,6 +737,7 @@ typedef struct part {
     /* protected by tsdb.lock */
     bool merging;
     bool dropped;
+    atomic_bool damaged; /* its index no longer matches the open's checksum: out of merges and drops (part_checked) */
     uint32_t ttl_gen;        /* retention generation ttl_any/ttl_all were computed for; 0: never */
     int64_t ttl_any, ttl_all; /* retention "now" after which some row / every row and tombstone has expired */
     atomic_bool obsolete; /* delete the file when the last reference goes */
@@ -843,6 +844,8 @@ static inline void gx_load(const part *p, uint32_t i, unsigned want, granule *g)
 int part_open(int dirfd, const char *name, bool pin, part **out);
 int part_open_as(int dirfd, const char *file, const char *name, bool pin, part **out);
 bool part_index_intact(const part *p);
+/* part_index_intact; a part that fails it is marked damaged, logged and counted once (st_broken_parts) */
+bool part_checked(struct eng *db, part *p, const char *what);
 void part_ref(part *p);
 void part_unref(part *p);
 /* Decodes a granule: timestamps, and values (if v) as slots of `type`; checks
@@ -931,6 +934,7 @@ typedef struct series_dict {
     size_t tcap;
     uint64_t seed;   /* random per open: names chosen to collide cannot be planted (nothing persists the hash) */
     uint64_t file_off; /* bytes of SERIES already loaded */
+    uint64_t last_off; /* where the last record loaded starts (a reload checks it is still there) */
     bool broken;       /* an append failed (under lock): the file may end in a torn record, append no more */
     bool tail_pending; /* a writer's open found a torn tail after file_off: cut by series_cut_tail, not before */
     /* test hook (tsdb_test_dict_fault), read atomically: called at the DICT_AT_* points; nonzero at DICT_AT_ADD
@@ -1153,6 +1157,9 @@ typedef struct graveyard_entry {
 
 int manifest_publish(struct eng *db);
 int follow_refresh(struct eng *db);
+/* MANIFEST's counts of SERIES and STATES records, when it is valid and its writer synced them before it counted them
+ * (no `fsync 0`); else TSDB_ERR_NOTFOUND */
+int manifest_synced_counts(struct eng *db, uint32_t *series, uint32_t *states);
 void *follower_main(void *arg);
 void db_retire_locked(struct eng *db, part *p);
 void graveyard_purge(struct eng *db, bool all);
@@ -1239,6 +1246,8 @@ struct eng {
     atomic_bool has_retention; /* some series has a limit: queries and merges look it up */
     int ret_fd;
     uint64_t ret_off;
+    uint64_t ret_size; /* a writer's open: RETENTION's size, cut back to ret_off once the open's checks passed */
+    uint64_t ret_ids;  /* one past the highest series id a RETENTION record names (the open's check, N1) */
     bool ret_broken;
 
     /* partition classes (classes.c). Lock order: flush_lock > cls_rw > class_lock > the WAL writer role; cls_mu is a
@@ -1250,6 +1259,7 @@ struct eng {
     size_t hcap, hn;
     int cls_fd;
     uint64_t cls_off; /* bytes of CLASSES applied (a writer appends here) */
+    uint64_t cls_ids; /* one past the highest series id a CLASSES record names (the open's check) */
     bool cls_broken;
     atomic_uint_fast64_t st_class_switches;
     /* One frozen history per placement: a large insert, a replace or a flush holds cls_rw for reading from the
@@ -1327,7 +1337,17 @@ struct eng {
     int64_t manifest_bad_since; /* follower: MANIFEST failed its checks since (monotonic ms), else 0 */
     bool manifest_reported;     /* follower: and that was logged */
     char broken_reported[96];   /* follower: the last broken part logged */
-    int64_t series_gap_since;   /* follower: a new part names a series SERIES lacks since (monotonic ms), else 0 */
+    int64_t series_bad_since;   /* follower: SERIES has failed series_reload's checks since (monotonic ms), else 0 */
+    bool series_bad_reported;
+    int64_t series_gap_since;   /* follower: the oldest series SERIES lacks is missing since (monotonic ms), else 0 */
+    /* follower: when each count of series first went missing ({need, since}, need increasing): the patience runs
+     * per record, from when the first one SERIES lacks went missing, not from the start of a gap that a writer
+     * creating series steadily would keep open for good */
+    struct {
+        uint32_t need;
+        int64_t since;
+    } sgap[32];
+    uint32_t nsgap;
     bool writer_nofsync;        /* follower: the writer's MANIFEST says it runs without fsync */
     uint64_t follow_flushed, follow_active;
     wal_tail tails[MAX_TAILS]; /* oldest first; the array is changed under db->lock + buf_lock */
@@ -1606,6 +1626,7 @@ void tsdb_test_granules(struct tsdb *t, void (*fn)(void *ctx, int cls, uint32_t 
 
 int ret_open(eng *db, bool read_only);
 int ret_reload(eng *db);
+int ret_cut_tail(eng *db); /* a writer's open, once its checks passed: cuts the torn tail ret_open found */
 void ret_close(eng *db);
 void ret_clock_init(eng *db);
 int64_t eng_now_ms(eng *db);

@@ -80,9 +80,10 @@ int manifest_publish(eng *db)
     }
     len += (size_t)snprintf(buf + len, cap - len,
                             "tsdb-manifest %d\nversion %" PRIu64 "\nseries %u\nwal_flushed %" PRIu64
-                            "\nwal_active %" PRIu64 "\nfsync %d\nparts %zu\n",
+                            "\nwal_active %" PRIu64 "\nfsync %d\nstates %u\nparts %zu\n",
                             FORMAT_VERSION, ++db->manifest_version, atomic_load(&db->series.count), db->wal_flushed,
-                            db->wal_enabled ? db->wal_seq : db->wal_flushed, db->opt.fsync ? 1 : 0, db->nparts);
+                            db->wal_enabled ? db->wal_seq : db->wal_flushed, db->opt.fsync ? 1 : 0,
+                            atomic_load(&db->states.count), db->nparts);
     for (size_t i = 0; i < db->nparts; i++)
         len += (size_t)snprintf(buf + len, cap - len, "%s\n", db->parts[i]->name);
     pthread_mutex_unlock(&db->lock);
@@ -167,7 +168,8 @@ void graveyard_purge(eng *db, bool all)
 typedef struct manifest {
     uint64_t version, wal_flushed, wal_active;
     uint64_t check; /* over the whole text: a new writer counts its versions from 1 again */
-    uint32_t series;
+    uint32_t series, states; /* records of SERIES and STATES when it was written (synced ones, unless nofsync) */
+    bool has_states;
     bool nofsync; /* the writer runs without fsync: its files may reach another host in any order */
     char **parts;
     size_t nparts;
@@ -231,6 +233,8 @@ static int manifest_read(eng *db, manifest *m)
             int fs;
             if (sscanf(line, "fsync %d", &fs) == 1) /* optional: a MANIFEST without it is a syncing writer's */
                 m->nofsync = fs == 0;
+            if (sscanf(line, "states %u", &m->states) == 1) /* optional, as fsync */
+                m->has_states = true;
             if (sscanf(line, "parts %zu", &nparts) == 1) {
                 /* the checksum is no authentication: a crafted count must not wrap the calloc below. Every part
                    takes a line of its own, so more parts than bytes is damage, and so is a second count */
@@ -255,6 +259,20 @@ static int manifest_read(eng *db, manifest *m)
         return TSDB_ERR_CORRUPT;
     }
     return 0;
+}
+
+int manifest_synced_counts(eng *db, uint32_t *series, uint32_t *states)
+{
+    manifest m;
+    int rc = manifest_read(db, &m);
+    if (rc == 0 && m.nofsync)
+        rc = TSDB_ERR_NOTFOUND; /* its counts may include records a power loss took */
+    if (rc == 0) {
+        *series = m.series;
+        *states = m.has_states ? m.states : 0;
+    }
+    manifest_free(&m);
+    return rc;
 }
 
 static int cmp_part_name(const void *a, const void *b)
@@ -328,6 +346,8 @@ static int tail_segment(eng *db, wal_tail *t)
             if (id >= eng_series_count(db) && !reloaded) {
                 /* created after our last look; without the names the rows would be lost */
                 rc = series_reload(&db->series, db->dirfd);
+                if (rc == TSDB_ERR_CORRUPT)
+                    rc = 0; /* the record waits, as for a name not there yet; the MANIFEST refresh reports SERIES */
                 if (rc == 0)
                     rc = series_reload(&db->states, db->dirfd);
                 reloaded = true;
@@ -380,6 +400,25 @@ static int tail_segment(eng *db, wal_tail *t)
     return rc;
 }
 
+/* A refresh found SERIES with nser records where `need` should be there. Records when each count first went missing,
+ * forgets the counts SERIES has reached, and sets series_gap_since to when the first record SERIES lacks (id nser)
+ * went missing: the first count above nser. A count noted while the list is full is noted again later, once older
+ * ones were reached, which gives it more patience, never less. */
+static void series_gap_note(eng *db, uint32_t nser, uint32_t need, int64_t now)
+{
+    uint32_t k = 0, cap = (uint32_t)(sizeof db->sgap / sizeof db->sgap[0]);
+    while (k < db->nsgap && db->sgap[k].need <= nser)
+        k++;
+    memmove(db->sgap, db->sgap + k, (db->nsgap - k) * sizeof db->sgap[0]);
+    db->nsgap -= k;
+    if (need > nser && (!db->nsgap || need > db->sgap[db->nsgap - 1].need) && db->nsgap < cap) {
+        db->sgap[db->nsgap].need = need;
+        db->sgap[db->nsgap].since = now;
+        db->nsgap++;
+    }
+    db->series_gap_since = db->nsgap ? db->sgap[0].since : now;
+}
+
 int follow_refresh(eng *db)
 {
     if (!db->opt.read_only)
@@ -419,6 +458,24 @@ int follow_refresh(eng *db)
      * same MANIFEST, it would keep the follower on the old segment until the new writer published once more. */
     if (m.version != db->follow_version || m.check != db->follow_check) {
         rc = series_reload(&db->series, db->dirfd);
+        if (rc == TSDB_ERR_CORRUPT) {
+            /* shorter than what was read, its last record read changed, or a bad record before valid ones: damage,
+             * or appends reaching this host out of order; the previous view stays, reported past the patience */
+            int64_t now = mono_ms();
+            if (!db->series_bad_since)
+                db->series_bad_since = now;
+            if (now - db->series_bad_since < follow_patience_ms(db)) {
+                rc = TSDB_ERR_STOPPED;
+            } else if (!db->series_bad_reported) {
+                db->series_bad_reported = true;
+                fprintf(stderr, "tsdb: follower: SERIES has failed its checks for %" PRId64 " ms (shorter than what "
+                                "was read, a record read before changed, or damaged before valid records); keeping "
+                                "the previous view\n", now - db->series_bad_since);
+            }
+        } else {
+            db->series_bad_since = 0;
+            db->series_bad_reported = false;
+        }
         if (rc == 0)
             rc = series_reload(&db->states, db->dirfd);
         if (rc == 0)
@@ -481,29 +538,36 @@ int follow_refresh(eng *db)
             }
         }
         if (rc == 0 && gap_part) {
-            /* the previous view stays, as for a broken part; reported once it outlasts the patience */
+            /* A syncing writer's: the previous view stays, as for a broken part; reported once the first series
+             * SERIES lacks has been missing longer than the patience. A writer without fsync that creates series
+             * steadily leaves a gap open in almost every MANIFEST, each record arriving with writeback: its views are
+             * taken (the series SERIES shows are complete; the others' rows show once their names arrive), and a
+             * record missing past the patience is reported the same way. */
             int64_t now = mono_ms();
-            if (!db->series_gap_since)
-                db->series_gap_since = now;
+            series_gap_note(db, nser, gap_count ? m.series : gap_series + 1, now);
             if (now - db->series_gap_since < series_patience_ms(db)) {
-                rc = TSDB_ERR_STOPPED; /* next poll reads SERIES again */
+                rc = m.nofsync ? 0 : TSDB_ERR_STOPPED; /* next poll reads SERIES again */
             } else {
+                const char *then = m.nofsync ? "serving the series it has" : "keeping the previous view";
                 if (strcmp(db->broken_reported, gap_part) != 0) {
                     if (gap_count)
                         fprintf(stderr, "tsdb: follower: MANIFEST counts %" PRIu32 " series, but SERIES has only %" PRIu32
-                                        " after %" PRId64 " ms: %s; keeping the previous view\n",
-                                m.series, nser, now - db->series_gap_since, series_gap_why(db));
+                                        " after %" PRId64 " ms: %s; %s\n",
+                                m.series, nser, now - db->series_gap_since, series_gap_why(db), then);
                     else
                         fprintf(stderr, "tsdb: follower: part %s holds series %" PRIu32 ", but SERIES has only %" PRIu32
-                                        " after %" PRId64 " ms: %s; keeping the previous view\n",
-                                gap_part, gap_series, nser, now - db->series_gap_since, series_gap_why(db));
+                                        " after %" PRId64 " ms: %s; %s\n",
+                                gap_part, gap_series, nser, now - db->series_gap_since, series_gap_why(db), then);
                     snprintf(db->broken_reported, sizeof db->broken_reported, "%s", gap_part);
                     atomic_fetch_add(&db->st_broken_parts, 1);
                 }
-                rc = TSDB_ERR_CORRUPT;
+                /* without fsync a record can be later than any patience (dirty_expire is a minimum age, not a
+                 * deadline): reported, but the views go on */
+                rc = m.nofsync ? 0 : TSDB_ERR_CORRUPT;
             }
         } else if (rc == 0) {
             db->series_gap_since = 0;
+            db->nsgap = 0;
         }
         if (rc == 0) {
             if (nnext)

@@ -156,6 +156,25 @@ disk format and the wire protocol.
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
+- The last `SERIES` or `STATES` record, damaged at rest, was cut as a torn tail although a `RETENTION` or `CLASSES`
+  record, or a syncing writer's MANIFEST, proved it acknowledged: the next series got its id and inherited its
+  retention limit (its rows hidden at once and dropped by merges) or class, or a new state name its code. The open
+  now refuses that with `TSDB_ERR_CORRUPT` and changes nothing. MANIFEST has a new optional line `states N`.
+- A retention drop decided from series ids read in the part's mapping: an index damaged after the open could make a
+  partition of a series without retention look expired, and it was retired for good. The drop checks each part's
+  index first. A part that fails that check, a merge's or the rate measurement's is now marked: logged once (a
+  failing merge was retried and logged every second, forever), counted in `broken_parts`, and left out of merge
+  selection, so retention drops and the other merges go on (before, nothing expired was ever dropped again);
+  `tsdb_optimize` merges the rest and returns `TSDB_ERR_CORRUPT`.
+- Followers timed their patience for a series `SERIES` lacks from the start of a gap, which a writer creating series
+  steadily keeps open: after a minute (or 2 s for a syncing writer) every refresh failed and the view froze. The
+  patience now runs per record, and the views of a writer without fsync are taken meanwhile. A follower also
+  notices `SERIES` cut below, or rewritten at, the last record it read.
+- A torn end of a WAL segment that a later segment with records follows was cut like a torn append, losing
+  acknowledged rows; a power loss cannot do that (each segment is synced before the next takes rows). The open now
+  refuses it and names the segment to move aside.
+- `RETENTION` logged `cutting a torn tail` without cutting anything (also in an open that was then refused); its
+  torn tail is now cut, after the open's checks, like the others.
 - Found by the new jepsen nemesis `misdirect`: a misdirected write into the granule index of a part the server had
   open could crash a merge (SIGSEGV): the index is checked at the open and then read in the part's mapping, where
   later damage shows. Every entry number taken from the index now stays inside it. With the new option

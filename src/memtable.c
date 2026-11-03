@@ -758,6 +758,7 @@ void *flusher_main(void *arg)
 typedef struct seg {
     uint64_t seq;
     size_t end; /* a writer's open: where the valid records end, as wal_check_segment found */
+    size_t len; /* and the segment's size */
     char name[256];
 } seg;
 
@@ -854,8 +855,36 @@ static int wal_check_segment(eng *db, seg *s)
         rc = tail_confirm(db->dirfd, s->name, buf + pos, pos, len - pos);
     }
     s->end = pos;
+    s->len = len;
     free(buf);
     return rc;
+}
+
+/* A torn tail is a torn append only in the newest segment. Every write to a segment holds the WAL writer role and is
+ * followed by its fdatasync before the role is given up (wal_write_sync, from wal_commit in either wal_sync_ms mode
+ * and from mt_flush); the rotation (mt_flush) holds the role from before the new segment takes rows until the rest of
+ * the old one is written and synced; and after a failed write or sync the engine fails, so no later segment gets a
+ * record. So once segment k+1 holds a record, all of k was durable: a power loss cannot leave k torn, and a torn end
+ * of k with records after it is damage at rest to acknowledged rows, unless parts hold k's rows already (flushes go in
+ * segment order and give their parts the segment's number; large inserts give 0). With fsync = 0 nothing above is
+ * synced, and a power loss looks like this damage, as it does elsewhere: the open fails. */
+static int wal_check_order(const seg *segs, size_t nseg, uint64_t parts_seq)
+{
+    for (size_t k = 0; k + 1 < nseg; k++) {
+        if (segs[k].end == segs[k].len || parts_seq >= segs[k].seq)
+            continue;
+        for (size_t j = k + 1; j < nseg; j++)
+            if (segs[j].end > 0) {
+                fprintf(stderr,
+                        "tsdb: WAL segment %s ends in %zu bytes that are not a record at offset %zu, but %s after it "
+                        "holds records: a power loss cannot do that (each segment is synced before the next takes "
+                        "rows), so acknowledged rows are damaged. Nothing was changed: restore the segment from a "
+                        "backup or snapshot, or move it out of the directory to accept the loss of its rows\n",
+                        segs[k].name, segs[k].len - segs[k].end, segs[k].end, segs[j].name);
+                return TSDB_ERR_CORRUPT;
+            }
+    }
+    return 0;
 }
 
 /* Replays WAL segments left by a previous run, then opens a fresh segment. A writer checks every segment first and
@@ -910,8 +939,13 @@ int wal_open(eng *db, int (*before_replay)(eng *))
     }
 
     int rc = 0;
+    uint64_t parts_seq = 0;
+    for (size_t i = 0; i < db->nparts; i++)
+        parts_seq = MAX(parts_seq, db->parts[i]->wal_seq);
     for (size_t k = 0; !ro && k < nseg && rc == 0; k++)
         rc = wal_check_segment(db, &segs[k]);
+    if (rc == 0 && !ro)
+        rc = wal_check_order(segs, nseg, parts_seq);
     if (rc == 0 && before_replay)
         rc = before_replay(db);
     for (size_t k = 0; k < nseg && rc == 0; k++) {

@@ -677,8 +677,11 @@ typedef struct tsdb_stats {
      * makes a writer's or reader's open fail with TSDB_ERR_CORRUPT and a log line
      * naming it, rather than leave its rows out (older values of the same keys
      * would come back); renaming it to <name>.broken accepts the loss. A follower
-     * keeps its previous view instead, logs the part, and counts it here (only a
-     * follower: a writer's open fails). */
+     * keeps its previous view instead, logs the part, and counts it here. A
+     * running writer counts a part whose index no longer matches the checksum
+     * its open checked (damaged since; found by a merge, a retention drop or a
+     * rate measurement): the part is logged once and left out of merges and
+     * drops, and the next open refuses it. */
     uint64_t broken_parts;
     uint64_t follow_errors; /* follower refreshes that failed (MANIFEST, a part or the WAL damaged, or EIO) */
 } tsdb_stats;
@@ -695,7 +698,8 @@ typedef struct tsdb_volume_stats {
     uint64_t wal_syncs;      /* WAL fdatasyncs since open (0 with fsync off) */
     uint64_t broken_parts, follow_errors;
     int64_t follow_refresh_age_ms;   /* follower: time since its last successful refresh; 0 for a writer */
-    uint64_t pinned_bytes;   /* heap the listed parts' index copies take (pin_index; 0 without it) */
+    uint64_t pinned_bytes;   /* heap the listed parts' index copies take (pin_index; 0 without it); a part a
+                                merge replaced keeps its copy, uncounted, until the last query reading it ends */
     int failed;              /* fail-stop state of this volume (see tsdb_failed) */
 } tsdb_volume_stats;
 int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);

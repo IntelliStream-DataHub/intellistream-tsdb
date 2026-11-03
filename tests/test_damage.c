@@ -1114,7 +1114,7 @@ static void test_observe_damaged_runs(const char *scratch)
                 part_unref(pt);
             close(dfd);
         }
-        OK(tsdb_test_observe(db));
+        RC(tsdb_test_observe(db), damage ? TSDB_ERR_CORRUPT : 0); /* the index is checked first now */
         if (damage)
             CHECK(!classes_has(dir, 1000));
         else
@@ -1790,6 +1790,457 @@ static void test_format_version(const char *scratch)
     printf("  a format-7 database is refused at open, naming both versions, untouched\n");
 }
 
+/* ---------------------------------------------------- second review (REVIEW2) */
+
+#define DAY_MS 86400000LL
+
+static int64_t wall_ms(void) { return (int64_t)time(NULL) * 1000; }
+
+static void insert_at(tsdb *db, tsdb_sid id, int64_t t0, int n)
+{
+    int64_t *ts = malloc((size_t)n * sizeof *ts);
+    float *v = malloc((size_t)n * sizeof *v);
+    for (int i = 0; i < n; i++)
+        ts[i] = t0 + i * 1000, v[i] = (float)i;
+    OK(tsdb_insert_series(db, id, ts, v, (size_t)n));
+    free(ts);
+    free(v);
+}
+
+/* N1 (rv2.c). The last SERIES record, damaged at rest, looks like a torn append and was cut: the next series got its
+ * id and inherited what other records said of it, here the retention limit of a series made for decommissioning,
+ * which hid and then dropped the new series' rows. A RETENTION or CLASSES record, or the count of a MANIFEST whose
+ * writer synced, proves the record was acknowledged: the open fails and changes nothing. STATES the same through
+ * MANIFEST. Without fsync MANIFEST proves nothing, and the record is cut as before. */
+static void test_records_prove_series(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-records-prove", scratch);
+    const char *what[] = {"RETENTION", "CLASSES", "MANIFEST's series", "MANIFEST's states"};
+    for (int proof = 0; proof < 4; proof++) {
+        rm_rf(dir);
+        tsdb_options o = opts();
+        o.fsync = 1;
+        tsdb *db;
+        tsdb_sid a, b, st;
+        OK(tsdb_open(dir, &o, &db));
+        OK(tsdb_series(db, "a", &a));
+        OK(tsdb_series(db, "decommissioned", &b));
+        insert_at(db, a, wall_ms() - 10 * DAY_MS, 100);
+        if (proof == 0)
+            OK(tsdb_set_retention(db, b, DAY_MS));
+        if (proof == 1) {
+            OK(tsdb_test_class_switch(db, b, 1, NULL));
+            CHECK(classes_has(dir, (uint32_t)b));
+        }
+        if (proof == 3) {
+            uint32_t code;
+            OK(tsdb_series_create(db, "machine.mode", TSDB_STATE, NULL, &st));
+            OK(tsdb_state(db, st, "running", &code));
+            insert_at(db, a, wall_ms() - 9 * DAY_MS, 10);
+        }
+        OK(tsdb_flush(db)); /* publishes MANIFEST with the counts */
+        tsdb_close(db);
+        if (proof < 2) {
+            char m[700];
+            path(m, sizeof m, dir, "MANIFEST");
+            CHECK(unlink(m) == 0); /* the record alone proves it */
+        }
+        const char *file = proof == 3 ? "STATES" : "SERIES";
+        off_t size = file_size(dir, file);
+        flip(dir, file, size - 1); /* the last record's name: one bit, at rest */
+        if (try_open(dir) != TSDB_ERR_CORRUPT) {
+            fprintf(stderr, "FAIL: %s did not keep the open from cutting the last %s record\n", what[proof], file);
+            failures++;
+        }
+        CHECK(file_size(dir, file) == size); /* nothing cut */
+        flip(dir, file, size - 1);
+        OK(try_open(dir));
+    }
+
+    /* a writer without fsync: its MANIFEST counts records a power loss may take, so the record is cut */
+    rm_rf(dir);
+    tsdb_options o = opts();
+    tsdb *db;
+    tsdb_sid a, b;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "a", &a));
+    OK(tsdb_series(db, "decommissioned", &b));
+    insert_at(db, a, wall_ms() - 10 * DAY_MS, 100);
+    OK(tsdb_flush(db));
+    tsdb_close(db);
+    flip(dir, "SERIES", file_size(dir, "SERIES") - 1);
+    OK(try_open(dir));
+    CHECK(rows_of(dir, "decommissioned") == -3); /* cut: no such series */
+    printf("  a SERIES or STATES record cut as torn while RETENTION, CLASSES or MANIFEST names it: the open fails\n");
+    rm_rf(dir);
+}
+
+/* the byte offset of the run table's series ids in a part's index, and the part's footer */
+static size_t rser_offset(const char *dir, const char *part, part_footer *ft)
+{
+    *ft = read_footer(dir, part);
+    uint8_t *ib = calloc(1, ft->index_len + 8);
+    file_pread(dir, part, (off_t)ft->index_off, ib, ft->index_len);
+    gix x;
+    size_t off = 0;
+    if (gix_parse(ib, ft->index_len, ft->ngranules, &x) == 0 && x.nruns)
+        off = (size_t)((const uint8_t *)x.rser - ib);
+    else
+        CHECK(!"gix_parse");
+    free(ib);
+    return off;
+}
+
+/* N2 (rv.c part A). A retention change recomputed when each part expires from series ids read in the mapping: an
+ * index damaged after the open renamed the run of a series without retention to one with a 1-day limit, and the
+ * merge thread retired the whole partition, for good. The drop checks the index first now, and counts the part. */
+static void test_retention_damaged_index(const char *scratch)
+{
+    char dir[600], part[256], again[256];
+    snprintf(dir, sizeof dir, "%s/damage-retention-index", scratch);
+    rm_rf(dir);
+    tsdb_options o = opts();
+    o.merge_threads = 1;
+    o.merge_idle_s = 100000;
+    o.wal_max_batch_rows = 100; /* straight to parts */
+    o.partition_classes = 0;
+    tsdb *db;
+    tsdb_sid a, b;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "keep.forever", &a));
+    OK(tsdb_series(db, "short.lived", &b));
+    insert_at(db, a, (wall_ms() / DAY_MS - 30) * DAY_MS + 3600000, 640);
+    CHECK(find_file(dir, "p", ".part", part, sizeof part));
+    part_footer ft;
+    size_t roff = rser_offset(dir, part, &ft);
+    off_t at = (off_t)(ft.index_off + roff);
+    uint32_t was, one = 1;
+    file_pread(dir, part, at, &was, 4);
+    CHECK(was == 0);
+    file_pwrite(dir, part, at, &one, 4); /* the run of keep.forever now names short.lived */
+    OK(tsdb_set_retention(db, b, DAY_MS));
+    tsdb_stats st = {0};
+    for (int i = 0; i < 40 && st.broken_parts == 0; i++) {
+        usleep(100000);
+        OK(tsdb_get_stats(db, &st));
+    }
+    CHECK(st.broken_parts == 1);
+    usleep(1500000); /* the merge thread looks again every second: still kept, counted once */
+    OK(tsdb_get_stats(db, &st));
+    CHECK(st.broken_parts == 1);
+    CHECK(find_file(dir, part, "", again, sizeof again));
+    file_pwrite(dir, part, at, &was, 4);
+    int rc;
+    CHECK(count_rows(db, a, &rc) == 640 && rc == 0);
+    tsdb_close(db);
+    o.merge_threads = 0;
+    OK(tsdb_open(dir, &o, &db)); /* repaired: the next open takes it */
+    CHECK(count_rows(db, a, &rc) == 640 && rc == 0);
+    tsdb_close(db);
+    printf("  a retention drop checks the part's index first: damaged since the open, the partition stays\n");
+    rm_rf(dir);
+}
+
+struct part_count {
+    int64_t partition;
+    int n;
+};
+
+static void count_partition(void *ctx, const tsdb_part_info *info)
+{
+    struct part_count *c = ctx;
+    c->n += info->partition == c->partition;
+}
+
+/* n3 (rv.c part B). A merge that failed the index check was retried every second, forever: two log lines a second,
+ * no count, and since retention runs only when no merge is selected, expired partitions were never dropped. The
+ * part is marked now: logged and counted once, left out of merge selection, and the rest goes on. */
+static void test_damaged_part_no_starvation(const char *scratch)
+{
+    char dir[600], log[700], p1[256], pfx[64], left[256];
+    snprintf(dir, sizeof dir, "%s/damage-merge-starve", scratch);
+    snprintf(log, sizeof log, "%s/damage-merge-starve.log", scratch);
+    rm_rf(dir);
+    tsdb_options o = opts();
+    o.merge_threads = 1;
+    o.merge_idle_s = 2; /* in whole seconds: not before the damage below */
+    o.wal_max_batch_rows = 100;
+    o.partition_classes = 0;
+    tsdb *db;
+    tsdb_sid a, c;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "damaged", &a));
+    OK(tsdb_series(db, "expiring", &c));
+    int64_t now = wall_ms(), yday = (now / DAY_MS - 1) * DAY_MS + 3600000, old = (now / DAY_MS - 30) * DAY_MS + 3600000;
+    insert_at(db, a, yday, 640);
+    insert_at(db, a, yday + 640 * 1000, 640);
+    snprintf(pfx, sizeof pfx, "p%lld_", (long long)(yday / DAY_MS));
+    CHECK(find_file(dir, pfx, ".part", p1, sizeof p1));
+    part_footer ft = read_footer(dir, p1);
+    fflush(stderr);
+    int saved = dup(2), lf = open(log, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    CHECK(saved >= 0 && lf >= 0 && dup2(lf, 2) == 2);
+    flip(dir, p1, (off_t)(ft.index_off + ft.index_len - 8));
+    insert_at(db, c, old, 640);
+    snprintf(pfx, sizeof pfx, "p%lld_", (long long)(old / DAY_MS));
+    usleep(4000000); /* the partition of yesterday is idle: its merge fails on the index check */
+    OK(tsdb_set_retention(db, c, DAY_MS));
+    struct part_count pc = {old / DAY_MS, 1};
+    for (int i = 0; i < 60 && pc.n; i++) { /* the part list, not the files: a rewrite renames them */
+        usleep(100000);
+        pc.n = 0;
+        OK(tsdb_foreach_part(db, count_partition, &pc));
+    }
+    CHECK(pc.n == 0); /* the expired partition went, though a merge keeps failing elsewhere */
+    CHECK(!find_file(dir, pfx, ".part", left, sizeof left));
+    RC(tsdb_optimize(db), TSDB_ERR_CORRUPT); /* the damaged partition is left out, and said so */
+    tsdb_stats st;
+    OK(tsdb_get_stats(db, &st));
+    tsdb_close(db);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    close(lf);
+    CHECK(st.broken_parts == 1);
+    FILE *f = fopen(log, "r");
+    int lines = 0;
+    char line[2048];
+    while (f && fgets(line, sizeof line, f))
+        lines += strstr(line, "no longer matches the checksum") != NULL;
+    if (f)
+        fclose(f);
+    if (lines != 1) {
+        fprintf(stderr, "FAIL: the damaged index was reported %d times, not once\n", lines);
+        failures++;
+    }
+    printf("  a part that fails the merge's index check is reported once and left out; retention drops go on\n");
+    unlink(log);
+    rm_rf(dir);
+}
+
+/* Copies what a follower in dst may see of the writer's directory src: parts (linked) and the small files, SERIES
+ * only up to `series_bytes` (its last records still in the writer's page cache, say), and no WAL. */
+static void mirror(const char *src, const char *dst, off_t series_bytes)
+{
+    mkdir(dst, 0755);
+    DIR *d = opendir(src);
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        const char *n = e->d_name;
+        char from[1024], to[1024];
+        path(from, sizeof from, src, n);
+        path(to, sizeof to, dst, n);
+        if (n[0] == '.' || !strncmp(n, "wal_", 4) || !strcmp(n, "LOCK") || !strncmp(n, "tmp", 3) ||
+            !strncmp(n, "retired_", 8))
+            continue;
+        if (n[0] == 'p' && strstr(n, ".part")) {
+            if (link(from, to) != 0 && errno != EEXIST)
+                CHECK(!"link");
+            continue;
+        }
+        off_t len = file_size(src, n);
+        if (len < 0 || e->d_type == DT_DIR) {
+            fprintf(stderr, "mirror: %s skipped (size %lld)\n", n, (long long)len);
+            continue;
+        }
+        if (!strcmp(n, "SERIES") && series_bytes < len)
+            len = series_bytes;
+        uint8_t *buf = malloc((size_t)len + 1);
+        file_pread(src, n, 0, buf, (size_t)len);
+        int fd = open(to, O_WRONLY | O_CREAT, 0644);
+        CHECK(fd >= 0 && pwrite(fd, buf, (size_t)len, 0) == (ssize_t)len && ftruncate(fd, len) == 0);
+        if (fd >= 0)
+            close(fd);
+        free(buf);
+    }
+    if (d)
+        closedir(d);
+}
+
+/* n4. A follower's patience for a series SERIES lacks ran from the start of the gap, which a writer creating series
+ * steadily keeps open for good (each MANIFEST counts a record or two not yet visible): after the patience every
+ * refresh failed, and the view froze. It runs per record now, from when the first missing one went missing; a
+ * writer without fsync has its views taken meanwhile. In one process: the follower reads a copy of the writer's
+ * files whose SERIES lags three records behind. */
+static void test_follower_steady_creation(const char *scratch)
+{
+    char dir[600], fdir[700];
+    snprintf(dir, sizeof dir, "%s/damage-steady", scratch);
+    snprintf(fdir, sizeof fdir, "%s/damage-steady-follower", scratch);
+    for (int sync = 0; sync <= 1; sync++) {
+        rm_rf(dir);
+        rm_rf(fdir);
+        tsdb_options o = opts();
+        o.fsync = sync;
+        o.wal_max_batch_rows = 10; /* straight to parts */
+        o.partition_classes = 0;
+        tsdb *w, *f;
+        tsdb_sid s0, id;
+        OK(tsdb_open(dir, &o, &w));
+        OK(tsdb_series(w, "s0000", &s0));
+        int64_t t = T0;
+        insert_at(w, s0, t, 20);
+        t += 20 * 1000;
+        mirror(dir, fdir, file_size(dir, "SERIES"));
+        OK(open_reader(fdir, 0, &f));
+        int rc;
+        long first = count_rows(f, s0, &rc);
+        CHECK(first == 20);
+        int fails = 0, n = 1;
+        long seen = first;
+        /* 3.6 s, longer than the 2 s patience; each record goes missing for about 0.3 s */
+        for (int tick = 0; tick < 36; tick++, n++) {
+            char name[32];
+            snprintf(name, sizeof name, "s%04d", n); /* records of 16 bytes */
+            OK(tsdb_series(w, name, &id));
+            insert_at(w, id, T0, 20);
+            insert_at(w, s0, t, 20);
+            t += 20 * 1000;
+            OK(tsdb_flush(w));
+            mirror(dir, fdir, MAX(16, file_size(dir, "SERIES") - 3 * 16)); /* never below what it read */
+            fails += tsdb_refresh(f) != 0;
+            seen = count_rows(f, s0, &rc);
+            usleep(100000);
+        }
+        if (fails) {
+            fprintf(stderr, "FAIL: steady creation (fsync %d): %d refreshes failed\n", sync, fails);
+            failures++;
+        }
+        if (!sync)
+            CHECK(seen >= first + 30 * 20); /* the views went on: rows of s0 kept arriving */
+        /* one record that stays missing is still reported after the patience (a syncing writer's) */
+        rc = 0;
+        for (int i = 0; sync && i < 40 && rc == 0; i++) {
+            usleep(100000);
+            rc = tsdb_refresh(f);
+        }
+        if (sync)
+            RC(rc, TSDB_ERR_CORRUPT);
+        mirror(dir, fdir, file_size(dir, "SERIES"));
+        OK(tsdb_refresh(f));
+        CHECK(count_rows(f, s0, &rc) == 20 + 36 * 20);
+        tsdb_close(f);
+        tsdb_close(w);
+    }
+    printf("  a writer creating series steadily: followers neither fail nor freeze; a record missing for good is "
+           "reported\n");
+    rm_rf(dir);
+    rm_rf(fdir);
+}
+
+struct seg_crash {
+    tsdb *db;
+    tsdb_sid id;
+};
+
+static void insert_then_die(void *arg)
+{
+    struct seg_crash *c = arg;
+    for (int r = 0; r < 3; r++)
+        insert_at(c->db, c->id, T0 + (100 + r * 10) * 1000, 5);
+    _exit(0); /* a crash in the middle of the flush: segment 1 not in parts, segment 2 with records */
+}
+
+/* A child writes three records to WAL segment 1, starts a flush (segment 2 created, segment 1 synced to its end),
+ * writes three records to segment 2 while the flush places its rows, and dies before the flush lists a part. */
+static void crash_with_two_segments(const char *dir)
+{
+    rm_rf(dir);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(20);
+        tsdb_options o = opts();
+        o.fsync = 1;
+        struct seg_crash c;
+        if (tsdb_open(dir, &o, &c.db) || tsdb_series(c.db, "wal.series", &c.id))
+            _exit(1);
+        for (int r = 0; r < 3; r++)
+            insert_at(c.db, c.id, T0 + r * 10 * 1000, 5);
+        tsdb_test_midplace(c.db, insert_then_die, &c);
+        tsdb_flush(c.db);
+        _exit(2);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+/* n5. The torn end of a WAL segment that a later segment with records follows was cut like a torn append, losing
+ * acknowledged rows: a power loss cannot do that, since each segment is synced to its end before the next takes
+ * rows (wal_check_order). Refused now, with nothing changed; a torn end of the newest segment is still cut. */
+static void test_wal_torn_before_later(const char *scratch)
+{
+    char dir[600], s1[64], s2[64];
+    snprintf(dir, sizeof dir, "%s/damage-wal-order", scratch);
+    snprintf(s1, sizeof s1, "wal_%016x.log", 1);
+    snprintf(s2, sizeof s2, "wal_%016x.log", 2);
+    crash_with_two_segments(dir);
+    CHECK(file_size(dir, s1) == 3 * (WAL_HDR + 5 * WAL_ROW) && file_size(dir, s2) == 3 * (WAL_HDR + 5 * WAL_ROW));
+    CHECK(rows_of(dir, "wal.series") == 30); /* the control: both replayed */
+
+    crash_with_two_segments(dir);
+    off_t len = file_size(dir, s1);
+    cut(dir, s1, len - 7); /* the last record of segment 1 torn */
+    RC(try_open(dir), TSDB_ERR_CORRUPT);
+    CHECK(file_size(dir, s1) == len - 7 && file_size(dir, s2) == len);
+    char m[700];
+    path(m, sizeof m, dir, s1);
+    CHECK(unlink(m) == 0); /* what the message says to do to accept the loss */
+    CHECK(rows_of(dir, "wal.series") == 15);
+
+    crash_with_two_segments(dir);
+    cut(dir, s2, file_size(dir, s2) - 7); /* the newest segment's end: a torn append */
+    CHECK(rows_of(dir, "wal.series") == 25);
+    printf("  a torn WAL segment followed by one with records fails the open; the newest one's torn end is cut\n");
+    rm_rf(dir);
+}
+
+/* i6. A follower that read the last SERIES record kept its name after the writer cut that record (damaged at rest,
+ * taken for a torn tail) and handed its id to a new name: SERIES shorter than what it read, or the same size with
+ * another record there. A reload reads the last record again now, and the refresh reports it after the patience. */
+static void test_follower_series_rewritten(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-series-rewritten", scratch);
+    rm_rf(dir);
+    tsdb_options o = opts(); /* no fsync: MANIFEST does not prove the last record, and the writer cuts it */
+    o.wal_max_batch_rows = 10;
+    tsdb *w, *f;
+    tsdb_sid id;
+    OK(tsdb_open(dir, &o, &w));
+    for (int s = 0; s < 4; s++) {
+        char name[32];
+        snprintf(name, sizeof name, "sensor_%d", s);
+        OK(tsdb_series(w, name, &id));
+        if (s < 3) /* sensor_3 has no rows: nothing else proves its record */
+            insert_at(w, id, T0, 100);
+    }
+    OK(tsdb_flush(w));
+    OK(open_reader(dir, 0, &f));
+    OK(tsdb_series_lookup(f, "sensor_3", &id));
+    tsdb_close(w);
+    flip(dir, "SERIES", file_size(dir, "SERIES") - 1);
+    OK(tsdb_open(dir, &o, &w)); /* cuts sensor_3 */
+    int rc = 0;
+    for (int i = 0; i < 40 && rc == 0; i++) {
+        usleep(100000);
+        rc = tsdb_refresh(f);
+    }
+    RC(rc, TSDB_ERR_CORRUPT); /* shorter than what it read */
+    OK(tsdb_series(w, "sensor_X", &id)); /* the same id, in a record of the same size */
+    OK(tsdb_flush(w));
+    RC(tsdb_refresh(f), TSDB_ERR_CORRUPT);
+    tsdb_close(f);
+    OK(open_reader(dir, 0, &f)); /* a new reader reads what is there */
+    RC(tsdb_series_lookup(f, "sensor_3", &id), TSDB_ERR_NOTFOUND);
+    OK(tsdb_series_lookup(f, "sensor_X", &id));
+    tsdb_close(f);
+    tsdb_close(w);
+    printf("  a follower notices SERIES cut below, or rewritten at, the last record it read\n");
+    rm_rf(dir);
+}
+
 int main(int argc, char **argv)
 {
     const char *scratch = argc > 1 ? argv[1] : "/tmp";
@@ -1807,6 +2258,12 @@ int main(int argc, char **argv)
     test_series_cut_under_wal(base);
     test_refused_open_keeps_files(base);
     test_series_gap_follower(base);
+    test_records_prove_series(base);
+    test_retention_damaged_index(base);
+    test_damaged_part_no_starvation(base);
+    test_follower_steady_creation(base);
+    test_wal_torn_before_later(base);
+    test_follower_series_rewritten(base);
     test_observe_damaged_runs(base);
     test_merge_index_damage(base);
     test_series_wal_follower(base);

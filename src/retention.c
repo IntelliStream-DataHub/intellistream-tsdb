@@ -100,6 +100,7 @@ static int ret_load(eng *db, bool writer)
         memcpy(&series, buf + pos + 4, 4);
         memcpy(&limit, buf + pos + 8, 8);
         rc = ret_put_locked(db, series, limit);
+        db->ret_ids = MAX(db->ret_ids, (uint64_t)series + 1); /* tsdb_set_retention refuses ids SERIES lacks: the open checks */
     }
     for (size_t q = pos + RET_REC; rc == 0 && q + RET_REC <= size; q += RET_REC) {
         if (rec_ok(buf + q, q)) {
@@ -107,10 +108,12 @@ static int ret_load(eng *db, bool writer)
             rc = TSDB_ERR_CORRUPT;
         }
     }
-    if (writer && rc == 0 && pos < size && (rc = tail_confirm(db->dirfd, RET_FILE, buf + pos, pos, size - pos)) == 0)
-        fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes at offset %zu\n", RET_FILE, size - pos, pos);
-    if (writer)
-        db->ret_off = pos; /* a torn tail is overwritten by the next append */
+    if (writer && rc == 0 && pos < size)
+        rc = tail_confirm(db->dirfd, RET_FILE, buf + pos, pos, size - pos);
+    if (writer) {
+        db->ret_off = pos; /* a torn tail is cut by ret_cut_tail once the open's checks passed */
+        db->ret_size = size;
+    }
     pthread_mutex_unlock(&db->ret_lock);
     free(buf);
     return rc;
@@ -124,6 +127,24 @@ int ret_open(eng *db, bool read_only)
 }
 
 int ret_reload(eng *db) { return ret_load(db, false); }
+
+/* As SERIES's (series_cut_tail): only after the open's checks passed, so a refused open leaves the file as it was,
+ * and logged only when something is cut. The next append would overwrite the tail anyway; cutting it keeps a reader
+ * from ever seeing a torn record followed by a valid one. */
+int ret_cut_tail(eng *db)
+{
+    if (db->ret_size <= db->ret_off)
+        return 0;
+    fprintf(stderr, "tsdb: %s: cutting a torn tail of %llu bytes at offset %llu\n", RET_FILE,
+            (unsigned long long)(db->ret_size - db->ret_off), (unsigned long long)db->ret_off);
+    int fd = openat(db->dirfd, RET_FILE, O_WRONLY | O_CLOEXEC);
+    int rc = fd < 0 || ftruncate(fd, (off_t)db->ret_off) != 0 ? TSDB_ERR_IO : 0;
+    if (fd >= 0)
+        close(fd);
+    if (rc == 0)
+        db->ret_size = db->ret_off;
+    return rc;
+}
 
 void ret_close(eng *db)
 {

@@ -301,6 +301,7 @@ static int cls_load(eng *db, bool confirm)
         int64_t from;
         memcpy(&from, buf + pos + 8, 8);
         rc = apply_locked(db, load32(buf + pos + 4), from, (int)load32(buf + pos + 16));
+        db->cls_ids = MAX(db->cls_ids, (uint64_t)load32(buf + pos + 4) + 1); /* the writer's open checks these */
         if (rc == TSDB_ERR_CORRUPT)
             fprintf(stderr, "tsdb: %s: a record at offset %zu goes back in time\n", CLS_FILE, base + pos);
     }
@@ -995,6 +996,10 @@ int cls_observe(eng *db, part *p)
 {
     if (!db->cls_on || db->opt.read_only || p->ng == 0)
         return 0;
+    /* the checks below catch a run table that damage made impossible, not one that names another valid series in
+     * order: only the checksum does, and a class record is for good */
+    if (!part_checked(db, p, "measuring series rates"))
+        return TSDB_ERR_CORRUPT;
     int64_t lo, hi;
     partition_range(db, p->partition, &lo, &hi);
     double len = (double)hi - (double)lo;

@@ -847,9 +847,17 @@ damage into silently missing or shifted data:
   to a granule; a merge hashes each source's index again before it uses it
   (about 0.3% of the part) and fails on a mismatch rather than write damaged
   statistics or series under the new part's fresh hash, so the damage stays
-  in the source part, which the next open refuses. Measuring a partition's
-  series rates (`cls_observe`) skips runs naming a series beyond SERIES or out
-  of order, so such damage writes no class record.
+  in the source part, which the next open refuses. A retention drop, which
+  retires a whole partition for good, checks the index of each of its parts
+  the same way and decides again from the checked bytes, and so does
+  measuring a partition's series rates (`cls_observe`, which also skips runs
+  naming a series beyond SERIES or out of order) before it writes a class
+  record. A part that fails such a check is marked: logged once, counted in
+  `broken_parts`, left out of merges, TTL rewrites and drops (its partition
+  stays as it is; `tsdb_optimize` merges the rest and returns
+  `TSDB_ERR_CORRUPT`), and refused by the next open. Every retention change
+  does not hash every index: that would hold the part list's lock for a pass
+  over all of them, and only a drop needs it.
 - **Series in parts.** Every series a part holds is in SERIES: its record is
   synced (`dict_append`) before its id is handed out, and so before any row of
   it can reach a part. A part that names a series beyond the end of SERIES
@@ -875,13 +883,41 @@ damage into silently missing or shifted data:
   order (the NFS client's writeback, up to 30 s by default), so a missing
   record is not called damage there; the patience is a minute and the log
   line says the record may still be on its way or lost with a crash of the
-  writer's host.
+  writer's host. The patience runs per record: from when the first record
+  SERIES lacks went missing, not from the start of the gap, which a writer
+  creating series steadily keeps open for good. A follower of a writer
+  without fsync takes each new view meanwhile (the series SERIES shows are
+  complete; the others' rows show once their names arrive), and past the
+  patience it logs and counts the missing record but goes on, since writeback
+  has no deadline. A follower also reads the last SERIES record it took again
+  with every reload: a file shorter than what it read, or another record in
+  that place (a writer cut it as torn and gave its id to a new name), keeps
+  the previous view and is reported after the patience.
+- **Other records prove SERIES and STATES records.** RETENTION records name
+  series that existed (`tsdb_set_retention` refuses others), CLASSES records
+  too, and a syncing writer's MANIFEST counts only synced SERIES and STATES
+  records (`series N`, `states N`). The open of a writer refuses when one of
+  them names a series or counts records the dictionary lacks: cut as a torn
+  tail, the record's id would go to the next name, which would inherit its
+  retention limit (its rows hidden and dropped) or its class, or (STATES) the
+  old rows' state codes. State values in parts and the WAL prove nothing:
+  inserts take any code, not only those `tsdb_state` handed out.
+- **WAL segments are synced in order.** Every write to a segment holds the WAL
+  writer role and is synced before the role is given up, and a rotation holds
+  the role until the rest of the old segment is written and synced, so once a
+  segment holds a record every older one was durable to its end. A torn end of
+  a segment that a later segment with records follows is therefore damage to
+  acknowledged rows, not a torn append: the open refuses it (unless parts hold
+  that segment's rows already) and names the segment to move aside.
 - **A refused open changes nothing.** The open of a writer finds torn tails
-  (SERIES, STATES, CLASSES, the WAL) before the checks above, which can prove
-  that a "torn" record was acknowledged. It cuts them only after every check
-  passed (the parts, CLASSES, and every WAL segment, checked before the replay
-  writes anything), so a refused open leaves each file byte for byte as it
-  was: a damaged last record can still be repaired (a single flipped bit can
+  (SERIES, STATES, CLASSES, RETENTION, the WAL) before the checks above, which
+  can prove that a "torn" record was acknowledged. It cuts them only after
+  every check passed (the parts, CLASSES, RETENTION, MANIFEST's counts, and
+  every WAL segment, checked before the replay writes anything), so a refused
+  open leaves each file byte for byte as it was (an open that fails later, in
+  the replay, on an I/O error or a second read of a segment that disagrees with
+  the first, has cut the tails and replayed the segments before it; nothing
+  acknowledged is lost by that): a damaged last record can still be repaired (a single flipped bit can
   be flipped back) or restored. The refusal names the way out: restore SERIES
   from a backup or snapshot (a copy with at least as many records as the
   message says), or move the named WAL segment or part aside to accept the
@@ -896,8 +932,14 @@ damage into silently missing or shifted data:
   WAL or an append-only file look the same, so such damage is cut, and
   acknowledged rows in that WAL record (or a retention or class record) are
   lost; the cut is logged (`cutting a torn tail`). A cut SERIES record is
-  noticed only through its series' rows (above): a series without any is
-  simply gone. On ext4 or XFS, which keep no checksums of the
+  noticed only through its series' rows and the records above: a series
+  without any, made by a writer without fsync, is simply gone. A CLASSES
+  record damaged at rest and cut breaks "a replay maps each WAL row to the
+  key its flush used": if rows at or after its T were deleted and merged into
+  an empty part, and their WAL segment is still on disk after a crash, the
+  replay puts them back under the old key. The check above does not cover it
+  (the record names a series SERIES has); it takes damage, a crash and a
+  segment not yet removed together. On ext4 or XFS, which keep no checksums of the
   data, run with `verify_checksums`, and with `pin_index` where the memory
   above is affordable; on ZFS the file system catches both.
   `make jepsen` runs the nemeses `misdirect` (misdirected writes, reads and
