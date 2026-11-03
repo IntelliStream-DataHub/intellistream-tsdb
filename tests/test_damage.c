@@ -950,6 +950,245 @@ static void test_series_check_races(const char *scratch)
     rm_rf(vol);
 }
 
+/* A child makes "wal.a" in the root and three series in vol (or "wal.b" in the root when vol is NULL), writes rows
+ * of each, and dies without closing: the rows live only in the WAL of their directory. */
+static void crash_with_series(const char *dir, const char *vol)
+{
+    rm_rf(dir);
+    if (vol)
+        rm_rf(vol);
+    pid_t pid = fork();
+    if (pid == 0) {
+        tsdb_options o = opts();
+        tsdb *db;
+        tsdb_sid id;
+        int64_t ts[WAL_RECROWS];
+        float v[WAL_RECROWS];
+        for (int i = 0; i < WAL_RECROWS; i++)
+            ts[i] = T0 + i * 1000, v[i] = (float)i;
+        if (tsdb_open(dir, &o, &db) || tsdb_series(db, "wal.a", &id) || tsdb_insert_series(db, id, ts, v, WAL_RECROWS))
+            _exit(1);
+        for (int s = 0; s < (vol ? 3 : 1); s++) {
+            char name[32];
+            snprintf(name, sizeof name, vol ? "vol.s%d" : "wal.b", s);
+            if ((vol ? tsdb_series_at(db, name, vol, &id) : tsdb_series(db, name, &id)) ||
+                tsdb_insert_series(db, id, ts, v, WAL_RECROWS))
+                _exit(1);
+        }
+        _exit(0); /* no tsdb_close: a crash */
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+static void junk_last_series(const char *dir, const char *name)
+{
+    off_t size = file_size(dir, "SERIES");
+    size_t rs = rec_size(strlen(name));
+    uint8_t junk[64];
+    for (size_t i = 0; i < sizeof junk; i++)
+        junk[i] = (uint8_t)(i * 37 + 11);
+    file_pwrite(dir, "SERIES", size - (off_t)rs, junk, rs);
+}
+
+/* Damage to the last SERIES record looks like a torn append, and the open cut it; a series whose rows were only in
+ * the WAL then had them skipped by the replay as rows "of a series never created": acknowledged writes gone without
+ * a word. A series' record is synced before its id is handed out, so such rows mean damage: the open fails, every
+ * time (the WAL segment stays), and in each volume against that volume's SERIES. */
+static void test_series_cut_under_wal(const char *scratch)
+{
+    char dir[600], vol[700], wal[256];
+    snprintf(dir, sizeof dir, "%s/damage-series-wal", scratch);
+    snprintf(vol, sizeof vol, "%s-vol", dir);
+
+    crash_with_series(dir, NULL);
+    CHECK(rows_of(dir, "wal.b") == WAL_RECROWS); /* undamaged: replayed */
+
+    for (int how = 0; how < 2; how++) {
+        crash_with_series(dir, NULL);
+        CHECK(find_file(dir, "wal_", ".log", wal, sizeof wal));
+        off_t wal_len = file_size(dir, wal);
+        if (how == 0)
+            junk_last_series(dir, "wal.b");
+        else
+            cut(dir, "SERIES", file_size(dir, "SERIES") - 3); /* a torn last record */
+        RC(try_open(dir), TSDB_ERR_CORRUPT);
+        RC(try_open(dir), TSDB_ERR_CORRUPT); /* and again: the segment was neither replayed nor cut */
+        CHECK(file_size(dir, wal) == wal_len);
+    }
+
+    /* volumes: the volume has more series than the root, all with rows only in its WAL */
+    crash_with_series(dir, vol);
+    OK(try_open(dir));
+    crash_with_series(dir, vol);
+    junk_last_series(vol, "vol.s2");
+    RC(try_open(dir), TSDB_ERR_CORRUPT);
+    printf("  SERIES cut below series with rows only in the WAL: the open fails, in each volume\n");
+    rm_rf(dir);
+    rm_rf(vol);
+}
+
+/* A writer with rows of a new series in its WAL opens between a reader's read of SERIES and its replay of the WAL
+ * (a reader opens without MANIFEST only before the first writer published one): the reader reads SERIES again. */
+static tsdb *wal_writer;
+static void wal_writer_in_between(void *arg)
+{
+    const char *dir = arg;
+    tsdb_test_before_parts(NULL, NULL);
+    tsdb_options o = opts();
+    tsdb_sid id;
+    int64_t ts[WAL_RECROWS];
+    float v[WAL_RECROWS];
+    for (int i = 0; i < WAL_RECROWS; i++)
+        ts[i] = T0 + i * 1000, v[i] = 4;
+    OK(tsdb_open(dir, &o, &wal_writer));
+    OK(tsdb_series(wal_writer, "race.wal", &id));
+    OK(tsdb_insert_series(wal_writer, id, ts, v, WAL_RECROWS)); /* kept open: the rows stay in its WAL */
+}
+
+struct series_maker {
+    tsdb *w;
+    int n;
+    atomic_int done;
+};
+
+static void *series_maker_main(void *arg)
+{
+    struct series_maker *sm = arg;
+    int64_t ts[3] = {T0, T0 + 1000, T0 + 2000};
+    float v[3] = {1, 2, 3};
+    for (int s = 0; s < sm->n; s++) {
+        char name[32];
+        tsdb_sid id;
+        snprintf(name, sizeof name, "race.f%d", s);
+        OK(tsdb_series(sm->w, name, &id));
+        OK(tsdb_insert_series(sm->w, id, ts, v, 3));
+    }
+    atomic_store(&sm->done, 1);
+    return NULL;
+}
+
+/* Followers take WAL rows of a series the writer created a moment ago: they read SERIES again before they judge,
+ * and never report damage for it. One whose SERIES stays short of a WAL row's series keeps the rows it showed,
+ * shows none of that record or later ones, and reports the damage once it outlasts the patience for NFS; once
+ * SERIES is whole again, the rows appear. */
+static void test_series_wal_follower(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-series-walfollow", scratch);
+
+    /* a reader without MANIFEST that raced a writer */
+    crash_with_series(dir, NULL);
+    OK(try_open(dir)); /* the rows to parts */
+    char mf[700];
+    snprintf(mf, sizeof mf, "%s/MANIFEST", dir);
+    OK(unlink(mf));
+    tsdb_test_before_parts(wal_writer_in_between, dir);
+    tsdb_options ro = opts();
+    ro.read_only = 1;
+    tsdb *r = NULL;
+    OK(tsdb_open(dir, &ro, &r));
+    tsdb_test_before_parts(NULL, NULL);
+    if (r) {
+        tsdb_sid late;
+        int rc;
+        OK(tsdb_series_lookup(r, "race.wal", &late));
+        CHECK(count_rows(r, late, &rc) == WAL_RECROWS && rc == 0);
+        tsdb_close(r);
+    }
+    if (wal_writer)
+        OK(tsdb_close(wal_writer));
+    wal_writer = NULL;
+
+    /* followers that refresh and open while the writer creates series */
+    rm_rf(dir);
+    tsdb_options o = opts();
+    tsdb_options fo = opts();
+    fo.follow = 1;
+    fo.read_only = 1;
+    fo.refresh_ms = 20;
+    struct series_maker sm = {.n = 3000};
+    tsdb *f;
+    OK(tsdb_open(dir, &o, &sm.w));
+    OK(tsdb_open(dir, &fo, &f));
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, series_maker_main, &sm) == 0);
+    int refreshes = 0, opens = 0;
+    while (!atomic_load(&sm.done)) {
+        OK(tsdb_refresh(f));
+        refreshes++;
+        if (refreshes % 4 == 0) {
+            tsdb *f2;
+            OK(tsdb_open(dir, &fo, &f2));
+            OK(tsdb_refresh(f2));
+            OK(tsdb_close(f2));
+            opens++;
+        }
+    }
+    pthread_join(th, NULL);
+    OK(tsdb_refresh(f));
+    tsdb_stats st;
+    OK(tsdb_get_stats(f, &st));
+    CHECK(st.follow_errors == 0);
+    for (int s = 0; s < sm.n; s++) {
+        char name[32];
+        tsdb_sid id;
+        int rc;
+        snprintf(name, sizeof name, "race.f%d", s);
+        OK(tsdb_series_lookup(f, name, &id));
+        CHECK(count_rows(f, id, &rc) == 3);
+    }
+    OK(tsdb_close(f));
+    printf("  followers: %d refreshes and %d opens while %d series were created, no damage reported\n", refreshes,
+           opens, sm.n);
+
+    /* SERIES short of a series with rows in the WAL */
+    tsdb_sid a, b;
+    int64_t ts[WAL_RECROWS];
+    float v[WAL_RECROWS];
+    for (int i = 0; i < WAL_RECROWS; i++)
+        ts[i] = T0 + i * 1000, v[i] = 5;
+    OK(tsdb_series(sm.w, "follow.a", &a));
+    OK(tsdb_insert_series(sm.w, a, ts, v, WAL_RECROWS));
+    OK(tsdb_open(dir, &fo, &f));
+    OK(tsdb_refresh(f));
+    off_t size = file_size(dir, "SERIES");
+    OK(tsdb_series(sm.w, "follow.b", &b));
+    size_t rs = rec_size(strlen("follow.b"));
+    uint8_t good[64];
+    file_pread(dir, "SERIES", size, good, rs);
+    junk_last_series(dir, "follow.b");
+    OK(tsdb_insert_series(sm.w, b, ts, v, WAL_RECROWS));
+    OK(tsdb_insert_series(sm.w, a, (int64_t[]){T0 + 100000}, (float[]){6}, 1)); /* after it: not shown either */
+    int rc = tsdb_refresh(f);
+    CHECK(rc == 0); /* within the patience */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    double waited = 0;
+    while ((rc = tsdb_refresh(f)) == 0 && waited < 10) {
+        usleep(50000);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        waited = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    }
+    RC(rc, TSDB_ERR_CORRUPT);
+    CHECK(waited >= 1.5);
+    OK(tsdb_get_stats(f, &st));
+    CHECK(st.follow_errors > 0);
+    tsdb_sid fb;
+    CHECK(count_rows(f, a, &rc) == WAL_RECROWS); /* what it showed stays */
+    CHECK(tsdb_series_lookup(f, "follow.b", &fb) == TSDB_ERR_NOTFOUND);
+    file_pwrite(dir, "SERIES", size, good, rs); /* whole again */
+    OK(tsdb_refresh(f));
+    OK(tsdb_series_lookup(f, "follow.b", &fb));
+    CHECK(count_rows(f, fb, &rc) == WAL_RECROWS);
+    CHECK(count_rows(f, a, &rc) == WAL_RECROWS + 1);
+    printf("  follower: SERIES short of a WAL row's series reported after %.1f s, the rows kept for later\n", waited);
+    OK(tsdb_close(f));
+    OK(tsdb_close(sm.w));
+    rm_rf(dir);
+}
+
 /* ------------------------------------------------------------- shifted records */
 
 /* A valid record at another offset (stale data, a misdirected write) is
@@ -1231,6 +1470,8 @@ int main(int argc, char **argv)
     test_index_after_open(base);
     test_series_cut_under_parts(base);
     test_series_check_races(base);
+    test_series_cut_under_wal(base);
+    test_series_wal_follower(base);
     test_misread_tail(base);
     test_read_errors(base);
     test_parts(base);

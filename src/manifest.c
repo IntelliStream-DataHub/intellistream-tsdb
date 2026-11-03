@@ -293,7 +293,8 @@ static int tail_segment(eng *db, wal_tail *t)
     }
     size_t pos = 0;
     int rc = 0;
-    bool reloaded = false;
+    bool reloaded = false, unknown = false;
+    uint32_t unknown_id = 0;
     size_t n, rec;
     /* a record that does not check out is still being written: next poll */
     while (rc == 0 && (rec = wal_record(buf + pos, (size_t)got - pos, t->seq, t->off + pos, &n)) != 0) {
@@ -301,17 +302,24 @@ static int tail_segment(eng *db, wal_tail *t)
         uint32_t id;
         int64_t ts;
         uint64_t slot;
-        for (size_t i = 0; i < n && !reloaded; i++, r += WAL_ROW) {
+        for (size_t i = 0; i < n && rc == 0 && !unknown; i++, r += WAL_ROW) {
             wal_row(r, &id, &ts, &slot);
-            if (id >= eng_series_count(db)) {
+            if (id >= eng_series_count(db) && !reloaded) {
                 /* created after our last look; without the names the rows would be lost */
                 rc = series_reload(&db->series, db->dirfd);
                 if (rc == 0)
                     rc = series_reload(&db->states, db->dirfd);
                 reloaded = true;
             }
+            if (rc == 0 && id >= eng_series_count(db)) {
+                /* Not in SERIES read after this record: its record was synced before the id was handed out, so
+                 * SERIES is damaged, unless this poll reloaded it already for an earlier record or NFS shows it
+                 * late. The record and those after it wait (next poll reads SERIES again); never dropped. */
+                unknown = true;
+                unknown_id = id;
+            }
         }
-        if (rc)
+        if (rc || unknown)
             break;
         /* A record holds whole inserts (the writer appends an insert to the WAL
          * buffer in one step, and writes what it took of it as one record): its
@@ -327,14 +335,19 @@ static int tail_segment(eng *db, wal_tail *t)
         pos += rec;
     }
     /* A bad record with a valid one after it is damage, unless the writer's
-     * appends reach us out of order (NFS): reported once it outlasts that. */
-    if (rc == 0 && pos < (size_t)got && wal_valid_after(buf, (size_t)got, pos, t->seq, t->off)) {
+     * appends reach us out of order (NFS): reported once it outlasts that.
+     * So is a record of a series SERIES still lacks. */
+    if (rc == 0 && pos < (size_t)got && (unknown || wal_valid_after(buf, (size_t)got, pos, t->seq, t->off))) {
         int64_t now = mono_ms();
         if (t->bad_off != t->off + pos || !t->bad_since) {
             t->bad_off = t->off + pos;
             t->bad_since = now;
         } else if (now - t->bad_since >= follow_patience_ms(db)) {
-            if (!t->reported)
+            if (!t->reported && unknown)
+                fprintf(stderr, "tsdb: follower: WAL segment %s names series %" PRIu32 " at offset %" PRIu64
+                                ", but SERIES has only %" PRIu32 ": SERIES is damaged; its later rows are not shown\n",
+                        name, unknown_id, t->bad_off, eng_series_count(db));
+            else if (!t->reported)
                 fprintf(stderr, "tsdb: follower: WAL segment %s is damaged at offset %" PRIu64
                                 ", before valid records; its later rows are not shown\n", name, t->bad_off);
             t->reported = true;

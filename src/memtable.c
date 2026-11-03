@@ -877,7 +877,7 @@ int wal_open(eng *db)
         size_t pos = 0, n, rec;
         int64_t cached_p = 0;
         uint64_t cached_seq = 0;
-        bool have_cache = false;
+        bool have_cache = false, reloaded = false;
         while (rc == 0 && (rec = wal_record(buf + pos, len - pos, segs[k].seq, pos, &n)) != 0) {
             const uint8_t *r = buf + pos + WAL_HDR;
             for (size_t i = 0; i < n && rc == 0; i++, r += WAL_ROW) {
@@ -885,16 +885,36 @@ int wal_open(eng *db)
                 int64_t ts;
                 uint64_t slot;
                 wal_row(r, &id, &ts, &slot);
+                if (id >= eng_series_count(db) && ro && !reloaded) {
+                    /* a reader read SERIES before this segment: a writer may have created the series since */
+                    rc = series_reload(&db->series, db->dirfd);
+                    reloaded = true;
+                }
+                if (rc == 0 && id >= eng_series_count(db)) {
+                    /* A series' record is synced before its id is handed out, so a WAL row of an id SERIES lacks
+                     * means SERIES lost records: cut as a torn tail at this open (damage to the last records
+                     * looks the same) or overwritten. Its rows are not dropped as those of a series never made. */
+                    fprintf(stderr,
+                            "tsdb: WAL segment %s names series %" PRIu32 " in the record at offset %zu, but SERIES "
+                            "has only %" PRIu32 ": SERIES is damaged\n",
+                            segs[k].name, id, pos, eng_series_count(db));
+                    rc = TSDB_ERR_CORRUPT;
+                    break;
+                }
+                if (rc)
+                    break;
                 int64_t p = partition_of(db, id, ts);
                 if (!have_cache || p != cached_p) {
                     cached_p = p;
                     cached_seq = partition_wal_seq(db, p);
                     have_cache = true;
                 }
-                if (cached_seq >= segs[k].seq || id >= eng_series_count(db))
-                    continue; /* already in a part (or a series that was never created) */
+                if (cached_seq >= segs[k].seq)
+                    continue; /* already in a part */
                 rc = mt_add(m, NULL, id, &ts, &slot, 8, 1, 0);
             }
+            if (rc)
+                break;
             pos += rec;
         }
         if (rc == 0 && pos < len && wal_valid_after(buf, len, pos, segs[k].seq, 0)) {
