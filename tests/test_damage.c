@@ -777,6 +777,117 @@ static void test_index_after_open(const char *scratch)
     rm_rf(dir);
 }
 
+/* SERIES damaged so that no valid record follows the first bad one is cut as a torn tail at the open: a misdirected
+ * write once overwrote all four records of jepsen's SERIES with WAL bytes, the open cut the file to nothing, and
+ * every series and its rows were gone without an error. A part that holds a series SERIES no longer has fails the
+ * open now. */
+static void test_series_cut_under_parts(const char *scratch)
+{
+    char dir[600], part[256];
+    snprintf(dir, sizeof dir, "%s/damage-series-cut", scratch);
+    for (int whole = 0; whole <= 1; whole++) {
+        tsdb_sid id;
+        tsdb *db = open_two_parts(dir, 0, &id, part, sizeof part);
+        tsdb_sid id2;
+        OK(tsdb_series(db, "md.other", &id2)); /* the last record, with rows in a part */
+        int64_t ts[PART_ROWS];
+        float v[PART_ROWS];
+        for (int i = 0; i < PART_ROWS; i++)
+            ts[i] = T0 + i, v[i] = 1;
+        OK(tsdb_insert_series(db, id2, ts, v, PART_ROWS));
+        OK(tsdb_close(db));
+        off_t size = file_size(dir, "SERIES");
+        off_t from = whole ? 0 : size - (off_t)rec_size(strlen("md.other"));
+        uint8_t junk[256];
+        for (size_t i = 0; i < sizeof junk; i++)
+            junk[i] = (uint8_t)(i * 37 + 11);
+        file_pwrite(dir, "SERIES", from, junk, (size_t)(size - from));
+        RC(try_open(dir), TSDB_ERR_CORRUPT);
+    }
+    printf("  SERIES cut below series that parts hold: the open fails\n");
+    rm_rf(dir);
+}
+
+/* src/db.c: in an open that lists the parts itself, just before it does */
+void tsdb_test_before_parts(void (*fn)(void *), void *arg);
+
+/* A writer opens, creates a series and writes a part of it between a reader's read of SERIES and its listing of
+ * the parts (a reader opens without MANIFEST only before the first writer published one). */
+static void writer_in_between(void *arg)
+{
+    const char *dir = arg;
+    tsdb_test_before_parts(NULL, NULL); /* not in the writer's own open */
+    tsdb_options o = opts();
+    o.wal_max_batch_rows = 100; /* straight to a part */
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "race.late", &id));
+    int64_t ts[PART_ROWS];
+    float v[PART_ROWS];
+    for (int i = 0; i < PART_ROWS; i++)
+        ts[i] = T0 + i, v[i] = 2;
+    OK(tsdb_insert_series(db, id, ts, v, PART_ROWS));
+    OK(tsdb_close(db));
+}
+
+/* The check that parts hold only series SERIES has must not refuse a reader that raced a writer: it reads SERIES
+ * again before it judges. Nor may it compare one volume's parts with another's SERIES: ids are local per volume. */
+static void test_series_check_races(const char *scratch)
+{
+    char dir[600], part[256], vol[700];
+    snprintf(dir, sizeof dir, "%s/damage-series-race", scratch);
+    tsdb_sid id;
+    OK(tsdb_close(open_two_parts(dir, 0, &id, part, sizeof part)));
+    char mf[700];
+    snprintf(mf, sizeof mf, "%s/MANIFEST", dir);
+    OK(unlink(mf));
+    tsdb_test_before_parts(writer_in_between, dir);
+    tsdb_options ro = opts();
+    ro.read_only = 1;
+    tsdb *r = NULL;
+    OK(tsdb_open(dir, &ro, &r));
+    tsdb_test_before_parts(NULL, NULL);
+    if (r) {
+        tsdb_sid late;
+        int rc;
+        OK(tsdb_series_lookup(r, "race.late", &late));
+        CHECK(count_rows(r, late, &rc) == PART_ROWS && rc == 0);
+        tsdb_close(r);
+    }
+
+    /* volumes: the second has more series than the root, each with rows in a part */
+    rm_rf(dir);
+    snprintf(vol, sizeof vol, "%s-vol", dir);
+    rm_rf(vol);
+    tsdb_options o = opts();
+    o.wal_max_batch_rows = 100;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    int64_t ts[PART_ROWS];
+    float v[PART_ROWS];
+    for (int i = 0; i < PART_ROWS; i++)
+        ts[i] = T0 + i, v[i] = 3;
+    OK(tsdb_series(db, "root.only", &id));
+    OK(tsdb_insert_series(db, id, ts, v, PART_ROWS));
+    for (int s = 0; s < 3; s++) {
+        char name[32];
+        snprintf(name, sizeof name, "vol.s%d", s);
+        OK(tsdb_series_at(db, name, vol, &id));
+        OK(tsdb_insert_series(db, id, ts, v, PART_ROWS));
+    }
+    OK(tsdb_close(db));
+    OK(try_open(dir));
+    off_t size = file_size(vol, "SERIES");
+    size_t rs = rec_size(strlen("vol.s2"));
+    uint8_t junk[64] = {0x5a};
+    file_pwrite(vol, "SERIES", size - (off_t)rs, junk, rs);
+    RC(try_open(dir), TSDB_ERR_CORRUPT);
+    printf("  that check reads SERIES again for a reader that raced a writer, and judges each volume by its own\n");
+    rm_rf(dir);
+    rm_rf(vol);
+}
+
 /* ------------------------------------------------------------- shifted records */
 
 /* A valid record at another offset (stale data, a misdirected write) is
@@ -1056,6 +1167,8 @@ int main(int argc, char **argv)
     test_wal_follower(base);
     test_shifted(base);
     test_index_after_open(base);
+    test_series_cut_under_parts(base);
+    test_series_check_races(base);
     test_read_errors(base);
     test_parts(base);
     test_part_follower(base);

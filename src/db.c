@@ -302,9 +302,55 @@ static int meta_load_or_create(eng *db, bool read_only)
     return meta_write(db);
 }
 
+/* Every series a part holds rows or tombstones of is in SERIES: its record was synced before the series was used.
+ * A part naming one beyond is damage to SERIES: records cut as a torn tail at its open, where damage to the last
+ * records looks the same (a misdirected write once overwrote all four of a test's), or lost. The open fails rather
+ * than serve those series as never created and their rows as gone. */
+static int parts_check_series(eng *db, bool read_only)
+{
+    uint32_t n = eng_series_count(db);
+    bool reloaded = false;
+    for (size_t i = 0; i < db->nparts; i++) {
+        const part *p = db->parts[i];
+        uint32_t s = p->ix.nruns ? p->ix.rser[p->ix.nruns - 1] : 0; /* runs are in series order: one per part */
+        bool bad = p->ix.nruns && s >= n;
+        for (uint32_t t = 0; !bad && t < p->nt; t++)
+            if ((bad = p->t[t].series >= n))
+                s = p->t[t].series;
+        if (bad && read_only && !reloaded) {
+            /* A reader without MANIFEST read SERIES before it listed the parts: a writer that opened in between
+             * may have created the series since (its record is synced before any part can hold it), so the file
+             * is read again before it is judged. A writer holds the lock: its SERIES cannot grow meanwhile. */
+            int rc = series_reload(&db->series, db->dirfd);
+            if (rc != 0)
+                return rc;
+            n = eng_series_count(db);
+            reloaded = true;
+            i--;
+            continue;
+        }
+        if (bad) {
+            fprintf(stderr, "tsdb: part %s holds series %u, but SERIES has only %u: SERIES is damaged\n", p->name,
+                    s, n);
+            return TSDB_ERR_CORRUPT;
+        }
+    }
+    return 0;
+}
+
+/* test hook (tsdb_test_before_parts): runs in an open that lists the parts itself, just before it does */
+static void (*test_before_parts)(void *);
+static void *test_before_parts_arg;
+void tsdb_test_before_parts(void (*fn)(void *), void *arg)
+{
+    test_before_parts_arg = arg;
+    test_before_parts = fn;
+}
+
 /* Loads every part, removes leftovers of interrupted writes, and removes parts
  * that a merged part covers (a crash between publishing the merged part and
  * deleting its sources leaves both on disk). */
+
 static int load_parts(eng *db, bool read_only)
 {
     DIR *d = fdopendir(dup(db->dirfd));
@@ -511,7 +557,10 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     } else {
         if (!ro && (rc = intents_recover(db)) != 0) /* before tmp files are cleaned up */
             goto fail;
-        if ((rc = load_parts(db, ro)) != 0 || (rc = cls_check_parts(db)) != 0)
+        if (test_before_parts)
+            test_before_parts(test_before_parts_arg);
+        if ((rc = load_parts(db, ro)) != 0 || (rc = parts_check_series(db, ro)) != 0 ||
+            (rc = cls_check_parts(db)) != 0)
             goto fail;
         /* a follower takes WAL rows from the writer's manifest once there is one */
         if (!db->opt.follow && (rc = wal_open(db)) != 0)
