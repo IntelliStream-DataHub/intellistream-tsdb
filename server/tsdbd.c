@@ -27,7 +27,8 @@
  * thread of its own: see metrics.c. Off by default; binds to --listen unless --metrics-bind.
  *
  * --verify-checksums checks each granule's checksum before a query decodes it
- * (off by default: meant for storage without checksums of its own).
+ * (off by default: meant for storage without checksums of its own). Without it, a directory on ext2/3/4 or
+ * XFS, which keep no checksums of the data, gets a line at startup that says so (fs_warn).
  *
  * --port 0 binds a port the kernel chooses; --port-file FILE then holds "PORT PID" (written to a temporary file
  * and renamed once the listener is up; an old FILE is removed at start), and the banner names the real port.
@@ -109,6 +110,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
@@ -2407,6 +2409,26 @@ static long long num_arg(const char *flag, const char *s, long long lo, long lon
     return v;
 }
 
+/* Without --verify-checksums a damaged or misdirected data block decodes to wrong values unless the storage checks
+ * its data itself (ZFS, btrfs). ext2/3/4 and XFS do not, and statfs names them; NFS hides what is behind it, so it
+ * gets no line (production: ZFS behind NFS). One line per volume on such a file system, at startup. */
+static void fs_warn(tsdb *t, int verify)
+{
+    if (verify)
+        return;
+    for (uint32_t i = 0; i < tsdb_volume_count(t); i++) {
+        const char *p = tsdb_volume_path(t, i);
+        struct statfs sf;
+        if (!p || statfs(p, &sf) != 0)
+            continue;
+        const char *fs = sf.f_type == 0xEF53 ? "ext4" : sf.f_type == 0x58465342 ? "XFS" : NULL;
+        if (fs)
+            fprintf(stderr, "tsdbd: %s is on %s, which keeps no checksums of its data, and --verify-checksums is off: "
+                            "a damaged or misdirected data block would be read as wrong values. Turn on "
+                            "--verify-checksums, or use a file system that checks its data (ZFS)\n", p, fs);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = NULL, *addr = "127.0.0.1", *port_file = NULL;
@@ -2620,6 +2642,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: cannot start a thread: %s\n", strerror(rc));
         return 1;
     }
+    fs_warn(db, o.verify_checksums);
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
             max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll");

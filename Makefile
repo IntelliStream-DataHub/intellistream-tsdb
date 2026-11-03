@@ -137,6 +137,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	B=$(B) tests/test_cli_spread.sh
 	B=$(B) tests/test_cli_input.sh
 	B=$(B) tests/test_bench_export.sh
+	B=$(B) tests/test_fs_warning.sh
 	./$(B)/test_limits
 	./$(B)/test_small_parts
 	./$(B)/test_classes

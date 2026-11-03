@@ -9,6 +9,9 @@ disk format and the wire protocol.
 ## [Unreleased]
 
 ### Added
+- tsdbd says at startup when a database or volume directory is on ext2/3/4 or XFS and `--verify-checksums` is
+  off: those file systems keep no checksums of the data, so a damaged or misdirected data block would be read as
+  wrong values. Turn the option on there, or use a file system that checks its data (ZFS).
 - `CONTRIBUTING.md`, `SECURITY.md` and `docs/licenses.md` (the licenses of everything tsdb builds on). The `make dist`
   tarball now carries `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd and liburing are linked into its binaries).
 - Partition classes: each series gets partitions of 1, 7, 28 or 364 base partitions (`partition_ms`), the
