@@ -1,7 +1,7 @@
 # Continuous integration for tsdb. What runs where is described in CONTRIBUTING.md ("CI").
 #
 #   every push to main and every pull request: build-test, asan, tsan, clients, portable, integration, dco (pull requests)
-#   jepsen (about 10 minutes of fault injection) on every push and pull request too, and once a week
+#   jepsen (about 12 minutes of fault injection) on every push and pull request too, and once a week (about 2 hours)
 #
 # Rules this file follows:
 #   - Jobs run directly on ubuntu-24.04 runners (4 CPUs, 16 GB), never in container jobs. Packages come from apt.
@@ -282,15 +282,18 @@ jobs:
   # ------------------------------------------------------------------------------------------------------ jepsen
   jepsen:
     name: jepsen fault injection
-    # On every push and pull request, and once a week: about 10 minutes of kill -9, simulated power loss (the crashfs
-    # LD_PRELOAD shim, built by make), I/O errors and pauses, on both event loops and the workloads kv and classes.
+    # On every push and pull request: about 12 minutes of kill -9, simulated power loss (the crashfs LD_PRELOAD shim,
+    # built by make), I/O errors, pauses, misdirected I/O and damage at rest, on both event loops and the workloads kv
+    # and classes. Once a week the same with every run 5 minutes long (one power seed): about 2 hours on both loops.
     if: >-
       github.event_name != 'schedule' ||
       github.repository == 'IntelliStream-DataHub/intellistream-tsdb'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: ${{ github.event_name == 'schedule' && 200 || 60 }}
     env:
       JEPSEN_DIR: /tmp/tsdb-jepsen-ci
+      JEPSEN_SECONDS: ${{ github.event_name == 'schedule' && '300' || '' }}
+      JEPSEN_SEEDS: ${{ github.event_name == 'schedule' && '1' || '1 2 3' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install packages

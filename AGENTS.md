@@ -11,7 +11,9 @@ make test                 # all unit, integration and server tests
 make test IO=epoll        # server tests on epoll only (where io_uring is disabled)
 make asan                 # the tests under AddressSanitizer + UBSan
 make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
-make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO; workloads kv and classes
+make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO; workloads kv and classes;
+                          # misdirected I/O (verify_checksums on and off) and damage at rest (rot) on kv;
+                          # JEPSEN_SECONDS=300 makes every run that long (the weekly CI run)
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays

@@ -43,7 +43,7 @@ make test               # all unit, crash-recovery and server tests
 make test IO=epoll      # the server tests on epoll only
 make asan               # the tests under AddressSanitizer and UBSan (starts with make clean)
 make tsan               # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
-make jepsen             # fault injection: kill -9, simulated power loss, pauses, disk errors
+make jepsen             # fault injection: kill -9, simulated power loss, pauses, disk errors, misdirected I/O, rot
 make fuzz               # the fuzz harnesses (FUZZ_SECONDS=600 for longer)
 make test-clients       # the Rust, Python and Java clients against build/tsdbd
 make integration-tests  # tsdbd, the CLI and all clients end to end (about 2 minutes)
@@ -84,8 +84,9 @@ Ubuntu 24.04 runners with 4 CPUs and 16 GB. These checks should be green before 
   no commit message or pull request text links to an AI session. It is the same check as the `commit-msg` hook,
   run by `.github/scripts/check-commits.sh BASE HEAD`, so you can try it on your branch.
 
-- **jepsen:** `make jepsen`, the fault injection with kill -9, simulated power loss, disk errors and pauses (about
-  10 minutes). It also runs once a week (Mondays), and by hand from the Actions tab ("Run workflow").
+- **jepsen:** `make jepsen`, the fault injection with kill -9, simulated power loss, disk errors, pauses, misdirected
+  reads and writes, and damage to files at rest (about 12 minutes). Once a week (Mondays) it runs longer: every run
+  5 minutes (`JEPSEN_SECONDS=300`, about 2 hours). It also runs by hand from the Actions tab ("Run workflow").
 
 When a job fails, its logs are attached to the run as an artifact for two weeks.
 
