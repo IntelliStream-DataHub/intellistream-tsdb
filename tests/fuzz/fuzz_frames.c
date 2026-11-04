@@ -22,6 +22,10 @@
  *
  * What counts as a failure: a sanitizer report, a crash, an input that runs longer than 20 s, and a reply
  * stream that is not well formed (each request answered by REPLY frames carrying its id, at least one).
+ *
+ * Login is on (server/auth.c with a USERS of its own): an input logs in as root, as a user with grants, or not at
+ * all, by a 4-byte mode in front of its frames (run_one); the pre-login limits and the SCRAM parser get the frames
+ * of a client that has not logged in, the checks get those of one that has.
  */
 #define _GNU_SOURCE
 #include "tsdb.h"
@@ -55,6 +59,7 @@ static void fz_out_wait(struct conn *c);
 #undef tsdb_series_create
 
 #include "../../client/tsdb_pack.h"
+#include "../../client/tsdb_crypto.h"
 
 /* ------------------------------------------------------------ coverage */
 
@@ -111,6 +116,49 @@ static int verbose; /* FUZZ_VERBOSE: each request's status (to check the seeds d
 static const uint8_t *cur_in;
 static size_t cur_len;
 
+/* Login is required, as in tsdbd without --no-auth. Before its frames run, an input logs in through the same
+ * parse() and handle() path: as "root" (a superuser, so that every handler is reached; the committed corpus from
+ * before login runs this way), as "fz" (grants on some series and an admin prefix, so that the rights map, the
+ * per-id checks and the admin rules decide) when it starts with mode_bytes[M_USER], and not at all with
+ * mode_bytes[M_PRE] (its frames are what a client sends before login). A mode is 4 bytes no other input can start
+ * with (a frame length over TSDB_MAX_FRAME, which closes the connection at once). Both nonces and the salts are
+ * fixed, so each login is the same three frames, made once. */
+#define MODE_LEN 4
+enum { M_ROOT, M_USER, M_PRE };
+static const uint8_t mode_bytes[3][MODE_LEN] = {{0}, {0xff, 0xff, 0xff, 'U'}, {0xff, 0xff, 0xff, 'P'}};
+static uint8_t *login_frames[2]; /* M_ROOT, M_USER */
+static size_t login_len[2];
+
+static int input_mode(const uint8_t *p, size_t len)
+{
+    for (int m = M_USER; m <= M_PRE; m++)
+        if (len >= MODE_LEN && memcmp(p, mode_bytes[m], MODE_LEN) == 0)
+            return m;
+    return M_ROOT;
+}
+
+/* USERS lives in its own directory (auth_init's), and an input that may have changed it (an admin op) gets the
+ * file as it was made back, so that every input meets the same users, in a replay as in a run. */
+static char users_dir[4200];
+static uint8_t *users_file;
+static size_t users_len;
+static bool users_dirty;
+
+static void users_reset(void)
+{
+    char p[4300], t[4300];
+    snprintf(p, sizeof p, "%s/USERS", users_dir);
+    snprintf(t, sizeof t, "%s/USERS.fz", users_dir);
+    auth_shutdown();
+    int fd = open(t, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 || write(fd, users_file, users_len) != (ssize_t)users_len || close(fd) != 0 || rename(t, p) != 0 ||
+        auth_init(users_dir, true, true, db) != 0) {
+        fprintf(stderr, "fuzz_frames: cannot put USERS back in %s\n", users_dir);
+        exit(2);
+    }
+    users_dirty = false;
+}
+
 static void fail_dump(void)
 {
     if (!cur_in || !crash_dir)
@@ -146,7 +194,7 @@ static void rm_rf(const char *path)
         fprintf(stderr, "fuzz_frames: could not remove %s\n", path);
 }
 
-/* A fresh database with a series of every type (ids 0-4) and a state name, so inputs find something. */
+/* A fresh database with a series of every type (TSDB_SID(0, 0 .. 4)) and a state name, so inputs find something. */
 static void db_start(void)
 {
     char d[4200];
@@ -165,19 +213,19 @@ static void db_start(void)
         exit(2);
     }
     static const char *names[] = {"f32", "f64", "i64", "bool", "state"};
-    for (unsigned t = 0; t < 5; t++) {
-        tsdb_sid id;
-        tsdb_series_create(db, names[t], (tsdb_type)t, NULL, &id);
-    }
+    tsdb_sid id[5] = {0};
+    for (unsigned t = 0; t < 5; t++)
+        tsdb_series_create(db, names[t], (tsdb_type)t, NULL, &id[t]);
     uint32_t code;
-    tsdb_state(db, 4, "on", &code);
+    tsdb_state(db, id[4], "on", &code);
     int64_t ts[200];
     float v[200];
     for (int i = 0; i < 200; i++)
         ts[i] = 1000 * i, v[i] = (float)i;
-    tsdb_insert_series(db, 0, ts, v, 200);
+    tsdb_insert_series(db, id[0], ts, v, 200);
     tsdb_flush(db);
-    tsdb_insert_series(db, 0, ts, v, 50); /* some rows in a part, some in the memtable */
+    tsdb_insert_series(db, id[0], ts, v, 50); /* some rows in a part, some in the memtable */
+    users_reset(); /* auth.c's handle on the database is this one */
 }
 
 static void db_stop(void)
@@ -244,45 +292,79 @@ static void check_replies(conn *c, uint32_t seq, uint8_t op)
     fz_frames = fz_bytes = 0;
 }
 
-/* One input: what a client sends on one connection. Requests run in order, as a worker would run them. */
+/* Delivers n bytes to c, as recv would, and runs what they complete. After each request it does what the event
+ * loop does when a worker is done: a closing login or a dropped user ends reading (eof), an answered AUTH_CONTINUE
+ * lets parse() go on, and what waited behind the two requests a connection may queue before login is read.
+ * false: the connection closed (or parked for memory, which only a large frame's partial header can be here). */
+static bool feed(conn *c, const uint8_t *p, size_t n, uint32_t *seq)
+{
+    if (buf_reserve(&c->in, n) != 0)
+        abort();
+    memcpy(c->in.p + c->in.len, p, n);
+    c->in.len += n;
+    bool ok = parse(c) == 0;
+    while (c->q_head) {
+        req *r = c->q_head;
+        c->q_head = r->next;
+        if (!c->q_head)
+            c->q_tail = NULL;
+        c->q_bytes -= r->len;
+        atomic_store(&c->cancel_running, r->cancelled); /* as dispatch() does: a CANCEL that came first */
+        uint8_t op = r->op;
+        r->id = *seq;
+        fz_seq = *seq;
+        fz_op = op;
+        handle(r);
+        check_replies(c, *seq, op);
+        (*seq)++;
+        req_free(r);
+        if (op >= TSDB_OP_USER_CREATE && op <= TSDB_OP_REVOKE)
+            users_dirty = true; /* refused or not: the next input meets USERS as it was made */
+        if (atomic_load(&c->auth_end))
+            c->eof = true;
+        if (c->auth_hold && op == TSDB_OP_AUTH_CONTINUE)
+            c->auth_hold = false;
+        if (ok && !c->eof && c->in.len)
+            ok = parse(c) == 0;
+    }
+    return ok;
+}
+
+/* One input: what a client sends on one connection, after the login of its mode. Requests run in order, as a
+ * worker would run them. */
 static void run_one(const uint8_t *in, size_t len)
 {
     cur_in = in;
     cur_len = len;
+    int mode = input_mode(in, len);
+    if (mode != M_ROOT)
+        in += MODE_LEN, len -= MODE_LEN;
     conn *c = calloc(1, sizeof *c);
     if (!c)
         abort();
     c->fd = -1;
     pthread_mutex_init(&c->lock, NULL);
     pthread_cond_init(&c->cv, NULL);
-    /* in pieces, as recv would deliver them: the first piece is short, to go through partial frames */
-    size_t first = len > 7 ? 7 : len, at = 0;
+    auth_conn_init(&c->auth); /* as on_accept: login required */
+    atomic_store(&c->authed, c->auth.state == AS_IN);
     uint32_t seq = 0;
     bool ok = true;
-    while (at < len && ok && !c->eof) { /* eof: a refused HELLO, after which tsdbd reads nothing more */
-        size_t take = at == 0 ? first : len - at;
-        if (buf_reserve(&c->in, take) != 0)
-            abort();
-        memcpy(c->in.p + c->in.len, in + at, take);
-        c->in.len += take;
-        at += take;
-        ok = parse(c) == 0; /* 1: parked for memory, which only a large frame's partial header can be here */
-        while (c->q_head) {
-            req *r = c->q_head;
-            c->q_head = r->next;
-            if (!c->q_head)
-                c->q_tail = NULL;
-            c->q_bytes -= r->len;
-            atomic_store(&c->cancel_running, r->cancelled); /* as dispatch() does: a CANCEL that came first */
-            r->id = seq;
-            fz_seq = seq;
-            fz_op = r->op;
-            handle(r);
-            check_replies(c, seq, r->op);
-            seq++;
-            req_free(r);
-        }
+    if (mode != M_PRE && (!feed(c, login_frames[mode], login_len[mode], &seq) || !atomic_load(&c->authed) ||
+                          c->eof)) {
+        fprintf(stderr, "fuzz_frames: the fixed login as %s failed\n", mode == M_ROOT ? "root" : "fz");
+        fail_dump();
+        abort();
     }
+    /* in pieces, as recv would deliver them: the first piece is short, to go through partial frames */
+    size_t first = len > 7 ? 7 : len, at = 0;
+    while (at < len && ok && !c->eof) { /* eof: a refused HELLO or login, after which tsdbd reads nothing more */
+        size_t take = at == 0 ? first : len - at;
+        ok = feed(c, in + at, take, &seq);
+        at += take;
+    }
+    auth_conn_free(&c->auth);
+    if (users_dirty)
+        users_reset();
     free(c->in.p);
     c->in = (buf){0};
     in_account(c);
@@ -413,6 +495,256 @@ static void multi_payload(fb *p, uint8_t op, uint8_t flags, uint16_t threads, ui
     for (uint32_t i = 0; i < n; i++) /* 77 and 2^32 + 1: unknown (not series 1) */
         psid(p, i == 2 ? 77 : i == 4 ? 0x100000001ull : i % 5);
     put(p, t->p, t->len);
+}
+
+/* ---------------------------------------------------------------- login */
+
+static const struct fz_user {
+    const char *name, *pw;
+    uint8_t salt_byte;
+} fz_users[2] = {{"root", "rootpw", 0x11}, {"fz", "fzpw", 0x22}}; /* by mode: M_ROOT, M_USER */
+#define FZ_CNONCE "fzclient"
+#define FZ_SNONCE "fuzznonce" /* auth_test_nonce */
+
+/* The client-final-message of user u's fixed exchange (bad: one bit of the proof flipped). The server-first-message
+ * it answers is what auth.c sends for these nonces and the salt; the login in run_one checks that it is. */
+static void fz_client_final(int u, bool bad, char *out, size_t cap)
+{
+    uint8_t salt[16], ck[32], sk[32], svk[32], sig[32], proof[32];
+    memset(salt, fz_users[u].salt_byte, sizeof salt);
+    tsdb_scram_keys(fz_users[u].pw, strlen(fz_users[u].pw), salt, 16, ITER_MIN, ck, sk, svk);
+    char sb[tsdb_base64_len(16) + 1], pb[tsdb_base64_len(32) + 1], am[600];
+    tsdb_base64_encode(salt, 16, sb);
+    snprintf(am, sizeof am, "n=%s,r=" FZ_CNONCE ",r=" FZ_CNONCE FZ_SNONCE ",s=%s,i=%u,c=biws,r=" FZ_CNONCE FZ_SNONCE,
+             fz_users[u].name, sb, (unsigned)ITER_MIN);
+    tsdb_hmac_sha256(sk, 32, am, strlen(am), sig);
+    for (int k = 0; k < 32; k++)
+        proof[k] = ck[k] ^ sig[k];
+    if (bad)
+        proof[7] ^= 0x10;
+    tsdb_base64_encode(proof, 32, pb);
+    snprintf(out, cap, "c=biws,r=" FZ_CNONCE FZ_SNONCE ",p=%s", pb);
+}
+
+static void fz_hello(fb *f)
+{
+    fb p = {0};
+    p32(&p, TSDB_PROTOCOL_VERSION);
+    frame(f, TSDB_OP_HELLO, &p);
+    free(p.p);
+}
+
+static void fz_start(fb *f, const char *mech, const char *client_first)
+{
+    fb p = {0};
+    p8(&p, (uint8_t)strlen(mech));
+    put(&p, mech, strlen(mech));
+    pstr16(&p, client_first);
+    frame(f, TSDB_OP_AUTH_START, &p);
+    free(p.p);
+}
+
+static void fz_continue(fb *f, const char *client_final)
+{
+    fb p = {0};
+    pstr16(&p, client_final);
+    frame(f, TSDB_OP_AUTH_CONTINUE, &p);
+    free(p.p);
+}
+
+/* HELLO, AUTH_START and AUTH_CONTINUE: user u's login. */
+static void fz_login(fb *f, int u, bool bad)
+{
+    char cf[64], fin[200];
+    fz_hello(f);
+    snprintf(cf, sizeof cf, "n,,n=%s,r=" FZ_CNONCE, fz_users[u].name);
+    fz_start(f, TSDB_SCRAM_SHA256, cf);
+    fz_client_final(u, bad, fin, sizeof fin);
+    fz_continue(f, fin);
+}
+
+/* A user admin op: the user's name, then u8 flags (flags >= 0), a verifier (ver), a grant (sel: u8 kind, u8 rights,
+ * u16 len, selector). */
+static void admin_frame(fb *f, uint8_t op, const char *name, int flags, bool ver, uint8_t kind, uint8_t rights,
+                        const char *sel)
+{
+    fb p = {0};
+    pstr16(&p, name);
+    if (flags >= 0)
+        p8(&p, (uint8_t)flags);
+    if (ver) {
+        p32(&p, ITER_MIN);
+        p8(&p, 16);
+        for (int i = 0; i < 16 + 64; i++)
+            p8(&p, (uint8_t)(0x33 + i));
+    }
+    if (sel) {
+        p8(&p, kind);
+        p8(&p, rights);
+        pstr16(&p, sel);
+    }
+    frame(f, op, &p);
+    free(p.p);
+}
+
+static void id_frame(fb *f, uint8_t op, tsdb_sid id, bool range)
+{
+    fb p = {0};
+    psid(&p, id);
+    if (range)
+        p64(&p, 0), p64(&p, 1000000);
+    frame(f, op, &p);
+    free(p.p);
+}
+
+static void name_frame(fb *f, uint8_t op, uint8_t create, const char *name)
+{
+    fb p = {0};
+    p8(&p, create);
+    pstr16(&p, name);
+    frame(f, op, &p);
+    free(p.p);
+}
+
+/* The seeds of login and of the checks after it, in the modes of run_one. */
+static void login_seeds(const char *dir)
+{
+    fb f = {0}, p = {0};
+    char cf[64], fin[200];
+    snprintf(cf, sizeof cf, "n,,n=fz,r=" FZ_CNONCE);
+    fz_client_final(M_USER, false, fin, sizeof fin);
+#define MSEED(name, mode, BODY)                                                                                        \
+    do {                                                                                                               \
+        f.len = 0;                                                                                                     \
+        put(&f, mode_bytes[mode], mode == M_ROOT ? 0 : MODE_LEN);                                                      \
+        BODY;                                                                                                          \
+        seed_write(dir, name, &f);                                                                                     \
+    } while (0)
+    /* before login */
+    MSEED("pre-hello", M_PRE, fz_hello(&f));
+    MSEED("pre-start", M_PRE, (fz_hello(&f), fz_start(&f, TSDB_SCRAM_SHA256, cf)));
+    MSEED("pre-login-fz", M_PRE, (fz_login(&f, M_USER, false), id_frame(&f, TSDB_OP_QUERY_VALUES, TSDB_SID(0, 0), true),
+                                  frame(&f, TSDB_OP_LAST_STATS, &p)));
+    MSEED("pre-wrong-proof", M_PRE, (fz_login(&f, M_USER, true), fz_hello(&f)));
+    MSEED("pre-unknown-user", M_PRE, (fz_hello(&f), fz_start(&f, TSDB_SCRAM_SHA256, "n,,n=nobody,r=" FZ_CNONCE),
+                                      fz_continue(&f, fin)));
+    MSEED("pre-bad-first", M_PRE, fz_start(&f, TSDB_SCRAM_SHA256, "n,,n=fz,r=" FZ_CNONCE ",x=1"));
+    MSEED("pre-gs2-y", M_PRE, fz_start(&f, TSDB_SCRAM_SHA256, "y,,n=fz,r=" FZ_CNONCE));
+    MSEED("pre-sha1", M_PRE, fz_start(&f, "SCRAM-SHA-1", cf));
+    MSEED("pre-continue-first", M_PRE, fz_continue(&f, fin));
+    MSEED("pre-stats", M_PRE, frame(&f, TSDB_OP_STATS, &p));
+    MSEED("pre-cancel", M_PRE, (p32(&p, 0), frame(&f, TSDB_OP_CANCEL, &p), p.len = 0));
+    MSEED("pre-big", M_PRE, ({
+              for (int i = 0; i < 1100; i++)
+                  p32(&p, TSDB_PROTOCOL_VERSION);
+              frame(&f, TSDB_OP_HELLO, &p);
+              p.len = 0;
+          }));
+    MSEED("pre-three", M_PRE, (fz_hello(&f), fz_hello(&f), fz_hello(&f), fz_start(&f, TSDB_SCRAM_SHA256, cf)));
+    /* as fz: its grants decide */
+    MSEED("fz-whoami", M_USER, (frame(&f, TSDB_OP_WHOAMI, &p), frame(&f, TSDB_OP_USER_LIST, &p)));
+    MSEED("fz-data", M_USER, ({
+              for (uint32_t i = 0; i < 5; i++) {
+                  id_frame(&f, TSDB_OP_QUERY_VALUES, TSDB_SID(0, i), true);
+                  id_frame(&f, TSDB_OP_GET_RETENTION, TSDB_SID(0, i), false);
+              }
+              id_frame(&f, TSDB_OP_DELETE_RANGE, TSDB_SID(0, 0), true);
+              id_frame(&f, TSDB_OP_DELETE_RANGE, TSDB_SID(0, 1), true);
+              id_frame(&f, TSDB_OP_QUERY_VALUES, TSDB_SID(0, 77), true); /* missing: DENIED, not NOTFOUND */
+              name_frame(&f, TSDB_OP_SERIES, 0, "f64");
+              name_frame(&f, TSDB_OP_SERIES, 0, "bool");
+              name_frame(&f, TSDB_OP_SERIES, 1, "new1");
+              name_frame(&f, TSDB_OP_SERIES, 1, "zzz");
+              frame(&f, TSDB_OP_STATS, &p);
+              fz_hello(&f); /* AUTH_* after login: INVALID, and the connection goes on */
+              fz_start(&f, TSDB_SCRAM_SHA256, cf);
+          }));
+    MSEED("fz-admin-own", M_USER, ({
+              admin_frame(&f, TSDB_OP_USER_CREATE, "fz/a", 0, true, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_GRANT, "fz/a", -1, false, SEL_PREFIX, R_READ, "fz/x");
+              admin_frame(&f, TSDB_OP_GRANT, "fz/a", -1, false, SEL_GLOB, R_READ | R_INSERT, "fz/*y");
+              frame(&f, TSDB_OP_USER_LIST, &p);
+              admin_frame(&f, TSDB_OP_USER_ALTER, "fz/a", 0, false, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_USER_PASSWORD, "fz/a", -1, true, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_REVOKE, "fz/a", -1, false, SEL_PREFIX, R_READ, "fz/x");
+              admin_frame(&f, TSDB_OP_USER_DROP, "fz/a", -1, false, 0, 0, NULL);
+          }));
+    MSEED("fz-admin-foreign", M_USER, ({
+              admin_frame(&f, TSDB_OP_USER_DROP, "root", -1, false, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_USER_ALTER, "fz", TSDB_USER_SUPERUSER, false, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_GRANT, "fz", -1, false, SEL_ALL, R_EVERY, "");
+              admin_frame(&f, TSDB_OP_USER_PASSWORD, "root", -1, true, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_USER_CREATE, "other", 1, true, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_USER_PASSWORD, "fz", -1, true, 0, 0, NULL);
+              id_frame(&f, TSDB_OP_QUERY_VALUES, TSDB_SID(0, 0), true);
+          }));
+    /* as root */
+    MSEED("root-admin", M_ROOT, ({
+              admin_frame(&f, TSDB_OP_USER_CREATE, "u1", 0, true, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_GRANT, "u1", -1, false, SEL_GLOB, R_READ, "f*");
+              admin_frame(&f, TSDB_OP_GRANT, "u1", -1, false, SEL_NAME, R_ADMIN, "state");
+              frame(&f, TSDB_OP_WHOAMI, &p);
+              frame(&f, TSDB_OP_USER_LIST, &p);
+              admin_frame(&f, TSDB_OP_USER_ALTER, "u1", TSDB_USER_SUPERUSER, false, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_USER_PASSWORD, "u1", -1, true, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_REVOKE, "u1", -1, false, SEL_GLOB, R_READ, "f*");
+              admin_frame(&f, TSDB_OP_USER_DROP, "u1", -1, false, 0, 0, NULL);
+              admin_frame(&f, TSDB_OP_USER_DROP, "root", -1, false, 0, 0, NULL); /* the last superuser */
+              admin_frame(&f, TSDB_OP_USER_ALTER, "root", 0, false, 0, 0, NULL);
+          }));
+#undef MSEED
+    free(f.p);
+    free(p.p);
+}
+
+/* USERS with root and fz, whose grants reach each kind of check: a name (f32: read, insert, delete), a prefix
+ * (i: read), a glob (?oo*: read, so bool), insert on prefix new (the seeds create "new"), admin on prefix fz/
+ * (users fz/... of its own to create, grant to and drop). Kept in memory for users_reset; the login frames too. */
+static void users_make(void)
+{
+    snprintf(users_dir, sizeof users_dir, "%s/auth-users", db_dir);
+    rm_rf(users_dir);
+    mkdir(users_dir, 0755);
+    users us;
+    int rc = users_open(&us, users_dir, true);
+    for (int u = 0; u < 2 && rc == 0; u++) {
+        user_verifier v = {.iterations = ITER_MIN, .salt_len = 16};
+        memset(v.salt, fz_users[u].salt_byte, 16);
+        tsdb_scram_keys(fz_users[u].pw, strlen(fz_users[u].pw), v.salt, 16, ITER_MIN, NULL, v.stored_key,
+                        v.server_key);
+        uint32_t uid;
+        rc = users_create(&us, 0, fz_users[u].name, u == 0 ? USER_SUPERUSER : 0, &v, &uid);
+    }
+    static const struct {
+        uint8_t kind;
+        const char *sel;
+        uint8_t rights;
+    } g[] = {{SEL_NAME, "f32", R_READ | R_INSERT | R_DELETE},
+             {SEL_PREFIX, "i", R_READ},
+             {SEL_GLOB, "?oo*", R_READ},
+             {SEL_PREFIX, "new", R_INSERT},
+             {SEL_PREFIX, "fz/", R_ADMIN}};
+    for (size_t i = 0; i < sizeof g / sizeof g[0] && rc == 0; i++)
+        rc = users_grant(&us, 0, "fz", g[i].kind, g[i].sel, strlen(g[i].sel), g[i].rights);
+    if (rc == 0)
+        users_close(&us);
+    char p[4300];
+    snprintf(p, sizeof p, "%s/USERS", users_dir);
+    FILE *f = rc == 0 ? fopen(p, "rb") : NULL;
+    uint8_t b[16384];
+    users_len = f ? fread(b, 1, sizeof b, f) : 0;
+    if (!f || !users_len || users_len == sizeof b || fclose(f) != 0 || !(users_file = malloc(users_len))) {
+        fprintf(stderr, "fuzz_frames: cannot make USERS in %s: %s\n", users_dir, tsdb_strerror(rc));
+        exit(2);
+    }
+    memcpy(users_file, b, users_len);
+    auth_test_nonce = FZ_SNONCE;
+    for (int u = 0; u < 2; u++) {
+        fb l = {0};
+        fz_login(&l, u, false);
+        login_frames[u] = l.p;
+        login_len[u] = l.len;
+    }
 }
 
 static int cmd_seeds(const char *dir)
@@ -705,6 +1037,7 @@ static int cmd_seeds(const char *dir)
     seed_write(dir, "pipeline", &f);
     free(f.p);
     free(p.p);
+    login_seeds(dir);
     return 0;
 }
 
@@ -896,14 +1229,15 @@ static size_t mutate(uint8_t *p, size_t len)
         }
         case 11: { /* append a frame of another input */
             input *o = &corpus[below(ncorpus)];
+            const uint8_t *op = o->p + (input_mode(o->p, o->len) == M_ROOT ? 0 : MODE_LEN);
             fr of[64];
-            size_t on = split(o->p, o->len, of, 64);
+            size_t on = split(op, o->len - (size_t)(op - o->p), of, 64);
             if (!on)
                 break;
             fr *g = &of[below(on)];
             if (len + 9 + g->len > FZ_MAX_INPUT)
                 break;
-            memcpy(p + len, o->p + g->at - 9, 9 + g->len);
+            memcpy(p + len, op + g->at - 9, 9 + g->len);
             len += 9 + g->len;
             nf = split(p, len, frs, 256);
             break;
@@ -920,6 +1254,23 @@ static size_t mutate(uint8_t *p, size_t len)
             break;
         }
         }
+    }
+    return len;
+}
+
+/* mutate on the frames after the mode; now and then the mode changes (who sends them: root, fz, nobody yet).
+ * p holds FZ_MAX_INPUT + MODE_LEN bytes. */
+static size_t mutate_input(uint8_t *p, size_t len)
+{
+    int mode = input_mode(p, len);
+    size_t at = mode == M_ROOT ? 0 : MODE_LEN;
+    len = at + mutate(p + at, len - at);
+    if (below(16) == 0) {
+        int to = (int)below(3);
+        size_t to_at = to == M_ROOT ? 0 : MODE_LEN;
+        memmove(p + to_at, p + at, len - at);
+        memcpy(p, mode_bytes[to], to_at);
+        len = len - at + to_at;
     }
     return len;
 }
@@ -944,6 +1295,7 @@ static void setup(const char *dir)
     if (__sanitizer_set_death_callback)
         __sanitizer_set_death_callback(fail_dump);
     send_timeout_s = 1;
+    users_make();
     db_start();
 }
 
@@ -1011,14 +1363,14 @@ int main(int argc, char **argv)
         cov_new();
     }
     printf("fuzz_frames: %zu seeds, %zu edges\n", ncorpus, cov_edges());
-    uint8_t *buf = malloc(FZ_MAX_INPUT);
+    uint8_t *buf = malloc(FZ_MAX_INPUT + MODE_LEN);
     time_t t0 = time(NULL), last = t0;
     uint64_t execs = 0, kept = 0;
     while (time(NULL) - t0 < seconds) {
         input *src = &corpus[below(ncorpus)];
         size_t len = src->len < FZ_MAX_INPUT ? src->len : FZ_MAX_INPUT;
         memcpy(buf, src->p, len);
-        len = mutate(buf, len);
+        len = mutate_input(buf, len);
         memset(cov_map, 0, sizeof cov_map);
         timed_run(buf, len);
         execs++;

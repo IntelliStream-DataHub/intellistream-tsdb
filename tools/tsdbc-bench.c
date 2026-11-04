@@ -16,6 +16,8 @@
  * overhead over the plain op).
  * connections holds --conns connections open at once (from up to 64 threads)
  * and keeps sending small aggregate queries through all of them.
+ * --user U --password-file F logs every connection in (a tsdbd without --no-auth); the keys are derived once per
+ * process, so a connect costs the SCRAM exchange's round trips and four HMACs.
  */
 #include "../client/tsdb_client.h"
 #include "cbench.h"
@@ -31,6 +33,13 @@ static uint32_t nseries = 100;
 static uint64_t points = 1000000;
 static double seconds = CB_DEFAULT_SECONDS;
 static int compression = 1; /* zstd level of insert batches; 0 sends plain arrays */
+static tsdbc_options login;  /* user NULL: no login */
+
+static int bench_connect(const char *h, int p, tsdbc **out)
+{
+    return login.user ? tsdbc_connect_opts(h, p, &login, out) : tsdbc_connect(h, p, out);
+}
+#define tsdbc_connect bench_connect /* every connection below, with the login when one is given */
 
 static void die(const char *what, int rc)
 {
@@ -454,6 +463,7 @@ int main(int argc, char **argv)
                                    {"series", required_argument, 0, 's'}, {"points", required_argument, 0, 'n'},
                                    {"seconds", required_argument, 0, 't'}, {"compression", required_argument, 0, 'z'},
                                    {"multi", required_argument, 0, 'm'}, {"multi-one", no_argument, 0, 'o'},
+                                   {"user", required_argument, 0, 'u'},  {"password-file", required_argument, 0, 'w'},
                                    {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -468,6 +478,8 @@ int main(int argc, char **argv)
         case 'z': compression = atoi(optarg); break;
         case 'm': multi_k = atoi(optarg); break;
         case 'o': multi_one = 1; break;
+        case 'u': login.user = optarg; break;
+        case 'w': login.password_file = optarg; break;
         default: return 2;
         }
     }
@@ -480,7 +492,7 @@ int main(int argc, char **argv)
                         "       tsdbc-bench verify FILE | optimize\n"
                         "       tsdbc-bench query [--series N] [--points N] [--conns N] [--seconds S] [--multi K [--multi-one]]\n"
                         "       tsdbc-bench connections --conns N [--seconds S]\n"
-                        "       [--host H] [--port P]\n");
+                        "       [--host H] [--port P] [--user U --password-file F]\n");
         return 2;
     }
     if (strcmp(argv[optind], "load") == 0 && optind + 1 < argc)
