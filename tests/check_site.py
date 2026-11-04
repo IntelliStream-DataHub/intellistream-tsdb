@@ -328,6 +328,70 @@ def check_site_car(page, raw, fix):
     return out
 
 
+# Text and background pairs of site.css and the contrast each must reach (WCAG 2): 7 for prose, 4.5 for other text,
+# 3 for large headings and the borders of controls. A background "a+b" is token a drawn over token b (for the
+# translucent ones: the hero's glow, the failure boxes, the borders).
+CONTRAST = [
+    ("text", "bg", 7), ("text", "surface", 7), ("text", "surface-2", 7),
+    ("muted", "bg", 7), ("muted", "surface", 7), ("muted", "surface-2", 7), ("muted", "hero-a+bg", 7),
+    ("text", "hero-a+bg", 7), ("code-text", "code-bg", 7), ("text", "bg-prose", 7), ("muted", "bg-prose", 7),
+    ("text", "bg-2", 7), ("muted", "bg-2", 7), ("faint", "bg-prose", 4.5), ("link", "bg-prose", 4.5),
+    ("faint", "bg", 4.5), ("faint", "surface", 4.5), ("faint", "surface-2", 4.5),
+    ("link", "bg", 4.5), ("link", "surface", 4.5), ("cyan", "bg", 4.5), ("cyan", "surface", 4.5),
+    ("on-accent", "cyan", 4.5), ("on-accent", "violet", 4.5), ("on-accent", "magenta", 4.5),
+    ("fail-text", "fail-bg+surface", 4.5), ("red", "surface", 4.5),
+    ("line-2", "bg", 3), ("line-2", "surface", 3),
+]
+
+
+def css_colour(v):
+    v = v.strip()
+    m = re.fullmatch(r"#([0-9a-fA-F]{6})", v)
+    if m:
+        return [int(m.group(1)[i:i + 2], 16) / 255 for i in (0, 2, 4)] + [1.0]
+    m = re.fullmatch(r"rgba\(\s*(\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\s*\)", v)
+    if m:
+        return [int(m.group(k)) / 255 for k in (1, 2, 3)] + [float(m.group(4))]
+    return None
+
+
+def luminance(c):
+    c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c[:3]]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def check_contrast(report=False):
+    """Every declared text/background pair of site.css's colour tokens meets its contrast target."""
+    path = os.path.join(SITE, "assets", "site.css")
+    css = open(path, encoding="utf-8").read()
+    root = re.search(r":root\s*\{(.*?)\}", css, re.S)
+    tokens = {m.group(1): css_colour(m.group(2)) for m in re.finditer(r"--([\w-]+):\s*([^;]+);", root.group(1))}
+
+    def resolve(name):
+        if "+" in name:  # a translucent colour drawn over an opaque one
+            top, under = name.split("+", 1)
+            t, u = resolve(top), resolve(under)
+            return [t[i] * t[3] + u[i] * (1 - t[3]) for i in range(3)] + [1.0]
+        if not tokens.get(name):
+            raise KeyError(name)
+        return tokens[name]
+
+    for fg, bg, want in CONTRAST:
+        try:
+            f, b = resolve(fg), resolve(bg)
+        except KeyError as e:
+            errors.append(f"site/assets/site.css: contrast: no colour token --{e.args[0]}")
+            continue
+        if f[3] < 1:  # a translucent foreground (a border) over its own background
+            f = [f[i] * f[3] + b[i] * (1 - f[3]) for i in range(3)] + [1.0]
+        hi, lo = sorted([luminance(f), luminance(b)], reverse=True)
+        ratio = (hi + 0.05) / (lo + 0.05)
+        if report:
+            print(f"  {fg:>10} on {bg:<16} {ratio:5.2f} (needs {want})")
+        if ratio < want:
+            errors.append(f"site/assets/site.css: --{fg} on --{bg}: contrast {ratio:.2f}, needs {want}")
+
+
 def find_chrome():
     """A headless Chromium: $CHROME, one on the PATH, or Playwright's headless shell; None if there is none."""
     if os.environ.get("CHROME"):
@@ -477,6 +541,7 @@ def main():
     for page in all_pages:
         check_links(page, parse(page)[0], lambda d: parse(d)[0].ids)
     check_readme_charts()
+    check_contrast(report="--contrast" in sys.argv[1:])
     check_tabs()
     node = shutil.which("node")
     scripts = sorted(f for f in os.listdir(os.path.join(SITE, "assets")) if f.endswith(".js"))
