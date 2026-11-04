@@ -89,6 +89,21 @@
   </dependencies>
 
   <build>
+    <resources>
+      <!-- src/main/resources (pulsar-io.yaml and THIRD-PARTY-NOTICES under META-INF), then the Apache-2.0 LICENSE and
+           NOTICE of the repository beside them. -->
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+      <resource>
+        <directory>${project.basedir}/../..</directory>
+        <includes>
+          <include>LICENSE</include>
+          <include>NOTICE</include>
+        </includes>
+        <targetPath>META-INF</targetPath>
+      </resource>
+    </resources>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

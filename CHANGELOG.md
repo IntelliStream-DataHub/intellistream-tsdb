@@ -132,7 +132,10 @@ Portable build and project files
 - `make dist` makes a tarball (`tsdb-0.9.0-x86_64-linux.tar.gz`) for x86-64-v2 CPUs and newer, with glibc 2.34 or
   newer, and the test suite that runs from it. It is checked on AlmaLinux 10 (Podman) and under an emulated
   Westmere and Sandy Bridge. It carries `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd and liburing are
-  linked into its binaries).
+  linked into its binaries). So do the other packages: the Python wheel and sdist (`THIRD-PARTY-NOTICES` of the
+  linked Rust crates and zstd, made by `tools/gen-third-party.py`; maturin 1.9 or newer builds it), the Rust
+  crates, the two Java jars (`META-INF`) and the Pulsar NAR (also zstd-jni, zstd and Jackson). `make
+  test-licenses`, part of `make test-clients`, fails when a package lacks them.
 - `make integration-tests` runs tsdbd, the CLI and all clients end to end.
 - One version: the file `VERSION`; `make check-version` makes sure the header, the binaries and the client
   manifests agree.

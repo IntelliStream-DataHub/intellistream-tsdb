@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.5,<2"]
+requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
@@ -7,8 +7,10 @@ name = "intellistream-tsdb-client"
 description = "Client for tsdbd, the TCP server of the tsdb time series database"
 requires-python = ">=3.9"
 dynamic = ["version"]
-license = { text = "Apache-2.0" }
-classifiers = ["License :: OSI Approved :: Apache Software License", "Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
+license = "Apache-2.0"
+# the wheel carries these under .dist-info/licenses/; tsdb's own terms and the notices of the libraries linked in
+license-files = ["LICENSE", "NOTICE", "THIRD-PARTY-NOTICES"]
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
 numpy = ["numpy"]

@@ -319,6 +319,8 @@ test-python-sdist: python-sdist
 	cd $(B)/sdist-check && unzip -q whl/intellistream_tsdb_client-*.whl -d site \
 	    && $(abspath $(PYVENV))/bin/python -I -c "import os, sys; sys.path.insert(0, os.path.abspath('site')); import tsdb_client; \
 	    assert tsdb_client.__file__.startswith('$(abspath $(B))/sdist-check/site'), tsdb_client.__file__; tsdb_client.Db"
+	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_client-*.tar.gz
+	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_client-*.whl
 
 test-java: $(B)/tsdbd $(B)/tsdb
 	cd client/java && mvn -q test
@@ -330,7 +332,22 @@ test-java-embedded: $(B)/tsdbd $(B)/libtsdb.so
 	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
 	cd client/java-embedded && mvn -q $(JAVA_M2) test
 
-test-clients: test-rust test-python test-python-sdist test-java test-java-embedded
+# Every package carries LICENSE and NOTICE (Apache-2.0), and those that pack other software its notices
+# (docs/licenses.md): the Rust crates (cargo package --list), the two jars and the Pulsar NAR, built here without
+# their tests. The Python sdist and wheel are checked by test-python-sdist. The Pulsar NAR needs build/m2 of
+# test-java-embedded's way (the tsdb-client jar) and the Maven plugins of connectors/pulsar.
+test-licenses:
+	tools/check-package-licenses.sh sources
+	tools/check-package-licenses.sh crate client/rust
+	tools/check-package-licenses.sh crate client/rust-sys
+	cd client/java && mvn -q $(JAVA_M2) install -DskipTests
+	tools/check-package-licenses.sh jar client/java/target/tsdb-client-$(RELEASE_VERSION).jar
+	cd client/java-embedded && mvn -q $(JAVA_M2) -DskipTests package
+	tools/check-package-licenses.sh jar client/java-embedded/target/tsdb-embedded-$(RELEASE_VERSION).jar
+	cd connectors/pulsar && mvn -q $(JAVA_M2) -DskipTests package
+	tools/check-package-licenses.sh nar connectors/pulsar/target/tsdb-pulsar-sink-$(RELEASE_VERSION).nar
+
+test-clients: test-rust test-python test-python-sdist test-java test-java-embedded test-licenses
 
 # Commit rules as a git hook (no session links, DCO sign-off last); once per clone.
 hooks:
@@ -376,7 +393,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)

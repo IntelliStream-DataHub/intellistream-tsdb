@@ -49,6 +49,17 @@
   </dependencies>
 
   <build>
+    <resources>
+      <!-- Apache-2.0 asks for LICENSE and NOTICE with every copy: they go to META-INF of the jar. -->
+      <resource>
+        <directory>${project.basedir}/../..</directory>
+        <includes>
+          <include>LICENSE</include>
+          <include>NOTICE</include>
+        </includes>
+        <targetPath>META-INF</targetPath>
+      </resource>
+    </resources>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

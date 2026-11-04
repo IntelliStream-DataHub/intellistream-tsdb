@@ -80,15 +80,26 @@ The Python module (`client/python`, PyO3) adds:
 | target-lexicon | 0.13.5 | Apache-2.0 WITH LLVM-exception | build only |
 
 Every license above is MIT, BSD, Apache-2.0 or an "OR" that offers one of them, apart from the Unicode data
-license, which applies to compiler-side code only. **When the crates or the Python wheel are published**, the
-notices of the statically linked crates (MIT and BSD ask for the copyright notice and license text) have to go
-with them. A tool such as `cargo about` or `cargo bundle-licenses` makes that file from the lockfile.
+license, which applies to compiler-side code only.
+
+**What ships.** The Python wheel and sdist (`client/python`) carry `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES`
+(maturin `license-files`; in the wheel under `.dist-info/licenses/`). `THIRD-PARTY-NOTICES` has the license texts of
+the crates that are linked into the extension module (normal dependencies, not build tools and not procedural
+macros, which run in the compiler) and of the zstd C library inside zstd-sys, where a crate that offers MIT OR
+Apache-2.0 is taken under MIT. It is generated from `client/python/Cargo.lock` by `tools/gen-third-party.py`
+(`--check` fails when the lockfile moved; no `cargo about` needed): rerun it when a dependency changes. The two
+published crates (`client/rust`, `client/rust-sys`) hold copies of `LICENSE` and `NOTICE` in their directories, so
+`cargo package --list` shows them; the sdist carries both crates as path dependencies and so both copies.
+`client/rust-sys` vendors the engine's own C sources (`vendor.sh`, `csrc/`): nothing in them comes from another
+project (see "Copied code" above), so `LICENSE` and `NOTICE` are all they need. The crates do not pack their
+dependencies (cargo fetches them), so a program that links them carries its dependencies' notices itself.
+`tools/check-package-licenses.sh` is the check (see below).
 
 ## Python
 
 | name | version | license | how it is used |
 |---|---|---|---|
-| maturin | >=1.5, <2 | MIT OR Apache-2.0 | build only (the build backend in `pyproject.toml`) |
+| maturin | >=1.9, <2 | MIT OR Apache-2.0 | build only (the build backend in `pyproject.toml`) |
 | numpy | any | BSD-3-Clause | optional at run time (`pip install tsdb-client[numpy]`); not shipped |
 | pytest | any | MIT | tests only |
 | apache-iotdb, pandas, numpy | pinned in `bench/dbcmp/release/iotdb-requirements.txt` | Apache-2.0, BSD-3-Clause, BSD-3-Clause | benchmark scripts only; installed by the person who runs the comparison, not part of tsdb |
@@ -114,8 +125,16 @@ be run offline; the poms of the artifacts that are there were read for their lic
 `tsdb-embedded` bundles `libtsdb.so` (our code) in its jar. That library links the system's libzstd
 dynamically, so no zstd code is inside the jar. It needs Java 22 or newer (the FFM API); the JDK is the user's.
 
-The Pulsar NAR packs Jackson and zstd-jni, so it should carry `LICENSE`, `NOTICE` and the notices of those two
-(their own jars hold theirs under `META-INF/`). Check the built NAR for this before it is published.
+The two jars (`tsdb-client`, `tsdb-embedded`) carry `LICENSE` and `NOTICE` in `META-INF/` (a Maven resource that
+reads the two files at the repository root). `tsdb-client` does not pack zstd-jni and `tsdb-embedded` packs only our
+`libtsdb.so`, which links the system's libzstd dynamically, so neither needs more. (A `libtsdb.so` built with zstd
+linked statically would need the zstd text of `dist/THIRD-PARTY-NOTICES` in the jar.)
+
+The Pulsar NAR packs `tsdb-client`, Jackson and zstd-jni (`META-INF/bundled-dependencies/`). Its own `META-INF/` has
+`LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (`connectors/pulsar/src/main/resources/META-INF/`): the texts of
+zstd-jni (BSD-2-Clause) and of zstd inside it (BSD-3-Clause), and Jackson's NOTICE (Apache-2.0 asks for it). The
+bundled jars keep their own `META-INF/LICENSE` and `NOTICE` unchanged; the zstd-jni jar has none, which is why its text
+is written out. jackson-core packs a shaded FastDoubleParser (MIT) whose notices are in the jackson-core jar.
 
 ## Not dependencies
 
@@ -137,5 +156,9 @@ benchmarks or publishing test results. Enterprise editions, which can carry othe
   tsdb's binaries, jars or wheels.
 - **The tarball must carry** `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd BSD text, liburing MIT text).
   `make dist` now copies them.
-- **To do at publication time**, outside the tarball: a notices file for the Python wheel and for any published
-  crate, and `LICENSE`/`NOTICE` in the Pulsar NAR.
+- **The other packages carry theirs too** (done 2026-11-04): the Python wheel and sdist (`LICENSE`, `NOTICE`,
+  `THIRD-PARTY-NOTICES`), the Rust crates (`LICENSE`, `NOTICE`), the jars (`META-INF/LICENSE`, `NOTICE`) and the
+  Pulsar NAR (also `THIRD-PARTY-NOTICES`). `make test-licenses` (part of `make test-clients`; the sdist and the wheel
+  in `make test-python-sdist`) builds each package and fails when a file is missing or differs from the root's
+  `LICENSE`/`NOTICE`; `tests/distro/dist-check.sh` does it for the tarball. After a dependency change: rerun
+  `tools/gen-third-party.py` and update the NAR's notices by hand.
