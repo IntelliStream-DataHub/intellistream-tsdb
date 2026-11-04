@@ -82,7 +82,8 @@ final class Native {
             JAVA_INT.withName("request_threads"),
             JAVA_INT.withName("partition_classes"),
             JAVA_INT.withName("pin_index"),
-            JAVA_INT.withName("insert_zstd_level")).withName("tsdb_options");
+            JAVA_INT.withName("insert_zstd_level"),
+            MemoryLayout.paddingLayout(4)).withName("tsdb_options");
 
     static final StructLayout VALUES = MemoryLayout.structLayout(
             JAVA_INT.withName("type"),
