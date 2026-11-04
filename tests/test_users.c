@@ -601,6 +601,46 @@ static void escalation(void)
     printf("  manage, create, grant, revoke, password and list checks of A9, escalations refused\n");
 }
 
+/* The name table (REVIEW1 #8): users added and dropped at random, in a table small enough that its clusters wrap
+ * around; after every step each live name is found, each dropped one is not, as a scan of the array says. */
+static void name_table(void)
+{
+    users us;
+    memset(&us, 0, sizeof us);
+    us.fd = -1;
+    unsigned seed = 11;
+    uint32_t next = 1;
+    char name[32];
+    int bad = 0;
+    for (int step = 0; step < 20000 && !bad; step++) {
+        if (us.n < 40 && (us.n < 10 || rand_r(&seed) % 2)) {
+            if (us.n == us.cap) {
+                us.cap = us.cap ? 2 * us.cap : 16;
+                us.u = realloc(us.u, us.cap * sizeof *us.u);
+            }
+            snprintf(name, sizeof name, "u%u", rand_r(&seed) % 100000);
+            if (users_find(&us, name))
+                continue;
+            us.u[us.n++] = mk(next++, name, 0); /* uids grow: the array stays sorted */
+            CHECK(names_add(&us, us.u[us.n - 1]) == 0);
+        } else {
+            uint32_t i = (uint32_t)rand_r(&seed) % us.n;
+            snprintf(name, sizeof name, "%s", us.u[i]->name);
+            names_del(&us, us.u[i]);
+            free_user(us.u[i]);
+            memmove(us.u + i, us.u + i + 1, (us.n - i - 1) * sizeof *us.u);
+            us.n--;
+            bad |= users_find(&us, name) != NULL;
+        }
+        for (uint32_t i = 0; i < us.n; i++)
+            bad |= users_find(&us, us.u[i]->name) != us.u[i];
+        bad |= us.names_n != us.n;
+    }
+    CHECK(!bad);
+    users_close(&us);
+    printf("  the name table: 20000 random adds and drops, every name found where a scan finds it\n");
+}
+
 static void matching(void)
 {
     user *u = mk(1, "u", 0);
@@ -1776,6 +1816,7 @@ int main(int argc, char **argv)
     inside();
     escalation();
     matching();
+    name_table();
     round_trip();
     torn_tail();
     damage();
