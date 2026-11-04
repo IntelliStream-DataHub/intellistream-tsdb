@@ -21,6 +21,8 @@ What it checks, with the Python standard library only:
 - Every number in a benchmark chart's table (<td data-v>) appears in the results file the table names
   (data-source), so a chart cannot show a number the published results do not have.
 - site.js has no syntax errors (node --check, when node is installed).
+- The README's benchmark charts (docs/img/bench-*.svg) are exactly what tools/readme-charts.py draws from
+  tools/readme-charts.json, and every number in that file appears in BENCHMARKS.md's summary tables.
 """
 
 import html
@@ -243,6 +245,34 @@ def check_links(page, parser, ids_of):
             err(page, f"line {line}: {link!r}: no id {frag!r} there")
 
 
+def check_readme_charts():
+    """The README's charts (docs/img/bench-*.svg) are what tools/readme-charts.py draws from its data file, and every
+    number of that file is in BENCHMARKS.md's summary tables."""
+    import importlib.util
+
+    gen = os.path.join(ROOT, "tools", "readme-charts.py")
+    spec = importlib.util.spec_from_file_location("readme_charts", gen)
+    mod = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True  # no tools/__pycache__ in the tree
+    spec.loader.exec_module(mod)
+    for name, svg in mod.render().items():
+        path = os.path.join(ROOT, "docs", "img", name)
+        have = open(path, encoding="utf-8").read() if os.path.isfile(path) else None
+        if have != svg:
+            errors.append(f"docs/img/{name}: {'missing' if have is None else 'differs from its data'} "
+                          f"(run python3 tools/readme-charts.py)")
+    with open(os.path.join(ROOT, "BENCHMARKS.md"), encoding="utf-8") as f:
+        text = f.read()
+    start = text.find("\n## The summary")
+    end = text.find("\n## ", start + 1)
+    summary = text[start:end] if start >= 0 else ""
+    if not summary:
+        errors.append("BENCHMARKS.md: no '## The summary' section")
+    for n in mod.numbers():
+        if not re.search(r"(?<![\d.,])" + re.escape(n) + r"(?![\d])", summary):
+            errors.append(f"tools/readme-charts.json: {n!r} is not in BENCHMARKS.md's summary tables")
+
+
 def main():
     fix = "--fix" in sys.argv[1:]
     if not os.path.isdir(SITE):
@@ -270,6 +300,7 @@ def main():
         check_numbers(page, raw)
     for page in all_pages:
         check_links(page, parse(page)[0], lambda d: parse(d)[0].ids)
+    check_readme_charts()
     js = os.path.join(SITE, "assets", "site.js")
     node = shutil.which("node")
     if node and os.path.isfile(js):
