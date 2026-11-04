@@ -252,7 +252,8 @@ build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-03 all 1d --tz Eu
 build/embedded-example /tmp/tsdb-qs/lib
 
 # 6. Start the server in the background. It saves its process id, so we can stop exactly this one.
-build/tsdbd --dir /tmp/tsdb-qs/server --port 17070 > /tmp/tsdb-qs/tsdbd.log 2>&1 &
+#    --no-auth: no logins, anyone who reaches the port may read and write (fine for this try-out on your machine).
+build/tsdbd --dir /tmp/tsdb-qs/server --no-auth --port 17070 > /tmp/tsdb-qs/tsdbd.log 2>&1 &
 echo $! > /tmp/tsdb-qs/tsdbd.pid
 for i in $(seq 100); do grep -q serving /tmp/tsdb-qs/tsdbd.log && break; sleep 0.1; done
 
