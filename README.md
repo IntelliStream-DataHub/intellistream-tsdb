@@ -251,14 +251,18 @@ build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-03 all 1d --tz Eu
 # 5. The same from a C program, with no server: it writes a day and reads it back.
 build/embedded-example /tmp/tsdb-qs/lib
 
-# 6. Start the server in the background. It saves its process id, so we can stop exactly this one.
-#    --no-auth: no logins, anyone who reaches the port may read and write (fine for this try-out on your machine).
-build/tsdbd --dir /tmp/tsdb-qs/server --no-auth --port 17070 > /tmp/tsdb-qs/tsdbd.log 2>&1 &
+# 6. The server lets in only clients that log in, and it does not start without a user who may do
+#    everything (a "superuser"). Add one called admin. Its password goes in a file only you can read:
+#    tsdb never takes a password from the command line, where other users could see it.
+#    Then start the server in the background. It saves its process id, so we can stop exactly this one.
+(umask 077 && echo 'try-out-password-17' > /tmp/tsdb-qs/password)
+build/tsdb /tmp/tsdb-qs/server user add admin --superuser --password-file /tmp/tsdb-qs/password
+build/tsdbd --dir /tmp/tsdb-qs/server --port 17070 > /tmp/tsdb-qs/tsdbd.log 2>&1 &
 echo $! > /tmp/tsdb-qs/tsdbd.pid
 for i in $(seq 100); do grep -q serving /tmp/tsdb-qs/tsdbd.log && break; sleep 0.1; done
 
-# 7. A client writes a day to the server and reads it back over the network.
-build/client-example 127.0.0.1 17070
+# 7. A client logs in as admin, writes a day to the server and reads it back over the network.
+build/client-example 127.0.0.1 17070 admin /tmp/tsdb-qs/password
 
 # 8. Stop the server, wait until it has gone (it finishes its writes first), then look at what it stored.
 kill $(cat /tmp/tsdb-qs/tsdbd.pid)
@@ -303,10 +307,17 @@ Oslo day 1: 1320 rows, average 50.23
 Oslo day 2: 120 rows, average 47.47
 ```
 
-Step 6 writes this line to `/tmp/tsdb-qs/tsdbd.log` (the details differ on your machine):
+Step 6 prints the new user and its number:
+
+<!-- quickstart-output -->
+```
+admin	uid 1	superuser
+```
+
+and writes this line to `/tmp/tsdb-qs/tsdbd.log` (the details differ on your machine):
 
 ```
-tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, no login (--no-auth), simd avx512, io io_uring
+tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, login required, simd avx512, io io_uring
 ```
 
 Step 8 prints a table with `rows 1440`: what the client wrote is on disk in the server's directory.
@@ -444,7 +455,7 @@ The key lines of the C client (link with `build/libtsdbclient.a -lzstd -lpthread
 
 ```c
 tsdbc *c;
-tsdbc_connect("127.0.0.1", 7070, &c);
+tsdbc_connect_auth("127.0.0.1", 7070, "acme/ingest", password, &c);  /* log in (see "Users and logins") */
 tsdb_sid id;                                         /* 64-bit; look it up by name, never count ids */
 tsdbc_series(c, "pump7.flow", 1, &id);
 tsdbc_insert_series(c, id, times, values, n);
@@ -457,6 +468,35 @@ on (a server that vanished without a word is noticed about a minute later).
 A request waits as long as the server takes unless you set a timeout
 (`tsdbc_set_timeout`); after a timeout or any connection error the client
 refuses further calls on that connection, so close it and connect again.
+
+### Users and logins
+
+tsdbd lets in only clients that log in with a user name and a password. The password never crosses the network:
+client and server prove to each other that they know it (SCRAM-SHA-256, the method PostgreSQL uses). The server
+keeps only a value made from the password, from which nobody can log in. tsdbd does not start until the
+database has at least one superuser, a user who may do everything:
+
+```sh
+build/tsdb /data/sensors user add admin --superuser    # asks for the password (or --password-file FILE)
+```
+
+Every other user gets rights on some series. A right is `read`, `insert`, `delete` or `admin` (`write` means
+insert and delete). It applies to `all` series, to the series whose name starts with a prefix (`prefix:acme/`),
+to one series (`name:pump7.flow`), or to the names a pattern matches (`glob:acme/*/temp?`: `*` is any text, `?` is
+one character). A collector that should only add data, never read or delete it:
+
+```sh
+build/tsdb /data/sensors user add acme/ingest --password-file /etc/tsdb/acme-ingest.password
+build/tsdb /data/sensors user grant acme/ingest insert prefix:acme/
+build/tsdb /data/sensors user list
+```
+
+These commands change the file `USERS` in the database directory and work while tsdbd runs: it sees the change
+within a second. A series a user may not touch answers like a series that does not exist. A user with `admin` on
+a prefix manages the users whose names start with it, over the network (`tsdb user ... --server HOST:PORT
+--login NAME`). `--no-auth` turns logins off, so that anyone who reaches the port may do everything: use it only
+for tests and try-outs on your own machine. `tsdb <dir> user` on its own lists every command, and
+[SECURITY.md](SECURITY.md) says what logins protect and what they do not.
 
 ### Backup and moving to a new version
 
@@ -530,5 +570,5 @@ The libraries tsdb builds on, and their licenses, are listed in [docs/licenses.m
 ## Contributing and security
 
 Want to help? [CONTRIBUTING.md](CONTRIBUTING.md) tells you how to build, test and send a change.
-tsdb is made for a trusted network (no login or encryption yet): please read [SECURITY.md](SECURITY.md) before you
+tsdb is made for a trusted network (logins, but no encryption yet): please read [SECURITY.md](SECURITY.md) before you
 run it anywhere else, and to report a vulnerability.

@@ -1657,18 +1657,40 @@ in one frame (256 MB), or a query over more than 4M buckets, is
 `TSDB_ERR_TOO_MANY_BUCKETS`. A compressed (packed)
 insert that would be larger than a frame unpacked is refused before anything is
 decompressed. A bad number on the command line (`--port 70000`, `--workers 0`)
-stops the server at once with status 2. Without authentication a client can
+stops the server at once with status 2. A client that has logged in can
 still take the whole limit with large frames it sends slowly, for
-`--frame-timeout` at a time, so that other clients' large frames wait.
+`--frame-timeout` at a time, so that other clients' large frames wait. Before
+login a connection holds at most two frames of 4 KiB (`TSDB_PRELOGIN_MAX`) and
+is closed after `--login-timeout` seconds (default 10), so an anonymous client
+cannot.
 
-There is no authentication or TLS: listen on loopback or a trusted network.
+**Login and access control** ([design-auth.md](design-auth.md) has the
+decisions). A client logs in right after HELLO with SCRAM-SHA-256 in
+PostgreSQL's message flow (`AUTH_START`, `AUTH_CONTINUE`); the server keeps per
+user a salt, an iteration count, StoredKey and ServerKey, in `USERS` in the
+database root (append-only checksummed records under an OFD lock, fail-stop on
+a failed write or sync, as the other append-only files). `tsdb <dir> user ...`
+appends to it while tsdbd runs, and a thread of tsdbd reads new records once a
+second (`server/users.c`). An unknown user gets a mock salt that stays the same
+across restarts and fails exactly as a wrong password does (`server/auth.c`).
+Every request then passes one table indexed by op number (the op list is an
+X-macro in `tsdb_protocol.h`): the rights it needs, where its series are (a
+name, an id, an id per row, the ids of a QUERY_MULTI, none), and whether it is
+for a superuser only; an op without an entry is refused. Names are matched
+against the user's grants (exact names and prefixes by hash lookups, globs by a
+bit-parallel matcher linear in the name); ids are checked through their names,
+with a map of rights by id that all connections of one user share. A series
+the user holds no right on answers like a missing one. tsdbd does not start
+without a superuser unless `--no-auth`, which lets every client do everything
+and refuses the user admin requests. There is no TLS yet: listen on loopback or
+a trusted network.
 
 The client library (`build/libtsdbclient.a`, [`client/tsdb_client.h`](client/tsdb_client.h))
 mirrors the embedded API and does not link the storage engine:
 
 ```c
 tsdbc *c;
-tsdbc_connect("127.0.0.1", 7070, &c);
+tsdbc_connect_auth("127.0.0.1", 7070, "acme/ingest", password, &c); /* SCRAM; keys cached per process */
 tsdb_sid id;                                       /* 64-bit; look it up by name, never count ids */
 tsdbc_series(c, "pump7.flow", 1, &id);
 tsdbc_insert_series_async(c, id, ts, values, n);   /* pipelined */

@@ -1,6 +1,11 @@
 # tsdbd as a systemd service (README.dist). Install:
 #   useradd -r -s /sbin/nologin -d /var/lib/tsdb tsdb
+#   install -d -o tsdb -g tsdb -m 750 /var/lib/tsdb
+#   runuser -u tsdb -- /usr/local/bin/tsdb /var/lib/tsdb user add admin --superuser
 #   cp tsdbd.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now tsdbd
+#
+# tsdbd refuses to start until the database has a superuser: the `user add ... --superuser` line above, run as
+# the tsdb user so that it owns USERS. --no-auth would let every client do everything; do not use it here.
 #
 # Type=simple: tsdbd does not call sd_notify; systemd counts it as started
 # once it runs, and it listens within milliseconds of that.
@@ -19,7 +24,7 @@ User=tsdb
 Group=tsdb
 # /var/lib/tsdb, created and owned by User= when missing
 StateDirectory=tsdb
-# There is no authentication: listen on a trusted interface only.
+# Clients log in, but there is no TLS (data travels in the clear): listen on a trusted interface only.
 ExecStart=/usr/local/bin/tsdbd --dir /var/lib/tsdb --listen 127.0.0.1 --port 7070
 # SIGTERM: requests in progress finish, the WAL is synced, then it exits
 KillSignal=SIGTERM

@@ -1,8 +1,9 @@
 # Prometheus metrics
 
 `tsdbd --metrics-port 9170` serves `GET /metrics` in the Prometheus text format (0.0.4) on a port of its own.
-It is off by default and binds to `--listen` unless `--metrics-bind ADDR` says otherwise. There is no
-authentication, like the main port: bind it to a trusted interface. `--metrics-port auto` takes a port the kernel
+It is off by default and binds to `--listen` unless `--metrics-bind ADDR` says otherwise. Unlike the main port it
+has no login, so Prometheus can scrape it as it is: bind it to a trusted interface. It shows counts for the whole
+server, never user names, series names or values. `--metrics-port auto` takes a port the kernel
 chooses, which `--port-file` reports as its third number (for tests that must not compute a port).
 
 ```yaml
@@ -46,7 +47,8 @@ directory) and `path`.
 | `tsdb_inserted_rows_total` | counter | rows in successful insert requests |
 | `tsdb_multi_series_total` | counter | series answered by many-series requests (QUERY_MULTI, `op="query_multi"` in the request counters) |
 | `tsdb_multi_deferred_total` | counter | series of such requests too large to hold ahead of their turn, run again at it (streaming); a high rate next to `tsdb_multi_series_total` means the requests are mostly large series |
-| `tsdb_request_errors_total{code}` | counter | replies with an error status: `io`, `invalid`, `notfound`, ... |
+| `tsdb_request_errors_total{code}` | counter | replies with an error status: `io`, `invalid`, `notfound`, ...; `denied` is a request for series or operations the user holds no right on, `auth` a failed login or a request before login |
+| `tsdb_logins_total{result}` | counter | login attempts: `ok`; `failed` (a wrong password, an unknown user or a malformed exchange: they are not told apart); `timeout` (not logged in within `--login-timeout`); `refused` (another request, or a message over 4 KiB, before login) |
 | `tsdb_query_duration_seconds{op}` | histogram | time a worker spent on a query request (0.5 ms to 30 s), up to handing the reply to the kernel, so a slow client taking a large result adds to it |
 | `tsdb_connections`, `tsdb_connections_max` | gauge | open connections on the main port, and the limit |
 | `tsdb_connections_accepted_total`, `tsdb_connections_rejected_total` | counter | accepted, and closed at once for the limit |
@@ -57,4 +59,6 @@ directory) and `path`.
 Useful expressions: `rate(tsdb_inserted_rows_total[1m])` is the insert rate;
 `histogram_quantile(0.99, sum by (le, op) (rate(tsdb_query_duration_seconds_bucket[5m])))` the p99 query time;
 `tsdb_failed == 1` pages someone; `tsdb_follow_refresh_age_seconds > 5` means the follower has stopped refreshing (it does not detect a dead writer);
-`tsdb_memtable_rows` growing without bound means flushes are not keeping up.
+`tsdb_memtable_rows` growing without bound means flushes are not keeping up;
+`rate(tsdb_logins_total{result="failed"}[5m])` well above zero is a client with a wrong password, or someone
+guessing (tsdbd's log names the user and the address, at most one line a second).
