@@ -297,6 +297,37 @@ def check_site_charts(page, raw, fix):
     return out
 
 
+SITE_CAR = re.compile(r"(<!-- site-car -->)(.*?)(<!-- /site-car -->)", re.S)
+_car = []
+
+
+def check_site_car(page, raw, fix):
+    """The hero's car is what tools/site-car.js draws (with node; without it this is skipped)."""
+    if not SITE_CAR.search(raw):
+        return raw
+    node = shutil.which("node")
+    if not node:
+        print("check_site: node not found, the hero's car is not compared with tools/site-car.js")
+        return raw
+    if not _car:
+        r = subprocess.run([node, os.path.join(ROOT, "tools", "site-car.js")], capture_output=True, text=True)
+        if r.returncode:
+            err(page, f"tools/site-car.js failed: {r.stderr.strip()}")
+            return raw
+        _car.append("\n" + r.stdout.rstrip("\n") + "\n")
+    m = SITE_CAR.search(raw)
+    if m.group(2) == _car[0]:
+        return raw
+    if not fix:
+        err(page, "the hero's car differs from tools/site-car.js (run python3 tests/check_site.py --fix)")
+        return raw
+    out = raw[: m.start(2)] + _car[0] + raw[m.end(2):]
+    with open(page, "w", encoding="utf-8") as f:
+        f.write(out)
+    print(f"updated {os.path.relpath(page, ROOT)} (car)")
+    return out
+
+
 def check_readme_charts():
     """The README's charts (docs/img/bench-*.svg) are what tools/readme-charts.py draws from its data file, and every
     number of that file is in BENCHMARKS.md's summary tables."""
@@ -343,7 +374,8 @@ def main():
         with open(page, encoding="utf-8") as f:
             raw = f.read()
         raw = check_code(page, raw, fix)
-        check_site_charts(page, raw, fix)
+        raw = check_site_charts(page, raw, fix)
+        check_site_car(page, raw, fix)
         parsed.pop(page, None)
         p, raw = parse(page)
         check_numbers(page, raw)
