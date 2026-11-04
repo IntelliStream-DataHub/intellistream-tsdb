@@ -75,7 +75,7 @@ static size_t add_rows(int64_t *ts, size_t n, size_t count, int64_t *t, int64_t 
 
 static int64_t nulls_from, nulls_to; /* one minute of d holds only nulls */
 
-static void load(tsdb *db, uint32_t *f, uint32_t *d)
+static void load(tsdb *db, tsdb_sid *f, tsdb_sid *d)
 {
     must(tsdb_series_create(db, "f", TSDB_FLOAT32, NULL, f), "create f");
     must(tsdb_series_create(db, "d", TSDB_FLOAT64, NULL, d), "create d");
@@ -125,7 +125,7 @@ static void load(tsdb *db, uint32_t *f, uint32_t *d)
     must(tsdb_insert_series_values(db, *d, ts, &vals, m), "overlap d");
     must(tsdb_flush(db), "flush");
     for (int s = 0; s < 2; s++) {
-        uint32_t id = s ? *d : *f;
+        tsdb_sid id = s ? *d : *f;
         must(tsdb_delete_range(db, id, T0 + 600000 + 10000, T0 + 600000 + 40000), "delete inside a minute");
         int64_t e = (ts[4500] / 60000) * 60000;
         must(tsdb_delete_range(db, id, e - 5000, e + 5000), "delete across an edge");
@@ -185,7 +185,7 @@ static int64_t ref_start(int64_t ts, int64_t iv, const int64_t *bounds, size_t n
 }
 
 /* the answer against the live rows of [start, end) */
-static void check(tsdb *db, uint32_t s, int64_t start, int64_t end, int64_t iv, const int64_t *bounds, size_t nbd,
+static void check(tsdb *db, tsdb_sid s, int64_t start, int64_t end, int64_t iv, const int64_t *bounds, size_t nbd,
                   const tsdb_bucket *b, size_t nb, const char *what)
 {
     live l = {0};
@@ -205,21 +205,22 @@ static void check(tsdb *db, uint32_t s, int64_t start, int64_t end, int64_t iv, 
             mx = l.v[j] > mx ? l.v[j] : mx;
         }
         if (k == nb) {
-            CHECK(0, "%s: series %u iv %lld: bucket at %lld missing (answer has %zu)", what, s, (long long)iv,
+            CHECK(0, "%s: series %u iv %lld: bucket at %lld missing (answer has %zu)", what, TSDB_SID_LOCAL(s), (long long)iv,
                   (long long)bs, nb);
             break;
         }
         CHECK(b[k].start == bs && b[k].count == count, "%s: series %u iv %lld bucket %zu: start %lld count %llu, "
-              "want %lld %llu", what, s, (long long)iv, k, (long long)b[k].start, (unsigned long long)b[k].count,
+              "want %lld %llu", what, TSDB_SID_LOCAL(s), (long long)iv, k, (long long)b[k].start, (unsigned long long)b[k].count,
               (long long)bs, (unsigned long long)count);
         if (count)
             CHECK(b[k].min == mn && b[k].max == mx && fabs(b[k].sum - sum) <= 1e-9 * (fabs(sum) + 1),
-                  "%s: series %u iv %lld bucket at %lld: min %g max %g sum %.17g, want %g %g %.17g", what, s,
+                  "%s: series %u iv %lld bucket at %lld: min %g max %g sum %.17g, want %g %g %.17g", what,
+                  TSDB_SID_LOCAL(s),
                   (long long)iv, (long long)bs, b[k].min, b[k].max, b[k].sum, mn, mx, sum);
         k++;
         i = j;
     }
-    CHECK(k == nb, "%s: series %u iv %lld: %zu buckets, want %zu", what, s, (long long)iv, nb, k);
+    CHECK(k == nb, "%s: series %u iv %lld: %zu buckets, want %zu", what, TSDB_SID_LOCAL(s), (long long)iv, nb, k);
     free(l.ts);
     free(l.v);
     free(l.null);
@@ -242,7 +243,7 @@ static void put(blob *b, const void *p, size_t n)
     b->n += n + 8;
 }
 
-static void answers(tsdb *db, const uint32_t *ids, bool verify, blob *out)
+static void answers(tsdb *db, const tsdb_sid *ids, bool verify, blob *out)
 {
     static const int64_t iv[] = {1000, 7000, 60000, 3600000};
     int64_t lo = T0 + 12345, hi = T0 + 1000LL * 86400000;
@@ -285,7 +286,7 @@ int main(int argc, char **argv)
     char dir[512];
     snprintf(dir, sizeof dir, "%s/test_buckets_%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     tsdb *db = open_db(dir, 1);
-    uint32_t ids[2];
+    tsdb_sid ids[2];
     load(db, &ids[0], &ids[1]);
     uint64_t seed = rnd_state;
     blob ref = {0};
