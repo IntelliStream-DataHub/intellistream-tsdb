@@ -1,31 +1,31 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="830" height="222" viewBox="0 0 830 222">
 <style>text{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;font-size:12px;fill:#e6edf3}.h{font-size:14px;font-weight:600}.m{font-size:11.5px;fill:#9198a1}.n{fill:#e6edf3}.v{font-size:11.5px;fill:#9198a1}.us .n,.us .v{font-weight:700;fill:#e6edf3}.b{fill:#557f61}.us .b{fill:#6cb1ff}.r{stroke:#3d444d;stroke-width:1}.fail{fill:#3d1214;stroke:#f85149;stroke-width:1}.failt{font-size:11px;fill:#ffa198}.none{fill:#151b23;stroke:#3d444d;stroke-width:1}.nonet{font-size:11.5px;font-style:italic;fill:#9198a1}</style>
 <text x="0" y="14" class="h">Size on disk</text>
-<text x="0" y="31" class="m">GB; times tsdb's size; log scale</text>
+<text x="0" y="31" class="m">GB; times tsdb's size; shorter is better</text>
 <line x1="104" x2="104" y1="40" y2="84" class="r"/>
 <g class="us"><text x="0" y="57" class="n">tsdb</text>
-<rect x="104" y="47" width="3.0" height="13" rx="2" class="b"/><text x="112.0" y="57" class="v">137.8 GB</text>
+<rect x="104" y="47" width="76.7" height="13" rx="2" class="b"/><text x="185.7" y="57" class="v">137.8 GB</text>
 </g>
 <g><text x="0" y="77" class="n">ClickHouse</text>
-<rect x="104" y="67" width="73.4" height="13" rx="2" class="b"/><text x="182.4" y="77" class="v">1.5× (212.1 GB)</text>
+<rect x="104" y="67" width="118.0" height="13" rx="2" class="b"/><text x="227.0" y="77" class="v">1.5× (212.1 GB)</text>
 </g>
 <text x="429" y="14" class="h">Ingest</text>
-<text x="429" y="31" class="m">speed; tsdb = full bar; log scale</text>
+<text x="429" y="31" class="m">speed; tsdb = full bar; longer is better</text>
 <line x1="533" x2="533" y1="40" y2="84" class="r"/>
 <g class="us"><text x="429" y="57" class="n">tsdb</text>
 <rect x="533" y="47" width="118.0" height="13" rx="2" class="b"/><text x="656.0" y="57" class="v">109.4 M rows/s</text>
 </g>
 <g><text x="429" y="77" class="n">ClickHouse</text>
-<rect x="533" y="67" width="89.2" height="13" rx="2" class="b"/><text x="627.2" y="77" class="v">2.1× slower (51.6 M rows/s)</text>
+<rect x="533" y="67" width="56.2" height="13" rx="2" class="b"/><text x="594.2" y="77" class="v">2.1× slower (51.6 M rows/s)</text>
 </g>
 <text x="0" y="120" class="h">Read</text>
-<text x="0" y="137" class="m">speed; tsdb = full bar; log scale</text>
+<text x="0" y="137" class="m">speed; tsdb = full bar; longer is better</text>
 <line x1="104" x2="104" y1="146" y2="190" class="r"/>
 <g class="us"><text x="0" y="163" class="n">tsdb</text>
 <rect x="104" y="153" width="118.0" height="13" rx="2" class="b"/><text x="227.0" y="163" class="v">1,910 M rows/s</text>
 </g>
 <g><text x="0" y="183" class="n">ClickHouse</text>
-<rect x="104" y="173" width="87.9" height="13" rx="2" class="b"/><text x="196.9" y="183" class="v">2.2× slower (886 M rows/s)</text>
+<rect x="104" y="173" width="53.6" height="13" rx="2" class="b"/><text x="162.6" y="183" class="v">2.2× slower (886 M rows/s)</text>
 </g>
 <text x="429" y="120" class="h">Max memory</text>
 <text x="429" y="137" class="m">GB; linear scale</text>

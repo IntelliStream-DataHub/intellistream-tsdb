@@ -220,12 +220,16 @@
             grow(+x, +y);
             return m;
         });
+        var carMid = (minx + maxx) / 2, carHalf = (maxx - minx) / 2; /* the car itself, without its streaks */
         streaks.forEach(function (s) {
             grow(s[0], s[1]);
             grow(s[2], s[3]);
         });
         var pad = 12;
-        var vb = [Math.floor(minx - pad), Math.floor(miny - pad), Math.ceil(maxx - minx + 2 * pad),
+        /* the box is the car's own width, centred on it, so the car (not car and streaks together) sits in the middle
+         * of the banner at its full size; the streaks that trail past the box are drawn anyway (overflow: visible) */
+        var half = carHalf;
+        var vb = [Math.floor(carMid - half - pad), Math.floor(miny - pad), Math.ceil(2 * half + 2 * pad),
             Math.ceil(maxy - miny + 2 * pad)];
         var cx = (nose[0] + tail[0]) / 2, cy = (nose[1] + tail[1]) / 2;
         var out = [];

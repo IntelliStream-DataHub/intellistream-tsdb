@@ -7,13 +7,13 @@
 The numbers come from tools/readme-charts.json, which holds them as BENCHMARKS.md prints them (the check makes sure
 every one is there). Each chart is small multiples: one panel per measure, one bar per system, tsdb highlighted.
 
-- Throughput panels (ingest, read): the bar is speed relative to tsdb, so tsdb's is the full bar and a system
-  N times slower has a shorter one. The scale is logarithmic (every factor of 10 takes the same length), and the
-  axis runs from tsdb's speed down to ten times below the panel's slowest system, so 2.6x and 2,423x both stay
-  readable and the slowest bar is still visible.
-- Latency panels (TWA, LTTB): the bar is the time relative to tsdb's on a log scale, shorter is better, tsdb's the
-  shortest (a system N times slower is log N long).
-- Size panels: times tsdb's size on a log scale, shorter is better, tsdb's the shortest.
+Every scale is linear (the user's rule: twice the performance is a bar twice as long), so a system hundreds of times
+slower gets a bar a few pixels long; the label beside it carries the number.
+- Throughput panels (ingest, read): the bar is speed, so tsdb's is the full bar and a system N times slower has one
+  1/N as long.
+- Latency panels (TWA, LTTB): the bar is the time, shorter is better; the slowest system has the full bar and tsdb's
+  is 1/N of it.
+- Size panels: the bar is the size, shorter is better, the largest system's the full bar.
 - Memory: gigabytes on a linear scale; a red tag beside the bar says where the system failed (at 32 clients).
 - No number (not measured, no such function): a marked box with the reason, never a bar.
 
@@ -88,14 +88,13 @@ def rows_of(panel, systems):
     if kind == "size":
         base = num(vals[0])
         ratios = [num(v) / base for v in vals if not isinstance(v, dict)]
-        top = math.log(max(ratios + [2.0]))
+        top = max(ratios + [1.0])
         for i, (name, v) in enumerate(zip(systems, vals)):
             r = num(v) / base
-            out.append((name, "us" if i == 0 else "bar", math.log(r) / top, v if i == 0 else f"{times(r)}× ({v})", None))
+            out.append((name, "us" if i == 0 else "bar", r / top, v if i == 0 else f"{times(r)}× ({v})", None))
     elif kind == "slower":
         unit = " rows/s" if panel["unit"] == "rows/s" else ""
         slow = [num(v[1]) for v in vals[1:] if not isinstance(v, dict)]
-        span = math.log(max(slow + [1.0])) + math.log(10)  # tsdb down to ten times below the slowest
         for i, (name, v) in enumerate(zip(systems, vals)):
             if isinstance(v, dict):
                 out.append((name, "none", None, v["none"], None))
@@ -103,19 +102,19 @@ def rows_of(panel, systems):
                 out.append((name, "us", 1.0, v[0] + unit, None))
             else:
                 r = num(v[1])
-                out.append((name, "bar", 1 - math.log(r) / span, f"{v[1].replace('x', '')}× slower ({v[0]}{unit})",
+                out.append((name, "bar", 1 / r, f"{v[1].replace('x', '')}× slower ({v[0]}{unit})",
                             None))
     elif kind == "latency":  # [time, "29x"], like "slower", drawn the other way: longer is slower
         slow = [num(v[1]) for v in vals[1:] if not isinstance(v, dict)]
-        top = math.log(max(slow + [2.0]))
+        top = max(slow + [1.0])
         for i, (name, v) in enumerate(zip(systems, vals)):
             if isinstance(v, dict):
                 out.append((name, "none", None, v["none"], None))
             elif i == 0:
-                out.append((name, "us", 0.0, v[0], None))
+                out.append((name, "us", 1 / top, v[0], None))
             else:
                 r = num(v[1])
-                out.append((name, "bar", math.log(r) / top, f"{v[1].replace('x', '')}× slower ({v[0]})", None))
+                out.append((name, "bar", r / top, f"{v[1].replace('x', '')}× slower ({v[0]})", None))
     else:  # absolute: [value] or [value, failure tag]
         top = max([num(v[0]) for v in vals] + [num(panel.get("limit", "0"))])
         for i, (name, v) in enumerate(zip(systems, vals)):
@@ -127,9 +126,9 @@ def subtitle(panel):
     """The line under a panel's title: its unit, which way is better, and the scale."""
     if panel.get("note"):
         return panel["note"]
-    return {"size": f"{panel['unit']}; times tsdb's size; log scale",
-            "slower": "speed; tsdb = full bar; log scale",
-            "latency": f"{panel['unit']}; shorter is better; log scale",
+    return {"size": f"{panel['unit']}; times tsdb's size; shorter is better",
+            "slower": "speed; tsdb = full bar; longer is better",
+            "latency": f"{panel['unit']}; shorter is better",
             "absolute": f"{panel['unit']}; linear scale"}[panel["kind"]]
 
 

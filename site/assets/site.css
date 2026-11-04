@@ -321,8 +321,8 @@ th.num {
 
 .topnav a:hover,
 .icon-btn:hover {
-    border-color: var(--cyan);
-    box-shadow: 0 0 18px color-mix(in srgb, var(--cyan) 30%, transparent);
+    border-color: color-mix(in srgb, var(--text) 30%, transparent);
+    box-shadow: 0 0 18px color-mix(in srgb, var(--cyan) 22%, transparent);
 }
 
 .topnav a:active,
@@ -496,7 +496,8 @@ th.num {
 }
 
 .car3d {
-    width: min(1040px, 100%);
+    width: min(900px, 86%);
+    overflow: visible; /* the streaks run past the car's box */
 }
 
 .car3d .near,
@@ -949,7 +950,6 @@ footer.site p {
 .sidebar a[aria-current="page"] {
     color: var(--text);
     background: linear-gradient(90deg, color-mix(in srgb, var(--cyan) 18%, transparent), transparent);
-    box-shadow: inset 3px 0 0 var(--cyan);
 }
 
 .sidebar .toc {
