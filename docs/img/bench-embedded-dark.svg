@@ -37,28 +37,28 @@
 <rect x="104" y="213" width="41.4" height="13" rx="2" class="b"/><text x="150.4" y="223" class="v">71× slower (23.9 M rows/s)</text>
 </g>
 <text x="429" y="140" class="h">Time-weighted average</text>
-<text x="429" y="157" class="m">speed; tsdb = full bar; log scale</text>
+<text x="429" y="157" class="m">median time; shorter is better; log scale</text>
 <line x1="533" x2="533" y1="166" y2="230" class="r"/>
 <g class="us"><text x="429" y="183" class="n">tsdb</text>
-<rect x="533" y="173" width="118.0" height="13" rx="2" class="b"/><text x="656.0" y="183" class="v">38.7 ms</text>
+<rect x="533" y="173" width="3.0" height="13" rx="2" class="b"/><text x="541.0" y="183" class="v">38.7 ms</text>
 </g>
 <g><text x="429" y="203" class="n">chDB</text>
-<rect x="533" y="193" width="54.8" height="13" rx="2" class="b"/><text x="592.8" y="203" class="v">27× slower (1,054 ms)</text>
+<rect x="533" y="193" width="101.0" height="13" rx="2" class="b"/><text x="639.0" y="203" class="v">27× slower (1,054 ms)</text>
 </g>
 <g><text x="429" y="223" class="n">DuckDB</text>
-<rect x="533" y="213" width="44.2" height="13" rx="2" class="b"/><text x="582.2" y="223" class="v">47× slower (1,820 ms)</text>
+<rect x="533" y="213" width="118.0" height="13" rx="2" class="b"/><text x="656.0" y="223" class="v">47× slower (1,820 ms)</text>
 </g>
 <text x="0" y="266" class="h">LTTB downsampling</text>
-<text x="0" y="283" class="m">speed; tsdb = full bar; log scale</text>
+<text x="0" y="283" class="m">median time; shorter is better; log scale</text>
 <line x1="104" x2="104" y1="292" y2="356" class="r"/>
 <g class="us"><text x="0" y="309" class="n">tsdb</text>
-<rect x="104" y="299" width="118.0" height="13" rx="2" class="b"/><text x="227.0" y="309" class="v">404 ms</text>
+<rect x="104" y="299" width="3.0" height="13" rx="2" class="b"/><text x="112.0" y="309" class="v">404 ms</text>
 </g>
 <g><text x="0" y="329" class="n">chDB</text>
-<rect x="104" y="319" width="113.3" height="13" rx="2" class="b"/><text x="222.3" y="329" class="v">1.1× slower (432 ms)</text>
+<rect x="104" y="319" width="16.2" height="13" rx="2" class="b"/><text x="125.2" y="329" class="v">1.1× slower (432 ms)</text>
 </g>
 <g><text x="0" y="349" class="n">DuckDB</text>
 <rect x="104" y="338" width="297" height="15" rx="3" class="none"/><text x="110" y="349" class="nonet">not measured</text>
 </g>
-<text x="0" y="380" class="m">Speed: tsdb is the full bar. Size and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: BENCHMARKS.md</text>
+<text x="0" y="380" class="m">Ingest, read: tsdb is the full bar. Time, size, memory: shorter is better. A box: no number, and why. Exact numbers: BENCHMARKS.md</text>
 </svg>

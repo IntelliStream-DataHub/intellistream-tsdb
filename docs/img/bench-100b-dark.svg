@@ -36,5 +36,5 @@
 <g><text x="429" y="183" class="n">ClickHouse</text>
 <rect x="533" y="173" width="118.0" height="13" rx="2" class="b"/><text x="656.0" y="183" class="v">5.9 GB</text>
 </g>
-<text x="0" y="214" class="m">Speed: tsdb is the full bar. Size and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: BENCHMARKS.md</text>
+<text x="0" y="214" class="m">Ingest, read: tsdb is the full bar. Time, size, memory: shorter is better. A box: no number, and why. Exact numbers: BENCHMARKS.md</text>
 </svg>

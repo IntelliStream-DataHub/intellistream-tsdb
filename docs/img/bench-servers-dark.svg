@@ -100,46 +100,46 @@
 <rect x="104" y="493" width="43.7" height="13" rx="2" class="b"/><text x="152.7" y="503" class="v">261× slower (5.84 M rows/s)</text>
 </g>
 <text x="429" y="280" class="h">Time-weighted average</text>
-<text x="429" y="297" class="m">speed; tsdb = full bar; log scale</text>
+<text x="429" y="297" class="m">median time; shorter is better; log scale</text>
 <line x1="533" x2="533" y1="306" y2="510" class="r"/>
 <g class="us"><text x="429" y="323" class="n">tsdb</text>
-<rect x="533" y="313" width="118.0" height="13" rx="2" class="b"/><text x="656.0" y="323" class="v">36.4 ms</text>
+<rect x="533" y="313" width="3.0" height="13" rx="2" class="b"/><text x="541.0" y="323" class="v">36.4 ms</text>
 </g>
 <g><text x="429" y="343" class="n">ClickHouse</text>
-<rect x="533" y="333" width="78.6" height="13" rx="2" class="b"/><text x="616.6" y="343" class="v">29× slower (1,063 ms)</text>
+<rect x="533" y="333" width="51.0" height="13" rx="2" class="b"/><text x="589.0" y="343" class="v">29× slower (1,063 ms)</text>
 </g>
 <g><text x="429" y="363" class="n">InfluxDB 2</text>
 <rect x="533" y="352" width="297" height="15" rx="3" class="none"/><text x="539" y="363" class="nonet">not measured: other answers</text>
 </g>
 <g><text x="429" y="383" class="n">InfluxDB 3</text>
-<rect x="533" y="373" width="54.3" height="13" rx="2" class="b"/><text x="592.3" y="383" class="v">233× slower (8,488 ms)</text>
+<rect x="533" y="373" width="82.5" height="13" rx="2" class="b"/><text x="620.5" y="383" class="v">233× slower (8,488 ms)</text>
 </g>
 <g><text x="429" y="403" class="n">VictoriaMetrics</text>
 <rect x="533" y="392" width="297" height="15" rx="3" class="none"/><text x="539" y="403" class="nonet">no such function</text>
 </g>
 <g><text x="429" y="423" class="n">QuestDB*</text>
-<rect x="533" y="413" width="75.8" height="13" rx="2" class="b"/><text x="613.8" y="423" class="v">37× slower (1,336 ms)</text>
+<rect x="533" y="413" width="54.7" height="13" rx="2" class="b"/><text x="592.7" y="423" class="v">37× slower (1,336 ms)</text>
 </g>
 <g><text x="429" y="443" class="n">TimescaleDB</text>
-<rect x="533" y="433" width="42.7" height="13" rx="2" class="b"/><text x="580.7" y="443" class="v">628× slower (22,869 ms)</text>
+<rect x="533" y="433" width="97.6" height="13" rx="2" class="b"/><text x="635.6" y="443" class="v">628× slower (22,869 ms)</text>
 </g>
 <g><text x="429" y="463" class="n">IoTDB</text>
-<rect x="533" y="453" width="26.9" height="13" rx="2" class="b"/><text x="564.9" y="463" class="v">2,423× slower (88,214 ms)</text>
+<rect x="533" y="453" width="118.0" height="13" rx="2" class="b"/><text x="656.0" y="463" class="v">2,423× slower (88,214 ms)</text>
 </g>
 <g><text x="429" y="483" class="n">TDengine</text>
-<rect x="533" y="473" width="35.2" height="13" rx="2" class="b"/><text x="573.2" y="483" class="v">1,188× slower (43,254 ms)</text>
+<rect x="533" y="473" width="107.2" height="13" rx="2" class="b"/><text x="645.2" y="483" class="v">1,188× slower (43,254 ms)</text>
 </g>
 <g><text x="429" y="503" class="n">Prometheus</text>
 <rect x="533" y="492" width="297" height="15" rx="3" class="none"/><text x="539" y="503" class="nonet">not measured</text>
 </g>
 <text x="0" y="546" class="h">LTTB downsampling</text>
-<text x="0" y="563" class="m">speed; tsdb = full bar; log scale</text>
+<text x="0" y="563" class="m">median time; shorter is better; log scale</text>
 <line x1="104" x2="104" y1="572" y2="776" class="r"/>
 <g class="us"><text x="0" y="589" class="n">tsdb</text>
-<rect x="104" y="579" width="118.0" height="13" rx="2" class="b"/><text x="227.0" y="589" class="v">456 ms</text>
+<rect x="104" y="579" width="3.0" height="13" rx="2" class="b"/><text x="112.0" y="589" class="v">456 ms</text>
 </g>
 <g><text x="0" y="609" class="n">ClickHouse</text>
-<rect x="104" y="599" width="114.2" height="13" rx="2" class="b"/><text x="223.2" y="609" class="v">1.2× slower (540 ms)</text>
+<rect x="104" y="599" width="6.5" height="13" rx="2" class="b"/><text x="115.5" y="609" class="v">1.2× slower (540 ms)</text>
 </g>
 <g><text x="0" y="629" class="n">InfluxDB 2</text>
 <rect x="104" y="618" width="297" height="15" rx="3" class="none"/><text x="110" y="629" class="nonet">not measured</text>
@@ -154,7 +154,7 @@
 <rect x="104" y="678" width="297" height="15" rx="3" class="none"/><text x="110" y="689" class="nonet">not measured</text>
 </g>
 <g><text x="0" y="709" class="n">TimescaleDB</text>
-<rect x="104" y="699" width="48.5" height="13" rx="2" class="b"/><text x="157.5" y="709" class="v">27× slower (12,256 ms)</text>
+<rect x="104" y="699" width="118.0" height="13" rx="2" class="b"/><text x="227.0" y="709" class="v">27× slower (12,256 ms)</text>
 </g>
 <g><text x="0" y="729" class="n">IoTDB</text>
 <rect x="104" y="718" width="297" height="15" rx="3" class="none"/><text x="110" y="729" class="nonet">no such function</text>
@@ -204,7 +204,7 @@
 <g><text x="429" y="769" class="n">Prometheus</text>
 <rect x="533" y="759" width="3.0" height="13" rx="2" class="b"/><text x="541.0" y="769" class="v">1.1 GB</text>
 </g>
-<text x="0" y="800" class="m">Speed: tsdb is the full bar. Size and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: BENCHMARKS.md</text>
+<text x="0" y="800" class="m">Ingest, read: tsdb is the full bar. Time, size, memory: shorter is better. A box: no number, and why. Exact numbers: BENCHMARKS.md</text>
 <text x="0" y="816" class="m">* QuestDB open source, in its default format, which does not compress. It compresses only partitions you convert</text>
 <text x="0" y="832" class="m">to Parquet by hand (with ZSTD 1.02 bytes per reading; converting took 28 minutes); automatic conversion is Enterprise only.</text>
 </svg>

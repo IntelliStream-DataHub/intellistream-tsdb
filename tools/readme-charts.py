@@ -7,10 +7,12 @@
 The numbers come from tools/readme-charts.json, which holds them as BENCHMARKS.md prints them (the check makes sure
 every one is there). Each chart is small multiples: one panel per measure, one bar per system, tsdb highlighted.
 
-- Speed panels (ingest, read, TWA, LTTB): the bar is speed relative to tsdb, so tsdb's is the full bar and a system
+- Throughput panels (ingest, read): the bar is speed relative to tsdb, so tsdb's is the full bar and a system
   N times slower has a shorter one. The scale is logarithmic (every factor of 10 takes the same length), and the
   axis runs from tsdb's speed down to ten times below the panel's slowest system, so 2.6x and 2,423x both stay
   readable and the slowest bar is still visible.
+- Latency panels (TWA, LTTB): the bar is the time relative to tsdb's on a log scale, shorter is better, tsdb's the
+  shortest (a system N times slower is log N long).
 - Size panels: times tsdb's size on a log scale, shorter is better, tsdb's the shortest.
 - Memory: gigabytes on a linear scale; a red tag beside the bar says where the system failed (at 32 clients).
 - No number (not measured, no such function): a marked box with the reason, never a bar.
@@ -103,6 +105,17 @@ def rows_of(panel, systems):
                 r = num(v[1])
                 out.append((name, "bar", 1 - math.log(r) / span, f"{v[1].replace('x', '')}× slower ({v[0]}{unit})",
                             None))
+    elif kind == "latency":  # [time, "29x"], like "slower", drawn the other way: longer is slower
+        slow = [num(v[1]) for v in vals[1:] if not isinstance(v, dict)]
+        top = math.log(max(slow + [2.0]))
+        for i, (name, v) in enumerate(zip(systems, vals)):
+            if isinstance(v, dict):
+                out.append((name, "none", None, v["none"], None))
+            elif i == 0:
+                out.append((name, "us", 0.0, v[0], None))
+            else:
+                r = num(v[1])
+                out.append((name, "bar", math.log(r) / top, f"{v[1].replace('x', '')}× slower ({v[0]})", None))
     else:  # absolute: [value] or [value, failure tag]
         top = max([num(v[0]) for v in vals] + [num(panel.get("limit", "0"))])
         for i, (name, v) in enumerate(zip(systems, vals)):
@@ -115,6 +128,7 @@ def panel_svg(panel, systems, x0, y0):
     p = []
     sub = {"size": f"{panel['unit']}; times tsdb's size; log scale",
            "slower": f"speed; tsdb = full bar; log scale",
+           "latency": f"{panel['unit']}; shorter is better; log scale",
            "absolute": f"{panel['unit']}; linear scale"}[panel["kind"]]
     if panel.get("note"):
         sub = panel["note"]
@@ -163,8 +177,8 @@ def chart_svg(chart, theme):
             h = max(h, ph)
         y += h + 22
     y += 2
-    parts.append(f'<text x="0" y="{y}" class="m">Speed: tsdb is the full bar. Size and memory: shorter is better. '
-                 f'A box instead of a bar: no number, and why. Exact numbers: BENCHMARKS.md</text>')
+    parts.append(f'<text x="0" y="{y}" class="m">Ingest, read: tsdb is the full bar. Time, size, memory: shorter is better. '
+                 f'A box: no number, and why. Exact numbers: BENCHMARKS.md</text>')
     for line in chart.get("footnotes", []):
         y += 16
         if text_w(line, 11.5) > W * 1.08:  # the estimate runs about 10% wide on prose
