@@ -59,6 +59,12 @@ From `cargo metadata` on the four lockfiles (the union is below; `tsdb-client` n
 | crossbeam-deque, -epoch, -utils | 0.8.8, 0.9.21, 0.8.23 | MIT OR Apache-2.0 | linked statically (through rayon) |
 | either | 1.19.0 | MIT OR Apache-2.0 | linked statically (through rayon) |
 | libc | 0.2.189 | MIT OR Apache-2.0 | linked statically |
+| sha2, hmac | 0.10.9, 0.12.1 | MIT OR Apache-2.0 | linked statically (the login, SCRAM-SHA-256) |
+| digest, crypto-common, block-buffer, cpufeatures | 0.10.7, 0.1.7, 0.10.4, 0.2.17 | MIT OR Apache-2.0 | linked statically (through sha2 and hmac) |
+| generic-array | 0.14.7 | MIT | linked statically (through digest) |
+| typenum | 1.20.1 | MIT OR Apache-2.0 | linked statically (through generic-array) |
+| subtle | 2.6.1 | BSD-3-Clause | linked statically (through digest) |
+| version_check | 0.9.5 | MIT/Apache-2.0 | build only (through generic-array) |
 | cc | 1.6.0 | MIT OR Apache-2.0 | build only |
 | find-msvc-tools, jobserver, shlex, pkg-config, cfg-if | 0.1.14, 0.1.35, 2.0.1, 0.3.34, 1.0.5 | MIT OR Apache-2.0 | build only (through cc) |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | build only (through jobserver) |

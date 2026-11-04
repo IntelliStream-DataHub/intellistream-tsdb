@@ -157,8 +157,9 @@ struct Seen {
     payload: Vec<u8>,
 }
 
-/// A server that answers HELLO with `version` and everything else with OK.
+/// A server that answers HELLO with `version` (no login, no mechanisms) and everything else with OK.
 fn fake_server(version: u32) -> (String, thread::JoinHandle<Vec<Seen>>) {
+    let hello = [version.to_le_bytes(), [0; 4]].concat();
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap().to_string();
     let h = thread::spawn(move || {
@@ -169,7 +170,7 @@ fn fake_server(version: u32) -> (String, thread::JoinHandle<Vec<Seen>>) {
             let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
             let mut payload = vec![0; len - 5];
             s.read_exact(&mut payload).unwrap();
-            let body: &[u8] = if h[8] == 1 { &version.to_le_bytes() } else { &[] };
+            let body: &[u8] = if h[8] == 1 { &hello } else { &[] };
             let mut reply = ((9 + body.len()) as u32).to_le_bytes().to_vec();
             reply.extend_from_slice(&h[4..8]);
             reply.extend_from_slice(&[0, 0, 0, 0, 0]);
@@ -199,7 +200,7 @@ fn talk(version: u32, level: i32) -> Vec<Seen> {
 
 #[test]
 fn level_zero_sends_plain_arrays() {
-    let seen = talk(11, 0);
+    let seen = talk(12, 0);
     let ops: Vec<u8> = seen.iter().map(|s| s.op).collect();
     assert_eq!(ops, vec![1, 4, 14, 4]); // HELLO at connect, then version 1 INSERT, plain INSERT_VALUES
     assert_eq!(seen[2].payload[5], 0); // flags
@@ -208,7 +209,7 @@ fn level_zero_sends_plain_arrays() {
 
 #[test]
 fn new_servers_get_packed_frames() {
-    let seen = talk(11, 1);
+    let seen = talk(12, 1);
     let ops: Vec<u8> = seen.iter().map(|s| s.op).collect();
     assert_eq!(ops, vec![1, 14, 14, 4]); // the float32 insert goes as packed INSERT_VALUES
     for (s, ty) in [(&seen[1], 0u8), (&seen[2], 2)] {

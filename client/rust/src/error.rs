@@ -27,6 +27,12 @@ pub enum Status {
     Stopped,
     /// `TSDB_ERR_READONLY` (-9): the server serves a read-only database.
     ReadOnly,
+    /// `TSDB_ERR_DENIED` (-16): the user holds no right for this, or the series does not exist (tsdbd answers
+    /// both alike, so no user learns what other tenants hold).
+    Denied,
+    /// `TSDB_ERR_AUTH` (-17): the login failed (unknown user or wrong password look alike), or the server
+    /// requires one first.
+    Auth,
     /// A code this client does not know.
     Unknown(i32),
 }
@@ -44,6 +50,8 @@ impl Status {
             -7 => Status::TooManyBuckets,
             -8 => Status::Stopped,
             -9 => Status::ReadOnly,
+            -16 => Status::Denied,
+            -17 => Status::Auth,
             c => Status::Unknown(c),
         }
     }
@@ -60,6 +68,8 @@ impl Status {
             Status::TooManyBuckets => -7,
             Status::Stopped => -8,
             Status::ReadOnly => -9,
+            Status::Denied => -16,
+            Status::Auth => -17,
             Status::Unknown(c) => c,
         }
     }
@@ -89,6 +99,8 @@ pub fn strerror(code: i32) -> &'static str {
         -7 => "too many buckets",
         -8 => "stopped",
         -9 => "database is read only",
+        -16 => "permission denied",
+        -17 => "login failed or required",
         _ => "unknown error",
     }
 }
@@ -114,6 +126,10 @@ pub enum Error {
         /// Its error.
         error: Box<Error>,
     },
+    /// The login at connect failed or was refused, by the server ([`Status::Auth`]: unknown user or wrong
+    /// password, which look alike) or by this client: the server did not prove it holds the user's verifier,
+    /// it asks for a login and none was given, or it asks for none and the options require one.
+    Auth(String),
 }
 
 impl Error {
@@ -125,14 +141,16 @@ impl Error {
             Error::Io(_) => -1,
             Error::Protocol(_) => -3,
             Error::InvalidArgument(_) => -4,
+            Error::Auth(_) => Status::Auth.code(),
             Error::Batch { error, .. } => error.code(),
         }
     }
 
-    /// The server status, if the server reported this error.
+    /// The server status, if the server reported this error; [`Status::Auth`] for every failed login.
     pub fn status(&self) -> Option<Status> {
         match self {
             Error::Server(s) => Some(*s),
+            Error::Auth(_) => Some(Status::Auth),
             Error::Batch { error, .. } => error.status(),
             _ => None,
         }
@@ -154,6 +172,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
             Error::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
+            Error::Auth(m) => write!(f, "login failed: {m}"),
             Error::Batch { index, error } => write!(f, "batch entry {index}: {error}"),
         }
     }

@@ -35,6 +35,26 @@ pub fn test_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+/// The tsdbd under test: `$TSDBD` or `../../build/tsdbd`.
+pub fn tsdbd() -> PathBuf {
+    std::env::var_os("TSDBD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/tsdbd"))
+}
+
+/// `tsdb DIR user ARGS` (the CLI beside the tsdbd in use) with `TSDB_PASSWORD` set to `pw`; panics unless it
+/// succeeds. It works on USERS alone, also while tsdbd runs.
+pub fn user_cli(dir: &std::path::Path, pw: Option<&str>, args: &[&str]) {
+    let cli = tsdbd().with_file_name("tsdb");
+    let mut cmd = Command::new(&cli);
+    cmd.arg(dir).arg("user").args(args).stdin(Stdio::null()).env_remove("LD_PRELOAD").env_remove("TSDB_PASSWORD");
+    if let Some(pw) = pw {
+        cmd.env("TSDB_PASSWORD", pw);
+    }
+    let out = cmd.output().unwrap_or_else(|e| panic!("{}: {e}", cli.display()));
+    assert!(out.status.success(), "tsdb user {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
 pub struct Server {
     child: Option<Child>,
     pub port: u16,
@@ -46,11 +66,22 @@ impl Server {
         Server::start_in(test_dir("tsdb-rust"))
     }
 
-    /// Starts tsdbd on `dir`, which may already hold a database.
+    /// Starts tsdbd on `dir`, which may already hold a database, with `--no-auth`.
     pub fn start_in(dir: PathBuf) -> Server {
-        let bin = std::env::var_os("TSDBD")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/tsdbd"));
+        Server::spawn(dir, false)
+    }
+
+    /// Starts tsdbd with login required, on a fresh directory whose USERS holds the superuser `root` with
+    /// password `root_pw`, added by the CLI as an operator does.
+    pub fn start_auth(root_pw: &str) -> Server {
+        let dir = test_dir("tsdb-rust-auth");
+        user_cli(&dir, Some(root_pw), &["add", "root", "--superuser"]);
+        Server::spawn(dir, true)
+    }
+
+    /// Starts tsdbd on `dir`, with login required (`auth`) or `--no-auth`.
+    pub fn spawn(dir: PathBuf, auth: bool) -> Server {
+        let bin = tsdbd();
         assert!(bin.exists(), "{} is missing: run make in the repository root", bin.display());
         // tsdbd picks its port (--port 0) and writes "PORT PID" to this file once it serves: no port is
         // computed here, and the pid in the file must be the child started here.
@@ -61,7 +92,8 @@ impl Server {
             .arg(&dir)
             .args(["--port", "0", "--port-file"])
             .arg(&pf)
-            .args(["--no-fsync", "--workers", "4", "--no-auth"])
+            .args(["--no-fsync", "--workers", "4"])
+            .args(if auth { &[][..] } else { &["--no-auth"][..] })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -111,10 +143,7 @@ impl Server {
     /// Adds volume `path` to the running server's database, as an operator does: `tsdb <dir> volume add`
     /// (tsdbd never creates a volume for a client). The CLI is the `tsdb` next to the tsdbd in use.
     pub fn add_volume(&self, path: &std::path::Path) {
-        let tsdbd = std::env::var_os("TSDBD")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/tsdbd"));
-        let cli = tsdbd.with_file_name("tsdb");
+        let cli = tsdbd().with_file_name("tsdb");
         let out = Command::new(&cli)
             .arg(&self.dir)
             .args(["volume", "add"])

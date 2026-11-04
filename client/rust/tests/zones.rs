@@ -158,7 +158,7 @@ fn fake_server(version: u32) -> (String, thread::JoinHandle<Seen>) {
             let mut payload = vec![0; len - 5];
             s.read_exact(&mut payload).unwrap();
             let body: Vec<u8> = match h[8] {
-                1 => version.to_le_bytes().to_vec(),
+                1 => [version.to_le_bytes(), [0; 4]].concat(), // no login, no mechanisms
                 15 => {
                     let ts = if payload[24] == 1 { LAST } else { FIRST };
                     let mut chunk = vec![1, 0, 0, 0, 1, 0, 0, 0];

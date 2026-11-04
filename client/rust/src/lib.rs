@@ -63,10 +63,15 @@
 //! The protocol is described in `include/tsdb_protocol.h` of the tsdb
 //! repository; this crate mirrors the C client in `client/tsdb_client.h`.
 //! Its dependencies are `zstd`, `rayon` (the thread pool of the batch calls: [`Pool`] and the
-//! `*_many` calls of `Db`) and, on Unix, `libc` (for the TCP keepalive options); with the
-//! `embedded` feature also `tsdb-sys`, the engine.
+//! `*_many` calls of `Db`), `sha2` and `hmac` (the login) and, on Unix, `libc` (for the TCP keepalive
+//! options and the login's nonces); with the `embedded` feature also `tsdb-sys`, the engine.
+//!
+//! A tsdbd that requires a login (the default) is reached with [`Client::connect_opts`] or
+//! [`Pool::connect_opts`] and a [`ConnectOptions`] naming the user and the password; the users and their
+//! grants are managed with [`Client::user_create`], [`Client::grant`] and the calls beside them.
 #![warn(missing_docs)]
 
+mod auth;
 mod batch;
 mod calendar;
 mod client;
@@ -80,9 +85,12 @@ mod protocol;
 mod types;
 mod value;
 
+#[doc(hidden)]
+pub use auth::test_hooks;
+pub use auth::{Grant, Rights, SCRAM_ITERATIONS, Selector, User};
 pub use batch::{AggQuery, InsertBatch, Pool, RangeQuery, Target};
 pub use calendar::calendar_bounds;
-pub use client::{CONNECT_TIMEOUT, Client, DEFAULT_COMPRESSION};
+pub use client::{CONNECT_TIMEOUT, Client, ConnectOptions, DEFAULT_COMPRESSION};
 pub use database::Database;
 #[cfg(feature = "embedded")]
 pub use embedded::{ChunkRef, Db, Options, PartInfo, RawValues, ValueCodec};

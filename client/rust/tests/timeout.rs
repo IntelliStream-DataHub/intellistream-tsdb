@@ -50,14 +50,15 @@ struct Fake {
 }
 
 impl Fake {
-    /// Answers the HELLO every connect sends (protocol 11), then behaves as `behave` says.
+    /// Answers the HELLO every connect sends (protocol 12, no login), then behaves as `behave` says.
     fn start(behave: impl FnOnce(TcpStream, mpsc::Receiver<()>) + Send + 'static) -> Fake {
         Fake::start_raw(|mut s, rx| {
             let Ok((id, op)) = read_request(&mut s) else { return };
             assert_eq!(op, 1, "the first request of a connection is HELLO");
             let mut r = ack(id).to_vec();
-            r[0..4].copy_from_slice(&13u32.to_le_bytes());
+            r[0..4].copy_from_slice(&17u32.to_le_bytes());
             r.extend_from_slice(&tsdb_client::PROTOCOL_VERSION.to_le_bytes());
+            r.extend_from_slice(&[0; 4]); // u16 flags, u16 mechanisms
             let _ = s.write_all(&r);
             behave(s, rx);
         })

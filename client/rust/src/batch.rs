@@ -32,7 +32,7 @@ use std::time::Duration;
 use rayon::prelude::*;
 
 use crate::SeriesId;
-use crate::client::Client;
+use crate::client::{Client, ConnectOptions};
 use crate::error::{Error, Result};
 use std::ops::{ControlFlow, RangeBounds};
 
@@ -356,6 +356,19 @@ impl Pool {
     pub fn connect(addr: impl ToSocketAddrs, n: usize) -> Result<Pool> {
         let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
         Pool::with_connector(n, move || Client::connect(&addrs[..]))
+    }
+
+    /// Opens `n` connections to `addr` with `opts` (as [`Client::connect_opts`]), which also replace
+    /// connections that broke. Every connection logs in; PBKDF2 runs once per process for the user and
+    /// password, not once per connection (the keys are cached).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for `n == 0`; the first connection's error ([`Error::Auth`] for a failed
+    /// login).
+    pub fn connect_opts(addr: impl ToSocketAddrs, n: usize, opts: ConnectOptions) -> Result<Pool> {
+        let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+        Pool::with_connector(n, move || Client::connect_opts(&addrs[..], &opts))
     }
 
     /// Opens `n` connections with `connect` (which also replaces connections that broke).

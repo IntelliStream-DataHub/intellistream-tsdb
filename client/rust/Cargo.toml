@@ -28,6 +28,9 @@ zstd = { version = "0.13", default-features = false }
 tsdb-sys = { package = "intellistream-tsdb-sys", path = "../rust-sys", optional = true }
 # batch calls (Pool, Db::*_many) run their queries and inserts on a thread pool
 rayon = "1"
+# login (SCRAM-SHA-256, design-auth.md A19): SHA-256 and HMAC; PBKDF2 is a loop over them in auth.rs
+sha2 = { version = "0.10", default-features = false }
+hmac = "0.12"
 
 # TCP keepalive options, which std does not expose
 [target.'cfg(unix)'.dependencies]

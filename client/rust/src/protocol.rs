@@ -14,13 +14,23 @@
 //! REPLACE_RANGE, SET_RETENTION, GET_RETENTION.
 //! Version 11: every series id is a u64 on the wire. A server that answers HELLO with less is refused
 //! when the client connects ([`Error::Protocol`]).
+//! Version 12: login (SCRAM-SHA-256) and access control. HELLO's reply says whether login is required and
+//! which mechanisms the server offers; AUTH_START and AUTH_CONTINUE carry the exchange (`auth.rs`), and the
+//! user admin ops (WHOAMI to USER_LIST) follow.
 
 use crate::error::{Error, Result};
 
 /// The protocol version this client speaks (`TSDB_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 11;
-/// The oldest server version this client talks to (`TSDB_PROTOCOL_MIN`): version 11 widened every series id.
-pub(crate) const PROTOCOL_MIN: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
+/// The oldest server version this client talks to (`TSDB_PROTOCOL_MIN`): version 11 widened every series id,
+/// 12 added login; tsdbd refuses a client below 12, as this client refuses such a server.
+pub(crate) const PROTOCOL_MIN: u32 = 12;
+/// HELLO reply flags: the server requires a login (`TSDB_HELLO_AUTH`).
+pub(crate) const HELLO_AUTH: u16 = 1;
+/// The one mechanism this client speaks (`TSDB_SCRAM_SHA256`).
+pub(crate) const SCRAM_SHA256: &str = "SCRAM-SHA-256";
+/// User flags (`TSDB_USER_SUPERUSER`).
+pub(crate) const USER_SUPERUSER: u8 = 1;
 /// The port tsdbd listens on by default (`TSDB_DEFAULT_PORT`).
 pub const DEFAULT_PORT: u16 = 7070;
 
@@ -95,6 +105,16 @@ pub(crate) enum Op {
     ReplaceRange = 26,
     SetRetention = 27,
     GetRetention = 28,
+    AuthStart = 29,
+    AuthContinue = 30,
+    Whoami = 31,
+    UserCreate = 32,
+    UserDrop = 33,
+    UserAlter = 34,
+    UserPassword = 35,
+    Grant = 36,
+    Revoke = 37,
+    UserList = 38,
 }
 
 /// Builds one request frame in a reusable buffer.

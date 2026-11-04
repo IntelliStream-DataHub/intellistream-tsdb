@@ -19,14 +19,16 @@ use std::ops::{Bound, ControlFlow, RangeBounds};
 use std::time::Duration;
 
 use crate::SeriesId;
+use crate::auth::{self, Rights, Scram, Selector, User};
 use crate::calendar;
 use crate::error::{Error, Result, Status};
 use crate::keepalive::{self, KeepAlive};
 use crate::pack;
 use crate::protocol::extend_i64s;
 use crate::protocol::{
-    BUCKET_ROW, Cursor, FrameBuf, MANY_SERIES, MAX_FRAME, MULTI_PREFIX, Op, PACKED, PROTOCOL_MIN, PROTOCOL_VERSION,
-    REPLACE_HEADER, REPLY_HEADER, SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW, VALID, VALUES_CHUNK_HEADER,
+    BUCKET_ROW, Cursor, FrameBuf, HELLO_AUTH, MANY_SERIES, MAX_FRAME, MULTI_PREFIX, Op, PACKED, PROTOCOL_MIN,
+    PROTOCOL_VERSION, REPLACE_HEADER, REPLY_HEADER, SCRAM_SHA256, SPREAD, SPREAD_ROW, TWA_HEADER, TWA_ROW,
+    USER_SUPERUSER, VALID, VALUES_CHUNK_HEADER,
 };
 use crate::types::{
     Bucket, Group, Order, Points, QueryOpts, QueryStats, Rows, SpreadBucket, Stats, TwaBucket, TwaOpts,
@@ -105,6 +107,9 @@ pub struct Client {
     level: i32,
     /// The server's protocol version, once asked.
     server_version: Option<u32>,
+    /// From HELLO: the server requires a login, and offers SCRAM-SHA-256.
+    login_required: bool,
+    scram: bool,
     packer: Option<Packer>,
     bytes_sent: u64,
 }
@@ -123,6 +128,106 @@ impl fmt::Debug for Client {
 
 /// How long [`Client::connect`] waits for each address before trying the next.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How [`Client::connect_opts`] and [`Pool::connect_opts`](crate::Pool::connect_opts) connect: the login and the
+/// timeout.
+///
+/// ```
+/// use tsdb_client::ConnectOptions;
+/// let opts = ConnectOptions::new().user("acme/ingest").password("s3cret").require_auth(true);
+/// assert!(!format!("{opts:?}").contains("s3cret"));
+/// ```
+#[derive(Clone, Default)]
+pub struct ConnectOptions {
+    user: Option<String>,
+    password: Option<Secret>,
+    password_file: Option<std::path::PathBuf>,
+    require_auth: bool,
+    timeout: Option<Duration>,
+}
+
+/// Password bytes, wiped when dropped.
+#[derive(Clone)]
+pub(crate) struct Secret(pub(crate) Vec<u8>);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        for b in self.0.iter_mut() {
+            // volatile, so the stores are not dropped as dead
+            unsafe { std::ptr::write_volatile(b, 0) };
+        }
+    }
+}
+
+impl fmt::Debug for ConnectOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectOptions")
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "(hidden)"))
+            .field("password_file", &self.password_file)
+            .field("require_auth", &self.require_auth)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl ConnectOptions {
+    /// No login, the default timeouts: what [`Client::connect`] does.
+    pub fn new() -> ConnectOptions {
+        ConnectOptions::default()
+    }
+
+    /// The user to log in as, when the server asks for a login.
+    pub fn user(mut self, name: impl Into<String>) -> ConnectOptions {
+        self.user = Some(name.into());
+        self
+    }
+
+    /// The user's password: its UTF-8 bytes, without normalization (ASCII passwords are safest). It stays in
+    /// memory for reconnects (a [`Pool`](crate::Pool) replaces broken connections) and is wiped when the options
+    /// are dropped.
+    pub fn password(mut self, password: impl Into<String>) -> ConnectOptions {
+        self.password = Some(Secret(password.into().into_bytes()));
+        self
+    }
+
+    /// Reads the password from the first line of this file at every connect (a trailing CR LF is cut), when no
+    /// [`password`](ConnectOptions::password) is given.
+    pub fn password_file(mut self, path: impl Into<std::path::PathBuf>) -> ConnectOptions {
+        self.password_file = Some(path.into());
+        self
+    }
+
+    /// Refuses ([`Error::Auth`]) a server that does not ask for a login (`--no-auth`), which would otherwise
+    /// be used without one. Off by default.
+    pub fn require_auth(mut self, require: bool) -> ConnectOptions {
+        self.require_auth = require;
+        self
+    }
+
+    /// As in [`Client::connect_with`]: bounds the connect to each address, the HELLO and the login, and then
+    /// every wait for the server; `None` (the default) gives the connect and the login [`CONNECT_TIMEOUT`] and
+    /// lets requests wait forever.
+    pub fn timeout(mut self, timeout: Option<Duration>) -> ConnectOptions {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The password: given, or the first line of the password file.
+    fn password_bytes(&self) -> Result<Secret> {
+        if let Some(p) = &self.password {
+            return Ok(p.clone());
+        }
+        let Some(path) = &self.password_file else {
+            return Err(Error::InvalidArgument("a user without a password or a password file".into()));
+        };
+        let all = Secret(std::fs::read(path)?);
+        let Some(line) = all.0.split(|&b| b == b'\n').next().filter(|_| !all.0.is_empty()) else {
+            return Err(Error::InvalidArgument(format!("{}: no password in it", path.display())));
+        };
+        Ok(Secret(line.strip_suffix(b"\r").unwrap_or(line).to_vec()))
+    }
+}
 
 /// Connects to the first address of `addr` that answers within `t`.
 fn connect_each(addr: impl ToSocketAddrs, t: Duration) -> io::Result<TcpStream> {
@@ -189,7 +294,41 @@ impl Client {
         };
         let mut c = Client::new(connect_each(addr, t)?)?;
         c.set_timeout(Some(t))?;
-        c.handshake()?;
+        c.handshake(&ConnectOptions::default())?;
+        Ok(c)
+    }
+
+    /// Connects with the options `opts`: a login, and the timeout of [`connect_with`](Client::connect_with).
+    ///
+    /// The HELLO and the login run within the connect timeout ([`CONNECT_TIMEOUT`] when `opts` sets none), so a
+    /// server that accepts and then says nothing does not hold the caller. The login is SCRAM-SHA-256: the
+    /// password never travels, and the connect fails unless the server proves it holds the user's verifier.
+    /// PBKDF2 runs once per process for a user and password (the keys are cached), so a [`Pool`](crate::Pool)
+    /// or a reconnect does not pay for it again. A server started with `--no-auth` is used without a login
+    /// unless [`require_auth`](ConnectOptions::require_auth) is set.
+    ///
+    /// ```no_run
+    /// use tsdb_client::{Client, ConnectOptions};
+    /// let opts = ConnectOptions::new().user("acme/ingest").password_file("/etc/tsdb/ingest.pw");
+    /// let mut c = Client::connect_opts("db.example:7070", &opts)?;
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for a user without a password or password file, or a password file without
+    /// a line; [`Error::Auth`] when the login fails (an unknown user and a wrong password look alike), the
+    /// server does not prove its signature, it asks for a login and `opts` gives none, or `opts` requires one
+    /// and it asks for none; otherwise as [`connect_with`](Client::connect_with).
+    pub fn connect_opts(addr: impl ToSocketAddrs, opts: &ConnectOptions) -> Result<Client> {
+        if opts.user.is_some() && opts.password.is_none() && opts.password_file.is_none() {
+            return Err(Error::InvalidArgument("a user without a password or a password file".into()));
+        }
+        let t = opts.timeout.unwrap_or(CONNECT_TIMEOUT);
+        let mut c = Client::new(connect_each(addr, t)?)?;
+        c.set_timeout(Some(t))?;
+        c.handshake(opts)?;
+        c.set_timeout(opts.timeout)?;
         Ok(c)
     }
 
@@ -200,25 +339,41 @@ impl Client {
     /// see [`set_keepalive`](Client::set_keepalive)). The stream's own timeouts
     /// are kept.
     ///
-    /// # Errors
-    ///
     /// Then asks the server for its protocol version (HELLO) and refuses a server older than this client
-    /// needs (version 11, the 64-bit series ids).
+    /// needs (version 12, login). A server that requires a login is refused too: use
+    /// [`from_stream_opts`](Client::from_stream_opts).
     ///
     /// # Errors
     ///
     /// [`Error::Io`] if `TCP_NODELAY` cannot be set on the stream or the HELLO fails;
-    /// [`Error::Protocol`] if the server speaks a protocol older than 11
-    /// ("tsdbd speaks protocol N; this client needs 11: upgrade the server").
+    /// [`Error::Protocol`] if the server speaks a protocol older than 12
+    /// ("tsdbd speaks protocol N; this client needs 12: upgrade the server");
+    /// [`Error::Auth`] if it requires a login.
     pub fn from_stream(stream: TcpStream) -> Result<Client> {
+        Client::from_stream_opts(stream, &ConnectOptions::default())
+    }
+
+    /// [`from_stream`](Client::from_stream) with a login: as [`connect_opts`](Client::connect_opts), except
+    /// that the stream's timeouts are kept (the options' timeout is not used).
+    ///
+    /// # Errors
+    ///
+    /// As [`from_stream`](Client::from_stream) and [`connect_opts`](Client::connect_opts).
+    pub fn from_stream_opts(stream: TcpStream, opts: &ConnectOptions) -> Result<Client> {
+        if opts.user.is_some() && opts.password.is_none() && opts.password_file.is_none() {
+            return Err(Error::InvalidArgument("a user without a password or a password file".into()));
+        }
         let mut c = Client::new(stream)?;
-        c.handshake()?;
+        c.handshake(opts)?;
         Ok(c)
     }
 
-    /// The first HELLO of a connection: the server's version must be at least [`PROTOCOL_MIN`].
-    fn handshake(&mut self) -> Result<()> {
-        self.protocol_version().map(|_| ())
+    /// The first HELLO of a connection (the server's version must be at least [`PROTOCOL_MIN`]), then the login.
+    fn handshake(&mut self, opts: &ConnectOptions) -> Result<()> {
+        self.run(|c| {
+            c.hello()?;
+            c.login(opts)
+        })
     }
 
     fn new(stream: TcpStream) -> Result<Client> {
@@ -235,6 +390,8 @@ impl Client {
             broken: false,
             level: DEFAULT_COMPRESSION,
             server_version: None,
+            login_required: false,
+            scram: false,
             packer: None,
             bytes_sent: 0,
         })
@@ -341,14 +498,54 @@ impl Client {
         })?;
         let mut r = Cursor::new(&self.body);
         let v = r.u32()?;
-        end(&r)?;
         if v < PROTOCOL_MIN {
             return Err(Error::Protocol(format!(
                 "tsdbd speaks protocol {v}; this client needs {PROTOCOL_MIN}: upgrade the server"
             )));
         }
+        // version 12: u16 flags, u16 n, n x (u8 len, mechanism); a server that does not say whether it wants a
+        // login is not talked to
+        let flags = r.u16()?;
+        let mut scram = false;
+        for _ in 0..r.u16()? {
+            let n = r.u8()? as usize;
+            scram |= r.take(n)? == SCRAM_SHA256.as_bytes();
+        }
+        end(&r)?;
+        self.login_required = flags & HELLO_AUTH != 0;
+        self.scram = scram;
         self.server_version = Some(v);
         Ok(v)
+    }
+
+    /// After HELLO: logs in when the server asks for it, and refuses a server that does not when the options
+    /// require a login.
+    fn login(&mut self, o: &ConnectOptions) -> Result<()> {
+        if !self.login_required {
+            if o.require_auth {
+                return Err(Error::Auth(
+                    "tsdbd does not ask for a login (--no-auth) and the options require one".into(),
+                ));
+            }
+            return Ok(()); // credentials, if any, are not needed
+        }
+        let Some(user) = o.user.as_deref() else {
+            return Err(Error::Auth("tsdbd requires a login: give a user and a password (ConnectOptions)".into()));
+        };
+        if !self.scram {
+            return Err(Error::Auth("tsdbd offers no login mechanism this client speaks (SCRAM-SHA-256)".into()));
+        }
+        let pw = o.password_bytes()?;
+        let s = Scram::start(user)?;
+        let body = s.start_body();
+        login_status(self.request(Op::AuthStart, |f| {
+            f.bytes(&body);
+        }))?;
+        let (cont, server_sig) = s.finish(&pw.0, auth::server_message(&self.body)?)?;
+        login_status(self.request(Op::AuthContinue, |f| {
+            f.bytes(&cont);
+        }))?;
+        auth::check_server_final(auth::server_message(&self.body)?, &server_sig)
     }
 
     /// Whether an insert goes packed: compression is on.
@@ -1879,6 +2076,153 @@ impl Client {
         })
     }
 
+    // ---------------------------------------------------------------- users
+
+    /// The user this connection is logged in as, with its grants; "" with every right (superuser) on a server
+    /// started with `--no-auth`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] and [`Error::Protocol`] as any call.
+    pub fn whoami(&mut self) -> Result<User> {
+        self.run(|c| {
+            c.request(Op::Whoami, |_| {})?;
+            let mut r = Cursor::new(&c.body);
+            let u = auth::read_user(&mut r)?;
+            end(&r)?;
+            Ok(u)
+        })
+    }
+
+    /// The users this one may see: itself, and the users it manages (every user, for a superuser).
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Denied`] on a server started with `--no-auth` (users are managed there with the offline
+    /// `tsdb <dir> user` verbs).
+    pub fn user_list(&mut self) -> Result<Vec<User>> {
+        self.run(|c| {
+            c.wait_inner()?;
+            c.req.begin(c.next_id, Op::UserList);
+            c.send()?;
+            let mut users = Vec::new();
+            // chunks of one reply: u8 last, u32 n, n users; an error status ends it
+            loop {
+                let st = c.read_frame()?;
+                if st != 0 {
+                    c.reply_id = c.reply_id.wrapping_add(1);
+                    return Err(Error::Server(Status::from_code(st)));
+                }
+                let mut r = Cursor::new(&c.body);
+                let last = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    x => return Err(Error::Protocol(format!("USER_LIST chunk with last = {x}"))),
+                };
+                let n = r.u32()? as usize;
+                if n > r.remaining() / 7 {
+                    return Err(Error::Protocol(format!("{n} users in {} bytes", r.remaining())));
+                }
+                for _ in 0..n {
+                    users.push(auth::read_user(&mut r)?);
+                }
+                end(&r)?;
+                if last {
+                    break;
+                }
+            }
+            c.reply_id = c.reply_id.wrapping_add(1);
+            Ok(users)
+        })
+    }
+
+    /// Creates user `name` with `password`, a superuser if `superuser`.
+    ///
+    /// The password does not travel: the client sends its verifier (a fresh 16-byte salt, StoredKey and
+    /// ServerKey) computed with `iterations` of PBKDF2 (`None`: [`SCRAM_ITERATIONS`](crate::SCRAM_ITERATIONS),
+    /// 4096; at most 100,000,000).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] for an empty password or an iteration count out of range;
+    /// [`Status::Denied`] unless this user is a superuser, or holds `admin` on a prefix that `name` starts with
+    /// (only a superuser creates superusers), and on a `--no-auth` server; [`Status::Invalid`] for a name
+    /// that exists or that USERS refuses.
+    pub fn user_create(&mut self, name: &str, password: &str, superuser: bool, iterations: Option<u32>) -> Result<()> {
+        let mut rest = vec![if superuser { USER_SUPERUSER } else { 0 }];
+        rest.extend(auth::verifier(password, iterations)?);
+        self.user_call(Op::UserCreate, name, &rest)
+    }
+
+    /// Sets the password of user `name` (its own, or one of a user it manages), as
+    /// [`user_create`](Client::user_create) sends it.
+    ///
+    /// # Errors
+    ///
+    /// As [`user_create`](Client::user_create); [`Status::Denied`] also for a user holding a grant outside this
+    /// one's `admin` selectors.
+    pub fn user_password(&mut self, name: &str, password: &str, iterations: Option<u32>) -> Result<()> {
+        let v = auth::verifier(password, iterations)?;
+        self.user_call(Op::UserPassword, name, &v)
+    }
+
+    /// Drops user `name`; its open connections are answered [`Status::Auth`] and closed.
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Denied`] for a user this one does not manage, and for the last superuser.
+    pub fn user_drop(&mut self, name: &str) -> Result<()> {
+        self.user_call(Op::UserDrop, name, &[])
+    }
+
+    /// Makes user `name` a superuser or takes that away (superusers only).
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Denied`] unless this user is a superuser, and for taking it from the last superuser.
+    pub fn user_alter(&mut self, name: &str, superuser: bool) -> Result<()> {
+        self.user_call(Op::UserAlter, name, &[if superuser { USER_SUPERUSER } else { 0 }])
+    }
+
+    /// Gives user `name` `rights` on the series `selector` matches. Grants only add.
+    ///
+    /// ```no_run
+    /// # let mut c = tsdb_client::Client::connect("127.0.0.1:7070")?;
+    /// use tsdb_client::{Rights, Selector};
+    /// c.grant("acme/ingest", &Selector::Prefix("acme/".into()), Rights::INSERT)?;
+    /// c.grant("acme/dash", &"glob:acme/*/temp".parse()?, "read".parse()?)?;
+    /// # Ok::<(), tsdb_client::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Status::Denied`] unless this user is a superuser or `selector` lies inside its own `admin`
+    /// selectors and it manages `name`; [`Status::Invalid`] for a malformed selector (a glob over 256 bytes, a
+    /// 65th glob grant).
+    pub fn grant(&mut self, name: &str, selector: &Selector, rights: Rights) -> Result<()> {
+        self.user_call(Op::Grant, name, &auth::grant_body(selector, rights)?)
+    }
+
+    /// Takes `rights` on `selector` from user `name` (the grant with exactly this selector).
+    ///
+    /// # Errors
+    ///
+    /// As [`grant`](Client::grant).
+    pub fn revoke(&mut self, name: &str, selector: &Selector, rights: Rights) -> Result<()> {
+        self.user_call(Op::Revoke, name, &auth::grant_body(selector, rights)?)
+    }
+
+    /// u16 len, `name` and `rest`, sent as one request with no reply body.
+    fn user_call(&mut self, op: Op, name: &str, rest: &[u8]) -> Result<()> {
+        let name = wire_str("user name", name, false)?;
+        self.run(|c| {
+            c.request(op, |f| {
+                f.u16(name.len() as u16).bytes(name).bytes(rest);
+            })?;
+            end(&Cursor::new(&c.body))
+        })
+    }
+
     // ---------------------------------------------------------------- I/O
 
     /// Runs one public call; an I/O or protocol error leaves the client unusable.
@@ -2038,6 +2382,17 @@ fn status_result(status: i32) -> Result<()> {
     match status {
         0 => Ok(()),
         s => Err(Error::Server(Status::from_code(s))),
+    }
+}
+
+/// A refused AUTH_START or AUTH_CONTINUE: the server answers every failure alike (A4), and INVALID only to a
+/// connection that logged in already, which a connect never is.
+fn login_status(r: Result<()>) -> Result<()> {
+    match r {
+        Err(Error::Server(Status::Auth | Status::Invalid)) => {
+            Err(Error::Auth("tsdbd refused the login (an unknown user or a wrong password)".into()))
+        }
+        r => r,
     }
 }
 

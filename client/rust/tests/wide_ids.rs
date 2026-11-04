@@ -18,7 +18,7 @@ const MANY: u64 = u64::MAX;
 /// What a fake server saw after the HELLO: op and payload.
 type Seen = Vec<(u8, Vec<u8>)>;
 
-/// A server that answers HELLO with `version`, SERIES and SERIES_CREATE with the id `A + 2`, the others with a valid empty answer, and everything else
+/// A server that answers HELLO with `version` (from 12 on with no login and no mechanisms), SERIES and SERIES_CREATE with the id `A + 2`, the others with a valid empty answer, and everything else
 /// with an empty OK (QUERY_MULTI is the one op whose answer the tests do not shape: its client fails after the request
 /// went out, which is all they look at).
 /// Returns the address and the thread, which ends when the client closes the connection and gives the requests.
@@ -34,6 +34,7 @@ fn fake_server(version: u32) -> (String, thread::JoinHandle<(Option<Vec<u8>>, Se
             let mut payload = vec![0; len - 5];
             s.read_exact(&mut payload).unwrap();
             let body: Vec<u8> = match h[8] {
+                1 if version >= 12 => [version.to_le_bytes(), [0; 4]].concat(),
                 1 => version.to_le_bytes().to_vec(),
                 2 | 12 => (A + 2).to_le_bytes().to_vec(),
                 5 => vec![1, 0, 0, 0, 0],                // a raw chunk of no rows, the last
@@ -70,7 +71,7 @@ fn requests(level: i32, f: impl FnOnce(&mut Client)) -> Seen {
     f(&mut c);
     drop(c);
     let (hello, seen) = h.join().unwrap();
-    assert_eq!(hello, Some(11u32.to_le_bytes().to_vec()));
+    assert_eq!(hello, Some(12u32.to_le_bytes().to_vec()));
     seen
 }
 
@@ -83,31 +84,31 @@ fn u32_at(p: &[u8], at: usize) -> u32 {
 }
 
 #[test]
-fn a_server_older_than_11_is_refused_at_connect() {
-    for version in [10, 7, 3, 1, 0] {
+fn a_server_older_than_12_is_refused_at_connect() {
+    for version in [11, 10, 7, 3, 1, 0] {
         let (addr, h) = fake_server(version);
         let Err(e) = Client::connect(addr) else { panic!("protocol {version} must be refused") };
-        let want = format!("tsdbd speaks protocol {version}; this client needs 11: upgrade the server");
+        let want = format!("tsdbd speaks protocol {version}; this client needs 12: upgrade the server");
         assert!(matches!(&e, Error::Protocol(m) if *m == want), "{e:?}");
         assert!(e.to_string().contains(&want));
         assert_eq!(e.code(), -3);
         let (hello, seen) = h.join().unwrap();
-        assert_eq!(hello, Some(11u32.to_le_bytes().to_vec())); // the client said 11
+        assert_eq!(hello, Some(12u32.to_le_bytes().to_vec())); // the client said 12
         assert!(seen.is_empty(), "nothing but HELLO was sent");
     }
     // a newer server is fine: the client speaks what it knows
-    let (addr, h) = fake_server(12);
+    let (addr, h) = fake_server(13);
     let mut c = Client::connect(addr).unwrap();
-    assert_eq!(c.protocol_version().unwrap(), 12);
+    assert_eq!(c.protocol_version().unwrap(), 13);
     drop(c);
     h.join().unwrap();
 }
 
 #[test]
-fn a_server_older_than_11_is_refused_for_a_stream_too() {
-    let (addr, h) = fake_server(10);
+fn a_server_older_than_12_is_refused_for_a_stream_too() {
+    let (addr, h) = fake_server(11);
     let s = TcpStream::connect(addr).unwrap();
-    assert!(matches!(Client::from_stream(s), Err(Error::Protocol(m)) if m.contains("needs 11")));
+    assert!(matches!(Client::from_stream(s), Err(Error::Protocol(m)) if m.contains("needs 12")));
     h.join().unwrap();
 }
 
