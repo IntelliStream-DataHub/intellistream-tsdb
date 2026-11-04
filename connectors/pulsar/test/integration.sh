@@ -4,12 +4,21 @@
 # delivery. Produces N points over 500 series with corrections and checks that every point reaches tsdb exactly
 # once with its last value, through these faults:
 #   A  kill -9 of tsdbd mid-stream, restarted on the same port; poison records sent meanwhile
-#   B  tsdbd stopped for STOP_S seconds while producing: Pulsar keeps the backlog, the sink stays up and blocked
+#   B  tsdbd stopped for STOP_S seconds while producing: Pulsar keeps the backlog, the sink stays up and blocked;
+#      with login, the sink's password is changed while tsdbd is down, so tsdbd refuses the sink's login after its
+#      start: the backlog must hold until the password is put back with the CLI beside the running tsdbd
 #   C  kill -9 of the sink mid-stream (the instance JVM that runs it and the localrun JVM that spawned it),
 #      restarted: unacked records are redelivered
 # then the poison records must be on the dead-letter topic, and nothing else.
 #
-# Usage: connectors/pulsar/test/integration.sh [WORKDIR]   (env: N=300000 STOP_S=180 KEEP=1 keeps the container)
+# Login (the default; AUTH=0 runs tsdbd with --no-auth): USERS is made by the CLI before tsdbd starts, with a
+# superuser `root` (verify reads as root) and the sink's user `sink`, granted `insert prefix:pump` alone. The sink
+# gets its user in the sink config and its password as the secret `password` (`localrun --secrets`, whose default
+# provider is clear text). One more poison record names a series outside the grant: DENIED, dead-lettered.
+#
+# Usage: connectors/pulsar/test/integration.sh [WORKDIR]   (env: N=300000 STOP_S=180 AUTH=1 KEEP=1 keeps the
+# container). Maven uses the tree's own repository (build/m2, then ~/.m2 read-only for the rest), so the NAR packs
+# this tree's tsdb-client, not another tree's build of the same version.
 # Podman only. Everything is bound to 127.0.0.1; only the container and the processes this script started are
 # stopped, by name and by pid.
 set -euo pipefail
@@ -21,6 +30,7 @@ IMAGE=docker.io/apachepulsar/pulsar@sha256:11e9a885121e16be91da77fdd3cfc3d4cbbec
 HOSTIP=169.254.1.9 # the host's loopback as the container sees it (pasta --map-host-loopback)
 N=${N:-300000}
 STOP_S=${STOP_S:-180}
+AUTH=${AUTH:-1}
 W=${1:-$(mktemp -d "${TMPDIR:-/tmp}/tsdb-pulsar-it.XXXXXX")}
 mkdir -p "$W"
 NAME=tsdb-pulsar-it-$$
@@ -50,8 +60,10 @@ trap cleanup EXIT
 
 log "workdir $W"
 log "building tsdbd, the NAR and the driver"
-make -C "$ROOT" -s build/tsdbd
-(cd "$CONN" && mvn -q -o package -DskipTests > "$W/mvn.log" 2>&1) || (cd "$CONN" && mvn -q package -DskipTests >> "$W/mvn.log" 2>&1)
+make -C "$ROOT" -s build/tsdbd build/tsdb
+mvn() { command mvn -Dmaven.repo.local="$ROOT/build/m2" -Dmaven.repo.local.tail="$HOME/.m2/repository" "$@"; }
+(cd "$ROOT/client/java" && mvn -q install -DskipTests > "$W/mvn.log" 2>&1) || die "client/java install, see $W/mvn.log"
+(cd "$CONN" && mvn -q -o package -DskipTests >> "$W/mvn.log" 2>&1) || (cd "$CONN" && mvn -q package -DskipTests >> "$W/mvn.log" 2>&1)
 NAR=$(ls "$CONN"/target/tsdb-pulsar-sink-*.nar)
 (cd "$CONN" && mvn -q -Pintegration dependency:build-classpath -Dmdep.outputFile=target/it-cp.txt \
     -Dmdep.includeScope=test >> "$W/mvn.log" 2>&1)
@@ -69,8 +81,9 @@ URL=pulsar://127.0.0.1:$BP
 start_tsdbd() {
     local pf="$W/tsdbd.port" want=${TP:-0} port pid
     rm -f "$pf"
-    "$ROOT/build/tsdbd" --dir "$W/data" --listen 127.0.0.1 --port "$want" --port-file "$pf" --workers 2 --no-auth \
-        >> "$W/tsdbd.log" 2>&1 &
+    # shellcheck disable=SC2046 # no option at all with login on
+    "$ROOT/build/tsdbd" --dir "$W/data" --listen 127.0.0.1 --port "$want" --port-file "$pf" --workers 2 \
+        $([ "$AUTH" = 1 ] || echo --no-auth) >> "$W/tsdbd.log" 2>&1 &
     TSDBD_PID=$!
     for _ in $(seq 600); do
         kill -0 "$TSDBD_PID" 2>/dev/null || { wait "$TSDBD_PID" 2>/dev/null || true; die "tsdbd did not start (port $want), see $W/tsdbd.log"; }
@@ -109,17 +122,32 @@ admin scalable-topics create -s 4 public/default/points
 admin scalable-topics create -s 1 public/default/points-dlq
 log "Pulsar up; scalable topics created"
 
+cli() { "$ROOT/build/tsdb" "$W/data" "$@" >> "$W/cli.log" 2>&1 || die "tsdb $* failed, see $W/cli.log"; }
+# a password file of a fresh random password (hex: it goes into the --secrets JSON and a shell string unquoted)
+pwfile() { (umask 077; od -An -N16 -tx1 /dev/urandom | tr -d ' \n' > "$W/$1.pw"); echo "$W/$1.pw"; }
+SINK_USER=; SINK_SECRETS=; VERIFY_LOGIN=()
+if [ "$AUTH" = 1 ]; then
+    mkdir -p "$W/data"
+    cli user add root --superuser --password-file "$(pwfile root)"
+    cli user add sink --password-file "$(pwfile sink)"
+    cli user grant sink insert prefix:pump # insert alone: a new series needs insert on its name, nothing more
+    SINK_USER="\"user\":\"sink\","
+    SINK_SECRETS="{\"password\":\"$(cat "$W/sink.pw")\"}"
+    VERIFY_LOGIN=(root "$W/root.pw")
+    log "USERS made by the CLI: root (superuser), sink (insert prefix:pump)"
+fi
+
 start_tsdbd
 
-SINK_CONFIG="{\"hosts\":\"$HOSTIP\",\"port\":$TP,\"connections\":2,\"maxInFlightRecords\":5000,\"retryMaxMs\":2000,\
-\"connectTimeoutMs\":2000,\"deadLetterTopic\":\"$DLQ\"}"
+SINK_CONFIG="{$SINK_USER\"hosts\":\"$HOSTIP\",\"port\":$TP,\"connections\":2,\"maxInFlightRecords\":5000,\
+\"retryMaxMs\":2000,\"connectTimeoutMs\":2000,\"deadLetterTopic\":\"$DLQ\"}"
 start_sink() {
     # $$ of this sh is the pid of the JVM: pulsar-admin execs java
     podman exec -d "$NAME" sh -c "echo \$\$ > /tmp/sink.pid; exec bin/pulsar-admin sinks localrun \
         --broker-service-url pulsar://127.0.0.1:$BP --archive /connector/tsdb-pulsar-sink.nar \
         --tenant public --namespace default --name tsdb --inputs $TOPIC --subs-name tsdb --subs-position Earliest \
         --retain-key-ordering --processing-guarantees ATLEAST_ONCE --sink-config '$SINK_CONFIG' \
-        >> /tmp/sink.log 2>&1" > /dev/null
+        ${SINK_SECRETS:+--secrets '$SINK_SECRETS'} >> /tmp/sink.log 2>&1" > /dev/null
     sleep 1
     SINK_PID=$(podman exec "$NAME" cat /tmp/sink.pid)
     log "sink started (pid $SINK_PID in the container)"
@@ -128,6 +156,11 @@ start_sink() {
 sink_alive() {
     podman exec "$NAME" sh -c "grep -q PulsarAdminTool /proc/$SINK_PID/cmdline && [ -n \"\$(pgrep -P $SINK_PID)\" ]" \
         2>/dev/null
+}
+# what localrun printed and the instances' logs, of every start
+sink_logs() {
+    podman exec "$NAME" sh -c 'cat /tmp/sink.log; find /pulsar/logs/functions -name "*.log" | xargs -r cat' 2>/dev/null \
+        || true
 }
 # entries the sink's subscription has not acknowledged, over all segments (a batch counts once: phase B sends unbatched)
 backlog() {
@@ -141,7 +174,7 @@ log "A: producing [0, $((N / 3))) and killing tsdbd -9 in the middle"
 driver produce "$URL" "$TOPIC" "$N" 0 $((N / 3)) > "$W/produce-a.log" 2>&1 &
 PA=$!
 sleep 4
-POISON=$(driver poison "$URL" "$TOPIC" | tail -1)
+POISON=$(driver poison "$URL" "$TOPIC" $([ "$AUTH" = 1 ] && echo denied) | tail -1)
 stop_tsdbd KILL
 log "A: tsdbd killed -9; down for 5 s"
 sleep 5
@@ -164,7 +197,28 @@ B_BACKLOG=$(backlog)
 # nothing of B can have been acknowledged while tsdbd was down: Pulsar still holds all of it
 [[ "$B_BACKLOG" =~ ^[0-9]+$ ]] && [ "$B_BACKLOG" -ge $((2 * N / 3 - N / 3)) ] \
     || die "backlog $B_BACKLOG after tsdbd was down: records were acknowledged without being written"
-start_tsdbd
+if [ "$AUTH" = 1 ]; then
+    # tsdbd comes back with another password for the sink: every login it tries is refused, nothing is written
+    # or acknowledged, and the sink stays up retrying until the operator puts the password back
+    cli user passwd sink --password-file "$(pwfile wrong)"
+    REFUSED0=$(sink_logs | grep -c 'refused the login' || true)
+    start_tsdbd
+    for _ in $(seq 60); do
+        [ "$(sink_logs | grep -c 'refused the login' || true)" -gt "$REFUSED0" ] && break
+        sleep 1
+    done
+    sleep 10 # a few more refused retries
+    REFUSED=$(( $(sink_logs | grep -c 'refused the login' || true) - REFUSED0 ))
+    [ "$REFUSED" -gt 0 ] || die "tsdbd is up with another password, but the sink logged no refused login"
+    sink_alive || die "the sink died while its login was refused"
+    WB=$(backlog)
+    [[ "$WB" =~ ^[0-9]+$ ]] && [ "$WB" -ge "$B_BACKLOG" ] \
+        || die "backlog $WB (was $B_BACKLOG) while the sink's login was refused: records acknowledged without a login"
+    log "B: sink's login refused $REFUSED times, backlog $WB held; putting its password back beside the running tsdbd"
+    cli user passwd sink --password-file "$W/sink.pw" # tsdbd reloads USERS within a second
+else
+    start_tsdbd
+fi
 
 # --- C: kill -9 the sink mid-stream
 log "C: producing [$((2 * N / 3)), $N) and killing the sink -9 in the middle"
@@ -185,7 +239,7 @@ cat "$W/produce-c.log"
 log "waiting for every point to reach tsdb"
 ok=
 for _ in $(seq 120); do
-    if driver verify 127.0.0.1 "$TP" "$N" > "$W/verify.log" 2>&1; then ok=1; break; fi
+    if driver verify 127.0.0.1 "$TP" "$N" "${VERIFY_LOGIN[@]}" > "$W/verify.log" 2>&1; then ok=1; break; fi
     sleep 5
 done
 cat "$W/verify.log"
@@ -193,8 +247,8 @@ cat "$W/verify.log"
 driver dlq "$URL" "$DLQ" "$POISON" 60 > "$W/dlq.log" 2>&1 || { cat "$W/dlq.log"; die "dead letters"; }
 cat "$W/dlq.log"
 sink_alive || die "the sink is not running at the end"
-podman exec "$NAME" sh -c 'cat /tmp/sink.log; find /pulsar/logs/functions -name "*.log" | xargs cat' \
-    > "$W/sink.log" 2>/dev/null || true
+sink_logs > "$W/sink.log"
 log "sink logs: $(grep -c 'retrying in' "$W/sink.log" || true) retry lines, \
 $(grep -c 'record dead-lettered' "$W/sink.log" || true) dead-letter lines"
-log "PASS: N=$N points, kill -9 tsdbd, tsdbd down ${STOP_S}s (backlog ${B_BACKLOG:-?}), kill -9 sink, $POISON dead letters"
+log "PASS: N=$N points, kill -9 tsdbd, tsdbd down ${STOP_S}s (backlog ${B_BACKLOG:-?}), kill -9 sink, $POISON dead letters\
+$([ "$AUTH" = 1 ] && echo ", login on (sink's login refused $REFUSED times, then let in)")"

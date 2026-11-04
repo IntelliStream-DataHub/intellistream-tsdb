@@ -1,9 +1,12 @@
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
 import ai.intellistream.tsdb.ValuePoints;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -27,8 +30,10 @@ import org.apache.pulsar.client.api.v5.schema.Schema;
  * produce URL TOPIC N FROM TO [unbatched]
  *                                  records [FROM, TO) of N, keyed by series; unbatched sends one message per entry,
  *                                  so that the subscription backlog (which counts entries) counts records
- * poison URL TOPIC                 records tsdb must refuse; prints how many
- * verify HOST PORT N               every key present once with its last value; exit 1 otherwise
+ * poison URL TOPIC [denied]        records tsdb must refuse; prints how many; denied adds one on a series outside
+ *                                  the sink user's grant (insert prefix:pump), which tsdbd answers DENIED
+ * verify HOST PORT N [USER PWFILE] every key present once with its last value; exit 1 otherwise; logs in as USER
+ *                                  with the password in PWFILE (the superuser: the sink's user cannot read)
  * dlq URL TOPIC EXPECTED SECONDS   counts messages on the dead-letter topic; exit 1 unless EXPECTED arrive
  * </pre>
  */
@@ -56,10 +61,13 @@ public final class IntegrationDriver {
                     a.length > 6 && a[6].equals("unbatched"));
             break;
         case "poison":
-            poison(a[1], a[2]);
+            poison(a[1], a[2], a.length > 3 && a[3].equals("denied"));
             break;
         case "verify":
-            System.exit(verify(a[1], Integer.parseInt(a[2]), Integer.parseInt(a[3])) ? 0 : 1);
+            ConnectOptions o = ConnectOptions.defaults().connectTimeout(Duration.ofSeconds(5));
+            if (a.length > 5)
+                o = o.user(a[4]).passwordFile(Path.of(a[5])).requireAuth(true);
+            System.exit(verify(a[1], Integer.parseInt(a[2]), Integer.parseInt(a[3]), o) ? 0 : 1);
             break;
         case "dlq":
             System.exit(dlq(a[1], a[2], Integer.parseInt(a[3]), Integer.parseInt(a[4])) ? 0 : 1);
@@ -98,13 +106,16 @@ public final class IntegrationDriver {
         System.out.printf("produced [%d, %d) in %.1f s%n", from, to, (System.nanoTime() - t) / 1e9);
     }
 
-    static void poison(String url, String topic) throws Exception {
+    static void poison(String url, String topic, boolean denied) throws Exception {
         String[] bad = {
             "{\"series\":\"pump3\",\"ts\":" + T0 + ",\"value\":\"high\"}", /* a string into a float64 series */
             "{\"series\":\"pump4\",\"ts\":" + T0 + ",\"value\":1,\"type\":\"int64\"}", /* pump4 is float64 */
             "{\"series\":\"" + "n".repeat(40_000) + "\",\"ts\":" + T0 + ",\"value\":1}", /* name too long */
             "{not json",
+            "{\"series\":\"boiler1\",\"ts\":" + T0 + ",\"value\":1}", /* outside the grant: DENIED, never retried */
         };
+        if (!denied)
+            bad = Arrays.copyOf(bad, bad.length - 1);
         try (PulsarClient c = client(url); Producer<byte[]> p = c.newProducer(Schema.bytes()).topic(topic).create()) {
             ArrayDeque<CompletableFuture<?>> window = new ArrayDeque<>();
             for (int i = 0; i < bad.length; i++)
@@ -115,7 +126,7 @@ public final class IntegrationDriver {
         System.out.println(bad.length);
     }
 
-    static boolean verify(String host, int port, int n) throws TsdbException {
+    static boolean verify(String host, int port, int n, ConnectOptions options) throws TsdbException {
         Map<Long, Integer> want = new HashMap<>(); /* (series index, ts) -> last value */
         for (int i = 0; i < n; i++) {
             int k = key(i, n);
@@ -124,7 +135,7 @@ public final class IntegrationDriver {
         int missing = 0, wrong = 0, extra = 0;
         long rows = 0;
         String example = null;
-        try (TsdbClient c = TsdbClient.connect(host, port, Duration.ofSeconds(5))) {
+        try (TsdbClient c = TsdbClient.connect(host, port, options)) {
             for (int s = 0; s < SERIES; s++) {
                 ValuePoints v;
                 try {

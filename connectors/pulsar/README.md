@@ -251,3 +251,12 @@ checks that each reaches tsdb exactly once with its last value while it kills
 tsdbd with `kill -9`, stops it for minutes (`STOP_S`, default 180 s), kills the
 sink with `kill -9`, and sends messages tsdb must refuse (they must arrive on
 the dead-letter topic).
+
+Login is on: the test makes the users with the `tsdb` command line before tsdbd
+starts (a superuser, and a `sink` user with `insert prefix:pump` alone), gives
+the sink its password with `--secrets`, and sends one message for a series
+outside that grant, which must reach the dead-letter topic too. While tsdbd is
+stopped it changes the sink's password, so tsdbd refuses the sink's login when
+it comes back: nothing may be acknowledged until the password is put back with
+the command line, beside the running tsdbd. `AUTH=0` runs tsdbd with
+`--no-auth` instead.
