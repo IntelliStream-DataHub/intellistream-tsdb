@@ -698,7 +698,8 @@ than every part), so a delete needs no ordering of its own:
   to listing rules out a flush there. A write that waited checks the engine's
   fail-stop state before it appends. tsdbd counts a waiting request and the
   large write that holds it as waiting workers (`tsdb_set_write_wait_hook`), so
-  it starts extra workers and keeps answering other requests.
+  it starts extra workers and keeps answering other requests, up to 256 extra
+  workers (see the server section below for what lies past that).
 - A replace is the tombstone parts plus the new rows' parts in one
   `parts_commit`, tombstones first (lower blocks): one intent, so a reader or a
   crash sees the old rows or the new ones. Rows outside `[start, end)` are
@@ -1579,7 +1580,17 @@ Connections: up to `--max-connections` at once (default 10,000; the descriptor
 limit is raised to the hard limit at start). An idle connection costs one file
 descriptor and about 16 KB; buffers grow for large frames and shrink back.
 Requests run on `--workers` threads (default: one per CPU) and the rest wait
-in their connection's queue. Measured with `tsdbc-bench connections`: 10,000
+in their connection's queue. A worker that has to wait (a client that reads
+no replies, a small write into the keys of a large write that is not
+published yet, which also counts the large write's worker) starts an extra
+worker once every worker waits, up to 256 extras. Past `--workers` + 256
+such waits the server stalls again: during a backfill of hundreds of millions
+of rows, thousands of connections each writing realtime rows into its keys
+(or, the fence being coarse, into series that share its buckets) hold every
+worker until the backfill is published, and queries queue behind them. Keep
+the number of connections that write during a big backfill below that (a
+Pulsar sink or a few collectors, not one connection per device), or split the
+backfill into smaller calls. Measured with `tsdbc-bench connections`: 10,000
 connections open at once, all querying, 85,000 queries/s in total, no
 failures; the server's resident memory went from 148 MB at 1,000 connections
 to 231 MB at 10,000.

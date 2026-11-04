@@ -564,8 +564,11 @@ int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t cs, const int64_
         return 0;
     }
     /* per lane and bucket: lo, hi; the thread's grow-only buffer (a malloc of 256 KB is an mmap and 64 page faults
-     * per insert) */
-    int64_t *r = eng_insert_scratch(3, LW_LANES * 2 * LW_BUCKETS * sizeof *r);
+     * per insert); an insert nested in another fence's window allocates its own */
+    const size_t bytes = LW_LANES * 2 * LW_BUCKETS * sizeof(int64_t);
+    int64_t *r = lw_table_take(bytes);
+    if (!r && (r = malloc(bytes)) != NULL)
+        f->r_heap = true;
     if (!r)
         return TSDB_ERR_NOMEM;
     for (size_t b = 0; b < LW_LANES * LW_BUCKETS; b++)
@@ -611,8 +614,14 @@ int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t cs, const int64_
         hi = MAX(hi, r[2 * b + 1]);
     }
     f->lo = lo, f->hi = hi, f->series = s0;
-    if (diff == 0) /* one series */
+    if (diff == 0) { /* one series */
+        if (f->r_heap)
+            free(r);
+        else
+            lw_table_put();
+        f->r_heap = false;
         return 0;
+    }
     f->nb = LW_BUCKETS;
     f->r = r;
     return 0;
@@ -650,11 +659,16 @@ void lw_leave(eng *db, lw_fence *f)
     pthread_cond_broadcast(&f->cv); /* only the writes this fence held; they look at the others again */
     bool held = f->held;
     pthread_mutex_unlock(&db->buf_lock);
-    if (held) /* this thread no longer holds up anyone */
-        db->wait_fn(db->wait_ctx, -1);
-    /* waits until the woken waiters are out of the cv (glibc), so the caller may free f; f->r stays the thread's */
+    if (held) /* this thread no longer holds up anyone; to the hook that got the +1 (with cls_rw read-held) */
+        f->hold_fn(f->hold_ctx, -1);
+    /* waits until the woken waiters are out of the cv (glibc), so the caller may free f */
     pthread_cond_destroy(&f->cv);
+    if (f->r_heap)
+        free(f->r);
+    else if (f->r)
+        lw_table_put(); /* no one reads it any more: unlinked under buf_lock */
     f->r = NULL;
+    f->r_heap = false;
 }
 
 /* the first registered fence a row of the batch falls inside, else NULL; buf_lock held */
@@ -684,16 +698,22 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     pthread_mutex_lock(&db->buf_lock);
     /* after the large write's publish this batch is the newer one, and wins as a memtable row (lw_fence) */
     bool announced = false;
+    void (*hook)(void *, int) = NULL; /* the hook this wait counts with, from its first +1 to its -1 */
+    void *hook_ctx = NULL;
     for (lw_fence *f; db->lw_head && (f = lw_overlaps(db, series, cs, ts, n)) != NULL;) {
-        if (db->wait_fn && (!announced || !f->held)) {
+        if (!announced)
+            hook = db->wait_fn, hook_ctx = db->wait_ctx;
+        if (hook && (!announced || !f->held)) {
             /* This thread is held, and so, for the server, is the large write's: it frees its thread only after
              * its publish, however long the write takes. Counted once per large write, given back by its
-             * lw_leave. Not under buf_lock: tsdbd may start a thread. */
+             * lw_leave to the same hook. Not under buf_lock: tsdbd may start a thread. */
             int d = !announced + !f->held;
-            announced = f->held = true;
+            if (!f->held)
+                f->held = true, f->hold_fn = hook, f->hold_ctx = hook_ctx;
+            announced = true;
             pthread_mutex_unlock(&db->buf_lock);
             for (int k = 0; k < d; k++)
-                db->wait_fn(db->wait_ctx, 1);
+                hook(hook_ctx, 1);
             pthread_mutex_lock(&db->buf_lock);
             continue; /* f may have left meanwhile */
         }
@@ -718,7 +738,7 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
         pthread_cond_signal(&db->flush_cv);
     pthread_mutex_unlock(&db->buf_lock);
     if (announced)
-        db->wait_fn(db->wait_ctx, -1);
+        hook(hook_ctx, -1);
     if (rc == 0 && db->wal_enabled && db->opt.wal_sync_ms == 0)
         rc = wal_commit(db, lsn);
     /* backpressure when the flusher falls behind */

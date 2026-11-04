@@ -1299,7 +1299,7 @@ struct eng {
     struct lw_fence *lw_head;      /* large writes between their memtable flush and their publish (buf_lock) */
     uint64_t lw_wakeups;           /* wake-ups of small writes waiting for one (buf_lock; tests) */
     /* tsdb_set_write_wait_hook: around a small write's wait for a fence, so a server with a fixed set of threads
-     * starts another (set before the first write, never changed) */
+     * starts another (buf_lock; a wait keeps the hook it counted with for its -1) */
     void (*wait_fn)(void *ctx, int delta);
     void *wait_ctx;
     memtable *active;
@@ -1449,10 +1449,18 @@ typedef struct lw_fence {
     int64_t lo, hi;   /* every key's timestamp is in [lo, hi]; lo > hi: no keys */
     uint32_t series;  /* nb == 0: the one series */
     uint32_t nb;      /* else LW_BUCKETS buckets of series (local id & (LW_BUCKETS - 1)), each with a range */
-    int64_t *r;       /* nb buckets: lo, hi; the thread's scratch (eng_insert_scratch), valid until lw_leave */
+    int64_t *r;       /* nb buckets: lo, hi; valid until lw_leave */
+    bool r_heap;      /* r was allocated (the thread's table was taken), else it is lw_table_take's */
     pthread_cond_t cv; /* from lw_enter to lw_leave: the writes waiting for this fence (buf_lock) */
-    bool held;         /* a waiter counted this large write's thread as held too (wait_fn; buf_lock) */
+    /* held: a waiter counted this large write's thread as held too, through hold_fn(hold_ctx, +1) (buf_lock); the
+     * -1 goes to the same hook, whatever tsdb_set_write_wait_hook set since */
+    bool held;
+    void (*hold_fn)(void *ctx, int delta);
+    void *hold_ctx;
 } lw_fence;
+/* The thread's fence table (insert.c): taken until lw_table_put; NULL while taken (or on failure). */
+void *lw_table_take(size_t bytes);
+void lw_table_put(void);
 int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t const_series, const int64_t *ts, size_t n);
 void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end); /* [start, end) */
 bool lw_enter(struct eng *db, lw_fence *f); /* returns whether the memtable holds rows to flush first */
@@ -1478,8 +1486,7 @@ const char *eng_state_name(eng *db, uint32_t code);
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n);
 /* The calling thread's grow-only buffer `which` (0, 1, 2) of at least `bytes`, for a caller that rearranges a batch
  * before eng_insert (the volume split, narrowed ids): a fresh malloc per batch of 8M rows or more is an mmap whose
- * pages fault in again every time, on every thread at once. Contents are lost when it grows; NULL on failure.
- * 3: the fence table of lw_fence_rows (256 KB, above glibc's mmap threshold), inside eng_insert. */
+ * pages fault in again every time, on every thread at once. Contents are lost when it grows; NULL on failure. */
 void *eng_insert_scratch(int which, size_t bytes);
 int eng_insert_series(eng *db, int type, uint32_t series, const int64_t *ts, const void *v, size_t n);
 int eng_commit(eng *db);

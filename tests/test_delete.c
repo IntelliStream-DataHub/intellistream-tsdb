@@ -1216,7 +1216,9 @@ static void lww_two_window(void *arg)
     x->wakeups_after_b = tsdb_test_fence_wakeups(x->db);
 }
 
-static void test_lww_wakeups(void)
+/* One run; returns the wake-ups before A published (a spurious return from pthread_cond_wait counts too, which
+ * glibc allows and almost never produces: the caller tries again before it calls it a failure) */
+static uint64_t lww_wakeups_once(void)
 {
     char dir[1024];
     snprintf(dir, sizeof dir, "%s/tsdb_delete_lww_two", scratch);
@@ -1235,13 +1237,176 @@ static void test_lww_wakeups(void)
     tsdb_test_precommit(db, NULL, NULL);
     OK(lww_join(&x.small));
     OK(x.rc_b);
-    if (x.small_early || x.small_after_b || x.wakeups_after_b != 0) {
-        fprintf(stderr, "lww wake-ups: the small write %s; it woke %" PRIu64 " times before A published\n",
-                x.small_early || x.small_after_b ? "did not wait for A" : "waited for A", x.wakeups_after_b);
+    if (x.small_early || x.small_after_b) {
+        fprintf(stderr, "lww wake-ups: the small write did not wait for A\n");
         failures++;
     }
     if (lww_read(db, x.a, LWW_K) != LWW_SMALL || lww_read(db, x.b, LWW_K) != LWW_NEW) {
         fprintf(stderr, "lww wake-ups: wrong values after both large writes\n");
+        failures++;
+    }
+    OK(tsdb_close(db));
+    return x.wakeups_after_b;
+}
+
+static void test_lww_wakeups(void)
+{
+    uint64_t woke = 0;
+    for (int attempt = 0; attempt < 3 && (attempt == 0 || woke != 0); attempt++)
+        woke = lww_wakeups_once();
+    if (woke != 0) {
+        fprintf(stderr, "lww wake-ups: the small write waiting for A woke %" PRIu64 " times before A published, in "
+                        "each of 3 tries\n", woke);
+        failures++;
+    }
+}
+
+/* The write wait hook may be changed or cleared while a write waits: the -1s (the waiter's and the large write's)
+ * go to the hook that got the +1s. Before, the large write's lw_leave and the waiter called whatever hook was set
+ * by then: a NULL one crashed, another one got -1s it never had +1s for. */
+static long lww_hook_count[2];
+
+static void lww_hook(void *ctx, int delta) { __atomic_add_fetch((long *)ctx, delta, __ATOMIC_SEQ_CST); }
+
+typedef struct {
+    tsdb *db;
+    tsdb_sid s;
+    int round; /* 0: the hook is cleared in the window, 1: replaced */
+    lww_write small;
+    int small_early;
+    long during;
+} lww_hk;
+
+static void lww_hook_window(void *arg)
+{
+    lww_hk *x = arg;
+    lww_start(&x->small, x->db, x->s, LWW_K, LWW_SMALL);
+    x->small_early = lww_wait(&x->small, 300);
+    x->during = __atomic_load_n(&lww_hook_count[0], __ATOMIC_SEQ_CST); /* the waiter and this large write */
+    tsdb_set_write_wait_hook(x->db, x->round ? lww_hook : NULL, x->round ? &lww_hook_count[1] : NULL);
+}
+
+static void test_lww_hook_change(void)
+{
+    for (int round = 0; round < 2; round++) {
+        char dir[1024];
+        snprintf(dir, sizeof dir, "%s/tsdb_delete_lww_hook", scratch);
+        rmrf(dir);
+        tsdb_options opt = test_opts();
+        tsdb *db;
+        OK(tsdb_open(dir, &opt, &db));
+        lww_hook_count[0] = lww_hook_count[1] = 0;
+        tsdb_set_write_wait_hook(db, lww_hook, &lww_hook_count[0]);
+        lww_hk x;
+        memset(&x, 0, sizeof x);
+        x.db = db, x.round = round;
+        OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &x.s));
+        tsdb_test_precommit(db, lww_hook_window, &x);
+        OK(lww_large(db, x.s));
+        tsdb_test_precommit(db, NULL, NULL);
+        OK(lww_join(&x.small));
+        long c0 = __atomic_load_n(&lww_hook_count[0], __ATOMIC_SEQ_CST);
+        long c1 = __atomic_load_n(&lww_hook_count[1], __ATOMIC_SEQ_CST);
+        if (x.small_early || x.during != 2 || c0 != 0 || c1 != 0) {
+            fprintf(stderr, "lww hook %s while a write waited: %s, %ld counted in the window (want 2); the counts "
+                            "end at %ld and %ld (want 0 and 0)\n", round ? "replaced" : "cleared",
+                    x.small_early ? "it did not wait" : "it waited", x.during, c0, c1);
+            failures++;
+        }
+        if (lww_read(db, x.s, LWW_K) != LWW_SMALL) {
+            fprintf(stderr, "lww hook: the small write did not win\n");
+            failures++;
+        }
+        OK(tsdb_close(db));
+    }
+}
+
+/* The precommit test hook reaches volumes added after it was set (tsdbd's TSDBD_TEST_HOLD_LARGE_MS sets it at start;
+ * a volume added later used to run its large writes without it, so a test there did not test the window). */
+static void lww_count_hook(void *arg) { ++*(int *)arg; }
+
+static void test_lww_hook_new_volume(void)
+{
+    char dir[1024], vol[1100];
+    snprintf(dir, sizeof dir, "%s/tsdb_delete_lww_vol", scratch);
+    snprintf(vol, sizeof vol, "%s.volume", dir);
+    rmrf(dir);
+    rmrf(vol);
+    tsdb_options opt = test_opts();
+    tsdb *db;
+    OK(tsdb_open(dir, &opt, &db));
+    int calls = 0;
+    tsdb_test_precommit(db, lww_count_hook, &calls);
+    uint32_t index;
+    OK(tsdb_volume_add(db, vol, &index));
+    tsdb_sid s;
+    OK(tsdb_series_create(db, "v", TSDB_INT64, vol, &s));
+    OK(lww_large(db, s));
+    tsdb_test_precommit(db, NULL, NULL);
+    if (calls != 1) {
+        fprintf(stderr, "lww: the precommit hook ran %d times for a large insert into a volume added later\n", calls);
+        failures++;
+    }
+    OK(tsdb_close(db));
+    rmrf(vol);
+}
+
+/* An insert nested in another large write's window (here in the precommit hook, on the same thread) must not
+ * rewrite the outer fence's table. Before, both tables were the thread's one scratch buffer: the nested insert
+ * reset it to its own series, and a small write into the outer write's keys was acknowledged before its publish. */
+typedef struct {
+    tsdb *db;
+    tsdb_sid a, b, c, d;
+    int depth;
+    lww_write small;
+    int in_window, rc_nested;
+} lww_nest;
+
+/* a large insert of two series, interleaved (a table of buckets): s1 and s2 every 40 ms from t0 */
+static int lww_large2(tsdb *db, tsdb_sid s1, tsdb_sid s2, int64_t t0)
+{
+    tsdb_sid ids[300];
+    int64_t ts[300], v[300];
+    for (int i = 0; i < 300; i++)
+        ids[i] = i % 2 ? s2 : s1, ts[i] = t0 + i / 2 * 40, v[i] = LWW_NEW;
+    tsdb_values col = {TSDB_INT64, v, NULL};
+    return tsdb_insert_values(db, ids, ts, &col, 300);
+}
+
+static void lww_nest_window(void *arg)
+{
+    lww_nest *x = arg;
+    if (x->depth++)
+        return; /* the nested insert's own window */
+    x->rc_nested = lww_large2(x->db, x->c, x->d, 100000);
+    lww_start(&x->small, x->db, x->a, LWW_K, LWW_SMALL);
+    x->in_window = lww_wait(&x->small, 300);
+}
+
+static void test_lww_nested(void)
+{
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/tsdb_delete_lww_nest", scratch);
+    rmrf(dir);
+    tsdb_options opt = test_opts();
+    opt.partition_classes = 0; /* the nested insert classifies nothing while the outer one holds the history */
+    tsdb *db;
+    OK(tsdb_open(dir, &opt, &db));
+    lww_nest x;
+    memset(&x, 0, sizeof x);
+    x.db = db;
+    OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &x.a));
+    OK(tsdb_series_create(db, "b", TSDB_INT64, NULL, &x.b));
+    OK(tsdb_series_create(db, "c", TSDB_INT64, NULL, &x.c));
+    OK(tsdb_series_create(db, "d", TSDB_INT64, NULL, &x.d));
+    tsdb_test_precommit(db, lww_nest_window, &x);
+    OK(lww_large2(db, x.a, x.b, 0)); /* LWW_K is a key of a */
+    tsdb_test_precommit(db, NULL, NULL);
+    OK(lww_join(&x.small));
+    OK(x.rc_nested);
+    if (x.in_window || lww_read(db, x.a, LWW_K) != LWW_SMALL) {
+        fprintf(stderr, "lww nested: after an insert nested in the window, a small write into the outer insert's "
+                        "keys was acknowledged before its publish\n");
         failures++;
     }
     OK(tsdb_close(db));
@@ -1261,6 +1426,9 @@ int main(int argc, char **argv)
     int rounds = getenv("TSDB_DELETE_ROUNDS") ? atoi(getenv("TSDB_DELETE_ROUNDS")) : 6;
     test_lww_realtime();
     test_lww_wakeups();
+    test_lww_hook_change();
+    test_lww_nested();
+    test_lww_hook_new_volume();
     test_stats();
     test_wal_replay();
     test_follower();

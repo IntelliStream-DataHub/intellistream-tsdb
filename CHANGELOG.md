@@ -167,7 +167,10 @@ disk format and the wire protocol.
   millions of rows), and while overlapping large writes follow each other without a gap, a small write into their
   keys waits for all of them. A write that waited is refused when the engine failed meanwhile. tsdbd counts such a
   waiting request and the large write it waits for as waiting workers and starts extra ones, so queries and other
-  writes keep being answered; embedded servers can do the same with the new `tsdb_set_write_wait_hook`.
+  writes keep being answered; embedded servers can do the same with the new `tsdb_set_write_wait_hook`. tsdbd starts
+  at most 256 extra workers: more than `--workers` + 256 connections writing into a large write's keys at once
+  stall it again until the publish, so keep the writing connections during a big backfill below that, or split the
+  backfill into smaller calls (docs/design.md, the server section).
 - Large inserts (8 million rows or more per call) faulted their memory in again on every call since the 64-bit series
   ids: `tsdb_insert` narrowed the ids into a fresh allocation per batch, which glibc serves from a new mmap above
   32 MB (4 bytes per row; a batch spanning volumes, 16). They now go to the inserting thread's grow-only buffers, as
