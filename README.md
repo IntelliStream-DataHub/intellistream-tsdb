@@ -88,13 +88,13 @@ performance optimizations for different CPU architectures.
 
 We ran tsdb 0.9.0 and the other databases on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a
 time, on the same data, with the same memory limit of 48 GB. Every answer was checked against tsdb's before it was
-timed. Every timing was repeated 5 times. "tsdb faster" says how many times faster tsdb was (tsdb = 1x).
+timed. Every timing was repeated 5 times. "slower" says how many times longer the other database took than tsdb.
 
 **Servers: 100 million readings** (100 sensors, 1 million readings each). tsdb ran as a server, over TCP.
 
-| database | size, bytes per reading | compression | ingest, rows/s | tsdb faster | read, rows/s | tsdb faster | TWA | tsdb faster | LTTB | tsdb faster | max memory |
+| database | size, bytes per reading | compression | ingest, rows/s | slower | read, rows/s | slower | TWA | slower | LTTB | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **tsdb** | **0.78** | **15.4x** | **85.8 M** | 1x | **1,524 M** | 1x | **36.4 ms** | 1x | **456 ms** | 1x | **2.0 GB** |
+| **tsdb** | **0.78** | **15.4x** | **85.8 M** | | **1,524 M** | | **36.4 ms** | | **456 ms** | | **2.0 GB** |
 | ClickHouse | 2.51 | 4.8x | 47.5 M | 1.8x | 265 M | 5.7x | 1,063 ms | 29x | 540 ms | 1.2x | 43.1 GB [1] |
 | InfluxDB 2 [2] | 34.5 | 0.3x | 3.59 M | 24x | 14.6 M | 104x | not measured [3] | | not measured | | 7.9 GB |
 | InfluxDB 3 | 9.59 | 1.3x | 1.34 M | 64x | 2.23 M | 685x | 8,488 ms | 233x | not measured | | 48 GB (limit, ran out) [4] |
@@ -135,9 +135,9 @@ bytes per reading (11.7x), but converting the 100 million readings took 28 minut
 **Embedded: a library inside your program**, the same 100 million readings in one process, with no network. chDB
 is ClickHouse as a library.
 
-| database | size on disk | compression | ingest, rows/s | tsdb faster | read, rows/s | tsdb faster | TWA | tsdb faster | LTTB | tsdb faster | max memory |
+| database | size on disk | compression | ingest, rows/s | slower | read, rows/s | slower | TWA | slower | LTTB | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **tsdb** | **114 MB** | **10.5x** | **144.8 M** | 1x | **1,697 M** | 1x | **38.7 ms** | 1x | **404 ms** | 1x | not measured |
+| **tsdb** | **114 MB** | **10.5x** | **144.8 M** | | **1,697 M** | | **38.7 ms** | | **404 ms** | | not measured |
 | chDB | 219 MB | 5.5x | 62.5 M | 2.3x | 23.9 M | 71x | 1,054 ms | 27x | 432 ms | 1.1x | not measured |
 | DuckDB | 306 MB | 3.9x | 27.5 M | 5.3x | 23.9 M | 71x | 1,820 ms | 47x | not measured | | not measured |
 
@@ -147,9 +147,9 @@ is ClickHouse as a library.
 
 **100 billion readings: tsdb and ClickHouse** (10,000 sensors, 10 million readings each, loaded by 8 streams).
 
-| database | size on disk | compression | ingest, rows/s | tsdb faster | read, rows/s | tsdb faster | max memory |
+| database | size on disk | compression | ingest, rows/s | slower | read, rows/s | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **tsdb** | **137.8 GB** | **8.7x** | **109.4 M** | 1x | **1,910 M** | 1x | **1.1 GB** |
+| **tsdb** | **137.8 GB** | **8.7x** | **109.4 M** | | **1,910 M** | | **1.1 GB** |
 | ClickHouse | 212.1 GB | 5.7x | 51.6 M | 2.1x | 886 M | 2.2x | 5.9 GB |
 
 - **Read:** the whole table in hourly buckets, 100 billion rows divided by the median time. Time-weighted averages

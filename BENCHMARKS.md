@@ -30,19 +30,19 @@ measurement, with its spread and number of runs, is in
   are in the full tables). Every bucket in the tables below is smaller than a block, so tsdb reads the data.
 - **16 clients:** some systems ran out of memory when 32 clients asked about 100 sensors at once. Those questions
   were timed again at 16 clients, for that system and for tsdb. The 16-client row is the fair comparison there.
-- **Ratios:** "tsdb faster" says how many times faster tsdb was (5x: the other database took 5 times as long).
+- **Ratios:** "slower" says how many times longer the other database took than tsdb (5x: 5 times as long).
 
 ## The summary
 
 We ran tsdb 0.9.0 and the other databases on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a
 time, on the same data, with the same memory limit of 48 GB. Every answer was checked against tsdb's before it was
-timed. Every timing was repeated 5 times. "tsdb faster" says how many times faster tsdb was (tsdb = 1x).
+timed. Every timing was repeated 5 times. "slower" says how many times longer the other database took than tsdb.
 
 **Servers: 100 million readings** (100 sensors, 1 million readings each). tsdb ran as a server, over TCP.
 
-| database | size, bytes per reading | compression | ingest, rows/s | tsdb faster | read, rows/s | tsdb faster | TWA | tsdb faster | LTTB | tsdb faster | max memory |
+| database | size, bytes per reading | compression | ingest, rows/s | slower | read, rows/s | slower | TWA | slower | LTTB | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **tsdb** | **0.78** | **15.4x** | **85.8 M** | 1x | **1,524 M** | 1x | **36.4 ms** | 1x | **456 ms** | 1x | **2.0 GB** |
+| **tsdb** | **0.78** | **15.4x** | **85.8 M** | | **1,524 M** | | **36.4 ms** | | **456 ms** | | **2.0 GB** |
 | ClickHouse | 2.51 | 4.8x | 47.5 M | 1.8x | 265 M | 5.7x | 1,063 ms | 29x | 540 ms | 1.2x | 43.1 GB [1] |
 | InfluxDB 2 [2] | 34.5 | 0.3x | 3.59 M | 24x | 14.6 M | 104x | not measured [3] | | not measured | | 7.9 GB |
 | InfluxDB 3 | 9.59 | 1.3x | 1.34 M | 64x | 2.23 M | 685x | 8,488 ms | 233x | not measured | | 48 GB (limit, ran out) [4] |
@@ -83,9 +83,9 @@ bytes per reading (11.7x), but converting the 100 million readings took 28 minut
 **Embedded: a library inside your program**, the same 100 million readings in one process, with no network. chDB
 is ClickHouse as a library.
 
-| database | size on disk | compression | ingest, rows/s | tsdb faster | read, rows/s | tsdb faster | TWA | tsdb faster | LTTB | tsdb faster | max memory |
+| database | size on disk | compression | ingest, rows/s | slower | read, rows/s | slower | TWA | slower | LTTB | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **tsdb** | **114 MB** | **10.5x** | **144.8 M** | 1x | **1,697 M** | 1x | **38.7 ms** | 1x | **404 ms** | 1x | not measured |
+| **tsdb** | **114 MB** | **10.5x** | **144.8 M** | | **1,697 M** | | **38.7 ms** | | **404 ms** | | not measured |
 | chDB | 219 MB | 5.5x | 62.5 M | 2.3x | 23.9 M | 71x | 1,054 ms | 27x | 432 ms | 1.1x | not measured |
 | DuckDB | 306 MB | 3.9x | 27.5 M | 5.3x | 23.9 M | 71x | 1,820 ms | 47x | not measured | | not measured |
 
@@ -95,9 +95,9 @@ is ClickHouse as a library.
 
 **100 billion readings: tsdb and ClickHouse** (10,000 sensors, 10 million readings each, loaded by 8 streams).
 
-| database | size on disk | compression | ingest, rows/s | tsdb faster | read, rows/s | tsdb faster | max memory |
+| database | size on disk | compression | ingest, rows/s | slower | read, rows/s | slower | max memory |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **tsdb** | **137.8 GB** | **8.7x** | **109.4 M** | 1x | **1,910 M** | 1x | **1.1 GB** |
+| **tsdb** | **137.8 GB** | **8.7x** | **109.4 M** | | **1,910 M** | | **1.1 GB** |
 | ClickHouse | 212.1 GB | 5.7x | 51.6 M | 2.1x | 886 M | 2.2x | 5.9 GB |
 
 - **Read:** the whole table in hourly buckets, 100 billion rows divided by the median time. Time-weighted averages
@@ -116,7 +116,7 @@ this data. It does not sync a write to disk before it answers.
 
 **Where tsdb is furthest ahead of ClickHouse** (one client):
 
-| question | tsdb | ClickHouse | tsdb faster |
+| question | tsdb | ClickHouse | slower |
 |---|---:|---:|---:|
 | one day of 100 sensors | **1.29 ms** | 125 ms | 97x |
 | one week of 100 sensors | **4.89 ms** | 274 ms | 56x |
@@ -127,7 +127,7 @@ The gap is largest when one request names many sensors: tsdb answers all 100 in 
 
 All questions, median time of one request:
 
-| question | clients | tsdb | ClickHouse | tsdb faster |
+| question | clients | tsdb | ClickHouse | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 191 ms | 23x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 377 ms | 5.7x |
@@ -154,7 +154,7 @@ All questions, median time of one request:
 **Time-weighted averages.** ClickHouse has no time-weighted average function, so it gets the same calculation
 written in SQL with window functions. Its answers agreed with tsdb's.
 
-| question | clients | tsdb | ClickHouse | tsdb faster |
+| question | clients | tsdb | ClickHouse | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 sensors, hourly, step | 1 | **36.4 ms** | 1,063 ms | 29x |
 | whole history of 100 sensors, hourly, linear | 1 | **43.3 ms** | 1,747 ms | 40x |
@@ -194,7 +194,7 @@ each time below is the faster of the two.
   differ from tsdb's. Not timed. **LTTB:** not measured.
 - **Failures:** none.
 
-| question | clients | tsdb | InfluxDB 2 | tsdb faster |
+| question | clients | tsdb | InfluxDB 2 | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s (F) | 284x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 6.85 s (F) | 104x |
@@ -225,7 +225,7 @@ earlier attempt used 28 GB).
 - **Failures:** with 32 clients asking for 10 one-week windows each, the kernel stopped it at the 48 GB limit in 4
   of 5 runs.
 
-| question | clients | tsdb | InfluxDB 3 | tsdb faster |
+| question | clients | tsdb | InfluxDB 3 | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 44.6 s | 5,374x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 44.9 s | 685x |
@@ -250,7 +250,7 @@ write. It answers a write from memory and writes it to disk within 5 seconds.
   integral without the covered time).
 - **Memory:** at most 5.9 GB. **Failures:** none.
 
-| question | clients | tsdb | VictoriaMetrics | tsdb faster |
+| question | clients | tsdb | VictoriaMetrics | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 208 ms | 25x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 947 ms | 14x |
@@ -283,7 +283,7 @@ QuestDB 10.0.1, a fast SQL database for time series. It does not sync a write to
 
 **Time-weighted averages** (a better query was written for it during the run; the older rows are not used):
 
-| question | clients | tsdb | QuestDB | tsdb faster |
+| question | clients | tsdb | QuestDB | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 sensors, hourly, step | 1 | **36.4 ms** | 1,336 ms | 37x |
 | 10 one-day windows | 1 | **0.843 ms** | 576 ms | 683x |
@@ -296,7 +296,7 @@ The linear form was not timed: the server was down or timed out when it was chec
 
 Its default format, median time of one request:
 
-| question | clients | tsdb | QuestDB | tsdb faster |
+| question | clients | tsdb | QuestDB | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 266 ms | 32x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 1.32 s | 20x |
@@ -346,7 +346,7 @@ its toolkit (the timescaledb-ha image).
 - **LTTB:** 12.3 s (tsdb 456 ms, 27x faster).
 - **Memory:** it reached the 48 GB limit with many clients.
 
-| question | clients | tsdb | TimescaleDB | tsdb faster |
+| question | clients | tsdb | TimescaleDB | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 3.60 s | 434x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 4.24 s | 65x |
@@ -395,7 +395,7 @@ its WAL synced. **TDengine 3.4.2.8** (community edition), loaded by line protoco
 
 IoTDB:
 
-| question | clients | tsdb | IoTDB | tsdb faster |
+| question | clients | tsdb | IoTDB | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 275 ms | 33x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 1.31 s | 20x |
@@ -417,7 +417,7 @@ IoTDB:
 
 TDengine:
 
-| question | clients | tsdb | TDengine | tsdb faster |
+| question | clients | tsdb | TDengine | slower |
 |---|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 124 ms | 15x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 652 ms | 9.9x |
@@ -445,7 +445,7 @@ faster). Remote write acknowledges from its head without syncing every request.
 - **Size:** the median over the 31 data sets is 3.7 times tsdb's (backfilled blocks).
 - **Time-weighted averages and LTTB:** not measured. **Memory:** at most 1.1 GB. **Failures:** none.
 
-| question | clients | tsdb | backfilled | remote write | tsdb faster (backfilled) |
+| question | clients | tsdb | backfilled | remote write | slower (backfilled) |
 |---|---:|---:|---:|---:|---:|
 | whole history of 100 series, buckets of 3,600 readings | 1 | **8.3 ms** | 13.7 s | 15.6 s | 1,656x |
 | whole history of 100 series, buckets of 60 readings | 1 | **65.6 ms** | 15.2 s | 17.1 s | 231x |
@@ -501,7 +501,7 @@ close there.
 10,000 sensors with 10 million readings each, loaded the same way into both by 8 streams. ClickHouse's queries ran
 after its background merges had settled.
 
-| | tsdb | ClickHouse | tsdb faster |
+| | tsdb | ClickHouse | slower |
 |---|---:|---:|---:|
 | size on disk | **137.8 GB** (1.38 bytes per reading) | 212.1 GB (2.12 bytes per reading) | |
 | load | **914 s** (109.4 M rows/s) | 1,937 s (51.6 M rows/s) | 2.1x |
@@ -515,7 +515,7 @@ with the old code and 236 s with the fixed one.
 
 Median time of one query:
 
-| question | readings | tsdb (server) | tsdb (embedded) | ClickHouse | tsdb faster (server) |
+| question | readings | tsdb (server) | tsdb (embedded) | ClickHouse | slower (than tsdb's server) |
 |---|---:|---:|---:|---:|---:|
 | one random reading | 1 | **0.31 ms** | 0.26 ms | 2 ms | 6.4x |
 | aggregate a window of one sensor [e] | 1 M | **0.61 ms** | 0.52 ms | 8 ms | 13x |
@@ -546,7 +546,7 @@ it has no primary key, so a newer reading does not replace an older one with the
 
 Median time of one call, one thread (chDB and DuckDB run each query on 32 threads):
 
-| question | tsdb | chDB | DuckDB | tsdb faster than the faster other |
+| question | tsdb | chDB | DuckDB | slower (the faster of chDB and DuckDB) |
 |---|---:|---:|---:|---:|
 | one day of one sensor | **0.050 ms** | 3.63 ms | 3.63 ms | 73x |
 | one week of one sensor | **0.085 ms** | 4.94 ms | 5.50 ms | 58x |
