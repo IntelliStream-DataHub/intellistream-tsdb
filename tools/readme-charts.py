@@ -123,15 +123,57 @@ def rows_of(panel, systems):
     return out
 
 
+def subtitle(panel):
+    """The line under a panel's title: its unit, which way is better, and the scale."""
+    if panel.get("note"):
+        return panel["note"]
+    return {"size": f"{panel['unit']}; times tsdb's size; log scale",
+            "slower": "speed; tsdb = full bar; log scale",
+            "latency": f"{panel['unit']}; shorter is better; log scale",
+            "absolute": f"{panel['unit']}; linear scale"}[panel["kind"]]
+
+
+def site_html():
+    """{chart name: HTML} for the site (site/index.html, site/docs/benchmarks.html): one <figure> per panel with a
+    table of the same rows, bar lengths and labels as the SVG, which site.js draws as animated bars. make check-site
+    compares the pages' copies with this, so the site and the README cannot disagree."""
+    with open(DATA, encoding="utf-8") as f:
+        data = json.load(f)
+    out = {}
+    for name, chart in data["charts"].items():
+        figs = []
+        for i, panel in enumerate(chart["panels"]):
+            rows = []
+            for sysname, kind, frac, label, tag in rows_of(panel, chart["systems"]):
+                attrs = ' class="us"' if kind == "us" else ""
+                if kind == "none":
+                    attrs += f' data-none="{escape(label)}"'
+                else:
+                    attrs += f' data-len="{max(frac, 0.0):.4f}"'
+                if tag:
+                    attrs += f' data-tag="{escape(tag)}"'
+                cell = escape(label) + (f" ({escape(tag)})" if tag else "")
+                rows.append(f'<tr{attrs}><th scope="row">{escape(sysname)}</th><td>{cell}</td></tr>')
+            figs.append(f'<figure class="chart" id="{name}-{i + 1}">\n'
+                        f'<figcaption><h3>{escape(panel["title"])}</h3><p>{escape(subtitle(panel))}</p></figcaption>\n'
+                        f'<div class="chart-svg"></div>\n'
+                        f'<details open><summary>The numbers</summary><div class="table-wrap">'
+                        f'<table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">\n'
+                        f'<thead><tr><th scope="col">System</th><th scope="col">{escape(subtitle(panel))}</th></tr>'
+                        f'</thead>\n<tbody>\n' + "\n".join(rows) + "\n</tbody></table></div></details>\n</figure>")
+        notes = ["Speed: tsdb is the full bar. Size, time and memory: shorter is better. A box instead of a bar: no "
+                 "number, and why."] + chart.get("footnotes", [])
+        notes_html = " ".join(escape(n) for n in notes)
+        out[name] = (f'\n<div class="charts">\n' + "\n".join(figs) + f'\n</div>\n<p class="chart-notes">{notes_html} '
+                     f'Exact numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/'
+                     f'BENCHMARKS.md">BENCHMARKS.md</a>.</p>\n')
+    return out
+
+
 def panel_svg(panel, systems, x0, y0):
     rows = rows_of(panel, systems)
     p = []
-    sub = {"size": f"{panel['unit']}; times tsdb's size; log scale",
-           "slower": f"speed; tsdb = full bar; log scale",
-           "latency": f"{panel['unit']}; shorter is better; log scale",
-           "absolute": f"{panel['unit']}; linear scale"}[panel["kind"]]
-    if panel.get("note"):
-        sub = panel["note"]
+    sub = subtitle(panel)
     p.append(f'<text x="{x0}" y="{y0 + 14}" class="h">{escape(panel["title"])}</text>')
     p.append(f'<text x="{x0}" y="{y0 + 31}" class="m">{escape(sub)}</text>')
     if text_w(sub, 11.5) > PW:

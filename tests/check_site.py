@@ -22,7 +22,7 @@ What it checks, with the Python standard library only:
                                  survives edits elsewhere in the file, unlike a line range)
 - Every number in a benchmark chart's table (<td data-v>) appears in the results file the table names
   (data-source), so a chart cannot show a number the published results do not have.
-- site.js has no syntax errors (node --check, when node is installed).
+- The scripts in site/assets have no syntax errors (node --check, when node is installed).
 - The README's benchmark charts (docs/img/bench-*.svg) are exactly what tools/readme-charts.py draws from
   tools/readme-charts.json, and every number in that file appears in BENCHMARKS.md's summary or memory tables.
 """
@@ -256,9 +256,7 @@ def check_links(page, parser, ids_of):
             err(page, f"line {line}: {link!r}: no id {frag!r} there")
 
 
-def check_readme_charts():
-    """The README's charts (docs/img/bench-*.svg) are what tools/readme-charts.py draws from its data file, and every
-    number of that file is in BENCHMARKS.md's summary tables."""
+def charts_module():
     import importlib.util
 
     gen = os.path.join(ROOT, "tools", "readme-charts.py")
@@ -266,6 +264,43 @@ def check_readme_charts():
     mod = importlib.util.module_from_spec(spec)
     sys.dont_write_bytecode = True  # no tools/__pycache__ in the tree
     spec.loader.exec_module(mod)
+    return mod
+
+
+SITE_CHART = re.compile(r"(<!-- readme-chart ([\w-]+) -->)(.*?)(<!-- /readme-chart -->)", re.S)
+
+
+def check_site_charts(page, raw, fix):
+    """The site's benchmark charts are the README's: each <!-- readme-chart NAME --> block holds exactly what
+    tools/readme-charts.py's site_html() makes from tools/readme-charts.json."""
+    want = charts_module().site_html()
+    changed = False
+
+    def one(m):
+        nonlocal changed
+        if m.group(2) not in want:
+            err(page, f"readme-chart {m.group(2)!r}: no such chart in tools/readme-charts.json")
+            return m.group(0)
+        if m.group(3) == want[m.group(2)]:
+            return m.group(0)
+        if fix:
+            changed = True
+            return m.group(1) + want[m.group(2)] + m.group(4)
+        err(page, f"readme-chart {m.group(2)}: differs from tools/readme-charts.json (run tests/check_site.py --fix)")
+        return m.group(0)
+
+    out = SITE_CHART.sub(one, raw)
+    if changed:
+        with open(page, "w", encoding="utf-8") as f:
+            f.write(out)
+        print(f"updated {os.path.relpath(page, ROOT)} (charts)")
+    return out
+
+
+def check_readme_charts():
+    """The README's charts (docs/img/bench-*.svg) are what tools/readme-charts.py draws from its data file, and every
+    number of that file is in BENCHMARKS.md's summary tables."""
+    mod = charts_module()
     for name, svg in mod.render().items():
         path = os.path.join(ROOT, "docs", "img", name)
         have = open(path, encoding="utf-8").read() if os.path.isfile(path) else None
@@ -307,21 +342,25 @@ def main():
     for page in all_pages:
         with open(page, encoding="utf-8") as f:
             raw = f.read()
-        check_code(page, raw, fix)
+        raw = check_code(page, raw, fix)
+        check_site_charts(page, raw, fix)
         parsed.pop(page, None)
         p, raw = parse(page)
         check_numbers(page, raw)
+        if not re.search(r'<link rel="icon" href="[^"]*assets/favicon\.svg" type="image/svg\+xml">', raw):
+            err(page, "no <link rel=\"icon\"> to assets/favicon.svg")
     for page in all_pages:
         check_links(page, parse(page)[0], lambda d: parse(d)[0].ids)
     check_readme_charts()
-    js = os.path.join(SITE, "assets", "site.js")
     node = shutil.which("node")
-    if node and os.path.isfile(js):
-        r = subprocess.run([node, "--check", js], capture_output=True, text=True)
-        if r.returncode:
-            errors.append(f"site/assets/site.js: {r.stderr.strip()}")
-    elif not node:
-        print("check_site: node not found, site.js not syntax-checked")
+    scripts = sorted(f for f in os.listdir(os.path.join(SITE, "assets")) if f.endswith(".js"))
+    if node:
+        for f in scripts:
+            r = subprocess.run([node, "--check", os.path.join(SITE, "assets", f)], capture_output=True, text=True)
+            if r.returncode:
+                errors.append(f"site/assets/{f}: {r.stderr.strip()}")
+    else:
+        print("check_site: node not found, the scripts are not syntax-checked")
     for e in errors:
         print(e)
     print(f"check_site: {len(all_pages)} pages, {'FAILED' if errors else 'ok'}")
