@@ -1,23 +1,53 @@
 package ai.intellistream.tsdb.pulsar;
 
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.ValueType;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import org.apache.pulsar.io.common.IOConfigUtils;
+import org.apache.pulsar.io.core.SinkContext;
 import org.apache.pulsar.io.core.annotations.FieldDoc;
 
 /**
- * Configuration of {@link TsdbSink}, read from the sink's {@code --sink-config} (JSON or YAML map).
+ * Configuration of {@link TsdbSink}, read from the sink's {@code --sink-config} (JSON or YAML map) and, for the
+ * {@code password}, from Pulsar's secrets.
  *
  * <p>Unknown keys are an error, so a misspelt option fails the sink at start instead of being ignored. Every option
  * has a default; {@link #validate()} checks the ranges.
  */
 public class TsdbSinkConfig {
+    /**
+     * The tsdbd user the sink logs in as; empty logs in as nobody, which only a tsdbd started with {@code --no-auth}
+     * accepts. The user needs {@code insert} on the series the sink writes (which also lets it look them up and
+     * create them); a record of any other series is refused ({@code TSDB_ERR_DENIED}) and dead-lettered.
+     */
+    @FieldDoc(required = false, defaultValue = "",
+            help = "tsdbd user to log in as (needs insert on the series written); empty: no login, "
+                    + "for a tsdbd started with --no-auth")
+    public String user = "";
+
+    /**
+     * The user's password. Sensitive: it is read from Pulsar's secrets (a secret named {@code password}, given with
+     * {@code --secrets}), never from the plain configuration, which Pulsar stores and shows as it is.
+     */
+    @FieldDoc(required = false, defaultValue = "", sensitive = true,
+            help = "the user's password; a secret named password (--secrets), never the plain config")
+    public String password = "";
+
+    /** A file whose first line is the password, read at every (re)connect; instead of {@link #password}. */
+    @FieldDoc(required = false, defaultValue = "",
+            help = "file whose first line is the user's password, read at every (re)connect; instead of password")
+    public String passwordFile = "";
+
     /**
      * tsdbd endpoints, "host[:port]" separated by commas, tried in order whenever a connection is (re)opened,
      * starting after the last one that refused writes (read only, locked, stopping).
@@ -156,15 +186,42 @@ public class TsdbSinkConfig {
     public String retryableCodes = "";
 
     /**
-     * Reads a configuration map; unknown keys and wrong types are errors.
+     * Reads a configuration map without secrets; unknown keys and wrong types are errors.
      *
      * @param map the sink configuration as Pulsar passes it to {@code open}
      * @return the validated configuration
-     * @throws IllegalArgumentException for unknown keys, wrong types or values out of range
+     * @throws IllegalArgumentException for unknown keys, wrong types, values out of range or a password (which is
+     *     a secret)
      */
     public static TsdbSinkConfig load(Map<String, Object> map) {
-        ObjectMapper m = new ObjectMapper().enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
-        TsdbSinkConfig c = m.convertValue(map == null ? Map.of() : map, TsdbSinkConfig.class);
+        return load(map, null);
+    }
+
+    /**
+     * Reads a configuration map with the sensitive options ({@code password}) taken from the sink's secrets, as
+     * Pulsar's own connectors do ({@code IOConfigUtils.loadWithSecrets}); unknown keys and wrong types are errors.
+     *
+     * @param map the sink configuration as Pulsar passes it to {@code open}
+     * @param ctx the sink context, whose {@code getSecret} gives the secrets; {@code null} reads the map alone
+     * @return the validated configuration
+     * @throws IllegalArgumentException for a password in the plain configuration, unknown keys, wrong types or values
+     *     out of range
+     */
+    public static TsdbSinkConfig load(Map<String, Object> map, SinkContext ctx) {
+        Map<String, Object> m = map == null ? Map.of() : map;
+        /* Pulsar keeps the sink config in its metadata store and shows it to anyone who may list sinks */
+        require(!m.containsKey("password"), "password belongs in the sink's secrets (--secrets '{\"password\": ...}'), "
+                + "not in its configuration; or use passwordFile");
+        TsdbSinkConfig c;
+        try {
+            c = ctx == null
+                    ? new ObjectMapper().enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+                            .convertValue(m, TsdbSinkConfig.class)
+                    : IOConfigUtils.loadWithSecrets(m, TsdbSinkConfig.class, ctx);
+        } catch (IllegalArgumentException e) {
+            /* Jackson's message names the unknown or mistyped key, never a value */
+            throw new IllegalArgumentException("tsdb sink config: " + e.getMessage(), e);
+        }
         c.validate();
         return c;
     }
@@ -196,6 +253,48 @@ public class TsdbSinkConfig {
         codes(retryableCodes);
         for (String f : new String[] {seriesField, timestampField, valueField, typeField, pointsField})
             require(f != null && !f.isEmpty(), "field names must not be empty");
+        validateLogin();
+    }
+
+    /* Mistakes in the login fail the sink at start: at connect they would only be retried, as a refused login is. */
+    private void validateLogin() {
+        boolean hasUser = user != null && !user.isEmpty();
+        boolean hasPassword = password != null && !password.isEmpty();
+        boolean hasFile = passwordFile != null && !passwordFile.isEmpty();
+        if (!hasUser) {
+            require(!hasPassword && !hasFile, "a password or passwordFile without a user");
+            return;
+        }
+        byte[] u = user.getBytes(StandardCharsets.UTF_8);
+        /* SCRAM's rule for a user name, which the client checks only at connect */
+        require(u.length <= 255 && user.indexOf(',') < 0 && user.indexOf('=') < 0 && user.indexOf('\0') < 0,
+                "user must be 1 to 255 bytes without ',', '=' or NUL");
+        require(hasPassword != hasFile, hasPassword ? "both password and passwordFile are set; give one"
+                : "user " + user + " needs a password (a secret) or a passwordFile");
+        if (hasPassword) {
+            try {
+                ConnectOptions.defaults().password(password); /* the one password rule of every client */
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("tsdb sink config: password: " + e.getMessage());
+            }
+        } else {
+            require(Files.isReadable(Path.of(passwordFile)), "passwordFile " + passwordFile + " cannot be read");
+        }
+    }
+
+    /**
+     * The options of a connection: the login and the timeouts.
+     *
+     * @return options for {@code TsdbClient.connect}
+     */
+    public ConnectOptions connectOptions() {
+        ConnectOptions o = ConnectOptions.defaults()
+                .connectTimeout(java.time.Duration.ofMillis(connectTimeoutMs))
+                .requestTimeout(java.time.Duration.ofMillis(requestTimeoutMs));
+        if (user == null || user.isEmpty())
+            return o;
+        o = o.user(user);
+        return password != null && !password.isEmpty() ? o.password(password) : o.passwordFile(Path.of(passwordFile));
     }
 
     /**

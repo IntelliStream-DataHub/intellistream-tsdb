@@ -44,8 +44,14 @@ final class FakeTsdb implements TsdbConnection.Factory {
     final Deque<Integer> awaitFailures = new ArrayDeque<>();
     /** Series whose rows the server refuses with ERR_INVALID (a check the sink does not make). */
     final Set<String> refused = new HashSet<>();
+    /** Series the sink's user has no right on: their rows are refused with ERR_DENIED. */
+    final Set<String> denied = new HashSet<>();
     /** While true, connect() and every call fail with ERR_IO. */
     volatile boolean down;
+    /** While true, connect() fails with ERR_AUTH, as a refused login does. */
+    volatile boolean loginRefused;
+    /** connect() calls refused for the login. */
+    int loginsRefused;
     /** When set, await() takes a permit first: lets tests hold acknowledgements. */
     volatile Semaphore gate;
     /** Series whose inserts are held: await() of an insert holding one of them first takes a permit of heldGate. */
@@ -69,6 +75,10 @@ final class FakeTsdb implements TsdbConnection.Factory {
     public synchronized TsdbConnection connect() throws TsdbException {
         if (down)
             throw new TsdbException(Status.ERR_IO, "connection refused", null);
+        if (loginRefused) {
+            loginsRefused++;
+            throw new TsdbException(Status.ERR_AUTH, "login refused", null);
+        }
         connects++;
         return new Conn();
     }
@@ -128,6 +138,8 @@ final class FakeTsdb implements TsdbConnection.Factory {
                     holding |= held.contains(name);
                     if (name == null || series.get(name).type != values.type() || refused.contains(name))
                         failed = failed != null ? failed : new TsdbException(Status.ERR_INVALID);
+                    if (denied.contains(name)) /* tsdbd refuses the whole frame for one foreign id */
+                        failed = failed != null ? failed : new TsdbException(Status.ERR_DENIED);
                     if (failed == null)
                         pending.add(new Row(name, ts[i], values.getDouble(i), values.type()));
                 }

@@ -1,11 +1,11 @@
 package ai.intellistream.tsdb.pulsar;
 
 import ai.intellistream.tsdb.Column;
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.Status;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
 import ai.intellistream.tsdb.ValueType;
-import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -55,8 +55,7 @@ interface TsdbConnection extends AutoCloseable {
      */
     static Factory client(TsdbSinkConfig c) {
         List<Map.Entry<String, Integer>> endpoints = c.endpoints();
-        Duration timeout = Duration.ofMillis(c.connectTimeoutMs);
-        Duration requestTimeout = Duration.ofMillis(c.requestTimeoutMs);
+        ConnectOptions options = c.connectOptions(); /* a password file is read again at every connect */
         AtomicInteger first = new AtomicInteger();
         return () -> {
             TsdbException last = null;
@@ -65,11 +64,13 @@ interface TsdbConnection extends AutoCloseable {
                 int k = (from + i) % n;
                 Map.Entry<String, Integer> e = endpoints.get(k);
                 try {
-                    TsdbClient cl = TsdbClient.connect(e.getKey(), e.getValue(), timeout, requestTimeout);
+                    TsdbClient cl = TsdbClient.connect(e.getKey(), e.getValue(), options);
                     cl.setCompression(c.compressionLevel);
                     return new ClientConnection(cl, () -> first.compareAndSet(k, (k + 1) % n));
                 } catch (TsdbException x) {
-                    last = x;
+                    /* a refused login says more than a later endpoint that is down: report that one */
+                    if (last == null || last.status() != Status.ERR_AUTH)
+                        last = x;
                 }
             }
             throw last != null ? last : new TsdbException(Status.ERR_IO, "no endpoints", null);

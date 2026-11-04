@@ -124,12 +124,53 @@ More than one instance (`--parallelism`) keeps per-series order only with
 key-ordered delivery (`--retain-key-ordering`), where Pulsar gives each key to
 one instance at a time; with `--retain-ordering` keep `--parallelism 1`.
 
+### Login
+
+tsdbd asks every client to log in, unless it was started with `--no-auth`. Give
+the sink a user of its own that may insert into the series it writes, and
+nothing else. On the tsdb host (the password is read from the file's first line,
+never from the command line):
+
+```sh
+tsdb /var/lib/tsdb user add pulsar-sink --password-file sink.pw
+tsdb /var/lib/tsdb user grant pulsar-sink insert prefix:plant1/
+```
+
+Then give the sink the user in its config and the password as a Pulsar
+**secret** named `password`. Pulsar keeps the sink config as plain text and
+shows it to anyone who may list sinks, so the sink refuses a `password` there.
+How a secret is given depends on how Pulsar runs functions: with the default
+(clear text) secrets provider of a function worker or `localrun`, the value in
+`--secrets` is the password itself; on Kubernetes it names a Kubernetes secret.
+
+```sh
+bin/pulsar-admin sinks create --archive tsdb-pulsar-sink-0.9.0.nar \
+    --tenant public --namespace default --name tsdb \
+    --inputs topic://public/default/points --subs-name tsdb --retain-key-ordering \
+    --sink-config '{"hosts": "tsdb1:7070", "connections": 4, "user": "pulsar-sink",
+                    "deadLetterTopic": "topic://public/default/points-dlq"}' \
+    --secrets '{"password": "the-password"}'
+```
+
+Instead of the secret, `passwordFile` names a file on the Pulsar host whose
+first line is the password; it is read again at every reconnect, so a changed
+password is picked up without a restart.
+
+If tsdbd refuses the login (wrong password, unknown or dropped user), the sink
+does not drop anything: it waits and tries again with its usual backoff, logs one
+warning per try that says the login was refused, and Pulsar keeps the messages
+meanwhile. A message for a series the user has no right on is refused by tsdbd
+(`TSDB_ERR_DENIED`) and goes to the dead-letter topic; the rest is written.
+
 ## Configuration
 
 | key | default | meaning |
 |---|---|---|
 | `hosts` | `127.0.0.1` | tsdbd endpoints, `host[:port]` separated by commas, tried in order on every (re)connect, starting after the last one that refused writes (read only, locked, stopping) |
 | `port` | `7070` | port of endpoints that name none |
+| `user` | empty | tsdbd user to log in as (see Login); empty: no login, for a tsdbd started with `--no-auth` |
+| `password` | empty | the user's password: only as the Pulsar secret `password` (`--secrets`), never in the config |
+| `passwordFile` | empty | instead of `password`: a file whose first line is the password, read at every (re)connect |
 | `connections` | `1` | connections to tsdbd; each series always uses the same one (by a hash of its name), which keeps its order |
 | `batchRows` | `10000` | a batch is sent when it holds this many points |
 | `batchBytes` | `4194304` | ... or about this many bytes |
@@ -158,7 +199,8 @@ one instance at a time; with `--retain-ordering` keep `--parallelism 1`.
 |---|---|
 | connection refused, reset or timed out; no answer within `requestTimeoutMs` (the connection is closed); `TSDB_ERR_IO` (disk or NFS gone), `NOMEM`, `CORRUPT`; any code it does not know | waits (exponential backoff with jitter, capped) and sends the **same** batch again; acknowledges nothing meanwhile |
 | `LOCKED`, `STOPPED`, `READONLY` (a follower after a failover, a server shutting down) | as above, but first closes the connection, so the retry goes to the next endpoint in `hosts` |
-| `TSDB_ERR_INVALID` (bad name, wrong type), `NOTFOUND` (unknown series, `autoCreate=false`), `TOO_MANY_BUCKETS`; a message that does not parse; a value that is tsdb's encoding of null (int64 `-9223372036854775808`, the reserved NaN of float32/float64), which would silently read back as null | dead-letters that message; the rest of the batch is written |
+| `AUTH`: the login was refused (wrong password, unknown or dropped user), or tsdbd wants a login and `user` is empty | waits and tries again with backoff, as above; logs one warning per try that names the login |
+| `TSDB_ERR_INVALID` (bad name, wrong type), `NOTFOUND` (unknown series, `autoCreate=false`), `DENIED` (the user has no right on the series), `TOO_MANY_BUCKETS`; a message that does not parse; a value that is tsdb's encoding of null (int64 `-9223372036854775808`, the reserved NaN of float32/float64), which would silently read back as null | dead-letters that message; the rest of the batch is written |
 | the dead-letter topic refuses the message | keeps it unacknowledged and tries again (backoff), so the stream behind it waits; counted in `tsdb_dead_letter_failures`, logged as an error when only an operator can fix it (permissions, missing topic, size limit) |
 
 A tsdb that stops answering (an NFS outage parks its requests, a dead peer sends

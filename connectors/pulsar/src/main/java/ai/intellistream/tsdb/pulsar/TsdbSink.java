@@ -68,7 +68,7 @@ public class TsdbSink implements Sink<GenericObject> {
      */
     @Override
     public void open(Map<String, Object> map, SinkContext ctx) {
-        open(TsdbSinkConfig.load(map), ctx, null);
+        open(TsdbSinkConfig.load(map, ctx), ctx, null);
     }
 
     void open(TsdbSinkConfig c, SinkContext ctx, DeadLetter dl) {
@@ -111,8 +111,9 @@ public class TsdbSink implements Sink<GenericObject> {
             shards[i] = new Shard(i, c, factory, classifier, metrics, this::settled, log);
         for (Shard s : shards)
             s.start();
-        log.info("tsdb sink: {} connection(s) to {}, batches of {} rows / {} ms, in flight {} records / {} bytes",
-                c.connections, c.hosts, c.batchRows, c.lingerMs, c.maxInFlightRecords, c.maxInFlightBytes);
+        log.info("tsdb sink: {} connection(s) to {} {}, batches of {} rows / {} ms, in flight {} records / {} bytes",
+                c.connections, c.hosts, c.user.isEmpty() ? "without login" : "as user " + c.user, c.batchRows,
+                c.lingerMs, c.maxInFlightRecords, c.maxInFlightBytes);
     }
 
     /**

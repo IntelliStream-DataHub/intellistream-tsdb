@@ -63,6 +63,14 @@
       <scope>provided</scope>
     </dependency>
 
+    <!-- IOConfigUtils.loadWithSecrets, for the password: not in the runtime, so packed into the NAR as Pulsar's own
+         connectors pack it. Its logger (slog) comes with pulsar-functions-api, which the runtime provides. -->
+    <dependency>
+      <groupId>org.apache.pulsar</groupId>
+      <artifactId>pulsar-io-common</artifactId>
+      <version>${pulsar.version}</version>
+    </dependency>
+
     <dependency>
       <groupId>ai.intellistream</groupId>
       <artifactId>tsdb-client</artifactId>

@@ -81,7 +81,9 @@ public class ErrorClassifier {
         case Status.ERR_INVALID:          /* type mismatch, bad name, value of the wrong type */
         case Status.ERR_NOTFOUND:         /* unknown series and auto-create off */
         case Status.ERR_TOO_MANY_BUCKETS: /* never from a write; a query bug, not a server condition */
+        case Status.ERR_DENIED:           /* the sink's user has no right on the record's series */
             return Kind.PERMANENT;
+        case Status.ERR_AUTH:     /* login refused, or the user was dropped: wait for the operator, Pulsar buffers */
         case Status.ERR_IO:       /* connection lost, or the volume's disk (NFS) is unavailable */
         case Status.ERR_NOMEM:    /* the server is short of memory: busy */
         case Status.ERR_CORRUPT:  /* malformed reply (the connection is closed) or a damaged part on the server */

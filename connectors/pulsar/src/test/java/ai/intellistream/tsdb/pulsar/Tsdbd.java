@@ -1,5 +1,6 @@
 package ai.intellistream.tsdb.pulsar;
 
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
 import java.io.IOException;
@@ -24,11 +25,52 @@ final class Tsdbd implements AutoCloseable {
     final Path dir;
     final int port;
     private final Process process;
+    /** The superuser {@link #ROOT}'s password file on a server with login; null with {@code --no-auth}. */
+    private final Path rootPassword;
 
-    private Tsdbd(Path dir, int port, Process process) {
+    static final String ROOT = "root";
+
+    private Tsdbd(Path dir, int port, Process process, Path rootPassword) {
         this.dir = dir;
         this.port = port;
         this.process = process;
+        this.rootPassword = rootPassword;
+    }
+
+    /** The CLI beside the tsdbd binary. */
+    static Path cliBinary() {
+        return binary().resolveSibling("tsdb");
+    }
+
+    /** Runs {@code tsdb DIR ARGS...} (offline: the USERS file, beside a running tsdbd or before one starts). */
+    static void cli(Path dir, String... args) throws IOException, InterruptedException {
+        List<String> cmd = new ArrayList<>(List.of(cliBinary().toString(), dir.toString()));
+        cmd.addAll(List.of(args));
+        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        if (p.waitFor() != 0)
+            throw new IllegalStateException(String.join(" ", cmd) + " failed: " + out);
+    }
+
+    /** A password file holding {@code password} in its first line, beside the database directory. */
+    static Path passwordFile(Path dir, String name, String password) throws IOException {
+        Path f = dir.resolveSibling(dir.getFileName() + "." + name + ".pw");
+        Files.writeString(f, password + "\n", StandardCharsets.UTF_8);
+        return f;
+    }
+
+    /**
+     * Starts with login (no {@code --no-auth}): makes the superuser {@link #ROOT} with the CLI first, as an operator
+     * does; other users are added with {@link #cli}.
+     */
+    static Tsdbd startWithLogin(Path dir, String... options) throws IOException, InterruptedException {
+        Files.createDirectories(dir);
+        Path pw = passwordFile(dir, ROOT, "root-secret-1");
+        cli(dir, "user", "add", ROOT, "--superuser", "--password-file", pw.toString());
+        Tsdbd t = tryStart(dir, 0, pw, options);
+        if (t == null)
+            throw new IllegalStateException("tsdbd did not start; see " + log(dir));
+        return t;
     }
 
     static Path binary() {
@@ -77,6 +119,12 @@ final class Tsdbd implements AutoCloseable {
      * the process started here: a test never talks to a server it did not start. Null when it exited (a taken port).
      */
     private static Tsdbd tryStart(Path dir, int port, String... options) throws IOException, InterruptedException {
+        return tryStart(dir, port, null, options);
+    }
+
+    /** As above; with {@code rootPassword} the server runs with login, else with {@code --no-auth}. */
+    private static Tsdbd tryStart(Path dir, int port, Path rootPassword, String... options)
+            throws IOException, InterruptedException {
         Path bin = binary();
         if (!Files.isExecutable(bin))
             throw new IllegalStateException(bin + " is missing: run make in the repository root first");
@@ -84,8 +132,9 @@ final class Tsdbd implements AutoCloseable {
         Path portFile = dir.resolveSibling(dir.getFileName() + ".port");
         Files.deleteIfExists(portFile);
         List<String> cmd = new ArrayList<>(List.of(bin.toString(), "--dir", dir.toString(), "--listen", "127.0.0.1",
-                "--port", Integer.toString(port), "--port-file", portFile.toString(), "--workers", "2",
-                "--no-auth"));
+                "--port", Integer.toString(port), "--port-file", portFile.toString(), "--workers", "2"));
+        if (rootPassword == null)
+            cmd.add("--no-auth");
         cmd.addAll(List.of(options));
         Process p = new ProcessBuilder(cmd)
                 .redirectErrorStream(true)
@@ -101,7 +150,7 @@ final class Tsdbd implements AutoCloseable {
                         throw new IllegalStateException(portFile + " names pid " + f[1]
                                 + ", but the server started here is pid " + p.pid());
                     }
-                    return new Tsdbd(dir, Integer.parseInt(f[0]), p);
+                    return new Tsdbd(dir, Integer.parseInt(f[0]), p, rootPassword);
                 }
             }
             Thread.sleep(20);
@@ -110,8 +159,12 @@ final class Tsdbd implements AutoCloseable {
         return null;
     }
 
+    /** A connection, as the superuser where the server has login. */
     TsdbClient client() throws TsdbException {
-        return TsdbClient.connect("127.0.0.1", port);
+        if (rootPassword == null)
+            return TsdbClient.connect("127.0.0.1", port);
+        return TsdbClient.connect("127.0.0.1", port,
+                ConnectOptions.defaults().user(ROOT).passwordFile(rootPassword).requireAuth(true));
     }
 
     /** SIGKILL: no flush, no clean shutdown. Only this process, through its handle (never a pid we computed). */
@@ -139,5 +192,10 @@ final class Tsdbd implements AutoCloseable {
             s.sorted(Comparator.reverseOrder()).forEach(f -> f.toFile().delete());
         }
         Files.deleteIfExists(log(p));
+        try (Stream<Path> s = Files.list(p.getParent())) { /* the password files of passwordFile() */
+            String pw = p.getFileName() + ".";
+            s.filter(f -> f.getFileName().toString().startsWith(pw) && f.toString().endsWith(".pw"))
+                    .forEach(f -> f.toFile().delete());
+        }
     }
 }

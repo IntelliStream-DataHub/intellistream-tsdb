@@ -8,6 +8,7 @@ import org.apache.pulsar.functions.api.Record;
 final class CapturingDeadLetter implements DeadLetter {
     final List<Record<?>> records = new CopyOnWriteArrayList<>();
     final List<String> reasons = new CopyOnWriteArrayList<>();
+    final List<Integer> statuses = new CopyOnWriteArrayList<>();
     volatile int failNext;
 
     @Override
@@ -23,6 +24,7 @@ final class CapturingDeadLetter implements DeadLetter {
         }
         records.add(r);
         reasons.add(reason);
+        statuses.add(status);
     }
 
     @Override

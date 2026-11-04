@@ -175,8 +175,15 @@ final class Shard implements Runnable {
                     throw new InterruptedException("closing");
                 long d = backoff.next();
                 metrics.retry(d);
-                log.warn("tsdb sink shard {}: batch of {} records failed, retrying in {} ms: {}", index, batch.size(), d,
-                        e.toString());
+                if (e instanceof TsdbException && ((TsdbException) e).status() == Status.ERR_AUTH)
+                    /* not the data's fault and not a network fault: say what the operator has to fix */
+                    log.warn("tsdb sink shard {}: tsdbd refused the login, retrying in {} ms ({} records wait): {}: {}",
+                            index, d, batch.size(), c.user.isEmpty() ? "it requires one: set user and password"
+                                    : "check that user " + c.user + " exists and its password (secret or passwordFile)",
+                            e.toString());
+                else
+                    log.warn("tsdb sink shard {}: batch of {} records failed, retrying in {} ms: {}", index,
+                            batch.size(), d, e.toString());
                 if (closing)
                     d = Math.min(d, Math.max(1, TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())));
                 Thread.sleep(d);

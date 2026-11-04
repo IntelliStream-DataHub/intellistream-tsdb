@@ -122,6 +122,7 @@ be run offline; the poms of the artifacts that are there were read for their lic
 | zstd-jni (`com.github.luben`) | 1.5.7-6 | BSD-2-Clause (its bundled native zstd: BSD-3-Clause) | `tsdb-client`, compile. Not shaded: the user's build brings it. In the Pulsar NAR it is packed. |
 | jackson-databind, -core, -annotations | 2.18.2 | Apache-2.0 | Pulsar connector, compile; packed into the NAR |
 | Pulsar: pulsar-io-core, pulsar-functions-api, pulsar-client-api, pulsar-client-api-v5 | 5.0.0 | Apache-2.0 | Pulsar connector, `provided`: the Pulsar runtime has them; not packed |
+| pulsar-io-common | 5.0.0 | Apache-2.0 | Pulsar connector, compile (`IOConfigUtils`, the password from Pulsar's secrets); packed into the NAR. Its logger, slog, comes with pulsar-functions-api from the runtime |
 | pulsar-client-v5 | 5.0.0 | Apache-2.0 | Pulsar connector, test scope in the `integration` profile |
 | junit-jupiter | 5.13.1 | EPL-2.0 | test scope in all three; never shipped |
 | slf4j-simple | 2.0.16 | MIT | Pulsar connector, test scope |
@@ -136,7 +137,7 @@ reads the two files at the repository root). `tsdb-client` does not pack zstd-jn
 `libtsdb.so`, which links the system's libzstd dynamically, so neither needs more. (A `libtsdb.so` built with zstd
 linked statically would need the zstd text of `dist/THIRD-PARTY-NOTICES` in the jar.)
 
-The Pulsar NAR packs `tsdb-client`, Jackson and zstd-jni (`META-INF/bundled-dependencies/`). Its own `META-INF/` has
+The Pulsar NAR packs `tsdb-client`, pulsar-io-common, Jackson and zstd-jni (`META-INF/bundled-dependencies/`). Its own `META-INF/` has
 `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (`connectors/pulsar/src/main/resources/META-INF/`): the texts of
 zstd-jni (BSD-2-Clause) and of zstd inside it (BSD-3-Clause), and Jackson's NOTICE (Apache-2.0 asks for it). The
 bundled jars keep their own `META-INF/LICENSE` and `NOTICE` unchanged; the zstd-jni jar has none, which is why its text

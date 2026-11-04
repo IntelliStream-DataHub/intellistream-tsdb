@@ -85,15 +85,19 @@ class RequestTimeoutTest {
         }
     }
 
-    /** Reads the HELLO a client sends at connect and answers protocol 11 (u32 len, u32 id, u8 op, u32 version). */
+    /**
+     * Reads the HELLO a client sends at connect and answers protocol 12 without login (u32 len, u32 id, u8 op,
+     * i32 status, u32 version, u16 flags 0, u16 no mechanisms), as a tsdbd with --no-auth does.
+     */
     private static void answerHello(Socket s) throws IOException {
         java.io.DataInputStream in = new java.io.DataInputStream(s.getInputStream());
         java.nio.ByteBuffer h = java.nio.ByteBuffer.allocate(9).order(java.nio.ByteOrder.LITTLE_ENDIAN);
         in.readFully(h.array());
         int len = h.getInt(0), id = h.getInt(4);
         in.readFully(new byte[len - 5]);
-        s.getOutputStream().write(java.nio.ByteBuffer.allocate(17).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-                .putInt(13).putInt(id).put((byte) 0).putInt(0).putInt(11).array());
+        s.getOutputStream().write(java.nio.ByteBuffer.allocate(21).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .putInt(17).putInt(id).put((byte) 0).putInt(0).putInt(12).putShort((short) 0).putShort((short) 0)
+                .array());
     }
 
     private static void pipe(Socket from, Socket to) {

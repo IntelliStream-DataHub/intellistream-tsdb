@@ -587,4 +587,80 @@ class TsdbSinkTest {
             assertTrue(k > 800, "uneven " + java.util.Arrays.toString(n));
         assertEquals(TsdbSink.shardOf("pump7.flow", 7), TsdbSink.shardOf("pump7.flow", 7));
     }
+
+    @Test
+    void deniedIsPermanentAndARefusedLoginRetryable() {
+        ErrorClassifier k = new ErrorClassifier(Set.of(), Set.of());
+        assertEquals(ErrorClassifier.Kind.PERMANENT, k.classify(Status.ERR_DENIED));
+        assertEquals(ErrorClassifier.Kind.RETRYABLE, k.classify(Status.ERR_AUTH));
+        assertEquals(ErrorClassifier.Kind.RETRYABLE,
+                new ErrorClassifier(Set.of(), Set.of(Status.ERR_DENIED)).classify(Status.ERR_DENIED));
+    }
+
+    /** One foreign series in a batch: tsdbd refuses the frame, the sink finds the records by halving. */
+    @Test
+    void deniedRecordsAreDeadLetteredAndTheRestIsWritten() throws Exception {
+        tsdb.denied.add("globex/x");
+        TsdbSinkConfig c = config();
+        c.lingerMs = 200;
+        open(c);
+        List<FakeRecord> rs = new ArrayList<>();
+        for (int i = 0; i < 40; i++) {
+            rs.add(FakeRecord.point(i, i % 13 == 5 ? "globex/x" : "acme/s" + (i % 4), i, i));
+            sink.write(rs.get(i));
+        }
+        eventually(() -> allSettled(rs), "all settled");
+        assertEquals(3, dlq.records.size(), String.valueOf(dlq.reasons)); /* 5, 18, 31 */
+        assertTrue(dlq.statuses.stream().allMatch(s -> s == Status.ERR_DENIED), String.valueOf(dlq.statuses));
+        assertEquals(37, tsdb.last().size());
+        assertTrue(rs.stream().allMatch(r -> r.acks.get() == 1 && r.fails.get() == 0));
+    }
+
+    /** A logger that keeps the format of every warning. */
+    private static org.slf4j.Logger capturing(List<String> warnings) {
+        return (org.slf4j.Logger) Proxy.newProxyInstance(org.slf4j.Logger.class.getClassLoader(),
+                new Class<?>[] {org.slf4j.Logger.class}, (proxy, m, args) -> {
+                    if (m.getName().equals("warn") && args != null && args[0] instanceof String)
+                        warnings.add((String) args[0]);
+                    if (m.getReturnType() == boolean.class)
+                        return true;
+                    return m.getReturnType() == String.class ? "test" : null;
+                });
+    }
+
+    /**
+     * A refused login (wrong password, dropped user) is the operator's to fix: the batch waits with backoff, nothing is
+     * acknowledged or dead-lettered, and each backoff step logs one line that says it is the login.
+     */
+    @Test
+    void aRefusedLoginIsRetriedWithBackoffAndLoggedOncePerStep() throws Exception {
+        tsdb.loginRefused = true;
+        List<String> warnings = new java.util.concurrent.CopyOnWriteArrayList<>();
+        org.slf4j.Logger logger = capturing(warnings);
+        SinkContext ctx = (SinkContext) Proxy.newProxyInstance(SinkContext.class.getClassLoader(),
+                new Class<?>[] {SinkContext.class}, (proxy, m, args) -> m.getName().equals("getLogger") ? logger : null);
+        TsdbSinkConfig c = config();
+        c.validate();
+        sink = new TsdbSink(tsdb);
+        sink.open(c, ctx, dlq);
+        List<FakeRecord> rs = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            rs.add(FakeRecord.point(i, "s" + i, i, i));
+            sink.write(rs.get(i));
+        }
+        eventually(() -> sink.metrics().retries() >= 4, "retries of the login");
+        assertTrue(rs.stream().noneMatch(FakeRecord::settled), "acknowledged without a login");
+        assertEquals(0, dlq.records.size());
+        tsdb.loginRefused = false;
+        eventually(() -> allSettled(rs), "acks once the login works");
+        assertTrue(rs.stream().allMatch(r -> r.acks.get() == 1 && r.fails.get() == 0));
+        assertEquals(0, dlq.records.size());
+        int refused;
+        synchronized (tsdb) {
+            refused = tsdb.loginsRefused;
+        }
+        long login = warnings.stream().filter(w -> w.contains("refused the login")).count();
+        assertEquals(refused, login, "one line per refused login: " + warnings);
+        assertEquals(refused, sink.metrics().retries(), "every refused login is one backoff step");
+    }
 }

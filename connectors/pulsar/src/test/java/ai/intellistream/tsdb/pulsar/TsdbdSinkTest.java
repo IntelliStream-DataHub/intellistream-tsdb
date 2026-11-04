@@ -2,10 +2,13 @@ package ai.intellistream.tsdb.pulsar;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import ai.intellistream.tsdb.Column;
+import ai.intellistream.tsdb.Status;
 import ai.intellistream.tsdb.TsdbClient;
+import ai.intellistream.tsdb.TsdbException;
 import ai.intellistream.tsdb.ValuePoints;
 import ai.intellistream.tsdb.ValueType;
 import java.nio.file.Path;
@@ -166,6 +169,78 @@ class TsdbdSinkTest {
         try (TsdbClient c = server.client()) {
             assertArrayEquals(new long[] {1, 3}, values(c, "flow").timestamps());
             assertArrayEquals(new long[] {9}, values(c, "made.elsewhere").values().longs());
+        }
+    }
+
+    /** Restarts the server with login, the superuser made by the CLI, and adds user acme with insert on acme/. */
+    private Path restartWithLogin(String acmePassword) throws Exception {
+        server.close();
+        server = null;
+        Path pw = Tsdbd.passwordFile(dir, "acme", acmePassword); /* what the sink sends */
+        Tsdbd.cli(dir, "user", "add", "acme", "--password-file", Tsdbd.passwordFile(dir, "acme.set", "acme-secret-1")
+                .toString());
+        Tsdbd.cli(dir, "user", "grant", "acme", "insert", "prefix:acme/"); /* insert alone: as the README says */
+        server = Tsdbd.startWithLogin(dir);
+        return pw;
+    }
+
+    private TsdbSinkConfig loginConfig(Path passwordFile) {
+        TsdbSinkConfig c = config();
+        c.user = "acme";
+        c.passwordFile = passwordFile.toString();
+        return c;
+    }
+
+    /** A user's rights decide per record: another tenant's series are dead letters (DENIED), the rest is written. */
+    @Test
+    void withLoginOtherTenantsSeriesAreDeadLetteredAsDenied() throws Exception {
+        Path pw = restartWithLogin("acme-secret-1");
+        try (TsdbClient c = server.client()) {
+            c.seriesCreate("globex/secret", ValueType.FLOAT64); /* exists, but not acme's */
+        }
+        open(loginConfig(pw));
+        List<FakeRecord> good = List.of(rec(0, "acme/a", 1, "1", null), rec(2, "acme/a", 2, "2", null),
+                rec(4, "acme/b", 1, "3", "int64"));
+        List<FakeRecord> bad = List.of(rec(1, "globex/secret", 1, "6", null), rec(3, "globex/new", 1, "7", null));
+        List<FakeRecord> all = new ArrayList<>(good);
+        all.addAll(bad);
+        all.sort((a, b) -> a.seq - b.seq);
+        for (FakeRecord r : all)
+            sink.write(r);
+        eventually(() -> all.stream().allMatch(FakeRecord::settled), 10_000, "acks");
+        assertTrue(all.stream().allMatch(r -> r.acks.get() == 1 && r.fails.get() == 0));
+        assertEquals(bad.size(), dlq.records.size(), String.valueOf(dlq.reasons));
+        assertTrue(dlq.records.containsAll(bad));
+        assertTrue(dlq.statuses.stream().allMatch(s -> s == Status.ERR_DENIED), String.valueOf(dlq.statuses));
+        try (TsdbClient c = server.client()) {
+            assertArrayEquals(new long[] {1, 2}, values(c, "acme/a").timestamps());
+            assertArrayEquals(new long[] {3}, values(c, "acme/b").values().longs());
+            assertEquals(0, values(c, "globex/secret").size());
+            assertEquals(Status.ERR_NOTFOUND, assertThrows(TsdbException.class,
+                    () -> c.series("globex/new", false)).status());
+        }
+    }
+
+    /**
+     * A refused login is retried with the sink's backoff, nothing is acknowledged or dead-lettered meanwhile, and the
+     * records are written once the password file is right (it is read at every connect).
+     */
+    @Test
+    void aRefusedLoginIsRetriedUntilThePasswordIsRight() throws Exception {
+        Path pw = restartWithLogin("not-the-password");
+        open(loginConfig(pw));
+        List<FakeRecord> rs = List.of(rec(0, "acme/a", 1, "1", null), rec(1, "acme/a", 2, "2", null));
+        for (FakeRecord r : rs)
+            sink.write(r);
+        eventually(() -> sink.metrics().retries() >= 3, 10_000, "retries of the login");
+        assertTrue(rs.stream().noneMatch(FakeRecord::settled), "acknowledged without a login");
+        assertEquals(0, dlq.records.size(), String.valueOf(dlq.reasons));
+        Tsdbd.passwordFile(dir, "acme", "acme-secret-1");
+        eventually(() -> rs.stream().allMatch(FakeRecord::settled), 10_000, "acks after the password was fixed");
+        assertTrue(rs.stream().allMatch(r -> r.acks.get() == 1 && r.fails.get() == 0));
+        assertEquals(0, dlq.records.size(), String.valueOf(dlq.reasons));
+        try (TsdbClient c = server.client()) {
+            assertArrayEquals(new long[] {1, 2}, values(c, "acme/a").timestamps());
         }
     }
 
