@@ -114,7 +114,7 @@ timed. Every timing was repeated 5 times. "tsdb faster" says how many times fast
   divided by the median time. Every row is read.
 - **TWA:** a time-weighted average of all 100 sensors in hourly buckets, over the whole history (the step form).
 - **LTTB:** downsampling all 100 sensors over the whole history to 1,000 points each. tsdb got one request per
-  sensor, one after another.
+  sensor, one after another (on 16 connections at once it takes 42 ms); ClickHouse ran one query on 32 threads.
 - **Max memory:** the most the server held, without the file cache, while it answered the questions of this
   benchmark (all of them, not only the ones in this table).
 
