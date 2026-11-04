@@ -248,6 +248,24 @@ int main(int argc, char **argv)
         unlink(tmp);
     }
 
+    /* the same, caught earlier: the child is still alive when the harness first asks (a process in exit has closed
+     * its sockets before waitpid sees it; CI hit that window) and exits a little later: still an exit, not TH_BAD */
+    {
+        char tmp[700], txt[64];
+        th_portfile(tmp, sizeof tmp, d1);
+        pid_t z = fork();
+        if (z == 0) {
+            usleep(200000);
+            _exit(3);
+        }
+        snprintf(txt, sizeof txt, "%d %d\n", p1, (int)z);
+        put(tmp, txt);
+        int r = th_await(tmp, z, 5000);
+        CHECK(r == TH_EXITED);
+        CHECK(WIFEXITED(th_status) && WEXITSTATUS(th_status) == 3);
+        unlink(tmp);
+    }
+
     /* a port somebody else holds: tsdbd gives up, the harness is told so and never connects */
     {
         int taken;

@@ -145,9 +145,13 @@ static inline int th_reaped(pid_t child)
     return 1;
 }
 
-/* Waits up to timeout_ms for the port file of `child`. Returns the port, or TH_EXITED / TH_BAD with th_why set. */
+/* Waits up to timeout_ms for the port file of `child`. Returns the port, or TH_EXITED / TH_BAD with th_why set.
+ * A child that named itself in the file held the port when it wrote it; holding it no longer means it is dying (a
+ * power cut by crashfs right after the write), and a process in exit has closed its sockets before waitpid sees it.
+ * So a port that is not held is asked about again until the timeout, and only a child still alive then is TH_BAD. */
 static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
 {
+    int unheld = 0; /* th_why says which port the child does not hold */
     for (int waited = 0; waited <= timeout_ms; waited += 5) {
         if (th_reaped(child))
             return TH_EXITED;
@@ -172,7 +176,9 @@ static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
                         return TH_EXITED;
                     snprintf(th_why, sizeof th_why,
                              "harness: port %d is not held by the server started here (pid %d)\n", port, (int)child);
-                    return TH_BAD;
+                    unheld = 1;
+                    usleep(5000);
+                    continue;
                 }
                 if (n == 3 && !th_owns_port(child, mport)) {
                     if (th_reaped(child))
@@ -180,7 +186,9 @@ static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
                     snprintf(th_why, sizeof th_why,
                              "harness: metrics port %d is not held by the server started here (pid %d)\n", mport,
                              (int)child);
-                    return TH_BAD;
+                    unheld = 1;
+                    usleep(5000);
+                    continue;
                 }
                 th_mport = n == 3 ? mport : 0;
                 return port;
@@ -188,8 +196,9 @@ static inline int th_await(const char *portfile, pid_t child, int timeout_ms)
         }
         usleep(5000);
     }
-    snprintf(th_why, sizeof th_why, "harness: tsdbd (pid %d) wrote no %s within %d ms\n", (int)child, portfile,
-             timeout_ms);
+    if (!unheld)
+        snprintf(th_why, sizeof th_why, "harness: tsdbd (pid %d) wrote no %s within %d ms\n", (int)child, portfile,
+                 timeout_ms);
     return TH_BAD;
 }
 #endif
