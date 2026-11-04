@@ -420,7 +420,7 @@
     /* The view: three-quarter front from the car's left, nose towards the lower right, the camera about 25 degrees
      * above the car and very close to it with a short focal length: a wide-angle look, the front wing and tyres large,
      * the rear wing far away. The camera is rolled a little (about 7 degrees). */
-    var VIEW = { angle: -2.2, pitch: -0.44, dist: 4.3, f: 250, roll: -0.12 };
+    var VIEW = { angle: -2.0, pitch: -0.44, dist: 4.3, f: 250, roll: -0.12 };
 
     function proj(x, y, z) {
         var ca = Math.cos(VIEW.angle), sa = Math.sin(VIEW.angle);

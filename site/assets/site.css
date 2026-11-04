@@ -333,7 +333,7 @@ th.num {
 }
 
 .topnav a[aria-current="page"] {
-    border-color: transparent;
+    border-color: var(--cyan);
     /* the gradient starts under the (transparent) border, not inside it: otherwise it repeats into the 1px edge
      * and draws a seam of the other end's colour around the button */
     background-origin: border-box;
