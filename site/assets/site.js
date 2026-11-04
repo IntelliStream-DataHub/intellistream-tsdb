@@ -25,18 +25,16 @@
         }
     }
 
+    /* dark unless the viewer chose light with the toggle, whatever the system prefers */
     var savedTheme = load(THEME_KEY);
-    if (savedTheme === "light" || savedTheme === "dark") root.setAttribute("data-theme", savedTheme);
-    root.classList.remove("no-js");
+    root.setAttribute("data-theme", savedTheme === "light" ? "light" : "dark");
 
     var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     /* ---------- theme ---------- */
 
     function effectiveTheme() {
-        var t = root.getAttribute("data-theme");
-        if (t) return t;
-        return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        return root.getAttribute("data-theme") === "light" ? "light" : "dark";
     }
 
     function initTheme() {
@@ -56,44 +54,104 @@
         });
     }
 
-    /* ---------- app bar and drawer ---------- */
+    /* ---------- top menu (phones) and docs sidebar ---------- */
 
-    function initBar() {
-        var bar = document.querySelector(".app-bar");
-        if (!bar) return;
-        function onScroll() {
-            bar.classList.toggle("raised", window.scrollY > 4);
-        }
-        window.addEventListener("scroll", onScroll, { passive: true });
-        onScroll();
+    /* One panel open at a time: the top menu (body.nav-open) or the docs sidebar (body.side-open). Escape and the
+     * scrim close it, and focus goes back to the button that opened it. */
+    var openPanel = null;
+
+    function setPanel(name, btn, focusEl) {
+        var scrim = document.querySelector(".scrim");
+        var buttons = document.querySelectorAll(".menu-btn, .side-btn");
+        document.body.classList.toggle("nav-open", name === "nav");
+        document.body.classList.toggle("side-open", name === "side");
+        for (var i = 0; i < buttons.length; i++) buttons[i].setAttribute("aria-expanded", "false");
+        if (btn && name) btn.setAttribute("aria-expanded", "true");
+        if (scrim) scrim.hidden = !name;
+        var was = openPanel;
+        openPanel = name ? { name: name, btn: btn } : null;
+        if (name && focusEl) focusEl.focus();
+        if (!name && was && was.btn) was.btn.focus();
     }
 
-    function initDrawer() {
-        var btn = document.querySelector(".menu-btn");
-        var drawer = document.querySelector(".drawer");
+    function initPanels() {
+        var menu = document.querySelector(".menu-btn");
+        var side = document.querySelector(".side-btn");
         var scrim = document.querySelector(".scrim");
-        if (!btn || !drawer) return;
-        function set(open) {
-            document.body.classList.toggle("drawer-open", open);
-            btn.setAttribute("aria-expanded", open ? "true" : "false");
-            if (open) {
-                var first = drawer.querySelector("a");
-                if (first) first.focus();
+        if (menu) {
+            menu.addEventListener("click", function () {
+                if (openPanel && openPanel.name === "nav") setPanel(null);
+                else setPanel("nav", menu, document.querySelector(".topnav a"));
+            });
+        }
+        if (side) {
+            side.addEventListener("click", function () {
+                if (openPanel && openPanel.name === "side") setPanel(null);
+                else setPanel("side", side, document.querySelector('.sidebar a[aria-current="page"]'));
+            });
+        }
+        if (scrim) scrim.addEventListener("click", function () { setPanel(null); });
+        document.addEventListener("keydown", function (e) {
+            if (e.key === "Escape" && openPanel) setPanel(null);
+        });
+        var sidebar = document.querySelector(".sidebar");
+        if (sidebar) {
+            sidebar.addEventListener("click", function (e) {
+                if (e.target.closest("a") && openPanel) {
+                    openPanel = null;
+                    setPanel(null);
+                }
+            });
+        }
+    }
+
+    /* The current page's sections, under its link in the sidebar: read from the page's own h2 headings, so the
+     * menu cannot drift from the page. The section in view is highlighted as the reader scrolls. */
+    function initToc() {
+        var current = document.querySelector('.sidebar a[aria-current="page"]');
+        var heads = document.querySelectorAll("main.doc h2[id]");
+        if (!current || !heads.length) return;
+        var ul = document.createElement("ul");
+        ul.className = "toc";
+        var links = [];
+        for (var i = 0; i < heads.length; i++) {
+            var li = document.createElement("li");
+            var a = document.createElement("a");
+            a.href = "#" + heads[i].id;
+            a.textContent = heads[i].textContent;
+            li.appendChild(a);
+            ul.appendChild(li);
+            links.push(a);
+        }
+        current.parentNode.appendChild(ul);
+        function mark(id) {
+            for (var j = 0; j < links.length; j++) {
+                var on = links[j].getAttribute("href") === "#" + id;
+                links[j].classList.toggle("active", on);
+                if (on) links[j].setAttribute("aria-current", "location");
+                else links[j].removeAttribute("aria-current");
             }
         }
-        btn.addEventListener("click", function () {
-            set(!document.body.classList.contains("drawer-open"));
-        });
-        if (scrim) scrim.addEventListener("click", function () { set(false); });
-        document.addEventListener("keydown", function (e) {
-            if (e.key === "Escape" && document.body.classList.contains("drawer-open")) {
-                set(false);
-                btn.focus();
+        function onScroll() {
+            var top = 0, id = heads[0].id;
+            var limit = (window.innerHeight || 800) * 0.3;
+            for (var k = 0; k < heads.length; k++) {
+                top = heads[k].getBoundingClientRect().top;
+                if (top - limit <= 0) id = heads[k].id;
             }
-        });
-        drawer.addEventListener("click", function (e) {
-            if (e.target.closest("a")) set(false);
-        });
+            if (window.innerHeight + window.scrollY >= document.body.scrollHeight - 4) id = heads[heads.length - 1].id;
+            mark(id);
+        }
+        var ticking = false;
+        window.addEventListener("scroll", function () {
+            if (ticking) return;
+            ticking = true;
+            window.requestAnimationFrame(function () {
+                ticking = false;
+                onScroll();
+            });
+        }, { passive: true });
+        onScroll();
     }
 
     /* ---------- language tabs ---------- */
@@ -200,14 +258,14 @@
     }
 
     /* ---------- charts ----------
-     * Each <figure class="chart"> holds a <table class="chart-data">: the numbers, which stay on the page as the
-     * text version. The script draws an SVG from that table.
-     *   data-kind="bars"    one bar per row: <th> the system, <td data-v> its number
-     *   data-kind="groups"  one group per row (a question), one bar per column (a system), each group scaled
-     *                       to its own largest number
-     * A <td data-fail="short reason"> is a failure: drawn as a marked box with the reason, never as a bar.
-     * A <td data-na="short reason"> was not measured or has no such feature: the reason, no bar.
-     * Row or column class "us" is tsdb, drawn in the primary colour. data-limit draws a memory-limit line. */
+     * Each <figure class="chart"> holds one panel of the README's benchmark charts: a <table class="chart-data">
+     * whose rows tools/readme-charts.py wrote from tools/readme-charts.json, with the bar length (data-len, 0 to 1)
+     * and the label already worked out there, so the site draws exactly what the README shows. The table stays on
+     * the page as the text version; the script draws an SVG from it.
+     *   tr.us          tsdb, in the highlight gradient
+     *   data-len       the bar's share of the bar area
+     *   data-none      no number (not measured, no such function): a box with the reason, never a bar
+     *   data-tag       a failure next to a bar (memory: where the system failed), drawn as a red tag */
 
     var SVGNS = "http://www.w3.org/2000/svg";
 
@@ -218,137 +276,108 @@
         return e;
     }
 
-    function cellText(td) {
-        return td.getAttribute("data-label") || td.textContent.replace(/\s+/g, " ").trim();
-    }
-
-    function rowsOf(table) {
-        var kind = table.getAttribute("data-kind") || "bars";
-        var out = [];
-        var trs = table.tBodies[0].rows;
-        if (kind === "bars") {
-            for (var i = 0; i < trs.length; i++) {
-                var th = trs[i].cells[0], td = trs[i].cells[1];
-                out.push({ group: null, items: [item(th.getAttribute("data-short") || th.textContent.trim(), td,
-                    trs[i].classList.contains("us"))] });
-            }
-            return out;
-        }
-        var heads = table.tHead.rows[0].cells;
-        for (var r = 0; r < trs.length; r++) {
-            var items = [];
-            for (var c = 1; c < trs[r].cells.length; c++)
-                items.push(item(heads[c].textContent.trim(), trs[r].cells[c], heads[c].classList.contains("us")));
-            out.push({ group: trs[r].cells[0].getAttribute("data-short") || trs[r].cells[0].textContent.trim(),
-                items: items });
-        }
-        return out;
-    }
-
-    function item(label, td, us) {
-        return {
-            label: label,
-            us: us,
-            v: td.hasAttribute("data-v") ? parseFloat(td.getAttribute("data-v")) : null,
-            text: cellText(td),
-            fail: td.getAttribute("data-fail"),
-            na: td.getAttribute("data-na")
-        };
-    }
-
     var measureCtx = null;
 
-    function textWidth(s, host) {
+    function textWidth(s, host, size, weight) {
         if (!measureCtx) {
             var c = document.createElement("canvas");
             measureCtx = c.getContext && c.getContext("2d");
-            if (!measureCtx) return s.length * 7.2;
         }
-        measureCtx.font = "700 13px " + window.getComputedStyle(host).fontFamily;
+        if (!measureCtx) return s.length * size * 0.56;
+        measureCtx.font = (weight || 400) + " " + size + "px " + window.getComputedStyle(host).fontFamily;
         return measureCtx.measureText(s).width;
+    }
+
+    function rowsOf(table) {
+        var out = [];
+        var trs = table.tBodies[0].rows;
+        for (var i = 0; i < trs.length; i++) {
+            var tr = trs[i];
+            var td = tr.cells[1];
+            var tag = tr.getAttribute("data-tag");
+            var text = td.textContent.replace(/\s+/g, " ").trim();
+            if (tag && text.slice(-(tag.length + 3)) === " (" + tag + ")") text = text.slice(0, -(tag.length + 3));
+            out.push({
+                name: tr.cells[0].textContent.trim(),
+                us: tr.classList.contains("us"),
+                len: tr.hasAttribute("data-len") ? parseFloat(tr.getAttribute("data-len")) : null,
+                none: tr.getAttribute("data-none"),
+                tag: tag,
+                text: text
+            });
+        }
+        return out;
     }
 
     function drawChart(fig) {
         var table = fig.querySelector("table.chart-data");
         var host = fig.querySelector(".chart-svg");
         if (!table || !host) return;
-        var groups = rowsOf(table);
+        var rows = rowsOf(table);
         var W = Math.max(260, Math.floor(host.clientWidth || 520));
-        /* the label column is as wide as the longest label, within limits; narrower than that, labels go above */
-        var longest = 0;
-        for (var m = 0; m < groups.length; m++)
-            for (var q = 0; q < groups[m].items.length; q++)
-                longest = Math.max(longest, textWidth(groups[m].items[q].label, host));
-        var narrow = W < 460 || longest > W * 0.42;
-        var labelW = narrow ? 0 : Math.ceil(longest) + 4;
-        var valW = narrow ? 78 : 92;
-        var barX = narrow ? 0 : labelW + 10;
-        var barMax = W - barX - valW;
-        var rowH = narrow ? 42 : 30;
-        var groupH = 26;
-        var limit = table.hasAttribute("data-limit") ? parseFloat(table.getAttribute("data-limit")) : null;
-        var globalMax = 0;
-        for (var g = 0; g < groups.length; g++)
-            for (var i = 0; i < groups[g].items.length; i++)
-                if (groups[g].items[i].v != null) globalMax = Math.max(globalMax, groups[g].items[i].v);
-        if (limit) globalMax = Math.max(globalMax, limit);
-
-        var y = 0, n = 0;
+        var nameW = 0, labelW = 0;
+        for (var i = 0; i < rows.length; i++) {
+            var r = rows[i];
+            nameW = Math.max(nameW, textWidth(r.name, host, 13, r.us ? 800 : 400));
+            if (!r.none) {
+                var lw = textWidth(r.text, host, 12.5, r.us ? 800 : 400) + 8;
+                if (r.tag) lw += textWidth(r.tag, host, 11.5, 600) + 26;
+                labelW = Math.max(labelW, lw);
+            }
+        }
+        /* names left of the bars where they fit, above the bars on narrow screens */
+        var narrow = W - nameW - 12 - labelW < 90;
+        var barX = narrow ? 0 : Math.ceil(nameW) + 12;
+        var barW = Math.max(40, W - barX - labelW);
+        var rowH = narrow ? 44 : 30;
+        var gid = "us-" + (fig.id || "chart");
         var svg = el("svg", { role: "img", width: W });
+        var defs = el("defs", {});
+        var lg = el("linearGradient", { id: gid, x1: "0", x2: "1", y1: "0", y2: "0" });
+        lg.appendChild(el("stop", { offset: "0", style: "stop-color:var(--cyan)" }));
+        lg.appendChild(el("stop", { offset: "1", style: "stop-color:var(--violet)" }));
+        defs.appendChild(lg);
+        svg.appendChild(defs);
         var aria = [];
-        var body = el("g", {});
-        for (g = 0; g < groups.length; g++) {
-            var grp = groups[g];
-            var max = globalMax;
-            if (grp.group != null) {
-                max = 0;
-                for (i = 0; i < grp.items.length; i++) if (grp.items[i].v != null) max = Math.max(max, grp.items[i].v);
-                body.appendChild(el("text", { x: 0, y: y + 18, "class": "grp" }, grp.group));
-                y += groupH;
-                aria.push(grp.group + ":");
-            }
-            for (i = 0; i < grp.items.length; i++) {
-                var it = grp.items[i];
-                var row = el("g", { "class": it.us ? "us" : "" });
-                var d = (n++ * 0.06).toFixed(2) + "s";
-                var by = narrow ? y + 19 : y + 7;
-                var bh = narrow ? 15 : 16;
-                row.appendChild(el("text", { x: 0, y: narrow ? y + 14 : y + 20, "class": "lab" }, it.label));
-                if (it.fail || it.na) {
-                    var msg = it.fail || it.na;
-                    if (it.fail) {
-                        row.appendChild(el("rect", { x: barX, y: by - 2, width: W - barX, height: bh + 4, rx: 4,
-                            "class": "fail-box", style: "--d:" + d }));
-                    }
-                    row.appendChild(el("text", { x: barX + (it.fail ? 8 : 0), y: by + bh - 3,
-                        "class": it.fail ? "fail-text" : "na-text", style: "--d:" + d }, msg));
-                    aria.push(it.label + " " + msg);
-                } else {
-                    var w = Math.max(2, (it.v / (max || 1)) * barMax);
-                    row.appendChild(el("rect", { x: barX, y: by, width: w.toFixed(1), height: bh, rx: 3,
-                        "class": "bar", style: "--d:" + d }));
-                    row.appendChild(el("text", { x: (barX + w + 6).toFixed(1), y: by + bh - 3, "class": "val",
-                        style: "--d:" + d }, it.text));
-                    aria.push(it.label + " " + it.text);
+        var y = 0;
+        for (i = 0; i < rows.length; i++) {
+            r = rows[i];
+            var g = el("g", { "class": r.us ? "us" : "" });
+            var d = (i * 0.06).toFixed(2) + "s";
+            var by = narrow ? y + 20 : y + 7, bh = 16;
+            g.appendChild(el("text", { x: 0, y: narrow ? y + 14 : y + 20, "class": "lab" }, r.name));
+            if (r.none) {
+                g.appendChild(el("rect", { x: barX, y: by - 1, width: W - barX, height: bh + 2, rx: 5,
+                    "class": "na-box", style: "--d:" + d }));
+                g.appendChild(el("text", { x: barX + 8, y: by + bh - 4, "class": "na-text", style: "--d:" + d }, r.none));
+                aria.push(r.name + ": " + r.none);
+            } else {
+                var w = Math.max(3, r.len * barW);
+                var rect = el("rect", { x: barX, y: by, width: w.toFixed(1), height: bh, rx: 4, "class": "bar",
+                    style: "--d:" + d });
+                if (r.us) rect.style.fill = "url(#" + gid + ")";
+                g.appendChild(rect);
+                var lx = barX + w + 7;
+                g.appendChild(el("text", { x: lx.toFixed(1), y: by + bh - 3.5, "class": "val", style: "--d:" + d }, r.text));
+                if (r.tag) {
+                    var tx = lx + textWidth(r.text, host, 12.5, 400) + 10;
+                    var tw = textWidth(r.tag, host, 11.5, 600) + 16;
+                    g.appendChild(el("rect", { x: tx.toFixed(1), y: by - 1, width: tw.toFixed(1), height: bh + 2,
+                        rx: 9, "class": "fail-box", style: "--d:" + d }));
+                    g.appendChild(el("text", { x: (tx + 8).toFixed(1), y: by + bh - 4, "class": "fail-text",
+                        style: "--d:" + d }, r.tag));
                 }
-                body.appendChild(row);
-                y += rowH;
+                aria.push(r.name + ": " + r.text + (r.tag ? ", " + r.tag : ""));
             }
-            if (grp.group != null) y += 8;
+            svg.appendChild(g);
+            y += rowH;
         }
-        if (limit) {
-            var lx = barX + (limit / globalMax) * barMax;
-            body.insertBefore(el("line", { x1: lx, x2: lx, y1: -4, y2: y, "class": "limit" }), body.firstChild);
-            var lt = table.getAttribute("data-limit-label") || "limit";
-            body.appendChild(el("text", { x: lx - 4, y: y + 14, "class": "limit-text", "text-anchor": "end" }, lt));
-            y += 18;
-            aria.push(lt);
-        }
-        svg.appendChild(body);
-        svg.setAttribute("viewBox", "0 -4 " + W + " " + (y + 8));
-        svg.setAttribute("height", y + 8);
+        svg.setAttribute("viewBox", "0 -2 " + W + " " + (y + 4));
+        svg.setAttribute("height", y + 4);
         var title = fig.querySelector("figcaption h3");
-        svg.setAttribute("aria-label", (title ? title.textContent.trim() + ". " : "") + aria.join("; "));
+        var sub = fig.querySelector("figcaption p");
+        svg.setAttribute("aria-label", (title ? title.textContent.trim() + " (" : "") + (sub ? sub.textContent.trim() : "") +
+            "). " + aria.join("; "));
         host.textContent = "";
         host.appendChild(svg);
         /* the table is written open, so that it is the chart without the script; with the chart drawn it folds */
@@ -387,8 +416,8 @@
 
     function start() {
         initTheme();
-        initBar();
-        initDrawer();
+        initPanels();
+        initToc();
         initTabs();
         initCopy();
         initCharts();
