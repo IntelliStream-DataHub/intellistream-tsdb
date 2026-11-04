@@ -889,11 +889,12 @@ int main(int argc, char **argv)
     test_inproc(dir);
     test_no_auth(dir);
 
+    int before = failures; /* a failure above does not stop the server tests: only the CLI's own */
     CHECK(cli_user(dir, "rootpw", "add root --superuser") == 0);
     CHECK(cli_user(dir, "adminpw", "add acme/admin") == 0);
     CHECK(cli_user(dir, NULL, "grant acme/admin admin prefix:acme/") == 0);
     CHECK(cli_user(dir, "ingestpw", "add acme/ingest") == 0);
-    if (failures) {
+    if (failures > before) {
         fprintf(stderr, "test_auth: the CLI could not make the users (%s, log %s)\n", cli, clilog);
         return 1;
     }
