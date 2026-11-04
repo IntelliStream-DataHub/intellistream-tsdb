@@ -377,7 +377,7 @@ integ-python:
 integ-java:
 	cd client/java && mvn -q -DskipTests package
 	@mkdir -p $(INTEG)/java
-	javac -d $(INTEG)/java -cp "$$(ls client/java/target/tsdb-client-*.jar | head -n 1)" tests/integration/java/Itj.java
+	javac -d $(INTEG)/java -cp client/java/target/tsdb-client-$(RELEASE_VERSION).jar tests/integration/java/Itj.java
 
 integration-tests: $(B)/tsdbd $(B)/tsdb $(INTEG)/itc integ-rust integ-python integ-java
 	python3 tests/integration/run.py --bin-dir $(B) $(INTEG_ARGS)

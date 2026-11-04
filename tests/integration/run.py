@@ -227,7 +227,9 @@ class Ctx:
         ib = BUILD / "integ"
         self.itc = Path(args.itc) if args.itc else ib / "itc"
         venv = Path(os.environ.get("PYVENV", BUILD / "pyvenv"))
-        jar = list((ROOT / "client/java/target").glob("tsdb-client-*.jar"))
+        # the jar of this version: target/ may still hold one of an older version, which a glob could pick
+        version = (ROOT / "VERSION").read_text().strip()
+        jar = [p for p in [ROOT / f"client/java/target/tsdb-client-{version}.jar"] if p.exists()]
         jarcp = ":".join([str(jar[0])] + [str(p) for p in sorted((ROOT / "client/java/target/lib").glob("*.jar"))]) if jar else ""
         self.cmd = {
             "c": [str(self.itc)],

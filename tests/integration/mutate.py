@@ -197,7 +197,7 @@ def run_one(m, keep, logdir):
         if "java" in m["build"]:
             sh(["mvn", "-q", "-DskipTests", "package"], tree / "client/java", log)
             (b / "integ/java").mkdir(parents=True, exist_ok=True)
-            jar = sorted((tree / "client/java/target").glob("tsdb-client-*.jar"))[0]
+            jar = tree / f"client/java/target/tsdb-client-{(tree / 'VERSION').read_text().strip()}.jar"
             sh(["javac", "-d", str(b / "integ/java"), "-cp", str(jar), "tests/integration/java/Itj.java"], tree, log)
         if "python" in m["build"]:
             venv = b / "pyvenv"
