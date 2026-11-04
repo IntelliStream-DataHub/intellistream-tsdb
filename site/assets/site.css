@@ -504,9 +504,10 @@ th.num {
     overflow: visible; /* the streaks run past the car's box */
 }
 
+/* about 6,800 edges in three depth layers: the nearer, the brighter and bolder, so the mesh stays legible */
 .car3d .near,
-.car3d .far,
-.car3d .ghost {
+.car3d .mid,
+.car3d .far {
     fill: none;
     stroke: url(#car-ink);
     stroke-linecap: round;
@@ -514,25 +515,26 @@ th.num {
 }
 
 .car3d .near {
-    stroke-width: 1.7;
+    stroke-width: 1.05;
+}
+
+.car3d .mid {
+    stroke-width: 0.8;
+    opacity: 0.72;
 }
 
 .car3d .far {
-    stroke-width: 1;
-    opacity: 0.4;
+    stroke-width: 0.6;
+    opacity: 0.32;
 }
 
-/* the motion trail: the near wireframe again, shifted backwards and faint */
-.car3d .ghost {
-    stroke-width: 1.2;
-}
-
+/* the motion trail: the near wireframe again (<use>), shifted backwards and faint */
 .car3d .g1 {
-    opacity: 0.16;
+    opacity: 0.14;
 }
 
 .car3d .g2 {
-    opacity: 0.07;
+    opacity: 0.06;
 }
 
 /* streaks: still lines under reduced motion, rushing backwards otherwise */
@@ -548,6 +550,7 @@ th.num {
 
 @media (prefers-reduced-motion: no-preference) {
     .car3d .near,
+    .car3d .mid,
     .car3d .far {
         stroke-dasharray: 1;
         stroke-dashoffset: 1;
@@ -1400,8 +1403,8 @@ dl.terms dd {
 
 @media (max-width: 600px) {
     .car3d {
-        width: 122%;
+        width: 104%;
         max-width: none;
-        margin-left: -3%;
+        margin-left: -2%;
     }
 }
