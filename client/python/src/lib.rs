@@ -749,10 +749,25 @@ impl Inner {
 ///     keepalive: Turn TCP keepalive on (the default): after 30 s of silence
 ///         the client probes every 10 s and drops the connection after 3
 ///         unanswered probes, where the platform allows.
+///     user: The user to log in as (SCRAM-SHA-256), when the server asks
+///         for a login. The password never travels, and the connect fails
+///         unless the server proves it holds the user's verifier. PBKDF2
+///         runs once per process for a user and password: later connects,
+///         a Pool's included, reuse the keys.
+///     password: The user's password (its UTF-8 bytes, without
+///         normalization; ASCII is safest).
+///     password_file: Read the password from the first line of this file
+///         instead (a trailing CR LF is cut), at every connect.
+///     require_auth: Refuse (ERR_AUTH) a server that does not ask for a
+///         login (--no-auth). Otherwise such a server is used without one.
 ///
 /// Raises:
-///     TsdbError: The connection failed.
-///     ValueError: timeout is not a positive number.
+///     TsdbError: The connection failed; ERR_AUTH when the login failed (an
+///         unknown user and a wrong password look alike), the server did not
+///         prove its signature, it asks for a login and none was given, or
+///         require_auth is set and it asks for none.
+///     ValueError: timeout is not a positive number, or a user has neither
+///         password nor password_file.
 #[pyclass(module = "tsdb_client")]
 struct Client {
     inner: Mutex<Inner>,
@@ -853,12 +868,96 @@ impl Client {
     }
 }
 
-fn connect(host: &str, port: u16, timeout: Option<Duration>, keepalive: bool) -> tc::Result<tc::Client> {
-    let c = tc::Client::connect_with((host, port), timeout)?;
+fn connect(host: &str, port: u16, opts: &tc::ConnectOptions, keepalive: bool) -> tc::Result<tc::Client> {
+    let c = tc::Client::connect_opts((host, port), opts)?;
     if !keepalive {
         c.set_keepalive(None)?;
     }
     Ok(c)
+}
+
+/// The keyword arguments of Client and Pool as the Rust client's options. They live as long as the Client or
+/// Pool: a Pool replaces a broken connection with a new login, from the password kept here (wiped when the Pool
+/// goes) or the password file read again.
+fn connect_options(
+    timeout: Option<f64>,
+    user: Option<String>,
+    password: Option<String>,
+    password_file: Option<std::path::PathBuf>,
+    require_auth: bool,
+) -> PyResult<tc::ConnectOptions> {
+    if user.is_some() && password.is_none() && password_file.is_none() {
+        return Err(PyValueError::new_err("a user needs a password or a password_file"));
+    }
+    let mut o = tc::ConnectOptions::new().timeout(seconds(timeout)?).require_auth(require_auth);
+    if let Some(u) = user {
+        o = o.user(u);
+    }
+    if let Some(p) = password {
+        o = o.password(p);
+    }
+    if let Some(f) = password_file {
+        o = o.password_file(f);
+    }
+    Ok(o)
+}
+
+/// Rights as a string of names ("read,insert"; "write" is insert and delete) or as the bits of RIGHT_*.
+fn rights(obj: &Bound<'_, PyAny>) -> PyResult<tc::Rights> {
+    if let Ok(s) = obj.extract::<String>() {
+        return s.parse().map_err(|e: tc::Error| PyValueError::new_err(e.to_string()));
+    }
+    match obj.extract::<u8>() {
+        Ok(b) if b != 0 && b & !0xf == 0 => Ok(tc::Rights::from_bits(b)),
+        _ => Err(PyValueError::new_err("rights must be names (\"read,insert\") or RIGHT_* bits (1 to 15)")),
+    }
+}
+
+/// A selector as the CLI writes it: "all", "prefix:P", "name:N" or "glob:G".
+fn selector(s: &str) -> PyResult<tc::Selector> {
+    s.parse().map_err(|e: tc::Error| PyValueError::new_err(e.to_string()))
+}
+
+/// A user of the server, from whoami() or user_list().
+#[pyclass(frozen, module = "tsdb_client")]
+struct User {
+    name: String,
+    superuser: bool,
+    grants: Vec<(String, String)>,
+}
+
+impl From<tc::User> for User {
+    fn from(u: tc::User) -> User {
+        let grants = u.grants.iter().map(|g| (g.selector.to_string(), g.rights.to_string())).collect();
+        User { name: u.name, superuser: u.superuser, grants }
+    }
+}
+
+#[pymethods]
+impl User {
+    /// The login name; "" from a server without login (--no-auth).
+    #[getter]
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Every right on every series, user management and the database-wide operations.
+    #[getter]
+    fn superuser(&self) -> bool {
+        self.superuser
+    }
+
+    /// The grants as (selector, rights) pairs of strings, e.g. ("prefix:acme/", "read,insert"). A user's rights
+    /// on a series are the union of those whose selector matches its name.
+    #[getter]
+    fn grants(&self) -> Vec<(String, String)> {
+        self.grants.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        let su = if self.superuser { "True" } else { "False" };
+        format!("User(name={:?}, superuser={su}, grants={:?})", self.name, self.grants)
+    }
 }
 
 /// A timeout in seconds as the client takes it: positive and finite, or None.
@@ -879,10 +978,22 @@ fn seconds(t: Option<f64>) -> PyResult<Option<Duration>> {
 #[pymethods]
 impl Client {
     #[new]
-    #[pyo3(signature = (host = "127.0.0.1", port = 7070, timeout = None, keepalive = true))]
-    fn new(py: Python<'_>, host: &str, port: u16, timeout: Option<f64>, keepalive: bool) -> PyResult<Self> {
-        let timeout = seconds(timeout)?;
-        let c = py.detach(|| connect(host, port, timeout, keepalive)).map_err(|e| to_pyerr(py, e))?;
+    #[pyo3(signature = (host = "127.0.0.1", port = 7070, timeout = None, keepalive = true, *, user = None,
+                        password = None, password_file = None, require_auth = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        host: &str,
+        port: u16,
+        timeout: Option<f64>,
+        keepalive: bool,
+        user: Option<String>,
+        password: Option<String>,
+        password_file: Option<std::path::PathBuf>,
+        require_auth: bool,
+    ) -> PyResult<Self> {
+        let opts = connect_options(timeout, user, password, password_file, require_auth)?;
+        let c = py.detach(|| connect(host, port, &opts, keepalive)).map_err(|e| to_pyerr(py, e))?;
         Ok(Client { inner: Mutex::new(Inner { conn: Some(c), ..Inner::default() }), addr: format!("{host}:{port}") })
     }
 
@@ -1720,6 +1831,109 @@ impl Client {
         self.with(py, |c| c.stats()).map(Stats::from)
     }
 
+    /// The user this connection is logged in as, with its grants (a User);
+    /// name "" with every right (superuser) on a server started with --no-auth.
+    fn whoami(&self, py: Python<'_>) -> PyResult<User> {
+        self.with(py, |c| c.whoami()).map(User::from)
+    }
+
+    /// The users this one may see (a list of User): itself, and the users it
+    /// manages (every user, for a superuser).
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_DENIED on a server started with --no-auth (users are
+    ///         managed there with the offline `tsdb DIR user` verbs).
+    fn user_list(&self, py: Python<'_>) -> PyResult<Vec<User>> {
+        self.with(py, |c| c.user_list()).map(|v| v.into_iter().map(User::from).collect())
+    }
+
+    /// Creates user name with password, a superuser if superuser.
+    ///
+    /// The password does not travel: the client sends its verifier (a fresh
+    /// salt, StoredKey and ServerKey) computed with iterations of PBKDF2
+    /// (None: SCRAM_ITERATIONS, 4096; at least 4096, at most 100,000,000).
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_DENIED unless this user is a superuser or holds admin
+    ///         on a prefix that name starts with (only a superuser creates
+    ///         superusers), and on a --no-auth server; ERR_INVALID for a name
+    ///         that exists or that the server refuses; ERR_INVALID for an
+    ///         empty password or iterations out of range.
+    #[pyo3(signature = (name, password, *, superuser = false, iterations = None))]
+    fn user_create(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        password: &str,
+        superuser: bool,
+        iterations: Option<u32>,
+    ) -> PyResult<()> {
+        self.with(py, |c| c.user_create(name, password, superuser, iterations))
+    }
+
+    /// Sets the password of user name (its own, or one of a user it manages),
+    /// sent as user_create() sends it.
+    ///
+    /// Raises:
+    ///     TsdbError: As user_create(); ERR_DENIED also for a user holding a
+    ///         grant outside this one's admin selectors.
+    #[pyo3(signature = (name, password, *, iterations = None))]
+    fn user_password(&self, py: Python<'_>, name: &str, password: &str, iterations: Option<u32>) -> PyResult<()> {
+        self.with(py, |c| c.user_password(name, password, iterations))
+    }
+
+    /// Drops user name; its open connections are answered ERR_AUTH and closed.
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_DENIED for a user this one does not manage, and for
+    ///         the last superuser.
+    fn user_drop(&self, py: Python<'_>, name: &str) -> PyResult<()> {
+        self.with(py, |c| c.user_drop(name))
+    }
+
+    /// Makes user name a superuser or takes that away (superusers only).
+    ///
+    /// Raises:
+    ///     TsdbError: ERR_DENIED unless this user is a superuser, and for
+    ///         taking it from the last superuser.
+    #[pyo3(signature = (name, *, superuser))]
+    fn user_alter(&self, py: Python<'_>, name: &str, superuser: bool) -> PyResult<()> {
+        self.with(py, |c| c.user_alter(name, superuser))
+    }
+
+    /// Gives user name rights on the series selector matches. Grants only add.
+    ///
+    /// selector is written as the CLI writes it: "all", "prefix:P" (a byte
+    /// prefix of the name: tenants end theirs in "/"), "name:N" or "glob:G"
+    /// (* any run of bytes, ? one byte, \ makes the next one literal). rights
+    /// are names ("read,insert"; "write" is insert and delete) or RIGHT_* bits.
+    ///
+    /// Example:
+    ///     >>> c.grant("acme/ingest", "prefix:acme/", "insert")
+    ///     >>> c.grant("acme/dash", "glob:acme/*/temp", RIGHT_READ)
+    ///
+    /// Raises:
+    ///     ValueError: A selector or rights it cannot read.
+    ///     TsdbError: ERR_DENIED unless this user is a superuser or selector
+    ///         lies inside its own admin selectors and it manages name;
+    ///         ERR_INVALID for a selector the server refuses (a glob over 256
+    ///         bytes, a 65th glob grant).
+    fn grant(&self, py: Python<'_>, name: &str, selector: &str, rights: &Bound<'_, PyAny>) -> PyResult<()> {
+        let (sel, r) = (self::selector(selector)?, self::rights(rights)?);
+        self.with(py, |c| c.grant(name, &sel, r))
+    }
+
+    /// Takes rights on selector from user name (the grant with exactly this
+    /// selector), as grant() writes them.
+    ///
+    /// Raises:
+    ///     ValueError: A selector or rights it cannot read.
+    ///     TsdbError: As grant().
+    fn revoke(&self, py: Python<'_>, name: &str, selector: &str, rights: &Bound<'_, PyAny>) -> PyResult<()> {
+        let (sel, r) = (self::selector(selector)?, self::rights(rights)?);
+        self.with(py, |c| c.revoke(name, &sel, r))
+    }
+
     /// Returns what the server did for this connection's previous query (a QueryStats).
     ///
     /// Rows covered, decompressed or answered from block statistics, bytes
@@ -1918,6 +2132,20 @@ fn strerror(code: i32) -> &'static str {
     tc::strerror(code)
 }
 
+/// Tests only: every later login of this process uses nonce as its client
+/// nonce (the RFC 7677 exchange); None goes back to random ones.
+#[pyfunction]
+#[pyo3(signature = (nonce))]
+fn _set_client_nonce(nonce: Option<&str>) {
+    tc::test_hooks::set_client_nonce(nonce);
+}
+
+/// Tests only: how many times this process ran PBKDF2 (logins and verifiers).
+#[pyfunction]
+fn _pbkdf2_runs() -> u64 {
+    tc::test_hooks::pbkdf2_runs()
+}
+
 /// Returns the UTC times at which local calendar periods begin.
 ///
 /// These are the bucket starts query_group() uses for a time zone, and what
@@ -2011,8 +2239,23 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
         ("ERR_TOO_MANY_BUCKETS", tc::Status::TooManyBuckets),
         ("ERR_STOPPED", tc::Status::Stopped),
         ("ERR_READONLY", tc::Status::ReadOnly),
+        ("ERR_DENIED", tc::Status::Denied),
+        ("ERR_AUTH", tc::Status::Auth),
     ] {
         m.add(name, s.code())?;
     }
+    m.add_class::<User>()?;
+    m.add("SCRAM_ITERATIONS", tc::SCRAM_ITERATIONS)?;
+    for (name, r) in [
+        ("RIGHT_READ", tc::Rights::READ),
+        ("RIGHT_INSERT", tc::Rights::INSERT),
+        ("RIGHT_DELETE", tc::Rights::DELETE),
+        ("RIGHT_ADMIN", tc::Rights::ADMIN),
+        ("RIGHT_WRITE", tc::Rights::WRITE),
+    ] {
+        m.add(name, r.bits())?;
+    }
+    m.add_function(wrap_pyfunction!(_set_client_nonce, m)?)?;
+    m.add_function(wrap_pyfunction!(_pbkdf2_runs, m)?)?;
     Ok(())
 }

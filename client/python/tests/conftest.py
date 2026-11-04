@@ -21,15 +21,31 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 TSDBD = os.environ.get("TSDBD", str(ROOT / "build" / "tsdbd"))
 
 
+def user_cli(dir, password, *args):
+    """`tsdb DIR user ARGS...` as an operator runs it beside tsdbd (USERS only), the password in TSDB_PASSWORD."""
+    cli = str(pathlib.Path(TSDBD).with_name("tsdb"))
+    env = {k: v for k, v in os.environ.items() if k not in ("LD_PRELOAD", "TSDB_PASSWORD")}
+    if password is not None:
+        env["TSDB_PASSWORD"] = password
+    r = subprocess.run([cli, str(dir), "user", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"tsdb user {args}: {r.stderr}")
+
+
 class Server:
-    def __init__(self, base, dir=None):
-        """Serves dir (an existing database: test_embedded), or a new directory under base."""
+    def __init__(self, base, dir=None, root_password=None):
+        """Serves dir (an existing database: test_embedded), or a new directory under base. With root_password the
+        server requires a login, and USERS holds the superuser root with that password (made by the CLI);
+        without, it runs with --no-auth."""
         own = pathlib.Path(tempfile.mkdtemp(prefix="tsdb-py-", dir=base))
         self.dir = pathlib.Path(dir) if dir else own / "db"
         pf = own / "port"
+        if root_password is not None:
+            user_cli(self.dir, root_password, "add", "root", "--superuser")
         self.proc = subprocess.Popen(
-            [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4",
-             "--no-auth"],
+            [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4"]
+            + ([] if root_password is not None else ["--no-auth"]),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -78,12 +94,25 @@ class Server:
         return self.proc.wait(timeout=30)
 
 
+ROOT_PASSWORD = "root-secret"
+
+
 @pytest.fixture
 def server():
+    yield from serve()
+
+
+@pytest.fixture
+def auth_server():
+    """A server that requires a login; root (a superuser) has ROOT_PASSWORD."""
+    yield from serve(ROOT_PASSWORD)
+
+
+def serve(root_password=None):
     if not os.access(TSDBD, os.X_OK):
         pytest.fail(f"{TSDBD} is missing: run make in the repository root")
     base = os.environ.get("TSDB_TEST_DIR")
-    srv = Server(base)
+    srv = Server(base, root_password=root_password)
     try:
         yield srv
     finally:

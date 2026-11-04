@@ -33,7 +33,7 @@ def fake_server(version):
             length, rid, op = struct.unpack("<IIB", hdr)
             payload = f.read(length - 5)
             body = {
-                1: struct.pack("<I", version),
+                1: struct.pack("<IHH", version, 0, 0),  # no login, no mechanisms
                 2: struct.pack("<Q", A + 2),
                 3: bytes(2),  # an empty name
                 5: bytes([1, 0, 0, 0, 0]),  # a raw chunk of no rows, the last
@@ -57,19 +57,19 @@ def requests(level, call):
     call(c)
     c.close()
     th.join(5)
-    assert hello == [struct.pack("<I", 11)]
+    assert hello == [struct.pack("<I", 12)]
     return seen
 
 
-@pytest.mark.parametrize("version", [10, 7, 3, 1, 0])
-def test_a_server_older_than_11_is_refused_at_connect(version):
+@pytest.mark.parametrize("version", [11, 10, 7, 3, 1, 0])
+def test_a_server_older_than_12_is_refused_at_connect(version):
     port, hello, seen, th = fake_server(version)
     with pytest.raises(TsdbError) as e:
         Client(port=port)
     assert e.value.code == -3
-    assert f"tsdbd speaks protocol {version}; this client needs 11: upgrade the server" in str(e.value)
+    assert f"tsdbd speaks protocol {version}; this client needs 12: upgrade the server" in str(e.value)
     th.join(5)
-    assert hello == [struct.pack("<I", 11)] and seen == []
+    assert hello == [struct.pack("<I", 12)] and seen == []
 
 
 def test_the_frames_carry_the_whole_id():

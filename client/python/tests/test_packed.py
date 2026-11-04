@@ -75,7 +75,7 @@ def fake_server(version):
         while hdr := f.read(9):
             length, rid, op = struct.unpack("<IIB", hdr)
             payload = f.read(length - 5)
-            body = struct.pack("<I", version) if op == 1 else b""
+            body = struct.pack("<IHH", version, 0, 0) if op == 1 else b""  # no login, no mechanisms
             s.sendall(struct.pack("<IIBi", 9 + len(body), rid, 0, 0) + body)
             seen.append((op, payload))
         s.close()
@@ -98,14 +98,14 @@ def talk(version, level):
 
 
 def test_level_zero_sends_plain_arrays():
-    seen = talk(11, 0)
+    seen = talk(12, 0)
     assert [op for op, _ in seen] == [1, 4, 14]  # HELLO at connect, version 1 INSERT, INSERT_VALUES
     assert seen[2][1][5] == 0  # flags: plain
     assert len(seen[2][1]) == 16 + 2 * 16
 
 
 def test_new_servers_get_packed_frames():
-    seen = talk(11, 1)
+    seen = talk(12, 1)
     assert [op for op, _ in seen] == [1, 14, 14]
     p = seen[2][1]
     assert p[:16] == bytes([2, 0, 0, 0, 2, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0])  # n, int64, PACKED, 0, series

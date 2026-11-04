@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
-use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -17,7 +16,7 @@ use ::tsdb_client as tc;
 use tc::ValueType;
 
 use crate::arrays::{BucketsMany, agg_queries, inserts, many_cols, points_list, range_queries, with_batches};
-use crate::{closed, connect, multi, opts, seconds, to_pyerr};
+use crate::{closed, connect, connect_options, multi, opts, to_pyerr};
 
 /// A pool of connections to tsdbd for batch calls that use them all at once.
 ///
@@ -32,6 +31,8 @@ use crate::{closed, connect, multi, opts, seconds, to_pyerr};
 ///     timeout: Seconds for the connect and every later read or write, as in
 ///         Client; None waits forever after a 10 s connect.
 ///     keepalive: TCP keepalive, as in Client.
+///     user, password, password_file, require_auth: The login, as in Client;
+///         every connection logs in, a replacement too.
 ///
 /// A connection that breaks (an I/O error or a timeout) is replaced by a new
 /// one before its next query, and so is every other connection made before
@@ -101,7 +102,8 @@ impl Pool {
 impl Pool {
     #[new]
     #[pyo3(signature = (host = "127.0.0.1", port = tc::DEFAULT_PORT, connections = None, *, timeout = None,
-                        keepalive = true))]
+                        keepalive = true, user = None, password = None, password_file = None, require_auth = false))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         host: &str,
@@ -109,15 +111,21 @@ impl Pool {
         connections: Option<usize>,
         timeout: Option<f64>,
         keepalive: bool,
+        user: Option<String>,
+        password: Option<String>,
+        password_file: Option<std::path::PathBuf>,
+        require_auth: bool,
     ) -> PyResult<Self> {
         let n = connections.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
         if n == 0 {
             return Err(PyValueError::new_err("connections must be at least 1"));
         }
-        let timeout: Option<Duration> = seconds(timeout)?;
+        // every connection, and every one that replaces a broken one, logs in with these; PBKDF2 runs once, as
+        // the Rust client caches the keys per process
+        let opts = connect_options(timeout, user, password, password_file, require_auth)?;
         let h = host.to_string();
         let pool = py
-            .detach(|| tc::Pool::with_connector(n, move || connect(&h, port, timeout, keepalive)))
+            .detach(|| tc::Pool::with_connector(n, move || connect(&h, port, &opts, keepalive)))
             .map_err(|e| to_pyerr(py, e))?;
         Ok(Pool { pool: RwLock::new(Some(pool)), addr: format!("{host}:{port}"), types: Mutex::default() })
     }

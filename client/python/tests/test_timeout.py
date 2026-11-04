@@ -52,7 +52,7 @@ def watchdog():
 class Fake:
     """Runs behave(conn, stop) on the first connection; closing it releases the connection.
 
-    Answers the HELLO every connect sends (protocol 11) first, unless raw: then behave sees it."""
+    Answers the HELLO every connect sends (protocol 12, no login) first, unless raw: then behave sees it."""
 
     def __init__(self, behave, raw=False):
         self.raw = raw
@@ -75,7 +75,8 @@ class Fake:
                 if not self.raw:
                     req_id, op = read_request(conn)
                     assert op == 1, "the first request of a connection is HELLO"
-                    conn.sendall(ack(req_id, struct.pack("<I", tsdb_client.PROTOCOL_VERSION)))
+                    # the version, no flags (no login), no mechanisms
+                    conn.sendall(ack(req_id, struct.pack("<IHH", tsdb_client.PROTOCOL_VERSION, 0, 0)))
                 self.behave(conn, self.stop)
             except (EOFError, OSError):
                 pass

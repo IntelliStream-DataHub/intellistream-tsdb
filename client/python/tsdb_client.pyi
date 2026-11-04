@@ -40,6 +40,22 @@ ERR_NOTFOUND: int
 ERR_TOO_MANY_BUCKETS: int
 ERR_STOPPED: int
 ERR_READONLY: int
+ERR_DENIED: int
+"""The user may not do this (no grant covers the series, or not its admin)."""
+ERR_AUTH: int
+"""The login failed or is required (an unknown user and a wrong password look alike)."""
+RIGHT_READ: int
+"""Reading the series' rows, aggregates and metadata (1)."""
+RIGHT_INSERT: int
+"""Inserting rows (2)."""
+RIGHT_DELETE: int
+"""Deleting and replacing rows (4)."""
+RIGHT_ADMIN: int
+"""Managing users and grants inside the selector (8)."""
+RIGHT_WRITE: int
+"""RIGHT_INSERT | RIGHT_DELETE (6)."""
+SCRAM_ITERATIONS: int
+"""The PBKDF2 iterations of a new verifier when none are given (4096)."""
 VALUE_TYPES: list[str]
 """The value types: ["float32", "float64", "int64", "bool", "state"]."""
 
@@ -382,6 +398,21 @@ class TwaBuckets(Sequence[TwaBucket]):
     def __getitem__(self, i: slice) -> TwaBuckets: ...
 
 @final
+class User:
+    """A user of the server, from whoami() or user_list()."""
+
+    @property
+    def name(self) -> str:
+        """The login name; "" from a server without login (--no-auth)."""
+    @property
+    def superuser(self) -> bool:
+        """Every right on every series, user management and the database-wide operations."""
+    @property
+    def grants(self) -> list[tuple[str, str]]:
+        """The grants as (selector, rights) pairs of strings, e.g. ("prefix:acme/", "read,insert"). A user's rights
+        on a series are the union of those whose selector matches its name."""
+
+@final
 class Stats:
     """Database statistics, as returned by Client.stats()."""
 
@@ -472,14 +503,38 @@ class Client:
         keepalive: Turn TCP keepalive on (the default): after 30 s of silence
             the client probes every 10 s and drops the connection after 3
             unanswered probes, where the platform allows.
+        user: The user to log in as (SCRAM-SHA-256), when the server asks
+            for a login. The password never travels, and the connect fails
+            unless the server proves it holds the user's verifier. PBKDF2
+            runs once per process for a user and password: later connects,
+            a Pool's included, reuse the keys.
+        password: The user's password (its UTF-8 bytes, without
+            normalization; ASCII is safest).
+        password_file: Read the password from the first line of this file
+            instead (a trailing CR LF is cut), at every connect.
+        require_auth: Refuse (ERR_AUTH) a server that does not ask for a
+            login (--no-auth). Otherwise such a server is used without one.
 
     Raises:
-        TsdbError: The connection failed.
-        ValueError: timeout is not a positive number.
+        TsdbError: The connection failed; ERR_AUTH when the login failed (an
+            unknown user and a wrong password look alike), the server did not
+            prove its signature, it asks for a login and none was given, or
+            require_auth is set and it asks for none.
+        ValueError: timeout is not a positive number, or a user has neither
+            password nor password_file.
     """
 
     def __new__(
-        cls, host: str = "127.0.0.1", port: int = 7070, timeout: float | None = None, keepalive: bool = True
+        cls,
+        host: str = "127.0.0.1",
+        port: int = 7070,
+        timeout: float | None = None,
+        keepalive: bool = True,
+        *,
+        user: str | None = None,
+        password: str | None = None,
+        password_file: str | os.PathLike[str] | None = None,
+        require_auth: bool = False,
     ) -> Client: ...
     def set_timeout(self, timeout: float | None) -> None:
         """Changes how long a call waits for the server, in seconds; None waits forever.
@@ -1066,6 +1121,80 @@ class Client:
         """Merges the parts of every partition into one (slow on big databases)."""
     def stats(self) -> Stats:
         """Returns database statistics (a Stats)."""
+    def whoami(self) -> User:
+        """The user this connection is logged in as, with its grants (a User);
+        name "" with every right (superuser) on a server started with --no-auth."""
+    def user_list(self) -> list[User]:
+        """The users this one may see (a list of User): itself, and the users it
+        manages (every user, for a superuser).
+
+        Raises:
+            TsdbError: ERR_DENIED on a server started with --no-auth (users are
+                managed there with the offline `tsdb DIR user` verbs).
+        """
+    def user_create(self, name: str, password: str, *, superuser: bool = False, iterations: int | None = None) -> None:
+        """Creates user name with password, a superuser if superuser.
+
+        The password does not travel: the client sends its verifier (a fresh
+        salt, StoredKey and ServerKey) computed with iterations of PBKDF2
+        (None: SCRAM_ITERATIONS, 4096; at least 4096, at most 100,000,000).
+
+        Raises:
+            TsdbError: ERR_DENIED unless this user is a superuser or holds admin
+                on a prefix that name starts with (only a superuser creates
+                superusers), and on a --no-auth server; ERR_INVALID for a name
+                that exists or that the server refuses; ERR_INVALID for an
+                empty password or iterations out of range.
+        """
+    def user_password(self, name: str, password: str, *, iterations: int | None = None) -> None:
+        """Sets the password of user name (its own, or one of a user it manages),
+        sent as user_create() sends it.
+
+        Raises:
+            TsdbError: As user_create(); ERR_DENIED also for a user holding a
+                grant outside this one's admin selectors.
+        """
+    def user_drop(self, name: str) -> None:
+        """Drops user name; its open connections are answered ERR_AUTH and closed.
+
+        Raises:
+            TsdbError: ERR_DENIED for a user this one does not manage, and for
+                the last superuser.
+        """
+    def user_alter(self, name: str, *, superuser: bool) -> None:
+        """Makes user name a superuser or takes that away (superusers only).
+
+        Raises:
+            TsdbError: ERR_DENIED unless this user is a superuser, and for
+                taking it from the last superuser.
+        """
+    def grant(self, name: str, selector: str, rights: str | int) -> None:
+        """Gives user name rights on the series selector matches. Grants only add.
+
+        selector is written as the CLI writes it: "all", "prefix:P" (a byte
+        prefix of the name: tenants end theirs in "/"), "name:N" or "glob:G"
+        (* any run of bytes, ? one byte, \\ makes the next one literal). rights
+        are names ("read,insert"; "write" is insert and delete) or RIGHT_* bits.
+
+        Example:
+            >>> c.grant("acme/ingest", "prefix:acme/", "insert")
+            >>> c.grant("acme/dash", "glob:acme/*/temp", RIGHT_READ)
+
+        Raises:
+            ValueError: A selector or rights it cannot read.
+            TsdbError: ERR_DENIED unless this user is a superuser or selector
+                lies inside its own admin selectors and it manages name;
+                ERR_INVALID for a selector the server refuses (a glob over 256
+                bytes, a 65th glob grant).
+        """
+    def revoke(self, name: str, selector: str, rights: str | int) -> None:
+        """Takes rights on selector from user name (the grant with exactly this
+        selector), as grant() writes them.
+
+        Raises:
+            ValueError: A selector or rights it cannot read.
+            TsdbError: As grant().
+        """
     def query_values_multi(
         self,
         series: _SeriesIds,
@@ -1867,6 +1996,8 @@ class Pool:
         timeout: Seconds for the connect and every later read or write, as in
             Client; None waits forever after a 10 s connect.
         keepalive: TCP keepalive, as in Client.
+        user, password, password_file, require_auth: The login, as in Client;
+            every connection logs in, a replacement too.
 
     A connection that breaks (an I/O error or a timeout) is replaced by a new
     one before its next query, and so is every other connection made before
@@ -1890,6 +2021,10 @@ class Pool:
         *,
         timeout: float | None = None,
         keepalive: bool = True,
+        user: str | None = None,
+        password: str | None = None,
+        password_file: str | os.PathLike[str] | None = None,
+        require_auth: bool = False,
     ) -> Pool: ...
     @property
     def connections(self) -> int:
