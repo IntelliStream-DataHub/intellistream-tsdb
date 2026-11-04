@@ -3,7 +3,7 @@
  * connection and must be used by one thread at a time (open one per thread).
  *
  *   tsdbc *c;
- *   tsdbc_connect("127.0.0.1", 7070, &c);
+ *   tsdbc_connect_auth("127.0.0.1", 7070, user, password, &c);  (a user with read and insert on the series)
  *   tsdb_sid id;
  *   tsdbc_series(c, "pump7.flow", 1, &id);
  *   tsdbc_insert_series(c, id, ts, values, n);

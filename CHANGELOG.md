@@ -132,8 +132,9 @@ Logins and access control (protocol 12, [docs/design-auth.md](docs/design-auth.m
   with a tsdbd started with `--no-auth`.
 - New error codes `TSDB_ERR_DENIED` (-16) and `TSDB_ERR_AUTH` (-17); the metric `tsdb_logins_total{result}`.
 - `examples/client.c` takes a user and a password file.
-- The Pulsar sink logs in: `user` and `password` (a secret, from Pulsar's secrets provider; refused in the plain
-  config) or `passwordFile`. A refused login is retried with the sink's backoff while Pulsar holds the backlog; a
+- The Pulsar sink logs in: `user` and `passwordFile` (a 0600 file on the worker host), or `password` as a Pulsar
+  secret (refused in the plain config; Pulsar's default secrets provider is clear text and shows the secret like
+  the config, so use it only with a real provider such as Kubernetes secrets). A refused login is retried with the sink's backoff while Pulsar holds the backlog; a
   record the user may not write (`TSDB_ERR_DENIED`) goes to the dead-letter path, the rest of its batch is written.
   `insert` on the sink's series is all the user needs.
 

@@ -290,8 +290,11 @@ cgroup, so `nice` does not keep your work out of its way.
   an id is checked through its name (`tsdb_series_name`) and the answer cached in the user's rights map: names never
   change and ids are never reused, which keeps the cache right until the user's grants change (then the map goes
   with the user's state, marked stale; a request already running finishes under its old rights). An id that resolves
-  to no name is DENIED and not cached. **Denied and missing look alike**: a name or id the user holds no right on is
-  `TSDB_ERR_DENIED` whether the series exists or not (only a user with the right on `all` sees NOTFOUND); QUERY_MULTI
+  to no name is DENIED and not cached. **Denied and missing look alike**: a name outside the user's grants, and any
+  id the user holds no right on, is `TSDB_ERR_DENIED` whether the series exists or not; a missing id is DENIED for
+  every user without the needed right on `all`. A missing name inside the user's grants is `TSDB_ERR_NOTFOUND` (the
+  clients and the sink rely on it: look up, NOTFOUND, then create), as is anything missing for a user with the
+  right on `all`; QUERY_MULTI
   answers DENIED per series, an insert frame with one denied row is refused whole. Before login only HELLO,
   AUTH_START and AUTH_CONTINUE pass; every failed login is `TSDB_ERR_AUTH` with no body, an unknown user included.
   Passwords never travel (clients send a verifier) and never appear in argv or logs. USERS keeps the rules of the

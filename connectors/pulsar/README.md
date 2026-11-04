@@ -136,25 +136,36 @@ tsdb /var/lib/tsdb user add pulsar-sink --password-file sink.pw
 tsdb /var/lib/tsdb user grant pulsar-sink insert prefix:plant1/
 ```
 
-Then give the sink the user in its config and the password as a Pulsar
-**secret** named `password`. Pulsar keeps the sink config as plain text and
-shows it to anyone who may list sinks, so the sink refuses a `password` there.
-How a secret is given depends on how Pulsar runs functions: with the default
-(clear text) secrets provider of a function worker or `localrun`, the value in
-`--secrets` is the password itself; on Kubernetes it names a Kubernetes secret.
+Then give the sink the user in its config, and the password in one of the two
+ways below. The sink refuses a `password` in the config itself: Pulsar keeps the
+config as plain text and shows it to anyone who may read the sink's settings
+(`pulsar-admin sinks get`).
+
+**A password file** (use this when Pulsar runs functions as processes or
+threads, which is its default): `passwordFile` names a file on the worker host
+whose first line is the password. Put it on every worker host that may run the
+sink, owned by the user the function worker runs as and readable by nobody else
+(`chmod 600`). It is read again at every reconnect, so a changed password is
+picked up without a restart.
 
 ```sh
 bin/pulsar-admin sinks create --archive tsdb-pulsar-sink-0.9.0.nar \
     --tenant public --namespace default --name tsdb \
     --inputs topic://public/default/points --subs-name tsdb --retain-key-ordering \
     --sink-config '{"hosts": "tsdb1:7070", "connections": 4, "user": "pulsar-sink",
-                    "deadLetterTopic": "topic://public/default/points-dlq"}' \
-    --secrets '{"password": "the-password"}'
+                    "passwordFile": "/etc/pulsar/tsdb-sink.password",
+                    "deadLetterTopic": "topic://public/default/points-dlq"}'
 ```
 
-Instead of the secret, `passwordFile` names a file on the Pulsar host whose
-first line is the password; it is read again at every reconnect, so a changed
-password is picked up without a restart.
+**A Pulsar secret** named `password` (`--secrets '{"password": ...}'` instead of
+`passwordFile`), but only with a secrets provider that really keeps it secret,
+such as Kubernetes secrets (there the value in `--secrets` names a Kubernetes
+secret, not the password). Pulsar's default secrets provider does not: it keeps
+the secret as clear text, exactly like the config. With it, the password shows
+in `pulsar-admin sinks get` to anyone who may read the sink's settings, and, when
+the worker runs the sink as a process, on that process's command line, which
+every user of the worker host can list (`ps`). With the default provider, use
+`passwordFile`.
 
 If tsdbd refuses the login (wrong password, unknown or dropped user), the sink
 does not drop anything: it waits and tries again with its usual backoff, logs one
@@ -169,8 +180,8 @@ meanwhile. A message for a series the user has no right on is refused by tsdbd
 | `hosts` | `127.0.0.1` | tsdbd endpoints, `host[:port]` separated by commas, tried in order on every (re)connect, starting after the last one that refused writes (read only, locked, stopping) |
 | `port` | `7070` | port of endpoints that name none |
 | `user` | empty | tsdbd user to log in as (see Login); empty: no login, for a tsdbd started with `--no-auth` |
-| `password` | empty | the user's password: only as the Pulsar secret `password` (`--secrets`), never in the config |
-| `passwordFile` | empty | instead of `password`: a file whose first line is the password, read at every (re)connect |
+| `password` | empty | the user's password: only as the Pulsar secret `password` (`--secrets`), never in the config; with Pulsar's default (clear text) secrets provider it is as visible as the config: use `passwordFile` then (see Login) |
+| `passwordFile` | empty | instead of `password`: a file on the worker host (mode 0600, owned by the worker's user) whose first line is the password, read at every (re)connect |
 | `connections` | `1` | connections to tsdbd; each series always uses the same one (by a hash of its name), which keeps its order |
 | `batchRows` | `10000` | a batch is sent when it holds this many points |
 | `batchBytes` | `4194304` | ... or about this many bytes |

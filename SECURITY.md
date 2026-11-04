@@ -22,11 +22,13 @@ leaves out what would cost speed and is not needed behind isolation.
 
 - **Login.** A client proves its password with SCRAM-SHA-256 (as PostgreSQL does). The password itself never
   crosses the network, and the server stores only a salted value made from it (the file `USERS` in the database
-  directory, mode 0600). Whoever reads that file cannot log in with what is in it. The client checks the server
+  directory, mode 0600). Whoever reads that file cannot log in with it alone, but can with it and one recorded
+  login of the same user (see below): keep `USERS` as secret as the data it protects. The client checks the server
   too: a server that does not hold the user's stored value cannot finish the login.
 - **Rights.** A user holds `read`, `insert`, `delete` and `admin` on all series, on a name prefix (a tenant such as
   `acme/`), on one series, or on the names a pattern matches. A series a user may not touch answers exactly like a
-  series that does not exist, so users cannot find out what other tenants store. A superuser may do everything.
+  series that does not exist, so users cannot find out which series other tenants store (only roughly how many,
+  see below). A superuser may do everything.
 - **Before login** a connection may send only the login messages, each at most 4 KiB, and must finish within
   `--login-timeout` seconds (10 by default). A failed login closes the connection and is logged with the user
   name and the address (at most one line a second; never a password).
@@ -35,17 +37,33 @@ leaves out what would cost speed and is not needed behind isolation.
 
 What logins do not protect against:
 
-- **Someone who can read the network.** There is no TLS yet ([roadmap](docs/roadmap.md)). Data and queries
-  travel in the clear. A recorded login does not show the password, but it lets the eavesdropper guess passwords
-  offline at their own speed: use long random passwords.
-- **The metrics port** (`--metrics-port`) is plain HTTP without a login. It shows server-wide counts only, no
-  series names or values. Bind it to a trusted interface (`--metrics-bind`).
+- **Someone who can read or change the network.** There is no TLS yet ([roadmap](docs/roadmap.md)). Data and
+  queries travel in the clear. A recorded login does not show the password, but:
+  - it lets the eavesdropper guess passwords offline at their own speed: use long random passwords;
+  - a recorded password change plus one later recorded login of the same user is enough to log in as that user,
+    with no guessing: `user add` and `user passwd` through the server send the value that `USERS` keeps, and that
+    value together with a recorded login gives what the client proves. The same goes for whoever has a copy of
+    `USERS` and records one login of the user;
+  - someone who can change traffic, not only read it, can take over a connection after it has logged in.
+
+  So on a network you do not trust, a login protects nothing until TLS is there. Keep the backend network
+  isolated, protect `USERS` like the data, and run password changes on the server host where you can
+  (`tsdb <dir> user ...` changes the file there and sends nothing over the network). TLS, which is planned,
+  closes all three.
+- **The metrics port** (`--metrics-port`) is plain HTTP without a login. It shows counts for the whole server, and
+  per volume its directory path with its rows and bytes on disk; no series names or values. Where a volume is
+  named after a tenant, anyone who reaches the port sees that name and how much the tenant stores. Bind it to a
+  trusted interface (`--metrics-bind`).
 - **Someone with access to the database directory or the host.** `tsdb <dir> ...` commands and programs that use
   tsdb as a library open the files directly and need no login: the file permissions decide. Whoever can write
   the directory can add a superuser.
 - **State names are shared within a volume.** Series of the `state` type store labels such as `RUNNING` in one
   list per volume. A user with a right on any series of a volume can look up the labels other tenants added
-  there. Where those labels are sensitive, give each tenant its own volume.
+  there. Where those labels are sensitive, give each tenant its own volume (its path then shows on the metrics
+  port, see above).
+- **How many series a volume holds.** Series ids are numbered in the order series are created, one count per
+  volume. A user who creates a series sees from its id how many series the volume held before, and from two such
+  ids how many other users created in between. Give each tenant its own volume where this matters.
 - **Passwords a tenant admin already knows.** A user with `admin` on `acme/` can create users under `acme/` and set
   their passwords. If a superuser later lets `acme/bob` read another tenant's series, the admin can no longer
   change bob's password, but still knows the one they set before. Give such a share to a user whose password the

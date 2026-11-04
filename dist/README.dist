@@ -52,12 +52,13 @@ Install
   The unit runs tsdbd on 127.0.0.1:7070 with its data in /var/lib/tsdb.
   Clients log in with a user name and a password. tsdbd does not start until
   the database has a superuser (a user who may do everything): that is the
-  `user add ... --superuser` line, run as the tsdb user so that the file
-  USERS it writes (mode 0600) belongs to the service. More users and their
-  rights: `tsdb /var/lib/tsdb user` lists the commands, which also work while
-  tsdbd runs; run them as the tsdb user too (`user compact` as root would
-  leave a USERS file the service cannot read). Without TLS, data and queries travel in the clear: listen on a
-  trusted interface only (SECURITY.md in the source). Under SELinux it
+  `user add ... --superuser` line. More users and their rights:
+  `tsdb /var/lib/tsdb user` lists the commands, which also work while tsdbd
+  runs. They give the file USERS they write (mode 0600) the owner of the
+  database directory, the tsdb user, even when run as root. USERS holds no
+  passwords, but keep it as secret as the data (SECURITY.md says why). Without
+  TLS, data and queries travel in the clear: listen on a trusted interface only
+  (SECURITY.md in the source). Under SELinux it
   runs unconfined (unconfined_service_t): no tsdb policy exists, so none
   confines it; the systemd sandboxing in the unit (ProtectSystem=strict, ...)
   is what limits it.

@@ -459,8 +459,13 @@ The key lines of the C client (link with `build/libtsdbclient.a -lzstd -lpthread
 tsdbc *c;
 tsdbc_connect_auth("127.0.0.1", 7070, "acme/ingest", password, &c);  /* log in (see "Users and logins") */
 tsdb_sid id;                                         /* 64-bit; look it up by name, never count ids */
-tsdbc_series(c, "pump7.flow", 1, &id);
+tsdbc_series(c, "acme/pump7.flow", 1, &id);          /* 1: create it if it is missing */
 tsdbc_insert_series(c, id, times, values, n);
+tsdbc_close(c);
+
+/* acme/ingest may only insert; acme/dashboard (read prefix:acme/) reads: */
+tsdbc_connect_auth("127.0.0.1", 7070, "acme/dashboard", password2, &c);
+tsdbc_series(c, "acme/pump7.flow", 0, &id);
 tsdbc_query_agg(c, id, start, end, 60000, &b, &nb);    /* one summary per minute */
 tsdbc_close(c);
 ```
@@ -475,7 +480,10 @@ refuses further calls on that connection, so close it and connect again.
 
 tsdbd lets in only clients that log in with a user name and a password. The password never crosses the network:
 client and server prove to each other that they know it (SCRAM-SHA-256, the method PostgreSQL uses). The server
-keeps only a value made from the password, from which nobody can log in. tsdbd does not start until the
+keeps only a value made from the password, not the password. That value is not enough to log in, but it is
+together with one recorded login, so keep the file `USERS` that holds it as secret as the data. There is no TLS
+yet: on a network you do not trust a login protects nothing ([SECURITY.md](SECURITY.md) says why and what to
+do). tsdbd does not start until the
 database has at least one superuser, a user who may do everything:
 
 ```sh

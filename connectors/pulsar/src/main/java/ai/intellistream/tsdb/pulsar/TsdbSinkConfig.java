@@ -37,15 +37,23 @@ public class TsdbSinkConfig {
 
     /**
      * The user's password. Sensitive: it is read from Pulsar's secrets (a secret named {@code password}, given with
-     * {@code --secrets}), never from the plain configuration, which Pulsar stores and shows as it is.
+     * {@code --secrets}), never from the plain configuration, which Pulsar stores and shows as it is. That keeps
+     * it hidden only with a secrets provider that is not clear text (Kubernetes secrets): Pulsar's default provider
+     * stores and shows the secret like the configuration ({@code sinks get}), and a process runtime puts it on the
+     * instance's command line, which every user of the worker host can list. Use {@link #passwordFile} there.
      */
     @FieldDoc(required = false, defaultValue = "", sensitive = true,
-            help = "the user's password; a secret named password (--secrets), never the plain config")
+            help = "the user's password; a secret named password (--secrets), never the plain config. Pulsar's "
+                    + "default secrets provider is clear text and shows it like the config: use passwordFile then")
     public String password = "";
 
-    /** A file whose first line is the password, read at every (re)connect; instead of {@link #password}. */
+    /**
+     * A file on the worker host whose first line is the password, read at every (re)connect; instead of
+     * {@link #password}. Owned by the user the function worker runs as, mode 0600.
+     */
     @FieldDoc(required = false, defaultValue = "",
-            help = "file whose first line is the user's password, read at every (re)connect; instead of password")
+            help = "file whose first line is the user's password (mode 0600, owned by the worker's user), read at "
+                    + "every (re)connect; instead of password")
     public String passwordFile = "";
 
     /**

@@ -43,7 +43,8 @@
  *
  * The file is created, and compacted, with the owner of the database directory (an operator running the CLI as
  * root must not leave a USERS the service user cannot read) and mode 0600; an existing one readable by others is
- * set to 0600, or refused when that fails: it holds the verifiers, which are offline guessing targets.
+ * set to 0600, or refused when that fails: it holds the verifiers, which are offline guessing targets, and with one
+ * recorded login of a user a way to log in as that user (StoredKey turns its ClientProof into ClientKey).
  *
  * Loading applies records in a batch with copy-on-write of the users it touches, so that a reload that meets damage
  * halfway leaves the state exactly as it was (A11: the last good state stays).

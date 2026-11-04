@@ -44,6 +44,12 @@ public final class Itj {
         Series s = series.get(name);
         if (s != null)
             return s;
+        if (create == null && name.startsWith("#")) { // "#ID:TYPE": by id, no lookup (see c/itc.c)
+            String[] p = name.substring(1).split(":");
+            s = new Series(Long.parseUnsignedLong(p[0]), parseType(p[1]));
+            series.put(name, s);
+            return s;
+        }
         try {
             long id = create != null ? c.seriesCreate(name, create) : c.series(name, false);
             s = new Series(id, create != null ? create : c.seriesType(id));

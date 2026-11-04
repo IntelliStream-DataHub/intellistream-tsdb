@@ -31,8 +31,9 @@ take the user and password file from ITG_USER and ITG_PASSWORD_FILE). In matrix+
 server as the superuser, adds a user per client with read and insert on its own set (prefix:LANG.) and one that
 reads every set's float64 series (glob:*.f64); each client writes its set as its own user, the superuser reads and
 administers as before, and at the end every client reads one query of each kind on every series as its own user and
-as the glob user: what the user may read must answer as the superuser's read did, and every other query must be
-refused. A cross-tenant answer fails the run.
+as the glob user, by name and again by the series' id (looked up by the superuser, so the query itself must refuse):
+what the user may read must answer as the superuser's read did, and every other query must be refused. A
+cross-tenant answer fails the run.
 
 Why Python and not bash: the scenarios need binary-safe comparison, threads (four clients and a server at once,
 a trigger that fires on the clients' acknowledgements), a model of the expected answers and zoneinfo as an
@@ -492,9 +493,10 @@ def add_tenants(ctx, F, d, port):
 
 def tenant_phase(ctx, F, d, port, queries, texts, users, types):
     """--auth on: each client reads, logged in as its own user and then as GLOB_USER, one query of every kind on
-    every series of every set. What the user may read must answer as the superuser's read did (texts: lang ->
-    its output); everything else must be refused ("!!"): any other answer is another tenant's data, and fails
-    the run."""
+    every series of every set, once by name and once more by the id the superuser looked up ("#ID:TYPE": the
+    client asks no lookup, so the query itself must refuse; ids are easy to guess, TSDB_SID(volume, 0..n-1)).
+    What the user may read must answer as the superuser's read did (texts: lang -> its output); everything else
+    must be refused ("!!"): any other answer is another tenant's data, and fails the run."""
     t0 = time.time()
     sup = {l: dict(gen.parse_blocks(t)) for l, t in texts.items()}
     if set(sup) != set(LANGS):
@@ -506,8 +508,19 @@ def tenant_phase(ctx, F, d, port, queries, texts, users, types):
         if (kind, name) not in seen and all(sup[l].get(q, ["!!"]) != ["!!"] for l in LANGS):
             seen.add((kind, name))
             pick.append(q)
+    nfile, idout = d / "names-tenants.txt", d / "ids-tenants.out"
+    nfile.write_text("".join(n + "\n" for n in sorted({q.split()[1] for q in pick})))
+    rc, _ = run_client(ctx, "c", ["ids", port, nfile], idout)  # as the superuser
+    if rc != 0:
+        F.add("tenants: looking up the ids as the superuser failed (%s): %s" % (rc, err_tail(idout)))
+        return
+    ids = dict(ln.split() for ln in idout.read_text().splitlines())
+    byid = {}  # the query naming its series by id -> the same query by name
+    for q in pick:
+        kind, name, rest = q.split(" ", 2)
+        byid["%s #%s:%s %s" % (kind, ids[name], types[name], rest)] = q
     qfile = d / "queries-tenants.txt"
-    qfile.write_text("\n".join(pick) + "\n")
+    qfile.write_text("\n".join(pick + list(byid)) + "\n")
     plans = {}
     for l in LANGS:
         plans["own-" + l] = (l, users[l], lambda n, l=l: n.startswith(l + "."))
@@ -523,6 +536,7 @@ def tenant_phase(ctx, F, d, port, queries, texts, users, types):
         got = dict(gen.parse_blocks(Path(jobs[k][2]).read_text(errors="surrogateescape")))
         mine = [q for q in pick if allowed(q.split()[1])]
         theirs = [q for q in pick if not allowed(q.split()[1])]
+        theirs += [qi for qi, q in byid.items() if not allowed(q.split()[1])]
         if not mine or not theirs:
             F.add("tenants: %s as %s has %d allowed and %d refused queries: the check has no teeth"
                   % (l, login[0], len(mine), len(theirs)))
@@ -533,12 +547,15 @@ def tenant_phase(ctx, F, d, port, queries, texts, users, types):
                     F.add("tenants: CROSS-TENANT READ: %s as %s got %s for `%s`, not a refusal"
                           % (l, login[0], ("%d lines" % len(got[q])) if q in got else "no answer", q))
         block = lambda src: "".join("## %s\n%s" % (q, "".join(x + "\n" for x in src.get(q, []))) for q in mine)
-        for m in diff_outputs("superuser", block(sup[l]), login[0], block(got), types=types):
-            F.add("tenants: %s as %s reads its own series otherwise than the superuser: %s" % (l, login[0], m))
+        by_id = {q: got[qi] for qi, q in byid.items() if qi in got}  # under the name, for block() and types
+        for how, src in (("", got), (" by id", by_id)):
+            for m in diff_outputs("superuser", block(sup[l]), login[0] + how, block(src), types=types):
+                F.add("tenants: %s as %s reads its own series%s otherwise than the superuser: %s"
+                      % (l, login[0], how, m))
     if leaked > 5:
         F.add("tenants: %d cross-tenant reads in all" % leaked)
-    F.note("tenants: 4 clients as their own users and as %s, %d queries each, in %.1f s"
-           % (GLOB_USER, len(pick), time.time() - t0))
+    F.note("tenants: 4 clients as their own users and as %s, %d queries each (half by id), in %.1f s"
+           % (GLOB_USER, 2 * len(pick), time.time() - t0))
 
 
 # ---------------------------------------------------------------- the CLI as the reference

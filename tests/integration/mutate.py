@@ -130,6 +130,11 @@ mut("M18", "server skips the rights check in handle(): a logged-in user reads an
     "    if ((rc = auth_fresh(a)) != 0 || (rc = auth_check(a, r->op, p, len)) != 0) {",
     "    if ((rc = auth_fresh(a)) != 0 || (rc = 0) != 0) {",
     ["c"], "matrix")
+mut("M19", "server skips the rights check of reads by id: a tenant reads any series whose id it has",
+    "server/auth.c",
+    "        return auth_id(a, id, need);",
+    "        return need == R_READ ? 0 : auth_id(a, id, need);",
+    ["c"], "matrix")
 
 
 def sh(cmd, cwd, log, env=None, check=True, timeout=None):

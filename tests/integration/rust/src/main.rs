@@ -35,6 +35,11 @@ impl Ctx {
         }
         let (id, ty) = match create {
             Some(t) => (self.c.series_create(name, t, None).unwrap(), t),
+            // "#ID:TYPE": by id, no lookup (see c/itc.c)
+            None if name.starts_with('#') => {
+                let (id, ty) = name[1..].split_once(':').expect("#ID:TYPE");
+                (id.parse().expect("id"), parse_type(ty))
+            }
             None => {
                 let id = self.c.series_lookup(name).ok()?;
                 (id, self.c.series_type(id).unwrap())

@@ -84,8 +84,9 @@ the RAM is there.</p>
 <h2 id="users">Users, rights and tenants</h2>
 <p>Clients log in with a user name and a password; the <a href="server.html#users">server page</a> explains how. The
 users live in one file, <code>USERS</code>, in the database directory. Only the file's owner may read it, and it
-holds no passwords, only values made from them. Whoever can write the directory can add a superuser, so keep it
-as closed as the data.</p>
+holds no passwords, only values made from them. Such a value is not enough to log in, but together with one
+recorded login of the same user it is (there is no TLS yet), so keep the file as secret as the data. Whoever can
+write the directory can add a superuser, so keep it as closed as the data.</p>
 
 <h3 id="users-setup">Setting up users</h3>
 <p>Start with one superuser, added before tsdbd first starts. Then give every program and person its own user,
@@ -113,7 +114,7 @@ build/tsdb /data/sensors user list</code></pre>
 </tbody></table></div>
 <p>Rights only add up: a user may do on a series what any of its grants allows. There is no way to deny. To take a
 right away, <code>tsdb DIR user revoke NAME RIGHTS SELECTOR</code>. A series a user holds no right on answers as if it
-did not exist, so users cannot find out what other tenants store.</p>
+did not exist, so users cannot find out which series other tenants store (only roughly how many: see below).</p>
 
 <h3 id="tenants">Tenants and tenant admins</h3>
 <p>A tenant is a name prefix: <code>acme/</code> for acme's series and acme's users. A user with <code>admin</code> on
@@ -134,6 +135,15 @@ one when you share (<code>tsdb DIR user passwd NAME</code>).</li>
 <li><strong>State names.</strong> Series of the <code>state</code> type store labels such as <code>RUNNING</code> in one
 list per volume. A user with a right on any series of a volume can look up the labels of every series there. Where
 those labels are sensitive, give each tenant its own <a href="#volumes">volume</a>.</li>
+<li><strong>Series counts.</strong> Series ids are numbered in the order series are created, one count per volume.
+A user who creates a series sees from its id how many series the volume held, and from two ids how many others
+created in between. A volume per tenant avoids that too; its path then shows on the <a href="#metrics">metrics
+port</a>.</li>
+<li><strong>The network.</strong> Without TLS (planned), whoever records a password change made through the server
+(<code>user add</code>, <code>user passwd</code>) and a later login of that user can log in as that user, and whoever
+can change traffic can take over a connection after its login. Keep the backend network isolated, and change
+passwords with <code>tsdb DIR user ...</code> on the server host where you can: that sends nothing over the
+network.</li>
 </ul>
 
 <h3 id="users-running">While tsdbd runs</h3>
@@ -158,7 +168,8 @@ the address, at most one line a second.</li>
 <h2 id="metrics">Metrics</h2>
 <p><code>--metrics-port 9170</code> serves <code>GET /metrics</code> in the Prometheus text format on a port of its own.
 It is off by default and, unlike the main port, has no login: bind it to a trusted interface. It shows counts for
-the whole server, never series names or values. A scrape never runs a query.
+the whole server and per volume, never series names or values; the per-volume counts name each volume's directory,
+so with a volume per tenant anyone who reaches the port sees those paths and their sizes. A scrape never runs a query.
 A Prometheus scrape config:</p>
 <pre><code class="language-yaml" data-src="docs/metrics.md#Prometheus metrics">scrape_configs:
   - job_name: tsdb

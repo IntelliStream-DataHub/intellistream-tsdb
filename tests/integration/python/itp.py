@@ -38,6 +38,10 @@ class Ctx:
     def find(self, name, create=None):
         if name in self.series:
             return self.series[name]
+        if not create and name.startswith("#"):  # "#ID:TYPE": by id, no lookup (see c/itc.c)
+            sid, ty = name[1:].split(":")
+            self.series[name] = (int(sid), ty)
+            return self.series[name]
         try:
             if create:
                 sid = self.c.series_create(name, create)

@@ -4,9 +4,12 @@
  *   itc read  <port> <queries-file>      print the canonical answers
  *   itc load  <port> <series> <seed> [level]   pipelined load for the kill -9 scenario
  *   itc admin <port> flush|optimize
+ *   itc ids   <port> <names-file>        print "name id" per line (C only: run.py's ids for reads by id)
  *
  * All four clients (C, Rust, Python, Java) speak this command line and print
- * byte-identical output for the same queries; run.py compares them. */
+ * byte-identical output for the same queries; run.py compares them. A query whose series is written
+ * "#ID:TYPE" names it by id, with no lookup on the server: a tenant reading another's series by an id it got
+ * elsewhere must be refused by the query itself, the check a lookup by name never reaches. */
 #define _GNU_SOURCE
 #include "tsdb_client.h"
 
@@ -49,7 +52,13 @@ static sinfo *find(tsdbc *c, const char *name, int create, tsdb_type type)
     sinfo *s = &infos[ninfos];
     snprintf(s->name, sizeof s->name, "%s", name);
     int rc;
-    if (create) {
+    if (!create && name[0] == '#') {
+        char *colon = strchr(name, ':');
+        if (!colon)
+            die(name, 0);
+        s->id = strtoull(name + 1, NULL, 10);
+        s->type = parse_type(colon + 1);
+    } else if (create) {
         if ((rc = tsdbc_series_create(c, name, type, NULL, &s->id)) != 0)
             die(name, rc);
         s->type = type;
@@ -378,6 +387,23 @@ static void do_read(tsdbc *c, const char *path)
     fclose(f);
 }
 
+/* ---- ids of named series (as the superuser), for run.py's reads by id ---- */
+static void do_ids(tsdbc *c, const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        die(path, TSDB_ERR_IO);
+    char name[256];
+    while (fscanf(f, "%255s", name) == 1) {
+        tsdb_sid id;
+        int rc = tsdbc_series(c, name, 0, &id);
+        if (rc)
+            die(name, rc);
+        printf("%s %" PRIu64 "\n", name, (uint64_t)id);
+    }
+    fclose(f);
+}
+
 /* ---- durability load ----
  * One series, `rows` timestamps 1000 ms apart. Pass 1 writes value base+i, pass 2 overwrites the same
  * timestamps with base+i+1000000. Batches of 200 rows are sent 8 at a time and then waited for together (the
@@ -430,7 +456,7 @@ static void do_load(tsdbc *c, const char *name, int level, int seed)
 int main(int argc, char **argv)
 {
     if (argc < 4) {
-        fprintf(stderr, "usage: itc write|read|load|admin <port> <arg>...\n");
+        fprintf(stderr, "usage: itc write|read|load|admin|ids <port> <arg>...\n");
         return 2;
     }
     tsdbc *c;
@@ -444,6 +470,8 @@ int main(int argc, char **argv)
         do_write(c, argv[3]);
     else if (strcmp(argv[1], "read") == 0)
         do_read(c, argv[3]);
+    else if (strcmp(argv[1], "ids") == 0)
+        do_ids(c, argv[3]);
     else if (strcmp(argv[1], "load") == 0 && argc >= 5)
         do_load(c, argv[3], argc > 5 ? atoi(argv[5]) : 1, atoi(argv[4]));
     else if (strcmp(argv[1], "admin") == 0) {

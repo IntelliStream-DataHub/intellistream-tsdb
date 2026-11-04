@@ -1690,9 +1690,10 @@ mirrors the embedded API and does not link the storage engine:
 
 ```c
 tsdbc *c;
-tsdbc_connect_auth("127.0.0.1", 7070, "acme/ingest", password, &c); /* SCRAM; keys cached per process */
+tsdbc_connect_auth("127.0.0.1", 7070, "acme/app", password, &c); /* SCRAM; keys cached per process */
+                                                   /* acme/app holds read,insert on prefix:acme/ */
 tsdb_sid id;                                       /* 64-bit; look it up by name, never count ids */
-tsdbc_series(c, "pump7.flow", 1, &id);
+tsdbc_series(c, "acme/pump7.flow", 1, &id);
 tsdbc_insert_series_async(c, id, ts, values, n);   /* pipelined */
 tsdbc_wait(c);                                     /* acknowledgements */
 tsdbc_query_agg(c, id, start, end, 60000, &b, &nb);
