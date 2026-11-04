@@ -80,7 +80,7 @@ def test_ports():
         sys.path.insert(0, %r)
         import run
         tmp = Path(tempfile.mkdtemp(prefix="integ-ports-"))
-        ctx = types.SimpleNamespace(tsdbd=%r)
+        ctx = types.SimpleNamespace(tsdbd=%r, auth=False)
         a = run.Server(ctx, tmp / "a", tmp / "a.log", "epoll").start()
         b = run.Server(ctx, tmp / "b", tmp / "b.log", "epoll").start()
         try:
@@ -112,7 +112,7 @@ def test_ports():
             from pathlib import Path
             sys.path.insert(0, %r)
             import run
-            ctx = types.SimpleNamespace(tsdbd=%r)
+            ctx = types.SimpleNamespace(tsdbd=%r, auth=False)
             try:
                 run.Server(ctx, Path(%r) / "db", Path(%r) / "x.log", "epoll").start()
                 print("result accepted")
