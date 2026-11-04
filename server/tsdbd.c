@@ -2907,10 +2907,11 @@ int main(int argc, char **argv)
         return 1;
     }
     fs_warn(db, o.verify_checksums);
-    fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s, %s\n", dir,
+    /* io stays last: scripts read it from the end of this line (bench-tsdb.sh, test_stability) */
+    fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, %s, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
-            max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll",
-            no_auth ? "no login (--no-auth)" : "login required");
+            max_conns, no_auth ? "no login (--no-auth)" : "login required", tsdb_simd_level(),
+            io == IO_URING ? "io_uring" : "epoll");
     if (port_file && write_port_file(port_file, port, metrics_on ? metrics_port : 0) != 0) { /* last: whoever reads it finds a server that serves */
         fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
         return 1;

@@ -306,7 +306,7 @@ Oslo day 2: 120 rows, average 47.47
 Step 6 writes this line to `/tmp/tsdb-qs/tsdbd.log` (the details differ on your machine):
 
 ```
-tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, simd avx512, io io_uring
+tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, no login (--no-auth), simd avx512, io io_uring
 ```
 
 Step 8 prints a table with `rows 1440`: what the client wrote is on disk in the server's directory.

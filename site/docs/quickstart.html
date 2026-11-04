@@ -94,7 +94,7 @@ read 1440 rows, the first: 1717200000000 50.00
 Oslo day 1: 1320 rows, average 50.23
 Oslo day 2: 120 rows, average 47.47</code></pre>
 <p>Step 6 writes a line like this to <code>/tmp/tsdb-qs/tsdbd.log</code>:</p>
-<pre><code data-lang="plain" data-block="3" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, simd avx512, io io_uring</code></pre>
+<pre><code data-lang="plain" data-block="3" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, no login (--no-auth), simd avx512, io io_uring</code></pre>
 <p>Step 8 prints a table with <code>rows 1440</code>: what the client wrote is on disk in the server's directory.</p>
 
 <h2 id="trouble">If something goes wrong</h2>

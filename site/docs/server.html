@@ -35,7 +35,7 @@ it. It runs one event loop (io_uring, or epoll where io_uring is off) and a pool
 127.0.0.1, port 7070. The directory is created if it is missing. To listen on another address, add
 <code>--listen ADDR</code>; tsdbd has no login, so listen on a trusted network only.</p>
 <p>When it serves, it prints one line, for example:</p>
-<pre><code data-lang="plain" data-block="3" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, simd avx512, io io_uring</code></pre>
+<pre><code data-lang="plain" data-block="3" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, no login (--no-auth), simd avx512, io io_uring</code></pre>
 <p>Stop it with <code>kill PID</code> (SIGTERM). It finishes its writes first. To run it as a service, use the
 systemd unit of the <a href="install.html#tarball">portable tarball</a>.</p>
 
