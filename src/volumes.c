@@ -104,6 +104,8 @@ struct tsdb {
     const char **names_held;
     size_t nheld, held_cap;
     atomic_bool dup_logged; /* a name found in two volumes (damage, or a hand-made copy) is reported once */
+    void (*wait_fn)(void *ctx, int delta); /* tsdb_set_write_wait_hook (lock), copied to every volume */
+    void *wait_ctx;
 };
 
 /* ---------------------------------------------------------------- helpers */
@@ -708,6 +710,8 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
     listed = false;
     pthread_rwlock_wrlock(&t->lock);
     if (rc == 0 && t->nvols == index && (rc = vols_grow(t)) == 0) {
+        e->wait_fn = t->wait_fn; /* before anyone can write to it */
+        e->wait_ctx = t->wait_ctx;
         t->vols[t->nvols] = e;
         t->paths[t->nvols] = p;
         t->nvols++;
@@ -1374,6 +1378,31 @@ void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg)
         t->vols[i]->test_precommit_arg = arg;
         t->vols[i]->test_precommit = fn;
     }
+}
+
+uint64_t tsdb_test_fence_wakeups(tsdb *t)
+{
+    uint64_t n = 0;
+    pthread_rwlock_rdlock(&t->lock);
+    for (size_t i = 0; i < t->nvols; i++) {
+        pthread_mutex_lock(&t->vols[i]->buf_lock);
+        n += t->vols[i]->lw_wakeups;
+        pthread_mutex_unlock(&t->vols[i]->buf_lock);
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return n;
+}
+
+void tsdb_set_write_wait_hook(tsdb *t, void (*on_wait)(void *ctx, int delta), void *ctx)
+{
+    pthread_rwlock_wrlock(&t->lock); /* volume_open copies it under the same lock as it lists a volume */
+    t->wait_fn = on_wait;
+    t->wait_ctx = ctx;
+    for (size_t i = 0; i < t->nvols; i++) {
+        t->vols[i]->wait_fn = on_wait;
+        t->vols[i]->wait_ctx = ctx;
+    }
+    pthread_rwlock_unlock(&t->lock);
 }
 
 /* Test hook on the series and state dictionaries of every open volume (series_dict.test_fault). */

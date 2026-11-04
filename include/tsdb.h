@@ -704,6 +704,16 @@ typedef struct tsdb_volume_stats {
 } tsdb_volume_stats;
 int tsdb_get_volume_stats(tsdb *db, uint32_t volume, tsdb_volume_stats *st);
 
+/* A small write (one that goes through the WAL) into the keys of a large insert, replace or delete that has not
+ * published its parts yet waits for that publish, so it does not win over a write that came before it. For as long
+ * as that can take (seconds for a very large insert), the calling thread is blocked, and the large write's thread
+ * holds it up. The hook counts such threads, so a server with a fixed set of request threads can start another
+ * meanwhile (tsdbd does): on_wait(ctx, +1) before a write blocks and on_wait(ctx, -1) once it goes on, both in its
+ * thread; and once per large write that holds up another, +1 (from the first waiting thread) and -1 (from the large
+ * write's thread, after its publish). The hook must not block or call the database. Set it once, before the first
+ * write; NULL: none. Volumes added later get it too. */
+void tsdb_set_write_wait_hook(tsdb *db, void (*on_wait)(void *ctx, int delta), void *ctx);
+
 /* Fail-stop. A storage error after which it is unknown what reached the disk
  * (a failed WAL write or fsync, a failed fsync of the directory after new
  * parts were named, a failed MANIFEST, series or state dictionary or a volume's META

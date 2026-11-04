@@ -317,6 +317,26 @@ static void worker_waits(int delta)
     pthread_mutex_unlock(&work_lock);
 }
 
+/* A small write waiting for a large write's publish (tsdb_set_write_wait_hook) holds its worker as long as that
+ * insert takes, and the large write's worker does not come free before then either: both count as waiting, so
+ * connections writing into its keys do not take every worker from queries and other writes. */
+static void write_on_wait(void *ctx, int delta)
+{
+    (void)ctx;
+    worker_waits(delta);
+}
+
+/* Tests (TSDBD_TEST_HOLD_LARGE_MS): every large insert, replace and delete sleeps that long after writing its parts,
+ * before it publishes them, so a test can write into its keys while it is in flight. */
+void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg); /* the library's test hook (src/internal.h) */
+static int hold_large_ms;
+static void hold_large(void *arg)
+{
+    (void)arg;
+    struct timespec d = {hold_large_ms / 1000, (long)(hold_large_ms % 1000) * 1000000};
+    nanosleep(&d, NULL);
+}
+
 /* events from workers to the main thread */
 typedef struct note {
     conn *c;
@@ -2550,6 +2570,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: %s: %s\n", dir, tsdb_strerror(rc));
         return 1;
     }
+    tsdb_set_write_wait_hook(db, write_on_wait, NULL); /* before the workers start */
+    if (getenv("TSDBD_TEST_HOLD_LARGE_MS") && (hold_large_ms = atoi(getenv("TSDBD_TEST_HOLD_LARGE_MS"))) > 0)
+        tsdb_test_precommit(db, hold_large, NULL);
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
         rl.rlim_cur = rl.rlim_max; /* one descriptor per connection */

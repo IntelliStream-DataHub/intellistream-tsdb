@@ -563,7 +563,9 @@ int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t cs, const int64_
         f->series = cs, f->lo = lo, f->hi = hi;
         return 0;
     }
-    int64_t *r = malloc(LW_LANES * 2 * LW_BUCKETS * sizeof *r); /* per lane and bucket: lo, hi */
+    /* per lane and bucket: lo, hi; the thread's grow-only buffer (a malloc of 256 KB is an mmap and 64 page faults
+     * per insert) */
+    int64_t *r = eng_insert_scratch(3, LW_LANES * 2 * LW_BUCKETS * sizeof *r);
     if (!r)
         return TSDB_ERR_NOMEM;
     for (size_t b = 0; b < LW_LANES * LW_BUCKETS; b++)
@@ -609,10 +611,8 @@ int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t cs, const int64_
         hi = MAX(hi, r[2 * b + 1]);
     }
     f->lo = lo, f->hi = hi, f->series = s0;
-    if (diff == 0) { /* one series */
-        free(r);
+    if (diff == 0) /* one series */
         return 0;
-    }
     f->nb = LW_BUCKETS;
     f->r = r;
     return 0;
@@ -629,6 +629,7 @@ void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end)
 bool lw_enter(eng *db, lw_fence *f)
 {
     pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
+    pthread_cond_init(&f->cv, NULL);
     pthread_mutex_lock(&db->buf_lock);
     f->next = db->lw_head;
     db->lw_head = f;
@@ -646,34 +647,66 @@ void lw_leave(eng *db, lw_fence *f)
             *p = f->next;
             break;
         }
-    pthread_cond_broadcast(&db->lw_cv);
+    pthread_cond_broadcast(&f->cv); /* only the writes this fence held; they look at the others again */
+    bool held = f->held;
     pthread_mutex_unlock(&db->buf_lock);
-    free(f->r);
+    if (held) /* this thread no longer holds up anyone */
+        db->wait_fn(db->wait_ctx, -1);
+    /* waits until the woken waiters are out of the cv (glibc), so the caller may free f; f->r stays the thread's */
+    pthread_cond_destroy(&f->cv);
     f->r = NULL;
 }
 
-/* whether a row of the batch falls inside a registered fence; buf_lock held */
-static bool lw_overlaps(const eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, size_t n)
+/* the first registered fence a row of the batch falls inside, else NULL; buf_lock held */
+static lw_fence *lw_overlaps(const eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, size_t n)
 {
-    for (const lw_fence *f = db->lw_head; f; f = f->next)
-        for (size_t i = 0; i < n; i++) {
-            if (ts[i] < f->lo || ts[i] > f->hi)
-                continue;
-            uint32_t s = series ? series[i] : cs;
-            if (f->nb == 0 ? s == f->series : ts[i] >= f->r[2 * (s % f->nb)] && ts[i] <= f->r[2 * (s % f->nb) + 1])
-                return true;
+    for (lw_fence *f = db->lw_head; f; f = f->next) {
+        const int64_t lo = f->lo, hi = f->hi, *r = f->r;
+        if (f->nb == 0) {
+            for (size_t i = 0; i < n; i++)
+                if (ts[i] >= lo && ts[i] <= hi && (series ? series[i] : cs) == f->series)
+                    return f;
+            continue;
         }
-    return false;
+        for (size_t i = 0; i < n; i++) {
+            if (ts[i] < lo || ts[i] > hi)
+                continue;
+            const int64_t *q = r + 2 * ((series ? series[i] : cs) & (LW_BUCKETS - 1));
+            if (ts[i] >= q[0] && ts[i] <= q[1])
+                return f;
+        }
+    }
+    return NULL;
 }
 
 int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n)
 {
     pthread_mutex_lock(&db->buf_lock);
     /* after the large write's publish this batch is the newer one, and wins as a memtable row (lw_fence) */
-    while (db->lw_head && lw_overlaps(db, series, cs, ts, n))
-        pthread_cond_wait(&db->lw_cv, &db->buf_lock);
-    int rc = db->bg_error;
-    db->bg_error = 0;
+    bool announced = false;
+    for (lw_fence *f; db->lw_head && (f = lw_overlaps(db, series, cs, ts, n)) != NULL;) {
+        if (db->wait_fn && (!announced || !f->held)) {
+            /* This thread is held, and so, for the server, is the large write's: it frees its thread only after
+             * its publish, however long the write takes. Counted once per large write, given back by its
+             * lw_leave. Not under buf_lock: tsdbd may start a thread. */
+            int d = !announced + !f->held;
+            announced = f->held = true;
+            pthread_mutex_unlock(&db->buf_lock);
+            for (int k = 0; k < d; k++)
+                db->wait_fn(db->wait_ctx, 1);
+            pthread_mutex_lock(&db->buf_lock);
+            continue; /* f may have left meanwhile */
+        }
+        pthread_cond_wait(&f->cv, &db->buf_lock);
+        db->lw_wakeups++;
+    }
+    /* A failure while this write waited (the large write's own publish, say) must refuse it: in async WAL mode
+     * nothing after this point checks, and the write would be acknowledged by a failed engine. */
+    int rc = eng_check(db);
+    if (rc == 0) {
+        rc = db->bg_error;
+        db->bg_error = 0;
+    }
     if (rc == 0 && db->wal_enabled)
         rc = wal_buffer(db, series, cs, ts, v, w, n); /* first: it can fail without side effects */
     if (rc == 0)
@@ -684,6 +717,8 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     if (rows >= db->opt.buffer_rows)
         pthread_cond_signal(&db->flush_cv);
     pthread_mutex_unlock(&db->buf_lock);
+    if (announced)
+        db->wait_fn(db->wait_ctx, -1);
     if (rc == 0 && db->wal_enabled && db->opt.wal_sync_ms == 0)
         rc = wal_commit(db, lsn);
     /* backpressure when the flusher falls behind */

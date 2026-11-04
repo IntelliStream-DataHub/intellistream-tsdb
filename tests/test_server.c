@@ -2296,6 +2296,103 @@ static int64_t main_port_worst_us(tsdbc *c, tsdb_sid id, int n)
     return worst;
 }
 
+/* A small write into the keys of a large write that has not published yet waits for its publish (lw_fence) and
+ * holds its worker meanwhile, and the large write's worker is busy until then too. tsdbd counts both as waiting
+ * (tsdb_set_write_wait_hook) and starts extra workers, so connections writing into those keys do not stop the server
+ * for a query on another connection. Before, with --workers 2, the large write and one waiting small write held
+ * both workers and the query waited for the publish. TSDBD_TEST_HOLD_LARGE_MS keeps the large write in flight. */
+enum { FW_SMALL = 3, FW_HOLD_MS = 2000 };
+typedef struct {
+    tsdb_sid s;
+    int64_t ts;
+    int rc;
+    int64_t us;
+} fw_write;
+
+static void *fw_small_main(void *arg)
+{
+    fw_write *w = arg;
+    tsdbc *c = NULL;
+    w->rc = tsdbc_connect("127.0.0.1", port, &c);
+    float v = 7;
+    int64_t t = mono_us();
+    if (w->rc == 0)
+        w->rc = tsdbc_insert_series(c, w->s, &w->ts, &v, 1);
+    w->us = mono_us() - t;
+    if (c)
+        tsdbc_close(c);
+    return NULL;
+}
+
+static void test_fence_workers(const char *dir)
+{
+    char cmd[700];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    CHECK(system(cmd) == 0);
+    char hold[16];
+    snprintf(hold, sizeof hold, "%d", FW_HOLD_MS);
+    setenv("TSDBD_TEST_HOLD_LARGE_MS", hold, 1);
+    static const char *const args[] = {"--wal-max-batch-rows", "360", "--workers", "2", NULL};
+    pid_t srv = start_server_with(dir, args);
+    unsetenv("TSDBD_TEST_HOLD_LARGE_MS");
+    tsdbc *l, *q;
+    OK(tsdbc_connect("127.0.0.1", port, &l));
+    OK(tsdbc_connect("127.0.0.1", port, &q));
+    tsdb_sid a, b;
+    OK(tsdbc_series(l, "fence_a", 1, &a));
+    OK(tsdbc_series(l, "fence_b", 1, &b));
+    int64_t tb = T0;
+    float one = 1;
+    OK(tsdbc_insert_series(q, b, &tb, &one, 1));
+    enum { NL = 1000 }; /* large: at least --wal-max-batch-rows */
+    static int64_t ts[NL];
+    static float v[NL];
+    for (int i = 0; i < NL; i++)
+        ts[i] = T0 + i, v[i] = 1;
+    int64_t began = mono_us();
+    OK(tsdbc_insert_series_async(l, a, ts, v, NL));
+    usleep(300000); /* the large write is in its hold */
+    fw_write w[FW_SMALL];
+    pthread_t th[FW_SMALL];
+    for (int i = 0; i < FW_SMALL; i++) {
+        w[i] = (fw_write){a, T0 + 500, -1, 0};
+        CHECK(pthread_create(&th[i], NULL, fw_small_main, &w[i]) == 0);
+    }
+    usleep(300000); /* they wait for it, on every worker the server started with and more */
+    int64_t t = mono_us();
+    tsdb_points p = {0};
+    int rc = tsdbc_query_points(q, b, T0, T0 + 1, &p);
+    int64_t query_us = mono_us() - t, query_at = mono_us() - began;
+    CHECK(rc == 0 && p.n == 1);
+    tsdb_points_free(&p);
+    OK(tsdbc_wait(l));
+    int64_t large_us = mono_us() - began;
+    for (int i = 0; i < FW_SMALL; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(w[i].rc == 0);
+    }
+    /* the query answered while the large write was still in flight, and the small writes waited for it */
+    if (query_at >= large_us || query_us > 500000 || large_us < FW_HOLD_MS * 1000) {
+        fprintf(stderr, "fence: query took %.3f s, answered at %.3f s; the large write took %.3f s\n", query_us / 1e6,
+                query_at / 1e6, large_us / 1e6);
+        failures++;
+    }
+    for (int i = 0; i < FW_SMALL; i++)
+        if (w[i].us < (FW_HOLD_MS - 800) * 1000) {
+            fprintf(stderr, "fence: small write %d took %.3f s, did not wait for the large write\n", i, w[i].us / 1e6);
+            failures++;
+        }
+    /* the small writes came after the large one and win */
+    OK(tsdbc_query_points(q, a, T0 + 500, T0 + 501, &p));
+    CHECK(p.n == 1 && p.values[0] == 7);
+    tsdb_points_free(&p);
+    tsdbc_close(l);
+    tsdbc_close(q);
+    stop_server(srv);
+    if (!failures)
+        CHECK(system(cmd) == 0);
+}
+
 static void test_metrics_buckets(void)
 {
     CHECK(metrics_bucket_for(0) == 0 && metrics_bucket_for(0.0004) == 0 && metrics_bucket_for(0.0005) == 0);
@@ -3395,6 +3492,9 @@ int main(int argc, char **argv)
     printf("fail-stop after a WAL write error\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-failstop-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_wal_failstop(dir);
+    printf("small writes waiting for a large write leave workers for queries\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-fence-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_fence_workers(dir);
     printf("prometheus metrics\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-metrics-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_metrics(dir);

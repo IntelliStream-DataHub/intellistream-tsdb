@@ -163,7 +163,11 @@ disk format and the wire protocol.
   the large write is published (only one whose rows fall inside the large write's keys: a timestamp range per
   bucket of series), and wins as the newer write. `make jepsen` checks this with a fifth rule: a write acknowledged
   before a read saw another write not yet in effect is older than it, although the two overlap in time; the old
-  server failed it in every 20-second run.
+  server failed it in every 20-second run. The wait lasts as long as the large write (seconds for hundreds of
+  millions of rows), and while overlapping large writes follow each other without a gap, a small write into their
+  keys waits for all of them. A write that waited is refused when the engine failed meanwhile. tsdbd counts such a
+  waiting request and the large write it waits for as waiting workers and starts extra ones, so queries and other
+  writes keep being answered; embedded servers can do the same with the new `tsdb_set_write_wait_hook`.
 - Large inserts (8 million rows or more per call) faulted their memory in again on every call since the 64-bit series
   ids: `tsdb_insert` narrowed the ids into a fresh allocation per batch, which glibc serves from a new mmap above
   32 MB (4 bytes per row; a batch spanning volumes, 16). They now go to the inserting thread's grow-only buffers, as

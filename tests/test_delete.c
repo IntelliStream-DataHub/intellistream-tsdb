@@ -1171,6 +1171,82 @@ static void test_lww_realtime(void)
     }
 }
 
+/* A large write that publishes wakes only the small writes its own fence held: a small write waiting for large
+ * write A sleeps through the publish of B on another series. With one condition variable for every fence, each
+ * publish woke every waiter, which scanned its rows against every fence again under buf_lock. */
+typedef struct {
+    tsdb *db;
+    tsdb_sid a, b;
+    int calls;
+    lww_write small;
+    int small_early, small_after_b, rc_b;
+    uint64_t wakeups_after_b;
+} lww_two;
+
+static int lww_large(tsdb *db, tsdb_sid s)
+{
+    int64_t ts[300], v[300];
+    for (int i = 0; i < 300; i++)
+        ts[i] = i * 20, v[i] = LWW_NEW;
+    tsdb_values col = {TSDB_INT64, v, NULL};
+    return tsdb_insert_series_values(db, s, ts, &col, 300); /* large: 300 >= wal_max_batch_rows */
+}
+
+static void *lww_large_b(void *arg)
+{
+    lww_two *x = arg;
+    x->rc_b = lww_large(x->db, x->b);
+    return NULL;
+}
+
+static void lww_two_window(void *arg)
+{
+    lww_two *x = arg;
+    if (__atomic_fetch_add(&x->calls, 1, __ATOMIC_SEQ_CST) != 0)
+        return; /* B's: it publishes at once */
+    lww_start(&x->small, x->db, x->a, LWW_K, LWW_SMALL);
+    x->small_early = lww_wait(&x->small, 300);
+    pthread_t th;
+    if (pthread_create(&th, NULL, lww_large_b, x) != 0) {
+        fprintf(stderr, "pthread_create\n");
+        exit(1);
+    }
+    pthread_join(th, NULL);
+    x->small_after_b = lww_wait(&x->small, 100);
+    x->wakeups_after_b = tsdb_test_fence_wakeups(x->db);
+}
+
+static void test_lww_wakeups(void)
+{
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/tsdb_delete_lww_two", scratch);
+    rmrf(dir);
+    tsdb_options opt = test_opts();
+    opt.partition_classes = 0; /* B classifies nothing while A holds the class history frozen */
+    tsdb *db;
+    OK(tsdb_open(dir, &opt, &db));
+    lww_two x;
+    memset(&x, 0, sizeof x);
+    x.db = db;
+    OK(tsdb_series_create(db, "a", TSDB_INT64, NULL, &x.a));
+    OK(tsdb_series_create(db, "b", TSDB_INT64, NULL, &x.b));
+    tsdb_test_precommit(db, lww_two_window, &x);
+    OK(lww_large(db, x.a));
+    tsdb_test_precommit(db, NULL, NULL);
+    OK(lww_join(&x.small));
+    OK(x.rc_b);
+    if (x.small_early || x.small_after_b || x.wakeups_after_b != 0) {
+        fprintf(stderr, "lww wake-ups: the small write %s; it woke %" PRIu64 " times before A published\n",
+                x.small_early || x.small_after_b ? "did not wait for A" : "waited for A", x.wakeups_after_b);
+        failures++;
+    }
+    if (lww_read(db, x.a, LWW_K) != LWW_SMALL || lww_read(db, x.b, LWW_K) != LWW_NEW) {
+        fprintf(stderr, "lww wake-ups: wrong values after both large writes\n");
+        failures++;
+    }
+    OK(tsdb_close(db));
+}
+
 int main(int argc, char **argv)
 {
     /* a directory of this run's own: the fixed names below collided between worktrees testing at once */
@@ -1184,6 +1260,7 @@ int main(int argc, char **argv)
     scratch = own;
     int rounds = getenv("TSDB_DELETE_ROUNDS") ? atoi(getenv("TSDB_DELETE_ROUNDS")) : 6;
     test_lww_realtime();
+    test_lww_wakeups();
     test_stats();
     test_wal_replay();
     test_follower();

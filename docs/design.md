@@ -685,6 +685,20 @@ than every part), so a delete needs no ordering of its own:
   delete, although acknowledged before the delete took effect); large inserts
   and replaces hold small writes to their keys the same way (`lw_fence`,
   internal.h). Small writes elsewhere do not wait.
+  The limits of that wait: it lasts until the large write is published, which
+  for hundreds of millions of rows (or on a slow NFS server) is seconds, and the
+  fence is coarse (a timestamp range per bucket of 4096 series buckets), so one
+  far row in a large write can hold small writes to other series of its bucket
+  for that long. Large writes never wait for small ones: while overlapping large
+  writes follow each other without a gap, a small write into their keys waits
+  for all of them. A ticket order (pass the fences that came after the write
+  began waiting) would bring the anomaly back, since such a fence has flushed
+  the memtable already; only a large write that flushes again just before its
+  publish could be fair, and the class history it holds frozen from placement
+  to listing rules out a flush there. A write that waited checks the engine's
+  fail-stop state before it appends. tsdbd counts a waiting request and the
+  large write that holds it as waiting workers (`tsdb_set_write_wait_hook`), so
+  it starts extra workers and keeps answering other requests.
 - A replace is the tombstone parts plus the new rows' parts in one
   `parts_commit`, tombstones first (lower blocks): one intent, so a reader or a
   crash sees the old rows or the new ones. Rows outside `[start, end)` are

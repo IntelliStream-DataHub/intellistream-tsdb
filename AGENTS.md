@@ -120,9 +120,16 @@ cgroup, so `nice` does not keep your work out of its way.
   parts, a large insert, replace or delete registers its keys (`lw_fence`: a
   timestamp range per bucket of series) with `lw_enter` in the step that decides
   whether to flush the memtable, and leaves (`lw_leave`) as soon as its parts are
-  published or failed; `mem_insert` waits on `lw_cv` while a row of its batch is
-  inside a registered fence. Otherwise a small write acknowledged before the
-  large write was visible would win over it (jepsen check 5; `test_lww_realtime`).
+  published or failed; `mem_insert` waits on the cv of a fence that a row of its
+  batch is inside, then checks `eng_check` before it appends (the large write's
+  own publish may have failed the engine; `test_failstop`). Otherwise a small
+  write acknowledged before the large write was visible would win over it
+  (jepsen check 5; `test_lww_realtime`). The wait is reported through
+  `tsdb_set_write_wait_hook` (the waiter, and once the large write's thread), so
+  tsdbd starts extra workers (`test_fence_workers` in test_server). Never let a
+  small write pass a fence registered after it began waiting: that fence's flush
+  has run, and the anomaly is back (no ticket order; a stream of overlapping
+  large writes can delay a small write as long as it lasts).
 - **Merges** only combine adjacent block ranges within a partition. On equal
   keys the newest source wins.
 - **Range tombstones** (deletes, replaces) live only in parts, never in the WAL
@@ -248,7 +255,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `partition_classes = 0`.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
-  is a leaf. A small write waiting for a large write's publish (`lw_cv`, on `buf_lock`) holds no other lock and has
+  is a leaf. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
   not yet appended anything, so nothing a registered large write waits for (a flush, the WAL writer role,
   `publish_lock`, `cls_rw`) waits for it. Series creation (`volumes.c`): a reserved name (`name_reserve`; its `name_mu` is a leaf) >
   `create_lock` (only around `volume_resolve` and volume adds) or, in a follower, `layout_lock` (only around the

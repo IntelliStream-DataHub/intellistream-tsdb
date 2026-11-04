@@ -21,8 +21,9 @@
 
 /* Grow-only per-thread buffers for sorting, so steady inserts do not fault
  * in fresh pages every batch. Freed when the thread exits. SCR_IN_* are the
- * caller's (eng_insert_scratch) and never touched inside eng_insert. */
-enum { SCR_A, SCR_B, SCR_S, SCR_T, SCR_V, SCR_CNT, SCR_IN_S, SCR_IN_T, SCR_IN_V, SCR_N };
+ * caller's (eng_insert_scratch) and never touched inside eng_insert; SCR_FENCE
+ * is the table of lw_fence_rows, held by a large write until its lw_leave. */
+enum { SCR_A, SCR_B, SCR_S, SCR_T, SCR_V, SCR_CNT, SCR_IN_S, SCR_IN_T, SCR_IN_V, SCR_FENCE, SCR_N };
 typedef struct scratch {
     void *p[SCR_N];
     size_t cap[SCR_N];
@@ -62,7 +63,7 @@ static void *scratch_get(int slot, size_t bytes)
 
 void *eng_insert_scratch(int which, size_t bytes)
 {
-    return which >= 0 && which < 3 ? scratch_get(SCR_IN_S + which, bytes ? bytes : 1) : NULL;
+    return which >= 0 && which < 4 ? scratch_get(SCR_IN_S + which, bytes ? bytes : 1) : NULL;
 }
 
 typedef struct rec {

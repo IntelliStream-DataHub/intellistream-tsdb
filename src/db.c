@@ -581,7 +581,6 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_cond_init(&db->merge_cv, NULL);
     pthread_cond_init(&db->merged_cv, NULL);
     pthread_cond_init(&db->flush_cv, NULL);
-    pthread_cond_init(&db->lw_cv, NULL);
 
     int rc;
     db->dir = strdup(dir);
@@ -758,7 +757,6 @@ int eng_close(eng *db)
     pthread_cond_destroy(&db->merge_cv);
     pthread_cond_destroy(&db->merged_cv);
     pthread_cond_destroy(&db->flush_cv);
-    pthread_cond_destroy(&db->lw_cv);
     free(db->dir);
     free(db);
     return rc;
@@ -898,10 +896,8 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
     }
     /* small writes to these keys wait from here until the parts are published (lw_fence) */
     lw_fence f;
-    if ((rc = lw_fence_rows(&f, series, cs, ts, n)) != 0) {
-        free(f.r);
+    if ((rc = lw_fence_rows(&f, series, cs, ts, n)) != 0)
         return rc;
-    }
     rc = lw_enter(db, &f) ? mt_flush(db) : 0;
     if (rc == 0 && ucls == -2) { /* fresh series: their class comes from these rows */
         rc = cls_classify_insert(db, series, cs, ts, n);

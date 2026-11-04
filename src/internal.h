@@ -1297,7 +1297,11 @@ struct eng {
     pthread_mutex_t buf_lock;      /* active memtable and pending WAL bytes */
     pthread_cond_t flush_cv;
     struct lw_fence *lw_head;      /* large writes between their memtable flush and their publish (buf_lock) */
-    pthread_cond_t lw_cv;          /* one of them left (buf_lock) */
+    uint64_t lw_wakeups;           /* wake-ups of small writes waiting for one (buf_lock; tests) */
+    /* tsdb_set_write_wait_hook: around a small write's wait for a fence, so a server with a fixed set of threads
+     * starts another (set before the first write, never changed) */
+    void (*wait_fn)(void *ctx, int delta);
+    void *wait_ctx;
     memtable *active;
     memtable *flushing[MAX_FLUSHING]; /* oldest first; guarded by db->lock */
     size_t nflushing;
@@ -1435,14 +1439,19 @@ int insert_rows(struct eng *db, int type, const uint32_t *series, uint32_t const
  * holding no lock and before it appends anything, while one of its rows falls inside a registered fence, so
  * nothing the large write waits for (a flush, the WAL writer role, publish_lock) can wait for it. Rows that wait
  * reach the WAL after the publish, so a replay ranks them above the large write as well. A false overlap (another
- * series in the same bucket) only delays a write. */
-#define LW_BUCKETS 4096
+ * series in the same bucket) only delays a write. A waiter sleeps on the cv of a fence it overlaps, so a large
+ * write that leaves wakes only the writes it held. Large writes never wait for small ones: while overlapping large
+ * writes follow each other without a gap, a small write into their keys waits for all of them (no ticket order:
+ * passing a fence that came later, whose memtable flush has run, would bring the anomaly back). */
+#define LW_BUCKETS 4096 /* a power of two: a row's bucket is a mask */
 typedef struct lw_fence {
     struct lw_fence *next;
     int64_t lo, hi;   /* every key's timestamp is in [lo, hi]; lo > hi: no keys */
     uint32_t series;  /* nb == 0: the one series */
-    uint32_t nb;      /* else LW_BUCKETS buckets of series (local id % nb), each with a range */
-    int64_t *r;       /* nb buckets: lo, hi */
+    uint32_t nb;      /* else LW_BUCKETS buckets of series (local id & (LW_BUCKETS - 1)), each with a range */
+    int64_t *r;       /* nb buckets: lo, hi; the thread's scratch (eng_insert_scratch), valid until lw_leave */
+    pthread_cond_t cv; /* from lw_enter to lw_leave: the writes waiting for this fence (buf_lock) */
+    bool held;         /* a waiter counted this large write's thread as held too (wait_fn; buf_lock) */
 } lw_fence;
 int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t const_series, const int64_t *ts, size_t n);
 void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end); /* [start, end) */
@@ -1469,7 +1478,8 @@ const char *eng_state_name(eng *db, uint32_t code);
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n);
 /* The calling thread's grow-only buffer `which` (0, 1, 2) of at least `bytes`, for a caller that rearranges a batch
  * before eng_insert (the volume split, narrowed ids): a fresh malloc per batch of 8M rows or more is an mmap whose
- * pages fault in again every time, on every thread at once. Contents are lost when it grows; NULL on failure. */
+ * pages fault in again every time, on every thread at once. Contents are lost when it grows; NULL on failure.
+ * 3: the fence table of lw_fence_rows (256 KB, above glibc's mmap threshold), inside eng_insert. */
 void *eng_insert_scratch(int which, size_t bytes);
 int eng_insert_series(eng *db, int type, uint32_t series, const int64_t *ts, const void *v, size_t n);
 int eng_commit(eng *db);
@@ -1642,6 +1652,8 @@ int tsdb_test_class_switch(struct tsdb *t, tsdb_sid series, int cls, const int64
 static inline bool sid_malformed(tsdb_sid id) { return (id >> 48) != 0 || (id >> 32) == 0; }
 /* test hook: fn(arg) runs in every large insert, replace and delete after its parts were written, before it commits */
 void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
+/* test: how often small writes waiting for a large write's publish woke up, over every open volume (lw_wakeups) */
+uint64_t tsdb_test_fence_wakeups(struct tsdb *t);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
 /* test hook: the WAL tail kept for switches, and how far segments are unlinked (durably) */
