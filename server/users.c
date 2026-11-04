@@ -214,38 +214,136 @@ uint8_t rights_parse(const char *text)
     }
 }
 
-/* Greedy, backtracking only to the last '*': no recursion, no allocation, at most glen x len steps (A24). */
+/* A glob compiled for a bit-parallel run (A24). Its tokens are a byte, '?' or '*' (a run of '*' is one); bit j of
+ * the state says the name read so far can end where token j starts, bit ntok that it matches all of the glob. A
+ * byte moves every live bit over a token that takes it (that byte or '?') one place on and keeps every live bit at
+ * a '*'; a live '*' also makes the token after it live (it may match nothing). Each byte of the name thus costs
+ * the same few word operations whatever the glob's shape: linear in the name, where the greedy matcher this
+ * replaces backtracked to the last '*' (64 globs of 256 bytes against one name of 32767 bytes took 0.3 s). */
+#define GLOB_WORDS 5 /* GLOB_MAX tokens and the end */
+
+struct glob_prog {
+    uint16_t ntok;
+    uint8_t words;     /* ceil((ntok + 1) / 64), at most GLOB_WORDS */
+    bool last_star;    /* the last token is a '*': once it is live, every rest of the name matches */
+    uint16_t cls[256]; /* byte -> its row of m; 0: a byte no token names, which only '?' takes */
+    uint64_t star[GLOB_WORDS];
+    uint64_t m[];      /* rows of `words` words: the tokens that take the byte */
+};
+
+enum { T_BYTE, T_ANY, T_STAR };
+
+/* The tokens of g; SIZE_MAX when there are more than GLOB_WORDS words hold. */
+static size_t glob_tokens(const char *g, size_t gl, uint8_t *kind, uint8_t *byte)
+{
+    size_t n = 0;
+    for (size_t p = 0; p < gl; p++) {
+        uint8_t k = g[p] == '*' ? T_STAR : g[p] == '?' ? T_ANY : T_BYTE, c = (uint8_t)g[p];
+        if (k == T_STAR && n && kind[n - 1] == T_STAR)
+            continue;
+        if (g[p] == '\\' && p + 1 < gl) /* a lone '\' at the end is the byte itself (sel_normalize refuses it) */
+            c = (uint8_t)g[++p];
+        if (n == 64 * GLOB_WORDS - 1)
+            return SIZE_MAX;
+        kind[n] = k, byte[n] = c;
+        n++;
+    }
+    return n;
+}
+
+/* Compiles g into p (NULL: only sizes it). The bytes p needs, or 0 for a glob of too many tokens. */
+static size_t glob_compile(const char *g, size_t gl, struct glob_prog *p)
+{
+    uint8_t kind[64 * GLOB_WORDS], byte[64 * GLOB_WORDS];
+    uint16_t cls[256] = {0};
+    size_t n = glob_tokens(g, gl, kind, byte);
+    if (n == SIZE_MAX)
+        return 0;
+    size_t ncls = 1, words = (n + 1 + 63) / 64;
+    for (size_t j = 0; j < n; j++)
+        if (kind[j] == T_BYTE && !cls[byte[j]])
+            cls[byte[j]] = (uint16_t)ncls++;
+    size_t size = sizeof(struct glob_prog) + ncls * words * 8;
+    if (!p)
+        return size;
+    memset(p, 0, size);
+    p->ntok = (uint16_t)n, p->words = (uint8_t)words, p->last_star = n && kind[n - 1] == T_STAR;
+    memcpy(p->cls, cls, sizeof cls);
+    for (size_t j = 0; j < n; j++) {
+        uint64_t bit = 1ull << (j & 63);
+        if (kind[j] == T_STAR) {
+            p->star[j >> 6] |= bit;
+        } else if (kind[j] == T_ANY) {
+            for (size_t c = 0; c < ncls; c++)
+                p->m[c * words + (j >> 6)] |= bit;
+        } else {
+            p->m[cls[byte[j]] * words + (j >> 6)] |= bit;
+        }
+    }
+    return size;
+}
+
+/* w words of state; inlined for each w, so the word loops unroll and the state stays in registers */
+static inline __attribute__((always_inline)) bool glob_run_w(const struct glob_prog *p, const char *s, size_t sl,
+                                                             const size_t w)
+{
+    size_t end = p->ntok, last = end - 1; /* last: only read when last_star, so ntok > 0 */
+    uint64_t d[GLOB_WORDS] = {1}, st[GLOB_WORDS];
+    for (size_t k = 0; k < w; k++)
+        st[k] = p->star[k];
+    d[0] |= (d[0] & st[0]) << 1;
+    for (size_t i = 0; i < sl; i++) {
+        if (p->last_star && (d[last >> 6] >> (last & 63) & 1))
+            return true;
+        const uint64_t *row = &p->m[p->cls[(uint8_t)s[i]] * w];
+        uint64_t carry = 0, any = 0;
+        for (size_t k = 0; k < w; k++) {
+            uint64_t x = d[k] & row[k];
+            d[k] = (x << 1) | carry | (d[k] & st[k]);
+            carry = x >> 63;
+        }
+        carry = 0; /* a live '*' lets the token after it start too; never two '*' in a row, so one pass */
+        for (size_t k = 0; k < w; k++) {
+            uint64_t e = d[k] & st[k];
+            d[k] |= (e << 1) | carry;
+            carry = e >> 63;
+            any |= d[k];
+        }
+        if (!any)
+            return false;
+    }
+    return d[end >> 6] >> (end & 63) & 1;
+}
+
+static bool glob_run(const struct glob_prog *p, const char *s, size_t sl)
+{
+    switch (p->words) {
+    case 1: return glob_run_w(p, s, sl, 1); /* up to 63 tokens: the common case */
+    case 2: return glob_run_w(p, s, sl, 2);
+    case 3: return glob_run_w(p, s, sl, 3);
+    case 4: return glob_run_w(p, s, sl, 4);
+    default: return glob_run_w(p, s, sl, GLOB_WORDS);
+    }
+}
+
+/* No recursion, no allocation (the program lives on the stack: at most 257 rows); the name's length x
+ * ceil((tokens + 1) / 64) word steps. A glob of more tokens than GLOB_WORDS words hold matches nothing: none is ever
+ * stored (GLOB_MAX, A24). */
 bool glob_match(const char *g, size_t gl, const char *s, size_t sl)
 {
-    size_t p = 0, i = 0, star_p = SIZE_MAX, star_i = 0;
-    while (i < sl) {
-        if (p < gl) {
-            char c = g[p];
-            if (c == '*') {
-                star_p = ++p;
-                star_i = i;
-                continue;
-            }
-            if (c == '?') {
-                p++, i++;
-                continue;
-            }
-            size_t w = 1;
-            if (c == '\\' && p + 1 < gl)
-                c = g[p + 1], w = 2;
-            if (c == s[i]) {
-                p += w, i++;
-                continue;
-            }
-        }
-        if (star_p == SIZE_MAX)
-            return false;
-        p = star_p;
-        i = ++star_i;
-    }
-    while (p < gl && g[p] == '*')
-        p++;
-    return p == gl;
+    uint64_t buf[(sizeof(struct glob_prog) + 257 * GLOB_WORDS * 8) / 8 + 1];
+    struct glob_prog *p = (struct glob_prog *)buf;
+    size_t need = glob_compile(g, gl, NULL);
+    if (!need || need > sizeof buf)
+        return false;
+    glob_compile(g, gl, p);
+    return glob_run(p, s, sl);
+}
+
+/* A stored glob runs the program its grant was given (glob_parts). */
+static bool grant_glob(const user_grant *g, const char *s, size_t sl)
+{
+    return g->prog ? glob_run(g->prog, s, sl) : glob_match(g->sel, g->len, s, sl);
 }
 
 static bool starts_with(const char *s, size_t sl, const char *p, size_t pl) { return sl >= pl && memcmp(s, p, pl) == 0; }
@@ -256,7 +354,7 @@ bool grant_matches(const user_grant *g, const char *name, size_t len)
     case SEL_ALL: return true;
     case SEL_PREFIX: return starts_with(name, len, g->sel, g->len);
     case SEL_NAME: return len == g->len && memcmp(name, g->sel, len) == 0;
-    default: return glob_match(g->sel, g->len, name, len);
+    default: return grant_glob(g, name, len);
     }
 }
 
@@ -273,7 +371,7 @@ bool sel_inside(const user_grant *s, const user_grant *t)
         }
     case SEL_GLOB:
         if (s->kind == SEL_NAME)
-            return glob_match(t->sel, t->len, s->sel, s->len);
+            return grant_glob(t, s->sel, s->len);
         return s->kind == SEL_GLOB && s->len == t->len && memcmp(s->sel, t->sel, s->len) == 0;
     default: return s->kind == SEL_NAME && s->len == t->len && memcmp(s->sel, t->sel, s->len) == 0;
     }
@@ -458,12 +556,14 @@ uint8_t rights_of(user *u, const char *name, size_t len)
         for (int32_t gi = e->glob; gi >= 0; gi = m->gnext[gi]) {
             const user_grant *g = &u->g[gi];
             if ((r | g->rights) != r && len >= (size_t)g->lit_len + g->suf_len &&
-                memcmp(name + len - g->suf_len, g->suf, g->suf_len) == 0 && glob_match(g->sel, g->len, name, len))
+                memcmp(name + len - g->suf_len, g->suf, g->suf_len) == 0 && grant_glob(g, name, len))
                 r |= g->rights;
         }
     }
     return expand(r);
 }
+
+bool user_index_build(user *u) { return u->m || (u->m = umatch_build(u)); }
 
 /* x's index, built on first use; a cache, so it is built through a const user too (users are never const objects). */
 static const struct umatch *umatch_of(const user *x)
@@ -484,7 +584,7 @@ static bool admin_glob_matches(const user *x, const struct umatch *m, const char
         for (int32_t gi = e->glob; gi >= 0; gi = m->gnext[gi]) {
             const user_grant *g = &x->g[gi];
             if ((g->rights & R_ADMIN) && len >= (size_t)g->lit_len + g->suf_len &&
-                memcmp(name + len - g->suf_len, g->suf, g->suf_len) == 0 && glob_match(g->sel, g->len, name, len))
+                memcmp(name + len - g->suf_len, g->suf, g->suf_len) == 0 && grant_glob(g, name, len))
                 return true;
         }
     }
@@ -538,7 +638,7 @@ static bool names_under(const user *x, const char *name)
 
 static void grant_clear(user_grant *g)
 {
-    free(g->sel), free(g->lit), free(g->suf);
+    free(g->sel), free(g->lit), free(g->suf), free(g->prog);
     memset(g, 0, sizeof *g);
 }
 
@@ -554,13 +654,17 @@ static void user_free(user *u)
     free(u);
 }
 
-/* The unescaped literal prefix and suffix of a normalized glob. */
+/* The unescaped literal prefix and suffix of a normalized glob, and its program. */
 static int glob_parts(user_grant *g)
 {
+    size_t ps = glob_compile(g->sel, g->len, NULL);
     g->lit = malloc(g->len + 1);
     g->suf = malloc(g->len + 1);
-    if (!g->lit || !g->suf)
+    g->prog = ps ? malloc(ps) : NULL; /* none for a glob of too many tokens: it matches nothing either way */
+    if (!g->lit || !g->suf || (ps && !g->prog))
         return TSDB_ERR_NOMEM;
+    if (ps)
+        glob_compile(g->sel, g->len, g->prog);
     size_t nl = 0, ns = 0;
     bool wild = false;
     for (size_t i = 0; i < g->len; i++) {

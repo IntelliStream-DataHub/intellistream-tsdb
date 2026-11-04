@@ -453,6 +453,103 @@ static void globs(void)
     printf("  globs: the table of §9, 65,535-byte names, an adversarial pattern, 200,000 random ones\n");
 }
 
+static double ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (double)(t1.tv_sec - t0->tv_sec) * 1e3 + (double)(t1.tv_nsec - t0->tv_nsec) / 1e6;
+}
+
+/* The bit-parallel matcher on globs of one to five words (up to 300 tokens) against the recursive matcher, names
+ * made from the glob so that about half match; then review 2's worst case: 64 globs of A24's longest that pass
+ * the literal prefix and suffix filters, against the longest names (rights_of took 578 ms on 65,535 bytes with the
+ * backtracking matcher). */
+static void globs_linear(void)
+{
+    unsigned seed = 4242;
+    int matched = 0;
+    for (int i = 0; i < 20000; i++) {
+        char g[700], s[1400];
+        size_t gl = 0, sl = 0, ntok = 40 + (size_t)rand_r(&seed) % 261, stars = 0;
+        for (size_t t = 0; t < ntok; t++) {
+            unsigned r = (unsigned)rand_r(&seed) % 100;
+            if (r < 2 && stars < 2 && (!gl || g[gl - 1] != '*')) { /* the reference is polynomial in 2 stars */
+                g[gl++] = '*', stars++;
+                for (int k = rand_r(&seed) % 4; k > 0; k--)
+                    s[sl++] = "ab*"[rand_r(&seed) % 3];
+            } else if (r < 20) {
+                g[gl++] = '?';
+                s[sl++] = "ab?"[rand_r(&seed) % 3];
+            } else if (r < 23) {
+                g[gl++] = '\\', g[gl++] = '*';
+                s[sl++] = '*';
+            } else {
+                char c = "ab"[rand_r(&seed) % 2];
+                g[gl++] = c;
+                s[sl++] = c;
+            }
+        }
+        if (rand_r(&seed) % 2 && sl) /* one byte changed, dropped or added */
+            switch (rand_r(&seed) % 3) {
+            case 0: s[rand_r(&seed) % sl] ^= 3; break;
+            case 1: sl--; break;
+            default: s[sl++] = 'a'; break;
+            }
+        bool want = ref_match(g, gl, s, sl);
+        matched += want;
+        user_grant ng;
+        if (glob_match(g, gl, s, sl) != want || grant_init(&ng, SEL_GLOB, R_READ, g, gl) != 0 ||
+            grant_matches(&ng, s, sl) != want) {
+            fprintf(stderr, "  glob of %zu bytes on %zu bytes differs from the reference (want %d)\n", gl, sl, want);
+            failures++;
+            break;
+        }
+        grant_clear(&ng);
+    }
+    CHECK(matched > 5000 && matched < 15000);
+
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/globcost-%d", base_dir, (int)getpid());
+    CHECK(mkdir(dir, 0755) == 0);
+    users us;
+    OK(users_open(&us, dir, true));
+    user_verifier v = {.iterations = ITER_MIN, .salt_len = 16};
+    OK(users_create(&us, 0, "acme/g", 0, &v, NULL));
+    for (int i = 0; i < USER_GLOBS; i++) {
+        char g[300];
+        int n = snprintf(g, sizeof g, "acme/*");
+        memset(g + n, 'a', 240);
+        n += 240;
+        n += snprintf(g + n, sizeof g - (size_t)n, "c%02d*b", i); /* 251 bytes */
+        OK(users_grant(&us, 0, "acme/g", SEL_GLOB, g, (size_t)n, R_READ));
+    }
+    user *u = (user *)users_find(&us, "acme/g");
+    size_t len = 65535;
+    char *name = malloc(len);
+    memcpy(name, "acme/", 5);
+    memset(name + 5, 'a', len - 6);
+    name[len - 1] = 'b';
+    CHECK(user_index_build(u));
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CHECK(rights_of(u, name, len) == 0);
+    double ms = ms_since(&t0);
+    name[32766] = 'b';
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CHECK(rights_of(u, name, 32767) == 0);
+    double ms2 = ms_since(&t0);
+    memcpy(name + 1000, "c07", 3); /* and one that matches: glob 7 */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    CHECK(rights_of(u, name, 32767) == R_READ);
+    double ms3 = ms_since(&t0);
+    CHECK(ms < 150 && ms2 < 150 && ms3 < 150); /* the backtracking matcher took 578 ms on the first */
+    free(name);
+    users_close(&us);
+    cleanup(dir);
+    printf("  globs: 20,000 random globs of 40-300 tokens against the reference; 64 globs x a 65,535-byte name: %.1f "
+           "ms (32,767 bytes: %.1f ms, a match %.1f ms)\n", ms, ms2, ms3);
+}
+
 static void free_grant(user_grant *g) { grant_clear(g); }
 
 /* Every cell of §2's inside table, for and against. */
@@ -1813,6 +1910,7 @@ int main(int argc, char **argv)
     names();
     normalize();
     globs();
+    globs_linear();
     inside();
     escalation();
     matching();

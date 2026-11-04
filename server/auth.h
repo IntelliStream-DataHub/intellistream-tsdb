@@ -1,7 +1,7 @@
 /*
  * Login and access control in tsdbd (docs/design-auth.md §3 and §5): the table of what each op needs, SCRAM-SHA-256
- * on the server side, the users of USERS behind one mutex, and the rights map each logged-in user's connections
- * share. tsdbd.c calls auth_admit before every request and the auth_* checks where series ids are only known
+ * on the server side, the users of USERS (a snapshot for logins, so USERS I/O never holds them up), and the rights
+ * map each logged-in user's connections share. tsdbd.c calls auth_admit before every request and the auth_* checks where series ids are only known
  * inside a request (a row per series, QUERY_MULTI).
  */
 #ifndef TSDBD_AUTH_H
@@ -96,5 +96,12 @@ int auth_user_list(auth_conn *a, int (*emit)(void *ctx, bool last, uint32_t n, c
 /* Test hook: the server's part of the nonce, used as is when set (the RFC 7677 test and the fuzzer replay fixed
  * exchanges). Printable, no ',', under 64 bytes. */
 extern const char *auth_test_nonce;
+/* Test hooks: the HMACs computed by logins so far; called by auth_reload before it reads USERS (users_mu held). */
+extern atomic_uint auth_test_hmacs;
+extern void (*auth_test_reload_hook)(void);
+/* The bytes the rights maps of all users may hold together (auth_init: a sixteenth of the RAM unless set before),
+ * and what they hold. */
+extern size_t auth_map_budget;
+size_t auth_map_total(void);
 
 #endif

@@ -42,9 +42,11 @@ typedef struct user_grant {
     uint16_t lit_len;
     char *suf;       /* glob: the literal suffix (bytes after the last wildcard), unescaped */
     uint16_t suf_len;
+    struct glob_prog *prog; /* glob: compiled for glob_match's linear run (users.c) */
 } user_grant;
 
 struct umatch;
+struct glob_prog;
 
 typedef struct user {
     uint32_t uid; /* assigned at creation, never reused */
@@ -143,6 +145,9 @@ bool grant_matches(const user_grant *g, const char *name, size_t len);
  * admin implying read, insert and delete. Indexed (§2 "Matching"); rights_of_slow tries every grant. */
 uint8_t rights_of(user *u, const char *name, size_t len);
 uint8_t rights_of_slow(const user *u, const char *name, size_t len);
+/* Builds rights_of's index of u now (false: out of memory). A user that threads share gets it before it is shared:
+ * rights_of then only reads u, and needs no lock. */
+bool user_index_build(user *u);
 
 /* Selector s lies inside t (§2's table; both normalized). */
 bool sel_inside(const user_grant *s, const user_grant *t);

@@ -5,10 +5,15 @@
  * the op byte, so an op the table does not name (who == P_NONE) is refused, and a new op in TSDB_OPS without a row
  * is caught by tests/test_auth_ops.c, which walks the same list.
  *
- * Users. The `users` of USERS is not thread-safe (server/users.h): every call on it holds auth_mu, a leaf lock
- * (no engine lock is taken under it, and it is never held while a request waits for anything but USERS itself).
- * A logged-in user's connections share one auth_user: a private copy of the user (so a rights_of miss does not
- * touch the shared state), the rights on `all`, and the rights map by id. When USERS changes that user (an admin op
+ * Users. The `users` of USERS is not thread-safe (server/users.h): every call on it holds users_mu, which is held
+ * across USERS's I/O (the reload's open and read, an admin op's append and fdatasync), so on NFS it can be held for
+ * as long as a server is away. Logins and requests therefore never take it: after each change of `us` its holder
+ * publishes a snapshot (copies of the live users, by uid and by name, the mock key), and they read that under
+ * auth_mu, a leaf lock never held across I/O (users_mu > auth_mu; no engine lock is taken under either). A hung
+ * USERS then delays only admin ops and later reloads; logins, the rights checks and every data op go on.
+ * A logged-in user's connections share one auth_user: a private copy of the user with its rights_of index built
+ * before it is shared (so a name check reads it without a lock: one user's slow check cannot park the workers of
+ * its other requests), the rights on `all`, and the rights map by id. When USERS changes that user (an admin op
  * here, the CLI seen on the reload tick, a compaction), its auth_user is marked stale and leaves the registry; each
  * connection's next request sees the flag (one relaxed load), takes the user's new state or, if the user is gone,
  * is answered TSDB_ERR_AUTH and closed. A request already running finishes under the rights it started with.
@@ -17,8 +22,10 @@
  * local id: 0 not known yet, else 0x80 | the rights. Levels are calloc'd and published with a release CAS; bytes are
  * relaxed atomics (every writer of a byte stores the same value: names never change and ids are never reused, so
  * an answer is stale only when the grants change, and then the whole map goes with its auth_user). An id that
- * resolves to no name (unknown, or a follower has not seen it yet) is answered DENIED and not cached. Past MAP_CAP
- * bytes per user nothing more is cached: checks then compute every time, slower but never wrong.
+ * resolves to no name (unknown, or a follower has not seen it yet) is answered DENIED and not cached. An id the
+ * user has no right on is cached only in a leaf that already exists: probing other tenants' ids allocates nothing.
+ * Past MAP_CAP bytes per user, or the budget of all users together (a sixteenth of the RAM), nothing more is
+ * cached: checks then compute every time, slower but never wrong.
  *
  * A failed write of USERS is fail-stop (A11): users.c calls on_fail, which ends tsdbd with status 1 before the
  * change is acknowledged.
@@ -38,6 +45,9 @@
 #include <unistd.h>
 
 #define MAP_CAP ((size_t)64 << 20)
+#define SERIES_NAME_MAX 32767 /* the engine's longest name (src/series.c MAX_NAME): a longer one is INVALID */
+
+uint64_t xxh64(const void *data, size_t len, uint64_t seed); /* the engine's (src/internal.h) */
 
 /* ------------------------------------------------------------ the table */
 
@@ -102,20 +112,35 @@ struct auth_user {
     uint8_t all;      /* rights on every series (R_EVERY for a superuser), admin expanded */
     bool superuser;
     bool writer;      /* insert or delete on some selector (COMMIT) */
-    pthread_mutex_t mu; /* the copy's rights_of (its index is a cache) */
-    user *u;
+    user *u;          /* its index built (user_index_build): rights_of only reads it */
     _Atomic(map_vlo *) vhi[256];
     atomic_size_t map_bytes;
 };
 
-static pthread_mutex_t auth_mu = PTHREAD_MUTEX_INITIALIZER;
+/* What logins and requests read of USERS: immutable once published. */
+typedef struct snapshot {
+    user **u; /* copies of the live users, by uid */
+    uint32_t n;
+    uint32_t *names; /* 1 + an index into u, open addressing on the name's hash; mask + 1 slots, at most half full */
+    uint32_t mask;
+    uint32_t superusers;
+    uint64_t batch; /* of `us` when it was made */
+    uint8_t mock_key[32];
+} snapshot;
+
+static pthread_mutex_t users_mu = PTHREAD_MUTEX_INITIALIZER; /* `us`, us_open, damaged_logged; across USERS I/O */
+static pthread_mutex_t auth_mu = PTHREAD_MUTEX_INITIALIZER;  /* snap and the registry; never across I/O */
 static users us;
+static snapshot *snap; /* replaced under users_mu and auth_mu both; read under either */
 static bool us_open, enabled, damaged_logged, no_super_logged;
 static tsdb *sdb;
+size_t auth_map_budget;
+static atomic_size_t map_total;
+atomic_uint auth_test_hmacs;
 /* The registry: the current state of each user with connections (or had them until the last sync), and the states
  * replaced since, until their last connection lets go. Only reg_sync frees, under auth_mu, an entry no connection
  * holds; a reference is only ever taken under auth_mu, so none can appear behind its back. Connections drop theirs
- * without the lock: the event loop must not wait for auth_mu while the reload thread reads USERS over NFS. */
+ * without the lock: the event loop takes none. */
 static auth_user **reg, **dead;
 static size_t nreg, reg_cap, ndead, dead_cap;
 static pthread_t reload_thread;
@@ -156,14 +181,99 @@ static void map_free(auth_user *au)
         }
         free(v);
     }
+    atomic_fetch_sub_explicit(&map_total, atomic_load_explicit(&au->map_bytes, memory_order_relaxed),
+                              memory_order_relaxed);
 }
 
 static void au_free(auth_user *au)
 {
     map_free(au);
     user_release(au->u);
-    pthread_mutex_destroy(&au->mu);
     free(au);
+}
+
+/* ------------------------------------------------------------ the snapshot */
+
+static uint32_t name_hash(const char *name, size_t len) { return (uint32_t)xxh64(name, len, 0x736e6170ull); }
+
+static const user *snap_find(const snapshot *s, const char *name)
+{
+    size_t len = strlen(name);
+    for (uint32_t i = name_hash(name, len) & s->mask; s->names[i]; i = (i + 1) & s->mask)
+        if (strcmp(s->u[s->names[i] - 1]->name, name) == 0)
+            return s->u[s->names[i] - 1];
+    return NULL;
+}
+
+static const user *snap_by_uid(const snapshot *s, uint32_t uid)
+{
+    size_t lo = 0, hi = s ? s->n : 0;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (s->u[mid]->uid < uid)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return s && lo < s->n && s->u[lo]->uid == uid ? s->u[lo] : NULL;
+}
+
+/* Frees s and the copies in it that the next snapshot did not take over (taken NULL: all of them). */
+static void snap_free(snapshot *s, const bool *taken)
+{
+    if (!s)
+        return;
+    for (uint32_t i = 0; i < s->n; i++)
+        if (!taken || !taken[i])
+            user_release(s->u[i]);
+    free(s->u), free(s->names), free(s);
+}
+
+/* A snapshot of `us`. The copies of users unchanged since old (same uid, same batch: a batch copies a user before
+ * it changes it) are taken over from old, and (*taken)[i] says old's copy i was. NULL when out of memory. users_mu
+ * held. */
+static snapshot *snap_build(const snapshot *old, bool **taken)
+{
+    snapshot *s = calloc(1, sizeof *s);
+    uint32_t cap = 16;
+    while (cap < 2 * us.n + 2)
+        cap *= 2;
+    *taken = old && old->n ? calloc(old->n, sizeof **taken) : NULL;
+    if (!s || (old && old->n && !*taken) || !(s->u = malloc(((size_t)us.n + 1) * sizeof *s->u)) ||
+        !(s->names = calloc(cap, sizeof *s->names))) {
+        if (s)
+            free(s->u), free(s->names);
+        free(s), free(*taken);
+        *taken = NULL;
+        return NULL;
+    }
+    s->mask = cap - 1, s->batch = us.batch;
+    memcpy(s->mock_key, us.mock_key, 32);
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < us.n; i++) {
+        const user *u = us.u[i];
+        while (old && j < old->n && old->u[j]->uid < u->uid)
+            j++;
+        user *c;
+        if (old && j < old->n && old->u[j]->uid == u->uid && old->u[j]->batch == u->batch) {
+            c = old->u[j];
+            (*taken)[j] = true;
+        } else if (!(c = user_copy(u))) {
+            for (uint32_t k = 0; k < s->n; k++) /* the copies made here; those taken over stay old's */
+                if (snap_by_uid(old, s->u[k]->uid) != s->u[k])
+                    user_release(s->u[k]);
+            free(s->u), free(s->names), free(s), free(*taken);
+            *taken = NULL;
+            return NULL;
+        }
+        s->u[s->n++] = c;
+        s->superusers += (c->flags & USER_SUPERUSER) != 0;
+        uint32_t h = name_hash(c->name, strlen(c->name)) & s->mask;
+        while (s->names[h])
+            h = (h + 1) & s->mask;
+        s->names[h] = s->n;
+    }
+    return s;
 }
 
 /* Any thread, no lock: reg_sync frees it once no connection holds it. */
@@ -187,10 +297,11 @@ static bool grow(auth_user ***a, size_t n, size_t *cap)
     return true;
 }
 
-/* The current state of user uid, made from USERS when no connection holds it; a new reference. auth_mu held. */
+/* The current state of user uid, made from the snapshot when no connection holds it; a new reference. auth_mu
+ * held. */
 static auth_user *au_get(uint32_t uid)
 {
-    const user *u = users_by_uid(&us, uid);
+    const user *u = snap_by_uid(snap, uid);
     if (!u)
         return NULL;
     for (size_t i = 0; i < nreg; i++)
@@ -201,11 +312,12 @@ static auth_user *au_get(uint32_t uid)
     if (!grow(&reg, nreg, &reg_cap) || !grow(&dead, ndead + nreg, &dead_cap))
         return NULL; /* dead has room for every listed state, so reg_sync never fails to move one */
     auth_user *au = calloc(1, sizeof *au);
-    if (!au || !(au->u = user_copy(u))) {
+    if (!au || !(au->u = user_copy(u)) || !user_index_build(au->u)) {
+        if (au)
+            user_release(au->u);
         free(au);
         return NULL;
     }
-    pthread_mutex_init(&au->mu, NULL);
     au->uid = uid, au->batch = u->batch;
     atomic_init(&au->refs, 1);
     au->superuser = u->flags & USER_SUPERUSER;
@@ -222,8 +334,8 @@ static auth_user *au_get(uint32_t uid)
     return au;
 }
 
-/* After USERS changed (a reload, an admin op): every listed state whose user changed or went is marked stale and
- * leaves the registry; its connections move on at their next request. auth_mu held. */
+/* After USERS changed (a reload, an admin op), and on every tick: every listed state whose user changed or went is
+ * marked stale and leaves the registry; its connections move on at their next request. auth_mu held. */
 static void reg_sync(void)
 {
     for (size_t i = 0; i < ndead;) {
@@ -236,7 +348,7 @@ static void reg_sync(void)
     }
     for (size_t i = 0; i < nreg;) {
         auth_user *au = reg[i];
-        const user *u = users_by_uid(&us, au->uid);
+        const user *u = snap_by_uid(snap, au->uid);
         if (u && u->batch == au->batch && !unheld(au)) {
             i++;
             continue;
@@ -249,7 +361,7 @@ static void reg_sync(void)
         atomic_store_explicit(&au->stale, true, memory_order_relaxed);
         dead[ndead++] = au; /* room: au_get kept dead_cap >= ndead + nreg */
     }
-    if (enabled && users_superusers(&us) == 0) {
+    if (enabled && snap && snap->superusers == 0) {
         if (!no_super_logged)
             fprintf(stderr, "tsdbd: USERS has no superuser any more: logged-in users keep their grants; a restart "
                             "will refuse to start until 'tsdb <dir> user add NAME --superuser'\n");
@@ -259,40 +371,75 @@ static void reg_sync(void)
     }
 }
 
+/* Publishes a snapshot of `us` when it changed since the last one, and syncs the registry with it. Out of memory:
+ * the last snapshot stays, the next tick tries again, and the caller does not acknowledge its change. users_mu
+ * held, so no other publisher reads or replaces snap meanwhile. */
+static int publish(void)
+{
+    snapshot *old = snap, *s = NULL;
+    bool *taken = NULL;
+    if ((!old || old->batch != us.batch) && !(s = snap_build(old, &taken)))
+        return TSDB_ERR_NOMEM;
+    pthread_mutex_lock(&auth_mu);
+    if (s)
+        snap = s;
+    reg_sync();
+    pthread_mutex_unlock(&auth_mu);
+    if (s)
+        snap_free(old, taken); /* no reader left: they read snap only under auth_mu */
+    free(taken);
+    return 0;
+}
+
 int auth_init(const char *dir, bool on, bool writable, tsdb *db)
 {
     enabled = on;
     sdb = db;
+    if (!auth_map_budget) {
+        long pages = sysconf(_SC_PHYS_PAGES), psize = sysconf(_SC_PAGESIZE);
+        auth_map_budget = pages > 0 && psize > 0 ? (size_t)pages * (size_t)psize / 16 : MAP_CAP;
+    }
     if (!on)
         return 0; /* --no-auth: nothing reads USERS, and the admin ops are refused (auth_check) */
+    pthread_mutex_lock(&users_mu);
     int rc = users_open(&us, dir, writable);
     if (rc != 0) {
+        pthread_mutex_unlock(&users_mu);
         fprintf(stderr, "tsdbd: %s/USERS: %s\n", dir, tsdb_strerror(rc));
         return rc;
     }
     us_open = true;
     us.on_fail = on_users_fail;
     if (users_superusers(&us) == 0) {
+        pthread_mutex_unlock(&users_mu);
         fprintf(stderr, "tsdbd: no superuser: run 'tsdb %s user add NAME --superuser', or start with --no-auth\n",
                 dir);
         return TSDB_ERR_AUTH;
     }
-    return 0;
+    rc = publish();
+    pthread_mutex_unlock(&users_mu);
+    if (rc != 0)
+        fprintf(stderr, "tsdbd: %s/USERS: %s\n", dir, tsdb_strerror(rc));
+    return rc;
 }
+
+void (*auth_test_reload_hook)(void);
 
 void auth_reload(void)
 {
-    pthread_mutex_lock(&auth_mu);
+    pthread_mutex_lock(&users_mu);
     if (us_open) {
-        int rc = users_reload(&us);
+        if (auth_test_reload_hook)
+            auth_test_reload_hook();
+        int rc = users_reload(&us); /* may wait on NFS: only users_mu is held */
         if (rc != 0 && !damaged_logged) {
             damaged_logged = true;
             fprintf(stderr, "tsdbd: USERS: %s: the users stay as last read; user admin ops are refused until a "
                             "restart\n", tsdb_strerror(rc));
         }
-        reg_sync();
+        (void)publish(); /* out of memory: the next tick tries again */
     }
-    pthread_mutex_unlock(&auth_mu);
+    pthread_mutex_unlock(&users_mu);
 }
 
 static void *reload_main(void *arg)
@@ -333,7 +480,8 @@ void auth_shutdown(void)
         pthread_join(reload_thread, NULL);
         reload_running = false;
     }
-    pthread_mutex_lock(&auth_mu); /* after every connection is gone */
+    pthread_mutex_lock(&users_mu); /* after every connection is gone */
+    pthread_mutex_lock(&auth_mu);
     for (size_t i = 0; i < nreg; i++)
         au_free(reg[i]);
     for (size_t i = 0; i < ndead; i++)
@@ -341,11 +489,17 @@ void auth_shutdown(void)
     free(reg), free(dead);
     reg = dead = NULL;
     nreg = ndead = reg_cap = dead_cap = 0;
+    snap_free(snap, NULL);
+    snap = NULL;
+    pthread_mutex_unlock(&auth_mu);
     if (us_open)
         users_close(&us);
     us_open = false;
-    pthread_mutex_unlock(&auth_mu);
+    damaged_logged = false;
+    pthread_mutex_unlock(&users_mu);
 }
+
+size_t auth_map_total(void) { return atomic_load_explicit(&map_total, memory_order_relaxed); }
 
 void auth_conn_init(auth_conn *a)
 {
@@ -387,13 +541,9 @@ size_t auth_hello(uint8_t *out)
  * proof, nonce or verifier (A21). */
 static int login_failed(auth_conn *a, const char *peer, const char *why)
 {
-    static time_t last;
+    static _Atomic time_t last;
     time_t t = time(NULL);
-    pthread_mutex_lock(&auth_mu);
-    bool log = t != last;
-    last = t;
-    pthread_mutex_unlock(&auth_mu);
-    if (log)
+    if (atomic_exchange_explicit(&last, t, memory_order_relaxed) != t)
         fprintf(stderr, "tsdbd: login failed%s%s from %s: %s\n", a->name[0] ? " for user " : "", a->name,
                 peer ? peer : "?", why);
     scram_clear(a);
@@ -409,6 +559,13 @@ static bool printable_nonce(const char *s, size_t n)
         if (s[i] < 0x21 || s[i] > 0x7e || s[i] == ',')
             return false;
     return true;
+}
+
+/* Every HMAC of a login goes through here: tests count them (A4: an unknown name costs what a known one does). */
+static void hmac(const uint8_t *key, size_t kl, const void *msg, size_t ml, uint8_t out[32])
+{
+    atomic_fetch_add_explicit(&auth_test_hmacs, 1, memory_order_relaxed);
+    tsdb_hmac_sha256(key, kl, msg, ml, out);
 }
 
 static size_t put_msg(uint8_t *out, const char *s, size_t n)
@@ -453,31 +610,40 @@ int auth_scram_start(auth_conn *a, const uint8_t *p, size_t len, uint8_t *out, s
     const char *cnonce = comma + 3;
     size_t cnl = (size_t)(end - cnonce);
 
-    uint8_t salt[SALT_MAX], salt_len;
-    uint32_t iter;
+    /* A4: an unknown name gets the same shape, a salt that is the same on every try and after a restart, and a key
+     * no one holds. Both kinds of name do the same work: one lookup and copy, the three mock HMACs, a select
+     * without a branch on whether the name exists, so the reply's timing does not tell (review 2 #4). */
+    static const user_verifier none;
+    user_verifier v;
+    uint8_t key[32] = {0};
+    uint32_t uid;
     pthread_mutex_lock(&auth_mu);
-    const user *u = us_open ? users_find(&us, a->name) : NULL;
-    if (u && u->has_verifier) {
-        a->uid = u->uid;
-        salt_len = u->v.salt_len;
-        memcpy(salt, u->v.salt, salt_len);
-        iter = u->v.iterations;
-        memcpy(a->stored_key, u->v.stored_key, 32);
-        memcpy(a->server_key, u->v.server_key, 32);
-    } else { /* A4: the same shape, a salt that is the same on every try and after a restart, a key no one holds */
-        uint8_t h[32], msg[USER_NAME_MAX + 8];
-        a->uid = 0;
-        tsdb_hmac_sha256(us.mock_key, 32, a->name, nl, h);
-        salt_len = 16;
-        memcpy(salt, h, 16);
-        iter = ITER_MIN;
-        memcpy(msg, "stored:", 7);
-        memcpy(msg + 7, a->name, nl);
-        tsdb_hmac_sha256(us.mock_key, 32, msg, 7 + nl, a->stored_key);
-        memcpy(msg, "server:", 7);
-        tsdb_hmac_sha256(us.mock_key, 32, msg, 7 + nl, a->server_key);
-    }
+    const user *u = snap ? snap_find(snap, a->name) : NULL;
+    bool known = u && u->has_verifier;
+    memcpy(&v, known ? &u->v : &none, sizeof v);
+    uid = known ? u->uid : 0;
+    if (snap)
+        memcpy(key, snap->mock_key, 32);
     pthread_mutex_unlock(&auth_mu);
+    uint8_t h[32], ms[32], mv[32], msg[USER_NAME_MAX + 8];
+    hmac(key, 32, a->name, nl, h);
+    memcpy(msg, "stored:", 7);
+    memcpy(msg + 7, a->name, nl);
+    hmac(key, 32, msg, 7 + nl, ms);
+    memcpy(msg, "server:", 7);
+    hmac(key, 32, msg, 7 + nl, mv);
+    uint8_t m8 = (uint8_t)-(uint8_t)known;
+    uint32_t m32 = (uint32_t)-(uint32_t)known;
+    uint8_t salt[SALT_MAX], salt_len = (uint8_t)((v.salt_len & m8) | (16 & ~m8));
+    for (int i = 0; i < SALT_MAX; i++)
+        salt[i] = (uint8_t)((v.salt[i] & m8) | ((i < 16 ? h[i] : 0) & ~m8));
+    for (int i = 0; i < 32; i++) {
+        a->stored_key[i] = (uint8_t)((v.stored_key[i] & m8) | (ms[i] & ~m8));
+        a->server_key[i] = (uint8_t)((v.server_key[i] & m8) | (mv[i] & ~m8));
+    }
+    uint32_t iter = (v.iterations & m32) | (ITER_MIN & ~m32);
+    a->uid = uid;
+    tsdb_wipe(&v, sizeof v);
 
     uint8_t sn[18];
     char b64salt[tsdb_base64_len(SALT_MAX) + 1], snb[64];
@@ -533,18 +699,18 @@ int auth_scram_continue(auth_conn *a, const uint8_t *p, size_t len, uint8_t *out
     am[a->msg_len] = ',';
     memcpy(am + a->msg_len + 1, f, pre);
     uint8_t sig[32], ck[32], h[32], ssig[32];
-    tsdb_hmac_sha256(a->stored_key, 32, am, am_len, sig);
+    hmac(a->stored_key, 32, am, am_len, sig);
     for (int i = 0; i < 32; i++)
         ck[i] = proof[i] ^ sig[i];
     tsdb_sha256_buf(ck, 32, h);
     bool ok = tsdb_ct_equal(h, a->stored_key, 32) && a->uid != 0;
-    tsdb_hmac_sha256(a->server_key, 32, am, am_len, ssig);
+    hmac(a->server_key, 32, am, am_len, ssig);
     free(am);
     tsdb_wipe(ck, sizeof ck);
     if (!ok)
         return login_failed(a, peer, "wrong password or unknown user");
     pthread_mutex_lock(&auth_mu);
-    const user *u = us_open ? users_by_uid(&us, a->uid) : NULL;
+    const user *u = snap_by_uid(snap, a->uid);
     /* the password may have changed, or the user gone, since AUTH_START: the proof is for that verifier only */
     auth_user *au = u && u->has_verifier && tsdb_ct_equal(u->v.stored_key, a->stored_key, 32) ? au_get(a->uid) : NULL;
     pthread_mutex_unlock(&auth_mu);
@@ -597,9 +763,11 @@ static _Atomic uint8_t *map_slot(auth_user *au, tsdb_sid id, bool make)
         return NULL;
     _Atomic(map_vlo *) *pv = &au->vhi[vol >> 8];
     map_vlo *v = atomic_load_explicit(pv, memory_order_acquire);
+    /* the budgets are checked before and counted after: threads racing past them overshoot by a level each */
 #define LEVEL(ptr, var, type, size)                                                                        \
     if (!var) {                                                                                            \
-        if (!make || atomic_load_explicit(&au->map_bytes, memory_order_relaxed) + (size) > MAP_CAP)        \
+        if (!make || atomic_load_explicit(&au->map_bytes, memory_order_relaxed) + (size) > MAP_CAP ||      \
+            atomic_load_explicit(&map_total, memory_order_relaxed) + (size) > auth_map_budget)             \
             return NULL;                                                                                   \
         type *n_ = calloc(1, size);                                                                        \
         if (!n_)                                                                                           \
@@ -607,6 +775,7 @@ static _Atomic uint8_t *map_slot(auth_user *au, tsdb_sid id, bool make)
         if (atomic_compare_exchange_strong_explicit(ptr, &var, n_, memory_order_acq_rel, memory_order_acquire)) { \
             var = n_;                                                                                      \
             atomic_fetch_add_explicit(&au->map_bytes, size, memory_order_relaxed);                         \
+            atomic_fetch_add_explicit(&map_total, size, memory_order_relaxed);                             \
         } else {                                                                                           \
             free(n_); /* another thread made it: var holds theirs */                                       \
         }                                                                                                  \
@@ -625,7 +794,8 @@ static _Atomic uint8_t *map_slot(auth_user *au, tsdb_sid id, bool make)
     return &leaf[local & 4095];
 }
 
-/* The map byte of id for this user: 0x80 | rights, or 0 for an id that names no series (not cached). */
+/* The map byte of id for this user: 0x80 | rights, or 0 for an id that names no series (not cached). No right at
+ * all is cached only in a leaf that is there already, so ids of other tenants cost no memory (review 2 #5). */
 static uint8_t rights_byte(auth_user *au, tsdb_sid id)
 {
     _Atomic uint8_t *s = map_slot(au, id, false);
@@ -635,12 +805,34 @@ static uint8_t rights_byte(auth_user *au, tsdb_sid id)
     const char *name = tsdb_series_name(sdb, id);
     if (!name)
         return 0;
-    pthread_mutex_lock(&au->mu);
-    b = 0x80 | rights_of(au->u, name, strlen(name));
-    pthread_mutex_unlock(&au->mu);
-    if ((s = map_slot(au, id, true)))
+    b = 0x80 | rights_of(au->u, name, strlen(name)); /* no lock: au->u's index was built before it was shared */
+    if (s || (b != 0x80 && (s = map_slot(au, id, true))))
         atomic_store_explicit(s, b, memory_order_relaxed);
     return b;
+}
+
+/* The l2 table of id's 4 M-id block, if the map has one. */
+static map_l2 *map_l2_of(auth_user *au, tsdb_sid id)
+{
+    uint64_t vol = (id >> 32) - 1;
+    uint32_t local = (uint32_t)id;
+    if ((id >> 48) || vol >= 65536 || (local >> 31))
+        return NULL;
+    map_vlo *v = atomic_load_explicit(&au->vhi[vol >> 8], memory_order_acquire);
+    map_l1 *l1 = v ? atomic_load_explicit(&v->l1[vol & 255], memory_order_acquire) : NULL;
+    return l1 ? atomic_load_explicit(&l1->l2[local >> 22], memory_order_acquire) : NULL;
+}
+
+/* auth_ids off its fast path: the leaf of id's block through the l2 in hand (or found and kept), NULL if none.
+ * Not inlined: the per-row loop then keeps its few values in registers. */
+static __attribute__((noinline)) _Atomic uint8_t *walk_leaf(auth_user *au, tsdb_sid id, uint64_t *l2key,
+                                                            map_l2 **l2)
+{
+    map_l2 *t;
+    if ((id >> 22) != *l2key && (t = map_l2_of(au, id)))
+        *l2 = t, *l2key = id >> 22;
+    return (id >> 22) == *l2key ? atomic_load_explicit(&(*l2)->leaf[(id >> 12) & 1023], memory_order_acquire)
+                                : NULL;
 }
 
 int auth_id(auth_conn *a, tsdb_sid id, uint8_t need)
@@ -654,13 +846,35 @@ int auth_id(auth_conn *a, tsdb_sid id, uint8_t need)
     return a->last_byte && enough(a->last_byte, need) ? 0 : TSDB_ERR_DENIED;
 }
 
+/* The per-row check of an id-per-row insert (A15). The user's state and its need are read once per request; the
+ * leaf of the previous row's 4096-id block and the l2 of its 4 M-id block stay in hand, so a row of a series near
+ * the last one costs one load, and any other row of a volume two (id >> 12 and id >> 22 name the volume and the
+ * block; a key taken from a valid id is matched only by valid ids). */
 int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need)
 {
-    if (!a->au || enough(a->au->all, need))
+    auth_user *au = a->au;
+    if (!au || enough(au->all, need))
         return 0;
-    for (size_t i = 0; i < n; i++)
-        if (auth_id(a, ids[i], need) != 0)
+    uint64_t lkey = UINT64_MAX, l2key = UINT64_MAX; /* no id >> 12 or id >> 22 is that large */
+    _Atomic uint8_t *leaf = NULL;
+    map_l2 *l2 = NULL;
+    for (size_t i = 0; i < n; i++) {
+        tsdb_sid id = ids[i];
+        uint8_t b = 0;
+        if ((id >> 12) == lkey) {
+            b = atomic_load_explicit(&leaf[id & 4095], memory_order_relaxed);
+        } else {
+            _Atomic uint8_t *lf = walk_leaf(au, id, &l2key, &l2);
+            if (lf) {
+                leaf = lf, lkey = id >> 12;
+                b = atomic_load_explicit(&leaf[id & 4095], memory_order_relaxed);
+            }
+        }
+        if (!b)
+            b = rights_byte(au, id); /* a miss: the name's rights, cached as rights_byte decides */
+        if (!b || !enough(b, need))
             return TSDB_ERR_DENIED;
+    }
     return 0;
 }
 
@@ -716,11 +930,9 @@ int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
     }
     case W_NAME3: {
         uint16_t n;
-        if (len < 3 || (memcpy(&n, p + 1, 2), n == 0 || len < 3u + n))
-            return TSDB_ERR_INVALID;
-        pthread_mutex_lock(&au->mu);
-        uint8_t r = rights_of(au->u, (const char *)p + 3, n);
-        pthread_mutex_unlock(&au->mu);
+        if (len < 3 || (memcpy(&n, p + 1, 2), n == 0 || len < 3u + n) || n > SERIES_NAME_MAX)
+            return TSDB_ERR_INVALID; /* the engine would refuse it too: no matching on names it never holds */
+        uint8_t r = rights_of(au->u, (const char *)p + 3, n); /* no lock: the index was built before sharing */
         return enough(r, need) ? 0 : TSDB_ERR_DENIED;
     }
     case W_MULTI: return 0; /* per series, in the handler (A17) */
@@ -830,7 +1042,7 @@ int auth_admin(auth_conn *a, uint8_t op, const uint8_t *p, size_t len, uint8_t *
     const uint8_t *q = get_name(p, end, name);
     if (!q)
         return TSDB_ERR_INVALID;
-    pthread_mutex_lock(&auth_mu);
+    pthread_mutex_lock(&users_mu); /* waits for USERS I/O (a reload on a slow NFS): admin ops only */
     if (!us_open) {
         rc = TSDB_ERR_CORRUPT;
     } else {
@@ -863,9 +1075,13 @@ int auth_admin(auth_conn *a, uint8_t op, const uint8_t *p, size_t len, uint8_t *
         }
         default: rc = TSDB_ERR_INVALID; break;
         }
-        reg_sync();
+        /* before the reply: the next request of a user this changed sees it. A change that is durable but not
+         * published (out of memory) is not acknowledged; the next tick publishes it. */
+        int pr = publish();
+        if (rc == 0)
+            rc = pr;
     }
-    pthread_mutex_unlock(&auth_mu);
+    pthread_mutex_unlock(&users_mu);
     tsdb_wipe(&v, sizeof v);
     return rc;
 }
@@ -878,7 +1094,7 @@ int auth_user_list(auth_conn *a, int (*emit)(void *ctx, bool last, uint32_t n, c
     wbuf b = {0};
     uint32_t *ends = NULL, n = 0;
     int rc = 0;
-    pthread_mutex_lock(&auth_mu);
+    pthread_mutex_lock(&users_mu);
     if (!a->au) {
         rc = TSDB_ERR_DENIED; /* --no-auth (auth_check refuses first) */
     } else if (!us_open) {
@@ -897,7 +1113,7 @@ int auth_user_list(auth_conn *a, int (*emit)(void *ctx, bool last, uint32_t n, c
                 }
         }
     }
-    pthread_mutex_unlock(&auth_mu);
+    pthread_mutex_unlock(&users_mu);
     if (rc == 0 && b.oom)
         rc = TSDB_ERR_NOMEM;
     if (rc == 0) { /* chunks of whole entries, each under LIST_CHUNK unless one entry alone is larger */

@@ -2149,6 +2149,23 @@ static int parse(conn *c)
     return rc;
 }
 
+/* Before login, frames received past the two queued ones (A5) wait in c->in, and no more bytes may come to have
+ * them parsed: they are parsed as a dispatch opens the window, so a third pipelined frame is answered (one past
+ * the window: AUTH, then the close) instead of waiting for --login-timeout. Never while a recv may still write into
+ * c->in. parse's result. */
+static int pre_reparse(conn *c)
+{
+    if (atomic_load(&c->authed) || c->auth_hold || c->eof || c->closed || c->recv_inflight || c->in.len < 4 ||
+        pre_queued(c) >= 2)
+        return 0;
+    int pr = parse(c);
+    if (pr > 0)
+        park(c, true);
+    if (pr >= 0)
+        dispatch(c);
+    return pr;
+}
+
 /* A recv finished: res bytes arrived (0: end of stream), or -errno. */
 static void on_recv(conn *c, ssize_t res)
 {
@@ -2178,6 +2195,10 @@ static void on_recv(conn *c, ssize_t res)
         park(c, true);
     in_shrink(c); /* a large frame's buffer goes once the frame is parsed */
     dispatch(c);
+    if (pre_reparse(c) < 0) {
+        conn_close(c);
+        return;
+    }
     submit_recv(c);
 }
 
@@ -2362,6 +2383,10 @@ static void on_wake(void)
         submit_send(c);
         if (batch[i].done) {
             dispatch(c);
+            if (pre_reparse(c) < 0) {
+                conn_close(c);
+                continue;
+            }
             submit_recv(c); /* its pipeline may have room again */
         }
         finish_if_drained(c);

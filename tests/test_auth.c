@@ -216,6 +216,53 @@ static void test_prelogin(void)
     raw_send(fd, 9, TSDB_OP_CANCEL, &cancel_id, 4);
     CHECK(closed(fd));
     close(fd);
+    /* three frames in one write before login (review 2 #6): two are queued (A5), the third waits in the buffer and
+     * is read once one of them is answered, though no byte follows. Three HELLOs: three replies. HELLO, AUTH_START,
+     * QUERY_RAW: the query hears AUTH and the connection closes, at once, not at the login timeout (10 s) */
+    uint32_t ver = TSDB_PROTOCOL_VERSION;
+    uint8_t w[512];
+    const char *cf = "n,,n=root,r=abcdefghijkl";
+    uint8_t st[128];
+    size_t ml = strlen(TSDB_SCRAM_SHA256), cl = strlen(cf);
+    uint16_t l16 = (uint16_t)cl;
+    st[0] = (uint8_t)ml;
+    memcpy(st + 1, TSDB_SCRAM_SHA256, ml);
+    memcpy(st + 1 + ml, &l16, 2);
+    memcpy(st + 3 + ml, cf, cl);
+    uint8_t q[24] = {0};
+    memcpy(q, &id, 8);
+    struct {
+        uint8_t op;
+        const void *p;
+        uint32_t len;
+    } three[2][3] = {{{TSDB_OP_HELLO, &ver, 4}, {TSDB_OP_HELLO, &ver, 4}, {TSDB_OP_HELLO, &ver, 4}},
+                     {{TSDB_OP_HELLO, &ver, 4}, {TSDB_OP_AUTH_START, st, (uint32_t)(3 + ml + cl)},
+                      {TSDB_OP_QUERY_RAW, q, 24}}};
+    for (int k = 0; k < 2; k++) {
+        size_t at = 0;
+        for (uint32_t i = 0; i < 3; i++) {
+            uint32_t fl = three[k][i].len + 5, fid = i + 1;
+            memcpy(w + at, &fl, 4);
+            memcpy(w + at + 4, &fid, 4);
+            w[at + 8] = three[k][i].op;
+            memcpy(w + at + 9, three[k][i].p, three[k][i].len);
+            at += 9 + three[k][i].len;
+        }
+        fd = raw_connect();
+        struct timeval tv = {3, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        double t0 = now_s();
+        CHECK(write(fd, w, at) == (ssize_t)at);
+        for (uint32_t i = 1; i <= 3; i++) {
+            uint32_t rid = 0;
+            int32_t s = raw_frame(fd, &rid, r, sizeof r, &n, NULL, NULL);
+            CHECK(rid == i && s == (k == 1 && i == 3 ? TSDB_ERR_AUTH : 0));
+        }
+        if (k == 1)
+            CHECK(closed(fd));
+        CHECK(now_s() - t0 < 2.5);
+        close(fd);
+    }
     /* after login: AUTH_START and AUTH_CONTINUE are INVALID, and the connection goes on */
     fd = raw_connect();
     CHECK(raw_login(fd, "root", "rootpw") == 0);
@@ -225,7 +272,8 @@ static void test_prelogin(void)
     raw_send(fd, 9, TSDB_OP_SERIES_NAME, &id, 8);
     CHECK(raw_reply(fd, r, sizeof r, &n) == 0);
     close(fd);
-    printf("  before login: other ops, a long frame and CANCEL close; AUTH_* after login is INVALID\n");
+    printf("  before login: other ops, a long frame and CANCEL close; three pipelined frames all answered (the third "
+           "past the window: AUTH, closed); AUTH_* after login is INVALID\n");
 }
 
 /* --login-timeout: a connection that has not logged in by then is closed; a logged-in one is not. */
@@ -248,6 +296,260 @@ static void test_login_timeout(const char *dir)
     tsdbc_close(c);
     stop(srv);
     printf("  --login-timeout 1: closed after %.2f s; a logged-in connection stays\n", took);
+}
+
+/* Review 2 #1: a tenant admin gives a user it made 64 globs of A24's longest, which pass the literal prefix and
+ * suffix filters, and that user sends SERIES requests with the longest names, over 16 connections (tsdbd runs 2
+ * workers here). Names over the engine's limit are INVALID before any matching; the others cost one linear pass
+ * per glob, outside any lock: root's WHOAMI on its own connection is answered within a small bound (the
+ * backtracking matcher under the user's mutex held it for seconds: 8.8 s in the review). */
+static void test_glob_stall(void)
+{
+    tsdbc *adm = login_as("acme/admin", "adminpw");
+    OK(tsdbc_user_create(adm, "acme/g", "gpw", 0, 0));
+    for (int i = 0; i < USER_GLOBS; i++) {
+        char g[300];
+        int n = snprintf(g, sizeof g, "acme/*");
+        memset(g + n, 'a', 240);
+        snprintf(g + n + 240, sizeof g - (size_t)n - 240, "c%02d*b", i);
+        OK(tsdbc_grant(adm, "acme/g", TSDB_SEL_GLOB, g, TSDB_RIGHT_READ));
+    }
+    tsdbc_close(adm);
+    int r = raw_connect();
+    CHECK(raw_login(r, "root", "rootpw") == 0);
+    enum { CONNS = 16, LONG = 65535, MAX = 32767 };
+    static uint8_t p[3 + LONG];
+    uint16_t l = LONG;
+    memcpy(p + 1, &l, 2);
+    memcpy(p + 3, "acme/", 5);
+    memset(p + 8, 'a', LONG - 6);
+    p[3 + LONG - 1] = 'b';
+    int g[CONNS];
+    for (int k = 0; k < CONNS; k++) {
+        g[k] = raw_connect();
+        CHECK(raw_login(g[k], "acme/g", "gpw") == 0);
+    }
+    double t0 = now_s();
+    for (int k = 0; k < CONNS; k++) { /* half over the engine's limit, half at it (ending in 'b' as well) */
+        if (k == CONNS / 2) {
+            l = MAX;
+            memcpy(p + 1, &l, 2);
+            p[3 + MAX - 1] = 'b';
+        }
+        raw_send(g[k], 100, TSDB_OP_SERIES, p, 3u + l);
+    }
+    nap_ms(20);
+    uint8_t b[512];
+    size_t n;
+    double w0 = now_s();
+    raw_send(r, 9, TSDB_OP_WHOAMI, NULL, 0);
+    CHECK(raw_reply(r, b, sizeof b, &n) == 0);
+    double whoami_ms = (now_s() - w0) * 1e3;
+    for (int k = 0; k < CONNS; k++) {
+        CHECK(raw_reply(g[k], b, sizeof b, &n) == (k < CONNS / 2 ? TSDB_ERR_INVALID : TSDB_ERR_DENIED));
+        close(g[k]);
+    }
+    double all_ms = (now_s() - t0) * 1e3;
+    CHECK(whoami_ms < 1000);
+    close(r);
+    printf("  64 long globs, 16 SERIES of the longest names: root's WHOAMI meanwhile %.1f ms, all answered in %.0f ms\n",
+           whoami_ms, all_ms);
+}
+
+/* ------------------------------------------------------------ server/auth.c in this process (review 2) */
+
+static size_t start_body(uint8_t *p, const char *cf)
+{
+    size_t ml = strlen(TSDB_SCRAM_SHA256), cl = strlen(cf);
+    uint16_t l = (uint16_t)cl;
+    p[0] = (uint8_t)ml;
+    memcpy(p + 1, TSDB_SCRAM_SHA256, ml);
+    memcpy(p + 1 + ml, &l, 2);
+    memcpy(p + 3 + ml, cf, cl);
+    return 3 + ml + cl;
+}
+
+static size_t continue_body(uint8_t *q, const char *fin)
+{
+    size_t fl = strlen(fin);
+    uint16_t l = (uint16_t)fl;
+    memcpy(q, &l, 2);
+    memcpy(q + 2, fin, fl);
+    return 2 + fl;
+}
+
+/* A login through auth_scram_start and _continue, with password pw: 0 or the status; *hs and *hc (when not NULL)
+ * the HMACs each step computed. */
+static int inproc_login(auth_conn *a, const char *user, const char *pw, unsigned *hs, unsigned *hc)
+{
+    uint8_t p[512], q[800], out[800];
+    size_t ol;
+    char cf[300], sf[700], fin[800], v[64];
+    snprintf(cf, sizeof cf, "n,,n=%s,r=testnonce", user);
+    auth_conn_init(a);
+    unsigned h0 = atomic_load(&auth_test_hmacs);
+    int rc = auth_scram_start(a, p, start_body(p, cf), out, sizeof out, &ol, "test");
+    unsigned h1 = atomic_load(&auth_test_hmacs);
+    if (hs)
+        *hs = h1 - h0;
+    if (rc != 0)
+        return rc;
+    uint16_t l;
+    memcpy(&l, out, 2);
+    memcpy(sf, out + 2, l);
+    sf[l] = 0;
+    client_final(user, pw, "testnonce", sf, fin, sizeof fin, v, sizeof v);
+    rc = auth_scram_continue(a, q, continue_body(q, fin), out, sizeof out, &ol, "test");
+    if (hc)
+        *hc = atomic_load(&auth_test_hmacs) - h1;
+    return rc;
+}
+
+static pthread_mutex_t hang_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hang_cv = PTHREAD_COND_INITIALIZER;
+static bool hang_in, hang_go;
+
+/* auth_reload's hook: blocks as an open of USERS on a hard NFS mount whose server is down does */
+static void hang_hook(void)
+{
+    pthread_mutex_lock(&hang_mu);
+    hang_in = true;
+    pthread_cond_broadcast(&hang_cv);
+    while (!hang_go)
+        pthread_cond_wait(&hang_cv, &hang_mu);
+    pthread_mutex_unlock(&hang_mu);
+}
+
+static void *reload_thread(void *arg)
+{
+    (void)arg;
+    auth_reload();
+    return NULL;
+}
+
+typedef struct during {
+    auth_conn *in; /* logged in before the hang */
+    tsdb_sid own, foreign;
+    int login, fresh, name, own_id, foreign_id;
+} during;
+
+static void *during_hang(void *arg)
+{
+    during *d = arg;
+    auth_conn a;
+    d->login = inproc_login(&a, "acme/r", "pw", NULL, NULL);
+    auth_conn_free(&a);
+    uint8_t s[16] = {0};
+    uint16_t l = 7;
+    memcpy(s + 1, &l, 2);
+    memcpy(s + 3, "acme/s0", 7);
+    d->fresh = auth_fresh(d->in);
+    d->name = auth_check(d->in, TSDB_OP_SERIES, s, 10);
+    d->own_id = auth_id(d->in, d->own, R_READ);
+    d->foreign_id = auth_id(d->in, d->foreign, R_READ);
+    return NULL;
+}
+
+/* server/auth.c linked in, on a database of 100,000 series (acme/sN for even N, globex/sN for odd):
+ *  - #4: a known and an unknown name compute the same HMACs at AUTH_START and at a failed AUTH_CONTINUE;
+ *  - #5: a user with no grant probing every id allocates no rights map; with the budget of all maps cut to 32 KiB,
+ *    a user's answers on every id stay right while its map stops growing;
+ *  - #2: while a reload is blocked inside its read of USERS, a new login and a logged-in user's checks answer. */
+static void test_inproc(const char *base)
+{
+    char dir[PATH_MAX + 32];
+    snprintf(dir, sizeof dir, "%s-inproc", base);
+    mkdir(dir, 0755);
+    users u;
+    OK(users_open(&u, dir, true));
+    user_verifier v = {.iterations = ITER_MIN, .salt_len = 16};
+    memcpy(v.salt, "0123456789abcdef", 16);
+    tsdb_scram_keys("pw", 2, v.salt, 16, ITER_MIN, NULL, v.stored_key, v.server_key);
+    OK(users_create(&u, 0, "root", USER_SUPERUSER, &v, NULL));
+    OK(users_create(&u, 0, "acme/r", 0, &v, NULL));
+    OK(users_grant(&u, 0, "acme/r", SEL_PREFIX, "acme/", 5, R_READ));
+    OK(users_create(&u, 0, "nogrant", 0, &v, NULL));
+    users_close(&u);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    tsdb *db = NULL;
+    OK(tsdb_open(dir, &o, &db));
+    enum { N = 100000 };
+    static tsdb_sid ids[N];
+    for (uint32_t i = 0; i < N; i++) {
+        char nm[32];
+        snprintf(nm, sizeof nm, "%s/s%u", i % 2 ? "globex" : "acme", i);
+        OK(tsdb_series_create(db, nm, TSDB_FLOAT32, NULL, &ids[i]));
+    }
+    OK(auth_init(dir, true, true, db));
+
+    /* #4 */
+    unsigned hs[2], hc[2];
+    const char *who[2] = {"acme/r", "nosuchuser"};
+    for (int k = 0; k < 2; k++) {
+        auth_conn a;
+        CHECK(inproc_login(&a, who[k], "wrongpw", &hs[k], &hc[k]) == TSDB_ERR_AUTH);
+        auth_conn_free(&a);
+    }
+    CHECK(hs[0] == 3 && hs[1] == 3 && hc[0] == hc[1] && hc[0] == 2);
+
+    /* #5 */
+    auth_conn ng, r;
+    CHECK(inproc_login(&ng, "nogrant", "pw", NULL, NULL) == 0);
+    int wrong = 0;
+    for (uint32_t i = 0; i < N; i++)
+        wrong += auth_id(&ng, ids[i], R_READ) != TSDB_ERR_DENIED;
+    CHECK(wrong == 0 && auth_ids(&ng, ids, N, R_READ) == TSDB_ERR_DENIED);
+    size_t probed = auth_map_total();
+    CHECK(probed == 0);
+    size_t budget = auth_map_budget;
+    auth_map_budget = 32 << 10;
+    CHECK(inproc_login(&r, "acme/r", "pw", NULL, NULL) == 0);
+    for (int pass = 0; pass < 2; pass++)
+        for (uint32_t i = 0; i < N; i++)
+            wrong += auth_id(&r, ids[i], R_READ) != (i % 2 ? TSDB_ERR_DENIED : 0);
+    static tsdb_sid even[N / 2];
+    for (uint32_t i = 0; i < N / 2; i++)
+        even[i] = ids[2 * i];
+    CHECK(wrong == 0 && auth_ids(&r, even, N / 2, R_READ) == 0 && auth_ids(&r, ids, N, R_READ) == TSDB_ERR_DENIED);
+    CHECK(auth_ids(&r, even + 1000, 1, R_READ) == 0 && auth_ids(&r, ids + 1, 1, R_READ) == TSDB_ERR_DENIED);
+    size_t capped = auth_map_total();
+    CHECK(capped > 0 && capped <= (32 << 10) + 4096);
+    auth_map_budget = budget;
+
+    /* #2 */
+    during d = {.in = &r, .own = ids[0], .foreign = ids[1], .login = -1};
+    auth_test_reload_hook = hang_hook;
+    pthread_t rt, dt;
+    CHECK(pthread_create(&rt, NULL, reload_thread, NULL) == 0);
+    pthread_mutex_lock(&hang_mu);
+    while (!hang_in)
+        pthread_cond_wait(&hang_cv, &hang_mu);
+    pthread_mutex_unlock(&hang_mu);
+    CHECK(pthread_create(&dt, NULL, during_hang, &d) == 0);
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 5;
+    bool answered = pthread_timedjoin_np(dt, NULL, &until) == 0;
+    CHECK(answered);
+    pthread_mutex_lock(&hang_mu);
+    hang_go = true;
+    pthread_cond_broadcast(&hang_cv);
+    pthread_mutex_unlock(&hang_mu);
+    if (!answered)
+        pthread_join(dt, NULL);
+    pthread_join(rt, NULL);
+    auth_test_reload_hook = NULL;
+    CHECK(d.login == 0 && d.fresh == 0 && d.name == 0 && d.own_id == 0 && d.foreign_id == TSDB_ERR_DENIED);
+
+    auth_conn_free(&ng);
+    auth_conn_free(&r);
+    auth_shutdown();
+    tsdb_close(db);
+    printf("  in process: the same HMACs for a known and an unknown name (%u, %u); %d ids probed without a grant: "
+           "map %zu bytes; past a 32 KiB budget (%zu bytes) every answer right; a login and checks answer while a "
+           "reload hangs in USERS\n", hs[0], hc[0], N, probed, capped);
 }
 
 /* Grants and revokes over the wire, an offline CLI edit and a drop reach a connected user's next request. */
@@ -571,6 +873,7 @@ int main(int argc, char **argv)
 
     test_rfc7677_client();
     test_rfc7677_server(dir);
+    test_inproc(dir);
     test_no_auth(dir);
 
     CHECK(cli_user(dir, "rootpw", "add root --superuser") == 0);
@@ -587,6 +890,7 @@ int main(int argc, char **argv)
     test_mock_salt(mock, sizeof mock);
     test_malformed();
     test_prelogin();
+    test_glob_stall();
     stop(srv);
     srv = start(dir, NULL); /* A4: the mock salt survives a restart */
     int fd = raw_connect();
@@ -609,8 +913,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "test_auth: %d failures (server log %s)\n", failures, srvlog);
         return 1;
     }
-    char cmd[6 * PATH_MAX];
-    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s-noauth' '%s-rfc' '%s' '%s'", dir, dir, dir, srvlog, clilog);
+    char cmd[8 * PATH_MAX];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s' '%s-noauth' '%s-rfc' '%s-inproc' '%s' '%s'", dir, dir, dir, dir, srvlog,
+             clilog);
     if (system(cmd) != 0)
         fprintf(stderr, "test_auth: could not remove %s\n", dir);
     printf("test_auth: ok\n");
