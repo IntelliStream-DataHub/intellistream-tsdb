@@ -215,8 +215,26 @@ cgroup, so `nice` does not keep your work out of its way.
   `tests/test_gindex.c`. The encoding is integer and compiled once: every CPU decodes the same bits.
 - **Granules** never span series, and in class 1-3 partitions never a base partition (day) edge either
   (`GRANULE_CUT`, `pw_add`; a merge copies a granule verbatim only inside one day): day and coarser buckets then
-  answer from statistics as in day partitions, bit for bit. Their count/nulls/sum/min/max, and m2 (floats) or the
-  sum of squares (integers), must match the rows exactly, because aggregates use them instead of decoding.
+  answer from statistics as in day partitions, bit for bit. Nor does a granule span a UTC hour edge where its series
+  is dense (hour cuts, `HOUR_CUT_MIN` = 3000, compile-time; `hour_lim`, `hk_cut`): at least 3000 rows of the series,
+  as given to that writer, lie in the hour before the edge. Hours and the days of whole-hour zones then answer from
+  statistics too. The rule counts the rows of the hour, never the rate of the last few (a burst is as fast as 1 Hz
+  while it lasts: a bursty series below 3000 rows an hour keeps its 8192-row granules) nor the class (a short
+  retention keeps slow series in class 0). A writer counts only the rows it was given, so a part that begins less
+  than 3000 rows before an edge (a flush, the first edge of an insert) does not cut there; the merges that see the
+  hour do. A merge copies a granule verbatim only where one writer given its rows would cut them the same way
+  (`pw_copy_fits`): no cut inside it, and a short one must end where the writer ends it (an hour cut, a day cut, or
+  the series' last row in the merge) with nothing of the series before that end left (in another source or later in
+  its own run); the counts come from the granule's count, window and longest gap between rows (`tw_gap`), and from
+  its decoded timestamps where those do not decide. Pending rows of the series go out before a copy only where a day
+  or hour cut lies between (`pw_hcut_before`). These rules shape the layout only: what makes a copy correct is
+  `before_rest` and no tombstone or retention filter. Readers take any granule boundaries, so hour cuts are not part
+  of the format; a database written before keeps its granules until merges rewrite them. `test_classes hourcut`
+  checks it (the hook `hour_cut_min`, 0: off, gives a database without them). Answers do not depend on the layout,
+  but for the last bits of float sums (float32 values too are summed in doubles per granule: exact only while their
+  range and count fit 53 bits), variances and TWA areas, which combine per granule.
+  Their count/nulls/sum/min/max, and m2 (floats) or the sum of squares (integers), must match the rows exactly,
+  because aggregates use them instead of decoding.
 - **Value types.** A series' type is fixed at creation and lives in the SERIES
   dictionary, not in the parts. Values travel as slots of `type_width(type)`
   bytes (4: float32, bool, state; 8: float64, int64); the memtable and the WAL

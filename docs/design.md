@@ -636,6 +636,35 @@ key is the base partition number.
   but day and 2.5-day buckets decoded nearly every granule. The cut is layout,
   not format: readers take any granule boundaries, a merge copies only granules
   inside one day and re-encodes (and so re-cuts) the rest.
+- **Granules of dense series end at hour edges** (hour cuts). In every class a
+  granule also ends at a UTC hour edge when at least 3000 rows of its series
+  lie in the hour before it (`HOUR_CUT_MIN`, a compile-time constant), counted
+  by the writer over the rows it was given. Rows, not a rate: a burst of 1 Hz
+  readings every quarter of an hour is as dense as 1 Hz while it lasts, and a
+  rule on the last few rows cut such a series (800 rows an hour) at every edge
+  a burst crossed, 9 granules becoming 72 and 41% more bytes (5x with values of
+  a few levels). Nor the class: a short retention keeps slow series in class 0,
+  and a class-0 partition holds fresh series too; a class rule would give a
+  series read every minute 60-row granules. Hourly buckets and the days of
+  zones a whole number of hours from UTC then come from granule statistics: on
+  the 100-billion-row benchmark, a whole table by hour took 53 s and by Oslo
+  day 41 s without them, against 0.2 s for UTC days. Cost: granules of a 1 Hz
+  series hold 3600 rows instead of 8192, 1-6% more bytes; each extra granule
+  costs 60-320 bytes depending on the codecs (an index entry of about 25, a
+  timestamp block's frame of 25 for a regular grid to about 120 for jittered
+  stamps, a value block's frame and the compression context it starts
+  afresh); up to 10% just above the threshold (3000 rows a granule); faster
+  series fill 8192 rows before the edge anyway (under 1%), and slower ones are
+  not cut. A writer that sees only part of an hour (a flush, the first edge of
+  an insert) does not cut at its end; the merges that see the whole hour do.
+  A merge copies a granule only where one writer given its rows would cut them
+  the same way: none of its edges is one where the writer cuts, and a short one
+  ends where the writer would end it (an hour cut, a day cut, the series' last
+  row) with nothing of the series before that end left. It judges from the
+  granule's count, time window and longest gap between rows, and decodes the
+  timestamps only when those leave the count of an hour on both sides of 3000;
+  so a merged layout is copied as it is by the next merge, and a granule
+  written before hour cuts is re-cut once. Layout again, not format.
 
 Writes are published atomically (`tmp_*.part`, fsync, rename, fsync dir).
 An insert that makes several parts (one per partition) commits through an

@@ -26,10 +26,22 @@
  *      and day buckets over whole days are answered from granule statistics alone.
  *  14. a switch waiting for a large insert in flight does not hold flushes back: a flush finishes while the insert
  *      is held inside its placement and the switch is pending; the switch goes through after the insert.
+ *  15. hour cuts (HOUR_CUT_MIN): with one writer per series and partition no granule spans an hour edge where its
+ *      series is dense (rates on both sides of the threshold, a row exactly at each edge, a gap of hours, granules
+ *      that fill exactly at an edge) and a short one ends only at such an edge; a slow series in class 0 (short
+ *      retention) keeps a granule a day; after small and large inserts, merges, a delete and a replace across edges
+ *      and a reopen the layout still holds, every granule's statistics are its rows', and every bucketed query
+ *      (minutes, hours, UTC days, Oslo and Kolkata days and hours, spread, TWA) answers as without hour cuts;
+ *      hours and Oslo days come from statistics alone; a merge copies whole hours (short granules) and ends with
+ *      one writer's layout; a database written without hour cuts gets them when merged; series in 1 Hz bursts
+ *      below 3000 rows an hour (class 1) keep the layout and bytes they have without hour cuts, and a series
+ *      dense three hours a day (class 1) is cut exactly at those hours, and a merge of merged parts copies every
+ *      granule it does not have to decode (a whole hour, a span of hours ended at an hour cut, a day's tail).
  *
  *   test_classes [scratch dir] */
 #define _GNU_SOURCE
 #include "tsdb.h"
+#include "tsdb_calendar.h"
 #include "../tools/datasets.h"
 #include <dirent.h>
 #include <errno.h>
@@ -38,6 +50,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +69,7 @@ typedef struct tsdb_test_granule {
     uint32_t grows;
 } tsdb_test_granule;
 void tsdb_test_granules(tsdb *t, void (*fn)(void *ctx, int cls, uint32_t i, const tsdb_test_granule *g), void *ctx);
+extern atomic_uint hour_cut_min; /* HOUR_CUT_MIN; 0 turns hour cuts off for the writers that begin after */
 
 #define DAY 86400000LL
 #define T0 (19723 * DAY) /* 2024-01-01 */
@@ -1595,11 +1609,831 @@ static void test_stall(void)
     OK(tsdb_close(db));
 }
 
+/* 15. Hour cuts (HOUR_CUT_MIN): a granule of a series dense at an hour edge (at least HOUR_CUT_MIN rows in the hour
+ * before it) ends there. The same rows go into databases with hour cuts on and off
+ * (hour_cut_min, read when a writer begins: each database's writes run with its own value). */
+#define HOUR 3600000LL
+#define HT0 (T0 + 3 * DAY)
+
+typedef struct hc_ser {
+    const char *name;
+    tsdb_type type;
+    size_t n;
+    int64_t *ts;
+    uint8_t *v;     /* slots of width */
+    uint8_t *alive; /* the model after deletes and replaces */
+    int width;
+} hc_ser;
+
+enum { HC_F32, HC_I64, HC_F64, HC_SWING, HC_SLOW, HC_NS };
+static hc_ser hcs[HC_NS];
+static unsigned hc_on_min; /* HOUR_CUT_MIN */
+
+static void hc_set(int on) { atomic_store(&hour_cut_min, on ? hc_on_min : 0); }
+
+/* the value of row i of generation gen into dst */
+static void hc_gen(const hc_ser *s, size_t i, int gen, void *dst)
+{
+    uint64_t r = mix(i * 8 + (uint64_t)s->type + (uint64_t)gen * 1000003);
+    if (s->type == TSDB_FLOAT32) { /* quarters below 2500: sums of up to 2^27 quarters are exact in a double */
+        float x = (float)((i * 7 + r % 97 + (uint64_t)gen * 13) % 10000) * 0.25f;
+        memcpy(dst, &x, 4);
+    } else if (s->type == TSDB_FLOAT64) {
+        double x = ((double)(i % 5000) * 0.01 + (double)(r % 1000) * 0.001) * 1.0000001;
+        memcpy(dst, &x, 8);
+    } else {
+        int64_t x = (int64_t)(r % 200001) - 100000;
+        memcpy(dst, &x, 8);
+    }
+}
+static void hc_val(hc_ser *s, size_t i, int gen) { hc_gen(s, i, gen, s->v + i * (size_t)s->width); }
+
+static void hc_make(void)
+{
+    static const struct {
+        int64_t step, len;
+    } swing[] = {{60000, 6 * HOUR}, {1200, 5 * HOUR}, {1250, 3 * HOUR}, {1000, 4 * HOUR},
+                 {60000, 6 * HOUR}, {1190, 7 * HOUR}, {1210, 7 * HOUR}, {60000, 10 * HOUR}};
+    static const char *names[HC_NS] = {"dense_f32", "dense_i64", "dense_f64", "swing_f32", "slow_c0"};
+    static const tsdb_type types[HC_NS] = {TSDB_FLOAT32, TSDB_INT64, TSDB_FLOAT64, TSDB_FLOAT32, TSDB_FLOAT32};
+    for (int k = 0; k < HC_NS; k++) {
+        hc_ser *s = &hcs[k];
+        s->name = names[k], s->type = types[k], s->width = s->type == TSDB_FLOAT32 ? 4 : 8;
+        size_t cap = 3 * 86400 + 16;
+        s->ts = malloc(cap * sizeof *s->ts), s->v = malloc(cap * 8), s->alive = malloc(cap);
+        size_t n = 0;
+        if (k == HC_F32) { /* 1 Hz with up to 300 ms of jitter, a row exactly at every hour edge, a 2.5-hour gap */
+            for (size_t i = 0; i < 3 * 86400; i++) {
+                int64_t t = HT0 + (int64_t)i * 1000 + (i % 3600 ? (int64_t)(mix(i) % 300) : 0);
+                if (t >= HT0 + DAY + 5 * HOUR + HOUR / 4 && t < HT0 + DAY + 7 * HOUR + 3 * HOUR / 4)
+                    continue;
+                s->ts[n++] = t;
+            }
+        } else if (k == HC_I64) { /* 2 Hz for a day */
+            for (size_t i = 0; i < 2 * 86400; i++)
+                s->ts[n++] = HT0 + (int64_t)i * 500;
+        } else if (k == HC_F64) { /* 3273 rows an hour, just above the threshold, for two days */
+            for (int64_t t = HT0 + 777; t < HT0 + 2 * DAY; t += 1100)
+                s->ts[n++] = t;
+        } else if (k == HC_SWING) { /* rates up and down across the threshold (1200 ms is exactly on it) */
+            int64_t t = HT0 + 37 * 60000;
+            for (size_t j = 0; j < sizeof swing / sizeof swing[0]; j++)
+                for (int64_t end = t + swing[j].len; t < end; t += swing[j].step)
+                    s->ts[n++] = t;
+        } else { /* one row a minute for three days, kept in class 0 by a short retention */
+            for (size_t i = 0; i < 3 * 1440; i++)
+                s->ts[n++] = HT0 + (int64_t)i * 60000;
+        }
+        s->n = n;
+        for (size_t i = 0; i < n; i++)
+            hc_val(s, i, 0), s->alive[i] = 1;
+    }
+}
+
+static int64_t hc_now(void *arg)
+{
+    (void)arg;
+    return HT0 + 4 * DAY;
+}
+
+static tsdb *hc_open(const char *dir, uint32_t grows, tsdb_sid *ids)
+{
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.merge_threads = 0;
+    o.clock_ms = hc_now;
+    if (grows)
+        o.granule_rows = grows;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    for (int k = 0; ids && k < HC_NS; k++) {
+        OK(tsdb_series_create(db, hcs[k].name, hcs[k].type, NULL, &ids[k]));
+        if (k == HC_SLOW)
+            OK(tsdb_set_retention(db, ids[k], 7 * DAY)); /* class 0: at most an eighth of the retention */
+    }
+    return db;
+}
+
+static void hc_put(tsdb *db, tsdb_sid id, const hc_ser *s, size_t a, size_t b, size_t batch)
+{
+    for (size_t i = a; i < b; i += batch) {
+        size_t m = b - i < batch ? b - i : batch;
+        tsdb_values v = {s->type, s->v + i * (size_t)s->width, NULL};
+        OK(tsdb_insert_series_values(db, id, s->ts + i, &v, m));
+    }
+}
+
+/* every series in one insert (a large insert, or WAL and one flush): each series' rows of a partition go through
+ * one writer, so the layout follows the rule exactly */
+static void hc_load_one(tsdb *db, const tsdb_sid *ids, int on)
+{
+    hc_set(on);
+    for (int k = 0; k < HC_NS; k++)
+        hc_put(db, ids[k], &hcs[k], 0, hcs[k].n, hcs[k].n);
+    OK(tsdb_flush(db));
+}
+
+/* 60% in small inserts (WAL, memtable, flushes), 20% in one large insert, optimize, then the rest */
+static void hc_load_rounds(tsdb *db, const tsdb_sid *ids, int on, int round)
+{
+    hc_set(on);
+    for (int k = 0; k < HC_NS; k++) {
+        size_t n = hcs[k].n, a = n * 3 / 5, b = n * 4 / 5;
+        if (round == 1) {
+            hc_put(db, ids[k], &hcs[k], 0, a, 2000);
+            OK(tsdb_flush(db));
+            hc_put(db, ids[k], &hcs[k], a, b, b - a);
+        } else {
+            hc_put(db, ids[k], &hcs[k], b, n, n - b);
+        }
+    }
+    OK(tsdb_flush(db));
+}
+
+static size_t hc_lb(const hc_ser *s, int64_t t)
+{
+    size_t lo = 0, hi = s->n;
+    while (lo < hi) {
+        size_t m = (lo + hi) / 2;
+        if (s->ts[m] < t)
+            lo = m + 1;
+        else
+            hi = m;
+    }
+    return lo;
+}
+
+/* A delete and a replace across hour edges, the same in a database and in the model (model only when db is NULL) */
+static void hc_edit(tsdb *db, const tsdb_sid *ids, int on)
+{
+    if (db)
+        hc_set(on);
+    /* dense_f32: delete across 10:00 of day 3 */
+    int64_t d0 = HT0 + 2 * DAY + 10 * HOUR - 1000000, d1 = HT0 + 2 * DAY + 10 * HOUR + 1500000;
+    if (db)
+        OK(tsdb_delete_range(db, ids[HC_F32], d0, d1));
+    else
+        for (size_t i = hc_lb(&hcs[HC_F32], d0); i < hc_lb(&hcs[HC_F32], d1); i++)
+            hcs[HC_F32].alive[i] = 0;
+    /* dense_f64: delete across 20:00 of day 1 */
+    d0 = HT0 + 20 * HOUR - 300000, d1 = HT0 + 20 * HOUR + 1;
+    if (db)
+        OK(tsdb_delete_range(db, ids[HC_F64], d0, d1));
+    else
+        for (size_t i = hc_lb(&hcs[HC_F64], d0); i < hc_lb(&hcs[HC_F64], d1); i++)
+            hcs[HC_F64].alive[i] = 0;
+    /* dense_i64 and swing (in its 1 s segment): replace across an edge with new values, every third row dropped */
+    int which[2] = {HC_I64, HC_SWING};
+    int64_t r0[2] = {HT0 + 15 * HOUR - 600000, HT0 + 16 * HOUR - 600000}; /* across 15:00 and 16:00 */
+    for (int w = 0; w < 2; w++) {
+        hc_ser *s = &hcs[which[w]];
+        int64_t a = r0[w], b = a + 1500000;
+        size_t i0 = hc_lb(s, a), i1 = hc_lb(s, b), m = 0;
+        int64_t *ts = malloc((i1 - i0) * sizeof *ts);
+        uint8_t *v = malloc((i1 - i0) * 8);
+        for (size_t i = i0; i < i1; i++) {
+            if (!db) {
+                s->alive[i] = (i - i0) % 3 != 2;
+                if (s->alive[i])
+                    hc_val(s, i, 1);
+            } else if ((i - i0) % 3 != 2) {
+                hc_gen(s, i, 1, v + m * (size_t)s->width);
+                ts[m++] = s->ts[i];
+            }
+        }
+        if (db) {
+            tsdb_values tv = {s->type, v, NULL};
+            OK(tsdb_replace_range(db, ids[which[w]], a, b, ts, &tv, m));
+        }
+        free(ts), free(v);
+    }
+}
+
+/* 1 dense, 0 not, -1 unknown: whether the writer cuts series s at hour edge e, that is whether at least
+ * HOUR_CUT_MIN live rows lie in the hour before e (one writer given every row of that hour). With slack, counts
+ * within 5% of the threshold are unknown (a merge takes copied granules' rows as evenly spaced). */
+static int hc_dense_at(const hc_ser *s, int64_t e, int slack)
+{
+    int64_t got = 0;
+    for (size_t i = hc_lb(s, e - HOUR); i < hc_lb(s, e); i++)
+        got += s->alive[i];
+    int64_t lim = hc_on_min;
+    if (!slack)
+        return got >= lim;
+    return got * 20 >= lim * 21 ? 1 : got * 20 < lim * 19 ? 0 : -1;
+}
+
+typedef struct hc_gran {
+    tsdb_test_granule g;
+    int cls;
+    uint32_t i;
+} hc_gran;
+typedef struct hc_glist {
+    hc_gran *a;
+    size_t n, cap;
+} hc_glist;
+
+static void on_hc_granule(void *ctx, int cls, uint32_t i, const tsdb_test_granule *g)
+{
+    hc_glist *l = ctx;
+    if (l->n == l->cap)
+        l->a = realloc(l->a, (l->cap = l->cap ? 2 * l->cap : 1024) * sizeof *l->a);
+    l->a[l->n++] = (hc_gran){*g, cls, i};
+}
+
+static int hc_which(const tsdb_sid *ids, uint32_t series) /* a granule names its series by the local id */
+{
+    for (int k = 0; k < HC_NS; k++)
+        if (TSDB_SID_LOCAL(ids[k]) == series)
+            return k;
+    return -1;
+}
+
+/* The layout: no granule spans an edge where its series is dense; a short granule followed by more of its series
+ * in its part ends at an hour edge (exact: a day edge or one where the series is dense or may be); slow_c0 keeps one
+ * granule a day. */
+static void hc_layout(tsdb *db, const tsdb_sid *ids, int exact, const char *what)
+{
+    hc_glist l = {0};
+    tsdb_test_granules(db, on_hc_granule, &l);
+    int cross = 0, shorts = 0, slow = 0;
+    for (size_t j = 0; j < l.n; j++) {
+        const tsdb_test_granule *g = &l.a[j].g;
+        int k = hc_which(ids, g->series);
+        if (k < 0)
+            continue;
+        if (k == HC_SLOW && (l.a[j].cls != 0 || g->count != 1440 || g->ts_min % DAY != 0))
+            if (slow++ < 3)
+                printf("  %s: slow_c0 granule of %u rows from %" PRId64 " in class %d (want 1440 from a day start)\n",
+                       what, g->count, g->ts_min, l.a[j].cls);
+        for (int64_t e = (floor_div(g->ts_min, HOUR) + 1) * HOUR; e <= g->ts_max; e += HOUR)
+            if (e % DAY && hc_dense_at(&hcs[k], e, !exact) == 1 && cross++ < 3)
+                printf("  %s: %s granule [%" PRId64 ", %" PRId64 "] (%u rows) spans the edge %" PRId64
+                       " where it is dense\n", what, hcs[k].name, g->ts_min, g->ts_max, g->count, e);
+        if (j + 1 < l.n && l.a[j + 1].i && l.a[j + 1].g.series == g->series && g->count < g->grows) {
+            const tsdb_test_granule *x = &l.a[j + 1].g;
+            int ok = 0;
+            for (int64_t e = (floor_div(g->ts_max, HOUR) + 1) * HOUR; e <= x->ts_min && !ok; e += HOUR)
+                ok = !exact || e % DAY == 0 || hc_dense_at(&hcs[k], e, 0) != 0;
+            if (!ok && shorts++ < 3)
+                printf("  %s: short %s granule (%u rows, [%" PRId64 ", %" PRId64 "]) before one at %" PRId64 "\n",
+                       what, hcs[k].name, g->count, g->ts_min, g->ts_max, x->ts_min);
+        }
+    }
+    CK(!cross && !shorts && !slow, "%s: %d granules span dense edges, %d short ones end elsewhere, %d bad slow_c0",
+       what, cross, shorts, slow);
+    free(l.a);
+}
+
+/* each granule's statistics are its rows': a query over exactly its range answers from them and as the rows */
+typedef struct hc_rows {
+    int type;
+    uint64_t n;
+    double sum, min, max;
+    __int128 isum;
+    int64_t imin, imax;
+    long double sq; /* for the variance: sum of (x - mean)^2, second pass */
+    double mean;
+    int pass;
+} hc_rows;
+
+static int on_hc_rows(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
+{
+    hc_rows *r = ctx;
+    for (size_t i = 0; i < n; i++) {
+        double x = v->type == TSDB_FLOAT32 ? ((const float *)v->values)[i]
+                   : v->type == TSDB_FLOAT64 ? ((const double *)v->values)[i]
+                                             : (double)((const int64_t *)v->values)[i];
+        if (r->pass) {
+            r->sq += ((long double)x - r->mean) * ((long double)x - r->mean);
+            continue;
+        }
+        if (!r->n++)
+            r->min = r->max = x, r->imin = r->imax = v->type == TSDB_INT64 ? ((const int64_t *)v->values)[i] : 0;
+        r->sum += x;
+        r->min = x < r->min ? x : r->min, r->max = x > r->max ? x : r->max;
+        if (v->type == TSDB_INT64) {
+            int64_t y = ((const int64_t *)v->values)[i];
+            r->isum += y, r->imin = y < r->imin ? y : r->imin, r->imax = y > r->imax ? y : r->imax;
+        }
+    }
+    (void)ts;
+    return 0;
+}
+
+static void hc_gstats(tsdb *db, const tsdb_sid *ids, const char *what)
+{
+    hc_glist l = {0};
+    tsdb_test_granules(db, on_hc_granule, &l);
+    int bad = 0, checked = 0;
+    for (size_t j = 0; j < l.n; j++) {
+        const tsdb_test_granule *g = &l.a[j].g;
+        int k = hc_which(ids, g->series);
+        if (k < 0)
+            continue;
+        hc_rows r = {.type = hcs[k].type};
+        OK(tsdb_query_values(db, ids[k], g->ts_min, g->ts_max + 1, NULL, on_hc_rows, &r));
+        r.mean = r.n ? (double)((long double)r.sum / r.n) : 0, r.pass = 1;
+        if (hcs[k].type == TSDB_INT64)
+            r.mean = (double)((long double)r.isum / r.n);
+        OK(tsdb_query_values(db, ids[k], g->ts_min, g->ts_max + 1, NULL, on_hc_rows, &r));
+        tsdb_spread_bucket *sb = NULL;
+        size_t nb = 0;
+        OK(tsdb_query_spread(db, ids[k], g->ts_min, g->ts_max + 1, 0, NULL, &sb, &nb));
+        tsdb_query_stats st;
+        tsdb_last_query_stats(&st);
+        checked++;
+        const tsdb_bucket *b = nb ? &sb[0].b : NULL;
+        double var = r.n ? (double)(r.sq / r.n) : 0;
+        int ok = b && st.rows_decoded == 0 && st.granules == 1 && st.granules_from_stats == 1 && b->count == g->count &&
+                 r.n == g->count && fabs(sb[0].var_pop - var) <= 1e-9 * var + 1e-12;
+        if (ok && hcs[k].type == TSDB_INT64)
+            ok = b->isum == (int64_t)r.isum && b->imin == r.imin && b->imax == r.imax;
+        else if (ok)
+            ok = b->min == r.min && b->max == r.max &&
+                 (hcs[k].type == TSDB_FLOAT32 ? b->sum == r.sum : fabs(b->sum - r.sum) <= 1e-12 * fabs(r.sum));
+        if (!ok && bad++ < 3)
+            printf("  %s: %s granule [%" PRId64 ", %" PRId64 "] (%u rows): %" PRIu64 " decoded, %" PRIu64 "/%" PRIu64
+                   " from stats; count %" PRIu64 " rows %" PRIu64 ", sum %.17g rows %.17g, var %.17g rows %.17g\n",
+                   what, hcs[k].name, g->ts_min, g->ts_max, g->count, st.rows_decoded, st.granules_from_stats,
+                   st.granules, b ? b->count : 0, r.n, b ? b->sum : 0, r.sum, nb ? sb[0].var_pop : 0, var);
+        free(sb);
+    }
+    CK(!bad && checked > 150, "%s: %d of %d granules' statistics differ from their rows", what, bad, checked);
+    free(l.a);
+}
+
+/* Answers of every bucketed kind with hour cuts on and off: bit for bit, but float64 sums, the spread's variances
+ * and TWA areas, which combine per granule in another order where granules differ (to 1e-12, 1e-9, 1e-12). Float32
+ * and int64 sums are exact here (quarters, integers), so their buckets must agree bit for bit. */
+static int hc_same_b(const tsdb_bucket *x, const tsdb_bucket *y, size_t n, int f64)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (!f64 ? memcmp(&x[i], &y[i], sizeof *x) != 0
+                 : x[i].start != y[i].start || x[i].count != y[i].count || x[i].min != y[i].min ||
+                       x[i].max != y[i].max || fabs(x[i].sum - y[i].sum) > 1e-12 * fabs(y[i].sum))
+            return 0;
+    }
+    return 1;
+}
+
+static int hc_same_s(const tsdb_spread_bucket *x, const tsdb_spread_bucket *y, size_t n, int f64)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (!hc_same_b(&x[i].b, &y[i].b, 1, f64) || x[i].range != y[i].range)
+            return 0;
+        double a[4] = {x[i].var_pop, x[i].var_samp, x[i].stddev_pop, x[i].stddev_samp};
+        double b[4] = {y[i].var_pop, y[i].var_samp, y[i].stddev_pop, y[i].stddev_samp};
+        for (int j = 0; j < 4; j++)
+            if (!(a[j] == b[j] || fabs(a[j] - b[j]) <= 1e-9 * fabs(b[j]) || (isnan(a[j]) && isnan(b[j]))))
+                return 0;
+    }
+    return 1;
+}
+
+/* TWA areas sum segment areas per granule (from its statistics) and across granule ends in an order the granules
+ * set, so with other granules they can differ in the last bits (seen: 1 in 1e16 on jittered timestamps): close,
+ * not bit for bit; hc_twa_inexact counts the answers that differ at all */
+static int hc_twa_inexact;
+static int hc_same_t(const tsdb_twa_bucket *x, const tsdb_twa_bucket *y, size_t n, int f64)
+{
+    (void)f64;
+    int exact = 1;
+    for (size_t i = 0; i < n; i++) {
+        exact &= x[i].area == y[i].area && x[i].twa == y[i].twa;
+        if (x[i].start != y[i].start || x[i].count != y[i].count || x[i].covered_ms != y[i].covered_ms ||
+            fabs(x[i].area - y[i].area) > 1e-12 * fabs(y[i].area) ||
+            fabs(x[i].twa - y[i].twa) > 1e-12 * fabs(y[i].twa)) {
+            printf("    bucket %zu: start %" PRId64 "/%" PRId64 " count %" PRIu64 "/%" PRIu64 " covered %" PRId64
+                   "/%" PRId64 " area %.17g/%.17g twa %.17g/%.17g\n", i, x[i].start, y[i].start, x[i].count,
+                   y[i].count, x[i].covered_ms, y[i].covered_ms, x[i].area, y[i].area, x[i].twa, y[i].twa);
+            return 0;
+        }
+    }
+    hc_twa_inexact += !exact;
+    return 1;
+}
+
+static void hc_compare(tsdb *on, tsdb *off, const tsdb_sid *ion, const tsdb_sid *ioff, int only, const char *what)
+{
+    static const int64_t iv[] = {0, 60000, 1020000, HOUR, DAY};
+    static const tsdb_group gr[] = {{TSDB_HOUR, 1, NULL},          {TSDB_DAY, 1, NULL},
+                                    {TSDB_DAY, 1, "Europe/Oslo"},  {TSDB_DAY, 1, "Asia/Kolkata"},
+                                    {TSDB_HOUR, 1, "Asia/Kolkata"}, {TSDB_MINUTE, 1, "Europe/Oslo"}};
+    int nq = 0, bad = 0;
+    for (int k = 0; k < HC_NS; k++) {
+        if (only >= 0 && k != only)
+            continue;
+        const hc_ser *s = &hcs[k];
+        int f64 = s->type == TSDB_FLOAT64;
+        int64_t lo = s->ts[0], hi = s->ts[s->n - 1] + 1;
+        int64_t win[7][2] = {{lo - DAY, hi + DAY}, {HT0 + HOUR + 123, HT0 + DAY + 7 * HOUR}, {HT0 + DAY - HOUR, hi}};
+        for (int w = 3; w < 7; w++) {
+            int64_t x = lo + (int64_t)(rnd() % (uint64_t)(hi - lo)), y = lo + (int64_t)(rnd() % (uint64_t)(hi - lo));
+            win[w][0] = x < y ? x : y, win[w][1] = (x < y ? y : x) + 1;
+        }
+        for (int w = 0; w < 7; w++) {
+            int64_t a = win[w][0], z = win[w][1];
+            dc_vh vx = {0xcbf29ce484222325ULL, 0}, vy = vx;
+            OK(tsdb_query_values(on, ion[k], a, z, NULL, on_dc_values, &vx));
+            OK(tsdb_query_values(off, ioff[k], a, z, NULL, on_dc_values, &vy));
+            nq++;
+            if ((vx.h != vy.h || vx.n != vy.n) && bad++ < 3)
+                printf("  %s: %s window %d: rows differ\n", what, s->name, w);
+#define HC_CMP(T, same, call_on, call_off)                                                                         \
+    do {                                                                                                           \
+        T *x_ = NULL, *y_ = NULL;                                                                                  \
+        size_t nx_ = 0, ny_ = 0;                                                                                   \
+        OK(call_on);                                                                                               \
+        OK(call_off);                                                                                              \
+        nq++;                                                                                                      \
+        if ((nx_ != ny_ || !same(x_, y_, nx_, f64)) && bad++ < 3)                                                  \
+            printf("  %s: %s window %d [%" PRId64 ", %" PRId64 "): %s differs (%zu, %zu buckets)\n", what, s->name, \
+                   w, a, z, #call_on, nx_, ny_);                                                                   \
+        free(x_), free(y_);                                                                                        \
+    } while (0)
+            for (size_t i = 0; i < sizeof iv / sizeof iv[0]; i++) {
+                HC_CMP(tsdb_bucket, hc_same_b, tsdb_query_agg(on, ion[k], a, z, iv[i], &x_, &nx_),
+                       tsdb_query_agg(off, ioff[k], a, z, iv[i], &y_, &ny_));
+                tsdb_twa_opts to[2] = {{.method = TSDB_TWA_STEP}, {.method = TSDB_TWA_LINEAR}};
+                for (int m = 0; m < 2; m++)
+                    HC_CMP(tsdb_twa_bucket, hc_same_t, tsdb_query_twa(on, ion[k], a, z, iv[i], &to[m], &x_, &nx_),
+                           tsdb_query_twa(off, ioff[k], a, z, iv[i], &to[m], &y_, &ny_));
+            }
+            HC_CMP(tsdb_spread_bucket, hc_same_s, tsdb_query_spread(on, ion[k], a, z, HOUR, NULL, &x_, &nx_),
+                   tsdb_query_spread(off, ioff[k], a, z, HOUR, NULL, &y_, &ny_));
+            for (size_t i = 0; i < sizeof gr / sizeof gr[0]; i++) {
+                HC_CMP(tsdb_bucket, hc_same_b, tsdb_query_group_local(on, ion[k], a, z, &gr[i], NULL, &x_, &nx_),
+                       tsdb_query_group_local(off, ioff[k], a, z, &gr[i], NULL, &y_, &ny_));
+                tsdb_twa_opts to[2] = {{.method = TSDB_TWA_STEP}, {.method = TSDB_TWA_LINEAR}};
+                for (int m = 0; m < 2; m++)
+                    HC_CMP(tsdb_twa_bucket, hc_same_t,
+                           tsdb_query_twa_group_local(on, ion[k], a, z, &gr[i], &to[m], &x_, &nx_),
+                           tsdb_query_twa_group_local(off, ioff[k], a, z, &gr[i], &to[m], &y_, &ny_));
+            }
+            HC_CMP(tsdb_spread_bucket, hc_same_s,
+                   tsdb_query_spread_group_local(on, ion[k], a, z, &gr[2], NULL, &x_, &nx_),
+                   tsdb_query_spread_group_local(off, ioff[k], a, z, &gr[2], NULL, &y_, &ny_));
+#undef HC_CMP
+        }
+    }
+    CK(!bad, "%s: %d of %d answers differ between hour cuts on and off", what, bad, nq);
+    printf("  %s: %d answers compared, %d TWA answers not bit for bit (within 1e-12)\n", what, nq, hc_twa_inexact);
+    hc_twa_inexact = 0;
+}
+
+/* hourly and Oslo-day buckets of dense_f32 come from statistics alone with hour cuts; Kolkata days decode one
+ * granule a day (its midnight is at :30); without hour cuts hours decode */
+static void hc_coverage(tsdb *db, tsdb_sid id, int on, const char *what)
+{
+    tsdb_bucket *b = NULL;
+    size_t nb = 0;
+    tsdb_query_stats st;
+    OK(tsdb_query_agg(db, id, HT0, HT0 + DAY, HOUR, &b, &nb));
+    tsdb_last_query_stats(&st);
+    free(b);
+    if (on)
+        CK(nb == 24 && st.rows_decoded == 0 && st.granules_from_stats == st.granules,
+           "%s: hours of day 1: %zu buckets, %" PRIu64 " rows decoded, %" PRIu64 "/%" PRIu64 " granules from stats",
+           what, nb, st.rows_decoded, st.granules_from_stats, st.granules);
+    else
+        CK(st.rows_decoded > 0, "%s: hours of day 1 without hour cuts decode nothing", what);
+    if (!on)
+        return;
+    tsdb_group oslo = {TSDB_DAY, 1, "Europe/Oslo"}, kol = {TSDB_DAY, 1, "Asia/Kolkata"};
+    OK(tsdb_query_group_local(db, id, HT0 + DAY - HOUR, HT0 + 3 * DAY - HOUR, &oslo, NULL, &b, &nb));
+    tsdb_last_query_stats(&st);
+    free(b);
+    CK(nb == 2 && st.rows_decoded == 0, "%s: Oslo days 2 and 3 (one across the gap): %zu buckets, %" PRIu64
+       " rows decoded", what, nb, st.rows_decoded);
+    OK(tsdb_query_group_local(db, id, HT0, HT0 + 3 * DAY, &kol, NULL, &b, &nb));
+    tsdb_last_query_stats(&st);
+    free(b);
+    CK(nb == 4 && st.granules - st.granules_from_stats <= 3 && st.rows_decoded <= 3 * 3600,
+       "%s: Kolkata days: %zu buckets, %" PRIu64 " of %" PRIu64 " granules decoded, %" PRIu64 " rows", what, nb,
+       st.granules - st.granules_from_stats, st.granules, st.rows_decoded);
+}
+
+/* granules (series, ts_min, ts_max, count) of one series, for comparing layouts */
+static hc_glist hc_series_granules(tsdb *db, tsdb_sid id)
+{
+    hc_glist l = {0}, r = {0};
+    tsdb_test_granules(db, on_hc_granule, &l);
+    for (size_t j = 0; j < l.n; j++)
+        if (l.a[j].g.series == TSDB_SID_LOCAL(id)) /* one volume: the local id names the series */
+            on_hc_granule(&r, l.a[j].cls, 0, &l.a[j].g);
+    free(l.a);
+    return r;
+}
+
+static int hc_same_layout(const hc_glist *x, const hc_glist *y)
+{
+    if (x->n != y->n)
+        return 0;
+    for (size_t j = 0; j < x->n; j++)
+        if (x->a[j].g.ts_min != y->a[j].g.ts_min || x->a[j].g.ts_max != y->a[j].g.ts_max ||
+            x->a[j].g.count != y->a[j].g.count)
+            return 0;
+    return 1;
+}
+
+/* a 1 Hz grid from a day start in granules of `grows` rows: each hour is whole granules, the last one ending
+ * exactly at the edge (1800: full exactly there; 1000: 600 rows) */
+static void hc_exact_edges(uint32_t grows)
+{
+    char dir[600];
+    char name[32];
+    snprintf(name, sizeof name, "hc-grows%u", grows);
+    dir_of(dir, sizeof dir, name);
+    hc_set(1);
+    tsdb *db = hc_open(dir, grows, NULL);
+    tsdb_sid id;
+    OK(tsdb_series_create(db, "grid", TSDB_FLOAT32, NULL, &id));
+    size_t n = 86400;
+    int64_t *ts = malloc(n * sizeof *ts);
+    float *v = malloc(n * sizeof *v);
+    for (size_t i = 0; i < n; i++)
+        ts[i] = HT0 + (int64_t)i * 1000, v[i] = (float)(i % 1000);
+    OK(tsdb_insert_series(db, id, ts, v, n));
+    OK(tsdb_optimize(db));
+    hc_glist l = hc_series_granules(db, id);
+    size_t per = (3600 + grows - 1) / grows, bad = 0;
+    CK(l.n == 24 * per, "granule_rows %u: %zu granules, want %zu", grows, l.n, 24 * per);
+    for (size_t j = 0; j < l.n && j < 24 * per; j++) {
+        size_t q = j % per;
+        uint32_t want = q + 1 < per ? grows : 3600 - (uint32_t)(per - 1) * grows;
+        int64_t start = HT0 + (int64_t)(j / per) * HOUR + (int64_t)q * grows * 1000;
+        if ((l.a[j].g.count != want || l.a[j].g.ts_min != start) && bad++ < 3)
+            printf("  granule_rows %u: granule %zu has %u rows from %" PRId64 ", want %u from %" PRId64 "\n", grows,
+                   j, l.a[j].g.count, l.a[j].g.ts_min, want, start);
+    }
+    CK(!bad, "granule_rows %u: %zu granules not as whole hours", grows, bad);
+    free(l.a), free(ts), free(v);
+    OK(tsdb_close(db));
+    rm_rf(dir);
+}
+
+/* the last row of every day again, and optimize: a merge in every partition, which may copy the granules before
+ * that row */
+static void hc_touch(tsdb *db, const tsdb_sid *ids)
+{
+    for (int k = 0; k < HC_NS; k++)
+        for (int d = 0; d < 3; d++) {
+            size_t i = hc_lb(&hcs[k], HT0 + (d + 1) * DAY);
+            if (i > 0 && hcs[k].ts[i - 1] >= HT0 + d * DAY)
+                hc_put(db, ids[k], &hcs[k], i - 1, i, 1);
+        }
+    OK(tsdb_flush(db));
+    OK(tsdb_optimize(db));
+}
+
+/* One series alone in a fresh database with hour cuts on or off: loaded in one insert, optimized, then merged twice
+ * more (hc_retouch), the second time from merged parts only, where granules are copied */
+typedef struct hc_db {
+    char dir[600];
+    tsdb *db;
+    tsdb_sid id;
+    int64_t *ts;
+    float *v;
+    size_t n;
+    uint64_t copied; /* granules the last merge copied */
+} hc_db;
+
+static void hc_retouch(hc_db *d, int64_t at)
+{
+    /* the row at or after `at` of each of the three days again: a merge in every partition, which re-encodes the
+     * granule of that row and may copy the others */
+    for (int day = 0; day < 3; day++) {
+        size_t i = 0;
+        while (i < d->n && d->ts[i] < HT0 + day * DAY + at)
+            i++;
+        if (i < d->n && d->ts[i] < HT0 + (day + 1) * DAY)
+            OK(tsdb_insert_series(d->db, d->id, d->ts + i, d->v + i, 1));
+    }
+    OK(tsdb_flush(d->db));
+    tsdb_stats s0, s1;
+    OK(tsdb_get_stats(d->db, &s0));
+    OK(tsdb_optimize(d->db));
+    OK(tsdb_get_stats(d->db, &s1));
+    d->copied = s1.passthrough_granules - s0.passthrough_granules;
+}
+
+static void hc_db_load(hc_db *d, const char *name, int on, int64_t *ts, size_t n, int64_t touch_at)
+{
+    snprintf(d->dir, sizeof d->dir, "%s/%s-%s", base, name, on ? "on" : "off");
+    rm_rf(d->dir);
+    hc_set(on);
+    d->db = hc_open(d->dir, 0, NULL);
+    OK(tsdb_series_create(d->db, name, TSDB_FLOAT32, NULL, &d->id));
+    d->ts = ts, d->n = n, d->v = malloc(n * sizeof *d->v);
+    for (size_t i = 0; i < n; i++)
+        d->v[i] = (float)(mix(i) % 4000) * 0.25f;
+    OK(tsdb_insert_series(d->db, d->id, ts, d->v, n));
+    OK(tsdb_flush(d->db));
+    OK(tsdb_optimize(d->db));
+    hc_retouch(d, touch_at); /* merged parts from here on */
+    hc_retouch(d, touch_at);
+}
+
+static void hc_db_close(hc_db *d)
+{
+    OK(tsdb_close(d->db));
+    rm_rf(d->dir);
+    free(d->v);
+}
+
+/* Bursts of `len` rows at 1 Hz every `every` seconds, the first at HT0 + first seconds, for three days: on average
+ * below HOUR_CUT_MIN rows an hour, though a burst across an hour edge is as dense as 1 Hz there. Hour cuts leave
+ * their granules alone: the layout, the bytes and what a merge copies are the same as without them. */
+static void hc_bursty(const char *name, int64_t len, int64_t every, int64_t first)
+{
+    size_t cap = (size_t)(3 * 86400 / every + 1) * (size_t)len, n = 0;
+    int64_t *ts = malloc(cap * sizeof *ts);
+    for (int64_t b = HT0 + first * 1000; b + len * 1000 <= HT0 + 3 * DAY; b += every * 1000)
+        for (int64_t j = 0; j < len; j++)
+            ts[n++] = b + j * 1000 + (j ? (int64_t)(mix((uint64_t)b + (uint64_t)j) % 200) : 0);
+    hc_db on, off;
+    hc_db_load(&on, name, 1, ts, n, 0);
+    hc_db_load(&off, name, 0, ts, n, 0);
+    hc_glist gon = hc_series_granules(on.db, on.id), goff = hc_series_granules(off.db, off.id);
+    tsdb_stats son, soff;
+    OK(tsdb_get_stats(on.db, &son));
+    OK(tsdb_get_stats(off.db, &soff));
+    printf("  %s: %zu rows (%.0f an hour) in class %d: %zu granules, %" PRIu64 " bytes; without hour cuts %zu, %" PRIu64
+           "; the last merge copied %" PRIu64 " and %" PRIu64 "\n", name, n, (double)n / 72, cls_of(on.db, on.id),
+           gon.n, son.bytes, goff.n, soff.bytes, on.copied, off.copied);
+    CK(cls_of(on.db, on.id) == 1, "%s: class %d, want 1", name, cls_of(on.db, on.id));
+    CK(hc_same_layout(&gon, &goff) && son.bytes == soff.bytes && gon.n <= n / 8192 + 3,
+       "%s: hour cuts change the layout of a bursty series: %zu granules, %" PRIu64 " bytes; without them %zu, %" PRIu64,
+       name, gon.n, son.bytes, goff.n, soff.bytes);
+    /* the second merge re-encodes the granule of each day's first row and copies the rest */
+    CK(on.copied == off.copied && on.copied + 3 == gon.n, "%s: the last merge copied %" PRIu64 " of %zu granules "
+       "(%" PRIu64 " without hour cuts), want all but 3", name, on.copied, gon.n, off.copied);
+    free(gon.a), free(goff.a);
+    hc_db_close(&on), hc_db_close(&off);
+    free(ts);
+}
+
+/* A series dense three hours a day (06:00 to 09:00 at 1 Hz, one row a minute otherwise; 12,060 rows a day, so
+ * class 1: week partitions, granules cut at day edges): a day is four granules, 00:00-07:00 (360 + 3600 rows: the
+ * hour before 06:00 has 60), 07:00-08:00, 08:00-09:00 and 09:00-24:00 (900 rows, ended by the day cut). A merge
+ * keeps that layout and copies each of them where nothing else of the series comes before its end: a whole hour,
+ * one that spans hours and ends at an hour cut (its stamps decide), one that ends at the day cut. */
+static void hc_class1(void)
+{
+    size_t n = 0;
+    int64_t *ts = malloc(3 * 12060 * sizeof *ts);
+    for (int day = 0; day < 3; day++)
+        for (int64_t t = 0; t < DAY; t += t >= 6 * HOUR && t < 9 * HOUR ? 1000 : 60000)
+            ts[n++] = HT0 + day * DAY + t;
+    hc_db on, off;
+    hc_db_load(&on, "dense3h", 1, ts, n, 3 * HOUR); /* the row at 03:00: the first granule of each day decodes */
+    hc_db_load(&off, "dense3h", 0, ts, n, 3 * HOUR);
+    CK(cls_of(on.db, on.id) == 1, "dense3h: class %d, want 1", cls_of(on.db, on.id));
+    hc_glist l = hc_series_granules(on.db, on.id), lo = hc_series_granules(off.db, off.id);
+    static const int64_t start[4] = {0, 7 * HOUR, 8 * HOUR, 9 * HOUR};
+    static const uint32_t count[4] = {3960, 3600, 3600, 900};
+    size_t bad = l.n != 12;
+    for (size_t j = 0; j < l.n && j < 12; j++)
+        if ((l.a[j].g.ts_min != HT0 + (int64_t)(j / 4) * DAY + start[j % 4] || l.a[j].g.count != count[j % 4]) &&
+            bad++ < 3)
+            printf("  dense3h: granule %zu of %u rows from %" PRId64 " (want %u from %" PRId64 ")\n", j,
+                   l.a[j].g.count, l.a[j].g.ts_min, count[j % 4], (int64_t)(HT0 + (int64_t)(j / 4) * DAY + start[j % 4]));
+    CK(!bad, "dense3h: %zu granules, %zu not as one writer cuts them", l.n, bad);
+    /* without hour cuts: 8192 rows and the 3868 left before the day cut, which the merge copies */
+    CK(lo.n == 6 && on.copied == 9 && off.copied == 3, "dense3h: the last merge copied %" PRIu64 " of %zu granules "
+       "(want 9 of 12), without hour cuts %" PRIu64 " of %zu (want 3 of 6)", on.copied, l.n, off.copied, lo.n);
+    tsdb_stats son, soff;
+    OK(tsdb_get_stats(on.db, &son));
+    OK(tsdb_get_stats(off.db, &soff));
+    printf("  dense3h: %zu granules, %" PRIu64 " bytes; without hour cuts %zu, %" PRIu64 "\n", l.n, son.bytes, lo.n,
+           soff.bytes);
+    free(l.a), free(lo.a);
+    hc_db_close(&on), hc_db_close(&off);
+    free(ts);
+}
+
+static void test_hourcut(void)
+{
+    hc_on_min = atomic_load(&hour_cut_min);
+    if (hc_on_min != 3000) { /* the data sets sit on both sides of 3000 rows an hour */
+        printf("  skipped: HOUR_CUT_MIN is %u, these cases are built around 3000\n", hc_on_min);
+        return;
+    }
+    hc_make();
+    hc_exact_edges(1800);
+    hc_exact_edges(1000);
+    hc_bursty("burst15m", 200, 900, 3500); /* 800 rows an hour, 100 of a burst before each hour edge */
+    hc_bursty("burst5m", 100, 300, 3530);  /* 1200 rows an hour, 70 before each hour edge */
+    hc_class1();
+
+    /* one writer per series and partition: the rule exactly, edges at granule ends, the threshold both ways */
+    char d_one[600], d_on[600], d_off[600], d_old[600], d_il[600];
+    dir_of(d_one, sizeof d_one, "hc-one");
+    dir_of(d_on, sizeof d_on, "hc-on");
+    dir_of(d_off, sizeof d_off, "hc-off");
+    dir_of(d_old, sizeof d_old, "hc-old");
+    dir_of(d_il, sizeof d_il, "hc-il");
+    tsdb_sid i_one[HC_NS], i_on[HC_NS], i_off[HC_NS], i_old[HC_NS], i_il[HC_NS];
+    tsdb *one = hc_open(d_one, 0, i_one), *on = hc_open(d_on, 0, i_on), *off = hc_open(d_off, 0, i_off);
+    hc_load_one(one, i_one, 1);
+    hc_layout(one, i_one, 1, "one writer");
+    CK(cls_of(one, i_one[HC_SLOW]) == 0, "slow_c0 in class %d", cls_of(one, i_one[HC_SLOW]));
+    hc_glist ref = hc_series_granules(one, i_one[HC_F32]);
+    size_t f32_hours = 0;
+    for (size_t j = 0; j < ref.n; j++)
+        f32_hours += ref.a[j].g.count < 3000 || ref.a[j].g.count > 3600 ? 0 : 1;
+    CK(ref.n == 69 && f32_hours == 68, "dense_f32: %zu granules, %zu of whole hours (want 69 and 68: 72 hours, "
+       "the two inside the gap gone; the 900 rows before it, the 900 after it and the hour after that in one, as "
+       "the hours before 06:00 and 08:00 hold 900 rows)", ref.n, f32_hours);
+
+    /* dense_f32 in chunks of 20000 rows, even ones first: the second optimize copies the whole hours inside the
+     * first round's chunks (short granules) and ends with the layout of one writer */
+    tsdb *il = hc_open(d_il, 0, i_il);
+    const hc_ser *f = &hcs[HC_F32];
+    size_t chunk = 20000;
+    for (int ph = 0; ph < 2; ph++) {
+        for (size_t a = (size_t)ph * chunk; a < f->n; a += 2 * chunk)
+            hc_put(il, i_il[HC_F32], f, a, a + chunk < f->n ? a + chunk : f->n, chunk);
+        OK(tsdb_flush(il));
+        tsdb_stats s0, s1;
+        OK(tsdb_get_stats(il, &s0));
+        OK(tsdb_optimize(il));
+        OK(tsdb_get_stats(il, &s1));
+        if (ph == 1)
+            CK(s1.passthrough_granules - s0.passthrough_granules >= 20, "interleaved: %" PRIu64 " granules copied",
+               s1.passthrough_granules - s0.passthrough_granules);
+    }
+    hc_glist gil = hc_series_granules(il, i_il[HC_F32]);
+    CK(hc_same_layout(&gil, &ref), "interleaved chunks: %zu granules, not the %zu of one writer", gil.n, ref.n);
+    free(gil.a);
+    OK(tsdb_close(il));
+
+    /* a database written without hour cuts: its granules span edges until a merge rewrites them, and then not */
+    hc_set(0);
+    tsdb *old = hc_open(d_old, 0, i_old);
+    hc_load_one(old, i_old, 0);
+    hc_touch(old, i_old); /* merged parts: a merge copies full granules of those, re-encodes the rest */
+    hc_glist g0 = hc_series_granules(old, i_old[HC_F32]);
+    CK(g0.n < 40, "written without hour cuts: %zu granules of dense_f32", g0.n);
+    free(g0.a);
+    hc_set(1);
+    hc_touch(old, i_old);
+    hc_layout(old, i_old, 0, "old database merged");
+    hc_glist g1 = hc_series_granules(old, i_old[HC_F32]);
+    CK(hc_same_layout(&g1, &ref), "old database merged: %zu granules of dense_f32, one writer makes %zu", g1.n,
+       ref.n);
+    free(g1.a);
+    hc_compare(old, one, i_old, i_one, -1, "old database merged, against one writer");
+    OK(tsdb_close(old));
+    /* rounds of small and large inserts, merges (copied and re-encoded granules), a delete and a replace */
+    for (int round = 1; round <= 2; round++) {
+        hc_load_rounds(on, i_on, 1, round);
+        hc_load_rounds(off, i_off, 0, round);
+        hc_set(1);
+        OK(tsdb_optimize(on));
+        hc_set(0);
+        OK(tsdb_optimize(off));
+        char what[64];
+        snprintf(what, sizeof what, "round %d, optimized", round);
+        if (round == 2) {
+            hc_layout(on, i_on, 0, what);
+            hc_compare(on, off, i_on, i_off, -1, what);
+            hc_coverage(on, i_on[HC_F32], 1, what);
+            hc_coverage(off, i_off[HC_F32], 0, what);
+        }
+    }
+    hc_edit(on, i_on, 1);
+    hc_edit(off, i_off, 0);
+    hc_edit(NULL, NULL, 0);
+    hc_compare(on, off, i_on, i_off, -1, "after a delete and a replace");
+    hc_set(1);
+    OK(tsdb_optimize(on));
+    hc_set(0);
+    OK(tsdb_optimize(off));
+    hc_layout(on, i_on, 0, "delete and replace, optimized");
+    hc_compare(on, off, i_on, i_off, -1, "delete and replace, optimized");
+    hc_gstats(on, i_on, "delete and replace, optimized");
+    OK(tsdb_close(on));
+    hc_set(1);
+    on = hc_open(d_on, 0, NULL);
+    hc_compare(on, off, i_on, i_off, -1, "reopened");
+
+    free(ref.a);
+    OK(tsdb_close(one));
+    OK(tsdb_close(on));
+    OK(tsdb_close(off));
+    hc_set(1);
+    rm_rf(d_one), rm_rf(d_on), rm_rf(d_off), rm_rf(d_old), rm_rf(d_il);
+    for (int k = 0; k < HC_NS; k++)
+        free(hcs[k].ts), free(hcs[k].v), free(hcs[k].alive);
+}
+
 int main(int argc, char **argv)
 {
     snprintf(base, sizeof base, "%s", argc > 1 ? argv[1] : "/tmp");
     setvbuf(stdout, NULL, _IOLBF, 0);
-    const char *only = argc > 2 ? argv[2] : NULL; /* one section: bulk, live, overlap, fresh, wal, damage, retention, format, midplace, far, wtail, opencheck, comeback, daycut, stall */
+    const char *only = argc > 2 ? argv[2] : NULL; /* one section: bulk, live, overlap, fresh, wal, damage, retention, format, midplace, far, wtail, opencheck, comeback, daycut, stall, hourcut */
 #define SECTION(name, title, call)                                                                                 \
     if (!only || !strcmp(only, name)) {                                                                            \
         printf("%s\n", title);                                                                                     \
@@ -1620,6 +2454,7 @@ int main(int argc, char **argv)
     SECTION("comeback", "a series back in a class it left", test_comeback());
     SECTION("daycut", "granules end at day edges in class partitions", test_daycut());
     SECTION("stall", "a pending switch does not hold flushes back", test_stall());
+    SECTION("hourcut", "granules of dense series end at hour edges", test_hourcut());
 #undef SECTION
     if (fails) {
         printf("test_classes: %d FAILED\n", fails);
