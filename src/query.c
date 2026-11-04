@@ -875,6 +875,23 @@ static inline void fold_run(const agg_target *t, const uint8_t *v, size_t n, boo
     }
 }
 
+/* The first of rows (i, n) at or after bend, given ts[i] < bend. A series' runs are about as long as the one before
+ * (len rows after its first), so the search starts there and steps a few rows; a binary search over the rest of the
+ * granule (13 steps for 8192 rows, mispredicted half the time) took most of fold_rows on 60-row buckets. */
+static inline size_t run_end(const int64_t *ts, size_t i, size_t n, size_t len, int64_t bend)
+{
+    size_t e = i + 1 + MIN(len, n - i - 1);
+    for (int k = 0; k < 4; k++) {
+        if (e < n && ts[e] < bend)
+            e++;
+        else if (e > i + 1 && ts[e - 1] >= bend)
+            e--;
+        else
+            return e;
+    }
+    return i + 1 + lower_bound_i64(ts + i + 1, n - i - 1, bend);
+}
+
 /* Folds time-sorted rows (all within [start, end)) into per-bucket states,
  * one entry per bucket touched (and its spread in outx, with t->accx); returns the number of entries. */
 static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, size_t n, bool may_be_null,
@@ -891,19 +908,29 @@ static size_t fold_rows(const agg_target *t, const int64_t *ts, const void *vv, 
         fold_run(t, v, n, may_be_null, &out[0].a, outx);
         return 1;
     }
-    size_t nl = 0;
-    for (size_t i = 0; i < n;) {
+    size_t nl = 0, len = 0;
+    int64_t b = bk_key(t->bk, ts[0]);
+    for (size_t i = 0;;) {
         /* one run of rows per bucket: the next bucket's start ends it */
-        int64_t b = bk_key(t->bk, ts[i]);
         int64_t bend = bk_start(t->bk, b + 1);
-        size_t e = bend == INT64_MAX ? n : i + 1 + lower_bound_i64(ts + i + 1, n - i - 1, bend);
+        size_t e = bend == INT64_MAX ? n : run_end(ts, i, n, len, bend);
         out[nl].b = b;
         agg_init(&out[nl].a, t->type);
         if (outx)
             agg_dev_init(&outx[nl]);
         fold_run(t, v + i * t->w, e - i, may_be_null, &out[nl].a, outx ? &outx[nl] : NULL);
         nl++;
+        if (e == n)
+            break;
+        len = e - i - 1;
         i = e;
+        /* ts[i] >= bend: in the next bucket when before the one after it, as at every edge of regular rows; only
+         * a gap of whole buckets needs the key computed (a division, or a search of the bounds) */
+        int64_t b2;
+        if (__builtin_add_overflow(b, 2, &b2) || ts[i] >= bk_start(t->bk, b2))
+            b = bk_key(t->bk, ts[i]);
+        else
+            b++;
     }
     return nl;
 }
@@ -992,6 +1019,89 @@ int query_threads_for(const eng *db, uint64_t rows, size_t items)
     t = MIN(t, (uint64_t)items);
     t = MIN(t, (uint64_t)db->opt.query_threads);
     return t > 1 ? (int)t : 1;
+}
+
+/* The passes over a dense array of bucket states that are not per granule (setting the states up, turning them into
+ * results) run by chunks of DENSE_CHUNK buckets on the query's threads. Minute buckets over months are hundreds of
+ * thousands of states (48 bytes each, results 64): on the caller alone these passes, their first touches of fresh
+ * memory included, were 40% of a 10 M-row query of 60-row buckets on 32 threads (scale-bench grp_1s_minute). Each
+ * bucket is handled alone, so how the chunks fall among threads changes no bit. */
+#define DENSE_CHUNK 8192
+size_t dense_chunk = DENSE_CHUNK;
+
+typedef struct dense_job {
+    atomic_size_t next;
+    size_t n, chunk;
+    void (*fn)(void *ctx, size_t lo, size_t hi);
+    void *ctx;
+} dense_job;
+
+static void dense_worker(void *arg, int idx)
+{
+    (void)idx;
+    dense_job *j = arg;
+    for (size_t lo; (lo = atomic_fetch_add(&j->next, j->chunk)) < j->n;) {
+        j->fn(j->ctx, lo, MIN(lo + j->chunk, j->n));
+        /* a helper told to go leaves the rest to the others and the caller (who never leaves); a cancelled query
+         * still completes the pass, which is short: its states must be whole */
+        if (sched_leave() > 0)
+            break;
+    }
+}
+
+static void dense_run(eng *db, size_t n, size_t chunk, void (*fn)(void *ctx, size_t lo, size_t hi), void *ctx)
+{
+    size_t chunks = (n + chunk - 1) / chunk;
+    if (chunks <= 1) {
+        fn(ctx, 0, n);
+        return;
+    }
+    dense_job j = {.n = n, .chunk = chunk, .fn = fn, .ctx = ctx};
+    atomic_init(&j.next, 0);
+    sched_run(db->sched, (int)MIN(chunks, (size_t)db->opt.query_threads), dense_worker, &j);
+}
+
+typedef struct dense_out {
+    const agg_target *t;
+    size_t chunk;
+    size_t *nonempty; /* per chunk: counted in the first pass, then where the chunk's results begin */
+    uint8_t *res;
+    size_t row;
+} dense_out;
+
+static void dense_init(void *ctx, size_t lo, size_t hi)
+{
+    const agg_target *t = ctx;
+    for (size_t k = lo; k < hi; k++)
+        agg_init(&t->acc[k], t->type);
+    for (size_t k = lo; t->accx && k < hi; k++)
+        agg_dev_init(&t->accx[k]);
+}
+
+static void dense_count(void *ctx, size_t lo, size_t hi)
+{
+    dense_out *o = ctx;
+    size_t c = 0;
+    for (size_t k = lo; k < hi; k++)
+        c += o->t->acc[k].rows != 0;
+    o->nonempty[lo / o->chunk] = c;
+}
+
+static void dense_results(void *ctx, size_t lo, size_t hi)
+{
+    dense_out *o = ctx;
+    const agg_target *t = o->t;
+    size_t at = o->nonempty[lo / o->chunk];
+    for (size_t k = lo; k < hi; k++) {
+        if (!t->acc[k].rows)
+            continue;
+        tsdb_bucket *r = (tsdb_bucket *)(o->res + at * o->row);
+        r->start = bk_start(t->bk, t->b0 + (int64_t)k);
+        agg_to_bucket(t->type, &t->acc[k], r);
+        if (t->accx)
+            agg_spread(t->type, &t->acc[k], &t->accx[k], (tsdb_spread_bucket *)r);
+        at++;
+    }
 }
 
 static void agg_worker(void *arg, int idx)
@@ -1368,12 +1478,10 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
         rc = TSDB_ERR_NOMEM;
         goto done;
     }
-    for (size_t k = 0; k < nb; k++)
-        agg_init(&acc[k], type);
-    for (size_t k = 0; accx && k < nb; k++)
-        agg_dev_init(&accx[k]);
     t.acc = acc;
     t.accx = accx;
+    const size_t chunk = dense_chunk ? dense_chunk : DENSE_CHUNK;
+    dense_run(db, nb, chunk, dense_init, &t);
     fc.t = &t;
     const unsigned want = GW_STAT | (accx ? GW_SPREAD : 0) | (type_is_int(type) ? GW_INT : 0);
 
@@ -1474,28 +1582,29 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
         free(nedge);
     }
     if (rc == 0) {
+        size_t nchunks = (nb + chunk - 1) / chunk;
+        dense_out o = {.t = &t, .chunk = chunk, .nonempty = malloc((nchunks ? nchunks : 1) * sizeof(size_t)),
+                       .row = q->spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket)};
+        if (!o.nonempty) {
+            rc = TSDB_ERR_NOMEM;
+            goto done;
+        }
+        dense_run(db, nb, chunk, dense_count, &o);
         size_t nonempty = 0;
-        for (size_t k = 0; k < nb; k++)
-            nonempty += acc[k].rows != 0;
-        size_t row = q->spread ? sizeof(tsdb_spread_bucket) : sizeof(tsdb_bucket);
-        uint8_t *res = malloc((nonempty ? nonempty : 1) * row);
-        if (!res) {
+        for (size_t c = 0; c < nchunks; c++) {
+            size_t n = o.nonempty[c];
+            o.nonempty[c] = nonempty;
+            nonempty += n;
+        }
+        o.res = malloc((nonempty ? nonempty : 1) * o.row);
+        if (!o.res) {
             rc = TSDB_ERR_NOMEM;
         } else {
-            size_t o = 0;
-            for (size_t k = 0; k < nb; k++) {
-                if (!acc[k].rows)
-                    continue;
-                tsdb_bucket *r = (tsdb_bucket *)(res + o * row);
-                r->start = bk_start(bk, t.b0 + (int64_t)k);
-                agg_to_bucket(type, &acc[k], r);
-                if (q->spread)
-                    agg_spread(type, &acc[k], &accx[k], (tsdb_spread_bucket *)r);
-                o++;
-            }
-            *out = res;
-            *nout = o;
+            dense_run(db, nb, chunk, dense_results, &o);
+            *out = o.res;
+            *nout = nonempty;
         }
+        free(o.nonempty);
     }
 done:
     if (cc)
