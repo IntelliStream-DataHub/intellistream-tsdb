@@ -542,7 +542,8 @@ static void globs_linear(void)
     clock_gettime(CLOCK_MONOTONIC, &t0);
     CHECK(rights_of(u, name, 32767) == R_READ);
     double ms3 = ms_since(&t0);
-    CHECK(ms < 150 && ms2 < 150 && ms3 < 150); /* the backtracking matcher took 578 ms on the first */
+    /* about 13 ms here, 70 under TSan, 106 under ASan; the backtracking matcher took 578 ms on the first */
+    CHECK(ms < 300 && ms2 < 300 && ms3 < 300);
     free(name);
     users_close(&us);
     cleanup(dir);
@@ -838,7 +839,7 @@ static void matching(void)
                 failures++;
                 round = 1000;
             }
-            free(g.lit), free(g.suf);
+            free(g.lit), free(g.suf), free(g.prog);
         }
         free_user(r);
     }
