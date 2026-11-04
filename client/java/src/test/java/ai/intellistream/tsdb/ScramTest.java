@@ -258,4 +258,48 @@ class ScramTest {
             assertEquals(s, Selector.parse(s).toString());
         assertThrows(IllegalArgumentException.class, () -> Selector.parse("acme/"));
     }
+
+    /** REVIEW3 #7: the grammar of server/users.c rights_parse, and every value prints as text that parses back. */
+    @Test
+    void rightsTextRoundTripsInTheServersGrammar() {
+        for (int bits = 0; bits < 256; bits++)
+            assertEquals(new Rights(bits), Rights.parse(new Rights(bits).toString()), new Rights(bits).toString());
+        assertEquals("read,delete,0x40", new Rights(0x45).toString());
+        Object[][] ok = {{"read, insert", 3}, {" read ,  write ", 7}, {"none", 0}, {"none,read", 1}, {"0x30", 0x30},
+            {"read,0xF0", 0xf1}, {"0x00", 0}};
+        for (Object[] c : ok)
+            assertEquals((int) c[1], Rights.parse((String) c[0]).bits(), (String) c[0]);
+        for (String bad : new String[] {"", "read,", "reads", "read,,insert", "READ", " ", "re ad", "read\t", "\tread",
+            "0x1", "0x100", "0xg0"})
+            assertThrows(IllegalArgumentException.class, () -> Rights.parse(bad), bad);
+    }
+
+    /** REVIEW3 #6: a kind a later server adds is kept with its number, shown, and not grantable. */
+    @Test
+    void unknownSelectorKindsAreKept() {
+        Selector s = Selector.fromWire(9, "x/*");
+        assertEquals(new Selector(Selector.Kind.UNKNOWN, "x/*", 9), s);
+        assertEquals("kind#9:x/*", s.toString());
+        assertThrows(IllegalArgumentException.class, () -> Selector.parse(s.toString()));
+        assertEquals(Selector.prefix("p/"), Selector.fromWire(1, "p/"));
+        assertThrows(IllegalArgumentException.class, () -> new Selector(Selector.Kind.UNKNOWN, "x"));
+        assertThrows(IllegalArgumentException.class, () -> new Selector(Selector.Kind.NAME, "x", 3));
+    }
+
+    /** REVIEW3 #2, #4: 1 to 1023 bytes without NUL; an unpaired surrogate is refused, never sent as '?'. */
+    @Test
+    void thePasswordRuleAndUnpairedSurrogates() {
+        String p1023 = "p".repeat(1023);
+        ConnectOptions.defaults().password("1");
+        ConnectOptions.defaults().password(p1023);
+        ConnectOptions.defaults().password("æ".repeat(511)); // 1022 bytes of UTF-8
+        for (String bad : new String[] {"", p1023 + "x", "æ".repeat(512), "a\0b", "pw\uD800", "\uDC00pw"})
+            assertThrows(IllegalArgumentException.class, () -> ConnectOptions.defaults().password(bad),
+                    bad.length() + " chars");
+        assertThrows(IllegalArgumentException.class, () -> Scram.utf8(new char[] {'p', 'w', '\uD800'}));
+        assertArrayEquals("pw?".getBytes(StandardCharsets.UTF_8), Scram.utf8("pw?".toCharArray()));
+        assertThrows(IllegalArgumentException.class, () -> Scram.verifier(new byte[0], 4096));
+        assertThrows(IllegalArgumentException.class,
+                () -> Scram.verifier((p1023 + "x").getBytes(StandardCharsets.UTF_8), 4096));
+    }
 }

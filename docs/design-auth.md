@@ -116,6 +116,13 @@ reused, so a user dropped and created again under the same name does not inherit
 bar of the brief) may look up and create series and insert into them, but not read them back; a user with only
 `read` on a few `name:` grants (user foo) may query exactly those.
 
+**Rights as text** (step 3 review): one grammar in tsdbd's `rights_parse`, the CLI and every client. Names
+separated by commas, spaces (only spaces) around a name ignored: `read`, `insert`, `delete`, `admin`, `write`,
+`none` (no bits) and `0xHH` (two hex digits: bits a later version may name; the server refuses to grant bits it
+does not know). An empty text or name is refused. Every printer writes what every parser reads back: the four
+names in that order, joined by `,`, the other bits as one `0xhh`, `none` for 0. A selector kind a client does not
+know is shown as `kind#N:TEXT` and is not parsed (docs/compatibility.md).
+
 **Matching** (`rights_of(user, name)`): the OR of the user's `all` bits, the bits of an exact grant found in a hash
 table of names, and, for each distinct length L among the user's prefixes (at most a few in practice), the bits of
 a prefix grant found by looking up the first L bytes in a second hash table, and the bits of every glob that
@@ -336,6 +343,18 @@ the RAM) stop filling the maps past them; checks then compute every time, which 
 - **Rust, Python, Java**: the same options and calls under their names (`ConnectOptions::user`, `Client(...,
   user=, password=)`, `Client.connect(Options...)`); Rust's and Java's pools and Python's through Rust share one
   key cache. The embedded bindings (`Db`, `EmbeddedDb`) do not change.
+- **The key cache computes each key once** (step 3 review): the connections of a pool start together, so the
+  first login that misses claims a pending entry and runs PBKDF2 outside the lock while the others wait for it;
+  a pending entry is never evicted. Without this a cold pool of n ran PBKDF2 n times and filled the 16-entry
+  cache with copies, evicting other users' keys.
+- **One password rule** in every client, the CLI and every verifier (`user_create`, `user_password`): a password
+  is 1 to 1023 bytes (the UTF-8 of the string) without NUL. A password file holds it in its first line, without
+  the `\n` or `\r\n` that ends it (a lone `\r` at the end of the file is part of it). An empty or longer password
+  is refused before anything is sent, with the language's invalid-argument error (C `TSDB_ERR_INVALID`, Rust
+  `Error::InvalidArgument`, Python `ValueError`, Java `IllegalArgumentException`); Java also refuses a password
+  that is not valid UTF-16 (an unpaired surrogate) instead of encoding it as `?`. A password file that cannot be
+  read or holds no password is `TSDB_ERR_INVALID` (-4) naming the file in every client (Rust `InvalidArgument`,
+  Python and Java the -4 status): a mistake in the setup, never retried as a network error.
 - **CLI**: offline, `tsdb <dir> user add|drop|passwd|grant|revoke|list|compact`, working on USERS only (the engine is
   not opened, so it runs beside tsdbd). Online, the same verbs with `--server HOST:PORT --login NAME` for tenant
   admins without shell access, through the C client. Passwords come from a prompt without echo, `--password-file`

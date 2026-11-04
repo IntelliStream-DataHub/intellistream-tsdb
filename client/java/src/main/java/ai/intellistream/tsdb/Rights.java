@@ -56,29 +56,46 @@ public record Rights(int bits) {
     }
 
     /**
-     * Parses comma-separated names: {@code read}, {@code insert}, {@code delete}, {@code admin}, {@code write}.
+     * Parses rights in the grammar of tsdbd, the CLI and every client (design §2): names separated by commas, spaces
+     * around a name ignored; {@code read}, {@code insert}, {@code delete}, {@code admin}, {@code write} (insert and
+     * delete), {@code none} (no rights) and {@code 0xHH} (two hex digits: bits a later server may name, as
+     * {@link #toString()} shows them). Whatever {@code toString} prints parses back to the same bits.
      *
      * @param s such as "read,write"
      * @return the rights
-     * @throws IllegalArgumentException for another word
+     * @throws IllegalArgumentException for another word, an empty one, or a tab or other blank that is not a space
      */
     public static Rights parse(String s) {
         int b = 0;
         for (String w : s.split(",", -1)) {
-            String t = w.trim();
+            int from = 0, to = w.length();
+            while (from < to && w.charAt(from) == ' ')
+                from++;
+            while (to > from && w.charAt(to - 1) == ' ')
+                to--;
+            String t = w.substring(from, to);
             int i = java.util.Arrays.asList(NAMES).indexOf(t);
             if (t.equals("write"))
                 b |= WRITE.bits;
+            else if (t.equals("none"))
+                continue;
             else if (i >= 0)
                 b |= 1 << i;
+            else if (t.length() == 4 && t.startsWith("0x") && hex(t.charAt(2)) >= 0 && hex(t.charAt(3)) >= 0)
+                b |= hex(t.charAt(2)) << 4 | hex(t.charAt(3));
             else
                 throw new IllegalArgumentException("rights \"" + s + "\": \"" + t
-                        + "\" is none of read, insert, delete, admin, write");
+                        + "\" is none of read, insert, delete, admin, write, none, 0xHH");
         }
         return new Rights(b);
     }
 
-    /** As the CLI writes them: "read,insert", "none" for no right; unknown bits in hex. */
+    private static int hex(char c) {
+        return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                : -1;
+    }
+
+    /** As the CLI writes them: "read,insert", "none" for no right; bits no client names yet as one "0xhh". */
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();

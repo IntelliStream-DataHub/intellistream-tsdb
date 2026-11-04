@@ -70,6 +70,11 @@ At 1.0 the format and the protocol freeze. From then on:
 - **A 1.x server speaks every protocol version of 1.0 and later**, and a client of any 1.x release works
   against any other 1.x server for the operations both know. New operations get a new protocol version
   number and fail with `TSDB_ERR_INVALID` against an older server.
+- **New grant selector kinds and rights bits may appear** in the users and grants a later server reports
+  (`WHOAMI`, `USER_LIST`). Clients must accept them: every 1.x client keeps a grant of a kind it does not know
+  (Rust `Selector::Other`, Java `Selector.Kind.UNKNOWN`, shown as `kind#N:TEXT`; the C client keeps the kind
+  byte) and shows rights bits it cannot name as `0xHH`, which every parser reads back. Such a grant cannot be
+  granted or revoked from a client that does not know its kind.
 - **Semantic versioning.** The C, Rust, Python and Java interfaces change incompatibly only in a new major
   version. New functions come in minor versions, fixes in patch versions.
 - **Release notes** say which format and protocol versions each release reads and speaks.

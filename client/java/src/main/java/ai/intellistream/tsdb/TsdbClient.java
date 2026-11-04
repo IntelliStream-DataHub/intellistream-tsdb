@@ -2933,7 +2933,7 @@ public final class TsdbClient implements AutoCloseable {
      * Creates user {@code name} with {@code password} and {@value #SCRAM_ITERATIONS} iterations of PBKDF2.
      *
      * @param name the user, as the server's USERS file allows it (a tenant's users usually start with its prefix)
-     * @param password not empty
+     * @param password 1 to {@link ConnectOptions#PASSWORD_MAX} bytes of UTF-8 without NUL
      * @param superuser whether it gets every right
      * @throws TsdbException as {@link #userCreate(String, char[], boolean, int)}
      */
@@ -2948,13 +2948,14 @@ public final class TsdbClient implements AutoCloseable {
      * computed with {@code iterations} of PBKDF2.
      *
      * @param name the user
-     * @param password not empty
+     * @param password 1 to {@link ConnectOptions#PASSWORD_MAX} bytes of UTF-8 without NUL
      * @param superuser whether it gets every right
      * @param iterations 4096 to 100,000,000
      * @throws TsdbException with {@link Status#ERR_DENIED} unless this user is a superuser, or holds {@code admin} on
      *     a prefix that {@code name} starts with (only a superuser creates superusers), and on a {@code --no-auth}
      *     server; with {@link Status#ERR_INVALID} for a name that exists or that USERS refuses
-     * @throws IllegalArgumentException for an empty password or an iteration count out of range
+     * @throws IllegalArgumentException for a password outside that rule or with an unpaired surrogate, or an
+     *     iteration count out of range
      */
     public void userCreate(String name, char[] password, boolean superuser, int iterations) throws TsdbException {
         byte[] pw = utf8(password);
@@ -2974,7 +2975,7 @@ public final class TsdbClient implements AutoCloseable {
      * with {@value #SCRAM_ITERATIONS} iterations.
      *
      * @param name the user
-     * @param password not empty
+     * @param password 1 to {@link ConnectOptions#PASSWORD_MAX} bytes of UTF-8 without NUL
      * @throws TsdbException as {@link #userPassword(String, char[], int)}
      */
     public void userPassword(String name, char[] password) throws TsdbException {
@@ -2985,7 +2986,7 @@ public final class TsdbClient implements AutoCloseable {
      * Sets the password of user {@code name} (its own, or one of a user it manages), as {@link #userCreate} sends it.
      *
      * @param name the user
-     * @param password not empty
+     * @param password 1 to {@link ConnectOptions#PASSWORD_MAX} bytes of UTF-8 without NUL
      * @param iterations 4096 to 100,000,000
      * @throws TsdbException as {@link #userCreate(String, char[], boolean, int)}; {@link Status#ERR_DENIED} also for
      *     a user holding a grant outside this one's {@code admin} selectors
@@ -3057,6 +3058,8 @@ public final class TsdbClient implements AutoCloseable {
     private static byte[] grantBody(Selector selector, Rights rights) throws TsdbException {
         Objects.requireNonNull(selector, "selector");
         Objects.requireNonNull(rights, "rights");
+        if (selector.kind() == Selector.Kind.UNKNOWN)
+            throw new IllegalArgumentException("a selector of kind " + selector.code() + " is unknown to this client");
         byte[] t = utf8(selector.text(), "selector");
         byte[] b = new byte[4 + t.length];
         b[0] = (byte) selector.kind().ordinal();
@@ -3092,15 +3095,13 @@ public final class TsdbClient implements AutoCloseable {
         if (g > (bodyEnd - in.position()) / 4)
             throw lost(Status.ERR_CORRUPT, g + " grants in " + (bodyEnd - in.position()) + " bytes");
         List<Grant> grants = new ArrayList<>((int) g);
-        Selector.Kind[] kinds = Selector.Kind.values();
         for (long i = 0; i < g; i++) {
             if (bodyEnd - in.position() < 2)
                 throw lost(Status.ERR_CORRUPT, "a grant cut short");
             int kind = in.get() & 0xff, rights = in.get() & 0xff;
             String text = replyString();
-            if (kind >= kinds.length)
-                throw lost(Status.ERR_CORRUPT, "a grant of unknown kind " + kind);
-            grants.add(new Grant(kind == 0 ? Selector.all() : new Selector(kinds[kind], text), new Rights(rights)));
+            // a kind a later server added is kept as UNKNOWN: whoami and userList go on working
+            grants.add(new Grant(kind == 0 ? Selector.all() : Selector.fromWire(kind, text), new Rights(rights)));
         }
         return new User(name, (flags & Protocol.USER_SUPERUSER) != 0, grants);
     }
@@ -3115,14 +3116,9 @@ public final class TsdbClient implements AutoCloseable {
         return new String(b, StandardCharsets.UTF_8);
     }
 
-    /** A password's UTF-8 bytes, which the caller clears. */
+    /** A password's UTF-8 bytes, which the caller clears; an unpaired surrogate is IllegalArgumentException. */
     private static byte[] utf8(char[] password) {
-        Objects.requireNonNull(password, "password");
-        ByteBuffer b = StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(password));
-        byte[] pw = new byte[b.remaining()];
-        b.get(pw);
-        Arrays.fill(b.array(), (byte) 0);
-        return pw;
+        return Scram.utf8(Objects.requireNonNull(password, "password"));
     }
 
     // --------------------------------------------------------------------- I/O

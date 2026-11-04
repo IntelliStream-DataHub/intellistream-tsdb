@@ -149,8 +149,41 @@ final class Scram {
      * @param iterations PBKDF2 iterations, 4096 to 100,000,000
      */
     static byte[] verifier(byte[] password, int iterations) {
-        if (password.length == 0)
-            throw new IllegalArgumentException("an empty password");
+        checkPassword(password);
+        return verifierOf(password, iterations);
+    }
+
+    /** The password rule of every client and the CLI (design-auth.md §6): 1 to PASSWORD_MAX bytes, no NUL. */
+    static void checkPassword(byte[] pw) {
+        boolean nul = false;
+        for (byte b : pw)
+            nul |= b == 0;
+        if (pw.length == 0 || pw.length > ConnectOptions.PASSWORD_MAX || nul)
+            throw new IllegalArgumentException(
+                    "a password is 1 to " + ConnectOptions.PASSWORD_MAX + " bytes without NUL");
+    }
+
+    /**
+     * The UTF-8 bytes of a password. An unpaired surrogate is refused, not replaced by '?' as String.getBytes and
+     * Charset.encode do: the password stored would not be the one typed, and no other client could log in with it.
+     */
+    static byte[] utf8(char[] password) {
+        java.nio.ByteBuffer b;
+        try {
+            b = StandardCharsets.UTF_8.newEncoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .encode(java.nio.CharBuffer.wrap(password));
+        } catch (java.nio.charset.CharacterCodingException e) {
+            throw new IllegalArgumentException("a password that is not valid UTF-16 (an unpaired surrogate)");
+        }
+        byte[] pw = new byte[b.remaining()];
+        b.get(pw);
+        if (b.hasArray())
+            Arrays.fill(b.array(), (byte) 0);
+        return pw;
+    }
+
+    private static byte[] verifierOf(byte[] password, int iterations) {
         if (iterations < ITERATIONS || iterations > ITER_MAX)
             throw new IllegalArgumentException(iterations + " iterations: 4096 to 100,000,000");
         byte[] salt = new byte[SALT_LEN];
@@ -242,37 +275,92 @@ final class Scram {
 
     // ------------------------------------------------------------ key cache
 
-    private record KeyEntry(String user, byte[] salt, int iterations, byte[] pwMac, byte[] clientKey,
-            byte[] serverKey) {
+    /** One key; clientKey and serverKey are null while one login computes them and others wait for it. */
+    private static final class KeyEntry {
+        final String user;
+        final byte[] salt, pwMac;
+        int iterations; // 0 once a computation failed: it matches no login (they ask for 4096 or more)
+        byte[] clientKey, serverKey;
+
+        KeyEntry(String user, byte[] salt, int iterations, byte[] pwMac) {
+            this.user = user;
+            this.salt = salt;
+            this.iterations = iterations;
+            this.pwMac = pwMac;
+        }
+
+        boolean pending() {
+            return clientKey == null;
+        }
     }
 
     private static final KeyEntry[] CACHE = new KeyEntry[KEY_CACHE];
     private static int cacheNext;
 
     /**
-     * ClientKey and ServerKey (copies the caller clears), from the cache or computed (outside the lock: milliseconds)
-     * and cached. HMAC(salt, password) tells one password from another without keeping it.
+     * ClientKey and ServerKey (copies the caller clears), from the cache or computed once. HMAC(salt, password)
+     * tells one password from another without keeping it. The connections of a pool, or the threads of a sink,
+     * start together: the first to miss claims an entry and computes it outside the lock, the others wait for it
+     * (one PBKDF2 per key, not one per connection, and one entry, so other users' keys are not evicted by
+     * copies). A pending entry is never evicted; with KEY_CACHE keys in flight, one more is computed uncached.
      */
     private static byte[][] keysCached(String user, byte[] password, byte[] salt, int iterations) {
         byte[] pwMac = hmac(salt, password);
+        KeyEntry mine = null;
         synchronized (CACHE) {
-            for (KeyEntry e : CACHE)
-                if (e != null && e.iterations == iterations && e.user.equals(user) && Arrays.equals(e.salt, salt)
-                        && MessageDigest.isEqual(e.pwMac, pwMac))
+            boolean interrupted = false;
+            for (;;) {
+                KeyEntry e = find(user, salt, iterations, pwMac);
+                if (e == null)
+                    break;
+                if (!e.pending())
                     return new byte[][] {e.clientKey.clone(), e.serverKey.clone()};
-        }
-        byte[][] k = keys(password, salt, iterations);
-        synchronized (CACHE) {
-            int i = cacheNext++ % KEY_CACHE;
-            KeyEntry old = CACHE[i];
-            if (old != null) {
-                Arrays.fill(old.clientKey, (byte) 0);
-                Arrays.fill(old.serverKey, (byte) 0);
+                try {
+                    CACHE.wait(); // another login computes this key
+                } catch (InterruptedException ie) {
+                    interrupted = true; // compute it here, uncached; the caller still sees the interrupt
+                    break;
+                }
             }
-            CACHE[i] = new KeyEntry(user, salt.clone(), iterations, pwMac, k[0].clone(), k[1].clone());
-            if (cacheNext < 0)
-                cacheNext = 0;
+            if (interrupted)
+                Thread.currentThread().interrupt();
+            for (int k = 0; k < KEY_CACHE && mine == null && !interrupted; k++) { // the next slot nobody waits for
+                int i = Math.floorMod(cacheNext++, KEY_CACHE);
+                KeyEntry old = CACHE[i];
+                if (old == null || !old.pending()) {
+                    if (old != null) {
+                        Arrays.fill(old.clientKey, (byte) 0);
+                        Arrays.fill(old.serverKey, (byte) 0);
+                    }
+                    mine = CACHE[i] = new KeyEntry(user, salt.clone(), iterations, pwMac);
+                }
+            }
         }
-        return k;
+        byte[][] k = null;
+        try {
+            k = keys(password, salt, iterations);
+            return k;
+        } finally {
+            if (mine != null) {
+                synchronized (CACHE) {
+                    if (k != null) {
+                        mine.clientKey = k[0].clone();
+                        mine.serverKey = k[1].clone();
+                    } else { // it threw: the waiters compute it themselves
+                        mine.iterations = 0;
+                        mine.clientKey = mine.serverKey = new byte[32];
+                    }
+                    CACHE.notifyAll();
+                }
+            }
+        }
+    }
+
+    private static KeyEntry find(String user, byte[] salt, int iterations, byte[] pwMac) {
+        for (KeyEntry e : CACHE)
+            if (e != null && e.iterations == iterations && e.user.equals(user) && Arrays.equals(e.salt, salt)
+                    && MessageDigest.isEqual(e.pwMac, pwMac))
+                return e;
+        return null;
     }
 }

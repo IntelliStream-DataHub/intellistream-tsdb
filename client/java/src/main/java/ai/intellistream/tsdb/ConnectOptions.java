@@ -1,7 +1,6 @@
 package ai.intellistream.tsdb;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -67,8 +66,10 @@ public final class ConnectOptions {
     /**
      * The user's password.
      *
-     * @param password not empty
+     * @param password 1 to {@link #PASSWORD_MAX} bytes of UTF-8 without NUL
      * @return the options
+     * @throws IllegalArgumentException for a password outside that rule, or one that is not valid UTF-16 (an
+     *     unpaired surrogate): it would not be the password the user typed
      */
     public ConnectOptions password(String password) {
         return password(Objects.requireNonNull(password, "password").toCharArray());
@@ -77,23 +78,32 @@ public final class ConnectOptions {
     /**
      * The user's password, from an array the caller may clear afterwards (the options keep their own copy).
      *
-     * @param password not empty
+     * @param password 1 to {@link #PASSWORD_MAX} bytes of UTF-8 without NUL
      * @return the options
+     * @throws IllegalArgumentException as {@link #password(String)}
      */
     public ConnectOptions password(char[] password) {
-        Objects.requireNonNull(password, "password");
-        if (password.length == 0)
-            throw new IllegalArgumentException("an empty password");
-        java.nio.ByteBuffer b = StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(password));
-        byte[] pw = new byte[b.remaining()];
-        b.get(pw);
-        Arrays.fill(b.array(), (byte) 0);
+        byte[] pw = Scram.utf8(Objects.requireNonNull(password, "password"));
+        try {
+            Scram.checkPassword(pw);
+        } catch (IllegalArgumentException e) {
+            Arrays.fill(pw, (byte) 0);
+            throw e;
+        }
         return new ConnectOptions(user, pw, passwordFile, requireAuth, connectTimeout, requestTimeout);
     }
 
     /**
-     * Reads the password from the first line of this file at every connect (a trailing CR LF is cut), when no
-     * {@link #password(String) password} is given.
+     * The longest password in bytes, in every client and the CLI (design-auth.md §6); a password is at least 1 byte
+     * and holds no NUL.
+     */
+    public static final int PASSWORD_MAX = 1023;
+
+    /**
+     * Reads the password from the first line of this file at every connect, without the LF or CR LF that ends it,
+     * when no {@link #password(String) password} is given. A file that cannot be read, or whose first line is not a
+     * password (empty, over {@link #PASSWORD_MAX} bytes), fails the connect with {@link Status#ERR_INVALID} naming the
+     * file: a mistake in the setup, not a network error to retry.
      *
      * @param file the file, readable by this process only, ideally
      * @return the options
@@ -168,7 +178,8 @@ public final class ConnectOptions {
     /**
      * The password bytes, a copy the caller clears: given, or the first line of the password file.
      *
-     * @throws TsdbException with {@link Status#ERR_IO} if the file cannot be read
+     * @throws TsdbException with {@link Status#ERR_INVALID}, naming the file, if it cannot be read or its first line
+     *     is not a password (as the C client)
      */
     byte[] passwordBytes() throws TsdbException {
         if (password != null)
@@ -177,16 +188,21 @@ public final class ConnectOptions {
         try {
             all = Files.readAllBytes(passwordFile);
         } catch (IOException e) {
-            throw new TsdbException(Status.ERR_IO, "password file " + passwordFile, e);
+            throw new TsdbException(Status.ERR_INVALID, "password file " + passwordFile + ": " + e, e);
         }
         int n = 0;
         while (n < all.length && all[n] != '\n')
             n++;
-        int end = n > 0 && all[n - 1] == '\r' ? n - 1 : n;
+        int end = n < all.length && n > 0 && all[n - 1] == '\r' ? n - 1 : n; // a '\r' ends a line only before '\n'
         byte[] pw = Arrays.copyOf(all, end);
         Arrays.fill(all, (byte) 0);
-        if (pw.length == 0)
-            throw new IllegalArgumentException(passwordFile + ": no password in it");
+        try {
+            Scram.checkPassword(pw);
+        } catch (IllegalArgumentException e) {
+            Arrays.fill(pw, (byte) 0);
+            throw new TsdbException(Status.ERR_INVALID, "password file " + passwordFile
+                    + ": no password in its first line (1 to " + PASSWORD_MAX + " bytes)", null);
+        }
         return pw;
     }
 
