@@ -65,6 +65,18 @@ u revoke acme/bob read prefix:acme/ || fail "revoke"
 u list | grep -q $'^\tinsert\tprefix:acme/$' || fail "revoke left insert"
 u revoke acme/bob insert prefix:acme/ || fail "revoke the rest"
 u list | grep -q 'prefix:acme/$' && fail "a grant with no rights left is still listed"
+# REVIEW1 #4: a revoke of what is not held fails and says so; one of a right admin implies takes admin with it
+refused "a revoke of a grant not held" revoke acme/bob read prefix:acme/
+u revoke acme/bob read name:nothing 2>"$dir/err" && fail "a revoke of a grant not held exits 0"
+grep -q 'nothing revoked' "$dir/err" || fail "no message for a revoke of a grant not held"
+u grant acme/bob admin prefix:acme/ || fail "grant admin"
+u revoke acme/bob delete prefix:acme/ 2>"$dir/err" || fail "revoke delete from admin"
+grep -q 'admin on prefix:acme/ is revoked too; acme/bob keeps read,insert there' "$dir/err" ||
+    fail "no message when admin goes with delete"
+u list | grep -q $'^\tread,insert\tprefix:acme/$' || fail "delete revoked from admin did not leave read,insert"
+u revoke acme/bob write prefix:acme/ 2>/dev/null || fail "revoke write"
+u list | grep -q $'^\tread\tprefix:acme/$' || fail "revoke write did not leave read"
+u revoke acme/bob read prefix:acme/ || fail "revoke the last read"
 
 # alter, passwd, drop; the last superuser may go offline, with a warning
 u alter acme/bob --superuser || fail "alter --superuser"

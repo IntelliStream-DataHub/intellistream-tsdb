@@ -40,6 +40,21 @@ static void sha256(void)
     uint8_t h[32];
     tsdb_sha256_buf("", 0, h);
     CHECK(hex_is(h, 32, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    /* (NULL, 0) is the empty message, also into a partly filled buffer: no memcpy from NULL (UBSan, make asan) */
+    tsdb_sha256_buf(NULL, 0, h);
+    CHECK(hex_is(h, 32, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    {
+        tsdb_sha256 z;
+        tsdb_sha256_init(&z);
+        tsdb_sha256_update(&z, "ab", 2);
+        tsdb_sha256_update(&z, NULL, 0);
+        tsdb_sha256_update(&z, "c", 1);
+        tsdb_sha256_final(&z, h);
+        CHECK(hex_is(h, 32, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        uint8_t m[32];
+        tsdb_hmac_sha256(NULL, 0, NULL, 0, m); /* HMAC with an empty key of an empty message */
+        CHECK(hex_is(m, 32, "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad"));
+    }
     tsdb_sha256_buf("abc", 3, h);
     CHECK(hex_is(h, 32, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
     const char *m448 = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";

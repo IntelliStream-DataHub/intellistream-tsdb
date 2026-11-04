@@ -13,7 +13,8 @@
  * (TSDB_ERR_CORRUPT); a bad record with nothing valid after it is an append that never finished, cut by the next
  * writer under the lock. Records:
  *
- *   HEADER   u32 format (1), u8 mock_key[32]          first, written with the first change
+ *   HEADER   u32 format (1), u8 mock_key[32], u8 file_id[16]   first, written with the first change and by a
+ *                                                              compaction (file_id random each time, mock_key kept)
  *   USER     u32 uid, u8 flags, u16 len, name          uid above every earlier one
  *   VERIFIER u32 uid, u32 iterations, u8 salt_len, salt, u8 stored_key[32], u8 server_key[32]
  *   FLAGS    u32 uid, u8 flags
@@ -27,8 +28,22 @@
  * where it is a server lock): lock, read what others appended (cutting a torn tail), check the change against that
  * state, append, fdatasync (and fsync the directory when the file is new), apply, unlock. A failed write or sync is
  * fail-stop: an acknowledged revoke must not come back after a power loss, and a retried fsync proves nothing.
+ * The failed records are cut off again before the lock goes: after a failed writeback the kernel marks their pages
+ * clean, and a retry that read them back would find its change made, write nothing and acknowledge a change that
+ * may never reach the disk. For the same reason an answer that changes nothing is given only after an fdatasync
+ * (the records it rests on may be the unsynced append of a writer that died).
  * A compaction writes the live state to a new file and renames it over USERS; whoever holds the old file sees
- * another inode at the path and reads the new one from the start.
+ * another inode at the path and reads the new one from the start. The inode number alone does not tell: a reader
+ * that closes the file between reloads (tsdbd's tick, a follower) can find a later compaction's file under the
+ * number of the one it read (ext4 reuses them, NFS fileids too), with the same size when a demotion or a new
+ * password compacted to as many bytes. So every reload also compares the HEADER's file_id and the last record it
+ * read, which a new file does not have at the same place. The compactor locks the new file before the rename and
+ * keeps it locked until the directory fsync: a writer that opens the new name meanwhile would otherwise append to
+ * a file whose name a power loss can still take back.
+ *
+ * The file is created, and compacted, with the owner of the database directory (an operator running the CLI as
+ * root must not leave a USERS the service user cannot read) and mode 0600; an existing one readable by others is
+ * set to 0600, or refused when that fails: it holds the verifiers, which are offline guessing targets.
  *
  * Loading applies records in a batch with copy-on-write of the users it touches, so that a reload that meets damage
  * halfway leaves the state exactly as it was (A11: the last good state stays).
@@ -53,6 +68,8 @@ enum { REC_HEADER = 1, REC_USER, REC_VERIFIER, REC_FLAGS, REC_GRANT, REC_DROP };
 #define REC_MORE 0x80 /* in the type: the change goes on in the next record (USER then VERIFIER) */
 #define USERS_FORMAT 1
 #define REC_PAYLOAD_MAX (4 + 1 + 1 + 2 + SEL_MAX)
+#define HEADER_LEN (4 + 32 + 16)
+#define HEADER_SIZE 72 /* rec_size(HEADER_LEN) */
 
 static size_t rec_size(size_t len) { return ((5 + len + 7) & ~(size_t)7) + 8; }
 
@@ -264,7 +281,9 @@ bool sel_inside(const user_grant *s, const user_grant *t)
 
 static bool superuser(const user *x) { return !x || (x->flags & USER_SUPERUSER); }
 
-static bool inside_admin(const user *x, const user_grant *s)
+/* s lies inside one of x's admin selectors. The slow forms try every grant of x; the others (after rights_of) use
+ * x's index, so that managing a user of many grants by an admin of many grants is not their product. */
+static bool inside_admin_slow(const user *x, const user_grant *s)
 {
     for (uint32_t i = 0; i < x->ng; i++)
         if ((x->g[i].rights & R_ADMIN) && sel_inside(s, &x->g[i]))
@@ -272,8 +291,11 @@ static bool inside_admin(const user *x, const user_grant *s)
     return false;
 }
 
+static bool inside_admin(const user *x, const user_grant *s);
+static bool names_under(const user *x, const char *name);
+
 /* x holds admin on all, or on a prefix of the name: user names are made and managed under prefixes only. */
-static bool names_under(const user *x, const char *name)
+static bool names_under_slow(const user *x, const char *name)
 {
     size_t len = strlen(name);
     for (uint32_t i = 0; i < x->ng; i++)
@@ -443,6 +465,75 @@ uint8_t rights_of(user *u, const char *name, size_t len)
     return expand(r);
 }
 
+/* x's index, built on first use; a cache, so it is built through a const user too (users are never const objects). */
+static const struct umatch *umatch_of(const user *x)
+{
+    user *w = (user *)x;
+    if (!w->m)
+        w->m = umatch_build(w);
+    return w->m;
+}
+
+/* A glob admin grant of x matches the name. */
+static bool admin_glob_matches(const user *x, const struct umatch *m, const char *name, size_t len)
+{
+    const ment *e;
+    for (size_t i = 0; i < m->ngl && m->glen[i] <= len; i++) {
+        if (!(e = mfind(m, SEL_GLOB, name, m->glen[i]))->key)
+            continue;
+        for (int32_t gi = e->glob; gi >= 0; gi = m->gnext[gi]) {
+            const user_grant *g = &x->g[gi];
+            if ((g->rights & R_ADMIN) && len >= (size_t)g->lit_len + g->suf_len &&
+                memcmp(name + len - g->suf_len, g->suf, g->suf_len) == 0 && glob_match(g->sel, g->len, name, len))
+                return true;
+        }
+    }
+    return false;
+}
+
+/* An admin prefix grant of x is a prefix of key. */
+static bool admin_prefix_of(const struct umatch *m, const char *key, size_t len)
+{
+    const ment *e;
+    for (size_t i = 0; i < m->np && m->plen[i] <= len; i++)
+        if ((e = mfind(m, SEL_PREFIX, key, m->plen[i]))->key && (e->rights & R_ADMIN))
+            return true;
+    return false;
+}
+
+/* sel_inside(s, t) for some admin grant t of x, by the table of §2 read the other way: t is all; a prefix of s's
+ * bytes (a glob's literal prefix); for a name, the same name or a glob that matches it; for a glob, the same glob. */
+static bool inside_admin(const user *x, const user_grant *s)
+{
+    const struct umatch *m = umatch_of(x);
+    if (!m)
+        return inside_admin_slow(x, s);
+    if (m->all & R_ADMIN)
+        return true;
+    if (s->kind == SEL_ALL)
+        return false;
+    const char *k = s->kind == SEL_GLOB ? s->lit : s->sel;
+    size_t kl = s->kind == SEL_GLOB ? s->lit_len : s->len;
+    if (admin_prefix_of(m, k, kl))
+        return true;
+    const ment *e;
+    if (s->kind == SEL_NAME)
+        return ((e = mfind(m, SEL_NAME, k, kl))->key && (e->rights & R_ADMIN)) || admin_glob_matches(x, m, k, kl);
+    if (s->kind == SEL_GLOB && (e = mfind(m, SEL_GLOB, k, kl))->key)
+        for (int32_t gi = e->glob; gi >= 0; gi = m->gnext[gi])
+            if ((x->g[gi].rights & R_ADMIN) && x->g[gi].len == s->len && memcmp(x->g[gi].sel, s->sel, s->len) == 0)
+                return true;
+    return false;
+}
+
+static bool names_under(const user *x, const char *name)
+{
+    const struct umatch *m = umatch_of(x);
+    if (!m)
+        return names_under_slow(x, name);
+    return (m->all & R_ADMIN) || admin_prefix_of(m, name, strlen(name));
+}
+
 /* ------------------------------------------------------- users in memory */
 
 static void grant_clear(user_grant *g)
@@ -544,11 +635,86 @@ const user *users_by_uid(const users *us, uint32_t uid)
     return i < 0 ? NULL : us->u[i];
 }
 
+/* The name table: linear probing on the name's hash, holding uids (users move in the array, their uids do not; 0 is
+ * an empty slot, uids start at 1), at most half full. It changes with every USER and DROP applied, and is rebuilt
+ * after a rollback; without memory for it, users_find scans. */
+struct uname {
+    uint32_t uid, h;
+};
+
+static uint32_t name_hash(const char *name) { return (uint32_t)xxh64(name, strlen(name), 0x6e616d6573ull); }
+
+static void names_put(users *us, const user *u)
+{
+    uint32_t h = name_hash(u->name), i = h & us->names_mask;
+    while (us->names[i].uid)
+        i = (i + 1) & us->names_mask;
+    us->names[i] = (struct uname){u->uid, h};
+    us->names_n++;
+}
+
+static int names_rebuild(users *us)
+{
+    free(us->names);
+    us->names = NULL;
+    us->names_n = us->names_mask = 0;
+    uint32_t cap = 16;
+    while (cap < 2 * (uint64_t)us->n + 2)
+        cap *= 2;
+    if (!(us->names = calloc(cap, sizeof *us->names)))
+        return TSDB_ERR_NOMEM;
+    us->names_mask = cap - 1;
+    for (uint32_t i = 0; i < us->n; i++)
+        names_put(us, us->u[i]);
+    return 0;
+}
+
+/* u was just added to us->u */
+static int names_add(users *us, const user *u)
+{
+    if (!us->names || 2 * ((uint64_t)us->names_n + 1) > (uint64_t)us->names_mask + 1)
+        return names_rebuild(us);
+    names_put(us, u);
+    return 0;
+}
+
+static void names_del(users *us, const user *u)
+{
+    if (!us->names)
+        return;
+    struct uname *t = us->names;
+    uint32_t m = us->names_mask, j = name_hash(u->name) & m;
+    while (t[j].uid && t[j].uid != u->uid)
+        j = (j + 1) & m;
+    if (!t[j].uid)
+        return;
+    /* backward shift: an entry after the hole moves into it unless its home slot lies in (hole, entry] */
+    for (uint32_t k = (j + 1) & m; t[k].uid; k = (k + 1) & m) {
+        uint32_t home = t[k].h & m;
+        if (j < k ? (home <= j || home > k) : (home <= j && home > k)) {
+            t[j] = t[k];
+            j = k;
+        }
+    }
+    t[j].uid = 0;
+    us->names_n--;
+}
+
 const user *users_find(const users *us, const char *name)
 {
-    for (uint32_t i = 0; i < us->n; i++)
-        if (strcmp(us->u[i]->name, name) == 0)
-            return us->u[i];
+    if (!us->names) {
+        for (uint32_t i = 0; i < us->n; i++)
+            if (strcmp(us->u[i]->name, name) == 0)
+                return us->u[i];
+        return NULL;
+    }
+    uint32_t h = name_hash(name);
+    for (uint32_t i = h & us->names_mask; us->names[i].uid; i = (i + 1) & us->names_mask)
+        if (us->names[i].h == h) {
+            const user *u = users_by_uid(us, us->names[i].uid);
+            if (u && strcmp(u->name, name) == 0)
+                return u;
+        }
     return NULL;
 }
 
@@ -589,7 +755,7 @@ typedef struct batch {
     user **saved; /* the array of live users before */
     uint32_t saved_n, saved_max;
     bool saved_hdr;
-    uint8_t saved_key[32];
+    uint8_t saved_key[32], saved_id[16];
     uint64_t saved_off, saved_last_off, saved_last_check;
     ptrs old;  /* originals copied or dropped: freed by a commit */
     ptrs dead; /* copies or new users dropped within the batch: freed either way */
@@ -618,6 +784,7 @@ static int batch_begin(users *us, batch *b)
         memcpy(b->saved, us->u, us->n * sizeof *b->saved);
     b->saved_n = us->n, b->saved_max = us->max_uid, b->saved_hdr = us->have_header;
     memcpy(b->saved_key, us->mock_key, 32);
+    memcpy(b->saved_id, us->file_id, 16);
     b->saved_off = us->off, b->saved_last_off = us->last_off, b->saved_last_check = us->last_check;
     return 0;
 }
@@ -642,8 +809,10 @@ static void batch_rollback(users *us, batch *b)
         memcpy(us->u, b->saved, b->saved_n * sizeof *us->u); /* the array only grew or shrank in place */
     us->n = b->saved_n, us->max_uid = b->saved_max, us->have_header = b->saved_hdr;
     memcpy(us->mock_key, b->saved_key, 32);
+    memcpy(us->file_id, b->saved_id, 16);
     us->off = b->saved_off, us->last_off = b->saved_last_off, us->last_check = b->saved_last_check;
     free(b->old.p), free(b->dead.p), free(b->saved);
+    (void)names_rebuild(us); /* out of memory: users_find scans until the next rebuild */
 }
 
 /* The user at index i, made the batch's own copy. */
@@ -667,6 +836,7 @@ static int drop_at(users *us, batch *b, long i)
     user *u = us->u[i];
     int rc = ptrs_push(u->batch == us->batch ? &b->dead : &b->old, u);
     if (rc == 0) {
+        names_del(us, u);
         memmove(us->u + i, us->u + i + 1, (us->n - (size_t)i - 1) * sizeof *us->u);
         us->n--;
     }
@@ -690,9 +860,10 @@ static int apply_rec(users *us, batch *b, uint8_t type, const uint8_t *p, size_t
     if ((off == 0) != (type == REC_HEADER))
         return TSDB_ERR_CORRUPT; /* the header is the first record and only the first */
     if (type == REC_HEADER) {
-        if (len != 36 || ld32(p) != USERS_FORMAT)
+        if (len != HEADER_LEN || ld32(p) != USERS_FORMAT)
             return TSDB_ERR_CORRUPT;
         memcpy(us->mock_key, p + 4, 32);
+        memcpy(us->file_id, p + 36, 16);
         us->have_header = true;
         return 0;
     }
@@ -725,6 +896,11 @@ static int apply_rec(users *us, batch *b, uint8_t type, const uint8_t *p, size_t
             us->u = a, us->cap = cap;
         }
         us->u[us->n++] = u; /* uids only grow: the array stays sorted */
+        if (names_add(us, u) != 0) {
+            us->n--;
+            free(u);
+            return TSDB_ERR_NOMEM;
+        }
         us->max_uid = uid;
         return 0;
     }
@@ -894,13 +1070,26 @@ static int catch_up(users *us, int fd, bool cut)
         return TSDB_ERR_IO;
     uint64_t size = (uint64_t)st.st_size;
     bool full = st.st_ino != us->ino || st.st_dev != us->dev || size < us->off || !us->off;
-    if (!full && size == us->off)
-        return 0;
     uint8_t *buf = NULL;
     uint64_t from = 0;
     int rc = 0;
-    if (!full && us->off) {
-        /* the last record read is read again: a file cut and appended to since is read from the start */
+    if (!full) {
+        /* another file under the same inode number (a reader that closed the old one lets ext4 or an NFS server hand
+         * it to a later compaction) has another file_id, even at the same size */
+        uint8_t hdr[HEADER_SIZE], type;
+        const uint8_t *pl;
+        size_t len, rs;
+        if (size < HEADER_SIZE)
+            full = true;
+        else if ((rc = read_at(fd, hdr, HEADER_SIZE, 0)) != 0)
+            return rc;
+        else if (!parse_rec(hdr, 0, HEADER_SIZE, 0, &type, &pl, &len, &rs) || type != REC_HEADER ||
+                 len != HEADER_LEN || memcmp(pl + 36, us->file_id, 16) != 0)
+            full = true;
+    }
+    if (!full) {
+        /* the last record read is read again (also when nothing was appended): a file cut and appended to since is
+         * read from the start */
         from = us->last_off;
         size_t n = (size_t)(size - from);
         uint8_t type;
@@ -916,6 +1105,9 @@ static int catch_up(users *us, int fd, bool cut)
             ld64(buf + rs - 8) != us->last_check) {
             free(buf), buf = NULL;
             full = true;
+        } else if (size == us->off) {
+            free(buf);
+            return 0; /* the same file, nothing new */
         }
     }
     if (full) {
@@ -967,6 +1159,8 @@ static int catch_up(users *us, int fd, bool cut)
     return rc;
 }
 
+static int file_perms(const char *path, int fd, const struct stat *d);
+
 int users_open(users *us, const char *dir, bool writable)
 {
     memset(us, 0, sizeof *us);
@@ -979,7 +1173,9 @@ int users_open(users *us, const char *dir, bool writable)
     int fd = open(us->path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return errno == ENOENT ? 0 : TSDB_ERR_IO;
-    int rc = catch_up(us, fd, false);
+    int rc = file_perms(us->path, fd, NULL); /* the mode; the owner is a writer's business */
+    if (rc == 0)
+        rc = catch_up(us, fd, false);
     close(fd);
     return rc;
 }
@@ -1008,6 +1204,7 @@ void users_close(users *us)
     for (uint32_t i = 0; i < us->n; i++)
         user_free(us->u[i]);
     free(us->u);
+    free(us->names);
     if (us->fd >= 0)
         close(us->fd);
     tsdb_wipe(us->mock_key, sizeof us->mock_key);
@@ -1075,11 +1272,18 @@ static void rec_end(rbuf *b)
     put32(b, (uint32_t)(h >> 32));
 }
 
+/* A HEADER for a new file: its own random file_id */
 static void rec_header(rbuf *b, const uint8_t key[32])
 {
+    uint8_t id[16];
+    if (tsdb_random(id, sizeof id) != 0) {
+        b->oom = true;
+        return;
+    }
     rec_begin(b, REC_HEADER);
     put32(b, USERS_FORMAT);
     put(b, key, 32);
+    put(b, id, 16);
     rec_end(b);
 }
 
@@ -1162,6 +1366,90 @@ static int fsync_dir(const char *dir)
     return r;
 }
 
+/* A writer runs as the owner of the database directory, or as root, who gives the files it makes to that owner:
+ * `sudo tsdb <dir> user add` must not leave a USERS that tsdbd, running as the directory's owner, cannot open. */
+static int writer_ok(users *us, struct stat *d)
+{
+    if (stat(us->dir, d) != 0)
+        return TSDB_ERR_IO;
+    uid_t me = geteuid();
+    if (me != 0 && me != d->st_uid) {
+        fprintf(stderr,
+                "tsdb: %s belongs to uid %u and this runs as uid %u: change users as the directory's owner (or "
+                "root), so that USERS stays readable by the server\n",
+                us->dir, (unsigned)d->st_uid, (unsigned)me);
+        return TSDB_ERR_IO;
+    }
+    return 0;
+}
+
+/* USERS (or a compaction's new file) gets the directory's owner and group and mode 0600: it holds the verifiers,
+ * which are offline guessing targets. A file that keeps another owner, or group or other bits, is refused. The group
+ * is best effort (the owner may not be in the directory's group; with mode 0600 it grants nothing). */
+static int file_perms(const char *path, int fd, const struct stat *d)
+{
+    struct stat st;
+    if (fstat(fd, &st) != 0)
+        return TSDB_ERR_IO;
+    if (d && (st.st_uid != d->st_uid || st.st_gid != d->st_gid) && fchown(fd, d->st_uid, d->st_gid) != 0 &&
+        st.st_uid != d->st_uid) {
+        fprintf(stderr, "tsdb: %s belongs to uid %u, not to the directory's owner (uid %u), and cannot be given to it: "
+                        "%s\n", path, (unsigned)st.st_uid, (unsigned)d->st_uid, strerror(errno));
+        return TSDB_ERR_IO;
+    }
+    if (st.st_mode & 077) {
+        if (fchmod(fd, 0600) != 0) {
+            fprintf(stderr, "tsdb: %s has mode %03o (readable by others) and cannot be set to 0600: %s\n", path,
+                    (unsigned)(st.st_mode & 0777), strerror(errno));
+            return TSDB_ERR_IO;
+        }
+        fprintf(stderr, "tsdb: %s had mode %03o: set to 0600\n", path, (unsigned)(st.st_mode & 0777));
+    }
+    return 0;
+}
+
+/* Cuts the records of a change that failed off the file again: after a failed writeback their pages are clean but
+ * may not be on the disk, and a retry that read them would take its change as made. Best effort: the process
+ * is failing anyway. */
+static void cut_failed(users *us, uint64_t base)
+{
+    int e = errno;
+    if (ftruncate(us->fd, (off_t)base) != 0)
+        fprintf(stderr, "tsdb: %s: the failed change could not be cut off again: %s\n", us->path, strerror(errno));
+    errno = e;
+}
+
+/* The directory entry of the file being changed is durable: fsynced by this process since that file got its name.
+ * A writer that dies between creating (or a compactor between renaming) and the directory fsync leaves a name a
+ * power loss can still take back, with records that the next writer would otherwise build on. */
+static int sync_name(users *us, const uint8_t id[16])
+{
+    if (us->name_synced && memcmp(us->synced_id, id, 16) == 0)
+        return 0;
+    if (fsync_dir(us->dir) != 0) {
+        users_fail(us, "the directory fsync");
+        return TSDB_ERR_IO;
+    }
+    memcpy(us->synced_id, id, 16);
+    us->name_synced = true;
+    return 0;
+}
+
+/* An answer that changes nothing (or says a user or a grant is not there), given under the lock: the state it rests
+ * on may hold records of a writer that died between its write and its fdatasync, which a power loss can take back,
+ * so they are made durable first. Unlocks. */
+static int change_none(users *us, int rc)
+{
+    if (fdatasync(us->fd) != 0) {
+        users_fail(us, "fdatasync");
+        rc = TSDB_ERR_IO;
+    } else if (us->have_header && sync_name(us, us->file_id) != 0) {
+        rc = TSDB_ERR_IO;
+    }
+    unlock(us);
+    return rc;
+}
+
 /* Takes the write lock on the file now at the path, and reads what others appended. */
 static int change_lock(users *us)
 {
@@ -1171,6 +1459,10 @@ static int change_lock(users *us)
         return TSDB_ERR_IO;
     if (us->damaged)
         return TSDB_ERR_CORRUPT;
+    struct stat d;
+    int rc = writer_ok(us, &d);
+    if (rc)
+        return rc;
     for (;;) {
         if (us->fd < 0) {
             /* created only by the first change ever seen: a file that went away is not replaced by an empty one,
@@ -1183,6 +1475,11 @@ static int change_lock(users *us)
                     return TSDB_ERR_CORRUPT;
                 }
                 return TSDB_ERR_IO;
+            }
+            if ((rc = file_perms(us->path, us->fd, &d)) != 0) {
+                close(us->fd);
+                us->fd = -1;
+                return rc;
             }
         }
         if (lock_fd(us->fd, F_WRLCK) != 0)
@@ -1199,7 +1496,7 @@ static int change_lock(users *us)
         close(us->fd);
         us->fd = -1;
     }
-    int rc = catch_up(us, us->fd, true);
+    rc = catch_up(us, us->fd, true);
     if (rc == TSDB_ERR_CORRUPT)
         us->damaged = true;
     if (rc)
@@ -1215,7 +1512,9 @@ static int change_write(users *us, rbuf *b)
         rc = TSDB_ERR_NOMEM;
         goto out;
     }
-    bool created = us->off == 0; /* the header goes with it: the directory entry must be durable too */
+    /* the file's id: in the header that goes with the change when the file is new */
+    uint8_t id[16];
+    memcpy(id, us->off ? us->file_id : b->p + 5 + 36, 16);
     for (size_t done = 0; done < b->n;) {
         ssize_t w = write(us->fd, b->p + done, b->n - done);
         if (w < 0 && errno == EINTR)
@@ -1223,6 +1522,7 @@ static int change_write(users *us, rbuf *b)
         if (w <= 0) {
             if (w == 0)
                 errno = EIO;
+            cut_failed(us, b->base); /* before users_fail: tsdbd's on_fail exits */
             users_fail(us, "a write");
             rc = TSDB_ERR_IO;
             goto out;
@@ -1230,15 +1530,13 @@ static int change_write(users *us, rbuf *b)
         done += (size_t)w;
     }
     if (fdatasync(us->fd) != 0) {
+        cut_failed(us, b->base);
         users_fail(us, "fdatasync");
         rc = TSDB_ERR_IO;
         goto out;
     }
-    if (created && fsync_dir(us->dir) != 0) {
-        users_fail(us, "the directory fsync");
-        rc = TSDB_ERR_IO;
+    if ((rc = sync_name(us, id)) != 0)
         goto out;
-    }
     batch bt;
     size_t end;
     if ((rc = batch_begin(us, &bt)) == 0) {
@@ -1330,6 +1628,8 @@ static int change_target(users *us, uint32_t actor, const char *name, const user
         return rc;
     if ((rc = actor_of(us, actor, x)) == 0 && !(*u = users_find(us, name)))
         rc = missing(*x, name);
+    if (rc == TSDB_ERR_NOTFOUND)
+        return change_none(us, rc);
     if (rc)
         unlock(us);
     return rc;
@@ -1383,10 +1683,8 @@ int users_set_flags(users *us, uint32_t actor, const char *name, uint8_t flags)
         unlock(us);
         return TSDB_ERR_DENIED;
     }
-    if (u->flags == flags) {
-        unlock(us);
-        return 0;
-    }
+    if (u->flags == flags)
+        return change_none(us, 0);
     rbuf b;
     change_buf(us, &b);
     rec_u8(&b, REC_FLAGS, u->uid, flags);
@@ -1415,12 +1713,26 @@ static int change_grant(users *us, uint32_t actor, const char *name, uint8_t kin
         return rc;
     }
     long gi = grant_find(u, s.kind, s.sel, s.len);
-    uint8_t had = gi >= 0 ? u->g[gi].rights : 0, now = grant ? had | rights : had & (uint8_t)~rights;
+    uint8_t had = gi >= 0 ? u->g[gi].rights : 0, now;
+    if (grant)
+        now = had | rights;
+    else if ((had & R_ADMIN) && !(rights & R_ADMIN) && (rights & R_EVERY & ~R_ADMIN))
+        now = expand(had) & (uint8_t)~rights & (uint8_t)~R_ADMIN; /* admin implies what goes: it goes too (A23) */
+    else
+        now = had & (uint8_t)~rights; /* the rights admin implied go with it, unless held as such */
     if (grant ? !may_grant(x, u, &s) : !may_revoke(x, &s))
         rc = TSDB_ERR_DENIED;
     else if (now != had && gi < 0 && s.kind == SEL_GLOB && glob_count(u) >= USER_GLOBS)
         rc = TSDB_ERR_INVALID;
-    if (rc || now == had) {
+    else if (!grant && !(expand(had) & rights))
+        /* nothing of it to revoke: said to whoever may know the user exists (decision 5), DENIED to anyone else,
+         * as for a name that does not exist, so that a revoke of one's own selector lists no other tenant's users */
+        rc = may_create(x, u->name, 0) ? TSDB_ERR_NOTFOUND : TSDB_ERR_DENIED;
+    if (rc == TSDB_ERR_NOTFOUND || (rc == 0 && now == had)) {
+        grant_clear(&s);
+        return change_none(us, rc);
+    }
+    if (rc) {
         unlock(us);
         grant_clear(&s);
         return rc;
@@ -1496,9 +1808,12 @@ int users_compact(users *us)
         else
             done += (size_t)w;
     }
-    struct stat st;
-    /* errors before the rename fail just this call: nothing relies on the new file yet */
-    if (rc || fsync(fd) != 0 || fstat(fd, &st) != 0 || rename(tmp, us->path) != 0) {
+    struct stat st, d;
+    /* errors before the rename fail just this call: nothing relies on the new file yet. The new file is locked
+     * before its name is: a writer that opens the name after the rename waits until the directory fsync made the
+     * rename durable (it would otherwise append to a file a power loss can take back, and acknowledge). */
+    if (rc || stat(us->dir, &d) != 0 || (rc = file_perms(tmp, fd, &d)) != 0 || fsync(fd) != 0 ||
+        fstat(fd, &st) != 0 || lock_fd(fd, F_WRLCK) != 0 || rename(tmp, us->path) != 0) {
         rc = TSDB_ERR_IO;
         unlink(tmp);
         goto out;
@@ -1508,6 +1823,9 @@ int users_compact(users *us)
         rc = TSDB_ERR_IO;
         goto out;
     }
+    memcpy(us->synced_id, b.p + 5 + 36, 16);
+    memcpy(us->file_id, us->synced_id, 16);
+    us->name_synced = true;
     /* the same state, now read from the new file; the old one's lock goes with its descriptor */
     us->ino = st.st_ino, us->dev = st.st_dev, us->off = b.n;
     uint8_t type;

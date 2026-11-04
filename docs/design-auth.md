@@ -53,7 +53,7 @@ tenant admins are in 0.9; state names shared within a volume are accepted and do
 | A6 | **Grants are `(selector, rights)`.** Selectors: `all`, `prefix:P`, `name:N`, `glob:G` (A24). Rights: `read`, `insert`, `delete`, `admin`, independent bits. Grants only add (no deny); a user's rights on a series are the union of the grants whose selector matches its name. | Roles per prefix (the brief's first version); deny grants; per-volume grants | The user refined the model to independent rights on series selectors (TASK 4b). Deny grants make "what may this user do" depend on order and precedence, and make the escalation rule (A9) hard to check. A volume is where data is stored, not whom it belongs to (series64 §2.3). |
 | A7 | **A prefix is a byte prefix of the name**, nothing more: `prefix:acme` also matches `acmecorp/x`. `tsdb user grant` warns when a prefix does not end in `/`, the convention the docs use for tenants. | A path boundary rule (`acme` matches `acme/...` only) | Series names have no structure today, and some deployments use `.` or `:` as separators. A rule that knows `/` would impose one convention on all of them; a warning catches the usual mistake without that. |
 | A8 | **A superuser** (a flag on the user) has every right on every series and is the only one who may run the database-wide ops (`FLUSH`, `OPTIMIZE`, `STATS`), create superusers and manage users outside a tenant. Volumes are still added only with the offline CLI (AGENTS.md "Volumes"). | Superuser without data rights (PostgreSQL-style split of `pg_read_all_data`) | One flag is simpler to reason about; an operator who wants an ingest account without delete rights creates a normal user for it. |
-| A9 | **Tenant admins** (decided for 0.9 on 2026-11-04). `admin` on a prefix P lets a user create users whose names start with P, set the password of or drop a user named under P whose every grant lies inside the admin's own `admin` selectors, and grant or revoke rights on selectors inside its `admin` selectors to and from the users it manages. `admin` on a selector implies `read`, `insert` and `delete` on it. Nobody can give what they do not administer, and nobody can take over (set the password of) a user holding a right they could not have given. | Superuser-only user management; ownership recorded per user | The brief's admin role per tenant, restated in grants. The "every grant inside" rule closes the takeover path: a superuser that shares `name:shared/weather` with `acme/bob` moves bob's password out of acme's admins' reach. User names under the prefix give a tenant its own user namespace without another field. |
+| A9 | **Tenant admins** (decided for 0.9 on 2026-11-04). `admin` on a prefix P lets a user create users whose names start with P, set the password of or drop a user named under P whose every grant lies inside the admin's own `admin` selectors, and grant or revoke rights on selectors inside its `admin` selectors to and from the users it manages. `admin` on a selector implies `read`, `insert` and `delete` on it. Nobody can give what they do not administer, and nobody can take over (set the password of) a user holding a right they could not have given. | Superuser-only user management; ownership recorded per user | The brief's admin role per tenant, restated in grants. The "every grant inside" rule closes the takeover path: a superuser that shares `name:shared/weather` with `acme/bob` moves bob's password out of acme's admins' reach. Caveat (review of step 1): the rule stops a *later* takeover only; an acme admin who created bob or set his password before the share still knows it and can log in as bob and read the shared series. So a cross-tenant share goes to a user whose password the tenant admins never set, or the superuser resets the password when sharing (operations docs and SECURITY.md, step 4). User names under the prefix give a tenant its own user namespace without another field. |
 | A10 | **Users live in `USERS` in the database root**: append-only records with a length, type and checksum (xxh64, as the other append-only files), mode 0600, appended under an OFD write lock on the file (as VOLUMES, src/volumes.c:182-245). The CLI may append while tsdbd runs; tsdbd reads new records on its one-second tick and after each of its own appends. `tsdb <dir> user compact` rewrites the file (tmp, fsync, rename, directory fsync) under the lock; a reader that sees a new inode reads it again from the start. | A separate file named by a flag; a text file edited by hand; users inside META | A follower on another host reads the same file over NFS with no copy to keep in step, and the operator backs up one directory. Append-only records give atomic changes and a cut torn tail, which a hand-edited file does not. |
 | A11 | **USERS errors are fail-stop.** A failed write or fdatasync of USERS (or of the root directory after creating it) stops tsdbd with status 1, like `eng_fail`; the change is not acknowledged. At open, damage follows the rules of the other files: a torn tail is cut, a bad record with a valid one after it fails the open with `TSDB_ERR_CORRUPT`. A reload while running that finds damage logs it, keeps the last good state and refuses admin ops until a restart. | Retrying the fsync; skipping a bad record | A revoke that was acknowledged must not come back after a power loss, and a retried fsync proves nothing (AGENTS.md "Fail-stop"). A skipped GRANT or DROP record changes who may read what without anyone noticing. |
 | A12 | **The first superuser is added offline**: `tsdb <dir> user add NAME --superuser` (password from a prompt, `--password-file` or `TSDB_PASSWORD`; never argv). It works with or without tsdbd running. | An online "first login sets the password"; a bootstrap token printed at start | Whoever can write the database directory already holds every right; the file permissions are the trust boundary. An online bootstrap is a window in which the first client to connect becomes superuser. |
@@ -143,12 +143,14 @@ created and managed under prefixes only. Then:
 | create user U | X is superuser; or U's name starts with a prefix X administers. Only superusers create superusers |
 | drop U, set U's password | X manages U; anyone may set their own password |
 | grant rights R on S to U | X manages U and S is inside one of X's `admin` selectors |
-| revoke rights R on S from U | S is inside one of X's `admin` selectors (any U: a tenant may cut a share of its own data) |
+| revoke rights R on S from U | S is inside one of X's `admin` selectors (any U: a tenant may cut a share of its own data). Revoking `read`, `insert` or `delete` from a grant holding `admin` revokes `admin` too and keeps the other implied rights (A23: cutting an ingest credential's `delete` must take effect); revoking `admin` takes the rights it implied with it, keeping those granted as such. A revoke of rights U holds none of on S answers `TSDB_ERR_NOTFOUND`, and the CLI exits non-zero; to an X that could not create U's name, `TSDB_ERR_DENIED`, as for a name that does not exist |
 | set or clear `superuser` | X is superuser; the last superuser cannot be dropped or demoted online |
 | list users | superuser: all; others: the users they manage, and themselves |
 
 Cross-tenant shares (`acme/bob` reads `name:weather/oslo`) are made by a superuser. They move bob's password out of
-acme's admins' reach, which is the point: whoever can set bob's password can read Oslo's weather.
+acme's admins' reach, which is the point: whoever can set bob's password can read Oslo's weather. It does not
+take back a password they already know (they created bob, or set his password before the share): share to a user
+whose password the tenant admins never set, or reset it as superuser when sharing.
 
 ## 3. Login on protocol 12
 
@@ -200,9 +202,12 @@ server-final   v=<base64 ServerSignature>
 ## 4. The USERS file
 
 ```
-USERS: records of  u32 len, u8 type, payload, u64 xxh64(type, payload)
+USERS: records of  u32 len, u8 type, payload, zeros to a multiple of 8, u64 check
+       check = xxh64 of everything before it in the record, seeded with the record's file offset
+       type bit 0x80 (MORE): the change goes on in the next record (USER then VERIFIER of one `user add`)
 
-HEADER    u32 format (1), u8 mock_key[32]                  first record, written when the file is created
+HEADER    u32 format (1), u8 mock_key[32], u8 file_id[16]  first record, written when the file is created
+                                                           and by a compaction (new random file_id, same mock_key)
 USER      u32 uid, u8 flags, u16 len, name                 creates a user (uid above every earlier one)
 VERIFIER  u32 uid, verifier                                replaces the user's verifier
 FLAGS     u32 uid, u8 flags                                superuser on or off
@@ -213,12 +218,25 @@ DROP      u32 uid                                          the user and its gran
 - GRANT kinds are those of the wire (0 all, 1 prefix, 2 name, 3 glob); a glob is stored normalized (A24), and a
   grant over the caps (256 bytes, 64 globs per user) is refused with `TSDB_ERR_INVALID` before anything is written.
 - A GRANT record holds the resulting rights, not a difference, so replaying the file twice gives the same state.
+- Records are 8-byte aligned, so a damaged record is told from a torn tail by a valid record after it (as SERIES);
+  pad bytes must be zero. A change of several records counts only when its last one is there (MORE), so a torn
+  `user add` never leaves a user without its password.
 - **Appending** (tsdbd's admin ops and the CLI): take the OFD write lock, read any records added since the last
-  read, check the change against that state (A9), append, fdatasync (and fsync the root directory when the file was
-  created), apply in memory, release, reply. Failure of the write or the sync is fail-stop (A11). Mode 0600.
+  read, check the change against that state (A9), append, fdatasync (and fsync the root directory the first time
+  this process changes that file, by its file_id: a writer that died before its directory fsync left a name a
+  power loss can take back), apply in memory, release, reply. Failure of the write or the sync is fail-stop (A11),
+  and the failed records are cut off again before the lock goes (after a failed writeback their pages are clean but
+  maybe not on the disk; a retry must not read them as made). An answer that changes nothing (a grant held, flags as
+  they are, NOTFOUND) is given only after an fdatasync. A compaction locks its new file before the rename and keeps
+  it locked until the directory fsync. Mode 0600, owner and group those of the database directory: a writer runs as
+  the directory's owner or as root (who gives the file to that owner); a USERS readable by others is set to 0600 at
+  open, or refused when that fails.
 - **Reading** at open: all records; a torn tail is cut by the next writer under the lock; damage fails the open.
-  tsdbd keeps `(inode, offset)`: on its tick it `fstat`s the path and reads what was appended, or the whole file
-  when the inode changed (a compaction). A partial record at the end is not yet complete: read it next time.
+  tsdbd keeps `(inode, offset)` and the HEADER's file_id: on its tick it `fstat`s the path and reads what was
+  appended, or the whole file when the inode changed (a compaction), and re-reads the HEADER and the last record it
+  read: another file_id or another last record is another file (a reader that closes the file between ticks can
+  meet a later compaction's file under the same inode number and at the same size; ext4 and NFS reuse them). A
+  partial record at the end is not yet complete: read it next time.
 - **Followers** (`--follow`) and `--read-only` servers read USERS the same way and refuse admin ops with
   `TSDB_ERR_READONLY`. Over NFS the OFD lock is a server lock (ha.md D2), so the CLI on another host appends
   safely. A revoke made on the writer reaches a follower within its tick plus the NFS attribute cache (`actimeo`).
@@ -411,6 +429,15 @@ the branch merges to main once, after step 5 (A22), so BENCHMARKS.md arrives wit
 
 Steps 1 and 2 touch server/tsdbd.c near `handle()` and parse(), where the lww-fix track adds its `worker_waits`
 hook; whichever lands second rebases.
+
+Left by step 1 for step 2:
+- The CLI may drop or demote the last superuser offline (with a warning; tsdbd then refuses to start, A13). Step 2
+  decides what a *running* tsdbd does when a reload shows no superuser (keep serving logged-in sessions and refuse
+  new admin ops, or stop), and tests it.
+- A `users` is not thread-safe: `rights_of` and the manage checks build each user's index on first use, writing
+  through a pointer reached from shared state. tsdbd holds one mutex around every `users` call (reload, admin ops,
+  rights lookups at login), or builds every index at load and treats the state as read-only between reloads.
+  Lookups by name are hashed and the manage checks indexed (step 1), so the mutex is held for microseconds.
 
 ## Open questions
 

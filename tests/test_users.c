@@ -8,7 +8,10 @@
  *    the open), records that check out but make no sense, incremental reloads that meet damage and keep the last
  *    good state, compaction (also under a reader in another process), appends from two processes at once, a file
  *    that went away, fail-stop on EIO and ENOSPC (this file's write/fdatasync/fsync/rename fail on demand, as in
- *    test_failstop), and power lost at every step of the CLI's add, revoke and compact (crashfs).
+ *    test_failstop), and power lost at every step of the CLI's add, revoke and compact (crashfs);
+ *  - the findings of the first review (REVIEW1 #1-#6, #8): another file at the same inode and size, the compaction's
+ *    rename-to-fsync window, failed appends cut off and no-op answers synced, revoke of implied rights and of
+ *    grants not held, owner and mode of USERS, the indexed manage checks against trying every grant.
  *
  *   ./build/test_users [scratch dir]
  */
@@ -46,6 +49,9 @@ enum { F_WRITE = 1, F_FDATASYNC = 2, F_FSYNC_DIR = 4, F_RENAME = 8 };
 static int f_op, f_errno, f_fired;
 static bool f_partial, f_drop;
 static off_t f_synced = -1; /* USERS' size at its last successful fdatasync */
+static int f_syncs;         /* successful fdatasyncs of USERS */
+static int f_dirsyncs;      /* successful fsyncs of a directory */
+static void (*after_rename)(const char *to); /* runs right after a real rename */
 
 static bool fd_is(int fd, const char *suffix)
 {
@@ -84,7 +90,7 @@ int fdatasync(int fd)
     int r = (int)syscall(SYS_fdatasync, fd);
     struct stat st;
     if (r == 0 && users_file && fstat(fd, &st) == 0)
-        f_synced = st.st_size;
+        f_synced = st.st_size, f_syncs++;
     return r;
 }
 
@@ -96,8 +102,15 @@ int fsync(int fd)
         errno = EIO;
         return -1;
     }
-    return (int)syscall(SYS_fsync, fd);
+    int r = (int)syscall(SYS_fsync, fd);
+    if (r == 0 && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
+        f_dirsyncs++;
+    return r;
 }
+
+/* another user than the directory's owner, without being one */
+static uid_t fake_euid = (uid_t)-1;
+uid_t geteuid(void) { return fake_euid != (uid_t)-1 ? fake_euid : (uid_t)syscall(SYS_geteuid); }
 
 int rename(const char *a, const char *b)
 {
@@ -106,7 +119,10 @@ int rename(const char *a, const char *b)
         errno = EIO;
         return -1;
     }
-    return (int)syscall(SYS_renameat, AT_FDCWD, a, AT_FDCWD, b);
+    int r = (int)syscall(SYS_renameat, AT_FDCWD, a, AT_FDCWD, b);
+    if (r == 0 && after_rename)
+        after_rename(b);
+    return r;
 }
 
 static void arm(int op, int err, bool partial, bool drop)
@@ -654,10 +670,43 @@ static void matching(void)
                 round = 1000;
                 break;
             }
+            /* user names under r's admin prefixes: the index against every grant */
+            char uname[12];
+            memcpy(uname, name, n);
+            uname[n] = '\0';
+            if (n && names_under(r, uname) != names_under_slow(r, uname)) {
+                fprintf(stderr, "  names_under differs from trying every grant on \"%s\"\n", uname);
+                failures++;
+                round = 1000;
+                break;
+            }
+        }
+        /* selectors inside r's admin selectors (who may grant, revoke and manage, REVIEW1 #8): the index against
+         * every grant tried */
+        for (int i = 0; i < 300; i++) {
+            char s[16], out[24];
+            size_t n = (size_t)rand_r(&seed) % 6;
+            for (size_t j = 0; j < n; j++)
+                s[j] = "ab/*?"[rand_r(&seed) % 5];
+            user_grant g = {0};
+            size_t on;
+            uint8_t kind = (uint8_t)(rand_r(&seed) % 4);
+            if (sel_normalize(kind, s, kind == SEL_ALL ? 0 : n, &g.kind, out, &on) != 0)
+                continue;
+            g.sel = out, g.len = (uint16_t)on;
+            if (g.kind == SEL_GLOB && glob_parts(&g) != 0)
+                continue;
+            if (inside_admin(r, &g) != inside_admin_slow(r, &g)) {
+                fprintf(stderr, "  inside_admin differs from trying every grant on kind %u \"%s\"\n", g.kind, out);
+                failures++;
+                round = 1000;
+            }
+            free(g.lit), free(g.suf);
         }
         free_user(r);
     }
-    printf("  rights_of: grants of every kind, a glob removed, superuser; the index against every grant tried\n");
+    printf("  rights_of, inside_admin, names_under: grants of every kind, a glob removed, superuser; the index "
+           "against every grant tried\n");
 }
 
 /* ------------------------------------------------------------- the file */
@@ -731,8 +780,8 @@ static void round_trip(void)
     CHECK(users_drop(&us, 0, "nobody") == TSDB_ERR_NOTFOUND);
     CHECK(users_set_verifier(&us, 0, "acme/bob", &weak) == TSDB_ERR_INVALID);
     CHECK(file_size(path) == sizes[k - 1]);
-    /* changes that change nothing write nothing */
-    OK(users_revoke(&us, 0, "acme/bob", SEL_NAME, "nothing", 7, R_READ));
+    /* changes that change nothing write nothing; a revoke of a grant not held says so */
+    CHECK(users_revoke(&us, 0, "acme/bob", SEL_NAME, "nothing", 7, R_READ) == TSDB_ERR_NOTFOUND);
     OK(users_grant(&us, 0, "acme/bob", SEL_ALL, "", 0, R_READ));
     OK(users_set_flags(&us, 0, "acme/bob", 0));
     CHECK(file_size(path) == sizes[k - 1]);
@@ -1209,23 +1258,30 @@ static void failstop(void)
         OK(users_create(&us, 0, "bob", 0, &v, NULL));
         OK(users_grant(&us, 0, "bob", SEL_PREFIX, "acme/", 5, R_READ));
         char *acked = dump_dup(&us);
+        char path[700];
+        snprintf(path, sizeof path, "%s/USERS", dir);
+        off_t before = file_size(path);
         arm(t[i].op, t[i].err, t[i].partial, t[i].drop);
         CHECK(users_revoke(&us, 0, "bob", SEL_PREFIX, "acme/", 5, R_READ) == TSDB_ERR_IO);
         CHECK(f_fired == 1 && us.failed && fail_calls == 1);
         /* not applied in memory, and nothing more acknowledged */
         CHECK(strcmp(acked, dump(&us)) == 0);
         CHECK(users_create(&us, 0, "carol", 0, &v, NULL) == TSDB_ERR_IO && fail_calls == 1);
+        /* the failed records are cut off again (REVIEW1 #3): after a failed writeback their pages are clean, maybe
+         * not on the disk, and a retry must not read them as its change already made */
+        CHECK(file_size(path) == before);
         users_close(&us);
-        /* a reopen: the acknowledged state, or (fdatasync failed but the pages were written) the revoke too, which
-         * was never acknowledged; never anything torn */
+        /* a reopen: the acknowledged state, never anything torn or failed */
         users r;
         OK(users_open(&r, dir, true));
         const user *bob = users_find(&r, "bob");
         CHECK(bob && !users_find(&r, "carol"));
-        if (t[i].op == F_WRITE || t[i].drop)
-            CHECK(strcmp(acked, dump(&r)) == 0);
-        else
-            CHECK(bob && bob->ng == 0);
+        CHECK(strcmp(acked, dump(&r)) == 0);
+        /* the retry writes its record and syncs it */
+        int syncs = f_syncs;
+        OK(users_revoke(&r, 0, "bob", SEL_PREFIX, "acme/", 5, R_READ));
+        CHECK(f_syncs > syncs && file_size(path) > before && users_find(&r, "bob")->ng == 0);
+        OK(users_grant(&r, 0, "bob", SEL_PREFIX, "acme/", 5, R_READ));
         OK(users_create(&r, 0, "carol", 0, &v, NULL)); /* the next writer cuts what was torn */
         users_close(&r);
         OK(users_open(&r, dir, false));
@@ -1309,6 +1365,269 @@ static void online(void)
     users_close(&us);
     cleanup(dir);
     printf("  online checks against the file's state: tenants, shares, the last superuser, a dropped actor\n");
+}
+
+/* ------------------------------------------------------- review 1 */
+
+/* REVIEW1 #1: a reader that closes USERS between reloads (tsdbd's tick, a follower) can meet a later compaction's
+ * file under the inode number it read, at the same size (a demotion compacts to as many bytes as before it). ext4
+ * does reuse the numbers; here the new bytes are written into the very inode the reader read, so the test does not
+ * depend on the file system: same inode, same size, another file. */
+static void replaced_same_size(void)
+{
+    char dir[600], other[600], path[700], opath[700];
+    fresh("same", dir, sizeof dir);
+    fresh("same2", other, sizeof other);
+    snprintf(path, sizeof path, "%s/USERS", dir);
+    snprintf(opath, sizeof opath, "%s/USERS", other);
+    user_verifier v = verifier("pw");
+    users w, o, r;
+    OK(users_open(&w, dir, true));
+    OK(users_open(&o, other, true));
+    users *both[] = {&w, &o};
+    for (int i = 0; i < 2; i++) {
+        OK(users_create(both[i], 0, "root", USER_SUPERUSER, &v, NULL));
+        OK(users_create(both[i], 0, "bob", USER_SUPERUSER, &v, NULL));
+    }
+    OK(users_open(&r, dir, false));
+    CHECK(users_find(&r, "bob")->flags == USER_SUPERUSER);
+    /* the other file: bob demoted, compacted to the size the reader read */
+    OK(users_set_flags(&o, 0, "bob", 0));
+    OK(users_compact(&o));
+    CHECK(file_size(opath) == (off_t)r.off);
+    struct stat a, b;
+    CHECK(stat(path, &a) == 0);
+    CHECK(copy_file(opath, path, file_size(opath)) == 0); /* in place: O_TRUNC, the same inode */
+    CHECK(stat(path, &b) == 0 && a.st_ino == b.st_ino && b.st_size == (off_t)r.off);
+    OK(users_reload(&r));
+    CHECK(users_find(&r, "bob") && users_find(&r, "bob")->flags == 0);
+    CHECK(same(&r, &o));
+    /* and a writer that kept its descriptor sees it too */
+    OK(users_grant(&w, 0, "bob", SEL_ALL, "", 0, R_READ));
+    CHECK(users_find(&w, "bob")->flags == 0);
+    users_close(&w), users_close(&o), users_close(&r);
+    cleanup(dir), cleanup(other);
+    printf("  a reload tells another file of the same inode and size by its file_id (REVIEW1 #1)\n");
+}
+
+/* REVIEW1 #2: between a compaction's rename and its directory fsync the new file is locked, so no writer appends
+ * (and acknowledges) to a file whose name a power loss can still take back. */
+static const char *probe_path;
+static int probe_locked = -1;
+
+static void probe_lock(const char *to)
+{
+    if (!probe_path || strcmp(to, probe_path) != 0)
+        return;
+    int fd = open(to, O_RDWR | O_CLOEXEC);
+    struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
+    probe_locked = fd >= 0 && fcntl(fd, F_OFD_SETLK, &fl) != 0 && (errno == EAGAIN || errno == EACCES);
+    if (fd >= 0)
+        close(fd);
+}
+
+static void compaction_window(void)
+{
+    char dir[600], path[700];
+    fresh("window", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/USERS", dir);
+    user_verifier v = verifier("pw");
+    users w;
+    OK(users_open(&w, dir, true));
+    OK(users_create(&w, 0, "root", USER_SUPERUSER, &v, NULL));
+    OK(users_create(&w, 0, "bob", 0, &v, NULL));
+    probe_path = path, probe_locked = -1, after_rename = probe_lock;
+    int dirsyncs = f_dirsyncs;
+    OK(users_compact(&w));
+    after_rename = NULL, probe_path = NULL;
+    CHECK(probe_locked == 1);
+    CHECK(f_dirsyncs > dirsyncs);
+    /* and released after it: the next writer gets the lock */
+    users x;
+    OK(users_open(&x, dir, true));
+    OK(users_grant(&x, 0, "bob", SEL_ALL, "", 0, R_READ));
+    users_close(&x), users_close(&w);
+    cleanup(dir);
+    printf("  a compaction's new file is locked from before its rename to its directory fsync (REVIEW1 #2)\n");
+}
+
+/* REVIEW1 #3 (the part failstop() does not cover): an answer that changes nothing rests on the file as read, which
+ * may hold records of a writer that died before its fdatasync; and a file whose writer died before the directory
+ * fsync has a name a power loss can take back. Both are made durable before anything is acknowledged. */
+static void unsynced_state(void)
+{
+    char dir[600], path[700];
+    fresh("unsynced", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/USERS", dir);
+    user_verifier v = verifier("pw");
+    users w;
+    OK(users_open(&w, dir, true));
+    OK(users_create(&w, 0, "root", USER_SUPERUSER, &v, NULL));
+    OK(users_create(&w, 0, "bob", 0, &v, NULL));
+    users_close(&w);
+    /* a writer that died between its write and its fdatasync: bob's grant is in the page cache only */
+    rbuf b;
+    memset(&b, 0, sizeof b);
+    b.base = (uint64_t)file_size(path);
+    rec_grant(&b, 2, SEL_ALL, R_READ, "", 0);
+    int fd = open(path, O_WRONLY | O_APPEND);
+    CHECK(fd >= 0 && syscall(SYS_write, fd, b.p, b.n) == (long)b.n);
+    close(fd);
+    free(b.p);
+    /* a fresh writer: its directory fsync comes with its first change, even though the file is not new */
+    users x;
+    OK(users_open(&x, dir, true));
+    int syncs = f_syncs, dirsyncs = f_dirsyncs;
+    off_t size = file_size(path);
+    OK(users_grant(&x, 0, "bob", SEL_ALL, "", 0, R_READ)); /* held already: nothing written, but synced */
+    CHECK(file_size(path) == size && f_syncs == syncs + 1 && f_dirsyncs == dirsyncs + 1);
+    OK(users_set_flags(&x, 0, "bob", 0));
+    CHECK(file_size(path) == size && f_syncs == syncs + 2 && f_dirsyncs == dirsyncs + 1);
+    CHECK(users_revoke(&x, 0, "bob", SEL_NAME, "x", 1, R_READ) == TSDB_ERR_NOTFOUND);
+    CHECK(users_drop(&x, 0, "nobody") == TSDB_ERR_NOTFOUND);
+    CHECK(file_size(path) == size && f_syncs == syncs + 4 && f_dirsyncs == dirsyncs + 1);
+    /* a failed fdatasync there is fail-stop like any other */
+    arm(F_FDATASYNC, EIO, false, false);
+    CHECK(users_set_flags(&x, 0, "bob", 0) == TSDB_ERR_IO && x.failed);
+    users_close(&x);
+    cleanup(dir);
+    printf("  answers that change nothing are synced first; a new writer fsyncs the directory once (REVIEW1 #3)\n");
+}
+
+/* REVIEW1 #4 and #5: revoking a right admin implies takes admin with it; revoking what is not held says so, but only
+ * to an actor that could know the user exists. */
+static void revoke_rules(void)
+{
+    char dir[600], path[700];
+    fresh("revoke", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/USERS", dir);
+    user_verifier v = verifier("pw");
+    users us;
+    OK(users_open(&us, dir, true));
+    uint32_t root, admin;
+    OK(users_create(&us, 0, "root", USER_SUPERUSER, &v, &root));
+    OK(users_create(&us, root, "acme/admin", 0, &v, &admin));
+    OK(users_grant(&us, root, "acme/admin", SEL_PREFIX, "acme/", 5, R_ADMIN));
+    OK(users_create(&us, root, "acme/bob", 0, &v, NULL));
+#define BOB(name) rights_of((user *)users_find(&us, "acme/bob"), name, strlen(name))
+    /* read out of admin: admin goes, insert and delete stay */
+    OK(users_grant(&us, 0, "acme/bob", SEL_PREFIX, "acme/", 5, R_ADMIN));
+    OK(users_revoke(&us, 0, "acme/bob", SEL_PREFIX, "acme/", 5, R_READ));
+    CHECK(BOB("acme/x") == (R_INSERT | R_DELETE));
+    /* write (insert and delete) out of admin, by the tenant admin: read stays */
+    OK(users_grant(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_ADMIN));
+    CHECK(BOB("acme/x") == R_EVERY);
+    OK(users_revoke(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_WRITE));
+    CHECK(BOB("acme/x") == R_READ);
+    /* delete alone (A23: an ingest credential that must not erase history) */
+    OK(users_grant(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_ADMIN));
+    OK(users_revoke(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_DELETE));
+    CHECK(BOB("acme/x") == (R_READ | R_INSERT));
+    /* admin itself: the rights it implied go with it, those granted as such stay */
+    OK(users_grant(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_ADMIN));
+    OK(users_revoke(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_ADMIN));
+    CHECK(BOB("acme/x") == (R_READ | R_INSERT));
+    OK(users_revoke(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_READ | R_INSERT));
+    OK(users_grant(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_ADMIN));
+    OK(users_revoke(&us, admin, "acme/bob", SEL_PREFIX, "acme/", 5, R_ADMIN | R_READ));
+    CHECK(BOB("acme/x") == 0 && users_find(&us, "acme/bob")->ng == 0);
+    /* a grant not held, or none of the rights named: NOTFOUND, nothing written */
+    off_t size = file_size(path);
+    CHECK(users_revoke(&us, 0, "acme/bob", SEL_PREFIX, "acme/", 5, R_READ) == TSDB_ERR_NOTFOUND);
+    OK(users_grant(&us, admin, "acme/bob", SEL_PREFIX, "acme/s/", 7, R_READ));
+    size = file_size(path);
+    CHECK(users_revoke(&us, admin, "acme/bob", SEL_PREFIX, "acme/s/", 7, R_INSERT) == TSDB_ERR_NOTFOUND);
+    CHECK(users_revoke(&us, admin, "acme/bob", SEL_NAME, "acme/s/t", 8, R_READ) == TSDB_ERR_NOTFOUND);
+    CHECK(file_size(path) == size && BOB("acme/s/t") == R_READ);
+    /* #5: the acme admin learns nothing of globex's users by revoking its own selector from them */
+    OK(users_create(&us, root, "globex/ceo", 0, &v, NULL));
+    CHECK(users_revoke(&us, admin, "globex/ceo", SEL_PREFIX, "acme/", 5, R_READ) == TSDB_ERR_DENIED);
+    CHECK(users_revoke(&us, admin, "globex/nobody", SEL_PREFIX, "acme/", 5, R_READ) == TSDB_ERR_DENIED);
+    /* a share of acme's data is still cut from them */
+    OK(users_grant(&us, root, "globex/ceo", SEL_NAME, "acme/s/t", 8, R_READ));
+    OK(users_revoke(&us, admin, "globex/ceo", SEL_NAME, "acme/s/t", 8, R_READ));
+    CHECK(users_find(&us, "globex/ceo")->ng == 0);
+    CHECK(users_revoke(&us, admin, "globex/ceo", SEL_NAME, "acme/s/t", 8, R_READ) == TSDB_ERR_DENIED);
+    /* the superuser and the operator see NOTFOUND */
+    CHECK(users_revoke(&us, root, "globex/ceo", SEL_NAME, "acme/s/t", 8, R_READ) == TSDB_ERR_NOTFOUND);
+#undef BOB
+    users_close(&us);
+    cleanup(dir);
+    printf("  revoke: implied rights take admin with them; not held is NOTFOUND only to who may know (REVIEW1 #4, #5)\n");
+}
+
+/* REVIEW1 #6: USERS (and a compaction's file) gets the directory's owner and group and mode 0600; an existing file
+ * readable by others is set to 0600; a writer that is neither the directory's owner nor root is refused. */
+static mode_t mode_of(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0 ? st.st_mode & 07777 : (mode_t)-1;
+}
+
+static void permissions(void)
+{
+    char dir[600], path[700], tmp[720];
+    fresh("perms", dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/USERS", dir);
+    snprintf(tmp, sizeof tmp, "%s.compact", path);
+    user_verifier v = verifier("pw");
+    /* a group of this user's other than its own: the directory gets it, the files must follow (without root, the
+     * group is the part of "the directory's owner" a test can change) */
+    gid_t groups[64], g = (gid_t)-1;
+    int ng = getgroups(64, groups);
+    for (int i = 0; i < ng; i++)
+        if (groups[i] != getegid())
+            g = groups[i];
+    if (g != (gid_t)-1)
+        CHECK(chown(dir, (uid_t)-1, g) == 0);
+    users w;
+    OK(users_open(&w, dir, true));
+    OK(users_create(&w, 0, "root", USER_SUPERUSER, &v, NULL));
+    struct stat st;
+    CHECK(mode_of(path) == 0600);
+    if (g != (gid_t)-1)
+        CHECK(stat(path, &st) == 0 && st.st_gid == g);
+    /* a stale compaction file of mode 0644 (O_TRUNC keeps a mode): the compacted USERS is 0600 */
+    int fd = open(tmp, O_WRONLY | O_CREAT, 0644);
+    CHECK(fd >= 0 && fchmod(fd, 0644) == 0);
+    close(fd);
+    OK(users_compact(&w));
+    CHECK(mode_of(path) == 0600);
+    if (g != (gid_t)-1)
+        CHECK(stat(path, &st) == 0 && st.st_gid == g);
+    users_close(&w);
+    /* an existing USERS readable by others: a reader sets it to 0600, and so does a writer */
+    CHECK(chmod(path, 0644) == 0);
+    users r;
+    OK(users_open(&r, dir, false));
+    CHECK(mode_of(path) == 0600);
+    users_close(&r);
+    CHECK(chmod(path, 0640) == 0);
+    OK(users_open(&w, dir, true));
+    OK(users_create(&w, 0, "bob", 0, &v, NULL));
+    CHECK(mode_of(path) == 0600);
+    /* another uid than the directory's owner (and not root): refused, nothing written */
+    off_t size = file_size(path);
+    fake_euid = (uid_t)syscall(SYS_geteuid) + 1;
+    if (fake_euid == 0)
+        fake_euid = 2;
+    CHECK(users_create(&w, 0, "carol", 0, &v, NULL) == TSDB_ERR_IO);
+    users x;
+    char empty[600];
+    fresh("perms-new", empty, sizeof empty);
+    OK(users_open(&x, empty, true));
+    CHECK(users_create(&x, 0, "root", USER_SUPERUSER, &v, NULL) == TSDB_ERR_IO);
+    char epath[700];
+    snprintf(epath, sizeof epath, "%s/USERS", empty);
+    CHECK(access(epath, F_OK) != 0); /* no file made */
+    fake_euid = (uid_t)-1;
+    OK(users_create(&x, 0, "root", USER_SUPERUSER, &v, NULL));
+    CHECK(file_size(path) == size);
+    OK(users_create(&w, 0, "carol", 0, &v, NULL));
+    users_close(&w), users_close(&x);
+    cleanup(dir), cleanup(empty);
+    printf("  USERS: the directory's owner and group (group %s), mode 0600, other writers refused (REVIEW1 #6)\n",
+           g != (gid_t)-1 ? "tested" : "not tested: no second group");
 }
 
 /* ------------------------------------------------------- power loss */
@@ -1467,6 +1786,11 @@ int main(int argc, char **argv)
     two_writers();
     failstop();
     online();
+    replaced_same_size();
+    compaction_window();
+    unsynced_state();
+    revoke_rules();
+    permissions();
     power_loss();
     if (failures) {
         fprintf(stderr, "test_users: %d failures\n", failures);

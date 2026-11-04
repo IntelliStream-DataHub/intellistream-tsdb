@@ -63,6 +63,8 @@ void tsdb_sha256_init(tsdb_sha256 *c)
 void tsdb_sha256_update(tsdb_sha256 *c, const void *data, size_t len)
 {
     const uint8_t *p = data;
+    if (!len)
+        return; /* data may be NULL: no memcpy or arithmetic on it (undefined even for 0 bytes) */
     c->bytes += len;
     if (c->n) {
         size_t k = 64 - c->n < len ? 64 - c->n : len;

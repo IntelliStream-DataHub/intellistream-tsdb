@@ -68,8 +68,13 @@ typedef struct users {
     uint64_t last_check;
     bool have_header;
     uint8_t mock_key[32];
+    uint8_t file_id[16]; /* the HEADER's: new with every file, so a file put in place of another is never taken for it */
+    bool name_synced;    /* this process fsynced the directory since the file of synced_id got its name */
+    uint8_t synced_id[16];
     user **u; /* live users, by uid */
     uint32_t n, cap;
+    struct uname *names; /* the live users by name (open addressing on the name's hash) */
+    uint32_t names_mask, names_n;
     uint32_t max_uid; /* the highest uid ever created */
     uint64_t batch;
     bool damaged; /* a reload found damage: the last good state stays, changes are refused (A11) */
@@ -93,7 +98,11 @@ void users_close(users *us);
  * that (A9; TSDB_ERR_DENIED), appends, fdatasyncs and applies it. TSDB_ERR_NOTFOUND for a user the actor could
  * create but that does not exist (DENIED for one it could not), TSDB_ERR_INVALID for a bad name, selector, rights
  * or verifier or a name that exists, TSDB_ERR_IO after a write or sync failed (fail-stop), TSDB_ERR_CORRUPT while
- * `damaged`, TSDB_ERR_READONLY without `writable`. */
+ * `damaged`, TSDB_ERR_READONLY without `writable`. An answer that changes nothing (flags as they are, a grant
+ * already held) is given only after an fdatasync of the file: the state it rests on may be another writer's
+ * unsynced append. users_revoke of rights the user holds none of on that selector: TSDB_ERR_NOTFOUND (DENIED to an
+ * actor that could not create the name). Revoking read, insert or delete from a grant holding admin takes admin
+ * too (admin implies them) and keeps the other implied rights. */
 int users_create(users *us, uint32_t actor, const char *name, uint8_t flags, const user_verifier *v, uint32_t *uid);
 int users_drop(users *us, uint32_t actor, const char *name);
 int users_set_verifier(users *us, uint32_t actor, const char *name, const user_verifier *v);
@@ -102,7 +111,8 @@ int users_grant(users *us, uint32_t actor, const char *name, uint8_t kind, const
                 uint8_t rights);
 int users_revoke(users *us, uint32_t actor, const char *name, uint8_t kind, const char *sel, size_t len,
                  uint8_t rights);
-/* Rewrites USERS with one record per live fact (tmp, fsync, rename, directory fsync) under the lock. */
+/* Rewrites USERS with one record per live fact (tmp, fsync, rename, directory fsync) under the lock, and under a lock
+ * on the new file from before the rename until the directory fsync. */
 int users_compact(users *us);
 
 const user *users_find(const users *us, const char *name);
@@ -131,7 +141,8 @@ uint8_t rights_of_slow(const user *u, const char *name, size_t len);
 
 /* Selector s lies inside t (§2's table; both normalized). */
 bool sel_inside(const user_grant *s, const user_grant *t);
-/* x may create, drop, set the password of, grant to, revoke from, list. x NULL is the operator (every right). */
+/* x may create, drop, set the password of, grant to, revoke from, list. x NULL is the operator (every right).
+ * They use x's rights_of index (built on first use), so they are as little thread-safe as rights_of. */
 bool user_manages(const user *x, const user *u);
 bool may_create(const user *x, const char *name, uint8_t flags);
 bool may_grant(const user *x, const user *u, const user_grant *s);

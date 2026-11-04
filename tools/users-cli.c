@@ -172,6 +172,16 @@ static void print_sel(FILE *f, uint8_t kind, const char *sel, size_t len)
     }
 }
 
+/* The rights NAME holds on exactly that (normalized) selector, 0 for none. */
+static uint8_t held_on(const users *us, const char *name, uint8_t kind, const char *sel, size_t len)
+{
+    const user *u = users_find(us, name);
+    for (uint32_t i = 0; u && i < u->ng; i++)
+        if (u->g[i].kind == kind && u->g[i].len == len && memcmp(u->g[i].sel, sel, len) == 0)
+            return u->g[i].rights;
+    return 0;
+}
+
 static int cmd_list(const users *us)
 {
     for (uint32_t i = 0; i < us->n; i++) {
@@ -335,10 +345,28 @@ int user_main(const char *dir, int argc, char **argv)
                 if (nk == SEL_PREFIX && norm[nl - 1] != '/')
                     fprintf(stderr, "tsdb: warning: prefix:%s also matches names such as %sX...; tenant prefixes "
                                     "end in '/'\n", norm, norm);
-                rc = strcmp(verb, "grant") == 0 ? users_grant(&us, 0, name, kind, sel, len, rights)
-                                                : users_revoke(&us, 0, name, kind, sel, len, rights);
+                bool grant = strcmp(verb, "grant") == 0;
+                uint8_t had = held_on(&us, name, nk, norm, nl);
+                rc = grant ? users_grant(&us, 0, name, kind, sel, len, rights)
+                           : users_revoke(&us, 0, name, kind, sel, len, rights);
                 if (rc == TSDB_ERR_INVALID && nk == SEL_GLOB)
                     fprintf(stderr, "tsdb: at most %d glob grants per user\n", USER_GLOBS);
+                uint8_t now = held_on(&us, name, nk, norm, nl);
+                if (!grant && rc == TSDB_ERR_NOTFOUND && users_find(&us, name)) {
+                    /* the operator believes something was cut: say that nothing was (A23) */
+                    fprintf(stderr, "tsdb: %s holds none of ", name);
+                    print_rights(stderr, rights);
+                    fprintf(stderr, " on ");
+                    print_sel(stderr, nk, norm, nl);
+                    fprintf(stderr, ": nothing revoked (grants on other selectors are revoked on their own)\n");
+                    rc = 0, ret = 1;
+                } else if (!grant && rc == 0 && (had & R_ADMIN) && !(rights & R_ADMIN)) {
+                    fprintf(stderr, "tsdb: admin implies read, insert and delete: admin on ");
+                    print_sel(stderr, nk, norm, nl);
+                    fprintf(stderr, " is revoked too; %s keeps ", name);
+                    print_rights(stderr, now);
+                    fprintf(stderr, "%s there\n", now ? "" : "nothing");
+                }
             }
             free(norm);
         }
