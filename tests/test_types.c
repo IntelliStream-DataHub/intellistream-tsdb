@@ -1466,6 +1466,70 @@ static void test_dataset_clock(void)
     }
 }
 
+/* Timestamp blocks keep ZSTD only when it saves 1/8 of the transform bytes, value blocks from 1/32
+ * (blk_zstd_min_saving): the same bytes of each saving are wrapped as both, and the generated clocks are checked. */
+static void test_ts_zstd_rule(void)
+{
+    enum { INNER = 8192 };
+    codec_ctx *c = codec_new();
+    uint8_t *src = malloc(INNER), *blk = malloc(ZSTD_compressBound(INNER) + 5 + BLK_SLACK);
+    size_t tmp_cap = ZSTD_compressBound(block_bound(8192));
+    uint8_t *tmp = malloc(tmp_cap);
+    static const int ts_kinds[] = {BLK_DD, BLK_TS_DELTA, BLK_TS_GRID};
+    for (int zeros_pct = 10; zeros_pct <= 40; zeros_pct += 30) { /* random bytes, then a run of zeros ZSTD removes */
+        for (size_t i = 0; i < INNER; i++)
+            src[i] = i < INNER * (size_t)(100 - zeros_pct) / 100 ? (uint8_t)rnd() : 0;
+        for (int level = 1; level <= 3; level += 2) {
+            size_t z = zstd_pack(c->cctx, tmp, ZSTD_compressBound(INNER), src, INNER, level);
+            CHECK(!ZSTD_isError(z));
+            bool mid = z + 4 < INNER - INNER / 32 && z + 4 >= INNER - INNER / 8; /* saves 1/32 to 1/8 */
+            CHECK(zeros_pct == 10 ? mid : z + 4 < INNER - INNER / 8); /* the premise of each case */
+            size_t vl = block_wrap_src(c, level, BLK_DECIMAL_BP, src, INNER, blk);
+            CHECK(blk[0] == (BLK_DECIMAL_BP | BLK_ZSTD) && vl == 5 + z); /* value blocks: 1/32 as before */
+            for (size_t k = 0; k < sizeof ts_kinds / sizeof *ts_kinds; k++) {
+                size_t tl = block_wrap_src(c, level, ts_kinds[k], src, INNER, blk);
+                if (mid)
+                    CHECK(blk[0] == ts_kinds[k] && tl == 1 + INNER && !memcmp(blk + 1, src, INNER));
+                else
+                    CHECK(blk[0] == (ts_kinds[k] | BLK_ZSTD) && tl == 5 + z);
+            }
+        }
+    }
+
+    /* block_encode_ts on the generated clocks: a ZSTD'd block saves 1/8, and some raw ones are blocks ZSTD would
+     * have shrunk by 1/32 (so the clocks reach the rule; tank_bar and tank_psi did in the 2026-11-02 measurement) */
+    enum { N = 8192 };
+    int64_t *ts = malloc(N * sizeof *ts), *back = malloc(N * sizeof *back);
+    uint8_t *tb = malloc(block_bound(N) + BLK_SLACK);
+    int raw_mid = 0;
+    for (int k = 0; k < DS_KINDS; k++) {
+        ds_state st;
+        ds_init(&st, (ds_kind)k, 7, 1704067200000);
+        for (int b = 0; b < 8; b++) {
+            double v;
+            for (int i = 0; i < N; i++)
+                ds_next_f64(&st, &ts[i], &v);
+            size_t tl = block_encode_ts(c, 1, ts, N, tb);
+            CHECK(tl > 0 && block_decode_ts(c, tb, tl, N, back) == 0 && !memcmp(ts, back, N * sizeof *ts));
+            if (tb[0] & BLK_ZSTD) {
+                size_t inner = load32(tb + 1);
+                CHECK(tl - 5 + 4 < inner - inner / 8);
+            } else if (tl - 1 >= 64) {
+                size_t inner = tl - 1, z = zstd_pack(c->cctx, tmp, tmp_cap, tb + 1, inner, 1);
+                raw_mid += !ZSTD_isError(z) && z + 4 < inner - inner / 32;
+            }
+        }
+    }
+    CHECK(raw_mid > 0);
+    free(ts);
+    free(back);
+    free(tb);
+    free(src);
+    free(blk);
+    free(tmp);
+    codec_free(c);
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -1476,6 +1540,7 @@ int main(int argc, char **argv)
         test_f32_sample();
     }
     test_dict();
+    test_ts_zstd_rule();
     test_exceptions_rt();
     test_f32_wide();
     test_engine(base);
