@@ -34,15 +34,15 @@ def user_cli(dir, password, *args):
 
 
 class Server:
-    def __init__(self, base, dir=None, root_password=None):
+    def __init__(self, base, dir=None, root_password=None, root="root"):
         """Serves dir (an existing database: test_embedded), or a new directory under base. With root_password the
-        server requires a login, and USERS holds the superuser root with that password (made by the CLI);
+        server requires a login, and USERS holds the superuser root (a name) with that password (made by the CLI);
         without, it runs with --no-auth."""
         own = pathlib.Path(tempfile.mkdtemp(prefix="tsdb-py-", dir=base))
         self.dir = pathlib.Path(dir) if dir else own / "db"
         pf = own / "port"
         if root_password is not None:
-            user_cli(self.dir, root_password, "add", "root", "--superuser")
+            user_cli(self.dir, root_password, "add", root, "--superuser")
         self.proc = subprocess.Popen(
             [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4"]
             + ([] if root_password is not None else ["--no-auth"]),
@@ -108,11 +108,21 @@ def auth_server():
     yield from serve(ROOT_PASSWORD)
 
 
-def serve(root_password=None):
+@pytest.fixture
+def readme_server():
+    """A server set up as the README's quick start does: the superuser admin, its password (ROOT_PASSWORD) in the
+    file srv.password_file."""
+    for srv in serve(ROOT_PASSWORD, root="admin"):
+        srv.password_file = srv.dir.parent / "password"
+        srv.password_file.write_text(ROOT_PASSWORD + "\n")
+        yield srv
+
+
+def serve(root_password=None, root="root"):
     if not os.access(TSDBD, os.X_OK):
         pytest.fail(f"{TSDBD} is missing: run make in the repository root")
     base = os.environ.get("TSDB_TEST_DIR")
-    srv = Server(base, root_password=root_password)
+    srv = Server(base, root_password=root_password, root=root)
     try:
         yield srv
     finally:

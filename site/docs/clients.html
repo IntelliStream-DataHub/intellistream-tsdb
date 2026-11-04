@@ -33,8 +33,15 @@ database inside your program, with no server. Pick your language once; every pag
 <code>make test</code> makes sure the page still shows exactly that code.</p>
 
 <h2 id="install">1. Get the client</h2>
-<p>First build tsdb and start a server: <code>make</code>, then <code>build/tsdbd --dir /tmp/tsdb-demo</code> in the
-top directory of the checkout. It listens on port 7070. Leave it running and open a second terminal.</p>
+<p>First build tsdb and start a server, in the top directory of the checkout. The server lets in only clients that
+log in, so first add a user, <code>admin</code>, who may do everything (a "superuser"). Its password goes in a file only
+you can read; every example on this page logs in with it:</p>
+<pre><code class="language-sh" data-src="client/rust/README.md#Quick start">make
+mkdir -p /tmp/tsdb-demo
+(umask 077 &amp;&amp; echo 'try-out-password-17' &gt; /tmp/tsdb-demo/password)
+./build/tsdb /tmp/tsdb-demo/db user add admin --superuser --password-file /tmp/tsdb-demo/password
+./build/tsdbd --dir /tmp/tsdb-demo/db</code></pre>
+<p>It listens on port 7070. Leave it running and open a second terminal.</p>
 <div class="tabs">
 <div class="tablist" role="tablist" aria-label="Language">
 <button type="button" role="tab" data-key="c">C</button>
@@ -181,15 +188,20 @@ done:
         tsdbc_close(c);
     return rc;
 }</code></pre>
-<p class="code-source">examples/client.c. <code>make</code> builds it; run <code>build/client-example 127.0.0.1 7070</code>.</p>
+<p class="code-source">examples/client.c. <code>make</code> builds it; run
+<code>build/client-example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code>.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
-<pre><code class="language-rust" data-src="client/rust/examples/quickstart.rs">use tsdb_client::{Client, Group, QueryOpts, Unit};
+<pre><code class="language-rust" data-src="client/rust/examples/quickstart.rs">use tsdb_client::{Client, ConnectOptions, Group, QueryOpts, Unit};
 
 fn main() -&gt; Result&lt;(), tsdb_client::Error&gt; {
-    // Connect to tsdbd. The address is the first argument, if there is one.
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let mut client = Client::connect(addr.as_str())?;
+    // Connect to tsdbd and log in. The arguments, all optional: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &amp;login)?;
 
     // Get the id of a series (it is created the first time).
     let id = client.series("pump7.flow")?;
@@ -231,7 +243,9 @@ day  1700002800000 count 1380 sum 40710</code></pre>
 <div class="tabpanel" role="tabpanel" data-key="python">
 <pre><code class="language-python" data-src="client/python/README.md#Quick start">from tsdb_client import Client
 
-with Client("127.0.0.1", port=7070) as client:  # the connection closes at the end of the block
+# Connect and log in as admin, with the password from the file of step 1.
+# The connection closes at the end of the with block.
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as client:
     # Get the id of a series (it is created the first time).
     series = client.series("pump7.flow")
 
@@ -260,15 +274,20 @@ with Client("127.0.0.1", port=7070) as client:  # the connection closes at the e
 <pre><code class="language-java" data-src="client/java/src/main/java/ai/intellistream/tsdb/example/Example.java">package ai.intellistream.tsdb.example;
 
 import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.Group;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.Unit;
 
+import java.nio.file.Path;
 import java.time.Instant;
 
-/** Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port]}. */
+/**
+ * Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port] [user]
+ * [password-file]}.
+ */
 public final class Example {
     private Example() {
     }
@@ -276,14 +295,19 @@ public final class Example {
     /**
      * Runs the example.
      *
-     * @param args the host and port of a running tsdbd; default 127.0.0.1 7070
-     * @throws Exception if the server cannot be reached or a request fails
+     * @param args the host and port of a running tsdbd, the user to log in as and the file with its password;
+     *     default 127.0.0.1 7070 admin /tmp/tsdb-demo/password
+     * @throws Exception if the server cannot be reached, the login fails or a request fails
      */
     public static void main(String[] args) throws Exception {
         String host = args.length &gt; 0 ? args[0] : "127.0.0.1";
         int port = args.length &gt; 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
+        String user = args.length &gt; 2 ? args[2] : "admin";
+        Path passwordFile = Path.of(args.length &gt; 3 ? args[3] : "/tmp/tsdb-demo/password");
 
-        try (TsdbClient client = TsdbClient.connect(host, port)) {
+        // Log in as user, with the password from the first line of passwordFile.
+        ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+        try (TsdbClient client = TsdbClient.connect(host, port, login)) {
             long pump = client.series("pump7.flow_m3h"); // get or create
 
             // One reading per minute for a day, from 2024-03-01T00:00Z, as a single batch.
@@ -317,7 +341,7 @@ public final class Example {
 <p class="code-source">client/java/src/main/java/ai/intellistream/tsdb/example/Example.java. Build and run it:</p>
 <pre><code class="language-sh" data-block="2" data-src="client/java/README.md#Quick start">cd client/java
 mvn -q package -DskipTests
-java -cp target/tsdb-client-0.9.0.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070</code></pre>
+java -cp target/tsdb-client-0.9.0.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code></pre>
 </div>
 </div>
 <p>Times are milliseconds since 1970 in UTC. The Oslo days are worked out by the client: the server knows only UTC
@@ -512,11 +536,16 @@ typedef struct tsdb_twa_bucket {
 *  - n &lt;= threshold returns every point. threshold &lt; 3 or a state series:</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
-<pre><code class="language-rust" data-src="client/rust/examples/analytics.rs">use tsdb_client::{Client, QueryOpts, TwaOpts, ValueType};
+<pre><code class="language-rust" data-src="client/rust/examples/analytics.rs">use tsdb_client::{Client, ConnectOptions, QueryOpts, TwaOpts, ValueType};
 
 fn main() -&gt; Result&lt;(), tsdb_client::Error&gt; {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let mut client = Client::connect(addr.as_str())?;
+    // As in the quick start: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &amp;login)?;
     let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC
     let hour = 3_600_000;
 
@@ -681,6 +710,166 @@ client.replaceRange(energy, t0, t0 + 2000, new long[] {t0}, Column.ofLongs(7));
 client.setRetention(energy, 30 * 86_400_000L);    // keep 30 days; 0 keeps everything
 long limit = client.retention(energy);</code></pre>
 <p class="code-source">From client/java/README.md.</p>
+</div>
+</div>
+
+<h2 id="login">7. Logging in, users and rights</h2>
+<p>Every program on this page logs in with a user name and a password. The password never crosses the network:
+client and server prove to each other that they know it. A wrong user name and a wrong password give the same
+error. Keep passwords in a file only you can read, or wherever your program keeps secrets, never in the source.</p>
+<p>A superuser may do everything. Every other user has rights (<code>read</code>, <code>insert</code>,
+<code>delete</code>, <code>admin</code>) on the series a selector matches: <code>all</code>, a name prefix such as
+<code>prefix:acme/</code>, one name, or a pattern such as <code>glob:acme/*/temp</code>. A series a user may not touch
+answers "permission denied", whether it exists or not. A superuser, or a user with <code>admin</code> on a prefix,
+adds users and gives them rights over the connection. Here a superuser adds a user for a collector that may only add
+rows under <code>acme/</code>, which then cannot read them back nor see another tenant's series. On the server's own
+machine an operator does the same with <a href="cli.html#users"><code>tsdb DIR user</code></a>.</p>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<p>The login is part of the connect options:</p>
+<pre><code class="language-c" data-src="examples/client.c#L51-L53">tsdbc_options login = {0};
+login.user = argc &gt; 3 ? argv[3] : NULL;          /* NULL: no login */
+login.password_file = argc &gt; 4 ? argv[4] : NULL; /* never the password itself: argv is visible in ps */</code></pre>
+<p>and the calls for users are in <code>client/tsdb_client.h</code> (the kinds of selector are
+<code>TSDB_SEL_*</code>, the rights <code>TSDB_RIGHT_*</code> bits):</p>
+<pre><code class="language-c" data-src="client/tsdb_client.h#L85-L90">int tsdbc_user_create(tsdbc *c, const char *name, const char *password, uint32_t iterations, uint8_t flags);
+int tsdbc_user_drop(tsdbc *c, const char *name);
+int tsdbc_user_alter(tsdbc *c, const char *name, uint8_t flags);
+int tsdbc_user_password(tsdbc *c, const char *name, const char *password, uint32_t iterations);
+int tsdbc_grant(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);
+int tsdbc_revoke(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);</code></pre>
+<p class="code-source">From examples/client.c and client/tsdb_client.h.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<pre><code class="language-rust" data-src="client/rust/examples/users.rs">use tsdb_client::{Client, ConnectOptions, QueryOpts, Rights, Selector};
+
+fn main() -&gt; Result&lt;(), tsdb_client::Error&gt; {
+    // Log in as the superuser of the quick start: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let mut admin = Client::connect_opts(addr.as_str(), &amp;ConnectOptions::new().user(user).password_file(password_file))?;
+
+    // A user for a collector of the tenant "acme": it may add rows to the series whose names start with
+    // "acme/", and do nothing else.
+    admin.user_create("acme/ingest", "collector-password-5", false, None)?;
+    admin.grant("acme/ingest", &amp;Selector::Prefix("acme/".into()), Rights::INSERT)?;
+    for u in admin.user_list()? {
+        let grants: Vec&lt;String&gt; = u.grants.iter().map(|g| format!("{} on {}", g.rights, g.selector)).collect();
+        println!("{}: {}", u.name, if u.superuser { "superuser".to_string() } else { grants.join(", ") });
+    }
+
+    // The collector logs in with its own password and writes a row.
+    let login = ConnectOptions::new().user("acme/ingest").password("collector-password-5");
+    let mut collector = Client::connect_opts(addr.as_str(), &amp;login)?;
+    let pump = collector.series("acme/pump1")?;
+    collector.insert_series(pump, &amp;[1_700_000_000_000], &amp;[1.5])?;
+
+    // It may not read the row back, nor see a series of another tenant.
+    if let Err(e) = collector.query_points(pump, .., QueryOpts::asc()) {
+        println!("read acme/pump1: {e}");
+    }
+    if let Err(e) = collector.series("globex/pump1") {
+        println!("globex/pump1: {e}");
+    }
+    collector.close()?;
+
+    // Drop the user again, so that the example can run once more.
+    admin.user_drop("acme/ingest")?;
+    admin.close()
+}</code></pre>
+<p class="code-source">client/rust/examples/users.rs. After the quick start, run
+<code>cargo run --example users</code>. It prints:</p>
+<pre><code data-lang="text" data-src="client/rust/README.md#Users and rights">admin: superuser
+acme/ingest: insert on prefix:acme/
+read acme/pump1: server error -16: permission denied
+globex/pump1: server error -16: permission denied</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<pre><code class="language-python" data-src="client/python/README.md#Users and rights">from tsdb_client import Client, TsdbError
+
+# Log in as the superuser of the quick start.
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as admin:
+    # A user for a collector of the tenant "acme": it may add rows to the
+    # series whose names start with "acme/", and do nothing else.
+    admin.user_create("acme/ingest", "collector-password-5")
+    admin.grant("acme/ingest", "prefix:acme/", "insert")
+    for u in admin.user_list():
+        print(f"{u.name}:", "superuser" if u.superuser else u.grants)
+
+    # The collector logs in with its own password and writes a row.
+    with Client("127.0.0.1", port=7070, user="acme/ingest", password="collector-password-5") as collector:
+        pump = collector.series("acme/pump1")
+        collector.insert_series(pump, [1_700_000_000_000], [1.5])
+
+        # It may not read the row back, nor see a series of another tenant.
+        try:
+            collector.query_raw(pump)
+        except TsdbError as e:
+            print("read acme/pump1:", e)
+        try:
+            collector.series("globex/pump1")
+        except TsdbError as e:
+            print("globex/pump1:", e)
+
+    # Drop the user again, so that the program can run once more.
+    admin.user_drop("acme/ingest")</code></pre>
+<p class="code-source">From client/python/README.md. It prints:</p>
+<pre><code data-lang="text" data-src="client/python/README.md#Users and rights">admin: superuser
+acme/ingest: [('prefix:acme/', 'insert')]
+read acme/pump1: server error -16: permission denied
+globex/pump1: server error -16: permission denied</code></pre>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<pre><code class="language-java" data-src="client/java/README.md#Users and rights">ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+try (TsdbClient admin = TsdbClient.connect(host, port, login)) {
+    // A user for a collector of the tenant "acme": it may add rows to the series whose names start
+    // with "acme/", and do nothing else.
+    admin.userCreate("acme/ingest", "collector-password-5".toCharArray(), false);
+    admin.grant("acme/ingest", Selector.prefix("acme/"), Rights.INSERT);
+    for (User u : admin.userList()) {
+        StringJoiner grants = new StringJoiner(", ");
+        for (Grant g : u.grants())
+            grants.add(g.rights() + " on " + g.selector());
+        System.out.println(u.name() + ": " + (u.superuser() ? "superuser" : grants));
+    }
+
+    // The collector logs in with its own password and writes a row.
+    ConnectOptions collectorLogin = ConnectOptions.defaults().user("acme/ingest")
+            .password("collector-password-5");
+    try (TsdbClient collector = TsdbClient.connect(host, port, collectorLogin)) {
+        long pump = collector.series("acme/pump1");
+        collector.insert(pump, new long[] {1_700_000_000_000L}, new float[] {1.5f});
+
+        // It may not read the row back, nor see a series of another tenant.
+        try {
+            collector.queryPoints(pump, Long.MIN_VALUE, Long.MAX_VALUE, Order.ASC, 10);
+        } catch (TsdbException e) {
+            System.out.println("read acme/pump1: " + e.getMessage());
+        }
+        try {
+            collector.series("globex/pump1");
+        } catch (TsdbException e) {
+            System.out.println("globex/pump1: " + e.getMessage());
+        }
+    }
+
+    // Drop the user again, so that the example can run once more.
+    admin.userDrop("acme/ingest");
+}</code></pre>
+<p class="code-source">The heart of client/java/src/main/java/ai/intellistream/tsdb/example/UsersExample.java, which you
+can run as the quick start's <code>Example</code>. It prints:</p>
+<pre><code data-lang="text" data-src="client/java/README.md#Users and rights">admin: superuser
+acme/ingest: insert on prefix:acme/
+read acme/pump1: permission denied (-16)
+globex/pump1: permission denied (-16)</code></pre>
 </div>
 </div>
 

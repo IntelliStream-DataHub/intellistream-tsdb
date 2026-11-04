@@ -31,7 +31,8 @@
 look at data, take backups and change settings.</p>
 <p>Every command starts with the database directory: <code>tsdb DIR COMMAND ...</code>. Run <code>build/tsdb</code>
 without arguments for the full list, the time formats and the groups. The <a href="quickstart.html">quick start</a>
-uses <code>import</code> and <code>query</code>.</p>
+uses <code>import</code> and <code>query</code>. <code>tsdb DIR user</code> manages the <a href="#users">users</a> who
+may log in to tsdbd.</p>
 
 <h2 id="commands">Commands</h2>
 <div class="table-wrap"><table>
@@ -52,7 +53,49 @@ uses <code>import</code> and <code>query</code>.</p>
 <tr><td><code>drop-before TIME</code></td><td>drops whole partitions that end before TIME</td></tr>
 <tr><td><code>delete SERIES START END</code></td><td>deletes the series' values in <code>[START, END)</code></td></tr>
 <tr><td><code>retention SERIES [AGE|off]</code></td><td>shows or sets how long the series keeps values, such as <code>30d</code> or <code>12h</code>; <code>off</code> keeps them for ever</td></tr>
+<tr><td><code>user ...</code></td><td>adds, changes and lists the users who may log in to tsdbd; see <a href="#users">below</a></td></tr>
 </tbody></table></div>
+
+<h2 id="users">Users</h2>
+<p>tsdbd lets in only clients that log in, and it does not start until the database has a superuser, a user who may
+do everything. <code>tsdb DIR user</code> changes the file <code>USERS</code> in the database directory. It works while
+tsdbd runs: the server sees a change within a second.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+<tbody>
+<tr><td><code>user add NAME [--superuser]</code></td><td>adds a user, a superuser with <code>--superuser</code>; it asks for the password</td></tr>
+<tr><td><code>user passwd NAME</code></td><td>sets a new password</td></tr>
+<tr><td><code>user drop NAME</code></td><td>removes a user; its open connections are closed. Dropping the last superuser only warns, but tsdbd then does not start again until there is one</td></tr>
+<tr><td><code>user alter NAME --superuser|--no-superuser</code></td><td>makes a user a superuser or takes that away</td></tr>
+<tr><td><code>user grant NAME RIGHTS SELECTOR</code></td><td>gives rights on the series the selector matches</td></tr>
+<tr><td><code>user revoke NAME RIGHTS SELECTOR</code></td><td>takes them away again</td></tr>
+<tr><td><code>user list</code></td><td>lists the users with their rights</td></tr>
+<tr><td><code>user compact</code></td><td>rewrites <code>USERS</code> with only what is current: every change is added at its end, so the file grows</td></tr>
+</tbody></table></div>
+<ul>
+<li><strong>Rights:</strong> <code>read</code>, <code>insert</code>, <code>delete</code>, <code>admin</code>, and
+<code>write</code> for insert and delete; several with commas, such as <code>read,insert</code>.</li>
+<li><strong>Selectors:</strong> <code>all</code>; <code>prefix:acme/</code>, the names that start with
+<code>acme/</code>; <code>name:pump7.flow</code>, one series; <code>glob:acme/*/temp?</code>, the names the pattern
+matches (<code>*</code> is any text, <code>?</code> one byte, <code>\</code> takes the next byte as it is). A series a
+user may not touch answers like a series that does not exist.</li>
+<li><strong>Passwords</strong> are never taken from the command line, where other users could see them:
+<code>--password-file FILE</code> reads the first line of FILE, else the variable <code>TSDB_PASSWORD</code>, else
+<code>tsdb</code> asks without showing what you type.</li>
+</ul>
+<p>A user for a collector that may only add data under <code>acme/</code>:</p>
+<pre><code class="language-sh" data-block="2" data-src="README.md#Users and logins">build/tsdb /data/sensors user add acme/ingest --password-file /etc/tsdb/acme-ingest.password
+build/tsdb /data/sensors user grant acme/ingest insert prefix:acme/
+build/tsdb /data/sensors user list</code></pre>
+<p>A user with <code>admin</code> on a prefix manages the users whose names start with it. It does that through a
+running tsdbd, so it needs no access to the server's files: add <code>--server HOST:PORT --login NAME</code> (the
+login's password comes from <code>--login-password-file FILE</code>, else <code>TSDB_LOGIN_PASSWORD</code>, else the
+terminal). <code>tsdb user whoami --server HOST:PORT --login NAME</code> shows that user's rights.</p>
+<pre><code class="language-sh" data-block="3" data-src="README.md#Users and logins">build/tsdb /data/sensors user add acme/admin --password-file /etc/tsdb/acme-admin.password
+build/tsdb /data/sensors user grant acme/admin admin prefix:acme/
+# from any machine that reaches tsdbd, as acme/admin (it asks for acme/admin's password, then the new one):
+build/tsdb user add acme/dashboard --server db1:7070 --login acme/admin
+build/tsdb user grant acme/dashboard read prefix:acme/ --server db1:7070 --login acme/admin</code></pre>
 
 <h2 id="query-options">Query options</h2>
 <ul>

@@ -17,10 +17,16 @@ plain lists. If numpy is installed, queries return numpy arrays.
 
    ```sh
    make
-   ./build/tsdbd --dir /tmp/tsdb-demo
+   mkdir -p /tmp/tsdb-demo
+   (umask 077 && echo 'try-out-password-17' > /tmp/tsdb-demo/password)
+   ./build/tsdb /tmp/tsdb-demo/db user add admin --superuser --password-file /tmp/tsdb-demo/password
+   ./build/tsdbd --dir /tmp/tsdb-demo/db
    ```
 
-   It listens on port 7070. Leave it running and open a second terminal.
+   The server lets in only clients that log in, so first add a user,
+   `admin`, who may do everything (a "superuser"). Its password goes in a
+   file only you can read. It listens on port 7070. Leave it running and
+   open a second terminal.
 
 2. Build and install the library into a virtual environment. You need Rust
    (`cargo`) and Python 3.9 or newer:
@@ -37,7 +43,9 @@ plain lists. If numpy is installed, queries return numpy arrays.
 ```python
 from tsdb_client import Client
 
-with Client("127.0.0.1", port=7070) as client:  # the connection closes at the end of the block
+# Connect and log in as admin, with the password from the file of step 1.
+# The connection closes at the end of the with block.
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as client:
     # Get the id of a series (it is created the first time).
     series = client.series("pump7.flow")
 
@@ -75,7 +83,8 @@ day  1700002800000 1380 40710.0
 
 ## Connect
 
-`Client(host, port=7070, timeout=None)` opens one connection. Use it in a
+`Client(host, port=7070, timeout=None, user=..., password_file=...)` opens
+one connection and logs in (see "Log in" below). Use it in a
 `with` block, or call `client.close()` when you are done. Threads can share
 a client (they take turns) or open one each. `timeout` is in seconds.
 
@@ -91,6 +100,86 @@ after 3 unanswered probes (`keepalive=False` turns it off).
 
 Errors are raised as `TsdbError`. Its `code` tells what went wrong, for
 example `tsdb_client.ERR_NOTFOUND`.
+
+## Log in
+
+tsdbd lets in only clients that log in with a user name and a password. The
+password never crosses the network: client and server prove to each other
+that they know it (SCRAM-SHA-256). `Client` takes the login as arguments:
+
+- `user="acme/ingest"`: the user name.
+- `password_file="/etc/tsdb/acme-ingest.password"`: read the password from
+  the first line of this file. Keep the file readable only by you. Or
+  `password=p` with the password itself, from wherever your program keeps
+  secrets.
+- `require_auth=True`: refuse a server that asks for no login (one started
+  with `--no-auth`). Without it, such a server is used without a login.
+
+A wrong user name and a wrong password raise the same error, `TsdbError` with
+`tsdb_client.ERR_AUTH`. `tsdb_client.Pool` takes the same arguments and logs
+every connection in. A client keeps what it worked out from the password, so
+connecting again as the same user is quick.
+
+## Users and rights
+
+A superuser may do everything. Every other user has rights (`read`,
+`insert`, `delete`, `admin`; `write` is insert and delete) on the series a
+selector matches: `all`, `prefix:acme/` (the names that start with it),
+`name:pump7.flow` or `glob:acme/*/temp` (`*` is any text, `?` one byte). A
+series a user may not touch raises `ERR_DENIED`, whether it exists or not,
+so nobody learns the names of other users' series.
+
+A superuser, or a user with `admin` on a prefix, adds and changes users over
+the connection. After the quick start, this program adds a user for a
+collector that may only add rows under `acme/`:
+
+```python
+from tsdb_client import Client, TsdbError
+
+# Log in as the superuser of the quick start.
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as admin:
+    # A user for a collector of the tenant "acme": it may add rows to the
+    # series whose names start with "acme/", and do nothing else.
+    admin.user_create("acme/ingest", "collector-password-5")
+    admin.grant("acme/ingest", "prefix:acme/", "insert")
+    for u in admin.user_list():
+        print(f"{u.name}:", "superuser" if u.superuser else u.grants)
+
+    # The collector logs in with its own password and writes a row.
+    with Client("127.0.0.1", port=7070, user="acme/ingest", password="collector-password-5") as collector:
+        pump = collector.series("acme/pump1")
+        collector.insert_series(pump, [1_700_000_000_000], [1.5])
+
+        # It may not read the row back, nor see a series of another tenant.
+        try:
+            collector.query_raw(pump)
+        except TsdbError as e:
+            print("read acme/pump1:", e)
+        try:
+            collector.series("globex/pump1")
+        except TsdbError as e:
+            print("globex/pump1:", e)
+
+    # Drop the user again, so that the program can run once more.
+    admin.user_drop("acme/ingest")
+```
+
+It prints:
+
+```text
+admin: superuser
+acme/ingest: [('prefix:acme/', 'insert')]
+read acme/pump1: server error -16: permission denied
+globex/pump1: server error -16: permission denied
+```
+
+The other calls: `whoami()` (who this connection is, with its grants),
+`user_password(name, password)`, `user_alter(name, superuser=True)`
+(superusers only) and `revoke(name, selector, rights)`. The password does
+not travel here either: the client sends only a value made from it. On the
+server's own machine an operator does the same with `tsdb DIR user ...` (see
+the main README, "Users and logins"); a server started with `--no-auth` has
+no users and refuses these calls.
 
 ## Create a series
 
@@ -307,7 +396,7 @@ The `_multi` calls ask for many series at once: one request, one answer,
 in the order of your list. The server (or, for `Db`, the database in this
 process) reads the series in parallel and from one moment in time, so an
 insert that wrote several series at once is seen whole or not at all.
-They need tsdbd 0.9 with protocol version 11.
+Every server this client connects to (protocol version 12) has them.
 
 ```python
 import numpy as np
@@ -391,7 +480,8 @@ Over the network, `tsdb_client.Pool` does the same with several
 connections to one server (by default one per CPU of this machine):
 
 ```python
-with tsdb_client.Pool("127.0.0.1", 7070, connections=16) as pool:
+login = dict(user="admin", password_file="/tmp/tsdb-demo/password")  # as for Client
+with tsdb_client.Pool("127.0.0.1", 7070, connections=16, **login) as pool:
     hours = pool.query_agg_many(pumps, t0, t0 + 86_400_000, 3_600_000)
 ```
 

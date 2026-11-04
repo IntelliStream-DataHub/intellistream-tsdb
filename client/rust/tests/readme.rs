@@ -1,4 +1,4 @@
-//! The README's quick start is `examples/quickstart.rs`, and it runs against a live server.
+//! The README's quick start is `examples/quickstart.rs`, and it runs against a live server that requires a login.
 
 mod common;
 
@@ -16,14 +16,30 @@ fn readme_quick_start_is_the_example() {
     assert_eq!(code.trim_end(), example.trim_end(), "README.md quick start differs from examples/quickstart.rs");
 }
 
-#[test]
-fn quick_start_runs() {
-    let srv = Server::start();
+/// Runs an example against a server that requires a login, set up as the README's step 1 does (the superuser
+/// `admin`, added by the CLI), logged in as `admin` through a password file; returns what it printed and whether it
+/// succeeded.
+fn run_logged_in(example: &str) -> std::process::Output {
+    let dir = common::test_dir("tsdb-readme-auth");
+    common::user_cli(&dir, Some("example-pw"), &["add", "admin", "--superuser"]);
+    let srv = Server::spawn(dir, true);
+    let pw_dir = common::test_dir("tsdb-readme-pw");
+    std::fs::create_dir_all(&pw_dir).unwrap();
+    let password_file = pw_dir.join("password");
+    std::fs::write(&password_file, "example-pw\n").unwrap();
     let out = Command::new(env!("CARGO"))
-        .args(["run", "--quiet", "--example", "quickstart", "--", &srv.addr()])
+        .args(["run", "--quiet", "--example", example, "--", &srv.addr(), "admin"])
+        .arg(&password_file)
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap();
+    std::fs::remove_dir_all(pw_dir).ok();
+    out
+}
+
+#[test]
+fn quick_start_runs() {
+    let out = run_logged_in("quickstart");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "quickstart failed:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     let count = |p: &str| stdout.lines().filter(|l| l.starts_with(p)).count();
@@ -93,13 +109,34 @@ fn analytics_output() -> &'static str {
 
 #[test]
 fn analytics_example_runs() {
-    let srv = Server::start();
-    let out = Command::new(env!("CARGO"))
-        .args(["run", "--quiet", "--example", "analytics", "--", &srv.addr()])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .unwrap();
+    let out = run_logged_in("analytics");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "analytics failed:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(stdout, analytics_output());
+}
+
+#[test]
+fn readme_users_section_is_the_example() {
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let readme = std::fs::read_to_string(format!("{dir}/README.md")).unwrap();
+    let example = std::fs::read_to_string(format!("{dir}/examples/users.rs")).unwrap();
+    let start = readme.find("## Users and rights").expect("a Users and rights section");
+    let section = &readme[start..];
+    let code = section.split("```rust\n").nth(1).and_then(|s| s.split("\n```").next()).unwrap();
+    assert_eq!(code.trim_end(), example.trim_end(), "README.md users section differs from examples/users.rs");
+    let printed = section.split("```text\n").nth(1).and_then(|s| s.split("```").next()).unwrap();
+    assert_eq!(printed, users_output(), "README.md shows other output than the example prints");
+}
+
+fn users_output() -> &'static str {
+    "admin: superuser\nacme/ingest: insert on prefix:acme/\nread acme/pump1: server error -16: permission denied\n\
+     globex/pump1: server error -16: permission denied\n"
+}
+
+#[test]
+fn users_example_runs() {
+    let out = run_logged_in("users");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "users failed:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, users_output());
 }

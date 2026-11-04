@@ -1,8 +1,13 @@
-use tsdb_client::{Client, QueryOpts, TwaOpts, ValueType};
+use tsdb_client::{Client, ConnectOptions, QueryOpts, TwaOpts, ValueType};
 
 fn main() -> Result<(), tsdb_client::Error> {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let mut client = Client::connect(addr.as_str())?;
+    // As in the quick start: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &login)?;
     let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC
     let hour = 3_600_000;
 

@@ -15,6 +15,7 @@ import java.util.Locale;
 
 import ai.intellistream.tsdb.example.Example;
 import ai.intellistream.tsdb.example.TypedExample;
+import ai.intellistream.tsdb.example.UsersExample;
 import org.junit.jupiter.api.Test;
 
 /** The README's quick start is the example class, and the examples run against a live server. */
@@ -39,6 +40,30 @@ class ExampleTest {
                 "README.md's quick start must hold Example.java, verbatim");
     }
 
+    /** The README's "Users and rights" snippet is the body of UsersExample.main, which exampleRuns runs. */
+    @Test
+    void readmeUsersSnippetIsTheExample() throws Exception {
+        String readme = Files.readString(BASE.resolve("README.md"), StandardCharsets.UTF_8);
+        String section = readme.substring(readme.indexOf("\n## Users and rights"));
+        int open = section.indexOf("```java\n") + "```java\n".length();
+        String snippet = section.substring(open, section.indexOf("\n```\n", open) + 1);
+        String example = Files.readString(BASE.resolve("src/main/java/ai/intellistream/tsdb/example/UsersExample.java"),
+                StandardCharsets.UTF_8);
+        StringBuilder indented = new StringBuilder();
+        for (String line : snippet.split("\n"))
+            indented.append(line.isEmpty() ? "" : "        ").append(line).append('\n');
+        assertTrue(example.contains(indented), "README.md's users snippet must be in UsersExample.java:\n" + snippet);
+        String printed = section.substring(section.indexOf("```text\n") + "```text\n".length());
+        assertEquals(USERS_OUTPUT, printed.substring(0, printed.indexOf("```")).replace("\n", System.lineSeparator()));
+    }
+
+    static final String USERS_OUTPUT = String.join(System.lineSeparator(),
+            "admin: superuser",
+            "acme/ingest: insert on prefix:acme/",
+            "read acme/pump1: permission denied (-16)",
+            "globex/pump1: permission denied (-16)",
+            "");
+
     /**
      * The README's other Java snippets compile: each becomes a method of one class, whose fields stand for the
      * variables the snippets share ({@code client}, {@code flow}, ...).
@@ -47,9 +72,10 @@ class ExampleTest {
     void readmeSnippetsCompile() throws Exception {
         String readme = Files.readString(BASE.resolve("README.md"), StandardCharsets.UTF_8);
         int after = readme.indexOf("\n## ", readme.indexOf("\n## Quick start") + 1);
-        StringBuilder src = new StringBuilder("import ai.intellistream.tsdb.*;\nimport java.time.*;\n"
-                + "import java.util.*;\nclass ReadmeSnippets {\n    static TsdbClient client;\n"
-                + "    static int flow, energy;\n    static long t0;\n");
+        StringBuilder src = new StringBuilder("import ai.intellistream.tsdb.*;\nimport java.nio.file.Path;\n"
+                + "import java.time.*;\nimport java.util.*;\nclass ReadmeSnippets {\n    static TsdbClient client;\n"
+                + "    static int flow, energy, port;\n    static long t0;\n    static String host, user;\n"
+                + "    static Path passwordFile;\n");
         int n = 0;
         for (int open = readme.indexOf("```java\n", after); open >= 0; open = readme.indexOf("```java\n", open + 1)) {
             int close = readme.indexOf("\n```\n", open);
@@ -71,15 +97,15 @@ class ExampleTest {
         }
     }
 
-    /** Runs an example's main against the server and returns what it printed. */
-    static String run(TsdbServer s, ThrowingMain main) throws Exception {
+    /** Runs an example's main against the server, logged in as admin, and returns what it printed. */
+    static String run(TsdbServer s, Path passwordFile, ThrowingMain main) throws Exception {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         PrintStream old = System.out;
         Locale locale = Locale.getDefault();
         System.setOut(new PrintStream(buf, true, StandardCharsets.UTF_8));
         Locale.setDefault(Locale.ROOT); /* decimal points */
         try {
-            main.run(new String[] {"127.0.0.1", Integer.toString(s.port)});
+            main.run(new String[] {"127.0.0.1", Integer.toString(s.port), "admin", passwordFile.toString()});
         } finally {
             System.setOut(old);
             Locale.setDefault(locale);
@@ -94,7 +120,10 @@ class ExampleTest {
     @Test
     void exampleRuns() throws Exception {
         Path scratch = TsdbServer.scratch("tsdbd-java-example-");
-        try (TsdbServer s = TsdbServer.start(scratch.resolve("db"))) {
+        // as the README's step 1: the superuser admin, its password in a file
+        Path passwordFile = Files.writeString(scratch.resolve("password"), "example-pw\n");
+        TsdbServer.userCli(scratch.resolve("db"), "example-pw", "add", "admin", "--superuser");
+        try (TsdbServer s = TsdbServer.start(scratch.resolve("db"), true)) {
             String expected = String.join(System.lineSeparator(),
                     "2024-03-01T23:59:00Z 45.9",
                     "2024-03-01T23:58:00Z 45.8",
@@ -106,7 +135,7 @@ class ExampleTest {
                     "Oslo day from 2024-02-29T23:00:00Z: 1380 points",
                     "Oslo day from 2024-03-01T23:00:00Z: 60 points",
                     "");
-            assertEquals(expected, run(s, Example::main));
+            assertEquals(expected, run(s, passwordFile, Example::main));
             assertEquals(String.join(System.lineSeparator(),
                     "2024-03-01T00:00:00Z 1000",
                     "2024-03-01T00:01:00Z 1250",
@@ -114,7 +143,9 @@ class ExampleTest {
                     "2024-03-01T00:03:00Z 1900",
                     "known 3, sum 4150, max 1900",
                     "running running stopped running",
-                    ""), run(s, TypedExample::main));
+                    ""), run(s, passwordFile, TypedExample::main));
+            for (int i = 0; i < 2; i++) // it drops its user again, so it runs twice
+                assertEquals(USERS_OUTPUT, run(s, passwordFile, UsersExample::main));
             assertEquals(0, s.stop(), s.log());
         } finally {
             TsdbServer.delete(scratch);

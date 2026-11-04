@@ -1,15 +1,20 @@
 package ai.intellistream.tsdb.example;
 
 import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.Group;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.Unit;
 
+import java.nio.file.Path;
 import java.time.Instant;
 
-/** Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port]}. */
+/**
+ * Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port] [user]
+ * [password-file]}.
+ */
 public final class Example {
     private Example() {
     }
@@ -17,14 +22,19 @@ public final class Example {
     /**
      * Runs the example.
      *
-     * @param args the host and port of a running tsdbd; default 127.0.0.1 7070
-     * @throws Exception if the server cannot be reached or a request fails
+     * @param args the host and port of a running tsdbd, the user to log in as and the file with its password;
+     *     default 127.0.0.1 7070 admin /tmp/tsdb-demo/password
+     * @throws Exception if the server cannot be reached, the login fails or a request fails
      */
     public static void main(String[] args) throws Exception {
         String host = args.length > 0 ? args[0] : "127.0.0.1";
         int port = args.length > 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
+        String user = args.length > 2 ? args[2] : "admin";
+        Path passwordFile = Path.of(args.length > 3 ? args[3] : "/tmp/tsdb-demo/password");
 
-        try (TsdbClient client = TsdbClient.connect(host, port)) {
+        // Log in as user, with the password from the first line of passwordFile.
+        ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+        try (TsdbClient client = TsdbClient.connect(host, port, login)) {
             long pump = client.series("pump7.flow_m3h"); // get or create
 
             // One reading per minute for a day, from 2024-03-01T00:00Z, as a single batch.

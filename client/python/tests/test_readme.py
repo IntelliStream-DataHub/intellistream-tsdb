@@ -8,12 +8,13 @@ import sys
 README = pathlib.Path(__file__).resolve().parents[1] / "README.md"
 
 
-def test_quick_start(server):
+def test_quick_start(readme_server):
     text = README.read_text()
     section = text[text.index("## Quick start") :]
     code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
-    assert "port=7070" in code
-    code = code.replace("port=7070", f"port={server.port}")
+    assert "port=7070" in code and '"/tmp/tsdb-demo/password"' in code
+    code = code.replace("port=7070", f"port={readme_server.port}")
+    code = code.replace('"/tmp/tsdb-demo/password"', repr(str(readme_server.password_file)))
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     lines = out.stdout.splitlines()
@@ -22,6 +23,20 @@ def test_quick_start(server):
     assert lines[0] == "raw  1700085540000 59.0", out.stdout
     # Oslo days begin at 23:00 UTC in November
     assert lines[-2:] == ["day  1699916400000 60 1770.0", "day  1700002800000 1380 40710.0"], out.stdout
+
+
+def test_users(readme_server):
+    text = README.read_text()
+    section = text[text.index("## Users and rights") :]
+    code = re.search(r"```python\n(.*?)\n```", section, re.S).group(1)
+    assert code.count("port=7070") == 2 and '"/tmp/tsdb-demo/password"' in code
+    code = code.replace("port=7070", f"port={readme_server.port}")
+    code = code.replace('"/tmp/tsdb-demo/password"', repr(str(readme_server.password_file)))
+    printed = re.search(r"```text\n(.*?)```", section, re.S).group(1)
+    for _ in range(2):  # the program drops its user again, so it runs twice
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout == printed
 
 
 def test_embedded(tmp_path):
