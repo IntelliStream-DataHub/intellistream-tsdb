@@ -7,6 +7,7 @@
  *   ./build/test_crypto
  */
 #include "tsdb_crypto.h"
+#include "rfc7677.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -211,24 +212,23 @@ static void misc(void)
  * as tsdbd and the C client will, and must equal the RFC's bytes. */
 static void scram_rfc7677(void)
 {
-    const char *cnonce = "rOprNGfwEbeRWgbNEkqO", *nonce = "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0";
-    const char *salt_b64 = "W22ZaJ0SNY7soEsUEjb6gQ==";
+    const char *cnonce = RFC7677_CNONCE, *nonce = RFC7677_NONCE;
+    const char *salt_b64 = RFC7677_SALT_B64;
     uint8_t salt[64];
     size_t salt_len;
     CHECK(tsdb_base64_decode(salt_b64, strlen(salt_b64), salt, sizeof salt, &salt_len) == 0 && salt_len == 16);
 
     /* the server's verifier, as `tsdb user add` computes it */
     uint8_t client_key[32], stored_key[32], server_key[32];
-    tsdb_scram_keys("pencil", 6, salt, salt_len, 4096, client_key, stored_key, server_key);
+    tsdb_scram_keys(RFC7677_PASSWORD, 6, salt, salt_len, RFC7677_ITER, client_key, stored_key, server_key);
 
     char client_first_bare[128], server_first[256], client_final_wo_proof[256], auth[640];
-    snprintf(client_first_bare, sizeof client_first_bare, "n=user,r=%s", cnonce);
+    snprintf(client_first_bare, sizeof client_first_bare, "n=%s,r=%s", RFC7677_USER, cnonce);
     char client_first[160];
     snprintf(client_first, sizeof client_first, "n,,%s", client_first_bare);
-    CHECK(strcmp(client_first, "n,,n=user,r=rOprNGfwEbeRWgbNEkqO") == 0);
-    snprintf(server_first, sizeof server_first, "r=%s,s=%s,i=%d", nonce, salt_b64, 4096);
-    CHECK(strcmp(server_first,
-                 "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096") == 0);
+    CHECK(strcmp(client_first, RFC7677_CLIENT_FIRST) == 0);
+    snprintf(server_first, sizeof server_first, "r=%s,s=%s,i=%d", nonce, salt_b64, RFC7677_ITER);
+    CHECK(strcmp(server_first, RFC7677_SERVER_FIRST) == 0);
     char gs2[8];
     tsdb_base64_encode("n,,", 3, gs2);
     CHECK(strcmp(gs2, "biws") == 0);
@@ -242,8 +242,7 @@ static void scram_rfc7677(void)
     char proof_b64[tsdb_base64_len(32) + 1], client_final[320];
     tsdb_base64_encode(proof, 32, proof_b64);
     snprintf(client_final, sizeof client_final, "%s,p=%s", client_final_wo_proof, proof_b64);
-    CHECK(strcmp(client_final, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
-                               "p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=") == 0);
+    CHECK(strcmp(client_final, RFC7677_CLIENT_FINAL) == 0);
 
     /* the server's check: StoredKey = H(ClientProof XOR ClientSignature), compared in constant time */
     uint8_t recovered[32], h[32];
@@ -262,7 +261,7 @@ static void scram_rfc7677(void)
     char sig_b64[tsdb_base64_len(32) + 1];
     tsdb_base64_encode(server_sig, 32, sig_b64);
     snprintf(server_final, sizeof server_final, "v=%s", sig_b64);
-    CHECK(strcmp(server_final, "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=") == 0);
+    CHECK(strcmp(server_final, RFC7677_SERVER_FINAL) == 0);
     /* and the keys the server stores (the same computed by Python's hashlib, for the other clients' tests) */
     CHECK(hex_is(stored_key, 32, "586e5df283e6dceb5c3e791d8b8528ec191e664045ce971792e2e6b5bb13e2a6"));
     CHECK(hex_is(server_key, 32, "c1f3cbc1c13a9d35a14c0990eed97629ea225863e566a4314ab99f3f00e5d9d5"));

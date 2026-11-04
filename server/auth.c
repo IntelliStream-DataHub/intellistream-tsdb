@@ -123,7 +123,7 @@ static bool reload_running;
 static pthread_mutex_t stop_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t stop_cv = PTHREAD_COND_INITIALIZER;
 static bool stop_flag;
-void (*auth_test_nonce)(uint8_t out[18]);
+const char *auth_test_nonce;
 
 bool auth_enabled(void) { return enabled; }
 
@@ -480,13 +480,14 @@ int auth_scram_start(auth_conn *a, const uint8_t *p, size_t len, uint8_t *out, s
     pthread_mutex_unlock(&auth_mu);
 
     uint8_t sn[18];
-    if (auth_test_nonce)
-        auth_test_nonce(sn);
+    char b64salt[tsdb_base64_len(SALT_MAX) + 1], snb[64];
+    if (auth_test_nonce) /* as is: the RFC 7677 test's server nonce is not base64 of 18 bytes */
+        snprintf(snb, sizeof snb, "%s", auth_test_nonce);
     else if (tsdb_random(sn, sizeof sn) != 0)
         return login_failed(a, peer, "no random bytes");
-    char b64salt[tsdb_base64_len(SALT_MAX) + 1], snb[tsdb_base64_len(18) + 1];
+    else
+        tsdb_base64_encode(sn, sizeof sn, snb);
     tsdb_base64_encode(salt, salt_len, b64salt);
-    tsdb_base64_encode(sn, sizeof sn, snb);
     a->nonce_len = cnl + strlen(snb);
     memcpy(a->nonce, cnonce, cnl);
     memcpy(a->nonce + cnl, snb, strlen(snb));

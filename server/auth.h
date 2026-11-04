@@ -93,7 +93,8 @@ int auth_admin(auth_conn *a, uint8_t op, const uint8_t *p, size_t len, uint8_t *
 int auth_user_list(auth_conn *a, int (*emit)(void *ctx, bool last, uint32_t n, const uint8_t *e, size_t len),
                    void *ctx);
 
-/* Test hooks: the server nonce comes from here when set (the fuzzer replays fixed exchanges). */
-extern void (*auth_test_nonce)(uint8_t out[18]);
+/* Test hook: the server's part of the nonce, used as is when set (the RFC 7677 test and the fuzzer replay fixed
+ * exchanges). Printable, no ',', under 64 bytes. */
+extern const char *auth_test_nonce;
 
 #endif
