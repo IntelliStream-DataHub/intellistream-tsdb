@@ -424,15 +424,19 @@ $(B)/insert-bench: tools/insert-bench.c tools/common.h tools/datasets.h $(LIB)
 RELEASE_VERSION := $(shell cat VERSION)
 TSDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
 
-$(B)/tsdbd: server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
-	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c $(B)/tsdb_pack.o $(LIB) $(LDLIBS) $(URING_LIBS)
+TSDBD_SRC := server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/users.h \
+             include/tsdb_protocol.h client/tsdb_pack.h client/tsdb_crypto.h
+$(B)/tsdbd: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c \
+	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS) $(URING_LIBS)
 
 # tests/fuzz/fuzz_frames.c includes server/tsdbd.c (epoll only: no ring needed without sockets). FRAMES_COV is
-# -fsanitize-coverage=trace-pc in `make fuzz-frames`, which feeds its coverage-guided driver; empty in `make test`
-# (FUZZ_COV is the on-disk harnesses' coverage flag and is always set).
-$(B)/fuzz_frames: tests/fuzz/fuzz_frames.c server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h \
-                  client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
-	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c $(B)/tsdb_pack.o $(LIB) $(LDLIBS)
+# -fsanitize-coverage=trace-pc in `make fuzz-frames`, which feeds its coverage-guided driver (auth.c, the login and
+# the checks, is compiled with it too); empty in `make test` (FUZZ_COV is the on-disk harnesses' coverage flag and
+# is always set).
+$(B)/fuzz_frames: tests/fuzz/fuzz_frames.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) $(FRAMES_COV) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o \
+	    $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 # Mutates the request corpus for FUZZ_SECONDS (shared with `make fuzz`, default 60) under ASan and UBSan, in
 # build-fuzz-frames/ (its own tree: `make fuzz` builds build-fuzz/ with other flags); new inputs go to

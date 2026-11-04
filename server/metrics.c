@@ -54,7 +54,7 @@
 
 #define NOPS 64 /* TSDB_OP_* are below this; a request with another op counts as "other" */
 #define OP_OTHER NOPS /* its own slot after the real ops: op 63 is not "other" */
-#define NERR 10 /* -TSDB_ERR_* 1..9; slot 0 is anything else */
+#define NERR 18 /* -TSDB_ERR_* 1..17 with a name in err_name; slot 0 is anything else */
 #define NBUCKETS 15
 
 static const double bucket_le[NBUCKETS] = {0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
@@ -72,48 +72,31 @@ typedef struct {
     atomic_uint_fast64_t rows_inserted;
     atomic_uint_fast64_t multi_series, multi_deferred;
     atomic_uint_fast64_t scrapes, scrape_rejects;
+    atomic_uint_fast64_t logins[METRICS_LOGIN_KINDS];
 } counters;
 static counters M;
 static atomic_bool on; /* set by metrics_enable before the server starts; the hooks do nothing until then */
 
-/* Every TSDB_OP_* the server answers has a row here (test_metrics reads tsdb_protocol.h and fails
- * for an op without one, so a new op cannot be left out unnoticed). `query` ops get a latency histogram. */
-static const struct {
+/* Every TSDB_OP_* has a row here, made from the op list (TSDB_OPS in tsdb_protocol.h; test_metrics checks each
+ * appears). `query` ops get a latency histogram. */
+#define OP_NAME_(name, num, metric) [num] = {#metric, false},
+static struct {
     const char *name;
     bool query;
-} ops[NOPS] = {
-    [TSDB_OP_HELLO] = {"hello"},
-    [TSDB_OP_SERIES] = {"series"},
-    [TSDB_OP_SERIES_NAME] = {"series_name"},
-    [TSDB_OP_INSERT] = {"insert"},
-    [TSDB_OP_QUERY_RAW] = {"query_raw", true},
-    [TSDB_OP_COMMIT] = {"commit"},
-    [TSDB_OP_FLUSH] = {"flush"},
-    [TSDB_OP_OPTIMIZE] = {"optimize"},
-    [TSDB_OP_STATS] = {"stats"},
-    [TSDB_OP_SERIES_CREATE] = {"series_create"},
-    [TSDB_OP_SERIES_TYPE] = {"series_type"},
-    [TSDB_OP_INSERT_VALUES] = {"insert_values"},
-    [TSDB_OP_QUERY_VALUES] = {"query_values", true},
-    [TSDB_OP_STATE] = {"state"},
-    [TSDB_OP_STATE_NAME] = {"state_name"},
-    [TSDB_OP_QUERY_BUCKETS] = {"query_buckets", true},
-    [TSDB_OP_LAST_STATS] = {"last_stats"},
-    [TSDB_OP_QUERY_BOUNDS] = {"query_bounds", true},
-    [TSDB_OP_QUERY_LTTB] = {"query_lttb", true},
-    [TSDB_OP_QUERY_TWA] = {"query_twa", true},
-    [TSDB_OP_QUERY_MULTI] = {"query_multi", true},
-    [TSDB_OP_CANCEL] = {"cancel"},
-    [TSDB_OP_DELETE_RANGE] = {"delete_range"},
-    [TSDB_OP_REPLACE_RANGE] = {"replace_range"},
-    [TSDB_OP_SET_RETENTION] = {"set_retention"},
-    [TSDB_OP_GET_RETENTION] = {"get_retention"},
-};
+} ops[NOPS] = {TSDB_OPS(OP_NAME_)};
+#undef OP_NAME_
+_Static_assert(TSDB_OP_USER_LIST < NOPS, "an op number past the metrics table");
 
-static bool is_query_op(unsigned o) { return o < NOPS && ops[o].query; }
+static bool is_query_op(unsigned o)
+{
+    return o == TSDB_OP_QUERY_RAW || o == TSDB_OP_QUERY_VALUES || o == TSDB_OP_QUERY_BUCKETS ||
+           o == TSDB_OP_QUERY_BOUNDS || o == TSDB_OP_QUERY_LTTB || o == TSDB_OP_QUERY_TWA || o == TSDB_OP_QUERY_MULTI;
+}
 
-static const char *const err_name[NERR] = {"other", "io", "nomem", "corrupt", "invalid", "locked",
-                                           "notfound", "too_many_buckets", "stopped", "readonly"};
+/* by -TSDB_ERR_*; NULL slots (-10 to -15, ha.md's) are counted as "other" until they exist */
+static const char *const err_name[NERR] = {"other",  "io",      "nomem",   "corrupt", "invalid", "locked",
+                                           "notfound", "too_many_buckets", "stopped", "readonly", NULL, NULL,
+                                           NULL,     NULL,      NULL,      NULL,      "denied",  "auth"};
 
 static int64_t now_ns(void)
 {
@@ -176,8 +159,15 @@ void metrics_error(int32_t status)
 {
     HOOK_OFF();
     int64_t k = -(int64_t)status;
-    unsigned i = k >= 1 && k < NERR ? (unsigned)k : 0;
+    unsigned i = k >= 1 && k < NERR && err_name[k] ? (unsigned)k : 0;
     atomic_fetch_add_explicit(&M.errors[i], 1, memory_order_relaxed);
+}
+
+void metrics_login(int what)
+{
+    HOOK_OFF();
+    if (what >= 0 && what < METRICS_LOGIN_KINDS)
+        atomic_fetch_add_explicit(&M.logins[what], 1, memory_order_relaxed);
 }
 
 void metrics_rows_inserted(uint64_t n)
@@ -349,10 +339,18 @@ static void render(sb *b)
            (unsigned long long)atomic_load_explicit(&M.multi_deferred, memory_order_relaxed));
     family(b, "tsdb_request_errors_total", "counter", "Replies with an error status, by TSDB_ERR_* code.");
     for (unsigned k = 1; k < NERR; k++)
-        sb_add(b, "tsdb_request_errors_total{code=\"%s\"} %llu\n", err_name[k],
-               (unsigned long long)atomic_load_explicit(&M.errors[k], memory_order_relaxed));
+        if (err_name[k])
+            sb_add(b, "tsdb_request_errors_total{code=\"%s\"} %llu\n", err_name[k],
+                   (unsigned long long)atomic_load_explicit(&M.errors[k], memory_order_relaxed));
     sb_add(b, "tsdb_request_errors_total{code=\"other\"} %llu\n",
            (unsigned long long)atomic_load_explicit(&M.errors[0], memory_order_relaxed));
+    family(b, "tsdb_logins_total", "counter",
+           "Login attempts by outcome: ok, failed (wrong password, unknown user or a malformed exchange), "
+           "timeout (not logged in within --login-timeout), refused (another op or a frame too large before login).");
+    static const char *const login_name[METRICS_LOGIN_KINDS] = {"ok", "failed", "timeout", "refused"};
+    for (int k = 0; k < METRICS_LOGIN_KINDS; k++)
+        sb_add(b, "tsdb_logins_total{result=\"%s\"} %llu\n", login_name[k],
+               (unsigned long long)atomic_load_explicit(&M.logins[k], memory_order_relaxed));
 
     family(b, "tsdb_query_duration_seconds", "histogram",
            "Time a worker spent on a query request, from taking it to handing the reply to the kernel (a slow client can add to it).");

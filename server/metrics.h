@@ -46,5 +46,8 @@ void metrics_error(int32_t status); /* a reply with a non-zero status */
 void metrics_rows_inserted(uint64_t n);
 void metrics_multi_series(uint64_t n); /* series a QUERY_MULTI answered */
 void metrics_multi_deferred(void);      /* a QUERY_MULTI series rerun at its turn */
+/* A login's outcome (no user names: the metrics port is unauthenticated, A21) */
+enum { METRICS_LOGIN_OK, METRICS_LOGIN_FAILED, METRICS_LOGIN_TIMEOUT, METRICS_LOGIN_REFUSED, METRICS_LOGIN_KINDS };
+void metrics_login(int what);
 
 #endif

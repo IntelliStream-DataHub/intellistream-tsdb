@@ -616,6 +616,9 @@ static user *user_dup(const user *u)
     return c;
 }
 
+user *user_copy(const user *u) { return user_dup(u); }
+void user_release(user *u) { user_free(u); }
+
 static long user_index(const users *us, uint32_t uid)
 {
     size_t lo = 0, hi = us->n;

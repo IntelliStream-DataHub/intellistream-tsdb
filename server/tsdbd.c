@@ -71,16 +71,22 @@
  * frame has been started but not completed for --frame-timeout seconds
  * (default 60) while the server waits for its bytes is closed (slow senders); time the server itself held the
  * connection unread does not count. Replies never exceed a frame: a result too large for one is
- * TSDB_ERR_TOO_MANY_BUCKETS. Without authentication, a client can still hold the whole limit with large frames it
- * sends slowly, for --frame-timeout at a time, making others' large frames wait.
+ * TSDB_ERR_TOO_MANY_BUCKETS. A logged-in client can still hold the whole limit with large frames it sends slowly,
+ * for --frame-timeout at a time, making others' large frames wait; before login a connection holds at most two
+ * frames of TSDB_PRELOGIN_MAX bytes and is closed after --login-timeout (A5), so an anonymous client cannot.
  *
- * There is no authentication: listen on a trusted interface only.
+ * Login (docs/design-auth.md, server/auth.c): required unless --no-auth. Before login parse() takes only HELLO,
+ * AUTH_START and AUTH_CONTINUE, at most two queued, and reads nothing after an AUTH_CONTINUE until the worker has
+ * answered it; any other op is queued with eof set and answered TSDB_ERR_AUTH. Every request then passes
+ * auth_check (the op table) in handle() before its case runs; ids that only the case knows (a row per series,
+ * QUERY_MULTI) are checked there. There is no TLS: a login is not readable on the wire, the data is.
  */
 #define _GNU_SOURCE
 #include "tsdb.h"
 #include "tsdb_protocol.h"
 #include "../client/tsdb_pack.h"
 #include "metrics.h"
+#include "auth.h"
 
 #ifndef TSDB_BUILD_VERSION
 #define TSDB_BUILD_VERSION "dev"
@@ -221,6 +227,12 @@ typedef struct conn {
     atomic_bool closing;
     bool notified;      /* an output event is queued for the main thread */
     tsdb_query_stats last_stats; /* of the previous query (LAST_STATS) */
+    /* login: the worker sets these, the main thread reads them */
+    atomic_bool authed;   /* logged in (or --no-auth): parse() takes every op */
+    atomic_bool auth_end; /* a failed login or a dropped user: close once the requests received are answered */
+    int64_t t_open;       /* accepted at (monotonic s), for --login-timeout (main thread) */
+    bool auth_hold;       /* an AUTH_CONTINUE waits or runs: nothing more is read until it is answered (main) */
+    auth_conn auth;       /* the worker running this connection's request (one at a time) */
 } conn;
 
 /* ------------------------------------------------------------ globals */
@@ -259,6 +271,7 @@ static void *worker_main(void *arg);
 static size_t req_budget = (size_t)1024 << 20; /* at least; main raises it to an eighth of the RAM */
 static atomic_size_t req_held;
 static int frame_timeout_s = 60;
+static int login_timeout_s = 10; /* --login-timeout */
 
 static size_t request_memory_now(void)
 {
@@ -644,7 +657,7 @@ static const tsdb_sid *frame_ids(const uint8_t *p, size_t len, size_t end, uint3
 }
 
 /* A packed INSERT_VALUES: unzstd, unshape into plain arrays, insert. */
-static int insert_packed(const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
+static int insert_packed(auth_conn *a, const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
 {
     unsigned type = p[4];
     bool valid = p[5] & TSDB_VALID, many = s == TSDB_MANY_SERIES;
@@ -677,6 +690,8 @@ static int insert_packed(const uint8_t *p, size_t len, uint32_t n, tsdb_sid s)
         if (ZSTD_isError(got) || got != raw_len ||
             tsdb_pack_unshape(raw, raw_len, n, type, valid, many, ts, vals, bits, series) != 0) {
             rc = TSDB_ERR_INVALID;
+        } else if (many && (rc = auth_ids(a, series, n, R_INSERT)) != 0) {
+            /* one row of a series the user may not insert into refuses the whole frame (A16) */
         } else {
             tsdb_values col = {(tsdb_type)type, vals, valid ? bits : NULL};
             rc = many ? tsdb_insert_values(db, series, ts, &col, n) : tsdb_insert_series_values(db, s, ts, &col, n);
@@ -891,6 +906,7 @@ typedef struct mctx {
     size_t cur;    /* the index vo is for, or SIZE_MAX */
     uint32_t answered;
     bool gone;
+    const uint8_t *denied; /* a bit per series the user may not read (asked as TSDB_SID_NONE); NULL: none */
 } mctx;
 
 static int multi_fn(void *ctx, const tsdb_series_result *r)
@@ -899,6 +915,13 @@ static int multi_fn(void *ctx, const tsdb_series_result *r)
     if (m->gone)
         return 1;
     uint32_t ix = (uint32_t)r->index;
+    tsdb_series_result dr;
+    if (m->denied && (m->denied[ix >> 3] >> (ix & 7) & 1)) { /* its own status, the others answered (A17) */
+        dr = *r;
+        dr.status = TSDB_ERR_DENIED;
+        dr.n = 0;
+        r = &dr;
+    }
     bool ok = true;
     if (m->op == TSDB_OP_QUERY_VALUES || m->op == TSDB_OP_QUERY_LTTB) {
         values_out *o = &m->vo;
@@ -1071,6 +1094,23 @@ static void handle_multi(conn *c, req *r)
     uint16_t threads = 0;
     uint64_t max_rows = 0;
     int rc = multi_parse(r->payload, r->len, &q, &qr, &series, &n, &m.op, &threads, &max_rows);
+    tsdb_sid *own = NULL;
+    uint8_t *denied = NULL;
+    if (rc == 0 && !auth_all(&c->auth, R_READ)) {
+        /* a series the user may not read is asked as an id that names none (status INVALID, no rows), which
+         * multi_fn turns into DENIED: unknown and foreign ids answer alike (A16) */
+        own = malloc((size_t)n * sizeof *own);
+        denied = calloc(((size_t)n + 7) / 8, 1);
+        if (!own || !denied)
+            rc = TSDB_ERR_NOMEM;
+        for (uint32_t i = 0; rc == 0 && i < n; i++) {
+            bool no = auth_id(&c->auth, series[i], R_READ) != 0;
+            own[i] = no ? TSDB_SID_NONE : series[i];
+            denied[i >> 3] |= (uint8_t)(no << (i & 7));
+        }
+        series = own;
+        m.denied = denied;
+    }
     if (rc == 0 && (m.op == TSDB_OP_QUERY_VALUES || m.op == TSDB_OP_QUERY_LTTB)) {
         m.vo = (values_out){.c = c, .id = r->id, .ob = &m.ob};
         m.vo.ts = malloc(RAW_CHUNK_ROWS * 8);
@@ -1097,11 +1137,68 @@ static void handle_multi(conn *c, req *r)
     qreq_free(&qr);
     free(m.vo.ts);
     free(m.vo.v);
+    free(own);
+    free(denied);
     metrics_multi_series(m.answered);
     if (!m.gone)
         frame_put(c, &m.ob, r->id, rc, &end_ix, &m.answered, 4, NULL, 0, NULL, 0);
     ob_flush(&m.ob);
     free(m.ob.p);
+}
+
+/* An error in the shape the op's replies have, so a client reads it as it reads that op's errors. */
+static void reply_error(conn *c, uint32_t id, uint8_t op, int32_t status)
+{
+    switch (auth_ops[op].shape) {
+    case S_RAW: {
+        raw_out o = {c, id, NULL, NULL, 0, false};
+        raw_flush(&o, true, status);
+        return;
+    }
+    case S_VALUES: {
+        values_out o = {c, id, 0, 0, NULL, NULL, 0, false, NULL, NULL};
+        values_flush(&o, true, status);
+        return;
+    }
+    case S_MULTI: {
+        static const uint32_t end_ix = TSDB_MULTI_END;
+        uint32_t none = 0;
+        frame_put(c, NULL, id, status, &end_ix, &none, 4, NULL, 0, NULL, 0);
+        return;
+    }
+    default: reply_status(c, id, status); return;
+    }
+}
+
+static void peer_name(int fd, char *out, size_t cap)
+{
+    struct sockaddr_storage sa;
+    socklen_t sl = sizeof sa;
+    char host[INET6_ADDRSTRLEN] = "?";
+    int port = 0;
+    if (fd >= 0 && getpeername(fd, (struct sockaddr *)&sa, &sl) == 0) {
+        if (sa.ss_family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in *)&sa)->sin_addr, host, sizeof host);
+            port = ntohs(((struct sockaddr_in *)&sa)->sin_port);
+        } else if (sa.ss_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&sa)->sin6_addr, host, sizeof host);
+            port = ntohs(((struct sockaddr_in6 *)&sa)->sin6_port);
+        }
+    }
+    snprintf(out, cap, "%s:%d", host, port);
+}
+
+typedef struct list_out {
+    conn *c;
+    uint32_t id;
+} list_out;
+
+static int list_emit(void *ctx, bool last, uint32_t n, const uint8_t *e, size_t len)
+{
+    list_out *o = ctx;
+    uint8_t h[5] = {last};
+    put32(h + 1, n);
+    return reply(o->c, o->id, 0, h, 5, e, len, NULL, 0) ? 0 : TSDB_ERR_STOPPED;
 }
 
 static void handle(req *r)
@@ -1110,6 +1207,17 @@ static void handle(req *r)
     const uint8_t *p = r->payload;
     size_t len = r->len;
     int rc = 0;
+    auth_conn *a = &c->auth;
+    uint8_t was = a->state;
+    if ((rc = auth_fresh(a)) != 0 || (rc = auth_check(a, r->op, p, len)) != 0) {
+        if (rc == TSDB_ERR_AUTH) { /* not logged in, or the user was dropped: the connection closes */
+            if (was == AS_NONE || was == AS_STARTED)
+                metrics_login(METRICS_LOGIN_REFUSED);
+            atomic_store(&c->auth_end, true);
+        }
+        reply_error(c, r->id, r->op, rc);
+        return;
+    }
     switch (r->op) {
     case TSDB_OP_HELLO: {
         /* the version both sides speak: a client never sends what it does not know, so an older one hears
@@ -1125,8 +1233,60 @@ static void handle(req *r)
             if (theirs < v)
                 v = theirs;
         }
-        reply(c, r->id, 0, &v, 4, NULL, 0, NULL, 0);
+        uint8_t h[64]; /* the version, then whether login is required and how (version 12) */
+        memcpy(h, &v, 4);
+        size_t hl = 4 + auth_hello(h + 4);
+        reply(c, r->id, 0, h, hl, NULL, 0, NULL, 0);
         return;
+    }
+    case TSDB_OP_AUTH_START:
+    case TSDB_OP_AUTH_CONTINUE: {
+        uint8_t out[640];
+        size_t ol = 0;
+        char peer[INET6_ADDRSTRLEN + 8];
+        peer_name(c->fd, peer, sizeof peer);
+        rc = r->op == TSDB_OP_AUTH_START ? auth_scram_start(a, p, len, out, sizeof out, &ol, peer)
+                                         : auth_scram_continue(a, p, len, out, sizeof out, &ol, peer);
+        if (rc == 0) {
+            if (a->state == AS_IN) {
+                metrics_login(METRICS_LOGIN_OK);
+                atomic_store(&c->authed, true); /* before the reply: parse() takes every op from now on */
+            }
+            reply(c, r->id, 0, out, ol, NULL, 0, NULL, 0);
+            return;
+        }
+        if (a->state == AS_FAILED) { /* a failed login closes the connection (A5) */
+            metrics_login(METRICS_LOGIN_FAILED);
+            atomic_store(&c->auth_end, true);
+        }
+        break;
+    }
+    case TSDB_OP_WHOAMI:
+    case TSDB_OP_USER_CREATE:
+    case TSDB_OP_USER_DROP:
+    case TSDB_OP_USER_ALTER:
+    case TSDB_OP_USER_PASSWORD:
+    case TSDB_OP_GRANT:
+    case TSDB_OP_REVOKE: {
+        uint8_t *out;
+        size_t ol;
+        if ((rc = auth_admin(a, r->op, p, len, &out, &ol)) == 0) {
+            reply(c, r->id, 0, out, ol, NULL, 0, NULL, 0);
+            free(out);
+            return;
+        }
+        break;
+    }
+    case TSDB_OP_USER_LIST: {
+        list_out o = {c, r->id};
+        if (len != 0) {
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        rc = auth_user_list(a, list_emit, &o);
+        if (rc == 0 || rc == TSDB_ERR_STOPPED) /* answered, or the client went away */
+            return;
+        break;
     }
     case TSDB_OP_SERIES: {
         if (len < 3) {
@@ -1191,6 +1351,8 @@ static void handle(req *r)
             rc = TSDB_ERR_INVALID;
             break;
         }
+        if (many && (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0)
+            break; /* all or nothing (A16) */
         const int64_t *ts = (const int64_t *)(const void *)(p + 16); /* the payload is malloc'd: 16-aligned */
         const float *v = (const float *)(const void *)(p + 16 + (size_t)n * 8);
         rc = many ? tsdb_insert(db, ids, ts, v, n) : tsdb_insert_series(db, s, ts, v, n);
@@ -1283,7 +1445,7 @@ static void handle(req *r)
         memcpy(&s, p + 8, 8);
         bool many = s == TSDB_MANY_SERIES;
         if (p[5] & TSDB_PACKED) {
-            rc = insert_packed(p, len, n, s);
+            rc = insert_packed(&c->auth, p, len, n, s);
             break;
         }
         size_t vb = (size_t)n * tsdb_wire_width(p[4]), valid = (p[5] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0;
@@ -1293,6 +1455,8 @@ static void handle(req *r)
             rc = TSDB_ERR_INVALID;
             break;
         }
+        if (many && (rc = auth_ids(&c->auth, ids, n, R_INSERT)) != 0)
+            break; /* all or nothing (A16) */
         const int64_t *ts = (const int64_t *)(const void *)(p + TSDB_VALUES_HEADER); /* the payload is 8-aligned */
         const uint8_t *vals = p + TSDB_VALUES_HEADER + (size_t)n * 8;
         tsdb_values col = {(tsdb_type)p[4], vals, valid ? vals + vb : NULL};
@@ -1677,11 +1841,14 @@ static void ep_want(conn *c)
     nready++;
 }
 
+static size_t pre_queued(const conn *c);
+
 static void submit_recv(conn *c)
 {
     if (c->recv_inflight || c->closed || c->eof || c->parked)
         return;
-    if (c->q_bytes > PIPE_CAP || c->q_multi >= MULTI_QUEUED) {
+    if (c->q_bytes > PIPE_CAP || c->q_multi >= MULTI_QUEUED ||
+        (!atomic_load(&c->authed) && (c->auth_hold || pre_queued(c) >= 2))) {
         c->held = true;
         return; /* on_wake resumes it as its requests run */
     }
@@ -1809,6 +1976,7 @@ static void conn_free(conn *c)
     close(c->fd);
     free(c->out.p);
     free(c->sending.p);
+    auth_conn_free(&c->auth); /* no lock: the event loop never waits for auth_mu */
     pthread_mutex_destroy(&c->lock);
     pthread_cond_destroy(&c->cv);
     if (c->in_ready)
@@ -1858,6 +2026,15 @@ static void cancel_multi(conn *c, uint32_t id)
         atomic_store(&c->cancel_running, true);
 }
 
+/* Requests waiting on a connection that has not logged in: at most two (A5), so a short walk. */
+static size_t pre_queued(const conn *c)
+{
+    size_t n = 0;
+    for (const req *r = c->q_head; r && n < 2; r = r->next)
+        n++;
+    return n;
+}
+
 static int parse(conn *c)
 {
     size_t off = 0;
@@ -1868,6 +2045,13 @@ static int parse(conn *c)
         memcpy(&flen, c->in.p + off, 4);
         if (flen < 5 || flen > TSDB_MAX_FRAME)
             return -1;
+        bool pre = !atomic_load(&c->authed); /* before login (A5) */
+        if (pre && 4 + (size_t)flen > TSDB_PRELOGIN_MAX) {
+            metrics_login(METRICS_LOGIN_REFUSED); /* closed before any of it is buffered */
+            return -1;
+        }
+        if (pre && (c->auth_hold || pre_queued(c) >= 2))
+            break; /* read on once the login has moved on (on_wake) */
         size_t need = 4 + (size_t)flen;
         if (c->in.len - off < need) {
             /* make room for the whole frame up front: exactly, for a large one, which request memory counts */
@@ -1894,6 +2078,10 @@ static int parse(conn *c)
                 in_account(c);
             }
             break;
+        }
+        if (pre && c->in.p[off + 8] == TSDB_OP_CANCEL) {
+            metrics_login(METRICS_LOGIN_REFUSED); /* nothing to cancel before login: a client that does not speak it */
+            return -1;
         }
         if (c->in.p[off + 8] == TSDB_OP_CANCEL) { /* no reply, and it must not wait behind the query it stops */
             if (flen == 9) {
@@ -1938,11 +2126,17 @@ static int parse(conn *c)
         }
         off += need;
         consumed = true;
-        if (r->op == TSDB_OP_HELLO && hello_refused(r->payload, r->len)) {
+        if ((r->op == TSDB_OP_HELLO && hello_refused(r->payload, r->len)) ||
+            (pre && r->op != TSDB_OP_HELLO && r->op != TSDB_OP_AUTH_START && r->op != TSDB_OP_AUTH_CONTINUE)) {
             /* an older client: nothing it sends after this can be read right. It hears INVALID, then the
-             * connection closes as at its end of stream (finish_if_drained). */
+             * connection closes as at its end of stream (finish_if_drained). An op before login likewise hears
+             * TSDB_ERR_AUTH (the worker's auth_check), and nothing after it is read. */
             c->eof = true;
             off = c->in.len;
+            break;
+        }
+        if (pre && r->op == TSDB_OP_AUTH_CONTINUE) {
+            c->auth_hold = true; /* what follows is read as the login's outcome allows */
             break;
         }
     }
@@ -2019,8 +2213,18 @@ static void on_tick(void)
         perror("tsdbd: timerfd");
     int64_t now = mono_s();
     static int64_t logged;
+    static int64_t login_logged;
     for (conn *c = conns, *next; c; c = next) {
         next = c->next;
+        if (!c->closed && !atomic_load(&c->authed) && now - c->t_open >= login_timeout_s) {
+            if (login_logged != now) {
+                login_logged = now;
+                fprintf(stderr, "tsdbd: connection closed: not logged in after %d s\n", login_timeout_s);
+            }
+            metrics_login(METRICS_LOGIN_TIMEOUT);
+            conn_close(c);
+            continue;
+        }
         if (c->frame_t0 && c->recv_inflight && !c->closed && now - c->frame_t0 > frame_timeout_s) {
             if (logged != now) {
                 logged = now;
@@ -2105,6 +2309,9 @@ static void on_accept(int fd)
     c->send_ev = (ev){EV_SEND, c};
     pthread_mutex_init(&c->lock, NULL);
     pthread_cond_init(&c->cv, NULL);
+    auth_conn_init(&c->auth);
+    atomic_store(&c->authed, c->auth.state == AS_IN); /* --no-auth: logged in from the start */
+    c->t_open = mono_s();
     c->next = conns;
     if (conns)
         conns->prev = c;
@@ -2139,6 +2346,18 @@ static void on_wake(void)
         if (c->closed) {
             conn_close(c);
             continue;
+        }
+        if (batch[i].done && atomic_load(&c->auth_end))
+            c->eof = true; /* a failed login or a dropped user: answer what was received, then close */
+        if (batch[i].done && c->auth_hold && c->run_op == TSDB_OP_AUTH_CONTINUE) {
+            c->auth_hold = false; /* the login's outcome is set: what the client sent behind it is read now */
+            int pr = c->eof ? 0 : parse(c);
+            if (pr < 0) {
+                conn_close(c);
+                continue;
+            }
+            if (pr > 0)
+                park(c, true);
         }
         submit_send(c);
         if (batch[i].done) {
@@ -2483,8 +2702,10 @@ int main(int argc, char **argv)
                                    {"request-threads", required_argument, 0, 'L'},
                                    {"multi-max-rows", required_argument, 0, 'U'},
                                    {"version", no_argument, 0, 'v'},
+                                   {"no-auth", no_argument, 0, 'A'},
+                                   {"login-timeout", required_argument, 0, 'O'},
                                    {0, 0, 0, 0}};
-    int ch, metrics_port = 0, metrics_on = 0;
+    int ch, metrics_port = 0, metrics_on = 0, no_auth = 0;
     const char *metrics_addr = NULL;
     long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page > 0 && (size_t)pages / 8 * (size_t)page > req_budget)
@@ -2533,6 +2754,8 @@ int main(int argc, char **argv)
         case 'L': o.request_threads = (int)num_arg("request-threads", optarg, 1, 4096); break;
         case 'U': multi_max_rows = (uint64_t)num_arg("multi-max-rows", optarg, 1, LLONG_MAX); break;
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
+        case 'A': no_auth = 1; break;
+        case 'O': login_timeout_s = (int)num_arg("login-timeout", optarg, 1, 86400); break;
         case 'X': req_budget = (size_t)num_arg("max-request-memory", optarg, 1, (long long)1 << 24) << 20; break;
         case 'I':
             if (strcmp(optarg, "auto") == 0)
@@ -2559,7 +2782,8 @@ int main(int argc, char **argv)
                         "             [--metrics-port N|auto [--metrics-bind ADDR]]\n"
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
                         "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"
-                        "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000]\n",
+                        "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000]\n"
+                        "             [--no-auth] [--login-timeout 10]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
@@ -2568,6 +2792,14 @@ int main(int argc, char **argv)
     int rc = tsdb_open(dir, &o, &db);
     if (rc) {
         fprintf(stderr, "tsdbd: %s: %s\n", dir, tsdb_strerror(rc));
+        return 1;
+    }
+    /* A13: login unless --no-auth, and then a superuser must exist; USERS is read before anyone connects */
+    if (no_auth)
+        fprintf(stderr, "tsdbd: --no-auth: no login, every client may do everything: listen on a trusted interface "
+                        "only\n");
+    if (auth_init(dir, !no_auth, !o.read_only && !o.follow, db) != 0) {
+        tsdb_close(db);
         return 1;
     }
     tsdb_set_write_wait_hook(db, write_on_wait, NULL); /* before the workers start */
@@ -2670,10 +2902,15 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: cannot start a thread: %s\n", strerror(rc));
         return 1;
     }
+    if ((rc = auth_start_reload()) != 0) {
+        fprintf(stderr, "tsdbd: cannot start the USERS reload thread: %s\n", strerror(rc));
+        return 1;
+    }
     fs_warn(db, o.verify_checksums);
-    fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s\n", dir,
+    fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, simd %s, io %s, %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
-            max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll");
+            max_conns, tsdb_simd_level(), io == IO_URING ? "io_uring" : "epoll",
+            no_auth ? "no login (--no-auth)" : "login required");
     if (port_file && write_port_file(port_file, port, metrics_on ? metrics_port : 0) != 0) { /* last: whoever reads it finds a server that serves */
         fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
         return 1;
@@ -2723,6 +2960,7 @@ int main(int argc, char **argv)
         free(c);
     }
     free(fd_conn);
+    auth_shutdown(); /* after the connections, whose states it frees */
     free(notes);
     for (size_t i = 0; i < nnew; i++)
         close(new_fds[i]);

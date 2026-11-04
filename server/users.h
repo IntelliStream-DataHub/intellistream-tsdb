@@ -115,6 +115,11 @@ int users_revoke(users *us, uint32_t actor, const char *name, uint8_t kind, cons
  * on the new file from before the rename until the directory fsync. */
 int users_compact(users *us);
 
+/* A private deep copy of a user (its grants and verifier, no index yet), for a reader that must not share the
+ * `users` state: tsdbd's per-user rights map works on one. NULL when out of memory. */
+user *user_copy(const user *u);
+void user_release(user *u);
+
 const user *users_find(const users *us, const char *name);
 const user *users_by_uid(const users *us, uint32_t uid);
 uint32_t users_superusers(const users *us);

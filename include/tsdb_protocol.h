@@ -155,50 +155,98 @@
  *   16 bytes, type and flags moved to offsets 4 and 5); QUERY_AGG and
  *   QUERY_GROUP were removed. Replies of queries and QUERY_MULTI's u32 index
  *   (an index into the request, not an id) did not change.
+ *   Version 12: login and access control (docs/design-auth.md). HELLO's reply grows:
+ *   HELLO       u32 version                    -> u32 version, u16 flags, u16 n, n x (u8 len, mechanism)
+ *               flags: TSDB_HELLO_AUTH (login required); mechanisms today: "SCRAM-SHA-256". A server
+ *               below 12 or a client below 12 is refused as below 11 was (TSDB_ERR_INVALID).
+ *   AUTH_START  u8 len, mechanism, u16 len, client-first-message  -> u16 len, server-first-message
+ *   AUTH_CONTINUE u16 len, client-final-message                   -> u16 len, server-final-message
+ *               SCRAM-SHA-256 (RFC 5802, RFC 7677) with gs2 header "n,," and the user in n=; any failure
+ *               (unknown user, wrong proof, anything malformed) is TSDB_ERR_AUTH with no body, and the
+ *               connection closes. Before login a connection may send only HELLO, AUTH_START and
+ *               AUTH_CONTINUE, each frame at most TSDB_PRELOGIN_MAX bytes (a longer one closes it at once);
+ *               any other op is answered TSDB_ERR_AUTH and closes it; a CANCEL closes it. AUTH_* after
+ *               login: TSDB_ERR_INVALID.
+ *   WHOAMI                                     -> u16 len, user, u8 flags, u32 n, n x grant
+ *   USER_CREATE u16 len, name, u8 flags, verifier   -> (nothing)
+ *   USER_DROP   u16 len, name                  -> (nothing)
+ *   USER_ALTER  u16 len, name, u8 flags        -> (nothing)    (flags: TSDB_USER_SUPERUSER)
+ *   USER_PASSWORD u16 len, name, verifier      -> (nothing)
+ *   GRANT, REVOKE u16 len, name, u8 kind, u8 rights, u16 len, selector  -> (nothing)
+ *   USER_LIST                                  -> chunks: u8 last, u32 n, n x (u16 len, name, u8 flags,
+ *               u32 g, g x grant)
+ *               verifier: u32 iterations, u8 salt_len, salt, u8 stored_key[32], u8 server_key[32]
+ *               grant: u8 kind (TSDB_SEL_*), u8 rights (TSDB_RIGHT_*), u16 len, selector
+ *   A request the user holds no right for is TSDB_ERR_DENIED, also when its series does not exist (only a user
+ *   with the right on all series sees NOTFOUND); QUERY_MULTI answers a denied series with its own status
+ *   TSDB_ERR_DENIED and the others as before. A user dropped while connected is answered TSDB_ERR_AUTH and
+ *   the connection closes.
  */
 #ifndef TSDB_PROTOCOL_H
 #define TSDB_PROTOCOL_H
 
 #include <stdint.h>
 
-#define TSDB_PROTOCOL_VERSION 11
-#define TSDB_PROTOCOL_MIN 11 /* the oldest version tsdbd and the clients speak */
+#define TSDB_PROTOCOL_VERSION 12
+#define TSDB_PROTOCOL_MIN 12 /* the oldest version tsdbd and the clients speak */
 #define TSDB_DEFAULT_PORT 7070
 #define TSDB_MAX_FRAME (256u << 20)
 #define TSDB_FRAME_HEADER 9 /* length + id + op */
 #define TSDB_MANY_SERIES UINT64_MAX /* the series field of a request with a series per row; never an id */
 
-enum {
-    TSDB_OP_REPLY = 0,
-    TSDB_OP_HELLO = 1,
-    TSDB_OP_SERIES = 2,
-    TSDB_OP_SERIES_NAME = 3,
-    TSDB_OP_INSERT = 4,
-    TSDB_OP_QUERY_RAW = 5,
-    /* 6: QUERY_AGG, removed in version 11 */
-    TSDB_OP_COMMIT = 7,
-    TSDB_OP_FLUSH = 8,
-    TSDB_OP_OPTIMIZE = 9,
-    TSDB_OP_STATS = 10,
-    /* 11: QUERY_GROUP, removed in version 11 */
-    TSDB_OP_SERIES_CREATE = 12,
-    TSDB_OP_SERIES_TYPE = 13,
-    TSDB_OP_INSERT_VALUES = 14,
-    TSDB_OP_QUERY_VALUES = 15,
-    TSDB_OP_STATE = 16,
-    TSDB_OP_STATE_NAME = 17,
-    TSDB_OP_QUERY_BUCKETS = 18,
-    TSDB_OP_LAST_STATS = 19,
-    TSDB_OP_QUERY_BOUNDS = 20,
-    TSDB_OP_QUERY_LTTB = 21,
-    TSDB_OP_QUERY_TWA = 22,
-    TSDB_OP_QUERY_MULTI = 23,
-    TSDB_OP_CANCEL = 24,
-    TSDB_OP_DELETE_RANGE = 25,
-    TSDB_OP_REPLACE_RANGE = 26,
-    TSDB_OP_SET_RETENTION = 27,
-    TSDB_OP_GET_RETENTION = 28,
-};
+/* Every request op: X(NAME, number, metric name). The server's rights table (server/auth.c), its metrics names and
+ * the test of every op across tenants (tests/test_auth_ops.c) are generated from this one list, so an op added
+ * here without a rights entry is refused (TSDB_ERR_DENIED) and the test names it.
+ * 6 (QUERY_AGG) and 11 (QUERY_GROUP) were removed in version 11. */
+#define TSDB_OPS(X)                                        \
+    X(HELLO, 1, hello)                                     \
+    X(SERIES, 2, series)                                   \
+    X(SERIES_NAME, 3, series_name)                         \
+    X(INSERT, 4, insert)                                   \
+    X(QUERY_RAW, 5, query_raw)                             \
+    X(COMMIT, 7, commit)                                   \
+    X(FLUSH, 8, flush)                                     \
+    X(OPTIMIZE, 9, optimize)                               \
+    X(STATS, 10, stats)                                    \
+    X(SERIES_CREATE, 12, series_create)                    \
+    X(SERIES_TYPE, 13, series_type)                        \
+    X(INSERT_VALUES, 14, insert_values)                    \
+    X(QUERY_VALUES, 15, query_values)                      \
+    X(STATE, 16, state)                                    \
+    X(STATE_NAME, 17, state_name)                          \
+    X(QUERY_BUCKETS, 18, query_buckets)                    \
+    X(LAST_STATS, 19, last_stats)                          \
+    X(QUERY_BOUNDS, 20, query_bounds)                      \
+    X(QUERY_LTTB, 21, query_lttb)                          \
+    X(QUERY_TWA, 22, query_twa)                            \
+    X(QUERY_MULTI, 23, query_multi)                        \
+    X(CANCEL, 24, cancel)                                  \
+    X(DELETE_RANGE, 25, delete_range)                      \
+    X(REPLACE_RANGE, 26, replace_range)                    \
+    X(SET_RETENTION, 27, set_retention)                    \
+    X(GET_RETENTION, 28, get_retention)                    \
+    X(AUTH_START, 29, auth_start)                          \
+    X(AUTH_CONTINUE, 30, auth_continue)                    \
+    X(WHOAMI, 31, whoami)                                  \
+    X(USER_CREATE, 32, user_create)                        \
+    X(USER_DROP, 33, user_drop)                            \
+    X(USER_ALTER, 34, user_alter)                          \
+    X(USER_PASSWORD, 35, user_password)                    \
+    X(GRANT, 36, grant)                                    \
+    X(REVOKE, 37, revoke)                                  \
+    X(USER_LIST, 38, user_list)
+
+#define TSDB_OP_ENUM_(name, num, metric) TSDB_OP_##name = num,
+enum { TSDB_OP_REPLY = 0, TSDB_OPS(TSDB_OP_ENUM_) };
+#undef TSDB_OP_ENUM_
+
+/* Version 12: login and access control */
+#define TSDB_HELLO_AUTH 1          /* HELLO reply flags: login is required */
+#define TSDB_PRELOGIN_MAX 4096     /* the largest frame (with its length field) before login */
+#define TSDB_SCRAM_SHA256 "SCRAM-SHA-256"
+#define TSDB_USER_SUPERUSER 1      /* user flags */
+enum { TSDB_SEL_ALL = 0, TSDB_SEL_PREFIX = 1, TSDB_SEL_NAME = 2, TSDB_SEL_GLOB = 3 };
+enum { TSDB_RIGHT_READ = 1, TSDB_RIGHT_INSERT = 2, TSDB_RIGHT_DELETE = 4, TSDB_RIGHT_ADMIN = 8 };
 
 #define TSDB_BUCKET_ROW 64 /* bytes per bucket in a QUERY_BUCKETS reply */
 #define TSDB_SPREAD 1       /* QUERY_BUCKETS/QUERY_BOUNDS fields: the spread follows each bucket (version 8) */
