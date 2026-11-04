@@ -483,27 +483,28 @@ explains each.</p>
 <div class="tabpanel" role="tabpanel" data-key="c">
 <p>The calls in <code>include/tsdb.h</code>. The C client has the same ones with the prefix <code>tsdbc_</code>
 (<code>tsdbc_query_spread</code>, <code>tsdbc_query_twa</code>, <code>tsdbc_query_lttb</code>).</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L475-L483"> * integers, so only these functions compute it; tsdb_query_agg and the rest
+<pre><code class="language-c" data-src="include/tsdb.h#L475-L483"> *    double), and does not depend on the order of the rows.
+ * Like every aggregate, the spread covers only the rows that are left: a
+ * deleted, replaced-away or expired (retention) value is never part of it,
+ * whether merges have removed it from disk yet or not.
+ * The spread costs a second pass over decoded floats and the squares of
+ * integers, so only these functions compute it; tsdb_query_agg and the rest
  * do not. Arguments, order and limit as in tsdb_query_agg, tsdb_query_group_ex
  * and tsdb_query_bounds; opts may be NULL. Free with free(). */
-typedef struct tsdb_spread_bucket {
-    tsdb_bucket b;
-    double range;
-    double var_pop, var_samp;
-    double stddev_pop, stddev_samp;
-} tsdb_spread_bucket;</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L539-L549">    int no_stats;       /* nonzero: decode every granule, never its statistics (benchmarks, checks) */
+typedef struct tsdb_spread_bucket {</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L539-L549">typedef struct tsdb_twa_opts {
+    tsdb_twa_method method;
+    int64_t max_gap_ms; /* 0: no staleness limit */
+    tsdb_order order;   /* of the buckets */
+    size_t limit;       /* 0: no limit */
+    int no_stats;       /* nonzero: decode every granule, never its statistics (benchmarks, checks) */
 } tsdb_twa_opts;
 
 typedef struct tsdb_twa_bucket {
     int64_t start; /* bucket start; with interval 0 this is the query start */
-    double twa;
-    double area;
-    int64_t covered_ms;
-    uint64_t count;
-} tsdb_twa_bucket;</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">* It reads one snapshot, so concurrent writes and merges do not tear the
-* result. Query statistics describe one read of the range (the counting pass,</code></pre>
+    double twa;</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L403-L404">*    the value as a double (int64 rounded, bool 0 or 1).
+*  - n &lt;= threshold returns every point. threshold &lt; 3 or a state series:</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
 <pre><code class="language-rust" data-src="client/rust/examples/analytics.rs">use tsdb_client::{Client, QueryOpts, TwaOpts, ValueType};
@@ -596,12 +597,12 @@ ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);</code></
 <p><code>tsdb_query_multi</code> calls your function once per series as the answers come;
 <code>tsdb_query_multi_collect</code> returns them all at once. The C client has <code>tsdbc_query_multi</code> and
 <code>tsdbc_query_multi_collect</code>.</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L638-L643">    void *hook_ctx;
-} tsdb_multi_opts;
-
-int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series, size_t n,
-                     const tsdb_multi_opts *mo, tsdb_multi_fn fn, void *ctx);
-/* The same into out[n] (index order, one result per series, rows of VALUES joined); free with</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L638-L643">int (*cancelled)(void *ctx);
+void (*on_wait)(void *ctx, int delta);
+int (*budget_take)(void *ctx, size_t bytes);
+void (*budget_give)(void *ctx, size_t bytes);
+void (*on_deferred)(void *ctx); /* a series is rerun at its turn (for a server's metrics) */
+void *hook_ctx;</code></pre>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
 <p>The Rust client has the same many-series calls.
@@ -654,11 +655,11 @@ for (int i = 0; i &lt; pumps.length; i++) {
 <button type="button" role="tab" data-key="java">Java</button>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="c">
-<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">* old values or the new ones, never a mix. Every ts must lie in [start, end)
-* (TSDB_ERR_INVALID otherwise); values as in tsdb_insert_series_values. n = 0
-* is a delete. */</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">* them in the background, whole partitions go when every series in them has
-* expired. Raising a limit brings back only values merges have not removed yet.</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L259-L261">* parts and remove the deleted rows for good later. Frequent small deletes
+* thus mean frequent small flushes. start &gt;= end deletes nothing.
+*</code></pre>
+<pre><code class="language-c" data-src="include/tsdb.h#L272-L273">* A series' values older than now - limit_ms disappear; 0 (the default)
+* keeps them. "now" is the wall clock (tsdb_options.clock_ms), but it never</code></pre>
 <p>The C client has the same calls with the prefix <code>tsdbc_</code>.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">

@@ -144,14 +144,18 @@ $(B)/test_multi: tests/test_multi.c src/internal.h $(LIB)
 $(B)/test_threads: tests/test_threads.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
+$(B)/test_buckets: tests/test_buckets.c src/internal.h $(LIB)
+	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
+
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
 	./$(B)/test_threads
+	./$(B)/test_buckets
 	LD_LIBRARY_PATH=$(B) ./$(B)/test_shared
 	./$(B)/test_failstop
 	./$(B)/test_damage
@@ -182,6 +186,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	! nm $(CLIB) | grep -w 'tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
+	./$(B)/test_out_send
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
@@ -518,6 +523,11 @@ $(B)/test_ports: tests/test_ports.c tests/harness.h $(CLIB)
 
 $(B)/test_client: tests/test_client.c $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+
+# includes server/tsdbd.c, as fuzz_frames does (epoll only)
+$(B)/test_out_send: tests/test_out_send.c server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h \
+                    client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
+	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c $(B)/tsdb_pack.o $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LDLIBS)

@@ -1387,6 +1387,8 @@ class Db:
         partition_classes: Slow series get partitions of 7, 28 or 364 base
             partitions, chosen from their rate (default True; fixed when the
             database is created).
+        insert_zstd_level: zstd level of the parts inserts write (default 0:
+            none; merges compress them at zstd_level); -1: zstd_level.
         The other keywords are the engine's tsdb_options fields of the same
         name; None keeps the engine's default. partition_ms and granule_rows
         are fixed when the database is created. value_codec is "auto",
@@ -1424,6 +1426,7 @@ class Db:
         request_threads: int | None = None,
         partition_classes: bool | None = None,
         pin_index: bool | None = None,
+        insert_zstd_level: int | None = None,
     ) -> Db: ...
     def close(self) -> None:
         """Flushes the memtable and closes the database.

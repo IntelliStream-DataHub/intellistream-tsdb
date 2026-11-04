@@ -829,6 +829,103 @@ static void test_cancel_pipeline(void)
     close(fd);
 }
 
+/* Replies leave from two places: a worker sends its connection's output itself while the event loop has none of it
+ * in flight, and hands the rest over when the socket is full; the loop then sends until it has drained, and the
+ * worker sends again. Pipelined requests with replies of every size, read by a client with a tiny receive buffer
+ * in chunks of every size with pauses, must arrive byte for byte as on a connection read at full speed: a byte sent
+ * twice, skipped or out of order breaks a frame or changes a hash. */
+enum { SR_REQS = 48, SR_SERIES = 200 };
+static uint64_t sr_hash(uint64_t h, const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
+static unsigned sr_rand = 12345;
+static bool sr_read(int fd, void *p, size_t n, bool slow)
+{
+    uint8_t *o = p;
+    while (n) {
+        size_t want = n;
+        if (slow) {
+            sr_rand = sr_rand * 1103515245u + 12345u;
+            size_t chunk = 1 + (sr_rand >> 8) % 6000;
+            want = chunk < n ? chunk : n;
+            if ((sr_rand >> 4) % 16 == 0)
+                usleep(100);
+        }
+        ssize_t r = recv(fd, o, want, 0);
+        if (r <= 0)
+            return false;
+        o += r;
+        n -= (size_t)r;
+    }
+    return true;
+}
+
+/* the frames of request k, hashed; false when the stream broke */
+static bool sr_reply(int fd, uint32_t k, bool slow, uint64_t *h)
+{
+    static uint8_t body[1 << 20];
+    *h = 14695981039346656037ull;
+    for (;;) {
+        uint8_t hd[17];
+        uint32_t len, id, ix;
+        if (!sr_read(fd, hd, 17, slow))
+            return false;
+        memcpy(&len, hd, 4);
+        memcpy(&id, hd + 4, 4);
+        memcpy(&ix, hd + 13, 4);
+        if (id != k + 1 || len < 13 || len - 13 > sizeof body || !sr_read(fd, body, len - 13, slow))
+            return false;
+        *h = sr_hash(sr_hash(*h, hd, 17), body, len - 13);
+        if (k % 2 || ix == TSDB_MULTI_END) /* odd: a single query of one row, one frame */
+            return true;
+    }
+}
+
+static void test_slow_reader(void)
+{
+    tsdb_sid *list = malloc(SR_SERIES * sizeof *list);
+    for (uint32_t i = 0; i < SR_SERIES; i++)
+        list[i] = ids[i % 5];
+    uint8_t t[33], one_t[33], *req = malloc(24 + SR_SERIES * 8 + 33); /* values_tmpl writes 33 bytes */
+    values_tmpl(one_t, ids[0], T0, T0 + 1);
+    uint64_t want[SR_REQS], got;
+    for (int slow = 0; slow < 2; slow++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int small = 4096;
+        if (slow) /* before connect, so the window stays small */
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+        struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) == 0);
+        for (uint32_t k = 0; k < SR_REQS; k++) {
+            if (k % 2) {
+                raw_send(fd, k + 1, TSDB_OP_QUERY_VALUES, one_t, 33);
+                continue;
+            }
+            uint32_t n = k % 4 ? 1 : SR_SERIES; /* a large reply, a small one */
+            values_tmpl(t, TSDB_MANY_SERIES, T0, T0 + 400000 + (int64_t)k * 1000);
+            raw_send(fd, k + 1, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_VALUES, 0, n, list, t, 33));
+        }
+        int bad = 0;
+        for (uint32_t k = 0; k < SR_REQS && !bad; k++) {
+            if (!sr_reply(fd, k, slow, slow ? &got : &want[k]))
+                bad = (int)k + 1;
+            else if (slow && got != want[k])
+                bad = (int)k + 1;
+        }
+        if (bad)
+            fprintf(stderr, "slow reader: reply %d %s\n", bad - 1, slow ? "differs or broke" : "broke");
+        CHECK(!bad);
+        close(fd);
+    }
+    free(list);
+    free(req);
+}
+
 typedef struct {
     int fd;
     const uint8_t *fill;
@@ -1094,6 +1191,7 @@ int main(int argc, char **argv)
     load_big(c);
     test_full_frame(c);
     test_cancel_pipeline();
+    test_slow_reader();
     test_cancel_flood();
     test_disconnect(c, pid);
     test_stall(c, pid, 3);

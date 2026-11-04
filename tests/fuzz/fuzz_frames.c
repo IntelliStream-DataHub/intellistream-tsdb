@@ -343,6 +343,8 @@ static void run_one(const uint8_t *in, size_t len)
     if (!c)
         abort();
     c->fd = -1;
+    c->n_out = (note){NULL, c, false}; /* as on_accept: replies push n_out onto note_top, which nobody takes here */
+    c->n_done = (note){NULL, c, true};
     pthread_mutex_init(&c->lock, NULL);
     pthread_cond_init(&c->cv, NULL);
     auth_conn_init(&c->auth); /* as on_accept: login required */
@@ -371,6 +373,7 @@ static void run_one(const uint8_t *in, size_t len)
     free(c->out.p);
     pthread_mutex_destroy(&c->lock);
     pthread_cond_destroy(&c->cv);
+    atomic_store(&note_top, NULL); /* it may point into c */
     free(c);
     cur_in = NULL;
 }

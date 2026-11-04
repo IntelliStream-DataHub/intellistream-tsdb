@@ -64,8 +64,11 @@ pub struct Options {
     pub partition_classes: bool,
     /// Rows per granule; fixed when the database is created. Default 8192.
     pub granule_rows: u32,
-    /// zstd level of the blocks; 0 disables zstd. Default 1.
+    /// zstd level of the blocks merges write; 0 disables zstd. Default 1.
     pub zstd_level: i32,
+    /// zstd level of the parts inserts and memtable flushes write; default 0: none (faster to write, larger
+    /// until a background merge re-encodes them at `zstd_level`). -1: `zstd_level`, as merges.
+    pub insert_zstd_level: i32,
     /// Value encoding.
     pub value_codec: ValueCodec,
     /// fsync parts before publishing them. Default true.
@@ -121,6 +124,7 @@ impl Default for Options {
             partition_classes: o.partition_classes != 0,
             granule_rows: o.granule_rows,
             zstd_level: o.zstd_level,
+            insert_zstd_level: o.insert_zstd_level,
             value_codec: match o.value_codec {
                 sys::TSDB_VALUES_GORILLA => ValueCodec::Gorilla,
                 sys::TSDB_VALUES_CHIMP => ValueCodec::Chimp,
@@ -181,6 +185,7 @@ impl Options {
             request_threads: self.request_threads,
             partition_classes: self.partition_classes as c_int,
             pin_index: self.pin_index as c_int,
+            insert_zstd_level: self.insert_zstd_level,
         }
     }
 }
@@ -375,7 +380,7 @@ impl Drop for Db {
 
 /// The `TSDB_ABI_VERSION` this crate was written for. A struct can keep its size while its fields move
 /// (`tsdb_series_result` did when ids became 64 bits), so the engine's number is compared, not sizes.
-const ABI_VERSION: c_int = 2;
+const ABI_VERSION: c_int = 3;
 
 fn check_abi(found: c_int) -> Result<()> {
     if found != ABI_VERSION {

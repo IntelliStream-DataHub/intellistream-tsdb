@@ -21,6 +21,7 @@ int main(void)
     F(tsdb_options, obsolete_part_lifetime_s); F(tsdb_options, verify_checksums); F(tsdb_options, retention_merge_s);
     F(tsdb_options, clock_ms); F(tsdb_options, clock_arg); F(tsdb_options, create_volumes);
     F(tsdb_options, request_threads); F(tsdb_options, partition_classes); F(tsdb_options, pin_index);
+    F(tsdb_options, insert_zstd_level);
     S(tsdb_values);
     F(tsdb_values, type); F(tsdb_values, values); F(tsdb_values, valid);
     S(tsdb_bucket);

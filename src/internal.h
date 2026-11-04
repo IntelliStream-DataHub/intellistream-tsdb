@@ -158,6 +158,16 @@ uint64_t xxh64(const void *data, size_t len, uint64_t seed);
 #define BLK_ZSTD 0x80 /* the transform output is additionally ZSTD compressed */
 #define BLK_SLACK 32  /* decoders may read up to this many bytes past a block */
 
+/* What ZSTD must save of `inner` transform bytes for a block to keep it, since decoding costs too: 1/8 for timestamp
+ * blocks, 1/32 for value blocks. Every query that reads rows decodes the timestamps, and the timestamp blocks ZSTD
+ * shrank by 1/32 to 1/8 (jittered clocks) were 0.65% of the bytes but 17-22% of a minute-bucket query on one thread
+ * (the user's decision, 2026-11-02). Integer arithmetic on the kind: every CPU level keeps the same blocks. */
+static inline size_t blk_zstd_min_saving(int kind, size_t inner)
+{
+    bool ts = kind == BLK_DD || kind == BLK_TS_DELTA || kind == BLK_TS_GRID;
+    return inner / (ts ? 8 : 32);
+}
+
 typedef struct codec_ctx {
     struct codec_ctx *next; /* free list in eng */
     ZSTD_CCtx *cctx;
@@ -856,6 +866,20 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_
 int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, bool verify, granule *g);
 extern atomic_uint_fast64_t granule_checks; /* granule checksums computed, for tests */
 
+/* Hour cuts. A granule of a series also ends at a UTC hour edge e (a multiple of HOUR_CUT_MS) when at least
+ * HOUR_CUT_MIN rows of it lie in the hour before e, [e - 1 h, e), so hourly buckets and local days (whole hours in
+ * nearly every zone) are answered from granule statistics instead of decoding the granule that holds the edge. The
+ * rule counts rows, not the rate of the last few (a burst would look dense) nor the class (a short retention keeps
+ * slow series in class 0): a series of fewer rows an hour, steady or in bursts, keeps its 8192-row granules. A
+ * writer counts the rows it was given, so a part that begins less than an hour's worth before an edge does not cut
+ * there; merges do, once they see the hour. Part of the layout the writer makes, not of the format: readers take any
+ * granule boundaries. A merge copies a granule only where the writer would cut its rows the same way
+ * (pw_copy_fits, pw_hcut_before). 0: off. */
+#ifndef HOUR_CUT_MIN
+#define HOUR_CUT_MIN 3000
+#endif
+#define HOUR_CUT_MS 3600000
+extern atomic_uint hour_cut_min; /* HOUR_CUT_MIN; tests set 0 to compare against the layout without hour cuts */
 typedef struct part_writer {
     struct eng *db;
     int64_t partition;
@@ -874,6 +898,13 @@ typedef struct part_writer {
     uint8_t *pend_v; /* slots of pend_type */
     uint32_t grows;
     int64_t cut_ms; /* > 0: granules end at multiples of it (GRANULE_CUT); 0 in a base partition */
+    uint32_t hc_min;          /* > 0: hour cuts for series of at least this many rows an hour (HOUR_CUT_MIN) */
+    uint32_t hk_series;       /* the series of the last rows given to the writer (emitted, pending or copied), */
+    int64_t hk_hour, hk_end;  /* the hour of the last one (floor of ts / HOUR_CUT_MS) and where it ends, */
+    uint64_t hk_cnt;          /* and how many of its rows given lie in that hour */
+    int64_t *hk_buf;          /* stamps pw_copy_fits decoded: of entry hk_di of hk_dsrc */
+    const struct part *hk_dsrc;
+    uint32_t hk_di;
     int zstd_level;
     int value_codec;
     codec_ctx *cc;
@@ -892,6 +923,14 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
 int pw_add(part_writer *w, uint32_t series, int type, const int64_t *ts, const void *v, size_t n);
 /* entry i of src, copied as it is */
 int pw_copy_granule(part_writer *w, const part *src, uint32_t i);
+/* Whether a merge may copy entry i of src next (g: its series, count and window) and keep the layout one writer
+ * given its rows would make: no hour cut inside it, and with want_end (a short granule) *end set to the hour edge
+ * after it where the writer cuts (INT64_MAX: none; then only a day cut or the end of the series' rows ends it, which
+ * the caller checks). 1 yes, 0 no, < 0 an error. Decides from the count, window and longest gap between rows where
+ * they suffice, else from the timestamps, decoded (and kept for pw_copy_granule's count of the hour). */
+int pw_copy_fits(part_writer *w, const struct part *src, uint32_t i, const granule *g, bool want_end, int64_t *end);
+/* whether w ends its pending rows at an hour edge at or before t (a cut before a granule of their series) */
+bool pw_hcut_before(const part_writer *w, int64_t t);
 /* Tombstones for the trailer, sorted by (series, start) and disjoint per series; copied. */
 int pw_set_tombs(part_writer *w, const tomb *t, size_t n);
 int pw_finish(part_writer *w, uint64_t min_block, uint64_t max_block, uint32_t level, part **out);
@@ -1568,6 +1607,7 @@ int eng_query_lttb(eng *db, uint32_t series, int64_t start, int64_t end, size_t 
 extern size_t lttb_buffer_bytes; /* tests make it small to exercise the two-pass way */
 extern size_t local_piece_bounds; /* local periods per window of tsdb_query_group_local (0: default); tests */
 extern size_t agg_dense_buckets; /* the most buckets one dense array holds (0: the default); for tests */
+extern size_t dense_chunk;       /* buckets per item of the passes over a dense array (0: the default); for tests */
 extern size_t agg_dense_states;  /* bucket states of all dense arrays so far (src/query.c); for tests */
 extern size_t local_twa_listed;  /* bounds local TWAs have listed so far (src/calendar.c); for tests */
 /* Buckets newest first with desc; at most limit non-empty ones (0: all), computing only about as many. */

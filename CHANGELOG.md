@@ -8,6 +8,31 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Added
+- Inserts and memtable flushes write their parts without zstd (`tsdb_options.insert_zstd_level`, default 0;
+  tsdbd `--insert-zstd-level`): background merges re-encode every such part at `zstd_level` anyway, with others
+  or alone once its partition is idle, so the parts at rest are the same bytes, and only parts not merged yet
+  are larger (1.68 instead of 1.12 bytes per row for a CPU temperature). Where nothing merges
+  (`merge_idle_s = -1`, `merge_threads = 0`) parts stay as inserted. `-1` writes inserts at `zstd_level` as
+  before. In the Rust, Python and Java embedded bindings (`insert_zstd_level`, `insertZstdLevel`);
+  `tsdb-bench --insert-zstd N --merge-threads N --fresh`, `insert-bench` and `scale-bench load --insert-zstd N`.
+  `TSDB_ABI_VERSION` is 3: `insert_zstd_level` follows `pin_index` and grows `tsdb_options` by 8 bytes.
+
+### Changed
+- Hour cuts: a granule ends at a UTC hour edge when at least 3000 rows of its series lie in the hour before it
+  (a row every 1.2 s or faster), so hourly buckets and the days of zones a whole number of hours from UTC
+  (Europe/Oslo, but not Asia/Kolkata) are answered from granule statistics instead of decoding the granules around
+  each edge. The rule counts the rows of the hour: a series below 3000 rows an hour keeps its granules as before,
+  whether steady or in bursts (a burst is as fast as 1 Hz while it lasts), and whatever its class. Cost: more,
+  smaller granules, each extra one 60-320 bytes depending on the codecs (an index entry, the frames of a timestamp
+  and a value block, compression context): 1-6% more bytes on the 1 Hz data sets measured (15%, or 0.018 bytes a
+  row, on a nearly constant one), up to 10% just above the threshold (1.1-1.2 s), under 1% for faster series and
+  none for slower ones. The layout changes, not the format (no `FORMAT_VERSION` bump): readers take any granule
+  boundaries, and a database written before keeps its granules until merges rewrite them. Merges copy granules
+  only where a writer given their rows would cut them the same way, so a merged layout stays put. Answers stay the
+  same; only float sums (float32 and float64, summed in doubles per granule), variances and TWA areas can differ
+  in the last bits.
+
 ## [0.9.0] - 2026-11-04
 
 The first release. **Disk format version 8, wire protocol version 11** (the server and the clients refuse a peer
