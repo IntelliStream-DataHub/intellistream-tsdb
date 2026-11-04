@@ -87,7 +87,7 @@ performance optimizations for different CPU architectures.
 ## How it compares
 
 We ran tsdb 0.9.0 and the other databases on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a
-time, on the same data, with the same memory limit of 48 GB. Every answer was checked against tsdb's before it was
+time, on the same data, with the same memory limit of 48 GB (InfluxDB 2: 24 GB; it used at most 7.9). Every answer was checked against tsdb's before it was
 timed. Every timing was repeated 5 times. "slower" says how many times longer the other database took than tsdb.
 
 **Servers: 100 million readings** (100 sensors, 1 million readings each). tsdb ran as a server, over TCP.
