@@ -525,9 +525,9 @@ $(B)/test_client: tests/test_client.c $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
-$(B)/test_out_send: tests/test_out_send.c server/tsdbd.c server/metrics.c server/metrics.h include/tsdb_protocol.h \
-                    client/tsdb_pack.h $(B)/tsdb_pack.o $(LIB)
-	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c $(B)/tsdb_pack.o $(LIB) $(LDLIBS)
+$(B)/test_out_send: tests/test_out_send.c $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -DTSDBD_NO_URING -o $@ $< server/metrics.c server/auth.c $(B)/tsdb_pack.o \
+	    $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 $(B)/test_server_multi: tests/test_server_multi.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LDLIBS)
