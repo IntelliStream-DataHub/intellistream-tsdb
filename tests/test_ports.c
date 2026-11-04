@@ -44,8 +44,8 @@ static pid_t spawn(const char *const *args)
         int dn = open("/dev/null", O_WRONLY);
         if (dn >= 0)
             dup2(dn, 2);
-        const char *argv[32] = {"tsdbd"};
-        int n = 1;
+        const char *argv[32] = {"tsdbd", "--no-auth"};
+        int n = 2;
         for (int i = 0; args[i] && n < 31; i++)
             argv[n++] = args[i];
         argv[n] = NULL;

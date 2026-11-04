@@ -2796,8 +2796,8 @@ int main(int argc, char **argv)
     }
     /* A13: login unless --no-auth, and then a superuser must exist; USERS is read before anyone connects */
     if (no_auth)
-        fprintf(stderr, "tsdbd: --no-auth: no login, every client may do everything: listen on a trusted interface "
-                        "only\n");
+        fprintf(stderr, "tsdbd: --no-auth: no login, every client may read and write every series (user admin ops "
+                        "are refused, A28): listen on a trusted interface only\n");
     if (auth_init(dir, !no_auth, !o.read_only && !o.follow, db) != 0) {
         tsdb_close(db);
         return 1;

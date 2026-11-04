@@ -100,7 +100,8 @@ class TcpCompareTest {
         Path log = tmp.resolve("tsdbd.log");
         Path portFile = tmp.resolve("tsdbd.port");
         Process server = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", "0", "--port-file",
-                portFile.toString(), "--no-fsync", "--workers", "2").redirectErrorStream(true).redirectOutput(log.toFile()).start();
+                portFile.toString(), "--no-fsync", "--workers", "2", "--no-auth").redirectErrorStream(true)
+                .redirectOutput(log.toFile()).start();
         try {
             int port = -1;
             for (int i = 0; i < 1500 && server.isAlive() && port < 0; i++) {

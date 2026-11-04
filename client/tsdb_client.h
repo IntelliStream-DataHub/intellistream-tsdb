@@ -35,11 +35,51 @@ typedef struct tsdbc tsdbc;
 #define TSDBC_KEEPALIVE_IDLE_S 30
 #define TSDBC_KEEPALIVE_INTERVAL_S 10
 #define TSDBC_KEEPALIVE_COUNT 3
-/* Connecting asks the server's protocol version (HELLO): a server below 11 (TSDB_PROTOCOL_MIN), which reads series
- * ids as 32 bits, is refused with TSDB_ERR_INVALID and a line on stderr. */
+/* Connecting asks the server's protocol version (HELLO): a server below 12 (TSDB_PROTOCOL_MIN) is refused with
+ * TSDB_ERR_INVALID and a line on stderr. Without a user it works only with a tsdbd started with --no-auth; one that
+ * requires a login answers TSDB_ERR_AUTH (tsdbc_connect_auth, tsdbc_connect_opts). */
 int tsdbc_connect(const char *host, int port, tsdbc **out);
 /* The same with its own connect timeout; 0 waits as long as the kernel does. */
 int tsdbc_connect_timeout(const char *host, int port, int connect_ms, tsdbc **out);
+
+/* Login (SCRAM-SHA-256, docs/design-auth.md). The client checks the server's signature, so a server that does not
+ * hold the user's verifier fails the connect too. PBKDF2 runs once per (user, password, salt, iterations) per
+ * process: the keys it gives are cached, and later connects cost four HMACs. Any failure (unknown user, wrong
+ * password, a server that cannot prove itself) is TSDB_ERR_AUTH. */
+typedef struct tsdbc_options {
+    const char *user;          /* NULL: no login (a tsdbd with --no-auth) */
+    const char *password;      /* the password's bytes (UTF-8, no normalization), or */
+    const char *password_file; /* the first line of this file (a trailing CR LF cut) */
+    int connect_ms;            /* 0: TSDBC_CONNECT_TIMEOUT_MS; below 0 waits as long as the kernel does */
+    int require_auth;          /* refuse (TSDB_ERR_AUTH) a server that does not ask for a login */
+} tsdbc_options;
+/* With credentials, a server that does not ask for a login (--no-auth) is used without one unless require_auth. */
+int tsdbc_connect_opts(const char *host, int port, const tsdbc_options *o, tsdbc **out);
+int tsdbc_connect_auth(const char *host, int port, const char *user, const char *password, tsdbc **out);
+
+/* Users and grants (tsdbd's USERS, managed over the wire by a superuser or a user with admin on a selector; a
+ * tsdbd with --no-auth refuses these with TSDB_ERR_DENIED: use `tsdb <dir> user` there). Flags: TSDB_USER_SUPERUSER.
+ * A grant's kind is TSDB_SEL_ALL, _PREFIX, _NAME or _GLOB (tsdb_protocol.h), rights TSDB_RIGHT_* bits. The
+ * password never leaves the client: its verifier (a fresh 16-byte salt, iterations, 0 for 4096) is computed here. */
+typedef struct tsdbc_user_grant {
+    uint8_t kind, rights;
+    char *selector; /* "" for all */
+} tsdbc_user_grant;
+typedef struct tsdbc_user {
+    char *name;
+    uint8_t flags;
+    uint32_t ngrants;
+    tsdbc_user_grant *grants;
+} tsdbc_user;
+int tsdbc_whoami(tsdbc *c, tsdbc_user **out); /* "" and TSDB_USER_SUPERUSER without login; free with tsdbc_users_free(out, 1) */
+int tsdbc_user_list(tsdbc *c, tsdbc_user **out, size_t *n); /* the users this one may see (itself, whom it manages) */
+void tsdbc_users_free(tsdbc_user *u, size_t n);
+int tsdbc_user_create(tsdbc *c, const char *name, const char *password, uint32_t iterations, uint8_t flags);
+int tsdbc_user_drop(tsdbc *c, const char *name);
+int tsdbc_user_alter(tsdbc *c, const char *name, uint8_t flags);
+int tsdbc_user_password(tsdbc *c, const char *name, const char *password, uint32_t iterations);
+int tsdbc_grant(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);
+int tsdbc_revoke(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights);
 /* Keepalive probes: idle_s of silence before the first, interval_s between
  * them, count unanswered before the connection is dropped; idle_s = 0 turns
  * keepalive off. */

@@ -456,7 +456,7 @@ start_server() {
     local ioargs=()
     [ -n "$IO" ] && ioargs=(--io "$IO")
     rm -f "$d/port"
-    "$B/tsdbd" --dir "$d/db" --listen 127.0.0.1 --port 0 --port-file "$d/port" ${ioargs[@]+"${ioargs[@]}"} >"$d/log" 2>&1 &
+    "$B/tsdbd" --dir "$d/db" --no-auth --listen 127.0.0.1 --port 0 --port-file "$d/port" ${ioargs[@]+"${ioargs[@]}"} >"$d/log" 2>&1 &
     SRV_PID=$!
     for ((i = 0; i < 600; i++)); do
         if ! kill -0 "$SRV_PID" 2>/dev/null; then

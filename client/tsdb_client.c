@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "tsdb_calendar.h"
 #include "tsdb_client.h"
+#include "tsdb_crypto.h"
 #include "tsdb_pack.h"
 #include "tsdb_protocol.h"
 
@@ -13,6 +14,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -39,6 +41,8 @@ struct tsdbc {
     /* packed inserts (protocol version 3) */
     int zlevel;      /* zstd level; 0: send plain arrays */
     uint32_t server_version; /* from HELLO; 0 until asked */
+    uint16_t hello_flags;    /* TSDB_HELLO_AUTH: the server requires a login */
+    bool scram;              /* the server offers SCRAM-SHA-256 */
     ZSTD_CCtx *zc;
     uint8_t *raw, *zbuf;
     size_t raw_cap, zbuf_cap;
@@ -96,12 +100,30 @@ int tsdbc_connect(const char *host, int port, tsdbc **out)
 }
 
 static int check_server_version(tsdbc *c);
+static int login(tsdbc *c, const tsdbc_options *o);
 
 int tsdbc_connect_timeout(const char *host, int port, int connect_ms, tsdbc **out)
 {
-    *out = NULL;
-    if (connect_ms < 0)
+    if (connect_ms < 0) {
+        *out = NULL;
         return TSDB_ERR_INVALID;
+    }
+    tsdbc_options o = {.connect_ms = connect_ms ? connect_ms : -1};
+    return tsdbc_connect_opts(host, port, &o, out);
+}
+
+int tsdbc_connect_auth(const char *host, int port, const char *user, const char *password, tsdbc **out)
+{
+    tsdbc_options o = {.user = user, .password = password};
+    return tsdbc_connect_opts(host, port, &o, out);
+}
+
+int tsdbc_connect_opts(const char *host, int port, const tsdbc_options *o, tsdbc **out)
+{
+    *out = NULL;
+    if (o->user && !o->password && !o->password_file)
+        return TSDB_ERR_INVALID;
+    int connect_ms = o->connect_ms == 0 ? TSDBC_CONNECT_TIMEOUT_MS : o->connect_ms < 0 ? 0 : o->connect_ms;
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     struct addrinfo hints = {.ai_socktype = SOCK_STREAM}, *ai;
@@ -132,11 +154,14 @@ int tsdbc_connect_timeout(const char *host, int port, int connect_ms, tsdbc **ou
     c->zlevel = 1;
     /* Best effort, as in the other clients: a socket without the probe options still works. */
     tsdbc_set_keepalive(c, TSDBC_KEEPALIVE_IDLE_S, TSDBC_KEEPALIVE_INTERVAL_S, TSDBC_KEEPALIVE_COUNT);
-    /* HELLO now, within the connect timeout: an older server is refused before any request reaches it */
+    /* HELLO and the login now, within the connect timeout: an older server is refused before any request reaches
+     * it, and one that cannot prove it holds the user's verifier before anything is sent to it */
     struct timeval tv = {connect_ms / 1000, (connect_ms % 1000) * 1000}, none = {0, 0};
     if (connect_ms > 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     int rc = check_server_version(c);
+    if (rc == 0)
+        rc = login(c, o);
     if (connect_ms > 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none);
     if (rc) {
@@ -160,6 +185,8 @@ const char *tsdbc_strerror(int err)
     case TSDB_ERR_TOO_MANY_BUCKETS: return "too many buckets";
     case TSDB_ERR_STOPPED: return "stopped";
     case TSDB_ERR_READONLY: return "database is read only";
+    case TSDB_ERR_DENIED: return "permission denied";
+    case TSDB_ERR_AUTH: return "login failed or required";
     default: return "unknown error";
     }
 }
@@ -965,8 +992,21 @@ static uint32_t server_version(tsdbc *c)
             read_reply(c, &st, &b, &n))
             return 1; /* the connection failed; whatever comes next reports it */
         uint32_t theirs = 1; /* a version 1 server does not know HELLO */
-        if (st == 0 && n == 4)
+        if (st == 0 && n >= 4)
             memcpy(&theirs, b, 4);
+        if (st == 0 && theirs >= 12) { /* u16 flags, u16 n, n x (u8 len, mechanism) */
+            uint16_t nm;
+            size_t at = 8;
+            if (n < 8) {
+                c->broken = true; /* a server of 12 that does not say whether it wants a login: answer nothing */
+                return 1;
+            }
+            memcpy(&c->hello_flags, b + 4, 2);
+            memcpy(&nm, b + 6, 2);
+            for (uint16_t i = 0; i < nm && at < n && at + 1 + b[at] <= n; i++, at += 1 + b[at])
+                c->scram |= b[at] == strlen(TSDB_SCRAM_SHA256) &&
+                            memcmp(b + at + 1, TSDB_SCRAM_SHA256, strlen(TSDB_SCRAM_SHA256)) == 0;
+        }
         c->server_version = theirs;
     }
     return c->server_version;
@@ -990,6 +1030,468 @@ static int check_server_version(tsdbc *c)
 uint32_t tsdbc_server_version(tsdbc *c) { return tsdbc_wait(c) ? 0 : server_version(c); }
 
 uint64_t tsdbc_bytes_sent(const tsdbc *c) { return c->sent; }
+
+/* ------------------------------------------------------------- login */
+
+#define SCRAM_ITER_MIN 4096         /* fewer is a downgrade a server could ask for: refused */
+#define SCRAM_ITER_MAX 100000000    /* more would let a fake server pin the client's CPU */
+#define KEY_CACHE 16
+
+/* The client nonce comes from here when set (the RFC 7677 test replays a fixed exchange). */
+const char *tsdbc_test_nonce;
+
+/* PBKDF2 once per process: ClientKey and ServerKey by user, salt, iterations and password. The password is not kept:
+ * an entry holds HMAC(salt, password) to tell one password from another. */
+typedef struct {
+    bool used;
+    char user[256];
+    uint8_t salt[64], pw_mac[32], client_key[32], server_key[32];
+    size_t salt_len;
+    uint32_t iterations;
+} key_entry;
+static pthread_mutex_t key_mu = PTHREAD_MUTEX_INITIALIZER;
+static key_entry keys[KEY_CACHE];
+static unsigned key_next;
+
+static void scram_keys_cached(const char *user, const char *pw, size_t pwl, const uint8_t *salt, size_t salt_len,
+                              uint32_t iter, uint8_t ck[32], uint8_t sk[32])
+{
+    uint8_t mac[32];
+    tsdb_hmac_sha256(salt, salt_len, pw, pwl, mac);
+    bool cacheable = strlen(user) < sizeof keys[0].user && salt_len <= sizeof keys[0].salt;
+    pthread_mutex_lock(&key_mu);
+    for (unsigned i = 0; cacheable && i < KEY_CACHE; i++) {
+        key_entry *e = &keys[i];
+        if (e->used && e->iterations == iter && e->salt_len == salt_len && strcmp(e->user, user) == 0 &&
+            memcmp(e->salt, salt, salt_len) == 0 && tsdb_ct_equal(e->pw_mac, mac, 32)) {
+            memcpy(ck, e->client_key, 32);
+            memcpy(sk, e->server_key, 32);
+            pthread_mutex_unlock(&key_mu);
+            tsdb_wipe(mac, sizeof mac);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&key_mu);
+    tsdb_scram_keys(pw, pwl, salt, salt_len, iter, ck, NULL, sk); /* outside the lock: milliseconds */
+    if (cacheable) {
+        pthread_mutex_lock(&key_mu);
+        key_entry *e = &keys[key_next++ % KEY_CACHE];
+        e->used = true;
+        snprintf(e->user, sizeof e->user, "%s", user);
+        memcpy(e->salt, salt, salt_len);
+        e->salt_len = salt_len;
+        e->iterations = iter;
+        memcpy(e->pw_mac, mac, 32);
+        memcpy(e->client_key, ck, 32);
+        memcpy(e->server_key, sk, 32);
+        pthread_mutex_unlock(&key_mu);
+    }
+    tsdb_wipe(mac, sizeof mac);
+}
+
+/* The first line of a file, without its line end. */
+static int read_password_file(const char *path, char *pw, size_t cap)
+{
+    FILE *f = fopen(path, "re");
+    if (!f)
+        return TSDB_ERR_IO;
+    bool ok = fgets(pw, (int)cap, f) != NULL;
+    fclose(f);
+    if (!ok)
+        return TSDB_ERR_INVALID;
+    size_t n = strcspn(pw, "\n");
+    if (pw[n] != '\n' && n == cap - 1)
+        return TSDB_ERR_INVALID; /* longer than cap */
+    pw[n] = '\0';
+    if (n && pw[n - 1] == '\r')
+        pw[n - 1] = '\0';
+    return 0;
+}
+
+/* A u16-length message from a reply body; NULL when the body is not exactly that. */
+static const char *reply_msg(const uint8_t *b, size_t n, size_t *len)
+{
+    uint16_t l;
+    if (n < 2 || (memcpy(&l, b, 2), n != 2u + l))
+        return NULL;
+    *len = l;
+    return (const char *)b + 2;
+}
+
+/* SCRAM-SHA-256 (RFC 5802, RFC 7677) as the client: the user in n=, no channel binding ("n,,"). The server's
+ * signature is checked before the connect returns: a server without this user's verifier cannot pass. */
+static int scram(tsdbc *c, const char *user, const char *pw)
+{
+    size_t ul = strlen(user), pwl = strlen(pw);
+    if (!ul || ul > 255 || strpbrk(user, ",="))
+        return TSDB_ERR_INVALID; /* user names never hold these (USER_NAME_MAX is far below 255) */
+    char cn[64];
+    if (tsdbc_test_nonce) {
+        snprintf(cn, sizeof cn, "%s", tsdbc_test_nonce);
+    } else {
+        uint8_t r[18];
+        if (tsdb_random(r, sizeof r) != 0)
+            return TSDB_ERR_IO;
+        tsdb_base64_encode(r, sizeof r, cn);
+    }
+    size_t cnl = strlen(cn);
+    /* AUTH_START: u8 len, mechanism, u16 len, "n,," client-first-message-bare */
+    char first[5 + 255 + 3 + sizeof cn];
+    int fl = snprintf(first, sizeof first, "n,,n=%s,r=%s", user, cn);
+    uint8_t start[1 + 13 + 2 + sizeof first];
+    size_t ml = strlen(TSDB_SCRAM_SHA256);
+    start[0] = (uint8_t)ml;
+    memcpy(start + 1, TSDB_SCRAM_SHA256, ml);
+    uint16_t fl16 = (uint16_t)fl;
+    memcpy(start + 1 + ml, &fl16, 2);
+    memcpy(start + 3 + ml, first, (size_t)fl);
+    const uint8_t *b;
+    size_t n, sl;
+    int rc = call(c, TSDB_OP_AUTH_START, start, 3 + ml + (size_t)fl, NULL, 0, &b, &n);
+    if (rc)
+        return rc == TSDB_ERR_AUTH || rc == TSDB_ERR_INVALID ? TSDB_ERR_AUTH : rc;
+    const char *sf = reply_msg(b, n, &sl);
+    /* server-first-message: r=<client nonce><server nonce>,s=<salt>,i=<iterations>, nothing else */
+    char server_first[600], nonce[300];
+    uint8_t salt[64];
+    size_t salt_len;
+    if (!sf || sl >= sizeof server_first)
+        return TSDB_ERR_AUTH;
+    memcpy(server_first, sf, sl);
+    server_first[sl] = '\0';
+    const char *s = strstr(server_first, ",s="), *i = s ? strstr(s + 3, ",i=") : NULL;
+    if (strncmp(server_first, "r=", 2) != 0 || !s || !i || (size_t)(s - server_first - 2) <= cnl ||
+        (size_t)(s - server_first - 2) >= sizeof nonce || memcmp(server_first + 2, cn, cnl) != 0 ||
+        tsdb_base64_decode(s + 3, (size_t)(i - s - 3), salt, sizeof salt, &salt_len) != 0 || salt_len == 0)
+        return TSDB_ERR_AUTH;
+    size_t nl = (size_t)(s - server_first - 2);
+    memcpy(nonce, server_first + 2, nl);
+    nonce[nl] = '\0';
+    char *end;
+    errno = 0;
+    unsigned long it = strtoul(i + 3, &end, 10);
+    if (*end || errno || i[3] < '1' || i[3] > '9' || it < SCRAM_ITER_MIN || it > SCRAM_ITER_MAX)
+        return TSDB_ERR_AUTH;
+    for (size_t k = 0; k < nl; k++)
+        if (nonce[k] < 0x21 || nonce[k] > 0x7e || nonce[k] == ',')
+            return TSDB_ERR_AUTH;
+    uint8_t ck[32], sk[32], stored[32], sig[32], proof[32], ssig[32];
+    scram_keys_cached(user, pw, pwl, salt, salt_len, (uint32_t)it, ck, sk);
+    /* AuthMessage = client-first-message-bare "," server-first-message "," client-final-message-without-proof */
+    char final[400 + tsdb_base64_len(32)];
+    int wl = snprintf(final, sizeof final, "c=biws,r=%s", nonce);
+    size_t am_len = (size_t)fl - 3 + 1 + sl + 1 + (size_t)wl;
+    char *am = malloc(am_len);
+    if (!am) {
+        tsdb_wipe(ck, sizeof ck);
+        return TSDB_ERR_NOMEM;
+    }
+    memcpy(am, first + 3, (size_t)fl - 3);
+    am[fl - 3] = ',';
+    memcpy(am + fl - 2, server_first, sl);
+    am[fl - 2 + sl] = ',';
+    memcpy(am + fl - 1 + sl, final, (size_t)wl);
+    tsdb_sha256_buf(ck, 32, stored);
+    tsdb_hmac_sha256(stored, 32, am, am_len, sig);
+    for (int k = 0; k < 32; k++)
+        proof[k] = ck[k] ^ sig[k];
+    tsdb_hmac_sha256(sk, 32, am, am_len, ssig);
+    free(am);
+    tsdb_wipe(ck, sizeof ck);
+    tsdb_wipe(sk, sizeof sk);
+    memcpy(final + wl, ",p=", 3);
+    wl += 3;
+    wl += (int)tsdb_base64_encode(proof, 32, final + wl);
+    tsdb_wipe(proof, sizeof proof);
+    uint8_t cont[2 + sizeof final];
+    uint16_t wl16 = (uint16_t)wl;
+    memcpy(cont, &wl16, 2);
+    memcpy(cont + 2, final, (size_t)wl);
+    rc = call(c, TSDB_OP_AUTH_CONTINUE, cont, 2 + (size_t)wl, NULL, 0, &b, &n);
+    if (rc)
+        return rc == TSDB_ERR_AUTH || rc == TSDB_ERR_INVALID ? TSDB_ERR_AUTH : rc;
+    /* server-final-message: v=<ServerSignature>; an e= (or anything else) fails */
+    const char *v = reply_msg(b, n, &sl);
+    uint8_t got[33];
+    size_t gl;
+    if (!v || sl < 2 || memcmp(v, "v=", 2) != 0 || tsdb_base64_decode(v + 2, sl - 2, got, sizeof got, &gl) != 0 ||
+        gl != 32 || !tsdb_ct_equal(got, ssig, 32))
+        return TSDB_ERR_AUTH;
+    return 0;
+}
+
+/* After HELLO: logs in when the server asks for it, refuses a server that does not when the caller requires it. */
+static int login(tsdbc *c, const tsdbc_options *o)
+{
+    bool wants = c->hello_flags & TSDB_HELLO_AUTH;
+    if (!wants) {
+        if (!o->require_auth)
+            return 0; /* --no-auth: credentials, if any, are not needed */
+        fprintf(stderr, "tsdbc: tsdbd does not ask for a login (--no-auth) and this client requires one\n");
+        return TSDB_ERR_AUTH;
+    }
+    if (!o->user) {
+        fprintf(stderr, "tsdbc: tsdbd requires a login: give a user and a password\n");
+        return TSDB_ERR_AUTH;
+    }
+    if (!c->scram)
+        return TSDB_ERR_AUTH; /* no mechanism this client speaks */
+    char buf[1024];
+    const char *pw = o->password;
+    if (!pw) {
+        int rc = read_password_file(o->password_file, buf, sizeof buf);
+        if (rc) {
+            fprintf(stderr, "tsdbc: %s: %s\n", o->password_file,
+                    rc == TSDB_ERR_IO ? strerror(errno) : "no password in it (or a line over 1023 bytes)");
+            return TSDB_ERR_INVALID;
+        }
+        pw = buf;
+    }
+    int rc = scram(c, o->user, pw);
+    tsdb_wipe(buf, sizeof buf);
+    return rc;
+}
+
+/* ------------------------------------------------------- users, grants */
+
+static void put_name16(uint8_t *p, const char *s, size_t n)
+{
+    uint16_t l = (uint16_t)n;
+    memcpy(p, &l, 2);
+    memcpy(p + 2, s, n);
+}
+
+/* u16 len, name and what follows it, sent as one request with no reply body. */
+static int user_call(tsdbc *c, uint8_t op, const char *name, const void *rest, size_t rest_len)
+{
+    size_t nl = strlen(name);
+    if (!nl || nl > 0xffff)
+        return TSDB_ERR_INVALID;
+    uint8_t *p = malloc(2 + nl + rest_len);
+    if (!p)
+        return TSDB_ERR_NOMEM;
+    put_name16(p, name, nl);
+    if (rest_len)
+        memcpy(p + 2 + nl, rest, rest_len);
+    int rc = call(c, op, p, 2 + nl + rest_len, NULL, 0, NULL, NULL);
+    tsdb_wipe(p, 2 + nl + rest_len);
+    free(p);
+    return rc;
+}
+
+/* The verifier of a password with a fresh salt: u32 iterations, u8 salt_len, salt, StoredKey, ServerKey (A18). */
+static int verifier(const char *password, uint32_t iterations, uint8_t *out, size_t *len)
+{
+    if (!password || !password[0])
+        return TSDB_ERR_INVALID;
+    uint32_t it = iterations ? iterations : SCRAM_ITER_MIN;
+    if (it < SCRAM_ITER_MIN || it > SCRAM_ITER_MAX)
+        return TSDB_ERR_INVALID;
+    uint8_t salt[16];
+    if (tsdb_random(salt, sizeof salt) != 0)
+        return TSDB_ERR_IO;
+    memcpy(out, &it, 4);
+    out[4] = sizeof salt;
+    memcpy(out + 5, salt, sizeof salt);
+    tsdb_scram_keys(password, strlen(password), salt, sizeof salt, it, NULL, out + 5 + sizeof salt,
+                    out + 5 + sizeof salt + 32);
+    *len = 5 + sizeof salt + 64;
+    return 0;
+}
+
+int tsdbc_user_create(tsdbc *c, const char *name, const char *password, uint32_t iterations, uint8_t flags)
+{
+    uint8_t v[1 + 5 + 16 + 64];
+    size_t vl;
+    int rc = verifier(password, iterations, v + 1, &vl);
+    if (rc)
+        return rc;
+    v[0] = flags;
+    rc = user_call(c, TSDB_OP_USER_CREATE, name, v, 1 + vl);
+    tsdb_wipe(v, sizeof v);
+    return rc;
+}
+
+int tsdbc_user_password(tsdbc *c, const char *name, const char *password, uint32_t iterations)
+{
+    uint8_t v[5 + 16 + 64];
+    size_t vl;
+    int rc = verifier(password, iterations, v, &vl);
+    if (rc == 0)
+        rc = user_call(c, TSDB_OP_USER_PASSWORD, name, v, vl);
+    tsdb_wipe(v, sizeof v);
+    return rc;
+}
+
+int tsdbc_user_drop(tsdbc *c, const char *name) { return user_call(c, TSDB_OP_USER_DROP, name, NULL, 0); }
+
+int tsdbc_user_alter(tsdbc *c, const char *name, uint8_t flags)
+{
+    return user_call(c, TSDB_OP_USER_ALTER, name, &flags, 1);
+}
+
+static int grant_call(tsdbc *c, uint8_t op, const char *name, uint8_t kind, const char *selector, uint8_t rights)
+{
+    size_t sl = selector ? strlen(selector) : 0;
+    if (sl > 0xffff)
+        return TSDB_ERR_INVALID;
+    uint8_t *g = malloc(4 + sl);
+    if (!g)
+        return TSDB_ERR_NOMEM;
+    g[0] = kind, g[1] = rights;
+    put_name16(g + 2, selector ? selector : "", sl);
+    int rc = user_call(c, op, name, g, 4 + sl);
+    free(g);
+    return rc;
+}
+
+int tsdbc_grant(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights)
+{
+    return grant_call(c, TSDB_OP_GRANT, name, kind, selector, rights);
+}
+
+int tsdbc_revoke(tsdbc *c, const char *name, uint8_t kind, const char *selector, uint8_t rights)
+{
+    return grant_call(c, TSDB_OP_REVOKE, name, kind, selector, rights);
+}
+
+void tsdbc_users_free(tsdbc_user *u, size_t n)
+{
+    for (size_t i = 0; u && i < n; i++) {
+        for (uint32_t j = 0; j < u[i].ngrants; j++)
+            free(u[i].grants[j].selector);
+        free(u[i].grants);
+        free(u[i].name);
+    }
+    free(u);
+}
+
+static char *dup_bytes(const uint8_t *p, size_t n)
+{
+    char *s = malloc(n + 1);
+    if (s) {
+        memcpy(s, p, n);
+        s[n] = '\0';
+    }
+    return s;
+}
+
+/* One user at p (u16 len, name, u8 flags, u32 g, g x (u8 kind, u8 rights, u16 len, selector)); the bytes after it,
+ * NULL when malformed (CORRUPT) or out of memory (*nomem). */
+static const uint8_t *read_user(const uint8_t *p, const uint8_t *end, tsdbc_user *u, bool *nomem)
+{
+    uint16_t l;
+    uint32_t g;
+    memset(u, 0, sizeof *u);
+    if (end - p < 2 || (memcpy(&l, p, 2), end - p < 2 + l + 5))
+        return NULL;
+    if (!(u->name = dup_bytes(p + 2, l)))
+        return *nomem = true, NULL;
+    p += 2 + l;
+    u->flags = p[0];
+    memcpy(&g, p + 1, 4);
+    p += 5;
+    if ((size_t)(end - p) / 4 < g)
+        return NULL;
+    if (g && !(u->grants = calloc(g, sizeof *u->grants)))
+        return *nomem = true, NULL;
+    for (; u->ngrants < g; u->ngrants++) {
+        tsdbc_user_grant *x = &u->grants[u->ngrants];
+        if (end - p < 4 || (memcpy(&l, p + 2, 2), end - p - 4 < l))
+            return NULL;
+        x->kind = p[0], x->rights = p[1];
+        if (!(x->selector = dup_bytes(p + 4, l)))
+            return *nomem = true, NULL;
+        p += 4 + l;
+    }
+    return p;
+}
+
+int tsdbc_whoami(tsdbc *c, tsdbc_user **out)
+{
+    *out = NULL;
+    const uint8_t *b;
+    size_t n;
+    int rc = call(c, TSDB_OP_WHOAMI, NULL, 0, NULL, 0, &b, &n);
+    if (rc)
+        return rc;
+    tsdbc_user *u = calloc(1, sizeof *u);
+    bool nomem = false;
+    if (!u)
+        return TSDB_ERR_NOMEM;
+    if (read_user(b, b + n, u, &nomem) != b + n) {
+        tsdbc_users_free(u, 1);
+        return nomem ? TSDB_ERR_NOMEM : TSDB_ERR_CORRUPT;
+    }
+    *out = u;
+    return 0;
+}
+
+int tsdbc_user_list(tsdbc *c, tsdbc_user **out, size_t *nout)
+{
+    *out = NULL;
+    *nout = 0;
+    int rc = tsdbc_wait(c);
+    if (rc || (rc = send_req(c, TSDB_OP_USER_LIST, NULL, 0, NULL, 0, NULL, 0, NULL, 0)) != 0)
+        return rc;
+    tsdbc_user *u = NULL;
+    size_t nu = 0, cap = 0;
+    for (;;) {
+        int32_t st;
+        const uint8_t *b;
+        size_t len;
+        if ((rc = read_reply(c, &st, &b, &len)) != 0)
+            break;
+        if (st) {
+            rc = st;
+            break;
+        }
+        uint32_t k;
+        if (len < 5 || b[0] > 1) {
+            c->broken = true;
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        bool last = b[0];
+        memcpy(&k, b + 1, 4);
+        const uint8_t *p = b + 5, *end = b + len;
+        if ((size_t)(end - p) / 7 < k) {
+            c->broken = true;
+            rc = TSDB_ERR_CORRUPT;
+            break;
+        }
+        if (nu + k > cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            while (nc < nu + k)
+                nc *= 2;
+            tsdbc_user *q = realloc(u, nc * sizeof *u);
+            if (!q) {
+                rc = TSDB_ERR_NOMEM;
+                c->broken = !last; /* the rest of the stream stays unread */
+                break;
+            }
+            u = q, cap = nc;
+        }
+        bool nomem = false;
+        for (uint32_t i = 0; i < k && p; i++, nu++)
+            p = read_user(p, end, &u[nu], &nomem);
+        if (p != end) { /* nu counts the one read_user left half made: freed with the others */
+            c->broken = nomem ? !last : true;
+            rc = nomem ? TSDB_ERR_NOMEM : TSDB_ERR_CORRUPT;
+            break;
+        }
+        if (last)
+            break;
+        stream_more(c);
+    }
+    if (rc) {
+        tsdbc_users_free(u, nu);
+        return rc;
+    }
+    *out = u;
+    *nout = nu;
+    return 0;
+}
 
 /* Whether inserts go packed: compression on. */
 static bool packing(tsdbc *c) { return c->zlevel != 0; }

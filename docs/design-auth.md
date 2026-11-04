@@ -72,6 +72,8 @@ tenant admins are in 0.9; state names shared within a volume are accepted and do
 | A25 | **Inside-rules for globs are conservative.** The literal prefix L of a glob is its bytes before the first wildcard; every name it matches starts with L. Glob S is inside `all`; inside `prefix:P` when L starts with P; inside glob T only when S equals T byte for byte. `name:N` is inside glob T when T matches N. `prefix:P` is never inside a glob. | Deciding inclusion between two globs; prefixes inside globs such as `a?c*` | Each rule is sound and one line of code. Whether one glob's set lies inside another's is a language-inclusion problem; a prefix is an infinite set, and the cases where a glob covers all of it are rare enough not to be worth a proof. An admin holding only glob `admin` grants can therefore pass on that glob and single names, not prefixes, and cannot create users (that needs `admin` on a prefix or `all`). |
 | A26 | **State names are shared within a volume, accepted for 0.9** (decided on 2026-11-04): SECURITY.md says so and the operations docs advise a volume per tenant where state labels are sensitive. | Per-series state dictionaries | They would change the disk format and the STATE ops before the release, for labels such as `RUNNING`. |
 | A27 | **A before-and-after benchmark closes the work** (the user's request): `tools/auth-bench.sh` runs main at 3bd4e96 against the auth build with `--no-auth` and with login, on a quiet machine, repeated, and its results go into BENCHMARKS.md (§9). | Only the perf gate of step 2 | The gate catches a regression during the work; the user wants a number to publish, rerunnable on other machines. |
+| A28 | **`--no-auth` refuses the user admin ops** (decided on 2026-11-04, step 2). Without login, connections need no login and every data op runs unchecked, but USER_CREATE, USER_DROP, USER_ALTER, USER_PASSWORD, GRANT, REVOKE and USER_LIST are answered TSDB_ERR_DENIED (a log line at most once a second); USERS is not opened. Users are managed with the offline `tsdb <dir> user` verbs. WHOAMI answers an empty name with the superuser flag. | Admin ops act as the operator (actor 0) on USERS | A server run without login for a while must not let any network client plant a superuser in USERS that stays valid once login is on (fail closed, as A13). |
+| A29 | **A reload that shows no superuser keeps serving** (step 2, the question step 1 left). Logged-in users keep their grants, admin ops follow users.c's rules (only a superuser could create one again, so none can until the CLI adds one), one log line per change into that state; the next start refuses (A13). | Stop the server | A CLI slip (dropping or demoting the last superuser) must not take a production server down; nothing is opened that was closed, and the restart fails closed. |
 
 ## 1. Threat model and scope
 
@@ -341,7 +343,8 @@ The perf gate measures the end-to-end numbers: tsdbc-bench insert and query with
 
 - Default: login required (A13). `tsdbd` refuses to start without a superuser in USERS, with the message
   `no superuser: run 'tsdb <dir> user add NAME --superuser', or start with --no-auth`.
-- `--no-auth`: today's behaviour, a warning line at start, the HELLO flag clear.
+- `--no-auth`: today's behaviour for data ops, a warning line at start, the HELLO flag clear; the user admin ops
+  are refused (A28).
 - `--login-timeout S` (default 10). The banner says whether login is on and how many users there are.
 - The `There is no authentication` paragraph of tsdbd's header (server/tsdbd.c:77) and its counterpart in the
   memory notes (server/tsdbd.c:74-75) change accordingly.

@@ -21,7 +21,7 @@ esac
 run() { # NAME [FLAGS]: starts tsdbd on $base/NAME, waits until it serves, stops it; the log is $base/NAME.log
     local n=$1
     shift
-    "$B/tsdbd" --dir "$base/$n" --port 0 --port-file "$base/$n.port" "$@" > "$base/$n.log" 2>&1 &
+    "$B/tsdbd" --dir "$base/$n" --no-auth --port 0 --port-file "$base/$n.port" "$@" > "$base/$n.log" 2>&1 &
     pid=$!
     for _ in $(seq 100); do [ -s "$base/$n.port" ] && break; kill -0 "$pid" 2> /dev/null || break; sleep 0.1; done
     [ -s "$base/$n.port" ] || fail "tsdbd did not serve: $(cat "$base/$n.log")"

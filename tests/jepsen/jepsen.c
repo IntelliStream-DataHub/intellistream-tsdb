@@ -370,8 +370,8 @@ static void start_server(bool faulty)
                     dup2(lfd, 2);
             }
             const char *av[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
-                                  "--wal-max-batch-rows", "500", "--partition-ms", pms};
-            int ac = 13;
+                                  "--wal-max-batch-rows", "500", "--partition-ms", pms, "--no-auth"};
+            int ac = 14;
             if (classes) {
                 av[ac++] = "--granule-rows", av[ac++] = CL_STR(CL_GRANULE_ROWS);
                 av[ac++] = "--merge-idle-s", av[ac++] = "1";
@@ -468,7 +468,7 @@ static void start_follower(void)
         if (log >= 0)
             dup2(log, 2);
         execl(tsdbd_path(), "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--follow",
-              getenv("TSDBD_IO") ? "--io" : NULL, getenv("TSDBD_IO"), (char *)NULL);
+              "--no-auth", getenv("TSDBD_IO") ? "--io" : NULL, getenv("TSDBD_IO"), (char *)NULL);
         _exit(127);
     }
     atomic_store(&follower_pid, pid);

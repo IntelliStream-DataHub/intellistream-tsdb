@@ -69,7 +69,7 @@ URL=pulsar://127.0.0.1:$BP
 start_tsdbd() {
     local pf="$W/tsdbd.port" want=${TP:-0} port pid
     rm -f "$pf"
-    "$ROOT/build/tsdbd" --dir "$W/data" --listen 127.0.0.1 --port "$want" --port-file "$pf" --workers 2 \
+    "$ROOT/build/tsdbd" --dir "$W/data" --listen 127.0.0.1 --port "$want" --port-file "$pf" --workers 2 --no-auth \
         >> "$W/tsdbd.log" 2>&1 &
     TSDBD_PID=$!
     for _ in $(seq 600); do

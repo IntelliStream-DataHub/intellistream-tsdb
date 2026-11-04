@@ -28,7 +28,8 @@ class Server:
         self.dir = pathlib.Path(dir) if dir else own / "db"
         pf = own / "port"
         self.proc = subprocess.Popen(
-            [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4"],
+            [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4",
+             "--no-auth"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

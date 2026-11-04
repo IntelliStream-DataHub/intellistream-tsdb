@@ -53,7 +53,8 @@ struct fake {
 static bool read_req(int fd, uint32_t *id, uint8_t *op, uint8_t *body, size_t cap, size_t *blen);
 static void reply(int fd, uint32_t id, int32_t status, const void *body, size_t n);
 
-/* The client says HELLO at connect (protocol 11): the fake answers it with its own version, then runs the script. */
+/* The client says HELLO at connect: the fake answers it with its own version and no login (protocol 12: u16 flags,
+ * u16 mechanisms), then runs the script. */
 static void *fake_main(void *arg)
 {
     struct fake *f = arg;
@@ -61,9 +62,11 @@ static void *fake_main(void *arg)
     if (fd >= 0) {
         uint8_t body[16], op;
         uint32_t id, v = TSDB_PROTOCOL_VERSION;
+        uint8_t h[8] = {0};
+        memcpy(h, &v, 4);
         size_t n;
         if (read_req(fd, &id, &op, body, sizeof body, &n) && op == TSDB_OP_HELLO) {
-            reply(fd, id, 0, &v, 4);
+            reply(fd, id, 0, h, sizeof h);
             f->script(fd);
         }
         close(fd);

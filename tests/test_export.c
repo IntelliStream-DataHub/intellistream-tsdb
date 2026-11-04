@@ -2014,7 +2014,7 @@ static void test_old_format(void)
         printf("  no %s: the server's refusal not checked\n", tsdbd);
     } else {
         /* the timeout only matters if tsdbd wrongly serves: it must exit before it writes the port file */
-        CHECK(sh("timeout 30 '%s' --dir '%s' --port 0 --port-file '%s' >/dev/null 2>%s", tsdbd, dir,
+        CHECK(sh("timeout 30 '%s' --dir '%s' --no-auth --port 0 --port-file '%s' >/dev/null 2>%s", tsdbd, dir,
                  path("format7.port"), errfile) == 1);
         for (int i = 0; i < 3; i++)
             CHECK(err_has(want[i]));

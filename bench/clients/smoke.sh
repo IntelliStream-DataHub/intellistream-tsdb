@@ -30,7 +30,7 @@ moved[100] = (moved[100][0], moved[100][1] + 500, moved[100][2])         # one r
 write("moved.rb", moved)
 PY
 mkdir -p "$W/neg"
-"$B/tsdbd" --dir "$W/neg/srv" --port 0 --port-file "$W/neg.port" >"$W/neg.log" 2>&1 &
+"$B/tsdbd" --dir "$W/neg/srv" --no-auth --port 0 --port-file "$W/neg.port" >"$W/neg.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT
 for _ in $(seq 100); do [ -s "$W/neg.port" ] && break; kill -0 $pid; sleep 0.1; done

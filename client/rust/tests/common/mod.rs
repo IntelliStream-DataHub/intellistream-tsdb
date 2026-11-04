@@ -61,7 +61,7 @@ impl Server {
             .arg(&dir)
             .args(["--port", "0", "--port-file"])
             .arg(&pf)
-            .args(["--no-fsync", "--workers", "4"])
+            .args(["--no-fsync", "--workers", "4", "--no-auth"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

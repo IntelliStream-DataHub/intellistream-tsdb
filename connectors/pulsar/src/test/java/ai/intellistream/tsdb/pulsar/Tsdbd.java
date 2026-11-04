@@ -84,7 +84,8 @@ final class Tsdbd implements AutoCloseable {
         Path portFile = dir.resolveSibling(dir.getFileName() + ".port");
         Files.deleteIfExists(portFile);
         List<String> cmd = new ArrayList<>(List.of(bin.toString(), "--dir", dir.toString(), "--listen", "127.0.0.1",
-                "--port", Integer.toString(port), "--port-file", portFile.toString(), "--workers", "2"));
+                "--port", Integer.toString(port), "--port-file", portFile.toString(), "--workers", "2",
+                "--no-auth"));
         cmd.addAll(List.of(options));
         Process p = new ProcessBuilder(cmd)
                 .redirectErrorStream(true)

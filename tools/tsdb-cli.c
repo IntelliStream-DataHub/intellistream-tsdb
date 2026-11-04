@@ -668,6 +668,9 @@ int main(int argc, char **argv)
     }
     if (argc < 3)
         usage();
+    for (int i = 3; strcmp(argv[1], "user") == 0 && i < argc; i++)
+        if (strcmp(argv[i], "--server") == 0) /* `tsdb user VERB ... --server HOST:PORT`: no directory */
+            return user_main(NULL, argc - 2, argv + 2);
     const char *dir = argv[1], *cmd = argv[2];
     if (strcmp(cmd, "volume") == 0 && argc == 5 && strcmp(argv[3], "add") == 0) {
         /* without opening the database: a running tsdbd holds its lock, and opens the volume when a

@@ -88,8 +88,9 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
             setenv("CRASHFS_EIO_ONLY", "wal_", 1);
             setenv("CRASHFS_MARK", eio_mark, 1);
         }
-        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-fsync"};
-        int n = eio_mark ? 9 : 10; /* under the shim, syncs are what make data survive its rollback at exit */
+        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-auth",
+                                "--no-fsync"};
+        int n = eio_mark ? 10 : 11; /* under the shim, syncs are what make data survive its rollback at exit */
         if (getenv("TSDBD_IO")) { /* the event loop backend: make test runs uring and epoll */
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
@@ -256,11 +257,17 @@ static void test_hello(void)
     for (uint32_t i = 0; i < 3; i++) {
         raw_send(fd, 70 + i, TSDB_OP_HELLO, i < 2 ? &asks[i] : NULL, i < 2 ? 4 : 0); /* the last: no version */
         uint32_t rid, v = 0;
-        uint8_t rest[16];
+        uint8_t rest[64];
         size_t nrest = 0;
-        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 70 + i && nrest == 4);
+        CHECK(raw_reply(fd, &rid, rest, sizeof rest, &nrest) == 0 && rid == 70 + i);
         memcpy(&v, rest, 4);
         CHECK(v == TSDB_PROTOCOL_VERSION);
+        /* version 12: u16 flags (no login: --no-auth), u16 n, n x (u8 len, mechanism) */
+        const size_t ml = strlen(TSDB_SCRAM_SHA256);
+        uint16_t flags = 1, nm = 0;
+        memcpy(&flags, rest + 4, 2);
+        memcpy(&nm, rest + 6, 2);
+        CHECK(nrest == 9 + ml && flags == 0 && nm == 1 && rest[8] == ml && memcmp(rest + 9, TSDB_SCRAM_SHA256, ml) == 0);
     }
     close(fd);
     const uint32_t old[] = {TSDB_PROTOCOL_MIN - 1, 1, 0};
@@ -2209,15 +2216,11 @@ static void check_ops_named(const mset *m)
     char line[256];
     int seen = 0;
     while (fgets(line, sizeof line, f)) {
-        char name[64];
+        char name[64], want[64];
         int num;
-        if (sscanf(line, " TSDB_OP_%63[A-Z_] = %d", name, &num) != 2 || strcmp(name, "REPLY") == 0)
+        /* the request ops are the TSDB_OPS X-macro's rows: X(NAME, number, metric name) */
+        if (sscanf(line, " X(%63[A-Z_], %d, %63[a-z_])", name, &num, want) != 3)
             continue;
-        char want[96];
-        size_t k = 0;
-        for (const char *q = name; *q && k < 60; q++)
-            want[k++] = (char)(*q >= 'A' && *q <= 'Z' ? *q - 'A' + 'a' : *q);
-        want[k] = 0;
         char lab[128];
         snprintf(lab, sizeof lab, "op=\"%s\"", want);
         double v = mval(m, "tsdb_requests_total", lab);
@@ -2682,7 +2685,7 @@ static void test_metrics_more(const char *dir)
             int st = system(cmd);
             CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 2);
         }
-        snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --port 0 --metrics-port %d >/dev/null 2>&1", bin, dir,
+        snprintf(cmd, sizeof cmd, "'%s' --dir '%s.bad' --no-auth --port 0 --metrics-port %d >/dev/null 2>&1", bin, dir,
                  mport); /* the port the running server holds */
         int st = system(cmd);
         CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 1);
@@ -2957,7 +2960,8 @@ static void test_hostile(const char *dir)
             snprintf(tmp, sizeof tmp, "%s.tmp.%d", pf, (int)getpid());
             if (symlink(target, tmp) != 0)
                 _exit(126);
-            execl(bin, "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--no-fsync", (char *)NULL);
+            execl(bin, "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--no-fsync", "--no-auth",
+                  (char *)NULL);
             _exit(127);
         }
         int p = th_await(pf, pid, 30000);

@@ -91,9 +91,10 @@ $(B)/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsd
 # export writes the tsdb version and the on-disk format version (not in the public API) into its stream header
 TSDB_FORMAT := $(shell sed -n 's/^\#define FORMAT_VERSION \([0-9]*\).*/\1/p' src/internal.h)
 
-$(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
+$(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c client/tsdb_client.h $(B)/users.o \
+          $(B)/tsdb_crypto.o $(B)/libtsdbclient.a $(LIB)
 	$(CC) $(CFLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -DTSDB_FORMAT_VERSION=$(TSDB_FORMAT) -o $@ $< tools/dump.c \
-	    tools/users-cli.c $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+	    tools/users-cli.c $(B)/users.o $(B)/tsdb_crypto.o $(CLIB) $(LIB) $(LDLIBS)
 
 # login (docs/design-auth.md): the crypto is client code, shared with tsdbd and the CLI; USERS and the grant model
 # are tsdbd's and the CLI's
@@ -456,7 +457,8 @@ fuzz-frames:
 
 CLIB := $(B)/libtsdbclient.a
 
-$(B)/tsdb_client.o: client/tsdb_client.c client/tsdb_client.h include/tsdb_protocol.h include/tsdb.h | $(B)
+$(B)/tsdb_client.o: client/tsdb_client.c client/tsdb_client.h client/tsdb_crypto.h include/tsdb_protocol.h \
+                    include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(B)/tsdb_pack.o: client/tsdb_pack.c client/tsdb_pack.h include/tsdb_protocol.h | $(B)

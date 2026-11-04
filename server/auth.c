@@ -263,17 +263,16 @@ int auth_init(const char *dir, bool on, bool writable, tsdb *db)
 {
     enabled = on;
     sdb = db;
+    if (!on)
+        return 0; /* --no-auth: nothing reads USERS, and the admin ops are refused (auth_check) */
     int rc = users_open(&us, dir, writable);
     if (rc != 0) {
         fprintf(stderr, "tsdbd: %s/USERS: %s\n", dir, tsdb_strerror(rc));
-        if (on)
-            return rc;
-        fprintf(stderr, "tsdbd: --no-auth: serving without USERS; user admin ops are refused\n");
-        return 0;
+        return rc;
     }
     us_open = true;
     us.on_fail = on_users_fail;
-    if (on && users_superusers(&us) == 0) {
+    if (users_superusers(&us) == 0) {
         fprintf(stderr, "tsdbd: no superuser: run 'tsdb %s user add NAME --superuser', or start with --no-auth\n",
                 dir);
         return TSDB_ERR_AUTH;
@@ -671,8 +670,20 @@ int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)
         return e->who == P_ANY || e->who == P_PRE ? 0 : TSDB_ERR_AUTH;
     if (e->who == P_PRE)
         return TSDB_ERR_INVALID; /* AUTH_* after login */
-    if (!a->au)
-        return 0; /* --no-auth: an unknown op gets the handler's INVALID, as before login existed */
+    if (!a->au) {
+        /* --no-auth: data ops run unchecked (an unknown op gets the handler's INVALID, as before login existed),
+         * but USERS is not changed or listed over the network: a server run without login for a while must not
+         * let any client plant a superuser that stays valid once login is on (A13, fail closed). The offline
+         * 'tsdb <dir> user' verbs manage users then. */
+        if (e->who != P_ADMIN)
+            return 0;
+        static _Atomic time_t last;
+        time_t t = time(NULL);
+        if (atomic_exchange_explicit(&last, t, memory_order_relaxed) != t)
+            fprintf(stderr, "tsdbd: --no-auth: user admin op %u refused; manage users with 'tsdb <dir> user'\n",
+                    op);
+        return TSDB_ERR_DENIED;
+    }
     if (e->who == P_NONE)
         return TSDB_ERR_DENIED;
     auth_user *au = a->au;
@@ -794,7 +805,6 @@ int auth_admin(auth_conn *a, uint8_t op, const uint8_t *p, size_t len, uint8_t *
     const uint8_t *end = p + len;
     char name[USER_NAME_MAX + 1];
     user_verifier v;
-    uint32_t actor = a->au ? a->au->uid : 0; /* --no-auth: every client is the operator, as before login existed */
     int rc;
     if (op == TSDB_OP_WHOAMI) {
         if (len != 0)
@@ -813,6 +823,9 @@ int auth_admin(auth_conn *a, uint8_t op, const uint8_t *p, size_t len, uint8_t *
         *out = b.p, *out_len = b.len;
         return 0;
     }
+    if (!a->au)
+        return TSDB_ERR_DENIED; /* --no-auth: never actor 0 over the network (auth_check refuses first) */
+    uint32_t actor = a->au->uid;
     const uint8_t *q = get_name(p, end, name);
     if (!q)
         return TSDB_ERR_INVALID;
@@ -865,11 +878,13 @@ int auth_user_list(auth_conn *a, int (*emit)(void *ctx, bool last, uint32_t n, c
     uint32_t *ends = NULL, n = 0;
     int rc = 0;
     pthread_mutex_lock(&auth_mu);
-    if (!us_open) {
+    if (!a->au) {
+        rc = TSDB_ERR_DENIED; /* --no-auth (auth_check refuses first) */
+    } else if (!us_open) {
         rc = TSDB_ERR_CORRUPT;
     } else {
-        const user *x = a->au ? users_by_uid(&us, a->au->uid) : NULL;
-        if (a->au && !x) {
+        const user *x = users_by_uid(&us, a->au->uid);
+        if (!x) {
             rc = TSDB_ERR_AUTH;
         } else if (!(ends = malloc(((size_t)us.n + 1) * sizeof *ends))) {
             rc = TSDB_ERR_NOMEM;

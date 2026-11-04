@@ -52,7 +52,7 @@ final class TsdbServer implements AutoCloseable {
         Path portFile = dir.resolveSibling(dir.getFileName() + ".port");
         Files.deleteIfExists(portFile);
         Process p = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", "0", "--port-file",
-                portFile.toString(), "--no-fsync", "--workers", "4")
+                portFile.toString(), "--no-fsync", "--workers", "4", "--no-auth")
                 .redirectErrorStream(true)
                 .redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()))
                 .start();

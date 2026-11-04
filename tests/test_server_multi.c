@@ -68,8 +68,9 @@ static pid_t start_server(const char *dir, const char *const *extra)
          * it inherited, a caller's `flock -s` lock among them, and held one shared for hours. */
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent)
             _exit(127);
-        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-fsync"};
-        int n = 10;
+        const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-fsync",
+                                "--no-auth"};
+        int n = 11;
         if (getenv("TSDBD_IO")) {
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
