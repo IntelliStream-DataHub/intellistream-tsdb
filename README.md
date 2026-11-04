@@ -16,12 +16,12 @@ of ClickHouse's storage design and adding ALP-style compression for the sensor
 values? tsdb is the result. We built it to:
 
 - **store that data for less money**: tsdb shrinks it to about a tenth of its
-  raw size, and needs less than half the disk ClickHouse needs for the same
-  data (the median over 31 data sets we test with);
+  raw size, and ClickHouse needs 2.9 times as much disk for the same data (the
+  median over 31 data sets we test with);
 - **cost less to run** than a ClickHouse cluster: one small program that works
   well with its defaults, and no cluster to look after;
 - **answer time series questions faster**: "the 5-minute averages of this
-  sensor yesterday" takes 0.09 ms, 35 times faster than ClickHouse.
+  sensor yesterday" takes 0.09 ms, 34 times faster than ClickHouse.
 
 We compared it with ClickHouse, InfluxDB, VictoriaMetrics, QuestDB, TimescaleDB
 and others on the same machine and the same data; the numbers are below.
@@ -86,177 +86,180 @@ performance optimizations for different CPU architectures.
 
 ## How it compares
 
-**New measurements for 0.9.0 are coming.** The first results (tsdb against
-ClickHouse and VictoriaMetrics, 100 billion rows against ClickHouse,
-time-weighted averages, memory use, and size on disk against 13 systems) are in
-[bench/dbcmp/results/0.9.0-interim.md](bench/dbcmp/results/0.9.0-interim.md).
-The tables below are from the earlier measurement; they will be replaced when
-the rest is in. InfluxDB 2's new load and query times are in
-[bench/dbcmp/results/0.9.0-interim-tables.md](bench/dbcmp/results/0.9.0-interim-tables.md)
-and in the section about InfluxDB 2 below.
+We measured tsdb 0.9.0 against ClickHouse, InfluxDB 2 and 3, VictoriaMetrics, QuestDB, TimescaleDB, IoTDB,
+TDengine, Prometheus, DuckDB and chDB on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a time,
+with the same data: 100 sensors with 1 million readings each, 100 million readings in all. Every server got the
+same memory limit of 48 GB (InfluxDB 2 got 24 GB and used at most 8.3 GB). Every answer was checked
+against tsdb's before it was timed, and every timing was repeated 5 times. The times below are the median time of
+one request. tsdb ran as a server, over TCP.
 
-Queries that tsdb answers from its stored statistics alone (such as a count
-over all the data) are left out, because they measure a lookup, not reading
-data.
+We left out the questions that tsdb answers from the summaries it stores, such as a count over all the data:
+they measure a lookup, not reading data. Every question below reads the data. A day is 86,400 readings, a week
+604,800.
 
-**Where tsdb is furthest ahead of ClickHouse** (100 million readings: 100
-sensors x 1 million readings, the same rows in both; median time of one
-request, tsdb through its server over TCP, one client; a day is 86,400
-readings, a week 604,800):
+All the numbers, and how each system was set up, are in
+[bench/dbcmp/results/0.9.0.md](bench/dbcmp/results/0.9.0.md). Every single measurement is in
+[bench/dbcmp/results/0.9.0-tables.md](bench/dbcmp/results/0.9.0-tables.md).
+
+**Where tsdb is furthest ahead of ClickHouse** (one client):
 
 | question | tsdb | ClickHouse | ClickHouse takes |
 |---|---:|---:|---:|
-| one day of 100 sensors, in 288 buckets each | **1.3 ms** | 125 ms | 96x longer |
-| one week of 100 sensors, in 168 buckets each | **4.9 ms** | 274 ms | 56x longer |
-| one week of one sensor, in 168 buckets | **0.12 ms** | 5.6 ms | 47x longer |
+| one day of 100 sensors, in 288 buckets each | **1.29 ms** | 125 ms | 97x longer |
+| one week of 100 sensors, in 168 buckets each | **4.89 ms** | 274 ms | 56x longer |
+| one week of one sensor, in 168 buckets | **0.125 ms** | 5.60 ms | 45x longer |
+| one day of one sensor, in 288 buckets | **0.090 ms** | 3.09 ms | 34x longer |
 
-Every query here reads the data: the buckets are smaller than the blocks of
-8192 readings tsdb keeps statistics for, so tsdb unpacks the blocks they cut.
-The gap is largest when one request names many sensors: tsdb answers all 100
-in one go. Interim numbers from
-[bench/dbcmp/results/0.9.0-interim.md](bench/dbcmp/results/0.9.0-interim.md).
+The buckets are smaller than the blocks of 8192 readings tsdb keeps summaries for, so tsdb unpacks the blocks
+they cut. The gap is largest when one request names many sensors: tsdb answers all 100 in one go.
 
 **tsdb against InfluxDB 2.** InfluxDB is the most popular time series database: number 1 in the
 [DB-Engines ranking](https://db-engines.com/en/ranking/time+series+dbms) (November 2026, with about twice the score of
-number 2, Prometheus). InfluxDB 2 remains one of its most widely deployed versions. The same machine and the same data: 100 sensors,
-1 million readings each. InfluxDB 2.7.12 ran in Podman with its default
-settings, except that it was told to compact old data after one minute without
-writes, so that its background work ends sooner. Like tsdb, it syncs a write to
-disk before it answers. InfluxDB 2
-has two query languages, InfluxQL and Flux. For every question below, the
-InfluxDB 2 time is the faster of the two (neither is faster on all questions).
-Every answer was checked against tsdb's before it was timed. These are interim
-numbers: more is coming, for example time-weighted averages for InfluxDB 2.
+number 2, Prometheus). InfluxDB 2 remains one of its most widely deployed versions. InfluxDB 2.7.12 ran with its
+default settings, except that it was told to compact old data after one minute without writes, so that its
+background work ends sooner. Like tsdb, it syncs a write to disk before it answers. InfluxDB 2 has two query
+languages, InfluxQL and Flux. For every question below, the InfluxDB 2 time is the faster of the two (neither is
+faster on all questions).
 
-*Size on disk.* Bytes per reading over 31 data sets (8 made-up sensor kinds and
-23 real sensors from a hydraulic test rig). Each size compared to tsdb's
-(tsdb = 1x):
+*Size on disk.* Bytes per reading over 31 data sets (8 made-up sensor kinds and 23 real sensors from a hydraulic
+test rig). Each size compared to tsdb's (tsdb = 1x):
 
 | | smallest | largest | median |
 |---|---:|---:|---:|
 | **tsdb** | **1x** | **1x** | **1x** |
 | InfluxDB 2 | 5.2x | 400x | 20.4x |
 
-tsdb is smaller on all 31 data sets. At its best, InfluxDB 2 needs 4.8 bytes
-per reading where tsdb needs 0.93. At its worst it needs 256 bytes where tsdb
-needs 0.64.
+tsdb is smaller on all 31 data sets. At its best, InfluxDB 2 needs 4.8 bytes per reading where tsdb needs 0.93. At
+its worst it needs 256 bytes where tsdb needs 0.64.
 
-*Speed.* The 100 million readings, median time of one request, tsdb through its
-server over TCP. "Clients" is how many connections ask at the same time. A
-request for 100 sensors names all of them. A day is 86,400 readings, a week is
-604,800. tsdb loaded with 4 connections, InfluxDB 2 with 8.
+*Speed.* "Clients" is how many connections ask at the same time. A request for 100 sensors names all of them.
 
 | question | clients | tsdb | InfluxDB 2 | InfluxDB 2 takes |
 |---|---:|---:|---:|---:|
-| load 100 million readings | | **1.08 s** | 27.9 s | 26x longer |
-| wait after the load until background work is done | | **0.02 s** | 664 s | |
-| whole history of 100 sensors, in buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s | 280x longer |
-| the same in buckets of 60 readings (1.67 million buckets) | 1 | **67 ms** | 6.85 s | 103x longer |
-| one day of one sensor, in 288 buckets | 1 | **0.089 ms** | 5.0 ms | 57x longer |
-| | 32 | **0.45 ms** | 33.6 ms | 75x longer |
-| one day of 100 sensors | 1 | **1.3 ms** | 293 ms | 230x longer |
-| | 32 | **28.5 ms** | 3.34 s | 120x longer |
-| one week of one sensor, in 168 buckets | 1 | **0.12 ms** | 8.4 ms | 70x longer |
-| | 32 | **1.4 ms** | 79.7 ms | 55x longer |
-| one week of 100 sensors | 1 | **4.9 ms** | 348 ms | 71x longer |
+| whole history of 100 sensors, in buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s | 284x longer |
+| the same in buckets of 60 readings (1.67 million buckets) | 1 | **65.6 ms** | 6.85 s | 104x longer |
+| one day of one sensor, in 288 buckets | 1 | **0.090 ms** | 5.04 ms | 56x longer |
+| | 32 | **0.47 ms** | 33.6 ms | 72x longer |
+| one day of 100 sensors | 1 | **1.29 ms** | 293 ms | 227x longer |
+| | 32 | **28.6 ms** | 3.34 s | 117x longer |
+| one week of one sensor, in 168 buckets | 1 | **0.125 ms** | 8.43 ms | 67x longer |
+| | 32 | **1.45 ms** | 79.7 ms | 55x longer |
+| one week of 100 sensors | 1 | **4.89 ms** | 348 ms | 71x longer |
 | | 32 | **137 ms** | 9.04 s | 66x longer |
-| 3,600 raw readings of one sensor | 1 | **0.043 ms** | 2.2 ms | 52x longer |
-| | 32 | **0.35 ms** | 6.7 ms | 20x longer |
-| 3,600 raw readings of each of 100 sensors | 1 | **1.2 ms** | 207 ms | 170x longer |
-| | 32 | **25.9 ms** | 648 ms | 25x longer |
-| one reading | 1 | **0.031 ms** | 0.29 ms | 9.4x longer |
-| | 32 | **0.23 ms** | 0.83 ms | 3.6x longer |
+| 3,600 raw readings of one sensor | 1 | **0.044 ms** | 2.23 ms | 51x longer |
+| | 32 | **0.34 ms** | 6.74 ms | 20x longer |
+| 3,600 raw readings of each of 100 sensors | 1 | **1.22 ms** | 207 ms | 169x longer |
+| | 32 | **25.8 ms** | 648 ms | 25x longer |
+| one reading | 1 | **0.032 ms** | 0.29 ms | 9.1x longer |
+| | 32 | **0.24 ms** | 0.83 ms | 3.5x longer |
 
-- **Memory:** in these queries tsdb used at most 1.8 GB (1.7 GB without the
-  file cache). InfluxDB 2's memory is not measured yet: more is coming.
-- You can also ask InfluxDB 2 one question per sensor, on 16 connections at
-  once. It then does the whole table in 0.41 s for buckets of 3,600 (tsdb:
-  9.0 ms, 46x faster) and 0.92 s for buckets of 60 (tsdb: 33.5 ms, 27x). Those
-  are the times of the whole pass over all 100 sensors, not of one request.
+- **Memory:** tsdb used at most 2.0 GB (1.9 GB without the file cache). InfluxDB 2 used up to 8.3 GB.
+- **Time-weighted averages:** InfluxDB 2's `timeWeightedAvg` gives other answers than tsdb's in a third of the
+  buckets (it does not carry readings across bucket edges), so it was not timed.
+- **Loading:** we do not show InfluxDB 2's load time. Its five load runs did not report the same steps, and the tool
+  that collects the results flags such numbers.
 
-The gaps of more than 100 times are on requests that name many sensors at once:
-tsdb answers a request for 100 sensors in one go. Every query above reads
-the data in both systems (the buckets of 60, 300 and 3,600 readings are smaller
-than tsdb's blocks of 8192 readings, so tsdb mostly unpacks them). For one sensor the gap is
-smaller: 20 to 75 times for a window, 4 to 9 times for one reading. Numbers from
-[bench/dbcmp/results/0.9.0-interim-tables.md](bench/dbcmp/results/0.9.0-interim-tables.md).
-tsdb's whole-table times are printed in tenths of a millisecond there, so
-those ratios are rounded.
+**tsdb against VictoriaMetrics.** VictoriaMetrics (v1.154.0) is a fast database for monitoring metrics. It
+answers a write from memory and writes it to disk within 5 seconds; tsdb syncs every write to disk first.
 
-100 million sensor readings (100 sensors, 1 million readings each), loaded and
-queried on the same machine (AMD Ryzen 9 7950X, NVMe disk). Two tables: tsdb as
-a library inside your program, and tsdb as a server used through its clients
-over TCP. Each is compared only with systems used the same way.
+| question | tsdb | VictoriaMetrics | VictoriaMetrics takes |
+|---|---:|---:|---:|
+| size on disk (median over the 31 data sets) | **1x** | 2.1x | |
+| load 100 million readings | **1.17 s** | 3.00 s | 2.6x longer |
+| whole history of 100 sensors, in buckets of 3,600 readings | **8.3 ms** | 208 ms | 25x longer |
+| one day of one sensor | **0.090 ms** | 4.95 ms | 55x longer |
+| one week of 100 sensors | **4.89 ms** | 2.40 s | 492x longer |
+| one reading | **0.032 ms** | 0.41 ms | 13x longer |
+| one reading, 32 clients | **0.24 ms** | 1.19 ms | 5.0x longer |
 
-**Embedded: a library inside your program, no network**
+VictoriaMetrics used at most 6.1 GB of memory. Its query language has no time-weighted average.
 
-| database | insert (rows per second) | query (rows per second) | query time | size on disk | size compared to tsdb |
-|---|---:|---:|---:|---:|---:|
-| **tsdb** | **101 million** | **2.5 billion** | **0.07 ms** | **119 MB** | **1x** |
-| DuckDB | 28 million | 552 million | 3.7 ms | 307 MB | 2.6x |
+**tsdb against QuestDB.** QuestDB (10.0.1) is a fast SQL database for time series. By default it stores the data
+uncompressed. Its open source version compresses only the parts you convert to Parquet files by hand; converting
+the 100 million readings took 28 minutes. The times below are for its default format. QuestDB does not sync a
+write to disk before it answers.
 
-**Server: through the clients over TCP**
+| question | tsdb | QuestDB | QuestDB takes |
+|---|---:|---:|---:|
+| size on disk, its default format (median) | **1x** | 56x | |
+| size on disk, converted to Parquet with ZSTD (median) | **1x** | 1.2x | |
+| load 100 million readings | **1.17 s** | 3.04 s | 2.6x longer |
+| whole history of 100 sensors, in buckets of 3,600 readings | **8.3 ms** | 266 ms | 32x longer |
+| one day of one sensor | **0.090 ms** | 5.61 ms | 62x longer |
+| one day of 100 sensors | **1.29 ms** | 500 ms | 387x longer |
+| one reading | **0.032 ms** | 0.21 ms | 6.5x longer |
+| one day of 100 sensors, 16 clients | **18.3 ms** | 2.75 s | 151x longer |
+| time-weighted averages, whole history of 100 sensors | **36.4 ms** | 1.34 s | 37x longer |
 
-| database | insert (rows per second) | query (rows per second) | query time | size on disk | size compared to tsdb |
-|---|---:|---:|---:|---:|---:|
-| **tsdb** (tsdbd) | **82.6 million** | **862 million** | **0.15 ms** | **119 MB** | **1x** |
-| ClickHouse | 43 million | 272 million | 3.2 ms | 221 MB | 1.9x |
-| InfluxDB 2 | 3.6 million | 14 million | 5.3 ms | 315 MB | 2.6x |
-| TimescaleDB | 3.4 million | 26 million | 5.8 ms | 404 MB | 3.4x |
-| InfluxDB 3 Core | 1.0 million | 2.2 million | 72 ms | 723 MB | 6.1x |
-| QuestDB (\*) | 32 million | 78 million | 5.3 ms | 1,657 MB | 13.9x |
+With 32 clients asking about 100 sensors at once, QuestDB refused every request: it went over its own memory limit.
+So that row compares both at 16 clients. Time-weighted averages for 100 sensors at once were refused even at 16
+clients, because QuestDB ran out of table readers.
 
-- **Query (rows per second):** all 100 sensors over the whole range in buckets
-  of 60 readings, a query that has to read every row: 100 million rows divided
-  by the time it took. tsdb used one thread (embedded) or one connection
-  (server); DuckDB and ClickHouse ran the query on 32 threads.
-- **Query time:** one day of one sensor as 5-minute averages (86,400 readings
-  into 288 buckets), one client, average over thousands of random days.
-- **Size compared to tsdb:** each system's size on disk divided by tsdb's: 2.6x
-  means 2.6 times as much disk for the same data. The raw data (8 bytes of time
-  and 4 bytes of value per reading) is 1.2 GB, 10 times tsdb's size.
-- **Inserts:** embedded, 4 threads (DuckDB got its rows sorted beforehand, not
-  counted); server, 4 connections for tsdb, each system's recommended loader
-  for the others.
-- (\*) QuestDB stores its data uncompressed by default, as measured here,
-  which is why it is larger than the raw data. Its open source version can
-  compress only if you convert partitions to Parquet by hand or run it on a
-  compressing file system such as ZFS; converting partitions automatically as
-  they age is a feature of its paid Enterprise edition.
-- Coming with the next measurement: ClickHouse embedded (chDB) in the first
-  table, Prometheus in the second, and columns for LTTB downsampling and
-  time-weighted averages.
+**tsdb against TimescaleDB.** TimescaleDB (2.30.1, on PostgreSQL 17) adds time series to PostgreSQL. It ran with
+compression on, as its docs recommend. Like tsdb, it syncs a write to disk before it answers.
 
-**Compression per kind of sensor (values only)**
+| question | tsdb | TimescaleDB | TimescaleDB takes |
+|---|---:|---:|---:|
+| size on disk (median over the 31 data sets) | **1x** | 3.9x | |
+| load 100 million readings | **1.17 s** | 28.6 s, then 12.3 s to compress | 24x longer |
+| whole history of 100 sensors, in buckets of 3,600 readings | **8.3 ms** | 3.60 s | 434x longer |
+| one day of one sensor | **0.090 ms** | 4.91 ms | 55x longer |
+| one week of 100 sensors | **4.89 ms** | 2.74 s | 560x longer |
+| one reading | **0.032 ms** | 0.29 ms | 9.0x longer |
+| one week of 100 sensors, 16 clients | **74.3 ms** | 5.77 s | 78x longer |
+| time-weighted averages, whole history of 100 sensors | **36.4 ms** | 22.9 s | 628x longer |
 
-| sensor | tsdb: bits per reading | tsdb: 1 million readings | Gorilla (InfluxDB, Prometheus, ClickHouse): bits, size compared to tsdb | ALP (DuckDB): bits, size compared to tsdb |
-|---|---:|---:|---:|---:|
-| SMART disk temperature, 0.1 °C, every 60 s | **0.88** (1x) | 110 KB | 2.66 (3.0x) | 2.36 (2.7x) |
-| CPU temperature with spikes, every 1 s | **2.99** (1x) | 374 KB | 10.82 (3.6x) | 4.97 (1.7x) |
-| tank pressure, 0.001 bar, every 10 s | **1.82** (1x) | 228 KB | 9.09 (5.0x) | 5.97 (3.3x) |
-| tank pressure converted to psi (not rounded) | **19.50** (1x) | 2.44 MB | 23.77 (1.2x) | - |
-| vibration, 16-bit sensor at 1000 readings/s | **14.02** (1x) | 1.75 MB | 21.51 (1.5x) | - |
-| pipeline flow rate, 0.01 m³/h | **10.72** (1x) | 1.34 MB | 23.08 (2.2x) | 12.29 (1.1x) |
-| pipeline flow totalizer, m³ | **1.68** (1x) | 210 KB | 8.68 (5.2x) | - |
-| random numbers (no pattern at all) | **27.29** (1x) | 3.41 MB | 32.32 (1.2x) | - |
+With 32 clients asking for a week of 100 sensors at once, TimescaleDB used up its 48 GB of memory and was stopped
+by the system. So that row compares both at 16 clients. Time-weighted averages for 100 sensors at once ran out of
+memory even at 16 clients.
 
-- Bits per reading for the value alone: a raw float takes 32. In brackets: the
-  size compared to tsdb's (3.0x: three times as many bits for the same readings). Timestamps come
-  on top and cost almost nothing on a steady clock. Measured with
-  `build/codec-bench`; sizes are exact.
-- Every method here has zstd on top. ClickHouse adds zstd to Gorilla like this;
-  InfluxDB, Prometheus and DuckDB do not, so their real sizes are larger than
-  shown: the comparison favours them.
-- This table compares compression methods. The next full measurement replaces
-  it with each database's real size on disk per kind of sensor, one column per
-  database.
-- "-": ALP does not apply to that data (it is not in fixed decimal steps); DuckDB
-  then uses another method.
-- The more regular the sensor, the bigger the gain: slow, rounded sensors
-  shrink 10 to 36 times; noisy or unrounded data has less pattern to remove.
+**Running out of memory.** With 32 clients each asking about 100 sensors at once, ClickHouse, QuestDB, TimescaleDB
+and IoTDB ran out of memory or refused some requests; InfluxDB 3 and TDengine did on other questions. tsdb never
+used more than 2.2 GB. The results page explains every case.
 
-At 100 billion rows, tsdb needs 138 GB where ClickHouse needs 212 GB. Reading
-the whole table in buckets of one hour takes 53 seconds instead of 113.
+**Size on disk.** Bytes per reading over the 31 data sets, each size compared to tsdb's (tsdb = 1x). The raw data
+takes 12 bytes per reading (8 for the time, 4 for the value); tsdb stores the 100 million readings in 114 MB, about a
+tenth of that.
+
+| database | smallest | largest | median |
+|---|---:|---:|---:|
+| **tsdb** | **1x** | **1x** | **1x** |
+| QuestDB, converted to Parquet with ZSTD by hand | 1.0x | 7.4x | 1.2x |
+| IoTDB, CHIMP + ZSTD | 1.2x | 3.9x | 1.9x |
+| VictoriaMetrics | 1.2x | 2.6x | 2.1x |
+| TDengine, zstd | 1.1x | 5.7x | 2.4x |
+| ClickHouse, ZSTD(22) | 1.2x | 4.4x | 2.6x |
+| ClickHouse, its best codecs | 1.2x | 4.8x | 2.9x |
+| Prometheus | 1.4x | 6.6x | 3.7x |
+| TimescaleDB | 1.9x | 293x | 3.9x |
+| DuckDB | 1.2x | 9.1x | 4.4x |
+| InfluxDB 3 | 4.4x | 977x | 10.3x |
+| InfluxDB 2 | 5.2x | 400x | 20.4x |
+| QuestDB, its default format | 19x | 611x | 56x |
+
+**100 billion readings: tsdb and ClickHouse.** 10,000 sensors with 10 million readings each, loaded the same way
+into both.
+
+| | tsdb | ClickHouse |
+|---|---:|---:|
+| size on disk | **138 GB** | 212 GB |
+| load | **1,480 s** | 1,937 s |
+| one sensor by hour (10 million readings) | **17.4 ms** | 42 ms |
+| 100 sensors by hour (1 billion readings) | **398 ms** | 1,100 ms |
+| everything by hour (100 billion readings) | **51.5 s** | 112.9 s |
+
+Hours cut through nearly every block of 8192 readings, so both systems read the data; tsdb is 2 to 3 times faster.
+
+**Embedded: a library inside your program.** The same 100 million readings in one process, with no network. chDB
+is ClickHouse as a library. DuckDB got its readings sorted beforehand, which made its job easier (not counted).
+
+| | tsdb | chDB | DuckDB |
+|---|---:|---:|---:|
+| load 100 million readings | **0.70 s** | 1.60 s | 3.65 s |
+| size on disk | **114 MB** (1x) | 219 MB (1.9x) | 306 MB (2.7x) |
+| one day of one sensor | **0.050 ms** | 3.63 ms | 3.63 ms |
+| one reading | **0.010 ms** | 1.23 ms | 0.72 ms |
+| time-weighted averages, whole history | **38.7 ms** | 1.05 s | 1.82 s |
 
 The test data behaves like real industrial sensors, not random numbers: disk
 temperatures that creep by 0.1 °C, CPU temperatures with spikes, tanks that
