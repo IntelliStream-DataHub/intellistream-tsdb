@@ -323,7 +323,9 @@ tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 c
 Step 8 prints a table with `rows 1440`: what the client wrote is on disk in the server's directory.
 
 If the server cannot start because the port is taken (the log then says "cannot listen"), something else uses 17070.
-Pick another number in steps 6 and 7. If the server is still running after a mistake, stop it
+Pick another number in steps 6 and 7. If the log says "no superuser", the `user add` line of step 6 did not run;
+if the client says "login failed", the user name or the password file in step 7 is not the one of step 6.
+If the server is still running after a mistake, stop it
 with `kill $(cat /tmp/tsdb-qs/tsdbd.pid)`. Do not use `pkill` or `killall`: they stop
 every process with that name, also ones that are not yours. When you are done, `rm -rf /tmp/tsdb-qs`.
 
@@ -480,10 +482,16 @@ database has at least one superuser, a user who may do everything:
 build/tsdb /data/sensors user add admin --superuser    # asks for the password (or --password-file FILE)
 ```
 
+Without one, tsdbd stops at once and says what to do:
+
+```
+tsdbd: no superuser: run 'tsdb /data/sensors user add NAME --superuser', or start with --no-auth
+```
+
 Every other user gets rights on some series. A right is `read`, `insert`, `delete` or `admin` (`write` means
 insert and delete). It applies to `all` series, to the series whose name starts with a prefix (`prefix:acme/`),
 to one series (`name:pump7.flow`), or to the names a pattern matches (`glob:acme/*/temp?`: `*` is any text, `?` is
-one character). A collector that should only add data, never read or delete it:
+one byte, such as one ASCII letter or digit). A collector that should only add data, never read or delete it:
 
 ```sh
 build/tsdb /data/sensors user add acme/ingest --password-file /etc/tsdb/acme-ingest.password
@@ -492,9 +500,20 @@ build/tsdb /data/sensors user list
 ```
 
 These commands change the file `USERS` in the database directory and work while tsdbd runs: it sees the change
-within a second. A series a user may not touch answers like a series that does not exist. A user with `admin` on
-a prefix manages the users whose names start with it, over the network (`tsdb user ... --server HOST:PORT
---login NAME`). `--no-auth` turns logins off, so that anyone who reaches the port may do everything: use it only
+within a second. A series a user may not touch answers like a series that does not exist.
+
+A user with `admin` on a prefix manages the users whose names start with it. It does that over the network, so it
+needs no access to the server's files:
+
+```sh
+build/tsdb /data/sensors user add acme/admin --password-file /etc/tsdb/acme-admin.password
+build/tsdb /data/sensors user grant acme/admin admin prefix:acme/
+# from any machine that reaches tsdbd, as acme/admin (it asks for acme/admin's password, then the new one):
+build/tsdb user add acme/dashboard --server db1:7070 --login acme/admin
+build/tsdb user grant acme/dashboard read prefix:acme/ --server db1:7070 --login acme/admin
+```
+
+`--no-auth` turns logins off, so that anyone who reaches the port may do everything: use it only
 for tests and try-outs on your own machine. `tsdb <dir> user` on its own lists every command, and
 [SECURITY.md](SECURITY.md) says what logins protect and what they do not.
 

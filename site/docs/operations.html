@@ -81,9 +81,84 @@ partition, so with many slow series it adds up: a billion series take about 51 G
 <code>tsdb_pinned_index_bytes</code> shows what it costs. Turn it on where you use <code>--verify-checksums</code> and
 the RAM is there.</p>
 
+<h2 id="users">Users, rights and tenants</h2>
+<p>Clients log in with a user name and a password; the <a href="server.html#users">server page</a> explains how. The
+users live in one file, <code>USERS</code>, in the database directory. Only the file's owner may read it, and it
+holds no passwords, only values made from them. Whoever can write the directory can add a superuser, so keep it
+as closed as the data.</p>
+
+<h3 id="users-setup">Setting up users</h3>
+<p>Start with one superuser, added before tsdbd first starts. Then give every program and person its own user,
+with the rights it needs and no more. A collector that only adds data gets <code>insert</code>, not
+<code>write</code>: if its password leaks, nobody can delete history with it.</p>
+<pre><code class="language-sh" data-src="README.md#Users and logins" data-block="2">build/tsdb /data/sensors user add acme/ingest --password-file /etc/tsdb/acme-ingest.password
+build/tsdb /data/sensors user grant acme/ingest insert prefix:acme/
+build/tsdb /data/sensors user list</code></pre>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Right</th><th scope="col">What it allows</th></tr></thead>
+<tbody>
+<tr><td><code>read</code></td><td>queries of every kind, and looking series up</td></tr>
+<tr><td><code>insert</code></td><td>writing rows and creating series (and looking them up, but not reading their rows)</td></tr>
+<tr><td><code>delete</code></td><td>deleting rows and setting retention; replacing a range needs <code>insert</code> too</td></tr>
+<tr><td><code>admin</code></td><td>read, insert and delete, plus managing the users named under its prefix</td></tr>
+<tr><td><code>write</code></td><td>short for <code>insert,delete</code></td></tr>
+</tbody></table></div>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Selector</th><th scope="col">The series it covers</th></tr></thead>
+<tbody>
+<tr><td><code>all</code></td><td>every series</td></tr>
+<tr><td><code>prefix:acme/</code></td><td>the names that start with <code>acme/</code>. A prefix is plain bytes: <code>prefix:acme</code> also covers <code>acmecorp/x</code>, so end a tenant's prefix with <code>/</code> (the command line warns otherwise)</td></tr>
+<tr><td><code>name:pump7.flow</code></td><td>that one series</td></tr>
+<tr><td><code>glob:acme/*/temp?</code></td><td>the names the pattern matches: <code>*</code> any bytes (also <code>/</code>, also none), <code>?</code> one byte, <code>\</code> takes the next byte as it is. At most 64 globs per user</td></tr>
+</tbody></table></div>
+<p>Rights only add up: a user may do on a series what any of its grants allows. There is no way to deny. To take a
+right away, <code>tsdb DIR user revoke NAME RIGHTS SELECTOR</code>. A series a user holds no right on answers as if it
+did not exist, so users cannot find out what other tenants store.</p>
+
+<h3 id="tenants">Tenants and tenant admins</h3>
+<p>A tenant is a name prefix: <code>acme/</code> for acme's series and acme's users. A user with <code>admin</code> on
+<code>prefix:acme/</code> creates and drops users named <code>acme/...</code>, sets their passwords and gives them rights
+inside <code>acme/</code>, over the network, without access to the server's files:</p>
+<pre><code class="language-sh" data-src="README.md#Users and logins" data-block="3">build/tsdb /data/sensors user add acme/admin --password-file /etc/tsdb/acme-admin.password
+build/tsdb /data/sensors user grant acme/admin admin prefix:acme/
+# from any machine that reaches tsdbd, as acme/admin (it asks for acme/admin's password, then the new one):
+build/tsdb user add acme/dashboard --server db1:7070 --login acme/admin
+build/tsdb user grant acme/dashboard read prefix:acme/ --server db1:7070 --login acme/admin</code></pre>
+<p>It cannot give rights outside its prefix, create superusers, or change a user that holds a right outside its
+prefix.</p>
+<ul>
+<li><strong>Shares between tenants.</strong> Only a superuser grants an <code>acme/</code> user a right on another
+tenant's series. After that the acme admins can no longer set that user's password. They may still know the
+password they set before, so give such a share to a user whose password the tenant admins never set, or set a new
+one when you share (<code>tsdb DIR user passwd NAME</code>).</li>
+<li><strong>State names.</strong> Series of the <code>state</code> type store labels such as <code>RUNNING</code> in one
+list per volume. A user with a right on any series of a volume can look up the labels of every series there. Where
+those labels are sensitive, give each tenant its own <a href="#volumes">volume</a>.</li>
+</ul>
+
+<h3 id="users-running">While tsdbd runs</h3>
+<ul>
+<li>The <code>tsdb DIR user ...</code> commands work beside a running tsdbd; it reads the change within a second. From
+then on a revoked right is gone on every connection of that user, also those already open, and the open
+connections of a dropped user get a login error on their next request.</li>
+<li>A user list that only grows: every change is added at the end of <code>USERS</code>.
+<code>tsdb DIR user compact</code> rewrites it with one entry per user and grant, also while tsdbd runs.</li>
+<li>If the last superuser is dropped, tsdbd keeps serving the users that are logged in, but the next start refuses
+until <code>tsdb DIR user add NAME --superuser</code> has run.</li>
+<li><a href="#followers">Followers</a> read the same <code>USERS</code> and accept no user changes: make them on the
+writer.</li>
+<li>If a write to <code>USERS</code> fails, tsdbd stops, as for any file it relies on: an acknowledged revoke must not
+come back after a crash.</li>
+<li><code>export</code> carries series, not users. Copy <code>USERS</code> into the new directory after an import, with
+tsdbd stopped, or add the users again.</li>
+<li>Failed logins are counted in <code>tsdb_logins_total{result="failed"}</code> and logged with the user name and
+the address, at most one line a second.</li>
+</ul>
+
 <h2 id="metrics">Metrics</h2>
 <p><code>--metrics-port 9170</code> serves <code>GET /metrics</code> in the Prometheus text format on a port of its own.
-It is off by default and has no login, like the main port: bind it to a trusted interface. A scrape never runs a query.
+It is off by default and, unlike the main port, has no login: bind it to a trusted interface. It shows counts for
+the whole server, never series names or values. A scrape never runs a query.
 A Prometheus scrape config:</p>
 <pre><code class="language-yaml" data-src="docs/metrics.md#Prometheus metrics">scrape_configs:
   - job_name: tsdb
@@ -98,7 +173,8 @@ A Prometheus scrape config:</p>
 <tr><td><code>tsdb_memtable_rows</code></td><td>rows in memory, not yet in parts; growing without end means writes to disk do not keep up</td></tr>
 <tr><td><code>tsdb_failed</code></td><td>1 once the disk failed and tsdbd stops: alert on it</td></tr>
 <tr><td><code>tsdb_follow_refresh_age_seconds</code></td><td>followers: time since the last good refresh</td></tr>
-<tr><td><code>tsdb_connections</code>, <code>tsdb_request_errors_total</code></td><td>open connections, and replies with an error, by code</td></tr>
+<tr><td><code>tsdb_connections</code>, <code>tsdb_request_errors_total</code></td><td>open connections, and replies with an error, by code (<code>denied</code>: a request for series the user holds no right on)</td></tr>
+<tr><td><code>tsdb_logins_total</code></td><td>logins by result: <code>ok</code>, <code>failed</code>, <code>timeout</code>, <code>refused</code>; many failures mean a client with a wrong password, or someone guessing</td></tr>
 </tbody></table></div>
 <p><a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/docs/metrics.md">docs/metrics.md</a>
 lists them all.</p>
@@ -138,6 +214,6 @@ directories.</p>
 
 <nav class="pager" aria-label="Previous and next page"><a class="prev" href="server.html"><span>Previous</span>The server, tsdbd</a><a class="next" href="benchmarks.html"><span>Next</span>Benchmarks</a></nav></main>
 </div>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>
