@@ -108,8 +108,13 @@ $(B)/test_crypto: tests/test_crypto.c tests/rfc7677.h $(B)/tsdb_crypto.o
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(B)/tsdb_crypto.o
 
 # starts tsdbd (login on) and links server/auth.c for the RFC 7677 exchange on the server side in this process
-$(B)/test_auth: tests/test_auth.c tests/harness.h tests/rfc7677.h server/auth.c server/auth.h server/users.h \
-                $(B)/users.o $(CLIB) $(LIB)
+$(B)/test_auth: tests/test_auth.c tests/harness.h tests/auth_harness.h tests/rfc7677.h server/auth.c server/auth.h \
+                server/users.h $(B)/users.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
+
+# every op of TSDB_OPS across tenants (links server/auth.c for its table, makes USERS with server/users.c)
+$(B)/test_auth_ops: tests/test_auth_ops.c tests/harness.h tests/auth_harness.h server/auth.c server/auth.h \
+                    server/users.h include/tsdb_protocol.h $(B)/users.o $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
 
 # includes server/users.c (its record builders) and defines write/fdatasync/fsync/rename to inject errors into it
@@ -135,7 +140,7 @@ $(B)/test_threads: tests/test_threads.c src/internal.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
@@ -175,6 +180,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server_multi && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth && \
+	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_auth_ops && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
 
 # ------------------------------------------------------------------ fuzzing
