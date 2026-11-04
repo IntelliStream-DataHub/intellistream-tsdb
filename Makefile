@@ -91,9 +91,24 @@ $(B)/tsdb_calendar.o: client/tsdb_calendar.c include/tsdb_calendar.h include/tsd
 # export writes the tsdb version and the on-disk format version (not in the public API) into its stream header
 TSDB_FORMAT := $(shell sed -n 's/^\#define FORMAT_VERSION \([0-9]*\).*/\1/p' src/internal.h)
 
-$(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h $(LIB)
+$(B)/tsdb: tools/tsdb-cli.c tools/dump.c tools/dump.h tools/common.h tools/users-cli.c $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -DTSDB_FORMAT_VERSION=$(TSDB_FORMAT) -o $@ $< tools/dump.c \
-	    $(LIB) $(LDLIBS)
+	    tools/users-cli.c $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
+
+# login (docs/design-auth.md): the crypto is client code, shared with tsdbd and the CLI; USERS and the grant model
+# are tsdbd's and the CLI's
+$(B)/tsdb_crypto.o: client/tsdb_crypto.c client/tsdb_crypto.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(B)/users.o: server/users.c server/users.h client/tsdb_crypto.h include/tsdb.h | $(B)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(B)/test_crypto: tests/test_crypto.c $(B)/tsdb_crypto.o
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(B)/tsdb_crypto.o
+
+# includes server/users.c (its record builders) and defines write/fdatasync/fsync/rename to inject errors into it
+$(B)/test_users: tests/test_users.c server/users.c server/users.h $(B)/tsdb_crypto.o $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< $(B)/tsdb_crypto.o $(LIB) $(LDLIBS)
 
 $(B)/tsdb-bench: tools/tsdb-bench.c tools/common.h tools/datasets.h tools/cbench.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
@@ -114,7 +129,7 @@ $(B)/test_threads: tests/test_threads.c src/internal.h $(LIB)
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_shared $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(B)/libcrashfs.so $(B)/tsdb $(B)/fuzz_frames
 	./$(B)/test_tsdb
 	./$(B)/test_sched
 	./$(B)/test_multi
@@ -143,6 +158,9 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	./$(B)/test_classes
 	./$(B)/test_follow
 	./$(B)/test_volumes
+	./$(B)/test_crypto
+	./$(B)/test_users
+	B=$(B) tests/test_cli_users.sh
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	TSDBD=$(TSDBD) ./$(B)/test_ports
@@ -440,7 +458,7 @@ $(B)/tsdb_client.o: client/tsdb_client.c client/tsdb_client.h include/tsdb_proto
 $(B)/tsdb_pack.o: client/tsdb_pack.c client/tsdb_pack.h include/tsdb_protocol.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(CLIB): $(B)/tsdb_client.o $(B)/tsdb_pack.o $(B)/tsdb_calendar.o
+$(CLIB): $(B)/tsdb_client.o $(B)/tsdb_pack.o $(B)/tsdb_calendar.o $(B)/tsdb_crypto.o
 	$(AR) rcs $@ $^
 
 $(B)/tsdbc-bench: tools/tsdbc-bench.c client/tsdb_client.h tools/common.h tools/datasets.h tools/cbench.h $(CLIB)

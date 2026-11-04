@@ -69,6 +69,9 @@ static void usage(void)
             "  delete <series> <start> <end>      delete the series' values in [start, end)\n"
             "  retention <series> [<age>|off]     show or set how long the series keeps values\n"
             "                                     (e.g. 30d, 12h; off keeps them for ever)\n"
+            "  user add|passwd|drop|alter|grant|revoke|list|compact ...\n"
+            "                                     the users of tsdbd's login (USERS), also while tsdbd\n"
+            "                                     runs; `tsdb <dir> user` for the details\n"
             "\n"
             "times: 1700000000000 (ms), 2024-01-31, \"2024-01-31 12:00:00.250\", 2024-01-31T12:00:00Z,\n"
             "       now, now-1h, min, max.  ranges are [start, end).\n"
@@ -77,6 +80,8 @@ static void usage(void)
             "        names escaped (\\t, \\n, \\\\, other control bytes as \\xNN).\n");
     exit(2);
 }
+
+int user_main(const char *dir, int argc, char **argv); /* tools/users-cli.c */
 
 static void die(const char *what, int rc)
 {
@@ -678,6 +683,8 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "volume") == 0 && (argc != 4 || strcmp(argv[3], "list") != 0))
         usage();
+    if (strcmp(cmd, "user") == 0)
+        return user_main(dir, argc - 3, argv + 3); /* USERS only: the engine is not opened */
     if (strcmp(cmd, "export") == 0)
         return dump_export_main(dir, argc - 3, argv + 3);
     FILE *csv = stdin;

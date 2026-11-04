@@ -28,6 +28,8 @@ const char *tsdb_strerror(int err)
     case TSDB_ERR_TOO_MANY_BUCKETS: return "too many buckets";
     case TSDB_ERR_STOPPED: return "stopped";
     case TSDB_ERR_READONLY: return "database is read only";
+    case TSDB_ERR_DENIED: return "permission denied";
+    case TSDB_ERR_AUTH: return "login failed";
     default: return "unknown error";
     }
 }

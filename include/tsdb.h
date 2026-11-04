@@ -71,6 +71,9 @@ enum {
     TSDB_ERR_TOO_MANY_BUCKETS = -7,
     TSDB_ERR_STOPPED = -8, /* a query callback returned non-zero, or the db is closing */
     TSDB_ERR_READONLY = -9,
+    /* -10 to -15 are kept for the HA track (docs/ha.md) */
+    TSDB_ERR_DENIED = -16, /* tsdbd: the user holds no right for this (or the series does not exist) */
+    TSDB_ERR_AUTH = -17,   /* tsdbd: login failed or is required first */
 };
 
 /* The ends of the time axis, for query ranges. Ranges are half-open, [start, end), so no range reaches a row at
