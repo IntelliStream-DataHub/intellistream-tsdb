@@ -1,13 +1,11 @@
-/* tsdb site: theme, navigation drawer, language tabs, copy buttons and the benchmark charts.
- * Plain JavaScript, no libraries. Loaded in <head> without defer so the saved theme applies before the first
- * paint; everything else waits for the document. localStorage may be missing or throw (private windows,
- * blocked storage): every access is wrapped, and the page works without it. */
+/* tsdb site: the phone menu, the docs sidebar and its section list, language tabs, copy buttons and the benchmark
+ * charts. Plain JavaScript, no libraries. Loaded in <head>; everything waits for the document. localStorage may be
+ * missing or throw (private windows, blocked storage): every access is wrapped, and the page works without it. The
+ * site is dark only, so there is no theme to choose. */
 (function () {
     "use strict";
 
-    var THEME_KEY = "tsdb-theme";
     var LANG_KEY = "tsdb-lang";
-    var root = document.documentElement;
 
     function load(key) {
         try {
@@ -25,34 +23,7 @@
         }
     }
 
-    /* dark unless the viewer chose light with the toggle, whatever the system prefers */
-    var savedTheme = load(THEME_KEY);
-    root.setAttribute("data-theme", savedTheme === "light" ? "light" : "dark");
-
     var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-    /* ---------- theme ---------- */
-
-    function effectiveTheme() {
-        return root.getAttribute("data-theme") === "light" ? "light" : "dark";
-    }
-
-    function initTheme() {
-        var btn = document.querySelector(".theme-btn");
-        if (!btn) return;
-        function label() {
-            var next = effectiveTheme() === "dark" ? "light" : "dark";
-            btn.setAttribute("aria-label", "Switch to the " + next + " theme");
-            btn.setAttribute("title", "Switch to the " + next + " theme");
-        }
-        label();
-        btn.addEventListener("click", function () {
-            var next = effectiveTheme() === "dark" ? "light" : "dark";
-            root.setAttribute("data-theme", next);
-            save(THEME_KEY, next);
-            label();
-        });
-    }
 
     /* ---------- top menu (phones) and docs sidebar ---------- */
 
@@ -415,7 +386,6 @@
     }
 
     function start() {
-        initTheme();
         initPanels();
         initToc();
         initTabs();

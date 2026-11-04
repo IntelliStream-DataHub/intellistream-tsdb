@@ -1,9 +1,8 @@
-/* tsdb site. Dark by default: a night-time pit wall, deep indigo with telemetry colours (cyan, violet, magenta,
- * amber, mint) that glow where something matters: the car, tsdb's bars, the current page. The light theme is the
- * same layout on paper-white, chosen with the toggle. Our own CSS, system fonts, no outside resources. */
+/* tsdb site. Dark only: a night-time pit wall, deep indigo with telemetry colours (cyan, violet, magenta, amber,
+ * mint) that glow where something matters: the car, tsdb's bars, the current page. Our own CSS, system fonts, no
+ * outside resources. */
 
-:root,
-:root[data-theme="dark"] {
+:root {
     color-scheme: dark;
     --bg: #070a17;
     --bg-2: #0b1022;
@@ -34,39 +33,6 @@
     --hero-a: rgba(143, 128, 255, 0.35);
     --hero-b: rgba(54, 226, 255, 0.22);
     --hero-c: rgba(255, 90, 217, 0.18);
-}
-
-:root[data-theme="light"] {
-    color-scheme: light;
-    --bg: #f5f6ff;
-    --bg-2: #eceffd;
-    --surface: #ffffff;
-    --surface-2: #f1f3ff;
-    --surface-3: #e4e8fb;
-    --line: rgba(40, 50, 120, 0.13);
-    --line-2: rgba(40, 50, 120, 0.24);
-    --text: #121735;
-    --muted: #464e72;
-    --faint: #5f678a;
-    --cyan: #0079a3;
-    --violet: #5a45dc;
-    --magenta: #b8178f;
-    --amber: #a35b00;
-    --mint: #0a7d4b;
-    --red: #c4243d;
-    --link: #0b62c4;
-    --code-bg: #f3f5ff;
-    --code-text: #1d2347;
-    --bar-other: #6a9a78;
-    --fail-bg: #ffe8ec;
-    --fail-text: #8a1023;
-    --glow: 0 0 0 rgba(0, 0, 0, 0);
-    --shadow: 0 8px 30px rgba(30, 40, 110, 0.12);
-    --topbar-bg: rgba(245, 246, 255, 0.82);
-    --grid-line: rgba(60, 70, 160, 0.08);
-    --hero-a: rgba(143, 128, 255, 0.22);
-    --hero-b: rgba(54, 226, 255, 0.22);
-    --hero-c: rgba(255, 90, 217, 0.12);
 }
 
 :root {
@@ -392,17 +358,7 @@ th.num {
     margin-left: 2px;
 }
 
-.theme-btn .sun {
-    display: none;
-}
 
-:root[data-theme="light"] .theme-btn .sun {
-    display: block;
-}
-
-:root[data-theme="light"] .theme-btn .moon {
-    display: none;
-}
 
 .menu-btn {
     display: none;
@@ -584,9 +540,6 @@ th.num {
     opacity: 0.7;
 }
 
-:root[data-theme="light"] .car3d .near {
-    filter: none;
-}
 
 @media (prefers-reduced-motion: no-preference) {
     .car3d .near,
@@ -1291,9 +1244,6 @@ dl.terms dd {
     filter: drop-shadow(0 0 6px rgba(54, 226, 255, 0.55));
 }
 
-:root[data-theme="light"] .chart-svg .us .bar {
-    filter: none;
-}
 
 .chart-svg .fail-box {
     fill: var(--fail-bg);

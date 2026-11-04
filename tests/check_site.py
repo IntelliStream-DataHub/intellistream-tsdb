@@ -328,6 +328,99 @@ def check_site_car(page, raw, fix):
     return out
 
 
+def find_chrome():
+    """A headless Chromium: $CHROME, one on the PATH, or Playwright's headless shell; None if there is none."""
+    if os.environ.get("CHROME"):
+        return os.environ["CHROME"]
+    for name in ("chrome-headless-shell", "chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        if shutil.which(name):
+            return shutil.which(name)
+    import glob
+
+    shells = sorted(glob.glob(os.path.expanduser(
+        "~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell")))
+    return shells[-1] if shells else None
+
+
+# Run inside a copy of a page: click every language in every tab group and report what is shown.
+TAB_PROBE = """<script>
+window.addEventListener("load", function () { setTimeout(function () {
+    var out = [], groups = document.querySelectorAll(".tabs");
+    if (window.TSDB_EXPECT) {
+        groups.forEach(function (g, gi) {
+            var sel = g.querySelector('[role="tab"][aria-selected="true"]');
+            out.push("start:" + gi + ":" + (sel ? sel.getAttribute("data-key") : "none"));
+        });
+    }
+    ["c", "rust", "python", "java"].forEach(function (k) {
+        var first = null;
+        groups.forEach(function (g) { if (!first) first = g.querySelector('[role="tab"][data-key="' + k + '"]'); });
+        if (!first) return;
+        first.click();
+        groups.forEach(function (g, gi) {
+            var b = g.querySelector('[role="tab"][data-key="' + k + '"]');
+            if (!b) return;
+            var p = document.getElementById(b.getAttribute("aria-controls"));
+            var ok = b.getAttribute("aria-selected") === "true" && p && !p.hidden;
+            out.push(k + ":" + gi + ":" + (ok ? "ok" : "FAIL"));
+        });
+    });
+    var py = document.querySelector('[role="tab"][data-key="python"]');
+    if (py) py.click();
+    var stored = null;
+    try { stored = localStorage.getItem("tsdb-lang"); } catch (e) {}
+    var pre = document.createElement("pre");
+    pre.id = "tabprobe";
+    pre.textContent = out.join(" ") + " stored:" + stored;
+    document.body.appendChild(pre);
+}, 50); });
+</script>"""
+
+
+def run_probe(chrome, page, profile, expect=None):
+    """The probe's report for a copy of page (beside it, so its relative links work), or None if the browser
+    could not run it."""
+    raw = open(page, encoding="utf-8").read()
+    pre = "<script>window.TSDB_EXPECT = %s;</script>" % ("true" if expect else "false")
+    probe = os.path.join(os.path.dirname(page), ".tabprobe-" + os.path.basename(page))
+    with open(probe, "w", encoding="utf-8") as f:
+        f.write(raw.replace("</body>", pre + TAB_PROBE + "</body>"))
+    try:
+        r = subprocess.run([chrome, "--headless", "--no-sandbox", "--disable-gpu", "--user-data-dir=" + profile,
+                            "--virtual-time-budget=3000", "--dump-dom", "file://" + probe],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        os.unlink(probe)
+    m = re.search(r'<pre id="tabprobe">(.*?)</pre>', r.stdout, re.S)
+    return m.group(1) if m else None
+
+
+def check_tabs():
+    """A smoke test of the language tabs in a real browser, when one is installed: on the landing page every
+    language shows its panel in every tab group, and the choice is remembered on the Clients page."""
+    chrome = find_chrome()
+    if not chrome:
+        print("check_site: no headless Chromium, the language tabs are not tried in a browser")
+        return
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="tsdb-tabs-") as profile:
+        first = run_probe(chrome, os.path.join(SITE, "index.html"), profile)
+        if first is None:
+            print(f"check_site: {chrome} did not run the tab probe, the language tabs are not tried in a browser")
+            return
+        if "FAIL" in first or "stored:python" not in first or ":0:ok" not in first:
+            errors.append(f"site/index.html: language tabs: {first}")
+        second = run_probe(chrome, os.path.join(SITE, "docs", "clients.html"), profile, expect=True)
+        if second is None:
+            return
+        starts = re.findall(r"start:\d+:(\w+)", second)
+        if not starts or any(s != "python" for s in starts) or "FAIL" in second:
+            errors.append(f"site/docs/clients.html: language tabs (python chosen on the landing page): {second}")
+
+
 def check_readme_charts():
     """The README's charts (docs/img/bench-*.svg) are what tools/readme-charts.py draws from its data file, and every
     number of that file is in BENCHMARKS.md's summary tables."""
@@ -384,6 +477,7 @@ def main():
     for page in all_pages:
         check_links(page, parse(page)[0], lambda d: parse(d)[0].ids)
     check_readme_charts()
+    check_tabs()
     node = shutil.which("node")
     scripts = sorted(f for f in os.listdir(os.path.join(SITE, "assets")) if f.endswith(".js"))
     if node:
