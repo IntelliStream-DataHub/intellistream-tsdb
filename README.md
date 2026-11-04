@@ -94,7 +94,7 @@ timed. Every timing was repeated 5 times. "slower" says how many times longer th
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/bench-servers-dark.svg">
-  <img src="docs/img/bench-servers-light.svg" width="830" alt="Servers, 100 million readings: tsdb needs 0.78 bytes per reading (ClickHouse 2.51), ingests 85.8 million rows/s (ClickHouse 1.8 times slower, the others 2.6 to 64 times), reads 1,524 million rows/s (the others 5.7 to 685 times slower), runs time-weighted averages in 36.4 ms (29 to 2,423 times slower) and LTTB in 456 ms (ClickHouse 1.2 times slower), and used at most 2.0 GB of memory, where InfluxDB 3 and TimescaleDB ran out of 48 GB and TDengine failed at that limit.">
+  <img src="docs/img/bench-servers-light.svg" width="830" alt="Servers, 100 million readings: tsdb needs 0.78 bytes per reading (ClickHouse 2.51), ingests 85.8 million rows/s (ClickHouse 1.8 times slower, the others 2.6 to 64 times), reads 1,524 million rows/s (the others 5.7 to 685 times slower), runs time-weighted averages in 36.4 ms (29 to 2,423 times slower) and LTTB in 456 ms (ClickHouse 1.2 times slower), and held at most 2.0 GB of memory over the runs that finished (Prometheus 1.1 GB, the others 5.9 to 47.9 GB); at 32 clients ClickHouse, QuestDB and IoTDB refused questions, InfluxDB 3 and TimescaleDB ran out of memory and TDengine failed.">
 </picture>
 
 - **Size:** bytes on disk per reading, the median over 31 data sets (8 made-up sensor kinds, 23 real sensors).
@@ -103,13 +103,14 @@ timed. Every timing was repeated 5 times. "slower" says how many times longer th
 - **Read:** all 100 sensors, the whole history, in buckets of 60 readings, in one request. Every row is read.
 - **TWA:** time-weighted averages of all 100 sensors in hourly buckets. **LTTB:** all 100 sensors downsampled to
   1,000 points each, one request per sensor for tsdb.
-- **Max memory:** the most the server held, without the file cache, over every question of the benchmark. Failures
-  happened with 32 clients asking about many sensors at once; BENCHMARKS.md has the comparisons at 16 clients
-  (ClickHouse, for one, refused 100 time-weighted averages at 32 clients and answered at 16).
+- **Max memory:** the most the server held, without the file cache, over the runs that finished, the 16-client
+  runs included. A red tag marks a system that failed with 32 clients asking about many sensors at once (refused
+  the question, ran out of the 48 GB limit, or failed). BENCHMARKS.md has the details and the 16-client timings.
 - InfluxDB is the most popular time series database: number 1 in the
   [DB-Engines ranking](https://db-engines.com/en/ranking/time+series+dbms) (November 2026).
-- QuestDB is shown in its default format, which is not compressed. Converted to Parquet with ZSTD by hand, it needs
-  1.02 bytes per reading, but converting the 100 million readings took 28 minutes.
+- \* QuestDB open source, in its default format, which does not compress. The open source version compresses only
+  partitions you convert to Parquet by hand: with ZSTD it needs 1.02 bytes per reading, but converting the 100
+  million readings took 28 minutes.
 
 **Embedded: a library inside your program**, the same 100 million readings in one process, with no network. chDB
 is ClickHouse as a library.
