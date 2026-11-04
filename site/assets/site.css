@@ -25,6 +25,15 @@
     --on-accent: #050816;
     --code-bg: #0a0f24;
     --code-text: #dfe5ff;
+    /* syntax highlighting (site.js), each at least 7:1 on --code-bg, like the code's own text */
+    --hl-com: #9aa6d6;
+    --hl-kw: #d2a8ff;
+    --hl-type: #7fe6ff;
+    --hl-fn: #ffc45e;
+    --hl-str: #a9f0b6;
+    --hl-num: #ffb685;
+    --hl-meta: #ff9be3;
+    --hl-var: #a9c4ff;
     --bar-other: #5b8f6b;
     --fail-bg: rgba(255, 107, 129, 0.14);
     --fail-text: #ffb3be;
@@ -183,6 +192,39 @@ pre {
 
 pre code {
     font-size: inherit;
+}
+
+.tok-com {
+    color: var(--hl-com);
+    font-style: italic;
+}
+
+.tok-kw {
+    color: var(--hl-kw);
+}
+
+.tok-type {
+    color: var(--hl-type);
+}
+
+.tok-fn {
+    color: var(--hl-fn);
+}
+
+.tok-str {
+    color: var(--hl-str);
+}
+
+.tok-num {
+    color: var(--hl-num);
+}
+
+.tok-meta {
+    color: var(--hl-meta);
+}
+
+.tok-var {
+    color: var(--hl-var);
 }
 
 .code-wrap {

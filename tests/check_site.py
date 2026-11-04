@@ -343,6 +343,8 @@ CONTRAST = [
     ("on-accent", "cyan", 4.5), ("on-accent", "violet", 4.5), ("on-accent", "magenta", 4.5),
     ("fail-text", "fail-bg+surface", 4.5), ("red", "surface", 4.5),
     ("line-2", "bg", 3), ("line-2", "surface", 3),
+    ("hl-com", "code-bg", 7), ("hl-kw", "code-bg", 7), ("hl-type", "code-bg", 7), ("hl-fn", "code-bg", 7),
+    ("hl-str", "code-bg", 7), ("hl-num", "code-bg", 7), ("hl-meta", "code-bg", 7), ("hl-var", "code-bg", 7),
 ]
 
 

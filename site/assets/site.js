@@ -214,6 +214,88 @@
         }
     }
 
+    /* ---------- syntax highlighting ----------
+     * Our own small highlighter: per language a list of [class, pattern], joined into one regular expression and
+     * scanned once; text between matches stays plain. The page's HTML keeps the plain code (check_site compares it
+     * with the tested sources); only the browser adds the spans, and the copy button still reads textContent. */
+    var KW = {
+        c: "auto break case const continue default do else enum extern for goto if inline register restrict return " +
+            "sizeof static struct switch typedef union volatile while void char short int long float double signed " +
+            "unsigned bool true false NULL",
+        rust: "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match " +
+            "mod move mut pub ref return self Self static struct super trait true type unsafe use where while u8 u16 " +
+            "u32 u64 usize i8 i16 i32 i64 isize f32 f64 bool str char",
+        java: "abstract assert boolean break byte case catch char class const continue default do double else enum " +
+            "extends final finally float for if implements import instanceof int interface long native new null " +
+            "package private protected public return short static super switch synchronized this throw throws try " +
+            "var void volatile while true false",
+        python: "and as assert async await break class continue def del elif else except False finally for from " +
+            "global if import in is lambda None nonlocal not or pass raise return True try while with yield"
+    };
+
+    function words(list) {
+        return "\\b(?:" + list.split(" ").join("|") + ")\\b";
+    }
+
+    var STR = "\"(?:[^\"\\\\\\n]|\\\\.)*\"", NUM = "\\b(?:0[xX][\\da-fA-F_]+|\\d[\\d_]*(?:\\.\\d[\\d_]*)?" +
+        "(?:[eE][+-]?\\d+)?)(?:[uU]?[lL]{0,2}|[fd]|[iu](?:8|16|32|64|size)|f32|f64)?\\b";
+    var CALL = "\\b[A-Za-z_]\\w*(?=\\s*\\()", CONST = "\\b[A-Z][A-Z0-9_]+\\b", TYPE = "\\b[A-Z][a-z0-9]\\w*\\b";
+    var HL = {
+        c: [["com", "/\\*[\\s\\S]*?\\*/|//.*"], ["meta", "#\\s*(?:include|define|undef|ifn?def|if|elif|else|endif|" +
+            "pragma)\\b"], ["str", STR + "|'(?:[^'\\\\\\n]|\\\\.)'|<[\\w./]+\\.h>"], ["kw", words(KW.c)],
+            ["type", "\\b\\w+_t\\b"], ["num", NUM + "|" + CONST], ["fn", CALL]],
+        rust: [["com", "/\\*[\\s\\S]*?\\*/|//.*"], ["meta", "#!?\\[[^\\]\\n]*\\]"], ["str", STR],
+            ["kw", words(KW.rust)], ["fn", "\\b[a-z_]\\w*!|" + CALL], ["num", NUM + "|" + CONST], ["type", TYPE]],
+        java: [["com", "/\\*[\\s\\S]*?\\*/|//.*"], ["meta", "@\\w+"], ["str", STR + "|'(?:[^'\\\\\\n]|\\\\.)'"],
+            ["kw", words(KW.java)], ["num", NUM + "|" + CONST], ["fn", CALL], ["type", TYPE]],
+        python: [["com", "#.*"], ["str", "[rbfRBF]{0,2}(?:\"\"\"[\\s\\S]*?\"\"\"|'''[\\s\\S]*?'''|" + STR +
+            "|'(?:[^'\\\\\\n]|\\\\.)*')"], ["meta", "@\\w+"], ["kw", words(KW.python)], ["num", NUM + "|" + CONST],
+            ["fn", CALL], ["type", TYPE]],
+        sh: [["com", "(?:^|(?<=\\s))#.*"], ["str", STR + "|'[^'\\n]*'"], ["var", "\\$\\{?\\w+\\}?|\\b\\w+(?==)"],
+            ["fn", "(?:^|(?<=(?:[|;&(]|\\$\\()\\s*))[\\w./][\\w./+-]*"], ["meta", "(?<=\\s)--?[A-Za-z][\\w-]*"]],
+        yaml: [["com", "(?:^|(?<=\\s))#.*"], ["var", "[\\w.-]+(?=:(?:\\s|$))"], ["str", STR + "|'[^'\\n]*'"],
+            ["num", NUM]],
+        toml: [["com", "#.*"], ["meta", "^\\s*\\[[^\\]\\n]*\\]"], ["var", "[\\w.-]+(?=\\s*=)"], ["str", STR],
+            ["num", NUM + "|\\b(?:true|false)\\b"]],
+        xml: [["com", "<!--[\\s\\S]*?-->"], ["kw", "</?[\\w:.-]+|/?>"], ["var", "[\\w:-]+(?==)"], ["str", STR]]
+    };
+    var hlRe = {};
+
+    function esc(s) {
+        return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    function highlight(code, lang) {
+        var rules = HL[lang];
+        if (!rules) return;
+        var re = hlRe[lang] || (hlRe[lang] = new RegExp(rules.map(function (r) { return "(" + r[1] + ")"; }).join("|"),
+            "gm"));
+        var text = code.textContent, out = "", at = 0, m;
+        re.lastIndex = 0;
+        while ((m = re.exec(text))) {
+            if (!m[0]) {
+                re.lastIndex++;
+                continue;
+            }
+            for (var k = 1; k < m.length && m[k] === undefined; k++);
+            out += esc(text.slice(at, m.index)) + '<span class="tok-' + rules[k - 1][0] + '">' + esc(m[0]) + "</span>";
+            at = m.index + m[0].length;
+        }
+        code.innerHTML = out + esc(text.slice(at));
+    }
+
+    function initHighlight() {
+        var blocks = document.querySelectorAll('pre > code[class*="language-"]');
+        for (var i = 0; i < blocks.length; i++) {
+            var m = /language-(\w+)/.exec(blocks[i].className);
+            try {
+                highlight(blocks[i], m[1]);
+            } catch (e) {
+                /* an engine without lookbehind: the code stays plain */
+            }
+        }
+    }
+
     function copy(e) {
         var btn = e.currentTarget;
         var text = btn.parentNode.querySelector("code").textContent;
@@ -392,6 +474,7 @@
         initPanels();
         initToc();
         initTabs();
+        initHighlight();
         initCopy();
         initCharts();
     }
