@@ -105,7 +105,10 @@ such as days of minute readings, come mostly from stored summaries.</p>
 <h2 id="lttb">Downsampling for charts (LTTB)</h2>
 <p>A chart 1,000 pixels wide does not need a million points. LTTB (largest triangle three buckets) picks at most the
 number of points you ask for, so that the line keeps its shape: the peaks and dips stay. Every point it returns is a
-real stored point.</p>
+real stored point. The method comes from Sveinn Steinarsson's master's thesis,
+<a href="https://skemman.is/handle/1946/15343">Downsampling Time Series for Visual Representation</a> (University of
+Iceland, 2013), which also has <a href="https://github.com/sveinn-steinarsson/flot-downsample">his reference
+code</a>.</p>
 
 <h2 id="delete">Deletes</h2>
 <p>You can delete the values of one series in a time range <code>[start, end)</code>. Queries stop seeing them at once;

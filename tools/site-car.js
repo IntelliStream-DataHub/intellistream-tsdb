@@ -345,38 +345,60 @@
     });
 
     /* ---- wheels: tyres as tori, rims with spokes, brake ducts, wheel covers ---- */
-    function wheel(cx, cy, cz, R, width, s) {
-        var rimR = 0.23, tube = (R - rimR) / 2, mid = rimR + tube, hw = width / 2;
-        var major = 22, minor = 8, k;
-        var grid = [];
-        for (var i = 0; i < major; i++) {
-            var a = (i / major) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+
+    /* The turning parts (the tyre's cross-section rings, the spokes, the hub nut) repeat every 30 degrees (24 rings,
+     * 12 spokes), so SPIN_FRAMES copies of them, turned a step further each, played in a loop, make the wheels roll;
+     * the rest of a wheel looks the same at any angle and is drawn once. */
+    var SPIN_FRAMES = 6, SPIN_STEP = Math.PI / 6 / SPIN_FRAMES, wheels = [];
+
+    function wheelTorus(R) {
+        var rimR = 0.23, tube = (R - rimR) / 2;
+        return { rimR: rimR, tube: tube, mid: rimR + tube };
+    }
+
+    /* a point of the tyre: angle a around the axle, b around the tube; a grows the way the car rolls forward */
+    function tyrePoint(w, a, b) {
+        var t = wheelTorus(w.R), rr = t.mid + t.tube * Math.cos(b) * 1.05;
+        return [w.cx + Math.cos(a) * rr, w.cy + Math.sin(a) * rr, w.cz + (w.width / 2) * Math.sin(b) * 0.98];
+    }
+
+    function wheelSpin(w, phase) {
+        var minor = 8, rimR = wheelTorus(w.R).rimR, s = w.s, i, k;
+        var zo = w.cz + s * (w.width / 2) * 0.7, cx = w.cx, cy = w.cy;
+        for (i = 0; i < 24; i++) {
             var ring = [];
-            for (k = 0; k < minor; k++) {
-                var b = (k / minor) * Math.PI * 2;
-                var rr = mid + tube * Math.cos(b) * 1.05, zz = hw * Math.sin(b) * 0.98;
-                ring.push([cx + ca * rr, cy + sa * rr, cz + zz]);
-            }
-            grid.push(ring);
+            for (k = 0; k < minor; k++) ring.push(tyrePoint(w, phase + (i / 24) * Math.PI * 2, (k / minor) * Math.PI * 2));
             poly(ring, true);
         }
-        for (k = 0; k < minor; k++) poly(grid.map(function (r) { return r[k]; }), true);
-        /* rim face, spokes and the hub nut on the outer side; the wheel cover's rim on the inner side */
-        var zo = cz + s * hw * 0.7, zi = cz - s * hw * 0.7, face = [], hub = [], cover = [];
+        var hub = [];
+        for (i = 0; i < 12; i++) {
+            var a = phase + (i / 12) * Math.PI * 2;
+            hub.push([cx + Math.cos(a) * 0.05, cy + Math.sin(a) * 0.05, zo + 0.02 * s]);
+            line([cx + Math.cos(a) * 0.06, cy + Math.sin(a) * 0.06, zo + 0.01 * s],
+                [cx + Math.cos(a + 0.12) * rimR * 0.97, cy + Math.sin(a + 0.12) * rimR * 0.97, zo]);
+        }
+        poly(hub, true);
+    }
+
+    function wheel(cx, cy, cz, R, width, s) {
+        var w = { cx: cx, cy: cy, cz: cz, R: R, width: width, s: s }, hw = width / 2, i, k;
+        var rimR = wheelTorus(R).rimR;
+        wheels.push(w);
+        /* the tyre's circles around the axle (a polygon of 48 sides looks the same turned by a frame's step) */
+        for (k = 0; k < 8; k++) {
+            var circle = [];
+            for (i = 0; i < 48; i++) circle.push(tyrePoint(w, (i / 48) * Math.PI * 2, (k / 8) * Math.PI * 2));
+            poly(circle, true);
+        }
+        /* the rim's face on the outer side; the wheel cover's rim on the inner side */
+        var zo = cz + s * hw * 0.7, zi = cz - s * hw * 0.7, face = [], cover = [];
         for (i = 0; i < 24; i++) {
             var a2 = (i / 24) * Math.PI * 2;
             face.push([cx + Math.cos(a2) * rimR, cy + Math.sin(a2) * rimR, zo]);
             cover.push([cx + Math.cos(a2) * rimR, cy + Math.sin(a2) * rimR, zi]);
-            if (i % 3 === 0) hub.push([cx + Math.cos(a2) * 0.05, cy + Math.sin(a2) * 0.05, zo + 0.02 * s]);
         }
         poly(face, true);
         poly(cover, true);
-        poly(hub, true);
-        for (i = 0; i < 12; i++) {
-            var a3 = (i / 12) * Math.PI * 2;
-            line([cx + Math.cos(a3) * 0.06, cy + Math.sin(a3) * 0.06, zo + 0.01 * s],
-                [cx + Math.cos(a3 + 0.12) * rimR * 0.97, cy + Math.sin(a3 + 0.12) * rimR * 0.97, zo]);
-        }
         /* brake duct: a scoop inside the wheel */
         var d = cz - s * (hw + 0.02);
         poly([[cx - 0.1, cy + 0.06, d], [cx + 0.12, cy + 0.08, d], [cx + 0.12, cy - 0.08, d], [cx - 0.1, cy - 0.06, d]],
@@ -460,8 +482,20 @@
         return depth > 0.3 ? 0 : depth > -0.35 ? 1 : 2;
     }
 
+    /* the turning parts of every wheel, one set of polylines per frame */
+    function spinFrames() {
+        var keep = lines, frames = [];
+        for (var f = 0; f < SPIN_FRAMES; f++) {
+            lines = [];
+            wheels.forEach(function (w) { wheelSpin(w, f * SPIN_STEP); });
+            frames.push(lines);
+        }
+        lines = keep;
+        return frames;
+    }
+
     /* every polyline projected and cut into runs per depth layer; returns {d: [far, mid, near], segs, box} */
-    function render() {
+    function render(lines) {
         var out = [[], [], []], last = [null, null, null], segs = 0;
         var box = [1e9, 1e9, -1e9, -1e9];
         for (var i = 0; i < lines.length; i++) {
@@ -542,7 +576,7 @@
         }
         void px;
         void py;
-        var r = render(), b = r.box;
+        var r = render(lines), b = r.box;
         var minx = b[0], miny = b[1], maxx = b[2], maxy = b[3];
         streaks.forEach(function (s) {
             miny = Math.min(miny, s[1], s[3]);
@@ -589,6 +623,15 @@
         out.push('<path class="far" pathLength="1" d="' + r.d[0] + '"/>');
         out.push('<path class="mid" pathLength="1" d="' + r.d[1] + '"/>');
         out.push('<path class="near" id="car-near" pathLength="1" filter="url(#car-glow)" d="' + r.d[2] + '"/>');
+        /* the wheels' turning parts, a frame each, shown one at a time by site.css */
+        out.push('<g class="spin">');
+        spinFrames().forEach(function (fl, f) {
+            var fr = render(fl);
+            out.push('<g style="--f:' + f + '"><path class="far" pathLength="1" d="' + fr.d[0] + '"/>' +
+                '<path class="mid" pathLength="1" d="' + fr.d[1] + '"/>' +
+                '<path class="near" pathLength="1" filter="url(#car-glow)" d="' + fr.d[2] + '"/></g>');
+        });
+        out.push("</g>");
         out.push("</svg>");
         return out.join("\n");
     }
@@ -597,7 +640,7 @@
         module.exports = { render: render, svg: svg, proj: proj, VIEW: VIEW, lines: lines, edgeCount: edgeCount };
         if (require.main === module) {
             if (process.argv[2] === "--stats") {
-                var s = svg(), r = render();
+                var s = svg(), r = render(lines);
                 process.stdout.write("edges " + edgeCount() + ", segments drawn " + r.segs + ", svg " + s.length +
                     " bytes (far " + r.d[0].length + ", mid " + r.d[1].length + ", near " + r.d[2].length + ")\n");
             } else process.stdout.write(svg() + "\n");

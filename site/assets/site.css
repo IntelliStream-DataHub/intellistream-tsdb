@@ -541,6 +541,16 @@ th.num {
     opacity: 0.06;
 }
 
+/* the wheels' turning parts: six frames 5 degrees apart (tools/site-car.js); the first alone under reduced motion,
+ * otherwise one at a time in a loop, so the wheels roll forward */
+.car3d .spin > g {
+    visibility: hidden;
+}
+
+.car3d .spin > g:first-child {
+    visibility: visible;
+}
+
 /* streaks: still lines under reduced motion, rushing backwards otherwise */
 .car3d .streak {
     fill: none;
@@ -580,6 +590,22 @@ th.num {
 
     .hero-track {
         animation: track 0.5s linear infinite;
+    }
+
+    /* frame f is shown in the f-th sixth of each turn of 30 degrees */
+    .car3d .spin > g {
+        animation: spin-frame 0.21s linear infinite;
+        animation-delay: calc((var(--f) - 6) * 0.035s);
+    }
+}
+
+@keyframes spin-frame {
+    0% {
+        visibility: visible;
+    }
+    16.6667%,
+    100% {
+        visibility: hidden;
     }
 }
 
