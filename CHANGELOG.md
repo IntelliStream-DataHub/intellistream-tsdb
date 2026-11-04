@@ -163,7 +163,10 @@ Clients and bindings
   distribution `intellistream-tsdb-client`; the imports stay `tsdb_client` and `tsdb_sys`, and the Java artifacts
   (`ai.intellistream:tsdb-client`) are unchanged.
 - Apache Pulsar 5 sink (`connectors/pulsar`): Pulsar holds the points while tsdb is down, and a point is taken off
-  Pulsar once it is on disk.
+  Pulsar once it is on disk. A sink instance takes all series or chosen ones (`series`, `seriesPrefixes`,
+  `seriesPattern`; the rest are acknowledged and counted in `tsdb_skipped_records` / `tsdb_skipped_points`), and
+  `volumes` creates new series in the volume their name maps to (a volume tsdbd does not know dead-letters the
+  message).
 
 The command line (`tsdb`) and tools
 - `tsdb` creates series, inserts, queries, deletes, sets retention, adds volumes, shows stats, parts and series,

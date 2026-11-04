@@ -37,21 +37,6 @@ final class Tsdbd implements AutoCloseable {
         this.rootPassword = rootPassword;
     }
 
-    /** The CLI beside the tsdbd binary. */
-    static Path cliBinary() {
-        return binary().resolveSibling("tsdb");
-    }
-
-    /** Runs {@code tsdb DIR ARGS...} (offline: the USERS file, beside a running tsdbd or before one starts). */
-    static void cli(Path dir, String... args) throws IOException, InterruptedException {
-        List<String> cmd = new ArrayList<>(List.of(cliBinary().toString(), dir.toString()));
-        cmd.addAll(List.of(args));
-        Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
-        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-        if (p.waitFor() != 0)
-            throw new IllegalStateException(String.join(" ", cmd) + " failed: " + out);
-    }
-
     /** A password file holding {@code password} in its first line, beside the database directory. */
     static Path passwordFile(Path dir, String name, String password) throws IOException {
         Path f = dir.resolveSibling(dir.getFileName() + "." + name + ".pw");
@@ -75,6 +60,37 @@ final class Tsdbd implements AutoCloseable {
 
     static Path binary() {
         return Paths.get(System.getProperty("tsdbd", "../../build/tsdbd")).toAbsolutePath().normalize();
+    }
+
+    /** The command line tool next to tsdbd (build/tsdb). */
+    static Path cli() {
+        return binary().resolveSibling("tsdb");
+    }
+
+    /**
+     * Runs {@code tsdb DIR args...} and returns its standard output. {@code volume add} and {@code user ...} (the
+     * USERS file) work before the server starts and while it runs; listing series needs the database closed (the
+     * server stopped).
+     */
+    static String cli(Path dir, String... args) throws IOException, InterruptedException {
+        if (!Files.isExecutable(cli()))
+            throw new IllegalStateException(cli() + " is missing: run make in the repository root first");
+        List<String> cmd = new ArrayList<>(List.of(cli().toString(), dir.toString()));
+        cmd.addAll(List.of(args));
+        Path out = Files.createTempFile(dir.getParent(), "tsdb-cli-", ".out");
+        try {
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).redirectOutput(out.toFile()).start();
+            if (!p.waitFor(60, TimeUnit.SECONDS)) {
+                p.destroyForcibly().waitFor();
+                throw new IllegalStateException(cmd + " did not finish");
+            }
+            String s = Files.readString(out, StandardCharsets.UTF_8);
+            if (p.exitValue() != 0)
+                throw new IllegalStateException(cmd + " failed (" + p.exitValue() + "): " + s);
+            return s;
+        } finally {
+            Files.deleteIfExists(out);
+        }
     }
 
     static Path scratch(String prefix) throws IOException {

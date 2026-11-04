@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -183,6 +184,39 @@ public class TsdbSinkConfig {
     @FieldDoc(required = false, defaultValue = "points", help = "record field with an array of points (batch message)")
     public String pointsField = "points";
 
+    /**
+     * Exact names of the series this sink instance writes. Together with {@link #seriesPrefixes} and
+     * {@link #seriesPattern}; when none of the three is set, every series is written.
+     */
+    @FieldDoc(required = false, defaultValue = "",
+            help = "series this instance writes: exact names. With seriesPrefixes and seriesPattern they add up; "
+                    + "none of the three set: all series. Messages for other series are acknowledged and dropped")
+    public List<String> series = new ArrayList<>();
+
+    /** Prefixes of the names of the series this sink instance writes; how tenants are named. */
+    @FieldDoc(required = false, defaultValue = "",
+            help = "series this instance writes: name prefixes, e.g. a tenant's. Adds up with series and "
+                    + "seriesPattern. Messages for other series are acknowledged and dropped")
+    public List<String> seriesPrefixes = new ArrayList<>();
+
+    /** A Java regular expression the whole name of a series must match to be written. */
+    @FieldDoc(required = false, defaultValue = "",
+            help = "series this instance writes: a Java regular expression the whole name must match. Adds up "
+                    + "with series and seriesPrefixes. Messages for other series are acknowledged and dropped")
+    public String seriesPattern = "";
+
+    /**
+     * Volume paths for new series: a name prefix (or a whole name) to the path of a volume on the tsdbd host. The
+     * longest matching key wins; unmatched names are created in the database directory.
+     */
+    @FieldDoc(required = false, defaultValue = "",
+            help = "volume for new series: name prefix or name to an absolute volume path, longest prefix wins; "
+                    + "other series go to the database directory. The operator must add the volume first "
+                    + "(tsdb DIR volume add PATH), else the message is dead-lettered")
+    public Map<String, String> volumes = new HashMap<>();
+
+    private SeriesSelection selection;
+
     /** Status codes treated as permanent in addition to (or instead of) the defaults, e.g. "-4,-6". */
     @FieldDoc(required = false, defaultValue = "",
             help = "tsdb status codes to treat as permanent (dead-letter), comma separated; overrides the default")
@@ -220,6 +254,13 @@ public class TsdbSinkConfig {
         /* Pulsar keeps the sink config in its metadata store and shows it to anyone who may list sinks */
         require(!m.containsKey("password"), "password belongs in the sink's secrets (--secrets '{\"password\": ...}'), "
                 + "not in its configuration; or use passwordFile");
+        /* a single name is a list of one; done here because IOConfigUtils converts with a mapper of its own */
+        for (String k : List.of("series", "seriesPrefixes")) {
+            if (m.get(k) instanceof String one) {
+                m = new HashMap<>(m);
+                m.put(k, List.of(one));
+            }
+        }
         TsdbSinkConfig c;
         try {
             c = ctx == null
@@ -256,6 +297,7 @@ public class TsdbSinkConfig {
         require(seriesCacheBytes >= 1, "seriesCacheBytes must be positive");
         require(stateCacheSize >= 1, "stateCacheSize must be positive");
         require(closeTimeoutMs >= 0, "closeTimeoutMs must not be negative");
+        selection = new SeriesSelection(series, seriesPrefixes, seriesPattern, volumes);
         defaultValueType();
         codes(permanentCodes);
         codes(retryableCodes);
@@ -303,6 +345,17 @@ public class TsdbSinkConfig {
             return o;
         o = o.user(user);
         return password != null && !password.isEmpty() ? o.password(password) : o.passwordFile(Path.of(passwordFile));
+    }
+
+    /**
+     * Which series this instance takes and where new ones are created.
+     *
+     * @return the selection built by {@link #validate()}
+     */
+    SeriesSelection selection() {
+        if (selection == null)
+            selection = new SeriesSelection(series, seriesPrefixes, seriesPattern, volumes);
+        return selection;
     }
 
     /**

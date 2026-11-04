@@ -287,17 +287,32 @@ final class Shard implements Runnable {
         }
     }
 
+    /** Volume paths tsdbd refused, to log each once at error level (every dead letter names the path anyway). */
+    private final java.util.Set<String> missingVolumes = new java.util.HashSet<>();
+
     private Resolved resolve(Point p) throws Exception {
         SeriesCache.Entry e = cache.get(p.series);
         if (e == null) {
+            String volume = null;
             try {
                 e = conn.lookup(p.series);
                 if (e == null) {
                     if (!c.autoCreate)
                         throw new PoisonException("series " + Point.brief(p.series) + " does not exist", Status.ERR_NOTFOUND);
-                    e = conn.create(p.series, p.type != null ? p.type : defaultType);
+                    volume = c.selection().volumeFor(p.series);
+                    e = conn.create(p.series, p.type != null ? p.type : defaultType, volume);
                 }
             } catch (TsdbException | IllegalArgumentException x) {
+                if (volume != null && x instanceof TsdbException && ((TsdbException) x).status() == Status.ERR_NOTFOUND
+                        && classifier.classify(x) == ErrorClassifier.Kind.PERMANENT) {
+                    /* tsdbd never adds a volume: only an operator can, so name the path where it can be read */
+                    String why = "volume " + Point.clip(volume) + " for series " + Point.brief(p.series)
+                            + " is not known to tsdbd; an operator must add it first (tsdb DIR volume add PATH)";
+                    if (missingVolumes.add(volume))
+                        log.error("tsdb sink shard {}: {}; messages for series mapped to it are dead-lettered until "
+                                + "it is added", index, why);
+                    throw new PoisonException(why, Status.ERR_NOTFOUND);
+                }
                 if (classifier.classify(x) == ErrorClassifier.Kind.PERMANENT)
                     throw new PoisonException("series " + Point.brief(p.series) + ": " + x.getMessage(),
                             x instanceof TsdbException ? ((TsdbException) x).status() : Status.ERR_INVALID);

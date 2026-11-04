@@ -23,8 +23,13 @@ interface TsdbConnection extends AutoCloseable {
     /** The id and type of a series, or {@code null} if it does not exist. */
     SeriesCache.Entry lookup(String name) throws TsdbException;
 
-    /** Creates a series (or returns the existing one if it has this type). */
-    SeriesCache.Entry create(String name, ValueType type) throws TsdbException;
+    /**
+     * Creates a series (or returns the existing one if it has this type).
+     *
+     * @param volume the path of the volume to create it in, or {@code null} for the database directory; tsdbd
+     *     answers {@code NOTFOUND} for a path the operator has not added
+     */
+    SeriesCache.Entry create(String name, ValueType type, String volume) throws TsdbException;
 
     /** The code of a state name of a state series, created if new. */
     int state(long series, String name) throws TsdbException;
@@ -107,8 +112,8 @@ interface TsdbConnection extends AutoCloseable {
         }
 
         @Override
-        public SeriesCache.Entry create(String name, ValueType type) throws TsdbException {
-            return new SeriesCache.Entry(c.seriesCreate(name, type), type);
+        public SeriesCache.Entry create(String name, ValueType type, String volume) throws TsdbException {
+            return new SeriesCache.Entry(c.seriesCreate(name, type, volume), type);
         }
 
         @Override

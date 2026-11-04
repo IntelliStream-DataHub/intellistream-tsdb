@@ -173,6 +173,110 @@ warning per try that says the login was refused, and Pulsar keeps the messages
 meanwhile. A message for a series the user has no right on is refused by tsdbd
 (`TSDB_ERR_DENIED`) and goes to the dead-letter topic; the rest is written.
 
+## Choosing series and volumes
+
+One sink instance takes **all** series by default. To split the work (one sink
+per tenant, or one sink for a few special series), tell the instance which series
+are its own:
+
+| key | meaning |
+|---|---|
+| `series` | a list of exact series names |
+| `seriesPrefixes` | a list of name prefixes: how tenants are usually named (`acme.`, `globex.`) |
+| `seriesPattern` | a Java regular expression the **whole** name must match (`pump[0-9]+\.flow`) |
+
+The three add up: a series is taken if it is in `series`, or starts with one
+of the `seriesPrefixes`, or matches `seriesPattern`. If none of the three is set,
+every series is taken.
+
+**What is not taken is dropped.** A message whose series is outside the
+selection is acknowledged and skipped: it is never written to tsdb and it does
+not go to the dead-letter topic. If a message holds several points (the
+`points` array), the points that are taken are written and the others are
+dropped. So the instances together must cover all series: when two sinks read the
+same topic, a series that neither of them takes is lost without an error. Give
+each series to exactly one instance (two instances that both take it would write
+it twice, which is harmless but wasteful). The sink counts what it drops in
+`tsdb_skipped_records` and `tsdb_skipped_points` and writes a log line the first
+time, and again at 10, 100, 1000... dropped points, with an example name, so a
+wrong selection is easy to see.
+
+Each series lives in one **volume**: a directory on the tsdbd host, often one
+per disk or NFS mount. `volumes` says where a **new** series is created:
+
+| key | meaning |
+|---|---|
+| `volumes` | a map from a name prefix (or a whole series name) to the absolute path of a volume on the tsdbd host. The longest matching key wins. Names that no key matches are created in the database directory |
+
+Only the creation of a series is affected: a series that already exists stays
+in its volume, whatever the map says. The map is independent of the selection,
+so a sink that takes everything can still sort tenants into volumes.
+
+tsdbd never adds a volume by itself. **The operator adds the volume first**,
+with the command line tool on the tsdbd host:
+
+```sh
+tsdb /var/lib/tsdb volume add /mnt/acme       # also while tsdbd runs
+tsdb /var/lib/tsdb volume list
+```
+
+If a message names a volume that was not added, tsdbd answers `NOTFOUND` for the
+path. The sink treats that as permanent for that message: it goes to the
+dead-letter path, the log says (once per path, at error level)
+`volume /mnt/acme for series acme.pump.flow is not known to tsdbd; an operator
+must add it first`, and the `tsdb-error` reason of every such dead letter names the path. The
+stream keeps going. Once the operator has added the volume tsdbd picks it up when
+the next request names it, and new messages are written; the dead-lettered
+messages stay where they are, to be replayed. (`retryableCodes: "-6"`, with the code number of `NOTFOUND`
+from `ai.intellistream.tsdb.Status`, turns this into waiting instead: the sink
+retries and the stream stalls until the volume is added.)
+
+### Example: two tenants into two volumes
+
+One sink for the whole topic, which sorts the series of two tenants into two
+volumes (and everything else into the database directory):
+
+```json
+{
+  "hosts": "tsdb1:7070",
+  "deadLetterTopic": "topic://public/default/points-dlq",
+  "volumes": {
+    "acme.":   "/mnt/acme",
+    "globex.": "/mnt/globex"
+  }
+}
+```
+
+Or one sink per tenant, each with its own subscription name and its own
+dead-letter topic, if the tenants should not hold each other up:
+
+```json
+{
+  "hosts": "tsdb1:7070",
+  "deadLetterTopic": "topic://public/default/acme-dlq",
+  "seriesPrefixes": ["acme."],
+  "volumes": { "acme.": "/mnt/acme" }
+}
+```
+
+Start the second sink the same way with `"seriesPrefixes": ["globex."]`, and a
+third (or no selection at all, if one sink may take everything else) for the
+rest. Each sink must have its own `--subs-name`, or Pulsar shares the messages
+between them and a message can reach the wrong sink and be dropped.
+
+### Example: only these three series
+
+```json
+{
+  "hosts": "tsdb1:7070",
+  "deadLetterTopic": "topic://public/default/points-dlq",
+  "series": ["pump7.flow", "pump7.temp", "tank1.bar"]
+}
+```
+
+Everything else on the topic is acknowledged and skipped by this sink; run
+another sink for it, or it is gone.
+
 ## Configuration
 
 | key | default | meaning |
@@ -202,6 +306,8 @@ meanwhile. A message for a series the user has no right on is refused by tsdbd
 | `stateCacheSize` | `4096` | state names remembered per state series; a forgotten one is asked from tsdbd again (same code) |
 | `closeTimeoutMs` | `30000` | how long stopping waits for batches in flight; what is not written by then stays unacknowledged |
 | `seriesField`, `timestampField`, `valueField`, `typeField`, `pointsField` | `series`, `ts`, `value`, `type`, `points` | field names |
+| `series`, `seriesPrefixes`, `seriesPattern` | all series | which series this instance takes; the rest are acknowledged and dropped (see above) |
+| `volumes` | empty | prefix or name to the absolute path of a volume for new series; longest prefix wins; the operator adds the volume first (see above) |
 | `permanentCodes`, `retryableCodes` | empty | tsdb status codes to treat as permanent or retryable, overriding the defaults below |
 
 ## Errors
@@ -212,6 +318,7 @@ meanwhile. A message for a series the user has no right on is refused by tsdbd
 | `LOCKED`, `STOPPED`, `READONLY` (a follower after a failover, a server shutting down) | as above, but first closes the connection, so the retry goes to the next endpoint in `hosts` |
 | `AUTH`: the login was refused (wrong password, unknown or dropped user), or tsdbd wants a login and `user` is empty | waits and tries again with backoff, as above; logs one warning per try that names the login |
 | `TSDB_ERR_INVALID` (bad name, wrong type), `NOTFOUND` (unknown series, `autoCreate=false`), `DENIED` (the user has no right on the series), `TOO_MANY_BUCKETS`; a message that does not parse; a value that is tsdb's encoding of null (int64 `-9223372036854775808`, the reserved NaN of float32/float64), which would silently read back as null | dead-letters that message; the rest of the batch is written |
+| a new series maps (`volumes`) to a volume path tsdbd does not know (`NOTFOUND` on create) | dead-letters that message with a reason naming the path, and logs the path once at error level; the operator adds the volume (`tsdb DIR volume add PATH`) and later messages are written |
 | the dead-letter topic refuses the message | keeps it unacknowledged and tries again (backoff), so the stream behind it waits; counted in `tsdb_dead_letter_failures`, logged as an error when only an operator can fix it (permissions, missing topic, size limit) |
 
 A tsdb that stops answering (an NFS outage parks its requests, a dead peer sends
@@ -243,7 +350,8 @@ to 1000 characters.
 ## Metrics
 
 Reported through the sink context: `tsdb_records_written`, `tsdb_rows_written`,
-`tsdb_retries`, `tsdb_dead_lettered`, `tsdb_dead_letter_failures` (alert on it:
+`tsdb_retries`, `tsdb_dead_lettered`, `tsdb_skipped_records` and `tsdb_skipped_points` (messages and points
+dropped because their series is outside `series` / `seriesPrefixes` / `seriesPattern`), `tsdb_dead_letter_failures` (alert on it:
 the stream waits for the dead-letter topic), `tsdb_backoff_ms` (current delay, 0
 when healthy) and `tsdb_batch_latency_ms`.
 
@@ -251,7 +359,7 @@ when healthy) and `tsdb_batch_latency_ms`.
 
 ```sh
 make                                     # build/tsdbd, in the repository root
-cd connectors/pulsar && mvn test         # unit tests, and tests against build/tsdbd (kill -9 included)
+cd connectors/pulsar && mvn test         # unit tests, and tests against build/tsdbd and build/tsdb (kill -9, volumes)
 connectors/pulsar/test/integration.sh    # Pulsar 5.0.0 in Podman, faults; a few minutes
 ```
 

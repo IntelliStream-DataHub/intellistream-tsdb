@@ -46,6 +46,9 @@ public class TsdbSink implements Sink<GenericObject> {
     private Metrics metrics;
     private Logger log = LoggerFactory.getLogger(TsdbSink.class);
     private volatile boolean closed;
+    private SeriesSelection selection;
+    /* only write() touches it, and Pulsar calls write() from one thread */
+    private long nextSkipLog = 1;
     private TsdbConnection.Factory factory;
 
     /** Creates a sink; Pulsar calls {@link #open} next. */
@@ -90,6 +93,7 @@ public class TsdbSink implements Sink<GenericObject> {
             throw new IllegalArgumentException("deadLetterTopic is required with retainOrdering / retainKeyOrdering: "
                     + "there an invalid record could only fail the instance");
         metrics = new Metrics(ctx);
+        selection = c.selection();
         parser = new PointParser(c);
         limiter = new InFlightLimiter(c.maxInFlightRecords, c.maxInFlightBytes);
         if (dl != null)
@@ -111,9 +115,9 @@ public class TsdbSink implements Sink<GenericObject> {
             shards[i] = new Shard(i, c, factory, classifier, metrics, this::settled, log);
         for (Shard s : shards)
             s.start();
-        log.info("tsdb sink: {} connection(s) to {} {}, batches of {} rows / {} ms, in flight {} records / {} bytes",
-                c.connections, c.hosts, c.user.isEmpty() ? "without login" : "as user " + c.user, c.batchRows,
-                c.lingerMs, c.maxInFlightRecords, c.maxInFlightBytes);
+        log.info("tsdb sink: {} connection(s) to {} {}, batches of {} rows / {} ms, in flight {} records / {} bytes; "
+                + "takes {}", c.connections, c.hosts, c.user.isEmpty() ? "without login" : "as user " + c.user,
+                c.batchRows, c.lingerMs, c.maxInFlightRecords, c.maxInFlightBytes, selection.describe());
     }
 
     /**
@@ -148,6 +152,21 @@ public class TsdbSink implements Sink<GenericObject> {
             settle(p);
             return;
         }
+        if (!selection.isAll()) {
+            List<Point> mine = new ArrayList<>(points.size());
+            for (Point pt : points)
+                if (selection.matches(pt.series))
+                    mine.add(pt);
+            if (mine.size() != points.size()) {
+                skipped(points, points.size() - mine.size(), mine.isEmpty());
+                if (mine.isEmpty()) {
+                    /* not ours: another sink instance takes it; acknowledged here so that it does not come back */
+                    record.ack();
+                    return;
+                }
+                points = mine;
+            }
+        }
         long size = 0;
         for (Point pt : points)
             size += pt.size();
@@ -180,6 +199,27 @@ public class TsdbSink implements Sink<GenericObject> {
                     b += pt.size();
                 shards[i].add(new Shard.Part(p, per.get(i), b));
             }
+    }
+
+    /**
+     * Counts points left out by the selection and says so in the log: the first time, then at every power of ten,
+     * so that a sink given the wrong selection is noticed without a line per message.
+     */
+    private void skipped(List<Point> points, int n, boolean whole) {
+        metrics.skipped(whole, n);
+        long total = metrics.skippedPoints();
+        if (total - n < nextSkipLog && total >= nextSkipLog) {
+            String example = "";
+            for (Point pt : points)
+                if (!config.selection().matches(pt.series)) {
+                    example = Point.brief(pt.series);
+                    break;
+                }
+            log.info("tsdb sink: {} point(s) so far were for series this instance does not take and were dropped "
+                    + "(acknowledged, not written), e.g. {}; another sink instance must take them", total, example);
+            while (nextSkipLog <= total)
+                nextSkipLog *= 10;
+        }
     }
 
     /** The shard of a series: a fixed function of the name, so all its points go through one connection. */
@@ -246,8 +286,9 @@ public class TsdbSink implements Sink<GenericObject> {
         for (Shard s : shards)
             s.join();
         deadLetter.close();
-        log.info("tsdb sink closed: {} records written, {} retries, {} dead-lettered, {} left unacknowledged",
-                metrics.written(), metrics.retries(), metrics.deadLetteredCount(), limiter.count());
+        log.info("tsdb sink closed: {} records written, {} retries, {} dead-lettered, {} dropped by the selection "
+                + "({} points), {} left unacknowledged", metrics.written(), metrics.retries(),
+                metrics.deadLetteredCount(), metrics.skippedRecords(), metrics.skippedPoints(), limiter.count());
     }
 
     /**

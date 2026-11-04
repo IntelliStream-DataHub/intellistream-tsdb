@@ -37,6 +37,10 @@ final class FakeTsdb implements TsdbConnection.Factory {
 
     final Map<String, SeriesCache.Entry> series = new HashMap<>();
     final Map<Long, String> names = new HashMap<>();
+    /** Volume paths the operator added; creating a series in any other is refused with NOTFOUND, as tsdbd does. */
+    final Set<String> volumes = new HashSet<>();
+    /** The volume path each series was created with (null: the database directory). */
+    final Map<String, String> volumeOf = new HashMap<>();
     /** STATE_NAME requests, to tell cache hits from lookups. */
     final java.util.concurrent.atomic.AtomicInteger stateCalls = new java.util.concurrent.atomic.AtomicInteger();
     final List<Row> rows = new ArrayList<>();
@@ -107,9 +111,11 @@ final class FakeTsdb implements TsdbConnection.Factory {
         }
 
         @Override
-        public SeriesCache.Entry create(String name, ValueType type) throws TsdbException {
+        public SeriesCache.Entry create(String name, ValueType type, String volume) throws TsdbException {
             check();
             synchronized (FakeTsdb.this) {
+                if (volume != null && !volumes.contains(volume))
+                    throw new TsdbException(Status.ERR_NOTFOUND, "no volume " + volume, null);
                 SeriesCache.Entry e = series.get(name);
                 if (e != null && e.type != type)
                     throw new TsdbException(Status.ERR_INVALID);
@@ -117,6 +123,7 @@ final class FakeTsdb implements TsdbConnection.Factory {
                     e = new SeriesCache.Entry(series.size() + 1, type);
                     series.put(name, e);
                     names.put(e.id, name);
+                    volumeOf.put(name, volume);
                 }
                 return new SeriesCache.Entry(e.id, e.type);
             }

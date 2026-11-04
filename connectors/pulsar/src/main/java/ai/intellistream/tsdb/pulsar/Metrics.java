@@ -15,6 +15,8 @@ public final class Metrics {
     final AtomicLong batches = new AtomicLong();
     final AtomicLong backoffMs = new AtomicLong();
     final AtomicLong deadLetterFailures = new AtomicLong();
+    final AtomicLong skippedRecords = new AtomicLong();
+    final AtomicLong skippedPoints = new AtomicLong();
 
     Metrics(SinkContext ctx) {
         this.ctx = ctx;
@@ -47,6 +49,16 @@ public final class Metrics {
         record("dead_lettered", 1);
     }
 
+    /** A record none of whose points is selected, or one point of a message that has some that are. */
+    void skipped(boolean wholeRecord, long points) {
+        if (wholeRecord) {
+            skippedRecords.incrementAndGet();
+            record("skipped_records", 1);
+        }
+        skippedPoints.addAndGet(points);
+        record("skipped_points", points);
+    }
+
     void deadLetterFailure() {
         deadLetterFailures.incrementAndGet();
         record("dead_letter_failures", 1);
@@ -59,6 +71,24 @@ public final class Metrics {
      */
     public long deadLetterFailures() {
         return deadLetterFailures.get();
+    }
+
+    /**
+     * Records acknowledged without being written because none of their series is selected.
+     *
+     * @return the count since open
+     */
+    public long skippedRecords() {
+        return skippedRecords.get();
+    }
+
+    /**
+     * Points left out because their series is not selected (also those of messages that were written in part).
+     *
+     * @return the count since open
+     */
+    public long skippedPoints() {
+        return skippedPoints.get();
     }
 
     /**
