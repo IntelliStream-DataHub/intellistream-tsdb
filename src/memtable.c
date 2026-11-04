@@ -327,7 +327,7 @@ static int mt_write(eng *db, const memtable *m, part_list *out)
                 memcpy((uint8_t *)v + 4 * i, &x, 4);
             }
         /* in (series, ts) order; insert_rows re-sorts only when partitions interleave */
-        rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false, ucls, NULL);
+        rc = insert_rows(db, type, s, 0, t, v, k, m->wal_seq, out, false, ucls, NULL, NULL);
     }
     free(s);
     free(t);
@@ -543,11 +543,190 @@ int wal_commit(eng *db, uint64_t target)
 
 /* ---------------------------------------------------------------- writes */
 
+/* The keys of a large insert (internal.h, lw_fence), in one pass over the rows. Rows of a batch come in any order
+ * of series (time-major from collectors, series-major from loads): a block of LW_BLOCK rows of one series is one
+ * update; in a mixed block each of LW_LANES rows in turn updates a table of its own, without branches, so rows of
+ * one series close together never wait for each other's store. A batch of one series keeps one range and no table.
+ * 10 million rows of 1000 series (Ryzen 9 7950X): 8 ms time-major or in random order, 2 ms series-major; a branch
+ * per run of one series took 22 ms time-major, beside about 240 ms for the insert itself. */
+#define LW_LANES 4
+#define LW_BLOCK 64
+int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t cs, const int64_t *ts, size_t n)
+{
+    memset(f, 0, sizeof *f);
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    if (!series) {
+        for (size_t i = 0; i < n; i++) {
+            lo = ts[i] < lo ? ts[i] : lo;
+            hi = ts[i] > hi ? ts[i] : hi;
+        }
+        f->series = cs, f->lo = lo, f->hi = hi;
+        return 0;
+    }
+    /* per lane and bucket: lo, hi; the thread's grow-only buffer (a malloc of 256 KB is an mmap and 64 page faults
+     * per insert); an insert nested in another fence's window allocates its own */
+    const size_t bytes = LW_LANES * 2 * LW_BUCKETS * sizeof(int64_t);
+    int64_t *r = lw_table_take(bytes);
+    if (!r && (r = malloc(bytes)) != NULL)
+        f->r_heap = true;
+    if (!r)
+        return TSDB_ERR_NOMEM;
+    for (size_t b = 0; b < LW_LANES * LW_BUCKETS; b++)
+        r[2 * b] = INT64_MAX, r[2 * b + 1] = INT64_MIN;
+    uint32_t s0 = n ? series[0] : 0, diff = 0;
+    size_t i = 0;
+    for (; i + LW_BLOCK <= n; i += LW_BLOCK) {
+        uint32_t s = series[i], d = 0;
+        for (size_t k = 0; k < LW_BLOCK; k++)
+            d |= series[i + k] ^ s;
+        diff |= d | (s ^ s0);
+        if (d == 0) { /* a block of one series: one update */
+            int64_t blo = ts[i], bhi = ts[i], *q = r + 2 * (s % LW_BUCKETS);
+            for (size_t k = 1; k < LW_BLOCK; k++) {
+                blo = ts[i + k] < blo ? ts[i + k] : blo;
+                bhi = ts[i + k] > bhi ? ts[i + k] : bhi;
+            }
+            q[0] = MIN(q[0], blo);
+            q[1] = MAX(q[1], bhi);
+            continue;
+        }
+        for (size_t k = 0; k < LW_BLOCK; k += LW_LANES)
+            for (size_t l = 0; l < LW_LANES; l++) {
+                uint32_t sl = series[i + k + l];
+                int64_t t = ts[i + k + l], *q = r + 2 * (l * LW_BUCKETS + sl % LW_BUCKETS);
+                q[0] = t < q[0] ? t : q[0];
+                q[1] = t > q[1] ? t : q[1];
+            }
+    }
+    for (; i < n; i++) {
+        int64_t t = ts[i], *q = r + 2 * (series[i] % LW_BUCKETS);
+        diff |= series[i] ^ s0;
+        q[0] = t < q[0] ? t : q[0];
+        q[1] = t > q[1] ? t : q[1];
+    }
+    for (size_t b = 0; b < LW_BUCKETS; b++) {
+        for (size_t l = 1; l < LW_LANES; l++) {
+            const int64_t *q = r + 2 * (l * LW_BUCKETS + b);
+            r[2 * b] = MIN(r[2 * b], q[0]);
+            r[2 * b + 1] = MAX(r[2 * b + 1], q[1]);
+        }
+        lo = MIN(lo, r[2 * b]);
+        hi = MAX(hi, r[2 * b + 1]);
+    }
+    f->lo = lo, f->hi = hi, f->series = s0;
+    if (diff == 0) { /* one series */
+        if (f->r_heap)
+            free(r);
+        else
+            lw_table_put();
+        f->r_heap = false;
+        return 0;
+    }
+    f->nb = LW_BUCKETS;
+    f->r = r;
+    return 0;
+}
+
+void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end)
+{
+    memset(f, 0, sizeof *f);
+    f->series = series;
+    f->lo = start;
+    f->hi = end - 1; /* start < end */
+}
+
+bool lw_enter(eng *db, lw_fence *f)
+{
+    pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
+    pthread_cond_init(&f->cv, NULL);
+    pthread_mutex_lock(&db->buf_lock);
+    f->next = db->lw_head;
+    db->lw_head = f;
+    bool pending = db->active->rows > 0 || db->nflushing > 0;
+    pthread_mutex_unlock(&db->buf_lock);
+    pthread_mutex_unlock(&db->lock);
+    return pending;
+}
+
+void lw_leave(eng *db, lw_fence *f)
+{
+    pthread_mutex_lock(&db->buf_lock);
+    for (lw_fence **p = &db->lw_head; *p; p = &(*p)->next)
+        if (*p == f) {
+            *p = f->next;
+            break;
+        }
+    pthread_cond_broadcast(&f->cv); /* only the writes this fence held; they look at the others again */
+    bool held = f->held;
+    pthread_mutex_unlock(&db->buf_lock);
+    if (held) /* this thread no longer holds up anyone; to the hook that got the +1 (with cls_rw read-held) */
+        f->hold_fn(f->hold_ctx, -1);
+    /* waits until the woken waiters are out of the cv (glibc), so the caller may free f */
+    pthread_cond_destroy(&f->cv);
+    if (f->r_heap)
+        free(f->r);
+    else if (f->r)
+        lw_table_put(); /* no one reads it any more: unlinked under buf_lock */
+    f->r = NULL;
+    f->r_heap = false;
+}
+
+/* the first registered fence a row of the batch falls inside, else NULL; buf_lock held */
+static lw_fence *lw_overlaps(const eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, size_t n)
+{
+    for (lw_fence *f = db->lw_head; f; f = f->next) {
+        const int64_t lo = f->lo, hi = f->hi, *r = f->r;
+        if (f->nb == 0) {
+            for (size_t i = 0; i < n; i++)
+                if (ts[i] >= lo && ts[i] <= hi && (series ? series[i] : cs) == f->series)
+                    return f;
+            continue;
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (ts[i] < lo || ts[i] > hi)
+                continue;
+            const int64_t *q = r + 2 * ((series ? series[i] : cs) & (LW_BUCKETS - 1));
+            if (ts[i] >= q[0] && ts[i] <= q[1])
+                return f;
+        }
+    }
+    return NULL;
+}
+
 int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t w, size_t n)
 {
     pthread_mutex_lock(&db->buf_lock);
-    int rc = db->bg_error;
-    db->bg_error = 0;
+    /* after the large write's publish this batch is the newer one, and wins as a memtable row (lw_fence) */
+    bool announced = false;
+    void (*hook)(void *, int) = NULL; /* the hook this wait counts with, from its first +1 to its -1 */
+    void *hook_ctx = NULL;
+    for (lw_fence *f; db->lw_head && (f = lw_overlaps(db, series, cs, ts, n)) != NULL;) {
+        if (!announced)
+            hook = db->wait_fn, hook_ctx = db->wait_ctx;
+        if (hook && (!announced || !f->held)) {
+            /* This thread is held, and so, for the server, is the large write's: it frees its thread only after
+             * its publish, however long the write takes. Counted once per large write, given back by its
+             * lw_leave to the same hook. Not under buf_lock: tsdbd may start a thread. */
+            int d = !announced + !f->held;
+            if (!f->held)
+                f->held = true, f->hold_fn = hook, f->hold_ctx = hook_ctx;
+            announced = true;
+            pthread_mutex_unlock(&db->buf_lock);
+            for (int k = 0; k < d; k++)
+                hook(hook_ctx, 1);
+            pthread_mutex_lock(&db->buf_lock);
+            continue; /* f may have left meanwhile */
+        }
+        pthread_cond_wait(&f->cv, &db->buf_lock);
+        db->lw_wakeups++;
+    }
+    /* A failure while this write waited (the large write's own publish, say) must refuse it: in async WAL mode
+     * nothing after this point checks, and the write would be acknowledged by a failed engine. */
+    int rc = eng_check(db);
+    if (rc == 0) {
+        rc = db->bg_error;
+        db->bg_error = 0;
+    }
     if (rc == 0 && db->wal_enabled)
         rc = wal_buffer(db, series, cs, ts, v, w, n); /* first: it can fail without side effects */
     if (rc == 0)
@@ -558,6 +737,8 @@ int mem_insert(eng *db, const uint32_t *series, uint32_t cs, const int64_t *ts, 
     if (rows >= db->opt.buffer_rows)
         pthread_cond_signal(&db->flush_cv);
     pthread_mutex_unlock(&db->buf_lock);
+    if (announced)
+        hook(hook_ctx, -1);
     if (rc == 0 && db->wal_enabled && db->opt.wal_sync_ms == 0)
         rc = wal_commit(db, lsn);
     /* backpressure when the flusher falls behind */

@@ -96,25 +96,28 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
     if (rc)
         return rc;
 
-    /* rows acknowledged before this call get older block numbers than its parts */
-    pthread_mutex_lock(&db->lock);
-    pthread_mutex_lock(&db->buf_lock);
-    bool pending = db->active->rows > 0 || db->nflushing > 0;
-    pthread_mutex_unlock(&db->buf_lock);
-    pthread_mutex_unlock(&db->lock);
-    if (pending && (rc = mt_flush(db)) != 0)
+    /* rows acknowledged before this call get older block numbers than its parts; small writes into the range wait
+     * from here until they are published (lw_fence) */
+    lw_fence f;
+    lw_fence_range(&f, series, start, end);
+    if (lw_enter(db, &f) && (rc = mt_flush(db)) != 0) {
+        lw_leave(db, &f);
         return rc;
+    }
     /* A fresh series gets its class from these rows, as from a large insert's: placed undecided in class 0, they
      * would stay there when a later insert classifies the series from the beginning of time (two copies of one
      * row in two partitions, classes.c) */
-    if (n && (rc = cls_classify_insert(db, NULL, series, ts, n)) != 0)
+    if (n && (rc = cls_classify_insert(db, NULL, series, ts, n)) != 0) {
+        lw_leave(db, &f);
         return rc;
+    }
 
     /* one frozen class history from placing the rows until they are listed (classes.c) */
     cls_freeze(db);
     part_list rows = {0}, all = {0};
     if (n && (rc = insert_rows(db, st, NULL, series, ts, v, n, 0, &rows, true, cls_uniform(db, NULL, series, 0),
-                               NULL)) != 0) {
+                               NULL, NULL)) != 0) {
+        lw_leave(db, &f);
         cls_thaw(db);
         parts_discard(db, rows.p, rows.n);
         free(rows.p);
@@ -133,7 +136,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
     }
     for (size_t i = 0; rc == 0 && i < nb; i++)
         rc = add_tomb_part(db, series, before[i], start, end, &all);
-    if (rc == 0 && n && db->test_precommit)
+    if (rc == 0 && db->test_precommit)
         db->test_precommit(db->test_precommit_arg);
     pthread_mutex_lock(&db->publish_lock);
     if (rc == 0)
@@ -167,6 +170,7 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         pthread_mutex_unlock(&db->lock);
     }
     pthread_mutex_unlock(&db->publish_lock);
+    lw_leave(db, &f); /* published (newer small writes win from now on) or failed */
     cls_thaw(db);
     free(before);
     free(now);

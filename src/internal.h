@@ -1296,6 +1296,12 @@ struct eng {
     bool wal_writing;              /* one WAL writer (commit or segment switch) at a time */
     pthread_mutex_t buf_lock;      /* active memtable and pending WAL bytes */
     pthread_cond_t flush_cv;
+    struct lw_fence *lw_head;      /* large writes between their memtable flush and their publish (buf_lock) */
+    uint64_t lw_wakeups;           /* wake-ups of small writes waiting for one (buf_lock; tests) */
+    /* tsdb_set_write_wait_hook: around a small write's wait for a fence, so a server with a fixed set of threads
+     * starts another (buf_lock; a wait keeps the hook it counted with for its -1) */
+    void (*wait_fn)(void *ctx, int delta);
+    void *wait_ctx;
     memtable *active;
     memtable *flushing[MAX_FLUSHING]; /* oldest first; guarded by db->lock */
     size_t nflushing;
@@ -1419,9 +1425,46 @@ void merge_commit_locked(struct eng *db, part **src, size_t k, part *out);
  * part per partition. Parts are published, or handed back in `collect`. With `refuse` (rows from a caller, not
  * a flush of the WAL), a row at TS_UNREACHABLE fails the insert with TSDB_ERR_INVALID. */
 /* ucls >= 0: every series of the batch has that class at every time (cls_uniform); -1: looked up per series. */
+/* `fence` (without collect): the caller's lw_enter, left as soon as the parts are published or have failed. */
 int insert_rows(struct eng *db, int type, const uint32_t *series, uint32_t const_series, const int64_t *ts,
                 const void *v, size_t n, uint64_t wal_seq, part_list *collect, bool refuse, int ucls,
-                const uint64_t *gen);
+                const uint64_t *gen, struct lw_fence *fence);
+
+/* Last write wins in real time (memtable.c). Memtable rows rank above every part, so a small write to a key of a
+ * large insert, replace or delete must not be acknowledged while that write is between its memtable flush and its
+ * publish: it would be older than the large write and still win. The large write describes its keys in a fence
+ * (conservatively: a timestamp range per bucket of series), registers it with lw_enter in the same step that
+ * decides whether the memtable needs a flush (a row added before is flushed under an older block number, one added
+ * after sees the fence), and leaves with lw_leave once its parts are published or have failed. mem_insert waits,
+ * holding no lock and before it appends anything, while one of its rows falls inside a registered fence, so
+ * nothing the large write waits for (a flush, the WAL writer role, publish_lock) can wait for it. Rows that wait
+ * reach the WAL after the publish, so a replay ranks them above the large write as well. A false overlap (another
+ * series in the same bucket) only delays a write. A waiter sleeps on the cv of a fence it overlaps, so a large
+ * write that leaves wakes only the writes it held. Large writes never wait for small ones: while overlapping large
+ * writes follow each other without a gap, a small write into their keys waits for all of them (no ticket order:
+ * passing a fence that came later, whose memtable flush has run, would bring the anomaly back). */
+#define LW_BUCKETS 4096 /* a power of two: a row's bucket is a mask */
+typedef struct lw_fence {
+    struct lw_fence *next;
+    int64_t lo, hi;   /* every key's timestamp is in [lo, hi]; lo > hi: no keys */
+    uint32_t series;  /* nb == 0: the one series */
+    uint32_t nb;      /* else LW_BUCKETS buckets of series (local id & (LW_BUCKETS - 1)), each with a range */
+    int64_t *r;       /* nb buckets: lo, hi; valid until lw_leave */
+    bool r_heap;      /* r was allocated (the thread's table was taken), else it is lw_table_take's */
+    pthread_cond_t cv; /* from lw_enter to lw_leave: the writes waiting for this fence (buf_lock) */
+    /* held: a waiter counted this large write's thread as held too, through hold_fn(hold_ctx, +1) (buf_lock); the
+     * -1 goes to the same hook, whatever tsdb_set_write_wait_hook set since */
+    bool held;
+    void (*hold_fn)(void *ctx, int delta);
+    void *hold_ctx;
+} lw_fence;
+/* The thread's fence table (insert.c): taken until lw_table_put; NULL while taken (or on failure). */
+void *lw_table_take(size_t bytes);
+void lw_table_put(void);
+int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t const_series, const int64_t *ts, size_t n);
+void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end); /* [start, end) */
+bool lw_enter(struct eng *db, lw_fence *f); /* returns whether the memtable holds rows to flush first */
+void lw_leave(struct eng *db, lw_fence *f);
 int part_list_push(part_list *l, part *p);
 int parts_publish(struct eng *db, part **ps, size_t n);
 
@@ -1614,8 +1657,10 @@ int tsdb_test_class_switch(struct tsdb *t, tsdb_sid series, int cls, const int64
  * TSDB_ERR_INVALID for it, so a truncated id does not look like an empty range; a well formed id that is unknown
  * (a series a follower has not seen yet) answers no rows. */
 static inline bool sid_malformed(tsdb_sid id) { return (id >> 48) != 0 || (id >> 32) == 0; }
-/* test hook: fn(arg) runs in every large insert and replace after its rows were placed, before it commits */
+/* test hook: fn(arg) runs in every large insert, replace and delete after its parts were written, before it commits */
 void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
+/* test: how often small writes waiting for a large write's publish woke up, over every open volume (lw_wakeups) */
+uint64_t tsdb_test_fence_wakeups(struct tsdb *t);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);
 /* test hook: the WAL tail kept for switches, and how far segments are unlinked (durably) */

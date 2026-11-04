@@ -679,7 +679,27 @@ than every part), so a delete needs no ordering of its own:
   when there is more than one). It returns once they are fsync'd and
   published. Anything published later (a flush, a large
   insert) has a higher block number and is newer than the delete; a partition
-  that held no rows of the series in the range needs no tombstone.
+  that held no rows of the series in the range needs no tombstone. A small
+  write into the range that arrives between the flush and the publish waits
+  until the publish (it would otherwise land in the memtable, newer than the
+  delete, although acknowledged before the delete took effect); large inserts
+  and replaces hold small writes to their keys the same way (`lw_fence`,
+  internal.h). Small writes elsewhere do not wait.
+  The limits of that wait: it lasts until the large write is published, which
+  for hundreds of millions of rows (or on a slow NFS server) is seconds, and the
+  fence is coarse (a timestamp range per bucket of 4096 series buckets), so one
+  far row in a large write can hold small writes to other series of its bucket
+  for that long. Large writes never wait for small ones: while overlapping large
+  writes follow each other without a gap, a small write into their keys waits
+  for all of them. A ticket order (pass the fences that came after the write
+  began waiting) would bring the anomaly back, since such a fence has flushed
+  the memtable already; only a large write that flushes again just before its
+  publish could be fair, and the class history it holds frozen from placement
+  to listing rules out a flush there. A write that waited checks the engine's
+  fail-stop state before it appends. tsdbd counts a waiting request and the
+  large write that holds it as waiting workers (`tsdb_set_write_wait_hook`), so
+  it starts extra workers and keeps answering other requests, up to 256 extra
+  workers (see the server section below for what lies past that).
 - A replace is the tombstone parts plus the new rows' parts in one
   `parts_commit`, tombstones first (lower blocks): one intent, so a reader or a
   crash sees the old rows or the new ones. Rows outside `[start, end)` are
@@ -1560,7 +1580,17 @@ Connections: up to `--max-connections` at once (default 10,000; the descriptor
 limit is raised to the hard limit at start). An idle connection costs one file
 descriptor and about 16 KB; buffers grow for large frames and shrink back.
 Requests run on `--workers` threads (default: one per CPU) and the rest wait
-in their connection's queue. Measured with `tsdbc-bench connections`: 10,000
+in their connection's queue. A worker that has to wait (a client that reads
+no replies, a small write into the keys of a large write that is not
+published yet, which also counts the large write's worker) starts an extra
+worker once every worker waits, up to 256 extras. Past `--workers` + 256
+such waits the server stalls again: during a backfill of hundreds of millions
+of rows, thousands of connections each writing realtime rows into its keys
+(or, the fence being coarse, into series that share its buckets) hold every
+worker until the backfill is published, and queries queue behind them. Keep
+the number of connections that write during a big backfill below that (a
+Pulsar sink or a few collectors, not one connection per device), or split the
+backfill into smaller calls. Measured with `tsdbc-bench connections`: 10,000
 connections open at once, all querying, 85,000 queries/s in total, no
 failures; the server's resident memory went from 148 MB at 1,000 connections
 to 231 MB at 10,000.

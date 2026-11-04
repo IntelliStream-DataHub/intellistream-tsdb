@@ -21,8 +21,9 @@
 
 /* Grow-only per-thread buffers for sorting, so steady inserts do not fault
  * in fresh pages every batch. Freed when the thread exits. SCR_IN_* are the
- * caller's (eng_insert_scratch) and never touched inside eng_insert. */
-enum { SCR_A, SCR_B, SCR_S, SCR_T, SCR_V, SCR_CNT, SCR_IN_S, SCR_IN_T, SCR_IN_V, SCR_N };
+ * caller's (eng_insert_scratch) and never touched inside eng_insert; SCR_FENCE
+ * is the table of lw_fence_rows, reached only through lw_table_take. */
+enum { SCR_A, SCR_B, SCR_S, SCR_T, SCR_V, SCR_CNT, SCR_IN_S, SCR_IN_T, SCR_IN_V, SCR_FENCE, SCR_N };
 typedef struct scratch {
     void *p[SCR_N];
     size_t cap[SCR_N];
@@ -64,6 +65,21 @@ void *eng_insert_scratch(int which, size_t bytes)
 {
     return which >= 0 && which < 3 ? scratch_get(SCR_IN_S + which, bytes ? bytes : 1) : NULL;
 }
+
+/* Other threads read a registered fence's table until its lw_leave, so it is the thread's only while no fence of the
+ * thread holds it: an insert nested in a fence's window (a test hook, another volume) gets NULL and allocates. */
+static __thread bool fence_taken;
+
+void *lw_table_take(size_t bytes)
+{
+    if (fence_taken)
+        return NULL;
+    void *p = scratch_get(SCR_FENCE, bytes);
+    fence_taken = p != NULL;
+    return p;
+}
+
+void lw_table_put(void) { fence_taken = false; }
 
 typedef struct rec {
     int64_t ts;
@@ -625,10 +641,13 @@ int parts_publish(eng *db, part **ps, size_t n)
  * holding the class history frozen (cls_freeze) throughout. `gen`: the class
  * generation read before the caller read the class bytes behind ucls. */
 int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t n,
-                uint64_t wal_seq, part_list *collect, bool refuse, int ucls, const uint64_t *gen)
+                uint64_t wal_seq, part_list *collect, bool refuse, int ucls, const uint64_t *gen, lw_fence *fence)
 {
-    if (n == 0)
+    if (n == 0) {
+        if (fence)
+            lw_leave(db, fence);
         return 0;
+    }
     pctx x = {db, db->cls_on ? ucls : 0};
     if (collect)
         return insert_rows_into(&x, type, series, cs, ts, v, n, wal_seq, collect, refuse);
@@ -650,6 +669,8 @@ int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const in
         partitions[i] = mine.p[i]->partition;
     if (rc == 0)
         rc = parts_publish(db, mine.p, mine.n);
+    if (fence) /* published (newer small writes win from now on) or failed */
+        lw_leave(db, fence);
     cls_thaw(db); /* before waiting for merges: the merge thread may be switching */
     if (rc) {
         parts_discard(db, mine.p, mine.n);

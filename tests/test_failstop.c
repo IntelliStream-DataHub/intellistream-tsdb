@@ -529,6 +529,72 @@ static void test_dir_fsync(const char *base)
     printf("  failed directory fsync after publishing a part\n");
 }
 
+/* A small write into the keys of a large write that has not published yet waits for its publish (lw_fence). When
+ * that publish fails the engine, the small write must be refused: with an asynchronous WAL nothing after the wait
+ * checked, so it went into the memtable and returned 0 from a failed engine, and its row was gone after a reopen. */
+void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg); /* the library's test hook (src/internal.h) */
+
+typedef struct {
+    appender small; /* a key of the large write */
+    pthread_t th;
+    bool started;
+    int done_early;
+} fence_fail;
+
+static void *fence_small_main(void *arg)
+{
+    appender *a = arg;
+    int64_t ts = a->ts;
+    float v = 7;
+    int rc = tsdb_insert_series(a->db, a->id, &ts, &v, 1);
+    __atomic_store_n(&a->rc, rc, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+static void fence_fail_window(void *arg)
+{
+    fence_fail *x = arg;
+    x->small.rc = 1; /* running */
+    x->started = pthread_create(&x->th, NULL, fence_small_main, &x->small) == 0;
+    sleep_ms(300);
+    x->done_early = __atomic_load_n(&x->small.rc, __ATOMIC_SEQ_CST) != 1;
+    arm(F_FSYNC, "/", false, false); /* the directory fsync of this publish */
+}
+
+static void test_fence_failure(const char *base)
+{
+    char name[600];
+    snprintf(name, sizeof name, "%s/failstop-fence", base);
+    tsdb_options o = opts();
+    o.wal_sync_ms = 100; /* asynchronous: no WAL commit refuses the write */
+    tsdb *db = open_fresh(name, o);
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    int64_t ts[100];
+    float v[100];
+    for (int i = 0; i < 100; i++) {
+        ts[i] = i;
+        v[i] = 1;
+    }
+    fence_fail x = {.small = {db, id, 50, 0}};
+    tsdb_test_precommit(db, fence_fail_window, &x);
+    CHECK(tsdb_insert_series(db, id, ts, v, 100) == TSDB_ERR_IO); /* large: 100 >= wal_max_batch_rows */
+    tsdb_test_precommit(db, NULL, NULL);
+    CHECK(fired() == 1);
+    CHECK(is_failed(db, "fsync of the directory"));
+    CHECK(x.started);
+    if (x.started)
+        pthread_join(x.th, NULL);
+    CHECK(!x.done_early); /* it waited for the large write */
+    if (x.small.rc != TSDB_ERR_IO) {
+        fprintf(stderr, "a small write that waited for a large write was acknowledged (%d) after its publish failed "
+                        "the engine\n", x.small.rc);
+        failures++;
+    }
+    tsdb_close(db);
+    printf("  a small write waiting for a large write whose publish fails\n");
+}
+
 /* A flush fails on a part file: an error that fails only the call, the
  * memtable waits to be retried. A large insert after it flushes the memtables
  * first, so older small writes cannot shadow its part: before the fix, the
@@ -1421,6 +1487,7 @@ int main(int argc, char **argv)
     test_group_commit(root);
     test_torn_write(root);
     test_dir_fsync(root);
+    test_fence_failure(root);
     test_flush_retry(root);
     test_manifest(root);
     test_series_dict(root);

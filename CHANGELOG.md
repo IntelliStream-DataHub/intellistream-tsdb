@@ -212,6 +212,23 @@ For anyone who ran a development build; a first install is not affected.
 
 ### Fixed
 
+Writes
+- Last write wins in real time. A small write (WAL and memtable) to a key of a large insert, replace or delete could be
+  acknowledged while that large write was between its memtable flush and its publish, and then kept winning over it,
+  because memtable rows rank above every part: a read showed the small write and, at another key, the large write
+  not yet; the large write was acknowledged; reads still showed the small write. Such a small write now waits until
+  the large write is published (only one whose rows fall inside the large write's keys: a timestamp range per
+  bucket of series), and wins as the newer write. `make jepsen` checks this with a fifth rule: a write acknowledged
+  before a read saw another write not yet in effect is older than it, although the two overlap in time; the old
+  server failed it in every 20-second run. The wait lasts as long as the large write (seconds for hundreds of
+  millions of rows), and while overlapping large writes follow each other without a gap, a small write into their
+  keys waits for all of them. A write that waited is refused when the engine failed meanwhile. tsdbd counts such a
+  waiting request and the large write it waits for as waiting workers and starts extra ones, so queries and other
+  writes keep being answered; embedded servers can do the same with the new `tsdb_set_write_wait_hook`. tsdbd starts
+  at most 256 extra workers: more than `--workers` + 256 connections writing into a large write's keys at once
+  stall it again until the publish, so keep the writing connections during a big backfill below that, or split the
+  backfill into smaller calls (docs/design.md, the server section).
+
 Damage and recovery
 - A damaged `SERIES`, `STATES`, `RETENTION` or `CLASSES` record, a misdirected write or a read that returned other
   bytes than the disk holds is no longer taken for a torn tail, which lost acknowledged data silently.

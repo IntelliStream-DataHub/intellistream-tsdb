@@ -74,7 +74,13 @@
  *     at another key of w inside its range, a value from a write that
  *     completed before w began (or nothing at all);
  *  4. no stale reads: a read that began after w was acknowledged sees, at w's
- *     keys inside its range, w or something not older than w.
+ *     keys inside its range, w or something not older than w;
+ *  5. real-time order through what a read saw: a read R that shows, at a key
+ *     w covers, a value from a write that completed before w began saw w not
+ *     yet in effect, so every write acknowledged before R began is older than
+ *     w although the two overlap in time; 1 and 4 hold for those pairs too (a
+ *     small write acknowledged while a large write was between its memtable
+ *     flush and its publish once kept winning over it).
  * Deletes and replaces clear a key range of one series (a replace writes its
  * keys in that range in the same step). A key may then be absent where the
  * checks above want a value, if a delete covering it that did not definitely
@@ -977,6 +983,15 @@ static int violations;
 /* w1 completed before w2 began: w1 is strictly older */
 static bool older(uint32_t w1, uint32_t w2) { return writes[w1].complete < writes[w2].invoke; }
 
+/* check 5: per write, a time before which it had not taken effect (at least its start) */
+static int64_t *lb;
+
+/* w1 is older than w2 in real time or, if acknowledged, by what a read saw (check 5) */
+static bool older_seen(uint32_t w1, uint32_t w2)
+{
+    return older(w1, w2) || (writes[w1].st == ST_OK && writes[w1].complete < lb[w2]);
+}
+
 static bool wrote_key(uint32_t w, uint32_t k)
 {
     for (uint32_t i = 0; i < writes[w].nkeys; i++)
@@ -1062,6 +1077,89 @@ static int check(const uint32_t *final)
     for (uint32_t w = 1; w < nw; w++)
         if (applied[w] && writes[w].st == ST_FAIL)
             VIOLATION("write %u failed but was applied\n", w);
+    /* 5. real-time order through what a read saw. A read that began at t and shows, at a key that write w covers
+     * (its keys; a delete's or replace's range), a value from a write that completed before w began saw w not yet in
+     * effect (w overwrites that value, and no write can bring it back): w takes effect after t. So every write
+     * acknowledged before t is older than w, although the two may overlap in time, and must not outlive it at a key
+     * both cover. lb[w] is the latest such t (at least w's start); checks 1 and 4 compare acknowledged values with
+     * it (older_seen). A small write acknowledged while a large write was between its memtable flush and its publish
+     * once kept winning over it, which only this check sees: the two overlap in time. Follower reads may be stale
+     * and do not count. */
+    lb = malloc(nw * sizeof *lb);
+    for (uint32_t w = 0; w < nw; w++)
+        lb[w] = w ? writes[w].invoke : INT64_MIN;
+    {
+        /* per key, the writes that cover it, by start time */
+        uint32_t *wc = calloc(koff[nseries] + 1, sizeof *wc), *wf = calloc(koff[nseries], sizeof *wf);
+        size_t nwk = 0;
+        for (uint32_t w = 1; w < nw; w++) {
+            const wop *o = &writes[w];
+            if (o->st == ST_FAIL)
+                continue;
+            if (o->kind == W_INSERT)
+                for (uint32_t j = 0; j < o->nkeys; j++, nwk++)
+                    wc[koff[o->series] + o->keys[j] + 1]++;
+            else
+                for (uint32_t k = o->lo; k < o->hi; k++, nwk++)
+                    wc[koff[o->series] + k + 1]++;
+        }
+        for (size_t x = 1; x <= koff[nseries]; x++)
+            wc[x] += wc[x - 1];
+        uint32_t *wl = malloc((nwk + 1) * sizeof *wl);
+        for (uint32_t w = 1; w < nw; w++) {
+            const wop *o = &writes[w];
+            if (o->st == ST_FAIL)
+                continue;
+            if (o->kind == W_INSERT)
+                for (uint32_t j = 0; j < o->nkeys; j++) {
+                    size_t slot = koff[o->series] + o->keys[j];
+                    wl[wc[slot] + wf[slot]++] = w;
+                }
+            else
+                for (uint32_t k = o->lo; k < o->hi; k++) {
+                    size_t slot = koff[o->series] + k;
+                    wl[wc[slot] + wf[slot]++] = w;
+                }
+        }
+        for (size_t slot = 0; slot < koff[nseries]; slot++) { /* ids come nearly in start order */
+            uint32_t *a = wl + wc[slot];
+            size_t n = wc[slot + 1] - wc[slot];
+            for (size_t x = 1; x < n; x++)
+                for (size_t y = x; y > 0 && writes[a[y - 1]].invoke > writes[a[y]].invoke; y--) {
+                    uint32_t t = a[y];
+                    a[y] = a[y - 1];
+                    a[y - 1] = t;
+                }
+        }
+        for (uint32_t i = 0; i < nr; i++) {
+            const rop *q = &reads[i];
+            if (q->st != ST_OK)
+                continue;
+            for (uint32_t k = q->lo; k < q->hi; k++) {
+                uint32_t x = q->seen[k - q->lo];
+                if (!x || x >= nw)
+                    continue;
+                size_t slot = koff[q->series] + k;
+                const uint32_t *a = wl + wc[slot];
+                size_t n = wc[slot + 1] - wc[slot], lo = 0, hi = n;
+                while (lo < hi) { /* the first write that began after x completed */
+                    size_t mid = (lo + hi) / 2;
+                    if (writes[a[mid]].invoke <= writes[x].complete)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
+                }
+                /* (a read that began after an acknowledged w completed and missed it is stale: check 4) */
+                for (size_t j = lo; j < n && writes[a[j]].invoke < q->complete; j++)
+                    if (a[j] != x && lb[a[j]] < q->invoke &&
+                        (writes[a[j]].st != ST_OK || q->invoke < writes[a[j]].complete))
+                        lb[a[j]] = q->invoke;
+            }
+        }
+        free(wl);
+        free(wf);
+        free(wc);
+    }
     /* 1. durability and order */
     int before_loss = violations;
     uint64_t lost = 0;
@@ -1070,10 +1168,13 @@ static int check(const uint32_t *final)
             continue;
         for (uint32_t i = 0; i < writes[w].nkeys; i++) {
             uint32_t k = writes[w].keys[i], f = final[koff[writes[w].series] + k];
-            if (f ? older(f, w) : !absent_ok(writes[w].series, k, writes[w].invoke, INT64_MAX)) {
+            if (f ? older_seen(f, w) : !absent_ok(writes[w].series, k, writes[w].invoke, INT64_MAX)) {
                 if (lost++ < 10)
-                    VIOLATION("write %u (%s) to series %d key %u lost: final holds %u\n", w,
-                              writes[w].st == ST_OK ? "acknowledged" : "seen or partly kept", writes[w].series, k, f);
+                    VIOLATION("write %u (%s, %u keys) to series %d key %u lost: final holds %u (%u keys)%s\n", w,
+                              writes[w].st == ST_OK ? "acknowledged" : "seen or partly kept", writes[w].nkeys,
+                              writes[w].series, k, f, f && f < nw ? writes[f].nkeys : 0,
+                              f && !older(f, w) ? ", acknowledged before a read saw the write not yet in effect "
+                                                  "(check 5)" : "");
                 else
                     violations++;
             }
@@ -1085,11 +1186,11 @@ static int check(const uint32_t *final)
             continue;
         for (uint32_t k = writes[w].lo; k < writes[w].hi; k++) {
             uint32_t f = final[koff[writes[w].series] + k];
-            if (f && f < nw && older(f, w)) {
+            if (f && f < nw && older_seen(f, w)) {
                 if (lost++ < 10)
-                    VIOLATION("%s %u of series %d keys %u..%u: final holds %u at key %u, which completed before\n",
+                    VIOLATION("%s %u of series %d keys %u..%u: final holds %u at key %u, which completed before%s\n",
                               writes[w].kind == W_DELETE ? "delete" : "replace", w, writes[w].series, writes[w].lo,
-                              writes[w].hi, f, k);
+                              writes[w].hi, f, k, older(f, w) ? "" : " a read saw the delete not yet in effect (check 5)");
                 else
                     violations++;
             }
@@ -1147,7 +1248,7 @@ static int check(const uint32_t *final)
      * the running maximum of their start times. A read that began at t must
      * not show anything older than the newest-starting write completed by t. */
     typedef struct ack {
-        int64_t complete, max_invoke;
+        int64_t complete, max_invoke, max_lb; /* max_lb: of lb (check 5), for acknowledged values */
     } ack;
     size_t total = 0;
     uint32_t *cnt = calloc(koff[nseries] + 1, sizeof *cnt);
@@ -1170,11 +1271,11 @@ static int check(const uint32_t *final)
         if (writes[w].st == ST_OK) {
             for (uint32_t j = 0; j < writes[w].nkeys; j++) {
                 size_t slot = koff[writes[w].series] + writes[w].keys[j];
-                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke};
+                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke, lb[w]};
             }
             for (uint32_t k = writes[w].lo; writes[w].kind != W_INSERT && k < writes[w].hi; k++) {
                 size_t slot = koff[writes[w].series] + k;
-                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke};
+                acks[cnt[slot] + fill[slot]++] = (ack){writes[w].complete, writes[w].invoke, lb[w]};
             }
         }
     for (size_t slot = 0; slot < koff[nseries]; slot++) {
@@ -1186,9 +1287,12 @@ static int check(const uint32_t *final)
                 a[y] = a[y - 1];
                 a[y - 1] = t;
             }
-        for (size_t x = 1; x < n; x++)
+        for (size_t x = 1; x < n; x++) {
             if (a[x].max_invoke < a[x - 1].max_invoke)
                 a[x].max_invoke = a[x - 1].max_invoke;
+            if (a[x].max_lb < a[x - 1].max_lb)
+                a[x].max_lb = a[x - 1].max_lb;
+        }
     }
     for (uint32_t i = 0; i < nr; i++) {
         rop *q = &reads[i];
@@ -1212,6 +1316,9 @@ static int check(const uint32_t *final)
                      : !absent_ok(q->series, k, a[lo - 1].max_invoke, q->complete))
                 VIOLATION("read %u shows %u at series %d key %u, older than an acknowledged write: stale\n", i, seen,
                           q->series, k);
+            else if (seen && seen < nw && writes[seen].st == ST_OK && writes[seen].complete < a[lo - 1].max_lb)
+                VIOLATION("read %u shows %u at series %d key %u, acknowledged before a read saw a later acknowledged "
+                          "write to it not yet in effect (check 5): stale\n", i, seen, q->series, k);
         }
     }
     free(acks);
@@ -1221,6 +1328,8 @@ static int check(const uint32_t *final)
     free(applied);
     free(dcnt);
     free(dlist);
+    free(lb);
+    lb = NULL;
     return violations;
 }
 

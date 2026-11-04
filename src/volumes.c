@@ -104,6 +104,10 @@ struct tsdb {
     const char **names_held;
     size_t nheld, held_cap;
     atomic_bool dup_logged; /* a name found in two volumes (damage, or a hand-made copy) is reported once */
+    void (*wait_fn)(void *ctx, int delta); /* tsdb_set_write_wait_hook (lock), copied to every volume */
+    void *wait_ctx;
+    void (*test_precommit)(void *); /* tsdb_test_precommit (lock), copied to every volume */
+    void *test_precommit_arg;
 };
 
 /* ---------------------------------------------------------------- helpers */
@@ -708,6 +712,10 @@ static int volume_open(tsdb *t, const char *path, uint32_t index, bool *meta_bad
     listed = false;
     pthread_rwlock_wrlock(&t->lock);
     if (rc == 0 && t->nvols == index && (rc = vols_grow(t)) == 0) {
+        e->wait_fn = t->wait_fn; /* before anyone can write to it */
+        e->wait_ctx = t->wait_ctx;
+        e->test_precommit = t->test_precommit;
+        e->test_precommit_arg = t->test_precommit_arg;
         t->vols[t->nvols] = e;
         t->paths[t->nvols] = p;
         t->nvols++;
@@ -1370,10 +1378,41 @@ int tsdb_test_class_switch(tsdb *t, tsdb_sid id, int cls, const int64_t *at)
 
 void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg)
 {
+    pthread_rwlock_wrlock(&t->lock); /* volume_open copies it to volumes added later */
+    t->test_precommit = fn;
+    t->test_precommit_arg = arg;
     for (size_t i = 0; i < t->nvols; i++) {
         t->vols[i]->test_precommit_arg = arg;
         t->vols[i]->test_precommit = fn;
     }
+    pthread_rwlock_unlock(&t->lock);
+}
+
+uint64_t tsdb_test_fence_wakeups(tsdb *t)
+{
+    uint64_t n = 0;
+    pthread_rwlock_rdlock(&t->lock);
+    for (size_t i = 0; i < t->nvols; i++) {
+        pthread_mutex_lock(&t->vols[i]->buf_lock);
+        n += t->vols[i]->lw_wakeups;
+        pthread_mutex_unlock(&t->vols[i]->buf_lock);
+    }
+    pthread_rwlock_unlock(&t->lock);
+    return n;
+}
+
+void tsdb_set_write_wait_hook(tsdb *t, void (*on_wait)(void *ctx, int delta), void *ctx)
+{
+    pthread_rwlock_wrlock(&t->lock); /* volume_open copies it under the same lock as it lists a volume */
+    t->wait_fn = on_wait;
+    t->wait_ctx = ctx;
+    for (size_t i = 0; i < t->nvols; i++) { /* waits read it under buf_lock, and keep what they counted with */
+        pthread_mutex_lock(&t->vols[i]->buf_lock);
+        t->vols[i]->wait_fn = on_wait;
+        t->vols[i]->wait_ctx = ctx;
+        pthread_mutex_unlock(&t->vols[i]->buf_lock);
+    }
+    pthread_rwlock_unlock(&t->lock);
 }
 
 /* Test hook on the series and state dictionaries of every open volume (series_dict.test_fault). */
