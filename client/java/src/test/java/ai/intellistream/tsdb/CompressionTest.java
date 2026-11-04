@@ -217,8 +217,9 @@ class CompressionTest {
                     frames.add(f);
                     int status = op == Protocol.OP_HELLO ? 0 : statuses.apply(f);
                     byte[] body = op == Protocol.OP_HELLO || status != 0 ? null : replies.apply(f);
-                    if (op == Protocol.OP_HELLO)
-                        body = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(version).array();
+                    if (op == Protocol.OP_HELLO) /* from 12 on: u16 flags 0 (no login), u16 0 mechanisms */
+                        body = ByteBuffer.allocate(version < 12 ? 4 : 8).order(ByteOrder.LITTLE_ENDIAN)
+                                .putInt(version).array();
                     else if (body == null)
                         body = new byte[0];
                     ByteBuffer r = ByteBuffer.allocate(13 + body.length).order(ByteOrder.LITTLE_ENDIAN);

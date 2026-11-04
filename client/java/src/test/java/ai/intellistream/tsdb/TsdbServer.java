@@ -45,14 +45,48 @@ final class TsdbServer implements AutoCloseable {
      * did not start.
      */
     static TsdbServer start(Path dir) throws IOException, InterruptedException {
+        return start(dir, false);
+    }
+
+    /**
+     * Starts the server on a fresh directory whose USERS file holds superuser {@code root} with {@code rootPassword},
+     * made by the CLI as an operator does; login is required.
+     */
+    static TsdbServer startAuth(Path dir, String rootPassword) throws IOException, InterruptedException {
+        userCli(dir, rootPassword, "add", "root", "--superuser");
+        return start(dir, true);
+    }
+
+    /** Runs {@code tsdb DIR user ARGS...} with the password in TSDB_PASSWORD (none if null); fails if it fails. */
+    static void userCli(Path dir, String password, String... args) throws IOException, InterruptedException {
+        java.util.List<String> cmd = new java.util.ArrayList<>(java.util.List.of(
+                binary().resolveSibling("tsdb").toString(), dir.toString(), "user"));
+        cmd.addAll(java.util.List.of(args));
+        ProcessBuilder pb = new ProcessBuilder(cmd).redirectErrorStream(true)
+                .redirectInput(ProcessBuilder.Redirect.from(new java.io.File("/dev/null")));
+        pb.environment().remove("TSDB_PASSWORD");
+        pb.environment().remove("LD_PRELOAD");
+        if (password != null)
+            pb.environment().put("TSDB_PASSWORD", password);
+        Process p = pb.start();
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        if (p.waitFor() != 0)
+            throw new IllegalStateException("tsdb user " + String.join(" ", args) + ": " + out);
+    }
+
+    /** Starts the server on {@code dir}, with login required ({@code auth}) or {@code --no-auth}. */
+    static TsdbServer start(Path dir, boolean auth) throws IOException, InterruptedException {
         Path bin = binary();
         if (!Files.isExecutable(bin))
             throw new IllegalStateException(bin + " is missing: run make in the repository root first");
         Path log = dir.resolveSibling(dir.getFileName() + ".log");
         Path portFile = dir.resolveSibling(dir.getFileName() + ".port");
         Files.deleteIfExists(portFile);
-        Process p = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", "0", "--port-file",
-                portFile.toString(), "--no-fsync", "--workers", "4", "--no-auth")
+        java.util.List<String> cmd = new java.util.ArrayList<>(java.util.List.of(bin.toString(), "--dir",
+                dir.toString(), "--port", "0", "--port-file", portFile.toString(), "--no-fsync", "--workers", "4"));
+        if (!auth)
+            cmd.add("--no-auth");
+        Process p = new ProcessBuilder(cmd)
                 .redirectErrorStream(true)
                 .redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()))
                 .start();

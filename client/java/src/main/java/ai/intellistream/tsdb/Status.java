@@ -27,6 +27,16 @@ public final class Status {
     public static final int ERR_STOPPED = -8;
     /** The server serves a read-only database (or follows another writer). */
     public static final int ERR_READONLY = -9;
+    /**
+     * The user holds no right for this, or the series does not exist (only a user with the right on every series is
+     * told {@link #ERR_NOTFOUND}).
+     */
+    public static final int ERR_DENIED = -16;
+    /**
+     * The login failed (an unknown user, a wrong password, a server that did not prove it holds the user's
+     * verifier), or the server requires one. The connection is closed.
+     */
+    public static final int ERR_AUTH = -17;
 
     private Status() {
     }
@@ -49,6 +59,8 @@ public final class Status {
         case ERR_TOO_MANY_BUCKETS: return "too many buckets";
         case ERR_STOPPED: return "stopped";
         case ERR_READONLY: return "database is read only";
+        case ERR_DENIED: return "permission denied";
+        case ERR_AUTH: return "login failed or required";
         default: return "unknown error";
         }
     }

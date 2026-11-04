@@ -81,9 +81,10 @@ class TimeoutTest {
         s.getOutputStream().write(helloReply(r[0], Protocol.VERSION));
     }
 
+    /** Protocol 12's HELLO reply of a server without login: the version, flags 0 and no mechanisms. */
     static byte[] helloReply(int id, int version) {
-        return ByteBuffer.allocate(17).order(ByteOrder.LITTLE_ENDIAN).putInt(13).putInt(id).put((byte) 0).putInt(0)
-                .putInt(version).array();
+        return ByteBuffer.allocate(21).order(ByteOrder.LITTLE_ENDIAN).putInt(17).putInt(id).put((byte) 0).putInt(0)
+                .putInt(version).putShort((short) 0).putShort((short) 0).array();
     }
 
     /** Reads one request frame and returns its id and op. */

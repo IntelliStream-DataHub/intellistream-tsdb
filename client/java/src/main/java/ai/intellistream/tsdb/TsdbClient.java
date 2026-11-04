@@ -9,7 +9,6 @@ import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -66,8 +65,14 @@ import jdk.net.ExtendedSocketOptions;
  * and years, {@link #queryGroup} computes the UTC instant each local period begins, with the JDK's time zone data,
  * and asks for buckets that begin there ({@link #queryBounds}).
  *
- * <p><b>Versions.</b> The client speaks protocol 11 (64-bit series ids) and refuses to connect to a server that
- * answers HELLO with a lower version: {@link TsdbException} with {@link Status#ERR_INVALID}.
+ * <p><b>Login.</b> A server started without {@code --no-auth} requires a login: connect with
+ * {@link #connect(String, int, ConnectOptions)} and a user and password (SCRAM-SHA-256; the password never travels).
+ * The user's grants decide what it may do: a request on a series it holds no right for fails with
+ * {@link Status#ERR_DENIED}, which leaves the connection usable. {@link #whoami()}, {@link #userList()},
+ * {@link #userCreate}, {@link #grant} and the other user calls manage users from a client.
+ *
+ * <p><b>Versions.</b> The client speaks protocol 12 (login) and refuses to connect to a server that answers HELLO
+ * with a lower version: {@link TsdbException} with {@link Status#ERR_INVALID}.
  *
  * <p><b>Numbers.</b> Series ids are unsigned 64-bit integers carried in a {@code long} (compare them with
  * {@link Long#compareUnsigned}); {@code -1L}, all ones, is reserved and refused with
@@ -95,7 +100,8 @@ public final class TsdbClient implements AutoCloseable {
     private static final int KEEPALIVE_COUNT = 3;
 
     private final SocketChannel ch;
-    private final Selector selector;             /* waits for the socket with a timeout; the channel is non-blocking */
+    /* waits for the socket with a timeout; the channel is non-blocking (Selector here is the grant's) */
+    private final java.nio.channels.Selector selector;
     private final SelectionKey key;
     private long timeoutNanos;                   /* of each wait for the server; 0: forever */
     private final ByteBuffer out = direct(BUF);  /* write mode; empty between requests */
@@ -112,6 +118,7 @@ public final class TsdbClient implements AutoCloseable {
     private final BitSet chunkNulls = new BitSet();
     private int zlevel = 1;                      /* zstd level of packed inserts; 0: plain arrays */
     private int serverVersion;                   /* from HELLO at connect */
+    private boolean loginRequired, scram;        /* from HELLO: the server asks for a login, and offers SCRAM */
     private Compressor zstd;                     /* created at the first packed insert */
     private boolean noZstd;                      /* zstd-jni could not be loaded: send plain arrays */
     private byte[] raw = new byte[0];            /* the reshaped body of a packed frame */
@@ -119,7 +126,7 @@ public final class TsdbClient implements AutoCloseable {
 
     private TsdbClient(SocketChannel ch, Duration requestTimeout) throws IOException {
         this.ch = ch;
-        this.selector = Selector.open();
+        this.selector = java.nio.channels.Selector.open();
         try {
             ch.configureBlocking(false);
             this.key = ch.register(selector, 0);
@@ -207,9 +214,50 @@ public final class TsdbClient implements AutoCloseable {
      */
     public static TsdbClient connect(String host, int port, Duration connectTimeout, Duration requestTimeout)
             throws TsdbException {
-        Objects.requireNonNull(host, "host");
         nanos(requestTimeout);
-        int ms = millis(connectTimeout);
+        millis(connectTimeout);
+        return connect(host, port, ConnectOptions.defaults().connectTimeout(connectTimeout)
+                .requestTimeout(requestTimeout));
+    }
+
+    /**
+     * Connects to a server and logs in, as {@link #connect(String, int, Duration, Duration)} with the options'
+     * timeouts; the connect timeout also bounds the HELLO and the login.
+     *
+     * <p>A server that requires a login ({@code tsdbd} without {@code --no-auth}) gets one with the options' user and
+     * password: SCRAM-SHA-256, in which the password never travels and the server proves that it holds the user's
+     * verifier before this returns. The keys PBKDF2 derives from the password are cached in the process, so only the
+     * first login of a user pays for it. A server that does not ask for a login is used without one, unless the
+     * options {@link ConnectOptions#requireAuth require} it.
+     *
+     * @param host a host name or address
+     * @param port the server's port
+     * @param options the user, password and timeouts
+     * @return the connected client, logged in where the server asks for it
+     * @throws TsdbException with {@link Status#ERR_AUTH} if the login fails (an unknown user and a wrong password
+     *     alike), the server requires one and the options have no user, or the options require one and the server
+     *     does not ask; with {@link Status#ERR_INVALID} for a server older than protocol 12; with
+     *     {@link Status#ERR_IO} if no address accepts the connection or the password file cannot be read
+     * @throws IllegalArgumentException for a user without a password, a user name SCRAM cannot carry (empty, over
+     *     255 bytes, or with {@code ,}, {@code =} or NUL) or an empty password file
+     */
+    public static TsdbClient connect(String host, int port, ConnectOptions options) throws TsdbException {
+        Objects.requireNonNull(host, "host");
+        Objects.requireNonNull(options, "options");
+        options.validate();
+        int ms = millis(options.connectTimeout());
+        Duration handshake = options.connectTimeout().isZero() ? options.requestTimeout() : options.connectTimeout();
+        byte[] pw = options.user() != null ? options.passwordBytes() : null; /* read at every connect */
+        try {
+            return connectEach(host, port, ms, handshake, options, pw);
+        } finally {
+            if (pw != null)
+                Arrays.fill(pw, (byte) 0);
+        }
+    }
+
+    private static TsdbClient connectEach(String host, int port, int ms, Duration handshake, ConnectOptions options,
+            byte[] pw) throws TsdbException {
         InetAddress[] addrs;
         try {
             addrs = InetAddress.getAllByName(host);
@@ -225,9 +273,11 @@ public final class TsdbClient implements AutoCloseable {
                 ch.socket().connect(new InetSocketAddress(a, port), ms);
                 /* before the client exists: its selector is opened last, and only a built client owns it */
                 setKeepAlive(ch, KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_COUNT);
-                TsdbClient c = new TsdbClient(ch, requestTimeout);
+                TsdbClient c = new TsdbClient(ch, handshake);
                 try {
-                    c.hello(); /* before any request: a server older than protocol 11 reads the new frames wrongly */
+                    c.hello(); /* before any request: a server older than protocol 12 reads the new frames wrongly */
+                    c.login(options, pw);
+                    c.setRequestTimeout(options.requestTimeout());
                 } catch (TsdbException | RuntimeException e) {
                     closeQuietly(c.ch);
                     closeQuietly(c.selector);
@@ -236,7 +286,8 @@ public final class TsdbClient implements AutoCloseable {
                 return c;
             } catch (TsdbException e) {
                 closeQuietly(ch);
-                if (e.status() == Status.ERR_INVALID) /* a server of another protocol: no other address helps */
+                /* a server of another protocol, or a refused login: no other address helps */
+                if (e.status() == Status.ERR_INVALID || e.status() == Status.ERR_AUTH)
                     throw e;
                 last = e;
             } catch (IOException | RuntimeException e) {
@@ -370,9 +421,9 @@ public final class TsdbClient implements AutoCloseable {
     /**
      * Exchanges protocol versions with the server.
      *
-     * @return the server's protocol version (11 for the server this client is written for)
-     * @throws TsdbException with {@link Status#ERR_INVALID} for a server older than protocol 11, which cannot read
-     *     64-bit series ids; with {@link Status#ERR_IO} on a connection failure
+     * @return the server's protocol version (12 for the server this client is written for)
+     * @throws TsdbException with {@link Status#ERR_INVALID} for a server older than protocol 12, which has no login;
+     *     with {@link Status#ERR_IO} on a connection failure
      */
     public int hello() throws TsdbException {
         request();
@@ -380,9 +431,30 @@ public final class TsdbClient implements AutoCloseable {
         out.putInt(Protocol.VERSION);
         send();
         int st = frame();
-        if (st == 0 && bodyLen != 4)
+        if (st == 0 && bodyLen < 4)
             throw lost(Status.ERR_CORRUPT, "HELLO reply of " + bodyLen + " bytes");
         int v = st == 0 ? in.getInt() : 0;
+        if (st == 0 && v >= Protocol.MIN_VERSION) {
+            /* version 12: u16 flags, u16 n, n x (u8 len, mechanism); a server that does not say whether it wants a
+             * login is not talked to */
+            boolean ok = bodyEnd - in.position() >= 4, auth = false, sha = false;
+            if (ok) {
+                auth = (in.getShort() & Protocol.HELLO_AUTH) != 0;
+                for (int n = in.getShort() & 0xffff; ok && n > 0; n--) {
+                    int len = bodyEnd - in.position() >= 1 ? in.get() & 0xff : -1;
+                    ok = len >= 0 && bodyEnd - in.position() >= len;
+                    if (ok) {
+                        byte[] m = new byte[len];
+                        in.get(m);
+                        sha |= new String(m, StandardCharsets.ISO_8859_1).equals(Protocol.SCRAM_SHA256);
+                    }
+                }
+            }
+            if (!ok || in.position() != bodyEnd)
+                throw lost(Status.ERR_CORRUPT, "HELLO reply of " + bodyLen + " bytes");
+            loginRequired = auth;
+            scram = sha;
+        }
         endReply();
         check(st);
         serverVersion = v;
@@ -390,6 +462,54 @@ public final class TsdbClient implements AutoCloseable {
             throw new TsdbException(Status.ERR_INVALID, "tsdbd speaks protocol " + v + "; this client needs "
                     + Protocol.MIN_VERSION + ": upgrade the server", null);
         return v;
+    }
+
+    /** After HELLO: logs in when the server asks for it; refuses a server that does not when the options say so. */
+    private void login(ConnectOptions o, byte[] pw) throws TsdbException {
+        if (!loginRequired) {
+            if (o.requireAuth())
+                throw Scram.refused("tsdbd does not ask for a login (--no-auth) and the options require one");
+            return; /* credentials, if any, are not needed */
+        }
+        if (o.user() == null)
+            throw Scram.refused("tsdbd requires a login: give a user and a password (ConnectOptions)");
+        if (!scram)
+            throw Scram.refused("tsdbd offers no login mechanism this client speaks (SCRAM-SHA-256)");
+        Scram s = new Scram(o.user());
+        byte[] start = s.startBody();
+        request();
+        begin(Protocol.OP_AUTH_START, start.length);
+        out.put(start);
+        send();
+        Scram.Final f = s.finish(pw, scramMessage());
+        request();
+        begin(Protocol.OP_AUTH_CONTINUE, f.body().length);
+        out.put(f.body());
+        send();
+        Scram.checkServerFinal(scramMessage(), f.serverSignature());
+    }
+
+    /**
+     * The reply to AUTH_START or AUTH_CONTINUE: u16 len and exactly that many bytes. The server answers every failure
+     * alike (A4), and ERR_INVALID only to a connection that logged in already, which a connect never is.
+     */
+    private byte[] scramMessage() throws TsdbException {
+        int st = frame();
+        byte[] m = null;
+        if (st == 0) {
+            int len = bodyLen >= 2 ? in.getShort() & 0xffff : -1;
+            if (len >= 0 && bodyLen == 2 + len) {
+                m = new byte[len];
+                in.get(m);
+            }
+        }
+        endReply();
+        if (st == Status.ERR_AUTH || st == Status.ERR_INVALID)
+            throw Scram.refused("tsdbd refused the login (an unknown user or a wrong password)");
+        check(st);
+        if (m == null)
+            throw Scram.refused("the server's SCRAM message is malformed");
+        return m;
     }
 
     /**
@@ -2744,6 +2864,265 @@ public final class TsdbClient implements AutoCloseable {
         int st = frame();
         endReply();
         check(st);
+    }
+
+    // --------------------------------------------------------------------- users
+
+    /** The iteration count of a verifier made without one ({@link #userCreate(String, char[], boolean)}). */
+    public static final int SCRAM_ITERATIONS = Scram.ITERATIONS;
+
+    /**
+     * The user this connection is logged in as, with its grants; "" with every right (a superuser) on a server
+     * started with {@code --no-auth}.
+     *
+     * @return the user
+     * @throws TsdbException on a connection failure
+     */
+    public User whoami() throws TsdbException {
+        request();
+        begin(Protocol.OP_WHOAMI, 0);
+        send();
+        int st = frame();
+        User u = st == 0 ? readUser() : null;
+        if (st == 0 && in.position() != bodyEnd)
+            throw lost(Status.ERR_CORRUPT, "WHOAMI reply of " + bodyLen + " bytes");
+        endReply();
+        check(st);
+        return u;
+    }
+
+    /**
+     * The users this one may see: itself, and the users it manages (every user, for a superuser).
+     *
+     * @return the users
+     * @throws TsdbException with {@link Status#ERR_DENIED} on a server started with {@code --no-auth} (users are
+     *     managed there with the offline {@code tsdb <dir> user} verbs)
+     */
+    public List<User> userList() throws TsdbException {
+        request();
+        begin(Protocol.OP_USER_LIST, 0);
+        send();
+        List<User> users = new ArrayList<>();
+        /* chunks of one reply: u8 last, u32 n, n users; an error status ends it */
+        for (;;) {
+            int st = frame();
+            if (st != 0) {
+                endReply();
+                throw new TsdbException(st);
+            }
+            if (bodyLen < 5)
+                throw lost(Status.ERR_CORRUPT, "USER_LIST chunk of " + bodyLen + " bytes");
+            int last = in.get();
+            long n = in.getInt() & 0xffffffffL;
+            if ((last & ~1) != 0 || n > (bodyEnd - in.position()) / 7)
+                throw lost(Status.ERR_CORRUPT, "USER_LIST chunk of " + bodyLen + " bytes");
+            for (long i = 0; i < n; i++)
+                users.add(readUser());
+            if (in.position() != bodyEnd)
+                throw lost(Status.ERR_CORRUPT, "USER_LIST chunk of " + bodyLen + " bytes");
+            if (last == 0) {
+                in.position(bodyEnd);
+                continue;
+            }
+            endReply();
+            return users;
+        }
+    }
+
+    /**
+     * Creates user {@code name} with {@code password} and {@value #SCRAM_ITERATIONS} iterations of PBKDF2.
+     *
+     * @param name the user, as the server's USERS file allows it (a tenant's users usually start with its prefix)
+     * @param password not empty
+     * @param superuser whether it gets every right
+     * @throws TsdbException as {@link #userCreate(String, char[], boolean, int)}
+     */
+    public void userCreate(String name, char[] password, boolean superuser) throws TsdbException {
+        userCreate(name, password, superuser, SCRAM_ITERATIONS);
+    }
+
+    /**
+     * Creates user {@code name} with {@code password}, a superuser if {@code superuser}.
+     *
+     * <p>The password does not travel: the client sends its verifier (a fresh 16-byte salt, StoredKey and ServerKey)
+     * computed with {@code iterations} of PBKDF2.
+     *
+     * @param name the user
+     * @param password not empty
+     * @param superuser whether it gets every right
+     * @param iterations 4096 to 100,000,000
+     * @throws TsdbException with {@link Status#ERR_DENIED} unless this user is a superuser, or holds {@code admin} on
+     *     a prefix that {@code name} starts with (only a superuser creates superusers), and on a {@code --no-auth}
+     *     server; with {@link Status#ERR_INVALID} for a name that exists or that USERS refuses
+     * @throws IllegalArgumentException for an empty password or an iteration count out of range
+     */
+    public void userCreate(String name, char[] password, boolean superuser, int iterations) throws TsdbException {
+        byte[] pw = utf8(password);
+        try {
+            byte[] v = Scram.verifier(pw, iterations);
+            byte[] rest = new byte[1 + v.length];
+            rest[0] = (byte) (superuser ? Protocol.USER_SUPERUSER : 0);
+            System.arraycopy(v, 0, rest, 1, v.length);
+            userCall(Protocol.OP_USER_CREATE, name, rest);
+        } finally {
+            Arrays.fill(pw, (byte) 0);
+        }
+    }
+
+    /**
+     * Sets the password of user {@code name} (its own, or one of a user it manages), as {@link #userCreate} sends it,
+     * with {@value #SCRAM_ITERATIONS} iterations.
+     *
+     * @param name the user
+     * @param password not empty
+     * @throws TsdbException as {@link #userPassword(String, char[], int)}
+     */
+    public void userPassword(String name, char[] password) throws TsdbException {
+        userPassword(name, password, SCRAM_ITERATIONS);
+    }
+
+    /**
+     * Sets the password of user {@code name} (its own, or one of a user it manages), as {@link #userCreate} sends it.
+     *
+     * @param name the user
+     * @param password not empty
+     * @param iterations 4096 to 100,000,000
+     * @throws TsdbException as {@link #userCreate(String, char[], boolean, int)}; {@link Status#ERR_DENIED} also for
+     *     a user holding a grant outside this one's {@code admin} selectors
+     */
+    public void userPassword(String name, char[] password, int iterations) throws TsdbException {
+        byte[] pw = utf8(password);
+        try {
+            userCall(Protocol.OP_USER_PASSWORD, name, Scram.verifier(pw, iterations));
+        } finally {
+            Arrays.fill(pw, (byte) 0);
+        }
+    }
+
+    /**
+     * Drops user {@code name}; its open connections are answered {@link Status#ERR_AUTH} and closed.
+     *
+     * @param name the user
+     * @throws TsdbException with {@link Status#ERR_DENIED} for a user this one does not manage, and for the last
+     *     superuser
+     */
+    public void userDrop(String name) throws TsdbException {
+        userCall(Protocol.OP_USER_DROP, name, new byte[0]);
+    }
+
+    /**
+     * Makes user {@code name} a superuser or takes that away (superusers only).
+     *
+     * @param name the user
+     * @param superuser whether it is one
+     * @throws TsdbException with {@link Status#ERR_DENIED} unless this user is a superuser, and for taking it from the
+     *     last superuser
+     */
+    public void userAlter(String name, boolean superuser) throws TsdbException {
+        userCall(Protocol.OP_USER_ALTER, name, new byte[] {(byte) (superuser ? Protocol.USER_SUPERUSER : 0)});
+    }
+
+    /**
+     * Gives user {@code name} {@code rights} on the series {@code selector} matches. Grants only add.
+     *
+     * <pre>{@code
+     * c.grant("acme/ingest", Selector.prefix("acme/"), Rights.INSERT);
+     * c.grant("acme/dash", Selector.parse("glob:acme/site?/temp"), Rights.parse("read"));
+     * }</pre>
+     *
+     * @param name the user
+     * @param selector the series
+     * @param rights what it may do there
+     * @throws TsdbException with {@link Status#ERR_DENIED} unless this user is a superuser or {@code selector} lies
+     *     inside its own {@code admin} selectors and it manages {@code name}; with {@link Status#ERR_INVALID} for a
+     *     malformed selector (a glob over 256 bytes, a 65th glob grant)
+     */
+    public void grant(String name, Selector selector, Rights rights) throws TsdbException {
+        userCall(Protocol.OP_GRANT, name, grantBody(selector, rights));
+    }
+
+    /**
+     * Takes {@code rights} on {@code selector} from user {@code name} (the grant with exactly this selector).
+     *
+     * @param name the user
+     * @param selector the series
+     * @param rights the rights to take
+     * @throws TsdbException as {@link #grant}
+     */
+    public void revoke(String name, Selector selector, Rights rights) throws TsdbException {
+        userCall(Protocol.OP_REVOKE, name, grantBody(selector, rights));
+    }
+
+    /** The u8 kind, u8 rights, u16 len, selector of GRANT and REVOKE. */
+    private static byte[] grantBody(Selector selector, Rights rights) throws TsdbException {
+        Objects.requireNonNull(selector, "selector");
+        Objects.requireNonNull(rights, "rights");
+        byte[] t = utf8(selector.text(), "selector");
+        byte[] b = new byte[4 + t.length];
+        b[0] = (byte) selector.kind().ordinal();
+        b[1] = (byte) rights.bits();
+        b[2] = (byte) t.length;
+        b[3] = (byte) (t.length >>> 8);
+        System.arraycopy(t, 0, b, 4, t.length);
+        return b;
+    }
+
+    /** u16 len, {@code name} and {@code rest}, sent as one request with no reply body. */
+    private void userCall(byte op, String name, byte[] rest) throws TsdbException {
+        byte[] n = utf8(Objects.requireNonNull(name, "name"), "user name");
+        request();
+        begin(op, 2 + n.length + rest.length);
+        out.putShort((short) n.length).put(n);
+        putBytes(rest);
+        send();
+        int st = frame();
+        if (st == 0 && bodyLen != 0)
+            throw lost(Status.ERR_CORRUPT, "reply of " + bodyLen + " bytes to a user call");
+        endReply();
+        check(st);
+    }
+
+    /** One user of a reply: u16 len, name, u8 flags, u32 g, g x (u8 kind, u8 rights, u16 len, selector). */
+    private User readUser() throws TsdbException {
+        String name = replyString();
+        if (bodyEnd - in.position() < 5)
+            throw lost(Status.ERR_CORRUPT, "a user cut short");
+        int flags = in.get();
+        long g = in.getInt() & 0xffffffffL;
+        if (g > (bodyEnd - in.position()) / 4)
+            throw lost(Status.ERR_CORRUPT, g + " grants in " + (bodyEnd - in.position()) + " bytes");
+        List<Grant> grants = new ArrayList<>((int) g);
+        Selector.Kind[] kinds = Selector.Kind.values();
+        for (long i = 0; i < g; i++) {
+            if (bodyEnd - in.position() < 2)
+                throw lost(Status.ERR_CORRUPT, "a grant cut short");
+            int kind = in.get() & 0xff, rights = in.get() & 0xff;
+            String text = replyString();
+            if (kind >= kinds.length)
+                throw lost(Status.ERR_CORRUPT, "a grant of unknown kind " + kind);
+            grants.add(new Grant(kind == 0 ? Selector.all() : new Selector(kinds[kind], text), new Rights(rights)));
+        }
+        return new User(name, (flags & Protocol.USER_SUPERUSER) != 0, grants);
+    }
+
+    /** u16 len and that many bytes of UTF-8, inside the reply frame. */
+    private String replyString() throws TsdbException {
+        int len = bodyEnd - in.position() >= 2 ? in.getShort() & 0xffff : -1;
+        if (len < 0 || bodyEnd - in.position() < len)
+            throw lost(Status.ERR_CORRUPT, "a string cut short");
+        byte[] b = new byte[len];
+        in.get(b);
+        return new String(b, StandardCharsets.UTF_8);
+    }
+
+    /** A password's UTF-8 bytes, which the caller clears. */
+    private static byte[] utf8(char[] password) {
+        Objects.requireNonNull(password, "password");
+        ByteBuffer b = StandardCharsets.UTF_8.encode(java.nio.CharBuffer.wrap(password));
+        byte[] pw = new byte[b.remaining()];
+        b.get(pw);
+        Arrays.fill(b.array(), (byte) 0);
+        return pw;
     }
 
     // --------------------------------------------------------------------- I/O

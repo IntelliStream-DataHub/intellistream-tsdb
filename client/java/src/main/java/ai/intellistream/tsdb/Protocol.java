@@ -2,9 +2,9 @@ package ai.intellistream.tsdb;
 
 /** Constants of the wire protocol; the authoritative description is {@code include/tsdb_protocol.h}. */
 final class Protocol {
-    /* HELLO answers the lower of both versions; version 11 made every series id 64 bits, so the client speaks 11 only */
-    static final int VERSION = 11;
-    static final int MIN_VERSION = 11;     /* the oldest server the client connects to */
+    /* HELLO answers the lower of both versions; version 12 (login) is the only one the client speaks */
+    static final int VERSION = 12;
+    static final int MIN_VERSION = 12;     /* the oldest server the client connects to */
     static final int DEFAULT_PORT = 7070;
     static final int MAX_FRAME = 256 << 20;
     static final int HEADER = 9;           /* u32 length, u32 id, u8 op */
@@ -57,6 +57,20 @@ final class Protocol {
     static final byte OP_REPLACE_RANGE = 26;
     static final byte OP_SET_RETENTION = 27;
     static final byte OP_GET_RETENTION = 28;
+    static final byte OP_AUTH_START = 29;     /* version 12: login and users */
+    static final byte OP_AUTH_CONTINUE = 30;
+    static final byte OP_WHOAMI = 31;
+    static final byte OP_USER_CREATE = 32;
+    static final byte OP_USER_DROP = 33;
+    static final byte OP_USER_ALTER = 34;
+    static final byte OP_USER_PASSWORD = 35;
+    static final byte OP_GRANT = 36;
+    static final byte OP_REVOKE = 37;
+    static final byte OP_USER_LIST = 38;
+
+    static final int HELLO_AUTH = 1;          /* HELLO reply flags: login is required */
+    static final String SCRAM_SHA256 = "SCRAM-SHA-256";
+    static final int USER_SUPERUSER = 1;      /* user flags */
 
     private Protocol() {
     }
