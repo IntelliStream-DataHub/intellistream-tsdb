@@ -1266,6 +1266,7 @@ public final class TsdbClient implements AutoCloseable {
      * @param order oldest or newest bucket first
      * @param limit the most buckets to return; 0 for all
      * @return the buckets with rows
+     * @throws TsdbException with {@link Status#ERR_TOO_MANY_BUCKETS} if the range holds too many buckets, and so on
      * @throws IllegalArgumentException for a negative limit
      */
     public List<SpreadBucket> querySpreadGroup(long series, long start, long end, Group group, Order order,

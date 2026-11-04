@@ -8,6 +8,7 @@
  *                      [--query-threads N] (embedded: tsdb_options.query_threads) [--repeat K] (K x the queries)
  *                      [--one-series S] (single-series classes query series S only)
  *                      [--digest] (a hash of every answer's bytes: compare builds; slows the timed loop)
+ *                      [--user U --password-file F] (log every connection in, for a tsdbd without --no-auth)
  *
  * The data are the seven sensor kinds of datasets.h, mixed over the series,
  * with their usual value streams but all stamped at 1 Hz, so every series
@@ -46,6 +47,7 @@ static const int64_t STEP = 1000;
 
 static const char *dir, *host = "127.0.0.1", *sql_dir, *only;
 static int port, threads = 8, query_threads, repeat = 1, one_series = -1, digest;
+static tsdbc_options login; /* user NULL: no login (a tsdbd with --no-auth) */
 static uint32_t nseries = 10000, s_from, s_to, group_series = 100;
 static uint64_t points = 10000000, window = 100000;
 
@@ -449,7 +451,8 @@ static int cmd_query(void)
     if (port) {
         tg.conns = calloc((size_t)threads, sizeof *tg.conns);
         for (int i = 0; i < threads; i++) {
-            int rc = tsdbc_connect(host, port, &tg.conns[i]);
+            int rc = login.user ? tsdbc_connect_opts(host, port, &login, &tg.conns[i])
+                                : tsdbc_connect(host, port, &tg.conns[i]);
             if (rc) {
                 fprintf(stderr, "connect %s:%d: %s\n", host, port, tsdbc_strerror(rc));
                 return 1;
@@ -508,7 +511,8 @@ int main(int argc, char **argv)
         {"sql", required_argument, 0, 'S'},    {"only", required_argument, 0, 'o'},
         {"query-threads", required_argument, 0, 'Q'}, {"repeat", required_argument, 0, 'R'},
         {"one-series", required_argument, 0, 'O'}, {"digest", no_argument, 0, 'D'},
-        {"insert-zstd", required_argument, 0, 'z'}, {0, 0, 0, 0}};
+        {"insert-zstd", required_argument, 0, 'z'}, {"user", required_argument, 0, 'u'},
+        {"password-file", required_argument, 0, 'W'}, {0, 0, 0, 0}};
     int ch;
     optind = 2;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -530,8 +534,14 @@ int main(int argc, char **argv)
         case 'O': one_series = atoi(optarg); break;
         case 'D': digest = 1; break;
         case 'z': insert_zstd = atoi(optarg); break;
+        case 'u': login.user = optarg; break;
+        case 'W': login.password_file = optarg; break;
         default: return 2;
         }
+    }
+    if (login.user && !login.password_file) {
+        fprintf(stderr, "scale-bench: --user needs --password-file (passwords never go on the command line)\n");
+        return 2;
     }
     if (strcmp(cmd, "export") == 0)
         return cmd_export();

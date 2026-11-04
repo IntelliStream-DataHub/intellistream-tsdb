@@ -30,17 +30,27 @@ public record TwaOptions(TwaMethod method, long maxGapMs, Order order, long limi
             throw new IllegalArgumentException("negative limit");
     }
 
-    /** @return step, no gap limit, oldest first, every bucket */
+    /**
+     * Step: each value holds until the next reading.
+     *
+     * @return step, no gap limit, oldest first, every bucket
+     */
     public static TwaOptions step() {
         return new TwaOptions(TwaMethod.STEP, 0, Order.ASC, 0);
     }
 
-    /** @return linear, no gap limit, oldest first, every bucket */
+    /**
+     * Linear: the value runs on a straight line from one reading to the next.
+     *
+     * @return linear, no gap limit, oldest first, every bucket
+     */
     public static TwaOptions linear() {
         return new TwaOptions(TwaMethod.LINEAR, 0, Order.ASC, 0);
     }
 
     /**
+     * Limits the gap a segment may span; a longer segment covers nothing (the value is stale).
+     *
      * @param ms the longest gap between readings a segment may span; 0 for no limit
      * @return these options with that gap
      */
@@ -49,6 +59,8 @@ public record TwaOptions(TwaMethod method, long maxGapMs, Order order, long limi
     }
 
     /**
+     * The order of the buckets.
+     *
      * @param o oldest or newest bucket first
      * @return these options in that order
      */
@@ -57,6 +69,8 @@ public record TwaOptions(TwaMethod method, long maxGapMs, Order order, long limi
     }
 
     /**
+     * Limits the number of buckets returned, counted in {@link #order(Order) order}.
+     *
      * @param n the most buckets to return; 0 for all
      * @return these options with that limit
      */

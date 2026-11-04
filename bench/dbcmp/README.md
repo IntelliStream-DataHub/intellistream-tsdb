@@ -84,7 +84,7 @@ samples per series).
 
 ```sh
 rm -rf $DBCMP/tsdb && sync
-$T/tsdbd --dir $DBCMP/tsdb --listen 127.0.0.1 --port 7070 &
+$T/tsdbd --dir $DBCMP/tsdb --no-auth --listen 127.0.0.1 --port 7070 &
 $T/tsdbc-bench load $DATA --conns 4 && sync -f $DBCMP
 $B/tsdbstat settle                        # background merges still running after the load; size
 cd $WORK

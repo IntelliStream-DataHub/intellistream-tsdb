@@ -103,7 +103,7 @@ build/tsdb-bench --dir /var/tmp/e --load data.rb --threads 4 [--no-fsync] [--opt
 build/tsdb-bench --dir /var/tmp/e --verify data.rb                                        # verifies an existing database
 build/tsdb-bench --dir /var/tmp/e --qps 32 --series 100 --points 1000000 --seconds 3     # the three classes
 
-build/tsdbd --dir /var/tmp/d --port 17070 &
+build/tsdbd --dir /var/tmp/d --no-auth --port 17070 &
 build/tsdbc-bench --port 17070 --conns 4 --compression 1 load data.rb
 build/tsdbc-bench --port 17070 verify data.rb          # count, sum and every (timestamp, value) of every series
 build/tsdbc-bench --port 17070 optimize                # flush and merge
