@@ -34,6 +34,10 @@ jobs:
           out=$(mktemp -d)
           cp -r site/. "$out/"
           touch "$out/.nojekyll"   # serve the files as they are, without Jekyll
+          # Pages lets browsers cache files for 10 minutes: a new page with an old site.js breaks the tabs and menus,
+          # so every page names its CSS and JS with this commit (assets/site.js?v=abc1234)
+          v=$(printf %s "$GITHUB_SHA" | cut -c1-7)
+          find "$out" -name '*.html' -exec sed -i -E "s#(assets/[A-Za-z0-9_.-]+\.(css|js))\"#\1?v=$v\"#g" {} +
           cd "$out"
           git init -q -b gh-pages
           git config user.name "github-actions[bot]"
