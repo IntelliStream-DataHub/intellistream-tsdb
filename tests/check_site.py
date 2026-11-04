@@ -450,7 +450,9 @@ def run_probe(chrome, page, profile, expect=None):
     could not run it."""
     raw = open(page, encoding="utf-8").read()
     pre = "<script>window.TSDB_EXPECT = %s;</script>" % ("true" if expect else "false")
-    probe = os.path.join(os.path.dirname(page), ".tabprobe-" + os.path.basename(page))
+    # named per process: make test and make tsan run this check at once in one tree, and a shared name let one
+    # run delete the other's probe
+    probe = os.path.join(os.path.dirname(page), ".tabprobe-%d-%s" % (os.getpid(), os.path.basename(page)))
     with open(probe, "w", encoding="utf-8") as f:
         f.write(raw.replace("</body>", pre + TAB_PROBE + "</body>"))
     try:
