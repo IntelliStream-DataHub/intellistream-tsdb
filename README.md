@@ -110,7 +110,8 @@ timed. Every timing was repeated 5 times. "slower" says how many times longer th
   [DB-Engines ranking](https://db-engines.com/en/ranking/time+series+dbms) (November 2026).
 - \* QuestDB open source, in its default format, which does not compress. The open source version compresses only
   partitions you convert to Parquet by hand: with ZSTD it needs 1.02 bytes per reading, but converting the 100
-  million readings took 28 minutes.
+  million readings took 28 minutes. Converting partitions automatically as they age ([storage policies](https://questdb.com/docs/concepts/storage-policy/)) is a feature of QuestDB's paid
+  Enterprise edition.
 
 **Embedded: a library inside your program**, the same 100 million readings in one process, with no network. chDB
 is ClickHouse as a library.

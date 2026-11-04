@@ -277,7 +277,9 @@ QuestDB 10.0.1, a fast SQL database for time series. It does not sync a write to
 - **Size:** in its default format it does not compress: the median over the 31 data sets is 56 times tsdb's. Its
   open source version compresses only partitions you convert to Parquet by hand: with ZSTD the median is 1.2
   times tsdb's (1.0 to 7.4 times), the closest of all, and with LZ4 2.3 times. Converting the 100 million readings
-  to Parquet with ZSTD took 28 minutes (1,702 s after the load); with LZ4 3 s.
+  to Parquet with ZSTD took 28 minutes (1,702 s after the load); with LZ4 3 s. Converting partitions
+  automatically as they age ([storage policies](https://questdb.com/docs/concepts/storage-policy/)) is a feature of QuestDB's paid Enterprise
+  edition.
 - **Load:** 3.04 s, then 2.9 s until its WAL was applied and 1.6 s to sync (tsdb 1.17 s, 2.6x faster).
 - **Memory:** close to the 48 GB limit (47.9 GB without the file cache): it keeps memory from earlier questions.
 

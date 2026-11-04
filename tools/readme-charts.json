@@ -4,8 +4,8 @@
     "bench-servers": {
       "systems": ["tsdb", "ClickHouse", "InfluxDB 2", "InfluxDB 3", "VictoriaMetrics", "QuestDB*", "TimescaleDB",
                   "IoTDB", "TDengine", "Prometheus"],
-      "footnotes": ["* QuestDB open source, in its default format, which does not compress. The open source version compresses",
-                    "only partitions you convert to Parquet by hand: with ZSTD 1.02 bytes per reading, but converting took 28 minutes."],
+      "footnotes": ["* QuestDB open source, in its default format, which does not compress. It compresses only partitions you convert",
+                    "to Parquet by hand (with ZSTD 1.02 bytes per reading; converting took 28 minutes); automatic conversion is Enterprise only."],
       "panels": [
         {"title": "Size on disk", "unit": "bytes per reading", "kind": "size",
          "values": ["0.78", "2.51", "34.5", "9.59", "1.60", "50.3", "3.42", "2.60", "2.71", "2.83"]},

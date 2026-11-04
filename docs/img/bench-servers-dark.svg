@@ -205,6 +205,6 @@
 <rect x="533" y="759" width="3.0" height="13" rx="2" class="b"/><text x="541.0" y="769" class="v">1.1 GB</text>
 </g>
 <text x="0" y="800" class="m">Speed: tsdb is the full bar. Size and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: BENCHMARKS.md</text>
-<text x="0" y="816" class="m">* QuestDB open source, in its default format, which does not compress. The open source version compresses</text>
-<text x="0" y="832" class="m">only partitions you convert to Parquet by hand: with ZSTD 1.02 bytes per reading, but converting took 28 minutes.</text>
+<text x="0" y="816" class="m">* QuestDB open source, in its default format, which does not compress. It compresses only partitions you convert</text>
+<text x="0" y="832" class="m">to Parquet by hand (with ZSTD 1.02 bytes per reading; converting took 28 minutes); automatic conversion is Enterprise only.</text>
 </svg>
