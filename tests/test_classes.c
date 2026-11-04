@@ -1696,7 +1696,7 @@ static int64_t hc_now(void *arg)
     return HT0 + 4 * DAY;
 }
 
-static tsdb *hc_open(const char *dir, uint32_t grows, uint32_t *ids)
+static tsdb *hc_open(const char *dir, uint32_t grows, tsdb_sid *ids)
 {
     tsdb_options o;
     tsdb_options_init(&o);
@@ -1714,7 +1714,7 @@ static tsdb *hc_open(const char *dir, uint32_t grows, uint32_t *ids)
     return db;
 }
 
-static void hc_put(tsdb *db, uint32_t id, const hc_ser *s, size_t a, size_t b, size_t batch)
+static void hc_put(tsdb *db, tsdb_sid id, const hc_ser *s, size_t a, size_t b, size_t batch)
 {
     for (size_t i = a; i < b; i += batch) {
         size_t m = b - i < batch ? b - i : batch;
@@ -1725,7 +1725,7 @@ static void hc_put(tsdb *db, uint32_t id, const hc_ser *s, size_t a, size_t b, s
 
 /* every series in one insert (a large insert, or WAL and one flush): each series' rows of a partition go through
  * one writer, so the layout follows the rule exactly */
-static void hc_load_one(tsdb *db, const uint32_t *ids, int on)
+static void hc_load_one(tsdb *db, const tsdb_sid *ids, int on)
 {
     hc_set(on);
     for (int k = 0; k < HC_NS; k++)
@@ -1734,7 +1734,7 @@ static void hc_load_one(tsdb *db, const uint32_t *ids, int on)
 }
 
 /* 60% in small inserts (WAL, memtable, flushes), 20% in one large insert, optimize, then the rest */
-static void hc_load_rounds(tsdb *db, const uint32_t *ids, int on, int round)
+static void hc_load_rounds(tsdb *db, const tsdb_sid *ids, int on, int round)
 {
     hc_set(on);
     for (int k = 0; k < HC_NS; k++) {
@@ -1764,7 +1764,7 @@ static size_t hc_lb(const hc_ser *s, int64_t t)
 }
 
 /* A delete and a replace across hour edges, the same in a database and in the model (model only when db is NULL) */
-static void hc_edit(tsdb *db, const uint32_t *ids, int on)
+static void hc_edit(tsdb *db, const tsdb_sid *ids, int on)
 {
     if (db)
         hc_set(on);
@@ -1841,10 +1841,10 @@ static void on_hc_granule(void *ctx, int cls, uint32_t i, const tsdb_test_granul
     l->a[l->n++] = (hc_gran){*g, cls, i};
 }
 
-static int hc_which(const uint32_t *ids, uint32_t series)
+static int hc_which(const tsdb_sid *ids, uint32_t series) /* a granule names its series by the local id */
 {
     for (int k = 0; k < HC_NS; k++)
-        if (ids[k] == series)
+        if (TSDB_SID_LOCAL(ids[k]) == series)
             return k;
     return -1;
 }
@@ -1852,7 +1852,7 @@ static int hc_which(const uint32_t *ids, uint32_t series)
 /* The layout: no granule spans an edge where its series is dense; a short granule followed by more of its series
  * in its part ends at an hour edge (exact: a day edge or one where the series is dense or may be); slow_c0 keeps one
  * granule a day. */
-static void hc_layout(tsdb *db, const uint32_t *ids, int exact, const char *what)
+static void hc_layout(tsdb *db, const tsdb_sid *ids, int exact, const char *what)
 {
     hc_glist l = {0};
     tsdb_test_granules(db, on_hc_granule, &l);
@@ -1921,7 +1921,7 @@ static int on_hc_rows(void *ctx, const int64_t *ts, const tsdb_values *v, size_t
     return 0;
 }
 
-static void hc_gstats(tsdb *db, const uint32_t *ids, const char *what)
+static void hc_gstats(tsdb *db, const tsdb_sid *ids, const char *what)
 {
     hc_glist l = {0};
     tsdb_test_granules(db, on_hc_granule, &l);
@@ -1932,14 +1932,14 @@ static void hc_gstats(tsdb *db, const uint32_t *ids, const char *what)
         if (k < 0)
             continue;
         hc_rows r = {.type = hcs[k].type};
-        OK(tsdb_query_values(db, g->series, g->ts_min, g->ts_max + 1, NULL, on_hc_rows, &r));
+        OK(tsdb_query_values(db, ids[k], g->ts_min, g->ts_max + 1, NULL, on_hc_rows, &r));
         r.mean = r.n ? (double)((long double)r.sum / r.n) : 0, r.pass = 1;
         if (hcs[k].type == TSDB_INT64)
             r.mean = (double)((long double)r.isum / r.n);
-        OK(tsdb_query_values(db, g->series, g->ts_min, g->ts_max + 1, NULL, on_hc_rows, &r));
+        OK(tsdb_query_values(db, ids[k], g->ts_min, g->ts_max + 1, NULL, on_hc_rows, &r));
         tsdb_spread_bucket *sb = NULL;
         size_t nb = 0;
-        OK(tsdb_query_spread(db, g->series, g->ts_min, g->ts_max + 1, 0, NULL, &sb, &nb));
+        OK(tsdb_query_spread(db, ids[k], g->ts_min, g->ts_max + 1, 0, NULL, &sb, &nb));
         tsdb_query_stats st;
         tsdb_last_query_stats(&st);
         checked++;
@@ -2014,7 +2014,7 @@ static int hc_same_t(const tsdb_twa_bucket *x, const tsdb_twa_bucket *y, size_t 
     return 1;
 }
 
-static void hc_compare(tsdb *on, tsdb *off, const uint32_t *ion, const uint32_t *ioff, int only, const char *what)
+static void hc_compare(tsdb *on, tsdb *off, const tsdb_sid *ion, const tsdb_sid *ioff, int only, const char *what)
 {
     static const int64_t iv[] = {0, 60000, 1020000, HOUR, DAY};
     static const tsdb_group gr[] = {{TSDB_HOUR, 1, NULL},          {TSDB_DAY, 1, NULL},
@@ -2084,7 +2084,7 @@ static void hc_compare(tsdb *on, tsdb *off, const uint32_t *ion, const uint32_t 
 
 /* hourly and Oslo-day buckets of dense_f32 come from statistics alone with hour cuts; Kolkata days decode one
  * granule a day (its midnight is at :30); without hour cuts hours decode */
-static void hc_coverage(tsdb *db, uint32_t id, int on, const char *what)
+static void hc_coverage(tsdb *db, tsdb_sid id, int on, const char *what)
 {
     tsdb_bucket *b = NULL;
     size_t nb = 0;
@@ -2115,12 +2115,12 @@ static void hc_coverage(tsdb *db, uint32_t id, int on, const char *what)
 }
 
 /* granules (series, ts_min, ts_max, count) of one series, for comparing layouts */
-static hc_glist hc_series_granules(tsdb *db, uint32_t id)
+static hc_glist hc_series_granules(tsdb *db, tsdb_sid id)
 {
     hc_glist l = {0}, r = {0};
     tsdb_test_granules(db, on_hc_granule, &l);
     for (size_t j = 0; j < l.n; j++)
-        if (l.a[j].g.series == id)
+        if (l.a[j].g.series == TSDB_SID_LOCAL(id)) /* one volume: the local id names the series */
             on_hc_granule(&r, l.a[j].cls, 0, &l.a[j].g);
     free(l.a);
     return r;
@@ -2147,7 +2147,7 @@ static void hc_exact_edges(uint32_t grows)
     dir_of(dir, sizeof dir, name);
     hc_set(1);
     tsdb *db = hc_open(dir, grows, NULL);
-    uint32_t id;
+    tsdb_sid id;
     OK(tsdb_series_create(db, "grid", TSDB_FLOAT32, NULL, &id));
     size_t n = 86400;
     int64_t *ts = malloc(n * sizeof *ts);
@@ -2175,7 +2175,7 @@ static void hc_exact_edges(uint32_t grows)
 
 /* the last row of every day again, and optimize: a merge in every partition, which may copy the granules before
  * that row */
-static void hc_touch(tsdb *db, const uint32_t *ids)
+static void hc_touch(tsdb *db, const tsdb_sid *ids)
 {
     for (int k = 0; k < HC_NS; k++)
         for (int d = 0; d < 3; d++) {
@@ -2192,7 +2192,7 @@ static void hc_touch(tsdb *db, const uint32_t *ids)
 typedef struct hc_db {
     char dir[600];
     tsdb *db;
-    uint32_t id;
+    tsdb_sid id;
     int64_t *ts;
     float *v;
     size_t n;
@@ -2334,7 +2334,7 @@ static void test_hourcut(void)
     dir_of(d_off, sizeof d_off, "hc-off");
     dir_of(d_old, sizeof d_old, "hc-old");
     dir_of(d_il, sizeof d_il, "hc-il");
-    uint32_t i_one[HC_NS], i_on[HC_NS], i_off[HC_NS], i_old[HC_NS], i_il[HC_NS];
+    tsdb_sid i_one[HC_NS], i_on[HC_NS], i_off[HC_NS], i_old[HC_NS], i_il[HC_NS];
     tsdb *one = hc_open(d_one, 0, i_one), *on = hc_open(d_on, 0, i_on), *off = hc_open(d_off, 0, i_off);
     hc_load_one(one, i_one, 1);
     hc_layout(one, i_one, 1, "one writer");
