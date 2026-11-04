@@ -136,6 +136,8 @@ its worst it needs 256 bytes where tsdb needs 0.64.
 
 | question | clients | tsdb | InfluxDB 2 | InfluxDB 2 takes |
 |---|---:|---:|---:|---:|
+| load 100 million readings (\*) | | **1.17 s** | 27.9 s | 24x longer |
+| wait after the load until background work is done (\*) | | **0.05 s** | 664 s | |
 | whole history of 100 sensors, in buckets of 3,600 readings | 1 | **8.3 ms** | 2.36 s | 284x longer |
 | the same in buckets of 60 readings (1.67 million buckets) | 1 | **65.6 ms** | 6.85 s | 104x longer |
 | one day of one sensor, in 288 buckets | 1 | **0.090 ms** | 5.04 ms | 56x longer |
@@ -156,8 +158,8 @@ its worst it needs 256 bytes where tsdb needs 0.64.
 - **Memory:** tsdb used at most 2.0 GB (1.9 GB without the file cache). InfluxDB 2 used up to 8.3 GB.
 - **Time-weighted averages:** InfluxDB 2's `timeWeightedAvg` gives other answers than tsdb's in a third of the
   buckets (it does not carry readings across bucket edges), so it was not timed.
-- **Loading:** we do not show InfluxDB 2's load time. Its five load runs did not report the same steps, and the tool
-  that collects the results flags such numbers.
+- (\*) **Loading:** tsdb loaded through 4 connections, InfluxDB 2 through 8. InfluxDB 2's five load runs logged
+  different background-work steps, but the times agree: 27.8 to 27.9 s to load, 664 s until the work was done.
 
 **tsdb against VictoriaMetrics.** VictoriaMetrics (v1.154.0) is a fast database for monitoring metrics. It
 answers a write from memory and writes it to disk within 5 seconds; tsdb syncs every write to disk first.
@@ -243,10 +245,11 @@ into both.
 | | tsdb | ClickHouse |
 |---|---:|---:|
 | size on disk | **138 GB** | 212 GB |
-| load | **1,480 s** | 1,937 s |
-| one sensor by hour (10 million readings) | **17.4 ms** | 42 ms |
-| 100 sensors by hour (1 billion readings) | **398 ms** | 1,100 ms |
-| everything by hour (100 billion readings) | **51.5 s** | 112.9 s |
+| load | **914 s** | 1,937 s |
+| load until background work is done | **3,259 s** | 4,507 s |
+| one sensor by hour (10 million readings) | **17.2 ms** | 42 ms |
+| 100 sensors by hour (1 billion readings) | **361 ms** | 1,100 ms |
+| everything by hour (100 billion readings) | **52.4 s** | 112.9 s |
 
 Hours cut through nearly every block of 8192 readings, so both systems read the data; tsdb is 2 to 3 times faster.
 
