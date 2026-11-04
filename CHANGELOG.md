@@ -156,6 +156,11 @@ disk format and the wire protocol.
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
+- Large inserts (8 million rows or more per call) faulted their memory in again on every call since the 64-bit series
+  ids: `tsdb_insert` narrowed the ids into a fresh allocation per batch, which glibc serves from a new mmap above
+  32 MB (4 bytes per row; a batch spanning volumes, 16). They now go to the inserting thread's grow-only buffers, as
+  the engine's own sort buffers do: 32 billion rows loaded with 1 million page faults instead of 32 million, and a
+  third of the system time. `scale-bench load` writes the ids as it generates the rows rather than in a second pass.
 - The last `SERIES` or `STATES` record, damaged at rest, was cut as a torn tail although a `RETENTION` or `CLASSES`
   record, or a syncing writer's MANIFEST, proved it acknowledged: the next series got its id and inherited its
   retention limit (its rows hidden at once and dropped by merges) or class, or a new state name its code. The open

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -1870,6 +1871,91 @@ static void test_wal_replay(const char *base)
     printf("  writer killed with rows in three volumes' WALs: replayed under the same ids\n");
 }
 
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define SANITIZED_MALLOC 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define SANITIZED_MALLOC 1
+#endif
+#endif
+
+static long minor_faults(void)
+{
+    struct rusage u;
+    getrusage(RUSAGE_SELF, &u);
+    return u.ru_minflt;
+}
+
+/* A large batch (here 9 M rows) written again and again must reuse the thread's buffers: the ids narrowed for the
+ * engine, and a split by volume, went to a malloc per batch, which glibc serves from a fresh mmap above 32 MB, so
+ * every batch faulted 4 bytes per row in again (and 16 when split); the 100-billion-row load ran 10% slower on CPU
+ * and tripled its system time. After a first batch the engine itself faults a few pages per batch. Sanitizer
+ * allocators keep freed memory in quarantine, so their own faults would decide this: skipped there. */
+static void test_large_insert_reuses_buffers(const char *base)
+{
+#ifdef SANITIZED_MALLOC
+    (void)base;
+    printf("  large inserts reuse their buffers: skipped under a sanitizer\n");
+#else
+    char top[600], root[700], vp[800];
+    fresh(base, "bigins", top, sizeof top, root, sizeof root);
+    snprintf(vp, sizeof vp, "%s/v1", top);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.merge_threads = 0;
+    tsdb *db;
+    OK(tsdb_open(root, &o, &db));
+    enum { SERIES = 100, PER = 90000 };
+    size_t n = (size_t)SERIES * PER;
+    tsdb_sid ids[2][SERIES];
+    for (int s = 0; s < SERIES; s++) {
+        char name[32];
+        snprintf(name, sizeof name, "big.%d", s);
+        OK(tsdb_series(db, name, &ids[0][s]));
+        snprintf(name, sizeof name, "big.v1.%d", s);
+        OK(tsdb_series_at(db, name, vp, &ids[1][s]));
+    }
+    tsdb_sid *id = malloc(n * sizeof *id);
+    int64_t *ts = malloc(n * sizeof *ts);
+    float *v = malloc(n * sizeof *v);
+    if (!id || !ts || !v)
+        exit(1);
+    long limit = (long)(n * sizeof(uint32_t) / 4096 / 4); /* a quarter of what one per-batch id array faults */
+    for (int split = 0; split < 2; split++) {
+        long faults = 0;
+        for (int b = 0; b < 2; b++) {
+            for (size_t s = 0, k = 0; s < SERIES; s++)
+                for (size_t i = 0; i < PER; i++, k++) {
+                    id[k] = ids[split && (s & 1)][s]; /* split: odd series in the volume, even ones in the root */
+                    ts[k] = T0 + (int64_t)(b * PER + i) * 1000;
+                    v[k] = (float)(i % 1000);
+                }
+            long f0 = minor_faults();
+            OK(tsdb_insert(db, id, ts, v, n));
+            faults = minor_faults() - f0;
+        }
+        if (faults >= limit)
+            fprintf(stderr, "  %s batch of %zu rows: %ld minor faults the second time (limit %ld)\n",
+                    split ? "split" : "one-volume", n, faults, limit);
+        CHECK(faults < limit);
+    }
+    tsdb_points p;
+    OK(tsdb_query_points(db, ids[1][1], INT64_MIN, INT64_MAX, &p));
+    CHECK(p.n == 2 * PER && p.ts[PER] == T0 + (int64_t)PER * 1000 && p.values[PER + 7] == 7);
+    tsdb_points_free(&p);
+    OK(tsdb_query_points(db, ids[0][2], INT64_MIN, INT64_MAX, &p));
+    CHECK(p.n == 2 * PER);
+    tsdb_points_free(&p);
+    free(id);
+    free(ts);
+    free(v);
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  large inserts (one volume and split) reuse their buffers: no page faults per batch\n");
+#endif
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -2149,6 +2235,7 @@ int main(int argc, char **argv)
     test_unique_names(base);
     test_duplicate_name(base);
     test_wal_replay(base);
+    test_large_insert_reuses_buffers(base);
 
     if (system(cmd) != 0)
         return 1;

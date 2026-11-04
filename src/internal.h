@@ -1441,6 +1441,10 @@ int eng_state(eng *db, const char *name, bool create, uint32_t *code);
 const char *eng_state_name(eng *db, uint32_t code);
 /* v: slots of `type`; every series must be of that type */
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *v, size_t n);
+/* The calling thread's grow-only buffer `which` (0, 1, 2) of at least `bytes`, for a caller that rearranges a batch
+ * before eng_insert (the volume split, narrowed ids): a fresh malloc per batch of 8M rows or more is an mmap whose
+ * pages fault in again every time, on every thread at once. Contents are lost when it grows; NULL on failure. */
+void *eng_insert_scratch(int which, size_t bytes);
 int eng_insert_series(eng *db, int type, uint32_t series, const int64_t *ts, const void *v, size_t n);
 int eng_commit(eng *db);
 int eng_flush(eng *db);

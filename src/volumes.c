@@ -1508,7 +1508,9 @@ static int insert_series_slots(tsdb *t, int type, tsdb_sid series, const int64_t
 }
 
 /* Rows of several series: split by volume, local ids, each volume written on
- * its own (a batch that spans volumes is durable per volume). */
+ * its own (a batch that spans volumes is durable per volume). The narrowed ids
+ * and the split go in the thread's grow-only buffers (eng_insert_scratch): a
+ * malloc per batch made every large insert fault its pages in again. */
 static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t *ts, const void *values, size_t n)
 {
     if (t->opt.read_only)
@@ -1516,35 +1518,56 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
     if (n && (!series || !ts || !values))
         return TSDB_ERR_INVALID;
     size_t w = type_width(type);
+    uint32_t *ls = eng_insert_scratch(0, n * sizeof *ls);
+    if (!ls)
+        return TSDB_ERR_NOMEM;
     pthread_rwlock_rdlock(&t->lock);
     size_t nv = t->nvols;
     /* every id first: an unknown one fails the whole batch before any volume writes a row */
     bool one = true; /* every row in one volume: the engine takes it as it is, with the ids narrowed */
-    for (size_t i = 0; i < n; i++) {
-        int64_t v = sid_volume(series[i]);
-        if (v < 0 || (size_t)v >= nv || TSDB_SID_LOCAL(series[i]) >= eng_series_count(t->vols[v])) {
+    if (n) {
+        /* the usual batch, every row in the first row's volume: one pass that vectorizes, then one check */
+        uint64_t hi = series[0] >> 32, diff = 0;
+        uint32_t top = 0;
+        for (size_t i = 0; i < n; i++) {
+            ls[i] = TSDB_SID_LOCAL(series[i]);
+            top = ls[i] > top ? ls[i] : top;
+            diff |= (series[i] >> 32) ^ hi;
+        }
+        int64_t v0 = sid_volume(series[0]);
+        one = diff == 0;
+        if (one && (v0 < 0 || (size_t)v0 >= nv || top >= eng_series_count(t->vols[v0]))) {
             pthread_rwlock_unlock(&t->lock);
             return TSDB_ERR_INVALID;
         }
-        one &= (series[i] >> 32) == (series[0] >> 32);
+    }
+    /* rows of several volumes: each id on its own; counts only grow, so one read per run of rows in a volume does */
+    int64_t lastv = -1;
+    uint32_t lim = 0;
+    for (size_t i = 0; !one && i < n; i++) {
+        int64_t v = sid_volume(series[i]);
+        if (v != lastv) {
+            if (v < 0 || (size_t)v >= nv) {
+                pthread_rwlock_unlock(&t->lock);
+                return TSDB_ERR_INVALID;
+            }
+            lim = eng_series_count(t->vols[v]);
+            lastv = v;
+        }
+        if (TSDB_SID_LOCAL(series[i]) >= lim) {
+            pthread_rwlock_unlock(&t->lock);
+            return TSDB_ERR_INVALID;
+        }
     }
     if (one) {
         eng *e = t->vols[n ? TSDB_SID_VOLUME(series[0]) : 0];
         pthread_rwlock_unlock(&t->lock);
-        uint32_t *ls = malloc((n ? n : 1) * sizeof *ls);
-        if (!ls)
-            return TSDB_ERR_NOMEM;
-        for (size_t i = 0; i < n; i++)
-            ls[i] = TSDB_SID_LOCAL(series[i]);
-        int rc = eng_insert(e, type, ls, ts, values, n);
-        free(ls);
-        return rc;
+        return eng_insert(e, type, ls, ts, values, n);
     }
     size_t *cnt = calloc(nv + 1, sizeof *cnt);
-    uint32_t *ls = malloc(n * sizeof *ls);
-    int64_t *lt = malloc(n * sizeof *lt);
-    uint8_t *lv = malloc(n * w);
-    int rc = (!cnt || !ls || !lt || !lv) ? TSDB_ERR_NOMEM : 0;
+    int64_t *lt = eng_insert_scratch(1, n * sizeof *lt);
+    uint8_t *lv = eng_insert_scratch(2, n * w);
+    int rc = (!cnt || !lt || !lv) ? TSDB_ERR_NOMEM : 0;
     if (rc == 0) {
         for (size_t i = 0; i < n; i++)
             cnt[TSDB_SID_VOLUME(series[i]) + 1]++;
@@ -1575,9 +1598,6 @@ static int insert_slots(tsdb *t, int type, const tsdb_sid *series, const int64_t
         rc = TSDB_ERR_NOMEM;
     free(vols);
     free(cnt);
-    free(ls);
-    free(lt);
-    free(lv);
     return rc;
 }
 

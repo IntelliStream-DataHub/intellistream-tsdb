@@ -53,15 +53,22 @@ static tsdb_sid *sids;
 
 static void series_name(uint32_t s, char *name, size_t len) { snprintf(name, len, "%s.%u", ds_info[kind_of(s)].name, s); }
 
-/* Rows of series [s0, s0 + ns) for samples [i0, i0 + n), series by series; sv[] gets the series numbers. */
-static size_t gen(ds_state *st, uint32_t s0, uint32_t ns, uint64_t n, uint32_t *sv, int64_t *tv, float *vv)
+/* Rows of series [s0, s0 + ns) for samples [i0, i0 + n), series by series; sv[] gets the series numbers (export),
+ * or idv[] their ids (load: written here, as a second pass over the batch cost the load 2% of its CPU). */
+static size_t gen(ds_state *st, uint32_t s0, uint32_t ns, uint64_t n, uint32_t *sv, tsdb_sid *idv, int64_t *tv,
+                  float *vv)
 {
     size_t k = 0;
-    for (uint32_t s = 0; s < ns; s++)
+    for (uint32_t s = 0; s < ns; s++) {
+        tsdb_sid id = idv ? sids[s0 + s] : 0;
         for (uint64_t i = 0; i < n; i++, k++) {
-            sv[k] = s0 + s;
+            if (idv)
+                idv[k] = id;
+            else
+                sv[k] = s0 + s;
             ds_next(&st[s], &tv[k], &vv[k]);
         }
+    }
     return k;
 }
 
@@ -82,7 +89,6 @@ static void *load_worker(void *arg)
 {
     tsdb *db = arg;
     size_t cap = (size_t)group_series * window;
-    uint32_t *sv = malloc(cap * sizeof *sv);
     tsdb_sid *idv = malloc(cap * sizeof *idv);
     int64_t *tv = malloc(cap * sizeof *tv);
     float *vv = malloc(cap * sizeof *vv);
@@ -93,9 +99,7 @@ static void *load_worker(void *arg)
         init_states(st, s0, ns);
         for (uint64_t i0 = 0; i0 < points; i0 += window) {
             uint64_t n = points - i0 < window ? points - i0 : window;
-            size_t rows = gen(st, s0, ns, n, sv, tv, vv);
-            for (size_t k = 0; k < rows; k++)
-                idv[k] = sids[sv[k]];
+            size_t rows = gen(st, s0, ns, n, NULL, idv, tv, vv);
             int rc = tsdb_insert(db, idv, tv, vv, rows);
             if (rc) {
                 fprintf(stderr, "insert: %s\n", tsdb_strerror(rc));
@@ -104,7 +108,6 @@ static void *load_worker(void *arg)
             atomic_fetch_add(&loaded, rows);
         }
     }
-    free(sv);
     free(idv);
     free(tv);
     free(vv);
@@ -192,7 +195,7 @@ static int cmd_export(void)
         init_states(st, s0, ns);
         for (uint64_t i0 = 0; i0 < points; i0 += window) {
             uint64_t n = points - i0 < window ? points - i0 : window;
-            size_t rows = gen(st, s0, ns, n, sv, tv, vv);
+            size_t rows = gen(st, s0, ns, n, sv, NULL, tv, vv);
             for (size_t k = 0; k < rows; k++) {
                 memcpy(buf + k * 16, &sv[k], 4); /* the series number, as in the SQL; not the id */
                 memcpy(buf + k * 16 + 4, &tv[k], 8);
