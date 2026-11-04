@@ -2,8 +2,10 @@
   "_about": "The numbers of the README's benchmark charts, as the summary tables of BENCHMARKS.md print them. tools/readme-charts.py draws docs/img/bench-*.svg from this file; make check-site redraws them and checks every number against BENCHMARKS.md. A row is [system, value, times slower] or [system, {\"fail\" or \"none\": short reason}].",
   "charts": {
     "bench-servers": {
-      "systems": ["tsdb", "ClickHouse", "InfluxDB 2", "InfluxDB 3", "VictoriaMetrics", "QuestDB", "TimescaleDB",
+      "systems": ["tsdb", "ClickHouse", "InfluxDB 2", "InfluxDB 3", "VictoriaMetrics", "QuestDB*", "TimescaleDB",
                   "IoTDB", "TDengine", "Prometheus"],
+      "footnotes": ["* QuestDB open source, in its default format, which does not compress. The open source version compresses",
+                    "only partitions you convert to Parquet by hand: with ZSTD 1.02 bytes per reading, but converting took 28 minutes."],
       "panels": [
         {"title": "Size on disk", "unit": "bytes per reading", "kind": "size",
          "values": ["0.78", "2.51", "34.5", "9.59", "1.60", "50.3", "3.42", "2.60", "2.71", "2.83"]},
@@ -21,10 +23,11 @@
          "values": [["456 ms"], ["540 ms", "1.2x"], {"none": "not measured"}, {"none": "not measured"},
                     {"none": "no such function"}, {"none": "not measured"}, ["12,256 ms", "27x"],
                     {"none": "no such function"}, {"none": "no such function"}, {"none": "not measured"}]},
-        {"title": "Max memory", "unit": "GB, without the file cache", "kind": "absolute", "limit": "48",
-         "values": [["2.0 GB"], ["43.1 GB"], ["7.9 GB"], {"fail": "ran out of memory at 32 clients"}, ["5.9 GB"],
-                    ["47.9 GB"], {"fail": "ran out of memory at 32 clients"}, ["18.6 GB"],
-                    {"fail": "a query failed at the 48 GB limit"}, ["1.1 GB"]]}
+        {"title": "Max memory", "unit": "GB", "kind": "absolute", "limit": "48",
+         "note": "GB without file cache, peak of finished runs (16 clients too)",
+         "values": [["2.0 GB"], ["30.0 GB", "refused at 32 clients"], ["7.9 GB"], ["26.1 GB", "ran out at 32 clients"],
+                    ["5.9 GB"], ["47.9 GB", "refused at 32 clients"], ["43.7 GB", "ran out at 32 clients"],
+                    ["18.6 GB", "refused at 32 clients"], ["38.4 GB", "failed at 32 clients"], ["1.1 GB"]]}
       ]
     },
     "bench-embedded": {

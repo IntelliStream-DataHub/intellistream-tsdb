@@ -1,64 +1,64 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="830" height="388" viewBox="0 0 830 388">
-<style>text{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;font-size:12px;fill:#1f2328}.h{font-size:14px;font-weight:600}.m{font-size:11.5px;fill:#59636e}.n{fill:#1f2328}.v{font-size:11.5px;fill:#59636e}.us .n,.us .v{font-weight:700;fill:#1f2328}.b{fill:#a8b1bc}.us .b{fill:#1d5fa8}.r{stroke:#d1d9e0;stroke-width:1}.fail{fill:#ffebe9;stroke:#cf222e;stroke-width:1;stroke-dasharray:3 2}.failt{font-size:11.5px;fill:#82071e}.none{fill:#f6f8fa;stroke:#afb8c1;stroke-width:1}.nonet{font-size:11.5px;font-style:italic;fill:#59636e}</style>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;font-size:12px;fill:#1f2328}.h{font-size:14px;font-weight:600}.m{font-size:11.5px;fill:#59636e}.n{fill:#1f2328}.v{font-size:11.5px;fill:#59636e}.us .n,.us .v{font-weight:700;fill:#1f2328}.b{fill:#6a9a78}.us .b{fill:#1d5fa8}.r{stroke:#d1d9e0;stroke-width:1}.fail{fill:#ffebe9;stroke:#cf222e;stroke-width:1}.failt{font-size:11px;fill:#82071e}.none{fill:#f6f8fa;stroke:#afb8c1;stroke-width:1}.nonet{font-size:11.5px;font-style:italic;fill:#59636e}</style>
 <text x="0" y="14" class="h">Size on disk</text>
-<text x="0" y="31" class="m">MB; times tsdb's size, log scale</text>
-<line x1="112" x2="112" y1="40" y2="104" class="r"/>
+<text x="0" y="31" class="m">MB; times tsdb's size; log scale</text>
+<line x1="104" x2="104" y1="40" y2="104" class="r"/>
 <g class="us"><text x="0" y="57" class="n">tsdb</text>
-<rect x="112" y="47" width="3.0" height="13" rx="2" class="b"/><text x="120.0" y="57" class="v">114 MB</text>
+<rect x="104" y="47" width="3.0" height="13" rx="2" class="b"/><text x="112.0" y="57" class="v">114 MB</text>
 </g>
 <g><text x="0" y="77" class="n">chDB</text>
-<rect x="112" y="67" width="111.7" height="13" rx="2" class="b"/><text x="228.7" y="77" class="v">1.9× (219 MB)</text>
+<rect x="104" y="67" width="78.0" height="13" rx="2" class="b"/><text x="187.0" y="77" class="v">1.9× (219 MB)</text>
 </g>
 <g><text x="0" y="97" class="n">DuckDB</text>
-<rect x="112" y="87" width="169.0" height="13" rx="2" class="b"/><text x="286.0" y="97" class="v">2.7× (306 MB)</text>
+<rect x="104" y="87" width="118.0" height="13" rx="2" class="b"/><text x="227.0" y="97" class="v">2.7× (306 MB)</text>
 </g>
 <text x="429" y="14" class="h">Ingest</text>
-<text x="429" y="31" class="m">rows/s; times slower than tsdb, log scale</text>
-<line x1="541" x2="541" y1="40" y2="104" class="r"/>
+<text x="429" y="31" class="m">speed; tsdb = full bar; log scale</text>
+<line x1="533" x2="533" y1="40" y2="104" class="r"/>
 <g class="us"><text x="429" y="57" class="n">tsdb</text>
-<rect x="541" y="47" width="3.0" height="13" rx="2" class="b"/><text x="549.0" y="57" class="v">144.8 M</text>
+<rect x="533" y="47" width="118.0" height="13" rx="2" class="b"/><text x="656.0" y="57" class="v">144.8 M rows/s</text>
 </g>
 <g><text x="429" y="77" class="n">chDB</text>
-<rect x="541" y="67" width="84.4" height="13" rx="2" class="b"/><text x="630.4" y="77" class="v">2.3× (62.5 M)</text>
+<rect x="533" y="67" width="93.2" height="13" rx="2" class="b"/><text x="631.2" y="77" class="v">2.3× slower (62.5 M rows/s)</text>
 </g>
 <g><text x="429" y="97" class="n">DuckDB</text>
-<rect x="541" y="87" width="169.0" height="13" rx="2" class="b"/><text x="715.0" y="97" class="v">5.3× (27.5 M)</text>
+<rect x="533" y="87" width="68.4" height="13" rx="2" class="b"/><text x="606.4" y="97" class="v">5.3× slower (27.5 M rows/s)</text>
 </g>
 <text x="0" y="140" class="h">Read</text>
-<text x="0" y="157" class="m">rows/s; times slower than tsdb, log scale</text>
-<line x1="112" x2="112" y1="166" y2="230" class="r"/>
+<text x="0" y="157" class="m">speed; tsdb = full bar; log scale</text>
+<line x1="104" x2="104" y1="166" y2="230" class="r"/>
 <g class="us"><text x="0" y="183" class="n">tsdb</text>
-<rect x="112" y="173" width="3.0" height="13" rx="2" class="b"/><text x="120.0" y="183" class="v">1,697 M</text>
+<rect x="104" y="173" width="118.0" height="13" rx="2" class="b"/><text x="227.0" y="183" class="v">1,697 M rows/s</text>
 </g>
 <g><text x="0" y="203" class="n">chDB</text>
-<rect x="112" y="193" width="169.0" height="13" rx="2" class="b"/><text x="286.0" y="203" class="v">71× (23.9 M)</text>
+<rect x="104" y="193" width="41.4" height="13" rx="2" class="b"/><text x="150.4" y="203" class="v">71× slower (23.9 M rows/s)</text>
 </g>
 <g><text x="0" y="223" class="n">DuckDB</text>
-<rect x="112" y="213" width="169.0" height="13" rx="2" class="b"/><text x="286.0" y="223" class="v">71× (23.9 M)</text>
+<rect x="104" y="213" width="41.4" height="13" rx="2" class="b"/><text x="150.4" y="223" class="v">71× slower (23.9 M rows/s)</text>
 </g>
 <text x="429" y="140" class="h">Time-weighted average</text>
-<text x="429" y="157" class="m">median time; times slower than tsdb, log scale</text>
-<line x1="541" x2="541" y1="166" y2="230" class="r"/>
+<text x="429" y="157" class="m">speed; tsdb = full bar; log scale</text>
+<line x1="533" x2="533" y1="166" y2="230" class="r"/>
 <g class="us"><text x="429" y="183" class="n">tsdb</text>
-<rect x="541" y="173" width="3.0" height="13" rx="2" class="b"/><text x="549.0" y="183" class="v">38.7 ms</text>
+<rect x="533" y="173" width="118.0" height="13" rx="2" class="b"/><text x="656.0" y="183" class="v">38.7 ms</text>
 </g>
 <g><text x="429" y="203" class="n">chDB</text>
-<rect x="541" y="193" width="144.7" height="13" rx="2" class="b"/><text x="690.7" y="203" class="v">27× (1,054 ms)</text>
+<rect x="533" y="193" width="54.8" height="13" rx="2" class="b"/><text x="592.8" y="203" class="v">27× slower (1,054 ms)</text>
 </g>
 <g><text x="429" y="223" class="n">DuckDB</text>
-<rect x="541" y="213" width="169.0" height="13" rx="2" class="b"/><text x="715.0" y="223" class="v">47× (1,820 ms)</text>
+<rect x="533" y="213" width="44.2" height="13" rx="2" class="b"/><text x="582.2" y="223" class="v">47× slower (1,820 ms)</text>
 </g>
 <text x="0" y="266" class="h">LTTB downsampling</text>
-<text x="0" y="283" class="m">median time; times slower than tsdb, log scale</text>
-<line x1="112" x2="112" y1="292" y2="356" class="r"/>
+<text x="0" y="283" class="m">speed; tsdb = full bar; log scale</text>
+<line x1="104" x2="104" y1="292" y2="356" class="r"/>
 <g class="us"><text x="0" y="309" class="n">tsdb</text>
-<rect x="112" y="299" width="3.0" height="13" rx="2" class="b"/><text x="120.0" y="309" class="v">404 ms</text>
+<rect x="104" y="299" width="118.0" height="13" rx="2" class="b"/><text x="227.0" y="309" class="v">404 ms</text>
 </g>
 <g><text x="0" y="329" class="n">chDB</text>
-<rect x="112" y="319" width="23.2" height="13" rx="2" class="b"/><text x="140.2" y="329" class="v">1.1× (432 ms)</text>
+<rect x="104" y="319" width="113.3" height="13" rx="2" class="b"/><text x="222.3" y="329" class="v">1.1× slower (432 ms)</text>
 </g>
 <g><text x="0" y="349" class="n">DuckDB</text>
-<rect x="112" y="338" width="289" height="15" rx="3" class="none"/><text x="118" y="349" class="nonet">not measured</text>
+<rect x="104" y="338" width="297" height="15" rx="3" class="none"/><text x="110" y="349" class="nonet">not measured</text>
 </g>
-<text x="0" y="380" class="m">tsdb is 1×. A box instead of a bar: no number, and why. Exact numbers: BENCHMARKS.md</text>
+<text x="0" y="380" class="m">Speed: tsdb is the full bar. Size and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: BENCHMARKS.md</text>
 </svg>

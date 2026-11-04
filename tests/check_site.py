@@ -18,11 +18,13 @@ What it checks, with the Python standard library only:
                                  language-X, or data-lang) after the heading that starts with that text;
                                  data-block="N" takes the Nth such block instead
     data-src="PATH#L10-L20"      lines 10 to 20 of the file, with their common indentation removed
+    data-src="PATH#@A..B"        from the line that starts with A up to the next line that starts with B (which
+                                 survives edits elsewhere in the file, unlike a line range)
 - Every number in a benchmark chart's table (<td data-v>) appears in the results file the table names
   (data-source), so a chart cannot show a number the published results do not have.
 - site.js has no syntax errors (node --check, when node is installed).
 - The README's benchmark charts (docs/img/bench-*.svg) are exactly what tools/readme-charts.py draws from
-  tools/readme-charts.json, and every number in that file appears in BENCHMARKS.md's summary tables.
+  tools/readme-charts.json, and every number in that file appears in BENCHMARKS.md's summary or memory tables.
 """
 
 import html
@@ -118,6 +120,15 @@ def source_text(spec, lang, block, page):
     if not frag:
         return text.rstrip("\n")
     m = re.fullmatch(r"L(\d+)-L(\d+)", frag)
+    t = re.fullmatch(r"@(.+?)\.\.(.+)", frag)
+    if t:  # from the line that starts with the first text up to the next line that starts with the second
+        lines = text.split("\n")
+        a = next((i for i, x in enumerate(lines) if x.startswith(t.group(1))), None)
+        b = next((i for i, x in enumerate(lines) if a is not None and i > a and x.startswith(t.group(2))), None)
+        if a is None or b is None:
+            err(page, f"data-src {spec!r}: no lines from {t.group(1)!r} to {t.group(2)!r}")
+            return None
+        return "\n".join(lines[a:b]).rstrip("\n")
     if m:
         lines = text.split("\n")[int(m.group(1)) - 1 : int(m.group(2))]
         pad = min((len(x) - len(x.lstrip()) for x in lines if x.strip()), default=0)
@@ -263,14 +274,16 @@ def check_readme_charts():
                           f"(run python3 tools/readme-charts.py)")
     with open(os.path.join(ROOT, "BENCHMARKS.md"), encoding="utf-8") as f:
         text = f.read()
-    start = text.find("\n## The summary")
-    end = text.find("\n## ", start + 1)
-    summary = text[start:end] if start >= 0 else ""
-    if not summary:
-        errors.append("BENCHMARKS.md: no '## The summary' section")
+    summary = ""
+    for title in ("The summary", "Memory"):  # the chart's memory panel comes from the memory section's table
+        start = text.find(f"\n## {title}\n")
+        end = text.find("\n## ", start + 1)
+        if start < 0:
+            errors.append(f"BENCHMARKS.md: no '## {title}' section")
+        summary += text[start:end] if start >= 0 else ""
     for n in mod.numbers():
         if not re.search(r"(?<![\d.,])" + re.escape(n) + r"(?![\d])", summary):
-            errors.append(f"tools/readme-charts.json: {n!r} is not in BENCHMARKS.md's summary tables")
+            errors.append(f"tools/readme-charts.json: {n!r} is not in BENCHMARKS.md's summary or memory tables")
 
 
 def main():

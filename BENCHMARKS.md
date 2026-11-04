@@ -584,6 +584,27 @@ most 1.1 GB and ClickHouse 5.9 GB without the file cache; with it, both fill the
 is larger than the machine's RAM. The embedded libraries' memory was not measured. Every class's peak, run by run,
 is in [0.9.0-tables.md](bench/dbcmp/results/0.9.0-tables.md) (the memory column and each system's memory sweep).
 
+**In the README's chart** a server's memory bar is the most it held without the file cache over the runs that
+finished: the timed classes and the memory sweep, the 16-client runs included (tsdb, ClickHouse, QuestDB and
+TimescaleDB were timed at 16 clients as well), and no class in which a run failed. Where a system failed at 32
+clients, the chart tags the bar.
+
+| database | peak over the runs that finished | in | at 32 clients |
+|---|---:|---|---|
+| **tsdb** | **2.0 GB** | raw readings of 100 sensors, 32 clients | finished every class |
+| ClickHouse | 30.0 GB (29.96) | 100 one-week time-weighted averages, 16 clients | refused those at its own 43.2 GB limit |
+| InfluxDB 2 | 7.9 GB | one week of 100 sensors (Flux), 32 clients, memory sweep | finished every class |
+| InfluxDB 3 | 26.1 GB | the whole history in buckets of 60, 16 connections, memory sweep | killed at 48 GB: 10 one-week windows |
+| VictoriaMetrics | 5.9 GB | the whole history, memory sweep | finished every class |
+| QuestDB | 47.9 GB | one week of 100 sensors, 1 client, memory sweep | refused at its own memory limit |
+| TimescaleDB | 43.7 GB | one week of 100 sensors, 16 clients (\*) | killed at 48 GB |
+| IoTDB | 18.6 GB | 10 one-day time-weighted averages, 1 client | refused by its memory pool |
+| TDengine | 38.4 GB | 100 one-day time-weighted averages, 1 client | no run finished, at the 48 GB limit |
+| Prometheus | 1.1 GB | the whole history (remote-write data) | finished every class |
+
+(\*) Four of its five runs, from their memory files (p2/ts/p6/ts.agg7d.b100.c16.2-5.mem: at most 43.7 GB). The
+fifth reached the 48 GB limit, was killed and run again; the class's row in the tables shows 48.00 GB for it.
+
 ## Reproduce it yourself
 
 **tsdb alone, on your machine:** `tools/bench-tsdb.sh` builds an optimized copy in `build-bench/`, runs tsdb's own
