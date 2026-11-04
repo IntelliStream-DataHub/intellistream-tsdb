@@ -593,4 +593,10 @@ test: check-version
 check-version: $(B)/tsdbd $(B)/tsdb
 	tools/check-version.sh $(B)
 
-.PHONY: test-quickstart
+# The GitHub Pages site (site/): well formed, no broken links, every code block the tested program or README
+# section it names, every chart number in the published results. --fix copies the code blocks again.
+test: check-site
+check-site:
+	python3 tests/check_site.py
+
+.PHONY: test-quickstart check-site
