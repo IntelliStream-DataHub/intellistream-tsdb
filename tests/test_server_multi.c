@@ -886,10 +886,10 @@ static bool sr_reply(int fd, uint32_t k, bool slow, uint64_t *h)
 
 static void test_slow_reader(void)
 {
-    uint32_t *list = malloc(SR_SERIES * 4);
+    tsdb_sid *list = malloc(SR_SERIES * sizeof *list);
     for (uint32_t i = 0; i < SR_SERIES; i++)
         list[i] = ids[i % 5];
-    uint8_t t[29], one_t[29], *req = malloc(24 + SR_SERIES * 4 + 8 + 29);
+    uint8_t t[33], one_t[33], *req = malloc(24 + SR_SERIES * 8 + 33); /* values_tmpl writes 33 bytes */
     values_tmpl(one_t, ids[0], T0, T0 + 1);
     uint64_t want[SR_REQS], got;
     for (int slow = 0; slow < 2; slow++) {
@@ -902,12 +902,12 @@ static void test_slow_reader(void)
         CHECK(fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) == 0);
         for (uint32_t k = 0; k < SR_REQS; k++) {
             if (k % 2) {
-                raw_send(fd, k + 1, TSDB_OP_QUERY_VALUES, one_t, 29);
+                raw_send(fd, k + 1, TSDB_OP_QUERY_VALUES, one_t, 33);
                 continue;
             }
             uint32_t n = k % 4 ? 1 : SR_SERIES; /* a large reply, a small one */
             values_tmpl(t, TSDB_MANY_SERIES, T0, T0 + 400000 + (int64_t)k * 1000);
-            raw_send(fd, k + 1, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_VALUES, 0, n, list, t, 29));
+            raw_send(fd, k + 1, TSDB_OP_QUERY_MULTI, req, multi_frame(req, TSDB_OP_QUERY_VALUES, 0, n, list, t, 33));
         }
         int bad = 0;
         for (uint32_t k = 0; k < SR_REQS && !bad; k++) {
