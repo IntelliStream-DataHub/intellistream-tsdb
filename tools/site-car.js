@@ -384,7 +384,9 @@
         poly([[cx - 0.1, cy + 0.06, d], [cx - 0.18, cy + 0.05, d - 0.06 * s], [cx - 0.18, cy - 0.05, d - 0.06 * s],
             [cx - 0.1, cy - 0.06, d]]);
     }
-    var FX = -1.65, RX = 1.95, FR = 0.385, RR = 0.395;
+    /* the front axle sits close behind the front wing, as on a real car: the wing's endplates end just ahead of the
+     * front tyres */
+    var FX = -1.92, RX = 1.95, FR = 0.385, RR = 0.395;
 
     /* suspension arms as thin quads (a narrow strip from inboard to the upright) */
     function arm(a, b, w) {
@@ -398,12 +400,12 @@
         wheel(FX, FR, 0.82 * s, FR, 0.37, s);
         wheel(RX, RR, 0.8 * s, RR, 0.47, s);
         var fu = [FX, FR + 0.12, 0.64 * s], fl = [FX, FR - 0.1, 0.65 * s];
-        arm([-1.95, 0.46, 0.14 * s], fu);
-        arm([-1.4, 0.48, 0.18 * s], fu);
-        arm([-1.98, 0.24, 0.16 * s], fl);
-        arm([-1.35, 0.22, 0.2 * s], fl);
-        arm([-1.55, 0.58, 0.16 * s], [FX + 0.02, FR - 0.08, 0.6 * s], 0.008); /* pushrod */
-        arm([-1.85, 0.3, 0.14 * s], [FX - 0.12, FR - 0.02, 0.62 * s], 0.006); /* track rod */
+        arm([FX - 0.3, 0.46, 0.14 * s], fu);
+        arm([FX + 0.25, 0.48, 0.18 * s], fu);
+        arm([FX - 0.33, 0.24, 0.16 * s], fl);
+        arm([FX + 0.3, 0.22, 0.2 * s], fl);
+        arm([FX + 0.1, 0.58, 0.16 * s], [FX + 0.02, FR - 0.08, 0.6 * s], 0.008); /* pushrod */
+        arm([FX - 0.2, 0.3, 0.14 * s], [FX - 0.12, FR - 0.02, 0.62 * s], 0.006); /* track rod */
         var ru = [RX, RR + 0.14, 0.58 * s], rl = [RX, RR - 0.1, 0.6 * s];
         arm([1.7, 0.5, 0.18 * s], ru);
         arm([2.25, 0.5, 0.14 * s], ru);
@@ -520,7 +522,7 @@
             return seed / 2147483648;
         }
         /* streaks start on points of the car (wing tips, wheel tops, sidepods, airbox) and behind it */
-        var anchors = [[-2.9, 0.2, 0.95], [-2.9, 0.2, -0.95], [-1.65, 0.72, 0.95], [-1.65, 0.72, -0.95],
+        var anchors = [[-2.9, 0.2, 0.95], [-2.9, 0.2, -0.95], [-1.92, 0.72, 0.95], [-1.92, 0.72, -0.95],
             [-0.45, 0.58, 0.78], [-0.45, 0.58, -0.78], [0.4, 1.02, 0], [1.95, 0.74, 0.98], [1.95, 0.74, -0.98],
             [3.04, 1.12, 1.17], [3.04, 1.12, -1.17], [2.9, 0.98, 0.5], [2.9, 0.98, -0.5], /* the rear wing's tips */
             [1.2, 0.05, 0.85], [1.2, 0.05, -0.85], [0.5, 0.75, 0.45]];
