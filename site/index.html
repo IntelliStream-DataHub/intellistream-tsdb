@@ -61,8 +61,8 @@ program.</p>
 ClickHouse takes 3.09 ms.</p></div>
 <div class="stat c3"><p class="big">114 MB</p><p>for 100 million readings: about a tenth of the raw size, and less
 than half the disk ClickHouse needs.</p></div>
-<div class="stat c4"><p class="big">2.2 GB</p><p>the most memory tsdb used in the whole benchmark. Four other
-servers hit the 48 GB limit.</p></div>
+<div class="stat c4"><p class="big">2.0 GB</p><p>the most memory tsdb used in the whole benchmark, without the file
+cache. Others ran out of their 48 GB with 32 clients.</p></div>
 </div>
 <p class="wrap stats-src">tsdb 0.9.0 against ClickHouse on one machine, every answer checked first. All
 numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md">the 0.9.0 results</a>.</p>
