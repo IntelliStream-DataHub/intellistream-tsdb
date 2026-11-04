@@ -236,10 +236,11 @@ public final class TsdbClient implements AutoCloseable {
      * @return the connected client, logged in where the server asks for it
      * @throws TsdbException with {@link Status#ERR_AUTH} if the login fails (an unknown user and a wrong password
      *     alike), the server requires one and the options have no user, or the options require one and the server
-     *     does not ask; with {@link Status#ERR_INVALID} for a server older than protocol 12; with
-     *     {@link Status#ERR_IO} if no address accepts the connection or the password file cannot be read
-     * @throws IllegalArgumentException for a user without a password, a user name SCRAM cannot carry (empty, over
-     *     255 bytes, or with {@code ,}, {@code =} or NUL) or an empty password file
+     *     does not ask; with {@link Status#ERR_INVALID} for a server older than protocol 12, or a password file that
+     *     cannot be read or has no password in its first line (a setup mistake, not a network error to retry); with
+     *     {@link Status#ERR_IO} if no address accepts the connection
+     * @throws IllegalArgumentException for a user without a password or a user name SCRAM cannot carry (empty, over
+     *     255 bytes, or with {@code ,}, {@code =} or NUL)
      */
     public static TsdbClient connect(String host, int port, ConnectOptions options) throws TsdbException {
         Objects.requireNonNull(host, "host");
