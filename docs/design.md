@@ -679,7 +679,12 @@ than every part), so a delete needs no ordering of its own:
   when there is more than one). It returns once they are fsync'd and
   published. Anything published later (a flush, a large
   insert) has a higher block number and is newer than the delete; a partition
-  that held no rows of the series in the range needs no tombstone.
+  that held no rows of the series in the range needs no tombstone. A small
+  write into the range that arrives between the flush and the publish waits
+  until the publish (it would otherwise land in the memtable, newer than the
+  delete, although acknowledged before the delete took effect); large inserts
+  and replaces hold small writes to their keys the same way (`lw_fence`,
+  internal.h). Small writes elsewhere do not wait.
 - A replace is the tombstone parts plus the new rows' parts in one
   `parts_commit`, tombstones first (lower blocks): one intent, so a reader or a
   crash sees the old rows or the new ones. Rows outside `[start, end)` are

@@ -116,7 +116,13 @@ cgroup, so `nice` does not keep your work out of its way.
   are newer than every part. Block numbers are assigned, files renamed and parts
   listed in one step under `publish_lock` (`parts_publish`, `mt_flush`).
   Allocating a block number anywhere else lets a merge span a part that is
-  still in flight and resurrect older values.
+  still in flight and resurrect older values. Because memtable rows rank above
+  parts, a large insert, replace or delete registers its keys (`lw_fence`: a
+  timestamp range per bucket of series) with `lw_enter` in the step that decides
+  whether to flush the memtable, and leaves (`lw_leave`) as soon as its parts are
+  published or failed; `mem_insert` waits on `lw_cv` while a row of its batch is
+  inside a registered fence. Otherwise a small write acknowledged before the
+  large write was visible would win over it (jepsen check 5; `test_lww_realtime`).
 - **Merges** only combine adjacent block ranges within a partition. On equal
   keys the newest source wins.
 - **Range tombstones** (deletes, replaces) live only in parts, never in the WAL
@@ -242,7 +248,9 @@ cgroup, so `nice` does not keep your work out of its way.
   `partition_classes = 0`.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
-  is a leaf. Series creation (`volumes.c`): a reserved name (`name_reserve`; its `name_mu` is a leaf) >
+  is a leaf. A small write waiting for a large write's publish (`lw_cv`, on `buf_lock`) holds no other lock and has
+  not yet appended anything, so nothing a registered large write waits for (a flush, the WAL writer role,
+  `publish_lock`, `cls_rw`) waits for it. Series creation (`volumes.c`): a reserved name (`name_reserve`; its `name_mu` is a leaf) >
   `create_lock` (only around `volume_resolve` and volume adds) or, in a follower, `layout_lock` (only around the
   opens of new volumes in `volume_at`; a lookup or a route to a volume already open never takes it, and a lookup
   reads SERIES of the open volumes before it opens new ones) > the `tsdb` rwlock (never held across I/O: a new

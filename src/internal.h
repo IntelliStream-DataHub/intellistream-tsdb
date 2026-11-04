@@ -1296,6 +1296,8 @@ struct eng {
     bool wal_writing;              /* one WAL writer (commit or segment switch) at a time */
     pthread_mutex_t buf_lock;      /* active memtable and pending WAL bytes */
     pthread_cond_t flush_cv;
+    struct lw_fence *lw_head;      /* large writes between their memtable flush and their publish (buf_lock) */
+    pthread_cond_t lw_cv;          /* one of them left (buf_lock) */
     memtable *active;
     memtable *flushing[MAX_FLUSHING]; /* oldest first; guarded by db->lock */
     size_t nflushing;
@@ -1419,9 +1421,33 @@ void merge_commit_locked(struct eng *db, part **src, size_t k, part *out);
  * part per partition. Parts are published, or handed back in `collect`. With `refuse` (rows from a caller, not
  * a flush of the WAL), a row at TS_UNREACHABLE fails the insert with TSDB_ERR_INVALID. */
 /* ucls >= 0: every series of the batch has that class at every time (cls_uniform); -1: looked up per series. */
+/* `fence` (without collect): the caller's lw_enter, left as soon as the parts are published or have failed. */
 int insert_rows(struct eng *db, int type, const uint32_t *series, uint32_t const_series, const int64_t *ts,
                 const void *v, size_t n, uint64_t wal_seq, part_list *collect, bool refuse, int ucls,
-                const uint64_t *gen);
+                const uint64_t *gen, struct lw_fence *fence);
+
+/* Last write wins in real time (memtable.c). Memtable rows rank above every part, so a small write to a key of a
+ * large insert, replace or delete must not be acknowledged while that write is between its memtable flush and its
+ * publish: it would be older than the large write and still win. The large write describes its keys in a fence
+ * (conservatively: a timestamp range per bucket of series), registers it with lw_enter in the same step that
+ * decides whether the memtable needs a flush (a row added before is flushed under an older block number, one added
+ * after sees the fence), and leaves with lw_leave once its parts are published or have failed. mem_insert waits,
+ * holding no lock and before it appends anything, while one of its rows falls inside a registered fence, so
+ * nothing the large write waits for (a flush, the WAL writer role, publish_lock) can wait for it. Rows that wait
+ * reach the WAL after the publish, so a replay ranks them above the large write as well. A false overlap (another
+ * series in the same bucket) only delays a write. */
+#define LW_BUCKETS 4096
+typedef struct lw_fence {
+    struct lw_fence *next;
+    int64_t lo, hi;   /* every key's timestamp is in [lo, hi]; lo > hi: no keys */
+    uint32_t series;  /* nb == 0: the one series */
+    uint32_t nb;      /* else LW_BUCKETS buckets of series (local id % nb), each with a range */
+    int64_t *r;       /* nb buckets: lo, hi */
+} lw_fence;
+int lw_fence_rows(lw_fence *f, const uint32_t *series, uint32_t const_series, const int64_t *ts, size_t n);
+void lw_fence_range(lw_fence *f, uint32_t series, int64_t start, int64_t end); /* [start, end) */
+bool lw_enter(struct eng *db, lw_fence *f); /* returns whether the memtable holds rows to flush first */
+void lw_leave(struct eng *db, lw_fence *f);
 int part_list_push(part_list *l, part *p);
 int parts_publish(struct eng *db, part **ps, size_t n);
 
@@ -1614,7 +1640,7 @@ int tsdb_test_class_switch(struct tsdb *t, tsdb_sid series, int cls, const int64
  * TSDB_ERR_INVALID for it, so a truncated id does not look like an empty range; a well formed id that is unknown
  * (a series a follower has not seen yet) answers no rows. */
 static inline bool sid_malformed(tsdb_sid id) { return (id >> 48) != 0 || (id >> 32) == 0; }
-/* test hook: fn(arg) runs in every large insert and replace after its rows were placed, before it commits */
+/* test hook: fn(arg) runs in every large insert, replace and delete after its parts were written, before it commits */
 void tsdb_test_precommit(struct tsdb *t, void (*fn)(void *), void *arg);
 /* test hook: fn(arg) runs inside every placement, before its sorted rows are grouped into parts */
 void tsdb_test_midplace(struct tsdb *t, void (*fn)(void *), void *arg);

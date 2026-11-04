@@ -156,6 +156,14 @@ disk format and the wire protocol.
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
+- Last write wins in real time. A small write (WAL and memtable) to a key of a large insert, replace or delete could be
+  acknowledged while that large write was between its memtable flush and its publish, and then kept winning over it,
+  because memtable rows rank above every part: a read showed the small write and, at another key, the large write
+  not yet; the large write was acknowledged; reads still showed the small write. Such a small write now waits until
+  the large write is published (only one whose rows fall inside the large write's keys: a timestamp range per
+  bucket of series), and wins as the newer write. `make jepsen` checks this with a fifth rule: a write acknowledged
+  before a read saw another write not yet in effect is older than it, although the two overlap in time; the old
+  server failed it in every 20-second run.
 - Large inserts (8 million rows or more per call) faulted their memory in again on every call since the 64-bit series
   ids: `tsdb_insert` narrowed the ids into a fresh allocation per batch, which glibc serves from a new mmap above
   32 MB (4 bytes per row; a batch spanning volumes, 16). They now go to the inserting thread's grow-only buffers, as

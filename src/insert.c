@@ -625,10 +625,13 @@ int parts_publish(eng *db, part **ps, size_t n)
  * holding the class history frozen (cls_freeze) throughout. `gen`: the class
  * generation read before the caller read the class bytes behind ucls. */
 int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const int64_t *ts, const void *v, size_t n,
-                uint64_t wal_seq, part_list *collect, bool refuse, int ucls, const uint64_t *gen)
+                uint64_t wal_seq, part_list *collect, bool refuse, int ucls, const uint64_t *gen, lw_fence *fence)
 {
-    if (n == 0)
+    if (n == 0) {
+        if (fence)
+            lw_leave(db, fence);
         return 0;
+    }
     pctx x = {db, db->cls_on ? ucls : 0};
     if (collect)
         return insert_rows_into(&x, type, series, cs, ts, v, n, wal_seq, collect, refuse);
@@ -650,6 +653,8 @@ int insert_rows(eng *db, int type, const uint32_t *series, uint32_t cs, const in
         partitions[i] = mine.p[i]->partition;
     if (rc == 0)
         rc = parts_publish(db, mine.p, mine.n);
+    if (fence) /* published (newer small writes win from now on) or failed */
+        lw_leave(db, fence);
     cls_thaw(db); /* before waiting for merges: the merge thread may be switching */
     if (rc) {
         parts_discard(db, mine.p, mine.n);

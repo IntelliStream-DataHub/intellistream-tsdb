@@ -581,6 +581,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
     pthread_cond_init(&db->merge_cv, NULL);
     pthread_cond_init(&db->merged_cv, NULL);
     pthread_cond_init(&db->flush_cv, NULL);
+    pthread_cond_init(&db->lw_cv, NULL);
 
     int rc;
     db->dir = strdup(dir);
@@ -757,6 +758,7 @@ int eng_close(eng *db)
     pthread_cond_destroy(&db->merge_cv);
     pthread_cond_destroy(&db->merged_cv);
     pthread_cond_destroy(&db->flush_cv);
+    pthread_cond_destroy(&db->lw_cv);
     free(db->dir);
     free(db);
     return rc;
@@ -894,17 +896,22 @@ static int write_rows(eng *db, int type, const uint32_t *series, uint32_t cs, co
             return TSDB_ERR_INVALID;
         return mem_insert(db, series, cs, ts, v, type_width(type), n);
     }
-    pthread_mutex_lock(&db->lock); /* nflushing changes under db->lock, the active memtable under both */
-    pthread_mutex_lock(&db->buf_lock);
-    bool pending = db->active->rows > 0 || db->nflushing > 0;
-    pthread_mutex_unlock(&db->buf_lock);
-    pthread_mutex_unlock(&db->lock);
-    rc = pending ? mt_flush(db) : 0;
+    /* small writes to these keys wait from here until the parts are published (lw_fence) */
+    lw_fence f;
+    if ((rc = lw_fence_rows(&f, series, cs, ts, n)) != 0) {
+        free(f.r);
+        return rc;
+    }
+    rc = lw_enter(db, &f) ? mt_flush(db) : 0;
     if (rc == 0 && ucls == -2) { /* fresh series: their class comes from these rows */
         rc = cls_classify_insert(db, series, cs, ts, n);
         ucls = -1;
     }
-    return rc ? rc : insert_rows(db, type, series, cs, ts, v, n, 0, NULL, true, ucls, &gen);
+    if (rc) {
+        lw_leave(db, &f);
+        return rc;
+    }
+    return insert_rows(db, type, series, cs, ts, v, n, 0, NULL, true, ucls, &gen, &f);
 }
 
 int eng_insert(eng *db, int type, const uint32_t *series, const int64_t *ts, const void *values, size_t n)
