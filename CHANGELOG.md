@@ -8,313 +8,323 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-04
+
+The first release. **Disk format version 8, wire protocol version 11** (the server and the clients refuse a peer
+below 11 at HELLO), **embedded C ABI version 2**, series ids of 64 bits. Both formats may still change in a 0.9.x
+release and freeze at 1.0 ([docs/compatibility.md](docs/compatibility.md)). Nothing was released before this
+version, so there is nothing to upgrade from; if you ran a development build, a database of disk format 5, 6 or
+7 is refused at open and is carried over with `tsdb export` (the build that wrote it) and `tsdb import` (this
+one), see "Changed".
+
 ### Added
-- tsdbd says at startup when a database or volume directory is on ext2/3/4 or XFS and `--verify-checksums` is
-  off: those file systems keep no checksums of the data, so a damaged or misdirected data block would be read as
-  wrong values. Turn the option on there, or use a file system that checks its data (ZFS).
-- `make jepsen` runs two more nemeses on the kv workload: `misdirect` (the crashfs shim sends writes and reads of
-  database files to other offsets or files and swaps pages of a mapped part, with `--verify-checksums` and without)
-  and `rot` (bits flipped in a file, or the file truncated, while the server is down). The claim they check: tsdb
-  answers correctly or reports the damage. Known limits, counted apart: without `--verify-checksums` damaged part
-  data reads as wrong values, and damage to the last record of the WAL or an append-only file is cut as a torn
-  tail ("Damage on disk" in docs/design.md). The weekly CI run makes every jepsen run 5 minutes long
-  (`JEPSEN_SECONDS`).
-- `CONTRIBUTING.md`, `SECURITY.md` and `docs/licenses.md` (the licenses of everything tsdb builds on). The `make dist`
-  tarball now carries `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd and liburing are linked into its binaries).
+
+The engine (the library, `libtsdb`)
+- Series of (time in milliseconds, value) points. A series has one value type: float32, float64, int64, bool
+  or state (a text label from a small set). Any value may be null.
+- MergeTree-style storage: every insert writes an immutable, sorted part; parts live in time partitions and
+  are merged in the background. Last write wins: a value written for a time that exists replaces it.
+- Compression chosen per block (fixed point, XOR, byte split, bit-packed deltas, a dictionary for readings that
+  take few distinct values, ZSTD): about 1.2 bytes per row on mixed sensor data. A float64 series fed float32
+  readings (a collector that widens what the sensor gives it) stores them as float32, exactly. Pressures
+  converted to psi come down to 0.14-0.20 times their float64 size with the dictionary codec. Background merges
+  try the better codecs, re-encode what inserts wrote and rewrite a partition's only insert-written part once the
+  partition is idle (`merge_idle_s`) or on `tsdb_optimize`.
 - Partition classes: each series gets partitions of 1, 7, 28 or 364 base partitions (`partition_ms`), the
   shortest that holds at least eight granules of it, chosen from its rate (a fresh series from its first batch,
   others when an idle merge measures them; a band widened 2x either way keeps them from flapping, and a class is
-  at most an eighth of the series' retention). In class partitions granules still end at every day edge, so
-  bucketed queries answer from granule statistics wherever day partitions do, with the same answers bit for bit:
-  a disk temperature read every minute takes 0.268 instead of 0.326 bytes per reading, and every query measured
-  is as fast as with day partitions or faster; fast series keep their day partitions exactly. `tsdb_options.partition_classes` (default 1, fixed at creation), `tsdb_series_class`,
-  `tsdb_part_info.cls`, `.start_ms` and `.end_ms`; `partition_classes` and the part fields in the Rust, Python
-  and Java embedded bindings (`series_class`, `seriesClass`); `tsdb <dir> parts` and `series` print the class.
-  tsdbd `--granule-rows N` (at creation), `--merge-idle-s N` and `--flush-interval-ms N`. `make jepsen` runs a
-  second workload, `classes`: series whose rate changes switch classes under every nemesis while large inserts,
-  replaces and deletes race the switches. Every placement (a large insert, a replace, a flush) reads one frozen
-  class history; the part writer refuses rows out of (series, time) order, and the open checks every part
-  against `CLASSES` (`TSDB_ERR_CORRUPT` with a log line).
-- Many series in one request (protocol 10): QUERY_MULTI answers values, buckets (fixed, calendar in any zone,
-  bounds), the spread, TWA and LTTB for up to 65,536 series in one request, in the order asked, every series
-  read from one snapshot (an insert into several series is seen by all of them or none), with a status per
-  series. The server runs the series in parallel under a memory budget (results held ahead of their turn are
-  charged to `--max-request-memory`; large series run at their turn, streaming). CANCEL stops a running
-  request. Embedded: `tsdb_query_multi`, `tsdb_query_multi_collect`. Clients: `tsdbc_query_multi` (C),
-  `query_{rows,buckets,spread,twa,lttb}_multi` and `query_chunks_multi` (Rust `Client`, `Pool`, `Db`), the
-  same five in Python with numpy columns and `errors="raise"|"status"`, `query*Multi` in Java `TsdbClient` and
-  `EmbeddedDb`. Longer lists are split by the clients; local time zones are handled by the clients as for
-  single series.
-- tsdbd `--query-threads N` (threads for queries, default one per CPU), `--request-threads N` (at most this many
-  for one request, default all) and `--multi-max-rows N` (rows or buckets of one QUERY_MULTI, default
-  268,435,456); `tsdb_options.request_threads`. Metrics `tsdb_multi_series_total`, `tsdb_multi_deferred_total`
-  and `tsdb_requests_total{op="query_multi"}`.
-- Benchmarks: `tsdbc-bench query --multi K`, TWA and whole-range classes; `bench/dbcmp` `tsdbq`/`embq`
-  `--batch K`, `twa` and qps classes `NAME.bK`; `build/threads-bench`, one thread against many per work size.
-- The Rust, Python and Java clients and the three embedded bindings at protocol 9: the spread (range, variance,
-  standard deviation) in fixed, calendar and bounds buckets; time-weighted averages (step or linear, a gap limit,
-  order and limit); LTTB with an order and a limit; aggregates with an order and a limit that stop early. The
-  embedded bindings also gain range delete, replace and retention. A call that needs a newer server than the one
-  connected fails with `Invalid` before anything is sent. Embedded and TCP answers are compared in each client's
-  tests. Python returns the spread as extra numpy columns of `Buckets` and TWA as `TwaBuckets`.
-- Batch calls: many queries or inserts in one call, run in parallel. Rust: `Db::query_points_many`,
-  `query_agg_many`, `insert_many` (on every CPU) and `Pool`, a fixed set of connections to one tsdbd with the
-  same three calls. Python: `Db.query_raw_many`, `query_agg_many`, `insert_many` and `tsdb_client.Pool`, with
-  the GIL released for the whole batch. A failed batch raises the error of its lowest failing entry and names
-  it (Rust `Error::Batch`, Python `TsdbError.index`); every entry below it ran. Inserts that share a series keep
-  their list order. `Db.last_query_stats()` after a batch reports the totals of its queries.
-- `Pool`: after a connection breaks (a server restart), every connection made before it is replaced before its
-  next use, and a query whose connection broke runs once more; inserts are not retried.
+  at most an eighth of the series' retention). Granules still end at every day edge, so bucketed queries answer
+  from granule statistics wherever day partitions do, with the same answers bit for bit: a disk temperature read
+  every minute takes 0.268 instead of 0.326 bytes per reading, and every query measured is as fast as with day
+  partitions or faster; fast series keep their day partitions exactly. `tsdb_options.partition_classes`
+  (default 1, fixed at creation), `tsdb_series_class`, `tsdb_part_info.cls`, `.start_ms` and `.end_ms`;
+  `tsdb <dir> parts` and `series` print the class. `tsdb_drop_before` drops whole partitions as before, so a slow
+  series' rows go in steps of its partition length (7, 28 or 364 days); retention still clamps queries to the
+  exact cutoff.
+- Queries: raw points (oldest or newest first, with a limit), count/sum/min/max/average per bucket (fixed
+  buckets and calendar buckets in a time zone), the spread (range, standard deviation, variance), LTTB
+  downsampling and time-weighted averages (step or linear, a gap limit). Aggregates come from stored granule
+  statistics wherever a bucket covers whole granules; sums of int64 are exact. Every kind takes an order and a
+  limit, and bucketed queries with a limit stop early.
+- Many series in one request: `tsdb_query_multi` and `tsdb_query_multi_collect` answer values, buckets (fixed,
+  calendar in any zone, bounds), the spread, TWA and LTTB for up to 65,536 series, in the order asked, every
+  series read from one snapshot (an insert into several series is seen by all of them or none), with a status per
+  series. The series run in parallel under a memory budget (results held ahead of their turn are charged to
+  `--max-request-memory`; large series run at their turn, streaming).
+- One query scheduler per database (`query_threads`, `request_threads`): concurrent queries share the CPUs by
+  groups capped at `request_threads`, the calling thread always works, and decoding of series already started
+  comes before new series. The threads one query step uses follow the rows it decodes, so small reads stay on one
+  thread; answers are bit-identical at any thread count.
+- Range delete and atomic replace of one series, retention per series, several volumes (directories or mounts).
+- Durable writes: a write is on disk when it returns (WAL with group commit, or a periodic sync). A failed
+  fsync is fail-stop. Tested by killing the process, simulated power loss and injected I/O errors (`make jepsen`).
+- One writer and any number of read-only followers on other hosts over NFS.
+- SIMD aggregation kernels for float32, float64, int64 and bool at four CPU levels (AVX-512, AVX2, AVX,
+  SSE4.2) that give identical results on every CPU.
+- tsdbd says at startup when a database or volume directory is on ext2/3/4 or XFS and
+  `--verify-checksums` is off: those file systems keep no checksums of the data, so a damaged or misdirected
+  data block would be read as wrong values. Turn the option on there, or use a file system that checks its data
+  (ZFS).
+
+The server (`tsdbd`)
+- One event loop on io_uring or epoll (epoll is chosen by itself where io_uring is disabled, as on AlmaLinux 10
+  and RHEL 10).
+- Compressed, packed inserts; the clients send about 6 bytes per point.
+- QUERY_MULTI answers many series in one request; CANCEL stops a running request.
+- Prometheus metrics on a port of their own (`--metrics-port`, docs/metrics.md), including
+  `tsdb_multi_series_total`, `tsdb_multi_deferred_total`, `tsdb_requests_total{op="query_multi"}` and
+  `tsdb_pinned_index_bytes`.
+- Options: `--port 0 --port-file FILE` for scripts and tests, `--version`, `--query-threads N` (threads for
+  queries, default one per CPU), `--request-threads N` (at most this many for one request, default all),
+  `--multi-max-rows N` (rows or buckets of one QUERY_MULTI, default 268,435,456), `--granule-rows N` (at
+  creation), `--merge-idle-s N`, `--flush-interval-ms N`, `--pin-index`.
+
+Clients and bindings
+- Clients of tsdbd in C, Rust, Python and Java, all at protocol 11, with the same operations: the spread (range,
+  variance, standard deviation) in fixed, calendar and bounds buckets; time-weighted averages; LTTB; aggregates
+  with an order and a limit that stop early; range delete, replace and retention; and many series in one call
+  (`tsdbc_query_multi` in C; `query_{rows,buckets,spread,twa,lttb}_multi` and `query_chunks_multi` in Rust
+  `Client`, `Pool` and `Db`; the same five in Python with numpy columns and `errors="raise"|"status"`;
+  `query*Multi` in Java `TsdbClient` and `EmbeddedDb`). Lists longer than a request holds are split by the
+  clients; local time zones are handled by the clients as for single series. A call that needs a newer server
+  than the one connected fails with `Invalid` before anything is sent.
+- Embedded bindings (no server): Rust `Db`, Python `Db` and Java 22+ `EmbeddedDb`, with the same operations as the
+  clients, including `partition_classes`, `pin_index` / `pinIndex` and `series_class` / `seriesClass`. Embedded
+  and TCP answers are compared in each client's tests.
+- Batch calls, run in parallel. Rust: `Db::query_points_many`, `query_agg_many`, `insert_many` and `Pool`, a fixed
+  set of connections to one tsdbd with the same three calls. Python: `Db.query_raw_many`, `query_agg_many`,
+  `insert_many` and `tsdb_client.Pool`, with the GIL released for the whole batch. A failed batch raises the
+  error of its lowest failing entry and names it (Rust `Error::Batch`, Python `TsdbError.index`); every entry
+  below it ran. Inserts that share a series keep their list order. `Db.last_query_stats()` after a batch reports
+  the totals of its queries. After a connection breaks (a server restart), a `Pool` replaces every connection
+  made before it before its next use, and a query whose connection broke runs once more; inserts are not retried.
+- Python returns the spread as extra numpy columns of `Buckets` and TWA as `TwaBuckets`; raw query results are
+  numpy arrays over the result vectors, without a copy.
+- Package names carry the company: Rust crates `intellistream-tsdb-client` and `intellistream-tsdb-sys`, Python
+  distribution `intellistream-tsdb-client`; the imports stay `tsdb_client` and `tsdb_sys`, and the Java artifacts
+  (`ai.intellistream:tsdb-client`) are unchanged.
+- Apache Pulsar 5 sink (`connectors/pulsar`): Pulsar holds the points while tsdb is down, and a point is taken off
+  Pulsar once it is on disk.
+
+The command line (`tsdb`) and tools
+- `tsdb` creates series, inserts, queries, deletes, sets retention, adds volumes, shows stats, parts and series,
+  and optimizes.
 - `tsdb <dir> export` and `tsdb <dir> import FILE`: a versioned, checksummed stream of whole databases or some
   series (types, volumes, retention, state names, values bit for bit), for backups and for carrying a database
   to a new format version. Every later tsdb reads every stream an earlier one wrote
   ([docs/export-format.md](docs/export-format.md)). An import from a file is checked whole before anything is
   written; `--skip-existing`, `--merge`, `--replace`, `--volume OLD=NEW`, `--volume-root OLD=NEW`,
-  `--create-volumes`, `--no-retention`, `--check`. An import into a new database is built beside it,
-  synced once at the end and then renamed to its name, so an interrupted one leaves no database under that name.
+  `--create-volumes`, `--no-retention`, `--check`. An import into a new database is built beside it, synced once
+  at the end and then renamed to its name, so an interrupted one leaves no database under that name.
+- `make jepsen` fault injection (kill -9, simulated power loss, pauses, I/O errors) on two workloads, `kv` and
+  `classes` (series whose rate changes switch classes under every nemesis while large inserts, replaces and
+  deletes race the switches), and two more nemeses, `misdirect` (the crashfs shim sends writes and reads of
+  database files to other offsets or files and swaps pages of a mapped part, with `--verify-checksums` and
+  without) and `rot` (bits flipped in a file, or the file truncated, while the server is down). The claim they
+  check: tsdb answers correctly or reports the damage. Known limits, counted apart: without `--verify-checksums`
+  damaged part data reads as wrong values, and damage to the last record of the WAL or an append-only file is cut
+  as a torn tail ("Damage on disk" in docs/design.md). The weekly CI run makes every jepsen run 5 minutes long
+  (`JEPSEN_SECONDS`).
+- Benchmarks: `tsdbc-bench query --multi K`, TWA and whole-range classes; `bench/dbcmp` `tsdbq`/`embq`
+  `--batch K`, `twa` and qps classes `NAME.bK`; `build/threads-bench`, one thread against many per work size.
+
+Portable build and project files
+- `make dist` makes a tarball (`tsdb-0.9.0-x86_64-linux.tar.gz`) for x86-64-v2 CPUs and newer, with glibc 2.34 or
+  newer, and the test suite that runs from it. It is checked on AlmaLinux 10 (Podman) and under an emulated
+  Westmere and Sandy Bridge. It carries `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES` (zstd and liburing are
+  linked into its binaries).
+- `make integration-tests` runs tsdbd, the CLI and all clients end to end.
+- One version: the file `VERSION`; `make check-version` makes sure the header, the binaries and the client
+  manifests agree.
+- `CONTRIBUTING.md`, `SECURITY.md` and `docs/licenses.md` (the licenses of everything tsdb builds on).
+- Documentation: the README compares tsdb with the other databases in a few charts (drawn by
+  `tools/readme-charts.py` from `tools/readme-charts.json`), [BENCHMARKS.md](BENCHMARKS.md) holds the full 0.9.0
+  comparison, and `site/` is a documentation site published to GitHub Pages (`.github/workflows/pages.yml`).
+  `make check-site` (part of `make test`) checks that the site is well formed, its links work, its code blocks
+  are the tested programs and its chart numbers are in the published results.
 
 ### Changed
-- Disk format 7: part keys are `4 x first base partition + class`, the new `CLASSES` file, zstd frames
-  without magic number and content size, and a packed granule index: each part's entries are bit-packed at a
-  fixed width per field (a frame of reference per field and part: a base, a slope for offsets and starts that
-  grow, shared trailing zeros, float32 bits for float statistics a float32 holds exactly, derived TWA areas as a
-  flag) and read in place from the mapping, about 32 bytes an entry instead of 160, behind a 64-byte footer that
-  gives the index's length. Every field decodes to the exact bits written (the writer checks by decoding before
-  the part is named; a damaged index is `TSDB_ERR_CORRUPT` at open). A year of minute readings of 10,000 disks:
-  939 instead of 1,407 MB (0.179 instead of 0.268 bytes a reading), the index 118 instead of 564 MB of page
-  cache, an open in 24 instead of 58 ms warm and 77 instead of 341 ms cold; the 100 M-row mixed set 1.14 instead
-  of 1.17 bytes a row. Queries answered from granule statistics run faster: whole-range aggregates 1.5 to 1.8
-  times, day buckets over a year 1.4 to 1.7 times (one thread), TWA through tsdbd 1.48 times (1 connection) and
-  1.63 times (32); queries that decode rows and inserts are unchanged (within noise). Answers are identical.
-  A version-6 database is refused at open; carry it over with
-  `tsdb export` (old release) and `tsdb import` (this one), which gives every series its class on its first
-  batch. `tsdb_drop_before` drops whole partitions as before, so a slow series' rows go in steps of its
-  partition length (7, 28 or 364 days); retention still clamps queries to the exact cutoff.
-- Series ids are 64-bit. A series' id is `(volume + 1) << 32 | local`: the volume's number plus one in the high
+
+For anyone who ran a development build; a first install is not affected.
+- **Disk format 8.** Series ids are 64-bit: `(volume + 1) << 32 | local`, the volume's number plus one in the high
   half, the series' index in that volume's `SERIES` file in the low half (`tsdb_sid`, `TSDB_SID`,
-  `TSDB_SID_VOLUME`, `TSDB_SID_LOCAL`, `TSDB_SID_NONE`). Every id is at least 2^32 and 0 is never one, so
-  an id cut to 32 bits in a cast, a Java `int`, a Rust `as u32` or a Python `"I"` is refused instead of being
-  taken for another series; a query of such an id (or of one with any of bits 48-63 set) answers `TSDB_ERR_INVALID`
-  rather than an empty range, while a well formed id that is unknown still has no rows. Ids are not dense any
-  more: list series with `tsdb_series_foreach` (C), `series_ids` (Rust and Python `Db`) or `seriesIds` (Java
-  `EmbeddedDb`), or `TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v) - 1)`, never `0 .. tsdb_series_count() - 1`
-  (which now returns `uint64_t`); look ids up by name. `tsdb_abi_version` names the layout of the C ABI the
-  bindings check. C `tsdb_sid`, Rust `SeriesId` (`u64`), Python `int` (numpy
-  `uint64` or `int64` columns; a 32-bit column raises `TypeError`), Java `long` and `long[]` (the methods that took `int` ids are
-  gone, not overloaded). `tsdb series` prints the id. The Pulsar sink keeps its ids as `long`. The
-  benchmarks find their ids by name and keep the series number of their row files as an index into that table.
-- The root file `CATALOG` is gone. It only routed a dense 32-bit id to its volume; with the volume inside the id,
-  routing is a shift. A series is created with one append to its volume's `SERIES` file instead of two, and
-  nothing is read from or kept for the root at an open (at a billion series, a 16 GB file and 16-32 GB of memory
-  less). A format-7 database, which has one, is refused at open (below).
+  `TSDB_SID_VOLUME`, `TSDB_SID_LOCAL`, `TSDB_SID_NONE`), so routing a series to its volume is a shift. The root
+  file `CATALOG` is gone (it only routed a dense 32-bit id to its volume): a series is created with one append to
+  its volume's `SERIES` file instead of two, and nothing is read from or kept for the root at an open (at a
+  billion series, a 16 GB file and 16-32 GB of memory less). Each volume's `META` holds its number (`volume=N`, 0
+  in the database directory), which the open checks against the line of `VOLUMES` the directory is on
+  (`TSDB_ERR_CORRUPT`, with a line that names both), so a cached id never reaches another volume's series.
+  Nothing costs a bit more per row. Format 8 also holds what formats 6 and 7 introduced: block headers that name
+  their codec in 7 bits (the dictionary codec), part keys `4 x first base partition + class` with the `CLASSES`
+  file, zstd frames without magic number and content size, and a packed granule index (each part's entries
+  bit-packed at a fixed width per field, read in place from the mapping, about 32 bytes an entry instead of 160,
+  behind a 64-byte footer that gives the index's length; every field decodes to the exact bits written, the
+  writer checks by decoding before the part is named, and a damaged index is `TSDB_ERR_CORRUPT` at open). A year
+  of minute readings of 10,000 disks takes 939 instead of 1,407 MB, the index 118 instead of 564 MB of page
+  cache, an open 24 instead of 58 ms warm and 77 instead of 341 ms cold; the 100 M-row mixed set 1.14 instead of
+  1.17 bytes a row. Queries answered from granule statistics run 1.4 to 1.8 times faster than with the 160-byte
+  entries; answers are identical.
+- **A database of another disk format is refused at open**, with a message that names both versions (`tsdb: the
+  database has disk format version 7; tsdb 0.9.0 reads version 8 only. ...`). Carry it over with `tsdb export`
+  (the build that wrote it) and `tsdb import` (this one); every series then gets its class on its first batch.
+  The export stream is unchanged, version 1: it names series, never ids, so every stream written so far imports
+  as before.
+- **Wire protocol 11.** Every series id in a request or reply is a `u64`, and `tsdbd` and the clients refuse a peer
+  below 11 at HELLO (`TSDB_ERR_INVALID`; there is no operation that a version-10 peer and this one could both do
+  safely). The two version-1 aggregate operations QUERY_AGG and QUERY_GROUP are removed: QUERY_BUCKETS and
+  QUERY_BOUNDS answer the same queries. Ids cost 4 bytes more per request (nothing more where a reserved word
+  took it, about nothing in packed inserts). Upgrade the server and its clients together.
+- **Series ids in the programming interfaces.** Every id is at least 2^32 and 0 is never one, so an id cut to 32
+  bits in a cast, a Java `int`, a Rust `as u32` or a Python `"I"` is refused instead of being taken for another
+  series: a query of such an id (or of one with any of bits 48-63 set) answers `TSDB_ERR_INVALID` rather than an
+  empty range, while a well formed id that is unknown still has no rows. Ids are not dense any more: list series
+  with `tsdb_series_foreach` (C), `series_ids` (Rust and Python `Db`) or `seriesIds` (Java `EmbeddedDb`), or
+  `TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v) - 1)`, never `0 .. tsdb_series_count() - 1` (which now returns
+  `uint64_t`); look ids up by name. `tsdb_abi_version` (now 2) names the layout of the C ABI the bindings check.
+  C `tsdb_sid`, Rust `SeriesId` (`u64`), Python `int` (numpy `uint64` or `int64` columns; a 32-bit column raises
+  `TypeError`), Java `long` and `long[]` (the methods that took `int` ids are gone, not overloaded). `tsdb series`
+  prints the id. The Pulsar sink keeps its ids as `long`.
 - Series creation no longer takes one lock for the whole database across the append and its fsync: a volume on a
   slow or hung file system holds up only the names being created in it, while other names, in any volume, and
   lookups go on. Two creators of one name still take turns and get one series. Opening a volume that was added
   while the database is open, and a follower's read of a volume's `SERIES`, hold no lock that lookups and
   creations in the other volumes need either.
-- Disk format 8: no `CATALOG`, and each volume's `META` holds its number (`volume=N`, 0 in the database
-  directory), which the open checks against the line of `VOLUMES` the directory is on (`TSDB_ERR_CORRUPT`, with a
-  line that names both), so a cached id never reaches another volume's series. Nothing inside a volume changed
-  (WAL, parts, granule index, `CLASSES`, `RETENTION`, `SERIES`), and nothing costs a bit more per row. A version-7
-  database is refused at open, with the message that names both versions; carry it over with `tsdb export` (the
-  release that wrote it) and `tsdb import` (this one). The export stream is unchanged, version 1 still: it
-  names series, never ids, so every stream written so far imports as before
-  ([docs/export-format.md](docs/export-format.md)).
-- The wire protocol is version 11: every series id in a request or reply is a `u64`, and `tsdbd` and the
-  clients refuse a peer below 11 at HELLO (`TSDB_ERR_INVALID`; there is no operation that a version-10 peer and
-  this one could both do safely). The two version-1 aggregate operations QUERY_AGG and QUERY_GROUP are removed:
-  QUERY_BUCKETS and QUERY_BOUNDS answer the same queries. Ids cost 4 bytes more per request
-  (nothing more where a reserved word took it, about nothing in packed inserts). The gates on protocol versions
-  3 to 10 in the clients are gone, since they always pass. Upgrade the server and its clients together.
-- One query scheduler per database instead of a thread pool per volume: concurrent queries share the CPUs by
-  groups capped at `request_threads`, the calling thread always works, and decoding of series already started
-  comes before new series.
-- The threads one query step uses follow the rows it decodes (`QUERY_ROWS_PER_THREAD`, measured) instead of a
-  fixed cliff at 8 granules: small reads stay on one thread. Answers are bit-identical at any thread count.
-- Rust `Db::query_points_many` and `query_agg_many` (and Python's `Db` batch calls over them) run through
-  `tsdb_query_multi` instead of one query per rayon task.
+- `verify_checksums` (`--verify-checksums`) now means the granule checksums only. The new option `pin_index`
+  (`tsdbd --pin-index`, off by default) reads the granule index and tombstones from the copy that was checked at
+  open, so damage that appears later cannot change answers; the copy costs about 32 to 51 bytes of RAM per
+  granule in every process that opens the part (at least one granule per series and partition: 51 GB per
+  partition generation at 10^9 series), reported as `tsdb_volume_stats.pinned_bytes` and the metric
+  `tsdb_pinned_index_bytes`. `TSDB_ABI_VERSION` is 2 (`pin_index` sits in what was padding of `tsdb_options`).
 - Python: aggregate queries (`query_agg`, `query_group`, `query_bounds` and the rest) return `Buckets` instead of
   a list of `Bucket`: a `collections.abc.Sequence` of `Bucket` (indexing, slices, iteration, `+` and `==` with
   lists, `count()`, `index()`), with a numpy column per field (`start`, `counts`, `sum`, `min`, `max`, `avg`,
   `isum`, `imin`, `imax`). It is no longer a `list` (`isinstance(b, list)` is false, `append` is gone) and does
-  not pickle. Raw query results are numpy arrays over the result vectors, without a copy.
-- Python: numpy input arrays are copied once with the GIL released instead of while holding it.
-- **Disk format version 6.** Block headers name their codec in 7 bits instead of 4, and a new codec, the
-  dictionary (the distinct values of a block and each value's rank among them), stores readings that take few
-  distinct values: pressures converted to psi come down to 0.14-0.20 times their float64 size and 0.44-0.63 times
-  their float32 size, the whole UCI hydraulic rig to 0.29 times (float64) and 0.65 times (float32). Background
-  merges try it (inserts keep their speed and encode as before), re-encode the granules of parts inserts wrote
-  instead of copying them, and rewrite a partition's only insert-written part once the partition is idle
-  (`merge_idle_s`; after real merges and retention drops) or on `tsdb_optimize`, which waits for such a rewrite in
-  flight. A database of format 5 is refused at open; carry it over with
-  `tsdb <dir> export` from the release that wrote it and `tsdb <newdir> import` with this one
-  ([docs/compatibility.md](docs/compatibility.md)).
-- Values: a float64 series fed float32 readings (a collector that widens what the sensor gives it) stores them as
-  float32, exactly (every bit of every value comes back): the UCI hydraulic rig widened to float64 takes 0.45 times
-  the space (as much as stored as float32) and inserts in 0.67 times the time; real doubles are unaffected.
+  not pickle. Numpy input arrays are copied once with the GIL released instead of while holding it.
+- Rust `Db::query_points_many` and `query_agg_many` (and Python's `Db` batch calls over them) run through
+  `tsdb_query_multi` instead of one query per rayon task.
+- `tsdb_open` refuses a `value_codec` other than `TSDB_VALUES_AUTO`, `_GORILLA` and `_CHIMP` (`TSDB_ERR_INVALID`)
+  instead of taking any other number as AUTO.
 - Values: float32 and float64 decode faster (fixed point with a 4-lane prefix sum), and AUTO adds packed bit
   deltas (both types) and ALP_rd (float64) as candidates, ranked on a ZSTD-compressed sample of the block.
 
 ### Fixed
-- Large inserts (8 million rows or more per call) faulted their memory in again on every call since the 64-bit series
-  ids: `tsdb_insert` narrowed the ids into a fresh allocation per batch, which glibc serves from a new mmap above
-  32 MB (4 bytes per row; a batch spanning volumes, 16). They now go to the inserting thread's grow-only buffers, as
-  the engine's own sort buffers do: 32 billion rows loaded with 1 million page faults instead of 32 million, and a
-  third of the system time. `scale-bench load` writes the ids as it generates the rows rather than in a second pass.
-- The last `SERIES` or `STATES` record, damaged at rest, was cut as a torn tail although a `RETENTION` or `CLASSES`
-  record, or a syncing writer's MANIFEST, proved it acknowledged: the next series got its id and inherited its
-  retention limit (its rows hidden at once and dropped by merges) or class, or a new state name its code. The open
-  now refuses that with `TSDB_ERR_CORRUPT` and changes nothing. MANIFEST has a new optional line `states N`.
-- A retention drop decided from series ids read in the part's mapping: an index damaged after the open could make a
-  partition of a series without retention look expired, and it was retired for good. The drop checks each part's
-  index first. A part that fails that check, a merge's or the rate measurement's is now marked: logged once (a
-  failing merge was retried and logged every second, forever), counted in `broken_parts`, and left out of merge
-  selection, so retention drops and the other merges go on (before, nothing expired was ever dropped again);
-  `tsdb_optimize` merges the rest and returns `TSDB_ERR_CORRUPT`.
-- Followers timed their patience for a series `SERIES` lacks from the start of a gap, which a writer creating series
-  steadily keeps open: after a minute (or 2 s for a syncing writer) every refresh failed and the view froze. The
-  patience now runs per record, and the views of a writer without fsync are taken meanwhile. A follower also
-  notices `SERIES` cut below, or rewritten at, the last record it read.
-- A torn end of a WAL segment that a later segment with records follows was cut like a torn append, losing
-  acknowledged rows; a power loss cannot do that (each segment is synced before the next takes rows). The open now
-  refuses it and names the segment to move aside.
-- `RETENTION` logged `cutting a torn tail` without cutting anything (also in an open that was then refused); its
-  torn tail is now cut, after the open's checks, like the others.
-- Found by the new jepsen nemesis `misdirect`: a misdirected write into the granule index of a part the server had
-  open could crash a merge (SIGSEGV): the index is checked at the open and then read in the part's mapping, where
-  later damage shows. Every entry number taken from the index now stays inside it. With the new option
-  `pin_index` (`tsdbd --pin-index`, off by default) the index and tombstones are read from the copy that was
-  checked, so answers do not change at all; the copy costs about 32 to 51 bytes of RAM per granule in every process
-  that opens the part (at least one granule per series and partition: 51 GB per partition generation at 10^9
-  series), reported as `tsdb_volume_stats.pinned_bytes` and the metric `tsdb_pinned_index_bytes`. It was part of
-  `verify_checksums` at first; that option now means the granule checksums only. Without `pin_index` such damage
-  gives wrong answers, like damage to data, and a merge hashes each source's index again first and fails on a
-  mismatch rather than write damaged statistics under a fresh hash (before, it copied them, and the damage became
-  undetectable); measuring series rates skips runs naming a series beyond `SERIES`, so no class record is written
-  for it. `TSDB_ABI_VERSION` is 2 (`pin_index` sits in what was padding of `tsdb_options`); the Rust, Python and
-  Java embedded bindings have `pin_index` / `pinIndex`.
-- A refused open no longer changes any file: the torn tails of `SERIES`, `STATES` and `CLASSES` were cut before the
-  checks that then proved the cut record was acknowledged and refused the open, so a record with one flipped bit,
-  which could have been repaired, was gone for good. A writer now cuts torn tails only after the parts, `CLASSES`
-  and every WAL segment passed their checks (the WAL is checked whole before the replay writes anything), and the
-  refusal names the way out (restore `SERIES`, or move a segment aside; `tsdb export` is refused the same way).
-- Followers, and readers that open through MANIFEST (volumes included), served series whose `SERIES` record was
-  damaged as never created: open fine, lookups NOTFOUND, rows unreachable, no error and no log line. After reading
-  `SERIES` again they now need as many records as MANIFEST counts and each new part may name no series beyond
-  them; otherwise the previous view stays (like for a broken part) and, after the follower patience, the refresh or
-  the open fails with `TSDB_ERR_CORRUPT`, logged once and counted in `broken_parts`. A writer without fsync says so
-  in MANIFEST (`fsync 0`, a new optional line): a follower then waits a minute for a missing record, since NFS can
-  show the writer's files in any order, and says it may still be on its way instead of calling `SERIES` damaged.
-- Found the same way: a misdirected write over the last records of `SERIES` made the open cut them as a torn tail,
-  and every series they named, with all its rows in parts, was gone without an error. The open now fails with
-  `TSDB_ERR_CORRUPT` when a part holds a series `SERIES` does not have (one comparison per part).
-- Likewise for rows still in the WAL: the replay skipped rows of a series `SERIES` lacked as those of a series
-  never created. It now fails the open with `TSDB_ERR_CORRUPT`, naming the segment, the offset and the series, and
-  keeps the segment. A reader that opens while a writer creates series reads `SERIES` again first (before, it
-  could miss the new series' rows); a follower that still lacks the series after reading `SERIES` again stops
-  before that WAL record and reports the damage once it outlasts its patience for NFS.
-- A read at the open that returned other bytes than the disk holds could make the last records of the WAL,
-  `SERIES`, `STATES`, `RETENTION` or `CLASSES` look torn, and the open cut them: acknowledged rows lost to a fault
-  that does not repeat. The tail is now read again from the disk before it is cut; if the reads differ, the open
-  fails with `TSDB_ERR_IO` and cuts nothing. Every cut is logged ("cutting a torn tail").
-- A follower could stop seeing new rows after the writer restarted. Every writer numbers its MANIFEST versions from 1
-  again, and a follower took a MANIFEST only when its version changed: after writers that died before they flushed
-  (kill -9, power loss), the new writer could publish the version the follower already had, and the follower kept
-  the old parts and the old WAL segment until the writer published again, which an idle writer may never do. A
-  follower now also compares the MANIFEST's checksum (`make jepsen`, power nemesis: "the follower does not catch up").
-- The float32 and float64 codecs no longer depend on the CPU's rounding mode. A host application that had set
-  `FE_UPWARD`, `FE_DOWNWARD` or `FE_TOWARDZERO` (the engine never does) stored other bytes than at round-to-nearest,
-  and in some blocks values that decoded one unit in the last place off at round-to-nearest, silently; a block read in
-  another mode (the mode is per thread, and the scheduler's helper threads keep the one their creator had when the
-  database was opened) gave other values. The block entry points now run with round-to-nearest and restore the caller's mode (a few register accesses
-  per block: no measurable cost). Granule statistics (sums, time-weighted areas) are still computed in the calling
-  thread's mode.
-- tsdbd no longer copies a large reply whole into a connection's output buffer: a bucket, aggregate or TWA reply of up
-  to a frame (256 MB) went in at once, in a buffer rounded up to 512 MB, while the engine's result was still held,
-  so one request peaked at about 500 MB of server memory. Replies now reach the output in pieces of 1 MB, the
-  worker waiting while the output is over its cap (8 MB), as for streamed rows; the peak is the result plus a few
-  MB. The wire format is unchanged.
+
+Damage and recovery
+- A damaged `SERIES`, `STATES`, `RETENTION` or `CLASSES` record, a misdirected write or a read that returned other
+  bytes than the disk holds is no longer taken for a torn tail, which lost acknowledged data silently.
+  - The last `SERIES` or `STATES` record, damaged at rest, was cut as a torn tail although a `RETENTION` or
+    `CLASSES` record, or a syncing writer's MANIFEST, proved it acknowledged: the next series got its id and
+    inherited its retention limit (its rows hidden at once and dropped by merges) or class, or a new state name
+    its code. The open now refuses that with `TSDB_ERR_CORRUPT` and changes nothing. MANIFEST has a new optional
+    line `states N`.
+  - A misdirected write over the last records of `SERIES` made the open cut them as a torn tail, and every series
+    they named, with all its rows in parts, was gone without an error. The open now fails with
+    `TSDB_ERR_CORRUPT` when a part holds a series `SERIES` does not have (one comparison per part). Likewise for
+    rows still in the WAL: the replay skipped rows of a series `SERIES` lacked as those of a series never
+    created. It now fails the open with `TSDB_ERR_CORRUPT`, naming the segment, the offset and the series, and
+    keeps the segment.
+  - A read at the open that returned other bytes than the disk holds could make the last records of the WAL,
+    `SERIES`, `STATES`, `RETENTION` or `CLASSES` look torn, and the open cut them: acknowledged rows lost to a
+    fault that does not repeat. The tail is now read again from the disk before it is cut; if the reads differ,
+    the open fails with `TSDB_ERR_IO` and cuts nothing. Every cut is logged ("cutting a torn tail").
+  - A torn end of a WAL segment that a later segment with records follows was cut like a torn append, losing
+    acknowledged rows; a power loss cannot do that (each segment is synced before the next takes rows). The open
+    now refuses it and names the segment to move aside.
+  - `RETENTION` logged `cutting a torn tail` without cutting anything (also in an open that was then refused); its
+    torn tail is now cut, after the open's checks, like the others.
+- A refused open no longer changes any file: the torn tails of `SERIES`, `STATES` and `CLASSES` were cut before
+  the checks that then proved the cut record was acknowledged and refused the open, so a record with one flipped
+  bit, which could have been repaired, was gone for good. A writer now cuts torn tails only after the parts,
+  `CLASSES` and every WAL segment passed their checks (the WAL is checked whole before the replay writes
+  anything), and the refusal names the way out (restore `SERIES`, or move a segment aside; `tsdb export` is
+  refused the same way).
+- A misdirected write into the granule index of a part the server had open could crash a merge (SIGSEGV; found by
+  the jepsen nemesis `misdirect`): the index is checked at the open and then read in the part's mapping, where
+  later damage shows. Every entry number taken from the index now stays inside it. Without `pin_index` such
+  damage gives wrong answers, like damage to data, and a merge hashes each source's index again first and fails
+  on a mismatch rather than write damaged statistics under a fresh hash (before, it copied them, and the damage
+  became undetectable); measuring series rates skips runs naming a series beyond `SERIES`, so no class record is
+  written for it.
+- A retention drop decided from series ids read in the part's mapping: an index damaged after the open could make
+  a partition of a series without retention look expired, and it was retired for good. The drop checks each
+  part's index first. A part that fails that check, a merge's or the rate measurement's is now marked: logged
+  once (a failing merge was retried and logged every second, forever), counted in `broken_parts`, and left out
+  of merge selection, so retention drops and the other merges go on (before, nothing expired was ever dropped
+  again); `tsdb_optimize` merges the rest and returns `TSDB_ERR_CORRUPT`.
 - A WAL segment whose unlink failed after its flush (an I/O error) was counted as removed: an empty merge output
   that keeps the segment's deleted rows from replaying could then be dropped, and the rows came back at the next
   open. The segment now stays counted until a later flush removes it.
-- `tsdb_open` refuses a `value_codec` other than `TSDB_VALUES_AUTO`, `_GORILLA` and `_CHIMP` (`TSDB_ERR_INVALID`)
-  instead of taking any other number as AUTO.
-- `tsdb import` refuses a target directory that has files in it and holds no database, before writing anything,
-  also through a symlink to one (it used to build the database among those files). A missing or empty directory
-  and an existing database are imported into as before; volume directories are unchanged.
 - Opening a database no longer deletes a user's files in a volume directory (a volume may be a directory that held
   other files before it was added). The cleanup at open used to remove every name starting with `tmp_` and read
   (then remove) every `txn_*` file as an insert intent; it now touches only the exact names tsdb writes
-  (`tmp_<pid>_<n>.part`, `META.tmp`, `txn_<pid>_<n>.intent`), and likewise reads as parts, WAL segments and retired
-  parts only `p<partition>_<min>_<max>_<level>.part`, `wal_<16 hex digits>.log` and `retired_` + a part name, so
-  a file like `plan.part` or `wal_notes.log` no longer fails the open or gets replayed.
-- `tsdb import` into a new database: after a failure it no longer tells you to delete a volume directory that was
-  there before the import (it may hold your other files). It removes only the files the import provably wrote in
-  the volumes it added (tsdb's own file names, not there before), leaves and names anything else, also what another
-  process put there meanwhile, and removes the directory only if the import made it and it is empty then; a sibling
-  left by a kill names the tsdb files to remove.
-  A target that is a symlink to an empty directory, or a dangling symlink, imports at the end of the link instead
-  of failing at the final rename.
+  (`tmp_<pid>_<n>.part`, `META.tmp`, `txn_<pid>_<n>.intent`), and likewise reads as parts, WAL segments and
+  retired parts only `p<partition>_<min>_<max>_<level>.part`, `wal_<16 hex digits>.log` and `retired_` + a part
+  name, so a file like `plan.part` or `wal_notes.log` no longer fails the open or gets replayed.
+
+Followers
+- Followers, and readers that open through MANIFEST (volumes included), served series whose `SERIES` record was
+  damaged as never created: open fine, lookups NOTFOUND, rows unreachable, no error and no log line. After
+  reading `SERIES` again they now need as many records as MANIFEST counts and each new part may name no series
+  beyond them; otherwise the previous view stays (like for a broken part) and, after the follower patience, the
+  refresh or the open fails with `TSDB_ERR_CORRUPT`, logged once and counted in `broken_parts`. A writer without
+  fsync says so in MANIFEST (`fsync 0`, a new optional line): a follower then waits a minute for a missing
+  record, since NFS can show the writer's files in any order, and says it may still be on its way instead of
+  calling `SERIES` damaged. A reader that opens while a writer creates series reads `SERIES` again first (before,
+  it could miss the new series' rows); a follower that still lacks the series after reading `SERIES` again stops
+  before that WAL record and reports the damage once it outlasts its patience for NFS.
+- Followers timed their patience for a series `SERIES` lacks from the start of a gap, which a writer creating
+  series steadily keeps open: after a minute (or 2 s for a syncing writer) every refresh failed and the view
+  froze. The patience now runs per record, and the views of a writer without fsync are taken meanwhile. A
+  follower also notices `SERIES` cut below, or rewritten at, the last record it read.
+- A follower could stop seeing new rows after the writer restarted. Every writer numbers its MANIFEST versions
+  from 1 again, and a follower took a MANIFEST only when its version changed: after writers that died before they
+  flushed (kill -9, power loss), the new writer could publish the version the follower already had, and the
+  follower kept the old parts and the old WAL segment until the writer published again, which an idle writer may
+  never do. A follower now also compares the MANIFEST's checksum (`make jepsen`, power nemesis: "the follower
+  does not catch up").
+
+Values and queries
+- The float32 and float64 codecs no longer depend on the CPU's rounding mode. A host application that had set
+  `FE_UPWARD`, `FE_DOWNWARD` or `FE_TOWARDZERO` (the engine never does) stored other bytes than at
+  round-to-nearest, and in some blocks values that decoded one unit in the last place off at round-to-nearest,
+  silently; a block read in another mode (the mode is per thread, and the scheduler's helper threads keep the one
+  their creator had when the database was opened) gave other values. The block entry points now run with
+  round-to-nearest and restore the caller's mode (a few register accesses per block: no measurable cost).
+  Granule statistics (sums, time-weighted areas) are still computed in the calling thread's mode.
 - Python: big-endian numpy arrays (`>i8`, `>f4`) were read byte-swapped (PyO3 takes '>' for native on
   little-endian machines); they are now converted element by element.
 
-## [0.9.0] - unreleased (tag v0.9.0 when the checklist in docs/release.md is done)
+Memory and speed
+- Large inserts (8 million rows or more per call) faulted their memory in again on every call since the 64-bit
+  series ids: `tsdb_insert` narrowed the ids into a fresh allocation per batch, which glibc serves from a new
+  mmap above 32 MB (4 bytes per row; a batch spanning volumes, 16). They now go to the inserting thread's
+  grow-only buffers, as the engine's own sort buffers do: 32 billion rows loaded with 1 million page faults
+  instead of 32 million, and a third of the system time. `scale-bench load` writes the ids as it generates the
+  rows rather than in a second pass.
+- tsdbd no longer copies a large reply whole into a connection's output buffer: a bucket, aggregate or TWA reply
+  of up to a frame (256 MB) went in at once, in a buffer rounded up to 512 MB, while the engine's result was
+  still held, so one request peaked at about 500 MB of server memory. Replies now reach the output in pieces of
+  1 MB, the worker waiting while the output is over its cap (8 MB), as for streamed rows; the peak is the result
+  plus a few MB. The wire format is unchanged.
 
-The first release. Disk format version 5, wire protocol version 9.
+Import
+- `tsdb import` refuses a target directory that has files in it and holds no database, before writing anything,
+  also through a symlink to one (it used to build the database among those files). A missing or empty directory
+  and an existing database are imported into as before; volume directories are unchanged.
+- `tsdb import` into a new database: after a failure it no longer tells you to delete a volume directory that was
+  there before the import (it may hold your other files). It removes only the files the import provably wrote in
+  the volumes it added (tsdb's own file names, not there before), leaves and names anything else, also what
+  another process put there meanwhile, and removes the directory only if the import made it and it is empty then;
+  a sibling left by a kill names the tsdb files to remove. A target that is a symlink to an empty directory, or a
+  dangling symlink, imports at the end of the link instead of failing at the final rename.
 
-### What it contains
+### Security hardening (input safety)
 
-Engine (the library, `libtsdb`)
-- Series of (time in milliseconds, value) points. A series has one value type: float32, float64, int64, bool
-  or state (a text label from a small set). Any value may be null.
-- MergeTree-style storage: every insert writes an immutable, sorted part; parts live in time partitions and
-  are merged in the background. Last write wins: a value written for a time that exists replaces it.
-- Compression chosen per block (fixed point, XOR, byte split, bit-packed deltas, ZSTD): about 1.2 bytes per
-  row on mixed sensor data.
-- Queries: raw points (oldest or newest first, with a limit), count/sum/min/max/average per bucket (fixed
-  buckets and calendar buckets in a time zone), the spread (range, standard deviation, variance), LTTB
-  downsampling and time-weighted averages. Aggregates come from stored granule statistics wherever a bucket
-  covers whole granules; sums of int64 are exact.
-- Range delete and atomic replace of one series, retention per series, several volumes (directories or
-  mounts).
-- Durable writes: a write is on disk when it returns (WAL with group commit, or a periodic sync). A failed
-  fsync is fail-stop. Tested by killing the process, simulated power loss and injected I/O errors
-  (`make jepsen`).
-- One writer and any number of read-only followers on other hosts over NFS.
-- SIMD aggregation kernels for float32, float64, int64 and bool at four CPU levels (AVX-512, AVX2, AVX,
-  SSE4.2) that give identical results on every CPU.
-
-Server (`tsdbd`)
-- One event loop on io_uring or epoll (epoll is chosen by itself where io_uring is disabled, as on
-  AlmaLinux 10 and RHEL 10).
-- Compressed, packed inserts; the clients send about 6 bytes per point.
-- Prometheus metrics on a port of their own (`--metrics-port`, docs/metrics.md).
-- `--port 0 --port-file FILE` for scripts and tests; `tsdbd --version`.
-
-Clients and bindings
-- Clients of tsdbd in C, Rust, Python and Java, all at protocol 9.
-- Embedded bindings (no server): Rust, Python and Java 22+, with the same operations as the clients.
-- Package names carry the company: Rust crates `intellistream-tsdb-client` and `intellistream-tsdb-sys`, Python
-  distribution `intellistream-tsdb-client`; the imports stay `tsdb_client` and `tsdb_sys`, and the Java artifacts
-  (`ai.intellistream:tsdb-client`) are unchanged.
-- Command-line tool `tsdb` (create, import, query, delete, retention, volumes, stats, optimize).
-- Apache Pulsar 5 sink (`connectors/pulsar`): Pulsar holds the points while tsdb is down, and a point is
-  taken off Pulsar once it is on disk.
-
-Security hardening (input safety)
 - Volume paths chosen by a client are checked; a client can never make the server add a volume.
 - Query memory follows the rows and buckets a query really has; request memory, frame size and the time to
   deliver a frame are bounded; flags and numbers on the server, CLI and clients are checked.
-- Crafted files do not corrupt memory: decoders and file loaders are fuzzed, and damage is never silent
-  (a damaged part or log fails the open, it is not skipped).
-
-Portable build and tooling
-- `make dist` makes a tarball (`tsdb-0.9.0-x86_64-linux.tar.gz`) for x86-64-v2 CPUs and newer, with
-  glibc 2.34 or newer, and the test suite that runs from it. It is checked on AlmaLinux 10 (Podman) and
-  under an emulated Westmere and Sandy Bridge.
-- `make integration-tests` runs tsdbd, the CLI and all clients end to end.
-- One version: the file `VERSION`; `make check-version` makes sure the header, the binaries and the client
-  manifests agree.
+- Crafted files do not corrupt memory: decoders and file loaders are fuzzed, and damage is never silent (a
+  damaged part or log fails the open, it is not skipped).
 
 ### Known limitations
 
@@ -322,11 +332,14 @@ Portable build and tooling
   firewall or a private network, and bind it to the interface you mean (`--listen`).
 - One writing server per database. Read-only followers can read the same directory; automatic failover is
   designed (docs/ha.md) but not built.
-- The disk format (version 5) and the wire protocol (version 9) may still change in a 0.9.x release, with
+- The disk format (version 8) and the wire protocol (version 11) may still change in a 0.9.x release, with
   export and import, or a migration, to carry data over. A database of another format version is refused
   when it is opened, with a message that says so. They freeze at 1.0. See docs/compatibility.md.
 - Client and server of different 0.9.x releases may not understand each other: use the same release on both
   sides.
+- Without `--verify-checksums` a damaged granule reads as wrong values (on ext4 and XFS, which keep no data
+  checksums, turn it on), and without `--pin-index` damage to a part's index after the open can give wrong
+  answers.
 - No SQL, no tables, no latest-value lookups or series metadata (the industrial context belongs to the
   DataHub platform).
 - Linux on x86-64 only for the tarball; other platforms build from source.

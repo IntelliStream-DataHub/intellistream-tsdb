@@ -49,12 +49,12 @@ writing server per database (read-only followers on other hosts over NFS); failo
 and 1.0 still need (the format and protocol changes may land in a 0.9.x, but before 1.0):
 
 - Input safety: client-chosen volume paths, query memory that follows rows, crafted files, network frames,
-  client and CLI parsing; fuzzing of decoders, file loaders and frames (in progress).
+  client and CLI parsing; fuzzing of decoders, file loaders and frames (done in 0.9.0).
 - SIMD kernels for float64, int64 and bool, the spread, time-weighted averages and LTTB, at every CPU level
-  (AVX-512, AVX2, x86-64-v2), with identical results on every CPU (in progress).
+  (AVX-512, AVX2, x86-64-v2), with identical results on every CPU (done in 0.9.0).
 - Release mechanics: version and tag, release notes, the compatibility promise (which formats and protocol
   versions 1.x reads), the portable tarball checked on AlmaLinux 10; export and import for 0.9.x format changes.
-- The release benchmarks: the full comparison (bench/dbcmp) and the internal numbers on a quiet machine.
+- The release benchmarks: the full comparison (bench/dbcmp) and the internal numbers on a quiet machine (done: bench/dbcmp/results/0.9.0.md, README).
 - VALUE_PROPOSITION.md for decision makers, written from the full comparison: storage cost compared to the most
   popular systems (InfluxDB first, per the DB-Engines ranking), servers needed, and the honest limits (one writer
   per database until failover; results to confirm with a pilot on the customer's data).
