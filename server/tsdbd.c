@@ -2,7 +2,8 @@
  * tsdbd: serves a tsdb directory over TCP (protocol in tsdb_protocol.h).
  *
  * One thread runs the event loop: one recv and at most one send in flight per
- * connection, and an eventfd through which workers report. The loop runs on
+ * connection, and an eventfd through which workers report (a lock-free stack of
+ * notes, see notify). The loop runs on
  * io_uring, or on epoll where io_uring is not allowed (RHEL and AlmaLinux 10
  * disable it by default); --io auto (the default) tries io_uring and falls
  * back to epoll when the kernel refuses it. Only how bytes move differs: see
@@ -17,7 +18,13 @@
  * write wins" for clients that pipeline. Workers append replies to the
  * connection's output buffer; a worker streaming a large result waits while
  * that buffer is over OUT_CAP, so a slow client cannot make the server buffer
- * without bound.
+ * without bound. Who sends a connection's output is decided under its lock:
+ * while the event loop has nothing of it in flight, the worker sends what it
+ * appended itself, without blocking (out_send: one loop thread cannot do the
+ * kernel's TCP transmit of every small reply); what such a send leaves, on a
+ * full socket buffer or an error, goes to the event loop, which then sends
+ * everything until it has drained the output (tx_loop), the worker meanwhile
+ * only appending.
  *
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--port-file FILE] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
@@ -187,6 +194,13 @@ typedef struct req {
  * without one (9 bytes on the wire) cannot pile up uncounted. */
 #define REQ_OVERHEAD (sizeof(req) + 64)
 #define REQ_COST(r) ((r)->len + REQ_OVERHEAD)
+/* What a worker tells the main thread about a connection: output is waiting, or its request finished. */
+typedef struct note {
+    struct note *next;
+    struct conn *c;
+    bool done;
+} note;
+
 typedef struct conn {
     struct conn *prev, *next; /* all connections, for shutdown (main thread) */
     int fd;
@@ -219,7 +233,12 @@ typedef struct conn {
     pthread_cond_t cv;
     buf out;
     atomic_bool closing;
-    bool notified;      /* an output event is queued for the main thread */
+    bool notified;      /* `out` has bytes the main thread was told of (n_out pushed): it sends them */
+    bool tx_loop;       /* the main thread sends: a send in flight, bytes left in `sending`, or bytes a worker's
+                           send left in `out`; the worker only appends until the main thread drained it all */
+    bool tx_worker;     /* the worker sends from the front of `out` itself (out_send): nobody else touches `out` */
+    note n_out, n_done; /* in note_top while queued for the main thread */
+    atomic_bool out_queued; /* n_out is in note_top or not yet handled */
     tsdb_query_stats last_stats; /* of the previous query (LAST_STATS) */
 } conn;
 
@@ -338,31 +357,35 @@ static void hold_large(void *arg)
 }
 
 /* events from workers to the main thread */
-typedef struct note {
-    conn *c;
-    bool done; /* the request finished (else: output is waiting) */
-} note;
-static pthread_mutex_t note_lock = PTHREAD_MUTEX_INITIALIZER;
-static note *notes;
-static size_t nnotes, notes_cap;
+/* Workers' notes to the main thread, a lock-free stack (each connection has its two notes; see notify). */
+static _Atomic(note *) note_top;
+static pthread_mutex_t note_lock = PTHREAD_MUTEX_INITIALIZER; /* new_fds */
 
 /* connections the accept thread took, for the main thread to set up */
 static int *new_fds;
 static size_t nnew, new_cap;
 
+/* With many connections of short requests the workers met on a lock here for every reply, and the main thread spent
+ * a quarter of its time waking the ones that waited for it; so the notes are a lock-free stack (Treiber), which the
+ * main thread takes whole and reverses into the order of the pushes. Each connection has two notes, each pushed at
+ * most once until the main thread took it: n_done once per request (the next is dispatched only after its note was
+ * handled), n_out guarded by out_queued (the main thread takes all output when it handles it, so an output note
+ * while one waits is not needed). A worker pushes n_out before n_done, so the main thread sees them in that order,
+ * and a connection whose done note it handles has no other note behind it in the batch. */
 static void notify(conn *c, bool done)
 {
-    pthread_mutex_lock(&note_lock);
-    if (nnotes == notes_cap) {
-        notes_cap = notes_cap ? notes_cap * 2 : 256;
-        notes = realloc(notes, notes_cap * sizeof *notes);
-        if (!notes)
-            abort();
-    }
-    notes[nnotes++] = (note){c, done};
-    pthread_mutex_unlock(&note_lock);
+    if (!done && atomic_exchange(&c->out_queued, true))
+        return;
+    note *n = done ? &c->n_done : &c->n_out;
+    note *top = atomic_load_explicit(&note_top, memory_order_relaxed);
+    do
+        n->next = top;
+    while (!atomic_compare_exchange_weak_explicit(&note_top, &top, n, memory_order_release, memory_order_relaxed));
+    /* Whoever pushes onto an empty stack writes the eventfd; the main thread reads the eventfd before it takes the
+     * stack, so a note pushed onto one not yet taken is seen without a write (a syscall saved per reply while the
+     * main thread is busy). */
     uint64_t one = 1;
-    if (write(wake_fd, &one, 8) != 8) {
+    if (!top && write(wake_fd, &one, 8) != 8) {
         /* the counter cannot overflow in practice; the main thread will see the note */
     }
 }
@@ -390,6 +413,44 @@ static void out_wait(conn *c)
     worker_waits(-1);
 }
 #endif
+
+/* Sends c's output from the worker's own thread, while the main thread has nothing of this connection's in flight
+ * (tx_worker, taken under c->lock, keeps it from taking `out` meanwhile). One event loop thread cannot keep up with
+ * many connections of small replies: the kernel's TCP transmit (on loopback the receiver's side too) was most of its
+ * time, and the loop at full load capped the server at about 120,000 replies a second. Done here it spreads over the
+ * workers, and a reply sent whole needs no wakeup of the main thread. What a non-blocking send leaves (a full socket
+ * buffer, an error) goes to the main thread as before, which sends it or closes the connection. Returns whether the
+ * main thread must be told of output. */
+static bool out_send(conn *c)
+{
+    /* While tx_worker is set nobody else reads or changes `out`: the main thread leaves it alone (submit_send), and
+     * only this worker appends to it. So the send, and moving what it left to the front (up to OUT_CAP + OUT_PIECE),
+     * need no lock; the main thread, which takes the lock for every note it handles, never waits for them. */
+    size_t done = 0, len = c->out.len;
+    while (done < len) {
+        ssize_t n = send(c->fd, c->out.p + done, len - done, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0)
+            done += (size_t)n;
+        else if (n < 0 && errno == EINTR)
+            continue;
+        else
+            break;
+    }
+    if (done && done < len)
+        memmove(c->out.p, c->out.p + done, len - done);
+    c->out.len = len - done;
+    pthread_mutex_lock(&c->lock);
+    c->tx_worker = false;
+    /* What the socket did not take now waits for it to drain: the main thread sends it, and everything appended
+     * until it has drained the output, rather than this worker trying again (an EAGAIN and a move per piece). */
+    if (c->out.len)
+        c->tx_loop = true;
+    bool wake = c->out.len && !c->notified;
+    if (wake)
+        c->notified = true;
+    pthread_mutex_unlock(&c->lock);
+    return wake;
+}
 
 /* Appends n pieces to c's output, waiting while the output is over OUT_CAP. A frame larger than OUT_PIECE goes in
  * pieces of that size, each after the output fell to OUT_CAP, so a connection's output buffer stays under OUT_CAP +
@@ -424,7 +485,7 @@ static bool out_put(conn *c, const struct iovec *iov, int n)
             shutdown(c->fd, SHUT_RDWR);
             ok = false;
         }
-        bool wake = false;
+        bool wake = false, direct = false;
         if (ok) {
             for (size_t left = total; left;) {
                 size_t take = iov[i].iov_len - at < left ? iov[i].iov_len - at : left;
@@ -437,10 +498,17 @@ static bool out_put(conn *c, const struct iovec *iov, int n)
                     at = 0;
                 }
             }
-            wake = !c->notified;
-            c->notified = true;
+            direct = !c->tx_loop && !c->tx_worker && c->fd >= 0;
+            if (direct) {
+                c->tx_worker = true;
+            } else {
+                wake = !c->notified;
+                c->notified = true;
+            }
         }
         pthread_mutex_unlock(&c->lock);
+        if (direct)
+            wake = out_send(c);
         if (wake)
             notify(c, false);
         if (!ok)
@@ -1725,11 +1793,20 @@ static void submit_send(conn *c)
     if (c->sent == c->sending.len) {
         /* take whatever the worker produced since the last send */
         pthread_mutex_lock(&c->lock);
+        if (c->tx_worker) {
+            /* the worker is sending `out` itself; it tells us of whatever it leaves */
+            c->notified = false;
+            c->tx_loop = false;
+            pthread_mutex_unlock(&c->lock);
+            c->sent = c->sending.len = 0;
+            return;
+        }
         buf t = c->sending;
         c->sending = c->out;
         c->out = t;
         c->out.len = 0;
         c->notified = false;
+        c->tx_loop = c->sending.len > 0;
         pthread_cond_broadcast(&c->cv);
         pthread_mutex_unlock(&c->lock);
         c->sent = 0;
@@ -1777,8 +1854,10 @@ static void dispatch(conn *c)
     else
         work_head = r;
     work_tail = r;
-    pthread_cond_signal(&work_cv);
     pthread_mutex_unlock(&work_lock);
+    /* after the unlock: a worker woken while the lock is held blocks on it at once, and the unlock must wake it a
+     * second time (with many short requests a quarter of the event loop's time) */
+    pthread_cond_signal(&work_cv);
 }
 
 /* Closes the descriptor and frees c. A connection still in the epoll ready
@@ -2101,6 +2180,8 @@ static void on_accept(int fd)
         c->readable = c->writable = true; /* until a call says otherwise */
     }
     c->fd = fd;
+    c->n_out = (note){NULL, c, false};
+    c->n_done = (note){NULL, c, true};
     c->recv_ev = (ev){EV_RECV, c};
     c->send_ev = (ev){EV_SEND, c};
     pthread_mutex_init(&c->lock, NULL);
@@ -2114,16 +2195,16 @@ static void on_accept(int fd)
     submit_recv(c);
 }
 
-static void on_wake(void)
+static void take_notes(void)
 {
-    uint64_t v;
-    if (read(wake_fd, &v, 8) < 0 && errno != EAGAIN)
-        perror("tsdbd: eventfd");
+    note *top = atomic_exchange_explicit(&note_top, NULL, memory_order_acquire), *batch = NULL;
+    while (top) { /* into the order of the pushes */
+        note *next = top->next;
+        top->next = batch;
+        batch = top;
+        top = next;
+    }
     pthread_mutex_lock(&note_lock);
-    note *batch = notes;
-    size_t n = nnotes;
-    notes = NULL;
-    nnotes = notes_cap = 0;
     int *fds = new_fds;
     size_t nfds = nnew;
     new_fds = NULL;
@@ -2132,24 +2213,45 @@ static void on_wake(void)
     for (size_t i = 0; i < nfds; i++)
         on_accept(fds[i]);
     free(fds);
-    for (size_t i = 0; i < n; i++) {
-        conn *c = batch[i].c;
-        if (batch[i].done)
+    for (note *nt = batch, *next; nt; nt = next) {
+        next = nt->next; /* nt may be pushed again once handled */
+        conn *c = nt->c;
+        bool done = nt->done;
+        if (done)
             c->busy = false;
+        else
+            atomic_store(&c->out_queued, false);
         if (c->closed) {
             conn_close(c);
             continue;
         }
         submit_send(c);
-        if (batch[i].done) {
+        if (done) {
             dispatch(c);
             submit_recv(c); /* its pipeline may have room again */
         }
         finish_if_drained(c);
     }
-    free(batch);
     if (park_head)
         unpark_some();
+}
+
+static void on_wake(void)
+{
+    uint64_t v;
+    if (read(wake_fd, &v, 8) < 0 && errno != EAGAIN)
+        perror("tsdbd: eventfd");
+    take_notes();
+}
+
+/* Only the push onto an empty stack writes the eventfd (notify), so a worker preempted between its push and that
+ * write would hold up every note pushed after it. The main thread therefore also takes the notes after each round
+ * of events when the stack is not empty (one load per round), so the notes that came during a round wait for no
+ * such write. The eventfd is left alone here: a count it holds only makes a later on_wake find less to do. */
+static void notes_pending(void)
+{
+    if (atomic_load_explicit(&note_top, memory_order_relaxed))
+        take_notes();
 }
 
 #ifndef TSDBD_NO_URING
@@ -2191,6 +2293,7 @@ static void uring_loop(void)
             }
         }
         io_uring_cq_advance(&ring, seen);
+        notes_pending();
     }
 }
 #endif
@@ -2269,6 +2372,7 @@ static void ep_loop(void)
             ep_want(c);
         }
         ep_round();
+        notes_pending();
     }
 }
 
@@ -2723,7 +2827,6 @@ int main(int argc, char **argv)
         free(c);
     }
     free(fd_conn);
-    free(notes);
     for (size_t i = 0; i < nnew; i++)
         close(new_fds[i]);
     free(new_fds);
