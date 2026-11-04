@@ -102,13 +102,13 @@
     }
 
     /* an airfoil loop in the x-y plane: leading edge at x0, chord c, thickness t, angle (nose up positive) */
-    function airfoil(x0, y0, z, c, t, angle, m) {
+    function airfoil(x0, y0, z, c, t, angle, m, camb) {
         var pts = [];
         var ca = Math.cos(angle), sa = Math.sin(angle);
         for (var i = 0; i < m; i++) {
             var u = i / m * 2, top = u <= 1, p = top ? u : 2 - u; /* 0 at the leading edge, 1 at the trailing */
             var th = 5 * t * (0.2969 * Math.sqrt(p) - 0.126 * p - 0.3516 * p * p + 0.2843 * p * p * p - 0.1036 * p * p * p * p);
-            var camber = 0.06 * Math.sin(Math.PI * p);
+            var camber = (camb || 0.06) * Math.sin(Math.PI * p);
             var px = p * c, py = (camber + (top ? th : -th)) * c;
             pts.push([x0 + px * ca + py * sa, y0 - px * sa + py * ca, z]);
         }
@@ -118,9 +118,9 @@
     /* ---- monocoque and nose cone: a rounded section from the nose tip to the gearbox, open at the cockpit ---- */
     var MONO = [
         /* x, half width, bottom, top, roundness */
-        [-2.78, 0.03, 0.2, 0.27, 2.2],
-        [-2.5, 0.08, 0.16, 0.34, 2.4],
-        [-2.0, 0.14, 0.13, 0.44, 2.6],
+        [-2.86, 0.035, 0.26, 0.32, 2.2],
+        [-2.5, 0.075, 0.22, 0.38, 2.4],
+        [-2.0, 0.13, 0.17, 0.46, 2.6],
         [-1.45, 0.21, 0.1, 0.54, 2.8],
         [-0.95, 0.29, 0.07, 0.63, 3.0],
         [-0.55, 0.36, 0.06, 0.68, 3.2],
@@ -131,7 +131,7 @@
         [2.15, 0.14, 0.14, 0.46, 2.6],
         [2.42, 0.1, 0.17, 0.4, 2.4]
     ];
-    loft(range(-2.78, 2.42, 30), function (x) {
+    loft(range(-2.86, 2.42, 30), function (x) {
         var k = keyed(MONO, x);
         return section(x, 0, (k[1] + k[2]) / 2, k[0], (k[2] - k[1]) / 2, k[3], 20);
     }, 1, function (x, i, m) {
@@ -150,8 +150,8 @@
 
     /* ---- engine cover with the airbox above the driver's head, and the shark fin ---- */
     var COVER = [
-        [0.32, 0.14, 0.66, 1.0],
-        [0.6, 0.2, 0.66, 1.03],
+        [0.32, 0.15, 0.66, 1.1],
+        [0.6, 0.2, 0.66, 1.08],
         [1.1, 0.19, 0.64, 0.9],
         [1.7, 0.14, 0.56, 0.72],
         [2.3, 0.08, 0.44, 0.52]
@@ -165,7 +165,7 @@
     /* shark fin: its top edge and ribs down to the cover */
     var fin = [];
     range(0.75, 2.45, 14).forEach(function (x, k) {
-        var top = lerp(1.04, 0.98, k / 13) - (x > 2.2 ? (x - 2.2) * 1.2 : 0);
+        var top = lerp(1.0, 0.86, k / 13) - (x > 2.2 ? (x - 2.2) * 1.2 : 0);
         var base = keyed(COVER, Math.min(x, 2.3))[2];
         fin.push([x, top, 0]);
         line([x, top, 0], [x, base, 0]);
@@ -218,13 +218,13 @@
     /* ---- front wing: four elements, rising and curling up towards the endplates, nose pylons ---- */
     var FW = [
         /* leading edge x, height, chord, angle */
-        [-3.08, 0.07, 0.3, 0.04],
+        [-3.02, 0.07, 0.24, 0.04],
         [-2.83, 0.12, 0.2, 0.22],
         [-2.69, 0.17, 0.15, 0.42],
         [-2.59, 0.22, 0.12, 0.62]
     ];
     FW.forEach(function (el, n) {
-        var zs = range(-0.95, 0.95, 13);
+        var zs = range(-0.95, 0.95, 9);
         loft(zs, function (z) {
             var t = Math.max(0, (Math.abs(z) - 0.28) / 0.67); /* 0 at the neutral middle, 1 at the endplate */
             var lift = n === 0 ? 0.01 * t : (0.015 + 0.02 * n) * t * t;
@@ -235,7 +235,8 @@
     });
     both(function (s) {
         var z = 0.97 * s;
-        poly([[-3.12, 0.02, z], [-2.45, 0.03, z], [-2.4, 0.2, z], [-2.48, 0.42, z], [-2.75, 0.4, z], [-3.05, 0.22, z]],
+        poly([[-3.12, 0.02, z], [-2.45, 0.03, z], [-2.38, 0.22, z + 0.02 * s], [-2.46, 0.5, z + 0.06 * s],
+            [-2.8, 0.46, z + 0.05 * s], [-3.06, 0.24, z + 0.02 * s]],
             true);
         poly([[-2.9, 0.06, z], [-2.55, 0.36, z]]);
         poly([[-3.0, 0.18, z], [-2.62, 0.4, z]]);
@@ -243,30 +244,49 @@
         poly([[-2.45, 0.2, 0.05 * s], [-2.58, 0.1, 0.12 * s], [-2.7, 0.1, 0.12 * s], [-2.58, 0.21, 0.05 * s]], true);
     });
 
-    /* ---- rear wing: mainplane, DRS flap, endplates, swan-neck mounts, beam wing ---- */
-    var RW = [[2.5, 0.88, 0.3, 0.12], [2.66, 1.0, 0.22, 0.42]];
+    /* ---- rear wing: mainplane, DRS flap, endplates, swan-neck mounts, beam wing ----
+     * A high-downforce wing nearly as wide as the rear wheels' outer edges (the wheels reach about 0.99 m out):
+     * deeply cambered elements, twisted to a steeper angle and swept up towards the endplates, a spoon-shaped dip
+     * in the middle. */
+    var RWZ = 0.9, rearWingFrom = lines.length;
+    var RW = [
+        /* leading edge x, height, chord, angle, camber */
+        [2.46, 0.86, 0.38, 0.14, 0.1],
+        [2.68, 1.0, 0.27, 0.5, 0.09]
+    ];
     RW.forEach(function (el) {
-        loft(range(-0.52, 0.52, 11), function (z) {
-            var dip = 0.025 * Math.cos((z / 0.52) * Math.PI / 2); /* a slight spoon shape */
-            return airfoil(el[0], el[1] - dip, z, el[2], 0.11, el[3], 10);
+        loft(range(-RWZ, RWZ, 17), function (z) {
+            var u = Math.abs(z) / RWZ;
+            var dip = 0.015 * Math.cos(u * Math.PI / 2); /* a slight spoon */
+            var tip = 0.01 * u * u; /* the tips meet the endplates */
+            return airfoil(el[0] - 0.02 * u, el[1] - dip + tip, z, el[2], 0.12, el[3] + 0.04 * u, 10, el[4]);
         }, 1);
     });
     both(function (s) {
-        var z = 0.54 * s;
-        poly([[2.38, 0.28, z], [2.93, 0.34, z], [3.0, 0.8, z], [2.97, 1.12, z], [2.6, 1.15, z], [2.4, 1.02, z],
-            [2.42, 0.6, z]], true);
-        [0.5, 0.6, 0.7].forEach(function (y) { line([2.5, y, z], [2.9, y + 0.03, z]); }); /* louvres */
+        var z = (RWZ + 0.02) * s;
+        /* endplate: a tall plate, with louvres along the bottom, slots at the top trailing corner and a footplate */
+        poly([[2.32, 0.26, z], [3.02, 0.28, z], [3.04, 1.14, z], [3.0, 1.22, z], [2.92, 1.26, z], [2.46, 1.26, z],
+            [2.36, 1.08, z], [2.38, 0.62, z]], true);
+        [0.38, 0.46, 0.54, 0.62, 0.7].forEach(function (y) { line([2.44, y, z], [2.96, y + 0.04, z]); }); /* louvres */
+        [2.78, 2.86, 2.94].forEach(function (x) { line([x, 1.02, z], [x + 0.04, 1.2, z]); }); /* slots */
+        poly([[2.3, 0.26, z], [2.3, 0.26, z - 0.1 * s], [3.0, 0.3, z - 0.1 * s], [3.0, 0.3, z]]); /* footplate */
+        line([3.04, 1.2, z], [3.04, 1.2, z - 0.06 * s]); /* the endplate's top lip */
         /* swan neck: from the mainplane's top down and forward to the gearbox, as a narrow strip */
         var neck = [];
         for (var k = 0; k <= 10; k++) {
             var t = k / 10;
-            neck.push([lerp(2.62, 2.28, t) + 0.12 * Math.sin(Math.PI * t), lerp(0.93, 0.44, t), 0.12 * s]);
+            neck.push([lerp(2.62, 2.28, t) + 0.12 * Math.sin(Math.PI * t), lerp(0.93, 0.44, t), 0.035 * s]);
         }
         poly(neck);
         poly(neck.map(function (p) { return [p[0] + 0.06, p[1] - 0.02, p[2]]; }));
         line(neck[0], [neck[0][0] + 0.06, neck[0][1] - 0.02, neck[0][2]]);
     });
-    loft(range(-0.46, 0.46, 9), function (z) { return airfoil(2.46, 0.42, z, 0.2, 0.1, 0.25, 8); }, 1);
+    /* beam wing: two elements low down, across the diffuser to the endplates */
+    loft(range(-RWZ, RWZ, 13), function (z) { return airfoil(2.44, 0.42, z, 0.22, 0.1, 0.25, 8, 0.08); }, 1);
+    loft(range(-RWZ, RWZ, 13), function (z) { return airfoil(2.64, 0.48, z, 0.16, 0.1, 0.45, 8, 0.08); }, 1);
+
+    /* the rear wing sits at the back of the view, but it is what reads as downforce: draw it one layer nearer */
+    for (var rw = rearWingFrom; rw < lines.length; rw++) lines[rw].boost = 1;
 
     /* ---- halo: a tube from the centre pillar round the driver's head to the legs behind ---- */
     function tube(path, r, m) {
@@ -305,11 +325,24 @@
             hoop.push([e[0] + 0.03 * k3, e[1] - 0.045 * k3, e[2] + 0.004 * k3 * s]);
         }
         tube(hoop, 0.025, 8);
-        /* mirror: a small lofted housing on a stalk */
-        loft(range(-0.82, -0.68, 4), function (x) {
-            return section(x, 0.47 * s, 0.75, 0.08, 0.035, 3, 8);
+        /* mirror: a swept, pointed pod (sharp at the front, the glass facing back), set on a small cambered wing
+         * from the chassis shoulder, with a winglet at its outer end */
+        var MIR = [[-0.94, 0.004, 0.003], [-0.88, 0.035, 0.018], [-0.8, 0.07, 0.032], [-0.72, 0.085, 0.04],
+            [-0.66, 0.088, 0.042]];
+        loft(range(-0.94, -0.66, 8), function (x) {
+            var k = keyed(MIR, x), back = (x + 0.94) / 0.28;
+            return section(x, (0.47 + 0.05 * back) * s, 0.78 + 0.015 * back, k[0], k[1], 3.6, 10);
         }, 1);
-        poly([[-0.72, 0.72, 0.4 * s], [-0.66, 0.66, 0.34 * s]]);
+        poly(section(-0.665, 0.52 * s, 0.795, 0.068, 0.03, 3, 10), true); /* the glass */
+        /* the mounting wing: a thin cambered blade, swept back as it rises to the pod */
+        loft(range(0, 1, 6), function (t) {
+            var z = lerp(0.26, 0.47, t) * s;
+            return airfoil(lerp(-0.9, -0.79, t), lerp(0.68, 0.755, t), z, lerp(0.1, 0.07, t), 0.08, 0.05, 8, 0.07);
+        }, 1);
+        /* a second, thinner strut behind it */
+        poly([[-0.7, 0.65, 0.36 * s], [-0.68, 0.7, 0.42 * s], [-0.69, 0.76, 0.5 * s]]);
+        /* winglet: a small swept fin under the pod's outer end */
+        poly([[-0.86, 0.77, 0.6 * s], [-0.72, 0.775, 0.62 * s], [-0.7, 0.72, 0.64 * s], [-0.8, 0.71, 0.63 * s]], true);
     });
 
     /* ---- wheels: tyres as tori, rims with spokes, brake ducts, wheel covers ---- */
@@ -352,7 +385,7 @@
         poly([[cx - 0.1, cy + 0.06, d], [cx - 0.18, cy + 0.05, d - 0.06 * s], [cx - 0.18, cy - 0.05, d - 0.06 * s],
             [cx - 0.1, cy - 0.06, d]]);
     }
-    var FX = -1.65, RX = 1.95, FR = 0.36, RR = 0.37;
+    var FX = -1.65, RX = 1.95, FR = 0.385, RR = 0.395;
 
     /* suspension arms as thin quads (a narrow strip from inboard to the upright) */
     function arm(a, b, w) {
@@ -363,8 +396,8 @@
     }
 
     both(function (s) {
-        wheel(FX, FR, 0.82 * s, FR, 0.3, s);
-        wheel(RX, RR, 0.8 * s, RR, 0.38, s);
+        wheel(FX, FR, 0.82 * s, FR, 0.37, s);
+        wheel(RX, RR, 0.8 * s, RR, 0.47, s);
         var fu = [FX, FR + 0.12, 0.64 * s], fl = [FX, FR - 0.1, 0.65 * s];
         arm([-1.95, 0.46, 0.14 * s], fu);
         arm([-1.4, 0.48, 0.18 * s], fu);
@@ -385,9 +418,9 @@
 
     var CENTER_X = 0.0, CENTER_Y = 0.5;
 
-    /* The view: three-quarter front, nose towards the lower left, the camera about 17 degrees above the car so the
-     * halo, airbox and wings show from the top. */
-    var VIEW = { angle: -0.62, pitch: -0.3, dist: 9, f: 520 };
+    /* The view: three-quarter front from the car's left, nose towards the lower right, the camera about 25 degrees
+     * above the car and close to it with a short focal length: a wide-angle look, the front wing and tyres large. */
+    var VIEW = { angle: -2.45, pitch: -0.44, dist: 6, f: 340 };
 
     function proj(x, y, z) {
         var ca = Math.cos(VIEW.angle), sa = Math.sin(VIEW.angle);
@@ -433,7 +466,7 @@
             });
             var cur = [null, null, null]; /* the end of this polyline's open run in each layer */
             for (var k = 0; k + 1 < pl.length; k++) {
-                var a = pl[k], b = pl[k + 1], L = layerOf((a[2] + b[2]) / 2);
+                var a = pl[k], b = pl[k + 1], L = Math.min(2, layerOf((a[2] + b[2]) / 2) + (lines[i].boost || 0));
                 var from = cur[L] || a;
                 if (Math.abs(b[0] - from[0]) + Math.abs(b[1] - from[1]) < 5) continue; /* under half a pixel */
                 if (!cur[L] || cur[L] !== from) {
@@ -486,19 +519,24 @@
         /* streaks start on points of the car (wing tips, wheel tops, sidepods, airbox) and behind it */
         var anchors = [[-2.9, 0.2, 0.95], [-2.9, 0.2, -0.95], [-1.65, 0.72, 0.95], [-1.65, 0.72, -0.95],
             [-0.45, 0.58, 0.78], [-0.45, 0.58, -0.78], [0.4, 1.02, 0], [1.95, 0.74, 0.98], [1.95, 0.74, -0.98],
-            [2.9, 1.1, 0.54], [2.9, 1.1, -0.54], [1.2, 0.05, 0.85], [1.2, 0.05, -0.85], [0.5, 0.75, 0.45]];
+            [3.04, 1.2, 0.92], [3.04, 1.2, -0.92], [2.9, 0.98, 0.5], [2.9, 0.98, -0.5], /* the rear wing's tips */
+            [1.2, 0.05, 0.85], [1.2, 0.05, -0.85], [0.5, 0.75, 0.45]];
+        /* streaks are lines in the scene, parallel to the car's axis and running back from it, so through the lens
+         * they converge towards the vanishing point behind the car */
         var streaks = [];
+        function streak(p, len, i) {
+            var a = proj(p[0], p[1], p[2]), e = proj(p[0] + len, p[1], p[2]);
+            streaks.push([a[0], a[1], e[0], e[1], i]);
+        }
         anchors.forEach(function (p, i) {
-            var s = proj(p[0], p[1], p[2]);
-            var off = (rnd() - 0.5) * 10, len = 90 + rnd() * 150;
-            var x1 = s[0] + px * off + ux * 6, y1 = s[1] + py * off + uy * 6;
-            streaks.push([x1, y1, x1 + ux * len, y1 + uy * len, i]);
+            var dz = (rnd() - 0.5) * 0.08, dy = (rnd() - 0.5) * 0.06;
+            streak([p[0] + 0.05, p[1] + dy, p[2] + dz], 1.5 + rnd() * 2.5, i);
         });
         for (var j = 0; j < 10; j++) { /* free air around the car */
-            var c = proj(-2.5 + rnd() * 5, 0.1 + rnd() * 1.2, (rnd() - 0.5) * 2.4);
-            var len2 = 60 + rnd() * 120;
-            streaks.push([c[0], c[1], c[0] + ux * len2, c[1] + uy * len2, anchors.length + j]);
+            streak([-2.5 + rnd() * 5, 0.1 + rnd() * 1.2, (rnd() - 0.5) * 2.4], 1 + rnd() * 2, anchors.length + j);
         }
+        void px;
+        void py;
         var r = render(), b = r.box;
         var minx = b[0], miny = b[1], maxx = b[2], maxy = b[3];
         streaks.forEach(function (s) {
@@ -551,7 +589,7 @@
     }
 
     if (typeof module !== "undefined" && module.exports) {
-        module.exports = { render: render, svg: svg, VIEW: VIEW, lines: lines, edgeCount: edgeCount };
+        module.exports = { render: render, svg: svg, proj: proj, VIEW: VIEW, lines: lines, edgeCount: edgeCount };
         if (require.main === module) {
             if (process.argv[2] === "--stats") {
                 var s = svg(), r = render();

@@ -1404,8 +1404,8 @@ dl.terms dd {
 
 @media (max-width: 600px) {
     .car3d {
-        width: 104%;
+        width: 100%;
         max-width: none;
-        margin-left: -2%;
+        margin-left: 0;
     }
 }
