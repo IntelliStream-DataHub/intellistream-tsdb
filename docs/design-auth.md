@@ -27,9 +27,9 @@ tenant admins are in 0.9; state names shared within a volume are accepted and do
   superuser is added that way, offline.
 - **Enforcement.** tsdbd checks every request against one table indexed by op number before it calls the engine;
   an op missing from the table is refused. Names are checked directly; ids through their names, with a per-user
-  map of rights by id that the user's connections share. Measured: 0.3 to 1.3 ns per row of an insert, against
+  map of rights by id that the user's connections share. Measured: 0.46 to 1.44 ns per row of an insert, against
   about 48 ns per row that tsdbd spends on an insert today; one branch per request for a superuser or a grant on
-  all series. Globs are matched only when the map misses (about 9 ns per glob tried, measured). A series the user
+  all series. Globs are matched only when the map misses (one linear pass over the name per glob tried). A series the user
   may not touch and a series that does not exist answer the same.
 - **Default.** tsdbd requires login and refuses to start without a superuser, unless started with `--no-auth`.
   Every quick start gains the `tsdb <dir> user add NAME --superuser` step. Test harnesses pass `--no-auth`, except
@@ -298,20 +298,33 @@ must not see each other's state labels get their own volumes (A26: accepted for 
 **Hot path.** For each id the check is, in order:
 
 1. the user holds the needed right on `all` (superusers too): nothing more, one branch per request;
-2. the id equals the previous row's: same answer;
+2. the id is in the 4096-id block of the previous row's: its byte in the leaf already in hand, one load (a frame's
+   rows are checked in one loop that reads the user's state once);
 3. the rights map: `volume -> 512 pointers -> 1024 pointers -> 4096 bytes`, allocated on first use, the leaf byte
-   loaded and stored with relaxed atomics (every writer stores the same value); a hit costs a few loads;
+   loaded and stored with relaxed atomics (every writer stores the same value); the l2 table of the previous row's
+   4 M-id block is in hand too, so another block of the volume costs two loads;
 4. a miss: `tsdb_series_name` (a route and an array index), then `rights_of` (§2, globs included), then store
-   the byte. Globs therefore cost nothing on a hit: a series' answer is computed once per user.
+   the byte. Globs therefore cost nothing on a hit: a series' answer is computed once per user. An id the user
+   has no right on is stored only in a leaf that exists already: probing other tenants' ids allocates nothing.
 
-Measured on the Ryzen 9 7950X (scratch microbenchmark of steps 2 and 3, 10,000-row frames): 0.3 ns a row when rows
-come in runs of 100 per series, 0.8 ns a row with ids random over 1,000 series, 1.3 ns a row with ids random over
-1 million series (a 1 MB map, in L2). tsdbd loads 82.6 M rows/s over 4 connections, about 48 ns a row per
-connection, so the check costs at most about 3% and usually under 1%; queries check one id per request. A miss
-costs an estimated 100 to 300 ns, once per id per user until its grants change: a first QUERY_MULTI over 65,536
-fresh ids pays about 13 ms once. Memory: 4 KB per 4096-id block a user touches plus 12 KB per volume, allocated
-only for users with connections; a user with a grant on `all` has no map. A cap per user (64 MB) stops filling
-the map past it; checks then compute every time, which is slower, never wrong.
+Measured on the Ryzen 9 7950X after the step 2 review (its microbenchmark, `hotpath_bench.c`, in process with real
+series names and USERS, a user with insert on `prefix:acme/`, 10,000-row frames x 2,000; mean of 3 runs x 3,
+interleaved with the code before the fix; the design's first estimates in brackets):
+
+| ids in the frame | before the fix | after | (estimate) |
+|---|---:|---:|---:|
+| runs of 100 per series (1 M series) | 0.58 ns | **0.46 ns** | (0.3) |
+| random over 1,000 series | 2.61 ns | **0.46 ns** | (0.8) |
+| random over 1 M series (a 1 MB map) | 2.97 ns | **1.44 ns** | (1.3) |
+| a miss (a fresh id) | 29 ns | **25 ns** | (100 to 300) |
+| a user with no grant, one probe per 4096-id block of 1 M series | 1,017,856 bytes of map | **0 bytes** | |
+
+tsdbd loads 82.6 M rows/s over 4 connections, about 48 ns a row per connection, so the check costs about 1% for
+rows that come series by series or over a few thousand series, and 3% when every row names another of a million
+series; queries check one id per request. A first QUERY_MULTI over 65,536 fresh ids pays about 2 ms once. Memory:
+4 KB per 4096-id block a user holds a right in plus 14 KB per volume, allocated only for users with connections; a
+user with a grant on `all` has no map. A cap per user (64 MB) and a budget for all users together (a sixteenth of
+the RAM) stop filling the maps past them; checks then compute every time, which is slower, never wrong.
 
 ## 6. Clients, CLI and the Pulsar sink
 
@@ -339,11 +352,11 @@ the map past it; checks then compute every time, which is slower, never wrong.
 | what | cost |
 |---|---|
 | a login, client side | PBKDF2 with 4096 iterations: 0.79 ms measured with OpenSSL (SHA-NI) on the 7950X; the portable C version is estimated at 2 to 4 ms; once per process with the key cache; then four HMACs |
-| a login, server side | a hash lookup and four HMACs: microseconds |
+| a login, server side | a hash lookup and five HMACs (three of them the mock verifier's, for every name: A4): microseconds |
 | a login, network | HELLO and AUTH_START pipelined, then AUTH_CONTINUE: one round trip more than today |
 | a request | one relaxed load of the stale flag |
-| an insert row | 0 (grant on `all`), 0.3 to 1.3 ns measured (map), about 200 ns once per new id, plus about 9 ns per glob run on that miss |
-| memory | about 4 KB per 4096 ids touched per user with connections; USERS in memory about its size on disk |
+| an insert row | 0 (grant on `all`), 0.46 to 1.44 ns measured (map, §5), about 25 ns once per new id, plus one linear pass of the name per glob whose literal prefix and suffix fit, on that miss |
+| memory | about 4 KB per 4096 ids a user holds a right in, per user with connections (capped per user and for all); USERS in memory about its size on disk, plus a snapshot of it for logins |
 
 The perf gate measures the end-to-end numbers: tsdbc-bench insert and query with a prefix-grant user against
 `--no-auth`, on a quiet machine, repeated (benchmark policy). Expected within 3%.

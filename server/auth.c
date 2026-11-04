@@ -823,18 +823,6 @@ static map_l2 *map_l2_of(auth_user *au, tsdb_sid id)
     return l1 ? atomic_load_explicit(&l1->l2[local >> 22], memory_order_acquire) : NULL;
 }
 
-/* auth_ids off its fast path: the leaf of id's block through the l2 in hand (or found and kept), NULL if none.
- * Not inlined: the per-row loop then keeps its few values in registers. */
-static __attribute__((noinline)) _Atomic uint8_t *walk_leaf(auth_user *au, tsdb_sid id, uint64_t *l2key,
-                                                            map_l2 **l2)
-{
-    map_l2 *t;
-    if ((id >> 22) != *l2key && (t = map_l2_of(au, id)))
-        *l2 = t, *l2key = id >> 22;
-    return (id >> 22) == *l2key ? atomic_load_explicit(&(*l2)->leaf[(id >> 12) & 1023], memory_order_acquire)
-                                : NULL;
-}
-
 int auth_id(auth_conn *a, tsdb_sid id, uint8_t need)
 {
     if (!a->au || enough(a->au->all, need))
@@ -846,36 +834,47 @@ int auth_id(auth_conn *a, tsdb_sid id, uint8_t need)
     return a->last_byte && enough(a->last_byte, need) ? 0 : TSDB_ERR_DENIED;
 }
 
-/* The per-row check of an id-per-row insert (A15). The user's state and its need are read once per request; the
- * leaf of the previous row's 4096-id block and the l2 of its 4 M-id block stay in hand, so a row of a series near
- * the last one costs one load, and any other row of a volume two (id >> 12 and id >> 22 name the volume and the
- * block; a key taken from a valid id is matched only by valid ids). */
-int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need)
+/* The per-row check of an id-per-row insert (A15). The user's state and its need are read once per request (any:
+ * the need is NEED_ANY; a constant in each copy of the loop); the leaf of the previous row's 4096-id block and the
+ * l2 of its 4 M-id block stay in hand, so a row of a series near the last one costs one load, and any other row of
+ * a volume two (id >> 12 and id >> 22 name the volume and the block; a key taken from a valid id is matched only by
+ * valid ids). */
+static inline __attribute__((always_inline)) int ids_check(auth_user *au, const tsdb_sid *ids, size_t n,
+                                                           uint8_t need, const bool any)
 {
-    auth_user *au = a->au;
-    if (!au || enough(au->all, need))
-        return 0;
     uint64_t lkey = UINT64_MAX, l2key = UINT64_MAX; /* no id >> 12 or id >> 22 is that large */
     _Atomic uint8_t *leaf = NULL;
     map_l2 *l2 = NULL;
     for (size_t i = 0; i < n; i++) {
         tsdb_sid id = ids[i];
         uint8_t b = 0;
-        if ((id >> 12) == lkey) {
+        if (__builtin_expect((id >> 12) == lkey, 1)) {
             b = atomic_load_explicit(&leaf[id & 4095], memory_order_relaxed);
         } else {
-            _Atomic uint8_t *lf = walk_leaf(au, id, &l2key, &l2);
+            map_l2 *t;
+            if ((id >> 22) != l2key && (t = map_l2_of(au, id)))
+                l2 = t, l2key = id >> 22;
+            _Atomic uint8_t *lf =
+                (id >> 22) == l2key ? atomic_load_explicit(&l2->leaf[(id >> 12) & 1023], memory_order_acquire) : NULL;
             if (lf) {
                 leaf = lf, lkey = id >> 12;
                 b = atomic_load_explicit(&leaf[id & 4095], memory_order_relaxed);
             }
         }
-        if (!b)
+        if (__builtin_expect(!b, 0))
             b = rights_byte(au, id); /* a miss: the name's rights, cached as rights_byte decides */
-        if (!b || !enough(b, need))
-            return TSDB_ERR_DENIED;
+        if (__builtin_expect(any ? !(b & R_EVERY) : (b & need) != need, 0))
+            return TSDB_ERR_DENIED; /* also b == 0: no series of that id */
     }
     return 0;
+}
+
+int auth_ids(auth_conn *a, const tsdb_sid *ids, size_t n, uint8_t need)
+{
+    auth_user *au = a->au;
+    if (!au || enough(au->all, need))
+        return 0;
+    return need == NEED_ANY ? ids_check(au, ids, n, need, true) : ids_check(au, ids, n, need, false);
 }
 
 int auth_check(auth_conn *a, uint8_t op, const uint8_t *p, size_t len)

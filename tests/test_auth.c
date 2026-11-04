@@ -450,7 +450,11 @@ static void *during_hang(void *arg)
     return NULL;
 }
 
-/* server/auth.c linked in, on a database of 100,000 series (acme/sN for even N, globex/sN for odd):
+/* Series i of test_inproc is acme's: even i in even 4096-id blocks, odd i in odd ones, so one offset in two
+ * neighbouring leaves of the rights map belongs to two tenants (a leaf taken for another catches the eye). */
+static bool acme_id(uint32_t i) { return (i + i / 4096) % 2 == 0; }
+
+/* server/auth.c linked in, on a database of 100,000 series (acme/sN or globex/sN by acme_id):
  *  - #4: a known and an unknown name compute the same HMACs at AUTH_START and at a failed AUTH_CONTINUE;
  *  - #5: a user with no grant probing every id allocates no rights map; with the budget of all maps cut to 32 KiB,
  *    a user's answers on every id stay right while its map stops growing;
@@ -479,7 +483,7 @@ static void test_inproc(const char *base)
     static tsdb_sid ids[N];
     for (uint32_t i = 0; i < N; i++) {
         char nm[32];
-        snprintf(nm, sizeof nm, "%s/s%u", i % 2 ? "globex" : "acme", i);
+        snprintf(nm, sizeof nm, "%s/s%u", acme_id(i) ? "acme" : "globex", i);
         OK(tsdb_series_create(db, nm, TSDB_FLOAT32, NULL, &ids[i]));
     }
     OK(auth_init(dir, true, true, db));
@@ -508,18 +512,27 @@ static void test_inproc(const char *base)
     CHECK(inproc_login(&r, "acme/r", "pw", NULL, NULL) == 0);
     for (int pass = 0; pass < 2; pass++)
         for (uint32_t i = 0; i < N; i++)
-            wrong += auth_id(&r, ids[i], R_READ) != (i % 2 ? TSDB_ERR_DENIED : 0);
-    static tsdb_sid even[N / 2];
-    for (uint32_t i = 0; i < N / 2; i++)
-        even[i] = ids[2 * i];
-    CHECK(wrong == 0 && auth_ids(&r, even, N / 2, R_READ) == 0 && auth_ids(&r, ids, N, R_READ) == TSDB_ERR_DENIED);
-    CHECK(auth_ids(&r, even + 1000, 1, R_READ) == 0 && auth_ids(&r, ids + 1, 1, R_READ) == TSDB_ERR_DENIED);
+            wrong += auth_id(&r, ids[i], R_READ) != (acme_id(i) ? 0 : TSDB_ERR_DENIED);
+    static tsdb_sid own[N];
+    uint32_t nown = 0;
+    for (uint32_t i = 0; i < N; i++)
+        if (acme_id(i))
+            own[nown++] = ids[i];
+    /* a frame of acme's ids across the blocks (the first four cached, the rest past the budget), then each foreign
+     * id after an own one of the block before it */
+    CHECK(wrong == 0 && auth_ids(&r, own, nown, R_READ) == 0 && auth_ids(&r, ids, N, R_READ) == TSDB_ERR_DENIED);
+    for (uint32_t b = 1; b < N / 4096; b++) {
+        uint32_t i = b * 4096 + (b * 37) % 4000 + 1, j = i - 4096; /* one offset, neither end of a block */
+        tsdb_sid pair[2] = {ids[j + !acme_id(j)], ids[i + acme_id(i)]};
+        wrong += auth_ids(&r, pair, 2, R_READ) != TSDB_ERR_DENIED || auth_ids(&r, pair, 1, R_READ) != 0;
+    }
+    CHECK(wrong == 0);
     size_t capped = auth_map_total();
     CHECK(capped > 0 && capped <= (32 << 10) + 4096);
     auth_map_budget = budget;
 
     /* #2 */
-    during d = {.in = &r, .own = ids[0], .foreign = ids[1], .login = -1};
+    during d = {.in = &r, .own = own[0], .foreign = ids[1], .login = -1};
     auth_test_reload_hook = hang_hook;
     pthread_t rt, dt;
     CHECK(pthread_create(&rt, NULL, reload_thread, NULL) == 0);
