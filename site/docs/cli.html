@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Command line</title>
+<meta name="description" content="tsdb docs|The tsdb command-line tool: import, query, export, create series, volumes, stats, delete and retention.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="app-bar">
+<button class="icon-btn menu-btn" type="button" aria-label="Open the menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="30" height="30">tsdb</a>
+<nav aria-label="Main"><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a></nav>
+<a class="icon-btn" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb" aria-label="tsdb on GitHub" title="tsdb on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg></a>
+<button class="icon-btn theme-btn" type="button" aria-label="Switch the theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg></button>
+</header>
+<nav class="drawer" aria-label="Documentation"><h2>Start</h2><ul><li><a href="../docs/index.html">What tsdb is</a></li><li><a href="../docs/install.html">Install and build</a></li><li><a href="../docs/quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="../docs/concepts.html">Concepts</a></li><li><a href="../docs/clients.html">Clients</a></li><li><a href="../docs/cli.html" aria-current="page">Command line</a></li><li><a href="../docs/server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="../docs/operations.html">Operations</a></li><li><a href="../docs/benchmarks.html">Benchmarks</a></li></ul><h2>Elsewhere</h2><ul><li><a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">Source on GitHub</a></li></ul></nav>
+<div class="scrim"></div>
+<div class="doc"><main id="main">
+<h1>Command line</h1>
+<p class="lead"><code>tsdb</code> works on a database directory directly, with no server. Use it to load files,
+look at data, take backups and change settings.</p>
+<p>Every command starts with the database directory: <code>tsdb DIR COMMAND ...</code>. Run <code>build/tsdb</code>
+without arguments for the full list, the time formats and the groups. The <a href="quickstart.html">quick start</a>
+uses <code>import</code> and <code>query</code>.</p>
+
+<h2 id="commands">Commands</h2>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Command</th><th scope="col">What it does</th></tr></thead>
+<tbody>
+<tr><td><code>insert SERIES</code></td><td>reads <code>time,value</code> lines from standard input into one series</td></tr>
+<tr><td><code>import [FILE]</code></td><td>reads <code>series,time,value</code> lines, or an export file (see <a href="operations.html#backup">backup</a>). New series are float32; an empty value or <code>null</code> is a null</td></tr>
+<tr><td><code>export [-o FILE]</code></td><td>writes all series, or those matching <code>--series PATTERN</code>, in a time range with <code>--from</code> and <code>--to</code>; also while tsdbd runs</td></tr>
+<tr><td><code>query SERIES START END [what] [group]</code></td><td>raw points, or <code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code>, <code>avg</code>, <code>all</code>, <code>range</code>, <code>stddev_pop</code>, <code>stddev_samp</code>, <code>var_pop</code>, <code>var_samp</code> per group</td></tr>
+<tr><td><code>query SERIES START END lttb N</code></td><td>N points that keep the shape of the line, for charts</td></tr>
+<tr><td><code>query SERIES START END twa [group]</code></td><td>time-weighted average; <code>--linear</code> for straight lines between readings, <code>--max-gap INTERVAL</code> for the longest silence that still counts</td></tr>
+<tr><td><code>create SERIES [PATH] [--type T]</code></td><td>creates a series of type float32, float64, int64, bool or state, in volume PATH if given</td></tr>
+<tr><td><code>series</code></td><td>lists the series with their type and volume</td></tr>
+<tr><td><code>volume add PATH</code>, <code>volume list</code></td><td>adds or lists <a href="operations.html#volumes">volumes</a></td></tr>
+<tr><td><code>stats</code></td><td>rows, parts, size and compression ratio</td></tr>
+<tr><td><code>parts</code></td><td>lists the parts (the files the data is in)</td></tr>
+<tr><td><code>optimize</code></td><td>merges every partition into one part</td></tr>
+<tr><td><code>drop-before TIME</code></td><td>drops whole partitions that end before TIME</td></tr>
+<tr><td><code>delete SERIES START END</code></td><td>deletes the series' values in <code>[START, END)</code></td></tr>
+<tr><td><code>retention SERIES [AGE|off]</code></td><td>shows or sets how long the series keeps values, such as <code>30d</code> or <code>12h</code>; <code>off</code> keeps them for ever</td></tr>
+</tbody></table></div>
+
+<h2 id="query-options">Query options</h2>
+<ul>
+<li><code>--desc</code>: newest first.</li>
+<li><code>--limit N</code>: at most N rows or buckets. With <code>--desc</code>, "the last 10 hours" reads about 10
+hours of data.</li>
+<li><code>--tz ZONE</code>: calendar groups in a time zone, such as <code>Europe/Oslo</code>. The default is UTC.</li>
+</ul>
+
+<h2 id="times">Times and groups</h2>
+<ul>
+<li><strong>Times:</strong> <code>1700000000000</code> (milliseconds), <code>2024-01-31</code>,
+<code>"2024-01-31 12:00:00.250"</code>, <code>2024-01-31T12:00:00Z</code>, <code>now</code>, <code>now-1h</code>,
+<code>min</code>, <code>max</code>. A range is <code>[start, end)</code>.</li>
+<li><strong>Fixed groups:</strong> <code>500ms</code>, <code>10s</code>, <code>15m</code>, <code>6h</code>.</li>
+<li><strong>Calendar groups:</strong> <code>1d</code>, <code>1w</code>, <code>1mo</code>, <code>1q</code>,
+<code>1y</code>, in the zone of <code>--tz</code>.</li>
+</ul>
+<p>The output is tab-separated text, as ClickHouse's client prints it, with times in UTC. After the rows it prints how
+many there were, how long the query took and what it read.</p>
+
+<h2 id="example">An example</h2>
+<p>Steps 3 and 4 of the quick start load a day of readings and ask for them in three ways:</p>
+<pre><code class="language-sh" data-src="README.md#L373-L379"># 3. Put it in a database. A database is just a directory; tsdb creates it.
+build/tsdb /tmp/tsdb-qs/db import &lt; /tmp/tsdb-qs/rows.csv
+
+# 4. Ask for it: the first 3 rows, the average of every hour, and a summary of every day in Oslo.
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-02 raw --limit 3
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-02 avg 1h
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-03 all 1d --tz Europe/Oslo</code></pre>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="clients.html"><span>Previous</span>Clients</a><a class="next" href="server.html"><span>Next</span>The server, tsdbd</a></nav></main>
+<footer class="site"><p>tsdb is open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></footer></div>
+</body>
+</html>

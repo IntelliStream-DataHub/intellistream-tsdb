@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Benchmarks</title>
+<meta name="description" content="tsdb docs|tsdb 0.9.0 against ClickHouse, InfluxDB, VictoriaMetrics, QuestDB, TimescaleDB, IoTDB, TDengine, Prometheus, DuckDB and chDB: size, load, queries, memory and failures.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="app-bar">
+<button class="icon-btn menu-btn" type="button" aria-label="Open the menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="30" height="30">tsdb</a>
+<nav aria-label="Main"><a href="../docs/index.html">Docs</a><a href="../docs/benchmarks.html" aria-current="page">Benchmarks</a></nav>
+<a class="icon-btn" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb" aria-label="tsdb on GitHub" title="tsdb on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg></a>
+<button class="icon-btn theme-btn" type="button" aria-label="Switch the theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg></button>
+</header>
+<nav class="drawer" aria-label="Documentation"><h2>Start</h2><ul><li><a href="../docs/index.html">What tsdb is</a></li><li><a href="../docs/install.html">Install and build</a></li><li><a href="../docs/quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="../docs/concepts.html">Concepts</a></li><li><a href="../docs/clients.html">Clients</a></li><li><a href="../docs/cli.html">Command line</a></li><li><a href="../docs/server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="../docs/operations.html">Operations</a></li><li><a href="../docs/benchmarks.html" aria-current="page">Benchmarks</a></li></ul><h2>Elsewhere</h2><ul><li><a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">Source on GitHub</a></li></ul></nav>
+<div class="scrim"></div>
+<div class="doc"><main id="main">
+<h1>Benchmarks</h1>
+<p class="lead">How tsdb 0.9.0 compares with eleven other databases on the same machine and the same data. Every number
+here comes from the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md">published
+0.9.0 results</a>.</p>
+
+<h2 id="how">How it was measured</h2>
+<ul>
+<li>One machine: AMD Ryzen 9 7950X (16 cores, 32 threads), 64 GB RAM, NVMe disk. One system at a time; every server in
+a container with the same hard memory limit of 48 GB (InfluxDB 2: 24 GB, and it used at most 8.3 GB).</li>
+<li>The data: 100 sensors with 1 million readings each, 100 million readings in all, from seven kinds of sensors that
+behave like real ones (temperatures that creep, tanks that fill and drain, a fast vibration sensor, flows with
+shutdowns). The size test adds 23 real sensors from a hydraulic test rig: 31 data sets.</li>
+<li>Every answer was checked against tsdb's before it was timed. Every timing was repeated 5 times; a time is the
+median time of one request. tsdb ran as a server, over TCP.</li>
+<li>We left out the questions tsdb answers from the summaries it stores, such as a count over all the data: they
+measure a lookup, not reading data. Every question below reads the data.</li>
+<li>A system that ran out of memory or refused a request is shown with the reason. That is a result, not a missing
+number.</li>
+</ul>
+
+<h2 id="size">Size on disk</h2>
+<p>The raw data takes 12 bytes per reading (8 for the time, 4 for the value). tsdb stores the 100 million readings in
+114 MB, about a tenth of that.</p>
+<figure class="chart" id="chart-size">
+<figcaption><h3>Size on disk</h3><p>The middle (median) size over 31 data sets, as a multiple of tsdb&#x27;s size. Shorter is better. tsdb is the smallest on all 31.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Median size</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="1">1x</td></tr>
+<tr><th scope="row">QuestDB, Parquet by hand</th><td class="num" data-v="1.2">1.2x</td></tr>
+<tr><th scope="row">IoTDB, CHIMP + ZSTD</th><td class="num" data-v="1.9">1.9x</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="2.1">2.1x</td></tr>
+<tr><th scope="row">TDengine, zstd</th><td class="num" data-v="2.4">2.4x</td></tr>
+<tr><th scope="row">ClickHouse, ZSTD(22)</th><td class="num" data-v="2.6">2.6x</td></tr>
+<tr><th scope="row">ClickHouse, its best codecs</th><td class="num" data-v="2.9">2.9x</td></tr>
+<tr><th scope="row">IoTDB, default</th><td class="num" data-v="3.1">3.1x</td></tr>
+<tr><th scope="row">TDengine, default</th><td class="num" data-v="3.1">3.1x</td></tr>
+<tr><th scope="row">Prometheus</th><td class="num" data-v="3.7">3.7x</td></tr>
+<tr><th scope="row">TimescaleDB, compressed</th><td class="num" data-v="3.9">3.9x</td></tr>
+<tr><th scope="row">DuckDB</th><td class="num" data-v="4.4">4.4x</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="10.3">10.3x</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="20.4">20.4x</td></tr>
+<tr><th scope="row">QuestDB, its default format</th><td class="num" data-v="56">56x</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#size-on-disk">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+
+<h2 id="load">Loading</h2>
+<figure class="chart" id="chart-load">
+<figcaption><h3>Loading 100 million readings</h3><p>Seconds until the last write was answered. tsdb, InfluxDB 2 and TimescaleDB sync every write to disk before they answer; ClickHouse and QuestDB do not. Shorter is better.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Load time</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="1.17">1.17 s</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="2.11">2.11 s</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="3.00">3.00 s</td></tr>
+<tr><th scope="row">QuestDB</th><td class="num" data-v="3.04">3.04 s</td></tr>
+<tr><th scope="row">Prometheus</th><td class="num" data-v="10.6">10.6 s</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="23.7">23.7 s</td></tr>
+<tr><th scope="row">IoTDB</th><td class="num" data-v="23.9">23.9 s</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="27.9">27.9 s</td></tr>
+<tr><th scope="row">TimescaleDB</th><td class="num" data-v="28.6">28.6 s</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="74.7">74.7 s</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#load">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+
+<h2 id="queries">Queries</h2>
+<figure class="chart" id="chart-day">
+<figcaption><h3>One day of one sensor</h3><p>86,400 readings in 288 buckets of 5 minutes, one client. Median time of one request, in milliseconds. Shorter is better.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Median time</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="0.090">0.090 ms</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="2.73">2.73 ms</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="3.09">3.09 ms</td></tr>
+<tr><th scope="row">IoTDB</th><td class="num" data-v="3.33">3.33 ms</td></tr>
+<tr><th scope="row">TimescaleDB</th><td class="num" data-v="4.91">4.91 ms</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="4.95">4.95 ms</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="5.04">5.04 ms</td></tr>
+<tr><th scope="row">QuestDB</th><td class="num" data-v="5.61">5.61 ms</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="13.7">13.7 ms</td></tr>
+<tr><th scope="row">Prometheus</th><td class="num" data-v="15.2">15.2 ms</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#random-windows-one-client">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+<figure class="chart" id="chart-whole">
+<figcaption><h3>The whole history of 100 sensors</h3><p>All 100 million readings in buckets of 3,600 readings, in one request. Median time, in milliseconds. Shorter is better.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Median time</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="8.3">8.3 ms</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="124">124 ms</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="191">191 ms</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="208">208 ms</td></tr>
+<tr><th scope="row">QuestDB</th><td class="num" data-v="266">266 ms</td></tr>
+<tr><th scope="row">IoTDB</th><td class="num" data-v="275">275 ms</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="2357">2,357 ms</td></tr>
+<tr><th scope="row">TimescaleDB</th><td class="num" data-v="3602">3,602 ms</td></tr>
+<tr><th scope="row">Prometheus</th><td class="num" data-v="13743">13,743 ms</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="44602">44,602 ms</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#whole-table-in-one-request">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+<figure class="chart" id="chart-twa">
+<figcaption><h3>Time-weighted averages of everything</h3><p>Hourly time-weighted averages (step) of all 100 sensors, 339,774 buckets, in one request. Median time, in milliseconds. Shorter is better. Grey text: not timed, with the reason.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Median time</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="36.4">36.4 ms</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="1063">1,063 ms</td></tr>
+<tr><th scope="row">QuestDB</th><td class="num" data-v="1336">1,336 ms</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="8488">8,488 ms</td></tr>
+<tr><th scope="row">TimescaleDB</th><td class="num" data-v="22869">22,869 ms</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="43254">43,254 ms</td></tr>
+<tr><th scope="row">IoTDB</th><td class="num" data-v="88214">88,214 ms</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td data-na="not timed: other answers">Not timed: its timeWeightedAvg interpolates only inside each bucket, so a third of its linear buckets differ from tsdb&#x27;s.</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td data-na="not timed: has no such query">Not timed: its query language has no time-weighted average.</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#time-weighted-averages">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+
+<h2 id="pressure">Many clients at once</h2>
+<p>With 32 clients each asking about 100 sensors at once, some systems ran out of memory or refused requests. tsdb
+never used more than 2.2 GB.</p>
+<figure class="chart" id="chart-week100">
+<figcaption><h3>One week of 100 sensors, 32 clients at once</h3><p>Each request asks for a week of 100 sensors in 168 buckets each, while 31 other clients do the same. Median time of one request. A red box is a system that failed, with the reason.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Median time</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="137">137 ms</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="2406">2,406 ms</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="3712">3,712 ms</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="9043">9,043 ms</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="14846">14,846 ms</td></tr>
+<tr><th scope="row">QuestDB</th><td data-fail="refused: over its memory limit">All 5 runs refused: “global RSS memory limit exceeded”, its own limit. At 16 clients it refused again.</td></tr>
+<tr><th scope="row">TimescaleDB</th><td data-fail="ran out of memory (48 GB)">The server was killed by the kernel at the 48 GB limit twice, so the class was stopped. At 16 clients it took 5,771 ms; tsdb 74.3 ms.</td></tr>
+<tr><th scope="row">IoTDB</th><td data-fail="refused by its memory pool">Refused by its own memory pool (code 719: “not enough memory to execute current fragment instance”).</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#batches-of-100-series-at-many-clients">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+<figure class="chart" id="chart-memory">
+<figcaption><h3>Highest memory use</h3><p>The most memory each server used over one pass of every query class, the load included, with the file cache. Every server had a hard limit of 48 GB (InfluxDB 2: 24 GB). Shorter is better.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars" data-limit="48" data-limit-label="48 GB limit">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Peak memory</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="2.0">2.0 GB</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="6.1">6.1 GB</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="8.3">8.3 GB</td></tr>
+<tr><th scope="row">IoTDB</th><td class="num" data-v="18.8">18.8 GB</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="20.2">20.2 GB</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="31.2">31.2 GB</td></tr>
+<tr><th scope="row">QuestDB, Parquet ZSTD</th><td class="num" data-v="41.7">41.7 GB</td></tr>
+<tr><th scope="row">QuestDB</th><td class="num" data-v="48.0">48.0 GB</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="48.0">48.0 GB</td></tr>
+<tr><th scope="row">TimescaleDB</th><td class="num" data-v="48.0">48.0 GB</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#memory">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+
+<h2 id="big">100 billion readings</h2>
+<p>Hours cut through nearly every block of 8192 readings, so both systems read the data; tsdb is 2 to 3 times
+faster.</p>
+<figure class="chart" id="chart-100b">
+<figcaption><h3>100 billion readings: tsdb and ClickHouse</h3><p>10,000 sensors with 10 million readings each, loaded by 8 streams into both. Each pair is scaled to its larger number. Shorter is better.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="groups">
+<thead><tr><th scope="col">Question</th><th scope="col" class="num us">tsdb</th><th scope="col" class="num">ClickHouse</th></tr></thead>
+<tbody>
+<tr><th scope="row">Size on disk</th><td class="num" data-v="137.8">137.8 GB</td><td class="num" data-v="212.1">212.1 GB</td></tr>
+<tr><th scope="row">Insert</th><td class="num" data-v="914">914 s</td><td class="num" data-v="1937">1,937 s</td></tr>
+<tr><th scope="row">Insert until merges settled</th><td class="num" data-v="3259">3,259 s</td><td class="num" data-v="4507">4,507 s</td></tr>
+<tr><th scope="row">One sensor by hour</th><td class="num" data-v="17.2">17.2 ms</td><td class="num" data-v="42">42 ms</td></tr>
+<tr><th scope="row">100 sensors by hour</th><td class="num" data-v="361">361 ms</td><td class="num" data-v="1100">1,100 ms</td></tr>
+<tr><th scope="row">Everything by hour</th><td class="num" data-v="52.4">52.4 s</td><td class="num" data-v="112.9">112.9 s</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#100-billion-rows-tsdb-and-clickhouse">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+
+<h2 id="embedded">Inside your program</h2>
+<p>chDB is ClickHouse as a library. DuckDB got its readings sorted beforehand, which made its job easier (not
+counted).</p>
+<figure class="chart" id="chart-embedded">
+<figcaption><h3>Inside your program: tsdb, chDB and DuckDB</h3><p>The same 100 million readings in one process, through each library&#x27;s C API, one thread per call. Each group is scaled to its largest number. Shorter is better.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="groups">
+<thead><tr><th scope="col">Question</th><th scope="col" class="num us">tsdb</th><th scope="col" class="num">chDB</th><th scope="col" class="num">DuckDB</th></tr></thead>
+<tbody>
+<tr><th scope="row">Load 100 million readings</th><td class="num" data-v="0.70">0.70 s</td><td class="num" data-v="1.60">1.60 s</td><td class="num" data-v="3.65">3.65 s</td></tr>
+<tr><th scope="row">Size on disk</th><td class="num" data-v="114">114 MB</td><td class="num" data-v="219">219 MB</td><td class="num" data-v="306">306 MB</td></tr>
+<tr><th scope="row">One day of one sensor</th><td class="num" data-v="0.050">0.050 ms</td><td class="num" data-v="3.63">3.63 ms</td><td class="num" data-v="3.63">3.63 ms</td></tr>
+<tr><th scope="row">One reading</th><td class="num" data-v="0.010">0.010 ms</td><td class="num" data-v="1.23">1.23 ms</td><td class="num" data-v="0.72">0.72 ms</td></tr>
+<tr><th scope="row">Time-weighted averages of everything</th><td class="num" data-v="38.7">38.7 ms</td><td class="num" data-v="1054">1,054 ms</td><td class="num" data-v="1820">1,820 ms</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#embedded-tsdb-duckdb-and-chdb">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+
+<h2 id="yourself">Measure it yourself</h2>
+<p>Clone the repository and run <code>tools/bench-tsdb.sh --quick</code> first to see that it works. It builds an
+optimized copy, runs tsdb's own benchmarks several times and writes a summary with the mean and spread of every number.
+The comparison with the other databases is in
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/tree/main/bench/dbcmp">bench/dbcmp</a>; every
+single measurement is in
+<a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0-tables.md">0.9.0-tables.md</a>.</p>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="operations.html"><span>Previous</span>Operations</a></nav></main>
+<footer class="site"><p>tsdb is open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></footer></div>
+</body>
+</html>

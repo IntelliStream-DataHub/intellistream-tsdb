@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>tsdb: a fast time series database in C</title>
+<meta name="description" content="tsdb stores sensor readings in about a tenth of their raw size and answers time series questions in fractions of a millisecond. Open source, Apache 2.0.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/site.js"></script>
+</head>
+<body class="home">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="app-bar">
+<button class="icon-btn menu-btn" type="button" aria-label="Open the menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+<a class="brand" href="index.html"><img src="assets/logo.svg" alt="" width="30" height="30">tsdb</a>
+<nav aria-label="Main"><a href="docs/index.html">Docs</a><a href="docs/benchmarks.html">Benchmarks</a></nav>
+<a class="icon-btn" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb" aria-label="tsdb on GitHub" title="tsdb on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg></a>
+<button class="icon-btn theme-btn" type="button" aria-label="Switch the theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg></button>
+</header>
+<nav class="drawer" aria-label="Documentation"><h2>tsdb</h2><ul><li><a href="index.html" aria-current="page">Home</a></li></ul><h2>Start</h2><ul><li><a href="docs/index.html">What tsdb is</a></li><li><a href="docs/install.html">Install and build</a></li><li><a href="docs/quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="docs/concepts.html">Concepts</a></li><li><a href="docs/clients.html">Clients</a></li><li><a href="docs/cli.html">Command line</a></li><li><a href="docs/server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="docs/operations.html">Operations</a></li><li><a href="docs/benchmarks.html">Benchmarks</a></li></ul><h2>Elsewhere</h2><ul><li><a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">Source on GitHub</a></li></ul></nav>
+<div class="scrim"></div>
+<main id="main">
+<section class="hero" aria-labelledby="hero-title">
+<svg class="car" viewBox="0 0 1200 370" role="img" aria-label="A line drawing of a modern open-wheel racing car, seen from the side">
+<g>
+<path class="guide" d="M40 318H1160"/>
+<path class="guide" d="M262 172V332M182 252H342M902 168V332M818 250H986"/>
+<path class="guide" d="M262 352H902M262 344V360M902 344V360"/>
+</g>
+<g>
+<path class="speed" style="--i:0" pathLength="300" d="M1112 150H1196"/>
+<path class="speed" style="--i:1" pathLength="300" d="M1120 196H1190"/>
+<path class="speed" style="--i:2" pathLength="300" d="M1104 232H1184"/>
+<path class="speed" style="--i:3" pathLength="300" d="M1070 302H1180"/>
+<path class="speed" style="--i:4" pathLength="300" d="M760 112H900"/>
+</g>
+<g>
+<circle class="ln" style="--i:0" pathLength="1" cx="262" cy="252" r="66"/>
+<circle class="ln thin" style="--i:1" pathLength="1" cx="262" cy="252" r="44"/>
+<circle class="ln thin" style="--i:2" pathLength="1" cx="262" cy="252" r="9"/>
+<circle class="ln" style="--i:1" pathLength="1" cx="902" cy="250" r="68"/>
+<circle class="ln thin" style="--i:2" pathLength="1" cx="902" cy="250" r="46"/>
+<circle class="ln thin" style="--i:3" pathLength="1" cx="902" cy="250" r="9"/>
+<path class="ln" style="--i:2" pathLength="1" d="M66 306Q130 298 200 302"/>
+<path class="ln" style="--i:3" pathLength="1" d="M80 294Q132 282 192 288"/>
+<path class="ln thin" style="--i:3" pathLength="1" d="M98 282Q142 270 186 274"/>
+<path class="ln" style="--i:4" pathLength="1" d="M72 306L76 262Q80 254 94 254L150 257L156 304Z"/>
+<path class="ln" style="--i:4" pathLength="1" d="M100 270C148 260 244 236 360 214L476 196"/>
+<path class="ln" style="--i:5" pathLength="1" d="M100 270Q90 278 110 283C172 276 262 262 360 248C380 252 392 264 398 288"/>
+<path class="ln thin" style="--i:5" pathLength="1" d="M150 279L156 300M128 281L132 302"/>
+<path class="ln thin" style="--i:6" pathLength="1" d="M262 252L372 222M262 252L382 246M266 246L362 212"/>
+<path class="ln" style="--i:6" pathLength="1" d="M476 196C520 190 560 190 606 192"/>
+<path class="ln" style="--i:7" pathLength="1" d="M480 196C494 176 522 164 560 162C590 161 606 170 612 188"/>
+<path class="ln thin" style="--i:7" pathLength="1" d="M484 195L496 174"/>
+<path class="ln thin" style="--i:8" pathLength="1" d="M548 192C546 172 562 160 578 162C594 164 602 178 600 192M558 177L592 175"/>
+<path class="ln thin" style="--i:8" pathLength="1" d="M516 198L524 183L554 181L555 191Z"/>
+<path class="ln" style="--i:8" pathLength="1" d="M608 192C618 170 626 150 640 136L676 134C690 136 700 146 708 158C760 180 860 194 962 206C990 208 1000 216 1002 228"/>
+<path class="ln thin" style="--i:9" pathLength="1" d="M640 136Q635 150 646 162"/>
+<path class="ln thin" style="--i:9" pathLength="1" d="M702 142L1004 162"/>
+<path class="ln" style="--i:9" pathLength="1" d="M548 214C560 206 590 204 620 206C700 208 780 222 846 250"/>
+<path class="ln" style="--i:10" pathLength="1" d="M548 214C542 226 544 244 552 254C640 262 760 268 830 278"/>
+<path class="ln" style="--i:10" pathLength="1" d="M398 288L836 292M396 298L834 300"/>
+<path class="ln" style="--i:11" pathLength="1" d="M970 298L1010 292C1030 286 1042 276 1050 262"/>
+<path class="ln thin" style="--i:11" pathLength="1" d="M902 250L982 214M902 250L992 234M906 244L976 204"/>
+<path class="ln" style="--i:12" pathLength="1" d="M1006 128L1090 120L1094 248L1032 268L1010 250Z"/>
+<path class="ln" style="--i:12" pathLength="1" d="M1012 152C1040 140 1070 138 1092 142C1066 150 1040 156 1012 156Z"/>
+<path class="ln" style="--i:13" pathLength="1" d="M1030 132C1050 124 1074 122 1092 124C1072 130 1050 134 1030 136Z"/>
+<path class="ln thin" style="--i:13" pathLength="1" d="M1040 154C1030 180 1012 200 984 216M1000 236C1030 230 1060 232 1084 238"/>
+<path class="ln thin" style="--i:14" pathLength="1" d="M1000 222H1010V232H1000Z"/>
+</g>
+</svg>
+<div class="hero-text">
+<h1 id="hero-title">Sensor data, stored small and read fast.</h1>
+<p class="lead">tsdb is a time series database written in C. It keeps sensor readings in about a tenth of their raw
+size, and it answers a question like "the 5-minute averages of this sensor yesterday" in 0.09 milliseconds. Run it as
+a server, or put it inside your own program.</p>
+<div class="actions">
+<a class="btn filled" href="docs/quickstart.html">Start in 5 minutes</a>
+<a class="btn" href="docs/index.html">Read the docs</a>
+<a class="btn" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">Get the code on GitHub</a>
+</div>
+</div>
+</section>
+
+<section class="section" aria-labelledby="why">
+<div class="wrap">
+<h2 id="why">Why tsdb</h2>
+<p class="intro">At IntelliStream we work with industrial data: pumps, tanks, pipelines and machines that report a
+value every second or every minute, for years. tsdb does one job, time series, and does it with less disk, less
+memory and less waiting.</p>
+<div class="facts">
+<div class="card"><h3>Less disk</h3><p>About a tenth of the raw size. Less than half the disk ClickHouse needs for
+the same data (the median over 31 data sets).</p></div>
+<div class="card"><h3>Fast answers</h3><p>One day of one sensor in 288 buckets: 0.090 ms. That is 34 times faster
+than ClickHouse, over TCP, on the same machine.</p></div>
+<div class="card"><h3>Safe writes</h3><p>Data is on disk when a write returns. We test this by killing the server
+and by simulating power loss.</p></div>
+<div class="card"><h3>Small to run</h3><p>One program that works well with its defaults. It never used more than
+2.2 GB of memory in the benchmark, where others hit 48 GB.</p></div>
+</div>
+</div>
+</section>
+
+<section class="section" aria-labelledby="compare">
+<div class="wrap">
+<h2 id="compare">How it compares</h2>
+<p class="intro">We measured tsdb 0.9.0 against ClickHouse, InfluxDB 2 and 3, VictoriaMetrics, QuestDB, TimescaleDB,
+IoTDB, TDengine and Prometheus on one machine (AMD Ryzen 9 7950X, 64 GB RAM, NVMe disk), one at a time, with the same
+data: 100 sensors with 1 million readings each. Every answer was checked against tsdb's before it was timed, and every
+timing was repeated 5 times. tsdb ran as a server, over TCP.</p>
+<div class="charts">
+<figure class="chart" id="chart-size">
+<figcaption><h3>Size on disk</h3><p>The middle (median) size over 31 data sets, as a multiple of tsdb&#x27;s size. Shorter is better. tsdb is the smallest on all 31.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Median size</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="1">1x</td></tr>
+<tr><th scope="row">QuestDB, Parquet by hand</th><td class="num" data-v="1.2">1.2x</td></tr>
+<tr><th scope="row">IoTDB, CHIMP + ZSTD</th><td class="num" data-v="1.9">1.9x</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="2.1">2.1x</td></tr>
+<tr><th scope="row">TDengine, zstd</th><td class="num" data-v="2.4">2.4x</td></tr>
+<tr><th scope="row">ClickHouse, ZSTD(22)</th><td class="num" data-v="2.6">2.6x</td></tr>
+<tr><th scope="row">ClickHouse, its best codecs</th><td class="num" data-v="2.9">2.9x</td></tr>
+<tr><th scope="row">IoTDB, default</th><td class="num" data-v="3.1">3.1x</td></tr>
+<tr><th scope="row">TDengine, default</th><td class="num" data-v="3.1">3.1x</td></tr>
+<tr><th scope="row">Prometheus</th><td class="num" data-v="3.7">3.7x</td></tr>
+<tr><th scope="row">TimescaleDB, compressed</th><td class="num" data-v="3.9">3.9x</td></tr>
+<tr><th scope="row">DuckDB</th><td class="num" data-v="4.4">4.4x</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="10.3">10.3x</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="20.4">20.4x</td></tr>
+<tr><th scope="row">QuestDB, its default format</th><td class="num" data-v="56">56x</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#size-on-disk">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+<figure class="chart" id="chart-day">
+<figcaption><h3>One day of one sensor</h3><p>86,400 readings in 288 buckets of 5 minutes, one client. Median time of one request, in milliseconds. Shorter is better.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Median time</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="0.090">0.090 ms</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="2.73">2.73 ms</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="3.09">3.09 ms</td></tr>
+<tr><th scope="row">IoTDB</th><td class="num" data-v="3.33">3.33 ms</td></tr>
+<tr><th scope="row">TimescaleDB</th><td class="num" data-v="4.91">4.91 ms</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="4.95">4.95 ms</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="5.04">5.04 ms</td></tr>
+<tr><th scope="row">QuestDB</th><td class="num" data-v="5.61">5.61 ms</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="13.7">13.7 ms</td></tr>
+<tr><th scope="row">Prometheus</th><td class="num" data-v="15.2">15.2 ms</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#random-windows-one-client">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+<figure class="chart" id="chart-week100">
+<figcaption><h3>One week of 100 sensors, 32 clients at once</h3><p>Each request asks for a week of 100 sensors in 168 buckets each, while 31 other clients do the same. Median time of one request. A red box is a system that failed, with the reason.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Median time</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="137">137 ms</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="2406">2,406 ms</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="3712">3,712 ms</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="9043">9,043 ms</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="14846">14,846 ms</td></tr>
+<tr><th scope="row">QuestDB</th><td data-fail="refused: over its memory limit">All 5 runs refused: “global RSS memory limit exceeded”, its own limit. At 16 clients it refused again.</td></tr>
+<tr><th scope="row">TimescaleDB</th><td data-fail="ran out of memory (48 GB)">The server was killed by the kernel at the 48 GB limit twice, so the class was stopped. At 16 clients it took 5,771 ms; tsdb 74.3 ms.</td></tr>
+<tr><th scope="row">IoTDB</th><td data-fail="refused by its memory pool">Refused by its own memory pool (code 719: “not enough memory to execute current fragment instance”).</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#batches-of-100-series-at-many-clients">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+<figure class="chart" id="chart-memory">
+<figcaption><h3>Highest memory use</h3><p>The most memory each server used over one pass of every query class, the load included, with the file cache. Every server had a hard limit of 48 GB (InfluxDB 2: 24 GB). Shorter is better.</p></figcaption>
+<div class="chart-svg"></div>
+<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-source="bench/dbcmp/results/0.9.0.md" data-kind="bars" data-limit="48" data-limit-label="48 GB limit">
+<thead><tr><th scope="col">System</th><th scope="col" class="num">Peak memory</th></tr></thead>
+<tbody>
+<tr class="us"><th scope="row">tsdb</th><td class="num" data-v="2.0">2.0 GB</td></tr>
+<tr><th scope="row">VictoriaMetrics</th><td class="num" data-v="6.1">6.1 GB</td></tr>
+<tr><th scope="row">InfluxDB 2</th><td class="num" data-v="8.3">8.3 GB</td></tr>
+<tr><th scope="row">IoTDB</th><td class="num" data-v="18.8">18.8 GB</td></tr>
+<tr><th scope="row">ClickHouse</th><td class="num" data-v="20.2">20.2 GB</td></tr>
+<tr><th scope="row">TDengine</th><td class="num" data-v="31.2">31.2 GB</td></tr>
+<tr><th scope="row">QuestDB, Parquet ZSTD</th><td class="num" data-v="41.7">41.7 GB</td></tr>
+<tr><th scope="row">QuestDB</th><td class="num" data-v="48.0">48.0 GB</td></tr>
+<tr><th scope="row">InfluxDB 3</th><td class="num" data-v="48.0">48.0 GB</td></tr>
+<tr><th scope="row">TimescaleDB</th><td class="num" data-v="48.0">48.0 GB</td></tr>
+</tbody></table></div></details>
+<p class="src">From <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/bench/dbcmp/results/0.9.0.md#memory">the tsdb 0.9.0 benchmark results</a>.</p>
+</figure>
+
+</div>
+<p><a href="docs/benchmarks.html">More charts: loading, whole-history queries, time-weighted averages, 100 billion
+readings and the embedded libraries.</a></p>
+</div>
+</section>
+
+<section class="section" aria-labelledby="features">
+<div class="wrap">
+<h2 id="features">What you can ask it</h2>
+<p class="intro">There is no SQL and there are no tables. You store series, one per sensor, of (time, value) points,
+and you read them back by time range.</p>
+<div class="facts">
+<div class="card"><h3>Raw points</h3><p>Oldest or newest first, with a limit. "The last 10 readings" reads about 10
+readings.</p></div>
+<div class="card"><h3>Summaries per bucket</h3><p>Count, sum, min, max and average every 5 minutes, or per day,
+week, month, quarter and year in your time zone.</p></div>
+<div class="card"><h3>Spread</h3><p>The range, the variance and the standard deviation of each bucket.</p></div>
+<div class="card"><h3>Time-weighted averages</h3><p>For sensors that report only on change: each value counts for
+as long as it held.</p></div>
+<div class="card"><h3>Charts</h3><p>Downsample a year to 1,000 points that keep the shape of the line (LTTB).</p></div>
+<div class="card"><h3>Many sensors at once</h3><p>The last hour of 200 sensors in one request, all read at the same
+instant.</p></div>
+</div>
+<p><a href="docs/concepts.html">Read about the concepts</a></p>
+</div>
+</section>
+
+<section class="section" aria-labelledby="try">
+<div class="wrap">
+<h2 id="try">Try it</h2>
+<p class="intro">Each program writes one reading a minute for a day, then reads it back: the raw readings, the hourly
+averages and the sums per day in Oslo. These are the programs our tests run. Pick your language; the site remembers
+it.</p>
+<div class="tabs">
+<div class="tablist" role="tablist" aria-label="Language">
+<button type="button" role="tab" data-key="c">C</button>
+<button type="button" role="tab" data-key="rust">Rust</button>
+<button type="button" role="tab" data-key="python">Python</button>
+<button type="button" role="tab" data-key="java">Java</button>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="c">
+<pre><code class="language-c" data-src="examples/client.c">/* tsdb as a server: write one day of readings through tsdbd and read them back.
+ *
+ *   build/tsdbd --dir /tmp/tsdb-qs/server --port 17070 &amp;
+ *   build/client-example 127.0.0.1 17070
+ *
+ * The C client does not link the storage engine; it only talks to the server. */
+#include &lt;inttypes.h&gt;
+#include &lt;math.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+#include "tsdb_calendar.h"
+#include "tsdb_client.h"
+
+#define N 1440 /* one reading a minute for a day */
+
+/* Called with blocks of rows. We only count them and remember the first one. */
+struct seen {
+    size_t rows;
+    int64_t first_ts;
+    float first_value;
+};
+
+static int on_rows(void *ctx, const int64_t *ts, const float *values, size_t n)
+{
+    struct seen *s = ctx;
+    if (s-&gt;rows == 0 &amp;&amp; n &gt; 0) {
+        s-&gt;first_ts = ts[0];
+        s-&gt;first_value = values[0];
+    }
+    s-&gt;rows += n;
+    return 0; /* non-zero would stop early */
+}
+
+#define CHECK(call)                                                         \
+    do {                                                                    \
+        int err_ = (call);                                                  \
+        if (err_ &lt; 0) {                                                     \
+            fprintf(stderr, "%s failed: %s\n", #call, tsdbc_strerror(err_)); \
+            rc = 1;                                                         \
+            goto done;                                                      \
+        }                                                                   \
+    } while (0)
+
+int main(int argc, char **argv)
+{
+    const char *host = argc &gt; 1 ? argv[1] : "127.0.0.1";
+    int port = argc &gt; 2 ? atoi(argv[2]) : 7070;
+    const int64_t start = 1717200000000; /* 2024-06-01 00:00:00 UTC, in milliseconds */
+    const int64_t end = start + 86400000;
+
+    int rc = 0;
+    tsdbc *c = NULL;
+    tsdb_bucket *hours = NULL, *days = NULL;
+    CHECK(tsdbc_connect(host, port, &amp;c)); /* on an error, CHECK prints it and jumps to done: below */
+
+    tsdb_sid flow;
+    CHECK(tsdbc_series(c, "pump7.flow", 1, &amp;flow)); /* 1: create the series if it is missing */
+
+    static int64_t times[N];
+    static float values[N];
+    for (int i = 0; i &lt; N; i++) {
+        times[i] = start + (int64_t)i * 60000;
+        values[i] = 50.0f + 10.0f * sinf((float)i / 229.0f);
+    }
+    CHECK(tsdbc_insert_series(c, flow, times, values, N)); /* the server has it on disk when this returns */
+    printf("wrote %d rows\n", N);
+
+    struct seen seen = {0};
+    CHECK(tsdbc_query_raw(c, flow, start, end, on_rows, &amp;seen));
+    printf("read %zu rows, the first: %" PRId64 " %.2f\n", seen.rows, seen.first_ts, seen.first_value);
+
+    size_t nhours;
+    CHECK(tsdbc_query_agg(c, flow, start, end, 3600000, &amp;hours, &amp;nhours)); /* one summary per hour */
+    if (nhours &gt; 0) /* an empty time range gives no buckets */
+        printf("%zu hours, the first average: %.2f\n", nhours, tsdb_bucket_avg(&amp;hours[0]));
+
+    size_t ndays;
+    tsdb_group day = {TSDB_DAY, 1, "Europe/Oslo"};
+    CHECK(tsdbc_query_group(c, flow, start, end, &amp;day, NULL, &amp;days, &amp;ndays)); /* one summary per Oslo day */
+    for (size_t i = 0; i &lt; ndays; i++)
+        printf("Oslo day %zu: %" PRIu64 " rows, average %.2f\n", i + 1, days[i].count, tsdb_bucket_avg(&amp;days[i]));
+
+done:
+    free(hours);
+    free(days);
+    if (c)
+        tsdbc_close(c);
+    return rc;
+}</code></pre>
+<p class="code-source">examples/client.c. Build it with <code>make</code>; run it with
+<code>build/client-example 127.0.0.1 7070</code>.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="rust">
+<pre><code class="language-rust" data-src="client/rust/examples/quickstart.rs">use tsdb_client::{Client, Group, QueryOpts, Unit};
+
+fn main() -&gt; Result&lt;(), tsdb_client::Error&gt; {
+    // Connect to tsdbd. The address is the first argument, if there is one.
+    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let mut client = Client::connect(addr.as_str())?;
+
+    // Get the id of a series (it is created the first time).
+    let id = client.series("pump7.flow")?;
+
+    // Insert one value per minute for a day. Times are ms since 1970-01-01 UTC.
+    let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC
+    let ts: Vec&lt;i64&gt; = (0..1440).map(|i| t0 + i * 60_000).collect();
+    let values: Vec&lt;f32&gt; = (0..1440).map(|i| (i % 60) as f32).collect();
+    client.insert_series(id, &amp;ts, &amp;values)?;
+
+    // Read the newest three values.
+    for (t, v) in client.query_points(id, .., QueryOpts::desc().limit(3))?.iter() {
+        println!("raw  {t} {v}");
+    }
+
+    // Count, average, min and max per hour, for the first six hours.
+    for b in client.query_agg(id, t0..t0 + 6 * 3_600_000, 3_600_000)? {
+        println!("hour {} count {} avg {:.2} min {} max {}", b.start, b.count, b.avg(), b.min, b.max);
+    }
+
+    // Sum per day, where days begin at midnight in Oslo.
+    let days = Group::new(Unit::Day).timezone("Europe/Oslo");
+    for b in client.query_group(id, .., Some(&amp;days), QueryOpts::asc())? {
+        println!("day  {} count {} sum {}", b.start, b.count, b.sum);
+    }
+
+    client.close()
+}</code></pre>
+<p class="code-source">client/rust/examples/quickstart.rs. Run it with <code>cargo run --example quickstart</code>
+in client/rust.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="python">
+<pre><code class="language-python" data-src="client/python/README.md#Quick start">from tsdb_client import Client
+
+with Client("127.0.0.1", port=7070) as client:  # the connection closes at the end of the block
+    # Get the id of a series (it is created the first time).
+    series = client.series("pump7.flow")
+
+    # Insert one value per minute for a day. Times are ms since 1970-01-01 UTC.
+    t0 = 1_699_999_200_000  # 2023-11-14 22:00 UTC
+    ts = [t0 + i * 60_000 for i in range(1440)]
+    values = [float(i % 60) for i in range(1440)]
+    client.insert_series(series, ts, values)
+
+    # Read the newest three values.
+    newest_ts, newest_values = client.query_raw(series, order="desc", limit=3)
+    for t, v in zip(newest_ts, newest_values):
+        print("raw ", int(t), float(v))
+
+    # Count, average, min and max per hour, for the first six hours.
+    for b in client.query_agg(series, t0, t0 + 6 * 3_600_000, interval_ms=3_600_000):
+        print("hour", b.start, b.count, round(b.avg, 2), b.min, b.max)
+
+    # Sum per day, where days begin at midnight in Oslo.
+    for b in client.query_group(series, unit="day", timezone="Europe/Oslo"):
+        print("day ", b.start, b.count, b.sum)</code></pre>
+<p class="code-source">The quick start of client/python/README.md.</p>
+</div>
+<div class="tabpanel" role="tabpanel" data-key="java">
+<pre><code class="language-java" data-src="client/java/src/main/java/ai/intellistream/tsdb/example/Example.java">package ai.intellistream.tsdb.example;
+
+import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.Group;
+import ai.intellistream.tsdb.Order;
+import ai.intellistream.tsdb.Points;
+import ai.intellistream.tsdb.TsdbClient;
+import ai.intellistream.tsdb.Unit;
+
+import java.time.Instant;
+
+/** Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port]}. */
+public final class Example {
+    private Example() {
+    }
+
+    /**
+     * Runs the example.
+     *
+     * @param args the host and port of a running tsdbd; default 127.0.0.1 7070
+     * @throws Exception if the server cannot be reached or a request fails
+     */
+    public static void main(String[] args) throws Exception {
+        String host = args.length &gt; 0 ? args[0] : "127.0.0.1";
+        int port = args.length &gt; 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
+
+        try (TsdbClient client = TsdbClient.connect(host, port)) {
+            long pump = client.series("pump7.flow_m3h"); // get or create
+
+            // One reading per minute for a day, from 2024-03-01T00:00Z, as a single batch.
+            long t0 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
+            int n = 24 * 60;
+            long[] ts = new long[n];
+            float[] values = new float[n];
+            for (int i = 0; i &lt; n; i++) {
+                ts[i] = t0 + i * 60_000L;
+                values[i] = 40 + (i % 60) / 10f;
+            }
+            client.insert(pump, ts, values);
+
+            // Raw points: the three newest.
+            Points newest = client.queryPoints(pump, Long.MIN_VALUE, Long.MAX_VALUE, Order.DESC, 3);
+            for (int i = 0; i &lt; newest.size(); i++)
+                System.out.printf("%s %.1f%n", Instant.ofEpochMilli(newest.timestamp(i)), newest.value(i));
+
+            // Aggregates over fixed 6-hour intervals.
+            for (Bucket b : client.queryAgg(pump, t0, t0 + 86_400_000L, 6 * 3_600_000L))
+                System.out.printf("%s count %d avg %.2f min %.1f max %.1f%n", Instant.ofEpochMilli(b.start()),
+                        b.count(), b.avg(), b.min(), b.max());
+
+            // Calendar days in Oslo (UTC+1 in March): the UTC day spans two local days.
+            Group osloDays = Group.of(Unit.DAY).in("Europe/Oslo");
+            for (Bucket b : client.queryGroup(pump, Long.MIN_VALUE, Long.MAX_VALUE, osloDays))
+                System.out.printf("Oslo day from %s: %d points%n", Instant.ofEpochMilli(b.start()), b.count());
+        }
+    }
+}</code></pre>
+<p class="code-source">client/java/src/main/java/ai/intellistream/tsdb/example/Example.java.</p>
+</div>
+</div>
+<ol class="steps">
+<li>Install a C compiler, make, libzstd and liburing. <a href="docs/install.html">Install and build</a> lists the
+packages.</li>
+<li>Run <code>make</code> in the checkout. Everything lands in <code>build/</code>.</li>
+<li>Start the server with <code>build/tsdbd --dir /tmp/tsdb-demo</code>. It listens on 127.0.0.1, port 7070.</li>
+<li>Run one of the programs above. <a href="docs/clients.html">The clients page</a> explains each step.</li>
+</ol>
+</div>
+</section>
+
+</main>
+<footer class="site"><p>tsdb is open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></footer>
+</body>
+</html>

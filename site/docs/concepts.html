@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Concepts</title>
+<meta name="description" content="tsdb docs|Series, value types, buckets, calendar groups and time zones, spread, time-weighted averages, LTTB, deletes, replace, retention and many-series requests.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="app-bar">
+<button class="icon-btn menu-btn" type="button" aria-label="Open the menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="30" height="30">tsdb</a>
+<nav aria-label="Main"><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a></nav>
+<a class="icon-btn" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb" aria-label="tsdb on GitHub" title="tsdb on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg></a>
+<button class="icon-btn theme-btn" type="button" aria-label="Switch the theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg></button>
+</header>
+<nav class="drawer" aria-label="Documentation"><h2>Start</h2><ul><li><a href="../docs/index.html">What tsdb is</a></li><li><a href="../docs/install.html">Install and build</a></li><li><a href="../docs/quickstart.html">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="../docs/concepts.html" aria-current="page">Concepts</a></li><li><a href="../docs/clients.html">Clients</a></li><li><a href="../docs/cli.html">Command line</a></li><li><a href="../docs/server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="../docs/operations.html">Operations</a></li><li><a href="../docs/benchmarks.html">Benchmarks</a></li></ul><h2>Elsewhere</h2><ul><li><a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">Source on GitHub</a></li></ul></nav>
+<div class="scrim"></div>
+<div class="doc"><main id="main">
+<h1>Concepts</h1>
+<p class="lead">A few ideas carry all of tsdb. Each section below is short, and the <a href="clients.html">clients</a>
+page shows them in code.</p>
+
+<h2 id="series">Series and points</h2>
+<p>A <strong>series</strong> is one sensor: a name such as <code>pump7.flow</code> and a list of
+<strong>points</strong>. A point is a time and a value. Times are milliseconds since 1970-01-01 UTC.</p>
+<p>You get a series by its name, and tsdb gives you its id: a 64-bit number. Keep the id in a 64-bit integer and look it
+up by name; never count ids yourself. The first time you ask for a name, the series is created.</p>
+<p><strong>Last write wins.</strong> Writing a value for a time that already exists replaces it. You never get duplicates
+back. A range of time is always written <code>[start, end)</code>: the start is in it, the end is not.</p>
+
+<h2 id="types">Value types</h2>
+<p>A series gets its type when you create it, and keeps it. Series created without a type are float32. Any value may
+be missing (null); summaries skip nulls.</p>
+<div class="table-wrap"><table>
+<thead><tr><th scope="col">Your values</th><th scope="col">Type</th><th scope="col">Why</th></tr></thead>
+<tbody>
+<tr><td>most sensors: temperatures, pressures, flows, levels</td><td><strong>float32</strong> (the default)</td><td>smallest and fastest; about 7 significant digits, more than a sensor delivers</td></tr>
+<tr><td>values that need more than 7 significant digits: a totalizer at 12,345,678.9 m³, energy counters</td><td><strong>float64</strong></td><td>about 15 significant digits</td></tr>
+<tr><td>counters and amounts in a fixed unit: liters, Wh, events</td><td><strong>int64</strong></td><td>exact, sums included</td></tr>
+<tr><td>on/off, open/closed</td><td><strong>bool</strong></td><td></td></tr>
+<tr><td>modes and status: "running", "stopped", "fault"</td><td><strong>state</strong></td><td>stored as small codes, with the names kept once</td></tr>
+</tbody></table></div>
+<p>Store a value in the type it comes in. A float32 reading stored as float64 does not get more precise: 35.1 becomes
+35.0999999…, which takes up to 2.6 times the space and is slower to read.</p>
+<p>Sums of int64 values are exact. Sums of float values can differ in the last digits from one run to the next, because
+the order of the additions changes. If exact sums matter, store the value as an int64 in fixed point: 21.3 °C as 21300
+milli-degrees.</p>
+
+<h2 id="raw">Raw points</h2>
+<p>Ask for the points of a time range, oldest first or newest first, with a limit if you like. A limit stops early:
+"the newest 10 points" of a year of data reads about 10 points.</p>
+
+<h2 id="buckets">Buckets</h2>
+<p>A <strong>bucket</strong> is a summary of the points in one piece of time: count, sum, min, max and average. You
+choose how long the pieces are.</p>
+<ul>
+<li><strong>Fixed buckets</strong> have one length, such as 5 minutes or 1 hour, counted from 1970. "The average of
+every hour" is a fixed bucket of 3,600,000 ms.</li>
+<li><strong>Calendar groups</strong> follow the calendar: day, week (from Monday), month, quarter and year, or several of
+them (2 weeks). Days, months and years have different lengths, so these are not fixed.</li>
+</ul>
+<p>A limit works on buckets too: "the last 10 hours" of a year of data reads about 10 hours of it.</p>
+<p>tsdb keeps a summary (count, sum, min, max) of every block of up to 8192 points. A bucket that covers whole blocks is
+answered from those summaries without reading the points. That is why a count over all the data is almost free, and why
+buckets smaller than a block cost more.</p>
+
+<h2 id="time-zones">Time zones</h2>
+<p>The database and the server know only UTC. A day in Oslo begins at 22:00 or 23:00 UTC the day before, depending on
+summer time. So the clients turn your local periods into UTC times for you: you ask for "days in Europe/Oslo", the
+client computes where each Oslo day starts and ends, and the server sums between those times. The CLI does the same
+with <code>--tz Europe/Oslo</code>. Embedded C programs use <code>tsdb_query_group_local</code> from
+<code>tsdb_calendar.h</code>.</p>
+
+<h2 id="spread">Spread</h2>
+<p>Besides count, sum, min, max and average, a bucket can tell how much the values spread: the range (max − min), and
+the variance and standard deviation, both for the whole population and as a sample. They stay exact for a sensor with
+a large offset and a small spread (air pressure: 101325 Pa, ± 5), and are exact for int64 values. The spread costs a
+second pass over the values, so you ask for it with its own call.</p>
+
+<h2 id="twa">Time-weighted averages (TWA)</h2>
+<p>A plain average counts every reading once. That is wrong for a sensor that reports irregularly, or only when its
+value changes: a value that held for an hour should count more than one that held for a second. A
+<strong>time-weighted average</strong> weighs each value by how long it held.</p>
+<ul>
+<li><strong>Step</strong> (the default): each value holds until the next reading.</li>
+<li><strong>Linear</strong>: the value runs on a straight line from one reading to the next.</li>
+<li><strong>Max gap</strong>: a silence longer than this counts as unknown, not as the old value. Without it there is no
+limit.</li>
+</ul>
+<p>The value in force at the start of a bucket comes from the last reading before it, however long ago (within the max
+gap). The last reading of a series holds until a later reading arrives, never up to "now". Each bucket also says how
+much time it covered. For a bool series, the average is the share of the covered time that it was true. Wide buckets,
+such as days of minute readings, come mostly from stored summaries.</p>
+
+<h2 id="lttb">Downsampling for charts (LTTB)</h2>
+<p>A chart 1,000 pixels wide does not need a million points. LTTB (largest triangle three buckets) picks at most the
+number of points you ask for, so that the line keeps its shape: the peaks and dips stay. Every point it returns is a
+real stored point.</p>
+
+<h2 id="delete">Deletes</h2>
+<p>You can delete the values of one series in a time range <code>[start, end)</code>. Queries stop seeing them at once;
+the disk space comes back later, when background merges rewrite the data.</p>
+
+<h2 id="replace">Replace</h2>
+<p>Replace deletes a range of one series and writes new points in its place, in one step. A reader sees the old values
+or the new ones, never a mix, and so does a crash. Use it to correct a range of bad readings.</p>
+
+<h2 id="retention">Retention</h2>
+<p>Give a series a retention period, such as 30 days, and values older than that disappear on their own. Queries stop
+returning them at once; merges remove them from disk in the background. The limit is safe on disk when the call returns.
+Without one, a series keeps its values for ever.</p>
+
+<h2 id="multi">Many series in one request</h2>
+<p>You can ask about many series at once: the last hour of 200 sensors, or a day of every pump by hour. The server works
+on the series in parallel and sends the answers back in the order you asked. All series are read at the same instant,
+so a write to several series shows up in all of them or in none. Each series succeeds or fails on its own: an unknown
+series does not spoil the others.</p>
+
+<h2 id="durability">Safe writes</h2>
+<p>In the default mode, a write returns only when it is on disk. Writers that arrive at the same time share one sync
+(group commit). The server can instead sync every few milliseconds (<code>--wal-sync-ms</code>), which bounds what a
+power failure can lose to the last few milliseconds of answered writes. We test this by killing the server and by
+simulating power loss.</p>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="quickstart.html"><span>Previous</span>Quick start</a><a class="next" href="clients.html"><span>Next</span>Clients</a></nav></main>
+<footer class="site"><p>tsdb is open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></footer></div>
+</body>
+</html>

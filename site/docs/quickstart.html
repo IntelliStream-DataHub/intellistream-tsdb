@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Quick start</title>
+<meta name="description" content="tsdb docs|Build tsdb, store a day of sensor readings, query them, and run the server and a client: five minutes on one machine.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/site.css">
+<script src="../assets/site.js"></script>
+</head>
+<body class="docs">
+<a class="skip" href="#main">Skip to the content</a>
+<header class="app-bar">
+<button class="icon-btn menu-btn" type="button" aria-label="Open the menu" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+<a class="brand" href="../index.html"><img src="../assets/logo.svg" alt="" width="30" height="30">tsdb</a>
+<nav aria-label="Main"><a href="../docs/index.html" aria-current="page">Docs</a><a href="../docs/benchmarks.html">Benchmarks</a></nav>
+<a class="icon-btn" href="https://github.com/IntelliStream-DataHub/intellistream-tsdb" aria-label="tsdb on GitHub" title="tsdb on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 19c-4 1.3-4-2-6-2.5M15 21v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1-.3-3.4 1.3a11.6 11.6 0 0 0-6.2 0C6.6 2.8 5.6 3.1 5.6 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4.2 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg></a>
+<button class="icon-btn theme-btn" type="button" aria-label="Switch the theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg></button>
+</header>
+<nav class="drawer" aria-label="Documentation"><h2>Start</h2><ul><li><a href="../docs/index.html">What tsdb is</a></li><li><a href="../docs/install.html">Install and build</a></li><li><a href="../docs/quickstart.html" aria-current="page">Quick start</a></li></ul><h2>Use</h2><ul><li><a href="../docs/concepts.html">Concepts</a></li><li><a href="../docs/clients.html">Clients</a></li><li><a href="../docs/cli.html">Command line</a></li><li><a href="../docs/server.html">The server, tsdbd</a></li></ul><h2>Run</h2><ul><li><a href="../docs/operations.html">Operations</a></li><li><a href="../docs/benchmarks.html">Benchmarks</a></li></ul><h2>Elsewhere</h2><ul><li><a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">Source on GitHub</a></li></ul></nav>
+<div class="scrim"></div>
+<div class="doc"><main id="main">
+<h1>Quick start</h1>
+<p class="lead">Five minutes, one machine. You build tsdb, store a day of readings from one sensor, ask for them, and
+then do the same through the server.</p>
+<p>This works from a fresh checkout. It only writes under <code>/tmp/tsdb-qs</code> and needs no root. Besides the
+<a href="install.html#packages">build requirements</a>, it needs only <code>make</code>, <code>awk</code> and a shell.
+Paste the whole block into a terminal, in the top directory of the checkout:</p>
+<pre><code class="language-sh" data-src="README.md#Quick start (5 minutes"># 1. Build. Everything lands in build/.
+make
+
+# 2. One day of sample data: one reading a minute from the sensor "pump7.flow".
+#    A line is: series name, time in milliseconds since 1970, value.
+#    LC_ALL=C makes awk write 50.04, not 50,04, whatever language your system speaks.
+rm -rf /tmp/tsdb-qs &amp;&amp; mkdir -p /tmp/tsdb-qs
+LC_ALL=C awk 'BEGIN { for (i = 0; i &lt; 1440; i++) printf "pump7.flow,%d000,%.2f\n", 1717200000 + i * 60, 50 + 10 * sin(i / 229) }' &gt; /tmp/tsdb-qs/rows.csv
+
+# 3. Put it in a database. A database is just a directory; tsdb creates it.
+build/tsdb /tmp/tsdb-qs/db import &lt; /tmp/tsdb-qs/rows.csv
+
+# 4. Ask for it: the first 3 rows, the average of every hour, and a summary of every day in Oslo.
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-02 raw --limit 3
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-02 avg 1h
+build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-03 all 1d --tz Europe/Oslo
+
+# 5. The same from a C program, with no server: it writes a day and reads it back.
+build/embedded-example /tmp/tsdb-qs/lib
+
+# 6. Start the server in the background. It saves its process id, so we can stop exactly this one.
+build/tsdbd --dir /tmp/tsdb-qs/server --port 17070 &gt; /tmp/tsdb-qs/tsdbd.log 2&gt;&amp;1 &amp;
+echo $! &gt; /tmp/tsdb-qs/tsdbd.pid
+for i in $(seq 100); do grep -q serving /tmp/tsdb-qs/tsdbd.log &amp;&amp; break; sleep 0.1; done
+
+# 7. A client writes a day to the server and reads it back over the network.
+build/client-example 127.0.0.1 17070
+
+# 8. Stop the server, wait until it has gone (it finishes its writes first), then look at what it stored.
+kill $(cat /tmp/tsdb-qs/tsdbd.pid)
+while kill -0 $(cat /tmp/tsdb-qs/tsdbd.pid) 2&gt;/dev/null; do sleep 0.1; done
+build/tsdb /tmp/tsdb-qs/server stats</code></pre>
+<p>Our tests run this block word for word, so it works as written.</p>
+
+<h2 id="output">What you should see</h2>
+<p>Steps 3 and 4 print this (shortened; your timings differ):</p>
+<pre><code data-lang="plain" data-src="README.md#Quick start (5 minutes">inserted 1440 rows in 0.00 s (563951 rows/s)
+
+2024-06-01 00:00:00.000    50
+2024-06-01 00:01:00.000    50.0400009
+2024-06-01 00:02:00.000    50.0900002
+3 rows in set. Elapsed: 0.000052 sec. ...
+
+2024-06-01 00:00:00.000    51.2811666
+2024-06-01 01:00:00.000    53.799
+...                                        (24 lines, one per hour)
+24 buckets in set. Elapsed: 0.000065 sec. ...
+
+time                       count   sum                  min                 max                 avg         range               stddev_pop  stddev_samp
+2024-05-31 22:00:00.000    1320    66304.249984741211   40                  60                  50.2304924  20                  7.32618041  7.32895705
+2024-06-01 22:00:00.000    120     5696.0299949645996   45.040000915527344  50.009998321533203  47.4669166  4.9699974060058594  1.45185671  1.45794418
+2 buckets in set. Elapsed: 0.000028 sec. ...</code></pre>
+<p>The times are in UTC. Oslo is two hours ahead in summer, so midnight in Oslo is 22:00 UTC the evening before. The
+day of data lies in two Oslo days, so you get two lines.</p>
+<p>Steps 5 and 7 print the same lines, one from the library and one from the server:</p>
+<pre><code data-lang="plain" data-block="2" data-src="README.md#Quick start (5 minutes">wrote 1440 rows
+read 1440 rows, the first: 1717200000000 50.00
+24 hours, the first average: 51.28
+Oslo day 1: 1320 rows, average 50.23
+Oslo day 2: 120 rows, average 47.47</code></pre>
+<p>Step 6 writes a line like this to <code>/tmp/tsdb-qs/tsdbd.log</code>:</p>
+<pre><code data-lang="plain" data-block="3" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, simd avx512, io io_uring</code></pre>
+<p>Step 8 prints a table with <code>rows 1440</code>: what the client wrote is on disk in the server's directory.</p>
+
+<h2 id="trouble">If something goes wrong</h2>
+<ul>
+<li>If the server cannot start because the port is taken (the log then says "cannot listen"), something else uses
+17070. Pick another number in steps 6 and 7.</li>
+<li>If the server is still running after a mistake, stop it with <code>kill $(cat /tmp/tsdb-qs/tsdbd.pid)</code>.
+Do not use <code>pkill</code> or <code>killall</code>: they stop every process with that name, also ones that are not
+yours.</li>
+<li>When you are done, <code>rm -rf /tmp/tsdb-qs</code>.</li>
+</ul>
+
+<h2 id="next">Next</h2>
+<p>The two C programs of steps 5 and 7 are short and worth reading: <a href="clients.html">Clients</a> shows them, and
+the same programs in Rust, Python and Java.</p>
+
+<nav class="pager" aria-label="Previous and next page"><a class="prev" href="install.html"><span>Previous</span>Install and build</a><a class="next" href="concepts.html"><span>Next</span>Concepts</a></nav></main>
+<footer class="site"><p>tsdb is open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></footer></div>
+</body>
+</html>
