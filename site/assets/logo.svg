@@ -1,6 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
   <title>tsdb</title>
-  <rect width="32" height="32" rx="8" fill="#1d5fa8"/>
-  <path d="M6 9v17h20" fill="none" stroke="#d5e3ff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M9 20l4-5 4 3 4-7 3 2" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <defs>
+    <linearGradient id="g" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#36e2ff"/>
+      <stop offset="0.55" stop-color="#8f80ff"/>
+      <stop offset="1" stop-color="#ff5ad9"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0b1022"/>
+  <!-- an open-wheel racing car from the side, nose to the left: wing, body, cockpit, rear wing, two big wheels -->
+  <path d="M3 41 L5 35 L11 35 L12 38 L24 33 L30 26 L37 26 L40 31 L51 31 L51 20 L61 18 L61 40 L56 43 L8 44 Z"
+        fill="url(#g)"/>
+  <circle cx="17" cy="43" r="9" fill="#e9ecff"/>
+  <circle cx="17" cy="43" r="3.5" fill="#0b1022"/>
+  <circle cx="48" cy="43" r="10" fill="#e9ecff"/>
+  <circle cx="48" cy="43" r="4" fill="#0b1022"/>
 </svg>
