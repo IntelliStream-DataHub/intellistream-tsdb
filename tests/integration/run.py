@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """End-to-end tests of tsdb: real tsdbd processes, real clients in four languages, and the tsdb CLI.
 
-  run.py [--only matrix,cli,follower,durability,stale_wal] [--io uring,epoll] [--scale 1.0] [--seed N]
-         [--logs DIR] [--keep] [--bin-dir DIR] [--itc PATH]
+  run.py [--only matrix,cli,follower,durability,stale_wal] [--io uring,epoll] [--auth off,on] [--scale 1.0]
+         [--seed N] [--logs DIR] [--keep] [--bin-dir DIR] [--itc PATH]
 
 Scenarios (each runs once per server backend, --io uring and --io epoll; on a host without io_uring only epoll):
 
@@ -24,6 +24,15 @@ Scenarios (each runs once per server backend, --io uring and --io epoll; on a ho
               killed with SIGKILL in the middle of pass 1 or pass 2; after the restart every acknowledged batch is
               there, nothing older came back, no batch is half there; again after optimize and after a clean
               restart. Each series is also read descending, whole and with a limit across the 65536-row window.
+
+Login (--auth, default off,on): matrix and cli run once with tsdbd --no-auth and once more (matrix+auth, cli+auth)
+with login. Then the CLI makes the superuser offline before tsdbd starts, and every client logs in (the programs
+take the user and password file from ITG_USER and ITG_PASSWORD_FILE). In matrix+auth the CLI, logged in through the
+server as the superuser, adds a user per client with read and insert on its own set (prefix:LANG.) and one that
+reads every set's float64 series (glob:*.f64); each client writes its set as its own user, the superuser reads and
+administers as before, and at the end every client reads one query of each kind on every series as its own user and
+as the glob user: what the user may read must answer as the superuser's read did, and every other query must be
+refused. A cross-tenant answer fails the run.
 
 Why Python and not bash: the scenarios need binary-safe comparison, threads (four clients and a server at once,
 a trigger that fires on the clients' acknowledgements), a model of the expected answers and zoneinfo as an
@@ -168,7 +177,7 @@ class Server:
     def start(self):
         pf = Path(str(self.log) + ".port.%d" % time.monotonic_ns())
         cmd = [str(self.ctx.tsdbd), "--dir", str(self.dir), "--listen", "127.0.0.1", "--port", "0",
-               "--port-file", str(pf), "--workers", "4", "--io", self.io, "--no-auth"] + \
+               "--port-file", str(pf), "--workers", "4", "--io", self.io] + ([] if self.ctx.auth else ["--no-auth"]) + \
               (["--follow", "--refresh-ms", "100"] if self.follow else []) + self.extra
         logf = open(self.log, "ab")
         logf.write(("$ " + " ".join(cmd) + "\n").encode())
@@ -240,6 +249,8 @@ class Ctx:
         self.logroot = Path(args.logs)
         self.work = Path(tempfile.mkdtemp(prefix="tsdb-integ-", dir=args.work))
         self.results = []
+        self.auth = False  # this scenario run's --auth: tsdbd requires a login
+        self.login = None  # (user, password file) the clients log in as by default: the superuser under --auth on
 
     def missing(self):
         need = [self.tsdbd, self.tsdb, self.itc, Path(self.cmd["rust"][0]), Path(self.cmd["python"][0]),
@@ -247,13 +258,19 @@ class Ctx:
         return [str(p) for p in need if not p.exists()]
 
 
-def run_client(ctx, lang, args, out, timeout=None):
-    """Runs one client program; stdout to the file out (stderr next to it). Returns (rc, seconds)."""
+def run_client(ctx, lang, args, out, timeout=None, login=None):
+    """Runs one client program; stdout to the file out (stderr next to it). Returns (rc, seconds).
+    login: (user, password file) to log in as, else ctx.login (the superuser under --auth on, else none). The
+    programs take it from ITG_USER and ITG_PASSWORD_FILE and then require the server to ask for it."""
     out = Path(out)
     timeout = timeout or ctx.args.timeout
+    login = login or ctx.login
+    env = {k: v for k, v in os.environ.items() if k not in ("ITG_USER", "ITG_PASSWORD_FILE")}
+    if login:
+        env.update(ITG_USER=login[0], ITG_PASSWORD_FILE=str(login[1]))
     t0 = time.time()
     with open(out, "wb") as so, open(str(out) + ".err", "wb") as se:
-        p = spawn(ctx.cmd[lang] + [str(a) for a in args], stdin=subprocess.DEVNULL, stdout=so, stderr=se)
+        p = spawn(ctx.cmd[lang] + [str(a) for a in args], stdin=subprocess.DEVNULL, stdout=so, stderr=se, env=env)
         try:
             rc = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -264,9 +281,10 @@ def run_client(ctx, lang, args, out, timeout=None):
 
 
 def run_all(ctx, jobs, timeout=None):
-    """jobs: {key: (lang, args, outfile)} run concurrently. Returns {key: (rc, secs)}."""
+    """jobs: {key: (lang, args, outfile[, login])} run concurrently. Returns {key: (rc, secs)}."""
     with concurrent.futures.ThreadPoolExecutor(len(jobs)) as ex:
-        futs = {k: ex.submit(run_client, ctx, lang, args, out, timeout) for k, (lang, args, out) in jobs.items()}
+        futs = {k: ex.submit(run_client, ctx, j[0], j[1], j[2], timeout, j[3] if len(j) > 3 else None)
+                for k, j in jobs.items()}
         return {k: f.result() for k, f in futs.items()}
 
 
@@ -395,9 +413,11 @@ def gen_scripts(ctx, model, d, wave, seedoff=0):
     return paths
 
 
-def write_phase(ctx, F, d, tag, port, scripts):
+def write_phase(ctx, F, d, tag, port, scripts, logins=None):
+    """logins: {lang: (user, password file)}, each client writing as its own user (--auth on)."""
     t0 = time.time()
-    jobs = {l: (l, ["write", port, p], d / ("write-%s-%s.out" % (tag, l))) for l, p in scripts.items()}
+    jobs = {l: (l, ["write", port, p], d / ("write-%s-%s.out" % (tag, l)), (logins or {}).get(l))
+            for l, p in scripts.items()}
     res = run_all(ctx, jobs)
     ok = True
     for l, (rc, secs) in res.items():
@@ -414,6 +434,111 @@ def admin(ctx, F, d, port, what):
     if rc != 0:
         F.add("admin %s failed (%s): %s" % (what, rc, err_tail(d / ("admin-%s.out" % what))))
     return rc == 0
+
+
+# ---------------------------------------------------------------- login (--auth on)
+
+TENANT_RIGHTS = "read,insert"  # what each client's own user has on its own set, prefix:LANG.
+GLOB_USER, GLOB_SEL, GLOB_SUFFIX = "f64reader", "glob:*.f64", ".f64"  # reads one type of every set, by a glob
+
+
+def pwfile(d, user):
+    """A password file holding a fresh random password, readable by this user only."""
+    p = d / ("%s.pw" % user)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(os.urandom(12).hex() + "\n")
+    return p
+
+
+def cli_user(ctx, F, d, args, port=None):
+    """`tsdb DIR user ...` offline (args then start with the directory), or `tsdb user ...` through the server at
+    port, logged in as the superuser."""
+    cmd = [str(ctx.tsdb)] + [str(a) for a in args]
+    if port:
+        cmd += ["--server", "127.0.0.1:%d" % port, "--login", ctx.login[0], "--login-password-file", str(ctx.login[1])]
+    p = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+    with open(d / "cli-user.log", "ab") as f:
+        f.write(("$ %s\n" % " ".join(cmd[1:])).encode() + p.stdout + p.stderr)
+    if p.returncode:
+        F.add("tsdb %s failed (%d): %s" % (" ".join(cmd[1:]), p.returncode, p.stderr.decode(errors="replace")[-300:]))
+    return p.returncode == 0
+
+
+def make_root(ctx, F, db, d):
+    """--auth on: the superuser `root`, made by the CLI offline before tsdbd starts (tsdbd refuses to start without
+    one), as an operator does; the clients log in as it unless a phase names another user."""
+    if not ctx.auth:
+        return True
+    pw = pwfile(d, "root")
+    db.mkdir(parents=True, exist_ok=True)
+    ctx.login = ("root", pw)
+    return cli_user(ctx, F, d, [db, "user", "add", "root", "--superuser", "--password-file", pw])
+
+
+def add_tenants(ctx, F, d, port):
+    """--auth on: through the running server, by the CLI logged in as the superuser, one user per client with
+    TENANT_RIGHTS on its own set (a prefix grant) and GLOB_USER, which reads one type of every set (a glob grant).
+    Returns {user: (user, password file)}, or None after a failure."""
+    users = {}
+    for u, rights, sel in [(l, TENANT_RIGHTS, "prefix:%s." % l) for l in LANGS] + [(GLOB_USER, "read", GLOB_SEL)]:
+        pw = pwfile(d, u)
+        if not (cli_user(ctx, F, d, ["user", "add", u, "--password-file", pw], port)
+                and cli_user(ctx, F, d, ["user", "grant", u, rights, sel], port)):
+            return None
+        users[u] = (u, pw)
+    return users
+
+
+def tenant_phase(ctx, F, d, port, queries, texts, users, types):
+    """--auth on: each client reads, logged in as its own user and then as GLOB_USER, one query of every kind on
+    every series of every set. What the user may read must answer as the superuser's read did (texts: lang ->
+    its output); everything else must be refused ("!!"): any other answer is another tenant's data, and fails
+    the run."""
+    t0 = time.time()
+    sup = {l: dict(gen.parse_blocks(t)) for l, t in texts.items()}
+    if set(sup) != set(LANGS):
+        F.add("tenants: not every client read as the superuser; nothing to compare with")
+        return
+    pick, seen = [], set()
+    for q in queries:  # one query per (kind, series) that the superuser got rows or buckets for, in every client
+        kind, name = q.split()[:2]
+        if (kind, name) not in seen and all(sup[l].get(q, ["!!"]) != ["!!"] for l in LANGS):
+            seen.add((kind, name))
+            pick.append(q)
+    qfile = d / "queries-tenants.txt"
+    qfile.write_text("\n".join(pick) + "\n")
+    plans = {}
+    for l in LANGS:
+        plans["own-" + l] = (l, users[l], lambda n, l=l: n.startswith(l + "."))
+        plans["glob-" + l] = (l, users[GLOB_USER], lambda n: n.endswith(GLOB_SUFFIX))
+    jobs = {k: (l, ["read", port, qfile], d / ("read-tenant-%s.out" % k), login) for k, (l, login, _) in plans.items()}
+    res = run_all(ctx, jobs)
+    leaked = 0
+    for k, (l, login, allowed) in plans.items():
+        rc, secs = res[k]
+        if rc != 0:
+            F.add("tenants: %s reading as %s failed (%s): %s" % (l, login[0], rc, err_tail(jobs[k][2])))
+            continue
+        got = dict(gen.parse_blocks(Path(jobs[k][2]).read_text(errors="surrogateescape")))
+        mine = [q for q in pick if allowed(q.split()[1])]
+        theirs = [q for q in pick if not allowed(q.split()[1])]
+        if not mine or not theirs:
+            F.add("tenants: %s as %s has %d allowed and %d refused queries: the check has no teeth"
+                  % (l, login[0], len(mine), len(theirs)))
+        for q in theirs:
+            if got.get(q) != ["!!"]:
+                leaked += 1
+                if leaked <= 5:
+                    F.add("tenants: CROSS-TENANT READ: %s as %s got %s for `%s`, not a refusal"
+                          % (l, login[0], ("%d lines" % len(got[q])) if q in got else "no answer", q))
+        block = lambda src: "".join("## %s\n%s" % (q, "".join(x + "\n" for x in src.get(q, []))) for q in mine)
+        for m in diff_outputs("superuser", block(sup[l]), login[0], block(got), types=types):
+            F.add("tenants: %s as %s reads its own series otherwise than the superuser: %s" % (l, login[0], m))
+    if leaked > 5:
+        F.add("tenants: %d cross-tenant reads in all" % leaked)
+    F.note("tenants: 4 clients as their own users and as %s, %d queries each, in %.1f s"
+           % (GLOB_USER, len(pick), time.time() - t0))
 
 
 # ---------------------------------------------------------------- the CLI as the reference
@@ -583,11 +708,16 @@ def scenario_matrix(ctx, F, io, d):
     expected = gen.expected_blocks(queries, model)
     F.note("%d series, %d rows, %d queries" % (len(model.types), sum(len(r) for r in model.rows.values()), len(queries)))
     db = d / "db"
+    if not make_root(ctx, F, db, d):
+        return
     srv = Server(ctx, db, d / "tsdbd.log", io).start()
     ref = None
     try:
-        if (write_phase(ctx, F, d, "write", srv.port, scripts) and admin(ctx, F, d, srv.port, "flush")
-                and write_phase(ctx, F, d, "write2", srv.port, scripts2)):
+        # --auth on: each client writes its set as its own user; the superuser reads everything and administers
+        users = add_tenants(ctx, F, d, srv.port) if ctx.auth else {}
+        if (users is not None and write_phase(ctx, F, d, "write", srv.port, scripts, users)
+                and admin(ctx, F, d, srv.port, "flush")
+                and write_phase(ctx, F, d, "write2", srv.port, scripts2, users)):
             first = read_phase(ctx, F, d, "live", srv.port, qfile, expected, model.types)
             ref = first.get("c")
             if admin(ctx, F, d, srv.port, "flush"):
@@ -595,6 +725,8 @@ def scenario_matrix(ctx, F, io, d):
             if admin(ctx, F, d, srv.port, "optimize"):
                 final = read_phase(ctx, F, d, "optimized", srv.port, qfile, expected, model.types, reference=ref)
                 ref = final.get("c", ref)
+                if ctx.auth:
+                    tenant_phase(ctx, F, d, srv.port, queries, final, users, model.types)
     finally:
         rc = srv.stop()
         if rc != 0:
@@ -764,6 +896,8 @@ def scenario_cli(ctx, F, io, d):
     qfile = d / "queries.txt"
     queries = write_queries(qfile, model)
     expected = gen.expected_blocks(queries, model)
+    if not make_root(ctx, F, db, d):  # --auth on: USERS made beside the imported data; the clients log in
+        return
     srv = Server(ctx, db, d / "tsdbd.log", io).start()
     try:
         out = read_phase(ctx, F, d, "csv", srv.port, qfile, expected, model.types)
@@ -1023,6 +1157,7 @@ def scenario_stale_wal(ctx, F, io, d):
 SCENARIOS = collections.OrderedDict([("matrix", scenario_matrix), ("cli", scenario_cli),
                                      ("follower", scenario_follower), ("durability", scenario_durability),
                                      ("stale_wal", scenario_stale_wal)])
+AUTH_SCENARIOS = ("matrix", "cli")  # the ones --auth on runs again with login
 
 
 # ---------------------------------------------------------------- main
@@ -1057,6 +1192,7 @@ def main():
     ap = argparse.ArgumentParser(description="tsdb end-to-end tests")
     ap.add_argument("--only", default=",".join(SCENARIOS))
     ap.add_argument("--io", default="uring,epoll")
+    ap.add_argument("--auth", default="off,on", help="off: tsdbd --no-auth; on: login (matrix and cli only)")
     ap.add_argument("--scale", type=float, default=float(os.environ.get("INTEG_SCALE", "1.0")))
     ap.add_argument("--seed", type=int, default=int(os.environ.get("INTEG_SEED", "1")))
     ap.add_argument("--logs", default=str(BUILD / "integ/logs"))
@@ -1093,11 +1229,20 @@ def main():
         if s not in SCENARIOS:
             print("unknown scenario " + s, file=sys.stderr)
             return 2
+    auths = [a for a in args.auth.split(",") if a]
+    if not auths or any(a not in ("off", "on") for a in auths):
+        print("--auth takes off, on or off,on", file=sys.stderr)
+        return 2
+    # login is a dimension of the scenarios where every client reads (and, in matrix, writes as its own tenant);
+    # the others test storage, where a login changes nothing (jepsen's kv workload restarts with login)
+    runs = [(s, a) for s in wanted for a in auths if a == "off" or s in AUTH_SCENARIOS]
     t00 = time.time()
     print("logs: %s\nwork: %s" % (args.logs, ctx.work))
     results = []
     for io in ios:
-        for s in wanted:
+        for s0, auth in runs:
+            s = s0 if auth == "off" else s0 + "+auth"
+            ctx.auth, ctx.login = auth == "on", None
             d = Path(args.logs) / io / s
             d.mkdir(parents=True)
             work = ctx.work / ("%s-%s" % (io, s))
@@ -1106,7 +1251,7 @@ def main():
             print("== %s [--io %s]" % (s, io), flush=True)
             t0 = time.time()
             try:
-                SCENARIOS[s](ctx, F, io, work)
+                SCENARIOS[s0](ctx, F, io, work)
             except Exception as e:  # noqa: BLE001
                 import traceback
                 F.add("scenario crashed: %s: %s\n%s" % (type(e).__name__, e, traceback.format_exc()))

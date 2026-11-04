@@ -434,7 +434,10 @@ int main(int argc, char **argv)
         return 2;
     }
     tsdbc *c;
-    int rc = tsdbc_connect("127.0.0.1", atoi(argv[2]), &c);
+    /* run.py --auth on names the user to log in as in the environment, as it does for every client program */
+    tsdbc_options o = {.user = getenv("ITG_USER"), .password_file = getenv("ITG_PASSWORD_FILE")};
+    o.require_auth = o.user != NULL;
+    int rc = tsdbc_connect_opts("127.0.0.1", atoi(argv[2]), &o, &c);
     if (rc)
         die("connect", rc);
     if (strcmp(argv[1], "write") == 0)

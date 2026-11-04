@@ -2,7 +2,7 @@
 //! java/Itj.java (see run.py).
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::ops::ControlFlow;
-use tsdb_client::{Bucket, Client, Column, Group, QueryOpts, Unit, ValueType, Values};
+use tsdb_client::{Bucket, Client, Column, ConnectOptions, Group, QueryOpts, Unit, ValueType, Values};
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -369,7 +369,17 @@ fn main() -> R<()> {
         eprintln!("usage: itr write|read|load|admin <port> <arg>...");
         std::process::exit(2);
     }
-    let c = Client::connect(format!("127.0.0.1:{}", a[2]))?;
+    let addr = format!("127.0.0.1:{}", a[2]);
+    // run.py --auth on names the user to log in as in the environment, as it does for every client program
+    let c = match (std::env::var_os("ITG_USER"), std::env::var_os("ITG_PASSWORD_FILE")) {
+        (Some(u), Some(pf)) => {
+            let o = ConnectOptions::new().user(u.to_string_lossy()).password_file(pf).require_auth(true);
+            let mut c = Client::connect_opts(addr, &o)?;
+            c.set_timeout(None)?; // as Client::connect: no limit on requests
+            c
+        }
+        _ => Client::connect(addr)?,
+    };
     let mut cx = Ctx { c, series: Default::default(), names: Default::default() };
     match a[1].as_str() {
         "write" => write(&mut cx, &a[3])?,

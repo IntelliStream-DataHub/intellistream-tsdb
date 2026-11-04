@@ -1,5 +1,6 @@
 import ai.intellistream.tsdb.Bucket;
 import ai.intellistream.tsdb.Column;
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.Group;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
@@ -280,7 +281,11 @@ public final class Itj {
             System.err.println("usage: Itj write|read|load|admin <port> <arg>...");
             System.exit(2);
         }
-        c = TsdbClient.connect("127.0.0.1", Integer.parseInt(a[1]));
+        // run.py --auth on names the user to log in as in the environment, as it does for every client program
+        String user = System.getenv("ITG_USER");
+        c = user == null ? TsdbClient.connect("127.0.0.1", Integer.parseInt(a[1]))
+                : TsdbClient.connect("127.0.0.1", Integer.parseInt(a[1]), ConnectOptions.defaults().user(user)
+                        .passwordFile(Path.of(System.getenv("ITG_PASSWORD_FILE"))).requireAuth(true));
         switch (a[0]) {
             case "write" -> write(a[2]);
             case "read" -> read(a[2]);

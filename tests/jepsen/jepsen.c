@@ -4,7 +4,12 @@
  *
  *   jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|none] [--seconds 20]
  *          [--clients 8] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]
- *          [--verify-checksums]
+ *          [--verify-checksums] [--auth]
+ *
+ * Login (--auth): before the first server, the CLI (JEPSEN_TSDB, default ./build/tsdb) makes USERS in DIR: a
+ * superuser, which tsdbd needs to start, and the user `kv` with read and write on prefix:jepsen., as which every
+ * client and follower reader logs in, at every reconnect: restarts, USERS read again at each open (after a power
+ * loss too) and logins after them are in the history. The servers run without --no-auth. Password files beside DIR.
  *
  * Model. Each series is a set of keys (timestamps) holding the id of the write
  * that set them, last write wins. Every write has a unique id, stored as the
@@ -164,6 +169,9 @@ static double seconds = 20;
 static uint64_t seed = 1;
 static tsdb_sid ids[MAX_SERIES];
 static bool classes;                /* --workload classes */
+static bool auth;                   /* --auth: the servers require a login, the clients log in as KV_USER */
+static char kv_pw[PATH_MAX];        /* KV_USER's password file, beside DIR */
+#define KV_USER "kv"
 static int nseries = NSERIES;
 static uint32_t nkeys[MAX_SERIES];  /* keys of a series */
 static size_t koff[MAX_SERIES + 1]; /* where its keys start in the checker's flat arrays */
@@ -370,8 +378,10 @@ static void start_server(bool faulty)
                     dup2(lfd, 2);
             }
             const char *av[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
-                                  "--wal-max-batch-rows", "500", "--partition-ms", pms, "--no-auth"};
-            int ac = 14;
+                                  "--wal-max-batch-rows", "500", "--partition-ms", pms};
+            int ac = 13;
+            if (!auth)
+                av[ac++] = "--no-auth";
             if (classes) {
                 av[ac++] = "--granule-rows", av[ac++] = CL_STR(CL_GRANULE_ROWS);
                 av[ac++] = "--merge-idle-s", av[ac++] = "1";
@@ -467,8 +477,14 @@ static void start_follower(void)
         int log = open(flogpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (log >= 0)
             dup2(log, 2);
-        execl(tsdbd_path(), "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--follow",
-              "--no-auth", getenv("TSDBD_IO") ? "--io" : NULL, getenv("TSDBD_IO"), (char *)NULL);
+        const char *av[16] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--follow"};
+        int ac = 10;
+        if (!auth)
+            av[ac++] = "--no-auth";
+        if (getenv("TSDBD_IO"))
+            av[ac++] = "--io", av[ac++] = getenv("TSDBD_IO");
+        av[ac] = NULL;
+        execv(tsdbd_path(), (char **)av);
         _exit(127);
     }
     atomic_store(&follower_pid, pid);
@@ -501,7 +517,8 @@ static void kill_follower(void) /* at exit(2): no orphan */
  * has to belong to `pid`. A dead server holds no socket, which makes this fail until the next one is up. */
 static int connect_own(int p, pid_t pid, tsdbc **c)
 {
-    if (p <= 0 || pid <= 0 || tsdbc_connect("127.0.0.1", p, c) != 0)
+    tsdbc_options o = {.user = auth ? KV_USER : NULL, .password_file = auth ? kv_pw : NULL, .require_auth = auth};
+    if (p <= 0 || pid <= 0 || tsdbc_connect_opts("127.0.0.1", p, &o, c) != 0)
         return -1;
     if (!th_owns_port(pid, p)) {
         tsdbc_close(*c);
@@ -1576,6 +1593,46 @@ static int check_classes(const uint32_t *final)
     return violations - before;
 }
 
+/* --auth: `tsdb DIR user ...`, the CLI as an operator runs it before the first start (never under the shim). */
+static int users_cli(const char *a1, const char *a2, const char *a3, const char *a4, const char *a5)
+{
+    const char *cli = getenv("JEPSEN_TSDB") ? getenv("JEPSEN_TSDB") : "./build/tsdb";
+    pid_t pid = fork();
+    if (pid == 0) {
+        unsetenv("LD_PRELOAD");
+        execl(cli, "tsdb", dir, "user", a1, a2, a3, a4, a5, (char *)NULL);
+        _exit(127);
+    }
+    int st;
+    if (pid < 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        fprintf(stderr, "jepsen: %s %s user %s %s ... failed\n", cli, dir, a1, a2);
+        return 1;
+    }
+    return 0;
+}
+
+/* --auth: the superuser tsdbd needs to start, and KV_USER, with only what the workload does on its series. */
+static int make_users(void)
+{
+    char root_pw[PATH_MAX];
+    snprintf(root_pw, sizeof root_pw, "%s.root.pw", dir);
+    snprintf(kv_pw, sizeof kv_pw, "%s.kv.pw", dir);
+    const char *pw[2] = {root_pw, kv_pw};
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(pw[i], "w");
+        if (!f || fprintf(f, "%s-%016llx\n", i ? "kv" : "root", (unsigned long long)mix(seed * 31 + (uint64_t)i)) < 0 ||
+            fclose(f) != 0) {
+            fprintf(stderr, "jepsen: cannot write %s\n", pw[i]);
+            return 1;
+        }
+    }
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+        return 1;
+    return users_cli("add", "root", "--superuser", "--password-file", root_pw) ||
+           users_cli("add", KV_USER, "--password-file", kv_pw, NULL) ||
+           users_cli("grant", KV_USER, "read,write", "prefix:jepsen.", NULL);
+}
+
 static int create_series(int from, int to)
 {
     tsdbc *c = connect_retry();
@@ -1751,7 +1808,7 @@ int main(int argc, char **argv)
                                    {"seconds", required_argument, 0, 't'}, {"clients", required_argument, 0, 'c'},
                                    {"seed", required_argument, 0, 's'},    {"crashfs", required_argument, 0, 'f'},
                                    {"workload", required_argument, 0, 'w'}, {"verify-checksums", no_argument, 0, 'V'},
-                                   {0, 0, 0, 0}};
+                                   {"auth", no_argument, 0, 'A'},           {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -1767,6 +1824,7 @@ int main(int argc, char **argv)
             classes = !strcmp(optarg, "classes");
             break;
         case 'V': verify = true; break;
+        case 'A': auth = true; break;
         default: return 2;
         }
     }
@@ -1776,7 +1834,7 @@ int main(int argc, char **argv)
     if (!dir || (shim && !crashfs) || ((md || rot) && classes)) {
         fprintf(stderr, "usage: jepsen --dir DIR [--nemesis kill|power|pause|eio|misdirect|rot|none] [--seconds S]\n"
                         "              [--clients N] [--seed N] [--crashfs build/libcrashfs.so] [--workload kv|classes]\n"
-                        "              [--verify-checksums]   (misdirect and rot: workload kv)\n");
+                        "              [--verify-checksums]   (misdirect and rot: workload kv) [--auth]\n");
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
@@ -1811,6 +1869,8 @@ int main(int argc, char **argv)
     reads = calloc(MAX_OPS, sizeof *reads);
     nseries = classes ? CL_SERIES : NSERIES;
     make_keys();
+    if (auth && make_users())
+        return 2;
 
     start_server(false); /* the series exist before any fault */
     /* classes under a shim: the series are created by the server under it (before the nemesis starts), so their

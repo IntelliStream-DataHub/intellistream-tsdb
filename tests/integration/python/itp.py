@@ -1,6 +1,7 @@
 """The Python client of the integration tests: same command line and output as c/itc.c, rust/ and java/
 (see run.py). Needs the tsdb_client module (make test-python's venv, build/pyvenv)."""
 import array
+import os
 import struct
 import sys
 
@@ -27,7 +28,10 @@ def bits64(x):
 
 class Ctx:
     def __init__(self, port):
-        self.c = t.Client("127.0.0.1", port)
+        # run.py --auth on names the user to log in as in the environment, as it does for every client program
+        user = os.environ.get("ITG_USER")
+        login = dict(user=user, password_file=os.environ["ITG_PASSWORD_FILE"], require_auth=True) if user else {}
+        self.c = t.Client("127.0.0.1", port, **login)
         self.series = {}
         self.names = {}
 

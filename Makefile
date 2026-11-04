@@ -615,8 +615,10 @@ JEPSEN_WORKLOADS ?= kv classes
 # engine's checks, which do not depend on the workload. JEPSEN_SECONDS, when set, is the length of every run (the
 # weekly CI run sets it, with one power seed); otherwise each nemesis has its own short default.
 JEPSEN_SECONDS ?=
+# Then kv once more with login (--auth: USERS made by $(B)/tsdb, every client logs in at every reconnect) under kill
+# and one power seed, per backend.
 jsec = $(if $(JEPSEN_SECONDS),$(JEPSEN_SECONDS),$(1))
-jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so jepsen-selftest
+jepsen: $(B)/jepsen $(B)/tsdbd $(B)/tsdb $(B)/libcrashfs.so jepsen-selftest
 	for io in $(IO); do for wl in $(JEPSEN_WORKLOADS); do echo "== tsdbd --io $$io, workload $$wl"; \
 	    TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --workload $$wl --nemesis kill  --seconds $(call jsec,20) && \
 	    for seed in $(JEPSEN_SEEDS); do \
@@ -631,7 +633,12 @@ jepsen: $(B)/jepsen $(B)/tsdbd $(B)/libcrashfs.so jepsen-selftest
 	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis misdirect --seconds $(call jsec,20) \
 	            --crashfs $(B)/libcrashfs.so && \
 	        TSDBD_IO=$$io ./$(B)/jepsen --dir $(JEPSEN_DIR) --nemesis rot --seconds $(call jsec,20) --verify-checksums; \
-	    fi || exit 1; done; done
+	    fi || exit 1; done; \
+	    echo "== tsdbd --io $$io, workload kv with login" && \
+	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --auth --nemesis kill \
+	        --seconds $(call jsec,20) && \
+	    TSDBD_IO=$$io JEPSEN_TSDB=./$(B)/tsdb ./$(B)/jepsen --dir $(JEPSEN_DIR) --auth --nemesis power \
+	        --seconds $(call jsec,20) --seed 1 --crashfs $(B)/libcrashfs.so || exit 1; done
 
 # The harness has to notice what it is meant to: a server that crashes (SIGSEGV, not crashfs's exit 99) fails the
 # power run, and a power run that restarts too rarely fails too.

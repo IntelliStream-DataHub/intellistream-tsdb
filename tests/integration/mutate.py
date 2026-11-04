@@ -125,6 +125,11 @@ mut("M17", "granule statistics drop the high word of 128-bit integer sums beyond
     "        g->isum_hi = (int64_t)(a.isum >> 64);",
     "        g->isum_hi = a.isum < 0 ? -1 : 0;",
     ["c"], "matrix")
+mut("M18", "server skips the rights check in handle(): a logged-in user reads another tenant's series",
+    "server/tsdbd.c",
+    "    if ((rc = auth_fresh(a)) != 0 || (rc = auth_check(a, r->op, p, len)) != 0) {",
+    "    if ((rc = auth_fresh(a)) != 0 || (rc = 0) != 0) {",
+    ["c"], "matrix")
 
 
 def sh(cmd, cwd, log, env=None, check=True, timeout=None):
