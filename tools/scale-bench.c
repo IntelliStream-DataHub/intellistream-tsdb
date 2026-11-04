@@ -2,7 +2,7 @@
  * Benchmark at scale: load a large data set, then run a fixed query suite, in
  * tsdb and, through the SQL it writes, in ClickHouse.
  *
- *   scale-bench load   --dir D [--series 10000] [--points 10000000] [--threads 8]
+ *   scale-bench load   --dir D [--series 10000] [--points 10000000] [--threads 8] [--insert-zstd LEVEL]
  *   scale-bench export [--series ...] [--from S0] [--to S1] > rows.rowbinary
  *   scale-bench query  --dir D | --port P  [--series ...] [--threads 32] [--sql DIR] [--only NAME]
  *                      [--query-threads N] (embedded: tsdb_options.query_threads) [--repeat K] (K x the queries)
@@ -34,6 +34,7 @@
 #include "tsdb_calendar.h"
 
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -118,10 +119,24 @@ static void *load_worker(void *arg)
     return NULL;
 }
 
+static void count_inserted(void *ctx, const tsdb_part_info *p) { *(uint64_t *)ctx += p->level == 0 && p->granules; }
+
+/* Parts with rows no merge has written yet. */
+static uint64_t inserted_parts(tsdb *db)
+{
+    uint64_t n = 0;
+    tsdb_foreach_part(db, count_inserted, &n);
+    return n;
+}
+
+static int insert_zstd = INT_MIN; /* load --insert-zstd: tsdb_options.insert_zstd_level; INT_MIN the default */
+
 static int cmd_load(void)
 {
     tsdb_options o;
     tsdb_options_init(&o);
+    if (insert_zstd != INT_MIN)
+        o.insert_zstd_level = insert_zstd;
     tsdb *db;
     int rc = tsdb_open(dir, &o, &db);
     if (rc) {
@@ -165,14 +180,19 @@ static int cmd_load(void)
     printf("inserted %.2f G rows in %.0f s: %.1f M rows/s; %" PRIu64 " parts, %.2f GB\n", total / 1e9, t_ins,
            total / t_ins / 1e6, s.parts, s.bytes / 1e9);
     fflush(stdout);
-    /* settled: no merge finished and the part count did not move for a minute */
-    for (int quiet = 0; quiet < 6;) {
+    /* settled: no merge finished and the part count did not move for a minute, and no part is left as an insert
+     * wrote it (CODEC_FAST, without zstd by default): those are rewritten only once their partition has been idle
+     * for merge_idle_s, which can come after a quiet minute */
+    double t_last = now_s();
+    for (int quiet = 0; quiet < 6 || inserted_parts(db) > 0;) {
         tsdb_stats p = s;
         sleep(10);
         tsdb_get_stats(db, &s);
         quiet = s.parts == p.parts && s.merges == p.merges ? quiet + 1 : 0;
+        if (!quiet)
+            t_last = now_s();
     }
-    double t_all = now_s() - t0 - 60;
+    double t_all = t_last - t0;
     printf("merges settled after %.0f s: %" PRIu64 " parts in %" PRIu64 " partitions, %" PRIu64
            " merges, %.2f GB = %.0f MB, %.3f bytes/row\n",
            t_all, s.parts, s.partitions, s.merges, s.bytes / 1e9, s.bytes / 1e6, (double)s.bytes / s.rows);
@@ -488,7 +508,7 @@ int main(int argc, char **argv)
         {"sql", required_argument, 0, 'S'},    {"only", required_argument, 0, 'o'},
         {"query-threads", required_argument, 0, 'Q'}, {"repeat", required_argument, 0, 'R'},
         {"one-series", required_argument, 0, 'O'}, {"digest", no_argument, 0, 'D'},
-        {0, 0, 0, 0}};
+        {"insert-zstd", required_argument, 0, 'z'}, {0, 0, 0, 0}};
     int ch;
     optind = 2;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -509,6 +529,7 @@ int main(int argc, char **argv)
         case 'R': repeat = atoi(optarg); break;
         case 'O': one_series = atoi(optarg); break;
         case 'D': digest = 1; break;
+        case 'z': insert_zstd = atoi(optarg); break;
         default: return 2;
         }
     }

@@ -1285,6 +1285,23 @@ the main branch copied every one, took 1.36 to 2.72 s (float32) and 1.68 to 3.42
 deliver (the `tsdb-bench` load, 4 writers, ran the same 192 merges in the same
 time as before).
 
+**Inserts without zstd.** Since every part an insert or a flush writes is
+re-encoded by a merge anyway, inserts skip zstd by default
+(`insert_zstd_level = 0`; merges keep `zstd_level`): a block's header byte then
+has no `BLK_ZSTD`, and at level 0 the timestamps take DoubleDelta without
+trying the other transforms. No flag in the part says so: level 0 (no merge
+wrote it) is already the mark, merges never copy such a granule, and the solo
+rewrite above reaches the parts no merge combines. The parts at rest are the
+same bytes either way (`test_insert_nozstd` checks the sizes, the answers, a
+crash in between and that no merged block lacks zstd it would profit from);
+only the parts between the insert and their merge are larger (1M-row loads of
+the eight sensor kinds, bytes per row as loaded with and without zstd:
+hdd_temp 0.42 / 0.18, cpu_temp 1.68 / 1.12, tank_bar 1.67 / 1.15, tank_psi
+3.47 / 3.11, vibration 1.89 / 1.76, flow_rate 2.45 / 1.84, flow_total 2.09 /
+0.74, random 4.50 / 3.92). Where a part is never merged (`merge_idle_s = -1`,
+`merge_threads = 0`) it stays as inserted. `insert_zstd_level = -1` (tsdbd
+`--insert-zstd-level -1`) writes inserts at `zstd_level` as before.
+
 Tried and left out: the old byte decimal (kind 3) with ZSTD as a merge candidate
 (5-20% smaller on some pressures, at 2-4 times the encode); plain values with
 ZSTD and Chimp128 after the dictionary (they won 54 and 9 of 1614 granules of one

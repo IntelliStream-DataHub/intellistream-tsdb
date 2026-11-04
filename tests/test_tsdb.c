@@ -1837,6 +1837,213 @@ static void test_solo_rewrite(const char *base)
     free(v);
 }
 
+/* ---- inserts without zstd (insert_zstd_level) ----
+ * nz_missing counts the blocks of a part that zstd at level 1 would shrink (block_wrap's rule) but that are
+ * stored without it: a merge or a solo rewrite must leave none; a part an insert wrote at insert_zstd_level 0 has
+ * some. */
+typedef struct nz_parts {
+    int n;
+    char names[64][128];
+    uint32_t level[64];
+    uint64_t bytes, rows;
+} nz_parts;
+
+static void nz_part(void *ctx, const tsdb_part_info *p)
+{
+    nz_parts *s = ctx;
+    if (s->n < 64) {
+        snprintf(s->names[s->n], sizeof s->names[0], "%s", p->name);
+        s->level[s->n] = p->level;
+    }
+    s->n++;
+    s->bytes += p->bytes;
+    s->rows += p->rows;
+}
+
+static int64_t nz_missing(const char *dir, const char *name, codec_ctx *cc, uint64_t *blocks)
+{
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    CHECK(dfd >= 0);
+    part *p;
+    OK(part_open(dfd, name, false, &p));
+    int64_t missing = 0;
+    for (uint32_t i = 0; i < p->ng; i++) {
+        granule g;
+        gx_load(p, i, GW_LOC, &g);
+        const uint8_t *b[2] = {p->map + g.off, p->map + g.off + g.ts_len};
+        size_t len[2] = {g.ts_len, g.val_len};
+        for (int k = 0; k < 2; k++) {
+            (*blocks)++;
+            if (b[k][0] & BLK_ZSTD)
+                continue;
+            uint8_t *out = malloc(5 + ZSTD_compressBound(len[k]));
+            CHECK(out);
+            block_wrap_src(cc, 1, b[k][0] & BLK_KIND_MASK, b[k] + 1, len[k] - 1, out);
+            missing += (out[0] & BLK_ZSTD) != 0;
+            free(out);
+        }
+    }
+    part_unref(p);
+    close(dfd);
+    return missing;
+}
+
+/* nz_missing over the parts merges wrote; *level0 gets the sum over the parts no merge wrote. */
+static int64_t nz_scan(tsdb *db, const char *dir, nz_parts *ps, int64_t *level0)
+{
+    memset(ps, 0, sizeof *ps);
+    OK(tsdb_foreach_part(db, nz_part, ps));
+    CHECK(ps->n <= 64);
+    codec_ctx *cc = codec_new();
+    CHECK(cc);
+    int64_t merged = 0;
+    *level0 = 0;
+    for (int i = 0; i < ps->n && i < 64; i++) {
+        uint64_t blocks = 0;
+        int64_t m = nz_missing(dir, ps->names[i], cc, &blocks);
+        CHECK(blocks > 0);
+        if (ps->level[i] == 0)
+            *level0 += m;
+        else
+            merged += m;
+    }
+    codec_free(cc);
+    return merged;
+}
+
+static void nz_rows(int64_t t0, int from, int n, int64_t *ts, float *v)
+{
+    for (int i = 0; i < n; i++) { /* a jittered clock and a sensor that repeats itself: zstd finds the repeats */
+        int r = from + i;
+        ts[i] = t0 + (int64_t)r * 1000 + (r * 37) % 23;
+        v[i] = 20.0f + 0.25f * (float)((r * 7) % 61) + 0.01f * (float)(r % 5);
+    }
+}
+
+static void nz_check_rows(tsdb *db, tsdb_sid id, int64_t t0, int n)
+{
+    int64_t *ts = malloc((size_t)n * sizeof *ts);
+    float *v = malloc((size_t)n * sizeof *v);
+    CHECK(ts && v);
+    nz_rows(t0, 0, n, ts, v);
+    tsdb_points p = {0};
+    OK(tsdb_query_points(db, id, t0, t0 + 86400000, &p));
+    CHECK(p.n == (size_t)n && memcmp(p.ts, ts, (size_t)n * sizeof *ts) == 0 &&
+          memcmp(p.values, v, (size_t)n * sizeof *v) == 0);
+    tsdb_points_free(&p);
+    free(ts);
+    free(v);
+}
+
+/* Inserts and memtable flushes write blocks without zstd by default (insert_zstd_level 0); merges write at
+ * zstd_level. Every such block must end up compressed: a merge re-encodes a part no merge wrote (level 0) and
+ * never copies its granules as they are, a part with nothing to merge with is rewritten alone once its partition
+ * is idle, and the parts at rest are as large as with insert_zstd_level -1 (inserts at zstd_level). A crash
+ * between the insert and the merge changes nothing: the WAL and the intent files do not depend on the level. */
+static void test_insert_nozstd(const char *base)
+{
+    enum { G = 1024, N = 8 * G, A = 500 };
+    const int64_t t0 = 1700006400000; /* a day's start */
+    const int64_t later = t0 + 10 * 86400000LL;
+    uint64_t final_bytes[2] = {0, 0};
+    int64_t *ts = malloc(N * sizeof *ts);
+    float *v = malloc(N * sizeof *v);
+    CHECK(ts && v);
+    for (int mode = 0; mode < 2; mode++) { /* 0: the default; 1: insert_zstd_level -1, inserts at zstd_level */
+        char dir[512];
+        snprintf(dir, sizeof dir, "%s/tsdb-nozstd-%d-%d", base, (int)getpid(), mode);
+        rm_rf(dir);
+        tsdb_options o;
+        tsdb_options_init(&o);
+        CHECK(o.insert_zstd_level == 0);
+        o.granule_rows = G;
+        o.fsync = 0;
+        o.wal_max_batch_rows = 100; /* a batch becomes a part, appends go to the WAL */
+        o.flush_interval_ms = 1000000;
+        o.merge_idle_s = -1;
+        if (mode)
+            o.insert_zstd_level = -1;
+        /* two large inserts and some WAL rows, then a crash */
+        pid_t pid = fork();
+        if (pid == 0) {
+            tsdb *db;
+            tsdb_sid id;
+            if (tsdb_open(dir, &o, &db) || tsdb_series(db, "s", &id))
+                _exit(1);
+            for (int b = 0; b < 2; b++) {
+                nz_rows(t0, b * N, N, ts, v);
+                if (tsdb_insert_series(db, id, ts, v, N))
+                    _exit(1);
+            }
+            nz_rows(t0, 2 * N, A, ts, v);
+            for (int i = 0; i < A; i++)
+                if (tsdb_append(db, id, ts[i], v[i]))
+                    _exit(1);
+            _exit(0); /* no tsdb_close: a crash */
+        }
+        int status;
+        CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        tsdb *db;
+        tsdb_sid id;
+        OK(tsdb_open(dir, &o, &db));
+        OK(tsdb_series(db, "s", &id));
+        nz_check_rows(db, id, t0, 2 * N + A);
+        OK(tsdb_flush(db)); /* the replayed WAL rows: a third part */
+        nz_parts ps;
+        int64_t raw0, merged = nz_scan(db, dir, &ps, &raw0);
+        CHECK(ps.n == 3 && ps.level[0] == 0 && ps.level[1] == 0 && ps.level[2] == 0 && merged == 0);
+        CHECK(mode ? raw0 == 0 : raw0 > 0);
+        uint64_t raw_bytes = ps.bytes;
+        nz_check_rows(db, id, t0, 2 * N + A);
+
+        /* one merge of the three, re-encoded at zstd_level */
+        OK(tsdb_optimize(db));
+        merged = nz_scan(db, dir, &ps, &raw0);
+        CHECK(ps.n == 1 && ps.level[0] == 1 && merged == 0 && raw0 == 0);
+        CHECK(mode || ps.bytes * 10 < raw_bytes * 9); /* data zstd shrinks: the test would see a missing zstd */
+        nz_check_rows(db, id, t0, 2 * N + A);
+
+        /* a merged part and a newer insert after it: the merged part's full granules are copied as they are, the
+         * inserted ones never (they would carry their blocks without zstd into the merged part) */
+        nz_rows(t0, 2 * N + A, N, ts, v);
+        OK(tsdb_insert_series(db, id, ts, v, N));
+        OK(tsdb_close(db));
+        OK(tsdb_open(dir, &o, &db));
+        merged = nz_scan(db, dir, &ps, &raw0);
+        CHECK(ps.n == 2 && merged == 0 && (mode ? raw0 == 0 : raw0 > 0));
+        tsdb_stats st0, st1;
+        OK(tsdb_get_stats(db, &st0));
+        OK(tsdb_optimize(db));
+        OK(tsdb_get_stats(db, &st1));
+        CHECK(st1.passthrough_granules >= st0.passthrough_granules + 2 * N / G);
+        merged = nz_scan(db, dir, &ps, &raw0);
+        CHECK(ps.n == 1 && merged == 0 && raw0 == 0);
+        nz_check_rows(db, id, t0, 3 * N + A);
+        OK(tsdb_close(db));
+
+        /* a part alone in its partition, rewritten in the background once the partition is idle */
+        o.merge_idle_s = 1;
+        OK(tsdb_open(dir, &o, &db));
+        nz_rows(later, 0, N, ts, v);
+        OK(tsdb_insert_series(db, id, ts, v, N));
+        for (int tries = 0; tries < 100; tries++) {
+            merged = nz_scan(db, dir, &ps, &raw0);
+            if (ps.n == 2 && ps.level[0] && ps.level[1])
+                break;
+            usleep(100000);
+        }
+        CHECK(ps.n == 2 && ps.level[0] && ps.level[1] && merged == 0 && raw0 == 0);
+        nz_check_rows(db, id, t0, 3 * N + A);
+        nz_check_rows(db, id, later, N);
+        final_bytes[mode] = ps.bytes;
+        OK(tsdb_close(db));
+        rm_rf(dir);
+    }
+    CHECK(final_bytes[0] == final_bytes[1]); /* the same parts at rest, whatever the inserts wrote */
+    free(ts);
+    free(v);
+}
+
 /* Solo rewrites come after the retention work. Regression (review of the solo rewrite): the merge thread looked
  * at retention only when it found nothing to merge, and an idle part only an insert wrote always counted as
  * something, so after a bulk load an expired partition was rewritten (to an empty part) before it was dropped,
@@ -2153,6 +2360,11 @@ int main(int argc, char **argv)
         printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
         return failures != 0;
     }
+    if (argc > 2 && strcmp(argv[2], "nozstd") == 0) {
+        test_insert_nozstd(base);
+        printf(failures ? "FAILED: %d checks\n" : "all tests passed\n", failures);
+        return failures != 0;
+    }
     printf("simd: %s\n", simd_name());
     printf("codecs\n");
     test_codecs();
@@ -2174,6 +2386,8 @@ int main(int argc, char **argv)
     printf("idle partitions merged\n");
     test_idle_merge(base);
     test_solo_rewrite(base);
+    printf("inserts without zstd, compressed by merges\n");
+    test_insert_nozstd(base);
     test_solo_after_retention(base);
     test_optimize_waits_for_solo(base);
     printf("volume statistics\n");

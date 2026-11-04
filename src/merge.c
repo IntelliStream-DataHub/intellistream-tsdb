@@ -54,9 +54,11 @@ static bool merge_allowed(double sum, double max_size, double min_age, double pa
 
 static double merge_score(double count, double sum) { return (sum + MERGE_FIXED_COST * count) / (count - 1.9); }
 
-/* A part no merge has written holds blocks encoded at insert speed (CODEC_FAST). Once its partition is idle,
- * or on tsdb_optimize, it is rewritten alone when it has nothing to merge with, so that every part at rest
- * ends up encoded at CODEC_MERGE. */
+/* A part no merge has written holds blocks encoded at insert speed (CODEC_FAST), and by default without zstd
+ * (insert_zstd_level 0). Once its partition is idle, or on tsdb_optimize, it is rewritten alone when it has
+ * nothing to merge with, so that every part at rest ends up encoded at CODEC_MERGE and zstd_level. Such a part
+ * is never copied granule by granule into a merge (merge_parts): level 0 is how a part says its blocks may lack
+ * zstd, so no flag in the part is needed. */
 static bool insert_written(const part *p) { return p->level == 0 && p->ng > 0; }
 
 /* Picks the best range over all partitions, or with `solo`, when there is none, one part to rewrite alone.
@@ -246,6 +248,7 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
     }
     w.keep_empty = true; /* replaces its sources even when nothing is left */
     w.effort = CODEC_MERGE;
+    w.zstd_level = db->opt.zstd_level; /* pw_begin chose the insert level */
     w.empty_ts = min_ts;
     if (tombs) {
         bool older = false; /* a listed part of the partition below the merge: the tombstones still hide it */
@@ -342,7 +345,8 @@ int merge_parts(eng *db, part **src, size_t k, part **out)
             bool pend_ok = w.pend_n == 0 || w.pend_series != g->series ||
                            (w.cut_ms && floor_div(w.pend_ts[w.pend_n - 1], w.cut_ms) < floor_div(g->ts_min, w.cut_ms)) ||
                            pw_hcut_before(&w, g->ts_min);
-            /* a part no merge has written was encoded at insert speed (CODEC_FAST): re-encoded once here */
+            /* a part no merge has written was encoded at insert speed (CODEC_FAST), maybe without zstd: re-encoded
+             * once here, never copied, so that no merged part carries an insert's blocks */
             bool merged = c->p->level > 0;
             int fit = 0;
             if (!filter && before_rest && day && merged && pend_ok) {

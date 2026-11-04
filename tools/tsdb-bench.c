@@ -28,6 +28,7 @@
 #include "tsdb_calendar.h"
 
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <sys/wait.h>
@@ -41,6 +42,9 @@ typedef struct cfg {
     size_t batch;    /* rows per insert call */
     int threads;
     int zstd;
+    int insert_zstd;   /* --insert-zstd: tsdb_options.insert_zstd_level; INT_MIN the library default */
+    int merge_threads; /* --merge-threads; -1 the library default */
+    bool fresh;        /* --fresh: query the parts as inserted, without tsdb_optimize */
     int fsync;
     bool keep, query_only;
     int query_threads; /* 0: library default */
@@ -478,7 +482,7 @@ static int mode_qps(const cfg *c)
 int main(int argc, char **argv)
 {
     cfg c = {.series = 100, .points = 1000000, .dataset = -1, .batch = 1000000, .threads = 4, .zstd = 1, .fsync = 1,
-             .seconds = CB_DEFAULT_SECONDS, .vtype = -1};
+             .insert_zstd = INT_MIN, .merge_threads = -1, .seconds = CB_DEFAULT_SECONDS, .vtype = -1};
     static struct option opts[] = {
         {"dir", required_argument, 0, 'd'},     {"series", required_argument, 0, 's'},
         {"points", required_argument, 0, 'p'},  {"dataset", required_argument, 0, 'v'},
@@ -489,7 +493,8 @@ int main(int argc, char **argv)
         {"load", required_argument, 0, 'L'},    {"qps", required_argument, 0, 'S'},
         {"seconds", required_argument, 0, 'T'}, {"optimize", no_argument, 0, 'O'},
         {"verify", required_argument, 0, 'V'},  {"type", required_argument, 0, 'Y'},
-        {0, 0, 0, 0}};
+        {"insert-zstd", required_argument, 0, 'I'}, {"merge-threads", required_argument, 0, 'M'},
+        {"fresh", no_argument, 0, 'R'},         {0, 0, 0, 0}};
     int ch;
     while ((ch = getopt_long(argc, argv, "", opts, NULL)) != -1) {
         switch (ch) {
@@ -506,6 +511,9 @@ int main(int argc, char **argv)
         case 'b': c.batch = strtoull(optarg, NULL, 10); break;
         case 't': c.threads = atoi(optarg); break;
         case 'z': c.zstd = atoi(optarg); break;
+        case 'I': c.insert_zstd = atoi(optarg); break;
+        case 'M': c.merge_threads = atoi(optarg); break;
+        case 'R': c.fresh = true; break;
         case 'F': c.fsync = 0; break;
         case 'k': c.keep = true; break;
         case 'q': c.query_only = c.keep = true; break;
@@ -530,6 +538,7 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "usage: tsdb-bench --dir DIR [--series N] [--points N] [--dataset mixed|hdd_temp|cpu_temp|...]\n"
                     "       [--batch ROWS] [--threads N] [--zstd LEVEL] [--no-fsync] [--keep] [--query-only]\n"
+                    "       [--insert-zstd LEVEL (-1: as --zstd)] [--merge-threads N] [--fresh (no optimize)]\n"
                     "       [--type float32|float64|int64]\n"
                     "       tsdb-bench --export FILE [--series N] [--points N] [--dataset ...]\n"
                     "       tsdb-bench --dir DIR --load FILE [--threads N] [--batch ROWS] [--no-fsync] [--optimize]\n"
@@ -579,6 +588,10 @@ int main(int argc, char **argv)
     tsdb_options o;
     tsdb_options_init(&o);
     o.zstd_level = c.zstd;
+    if (c.insert_zstd != INT_MIN)
+        o.insert_zstd_level = c.insert_zstd;
+    if (c.merge_threads >= 0)
+        o.merge_threads = c.merge_threads;
     o.fsync = c.fsync;
     if (c.query_threads > 0)
         o.query_threads = c.query_threads;
@@ -601,10 +614,10 @@ int main(int argc, char **argv)
         }
     }
     printf("tsdb-bench: %u series x %" PRIu64 " points = %.1f M rows, dataset %s, %s,\n"
-           "            batch %zu rows, %d writer threads, zstd %d, fsync %d, simd %s\n\n",
+           "            batch %zu rows, %d writer threads, zstd %d (inserts %d), fsync %d, simd %s\n\n",
            c.series, c.points, total / 1e6, c.dataset < 0 ? "mixed" : ds_info[c.dataset].name,
            c.vtype == TSDB_FLOAT64 ? "float64" : c.vtype == TSDB_INT64 ? "int64" : "float32", c.batch, c.threads,
-           c.zstd, c.fsync, tsdb_simd_level());
+           c.zstd, o.insert_zstd_level < 0 ? c.zstd : o.insert_zstd_level, c.fsync, tsdb_simd_level());
 
     tsdb_stats st;
     if (!c.query_only) {
@@ -620,13 +633,16 @@ int main(int argc, char **argv)
         tsdb_get_stats(db, &st);
         printf("insert+generate %6.2f s  %7.2f M rows/s   (%" PRIu64 " parts, %" PRIu64 " merges so far)\n", ti,
                total / ti / 1e6, st.parts, st.merges);
-        t0 = now_s();
-        rc = tsdb_optimize(db);
-        double to = now_s() - t0;
-        tsdb_get_stats(db, &st);
-        printf("optimize        %6.2f s  -> %" PRIu64 " parts in %" PRIu64 " partitions, %" PRIu64
-               " granules copied as-is\n",
-               to, st.parts, st.partitions, st.passthrough_granules);
+        printf("as loaded  %8.2f MiB  %.3f bytes/row\n", st.bytes / 1048576.0, (double)st.bytes / (double)st.rows);
+        if (!c.fresh) {
+            t0 = now_s();
+            rc = tsdb_optimize(db);
+            double to = now_s() - t0;
+            tsdb_get_stats(db, &st);
+            printf("optimize        %6.2f s  -> %" PRIu64 " parts in %" PRIu64 " partitions, %" PRIu64
+                   " granules copied as-is\n",
+                   to, st.parts, st.partitions, st.passthrough_granules);
+        }
     }
     tsdb_get_stats(db, &st);
     printf("storage    %8.2f MiB  %.3f bytes/row  ratio %.1fx vs 12 bytes/row (DateTime64(3)+Float32)\n\n",

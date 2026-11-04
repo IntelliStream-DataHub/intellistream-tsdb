@@ -160,7 +160,8 @@ def test_options_and_errors(tmp_path):
     with pytest.raises(ValueError):
         Db(tmp_path / "x", value_codec="lz4")
     assert code(Db, tmp_path / "missing" / "db") == tsdb_client.ERR_IO
-    db = Db(tmp_path / "db", fsync=False, wal_sync_ms=-1, value_codec="chimp", granule_rows=1024, zstd_level=0)
+    db = Db(tmp_path / "db", fsync=False, wal_sync_ms=-1, value_codec="chimp", granule_rows=1024, zstd_level=0,
+            insert_zstd_level=-1)
     a = db.series("a")
     db.insert_series(a, [T0 + i for i in range(5000)], [float(i) for i in range(5000)])
     db.flush()

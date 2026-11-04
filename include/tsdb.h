@@ -92,7 +92,7 @@ typedef struct tsdb_options {
                               * granules per day) gets partitions of 7, 28 or 364 base partitions, chosen
                               * from its rate (and at most an eighth of its retention) */
     uint32_t granule_rows;   /* fixed at creation; default 8192 */
-    int zstd_level;          /* default 1; 0 disables zstd */
+    int zstd_level;          /* default 1; 0 disables zstd. Merges write at this level; see insert_zstd_level */
     int value_codec;         /* TSDB_VALUES_AUTO (default), _GORILLA or _CHIMP; tsdb_open refuses others */
     int fsync;               /* fsync parts, WAL and dictionaries before relying on them; default 1. With 0,
                               * a power loss (not a process crash) can leave files that fail their checks
@@ -138,13 +138,18 @@ typedef struct tsdb_options {
     int partition_classes;   /* fixed at creation; 1 (default): a partition length per series from its rate
                               * (see partition_ms), so slow series pay little per partition; 0: every series
                               * in base partitions. Off by itself when partition_ms is below 4 ms */
-    int pin_index;           /* 1: each part's granule index and tombstones are copied into memory when the open
+    int pin_index;          /* 1: each part's granule index and tombstones are copied into memory when the open
                               * checks them, and read from that copy: damage that reaches the file later (a
                               * misdirected write, a misread page) cannot change what queries see. Costs about 32
                               * to 51 bytes of RAM per granule, in every process that opens the part
                               * (tsdb_volume_stats.pinned_bytes). Default 0: read in place from the mapping (page
                               * cache); damage after the open can then give wrong answers, never a read outside the
                               * part. Independent of verify_checksums */
+    int insert_zstd_level;   /* zstd level of the parts inserts and memtable flushes write; default 0: none, which
+                              * makes them faster to write and larger until merged. Background merges re-encode
+                              * every such part at zstd_level: with others, or alone once its partition is idle
+                              * (merge_idle_s; with merge_idle_s = -1 or merge_threads = 0 a part no merge
+                              * combines stays as inserted). -1: zstd_level, as merges (the earlier behaviour) */
 } tsdb_options;
 
 void tsdb_options_init(tsdb_options *opts);
@@ -782,7 +787,7 @@ size_t tsdb_struct_size(int kind);
 /* Raised with every incompatible change of a public struct's layout or of a function's signature, which a size
  * check misses (tsdb_series_result kept its size when its series became 64 bits). Bindings compare it with the
  * number they were written for when they load the library and refuse another. */
-#define TSDB_ABI_VERSION 2 /* 2: tsdb_options.pin_index (in what was padding) */
+#define TSDB_ABI_VERSION 3 /* 3: tsdb_options.insert_zstd_level (the struct grows by 8); 2: pin_index (in what was padding) */
 int tsdb_abi_version(void);
 
 #ifdef __cplusplus

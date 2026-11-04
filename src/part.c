@@ -305,7 +305,8 @@ int pw_begin(part_writer *w, struct eng *db, int64_t partition, uint64_t wal_seq
     w->cut_ms = db->cls_len[partition_class(db, partition)] > cut ? cut : 0;
     w->hc_min = atomic_load_explicit(&hour_cut_min, memory_order_relaxed);
     w->hk_end = INT64_MIN; /* no row given yet */
-    w->zstd_level = db->opt.zstd_level;
+    /* inserts and flushes (CODEC_FAST) may skip zstd: a merge re-encodes every part no merge wrote (merge.c) */
+    w->zstd_level = db->opt.insert_zstd_level < 0 ? db->opt.zstd_level : db->opt.insert_zstd_level;
     w->value_codec = db->opt.value_codec;
     w->min_ts = INT64_MAX;
     w->max_ts = INT64_MIN;
