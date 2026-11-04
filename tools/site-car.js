@@ -245,32 +245,31 @@
     });
 
     /* ---- rear wing: mainplane, DRS flap, endplates, swan-neck mounts, beam wing ----
-     * A high-downforce wing nearly as wide as the rear wheels' outer edges (the wheels reach about 0.99 m out):
-     * deeply cambered elements, twisted to a steeper angle and swept up towards the endplates, a spoon-shaped dip
-     * in the middle. */
-    var RWZ = 0.9, rearWingFrom = lines.length;
+     * A wide, flat wing, past the rear wheels' outer edges (the wheels reach about 0.99 m out): a long flat
+     * mainplane and a shallow DRS flap close above it, low endplates, a slight spoon-shaped dip in the middle. */
+    var RWZ = 1.15, rearWingFrom = lines.length;
     var RW = [
         /* leading edge x, height, chord, angle, camber */
-        [2.46, 0.86, 0.38, 0.14, 0.1],
-        [2.68, 1.0, 0.27, 0.5, 0.09]
+        [2.44, 0.9, 0.42, 0.04, 0.06],
+        [2.72, 0.97, 0.3, 0.2, 0.05]
     ];
     RW.forEach(function (el) {
         loft(range(-RWZ, RWZ, 17), function (z) {
             var u = Math.abs(z) / RWZ;
             var dip = 0.015 * Math.cos(u * Math.PI / 2); /* a slight spoon */
             var tip = 0.01 * u * u; /* the tips meet the endplates */
-            return airfoil(el[0] - 0.02 * u, el[1] - dip + tip, z, el[2], 0.12, el[3] + 0.04 * u, 10, el[4]);
+            return airfoil(el[0] - 0.02 * u, el[1] - dip + tip, z, el[2], 0.09, el[3] + 0.02 * u, 10, el[4]);
         }, 1);
     });
     both(function (s) {
         var z = (RWZ + 0.02) * s;
         /* endplate: a tall plate, with louvres along the bottom, slots at the top trailing corner and a footplate */
-        poly([[2.32, 0.26, z], [3.02, 0.28, z], [3.04, 1.14, z], [3.0, 1.22, z], [2.92, 1.26, z], [2.46, 1.26, z],
-            [2.36, 1.08, z], [2.38, 0.62, z]], true);
+        poly([[2.32, 0.26, z], [3.02, 0.28, z], [3.04, 1.06, z], [3.0, 1.13, z], [2.92, 1.16, z], [2.46, 1.16, z],
+            [2.36, 1.02, z], [2.38, 0.62, z]], true);
         [0.38, 0.46, 0.54, 0.62, 0.7].forEach(function (y) { line([2.44, y, z], [2.96, y + 0.04, z]); }); /* louvres */
-        [2.78, 2.86, 2.94].forEach(function (x) { line([x, 1.02, z], [x + 0.04, 1.2, z]); }); /* slots */
+        [2.78, 2.86, 2.94].forEach(function (x) { line([x, 0.98, z], [x + 0.03, 1.1, z]); }); /* slots */
         poly([[2.3, 0.26, z], [2.3, 0.26, z - 0.1 * s], [3.0, 0.3, z - 0.1 * s], [3.0, 0.3, z]]); /* footplate */
-        line([3.04, 1.2, z], [3.04, 1.2, z - 0.06 * s]); /* the endplate's top lip */
+        line([3.04, 1.1, z], [3.04, 1.1, z - 0.06 * s]); /* the endplate's top lip */
         /* swan neck: from the mainplane's top down and forward to the gearbox, as a narrow strip */
         var neck = [];
         for (var k = 0; k <= 10; k++) {
@@ -523,7 +522,7 @@
         /* streaks start on points of the car (wing tips, wheel tops, sidepods, airbox) and behind it */
         var anchors = [[-2.9, 0.2, 0.95], [-2.9, 0.2, -0.95], [-1.65, 0.72, 0.95], [-1.65, 0.72, -0.95],
             [-0.45, 0.58, 0.78], [-0.45, 0.58, -0.78], [0.4, 1.02, 0], [1.95, 0.74, 0.98], [1.95, 0.74, -0.98],
-            [3.04, 1.2, 0.92], [3.04, 1.2, -0.92], [2.9, 0.98, 0.5], [2.9, 0.98, -0.5], /* the rear wing's tips */
+            [3.04, 1.12, 1.17], [3.04, 1.12, -1.17], [2.9, 0.98, 0.5], [2.9, 0.98, -0.5], /* the rear wing's tips */
             [1.2, 0.05, 0.85], [1.2, 0.05, -0.85], [0.5, 0.75, 0.45]];
         /* streaks are lines in the scene, parallel to the car's axis and running back from it, so through the lens
          * they converge towards the vanishing point behind the car */
