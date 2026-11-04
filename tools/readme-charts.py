@@ -156,10 +156,10 @@ def site_html():
             figs.append(f'<figure class="chart" id="{name}-{i + 1}">\n'
                         f'<figcaption><h3>{escape(panel["title"])}</h3><p>{escape(subtitle(panel))}</p></figcaption>\n'
                         f'<div class="chart-svg"></div>\n'
-                        f'<details open><summary>The numbers</summary><div class="table-wrap">'
+                        f'<div class="chart-table table-wrap">'
                         f'<table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">\n'
                         f'<thead><tr><th scope="col">System</th><th scope="col">{escape(subtitle(panel))}</th></tr>'
-                        f'</thead>\n<tbody>\n' + "\n".join(rows) + "\n</tbody></table></div></details>\n</figure>")
+                        f'</thead>\n<tbody>\n' + "\n".join(rows) + "\n</tbody></table></div>\n</figure>")
         notes = ["Speed: tsdb is the full bar. Size, time and memory: shorter is better. A box instead of a bar: no "
                  "number, and why."] + chart.get("footnotes", [])
         notes_html = " ".join(escape(n) for n in notes)

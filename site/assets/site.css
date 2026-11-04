@@ -1348,30 +1348,31 @@ dl.terms dd {
     }
 }
 
-.chart details {
+.chart .chart-table {
     margin-top: 10px;
-    font-size: 0.88rem;
-}
-
-.chart summary {
-    cursor: pointer;
-    color: var(--link);
-    font-weight: 600;
-    padding: 4px 0;
-}
-
-.chart details .table-wrap {
-    margin-top: 8px;
     background: transparent;
 }
 
-.chart details table {
+.chart .chart-table table {
     font-size: 0.82rem;
 }
 
-.chart details th,
-.chart details td {
+.chart .chart-table th,
+.chart .chart-table td {
     padding: 6px 9px;
+}
+
+/* in the page for screen readers and as the chart's data, not on screen */
+.visually-hidden {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0, 0, 0, 0) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
 }
 
 .chart tr.us th,

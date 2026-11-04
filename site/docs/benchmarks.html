@@ -57,7 +57,7 @@ system that failed with 32 clients asking about many sensors at once.</p>
 <figure class="chart" id="bench-servers-1">
 <figcaption><h3>Size on disk</h3><p>bytes per reading; times tsdb's size; shorter is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">bytes per reading; times tsdb's size; shorter is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.0155"><th scope="row">tsdb</th><td>0.78</td></tr>
@@ -70,12 +70,12 @@ system that failed with 32 clients asking about many sensors at once.</p>
 <tr data-len="0.0517"><th scope="row">IoTDB</th><td>3.3× (2.60)</td></tr>
 <tr data-len="0.0539"><th scope="row">TDengine</th><td>3.5× (2.71)</td></tr>
 <tr data-len="0.0563"><th scope="row">Prometheus</th><td>3.6× (2.83)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-servers-2">
 <figcaption><h3>Ingest</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>85.8 M rows/s</td></tr>
@@ -88,12 +88,12 @@ system that failed with 32 clients asking about many sensors at once.</p>
 <tr data-len="0.0500"><th scope="row">IoTDB</th><td>20× slower (4.19 M rows/s)</td></tr>
 <tr data-len="0.0500"><th scope="row">TDengine</th><td>20× slower (4.22 M rows/s)</td></tr>
 <tr data-len="0.1099"><th scope="row">Prometheus</th><td>9.1× slower (9.46 M rows/s)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-servers-3">
 <figcaption><h3>Read</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>1,524 M rows/s</td></tr>
@@ -106,12 +106,12 @@ system that failed with 32 clients asking about many sensors at once.</p>
 <tr data-len="0.0500"><th scope="row">IoTDB</th><td>20× slower (76.1 M rows/s)</td></tr>
 <tr data-len="0.1010"><th scope="row">TDengine</th><td>9.9× slower (153 M rows/s)</td></tr>
 <tr data-len="0.0038"><th scope="row">Prometheus</th><td>261× slower (5.84 M rows/s)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-servers-4">
 <figcaption><h3>Time-weighted average</h3><p>median time; shorter is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.0004"><th scope="row">tsdb</th><td>36.4 ms</td></tr>
@@ -124,12 +124,12 @@ system that failed with 32 clients asking about many sensors at once.</p>
 <tr data-len="1.0000"><th scope="row">IoTDB</th><td>2,423× slower (88,214 ms)</td></tr>
 <tr data-len="0.4903"><th scope="row">TDengine</th><td>1,188× slower (43,254 ms)</td></tr>
 <tr data-none="not measured"><th scope="row">Prometheus</th><td>not measured</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-servers-5">
 <figcaption><h3>LTTB downsampling</h3><p>median time; shorter is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.0370"><th scope="row">tsdb</th><td>456 ms</td></tr>
@@ -142,12 +142,12 @@ system that failed with 32 clients asking about many sensors at once.</p>
 <tr data-none="no such function"><th scope="row">IoTDB</th><td>no such function</td></tr>
 <tr data-none="no such function"><th scope="row">TDengine</th><td>no such function</td></tr>
 <tr data-none="not measured"><th scope="row">Prometheus</th><td>not measured</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-servers-6">
 <figcaption><h3>Max memory</h3><p>GB without file cache, peak of finished runs (16 clients too)</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">GB without file cache, peak of finished runs (16 clients too)</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.0417"><th scope="row">tsdb</th><td>2.0 GB</td></tr>
@@ -160,7 +160,7 @@ system that failed with 32 clients asking about many sensors at once.</p>
 <tr data-len="0.3875" data-tag="refused at 32 clients"><th scope="row">IoTDB</th><td>18.6 GB (refused at 32 clients)</td></tr>
 <tr data-len="0.8000" data-tag="failed at 32 clients"><th scope="row">TDengine</th><td>38.4 GB (failed at 32 clients)</td></tr>
 <tr data-len="0.0229"><th scope="row">Prometheus</th><td>1.1 GB</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 </div>
 <p class="chart-notes">Speed: tsdb is the full bar. Size, time and memory: shorter is better. A box instead of a bar: no number, and why. * QuestDB open source, in its default format, which does not compress. It compresses only partitions you convert to Parquet by hand (with ZSTD 1.02 bytes per reading; converting took 28 minutes); automatic conversion is Enterprise only. Exact numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
@@ -175,57 +175,57 @@ got its readings sorted beforehand (not counted).</p>
 <figure class="chart" id="bench-embedded-1">
 <figcaption><h3>Size on disk</h3><p>MB; times tsdb's size; shorter is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">MB; times tsdb's size; shorter is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.3725"><th scope="row">tsdb</th><td>114 MB</td></tr>
 <tr data-len="0.7157"><th scope="row">chDB</th><td>1.9× (219 MB)</td></tr>
 <tr data-len="1.0000"><th scope="row">DuckDB</th><td>2.7× (306 MB)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-embedded-2">
 <figcaption><h3>Ingest</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>144.8 M rows/s</td></tr>
 <tr data-len="0.4348"><th scope="row">chDB</th><td>2.3× slower (62.5 M rows/s)</td></tr>
 <tr data-len="0.1887"><th scope="row">DuckDB</th><td>5.3× slower (27.5 M rows/s)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-embedded-3">
 <figcaption><h3>Read</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>1,697 M rows/s</td></tr>
 <tr data-len="0.0141"><th scope="row">chDB</th><td>71× slower (23.9 M rows/s)</td></tr>
 <tr data-len="0.0141"><th scope="row">DuckDB</th><td>71× slower (23.9 M rows/s)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-embedded-4">
 <figcaption><h3>Time-weighted average</h3><p>median time; shorter is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.0213"><th scope="row">tsdb</th><td>38.7 ms</td></tr>
 <tr data-len="0.5745"><th scope="row">chDB</th><td>27× slower (1,054 ms)</td></tr>
 <tr data-len="1.0000"><th scope="row">DuckDB</th><td>47× slower (1,820 ms)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-embedded-5">
 <figcaption><h3>LTTB downsampling</h3><p>median time; shorter is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">median time; shorter is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.9091"><th scope="row">tsdb</th><td>404 ms</td></tr>
 <tr data-len="1.0000"><th scope="row">chDB</th><td>1.1× slower (432 ms)</td></tr>
 <tr data-none="not measured"><th scope="row">DuckDB</th><td>not measured</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 </div>
 <p class="chart-notes">Speed: tsdb is the full bar. Size, time and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
@@ -238,42 +238,42 @@ got its readings sorted beforehand (not counted).</p>
 <figure class="chart" id="bench-100b-1">
 <figcaption><h3>Size on disk</h3><p>GB; times tsdb's size; shorter is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">GB; times tsdb's size; shorter is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.6497"><th scope="row">tsdb</th><td>137.8 GB</td></tr>
 <tr data-len="1.0000"><th scope="row">ClickHouse</th><td>1.5× (212.1 GB)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-100b-2">
 <figcaption><h3>Ingest</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>109.4 M rows/s</td></tr>
 <tr data-len="0.4762"><th scope="row">ClickHouse</th><td>2.1× slower (51.6 M rows/s)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-100b-3">
 <figcaption><h3>Read</h3><p>speed; tsdb = full bar; longer is better</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">speed; tsdb = full bar; longer is better</th></tr></thead>
 <tbody>
 <tr class="us" data-len="1.0000"><th scope="row">tsdb</th><td>1,910 M rows/s</td></tr>
 <tr data-len="0.4545"><th scope="row">ClickHouse</th><td>2.2× slower (886 M rows/s)</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 <figure class="chart" id="bench-100b-4">
 <figcaption><h3>Max memory</h3><p>GB; linear scale</p></figcaption>
 <div class="chart-svg"></div>
-<details open><summary>The numbers</summary><div class="table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
+<div class="chart-table table-wrap"><table class="chart-data" data-kind="panel" data-source="BENCHMARKS.md">
 <thead><tr><th scope="col">System</th><th scope="col">GB; linear scale</th></tr></thead>
 <tbody>
 <tr class="us" data-len="0.1864"><th scope="row">tsdb</th><td>1.1 GB</td></tr>
 <tr data-len="1.0000"><th scope="row">ClickHouse</th><td>5.9 GB</td></tr>
-</tbody></table></div></details>
+</tbody></table></div>
 </figure>
 </div>
 <p class="chart-notes">Speed: tsdb is the full bar. Size, time and memory: shorter is better. A box instead of a bar: no number, and why. Exact numbers: <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>

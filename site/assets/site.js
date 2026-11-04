@@ -351,9 +351,12 @@
             "). " + aria.join("; "));
         host.textContent = "";
         host.appendChild(svg);
-        /* the table is written open, so that it is the chart without the script; with the chart drawn it folds */
-        var det = fig.querySelector("details");
-        if (det && !fig.hasAttribute("data-drawn")) det.open = false;
+        /* The table is the chart without the script. With the chart drawn it stays in the page for screen readers
+         * (visually hidden, so the drawing, which says the same, is hidden from them instead). */
+        var table = fig.querySelector(".chart-table");
+        if (table) table.classList.add("visually-hidden");
+        svg.setAttribute("aria-hidden", "true");
+        svg.removeAttribute("role");
         fig.setAttribute("data-drawn", "");
     }
 
