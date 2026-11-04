@@ -23,6 +23,8 @@ What it checks, with the Python standard library only:
 - Every number in a benchmark chart's table (<td data-v>) appears in the results file the table names
   (data-source), so a chart cannot show a number the published results do not have.
 - The scripts in site/assets have no syntax errors (node --check, when node is installed).
+- In a browser, when one is installed: the language tabs work and remember the choice (headless Chromium), and
+  real pointer clicks reach the tabs and the sidebar links in Firefox (tests/firefox-clicks.mjs, WebDriver BiDi).
 - The README's benchmark charts (docs/img/bench-*.svg) are exactly what tools/readme-charts.py draws from
   tools/readme-charts.json, and every number in that file appears in BENCHMARKS.md's summary or memory tables.
 """
@@ -485,6 +487,27 @@ def check_tabs():
             errors.append(f"site/docs/clients.html: language tabs (python chosen on the landing page): {second}")
 
 
+def check_firefox():
+    """Real pointer clicks in Firefox (tests/firefox-clicks.mjs, over WebDriver BiDi): every language tab and a
+    sidebar link must get the click and change state. Skipped without node or Firefox."""
+    node = shutil.which("node")
+    if not node or not (os.environ.get("FIREFOX") or shutil.which("firefox")):
+        print("check_site: no node or Firefox, the clicks are not tried in Firefox")
+        return
+    try:
+        r = subprocess.run([node, os.path.join(ROOT, "tests", "firefox-clicks.mjs"), SITE], capture_output=True,
+                           text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        errors.append("tests/firefox-clicks.mjs: no answer in 240 s")
+        return
+    if r.returncode == 3:
+        print("check_site: " + (r.stdout.strip().splitlines() or ["Firefox skipped"])[-1].lower())
+        return
+    if r.returncode or "RESULT ok" not in r.stdout:
+        fails = [line for line in r.stdout.splitlines() if line.startswith("FAIL")] or [r.stderr.strip()[-400:]]
+        errors.extend("Firefox: " + line for line in fails)
+
+
 def check_readme_charts():
     """The README's charts (docs/img/bench-*.svg) are what tools/readme-charts.py draws from its data file, and every
     number of that file is in BENCHMARKS.md's summary tables."""
@@ -543,6 +566,7 @@ def main():
     check_readme_charts()
     check_contrast(report="--contrast" in sys.argv[1:])
     check_tabs()
+    check_firefox()
     node = shutil.which("node")
     scripts = sorted(f for f in os.listdir(os.path.join(SITE, "assets")) if f.endswith(".js"))
     if node:
