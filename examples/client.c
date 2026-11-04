@@ -1,9 +1,11 @@
 /* tsdb as a server: write one day of readings through tsdbd and read them back.
  *
+ *   build/tsdb /tmp/tsdb-qs/server user add admin --superuser --password-file /tmp/tsdb-qs/password
  *   build/tsdbd --dir /tmp/tsdb-qs/server --port 17070 &
- *   build/client-example 127.0.0.1 17070
+ *   build/client-example 127.0.0.1 17070 admin /tmp/tsdb-qs/password
  *
- * The C client does not link the storage engine; it only talks to the server. */
+ * The last two arguments are the user and a file whose first line is the password. Leave them out for a
+ * tsdbd started with --no-auth. The C client does not link the storage engine; it only talks to the server. */
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
@@ -46,13 +48,16 @@ int main(int argc, char **argv)
 {
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
     int port = argc > 2 ? atoi(argv[2]) : 7070;
+    tsdbc_options login = {0};
+    login.user = argc > 3 ? argv[3] : NULL;          /* NULL: no login */
+    login.password_file = argc > 4 ? argv[4] : NULL; /* never the password itself: argv is visible in ps */
     const int64_t start = 1717200000000; /* 2024-06-01 00:00:00 UTC, in milliseconds */
     const int64_t end = start + 86400000;
 
     int rc = 0;
     tsdbc *c = NULL;
     tsdb_bucket *hours = NULL, *days = NULL;
-    CHECK(tsdbc_connect(host, port, &c)); /* on an error, CHECK prints it and jumps to done: below */
+    CHECK(tsdbc_connect_opts(host, port, &login, &c)); /* on an error, CHECK prints it and jumps to done: below */
 
     tsdb_sid flow;
     CHECK(tsdbc_series(c, "pump7.flow", 1, &flow)); /* 1: create the series if it is missing */

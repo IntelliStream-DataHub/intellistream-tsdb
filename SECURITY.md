@@ -16,22 +16,53 @@ isolation (a private network, a firewall, a VPN) next to the programs that write
 not made to face the internet or any network you do not trust. Speed is a goal of the project, and the design
 leaves out what would cost speed and is not needed behind isolation.
 
-Today that means:
+### Logins and rights
 
-- **No authentication.** Anyone who can open a connection to `tsdbd` can read, write and delete any data.
-- **No encryption.** There is no TLS. Data and queries travel in the clear. The metrics port (`--metrics-port`)
-  is plain HTTP and also has no login.
-- **No access control.** There are no users, roles or per-series permissions.
+`tsdbd` lets in only clients that log in, and gives each user only the rights it was granted:
 
-These three are on the [roadmap](docs/roadmap.md) for after 1.0. Until then:
+- **Login.** A client proves its password with SCRAM-SHA-256 (as PostgreSQL does). The password itself never
+  crosses the network, and the server stores only a salted value made from it (the file `USERS` in the database
+  directory, mode 0600). Whoever reads that file cannot log in with what is in it. The client checks the server
+  too: a server that does not hold the user's stored value cannot finish the login.
+- **Rights.** A user holds `read`, `insert`, `delete` and `admin` on all series, on a name prefix (a tenant such as
+  `acme/`), on one series, or on the names a pattern matches. A series a user may not touch answers exactly like a
+  series that does not exist, so users cannot find out what other tenants store. A superuser may do everything.
+- **Before login** a connection may send only the login messages, each at most 4 KiB, and must finish within
+  `--login-timeout` seconds (10 by default). A failed login closes the connection and is logged with the user
+  name and the address (at most one line a second; never a password).
+- **Without a superuser `tsdbd` does not start.** `--no-auth` turns logins off: then anyone who can open a
+  connection can read, write and delete any data, as before 0.9. Use it only for tests and on your own machine.
+
+What logins do not protect against:
+
+- **Someone who can read the network.** There is no TLS yet ([roadmap](docs/roadmap.md)). Data and queries
+  travel in the clear. A recorded login does not show the password, but it lets the eavesdropper guess passwords
+  offline at their own speed: use long random passwords.
+- **The metrics port** (`--metrics-port`) is plain HTTP without a login. It shows server-wide counts only, no
+  series names or values. Bind it to a trusted interface (`--metrics-bind`).
+- **Someone with access to the database directory or the host.** `tsdb <dir> ...` commands and programs that use
+  tsdb as a library open the files directly and need no login: the file permissions decide. Whoever can write
+  the directory can add a superuser.
+- **State names are shared within a volume.** Series of the `state` type store labels such as `RUNNING` in one
+  list per volume. A user with a right on any series of a volume can look up the labels other tenants added
+  there. Where those labels are sensitive, give each tenant its own volume.
+- **Passwords a tenant admin already knows.** A user with `admin` on `acme/` can create users under `acme/` and set
+  their passwords. If a superuser later lets `acme/bob` read another tenant's series, the admin can no longer
+  change bob's password, but still knows the one they set before. Give such a share to a user whose password the
+  tenant admins never set, or reset the password when you share.
+- **Denial of service by a user who has logged in**, such as one opening thousands of connections.
+
+So, even with logins:
 
 - **Do not expose `tsdbd` to an untrusted network.** `tsdbd` listens on `127.0.0.1` unless you pass `--listen`
   with another address; keep it that way, or bind it to an interface that only your own systems can reach.
 - Put the database directory where only the `tsdbd` user can write. The files are not signed: anyone who can
   write to them can change your data.
-- If you need access from outside, put a proxy, a VPN or an SSH tunnel in front, and do the access control there.
+- If you need access from outside, put a proxy, a VPN or an SSH tunnel in front.
 
-Because of this, we treat "an unauthenticated client can do X" as expected behaviour, not as a vulnerability.
+We treat a way around a login or a grant as a vulnerability: a client that is not logged in doing anything but
+log in, a user reading, changing or learning about series it holds no right on, or a user gaining rights or
+taking over another user it does not manage. With `--no-auth` every client may do everything, by design.
 
 ## What we do defend against
 
@@ -57,8 +88,9 @@ are in scope, and we want to hear about a way around any of them:
 The details are in the "Invariants" section of [AGENTS.md](AGENTS.md); earlier security-related fixes are in the
 [CHANGELOG](CHANGELOG.md) ("Security hardening").
 
-Out of scope for now: missing authentication, TLS or access control (see above), denial of service that needs
-sustained abuse by an authenticated or trusted peer (such as a client opening thousands of connections), and
+Out of scope for now: what logins do not protect against (see above; TLS is on the roadmap), anything a client
+of a `tsdbd` started with `--no-auth` can do, denial of service that needs sustained abuse by a logged-in or
+trusted peer (such as a client opening thousands of connections), and
 hardening ideas without a concrete way to go wrong. You are still welcome to open an ordinary issue for those.
 
 ## Reporting a vulnerability

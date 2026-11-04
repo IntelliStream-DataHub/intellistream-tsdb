@@ -17,10 +17,16 @@ examples below.
 
    ```sh
    make
-   ./build/tsdbd --dir /tmp/tsdb-demo
+   mkdir -p /tmp/tsdb-demo
+   (umask 077 && echo 'try-out-password-17' > /tmp/tsdb-demo/password)
+   ./build/tsdb /tmp/tsdb-demo/db user add admin --superuser --password-file /tmp/tsdb-demo/password
+   ./build/tsdbd --dir /tmp/tsdb-demo/db
    ```
 
-   It listens on port 7070. Leave it running and open a second terminal.
+   The server lets in only clients that log in, so first add a user,
+   `admin`, who may do everything (a "superuser"). Its password goes in a
+   file only you can read. It listens on port 7070. Leave it running and
+   open a second terminal.
 
 2. Run the example program in `examples/quickstart.rs`:
 
@@ -29,18 +35,23 @@ examples below.
    cargo run --example quickstart
    ```
 
-   To use another server, add its address: `cargo run --example quickstart -- 10.0.0.5:7070`.
+   It logs in as `admin` with the password in `/tmp/tsdb-demo/password`. To use another server or user, give the
+   address, the user and its password file: `cargo run --example quickstart -- 10.0.0.5:7070 alice /home/alice/tsdb.pw`.
 
 This is the program. It stores one value per minute for a day, then reads
 them back in three ways:
 
 ```rust
-use tsdb_client::{Client, Group, QueryOpts, Unit};
+use tsdb_client::{Client, ConnectOptions, Group, QueryOpts, Unit};
 
 fn main() -> Result<(), tsdb_client::Error> {
-    // Connect to tsdbd. The address is the first argument, if there is one.
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let mut client = Client::connect(addr.as_str())?;
+    // Connect to tsdbd and log in. The arguments, all optional: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &login)?;
 
     // Get the id of a series (it is created the first time).
     let id = client.series("pump7.flow")?;
@@ -92,7 +103,8 @@ intellistream-tsdb-client = { path = "path/to/tsdb/client/rust" }
 
 ## Connect
 
-`Client::connect("127.0.0.1:7070")` opens one connection. Methods take
+`Client::connect_opts("127.0.0.1:7070", &ConnectOptions::new().user("admin").password_file(path))` opens one
+connection and logs in. Methods take
 `&mut self`, so give each thread its own client. `close()` waits for
 unfinished inserts and closes the connection; dropping the client closes it too.
 
@@ -110,6 +122,90 @@ out returns `Error::Io` of kind `TimedOut` and the client refuses further
 calls (`is_broken()`), so close it and connect again. TCP keepalive is on:
 after 30 s of silence the client probes every 10 s and drops the connection
 after 3 unanswered probes, which `set_keepalive` changes or turns off.
+
+## Log in
+
+tsdbd lets in only clients that log in with a user name and a password. The password never crosses the network:
+client and server prove to each other that they know it (SCRAM-SHA-256). `ConnectOptions` says how to log in:
+
+- `.user("acme/ingest")`: the user name.
+- `.password_file("/etc/tsdb/acme-ingest.password")`: read the password from the first line of this file. Keep the
+  file readable only by you. Or `.password(p)` with the password itself, from wherever your program keeps secrets.
+- `.timeout(Some(Duration::from_secs(30)))`: as `connect_with` above.
+- `.require_auth(true)`: refuse a server that asks for no login (one started with `--no-auth`). Without it, such a
+  server is used without a login.
+
+A wrong user name and a wrong password give the same error, `Error::Auth` ("login failed"). `Client::connect`
+without options logs in as nobody, which only a server started with `--no-auth` accepts. `Pool::connect_opts(addr,
+n, opts)` logs every connection of a pool in. A client keeps what it worked out from the password, so connecting
+again as the same user is quick.
+
+## Users and rights
+
+A superuser may do everything. Every other user has rights (`Rights::READ`, `INSERT`, `DELETE`, `ADMIN`; `WRITE`
+is insert and delete) on the series a selector matches: `Selector::All`, `Selector::Prefix("acme/".into())` (the
+names that start with it), `Selector::Name("pump7.flow".into())` or `Selector::Glob("acme/*/temp".into())` (`*` is
+any text, `?` one byte). `"prefix:acme/".parse()` makes a selector from the text the CLI uses. A series a user may not
+touch answers `permission denied`, whether it exists or not, so nobody learns the names of other users' series.
+
+A superuser, or a user with `admin` on a prefix, adds and changes users over the connection. This is
+`examples/users.rs`; run it after the quick start with `cargo run --example users`:
+
+```rust
+use tsdb_client::{Client, ConnectOptions, QueryOpts, Rights, Selector};
+
+fn main() -> Result<(), tsdb_client::Error> {
+    // Log in as the superuser of the quick start: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let mut admin = Client::connect_opts(addr.as_str(), &ConnectOptions::new().user(user).password_file(password_file))?;
+
+    // A user for a collector of the tenant "acme": it may add rows to the series whose names start with
+    // "acme/", and do nothing else.
+    admin.user_create("acme/ingest", "collector-password-5", false, None)?;
+    admin.grant("acme/ingest", &Selector::Prefix("acme/".into()), Rights::INSERT)?;
+    for u in admin.user_list()? {
+        let grants: Vec<String> = u.grants.iter().map(|g| format!("{} on {}", g.rights, g.selector)).collect();
+        println!("{}: {}", u.name, if u.superuser { "superuser".to_string() } else { grants.join(", ") });
+    }
+
+    // The collector logs in with its own password and writes a row.
+    let login = ConnectOptions::new().user("acme/ingest").password("collector-password-5");
+    let mut collector = Client::connect_opts(addr.as_str(), &login)?;
+    let pump = collector.series("acme/pump1")?;
+    collector.insert_series(pump, &[1_700_000_000_000], &[1.5])?;
+
+    // It may not read the row back, nor see a series of another tenant.
+    if let Err(e) = collector.query_points(pump, .., QueryOpts::asc()) {
+        println!("read acme/pump1: {e}");
+    }
+    if let Err(e) = collector.series("globex/pump1") {
+        println!("globex/pump1: {e}");
+    }
+    collector.close()?;
+
+    // Drop the user again, so that the example can run once more.
+    admin.user_drop("acme/ingest")?;
+    admin.close()
+}
+```
+
+It prints:
+
+```text
+admin: superuser
+acme/ingest: insert on prefix:acme/
+read acme/pump1: server error -16: permission denied
+globex/pump1: server error -16: permission denied
+```
+
+The other calls: `whoami()` (who this connection is, with its grants), `user_password(name, password, None)`,
+`user_alter(name, superuser)` (superusers only) and `revoke(name, &selector, rights)`. The password does not
+travel here either: the client sends only a value made from it. On the server's own machine an operator does the
+same with `tsdb DIR user ...` (see the main README, "Users and logins"); a server started with `--no-auth` has no
+users and refuses these calls.
 
 ## Create a series
 
@@ -226,11 +322,16 @@ each bucket, and `query_lttb` picks a few points that keep the shape of a long
 line, for a chart. This is `examples/analytics.rs`:
 
 ```rust
-use tsdb_client::{Client, QueryOpts, TwaOpts, ValueType};
+use tsdb_client::{Client, ConnectOptions, QueryOpts, TwaOpts, ValueType};
 
 fn main() -> Result<(), tsdb_client::Error> {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let mut client = Client::connect(addr.as_str())?;
+    // As in the quick start: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &login)?;
     let t0: i64 = 1_699_999_200_000; // 2023-11-14 22:00 UTC
     let hour = 3_600_000;
 
@@ -365,10 +466,11 @@ failed. This is what the Python client builds on, but a Rust program that
 wants many answers at once gets them the same way:
 
 ```rust
-use tsdb_client::{AggQuery, Pool};
+use tsdb_client::{AggQuery, ConnectOptions, Pool};
 
 fn main() -> tsdb_client::Result<()> {
-    let pool = Pool::connect("127.0.0.1:7070", 16)?; // 16 connections, one thread each
+    let login = ConnectOptions::new().user("admin").password_file("/tmp/tsdb-demo/password");
+    let pool = Pool::connect_opts("127.0.0.1:7070", 16, login)?; // 16 connections, one thread each
     let day = 86_400_000;
     let queries: Vec<AggQuery> = (0..100).map(|s| AggQuery::new(s, 0, day, 3_600_000)).collect();
     let hourly = pool.query_agg_many(&queries)?; // hourly[i]: the buckets of queries[i]
@@ -393,10 +495,11 @@ series at the same instant. Each series has its own result: an unknown or
 bad one does not spoil the others.
 
 ```rust
-use tsdb_client::{Buckets, Client, MultiOpts, QueryOpts};
+use tsdb_client::{Buckets, Client, ConnectOptions, MultiOpts, QueryOpts};
 
 fn main() -> tsdb_client::Result<()> {
-    let mut c = Client::connect("127.0.0.1:7070")?;
+    let login = ConnectOptions::new().user("admin").password_file("/tmp/tsdb-demo/password");
+    let mut c = Client::connect_opts("127.0.0.1:7070", &login)?;
     let pumps: Vec<u64> = (0..200).map(|i| c.series(&format!("pump{i}.flow"))).collect::<Result<_, _>>()?;
     let day = 86_400_000;
     // every pump by hour over one day: hourly[i] is pumps[i]'s answer

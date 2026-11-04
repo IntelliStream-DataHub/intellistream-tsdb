@@ -13,6 +13,7 @@ make asan                 # the tests under AddressSanitizer + UBSan
 make tsan                 # the tests under ThreadSanitizer, in build-tsan/ (about 2.5 minutes)
 make jepsen               # fault injection: kill -9, simulated power loss, pauses, EIO; workloads kv and classes;
                           # misdirected I/O (verify_checksums on and off) and damage at rest (rot) on kv;
+                          # kv also with login on (jepsen --auth) under kill and power, on each backend;
                           # JEPSEN_SECONDS=300 makes every run that long (the weekly CI run)
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
@@ -28,6 +29,7 @@ make test-clients         # Rust, Python and Java clients against build/tsdbd (n
 make hooks                # once per clone: the commit-msg hook (no session links, sign-off last)
 make integration-tests    # tsdbd + CLI + C/Rust/Python/Java clients end to end, uring and epoll (~2 min, same tools);
                           # INTEG_ARGS="--only matrix,follower --io epoll"; logs in build/integ/logs/; mutate.py checks it has teeth;
+                          # run.py --auth off,on (default both): matrix and cli also as users with grants, cross-tenant reads fail;
                           # make integration-selftest tests the harness itself (seconds)
 ```
 
@@ -55,6 +57,11 @@ holds the port), and fail if the server exited or the file names someone else. A
 reconnect to the one in the new file. `th_owns_port` remembers the listener's socket inode, so a client that asks on every
 connect scans only the server's descriptors, not `/proc/net/tcp` (which grows with every reconnect). `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
 `tests/integration/run.py` has `Server`, and the client test helpers under `client/*/tests` do the same in their language.
+
+Login: tsdbd requires one by default and refuses to start while USERS has no superuser. A harness that tests something
+other than login starts it with `--no-auth` (every data op runs unchecked; the user admin ops are refused). A login
+test makes USERS first, with the CLI (`tsdb DIR user add NAME --superuser --password-file F`, never a password in argv)
+or `tests/auth_harness.h`, and starts tsdbd without the flag; the client helpers take a flag or a root password for it.
 
 Every bug fix comes with a regression test that fails without the fix (check
 by building the old code). Query timings go on a quiet machine: no builds or
@@ -92,6 +99,11 @@ cgroup, so `nice` does not keep your work out of its way.
   is disabled, as on RHEL/AlmaLinux 10); `make test` and `make jepsen` run the server tests on both.
   `server/metrics.c`: the `--metrics-port` thread (Prometheus text format, own poll loop, counters
   the server bumps through small hooks); `tsdb_get_volume_stats` feeds it. `docs/metrics.md` lists the metrics.
+  `server/auth.c`: login (SCRAM-SHA-256) and the rights checks: `auth_ops`, one row per op of `TSDB_OPS`
+  (who may send it, where its series are, the rights it needs), which `handle()` consults before its switch, and
+  the per-user rights maps. `server/users.c`: the USERS file, shared with `tools/users-cli.c` (`tsdb DIR user ...`,
+  which edits it beside a running tsdbd). `client/tsdb_crypto.c`: SHA-256, HMAC, PBKDF2 and base64 for SCRAM, used
+  by tsdbd, the C client and the CLI. `docs/design-auth.md` is the design (decisions A1-A29).
   `client/`: C client library (does not link the engine);
   `client/rust`, `client/python` (PyO3 over the Rust crate), `client/java`: the other clients.
   A protocol change has to reach all four; `make test-clients` runs their tests.
@@ -271,6 +283,21 @@ cgroup, so `nice` does not keep your work out of its way.
   `tsdb_part_info.partition` stays the base partition number (where the partition starts); `cls`, `start_ms`,
   `end_ms` say the rest. Tests that count parts per base partition or name `p<N>_` files set
   `partition_classes = 0`.
+- **Login and rights** (`server/auth.c`, `docs/design-auth.md`). Every op needs a row in `auth_ops` (who may send
+  it, the rights, where its series are: a name, an id, an id per row, QUERY_MULTI's ids); a new op in `TSDB_OPS`
+  without one is refused and fails `tests/test_auth_ops.c`. Ids that only an op's case finds (a row per series of a
+  packed insert, QUERY_MULTI) are checked in that case. Grants name series (`all`, `prefix:`, `name:`, `glob:`), so
+  an id is checked through its name (`tsdb_series_name`) and the answer cached in the user's rights map: names never
+  change and ids are never reused, which keeps the cache right until the user's grants change (then the map goes
+  with the user's state, marked stale; a request already running finishes under its old rights). An id that resolves
+  to no name is DENIED and not cached. **Denied and missing look alike**: a name or id the user holds no right on is
+  `TSDB_ERR_DENIED` whether the series exists or not (only a user with the right on `all` sees NOTFOUND); QUERY_MULTI
+  answers DENIED per series, an insert frame with one denied row is refused whole. Before login only HELLO,
+  AUTH_START and AUTH_CONTINUE pass; every failed login is `TSDB_ERR_AUTH` with no body, an unknown user included.
+  Passwords never travel (clients send a verifier) and never appear in argv or logs. USERS keeps the rules of the
+  other append-only files (checksummed records, OFD write lock, torn tail cut, damage fails the open), and a failed
+  write or fdatasync of it is fail-stop (tsdbd exits with status 1 before acknowledging): an acknowledged revoke
+  must not come back after a power loss. `--no-auth` checks nothing and refuses the user admin ops.
 - **Lock order:** `flush_lock` > `cls_rw` > `class_lock` > the WAL writer role > `publish_lock` >
   `manifest_lock` > `db->lock` > `buf_lock` > `dir_sync_lock` > `fail_lock`; `cls_mu` (the class history map)
   is a leaf. A small write waiting for a large write's publish (the fence's cv, on `buf_lock`) holds no other lock and has
@@ -289,6 +316,10 @@ cgroup, so `nice` does not keep your work out of its way.
   `append_lock` is released (also when a durable record could not be added in memory). The `crashfs` lock in tests is innermost. The scheduler's mutex (`sched.c`) and a multi call's (`multi.c`) are leaves: never held while a job's
   `fn`, a query or the callback runs, nor while an engine lock is taken. A job's `fn` waits only for the items of its
   own nested jobs (a fork/join tree), never for a lock another job's worker may hold while waiting for helpers.
+  tsdbd's login (`server/auth.c`): `users_mu` (the USERS state; held across USERS's I/O and its OFD lock, so on NFS
+  as long as a server is away) > `auth_mu` (the published snapshot of the users and the registry of logged-in
+  users; a leaf, never held across I/O). Logins and requests take only `auth_mu`, never `users_mu`, and no engine
+  lock is taken under either; a user's rights index is built before it is shared and read without a lock.
 - **Directory scans** use `fdopendir(dup(dirfd))` followed by `rewinddir`: the
   dup shares its offset with `dirfd`.
 - **Versions.** The release version is the file `VERSION` (0.9.0); `tools/check-version.sh` compares it with
@@ -322,8 +353,11 @@ cgroup, so `nice` does not keep your work out of its way.
   order and limit for LTTB (and early-stopping limits on bucketed queries), 10
   QUERY_MULTI (many series in one request, one snapshot) and CANCEL, 11 u64 series
   ids (`tsdb_sid`; QUERY_AGG and QUERY_GROUP removed; HELLO floor 11: tsdbd refuses a
-  client below 11 and a client a server below 11, `TSDB_ERR_INVALID`).
-  All four clients speak 11 and no call is gated on a version below the floor;
+  client below 11 and a client a server below 11, `TSDB_ERR_INVALID`), 12 login and
+  access control (HELLO's reply says whether login is required and lists the mechanisms;
+  AUTH_START and AUTH_CONTINUE run SCRAM-SHA-256; WHOAMI, the user admin ops,
+  `TSDB_ERR_DENIED` and `TSDB_ERR_AUTH`; the op list is the X-macro `TSDB_OPS`; HELLO floor 12).
+  All four clients speak 12 and no call is gated on a version below the floor;
   the embedded bindings (Rust `Db`, Python `Db`, Java `EmbeddedDb`) have the
   same operations, and their tests compare them with tsdbd's answers.
 

@@ -57,7 +57,8 @@ once.</dd>
 <h2 id="what-it-is-not">What it is not</h2>
 <ul>
 <li>It is not a SQL database. There are no tables and no joins. You ask for a series and a time range.</li>
-<li>It has no login and no encryption yet. Run it on a trusted network only. See
+<li>Clients log in, and each user gets rights on some series, but there is no encryption yet. Run it on a trusted
+network only. See
 <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a>.</li>
 <li>It is still young. Version 0.9.0 is the first release. Until 1.0, a new 0.9.x version may not open the files of an
 older one; you then move your data with <a href="operations.html#backup">export and import</a>.</li>
@@ -86,6 +87,6 @@ releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-
 
 <nav class="pager" aria-label="Previous and next page"><a class="next" href="install.html"><span>Next</span>Install and build</a></nav></main>
 </div>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>

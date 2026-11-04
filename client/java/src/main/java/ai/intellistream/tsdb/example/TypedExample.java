@@ -2,10 +2,12 @@ package ai.intellistream.tsdb.example;
 
 import ai.intellistream.tsdb.Bucket;
 import ai.intellistream.tsdb.Column;
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.ValuePoints;
 import ai.intellistream.tsdb.ValueType;
 
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.BitSet;
 import java.util.StringJoiner;
@@ -18,14 +20,18 @@ public final class TypedExample {
     /**
      * Runs the example.
      *
-     * @param args the host and port of a running tsdbd; default 127.0.0.1 7070
-     * @throws Exception if the server cannot be reached or a request fails
+     * @param args as for {@link Example}: host, port, user and password file; default 127.0.0.1 7070 admin
+     *     /tmp/tsdb-demo/password
+     * @throws Exception if the server cannot be reached, the login fails or a request fails
      */
     public static void main(String[] args) throws Exception {
         String host = args.length > 0 ? args[0] : "127.0.0.1";
         int port = args.length > 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
+        String user = args.length > 2 ? args[2] : "admin";
+        Path passwordFile = Path.of(args.length > 3 ? args[3] : "/tmp/tsdb-demo/password");
 
-        try (TsdbClient client = TsdbClient.connect(host, port)) {
+        ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+        try (TsdbClient client = TsdbClient.connect(host, port, login)) {
             long t0 = Instant.parse("2024-03-01T00:00:00Z").toEpochMilli();
             long[] ts = {t0, t0 + 60_000, t0 + 120_000, t0 + 180_000};
 

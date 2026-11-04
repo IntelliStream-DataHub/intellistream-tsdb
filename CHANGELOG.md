@@ -35,8 +35,9 @@ disk format and the wire protocol.
 
 ## [0.9.0] - 2026-11-04
 
-The first release. **Disk format version 8, wire protocol version 11** (the server and the clients refuse a peer
-below 11 at HELLO), **embedded C ABI version 2**, series ids of 64 bits. Both formats may still change in a 0.9.x
+The first release. **Disk format version 8, wire protocol version 12** (the server and the clients refuse a peer
+below 12 at HELLO), **embedded C ABI version 2**, series ids of 64 bits, **login required by default**. Both
+formats may still change in a 0.9.x
 release and freeze at 1.0 ([docs/compatibility.md](docs/compatibility.md)). Nothing was released before this
 version, so there is nothing to upgrade from; if you ran a development build, a database of disk format 5, 6 or
 7 is refused at open and is carried over with `tsdb export` (the build that wrote it) and `tsdb import` (this
@@ -104,8 +105,40 @@ The server (`tsdbd`)
   `--multi-max-rows N` (rows or buckets of one QUERY_MULTI, default 268,435,456), `--granule-rows N` (at
   creation), `--merge-idle-s N`, `--flush-interval-ms N`, `--pin-index`.
 
+Logins and access control (protocol 12, [docs/design-auth.md](docs/design-auth.md))
+- tsdbd lets in only clients that log in with SCRAM-SHA-256, as PostgreSQL does: the password never crosses the
+  network, both sides prove themselves, and the server keeps only a salted verifier per user in `USERS` in the
+  database directory (append-only checksummed records, mode 0600, fail-stop on a failed write or sync). An
+  unknown user fails exactly like a wrong password. Before login a connection may send only the login messages
+  (at most 4 KiB each) and must finish within `--login-timeout` (10 s).
+- Rights per user: `read`, `insert`, `delete` and `admin` (`write` is insert and delete) on `all` series, a name
+  prefix (`prefix:acme/`, a tenant), one series (`name:N`) or a glob (`glob:acme/*/temp?`: `*` any bytes, `?` one
+  byte). Grants only add. A superuser may do everything. A series a user holds no right on answers like a
+  missing one (`TSDB_ERR_DENIED` for ids, whether they exist or not); QUERY_MULTI answers the series it may and
+  gives each denied one its own status. Every op passes one table indexed by op number; an op missing from it is
+  refused.
+- Tenant admins: `admin` on a prefix lets a user create, drop and set the password of users named under it and
+  grant them rights inside its own `admin` selectors, never more.
+- tsdbd refuses to start without a superuser and names the command that adds one. `--no-auth` turns logins off
+  (every client may do everything, a warning at start; the user admin requests are refused).
+- `tsdb <dir> user add|passwd|drop|alter|grant|revoke|list|compact` edits USERS offline, also while tsdbd runs
+  (it reads changes within a second); `tsdb user ... --server HOST:PORT --login NAME` does the same through tsdbd,
+  for tenant admins. Passwords come from a prompt, `--password-file` or `TSDB_PASSWORD`, never from the command
+  line, and only the verifier leaves the client.
+- All four clients log in (C `tsdbc_connect_auth` and `tsdbc_connect_opts`; Rust `Client::connect_opts` with
+  `ConnectOptions`; Python `Client(..., user=, password=)` or `password_file=`; Java `TsdbClient.connect(host, port,
+  ConnectOptions)`), with a password or a password file, and manage users and grants (`whoami`, `user_create` /
+  `userCreate`, `grant`, ...). PBKDF2 runs once per process: the keys are cached. Without a user they work only
+  with a tsdbd started with `--no-auth`.
+- New error codes `TSDB_ERR_DENIED` (-16) and `TSDB_ERR_AUTH` (-17); the metric `tsdb_logins_total{result}`.
+- `examples/client.c` takes a user and a password file.
+- The Pulsar sink logs in: `user` and `password` (a secret, from Pulsar's secrets provider; refused in the plain
+  config) or `passwordFile`. A refused login is retried with the sink's backoff while Pulsar holds the backlog; a
+  record the user may not write (`TSDB_ERR_DENIED`) goes to the dead-letter path, the rest of its batch is written.
+  `insert` on the sink's series is all the user needs.
+
 Clients and bindings
-- Clients of tsdbd in C, Rust, Python and Java, all at protocol 11, with the same operations: the spread (range,
+- Clients of tsdbd in C, Rust, Python and Java, all at protocol 12, with the same operations: the spread (range,
   variance, standard deviation) in fixed, calendar and bounds buckets; time-weighted averages; LTTB; aggregates
   with an order and a limit that stop early; range delete, replace and retention; and many series in one call
   (`tsdbc_query_multi` in C; `query_{rows,buckets,spread,twa,lttb}_multi` and `query_chunks_multi` in Rust
@@ -202,6 +235,10 @@ For anyone who ran a development build; a first install is not affected.
   safely). The two version-1 aggregate operations QUERY_AGG and QUERY_GROUP are removed: QUERY_BUCKETS and
   QUERY_BOUNDS answer the same queries. Ids cost 4 bytes more per request (nothing more where a reserved word
   took it, about nothing in packed inserts). Upgrade the server and its clients together.
+- **Wire protocol 12: login.** HELLO's reply says whether the server wants a login; the floor is now 12 on both
+  sides. tsdbd no longer starts on a database without a superuser: add one with
+  `tsdb <dir> user add NAME --superuser`, or start it with `--no-auth` to keep the old open behaviour (tests and
+  try-outs only). Clients connecting without a user work only with `--no-auth`; with one they log in.
 - **Series ids in the programming interfaces.** Every id is at least 2^32 and 0 is never one, so an id cut to 32
   bits in a cast, a Java `int`, a Rust `as u32` or a Python `"I"` is refused instead of being taken for another
   series: a query of such an id (or of one with any of bits 48-63 set) answers `TSDB_ERR_INVALID` rather than an
@@ -373,11 +410,13 @@ Import
 
 ### Known limitations
 
-- No authentication, no TLS and no access control: tsdbd belongs on a trusted network only. Put it behind a
-  firewall or a private network, and bind it to the interface you mean (`--listen`).
+- No TLS: data, queries and login exchanges travel in the clear (a recorded login lets an eavesdropper guess
+  the password offline), and the metrics port has no login. tsdbd belongs on a trusted network only. Put it
+  behind a firewall or a private network, and bind it to the interface you mean (`--listen`). State names are
+  shared by the series of a volume, across tenants (SECURITY.md).
 - One writing server per database. Read-only followers can read the same directory; automatic failover is
   designed (docs/ha.md) but not built.
-- The disk format (version 8) and the wire protocol (version 11) may still change in a 0.9.x release, with
+- The disk format (version 8) and the wire protocol (version 12) may still change in a 0.9.x release, with
   export and import, or a migration, to carry data over. A database of another format version is refused
   when it is opened, with a message that says so. They freeze at 1.0. See docs/compatibility.md.
 - Client and server of different 0.9.x releases may not understand each other: use the same release on both

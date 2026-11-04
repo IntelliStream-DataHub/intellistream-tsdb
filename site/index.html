@@ -270,10 +270,12 @@ it.</p>
 <div class="tabpanel" role="tabpanel" data-key="c">
 <pre><code class="language-c" data-src="examples/client.c">/* tsdb as a server: write one day of readings through tsdbd and read them back.
  *
+ *   build/tsdb /tmp/tsdb-qs/server user add admin --superuser --password-file /tmp/tsdb-qs/password
  *   build/tsdbd --dir /tmp/tsdb-qs/server --port 17070 &amp;
- *   build/client-example 127.0.0.1 17070
+ *   build/client-example 127.0.0.1 17070 admin /tmp/tsdb-qs/password
  *
- * The C client does not link the storage engine; it only talks to the server. */
+ * The last two arguments are the user and a file whose first line is the password. Leave them out for a
+ * tsdbd started with --no-auth. The C client does not link the storage engine; it only talks to the server. */
 #include &lt;inttypes.h&gt;
 #include &lt;math.h&gt;
 #include &lt;stdio.h&gt;
@@ -316,13 +318,16 @@ int main(int argc, char **argv)
 {
     const char *host = argc &gt; 1 ? argv[1] : "127.0.0.1";
     int port = argc &gt; 2 ? atoi(argv[2]) : 7070;
+    tsdbc_options login = {0};
+    login.user = argc &gt; 3 ? argv[3] : NULL;          /* NULL: no login */
+    login.password_file = argc &gt; 4 ? argv[4] : NULL; /* never the password itself: argv is visible in ps */
     const int64_t start = 1717200000000; /* 2024-06-01 00:00:00 UTC, in milliseconds */
     const int64_t end = start + 86400000;
 
     int rc = 0;
     tsdbc *c = NULL;
     tsdb_bucket *hours = NULL, *days = NULL;
-    CHECK(tsdbc_connect(host, port, &amp;c)); /* on an error, CHECK prints it and jumps to done: below */
+    CHECK(tsdbc_connect_opts(host, port, &amp;login, &amp;c)); /* on an error, CHECK prints it and jumps to done: below */
 
     tsdb_sid flow;
     CHECK(tsdbc_series(c, "pump7.flow", 1, &amp;flow)); /* 1: create the series if it is missing */
@@ -359,15 +364,19 @@ done:
     return rc;
 }</code></pre>
 <p class="code-source">examples/client.c. Build it with <code>make</code>; run it with
-<code>build/client-example 127.0.0.1 7070</code>.</p>
+<code>build/client-example 127.0.0.1 7070 admin /tmp/tsdb-demo/password</code>.</p>
 </div>
 <div class="tabpanel" role="tabpanel" data-key="rust">
-<pre><code class="language-rust" data-src="client/rust/examples/quickstart.rs">use tsdb_client::{Client, Group, QueryOpts, Unit};
+<pre><code class="language-rust" data-src="client/rust/examples/quickstart.rs">use tsdb_client::{Client, ConnectOptions, Group, QueryOpts, Unit};
 
 fn main() -&gt; Result&lt;(), tsdb_client::Error&gt; {
-    // Connect to tsdbd. The address is the first argument, if there is one.
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let mut client = Client::connect(addr.as_str())?;
+    // Connect to tsdbd and log in. The arguments, all optional: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &amp;login)?;
 
     // Get the id of a series (it is created the first time).
     let id = client.series("pump7.flow")?;
@@ -402,7 +411,9 @@ in client/rust.</p>
 <div class="tabpanel" role="tabpanel" data-key="python">
 <pre><code class="language-python" data-src="client/python/README.md#Quick start">from tsdb_client import Client
 
-with Client("127.0.0.1", port=7070) as client:  # the connection closes at the end of the block
+# Connect and log in as admin, with the password from the file of step 1.
+# The connection closes at the end of the with block.
+with Client("127.0.0.1", port=7070, user="admin", password_file="/tmp/tsdb-demo/password") as client:
     # Get the id of a series (it is created the first time).
     series = client.series("pump7.flow")
 
@@ -430,15 +441,20 @@ with Client("127.0.0.1", port=7070) as client:  # the connection closes at the e
 <pre><code class="language-java" data-src="client/java/src/main/java/ai/intellistream/tsdb/example/Example.java">package ai.intellistream.tsdb.example;
 
 import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.Group;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.Unit;
 
+import java.nio.file.Path;
 import java.time.Instant;
 
-/** Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port]}. */
+/**
+ * Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port] [user]
+ * [password-file]}.
+ */
 public final class Example {
     private Example() {
     }
@@ -446,14 +462,19 @@ public final class Example {
     /**
      * Runs the example.
      *
-     * @param args the host and port of a running tsdbd; default 127.0.0.1 7070
-     * @throws Exception if the server cannot be reached or a request fails
+     * @param args the host and port of a running tsdbd, the user to log in as and the file with its password;
+     *     default 127.0.0.1 7070 admin /tmp/tsdb-demo/password
+     * @throws Exception if the server cannot be reached, the login fails or a request fails
      */
     public static void main(String[] args) throws Exception {
         String host = args.length &gt; 0 ? args[0] : "127.0.0.1";
         int port = args.length &gt; 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
+        String user = args.length &gt; 2 ? args[2] : "admin";
+        Path passwordFile = Path.of(args.length &gt; 3 ? args[3] : "/tmp/tsdb-demo/password");
 
-        try (TsdbClient client = TsdbClient.connect(host, port)) {
+        // Log in as user, with the password from the first line of passwordFile.
+        ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+        try (TsdbClient client = TsdbClient.connect(host, port, login)) {
             long pump = client.series("pump7.flow_m3h"); // get or create
 
             // One reading per minute for a day, from 2024-03-01T00:00Z, as a single batch.
@@ -490,14 +511,20 @@ public final class Example {
 <ol class="steps">
 <li>Install a C compiler, make, libzstd and liburing. <a href="docs/install.html">Install and build</a> lists the
 packages.</li>
-<li>Run <code>make</code> in the checkout. Everything lands in <code>build/</code>.</li>
-<li>Start the server with <code>build/tsdbd --dir /tmp/tsdb-demo</code>. It listens on 127.0.0.1, port 7070.</li>
+<li>In the checkout, build everything into <code>build/</code>, add a user who may do everything (its password in a
+file only you can read: the programs above log in with it), and start the server. It listens on 127.0.0.1, port
+7070:
+<pre><code class="language-sh" data-src="client/rust/README.md#Quick start">make
+mkdir -p /tmp/tsdb-demo
+(umask 077 &amp;&amp; echo 'try-out-password-17' &gt; /tmp/tsdb-demo/password)
+./build/tsdb /tmp/tsdb-demo/db user add admin --superuser --password-file /tmp/tsdb-demo/password
+./build/tsdbd --dir /tmp/tsdb-demo/db</code></pre></li>
 <li>Run one of the programs above. <a href="docs/clients.html">The clients page</a> explains each step.</li>
 </ol>
 </div>
 </section>
 
 </main>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>

@@ -1,9 +1,13 @@
-use tsdb_client::{Client, Group, QueryOpts, Unit};
+use tsdb_client::{Client, ConnectOptions, Group, QueryOpts, Unit};
 
 fn main() -> Result<(), tsdb_client::Error> {
-    // Connect to tsdbd. The address is the first argument, if there is one.
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7070".to_string());
-    let mut client = Client::connect(addr.as_str())?;
+    // Connect to tsdbd and log in. The arguments, all optional: the address, the user and its password file.
+    let mut args = std::env::args().skip(1);
+    let addr = args.next().unwrap_or_else(|| "127.0.0.1:7070".to_string());
+    let user = args.next().unwrap_or_else(|| "admin".to_string());
+    let password_file = args.next().unwrap_or_else(|| "/tmp/tsdb-demo/password".to_string());
+    let login = ConnectOptions::new().user(user).password_file(password_file);
+    let mut client = Client::connect_opts(addr.as_str(), &login)?;
 
     // Get the id of a series (it is created the first time).
     let id = client.series("pump7.flow")?;

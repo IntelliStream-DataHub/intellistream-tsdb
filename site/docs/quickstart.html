@@ -52,14 +52,18 @@ build/tsdb /tmp/tsdb-qs/db query pump7.flow 2024-06-01 2024-06-03 all 1d --tz Eu
 # 5. The same from a C program, with no server: it writes a day and reads it back.
 build/embedded-example /tmp/tsdb-qs/lib
 
-# 6. Start the server in the background. It saves its process id, so we can stop exactly this one.
-#    --no-auth: no logins, anyone who reaches the port may read and write (fine for this try-out on your machine).
-build/tsdbd --dir /tmp/tsdb-qs/server --no-auth --port 17070 &gt; /tmp/tsdb-qs/tsdbd.log 2&gt;&amp;1 &amp;
+# 6. The server lets in only clients that log in, and it does not start without a user who may do
+#    everything (a "superuser"). Add one called admin. Its password goes in a file only you can read:
+#    tsdb never takes a password from the command line, where other users could see it.
+#    Then start the server in the background. It saves its process id, so we can stop exactly this one.
+(umask 077 &amp;&amp; echo 'try-out-password-17' &gt; /tmp/tsdb-qs/password)
+build/tsdb /tmp/tsdb-qs/server user add admin --superuser --password-file /tmp/tsdb-qs/password
+build/tsdbd --dir /tmp/tsdb-qs/server --port 17070 &gt; /tmp/tsdb-qs/tsdbd.log 2&gt;&amp;1 &amp;
 echo $! &gt; /tmp/tsdb-qs/tsdbd.pid
 for i in $(seq 100); do grep -q serving /tmp/tsdb-qs/tsdbd.log &amp;&amp; break; sleep 0.1; done
 
-# 7. A client writes a day to the server and reads it back over the network.
-build/client-example 127.0.0.1 17070
+# 7. A client logs in as admin, writes a day to the server and reads it back over the network.
+build/client-example 127.0.0.1 17070 admin /tmp/tsdb-qs/password
 
 # 8. Stop the server, wait until it has gone (it finishes its writes first), then look at what it stored.
 kill $(cat /tmp/tsdb-qs/tsdbd.pid)
@@ -93,14 +97,18 @@ read 1440 rows, the first: 1717200000000 50.00
 24 hours, the first average: 51.28
 Oslo day 1: 1320 rows, average 50.23
 Oslo day 2: 120 rows, average 47.47</code></pre>
-<p>Step 6 writes a line like this to <code>/tmp/tsdb-qs/tsdbd.log</code>:</p>
-<pre><code data-lang="plain" data-block="3" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, no login (--no-auth), simd avx512, io io_uring</code></pre>
+<p>Step 6 prints the new user and its number:</p>
+<pre><code data-lang="plain" data-block="3" data-src="README.md#Quick start (5 minutes">admin	uid 1	superuser</code></pre>
+<p>and writes a line like this to <code>/tmp/tsdb-qs/tsdbd.log</code>:</p>
+<pre><code data-lang="plain" data-block="4" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, login required, simd avx512, io io_uring</code></pre>
 <p>Step 8 prints a table with <code>rows 1440</code>: what the client wrote is on disk in the server's directory.</p>
 
 <h2 id="trouble">If something goes wrong</h2>
 <ul>
 <li>If the server cannot start because the port is taken (the log then says "cannot listen"), something else uses
 17070. Pick another number in steps 6 and 7.</li>
+<li>If the log says "no superuser", the <code>user add</code> line of step 6 did not run. If the client says "login
+failed", the user name or the password file in step 7 is not the one of step 6.</li>
 <li>If the server is still running after a mistake, stop it with <code>kill $(cat /tmp/tsdb-qs/tsdbd.pid)</code>.
 Do not use <code>pkill</code> or <code>killall</code>: they stop every process with that name, also ones that are not
 yours.</li>
@@ -113,6 +121,6 @@ the same programs in Rust, Python and Java.</p>
 
 <nav class="pager" aria-label="Previous and next page"><a class="prev" href="install.html"><span>Previous</span>Install and build</a><a class="next" href="concepts.html"><span>Next</span>Concepts</a></nav></main>
 </div>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>

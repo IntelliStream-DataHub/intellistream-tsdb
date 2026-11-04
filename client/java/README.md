@@ -27,15 +27,22 @@ Start Java with `--enable-native-access=ALL-UNNAMED` so that it allows the calls
 
    ```sh
    make
-   ./build/tsdbd --dir /tmp/tsdb-demo --port 7070
+   mkdir -p /tmp/tsdb-demo
+   (umask 077 && echo 'try-out-password-17' > /tmp/tsdb-demo/password)
+   ./build/tsdb /tmp/tsdb-demo/db user add admin --superuser --password-file /tmp/tsdb-demo/password
+   ./build/tsdbd --dir /tmp/tsdb-demo/db --port 7070
    ```
 
-2. In another terminal, build the client and run the example below:
+   The server lets in only clients that log in, so first add a user, `admin`, who may do everything (a
+   "superuser"). Its password goes in a file only you can read.
+
+2. In another terminal, build the client and run the example below. It logs in as `admin` with the password from
+   `/tmp/tsdb-demo/password`:
 
    ```sh
    cd client/java
    mvn -q package -DskipTests
-   java -cp target/tsdb-client-0.9.0.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070
+   java -cp target/tsdb-client-0.9.0.jar ai.intellistream.tsdb.example.Example 127.0.0.1 7070 admin /tmp/tsdb-demo/password
    ```
 
 3. To use the client in your own Maven project, install it into your local Maven repository with `mvn install`
@@ -56,15 +63,20 @@ then reads them back in three ways:
 package ai.intellistream.tsdb.example;
 
 import ai.intellistream.tsdb.Bucket;
+import ai.intellistream.tsdb.ConnectOptions;
 import ai.intellistream.tsdb.Group;
 import ai.intellistream.tsdb.Order;
 import ai.intellistream.tsdb.Points;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.Unit;
 
+import java.nio.file.Path;
 import java.time.Instant;
 
-/** Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port]}. */
+/**
+ * Quick start: {@code java -cp tsdb-client.jar ai.intellistream.tsdb.example.Example [host] [port] [user]
+ * [password-file]}.
+ */
 public final class Example {
     private Example() {
     }
@@ -72,14 +84,19 @@ public final class Example {
     /**
      * Runs the example.
      *
-     * @param args the host and port of a running tsdbd; default 127.0.0.1 7070
-     * @throws Exception if the server cannot be reached or a request fails
+     * @param args the host and port of a running tsdbd, the user to log in as and the file with its password;
+     *     default 127.0.0.1 7070 admin /tmp/tsdb-demo/password
+     * @throws Exception if the server cannot be reached, the login fails or a request fails
      */
     public static void main(String[] args) throws Exception {
         String host = args.length > 0 ? args[0] : "127.0.0.1";
         int port = args.length > 1 ? Integer.parseInt(args[1]) : TsdbClient.DEFAULT_PORT;
+        String user = args.length > 2 ? args[2] : "admin";
+        Path passwordFile = Path.of(args.length > 3 ? args[3] : "/tmp/tsdb-demo/password");
 
-        try (TsdbClient client = TsdbClient.connect(host, port)) {
+        // Log in as user, with the password from the first line of passwordFile.
+        ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+        try (TsdbClient client = TsdbClient.connect(host, port, login)) {
             long pump = client.series("pump7.flow_m3h"); // get or create
 
             // One reading per minute for a day, from 2024-03-01T00:00Z, as a single batch.
@@ -115,7 +132,8 @@ public final class Example {
 ## Connect
 
 ```java
-try (TsdbClient client = TsdbClient.connect("127.0.0.1", 7070)) {
+ConnectOptions login = ConnectOptions.defaults().user("admin").passwordFile(Path.of("/tmp/tsdb-demo/password"));
+try (TsdbClient client = TsdbClient.connect("127.0.0.1", 7070, login)) {
     // use the client here; it is closed at the end of the block
 }
 ```
@@ -132,11 +150,93 @@ times out throws `TsdbException` with `Status.ERR_IO` (`isTimeout()` is true) an
 one. TCP keepalive is on: after 30 seconds of silence the client probes every 10 seconds and drops the connection
 after 3 unanswered probes (`setKeepAlive` changes or turns it off).
 
+## Log in
+
+tsdbd lets in only clients that log in with a user name and a password. The password never crosses the network:
+client and server prove to each other that they know it (SCRAM-SHA-256). `ConnectOptions` says how to log in:
+
+- `.user("acme/ingest")`: the user name.
+- `.passwordFile(Path.of("/etc/tsdb/acme-ingest.password"))`: read the password from the first line of this file.
+  Keep the file readable only by you. Or `.password(chars)` with the password itself, from wherever your program
+  keeps secrets.
+- `.connectTimeout(d)` and `.requestTimeout(d)`: as the two `Duration`s of `connect` above.
+- `.requireAuth(true)`: refuse a server that asks for no login (one started with `--no-auth`). Without it, such a
+  server is used without a login.
+
+A wrong user name and a wrong password give the same error, `TsdbException` with `Status.ERR_AUTH`.
+`TsdbClient.connect(host, port)` without options logs in as nobody, which only a server started with `--no-auth`
+accepts. A client keeps what it worked out from the password, so connecting again as the same user is quick.
+
+## Users and rights
+
+A superuser may do everything. Every other user has rights (`Rights.READ`, `INSERT`, `DELETE`, `ADMIN`; `WRITE` is
+insert and delete) on the series a selector matches: `Selector.all()`, `Selector.prefix("acme/")` (the names that
+start with it), `Selector.name("pump7.flow")` or `Selector.glob("acme/*/temp")` (`*` is any text, `?` one byte).
+`Selector.parse("prefix:acme/")` and `Rights.parse("read,insert")` read the text the CLI uses. A series a user may
+not touch answers `Status.ERR_DENIED`, whether it exists or not, so nobody learns the names of other users' series.
+
+A superuser, or a user with `admin` on a prefix, adds and changes users over the connection. This is the heart of
+`ai.intellistream.tsdb.example.UsersExample`, which you can run after the quick start as the `Example` above:
+
+```java
+ConnectOptions login = ConnectOptions.defaults().user(user).passwordFile(passwordFile);
+try (TsdbClient admin = TsdbClient.connect(host, port, login)) {
+    // A user for a collector of the tenant "acme": it may add rows to the series whose names start
+    // with "acme/", and do nothing else.
+    admin.userCreate("acme/ingest", "collector-password-5".toCharArray(), false);
+    admin.grant("acme/ingest", Selector.prefix("acme/"), Rights.INSERT);
+    for (User u : admin.userList()) {
+        StringJoiner grants = new StringJoiner(", ");
+        for (Grant g : u.grants())
+            grants.add(g.rights() + " on " + g.selector());
+        System.out.println(u.name() + ": " + (u.superuser() ? "superuser" : grants));
+    }
+
+    // The collector logs in with its own password and writes a row.
+    ConnectOptions collectorLogin = ConnectOptions.defaults().user("acme/ingest")
+            .password("collector-password-5");
+    try (TsdbClient collector = TsdbClient.connect(host, port, collectorLogin)) {
+        long pump = collector.series("acme/pump1");
+        collector.insert(pump, new long[] {1_700_000_000_000L}, new float[] {1.5f});
+
+        // It may not read the row back, nor see a series of another tenant.
+        try {
+            collector.queryPoints(pump, Long.MIN_VALUE, Long.MAX_VALUE, Order.ASC, 10);
+        } catch (TsdbException e) {
+            System.out.println("read acme/pump1: " + e.getMessage());
+        }
+        try {
+            collector.series("globex/pump1");
+        } catch (TsdbException e) {
+            System.out.println("globex/pump1: " + e.getMessage());
+        }
+    }
+
+    // Drop the user again, so that the example can run once more.
+    admin.userDrop("acme/ingest");
+}
+```
+
+It prints:
+
+```text
+admin: superuser
+acme/ingest: insert on prefix:acme/
+read acme/pump1: permission denied (-16)
+globex/pump1: permission denied (-16)
+```
+
+The other calls: `whoami()` (who this connection is, with its grants), `userPassword(name, chars)`,
+`userAlter(name, superuser)` (superusers only) and `revoke(name, selector, rights)`. The password does not travel
+here either: the client sends only a value made from it. On the server's own machine an operator does the same with
+`tsdb DIR user ...` (see the main README, "Users and logins"); a server started with `--no-auth` has no users and
+refuses these calls.
+
 ## Create a series
 
 Series ids are 64-bit numbers in a `long`, handed out by the database: the volume in the high half, so every id is
 at least 2^32 and positive. Look them up by name and keep them in a `long`, never an `int`; do not count on them
-being 0, 1, 2 and so on. The client speaks protocol 11 and
+being 0, 1, 2 and so on. The client speaks protocol 12 and
 `TsdbClient.connect` fails with `Status.ERR_INVALID` ("upgrade the server") when the server answers an older version.
 
 A series has a name and a value type. `series` gets a series of 32-bit floats, and creates it if it is missing.

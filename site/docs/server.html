@@ -33,9 +33,10 @@ it. It runs one event loop (io_uring, or epoll where io_uring is off) and a pool
 <h2 id="start">Start it</h2>
 <p>The only flag you must give is the directory: <code>build/tsdbd --dir /data/sensors</code>. It listens on
 127.0.0.1, port 7070. The directory is created if it is missing. To listen on another address, add
-<code>--listen ADDR</code>; tsdbd has no login, so listen on a trusted network only.</p>
-<p>When it serves, it prints one line, for example:</p>
-<pre><code data-lang="plain" data-block="3" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, no login (--no-auth), simd avx512, io io_uring</code></pre>
+<code>--listen ADDR</code>; there is no encryption yet, so listen on a trusted network only.</p>
+<p>It does not start until the database has a superuser, a user who may do everything (see
+<a href="#users">Users and logins</a> below). When it serves, it prints one line, for example:</p>
+<pre><code data-lang="plain" data-block="4" data-src="README.md#Quick start (5 minutes">tsdbd: serving /tmp/tsdb-qs/server on 127.0.0.1:17070, 32 workers, up to 10000 connections, login required, simd avx512, io io_uring</code></pre>
 <p>Stop it with <code>kill PID</code> (SIGTERM). It finishes its writes first. To run it as a service, use the
 systemd unit of the <a href="install.html#tarball">portable tarball</a>.</p>
 
@@ -65,11 +66,32 @@ systemd unit of the <a href="install.html#tarball">portable tarball</a>.</p>
 <tr><td><code>--merge-idle-s S</code></td><td>300</td><td>a partition with no new data for this long is merged into one part; <code>-1</code> never</td></tr>
 <tr><td><code>--flush-interval-ms MS</code></td><td>5000</td><td>how old the newest rows in memory may get before they are written into parts</td></tr>
 <tr><td><code>--no-fsync</code></td><td></td><td>never syncs to disk. Faster, but a power loss then looks like damage, and the next start refuses the database</td></tr>
+<tr><td><code>--login-timeout S</code></td><td>10</td><td>a client that has not logged in after this many seconds is disconnected</td></tr>
+<tr><td><code>--no-auth</code></td><td></td><td>no logins: every client may do everything. For tests and try-outs on your own machine only</td></tr>
 <tr><td><code>--version</code></td><td></td><td>prints the version</td></tr>
 </tbody></table></div>
 <p><code>--partition-ms</code>, <code>--partition-classes</code> and <code>--granule-rows</code> set how a new database
 lays out its files. They count only when the database is created; the defaults suit most data. Run
 <code>build/tsdbd</code> with a wrong flag to see the full list.</p>
+
+<h2 id="users">Users and logins</h2>
+<p>Every client logs in with a user name and a password. The password never crosses the network: the client and the
+server prove to each other that they know it (SCRAM-SHA-256, the method PostgreSQL uses). The users live in the
+file <code>USERS</code> in the database directory, which keeps only a value made from each password, not the
+password.</p>
+<p>tsdbd does not start until there is a superuser, a user who may do everything. Add one with the command line,
+before the first start:</p>
+<pre><code class="language-sh" data-src="README.md#Users and logins">build/tsdb /data/sensors user add admin --superuser    # asks for the password (or --password-file FILE)</code></pre>
+<p>Every other user gets rights on some series: <code>read</code>, <code>insert</code>, <code>delete</code> or
+<code>admin</code> (<code>write</code> means insert and delete), on <code>all</code> series, on a name prefix
+(<code>prefix:acme/</code>), on one series (<code>name:pump7.flow</code>) or on a pattern
+(<code>glob:acme/*/temp?</code>). The <a href="operations.html#users">operations page</a> shows how to set them up.
+A series a user may not touch answers as if it did not exist.</p>
+<p>The <code>tsdb DIR user ...</code> commands change <code>USERS</code> directly and work while tsdbd runs: it
+reads the change within a second. Without a superuser tsdbd stops at once with</p>
+<pre><code data-lang="plain" data-src="README.md#Users and logins">tsdbd: no superuser: run 'tsdb /data/sensors user add NAME --superuser', or start with --no-auth</code></pre>
+<p>With <code>--no-auth</code> nobody logs in and anyone who reaches the port may read, write and delete everything,
+as in the quick starts of other databases. Use it only on your own machine.</p>
 
 <h2 id="threads">How it uses threads</h2>
 <p>A small query runs on one thread. A large one, or a request for many series, spreads over more threads, up to
@@ -87,6 +109,6 @@ connection error, close the connection and connect again.</p>
 
 <nav class="pager" aria-label="Previous and next page"><a class="prev" href="cli.html"><span>Previous</span>Command line</a><a class="next" href="operations.html"><span>Next</span>Operations</a></nav></main>
 </div>
-<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: it has no login or encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
+<footer class="site"><div class="footer-in"><p class="footer-brand"><img src="../assets/logo.svg" alt="" width="24" height="24"> tsdb</p><p>Open source under the <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/LICENSE">Apache License 2.0</a>. Copyright 2026 IntelliStream AS. The code, the issues and the releases are on <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb">GitHub</a>.</p><p>tsdb is made for a trusted network: clients log in, but there is no encryption yet. Read <a href="https://github.com/IntelliStream-DataHub/intellistream-tsdb/blob/main/SECURITY.md">SECURITY.md</a> before you run it anywhere else.</p></div></footer>
 </body>
 </html>
