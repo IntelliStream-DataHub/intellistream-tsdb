@@ -419,8 +419,9 @@
     var CENTER_X = 0.0, CENTER_Y = 0.5;
 
     /* The view: three-quarter front from the car's left, nose towards the lower right, the camera about 25 degrees
-     * above the car and close to it with a short focal length: a wide-angle look, the front wing and tyres large. */
-    var VIEW = { angle: -2.45, pitch: -0.44, dist: 6, f: 340 };
+     * above the car and very close to it with a short focal length: a wide-angle look, the front wing and tyres large,
+     * the rear wing far away. The camera is rolled a little (about 7 degrees). */
+    var VIEW = { angle: -2.45, pitch: -0.44, dist: 4.3, f: 250, roll: -0.12 };
 
     function proj(x, y, z) {
         var ca = Math.cos(VIEW.angle), sa = Math.sin(VIEW.angle);
@@ -430,7 +431,10 @@
         var rx = x * ca + z * sa, rz = -x * sa + z * ca; /* turn around the vertical axis */
         var ry = y * cp - rz * sp, rz2 = y * sp + rz * cp; /* tilt: a negative pitch looks down on the car */
         var k = VIEW.f / (VIEW.dist + rz2);
-        return [rx * k, -ry * k, rz2];
+        /* roll: the camera tilted a little sideways, as a hand-held wide-angle shot */
+        var cr = Math.cos(VIEW.roll), sr = Math.sin(VIEW.roll);
+        var px = rx * k, py = -ry * k;
+        return [px * cr - py * sr, px * sr + py * cr, rz2];
     }
 
     function f1(v) {
