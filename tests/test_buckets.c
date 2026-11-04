@@ -290,6 +290,15 @@ int main(int argc, char **argv)
     load(db, &ids[0], &ids[1]);
     uint64_t seed = rnd_state;
     blob ref = {0};
+    /* Checked against the live rows with the tail still in the memtable. Its bytes are not the reference: hour
+     * cuts let an hourly bucket take a granule's statistics once the tail is in a part, and variances from them can
+     * differ in the last bits from the same rows summed one by one (CHANGELOG, hour cuts). */
+    blob mem = {0};
+    answers(db, ids, true, &mem);
+    free(mem.p);
+    tsdb_close(db);
+    rnd_state = seed;
+    db = open_db(dir, 1); /* the close put the tail in a part */
     answers(db, ids, true, &ref);
     tsdb_close(db);
     static const int qt[] = {1, 4};
