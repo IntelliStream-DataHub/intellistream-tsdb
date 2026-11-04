@@ -152,7 +152,7 @@ def classify(rc, out, hang=False):
     """The verdict for a run.py exit status and output. Only a failed CHECK is a catch: a driver that crashed
     ("scenario crashed", a Python exception in run.py) or hung says nothing about the planted bug, and neither does a
     client that timed out as the first failure."""
-    first = [ln for ln in out.splitlines() if re.match(r"\[\w+ \w+\] ", ln)][:1]
+    first = [ln for ln in out.splitlines() if re.match(r"\[\w+(\+auth)? \w+\] ", ln)][:1]  # run.py's summary lines
     line = (first[0] if first else "?")[:330]
     if rc == "timeout":
         return "TIMEOUT", "run.py did not finish in %d s" % RUN_TIMEOUT

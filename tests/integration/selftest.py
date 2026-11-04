@@ -192,6 +192,9 @@ def test_verdicts():
         ((1, "[matrix epoll] scenario crashed: NameError: name 'ref' is not defined"), "HARNESS"),
         ((1, "Traceback (most recent call last):\n  File run.py\nKeyError"), "HARNESS"),
         ((1, "[matrix epoll] write: c writer failed (timeout after 40 s)"), "TIMEOUT"),
+        # the --auth on runs of a scenario are named SCENARIO+auth
+        ((1, "[matrix+auth epoll] tenants: CROSS-TENANT READ: c as c got 2 lines for `raw java.f32 0 1 asc 0`"),
+         "CAUGHT"),
         (("timeout", ""), "TIMEOUT"),
         ((2, ""), "ERROR"),
         # build output that happens to start with a bracket is not a failure line
