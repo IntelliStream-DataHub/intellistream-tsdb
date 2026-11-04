@@ -192,7 +192,8 @@ def test_login_with_the_right_password_a_wrong_one_and_an_unknown_user(auth_serv
     pf.unlink()
     with pytest.raises(TsdbError) as e:
         Client(port=srv.port, user="root", password_file=pf)
-    assert e.value.code == tsdb_client.ERR_IO
+    # a missing file is a mistake to fix, not a network error (ERR_IO) to retry; the error names it (REVIEW3 #3)
+    assert e.value.code == tsdb_client.ERR_INVALID and str(pf) in str(e.value)
 
     # a pool logs in on every connection
     with Pool(port=srv.port, connections=3, user="root", password=ROOT_PASSWORD) as p:
@@ -263,10 +264,11 @@ def test_admin_calls_round_trip(auth_server):
     with pytest.raises(TsdbError) as e:
         r.user_create("acme/admin", "again")
     assert e.value.code == tsdb_client.ERR_INVALID
-    for bad in (lambda: r.user_create("x", ""), lambda: r.user_create("x", "pw", iterations=100)):
-        with pytest.raises(TsdbError) as e:
-            bad()
-        assert e.value.code == tsdb_client.ERR_INVALID
+    with pytest.raises(TsdbError) as e:
+        r.user_create("x", "pw", iterations=100)
+    assert e.value.code == tsdb_client.ERR_INVALID
+    with pytest.raises(ValueError):  # the password rule (test_the_password_rule_and_password_files)
+        r.user_create("x", "")
     for sel, rights in (("acme/", "read"), ("all", "read,fly"), ("all", 0), ("all", 16), ("all", 1.5)):
         with pytest.raises(ValueError):
             r.grant("acme/admin", sel, rights)
@@ -375,4 +377,122 @@ def test_the_module_names_the_auth_constants():
     assert (tsdb_client.RIGHT_READ, tsdb_client.RIGHT_INSERT, tsdb_client.RIGHT_DELETE) == (1, 2, 4)
     assert (tsdb_client.RIGHT_ADMIN, tsdb_client.RIGHT_WRITE) == (8, 6)
     assert tsdb_client.SCRAM_ITERATIONS == 4096
+    assert tsdb_client.PASSWORD_MAX == 1023
     assert tsdb_client.strerror(tsdb_client.ERR_DENIED) == "permission denied"
+
+
+def test_a_cold_pool_runs_pbkdf2_once_and_keeps_other_users_keys(auth_server):
+    """REVIEW3 #1: the connections of a Pool start together; one PBKDF2 for all of them, one cache entry."""
+    srv = auth_server
+    with login(srv, "root", ROOT_PASSWORD) as r:
+        # iterations high enough that all connections of the pool miss before the first is done
+        r.user_create("cold/a", "a-pw", iterations=100_000)
+        r.user_create("cold/b", "b-pw", iterations=100_000)
+    login(srv, "root", ROOT_PASSWORD).close()
+    before = tsdb_client._pbkdf2_runs()
+    with Pool(port=srv.port, connections=24, user="cold/a", password="a-pw") as p:
+        assert p.connections == 24
+    assert tsdb_client._pbkdf2_runs() == before + 1, "a cold pool of 24, one PBKDF2"
+    with Pool(port=srv.port, connections=16, user="cold/b", password="b-pw"):
+        pass
+    assert tsdb_client._pbkdf2_runs() == before + 2, "a cold pool of 16, one PBKDF2"
+    login(srv, "root", ROOT_PASSWORD).close()
+    login(srv, "cold/a", "a-pw").close()
+    assert tsdb_client._pbkdf2_runs() == before + 2, "the other users' keys survived the cold pools"
+
+
+def test_the_password_rule_and_password_files(auth_server, tmp_path):
+    """REVIEW3 #2, #3: 1 to 1023 bytes in every client; a file's first line without LF or CR LF."""
+    srv = auth_server
+    p1023 = "".join(chr(32 + i % 95) for i in range(1023))
+    p1024 = p1023 + "x"
+    with login(srv, "root", ROOT_PASSWORD) as r:
+        for bad in ("", p1024, "a\0b"):
+            with pytest.raises(ValueError):
+                r.user_create("pw/0", bad)
+            with pytest.raises(ValueError):
+                r.user_password("root", bad)
+        r.user_create("pw/1", "1")
+        r.user_create("pw/1023", p1023)
+    login(srv, "pw/1", "1").close()
+    login(srv, "pw/1023", p1023).close()
+    for user, bad in (("pw/1", ""), ("pw/1023", p1024)):
+        with pytest.raises(ValueError):
+            login(srv, user, bad)
+    with pytest.raises(ValueError):
+        Client(port=1, user="pw/1", password="")  # before connecting: nothing listens there
+    with pytest.raises(UnicodeEncodeError):
+        login(srv, "pw/1", "pw\ud800")  # a str that is no UTF-8 is never sent
+
+    pf = tmp_path / "pw"
+
+    def file_login(user, content):
+        pf.write_bytes(content)
+        Client(port=srv.port, user=user, password_file=pf).close()
+
+    for user, good in (("pw/1", b"1"), ("pw/1", b"1\n"), ("pw/1", b"1\r\nx\n")):
+        file_login(user, good)
+    file_login("pw/1023", p1023.encode())
+    file_login("pw/1023", p1023.encode() + b"\r\n")
+    bad = [("pw/1023", p1023.encode() + b"\r"), ("pw/1023", p1024.encode() + b"\n")]
+    bad += [("pw/1", b""), ("pw/1", b"\n1\n"), ("pw/1", b"\r\n"), ("pw/1", b"1\x002\n")]
+    for user, content in bad:
+        with pytest.raises(TsdbError) as e:
+            file_login(user, content)
+        assert e.value.code == tsdb_client.ERR_INVALID and str(pf) in str(e.value), content
+
+
+def test_rights_print_as_they_parse(auth_server):
+    """REVIEW3 #7: the rights of every grant read back print in the grammar grant() and tsdbd read: the 15
+    non-empty combinations of the four rights, granted again from their printed form, give the same grants."""
+    srv = auth_server
+    names = ["read", "insert", "delete", "admin"]
+    with login(srv, "root", ROOT_PASSWORD) as r:
+        r.user_create("rt/a", "a-pw")
+        r.user_create("rt/b", "b-pw")
+        for bits in range(1, 16):
+            r.grant("rt/a", f"name:rt/{bits}", ",".join(n for i, n in enumerate(names) if bits >> i & 1))
+        printed = {u.name: sorted(u.grants) for u in r.user_list() if u.name.startswith("rt/")}
+        assert len(printed["rt/a"]) == 15
+        for sel, rights in printed["rt/a"]:
+            r.grant("rt/b", sel, rights)
+        assert sorted(next(u for u in r.user_list() if u.name == "rt/b").grants) == printed["rt/a"]
+        r.grant("rt/b", "name:rt/sp", "read , insert")  # spaces around a name, as tsdbd reads them
+        assert ("name:rt/sp", "read,insert") in next(u for u in r.user_list() if u.name == "rt/b").grants
+        for nothing in ("none", "0x10"):  # they parse, and the server refuses to grant them
+            with pytest.raises(TsdbError) as e:
+                r.grant("rt/b", "name:rt/x", nothing)
+            assert e.value.code == tsdb_client.ERR_INVALID
+        for bad in ("read\t", "reads", "read,,insert", "", "0x1"):
+            with pytest.raises(ValueError):
+                r.grant("rt/b", "name:rt/x", bad)
+
+
+def test_an_unknown_selector_kind_is_kept():
+    """REVIEW3 #6: a grant of a kind a later server adds (9 here) reaches whoami and user_list as "kind#9:TEXT",
+    with bits no client knows as 0xHH, and the connection stays usable."""
+    lst = socket.socket()
+    lst.bind(("127.0.0.1", 0))
+    lst.listen(1)
+    user = b"\x01\x00u\x00\x02\x00\x00\x00" + b"\x09\x45\x03\x00x/*" + b"\x01\x01\x02\x00p/"
+
+    def serve():
+        s, _ = lst.accept()
+        f = s.makefile("rb")
+        while hdr := f.read(9):
+            length, rid, op = struct.unpack("<IIB", hdr)
+            f.read(length - 5)
+            body = {1: struct.pack("<IHH", 12, 0, 0), 31: user, 38: b"\x01\x01\x00\x00\x00" + user}.get(op, b"")
+            s.sendall(struct.pack("<IIBi", 9 + len(body), rid, 0, 0) + body)
+        s.close()
+        lst.close()
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    with Client(port=lst.getsockname()[1]) as c:
+        for u in (c.whoami(), c.user_list()[0], c.whoami()):
+            assert u.name == "u"
+            assert u.grants == [("kind#9:x/*", "read,delete,0x40"), ("prefix:p/", "read")]
+        with pytest.raises(ValueError):
+            c.grant("u", "kind#9:x/*", "read")
+    th.join(10)

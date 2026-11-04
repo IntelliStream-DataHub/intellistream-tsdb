@@ -112,6 +112,12 @@ int tsdbc_connect_timeout(const char *host, int port, int connect_ms, tsdbc **ou
     return tsdbc_connect_opts(host, port, &o, out);
 }
 
+/* The password rule (tsdb_client.h): 1 to TSDBC_PASSWORD_MAX bytes. */
+static bool password_ok(const char *pw)
+{
+    return pw && pw[0] && strnlen(pw, TSDBC_PASSWORD_MAX + 1) <= TSDBC_PASSWORD_MAX;
+}
+
 int tsdbc_connect_auth(const char *host, int port, const char *user, const char *password, tsdbc **out)
 {
     tsdbc_options o = {.user = user, .password = password};
@@ -121,7 +127,7 @@ int tsdbc_connect_auth(const char *host, int port, const char *user, const char 
 int tsdbc_connect_opts(const char *host, int port, const tsdbc_options *o, tsdbc **out)
 {
     *out = NULL;
-    if (o->user && !o->password && !o->password_file)
+    if (o->user && (o->password ? !password_ok(o->password) : !o->password_file))
         return TSDB_ERR_INVALID;
     int connect_ms = o->connect_ms == 0 ? TSDBC_CONNECT_TIMEOUT_MS : o->connect_ms < 0 ? 0 : o->connect_ms;
     char portstr[16];
@@ -1037,75 +1043,102 @@ uint64_t tsdbc_bytes_sent(const tsdbc *c) { return c->sent; }
 #define SCRAM_ITER_MAX 100000000    /* more would let a fake server pin the client's CPU */
 #define KEY_CACHE 16
 
-/* The client nonce comes from here when set (the RFC 7677 test replays a fixed exchange). */
+_Static_assert(TSDBC_PASSWORD_MAX == TSDB_PASSWORD_MAX, "one password rule");
+
+#ifdef TSDBC_TEST_HOOKS
+/* Only in the tests' build of this file (tests/client_hooks.h), never in libtsdbclient.a: the client nonce comes
+ * from here when set (the RFC 7677 test replays a fixed exchange), and PBKDF2 runs are counted (the key cache). */
 const char *tsdbc_test_nonce;
+unsigned tsdbc_test_pbkdf2_runs;
+#endif
 
 /* PBKDF2 once per process: ClientKey and ServerKey by user, salt, iterations and password. The password is not kept:
- * an entry holds HMAC(salt, password) to tell one password from another. */
+ * an entry holds HMAC(salt, password) to tell one password from another. One computation per key at a time: the
+ * connections of a pool start together, and every one that missed would otherwise run PBKDF2 (n times the CPU at
+ * a high iteration count) and insert its own copy, evicting other users' keys from the ring. The first to miss
+ * claims an entry as pending and computes outside the lock; the others wait for it. A pending entry is never
+ * evicted, so a waiter finds it until it is done. */
 typedef struct {
-    bool used;
+    bool used, pending;
     char user[256];
     uint8_t salt[64], pw_mac[32], client_key[32], server_key[32];
     size_t salt_len;
     uint32_t iterations;
 } key_entry;
 static pthread_mutex_t key_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t key_done = PTHREAD_COND_INITIALIZER;
 static key_entry keys[KEY_CACHE];
 static unsigned key_next;
+
+static key_entry *key_find(const char *user, const uint8_t *salt, size_t salt_len, uint32_t iter, const uint8_t *mac)
+{
+    for (unsigned i = 0; i < KEY_CACHE; i++) {
+        key_entry *e = &keys[i];
+        if (e->used && e->iterations == iter && e->salt_len == salt_len && strcmp(e->user, user) == 0 &&
+            memcmp(e->salt, salt, salt_len) == 0 && tsdb_ct_equal(e->pw_mac, mac, 32))
+            return e;
+    }
+    return NULL;
+}
 
 static void scram_keys_cached(const char *user, const char *pw, size_t pwl, const uint8_t *salt, size_t salt_len,
                               uint32_t iter, uint8_t ck[32], uint8_t sk[32])
 {
     uint8_t mac[32];
     tsdb_hmac_sha256(salt, salt_len, pw, pwl, mac);
-    bool cacheable = strlen(user) < sizeof keys[0].user && salt_len <= sizeof keys[0].salt;
-    pthread_mutex_lock(&key_mu);
-    for (unsigned i = 0; cacheable && i < KEY_CACHE; i++) {
-        key_entry *e = &keys[i];
-        if (e->used && e->iterations == iter && e->salt_len == salt_len && strcmp(e->user, user) == 0 &&
-            memcmp(e->salt, salt, salt_len) == 0 && tsdb_ct_equal(e->pw_mac, mac, 32)) {
+    key_entry *mine = NULL;
+    if (strlen(user) < sizeof keys[0].user && salt_len <= sizeof keys[0].salt) {
+        pthread_mutex_lock(&key_mu);
+        key_entry *e;
+        while ((e = key_find(user, salt, salt_len, iter, mac)) && e->pending)
+            pthread_cond_wait(&key_done, &key_mu); /* another login computes this key */
+        if (e) {
             memcpy(ck, e->client_key, 32);
             memcpy(sk, e->server_key, 32);
             pthread_mutex_unlock(&key_mu);
             tsdb_wipe(mac, sizeof mac);
             return;
         }
+        for (unsigned k = 0; k < KEY_CACHE && !mine; k++) { /* the next slot of the ring that nobody waits for */
+            e = &keys[key_next++ % KEY_CACHE];
+            if (!e->pending)
+                mine = e;
+        }
+        if (mine) { /* else KEY_CACHE other keys are in flight: this one is computed without being cached */
+            *mine = (key_entry){.used = true, .pending = true, .salt_len = salt_len, .iterations = iter};
+            snprintf(mine->user, sizeof mine->user, "%s", user);
+            memcpy(mine->salt, salt, salt_len);
+            memcpy(mine->pw_mac, mac, 32);
+        }
+        pthread_mutex_unlock(&key_mu);
     }
-    pthread_mutex_unlock(&key_mu);
-    tsdb_scram_keys(pw, pwl, salt, salt_len, iter, ck, NULL, sk); /* outside the lock: milliseconds */
-    if (cacheable) {
+    tsdb_scram_keys(pw, pwl, salt, salt_len, iter, ck, NULL, sk); /* outside the lock: milliseconds or more */
+#ifdef TSDBC_TEST_HOOKS
+    __atomic_add_fetch(&tsdbc_test_pbkdf2_runs, 1, __ATOMIC_RELAXED);
+#endif
+    if (mine) {
         pthread_mutex_lock(&key_mu);
-        key_entry *e = &keys[key_next++ % KEY_CACHE];
-        e->used = true;
-        snprintf(e->user, sizeof e->user, "%s", user);
-        memcpy(e->salt, salt, salt_len);
-        e->salt_len = salt_len;
-        e->iterations = iter;
-        memcpy(e->pw_mac, mac, 32);
-        memcpy(e->client_key, ck, 32);
-        memcpy(e->server_key, sk, 32);
+        memcpy(mine->client_key, ck, 32);
+        memcpy(mine->server_key, sk, 32);
+        mine->pending = false;
+        pthread_cond_broadcast(&key_done);
         pthread_mutex_unlock(&key_mu);
     }
     tsdb_wipe(mac, sizeof mac);
 }
 
-/* The first line of a file, without its line end. */
-static int read_password_file(const char *path, char *pw, size_t cap)
+/* The password in the first line of a file: TSDB_ERR_IO (errno set) when it cannot be read, TSDB_ERR_INVALID when
+ * the line breaks the password rule. */
+static int read_password_file(const char *path, char pw[TSDBC_PASSWORD_MAX + 1])
 {
     FILE *f = fopen(path, "re");
     if (!f)
         return TSDB_ERR_IO;
-    bool ok = fgets(pw, (int)cap, f) != NULL;
+    int rc = tsdb_read_password(f, pw);
+    int err = errno;
     fclose(f);
-    if (!ok)
-        return TSDB_ERR_INVALID;
-    size_t n = strcspn(pw, "\n");
-    if (pw[n] != '\n' && n == cap - 1)
-        return TSDB_ERR_INVALID; /* longer than cap */
-    pw[n] = '\0';
-    if (n && pw[n - 1] == '\r')
-        pw[n - 1] = '\0';
-    return 0;
+    errno = err;
+    return rc == -1 ? TSDB_ERR_IO : rc ? TSDB_ERR_INVALID : 0;
 }
 
 /* A u16-length message from a reply body; NULL when the body is not exactly that. */
@@ -1126,9 +1159,12 @@ static int scram(tsdbc *c, const char *user, const char *pw)
     if (!ul || ul > 255 || strpbrk(user, ",="))
         return TSDB_ERR_INVALID; /* user names never hold these (USER_NAME_MAX is far below 255) */
     char cn[64];
+#ifdef TSDBC_TEST_HOOKS
     if (tsdbc_test_nonce) {
         snprintf(cn, sizeof cn, "%s", tsdbc_test_nonce);
-    } else {
+    } else
+#endif
+    {
         uint8_t r[18];
         if (tsdb_random(r, sizeof r) != 0)
             return TSDB_ERR_IO;
@@ -1236,13 +1272,13 @@ static int login(tsdbc *c, const tsdbc_options *o)
     }
     if (!c->scram)
         return TSDB_ERR_AUTH; /* no mechanism this client speaks */
-    char buf[1024];
+    char buf[TSDBC_PASSWORD_MAX + 1];
     const char *pw = o->password;
     if (!pw) {
-        int rc = read_password_file(o->password_file, buf, sizeof buf);
+        int rc = read_password_file(o->password_file, buf);
         if (rc) {
-            fprintf(stderr, "tsdbc: %s: %s\n", o->password_file,
-                    rc == TSDB_ERR_IO ? strerror(errno) : "no password in it (or a line over 1023 bytes)");
+            fprintf(stderr, "tsdbc: password file %s: %s\n", o->password_file,
+                    rc == TSDB_ERR_IO ? strerror(errno) : "no password in its first line (1 to 1023 bytes)");
             return TSDB_ERR_INVALID;
         }
         pw = buf;
@@ -1282,7 +1318,7 @@ static int user_call(tsdbc *c, uint8_t op, const char *name, const void *rest, s
 /* The verifier of a password with a fresh salt: u32 iterations, u8 salt_len, salt, StoredKey, ServerKey (A18). */
 static int verifier(const char *password, uint32_t iterations, uint8_t *out, size_t *len)
 {
-    if (!password || !password[0])
+    if (!password_ok(password))
         return TSDB_ERR_INVALID;
     uint32_t it = iterations ? iterations : SCRAM_ITER_MIN;
     if (it < SCRAM_ITER_MIN || it > SCRAM_ITER_MAX)

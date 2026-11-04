@@ -11,8 +11,17 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define TSDB_SHA256_LEN 32
+
+/* The password rule of every client and the CLI (design-auth.md §6): 1 to TSDB_PASSWORD_MAX bytes, no NUL; a
+ * password file holds it in its first line, ended by "\n" or "\r\n" (or the end of the file). */
+#define TSDB_PASSWORD_MAX 1023
+
+/* The password in the first line of f: 0; -1 (errno set) when f cannot be read; -2 when that line is empty, longer
+ * than TSDB_PASSWORD_MAX or holds a NUL. */
+int tsdb_read_password(FILE *f, char pw[TSDB_PASSWORD_MAX + 1]);
 
 typedef struct tsdb_sha256 {
     uint32_t h[8];

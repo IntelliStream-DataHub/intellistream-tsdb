@@ -131,6 +131,7 @@ name = "intellistream-tsdb-client"
 version = "0.9.0"
 dependencies = [
  "hmac",
+ "intellistream-tsdb-client",
  "intellistream-tsdb-sys",
  "libc",
  "rayon",

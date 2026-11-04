@@ -56,6 +56,8 @@ RIGHT_WRITE: int
 """RIGHT_INSERT | RIGHT_DELETE (6)."""
 SCRAM_ITERATIONS: int
 """The PBKDF2 iterations of a new verifier when none are given (4096)."""
+PASSWORD_MAX: int
+"""The longest password in bytes (1023); a password is at least 1 byte, without NUL, in every client and the CLI."""
 VALUE_TYPES: list[str]
 """The value types: ["float32", "float64", "int64", "bool", "state"]."""
 
@@ -410,7 +412,8 @@ class User:
     @property
     def grants(self) -> list[tuple[str, str]]:
         """The grants as (selector, rights) pairs of strings, e.g. ("prefix:acme/", "read,insert"). A user's rights
-        on a series are the union of those whose selector matches its name."""
+        on a series are the union of those whose selector matches its name. The rights read back in grant(); a
+        selector of a kind this client does not know (a later server's) shows as "kind#N:TEXT" and does not."""
 
 @final
 class Stats:
@@ -509,9 +512,10 @@ class Client:
             runs once per process for a user and password: later connects,
             a Pool's included, reuse the keys.
         password: The user's password (its UTF-8 bytes, without
-            normalization; ASCII is safest).
+            normalization; ASCII is safest): 1 to PASSWORD_MAX (1023) bytes
+            without NUL, in every client and the CLI.
         password_file: Read the password from the first line of this file
-            instead (a trailing CR LF is cut), at every connect.
+            instead, without the LF or CR LF that ends it, at every login.
         require_auth: Refuse (ERR_AUTH) a server that does not ask for a
             login (--no-auth). Otherwise such a server is used without one.
 
@@ -519,9 +523,11 @@ class Client:
         TsdbError: The connection failed; ERR_AUTH when the login failed (an
             unknown user and a wrong password look alike), the server did not
             prove its signature, it asks for a login and none was given, or
-            require_auth is set and it asks for none.
-        ValueError: timeout is not a positive number, or a user has neither
-            password nor password_file.
+            require_auth is set and it asks for none; ERR_INVALID, naming
+            the file, when password_file cannot be read or its first line is
+            not a password (a mistake to fix, not a network error to retry).
+        ValueError: timeout is not a positive number, a user has neither
+            password nor password_file, or password breaks the rule above.
     """
 
     def __new__(
@@ -1143,8 +1149,10 @@ class Client:
             TsdbError: ERR_DENIED unless this user is a superuser or holds admin
                 on a prefix that name starts with (only a superuser creates
                 superusers), and on a --no-auth server; ERR_INVALID for a name
-                that exists or that the server refuses; ERR_INVALID for an
-                empty password or iterations out of range.
+                that exists or that the server refuses; ERR_INVALID for
+                iterations out of range.
+            ValueError: password is not 1 to PASSWORD_MAX (1023) bytes without
+                NUL (the rule of every client and the CLI).
         """
     def user_password(self, name: str, password: str, *, iterations: int | None = None) -> None:
         """Sets the password of user name (its own, or one of a user it manages),
@@ -1175,6 +1183,9 @@ class Client:
         prefix of the name: tenants end theirs in "/"), "name:N" or "glob:G"
         (* any run of bytes, ? one byte, \\ makes the next one literal). rights
         are names ("read,insert"; "write" is insert and delete) or RIGHT_* bits.
+        Names are separated by commas, with spaces around them allowed, as
+        tsdbd and the CLI read them; "none" and "0xHH" (bits a later server
+        may name) read too, and the server refuses rights it cannot grant.
 
         Example:
             >>> c.grant("acme/ingest", "prefix:acme/", "insert")

@@ -85,9 +85,10 @@ mod protocol;
 mod types;
 mod value;
 
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use auth::test_hooks;
-pub use auth::{Grant, Rights, SCRAM_ITERATIONS, Selector, User};
+pub use auth::{Grant, PASSWORD_MAX, Rights, SCRAM_ITERATIONS, Selector, User};
 pub use batch::{AggQuery, InsertBatch, Pool, RangeQuery, Target};
 pub use calendar::calendar_bounds;
 pub use client::{CONNECT_TIMEOUT, Client, ConnectOptions, DEFAULT_COMPRESSION};

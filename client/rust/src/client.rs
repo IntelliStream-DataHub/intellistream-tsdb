@@ -19,7 +19,7 @@ use std::ops::{Bound, ControlFlow, RangeBounds};
 use std::time::Duration;
 
 use crate::SeriesId;
-use crate::auth::{self, Rights, Scram, Selector, User};
+use crate::auth::{self, PASSWORD_MAX, Rights, Scram, Selector, User};
 use crate::calendar;
 use crate::error::{Error, Result, Status};
 use crate::keepalive::{self, KeepAlive};
@@ -185,14 +185,17 @@ impl ConnectOptions {
 
     /// The user's password: its UTF-8 bytes, without normalization (ASCII passwords are safest). It stays in
     /// memory for reconnects (a [`Pool`](crate::Pool) replaces broken connections) and is wiped when the options
-    /// are dropped.
+    /// are dropped. A password is 1 to [`PASSWORD_MAX`](crate::PASSWORD_MAX) bytes without NUL, in every client
+    /// and the CLI; another is refused at connect with [`Error::InvalidArgument`].
     pub fn password(mut self, password: impl Into<String>) -> ConnectOptions {
         self.password = Some(Secret(password.into().into_bytes()));
         self
     }
 
-    /// Reads the password from the first line of this file at every connect (a trailing CR LF is cut), when no
-    /// [`password`](ConnectOptions::password) is given.
+    /// Reads the password from the first line of this file at every login, without the `\n` or `\r\n` that ends
+    /// it, when no [`password`](ConnectOptions::password) is given. A file that cannot be read, or whose first line
+    /// is not a password (empty, over [`PASSWORD_MAX`](crate::PASSWORD_MAX) bytes), fails the connect with
+    /// [`Error::InvalidArgument`] naming the path: a mistake in the setup, not a network error to retry.
     pub fn password_file(mut self, path: impl Into<std::path::PathBuf>) -> ConnectOptions {
         self.password_file = Some(path.into());
         self
@@ -221,11 +224,43 @@ impl ConnectOptions {
         let Some(path) = &self.password_file else {
             return Err(Error::InvalidArgument("a user without a password or a password file".into()));
         };
-        let all = Secret(std::fs::read(path)?);
-        let Some(line) = all.0.split(|&b| b == b'\n').next().filter(|_| !all.0.is_empty()) else {
-            return Err(Error::InvalidArgument(format!("{}: no password in it", path.display())));
+        let all = Secret(
+            std::fs::read(path)
+                .map_err(|e| Error::InvalidArgument(format!("password file {}: {e}", path.display())))?,
+        );
+        let line = match all.0.iter().position(|&b| b == b'\n') {
+            Some(n) => all.0[..n].strip_suffix(b"\r").unwrap_or(&all.0[..n]),
+            None => &all.0[..],
         };
-        Ok(Secret(line.strip_suffix(b"\r").unwrap_or(line).to_vec()))
+        let pw = Secret(line.to_vec());
+        check_password(&pw.0).map_err(|_| {
+            Error::InvalidArgument(format!(
+                "password file {}: no password in its first line (1 to {PASSWORD_MAX} bytes)",
+                path.display()
+            ))
+        })?;
+        Ok(pw)
+    }
+}
+
+/// The password rule of every client and the CLI (design-auth.md §6): 1 to [`PASSWORD_MAX`] bytes, no NUL.
+pub(crate) fn check_password(p: &[u8]) -> Result<()> {
+    if p.is_empty() || p.len() > PASSWORD_MAX || p.contains(&0) {
+        return Err(Error::InvalidArgument(format!("a password is 1 to {PASSWORD_MAX} bytes without NUL")));
+    }
+    Ok(())
+}
+
+impl ConnectOptions {
+    /// Refuses, before connecting, what can never log in: a user without a password, or a password outside the rule.
+    fn check(&self) -> Result<()> {
+        if self.user.is_some() && self.password.is_none() && self.password_file.is_none() {
+            return Err(Error::InvalidArgument("a user without a password or a password file".into()));
+        }
+        match &self.password {
+            Some(p) => check_password(&p.0),
+            None => Ok(()),
+        }
     }
 }
 
@@ -321,9 +356,7 @@ impl Client {
     /// server does not prove its signature, it asks for a login and `opts` gives none, or `opts` requires one
     /// and it asks for none; otherwise as [`connect_with`](Client::connect_with).
     pub fn connect_opts(addr: impl ToSocketAddrs, opts: &ConnectOptions) -> Result<Client> {
-        if opts.user.is_some() && opts.password.is_none() && opts.password_file.is_none() {
-            return Err(Error::InvalidArgument("a user without a password or a password file".into()));
-        }
+        opts.check()?;
         let t = opts.timeout.unwrap_or(CONNECT_TIMEOUT);
         let mut c = Client::new(connect_each(addr, t)?)?;
         c.set_timeout(Some(t))?;
@@ -360,9 +393,7 @@ impl Client {
     ///
     /// As [`from_stream`](Client::from_stream) and [`connect_opts`](Client::connect_opts).
     pub fn from_stream_opts(stream: TcpStream, opts: &ConnectOptions) -> Result<Client> {
-        if opts.user.is_some() && opts.password.is_none() && opts.password_file.is_none() {
-            return Err(Error::InvalidArgument("a user without a password or a password file".into()));
-        }
+        opts.check()?;
         let mut c = Client::new(stream)?;
         c.handshake(opts)?;
         Ok(c)

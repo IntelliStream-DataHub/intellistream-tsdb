@@ -16,10 +16,9 @@
 #include "harness.h"
 #include "auth_harness.h"
 #include "rfc7677.h"
+#include "client_hooks.h"
 
 #include <pthread.h>
-
-extern const char *tsdbc_test_nonce; /* client/tsdb_client.c's test hook (not in the header) */
 
 /* s= and i= of a server-first-message, for comparing them */
 static void salt_iter(const char *sf, char *out, size_t cap)
@@ -70,6 +69,137 @@ static void test_login(void)
     tsdbc_close(c);
     unlink(pwf);
     printf("  login: right and wrong password, unknown user, no user, password file\n");
+}
+
+/* REVIEW3 #1: a pool's connections start together. PBKDF2 runs once for all of them (the others wait for it), and
+ * the cache gets one entry, so another user's entry survives. Iterations high enough that the old code (every miss
+ * computed and inserted its copy) ran it once per connection and filled the 16-entry ring with copies. */
+#define POOL 24
+struct pool_arg {
+    const char *user, *pw;
+    pthread_barrier_t *go;
+    int rc;
+};
+
+static void *pool_conn(void *arg)
+{
+    struct pool_arg *a = arg;
+    tsdbc *c = NULL;
+    pthread_barrier_wait(a->go);
+    a->rc = tsdbc_connect_auth("127.0.0.1", port, a->user, a->pw, &c);
+    if (c)
+        tsdbc_close(c);
+    return NULL;
+}
+
+static unsigned cold_pool(const char *user, const char *pw, int n)
+{
+    pthread_t th[POOL];
+    struct pool_arg a[POOL];
+    pthread_barrier_t go;
+    pthread_barrier_init(&go, NULL, (unsigned)n);
+    unsigned before = __atomic_load_n(&tsdbc_test_pbkdf2_runs, __ATOMIC_RELAXED);
+    for (int i = 0; i < n; i++) {
+        a[i] = (struct pool_arg){.user = user, .pw = pw, .go = &go, .rc = 1};
+        pthread_create(&th[i], NULL, pool_conn, &a[i]);
+    }
+    for (int i = 0; i < n; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(a[i].rc == 0);
+    }
+    pthread_barrier_destroy(&go);
+    return __atomic_load_n(&tsdbc_test_pbkdf2_runs, __ATOMIC_RELAXED) - before;
+}
+
+/* The PBKDF2 runs of one login, which must end in rc */
+static unsigned runs_of_login(const char *user, const char *pw, int rc)
+{
+    unsigned before = __atomic_load_n(&tsdbc_test_pbkdf2_runs, __ATOMIC_RELAXED);
+    tsdbc *c = NULL;
+    CHECK(tsdbc_connect_auth("127.0.0.1", port, user, pw, &c) == rc);
+    if (c)
+        tsdbc_close(c);
+    return __atomic_load_n(&tsdbc_test_pbkdf2_runs, __ATOMIC_RELAXED) - before;
+}
+
+static void test_key_cache(void)
+{
+    tsdbc *root = login_as("root", "rootpw");
+    OK(tsdbc_user_create(root, "acme/pool", "poolpw", 100000, 0));
+    OK(tsdbc_user_create(root, "acme/pool2", "pool2pw", 100000, 0));
+    tsdbc_close(root);
+    CHECK(runs_of_login("root", "rootpw", 0) == 0); /* cached since test_login */
+    unsigned r = cold_pool("acme/pool", "poolpw", POOL);
+    CHECK(r == 1);
+    CHECK(runs_of_login("acme/pool", "poolpw", 0) == 0);
+    r += cold_pool("acme/pool2", "pool2pw", 16);
+    CHECK(r == 2);
+    CHECK(runs_of_login("root", "rootpw", 0) == 0); /* the cold pool of 16 left root's entry alone */
+    CHECK(runs_of_login("acme/pool", "poolpw", 0) == 0);
+    CHECK(runs_of_login("acme/pool", "wrong", TSDB_ERR_AUTH) == 1);
+    CHECK(runs_of_login("acme/pool", "poolpw", 0) == 0);
+    printf("  key cache: a cold pool of %d runs PBKDF2 once (%u runs for two pools); other users' keys stay\n", POOL,
+           r);
+}
+
+/* REVIEW3 #2, #3: a password is 1 to 1023 bytes everywhere; a password file's first line without "\n" or "\r\n";
+ * an empty or longer one, or a file that is not there, is TSDB_ERR_INVALID before anything is sent. */
+static int file_login(const char *user, const char *content, size_t n)
+{
+    char pwf[PATH_MAX + 64];
+    snprintf(pwf, sizeof pwf, "%s.pwrule", srvlog);
+    FILE *f = fopen(pwf, "w");
+    fwrite(content, 1, n, f);
+    fclose(f);
+    tsdbc_options o = {.user = user, .password_file = pwf};
+    tsdbc *c = NULL;
+    int rc = tsdbc_connect_opts("127.0.0.1", port, &o, &c);
+    if (c)
+        tsdbc_close(c);
+    unlink(pwf);
+    return rc;
+}
+
+static void test_password_rule(void)
+{
+    char p1023[1023 + 3], p1024[1024 + 1];
+    for (int i = 0; i < 1023; i++)
+        p1023[i] = (char)(' ' + i % 95); /* spaces, commas and '=' too */
+    p1023[1023] = '\0';
+    memcpy(p1024, p1023, 1023);
+    p1024[1023] = 'x', p1024[1024] = '\0';
+    tsdbc *root = login_as("root", "rootpw"), *c = NULL;
+    CHECK(tsdbc_user_create(root, "acme/p0", "", 0, 0) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_user_create(root, "acme/p0", p1024, 0, 0) == TSDB_ERR_INVALID);
+    OK(tsdbc_user_create(root, "acme/p1", "1", 0, 0));
+    OK(tsdbc_user_create(root, "acme/p1023", p1023, 0, 0));
+    CHECK(tsdbc_user_password(root, "acme/p1", "", 0) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_user_password(root, "acme/p1", p1024, 0) == TSDB_ERR_INVALID);
+    tsdbc_close(root);
+
+    tsdbc_close(login_as("acme/p1", "1"));
+    tsdbc_close(login_as("acme/p1023", p1023));
+    CHECK(tsdbc_connect_auth("127.0.0.1", port, "acme/p1", "", &c) == TSDB_ERR_INVALID && !c);
+    CHECK(tsdbc_connect_auth("127.0.0.1", port, "acme/p1023", p1024, &c) == TSDB_ERR_INVALID && !c);
+    /* refused up front: no server needed */
+    CHECK(tsdbc_connect_auth("127.0.0.1", 1, "acme/p1", "", &c) == TSDB_ERR_INVALID && !c);
+
+    CHECK(file_login("acme/p1", "1", 1) == 0);
+    CHECK(file_login("acme/p1", "1\n", 2) == 0);
+    CHECK(file_login("acme/p1", "1\r\nx\n", 5) == 0);
+    CHECK(file_login("acme/p1023", p1023, 1023) == 0);
+    memcpy(p1023 + 1023, "\r\n", 3);
+    CHECK(file_login("acme/p1023", p1023, 1025) == 0);
+    CHECK(file_login("acme/p1023", p1023, 1024) == TSDB_ERR_INVALID); /* a lone '\r' is the 1024th byte */
+    p1023[1023] = '\0';
+    CHECK(file_login("acme/p1023", p1024, 1024) == TSDB_ERR_INVALID);
+    CHECK(file_login("acme/p1", "", 0) == TSDB_ERR_INVALID);
+    CHECK(file_login("acme/p1", "\n1\n", 3) == TSDB_ERR_INVALID);
+    CHECK(file_login("acme/p1", "\r\n", 2) == TSDB_ERR_INVALID);
+    CHECK(file_login("acme/p1", "1\0002\n", 4) == TSDB_ERR_INVALID);
+    tsdbc_options o = {.user = "acme/p1", .password_file = "/nonexistent/tsdb-password"};
+    CHECK(tsdbc_connect_opts("127.0.0.1", port, &o, &c) == TSDB_ERR_INVALID && !c);
+    printf("  password rule: 1 to 1023 bytes by string, file and verifier; files with and without CR LF\n");
 }
 
 /* A4: an unknown name gets a server-first-message of the same shape as a real one, with the same salt and
@@ -900,6 +1030,8 @@ int main(int argc, char **argv)
     }
     pid_t srv = start(dir, NULL);
     test_login();
+    test_key_cache();
+    test_password_rule();
     char mock[200], again[200], sf[600];
     test_mock_salt(mock, sizeof mock);
     test_malformed();

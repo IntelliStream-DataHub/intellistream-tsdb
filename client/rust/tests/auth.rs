@@ -48,7 +48,8 @@ fn login_with_the_right_password_wrong_password_and_unknown_user() {
     std::fs::write(&pf, "").unwrap();
     assert!(matches!(Client::connect_opts(srv.addr(), &opts).unwrap_err(), Error::InvalidArgument(_)));
     std::fs::remove_file(&pf).unwrap();
-    assert!(matches!(Client::connect_opts(srv.addr(), &opts).unwrap_err(), Error::Io(_)));
+    // a missing file is the caller's mistake, not a network error to retry (REVIEW3 #3)
+    assert!(matches!(Client::connect_opts(srv.addr(), &opts).unwrap_err(), Error::InvalidArgument(_)));
     assert!(matches!(
         Client::connect_opts(srv.addr(), &ConnectOptions::new().user("root")).unwrap_err(),
         Error::InvalidArgument(_)
@@ -198,4 +199,108 @@ fn a_cli_grant_is_seen_while_running() {
             Err(e) => panic!("{e}"),
         }
     }
+}
+
+/// A login with the password in a file holding `content`.
+fn file_login(srv: &Server, user: &str, content: &[u8]) -> tsdb_client::Result<Client> {
+    let f = srv.dir.with_extension(format!("pw-{}", content.len()));
+    std::fs::write(&f, content).unwrap();
+    let r = Client::connect_opts(srv.addr(), &ConnectOptions::new().user(user).password_file(&f));
+    std::fs::remove_file(&f).unwrap();
+    r
+}
+
+fn invalid(r: tsdb_client::Result<impl std::fmt::Debug>) -> String {
+    match r {
+        Err(e @ Error::InvalidArgument(_)) => {
+            assert_eq!(e.code(), -4);
+            e.to_string()
+        }
+        other => panic!("not InvalidArgument: {other:?}"),
+    }
+}
+
+/// REVIEW3 #2, #3: one password rule in every client: 1 to 1023 bytes; a file's first line without "\n" or
+/// "\r\n"; anything else, and a file that is not there, is InvalidArgument (-4) naming the file, before a login.
+#[test]
+fn the_password_rule_and_password_files() {
+    let srv = Server::start_auth(ROOT_PW);
+    let p1023: String = (0..1023).map(|i| char::from(b' ' + (i % 95) as u8)).collect();
+    let p1024 = format!("{p1023}x");
+    let mut r = root(&srv);
+    invalid(r.user_create("p0", "", false, None));
+    invalid(r.user_create("p0", &p1024, false, None));
+    invalid(r.user_create("p0", "a\0b", false, None));
+    r.user_create("p1", "1", false, None).unwrap();
+    r.user_create("p1023", &p1023, false, None).unwrap();
+    invalid(r.user_password("p1", "", None));
+    invalid(r.user_password("p1", &p1024, None));
+
+    login(&srv, "p1", "1").unwrap();
+    login(&srv, "p1023", &p1023).unwrap();
+    invalid(login(&srv, "p1", ""));
+    invalid(login(&srv, "p1023", &p1024));
+    // refused before connecting: no server listens there
+    invalid(Client::connect_opts("127.0.0.1:1", &ConnectOptions::new().user("p1").password("")));
+
+    file_login(&srv, "p1", b"1").unwrap();
+    file_login(&srv, "p1", b"1\n").unwrap();
+    file_login(&srv, "p1", b"1\r\nx\n").unwrap();
+    file_login(&srv, "p1023", p1023.as_bytes()).unwrap();
+    file_login(&srv, "p1023", format!("{p1023}\r\n").as_bytes()).unwrap();
+    let e = invalid(file_login(&srv, "p1023", format!("{p1023}\r").as_bytes())); // the '\r' is the 1024th byte
+    assert!(e.contains("password file") && e.contains("1 to 1023 bytes"), "{e}");
+    invalid(file_login(&srv, "p1023", format!("{p1024}\n").as_bytes()));
+    for bad in [&b""[..], b"\n1\n", b"\r\n", b"1\x002\n"] {
+        invalid(file_login(&srv, "p1", bad));
+    }
+    let missing = srv.dir.join("no-such-password-file");
+    let e = invalid(Client::connect_opts(srv.addr(), &ConnectOptions::new().user("p1").password_file(&missing)));
+    assert!(e.contains(&missing.display().to_string()), "the error names the file: {e}");
+}
+
+/// REVIEW3 #6: a grant of a kind a later server adds reaches whoami and user_list as Selector::Other, and the
+/// connection stays usable. A fake server of protocol 12 without login answers with one.
+#[test]
+fn an_unknown_selector_kind_is_kept() {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        // a user "u": no flags, two grants: kind 9 "x/*" with read,delete and a bit no client knows, prefix "p/"
+        let mut user = vec![1, 0, b'u', 0, 2, 0, 0, 0];
+        user.extend_from_slice(&[9, 0x45, 3, 0, b'x', b'/', b'*', 1, 1, 2, 0, b'p', b'/']);
+        let mut h = [0u8; 9];
+        while s.read_exact(&mut h).is_ok() {
+            let mut payload = vec![0; u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize - 5];
+            s.read_exact(&mut payload).unwrap();
+            let body: Vec<u8> = match h[8] {
+                1 => [12u32.to_le_bytes(), [0; 4]].concat(),
+                31 => user.clone(),
+                38 => [&[1u8, 1, 0, 0, 0][..], &user].concat(), // the last chunk, one user
+                _ => Vec::new(),
+            };
+            let mut reply = ((9 + body.len()) as u32).to_le_bytes().to_vec();
+            reply.extend_from_slice(&h[4..8]);
+            reply.extend_from_slice(&[0, 0, 0, 0, 0]);
+            reply.extend_from_slice(&body);
+            if s.write_all(&reply).is_err() {
+                break;
+            }
+        }
+    });
+    let mut c = Client::connect(&addr).unwrap();
+    for u in [c.whoami().unwrap(), c.user_list().unwrap().remove(0), c.whoami().unwrap()] {
+        assert_eq!(u.name, "u");
+        assert!(matches!(&u.grants[0].selector, Selector::Other { kind: 9, text } if text == "x/*"));
+        assert_eq!(u.grants[0].selector.to_string(), "kind#9:x/*");
+        assert_eq!(u.grants[0].rights.to_string(), "read,delete,0x40");
+        assert_eq!(u.grants[0].rights.to_string().parse::<Rights>().unwrap(), u.grants[0].rights);
+        assert_eq!(u.grants[1].selector, Selector::Prefix("p/".into()));
+    }
+    let other = c.whoami().unwrap().grants[0].selector.clone();
+    assert!(matches!(c.grant("u", &other, Rights::READ), Err(Error::InvalidArgument(_))));
+    drop(c);
+    h.join().unwrap();
 }

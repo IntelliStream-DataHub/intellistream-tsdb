@@ -273,6 +273,13 @@ static void names(void)
     printf("  user names: the allowed bytes, 1 to 128 of them, not starting with /\n");
 }
 
+/* rights_parse as one int: the bits, or -1 when refused */
+static int rp(const char *text)
+{
+    uint8_t r = 0xee;
+    return rights_parse(text, &r) == 0 ? r : -1;
+}
+
 static void normalize(void)
 {
     static const struct {
@@ -338,11 +345,23 @@ static void normalize(void)
     CHECK(sel_parse("glob:a*", &kind, &s, &len) == 0 && kind == SEL_GLOB && len == 2);
     CHECK(sel_parse("acme/", &kind, &s, &len) != 0 && sel_parse("All", &kind, &s, &len) != 0);
 
-    CHECK(rights_parse("read") == R_READ && rights_parse("write") == R_WRITE);
-    CHECK(rights_parse("admin,read") == (R_ADMIN | R_READ));
-    CHECK(rights_parse("read,insert,delete,admin") == R_EVERY);
-    CHECK(rights_parse("") == 0 && rights_parse("read,") == 0 && rights_parse("reads") == 0 &&
-          rights_parse("read,,insert") == 0 && rights_parse("READ") == 0);
+    CHECK(rp("read") == R_READ && rp("write") == R_WRITE && rp("none") == 0);
+    CHECK(rp("admin,read") == (R_ADMIN | R_READ));
+    CHECK(rp("read,insert,delete,admin") == R_EVERY);
+    CHECK(rp("") < 0 && rp("read,") < 0 && rp("reads") < 0 && rp("read,,insert") < 0 && rp("READ") < 0 &&
+          rp(" ") < 0 && rp("read ,") < 0 && rp("re ad") < 0 && rp("read\t") < 0 && rp("0x1") < 0 &&
+          rp("0x100") < 0 && rp("0xg0") < 0 && rp("x10") < 0);
+    /* one grammar with every client (design §2): spaces around a name, "none", two hex digits */
+    CHECK(rp("read, insert") == (R_READ | R_INSERT) && rp(" read ,  write ") == (R_READ | R_WRITE) &&
+          rp("none,read") == R_READ && rp("0x30") == 0x30 && rp("read,0xF0") == (R_READ | 0xf0) && rp("0x00") == 0);
+    /* every byte prints as text that parses back to it: the 16 combinations of the four rights and later bits */
+    for (unsigned r = 0; r < 256; r++) {
+        char b[RIGHTS_TEXT_MAX];
+        rights_text((uint8_t)r, b);
+        CHECK(rp(b) == (int)r);
+        CHECK(r != 0 || strcmp(b, "none") == 0);
+        CHECK(r != (R_READ | R_DELETE | 0x40) || strcmp(b, "read,delete,0x40") == 0);
+    }
     printf("  selectors: normal forms (A24), caps, parsing; rights words\n");
 }
 

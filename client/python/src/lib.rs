@@ -755,9 +755,10 @@ impl Inner {
 ///         runs once per process for a user and password: later connects,
 ///         a Pool's included, reuse the keys.
 ///     password: The user's password (its UTF-8 bytes, without
-///         normalization; ASCII is safest).
+///         normalization; ASCII is safest): 1 to PASSWORD_MAX (1023) bytes
+///         without NUL, in every client and the CLI.
 ///     password_file: Read the password from the first line of this file
-///         instead (a trailing CR LF is cut), at every connect.
+///         instead, without the LF or CR LF that ends it, at every login.
 ///     require_auth: Refuse (ERR_AUTH) a server that does not ask for a
 ///         login (--no-auth). Otherwise such a server is used without one.
 ///
@@ -765,9 +766,11 @@ impl Inner {
 ///     TsdbError: The connection failed; ERR_AUTH when the login failed (an
 ///         unknown user and a wrong password look alike), the server did not
 ///         prove its signature, it asks for a login and none was given, or
-///         require_auth is set and it asks for none.
-///     ValueError: timeout is not a positive number, or a user has neither
-///         password nor password_file.
+///         require_auth is set and it asks for none; ERR_INVALID, naming
+///         the file, when password_file cannot be read or its first line is
+///         not a password (a mistake to fix, not a network error to retry).
+///     ValueError: timeout is not a positive number, a user has neither
+///         password nor password_file, or password breaks the rule above.
 #[pyclass(module = "tsdb_client")]
 struct Client {
     inner: Mutex<Inner>,
@@ -889,6 +892,9 @@ fn connect_options(
     if user.is_some() && password.is_none() && password_file.is_none() {
         return Err(PyValueError::new_err("a user needs a password or a password_file"));
     }
+    if let Some(p) = &password {
+        check_password(p)?;
+    }
     let mut o = tc::ConnectOptions::new().timeout(seconds(timeout)?).require_auth(require_auth);
     if let Some(u) = user {
         o = o.user(u);
@@ -900,6 +906,14 @@ fn connect_options(
         o = o.password_file(f);
     }
     Ok(o)
+}
+
+/// The password rule of every client and the CLI (design-auth.md §6), as ValueError: 1 to PASSWORD_MAX bytes, no NUL.
+fn check_password(p: &str) -> PyResult<()> {
+    if p.is_empty() || p.len() > tc::PASSWORD_MAX || p.contains('\0') {
+        return Err(PyValueError::new_err(format!("a password is 1 to {} bytes without NUL", tc::PASSWORD_MAX)));
+    }
+    Ok(())
 }
 
 /// Rights as a string of names ("read,insert"; "write" is insert and delete) or as the bits of RIGHT_*.
@@ -948,7 +962,8 @@ impl User {
     }
 
     /// The grants as (selector, rights) pairs of strings, e.g. ("prefix:acme/", "read,insert"). A user's rights
-    /// on a series are the union of those whose selector matches its name.
+    /// on a series are the union of those whose selector matches its name. The rights read back in grant(); a
+    /// selector of a kind this client does not know (a later server's) shows as "kind#N:TEXT" and does not.
     #[getter]
     fn grants(&self) -> Vec<(String, String)> {
         self.grants.clone()
@@ -1857,8 +1872,10 @@ impl Client {
     ///     TsdbError: ERR_DENIED unless this user is a superuser or holds admin
     ///         on a prefix that name starts with (only a superuser creates
     ///         superusers), and on a --no-auth server; ERR_INVALID for a name
-    ///         that exists or that the server refuses; ERR_INVALID for an
-    ///         empty password or iterations out of range.
+    ///         that exists or that the server refuses; ERR_INVALID for
+    ///         iterations out of range.
+    ///     ValueError: password is not 1 to PASSWORD_MAX (1023) bytes without
+    ///         NUL (the rule of every client and the CLI).
     #[pyo3(signature = (name, password, *, superuser = false, iterations = None))]
     fn user_create(
         &self,
@@ -1868,6 +1885,7 @@ impl Client {
         superuser: bool,
         iterations: Option<u32>,
     ) -> PyResult<()> {
+        check_password(password)?;
         self.with(py, |c| c.user_create(name, password, superuser, iterations))
     }
 
@@ -1879,6 +1897,7 @@ impl Client {
     ///         grant outside this one's admin selectors.
     #[pyo3(signature = (name, password, *, iterations = None))]
     fn user_password(&self, py: Python<'_>, name: &str, password: &str, iterations: Option<u32>) -> PyResult<()> {
+        check_password(password)?;
         self.with(py, |c| c.user_password(name, password, iterations))
     }
 
@@ -1907,6 +1926,9 @@ impl Client {
     /// prefix of the name: tenants end theirs in "/"), "name:N" or "glob:G"
     /// (* any run of bytes, ? one byte, \ makes the next one literal). rights
     /// are names ("read,insert"; "write" is insert and delete) or RIGHT_* bits.
+    /// Names are separated by commas, with spaces around them allowed, as
+    /// tsdbd and the CLI read them; "none" and "0xHH" (bits a later server
+    /// may name) read too, and the server refuses rights it cannot grant.
     ///
     /// Example:
     ///     >>> c.grant("acme/ingest", "prefix:acme/", "insert")
@@ -2132,15 +2154,19 @@ fn strerror(code: i32) -> &'static str {
     tc::strerror(code)
 }
 
-/// Tests only: every later login of this process uses nonce as its client
-/// nonce (the RFC 7677 exchange); None goes back to random ones.
+/// Tests only (the feature test-hooks, never in a wheel): every later login of
+/// this process uses nonce as its client nonce (the RFC 7677 exchange); None
+/// goes back to random ones.
+#[cfg(feature = "test-hooks")]
 #[pyfunction]
 #[pyo3(signature = (nonce))]
 fn _set_client_nonce(nonce: Option<&str>) {
     tc::test_hooks::set_client_nonce(nonce);
 }
 
-/// Tests only: how many times this process ran PBKDF2 (logins and verifiers).
+/// Tests only (the feature test-hooks): how many times this process ran
+/// PBKDF2 (logins and verifiers).
+#[cfg(feature = "test-hooks")]
 #[pyfunction]
 fn _pbkdf2_runs() -> u64 {
     tc::test_hooks::pbkdf2_runs()
@@ -2246,6 +2272,7 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
     m.add_class::<User>()?;
     m.add("SCRAM_ITERATIONS", tc::SCRAM_ITERATIONS)?;
+    m.add("PASSWORD_MAX", tc::PASSWORD_MAX)?;
     for (name, r) in [
         ("RIGHT_READ", tc::Rights::READ),
         ("RIGHT_INSERT", tc::Rights::INSERT),
@@ -2255,7 +2282,10 @@ fn tsdb_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ] {
         m.add(name, r.bits())?;
     }
-    m.add_function(wrap_pyfunction!(_set_client_nonce, m)?)?;
-    m.add_function(wrap_pyfunction!(_pbkdf2_runs, m)?)?;
+    #[cfg(feature = "test-hooks")]
+    {
+        m.add_function(wrap_pyfunction!(_set_client_nonce, m)?)?;
+        m.add_function(wrap_pyfunction!(_pbkdf2_runs, m)?)?;
+    }
     Ok(())
 }

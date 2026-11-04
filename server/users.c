@@ -191,27 +191,54 @@ int sel_parse(const char *text, uint8_t *kind, const char **sel, size_t *len)
     return TSDB_ERR_INVALID;
 }
 
-uint8_t rights_parse(const char *text)
+static const struct {
+    const char *w;
+    uint8_t r;
+} right_words[] = {{"read", R_READ},   {"insert", R_INSERT}, {"delete", R_DELETE},
+                   {"admin", R_ADMIN}, {"write", R_WRITE},   {"none", 0}};
+
+static int hex_digit(char c)
+{
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+int rights_parse(const char *text, uint8_t *out)
 {
     uint8_t r = 0;
     for (const char *p = text;;) {
-        size_t n = strcspn(p, ",");
-        static const struct {
-            const char *w;
-            uint8_t r;
-        } words[] = {{"read", R_READ}, {"insert", R_INSERT}, {"delete", R_DELETE}, {"admin", R_ADMIN},
-                     {"write", R_WRITE}};
+        size_t n = strcspn(p, ","), next = n;
+        while (n && *p == ' ')
+            p++, n--, next--;
+        while (n && p[n - 1] == ' ')
+            n--;
         size_t i;
-        for (i = 0; i < 5; i++)
-            if (strlen(words[i].w) == n && strncmp(p, words[i].w, n) == 0)
+        for (i = 0; i < sizeof right_words / sizeof right_words[0]; i++)
+            if (strlen(right_words[i].w) == n && strncmp(p, right_words[i].w, n) == 0)
                 break;
-        if (i == 5)
-            return 0;
-        r |= words[i].r;
-        if (!p[n])
-            return r;
-        p += n + 1;
+        if (i < sizeof right_words / sizeof right_words[0])
+            r |= right_words[i].r;
+        else if (n == 4 && p[0] == '0' && p[1] == 'x' && hex_digit(p[2]) >= 0 && hex_digit(p[3]) >= 0)
+            r |= (uint8_t)(hex_digit(p[2]) << 4 | hex_digit(p[3]));
+        else
+            return TSDB_ERR_INVALID;
+        if (!p[next])
+            return *out = r, 0;
+        p += next + 1;
     }
+}
+
+const char *rights_text(uint8_t r, char buf[RIGHTS_TEXT_MAX])
+{
+    size_t n = 0;
+    buf[0] = '\0';
+    for (size_t i = 0; i < 4; i++)
+        if (r & right_words[i].r)
+            n += (size_t)snprintf(buf + n, RIGHTS_TEXT_MAX - n, "%s%s", n ? "," : "", right_words[i].w);
+    if (r & ~R_EVERY)
+        snprintf(buf + n, RIGHTS_TEXT_MAX - n, "%s0x%02x", n ? "," : "", r & ~R_EVERY);
+    else if (!r)
+        snprintf(buf, RIGHTS_TEXT_MAX, "none");
+    return buf;
 }
 
 /* A glob compiled for a bit-parallel run (A24). Its tokens are a byte, '?' or '*' (a run of '*' is one); bit j of

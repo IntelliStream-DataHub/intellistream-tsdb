@@ -50,21 +50,22 @@ static int fail(const char *what, int rc)
     return 1;
 }
 
-/* One line from fd without echo when it is a terminal. */
-static int read_line(FILE *f, char *buf, size_t cap)
+typedef char password[TSDB_PASSWORD_MAX + 1];
+
+/* A password from the first line of f, the rule of every client (tsdb_read_password): -1 with a line on stderr
+ * naming `what` when there is none. */
+static int read_line(FILE *f, const char *what, password buf)
 {
-    if (!fgets(buf, (int)cap, f))
-        return -1;
-    size_t n = strcspn(buf, "\n");
-    if (buf[n] != '\n' && !feof(f))
-        return -1; /* longer than cap */
-    buf[n] = '\0';
-    if (n && buf[n - 1] == '\r')
-        buf[n - 1] = '\0';
-    return 0;
+    int rc = tsdb_read_password(f, buf);
+    if (rc == -1)
+        fprintf(stderr, "tsdb: %s: %s\n", what, strerror(errno));
+    else if (rc)
+        fprintf(stderr, "tsdb: %s: no password in its first line (1 to %d bytes)\n", what, TSDB_PASSWORD_MAX);
+    return rc ? -1 : 0;
 }
 
-static int prompt(FILE *tty, const char *what, char *buf, size_t cap)
+/* One line from the terminal without echo. */
+static int prompt(FILE *tty, const char *what, password buf)
 {
     struct termios old, quiet;
     int fd = fileno(tty);
@@ -76,7 +77,7 @@ static int prompt(FILE *tty, const char *what, char *buf, size_t cap)
     }
     fprintf(tty, "%s", what);
     fflush(tty);
-    int rc = read_line(tty, buf, cap);
+    int rc = read_line(tty, "the terminal", buf);
     if (echo_off)
         tcsetattr(fd, TCSAFLUSH, &old);
     fprintf(tty, "\n");
@@ -84,7 +85,7 @@ static int prompt(FILE *tty, const char *what, char *buf, size_t cap)
 }
 
 /* A password from file, else the environment variable env, else the terminal (twice when it is a new one). */
-static int get_password_from(const char *file, const char *env, const char *name, bool confirm, char *pw, size_t cap)
+static int get_password_from(const char *file, const char *env, const char *name, bool confirm, password pw)
 {
     if (file) {
         FILE *f = strcmp(file, "-") == 0 ? stdin : fopen(file, "r");
@@ -92,28 +93,30 @@ static int get_password_from(const char *file, const char *env, const char *name
             fprintf(stderr, "tsdb: %s: %s\n", file, strerror(errno));
             return -1;
         }
-        int rc = read_line(f, pw, cap);
+        int rc = read_line(f, file, pw);
         if (f != stdin)
             fclose(f);
-        if (rc != 0) {
-            fprintf(stderr, "tsdb: %s: no password in it (or a line over %zu bytes)\n", file, cap - 1);
+        if (rc != 0)
+            return -1;
+    } else if (getenv(env)) {
+        size_t n = strlen(getenv(env));
+        if (n == 0 || n > TSDB_PASSWORD_MAX) {
+            fprintf(stderr, "tsdb: %s: a password is 1 to %d bytes\n", env, TSDB_PASSWORD_MAX);
             return -1;
         }
-    } else if (getenv(env)) {
-        if (strlen(getenv(env)) >= cap)
-            return -1;
-        snprintf(pw, cap, "%s", getenv(env));
+        memcpy(pw, getenv(env), n + 1);
     } else {
         FILE *tty = fopen("/dev/tty", "r+");
         if (!tty) {
             fprintf(stderr, "tsdb: no terminal for the password of %s: use a password file or %s\n", name, env);
             return -1;
         }
-        char again[1024], what[200];
+        password again;
+        char what[200];
         snprintf(what, sizeof what, "Password for %s: ", name);
-        int rc = prompt(tty, what, pw, cap);
+        int rc = prompt(tty, what, pw);
         if (rc == 0 && confirm)
-            rc = prompt(tty, "Again: ", again, sizeof again);
+            rc = prompt(tty, "Again: ", again);
         fclose(tty);
         if (rc == 0 && confirm && strcmp(pw, again) != 0) {
             fprintf(stderr, "tsdb: the passwords differ\n");
@@ -123,23 +126,19 @@ static int get_password_from(const char *file, const char *env, const char *name
         if (rc != 0)
             return -1;
     }
-    if (!pw[0]) {
-        fprintf(stderr, "tsdb: the password is empty\n");
-        return -1;
-    }
     return 0;
 }
 
-static int get_password(const char *file, const char *name, char *pw, size_t cap)
+static int get_password(const char *file, const char *name, password pw)
 {
-    return get_password_from(file, "TSDB_PASSWORD", name, true, pw, cap);
+    return get_password_from(file, "TSDB_PASSWORD", name, true, pw);
 }
 
 /* The verifier of a password with a fresh random salt (A18: the server never sees the password). */
 static int make_verifier(const char *file, const char *name, uint32_t iterations, user_verifier *v)
 {
-    char pw[1024];
-    if (get_password(file, name, pw, sizeof pw) != 0)
+    password pw;
+    if (get_password(file, name, pw) != 0)
         return -1;
     memset(v, 0, sizeof *v);
     v->iterations = iterations;
@@ -156,23 +155,22 @@ static int make_verifier(const char *file, const char *name, uint32_t iterations
 static const char *kind_tag(uint8_t kind)
 {
     static const char *t[] = {"all", "prefix:", "name:", "glob:"};
-    return kind <= SEL_GLOB ? t[kind] : "?";
+    return kind <= SEL_GLOB ? t[kind] : NULL;
 }
 
+/* As rights_parse reads it back (and every client prints it). */
 static void print_rights(FILE *f, uint8_t r)
 {
-    static const char *w[] = {"read", "insert", "delete", "admin"};
-    bool first = true;
-    for (int i = 0; i < 4; i++)
-        if (r & (1 << i)) {
-            fprintf(f, "%s%s", first ? "" : ",", w[i]);
-            first = false;
-        }
+    char b[RIGHTS_TEXT_MAX];
+    fputs(rights_text(r, b), f);
 }
 
 static void print_sel(FILE *f, uint8_t kind, const char *sel, size_t len)
 {
-    fputs(kind_tag(kind), f);
+    if (kind_tag(kind))
+        fputs(kind_tag(kind), f);
+    else
+        fprintf(f, "kind#%u:", kind); /* a later server's kind, as the clients show it */
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)sel[i];
         if (c < 0x20 || c == 0x7f)
@@ -254,8 +252,8 @@ static int user_online(const char *server, const char *login, const char *login_
         memmove(host, host + 1, strlen(host));
         host[strlen(host) - 1] = '\0';
     }
-    char lpw[1024];
-    if (get_password_from(login_pwfile, "TSDB_LOGIN_PASSWORD", login, false, lpw, sizeof lpw) != 0)
+    password lpw;
+    if (get_password_from(login_pwfile, "TSDB_LOGIN_PASSWORD", login, false, lpw) != 0)
         return 1;
     tsdbc_options o = {.user = login, .password = lpw, .require_auth = 1};
     tsdbc *c;
@@ -283,8 +281,8 @@ static int user_online(const char *server, const char *login, const char *login_
         if (rc == 0)
             tsdbc_users_free(u, n);
     } else if (strcmp(verb, "add") == 0 || strcmp(verb, "passwd") == 0) {
-        char pw[1024];
-        if (get_password(pwfile, name, pw, sizeof pw) != 0) {
+        password pw;
+        if (get_password(pwfile, name, pw) != 0) {
             tsdbc_close(c);
             return 1;
         }
@@ -296,12 +294,13 @@ static int user_online(const char *server, const char *login, const char *login_
     } else if (strcmp(verb, "alter") == 0) {
         rc = tsdbc_user_alter(c, name, super == 1 ? USER_SUPERUSER : 0);
     } else { /* grant, revoke */
-        uint8_t rights = rights_parse(args[1]), kind;
+        uint8_t rights = 0, kind;
         const char *sel;
         size_t len;
-        if (!rights || sel_parse(args[2], &kind, &sel, &len) != 0 || memchr(sel, 0, len)) {
-            fprintf(stderr, "tsdb: %s %s: rights are read, insert, delete, admin and write; a selector is all, "
-                            "prefix:P, name:N or glob:G\n", args[1], args[2]);
+        if (rights_parse(args[1], &rights) != 0 || !rights || sel_parse(args[2], &kind, &sel, &len) != 0 ||
+            memchr(sel, 0, len)) {
+            fprintf(stderr, "tsdb: %s %s: rights are read, insert, delete, admin and write, comma-separated; a "
+                            "selector is all, prefix:P, name:N or glob:G\n", args[1], args[2]);
             tsdbc_close(c);
             return 1;
         }
@@ -435,10 +434,10 @@ int user_main(const char *dir, int argc, char **argv)
             fprintf(stderr, "tsdb: warning: no superuser is left; tsdbd will not start until one is added "
                             "(tsdb %s user add NAME --superuser)\n", dir);
     } else {
-        uint8_t rights = rights_parse(args[1]), kind;
+        uint8_t rights = 0, kind;
         const char *sel;
         size_t len;
-        if (!rights) {
+        if (rights_parse(args[1], &rights) != 0 || !rights) {
             fprintf(stderr, "tsdb: %s: rights are read, insert, delete, admin and write, comma-separated\n", args[1]);
             ret = 1;
         } else if (sel_parse(args[2], &kind, &sel, &len) != 0) {

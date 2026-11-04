@@ -45,11 +45,17 @@ int tsdbc_connect_timeout(const char *host, int port, int connect_ms, tsdbc **ou
 /* Login (SCRAM-SHA-256, docs/design-auth.md). The client checks the server's signature, so a server that does not
  * hold the user's verifier fails the connect too. PBKDF2 runs once per (user, password, salt, iterations) per
  * process: the keys it gives are cached, and later connects cost four HMACs. Any failure (unknown user, wrong
- * password, a server that cannot prove itself) is TSDB_ERR_AUTH. */
+ * password, a server that cannot prove itself) is TSDB_ERR_AUTH.
+ *
+ * A password is 1 to TSDBC_PASSWORD_MAX bytes, in every client and the CLI; a password file holds it in its first
+ * line, without the "\n" or "\r\n" that ends it. An empty or longer password, or a password file that cannot be read
+ * or holds none, is TSDB_ERR_INVALID (a file's path and the reason go to stderr), never retried as a network error;
+ * so is a user with neither password nor password_file. */
+#define TSDBC_PASSWORD_MAX 1023
 typedef struct tsdbc_options {
     const char *user;          /* NULL: no login (a tsdbd with --no-auth) */
     const char *password;      /* the password's bytes (UTF-8, no normalization), or */
-    const char *password_file; /* the first line of this file (a trailing CR LF cut) */
+    const char *password_file; /* the first line of this file */
     int connect_ms;            /* 0: TSDBC_CONNECT_TIMEOUT_MS; below 0 waits as long as the kernel does */
     int require_auth;          /* refuse (TSDB_ERR_AUTH) a server that does not ask for a login */
 } tsdbc_options;
@@ -60,7 +66,9 @@ int tsdbc_connect_auth(const char *host, int port, const char *user, const char 
 /* Users and grants (tsdbd's USERS, managed over the wire by a superuser or a user with admin on a selector; a
  * tsdbd with --no-auth refuses these with TSDB_ERR_DENIED: use `tsdb <dir> user` there). Flags: TSDB_USER_SUPERUSER.
  * A grant's kind is TSDB_SEL_ALL, _PREFIX, _NAME or _GLOB (tsdb_protocol.h), rights TSDB_RIGHT_* bits. The
- * password never leaves the client: its verifier (a fresh 16-byte salt, iterations, 0 for 4096) is computed here. */
+ * password never leaves the client: its verifier (a fresh 16-byte salt, iterations, 0 for 4096) is computed here;
+ * a password outside the rule above is TSDB_ERR_INVALID. A grant read back may carry a kind or rights bits this
+ * client does not know (a later server's): they are kept as they came. */
 typedef struct tsdbc_user_grant {
     uint8_t kind, rights;
     char *selector; /* "" for all */

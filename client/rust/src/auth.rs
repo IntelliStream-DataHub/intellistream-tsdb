@@ -10,8 +10,8 @@
 
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -26,6 +26,9 @@ type HmacSha256 = Hmac<Sha256>;
 pub const SCRAM_ITERATIONS: u32 = 4096;
 /// More would let a fake server pin the client's CPU for minutes (as the C client).
 const ITER_MAX: u32 = 100_000_000;
+/// The longest password, in bytes, in every client and the CLI (design-auth.md §6); a password is at least 1 byte
+/// and holds no NUL.
+pub const PASSWORD_MAX: usize = 1023;
 const SALT_LEN: usize = 16;
 const KEY_CACHE: usize = 16;
 
@@ -104,19 +107,28 @@ impl fmt::Display for Rights {
 impl FromStr for Rights {
     type Err = Error;
 
-    /// Comma-separated names: `read`, `insert`, `delete`, `admin`, `write`.
+    /// The grammar of tsdbd, the CLI and every client (design §2): names separated by commas, spaces around a name
+    /// ignored; `read`, `insert`, `delete`, `admin`, `write` (insert and delete), `none` (no rights) and `0xHH`
+    /// (two hex digits: bits a later server may name, as [`Display`](fmt::Display) shows them). Whatever
+    /// `Display` prints parses back to the same bits.
     fn from_str(s: &str) -> Result<Rights> {
         let mut r = Rights::default();
         for word in s.split(',') {
-            r |= match word.trim() {
+            r |= match word.trim_matches(' ') {
                 "write" => Rights::WRITE,
+                "none" => Rights::default(),
                 w => match RIGHT_NAMES.iter().find(|(n, _)| *n == w) {
                     Some(&(_, x)) => x,
-                    None => {
-                        return Err(Error::InvalidArgument(format!(
-                            "rights {s:?}: {w:?} is none of read, insert, delete, admin, write"
-                        )));
-                    }
+                    None => match w.strip_prefix("0x") {
+                        Some(h) if h.len() == 2 && h.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                            Rights(u8::from_str_radix(h, 16).expect("two hex digits"))
+                        }
+                        _ => {
+                            return Err(Error::InvalidArgument(format!(
+                                "rights {s:?}: {w:?} is none of read, insert, delete, admin, write, none, 0xHH"
+                            )));
+                        }
+                    },
                 },
             };
         }
@@ -130,7 +142,11 @@ impl FromStr for Rights {
 /// A prefix is a byte prefix of the name (`prefix:acme` also matches `acmecorp/x`; tenants end theirs in `/`).
 /// In a glob `*` matches any run of bytes, `?` one byte and `\` makes the next byte literal; the server stores a
 /// glob without a wildcard as a name and one ending in a single final `*` as a prefix.
+///
+/// A later server may add kinds (docs/compatibility.md): a grant of a kind this client does not know is read as
+/// [`Selector::Other`], shown as `kind#N:TEXT`, and cannot be granted or revoked from here. Match with a `_` arm.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Selector {
     /// Every series.
     All,
@@ -140,6 +156,13 @@ pub enum Selector {
     Name(String),
     /// The names the glob matches.
     Glob(String),
+    /// A kind this client does not know, as the server sent it.
+    Other {
+        /// The kind on the wire.
+        kind: u8,
+        /// Its text.
+        text: String,
+    },
 }
 
 impl Selector {
@@ -150,6 +173,7 @@ impl Selector {
             Selector::Prefix(_) => 1,
             Selector::Name(_) => 2,
             Selector::Glob(_) => 3,
+            Selector::Other { kind, .. } => *kind,
         }
     }
 
@@ -157,18 +181,18 @@ impl Selector {
     pub fn text(&self) -> &str {
         match self {
             Selector::All => "",
-            Selector::Prefix(s) | Selector::Name(s) | Selector::Glob(s) => s,
+            Selector::Prefix(s) | Selector::Name(s) | Selector::Glob(s) | Selector::Other { text: s, .. } => s,
         }
     }
 
-    fn from_wire(kind: u8, text: String) -> Result<Selector> {
-        Ok(match kind {
+    fn from_wire(kind: u8, text: String) -> Selector {
+        match kind {
             0 => Selector::All,
             1 => Selector::Prefix(text),
             2 => Selector::Name(text),
             3 => Selector::Glob(text),
-            k => return Err(Error::Protocol(format!("a grant of unknown kind {k}"))),
-        })
+            kind => Selector::Other { kind, text },
+        }
     }
 }
 
@@ -179,6 +203,7 @@ impl fmt::Display for Selector {
             Selector::Prefix(s) => write!(f, "prefix:{s}"),
             Selector::Name(s) => write!(f, "name:{s}"),
             Selector::Glob(s) => write!(f, "glob:{s}"),
+            Selector::Other { kind, text } => write!(f, "kind#{kind}:{text}"),
         }
     }
 }
@@ -237,13 +262,16 @@ pub(crate) fn read_user(r: &mut Cursor<'_>) -> Result<User> {
         let (kind, rights) = (r.u8()?, r.u8()?);
         let n = r.u16()? as usize;
         let text = String::from_utf8_lossy(r.take(n)?).into_owned();
-        grants.push(Grant { selector: Selector::from_wire(kind, text)?, rights: Rights(rights) });
+        grants.push(Grant { selector: Selector::from_wire(kind, text), rights: Rights(rights) });
     }
     Ok(User { name, superuser: flags & USER_SUPERUSER != 0, grants })
 }
 
 /// The u8 kind, u8 rights, u16 len, selector of GRANT and REVOKE.
 pub(crate) fn grant_body(selector: &Selector, rights: Rights) -> Result<Vec<u8>> {
+    if let Selector::Other { kind, .. } = selector {
+        return Err(Error::InvalidArgument(format!("a selector of kind {kind} is unknown to this client")));
+    }
     let t = selector.text().as_bytes();
     if t.len() > u16::MAX as usize {
         return Err(Error::InvalidArgument("a selector is longer than 65535 bytes".into()));
@@ -377,11 +405,21 @@ fn random(buf: &mut [u8]) -> Result<()> {
 struct KeyEntry {
     user: String,
     salt: Vec<u8>,
+    /// 0 for an entry whose computation failed: it matches no login (they ask for 4096 or more).
     iterations: u32,
     /// HMAC(salt, password): tells one password from another without keeping it.
     pw_mac: [u8; 32],
-    client_key: [u8; 32],
-    server_key: [u8; 32],
+    /// ClientKey and ServerKey; None while one login computes them and others wait for it.
+    keys: Option<([u8; 32], [u8; 32])>,
+}
+
+impl Drop for KeyEntry {
+    fn drop(&mut self) {
+        if let Some((ck, sk)) = &mut self.keys {
+            wipe(ck);
+            wipe(sk);
+        }
+    }
 }
 
 struct KeyCache {
@@ -390,52 +428,95 @@ struct KeyCache {
 }
 
 static KEYS: Mutex<KeyCache> = Mutex::new(KeyCache { entries: Vec::new(), next: 0 });
+/// Signalled when a computation ends: the logins waiting for that key look again.
+static KEYS_DONE: Condvar = Condvar::new();
 
-/// ClientKey and ServerKey, from the cache or computed (outside the lock: milliseconds) and cached.
+fn lock_keys() -> MutexGuard<'static, KeyCache> {
+    KEYS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The slot a computation claimed; if the computation unwinds, the slot is given up so its waiters do not wait
+/// for ever (they then compute the key themselves).
+struct Claim(Option<usize>);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(i) = self.0 {
+            let mut cache = lock_keys();
+            cache.entries[i].iterations = 0;
+            cache.entries[i].keys = Some(([0; 32], [0; 32]));
+            KEYS_DONE.notify_all();
+        }
+    }
+}
+
+/// ClientKey and ServerKey, from the cache or computed once. The connections of a pool start together: the first
+/// to miss claims an entry and computes it outside the lock, the others wait for it (one PBKDF2 per key, not one
+/// per connection, and one entry, so other users' keys are not evicted by copies). A pending entry is never
+/// evicted; with KEY_CACHE keys in flight, one more is computed without being cached.
 fn keys_cached(user: &str, password: &[u8], salt: &[u8], iterations: u32) -> ([u8; 32], [u8; 32]) {
     let mut mac = hmac(salt, &[password]);
-    {
-        let cache = KEYS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(e) = cache
+    let mut cache = lock_keys();
+    let claim = loop {
+        let found = cache
             .entries
             .iter()
             .find(|e| e.iterations == iterations && e.user == user && e.salt == salt && ct_equal(&e.pw_mac, &mac))
-        {
-            let r = (e.client_key, e.server_key);
-            wipe(&mut mac);
-            return r;
+            .map(|e| e.keys);
+        match found {
+            Some(Some(k)) => {
+                wipe(&mut mac);
+                return k;
+            }
+            Some(None) => cache = KEYS_DONE.wait(cache).unwrap_or_else(|e| e.into_inner()),
+            None => break claim_slot(&mut cache),
+        }
+    };
+    if let Some(i) = claim {
+        cache.entries[i].user = user.to_string();
+        cache.entries[i].salt = salt.to_vec();
+        cache.entries[i].iterations = iterations;
+        cache.entries[i].pw_mac = mac;
+    }
+    wipe(&mut mac);
+    drop(cache);
+    let mut claim = Claim(claim);
+    let k = keys(password, salt, iterations);
+    if let Some(i) = claim.0.take() {
+        let mut cache = lock_keys();
+        cache.entries[i].keys = Some(k);
+        KEYS_DONE.notify_all();
+    }
+    k
+}
+
+/// A pending entry for a new key: a new one while there is room, else the next in the ring that nobody waits for.
+fn claim_slot(cache: &mut KeyCache) -> Option<usize> {
+    let pending = || KeyEntry { user: String::new(), salt: Vec::new(), iterations: 0, pw_mac: [0; 32], keys: None };
+    if cache.entries.len() < KEY_CACHE {
+        cache.entries.push(pending());
+        return Some(cache.entries.len() - 1);
+    }
+    for _ in 0..KEY_CACHE {
+        let i = cache.next % KEY_CACHE;
+        cache.next = cache.next.wrapping_add(1);
+        if cache.entries[i].keys.is_some() {
+            cache.entries[i] = pending();
+            return Some(i);
         }
     }
-    let (ck, sk) = keys(password, salt, iterations);
-    let mut cache = KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = KeyEntry {
-        user: user.to_string(),
-        salt: salt.to_vec(),
-        iterations,
-        pw_mac: mac,
-        client_key: ck,
-        server_key: sk,
-    };
-    wipe(&mut mac);
-    if cache.entries.len() < KEY_CACHE {
-        cache.entries.push(e);
-    } else {
-        let i = cache.next % KEY_CACHE;
-        let old = &mut cache.entries[i];
-        wipe(&mut old.client_key);
-        wipe(&mut old.server_key);
-        *old = e;
-    }
-    cache.next = cache.next.wrapping_add(1);
-    (ck, sk)
+    None
 }
 
 // ------------------------------------------------------------ the exchange
 
+#[cfg(feature = "test-hooks")]
 static TEST_NONCE: Mutex<Option<String>> = Mutex::new(None);
 
-/// Test hooks, not part of the API: a fixed client nonce (the RFC 7677 test replays a fixed exchange) and the
-/// number of PBKDF2 runs in this process (the key cache test).
+/// Test hooks, only with the feature `test-hooks` (the crate's own tests and the Python module's test build turn
+/// it on; nothing else should): a fixed client nonce (the RFC 7677 test replays a fixed exchange) and the number
+/// of PBKDF2 runs in this process (the key cache test).
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub mod test_hooks {
     /// Every later login of this process uses `nonce` as its client nonce; `None` goes back to random ones.
@@ -468,7 +549,11 @@ impl Scram {
         if user.is_empty() || user.len() > 255 || user.contains([',', '=', '\0']) {
             return Err(Error::InvalidArgument(format!("user name {user:?}: 1 to 255 bytes without , = or NUL")));
         }
-        let nonce = match TEST_NONCE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        #[cfg(feature = "test-hooks")]
+        let fixed = TEST_NONCE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        #[cfg(not(feature = "test-hooks"))]
+        let fixed: Option<String> = None;
+        let nonce = match fixed {
             Some(n) => n,
             None => {
                 let mut r = [0u8; 18];
@@ -553,9 +638,7 @@ pub(crate) fn server_message(body: &[u8]) -> Result<&[u8]> {
 /// A password's verifier with a fresh salt (A18): u32 iterations, u8 salt_len, salt, StoredKey, ServerKey.
 pub(crate) fn verifier(password: &str, iterations: Option<u32>) -> Result<Vec<u8>> {
     let it = iterations.unwrap_or(SCRAM_ITERATIONS);
-    if password.is_empty() {
-        return Err(Error::InvalidArgument("an empty password".into()));
-    }
+    crate::client::check_password(password.as_bytes())?;
     if !(SCRAM_ITERATIONS..=ITER_MAX).contains(&it) {
         return Err(Error::InvalidArgument(format!("{it} iterations: 4096 to 100,000,000")));
     }
@@ -621,5 +704,42 @@ mod tests {
             assert_eq!(s.parse::<Selector>().unwrap().to_string(), s);
         }
         assert!("acme/".parse::<Selector>().is_err());
+    }
+
+    /// REVIEW3 #7: the grammar of server/users.c rights_parse, and every value prints as text that parses back.
+    #[test]
+    fn rights_text_round_trips_in_the_servers_grammar() {
+        for bits in 0..=255u8 {
+            let r = Rights::from_bits(bits);
+            assert_eq!(r.to_string().parse::<Rights>().unwrap(), r, "{r}");
+        }
+        assert_eq!(Rights::from_bits(0x45).to_string(), "read,delete,0x40");
+        let ok = [
+            ("read, insert", 3),
+            (" read ,  write ", 7),
+            ("none", 0),
+            ("none,read", 1),
+            ("0x30", 0x30),
+            ("read,0xF0", 0xf1),
+            ("0x00", 0),
+        ];
+        for (text, bits) in ok {
+            assert_eq!(text.parse::<Rights>().unwrap().bits(), bits, "{text}");
+        }
+        for bad in
+            ["", "read,", "reads", "read,,insert", "READ", " ", "re ad", "read\t", "\tread", "0x1", "0x100", "0xg0"]
+        {
+            assert!(bad.parse::<Rights>().is_err(), "{bad:?}");
+        }
+    }
+
+    /// REVIEW3 #6: a kind a later server adds is kept and shown, never a broken reply, and cannot be granted.
+    #[test]
+    fn unknown_selector_kinds_are_kept() {
+        let s = Selector::from_wire(9, "x/*".into());
+        assert_eq!(s, Selector::Other { kind: 9, text: "x/*".into() });
+        assert_eq!(s.to_string(), "kind#9:x/*");
+        assert!(s.to_string().parse::<Selector>().is_err());
+        assert!(matches!(grant_body(&s, Rights::READ), Err(Error::InvalidArgument(_))));
     }
 }

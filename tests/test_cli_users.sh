@@ -128,6 +128,46 @@ assert hmac.new(sp, b"Server Key", "sha256").digest() == server
 EOF
 fi
 
+# REVIEW3 #2: the password rule of every client: 1 to 1023 bytes; a file's first line without "\n" or "\r\n"
+p1023=$(printf 'p%.0s' $(seq 1023))
+printf '%s' "$p1023" > "$dir/p1023"
+printf '%s\r\n' "$p1023" > "$dir/p1023crlf"
+printf '%sx\n' "$p1023" > "$dir/p1024"
+printf '\nsecond\n' > "$dir/pempty"
+printf '1\n' > "$dir/p1"
+refused "a password file whose first line is empty" add x --password-file "$dir/pempty"
+refused "a password file of 1024 bytes" add x --password-file "$dir/p1024"
+refused "a missing password file" add x --password-file "$dir/nonexistent"
+TSDB_PASSWORD="${p1023}x" refused "TSDB_PASSWORD of 1024 bytes" add x
+u add pw/one --password-file "$dir/p1" >/dev/null || fail "a password of 1 byte"
+u add pw/max --password-file "$dir/p1023crlf" >/dev/null || fail "a password of 1023 bytes and CR LF"
+TSDB_PASSWORD="$p1023" u passwd pw/max || fail "TSDB_PASSWORD of 1023 bytes"
+u add pw/max2 --password-file "$dir/p1023" >/dev/null || fail "a password of 1023 bytes without a line end"
+u drop pw/one && u drop pw/max && u drop pw/max2 || fail "drop the password users"
+
+# REVIEW3 #7: one rights grammar (server/users.c rights_parse): spaces around names, "none", "0xHH"; what the CLI
+# prints parses back. The 15 non-empty combinations of the four rights, granted again from their printed form.
+names=(read insert delete admin)
+TSDB_PASSWORD=x u add rt/a >/dev/null && TSDB_PASSWORD=x u add rt/b >/dev/null || fail "add rt/a, rt/b"
+for r in $(seq 1 15); do
+    words=()
+    for i in 0 1 2 3; do (( r >> i & 1 )) && words+=("${names[$i]}"); done
+    text=$(IFS=,; echo "${words[*]}")
+    u grant rt/a "$text" "name:rt/$r" || fail "grant $text"
+done
+u list | awk -F'\t' '$3 ~ /^name:rt\// {print $2 "\t" $3}' > "$dir/printed"
+[ "$(wc -l < "$dir/printed")" = 15 ] || fail "rights round trip: $(wc -l < "$dir/printed") grants listed, not 15"
+while IFS=$'\t' read -r text sel; do u grant rt/b "$text" "$sel" || fail "printed rights $text do not parse"; done \
+    < "$dir/printed"
+u list | awk -F'\t' '$3 ~ /^name:rt\// {print $2 "\t" $3}' | sort | uniq -c | awk '$1 != 2' | grep -q . \
+    && fail "rights printed for rt/b differ from rt/a's"
+u grant rt/b 'read , insert' name:rt/sp || fail "rights with spaces around the comma"
+u list | grep -q $'^\tread,insert\tname:rt/sp$' || fail "rights with spaces: not read,insert"
+refused "rights none (nothing to grant)" grant rt/b none name:rt/none
+refused "rights 0x10 (no such right yet)" grant rt/b 0x10 name:rt/none
+refused "rights with a tab" grant rt/b $'read\t' name:rt/none
+u drop rt/a && u drop rt/b || fail "drop rt/a, rt/b"
+
 # beside a database: the engine opens with USERS in its directory, and user commands do not open the engine
 "$B/tsdb" "$dir/db" create s1 >/dev/null || fail "a database in the directory of USERS"
 u list | grep -q root || fail "list beside a database"

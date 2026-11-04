@@ -107,10 +107,17 @@ $(B)/users.o: server/users.c server/users.h client/tsdb_crypto.h include/tsdb.h 
 $(B)/test_crypto: tests/test_crypto.c tests/rfc7677.h $(B)/tsdb_crypto.o
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(B)/tsdb_crypto.o
 
+# The C client with its test hooks (tests/client_hooks.h), which libtsdbclient.a does not have; linked before
+# $(CLIB), so the archive's own tsdb_client.o is not pulled in.
+$(B)/tsdb_client_hooks.o: client/tsdb_client.c client/tsdb_client.h client/tsdb_crypto.h include/tsdb_protocol.h \
+                          include/tsdb.h | $(B)
+	$(CC) $(CFLAGS) -DTSDBC_TEST_HOOKS -c -o $@ $<
+
 # starts tsdbd (login on) and links server/auth.c for the RFC 7677 exchange on the server side in this process
-$(B)/test_auth: tests/test_auth.c tests/harness.h tests/auth_harness.h tests/rfc7677.h server/auth.c server/auth.h \
-                server/users.h $(B)/users.o $(CLIB) $(LIB)
-	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c $(B)/users.o $(CLIB) $(LIB) $(LDLIBS)
+$(B)/test_auth: tests/test_auth.c tests/harness.h tests/auth_harness.h tests/rfc7677.h tests/client_hooks.h \
+                server/auth.c server/auth.h server/users.h $(B)/users.o $(B)/tsdb_client_hooks.o $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -Iserver -o $@ $< server/auth.c $(B)/users.o $(B)/tsdb_client_hooks.o $(CLIB) $(LIB) \
+	    $(LDLIBS)
 
 # every op of TSDB_OPS across tenants (links server/auth.c for its table, makes USERS with server/users.c)
 $(B)/test_auth_ops: tests/test_auth_ops.c tests/harness.h tests/auth_harness.h server/auth.c server/auth.h \
@@ -172,6 +179,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	./$(B)/test_crypto
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh
+	! nm $(CLIB) | grep -w 'tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	TSDBD=$(TSDBD) ./$(B)/test_ports
@@ -328,12 +336,13 @@ test-rust: $(B)/tsdbd $(B)/tsdb
 	cd client/rust-sys && cargo test
 
 # numpy is an optional extra of the package, but the tests use it (numpy results, batch calls); a venv made before
-# it was needed gets it too
+# it was needed gets it too. The test build has the test hooks (feature test-hooks: a fixed client nonce, the
+# PBKDF2 count), which wheels never have.
 test-python: $(B)/tsdbd $(B)/tsdb
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	$(PYVENV)/bin/python -c 'import numpy' 2>/dev/null || $(PYVENV)/bin/pip install -q numpy
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
-	    && $(abspath $(PYVENV))/bin/python -m pytest tests
+	    --features test-hooks && $(abspath $(PYVENV))/bin/python -m pytest tests
 
 # The Python sdist (distribution intellistream-tsdb-client, module tsdb_client) carries intellistream-tsdb-sys as a
 # path dependency, so the engine's C sources travel in it as the copy client/rust-sys/vendor.sh makes (csrc/).
@@ -349,7 +358,8 @@ test-python-sdist: python-sdist
 	PATH=$(abspath $(PYVENV))/bin:$$PATH $(PYVENV)/bin/pip wheel -q --no-build-isolation --no-deps -w $(B)/sdist-check/whl $(B)/sdist/intellistream_tsdb_client-*.tar.gz
 	cd $(B)/sdist-check && unzip -q whl/intellistream_tsdb_client-*.whl -d site \
 	    && $(abspath $(PYVENV))/bin/python -I -c "import os, sys; sys.path.insert(0, os.path.abspath('site')); import tsdb_client; \
-	    assert tsdb_client.__file__.startswith('$(abspath $(B))/sdist-check/site'), tsdb_client.__file__; tsdb_client.Db"
+	    assert tsdb_client.__file__.startswith('$(abspath $(B))/sdist-check/site'), tsdb_client.__file__; tsdb_client.Db; \
+	    assert not hasattr(tsdb_client, '_set_client_nonce'), 'a wheel with the test hooks'"
 	tools/check-package-licenses.sh sdist $(B)/sdist/intellistream_tsdb_client-*.tar.gz
 	tools/check-package-licenses.sh wheel $(B)/sdist-check/whl/intellistream_tsdb_client-*.whl
 

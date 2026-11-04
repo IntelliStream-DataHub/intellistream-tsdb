@@ -21,6 +21,9 @@ embedded = ["dep:tsdb-sys"]
 embedded-system = ["embedded", "tsdb-sys/system"]
 # embedded, with the engine compiled for this CPU (-march=native)
 native = ["embedded", "tsdb-sys/native"]
+# tests only (a fixed client nonce, the PBKDF2 count: `tsdb_client::test_hooks`); this crate's own tests turn it
+# on through the dev-dependency below, the Python module's test build through its own feature. Not for users.
+test-hooks = []
 
 [dependencies]
 # packed inserts (protocol version 3); the bundled libzstd, no optional features
@@ -35,6 +38,10 @@ hmac = "0.12"
 # TCP keepalive options, which std does not expose
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# the crate itself with its test hooks, for its own tests (a dev-dependency never reaches a user's build)
+[dev-dependencies]
+intellistream-tsdb-client = { path = ".", features = ["test-hooks"] }
 
 [[example]]
 name = "embedded_quickstart"

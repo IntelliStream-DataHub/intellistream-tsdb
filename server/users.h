@@ -135,8 +135,14 @@ bool verifier_valid(const user_verifier *v);
 int sel_normalize(uint8_t kind, const char *in, size_t len, uint8_t *out_kind, char *out, size_t *out_len);
 /* Parses "all", "prefix:P", "name:N", "glob:G" into its kind and bytes (not normalized). */
 int sel_parse(const char *text, uint8_t *kind, const char **sel, size_t *len);
-/* "read,insert,delete,admin,write" (any order, comma-separated) -> bits; 0 for anything else. */
-uint8_t rights_parse(const char *text);
+/* Rights as text, one grammar in tsdbd, the CLI and every client (design-auth.md §2): names separated by commas,
+ * spaces around a name ignored; "read", "insert", "delete", "admin", "write" (insert and delete), "none" (no bits)
+ * and "0xHH" (two hex digits: bits a later version may name). rights_parse: 0 and *out, or TSDB_ERR_INVALID (an empty
+ * text or name, any other word). rights_text writes what rights_parse reads back: the four names in that order, the
+ * other bits as one "0xhh", "none" for 0. */
+int rights_parse(const char *text, uint8_t *out);
+#define RIGHTS_TEXT_MAX sizeof "read,insert,delete,admin,0xf0"
+const char *rights_text(uint8_t r, char buf[RIGHTS_TEXT_MAX]);
 
 bool glob_match(const char *glob, size_t glen, const char *name, size_t len);
 /* Whether the selector matches the series name. */

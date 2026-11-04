@@ -288,3 +288,28 @@ void tsdb_scram_keys(const void *password, size_t password_len, const void *salt
     tsdb_wipe(sp, sizeof sp);
     tsdb_wipe(ck, sizeof ck);
 }
+
+int tsdb_read_password(FILE *f, char pw[TSDB_PASSWORD_MAX + 1])
+{
+    char line[TSDB_PASSWORD_MAX + 2]; /* the password, a '\r' before the '\n', and one byte to see a longer line */
+    size_t n = 0;
+    int ch;
+    while ((ch = getc(f)) != EOF && ch != '\n')
+        if (n < sizeof line)
+            line[n++] = (char)ch; /* the rest of a long line is read and dropped */
+        else
+            n = sizeof line + 1;
+    if (ferror(f))
+        return tsdb_wipe(line, sizeof line), -1;
+    if (ch == '\n' && n && n <= sizeof line && line[n - 1] == '\r')
+        n--; /* "\r\n": only before a '\n' is a '\r' a line end */
+    int rc = 0;
+    if (n == 0 || n > TSDB_PASSWORD_MAX || memchr(line, '\0', n))
+        rc = -2;
+    else {
+        memcpy(pw, line, n);
+        pw[n] = '\0';
+    }
+    tsdb_wipe(line, sizeof line);
+    return rc;
+}

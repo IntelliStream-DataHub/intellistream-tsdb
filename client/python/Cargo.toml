@@ -16,3 +16,8 @@ tsdb-client = { package = "intellistream-tsdb-client", path = "../rust", feature
 pyo3 = "0.29"
 # results handed to numpy without a copy (PyArray from a Vec)
 numpy = "0.29"
+
+[features]
+# tests only: tsdb_client._set_client_nonce and _pbkdf2_runs (`maturin develop --features test-hooks`, as
+# `make test-python` builds it); wheels and sdists are built without it
+test-hooks = ["tsdb-client/test-hooks"]
