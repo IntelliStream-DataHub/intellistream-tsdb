@@ -1865,7 +1865,7 @@ static int64_t nz_missing(const char *dir, const char *name, codec_ctx *cc, uint
     int dfd = open(dir, O_RDONLY | O_DIRECTORY);
     CHECK(dfd >= 0);
     part *p;
-    OK(part_open(dfd, name, &p));
+    OK(part_open(dfd, name, false, &p));
     int64_t missing = 0;
     for (uint32_t i = 0; i < p->ng; i++) {
         granule g;
@@ -1920,7 +1920,7 @@ static void nz_rows(int64_t t0, int from, int n, int64_t *ts, float *v)
     }
 }
 
-static void nz_check_rows(tsdb *db, uint32_t id, int64_t t0, int n)
+static void nz_check_rows(tsdb *db, tsdb_sid id, int64_t t0, int n)
 {
     int64_t *ts = malloc((size_t)n * sizeof *ts);
     float *v = malloc((size_t)n * sizeof *v);
@@ -1967,7 +1967,7 @@ static void test_insert_nozstd(const char *base)
         pid_t pid = fork();
         if (pid == 0) {
             tsdb *db;
-            uint32_t id;
+            tsdb_sid id;
             if (tsdb_open(dir, &o, &db) || tsdb_series(db, "s", &id))
                 _exit(1);
             for (int b = 0; b < 2; b++) {
@@ -1984,7 +1984,7 @@ static void test_insert_nozstd(const char *base)
         int status;
         CHECK(pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
         tsdb *db;
-        uint32_t id;
+        tsdb_sid id;
         OK(tsdb_open(dir, &o, &db));
         OK(tsdb_series(db, "s", &id));
         nz_check_rows(db, id, t0, 2 * N + A);
