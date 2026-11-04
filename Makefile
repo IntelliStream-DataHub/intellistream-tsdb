@@ -291,14 +291,14 @@ dist-check-sandybridge: dist
 # cargo, Python or JDK. Each runs its tests against build/tsdbd.
 PYVENV ?= build/pyvenv
 
-test-rust: $(B)/tsdbd
+test-rust: $(B)/tsdbd $(B)/tsdb
 	cd client/rust && cargo test --features embedded
 	cd client/rust && cargo build --all-targets  # the TCP-only crate (no features) must still build
 	cd client/rust-sys && cargo test
 
 # numpy is an optional extra of the package, but the tests use it (numpy results, batch calls); a venv made before
 # it was needed gets it too
-test-python: $(B)/tsdbd
+test-python: $(B)/tsdbd $(B)/tsdb
 	test -x $(PYVENV)/bin/maturin || (python3 -m venv $(PYVENV) && $(PYVENV)/bin/pip install -q maturin pytest)
 	$(PYVENV)/bin/python -c 'import numpy' 2>/dev/null || $(PYVENV)/bin/pip install -q numpy
 	cd client/python && VIRTUAL_ENV=$(abspath $(PYVENV)) $(abspath $(PYVENV))/bin/maturin develop --release \
