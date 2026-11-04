@@ -502,8 +502,9 @@ th.num {
     margin: 0 auto;
 }
 
+/* the car's box is square, so its width is also the banner's height: capped by the screen's height too */
 .car3d {
-    width: min(900px, 86%);
+    width: min(620px, 80%, 58vh);
     overflow: visible; /* the streaks run past the car's box */
 }
 
@@ -657,11 +658,37 @@ th.num {
     justify-content: center;
 }
 
-/* on wide screens the text sits at the bottom left, over the banner, on a dark glass panel so it stays readable over
- * the car and the glow; narrower screens keep it under the car, centred */
-@media (min-width: 900px) {
+/* tablets: a smaller headline, so it and the buttons stay on the first screen of an iPad held either way */
+@media (min-width: 601px) and (max-width: 1199px) {
+    .hero h1 {
+        font-size: clamp(2.5rem, 1rem + 3.4vw, 3.7rem);
+        margin-bottom: 14px;
+    }
+
+    .hero .lead {
+        font-size: 1.06rem;
+    }
+}
+
+/* an iPad on its side is short: a smaller car leaves room for the buttons */
+@media (min-width: 601px) and (max-width: 1199px) and (orientation: landscape) {
+    .hero .car3d {
+        width: min(620px, 80%, 46vh);
+    }
+}
+
+/* three layouts: wide screens put the text at the bottom left, over the banner, on a dark glass panel so it stays
+ * readable over the car and the glow, with the car moved right; tablets (iPads either way up) and phones keep the
+ * text under the car, centred, the car sized to leave the headline on the first screen */
+@media (min-width: 1200px) {
     .hero {
         padding-bottom: clamp(24px, 3vw, 40px);
+        overflow: hidden; /* the car is shifted right and its streaks run past the edge */
+    }
+
+    .hero .car3d {
+        width: min(700px, 60%, 76vh);
+        transform: translateX(22%); /* clear of the text panel at the bottom left */
     }
 
     .hero-text {
@@ -1446,8 +1473,7 @@ dl.terms dd {
 
 @media (max-width: 600px) {
     .car3d {
-        width: 100%;
+        width: min(100%, 52vh);
         max-width: none;
-        margin-left: 0;
     }
 }
