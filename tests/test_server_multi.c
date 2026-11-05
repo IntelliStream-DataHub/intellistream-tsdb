@@ -62,6 +62,8 @@ static pid_t start_server(const char *dir, const char *const *extra)
     th_portfile(pf, sizeof pf, dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
     pid_t parent = getpid();
+    char follow[64];
+    th_follow_me(follow, sizeof follow);
     pid_t pid = fork();
     if (pid == 0) {
         /* A test that stops early (OK() exits) must not leave its server behind: an orphan keeps the descriptors
@@ -71,7 +73,7 @@ static pid_t start_server(const char *dir, const char *const *extra)
         const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-fsync",
                                 "--no-auth"};
         int n = 11;
-        argv[n++] = "--exit-with-parent"; /* as every harness; PDEATHSIG above is the second line */
+        argv[n++] = follow; /* as every harness; PDEATHSIG above is the second line */
         if (getenv("TSDBD_IO")) {
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");

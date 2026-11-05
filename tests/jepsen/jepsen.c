@@ -344,6 +344,8 @@ static void start_server(bool faulty)
     for (int attempt = 0;; attempt++) {
         unlink(markpath); /* an EIO while opening: the clean server of the second attempt has no fault */
         th_portfile(pf, sizeof pf, dir);
+        char follow[64];
+        th_follow_me(follow, sizeof follow);
         pid_t pid = fork();
         if (pid == 0) {
             if (faulty && crashfs && attempt == 0) {
@@ -380,7 +382,7 @@ static void start_server(bool faulty)
             const char *av[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
                                   "--wal-max-batch-rows", "500", "--partition-ms", pms};
             int ac = 13;
-            av[ac++] = "--exit-with-parent"; /* a killed run leaves no server behind */
+            av[ac++] = follow; /* a killed run leaves no server behind */
             if (!auth)
                 av[ac++] = "--no-auth";
             if (classes) {
@@ -472,6 +474,8 @@ static void start_follower(void)
 {
     char pf[PATH_MAX];
     th_portfile(pf, sizeof pf, dir);
+    char follow[64];
+    th_follow_me(follow, sizeof follow);
     pid_t pid = fork();
     if (pid == 0) { /* never under the shim: it plays a reader on another host */
         unsetenv("LD_PRELOAD");
@@ -480,7 +484,7 @@ static void start_follower(void)
             dup2(log, 2);
         const char *av[16] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--follow"};
         int ac = 10;
-        av[ac++] = "--exit-with-parent";
+        av[ac++] = follow;
         if (!auth)
             av[ac++] = "--no-auth";
         if (getenv("TSDBD_IO"))

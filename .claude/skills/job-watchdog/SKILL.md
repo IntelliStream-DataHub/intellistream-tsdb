@@ -44,7 +44,7 @@ A job that logs its progress outside its `out` file should get a `watch` file in
 | WAITING | holder is RUNNING | nothing |
 | STALLED or a lock holder with no job | no output, no CPU, no progress in its own logs for well past the step's expected time, and no container doing work | stop it (3) |
 | DIED | no rc file | find why (out, `journalctl --user`, dmesg for OOM), then rerun (4) if the work is still wanted |
-| `LOOK orphan tsdbd pid N (ppid 1, dir D, ...)` | its parent is gone; D under /var/tmp or /tmp | if D belongs to a finished job (rc written, no live job or agent names it), stop that one pid (3) and report which harness lacks `--exit-with-parent`; if a running job owns D, report only |
+| `LOOK orphan tsdbd pid N (ppid 1, dir D, ...)` | its parent is gone; started with `--port-file` (a harness's server: a user's own, as the README's quick start, has a fixed port and is never listed); D under /var/tmp or /tmp (`--dir=` and a relative `--dir` resolved) | if D belongs to a finished job (rc written, no live job or agent names it), stop that one pid (3) and report which harness lacks `--exit-with-parent=PID`; if a running job owns D, report only |
 
 When in doubt, do not stop anything: report the evidence and let the session decide. Never stop a job of another
 project (the PATTERN argument keeps them out of the report), a tsdbd you did not trace to a stalled job, or the user's

@@ -204,7 +204,8 @@ class EmbeddedMultiTest {
         Assumptions.assumeTrue(Files.isExecutable(bin), bin + " is missing: run make first");
         Path log = tmp.resolve("tsdbd.log"), portFile = tmp.resolve("tsdbd.port");
         Process server = new ProcessBuilder(bin.toString(), "--dir", dir.toString(), "--port", "0", "--port-file",
-                portFile.toString(), "--no-fsync", "--workers", "2", "--no-auth", "--exit-with-parent")
+                portFile.toString(), "--no-fsync", "--workers", "2", "--no-auth",
+                "--exit-with-parent=" + ProcessHandle.current().pid())
                 .redirectErrorStream(true)
                 .redirectOutput(log.toFile()).start();
         try {

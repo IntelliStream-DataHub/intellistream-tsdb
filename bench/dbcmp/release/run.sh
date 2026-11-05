@@ -350,14 +350,15 @@ runstats() { python3 -I "$TOOLS/runstats.py" "$1" >> "$OUT/driver.log" 2>&1; }
 # ------------------------------------------------------------------ processes and containers we own
 TPID=
 tsdbd_start() { # DIR [ARGS]: tsdbd on --port 0 --port-file; sets TPID and TSDB_PORT
-    local d=$1 p pid i na=()
+    local d=$1 p pid i na=() help me=$BASHPID # me: the shell that starts tsdbd below (memwrap and taskset exec)
     shift
     rm -f "$d.pf"
+    help=$("$T/tsdbd" --help 2>&1) || true # exits 2: no pipe, which pipefail would call failed
     # a tsdbd with login refuses to start without a superuser in USERS; the comparison measures it without login,
     # as the older trees it also runs (which have no --no-auth) are measured
-    "$T/tsdbd" --help 2>&1 | grep -q -- '--no-auth' && na=(--no-auth)
+    grep -q -- '--no-auth' <<<"$help" && na=(--no-auth)
     # and it stops by itself once this script is gone (killed by a timeout), where the tree has the flag
-    "$T/tsdbd" --help 2>&1 | grep -q -- '--exit-with-parent' && na+=(--exit-with-parent)
+    grep -qF -- '--exit-with-parent[=PID]' <<<"$help" && na+=(--exit-with-parent="$me")
     # shellcheck disable=SC2046
     $(tsdbd_memwrap) ${TSDBD_WRAP:-} "$T/tsdbd" --dir "$d" "${na[@]}" --listen 127.0.0.1 --port 0 --port-file "$d.pf" "$@" > "$d.log" 2>&1 9>&- &
     TPID=$!

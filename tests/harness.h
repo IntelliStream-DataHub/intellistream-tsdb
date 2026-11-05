@@ -1,4 +1,5 @@
 /* Shared by the C test harnesses that start tsdbd (test_server, test_stability, jepsen, test_ports).
+ * They pass th_follow_me()'s --exit-with-parent=PID as well: a test killed by a timeout leaves no server behind.
  *
  * A harness never computes a port. It starts tsdbd with `--port 0 --port-file FILE` and reads the port from that
  * file, which the server writes (as "PORT PID") once its listener is up. th_await() also makes sure the answer
@@ -18,6 +19,15 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* "--exit-with-parent=PID" for a tsdbd this process is about to fork, PID being this process: the server stops once
+ * the test is gone, and refuses to start when it is gone already. Call it before the fork: in the child, getppid()
+ * may already name a subreaper that adopted it. */
+static inline const char *th_follow_me(char *buf, size_t n)
+{
+    snprintf(buf, n, "--exit-with-parent=%d", (int)getpid());
+    return buf;
+}
 
 /* A fresh path for a port file: BASE.port.PID.N, with the file removed so that a stale one cannot be read. */
 static inline void th_portfile(char *buf, size_t n, const char *base)

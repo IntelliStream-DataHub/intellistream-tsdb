@@ -57,10 +57,12 @@ holds the port), and fail if the server exited or the file names someone else. A
 reconnect to the one in the new file. `th_owns_port` remembers the listener's socket inode, so a client that asks on every
 connect scans only the server's descriptors, not `/proc/net/tcp` (which grows with every reconnect). `tests/test_ports.c` is the test of this; C harnesses include `tests/harness.h`,
 `tests/integration/run.py` has `Server`, and the client test helpers under `client/*/tests` do the same in their language.
-Every harness also passes `--exit-with-parent` (the server stops cleanly once its parent is gone): a test killed by a
-timeout otherwise leaves its tsdbd running under init, holding an io_uring ring, until a later run cannot get one.
-Start tsdbd as a direct child of the test (not through a shell that exits), and keep the flag out of supervised servers.
-`tests/test_ports.c` (`orphan`) checks it.
+Every harness also passes `--exit-with-parent=PID`, PID being its own pid (the server stops cleanly once its parent is
+gone, and refuses to start under any other parent): a test killed by a timeout otherwise leaves its tsdbd running
+under init, holding an io_uring ring, until a later run cannot get one. C: `th_follow_me` before the fork; bash:
+`me=$BASHPID` in the shell that runs `tsdbd ... &` (`$BASHPID` written on that line expands in the child, and `$$`
+is wrong in a subshell). Start tsdbd as a direct child of the test (or through wrappers that exec), and keep the
+flag out of supervised servers. `tests/test_ports.c` (`orphan`, `launcher_race`) checks it.
 
 Login: tsdbd requires one by default and refuses to start while USERS has no superuser. A harness that tests something
 other than login starts it with `--no-auth` (every data op runs unchecked; the user admin ops are refused). A login

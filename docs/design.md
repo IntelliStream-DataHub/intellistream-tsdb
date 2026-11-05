@@ -1674,7 +1674,12 @@ server behind (six such servers once held their io_uring rings for 17 hours,
 until a later run could not create one). It is a parent check rather than
 `PR_SET_PDEATHSIG`, which fires when the spawning *thread* exits: the Rust,
 Java and Python tests start servers from threads that end while the test goes
-on. A server run by a supervisor does not pass it.
+on. A server run by a supervisor does not pass it. Harnesses pass
+`--exit-with-parent=PID` with their own pid, and tsdbd refuses to start
+(status 2) when its parent is not that process: a launcher that dies between
+fork and the option parse (a shell that exits, a test killed in that moment)
+would otherwise hand tsdbd to a subreaper such as `systemd --user`, which
+plain `--exit-with-parent` would then follow, and which never exits.
 
 **Login and access control** ([design-auth.md](design-auth.md) has the
 decisions). A client logs in right after HELLO with SCRAM-SHA-256 in

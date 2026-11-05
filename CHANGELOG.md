@@ -10,8 +10,10 @@ disk format and the wire protocol.
 
 ### Added
 - tsdbd `--exit-with-parent`: the server stops as on SIGTERM (clean close, memtable flushed, status 0) once the
-  process that started it is gone, checked once a second; it refuses to start if the parent is already init. Every
-  test harness, the client test helpers and the benchmark scripts pass it, so a test killed by a timeout no longer
+  process that started it is gone, checked once a second; it refuses to start if the parent is already init, and
+  with `--exit-with-parent=PID` if the parent is not PID (a launcher that died before tsdbd read its options, under
+  a subreaper such as `systemd --user`). Every test harness, the client test helpers and the benchmark scripts pass
+  it with their own pid, so a test killed by a timeout no longer
   leaves its server running (six did for 17 hours, holding io_uring rings until a later run could not create one).
 - Inserts and memtable flushes write their parts without zstd (`tsdb_options.insert_zstd_level`, default 0;
   tsdbd `--insert-zstd-level`): background merges re-encode every such part at `zstd_level` anyway, with others

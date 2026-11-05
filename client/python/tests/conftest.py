@@ -46,7 +46,7 @@ class Server:
         self.proc = subprocess.Popen(
             # --exit-with-parent: a test run killed by a timeout leaves no server behind
             [TSDBD, "--dir", str(self.dir), "--port", "0", "--port-file", str(pf), "--no-fsync", "--workers", "4",
-             "--exit-with-parent"]
+             "--exit-with-parent=%d" % os.getpid()]
             + ([] if root_password is not None else ["--no-auth"]),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
