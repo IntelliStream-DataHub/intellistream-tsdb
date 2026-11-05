@@ -2,7 +2,7 @@
  * The workloads of tools/auth-bench.sh that tsdbc-bench does not have: inserts of a chosen shape, logins per second,
  * and (with a login) grants in bulk.
  *
- *   auth-bench-client insert series|rows [--conns 1] [--seconds 3] [--rows 1000] [--pool 1000]
+ *   auth-bench-client insert series|rows [--conns 1] [--seconds 3] [--rows 1000] [--pool 1000] [--run 0]
  *   auth-bench-client logins [--conns 1] [--seconds 3] [--cold]
  *   auth-bench-client grant --grantee U --kind prefix|name|glob --rights N FILE      (needs -DAB_ADMIN)
  *   [--host H] [--port P] [--user U --password-file F]                               (the login, needs -DAB_LOGIN)
@@ -16,7 +16,10 @@
  * all rows of a request belong to one series, picked round robin from the pool of --pool series "ins.N" (created
  * first, outside the timing); "rows": row j of a request belongs to series j of the pool (so --rows is at most
  * --pool), the shape of collectors that send one reading from each of many sensors. Timestamps never repeat in a
- * series, so no write replaces another. The pool is not a series any query benchmark reads.
+ * series, so no write replaces another, and run number --run starts them 2^37 ms (4.4 years) after run number
+ * --run - 1, so that runs against one database (when the script does not use a fresh copy for each) never write
+ * the keys of another; a run that would outgrow its slice stops with an error. The result line carries rows_per_s.
+ * The pool is not a series any query benchmark reads.
  *
  * logins: connect, one small request (a series lookup), close, in a loop on --conns threads. A login's PBKDF2 runs
  * once per process (the client caches the keys), so "cached" is the steady state of a long-lived client and --cold
@@ -37,6 +40,8 @@ static const char *host = "127.0.0.1";
 static int port = 7070, conns = 1, cold;
 static double seconds = CB_DEFAULT_SECONDS;
 static size_t rows_per_req = 1000, pool = 1000;
+static uint64_t run_no;
+#define RUN_SPAN (UINT64_C(1) << 37) /* milliseconds of timestamps one run may use */
 static struct {
     const char *user, *password_file; /* user NULL: no login */
 } login;
@@ -85,10 +90,14 @@ static void *inserter(void *arg)
         for (int rep = 0; rep < 8; rep++, k++) {
             /* the stamp is unique per (series, connection): 256 connections at most, so idx is the low digit */
             for (size_t r = 0; r < rows_per_req; r++) {
-                t[r] = CB_T0 + (int64_t)((k * rows_per_req + r) * 256 + (uint64_t)j->idx);
+                t[r] = CB_T0 + (int64_t)(run_no * RUN_SPAN + (k * rows_per_req + r) * 256 + (uint64_t)j->idx);
                 v[r] = (float)((k + r) % 1000) * 0.1f;
                 if (!by_series)
                     s[r] = pool_ids[r % pool];
+            }
+            if ((k * rows_per_req + rows_per_req) * 256 + 256 > RUN_SPAN) {
+                fprintf(stderr, "auth-bench-client: the run outgrew its %" PRIu64 " ms of timestamps\n", (uint64_t)RUN_SPAN);
+                exit(1);
             }
             if (by_series)
                 rc = tsdbc_insert_series(c, pool_ids[(k * 31 + (uint64_t)j->idx) % pool], t, v, rows_per_req);
@@ -143,8 +152,8 @@ static int insert_main(void)
     printf("insert %s, %d connection(s), %zu rows a request: %.0f requests/s = %.3f M rows/s\n",
            by_series ? "one series per request" : "a series per row", conns, rows_per_req, (double)req / secs,
            (double)rows / secs / 1e6);
-    printf("RESULT kind=insert mode=%s conns=%d requests=%" PRIu64 " rows=%" PRIu64 " secs=%.4f\n",
-           by_series ? "series" : "rows", conns, req, rows, secs);
+    printf("RESULT kind=insert mode=%s conns=%d run=%" PRIu64 " requests=%" PRIu64 " rows=%" PRIu64 " secs=%.4f rows_per_s=%.0f\n",
+           by_series ? "series" : "rows", conns, run_no, req, rows, secs, (double)rows / secs);
     return 0;
 }
 
@@ -257,7 +266,8 @@ int main(int argc, char **argv)
     static struct option opts[] = {{"host", required_argument, 0, 'h'},    {"port", required_argument, 0, 'p'},
                                    {"conns", required_argument, 0, 'c'},   {"seconds", required_argument, 0, 't'},
                                    {"rows", required_argument, 0, 'r'},    {"pool", required_argument, 0, 'P'},
-                                   {"cold", no_argument, 0, 'C'},          {"user", required_argument, 0, 'u'},
+                                   {"cold", no_argument, 0, 'C'},          {"run", required_argument, 0, 'n'},
+                                   {"user", required_argument, 0, 'u'},
                                    {"password-file", required_argument, 0, 'w'},
                                    {"grantee", required_argument, 0, 'g'}, {"kind", required_argument, 0, 'k'},
                                    {"rights", required_argument, 0, 'R'},  {0, 0, 0, 0}};
@@ -272,6 +282,7 @@ int main(int argc, char **argv)
         case 'r': rows_per_req = strtoull(optarg, NULL, 10); break;
         case 'P': pool = strtoull(optarg, NULL, 10); break;
         case 'C': cold = 1; break;
+        case 'n': run_no = strtoull(optarg, NULL, 10); break;
         case 'u': login.user = optarg; break;
         case 'w': login.password_file = optarg; break;
         case 'g': grantee = optarg; break;
@@ -288,7 +299,7 @@ int main(int argc, char **argv)
 #endif
     if (conns < 1 || conns > 256 || optind >= argc) {
         fprintf(stderr, "usage: auth-bench-client insert series|rows | logins [--cold] | grant ... FILE\n"
-                        "       [--conns N] [--seconds S] [--rows R] [--pool P] [--host H] [--port P]\n"
+                        "       [--conns N] [--seconds S] [--rows R] [--pool P] [--run N] [--host H] [--port P]\n"
                         "       [--user U --password-file F]\n");
         return 2;
     }

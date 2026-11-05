@@ -7,7 +7,9 @@ RESULTS_DIR holds meta.kv (the machine and the run), commands.txt, status.txt ("
 quiet.txt (runs that started on a busy machine) and raw/CONFIG.WORKLOAD.REP.txt (the output of every run). A number is
 parsed from the RESULT lines of those files: a mean over the repetitions with the sample standard deviation and the
 lowest and highest run (statistics and number format of tools/bench-summary.py), and next to each table the same
-means as a change against ffa4942 (main without auth), which is what the login and the grants cost. Standard library only.
+means as a change against main1 (main without auth, the commit meta.kv names), which is what the login and the grants
+cost. Groups the run did not measure (tools/auth-bench.sh --only) are left out, and so is main0 unless it was run.
+Inserts are measured without fsync on a fresh database for each run; the summary says so. Standard library only.
 """
 import importlib.util
 import json
@@ -22,8 +24,8 @@ spec.loader.exec_module(bs)
 stats, fmt = bs.stats, bs.fmt
 
 CONFIGS = [
-    ("main0", "main before (3bd4e96)"),
-    ("main1", "main without auth (ffa4942), the baseline"),
+    ("main0", "main before the work of 2026-11-05"),
+    ("main1", "main without auth, the baseline"),
     ("noauth", "auth build, --no-auth"),
     ("super", "auth build, logged in as a superuser"),
     ("prefix", "auth build, a user with 8 prefix: grants"),
@@ -86,7 +88,7 @@ def groups(multi):
     for c in (1, 32):
         g.append(("QUERY_MULTI of %d series per request, %d connection%s (windows/s)" % (multi, c, "" if c == 1 else "s"),
                   "windows/s", [("multi-c%d" % c, CLASS_LABEL[k], pick_class(k, ".m%d" % multi)) for k in CLASSES]))
-    g.append(("Inserts, 1,000 rows a request", "rows/s",
+    g.append(("Inserts, 1,000 rows a request, without fsync, on a fresh database for every run", "rows/s",
               [("insert-series-c1", "one series per request, 1 connection", pick_first("insert", "rows")),
                ("insert-series-c32", "one series per request, 32 connections", pick_first("insert", "rows")),
                ("insert-rows-c1", "a series per row, 1 connection", pick_first("insert", "rows")),
@@ -140,9 +142,13 @@ def main():
     lines.append("Mean of the runs, then (standard deviation in percent of the mean; lowest to highest run). "
                  "Written by tools/auth-bench-summary.py from raw/; every number can be found there.")
     lines.append("")
+    if "inserts" in meta:
+        lines.append("**Inserts measured without fsync, so they compare the server's code, not the disk** (%s)." %
+                     meta["inserts"].split("; inserts measured")[0])
+        lines.append("")
     lines.append("## The run")
     lines.append("")
-    for k in ["date", "mode", "reps", "seconds_per_workload", "host", "cpu", "cpu_topology", "memory", "kernel", "os",
+    for k in ["date", "mode", "reps", "groups", "seconds_per_workload", "inserts", "host", "cpu", "cpu_topology", "memory", "kernel", "os",
               "governor", "compiler", "scratch", "lock", "busy_at_start", "git_clone", "tree_before", "tree_main",
               "tree_auth", "tsdbd_flags", "workload_sizes"]:
         if k in meta:
@@ -162,9 +168,16 @@ def main():
         lines.append("**Failed runs** (status.txt): " + ", ".join(failed))
         lines.append("")
     all_reps = sorted({r for (_, _, r) in files})
+    base_ref = (meta.get("tree_main", "").split(" ")[0]) or "main1"
+    cfg_list = [(c, d) for c, d in CONFIGS if c != "main0" or any(k[0] == "main0" for k in files)]
+    cfg_list = [(c, d.replace("main without auth", "main %s without auth" % base_ref) if c == "main1" else d)
+                for c, d in cfg_list]
+    if "main0" in [c for c, _ in cfg_list]:
+        cfg_list = [(c, d.replace("main before", "main %s, before" % meta.get("tree_before", "").split(" ")[0]))
+                    if c == "main0" else (c, d) for c, d in cfg_list]
     for title, unit, cols in groups(multi):
         table = {}
-        for cfg, _ in CONFIGS:
+        for cfg, _ in cfg_list:
             for wl, label, pick in cols:
                 vals = []
                 for rep in all_reps:
@@ -180,15 +193,17 @@ def main():
         for _, label, _ in cols:
             if label not in labels:
                 labels.append(label)
+        if not table:
+            continue
         out["groups"][title] = {cfg: {label: table[(cfg, label)] for label in labels if (cfg, label) in table}
-                                for cfg, _ in CONFIGS}
+                                for cfg, _ in cfg_list}
         lines.append("## %s" % title)
         lines.append("")
         lines.append("Unit: %s." % unit)
         lines.append("")
         lines.append("| configuration | " + " | ".join(labels) + " |")
         lines.append("|---|" + "---:|" * len(labels))
-        for cfg, desc in CONFIGS:
+        for cfg, desc in cfg_list:
             cells = []
             for label in labels:
                 st = table.get((cfg, label))
@@ -196,11 +211,11 @@ def main():
                              if st else "-")
             lines.append("| %s | %s |" % (desc, " | ".join(cells)))
         lines.append("")
-        lines.append("Change against ffa4942 (the same code without auth), in percent of its mean:")
+        lines.append("Change against %s (the same code without auth), in percent of its mean:" % base_ref)
         lines.append("")
         lines.append("| configuration | " + " | ".join(labels) + " |")
         lines.append("|---|" + "---:|" * len(labels))
-        for cfg, desc in CONFIGS:
+        for cfg, desc in cfg_list:
             if cfg == BASE:
                 continue
             cells = []

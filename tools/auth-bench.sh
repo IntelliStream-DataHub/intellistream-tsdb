@@ -2,14 +2,17 @@
 # The before-and-after benchmark of login and per-series grants (docs/design-auth.md, A27): what does access control
 # cost in tsdbd?
 #
-#   tools/auth-bench.sh [--quick] [--reps N] [--seconds S] [--dir SCRATCH] [--out RESULTS_DIR] [--lock FILE] [--keep]
+#   tools/auth-bench.sh [--quick] [--reps N] [--seconds S] [--insert-seconds S] [--only GROUP[,GROUP]]
+#                       [--ref-main REF] [--ref-auth REF] [--with-main0 [--ref-before REF]]
+#                       [--dir SCRATCH] [--out RESULTS_DIR] [--lock FILE] [--keep]
 #
-# It builds three trees from `git archive`, each from scratch with the Makefile's optimized flags into a directory of
-# its own, as tools/bench-tsdb.sh does: main before the work of 2026-11-05 (3bd4e96), main without auth (ffa4942, the
-# baseline that isolates the login) and the auth build (HEAD of this clone). Seven configurations are measured:
+# It builds two trees from `git archive`, each from scratch with the Makefile's optimized flags into a directory of
+# its own, as tools/bench-tsdb.sh does: main without auth (--ref-main, default ba4f6c2, the baseline that isolates
+# the login) and the auth build (--ref-auth, default HEAD of this clone); with --with-main0 also main from before
+# the work of 2026-11-05 (--ref-before, default 3bd4e96). Six configurations are measured, seven with --with-main0:
 #
-#   main0      3bd4e96
-#   main1      ffa4942
+#   main0      3bd4e96 (only with --with-main0)
+#   main1      ba4f6c2
 #   noauth     auth build, tsdbd --no-auth
 #   super      auth build, logged in as a superuser
 #   prefix     auth build, a user with read+insert on 8 prefix: grants
@@ -25,10 +28,15 @@
 #   logins      auth-bench-client logins: connect + one small request + close per iteration, on 1 and 32 threads;
 #               with the client's key cache warm, and --cold (a new process for every login: PBKDF2 each time)
 #   inserts     auth-bench-client insert: 1,000 rows a request, all in one series, or one row from each of 1,000
-#               series, on 1 and 32 connections (last in a run: it grows the database)
+#               series, on 1 and 32 connections, --insert-seconds each (default 10). Every insert workload and
+#               repetition runs on a FRESH copy of the configuration's database, in a tsdbd of its own started with
+#               --no-fsync, and with timestamps unique to the run: inserts measured without fsync compare the
+#               server's code, not the disk (on a disk that is nearly full the fsync and writeback latency moved
+#               32-connection runs by 30 to 60%, whatever the code did)
 #
-# Every tsdbd runs with --wal-sync-ms 10, so inserts wait for no fsync and show the server's CPU work; with the
-# default (an fsync per request) the per-request cost of a login check is lost in the disk's 0.7 ms.
+# --only picks groups (queries, multi, inserts, logins; default all). Every tsdbd runs with --wal-sync-ms 10, so
+# requests wait for no fsync and show the server's CPU work; with the default (an fsync per request) the per-request
+# cost of a login check is lost in the disk's 0.7 ms.
 # The raw output of every run goes to RESULTS_DIR/raw, the tables (mean, standard deviation, lowest and highest run) to
 # summary.md and summary.json (tools/auth-bench-summary.py). Besides the build directories under SCRATCH it writes
 # only to SCRATCH and RESULTS_DIR, and stops only the tsdbd it started, by pid.
@@ -47,8 +55,11 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 2
 
 REF_BEFORE=${AB_REF_BEFORE:-3bd4e96}
-REF_MAIN=${AB_REF_MAIN:-ffa4942}
+REF_MAIN=${AB_REF_MAIN:-ba4f6c2}
 REF_AUTH=${AB_REF_AUTH:-HEAD}
+WITH_MAIN0=0
+ONLY=
+INS_SECS=
 
 MODE=standard
 REPS=
@@ -68,6 +79,12 @@ while [ $# -gt 0 ]; do
     --quick) MODE=quick ;;
     --reps) REPS=${2:-}; shift ;;
     --seconds) SECS=${2:-}; shift ;;
+    --insert-seconds) INS_SECS=${2:-}; shift ;;
+    --only) ONLY=${2:-}; shift ;;
+    --ref-main) REF_MAIN=${2:-}; shift ;;
+    --ref-auth) REF_AUTH=${2:-}; shift ;;
+    --ref-before) REF_BEFORE=${2:-}; shift ;;
+    --with-main0) WITH_MAIN0=1 ;;
     --dir) SCRATCH=${2:-}; shift ;;
     --out) OUT=${2:-}; shift ;;
     --lock) LOCK=${2:-}; shift ;;
@@ -81,10 +98,18 @@ done
 case ${REPS:-1} in *[!0-9]* | 0) echo "auth-bench.sh: --reps wants a positive number" >&2; exit 2 ;; esac
 [ -n "$SCRATCH" ] || { echo "auth-bench.sh: --dir wants a path" >&2; exit 2; }
 if [ "$MODE" = quick ]; then
-    SERIES=10; POINTS=20000; : "${SECS:=0.3}"; : "${REPS:=1}"; NEED_GB=1
+    SERIES=10; POINTS=20000; : "${SECS:=0.3}"; : "${INS_SECS:=0.3}"; : "${REPS:=1}"; NEED_GB=1
 else
-    SERIES=100; POINTS=1000000; : "${SECS:=3}"; : "${REPS:=5}"; NEED_GB=4
+    SERIES=100; POINTS=1000000; : "${SECS:=3}"; : "${INS_SECS:=10}"; : "${REPS:=5}"; NEED_GB=8
 fi
+GROUPS_ALL="queries multi inserts logins"
+if [ -z "$ONLY" ]; then
+    ONLY=${GROUPS_ALL// /,}
+fi
+for g in ${ONLY//,/ }; do
+    case " $GROUPS_ALL " in *" $g "*) ;; *) echo "auth-bench.sh: --only wants queries, multi, inserts or logins, not \"$g\"" >&2; exit 2 ;; esac
+done
+want() { case ",$ONLY," in *",$1,"*) return 0 ;; esac; return 1; }
 POOL=1000       # series of the insert benchmark ("ins.N")
 ROWS=1000       # rows an insert request carries
 NAMES=5000      # name: grants of the name5000 user
@@ -187,7 +212,7 @@ if [ $URING = 0 ]; then
     NOURING_MAKE=(NO_URING=1)
 fi
 git rev-parse --git-dir >/dev/null 2>&1 || die "run it from a git clone: the trees are made with git archive"
-for r in "$REF_BEFORE" "$REF_MAIN" "$REF_AUTH"; do
+for r in "$REF_MAIN" "$REF_AUTH" $([ "$WITH_MAIN0" = 1 ] && echo "$REF_BEFORE"); do
     git rev-parse --verify --quiet "$r^{commit}" >/dev/null || die "the commit $r is not in this clone"
 done
 [ -z "$LOCK" ] || [ -e "$LOCK" ] || die "the lock file $LOCK does not exist"
@@ -253,6 +278,8 @@ machine_info() {
     meta mode "$MODE"
     meta reps "$REPS"
     meta seconds_per_workload "$SECS"
+    meta groups "${ONLY//,/ }"
+    want inserts && meta inserts "tsdbd --no-fsync, each workload and repetition on a fresh copy of the database, $INS_SECS s each; inserts measured without fsync, so they compare the server's code, not the disk"
     meta host "$(hostname 2>/dev/null)"
     model=$(awk -F: '/^model name/ { sub(/^ +/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null)
     meta cpu "${model:-unknown}"
@@ -279,7 +306,7 @@ machine_info() {
     meta scratch "$SCRATCH ($(df -PT "$WORK" 2>/dev/null | awk 'NR == 2 { print $2 }'), $(df -Ph "$WORK" | awk 'NR == 2 { print $4 }') free)"
     meta compiler "$CCV"
     meta lock "${LOCK:-none: other jobs are not kept out of the timings}"
-    meta tsdbd_flags "--wal-sync-ms 10 --port 0 --port-file (and --no-auth for noauth)"
+    meta tsdbd_flags "--wal-sync-ms 10 --port 0 --port-file (and --no-auth for noauth; --no-fsync for the insert workloads)"
     meta workload_sizes "$SERIES series x $POINTS points; $SECS s per workload; inserts: $ROWS rows a request over a pool of $POOL series; QUERY_MULTI: $MULTI series a request"
     local dirty
     dirty=$(git -C "$ROOT" status --porcelain tools docs server client include 2>/dev/null | wc -l)
@@ -297,7 +324,8 @@ machine_info() {
 # ------------------------------------------------------------------ trees and builds
 
 # tree NAME REF: git archive REF into $WORK/tree-NAME and build what is measured, from scratch.
-TREES=(before main auth)
+TREES=(main auth)
+[ "$WITH_MAIN0" = 1 ] && TREES=(before main auth)
 tree_ref() { case $1 in before) echo "$REF_BEFORE" ;; main) echo "$REF_MAIN" ;; auth) echo "$REF_AUTH" ;; esac; }
 tree_b() { echo "$WORK/tree-$1/build-bench"; }
 
@@ -334,15 +362,17 @@ build_tree() {
 
 # ------------------------------------------------------------------ configurations
 
-CFGS=(main0 main1 noauth super prefix name5000 glob64)
+CFGS=(main1 noauth super prefix name5000 glob64)
+[ "$WITH_MAIN0" = 1 ] && CFGS=(main0 "${CFGS[@]}")
 cfg_tree() { case $1 in main0) echo before ;; main1) echo main ;; *) echo auth ;; esac; }
 cfg_user() { case $1 in super) echo u-super ;; prefix) echo u-prefix ;; name5000) echo u-name ;; glob64) echo u-glob ;; esac; }
 cfg_login() { [ -n "$(cfg_user "$1")" ]; }
 
-# start_server CFG DIR: tsdbd for CFG on DIR/db, port from its port file, never a port computed here.
+# start_server CFG DIR [FLAG...]: tsdbd for CFG on DIR/db, port from its port file, never a port computed here.
 start_server() {
     local cfg=$1 d=$2 b port="" spid="" i
-    local flags=(--wal-sync-ms 10)
+    shift 2
+    local flags=(--wal-sync-ms 10 "$@")
     b=$(tree_b "$(cfg_tree "$cfg")")
     [ "$cfg" = noauth ] && flags+=(--no-auth)
     rm -f "$d/port"
@@ -439,7 +469,7 @@ check_user() {
     cp -a "$WORK/db.$cfg/db" "$d/db"
     start_server "$cfg" "$d" || die "tsdbd for $cfg did not start (log: $d/log)"
     lg=(--user "$user" --password-file "$PW")
-    "$b/auth-bench-client" --port "$SRV_PORT" "${lg[@]}" --seconds 0.1 insert series >>"$RAW/setup.$cfg.txt" 2>&1 &&
+    "$b/auth-bench-client" --port "$SRV_PORT" "${lg[@]}" --seconds 0.1 --run 0 insert series >>"$RAW/setup.$cfg.txt" 2>&1 &&
         "$b/auth-bench-client" --port "$SRV_PORT" "${lg[@]}" --seconds 0.1 logins >>"$RAW/setup.$cfg.txt" 2>&1 &&
         "$b/tsdbc-bench" --port "$SRV_PORT" "${lg[@]}" --series "$SERIES" --points "$POINTS" --seconds 0.1 query >>"$RAW/setup.$cfg.txt" 2>&1 ||
         { stop_server; die "$user cannot do the workloads of $cfg (see $RAW/setup.$cfg.txt)"; }
@@ -469,6 +499,7 @@ measure_body() {
     "$@" >>"$f" 2>&1
 }
 
+CUR_DIR=
 measure() {
     local cfg=$1 name=$2 rep=$3 rc f
     shift 3
@@ -488,18 +519,20 @@ measure() {
     if [ -n "$SRV_PID" ] && ! kill -0 "$SRV_PID" 2>/dev/null; then
         FAILED=1
         log "  tsdbd ($cfg) died during $name (log: $RAW/tsdbd-died.$cfg.$rep.txt)"
-        cp "$WORK/run.$cfg/log" "$RAW/tsdbd-died.$cfg.$rep.txt" 2>/dev/null
+        cp "$CUR_DIR/log" "$RAW/tsdbd-died.$cfg.$rep.txt" 2>/dev/null
         SRV_PID=
         return 1
     fi
     return 0
 }
 
-run_cfg() {
+# run_cfg_reads REP CFG: queries, QUERY_MULTI and logins on one server over one copy of the database.
+run_cfg_reads() {
     local rep=$1 cfg=$2 t b d lg=() user port c
     t=$(cfg_tree "$cfg")
     b=$(tree_b "$t")
     d=$WORK/run.$cfg
+    CUR_DIR=$d
     rm -rf -- "$d"
     mkdir -p "$d"
     shared cp -a "$WORK/db.$cfg/db" "$d/db" || { FAILED=1; return; }
@@ -513,30 +546,75 @@ run_cfg() {
     [ -n "$user" ] && lg=(--user "$user" --password-file "$PW")
     local tb=("$b/tsdbc-bench" --port "$port" "${lg[@]+"${lg[@]}"}" --series "$SERIES" --points "$POINTS" --seconds "$SECS")
     local ab=("$b/auth-bench-client" --port "$port" "${lg[@]+"${lg[@]}"}" --seconds "$SECS")
-    for c in 1 $HI; do
-        measure "$cfg" "query-c$c" "$rep" "${tb[@]}" --conns "$c" query || break
-    done
-    for c in 1 $HI; do
-        measure "$cfg" "multi-c$c" "$rep" "${tb[@]}" --conns "$c" --multi "$MULTI" query || break
-    done
-    for c in 1 $HI; do
-        measure "$cfg" "login-c$c" "$rep" "${ab[@]}" --conns "$c" logins || break
-    done
-    for c in 1 $HI; do
-        measure "$cfg" "login-cold-c$c" "$rep" "${ab[@]}" --conns "$c" --cold logins || break
-    done
-    for c in 1 $HI; do
-        measure "$cfg" "insert-series-c$c" "$rep" "${ab[@]}" --conns "$c" --rows "$ROWS" --pool "$POOL" insert series || break
-    done
-    for c in 1 $HI; do
-        measure "$cfg" "insert-rows-c$c" "$rep" "${ab[@]}" --conns "$c" --rows "$ROWS" --pool "$POOL" insert rows || break
-    done
+    if want queries; then
+        for c in 1 $HI; do
+            measure "$cfg" "query-c$c" "$rep" "${tb[@]}" --conns "$c" query || break
+        done
+    fi
+    if want multi; then
+        for c in 1 $HI; do
+            measure "$cfg" "multi-c$c" "$rep" "${tb[@]}" --conns "$c" --multi "$MULTI" query || break
+        done
+    fi
+    if want logins; then
+        for c in 1 $HI; do
+            measure "$cfg" "login-c$c" "$rep" "${ab[@]}" --conns "$c" logins || break
+        done
+        for c in 1 $HI; do
+            measure "$cfg" "login-cold-c$c" "$rep" "${ab[@]}" --conns "$c" --cold logins || break
+        done
+    fi
     if [ -n "$SRV_PID" ]; then
         [ "$rep" = 1 ] && meta "server_$cfg" "$(grep -m1 -o 'simd [a-z0-9_]*.*io [a-z_]*' "$d/log")"
         stop_server
     fi
     [ "$rep" = 1 ] && cp "$d/log" "$RAW/tsdbd.$cfg.1.txt" 2>/dev/null
     rm -rf -- "$d"
+}
+
+# run_cfg_insert REP CFG NAME RUN MODE CONNS: one insert workload on a fresh copy of the database and a tsdbd of its own
+# with --no-fsync (the disk's latency is not what is measured). RUN numbers the run: its timestamps start at an
+# offset of their own, so no run writes the keys of another.
+run_cfg_insert() {
+    local rep=$1 cfg=$2 name=$3 run=$4 mode=$5 c=$6 t b d lg=() user
+    t=$(cfg_tree "$cfg")
+    b=$(tree_b "$t")
+    d=$WORK/run.$cfg.ins
+    CUR_DIR=$d
+    rm -rf -- "$d"
+    mkdir -p "$d"
+    shared cp -a "$WORK/db.$cfg/db" "$d/db" || { FAILED=1; return; }
+    sync -f "$d/db" 2>/dev/null || sync # the copy's writeback must not run into the timing
+    if ! start_server "$cfg" "$d" --no-fsync; then
+        FAILED=1
+        printf '%s server %s 1\n' "$cfg" "$rep" >>"$RES/status.txt"
+        return
+    fi
+    user=$(cfg_user "$cfg")
+    [ -n "$user" ] && lg=(--user "$user" --password-file "$PW")
+    measure "$cfg" "$name" "$rep" "$b/auth-bench-client" --port "$SRV_PORT" "${lg[@]+"${lg[@]}"}" --seconds "$INS_SECS" \
+        --conns "$c" --rows "$ROWS" --pool "$POOL" --run "$run" insert "$mode"
+    if [ -n "$SRV_PID" ]; then
+        [ "$rep" = 1 ] && [ "$name" = insert-series-c1 ] && cp "$d/log" "$RAW/tsdbd.$cfg.ins.1.txt" 2>/dev/null
+        if [ "$rep" = 1 ] && [ "$name" = insert-series-c1 ] && ! want queries && ! want multi && ! want logins; then
+            meta "server_$cfg" "$(grep -m1 -o 'simd [a-z0-9_]*.*io [a-z_]*' "$d/log")"
+        fi
+        stop_server
+    fi
+    rm -rf -- "$d"
+}
+
+run_cfg() {
+    local rep=$1 cfg=$2 w=0 mode c
+    if want queries || want multi || want logins; then run_cfg_reads "$rep" "$cfg"; fi
+    if want inserts; then
+        for mode in series rows; do
+            for c in 1 $HI; do
+                run_cfg_insert "$rep" "$cfg" "insert-$mode-c$c" $(((rep - 1) * 4 + w)) "$mode" "$c"
+                w=$((w + 1))
+            done
+        done
+    fi
 }
 
 # ------------------------------------------------------------------ main
@@ -553,12 +631,13 @@ selectors
 log "making the rows ($SERIES series x $POINTS points) ..."
 shared "$(tree_b auth)/tsdb-bench" --export "$WORK/data.bin" --series "$SERIES" --points "$POINTS" >"$RAW/export.txt" 2>&1 ||
     die "tsdb-bench --export failed (see $RAW/export.txt)"
-log "setting up the seven databases ..."
+log "setting up the ${#CFGS[@]} databases ..."
 for cfg in "${CFGS[@]}"; do setup_cfg "$cfg"; done
 rm -f -- "$WORK/data.bin"
 
-printf 'run\ttools/auth-bench.sh %s --reps %s --seconds %s (refs %s %s %s)\n' "$([ "$MODE" = quick ] && echo --quick)" "$REPS" "$SECS" \
-    "$REF_BEFORE" "$REF_MAIN" "$REF_AUTH" >>"$RES/commands.txt"
+printf 'run\ttools/auth-bench.sh %s --reps %s --seconds %s --insert-seconds %s --only %s (refs %s%s %s)\n' \
+    "$([ "$MODE" = quick ] && echo --quick)" "$REPS" "$SECS" "$INS_SECS" "$ONLY" "$([ "$WITH_MAIN0" = 1 ] && echo "$REF_BEFORE ")" \
+    "$REF_MAIN" "$REF_AUTH" >>"$RES/commands.txt"
 for ((rep = 1; rep <= REPS; rep++)); do
     order=("${CFGS[@]}")
     if [ $((rep % 2)) = 0 ]; then # every second repetition goes the other way round
