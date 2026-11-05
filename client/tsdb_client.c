@@ -775,7 +775,8 @@ static int group_req(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, cons
         return rc;
     int64_t *bounds;
     size_t n;
-    rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
+    rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi == INT64_MAX ? hi : hi + 1,
+                              &bounds, &n);
     /* more local periods than one request carries: the status of more than the calendar computes, in every client */
     if (rc == 0 && n > (TSDB_MAX_FRAME - 64) / 8)
         rc = TSDB_ERR_TOO_MANY_BUCKETS;
@@ -914,7 +915,8 @@ int tsdbc_query_twa_group(tsdbc *c, tsdb_sid series, int64_t start, int64_t end,
         return rc;
     int64_t *bounds;
     size_t n;
-    rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi + 1, &bounds, &n);
+    rc = tsdb_calendar_bounds(group->timezone, group->unit, group->count, lo, hi == INT64_MAX ? hi : hi + 1,
+                              &bounds, &n);
     if (rc == 0 && n > (TSDB_MAX_FRAME - 64 - TSDB_TWA_HEADER) / 8) /* as in group_req */
         rc = TSDB_ERR_TOO_MANY_BUCKETS;
     if (rc == 0)
@@ -1691,6 +1693,7 @@ static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
     uint8_t *v = NULL;
     size_t cap = 0;
     bool stopped = false;
+    int type = -1; /* of the first frame: the series has one, and a callback may size its buffer by it */
     for (;;) {
         int32_t st;
         const uint8_t *b;
@@ -1698,11 +1701,12 @@ static int read_values(tsdbc *c, tsdb_values_fn fn, void *ctx)
         if ((rc = read_reply(c, &st, &b, &len)) != 0)
             break;
         uint32_t n;
-        if (len < 8 || b[1] > TSDB_STATE || (memcpy(&n, b + 4, 4), false)) {
+        if (len < 8 || b[1] > TSDB_STATE || (type >= 0 && b[1] != type) || (memcpy(&n, b + 4, 4), false)) {
             rc = TSDB_ERR_CORRUPT;
             c->broken = true;
             break;
         }
+        type = b[1];
         unsigned aw = tsdb_wire_width(b[1]);
         size_t valid = (b[2] & TSDB_VALID) ? ((size_t)n + 7) / 8 : 0;
         if (len != 8 + (size_t)n * (8 + aw) + valid) {
@@ -1965,6 +1969,7 @@ static int multi_read(mrun *m, uint32_t id, uint8_t op, uint8_t fields, const ts
     size_t row = op == TSDB_OP_QUERY_TWA ? TSDB_TWA_ROW : fields & TSDB_SPREAD ? TSDB_SPREAD_ROW : TSDB_BUCKET_ROW;
     size_t next = 0;   /* the lowest index the next frame may have */
     bool open = false; /* series `next` has had frames, but not its last */
+    uint8_t open_type = 0; /* the value type of those frames: a series has one, and callers size buffers by it */
     bool cancel_sent = false;
     for (;;) {
         int32_t st;
@@ -1995,8 +2000,9 @@ static int multi_read(mrun *m, uint32_t id, uint8_t op, uint8_t fields, const ts
             memcpy(&k, b + 4, 4);
             unsigned aw = tsdb_wire_width(b[1]);
             size_t valid = (b[2] & TSDB_VALID) ? ((size_t)k + 7) / 8 : 0;
-            if (len != 8 + (size_t)k * (8 + aw) + valid || (st && !b[0]))
+            if (len != 8 + (size_t)k * (8 + aw) + valid || (st && !b[0]) || (open && b[1] != open_type))
                 goto corrupt;
+            open_type = b[1];
             r.values.type = (tsdb_type)b[1];
             r.last = b[0];
             if (k && !m->stopped) {
@@ -2310,7 +2316,8 @@ static int multi_local(mrun *m, const tsdb_multi_query *q, const tsdb_sid *serie
     }
     int64_t *bounds;
     size_t nb;
-    rc = tsdb_calendar_bounds(q->group->timezone, q->group->unit, q->group->count, L, H + 1, &bounds, &nb);
+    rc = tsdb_calendar_bounds(q->group->timezone, q->group->unit, q->group->count, L, H == INT64_MAX ? H : H + 1,
+                              &bounds, &nb);
     if (rc)
         return rc;
     if (nb > (TSDB_MAX_FRAME - ((size_t)8 << 20)) / 8) /* the union is too long for one frame: one by one */
@@ -2372,6 +2379,10 @@ static int collect_fn(void *ctx, const tsdb_series_result *in)
         o->n = in->n;
         return 0;
     }
+    /* The buffer is sized by the type of the series' first rows: rows of another (wider) type would not fit.
+     * multi_read refuses such a reply already; this keeps the buffer safe whatever reaches it. */
+    if (o->n && in->values.type != o->values.type)
+        return k->err = TSDB_ERR_CORRUPT;
     unsigned aw = tsdb_wire_width(in->values.type);
     size_t need = o->n + in->n, *cap = &k->cap[in->index];
     if (need > *cap) {
