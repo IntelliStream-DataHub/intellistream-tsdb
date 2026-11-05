@@ -104,6 +104,47 @@ int main(void)
     CHECK(all == BIG + MORE + SMALL);
     CHECK(memcmp(got, data, all) == 0);
 
+    /* The only QUERY_MULTI streaming hands a full batch to the loop, which sends it while the worker computes the
+     * next series (one connection lost 28% of its windows/s when the worker sent each batch itself): nothing leaves
+     * from the worker's thread, though the socket has room. A smaller batch costs less to send than a wakeup of the
+     * loop: the worker sends that. */
+    atomic_store(&note_top, NULL);
+    atomic_store(&c->out_queued, false);
+    c->streaming = true;
+    atomic_store(&streaming_conns, 1);
+    v = (struct iovec){data, SMALL};
+    CHECK(out_put(c, &v, 1));
+    CHECK(c->out.len == 0 && !c->tx_loop && !c->tx_worker && !c->notified);
+    CHECK(drain(sv[1], got, BIG + MORE + SMALL) == SMALL && memcmp(got, data, SMALL) == 0);
+    v = (struct iovec){data, HANDOFF_MIN};
+    CHECK(out_put(c, &v, 1));
+    CHECK(drain(sv[1], got, BIG + MORE + SMALL) == 0);
+    CHECK(c->out.len == HANDOFF_MIN && memcmp(c->out.p, data, HANDOFF_MIN) == 0);
+    CHECK(c->tx_loop && !c->tx_worker && c->notified);
+    CHECK(atomic_load(&note_top) == &c->n_out && atomic_load(&c->out_queued));
+    /* the loop sent it (here: dropped) and drained the output */
+    pthread_mutex_lock(&c->lock);
+    c->out.len = 0;
+    c->tx_loop = c->notified = false;
+    pthread_mutex_unlock(&c->lock);
+    atomic_store(&note_top, NULL);
+    atomic_store(&c->out_queued, false);
+    /* With a second connection streaming, one loop thread would send for all of them: the worker sends again. */
+    atomic_store(&streaming_conns, 2);
+    v = (struct iovec){data + SMALL, SMALL};
+    CHECK(out_put(c, &v, 1));
+    CHECK(c->out.len == 0 && !c->tx_loop && !c->tx_worker && !c->notified);
+    CHECK(drain(sv[1], got, BIG + MORE + SMALL) == SMALL && memcmp(got, data + SMALL, SMALL) == 0);
+    /* and so does a connection that is not the one streaming (a single reply, or the end of a QUERY_MULTI) */
+    c->streaming = false;
+    atomic_store(&streaming_conns, 1);
+    v = (struct iovec){data + 2 * SMALL, SMALL};
+    CHECK(out_put(c, &v, 1));
+    CHECK(c->out.len == 0 && !c->tx_loop && !c->tx_worker && !c->notified);
+    CHECK(drain(sv[1], got, BIG + MORE + SMALL) == SMALL && memcmp(got, data + 2 * SMALL, SMALL) == 0);
+    CHECK(atomic_load(&note_top) == NULL);
+    atomic_store(&streaming_conns, 0);
+
     atomic_store(&note_top, NULL);
     free(c->out.p);
     pthread_mutex_destroy(&c->lock);

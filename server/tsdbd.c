@@ -24,7 +24,8 @@
  * kernel's TCP transmit of every small reply); what such a send leaves, on a
  * full socket buffer or an error, goes to the event loop, which then sends
  * everything until it has drained the output (tx_loop), the worker meanwhile
- * only appending.
+ * only appending. The one QUERY_MULTI streaming at a time hands its batches to
+ * the event loop, which sends them while the worker computes (streaming_conns).
  *
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--port-file FILE] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
@@ -235,8 +236,10 @@ typedef struct conn {
     atomic_bool closing;
     bool notified;      /* `out` has bytes the main thread was told of (n_out pushed): it sends them */
     bool tx_loop;       /* the main thread sends: a send in flight, bytes left in `sending`, or bytes a worker's
-                           send left in `out`; the worker only appends until the main thread drained it all */
+                           send left in `out` or handed it (out_put); the worker only appends until the main thread
+                           drained it all */
     bool tx_worker;     /* the worker sends from the front of `out` itself (out_send): nobody else touches `out` */
+    bool streaming;     /* the worker runs a QUERY_MULTI, whose batches go out while it computes (worker only) */
     note n_out, n_done; /* in note_top while queued for the main thread */
     atomic_bool out_queued; /* n_out is in note_top or not yet handled */
     tsdb_query_stats last_stats; /* of the previous query (LAST_STATS) */
@@ -459,6 +462,18 @@ static bool out_send(conn *c)
  * appends to its output (a QUERY_MULTI's callbacks all run on it), so the pieces of a frame follow each other.
  * Returns false when the connection is going away. */
 #define OUT_PIECE (1u << 20)
+
+/* Connections whose worker runs a QUERY_MULTI (conn.streaming). Its results stream out in batches (ob_flush) while
+ * it computes the next series; a batch the worker sends itself puts the send (on loopback the receiver's side of
+ * TCP too) on that query's serial path, and one connection lost 28% of its windows/s that way (52b710e). So the
+ * batches of the only streaming connection go to the event loop, which sends them meanwhile, as before 52b710e.
+ * With two or more the workers send their own again: one loop thread sending for many streaming connections is
+ * what capped the server (handing a batch over whenever the loop owned nobody's output, 32 connections lost 4%).
+ * Only full batches go over (HANDOFF_MIN, OB_FLUSH): a smaller one (what is ready while the head is computed) costs
+ * less to send than a wakeup of the loop. */
+static atomic_int streaming_conns;
+#define HANDOFF_MIN (64u << 10)
+
 static bool out_put(conn *c, const struct iovec *iov, int n)
 {
     int i = 0;
@@ -499,6 +514,11 @@ static bool out_put(conn *c, const struct iovec *iov, int n)
                 }
             }
             direct = !c->tx_loop && !c->tx_worker && c->fd >= 0;
+            if (direct && c->streaming && c->out.len >= HANDOFF_MIN &&
+                atomic_load_explicit(&streaming_conns, memory_order_relaxed) == 1) {
+                c->tx_loop = true; /* the loop owns `out` now, as after a send that left bytes in it */
+                direct = false;
+            }
             if (direct) {
                 c->tx_worker = true;
             } else {
@@ -1160,7 +1180,12 @@ static void handle_multi(conn *c, req *r)
                               .budget_give = multi_budget_give,
                               .on_deferred = multi_on_deferred,
                               .hook_ctx = &m};
+        /* the end frame and the last batch go out after it, by whoever owns the output then (out_put) */
+        c->streaming = true;
+        atomic_fetch_add(&streaming_conns, 1);
         rc = tsdb_query_multi(db, &q, series, n, &mo, multi_fn, &m);
+        atomic_fetch_sub(&streaming_conns, 1);
+        c->streaming = false;
     }
     qreq_free(&qr);
     free(m.vo.ts);
