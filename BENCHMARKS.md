@@ -607,6 +607,131 @@ clients, the chart tags the bar.
 (\*) Four of its five runs, from their memory files (p2/ts/p6/ts.agg7d.b100.c16.2-5.mem: at most 43.7 GB). The
 fifth reached the 48 GB limit, was killed and run again; the class's row in the tables shows 48.00 GB for it.
 
+## Login and access control
+
+What does it cost to log in to tsdbd, and to have every request checked against a user's grants? The answer comes from
+comparing the build with access control against the same code without it (commit ffa4942), so a difference can only
+come from the login and the checks.
+
+**In short:** logging in costs nothing we can measure on queries and inserts: every change is inside the run-to-run
+noise, with 1 or 32 connections. A login costs one round trip more and, once per process, about 1.6 ms of key
+derivation (PBKDF2); a login in a fresh process takes 1.9 ms in all.
+
+**How it was measured**
+
+- **Command:** `tools/auth-bench.sh --reps 5 --seconds 3`. It builds three trees from `git archive` with the
+  Makefile's optimized flags: 3bd4e96 (the earlier main), ffa4942 (main without access control) and the auth branch
+  at f5eddd2. Only ffa4942 and the auth build appear below: the comparison with the earlier main is left for a
+  separate investigation.
+- **Seven configurations**, each with its own tsdbd and its own copy of the same database (100 series x 1 million
+  rows): 3bd4e96; ffa4942; the auth build started with `--no-auth`; and the auth build with a logged-in user who
+  is a superuser, or who holds 8 `prefix:` grants, 5,000 `name:` grants, or 64 `glob:` grants (the most one user may
+  hold). The grants cover the series the benchmark uses.
+- **5 runs of 3 seconds** for every workload and configuration, interleaved across the configurations (the order
+  reversed every second run), each under an exclusive lock, started only on a quiet machine (0.04 of 32 CPUs busy at
+  the start). All 420 measurements finished without error.
+- **Every tsdbd ran with `--wal-sync-ms 10`**, so an insert waits for no fsync and the numbers show the server's CPU
+  work. The default (an fsync for every request) was not measured: there the check, a few microseconds, would be lost
+  in the 0.7 ms the disk takes.
+- **The machine:** AMD Ryzen 9 7950X (16 cores, 32 threads), 61 GB RAM, Ubuntu 26.04.1, Linux 7.0.0-38, `performance`
+  governor, ext4 on NVMe, gcc 15.2, tsdbd on io_uring. Measured on 2026-11-05.
+- **Left out:** inserts on 32 connections (their runs differed by 30 to 60%, too much to read anything from; they are
+  being measured again) and, as elsewhere on this page, whole-range questions answered from block statistics (they
+  changed by at most 3%). Every number, including those, is in
+  [bench/auth/results/2026-11-05-summary.md](bench/auth/results/2026-11-05-summary.md).
+
+In the tables a cell is the mean of the 5 runs, the spread in parentheses (standard deviation in percent of the mean)
+and the change against ffa4942. The first row is ffa4942, the baseline.
+
+**Queries, 1 connection** (queries per second). The raw column is noisy for every configuration, the baseline
+included (its runs went from 19,417 to 25,613).
+
+| configuration | raw rows, 3600 | 86,400 rows, buckets of 300 | 604,800 rows, buckets of 3600 | 604,800 rows, time-weighted |
+|---|---:|---:|---:|---:|
+| ffa4942, no access control | 21,522 (11.9%) | 10,810 (3.6%) | 11,535 (0.3%) | 5,773 (0.9%) |
+| auth build, `--no-auth` | 22,523 (11.5%) +4.7% | 11,158 (5.9%) +3.2% | 11,570 (0.6%) +0.3% | 5,762 (0.3%) -0.2% |
+| superuser | 20,490 (10.1%) -4.8% | 11,143 (2.7%) +3.1% | 11,676 (0.9%) +1.2% | 5,779 (0.3%) +0.1% |
+| 8 prefix grants | 21,357 (10.1%) -0.8% | 11,031 (3.5%) +2.0% | 11,661 (0.7%) +1.1% | 5,773 (0.7%) +0.0% |
+| 5,000 name grants | 21,235 (5.8%) -1.3% | 10,918 (1.9%) +1.0% | 11,610 (0.5%) +0.6% | 5,767 (0.7%) -0.1% |
+| 64 glob grants | 20,533 (11.1%) -4.6% | 10,927 (1.9%) +1.1% | 11,630 (0.4%) +0.8% | 5,769 (1.1%) -0.1% |
+
+**Queries, 32 connections** (queries per second)
+
+| configuration | raw rows, 3600 | 86,400 rows, buckets of 300 | 604,800 rows, buckets of 3600 | 604,800 rows, time-weighted |
+|---|---:|---:|---:|---:|
+| ffa4942, no access control | 199,216 (1.5%) | 84,919 (1.0%) | 46,240 (0.3%) | 11,273 (0.3%) |
+| auth build, `--no-auth` | 201,994 (2.1%) +1.4% | 85,001 (1.0%) +0.1% | 46,147 (0.4%) -0.2% | 11,194 (0.2%) -0.7% |
+| superuser | 196,938 (1.5%) -1.1% | 86,018 (0.6%) +1.3% | 46,340 (0.1%) +0.2% | 11,191 (0.3%) -0.7% |
+| 8 prefix grants | 199,287 (2.4%) +0.0% | 85,385 (0.8%) +0.5% | 46,282 (0.2%) +0.1% | 11,182 (0.1%) -0.8% |
+| 5,000 name grants | 203,869 (1.1%) +2.3% | 84,641 (0.4%) -0.3% | 46,053 (0.4%) -0.4% | 11,172 (0.2%) -0.9% |
+| 64 glob grants | 198,897 (2.2%) -0.2% | 85,796 (0.6%) +1.0% | 46,243 (0.3%) +0.0% | 11,162 (0.3%) -1.0% |
+
+**QUERY_MULTI, 100 series in one request, 1 connection** (series windows per second)
+
+| configuration | raw rows, 3600 | 86,400 rows, buckets of 300 | 604,800 rows, buckets of 3600 | 604,800 rows, time-weighted |
+|---|---:|---:|---:|---:|
+| ffa4942, no access control | 57,262 (0.6%) | 69,927 (0.3%) | 41,555 (0.2%) | 11,269 (0.1%) |
+| auth build, `--no-auth` | 57,321 (1.1%) +0.1% | 70,195 (0.2%) +0.4% | 41,574 (0.2%) +0.0% | 11,183 (0.1%) -0.8% |
+| superuser | 56,592 (0.7%) -1.2% | 70,278 (0.7%) +0.5% | 41,551 (0.1%) -0.0% | 11,196 (0.3%) -0.6% |
+| 8 prefix grants | 56,578 (0.4%) -1.2% | 69,908 (0.5%) -0.0% | 41,568 (0.2%) +0.0% | 11,192 (0.2%) -0.7% |
+| 5,000 name grants | 56,158 (3.1%) -1.9% | 69,911 (0.6%) -0.0% | 41,548 (0.2%) -0.0% | 11,187 (0.1%) -0.7% |
+| 64 glob grants | 56,745 (0.5%) -0.9% | 69,783 (0.6%) -0.2% | 41,580 (0.2%) +0.1% | 11,168 (0.4%) -0.9% |
+
+**QUERY_MULTI, 100 series in one request, 32 connections** (series windows per second)
+
+| configuration | raw rows, 3600 | 86,400 rows, buckets of 300 | 604,800 rows, buckets of 3600 | 604,800 rows, time-weighted |
+|---|---:|---:|---:|---:|
+| ffa4942, no access control | 442,991 (0.8%) | 105,637 (0.1%) | 53,466 (0.3%) | 12,004 (0.1%) |
+| auth build, `--no-auth` | 440,285 (1.5%) -0.6% | 105,162 (0.2%) -0.5% | 53,448 (0.3%) -0.0% | 11,876 (0.1%) -1.1% |
+| superuser | 441,841 (1.4%) -0.3% | 105,229 (0.3%) -0.4% | 53,451 (0.1%) -0.0% | 11,909 (0.2%) -0.8% |
+| 8 prefix grants | 442,484 (1.5%) -0.1% | 105,587 (0.2%) -0.0% | 53,451 (0.3%) -0.0% | 11,894 (0.3%) -0.9% |
+| 5,000 name grants | 442,007 (1.5%) -0.2% | 105,393 (0.2%) -0.2% | 53,499 (0.2%) +0.1% | 11,880 (0.2%) -1.0% |
+| 64 glob grants | 440,074 (1.6%) -0.7% | 105,306 (0.2%) -0.3% | 53,433 (0.3%) -0.1% | 11,868 (0.5%) -1.1% |
+
+In the last three tables the time-weighted column is 0.6 to 1.1% lower in every auth-build row, `--no-auth`
+included, so that small difference comes with the build and not with the login or the grants.
+
+**Inserts, 1 connection, 1,000 rows a request** (million rows per second). "One series" puts all 1,000 rows in one
+series; "a series per row" takes one row from each of 1,000 series. The second column varies a lot between runs for
+every configuration (16 to 44%), and the runs of all rows overlap; read nothing into its changes.
+
+| configuration | one series per request | a series per row |
+|---|---:|---:|
+| ffa4942, no access control | 21.39 (1.6%) | 10.18 (37.6%) |
+| auth build, `--no-auth` | 21.15 (1.9%) -1.1% | 12.66 (18.4%) +24.4% |
+| superuser | 21.62 (0.7%) +1.1% | 13.33 (18.9%) +30.9% |
+| 8 prefix grants | 21.65 (1.2%) +1.2% | 10.81 (34.9%) +6.2% |
+| 5,000 name grants | 21.96 (0.8%) +2.7% | 11.76 (16.3%) +15.6% |
+| 64 glob grants | 21.77 (2.5%) +1.8% | 9.61 (43.8%) -5.6% |
+
+**Logins** (logins per second). A login here is: connect, one small request, close. In the first two rows the server
+has no access control, so there is no login step, only the connect, the request and the close. "Key cache" means the
+client keeps the derived key, so PBKDF2 runs once per process; "cold" starts a new process for every login, so it
+runs every time.
+
+| configuration | key cache, 1 thread | key cache, 32 threads | cold, 1 thread | cold, 32 threads |
+|---|---:|---:|---:|---:|
+| ffa4942, no access control | 13,987 (0.7%) | 19,758 (0.2%) | 3,165 (0.5%) | 7,723 (1.1%) |
+| auth build, `--no-auth` | 13,990 (0.6%) +0.0% | 19,780 (0.3%) +0.1% | 3,126 (0.4%) -1.2% | 7,707 (0.6%) -0.2% |
+| superuser | 7,871 (1.5%) -43.7% | 18,975 (0.1%) -4.0% | 525.9 (0.9%) -83.4% | 6,511 (0.8%) -15.7% |
+| 8 prefix grants | 7,756 (2.0%) -44.6% | 18,949 (0.2%) -4.1% | 527.7 (0.9%) -83.3% | 6,508 (0.4%) -15.7% |
+| 5,000 name grants | 7,792 (3.1%) -44.3% | 18,944 (0.2%) -4.1% | 528.9 (1.0%) -83.3% | 6,477 (0.5%) -16.1% |
+| 64 glob grants | 7,858 (1.8%) -43.8% | 18,993 (0.2%) -3.9% | 528.5 (0.7%) -83.3% | 6,489 (0.6%) -16.0% |
+
+**What this says**
+
+- **Queries and inserts:** a logged-in user, with any of the grant sets, gets the same speed as without access
+  control. Differences are at most a few percent, and they go both ways, the same size as the run-to-run spread.
+  Having 5,000 grants or 64 glob patterns costs nothing more than having 8.
+- **A login costs one round trip more:** one connection logging in again and again does 7,900 logins a second against
+  14,000, which is 127 microseconds each instead of 72, so about 56 microseconds more. With 32 threads the loss is
+  4%.
+- **A new process pays for PBKDF2 once:** a login in a fresh process takes 1.9 ms in all, against 0.32 ms without
+  access control; the extra 1.6 ms is mostly the key derivation. A process that keeps its key (the key cache) pays it
+  once, not for each connection.
+- **Not measured:** the default durability mode (an fsync for every request) and inserts on 32 connections (being
+  measured again). The comparison with the earlier main (3bd4e96) is left for a separate investigation.
+
 ## Reproduce it yourself
 
 **tsdb alone, on your machine:** `tools/bench-tsdb.sh` builds an optimized copy in `build-bench/`, runs tsdb's own
