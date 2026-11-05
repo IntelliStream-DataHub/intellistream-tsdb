@@ -116,7 +116,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             granule g;
             memset(&g, 0, sizeof g);
             gx_load(p, i, GW_ALL, &g);
-            granule_read(cc, p, &g, (int)((g.series + i / 2) % 5), ts, vals, i & 1);
+            granule_read(cc, p, &g, (int)((g.series + i / 2) % 5), ts, vals, MAX_GRANULE_ROWS, i & 1);
         }
         for (uint32_t i = 0; i < p->nt; i++)
             (void)p->t[i].series;

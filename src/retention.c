@@ -93,16 +93,27 @@ static int ret_load(eng *db, bool writer)
     close(fd);
     int rc = got == size ? 0 : TSDB_ERR_IO;
     size_t pos = 0;
+    uint32_t nser = eng_series_count(db);
+    bool later = false; /* a reader stopped at a record of a series it has not read yet */
     pthread_mutex_lock(&db->ret_lock);
     for (; rc == 0 && pos + RET_REC <= size && rec_ok(buf + pos, pos); pos += RET_REC) {
         uint32_t series;
         int64_t limit;
         memcpy(&series, buf + pos + 4, 4);
         memcpy(&limit, buf + pos + 8, 8);
-        rc = ret_put_locked(db, series, limit);
         db->ret_ids = MAX(db->ret_ids, (uint64_t)series + 1); /* tsdb_set_retention refuses ids SERIES lacks: the open checks */
+        /* The table grows to the id: one SERIES lacks (a crafted record may name 2^32 - 1: 32 GB) is never applied.
+         * The writer's open fails on it (open_check_records), a reader reads it again at its next reload: the
+         * writer may have made the series after the reader read SERIES. */
+        if (series >= nser) {
+            if (writer)
+                continue;
+            later = true;
+            break;
+        }
+        rc = ret_put_locked(db, series, limit);
     }
-    for (size_t q = pos + RET_REC; rc == 0 && q + RET_REC <= size; q += RET_REC) {
+    for (size_t q = pos + RET_REC; rc == 0 && !later && q + RET_REC <= size; q += RET_REC) {
         if (rec_ok(buf + q, q)) {
             fprintf(stderr, "tsdb: %s is damaged at offset %zu, before valid records\n", RET_FILE, pos);
             rc = TSDB_ERR_CORRUPT;

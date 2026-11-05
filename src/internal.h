@@ -858,13 +858,27 @@ bool part_index_intact(const part *p);
 bool part_checked(struct eng *db, part *p, const char *what);
 void part_ref(part *p);
 void part_unref(part *p);
-/* Decodes a granule: timestamps, and values (if v) as slots of `type`; checks
- * the granule's checksum first if verify. */
-int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, bool verify);
+/* Decodes a granule: timestamps, and values (if v) as slots of `type`, into buffers of room for cap rows; checks
+ * the granule's checksum first if verify. A count above cap or the part's granule size is TSDB_ERR_CORRUPT: without
+ * pin_index the count is read in the mapping, where a write to the file can change it between the load that sized
+ * the caller's buffers and the one in g, so cap is what the buffers hold, never a count loaded before. */
+int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
+                 bool verify);
 /* the same for entry i: decodes its GW_LOC fields into *g first. Out of line on purpose: inlined, the entry's
  * decoding changes how the compiler lays out a caller's per-row loop (TWA lost 12% that way). */
-int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, bool verify, granule *g);
+int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, size_t cap, bool verify,
+                    granule *g);
 extern atomic_uint_fast64_t granule_checks; /* granule checksums computed, for tests */
+/* test hook: runs where a reader has used the counts of entries from i of p (without pin_index, in the mapping) and
+ * is about to load them again (IX_*), so a test can change them in between, as a write to the file can */
+enum { IX_SRC, IX_VISIBLE, IX_FITS, IX_COPY };
+extern void (*_Atomic index_reload_hook)(const part *p, uint32_t i, int at);
+#define IX_HOOK(p, i, at)                                                                                            \
+    do {                                                                                                             \
+        void (*h_)(const part *, uint32_t, int) = atomic_load_explicit(&index_reload_hook, memory_order_relaxed);   \
+        if (h_)                                                                                                      \
+            h_(p, i, at);                                                                                            \
+    } while (0)
 
 /* Hour cuts. A granule of a series also ends at a UTC hour edge e (a multiple of HOUR_CUT_MS) when at least
  * HOUR_CUT_MIN rows of it lie in the hour before e, [e - 1 h, e), so hourly buckets and local days (whole hours in
@@ -902,9 +916,9 @@ typedef struct part_writer {
     uint32_t hk_series;       /* the series of the last rows given to the writer (emitted, pending or copied), */
     int64_t hk_hour, hk_end;  /* the hour of the last one (floor of ts / HOUR_CUT_MS) and where it ends, */
     uint64_t hk_cnt;          /* and how many of its rows given lie in that hour */
-    int64_t *hk_buf;          /* stamps pw_copy_fits decoded: of entry hk_di of hk_dsrc */
+    int64_t *hk_buf;          /* stamps pw_copy_fits decoded: of entry hk_di of hk_dsrc, hk_dn of them */
     const struct part *hk_dsrc;
-    uint32_t hk_di;
+    uint32_t hk_di, hk_dn;
     int zstd_level;
     int value_codec;
     codec_ctx *cc;
@@ -1590,7 +1604,8 @@ typedef struct src {
     uint8_t *v;      /* slots of `type` */
     int type;
     size_t w;        /* slot width */
-    bool own;        /* ts/v are decode buffers owned by the cursor */
+    bool own;        /* ts/v are decode buffers owned by the cursor, */
+    uint32_t cap;    /* of room for cap rows */
 } src;
 void src_init_part(src *c, const part *p, uint32_t gi, uint32_t gj, int type);
 void src_init_mem(src *c, const mem_run *r, uint64_t prio, int type);

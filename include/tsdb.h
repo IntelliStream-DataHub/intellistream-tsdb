@@ -146,8 +146,8 @@ typedef struct tsdb_options {
                               * misdirected write, a misread page) cannot change what queries see. Costs about 32
                               * to 51 bytes of RAM per granule, in every process that opens the part
                               * (tsdb_volume_stats.pinned_bytes). Default 0: read in place from the mapping (page
-                              * cache); damage after the open can then give wrong answers, never a read outside the
-                              * part. Independent of verify_checksums */
+                              * cache); damage after the open gives wrong answers or TSDB_ERR_CORRUPT, never a
+                              * read outside the part or a write outside a buffer. Independent of verify_checksums */
     int insert_zstd_level;   /* zstd level of the parts inserts and memtable flushes write; default 0: none, which
                               * makes them faster to write and larger until merged. Background merges re-encode
                               * every such part at zstd_level: with others, or alone once its partition is idle

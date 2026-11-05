@@ -509,7 +509,7 @@ static size_t check_parts(const char *dir, int type, const char *label)
             granule s, r;
             memset(&s, 0, sizeof s);
             gx_load(p, i, GW_ALL, &s);
-            if (granule_read(cc, p, &s, type, ts, v, true) != 0) { /* verify: the crc covers the blocks */
+            if (granule_read(cc, p, &s, type, ts, v, MAX_GRANULE_ROWS, true) != 0) { /* verify: the crc covers the blocks */
                 fprintf(stderr, "%s: %s entry %u does not decode\n", label, de->d_name, i);
                 bad++;
                 continue;

@@ -29,6 +29,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -830,6 +832,182 @@ static void test_merge_index_damage(const char *scratch)
     CHECK(find_file(dir, part, "", again, sizeof again)); /* still there, not replaced by a laundered copy */
     tsdb_close(db);
     printf("  a merge does not copy statistics from an index damaged after the open\n");
+    rm_rf(dir);
+}
+
+/* A granule's count changed in the mapping between two loads of it (pin_index off, the default), found by the 0.9.0
+ * review (secrel F1): a raw query sized its buffers from the counts of its window, then decoded the count it loaded
+ * again into them, and a merge bounded its loops by one load and its decoded stamps by another: a heap overflow
+ * from file bytes, where tsdb.h promises wrong answers at most. Every decode is bounded by the buffer it writes now,
+ * and a merge refuses a count that changed. The hook flips the top bit of an entry's count in the file exactly
+ * between the loads (IX_*); the mapping shows it at once, as it shows a misdirected write. */
+static atomic_int ix_at = -1, ix_fired, ix_flip_it = 1;
+static off_t ix_off; /* where the bit is: the file, the offset, which bit */
+static char ix_name[96];
+static uint8_t ix_mask;
+
+static void ix_hook(const part *p, uint32_t i, int at)
+{
+    if (at != atomic_load(&ix_at) || atomic_exchange(&ix_fired, 1))
+        return;
+    const gix_field *c = &p->ix.f[GF_COUNT];
+    CHECK(c->width > 0); /* counts that differ: the field has bits */
+    unsigned bit = c->bit + c->width - 1u;
+    ix_off = (off_t)(p->ix.e - p->map) + (off_t)i * p->ix.stride + c->byte + bit / 8;
+    ix_mask = (uint8_t)(1u << (bit % 8));
+    snprintf(ix_name, sizeof ix_name, "%s", p->name);
+    if (!c->width || !atomic_load(&ix_flip_it))
+        return;
+    uint32_t before = gx_count(p, i);
+    int fd = openat(p->dirfd, p->name, O_RDWR | O_CLOEXEC);
+    uint8_t b = 0;
+    CHECK(fd >= 0 && pread(fd, &b, 1, ix_off) == 1);
+    b ^= ix_mask;
+    CHECK(fd >= 0 && pwrite(fd, &b, 1, ix_off) == 1);
+    if (fd >= 0)
+        close(fd);
+    CHECK(gx_count(p, i) != before); /* the readers see it */
+}
+
+/* ix.a: one granule of 10 rows, ix.b: one of 40, in one part; tomb: a delete touches ix.a's granule, so the query
+ * decodes it through decode_visible rather than a source (src_fill). ix.a's count is the smaller: its top bit is 0,
+ * and the flip raises it above the buffer sized for 10 rows. */
+static tsdb *ix_query_db(const char *dir, bool tomb, tsdb_sid *a)
+{
+    rm_rf(dir);
+    tsdb_options o = opts();
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 1; /* straight to a part */
+    tsdb *db;
+    tsdb_sid b;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "ix.a", a));
+    OK(tsdb_series(db, "ix.b", &b));
+    tsdb_sid ids[50];
+    int64_t ts[50];
+    float v[50];
+    for (int i = 0; i < 50; i++)
+        ids[i] = i < 10 ? *a : b, ts[i] = T0 + (i < 10 ? i : i - 10) * 1000, v[i] = 1.0f;
+    OK(tsdb_insert(db, ids, ts, v, 50));
+    if (tomb)
+        OK(tsdb_delete_range(db, *a, T0 + 5000, T0 + 5001));
+    return db;
+}
+
+/* The merge path: a merged part holds ix.a (60 rows, one granule across an hour edge, written with hour cuts off)
+ * and ix.c (64 rows); its count and longest gap leave the rows of each hour open, so a merge with hour cuts on
+ * decodes its stamps (pw_copy_fits) and copies it (pw_copy_granule) with the hour count taken from them. */
+static void ix_merge(const char *dir, int at, bool flip)
+{
+    rm_rf(dir);
+    unsigned hc = atomic_load(&hour_cut_min);
+    atomic_store(&hour_cut_min, 0);
+    tsdb_options o = opts();
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 1;
+    tsdb *db;
+    tsdb_sid a, b, c;
+    OK(tsdb_open(dir, &o, &db));
+    OK(tsdb_series(db, "ix.a", &a));
+    OK(tsdb_series(db, "ix.b", &b));
+    OK(tsdb_series(db, "ix.c", &c));
+    int64_t e = (T0 / 3600000 + 10) * 3600000; /* an hour edge inside a day */
+    int64_t ta[60], tc[64];
+    float va[60], vc[64];
+    for (int i = 0; i < 60; i++) /* 15 rows in the hour before e, 45 after it, 30 min 20 s apart */
+        ta[i] = i < 15 ? e - 1800000 + i * 20000 : e + 300000 + (i - 15) * 20000, va[i] = (float)i;
+    for (int i = 0; i < 64; i++)
+        tc[i] = e + 1800000 + i * 1000, vc[i] = 1.0f;
+    OK(tsdb_insert_series(db, a, ta, va, 30));
+    OK(tsdb_insert_series(db, c, tc, vc, 64));
+    OK(tsdb_insert_series(db, a, ta + 30, va + 30, 30));
+    OK(tsdb_optimize(db));
+    OK(tsdb_insert_series(db, b, tc, vc, 10));
+    atomic_store(&hour_cut_min, 20);
+    atomic_store(&ix_flip_it, flip);
+    atomic_store(&ix_fired, 0);
+    atomic_store(&ix_at, at);
+    RC(tsdb_optimize(db), flip ? TSDB_ERR_CORRUPT : 0);
+    CHECK(atomic_load(&ix_fired));
+    atomic_store(&ix_at, -1);
+    atomic_store(&ix_flip_it, 1);
+    atomic_store(&hour_cut_min, hc);
+    tsdb_close(db);
+}
+
+static atomic_int ix_stop;
+static uint8_t *ix_byte;
+
+static void *ix_flipper(void *arg)
+{
+    (void)arg;
+    while (!atomic_load_explicit(&ix_stop, memory_order_relaxed))
+        *(volatile uint8_t *)ix_byte ^= ix_mask;
+    return NULL;
+}
+
+static void test_index_count_changes(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-index-count", scratch);
+    atomic_store(&index_reload_hook, ix_hook);
+    for (int tomb = 0; tomb <= 1; tomb++) {
+        tsdb_sid a;
+        tsdb *db = ix_query_db(dir, tomb, &a);
+        int rc;
+        CHECK(count_rows(db, a, &rc) == 10 - tomb && rc == 0);
+        atomic_store(&ix_fired, 0);
+        atomic_store(&ix_at, tomb ? IX_VISIBLE : IX_SRC);
+        count_rows(db, a, &rc);
+        CHECK(atomic_load(&ix_fired));
+        RC(rc, TSDB_ERR_CORRUPT);
+        atomic_store(&ix_at, -1);
+        tsdb_close(db);
+    }
+    ix_merge(dir, IX_FITS, false); /* the path is taken, and without a change the merge goes through */
+    ix_merge(dir, IX_COPY, false);
+    ix_merge(dir, IX_FITS, true);
+    ix_merge(dir, IX_COPY, true);
+
+    /* and racing: a thread toggles the bit while queries run (what ASan caught in seconds before) */
+    for (int tomb = 0; tomb <= 1; tomb++) {
+        tsdb_sid a;
+        tsdb *db = ix_query_db(dir, tomb, &a);
+        atomic_store(&ix_flip_it, 0); /* the hook only finds the bit */
+        atomic_store(&ix_fired, 0);
+        atomic_store(&ix_at, tomb ? IX_VISIBLE : IX_SRC);
+        int rc;
+        count_rows(db, a, &rc);
+        atomic_store(&ix_at, -1);
+        atomic_store(&ix_flip_it, 1);
+        CHECK(atomic_load(&ix_fired));
+        char p[900];
+        path(p, sizeof p, dir, ix_name);
+        int fd = open(p, O_RDWR | O_CLOEXEC);
+        off_t size = fd >= 0 ? lseek(fd, 0, SEEK_END) : 0;
+        uint8_t *m = fd >= 0 ? mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+        CHECK(m != MAP_FAILED && ix_off < size);
+        if (m != MAP_FAILED && ix_off < size) {
+            ix_byte = m + ix_off;
+            atomic_store(&ix_stop, 0);
+            pthread_t t;
+            pthread_create(&t, NULL, ix_flipper, NULL);
+            long wrong = 0; /* answers and TSDB_ERR_CORRUPT are both right here; anything else is not */
+            for (int i = 0; i < 20000; i++) {
+                count_rows(db, a, &rc);
+                wrong += rc != 0 && rc != TSDB_ERR_CORRUPT;
+            }
+            atomic_store(&ix_stop, 1);
+            pthread_join(t, NULL);
+            CHECK(wrong == 0);
+            munmap(m, (size_t)size);
+        }
+        if (fd >= 0)
+            close(fd);
+        tsdb_close(db);
+    }
+    atomic_store(&index_reload_hook, NULL);
+    printf("  a granule count that changes in the mapping between two loads is refused, never decoded past a buffer\n");
     rm_rf(dir);
 }
 
@@ -1892,6 +2070,79 @@ static size_t rser_offset(const char *dir, const char *part, part_footer *ft)
     return off;
 }
 
+/* A RETENTION or CLASSES record (checksum sealed, as only a crafted file has it) that names series 2^32 - 1: the
+ * tables these records fill grew to the id before the open compared it with SERIES, 32 GB (RETENTION) or 4 GB
+ * (CLASSES) of zeroed memory, and a reader kept them (the 0.9.0 review, secrel L1). A record of a series SERIES
+ * lacks is never applied now: the writer's open fails on it as before, a reader leaves it for a later refresh. The
+ * opens run in a child with 3 GB of address space, where such a table fails to allocate (not under ASan or TSan,
+ * which reserve terabytes of it). */
+static void test_records_huge_id(const char *scratch)
+{
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/damage-records-huge-id", scratch);
+    for (int cls = 0; cls <= 1; cls++) {
+        rm_rf(dir);
+        tsdb_options o = opts();
+        tsdb *db;
+        tsdb_sid a;
+        OK(tsdb_open(dir, &o, &db));
+        OK(tsdb_series(db, "a", &a));
+        insert_at(db, a, T0, 10);
+        OK(tsdb_flush(db));
+        tsdb_close(db);
+        const char *file = cls ? "CLASSES" : "RETENTION";
+        off_t at = file_size(dir, file);
+        if (at < 0)
+            at = 0;
+        uint8_t rec[24] = {0};
+        size_t n = cls ? 24 : 16;
+        uint32_t s = UINT32_MAX;
+        int64_t v = cls ? INT64_MIN : 86400000; /* CLASSES: from (then class 0 at +16); RETENTION: the limit */
+        memcpy(rec + 4, &s, 4);
+        memcpy(rec + 8, &v, 8);
+        uint32_t check = (uint32_t)xxh64(rec + 4, n - 4, (uint64_t)at);
+        memcpy(rec, &check, 4);
+        char p[700];
+        path(p, sizeof p, dir, file);
+        int fd = open(p, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+        CHECK(fd >= 0 && pwrite(fd, rec, n, at) == (ssize_t)n);
+        if (fd >= 0)
+            close(fd);
+        fflush(NULL);
+        pid_t pid = fork();
+        if (pid == 0) {
+#if !defined(__SANITIZE_ADDRESS__) && !defined(__SANITIZE_THREAD__)
+            struct rlimit rl = {3ull << 30, 3ull << 30};
+            if (setrlimit(RLIMIT_AS, &rl) != 0)
+                _exit(3);
+#endif
+            int w = try_open(dir); /* the writer: SERIES lacks the series, the open fails, nothing cut */
+            if (w != TSDB_ERR_CORRUPT)
+                fprintf(stderr, "  %s naming series 2^32 - 1: the writer's open gave %s\n", file, tsdb_strerror(w));
+            tsdb_options ro = opts();
+            ro.read_only = 1;
+            int r = tsdb_open(dir, &ro, &db);
+            long rows = -1;
+            if (r == 0) {
+                tsdb_sid id;
+                int qrc;
+                if (tsdb_series_lookup(db, "a", &id) == 0)
+                    rows = count_rows(db, id, &qrc);
+                tsdb_close(db);
+            } else {
+                fprintf(stderr, "  %s naming series 2^32 - 1: a reader's open gave %s\n", file, tsdb_strerror(r));
+            }
+            _exit(w == TSDB_ERR_CORRUPT && r == 0 && rows == 10 ? 0 : 1);
+        }
+        int status = 0;
+        CHECK(pid > 0 && waitpid(pid, &status, 0) == pid);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(file_size(dir, file) == at + (off_t)n); /* kept for the operator */
+    }
+    printf("  a RETENTION or CLASSES record of series 2^32 - 1 grows no table: the writer's open fails, a reader's not\n");
+    rm_rf(dir);
+}
+
 /* N2 (rv.c part A). A retention change recomputed when each part expires from series ids read in the mapping: an
  * index damaged after the open renamed the run of a series without retention to one with a 1-day limit, and the
  * merge thread retired the whole partition, for good. The drop checks the index first now, and counts the part. */
@@ -2259,6 +2510,7 @@ int main(int argc, char **argv)
     test_refused_open_keeps_files(base);
     test_series_gap_follower(base);
     test_records_prove_series(base);
+    test_records_huge_id(base);
     test_retention_damaged_index(base);
     test_damaged_part_no_starvation(base);
     test_follower_steady_creation(base);
@@ -2266,6 +2518,7 @@ int main(int argc, char **argv)
     test_follower_series_rewritten(base);
     test_observe_damaged_runs(base);
     test_merge_index_damage(base);
+    test_index_count_changes(base);
     test_series_wal_follower(base);
     test_misread_tail(base);
     test_read_errors(base);

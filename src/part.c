@@ -255,18 +255,21 @@ void part_unref(part *p)
 
 atomic_uint_fast64_t granule_checks;
 atomic_uint hour_cut_min = HOUR_CUT_MIN;
+void (*_Atomic index_reload_hook)(const part *p, uint32_t i, int at);
 
-int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, bool verify, granule *g)
+int granule_read_at(codec_ctx *c, const part *p, uint32_t i, int type, int64_t *ts, void *v, size_t cap, bool verify,
+                    granule *g)
 {
     gx_load(p, i, GW_LOC, g);
-    return granule_read(c, p, g, type, ts, v, verify);
+    return granule_read(c, p, g, type, ts, v, cap, verify);
 }
 
-int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, bool verify)
+int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_t *ts, void *v, size_t cap,
+                 bool verify)
 {
     uint64_t len = (uint64_t)g->ts_len + g->val_len;
     if (g->off < sizeof(part_header) || g->off > p->index_off || len > p->index_off - g->off || g->count == 0 ||
-        g->count > p->grows)
+        g->count > p->grows || g->count > cap)
         return TSDB_ERR_CORRUPT;
     const uint8_t *blk = p->map + g->off;
     if (verify) {
@@ -533,8 +536,12 @@ int pw_copy_fits(part_writer *w, const part *src, uint32_t i, const granule *g, 
         return TSDB_ERR_NOMEM;
     granule gl;
     memset(&gl, 0, sizeof gl);
+    IX_HOOK(src, i, IX_FITS);
     gx_load(src, i, GW_TIME | GW_LOC, &gl);
-    int rc = granule_read(w->cc, src, &gl, 0, w->hk_buf, NULL, true);
+    /* the count bounds the loop below: another than the caller's (the index changed in the mapping) is damage */
+    if (gl.count != c)
+        return TSDB_ERR_CORRUPT;
+    int rc = granule_read(w->cc, src, &gl, 0, w->hk_buf, NULL, MAX_GRANULE_ROWS, true);
     if (rc)
         return rc;
     const int64_t *ts = w->hk_buf;
@@ -553,6 +560,7 @@ int pw_copy_fits(part_writer *w, const part *src, uint32_t i, const granule *g, 
     }
     w->hk_dsrc = src;
     w->hk_di = i;
+    w->hk_dn = gl.count;
     return 1;
 }
 
@@ -644,11 +652,15 @@ int pw_copy_granule(part_writer *w, const part *src, uint32_t i)
         return rc;
     granule gb;
     memset(&gb, 0, sizeof gb);
+    IX_HOOK(src, i, IX_COPY);
     gx_load(src, i, GW_ALL, &gb);
     const granule *g = &gb;
     size_t len = (size_t)g->ts_len + g->val_len;
     if (g->off < sizeof(part_header) || g->off > src->index_off || len > src->index_off - g->off)
         return TSDB_ERR_CORRUPT;
+    bool decoded = w->hc_min && w->hk_dsrc == src && w->hk_di == i; /* pw_copy_fits decoded its stamps */
+    if (decoded && g->count != w->hk_dn)
+        return TSDB_ERR_CORRUPT; /* not the count of the stamps in hk_buf: the index changed in the mapping */
     if (w->len + len > w->cap && (rc = pw_flush(w)) != 0)
         return rc;
     granule ng = *g;
@@ -663,7 +675,7 @@ int pw_copy_granule(part_writer *w, const part *src, uint32_t i)
         w->len += len;
     }
     if (w->hc_min && g->count) {
-        if (w->hk_dsrc == src && w->hk_di == i) { /* pw_copy_fits decoded its stamps */
+        if (decoded) {
             hk_push(w, g->series, w->hk_buf, g->count);
         } else { /* the rows of its last hour, or at least as many as its window and longest gap give */
             int64_t h = floor_div(g->ts_max, HOUR_CUT_MS);

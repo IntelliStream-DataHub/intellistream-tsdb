@@ -441,7 +441,7 @@ static void twa_worker(void *arg, int idx)
         twa_piece *pc = &j->pc[j->work[w]];
         const part *p = j->sn->parts[pc->src];
         granule gb;
-        int rc = granule_read_at(cc, p, pc->k, j->q->type, ts, v, p->verify, &gb);
+        int rc = granule_read_at(cc, p, pc->k, j->q->type, ts, v, cap, p->verify, &gb);
         if (rc) {
             atomic_store(&j->err, rc);
             break;
