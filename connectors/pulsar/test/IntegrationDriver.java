@@ -1,4 +1,5 @@
 import ai.intellistream.tsdb.ConnectOptions;
+import ai.intellistream.tsdb.Status;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
 import ai.intellistream.tsdb.ValuePoints;
@@ -35,6 +36,10 @@ import org.apache.pulsar.client.api.v5.schema.Schema;
  * verify HOST PORT N [USER PWFILE] every key present once with its last value; exit 1 otherwise; logs in as USER
  *                                  with the password in PWFILE (the superuser: the sink's user cannot read)
  * dlq URL TOPIC EXPECTED SECONDS   counts messages on the dead-letter topic; exit 1 unless EXPECTED arrive
+ * tenants URL TOPIC N              N points on each of the series acme.s0-s9 and globex.s0-s9 (the selection case)
+ * verify-tenants HOST PORT N VOLUME [USER PWFILE]
+ *                                  every acme.* point present, each acme.* series in volume number VOLUME, no
+ *                                  globex.* series at all (the selecting sink acknowledged and dropped them)
  * </pre>
  */
 public final class IntegrationDriver {
@@ -68,6 +73,16 @@ public final class IntegrationDriver {
             if (a.length > 5)
                 o = o.user(a[4]).passwordFile(Path.of(a[5])).requireAuth(true);
             System.exit(verify(a[1], Integer.parseInt(a[2]), Integer.parseInt(a[3]), o) ? 0 : 1);
+            break;
+        case "tenants":
+            tenants(a[1], a[2], Integer.parseInt(a[3]));
+            break;
+        case "verify-tenants":
+            ConnectOptions to = ConnectOptions.defaults().connectTimeout(Duration.ofSeconds(5));
+            if (a.length > 6)
+                to = to.user(a[5]).passwordFile(Path.of(a[6])).requireAuth(true);
+            System.exit(verifyTenants(a[1], Integer.parseInt(a[2]), Integer.parseInt(a[3]), Integer.parseInt(a[4]),
+                    to) ? 0 : 1);
             break;
         case "dlq":
             System.exit(dlq(a[1], a[2], Integer.parseInt(a[3]), Integer.parseInt(a[4])) ? 0 : 1);
@@ -162,6 +177,57 @@ public final class IntegrationDriver {
         boolean ok = missing == 0 && wrong == 0 && extra == 0 && rows == want.size();
         System.out.printf("verify: %s keys=%d rows=%d missing=%d wrong=%d extra=%d%s%n", ok ? "OK" : "NOT YET",
                 want.size(), rows, missing, wrong, extra, example == null ? "" : " e.g. " + example);
+        return ok;
+    }
+
+    static final String[] TENANTS = {"acme.", "globex."};
+
+    static void tenants(String url, String topic, int n) throws Exception {
+        try (PulsarClient c = client(url); Producer<byte[]> p = producer(c, topic, false)) {
+            ArrayDeque<CompletableFuture<?>> window = new ArrayDeque<>();
+            for (int i = 0; i < n; i++)
+                for (String t : TENANTS)
+                    for (int s = 0; s < 10; s++)
+                        send(p, window, t + "s" + s, "{\"series\":\"" + t + "s" + s + "\",\"ts\":" + (T0 + i * 1000L)
+                                + ",\"value\":" + i + "}");
+            while (!window.isEmpty())
+                window.poll().join();
+        }
+        System.out.println("produced " + n + " points on each of 20 series");
+    }
+
+    static boolean verifyTenants(String host, int port, int n, int volume, ConnectOptions options)
+            throws TsdbException {
+        int rows = 0, wrong = 0, misplaced = 0, missing = 0, present = 0;
+        try (TsdbClient c = TsdbClient.connect(host, port, options)) {
+            for (int s = 0; s < 10; s++) {
+                long id;
+                try {
+                    id = c.series("acme.s" + s, false);
+                } catch (TsdbException e) {
+                    missing++;
+                    continue;
+                }
+                if ((id >>> 32) - 1 != volume)
+                    misplaced++;
+                ValuePoints v = c.queryValues(id, Long.MIN_VALUE, Long.MAX_VALUE);
+                rows += v.size();
+                for (int i = 0; i < v.size(); i++)
+                    if (v.timestamps()[i] != T0 + i * 1000L || v.values().doubles()[i] != i)
+                        wrong++;
+                try {
+                    c.series("globex.s" + s, false);
+                    present++;
+                } catch (TsdbException e) {
+                    if (e.status() != Status.ERR_NOTFOUND)
+                        throw e;
+                }
+            }
+        }
+        boolean ok = missing == 0 && rows == 10 * n && wrong == 0 && misplaced == 0 && present == 0;
+        System.out.printf("verify-tenants: %s acme rows=%d of %d, series missing=%d, wrong=%d, not in volume %d=%d; "
+                + "globex series present=%d%n", ok ? "OK" : "NOT YET", rows, 10 * n, missing, wrong, volume, misplaced,
+                present);
         return ok;
     }
 

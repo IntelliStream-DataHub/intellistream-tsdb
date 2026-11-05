@@ -254,6 +254,8 @@ dead-letter topic, if the tenants should not hold each other up:
 {
   "hosts": "tsdb1:7070",
   "deadLetterTopic": "topic://public/default/acme-dlq",
+  "user": "acme-sink",
+  "passwordFile": "/etc/pulsar/acme-sink.password",
   "seriesPrefixes": ["acme."],
   "volumes": { "acme.": "/mnt/acme" }
 }
@@ -263,6 +265,22 @@ Start the second sink the same way with `"seriesPrefixes": ["globex."]`, and a
 third (or no selection at all, if one sink may take everything else) for the
 rest. Each sink must have its own `--subs-name`, or Pulsar shares the messages
 between them and a message can reach the wrong sink and be dropped.
+
+**With login** (see Login above), the selection and the user's rights are two
+separate things. The selection decides what the sink sends; the user's rights
+decide what tsdbd accepts. Give each tenant's sink a user with `insert` on that
+tenant's names and nothing else (no `read` is needed: the sink only looks names
+up and writes), and select the same names:
+
+```sh
+tsdb /var/lib/tsdb user add acme-sink --password-file acme-sink.pw
+tsdb /var/lib/tsdb user grant acme-sink insert prefix:acme.
+```
+
+A series the sink selects but its user may not write is refused by tsdbd
+(`TSDB_ERR_DENIED`) and goes to the dead-letter topic, message by message; the
+sink keeps running and writes the rest. A series it does not select never
+reaches tsdbd, so the user's rights do not matter for it.
 
 ### Example: only these three series
 

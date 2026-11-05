@@ -10,9 +10,13 @@
 #   C  kill -9 of the sink mid-stream (the instance JVM that runs it and the localrun JVM that spawned it),
 #      restarted: unacked records are redelivered
 # then the poison records must be on the dead-letter topic, and nothing else.
+#   S  selection: the first sink stops and a second one (its own topic and subscription) takes only the series named
+#      acme.* and creates them in a volume the operator added with `tsdb DIR volume add` beside the running tsdbd;
+#      every acme.* point must be in that volume, and no globex.* series may exist (acknowledged and dropped)
 #
 # Login (the default; AUTH=0 runs tsdbd with --no-auth): USERS is made by the CLI before tsdbd starts, with a
-# superuser `root` (verify reads as root) and the sink's user `sink`, granted `insert prefix:pump` alone. The sink
+# superuser `root` (verify reads as root) and the sink's user `sink`, granted `insert prefix:pump` and
+# `insert prefix:acme.` (for S) alone. The sink
 # gets its user in the sink config and its password as the secret `password` (`localrun --secrets`, whose default
 # provider is clear text). One more poison record names a series outside the grant: DENIED, dead-lettered.
 #
@@ -33,6 +37,7 @@ STOP_S=${STOP_S:-180}
 AUTH=${AUTH:-1}
 W=${1:-$(mktemp -d "${TMPDIR:-/tmp}/tsdb-pulsar-it.XXXXXX")}
 mkdir -p "$W"
+W=$(cd "$W" && pwd -P) # absolute and without symlinks: the volume of S is named by its path
 NAME=tsdb-pulsar-it-$$
 TOPIC=topic://public/default/points
 DLQ=topic://public/default/points-dlq
@@ -71,6 +76,8 @@ mkdir -p "$CONN/target/it-classes"
 javac -nowarn -cp "$(cat "$CONN/target/it-cp.txt")" -d "$CONN/target/it-classes" "$HERE/IntegrationDriver.java"
 driver() { java -cp "$CONN/target/it-classes:$(cat "$CONN/target/it-cp.txt")" IntegrationDriver "$@"; }
 
+# a tsdbd that has it ends with this script, however the script ends
+EXIT_WITH_PARENT=$("$ROOT/build/tsdbd" --help 2>&1 | grep -q -- --exit-with-parent && echo --exit-with-parent || true)
 BP=$(free_port); WP=$(free_port) # Pulsar's ports; tsdbd's port comes from tsdbd itself
 TP=
 URL=pulsar://127.0.0.1:$BP
@@ -83,7 +90,7 @@ start_tsdbd() {
     rm -f "$pf"
     # shellcheck disable=SC2046 # no option at all with login on
     "$ROOT/build/tsdbd" --dir "$W/data" --listen 127.0.0.1 --port "$want" --port-file "$pf" --workers 2 \
-        $([ "$AUTH" = 1 ] || echo --no-auth) >> "$W/tsdbd.log" 2>&1 &
+        $([ "$AUTH" = 1 ] || echo --no-auth) $EXIT_WITH_PARENT >> "$W/tsdbd.log" 2>&1 &
     TSDBD_PID=$!
     for _ in $(seq 600); do
         kill -0 "$TSDBD_PID" 2>/dev/null || { wait "$TSDBD_PID" 2>/dev/null || true; die "tsdbd did not start (port $want), see $W/tsdbd.log"; }
@@ -131,22 +138,24 @@ if [ "$AUTH" = 1 ]; then
     cli user add root --superuser --password-file "$(pwfile root)"
     cli user add sink --password-file "$(pwfile sink)"
     cli user grant sink insert prefix:pump # insert alone: a new series needs insert on its name, nothing more
+    cli user grant sink insert prefix:acme. # S: the selected tenant; globex.* is neither granted nor selected
     SINK_USER="\"user\":\"sink\","
     SINK_SECRETS="{\"password\":\"$(cat "$W/sink.pw")\"}"
     VERIFY_LOGIN=(root "$W/root.pw")
-    log "USERS made by the CLI: root (superuser), sink (insert prefix:pump)"
+    log "USERS made by the CLI: root (superuser), sink (insert prefix:pump, prefix:acme.)"
 fi
 
 start_tsdbd
 
 SINK_CONFIG="{$SINK_USER\"hosts\":\"$HOSTIP\",\"port\":$TP,\"connections\":2,\"maxInFlightRecords\":5000,\
 \"retryMaxMs\":2000,\"connectTimeoutMs\":2000,\"deadLetterTopic\":\"$DLQ\"}"
-start_sink() {
+start_sink() { # $1 $2 $3: name (also the subscription), topic, sink config; the main sink's by default
+    local name=${1:-tsdb} topic=${2:-$TOPIC} config=${3:-$SINK_CONFIG}
     # $$ of this sh is the pid of the JVM: pulsar-admin execs java
     podman exec -d "$NAME" sh -c "echo \$\$ > /tmp/sink.pid; exec bin/pulsar-admin sinks localrun \
         --broker-service-url pulsar://127.0.0.1:$BP --archive /connector/tsdb-pulsar-sink.nar \
-        --tenant public --namespace default --name tsdb --inputs $TOPIC --subs-name tsdb --subs-position Earliest \
-        --retain-key-ordering --processing-guarantees ATLEAST_ONCE --sink-config '$SINK_CONFIG' \
+        --tenant public --namespace default --name $name --inputs $topic --subs-name $name --subs-position Earliest \
+        --retain-key-ordering --processing-guarantees ATLEAST_ONCE --sink-config '$config' \
         ${SINK_SECRETS:+--secrets '$SINK_SECRETS'} >> /tmp/sink.log 2>&1" > /dev/null
     sleep 1
     SINK_PID=$(podman exec "$NAME" cat /tmp/sink.pid)
@@ -247,8 +256,37 @@ cat "$W/verify.log"
 driver dlq "$URL" "$DLQ" "$POISON" 60 > "$W/dlq.log" 2>&1 || { cat "$W/dlq.log"; die "dead letters"; }
 cat "$W/dlq.log"
 sink_alive || die "the sink is not running at the end"
+
+# --- S: a second sink that selects one tenant and creates its series in a volume of their own
+log "S: stopping the first sink; a sink for acme.* only, into the volume $W/vol-acme"
+INSTANCE=$(podman exec "$NAME" pgrep -P "$SINK_PID" | tr '\n' ' ')
+[[ "$INSTANCE" =~ ^[0-9\ ]+$ ]] || die "no sink instance under localrun pid $SINK_PID"
+podman exec "$NAME" sh -c "grep -q PulsarAdminTool /proc/$SINK_PID/cmdline && kill $INSTANCE $SINK_PID" \
+    || die "sink pid $SINK_PID is not the localrun JVM"
+for _ in $(seq 60); do podman exec "$NAME" test -e /proc/"$SINK_PID" || break; sleep 1; done
+mkdir -p "$W/vol-acme"
+cli volume add "$W/vol-acme" # beside the running tsdbd, as an operator does; the root is volume 0, this one 1
+admin scalable-topics create -s 2 public/default/tenants
+SEL_N=2000
+SEL_CONFIG="{$SINK_USER\"hosts\":\"$HOSTIP\",\"port\":$TP,\"deadLetterTopic\":\"$DLQ\",\
+\"seriesPrefixes\":[\"acme.\"],\"volumes\":{\"acme.\":\"$W/vol-acme\"}}"
+start_sink tsdb-sel topic://public/default/tenants "$SEL_CONFIG"
+driver tenants "$URL" topic://public/default/tenants "$SEL_N" > "$W/produce-s.log" 2>&1 \
+    || die "producer S failed: $(tail -5 "$W/produce-s.log")"
+cat "$W/produce-s.log"
+ok=
+for _ in $(seq 60); do
+    if driver verify-tenants 127.0.0.1 "$TP" "$SEL_N" 1 "${VERIFY_LOGIN[@]}" > "$W/verify-s.log" 2>&1; then ok=1; break; fi
+    sleep 2
+done
+cat "$W/verify-s.log"
+[ -n "$ok" ] || die "S: the acme.* points are not all in volume 1, or a globex.* series exists"
+sink_alive || die "the selecting sink is not running at the end"
 sink_logs > "$W/sink.log"
+grep -q 'this instance does not take and were dropped' "$W/sink.log" \
+    || die "S: the selecting sink logged no dropped points"
 log "sink logs: $(grep -c 'retrying in' "$W/sink.log" || true) retry lines, \
 $(grep -c 'record dead-lettered' "$W/sink.log" || true) dead-letter lines"
 log "PASS: N=$N points, kill -9 tsdbd, tsdbd down ${STOP_S}s (backlog ${B_BACKLOG:-?}), kill -9 sink, $POISON dead letters\
-$([ "$AUTH" = 1 ] && echo ", login on (sink's login refused $REFUSED times, then let in)")"
+$([ "$AUTH" = 1 ] && echo ", login on (sink's login refused $REFUSED times, then let in)"), \
+selection of acme.* into volume 1 ($SEL_N x 10 points kept, 10 globex.* series dropped)"

@@ -44,6 +44,24 @@ class LoginConfigTest {
         assertFalse(c.connectOptions().toString().contains("s3cret-pw"), "the password in toString()");
     }
 
+    /**
+     * The selection read through Pulsar's IOConfigUtils (its own mapper), as the runtime does: a single prefix is a
+     * list of one there too, and the volumes and the pattern come through beside the secret.
+     */
+    @Test
+    void theSelectionComesThroughWithTheSecrets() {
+        TsdbSinkConfig c = TsdbSinkConfig.load(map("user", "acme-sink", "seriesPrefixes", "acme.", "series",
+                java.util.List.of("pump7.flow"), "seriesPattern", "x[0-9]", "volumes", Map.of("acme.", "/vol/acme")),
+                secrets(Map.of("password", "pw-1")));
+        assertEquals("pw-1", c.password);
+        SeriesSelection s = c.selection();
+        assertTrue(s.matches("acme.a") && s.matches("pump7.flow") && s.matches("x3"));
+        assertFalse(s.matches("globex.a"));
+        assertEquals("/vol/acme", s.volumeFor("acme.a"));
+        assertThrows(IllegalArgumentException.class,
+                () -> TsdbSinkConfig.load(map("seriesPrefix", "acme."), secrets(Map.of())));
+    }
+
     @Test
     void aPasswordInThePlainConfigIsRefused() {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,

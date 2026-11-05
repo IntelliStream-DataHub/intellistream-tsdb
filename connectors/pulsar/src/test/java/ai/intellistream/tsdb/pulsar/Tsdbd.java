@@ -151,6 +151,8 @@ final class Tsdbd implements AutoCloseable {
                 "--port", Integer.toString(port), "--port-file", portFile.toString(), "--workers", "2"));
         if (rootPassword == null)
             cmd.add("--no-auth");
+        if (exitsWithParent(bin))
+            cmd.add("--exit-with-parent"); /* a JVM killed mid-test leaves no server behind */
         cmd.addAll(List.of(options));
         Process p = new ProcessBuilder(cmd)
                 .redirectErrorStream(true)
@@ -173,6 +175,20 @@ final class Tsdbd implements AutoCloseable {
         }
         p.destroyForcibly().waitFor();
         return null;
+    }
+
+    private static volatile Boolean exitWithParent;
+
+    /** Whether this tsdbd has {@code --exit-with-parent}: asked once from its {@code --help}, which older builds lack. */
+    private static boolean exitsWithParent(Path bin) throws IOException, InterruptedException {
+        Boolean b = exitWithParent;
+        if (b == null) {
+            Process p = new ProcessBuilder(bin.toString(), "--help").redirectErrorStream(true).start();
+            String help = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            p.waitFor();
+            exitWithParent = b = help.contains("--exit-with-parent");
+        }
+        return b;
     }
 
     /** A connection, as the superuser where the server has login. */

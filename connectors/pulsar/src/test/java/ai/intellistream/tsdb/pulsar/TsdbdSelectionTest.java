@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import ai.intellistream.tsdb.Status;
 import ai.intellistream.tsdb.TsdbClient;
 import ai.intellistream.tsdb.TsdbException;
 import ai.intellistream.tsdb.ValuePoints;
@@ -21,7 +22,8 @@ import org.junit.jupiter.api.Test;
  * Two tenants into two volumes, and a sink that takes only some series, against a real build/tsdbd: the operator adds
  * the volumes with the CLI first, the sink creates each new series in the volume its name maps to, series outside the
  * selection never reach tsdbd, and a volume nobody added dead-letters the message (until it is added, which tsdbd
- * accepts while it runs).
+ * accepts while it runs). With login, the sink's user needs insert on the series it takes and nothing else: a selected
+ * series it may not write is a dead letter (DENIED), not a failure of the sink.
  */
 class TsdbdSelectionTest {
     private Path dir;
@@ -184,5 +186,84 @@ class TsdbdSelectionTest {
         } finally {
             Tsdbd.delete(initech);
         }
+    }
+
+    /**
+     * Login with insert on one prefix alone (no read right, no other tenant): the selection and the volumes work, a
+     * selected series outside the grant is dead-lettered as DENIED while the rest goes on, a volume nobody added is
+     * dead-lettered as NOTFOUND naming its path, and what is not selected is dropped before it reaches tsdbd.
+     */
+    @Test
+    void withLoginInsertOnAPrefixIsAllTheSelectionNeeds() throws Exception {
+        Path initech = Tsdbd.scratch("tsdb-pulsar-vol-initech-").toRealPath(); /* never added */
+        try {
+            server.close();
+            server = null;
+            Tsdbd.cli(dir, "user", "add", "acme", "--password-file",
+                    Tsdbd.passwordFile(dir, "acme", "acme-secret-1").toString());
+            Tsdbd.cli(dir, "user", "grant", "acme", "insert", "prefix:acme.");
+            Tsdbd.cli(dir, "user", "grant", "acme", "insert", "prefix:initech.");
+            server = Tsdbd.startWithLogin(dir);
+            TsdbSinkConfig c = config();
+            c.user = "acme";
+            c.passwordFile = dir.resolveSibling(dir.getFileName() + ".acme.pw").toString();
+            c.seriesPrefixes = List.of("acme.", "globex.", "initech.");
+            c.volumes = Map.of("acme.", acme.toString(), "globex.", globex.toString(), "initech.", initech.toString());
+            open(c);
+            String[] names = {"acme.a", "globex.a", "initech.a", "hooli.a", "acme.b"};
+            List<FakeRecord> rs = new ArrayList<>();
+            for (int i = 0; i < 20; i++) {
+                FakeRecord r = FakeRecord.point(i, names[i % names.length], 1000 + i, i);
+                rs.add(r);
+                sink.write(r);
+            }
+            eventually(() -> rs.stream().allMatch(FakeRecord::settled), "acks");
+            assertTrue(rs.stream().allMatch(r -> r.acks.get() == 1 && r.fails.get() == 0), "acknowledged once each");
+            assertEquals(4, sink.metrics().skippedRecords()); /* hooli.a */
+            assertEquals(8, dlq.records.size(), String.valueOf(dlq.reasons));
+            int denied = 0, notFound = 0;
+            for (int i = 0; i < dlq.records.size(); i++) {
+                String name = names[((FakeRecord) dlq.records.get(i)).seq % names.length];
+                if (dlq.statuses.get(i) == Status.ERR_DENIED && name.equals("globex.a"))
+                    denied++;
+                else if (dlq.statuses.get(i) == Status.ERR_NOTFOUND && name.equals("initech.a")
+                        && dlq.reasons.get(i).contains(initech.toString()))
+                    notFound++;
+            }
+            assertEquals(4, denied, String.valueOf(dlq.reasons));
+            assertEquals(4, notFound, String.valueOf(dlq.reasons));
+            assertEquals(0, sink.metrics().retries());
+            try (TsdbClient cl = server.client()) {
+                for (String n : new String[] {"acme.a", "acme.b"})
+                    assertEquals(4, cl.queryValues(cl.series(n, false), Long.MIN_VALUE, Long.MAX_VALUE).size(), n);
+            }
+            Map<String, String> where = volumesOfSeries();
+            assertEquals(acme.toString(), where.get("acme.a"));
+            assertEquals(acme.toString(), where.get("acme.b"));
+            assertEquals(2, where.size(), String.valueOf(where));
+        } finally {
+            Tsdbd.delete(initech);
+        }
+    }
+
+    /** A pattern that no name matches (it must match the whole name): everything is acknowledged and dropped. */
+    @Test
+    void aPatternSelectingNothingWritesNothing() throws Exception {
+        TsdbSinkConfig c = config();
+        c.seriesPattern = "pump[0-9]+"; /* matches part of every name below, the whole of none */
+        c.volumes = Map.of("pump", acme.toString());
+        open(c);
+        List<FakeRecord> rs = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            FakeRecord r = FakeRecord.point(i, "pump" + i + ".flow", 1000 + i, i);
+            rs.add(r);
+            sink.write(r);
+        }
+        eventually(() -> rs.stream().allMatch(FakeRecord::settled), "acks");
+        assertTrue(rs.stream().allMatch(r -> r.acks.get() == 1 && r.fails.get() == 0));
+        assertEquals(0, sink.metrics().written());
+        assertEquals(10, sink.metrics().skippedRecords());
+        assertTrue(dlq.records.isEmpty(), String.valueOf(dlq.reasons));
+        assertTrue(volumesOfSeries().isEmpty(), "no series may be created");
     }
 }
