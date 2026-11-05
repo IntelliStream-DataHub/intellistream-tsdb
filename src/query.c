@@ -1111,13 +1111,13 @@ static void agg_worker(void *arg, int idx)
     eng *db = j->db;
     qstats *mine = cur_qstats;
     cur_qstats = j->qs;
-    codec_ctx *cc = cc_get(db);
+    codec_ctx *cc = NULL; /* taken with the first granule: a helper that finds the work gone takes none */
     size_t cap = db->granule_rows;
     int64_t *ts = qscratch_get(0, cap * sizeof *ts);
     uint8_t *v = qscratch_get(1, cap * sizeof(uint64_t));
     local_bucket *local = qscratch_get(2, cap * sizeof *local); /* a granule touches at most count buckets */
     agg_dev *localx = j->t.accx ? qscratch_get(3, cap * sizeof *localx) : NULL;
-    if (!cc || !ts || !v || !local || (j->t.accx && !localx)) {
+    if (!ts || !v || !local || (j->t.accx && !localx)) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
         goto out;
     }
@@ -1125,6 +1125,10 @@ static void agg_worker(void *arg, int idx)
         size_t w = atomic_fetch_add(&j->next, 1);
         if (w >= j->nwork || atomic_load_explicit(&j->err, memory_order_relaxed))
             break;
+        if (!cc && !(cc = cc_get(db))) {
+            atomic_store(&j->err, TSDB_ERR_NOMEM);
+            break;
+        }
         const gref *r = &j->work[w];
         granule gb;
         int rc = granule_read_at(cc, r->p, r->k, j->t.type, ts, v, r->p->verify, &gb);
@@ -1473,8 +1477,9 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
     accx = q->spread ? malloc(nb * sizeof *accx) : NULL;
     work = malloc(nin * sizeof *work);
     srcs = malloc((sn->np + sn->nmem) * sizeof *srcs);
-    cc = cc_get(db);
-    if (!acc || (q->spread && !accx) || !work || !srcs || !cc) {
+    /* the codec context only once a cluster's sources overlap (merge_stream; the granules decoded alone take the
+     * workers' own): an answer from statistics and memtable rows never meets other queries on cc_lock */
+    if (!acc || (q->spread && !accx) || !work || !srcs) {
         rc = TSDB_ERR_NOMEM;
         goto done;
     }
@@ -1543,7 +1548,9 @@ static int bq_dense(const bq *q, int64_t start, int64_t end, size_t c0, size_t c
                     src_init_mem(&srcs[ns++], &r, mem_prio(sn, s - sn->np), type);
             }
         }
-        rc = merge_stream(cc, srcs, ns, start, end, fold_emit, &fc);
+        if (!cc)
+            cc = cc_get(db);
+        rc = cc ? merge_stream(cc, srcs, ns, start, end, fold_emit, &fc) : TSDB_ERR_NOMEM;
         if (rc == TSDB_ERR_STOPPED)
             rc = TSDB_ERR_NOMEM;
         for (size_t k = 0; k < ns; k++)

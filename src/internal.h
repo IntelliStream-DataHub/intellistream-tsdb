@@ -1438,6 +1438,7 @@ int eng_failed_msg(struct eng *db, char *msg, size_t len);
 
 codec_ctx *cc_get(struct eng *db);
 void cc_put(struct eng *db, codec_ctx *c);
+extern __thread size_t cc_gets; /* contexts this thread took (db.c); for tests: statistics alone take none */
 
 /* classes.c: the partition key of a row, and a key's class and time range [lo, hi) (hi saturates at INT64_MAX
  * for the last partition, which then holds INT64_MAX itself) */
