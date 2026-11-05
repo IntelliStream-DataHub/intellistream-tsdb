@@ -216,11 +216,11 @@ class SelectionSinkTest {
     /**
      * A skipped record is acknowledged at once, while an earlier one still waits for tsdb. Under EFFECTIVELY_ONCE
      * Pulsar's classic source acknowledges cumulatively, so that ack would take the earlier record off Pulsar before
-     * it is durable and a crash would lose it: the sink refuses EFFECTIVELY_ONCE at open (ATLEAST_ONCE loses
-     * nothing, tsdb writes being idempotent).
+     * it is durable and a crash would lose it. ATMOST_ONCE acknowledges before tsdb has anything. The sink accepts
+     * only ATLEAST_ONCE (which loses nothing, tsdb writes being idempotent) and refuses the others at open.
      */
     @Test
-    void effectivelyOnceIsRefusedBecauseSkipsAreAcknowledgedFirst() throws Exception {
+    void onlyAtLeastOnceIsAcceptedBecauseSkipsAreAcknowledgedFirst() throws Exception {
         TsdbSinkConfig c = config();
         c.seriesPrefixes = List.of("acme.");
         tsdb.gate = new Semaphore(0); /* tsdb acknowledges nothing yet */
@@ -239,12 +239,21 @@ class SelectionSinkTest {
         TsdbSinkConfig e1 = config();
         e1.seriesPrefixes = List.of("acme.");
         e1.validate();
-        TsdbSink refused = new TsdbSink(tsdb);
-        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-                () -> refused.open(e1, context(ProcessingGuarantees.EFFECTIVELY_ONCE), dlq));
-        assertTrue(e.getMessage().contains("EFFECTIVELY_ONCE") && e.getMessage().contains("ATLEAST_ONCE"),
-                e.getMessage());
-        /* the default guarantee opens */
+        /* ATMOST_ONCE acknowledges before tsdb has the record; MANUAL leaves acknowledging to others */
+        for (ProcessingGuarantees g : List.of(ProcessingGuarantees.EFFECTIVELY_ONCE, ProcessingGuarantees.ATMOST_ONCE,
+                ProcessingGuarantees.MANUAL)) {
+            TsdbSink refused = new TsdbSink(tsdb);
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> refused.open(e1, context(g), dlq), g.toString());
+            assertTrue(e.getMessage().contains(g.toString()) && e.getMessage().contains("ATLEAST_ONCE"),
+                    e.getMessage());
+        }
+        /* the default guarantee opens, given or not */
+        TsdbSinkConfig unset = config();
+        unset.validate();
+        sink = new TsdbSink(tsdb);
+        sink.open(unset, context(null), dlq);
+        sink.close();
         TsdbSinkConfig ok = config();
         ok.validate();
         sink = new TsdbSink(tsdb);

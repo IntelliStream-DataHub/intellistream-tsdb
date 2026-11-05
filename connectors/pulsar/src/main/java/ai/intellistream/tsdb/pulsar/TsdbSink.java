@@ -85,13 +85,20 @@ public class TsdbSink implements Sink<GenericObject> {
         if (rc != null && rc.getTimeoutMs() != null && rc.getTimeoutMs() > 0)
             throw new IllegalArgumentException("the tsdb sink must run without an ack timeout (timeoutMs / --timeout-ms "
                     + rc.getTimeoutMs() + "): a redelivered copy would overwrite newer values of its key");
-        /* Under EFFECTIVELY_ONCE Pulsar's classic source acknowledges cumulatively: a skipped record, or one whose
-         * shard is faster, acknowledges every earlier record still waiting for tsdb, and a crash then loses those. */
-        if (rc != null && rc.getProcessingGuarantees() == ProcessingGuarantees.EFFECTIVELY_ONCE)
-            throw new IllegalArgumentException("the tsdb sink does not run with --processing-guarantees "
-                    + "EFFECTIVELY_ONCE (its cumulative acknowledgements could take messages off Pulsar before tsdb has "
-                    + "them); use ATLEAST_ONCE, the default: tsdb writes are idempotent (one value per series and time, "
-                    + "the last written), so a redelivered message changes nothing and ATLEAST_ONCE loses nothing");
+        /* Only ATLEAST_ONCE keeps "nothing is lost". Under EFFECTIVELY_ONCE Pulsar's classic source acknowledges
+         * cumulatively: a skipped record, or one whose shard is faster, acknowledges every earlier record still
+         * waiting for tsdb, and a crash then loses those. ATMOST_ONCE acknowledges before the sink has the record.
+         * MANUAL leaves the acknowledgements to code the sink is not. Nothing is gained by any of them: tsdb's
+         * acknowledgement means durable and writes are idempotent, so at-least-once costs nothing. */
+        ProcessingGuarantees g = rc != null ? rc.getProcessingGuarantees() : null;
+        if (g != null && g != ProcessingGuarantees.ATLEAST_ONCE)
+            throw new IllegalArgumentException("the tsdb sink runs only with --processing-guarantees ATLEAST_ONCE (the "
+                    + "default), not " + g + (g == ProcessingGuarantees.EFFECTIVELY_ONCE
+                            ? " (its cumulative acknowledgements could take messages off Pulsar before tsdb has them)"
+                            : g == ProcessingGuarantees.ATMOST_ONCE
+                                    ? " (it acknowledges messages before tsdb has them)" : "")
+                    + ": tsdb writes are idempotent (one value per series and time, the last written), so a "
+                    + "redelivered message changes nothing and ATLEAST_ONCE loses nothing");
         boolean ordered = rc != null && (Boolean.TRUE.equals(rc.getRetainOrdering())
                 || Boolean.TRUE.equals(rc.getRetainKeyOrdering()));
         boolean runtimeDeadLetter = rc != null && rc.getDeadLetterTopic() != null && !rc.getDeadLetterTopic().isEmpty();

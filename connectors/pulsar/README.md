@@ -93,13 +93,15 @@ array of points, or one series with arrays: `{"series": "s", "ts": [1, 2],
    wait in the sink for hours. An ack timeout would deliver them again meanwhile,
    and the copy, queued behind newer messages of its key, would overwrite their
    values. The sink refuses to start with one.
-5. **Keep the processing guarantee at `ATLEAST_ONCE`** (the default). With
-   `EFFECTIVELY_ONCE` Pulsar acknowledges cumulatively: acknowledging a later
-   message (one the selection skips, or one whose connection was faster) would
-   also take earlier messages off Pulsar that tsdb does not have yet, and a
-   crash would lose them. The sink refuses to start with it. Nothing is gained
-   by it anyway: tsdb keeps the last value written per series and time, so a
-   message delivered twice changes nothing.
+5. **Keep the processing guarantee at `ATLEAST_ONCE`** (the default); the
+   sink refuses to start with any other. With `EFFECTIVELY_ONCE` Pulsar
+   acknowledges cumulatively: acknowledging a later message (one the selection
+   skips, or one whose connection was faster) would also take earlier messages
+   off Pulsar that tsdb does not have yet, and a crash would lose them. With
+   `ATMOST_ONCE` Pulsar acknowledges a message before tsdb has it. Nothing is
+   gained by either: tsdb confirms only what is on disk and keeps the last value
+   written per series and time, so a message delivered twice changes nothing,
+   and at-least-once loses nothing.
 
 Note: the Pulsar 5.0 announcement says the v4 subscription types (Shared,
 Key_Shared, Failover, Exclusive) remain supported next to scalable topics;
