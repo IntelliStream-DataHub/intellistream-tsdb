@@ -210,6 +210,8 @@ static void *helper_main(void *a)
     helper *h = a;
     sched *s = h->s;
     is_helper_thread = true;
+    /* Named for top -H and for tests that count the helpers (test_sched's test_volumes). */
+    pthread_setname_np(pthread_self(), "tsdb-query");
     pthread_mutex_lock(&s->m);
     for (;;) {
         if (s->stop)

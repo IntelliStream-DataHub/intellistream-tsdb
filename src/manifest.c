@@ -655,6 +655,7 @@ void *follower_main(void *arg)
 {
     eng *db = arg;
     int ms = db->opt.refresh_ms > 0 ? db->opt.refresh_ms : 100, last = 0;
+    pthread_setname_np(pthread_self(), "tsdb-follow");
     pthread_mutex_lock(&db->buf_lock);
     while (!db->follower_stop) {
         struct timespec ts;

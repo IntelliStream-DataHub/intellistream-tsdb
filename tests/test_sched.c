@@ -481,14 +481,40 @@ static void test_reopen(void)
     sched_free(s);
 }
 
-static int count_threads(void)
+/* Threads of this process whose name starts with `name` (the engine names its threads tsdb-query, tsdb-flush, ...).
+ * Counting every thread in /proc/self/task was flaky: pthread_join returns once the kernel clears the thread's tid,
+ * before the task leaves /proc/self/task, and under load a joined thread stayed listed through a whole tsdb_open
+ * (7 threads started and 3 for 8 and 3). So the test counts by name, waits for the threads of an earlier open to
+ * leave, and waits for new ones to name themselves (a thread sets its name when it first runs). */
+static int count_threads(const char *name)
 {
     DIR *d = opendir("/proc/self/task");
     int n = 0;
-    for (struct dirent *e; d && (e = readdir(d));)
-        n += e->d_name[0] != '.';
+    for (struct dirent *e; d && (e = readdir(d));) {
+        if (e->d_name[0] == '.')
+            continue;
+        char path[300], comm[32] = "";
+        snprintf(path, sizeof path, "/proc/self/task/%s/comm", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f)
+            continue; /* gone since the readdir */
+        if (fgets(comm, sizeof comm, f))
+            n += strncmp(comm, name, strlen(name)) == 0;
+        fclose(f);
+    }
     if (d)
         closedir(d);
+    return n;
+}
+
+/* Waits up to 10 s for the count of `name` threads to reach `want` from either side, and returns it. */
+static int await_threads(const char *name, int want)
+{
+    int n = count_threads(name);
+    for (int i = 0; n != want && i < 10000; i++) {
+        usleep(1000);
+        n = count_threads(name);
+    }
     return n;
 }
 
@@ -512,17 +538,22 @@ static void test_volumes(const char *base)
     OK(tsdb_volume_add(db, v1, &vi));
     OK(tsdb_volume_add(db, v2, &vi));
     OK(tsdb_close(db));
-    int before = count_threads();
-    o.query_threads = 1; /* the threads every volume has besides (WAL sync, ...) */
+    CHECK(await_threads("tsdb-", 0) == 0); /* also the helpers of the tests before */
+    o.query_threads = 1;                   /* no helpers; the flusher every volume has besides */
     OK(tsdb_open(dir, &o, &db));
-    int base_threads = count_threads() - before;
+    int flushers = await_threads("tsdb-flush", 3);
+    int base_helpers = count_threads("tsdb-query");
     OK(tsdb_close(db));
+    CHECK(await_threads("tsdb-", 0) == 0);
     o.query_threads = 6;
     OK(tsdb_open(dir, &o, &db));
-    int during = count_threads() - before;
+    int helpers = await_threads("tsdb-query", 5);
+    int during = await_threads("tsdb-", 8);
     OK(tsdb_close(db));
-    fprintf(stderr, "  3 volumes, query_threads 6: %d threads started, %d with query_threads 1\n", during, base_threads);
-    CHECK(during - base_threads == 5);
+    fprintf(stderr, "  3 volumes, query_threads 6: %d helpers (%d threads), %d with query_threads 1 (%d flushers)\n",
+            helpers, during, base_helpers, flushers);
+    CHECK(flushers == 3 && base_helpers == 0);
+    CHECK(helpers == 5 && during == 8);
     CHECK(system(cmd) == 0);
 }
 

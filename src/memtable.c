@@ -893,6 +893,7 @@ int mt_flush(eng *db)
 void *flusher_main(void *arg)
 {
     eng *db = arg;
+    pthread_setname_np(pthread_self(), "tsdb-flush");
     pthread_mutex_lock(&db->buf_lock);
     while (!db->flusher_stop) {
         int64_t interval = db->opt.flush_interval_ms > 0 ? db->opt.flush_interval_ms : 1000;
