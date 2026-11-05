@@ -172,4 +172,18 @@ u drop rt/a && u drop rt/b || fail "drop rt/a, rt/b"
 "$B/tsdb" "$dir/db" create s1 >/dev/null || fail "a database in the directory of USERS"
 u list | grep -q root || fail "list beside a database"
 
+# as root on a directory another user owns, with links planted there (tests/test_cli_root.sh): in a user namespace
+# where this user is root (podman unshare), or directly when this is root
+mkdir "$dir/root" && cp "$B/tsdb" "$dir/root/tsdb" && chmod 755 "$dir" "$dir/root" "$dir/root/tsdb"
+if ! command -v setpriv > /dev/null; then
+    echo "test_cli_users: the root cases are skipped: no setpriv"
+elif [ "$(id -u)" = 0 ]; then
+    bash tests/test_cli_root.sh "$dir/root/tsdb" "$dir/root/s" || fail "the root cases"
+elif command -v podman > /dev/null && podman unshare true 2> /dev/null; then
+    podman unshare bash tests/test_cli_root.sh "$dir/root/tsdb" "$dir/root/s" || fail "the root cases"
+    podman unshare rm -rf "$dir/root" # files of another uid of the namespace
+else
+    echo "test_cli_users: the root cases are skipped: not root, and no podman unshare"
+fi
+
 [ "$errors" = 0 ] && echo "test_cli_users: ok" || { echo "test_cli_users: $errors failures" >&2; exit 1; }

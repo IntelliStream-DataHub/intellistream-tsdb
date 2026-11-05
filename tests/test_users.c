@@ -11,7 +11,9 @@
  *    test_failstop), and power lost at every step of the CLI's add, revoke and compact (crashfs);
  *  - the findings of the first review (REVIEW1 #1-#6, #8): another file at the same inode and size, the compaction's
  *    rename-to-fsync window, failed appends cut off and no-op answers synced, revoke of implied rights and of
- *    grants not held, owner and mode of USERS, the indexed manage checks against trying every grant.
+ *    grants not held, owner and mode of USERS, the indexed manage checks against trying every grant;
+ *  - secrel cli #1: USERS and USERS.compact as symbolic links (dangling or not) and hard links write, create and
+ *    chmod nothing outside the directory (tests/test_cli_root.sh runs the CLI as root against the same).
  *
  *   ./build/test_users [scratch dir]
  */
@@ -112,16 +114,22 @@ int fsync(int fd)
 static uid_t fake_euid = (uid_t)-1;
 uid_t geteuid(void) { return fake_euid != (uid_t)-1 ? fake_euid : (uid_t)syscall(SYS_geteuid); }
 
-int rename(const char *a, const char *b)
+int renameat(int ad, const char *a, int bd, const char *b)
 {
     if (f_op == F_RENAME) {
         f_op = 0, f_fired++;
         errno = EIO;
         return -1;
     }
-    int r = (int)syscall(SYS_renameat, AT_FDCWD, a, AT_FDCWD, b);
-    if (r == 0 && after_rename)
-        after_rename(b);
+    int r = (int)syscall(SYS_renameat, ad, a, bd, b);
+    if (r == 0 && after_rename) {
+        char link[64], to[4200];
+        snprintf(link, sizeof link, "/proc/self/fd/%d", bd);
+        ssize_t n = bd == AT_FDCWD || b[0] == '/' ? 0 : readlink(link, to, sizeof to - 1);
+        to[n > 0 ? n : 0] = '\0';
+        snprintf(to + strlen(to), sizeof to - strlen(to), "%s%s", n > 0 ? "/" : "", b);
+        after_rename(to);
+    }
     return r;
 }
 
@@ -1574,7 +1582,8 @@ static int probe_locked = -1;
 
 static void probe_lock(const char *to)
 {
-    if (!probe_path || strcmp(to, probe_path) != 0)
+    size_t n = strlen(to);
+    if (!probe_path || n < 6 || strcmp(to + n - 6, "/USERS") != 0) /* to: through /proc, the scratch dir resolved */
         return;
     int fd = open(to, O_RDWR | O_CLOEXEC);
     struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET};
@@ -1787,6 +1796,96 @@ static void permissions(void)
            g != (gid_t)-1 ? "tested" : "not tested: no second group");
 }
 
+/* The file at path holds exactly text and has mode m (a victim a link in the directory points at). */
+static bool file_is(const char *path, const char *text, mode_t m)
+{
+    char buf[256];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t n = fd >= 0 ? read(fd, buf, sizeof buf) : -1;
+    if (fd >= 0)
+        close(fd);
+    return n == (ssize_t)strlen(text) && memcmp(buf, text, (size_t)n) == 0 && mode_of(path) == m;
+}
+
+static void put_victim(const char *path)
+{
+    unlink(path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    CHECK(fd >= 0 && write(fd, "victim\n", 7) == 7 && fchmod(fd, 0644) == 0);
+    if (fd >= 0)
+        close(fd);
+}
+
+/* secrel cli #1: whoever can write the directory puts a symbolic link or a hard link where USERS or USERS.compact
+ * goes. No file outside the directory is created, written or chmodded (a writer as root would also chown it): a
+ * link named USERS is refused by readers and writers, a hard link too, and a compaction unlinks whatever has its
+ * new file's name and makes its own. tests/test_cli_users.sh runs the CLI as root against the same links. */
+static void links(void)
+{
+    char dir[600], out[600], path[700], tmp[720], victim[700], absent[700];
+    fresh("links", dir, sizeof dir);
+    fresh("links-out", out, sizeof out);
+    snprintf(path, sizeof path, "%s/USERS", dir);
+    snprintf(tmp, sizeof tmp, "%s.compact", path);
+    snprintf(victim, sizeof victim, "%s/victim", out);
+    snprintf(absent, sizeof absent, "%s/absent", out);
+    user_verifier v = verifier("pw");
+    users w, r;
+    int rc;
+    for (int dangling = 0; dangling < 2; dangling++) {
+        put_victim(victim);
+        CHECK(symlink(dangling ? absent : victim, path) == 0);
+        rc = users_open(&r, dir, false);
+        CHECK(rc == TSDB_ERR_IO);
+        users_close(&r);
+        rc = users_open(&w, dir, true);
+        if (rc == 0)
+            rc = users_create(&w, 0, "root", USER_SUPERUSER, &v, NULL);
+        CHECK(rc == TSDB_ERR_IO);
+        users_close(&w);
+        CHECK(access(absent, F_OK) != 0);
+        CHECK(file_is(victim, "victim\n", 0644));
+        CHECK(unlink(path) == 0);
+    }
+    /* a hard link (to a file of this user's own; root's would be chowned too): refused, mode and bytes kept */
+    put_victim(victim);
+    CHECK(link(victim, path) == 0);
+    rc = users_open(&r, dir, false);
+    CHECK(rc == TSDB_ERR_IO);
+    users_close(&r);
+    rc = users_open(&w, dir, true);
+    if (rc == 0)
+        rc = users_create(&w, 0, "root", USER_SUPERUSER, &v, NULL);
+    CHECK(rc == TSDB_ERR_IO);
+    users_close(&w);
+    CHECK(file_is(victim, "victim\n", 0644));
+    CHECK(unlink(path) == 0);
+    /* USERS.compact a link to an existing file, then to a missing one: the compaction makes its own file */
+    OK(users_open(&w, dir, true));
+    OK(users_create(&w, 0, "root", USER_SUPERUSER, &v, NULL));
+    for (int dangling = 0; dangling < 2; dangling++) {
+        put_victim(victim);
+        CHECK(symlink(dangling ? absent : victim, tmp) == 0);
+        OK(users_compact(&w));
+        CHECK(access(absent, F_OK) != 0);
+        CHECK(file_is(victim, "victim\n", 0644));
+        struct stat st;
+        CHECK(lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1 && (st.st_mode & 0777) == 0600);
+        CHECK(lstat(tmp, &st) != 0 && errno == ENOENT);
+    }
+    /* and a hard link there: unlinked, the other name keeps its bytes and mode */
+    put_victim(victim);
+    CHECK(link(victim, tmp) == 0);
+    OK(users_compact(&w));
+    CHECK(file_is(victim, "victim\n", 0644));
+    users_close(&w);
+    OK(users_open(&r, dir, false));
+    CHECK(users_find(&r, "root") != NULL);
+    users_close(&r);
+    cleanup(dir), cleanup(out);
+    printf("  USERS and USERS.compact as symbolic or hard links: refused or replaced, nothing outside written\n");
+}
+
 /* ------------------------------------------------------- power loss */
 
 static char cli[PATH_MAX], shim[PATH_MAX];
@@ -1950,6 +2049,7 @@ int main(int argc, char **argv)
     unsynced_state();
     revoke_rules();
     permissions();
+    links();
     power_loss();
     if (failures) {
         fprintf(stderr, "test_users: %d failures\n", failures);

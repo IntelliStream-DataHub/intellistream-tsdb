@@ -63,6 +63,7 @@ typedef struct user {
 typedef struct users {
     char dir[4096], path[4200];
     bool writable;
+    int dfd;         /* dir, opened once: USERS and USERS.compact are reached through it, never through a symlink */
     int fd;          /* USERS, open for appending and its lock; -1 until a change needs it */
     dev_t dev;       /* the file read so far, and how far (whole records) */
     ino_t ino;

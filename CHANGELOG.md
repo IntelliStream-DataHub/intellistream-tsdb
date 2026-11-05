@@ -39,6 +39,18 @@ disk format and the wire protocol.
   same; only float sums (float32 and float64, summed in doubles per granule), variances and TWA areas can differ
   in the last bits.
 
+### Security
+- `tsdb <dir> ...` run as root on a directory another user owns no longer follows links that user planted there
+  (release security review): `user add` through a dangling `USERS` link created any file (`/etc/ld.so.preload`)
+  and gave it to the directory's owner, `user compact` through a `USERS.compact` link overwrote and chowned any
+  file (`/etc/shadow`), and even `user list` chmodded the file a `USERS` link named. As root, every command now
+  first becomes the directory's owner and group for good (setgroups, setgid, setuid; it says so in one line and
+  refuses when root could come back); a directory of root's keeps root. Files named on the command line
+  (`--password-file`, `export -o`, `import FILE`) are then opened as that user. `USERS` and `USERS.compact` are
+  opened through the directory's descriptor with `O_NOFOLLOW` (tsdbd's reads too), `USERS.compact` is made new
+  with `O_EXCL` after unlinking whatever had the name, and a `USERS` that is not a regular file or has a second
+  name (a hard link) is refused before any chown or chmod.
+
 ## [0.9.0] - 2026-11-04
 
 The first release. **Disk format version 8, wire protocol version 12** (the server and the clients refuse a peer
