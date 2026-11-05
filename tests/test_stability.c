@@ -170,10 +170,10 @@ static pid_t spawn(const char *dir, int port, const char *extra1, const char *ex
         const char *io = getenv("TSDBD_IO"); /* the event loop backend: make test runs uring and epoll */
         if (io)
             execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--port-file", spawn_pf, "--workers", "4", "--no-auth",
-                  "--io", io, extra1, extra2, (char *)NULL);
+                  "--exit-with-parent", "--io", io, extra1, extra2, (char *)NULL);
         else
             execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--port-file", spawn_pf, "--workers", "4", "--no-auth",
-                  extra1, extra2, (char *)NULL);
+                  "--exit-with-parent", extra1, extra2, (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 16; i++)

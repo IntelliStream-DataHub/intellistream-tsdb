@@ -92,7 +92,9 @@ impl Server {
             .arg(&dir)
             .args(["--port", "0", "--port-file"])
             .arg(&pf)
-            .args(["--no-fsync", "--workers", "4"])
+            // --exit-with-parent: the server stops once this test process is gone (killed by a timeout); it
+            // watches the process, not the thread that spawned it, which may end first
+            .args(["--no-fsync", "--workers", "4", "--exit-with-parent"])
             .args(if auth { &[][..] } else { &["--no-auth"][..] })
             .stdin(Stdio::null())
             .stdout(Stdio::null())

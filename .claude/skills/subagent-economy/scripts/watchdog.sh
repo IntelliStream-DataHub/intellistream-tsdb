@@ -11,9 +11,24 @@
 # container's cgroup) shows 0%, so STALLED is a lead to check, not a verdict. The script only reads /proc and the
 # run directories; deciding what to do is the job of the watchdog agent (.claude/agents/job-watchdog.md, skill
 # .claude/skills/job-watchdog/SKILL.md).
+# Also one line per orphaned server, a process named in WATCHDOG_ORPHANS (default tsdbd) whose parent is gone
+# (reparented to init, or to the user's systemd as subreaper) and whose --dir is under /var/tmp or /tmp:
+#   LOOK orphan tsdbd pid N (ppid 1, dir D, age T)   the server of a test or benchmark killed without stopping it
+# (on 2026-11-05 six ran 17 h holding io_uring rings until jepsen could not create one). Harnesses pass
+# --exit-with-parent, so one of these is a harness without it, an old tree, or a server stopping right now.
 . "$(dirname "$(readlink -f "$0")")/se-env.sh"
 STALL_MIN=${1:-45}; PATTERN=${2:-}
 L=${BENCH_LOCK:-$SE_HOME/BENCH.lock}
+
+for name in ${WATCHDOG_ORPHANS-tsdbd}; do
+    for p in $(pgrep -u "$(id -u)" -x "$name"); do
+        pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$pp" ] || continue
+        [ "$pp" = 1 ] || [ "$(ps -o comm= -p "$pp" 2>/dev/null)" = systemd ] || continue
+        d=$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | sed -n '/^--dir$/{n;p;q}')
+        case "$d" in /var/tmp/* | /tmp/*) ;; *) continue ;; esac
+        echo "LOOK orphan $name pid $p (ppid $pp, dir $d, age $(ps -o etime= -p "$p" 2>/dev/null | tr -d ' '))"
+    done
+done
 now=$(date +%s)
 ticks=$(getconf CLK_TCK)
 

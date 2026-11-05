@@ -155,7 +155,7 @@ start_server() { # fresh data directory unless $1 = keep
     [ "${1:-}" = keep ] || rm -rf "$SRV"
     local pf=$OUT/tsdbd.port
     rm -f "$pf"
-    "$B/tsdbd" --dir "$SRV" --no-auth --port "$REQ_PORT" --port-file "$pf" >>"$OUT/tsdbd.log" 2>&1 &
+    "$B/tsdbd" --dir "$SRV" --no-auth --port "$REQ_PORT" --port-file "$pf" --exit-with-parent >>"$OUT/tsdbd.log" 2>&1 &
     SPID=$!
     for _ in $(seq 300); do
         kill -0 "$SPID" 2>/dev/null || { echo "tsdbd died, see $OUT/tsdbd.log" >&2; exit 1; }

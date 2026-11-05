@@ -1664,6 +1664,18 @@ login a connection holds at most two frames of 4 KiB (`TSDB_PRELOGIN_MAX`) and
 is closed after `--login-timeout` seconds (default 10), so an anonymous client
 cannot.
 
+**A test's server ends with its test.** With `--exit-with-parent` tsdbd notes
+its parent process at start (and refuses to start, status 2, if the parent is
+already gone) and, on the same once-a-second tick that enforces
+`--frame-timeout`, stops as on SIGTERM when `getppid()` has changed: one log
+line, requests in progress finish, the memtable is flushed, status 0. Every
+harness that starts tsdbd passes it, so a test killed by a timeout leaves no
+server behind (six such servers once held their io_uring rings for 17 hours,
+until a later run could not create one). It is a parent check rather than
+`PR_SET_PDEATHSIG`, which fires when the spawning *thread* exits: the Rust,
+Java and Python tests start servers from threads that end while the test goes
+on. A server run by a supervisor does not pass it.
+
 **Login and access control** ([design-auth.md](design-auth.md) has the
 decisions). A client logs in right after HELLO with SCRAM-SHA-256 in
 PostgreSQL's message flow (`AUTH_START`, `AUTH_CONTINUE`); the server keeps per

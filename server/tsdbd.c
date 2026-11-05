@@ -56,6 +56,10 @@
  *
  * Signals: SIGTERM and SIGINT stop it cleanly (requests in progress finish,
  * the memtable is flushed, exit status 0); SIGHUP and SIGPIPE are ignored.
+ * With --exit-with-parent it stops the same way once its parent process is gone: a test's server must not outlive
+ * the test (killed tests left servers holding io_uring rings for hours). The tick compares getppid() with the
+ * parent at start; not PR_SET_PDEATHSIG, which fires when the spawning thread ends, and Rust, Java and Python
+ * tests start servers from threads that end while the test goes on.
  *
  * Fail-stop: when a storage error puts the database in its failed state
  * (tsdb_failed: a failed WAL write or fsync and the like, after which it is
@@ -293,6 +297,7 @@ static void *worker_main(void *arg);
 static size_t req_budget = (size_t)1024 << 20; /* at least; main raises it to an eighth of the RAM */
 static atomic_size_t req_held;
 static int frame_timeout_s = 60;
+static pid_t start_ppid; /* --exit-with-parent: the parent at start; 0 without the flag */
 static int login_timeout_s = 10; /* --login-timeout */
 
 static size_t request_memory_now(void)
@@ -2341,6 +2346,13 @@ static void on_tick(void)
     int64_t now = mono_s();
     static int64_t logged;
     static int64_t login_logged;
+    if (start_ppid && getppid() != start_ppid && !stopping) { /* reparented: the parent is gone */
+        fprintf(stderr, "tsdbd: --exit-with-parent: parent %d exited, stopping\n", (int)start_ppid);
+        stopping = 1; /* as SIGTERM: the loop ends, requests in progress finish, the memtable is flushed */
+        uint64_t one = 1;
+        if (write(wake_fd, &one, 8) != 8) {
+        }
+    }
     for (conn *c = conns, *next; c; c = next) {
         next = c->next;
         if (!c->closed && !atomic_load(&c->authed) && now - c->t_open >= login_timeout_s) {
@@ -2861,6 +2873,7 @@ int main(int argc, char **argv)
                                    {"version", no_argument, 0, 'v'},
                                    {"no-auth", no_argument, 0, 'A'},
                                    {"login-timeout", required_argument, 0, 'O'},
+                                   {"exit-with-parent", no_argument, 0, 'E'},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0, no_auth = 0;
     const char *metrics_addr = NULL;
@@ -2913,6 +2926,13 @@ int main(int argc, char **argv)
         case 'U': multi_max_rows = (uint64_t)num_arg("multi-max-rows", optarg, 1, LLONG_MAX); break;
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'A': no_auth = 1; break;
+        case 'E':
+            start_ppid = getppid();
+            if (start_ppid == 1) { /* the parent is gone already (or never was one to follow) */
+                fprintf(stderr, "tsdbd: --exit-with-parent: the parent has already exited\n");
+                return 2;
+            }
+            break;
         case 'O': login_timeout_s = (int)num_arg("login-timeout", optarg, 1, 86400); break;
         case 'X': req_budget = (size_t)num_arg("max-request-memory", optarg, 1, (long long)1 << 24) << 20; break;
         case 'I':
@@ -2941,7 +2961,7 @@ int main(int argc, char **argv)
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
                         "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
-                        "             [--no-auth] [--login-timeout 10]\n",
+                        "             [--no-auth] [--login-timeout 10] [--exit-with-parent]\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }

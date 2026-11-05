@@ -178,7 +178,8 @@ class Server:
     def start(self):
         pf = Path(str(self.log) + ".port.%d" % time.monotonic_ns())
         cmd = [str(self.ctx.tsdbd), "--dir", str(self.dir), "--listen", "127.0.0.1", "--port", "0",
-               "--port-file", str(pf), "--workers", "4", "--io", self.io] + ([] if self.ctx.auth else ["--no-auth"]) + \
+               "--port-file", str(pf), "--workers", "4", "--io", self.io, "--exit-with-parent"] + \
+              ([] if self.ctx.auth else ["--no-auth"]) + \
               (["--follow", "--refresh-ms", "100"] if self.follow else []) + self.extra
         logf = open(self.log, "ab")
         logf.write(("$ " + " ".join(cmd) + "\n").encode())

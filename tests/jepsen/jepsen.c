@@ -380,6 +380,7 @@ static void start_server(bool faulty)
             const char *av[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "8",
                                   "--wal-max-batch-rows", "500", "--partition-ms", pms};
             int ac = 13;
+            av[ac++] = "--exit-with-parent"; /* a killed run leaves no server behind */
             if (!auth)
                 av[ac++] = "--no-auth";
             if (classes) {
@@ -479,6 +480,7 @@ static void start_follower(void)
             dup2(log, 2);
         const char *av[16] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--follow"};
         int ac = 10;
+        av[ac++] = "--exit-with-parent";
         if (!auth)
             av[ac++] = "--no-auth";
         if (getenv("TSDBD_IO"))

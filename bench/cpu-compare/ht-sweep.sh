@@ -73,7 +73,7 @@ for ((r = 1; r <= ROUNDS; r++)); do
     if [ "$SERVER" = 1 ]; then
         for q in $qs; do
             PF=$O/port; rm -f "$PF"
-            "$B/tsdbd" --dir "$DB" --no-auth --port 0 --port-file "$PF" --query-threads "$q" >"$O/srv.q$q.$r" 2>&1 &
+            "$B/tsdbd" --dir "$DB" --no-auth --port 0 --port-file "$PF" --exit-with-parent --query-threads "$q" >"$O/srv.q$q.$r" 2>&1 &
             pid=$!
             for _ in $(seq 100); do [ -s "$PF" ] && break; sleep 0.1; done
             read -r port fpid _ <"$PF"

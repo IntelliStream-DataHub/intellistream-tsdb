@@ -91,6 +91,7 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
         const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-auth",
                                 "--no-fsync"};
         int n = eio_mark ? 10 : 11; /* under the shim, syncs are what make data survive its rollback at exit */
+        argv[n++] = "--exit-with-parent"; /* a killed test leaves no server behind */
         if (getenv("TSDBD_IO")) { /* the event loop backend: make test runs uring and epoll */
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
@@ -2961,7 +2962,7 @@ static void test_hostile(const char *dir)
             if (symlink(target, tmp) != 0)
                 _exit(126);
             execl(bin, "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--no-fsync", "--no-auth",
-                  (char *)NULL);
+                  "--exit-with-parent", (char *)NULL);
             _exit(127);
         }
         int p = th_await(pf, pid, 30000);

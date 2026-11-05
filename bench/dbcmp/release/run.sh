@@ -356,6 +356,8 @@ tsdbd_start() { # DIR [ARGS]: tsdbd on --port 0 --port-file; sets TPID and TSDB_
     # a tsdbd with login refuses to start without a superuser in USERS; the comparison measures it without login,
     # as the older trees it also runs (which have no --no-auth) are measured
     "$T/tsdbd" --help 2>&1 | grep -q -- '--no-auth' && na=(--no-auth)
+    # and it stops by itself once this script is gone (killed by a timeout), where the tree has the flag
+    "$T/tsdbd" --help 2>&1 | grep -q -- '--exit-with-parent' && na+=(--exit-with-parent)
     # shellcheck disable=SC2046
     $(tsdbd_memwrap) ${TSDBD_WRAP:-} "$T/tsdbd" --dir "$d" "${na[@]}" --listen 127.0.0.1 --port 0 --port-file "$d.pf" "$@" > "$d.log" 2>&1 9>&- &
     TPID=$!

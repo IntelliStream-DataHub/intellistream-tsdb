@@ -375,6 +375,9 @@ start_server() {
     local flags=(--wal-sync-ms 10 "$@")
     b=$(tree_b "$(cfg_tree "$cfg")")
     [ "$cfg" = noauth ] && flags+=(--no-auth)
+    # stops by itself once this script is gone (killed by a timeout); a tree older than the flag lacks it
+    # (--help exits 2: no pipe, which pipefail would call failed)
+    grep -q -- '--exit-with-parent' <<<"$("$b/tsdbd" --help 2>&1)" && flags+=(--exit-with-parent)
     rm -f "$d/port"
     "$b/tsdbd" --dir "$d/db" --listen 127.0.0.1 --port 0 --port-file "$d/port" "${flags[@]}" >"$d/log" 2>&1 &
     SRV_PID=$!

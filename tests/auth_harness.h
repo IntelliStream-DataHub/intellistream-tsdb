@@ -76,6 +76,7 @@ static inline pid_t spawn(const char *dir, const char *const *extra, char *pf, s
             dup2(fd, 2);
         const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--no-fsync"};
         int n = 10;
+        argv[n++] = "--exit-with-parent"; /* a killed test leaves no server behind */
         if (getenv("TSDBD_IO")) {
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");

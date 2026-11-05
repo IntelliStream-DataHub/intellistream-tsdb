@@ -3,7 +3,8 @@
  * Two servers started at once get different ports and each port file names its own server; a server that cannot
  * start (a taken port, a bad directory, an unwritable port file) is reported as such and the harness never
  * connects to whoever holds the port; a port file that names another process, or a port another process holds,
- * is refused. Usage: test_ports [scratch directory, default /tmp]. */
+ * is refused. A server started with --exit-with-parent stops cleanly once the process that started it is killed;
+ * one without the flag keeps running. Usage: test_ports [scratch directory, default /tmp]. */
 #define _GNU_SOURCE
 #include "tsdb.h"
 #include "tsdb_client.h"
@@ -16,6 +17,8 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 
 static int failures;
@@ -35,17 +38,18 @@ static void sig(pid_t pid, int s)
         kill(pid, s);
 }
 
-/* tsdbd with the given arguments (NULL-terminated), stderr to /dev/null */
-static pid_t spawn(const char *const *args)
+/* tsdbd with the given arguments (NULL-terminated), stderr to `log` (NULL: /dev/null); --exit-with-parent unless
+ * `orphan_ok` */
+static pid_t spawn_with(const char *const *args, const char *log, bool orphan_ok)
 {
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
     pid_t pid = fork();
     if (pid == 0) {
-        int dn = open("/dev/null", O_WRONLY);
+        int dn = log ? open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644) : open("/dev/null", O_WRONLY);
         if (dn >= 0)
             dup2(dn, 2);
-        const char *argv[32] = {"tsdbd", "--no-auth"};
-        int n = 2;
+        const char *argv[32] = {"tsdbd", "--no-auth", "--exit-with-parent"};
+        int n = orphan_ok ? 2 : 3;
         for (int i = 0; args[i] && n < 31; i++)
             argv[n++] = args[i];
         argv[n] = NULL;
@@ -54,6 +58,8 @@ static pid_t spawn(const char *const *args)
     }
     return pid;
 }
+
+static pid_t spawn(const char *const *args) { return spawn_with(args, NULL, false); }
 
 static bool serves(int port)
 {
@@ -128,6 +134,132 @@ static void put(const char *path, const char *text)
         fputs(text, f);
         fclose(f);
     }
+}
+
+static bool has_line(const char *path, const char *text)
+{
+    char line[1024];
+    bool found = false;
+    FILE *f = fopen(path, "r");
+    while (f && !found && fgets(line, sizeof line, f))
+        found = strstr(line, text) != NULL;
+    if (f)
+        fclose(f);
+    return found;
+}
+
+static uint64_t rows_of(int port, const char *name)
+{
+    tsdbc *c;
+    uint64_t n = UINT64_MAX;
+    if (tsdbc_connect("127.0.0.1", port, &c) != 0)
+        return n;
+    tsdb_sid id;
+    tsdb_bucket *b = NULL;
+    size_t nb = 0;
+    if (tsdbc_series(c, name, 0, &id) == 0 && tsdbc_query_agg(c, id, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0)
+        n = nb ? b[0].count : 0;
+    free(b);
+    tsdbc_close(c);
+    return n;
+}
+
+/* --exit-with-parent: a test killed by a timeout used to leave its server running under init for hours, holding an
+ * io_uring ring. A middle process starts tsdbd (with or without the flag), the test writes rows through it and then
+ * SIGKILLs the middle process. This process is a subreaper meanwhile, so the orphan is reparented here (its
+ * getppid() changes exactly as it would to init) and its exit status can be read. With the flag the server stops
+ * within a few seconds with status 0 (as on SIGTERM: one log line, the memtable flushed) and a new server on the
+ * directory has every row; without it the server keeps serving until it is stopped here, by pid. */
+static void orphan(bool flag)
+{
+    char d[600], pf[700], log[700];
+    snprintf(d, sizeof d, "%s/ports-%d-orphan%d", base, (int)getpid(), (int)flag);
+    snprintf(log, sizeof log, "%s.log", d);
+    rmrf(d);
+    th_portfile(pf, sizeof pf, d);
+    unlink(pf);
+    CHECK(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+    pid_t mid = fork();
+    if (mid == 0) {
+        const char *a[] = {"--dir", d, "--port", "0", "--port-file", pf, "--workers", "2", "--no-fsync", NULL};
+        pid_t s = spawn_with(a, log, !flag);
+        if (th_await(pf, s, 30000) <= 0) {
+            fputs(th_why, stderr);
+            sig(s, SIGKILL);
+            _exit(1);
+        }
+        for (;;)
+            pause();
+    }
+    int port = 0, srv = 0;
+    for (int waited = 0; waited < 30000 && mid > 0; waited += 5) {
+        if (waitpid(mid, NULL, WNOHANG) == mid) {
+            mid = 0; /* the server did not start (a tsdbd without the flag refuses it: status 2) */
+            break;
+        }
+        FILE *f = fopen(pf, "r");
+        int n = f ? fscanf(f, "%d %d", &port, &srv) : 0;
+        if (f)
+            fclose(f);
+        if (n == 2 && port > 0 && srv > 0 && th_owns_port(srv, port))
+            break;
+        port = srv = 0;
+        usleep(5000);
+    }
+    CHECK(port > 0 && srv > 0 && srv != mid);
+    if (port > 0 && srv > 0) {
+        tsdbc *c = NULL;
+        tsdb_sid id = TSDB_SID_NONE;
+        int64_t ts[1000];
+        float v[1000];
+        for (int i = 0; i < 1000; i++) {
+            ts[i] = 1700000000000LL + i * 1000;
+            v[i] = (float)i;
+        }
+        CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "o", 1, &id) == 0 &&
+              tsdbc_insert_series(c, id, ts, v, 1000) == 0);
+        if (c)
+            tsdbc_close(c);
+    }
+    if (mid > 0) {
+        sig(mid, SIGKILL); /* the test's parent dies: the server is an orphan now */
+        waitpid(mid, NULL, 0);
+    }
+    if (srv > 0) {
+        int st = 0;
+        pid_t r = 0;
+        for (int waited = 0; waited < (flag ? 10000 : 3000) && (r = waitpid(srv, &st, WNOHANG)) == 0; waited += 10)
+            usleep(10000);
+        if (flag) {
+            CHECK(r == srv && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+            CHECK(has_line(log, "--exit-with-parent: parent"));
+            if (r != srv) {
+                sig(srv, SIGKILL);
+                waitpid(srv, NULL, 0);
+            }
+            /* the database opens clean, with every row the orphan acknowledged */
+            const char *a[] = {"--dir", d, "--port", "0", "--port-file", pf, "--workers", "2", "--no-fsync", NULL};
+            unlink(pf); /* the orphan's own */
+            pid_t s = spawn(a);
+            int p = th_await(pf, s, 30000);
+            CHECK(p > 0);
+            if (p > 0) {
+                CHECK(rows_of(p, "o") == 1000);
+                stop(s);
+            } else {
+                fputs(th_why, stderr);
+                sig(s, SIGKILL);
+                waitpid(s, NULL, 0);
+            }
+        } else {
+            CHECK(r == 0 && serves(port)); /* still running three seconds (three ticks) later */
+            stop(srv);                     /* by its pid: it is this process's child now */
+        }
+    }
+    CHECK(prctl(PR_SET_CHILD_SUBREAPER, 0) == 0);
+    unlink(pf);
+    unlink(log);
+    rmrf(d);
 }
 
 int main(int argc, char **argv)
@@ -330,6 +462,9 @@ int main(int argc, char **argv)
         }
         rmrf(d4);
     }
+
+    orphan(true);
+    orphan(false);
 
     stop(s1);
     stop(s2);
