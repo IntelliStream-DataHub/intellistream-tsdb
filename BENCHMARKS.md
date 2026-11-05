@@ -614,16 +614,19 @@ comparing the build with access control against the same code without it (commit
 come from the login and the checks.
 
 **In short:** logging in costs nothing we can measure on queries and inserts: every change is inside the run-to-run
-noise, with 1 or 32 connections. A login costs one round trip more and, once per process, about 1.6 ms of key
+noise, with 1 or 32 connections (inserts were measured again without fsync, on a fresh database for every run: see
+below). A login costs one round trip more and, once per process, about 1.6 ms of key
 derivation (PBKDF2); a login in a fresh process takes 1.9 ms in all.
 
 **How it was measured**
 
-- **Command:** `tools/auth-bench.sh --reps 5 --seconds 3`. It builds three trees from `git archive` with the
-  Makefile's optimized flags: 3bd4e96 (the earlier main), ffa4942 (main without access control) and the auth branch
-  at f5eddd2. Only ffa4942 and the auth build appear below: the comparison with the earlier main is left for a
-  separate investigation.
-- **Seven configurations**, each with its own tsdbd and its own copy of the same database (100 series x 1 million
+- **Command:** `tools/auth-bench.sh --reps 5 --seconds 3` for queries, QUERY_MULTI and logins. It builds three trees
+  from `git archive` with the Makefile's optimized flags: 3bd4e96 (the earlier main), ffa4942 (main without access
+  control) and the auth branch at f5eddd2. Only ffa4942 and the auth build appear in those tables: the comparison
+  with the earlier main is left for a separate investigation. The inserts come from a later run, `tools/auth-bench.sh
+  --only inserts --reps 5` (10 seconds each), on two trees: ba4f6c2 (main with the QUERY_MULTI fixes, no access
+  control, the baseline there) and the auth branch with those fixes merged (4ed9f27).
+- **Seven configurations** (six in the insert run, which leaves out 3bd4e96), each with its own tsdbd and its own copy of the same database (100 series x 1 million
   rows): 3bd4e96; ffa4942; the auth build started with `--no-auth`; and the auth build with a logged-in user who
   is a superuser, or who holds 8 `prefix:` grants, 5,000 `name:` grants, or 64 `glob:` grants (the most one user may
   hold). The grants cover the series the benchmark uses.
@@ -635,10 +638,17 @@ derivation (PBKDF2); a login in a fresh process takes 1.9 ms in all.
   in the 0.7 ms the disk takes.
 - **The machine:** AMD Ryzen 9 7950X (16 cores, 32 threads), 61 GB RAM, Ubuntu 26.04.1, Linux 7.0.0-38, `performance`
   governor, ext4 on NVMe, gcc 15.2, tsdbd on io_uring. Measured on 2026-11-05.
-- **Left out:** inserts on 32 connections (their runs differed by 30 to 60%, too much to read anything from; they are
-  being measured again) and, as elsewhere on this page, whole-range questions answered from block statistics (they
-  changed by at most 3%). Every number, including those, is in
-  [bench/auth/results/2026-11-05-summary.md](bench/auth/results/2026-11-05-summary.md).
+- **Inserts without fsync, on a fresh database.** Our first insert runs, on one tsdbd for all the insert workloads
+  and with `--wal-sync-ms 10`, differed by 30 to 60% from run to run on 32 connections: the disk (84% full) and its
+  fsync and writeback latency decided, not the code. So every insert run (a workload, a configuration, a repetition)
+  now gets a fresh copy of the configuration's database and a tsdbd of its own started with `--no-fsync`, runs for 10
+  seconds, and writes timestamps no other run uses. These numbers compare the server's code, not the disk. They say
+  nothing about durable inserts. 5 runs of each, under the same exclusive lock and quiet check, all 120 finished
+  without error on a machine with 1.05 of 32 CPUs busy at the start. Measured on 2026-11-05.
+- **Left out** of the tables below, as elsewhere on this page: whole-range questions answered from block statistics
+  (they changed by at most 3%). Every number, including those, is in
+  [bench/auth/results/2026-11-05-summary.md](bench/auth/results/2026-11-05-summary.md) and, for the inserts,
+  [bench/auth/results/2026-11-05-inserts-summary.md](bench/auth/results/2026-11-05-inserts-summary.md).
 
 In the tables a cell is the mean of the 5 runs, the spread in parentheses (standard deviation in percent of the mean)
 and the change against ffa4942. The first row is ffa4942, the baseline.
@@ -691,18 +701,37 @@ included (its runs went from 19,417 to 25,613).
 In the last three tables the time-weighted column is 0.6 to 1.1% lower in every auth-build row, `--no-auth`
 included, so that small difference comes with the build and not with the login or the grants.
 
-**Inserts, 1 connection, 1,000 rows a request** (million rows per second). "One series" puts all 1,000 rows in one
-series; "a series per row" takes one row from each of 1,000 series. The second column varies a lot between runs for
-every configuration (16 to 44%), and the runs of all rows overlap; read nothing into its changes.
+**Inserts, 1,000 rows a request, without fsync, on a fresh database for every run** (million rows per second, 10
+seconds a run). "One series" puts all 1,000 rows in one series; "a series per row" takes one row from each of 1,000
+series. The change is against ba4f6c2, the first row, built from main without access control.
+
+1 connection:
 
 | configuration | one series per request | a series per row |
 |---|---:|---:|
-| ffa4942, no access control | 21.39 (1.6%) | 10.18 (37.6%) |
-| auth build, `--no-auth` | 21.15 (1.9%) -1.1% | 12.66 (18.4%) +24.4% |
-| superuser | 21.62 (0.7%) +1.1% | 13.33 (18.9%) +30.9% |
-| 8 prefix grants | 21.65 (1.2%) +1.2% | 10.81 (34.9%) +6.2% |
-| 5,000 name grants | 21.96 (0.8%) +2.7% | 11.76 (16.3%) +15.6% |
-| 64 glob grants | 21.77 (2.5%) +1.8% | 9.61 (43.8%) -5.6% |
+| ba4f6c2, no access control | 25.65 (2.8%; 24.96 to 26.78) | 13.81 (5.3%; 12.97 to 14.68) |
+| auth build, `--no-auth` | 26.06 (1.9%; 25.57 to 26.78) +1.6% | 13.16 (7.1%; 12.38 to 14.64) -4.7% |
+| superuser | 25.73 (4.7%; 25.07 to 27.88) +0.3% | 13.34 (6.1%; 12.59 to 14.70) -3.4% |
+| 8 prefix grants | 26.64 (3.3%; 26.09 to 28.18) +3.9% | 13.18 (10.0%; 11.39 to 14.73) -4.6% |
+| 5,000 name grants | 25.61 (3.7%; 24.37 to 26.36) -0.1% | 13.07 (8.9%; 12.06 to 14.65) -5.3% |
+| 64 glob grants | 26.38 (2.0%; 25.84 to 27.28) +2.8% | 13.15 (4.2%; 12.41 to 13.96) -4.7% |
+
+32 connections:
+
+| configuration | one series per request | a series per row |
+|---|---:|---:|
+| ba4f6c2, no access control | 26.03 (1.0%; 25.61 to 26.22) | 16.13 (3.7%; 15.64 to 17.18) |
+| auth build, `--no-auth` | 26.06 (1.5%; 25.56 to 26.62) +0.1% | 15.98 (1.4%; 15.73 to 16.31) -0.9% |
+| superuser | 25.98 (0.9%; 25.62 to 26.17) -0.2% | 16.39 (1.7%; 16.03 to 16.66) +1.7% |
+| 8 prefix grants | 26.03 (1.8%; 25.37 to 26.69) -0.0% | 16.26 (2.9%; 15.89 to 17.01) +0.8% |
+| 5,000 name grants | 26.05 (1.0%; 25.64 to 26.33) +0.1% | 15.79 (1.7%; 15.54 to 16.22) -2.1% |
+| 64 glob grants | 25.97 (1.1%; 25.69 to 26.40) -0.2% | 16.19 (3.9%; 15.64 to 17.01) +0.4% |
+
+The spread is now 1 to 5% for most cells (up to 10% for a series per row on 1 connection), where it was 16 to 60%.
+The only difference that stands out is a series per row on 1 connection: every auth-build row is 3 to 5% lower,
+`--no-auth` included, so it comes with the build and not with the login or the grants, and the runs of all the rows
+overlap. Everything else is within the spread. The ba4f6c2 baseline is a different commit from the one the query
+tables use (ffa4942).
 
 **Logins** (logins per second). A login here is: connect, one small request, close. In the first two rows the server
 has no access control, so there is no login step, only the connect, the request and the close. "Key cache" means the
@@ -729,8 +758,8 @@ runs every time.
 - **A new process pays for PBKDF2 once:** a login in a fresh process takes 1.9 ms in all, against 0.32 ms without
   access control; the extra 1.6 ms is mostly the key derivation. A process that keeps its key (the key cache) pays it
   once, not for each connection.
-- **Not measured:** the default durability mode (an fsync for every request) and inserts on 32 connections (being
-  measured again). The comparison with the earlier main (3bd4e96) is left for a separate investigation.
+- **Not measured:** the default durability mode (an fsync for every request; the inserts above had no fsync at all).
+  The comparison with the earlier main (3bd4e96) is left for a separate investigation.
 
 ## Reproduce it yourself
 
