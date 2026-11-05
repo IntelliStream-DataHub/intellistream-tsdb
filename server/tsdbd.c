@@ -470,7 +470,9 @@ static bool out_send(conn *c)
  * With two or more the workers send their own again: one loop thread sending for many streaming connections is
  * what capped the server (handing a batch over whenever the loop owned nobody's output, 32 connections lost 4%).
  * Only full batches go over (HANDOFF_MIN, OB_FLUSH): a smaller one (what is ready while the head is computed) costs
- * less to send than a wakeup of the loop. */
+ * less to send than a wakeup of the loop. A connection counts for its whole tsdb_query_multi, also while its worker
+ * waits for a client that does not read (OUT_WAIT): one stalled QUERY_MULTI makes another streaming one send its
+ * own batches again, slower but correct, until the stalled one ends or times out (--send-timeout). */
 static atomic_int streaming_conns;
 #define HANDOFF_MIN (64u << 10)
 
