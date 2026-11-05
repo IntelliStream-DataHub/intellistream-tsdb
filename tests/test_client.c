@@ -1,6 +1,7 @@
 /* The C client against fake servers in this process: replies out of step, a
  * reply that comes after the caller gave up, malformed name replies, a stream
- * cut short, a timeout inside a large frame, a server that hangs up, the
+ * cut short, a series whose value type changes between chunks (a heap overflow
+ * of the multi collector once), a timeout inside a large frame, a server that hangs up, the
  * keepalive defaults, and a connect that would otherwise wait for the kernel. Nothing
  * here starts tsdbd; the fake servers listen on port 0 and hand out the port
  * they got. */
@@ -474,6 +475,137 @@ static void test_values_stream_in_step(void)
     fake_stop(&f);
 }
 
+/* One QUERY_VALUES / LTTB chunk of n rows of `type` (timestamps 0 .. n-1, every value byte `fill`), after the u32
+ * index of a QUERY_MULTI series unless ix is NULL. */
+static void values_chunk(int fd, uint32_t id, const uint32_t *ix, bool last, uint8_t type, uint32_t n, uint8_t fill)
+{
+    size_t pre = ix ? TSDB_MULTI_PREFIX : 0, aw = tsdb_wire_width(type), len = pre + 8 + (size_t)n * (8 + aw);
+    uint8_t *b = calloc(len, 1);
+    if (!b)
+        return;
+    if (ix)
+        memcpy(b, ix, 4);
+    b[pre] = last;
+    b[pre + 1] = type;
+    memcpy(b + pre + 4, &n, 4);
+    for (uint32_t i = 0; i < n; i++) {
+        int64_t ts = i;
+        memcpy(b + pre + 8 + (size_t)i * 8, &ts, 8);
+    }
+    memset(b + pre + 8 + (size_t)n * 8, fill, (size_t)n * aw);
+    reply(fd, id, 0, b, len);
+    free(b);
+}
+
+static void multi_end(int fd, uint32_t id, uint32_t answered)
+{
+    uint32_t b[2] = {TSDB_MULTI_END, answered};
+    reply(fd, id, 0, b, sizeof b);
+}
+
+/* A QUERY_MULTI whose series 0 changes type between its chunks: one bool row, then 1000 float64 rows. tsdbd never
+ * sends that (a series' type is fixed at creation), but a hostile server could: the collector sized the series'
+ * buffer for 1024 bools, and the float64 rows are 8000 bytes. Then a QUERY_VALUES stream that does the same. */
+static void type_switch(int fd)
+{
+    uint8_t body[4096];
+    size_t n;
+    uint32_t id;
+    uint8_t op;
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        if (op == TSDB_OP_QUERY_MULTI) {
+            uint32_t ix = 0;
+            values_chunk(fd, id, &ix, false, TSDB_BOOL, 1, 1);
+            values_chunk(fd, id, &ix, true, TSDB_FLOAT64, 1000, 0x41);
+            multi_end(fd, id, 1);
+        } else if (op == TSDB_OP_QUERY_VALUES) {
+            values_chunk(fd, id, NULL, false, TSDB_FLOAT32, 1, 0);
+            values_chunk(fd, id, NULL, true, TSDB_FLOAT64, 4, 0x41);
+        } else {
+            uint64_t sid = 42;
+            reply(fd, id, 0, &sid, 8);
+        }
+    }
+}
+
+/* Series of different types in one QUERY_MULTI, the first in two chunks: each keeps its own type. */
+static void multi_types(int fd)
+{
+    uint8_t body[4096];
+    size_t n;
+    uint32_t id;
+    uint8_t op;
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        if (op == TSDB_OP_QUERY_MULTI) {
+            uint32_t ix = 0;
+            values_chunk(fd, id, &ix, false, TSDB_BOOL, 1, 1);
+            values_chunk(fd, id, &ix, true, TSDB_BOOL, 3, 1);
+            ix = 1;
+            values_chunk(fd, id, &ix, true, TSDB_FLOAT64, 1000, 0x41);
+            multi_end(fd, id, 2);
+        } else {
+            uint64_t sid = 42;
+            reply(fd, id, 0, &sid, 8);
+        }
+    }
+}
+
+static int values_types(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
+{
+    (void)ts;
+    (void)n;
+    *(unsigned *)ctx |= 1u << v->type;
+    return 0;
+}
+
+static void test_type_switch(void)
+{
+    tsdb_sid s[2] = {TSDB_SID(0, 0), TSDB_SID(0, 1)};
+    tsdb_multi_query q = {.kind = TSDB_MULTI_VALUES, .start = INT64_MIN, .end = INT64_MAX};
+    struct fake f;
+    tsdbc *c;
+    tsdb_sid id = 0;
+
+    /* a type switch within one series is corrupt, and the connection is broken: nothing written past a buffer */
+    fake_start(&f, type_switch);
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    tsdb_series_result *r = NULL;
+    CHECK(tsdbc_query_multi_collect(c, &q, s, 1, NULL, &r) == TSDB_ERR_CORRUPT);
+    CHECK(r == NULL);
+    tsdbc_series_results_free(r, 1);
+    CHECK(tsdbc_series(c, "x", 1, &id) == TSDB_ERR_IO);
+    tsdbc_close(c);
+    fake_stop(&f);
+
+    /* the same in a single series' stream: the callback sees the first type only */
+    fake_start(&f, type_switch);
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    unsigned seen = 0;
+    CHECK(tsdbc_query_values(c, s[0], 0, 100, NULL, values_types, &seen) == TSDB_ERR_CORRUPT);
+    CHECK(seen == 1u << TSDB_FLOAT32);
+    CHECK(tsdbc_series(c, "x", 1, &id) == TSDB_ERR_IO);
+    tsdbc_close(c);
+    fake_stop(&f);
+
+    /* series of different types, one in two chunks: collected whole, and the connection stays in step */
+    fake_start(&f, multi_types);
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    r = NULL;
+    CHECK(tsdbc_query_multi_collect(c, &q, s, 2, NULL, &r) == 0);
+    if (r) {
+        CHECK(r[0].values.type == TSDB_BOOL && r[0].n == 4 && r[0].ts[3] == 2);
+        CHECK(r[1].values.type == TSDB_FLOAT64 && r[1].n == 1000 && r[1].ts[999] == 999);
+        bool same = true;
+        for (size_t i = 0; r[1].n == 1000 && i < 8000; i++)
+            same &= ((const uint8_t *)r[1].values.values)[i] == 0x41;
+        CHECK(same);
+    }
+    tsdbc_series_results_free(r, 2);
+    CHECK(tsdbc_series(c, "x", 1, &id) == 0 && id == 42);
+    tsdbc_close(c);
+    fake_stop(&f);
+}
+
 /* The socket of the connection to port: the client keeps its fd to itself. */
 static int client_fd(int port)
 {
@@ -644,6 +776,7 @@ int main(void)
     test_stream_in_step();
     test_timeout_in_large_body();
     test_values_stream_in_step();
+    test_type_switch();
     test_peer_closed();
     test_connect_timeout();
     test_keepalive_args();

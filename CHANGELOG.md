@@ -39,6 +39,15 @@ disk format and the wire protocol.
   same; only float sums (float32 and float64, summed in doubles per granule), variances and TWA areas can differ
   in the last bits.
 
+### Fixed
+- C client: a QUERY_MULTI reply whose series changed value type between its chunks (a bool chunk, then a float64
+  one) made `tsdbc_query_multi_collect` write past the series' buffer, which it had sized by the first chunk's type:
+  a heap overflow of server-chosen length and bytes. tsdbd never sends that (a series' type is fixed), but a
+  hostile server or a man in the middle could. A chunk of another type within one series is now
+  `TSDB_ERR_CORRUPT` and breaks the connection, in multi replies and in single-series QUERY_VALUES / LTTB streams
+  alike (as the Rust and Java clients already did), and the collector refuses such rows on its own as well. The
+  local-period bucket calls no longer overflow `hi + 1` when a server reports a row at `INT64_MAX`.
+
 ## [0.9.0] - 2026-11-04
 
 The first release. **Disk format version 8, wire protocol version 12** (the server and the clients refuse a peer
