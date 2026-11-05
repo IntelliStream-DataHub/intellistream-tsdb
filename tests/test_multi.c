@@ -701,8 +701,11 @@ static int b_take(void *ctx, size_t n)
 }
 static void b_give(void *ctx, size_t n) { atomic_fetch_sub(&((budget *)ctx)->out, (long)n); }
 static void b_deferred(void *ctx) { atomic_fetch_add(&((budget *)ctx)->deferred, 1); }
+/* calls[i]: a series with rows that ran at the head streams them and closes with a call of its own (2 or more
+ * calls); one collected ahead of the head arrives in a single call. Which one ran where is up to the scheduler: a
+ * helper woken by the call can claim series 0 before the caller does. */
 typedef struct {
-    int status[64];
+    int status[64], calls[64];
     uint64_t rows;
 } slow_ctx;
 static int slow_head(void *ctx, const tsdb_series_result *r)
@@ -711,6 +714,8 @@ static int slow_head(void *ctx, const tsdb_series_result *r)
     if (r->index == 0 && r->last)
         usleep(300000);
     s->rows += r->status ? 0 : r->n;
+    if (r->index < 64)
+        s->calls[r->index]++;
     if (r->last && r->index < 64)
         s->status[r->index] = r->status;
     return 0;
@@ -803,9 +808,18 @@ static void bounds(const char *base)
     slow_ctx sc = {0};
     OK(tsdb_query_multi(db, &qv, list, 9, &mo, slow_head, &sc));
     CHECK(sc.status[0] == 0);
-    for (int i = 1; i < 9; i++)
+    int failed_ahead = 0;
+    for (int i = 1; i < 9; i++) {
         CHECK(sc.status[i] == TSDB_ERR_CORRUPT);
-    CHECK(atomic_load(&b.takes) == 0 && atomic_load(&b.out) == 0);
+        failed_ahead += sc.calls[i] == 1;
+    }
+    /* the good series is charged only when a helper claimed it before the caller took it as the head (the caller
+     * may be preempted right after waking the helpers); the failed ones never are, wherever they ran */
+    bool good_ahead = sc.calls[0] == 1;
+    CHECK(sc.calls[0] >= 1);
+    fprintf(stderr, "  failures ahead: %d of 8, the head %s\n", failed_ahead,
+            good_ahead ? "collected ahead" : "streamed");
+    CHECK(atomic_load(&b.takes) == (good_ahead ? 1 : 0) && atomic_load(&b.out) == 0);
     CHECK(atomic_load(&b.deferred) == 0); /* and nothing flipped the call to one series at a time */
 
     /* results ahead stop at max_held_bytes: a refused one makes the call head-only */
