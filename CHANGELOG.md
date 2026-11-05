@@ -410,6 +410,16 @@ Import
 
 ### Security hardening (input safety)
 
+- `tsdb <dir> ...` run as root on a directory another user owns no longer follows links that user planted there
+  (release security review): `user add` through a dangling `USERS` link created any file (`/etc/ld.so.preload`)
+  and gave it to the directory's owner, `user compact` through a `USERS.compact` link overwrote and chowned any
+  file (`/etc/shadow`), and even `user list` chmodded the file a `USERS` link named. As root, every command now
+  first becomes the directory's owner and group for good (setgroups, setgid, setuid; it says so in one line and
+  refuses when root could come back); a directory of root's keeps root. Files named on the command line
+  (`--password-file`, `export -o`, `import FILE`) are then opened as that user. `USERS` and `USERS.compact` are
+  opened through the directory's descriptor with `O_NOFOLLOW` (tsdbd's reads too), `USERS.compact` is made new
+  with `O_EXCL` after unlinking whatever had the name, and a `USERS` that is not a regular file or has a second
+  name (a hard link) is refused before any chown or chmod.
 - Volume paths chosen by a client are checked; a client can never make the server add a volume.
 - Query memory follows the rows and buckets a query really has; request memory, frame size and the time to
   deliver a frame are bounded; flags and numbers on the server, CLI and clients are checked.

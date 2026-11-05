@@ -4,7 +4,12 @@
 #include "tsdb.h"
 #include "tsdb_calendar.h"
 
+#include <errno.h>
+#include <grp.h>
+#include <limits.h>
 #include <math.h>
+#include <pwd.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef TSDB_BUILD_VERSION
@@ -77,7 +82,10 @@ static void usage(void)
             "       now, now-1h, min, max.  ranges are [start, end).\n"
             "groups: 500ms, 10s, 15m, 6h (fixed length); 1d, 1w, 1mo, 1q, 1y (calendar, in --tz,\n"
             "        e.g. Europe/Oslo; default UTC). Output is ClickHouse-style TSV, times in UTC;\n"
-            "        names escaped (\\t, \\n, \\\\, other control bytes as \\xNN).\n");
+            "        names escaped (\\t, \\n, \\\\, other control bytes as \\xNN).\n"
+            "root:   run as root on a <dir> another user owns, tsdb becomes that user and group first,\n"
+            "        for every command (the owner could put links in <dir> that root would follow), and\n"
+            "        opens the files it names (--password-file, -o, import FILE) as that user too.\n");
     exit(2);
 }
 
@@ -660,6 +668,52 @@ static int print_series(void *ctx, tsdb_sid id)
     return 0;
 }
 
+/* Run as root on a directory that another user owns (`sudo tsdb /var/lib/tsdb ...`), the CLI becomes that user and
+ * group for good before it opens anything there. Whoever owns the directory (the service account, or whoever took
+ * it over) can put symbolic links in it, and root would follow them: USERS, MANIFEST, the WAL, VOLUMES and the rest
+ * would create, overwrite, chown or chmod files anywhere (secrel cli #1). As the owner, the CLI can do only what the
+ * owner can, and what it makes belongs to the owner, as when tsdbd makes it. A directory that does not exist yet
+ * counts as its nearest existing parent's (a new database, an import built beside it). A directory of root's: root
+ * stays root (nothing to drop to). Exits when the change does not take, or root could come back. */
+static void drop_root(const char *dir)
+{
+    if (geteuid() != 0)
+        return;
+    char p[PATH_MAX];
+    if (strlen(dir) >= sizeof p)
+        die(dir, TSDB_ERR_INVALID);
+    snprintf(p, sizeof p, "%s", dir);
+    struct stat st;
+    while (stat(p, &st) != 0) {
+        if (errno != ENOENT || strcmp(p, ".") == 0 || strcmp(p, "/") == 0) {
+            fprintf(stderr, "tsdb: %s: %s\n", p, strerror(errno));
+            exit(1);
+        }
+        char *s = strrchr(p, '/');
+        if (!s)
+            snprintf(p, sizeof p, ".");
+        else if (s == p)
+            p[1] = '\0';
+        else
+            *s = '\0';
+    }
+    if (st.st_uid == 0)
+        return;
+    uid_t uid = st.st_uid;
+    gid_t gid = st.st_gid;
+    const struct passwd *pw = getpwuid(uid);
+    char name[64];
+    snprintf(name, sizeof name, "%s", pw && pw->pw_name ? pw->pw_name : "no name");
+    if (setgroups(1, &gid) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid ||
+        getgid() != gid || getegid() != gid || setuid(0) == 0 || seteuid(0) == 0) {
+        fprintf(stderr, "tsdb: %s belongs to uid %u (%s): running as root, this must become that user and cannot "
+                        "(%s); refused\n", p, (unsigned)uid, name, strerror(errno));
+        exit(1);
+    }
+    fprintf(stderr, "tsdb: running as uid %u (%s), gid %u, the owner of %s, not as root\n", (unsigned)uid, name,
+            (unsigned)gid, p);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
@@ -672,6 +726,7 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--server") == 0) /* `tsdb user VERB ... --server HOST:PORT`: no directory */
             return user_main(NULL, argc - 2, argv + 2);
     const char *dir = argv[1], *cmd = argv[2];
+    drop_root(dir); /* before anything in dir is opened, by every command */
     if (strcmp(cmd, "volume") == 0 && argc == 5 && strcmp(argv[3], "add") == 0) {
         /* without opening the database: a running tsdbd holds its lock, and opens the volume when a
          * request first names it */

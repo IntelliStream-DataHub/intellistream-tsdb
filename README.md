@@ -510,6 +510,16 @@ build/tsdb /data/sensors user list
 These commands change the file `USERS` in the database directory and work while tsdbd runs: it sees the change
 within a second. A series a user may not touch answers like a series that does not exist.
 
+Run `tsdb` as the owner of the database directory (the user tsdbd runs as), or as root. As root, every `tsdb <dir>`
+command first becomes the directory's owner and group for good, and says so:
+`tsdb: running as uid 990 (tsdb), gid 990, the owner of /data/sensors, not as root`. Whoever owns the directory can
+put links in it, and root would follow them to files anywhere on the machine; as the owner, `tsdb` can do only what
+the owner can, and the files it makes belong to the owner. Files named on the command line (`--password-file`,
+`export -o`, `import FILE`) are then read and written as the owner too: give the owner access to them, or use
+`TSDB_PASSWORD`, `<` and `>` instead. A directory that does not exist yet counts as its parent's; a directory that
+belongs to root keeps the command root. `USERS` itself is never opened through a link: a `USERS` that is a symbolic
+link, or has a second name (a hard link), is refused.
+
 A user with `admin` on a prefix manages the users whose names start with it. It does that over the network, so it
 needs no access to the server's files:
 

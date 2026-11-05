@@ -45,6 +45,9 @@
  * root must not leave a USERS the service user cannot read) and mode 0600; an existing one readable by others is
  * set to 0600, or refused when that fails: it holds the verifiers, which are offline guessing targets, and with one
  * recorded login of a user a way to log in as that user (StoredKey turns its ClientProof into ClientKey).
+ * Both files are opened through the directory's descriptor with O_NOFOLLOW (USERS.compact new, with O_EXCL, after
+ * unlinking whatever had the name), and only a regular file with one link is chowned, chmodded or read: whoever can
+ * write the directory must not get a writer running as root to create, overwrite or chmod a file elsewhere.
  *
  * Loading applies records in a batch with copy-on-write of the users it touches, so that a reload that meets damage
  * halfway leaves the state exactly as it was (A11: the last good state stays).
@@ -1296,16 +1299,42 @@ static int catch_up(users *us, int fd, bool cut)
 
 static int file_perms(const char *path, int fd, const struct stat *d);
 
+/* The directory, opened once (again only while it is missing): the files in it are reached through this descriptor,
+ * so a directory renamed or replaced meanwhile is not mixed with the one opened. */
+static int users_dirfd(users *us)
+{
+    if (us->dfd < 0)
+        us->dfd = open(us->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    return us->dfd;
+}
+
+/* USERS or USERS.compact, never through a symbolic link: whoever can write the directory could otherwise point the
+ * name at any file, and a writer running as root (an embedding program; the tsdb CLI drops to the directory's owner
+ * first) would create, truncate, chown or chmod that file instead (secrel cli #1). */
+static int open_in_dir(users *us, const char *name, int flags, mode_t mode)
+{
+    int dfd = users_dirfd(us);
+    if (dfd < 0)
+        return -1;
+    int fd = openat(dfd, name, flags | O_NOFOLLOW | O_CLOEXEC, mode);
+    if (fd < 0 && errno == ELOOP) {
+        fprintf(stderr, "tsdb: %s/%s is a symbolic link: refused (tsdb makes it as a regular file)\n", us->dir, name);
+        errno = ELOOP;
+    }
+    return fd;
+}
+
 int users_open(users *us, const char *dir, bool writable)
 {
     memset(us, 0, sizeof *us);
     us->fd = -1;
+    us->dfd = -1;
     us->writable = writable;
     if (strlen(dir) >= sizeof us->dir)
         return TSDB_ERR_INVALID;
     snprintf(us->dir, sizeof us->dir, "%s", dir);
     snprintf(us->path, sizeof us->path, "%s/USERS", dir);
-    int fd = open(us->path, O_RDONLY | O_CLOEXEC);
+    int fd = open_in_dir(us, "USERS", O_RDONLY, 0);
     if (fd < 0)
         return errno == ENOENT ? 0 : TSDB_ERR_IO;
     int rc = file_perms(us->path, fd, NULL); /* the mode; the owner is a writer's business */
@@ -1318,7 +1347,7 @@ int users_open(users *us, const char *dir, bool writable)
 int users_reload(users *us)
 {
     /* opened again each time: on NFS that revalidates the size (close-to-open consistency) */
-    int fd = open(us->path, O_RDONLY | O_CLOEXEC);
+    int fd = open_in_dir(us, "USERS", O_RDONLY, 0);
     int rc;
     if (fd < 0 && errno == ENOENT && us->ino) {
         fprintf(stderr, "tsdb: %s is gone: the users stay as they were read\n", us->path);
@@ -1342,9 +1371,12 @@ void users_close(users *us)
     free(us->names);
     if (us->fd >= 0)
         close(us->fd);
+    if (us->dfd >= 0)
+        close(us->dfd);
     tsdb_wipe(us->mock_key, sizeof us->mock_key);
     memset(us, 0, sizeof *us);
     us->fd = -1;
+    us->dfd = -1;
 }
 
 /* ------------------------------------------------------- appending */
@@ -1505,7 +1537,8 @@ static int fsync_dir(const char *dir)
  * `sudo tsdb <dir> user add` must not leave a USERS that tsdbd, running as the directory's owner, cannot open. */
 static int writer_ok(users *us, struct stat *d)
 {
-    if (stat(us->dir, d) != 0)
+    int dfd = users_dirfd(us);
+    if (dfd < 0 || fstat(dfd, d) != 0)
         return TSDB_ERR_IO;
     uid_t me = geteuid();
     if (me != 0 && me != d->st_uid) {
@@ -1520,12 +1553,19 @@ static int writer_ok(users *us, struct stat *d)
 
 /* USERS (or a compaction's new file) gets the directory's owner and group and mode 0600: it holds the verifiers,
  * which are offline guessing targets. A file that keeps another owner, or group or other bits, is refused. The group
- * is best effort (the owner may not be in the directory's group; with mode 0600 it grants nothing). */
+ * is best effort (the owner may not be in the directory's group; with mode 0600 it grants nothing).
+ * Only a regular file with no other name is changed or read: a hard link (or a device or FIFO) put in the directory
+ * would have the owner and mode of another file changed, and tsdb never makes one there. */
 static int file_perms(const char *path, int fd, const struct stat *d)
 {
     struct stat st;
     if (fstat(fd, &st) != 0)
         return TSDB_ERR_IO;
+    if (!S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        fprintf(stderr, "tsdb: %s is %s: refused (tsdb makes it as a regular file with no other name)\n", path,
+                !S_ISREG(st.st_mode) ? "not a regular file" : "a file with more than one name (a hard link)");
+        return TSDB_ERR_IO;
+    }
     if (d && (st.st_uid != d->st_uid || st.st_gid != d->st_gid) && fchown(fd, d->st_uid, d->st_gid) != 0 &&
         st.st_uid != d->st_uid) {
         fprintf(stderr, "tsdb: %s belongs to uid %u, not to the directory's owner (uid %u), and cannot be given to it: "
@@ -1602,7 +1642,7 @@ static int change_lock(users *us)
         if (us->fd < 0) {
             /* created only by the first change ever seen: a file that went away is not replaced by an empty one,
              * which would drop every user without a word */
-            us->fd = open(us->path, O_RDWR | O_APPEND | O_CLOEXEC | (us->ino ? 0 : O_CREAT), 0600);
+            us->fd = open_in_dir(us, "USERS", O_RDWR | O_APPEND | (us->ino ? 0 : O_CREAT), 0600);
             if (us->fd < 0) {
                 if (errno == ENOENT) {
                     fprintf(stderr, "tsdb: %s is gone: no change is made\n", us->path);
@@ -1624,7 +1664,7 @@ static int change_lock(users *us)
             unlock(us);
             return TSDB_ERR_IO;
         }
-        if (stat(us->path, &p) == 0 && p.st_ino == a.st_ino && p.st_dev == a.st_dev)
+        if (fstatat(us->dfd, "USERS", &p, AT_SYMLINK_NOFOLLOW) == 0 && p.st_ino == a.st_ino && p.st_dev == a.st_dev)
             break;
         /* a compaction put another file in its place while this one waited */
         unlock(us);
@@ -1930,7 +1970,13 @@ int users_compact(users *us)
         rc = TSDB_ERR_NOMEM;
         goto out;
     }
-    if ((fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)) < 0) {
+    /* a new file of this process's own: whatever has the name (a dead compaction's file, or a link someone put
+     * there) is unlinked first, the name itself and never what a link names, and O_EXCL does not follow one */
+    int dfd = users_dirfd(us);
+    if (dfd < 0 || (unlinkat(dfd, "USERS.compact", 0) != 0 && errno != ENOENT) ||
+        (fd = open_in_dir(us, "USERS.compact", O_WRONLY | O_CREAT | O_EXCL, 0600)) < 0) {
+        if (dfd >= 0 && errno != ELOOP) /* ELOOP: open_in_dir said why */
+            fprintf(stderr, "tsdb: %s: %s\n", tmp, strerror(errno));
         rc = TSDB_ERR_IO;
         goto out;
     }
@@ -1947,10 +1993,10 @@ int users_compact(users *us)
     /* errors before the rename fail just this call: nothing relies on the new file yet. The new file is locked
      * before its name is: a writer that opens the name after the rename waits until the directory fsync made the
      * rename durable (it would otherwise append to a file a power loss can take back, and acknowledge). */
-    if (rc || stat(us->dir, &d) != 0 || (rc = file_perms(tmp, fd, &d)) != 0 || fsync(fd) != 0 ||
-        fstat(fd, &st) != 0 || lock_fd(fd, F_WRLCK) != 0 || rename(tmp, us->path) != 0) {
+    if (rc || fstat(dfd, &d) != 0 || (rc = file_perms(tmp, fd, &d)) != 0 || fsync(fd) != 0 ||
+        fstat(fd, &st) != 0 || lock_fd(fd, F_WRLCK) != 0 || renameat(dfd, "USERS.compact", dfd, "USERS") != 0) {
         rc = TSDB_ERR_IO;
-        unlink(tmp);
+        unlinkat(dfd, "USERS.compact", 0);
         goto out;
     }
     if (fsync_dir(us->dir) != 0) {

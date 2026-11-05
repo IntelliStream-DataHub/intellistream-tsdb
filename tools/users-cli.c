@@ -40,7 +40,9 @@ static int user_usage(void)
             "  SELECTOR  all, prefix:P, name:N or glob:G (* any bytes, ? one byte, \\ the next byte as is)\n"
             "  The password is read from FILE (its first line), else from TSDB_PASSWORD, else from the\n"
             "  terminal without echo; never from the command line. The login's password: FILE, else\n"
-            "  TSDB_LOGIN_PASSWORD, else the terminal.\n");
+            "  TSDB_LOGIN_PASSWORD, else the terminal.\n"
+            "  Run as the owner of <dir>, or as root: root on a <dir> another user owns becomes that\n"
+            "  user first (and reads FILE as that user). A USERS that is a link is refused.\n");
     return 2;
 }
 
