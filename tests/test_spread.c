@@ -937,6 +937,82 @@ static void test_fast_path(void)
     rmrf(dir);
 }
 
+static int count_rows(void *ctx, const int64_t *ts, const float *values, size_t n)
+{
+    (void)ts;
+    (void)values;
+    *(size_t *)ctx += n;
+    return 0;
+}
+
+/* An answer from granule statistics and memtable rows decodes nothing, so it takes no codec context: the pool's
+ * cc_lock is one mutex per volume, and taking it on every bucket query made queries at 32 connections convoy on
+ * it (qm-bisect: 35% of the time in its spin lock; whole-range QUERY_MULTI at 32 connections 1.81 M -> 1.30 M
+ * windows/s). Overlapping sources, which are merged, and raw queries take one; the counter is per thread, and
+ * query_threads = 1 keeps every query in this one. */
+static void test_no_codec(void)
+{
+    char dir[600];
+    tsdb *db = open_db("nocodec", dir);
+    tsdb_sid id;
+    OK(tsdb_series_create(db, "s", TSDB_FLOAT32, NULL, &id));
+    enum { N = 64 * 20 };
+    static int64_t ts[N];
+    static float v[N];
+    for (int i = 0; i < N; i++)
+        ts[i] = (int64_t)i * 10, v[i] = (float)(i % 7);
+    OK(tsdb_insert_series(db, id, ts, v, N));
+    for (int round = 0; round < 3; round++) {
+        /* 0: memtable rows; 1: one part, 6400 ms buckets of 10 whole granules; 2: a second part over the first */
+        if (round == 1)
+            OK(tsdb_flush(db));
+        if (round == 2) {
+            for (int i = 0; i < N; i++)
+                v[i] += 1;
+            OK(tsdb_insert_series(db, id, ts, v, N));
+            OK(tsdb_flush(db));
+        }
+        tsdb_bucket *b = NULL;
+        tsdb_spread_bucket *sb = NULL;
+        tsdb_twa_bucket *tb = NULL;
+        size_t nb = 0, ns = 0, nt = 0;
+        tsdb_query_stats st[3];
+        size_t got[3];
+        size_t before = cc_gets;
+        OK(tsdb_query_agg(db, id, 0, INT64_MAX, 6400, &b, &nb));
+        tsdb_last_query_stats(&st[0]);
+        got[0] = cc_gets - before;
+        before = cc_gets;
+        OK(tsdb_query_spread(db, id, 0, INT64_MAX, 6400, NULL, &sb, &ns));
+        tsdb_last_query_stats(&st[1]);
+        got[1] = cc_gets - before;
+        before = cc_gets;
+        OK(tsdb_query_twa(db, id, 0, INT64_MAX, 6400, NULL, &tb, &nt));
+        tsdb_last_query_stats(&st[2]);
+        got[2] = cc_gets - before;
+        CHECK(nb == 2 && ns == 2 && nt == 2);
+        if (nb == 2)
+            CHECK(b[0].count == 640 && b[1].count == 640 && b[0].sum == (round == 2 ? 1914 + 640 : 1914));
+        for (int k = 0; k < 3; k++) {
+            bool want = round == 2; /* overlapping parts: merged, which decodes */
+            CHECK(want ? got[k] >= 1 : got[k] == 0);
+            CHECK(want || st[k].rows_decoded == 0);
+            if (want ? got[k] < 1 : got[k] != 0)
+                fprintf(stderr, "round %d query %d: %zu codec contexts taken, %llu rows decoded\n", round, k, got[k],
+                        (unsigned long long)st[k].rows_decoded);
+        }
+        free(b);
+        free(sb);
+        free(tb);
+    }
+    size_t before = cc_gets;
+    size_t rows = 0;
+    OK(tsdb_query_raw(db, id, 0, INT64_MAX, count_rows, &rows));
+    CHECK(rows == N && cc_gets - before == 1);
+    tsdb_close(db);
+    rmrf(dir);
+}
+
 /* The kernels bit for bit, on what reaches them: float32 runs without nulls and NaN, of varied values (the
  * data the database-level tests feed them is mostly constant, NaN-ridden or null-ridden in float32, and FMA
  * in the deviation pass happens not to change 101325 +- 5). Each kernel's agg_state of every run, with and
@@ -1248,6 +1324,7 @@ int main(int argc, char **argv)
     test_single_runs();
     test_random();
     test_fast_path();
+    test_no_codec();
     test_sparse_span();
     test_deletes(false);
     test_deletes(true);

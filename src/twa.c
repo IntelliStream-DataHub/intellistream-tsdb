@@ -422,11 +422,11 @@ static void twa_worker(void *arg, int idx)
     twa_job *j = arg;
     qstats *mine = cur_qstats;
     cur_qstats = j->qs;
-    codec_ctx *cc = cc_get(j->db);
+    codec_ctx *cc = NULL; /* taken with the first granule: a helper that finds the work gone takes none */
     size_t cap = j->db->granule_rows;
     int64_t *ts = qscratch_get(0, cap * sizeof *ts);
     uint8_t *v = qscratch_get(1, cap * sizeof(uint64_t));
-    if (!cc || !ts || !v) {
+    if (!ts || !v) {
         atomic_store(&j->err, TSDB_ERR_NOMEM);
         goto out;
     }
@@ -434,6 +434,10 @@ static void twa_worker(void *arg, int idx)
         size_t w = atomic_fetch_add(&j->next, 1);
         if (w >= j->nwork || atomic_load_explicit(&j->err, memory_order_relaxed))
             break;
+        if (!cc && !(cc = cc_get(j->db))) {
+            atomic_store(&j->err, TSDB_ERR_NOMEM);
+            break;
+        }
         twa_piece *pc = &j->pc[j->work[w]];
         const part *p = j->sn->parts[pc->src];
         granule gb;
@@ -674,11 +678,8 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
             goto done;
     }
 
-    cc = cc_get(db);
-    if (!cc) {
-        rc = TSDB_ERR_NOMEM;
-        goto done;
-    }
+    /* cc only for a merge of overlapping sources (PC_MERGE, below): pieces from statistics and memtable rows take
+     * none, so such a query never meets every other one on the volume's cc_lock */
     for (size_t i = 0; i < npc && rc == 0; i++) {
         twa_piece *x = &pc[i];
         switch (x->kind) {
@@ -751,7 +752,9 @@ static int twa_window(void *ctx, int64_t start, int64_t end, void **outp, size_t
                     src_init_mem(&srcs[ns++], &sn.mem[s - sn.np], mem_prio(&sn, s - sn.np), type);
             }
             void *ctx[2] = {&q, &c};
-            rc = merge_stream(cc, srcs, ns, lo, hi, rows_cb, ctx);
+            if (!cc)
+                cc = cc_get(db);
+            rc = cc ? merge_stream(cc, srcs, ns, lo, hi, rows_cb, ctx) : TSDB_ERR_NOMEM;
             for (size_t k = 0; k < ns; k++)
                 src_free(&srcs[k]);
         }

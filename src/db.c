@@ -63,8 +63,13 @@ void tsdb_options_init(tsdb_options *o)
 
 /* ------------------------------------------------------------ codec pool */
 
+__thread size_t cc_gets; /* per thread: a shared counter would be one more line every reader writes */
+
+/* cc_lock is one mutex per volume that every reader meets: take a context only for work that decodes (the bucket
+ * and TWA paths take theirs lazily), or queries answered from statistics alone queue here at many connections */
 codec_ctx *cc_get(eng *db)
 {
+    cc_gets++;
     pthread_mutex_lock(&db->cc_lock);
     codec_ctx *c = db->cc_free;
     if (c)
