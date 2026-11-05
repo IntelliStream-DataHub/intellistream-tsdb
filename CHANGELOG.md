@@ -354,6 +354,24 @@ Damage and recovery
   (`tmp_<pid>_<n>.part`, `META.tmp`, `txn_<pid>_<n>.intent`), and likewise reads as parts, WAL segments and
   retired parts only `p<partition>_<min>_<max>_<level>.part`, `wal_<16 hex digits>.log` and `retired_` + a part
   name, so a file like `plan.part` or `wal_notes.log` no longer fails the open or gets replayed.
+- A part file changed on disk while a query read it could corrupt memory (found by the release security review).
+  Without `pin_index` (the default) queries read a part's granule index straight from the file's mapping. A raw
+  query sized its buffer from a granule's row count, read the count again, and decoded that many rows: if the count
+  had grown in between (a misdirected write, a page read again from a failing disk or from NFS), the rows were
+  written past the end of the buffer. A merge had the same gap. Every decode is now bounded by the buffer it
+  writes, and a merge refuses a count that changed; such damage now gives `TSDB_ERR_CORRUPT` or wrong answers,
+  as documented, never a write outside a buffer. The cost is one comparison per granule.
+- One damaged byte in `VOLUMES` could make volumes disappear and their numbers be reused (found by the release
+  security review). A NUL byte inside a line, a lost newline between two lines, or two damaged lines made the open
+  take the rest of the file for a half-written last line and cut it, with no error: the series in those volumes
+  were gone, and the next `volume add` got a cut volume's number, so series ids that clients kept pointed at the
+  new volume's series. Now only a tail with no newline at all (an add that died while writing its line) is cut;
+  any other damage fails the open, a read-only open and `volume add` with `TSDB_ERR_CORRUPT`, naming the line, and
+  the file is left as it was for the operator to repair.
+- A crafted `RETENTION` or `CLASSES` record naming series 4294967295 made the open reserve 32 GB or 4 GB of memory
+  before it noticed that the series does not exist. Records of series that `SERIES` does not have are no longer
+  applied: a writer's open fails on them as before, and a reader leaves them for a later refresh (the writer may
+  have created the series a moment ago).
 
 Followers
 - Followers, and readers that open through MANIFEST (volumes included), served series whose `SERIES` record was

@@ -390,13 +390,14 @@ static int decode_visible(codec_ctx *cc, const part *p, uint32_t k, uint32_t e, 
     out->v = malloc(total * w + 1);
     if (!out->ts || !out->v)
         return TSDB_ERR_NOMEM;
+    IX_HOOK(p, k, IX_VISIBLE);
     for (uint32_t x = k; x < e; x++) {
         granule gb;
         gx_load(p, x, GW_LOC, &gb);
         const granule *g = &gb;
         int64_t *ts = out->ts + out->n;
         uint8_t *v = out->v + out->n * w;
-        int rc = granule_read(cc, p, g, type, ts, v, p->verify);
+        int rc = granule_read(cc, p, g, type, ts, v, total - out->n, p->verify); /* counts loaded again */
         if (rc)
             return rc;
         size_t lo = lower_bound_i64(ts, g->count, start), hi = lower_bound_i64(ts, g->count, end);
@@ -561,8 +562,8 @@ static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
         /* as many rows as its largest granule, not the part's granule size: a query holds a source per part of
            its range at once, and parts of small batches (unmerged, or many series each) have granules of a few
            hundred rows. Sized by granule_rows, 4,500 such parts asked for 576 MB per query, and the heap's trim
-           and the page faults after it were a third of a raw scan. A count above grows is refused by
-           granule_read before it decodes. */
+           and the page faults after it were a third of a raw scan. A count above the buffers (loaded again below,
+           and changed in the mapping since) is refused by granule_read before it decodes. */
         uint32_t rows = 1;
         for (uint32_t k = c->gi; k < c->gj; k++)
             rows = MAX(rows, gx_count(c->p, k));
@@ -570,14 +571,16 @@ static int src_fill(codec_ctx *cc, src *c, int64_t start, int64_t end)
         c->ts = malloc(rows * sizeof *c->ts);
         c->v = malloc(rows * c->w);
         c->own = true;
+        c->cap = rows;
         if (!c->ts || !c->v)
             return TSDB_ERR_NOMEM;
+        IX_HOOK(c->p, c->gi, IX_SRC);
     }
     while (c->gi < c->gj) {
         granule gb;
         gx_load(c->p, c->gi++, GW_LOC | GW_TIME, &gb);
         const granule *g = &gb;
-        int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, c->p->verify);
+        int rc = granule_read(cc, c->p, g, c->type, c->ts, c->v, c->cap, c->p->verify);
         if (rc)
             return rc;
         c->pos = g->ts_min >= start ? 0 : lower_bound_i64(c->ts, g->count, start);
@@ -1131,7 +1134,7 @@ static void agg_worker(void *arg, int idx)
         }
         const gref *r = &j->work[w];
         granule gb;
-        int rc = granule_read_at(cc, r->p, r->k, j->t.type, ts, v, r->p->verify, &gb);
+        int rc = granule_read_at(cc, r->p, r->k, j->t.type, ts, v, cap, r->p->verify, &gb);
         if (rc) {
             atomic_store(&j->err, rc);
             break;

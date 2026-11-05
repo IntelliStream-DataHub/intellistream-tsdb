@@ -1374,6 +1374,145 @@ static void test_reload_states_fails(const char *base)
     printf("  a follower finds a new series when STATES cannot be read\n");
 }
 
+static void put_byte(const char *path, off_t off, char c)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    CHECK(fd >= 0 && pwrite(fd, &c, 1, off) == 1);
+    if (fd >= 0)
+        close(fd);
+}
+
+static bool same_text(const char *path, const char *want, size_t len)
+{
+    char buf[4096];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t n = fd >= 0 ? read(fd, buf, sizeof buf) : -1;
+    if (fd >= 0)
+        close(fd);
+    return n == (ssize_t)len && memcmp(buf, want, len) == 0;
+}
+
+/* One damaged byte in VOLUMES (the 0.9.0 review, secrel F2). Lines were split with strchr, which stops at a NUL, and
+ * a bad line was damage only when the one line after it passed its check under the bad line's number + 1: a NUL in
+ * line 2, a newline lost between lines 1 and 2, two bad lines or a bad last line were taken for a torn tail. The open
+ * cut every line from there and succeeded, those volumes' series were gone, and the next add handed a cut volume's
+ * number out again, so ids clients hold named the new volume's series. A torn append is the last line without its
+ * newline; only a tail with no newline at all is cut now, and any other damage fails the writer's open, a reader's
+ * and an add with TSDB_ERR_CORRUPT, the file as it was. */
+static void test_volumes_damaged_lines(const char *base)
+{
+    char top[600], root[700], vols[800], v[3][800], vd[800], name[32];
+    fresh(base, "voldmg", top, sizeof top, root, sizeof root);
+    snprintf(vols, sizeof vols, "%s/VOLUMES", root);
+    snprintf(vd, sizeof vd, "%s/vd", top);
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    o.create_volumes = 0;
+    tsdb_options ro = o;
+    ro.read_only = 1;
+    tsdb *db;
+    tsdb_sid ids[3], id;
+    uint32_t idx;
+    for (int i = 0; i < 3; i++) {
+        snprintf(v[i], sizeof v[i], "%s/v%d", top, i + 1);
+        OK(tsdb_volume_add_dir(root, v[i], &idx));
+        CHECK(idx == (uint32_t)i + 1);
+    }
+    OK(tsdb_open(root, &o, &db));
+    for (int i = 0; i < 3; i++) {
+        snprintf(name, sizeof name, "s%d", i + 1);
+        OK(tsdb_series_at(db, name, v[i], &ids[i]));
+        CHECK(ids[i] == TSDB_SID((uint32_t)i + 1, 0));
+    }
+    OK(tsdb_close(db));
+    char good[4096];
+    read_text(vols, good, sizeof good);
+    size_t len = strlen(good);
+    const char *nl1 = strchr(good, '\n'), *nl2 = nl1 ? strchr(nl1 + 1, '\n') : NULL;
+    CHECK(nl1 && nl2 && good[len - 1] == '\n');
+    if (!nl1 || !nl2)
+        return;
+    off_t l2 = nl1 + 1 - good, l3 = nl2 + 1 - good; /* where lines 2 and 3 start */
+    static const struct {
+        const char *what;
+        int line;  /* 2: at l2 + at, 1: at l2 - 1 (line 1's newline), 3: at l3 + at */
+        int at;
+        char c;
+        int line2; /* a second byte, or 0 */
+    } cases[] = {
+        {"a NUL inside line 2", 2, 8, '\0', 0},
+        {"line 1's newline lost (two lines run together)", 1, 0, 'Z', 0},
+        {"lines 2 and 3 damaged", 2, 3, 'x', 3},
+        {"the last line damaged, its newline whole", 3, 12, 'q', 0},
+        {"a NUL at the start of line 2", 2, 0, '\0', 0},
+    };
+    for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
+        write_file(vols, good);
+        off_t at = cases[k].line == 1 ? l2 - 1 : (cases[k].line == 2 ? l2 : l3) + cases[k].at;
+        put_byte(vols, at, cases[k].c);
+        if (cases[k].line2)
+            put_byte(vols, l3 + 3, 'x');
+        char damaged[4096];
+        int fd = open(vols, O_RDONLY | O_CLOEXEC);
+        CHECK(fd >= 0 && read(fd, damaged, sizeof damaged) == (ssize_t)len);
+        if (fd >= 0)
+            close(fd);
+        int w = tsdb_open(root, &o, &db), r = w;
+        if (w == 0)
+            tsdb_close(db);
+        if (w != TSDB_ERR_CORRUPT)
+            fprintf(stderr, "  %s: the writer's open gave %d, not TSDB_ERR_CORRUPT\n", cases[k].what, w);
+        CHECK(w == TSDB_ERR_CORRUPT);
+        CHECK(same_text(vols, damaged, len)); /* nothing cut */
+        if ((r = tsdb_open(root, &ro, &db)) == 0)
+            tsdb_close(db);
+        CHECK(r == TSDB_ERR_CORRUPT);
+        int a = tsdb_volume_add_dir(root, vd, &idx);
+        if (a != TSDB_ERR_CORRUPT)
+            fprintf(stderr, "  %s: an add gave %d (volume %u), not TSDB_ERR_CORRUPT\n", cases[k].what, a, idx);
+        CHECK(a == TSDB_ERR_CORRUPT);
+        CHECK(same_text(vols, damaged, len));
+    }
+    /* repaired: every volume and series is there again */
+    write_file(vols, good);
+    OK(tsdb_open(root, &o, &db));
+    CHECK(tsdb_volume_count(db) == 4);
+    for (int i = 0; i < 3; i++) {
+        snprintf(name, sizeof name, "s%d", i + 1);
+        OK(tsdb_series_lookup(db, name, &id));
+        CHECK(id == ids[i]);
+    }
+    OK(tsdb_close(db));
+    /* a torn append (no newline in the tail) is still cut, by the open and by an add, and also when it is zeros */
+    for (int z = 0; z <= 1; z++) {
+        append_bytes(vols, z ? "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" : "1234abcd /half/v", 16);
+        OK(tsdb_open(root, &o, &db));
+        CHECK(tsdb_volume_count(db) == 4);
+        OK(tsdb_close(db));
+        CHECK(same_text(vols, good, len));
+    }
+    append_bytes(vols, "1234abcd /half/v", 16);
+    if (tsdb_open(root, &ro, &db) == 0) { /* a reader stops before it: a writer may be appending */
+        CHECK(tsdb_volume_count(db) == 4);
+        tsdb_close(db);
+    } else {
+        CHECK(!"a reader refused a torn tail");
+    }
+    OK(tsdb_volume_add_dir(root, vd, &idx));
+    CHECK(idx == 4);
+    OK(tsdb_open(root, &o, &db));
+    OK(tsdb_series_at(db, "s4", vd, &id));
+    CHECK(id == TSDB_SID(4, 0));
+    for (int i = 0; i < 3; i++) {
+        snprintf(name, sizeof name, "s%d", i + 1);
+        CHECK(tsdb_series_lookup(db, name, &id) == 0 && id == ids[i]);
+    }
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  damage in VOLUMES fails the open, a reader's and an add; only a torn tail without a newline is cut\n");
+}
+
 /* A reader that saw VOLUMES end in a torn line (here the zeros a power loss leaves) must notice when an add cuts it
  * and appends a line of the very same length: the size alone does not change. */
 static void test_volumes_same_size(const char *base)
@@ -2223,6 +2362,7 @@ int main(int argc, char **argv)
     test_new_meta_write(base);
     test_hung_volume(base);
     test_volumes_same_size(base);
+    test_volumes_damaged_lines(base);
     test_hung_reload(base);
     test_hung_new_volume(base);
     test_follower_hung_new_volume(base);

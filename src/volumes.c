@@ -232,13 +232,13 @@ static bool path_within(const char *a, const char *b)
     return n == 1 || (strncmp(a, b, n) == 0 && (a[n] == '\0' || a[n] == '/'));
 }
 
-/* Line i (from 1) of VOLUMES, NUL-terminated in place of its '\n'. */
-static bool vol_line_ok(const char *line, size_t i)
+/* Line i (from 1) of VOLUMES, len bytes, NUL-terminated in place of its '\n'. A NUL inside is damage: lines are
+ * found with memchr, never strchr, which would take it for the end of the line and of the file. */
+static bool vol_line_ok(const char *line, size_t len, size_t i)
 {
     unsigned check;
     int pos = 0;
-    size_t len = strlen(line);
-    return len >= 10 && sscanf(line, "%8x %n", &check, &pos) == 1 && pos == 9 &&
+    return len >= 10 && !memchr(line, '\0', len) && sscanf(line, "%8x %n", &check, &pos) == 1 && pos == 9 &&
            check == vol_check(line + 9, len - 9, i);
 }
 
@@ -253,9 +253,10 @@ static int volumes_lock(int fd, short type)
 
 /* The paths in VOLUMES, read through fd under its lock, where nobody is
  * appending: anything but whole lines that check out is damage. An incomplete
- * last line is an add that died in its write, never acknowledged: with `cut`
- * (the write lock, fd writable) it is cut off, as tsdb_open does, so a torn
- * tail does not stop a running writer and every later add until a restart. */
+ * last line (a tail with no newline at all) is an add that died in its write,
+ * never acknowledged: with `cut` (the write lock, fd writable) it is cut off, as
+ * tsdb_open does, so a torn tail does not stop a running writer and every later
+ * add until a restart. */
 static int volumes_parse(int fd, bool cut, bool sync, char ***out, size_t *n, off_t *size)
 {
     *out = NULL;
@@ -268,7 +269,7 @@ static int volumes_parse(int fd, bool cut, bool sync, char ***out, size_t *n, of
     *size = (off_t)len;
     size_t cap = 0;
     for (char *line = txt, *next; rc == 0 && line < txt + len; line = next) { /* zeros are no end of file */
-        if (!(next = strchr(line, '\n')) && cut) {
+        if (!(next = memchr(line, '\n', len - (size_t)(line - txt))) && cut) {
             fprintf(stderr, "tsdb: %s: cutting a torn tail of %zu bytes\n", VOLUMES_FILE, len - (size_t)(line - txt));
             *size = (off_t)(line - txt);
             if (ftruncate(fd, *size) != 0 || (sync && fdatasync(fd) != 0))
@@ -282,7 +283,7 @@ static int volumes_parse(int fd, bool cut, bool sync, char ***out, size_t *n, of
             break;
         }
         *next++ = '\0';
-        if (!vol_line_ok(line, *n + 1)) {
+        if (!vol_line_ok(line, (size_t)(next - 1 - line), *n + 1)) {
             fprintf(stderr, "tsdb: %s: line %zu is damaged\n", VOLUMES_FILE, *n + 1);
             rc = TSDB_ERR_CORRUPT;
         } else if (*n == cap) {
@@ -744,42 +745,29 @@ static int load_layout(tsdb *t)
         rc = 0; /* no extra volumes */
     else if (rc)
         return rc;
+    /* Lines are appended whole, one write and an fdatasync each, under the lock: only the last can be torn, and a
+     * torn append holds no newline (its own is its last byte). So the tail after the good lines is cut only when it
+     * has no newline at all; a line that ends in one and fails its check is damage (a NUL, a flipped bit, a newline
+     * lost between two lines), whatever follows it: cutting there would drop the volumes from it on and hand their
+     * numbers, which ids carry, to the next adds. Readers cannot cut, but fail on damage just as well. */
     size_t line_no = 0, good_end = 0;
-    bool bad = false;
-    for (char *line = txt, *next; rc == 0 && line && *line; line = next) {
-        next = strchr(line, '\n');
+    for (char *line = txt, *next; rc == 0 && line < txt + len; line = next) {
+        next = memchr(line, '\n', len - (size_t)(line - txt));
         if (!next)
             break; /* still being written, or torn */
         *next++ = '\0';
-        if (!vol_line_ok(line, line_no + 1)) {
-            next[-1] = '\n'; /* the scan below looks for the line after this one */
-            bad = true;
+        if (!vol_line_ok(line, (size_t)(next - 1 - line), line_no + 1)) {
+            fprintf(stderr, "tsdb: %s: line %zu is damaged (not a torn append: it ends in a newline): the open "
+                    "fails\n", VOLUMES_FILE, line_no + 1);
+            rc = TSDB_ERR_CORRUPT;
             break;
         }
         good_end = (size_t)(next - txt);
         rc = volume_open(t, line + 9, (uint32_t)++line_no, NULL); /* nothing to do when already open */
     }
     size_t vols_cut = SIZE_MAX, vols_len = len;
-    if (rc == 0 && writer && good_end < len) {
-        /* damage when the line after the bad one passes its check (as the next volume's) */
-        bool later = false;
-        char *l = bad ? memchr(txt + good_end, '\n', len - good_end) : NULL;
-        char *e = l ? memchr(l + 1, '\n', len - (size_t)(l + 1 - txt)) : NULL;
-        if (e && e - l - 1 >= 10) {
-            unsigned check;
-            int pos = 0;
-            *e = '\0';
-            later = sscanf(l + 1, "%8x %n", &check, &pos) == 1 && pos == 9 &&
-                    check == vol_check(l + 10, (size_t)(e - l - 10), line_no + 2);
-        }
-        if (later) {
-            fprintf(stderr, "tsdb: %s: line %zu is damaged and later lines are not: the open fails\n", VOLUMES_FILE,
-                    line_no + 1);
-            rc = TSDB_ERR_CORRUPT;
-        } else {
-            vols_cut = good_end;
-        }
-    }
+    if (rc == 0 && writer && good_end < len)
+        vols_cut = good_end;
     free(txt);
     if (rc)
         return rc;

@@ -296,17 +296,29 @@ static int cls_load(eng *db, bool confirm)
     }
     close(fd);
     size_t pos = 0, len = size - base;
+    uint32_t nser = eng_series_count(db);
+    bool later = false; /* a reader stopped at a record of a series it has not read yet */
     pthread_mutex_lock(&db->cls_mu);
     for (; rc == 0 && pos + CLS_REC <= len && rec_ok(buf + pos, base + pos); pos += CLS_REC) {
+        uint32_t s = load32(buf + pos + 4);
+        db->cls_ids = MAX(db->cls_ids, (uint64_t)s + 1); /* the writer's open checks these */
+        /* The table grows to the id: one SERIES lacks (a crafted record may name 2^32 - 1) is never applied. The
+         * writer's open fails on it (open_check_records), a reader reads it again at its next refresh: the writer
+         * may have made the series after the reader read SERIES. */
+        if (s >= nser) {
+            if (confirm)
+                continue;
+            later = true;
+            break;
+        }
         int64_t from;
         memcpy(&from, buf + pos + 8, 8);
-        rc = apply_locked(db, load32(buf + pos + 4), from, (int)load32(buf + pos + 16));
-        db->cls_ids = MAX(db->cls_ids, (uint64_t)load32(buf + pos + 4) + 1); /* the writer's open checks these */
+        rc = apply_locked(db, s, from, (int)load32(buf + pos + 16));
         if (rc == TSDB_ERR_CORRUPT)
             fprintf(stderr, "tsdb: %s: a record at offset %zu goes back in time\n", CLS_FILE, base + pos);
     }
     pthread_mutex_unlock(&db->cls_mu);
-    for (size_t q = pos + CLS_REC; rc == 0 && q + CLS_REC <= len; q += CLS_REC)
+    for (size_t q = pos + CLS_REC; rc == 0 && !later && q + CLS_REC <= len; q += CLS_REC)
         if (rec_ok(buf + q, base + q)) {
             fprintf(stderr, "tsdb: %s is damaged at offset %zu, before valid records\n", CLS_FILE, base + pos);
             rc = TSDB_ERR_CORRUPT;
@@ -1061,7 +1073,7 @@ static int check_granule(eng *db, codec_ctx *cc, int64_t *ts, const part *p, con
         return 0;
     if (c != pc || cls_at(db, s, g->ts_max, &flo, &fhi) != pc)
         return check_fail(p, s, "rows in a partition of another class than CLASSES gives them", g->ts_min, g->ts_max);
-    int rc = granule_read(cc, p, g, 0, ts, NULL, db->opt.verify_checksums);
+    int rc = granule_read(cc, p, g, 0, ts, NULL, p->grows, db->opt.verify_checksums); /* ts holds grows */
     if (rc) {
         fprintf(stderr, "tsdb: part %s: series %u: a granule does not decode (%d)\n", p->name, s, rc);
         return rc == TSDB_ERR_NOMEM ? rc : TSDB_ERR_CORRUPT;
