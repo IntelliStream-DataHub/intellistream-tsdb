@@ -12,6 +12,9 @@ set -u
 T=$1
 S=$2
 O=4242 # the directory's owner: the service account
+# make asan: LeakSanitizer stops the world with ptrace, which a process that gave up root may not do (it is no longer
+# dumpable, on purpose: the owner must not read what root gave it, such as TSDB_PASSWORD). ASan itself still runs.
+export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
 errors=0
 fail() { echo "test_cli_root: FAIL: $*" >&2; errors=$((errors + 1)); }
 as_owner() { setpriv --reuid $O --regid $O --clear-groups "$@"; }
