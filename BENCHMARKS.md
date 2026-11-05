@@ -10,6 +10,13 @@ measurement, with its spread and number of runs, is in
 
 - **One machine:** AMD Ryzen 9 7950X (16 cores, 32 threads), 64 GB RAM, an NVMe disk. One database at a time,
   every server in Podman on 127.0.0.1. Measured from 2026-10-29 to 2026-11-04.
+- **The released 0.9.0 differs a little:** the comparison ran on tsdb as of 2026-11-04 (3bd4e96). tsdb's own
+  benchmark suite (`tools/bench-tsdb.sh --standard`, 5 runs each) on that code and on the release (90e3b94): no
+  query or insert got slower except two answered from block summaries (one bucket over the whole range -20%, 15-minute
+  buckets -5%), many got faster (32 connections: raw readings 2.2x, a week in hourly buckets 2.5x; durable inserts of
+  100,000 rows a call 1.9x), and the release stores about 2% more bytes per reading on this data (1.397 -> 1.427):
+  hour cuts, which cut blocks at UTC hours so that hourly buckets need no decoding. So tsdb's sizes below are about 2%
+  low for 0.9.0, and its speeds are as measured or better.
 - **The same memory for everyone:** every server, tsdb's too, ran with a hard limit of 48 GB and no swap. InfluxDB 2
   had 24 GB (it used at most 8.3 GB). A server that ran out, or refused a question because of its own limit, is
   shown as such: that is a result.
