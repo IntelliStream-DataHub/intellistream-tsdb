@@ -431,6 +431,7 @@ tsdb-bench, tsdbd (started with `--port 0 --port-file`) with tsdbc-bench, insert
 | tool | measures |
 |---|---|
 | `tools/bench-tsdb.sh` | all of the below except dbcmp and hydraulic, repeated, with a summary; see above |
+| `tools/auth-bench.sh` | what login and grants cost: main before, main without auth and the auth build (`--no-auth`, a superuser, 8 prefix, 5,000 name and 64 glob grants), each built from `git archive`; queries, QUERY_MULTI, inserts and logins on 1 and 32 connections, repeated and interleaved (`--quick`, `--reps N`, `--lock FILE`); `tools/auth-bench-client.c` has the insert and login workloads |
 | `build/codec-bench` | float32 value codecs per sensor type: bits per value, speed; `--file F` for raw float32 values from a file |
 | `build/type-bench` | the float64, int64, bool and state codecs; `--file F float32\|float64` for raw values from a file |
 | `build/decode-bench` | bit unpacking per width (loops, the AVX2 kernel, PDEP) and the int_bp and float64 decimal codecs, for comparing CPUs; [`bench/cpu-compare`](bench/cpu-compare) has the Hyper-Threading and threshold sweeps |
