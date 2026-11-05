@@ -8,41 +8,10 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
-### Added
-- tsdbd `--exit-with-parent`: the server stops as on SIGTERM (clean close, memtable flushed, status 0) once the
-  process that started it is gone, checked once a second; it refuses to start if the parent is already init, and
-  with `--exit-with-parent=PID` if the parent is not PID (a launcher that died before tsdbd read its options, under
-  a subreaper such as `systemd --user`). Every test harness, the client test helpers and the benchmark scripts pass
-  it with their own pid, so a test killed by a timeout no longer
-  leaves its server running (six did for 17 hours, holding io_uring rings until a later run could not create one).
-- Inserts and memtable flushes write their parts without zstd (`tsdb_options.insert_zstd_level`, default 0;
-  tsdbd `--insert-zstd-level`): background merges re-encode every such part at `zstd_level` anyway, with others
-  or alone once its partition is idle, so the parts at rest are the same bytes, and only parts not merged yet
-  are larger (1.68 instead of 1.12 bytes per row for a CPU temperature). Where nothing merges
-  (`merge_idle_s = -1`, `merge_threads = 0`) parts stay as inserted. `-1` writes inserts at `zstd_level` as
-  before. In the Rust, Python and Java embedded bindings (`insert_zstd_level`, `insertZstdLevel`);
-  `tsdb-bench --insert-zstd N --merge-threads N --fresh`, `insert-bench` and `scale-bench load --insert-zstd N`.
-  `TSDB_ABI_VERSION` is 3: `insert_zstd_level` follows `pin_index` and grows `tsdb_options` by 8 bytes.
-
-### Changed
-- Hour cuts: a granule ends at a UTC hour edge when at least 3000 rows of its series lie in the hour before it
-  (a row every 1.2 s or faster), so hourly buckets and the days of zones a whole number of hours from UTC
-  (Europe/Oslo, but not Asia/Kolkata) are answered from granule statistics instead of decoding the granules around
-  each edge. The rule counts the rows of the hour: a series below 3000 rows an hour keeps its granules as before,
-  whether steady or in bursts (a burst is as fast as 1 Hz while it lasts), and whatever its class. Cost: more,
-  smaller granules, each extra one 60-320 bytes depending on the codecs (an index entry, the frames of a timestamp
-  and a value block, compression context): 1-6% more bytes on the 1 Hz data sets measured (15%, or 0.018 bytes a
-  row, on a nearly constant one), up to 10% just above the threshold (1.1-1.2 s), under 1% for faster series and
-  none for slower ones. The layout changes, not the format (no `FORMAT_VERSION` bump): readers take any granule
-  boundaries, and a database written before keeps its granules until merges rewrite them. Merges copy granules
-  only where a writer given their rows would cut them the same way, so a merged layout stays put. Answers stay the
-  same; only float sums (float32 and float64, summed in doubles per granule), variances and TWA areas can differ
-  in the last bits.
-
-## [0.9.0] - 2026-11-04
+## [0.9.0] - 2026-11-05
 
 The first release. **Disk format version 8, wire protocol version 12** (the server and the clients refuse a peer
-below 12 at HELLO), **embedded C ABI version 2**, series ids of 64 bits, **login required by default**. Both
+below 12 at HELLO), **embedded C ABI version 3**, series ids of 64 bits, **login required by default**. Both
 formats may still change in a 0.9.x
 release and freeze at 1.0 ([docs/compatibility.md](docs/compatibility.md)). Nothing was released before this
 version, so there is nothing to upgrade from; if you ran a development build, a database of disk format 5, 6 or
@@ -62,6 +31,13 @@ The engine (the library, `libtsdb`)
   converted to psi come down to 0.14-0.20 times their float64 size with the dictionary codec. Background merges
   try the better codecs, re-encode what inserts wrote and rewrite a partition's only insert-written part once the
   partition is idle (`merge_idle_s`) or on `tsdb_optimize`.
+- Inserts and memtable flushes write their parts without zstd (`tsdb_options.insert_zstd_level`, default 0;
+  tsdbd `--insert-zstd-level`): background merges re-encode every such part at `zstd_level` anyway, with others
+  or alone once its partition is idle, so the parts at rest are the same bytes, and only parts not merged yet
+  are larger (1.68 instead of 1.12 bytes per row for a CPU temperature). Where nothing merges
+  (`merge_idle_s = -1`, `merge_threads = 0`) parts stay as inserted. `-1` writes inserts at `zstd_level`. Also in
+  the Rust, Python and Java embedded bindings (`insert_zstd_level`, `insertZstdLevel`);
+  `tsdb-bench --insert-zstd N --merge-threads N --fresh`, `insert-bench` and `scale-bench load --insert-zstd N`.
 - Partition classes: each series gets partitions of 1, 7, 28 or 364 base partitions (`partition_ms`), the
   shortest that holds at least eight granules of it, chosen from its rate (a fresh series from its first batch,
   others when an idle merge measures them; a band widened 2x either way keeps them from flapping, and a class is
@@ -92,7 +68,7 @@ The engine (the library, `libtsdb`)
   fsync is fail-stop. Tested by killing the process, simulated power loss and injected I/O errors (`make jepsen`).
 - One writer and any number of read-only followers on other hosts over NFS.
 - SIMD aggregation kernels for float32, float64, int64 and bool at four CPU levels (AVX-512, AVX2, AVX,
-  SSE4.2) that give identical results on every CPU.
+  SSE4.2, and a scalar fallback) that give identical results on every CPU.
 - tsdbd says at startup when a database or volume directory is on ext2/3/4 or XFS and
   `--verify-checksums` is off: those file systems keep no checksums of the data, so a damaged or misdirected
   data block would be read as wrong values. Turn the option on there, or use a file system that checks its data
@@ -109,7 +85,12 @@ The server (`tsdbd`)
 - Options: `--port 0 --port-file FILE` for scripts and tests, `--version`, `--query-threads N` (threads for
   queries, default one per CPU), `--request-threads N` (at most this many for one request, default all),
   `--multi-max-rows N` (rows or buckets of one QUERY_MULTI, default 268,435,456), `--granule-rows N` (at
-  creation), `--merge-idle-s N`, `--flush-interval-ms N`, `--pin-index`.
+  creation), `--merge-idle-s N`, `--flush-interval-ms N`, `--pin-index`, `--insert-zstd-level N`.
+- `--exit-with-parent`: the server stops as on SIGTERM (clean close, memtable flushed, status 0) once the
+  process that started it is gone, checked once a second; it refuses to start if the parent is already init, and
+  with `--exit-with-parent=PID` if the parent is not PID (a launcher that died before tsdbd read its options, under
+  a subreaper such as `systemd --user`). Every test harness, the client test helpers and the benchmark scripts pass
+  it with their own pid, so a test killed by a timeout no longer leaves its server running.
 
 Logins and access control (protocol 12, [docs/design-auth.md](docs/design-auth.md))
 - tsdbd lets in only clients that log in with SCRAM-SHA-256, as PostgreSQL does: the password never crosses the
@@ -242,22 +223,23 @@ For anyone who ran a development build; a first install is not affected.
   (the build that wrote it) and `tsdb import` (this one); every series then gets its class on its first batch.
   The export stream is unchanged, version 1: it names series, never ids, so every stream written so far imports
   as before.
-- **Wire protocol 11.** Every series id in a request or reply is a `u64`, and `tsdbd` and the clients refuse a peer
-  below 11 at HELLO (`TSDB_ERR_INVALID`; there is no operation that a version-10 peer and this one could both do
-  safely). The two version-1 aggregate operations QUERY_AGG and QUERY_GROUP are removed: QUERY_BUCKETS and
-  QUERY_BOUNDS answer the same queries. Ids cost 4 bytes more per request (nothing more where a reserved word
-  took it, about nothing in packed inserts). Upgrade the server and its clients together.
-- **Wire protocol 12: login.** HELLO's reply says whether the server wants a login; the floor is now 12 on both
-  sides. tsdbd no longer starts on a database without a superuser: add one with
+- **Wire protocol 12** (11 widened the ids, 12 added login). Every series id in a request or reply is a `u64`, and
+  `tsdbd` and the clients refuse a peer below 12 at HELLO (`TSDB_ERR_INVALID`; there is no operation that a
+  version-10 peer and this one could both do safely). The two version-1 aggregate operations QUERY_AGG and
+  QUERY_GROUP are removed: QUERY_BUCKETS and QUERY_BOUNDS answer the same queries. Ids cost 4 bytes more per
+  request (nothing more where a reserved word took it, about nothing in packed inserts). HELLO's reply says
+  whether the server wants a login. tsdbd no longer starts on a database without a superuser: add one with
   `tsdb <dir> user add NAME --superuser`, or start it with `--no-auth` to keep the old open behaviour (tests and
-  try-outs only). Clients connecting without a user work only with `--no-auth`; with one they log in.
+  try-outs only). Clients connecting without a user work only with `--no-auth`; with one they log in. Upgrade the
+  server and its clients together.
 - **Series ids in the programming interfaces.** Every id is at least 2^32 and 0 is never one, so an id cut to 32
   bits in a cast, a Java `int`, a Rust `as u32` or a Python `"I"` is refused instead of being taken for another
   series: a query of such an id (or of one with any of bits 48-63 set) answers `TSDB_ERR_INVALID` rather than an
   empty range, while a well formed id that is unknown still has no rows. Ids are not dense any more: list series
   with `tsdb_series_foreach` (C), `series_ids` (Rust and Python `Db`) or `seriesIds` (Java `EmbeddedDb`), or
   `TSDB_SID(v, 0 .. tsdb_volume_series_count(db, v) - 1)`, never `0 .. tsdb_series_count() - 1` (which now returns
-  `uint64_t`); look ids up by name. `tsdb_abi_version` (now 2) names the layout of the C ABI the bindings check.
+  `uint64_t`); look ids up by name. `tsdb_abi_version` (3 in this release) names the layout of the C ABI the
+  bindings check.
   C `tsdb_sid`, Rust `SeriesId` (`u64`), Python `int` (numpy `uint64` or `int64` columns; a 32-bit column raises
   `TypeError`), Java `long` and `long[]` (the methods that took `int` ids are gone, not overloaded). `tsdb series`
   prints the id. The Pulsar sink keeps its ids as `long`.
@@ -271,7 +253,21 @@ For anyone who ran a development build; a first install is not affected.
   open, so damage that appears later cannot change answers; the copy costs about 32 to 51 bytes of RAM per
   granule in every process that opens the part (at least one granule per series and partition: 51 GB per
   partition generation at 10^9 series), reported as `tsdb_volume_stats.pinned_bytes` and the metric
-  `tsdb_pinned_index_bytes`. `TSDB_ABI_VERSION` is 2 (`pin_index` sits in what was padding of `tsdb_options`).
+  `tsdb_pinned_index_bytes`. `pin_index` sits in what was padding of `tsdb_options` (ABI 2), and
+  `insert_zstd_level` (see "Added") follows it and grows the struct by 8 bytes: `TSDB_ABI_VERSION` is 3.
+- Hour cuts: a granule ends at a UTC hour edge when at least 3000 rows of its series lie in the hour before it
+  (a row every 1.2 s or faster), so hourly buckets and the days of zones a whole number of hours from UTC
+  (Europe/Oslo, but not Asia/Kolkata) are answered from granule statistics instead of decoding the granules around
+  each edge. The rule counts the rows of the hour: a series below 3000 rows an hour keeps its granules as before,
+  whether steady or in bursts (a burst is as fast as 1 Hz while it lasts), and whatever its class. Cost: more,
+  smaller granules, each extra one 60-320 bytes depending on the codecs (an index entry, the frames of a timestamp
+  and a value block, compression context): 1-6% more bytes on the 1 Hz data sets measured (15%, or 0.018 bytes a
+  row, on a nearly constant one), up to 10% just above the threshold (1.1-1.2 s), under 1% for faster series and
+  none for slower ones. The layout changes, not the format (no `FORMAT_VERSION` bump): readers take any granule
+  boundaries, and a database written before keeps its granules until merges rewrite them. Merges copy granules
+  only where a writer given their rows would cut them the same way, so a merged layout stays put. Answers stay the
+  same; only float sums (float32 and float64, summed in doubles per granule), variances and TWA areas can differ
+  in the last bits.
 - Python: aggregate queries (`query_agg`, `query_group`, `query_bounds` and the rest) return `Buckets` instead of
   a list of `Bucket`: a `collections.abc.Sequence` of `Bucket` (indexing, slices, iteration, `+` and `==` with
   lists, `count()`, `index()`), with a numpy column per field (`start`, `counts`, `sum`, `min`, `max`, `avg`,
@@ -424,8 +420,10 @@ Import
 
 - No TLS: data, queries and login exchanges travel in the clear (a recorded login lets an eavesdropper guess
   the password offline), and the metrics port has no login. tsdbd belongs on a trusted network only. Put it
-  behind a firewall or a private network, and bind it to the interface you mean (`--listen`). State names are
-  shared by the series of a volume, across tenants (SECURITY.md).
+  behind a firewall or a private network, and bind it to the interface you mean (`--listen`, `--metrics-bind`).
+  The library and `tsdb <dir>` open the files directly and need no login: the file permissions decide. State
+  names are shared by the series of a volume, across tenants, and a series id shows how many series its volume
+  held before (SECURITY.md).
 - One writing server per database. Read-only followers can read the same directory; automatic failover is
   designed (docs/ha.md) but not built.
 - The disk format (version 8) and the wire protocol (version 12) may still change in a 0.9.x release, with

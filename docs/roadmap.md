@@ -12,7 +12,7 @@ series store underneath; tsdb does not duplicate it.
 ## Done
 
 - 64-bit series ids, from the failover design (docs/ha.md §5): `(volume + 1) << 32 | local`, so an id names its
-  volume and routing needs no table; `CATALOG` is gone (disk format 8, protocol 11, all four clients, the
+  volume and routing needs no table; `CATALOG` is gone (disk format 8, protocol 11 and then 12, all four clients, the
   embedded bindings and the Pulsar sink). It changed the protocol and the on-disk layout before the formats
   freeze, so failover can follow in 1.1 without a break. The design is docs/design-series64.md.
 - Many series in one request (protocol 10, QUERY_MULTI and CANCEL): values, buckets (fixed, calendar in any
@@ -22,7 +22,21 @@ series store underneath; tsdb does not duplicate it.
   and threads per query that follow the rows it decodes.
 - Time-weighted averages (step and linear, staleness limit), LTTB downsampling, canonical NaN results, in the
   library, tsdbd and the C client and CLI.
-- Edge buffering: the Apache Pulsar 5 sink (connectors/pulsar).
+- Logins and access control (protocol 12, docs/design-auth.md): SCRAM-SHA-256 login (the password never crosses
+  the network), rights `read`, `insert`, `delete` and `admin` per user on all series, a name prefix (a tenant), one
+  series or a glob, tenant admins, the `USERS` file and `tsdb <dir> user ...` (also through the server), login in
+  all four clients and the Pulsar sink, `--no-auth` for tests, a measured cost (BENCHMARKS.md). **TLS is still to
+  do** (below): until then data and login exchanges travel in the clear and tsdbd belongs on a trusted network.
+- Edge buffering: the Apache Pulsar 5 sink (connectors/pulsar), with login, the choice of series (names, prefixes,
+  a pattern or all; the rest are acknowledged and counted), a volume per name, and only the processing guarantee
+  ATLEAST_ONCE (nothing is taken off Pulsar before tsdb has it on disk).
+- Parts that inserts write without zstd (`insert_zstd_level`, merges re-encode them) and granules cut at hour
+  edges for series of one row every 1.2 s or faster, so hourly buckets and the days of whole-hour zones come from
+  granule statistics (CHANGELOG.md).
+- Fixes found by `make jepsen` and review before the release (CHANGELOG.md, "Fixed"): last write wins in real
+  time, damage at rest never taken for a torn tail, followers that catch up after a writer restart.
+- A first SIMD bit-unpacking kernel: AVX2 shuffles for widths 1-25 at the v3 level (src/bitpack.h; unpack 5.5-8.5
+  times faster on an i9-10850K, docs/tasks/intel-10850k-results.md). See the table below for what is left.
 - Limits: raw, bucketed, bounds, calendar, time-weighted, spread and LTTB queries take an order and a limit;
   bucketed queries with a limit stop early (protocol 9, C client and CLI).
 - Embedded bindings: Rust (`tsdb_client::Db`), Python (`tsdb_client.Db`) and Java 22+ (FFM, client/java-embedded).
@@ -42,22 +56,40 @@ series store underneath; tsdb does not duplicate it.
 
 ## Releases 0.9.0 and 1.0
 
-Decided on 2026-10-24 and 2026-10-25: the first release is 0.9.0. The disk format and the wire
+Decided on 2026-10-24 and 2026-10-25: the first release is 0.9.0 (cut on 2026-11-05). The disk format and the wire
 protocol freeze at 1.0, not before: a 0.9.x release may still change them, with a way to carry data over
 (export and import, or a migration) and a database of another format refused with a clear message. 1.0 is one
 writing server per database (read-only followers on other hosts over NFS); failover comes after it. What 0.9.0
-and 1.0 still need (the format and protocol changes may land in a 0.9.x, but before 1.0):
+and 1.0 needed (the format and protocol changes may land in a 0.9.x, but before 1.0); done in 0.9.0 unless it says
+otherwise:
 
 - Input safety: client-chosen volume paths, query memory that follows rows, crafted files, network frames,
-  client and CLI parsing; fuzzing of decoders, file loaders and frames (done in 0.9.0).
+  client and CLI parsing; fuzzing of decoders, file loaders and frames.
+- Logins and per-series rights (see Done); the security policy is SECURITY.md.
 - SIMD kernels for float64, int64 and bool, the spread, time-weighted averages and LTTB, at every CPU level
   (AVX-512, AVX2, x86-64-v2), with identical results on every CPU (done in 0.9.0).
 - Release mechanics: version and tag, release notes, the compatibility promise (which formats and protocol
-  versions 1.x reads), the portable tarball checked on AlmaLinux 10; export and import for 0.9.x format changes.
+  versions 1.x reads), the portable tarball checked on AlmaLinux 10; export and import for 0.9.x format changes
+  (docs/release.md, docs/compatibility.md).
 - The release benchmarks: the full comparison (bench/dbcmp) and the internal numbers on a quiet machine (done: bench/dbcmp/results/0.9.0.md, README).
-- VALUE_PROPOSITION.md for decision makers, written from the full comparison: storage cost compared to the most
+- Not done: VALUE_PROPOSITION.md for decision makers, written from the full comparison: storage cost compared to the most
   popular systems (InfluxDB first, per the DB-Engines ranking), servers needed, and the honest limits (one writer
-  per database until failover; results to confirm with a pilot on the customer's data).
+  per database until failover; results to confirm with a pilot on the customer's data). A skeleton is on the branch
+  `release-docs`, not on main.
+
+## Next
+
+What comes after 0.9.0, in the order it is likely to be done. The format and the protocol freeze at 1.0, so what
+changes them goes before it:
+
+1. TLS for the client port (and the metrics port), with `SCRAM-SHA-256-PLUS` channel binding: the one thing logins
+   still lack (SECURITY.md). It needs no protocol break (a flag), so it may come after 1.0.
+2. The comparison of the CPU unpack kernels on the machines the user measures on (Zen 4 and Zen 5 at v4, with the
+   AVX2 kernel switched on by `-DTSDB_UNPACK_AVX2` and `build/decode-bench`; VBMI and BMI2 variants, see the tasks in
+   docs/tasks): it waits for those measurements, and it needs no format change.
+3. Anything from the 0.9.x field use that changes the format or the protocol, and the VALUE_PROPOSITION.md above.
+
+After 1.0: failover with one writer per volume, then the rows of the next table.
 
 ## After the first release
 
@@ -67,7 +99,7 @@ and 1.0 still need (the format and protocol changes may land in a 0.9.x, but bef
 | TLS | logins and per-series rights came in 0.9.0 (docs/design-auth.md); without TLS data and login exchanges travel in the clear, so tsdbd belongs on a trusted network until then. With TLS the server offers `SCRAM-SHA-256-PLUS` (channel binding, design-auth.md A3): a flag, not a protocol break |
 | Store on change (opt-in, per series) | keep a row only when the value changes, plus a heartbeat row after a maximum gap so a silent sensor is not mistaken for a steady one (decided on 2026-10-26). Measured on 2026-10-26 (1000 series x 86,400 rows, sizes compared to keeping every row): it pays where values repeat and timestamps jitter (slow float32 0.09x, door 0.007-0.03x, 5-state mode 0.01-0.03x, counter 0.11-0.12x; raw-row queries 11-312x faster), saves less with exactly regular timestamps (0.2-0.9x: they already cost 0.03 bits a row), and costs on series that change almost every sample (1.11x jittered) and on most real hydraulic sensors (14 of 17 larger, up to 1.16x), so it stays opt-in per series. Step TWA gives identical answers on both; a client-side filter costs about 1 ns a row. Exact equality only by default (a deadband threshold would be lossy compression). Counts and plain averages then count stored rows; time-weighted averages and the `state` type stay right. Start in the clients and the Pulsar connector (no engine or format change); an engine option in the series dictionary only if that is not enough, before the 1.0 freeze |
 | Interpolation at query time (resampling to a finer or regular grid) | decided on 2026-10-26, replacing the earlier "not planned". A query names a range, an output step and a method, and gets one value per step: previous value (step, last observation carried forward), nearest, linear, monotone cubic (PCHIP, never overshoots the readings) and Akima (smooth, little ripple). All five are local (two readings on each side at most), so they run one granule run at a time like the TWA code, whose rules they reuse: the reading before the range is carried in, nulls and gaps longer than `max_gap_ms` give null instead of a made-up value, deleted and expired readings do not exist. bool and state allow previous and nearest only. One timestamp gives the value at a time. A cap on output points like the bucket limits; written without FMA so every CPU level gives the same values. A new operation in the protocol, in all four clients and the embedded bindings in one change. Pairs with store on change: previous value rebuilds the regular series from changes only |
-| SIMD bit unpacking in the codecs | decided on 2026-11-01. Decoding a bit-packed block (decimal_bp, the integer and bool/state codecs) is unpack, then the zigzag running sum, then the conversion to values. The compiler vectorizes only the conversion (AVX2 at v3, AVX-512 at v4); the running sum is hand-written SSE2, 4 lanes; the unpack (`unpack_W` in src/bitpack.h) stays scalar, one value per iteration at every level (checked in the -O3 assembly of codec.c), and it is the bottleneck. Write AVX2 and AVX-512 unpackers for the current LSB-first layout (shuffles and variable shifts: no format change), and widen the running sum to 8 and 16 lanes; both live in the per-level files (levels.h). Every level must give identical values (tests/test_levels.c, every width 0-32 and the tails of a 1024-value vector); measure with build/codec-bench and build/type-bench on a quiet machine, decode speed per codec, mean of several runs. A FastLanes-style interleaved layout could be faster still but changes the format, so it would have to come before the 1.0 freeze; decide on the numbers of the layout-preserving version first. VBMI's VPMULTISHIFTQB (row below) is a further step on CPUs that have it |
+| SIMD bit unpacking in the codecs | decided on 2026-11-01. Partly done: the AVX2 shuffle unpacker for widths 1-25 runs at the v3 level (and on CPUs without AVX-512BW) and gave 5.5-8.5x on the unpack (docs/tasks/intel-10850k-results.md); v4 keeps the portable loops until the kernels are measured on AVX-512 hardware (the user's measurements on the 7950X and 9950X; `-DTSDB_UNPACK_AVX2`, `build/decode-bench`),. The original plan follows. Decoding a bit-packed block (decimal_bp, the integer and bool/state codecs) is unpack, then the zigzag running sum, then the conversion to values. The compiler vectorizes only the conversion (AVX2 at v3, AVX-512 at v4); the running sum is hand-written SSE2, 4 lanes; the unpack (`unpack_W` in src/bitpack.h) stays scalar, one value per iteration at every level (checked in the -O3 assembly of codec.c), and it is the bottleneck. Write AVX2 and AVX-512 unpackers for the current LSB-first layout (shuffles and variable shifts: no format change), and widen the running sum to 8 and 16 lanes; both live in the per-level files (levels.h). Every level must give identical values (tests/test_levels.c, every width 0-32 and the tails of a 1024-value vector); measure with build/codec-bench and build/type-bench on a quiet machine, decode speed per codec, mean of several runs. A FastLanes-style interleaved layout could be faster still but changes the format, so it would have to come before the 1.0 freeze; decide on the numbers of the layout-preserving version first. VBMI's VPMULTISHIFTQB (row below) is a further step on CPUs that have it |
 | Codec-compressed inserts for slow links | decided on 2026-11-02, for later. The clients send about 6 bytes per reading today (packed deltas, then zstd, which shrinks float values little); tsdb stores about 1.2. A new insert frame with columns per series, timestamps as bit-packed delta-of-delta and values with a decimal scale and bit-packed deltas (falling back to XOR or raw), would make the wire about 5 times smaller. The server decodes it into rows and encodes for storage as now, so it trusts nothing from the client and its work stays about the same; the client encoders need only be lossless, not bit-identical to the engine's. It pays where the link is the limit: on 1 Gb/s the wire caps ingest at about 20 M readings/s today and about 100 M with the codecs, and on WAN, cellular or metered links from edge sites; on 10 Gb/s and faster the server is the limit. A client picks codecs or plain zstd per connection (codec choice costs more client CPU than zstd level 1). A protocol change: all four clients |
 | A timestamp encoder for jittered clocks | found on 2026-11-02 profiling small buckets (branch minute-buckets): zstd decompression is 43-51% of a 1-thread query on 60-sample buckets, mostly timestamp blocks of jittered clocks that zstd barely shrinks (the 1/8 keep rule, branch ts-zstd-rule, stores half of tank_bar's and tank_psi's timestamp blocks raw for +0.5% bytes overall). An encoder made for a clock with jitter (deltas around a period: bit-packed residuals, or a small entropy coder on them) instead of zstd on top of DoubleDelta would make those blocks both smaller and fast to decode, and would let bucket edges be found arithmetically. Measure on the 8 generated clocks and the hydraulic sets, every CPU level byte-identical |
 | tsdbd: fewer wakes per request | after branch tsdbd-multi-perf (2026-11-02: workers send their own replies; the 10,000-series aggregate over TCP 83 -> 26 ms, embedded 10.7 ms) the event loop is still about 96% busy: about 41% of it is one futex wake to start a worker per request, about 34% re-arming the io_uring receive. Next: one batched wake per loop pass, multishot receive, or several event loops; measured with build/scale-bench query --port on 10,000 series |

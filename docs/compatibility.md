@@ -8,7 +8,11 @@ protocol** (what tsdbd and its clients say to each other). Both have a version n
 |---|---|---|
 | release version | the file `VERSION`, `tsdb.h` (`TSDB_VERSION`), `tsdbd --version`, `tsdb --version` | 0.9.0 |
 | disk format version | `FORMAT_VERSION` in `src/internal.h`, in the `META` and `MANIFEST` files | 8 |
-| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 11 |
+| wire protocol version | `TSDB_PROTOCOL_VERSION` in `include/tsdb_protocol.h`, answered to `HELLO` | 12 |
+| oldest protocol spoken (the floor) | `TSDB_PROTOCOL_MIN` in `include/tsdb_protocol.h` | 12 |
+| embedded C ABI version | `TSDB_ABI_VERSION` in `include/tsdb.h`, `tsdb_abi_version()` | 3 |
+
+0.9.0 reads databases of disk format 8 only, and speaks to clients and servers of protocol 12 only.
 
 ## Disk format versions
 
@@ -45,10 +49,11 @@ volume path, for example, changes both). So:
   way: a newer release's database is not read by an older release.
 - **Use the same release for the server and its clients.** On connect a client sends `HELLO` with the
   protocol version it speaks, and the server answers with the lower of its own and the client's. Each 0.9.x
-  release names the oldest protocol it speaks (the floor, 11 now): the server refuses a client below it,
-  and a client refuses a server below it, with `TSDB_ERR_INVALID` at connect. The release that moved the
-  floor to 11 did so because every series id on the wire became 64 bits: a version-10 peer would read a
-  `u32` where a `u64` is sent, so there is no operation both could do safely. Above the floor, a client
+  release names the oldest protocol it speaks (the floor, 12 now): the server refuses a client below it,
+  and a client refuses a server below it, with `TSDB_ERR_INVALID` at connect. The floor moved to 11 because
+  every series id on the wire became 64 bits (a version-10 peer would read a `u32` where a `u64` is sent, so
+  there is no operation both could do safely), and to 12 because every connection now logs in (a version-11
+  peer has no login messages and no rights to check). Above the floor, a client
   never sends what the server's version does not know: if it asks for something that needs a newer server,
   the call fails with `TSDB_ERR_INVALID` without sending it. Across a 0.9.x release that changed the
   protocol we do not promise more than that: upgrade the server and its clients together, the server last.

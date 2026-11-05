@@ -219,7 +219,7 @@ cgroup, so `nice` does not keep your work out of its way.
   `TSDB_ERR_NOTFOUND` for lookups). A 32-bit variable, `%u`, Java `int`, Rust `as u32` or Python `"I"` that holds an
   id is a bug that tests with ids above 2^32 find; row files of the benchmarks keep a u32 series NUMBER that indexes
   the bench's table of ids, never an id. Ids are never reused and mean nothing in another database (export and
-  import name series, not ids). `tsdb_abi_version` changes when the C structs or signatures the bindings use change.
+  import name series, not ids). `tsdb_abi_version` (3 in 0.9.0) changes when the C structs or signatures the bindings use change.
 - **Crash recovery** relies on each part's `wal_seq`: a WAL segment is replayed
   only into partitions without a part from that segment.
 - **NFS followers.** MANIFEST is rewritten in place with a checksum, never
@@ -352,9 +352,9 @@ cgroup, so `nice` does not keep your work out of its way.
   without it a damaged granule decodes to wrong values; decoders must therefore
   be safe (no UB, no overread) on any bytes. With `fsync = 0` a power loss looks
   like damage and fails the open.
-- **Protocol.** There has been no release yet, so the wire protocol may change
-  without keeping old clients working (decided on 2026-10-24): no
-  legacy paths for earlier protocol versions in new designs. Every change must
+- **Protocol.** Until 1.0 (0.9.0 is the first release, 2026-11-05) the wire protocol may change
+  without keeping old clients working (decided on 2026-10-24; the changelog of the release that moves it names
+  the new version and the floor): no legacy paths for earlier protocol versions in new designs. Every change must
   reach the C, Rust, Python and Java clients in the same commit, with
   `make test-clients` green. History so far: version 2 typed operations, 3
   packed inserts, 4 QUERY_BOUNDS (the server knows UTC only), 5 LTTB, 6 TWA,
