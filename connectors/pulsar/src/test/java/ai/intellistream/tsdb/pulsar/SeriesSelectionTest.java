@@ -117,4 +117,29 @@ class SeriesSelectionTest {
         assertThrows(IllegalArgumentException.class, () -> TsdbSinkConfig.load(Map.of("volumes", Map.of("a", "rel"))));
         assertThrows(IllegalArgumentException.class, () -> TsdbSinkConfig.load(Map.of("seriesPrefix", List.of("a"))));
     }
+
+    /**
+     * The pattern runs on Pulsar's single write() thread, and a counted repetition such as (.*a){12}b takes seconds
+     * on one name: it runs once per name, not once per point, and the answers it remembers are bounded.
+     */
+    @Test
+    void thePatternRunsOncePerName() {
+        SeriesSelection s = new SeriesSelection(List.of("exact"), List.of("acme."), "pump[0-9]+\\.flow", null);
+        for (int i = 0; i < 1000; i++) {
+            assertTrue(s.matches("pump7.flow"));
+            assertFalse(s.matches("pump7.temp"));
+        }
+        assertEquals(2, s.patternRuns.get());
+        assertTrue(s.matches("exact") && s.matches("acme.x")); /* names and prefixes do not need the pattern */
+        assertEquals(2, s.patternRuns.get());
+
+        SeriesSelection small = new SeriesSelection(null, null, "p[0-9]+", null, 4);
+        for (int round = 0; round < 3; round++)
+            for (int i = 0; i < 4; i++)
+                assertTrue(small.matches("p" + i));
+        assertEquals(4, small.patternRuns.get()); /* four names fit */
+        assertTrue(small.matches("p4")); /* the fifth clears the full cache and starts it again */
+        assertTrue(small.matches("p4") && small.matches("p0"));
+        assertEquals(6, small.patternRuns.get());
+    }
 }

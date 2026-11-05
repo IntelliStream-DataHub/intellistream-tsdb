@@ -93,6 +93,13 @@ array of points, or one series with arrays: `{"series": "s", "ts": [1, 2],
    wait in the sink for hours. An ack timeout would deliver them again meanwhile,
    and the copy, queued behind newer messages of its key, would overwrite their
    values. The sink refuses to start with one.
+5. **Keep the processing guarantee at `ATLEAST_ONCE`** (the default). With
+   `EFFECTIVELY_ONCE` Pulsar acknowledges cumulatively: acknowledging a later
+   message (one the selection skips, or one whose connection was faster) would
+   also take earlier messages off Pulsar that tsdb does not have yet, and a
+   crash would lose them. The sink refuses to start with it. Nothing is gained
+   by it anyway: tsdb keeps the last value written per series and time, so a
+   message delivered twice changes nothing.
 
 Note: the Pulsar 5.0 announcement says the v4 subscription types (Shared,
 Key_Shared, Failover, Exclusive) remain supported next to scalable topics;
@@ -183,7 +190,11 @@ are its own:
 |---|---|
 | `series` | a list of exact series names |
 | `seriesPrefixes` | a list of name prefixes: how tenants are usually named (`acme.`, `globex.`) |
-| `seriesPattern` | a Java regular expression the **whole** name must match (`pump[0-9]+\.flow`) |
+| `seriesPattern` | a Java regular expression the **whole** name must match (`pump[0-9]+\.flow`). It runs once per series name, and the answer is remembered (for up to 65,536 names), not once per message |
+
+`series` and `seriesPrefixes` are JSON lists (`["acme.", "globex."]`). A single
+string is a list of one, but a single string with a comma (`"acme.,globex."`)
+is refused at start: it would be one prefix that matches nothing.
 
 The three add up: a series is taken if it is in `series`, or starts with one
 of the `seriesPrefixes`, or matches `seriesPattern`. If none of the three is set,
@@ -367,7 +378,8 @@ to 1000 characters.
 
 ## Metrics
 
-Reported through the sink context: `tsdb_records_written`, `tsdb_rows_written`,
+Reported through the sink context: `tsdb_records_written` (messages acknowledged
+after tsdb took them, each counted once), `tsdb_rows_written`,
 `tsdb_retries`, `tsdb_dead_lettered`, `tsdb_skipped_records` and `tsdb_skipped_points` (messages and points
 dropped because their series is outside `series` / `seriesPrefixes` / `seriesPattern`), `tsdb_dead_letter_failures` (alert on it:
 the stream waits for the dead-letter topic), `tsdb_backoff_ms` (current delay, 0

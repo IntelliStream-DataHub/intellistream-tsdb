@@ -2,10 +2,12 @@ package ai.intellistream.tsdb.pulsar;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 
 /**
@@ -19,13 +21,25 @@ import java.util.regex.Pattern;
  * volume; the longest matching key wins. Names no key matches have no volume: they are created in the database
  * directory.
  *
- * <p>Immutable and thread safe.
+ * <p>Immutable apart from the cache of the pattern's answers, and thread safe.
  */
 final class SeriesSelection {
     private final boolean all;
     private final Set<String> names;
     private final List<String> prefixes;
     private final Pattern pattern;
+    /*
+     * The pattern's answer per name. A pattern runs on Pulsar's single write() thread and some take seconds on one
+     * name (a counted repetition such as (.*a){12}b backtracks); without this it would run again for every point.
+     * Bounded by entries and characters, and cleared when full: a name then costs the pattern once per fill.
+     */
+    static final int PATTERN_CACHE_ENTRIES = 65536;
+    static final long PATTERN_CACHE_CHARS = 4L << 20;
+    private final int cacheEntries;
+    private final HashMap<String, Boolean> patternCache = new HashMap<>(); /* guarded by itself */
+    private long cacheChars; /* guarded by patternCache */
+    /** How often the pattern ran, for tests. */
+    final AtomicLong patternRuns = new AtomicLong();
     /** The keys of the volume map, longest first, so that the first match is the longest. */
     private final List<Map.Entry<String, String>> volumes;
 
@@ -39,6 +53,13 @@ final class SeriesSelection {
      * @throws IllegalArgumentException for an empty name or prefix, an invalid pattern or a path that is not absolute
      */
     SeriesSelection(List<String> series, List<String> prefixes, String pattern, Map<String, String> volumes) {
+        this(series, prefixes, pattern, volumes, PATTERN_CACHE_ENTRIES);
+    }
+
+    /** For tests: a pattern cache of {@code cacheEntries} names. */
+    SeriesSelection(List<String> series, List<String> prefixes, String pattern, Map<String, String> volumes,
+            int cacheEntries) {
+        this.cacheEntries = cacheEntries;
         this.names = new HashSet<>();
         for (String s : orEmpty(series)) {
             if (s == null || s.isEmpty())
@@ -113,7 +134,27 @@ final class SeriesSelection {
         for (String p : prefixes)
             if (name.startsWith(p))
                 return true;
-        return pattern != null && pattern.matcher(name).matches();
+        return pattern != null && patternMatches(name);
+    }
+
+    private boolean patternMatches(String name) {
+        Boolean known;
+        synchronized (patternCache) {
+            known = patternCache.get(name);
+        }
+        if (known != null)
+            return known;
+        patternRuns.incrementAndGet();
+        boolean m = pattern.matcher(name).matches(); /* outside the lock: it may take long */
+        synchronized (patternCache) {
+            if (patternCache.size() >= cacheEntries || cacheChars + name.length() > PATTERN_CACHE_CHARS) {
+                patternCache.clear();
+                cacheChars = 0;
+            }
+            if (patternCache.put(name, m) == null)
+                cacheChars += name.length();
+        }
+        return m;
     }
 
     /**

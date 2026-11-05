@@ -11,6 +11,7 @@ import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import org.apache.pulsar.io.core.SinkContext;
 import org.junit.jupiter.api.Test;
@@ -51,7 +52,7 @@ class LoginConfigTest {
     @Test
     void theSelectionComesThroughWithTheSecrets() {
         TsdbSinkConfig c = TsdbSinkConfig.load(map("user", "acme-sink", "seriesPrefixes", "acme.", "series",
-                java.util.List.of("pump7.flow"), "seriesPattern", "x[0-9]", "volumes", Map.of("acme.", "/vol/acme")),
+                List.of("pump7.flow"), "seriesPattern", "x[0-9]", "volumes", Map.of("acme.", "/vol/acme")),
                 secrets(Map.of("password", "pw-1")));
         assertEquals("pw-1", c.password);
         SeriesSelection s = c.selection();
@@ -60,6 +61,24 @@ class LoginConfigTest {
         assertEquals("/vol/acme", s.volumeFor("acme.a"));
         assertThrows(IllegalArgumentException.class,
                 () -> TsdbSinkConfig.load(map("seriesPrefix", "acme."), secrets(Map.of())));
+    }
+
+    /**
+     * "acme.,globex." written like permanentCodes was one prefix that matched nothing: the sink started and dropped
+     * every message. Refused through both loaders; a JSON list (which may hold a name with a comma) still works.
+     */
+    @Test
+    void aCommaSeparatedStringIsRefusedForTheSelection() {
+        for (String k : List.of("seriesPrefixes", "series")) {
+            for (SinkContext ctx : java.util.Arrays.asList(null, secrets(Map.of()))) {
+                IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                        () -> TsdbSinkConfig.load(map(k, "acme.,globex."), ctx), k);
+                assertTrue(e.getMessage().contains(k) && e.getMessage().contains("JSON list"), e.getMessage());
+                SeriesSelection s = TsdbSinkConfig.load(map(k, List.of("acme.", "globex.")), ctx).selection();
+                assertTrue(s.matches(k.equals("series") ? "globex." : "globex.x"), k);
+                assertTrue(TsdbSinkConfig.load(map(k, List.of("a,b")), ctx).selection().matches("a,b"), k);
+            }
+        }
     }
 
     @Test

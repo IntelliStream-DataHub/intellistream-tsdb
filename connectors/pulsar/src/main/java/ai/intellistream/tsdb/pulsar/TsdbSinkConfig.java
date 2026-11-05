@@ -257,6 +257,10 @@ public class TsdbSinkConfig {
         /* a single name is a list of one; done here because IOConfigUtils converts with a mapper of its own */
         for (String k : List.of("series", "seriesPrefixes")) {
             if (m.get(k) instanceof String one) {
+                /* "acme.,globex." (the way permanentCodes is written) would be one prefix that selects nothing, and
+                 * the sink would acknowledge and drop every message; a list still allows a name with a comma */
+                require(one.indexOf(',') < 0, k + " is one string with a comma: give a JSON list ([\"acme.\", "
+                        + "\"globex.\"]), not a comma separated string");
                 m = new HashMap<>(m);
                 m.put(k, List.of(one));
             }

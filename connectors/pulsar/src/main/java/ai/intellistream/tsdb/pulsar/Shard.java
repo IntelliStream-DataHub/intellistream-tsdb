@@ -192,7 +192,7 @@ final class Shard implements Runnable {
         /* outside the retry: a failure from here on must not write and settle the batch a second time, which would
          * count a part of a record split over shards twice and acknowledge it while another shard still holds it */
         backoff.reset();
-        metrics.batch(batch.size(), rows, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+        metrics.batch(rows, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
         for (Part p : batch) {
             try {
                 settler.settled(p);

@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.apache.pulsar.client.api.schema.GenericObject;
+import org.apache.pulsar.common.functions.FunctionConfig.ProcessingGuarantees;
 import org.apache.pulsar.common.io.SinkConfig;
 import org.apache.pulsar.functions.api.Record;
 import org.apache.pulsar.io.core.Sink;
@@ -84,6 +85,13 @@ public class TsdbSink implements Sink<GenericObject> {
         if (rc != null && rc.getTimeoutMs() != null && rc.getTimeoutMs() > 0)
             throw new IllegalArgumentException("the tsdb sink must run without an ack timeout (timeoutMs / --timeout-ms "
                     + rc.getTimeoutMs() + "): a redelivered copy would overwrite newer values of its key");
+        /* Under EFFECTIVELY_ONCE Pulsar's classic source acknowledges cumulatively: a skipped record, or one whose
+         * shard is faster, acknowledges every earlier record still waiting for tsdb, and a crash then loses those. */
+        if (rc != null && rc.getProcessingGuarantees() == ProcessingGuarantees.EFFECTIVELY_ONCE)
+            throw new IllegalArgumentException("the tsdb sink does not run with --processing-guarantees "
+                    + "EFFECTIVELY_ONCE (its cumulative acknowledgements could take messages off Pulsar before tsdb has "
+                    + "them); use ATLEAST_ONCE, the default: tsdb writes are idempotent (one value per series and time, "
+                    + "the last written), so a redelivered message changes nothing and ATLEAST_ONCE loses nothing");
         boolean ordered = rc != null && (Boolean.TRUE.equals(rc.getRetainOrdering())
                 || Boolean.TRUE.equals(rc.getRetainKeyOrdering()));
         boolean runtimeDeadLetter = rc != null && rc.getDeadLetterTopic() != null && !rc.getDeadLetterTopic().isEmpty();
@@ -261,8 +269,10 @@ public class TsdbSink implements Sink<GenericObject> {
                 log.warn("tsdb sink: record dead-lettered: {}", p.reason());
                 if (!deadLetter.settles())
                     p.record.ack();
-            } else
+            } else {
                 p.record.ack();
+                metrics.recordWritten();
+            }
         } finally {
             limiter.release(p.size);
         }

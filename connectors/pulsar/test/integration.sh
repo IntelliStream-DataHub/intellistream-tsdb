@@ -76,8 +76,12 @@ mkdir -p "$CONN/target/it-classes"
 javac -nowarn -cp "$(cat "$CONN/target/it-cp.txt")" -d "$CONN/target/it-classes" "$HERE/IntegrationDriver.java"
 driver() { java -cp "$CONN/target/it-classes:$(cat "$CONN/target/it-cp.txt")" IntegrationDriver "$@"; }
 
-# a tsdbd that has it ends with this script, however the script ends
-EXIT_WITH_PARENT=$("$ROOT/build/tsdbd" --help 2>&1 | grep -q -- --exit-with-parent && echo --exit-with-parent || true)
+# a tsdbd that has it ends with this script, however the script ends. A here-string, not a pipe: --help exits 2
+# (and grep -q may SIGPIPE it), which under pipefail would fail the pipe and never pass the flag.
+EXIT_WITH_PARENT=
+if grep -q -- --exit-with-parent <<<"$("$ROOT/build/tsdbd" --help 2>&1)"; then
+    EXIT_WITH_PARENT=--exit-with-parent
+fi
 BP=$(free_port); WP=$(free_port) # Pulsar's ports; tsdbd's port comes from tsdbd itself
 TP=
 URL=pulsar://127.0.0.1:$BP

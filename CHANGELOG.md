@@ -166,7 +166,9 @@ Clients and bindings
   Pulsar once it is on disk. A sink instance takes all series or chosen ones (`series`, `seriesPrefixes`,
   `seriesPattern`; the rest are acknowledged and counted in `tsdb_skipped_records` / `tsdb_skipped_points`), and
   `volumes` creates new series in the volume their name maps to (a volume tsdbd does not know dead-letters the
-  message).
+  message). It refuses to start with the processing guarantee `EFFECTIVELY_ONCE`, whose cumulative acknowledgements
+  could take messages off Pulsar before tsdb has them; `ATLEAST_ONCE` (the default) loses nothing, as tsdb writes
+  are idempotent.
 
 The command line (`tsdb`) and tools
 - `tsdb` creates series, inserts, queries, deletes, sets retention, adds volumes, shows stats, parts and series,

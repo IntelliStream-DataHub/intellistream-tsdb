@@ -27,10 +27,10 @@ public final class Metrics {
             ctx.recordMetric("tsdb_" + name, v);
     }
 
-    void batch(long records, long rows, long latencyMs) {
-        written.addAndGet(records);
+    /* records are not counted here: a batch holds parts of records (one per shard a record's points go to), and
+     * parts of records that are dead-lettered */
+    void batch(long rows, long latencyMs) {
         batches.incrementAndGet();
-        record("records_written", records);
         record("rows_written", rows);
         record("batch_latency_ms", latencyMs);
         if (backoffMs.getAndSet(0) != 0)
@@ -42,6 +42,12 @@ public final class Metrics {
         backoffMs.set(delayMs);
         record("retries", 1);
         record("backoff_ms", delayMs);
+    }
+
+    /** A record whose rows tsdb made durable, counted once, when it is acknowledged. */
+    void recordWritten() {
+        written.incrementAndGet();
+        record("records_written", 1);
     }
 
     void deadLettered() {
