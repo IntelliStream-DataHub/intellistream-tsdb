@@ -153,9 +153,9 @@ stop_server() {
 start_server() { # fresh data directory unless $1 = keep
     stop_server
     [ "${1:-}" = keep ] || rm -rf "$SRV"
-    local pf=$OUT/tsdbd.port
+    local pf=$OUT/tsdbd.port me=$BASHPID # the shell that starts tsdbd below, a subshell included (not $$)
     rm -f "$pf"
-    "$B/tsdbd" --dir "$SRV" --no-auth --port "$REQ_PORT" --port-file "$pf" >>"$OUT/tsdbd.log" 2>&1 &
+    "$B/tsdbd" --dir "$SRV" --no-auth --port "$REQ_PORT" --port-file "$pf" --exit-with-parent="$me" >>"$OUT/tsdbd.log" 2>&1 &
     SPID=$!
     for _ in $(seq 300); do
         kill -0 "$SPID" 2>/dev/null || { echo "tsdbd died, see $OUT/tsdbd.log" >&2; exit 1; }

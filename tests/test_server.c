@@ -76,6 +76,8 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
             exit(1);
         }
     }
+    char follow[64];
+    th_follow_me(follow, sizeof follow);
     pid_t pid = fork();
     if (pid == 0) {
         if (eio_mark) {
@@ -91,6 +93,7 @@ static pid_t start_server_with(const char *dir, const char *const *extra)
         const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "4", "--no-auth",
                                 "--no-fsync"};
         int n = eio_mark ? 10 : 11; /* under the shim, syncs are what make data survive its rollback at exit */
+        argv[n++] = follow; /* a killed test leaves no server behind */
         if (getenv("TSDBD_IO")) { /* the event loop backend: make test runs uring and epoll */
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");
@@ -2955,12 +2958,14 @@ static void test_hostile(const char *dir)
         snprintf(target, sizeof target, "%s.bad.target", dir);
         FILE *f = fopen(target, "w");
         CHECK(f && fputs("precious\n", f) >= 0 && fclose(f) == 0);
+        char follow[64];
+        th_follow_me(follow, sizeof follow);
         pid_t pid = fork();
         if (pid == 0) {
             snprintf(tmp, sizeof tmp, "%s.tmp.%d", pf, (int)getpid());
             if (symlink(target, tmp) != 0)
                 _exit(126);
-            execl(bin, "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--no-fsync", "--no-auth",
+            execl(bin, "tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--no-fsync", "--no-auth", follow,
                   (char *)NULL);
             _exit(127);
         }

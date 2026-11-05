@@ -76,8 +76,9 @@ else
 fi
 
 # The README names port 17070, a fixed one a reader may change. Here the server gets any free port and says which:
-# "--port 0 --port-file", the wait loop waits for that file, the client reads the port from it.
-sed -e "s#/tmp/tsdb-qs#$scratch/qs#g" -e "s#--port 17070#--port 0 --port-file $portfile#" \
+# "--port 0 --port-file", the wait loop waits for that file, the client reads the port from it. --exit-with-parent:
+# a quick start killed by its timeout leaves no server behind ($$: the bash running the block, which starts it).
+sed -e "s#/tmp/tsdb-qs#$scratch/qs#g" -e "s#--port 17070#--port 0 --port-file $portfile --exit-with-parent=\$\$#" \
     -e "s#grep -q serving [^ ]*tsdbd.log#test -s $portfile#" -e "s#127.0.0.1 17070#127.0.0.1 \$(cut -d' ' -f1 $portfile)#" \
     -e "s#^\\(build/\\)#$B/#" \
     -e "s#\\([ <(]\\)build/#\\1$B/#g" "$scratch/block.orig" > "$scratch/block.sh"

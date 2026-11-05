@@ -370,11 +370,14 @@ cfg_login() { [ -n "$(cfg_user "$1")" ]; }
 
 # start_server CFG DIR [FLAG...]: tsdbd for CFG on DIR/db, port from its port file, never a port computed here.
 start_server() {
-    local cfg=$1 d=$2 b port="" spid="" i
+    local cfg=$1 d=$2 b port="" spid="" i me=$BASHPID # the shell that starts tsdbd below, a subshell included
     shift 2
     local flags=(--wal-sync-ms 10 "$@")
     b=$(tree_b "$(cfg_tree "$cfg")")
     [ "$cfg" = noauth ] && flags+=(--no-auth)
+    # stops by itself once this script is gone (killed by a timeout); a tree older than the flag lacks it
+    # (--help exits 2: no pipe, which pipefail would call failed)
+    grep -qF -- '--exit-with-parent[=PID]' <<<"$("$b/tsdbd" --help 2>&1)" && flags+=(--exit-with-parent="$me")
     rm -f "$d/port"
     "$b/tsdbd" --dir "$d/db" --listen 127.0.0.1 --port 0 --port-file "$d/port" "${flags[@]}" >"$d/log" 2>&1 &
     SRV_PID=$!

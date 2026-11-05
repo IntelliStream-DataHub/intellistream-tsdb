@@ -157,6 +157,8 @@ static pid_t spawn(const char *dir, int port, const char *extra1, const char *ex
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     th_portfile(spawn_pf, sizeof spawn_pf, dir);
+    char follow[64];
+    th_follow_me(follow, sizeof follow);
     pid_t pid = fork();
     if (pid == 0) {
         const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
@@ -170,10 +172,10 @@ static pid_t spawn(const char *dir, int port, const char *extra1, const char *ex
         const char *io = getenv("TSDBD_IO"); /* the event loop backend: make test runs uring and epoll */
         if (io)
             execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--port-file", spawn_pf, "--workers", "4", "--no-auth",
-                  "--io", io, extra1, extra2, (char *)NULL);
+                  follow, "--io", io, extra1, extra2, (char *)NULL);
         else
             execl(bin, "tsdbd", "--dir", dir, "--port", portstr, "--port-file", spawn_pf, "--workers", "4", "--no-auth",
-                  extra1, extra2, (char *)NULL);
+                  follow, extra1, extra2, (char *)NULL);
         _exit(127);
     }
     for (int i = 0; i < 16; i++)

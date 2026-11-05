@@ -69,6 +69,8 @@ static inline pid_t spawn(const char *dir, const char *const *extra, char *pf, s
 {
     th_portfile(pf, pfn, dir);
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+    char follow[64];
+    th_follow_me(follow, sizeof follow);
     pid_t pid = fork();
     if (pid == 0) {
         int fd = open(srvlog, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -76,6 +78,7 @@ static inline pid_t spawn(const char *dir, const char *const *extra, char *pf, s
             dup2(fd, 2);
         const char *argv[32] = {"tsdbd", "--dir", dir, "--port", "0", "--port-file", pf, "--workers", "2", "--no-fsync"};
         int n = 10;
+        argv[n++] = follow; /* a killed test leaves no server behind */
         if (getenv("TSDBD_IO")) {
             argv[n++] = "--io";
             argv[n++] = getenv("TSDBD_IO");

@@ -83,7 +83,9 @@ final class TsdbServer implements AutoCloseable {
         Path portFile = dir.resolveSibling(dir.getFileName() + ".port");
         Files.deleteIfExists(portFile);
         java.util.List<String> cmd = new java.util.ArrayList<>(java.util.List.of(bin.toString(), "--dir",
-                dir.toString(), "--port", "0", "--port-file", portFile.toString(), "--no-fsync", "--workers", "4"));
+                dir.toString(), "--port", "0", "--port-file", portFile.toString(), "--no-fsync", "--workers", "4",
+                /* a test JVM killed by a timeout leaves no server behind */
+                "--exit-with-parent=" + ProcessHandle.current().pid()));
         if (!auth)
             cmd.add("--no-auth");
         Process p = new ProcessBuilder(cmd)

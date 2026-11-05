@@ -11,9 +11,36 @@
 # container's cgroup) shows 0%, so STALLED is a lead to check, not a verdict. The script only reads /proc and the
 # run directories; deciding what to do is the job of the watchdog agent (.claude/agents/job-watchdog.md, skill
 # .claude/skills/job-watchdog/SKILL.md).
+# Also one line per orphaned server, a process named in WATCHDOG_ORPHANS (default tsdbd) whose parent is gone
+# (reparented to init, or to the user's systemd as subreaper), that was started with --port-file (what every harness
+# passes; a user's own server, as the README's quick start, has a fixed port and is none of the watchdog's business)
+# and whose --dir (or --dir=; a relative one taken from the process's cwd) is under /var/tmp or /tmp:
+#   LOOK orphan tsdbd pid N (ppid 1, dir D, age T)   the server of a test or benchmark killed without stopping it
+# (on 2026-11-05 six ran 17 h holding io_uring rings until jepsen could not create one). Harnesses pass
+# --exit-with-parent=PID, so one of these is a harness without it, an old tree, or a server stopping right now.
 . "$(dirname "$(readlink -f "$0")")/se-env.sh"
 STALL_MIN=${1:-45}; PATTERN=${2:-}
 L=${BENCH_LOCK:-$SE_HOME/BENCH.lock}
+
+for name in ${WATCHDOG_ORPHANS-tsdbd}; do
+    for p in $(pgrep -u "$(id -u)" -x "$name"); do
+        pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$pp" ] || continue
+        [ "$pp" = 1 ] || [ "$(ps -o comm= -p "$pp" 2>/dev/null)" = systemd ] || continue
+        mapfile -d '' -t a 2>/dev/null < "/proc/$p/cmdline" || continue
+        d= pf=
+        for ((i = 1; i < ${#a[@]}; i++)); do
+            case "${a[i]}" in
+            --dir) d=${a[i + 1]-} ;;
+            --dir=*) d=${a[i]#--dir=} ;;
+            --port-file | --port-file=*) pf=1 ;;
+            esac
+        done
+        [ -n "$pf" ] || continue # not a harness's server
+        case "$d" in /*) ;; ?*) d=$(readlink "/proc/$p/cwd" 2>/dev/null)/${d#./} ;; esac
+        case "$d" in /var/tmp/* | /tmp/*) ;; *) continue ;; esac
+        echo "LOOK orphan $name pid $p (ppid $pp, dir $d, age $(ps -o etime= -p "$p" 2>/dev/null | tr -d ' '))"
+    done
+done
 now=$(date +%s)
 ticks=$(getconf CLK_TCK)
 

@@ -3,7 +3,8 @@
  * Two servers started at once get different ports and each port file names its own server; a server that cannot
  * start (a taken port, a bad directory, an unwritable port file) is reported as such and the harness never
  * connects to whoever holds the port; a port file that names another process, or a port another process holds,
- * is refused. Usage: test_ports [scratch directory, default /tmp]. */
+ * is refused. A server started with --exit-with-parent stops cleanly once the process that started it is killed;
+ * one without the flag keeps running. Usage: test_ports [scratch directory, default /tmp]. */
 #define _GNU_SOURCE
 #include "tsdb.h"
 #include "tsdb_client.h"
@@ -16,6 +17,8 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 
 static int failures;
@@ -35,17 +38,23 @@ static void sig(pid_t pid, int s)
         kill(pid, s);
 }
 
-/* tsdbd with the given arguments (NULL-terminated), stderr to /dev/null */
-static pid_t spawn(const char *const *args)
+/* How a server follows its parent: not at all, plain --exit-with-parent (the parent tsdbd finds at start), or
+ * --exit-with-parent=PID with the pid of the process that forks it (what every harness passes). */
+enum follow { FOLLOW_NONE, FOLLOW_PLAIN, FOLLOW_PID };
+
+/* tsdbd with the given arguments (NULL-terminated), stderr to `log` (NULL: /dev/null) */
+static pid_t spawn_with(const char *const *args, const char *log, enum follow follow)
 {
     const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+    char flag[64];
+    th_follow_me(flag, sizeof flag);
     pid_t pid = fork();
     if (pid == 0) {
-        int dn = open("/dev/null", O_WRONLY);
+        int dn = log ? open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644) : open("/dev/null", O_WRONLY);
         if (dn >= 0)
             dup2(dn, 2);
-        const char *argv[32] = {"tsdbd", "--no-auth"};
-        int n = 2;
+        const char *argv[32] = {"tsdbd", "--no-auth", follow == FOLLOW_PID ? flag : "--exit-with-parent"};
+        int n = follow == FOLLOW_NONE ? 2 : 3;
         for (int i = 0; args[i] && n < 31; i++)
             argv[n++] = args[i];
         argv[n] = NULL;
@@ -54,6 +63,8 @@ static pid_t spawn(const char *const *args)
     }
     return pid;
 }
+
+static pid_t spawn(const char *const *args) { return spawn_with(args, NULL, FOLLOW_PID); }
 
 static bool serves(int port)
 {
@@ -128,6 +139,194 @@ static void put(const char *path, const char *text)
         fputs(text, f);
         fclose(f);
     }
+}
+
+static bool has_line(const char *path, const char *text)
+{
+    char line[1024];
+    bool found = false;
+    FILE *f = fopen(path, "r");
+    while (f && !found && fgets(line, sizeof line, f))
+        found = strstr(line, text) != NULL;
+    if (f)
+        fclose(f);
+    return found;
+}
+
+static uint64_t rows_of(int port, const char *name)
+{
+    tsdbc *c;
+    uint64_t n = UINT64_MAX;
+    if (tsdbc_connect("127.0.0.1", port, &c) != 0)
+        return n;
+    tsdb_sid id;
+    tsdb_bucket *b = NULL;
+    size_t nb = 0;
+    if (tsdbc_series(c, name, 0, &id) == 0 && tsdbc_query_agg(c, id, INT64_MIN, INT64_MAX, 0, &b, &nb) == 0)
+        n = nb ? b[0].count : 0;
+    free(b);
+    tsdbc_close(c);
+    return n;
+}
+
+/* --exit-with-parent: a test killed by a timeout used to leave its server running under init for hours, holding an
+ * io_uring ring. A middle process starts tsdbd (with or without the flag), the test writes rows through it and then
+ * SIGKILLs the middle process. This process is a subreaper meanwhile, so the orphan is reparented here (its
+ * getppid() changes exactly as it would to init) and its exit status can be read. With the flag the server stops
+ * within a few seconds with status 0 (as on SIGTERM: one log line, the memtable flushed) and a new server on the
+ * directory has every row; without it the server keeps serving until it is stopped here, by pid. Both forms of the
+ * flag: =PID (the middle process's pid) and plain. */
+static void orphan(enum follow follow)
+{
+    bool flag = follow != FOLLOW_NONE;
+    char d[600], pf[700], log[700];
+    snprintf(d, sizeof d, "%s/ports-%d-orphan%d", base, (int)getpid(), (int)follow);
+    snprintf(log, sizeof log, "%s.log", d);
+    rmrf(d);
+    th_portfile(pf, sizeof pf, d);
+    unlink(pf);
+    CHECK(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+    pid_t mid = fork();
+    if (mid == 0) {
+        const char *a[] = {"--dir", d, "--port", "0", "--port-file", pf, "--workers", "2", "--no-fsync", NULL};
+        pid_t s = spawn_with(a, log, follow);
+        if (th_await(pf, s, 30000) <= 0) {
+            fputs(th_why, stderr);
+            sig(s, SIGKILL);
+            _exit(1);
+        }
+        for (;;)
+            pause();
+    }
+    int port = 0, srv = 0;
+    for (int waited = 0; waited < 30000 && mid > 0; waited += 5) {
+        if (waitpid(mid, NULL, WNOHANG) == mid) {
+            mid = 0; /* the server did not start (a tsdbd without the flag refuses it: status 2) */
+            break;
+        }
+        FILE *f = fopen(pf, "r");
+        int n = f ? fscanf(f, "%d %d", &port, &srv) : 0;
+        if (f)
+            fclose(f);
+        if (n == 2 && port > 0 && srv > 0 && th_owns_port(srv, port))
+            break;
+        port = srv = 0;
+        usleep(5000);
+    }
+    CHECK(port > 0 && srv > 0 && srv != mid);
+    if (port > 0 && srv > 0) {
+        tsdbc *c = NULL;
+        tsdb_sid id = TSDB_SID_NONE;
+        int64_t ts[1000];
+        float v[1000];
+        for (int i = 0; i < 1000; i++) {
+            ts[i] = 1700000000000LL + i * 1000;
+            v[i] = (float)i;
+        }
+        CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "o", 1, &id) == 0 &&
+              tsdbc_insert_series(c, id, ts, v, 1000) == 0);
+        if (c)
+            tsdbc_close(c);
+    }
+    if (mid > 0) {
+        sig(mid, SIGKILL); /* the test's parent dies: the server is an orphan now */
+        waitpid(mid, NULL, 0);
+    }
+    if (srv > 0) {
+        int st = 0;
+        pid_t r = 0;
+        for (int waited = 0; waited < (flag ? 10000 : 3000) && (r = waitpid(srv, &st, WNOHANG)) == 0; waited += 10)
+            usleep(10000);
+        if (flag) {
+            CHECK(r == srv && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+            CHECK(has_line(log, "--exit-with-parent: parent"));
+            if (r != srv) {
+                sig(srv, SIGKILL);
+                waitpid(srv, NULL, 0);
+            }
+            /* the database opens clean, with every row the orphan acknowledged */
+            const char *a[] = {"--dir", d, "--port", "0", "--port-file", pf, "--workers", "2", "--no-fsync", NULL};
+            unlink(pf); /* the orphan's own */
+            pid_t s = spawn(a);
+            int p = th_await(pf, s, 30000);
+            CHECK(p > 0);
+            if (p > 0) {
+                CHECK(rows_of(p, "o") == 1000);
+                stop(s);
+            } else {
+                fputs(th_why, stderr);
+                sig(s, SIGKILL);
+                waitpid(s, NULL, 0);
+            }
+        } else {
+            CHECK(r == 0 && serves(port)); /* still running three seconds (three ticks) later */
+            stop(srv);                     /* by its pid: it is this process's child now */
+        }
+    }
+    CHECK(prctl(PR_SET_CHILD_SUBREAPER, 0) == 0);
+    unlink(pf);
+    unlink(log);
+    rmrf(d);
+}
+
+/* The launcher race (pre-tag review, r1-subreaper.py): a launcher forks and dies before tsdbd reads its options (a
+ * shell that exits, a test killed between fork and exec). Under a subreaper (systemd --user on a desktop; this
+ * process here) tsdbd is adopted by it, so plain --exit-with-parent took the subreaper for the parent to follow and
+ * the server outlived its test. With --exit-with-parent=LAUNCHER it refuses to start (status 2, one line) and
+ * creates nothing. The child execs tsdbd only once it has seen its launcher gone, so the window is always hit. */
+static void launcher_race(void)
+{
+    char d[600], pf[700], log[700], flag[64];
+    snprintf(d, sizeof d, "%s/ports-%d-race", base, (int)getpid());
+    snprintf(log, sizeof log, "%s.log", d);
+    rmrf(d);
+    th_portfile(pf, sizeof pf, d);
+    unlink(pf);
+    CHECK(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+    int fds[2];
+    CHECK(pipe(fds) == 0);
+    pid_t launcher = fork();
+    if (launcher == 0) {
+        pid_t me = getpid();
+        snprintf(flag, sizeof flag, "--exit-with-parent=%d", (int)me);
+        pid_t s = fork();
+        if (s == 0) {
+            for (int i = 0; i < 10000 && getppid() == me; i++) /* until the launcher is gone */
+                usleep(1000);
+            int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0)
+                dup2(fd, 2);
+            const char *bin = getenv("TSDBD") ? getenv("TSDBD") : "./build/tsdbd";
+            execl(bin, "tsdbd", "--no-auth", flag, "--dir", d, "--port", "0", "--port-file", pf, "--workers", "2",
+                  "--no-fsync", (char *)NULL);
+            _exit(127);
+        }
+        if (write(fds[1], &s, sizeof s) != sizeof s)
+            _exit(1);
+        _exit(0); /* gone before the server reads its options */
+    }
+    close(fds[1]);
+    pid_t srv = 0;
+    CHECK(read(fds[0], &srv, sizeof srv) == sizeof srv && srv > 0);
+    close(fds[0]);
+    waitpid(launcher, NULL, 0);
+    if (srv > 0) {
+        int st = 0;
+        pid_t r = 0;
+        for (int waited = 0; waited < 10000 && (r = waitpid(srv, &st, WNOHANG)) == 0; waited += 10)
+            usleep(10000);
+        CHECK(r == srv && WIFEXITED(st) && WEXITSTATUS(st) == 2);
+        CHECK(has_line(log, "--exit-with-parent=") && has_line(log, "it has exited"));
+        CHECK(access(d, F_OK) != 0); /* refused before the database was created */
+        if (r != srv) {               /* the bug: it serves under the subreaper; stop it by its pid */
+            sig(srv, SIGTERM);
+            waitpid(srv, NULL, 0);
+        }
+    }
+    CHECK(prctl(PR_SET_CHILD_SUBREAPER, 0) == 0);
+    unlink(pf);
+    unlink(log);
+    rmrf(d);
 }
 
 int main(int argc, char **argv)
@@ -330,6 +529,11 @@ int main(int argc, char **argv)
         }
         rmrf(d4);
     }
+
+    orphan(FOLLOW_PID);
+    orphan(FOLLOW_PLAIN);
+    orphan(FOLLOW_NONE);
+    launcher_race();
 
     stop(s1);
     stop(s2);
