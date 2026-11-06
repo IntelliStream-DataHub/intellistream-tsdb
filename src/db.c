@@ -752,10 +752,33 @@ void eng_halt(eng *db)
     db->nmergers = 0;
 }
 
-int eng_retire(eng *db)
+/* Appends the name strings of d to *vec (freed by the owner of the vector, at tsdb_close). */
+static void names_take(series_dict *d, char ***vec, size_t *n, size_t *cap)
 {
-    if (db)
-        db->retiring = true;
+    uint32_t cnt = atomic_load(&d->count);
+    if (!d->file || !cnt)
+        return;
+    if (*n + cnt > *cap) {
+        size_t nc = (*n + cnt) * 2;
+        char **v = realloc(*vec, nc * sizeof *v);
+        if (!v)
+            return; /* the strings stay allocated and are never freed: a leak of a few bytes, not a dangling name */
+        *vec = v;
+        *cap = nc;
+    }
+    for (uint32_t i = 0; i < cnt; i++)
+        (*vec)[(*n)++] = d->names[i];
+}
+
+int eng_retire(eng *db, pthread_mutex_t *mu, char ***kept, size_t *nkept, size_t *capkept)
+{
+    if (!db)
+        return 0;
+    db->retiring = true;
+    pthread_mutex_lock(mu); /* retires of several volumes run at once; the close below may be slow and is outside */
+    names_take(&db->series, kept, nkept, capkept);
+    names_take(&db->states, kept, nkept, capkept);
+    pthread_mutex_unlock(mu);
     return eng_close(db);
 }
 

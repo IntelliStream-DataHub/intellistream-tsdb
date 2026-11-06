@@ -726,6 +726,9 @@ $(B)/liboutagefs.so: tests/jepsen/outagefs.c | $(B)
 $(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
 	$(CC) $(CFLAGS) -o $@ $< -lpthread
 
+$(B)/test_outage: tests/test_outage.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+
 $(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
@@ -801,9 +804,11 @@ test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 # The outage shim's own test (Linux only: LD_PRELOAD)
 ifneq ($(UNAME_S),Darwin)
 test: test-outagefs
-test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/liboutagefs.so
+test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/liboutagefs.so $(B)/tsdbd
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health /tmp
+	for io in $(IO); do echo "== outage, tsdbd --io $$io"; \
+	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; done
 endif
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.

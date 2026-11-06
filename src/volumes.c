@@ -102,6 +102,9 @@ struct tsdb {
     pthread_mutex_t name_mu;
     pthread_cond_t name_cv;
     const char **names_held;
+    char **kept_names; /* name strings of retired engines: tsdb_series_name pointers outlive a reopen */
+    size_t nkept, capkept;
+    pthread_mutex_t kept_mu; /* a leaf: guards the three above */
     size_t nheld, held_cap;
     atomic_bool dup_logged; /* a name found in two volumes (damage, or a hand-made copy) is reported once */
     void (*wait_fn)(void *ctx, int delta); /* tsdb_set_write_wait_hook (lock), copied to every volume */
@@ -792,6 +795,7 @@ int tsdb_open(const char *dir, const tsdb_options *opts, tsdb **out)
     pthread_mutex_init(&t->create_lock, NULL);
     pthread_mutex_init(&t->layout_lock, NULL);
     pthread_mutex_init(&t->name_mu, NULL);
+    pthread_mutex_init(&t->kept_mu, NULL);
     pthread_cond_init(&t->name_cv, NULL);
     t->dirfd = -1;
     t->sched = sched_new(t->opt.query_threads, t->opt.request_threads);
@@ -888,8 +892,12 @@ int tsdb_close(tsdb *t)
     pthread_mutex_destroy(&t->create_lock);
     pthread_mutex_destroy(&t->layout_lock);
     pthread_mutex_destroy(&t->name_mu);
+    pthread_mutex_destroy(&t->kept_mu);
     pthread_cond_destroy(&t->name_cv);
     free(t->names_held);
+    for (size_t i = 0; i < t->nkept; i++)
+        free(t->kept_names[i]);
+    free(t->kept_names);
     free(t);
     return rc;
 }
@@ -1541,7 +1549,7 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     e->test_precommit_arg = t->test_precommit_arg;
     t->vols[vol] = e;
     pthread_rwlock_unlock(&t->lock);
-    eng_retire(old);
+    eng_retire(old, &t->kept_mu, &t->kept_names, &t->nkept, &t->capkept); /* names stay valid until tsdb_close */
     return 0;
 }
 

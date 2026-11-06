@@ -1550,7 +1550,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *s, eng **ou
 int eng_close(eng *db);
 /* As eng_close, for an engine replaced by a fresh open of its directory (ha.md 15.5): the name strings stay, for the
  * `tsdb_series_name` pointers callers hold until tsdb_close. */
-int eng_retire(eng *db);
+int eng_retire(eng *db, pthread_mutex_t *mu, char ***kept, size_t *nkept, size_t *capkept);
 /* Recovery of a halted engine (revalidate.c, ha.md 15.5 step 3 and 4); see tsdb_volume_reopen. */
 int wal_verify_tail(eng *db, const char *dir); /* 0 intact, 1 the storage lost what was durable, <0 error */
 int wal_relog(eng *db, const char *dir, uint64_t *rows); /* the rows memory holds into a new segment */

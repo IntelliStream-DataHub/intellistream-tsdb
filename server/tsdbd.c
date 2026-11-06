@@ -429,6 +429,9 @@ static void write_on_wait(void *ctx, int delta)
     worker_waits(delta);
 }
 
+#include "domains.h"
+static void dom_waits(int delta) { worker_waits(delta); }
+
 /* Tests (TSDBD_TEST_HOLD_LARGE_MS): every large insert, replace and delete sleeps that long after writing its parts,
  * before it publishes them, so a test can write into its keys while it is in flight. */
 void tsdb_test_precommit(tsdb *t, void (*fn)(void *), void *arg); /* the library's test hook (src/internal.h) */
@@ -1362,6 +1365,7 @@ static int list_emit(void *ctx, bool last, uint32_t n, const uint8_t *e, size_t 
     return reply(o->c, o->id, 0, h, 5, e, len, NULL, 0) ? 0 : TSDB_ERR_STOPPED;
 }
 
+static void handle_op(req *r);
 static void handle(req *r)
 {
     conn *c = r->c;
@@ -1379,6 +1383,26 @@ static void handle(req *r)
         reply_error(c, r->id, r->op, rc);
         return;
     }
+    int dv = dom_volume_of(r->op, p, len); /* a volume of a storage domain: at most DOM_CAP requests inside */
+    if (dv >= 0) {
+        if ((rc = dom_enter(dv)) != 0) {
+            reply_error(c, r->id, r->op, rc);
+            return;
+        }
+        handle_op(r);
+        dom_exit(dv);
+        return;
+    }
+    handle_op(r);
+}
+
+static void handle_op(req *r)
+{
+    conn *c = r->c;
+    const uint8_t *p = r->payload;
+    size_t len = r->len;
+    int rc = 0;
+    auth_conn *a = &c->auth;
     switch (r->op) {
     case TSDB_OP_HELLO: {
         /* the version both sides speak: a client never sends what it does not know, so an older one hears
@@ -2829,7 +2853,7 @@ static void *failwatch_main(void *arg)
     int lfd = *(int *)arg;
     char msg[512];
     while (!stopping) {
-        if (tsdb_failed(db, msg, sizeof msg)) {
+        if (dom_failwatch(msg, sizeof msg)) {
             fprintf(stderr, "tsdbd: storage failure, exiting: %s\n", msg);
             atomic_store(&db_failed, true);
             shutdown(lfd, SHUT_RDWR); /* new clients go elsewhere; ends the accept thread */
@@ -3002,8 +3026,11 @@ int main(int argc, char **argv)
                                    {"no-auth", no_argument, 0, 'A'},
                                    {"login-timeout", required_argument, 0, 'O'},
                                    {"exit-with-parent", optional_argument, 0, 'E'},
+                                   {"health-domain", required_argument, 0, 0x100},
                                    {0, 0, 0, 0}};
     int ch, metrics_port = 0, metrics_on = 0, no_auth = 0;
+    char *health_domains[DOM_MAX];
+    int nhealth = 0;
     const char *metrics_addr = NULL;
     long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page > 0 && (size_t)pages / 8 * (size_t)page > req_budget)
@@ -3012,6 +3039,13 @@ int main(int argc, char **argv)
         switch (ch) {
         case 'v': printf("tsdbd %s (build %s)\n", tsdb_version(), TSDB_BUILD_VERSION); return 0;
         case 'd': dir = optarg; break;
+        case 0x100:
+            if (nhealth >= DOM_MAX) {
+                fprintf(stderr, "tsdbd: at most %d --health-domain\n", DOM_MAX);
+                return 2;
+            }
+            health_domains[nhealth++] = optarg;
+            break;
         case 'l': addr = optarg; break;
         case 'p': port = (int)num_arg("port", optarg, 0, 65535); break; /* 0: any free port, told by --port-file and the banner */
         case 'Q': port_file = optarg; break;
@@ -3097,7 +3131,8 @@ int main(int argc, char **argv)
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
                         "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
-                        "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n",
+                        "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n"
+                        "             [--health-domain PREFIX]...\n",
                 TSDB_DEFAULT_PORT);
         return 2;
     }
@@ -3117,6 +3152,10 @@ int main(int argc, char **argv)
         return 1;
     }
     tsdb_set_write_wait_hook(db, write_on_wait, NULL); /* before the workers start */
+    if (dom_init(db, health_domains, nhealth, dom_waits) != 0) {
+        tsdb_close(db);
+        return 1;
+    }
     if (getenv("TSDBD_TEST_HOLD_LARGE_MS") && (hold_large_ms = atoi(getenv("TSDBD_TEST_HOLD_LARGE_MS"))) > 0)
         tsdb_test_precommit(db, hold_large, NULL);
     struct rlimit rl;
@@ -3286,6 +3325,7 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < nnew; i++)
         close(new_fds[i]);
     free(new_fds);
+    dom_shutdown();
     rc = tsdb_close(db);
     if (atomic_load(&db_failed))
         return 1; /* close failed too, by design: nothing more was written */
