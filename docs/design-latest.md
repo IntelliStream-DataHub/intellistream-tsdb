@@ -70,7 +70,7 @@ change).
 | A2 | **Decided (user, 2026-11-06): the newest non-null value by default.** `WITH_NULLS` returns the newest row, which may be a null (kind NULL appears only with it); it takes the slow path. | If the table had to answer `WITH_NULLS` fast, each entry would need a "newer null" bit kept by every publish; added only if measurements ask for it. |
 | A3 | **Sharded by volume, inside the engine.** Each volume keeps its series' newest points; in the cluster the volume's leader answers and its replicas keep the table warm. No cache service of its own. | A separate cache tier is rejected in L2 and §7.3; it cannot be exact without being on the write path anyway. |
 | A4 | **Exact and fresh.** A lookup reflects every acknowledged write and delete, and never a write that queries do not show yet, by the same snapshot rules as a query. | A "fast but maybe stale" mode would need no lock at all, but every client would have to guess how stale. Not offered. |
-| A5 | **One instant per series, not per request**: each series' answer is the state at one instant during the request; two series of one request may be read at different instants (a request for 100,000 series may see an insert in some series and not yet in others). | One instant per volume per request needs a lock held across the whole request, which would hold up every publish. Open question 1. QUERY_MULTI with `VALUES`, descending, limit 1 keeps its one cut per volume for those who need it. |
+| A5 | **One instant per series, not per request**: each series' answer is the state at one instant during the request; two series of one request may be read at different instants (a request for 100,000 series may see an insert in some series and not yet in others). | One instant per volume per request needs a lock held across the whole request, which would hold up every publish. Decision D1. QUERY_MULTI with `VALUES`, descending, limit 1 keeps its one cut per volume for those who need it. |
 | A6 | **Decided (user): on by default**, as a byte budget: `tsdb_options.latest_cache` (default RAM/16 for the process, shared by its volumes; tsdbd `--latest-cache BYTES`, `0` off). Series beyond the budget, every series when it is 0, and every series on an NFS follower are answered exactly through the slow path. | |
 
 ## Decisions
@@ -122,7 +122,7 @@ Consequences worth saying:
   know that the newest point is a null asks with `WITH_NULLS` (the slow path, §5.1).
 - A stray row far in the future (a device with a wrong clock) is the latest until it is deleted or overwritten by a
   null. A client that wants "the newest point that is not in the future" sends `end = now + 1`; that is the slow
-  path (§5.1).
+  path (§5.1). Operators see such series in `tsdb_latest_future_series` (§6.5, D2).
 - A series that has never been written, one that has written only nulls, and one whose every non-null row expired or
   was deleted, all answer **none**.
 
@@ -459,7 +459,7 @@ merge.c:533-579, which reads the limits there, so it lies wholly before or after
   were all in the dropped partitions). A series with surviving rows below `t` (in a partition of a long class that
   ends after `t`, or a backfill below `t` after the drop) keeps being searched until it is written again; that
   series has not been written since `t`, which a drop usually leaves well behind. The metric
-  `tsdb_latest_search_total{why="floor"}` counts them (open question 3).
+  `tsdb_latest_search_total{why="floor"}` counts them (decision D3).
 - Class switches move no row (AGENTS.md, "Partition classes"): no change. One (series, ts) is never in two keys,
   so ties between parts of different keys cannot happen.
 - Merges (merge.c:463) list their output and retire the sources with the same last-write-wins values: no change
@@ -801,7 +801,9 @@ and without `with_nulls`), denied ids and names and missing ones included.
 `tsdb_latest_search_total{why="unknown"|"inflight"|"stale"|"shadow"|"bound"|"with_nulls"|"cap"|"floor"|"follower"}`,
 `tsdb_latest_unknown` (entries left to fill, per volume), `tsdb_latest_table_bytes`, `tsdb_latest_budget_capped`
 (volumes whose pages the budget refused), `tsdb_latest_wait_seconds_total` (time lookups waited for a write section),
-`tsdb_latest_fills_total{result="stored"|"refused"}`.
+`tsdb_latest_fills_total{result="stored"|"refused"}`, and `tsdb_latest_future_series` (series whose cached newest
+row is more than one hour ahead of the clock, per volume; D2). The warmer and the open's build count it as they walk,
+and publishes keep it current from the entries they store, at the cost of one compare against a cached `now + 1 h`.
 
 ## 7. The cluster
 
@@ -994,20 +996,21 @@ row (V12), and a null in a listed part above a new merge output's row (N3). The 
 
 ## Open questions
 
-1. **One instant per request, or per series?** Recommended: per series (A5), documented; QUERY_MULTI (values,
-   descending, limit 1) remains for the rare caller that needs one cut per volume.
-2. **Future timestamps**: should "latest" default to `end = now + 1` so a device with a wrong clock does not stick?
-   Recommended: no; the default is the greatest timestamp (A1), and callers that distrust clocks pass the bound
-   (the slow path). A metric of series whose latest is more than an hour ahead of the clock would help operators.
-3. **Series that survive a drop below its `t`** stay on the slow path until they are written again (L20, §3.6).
-   Recommended: accept it, with the metric `why="floor"`; if the metric shows many, give each page a floor epoch that
-   the warmer (never a publisher) advances after it has walked the page.
-4. **`WITH_NULLS` always takes the slow path** (5 to 20 µs per id). Recommended: accept it; if a dashboard needs it
-   fast, add a per-entry "a newer null exists" bit that publishes set and the memtable layer reads, measured first.
-5. **No table on NFS followers** (L13): follower lookups cost 50 to 100 times more per id. Recommended: accept it for
-   this design; build §11 only if a single-server deployment asks for fast lookups on its followers.
-6. **The budget's cap is sticky until the volume reopens** (L5). Recommended: yes; ids beyond it are answered exactly
-   by the slow path, and a reopen sizes the table to the budget then free.
+None. The six that remained were closed on 2026-11-06 by taking the recommended answers as defaults (D1 to D6
+below); the user may change any of them.
+
+## Decisions on the former open questions (2026-11-06)
+
+Taken as defaults on 2026-11-06, the recommended answer of each; the user may change them.
+
+| # | Decision | Revisit when |
+|---|---|---|
+| D1 | **Per-series instants** (A5). Each series is read at one instant during the request; two series of one request may be read at different instants. This is documented in tsdb.h, the wire doc and the clients. QUERY_MULTI (`VALUES`, descending, limit 1) stays for the rare caller that needs one cut per volume. | A user needs one instant per request for 10^5 ids at publish rates the lock would not hold up; that would be a new op or flag, not a change of this one. |
+| D2 | **No `now + 1` clamp.** The default answer is the greatest timestamp (A1); a caller that distrusts device clocks passes the end bound (slow path, §5.1). Added: the metric `tsdb_latest_future_series` (§6.5), series whose cached newest row is more than one hour ahead of the clock. | The metric shows far-future rows in real data and operators want them hidden by default: then a per-volume clamp option, off by default. |
+| D3 | **The drop floor is accepted** (L20, §3.6): series whose newest non-null row lies below a drop's `t` and survived it take the slow path until written again, counted by `tsdb_latest_search_total{why="floor"}`. | The metric shows many such series: give each page a floor epoch that the warmer (never a publisher) advances after it has walked the page. |
+| D4 | **`WITH_NULLS` takes the slow path** (5 to 20 µs per id, §5.1), as A2 and §5.2 say. | A dashboard needs it fast, measured first: a per-entry "a newer null exists" bit that publishes set and the memtable layer reads. |
+| D5 | **No latest table on NFS followers** (L13): `--follow` forces `latest_cache = 0` and lookups cost 50 to 100 times more per id there (`why="follower"`). §11 stays a later step. | A single-server deployment asks for fast lookups on its followers: build §11. |
+| D6 | **The budget's cap is sticky until the volume reopens** (L5). Ids beyond it are answered exactly by the slow path (`why="cap"`); a reopen sizes the table to the budget then free. | Operators need to lift the cap without a restart: that is the "unknown, no bound" state L5 rejected, so it needs its own design. |
 
 ## Unverified assumptions
 
@@ -1077,7 +1080,7 @@ Third round: a second verification under the user's answers (N), and a simplific
 | N3 (high): a follower took a merge output's row that a listed null overwrote | §3.10: no follower table; the slow path's §5.2 rule ranks parts by block; a follower test; an acceptance test of §11 |
 | N4: the §3.2 window could expose an invalidation as a known row | §3.2: step 2 only stores the flush's own row; invalidations wait for step 3, under the write lock |
 | N5: `top` tracked any value, and two indexes would cost 20% of `mt_series` | L6, §2.2: one `top_nn`, the type byte and flags `has_nn`, `has_null`, `nn_stale`; 40 bytes stay 40 |
-| N6: the old default was encoded throughout; `WITH_NULLS` cannot come from a table of non-null rows | §1, §2.1, §5.2, §6.1, §6.2, §8 (oracle, jepsen with null writes); `WITH_NULLS` takes the slow path (open question 4) |
+| N6: the old default was encoded throughout; `WITH_NULLS` cannot come from a table of non-null rows | §1, §2.1, §5.2, §6.1, §6.2, §8 (oracle, jepsen with null writes); `WITH_NULLS` takes the slow path (decision D4) |
 | N7 (low): the open read `GF_LAST` without its null flag | §3.9 step 3: `GT_LAST_NULL` gives unknown `(ts - 1)`; state series by their null count; U5 counts series ending in nulls |
 | N8 (low): a cut reused across holds met a later cutoff | §2.3: searches read their cutoffs right before the cut, as queries do; no cut is reused across holds |
 | N9 (low): pages made after the cap lifted, and pages built out of order | L5: the cap is sticky until reopen (S8); L11, §3.9: pages reserved in id order before the walk |
