@@ -232,6 +232,14 @@ const char *tsdb_volume_path(tsdb *db, uint32_t index);
 int tsdb_volume_add(tsdb *db, const char *path, uint32_t *index);
 int tsdb_volume_add_dir(const char *dir, const char *path, uint32_t *index);
 
+/* Carries a database of the previous disk format (8) over to this release's (9) in place, without opening it:
+ * every volume and the root, volumes first. Refuses (TSDB_ERR_INVALID, with a message on stderr) unless each
+ * directory was closed cleanly by the release that wrote it (no WAL segment, intent file or tmp part) and refuses
+ * (TSDB_ERR_LOCKED) while a writer holds one. Followers on other hosts cannot be seen and must be stopped first. Safe
+ * to run again after a crash. Returns the number of directories upgraded (0: nothing to do), or a negative status.
+ * Parts keep their old headers until merges rewrite them (docs/compatibility.md). */
+int tsdb_upgrade(const char *dir);
+
 /* ---- writing ----
  * (series, ts) is a unique key, as in ReplacingMergeTree read with FINAL:
  * writing an existing (series, ts) replaces its value, the last write wins

@@ -68,6 +68,8 @@ static void usage(void)
             "  volume add <path>                  add a volume: a directory for series of their own\n"
             "                                     (e.g. one per disk or NFS mount); also while tsdbd runs\n"
             "  volume list                        list the volumes, the database directory first\n"
+            "  upgrade                            carry a database closed cleanly by the previous release\n"
+            "                                     (disk format 8) over to this one, in place; stop followers first\n"
             "  stats                              rows, parts, size, compression ratio\n"
             "  parts                              list active parts (partition class and range)\n"
             "  optimize                           merge every partition into one part\n"
@@ -728,6 +730,19 @@ int main(int argc, char **argv)
             return user_main(NULL, argc - 2, argv + 2);
     const char *dir = argv[1], *cmd = argv[2];
     drop_root(dir); /* before anything in dir is opened, by every command */
+    if (strcmp(cmd, "upgrade") == 0) {
+        if (argc != 3)
+            usage();
+        int rc = tsdb_upgrade(dir); /* the database is not opened: its files are of the previous format */
+        if (rc < 0)
+            die(dir, rc);
+        if (rc == 0)
+            printf("%s: nothing to upgrade (already disk format 9)\n", dir);
+        else
+            printf("%s: %d director%s carried over to disk format 9; parts keep their old headers until merges "
+                   "rewrite them\n", dir, rc, rc == 1 ? "y" : "ies");
+        return 0;
+    }
     if (strcmp(cmd, "volume") == 0 && argc == 5 && strcmp(argv[3], "add") == 0) {
         /* without opening the database: a running tsdbd holds its lock, and opens the volume when a
          * request first names it */

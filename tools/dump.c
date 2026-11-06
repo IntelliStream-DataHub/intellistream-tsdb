@@ -1033,7 +1033,7 @@ static bool vname_ours(const char *s, const char *prefix, const char *suffix)
 static bool vname_engine(const char *s)
 {
     static const char *const fixed[] = {"LOCK", "MANIFEST", "META", "META.tmp", "ROOT_ID", "SERIES", "STATES",
-                                        "RETENTION"};
+                                        "RETENTION", "FNO", "FNO.tmp"};
     for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++)
         if (strcmp(s, fixed[i]) == 0)
             return true;

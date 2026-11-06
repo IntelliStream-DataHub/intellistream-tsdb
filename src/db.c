@@ -471,7 +471,8 @@ static int load_parts(eng *db, bool read_only)
         const char *name = e->d_name;
         /* Only names the engine writes: a volume may be a directory with the user's own files in it
          * (tsdb_volume_add_dir), and their tmp_notes.txt or retired_old.csv is not ours to delete. */
-        if (part_tmp_name(name) || meta_tmp_name(name)) {
+        if (part_tmp_name(name) || meta_tmp_name(name) || strcmp(name, FNO_FILE ".tmp") == 0 ||
+            strcmp(name, "MANIFEST.tmp") == 0) { /* an interrupted fno_create or `tsdb upgrade` */
             if (!read_only)
                 unlinkat(db->dirfd, name, 0);
             continue;

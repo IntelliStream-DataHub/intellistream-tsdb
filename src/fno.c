@@ -75,6 +75,20 @@ int fno_create(int dirfd, uint64_t next, bool sync)
     return !sync || tsdb_fsync(dirfd) == 0 ? 0 : TSDB_ERR_IO;
 }
 
+/* Whether the directory has an FNO file whose two slots are both valid (an upgrade that died after making it, and
+ * runs again, keeps it; any other file is made anew). */
+bool fno_file_intact(int dirfd)
+{
+    uint8_t pages[2 * FNO_PAGE];
+    int fd = openat(dirfd, FNO_FILE, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    ssize_t r = pread(fd, pages, sizeof pages, 0);
+    close(fd);
+    uint64_t n, g;
+    return r == (ssize_t)sizeof pages && slot_parse(pages, &n, &g) && slot_parse(pages + FNO_PAGE, &n, &g);
+}
+
 /* Reads FNO: *next is the valid slot with the higher generation. TSDB_ERR_NOTFOUND: no file. TSDB_ERR_CORRUPT:
  * both slots bad (logged). *torn: one slot was bad, the other valid. */
 int fno_load(eng *db, uint64_t *next, uint64_t *gen, int *slot, bool *torn)

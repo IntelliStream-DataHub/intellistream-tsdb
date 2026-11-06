@@ -1263,6 +1263,7 @@ static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
 
 #define FNO_FILE "FNO"
 int fno_create(int dirfd, uint64_t next, bool sync);
+bool fno_file_intact(int dirfd);
 int fno_load(struct eng *db, uint64_t *next, uint64_t *gen, int *slot, bool *torn);
 int fno_require(struct eng *db, uint64_t v);
 void wal_row(const uint8_t *r, uint32_t *id, int64_t *ts, uint64_t *slot);

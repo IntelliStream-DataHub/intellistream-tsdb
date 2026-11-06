@@ -1921,7 +1921,7 @@ static int entries(const char *dir)
 
 /* A database of another disk format (7: series ids from a CATALOG, no volume numbers in META) is refused at open,
  * by writers and readers, with a message that names both versions, and nothing in it is touched. */
-static void test_format_version(const char *scratch)
+static void test_format_version_of(const char *scratch, int old)
 {
     char dir[600];
     snprintf(dir, sizeof dir, "%s/damage-format", scratch);
@@ -1939,10 +1939,10 @@ static void test_format_version(const char *scratch)
     file_pread(dir, "META", 0, meta, (size_t)len);
     meta[len] = '\0';
     char *v = strstr(meta, "version=");
-    CHECK(v && atoi(v + 8) == FORMAT_VERSION && FORMAT_VERSION == 8);
+    CHECK(v && atoi(v + 8) == FORMAT_VERSION && FORMAT_VERSION == 9);
     if (!v)
         return;
-    v[8] = '7';
+    v[8] = (char)('0' + old);
     file_pwrite(dir, "META", 0, meta, (size_t)len);
     int before = entries(dir);
     for (int ro = 0; ro < 2; ro++) {
@@ -1965,13 +1965,23 @@ static void test_format_version(const char *scratch)
         RC(rc, TSDB_ERR_CORRUPT);
         if (db)
             tsdb_close(db);
-        CHECK(strstr(got, "disk format version 7;") && strstr(got, "reads version 8 only"));
+        char want[64];
+        snprintf(want, sizeof want, "disk format version %d;", old);
+        CHECK(strstr(got, want) && strstr(got, "reads version 9 only"));
+        /* the previous format has a way over, named in the message; older ones only export and import */
+        CHECK((old == 8) == (strstr(got, "tsdb DIR upgrade") != NULL));
     }
     CHECK(entries(dir) == before);
     file_pread(dir, "META", 0, text, (size_t)len);
     CHECK(memcmp(text, meta, (size_t)len) == 0 && file_size(dir, "META") == len);
     rm_rf(dir);
-    printf("  a format-7 database is refused at open, naming both versions, untouched\n");
+    printf("  a format-%d database is refused at open, naming both versions, untouched\n", old);
+}
+
+static void test_format_version(const char *scratch)
+{
+    test_format_version_of(scratch, 7);
+    test_format_version_of(scratch, 8);
 }
 
 /* ---------------------------------------------------- second review (REVIEW2) */
