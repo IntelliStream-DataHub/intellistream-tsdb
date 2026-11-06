@@ -178,10 +178,15 @@ and stay with the volumes.
   identity (PROBE), commits MEMBER_ADD with the next id and that identity, and only then sends JOIN, on which the
   new server writes `meta/NODE`: an id exists in the log before any server holds it, and a leader change in the
   middle cannot hand it out twice. A repeated `node add` of the same server answers with the same id.
-- **Crash during a snapshot install.** The core resets the log to the image's index before the image is kept. A
-  server that boots with a log based past its snapshot fences its vote at the log's last entry, drops the log and
-  the snapshot, and waits for a new image from the leader (the reseed), rather than booting a core that would
-  never apply another entry. A snapshot whose directory fsync fails after the rename is fail-stop. Snapshots are
+- **Crash during a snapshot install.** The core resets the log to the image's index before the image is applied.
+  So a server first writes the image it was sent, durably, to `meta/snapshot.install` (checked: its applied index
+  and term are the message's), and only then hands the message to the core; a failed write drops the message (the
+  leader sends it again). A server that boots with a log based past its snapshot takes the kept image when it
+  matches the log's base (index and term) exactly, rather than booting a core that would never apply another entry.
+  Without a matching image (damage) it fences its vote at the log's last entry, drops the log and the snapshot, and
+  waits for a new image from the leader (the reseed). The reseed is only the fallback: a fenced voter counts as
+  missing until a leader sends it an image, so a group that needs its vote to elect that leader stays without one.
+  A snapshot whose directory fsync fails after the rename is fail-stop. Snapshots are
   taken only over a synced log (the syncs run inline, before the snapshot): an image past the synced log would boot
   a core whose commit is above its last entry, which the core cannot fill.
 - **Watchers** rotate to another voter when the commit index they hear in heartbeat answers stays ahead of what
@@ -777,11 +782,13 @@ performance; above them, the cluster stays correct and slows down.
   diff); `raft_sim`'s own chaos seeds run beside it in the same test. `make test` runs a few seeds, `make meta-soak`
   thousands. Besides the state checks it checks what each operation named (an applied VOLUME_LEADER or ISR_CHANGE
   named the volume's epoch and ISR version, an applied MEMBER_STATE an incarnation no older than the member's), cuts
-  snapshot installs short (a crash between the log's reset and the image being kept) and ends every run with a
-  quiet stretch in which every server must catch up. `tests/test_cluster.c` runs real tsdbd servers through named
-  scenarios (a wrong secret and oversized pre-handshake frames, a relayed handshake, crashes during init and during an
-  install, a failed snapshot directory fsync, ids under a leader change and an impostor, a watcher on a paused voter,
-  and the life cycle: growth to 5 voters, a killed leader, replacement, restart).
+  snapshot installs short (a crash between the log's reset and the image being applied, with and without the kept
+  image), changes the membership (learners added and promoted, voters demoted and removed, down to 2 of 3) and ends
+  every run with a quiet stretch in which everyone is a voter again and every server must catch up.
+  `tests/test_cluster.c` runs real tsdbd servers through named scenarios (a wrong secret and oversized
+  pre-handshake frames, a relayed handshake, crashes during init and during an install (the kept image, and the
+  reseed without it), a failed snapshot directory fsync, ids under a leader change and an impostor, a watcher on a
+  paused voter, and the life cycle: growth to 5 voters, a killed leader, replacement, restart).
 - **The replication core** (`src/repl.c`, sans-IO like the Raft core: records, ACKs, fences, commit points and ISR
   changes go in; sends, syncs, applies and cuts come out) under its own simulator: a fake disk that loses what was not
   synced on a crash, a network that delays, drops, duplicates, reorders and partitions, and a fake metadata service.
