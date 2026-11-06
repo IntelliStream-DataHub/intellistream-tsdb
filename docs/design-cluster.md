@@ -313,8 +313,10 @@ The volume log is the leader's WAL, in WAL record version 2 of design-cdc.md:
 
 - **Rows** (kind 0): one group commit, as today. Its `fno` is the position of its first row; its rows take
   consecutive numbers.
-- **Markers** (kind 1): everything else, each taking one number. The cluster adds these kinds to the change feed's
-  markers:
+- **Markers** (kind 1): everything else, each taking `span` numbers (settled in S0: one for every marker but a
+  `COMMIT`, which takes the events it expands into; the cluster only needs the first; payloads in `src/marker.h`).
+  The cluster adds these kinds to the change feed's markers (their type numbers are reserved in S0, the payloads
+  come with the cluster):
 
 | Marker | Payload | Applied as |
 |---|---|---|
@@ -892,7 +894,8 @@ applies to memory as to the rest.
 |---|---|---|
 | WAL record version 2 with `fno` and `commit_ms` (design-cdc.md §2.1), format 9 | **yes** | The record is the replication unit. Changing it after the freeze would be a break. Shared with the change feed. |
 | Marker records (kind 1) in the WAL; replay skips kinds it does not need | **yes** (the kind field; the cluster's kinds come later) | A 1.0 replay must not choke on a kind it does not know in a cluster volume it should not open anyway; a single server writes only rows (and feed markers). |
-| A position range `fno_lo, fno_hi` in the part header, covered by its checksum (0 when unknown; a merge takes the min and max) | **yes** | The cold move (§9.3), partial rebuild and the change feed need to know what a part holds. |
+| A position range `fno_lo, fno_hi` in the part header, covered by its checksum (0 when unknown; a merge takes the min and max), and `written_ms`; **the range covers the rows records a part holds, never markers** (settled in S0) | **yes** | The cold move (§9.3), partial rebuild and the change feed need to know what a part holds; a part claiming the numbers of markers it does not hold could make a rebuild skip a CLASS or RETENTION marker. |
+| `FNO`, two checksummed slots in every volume: the durable bound of the numbers (design-cdc.md §2.1), written before a segment is unlinked | **yes** | The log's numbers never go back across opens whatever was removed; MANIFEST cannot hold the bound (unsynced, rewritten in place). |
 | META `requires=<feature>,...`: an open refuses a feature it does not know | **yes** | A 1.0 server must refuse a cluster volume (and any later feature) instead of opening and writing it. |
 | `wal_seq` with an epoch in the high bits | no | Segment numbers are 64-bit already; a single server's epoch is 0. |
 | REPL, the slot index, `.cold` index files | no | New files in cluster volumes only, behind `requires=cluster`. |

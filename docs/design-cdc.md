@@ -310,9 +310,12 @@ and the feed's lag in milliseconds. The hash covers `fno`, `commit_ms` and the p
 the record to its segment and offset.
 
 - **kind 0, rows**: `len` = rows (below 2^28; `buffer_rows` defaults to 1 M); payload as today. Takes `len` numbers.
-- **kind 1, marker**: `len` = payload bytes; the payload starts with `u16 type, u16 flags, u32 span` and takes `span`
-  numbers (at least 1). A replay or a follower skips marker types it does not apply and continues the numbering;
-  `requires=` in META (§5) keeps a binary from opening a volume with markers it would have to apply and does not know.
+- **kind 1, marker**: `len` = payload bytes (a multiple of 4); the payload starts with `u16 type, u16 flags, u32 span`
+  and takes `span` numbers (at least 1; settled in S0: one number per marker is the special case `span` = 1, and a
+  `COMMIT` takes as many as the events it expands into). A replay or a follower skips marker types it does not apply
+  and continues the numbering; `requires=` in META (§5) keeps a binary from opening a volume with markers it would
+  have to apply and does not know. Built in S0: `src/marker.h` and `src/marker.c` (one encoder and decoder, fuzzed by
+  `fuzz_marker`), `wal_marker` (the engine's append; nothing but tests calls it before the backends exist).
 
 Marker types (S0 defines the payloads once, design-ha-modes.md §2.1, M15):
 
@@ -328,10 +331,35 @@ Marker types (S0 defines the payloads once, design-ha-modes.md §2.1, M15):
 off on a single server no markers are written; the 16 bytes and the numbering are paid anyway (F9), and the cluster
 needs both.
 
-**`fno` across opens.** MANIFEST records `fno_next` each time it is written (a flush publishes it before it unlinks
-or renames segments), so the number continues even when no segment is left (feed off, clean close). At open, `fno`
-= the larger of MANIFEST's `fno_next` and the end of the newest segment (`wal_` or `fwal_`), and, with the feed on,
-`FEED`'s floor.
+**`fno` across opens (settled in S0, with the advisor).** The bound lives in `FNO`, a file in every volume, not in
+MANIFEST: the writer never reads MANIFEST at open, and MANIFEST is one copy rewritten in place without a sync, so a
+power loss during any later rewrite tears it (merges, retention, deletes and the open's own publish all rewrite it;
+`CRASHFS_TEAR=1` does exactly that). A torn MANIFEST would leave the writer two bad choices, failing an open that
+fails nowhere today or losing the bound: rows take 1..1000, the flush syncs MANIFEST with 1001 and unlinks the
+segment, retention retires the part and deletes it, the MANIFEST rewrite for that is torn, and the open starts at 1
+again. `FNO` is two checksummed slots (magic, `fno_next`, generation, xxh64), each on a page of its own, in a file made
+at its full 8 KiB by mkdb, a volume add or the upgrade (a store never allocates). A store overwrites the slot with the
+older generation and `fdatasync`s it; a failure is fail-stop (`eng_fail`, ENOSPC too), and with `fsync = 0` the
+sync is skipped (a power loss is damage there already).
+- **When it is written.** Before any WAL segment is unlinked, `FNO` holds at least the number that ends that segment:
+  after a flush (`wal_unlink_upto`), after the replay at open, and for the empty segment at a clean close. Only
+  when the value moved since the last store, so at most one `fdatasync` per flush, under `flush_lock` and off
+  `buf_lock`. A clean close stores the exact `fno_next`.
+- **At open**, `fno_next` is the largest of the valid slot with the higher generation, the end of the valid records
+  of every segment, and 1 + the largest part `fno_hi`. One bad slot is a torn store (nothing relied on the newer
+  value before its sync) and the other is used; both bad, or no file in a format-9 volume, is `TSDB_ERR_CORRUPT`
+  with a log line.
+- **MANIFEST's `fno_next`** is information for followers only; the writer never relies on it, and followers never read
+  `FNO`. A part's `fno_lo, fno_hi` cover the rows records it holds, never markers (a rebuild must not skip a marker
+  a part seems to cover); at open they are an extra lower bound, never the main one. A part written by a large
+  insert, replace or delete has no numbers (0, 0).
+- **Not done:** reserving ahead (writing `fno_next + R`) would save the sync but makes a gap at every reopen, which the
+  cluster's log `[start, end]` and its epoch to first position history would then have to accept. Keeping the last
+  segment instead does not work either: an empty segment carries no number.
+`test_fno` (CRASHFS_TEAR power loss at every step of rows, a flush, a drop, markers, and of the open that replays a
+segment of markers only; the retention history; torn and missing slots) and four planted bugs it must catch: numbers
+restarting from the parts, the bound taken from MANIFEST, a segment unlinked before `FNO` holds its end, a marker
+replayed as rows.
 
 ### 2.2 Retained segments
 
@@ -1108,7 +1136,7 @@ they are all of its disk format apart from the files behind `requires=feed`:
 | piece | the feed uses it for | others |
 |---|---|---|
 | WAL record v2 (§2.1): 32-byte header with `fno`, `commit_ms`, `kind`; markers with `type, flags, span`; replay and followers skip markers and keep numbering | positions, cursors, event time, all markers | the cluster's replication unit |
-| `fno` assigned in `wal_buffer`; MANIFEST's `fno_next` (§2.1) | numbers that never go back across opens | the cluster's positions |
+| `fno` assigned in `wal_buffer`; the `FNO` file of each volume (§2.1; MANIFEST's `fno_next` is information only) | numbers that never go back across opens | the cluster's positions |
 | Marker payloads `COMMIT`, `DROP`, `RETENTION` (one encoder, M15) and the type numbers of `FEED_SLOT` and of the cluster's kinds, reserved | the feed's events; the ledger and the cluster share `COMMIT` | M15 |
 | META `requires=` (an open refuses a feature it does not know) | `requires=feed` (§2.13): a binary without the feed never opens a database with feed files (it would remove links as orphans and rename nothing) | `nfs-ha`, `cluster` |
 | Status codes -18, -19 reserved | `FEED_GONE`, `FEED_RESET` | |
@@ -1118,18 +1146,28 @@ through markers and does not read it), the wire bodies (MOVED, UNAVAILABLE, TOPO
 cluster's other marker kinds. The feed's own pieces come later and change no format: `tsdb-intent 4`, `fwal_`,
 `fcommit_`, links, `FEED`, `FEEDSLOTS`, `FEEDPOS`, all behind `requires=feed`.
 
-Points for S0 to settle with design-cluster.md and design-ha-modes.md: §4.1 there says every marker takes one number,
-where the `COMMIT` of §2.1 takes `span` (the events it expands into: the cluster only needs the first); MANIFEST's
-`fno_next` is new to both designs; the `DROP` payload carries the drop's block number and the `RETENTION` payload its
-record's offset in `RETENTION` (F17); and the HA heartbeats' positions (design-ha-modes.md §5.4) gain the durable
-`fno` (F19, built in N7).
+Points S0 settled with design-cluster.md and design-ha-modes.md: a marker takes `span` numbers (a plain marker one, a
+`COMMIT` the events it expands into: the cluster only needs the first), design-cluster.md §4.1 is amended; the numbers'
+durable bound is the `FNO` file, not MANIFEST (§2.1), and MANIFEST's `fno_next` is information for followers;
+`fno_lo, fno_hi` cover rows only; the `DROP` payload carries the drop's block number (and a partition key for a
+single-partition drop) and the `RETENTION` payload its record's offset in `RETENTION` (F17); the HA heartbeats'
+positions (design-ha-modes.md §5.4) gain the durable `fno` (F19, built in N7).
 
-**Migration note** (S0's to write; 0.9.0's rules, compatibility.md): format 9 changes the WAL record, MANIFEST and the
-part header. A format-8 database is refused with the message that names both versions; the way over is the export
-and import of `docs/export-format.md`, which always works. If S0 keeps format-8 part headers readable (a version in
-the header), an in-place `tsdb <dir> upgrade` is cheap: it refuses unless the database was closed cleanly with no WAL
-segment left, then writes MANIFEST and META version 9. Recommended, and S0's to decide with the HA work (it was this
-design's open question 5 before the review).
+**Migration note** (written in S0; 0.9.0's rules, compatibility.md): format 9 changes the WAL record, MANIFEST (one
+line), the part header (48 bytes) and adds `FNO`. A format-8 database is refused with a message that names both
+versions and the two ways over: `tsdb <dir> upgrade` (built in S0, decided with the advisor: export and import of a
+large database costs hours and twice the disk) and the export and import of `docs/export-format.md`, which always works.
+The upgrade refuses, before it writes anything, unless every volume was closed cleanly by the release that wrote it
+(no `wal_*` segment, intent or `tmp_*` part, the writers' locks free; `retired_*` parts are normal and do not count),
+holds the locks of every directory and of VOLUMES for the whole run, and per volume makes and syncs `FNO`, rewrites
+MANIFEST as version 9 (tmp, fsync, rename), then writes META 9 the same way; volumes first, the root last, so a crash
+leaves a root that still says 8 (the new binary refuses it and names the command, the 0.9.0 binary opens it and then
+refuses the volumes at 9). A run that died is run again. Followers on other hosts cannot be seen: stop them first.
+Parts keep their 24-byte headers: META says `parts_v8=1`, the open reads a part with a format-8 header only in such a
+volume and only when header and footer both say 8 (anywhere else it is damage), a merge of an idle partition (and
+`tsdb_optimize`) rewrites such a part alone, the open logs how many are left, and the line leaves META when none is.
+**This reader goes before 1.0** (docs/tasks/pre-1.0-v8-parts.md): a 1.0 open that finds a format-8 part refuses it and
+says to run 0.9.x until the count is zero, or to export and import.
 
 ## 6. Test plan
 
