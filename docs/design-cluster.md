@@ -690,10 +690,11 @@ capacity in CPU, disk I/O and network: 75% for 8 servers and f = 2, 60% for 5, 8
 performance; above them, the cluster stays correct and slows down.
 
 Memory: per series copy a server holds, count 40 bytes for each memtable that holds the series (the active one and
-up to four flushing; `mt_series` arrays are dense by local id), 16 bytes for the latest table
-([design-latest.md](design-latest.md) §2.4, within its budget), and the rights maps (1 byte per id per logged-in
-user, at most RAM/16). At 10^9 series, three copies on 8 servers (3.75 x 10^8 copies per server), the memtables are
-15 to 75 GB and the latest table 6 GB of a 256 GB server; the (N − f) / N rule applies to memory as to the rest.
+at most one flushing: a memtable joins `flushing` only when none is there; `mt_series` arrays are dense by local
+id), 16 bytes for the latest table ([design-latest.md](design-latest.md) §2.4, within its budget), and the rights
+maps (1 byte per id per logged-in user, at most RAM/16). At 10^9 series, three copies on 8 servers (3.75 x 10^8
+copies per server), the memtables are 15 to 30 GB and the latest table 6 GB of a 256 GB server; the (N − f) / N rule
+applies to memory as to the rest.
 
 ### 10.3 Measurements to plan (a quiet machine, several runs, the mean)
 
