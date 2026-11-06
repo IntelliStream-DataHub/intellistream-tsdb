@@ -563,6 +563,7 @@ static int connect_own(int p, pid_t pid, tsdbc **c)
         *c = NULL;
         return -1;
     }
+    tsdbc_set_retry(*c, 0); /* the history records what the server answered, not what a retrying client made of it */
     return 0;
 }
 

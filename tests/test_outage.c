@@ -43,6 +43,16 @@ static int failures;
         }                                                                      \
     } while (0)
 
+/* This test is about what the server answers: the client's own retry of UNAVAILABLE (protocol 13) is off here
+ * (tests/test_unavailable.c has it on). */
+static int connect_noretry(const char *host, int port, int ms, tsdbc **out)
+{
+    int rc = tsdbc_connect_timeout(host, port, ms, out);
+    if (rc == 0)
+        tsdbc_set_retry(*out, 0);
+    return rc;
+}
+
 static char ctl[256], root[512];
 static int port;
 static pid_t server;
@@ -134,7 +144,7 @@ static void *extra_main(void *arg)
 {
     intptr_t k = (intptr_t)arg, packed = k >= 1000;
     tsdbc *c;
-    if (tsdbc_connect_timeout("127.0.0.1", port, 3000, &c))
+    if (connect_noretry("127.0.0.1", port, 3000, &c))
         return NULL;
     int64_t base = 3000000000LL + k * 1000000LL;
     while (!atomic_load(&stop_extra)) {
@@ -168,7 +178,7 @@ static void *writer(void *arg)
 {
     side *s = arg;
     tsdbc *c;
-    if (tsdbc_connect_timeout("127.0.0.1", port, 3000, &c))
+    if (connect_noretry("127.0.0.1", port, 3000, &c))
         return NULL;
     while (!atomic_load(&stop_writers)) {
         int64_t ts = s->next++;
@@ -200,7 +210,7 @@ static void *writer(void *arg)
                 tsdbc_close(c);
                 c = NULL;
                 for (int i = 0; i < 50 && !c; i++)
-                    if (tsdbc_connect_timeout("127.0.0.1", port, 1000, &c))
+                    if (connect_noretry("127.0.0.1", port, 1000, &c))
                         c = NULL, msleep(100);
                 if (!c)
                     return NULL;
@@ -243,7 +253,7 @@ static int has(const seen *s, int64_t ts)
 static void verify(const char *what, side *s)
 {
     tsdbc *c;
-    CHECK(tsdbc_connect_timeout("127.0.0.1", port, 3000, &c) == 0);
+    CHECK(connect_noretry("127.0.0.1", port, 3000, &c) == 0);
     if (!c)
         return;
     /* The writers go on while this runs: judge only what was acknowledged or refused before the read began (a row
@@ -284,7 +294,7 @@ static int alive(void) { return waitpid(server, NULL, WNOHANG) == 0; }
 static int await_writes(side *s, int timeout_ms)
 {
     tsdbc *c;
-    if (tsdbc_connect_timeout("127.0.0.1", port, 3000, &c))
+    if (connect_noretry("127.0.0.1", port, 3000, &c))
         return -1;
     double t0 = now_ms();
     int rc = -1;
@@ -356,7 +366,7 @@ int main(int argc, char **argv)
     msleep(4500); /* past the DOWN threshold (2.5 s here); A's own writer is inside a hung call until the heal */
     /* a request that arrives now is refused at once: DOWN quiesces the volume, and at most four wait inside it */
     tsdbc *pc;
-    CHECK(tsdbc_connect_timeout("127.0.0.1", port, 3000, &pc) == 0);
+    CHECK(connect_noretry("127.0.0.1", port, 3000, &pc) == 0);
     for (int i = 0; i < 3 && pc; i++) {
         int64_t ts = 2000000000 + i;
         float v = 1;
@@ -425,7 +435,7 @@ int main(int argc, char **argv)
     /* 3. a part of A lost while A is down: DIVERGED, and a second outage does not resume it */
     {
         tsdbc *c;
-        CHECK(tsdbc_connect_timeout("127.0.0.1", port, 3000, &c) == 0);
+        CHECK(connect_noretry("127.0.0.1", port, 3000, &c) == 0);
         CHECK(c && tsdbc_flush(c) == 0); /* the rows so far are in parts */
         CHECK(fault("hang", dir_a, NULL) == 0);
         msleep(3500); /* DOWN */

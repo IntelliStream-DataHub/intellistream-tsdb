@@ -712,8 +712,19 @@ static int reconnect_to(tsdbc *c, const char *host, int port)
     c->hello_flags = 0;
     c->scram = false;
     c->expect = c->next_id; /* the handshake's own ids: the server only echoes them */
+    /* the handshake's calls trim the queue of requests kept (everything before c->expect): hide it meanwhile */
+    struct sent *kq = c->q;
+    size_t khead = c->qhead, klen = c->qlen, kcap = c->qcap, kbytes = c->qbytes;
+    c->q = NULL;
+    c->qhead = c->qlen = c->qcap = c->qbytes = 0;
     tsdbc_set_keepalive(c, TSDBC_KEEPALIVE_IDLE_S, TSDBC_KEEPALIVE_INTERVAL_S, TSDBC_KEEPALIVE_COUNT);
     int rc = handshake(c, connect_ms);
+    free(c->q);
+    c->q = kq;
+    c->qhead = khead;
+    c->qlen = klen;
+    c->qcap = kcap;
+    c->qbytes = kbytes;
     c->pending = pending;
     c->next_id = next;
     if (rc) {
@@ -2983,6 +2994,9 @@ static uint64_t shuffle_next(uint64_t *x)
 int tsdbc_connect_nodes(const char *nodes, const tsdbc_options *o, tsdbc **out)
 {
     *out = NULL;
+    static const tsdbc_options no_options;
+    if (!o)
+        o = &no_options;
     if (!nodes)
         return TSDB_ERR_INVALID;
     char **list = NULL;

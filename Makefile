@@ -147,7 +147,7 @@ $(B)/test_crypto: tests/test_crypto.c tests/rfc7677.h $(B)/tsdb_crypto.o
 # The C client with its test hooks (tests/client_hooks.h), which libtsdbclient.a does not have; linked before
 # $(CLIB), so the archive's own tsdb_client.o is not pulled in.
 $(B)/tsdb_client_hooks.o: client/tsdb_client.c client/tsdb_client.h client/tsdb_crypto.h include/tsdb_protocol.h \
-                          include/tsdb.h | $(B)
+                          include/tsdb.h include/tsdb_wire.h | $(B)
 	$(CC) $(CFLAGS) -DTSDBC_TEST_HOOKS -c -o $@ $<
 
 # starts tsdbd (login on) and links server/auth.c for the RFC 7677 exchange on the server side in this process
@@ -227,7 +227,7 @@ $(B)/test_abandon: tests/test_abandon.c $(LIB)
 $(B)/test_recover: tests/test_recover.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_graveyard $(B)/test_abandon $(B)/test_recover $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_wire $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
 	./$(B)/test_tsdb
 	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
@@ -273,6 +273,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_latest $(B)/test_
 	./$(B)/test_out_send
 	TSDBD=$(TSDBD) ./$(B)/test_ports
 	./$(B)/test_client
+	./$(B)/test_wire tests/data/wire13-vectors.txt
 	for io in $(IO); do echo "== tsdbd --io $$io"; \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server && \
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_server_multi && \
@@ -579,7 +580,7 @@ RELEASE_VERSION := $(shell cat VERSION)
 TSDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
 
 TSDBD_SRC := server/tsdbd.c server/metrics.c server/metrics.h server/auth.c server/auth.h server/users.h \
-             include/tsdb_protocol.h client/tsdb_pack.h client/tsdb_crypto.h
+             include/tsdb_protocol.h include/tsdb_wire.h client/tsdb_pack.h client/tsdb_crypto.h
 $(B)/tsdbd: $(TSDBD_SRC) $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB)
 	$(CC) $(CFLAGS) $(URING_FLAGS) -DTSDB_BUILD_VERSION='"$(TSDB_VERSION)"' -o $@ $< server/metrics.c server/auth.c \
 	    $(B)/tsdb_pack.o $(B)/users.o $(B)/tsdb_crypto.o $(LIB) $(LDLIBS) $(URING_LIBS)
@@ -611,7 +612,7 @@ fuzz-frames:
 CLIB := $(B)/libtsdbclient.a
 
 $(B)/tsdb_client.o: client/tsdb_client.c client/tsdb_client.h client/tsdb_crypto.h include/tsdb_protocol.h \
-                    include/tsdb.h | $(B)
+                    include/tsdb.h include/tsdb_wire.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(B)/tsdb_pack.o: client/tsdb_pack.c client/tsdb_pack.h include/tsdb_protocol.h | $(B)
@@ -651,6 +652,9 @@ $(B)/test_ports: tests/test_ports.c tests/harness.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 $(B)/test_client: tests/test_client.c $(CLIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
+
+$(B)/test_wire: tests/test_wire.c include/tsdb_wire.h $(CLIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 
 # includes server/tsdbd.c, as fuzz_frames does (epoll only)
@@ -741,6 +745,9 @@ $(B)/test_outagefs: tests/test_outagefs.c tests/outagefs_ctl.h | $(B)
 $(B)/test_outage: tests/test_outage.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
 	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
 
+$(B)/test_unavailable: tests/test_unavailable.c tests/harness.h tests/outagefs_ctl.h $(CLIB) $(LIB)
+	$(CC) $(CFLAGS) -Iclient -o $@ $< $(CLIB) $(LIB) $(LDLIBS)
+
 $(B)/test_health: tests/test_health.c tests/outagefs_ctl.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
@@ -821,11 +828,12 @@ test-quickstart: $(B)/tsdb $(B)/tsdbd $(B)/embedded-example $(B)/client-example
 # The outage shim's own test (Linux only: LD_PRELOAD)
 ifneq ($(UNAME_S),Darwin)
 test: test-outagefs
-test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/liboutagefs.so $(B)/tsdbd
+test-outagefs: $(B)/test_outagefs $(B)/test_health $(B)/test_outage $(B)/test_unavailable $(B)/liboutagefs.so $(B)/tsdbd
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_outagefs /tmp
 	OUTAGEFS_LIB=$(B)/liboutagefs.so ./$(B)/test_health /tmp
 	for io in $(IO); do echo "== outage, tsdbd --io $$io"; \
-	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; done
+	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_outage /tmp || exit 1; \
+	    OUTAGEFS_LIB=$(B)/liboutagefs.so TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_unavailable /tmp || exit 1; done
 endif
 
 # The version is in VERSION, include/tsdb.h, the binaries and the client manifests; they must agree.

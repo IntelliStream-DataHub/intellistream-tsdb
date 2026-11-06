@@ -363,7 +363,7 @@ static inline size_t tsdb_wire_put_topo_vol(uint8_t *out, size_t cap, const tsdb
 {
     if (v->addr_len > TSDB_ADDR_MAX || v->path_len > 4096)
         return 0;
-    size_t need = 28 + 2 + v->addr_len + 2 + v->path_len;
+    size_t need = 28 + (size_t)v->addr_len + 2 + v->path_len;
     if (need <= cap) {
         tsdb_wire_wr16(out, v->vol);
         out[2] = v->role;
