@@ -1363,7 +1363,7 @@ int wal_verify_tail(eng *db, const char *dir)
 }
 
 /* Writes the rows the halted engine holds in memory (its flushing memtables, oldest first, then the active one;
- * rows past what was durable only where the WAL is not synced per write: those were not acknowledged) into a new
+ * rows past what was durable only where the WAL is not synced per write: there they were acknowledged, in sync mode they were not) into a new
  * segment after the last one, on new descriptors, and syncs it and the directory. The open that follows replays it
  * after every older segment, so a row it holds wins over an older copy and nothing the memory knew is missing.
  * The failed descriptors are never used: what they report proves nothing (ha.md 15.5 step 4).
@@ -1380,7 +1380,9 @@ int wal_relog(eng *db, const char *dir, uint64_t *rows_out)
     char name[64];
     uint64_t seq = db->wal_seq + 1;
     wal_name(name, sizeof name, seq);
-    int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL | O_APPEND | O_CLOEXEC, 0644);
+    /* O_TRUNC, not O_EXCL: an attempt whose open failed afterwards left this segment, and the retry writes the same
+     * rows again (the old engine's memory has not changed); nothing else can own this name, the lock is ours */
+    int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, 0644);
     if (fd < 0) {
         close(dirfd);
         return TSDB_ERR_IO;

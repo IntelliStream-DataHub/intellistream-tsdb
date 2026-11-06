@@ -1563,6 +1563,7 @@ typedef struct reval_part {
 int reval_dicts(eng *old, const char *dir, uint64_t *series_added, uint64_t *states_added);
 int reval_capture(eng *old, reval_part **out, size_t *n);
 void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost, uint64_t *lost_rows);
+void reval_logs(const eng *old, const eng *neu, uint64_t *lost_bytes);
 void eng_halt(eng *db);
 /* A new engine for the directory of `old` (halted, closed afterwards by eng_retire) that takes over its lock. */
 int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, struct sched *qs, eng **out);

@@ -10,9 +10,12 @@
  *   - SERIES and STATES hold every id the engine handed out: entries the server lost are appended again with their
  *     names before anything else opens the files (a lost entry would give an id another name, and a client holding
  *     it would write into the wrong series); a prefix that differs is damage and fails;
- *   - after the open, every part that was live must be there, or have been merged into a part that is, or be
- *     replaced by the parts a rolled-back merge brought back (a consistent rollback leaves one or the other).
- *     What remains is lost: counted, logged, and the volume stays refused (DIVERGED) until an operator accepts it.
+ *   - after the open, every part that was live must be there, or lie inside the block range of a part that is (a
+ *     merge that finished while the engine was stopped). Nothing else counts: a merge the storage took back brings
+ *     its sources back, but an overwrite, a delete or an expiry that was merged into its output is not in them (the
+ *     rows would silently revert), and counting rows cannot tell the two apart. What remains is lost: counted,
+ *     logged, and the volume stays refused (DIVERGED) until an operator accepts it;
+ *   - RETENTION and CLASSES are append-only: the open must apply as many bytes of each as the engine had (reval_logs).
  *
  * What this does not see: a payload damaged inside a part of the right name and size (only the header, index and
  * footer checksums at open, and verify_checksums at read time, see it), and a rollback of a volume whose engine
@@ -108,8 +111,6 @@ void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost,
     for (size_t i = 0; i < nx; i++) {
         const reval_part *o = &x[i];
         bool found = false, covered = false;
-        uint64_t inside = 0;
-        size_t ninside = 0;
         for (size_t j = 0; j < neu->nparts; j++) {
             const part *p = neu->parts[j];
             if (strcmp(p->name, o->name) == 0) {
@@ -120,15 +121,7 @@ void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost,
                 continue;
             if (p->min_block <= o->min_block && p->max_block >= o->max_block)
                 covered = true; /* merged into this one while the engine was stopped (an interrupted merge) */
-            else if (p->min_block >= o->min_block && p->max_block <= o->max_block) {
-                inside += p->rows; /* the sources of a merge the storage took back */
-                ninside++;
-            }
         }
-        /* a part with tombstones is replaced only by a part that holds them (merges carry them), never by sources:
-         * the delete would be gone */
-        if (!found && !covered && o->nt == 0 && ninside > 0 && inside >= o->rows)
-            covered = true;
         if (found || covered)
             continue;
         (*lost)++;
@@ -137,5 +130,23 @@ void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost,
                         "lost\n",
                 o->name, (unsigned long long)o->min_block, (unsigned long long)o->max_block,
                 (unsigned long long)o->rows, o->nt ? ", with deletes" : "");
+    }
+}
+
+/* After the open: RETENTION and CLASSES only grow, so fewer bytes applied than the halted engine had means records
+ * the storage lost (a limit that was acknowledged, a class switch). The bytes are summed into *lost. */
+void reval_logs(const eng *old, const eng *neu, uint64_t *lost)
+{
+    if (neu->ret_off < old->ret_off) {
+        *lost += old->ret_off - neu->ret_off;
+        fprintf(stderr, "tsdb: RETENTION holds %llu bytes of records on the storage and the engine had %llu: "
+                        "acknowledged retention limits are gone\n",
+                (unsigned long long)neu->ret_off, (unsigned long long)old->ret_off);
+    }
+    if (neu->cls_off < old->cls_off) {
+        *lost += old->cls_off - neu->cls_off;
+        fprintf(stderr, "tsdb: CLASSES holds %llu bytes of records on the storage and the engine had %llu: "
+                        "acknowledged class switches are gone\n",
+                (unsigned long long)neu->cls_off, (unsigned long long)old->cls_off);
     }
 }

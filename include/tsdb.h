@@ -745,11 +745,14 @@ int tsdb_volume_idle(tsdb *db, size_t vol, int timeout_ms);
  * 4): wal_mismatch: the last durable WAL record was not on the storage as written (a rolled-back server), so the
  * rows memory held (relogged_rows) went into a new segment first; series_repaired, states_repaired: entries of SERIES
  * and STATES the storage had lost, appended again from memory; lost_parts, lost_part_rows: parts that were listed and
- * are gone, and not merged into or replaced by others (their rows are lost); diverged: lost_parts != 0, and the new
- * engine stays quiesced until the caller accepts it with tsdb_volume_resume. */
+ * are gone, and not merged into others (their rows are lost; a merge the storage took back counts as lost: its
+ * sources are there, but an overwrite or delete merged into its output is not); lost_log_bytes: bytes of RETENTION and
+ * CLASSES records the storage lost; diverged: lost_parts != 0 or lost_log_bytes != 0, and the new engine stays
+ * quiesced until the caller accepts it with tsdb_volume_resume. With wal_sync_ms > 0 every row the memory holds is
+ * written again (relogged_rows) on every reopen, since acknowledged rows past the last sync exist only there. */
 typedef struct tsdb_volume_report {
     int wal_mismatch, diverged;
-    uint64_t relogged_rows, series_repaired, states_repaired, lost_parts, lost_part_rows;
+    uint64_t relogged_rows, series_repaired, states_repaired, lost_parts, lost_part_rows, lost_log_bytes;
 } tsdb_volume_report;
 int tsdb_volume_reopen(tsdb *db, size_t vol, tsdb_volume_report *report /* may be NULL */);
 int tsdb_volume_resume(tsdb *db, size_t vol);

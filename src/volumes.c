@@ -1526,6 +1526,10 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
     if (rc == 0 && (rc = wal_verify_tail(old, path)) == 1) {
         rep->wal_mismatch = 1;
         rc = wal_relog(old, path, &rep->relogged_rows);
+    } else if (rc == 0 && old->wal_enabled && old->opt.wal_sync_ms > 0) {
+        /* async WAL: rows past wal_durable were acknowledged and exist only in memory, and the tail of the log
+         * matches whatever the storage did: the open would drop them. Always carry them over. */
+        rc = wal_relog(old, path, &rep->relogged_rows);
     }
     if (rc == 0)
         rc = reval_dicts(old, path, &rep->series_repaired, &rep->states_repaired);
@@ -1538,8 +1542,9 @@ int tsdb_volume_reopen(tsdb *t, size_t vol, tsdb_volume_report *report)
         return rc; /* the old engine stays, halted and quiesced: try again */
     }
     reval_parts(e, exp, nexp, &rep->lost_parts, &rep->lost_part_rows);
+    reval_logs(old, e, &rep->lost_log_bytes);
     free(exp);
-    rep->diverged = rep->lost_parts != 0;
+    rep->diverged = rep->lost_parts != 0 || rep->lost_log_bytes != 0;
     if (rep->diverged) /* refused until an operator accepts the loss (tsdb_volume_resume) */
         atomic_store_explicit(&e->quiesced, true, memory_order_release);
     pthread_rwlock_wrlock(&t->lock);

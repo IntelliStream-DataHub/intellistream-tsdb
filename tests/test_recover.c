@@ -197,20 +197,93 @@ static void revalidation(void)
     CHECK(count(db, s) == 0);
     tsdb_close(db);
 
-    /* a merge taken back: the sources are there again and the merged part is not: no loss */
+    /* a merge taken back: its sources are there again and the merged part is not. The merge carried an overwrite
+     * (the third insert) that the sources do not hold, and rows counting cannot see that: lost, DIVERGED */
     sh("rm -rf '%s' '%s'", root, vol);
     db = reval_open(root, vol, &s, "merged");
     OK(tsdb_insert_series(db, s, ts, v, 250));
     OK(tsdb_insert_series(db, s, ts + 250, v + 250, 250));
-    OK(tsdb_insert_series(db, s, ts + 100, v + 100, 250)); /* overlaps both */
     sh("mkdir -p '%s/before' && cp '%s'/p*.part '%s/before/'", vol, vol, vol);
+    float v2[600];
+    for (int i = 0; i < 600; i++)
+        v2[i] = 2;
+    OK(tsdb_insert_series(db, s, ts + 100, v2, 250)); /* overlaps both, acknowledged */
     OK(tsdb_optimize(db));
     CHECK(count(db, s) == 500);
     stop_volume(db);
     sh("rm -f '%s'/p*.part && cp '%s/before'/p*.part '%s/'", vol, vol, vol);
     OK(tsdb_volume_reopen(db, 1, &rep));
-    CHECK(rep.lost_parts == 0 && !rep.diverged);
-    CHECK(count(db, s) == 500);
+    CHECK(rep.lost_parts == 1 && rep.diverged);
+    tsdb_close(db);
+
+    /* a delete merged away and taken back: the deleted rows would come back */
+    sh("rm -rf '%s' '%s'", root, vol);
+    db = reval_open(root, vol, &s, "deleted");
+    OK(tsdb_insert_series(db, s, ts, v, 250));
+    OK(tsdb_insert_series(db, s, ts + 250, v + 250, 250));
+    sh("mkdir -p '%s/before' && cp '%s'/p*.part '%s/before/'", vol, vol, vol);
+    OK(tsdb_delete_range(db, s, 100, 200));
+    OK(tsdb_optimize(db));
+    CHECK(count(db, s) == 400);
+    stop_volume(db);
+    sh("rm -f '%s'/p*.part && cp '%s/before'/p*.part '%s/'", vol, vol, vol);
+    OK(tsdb_volume_reopen(db, 1, &rep));
+    CHECK(rep.diverged && rep.lost_parts >= 1);
+    tsdb_close(db);
+
+    /* an acknowledged retention limit lost with RETENTION: the expired rows would come back */
+    sh("rm -rf '%s' '%s'", root, vol);
+    db = reval_open(root, vol, &s, "ret");
+    int64_t now = (int64_t)time(NULL) * 1000, rt[300];
+    float rv[300];
+    for (int i = 0; i < 300; i++)
+        rt[i] = now - 300000 + i * 1000, rv[i] = 1;
+    OK(tsdb_insert_series(db, s, rt, rv, 300));
+    OK(tsdb_set_retention(db, s, 60000));
+    CHECK(count(db, s) < 100);
+    stop_volume(db);
+    sh("rm -f '%s'/RETENTION", vol);
+    OK(tsdb_volume_reopen(db, 1, &rep));
+    CHECK(rep.lost_log_bytes > 0 && rep.diverged);
+    tsdb_close(db);
+
+    /* an async WAL: rows past the last sync were acknowledged and live in memory only; the storage lost nothing,
+     * and the reopen must still keep them */
+    sh("rm -rf '%s' '%s'", root, vol);
+    {
+        tsdb_options o;
+        tsdb_options_init(&o);
+        o.wal_max_batch_rows = 200;
+        o.merge_idle_s = -1;
+        o.partition_classes = 0;
+        o.wal_sync_ms = 3000;
+        OK(tsdb_open(root, &o, &db));
+        uint32_t vi;
+        OK(tsdb_volume_add(db, vol, &vi));
+        OK(tsdb_series_at(db, "async", vol, &s));
+    }
+    OK(tsdb_insert_series(db, s, ts, v, 100));
+    CHECK(count(db, s) == 100);
+    stop_volume(db);
+    OK(tsdb_volume_reopen(db, 1, &rep));
+    CHECK(rep.relogged_rows == 100 && !rep.diverged);
+    CHECK(count(db, s) == 100);
+    tsdb_close(db);
+
+    /* a reopen that fails after it re-logged can be repeated once the cause is gone */
+    sh("rm -rf '%s' '%s'", root, vol);
+    db = reval_open(root, vol, &s, "retry");
+    OK(tsdb_insert_series(db, s, ts, v, 300)); /* a part */
+    OK(tsdb_insert_series(db, s, ts + 250, v, 50)); /* WAL rows */
+    stop_volume(db);
+    sh("for f in '%s'/wal_*.log; do : > \"$f\"; done; chmod 000 '%s'/p*.part", vol, vol);
+    if (geteuid() != 0) { /* root reads a part with mode 000 */
+        CHECK(tsdb_volume_reopen(db, 1, &rep) != 0);
+        sh("chmod 644 '%s'/p*.part", vol);
+        OK(tsdb_volume_reopen(db, 1, &rep));
+        CHECK(rep.wal_mismatch == 1 && !rep.diverged);
+        CHECK(count(db, s) == 300);
+    }
     tsdb_close(db);
 }
 
