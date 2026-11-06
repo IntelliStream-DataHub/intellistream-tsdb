@@ -1077,7 +1077,12 @@ int eng_drop_before(eng *db, int64_t ts)
     /* A merge of a partition being dropped names its output (durably) before it takes db->lock to list it. Dropped
      * meanwhile, its sources are gone and the output is the only part with their rows: a crash after the
      * acknowledgement would list it alone. So wait until the merge has listed it (the loop below retires it with
-     * the rest, by rename, before the fsync) and look again: the wait released db->lock. */
+     * the rest, by rename, before the fsync) and look again: the wait released db->lock. The intent is published
+     * first, so that no further merge of those partitions is selected meanwhile (select_merge_locked,
+     * ttl_select_locked, eng_optimize): the wait ends with the merges already in flight. Drops are serialized by
+     * drop_lock (tsdb_drop_before), so there is one intent at a time; it is cleared on every way out below. */
+    db->drop_pending = true;
+    db->drop_pending_end = ts;
     for (bool busy = true; busy && !eng_check(db);) {
         busy = false;
         for (size_t i = 0; i < db->nparts && !busy; i++) {
@@ -1101,6 +1106,7 @@ int eng_drop_before(eng *db, int64_t ts)
             i++;
         }
     }
+    db->drop_pending = false; /* also after a failed engine: the retire loop above is the only exit */
     pthread_mutex_unlock(&db->lock);
     if ((rc = eng_sync_dir(db, "fsync of the directory after retiring dropped parts")) != 0)
         return rc; /* failed since the flush, here or elsewhere */

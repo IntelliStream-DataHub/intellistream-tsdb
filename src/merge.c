@@ -81,7 +81,7 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
             newest = MAX(newest, db->parts[i]->written);
             damaged |= atomic_load(&db->parts[i]->damaged);
         }
-        if (damaged) {
+        if (damaged || partition_dropping(db, db->parts[a]->partition)) { /* the drop retires it: start nothing */
             a = b;
             continue;
         }
@@ -474,9 +474,13 @@ void merge_commit_locked(eng *db, part **src, size_t k, part *out)
         /* A source was dropped meanwhile: the merged data must not come back. Neither eng_drop_before nor the
          * retention drop lets this happen (they wait for, or leave, a partition with a merging part), so this is a
          * backstop. The output already has its listed name, durable (pw_finish): it goes by rename and a directory
-         * fsync, as a dropped part does, never by an unlink a power loss can undo. */
-        db_retire_unlisted_locked(db, out);
-        atomic_store(&out->obsolete, true);
+         * fsync, as a dropped part does, never by an unlink a power loss can undo. A failed engine names no new
+         * file, so there it stays as it is (the next open sees what a crash here leaves, and the sources are
+         * retired or listed as the open finds them). */
+        if (!eng_check(db)) {
+            db_retire_unlisted_locked(db, out);
+            atomic_store(&out->obsolete, true);
+        }
         part_unref(out);
     }
     pthread_cond_broadcast(&db->merged_cv);
@@ -559,7 +563,7 @@ size_t ttl_select_locked(eng *db, part **sel, bool *dropped, bool *sync_wal)
     size_t k = 0;
     for (size_t a = 0, b; a < db->nparts; a = b) {
         int64_t all = INT64_MIN;
-        bool busy = false;
+        bool busy = partition_dropping(db, db->parts[a]->partition); /* a drop retires it: no rewrite, no second drop */
         for (b = a; b < db->nparts && db->parts[b]->partition == db->parts[a]->partition; b++) {
             part *p = db->parts[b];
             busy |= p->merging;
@@ -700,6 +704,8 @@ int eng_optimize(eng *db)
                 damaged |= atomic_load(&db->parts[j]->damaged);
             }
             if (j - i < 2 && !insert_written(db->parts[i]))
+                continue;
+            if (partition_dropping(db, db->parts[i]->partition)) /* the drop retires it: nothing to optimize */
                 continue;
             if (damaged) { /* found by a merge before (part_checked): the rest is merged, and the call fails */
                 skipped = true;

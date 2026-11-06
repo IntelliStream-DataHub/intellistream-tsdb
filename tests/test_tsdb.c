@@ -2543,8 +2543,95 @@ static void retention_vs_merge(const char *base)
     rm_rf(copy);
 }
 
+/* ------------------------------------------------ a drop does not wait for merges that start after it began */
+
+/* The first merge is held until rel1, a second one (should any start) until rel2; later ones pass. */
+static atomic_int dm_started, dm_rel1, dm_rel2;
+
+static void dm_hook(int at)
+{
+    if (at != 0)
+        return;
+    int n = atomic_fetch_add(&dm_started, 1);
+    if (n == 0)
+        while (!atomic_load(&dm_rel1))
+            usleep(1000);
+    else if (n == 1)
+        while (!atomic_load(&dm_rel2))
+            usleep(1000);
+}
+
+static void *plain_optimize_thread(void *arg)
+{
+    (void)tsdb_optimize(arg);
+    return NULL;
+}
+
+/* Regression (review of aeda31c, L1): tsdb_drop_before waits for the merges of its partitions that are in flight,
+ * and nothing kept new ones from being selected meanwhile: another tsdb_optimize (or a merge thread) that wakes when
+ * the held merge ends could start a merge of the same partition (here the merged part and one inserted during the
+ * hold), and the drop, holding drop_lock and an engine reference, waited for that one too, and so on. The drop
+ * publishes its intent (drop_pending_end) before it waits, and no merge of a partition it retires is selected. */
+static void drop_blocks_new_merges(const char *base)
+{
+    char dir[512];
+    snprintf(dir, sizeof dir, "%s/tsdb-dropnew-%d", base, (int)getpid());
+    rm_rf(dir);
+    tsdb_options o = test_opts(0);
+    o.partition_classes = 0;
+    o.wal_max_batch_rows = 100;
+    o.fsync = 0;
+    tsdb *db;
+    OK(tsdb_open(dir, &o, &db));
+    tsdb_sid id;
+    OK(tsdb_series(db, "s", &id));
+    const int64_t t0 = 1700000000000LL;
+    two_parts_one_partition(db, id, t0);
+    atomic_store(&dm_started, 0);
+    atomic_store(&dm_rel1, 0);
+    atomic_store(&dm_rel2, 0);
+    atomic_store(&merge_hook, dm_hook);
+    pthread_t a, b, dropper;
+    pthread_create(&a, NULL, plain_optimize_thread, db); /* merge 1, held */
+    for (int i = 0; i < 20000 && atomic_load(&dm_started) < 1; i++)
+        usleep(1000);
+    CHECK(atomic_load(&dm_started) == 1);
+    {   /* a third part of the same partition, not merging: with the merge's output it makes a merge to start */
+        enum { N = 1000 };
+        int64_t ts[N];
+        float v[N];
+        for (int i = 0; i < N; i++) {
+            ts[i] = t0 + 300000 + i * 100;
+            v[i] = (float)i;
+        }
+        OK(tsdb_insert_series(db, id, ts, v, N));
+    }
+    pthread_create(&b, NULL, plain_optimize_thread, db); /* waits: the partition is busy */
+    usleep(300000);
+    drop_job j = {db, dir, NULL, t0 + 30LL * 86400000, false, -1};
+    pthread_create(&dropper, NULL, drop_thread, &j); /* waits for merge 1 */
+    usleep(300000);
+    CHECK(!atomic_load(&j.done));
+    atomic_store(&dm_rel1, 1);
+    for (int i = 0; i < 2000 && !atomic_load(&j.done); i++) /* 2 s: only merge 1 was in flight */
+        usleep(1000);
+    CHECK(atomic_load(&j.done));
+    CHECK(atomic_load(&dm_started) == 1); /* the old code started a second merge, held here, and waited for it */
+    atomic_store(&dm_rel2, 1);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    pthread_join(dropper, NULL);
+    atomic_store(&merge_hook, NULL);
+    CHECK(j.rc == 0);
+    CHECK(rows_in(db, id) == 0);
+    OK(tsdb_close(db));
+    rm_rf(dir);
+}
+
 static void test_drop_vs_merge(const char *base)
 {
+    drop_blocks_new_merges(base);
+    printf("  a pending drop keeps new merges out of its partitions: it waits only for those in flight\n");
     for (int point = 0; point < 2; point++) {
         drop_vs_merge(base, point, 0);
         drop_vs_merge(base, point, 480);

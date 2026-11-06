@@ -1352,6 +1352,8 @@ struct eng {
     atomic_int_fast64_t clock_floor; /* now never goes below this */
     atomic_uint ret_gen;             /* bumped by every change of a limit (parts cache their expiry) */
     int64_t last_ttl_ms;             /* merge thread: last scan for expired rows, CLOCK_MONOTONIC (under lock) */
+    bool drop_pending;               /* eng_drop_before is waiting for merges, then retiring (under lock) */
+    int64_t drop_pending_end;        /* ...every partition ending at or before this: no merge of one is selected */
     sched *sched;
     bool own_sched; /* opened alone (eng_open), not by a tsdb that shares its scheduler */
 
@@ -1489,6 +1491,9 @@ extern __thread size_t cc_gets; /* contexts this thread took (db.c); for tests: 
  * for the last partition, which then holds INT64_MAX itself) */
 int64_t partition_of(struct eng *db, uint32_t series, int64_t ts);
 void partition_range(const struct eng *db, int64_t key, int64_t *lo, int64_t *hi);
+/* A drop (eng_drop_before) is under way that retires this partition: no new merge or rewrite may start in it, or
+ * the drop could wait for as long as merges keep being selected. Caller holds db->lock. */
+bool partition_dropping(const struct eng *db, int64_t key);
 int partition_class(const struct eng *db, int64_t key);
 /* Lists committed parts, taking over the caller's references, and rewrites
  * MANIFEST. Cannot fail: once listed, the parts are published and must not

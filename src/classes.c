@@ -83,6 +83,15 @@ int partition_class(const eng *db, int64_t key)
     return (int)(key - floor_div(key, db->cls_kmul) * db->cls_kmul);
 }
 
+bool partition_dropping(const eng *db, int64_t key)
+{
+    int64_t lo, end;
+    if (!db->drop_pending)
+        return false;
+    partition_range(db, key, &lo, &end);
+    return end <= db->drop_pending_end;
+}
+
 void partition_range(const eng *db, int64_t key, int64_t *lo, int64_t *hi)
 {
     int c = partition_class(db, key);
