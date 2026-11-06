@@ -2,8 +2,9 @@
 # Builds and checks the release tarball of TAG from the checkout in the current directory, which must be exactly
 # that tag, clean, with VERSION equal to TAG without its "v" and without a -prerelease suffix (VERSION is always
 # X.Y.Z: tools/check-version.sh). The release workflow (.github/workflows/release.yml) runs it from its own checkout
-# against a checkout of the tag, so a tag older than this script is built the same way; you can run it in a clean
-# clone too.
+# against a checkout of the tag, so a tag older than this script is built the same way; you can run it in a fresh
+# clone too (not in a tree built for another tag: make keeps binaries whose build id names that tag, and the
+# --version check below refuses them).
 #
 #   .github/scripts/release-build.sh TAG OUT-DIR
 #   EXPECT_COMMIT=SHA      fail unless the tag is that commit (a tag push: the commit that was pushed)
