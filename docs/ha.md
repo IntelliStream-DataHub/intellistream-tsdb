@@ -15,7 +15,7 @@
 | Goals | Stay. "No consensus protocol" now means none on the insert path: ownership is decided by the metadata group (M2), which no row goes through. |
 | Decisions | Kept; rows changed by the modes design start with *Changed 2026-11-06*. |
 | §1 Roles | Roles and slots stay; `NODES` and `--volumes` candidate filters become metadata members and candidate lists (design-ha-modes.md §5.4). |
-| §2 Arbiter and fencing | **Shared-mode only, kept as the fence** (M3, design-ha-modes.md §6). The lock no longer decides who should own a volume; only a node the metadata group granted the volume asks for it (M4). §2.4's epoch claim takes the granted epoch (design-ha-modes.md §5.5). Revised after review (2026-11-06): `CLASSES` and `RETENTION` are chained like `SERIES` (§2.2, §2.5, §2.6); a volume leaves SUSPECT through RECHECK, and owner reads wait for the read barrier (§2.7, M16). |
+| §2 Arbiter and fencing | **Shared-mode only, kept as the fence** (M3, design-ha-modes.md §6). The lock no longer decides who should own a volume; only a node the metadata group granted the volume asks for it (M4). §2.4's epoch claim takes the granted epoch (design-ha-modes.md §5.5). Revised after review (2026-11-06): `CLASSES` and `RETENTION` are chained like `SERIES` (§2.2, §2.5, §2.6); a volume leaves SUSPECT through RECHECK, and owner reads wait for the read barrier (§2.7, M16). Revised after verification (2026-11-06): the ack gate is a continuity check made by the write itself; RECHECK reads back the tails W wrote last; an owner never resumes across a storage outage but claims its volume again at an epoch reserved for it, by a cold open (§2.7, §15.5, M17, M18). |
 | §3 The proof | Shared-mode only, kept; L2 now rests on the metadata grant plus the storage check (design-ha-modes.md §6.4, G2). |
 | §4 Takeover | Steps 2-8 shared-mode only, kept (step 4 changed); step 1 is triggered by a metadata grant, and `ha init` becomes `tsdb cluster adopt`. |
 | §5 Addressing | Ids built (design-series64.md). Names are unique in the whole database with name slots (shared, design-cluster.md C18), not per volume; in shared mode a series lives in its slot's home and no volume records other volumes' series (design-ha-modes.md M14, §5.7). Ids are handed out only below a reservation committed in the metadata group (M12). `VOLUMES` becomes the metadata group's volume records; `volumes.cache` stays only as each node's record of the highest epoch it has seen per volume (M4). |
@@ -27,7 +27,7 @@
 | §11 Configuration | NFS server and mount settings stay; tsdbd flags move to `tsdb cluster` settings. |
 | §12 Backend interface, §13 Tests | Shared-mode only, kept; `jepsen-ha` adds the metadata group's faults. |
 | §14 Implementation plan | **Replaced** by the combined plan, design-ha-modes.md §7 (its steps N0-N8 take this plan's steps 0-10). |
-| §15 NFS server outages | Shared-mode only, kept; ships first, on single servers (N1, after the N0 probe). Standby hold-back after grace (§15.2) is not needed under the metadata group. The wire bodies of §15.4 are defined in S0, before the 1.0 protocol freeze; N1 keeps only the single-server parts of §15.9 (no volumes-follower thread, no cross-node root repair). Operator commands become `tsdb cluster domain ...` and `volume ...` (design-ha-modes.md §8). |
+| §15 NFS server outages | Shared-mode only, kept; ships first, on single servers (N1, which does not wait for the N0 probe). Under the metadata group an owned volume does not resume after DOWN but is claimed again by a cold open (§15.5's note, M17). Standby hold-back after grace (§15.2) is not needed under the metadata group. The wire bodies of §15.4 are defined in S0, before the 1.0 protocol freeze; N1 keeps only the single-server parts of §15.9 (no volumes-follower thread, no cross-node root repair). Operator commands become `tsdb cluster domain ...` and `volume ...` (design-ha-modes.md §8). |
 
 Status: design, not implemented. Scope: shared storage on NFSv4.1/4.2 over RDMA. An object-store backend (intellistream-objects) is planned for later, behind the interface in §12, and is not built now.
 
@@ -181,6 +181,7 @@ Records follow the checkpoint: `{u32 len, u32 gen, u32 epoch, u8 kind, payload, 
 - The active region is the one whose valid checkpoint has the higher `gen`.
 - Replay stops at the first bad record, or at the first record whose `gen` does not match.
 - Compaction runs under `ledger_lock` alone: serialize `lstate` into the other region, `fdatasync`, switch. It runs when the active region is half full, at every takeover (§4, step 6), or every 10 min. A torn checkpoint fails its checksum and the old region is still intact.
+- **The next record goes where the previous one ended only while nothing can have cut the region shorter.** `lstate` and the append offset are in memory; a pool rollback can remove records whose `fdatasync` returned (held only in the SLOG). After any storage outage the owner therefore never appends again with them: the volume is FENCED and claimed again by a cold open, which folds the region as storage has it (§2.7, §15.5; design-ha-modes.md M17). A record written past a hole would end replay before it, and every later COMMIT would be purged as an orphan at the next takeover (verification of 2026-11-06).
 
 **Lock order:** `flush_lock` > WAL writer role > `publish_lock` > **`ledger_lock`** > `manifest_lock` > `db->lock` > `buf_lock`. The dictionary lock is taken without holding any of these. The drop watermark (D33) is raised under `publish_lock` and then `buf_lock`, in that order.
 
@@ -280,8 +281,17 @@ The engine checks the gate once per group commit. tsdbd checks it again before t
 
 ```
 ack iff role == OWNER(frame.epoch) && sync returned 0 && fence_gen unchanged
-     && now_mono < t_send(last successful fenced write) + lease − margin     /* margin = max(2 s, 15% lease) */
+     && t_send(this) − t_done(newest fenced write completed before this was issued) < lease − margin
+     && t_done(this) − t_send(this) < lease/5                     /* margin = max(2 s, 15% lease) */
 ```
+
+*Changed in verification (2026-11-06).* The first form, `now_mono < t_send(last successful fenced write) + lease −
+margin`, measured from the write being judged: after a pause the first write issued is itself the last successful
+one, so it passed with a running clock. The continuity form is checked by the issuer (the group-commit leader, the
+ledger appender, the dictionary appender) for its own write: a pause long enough to lose the lease falls between two
+fenced writes of the volume, so the write after it fails unless the monotonic clock did not advance. A write that
+fails the check is not acknowledged (IO, indeterminate), the volume goes SUSPECT, then RECHECK. The heartbeat keeps
+the normal gap at `lease/5` (2 s), so the check costs nothing. The per-volume times are atomics, read without a lock.
 
 **Probes.**
 - The heartbeat runs on a dedicated per-volume HA thread every `lease/5`. It takes `ledger_lock` with a trylock; if the lock is busy, the holder's `fdatasync` is the probe. It writes the alternate slot with `heartbeat_ctr+1` and fdatasyncs it.
@@ -290,14 +300,17 @@ ack iff role == OWNER(frame.epoch) && sync returned 0 && fence_gen unchanged
 
 **Refusals.**
 - A refusal after engine work replies `TSDB_ERR_IO` (indeterminate). A refusal before engine work replies UNAVAILABLE or MOVED (definitely not applied).
+- A proposal to the metadata group whose outcome is unknown (a `VOLUME_DROP` that timed out) is engine work for this rule: IO, never UNAVAILABLE. UNAVAILABLE is only for a proposal never sent (design-ha-modes.md §5.4).
 - When the deadline passes the volume goes SUSPECT. A later successful probe proves the lock was never lost, because LOST is sticky, *provided the server never grants a reclaim to a client it already expired (U4)*. So the volume does not return to OWNER on the probe; it goes to RECHECK (below). This rides out an NFS server restart or a stall shorter than the lease.
 
 **RECHECK** (revised after review, 2026-11-06; design-ha-modes.md M16, F6). The belt for U4 is the epoch read-back, and it must run *after* anything that may have let the kernel reclaim a lock the server should have refused. Triggers:
 - leaving SUSPECT;
 - a change of the domain's RDMA transport `connect_count` in `/proc/self/mountstats`, read by the health monitor (§15.2) at every probe (a server restart forces a reconnect; design-ha-modes.md V5);
-- a fenced call that took longer than `lease/5`.
+- a fenced call that took longer than `lease/5` (seen by the issuer of that call, at its return, as well as by the monitor), or a write that failed the continuity check above.
 
-In RECHECK the volume acknowledges nothing, makes no ledger edit (`ledger_edit` waits), renames and unlinks nothing, and answers no read. It leaves RECHECK only after an O_DIRECT read-back, issued after the trigger, of both slots, the active ledger region's checkpoint generation and `CLAIM`, and, where the node's metadata copy is fresh, the copy still naming (v, self, E). Any higher epoch or generation, or a `CLAIM` above E, means FENCED. The remaining window (no trigger seen: a pause with a frozen monotonic clock across a lease expiry, a takeover and a server reboot, with the reconnect between two monitor samples, *and* U4 broken) is closed by the periodic read-back within `lease/5`; design-ha-modes.md §6.4 explains why a read-back before every ack is not used.
+In RECHECK the volume acknowledges nothing, makes no ledger edit (`ledger_edit` waits), renames and unlinks nothing, and answers no read. It leaves RECHECK only after an O_DIRECT read-back, issued after the trigger, of both slots, the active ledger region's checkpoint generation and `CLAIM`, and, where the node's metadata copy is fresh, the copy still naming (v, self, E). Any higher epoch or generation, or a valid `CLAIM` above E from a claimant that is polling (design-ha-modes.md §5.5), means FENCED (or a clean release). Since verification the read-back also compares what W wrote last: the ledger record at W's last fdatasynced offset (length and xxh32), the checkpoint generation and `heartbeat_ctr` (not lower than W's), and the tails of `SERIES`, `STATES`, `CLASSES`, `RETENTION` and the current WAL segment (length and last record's checksum). Anything shorter or older is a rollback under W: FENCED, and the cold open below. The remaining window (no trigger seen and the continuity check passed: a pause with a monotonic clock that did not advance across a lease expiry, a takeover and a server reboot, with the reconnect between two monitor samples, *and* U4 broken) is closed by the periodic read-back within `lease/5`; design-ha-modes.md §6.4 explains why a read-back before every ack is not used.
+
+**No resume across an outage** (design-ha-modes.md M17, F7). These make the volume FENCED at once, without a read-back: its domain went DOWN (§15.2); a fenced call of the volume was in flight longer than `down_ms`; the domain's transport reconnected while the volume was SUSPECT; a file of the volume answered ESTALE. The engine is abandoned (§2.6) and the node claims the volume again at the epoch reserved for it (design-ha-modes.md M18) by a cold open (§4), which re-reads the slots, the ledger, every chained file and the WAL from storage and compares them with the positions W last held (DIVERGED). Neither `lstate`, nor an append offset, nor the memtable outlives the outage. This also removes U4 from the server-restart case: an owner that never resumes cannot acknowledge on a reclaim the server should have refused.
 
 **Read barrier** (design-ha-modes.md M16). The owner answers a read only after a fenced write issued after the read arrived has succeeded: a WAL group commit or ledger append (sync returned 0, `fence_gen` unchanged), or a heartbeat slot write that the first waiting read starts when nothing is in flight. One barrier serves all reads waiting for it. The clock-based gate no longer decides reads: a frozen monotonic clock in a VM pause would let it pass, and stale reads were ruled out (D23).
 - **Stuck I/O.** If a fenced write on one volume has been outstanding for more than 3×lease while probes on other volumes (or a node probe file) succeed, the file is stuck and the server is not. The node stops feeding the watchdog (§8).
@@ -342,7 +355,8 @@ Unlinks of adopted names happen only after a PURGE record, which a fenced writer
 
 ## 4. Takeover (standby S, volume v)
 
-> Under the metadata group (2026-11-06): S starts only after a grant `(v, S, E)`, and step 4 writes the granted E
+> Under the metadata group (2026-11-06): S starts only after a grant `(v, S, E)` (or claims the epoch its own last
+> grant reserved for it, after an outage or a restart, design-ha-modes.md M18), and step 4 writes the granted E
 > after checking that every epoch on storage, and in the node's own `volumes.cache`, is below it; a refusal is
 > reported as `CLAIM_REFUSED` and the next grant goes above it ([design-ha-modes.md](design-ha-modes.md) §5.4, §5.5).
 > Step 5 fills LOST entries up to the id reservations committed in the metadata group and applies its committed
@@ -360,7 +374,7 @@ A node runs at most 4 takeovers per NFS server group at once, each started after
 5. **Recover.**
    - `fdatasync` SERIES, STATES, CLASSES and RETENTION through the new fds, so the server has stable copies.
    - Truncate torn tails (series.c:147) of all four. For CLASSES and RETENTION that is all: their records are not ids and fill no LOST entries.
-   - Append LOST entries to SERIES and STATES up to the reservations committed in the metadata group (D36, design-ha-modes.md M12), and, once `lstate` is folded (next item), apply the committed drop watermark when it is above `lstate`'s. If storage is behind the lengths last committed with an ownership change, it was rolled back: mark the volume DIVERGED (§15.5 step 4).
+   - Append LOST entries to SERIES and STATES up to the reservations committed in the metadata group (D36, design-ha-modes.md M12), and, once `lstate` is folded (next item), apply the committed drop watermark when it is above `lstate`'s. If storage is behind the positions the grant carries (the previous owner's last reported WAL and ledger positions and dictionary lengths), or behind the exact positions this node held when it claims its own volume again, it was rolled back: mark the volume DIVERGED (§15.5 step 4; design-ha-modes.md §5.4). A domain the operator marked `rolled-back` is DIVERGED whatever the positions say.
    - Fold the checkpoint and the records into `lstate`.
    - Roll forward renames whose tmp exists and whose final name does not.
    - Open adopted parts by name (no readdir trust). Missing as both: CORRUPT.
@@ -637,7 +651,7 @@ There is no release yet, so version 5 replaces versions 1-4 (D32). The server re
 | SIGSTOP of the process | The same as a hang. | ≈ 6.5 s | L1(a). |
 | VM pause (renewals stop) | Expiry; EIO on resume. The monotonic clock may be frozen, so the lock alone carries safety. | ≈ 11.5 s | L1(b), L3. The gate is only a belt. |
 | NFS server stall shorter than the lease | SUSPECT, no acks, then RECHECK and back to OWNER after the read-back (§2.7). No kill, because the watchdog does not wait for NFS. | none | LOST is sticky, so a successful probe proves continuity if U4 holds; the read-back after it covers a broken U4. |
-| NFS server restart | Grace starts when nfsd starts, after the reboot. The owner reclaims within grace (nfs4proc.c:L10422) and is SUSPECT meanwhile; the transport reconnect and the end of SUSPECT both put it in RECHECK, so it acks again only after a read-back issued after the reclaim (§2.7). Standbys get NFS4ERR_GRACE and wait. An owner whose RDMA reconnect backoff outlasts grace becomes LOST, FENCED, then fails over by cold open; no acked write is lost (§15.1, D34). Takeovers are capped at 4 per server group per node (§4), and such a loss gets no back-off (§6). | 0, or grace + poll + open | U4. The read-back in RECHECK catches a reclaim that should have been refused before any ack, ledger edit or rename. |
+| NFS server restart | *Under the metadata group (M17):* the restart is DOWN, or a reconnect while SUSPECT, so every owned volume on the server is FENCED and claimed again by its owner at the reserved epoch by a cold open, at most 4 per server group per node; the rest of this cell is the original design. Grace starts when nfsd starts, after the reboot. The owner reclaims within grace (nfs4proc.c:L10422) and is SUSPECT meanwhile; the transport reconnect and the end of SUSPECT both put it in RECHECK, so it acks again only after a read-back issued after the reclaim (§2.7). Standbys get NFS4ERR_GRACE and wait. An owner whose RDMA reconnect backoff outlasts grace becomes LOST, FENCED, then fails over by cold open; no acked write is lost (§15.1, D34). Takeovers are capped at 4 per server group per node (§4), and such a loss gets no back-off (§6). | 0, or grace + poll + open | U4. The read-back in RECHECK catches a reclaim that should have been refused before any ack, ledger edit or rename. |
 | NFS server crash during a slot write | The torn slot is never the newest (strict alternation). E is also recovered from the checkpoint and EPOCH records. | — | L2. |
 | Transient EIO or ENOSPC on a fenced fd | FENCED and abandon (poison, no close), then a fresh claim by any candidate. This node does not claim again until it has drained. | poll + open | §2.6. The fd number cannot be reused. |
 | EIO or ENOSPC on a tmp part (unfenced) | The flush or merge fails and the tmp is unrecorded, so it is retried. The active memtable is rotated before any direct insert (bug fix B5). | none | Unrecorded tmps are never adopted. |
@@ -654,7 +668,7 @@ There is no release yet, so version 5 replaces versions 1-4 (D32). The server re
 | Entry node paused (SIGSTOP, VM pause) during a failover, frames buffered in its sockets or queues | On resume it drops frames older than `fwd_max_age` or whose client has gone; frames stamped with the old epoch get MOVED; SESSION_FENCE has told the peers the stream's newer attempt. | — | D31. |
 | `peer_links` grows, or a link is replaced, mid-pipeline | Streams with unanswered frames keep their link; the frames of a broken link fail with IO and block their streams until resent. | — | D31, sticky links. |
 | OWNERS push lands in the middle of a pipeline | The stream keeps its stamped epoch until it has nothing outstanding; a refusal at the old owner blocks the stream on the entry node. | — | D31. |
-| Pool rollback of LOCK, SERIES and the ledger (`zpool import -F`, SLOG loss) | The next claim takes an epoch above every node's high-water mark; lost ids become LOST (STALE_ID); the highest watermark is re-applied; DIVERGED. | cold open | D36. |
+| Pool rollback of LOCK, SERIES and the ledger (`zpool import -F`, SLOG loss) | The next claim takes an epoch above every node's high-water mark; lost ids become LOST (STALE_ID); the highest watermark is re-applied; DIVERGED. Under the metadata group: no owner resumes across it, even one whose lock survived (M17); epochs, ids and the watermark come from the metadata group; DIVERGED from the last reported positions or the operator's `domain rolled-back` (design-ha-modes.md §5.4). | cold open | D36; M12, M17. |
 | VOLUMES rolled back, then `volume add` from a host without a cache | Refused: a live node's cache is longer or differs. A node whose line k has another uuid than a peer's treats k as ROOT_DIVERGED. | — | D36, §5. |
 | Slow reader of a large query | Its credit runs out and only that query waits. Insert acks use other links. | — | D37. |
 | `drop_before` with a future timestamp or a wrong unit | INVALID unless FORCE; `volume lower-watermark` undoes a forced mistake. | — | D33. |
@@ -849,7 +863,7 @@ Answered on 2026-10-24: direct mode by default for every client, with forwarding
 |---|---|---|
 | U1 | After expiry on conflict, OFD-locked descriptions return EIO on write, fsync and O_DIRECT, and EBADF on `ftruncate`. Unlocked fds are not fenced. | lockprobe partition run (step 0) |
 | U2 | `fs.leases-enable=0` makes nfsd skip write delegations silently. | Source (`nfs4_set_delegation`, `vfs_setlease`); `/proc/fs/nfsd/clients/*/states` shows no `deleg` |
-| U3 | `cl_rpc_users` blocks the COURTESY transition while a WRITE compound is in flight. | Source (`nfs4_laundromat`); jepsen check 5 with partitions in the middle of a WRITE |
+| U3 | `cl_rpc_users` blocks the COURTESY transition while a WRITE compound is in flight. | Source (`nfs4_laundromat`); jepsen check 5 with partitions in the middle of a WRITE; and on the production servers' kernel in N0, with U8 and U17 (design-ha-modes.md §7, which also says what ships if it fails) |
 | U4 | nfsdcld refuses reclaims from clients it already expired. | Scenario (e) with an expired owner; the read-back alarm must not fire |
 | U5 | At exit, `->flush` writes back and waits uninterruptibly before the OFD lock is released at `__fput`. | Source (`filp_flush`, `nfs_file_flush`, `locks_remove_file`); lockprobe kill-during-write run |
 | U6 | O_DIRECT on NFS accepts unaligned I/O and returns errors synchronously. A `pread` past EOF returns short. | lockprobe |
@@ -1154,6 +1168,14 @@ The row numbers refer to the stall map (rows 1-16).
 
 ### 15.5 Recovery when the storage returns
 
+> **In shared mode under the metadata group** (verification of 2026-11-06, design-ha-modes.md M17): an owned volume
+> never takes steps 3 and 4 below. Its domain went DOWN, so it is FENCED (§2.7); once the domain is RECOVERING and
+> every thread holding its old `eng` has returned (step 2), the node claims it again at the epoch reserved for it, by
+> the cold open of §4 with rollback detection, within the cap of step 2. Steps 3 and 4 stay for single servers (N1),
+> where no ledger exists and the memory of the one process is the best record there is. The verification found that
+> an owner which reclaimed in grace and revalidated only the WAL, MANIFEST, parts and SERIES resumed past a ledger
+> record the pool had lost, and lost every later acknowledged COMMIT at the next takeover.
+
 1. **The domain goes RECOVERING** on write probes (§15.2). Stuck threads return on their own as the hard mount retries.
 2. **Wait for references.** A volume is recovered only after every thread holding a reference on its `eng` has returned: parked workers, the opener, the flusher, mergers, the follower and the HA thread. Late writes therefore land, or are abandoned, before anything new is admitted. One recovery attempt per volume runs at a time; a new attempt starts only after the previous thread has returned. At most 4 volumes per server group per node recover at once, with 0-5 s of jitter.
 3. **Revalidate (D27).** This runs for every volume, tainted or not.
@@ -1161,6 +1183,7 @@ The row numbers refer to the stall map (rows 1-16).
    - **MANIFEST:** an O_DIRECT read must match the last published checksum and generation.
    - **Parts:** every live part exists with its expected size (`fstatat` on a fresh open).
    - **SERIES and STATES:** the server size is at least the length of every id the dictionary has handed out.
+   - **CLASSES and RETENTION** (added in verification, 2026-11-06): the server size is at least the length of every record the engine appended, and the last record's checksum matches. A lost class switch followed by parts under the new class would otherwise fail the next open with CORRUPT (`cls_check_parts`), and a lost retention limit would never be noticed.
    - **Watermark and ids:** apply the higher of the ledger's watermark and the highest any node has seen, and compare the SERIES and STATES lengths with the high-water marks (D36). Storage behind them is DIVERGED.
    - If everything matches and the volume is not tainted: resume on new fds (`wal_fd` is reopened, never reused).
 4. **Re-log** (on taint, or on DIVERGED after a mismatch).
@@ -1177,6 +1200,7 @@ The row numbers refer to the stall map (rows 1-16).
    - A server that stayed up keeps an uncontested expired client as COURTESY.
    - Lost state (`NFS4ERR_EXPIRED`, `recover_lost_locks=0`) returns EIO on lock-owning fds (`nfs4state.c:998-999`), which leads to taint and the re-log path.
 7. **HA writer lease.**
+   - *Under the metadata group this item is replaced* by the note at the top of this section: after DOWN the volume is claimed again at the reserved epoch, whether or not its lock survived. A stall that never reached DOWN, without a reconnect while SUSPECT, still returns through RECHECK (§2.7). The rest of this item is the original design.
    - A lock that survived: the next heartbeat moves SUSPECT to OWNER, same epoch.
    - A LOST lock leads to FENCED and abandon (§2.6), then the §4 takeover by a cold open, at most 4 per server group per node at once. Standbys hold back for grace + 5 s, or less (§15.2), so an old owner that reconnects within grace reclaims and keeps its volumes. A loss caused by the server restart is not a node fault: no back-off, and rebalancing may move the volume back within minutes (§6).
    - Entry nodes learn the new owner from its `OWNERS` push, or from MOVED (§9.1).
@@ -1265,7 +1289,8 @@ Each run records: time to UNAVAILABLE, healthy-volume bench numbers, `df`/`sync`
 ### 15.9 Implementation plan
 
 > Under the combined plan ([design-ha-modes.md](design-ha-modes.md) §7, revised 2026-11-06): O0 is part of N0, which
-> gates the rest. N1 takes O1-O3, O5-O7 and O9 in their **single-server** form: O4 keeps only a local high-water cache
+> gates the failover engine (N3-N7) but not N1: N1 starts on a test NFS server with §15.1's defaults, and N0's numbers
+> tune them. N1 takes O1-O3, O5-O7 and O9 in their **single-server** form: O4 keeps only a local high-water cache
 > (no volumes-follower thread, no `VOLUMES_GEN` push; routing comes from the metadata group later), O6 is the only
 > admission step (S2 builds none), O7 has no cross-node root repair. O8's bodies and TOPOLOGY move to S0. O10 goes to
 > N6 and N7.

@@ -252,8 +252,12 @@ is cut.
   - **Lookup by name**: one request to the home volume's leader; it answers from SERIES or the slot index, and asks the
     earlier homes of a slot only if the slot moved.
   - **Slot moves**: when volumes are added, the Raft leader moves some slots to them so new series spread there too.
-    During a move, creations in that slot pause for one metadata commit; existing series stay where they are, and the
-    new home asks the old one for names it does not know.
+    Existing series stay where they are, and the new home asks the old one for names it does not know. A move is
+    two-phase (design-ha-modes.md M19, verification of 2026-11-06): the old home's leader stops creating in the slot
+    under its creation lock and commits `SLOT_FREEZE(s, A, e_A)`, conditional on its epoch; only then does the Raft
+    leader commit `SLOT_MOVE(s, B)`, and a frozen slot answers creations with MOVED. The first form ("creations pause
+    for one metadata commit") needed the old home to have seen that commit: a leader of A with a lagging watch could
+    finish a creation after B had asked A and created the same name.
 - **Shared mode differs** (design-ha-modes.md M14, §5.7): its volumes sit on NFS pools that can roll back and be away
   for hours, so it keeps no slot index of other volumes' series. A series is created only in its slot's current home,
   a slot's earlier homes are a chain in the metadata, and a lookup asks them in turn. Everything below holds for
@@ -531,7 +535,7 @@ client's final value.
 | Leader partitioned from its replicas only | Leadership moves to a replica (§6.1) | about 1 s | the move is a Raft commit and a fence |
 | Replica partitioned from its leader only | ISR shrink; it rejoins when the partition heals | up to 1 s | §8.2 |
 | Raft leader lost | The voters elect a new one (election timeout 1-2 s); it waits one lease before declaring anyone down | none for writes; failovers delayed by about 3 s | Raft |
-| Three metadata voters lost | No failovers, no ISR changes; writes go on while ISRs answer | only for volumes that need an ISR change | nothing can be decided without a quorum |
+| Three metadata voters lost | No failovers, no ISR changes; writes go on while ISRs answer; **leader reads stop** within `lease_ms` (§7.1: only the Raft leader's heartbeat answers extend the read lease), `REPLICA_OK` reads go on | only for volumes that need an ISR change | nothing can be decided without a quorum |
 | A paused leader resumes | Its records of the old epoch are refused | none | §6.3 |
 | Clock jumps or drifts beyond A5 | A deposed leader may serve reads past its lease | none | writes do not use clocks (C13) |
 | Disk full on a replica | Fail-stop for that replica (ENOSPC on the WAL is fail-stop); ISR shrink | up to 1 s | §5.7 |
@@ -545,7 +549,9 @@ A leader serves reads while it holds a **lease**: each heartbeat answer from the
 `send time + lease_ms × (1 − drift)` on the leader's monotonic clock (`lease_ms` 2 s, drift from A5). The Raft leader
 does not promote another leader for the volume before `lease_ms × (1 + drift)` after the last answer it gave, and
 `node_timeout` (3 s) is longer than the lease anyway. A leader whose lease ran out answers reads with UNAVAILABLE and
-retry, and the client refreshes TOPOLOGY.
+retry, and the client refreshes TOPOLOGY. So while the Raft majority is lost, no leader reads are served after
+`lease_ms`, though writes go on (§6.7); clients that accept it read with `REPLICA_OK` (§7.2). A read lease granted by
+the ISR instead, which would keep leader reads going, is under "Later".
 
 Leader reads see every acknowledged write (C7): read-your-writes, and monotonic reads within a session as long as
 the leader does not change. After a failover the new leader has every acknowledged write, so it stays so.
@@ -823,8 +829,9 @@ estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's step
 - **Shared by both modes** (built once): step 0 (S0, which also defines every wire body the HA work needs before the
   1.0 freeze, and the namespace-event payloads shared by the ledger and this design's markers, design-ha-modes.md
   §2.1), step 1 (S1, extended with shared volumes, §7.1 there), the part of step 4 that is peer links, TOPOLOGY and
-  forwarding (S2; per-volume admission is built once, in ha.md's N1), step 5 (S4, name slots and users), step 6 (S3,
-  clients and the Pulsar sink), step 8 (X1, the cold boundary) and step 9 (X3).
+  forwarding, and users in the metadata group from step 5 (S2; per-volume admission is built once, in ha.md's N1,
+  which does not wait for the N0 probe), the rest of step 5 (S4, name slots with two-phase moves), step 6 (S3, clients
+  and the Pulsar sink), step 8 (X1, the cold boundary) and step 9 (X3).
 - **Replicated mode only**: step 2 (R1), step 3 (R2: the engine's replica mode, and the marker backend of the journal
   hook that N4 builds), the rest of step 4 (R3: replication, ISR, promotion, leases), step 7 (R4, rebuild).
 - **Order: shared mode ships first**, because production runs on NFS today: the N0 probe on the production NFS
@@ -837,7 +844,10 @@ estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's step
   an owner change is `META_OP_VOLUME_LEADER`, with the candidates as the ISR. It must change before its formats settle
   (design-ha-modes.md §7.1): an extensible heartbeat body, heartbeats on a thread with no Raft log I/O and syncs on a
   worker (as §2.3 above already says), step-down on a stalled sync, the state directory on a local disk, a voter-role
-  fault instead of `_exit` in a shared-mode deployment, and the shared-volume operations. Step 2 (`cluster-s2`,
+  fault instead of `_exit` in a shared-mode deployment, the shared-volume operations, and (from the verification of
+  2026-11-06) voter eligibility flags with replacement by Raft progress rather than heartbeats heard, `--witness`,
+  metadata copies persisted on every member, reserved epochs and slot freezes. Slot freezes and the progress-based
+  voter replacement apply to replicated mode as well. Step 2 (`cluster-s2`,
   44b352b: the replication core) gives shared mode nothing it needs, only the method of a sans-IO core under a
   simulator, which the shared-mode HA manager copies.
 
@@ -853,6 +863,10 @@ estimates, is [design-ha-modes.md](design-ha-modes.md) §7; how this plan's step
 - Rebuilding a returning replica partially, from the part position ranges, when its absence outlived the retained WAL.
 - A rolling upgrade protocol for the peer links.
 - A local cache of cold granules on replicas.
+- A read lease from the ISR rather than the Raft leader, so that leader reads go on while the Raft majority is lost:
+  each ISR member promises the leader not to answer a FENCE for a higher epoch until `lease_ms × (1 + drift)` after its
+  last ack, and a promotion waits those promises out. It changes §6.2's promotion and is worth it only if quorum loss
+  turns out to happen (verification of 2026-11-06, design-ha-modes.md).
 - Reads across volumes at one instant, if a user needs them.
 
 ## Open questions
