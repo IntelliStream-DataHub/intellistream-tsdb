@@ -999,6 +999,7 @@ typedef struct series_dict {
      * fails that add as if memory ran out */
     int (*test_fault)(void *arg, int point, const char *name);
     void *test_fault_arg;
+    bool keep_names;   /* series_close leaves the name strings: tsdb_series_name pointers outlive a retired engine */
 } series_dict;
 enum { DICT_AT_ADD = 1, DICT_AT_FAILED = 2, DICT_AT_RELOAD = 3 };
 
@@ -1213,7 +1214,7 @@ typedef struct wal_tail {
 
 typedef struct graveyard_entry {
     char name[256];   /* retired_<part name> */
-    int64_t deadline; /* realtime seconds */
+    int64_t deadline; /* monotonic ms (eng_mono_ms): a wall clock step must not purge early */
 } graveyard_entry;
 
 int manifest_publish(struct eng *db);
@@ -1369,6 +1370,9 @@ struct eng {
     int wal_fd;
     uint64_t wal_seq;
     uint64_t wal_off; /* bytes in segment wal_seq (the WAL writer role) */
+    /* the last record whose write and sync succeeded, in any segment (the WAL writer role; read once the engine is
+     * halted): revalidation after an outage finds it again, byte for byte, before it trusts the log (ha.md 15.5) */
+    uint64_t wal_last_seq, wal_last_off, wal_last_len, wal_last_hash;
     uint8_t *wal_buf, *wal_spare;
     size_t wal_len, wal_cap, wal_spare_cap;
     uint64_t wal_appended;            /* rows appended (buf_lock) */
@@ -1424,6 +1428,9 @@ struct eng {
     /* fail-stop (eng_fail): set once, never cleared; fail_msg is written under
      * fail_lock before `failed` is stored, so whoever sees `failed` can read it */
     atomic_bool failed;
+    atomic_int refs;       /* callers inside this engine through the tsdb handle (volumes.c, ha.md 15.5 step 2) */
+    atomic_bool quiesced;  /* no new caller: the volume is being recovered */
+    bool retiring;         /* eng_close keeps the names of the dictionaries (eng_retire) */
     pthread_mutex_t fail_lock; /* innermost; held only to fill fail_msg */
     pthread_mutex_t dir_sync_lock; /* eng_sync_dir; inside every lock but fail_lock */
     char fail_msg[256];
@@ -1453,6 +1460,18 @@ int eng_sync_dir(struct eng *db, const char *what);
 static inline int eng_check(struct eng *db)
 {
     return atomic_load_explicit(&db->failed, memory_order_acquire) ? TSDB_ERR_IO : 0;
+}
+/* The abandon flag of the request this thread runs (tsdb_set_abandon_flag; ha.md 15.3): a request parked on a stuck
+ * volume is told to discard its work. Checked at the two places where a request's effects become visible or
+ * durable: in mem_insert before the WAL append, and under publish_lock before block numbers are given out. A step
+ * already past its check completes. The pointer is thread-local, which is right only because every such step runs
+ * on the request thread (scheduler helpers never publish): a path that publishes from a helper thread has to pass the
+ * flag on explicitly. Embedded use never sets it, so nothing is abandoned there. */
+extern __thread const volatile int *cur_abandon;
+static inline int eng_abandoned(void)
+{
+    const volatile int *f = cur_abandon;
+    return f && __atomic_load_n(f, __ATOMIC_ACQUIRE) ? TSDB_ERR_ABANDONED : 0;
 }
 /* 0 while healthy; TSDB_ERR_IO with the message (directory, what failed, errno) once failed. */
 int eng_failed_msg(struct eng *db, char *msg, size_t len);
@@ -1534,6 +1553,25 @@ int eng_open(const char *dir, const tsdb_options *opts, eng **out);
 /* the same with the scheduler of the tsdb that owns the engine */
 int eng_open_sched(const char *dir, const tsdb_options *opts, sched *s, eng **out);
 int eng_close(eng *db);
+/* As eng_close, for an engine replaced by a fresh open of its directory (ha.md 15.5): the name strings stay, for the
+ * `tsdb_series_name` pointers callers hold until tsdb_close. */
+int eng_retire(eng *db, pthread_mutex_t *mu, char ***kept, size_t *nkept, size_t *capkept);
+/* Recovery of a halted engine (revalidate.c, ha.md 15.5 step 3 and 4); see tsdb_volume_reopen. */
+int wal_verify_tail(eng *db, const char *dir); /* 0 intact, 1 the storage lost what was durable, <0 error */
+int wal_relog(eng *db, const char *dir, uint64_t *rows); /* the rows memory holds into a new segment */
+typedef struct reval_part {
+    char name[96];
+    int64_t partition;
+    uint64_t min_block, max_block, rows;
+    uint32_t nt;
+} reval_part;
+int reval_dicts(eng *old, const char *dir, uint64_t *series_added, uint64_t *states_added);
+int reval_capture(eng *old, reval_part **out, size_t *n);
+void reval_parts(const eng *neu, const reval_part *x, size_t nx, uint64_t *lost, uint64_t *lost_rows);
+void reval_logs(const eng *old, const eng *neu, uint64_t *lost_bytes);
+void eng_halt(eng *db);
+/* A new engine for the directory of `old` (halted, closed afterwards by eng_retire) that takes over its lock. */
+int eng_reopen(eng *old, const char *dir, const tsdb_options *opts, struct sched *qs, eng **out);
 int eng_series(eng *db, const char *name, int type, uint32_t *id);
 int eng_series_lookup(eng *db, const char *name, uint32_t *id);
 uint32_t eng_series_count(eng *db);
@@ -1590,6 +1628,9 @@ typedef struct qcuts {
     qcut **c; /* each cut on its own: a pointer handed out stays valid while the array grows */
     size_t n, cap;
 } qcuts;
+/* One engine's cut on its own (latest.c): taken, then released, by the caller; the qcut is not heap-allocated. */
+int cut_take(struct eng *db, qcut *c);
+void cut_release(qcut *c);
 extern __thread qcuts *cur_cuts; /* the multi-series request this thread works for; NULL elsewhere */
 void qcuts_init(qcuts *cs);
 void qcuts_free(qcuts *cs);
@@ -1622,6 +1663,18 @@ typedef int (*slot_fn)(void *ctx, const int64_t *ts, const void *v, size_t n);
 int merge_stream(codec_ctx *cc, src *cur, size_t nc, int64_t start, int64_t end, slot_fn fn, void *ctx);
 int eng_query_raw_ex(eng *db, uint32_t series, int64_t start, int64_t end, bool descending, size_t limit,
                      slot_fn fn, void *ctx);
+/* The newest row of each of n series of one engine, at one cut of it (latest.c; design-latest.md section 5). `ends`
+ * (per series) or `end`: only rows before it. Default: the newest row whose last-write-wins value is not null;
+ * with_nulls: the newest row. out[i].status is TSDB_ERR_NOTFOUND for a local id that names no series. */
+typedef struct latest_row {
+    int32_t status;
+    uint8_t kind; /* tsdb_latest_kind */
+    uint8_t type;
+    int64_t ts;
+    uint64_t slot; /* the value, zero-extended slot bits of the series' type */
+} latest_row;
+int eng_latest(eng *db, const uint32_t *local, size_t n, const int64_t *ends, int64_t end, bool with_nulls,
+               latest_row *out);
 /* LTTB downsampling to `threshold` points (>= 3) of the known, finite values; state series: TSDB_ERR_INVALID.
  * desc: the same points newest first; `keep` (0: all) is how many of them the caller takes at most, which bounds
  * what newest first holds in memory (fn still decides when to stop). */

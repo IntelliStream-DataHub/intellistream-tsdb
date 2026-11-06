@@ -160,7 +160,9 @@ int eng_replace_range(eng *db, int type, uint32_t series, int64_t start, int64_t
         for (size_t i = 0; i < rows.n; i++)
             all.p[all.n++] = rows.p[i]; /* after the tombstones: newer */
         rows.n = 0; /* `all` owns them now */
-        rc = parts_commit(db, all.p, all.n);
+        rc = eng_abandoned(); /* see cur_abandon: before any block number is taken */
+        if (rc == 0)
+            rc = parts_commit(db, all.p, all.n);
     }
     if (rc == 0) {
         pthread_mutex_lock(&db->lock);
