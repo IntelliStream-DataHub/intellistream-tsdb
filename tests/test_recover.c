@@ -70,15 +70,15 @@ static size_t count(tsdb *db, tsdb_sid s)
 typedef struct {
     tsdb *db;
     tsdb_sid s;
-    volatile int inside, release, rc;
+    int inside, release, rc; /* accessed with __atomic (volatile is not enough for TSan) */
 } holder;
 
 static int hold_cb(void *ctx, const int64_t *ts, const tsdb_values *v, size_t n)
 {
     (void)ts, (void)v, (void)n;
     holder *h = ctx;
-    h->inside = 1;
-    while (!h->release)
+    __atomic_store_n(&h->inside, 1, __ATOMIC_SEQ_CST);
+    while (!__atomic_load_n(&h->release, __ATOMIC_SEQ_CST))
         sleep_ms(5);
     return 0;
 }
@@ -250,7 +250,7 @@ int main(int argc, char **argv)
     holder h = {.db = db, .s = b};
     pthread_t th;
     CHECK(pthread_create(&th, NULL, hold_main, &h) == 0);
-    while (!h.inside)
+    while (!__atomic_load_n(&h.inside, __ATOMIC_SEQ_CST))
         sleep_ms(5);
     OK(tsdb_volume_quiesce(db, 1));
     CHECK(tsdb_insert_series(db, b, ts, v, 1) == TSDB_ERR_UNAVAILABLE);
@@ -268,7 +268,7 @@ int main(int argc, char **argv)
     CHECK(tsdb_series_name(db, b) == name_before); /* dictionaries answer */
     CHECK(tsdb_volume_idle(db, 1, 200) == 1);      /* the reader is still inside */
     CHECK(tsdb_volume_reopen(db, 1, NULL) == TSDB_ERR_INVALID); /* not idle */
-    h.release = 1;
+    __atomic_store_n(&h.release, 1, __ATOMIC_SEQ_CST);
     pthread_join(th, NULL);
     CHECK(h.rc == 0);
     CHECK(tsdb_volume_idle(db, 1, 5000) == 0);
