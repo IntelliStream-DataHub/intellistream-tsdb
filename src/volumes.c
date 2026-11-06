@@ -2720,7 +2720,7 @@ static int up_put(int dirfd, const char *tmp, const char *final, const char *dat
 /* MANIFEST as format 9: the first line says 9 and an `fno_next` line (information for followers only, 1: no
  * number was ever given) goes before `parts`; the checksum is made again. A missing MANIFEST stays missing (the
  * open writes it); one that is damaged or of another format is refused. A MANIFEST already at 9 is kept. */
-static int up_manifest(const up_dir *d)
+static int up_manifest(const up_dir *d, bool write)
 {
     char *txt;
     size_t len;
@@ -2740,7 +2740,7 @@ static int up_manifest(const up_dir *d)
         free(txt);
         return TSDB_ERR_CORRUPT;
     }
-    if (format == FORMAT_VERSION) {
+    if (format == FORMAT_VERSION || !write) {
         free(txt);
         return 0;
     }
@@ -2859,7 +2859,9 @@ static int up_open(up_dir *d, const char *path, uint32_t index)
     }
     if ((rc = meta_check(d->dirfd, path, index)) != 0)
         return rc;
-    return d->version == PREV_FORMAT_VERSION ? up_scan(d) : 0;
+    if (d->version != PREV_FORMAT_VERSION)
+        return 0;
+    return (rc = up_scan(d)) != 0 ? rc : up_manifest(d, false); /* before anything is written */
 }
 
 static void up_close(up_dir *d)
@@ -2879,7 +2881,7 @@ static int up_one(const up_dir *d)
         fprintf(stderr, "tsdb: upgrade: cannot make %s/FNO\n", d->path);
         return TSDB_ERR_IO;
     }
-    if ((rc = up_manifest(d)) != 0)
+    if ((rc = up_manifest(d, true)) != 0)
         return rc;
     char *txt;
     size_t len;

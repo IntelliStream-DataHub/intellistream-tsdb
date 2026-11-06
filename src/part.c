@@ -236,7 +236,7 @@ int part_open_as(int dirfd, const char *file, const char *name, bool pin, bool v
         p->pinned = ilen + tlen + 8;
         rc = TSDB_ERR_CORRUPT;
     }
-    if (part_hash(&h, p->hdr_len, ib, ilen, ib + ilen, tlen, &f) != f.index_hash || f.min_ts > f.max_ts ||
+    if (part_hash(&h, eng_test_mutant == MUT_V8_HASH48 ? sizeof h : p->hdr_len, ib, ilen, ib + ilen, tlen, &f) != f.index_hash || f.min_ts > f.max_ts ||
         !trailer_parse(ib + ilen, tlen, &p->t, &p->nt) || gix_parse(ib, ilen, f.ngranules, &p->ix) != 0)
         goto fail;
     p->ng = f.ngranules;
@@ -305,6 +305,7 @@ int granule_read(codec_ctx *c, const part *p, const granule *g, int type, int64_
 /* ---------------------------------------------------------------- writer */
 
 __thread uint64_t cur_fno_lo, cur_fno_hi;
+int eng_test_mutant;
 
 static void pw_header(const part_writer *w, part_header *h)
 {

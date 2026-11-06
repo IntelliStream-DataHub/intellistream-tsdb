@@ -61,6 +61,10 @@ static double merge_score(double count, double sum) { return (sum + MERGE_FIXED_
  * zstd, so no flag in the part is needed. */
 static bool insert_written(const part *p) { return p->level == 0 && p->ng > 0; }
 
+/* A part an upgrade carried over from format 8 (its header has no position range): rewritten alone once its
+ * partition is idle, as a merge of a single part, so that the parts_v8 allowance in META can go (v8_parts_account) */
+static bool rewrite_alone(const part *p) { return insert_written(p) || p->hdr_len == PART_HDR_V8; }
+
 /* Picks the best range over all partitions, or with `solo`, when there is none, one part to rewrite alone.
  * Solo rewrites come last (merge_thread_main): after real merges and after the retention work, so that an
  * expired partition is dropped rather than rewritten and the WAL's removal is made durable without waiting
@@ -87,7 +91,7 @@ static size_t select_merge_locked(eng *db, part **sel, bool solo_ok)
         }
         bool idle = db->opt.merge_idle_s >= 0 && now - newest >= db->opt.merge_idle_s;
         for (size_t i = a; i < b && solo_ok && idle && solo == SIZE_MAX; i++)
-            if (insert_written(db->parts[i]) && !db->parts[i]->merging)
+            if (rewrite_alone(db->parts[i]) && !db->parts[i]->merging)
                 solo = i;
         if (nparts >= 2) {
             for (size_t i = a; i < b; i++) {
@@ -650,6 +654,8 @@ void *merge_thread_main(void *arg)
             manifest_publish(db);
         for (size_t i = 0; i < k; i++)
             part_unref(sel[i]);
+        if (out && db->parts_v8)
+            v8_parts_account(db, false);
         if (watch) {
             int crc = cls_observe(db, watch);
             if (crc && crc != TSDB_ERR_IO)
@@ -692,7 +698,7 @@ int eng_optimize(eng *db)
                 busy |= db->parts[j]->merging;
                 damaged |= atomic_load(&db->parts[j]->damaged);
             }
-            if (j - i < 2 && !insert_written(db->parts[i]))
+            if (j - i < 2 && !rewrite_alone(db->parts[i]))
                 continue;
             if (damaged) { /* found by a merge before (part_checked): the rest is merged, and the call fails */
                 skipped = true;
@@ -740,5 +746,6 @@ int eng_optimize(eng *db)
             break;
     }
     pthread_mutex_unlock(&db->lock);
+    v8_parts_account(db, false);
     return rc == 0 && skipped ? TSDB_ERR_CORRUPT : rc;
 }

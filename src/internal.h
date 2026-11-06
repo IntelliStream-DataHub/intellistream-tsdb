@@ -46,6 +46,10 @@ typedef struct eng eng;
 #define FORMAT_VERSION 9
 #define PREV_FORMAT_VERSION 8
 #define PART_HDR_V8 24 /* the header of a part written at format 8 */
+/* Planted mutations: a test sets eng_test_mutant (tests link the engine) and must then fail, to show that it
+ * catches the bug; nothing in the library or the server ever sets it. */
+enum { MUT_NONE = 0, MUT_V8_HASH48, MUT_FNO_MANIFEST_ONLY, MUT_FNO_REUSE, MUT_MARKER_ROWS };
+extern int eng_test_mutant;
 #define MAX_GRANULE_ROWS 65536
 #define MAX_MERGE_PARTS 100
 #define PARTS_TO_DELAY_INSERT 300 /* per partition, like parts_to_delay_insert */
@@ -1263,6 +1267,7 @@ static inline void jr_commit(struct eng *db, enum jr_kind kind, const void *arg)
 
 #define FNO_FILE "FNO"
 int fno_create(int dirfd, uint64_t next, bool sync);
+void v8_parts_account(struct eng *db, bool at_open); /* upgraded databases: parts with a format-8 header left (db.c) */
 bool fno_file_intact(int dirfd);
 int fno_load(struct eng *db, uint64_t *next, uint64_t *gen, int *slot, bool *torn);
 int fno_require(struct eng *db, uint64_t v);
@@ -1460,7 +1465,8 @@ struct eng {
     atomic_uint_fast64_t fno_durable;
     pthread_mutex_t fno_lock; /* after dir_sync_lock, before fail_lock; held across the store's I/O */
     atomic_uint_fast64_t st_fno_syncs;
-    bool parts_v8;                    /* META says parts_v8=1: format-8 part headers are valid here (upgrade) */
+    bool parts_v8;                    /* META said parts_v8=1 at open: format-8 part headers are valid here (upgrade) */
+    bool v8_meta;                     /* META still says it (db->lock): v8_parts_account takes it out when none is left */
     atomic_uint_fast64_t wal_durable; /* rows durable */
     int64_t last_wal_sync_ms;
     int bg_error;

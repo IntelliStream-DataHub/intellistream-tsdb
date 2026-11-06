@@ -317,7 +317,7 @@ static int meta_load_or_create(eng *db, bool read_only)
                 return TSDB_ERR_INVALID;
             }
         }
-        db->parts_v8 = (line = strstr(buf, "parts_v8=")) && atoi(line + 9) == 1;
+        db->parts_v8 = db->v8_meta = (line = strstr(buf, "parts_v8=")) && atoi(line + 9) == 1;
         if (pms <= 0 || grows == 0 || grows > MAX_GRANULE_ROWS || classes < 0 || classes > 1)
             return TSDB_ERR_CORRUPT;
         db->partition_ms = pms;
@@ -333,6 +333,71 @@ static int meta_load_or_create(eng *db, bool read_only)
         return TSDB_ERR_INVALID;
     cls_setup(db, db->opt.partition_classes);
     return meta_write(db);
+}
+
+/* An upgraded database (`tsdb DIR upgrade`) keeps the parts of format 8 until merges rewrite them, which an idle
+ * partition's merge or tsdb_optimize does one part at a time (merge.c). Logged at open, and once none is left META's
+ * parts_v8=1 goes (tmp, fsync, rename, directory fsync): from the next open a part with the old header is damage like
+ * any other, and a database that has none can be opened by every later release. A failed rewrite only leaves the
+ * line, which is harmless: nothing depends on it going. */
+void v8_parts_account(eng *db, bool at_open)
+{
+    if (db->opt.read_only || db->opt.follow)
+        return;
+    pthread_mutex_lock(&db->lock);
+    size_t n = 0;
+    for (size_t i = 0; db->v8_meta && i < db->nparts; i++)
+        n += db->parts[i]->hdr_len == PART_HDR_V8;
+    bool drop = db->v8_meta && n == 0;
+    bool log = db->v8_meta && n > 0 && at_open;
+    if (drop)
+        db->v8_meta = false; /* one caller does it */
+    pthread_mutex_unlock(&db->lock);
+    if (log)
+        fprintf(stderr, "tsdb: %s: %zu part%s still ha%s the format-8 header (carried over by `tsdb DIR upgrade`): "
+                "merges of idle partitions rewrite them, `tsdb DIR optimize` does it at once\n", db->dir, n,
+                n == 1 ? "" : "s", n == 1 ? "s" : "ve");
+    if (!drop)
+        return;
+    char *txt = NULL;
+    int fd = openat(db->dirfd, META_FILE, O_RDONLY | O_CLOEXEC);
+    ssize_t r = -1;
+    char buf[512];
+    if (fd >= 0) {
+        r = read(fd, buf, sizeof buf - 1);
+        close(fd);
+    }
+    if (r <= 0)
+        goto fail;
+    buf[r] = '\0';
+    txt = malloc((size_t)r + 1);
+    if (!txt)
+        goto fail;
+    size_t len = 0;
+    for (const char *l = buf; *l;) {
+        const char *e = strchr(l, '\n');
+        size_t ll = e ? (size_t)(e - l) + 1 : strlen(l);
+        if (strncmp(l, "parts_v8=", 9) != 0) {
+            memcpy(txt + len, l, ll);
+            len += ll;
+        }
+        l += ll;
+    }
+    char tmp[256];
+    meta_tmp_make(tmp, sizeof tmp);
+    fd = openat(db->dirfd, tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        goto fail;
+    bool ok = write(fd, txt, len) == (ssize_t)len && tsdb_fsync(fd) == 0;
+    close(fd);
+    if (!ok || renameat(db->dirfd, tmp, db->dirfd, META_FILE) != 0 || tsdb_fsync(db->dirfd) != 0)
+        goto fail;
+    free(txt);
+    fprintf(stderr, "tsdb: %s: no part has the format-8 header any more: META no longer allows it\n", db->dir);
+    return;
+fail:
+    free(txt);
+    fprintf(stderr, "tsdb: %s: could not take parts_v8 out of META (left as it is; it does no harm)\n", db->dir);
 }
 
 /* Every series a part holds rows or tombstones of is in SERIES: its record was synced before the series was used.
@@ -719,6 +784,7 @@ int eng_open_sched(const char *dir, const tsdb_options *opts, sched *qs, eng **o
         db->wal_removed = db->wal_removed_synced = db->wal_seq - 1; /* and unlinked them, with a directory fsync */
         if ((rc = manifest_publish(db)) != 0)
             goto fail;
+        v8_parts_account(db, true);
     }
 
     ret_clock_init(db);
