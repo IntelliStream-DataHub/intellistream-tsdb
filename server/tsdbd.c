@@ -2028,6 +2028,7 @@ static void submit_send(conn *c)
     }
     c->send_inflight = true;
     c->tx_t0 = mono_s(); /* a send is started only after the last one moved bytes (on_send) */
+    c->tx_outq = -1;     /* the next tick's reading is the baseline, not progress: it would add a second */
     if (io == IO_EPOLL) {
         ep_want(c);
         return;
@@ -2412,8 +2413,9 @@ static void on_tick(void)
         if (c->send_inflight && !c->closed) {
             int q;
             if (ioctl(c->fd, SIOCOUTQ, &q) == 0 && q != c->tx_outq) {
+                if (c->tx_outq >= 0)
+                    c->tx_t0 = now;
                 c->tx_outq = q;
-                c->tx_t0 = now;
             }
         }
         if (c->send_inflight && !c->closed && now - c->tx_t0 > send_timeout_s) {
