@@ -266,6 +266,7 @@ typedef struct conn {
     pthread_cond_t cv;
     buf out;
     atomic_bool closing;
+    atomic_uint proto;  /* the version the HELLO settled on (TSDB_PROTOCOL_MIN until there is one): HA bodies from 13 */
     bool notified;      /* `out` has bytes the main thread was told of (n_out pushed): it sends them */
     bool tx_loop;       /* the main thread sends: a send in flight, bytes left in `sending`, or bytes a worker's
                            send left in `out` or handed it (out_put); the worker only appends until the main thread
@@ -747,7 +748,9 @@ static bool frame_put(conn *c, obatch *ob, uint32_t id, int32_t status, const ui
     size_t pre = ix ? TSDB_MULTI_PREFIX : 0;
     uint8_t ub[2 + TSDB_UNAVAIL_ENTRY]; /* the body of UNAVAILABLE (protocol 13), after the op's own error shape */
     size_t ulen = 0;
-    if (status == TSDB_ERR_UNAVAILABLE) {
+    /* Only a connection that said version 13 in its HELLO reads the body (a 12 client takes a longer error reply
+     * as corrupt), and in QUERY_MULTI only the END frame carries it: a per-series frame is the op's bare shape. */
+    if (status == TSDB_ERR_UNAVAILABLE && atomic_load(&c->proto) >= 13 && (!ix || *ix == TSDB_MULTI_END)) {
         tsdb_unavail e = unav_entry(unav_vol);
         ulen = tsdb_wire_put_unavail(ub, sizeof ub, &e, 1);
     }
@@ -1696,6 +1699,7 @@ static void handle_op(req *r)
             if (theirs < v)
                 v = theirs;
         }
+        atomic_store(&c->proto, v);
         uint8_t h[64]; /* the version, then whether login is required and how (version 12) */
         memcpy(h, &v, 4);
         size_t hl = 4 + auth_hello(h + 4);
@@ -2890,6 +2894,7 @@ static void on_accept(int fd)
         drop_new_conn(fd, "connection", ENOMEM);
         return;
     }
+    atomic_store(&c->proto, TSDB_PROTOCOL_MIN);
     if (io == IO_EPOLL) {
         if ((size_t)fd >= fd_conn_cap) {
             size_t cap = fd_conn_cap ? fd_conn_cap : 1024;

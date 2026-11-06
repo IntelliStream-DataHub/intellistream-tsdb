@@ -16,7 +16,9 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <netinet/in.h>
 #include <stdbool.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 
@@ -119,6 +121,106 @@ static int count_cb(void *ctx, const int64_t *ts, const float *v, size_t n)
     return 0;
 }
 
+/* ---- a raw connection, for what a client of another protocol version sees */
+
+static bool rd_all(int fd, void *p, size_t n)
+{
+    uint8_t *o = p;
+    while (n) {
+        ssize_t r = read(fd, o, n);
+        if (r <= 0)
+            return false;
+        o += r;
+        n -= (size_t)r;
+    }
+    return true;
+}
+
+/* Sends one request frame and reads its reply: returns the length field of the reply (id, op, status, body) or
+ * -1, with the status in *status. */
+static long raw_call(int fd, uint32_t id, uint8_t op, const void *pl, size_t n, int32_t *status)
+{
+    uint8_t h[9];
+    uint32_t len = (uint32_t)(5 + n);
+    memcpy(h, &len, 4);
+    memcpy(h + 4, &id, 4);
+    h[8] = op;
+    if (write(fd, h, 9) != 9 || (n && write(fd, pl, n) != (ssize_t)n))
+        return -1;
+    uint8_t rh[13];
+    if (!rd_all(fd, rh, 13))
+        return -1;
+    memcpy(&len, rh, 4);
+    memcpy(status, rh + 9, 4);
+    uint8_t *rest = malloc(len);
+    bool ok = len < 9 || rd_all(fd, rest, len - 9);
+    free(rest);
+    return ok ? (long)len : -1;
+}
+
+static int raw_open(uint32_t version)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (fd < 0 || connect(fd, (struct sockaddr *)&a, sizeof a) != 0)
+        return -1;
+    int32_t st;
+    if (raw_call(fd, 1, TSDB_OP_HELLO, &version, 4, &st) < 0 || st != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* A QUERY_RAW of sid_a, refused: the reply is the op's bare error shape (u8 last, u32 n: 14 bytes after the length
+ * field) for a client that said 12, and longer by the body for one that said 13. */
+static void check_version_gate(void)
+{
+    uint8_t q[24] = {0};
+    memcpy(q, &sid_a, 8);
+    int64_t end = 100000;
+    memcpy(q + 16, &end, 8);
+    for (uint32_t ver = 12; ver <= 13; ver++) {
+        int fd = raw_open(ver);
+        CHECK(fd >= 0);
+        if (fd < 0)
+            continue;
+        int32_t st = 0;
+        long len = raw_call(fd, 2, TSDB_OP_QUERY_RAW, q, sizeof q, &st);
+        CHECK(st == TSDB_ERR_UNAVAILABLE);
+        CHECK(ver == 12 ? len == 14 : len > 14); /* mutation "body for every connection": 12 gets it too */
+        /* and the connection still answers */
+        uint8_t rq[24] = {0};
+        tsdb_sid r = sid_root;
+        memcpy(rq, &r, 8);
+        memcpy(rq + 16, &end, 8);
+        CHECK(raw_call(fd, 3, TSDB_OP_QUERY_RAW, rq, sizeof rq, &st) > 0 && st == 0);
+        close(fd);
+    }
+}
+
+/* QUERY_MULTI over a series of the down volume and one of the root: the down series answers UNAVAILABLE in its
+ * own frame (bare), the other series is answered, the call returns 0 and the connection stays usable. */
+static void check_multi_during_outage(tsdbc *c)
+{
+    tsdb_sid ids[2] = {sid_a, sid_root};
+    for (int kind = TSDB_MULTI_VALUES; kind <= TSDB_MULTI_BUCKETS; kind++) {
+        tsdb_multi_query q = {.kind = kind, .start = 0, .end = 100000, .interval_ms = 1000};
+        tsdb_series_result *out = NULL;
+        int rc = tsdbc_query_multi_collect(c, &q, ids, 2, NULL, &out);
+        CHECK(rc == 0);
+        if (rc == 0 && out) {
+            CHECK(out[0].status == TSDB_ERR_UNAVAILABLE);
+            CHECK(out[1].status == 0);
+            tsdbc_series_results_free(out, 2);
+        }
+        int64_t ts = 6000 + kind;
+        float v = 1;
+        CHECK(tsdbc_insert_series(c, sid_root, &ts, &v, 1) == 0); /* the connection is not lost */
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *base = argc > 1 ? argv[1] : "/tmp";
@@ -184,6 +286,8 @@ int main(int argc, char **argv)
     /* the root answers while A is away */
     ts = 2001;
     CHECK(tsdbc_insert_series(c, sid_root, &ts, &v, 1) == 0);
+    check_multi_during_outage(c);
+    check_version_gate();
     t = NULL;
     CHECK(tsdbc_topology(c, &t) == 0 && t);
     if (t) {

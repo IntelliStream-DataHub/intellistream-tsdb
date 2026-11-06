@@ -353,6 +353,7 @@ static void run_one(const uint8_t *in, size_t len)
     if (!c)
         abort();
     c->fd = -1;
+    atomic_store(&c->proto, TSDB_PROTOCOL_VERSION); /* HA bodies on, as for a client that said 13 */
     c->n_out = (note){NULL, c, false}; /* as on_accept: replies push n_out onto note_top, which nobody takes here */
     c->n_done = (note){NULL, c, true};
     pthread_mutex_init(&c->lock, NULL);

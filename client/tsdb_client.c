@@ -622,12 +622,16 @@ int tsdbc_set_retry(tsdbc *c, int budget_ms)
 {
     if (budget_ms < 0)
         return TSDB_ERR_INVALID;
-    if (budget_ms == 0 && c->retry_ms > 0 && c->qlen == 0)
-        c->retry_ms = 0;
-    else if (budget_ms > 0)
+    if (budget_ms > 0) {
         c->retry_ms = budget_ms;
-    else
+        return 0;
+    }
+    if (c->retry_ms == 0)
+        return 0; /* already off */
+    q_trim(c);    /* the frame of a finished request is kept until the next send: it is not "in flight" */
+    if (c->qlen != 0)
         return TSDB_ERR_INVALID; /* with requests in flight (they hold their frames) */
+    c->retry_ms = 0;
     return 0;
 }
 
@@ -845,11 +849,13 @@ static int drain(tsdbc *c)
             const uint8_t *b;
             size_t n;
             uint32_t id = c->expect;
-            int rc = read_reply(c, &st, &b, &n);
+            /* the raw read: read_reply's retry in place of the last refused frame would send it before the earlier
+             * refused ones (it cannot see them: their ids are below expect) */
+            int rc = read_reply_raw(c, &st, &b, &n);
             if (rc)
                 return rc;
             c->pending--;
-            if (retryable_status(st) && !c->gave_up && c->retry_ms > 0 && q_find(c, id)) {
+            if (retryable_status(st) && c->retry_ms > 0 && q_find(c, id)) {
                 if (!failed) {
                     failed = true;
                     first_id = id;

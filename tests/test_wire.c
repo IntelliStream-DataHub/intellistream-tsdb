@@ -771,6 +771,106 @@ static void test_pipeline(void)
     fake_stop(&f);
 }
 
+/* Refusals at the first and the last of three pipelined frames: the last one must not be sent again alone and ahead
+ * of the first (drain's reads take no retry of their own), so the arrival order is 0 1 2, then 0 1 2 again. */
+static void script_pipeline_ends(struct fake *f, int fd)
+{
+    uint8_t body[4096], op, ub[64];
+    size_t n, un;
+    uint32_t id;
+    body_unavail(ub, &un, 20);
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        int i = note_req(f, id);
+        if (i < 32)
+            pipe_hash[i] = fnv(body, n);
+        if (i == 0 || i == 2)
+            reply(fd, id, TSDB_ERR_UNAVAILABLE, ub, un);
+        else
+            reply(fd, id, 0, NULL, 0);
+    }
+}
+
+static void test_pipeline_ends(void)
+{
+    struct fake f;
+    tsdbc *c;
+    fake_start(&f, 1, script_pipeline_ends);
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    for (int i = 0; i < 3; i++) {
+        int64_t ts = 1000 + i * 77777;
+        float v = (float)i;
+        CHECK(tsdbc_insert_series_async(c, TSDB_SID(0, 5), &ts, &v, 1) == 0);
+    }
+    CHECK(tsdbc_wait(c) == 0);
+    CHECK(atomic_load(&f.nreq) == 6); /* mutation "drain reads through read_reply": 7, in the order 0 1 2 2 0 1 2 */
+    static const int want[6] = {0, 1, 2, 0, 1, 2};
+    uint64_t first[3];
+    for (int i = 0; i < 3; i++)
+        first[i] = pipe_hash[i];
+    for (int i = 0; i < 6 && i < 32; i++)
+        CHECK(pipe_hash[i] == first[want[i]]);
+    tsdbc_close(c);
+    fake_stop(&f);
+}
+
+static void script_pipeline_always(struct fake *f, int fd)
+{
+    uint8_t body[4096], op, ub[64];
+    size_t n, un;
+    uint32_t id;
+    body_unavail(ub, &un, 100);
+    while (read_req(fd, &id, &op, body, sizeof body, &n)) {
+        note_req(f, id);
+        reply(fd, id, TSDB_ERR_UNAVAILABLE, ub, un);
+    }
+}
+
+/* Every frame refused for good: the budget is spent once, not once in the reads and again in the resends. */
+static void test_pipeline_budget(void)
+{
+    struct fake f;
+    tsdbc *c;
+    fake_start(&f, 1, script_pipeline_always);
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    tsdbc_set_retry(c, 1000);
+    for (int i = 0; i < 3; i++) {
+        int64_t ts = 1000 + i * 77777;
+        float v = (float)i;
+        CHECK(tsdbc_insert_series_async(c, TSDB_SID(0, 5), &ts, &v, 1) == 0);
+    }
+    double t0 = now_ms();
+    CHECK(tsdbc_wait(c) == TSDB_ERR_UNAVAILABLE);
+    double dt = now_ms() - t0;
+    CHECK(dt < 1300); /* mutation: about 2000 ms and 13 frames */
+    CHECK(atomic_load(&f.nreq) <= 3 * 12);
+    tsdbc_close(c);
+    fake_stop(&f);
+}
+
+/* tsdbc_set_retry(c, 0): refused only while a request is in flight; after a finished request (whose frame is kept
+ * until the next send) and when retries are already off it is accepted. */
+static void test_set_retry(void)
+{
+    struct fake f;
+    tsdbc *c;
+    tsdb_sid sid = 0;
+    fake_start(&f, 1, script_ok);
+    CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
+    CHECK(tsdbc_series(c, "x.y", 1, &sid) == 0);
+    CHECK(tsdbc_set_retry(c, 0) == 0); /* mutation: INVALID, the finished request's frame still counts */
+    CHECK(tsdbc_set_retry(c, 0) == 0); /* already off */
+    CHECK(tsdbc_set_retry(c, -1) == TSDB_ERR_INVALID);
+    CHECK(tsdbc_set_retry(c, 500) == 0);
+    int64_t ts = 1;
+    float v = 1;
+    CHECK(tsdbc_insert_series_async(c, TSDB_SID(0, 5), &ts, &v, 1) == 0);
+    CHECK(tsdbc_set_retry(c, 0) == TSDB_ERR_INVALID); /* in flight */
+    CHECK(tsdbc_wait(c) == 0);
+    CHECK(tsdbc_set_retry(c, 0) == 0);
+    tsdbc_close(c);
+    fake_stop(&f);
+}
+
 /* ------------------------------------------------------------ several nodes */
 
 static void test_nodes(void)
@@ -859,6 +959,9 @@ int main(int argc, char **argv)
     test_partial_dropped();
     test_multi_refused();
     test_pipeline();
+    test_pipeline_ends();
+    test_pipeline_budget();
+    test_set_retry();
     test_nodes();
     test_topology();
     if (failures) {
