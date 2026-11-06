@@ -44,6 +44,22 @@ disk format and the wire protocol.
   hung-volume tests, `make jepsen`, `make dist` and the sanitizers stay Linux only. The Linux build is unchanged:
   the macOS code is behind `__APPLE__` or in inline `tsdb_*` wrappers that are the plain call on Linux, and the
   Linux objects are the same machine code as before.
+- **Wire protocol 13: every HA body, before the 1.0 freeze** (step S0, the wire half; docs/ha.md 15.4,
+  `include/tsdb_protocol.h`, `include/tsdb_wire.h`). The floor stays 12: the new statuses only answer requests a
+  client of 12 already sends, and it treats an unknown status as an error. New statuses `TSDB_ERR_MOVED` (-10),
+  `TSDB_ERR_UNAVAILABLE` (-11, which already existed without a body), `TSDB_ERR_PARTIAL` (-12) and
+  `TSDB_ERR_DROPPED` (-13), each with a body: UNAVAILABLE names the volume, the reason, `retry_after_ms` and the outage;
+  MOVED names the volume, epoch and owner address; PARTIAL the status of each volume and the rows not applied; DROPPED
+  the volume and its watermark. New ops `TOPOLOGY` (48: nodes, and per volume owner, role, health, epoch; a single
+  tsdbd answers itself) and `STATUS` (49: `key=value` lines, superuser). tsdbd sends only UNAVAILABLE, with its body
+  from the storage domains (docs/ha.md 15.2); the others are defined, coded, decoded and fuzzed
+  (`tests/fuzz/fuzz_wire.c`) for the cluster. All four clients decode the bodies, retry UNAVAILABLE after
+  `retry_after` within a time budget (30 s by default, off with `tsdbc_set_retry(c, 0)`, `set_retry`, `retry=`,
+  `setRetry`), follow MOVED, and connect to a list of nodes (`tsdbc_connect_nodes`, `connect_nodes`,
+  `connectNodes`); new exceptions `TsdbUnavailable`, `TsdbMoved`, `TsdbPartial`, `TsdbDropped` (Python) and
+  `UnavailableException` and its siblings (Java), `Status::{Moved, Unavailable, Partial, Dropped}` (Rust). The
+  C client keeps a copy of each request until its reply (one more memcpy). The Pulsar sink works as before (its tests
+  pass). **Protocol numbers moved:** `QUERY_LATEST` is protocol 14, the change feed 15, statistics 16.
 - tsdbd `--lttb-max-threshold N` (default 16,777,216): the largest LTTB threshold the server computes, for
   QUERY_LTTB and QUERY_MULTI; a larger one is taken as this. A range of no more rows than that still answers every
   point. Newest-first LTTB holds its chosen points until the last is chosen, so before this a threshold near the

@@ -417,7 +417,12 @@ cgroup, so `nice` does not keep your work out of its way.
   access control (HELLO's reply says whether login is required and lists the mechanisms;
   AUTH_START and AUTH_CONTINUE run SCRAM-SHA-256; WHOAMI, the user admin ops,
   `TSDB_ERR_DENIED` and `TSDB_ERR_AUTH`; the op list is the X-macro `TSDB_OPS`; HELLO floor 12).
-  All four clients speak 12 and no call is gated on a version below the floor;
+  13 the HA bodies (include/tsdb_wire.h, docs/ha.md 15.4): `TSDB_ERR_MOVED` -10, `UNAVAILABLE` -11, `PARTIAL` -12 and
+  `DROPPED` -13 with their bodies, the ops TOPOLOGY (48) and STATUS (49); floor still 12. The four clients retry
+  UNAVAILABLE after `retry_after` and follow MOVED within a time budget (`tsdbc_set_retry`, 30 s by default), and
+  connect to a list of nodes; tsdbd sends only UNAVAILABLE (MOVED, PARTIAL and DROPPED wait for the cluster).
+  The planned protocols moved up: QUERY_LATEST 14, the change feed 15, statistics 16.
+  All four clients speak 13 and no call is gated on a version below the floor;
   the embedded bindings (Rust `Db`, Python `Db`, Java `EmbeddedDb`) have the
   same operations, and their tests compare them with tsdbd's answers.
 

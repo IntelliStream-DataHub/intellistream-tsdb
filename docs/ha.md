@@ -1126,9 +1126,35 @@ The row numbers refer to the stall map (rows 1-16).
 
 ### 15.4 Client-facing behaviour (protocol v5, extending §9)
 
-> "Protocol v5" is this document's old numbering; the protocol is at 12 (AGENTS.md). These bodies (UNAVAILABLE with
-> reasons and `retry_after`, PARTIAL, DROPPED) and TOPOLOGY with per-volume role and health are defined once, in step
+> "Protocol v5" is this document's old numbering; the protocol is at 13 (AGENTS.md). These bodies (UNAVAILABLE with
+> reasons and `retry_after`, MOVED, PARTIAL, DROPPED) and TOPOLOGY with per-volume role and health are defined once, in step
 > S0 of [design-ha-modes.md](design-ha-modes.md) §7, in the four clients, before the 1.0 protocol freeze. N1 uses them.
+
+> **What protocol 13 has (S0, the wire half).** The layouts of every body are in the comment at the top of
+> `include/tsdb_protocol.h` and coded once in `include/tsdb_wire.h` (tsdbd, the C client and the tests share that
+> code; the Rust, Python and Java clients decode the same bytes, checked against `tests/data/wire13-vectors.txt`).
+> The floor stays 12.
+> - **Statuses:** `TSDB_ERR_MOVED` -10, `UNAVAILABLE` -11, `PARTIAL` -12, `DROPPED` -13. A reply with one of them is the
+>   op's own error reply shape (the empty last chunk of a streaming op, QUERY_MULTI's END frame with its u32 answered),
+>   then the body. A client of 12 sees an unknown negative status and fails the call, as for any error.
+> - **tsdbd sends only UNAVAILABLE**, with one entry: the volume (`TSDB_VOL_ANY` when the request names none), the
+>   reason from the storage domain (§15.2), `epoch` 0, `since_ms`, `retry_after_ms` and `outage_id`. MOVED, PARTIAL and
+>   DROPPED are defined, encoded, decoded and fuzzed (`tests/fuzz/fuzz_wire.c`), but a single server has no owner to
+>   name, no frame that spans owners and no drop watermark: the cluster (S1/S2) and the drop (D33) send them.
+> - **TOPOLOGY (48)** answers a single server: node 1, every volume as OWNER (FOLLOWER under `--follow`), the health of
+>   its domain, and `gen`, a hash of the reply. Paths go to a superuser only. Any logged-in user may ask. **STATUS (49)**
+>   is `key=value` lines for a superuser (`vol.<n>.health`, `vol.<n>.reason`, `domain.<d>.state`, ...).
+> - **Not in 13:** sessions, streams, `seq` and `attempt` on inserts, forwarding between nodes and direct mode (S2, S3),
+>   so `resend_from` is never sent. Without a `seq` a retry is safe because UNAVAILABLE and MOVED mean "not applied":
+>   a client resends in order from the first refused frame, also the frames acknowledged after it.
+> - **Clients (all four):** decode every body (`tsdbc_last_error`, `Client::last_error`, `TsdbUnavailable.volumes` and
+>   `.retry_after`, `UnavailableException.info()`); retry an UNAVAILABLE request after the largest `retry_after_ms` (1 s
+>   without a body; clamped to 1 ms to 60 s) within a time budget, 30 s by default (`tsdbc_set_retry`,
+>   `set_retry`, `Client(retry=)`, `setRetry`; 0 turns it off); follow MOVED to the address it names, or to the next
+>   node of the connect string; and connect to a list of nodes (`tsdbc_connect_nodes`, `Client::connect_nodes`,
+>   `Client.connect_nodes`, `TsdbClient.connectNodes`). A streamed reply is retried only if no row was delivered, and
+>   QUERY_MULTI is never resent (its rows may have been delivered). The embedded bindings have no wire and no change.
+> - The code `-14` is `TSDB_ERR_ABANDONED` in `tsdb.h`; this document's STALE_ID (D-numbers above) has no code yet.
 
 **`TSDB_ERR_UNAVAILABLE = -11`** is sent only before engine work, by the owner or by an entry node (§9.1).
 - Body: `u16 n, n × {u16 vol, u8 reason, u8 flags, u32 epoch, i64 since_ms, u32 retry_after_ms, u64 outage_id}`, then `[u64 resend_from]` when the frame carried a seq.

@@ -236,8 +236,8 @@ refuses these calls.
 
 Series ids are 64-bit numbers in a `long`, handed out by the database: the volume in the high half, so every id is
 at least 2^32 and positive. Look them up by name and keep them in a `long`, never an `int`; do not count on them
-being 0, 1, 2 and so on. The client speaks protocol 12 and
-`TsdbClient.connect` fails with `Status.ERR_INVALID` ("upgrade the server") when the server answers an older version.
+being 0, 1, 2 and so on. The client speaks protocol 13 (a server of 12 works too) and
+`TsdbClient.connect` fails with `Status.ERR_INVALID` ("upgrade the server") when the server answers a version below 12.
 
 A series has a name and a value type. `series` gets a series of 32-bit floats, and creates it if it is missing.
 `seriesCreate` lets you choose another type (see [Value types and nulls](#value-types-and-nulls)).

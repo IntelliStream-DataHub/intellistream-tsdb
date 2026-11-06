@@ -691,6 +691,14 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | X1 | both | Cold-tier boundary (step 8); a shared volume hands partitions over the same way | 2 | 4 (midcommit at the move) | — |
 | X3 | both | Measurements and docs: README section, AGENTS.md invariants and lock order, operator guides | 1-2 | the benchmarks, quiet machine | — |
 
+**S0, the wire half (built, branch s0-wire): protocol 13.** TOPOLOGY is op 48 and STATUS op 49 (ops 39-47 stay with
+the latest values, the feed and statistics); the protocols they plan move up one: `QUERY_LATEST` 14, the feed 15,
+statistics 16. Every body is in `include/tsdb_protocol.h` and `include/tsdb_wire.h` and described in ha.md §15.4.
+tsdbd (single server) sends UNAVAILABLE with its body and answers TOPOLOGY (itself, every volume, health from the
+domains) and STATUS; MOVED, PARTIAL and DROPPED are encoded, decoded and fuzzed but sent by S1 and S2 only. Not in 13:
+sessions, streams, `seq`, `attempt` and `resend_from` on inserts (S2, S3); the clients' retry relies on "refused
+means not applied" and resends in order from the first refused frame.
+
 **Minimum production HA** (shared mode; corrected in verification): S0, N0, N1, N2-N7, S1, S2 (whole: users and
 TOPOLOGY in the metadata copy are needed by `adopt`, which moves the root's users there), S4 and N8. N1 is in it
 because storage domains and probes (M6, the stuck-release rule, `domain maint`, domain health in heartbeats),
