@@ -164,7 +164,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	./$(B)/test_crafted
 	./$(B)/test_gindex
 	./$(B)/test_tzfiles
-	for h in $(FUZZ_HARNESSES); do ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
+	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 	./$(B)/test_types
 	./$(B)/test_delete
 	./$(B)/test_levels
@@ -207,12 +207,14 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 # Every input a run found a bug with is copied into the corpus with its fix.
 FUZZ           ?= $(FUZZ_HARNESSES)
 FUZZ_SECONDS   ?= 60
-FUZZ_B         ?= build-fuzz
 FUZZ_CC        ?= $(CC)
 # The CPU level of `make fuzz`: generic x86-64 by default (scalar unpack). FUZZ_ARCH=-march=x86-64-v3 reaches the
 # AVX2 kernels, -march=x86-64-v4 the AVX-512 code generation (codecx, part and the others: all of it matters, the
 # decoders compile differently); the harnesses must work at every level, ASan's fake stack included.
 FUZZ_ARCH      ?=
+# Its own directory per level (build-fuzz, build-fuzz-v4, build-fuzz-native), and a level change in a directory you
+# name yourself empties its objects and binaries (the libtsdb.a rule below records the flags in .flags).
+FUZZ_B         ?= build-fuzz$(subst -march=,-,$(subst -march=x86-64-,-,$(FUZZ_ARCH)))
 FUZZ_SAN       := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 FUZZ_COMMON    := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off -Iinclude -Isrc -Iclient -Iserver
 ifeq ($(findstring clang,$(FUZZ_CC)),clang)
@@ -232,10 +234,17 @@ $(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
 $(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
 fuzz-replay: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
-	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(or $(TMPDIR),/tmp) ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
+	for h in $(FUZZ_HARNESSES); do FUZZ_IMPORT_EXPECT_END=1 FUZZ_TMP=$(or $(TMPDIR),/tmp) ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 
-ifneq ($(B),$(FUZZ_B))
+# abspath: FUZZ_B=./build from the environment is build/ too, and must not redirect the normal build's rules
+ifneq ($(abspath $(B)),$(abspath $(FUZZ_B)))
+FUZZ_SIG = $(FUZZ_CC) | $(FUZZ_ARCH) | $(FUZZ_SAN) | $(FUZZ_COV)
 $(FUZZ_B)/libtsdb.a: FORCE
+	@mkdir -p $(FUZZ_B); \
+	if [ "$$(cat $(FUZZ_B)/.flags 2>/dev/null)" != "$(FUZZ_SIG)" ]; then \
+	    [ -f $(FUZZ_B)/libtsdb.a ] && echo "fuzz: compiler or flags changed since the last build: rebuilding $(FUZZ_B)"; \
+	    rm -f $(FUZZ_B)/*.o $(FUZZ_B)/*.a $(FUZZ_B)/fuzz-*; printf '%s\n' "$(FUZZ_SIG)" >$(FUZZ_B)/.flags; \
+	fi
 	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH="$(FUZZ_ARCH)" CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@ \
 	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o
 
@@ -256,13 +265,24 @@ fuzz: $(FUZZ:%=$(FUZZ_B)/fuzz-%)
 	    $(FUZZ_B)/fuzz-$$h $(if $(FUZZ_DRV),-t $(FUZZ_SECONDS) -o $(FUZZ_B)/out/$$h,-max_total_time=$(FUZZ_SECONDS) \
 	        -artifact_prefix=$(FUZZ_B)/out/$$h/) $(FUZZ_B)/out/$$h tests/fuzz/corpus/$$h || exit 1; done
 
+# The guard of the _Alignas fix (an input alone does not trip it, a replay of the whole directory does): the harnesses
+# that read bytes without opening a database, built at x86-64-v4 under ASan with use-after-return detection on, replay
+# their whole corpus. Not part of `make test`: it needs AVX-512 (skipped without) and a build of the engine under ASan.
+FUZZ_V4_CHECK  ?= part codecx
+fuzz-replay-asan: $(FUZZ_V4_CHECK:%=$(FUZZ_B)/fuzz-%)
+	for h in $(FUZZ_V4_CHECK); do FUZZ_TMP=$(or $(TMPDIR),/tmp) ASAN_OPTIONS=detect_stack_use_after_return=1:detect_leaks=0 \
+	    UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./$(FUZZ_B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
+
 # writes each harness's generated seeds into tests/fuzz/corpus/<harness>/ (after a format change)
 fuzz-seeds: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
 	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(or $(TMPDIR),/tmp) ./$(B)/fuzz-$$h -seeds tests/fuzz/corpus/$$h || exit 1; done
 
 endif
+fuzz-v4-check:
+	@if grep -q avx512f /proc/cpuinfo; then $(MAKE) FUZZ_ARCH=-march=x86-64-v4 fuzz-replay-asan; \
+	else echo "fuzz-v4-check: no AVX-512 on this CPU, skipped"; fi
 FORCE:
-.PHONY: fuzz fuzz-replay fuzz-seeds FORCE
+.PHONY: fuzz fuzz-replay fuzz-replay-asan fuzz-v4-check fuzz-seeds FORCE
 
 # Without -march=native: with it, GCC 15.2's AddressSanitizer crashes in memcpy into
 # fake-stack frames (use-after-return detection), in code that did not change.
@@ -304,7 +324,7 @@ $(B):
 	mkdir -p $(B)
 
 clean:
-	rm -rf build build-tsan build-fuzz build-fuzz-v3 build-fuzz-v4 build-fuzz-frames $(DIST_B)
+	rm -rf build build-tsan build-fuzz build-fuzz-v3 build-fuzz-v4 build-fuzz-native build-fuzz-frames $(DIST_B)
 
 # ---- portable binaries (dist/README.dist): built here, run on AlmaLinux 10 ----
 # x86-64-v2 for CPUs as old as Nehalem (no AVX needed), with the codecs also compiled for

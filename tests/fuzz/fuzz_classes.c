@@ -33,6 +33,38 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
 
 static int cb(void *ctx, const int64_t *ts, const float *v, size_t n) { (void)ctx, (void)ts, (void)v, (void)n; return 0; }
 
+/* tsdb_open of D, then queries of every series (and, writable, one insert). Returns whether the open succeeded. */
+static bool run_open(bool read_only)
+{
+    tsdb_options o;
+    template_opts(&o);
+    o.read_only = read_only;
+    tsdb *db;
+    if (tsdb_open(D, &o, &db) != 0)
+        return false;
+    static const char *names[] = {"a", "b", "c", "d"};
+    for (int i = 0; i < 4; i++) {
+        tsdb_sid id;
+        if (tsdb_series_lookup(db, names[i], &id) != 0)
+            continue;
+        int cls;
+        (void)tsdb_series_class(db, id, &cls);
+        if (i == 0)
+            (void)tsdb_query_raw(db, id, INT64_MIN, INT64_MAX, cb, NULL);
+        tsdb_bucket *bk = NULL;
+        size_t nb = 0;
+        if (tsdb_query_agg(db, id, INT64_MIN, INT64_MAX, 3600000, &bk, &nb) == 0)
+            free(bk);
+        if (!read_only && i == 0) {
+            int64_t t = 1704067200000 + 400 * 600000LL;
+            float v = 1;
+            (void)tsdb_insert_series(db, id, &t, &v, 1);
+        }
+    }
+    tsdb_close(db);
+    return true;
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
     if (!D)
@@ -43,32 +75,11 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     reseal(b, size);
     fuzz_put(D, CLS_FILE, b, size);
     free(b);
-    tsdb_options o;
-    template_opts(&o);
-    o.read_only = size % 8 == 1; /* a reader waits up to 1 s on a CLASSES that fails the parts check */
-    tsdb *db;
-    if (tsdb_open(D, &o, &db) == 0) {
-        static const char *names[] = {"a", "b", "c", "d"};
-        for (int i = 0; i < 4; i++) {
-            tsdb_sid id;
-            if (tsdb_series_lookup(db, names[i], &id) != 0)
-                continue;
-            int cls;
-            (void)tsdb_series_class(db, id, &cls);
-            if (i == 0)
-                (void)tsdb_query_raw(db, id, INT64_MIN, INT64_MAX, cb, NULL);
-            tsdb_bucket *bk = NULL;
-            size_t nb = 0;
-            if (tsdb_query_agg(db, id, INT64_MIN, INT64_MAX, 3600000, &bk, &nb) == 0)
-                free(bk);
-            if (!o.read_only && i == 0) {
-                int64_t t = 1704067200000 + 400 * 600000LL;
-                float v = 1;
-                (void)tsdb_insert_series(db, id, &t, &v, 1);
-            }
-        }
-        tsdb_close(db);
-    }
+    /* A reader waits up to 1 s (100 x 10 ms, src/db.c) on a CLASSES that fails the parts check, which made one
+     * input in 8 cost 1 s: it opens read-only only after the writable open of the same bytes succeeded (the check
+     * passed, nothing waits). The writable run changed the files (an insert), the reader sees that state. */
+    if (run_open(false) && size % 8 == 1)
+        (void)run_open(true);
     return 0;
 }
 

@@ -22,7 +22,8 @@ make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tes
                           # with an output buffer of exactly n values, part, manifest, wal, dict, volumes, tz, import = the
                           # export stream, users = USERS, classes = CLASSES) under ASan+UBSan in build-fuzz/; make test
                           # replays tests/fuzz/corpus/<name>/ (codecx uses codec's). A crash-* input, once fixed, goes there.
-                          # At a CPU level: make fuzz FUZZ_B=build-fuzz-v4 FUZZ_ARCH=-march=x86-64-v4 (or -v3; the
+                          # At a CPU level: make fuzz FUZZ_ARCH=-march=x86-64-v4 (or -v3; its own dir build-fuzz-v4, and a changed level in a FUZZ_B you name
+                          # empties it; make fuzz-v4-check replays part and codecx at v4 under ASan with use-after-return on; the
                           # decoders compile differently at each; the harnesses' 64-byte locals are _Alignas(64) because
                           # ASan's fake stack aligns to 32). make asan ASAN_ARCH=-march=x86-64-v4 likewise (engine code copies the
                           # footer the same way, so that run turns detect_stack_use_after_return off).
