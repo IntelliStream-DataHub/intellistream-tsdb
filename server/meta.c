@@ -63,6 +63,13 @@ uint32_t meta_voter_target(const struct meta_settings *s, uint32_t servers)
     return t < max ? t : max;
 }
 
+/* memcpy with a null pointer is undefined even for 0 bytes, and an empty state's arrays are null (UBSan) */
+static void copy_n(void *dst, const void *src, size_t n)
+{
+    if (n)
+        memcpy(dst, src, n);
+}
+
 void meta_init(struct meta_state *m)
 {
     memset(m, 0, sizeof *m);
@@ -117,24 +124,24 @@ void meta_copy(struct meta_state *dst, const struct meta_state *src)
     dst->volumes_cap = src->nvolumes + 1;
     dst->moves_cap = src->nmoves + 1;
     dst->users_cap = src->nusers + 1;
-    memcpy(dst->members, src->members, src->nmembers * sizeof *dst->members);
-    memcpy(dst->volumes, src->volumes, src->nvolumes * sizeof *dst->volumes);
-    memcpy(dst->moves, src->moves, src->nmoves * sizeof *dst->moves);
-    memcpy(dst->users, src->users, src->nusers * sizeof *dst->users);
+    copy_n(dst->members, src->members, src->nmembers * sizeof *dst->members);
+    copy_n(dst->volumes, src->volumes, src->nvolumes * sizeof *dst->volumes);
+    copy_n(dst->moves, src->moves, src->nmoves * sizeof *dst->moves);
+    copy_n(dst->users, src->users, src->nusers * sizeof *dst->users);
     memcpy(dst->slot_home, src->slot_home, META_SLOTS * sizeof *dst->slot_home);
     for (uint32_t i = 0; i < src->nvolumes; i++) {
         struct meta_volume *v = &dst->volumes[i];
         v->hist = malloc((v->nhist + 1) * sizeof *v->hist);
         if (!v->hist)
             abort();
-        memcpy(v->hist, src->volumes[i].hist, v->nhist * sizeof *v->hist);
+        copy_n(v->hist, src->volumes[i].hist, v->nhist * sizeof *v->hist);
     }
     for (uint32_t i = 0; i < src->nusers; i++) {
         struct meta_user *u = &dst->users[i];
         u->blob = malloc(u->len + 1);
         if (!u->blob)
             abort();
-        memcpy(u->blob, src->users[i].blob, u->len);
+        copy_n(u->blob, src->users[i].blob, u->len);
     }
 }
 

@@ -391,7 +391,8 @@ static iso_err ml_append(void *p, const raft_entry *e, unsigned n)
             l->e = realloc(l->e, l->cap * sizeof *l->e);
         }
         uint8_t *d = malloc(e[k].len + 1);
-        memcpy(d, e[k].data, e[k].len);
+        if (e[k].len) /* an empty entry's data may be null */
+            memcpy(d, e[k].data, e[k].len);
         l->e[l->n++] = (struct mentry){e[k].term, e[k].type, e[k].len, d};
     }
     return ISO_OK;

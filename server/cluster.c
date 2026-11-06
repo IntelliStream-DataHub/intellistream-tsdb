@@ -2193,6 +2193,7 @@ static void watch_duty(uint64_t now)
         return;
     C.watch_next_try = now + 1000 * MS;
     if (C.r && !C.wsm_on) {
+        meta_free(&C.wsm); /* the empty state cluster_start made, or a freed one */
         meta_init(&C.wsm);
         C.wsm_on = 1;
     }
@@ -2432,16 +2433,17 @@ int cluster_start(const struct cluster_cfg *cfg)
     }
     int fl = fcntl(C.lfd, F_GETFL);
     fcntl(C.lfd, F_SETFL, fl | O_NONBLOCK);
-    if (pthread_create(&C.th, NULL, cluster_main, NULL) != 0) {
-        fprintf(stderr, "tsdbd: cluster: cannot start its thread\n");
-        return -1;
-    }
-    C.running = 1;
+    /* said before the thread starts: from then on C belongs to it (an INIT may already be changing it) */
     if (C.have_node)
         fprintf(stderr, "tsdbd: cluster: node %" PRIu32 ", incarnation %" PRIu64 ", %s\n", C.id, C.incarnation,
                 C.r ? "in the metadata group" : "following a watch stream");
     else
         fprintf(stderr, "tsdbd: cluster: in no cluster yet (tsdb cluster init, or node add from a member)\n");
+    if (pthread_create(&C.th, NULL, cluster_main, NULL) != 0) {
+        fprintf(stderr, "tsdbd: cluster: cannot start its thread\n");
+        return -1;
+    }
+    C.running = 1;
     return 0;
 }
 
