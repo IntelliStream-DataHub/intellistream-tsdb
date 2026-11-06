@@ -34,6 +34,7 @@
 #include "auth.h"
 #include "tsdb_protocol.h"
 #include "../client/tsdb_crypto.h"
+#include "../src/compat.h" /* tsdb_thread_create (macOS: an 8 MB stack); nothing new on Linux */
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -465,7 +466,7 @@ int auth_start_reload(void)
 {
     if (!us_open)
         return 0;
-    int rc = pthread_create(&reload_thread, NULL, reload_main, NULL);
+    int rc = tsdb_thread_create(&reload_thread, reload_main, NULL);
     reload_running = rc == 0;
     return rc;
 }

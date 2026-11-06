@@ -32,7 +32,10 @@
 #include "../src/compat.h" /* tsdb_fsync (macOS: with the drive cache flush) */
 
 #ifdef __APPLE__
-#define syncfs(fd) tsdb_fsync(fd) /* no syncfs; the fsync that follows is the same call, kept for the error text */
+/* No syncfs: sync() starts the writeback of every file system without waiting for it, so an import written with
+ * fsync = 0 is durable on macOS only as far as that writeback got before the drive's cache flush (best effort on a
+ * developer platform; docs/macos.md). The fsync that follows is the same call again, kept for the error text. */
+#define syncfs(fd) (sync(), tsdb_fsync(fd))
 #endif
 #if defined(__SSE4_2__)
 #include <nmmintrin.h>

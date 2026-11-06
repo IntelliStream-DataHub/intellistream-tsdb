@@ -80,7 +80,7 @@ BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
 all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench
 
-$(B)/%.o: src/%.c src/internal.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
+$(B)/%.o: src/%.c src/internal.h src/compat.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 # simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
 $(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
@@ -219,7 +219,7 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	./$(B)/test_crypto
 	./$(B)/test_users
 	B=$(B) tests/test_cli_users.sh
-	! nm $(CLIB) | grep -w 'tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only
+	! nm $(CLIB) | grep -wE '_?tsdbc_test_[a-z0-9_]*' # the client's test hooks are in the tests' build only (_: Mach-O)
 	./$(B)/test_export
 	./$(B)/fuzz_frames replay tests/fuzz/frames
 	./$(B)/test_out_send
@@ -233,7 +233,10 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 	    TSDBD=$(TSDBD) TSDBD_IO=$$io ./$(B)/test_stability || exit 1; done
 
 # the portability headers (macOS shims) are part of these tests and of the server
-$(B)/test_classes $(B)/test_damage $(B)/test_export $(B)/test_failstop $(B)/test_follow $(B)/test_group $(B)/test_sched $(B)/test_server_multi $(B)/test_server $(B)/test_spread $(B)/test_stability $(B)/test_tsdb $(B)/test_volumes $(B)/tsdbd: tests/portable.h src/compat.h server/epoll_compat.h
+$(B)/test_classes $(B)/test_damage $(B)/test_export $(B)/test_failstop $(B)/test_follow $(B)/test_group $(B)/test_sched \
+$(B)/test_server_multi $(B)/test_server $(B)/test_spread $(B)/test_stability $(B)/test_tsdb $(B)/test_volumes \
+$(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/test_ports $(B)/test_out_send $(B)/fuzz_frames $(B)/tsdbd $(B)/users.o $(B)/tsdb: \
+    tests/portable.h src/compat.h server/epoll_compat.h
 
 # ------------------------------------------------------------------ fuzzing
 # tests/fuzz/: one harness per decoder or loader of what lies on disk (driver.c has the details).

@@ -13,13 +13,18 @@ stop() { [ -n "$pid" ] && [ "$pid" -gt 1 ] 2> /dev/null && kill "$pid" 2> /dev/n
 trap 'stop; rm -rf "$base"' EXIT
 fail() { echo "test_fs_warning: FAIL: $*" >&2; exit 1; }
 
-case $(stat -f -c %T "$base") in
+fstype() { # GNU stat; macOS (BSD stat) has neither ext4 nor XFS, so no warning there
+    if [ "$(uname -s)" = Darwin ]; then echo darwin; else stat -f -c %T "$1"; fi
+}
+case $(fstype "$base") in
 ext2/ext3 | ext4 | xfs) want=1 ;;
 *) want=0 ;;
 esac
 
 run() { # NAME [FLAGS]: starts tsdbd on $base/NAME, waits until it serves, stops it; the log is $base/NAME.log
-    local n=$1 me=$BASHPID # the shell that starts tsdbd below, a subshell included (not $$)
+    # the shell that starts tsdbd below, a subshell included (not $$); bash 3.2 (macOS) has no BASHPID: the parent of
+    # a process that replaced the command substitution's subshell is this shell
+    local n=$1 me=${BASHPID:-$(exec sh -c 'echo $PPID')}
     shift
     "$B/tsdbd" --dir "$base/$n" --no-auth --port 0 --port-file "$base/$n.port" --exit-with-parent="$me" "$@" > "$base/$n.log" 2>&1 &
     pid=$!
@@ -32,6 +37,6 @@ run() { # NAME [FLAGS]: starts tsdbd on $base/NAME, waits until it serves, stops
 run off
 run on --verify-checksums
 got=$(grep -c "keeps no checksums of its data" "$base/off.log")
-[ "$got" -eq "$want" ] || fail "$(stat -f -c %T "$base"): $got warnings without --verify-checksums, want $want: $(cat "$base/off.log")"
+[ "$got" -eq "$want" ] || fail "$(fstype "$base"): $got warnings without --verify-checksums, want $want: $(cat "$base/off.log")"
 grep -q "keeps no checksums" "$base/on.log" && fail "a warning with --verify-checksums: $(cat "$base/on.log")"
-echo "test_fs_warning: ok ($(stat -f -c %T "$base"), warning $([ "$want" = 1 ] && echo shown || echo not needed))"
+echo "test_fs_warning: ok ($(fstype "$base"), warning $([ "$want" = 1 ] && echo shown || echo not needed))"

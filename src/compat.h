@@ -1,9 +1,13 @@
 /* compat.h: what Linux has and macOS (the developer instance, arm64 or x86-64) lacks.
  *
- * Everything here is under __APPLE__; on Linux this header adds nothing, so the Linux build is the code
- * as it was. Each shim keeps the behaviour the engine relies on, or says what is weaker and why that is
+ * Everything here is under __APPLE__; on Linux this header adds only the tsdb_* wrappers, each the plain call it
+ * names (inline, so the Linux build is the code as it was). macOS is a developer platform, never production
+ * (docs/macos.md). Each shim keeps the behaviour the engine relies on, or says what is weaker and why that is
  * acceptable for a developer instance:
  *
+ *  - posix_fadvise       nothing: the re-read of a tail about to be cut as torn (tail_confirm, USERS) may come from
+ *                        the cache there, so a page misread into the cache is not caught by the second read
+ *  - thread names        tsdb_thread_name: macOS names only the calling thread
  *  - getrandom           arc4random_buf (never blocks, never short)
  *  - sync_file_range     nothing: it only started writeback early; the caller's fdatasync still makes it durable
  *  - memrchr             a loop
@@ -71,6 +75,15 @@ static inline ssize_t getrandom(void *buf, size_t n, unsigned flags)
     arc4random_buf(buf, n);
     return (ssize_t)n;
 }
+
+#ifndef POSIX_FADV_DONTNEED
+#define POSIX_FADV_DONTNEED 4
+static inline int posix_fadvise(int fd, off_t off, off_t len, int advice)
+{
+    (void)fd, (void)off, (void)len, (void)advice;
+    return 0;
+}
+#endif
 
 #define SYNC_FILE_RANGE_WRITE 0
 static inline int sync_file_range(int fd, off_t off, off_t n, unsigned flags)

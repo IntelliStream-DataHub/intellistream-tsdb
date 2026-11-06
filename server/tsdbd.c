@@ -140,7 +140,11 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#ifdef __APPLE__ /* statfs; its f_type never names ext4 or XFS there, so fs_warn says nothing */
+#include <sys/mount.h>
+#else
 #include <sys/vfs.h>
+#endif
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>

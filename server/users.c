@@ -57,6 +57,7 @@
 
 #include "tsdb.h"
 #include "../client/tsdb_crypto.h"
+#include "../src/compat.h" /* tsdb_fsync, tsdb_fdatasync (macOS: with the drive's cache flush); nothing new on Linux */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1526,7 +1527,7 @@ static int fsync_dir(const char *dir)
     int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    int r = fsync(fd);
+    int r = tsdb_fsync(fd);
     int e = errno;
     close(fd);
     errno = e;
@@ -1615,7 +1616,7 @@ static int sync_name(users *us, const uint8_t id[16])
  * so they are made durable first. Unlocks. */
 static int change_none(users *us, int rc)
 {
-    if (fdatasync(us->fd) != 0) {
+    if (tsdb_fdatasync(us->fd) != 0) {
         users_fail(us, "fdatasync");
         rc = TSDB_ERR_IO;
     } else if (us->have_header && sync_name(us, us->file_id) != 0) {
@@ -1704,7 +1705,7 @@ static int change_write(users *us, rbuf *b)
         }
         done += (size_t)w;
     }
-    if (fdatasync(us->fd) != 0) {
+    if (tsdb_fdatasync(us->fd) != 0) {
         cut_failed(us, b->base);
         users_fail(us, "fdatasync");
         rc = TSDB_ERR_IO;
@@ -1993,7 +1994,7 @@ int users_compact(users *us)
     /* errors before the rename fail just this call: nothing relies on the new file yet. The new file is locked
      * before its name is: a writer that opens the name after the rename waits until the directory fsync made the
      * rename durable (it would otherwise append to a file a power loss can take back, and acknowledge). */
-    if (rc || fstat(dfd, &d) != 0 || (rc = file_perms(tmp, fd, &d)) != 0 || fsync(fd) != 0 ||
+    if (rc || fstat(dfd, &d) != 0 || (rc = file_perms(tmp, fd, &d)) != 0 || tsdb_fsync(fd) != 0 ||
         fstat(fd, &st) != 0 || lock_fd(fd, F_WRLCK) != 0 || renameat(dfd, "USERS.compact", dfd, "USERS") != 0) {
         rc = TSDB_ERR_IO;
         unlinkat(dfd, "USERS.compact", 0);

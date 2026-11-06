@@ -26,6 +26,24 @@
 #include <sys/wait.h>
 #include <time.h>
 
+#include "portable.h"
+
+/* The real calls behind this file's fault injectors: the system call on Linux; on macOS, which has no stable system
+ * call numbers, the next definition of the name (libc's). */
+#ifdef __APPLE__
+#define real_write(fd, buf, n) REAL(write)(fd, buf, n)
+#define real_fdatasync(fd) REAL(fdatasync)(fd)
+#define real_fsync(fd) REAL(fsync)(fd)
+#define real_geteuid() REAL(geteuid)()
+#define real_renameat(ad, a, bd, b) REAL(renameat)(ad, a, bd, b)
+#else
+#define real_write(fd, buf, n) syscall(SYS_write, fd, buf, n)
+#define real_fdatasync(fd) (int)syscall(SYS_fdatasync, fd)
+#define real_fsync(fd) (int)syscall(SYS_fsync, fd)
+#define real_geteuid() (uid_t)syscall(SYS_geteuid)
+#define real_renameat(ad, a, bd, b) (int)syscall(SYS_renameat, ad, a, bd, b)
+#endif
+
 static int failures;
 
 #define CHECK(cond)                                                                                                \
@@ -57,12 +75,10 @@ static void (*after_rename)(const char *to); /* runs right after a real rename *
 
 static bool fd_is(int fd, const char *suffix)
 {
-    char link[64], path[4200];
-    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-    ssize_t n = readlink(link, path, sizeof path - 1);
+    char path[4200];
+    ssize_t n = fd_path(fd, path, sizeof path);
     if (n <= 0)
         return false;
-    path[n] = '\0';
     size_t s = strlen(suffix);
     return (size_t)n >= s && strcmp(path + n - s, suffix) == 0;
 }
@@ -72,11 +88,11 @@ ssize_t write(int fd, const void *buf, size_t n)
     if (f_op == F_WRITE && fd_is(fd, "/USERS")) {
         f_op = 0, f_fired++;
         if (f_partial && n > 1)
-            (void)syscall(SYS_write, fd, buf, n / 2);
+            (void)real_write(fd, buf, n / 2);
         errno = f_errno;
         return -1;
     }
-    return syscall(SYS_write, fd, buf, n);
+    return real_write(fd, buf, n);
 }
 
 int fdatasync(int fd)
@@ -89,7 +105,7 @@ int fdatasync(int fd)
         errno = EIO;
         return -1;
     }
-    int r = (int)syscall(SYS_fdatasync, fd);
+    int r = real_fdatasync(fd);
     struct stat st;
     if (r == 0 && users_file && fstat(fd, &st) == 0)
         f_synced = st.st_size, f_syncs++;
@@ -104,7 +120,7 @@ int fsync(int fd)
         errno = EIO;
         return -1;
     }
-    int r = (int)syscall(SYS_fsync, fd);
+    int r = real_fsync(fd);
     if (r == 0 && fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
         f_dirsyncs++;
     return r;
@@ -112,7 +128,7 @@ int fsync(int fd)
 
 /* another user than the directory's owner, without being one */
 static uid_t fake_euid = (uid_t)-1;
-uid_t geteuid(void) { return fake_euid != (uid_t)-1 ? fake_euid : (uid_t)syscall(SYS_geteuid); }
+uid_t geteuid(void) { return fake_euid != (uid_t)-1 ? fake_euid : real_geteuid(); }
 
 int renameat(int ad, const char *a, int bd, const char *b)
 {
@@ -121,11 +137,10 @@ int renameat(int ad, const char *a, int bd, const char *b)
         errno = EIO;
         return -1;
     }
-    int r = (int)syscall(SYS_renameat, ad, a, bd, b);
+    int r = real_renameat(ad, a, bd, b);
     if (r == 0 && after_rename) {
-        char link[64], to[4200];
-        snprintf(link, sizeof link, "/proc/self/fd/%d", bd);
-        ssize_t n = bd == AT_FDCWD || b[0] == '/' ? 0 : readlink(link, to, sizeof to - 1);
+        char to[4200];
+        ssize_t n = bd == AT_FDCWD || b[0] == '/' ? 0 : fd_path(bd, to, sizeof to);
         to[n > 0 ? n : 0] = '\0';
         snprintf(to + strlen(to), sizeof to - strlen(to), "%s%s", n > 0 ? "/" : "", b);
         after_rename(to);
@@ -207,7 +222,7 @@ static int copy_file(const char *from, const char *to, off_t len)
     int rc = a < 0 || b < 0 ? -1 : 0;
     while (rc == 0 && len > 0) {
         ssize_t r = read(a, buf, (size_t)(len < (off_t)sizeof buf ? len : (off_t)sizeof buf));
-        if (r <= 0 || syscall(SYS_write, b, buf, (size_t)r) != r)
+        if (r <= 0 || real_write(b, buf, (size_t)r) != r)
             rc = -1;
         else
             len -= r;
@@ -1067,7 +1082,7 @@ static void write_records(const char *dir, rbuf *b)
     char path[700];
     snprintf(path, sizeof path, "%s/USERS", dir);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    CHECK(fd >= 0 && syscall(SYS_write, fd, b->p, b->n) == (long)b->n);
+    CHECK(fd >= 0 && real_write(fd, b->p, b->n) == (long)b->n);
     close(fd);
 }
 
@@ -1123,7 +1138,7 @@ static void append_raw(const char *dir, rbuf *b, size_t from, size_t len)
     char path[700];
     snprintf(path, sizeof path, "%s/USERS", dir);
     int fd = open(path, O_WRONLY | O_APPEND);
-    CHECK(fd >= 0 && syscall(SYS_write, fd, b->p + from, len) == (long)len);
+    CHECK(fd >= 0 && real_write(fd, b->p + from, len) == (long)len);
     close(fd);
 }
 
@@ -1637,7 +1652,7 @@ static void unsynced_state(void)
     b.base = (uint64_t)file_size(path);
     rec_grant(&b, 2, SEL_ALL, R_READ, "", 0);
     int fd = open(path, O_WRONLY | O_APPEND);
-    CHECK(fd >= 0 && syscall(SYS_write, fd, b.p, b.n) == (long)b.n);
+    CHECK(fd >= 0 && real_write(fd, b.p, b.n) == (long)b.n);
     close(fd);
     free(b.p);
     /* a fresh writer: its directory fsync comes with its first change, even though the file is not new */
@@ -1774,7 +1789,7 @@ static void permissions(void)
     CHECK(mode_of(path) == 0600);
     /* another uid than the directory's owner (and not root): refused, nothing written */
     off_t size = file_size(path);
-    fake_euid = (uid_t)syscall(SYS_geteuid) + 1;
+    fake_euid = real_geteuid() + 1;
     if (fake_euid == 0)
         fake_euid = 2;
     CHECK(users_create(&w, 0, "carol", 0, &v, NULL) == TSDB_ERR_IO);
@@ -1966,7 +1981,7 @@ static void power_loss(void)
                     mkdir(db, 0755);
                     int fd = open(top, O_RDONLY | O_DIRECTORY); /* the shim's starting point is durable */
                     if (fd >= 0)
-                        syscall(SYS_fsync, fd), close(fd);
+                        (void)real_fsync(fd), close(fd);
                 }
                 char *add[] = {cli, db, "user", "add", "root", "--superuser", NULL};
                 char *rev[] = {cli, db, "user", "revoke", "acme/bob", "read", "prefix:acme/", NULL};
@@ -2018,7 +2033,7 @@ int main(int argc, char **argv)
 {
     snprintf(base_dir, sizeof base_dir, "%s", argc > 1 ? argv[1] : "/tmp");
     char self[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    ssize_t n = tp_self_exe(self, sizeof self);
     self[n > 0 ? n : 0] = '\0';
     char *slash = strrchr(self, '/');
     if (slash)
@@ -2050,7 +2065,12 @@ int main(int argc, char **argv)
     revoke_rules();
     permissions();
     links();
+#ifdef __APPLE__
+    printf("  (power loss in the CLI's add, revoke and compact: skipped on macOS, it needs the crashfs LD_PRELOAD shim)\n");
+    (void)power_loss;
+#else
     power_loss();
+#endif
     if (failures) {
         fprintf(stderr, "test_users: %d failures\n", failures);
         return 1;

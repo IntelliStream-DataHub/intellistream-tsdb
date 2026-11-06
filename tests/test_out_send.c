@@ -43,10 +43,19 @@ int main(void)
     for (size_t i = 0; i < BIG + MORE + SMALL; i++)
         data[i] = (uint8_t)(i * 7 + (i >> 8));
     int sv[2];
+#ifdef __APPLE__ /* compat.h's SOCK_CLOEXEC is not the kernel's; and tsdbd's sockets are non-blocking there */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        perror("socketpair");
+        return 1;
+    }
+    tsdb_sock_flags(sv[0], SOCK_CLOEXEC | SOCK_NONBLOCK);
+    tsdb_sock_flags(sv[1], SOCK_CLOEXEC);
+#else
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
         perror("socketpair");
         return 1;
     }
+#endif
     int small = 4096;
     setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
     setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
