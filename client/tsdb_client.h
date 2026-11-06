@@ -18,6 +18,7 @@
 #define TSDB_CLIENT_H
 
 #include "tsdb.h"
+#include "tsdb_wire.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -120,6 +121,87 @@ int tsdbc_insert_series(tsdbc *c, tsdb_sid series, const int64_t *ts, const floa
 int tsdbc_insert_async(tsdbc *c, const tsdb_sid *series, const int64_t *ts, const float *values, size_t n);
 int tsdbc_insert_series_async(tsdbc *c, tsdb_sid series, const int64_t *ts, const float *values, size_t n);
 int tsdbc_wait(tsdbc *c);
+
+/* ---- Protocol 13: errors with a body, retry, several nodes, TOPOLOGY and STATUS (docs/ha.md 9, 15.4) ----
+ *
+ * A request the server refuses before it does anything answers TSDB_ERR_UNAVAILABLE (the volume's storage is down or
+ * recovering) or TSDB_ERR_MOVED (another node owns the volume): definitely not applied. The client sends it again,
+ * after the retry_after_ms the reply names, until the time budget is spent (30 s; tsdbc_set_retry), and then returns
+ * the status. A MOVED goes to the node it names, or another node of the connect string (tsdbc_connect_nodes), and
+ * is sent again there. Pipelined inserts (tsdbc_insert_async) that were refused are sent again in order from the
+ * first refused one, those acknowledged after it too (last write wins keeps that safe: the same rows, the same
+ * order). Not retried: a query whose reply has begun (rows were delivered), QUERY_MULTI, and an I/O error or
+ * timeout (the request may have been applied: the caller decides). TSDB_ERR_PARTIAL and TSDB_ERR_DROPPED are
+ * returned with their bodies; a server of one node never sends them. DROPPED rows are never to be sent again.
+ * A single request that is refused for the whole budget costs that budget in latency: set it lower (or 0 for none)
+ * for a caller that has its own retry.
+ */
+#define TSDBC_ERR_ENTRIES 16 /* entries of a body kept; the totals say how many there were */
+typedef struct tsdbc_moved {
+    uint16_t vol;
+    uint32_t epoch;
+    uint8_t flags; /* TSDB_MOVED_HANDOFF */
+    uint32_t node_id;
+    char addr[TSDB_ADDR_MAX + 1]; /* empty: not named */
+} tsdbc_moved;
+typedef struct tsdbc_err_info {
+    int status;   /* TSDB_ERR_MOVED, _UNAVAILABLE, _PARTIAL, _DROPPED of the latest such reply; 0 before any */
+    int has_body; /* 0: the server sent none (protocol 12) or it was malformed: only the status is known */
+    unsigned nunavail, unavail_total; /* UNAVAILABLE entries (also PARTIAL's refused volumes) */
+    tsdb_unavail unavail[TSDBC_ERR_ENTRIES];
+    unsigned nmoved, moved_total;
+    tsdbc_moved moved[TSDBC_ERR_ENTRIES];
+    int has_resend;
+    uint64_t resend_from; /* of an UNAVAILABLE or MOVED for a frame that carried a seq */
+    unsigned nvols;       /* PARTIAL: the per-volume statuses, */
+    tsdb_partial_vol vols[TSDBC_ERR_ENTRIES];
+    uint32_t nrows;                /* the rows of the frame, */
+    const uint8_t *not_applied;    /* and their bitmap (bit i set: row i not applied); valid until the next call */
+    uint16_t dropped_vol;          /* DROPPED */
+    int64_t dropped_before;
+} tsdbc_err_info;
+/* The latest such reply's body (a copy; not_applied points into the connection's buffer); its status. */
+int tsdbc_last_error(const tsdbc *c, tsdbc_err_info *out);
+/* The UNAVAILABLE entries of the latest reply, up to cap; *n is how many there were. INVALID if it was not UNAVAILABLE. */
+int tsdbc_unavailable(const tsdbc *c, tsdb_unavail *e, unsigned cap, unsigned *n);
+/* The time budget of the retries of one request in ms (default TSDB_BUDGET_MS). 0 turns retries off, which is
+ * possible only while no request is in flight (it keeps its frame for a resend); TSDB_ERR_INVALID otherwise. */
+int tsdbc_set_retry(tsdbc *c, int budget_ms);
+/* Connects to "host:port,host:port,..." (IPv6 as [::1]:7070; the default port 7070): the list is shuffled once and
+ * the first node that answers (HELLO and login) is the connection; a MOVED without an address, or one whose
+ * address cannot be reached, goes on to the next node. TSDB_ERR_IO when none answers. The password is kept
+ * (and wiped at tsdbc_close) for the reconnects. */
+int tsdbc_connect_nodes(const char *nodes, const tsdbc_options *o, tsdbc **out);
+
+typedef struct tsdbc_node {
+    uint32_t node_id;
+    int alive;
+    char addr[TSDB_ADDR_MAX + 1]; /* empty: the node you are connected to */
+} tsdbc_node;
+typedef struct tsdbc_vol {
+    uint16_t vol;
+    uint8_t role, health; /* TSDB_ROLE_*, TSDB_HEALTH_* */
+    uint32_t epoch;
+    uint8_t reason; /* TSDB_WHY_* */
+    uint16_t domain; /* 0xffff: unknown */
+    int64_t since_ms;
+    uint32_t owner;  /* a node_id */
+    uint16_t server;
+    char addr[TSDB_ADDR_MAX + 1];
+    char *path; /* the volume's directory; empty unless the user is a superuser */
+} tsdbc_vol;
+typedef struct tsdbc_topology {
+    uint64_t gen;
+    size_t nnodes, nvols;
+    tsdbc_node *nodes;
+    tsdbc_vol *vols;
+} tsdbc_topo;
+/* TOPOLOGY (protocol 13): TSDB_ERR_INVALID from an older server. Free with tsdbc_topology_free. */
+int tsdbc_topology(tsdbc *c, tsdbc_topo **out);
+void tsdbc_topology_free(tsdbc_topo *t);
+/* STATUS (a superuser; protocol 13): key=value lines, malloc'd and NUL terminated (free it). */
+int tsdbc_status(tsdbc *c, char **text);
+
 
 int tsdbc_query_raw(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, tsdb_raw_fn fn, void *ctx);
 int tsdbc_query_points(tsdbc *c, tsdb_sid series, int64_t start, int64_t end, tsdb_points *out);

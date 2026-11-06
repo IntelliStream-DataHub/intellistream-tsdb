@@ -5,6 +5,7 @@
 #include "tsdb_crypto.h"
 #include "tsdb_pack.h"
 #include "tsdb_protocol.h"
+#include "tsdb_wire.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 #include <zstd.h>
 
@@ -57,7 +59,31 @@ struct tsdbc {
      * a frame may be unsent or unread, so the next reply read could answer an
      * earlier request. Every later call fails with TSDB_ERR_IO. */
     bool broken;
+    /* Protocol 13: retry, and the nodes to go to. Every request that can be sent again is kept (a copy of its frame)
+     * until its reply is read; UNAVAILABLE and MOVED, which mean "not applied", send it again (see read_reply and
+     * drain). */
+    int retry_ms;            /* the time budget of one request's retries; 0: none (tsdbc_set_retry) */
+    uint8_t last_op;         /* of the request sent last: where an error reply's body starts */
+    struct sent {
+        uint32_t id;
+        uint8_t op;
+        size_t len;
+        uint8_t *p;          /* the whole frame, header included */
+    } *q;
+    size_t qhead, qlen, qcap, qbytes;
+    bool stream_valid;       /* a reply of stream_id has been delivered in part: it cannot be sent again */
+    uint32_t stream_id;
+    bool gave_up;            /* read_reply stopped retrying (the budget): drain must not start over */
+    int timeout_ms;
+    tsdbc_err_info err;
+    char **nodes;            /* the connect string's nodes (shuffled once) for a reconnect after MOVED */
+    size_t nnodes, node_at;
+    char *user, *password, *password_file;
+    int connect_ms, require_auth;
 };
+
+#define QCAP_FRAMES 1024u            /* pipelined inserts kept for a resend: drain before there are more */
+#define QCAP_BYTES ((size_t)128 << 20)
 
 /* Waits up to ms (0: as long as the kernel does) for a connect to finish. */
 static int connect_within(int fd, const struct sockaddr *addr, socklen_t len, int ms)
@@ -129,17 +155,14 @@ int tsdbc_connect_auth(const char *host, int port, const char *user, const char 
     return tsdbc_connect_opts(host, port, &o, out);
 }
 
-int tsdbc_connect_opts(const char *host, int port, const tsdbc_options *o, tsdbc **out)
+/* A connected socket to host:port within connect_ms (0: as long as the kernel does), or -1. */
+static int open_socket(const char *host, int port, int connect_ms)
 {
-    *out = NULL;
-    if (o->user && (o->password ? !password_ok(o->password) : !o->password_file))
-        return TSDB_ERR_INVALID;
-    int connect_ms = o->connect_ms == 0 ? TSDBC_CONNECT_TIMEOUT_MS : o->connect_ms < 0 ? 0 : o->connect_ms;
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     struct addrinfo hints = {.ai_socktype = SOCK_STREAM}, *ai;
     if (getaddrinfo(host, portstr, &hints, &ai) != 0)
-        return TSDB_ERR_IO;
+        return -1;
     int fd = -1;
     for (struct addrinfo *a = ai; a; a = a->ai_next) {
         fd = socket(a->ai_family, a->ai_socktype | SOCK_CLOEXEC, a->ai_protocol);
@@ -157,10 +180,22 @@ int tsdbc_connect_opts(const char *host, int port, const tsdbc_options *o, tsdbc
         fd = -1;
     }
     freeaddrinfo(ai);
+    if (fd >= 0) {
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    }
+    return fd;
+}
+
+int tsdbc_connect_opts(const char *host, int port, const tsdbc_options *o, tsdbc **out)
+{
+    *out = NULL;
+    if (o->user && (o->password ? !password_ok(o->password) : !o->password_file))
+        return TSDB_ERR_INVALID;
+    int connect_ms = o->connect_ms == 0 ? TSDBC_CONNECT_TIMEOUT_MS : o->connect_ms < 0 ? 0 : o->connect_ms;
+    int fd = open_socket(host, port, connect_ms);
     if (fd < 0)
         return TSDB_ERR_IO;
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     tsdbc *c = calloc(1, sizeof *c);
     if (!c || !(c->rbuf = malloc(RBUF))) {
         free(c);
@@ -170,6 +205,14 @@ int tsdbc_connect_opts(const char *host, int port, const tsdbc_options *o, tsdbc
     c->fd = fd;
     c->rcap = RBUF;
     c->zlevel = 1;
+    c->retry_ms = TSDB_BUDGET_MS;
+    c->connect_ms = o->connect_ms;
+    c->require_auth = o->require_auth;
+    if ((o->user && !(c->user = strdup(o->user))) || (o->password && !(c->password = strdup(o->password))) ||
+        (o->password_file && !(c->password_file = strdup(o->password_file)))) {
+        tsdbc_close(c);
+        return TSDB_ERR_NOMEM;
+    }
     /* Best effort, as in the other clients: a socket without the probe options still works. */
     tsdbc_set_keepalive(c, TSDBC_KEEPALIVE_IDLE_S, TSDBC_KEEPALIVE_INTERVAL_S, TSDBC_KEEPALIVE_COUNT);
     /* HELLO and the login now, within the connect timeout: an older server is refused before any request reaches
@@ -203,6 +246,10 @@ const char *tsdbc_strerror(int err)
     case TSDB_ERR_TOO_MANY_BUCKETS: return "too many buckets";
     case TSDB_ERR_STOPPED: return "stopped";
     case TSDB_ERR_READONLY: return "database is read only";
+    case TSDB_ERR_MOVED: return "the volume is owned by another node";
+    case TSDB_ERR_UNAVAILABLE: return "the volume is unavailable (storage down or recovering); not applied";
+    case TSDB_ERR_PARTIAL: return "applied for some volumes only";
+    case TSDB_ERR_DROPPED: return "below the volume's drop watermark; never applied";
     case TSDB_ERR_DENIED: return "permission denied";
     case TSDB_ERR_AUTH: return "login failed or required";
     default: return "unknown error";
@@ -218,6 +265,18 @@ void tsdbc_close(tsdbc *c)
     if (c->pending && !c->broken)
         tsdbc_wait(c);
     close(c->fd);
+    for (size_t i = 0; i < c->qlen; i++)
+        free(c->q[c->qhead + i].p);
+    free(c->q);
+    for (size_t i = 0; i < c->nnodes; i++)
+        free(c->nodes[i]);
+    free(c->nodes);
+    free(c->user);
+    if (c->password) {
+        tsdb_wipe(c->password, strlen(c->password));
+        free(c->password);
+    }
+    free(c->password_file);
     free(c->rbuf);
     free(c->frame);
     ZSTD_freeCCtx(c->zc);
@@ -257,6 +316,80 @@ static int send_iov(tsdbc *c, struct iovec *iov, int n)
     return 0;
 }
 
+static int drain(tsdbc *c);
+
+/* The requests kept for a resend: those whose reply is not read yet, oldest first. Entries before c->expect are
+ * done and go; frames of a stream that was delivered in part are never sent again (see read_reply). */
+static void q_trim(tsdbc *c)
+{
+    while (c->qlen && (int32_t)(c->q[c->qhead].id - c->expect) < 0) {
+        c->qbytes -= c->q[c->qhead].len;
+        free(c->q[c->qhead].p);
+        c->qhead++;
+        c->qlen--;
+    }
+    if (!c->qlen)
+        c->qhead = 0;
+}
+
+static bool retained_op(uint8_t op)
+{
+    return op != TSDB_OP_HELLO && op != TSDB_OP_AUTH_START && op != TSDB_OP_AUTH_CONTINUE &&
+           op != TSDB_OP_QUERY_MULTI && op != TSDB_OP_CANCEL;
+}
+
+static struct sent *q_find(tsdbc *c, uint32_t id)
+{
+    for (size_t i = 0; i < c->qlen; i++)
+        if (c->q[c->qhead + i].id == id)
+            return &c->q[c->qhead + i];
+    return NULL;
+}
+
+/* Keeps a copy of the frame about to be sent: header and the pieces iov[0..n) of its payload. */
+static int q_keep(tsdbc *c, uint8_t op, uint32_t id, const struct iovec *iov, int n)
+{
+    c->last_op = op;
+    if (c->retry_ms <= 0 || !retained_op(op))
+        return 0;
+    if (c->pending && (c->qlen >= QCAP_FRAMES || c->qbytes >= QCAP_BYTES)) { /* the window: collect (and resend) */
+        int rc = drain(c);
+        if (rc)
+            return rc;
+    }
+    q_trim(c);
+    size_t total = 0;
+    for (int i = 0; i < n; i++)
+        total += iov[i].iov_len;
+    uint8_t *p = malloc(total ? total : 1);
+    if (!p)
+        return TSDB_ERR_NOMEM;
+    size_t at = 0;
+    for (int i = 0; i < n; i++) {
+        if (iov[i].iov_len)
+            memcpy(p + at, iov[i].iov_base, iov[i].iov_len);
+        at += iov[i].iov_len;
+    }
+    if (c->qhead + c->qlen == c->qcap) {
+        if (c->qhead) {
+            memmove(c->q, c->q + c->qhead, c->qlen * sizeof *c->q);
+            c->qhead = 0;
+        } else {
+            size_t cap = c->qcap ? c->qcap * 2 : 16;
+            struct sent *nq = realloc(c->q, cap * sizeof *nq);
+            if (!nq) {
+                free(p);
+                return TSDB_ERR_NOMEM;
+            }
+            c->q = nq;
+            c->qcap = cap;
+        }
+    }
+    c->q[c->qhead + c->qlen++] = (struct sent){id, op, total, p};
+    c->qbytes += total;
+    return 0;
+}
+
 /* Sends one request frame made of up to four payload pieces. */
 static int send_req(tsdbc *c, uint8_t op, const void *a, size_t alen, const void *b, size_t blen, const void *d,
                     size_t dlen, const void *e, size_t elen)
@@ -268,7 +401,8 @@ static int send_req(tsdbc *c, uint8_t op, const void *a, size_t alen, const void
     hdr[8] = op;
     struct iovec iov[5] = {{hdr, sizeof hdr}, {(void *)a, alen}, {(void *)b, blen}, {(void *)d, dlen},
                            {(void *)e, elen}};
-    return send_iov(c, iov, 5);
+    int rc = q_keep(c, op, id, iov, 5);
+    return rc ? rc : send_iov(c, iov, 5);
 }
 
 /* Sends one request frame made of the pieces parts[1..n) (parts[0] is filled
@@ -284,7 +418,8 @@ static int send_reqv(tsdbc *c, uint8_t op, struct iovec *parts, int n)
     memcpy(hdr + 4, &id, 4);
     hdr[8] = op;
     parts[0] = (struct iovec){hdr, sizeof hdr};
-    return send_iov(c, parts, n);
+    int rc = q_keep(c, op, id, parts, n);
+    return rc ? rc : send_iov(c, parts, n);
 }
 
 static int read_exact(tsdbc *c, void *dst, size_t n)
@@ -330,7 +465,8 @@ static int read_exact(tsdbc *c, void *dst, size_t n)
  * order of the requests, so any other id means the stream is out of step. A
  * reply counts as answered here; a stream's frames all carry its request's id,
  * and the readers of streams call stream_more for each frame before the last. */
-static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *blen)
+static void decode_err(tsdbc *c, int32_t st, const uint8_t *b, size_t n, uint8_t op);
+static int read_reply_raw(tsdbc *c, int32_t *status, const uint8_t **body, size_t *blen)
 {
     uint8_t hdr[13];
     int rc = read_exact(c, hdr, 13);
@@ -359,26 +495,381 @@ static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *b
     *body = c->frame;
     *blen = n;
     c->expect++;
+    if (*status == TSDB_ERR_MOVED || *status == TSDB_ERR_UNAVAILABLE || *status == TSDB_ERR_PARTIAL ||
+        *status == TSDB_ERR_DROPPED) {
+        struct sent *e = q_find(c, id);
+        decode_err(c, *status, c->frame, n, e ? e->op : c->last_op);
+    }
     return 0;
 }
 
-/* The frame just read is not the last of its stream. */
-static void stream_more(tsdbc *c) { c->expect--; }
+/* The frame just read is not the last of its stream: the rest of it is still to come, and a delivered part of a
+ * reply is never asked for again. */
+static void stream_more(tsdbc *c)
+{
+    c->expect--;
+    c->stream_valid = true;
+    c->stream_id = c->expect;
+}
+
+/* ----------------------------------------------- the body of an error reply, retry, other nodes */
+
+static int64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void sleep_ms(int64_t ms)
+{
+    struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
+    while (ms > 0 && nanosleep(&ts, &ts) != 0 && errno == EINTR)
+        ;
+}
+
+/* c->err from the body of an error reply: after the op's own error shape (tsdb_wire_error_shape). A body that
+ * is missing (an older server) or malformed leaves has_body 0: the status alone still tells what to do. */
+static void decode_err(tsdbc *c, int32_t st, const uint8_t *b, size_t n, uint8_t op)
+{
+    tsdbc_err_info *e = &c->err;
+    memset(e, 0, sizeof *e);
+    e->status = st;
+    int off = tsdb_wire_error_shape(op);
+    if (off < 0 || (size_t)off > n)
+        return;
+    b += off;
+    n -= (size_t)off;
+    unsigned total = 0;
+    size_t used = 0;
+    switch (st) {
+    case TSDB_ERR_UNAVAILABLE: {
+        if (tsdb_wire_get_unavail(b, n, e->unavail, TSDBC_ERR_ENTRIES, &total, &used) != 0)
+            return;
+        int rs = tsdb_wire_get_resend(b + used, n - used, &e->resend_from);
+        if (rs < 0)
+            return;
+        e->has_resend = rs;
+        e->unavail_total = total;
+        e->nunavail = total < TSDBC_ERR_ENTRIES ? total : TSDBC_ERR_ENTRIES;
+        e->has_body = 1;
+        return;
+    }
+    case TSDB_ERR_MOVED: {
+        tsdb_moved m[TSDBC_ERR_ENTRIES];
+        if (tsdb_wire_get_moved(b, n, m, TSDBC_ERR_ENTRIES, &total, &used) != 0)
+            return;
+        int rs = tsdb_wire_get_resend(b + used, n - used, &e->resend_from);
+        if (rs < 0)
+            return;
+        e->has_resend = rs;
+        e->moved_total = total;
+        e->nmoved = total < TSDBC_ERR_ENTRIES ? total : TSDBC_ERR_ENTRIES;
+        for (unsigned i = 0; i < e->nmoved; i++) {
+            e->moved[i].vol = m[i].vol;
+            e->moved[i].epoch = m[i].epoch;
+            e->moved[i].flags = m[i].flags;
+            e->moved[i].node_id = m[i].node_id;
+            memcpy(e->moved[i].addr, m[i].addr, m[i].addr_len);
+            e->moved[i].addr[m[i].addr_len] = 0;
+        }
+        e->has_body = 1;
+        return;
+    }
+    case TSDB_ERR_PARTIAL: {
+        tsdb_partial_vol v[TSDBC_ERR_ENTRIES];
+        unsigned nv, ne;
+        uint32_t rows;
+        const uint8_t *bits;
+        if (tsdb_wire_get_partial(b, n, v, TSDBC_ERR_ENTRIES, &nv, &rows, &bits, e->unavail, TSDBC_ERR_ENTRIES,
+                                  &ne) != 0)
+            return;
+        e->nvols = nv < TSDBC_ERR_ENTRIES ? nv : TSDBC_ERR_ENTRIES;
+        memcpy(e->vols, v, e->nvols * sizeof v[0]);
+        e->nrows = rows;
+        e->not_applied = bits;
+        e->unavail_total = ne;
+        e->nunavail = ne < TSDBC_ERR_ENTRIES ? ne : TSDBC_ERR_ENTRIES;
+        e->has_body = 1;
+        return;
+    }
+    case TSDB_ERR_DROPPED:
+        if (tsdb_wire_get_dropped(b, n, &e->dropped_vol, &e->dropped_before) == 0)
+            e->has_body = 1;
+        return;
+    }
+}
+
+int tsdbc_last_error(const tsdbc *c, tsdbc_err_info *out)
+{
+    *out = c->err;
+    return c->err.status;
+}
+
+int tsdbc_unavailable(const tsdbc *c, tsdb_unavail *e, unsigned cap, unsigned *n)
+{
+    if (c->err.status != TSDB_ERR_UNAVAILABLE && c->err.status != TSDB_ERR_PARTIAL)
+        return TSDB_ERR_INVALID;
+    unsigned k = c->err.nunavail < cap ? c->err.nunavail : cap;
+    if (e)
+        memcpy(e, c->err.unavail, k * sizeof *e);
+    if (n)
+        *n = c->err.unavail_total;
+    return 0;
+}
+
+int tsdbc_set_retry(tsdbc *c, int budget_ms)
+{
+    if (budget_ms < 0)
+        return TSDB_ERR_INVALID;
+    if (budget_ms == 0 && c->retry_ms > 0 && c->qlen == 0)
+        c->retry_ms = 0;
+    else if (budget_ms > 0)
+        c->retry_ms = budget_ms;
+    else
+        return TSDB_ERR_INVALID; /* with requests in flight (they hold their frames) */
+    return 0;
+}
+
+/* "host:port", "[v6]:port" or "host" (the default port) into host and port. */
+static int parse_node(const char *s, char *host, size_t cap, int *port)
+{
+    while (*s == ' ')
+        s++;
+    const char *end = s + strlen(s);
+    while (end > s && end[-1] == ' ')
+        end--;
+    if (end == s)
+        return -1;
+    const char *colon = NULL, *h0 = s, *h1 = end;
+    if (*s == '[') {
+        const char *rb = memchr(s, ']', (size_t)(end - s));
+        if (!rb)
+            return -1;
+        h0 = s + 1;
+        h1 = rb;
+        if (rb + 1 < end)
+            colon = rb[1] == ':' ? rb + 1 : NULL;
+        if (rb + 1 < end && !colon)
+            return -1;
+    } else {
+        for (const char *q = s; q < end; q++)
+            if (*q == ':')
+                colon = colon ? s - 1 : q; /* a second colon: a bare IPv6 address has no port to read */
+        if (colon == s - 1) {
+            colon = NULL;
+        } else if (colon) {
+            h1 = colon;
+        }
+    }
+    *port = TSDB_DEFAULT_PORT;
+    if (colon) {
+        char *pe;
+        long v = strtol(colon + 1, &pe, 10);
+        if (pe == colon + 1 || pe != end || v < 1 || v > 65535)
+            return -1;
+        *port = (int)v;
+    }
+    size_t hl = (size_t)(h1 - h0);
+    if (hl == 0 || hl >= cap)
+        return -1;
+    memcpy(host, h0, hl);
+    host[hl] = 0;
+    return 0;
+}
+
+static int handshake(tsdbc *c, int connect_ms)
+{
+    tsdbc_options o = {.user = c->user, .password = c->password, .password_file = c->password_file,
+                       .require_auth = c->require_auth};
+    struct timeval tv = {connect_ms / 1000, (connect_ms % 1000) * 1000}, none = {0, 0};
+    if (connect_ms > 0)
+        setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    int rc = check_server_version(c);
+    if (rc == 0)
+        rc = login(c, &o);
+    if (connect_ms > 0)
+        setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none);
+    return rc;
+}
+
+/* Moves the connection to host:port (the requests kept stay kept: the caller sends them again). On failure the
+ * old connection is as it was. */
+static int reconnect_to(tsdbc *c, const char *host, int port)
+{
+    int connect_ms = c->connect_ms == 0 ? TSDBC_CONNECT_TIMEOUT_MS : c->connect_ms < 0 ? 0 : c->connect_ms;
+    int fd = open_socket(host, port, connect_ms);
+    if (fd < 0)
+        return TSDB_ERR_IO;
+    int old = c->fd;
+    c->fd = fd;
+    size_t pending = c->pending;
+    uint32_t next = c->next_id, expect = c->expect;
+    c->pending = 0;
+    c->rlen = c->roff = 0;
+    c->broken = false;
+    c->server_version = 0;
+    c->hello_flags = 0;
+    c->scram = false;
+    c->expect = c->next_id; /* the handshake's own ids: the server only echoes them */
+    tsdbc_set_keepalive(c, TSDBC_KEEPALIVE_IDLE_S, TSDBC_KEEPALIVE_INTERVAL_S, TSDBC_KEEPALIVE_COUNT);
+    int rc = handshake(c, connect_ms);
+    c->pending = pending;
+    c->next_id = next;
+    if (rc) {
+        close(fd);
+        c->fd = old;
+        c->broken = false;
+        c->expect = expect;
+        return rc;
+    }
+    close(old);
+    if (c->timeout_ms > 0)
+        tsdbc_set_timeout(c, c->timeout_ms);
+    return 0;
+}
+
+/* After MOVED: to the address it names, else to another node of the connect string. 0 when connected somewhere
+ * new; nonzero when there is nowhere to go (the status stands). */
+static int follow_moved(tsdbc *c, const tsdbc_err_info *e)
+{
+    char host[256];
+    int port;
+    for (unsigned i = 0; i < e->nmoved; i++) {
+        if (e->moved[i].addr[0] && parse_node(e->moved[i].addr, host, sizeof host, &port) == 0 &&
+            reconnect_to(c, host, port) == 0)
+            return 0;
+    }
+    for (size_t k = 1; k < c->nnodes; k++) {
+        size_t i = (c->node_at + k) % c->nnodes;
+        if (parse_node(c->nodes[i], host, sizeof host, &port) == 0 && reconnect_to(c, host, port) == 0) {
+            c->node_at = i;
+            return 0;
+        }
+    }
+    return TSDB_ERR_NOTFOUND;
+}
+
+static uint32_t retry_delay_ms(const tsdbc_err_info *e)
+{
+    if (e->status == TSDB_ERR_MOVED)
+        return e->nmoved && (e->moved[0].flags & TSDB_MOVED_HANDOFF) ? 200 : 0;
+    if (!e->has_body || !e->nunavail)
+        return 1000; /* a server without the body (protocol 12) */
+    return tsdb_wire_retry_after(e->unavail, e->nunavail);
+}
+
+static bool retryable_status(int32_t st) { return st == TSDB_ERR_UNAVAILABLE || st == TSDB_ERR_MOVED; }
+
+/* One step of retrying the request whose reply was UNAVAILABLE or MOVED (c->err describes it): waits the server's
+ * retry_after_ms, follows a MOVED. 1: send the request again; 0: give up, the status stands (the budget would be
+ * over, or a MOVED with nowhere to go). deadline is 0 until the first refusal of this request. */
+static int retry_step(tsdbc *c, const tsdbc_err_info *e, int64_t *deadline, unsigned *tries)
+{
+    int64_t now = mono_ms();
+    if (!*deadline)
+        *deadline = now + c->retry_ms;
+    int64_t delay = retry_delay_ms(e);
+    if (e->status == TSDB_ERR_MOVED && *tries) /* a MOVED that keeps coming: not a tight loop */
+        delay = delay > 50 * (int64_t)*tries ? delay : 50 * (int64_t)*tries > 1000 ? 1000 : 50 * (int64_t)*tries;
+    if (now + delay > *deadline)
+        return 0;
+    sleep_ms(delay);
+    (*tries)++;
+    if (e->status == TSDB_ERR_MOVED && follow_moved(c, e) != 0)
+        return 0;
+    return 1;
+}
+
+static int send_kept(tsdbc *c, const struct sent *e)
+{
+    struct iovec iov = {e->p, e->len};
+    return send_iov(c, &iov, 1);
+}
+
+/* read_reply_raw, and a request the server refused before doing anything (UNAVAILABLE, MOVED) is sent again, after
+ * what the reply says, while it is the only one in flight and none of its reply has been delivered: a request,
+ * and a streamed reply that has not begun. Past the time budget (tsdbc_set_retry) the status is returned and
+ * c->err says why. Several requests in flight (pipelined inserts) are drain's: it resends them in order. */
+static int read_reply(tsdbc *c, int32_t *status, const uint8_t **body, size_t *blen)
+{
+    int64_t deadline = 0;
+    unsigned tries = 0;
+    c->gave_up = false;
+    for (;;) {
+        uint32_t id = c->expect;
+        int rc = read_reply_raw(c, status, body, blen);
+        if (rc || !retryable_status(*status) || c->retry_ms <= 0)
+            return rc;
+        struct sent *e = q_find(c, id);
+        bool alone = e != NULL;
+        for (size_t i = 0; alone && i < c->qlen; i++)
+            if (c->q[c->qhead + i].id != id && (int32_t)(c->q[c->qhead + i].id - c->expect) >= 0)
+                alone = false;
+        if (!alone || (c->stream_valid && c->stream_id == id))
+            return 0;
+        tsdbc_err_info err = c->err;
+        if (!retry_step(c, &err, &deadline, &tries)) {
+            c->gave_up = true;
+            return 0;
+        }
+        e = q_find(c, id); /* the queue is not touched by a reconnect, but be sure of the pointer */
+        c->expect = id;
+        if ((rc = send_kept(c, e)) != 0)
+            return rc;
+    }
+}
 
 /* Reads the pipelined acknowledgements, keeping the first error for tsdbc_wait. */
 static int drain(tsdbc *c)
 {
-    while (c->pending) {
-        int32_t st;
-        const uint8_t *b;
-        size_t n;
-        int rc = read_reply(c, &st, &b, &n);
-        if (rc)
-            return rc;
-        c->pending--;
-        if (st && !c->pending_rc)
-            c->pending_rc = st;
+    int64_t deadline = 0;
+    unsigned tries = 0;
+    for (;;) {
+        bool failed = false;
+        uint32_t first_id = 0;
+        tsdbc_err_info first_err;
+        while (c->pending) {
+            int32_t st;
+            const uint8_t *b;
+            size_t n;
+            uint32_t id = c->expect;
+            int rc = read_reply(c, &st, &b, &n);
+            if (rc)
+                return rc;
+            c->pending--;
+            if (retryable_status(st) && !c->gave_up && c->retry_ms > 0 && q_find(c, id)) {
+                if (!failed) {
+                    failed = true;
+                    first_id = id;
+                    first_err = c->err;
+                }
+                continue; /* the rest of the replies are read first: the frames after it go again, in order */
+            }
+            if (st && !c->pending_rc)
+                c->pending_rc = st;
+        }
+        if (!failed)
+            break;
+        if (!retry_step(c, &first_err, &deadline, &tries)) {
+            if (!c->pending_rc)
+                c->pending_rc = first_err.status;
+            break;
+        }
+        /* every frame from the first refused one, in order, also those that were acknowledged after it: a later
+         * frame of the same series must not be overtaken by the earlier one's resend */
+        size_t i = 0;
+        while (i < c->qlen && c->q[c->qhead + i].id != first_id)
+            i++;
+        c->expect = first_id;
+        for (; i < c->qlen; i++) {
+            int rc = send_kept(c, &c->q[c->qhead + i]);
+            if (rc)
+                return rc;
+            c->pending++;
+        }
     }
+    q_trim(c);
     return 0;
 }
 
@@ -987,6 +1478,7 @@ int tsdbc_set_timeout(tsdbc *c, int ms)
     if (setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0 ||
         setsockopt(c->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0)
         return TSDB_ERR_IO;
+    c->timeout_ms = ms;
     return 0;
 }
 
@@ -2476,4 +2968,182 @@ void tsdbc_series_results_free(tsdb_series_result *r, size_t n)
         free((void *)r[i].buckets);
     }
     free(r);
+}
+
+/* ------------------------------------------------- nodes, TOPOLOGY and STATUS (protocol 13) */
+
+static uint64_t shuffle_next(uint64_t *x)
+{
+    *x ^= *x << 13;
+    *x ^= *x >> 7;
+    *x ^= *x << 17;
+    return *x;
+}
+
+int tsdbc_connect_nodes(const char *nodes, const tsdbc_options *o, tsdbc **out)
+{
+    *out = NULL;
+    if (!nodes)
+        return TSDB_ERR_INVALID;
+    char **list = NULL;
+    size_t n = 0;
+    int rc = 0;
+    const char *p = nodes;
+    while (*p) {
+        const char *e = strchr(p, ',');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        char host[256];
+        int port;
+        char *item = strndup(p, l);
+        char **nl = item ? realloc(list, (n + 1) * sizeof *list) : NULL;
+        if (!nl) {
+            free(item);
+            rc = TSDB_ERR_NOMEM;
+            break;
+        }
+        list = nl;
+        if (parse_node(item, host, sizeof host, &port) != 0) {
+            free(item);
+            rc = TSDB_ERR_INVALID;
+            break;
+        }
+        list[n++] = item;
+        p += l + (e ? 1 : 0);
+        if (!e)
+            break;
+    }
+    if (rc == 0 && n == 0)
+        rc = TSDB_ERR_INVALID;
+    /* shuffled once, so a fleet of clients spreads over the nodes */
+    uint64_t x = (uint64_t)mono_ms() * 0x9e3779b97f4a7c15ull ^ (uint64_t)(uintptr_t)list ^ ((uint64_t)getpid() << 32);
+    if (!x)
+        x = 1;
+    for (size_t i = n; rc == 0 && i > 1; i--) {
+        size_t j = (size_t)(shuffle_next(&x) % i);
+        char *t = list[i - 1];
+        list[i - 1] = list[j];
+        list[j] = t;
+    }
+    for (size_t i = 0; rc == 0 && i < n; i++) {
+        char host[256];
+        int port;
+        parse_node(list[i], host, sizeof host, &port);
+        tsdbc *c;
+        int r = tsdbc_connect_opts(host, port, o, &c);
+        if (r == 0) {
+            c->nodes = list;
+            c->nnodes = n;
+            c->node_at = i;
+            *out = c;
+            return 0;
+        }
+        rc = r;
+        if (r == TSDB_ERR_IO)
+            rc = 0; /* this node is not there: the next one */
+        if (r == TSDB_ERR_IO && i + 1 == n)
+            rc = TSDB_ERR_IO;
+    }
+    for (size_t i = 0; i < n; i++)
+        free(list[i]);
+    free(list);
+    return rc ? rc : TSDB_ERR_IO;
+}
+
+static void copy_addr(char *dst, const char *src, size_t n)
+{
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+int tsdbc_topology(tsdbc *c, tsdbc_topo **out)
+{
+    *out = NULL;
+    if (tsdbc_server_version(c) < 13)
+        return TSDB_ERR_INVALID; /* the op does not exist there */
+    const uint8_t *b;
+    size_t n;
+    int rc = call(c, TSDB_OP_TOPOLOGY, NULL, 0, NULL, 0, &b, &n);
+    if (rc)
+        return rc;
+    tsdb_topo_it it;
+    if (tsdb_wire_topo_open(&it, b, n) != 0)
+        return TSDB_ERR_CORRUPT;
+    tsdbc_topo *t = calloc(1, sizeof *t);
+    if (!t)
+        return TSDB_ERR_NOMEM;
+    t->gen = it.gen;
+    t->nodes = calloc(it.nn ? it.nn : 1, sizeof *t->nodes);
+    if (!t->nodes) {
+        free(t);
+        return TSDB_ERR_NOMEM;
+    }
+    tsdb_topo_node nd;
+    int r;
+    while ((r = tsdb_wire_topo_node(&it, &nd)) == 1) {
+        tsdbc_node *o = &t->nodes[t->nnodes++];
+        o->node_id = nd.node_id;
+        o->alive = nd.alive;
+        copy_addr(o->addr, nd.addr, nd.addr_len);
+    }
+    if (r < 0) {
+        tsdbc_topology_free(t);
+        return TSDB_ERR_CORRUPT;
+    }
+    t->vols = calloc(it.nv ? it.nv : 1, sizeof *t->vols);
+    if (!t->vols) {
+        tsdbc_topology_free(t);
+        return TSDB_ERR_NOMEM;
+    }
+    tsdb_topo_vol v;
+    while ((r = tsdb_wire_topo_vol(&it, &v)) == 1) {
+        tsdbc_vol *o = &t->vols[t->nvols++];
+        o->vol = v.vol;
+        o->role = v.role;
+        o->health = v.health;
+        o->epoch = v.epoch;
+        o->reason = v.reason;
+        o->domain = v.domain;
+        o->since_ms = v.since_ms;
+        o->owner = v.owner;
+        o->server = v.server;
+        copy_addr(o->addr, v.addr, v.addr_len);
+        o->path = strndup(v.path, v.path_len);
+        if (!o->path) {
+            tsdbc_topology_free(t);
+            return TSDB_ERR_NOMEM;
+        }
+    }
+    if (r < 0) {
+        tsdbc_topology_free(t);
+        return TSDB_ERR_CORRUPT;
+    }
+    *out = t;
+    return 0;
+}
+
+void tsdbc_topology_free(tsdbc_topo *t)
+{
+    if (!t)
+        return;
+    for (size_t i = 0; i < t->nvols; i++)
+        free(t->vols[i].path);
+    free(t->vols);
+    free(t->nodes);
+    free(t);
+}
+
+int tsdbc_status(tsdbc *c, char **text)
+{
+    *text = NULL;
+    if (tsdbc_server_version(c) < 13)
+        return TSDB_ERR_INVALID;
+    const uint8_t *b;
+    size_t n;
+    int rc = call(c, TSDB_OP_STATUS, NULL, 0, NULL, 0, &b, &n);
+    if (rc)
+        return rc;
+    if (n < 4 || tsdb_wire_rd32(b) != n - 4)
+        return TSDB_ERR_CORRUPT;
+    *text = strndup((const char *)b + 4, n - 4);
+    return *text ? 0 : TSDB_ERR_NOMEM;
 }
