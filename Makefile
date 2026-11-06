@@ -184,11 +184,39 @@ $(B)/test_threads: tests/test_threads.c src/internal.h $(LIB)
 $(B)/test_buckets: tests/test_buckets.c src/internal.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS) -lm
 
+# The replication core (src/repl.c, sans-IO) under its simulator (docs/design-cluster.md §13.1). sim_repl_mut has
+# the planted bugs (MUT() in repl.c) that tests/sim_repl.sh checks the checker catches.
+$(B)/sim_repl: tests/sim_repl.c src/repl.c src/repl.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/sim_repl.c src/repl.c
+
+$(B)/sim_repl_mut: tests/sim_repl.c src/repl.c src/repl.h | $(B)
+	$(CC) $(CFLAGS) -DREPL_MUTANTS -Isrc -o $@ tests/sim_repl.c src/repl.c
+
+# Scenarios the simulator reaches rarely or never, driven by hand (tests/test_repl.c); tests/sim_repl.sh checks
+# with test_repl_mut that each fails with the bug it guards.
+$(B)/test_repl: tests/test_repl.c src/repl.c src/repl.h | $(B)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/test_repl.c src/repl.c
+
+$(B)/test_repl_mut: tests/test_repl.c src/repl.c src/repl.h | $(B)
+	$(CC) $(CFLAGS) -DREPL_MUTANTS -Isrc -o $@ tests/test_repl.c src/repl.c
+
+$(B)/repl.o: src/repl.h
+
+# `make sim-repl-soak [SOAK_SEEDS=1000000] [SOAK_JOBS=n]`: the long run, then every planted bug with 20,000 seeds.
+SOAK_SEEDS ?= 1000000
+SOAK_JOBS  ?= $(shell nproc)
+sim-repl-soak: $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
+	B=$(B) tests/sim_repl.sh soak $(SOAK_SEEDS) $(SOAK_JOBS)
+
+sim-repl-mutants: $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
+	B=$(B) tests/sim_repl.sh mutants
+
 $(B)/test_failstop: tests/test_failstop.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send
+test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test_buckets $(B)/test_shared $(B)/test_compat $(B)/test_failstop $(B)/test_damage $(B)/test_types $(B)/test_delete $(B)/test_levels $(B)/test_server $(B)/test_server_multi $(B)/test_stability $(B)/test_ports $(B)/test_client $(B)/test_follow $(B)/test_volumes $(B)/test_group $(B)/test_lttb $(B)/test_twa $(B)/test_spread $(B)/test_limits $(B)/test_small_parts $(B)/test_classes $(B)/test_crafted $(B)/test_gindex $(B)/test_tzfiles $(B)/test_export $(B)/test_crypto $(B)/test_users $(B)/test_auth $(B)/test_auth_ops $(B)/tsdb-bench $(FUZZ_HARNESSES:%=$(B)/fuzz-%) $(B)/tsdbd $(CRASHFS_SO) $(B)/tsdb $(B)/fuzz_frames $(B)/test_out_send $(B)/sim_repl $(B)/sim_repl_mut $(B)/test_repl $(B)/test_repl_mut
 	./$(B)/test_tsdb
+	B=$(B) tests/sim_repl.sh quick
 	./$(B)/test_sched
 	./$(B)/test_multi
 	./$(B)/test_threads
@@ -520,7 +548,7 @@ integration-tests-dist: dist integ-rust integ-python integ-java
 	    $(ZSTD_LIB) -lpthread -lm
 	python3 tests/integration/run.py --bin-dir $(DIST_B) --itc $(DIST_B)/itc $(INTEG_ARGS)
 
-.PHONY: check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
+.PHONY: sim-repl-soak sim-repl-mutants check-version fuzz-frames jepsen-selftest bench-clients-smoke hooks all test asan ubsan-check tsan clean jepsen test-almalinux10 test-rust test-python test-java test-java-embedded test-clients python-sdist test-python-sdist test-licenses dist dist-test dist-check-almalinux10 dist-check-sandybridge integ-rust integ-python integ-java integration-tests integration-tests-dist integration-selftest
 
 $(B)/codec-bench: tools/codec-bench.c tools/common.h tools/datasets.h $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
