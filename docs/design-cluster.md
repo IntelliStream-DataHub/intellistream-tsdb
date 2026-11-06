@@ -2,7 +2,7 @@
 
 Status: design, not implemented. Branch `cluster-design`, written on 2026-11-05 from main at 9b00186. Code references
 are `file:line` at that commit. Builds after the 0.9.0 tag; what must be in 1.0 so that the cluster is an addition and
-not a break is §11.
+not a break is §11. Revised on 2026-11-06 with the user's answers to its open questions (D1-D6 below).
 
 Decided by the user on 2026-11-05 and not reopened here:
 1. A cluster (for example 8 servers) stays up, and keeps almost all of its performance, when one or two servers go
@@ -11,12 +11,29 @@ Decided by the user on 2026-11-05 and not reopened here:
    the cold tier gets its own design).
 3. Raft stays **off the insert path** (the stance of 2026-10-24: Raft-replicated inserts were called a nightmare).
 
+Decided by the user on 2026-11-06 (the open questions of the first draft):
+- **D1. Minimum ISR 1 by default**, with an alert and rebuild priority for volumes down to one in-sync copy;
+  `min_isr = 2`, or replication 4, as per-volume options for data that must survive a third loss (C11, §6.6, §8.4).
+- **D2. The Raft core is copied into tsdb under Apache 2.0.** The user, as owner of intellistream-objects, grants
+  copying its `src/raft` (core, log, wire, simulator) into tsdb under Apache 2.0, with Apache headers and a sync
+  script (C3, §2.3). intellistream-objects should get a LICENSE (or a grant file naming Apache 2.0) as well, and
+  tsdb's [licenses.md](licenses.md) lists the copied files when they land (build plan step 1).
+- **D3. The cluster replaces ha.md for new work.** ha.md's client rules, streams, forwarding and drop watermark are
+  part of this design now; its NFS lock, ledger and SUSPECT state are dropped. NFS followers stay for single-server
+  use. ha.md carries a note at its top saying so.
+- **D4. Name slots**: names stay unique in the whole cluster, which keeps the decision of 2026-11-02 (C18, §3.3).
+- **D5. Reads from leaders by default**; `REPLICA_OK` per query or per client (C15, §7). The user did not answer this
+  one: the recommendation is the default, and the user may change it.
+- **D6. The 1.0 room of §11** (format 9 shared with the change feed, the position range in part headers, META
+  `requires=`, clients retrying MOVED and UNAVAILABLE, connect strings with several servers) lands in a 0.9.x before
+  the 1.0 freeze (build plan step 0). Not answered either; the recommendation is the default, as for D5.
+
 Scope: the replicated hot tier. The metadata group, placement, the write path to in-sync replicas, failover and
 fencing, reads, rebuild, the two-servers-down case, room in the 1.0 format and protocol, tests and a build plan.
 **Not here**: erasure coding, shard placement, ISA-L, degraded reads. §9 says only what the hot tier hands to a
 cold tier and what it needs from one.
 
-Related designs: [ha.md](ha.md) (failover over shared NFS storage; its client rules, streams, forwarding and drop
+Related designs: [ha.md](ha.md) (failover over shared NFS storage, superseded by this design for new work (D3); its client rules, streams, forwarding and drop
 watermark carry over, its NFS lock arbiter does not), [design-series64.md](design-series64.md) (ids
 `(volume + 1) << 32 | local`; names unique in the whole database), design-cdc.md on branch `cdc-design` (WAL record
 version 2 with a per-volume number for every row: the cluster uses the same number), [design-auth.md](design-auth.md)
@@ -43,7 +60,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
   in-sync replica with the longest log, raises the epoch, and clients follow TOPOLOGY and MOVED as in ha.md §9.
   Writes to those volumes pause for about 4 s; every other volume does not notice.
 - **Two servers down**: every volume keeps at least one in-sync replica, so writes go on. A volume that lost two of its
-  three replicas is acknowledged on one disk until a new replica has caught up (open question 1).
+  three replicas is acknowledged on one disk until a new replica has caught up (D1).
 - **Rebuild** copies a replica's immutable parts by hard-linked snapshot from any in-sync replica, throttled, then
   catches up from the leader's WAL. A server back after a short outage only catches up.
 - **Cold tier boundary**: a settled, idle, old partition is handed to a cold tier through four calls (put, read
@@ -57,8 +74,8 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 
 | # | Assumption | What changes if it does not hold |
 |---|---|---|
-| A1 | **Shared-nothing.** Each server has its own disks; the cluster does not use the NFS/ZFS servers. | With shared storage, ha.md (one copy, failover by lock) is cheaper; this design and ha.md are alternatives for the same need (open question 3). |
-| A2 | **Writes go on with two servers down, and no acknowledged write is lost** when up to two servers and their disks are lost. Hence: replication factor 3, acknowledge only after every in-sync replica has the write durable, and an in-sync set that shrinks on failure (Kafka's ISR). | A minimum in-sync size of 2 (open question 1) or a replication factor of 4 trades availability or disk for safety against a third loss. |
+| A1 | **Shared-nothing.** Each server has its own disks; the cluster does not use the NFS/ZFS servers. | With shared storage, ha.md (one copy, failover by lock) is cheaper; this design and ha.md are alternatives for the same need; the user chose this one for new work (D3). |
+| A2 | **Writes go on with two servers down, and no acknowledged write is lost** when up to two servers and their disks are lost. Hence: replication factor 3, acknowledge only after every in-sync replica has the write durable, and an in-sync set that shrinks on failure (Kafka's ISR). | A minimum in-sync size of 2 (a per-volume option, D1) or a replication factor of 4 trades availability or disk for safety against a third loss. |
 | A3 | **Design now, build after the 0.9.0 tag**; the 1.0 format and protocol leave room (§11), so the cluster arrives in a 1.x without a break. | If the cluster must be in 1.0, the build plan (§14) moves before the freeze. |
 | A4 | The servers are in one data center, 25 GbE or faster between them, round trip below 100 µs, NVMe with `fdatasync` around 0.7 ms (the README's drive). | Across sites, every small insert pays a WAN round trip. |
 | A5 | Clocks are disciplined by chrony or ntpd with a bounded slew rate (500 ppm, chrony `maxslewrate 500`). Only read leases depend on it (§7); write safety does not. | Leader reads must confirm leadership per read (one round trip) instead of a lease. |
@@ -69,7 +86,7 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 |---|---|---|---|
 | C1 | **The volume is the unit** of replication, leadership and placement, as in ha.md D1. A cluster has many: by default 16 led per server (128 on 8 servers), so a lost server's work and its rebuild spread over all the others. | One volume per server; per series; per partition | A series id names its volume (series64), so routing needs no table beyond volume to replicas. One volume per server would put a dead server's whole load on its two replica holders, and rebuild from two sources. Finer units would need a map the size of the data. |
 | C2 | **Metadata in a Raft group of 5 voters** (3 below 5 servers; at most 5 at any size). Other servers are not Raft members: they follow the applied state through a watch stream from any voter. | etcd or ZooKeeper; every server a voter; the NFS lock of ha.md | The user ruled out an external coordinator (ha.md D2). More voters only slow commits. A shared-nothing cluster has no shared lock. 5 voters survive 2 losses, which is the requirement. |
-| C3 | **The user's Raft core**, copied into `src/raft/` from intellistream-objects at a recorded commit (§2.3). | Writing a new Raft; linking the other repository | It is sans-IO, tested by a seeded simulator with crashes, torn disks and partitions, has pre-vote, check-quorum, learners, leader transfer and a durable floor. A copy keeps tsdb's build self-contained; a script re-syncs it. |
+| C3 | **The user's Raft core**, copied into `src/raft/` from intellistream-objects at a recorded commit, under Apache 2.0 by the owner's grant (D2, 2026-11-06; §2.3). | Writing a new Raft; linking the other repository | It is sans-IO, tested by a seeded simulator with crashes, torn disks and partitions, has pre-vote, check-quorum, learners, leader transfer and a durable floor. A copy keeps tsdb's build self-contained; a script re-syncs it. |
 | C4 | **Raft is not on the insert path.** Each volume leader replicates to its in-sync set directly (§4, §5). | Raft per volume; majority quorum writes | The user's decision. A majority of 3 cannot write with 2 replicas down; an in-sync set can. |
 | C5 | **The replicated log is the leader's WAL, byte for byte**, in the same segments, plus marker records for everything that is not rows (§4). | Each replica re-framing rows into its own WAL; shipping client frames; a separate control log | Identical bytes need no re-encoding, the existing record checks hold unchanged (they bind a record to its segment and offset), and a replica's memtables match the leader's, so "flush through segment S" means the same everywhere. |
 | C6 | **One position counter per volume**: the feed number `fno` of design-cdc.md (WAL record version 2). Commit points, catch-up, read tokens and the change feed all use it. | A separate replication sequence number | One number, one WAL format (format 9), and the feed and replication agree on order by construction. |
@@ -77,14 +94,14 @@ version 2 with a per-volume number for every row: the cluster uses the same numb
 | C8 | **Large inserts, deletes and replaces: the leader writes the parts and ships the files**; the replicas store them pending, a marker commits them, and each replica commits them under its own block numbers (§5.2). | Replicas encoding the rows themselves | Encoded parts are about 1.2 bytes a row against 20 in a WAL row: 15 times less network and no encoding CPU on replicas. Block numbers live only in file names (part.c:21, 782), so the file bytes do not depend on where they are committed. |
 | C9 | **Each replica flushes and merges on its own.** Replicas are logically equal (same rows, same answers), not byte equal (§5.6). | The leader shipping merged parts; merges as log commands | Shipping merges costs the network several times the compressed ingest per replica. Merges as commands would stall a replica's apply behind a merge of minutes, or need out-of-order apply. |
 | C10 | **Only the leader decides** anything that depends on a clock or on local state: class switches, the retention clock (`NOW` markers), retention limits, drops, series and state creation. Replicas apply the markers (§5.4, §5.5). | Replicas deciding on their own clocks and histories | Two replicas deciding a class switch or a cutoff differently would answer differently. |
-| C11 | **Commit = every in-sync replica has it durable.** The in-sync set (ISR) changes only by a Raft commit that names the volume's current epoch. The minimum ISR is 1 by default (open question 1). | Majority quorum; the leader changing the ISR on its own | With the ISR in Raft and conditional on the epoch, a deposed leader can never shrink its way to an acknowledgement (§6.3). |
+| C11 | **Commit = every in-sync replica has it durable.** The in-sync set (ISR) changes only by a Raft commit that names the volume's current epoch. The minimum ISR is 1 by default, 2 per volume as an option (D1, 2026-11-06). | Majority quorum; the leader changing the ISR on its own | With the ISR in Raft and conditional on the epoch, a deposed leader can never shrink its way to an acknowledgement (§6.3). |
 | C12 | **Failover by the Raft leader**: a server is down after 3 s without a heartbeat; the new volume leader is the reachable ISR member with the longest log, after it has been fenced; the epoch rises. No unclean election: a volume whose ISR is all down waits. | Electing any live replica; client votes | Only an ISR member is known to hold every acknowledged write. |
 | C13 | **Write safety uses no clock.** Clocks bound only how long a deposed leader may still answer reads (a lease, §7.1). | A time-based write fence | ha.md D11, and the Raft core's own rule: a wrong drift bound must cost at most a stale read. |
 | C14 | **A returning replica cuts its divergent tail** by the epoch history (Kafka's leader epochs, KIP-101), then catches up (§8.2). | Rebuilding every returning replica | A server back after minutes would otherwise copy its whole data again. |
-| C15 | **Reads go to the leader by default**; any in-sync replica serves them on request, with a position token for read-your-writes (§7). | Any replica by default | A stale read by default surprises; leaders are spread evenly, so reads are spread too. |
+| C15 | **Reads go to the leader by default** (D5); any in-sync replica serves them on request, with a position token for read-your-writes (§7). | Any replica by default | A stale read by default surprises; leaders are spread evenly, so reads are spread too. |
 | C16 | **QUERY_MULTI over several servers**: the client splits it per leader in direct mode and merges the replies by index; the entry server does it in simple mode. Each volume answers from its own cut (§7.3). | One snapshot across volumes | There is no cluster-wide instant without a global clock or a round of coordination per query. |
 | C17 | **Clients, streams and forwarding as in ha.md** §9 and §9.1: a node list, TOPOLOGY, direct mode by default (D39), streams `(session, vol)` with `seq` and `attempt` (D13, D31), one hop of forwarding (D29, D30), MOVED and UNAVAILABLE, resends in order by time budget. | New client rules | They were designed for exactly this: a volume whose writer moves. Only TOPOLOGY's content changes. |
-| C18 | **Names stay unique in the whole database** (decided 2026-11-02) through **name slots**: a name hashes to one of 65,536 slots; each slot has a home volume, whose leader serialises creation of the slot's names and records every one of them (§3.3). | A name index in Raft; names unique per volume; asking every leader | A billion names do not fit a Raft state machine. Per-volume names reverse the user's decision. Asking every leader cannot stop two concurrent creations. |
+| C18 | **Names stay unique in the whole database** (decided 2026-11-02, confirmed with D4 on 2026-11-06) through **name slots**: a name hashes to one of 65,536 slots; each slot has a home volume, whose leader serialises creation of the slot's names and records every one of them (§3.3). | A name index in Raft; names unique per volume; asking every leader | A billion names do not fit a Raft state machine. Per-volume names reverse the user's decision. Asking every leader cannot stop two concurrent creations. |
 | C19 | **Placement is explicit** in the metadata: replica lists per volume, chosen by a balancing rule (distinct servers, distinct racks, even leaders, even pairs) and changed only by moves (§3.2). | Placement computed from the member list (CRUSH, rendezvous hashing) | A computed placement moves data whenever membership changes, even briefly. Explicit lists move it only when the operator or a permanent loss says so. |
 | C20 | **Rebuild from a hard-linked snapshot** of any ISR member, throttled per server, then catch-up from the leader's retained WAL segments (§8). | Copying only from the leader; replaying a log from the beginning | Spreading sources spreads the load; the WAL is not kept forever. |
 | C21 | **Cold tier: only the boundary here** (§9). A whole partition, settled and idle, is handed over; every replica keeps its granule index locally. | Designing erasure coding inside tsdb now | The user moved the cold tier to its own design; isod may serve it over S3 (see Later). |
@@ -169,8 +186,11 @@ How to bring it in: copy `raft.[ch]`, `raft_log.[ch]`, `raft_wire.[ch]`, `raft_s
 (their own style, tabs, so a re-sync is a clean diff), with a small `src/raft/compat.h` for what they include from
 isod: `common/util.h`, `common/rng.h`, `common/clock.h`, `common/crc32c.h`, `common/log.h` and `proto/frame.h`.
 `tools/sync-raft.sh <commit>` re-copies and records the commit in `src/raft/UPSTREAM`. The intellistream-objects
-repository has no LICENSE file, and tsdb is Apache 2.0: the copied files need the owner's grant under Apache 2.0
-(open question 2).
+repository has no LICENSE file; its owner granted copying these files into tsdb under Apache 2.0 (D2, 2026-11-06).
+So: each copied file gets the Apache 2.0 header of tsdb's own files, `src/raft/UPSTREAM` names the source repository,
+its commit and the grant, [licenses.md](licenses.md) lists the files under "Copied code and data", and
+intellistream-objects should get a LICENSE (or a grant file naming Apache 2.0) of its own, so the grant is written
+down at the source too.
 
 ## 3. Volumes, placement and routing
 
@@ -769,7 +789,7 @@ Each step is a track (build, adversarial review, fixes) with the gates of AGENTS
 | Step | Content | Gate beyond the usual | Weeks |
 |---|---|---|---|
 | 0 | **Before 1.0**: format 9 (WAL record v2 with `fno`, kinds; part position range; META `requires=`), shared with the change feed; MOVED and UNAVAILABLE in the four clients; node lists | jepsen (it changes the WAL) | 2 |
-| 1 | Raft core copied in, compat shim, metadata state machine, watch stream, heartbeats, `tsdb cluster init / node add / status`; simulator runs | Raft simulator soak | 3 |
+| 1 | Raft core copied in (Apache headers, `UPSTREAM`, `tools/sync-raft.sh`, an entry in licenses.md), compat shim, metadata state machine, watch stream, heartbeats, `tsdb cluster init / node add / status`; simulator runs | Raft simulator soak | 3 |
 | 2 | `src/repl.c` sans-IO replication core and its simulator | replication simulator soak | 3 |
 | 3 | Engine replica mode: apply up to the commit point, verbatim WAL writes, markers, pending files kept, replicated clock, class precondition, cut by position | jepsen (single server, regressions) | 4 |
 | 4 | tsdbd peer links (log and bulk), replication, ISR changes, failover, fencing, leases, TOPOLOGY, forwarding | jepsen-cluster: kill, partition, pause, midcommit | 4 |
@@ -797,26 +817,8 @@ About 28 weeks for one track; steps 1-2 and 6 can run in parallel with 3-4, whic
 
 ## Open questions
 
-1. **Minimum ISR: 1 or 2?** With 1 (assumed, A2), writes go on with two of a volume's three replicas down, and a write
-   acknowledged in that window is on one disk until a new replica has caught up (minutes, §8.4); a third loss in that
-   window would lose it. With 2, those volumes (about 14 of 128 when 2 of 8 servers fail) refuse writes until the new
-   replica is in, and Pulsar buffers. **Recommended: 1 by default**, with an alert and rebuild priority for volumes at
-   one member, and `min_isr = 2` (or replication 4) as a per-volume setting for data that must survive three losses.
-2. **The Raft core: may tsdb copy it under Apache 2.0?** intellistream-objects has no LICENSE file; tsdb is Apache 2.0.
-   **Recommended: yes**, copy `src/raft` (core, log, wire, simulator) with Apache 2.0 headers and a sync script, rather
-   than a second Raft or a library dependency between the two repositories.
-3. **Does the cluster replace ha.md?** ha.md is failover over shared NFS storage (one copy, a lock as arbiter); this
-   is shared-nothing with three copies. **Recommended: yes for new work**: build this one; keep ha.md's client rules,
-   streams, forwarding and drop watermark (they are part of this design now) and drop its NFS lock, ledger and
-   SUSPECT machinery. NFS followers stay for single-server deployments.
-4. **Name slots, or names unique per volume?** Keeping names unique in the whole database (2026-11-02) costs the slot
-   index and a hop to the home volume on creation and on lookups by name (§3.3); it also gives clients that name no
-   volume an even spread. **Recommended: name slots** as designed.
-5. **Reads from replicas by default?** **Recommended: no.** Leaders by default (read-your-writes, monotonic), and
-   `REPLICA_OK` per query or per client for scans and dashboards that can be a millisecond behind.
-6. **The 1.0 changes of §11 (format 9 shared with the change feed, part position ranges, META `requires=`, MOVED and
-   UNAVAILABLE in the clients): land them in a 0.9.x before the freeze?** **Recommended: yes**, as one format change
-   with the change feed's WAL record, so the cluster and the feed arrive in 1.x without a break.
+None. The six questions of the first draft were answered on 2026-11-06 and are decisions D1-D6 at the top of this
+document.
 
 ## Unverified assumptions
 
