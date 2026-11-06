@@ -403,6 +403,33 @@ static void kinds(tsdb *db)
     int64_t *bounds;
     size_t nb;
     OK(tsdb_calendar_bounds("Europe/Oslo", TSDB_HOUR, 2, T0 - 86400000, T0 + 2 * 86400000, &bounds, &nb));
+    /* Regression (release review N1): one call checks its bounds once, not once per series (65,536 series over the
+     * 33 M bounds of one frame were 250 s of comparisons). Bounds that do not increase still answer INVALID for every
+     * series, as each series' own query does, trimmed or not. */
+    CHECK(nlist > 1);
+    for (int kind = TSDB_MULTI_BUCKETS; kind <= TSDB_MULTI_TWA; kind++)
+        for (unsigned trim = 0; trim < 2; trim++) {
+            tsdb_multi_query q = {.kind = (tsdb_multi_kind)kind, .start = INT64_MIN, .end = INT64_MAX,
+                                  .bounds = bounds, .nbounds = nb,
+                                  .trim = trim ? TSDB_MULTI_TRIM_LO | TSDB_MULTI_TRIM_HI : 0};
+            tsdb_series_result *res;
+            size_t before = __atomic_load_n(&bounds_checked, __ATOMIC_RELAXED);
+            OK(tsdb_query_multi_collect(db, &q, list, nlist, NULL, &res));
+            size_t looked = __atomic_load_n(&bounds_checked, __ATOMIC_RELAXED) - before;
+            if (looked != nb) {
+                fprintf(stderr, "kind %d trim %u: %zu bounds checked for %zu bounds and %zu series\n", kind, trim,
+                        looked, nb, nlist);
+                CHECK(looked == nb);
+            }
+            tsdb_series_results_free(res, nlist); /* the answers themselves are compared below */
+            int64_t bad[] = {T0, T0 + 3600000, T0 + 3600000, T0 + 7200000};
+            q.bounds = bad;
+            q.nbounds = 4;
+            OK(tsdb_query_multi_collect(db, &q, list, nlist, NULL, &res));
+            for (size_t i = 0; i < nlist; i++)
+                CHECK(res[i].status == TSDB_ERR_INVALID && res[i].n == 0);
+            tsdb_series_results_free(res, nlist);
+        }
     for (int kind = TSDB_MULTI_BUCKETS; kind <= TSDB_MULTI_TWA; kind++)
         for (size_t o = 0; o < 4; o++)
             for (int mode = 0; mode < 6; mode++)
@@ -708,6 +735,8 @@ typedef struct {
     int status[64], calls[64];
     uint64_t rows;
 } slow_ctx;
+static void late_conductor(void) { usleep(20000); } /* the helpers run first */
+
 static int slow_head(void *ctx, const tsdb_series_result *r)
 {
     slow_ctx *s = ctx;
@@ -806,20 +835,23 @@ static void bounds(const char *base)
     tsdb_multi_opts mo = {.threads = 8, .budget_take = b_take, .budget_give = b_give, .on_deferred = b_deferred,
                           .hook_ctx = &b};
     slow_ctx sc = {0};
+    /* Regression: the caller is preempted right after waking the helpers (the hook makes it certain); the head is
+     * still the caller's, streamed, never collected ahead by a helper and charged (multi-flake: 2.5% of runs) */
+    atomic_store(&multi_open_hook, late_conductor);
     OK(tsdb_query_multi(db, &qv, list, 9, &mo, slow_head, &sc));
+    atomic_store(&multi_open_hook, NULL);
     CHECK(sc.status[0] == 0);
     int failed_ahead = 0;
     for (int i = 1; i < 9; i++) {
         CHECK(sc.status[i] == TSDB_ERR_CORRUPT);
         failed_ahead += sc.calls[i] == 1;
     }
-    /* the good series is charged only when a helper claimed it before the caller took it as the head (the caller
-     * may be preempted right after waking the helpers); the failed ones never are, wherever they ran */
+    /* the failed ones are never charged, wherever they ran */
     bool good_ahead = sc.calls[0] == 1;
-    CHECK(sc.calls[0] >= 1);
     fprintf(stderr, "  failures ahead: %d of 8, the head %s\n", failed_ahead,
             good_ahead ? "collected ahead" : "streamed");
-    CHECK(atomic_load(&b.takes) == (good_ahead ? 1 : 0) && atomic_load(&b.out) == 0);
+    CHECK(sc.calls[0] > 1 && !good_ahead);
+    CHECK(atomic_load(&b.takes) == 0 && atomic_load(&b.out) == 0);
     CHECK(atomic_load(&b.deferred) == 0); /* and nothing flipped the call to one series at a time */
 
     /* results ahead stop at max_held_bytes: a refused one makes the call head-only */

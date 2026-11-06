@@ -413,7 +413,9 @@ int tsdb_query_lttb(tsdb *db, tsdb_sid series, int64_t start, int64_t end, size_
 /* The same points newest first (TSDB_DESC), or only the first `limit` of them in that order: the choice
  * does not change, since it needs every point of the range anyway (opts NULL: as tsdb_query_lttb). Newest first
  * holds at most min(limit, threshold) chosen points in memory, and none where the threshold keeps every point
- * (a backwards read that stops at the limit). */
+ * (a backwards read that stops at the limit): 8 bytes and the value's width each, so a threshold near the rows of
+ * a very large range holds about as much as reading the range raw. tsdbd caps the threshold of its clients
+ * (--lttb-max-threshold, default 16,777,216). */
 int tsdb_query_lttb_ex(tsdb *db, tsdb_sid series, int64_t start, int64_t end, size_t threshold,
                        const tsdb_query_opts *opts, tsdb_values_fn fn, void *ctx);
 

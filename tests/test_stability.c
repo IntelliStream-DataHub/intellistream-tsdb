@@ -746,6 +746,44 @@ static double thread_cpu(pid_t pid, pid_t tid)
     return (double)(ut + st) / (double)sysconf(_SC_CLK_TCK);
 }
 
+/* Regression (release review L1): a reply that fits whole in the connection's output buffers (under OUT_CAP, so no
+ * worker waits for space and out_wait's deadline never runs) to a client that reads none of it is not held for as
+ * long as the client keeps the socket open: the connection is closed after --send-timeout. */
+static void test_stuck_reader_whole_reply(void)
+{
+    current = "stuck reader: whole reply buffered";
+    alarm(60);
+    char dir[512];
+    make_dir(dir, sizeof dir, "whole");
+    int port = 0;
+    pid_t pid = start(dir, &port, "--send-timeout=2", NULL);
+    enum { N = 600000 }; /* 7.2 MB of reply: under OUT_CAP, beyond both socket buffers */
+    CHECK(insert(port, "big", 0, N) == 0);
+    tsdbc *c;
+    tsdb_sid id = 0;
+    CHECK(tsdbc_connect("127.0.0.1", port, &c) == 0 && tsdbc_series(c, "big", 0, &id) == 0);
+    tsdbc_close(c);
+    int fd = raw_connect(port);
+    /* no receive buffer autotuning, but not so small that reading what was sent crawls (a 4 KB window on loopback
+     * waits for the persist timer between segments) */
+    int small = 65536;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+    send_query_raw(fd, id);
+    sleep_ms(5000); /* past the send timeout, and a tick */
+    size_t got = 0;
+    uint8_t b[65536];
+    ssize_t r;
+    while ((r = read(fd, b, sizeof b)) > 0)
+        got += (size_t)r;
+    CHECK(r == 0 || errno == ECONNRESET); /* cut off; before the fix the whole reply came, then EAGAIN after 5 s */
+    CHECK(got < (size_t)N * 12);
+    close(fd);
+    CHECK(hello(port));
+    signal_pid(pid, SIGTERM);
+    CHECK(clean_exit(wait_exit(pid, 10)));
+    remove_dir(dir);
+}
+
 /* Regression: a client that stops reading must cost the event loop nothing
  * while its send waits. An epoll loop that keeps such a socket marked writable
  * after EAGAIN tries the send again on every round and burns a core per stuck
@@ -993,6 +1031,7 @@ int main(int argc, char **argv)
     test_follower();
     test_slow_readers();
     test_stuck_reader_idle();
+    test_stuck_reader_whole_reply();
     test_connection_limit();
     test_half_close_while_stopped();
     test_io_fallback();

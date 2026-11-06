@@ -44,6 +44,7 @@
  */
 #include "internal.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -316,15 +317,58 @@ static void paths_free(char **p, size_t n)
     free(p);
 }
 
+/* A name the engine of a volume would take for a file of its own beyond MANIFEST, SERIES and LOCK (an engine's,
+ * checked apart) and META (an add's too): its open replays a WAL segment, cuts what it reads as the torn tail of
+ * STATES, RETENTION or CLASSES, runs an intent, opens a part, deletes a part's temporary or a retired part. */
+static bool engine_file_name(const char *name)
+{
+    static const char *const fixed[] = {"STATES", "RETENTION", "CLASSES"};
+    for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++)
+        if (strcmp(name, fixed[i]) == 0)
+            return true;
+    return wal_file_name(name) || part_file_name(name) || part_tmp_name(name) || intent_file_name(name) ||
+           (strncmp(name, "retired_", 8) == 0 && part_file_name(name + 8));
+}
+
+/* The first file in the directory open at fd that engine_file_name takes for the engine's, into name; 0 when
+ * there is none, or TSDB_ERR_IO. */
+static int engine_file_find(int fd, char *name, size_t cap)
+{
+    name[0] = '\0';
+    int dfd = dup(fd);
+    DIR *d = dfd < 0 ? NULL : fdopendir(dfd);
+    if (!d) {
+        if (dfd >= 0)
+            close(dfd);
+        return TSDB_ERR_IO;
+    }
+    rewinddir(d); /* the dup shares its offset with fd */
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL)
+        if (engine_file_name(e->d_name)) {
+            snprintf(name, cap, "%s", e->d_name);
+            break;
+        }
+    closedir(d);
+    return 0;
+}
+
 /* What a new volume's directory may hold: nothing of another database (its ID
- * or VOLUMES as a root, its ROOT_ID as a volume) and no engine files without
- * our ROOT_ID; our ROOT_ID and META alone are a crashed add. Writes ROOT_ID;
+ * or VOLUMES as a root, its ROOT_ID as a volume), no engine files without
+ * our ROOT_ID, and no file the engine would take for its own (an operator's
+ * STATES or wal_0000000000000001.log would be cut or replayed by the first
+ * open); our ROOT_ID and META alone are a crashed add. Writes ROOT_ID;
  * META follows once the add knows the volume's number (volume_meta_write). */
 static int volume_dir_prepare(const char *canon, uint64_t id, bool sync)
 {
     int fd = open(canon, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0)
         return TSDB_ERR_IO;
+    char stray[256];
+    if (engine_file_find(fd, stray, sizeof stray) != 0) {
+        close(fd);
+        return TSDB_ERR_IO;
+    }
     static const char *const root_files[] = {ID_FILE, VOLUMES_FILE};
     static const char *const eng_files[] = {"MANIFEST", "SERIES", "LOCK"};
     const char *why = NULL;
@@ -349,6 +393,12 @@ static int volume_dir_prepare(const char *canon, uint64_t id, bool sync)
         rc = 0;
         if (engine || meta)
             why = "holds tsdb files of no database";
+    }
+    if (!why && rc == 0 && stray[0]) {
+        fprintf(stderr, "tsdb: volume %s holds %s, a name the volume would take for a tsdb file of its own: not added\n",
+                canon, stray);
+        close(fd);
+        return TSDB_ERR_INVALID;
     }
     if (!why && rc == 0 && !ours) {
         char buf[32];
@@ -2116,29 +2166,19 @@ int tsdb_query_twa_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end, c
 int tsdb_query_twa_bounds(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                           const tsdb_twa_opts *opts, tsdb_twa_bucket **out, size_t *nout)
 {
-    *out = NULL;
-    *nout = 0;
-    bucketer bk;
-    int rc = bounds ? bucketer_bounds(&bk, bounds, n) : TSDB_ERR_INVALID;
-    if (rc)
-        return rc;
-    if (start < bounds[0]) /* segments before the first bound belong to no bucket */
-        start = bounds[0];
-    return query_twa(t, series, start, end, &bk, opts, out, nout);
+    void *o;
+    int rc = query_bounds_of(t, TSDB_MULTI_TWA, series, start, end, bounds, n, false, NULL, opts, &o, nout);
+    *out = o;
+    return rc;
 }
 
 int tsdb_query_bounds(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
                       const tsdb_query_opts *opts, tsdb_bucket **out, size_t *nout)
 {
-    *out = NULL;
-    *nout = 0;
-    bucketer bk;
-    int rc = bounds ? bucketer_bounds(&bk, bounds, n) : TSDB_ERR_INVALID;
-    if (rc)
-        return rc;
-    if (start < bounds[0]) /* rows before the first bound belong to no bucket */
-        start = bounds[0];
-    return query_group(t, series, start, end, &bk, opts, out, nout);
+    void *o;
+    int rc = query_bounds_of(t, TSDB_MULTI_BUCKETS, series, start, end, bounds, n, false, opts, NULL, &o, nout);
+    *out = o;
+    return rc;
 }
 
 /* The spread: one router for the interval, group and bounds forms, like query_twa. */
@@ -2183,15 +2223,37 @@ int tsdb_query_spread_group(tsdb *t, tsdb_sid series, int64_t start, int64_t end
 int tsdb_query_spread_bounds(tsdb *t, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds,
                              size_t n, const tsdb_query_opts *opts, tsdb_spread_bucket **out, size_t *nout)
 {
+    void *o;
+    int rc = query_bounds_of(t, TSDB_MULTI_SPREAD, series, start, end, bounds, n, false, opts, NULL, &o, nout);
+    *out = o;
+    return rc;
+}
+
+int query_bounds_of(tsdb *t, int kind, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                    bool checked, const tsdb_query_opts *opts, const tsdb_twa_opts *twa, void **out, size_t *nout)
+{
     *out = NULL;
     *nout = 0;
     bucketer bk;
-    int rc = bounds ? bucketer_bounds(&bk, bounds, n) : TSDB_ERR_INVALID;
+    int rc = bounds ? bucketer_bounds(&bk, bounds, n, checked) : TSDB_ERR_INVALID;
     if (rc)
         return rc;
-    if (start < bounds[0]) /* rows before the first bound belong to no bucket */
+    if (start < bounds[0]) /* rows (TWA: segments) before the first bound belong to no bucket */
         start = bounds[0];
-    return query_spread(t, series, start, end, &bk, opts, out, nout);
+    if (kind == TSDB_MULTI_TWA) {
+        tsdb_twa_bucket *o = NULL;
+        rc = query_twa(t, series, start, end, &bk, twa, &o, nout);
+        *out = o;
+    } else if (kind == TSDB_MULTI_SPREAD) {
+        tsdb_spread_bucket *o = NULL;
+        rc = query_spread(t, series, start, end, &bk, opts, &o, nout);
+        *out = o;
+    } else {
+        tsdb_bucket *o = NULL;
+        rc = query_group(t, series, start, end, &bk, opts, &o, nout);
+        *out = o;
+    }
+    return rc;
 }
 
 /* ----------------------------------------------------------- inspection */

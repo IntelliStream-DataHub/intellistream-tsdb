@@ -88,7 +88,8 @@
  *   QUERY_LTTB  u64 series, i64 start, i64 end, u64 threshold
  *               -> chunks as QUERY_VALUES (never with TSDB_VALID: no nulls),
  *               the chosen points in time order with their stored values
- *               (threshold < 3 or a state series: TSDB_ERR_INVALID)
+ *               (threshold < 3 or a state series: TSDB_ERR_INVALID; a threshold above the server's
+ *               --lttb-max-threshold, default 16,777,216, is taken as that, here and in QUERY_MULTI)
  *   Version 6: time-weighted averages (tsdb_query_twa in tsdb.h has the rules).
  *   QUERY_TWA   u64 series, i64 start, i64 end, u8 method (0 STEP, 1 LINEAR), u8 order,
  *               u8 unit, u8 0, i64 max_gap, u64 limit, i64 interval, u32 count, u32 n,

@@ -80,7 +80,8 @@
  * while the total would exceed it, unless no other is unpacking. Outside it: up to IN_KEEP of receive buffer per
  * connection, and the replies waiting for a client that does not read them (two buffers per connection, the one
  * being sent and the one its worker fills, each up to OUT_CAP + OUT_PIECE: a larger reply goes in pieces, its
- * worker waiting between them). A connection with more than PIPE_CAP of requests (or MULTI_QUEUED
+ * worker waiting between them; a connection whose output has not moved for --send-timeout seconds is closed, whether
+ * a worker waits on it or the whole reply already fits). A connection with more than PIPE_CAP of requests (or MULTI_QUEUED
  * multi-series queries) waiting reads no more until they run, so a CANCEL behind them waits too, and one whose
  * frame has been started but not completed for --frame-timeout seconds
  * (default 60) while the server waits for its bytes is closed (slow senders); time the server itself held the
@@ -228,6 +229,7 @@ typedef struct conn {
     bool eof;           /* the client sent everything it will: reply to it, then close */
     buf sending;
     size_t sent;
+    int64_t tx_t0;      /* when the send in flight was started, so when the output last moved (monotonic s) */
     size_t in_charged;  /* of in.cap, counted in req_held (a buffer grown for a large frame) */
     size_t q_bytes;     /* REQ_COST of the requests in q */
     int64_t frame_t0;   /* when the partial frame in `in` was started (monotonic s), 0: none */
@@ -881,6 +883,12 @@ static int copy_bounds(qreq *r, const uint8_t *p, uint32_t n)
     return 0;
 }
 
+/* The largest LTTB threshold tsdbd computes (--lttb-max-threshold); a larger one is taken as this. Newest first
+ * holds the chosen points until the last is chosen (8 bytes and the value's width each), so a threshold near the
+ * rows of a series of billions would hold gigabytes for one request, outside --max-request-memory. A range of no
+ * more rows than the cap still answers every point; one of more answers at most the cap. */
+static uint64_t lttb_max_threshold = 16777216;
+
 /* QUERY_VALUES and QUERY_LTTB (the latter: the threshold, then optional order and limit since version 9) */
 static int parse_values(const uint8_t *p, size_t len, bool lttb, qreq *r)
 {
@@ -899,6 +907,8 @@ static int parse_values(const uint8_t *p, size_t len, bool lttb, qreq *r)
         memcpy(&lim, p + at + 1, 8);
         r->q.limit = lim > SIZE_MAX ? SIZE_MAX : (size_t)lim;
     }
+    if (lttb && r->threshold > lttb_max_threshold)
+        r->threshold = lttb_max_threshold;
     return lttb && r->threshold > SIZE_MAX ? TSDB_ERR_INVALID : 0;
 }
 
@@ -2017,6 +2027,7 @@ static void submit_send(conn *c)
         }
     }
     c->send_inflight = true;
+    c->tx_t0 = mono_s(); /* a send is started only after the last one moved bytes (on_send) */
     if (io == IO_EPOLL) {
         ep_want(c);
         return;
@@ -2339,7 +2350,8 @@ static void unpark_some(void)
 }
 
 /* Once a second: closes connections whose frame was started frame_timeout_s ago and is still incomplete while
- * the server waits for its bytes (not one parked or held back by its own pipeline). */
+ * the server waits for its bytes (not one parked or held back by its own pipeline), and those whose output has
+ * waited send_timeout_s for the client to read any of it. */
 static void on_tick(void)
 {
     uint64_t v;
@@ -2348,6 +2360,7 @@ static void on_tick(void)
     int64_t now = mono_s();
     static int64_t logged;
     static int64_t login_logged;
+    static int64_t send_logged;
     if (start_ppid && getppid() != start_ppid && !stopping) { /* reparented: the parent is gone */
         fprintf(stderr, "tsdbd: --exit-with-parent: parent %d exited, stopping\n", (int)start_ppid);
         stopping = 1; /* as SIGTERM: the loop ends, requests in progress finish, the memtable is flushed */
@@ -2370,6 +2383,18 @@ static void on_tick(void)
             if (logged != now) {
                 logged = now;
                 fprintf(stderr, "tsdbd: connection closed: a frame incomplete after %d s\n", frame_timeout_s);
+            }
+            conn_close(c);
+            continue;
+        }
+        /* Output that has not moved for --send-timeout: the client reads nothing. A worker waiting for output
+         * space gives up after that long (out_wait); this ends the connections whose whole reply fit in its two
+         * buffers, which nothing waits on, so they do not hold up to 2 x (OUT_CAP + OUT_PIECE) each for as long
+         * as the client keeps the socket open. */
+        if (c->send_inflight && !c->closed && now - c->tx_t0 > send_timeout_s) {
+            if (send_logged != now) {
+                send_logged = now;
+                fprintf(stderr, "tsdbd: connection closed: its output did not move for %d s\n", send_timeout_s);
             }
             conn_close(c);
         }
@@ -2872,6 +2897,7 @@ int main(int argc, char **argv)
                                    {"query-threads", required_argument, 0, 'q'},
                                    {"request-threads", required_argument, 0, 'L'},
                                    {"multi-max-rows", required_argument, 0, 'U'},
+                                   {"lttb-max-threshold", required_argument, 0, 'W'},
                                    {"version", no_argument, 0, 'v'},
                                    {"no-auth", no_argument, 0, 'A'},
                                    {"login-timeout", required_argument, 0, 'O'},
@@ -2926,6 +2952,7 @@ int main(int argc, char **argv)
         case 'q': o.query_threads = (int)num_arg("query-threads", optarg, 1, 4096); break;
         case 'L': o.request_threads = (int)num_arg("request-threads", optarg, 1, 4096); break;
         case 'U': multi_max_rows = (uint64_t)num_arg("multi-max-rows", optarg, 1, LLONG_MAX); break;
+        case 'W': lttb_max_threshold = (uint64_t)num_arg("lttb-max-threshold", optarg, 3, LLONG_MAX); break;
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'A': no_auth = 1; break;
         case 'E':
@@ -2970,6 +2997,7 @@ int main(int argc, char **argv)
                         "             [--metrics-port N|auto [--metrics-bind ADDR]]\n"
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
                         "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"
+                        "             [--lttb-max-threshold 16777216]\n"
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
                         "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n",
                 TSDB_DEFAULT_PORT);

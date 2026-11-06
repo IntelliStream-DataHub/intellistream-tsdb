@@ -8,6 +8,30 @@ disk format and the wire protocol.
 
 ## [Unreleased]
 
+### Added
+- tsdbd `--lttb-max-threshold N` (default 16,777,216): the largest LTTB threshold the server computes, for
+  QUERY_LTTB and QUERY_MULTI; a larger one is taken as this. A range of no more rows than that still answers every
+  point. Newest-first LTTB holds its chosen points until the last is chosen, so before this a threshold near the
+  rows of a series of billions held gigabytes for one request, outside `--max-request-memory`.
+
+### Changed
+- An operator's `volume add` (and `import --create-volumes`) refuses a directory that holds a file with a name the
+  volume would take for one of its own: `STATES`, `RETENTION`, `CLASSES`, a WAL segment (`wal_<16 hex>.log`), a
+  part, a part's temporary, a retired part or an intent. The first open would otherwise have cut such a file of the
+  user's as a torn tail, replayed it, run it or deleted it. The message names the file; nothing is written.
+
+### Fixed
+- tsdbd closes a connection whose output has not moved for `--send-timeout` seconds even when its whole reply fit in
+  the server's buffers (so no worker waited on it): before, a client that sent a query and never read the answer held
+  up to about 17 MB per connection for as long as it kept the socket open, outside `--max-request-memory`.
+- `tsdb_query_multi` (QUERY_MULTI) checks the bounds of a bounds query once per call instead of once per series:
+  65,536 series over the 33 million bounds of one frame took about 250 s of comparisons. Bounds that do not
+  increase answer `TSDB_ERR_INVALID` for every series, trimmed or not (a trimmed series without rows answered an
+  empty result before).
+- `tsdb_query_multi` claims the first series for the caller before it wakes its helpers. A helper that ran first
+  took it as a series ahead: collected and held, or, over 65,536 rows, computed, thrown away and run again at its
+  turn.
+
 ## [0.9.0] - 2026-11-05
 
 The first release. **Disk format version 8, wire protocol version 12** (the server and the clients refuse a peer

@@ -980,7 +980,7 @@ bool part_file_name(const char *name)
     return strcmp(s, "part") == 0;
 }
 
-static bool intent_file_name(const char *name) { return two_numbers_name(name, INTENT_PREFIX, ".intent"); }
+bool intent_file_name(const char *name) { return two_numbers_name(name, INTENT_PREFIX, ".intent"); }
 
 /* Parses an intent into its n renames; false when it is torn or damaged. */
 static bool intent_parse(char *buf, size_t len, char (**tmp)[96], char (**fin)[128], size_t *n)

@@ -487,6 +487,47 @@ static void test_user_files_in_volume(const char *base)
            "the open; the engine's leftovers go\n");
 }
 
+/* Regression (release review L2): an add refuses a directory holding a file with a name the volume's engine takes
+ * for its own (its first open would cut a STATES, RETENTION or CLASSES of the user's as a torn tail, replay a WAL
+ * segment, run an intent, open a part, delete a part's temporary), and the file is left as it was. */
+static void test_engine_names_in_volume(const char *base)
+{
+    char top[600], root[700], vol[800], p[1000];
+    fresh(base, "volnames", top, sizeof top, root, sizeof root);
+    snprintf(vol, sizeof vol, "%s/data", top);
+    CHECK(mkdir(vol, 0755) == 0);
+    static const char *const names[] = {"STATES", "RETENTION", "CLASSES", "wal_0000000000000001.log",
+                                        "p1_2_3_0.part", "p-1_2_3_0.part", "tmp_1_2.part", "txn_1_2.intent",
+                                        "retired_p1_2_3_0.part"};
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        snprintf(p, sizeof p, "%s/%s", vol, names[i]);
+        write_file(p, "the user's\n");
+        uint32_t v = 99;
+        int rc = tsdb_volume_add_dir(root, vol, &v);
+        if (rc != TSDB_ERR_INVALID)
+            fprintf(stderr, "  %s: the add returned %d\n", names[i], rc);
+        CHECK(rc == TSDB_ERR_INVALID);
+        CHECK(exists(p) && file_size(p) == 11);
+        snprintf(p, sizeof p, "%s/ROOT_ID", vol);
+        CHECK(!exists(p)); /* refused before it claimed the directory */
+        snprintf(p, sizeof p, "%s/%s", vol, names[i]);
+        CHECK(unlink(p) == 0);
+    }
+    tsdb_options o;
+    tsdb_options_init(&o);
+    o.fsync = 0;
+    uint32_t v;
+    OK(tsdb_volume_add_dir(root, vol, &v)); /* the names gone, the same directory is added */
+    tsdb *db;
+    tsdb_sid id;
+    OK(tsdb_open(root, &o, &db));
+    OK(tsdb_series_at(db, "s", vol, &id));
+    OK(tsdb_close(db));
+    remove_tree(top);
+    printf("  an add refuses a directory holding STATES, RETENTION, CLASSES, a WAL segment, a part or an intent of "
+           "the user's, and leaves the file alone\n");
+}
+
 /* VOLUMES changed under a running writer: a torn tail (an add killed in its
  * write) is cut, so volumes still come and go as before; a line rewritten to
  * name another directory is damage, reported once per change. */
@@ -2355,6 +2396,7 @@ int main(int argc, char **argv)
     test_paths(base);
     test_refused_dirs(base);
     test_user_files_in_volume(base);
+    test_engine_names_in_volume(base);
     test_volumes_under_writer(base);
     test_concurrent_adds(base);
     test_open_waits_for_add(base);
