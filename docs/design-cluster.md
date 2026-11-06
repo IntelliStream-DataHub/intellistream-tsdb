@@ -425,6 +425,10 @@ at once; the Raft leader sees the volume reported failed in the next heartbeat a
 - A tsdbd that hangs but keeps its sockets open stops heartbeating (heartbeats come from the event loop, which also
   serves the volumes), so it is treated as down. A slow disk shows as a replica falling behind: ISR removal, not
   failover.
+- **Known gap until step 4.** In step 1 heartbeats come from the cluster thread (`server/cluster.c`, its own poll
+  loop beside the request loop), so a tsdbd whose request loop or engine hangs keeps heartbeating and is not marked
+  down. Step 4 moves the heartbeat onto the loop that serves the volumes, which closes it; until then nothing fails
+  over on a heartbeat anyway (no volume is replicated before step 4).
 
 ### 6.2 Promotion
 
@@ -741,6 +745,11 @@ performance; above them, the cluster stays correct and slows down.
 - **The metadata state machine** under the Raft core's simulator (`raft_sim`): seeded runs with crashes, partitions and
   clock drift, checking after every event: one leader per volume per epoch, epochs only rise, a new leader was in the
   ISR, the ISR only changes at the current epoch.
+  As built (step 1), this simulator is `tests/test_meta.c`'s own: the real Raft cores and `server/meta.c` over an
+  in-memory log with explicit durability, the core's wire encoding, snapshots, crashes, partitions, drops, duplicates
+  and drift. `raft_sim.c` has no state machine hook, and the copied files stay unchanged (so a re-sync is a clean
+  diff); `raft_sim`'s own chaos seeds run beside it in the same test. `make test` runs a few seeds, `make meta-soak`
+  thousands.
 - **The replication core** (`src/repl.c`, sans-IO like the Raft core: records, ACKs, fences, commit points and ISR
   changes go in; sends, syncs, applies and cuts come out) under its own simulator: a fake disk that loses what was not
   synced on a crash, a network that delays, drops, duplicates, reorders and partitions, and a fake metadata service.
@@ -792,7 +801,7 @@ Each step is a track (build, adversarial review, fixes) with the gates of AGENTS
 | 1 | Raft core copied in (Apache headers, `UPSTREAM`, `tools/sync-raft.sh`, an entry in licenses.md), compat shim, metadata state machine, watch stream, heartbeats, `tsdb cluster init / node add / status`; simulator runs | Raft simulator soak | 3 |
 | 2 | `src/repl.c` sans-IO replication core and its simulator | replication simulator soak | 3 |
 | 3 | Engine replica mode: apply up to the commit point, verbatim WAL writes, markers, pending files kept, replicated clock, class precondition, cut by position | jepsen (single server, regressions) | 4 |
-| 4 | tsdbd peer links (log and bulk), replication, ISR changes, failover, fencing, leases, TOPOLOGY, forwarding | jepsen-cluster: kill, partition, pause, midcommit | 4 |
+| 4 | tsdbd peer links (log and bulk), replication, ISR changes, failover, fencing, leases, TOPOLOGY, forwarding; heartbeats move from the cluster thread onto the loop that serves the volumes, so a hung loop stops them (§6.1's known gap) | jepsen-cluster: kill, partition, pause, midcommit | 4 |
 | 5 | Name slots, creation and lookup across volumes, users in metadata | jepsen-cluster with creations | 2 |
 | 6 | Clients: direct mode, streams, the 32-byte header, positions, QUERY_MULTI split; Pulsar sink | test-clients, integration-tests cluster | 3 |
 | 7 | Rebuild, catch-up, retained segments, moves, leader balance, throttling | jepsen-cluster: kill2, rebuild, slow | 3 |

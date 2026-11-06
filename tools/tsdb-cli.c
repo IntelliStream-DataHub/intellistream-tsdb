@@ -20,6 +20,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: tsdb <dir> <command> [args]\n"
+            "       tsdb cluster init|node add|status PEER ... (tsdb cluster for the details)\n"
             "       tsdb --version\n"
             "\n"
             "  insert <series>                    read \"time,value\" lines from stdin\n"
@@ -90,6 +91,7 @@ static void usage(void)
 }
 
 int user_main(const char *dir, int argc, char **argv); /* tools/users-cli.c */
+int cluster_cli(int argc, char **argv);                /* tools/cluster-cli.c */
 
 static void die(const char *what, int rc)
 {
@@ -722,6 +724,8 @@ int main(int argc, char **argv)
     }
     if (argc < 3)
         usage();
+    if (strcmp(argv[1], "cluster") == 0) /* `tsdb cluster VERB PEER ...`: a server's peer port, no directory */
+        return cluster_cli(argc - 1, argv + 1);
     for (int i = 3; strcmp(argv[1], "user") == 0 && i < argc; i++)
         if (strcmp(argv[i], "--server") == 0) /* `tsdb user VERB ... --server HOST:PORT`: no directory */
             return user_main(NULL, argc - 2, argv + 2);

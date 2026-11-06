@@ -30,6 +30,13 @@
  *   tsdbd --dir /data/sensors [--listen 127.0.0.1] [--port 7070] [--port-file FILE] [--workers N]
  *         [--wal-sync-ms 0] [--no-fsync] [--read-only | --follow] [--io auto|uring|epoll]
  *         [--verify-checksums] [--pin-index] [--metrics-port N|auto [--metrics-bind ADDR]]
+ *         [--cluster --cluster-secret-file F [--peer-port 7071|0] [--peer-listen ADDR] [--advertise HOST]
+ *          [--rack NAME]]
+ *
+ * --cluster runs the cluster thread (cluster.c, docs/design-cluster.md): the metadata group on a peer port of its
+ * own (--peer-port, default the client port + 1; bound to --peer-listen, default --listen), with its files in
+ * DIR/meta/. --advertise is the host other servers and clients reach this one at (default --listen, which must then
+ * not be a wildcard). Step 1 of the design: the engine and the client port are unchanged.
  *
  * --metrics-port serves Prometheus metrics (GET /metrics) on a port of its own, from a
  * thread of its own: see metrics.c. Off by default; binds to --listen unless --metrics-bind.
@@ -45,6 +52,7 @@
  * and renamed once the listener is up; an old FILE is removed at start), and the banner names the real port.
  * Scripts and tests start servers this way and never compute a port, so two of them cannot collide.
  * --metrics-port auto does the same for the metrics port, which the file then names as a third number.
+ * With --cluster the file names the peer port as a fourth ("PORT PID MPORT PEER_PORT", MPORT 0 without metrics).
  *
  * --follow serves queries from a directory another process writes (on this
  * host or another one, over NFS), following its parts and WAL as they change.
@@ -99,8 +107,10 @@
 #include "tsdb.h"
 #include "tsdb_protocol.h"
 #include "../client/tsdb_pack.h"
+#include "../client/tsdb_crypto.h"
 #include "metrics.h"
 #include "auth.h"
+#include "cluster.h"
 
 #ifndef TSDB_BUILD_VERSION
 #define TSDB_BUILD_VERSION "dev"
@@ -2774,7 +2784,7 @@ static int listen_on(const char *addr, int *port_p)
 
 /* "PORT PID [METRICS_PORT]\n", written to a temporary file and renamed once the listener is up, so a reader sees
  * all of it or none (a half-written pid would read as another server's, and the harness would refuse a good one). A stale file is removed at startup: whoever finds one now knows this server wrote it. */
-static int write_port_file(const char *path, int port, int mport)
+static int write_port_file(const char *path, int port, int mport, int pport)
 {
     /* A name nobody can guess, created new (mkostemp: O_EXCL, so never through a link planted there): the directory
      * may be shared. */
@@ -2796,8 +2806,10 @@ static int write_port_file(const char *path, int port, int mport)
         return -1;
     }
     int ok = fprintf(f, "%d %d", port, (int)getpid()) > 0;
-    if (mport)
+    if (mport || pport)
         ok = (fprintf(f, " %d", mport) > 0 && ok);
+    if (pport)
+        ok = (fprintf(f, " %d", pport) > 0 && ok);
     ok = (fputc('\n', f) != EOF && ok);
     ok = (fflush(f) == 0 && ok);
     ok = (fclose(f) == 0 && ok);
@@ -2876,8 +2888,15 @@ int main(int argc, char **argv)
                                    {"no-auth", no_argument, 0, 'A'},
                                    {"login-timeout", required_argument, 0, 'O'},
                                    {"exit-with-parent", optional_argument, 0, 'E'},
+                                   {"cluster", no_argument, 0, 'c'},
+                                   {"peer-port", required_argument, 0, 'y'},
+                                   {"peer-listen", required_argument, 0, 'Y'},
+                                   {"advertise", required_argument, 0, 'a'},
+                                   {"rack", required_argument, 0, 'k'},
+                                   {"cluster-secret-file", required_argument, 0, 'S'},
                                    {0, 0, 0, 0}};
-    int ch, metrics_port = 0, metrics_on = 0, no_auth = 0;
+    int ch, metrics_port = 0, metrics_on = 0, no_auth = 0, cluster_on = 0, peer_port = -1, cluster_opts = 0;
+    const char *peer_addr = NULL, *advertise = NULL, *rack = "", *secret_file = NULL;
     const char *metrics_addr = NULL;
     long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
     if (pages > 0 && page > 0 && (size_t)pages / 8 * (size_t)page > req_budget)
@@ -2928,6 +2947,12 @@ int main(int argc, char **argv)
         case 'U': multi_max_rows = (uint64_t)num_arg("multi-max-rows", optarg, 1, LLONG_MAX); break;
         case 'D': frame_timeout_s = (int)num_arg("frame-timeout", optarg, 1, 86400); break;
         case 'A': no_auth = 1; break;
+        case 'c': cluster_on = 1; break;
+        case 'y': peer_port = (int)num_arg("peer-port", optarg, 0, 65535); cluster_opts = 1; break;
+        case 'Y': peer_addr = optarg; cluster_opts = 1; break;
+        case 'a': advertise = optarg; cluster_opts = 1; break;
+        case 'k': rack = optarg; cluster_opts = 1; break;
+        case 'S': secret_file = optarg; cluster_opts = 1; break;
         case 'E':
             start_ppid = getppid();
             if (start_ppid == 1) { /* the parent is gone already (or never was one to follow) */
@@ -2958,8 +2983,12 @@ int main(int argc, char **argv)
         default: goto usage;
         }
     }
+    if (cluster_on && (!secret_file || o.read_only || o.follow)) {
+        fprintf(stderr, "tsdbd: --cluster needs --cluster-secret-file, and a writer (not --read-only or --follow)\n");
+        return 2;
+    }
     if (!dir || nworkers < 1 || send_timeout_s < 1 || metrics_port < 0 || metrics_port > 65535 ||
-        (metrics_addr && !metrics_on)) {
+        (metrics_addr && !metrics_on) || (cluster_opts && !cluster_on)) {
     usage:
         fprintf(stderr, "usage: tsdbd --version\n"
                         "       tsdbd --dir DIR [--listen ADDR] [--port %d|0] [--port-file FILE] [--workers N]\n"
@@ -2971,9 +3000,25 @@ int main(int argc, char **argv)
                         "             [--max-request-memory MB] [--frame-timeout 60]\n"
                         "             [--query-threads N] [--request-threads N] [--multi-max-rows N]\n"
                         "             [--merge-idle-s 300|-1] [--flush-interval-ms 5000] [--insert-zstd-level 0|-1|N]\n"
-                        "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n",
-                TSDB_DEFAULT_PORT);
+                        "             [--no-auth] [--login-timeout 10] [--exit-with-parent[=PID]]\n"
+                        "             [--cluster --cluster-secret-file F [--peer-port %d|0] [--peer-listen ADDR]\n"
+                        "              [--advertise HOST] [--rack NAME]]\n",
+                TSDB_DEFAULT_PORT, TSDB_DEFAULT_PORT + 1);
         return 2;
+    }
+    uint8_t secret[CLUSTER_SECRET_MAX];
+    size_t secret_len = 0;
+    if (cluster_on) {
+        char err[512];
+        if (cluster_read_secret(secret_file, secret, sizeof secret, &secret_len, err, sizeof err) != 0) {
+            fprintf(stderr, "tsdbd: %s\n", err);
+            return 1;
+        }
+        const char *host = advertise ? advertise : addr;
+        if (!strcmp(host, "0.0.0.0") || !strcmp(host, "::")) {
+            fprintf(stderr, "tsdbd: --cluster on a wildcard --listen needs --advertise HOST\n");
+            return 2;
+        }
     }
     if (port_file)
         unlink(port_file);
@@ -3006,9 +3051,16 @@ int main(int argc, char **argv)
     /* static: the accept and failwatch threads read it through a pointer, and a startup failure after they began
      * (the port file) returns from main while they may not have read it yet */
     static int lfd;
+    if (cluster_on && peer_port < 0) /* by default the client port + 1; with --port 0 one the kernel chooses */
+        peer_port = port == 0 || port == 65535 ? 0 : port + 1;
     lfd = listen_on(addr, &port);
     if (lfd < 0)
         return 1;
+    int pfd = -1;
+    if (cluster_on) {
+        if ((pfd = listen_on(peer_addr ? peer_addr : addr, &peer_port)) < 0)
+            return 1;
+    }
     int mfd = -1;
     if (metrics_on)
         metrics_enable(); /* before any connection: the hooks count from the start */
@@ -3094,13 +3146,28 @@ int main(int argc, char **argv)
         fprintf(stderr, "tsdbd: cannot start the USERS reload thread: %s\n", strerror(rc));
         return 1;
     }
+    if (cluster_on) {
+        const char *host = advertise ? advertise : addr;
+        const char *lb = strchr(host, ':') ? "[" : "", *rb = strchr(host, ':') ? "]" : "";
+        char cadv[256], padv[256];
+        snprintf(cadv, sizeof cadv, "%s%s%s:%d", lb, host, rb, port);
+        snprintf(padv, sizeof padv, "%s%s%s:%d", lb, host, rb, peer_port);
+        struct cluster_cfg cc = {.dir = dir, .peer_fd = pfd, .advertise = cadv, .peer_advertise = padv,
+                                 .rack = rack, .secret = secret, .secret_len = secret_len};
+        if (cluster_start(&cc) != 0)
+            return 1;
+        tsdb_wipe(secret, sizeof secret);
+        fprintf(stderr, "tsdbd: cluster peer port on %s:%d (advertised as %s)\n", peer_addr ? peer_addr : addr,
+                peer_port, padv);
+    }
     fs_warn(db, o.verify_checksums);
     /* io stays last: scripts read it from the end of this line (bench-tsdb.sh, test_stability) */
     fprintf(stderr, "tsdbd: serving %s%s on %s:%d, %d workers, up to %zu connections, %s, simd %s, io %s\n", dir,
             o.follow ? " (following its writer)" : o.read_only ? " (read only)" : "", addr, port, nworkers,
             max_conns, no_auth ? "no login (--no-auth)" : "login required", tsdb_simd_level(),
             io == IO_URING ? "io_uring" : "epoll");
-    if (port_file && write_port_file(port_file, port, metrics_on ? metrics_port : 0) != 0) { /* last: whoever reads it finds a server that serves */
+    if (port_file && write_port_file(port_file, port, metrics_on ? metrics_port : 0,
+                                      cluster_on ? peer_port : 0) != 0) { /* last: whoever reads it finds a server that serves */
         fprintf(stderr, "tsdbd: cannot write %s: %s\n", port_file, strerror(errno));
         return 1;
     }
@@ -3118,6 +3185,8 @@ int main(int argc, char **argv)
     close(lfd);
     if (mfd >= 0)
         metrics_stop(); /* before tsdb_close: it reads the database */
+    if (cluster_on)
+        cluster_stop();
     pthread_mutex_lock(&work_lock);
     work_stop = true;
     pthread_cond_broadcast(&work_cv);
