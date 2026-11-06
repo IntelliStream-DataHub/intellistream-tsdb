@@ -18,6 +18,13 @@ make jepsen               # fault injection: kill -9, simulated power loss, paus
                           # (JEPSEN_WORKLOADS=classes: series switching partition classes under every nemesis)
 make fuzz-frames FUZZ_SECONDS=600   # mutate tsdbd request frames under ASan+UBSan (build-fuzz-frames/); a crash-* input,
                           # once fixed, goes to tests/fuzz/frames/, which make test replays
+make fuzz FUZZ_SECONDS=600 [FUZZ="codecx import"]   # the on-disk harnesses (tests/fuzz/fuzz_<name>.c: codec, codecx = codec
+                          # with an output buffer of exactly n values, part, manifest, wal, dict, volumes, tz, import = the
+                          # export stream, users = USERS, classes = CLASSES) under ASan+UBSan in build-fuzz/; make test
+                          # replays tests/fuzz/corpus/<name>/ (codecx uses codec's). A crash-* input, once fixed, goes there.
+                          # At a CPU level: make fuzz FUZZ_B=build-fuzz-v4 FUZZ_ARCH=-march=x86-64-v4 (or -v3; the
+                          # decoders compile differently at each; the harnesses' 64-byte locals are _Alignas(64) because
+                          # ASan's fake stack aligns to 32). make asan ASAN_ARCH=-march=x86-64-v4 likewise.
 make PORTABLE=1           # without -march=native
 make NO_URING=1           # tsdbd on epoll only, without liburing (after make clean)
 make dist                 # portable tarball (x86-64-v2 + v3/v4 codecs) in build-dist/; checks glibc and ISA

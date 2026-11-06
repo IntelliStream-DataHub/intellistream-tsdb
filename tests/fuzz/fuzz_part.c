@@ -44,7 +44,9 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
 /* part_hash (part.c) over b, when the footer's bounds allow it; part_open checks them again */
 static void reseal(uint8_t *b, size_t size)
 {
-    part_footer f;
+    /* at x86-64-v4 GCC copies this 64-byte struct with aligned zmm moves; ASan's fake stack aligns its frames
+     * to 32 bytes only, so without the alignment the harness itself faults (FUZZ_ARCH=-march=x86-64-v4) */
+    _Alignas(64) part_footer f;
     if (size < sizeof(part_header) + sizeof f)
         return;
     memcpy(&f, b + size - sizeof f, sizeof f);
@@ -135,7 +137,7 @@ void fuzz_seeds(const char *dir)
             snprintf(seed, sizeof seed, "seed-%s", tpl.f[i].rel);
             fuzz_put(dir, seed, tpl.f[i].d, tpl.f[i].n);
             /* its index alone */
-            part_footer f;
+            _Alignas(64) part_footer f;
             const uint8_t *d = tpl.f[i].d;
             size_t n = tpl.f[i].n;
             if (n < sizeof f)

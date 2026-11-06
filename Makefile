@@ -19,7 +19,9 @@ LDLIBS  += $(ZSTD_LIB) -lpthread -lm $(LINK_EXTRA)
 # Output directory; `make tsan` builds into its own, next to a normal build.
 B       ?= build
 # the fuzz harnesses (tests/fuzz/fuzz_<name>.c; see `make fuzz`)
-FUZZ_HARNESSES := codec part manifest wal dict volumes tz
+FUZZ_HARNESSES := codec codecx part manifest wal dict volumes tz import users classes
+# objects a harness links besides the library (in $(B) or build-fuzz/)
+FUZZ_OBJS_users := users.o tsdb_crypto.o
 TSDBD   ?= $(B)/tsdbd
 # Event loop backends the server tests and jepsen run against; `make test IO=epoll`
 # where io_uring is disabled (RHEL and AlmaLinux 10). NO_URING=1 builds tsdbd on
@@ -205,10 +207,14 @@ test: $(B)/test_tsdb $(B)/test_sched $(B)/test_multi $(B)/test_threads $(B)/test
 # Every input a run found a bug with is copied into the corpus with its fix.
 FUZZ           ?= $(FUZZ_HARNESSES)
 FUZZ_SECONDS   ?= 60
-FUZZ_B         := build-fuzz
+FUZZ_B         ?= build-fuzz
 FUZZ_CC        ?= $(CC)
+# The CPU level of `make fuzz`: generic x86-64 by default (scalar unpack). FUZZ_ARCH=-march=x86-64-v3 reaches the
+# AVX2 kernels, -march=x86-64-v4 the AVX-512 code generation (codecx, part and the others: all of it matters, the
+# decoders compile differently); the harnesses must work at every level, ASan's fake stack included.
+FUZZ_ARCH      ?=
 FUZZ_SAN       := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
-FUZZ_COMMON    := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off -Iinclude -Isrc -Iclient
+FUZZ_COMMON    := -std=gnu11 -Wall -Wextra -Wno-unused-parameter -fno-math-errno -ffp-contract=off -Iinclude -Isrc -Iclient -Iserver
 ifeq ($(findstring clang,$(FUZZ_CC)),clang)
 FUZZ_COV  := -fsanitize=fuzzer-no-link
 FUZZ_LINK := -fsanitize=fuzzer
@@ -220,14 +226,18 @@ FUZZ_DRV  := tests/fuzz/driver.c
 endif
 
 $(B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/driver.c tests/fuzz/fuzz.h tests/fuzz/template.h src/internal.h $(LIB)
-	$(CC) $(CFLAGS) -Isrc -Iclient -o $@ $< tests/fuzz/driver.c $(LIB) $(LDLIBS)
+	$(CC) $(CFLAGS) -Isrc -Iclient -Iserver -o $@ $< tests/fuzz/driver.c $(FUZZ_OBJS_$*:%=$(B)/%) $(LIB) $(LDLIBS)
+$(B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
+$(B)/fuzz-users: $(B)/users.o $(B)/tsdb_crypto.o
+$(B)/fuzz-import: tools/dump.c tools/dump.h tools/common.h
 
 fuzz-replay: $(FUZZ_HARNESSES:%=$(B)/fuzz-%)
 	for h in $(FUZZ_HARNESSES); do FUZZ_TMP=$(or $(TMPDIR),/tmp) ./$(B)/fuzz-$$h -replay tests/fuzz/corpus/$$h || exit 1; done
 
 ifneq ($(B),$(FUZZ_B))
 $(FUZZ_B)/libtsdb.a: FORCE
-	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH= CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@
+	$(MAKE) B=$(FUZZ_B) CC=$(FUZZ_CC) ARCH="$(FUZZ_ARCH)" CFLAGS="$(FUZZ_SAN) $(FUZZ_COV)" $@ \
+	    $(FUZZ_B)/users.o $(FUZZ_B)/tsdb_crypto.o
 
 # the driver is built without coverage: it holds the hook
 $(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
@@ -235,8 +245,10 @@ $(FUZZ_B)/driver.o: tests/fuzz/driver.c $(FUZZ_B)/libtsdb.a
 
 $(FUZZ_B)/fuzz-%: tests/fuzz/fuzz_%.c tests/fuzz/fuzz.h tests/fuzz/template.h src/internal.h $(FUZZ_B)/libtsdb.a \
                   $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o)
-	$(FUZZ_CC) $(FUZZ_COMMON) $(FUZZ_SAN) $(FUZZ_COV) -c -o $@.o $<
-	$(FUZZ_CC) $(FUZZ_SAN) $(FUZZ_LINK) -o $@ $@.o $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o) $(FUZZ_B)/libtsdb.a $(LDLIBS)
+	$(FUZZ_CC) $(FUZZ_COMMON) $(FUZZ_ARCH) $(FUZZ_SAN) $(FUZZ_COV) -c -o $@.o $<
+	$(FUZZ_CC) $(FUZZ_SAN) $(FUZZ_LINK) -o $@ $@.o $(if $(FUZZ_DRV),$(FUZZ_B)/driver.o) \
+	    $(FUZZ_OBJS_$*:%=$(FUZZ_B)/%) $(FUZZ_B)/libtsdb.a $(LDLIBS)
+$(FUZZ_B)/fuzz-codecx: tests/fuzz/fuzz_codec.c
 
 fuzz: $(FUZZ:%=$(FUZZ_B)/fuzz-%)
 	for h in $(FUZZ); do echo "== fuzz $$h, $(FUZZ_SECONDS) s"; mkdir -p $(FUZZ_B)/out/$$h; \
@@ -258,12 +270,14 @@ FORCE:
 # UBSan only prints by default and the run still exits 0: halt_on_error makes the first report fail
 # it. `ubsan-check` proves that with a program that overflows on purpose, then runs the CLI's parsers on
 # out-of-range input with float-cast-overflow added (GCC's `undefined` leaves it out).
+# ASAN_ARCH=-march=x86-64-v4 (or -v3) runs `make asan` at that CPU level (default: generic, see above)
+ASAN_ARCH  ?=
 ASAN_FLAGS := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 UBSAN_RUN  := halt_on_error=1:print_stacktrace=1
 asan: ubsan-check
 	$(MAKE) clean
 	UBSAN_OPTIONS="$(UBSAN_RUN) $$UBSAN_OPTIONS" \
-	$(MAKE) ARCH= CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" test
+	$(MAKE) ARCH="$(ASAN_ARCH)" CFLAGS="$(ASAN_FLAGS)" LDFLAGS="-fsanitize=address,undefined" test
 
 ubsan-check:
 	@mkdir -p $(B)
@@ -287,7 +301,7 @@ $(B):
 	mkdir -p $(B)
 
 clean:
-	rm -rf build build-tsan build-fuzz build-fuzz-frames $(DIST_B)
+	rm -rf build build-tsan build-fuzz build-fuzz-v3 build-fuzz-v4 build-fuzz-frames $(DIST_B)
 
 # ---- portable binaries (dist/README.dist): built here, run on AlmaLinux 10 ----
 # x86-64-v2 for CPUs as old as Nehalem (no AVX needed), with the codecs also compiled for

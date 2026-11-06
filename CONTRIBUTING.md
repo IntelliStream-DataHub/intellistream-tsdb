@@ -59,6 +59,7 @@ Run the tests that cover what you changed. In short:
 | the wire protocol or a client | `make test-clients` and `make integration-tests` |
 | a codec or a SIMD kernel | `make test` (it runs `tests/test_levels.c`); `make dist-test` for the CPU levels |
 | a frame the server parses | `make fuzz-frames FUZZ_SECONDS=600` |
+| a decoder, the export stream, USERS or CLASSES | `make fuzz FUZZ_SECONDS=600` (a codec also at `FUZZ_ARCH=-march=x86-64-v3` and `-v4` with its own `FUZZ_B`, see AGENTS.md) |
 | the version number | `make check-version` (`make test` runs it) |
 
 `make asan` cleans `build/` first. If something else is using `build/` (a running `tsdbd`, client tests), run

@@ -6,6 +6,9 @@
  * Input: byte 0 picks the decoder (the block dispatchers by type, or one
  * transform directly), bytes 1-2 the row count, the rest is the block. Like a
  * mapped part, the block is followed by BLK_SLACK readable bytes.
+ *
+ * With CODEC_EXACT_OUT (fuzz_codecx.c) the output buffer is exactly n values of the decoder's width, so a decoder
+ * that writes past n is caught; fuzz_codec.c hands every decoder MAX_GRANULE_ROWS x 8 bytes, which tolerates that.
  */
 #include "fuzz.h"
 #include "internal.h"
@@ -23,6 +26,15 @@ int LLVMFuzzerInitialize(int *argc, char ***argv)
 }
 
 enum { NSEL = 27 };
+
+#ifdef CODEC_EXACT_OUT
+/* the bytes per output value of each selector */
+static size_t width(int sel)
+{
+    static const unsigned char w[NSEL] = {8, 0, 0, 0, 0, 0, 8, 4, 4, 4, 4, 4, 4, 8, 8, 4, 4, 4, 4, 8, 8, 8, 4, 8, 8, 4, 8};
+    return sel >= 1 && sel <= 5 ? type_width(sel - 1) : w[sel];
+}
+#endif
 
 static int decode(int sel, const uint8_t *p, size_t len, size_t n)
 {
@@ -66,6 +78,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     buf = malloc(len + BLK_SLACK);
     memcpy(buf, data + 3, len);
     memset(buf + len, 0xa5, BLK_SLACK);
+#ifdef CODEC_EXACT_OUT
+    free(out);
+    out = malloc(n * width(sel));
+    if (!out)
+        return 0;
+#endif
     decode(sel, buf, len, n);
     return 0;
 }

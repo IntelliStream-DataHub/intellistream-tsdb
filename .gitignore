@@ -2,6 +2,8 @@
 /build/
 /build-tsan/
 /build-fuzz/
+/build-fuzz-v3/
+/build-fuzz-v4/
 /build-dist/
 *.o
 *.a
