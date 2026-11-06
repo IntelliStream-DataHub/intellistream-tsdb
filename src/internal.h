@@ -964,6 +964,8 @@ int intents_recover(struct eng *db);
 /* Exactly the names the engine gives part writers' tmp files and parts: what a cleanup at open may touch. */
 bool part_tmp_name(const char *name);
 bool part_file_name(const char *name);
+bool intent_file_name(const char *name); /* an insert's intent, txn_<pid>_<n>.intent */
+bool wal_file_name(const char *name);    /* a WAL segment, wal_<16 lowercase hex>.log (memtable.c) */
 void meta_tmp_make(char *buf, size_t cap); /* a volume add's own META temporary (db.c) */
 bool meta_tmp_name(const char *name);      /* the engine's or an add's META temporary */
 void pw_abort(part_writer *w);
@@ -1028,6 +1030,9 @@ extern __thread const qbudget *cur_budget;
 extern size_t multi_defer_bytes, multi_defer_rows; /* 16 MiB, 65536; tests lower them to force deferral */
 /* the most bounds one series of a TRIM request may keep: what one client request carries (tests lower it) */
 extern size_t multi_max_bounds;
+/* test hook: runs in tsdb_query_multi once the helpers were woken, before the caller conducts (a caller preempted
+ * there, which tests make certain) */
+extern void (*_Atomic multi_open_hook)(void);
 
 /* Threads for a query step that decodes `rows` rows in `items` independent pieces (granules): one per
  * query_rows_per_thread rows, at most one per item and query_threads. Small reads are fastest on the calling
@@ -1649,7 +1654,15 @@ typedef struct bk_windows {
 } bk_windows;
 int bucket_windows(const bk_windows *w, int64_t start, int64_t end, void **out, size_t *nout);
 int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g);
-int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n);
+/* Bounds must be strictly increasing (bounds_check: 0 or TSDB_ERR_INVALID). checked: the caller has checked them,
+ * once for many series (tsdb_query_multi), as a check per series costs a pass over every bound for each. */
+int bounds_check(const int64_t *bounds, size_t n);
+extern size_t bounds_checked; /* bounds that bounds_check has looked at so far (src/query.c); for tests */
+int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n, bool checked);
+/* tsdb_query_bounds, tsdb_query_spread_bounds (kind TSDB_MULTI_SPREAD) and tsdb_query_twa_bounds (TSDB_MULTI_TWA,
+ * opts unused, twa used) in one, with the bounds checked or not (volumes.c) */
+int query_bounds_of(tsdb *t, int kind, tsdb_sid series, int64_t start, int64_t end, const int64_t *bounds, size_t n,
+                    bool checked, const tsdb_query_opts *opts, const tsdb_twa_opts *twa, void **out, size_t *nout);
 int64_t bucketer_key(const bucketer *bk, int64_t ts);    /* the bucket of ts */
 int64_t bucketer_start(const bucketer *bk, int64_t key); /* the first instant of bucket key */
 /* Time-weighted averages (twa.c). */

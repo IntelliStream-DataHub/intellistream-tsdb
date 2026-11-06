@@ -512,7 +512,7 @@ explains each.</p>
 <div class="tabpanel" role="tabpanel" data-key="c">
 <p>The calls in <code>include/tsdb.h</code>. The C client has the same ones with the prefix <code>tsdbc_</code>
 (<code>tsdbc_query_spread</code>, <code>tsdbc_query_twa</code>, <code>tsdbc_query_lttb</code>).</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L475-L483"> *    double), and does not depend on the order of the rows.
+<pre><code class="language-c" data-src="include/tsdb.h#L477-L485"> *    double), and does not depend on the order of the rows.
  * Like every aggregate, the spread covers only the rows that are left: a
  * deleted, replaced-away or expired (retention) value is never part of it,
  * whether merges have removed it from disk yet or not.
@@ -521,7 +521,7 @@ explains each.</p>
  * do not. Arguments, order and limit as in tsdb_query_agg, tsdb_query_group_ex
  * and tsdb_query_bounds; opts may be NULL. Free with free(). */
 typedef struct tsdb_spread_bucket {</code></pre>
-<pre><code class="language-c" data-src="include/tsdb.h#L539-L549">typedef struct tsdb_twa_opts {
+<pre><code class="language-c" data-src="include/tsdb.h#L541-L551">typedef struct tsdb_twa_opts {
     tsdb_twa_method method;
     int64_t max_gap_ms; /* 0: no staleness limit */
     tsdb_order order;   /* of the buckets */
@@ -631,7 +631,7 @@ ValuePoints chart = client.queryLttb(energy, t0, t0 + 86_400_000, 500);</code></
 <p><code>tsdb_query_multi</code> calls your function once per series as the answers come;
 <code>tsdb_query_multi_collect</code> returns them all at once. The C client has <code>tsdbc_query_multi</code> and
 <code>tsdbc_query_multi_collect</code>.</p>
-<pre><code class="language-c" data-src="include/tsdb.h#L638-L643">int (*cancelled)(void *ctx);
+<pre><code class="language-c" data-src="include/tsdb.h#L641-L646">int (*cancelled)(void *ctx);
 void (*on_wait)(void *ctx, int delta);
 int (*budget_take)(void *ctx, size_t bytes);
 void (*budget_give)(void *ctx, size_t bytes);

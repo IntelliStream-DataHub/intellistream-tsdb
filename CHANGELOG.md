@@ -20,6 +20,49 @@ disk format and the wire protocol.
   hung-volume tests, `make jepsen`, `make dist` and the sanitizers stay Linux only. The Linux build is unchanged:
   the macOS code is behind `__APPLE__` or in inline `tsdb_*` wrappers that are the plain call on Linux, and the
   Linux objects are the same machine code as before.
+- tsdbd `--lttb-max-threshold N` (default 16,777,216): the largest LTTB threshold the server computes, for
+  QUERY_LTTB and QUERY_MULTI; a larger one is taken as this. A range of no more rows than that still answers every
+  point. Newest-first LTTB holds its chosen points until the last is chosen, so before this a threshold near the
+  rows of a series of billions held gigabytes for one request, outside `--max-request-memory`.
+
+### Changed
+- An operator's `volume add` (and `import --create-volumes`) refuses a directory that holds a file with a name the
+  volume would take for one of its own: `STATES`, `RETENTION`, `CLASSES`, a WAL segment (`wal_<16 hex>.log`), a
+  part, a part's temporary, a retired part, an intent or `META.tmp`. The first open would otherwise have cut such a file of the
+  user's as a torn tail, replayed it, run it or deleted it. The message names the file; nothing is written.
+
+### Fixed
+- tsdbd closes a connection whose output has not moved for `--send-timeout` seconds even when its whole reply fit in
+  the server's buffers (so no worker waited on it): before, a client that sent a query and never read the answer held
+  up to about 17 MB per connection for as long as it kept the socket open, outside `--max-request-memory`.
+- tsdbd no longer cuts a client that keeps reading its reply, only slowly. A reply larger than 8 MB was lost by a
+  client that read less than about 9 MB per `--send-timeout` (150 KB/s at the default of 60 s): a worker waiting for
+  output space gave up that long after its wait began, whether the output moved or not. Progress is now any change
+  in the socket's queue, checked every second, so the floor is gone for replies of any size. Time the server itself
+  was stopped (SIGSTOP, a frozen container) no longer counts against `--send-timeout`, `--frame-timeout` or
+  `--login-timeout`.
+- `tsdb_query_multi` (QUERY_MULTI) checks the bounds of a bounds query once per call instead of once per series:
+  65,536 series over the 33 million bounds of one frame took about 250 s of comparisons. Bounds that do not
+  strictly increase now answer `TSDB_ERR_INVALID` for every series, trimmed or not, as the single-series call does
+  on the whole bounds. Before, a trimmed series was answered from its own part of the bounds: buckets when that
+  part increased, empty when the series had no rows. No client sends such bounds.
+- `tsdb_query_multi` claims the first series for the caller before it wakes its helpers. A helper that ran first
+  took it as a series ahead: collected and held, or, over 65,536 rows, computed, thrown away and run again at its
+  turn. Measured with `tsdbc-bench query --multi 100 --conns 1` (100 series x 1 M rows, optimized; 0.9.0 and this
+  change interleaved, 5 runs each; series per second, mean +- sd, lowest-highest):
+
+  | query | 0.9.0 | this change |
+  |---|---:|---:|
+  | raw, 3600 samples | 79,247 +- 1,699 (77,153-81,053) | 79,511 +- 1,084 (77,652-80,413) |
+  | 86,400 samples in 288 buckets | 70,629 +- 1,967 (68,029-72,463) | 70,889 +- 1,363 (68,679-71,847) |
+  | 604,800 samples in 168 buckets | 40,522 +- 967 (39,116-41,286) | 37,939 +- 5,485 (28,190-41,001) |
+  | TWA, 604,800 samples in 168 buckets | 11,073 +- 184 (10,746-11,188) | 10,963 +- 240 (10,692-11,237) |
+  | the whole range in one bucket | 86,061 +- 705 (85,121-86,737) | 84,584 +- 675 (83,664-85,296) |
+
+  The same within the noise, but for the whole range in one bucket (about 12 us a series, from granule statistics):
+  1.7% fewer, in each of the five pairs of runs. The 168-bucket column has one slow run (28,190); the other four
+  average 40,376. Every answer here is far below 65,536 rows, so the change has nothing to save in this benchmark;
+  it saves where the first series' answer is larger.
 
 ## [0.9.0] - 2026-11-05
 

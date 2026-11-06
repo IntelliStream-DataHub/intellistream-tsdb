@@ -683,14 +683,25 @@ int bucketer_init(bucketer *bk, int64_t start, const tsdb_group *g)
     return 0;
 }
 
-int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n)
+size_t bounds_checked; /* bounds bounds_check has looked at so far; tests */
+
+int bounds_check(const int64_t *bounds, size_t n)
 {
-    memset(bk, 0, sizeof *bk);
+    __atomic_fetch_add(&bounds_checked, n, __ATOMIC_RELAXED);
     if (n == 0)
         return TSDB_ERR_INVALID;
     for (size_t i = 1; i < n; i++)
         if (bounds[i] <= bounds[i - 1])
             return TSDB_ERR_INVALID;
+    return 0;
+}
+
+int bucketer_bounds(bucketer *bk, const int64_t *bounds, size_t n, bool checked)
+{
+    memset(bk, 0, sizeof *bk);
+    int rc = checked ? (n ? 0 : TSDB_ERR_INVALID) : bounds_check(bounds, n);
+    if (rc)
+        return rc;
     bk->kind = BK_BOUNDS;
     bk->bounds = bounds;
     bk->nbounds = n;

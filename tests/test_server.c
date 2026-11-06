@@ -1003,6 +1003,66 @@ static void test_lttb_remote(tsdbc *c)
     free(valid);
 }
 
+/* Regression (release review N2): --lttb-max-threshold caps what a client may ask, so newest-first LTTB holds a
+ * bounded number of chosen points. A larger threshold answers as the cap does, both orders and in QUERY_MULTI; a
+ * range of no more rows than the cap still answers every point. */
+static void test_lttb_cap(const char *dir)
+{
+    char cmd[1200];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0) {
+        failures++;
+        return;
+    }
+    const char *extra[] = {"--lttb-max-threshold", "100", NULL};
+    pid_t srv = start_server_with(dir, extra);
+    tsdbc *c;
+    OK(tsdbc_connect("127.0.0.1", port, &c));
+    tsdb_sid s;
+    OK(tsdbc_series_create(c, "lttb.cap", TSDB_FLOAT64, NULL, &s));
+    enum { N = 5000 };
+    int64_t ts[N];
+    double v[N];
+    for (int i = 0; i < N; i++) {
+        ts[i] = T0 + (int64_t)i * 1000;
+        v[i] = sin(i / 40.0) * 10 + (i % 211 == 0 ? 50 : 0);
+    }
+    OK(tsdbc_insert_series_values(c, s, ts, &(tsdb_values){TSDB_FLOAT64, v, NULL}, N));
+    tsdb_query_opts asc = {TSDB_ASC, 0}, desc = {TSDB_DESC, 0};
+    lpts cap = {0}, big = {0}, bigd = {0}, few = {0};
+    OK(tsdbc_query_lttb_ex(c, s, INT64_MIN, INT64_MAX, 100, &asc, lttb_collect, &cap));
+    OK(tsdbc_query_lttb_ex(c, s, INT64_MIN, INT64_MAX, 1000000, &asc, lttb_collect, &big));
+    OK(tsdbc_query_lttb_ex(c, s, INT64_MIN, INT64_MAX, UINT64_MAX >> 1, &desc, lttb_collect, &bigd));
+    CHECK(cap.n == 100 && big.n == cap.n && bigd.n == cap.n);
+    for (size_t i = 0; i < cap.n && i < big.n && i < bigd.n; i++)
+        CHECK(big.p[i].ts == cap.p[i].ts && big.p[i].bits == cap.p[i].bits &&
+              bigd.p[cap.n - 1 - i].ts == cap.p[i].ts && bigd.p[cap.n - 1 - i].bits == cap.p[i].bits);
+    /* 60 rows: every point, whatever the threshold */
+    OK(tsdbc_query_lttb_ex(c, s, T0, T0 + 60000, 1000000, &desc, lttb_collect, &few));
+    CHECK(few.n == 60);
+    tsdb_multi_query q = {.kind = TSDB_MULTI_LTTB, .start = INT64_MIN, .end = INT64_MAX, .threshold = 1000000,
+                          .opts = desc};
+    tsdb_sid two[2] = {s, s};
+    tsdb_series_result *res;
+    OK(tsdbc_query_multi_collect(c, &q, two, 2, NULL, &res));
+    for (int k = 0; k < 2; k++) {
+        CHECK(res[k].status == 0 && res[k].n == cap.n);
+        for (size_t i = 0; res[k].status == 0 && i < res[k].n && i < cap.n; i++)
+            CHECK(res[k].ts[i] == cap.p[cap.n - 1 - i].ts &&
+                  ((const double *)res[k].values.values)[i] == cap.p[cap.n - 1 - i].y);
+    }
+    tsdbc_series_results_free(res, 2);
+    free(cap.p);
+    free(big.p);
+    free(bigd.p);
+    free(few.p);
+    tsdbc_close(c);
+    signal_pid(srv, SIGTERM);
+    waitpid(srv, NULL, 0);
+    if (system(cmd) != 0)
+        failures++;
+}
+
 /* A bucketed reply that does not fit a frame is refused with TSDB_ERR_TOO_MANY_BUCKETS, and the server computes
  * no more buckets than a frame carries (plus one) to find out: it used to build the whole reply, over 256 MB,
  * which the client then refused as a broken frame. A limit within a frame still answers. */
@@ -3527,6 +3587,9 @@ int main(int argc, char **argv)
     printf("hostile clients and flags\n");
     snprintf(dir, sizeof dir, "%s/tsdbd-hostile-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
     test_hostile(dir);
+    printf("the LTTB threshold cap\n");
+    snprintf(dir, sizeof dir, "%s/tsdbd-lttbcap-%d", argc > 1 ? argv[1] : "/tmp", (int)getpid());
+    test_lttb_cap(dir);
     if (failures) {
         printf("FAILED: %d checks\n", failures);
         return 1;

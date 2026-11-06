@@ -29,6 +29,7 @@ __thread const qbudget *cur_budget;
 size_t multi_defer_bytes = 16u << 20;
 size_t multi_defer_rows = 65536;
 size_t multi_max_bounds = (TSDB_MAX_FRAME - 64) / 8;
+void (*_Atomic multi_open_hook)(void);
 
 #define MULTI_HELD_DEFAULT ((size_t)64 << 20)
 
@@ -70,6 +71,7 @@ typedef struct mcall {
     size_t held, max_held;
     bool headonly, stop;
     uint64_t rows_sent, max_rows; /* the conductor's */
+    int bounds_rc; /* q's bounds checked once for the call (bounds_check), not by each series' query */
     sjob job;
 } mcall;
 
@@ -271,15 +273,12 @@ static int run_one(mcall *c, size_t i, msink *k)
     if (q->bounds && q->nbounds) {
         const int64_t *b = q->bounds;
         size_t n = q->nbounds;
+        if (c->bounds_rc)
+            return c->bounds_rc; /* each series answers INVALID, as its own query would */
         rc = q->trim ? trim_bounds(c, id, s, e, &b, &n) : 0;
         if (rc || n == 0)
             return rc;
-        if (q->kind == TSDB_MULTI_BUCKETS)
-            rc = tsdb_query_bounds(c->db, id, s, e, b, n, &q->opts, (tsdb_bucket **)&out, &nb);
-        else if (q->kind == TSDB_MULTI_SPREAD)
-            rc = tsdb_query_spread_bounds(c->db, id, s, e, b, n, &q->opts, (tsdb_spread_bucket **)&out, &nb);
-        else
-            rc = tsdb_query_twa_bounds(c->db, id, s, e, b, n, &q->twa, (tsdb_twa_bucket **)&out, &nb);
+        rc = query_bounds_of(c->db, q->kind, id, s, e, b, n, true, &q->opts, &q->twa, &out, &nb);
     } else if (q->group) {
         if (q->kind == TSDB_MULTI_BUCKETS)
             rc = tsdb_query_group_local(c->db, id, s, e, q->group, &q->opts, (tsdb_bucket **)&out, &nb);
@@ -463,8 +462,8 @@ static int conduct(mcall *c)
         size_t h = c->head;
         mslot *sl = &c->slots[h % c->W];
         if (sl->state == S_FREE || sl->state == S_DEFERRED) {
-            if (sl->state == S_FREE)
-                c->next++; /* nobody claimed it: head == next */
+            if (sl->state == S_FREE && c->next == h)
+                c->next++; /* nobody claimed it: head == next (but series 0, which the caller claimed at the start) */
             sl->state = S_RUNNING;
             pthread_mutex_unlock(&c->m);
             rc = run_head(c, h);
@@ -522,6 +521,8 @@ int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series
         return 0;
     int threads = clamp_threads(db, mo);
     mcall c = {.db = db, .q = q, .series = series, .n = n, .mo = mo, .fn = fn, .ctx = ctx};
+    /* once, not per series: 65,536 series over 33 M bounds (one frame of them) were 250 s of comparisons */
+    c.bounds_rc = q->nbounds ? bounds_check(q->bounds, q->nbounds) : 0;
     c.W = 2 * (size_t)threads;
     c.max_held = mo && mo->max_held_bytes ? mo->max_held_bytes : MULTI_HELD_DEFAULT;
     c.max_rows = mo ? mo->max_rows : 0;
@@ -544,9 +545,16 @@ int tsdb_query_multi(tsdb *db, const tsdb_multi_query *q, const tsdb_sid *series
     c.qs = &qr.q;
     c.cuts = cut ? &cuts : NULL;
     cur_cuts = c.cuts;
+    /* The caller claims series 0 before any helper wakes. A helper that ran before the caller's first look at the
+     * head would claim it as a series ahead: collected and held (a series over 65,536 rows computed and thrown
+     * away, to run again at its turn), when the caller would stream it at once. Helpers start at series 1. */
+    c.next = 1;
     /* helpers only run series ahead of the head: one series alone wakes none (a wakeup costs more than a
      * small query), though its own parallel work still has the group's cap */
     sched_open(query_sched(db), &c.job, (int)MIN((size_t)threads, n), task_fn, &c);
+    void (*hook)(void) = atomic_load(&multi_open_hook);
+    if (hook)
+        hook();
     int rc = conduct(&c);
     if (rc) {
         pthread_mutex_lock(&c.m);

@@ -1069,6 +1069,14 @@ static int wal_check_order(const seg *segs, size_t nseg, uint64_t parts_seq)
     return 0;
 }
 
+/* Exactly what wal_name writes (16 lowercase hex digits): a user's wal_x.log in a volume directory is neither
+ * replayed (and cut at a "torn tail") nor deleted. */
+bool wal_file_name(const char *name)
+{
+    return strlen(name) == 24 && strncmp(name, "wal_", 4) == 0 && strspn(name + 4, "0123456789abcdef") == 16 &&
+           strcmp(name + 20, ".log") == 0;
+}
+
 /* Replays WAL segments left by a previous run, then opens a fresh segment. A writer checks every segment first and
  * then calls before_replay (the open's cuts of torn tails), so nothing is written or cut until all checks passed. */
 int wal_open(eng *db, int (*before_replay)(eng *))
@@ -1084,11 +1092,8 @@ int wal_open(eng *db, int (*before_replay)(eng *))
     while ((e = readdir(d))) {
         uint64_t seq;
         int consumed = 0;
-        /* exactly what wal_name writes (16 lowercase hex digits): a user's wal_x.log in a volume directory is
-         * neither replayed (and cut at a "torn tail") nor deleted */
-        if (strlen(e->d_name) != 24 || strncmp(e->d_name, "wal_", 4) != 0 ||
-            strspn(e->d_name + 4, "0123456789abcdef") != 16 || strcmp(e->d_name + 20, ".log") != 0 ||
-            sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &consumed) != 1 || e->d_name[consumed])
+        if (!wal_file_name(e->d_name) || sscanf(e->d_name, "wal_%" SCNx64 ".log%n", &seq, &consumed) != 1 ||
+            e->d_name[consumed])
             continue;
         if (nseg == cap) {
             cap = cap ? cap * 2 : 16;
