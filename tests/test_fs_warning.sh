@@ -1,7 +1,7 @@
 #!/bin/bash
-# tsdbd says at startup when its directory is on ext2/3/4 or XFS and --verify-checksums is off (those file systems keep
-# no checksums of the data, so a damaged or misdirected data block would be read as wrong values), and says nothing
-# with --verify-checksums or on another file system (tmpfs, ZFS, btrfs, NFS).
+# tsdbd says at startup when its directory is on ext2/3/4 or XFS (macOS: APFS or HFS+) and --verify-checksums is off
+# (those file systems keep no checksums of the data, so a damaged or misdirected data block would be read as wrong
+# values), and says nothing with --verify-checksums or on another file system (tmpfs, ZFS, btrfs, NFS).
 #
 #   B=build tests/test_fs_warning.sh      (make test runs it; FS_TEST_DIR picks the file system, default /var/tmp)
 set -u
@@ -13,11 +13,17 @@ stop() { [ -n "$pid" ] && [ "$pid" -gt 1 ] 2> /dev/null && kill "$pid" 2> /dev/n
 trap 'stop; rm -rf "$base"' EXIT
 fail() { echo "test_fs_warning: FAIL: $*" >&2; exit 1; }
 
-fstype() { # GNU stat; macOS (BSD stat) has neither ext4 nor XFS, so no warning there
-    if [ "$(uname -s)" = Darwin ]; then echo darwin; else stat -f -c %T "$1"; fi
+fstype() { # GNU stat; on macOS (BSD stat has no name for it) the type mount(8) gives the mount point of $1
+    if [ "$(uname -s)" = Darwin ]; then
+        local mp line t
+        mp=$(df -P "$1" | tail -1 | awk '{print $NF}')
+        mount | while IFS= read -r line; do
+            case $line in *" on $mp ("*) t=${line##*" on $mp ("} && t=${t%%,*} && echo "${t%)}" && break ;; esac
+        done
+    else stat -f -c %T "$1"; fi
 }
 case $(fstype "$base") in
-ext2/ext3 | ext4 | xfs) want=1 ;;
+ext2/ext3 | ext4 | xfs | apfs | hfs) want=1 ;;
 *) want=0 ;;
 esac
 

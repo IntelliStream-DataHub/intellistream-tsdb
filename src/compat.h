@@ -33,6 +33,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -40,21 +41,29 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Durable sync: the real call first (the one tests interpose, and what Linux does), then the drive's cache flush.
- * A file system without F_FULLFSYNC (it answers ENOTSUP, EINVAL or ENOTTY) has only the first. Any other error,
- * EIO above all, is the caller's to treat as a failed sync. */
+/* TSDB_FAST_FSYNC, read once. One variable per binary (weak: every file that includes this shares it), so that the
+ * warning below comes once: the variable is easily left exported in a shell, and then real data would lose the drive
+ * cache flush without a word. */
+__attribute__((weak, visibility("hidden"))) int tsdb_fast_fsync_mode = -1;
+
 static inline int tsdb_fast_fsync(void)
 {
-    static int mode = -1;
-    int m = __atomic_load_n(&mode, __ATOMIC_RELAXED);
+    int m = __atomic_load_n(&tsdb_fast_fsync_mode, __ATOMIC_RELAXED);
     if (m < 0) {
         const char *e = getenv("TSDB_FAST_FSYNC");
-        m = e && *e && *e != '0';
-        __atomic_store_n(&mode, m, __ATOMIC_RELAXED);
+        int want = e && *e && *e != '0', unset = -1;
+        if (__atomic_compare_exchange_n(&tsdb_fast_fsync_mode, &unset, want, 0, __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED) && want)
+            fprintf(stderr, "tsdb: TSDB_FAST_FSYNC is set: syncs do not flush the drive's cache, so a power loss "
+                            "can lose acknowledged writes\n");
+        m = want;
     }
     return m;
 }
 
+/* Durable sync: the real call first (the one tests interpose, and what Linux does), then the drive's cache flush.
+ * A file system without F_FULLFSYNC (it answers ENOTSUP, EINVAL or ENOTTY) has only the first. Any other error,
+ * EIO above all, is the caller's to treat as a failed sync. */
 static inline int tsdb_full_flush(int fd)
 {
     if (tsdb_fast_fsync() || fcntl(fd, F_FULLFSYNC) == 0)

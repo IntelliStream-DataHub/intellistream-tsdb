@@ -686,7 +686,7 @@ static void test_keepalive_args(void)
     CHECK(tsdbc_connect("127.0.0.1", f.port, &c) == 0);
     int fd = client_fd(f.port); /* keepalive on by default: 30 s idle, every 10 s, 3 probes (as Rust and Java) */
     CHECK(fd >= 0);
-    CHECK(sockopt(fd, SOL_SOCKET, SO_KEEPALIVE) != 0); /* macOS returns the option bit, not 1 */
+    CHECK(sockopt(fd, SOL_SOCKET, SO_KEEPALIVE) > 0); /* macOS returns the option bit, not 1 */
     CHECK(sockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE) == 30);
     CHECK(sockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL) == 10);
     CHECK(sockopt(fd, IPPROTO_TCP, TCP_KEEPCNT) == 3);

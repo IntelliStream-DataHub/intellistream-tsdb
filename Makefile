@@ -81,7 +81,7 @@ BINS := $(B)/tsdb $(B)/tsdb-bench $(B)/test_tsdb
 
 all: $(LIB) $(B)/libtsdb.$(SOEXT) $(B)/tsdb $(B)/tsdb-bench $(B)/codec-bench $(B)/insert-bench $(B)/tsdbd $(CLIB) $(B)/tsdbc-bench $(B)/scale-bench $(B)/type-bench $(B)/twa-bench $(B)/fold-bench $(B)/threads-bench $(B)/decode-bench
 
-$(B)/%.o: src/%.c src/internal.h src/compat.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
+$(B)/%.o: src/%.c src/internal.h src/compat.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -c -o $@ $<
 # simd.c includes its kernels twice each (SSE and AVX, AVX and AVX2)
 $(B)/simd.o: src/simd_avx.inc src/simd_sse.inc
@@ -92,7 +92,7 @@ MEMSET_FLAG := $(shell $(CC) -mmemset-strategy=vector_loop:512:noalign,libcall:-
                  >/dev/null 2>&1 && echo -mmemset-strategy=vector_loop:512:noalign,libcall:-1:noalign)
 $(B)/simd.o: override CFLAGS += $(MEMSET_FLAG)
 
-$(B)/%.base.o: src/%.c src/internal.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
+$(B)/%.base.o: src/%.c src/internal.h src/ext80.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
 	$(CC) $(CFLAGS) -DTSDB_LV=base -c -o $@ $<
 
 $(B)/%.v3.o: src/%.c src/internal.h src/levels.h src/bitpack.h src/fpmode.h include/tsdb.h | $(B)
@@ -627,7 +627,7 @@ $(B)/test_group: tests/test_group.c $(LIB)
 $(B)/test_twa: tests/test_twa.c $(LIB)
 	$(CC) $(CFLAGS) -o $@ $< $(LIB) $(LDLIBS)
 
-$(B)/test_spread: tests/test_spread.c src/internal.h $(LIB)
+$(B)/test_spread: tests/test_spread.c src/internal.h src/ext80.h $(LIB)
 	$(CC) $(CFLAGS) -Isrc -o $@ $< $(LIB) $(LDLIBS)
 
 $(B)/test_limits: tests/test_limits.c $(LIB)

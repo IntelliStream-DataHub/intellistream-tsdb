@@ -51,17 +51,26 @@ read and write everything, so keep it on 127.0.0.1).
 **Durability.** On macOS a plain `fsync` hands the data to the drive but does not empty the drive's own cache, so a
 power cut could still lose an acknowledged write. tsdb therefore follows every `fsync` and `fdatasync` with
 `fcntl(F_FULLFSYNC)`, which waits for the drive. That is much slower (about 3.5 ms a call on the laptop this was
-ported on, against 0.03 ms for the plain call). For throwaway data, `TSDB_FAST_FSYNC=1` in the environment skips it.
+ported on, against 0.03 ms for the plain call). For throwaway data, `TSDB_FAST_FSYNC=1` in the environment skips it;
+every program that syncs then says so once on stderr (`TSDB_FAST_FSYNC is set: syncs do not flush the drive's
+cache`), so that a variable left exported in a shell does not quietly cost real data its durability.
+`make test` checks that APFS takes the cache flush on a directory as well as on a file (`test_compat`).
 
-Smaller differences, all in `src/compat.h` with the reason for each:
+Smaller differences, each with its reason in the code (most in `src/compat.h`):
 
 - `posix_fadvise` does nothing. tsdb uses it to drop a file's pages from the cache before it reads a damaged-looking
   tail a second time; on macOS that second read may come from the cache.
 - `sync_file_range` does nothing. It only starts the writeback early; the `fdatasync` after it still makes the data
   durable.
-- `tsdb import` with `fsync = 0` has no `syncfs` on macOS. It calls `sync()` (which starts writing every file system's
-  dirty data without waiting for it) and then syncs the directories, so the import is durable only as far as that got.
-- The warning that ext4 and XFS keep no checksums of the data is never printed: macOS file systems have other names.
+- `tsdb import` into a new directory syncs every file as it writes it. On Linux it writes the new database without
+  syncing file by file and syncs each file system once at the end (`syncfs`); macOS has no `syncfs`, and its `sync()`
+  does not wait for the writes. An import of many small series is therefore slower on a Mac (about one cache flush
+  per new series).
+- Integer variances and standard deviations (int64, bool) come from an exact 256-bit integer, converted through x87
+  `long double` on x86. On Apple silicon `long double` is a plain `double`, so `src/ext80.h` does the same arithmetic
+  in integers there: the answers have the same bits on both.
+- tsdbd's startup warning that the file system keeps no checksums of the data names APFS and HFS+ on macOS (ext4 and
+  XFS on Linux): they checksum only their own metadata, so `--verify-checksums` matters there as it does on ext4.
 
 All of these are compiled only on macOS (`#ifdef __APPLE__`, or a `tsdb_*` wrapper that is the plain call on Linux).
 The Linux build is the same machine code as without the port.
@@ -77,7 +86,8 @@ Each prints a line saying so when it runs.
   hung volume on macOS is therefore not known; do not rely on it there.
 - `test_ports` orphan and launcher_race. `tsdbd --exit-with-parent` works on macOS (it checks once a second whether
   its parent is gone), but these two tests need a subreaper (`PR_SET_CHILD_SUBREAPER`), which macOS lacks.
-- `test_spread` on Apple silicon: its reference arithmetic needs the 64-bit mantissa of x86's `long double`.
+- Most of `test_spread` on Apple silicon: its reference arithmetic needs the 64-bit mantissa of x86's `long double`.
+  Its known answers for the integer variances (x87's bits) run there too.
 - `test_connect_timeout` (a full accept queue answers differently) and the io_uring fallback of `test_stability`.
 - The metrics test that a client that does not read loses part of its reply: macOS loopback buffers hold all of it.
 
@@ -94,7 +104,5 @@ ported on, so the memory and thread checks (`make asan`, `make tsan`) run on Lin
   embedded Rust and Python builds hide the engine's internal symbols with `ld -r -exported_symbols_list`
   (`client/rust-sys/build.rs`); the Java embedded jar carries `libtsdb.dylib` (Maven profiles `macos-aarch64` and
   `macos-x86_64`). The Pulsar connector and `make integration-tests` were not run on macOS.
-- `test_multi` failed about 1 run in 12 on macOS (the budget check for series 0): a helper thread can claim series 0
-  ahead of the head. The race exists on Linux too but is rarer there.
 - VOLUMES and USERS are locked with open-file-description locks (`F_OFD_SETLKW`), which recent macOS SDKs define.
   If yours does not, the build stops in `src/volumes.c`; report it ([docs/tasks/macos.md](tasks/macos.md)).

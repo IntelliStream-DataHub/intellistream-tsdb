@@ -39,7 +39,8 @@ Platforms: Linux is the one production platform; every gate, benchmark and durab
 at any cost to Linux. macOS code goes behind `#ifdef __APPLE__` or into the portability headers (`src/compat.h`,
 `server/epoll_compat.h`, `tests/portable.h`), whose Linux side is the plain call inline, so the Linux objects stay
 the same machine code (check with `objdump -d` against main). A new Linux-only call in shared code needs its shim
-there; a test that cannot run on macOS prints that it is skipped. Nobody here has a Mac: what needs one goes into
+there; a test that cannot run on macOS prints that it is skipped. Answers must have the same bits there: arm64 has
+no x87 `long double` (int_variance takes `src/ext80.h`). Nobody here has a Mac: what needs one goes into
 docs/tasks/macos.md.
 Tests take a scratch directory as their first argument
 (`./build/test_tsdb /tmp/x`); default `/tmp`.

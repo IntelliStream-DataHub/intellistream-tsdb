@@ -36,7 +36,7 @@
  *
  * --verify-checksums checks each granule's checksum before a query decodes it
  * (off by default: meant for storage without checksums of its own). Without it, a directory on ext2/3/4 or
- * XFS, which keep no checksums of the data, gets a line at startup that says so (fs_warn).
+ * XFS (macOS: APFS or HFS+), which keep no checksums of the data, gets a line at startup that says so (fs_warn).
  * --pin-index keeps each part's granule index and tombstones in memory as the open checked them (about 32 to 51
  * bytes per granule; the tsdb_pinned_index_bytes metric), so damage that reaches a part file later cannot change
  * which granules a query reads or the statistics it answers from. Off by default: then they are read in place.
@@ -140,7 +140,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#ifdef __APPLE__ /* statfs; its f_type never names ext4 or XFS there, so fs_warn says nothing */
+#ifdef __APPLE__ /* statfs, with the file system's name in f_fstypename (fs_warn) */
 #include <sys/mount.h>
 #else
 #include <sys/vfs.h>
@@ -2955,7 +2955,11 @@ static void fs_warn(tsdb *t, int verify)
         struct statfs sf;
         if (!p || statfs(p, &sf) != 0)
             continue;
+#ifdef __APPLE__ /* f_type is only an index there; the name says it, and neither APFS nor HFS+ checksums data */
+        const char *fs = !strcmp(sf.f_fstypename, "apfs") ? "APFS" : !strcmp(sf.f_fstypename, "hfs") ? "HFS+" : NULL;
+#else
         const char *fs = sf.f_type == 0xEF53 ? "ext4" : sf.f_type == 0x58465342 ? "XFS" : NULL;
+#endif
         if (fs)
             fprintf(stderr, "tsdbd: %s is on %s, which keeps no checksums of its data, and --verify-checksums is off: "
                             "a damaged or misdirected data block would be read as wrong values. Turn on "

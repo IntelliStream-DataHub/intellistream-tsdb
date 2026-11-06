@@ -2111,9 +2111,17 @@ int main(int argc, char **argv)
 {
     tp_raise_nofile();
     const char *base = argc > 1 ? argv[1] : "/tmp";
-    static char canon[PATH_MAX]; /* static: nothing for LeakSanitizer to report at exit */
-    if (realpath(base, canon))   /* canonical, as VOLUMES keeps paths (/tmp is /private/tmp on macOS) */
+    /* canonical, as VOLUMES keeps paths (/tmp is /private/tmp on macOS); static: nothing for LeakSanitizer at exit.
+     * Kept in 400 bytes, a longer base refused: every path below is built in a fixed buffer and must fit whole. */
+    static char canon[PATH_MAX], base_buf[400];
+    if (realpath(base, canon))
         base = canon;
+    if (strlen(base) >= sizeof base_buf) {
+        fprintf(stderr, "test_volumes: scratch directory longer than %zu bytes: %s\n", sizeof base_buf - 1, base);
+        return 1;
+    }
+    memcpy(base_buf, base, strlen(base) + 1);
+    base = base_buf;
     char root[512], va[512], vb[512], other[512], cmd[2200];
     snprintf(root, sizeof root, "%s/tsdb-vol-%d/root", base, (int)getpid());
     snprintf(va, sizeof va, "%s/tsdb-vol-%d/mount_a/sensors", base, (int)getpid());
@@ -2332,7 +2340,7 @@ int main(int argc, char **argv)
     /* an add that crashed after the volume's META and before its VOLUMES line: the directory holds our ROOT_ID and
      * a META with a number no line gives it; the open ignores it, and the retried add completes it, under the
      * number it gets then (the second one's was taken by another add in between) */
-    char crashed[2][600], rid[700], ridtext[64];
+    char crashed[2][600], rid[1300], ridtext[64]; /* rid: GCC sizes crashed[k] as both rows */
     snprintf(rid, sizeof rid, "%s/ROOT_ID", va);
     read_text(rid, ridtext, sizeof ridtext);
     for (int k = 0; k < 2; k++) {
