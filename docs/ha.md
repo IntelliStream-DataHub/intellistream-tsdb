@@ -20,13 +20,13 @@
 | §4 Takeover | Steps 2-8 shared-mode only, kept (step 4 changed); step 1 is triggered by a metadata grant, and `ha init` becomes `tsdb cluster adopt`. |
 | §5 Addressing | Ids built (design-series64.md). Names are unique in the whole database with name slots (shared, design-cluster.md C18), not per volume; in shared mode a series lives in its slot's home and no volume records other volumes' series (design-ha-modes.md M14, §5.7). Ids are handed out only below a reservation committed in the metadata group (M12). `VOLUMES` becomes the metadata group's volume records; `volumes.cache` stays only as each node's record of the highest epoch it has seen per volume (M4). |
 | §6 Placement, polling, handoff | **Replaced** by the metadata group: grants, moves, rebalancing; `CLAIM` replaces `WANT` and `handoff_to` (design-ha-modes.md §5.3, §5.5). |
-| §7 Followers and reads | Shared-mode only, kept; owner reads wait for the read barrier, a fenced write issued after they arrived (design-ha-modes.md §5.5, M16). |
-| §8 Server | Admission shared (D19), built once in N1; systemd, watchdog and escalation shared-mode only. A release stuck on a wedged domain whose server is healthy escalates too (design-ha-modes.md §5.5, §15.2 below). |
+| §7 Followers and reads | Shared-mode only, kept; owner reads wait for the read barrier, a fenced write issued after they arrived (design-ha-modes.md §5.5, M16), on by default with `--read-barrier off` as the opt-out (M24, 2026-11-06). |
+| §8 Server | Admission shared (D19), built once in N1; systemd, watchdog and escalation shared-mode only. A release stuck on a wedged domain whose server is healthy escalates too, once one fenced call has been outstanding for 3 × lease and another candidate reports the domain UP (design-ha-modes.md §5.5, M25, 2026-11-06; §15.2 below). |
 | §9 Protocol, §9.1 Forwarding | **Shared by both modes.** `OWNERS` gossip of owners and epochs is replaced by the metadata watch stream; health still travels with the owner's reports. Version numbers: the protocol is at 12 now; this lands as a later version. |
 | §10 Failure modes | Shared-mode only; rows about polling, ranks and D38 read as design-ha-modes.md §5.2. |
 | §11 Configuration | NFS server and mount settings stay; tsdbd flags move to `tsdb cluster` settings. |
 | §12 Backend interface, §13 Tests | Shared-mode only, kept; `jepsen-ha` adds the metadata group's faults. |
-| §14 Implementation plan | **Replaced** by the combined plan, design-ha-modes.md §7 (its steps N0-N8 take this plan's steps 0-10). |
+| §14 Implementation plan | **Replaced** by the combined plan, design-ha-modes.md §7 (its steps N0-N8 take this plan's steps 0-10). Shared mode ships first with the minimum production HA set (M21); step 0's probe (N0) runs in the next maintenance window on one NFS server and a test pool, and if it finds no server-enforced fence, failover waits for an operator's attestation unless every node has a BMC the metadata leader reaches (M22, 2026-11-06). |
 | §15 NFS server outages | Shared-mode only, kept; ships first, on single servers (N1, which does not wait for the N0 probe). Under the metadata group an owned volume does not resume after DOWN but is claimed again by a cold open (§15.5's note, M17). Standby hold-back after grace (§15.2) is not needed under the metadata group. The wire bodies of §15.4 are defined in S0, before the 1.0 protocol freeze; N1 keeps only the single-server parts of §15.9 (no volumes-follower thread, no cross-node root repair). Operator commands become `tsdb cluster domain ...` and `volume ...` (design-ha-modes.md §8). |
 
 Status: design, not implemented. Scope: shared storage on NFSv4.1/4.2 over RDMA. An object-store backend (intellistream-objects) is planned for later, behind the interface in §12, and is not built now.
@@ -847,7 +847,7 @@ Each step lands with its tests green: `make test`, `make asan`, plus `make jepse
 ## Open questions
 
 1. **Lease time.** 10 s (the floor) gives about 11.5 s failover after node faults. 15 s tolerates more NFS server load before a false expiry but means about 17 s failover. Proposed: 10 s, margin 2 s.
-2. **Automatic reboot.** A tsdbd stuck in D state keeps its volumes' locks until the node reboots. May tsdbd escalate to `reboot-force` on its own (proposed), or should that stay manual?
+2. **Automatic reboot.** A tsdbd stuck in D state keeps its volumes' locks until the node reboots. May tsdbd escalate to `reboot-force` on its own (proposed), or should that stay manual? *Answered on 2026-11-06 for shared mode under the metadata group (design-ha-modes.md M25; the recommendation taken as the default, the user may change it): yes, on its own, for a stuck file or a release stuck on a wedged domain, once one fenced call has been outstanding for 3 × lease and another candidate reports the domain UP.*
 3. **Read routing.** Proposed: reads go to the owner (forwarded by any node), with lazy followers elsewhere only on fallback or by configuration. That saves NFS bandwidth for inserts but puts read CPU on the writers. Should there be dedicated read replicas by default?
 4. **Client-only partitions** do not fail over (D14). Acceptable?
 5. **The NFS server.** Is it dedicated? `fs.leases-enable=0` (no delegations) and a 10 s lease affect every client of that server.
@@ -1313,9 +1313,9 @@ Each step lands with `make test` and `make asan`. Steps that touch the disk path
 1. Hard mounts with tsdb's own detection, as proposed? Is any node mounted `soft`?
 2. Answered: Pulsar buffers writes during an outage (D28). Still open: the ingest rate per volume, which sizes the backlog to drain after a 3 h outage.
 3. Planned ZFS maintenance: how often? (`domain maint` drains.)
-4. Answered on 2026-10-24: it was believed that the ZFS servers do not run nfsdcld. It is required (§11): without it nfsd refuses every reclaim. [nfs-server.md](nfs-server.md) §2.4 explains how to check (EL10's `nfs-server.service` may already pull it in) and how to enable it. Still open: the check's result on each server, and the maintenance window for the restart that enabling it needs.
+4. Answered on 2026-10-24: it was believed that the ZFS servers do not run nfsdcld. It is required (§11): without it nfsd refuses every reclaim. [nfs-server.md](nfs-server.md) §2.4 explains how to check (EL10's `nfs-server.service` may already pull it in) and how to enable it. Still open: the check's result on each server, and the maintenance window for the restart that enabling it needs. *2026-11-06: N0 runs in the next maintenance window on one NFS server and a test pool (design-ha-modes.md M22); that server's check and restart happen there.*
 5. Monitoring agents on the tsdb nodes: which ones call statfs or `df`?
-6. Should placement spread tenants across servers?
+6. Should placement spread tenants across servers? *Answered on 2026-11-06 (design-ha-modes.md M23): by default names are placed by hash over all volumes, so every tenant spreads over every server; prefix groups are an option that keeps a prefix (a tenant, a plant) on one group of volumes, set before its first series exists.*
 7. Is there a spare head where pools can be imported? If so, `volume abandon` is the procedure.
 
 Answered on 2026-10-24: one export per ZFS pool (D21); per-volume ids with path addressing (D9); grace (D34); never serve reads from page cache (D23); no old clients (D32); a drop watermark (D33); built-in forwarding (D29).

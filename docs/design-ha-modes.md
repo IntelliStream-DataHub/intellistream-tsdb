@@ -4,7 +4,9 @@ Status: design, not implemented. Branch `ha-modes`, written on 2026-11-06 from m
 group of cluster step 1 (branch `cluster-s1`, 35e1456 and ede84e5) in view; revised the same day after two reviews
 (fencing and control plane; sharing, cost and operations; what changed is listed under "Review of 2026-11-06" at the
 end), and again after two verification passes (NFS fencing and durability; control plane and operations, read against
-cluster-s1 at e0bba99; "Verification of 2026-11-06" at the end). This document is the overview of tsdb's high availability. The two modes have their own designs:
+cluster-s1 at e0bba99; "Verification of 2026-11-06" at the end), and closed with the user's answers to its open
+questions the same day (M20-M25; "Open questions" at the end says what was asked).
+This document is the overview of tsdb's high availability. The two modes have their own designs:
 [ha.md](ha.md) (shared NFS storage) and [design-cluster.md](design-cluster.md) (servers with their own disks). This one
 says how they relate, what they share, which control plane runs both, and how a deposed writer is kept off shared
 storage.
@@ -46,9 +48,15 @@ writes meanwhile). Everything else in design-cluster.md (D1, D2, D4-D6, C1-C25) 
   re-reads everything from storage. That costs a few seconds per volume after an outage that lasted minutes or hours,
   and removes the class of bugs where an owner resumes with a picture of the files that a pool rollback has undone.
   The reserved epoch also lets an owner that restarts recover its own volumes while the metadata group is down (M18).
-- **Order**: shared mode ships first, because production runs on NFS (M9). Single-server outage handling (N1) starts
-  now on a test NFS server; the go/no-go probe on the production NFS servers (N0) gates the shared-mode failover
-  engine (N3-N7) and needs a maintenance window from the user. If N0 fails, §7 says what ships instead.
+- **Order**: shared mode ships first, with the minimum production HA set of §7 (M9, M21, decided by the user on
+  2026-11-06). Single-server outage handling (N1) starts now on a test NFS server; the go/no-go probe (N0) runs in the
+  next maintenance window on one production NFS server and a test pool, and gates the shared-mode failover engine
+  (N3-N7). If N0 finds no server-enforced fence, failover off a dead node waits for an operator's attestation that it
+  is off, unless every node has a BMC the metadata leader reaches (M22, §7).
+- **Decided with the user on 2026-11-06** (M20-M25): metadata voters on the OS disks of 3 (or 5) nodes in different
+  racks and power feeds; names placed by hash over all volumes, prefix groups optional; the read barrier on by
+  default (`--read-barrier off` to opt out); a stuck release kills tsdbd only after 3 × lease with another candidate
+  reporting the domain UP.
 
 ## Decisions
 
@@ -73,12 +81,18 @@ writes meanwhile). Everything else in design-cluster.md (D1, D2, D4-D6, C1-C25) 
 | M17 | **An owner never resumes a volume across a storage outage.** When the volume's domain went DOWN, a fenced call was in flight longer than `down_ms`, the domain's transport reconnected while the volume was SUSPECT, any of its files answered ESTALE, or RECHECK found a tail older than W wrote, the volume goes FENCED: abandon (poison, no cleanup), then a fresh claim at the epoch reserved for this node (M18), a cold open that reads the slots, the ledger, every chained file and the WAL from storage, with rollback detection (§5.4). A stall that never reached DOWN, without a reconnect, still returns through RECHECK. | Resuming with the in-memory `lstate` and append offsets after revalidating the WAL, MANIFEST, parts and `SERIES` (ha.md §15.5 step 3, the first revision) | *New in verification.* A pool rollback can remove records W saw fdatasynced (a `DROP` held only in the SLOG) while W keeps its lock: nfsdcld lives on the server's OS disk, so W reclaims in grace. W then appended past the rolled-back end of the ledger, and replay, which stops at the first bad record, dropped every later acknowledged COMMIT at the next takeover; a lost `CLASSES` record made the next open CORRUPT. A cold open re-reads what is on storage, so no picture of the files survives the outage that made it wrong. The price, a cold open per volume (0.5-3 s, at most 4 per server group per node), was already paid for a missed grace, and is small after an outage. It also gives up ha.md §15.5 step 4's re-log of memtable rows from memory in shared mode: acknowledged rows a rollback removed from the WAL are reported (DIVERGED, with the WAL position) and replayed from Pulsar, as they already were whenever the owner had restarted. It also takes U4 out of the server-restart case: an owner that never resumes cannot ack on a reclaim the server should have refused. |
 | M18 | **Every grant reserves the next epoch for its holder, and every member keeps its metadata copy on its local disk.** `VOLUME_LEADER(v, owner W, E)` also reserves E + 1 for W: any other node's next grant is E + 2. W may claim E + 1 on its own (M17, a restart, FENCED) without a new grant, under the lock and G2, and confirms it with `VOLUME_SELF(v, W, E + 1)` (conditional on E) once the metadata group answers. The copy (snapshot and applied index, in `--state-dir`) serves routing and logins after a restart, marked stale, while the group is away. | A fresh grant for every claim (the first revision); copies only in memory on non-voters (cluster-s1) | *New in verification.* With quorum lost, any tsdbd restart (the watchdog's SIGKILL, an OOM kill, an upgrade) dropped that node's locks, and its volumes then waited for quorum with nobody owning them; the restarted node had no users, no TOPOLOGY and no slot chains. E + 1 is reserved, so nobody else can ever write it, and G2 refuses it if anyone wrote E + 2. Creation and drops stay UNAVAILABLE until `VOLUME_SELF` commits (they need the metadata group anyway). |
 | M19 | **A slot move is two-phase.** The old home's owner stops creating in the slot under its dictionary lock and commits `SLOT_FREEZE(s, A, E_A)`, conditional on its epoch; only then does the leader commit `SLOT_MOVE(s, B)`. A frozen slot answers creations with MOVED. Both modes. | design-cluster.md §3.3's pause of one metadata commit | *New in verification.* A pause works only for an old home that has seen the commit: a stale owner of A could finish creating N after B's owner had asked A and created N too. The freeze is committed by A's owner itself, so no creation in A follows it, and a later owner of A inherits it by log order, as with reservations. |
+| M20 | **Metadata voters on the nodes' local OS disks** (user, 2026-11-06, open question 1: "yes, the production nodes have writable local OS disks"): 3 voters, or 5, on the OS disks of tsdb nodes in different racks and on different power feeds, in a state directory on its own small filesystem or under a quota (§5.6). Members record their rack and power feed; the leader picks voters across both. No `--witness` hosts are needed in production; the witness stays for deployments that lack such nodes. | Witness hosts; voters on the NFS/ZFS servers; voters on one rack or feed | The nodes have the disks, so no extra machines; distinct racks and feeds keep a single rack or feed fault from costing the quorum. M11's rules (never on NFS, never restored, voter-role faults) apply unchanged. |
+| M21 | **Shared mode first, with the minimum production HA set of §7** (user, 2026-11-06, open question 2): S0, N0, N1, N2-N7, S1, S2, S4 and N8; direct-mode clients (S3) after it; replicated mode's R2-R4 after N7, with R1 going on in parallel. | The cluster first; shared mode without S2 or S4 | Confirms M9. Production runs on NFS; the minimum set is what §7 found the failover needs (users and TOPOLOGY in the metadata copy for `adopt`, name slots for creation). |
+| M22 | **N0 runs in the next maintenance window**, on one production NFS server and a test pool (user, 2026-11-06, open question 3). **If it finds no server-enforced fence, fallback (i)**: a volume moves off a dead node only after an operator attests that the node is off (`volume move V NODE --dead OLD`), **unless every node has a BMC reachable by the metadata leader**, in which case (ii), a BMC power fence before each grant. The recommended default; the user may change it. The choice is a deployment setting (`failover = lease \| attested \| bmc`, in INIT and SETTINGS); `lease` is allowed only after N0 passed. | Waiting for a window of its own; one fallback for every deployment | One server and a pool that may be restarted and rolled back cover U1-U8, U13, U17, U19, U21 and O0 without touching production volumes. (i) needs no hardware and is safe whatever N0 finds; (ii) is automatic but only as reliable as the BMCs and the path to them, so it is chosen only where every node has one. |
+| M23 | **Names are placed by hash over all volumes by default; prefix groups are an option** (user, 2026-11-06, open question 4). With a prefix group, a name prefix picks a group of volumes (for example those on one server group) and the hash picks a slot home within it; a group is set before the first series of its prefix exists, since a later change would move slots (§5.7). | Grouping by default; per-plant volumes chosen by clients | Hashing spreads load and creation evenly with nothing to configure; the price, that one NFS server outage takes a slice of every plant, is what an operator can buy back per prefix where it matters. |
+| M24 | **The read barrier is on by default** (M16; open question 5, the recommendation taken as the default on 2026-11-06; the user may change it). Its cost is measured in N8 (V6). `--read-barrier off` (a node setting) falls back to the clock gate, for deployments that accept stale reads after a VM pause. | Off by default; no opt-out | Stale reads were ruled out (ha.md D23), and a frozen clock in a VM pause defeats any clock gate. The barrier's expected cost is one slot write and `fdatasync` on an idle volume, nothing under insert load. |
+| M25 | **A stuck release may kill tsdbd and escalate to a reboot on its own**, only when one fenced call of the volume has been outstanding for 3 × `lease_s` (30 s) **and** another candidate reports the volume's domain UP (§5.5; open question 6, the recommendation taken as the default on 2026-11-06; the user may change it). A release that is only slow is shortened, never killed. This also answers ha.md open question 2 for shared mode. | Manual reboots only; killing on any slow release | A wedged process is the only holder of a lock whose lease lives; without the kill its volumes wait for an operator. Requiring another candidate's UP report keeps a server outage, which every node sees, from killing every owner. |
 
 ## 1. The modes and when to use which
 
 | | **Shared mode** ([ha.md](ha.md)) | **Replicated mode** ([design-cluster.md](design-cluster.md)) |
 |---|---|---|
-| Hardware | Nodes without data disks (an OS disk is enough); volumes on NFSv4.1/4.2 (RDMA) exports of ZFS pools; 3 or 5 hosts with a local disk as metadata voters | Servers with their own NVMe; nothing shared |
+| Hardware | Nodes without data disks (an OS disk is enough); volumes on NFSv4.1/4.2 (RDMA) exports of ZFS pools; metadata voters on the OS disks of 3 or 5 of the nodes, in different racks and power feeds (M20) | Servers with their own NVMe; nothing shared |
 | Copies of the data | One, protected by the pool (raidz/draid, a mirrored SLOG) | Three (replication 3), on three servers |
 | Who writes a volume | Its owner: the node holding the volume's NFS lock at the current epoch | Its leader, which replicates to the in-sync set |
 | What survives | Any node fault, any number of nodes as long as one candidate is alive; not an NFS server outage (its volumes wait) | Two servers lost with their disks (min ISR 1) |
@@ -357,6 +371,7 @@ healthy": it stops feeding the watchdog, which kills tsdbd; if the kill does not
 reboots the node. Another candidate's UP report through the metadata group counts as
 ha.md §15.2's "probe of the same fs domain succeeded" for this rule. This costs all of W's volumes a failover, which is
 ha.md's existing price for a stuck file; it is the only way a wedged process lets go of a lock whose lease lives.
+Taken as the default on 2026-11-06 (M25; the user may change it).
 
 **The `CLAIM` file.** `<vol>/CLAIM`, 4 KiB, written by a refused claimant with one O_DIRECT `pwrite` at offset 0:
 `{magic, volume uuid, granted epoch, node id, metadata index, poll counter, withdrawn, xxh64}`, rewritten at every poll
@@ -377,7 +392,8 @@ WAL group commit or a ledger append (`fdatasync` returned 0, `fence_gen` unchang
 the first waiting read starts when nothing is in flight. One barrier serves every read waiting for it. LOST is sticky,
 so its success proves W held the lock after the read arrived, whatever W's clock says. Under insert load the barrier is
 the next group commit; on an idle volume it is one slot write and `fdatasync` (V6). Not at all once FENCED, RECHECK
-or released. Followers and `STALE_OK` stay as ha.md §7.
+or released. Followers and `STALE_OK` stay as ha.md §7. The barrier is on by default; `--read-barrier off` falls back
+to the clock gate for deployments that accept stale reads after a VM pause (M24, 2026-11-06).
 
 ### 5.6 Where the metadata group lives (M11)
 
@@ -398,7 +414,10 @@ or released. Followers and `STALE_OK` stay as ha.md §7.
   `systemd-coredump`: nodes built from one image fill those together, and a full disk on every voter at once loses
   quorum. tsdbd checks the free space at start and exports it (`tsdb_state_dir_free_bytes`, with an alert in the
   operator guide).
-- **Where voters go.** Never on the NFS/ZFS servers (an NFS outage would then also cost a voter, and two outages the
+- **Where voters go** (M20: the user confirmed on 2026-11-06 that the production nodes have writable local OS disks).
+  On the OS disks of 3 tsdb nodes, or 5, each in its own rack and on its own power feed (members record both, with
+  `--rack` and `--power-feed`, and the leader picks voters across them).
+  Never on the NFS/ZFS servers (an NFS outage would then also cost a voter, and two outages the
   quorum, and with it every failover for the other servers' volumes); each voter in its own rack and power feed; on
   the same network as the tsdb nodes and their clients (voters on a separate management network would move healthy
   owners away whenever that network is cut). The voters' disks must honour a cache flush, or have power-loss
@@ -454,7 +473,13 @@ or released. Followers and `STALE_OK` stay as ha.md §7.
   simulator and jepsen-ha move a slot while a creation runs on a paused old home. A moved slot depends on its earlier homes for creation of new names; an NFS outage of one
   then stops creation of new names in the slots that moved away from it (not lookups of series elsewhere). Moves are
   rate-limited, so a deployment that adds volumes rarely has few such slots.
-- Open question 4 asks whether placement by hash over all volumes is acceptable in production.
+- **Placement** (M23, decided by the user on 2026-11-06). By default a slot's home is chosen by hash over all volumes,
+  so a plant's series spread over every NFS server and one server outage takes a slice of every plant. **Prefix
+  groups** are an option: `tsdb cluster names group PREFIX --volumes V...` makes names starting
+  with PREFIX hash to slots homed in that group's volumes only, so a plant can live on one server group. A group must
+  be set before the first series of its prefix exists, since a later change would move slots; the command scans the
+  names of every volume (a rare admin operation) and refuses a prefix that already has a series. Groups are rules in
+  the metadata group, checked before the hash, longest prefix first. Built in S4.
 
 ## 6. Fencing on shared storage
 
@@ -659,7 +684,7 @@ likely to need), **gate hours** (machine time of the gates beyond `make test`), 
 | N7 | shared | Shared-mode HA manager: grants to claims (§5.5), `CLAIM` with its counter, `CLAIM_REFUSED`, `CLAIM_FAILED`, clean, shortened and stuck release, M6 moves, reservations and drops (indeterminate proposals), the cold open after every outage and the claim at the reserved epoch (M17, M18), rollback detection by positions, `tsdb cluster adopt`, `restore` and `domain rolled-back`, the shared-mode CLI (§8), watchdog and escalation (ha.md §8, §15.2) | 4-6 | 16-28 (`make jepsen-ha`: kill, power, pause, partition, NFS restart, local NFS fault, wedged domain, U4 broken by a fake nfsd, pool rollback with creations, and the cases of §6.4 added in verification) | — |
 | N8 | shared | Real NFS/RDMA runs (ha.md §13 a-h, §15 manual runs), takeover timings (U10), the read barrier's cost (V6), operator guide and runbooks (§8) | 2 | 2-3 days of runs | **maintenance windows**; a pool that may be rolled back |
 | S3 | both | Clients (design-cluster.md step 6): direct mode, streams, the 32-byte header, QUERY_MULTI split; Pulsar sink | 3 | 4 (test-clients, integration with failover) | — |
-| R1 | replicated | `src/repl.c` and its simulator (design-cluster.md step 2; first checkpoint 44b352b) | 1-2 | 6 (simulator soak) | — |
+| R1 | replicated | `src/repl.c` and its simulator (design-cluster.md step 2; first checkpoint 44b352b, review fixes 9f2cf49; its fifteen design gaps folded into design-cluster.md on 2026-11-06; still to add: a restored-directory fault, gap 14) | 1-2 | 6 (simulator soak) | — |
 | R2 | replicated | Engine replica mode (step 3); the marker backend of the journal hook | 2-4 | 6 (jepsen) | — |
 | R3 | replicated | Replication, ISR, promotion and leases in tsdbd (step 4 without what S2 built) | 3-4 | 12 (jepsen-cluster: kill, partition, pause, midcommit) | servers with disks |
 | R4 | replicated | Rebuild, catch-up, moves, leader balance (step 7) | 2-3 | 12 (jepsen-cluster: kill2, rebuild, slow) | servers with disks |
@@ -673,7 +698,8 @@ per-volume admission (SUSPECT and PROMOTING refused before a worker) and DIVERGE
 follow it; until then clients reach owners through forwarding. N1 also ships on its own to today's single servers.
 
 **Order** (M9):
-1. **Now**: schedule N0 with the user (the maintenance window is the long pole); S0 (it must land before 1.0); N1 on
+1. **Now**: N0 is booked for the next maintenance window, on one NFS server and a test pool (M22; the window is the
+   long pole); S0 (it must land before 1.0); N1 on
    a test NFS server with ha.md §15.1's default thresholds (N0's numbers tune them later); S1 and N2; R1 goes on.
 2. **After N0 passes**: N3, N4, N5, N6 on one track; S2 and S4 on another; N1 finishes on the third.
 3. **Then** N7 with its jepsen-ha matrix, then N8 in maintenance windows; S3 alongside.
@@ -687,7 +713,9 @@ for replicated mode, 8-13 track-days, and X1 and X3, 3-4. Gate time for the mini
 gates plus N8's 2-3 days of real NFS runs, **about 5-7 machine-days**, mostly jepsen-ha and the NFS runs. The calendar
 is set by the two maintenance windows (N0 and N8) and the review rounds, not by building.
 
-**If N0 fails** (the no-go branch, written down before the window so that the user can choose knowing it):
+**If N0 fails** (the no-go branch, written down before the window so that the user can choose knowing it; on
+2026-11-06 the user took (i) unless every node has a BMC the metadata leader reaches, then (ii): M22, the recommended
+default, which the user may change):
 - *OFD locks do not fence over RDMA, POSIX locks do* (U1 holds for POSIX locks owned by one thread): ha.md §14 step
   0's fallback changes F1's mechanics, not this design.
 - *No lock form fences* (U1 fails for both, U5 or U19 fails so in-flight I/O outlives the lock, or U3 fails so a
@@ -710,7 +738,11 @@ is set by the two maintenance windows (N0 and N8) and the review rounds, not by 
   slots, users), epoch-conditional operations applied one by one, snapshots, the step checker and the simulator. All
   of it serves shared mode as it is: an owner change is `META_OP_VOLUME_LEADER` with candidates as the ISR (M8).
 - **What step 1 must change, before its formats settle** (to go into cluster-s1's task; this design does not edit
-  another track's files):
+  another track's files). This is the **complete list of amendments the running cluster-s1 track must take**: items
+  1-9 from the review and verification, 10-14 from the user's answers of 2026-11-06 (M20-M25), 15-22 from the gaps
+  that cluster step 2's simulator found in design-cluster.md (folded in there on 2026-11-06, "Corrections from step
+  2's simulator"; `repl.h`'s `struct repl_vmeta` and `repl_meta_promote` at 9f2cf49 are the reference). design-cluster.md
+  §14 points here rather than keeping a second list.
   1. An extensible heartbeat body: `HB{node, incarnation, applied, typed sections}`, the first sections being owned
      volumes (role, epoch, health reason, dictionary lengths) and storage domains (state). The leader keeps a
      per-(volume, domain) `local_fault_s` timer from them (M6).
@@ -737,8 +769,54 @@ is set by the two maintenance windows (N0 and N8) and the review rounds, not by 
      current epoch), positions in grant and reservation entries (§5.4), and a restore generation for
      `tsdb cluster restore` (§8.1). The checker gains: no epoch is granted to a node other than the one it is
      reserved for; no slot moves without a freeze.
-- **Step 2 (`cluster-s2`, 44b352b)**: the sans-IO replication core. Shared mode needs none of it (one copy, no
-  ISR), and is not blocked by it. What carries over is the method (a sans-IO core under a seeded simulator), which
+  10. *(user, M20)* A power feed beside the rack in `MEMBER_ADD` and the member record (`tsdbd --power-feed`, like
+      `--rack`); `manage_voters` picks 3 voters (5 from 5 eligible nodes) in distinct racks and distinct power feeds
+      when there are enough, among `voter_ok` members only (item 6).
+  11. *(user, M22)* A deployment setting `failover = lease | attested | bmc` in INIT and SETTINGS. Under `attested`
+      the leader never grants a shared volume away from a node it no longer hears (grant reasons 1 and 4 of §5.5);
+      only an operator's `VOLUME_LEADER` with an attestation (`volume move V NODE --dead OLD`, which records who
+      attested and when) does. `bmc` needs a BMC address per member (`MEMBER_ADD`) and a power-off confirmation
+      before such a grant. `lease` is today's rule.
+  12. *(user, M24)* A deployment setting `read_barrier` (on by default), which a node's `--read-barrier off`
+      overrides for itself; the node reports it in its heartbeat so `tsdb cluster status` shows who runs without it.
+  13. *(user, M23)* Nothing in S1 for prefix groups beyond room in the snapshot for a rule list
+      (`NAME_GROUP(prefix, volumes)`), which S4 adds; slot homes stay `META_OP_SLOT_HOME` over all volumes.
+  14. *(user, M25)* Nothing in `meta.c`: the stuck-release rule uses `lease_s` (item 5) and the domain health in
+      heartbeats (item 1). The heartbeat's volume section carries the age of the oldest outstanding fenced call, so
+      the leader and `status` can show a release on its way to the kill.
+  15. *(step 2, gap 3)* **Replica instances.** Each replica entry and each ISR member names the replica's instance
+      id (`rid`, 64 bits, new for every fresh directory): `struct meta_replica` gains `rid`, `isr[]` becomes (node,
+      rid) pairs, `REPLICA_ADD` names the learner's rid, and `ISR_CHANGE` and `VOLUME_LEADER` carry the rid of every
+      member they list. A member whose rid differs from the record's is not in the ISR, whatever its node id.
+  16. *(step 2, gaps 5 and 11)* **The promoted ISR keeps the fenced members that did not answer**, the old leader
+      included, marked in an `unanswered` mask of the volume record; a later `ISR_CHANGE` by the new leader clears or
+      drops them. `VOLUME_LEADER` as a promotion takes the fenced set and the replies (node, rid, durable end, last
+      epoch) and applies `repl_meta_promote`'s rule, so the state machine and the simulator share one function.
+  17. *(step 2, gap 8)* **A promotion is conditional on the ISR version as well as the epoch** (the basis the fences
+      were sent for). `meta_op_volume_leader` names only the epoch today; an `ISR_CHANGE` committed by the deposed
+      leader after the fences went out would otherwise be undone by the promotion.
+  18. *(step 2, gap 7)* **The epoch history is not capped at a count.** `meta.c` keeps every epoch now, which is right:
+      a returning replica may hold any epoch back to its oldest retained segment. If it is ever trimmed, then by a
+      position the volume's leader reports (the oldest position any replica may still hold), never to "the last
+      64". The checker gains: the history only grows at its end, and each entry's start is above the previous one's.
+  19. *(step 2, gap 14)* **A replica's open generation**: `REPLICA_OPEN(v, node, rid, gen)`, committed before the
+      replica answers a fence, sends an ACK or leads, conditional on `gen` being above the recorded one; the record
+      keeps the last `gen` per replica. A directory whose REPL generation is below the record's is a restored copy
+      and is refused (design-cluster.md §8.5).
+  20. *(step 2, gap 4)* Nothing in `meta.c` for "a restarted leader never resumes its epoch": the core resigns
+      (`led` in REPL), and the state machine must accept a promotion away from a leader that is alive and heard
+      (grant reason "the leader resigned": a `RESIGN(v, epoch)` request, the core's `REPL_M_RESIGN`), fencing as for
+      a dead leader.
+  21. *(step 2, gap 1)* Nothing in `meta.c` for ISR growth beyond item 15: the joining replica is counted by the
+      leader from the moment it asks (R3), and `ISR_CHANGE` stays conditional on epoch and ISR version. The checker
+      gains: an ISR member added by `ISR_CHANGE` had been a replica (`REPLICA_ADD`) with the same rid.
+  22. *(step 2, gap 15)* **A shrink's `ISR_CHANGE` carries the leader's commit point** when it asked, kept in the
+      volume record, so that `tsdb cluster status` and `volume force-leader` can show which remaining replicas hold
+      everything up to it (an unclean promotion is safe exactly when nothing was acknowledged after the last shrink).
+- **Step 2 (`cluster-s2`, 44b352b, then 13081cc and 9f2cf49 after review)**: the sans-IO replication core. Shared
+  mode needs none of it (one copy, no ISR), and is not blocked by it. Its simulator found fifteen gaps in
+  design-cluster.md, folded in there on 2026-11-06 (its "Corrections from step 2's simulator"); items 15-22 above are
+  what they ask of step 1. What carries over is the method (a sans-IO core under a seeded simulator), which
   the shared-mode HA manager should copy: grants, lock results, heartbeats and `CLAIM` reads in; claims, releases and
   reports out; checked for G1-G5 against a fake NFS server that expires client state and, in one mode, breaks U4.
 
@@ -752,6 +830,8 @@ is set by the two maintenance windows (N0 and N8) and the review rounds, not by 
 | `node add\|drain\|out`, `status` | both | Members; `status` groups shared volumes by server and domain (ha.md §15.7). |
 | `volume add --shared PATH` / `volume add` | shared / replicated | A volume of the deployment's kind; a shared volume's path is checked on every candidate (ha.md D26). |
 | `volume move V NODE` | both | A planned handoff (§5.5 grant reason 3). |
+| `volume move V NODE --dead OLD` / `node dead OLD` | shared | Under `failover = attested` (M22): the operator attests that OLD is powered off (or its tsdbd stopped and the export unmounted); the grant records who attested and when. `node dead` does it for every volume OLD owned. |
+| `names group PREFIX --volumes V...` | both | A prefix group (M23): names with PREFIX get slot homes in those volumes only. Refused once a series with the prefix exists. |
 | `user add\|revoke\|grant ...` | both | Users and grants in the metadata group. `tsdb DIR user` refuses on an adopted root and names this command. A revoke reports the members that have not applied it yet (their applied index from heartbeats) and waits for them up to `--wait` (10 s); a member cut off from the group keeps accepting the revoked user until it hears the group again. |
 | `restore --from NODE` | both | The Raft majority is gone for good: rebuilds the group from the surviving voter with the highest log, after the operator confirms. It starts a new restore generation, so an old voter that comes back is refused, not merged. Shared mode seeds each volume's epoch, reservations and watermark from the owners' heartbeats and from storage (witnesses mount nothing); an owner whose `VOLUME_RESERVE` or `VOLUME_SELF` the restored group refuses because it holds an older epoch reports `CLAIM_REFUSED` with its epoch, which lifts the volume's epoch (§5.4). Replicated mode seeds from the replicas. |
 | `adopt ROOT` | shared | Takes an existing NFS database in (§5.4). |
@@ -771,6 +851,7 @@ is set by the two maintenance windows (N0 and N8) and the review rounds, not by 
 | An NFS server down for hours | Its volumes are UNAVAILABLE (DOWN, `retry_after` up to 60 s); nothing moves (M6); Pulsar holds the writes; the rest runs at full speed. When it returns, each owner claims its volumes on it again at their reserved epochs by a cold open (M17), 4 at a time per server group per node. | Nothing in tsdb. Afterwards `tsdb cluster status`: any DIVERGED volume means the pool lost acknowledged writes. If the pool comes back on another head or address: `volume relocate` (or `domain abandon` when threads are stuck). |
 | A pool rolled back (`zpool import -F`, a lost SLOG) | No owner resumes (M17); the claim fills LOST ids up to the reservations, re-applies the watermarks, and marks a volume DIVERGED when storage is behind the positions last reported (§5.4); clients with cached ids of lost series get NOTFOUND. tsdb cannot see every rollback (one within the last heartbeat, or a site power loss that also took the Raft leader). | **Always** run `domain rolled-back D` when ZFS reports the import or the SLOG loss. Then check `tsdb_lost_parts`; replay the lost window from Pulsar if it still holds it; then `volume ack-divergence`. |
 | A pool lost | Its volumes stay UNAVAILABLE. | Restore the pool from a backup into an export, `volume relocate`; the restore is a rollback (row above). |
+| A node dead, under `failover = attested` (N0 found no server-enforced fence, M22) | Its volumes are UNAVAILABLE(NO_OWNER) with an alert naming the node; nothing moves on its own. | Make sure the node is off (power, or tsdbd stopped and the exports unmounted), then `tsdb cluster node dead OLD`; its volumes are granted and claimed as after a lease. Never attest a node that may still be running. |
 | A node's OS disk lost | Its volumes fail over after the lease; a voter is replaced after `voter_replace_s`. | Reinstall; `node add` it as a **new** member. Never restore its state directory from a backup or image (M11). |
 | A voter's state disk full or failing | It drops its core (`core_dropped`, `retired`), keeps its volumes and is replaced as a voter after `voter_replace_s` (§5.6); the free-space alert fires first. | Free the space or replace the disk; clear `retired` and `node add` it as a new member to make it a voter again. |
 | The Raft majority lost | Owners keep serving; no grants, moves, admin or watermark raises; creation until reservations run out. An owner that restarts or is FENCED by an NFS restart claims its own volumes again at their reserved epochs (M18) and serves routing and logins from its persisted copy, without creation or drops in those volumes. A node that dies for good leaves its volumes waiting. | Bring voters back. Avoid planned restarts and upgrades of tsdb nodes until they are back. If they are gone for good: `tsdb cluster restore --from NODE` (§8.1). |
@@ -796,8 +877,8 @@ finding was taken; where a part of one was not, it says why ("Considered in revi
 | Fencing 5 (medium): a refused claim has no way forward | M4, §5.4 `CLAIM_REFUSED`, M13's new incarnation, seeding at adopt and restore |
 | Fencing 6 (medium): M6 needs the owner's lease to die | M6, §5.2, §5.5 stuck release; ha.md §15.2 |
 | Fencing 7 (low): a stale claimant can expire a live owner's whole client | §5.5 step 3: poll only with a fresh copy, `raft_read_index` every 8 polls |
-| Fencing 8 (low): a frozen clock gives stale owner reads | M16, §5.5 Reads: the read barrier; open question 5 on its cost |
-| Sharing 1 (high): name slots carry cluster assumptions into shared mode | M14, §5.7; open question 4 |
+| Fencing 8 (low): a frozen clock gives stale owner reads | M16, §5.5 Reads: the read barrier; open question 5 on its cost (answered: M24) |
+| Sharing 1 (high): name slots carry cluster assumptions into shared mode | M14, §5.7; open question 4 (answered: M23) |
 | Sharing 2 (high): a voter's storage fault takes down a healthy data plane | M11, §5.6, §7.1 items 2-4 |
 | Sharing 3 (medium): a 3 s node timeout for shared volumes | M13 (was open question 6) |
 | Sharing 4 (medium): mixing per volume rests on a migration path that does not work | M7, §4; X2 dropped (was open question 3) |
@@ -834,16 +915,16 @@ the low ones too, except where noted.
 | V2-0 6, V2-1 7 (low-medium): grants to a claimant that cannot reach the storage; local claim faults loop | §5.5: grants only to candidates reporting the domain UP, re-grant by reason (6), `raft_read_index` after a blocking lock call, `CLAIM_FAILED` (§5.4) |
 | V2-0 7 (low): the stuck-release rule fired on slow releases | §5.5: a slow release is shortened (no flush) after `release_stuck_s`; only a call outstanding for 3 × lease is stuck |
 | V2-0 8 (low): `CLAIM` written once could be overwritten by an older record | §5.5: rewritten at every poll; any valid record above the owner's epoch is news |
-| V2-0 9 (low): voters' disks may lose acknowledged entries on power loss | V7; §5.6 placement; open question 1 |
+| V2-0 9 (low): voters' disks may lose acknowledged entries on power loss | V7; §5.6 placement; open question 1 (answered: M20) |
 | V2-1 1 (high): a voter with a faulty disk is never replaced; no voter eligibility, no `--witness` step | M11, §5.6 (flags, progress-based replacement, `retired`, the state directory's own filesystem and alert), §7.1 items 6-8, S1 |
 | V2-1 2 (medium): any restart during quorum loss lost that node's volumes and logins | M18: reserved epochs, `VOLUME_SELF`, persisted copies; §5.2, §8.2 corrected |
 | V2-1 3 (medium): `CLAIM` could make an owner release after the claimant gave up | M5, §5.5: poll counter, `withdrawn`, release only on an advancing counter, the claimant resumes, re-grant by reason (6) |
 | V2-1 4 (medium): replicated-mode leader reads stop during quorum loss, the runbook said otherwise | The simpler of the two fixes: stated in §3, §8.2 and design-cluster.md §6.7, §7.1; an ISR-based read lease is listed under "Later" there |
 | V2-1 5 (medium): the minimum HA set left out N1 and cut S2; totals did not add up; users in two steps | §7: minimum restated with N1 and all of S2, totals recomputed; users in S2 in both documents |
-| V2-1 6 (medium): N0 gated N1; no no-go branch; U3 missing | M9, §7: N1 starts now; N0 gates N3-N7; U3, U8, U17 in N0; "If N0 fails" with outcomes (i) and (ii); open question 3 |
+| V2-1 6 (medium): N0 gated N1; no no-go branch; U3 missing | M9, §7: N1 starts now; N0 gates N3-N7; U3, U8, U17 in N0; "If N0 fails" with outcomes (i) and (ii); open question 3 (answered: M22) |
 | V2-1 8 (low): `tsdb cluster restore` only in the runbook | §8.1 with its restore generation, seeding and refusal rules; N7 |
 | V2-1 9 (low): a revoke does not reach nodes cut off from the group | §5.6, §8.1: the revoke reports and waits for laggards; the runbook says so |
-| V2-1 10 (low): no guidance on where voters go | §5.6 placement; open question 1 |
+| V2-1 10 (low): no guidance on where voters go | §5.6 placement; open question 1 (answered: M20) |
 
 **Considered in verification.**
 - *Keeping ha.md §15.5 step 4's re-log of memtable rows from memory in shared mode*: dropped (M17). It is exactly the
@@ -855,34 +936,53 @@ the low ones too, except where noted.
 
 ## Open questions
 
-No new answers from the user since the first revision; these are the same questions, updated by verification.
+**All six were answered on 2026-11-06** and are decisions M20-M25. The user answered 1 to 4; for 5 and 6 the
+recommendations were taken as defaults, which the user may change, and for 3 the fallback is the recommended default.
+The questions are kept below with their answers, so the reasoning stays readable.
+
+**Still open** (facts to collect, not choices): which nodes, racks and power feeds carry the voters, and whether
+their OS disks honour a cache flush (V7, checked on one voter host in S1 or N0); the date of the next maintenance
+window, and whether nfsdcld is already enabled on the server N0 uses (ha.md §15.10 q4); whether every node has a BMC
+the metadata leader can reach (it decides between fallbacks (i) and (ii) if N0 fails, M22); the prefix groups, if
+any, that the operator wants before the first series of those prefixes are created (M23).
 
 1. **Do the production nodes have a writable local OS disk that can hold the Raft log** (kilobytes, a few syncs a
    minute) on a filesystem of its own or under a quota, and does it honour a cache flush (V7)? If fewer than 3 do,
    where can witnesses run? *Recommended: voters on the OS disks of 3 (or 5) nodes in different racks and power
    feeds, never on the NFS/ZFS servers, on the tsdb network; otherwise 3 small `tsdbd --witness` hosts with a disk.*
    The log must never be on NFS (M11).
+   **Answered by the user on 2026-11-06: yes**, the production nodes have writable local OS disks; voters on the OS
+   disks of 3 (or 5) nodes in different racks and power feeds (M20, §5.6).
 2. **Shared mode first, with the minimum production HA of §7** (S0, N0, N1, N2-N7, S1, S2, S4, N8: about 27-39
    track-days and 5-7 machine-days; direct-mode clients after)? *Recommended: yes*; N1 ships to today's single
    servers first, and the cluster's replication core continues in parallel.
+   **Answered by the user on 2026-11-06: yes**, shared (NFS) mode first with the minimum production HA set (M21, §7).
 3. **When can N0 run on the production NFS servers, and if it finds no server-enforced fence, which fallback** (§7,
    "If N0 fails": (i) failover only after an operator attests the old node is off, or (ii) a BMC power fence before
    each grant)? It needs nfsd restarts and nfsdcld enabled (ha.md §15.10 q4), and it gates N3-N7. *Recommended: the
    next maintenance window, on one server and one test pool; S0, N1, S1 and N2 do not wait for it. Fallback (i),
    unless every node has a BMC the metadata leader can reach.*
+   **Answered by the user on 2026-11-06**: N0 runs in the next maintenance window, on one NFS server and a test pool;
+   if it finds no server-enforced fence, fallback (i) unless every node has a BMC reachable by the metadata leader
+   (the recommended default; the user may change it). M22, §7.
 4. **Placement of names in shared mode** (M14): a name's home volume is chosen by hash over all volumes, so a plant's
    series spread over every NFS server and one server outage takes a slice of every plant. Acceptable, or should
    homes be grouped (a name prefix picks a group of volumes on one server group, and the hash picks within it)?
    *Recommended: hash over all volumes by default, with prefix groups as an option the operator sets before the
    first series of the prefix exists* (a later change of the rule would move slots, §5.7).
+   **Answered by the user on 2026-11-06**: hash over all volumes by default, prefix groups optional (M23, §5.7).
 5. **The read barrier's cost** (M16): an owner read waits for the next fenced write after it arrived; on an idle
    volume that is one slot write and `fdatasync` over NFS (perhaps 0.2-0.5 ms, V6). *Recommended: on by default,
    since stale reads were ruled out (ha.md D23); measure in N8; offer `--read-barrier off` (the clock gate) only for
    deployments that accept stale reads after a VM pause.*
+   **Default taken on 2026-11-06** (the recommendation; the user may change it): on by default, measured in N8,
+   `--read-barrier off` as the opt-out (M24, §5.5).
 6. **May tsdbd kill itself, and the escalation reboot the node, for a release stuck on a wedged domain whose server is
    healthy** (§5.5; ha.md open question 2 asks the same for a stuck file)? *Recommended: yes, when one fenced call has
    been outstanding for 3 × lease (30 s) and another candidate reports the domain UP*; a release that is only slow is
    shortened instead. It fails all of that node's volumes over, which is the only way the lock is freed.
+   **Default taken on 2026-11-06** (the recommendation; the user may change it): yes, only after 3 × lease with
+   another candidate reporting the domain UP (M25, §5.5).
 
 ## Unverified assumptions
 
